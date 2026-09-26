@@ -27,19 +27,32 @@ pre-commit:
     # ベースにする（`(^|/)` アンカーでサブディレクトリ内の `.env.*` も検出し、
     # 拡張子なしの SSH 鍵 `id_rsa` / `id_ed25519` も拒否する。一方 `.env.example` 等の
     # 雛形・`id_rsa.pub` 等の公開鍵は許可リストで通す。拡張子 `.env` は旧パターンの
-    # 検出範囲を維持するため追加している）
+    # 検出範囲を維持するため追加している）。
+    # {staged_files} は rename 後の名前しか含まないため、`.env` 等を無害な名前へ rename
+    # すると素通りする。staged の name-status から rename / copy 元と先の両方を検査する。
+    # 一覧を取得できない場合は検査不能として失敗させる（fail-closed）
     - name: secrets-guard
       run: |
-        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
-        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
-            echo "NG: 秘密情報ファイルがステージされています: $f" >&2
-            exit 1
-          fi
-        done
+        if ! status=$(git diff --cached --name-status -M --diff-filter=ACMR --no-ext-diff); then
+          echo "NG: staged ファイル一覧を取得できないため秘密情報の検査を実施できません" >&2
+          exit 1
+        fi
+        # name-status はタブ区切り（R/C 行は「状態 元 先」）。状態列を除いたパス列を 1 行 1 件に
+        # 展開し、特殊文字を含むパスに git が付ける前後の二重引用符を外してから判定する。
+        # 末尾 grep の終了状態は 0=一致あり・1=一致なし・2 以上=検査エラー（fail-closed）
+        bad=$(printf '%s\n' "$status" | cut -f2- | tr '\t' '\n' | sed -e 's/^"//' -e 's/"$//' \
+          | grep -E "$re" | grep -vE "$re_ok")
+        rc=$?
+        if [ "$rc" -gt 1 ]; then
+          echo "NG: 秘密情報ファイルの判定でエラーが発生しました" >&2
+          exit 1
+        fi
+        if [ -n "$bad" ]; then
+          printf '%s\n' "$bad" | sed 's/^/NG: 秘密情報ファイルがステージされています（rename \/ copy 元を含む）: /' >&2
+          exit 1
+        fi
 
     # ファイル名パターンだけでは検出できない、内容そのものに秘密情報らしき
     # 文字列が含まれるケースの「うっかり」防止(網羅的な検出ではない。
@@ -47,9 +60,12 @@ pre-commit:
     # （リポジトリ設定で有効化済み）。誤検知した場合も --no-verify での回避は
     # 行わず、該当箇所の値を除去してから再ステージする）。
     # staged diff の追加行（`+` 始まり。削除行・`+++` ヘッダ行は対象外）のみを
-    # 走査する。バイナリファイルは git diff が +/- 行を出力しないため自然に
-    # 除外される。検出時はファイル名とパターン種別のみを表示し、値そのものは
-    # 出力しない。
+    # 走査する。`--no-renames` により rename は「元の削除 + 先の新規追加」として扱い、
+    # 内容が変わらない rename でも移動先の全行を走査する。バイナリファイルは
+    # git diff が +/- 行を出力しないため対象外（バイナリの資格情報ファイルは
+    # secrets-guard のファイル名検査が担う）。diff を取得できない場合は検査不能として
+    # 失敗させる（fail-closed）。検出時はファイル名とパターン種別のみを表示し、
+    # 値そのものは出力しない。
     - name: secrets-content-guard
       run: |
         patterns='
@@ -61,8 +77,14 @@ pre-commit:
         xox[abprs]-[A-Za-z0-9-]{10,}|slack-token
         AIza[0-9A-Za-z_-]{35}|google-api-key
         '
+        # パイプの左辺（git diff）の失敗は右辺の while に隠れて成功扱いになるため、
+        # 先に変数へ取得して終了状態を確認する
+        if ! diff=$(git diff --cached --no-renames --diff-filter=ACMR -U0 --no-ext-diff --no-color -- .); then
+          echo "NG: staged diff を取得できないため秘密情報の検査を実施できません" >&2
+          exit 1
+        fi
         file=""
-        git diff --cached --diff-filter=ACMR -U0 -- . | while IFS= read -r line; do
+        printf '%s\n' "$diff" | while IFS= read -r line; do
           case "$line" in
             "+++ b/"*)
               file="${line#+++ b/}"
