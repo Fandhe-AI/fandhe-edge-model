@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fandhe_edge_trainer.contract import TrainExample, TrainRequest
+from fandhe_edge_trainer.limits import MAX_TRAIN_RSS_BYTES, MAX_TRAIN_WALL_SECONDS
 
 #: テストのみに使う合成データセット（自明に分離可能な 2 クラス）。実データではない。
 LABEL_ORDER = ["cat_a", "cat_b"]
@@ -43,7 +44,13 @@ TINY_CONFIG = {
 
 
 def make_request(
-    tmp_path, *, config: dict | None = None, seed: int = 0, out_name: str = "out"
+    tmp_path,
+    *,
+    config: dict | None = None,
+    seed: int = 0,
+    out_name: str = "out",
+    time_limit_seconds: int = MAX_TRAIN_WALL_SECONDS,
+    rss_limit_bytes: int = MAX_TRAIN_RSS_BYTES,
 ) -> TrainRequest:
     """`TrainRequest` を直接構築する（`guard.safe_join` を経由しないテスト専用の近道。
     経路の閉じ込め検証そのものは `test_contract.py` 側で個別に検証する）。
@@ -59,4 +66,6 @@ def make_request(
         root=tmp_path,
         train_path=tmp_path / "train.jsonl",
         out_dir=tmp_path / out_name,
+        time_limit_seconds=time_limit_seconds,
+        rss_limit_bytes=rss_limit_bytes,
     )

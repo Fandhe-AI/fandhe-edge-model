@@ -309,6 +309,35 @@ def test_load_request_rejects_bool_seed(tmp_path: Path) -> None:
     assert exc_info.value.code == "invalid_request"
 
 
+def test_load_request_accepts_lower_resource_limits(tmp_path: Path) -> None:
+    """P0-B: `time_limit_seconds`・`rss_limit_bytes` は既定の上限を下げるだけ許可する。"""
+    req_dict = {**_base_request(tmp_path), "time_limit_seconds": 60, "rss_limit_bytes": 1024}
+    p = _write(tmp_path / "req.json", req_dict)
+    req = contract.load_request(p)
+    assert req.time_limit_seconds == 60
+    assert req.rss_limit_bytes == 1024
+
+
+def test_load_request_rejects_time_limit_above_max(tmp_path: Path) -> None:
+    from fandhe_edge_trainer.limits import MAX_TRAIN_WALL_SECONDS
+
+    req_dict = {**_base_request(tmp_path), "time_limit_seconds": MAX_TRAIN_WALL_SECONDS + 1}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_request"
+
+
+def test_load_request_rejects_rss_limit_above_max(tmp_path: Path) -> None:
+    from fandhe_edge_trainer.limits import MAX_TRAIN_RSS_BYTES
+
+    req_dict = {**_base_request(tmp_path), "rss_limit_bytes": MAX_TRAIN_RSS_BYTES + 1}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_request"
+
+
 def test_load_train_examples_rejects_nan_in_line(tmp_path: Path) -> None:
     train_path = tmp_path / "train.jsonl"
     train_path.write_text('{"input": NaN, "label": "a"}\n', encoding="utf-8")
@@ -369,33 +398,95 @@ def test_finalize_out_dir_converts_os_error_to_worker_error(
 ) -> None:
     """項目 8: `os.replace` の失敗を `WorkerError`（output_conflict・exit 64）へ変換する。"""
     out_dir = tmp_path / "out"
-    tmp_dir = contract.prepare_out_dir(out_dir)
+    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
 
     def _boom(_src: object, _dst: object) -> None:
         raise OSError("simulated concurrent creation")
 
     monkeypatch.setattr(contract.os, "replace", _boom)
     with pytest.raises(WorkerError) as exc_info:
-        contract.finalize_out_dir(tmp_dir, out_dir)
+        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
     assert exc_info.value.code == "output_conflict"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    assert not tmp_dir.exists()  # 失敗時も一時ディレクトリは掃除される
+    assert not tmp_dir.exists()  # 失敗時も一時ディレクトリ（自分のもの）は掃除される
+    assert out_dir.exists()  # 予約済み out_dir 自体は触れずに残る
 
 
 def test_prepare_out_dir_rejects_existing_dir(tmp_path: Path) -> None:
+    """P0-A: `os.mkdir` の `FileExistsError` を検出する（存在確認 → 作成の 2 手順にしない）。"""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     with pytest.raises(WorkerError) as exc_info:
         contract.prepare_out_dir(out_dir)
-    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.code == "output_conflict"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
 
 def test_prepare_and_finalize_out_dir_roundtrip(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
-    tmp_dir = contract.prepare_out_dir(out_dir)
+    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
     assert tmp_dir.exists()
-    assert not out_dir.exists()
+    assert out_dir.is_dir()  # 予約済み（空ディレクトリとして先に作成されている）
+    assert not any(out_dir.iterdir())
     (tmp_dir / "marker.txt").write_text("ok", encoding="utf-8")
-    contract.finalize_out_dir(tmp_dir, out_dir)
+    contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
     assert out_dir.exists()
     assert (out_dir / "marker.txt").read_text(encoding="utf-8") == "ok"
+
+
+def test_finalize_out_dir_rejects_when_reserved_dir_became_nonempty(tmp_path: Path) -> None:
+    """P0-A: 予約後に別プロセス（を模したテスト側の書き込み）が out_dir へ何かを
+    置いた場合、`os.replace` が ENOTEMPTY で失敗し、その内容を消さずに残すこと。
+    """
+    out_dir = tmp_path / "out"
+    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+    (tmp_dir / "marker.txt").write_text("ok", encoding="utf-8")
+
+    # 予約と確定の間に、別プロセスが out_dir の中身を書き換えたことを模す。
+    (out_dir / "foreign.txt").write_text("someone else's data", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as exc_info:
+        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
+    assert exc_info.value.code == "output_conflict"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    # 他者が書いた内容は消さない。
+    assert (out_dir / "foreign.txt").read_text(encoding="utf-8") == "someone else's data"
+
+
+def test_finalize_out_dir_rejects_when_reserved_dir_replaced_by_different_dir(
+    tmp_path: Path,
+) -> None:
+    """P0-A: 予約後に out_dir が別物（別 inode のディレクトリ）へすり替わっていた場合、
+    `os.replace` を呼ぶ前に `(st_dev, st_ino)` の不一致で検出し拒否すること。
+    """
+    out_dir = tmp_path / "out"
+    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+
+    # 予約済みディレクトリを削除し、同名の別ディレクトリへ差し替える
+    # （別プロセスによる置き換えを模す。inode が変わる）。
+    out_dir.rmdir()
+    out_dir.mkdir()
+    (out_dir / "someone_elses_file.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as exc_info:
+        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
+    assert exc_info.value.code == "output_conflict"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    # すり替わった側には触れない。
+    assert (out_dir / "someone_elses_file.txt").exists()
+
+
+def test_cleanup_reserved_out_dir_removes_own_empty_reservation(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    _tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+    contract.cleanup_reserved_out_dir(out_dir, reserved_id)
+    assert not out_dir.exists()
+
+
+def test_cleanup_reserved_out_dir_leaves_nonempty_reservation(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    _tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+    (out_dir / "foreign.txt").write_text("x", encoding="utf-8")
+    contract.cleanup_reserved_out_dir(out_dir, reserved_id)
+    assert out_dir.exists()
+    assert (out_dir / "foreign.txt").exists()

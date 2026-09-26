@@ -55,7 +55,7 @@ def run_train(request_path: Path) -> ExitCode:
     examples = contract.load_train_examples(request.train_path, request.label_order)
     kind_impl = resolve_kind(request.kind, request.kind_version)
 
-    tmp_dir = contract.prepare_out_dir(request.out_dir)
+    tmp_dir, reserved_id = contract.prepare_out_dir(request.out_dir)
     try:
         trained = kind_impl.train(examples, request)
         onnx_path = tmp_dir / artifact_mod.ONNX_FILE_NAME
@@ -76,9 +76,14 @@ def run_train(request_path: Path) -> ExitCode:
         )
         artifact_mod.write_artifact(tmp_dir, art)
     except BaseException:
+        # tmp_dir（一時作業ディレクトリ）は必ず自分のものなので無条件に消す。
+        # 予約済み out_dir は「まだ自分の予約かつ空である場合のみ」解放する
+        # （P0-A: 学習中に何者かが out_dir へ書き込んでいたら残す。contract.py
+        # `cleanup_reserved_out_dir` のドキュメント参照）。
         _cleanup(tmp_dir)
+        contract.cleanup_reserved_out_dir(request.out_dir, reserved_id)
         raise
-    contract.finalize_out_dir(tmp_dir, request.out_dir)
+    contract.finalize_out_dir(tmp_dir, request.out_dir, reserved_id)
 
     artifact_path = request.out_dir / artifact_mod.ARTIFACT_FILE_NAME
     art_written = json.loads(artifact_path.read_text(encoding="utf-8"))

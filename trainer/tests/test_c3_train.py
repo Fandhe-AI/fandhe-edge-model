@@ -159,3 +159,59 @@ def test_c3_export_rejects_nonzero_pad_embedding_row(tmp_path: Path) -> None:
         kind.export_onnx(trained, tmp_path / "broken.onnx")
     assert exc_info.value.code == "runtime_error"
     assert exc_info.value.exit_code == ExitCode.RUNTIME_ERROR
+
+
+def test_c3_train_rejects_sample_steps_over_limit(tmp_path: Path) -> None:
+    """P0-B: examples 件数 × epochs が上限を超える場合、1 バッチも回さず拒否する。
+
+    `epochs` は `MAX_C3_EPOCHS`（config 検証の上限）に固定し、examples 件数の方を
+    増やして総ステップ数を上限超過させる（バイトエンコードは検査より後に行われる
+    ため、examples はダミーの入力文字列で十分。学習は 1 バッチも回らない）。
+    """
+    from fandhe_edge_trainer.contract import TrainExample
+    from fandhe_edge_trainer.limits import MAX_C3_EPOCHS, MAX_TRAIN_SAMPLE_STEPS
+
+    kind = C3Kind()
+    epochs = MAX_C3_EPOCHS
+    n_examples = MAX_TRAIN_SAMPLE_STEPS // epochs + 10
+    examples = [TrainExample(input="alpha beta", label="cat_a") for _ in range(n_examples)]
+    req = make_request(tmp_path, config={**TINY_CONFIG, "epochs": epochs})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(examples, req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_c3_train_rejects_tiny_time_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P0-B: `time_limit_seconds` を極小にし、`time.monotonic` を進めて締切り超過を検出する。"""
+    from fandhe_edge_trainer import budget as budget_mod
+
+    real_monotonic = budget_mod.time.monotonic
+    calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        calls["n"] += 1
+        # __post_init__ の締切り計算では実時刻を使い、2 回目以降の呼び出し
+        # （学習ループ内の check()）で大きく先の時刻を返して締切りを超えさせる。
+        if calls["n"] == 1:
+            return real_monotonic()
+        return real_monotonic() + 10_000.0
+
+    monkeypatch.setattr(budget_mod.time, "monotonic", _fake_monotonic)
+
+    kind = C3Kind()
+    req = make_request(tmp_path, config=TINY_CONFIG, time_limit_seconds=1)
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_c3_train_rejects_tiny_rss_limit(tmp_path: Path) -> None:
+    """P0-B: `rss_limit_bytes` を極小（1 byte）にすると、実プロセスの RSS が必ず超過する。"""
+    kind = C3Kind()
+    req = make_request(tmp_path, config=TINY_CONFIG, rss_limit_bytes=1)
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED

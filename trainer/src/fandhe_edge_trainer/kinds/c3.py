@@ -48,6 +48,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
+from .. import budget as budget_mod
 from ..contract import TrainExample, TrainRequest
 from ..encoding import encode_bytes
 from ..errors import WorkerError
@@ -215,6 +216,9 @@ class C3TrainedModel:
 
     `config`・`label_order`・`max_bytes` は `kinds/__init__.py::TrainedModel`
     プロトコルが宣言する共通フィールド（`cli.py::run_train` が種類非依存で読む）。
+    `resource_budget` は学習ループで使ったものと同じインスタンスを持ち回り、
+    ONNX 書き出し（`export_onnx`）でも 1 回だけ資源上限を検査する（P0-B。
+    書き出し自体は学習ほど長時間・大量のメモリを使わないが、念のため検査する）。
     """
 
     model: ByteCNN
@@ -223,6 +227,7 @@ class C3TrainedModel:
     max_bytes: int = 512
     seed: int = 0
     epochs_run: int = 0
+    resource_budget: budget_mod.ResourceBudget | None = None
 
 
 class C3Kind:
@@ -234,6 +239,16 @@ class C3Kind:
         widths = tuple(int(w) for w in cfg["widths"])
         label_order = request.label_order
         label_id = {label: i for i, label in enumerate(label_order)}
+
+        epochs = int(cfg["epochs"])
+        # P0-B: 学習開始前に総ステップ数（examples 件数 × epochs）の見積もりで
+        # 上限を検査する（REQ-39。1 ステップも回さずに reject できる）。
+        budget_mod.check_sample_steps(len(examples), epochs)
+        resource_budget = budget_mod.ResourceBudget(
+            wall_seconds=float(request.time_limit_seconds),
+            rss_bytes=request.rss_limit_bytes,
+            device=request.device,
+        )
 
         mx.set_default_device(mx.cpu if request.device == "cpu" else mx.gpu)
         mx.random.seed(request.seed)
@@ -253,7 +268,6 @@ class C3Kind:
 
         step = nn.value_and_grad(model, loss_fn)
         batch_size = int(cfg["batch_size"])
-        epochs = int(cfg["epochs"])
         model.train()
         for _epoch in range(epochs):
             order = rng.permutation(len(ids))
@@ -277,6 +291,9 @@ class C3Kind:
                         "training loss became non-finite",
                         ExitCode.PENDING,
                     )
+                # P0-B: 壁時計・RSS（device="gpu" なら MLX active memory も）を
+                # バッチごとに検査する（REQ-39。budget.py::ResourceBudget 参照）。
+                resource_budget.check()
         model.eval()
         return C3TrainedModel(
             model=model,
@@ -285,9 +302,12 @@ class C3Kind:
             max_bytes=request.max_bytes,
             seed=request.seed,
             epochs_run=epochs,
+            resource_budget=resource_budget,
         )
 
     def export_onnx(self, trained: C3TrainedModel, path: Path) -> None:
+        if trained.resource_budget is not None:
+            trained.resource_budget.check()
         _export_c3_onnx(trained, path)
 
 

@@ -15,7 +15,9 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
   "device": "cpu",
   "root": "/abs/path/to/project",
   "train_path": "train.jsonl",
-  "out_dir": "out"
+  "out_dir": "out",
+  "time_limit_seconds": 3600,
+  "rss_limit_bytes": 8589934592
 }
 ```
 
@@ -23,6 +25,12 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 `root` からの**相対パス**でなければならない（絶対パス・`..` 構成要素・空文字列は
 拒否する）。`TrainRequest.train_path`・`TrainRequest.out_dir` は検証・解決済みの
 絶対パス（`root` 配下であることを確認済み）を保持する。
+
+`time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
+`MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
+指定する場合は、その上限を**下げる**ことしかできない（上限より大きい値は
+`invalid_request` で拒否する）。学習ループ中の実際の検査は `budget.py`
+（`ResourceBudget`）が担う。
 
 学習データ（`train_path` が指す JSONL）は 1 行 1 オブジェクト `{"input": str,
 "label": str}`。label は label_order に含まれる必要がある。
@@ -40,8 +48,20 @@ Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単�
 **ジョブの再開・異常終了時の後片付けは本モジュールの責務ではない**（REQ-34）。
 `prepare_out_dir`/`finalize_out_dir` は「同一プロセス内で正常終了 or 例外終了する」
 場合の半端な書き込み防止だけを担う。本ワーカーが SIGKILL 等で強制終了した場合、
-`<out_dir>.tmp-*` が残置されうるが、その回収（次回実行前の掃除・再試行判断）は
-ジョブ管理を担う Rust 側（TASK-34.x）の責務とする。
+空の予約済み `out_dir`・`<out_dir>.tmp-*` が残置されうるが、その回収（次回実行前の
+掃除・再試行判断）はジョブ管理を担う Rust 側（TASK-34.x）の責務とする。予約済み
+`out_dir` が空のままであること自体が「成果物は公開されていない」ことの証拠になる
+（後述の予約方式）。
+
+**`out_dir` の確定は「空ディレクトリの予約 → 別ディレクトリで作業 → アトミックな
+置き換え」の 3 段で行う**（TOCTOU 対策）。`prepare_out_dir` が `os.mkdir` で
+`out_dir` そのものを排他的に作成する（既存なら `FileExistsError` を検出できる。
+`exists()` チェック → 後から作成という 2 手順では、その間に別プロセスが
+先に作成できてしまう）。学習・書き出しは兄弟の一時ディレクトリで行い、
+`finalize_out_dir` が予約時に記録した `(st_dev, st_ino)` と現在の `out_dir` の
+それを突き合わせてから（別物にすり替わっていないか）`os.replace` で確定する。
+置き換え先が空ディレクトリでなくなっていた場合（何者かが書き込んだ）は
+`os.replace` 自体が `ENOTEMPTY` で失敗するため、その内容を消さずに残す。
 """
 
 from __future__ import annotations
@@ -67,6 +87,8 @@ from .limits import (
     MAX_TRAIN_DATA_BYTES,
     MAX_TRAIN_EXAMPLES,
     MAX_TRAIN_LINE_BYTES,
+    MAX_TRAIN_RSS_BYTES,
+    MAX_TRAIN_WALL_SECONDS,
     MIN_LABELS,
     MIN_MAX_BYTES,
     MIN_SEED,
@@ -86,6 +108,8 @@ _REQUEST_FIELDS = {
     "root",
     "train_path",
     "out_dir",
+    "time_limit_seconds",
+    "rss_limit_bytes",
 }
 
 
@@ -111,6 +135,8 @@ class TrainRequest:
     root: Path
     train_path: Path
     out_dir: Path
+    time_limit_seconds: int
+    rss_limit_bytes: int
 
 
 def _invalid(message: str) -> WorkerError:
@@ -269,6 +295,24 @@ def _validate_request(raw: Any) -> TrainRequest:
     train_path = guard.safe_join(root_real, raw.get("train_path"), "train_path")
     out_dir = guard.safe_join(root_real, raw.get("out_dir"), "out_dir")
 
+    # ジョブ全体の資源上限（REQ-39・budget.py）。任意項目で「既定の上限より
+    # 下げる」ことだけを許す（上限そのものを緩める経路は無い）。
+    time_limit_seconds = raw.get("time_limit_seconds", MAX_TRAIN_WALL_SECONDS)
+    if (
+        not isinstance(time_limit_seconds, int)
+        or isinstance(time_limit_seconds, bool)
+        or not (1 <= time_limit_seconds <= MAX_TRAIN_WALL_SECONDS)
+    ):
+        raise _invalid(f"time_limit_seconds must be an integer in [1, {MAX_TRAIN_WALL_SECONDS}]")
+
+    rss_limit_bytes = raw.get("rss_limit_bytes", MAX_TRAIN_RSS_BYTES)
+    if (
+        not isinstance(rss_limit_bytes, int)
+        or isinstance(rss_limit_bytes, bool)
+        or not (1 <= rss_limit_bytes <= MAX_TRAIN_RSS_BYTES)
+    ):
+        raise _invalid(f"rss_limit_bytes must be an integer in [1, {MAX_TRAIN_RSS_BYTES}]")
+
     return TrainRequest(
         kind=kind,
         kind_version=kind_version,
@@ -280,6 +324,8 @@ def _validate_request(raw: Any) -> TrainRequest:
         root=root_real,
         train_path=train_path,
         out_dir=out_dir,
+        time_limit_seconds=time_limit_seconds,
+        rss_limit_bytes=rss_limit_bytes,
     )
 
 
@@ -389,50 +435,113 @@ def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainE
     return examples
 
 
-def prepare_out_dir(out_dir: Path) -> Path:
-    """`out_dir` が未作成であることを確認し、書き込み用の一時ディレクトリを作って返す。
+#: `out_dir` の実体識別子（`st_dev`・`st_ino`）。予約時点のものを覚えておき、
+#: 確定（`finalize_out_dir`）の直前に「まだ自分が予約した実体と同じか」を
+#: 確認するために使う（P0-A: 予約と確定の間の TOCTOU 対策）。
+ReservedId = tuple[int, int]
+
+
+def prepare_out_dir(out_dir: Path) -> tuple[Path, ReservedId]:
+    """`out_dir` を空ディレクトリとして排他的に予約し、書き込み用の一時
+    ディレクトリ（兄弟）を作って返す。
 
     `out_dir` は呼び出し元（`_validate_request`）で `guard.safe_join` によって
     root 配下への閉じ込めを検証・解決済みの絶対パスである前提（`out_dir.parent` が
     その時点で解決済みの実体パス）。一時ディレクトリはこの同じ親の配下に作るため、
     root の外へ書き出す経路は生まれない。
 
-    半端な書き込みを避けるため、実際の出力は一時ディレクトリへ行い、成功時に
-    `os.replace` で `out_dir` へ確定させる（ジョブの再開・チェックポイント機構は
-    Rust 側 REQ-34 の責務であり、本関数はその前提を壊さないための最小限の対処。
-    本関数のモジュール docstring も参照）。
+    「存在確認 → 後で作成」という 2 手順では、その間に別プロセスが先に
+    `out_dir` を作れてしまう（TOCTOU）。`os.mkdir` は対象が既に存在すれば
+    `FileExistsError` を返すことがカーネルにより保証されたアトミックな操作
+    のため、予約自体を 1 手順で行う。学習・書き出しは兄弟の一時ディレクトリで
+    行い、成功時に `finalize_out_dir` がこの予約済み空ディレクトリを
+    `os.replace` で置き換える（本関数のモジュール docstring も参照）。
     """
-    # exists() ではなく lexists() を使う: 壊れたシンボリックリンク（リンク先が
-    # 存在しない）は exists() では検出できないが、out_dir の位置に何らかの
-    # エントリが既にあるという事実自体は lexists() で検出できる（REQ-39
-    # ガード層の「完全性」寄りの考え方。既存エントリを黙って上書きしない）。
-    if os.path.lexists(out_dir):
-        raise _invalid("out_dir already exists")
     parent = out_dir.parent
     if not parent.is_dir():
         raise _invalid("out_dir's parent directory does not exist")
+    try:
+        os.mkdir(out_dir, 0o700)
+    except FileExistsError as e:
+        raise WorkerError(
+            "output_conflict", "out_dir already exists", ExitCode.INVALID_INPUT
+        ) from e
+    except OSError as e:
+        raise _invalid(f"failed to create out_dir: {type(e).__name__}") from e
+    reserved_id = _reserved_id_of(out_dir)
     tmp = Path(tempfile.mkdtemp(prefix=f"{out_dir.name}.tmp-", dir=parent))
-    return tmp
+    return tmp, reserved_id
 
 
-def finalize_out_dir(tmp_dir: Path, out_dir: Path) -> None:
-    """一時ディレクトリを `out_dir` へ確定させる。失敗時は一時ディレクトリを削除する。
+def _reserved_id_of(out_dir: Path) -> ReservedId:
+    st = os.lstat(out_dir)
+    return (st.st_dev, st.st_ino)
 
-    `os.replace` の失敗（例: `out_dir` が学習中に別プロセスから作られた）は
-    利用者側の入力・実行環境に起因しうる競合であり、本ワーカーの内部バグではない
-    ため `runtime_error`（exit 70）ではなく `invalid_request`（exit 64）として
-    扱う（`prepare_out_dir` が「未作成であること」を確認した後の TOCTOU なので、
-    完全には防げないレースだが、検出はできる）。
+
+def finalize_out_dir(tmp_dir: Path, out_dir: Path, reserved_id: ReservedId) -> None:
+    """予約済みの `out_dir`（空ディレクトリ）を一時ディレクトリの内容で確定させる。
+
+    確定前に `out_dir` が「予約時点と同じ実体（`st_dev`・`st_ino` が一致する
+    ディレクトリ。シンボリックリンクや別物にすり替わっていない）」であることを
+    確認する。一致しなければ、実体が何であれ触れずに `output_conflict`
+    （exit 64）とする。一致していれば `os.replace` で置き換える: 予約後に
+    何者かが `out_dir` の中へファイルを書き込んでいた場合、`os.replace` は
+    ディレクトリを空でない置き換え先へは適用できない（`ENOTEMPTY`）ため
+    失敗する。この場合もその内容を削除せず残したまま `output_conflict` とする
+    （利用者側の入力・実行環境に起因しうる競合であり、本ワーカーの内部バグでは
+    ないため `runtime_error`〔exit 70〕ではなく `invalid_request` 系の
+    `output_conflict`〔exit 64〕として扱う）。
     """
     try:
-        os.replace(tmp_dir, out_dir)
+        st = os.lstat(out_dir)
     except OSError as e:
         _cleanup_tmp_dir(tmp_dir)
         raise WorkerError(
             "output_conflict",
-            f"failed to finalize out_dir (possibly created concurrently): {type(e).__name__}",
+            f"reserved out_dir vanished before finalize: {type(e).__name__}",
             ExitCode.INVALID_INPUT,
         ) from e
+    current_id = (st.st_dev, st.st_ino)
+    if not stat.S_ISDIR(st.st_mode) or current_id != reserved_id:
+        _cleanup_tmp_dir(tmp_dir)
+        raise WorkerError(
+            "output_conflict",
+            "out_dir was replaced by a different entry before finalize",
+            ExitCode.INVALID_INPUT,
+        )
+    try:
+        os.replace(tmp_dir, out_dir)
+    except OSError as e:
+        # ENOTEMPTY（予約後に何者かが書き込んだ）等。out_dir の中身は触らない
+        # （foreign content を残す。cli.py::run_train の失敗時クリーンアップも
+        # 同様に「自分の予約かつ空である場合のみ」rmdir する設計にしてある）。
+        _cleanup_tmp_dir(tmp_dir)
+        raise WorkerError(
+            "output_conflict",
+            f"failed to finalize out_dir: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+
+
+def cleanup_reserved_out_dir(out_dir: Path, reserved_id: ReservedId) -> None:
+    """学習失敗時などに予約を解放する。
+
+    まだ自分が予約した実体（`st_dev`・`st_ino` が一致）であり、かつ空である
+    場合にのみ `os.rmdir` する。他プロセスが何か書き込んでいる・別物へ
+    すり替わっている場合は何もしない（残置は Rust 側ジョブ管理〔REQ-34〕が
+    次回実行前に判断する。予約が空のまま残ることは「成果物は公開されていない」
+    ことの証拠であり、安全側の残置である）。
+    """
+    try:
+        st = os.lstat(out_dir)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != reserved_id:
+        return
+    try:
+        os.rmdir(out_dir)  # 空でなければ ENOTEMPTY → 例外を握りつぶして残置する
+    except OSError:
+        pass
 
 
 def _cleanup_tmp_dir(tmp_dir: Path) -> None:
