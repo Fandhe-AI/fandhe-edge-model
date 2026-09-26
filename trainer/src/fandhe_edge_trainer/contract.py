@@ -329,10 +329,17 @@ def validate_request(raw: Any) -> TrainRequest:
         raise _invalid(f"request has unknown fields: {truncate_list_for_message(sorted(unknown))}")
 
     schema_version = raw.get("schema_version")
-    if schema_version != SCHEMA_VERSION:
+    # `bool` は `int` のサブクラスであり、`True == 1` が成り立つ（`True !=
+    # SCHEMA_VERSION` は False になり、`bool` を素通りさせてしまう）。
+    # `type(v) is int` で明示的に除外してから比較する（P1）。文字列等の場合は
+    # 値そのものを埋め込まない（無制限の長さになりうるため。型名だけ示す）。
+    if type(schema_version) is not int:
         raise _invalid(
-            f"unsupported schema_version: {schema_version!r} (expected {SCHEMA_VERSION})"
+            f"schema_version must be an integer (expected {SCHEMA_VERSION}), "
+            f"got {type(schema_version).__name__}"
         )
+    if schema_version != SCHEMA_VERSION:
+        raise _invalid(f"unsupported schema_version: {schema_version} (expected {SCHEMA_VERSION})")
 
     kind = raw.get("kind")
     if not isinstance(kind, str) or not kind:

@@ -61,6 +61,7 @@ def test_c3_artifact_fields(tmp_path: Path) -> None:
         output_type="choice",
         max_bytes=trained.max_bytes,
         candidate_label="c3",
+        onnx_sha256="0" * 64,
     )
     assert art["kind"] == "c3"
     assert art["kind_version"] == 1
@@ -69,6 +70,7 @@ def test_c3_artifact_fields(tmp_path: Path) -> None:
     assert art["output_type"] == "choice"
     assert art["max_bytes"] == 64
     assert art["onnx_file"] == "model.onnx"
+    assert art["onnx_sha256"] == "0" * 64
     assert art["candidate_label"] == "c3"
     assert art["config"]["emb"] == TINY_CONFIG["emb"]
     assert isinstance(art["created_utc"], str)
@@ -111,6 +113,33 @@ def test_c3_train_rejects_config_upper_bound_violation(tmp_path: Path) -> None:
 
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "emb": MAX_C3_EMB + 1})
+    with pytest.raises(WorkerError) as exc_info:
+        train_c3(kind, make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("field", ["epochs", "batch_size", "emb", "filters"])
+@pytest.mark.parametrize("value", [True, False])
+def test_c3_train_rejects_bool_for_integer_config_fields(
+    tmp_path: Path, field: str, value: bool
+) -> None:
+    """P1: 真偽値は `int` のサブクラス（`True == 1`・`False == 0`）であるため、
+    config の整数フィールドの検証は明示的に `bool` を除外しないと素通りしうる
+    （回帰を防ぐための確認）。
+    """
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, field: value})
+    with pytest.raises(WorkerError) as exc_info:
+        train_c3(kind, make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_c3_train_rejects_bool_width_element(tmp_path: Path, value: bool) -> None:
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "widths": [3, value]})
     with pytest.raises(WorkerError) as exc_info:
         train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"

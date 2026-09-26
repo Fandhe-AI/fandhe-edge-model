@@ -133,7 +133,11 @@ def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
             dir_fd=out_fd,
         )
         with os.fdopen(onnx_fd, "wb") as onnx_file:
-            kind_impl.export_onnx(trained, onnx_file)
+            # HashingWriter: model.onnx へ書き込んだ厳密なバイト列の SHA-256 を、
+            # export_onnx 側を変更せずに計算する（P0: artifact.py モジュール
+            # docstring・AGENTS.md ガード層「完全性と版」参照）。
+            hashing_writer = artifact_mod.HashingWriter(onnx_file)
+            kind_impl.export_onnx(trained, hashing_writer)
         art = artifact_mod.build_artifact(
             kind=request.kind,
             kind_version=request.kind_version,
@@ -147,6 +151,7 @@ def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
             output_type="choice",
             max_bytes=trained.max_bytes,
             candidate_label=request.kind,
+            onnx_sha256=hashing_writer.hexdigest(),
         )
         artifact_mod.write_artifact(out_fd, art)
     finally:

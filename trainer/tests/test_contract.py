@@ -388,6 +388,34 @@ def test_load_request_rejects_bool_seed(tmp_path: Path) -> None:
     assert exc_info.value.code == "invalid_request"
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema_version",
+        "kind_version",
+        "max_bytes",
+        "seed",
+        "time_limit_seconds",
+        "rss_limit_bytes",
+    ],
+)
+@pytest.mark.parametrize("value", [True, False])
+def test_load_request_rejects_bool_for_integer_fields(
+    tmp_path: Path, field: str, value: bool
+) -> None:
+    """P1: 真偽値は `int` のサブクラス（`True == 1`・`False == 0`）であるため、
+    整数フィールドの検証は明示的に `bool` を除外しないと素通りしうる
+    （`schema_version` はこの見落としがあった。他のフィールドは既に対応済みだが、
+    回帰を防ぐためすべて一括りに確認する）。
+    """
+    req_dict = {**_base_request(tmp_path), field: value}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
 def test_load_request_accepts_lower_resource_limits(tmp_path: Path) -> None:
     """`time_limit_seconds`・`rss_limit_bytes` は既定の上限を下げるだけ許可する。"""
     req_dict = {**_base_request(tmp_path), "time_limit_seconds": 60, "rss_limit_bytes": 1024}

@@ -52,8 +52,11 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    確認する。いずれかを満たさない、またはシグナルによる終了なら
    `runtime_error`（exit 70）とし、予約を解放する。終了コードが 0 以外（7 種の
    いずれかのエラー）なら、そのコード・JSON をそのまま使い、予約は解放する
-   （出力を確定させない）。終了コードが 0（成功）なら `contract.finalize_out_dir`
-   で確定させたうえで、そのまま出力する。
+   （出力を確定させない）。終了コードが 0（成功）なら、確定の前に
+   `artifact.verify_output` で `model.onnx` の SHA-256 が `artifact.json` の
+   記録と一致するかを確認し（P0: AGENTS.md ガード層「完全性と版」・REQ-39。
+   不一致・欠落は予約を解放して確定させない）、一致すれば
+   `contract.finalize_out_dir` で確定させたうえで、そのまま出力する。
 
 Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパーバイザー」の役割を
 担う計画であり、本モジュールは Rust 側が無い・本ワーカーが単独プロセスとして
@@ -67,6 +70,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -75,6 +79,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import artifact as artifact_mod
 from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
@@ -140,6 +145,48 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         proc.kill()  # プロセスグループの取得自体に失敗した場合の保険
 
 
+def _cpu_seconds_consumed_by_children(baseline: resource.struct_rusage) -> float:
+    """`baseline`（監視開始時点の `RUSAGE_CHILDREN`）からの CPU 時間（user+sys 秒）の
+    増分。`RUSAGE_CHILDREN` は「これまでに reap した子プロセス」の累積値のため、
+    1 ジョブにつきワーカーを 1 つずつ順に起動する本モジュールの設計では、この
+    増分は基本的に当該ワーカーに帰属する（`_current_child_rss_bytes` が起動する
+    `ps` の CPU 消費もわずかに混入しうるが、しきい値との比較粒度に対して無視できる
+    ほど小さい）。
+    """
+    current = resource.getrusage(resource.RUSAGE_CHILDREN)
+    before = baseline.ru_utime + baseline.ru_stime
+    after = current.ru_utime + current.ru_stime
+    return after - before
+
+
+def _classify_self_exit(
+    proc: subprocess.Popen, cpu_baseline: resource.struct_rusage, soft_cpu_limit_seconds: float
+) -> str | None:
+    """子プロセスが自分で終了した直後に、それが `RLIMIT_CPU`（ワーカー自身が
+    `cli.py::_apply_rlimit_cpu_backstop` で設定するソフト上限）による自己終了か
+    どうかを判定する（P1）。
+
+    ソフト上限到達時の既定動作は `SIGXCPU` によるプロセスの終了なので、通常は
+    `returncode == -signal.SIGXCPU` で検出できる。ワーカーが `SIGXCPU` を
+    キャッチ・無視していた場合はハード上限で `SIGKILL` されるため、その場合は
+    「消費した CPU 時間がソフト上限以上か」で判定する（`SIGKILL` は OOM killer・
+    外部からの kill でも起こりうるため、CPU 消費量で区別する）。
+    いずれにも該当しなければ `None`（呼び出し元が通常の終了処理・
+    シグナル終了の判定を続ける）。
+    """
+    returncode = proc.returncode
+    if returncode is None or returncode >= 0:
+        return None
+    sig = -returncode
+    if sig == signal.SIGXCPU:
+        return "cpu"
+    if sig == signal.SIGKILL:
+        consumed = _cpu_seconds_consumed_by_children(cpu_baseline)
+        if consumed >= soft_cpu_limit_seconds:
+            return "cpu"
+    return None
+
+
 def monitor_child(
     proc: subprocess.Popen,
     *,
@@ -155,6 +202,13 @@ def monitor_child(
     （`"time"`/`"rss"`/`"monitor_failed"`）を返す（呼び出し元が `proc.wait()`
     済みであることを前提にせず、本関数が確実に終了させてから返る）。
 
+    **`RLIMIT_CPU`（`cli.py::_apply_rlimit_cpu_backstop`）による自己終了は
+    `"cpu"` として返す**（P1）: ワーカー内の kernel レベルの CPU 時間上限は
+    `time_limit_seconds` と同じ値をソフト上限に使っているため、これに達して
+    ワーカーが自ら終了した場合も「資源上限超過」（`limit_exceeded`）として扱う
+    べきで、外部からの予期しない終了（`runtime_error`）と区別する
+    （`_classify_self_exit` 参照）。
+
     **本関数は `proc.stdout` を一切読まない**（P1-1: 標準出力の読み出しは
     呼び出し元が別スレッドで並行して行う。本関数が読み出しを兼ねると、
     `stdout=PIPE` のバッファが埋まった子プロセスがブロックし、実際には
@@ -164,11 +218,12 @@ def monitor_child(
     （`sys.executable -c "..."`）に対して呼ぶことで、実際の学習ワーカーを
     起動せずに監視ロジックを検証する。
     """
+    cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
     while True:
         try:
             proc.wait(timeout=poll_interval)
-            return None
+            return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         except subprocess.TimeoutExpired:
             pass
         if time.monotonic() > deadline:
@@ -420,6 +475,17 @@ def _spawn_worker_and_finalize(
         contract.cleanup_reservation(reservation)
         _emit(payload)
         return ExitCode(returncode)
+
+    # P0: 確定（rename）の直前に、保持し続けている tmp_fd（名前を再解決しない）
+    # に対して model.onnx の SHA-256 が artifact.json の記録と一致するかを
+    # 確認する（AGENTS.md ガード層「完全性と版」・REQ-39。artifact.py の
+    # モジュール docstring 参照）。不一致・欠落は出力を確定させない。
+    try:
+        artifact_mod.verify_output(reservation.tmp_fd)
+    except WorkerError as e:
+        contract.cleanup_reservation(reservation)
+        _emit({"status": "error", "code": e.code, "message": e.message})
+        return e.exit_code
 
     try:
         contract.finalize_out_dir(reservation)

@@ -114,6 +114,53 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
+def test_cli_train_succeeds_with_large_stdout_payload(tmp_path: Path) -> None:
+    """`supervisor.py::_drain_stdout` が別スレッドでパイプを溜めずに読み進める
+    ことで、ワーカーの標準出力が OS のパイプ容量（一般的に 64KiB 程度）を
+    大きく超えても（本テストは `label_order` を 1024 件 × 約 200 バイトにして
+    artifact の JSON 応答を肥大化させる）、監視がブロックによる誤検知
+    〔`limit_exceeded`〕を起こさず正常終了すること（exit 0）。
+    """
+    label_order = [f"label-{i:04d}-" + "x" * 190 for i in range(1024)]
+    assert all(len(label.encode("utf-8")) <= 256 for label in label_order)
+
+    train_path = tmp_path / "train.jsonl"
+    rows = []
+    for i in range(12):
+        rows.append({"input": f"alpha alpha beta gamma {i}", "label": label_order[0]})
+        rows.append({"input": f"delta delta epsilon zeta {i}", "label": label_order[1]})
+    train_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": label_order,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    result = _run_cli(request_path)
+    assert result.returncode == 0, (result.returncode, result.stdout[:500], result.stderr[:2000])
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    # パイプ容量（64KiB 程度）を明確に超える大きさであることの確認。
+    assert len(lines[0].encode("utf-8")) > 64 * 1024
+    payload = json.loads(lines[0])
+    assert payload["status"] == "ok"
+    assert payload["artifact"]["label_order"] == label_order
+    assert (out_dir / "artifact.json").exists()
+    assert (out_dir / "model.onnx").exists()
+
+
 def test_cli_train_exceeding_rss_limit_is_killed_and_cleaned_up(tmp_path: Path) -> None:
     """P0-2: 実際にワーカー（mlx を import する本物のプロセス）を起動しても、
     極小の `rss_limit_bytes` を与えればスーパーバイザーが強制終了し、

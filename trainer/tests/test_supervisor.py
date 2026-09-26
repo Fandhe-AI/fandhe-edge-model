@@ -107,6 +107,42 @@ def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.Monk
         _reap(proc)
 
 
+def test_monitor_child_maps_rlimit_cpu_self_kill_to_limit_exceeded() -> None:
+    """P1: ワーカー自身が `RLIMIT_CPU`（`cli.py::_apply_rlimit_cpu_backstop` と
+    同様の、自プロセスへのソフト上限設定）に達して自己終了した場合、
+    `runtime_error` ではなく `limit_exceeded` として扱われること（`"cpu"` が
+    返り、呼び出し元〔`_spawn_worker_and_finalize`〕はこれを他の強制終了理由と
+    同じく `ExitCode.LIMIT_EXCEEDED` へ写す）。
+
+    ダミーの子プロセスが自分で `resource.setrlimit(RLIMIT_CPU, (1, 1))` を
+    設定してから busy-loop することで、監視側からの強制終了ではなく、
+    カーネルによる `SIGXCPU` での自己終了を再現する。
+    """
+    code = (
+        "import resource\n"
+        "resource.setrlimit(resource.RLIMIT_CPU, (1, 1))\n"
+        "x = 0\n"
+        "while True:\n"
+        "    x += 1\n"
+    )
+    proc = _spawn(code)
+    try:
+        t0 = time_mod.monotonic()
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60.0,  # 壁時計では打ち切られない大きさにする
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        elapsed = time_mod.monotonic() - t0
+        assert reason == "cpu"
+        assert elapsed < 10.0  # ソフト上限（1 秒）＋ポーリング遅延程度で終わっていること
+        assert proc.poll() is not None
+    finally:
+        _reap(proc)
+
+
 def test_parse_worker_stdout_accepts_single_json_object() -> None:
     payload = supervisor._parse_worker_stdout(b'{"status": "ok"}\n')
     assert payload == {"status": "ok"}
