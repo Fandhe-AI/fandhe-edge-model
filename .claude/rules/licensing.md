@@ -7,7 +7,7 @@
 
 ## 依存ライセンス
 
-- 依存は MIT / Apache-2.0 / BSD / ISC / Unlicense / Zlib 等の permissive ライセンスに限る（`deny.toml` の許可リスト。`deny.toml` は未追加）
+- 依存は MIT / Apache-2.0 / BSD / ISC / Unlicense / Zlib 等の permissive ライセンスに限る（`deny.toml` の許可リスト）
 - GPL / LGPL / AGPL 系・MPL-2.0 等のコピーレフト系の依存は導入しない
 - `cargo deny check licenses`（`make deny`・`make ci`・CI の rust-ci に含まれる）で許可外ライセンスを検出したら fail させる。Python 依存は `cargo deny` の対象外のため、導入時に手動確認する
 

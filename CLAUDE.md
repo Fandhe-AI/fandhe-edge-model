@@ -26,7 +26,9 @@ fandhe-edge-model/
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── .markdownlint.jsonc / .markdownlintignore / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── Cargo.toml / deny.toml / lefthook.yml  #（予定）workspace 定義・cargo-deny 設定・git hooks
+├── deny.toml                       # cargo-deny 設定（HAS_CARGO 等が揃うまで Makefile 側でスキップ）
+├── lefthook.yml                    # git hooks 定義（`make hooks` で導入。未導入の間は動作しない）
+├── Cargo.toml                      #（予定）workspace 定義
 ├── crates/                        #（予定）6 層に対応する crate 群（共通コア・データ契約・評価器・推論ランタイム・CLI 等）
 ├── （学習ワーカー）               #（予定）Python（MLX）または Rust。配置・言語は未確定
 ├── docs/
