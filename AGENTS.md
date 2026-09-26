@@ -27,7 +27,8 @@ make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
 make test        # cargo test --workspace（既定 feature）
 make deny        # cargo deny --locked check advisories bans licenses sources
-make ci          # lint-docs + check-workspace-manifest + 上記 4 つを一括実行
+make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest（uv run --locked）
+make ci          # lint-docs + check-workspace-manifest + 上記 5 つを一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
 
@@ -35,7 +36,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 - workspace 作成後の PR からは、PR 本文にこれらのコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#![allow(...)]` や、`unsafe` 関連 lint・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化・浮動小数の許容差の拡大で CI を通す差分は P0（回帰検出の後退を招くため）
-- 学習ワーカーを Python で実装する場合、ruff（`ruff check`・`ruff format --check`）・pytest の Makefile ターゲットと CI への組み込みを伴っているか（`.claude/rules/coding-python.md`）。Python コードを追加しながら検証経路が無い差分は P1
+- 学習ワーカーは `trainer/` の Python（uv プロジェクト）で実装する（オーナー判断 2026-09-27）。`trainer/` のコードは `make py-ci` と `python-ci.yml` で検証される。ruff の設定（特に `S` ルール）の緩和・`# noqa` による理由なしの抑止・`uv.lock` を更新しない依存変更は P1（`.claude/rules/coding-python.md`）
 
 ### 実機前提テスト
 
@@ -138,5 +139,6 @@ make doctor      # 環境診断のみ（何も導入しない）
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか。`${{ }}` を `run` へ直接埋め込まず `env` 経由で渡しているか | P0 |
 | `ci.yml` の現状 | `ci.yml` は準備が整うまで発火条件を無効化中（`workflow_dispatch` のみ）であり、workspace（`Cargo.toml`）・メンバー crate・`deny.toml` の作成後に `pull_request` / `push` を有効化し、ruleset の必須チェックへ `ci-complete` を登録する設計であることを踏まえ、この無効化自体を指摘しない | 指摘しない（既知の暫定状態） |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、集約ジョブ `ci-complete` の `needs` に全ジョブが含まれているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
+| 必須チェック名の変更 | ジョブ ID・`name:` の変更で check 名（`codex / *`・`python-ci`）が変わる差分に、ruleset の必須チェックの更新手順（マージ前の置換）が PR 本文に記載されているか。旧名のまま残ると全チェック pass でもマージがブロックされる | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象 crate 名・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
 | `update-external.yml` の `runner-json` | `runner-json` は folded block scalar（`>-`）で JSON 文字列 `"ubuntu-latest"`（二重引用符込み、バックスラッシュなし）を渡す正しい記法であり、`fromJSON` で `ubuntu-latest` に解決される。エスケープの誤りとして指摘しない | 指摘しない（正しい記法） |

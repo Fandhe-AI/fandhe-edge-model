@@ -1,0 +1,56 @@
+# 学習ワーカー（学習ワーカー層。REQ-18〜20/19b。ジョブ管理 REQ-34 は Rust 側）の
+# self-contained uv プロジェクト。
+#
+# 将来の Rust workspace ルートとは別ディレクトリに切り出している理由:
+# 推論ランタイムは学習側（Python・MLX・学習用依存）に一切依存しない（REQ-32）。
+# `trainer/` を独立した uv プロジェクトとして分離することで、この境界を
+# ディレクトリ構造そのもので可視化する（依存関係の混入をレビューで見つけやすくする）。
+#
+# 依存方針（.claude/rules/dependency-policy.md）: 依存最小・ユーザー承認制・完全固定。
+# 2026-09-27 時点でオーナーが承認した依存は uv 0.12.19 / ruff 0.16.9 / pytest 9.1.1 の
+# 3 件のみ（pytest の推移的依存 iniconfig/packaging/pluggy/pygments は uv.lock 経由で
+# 付随。いずれも permissive ライセンス）。mlx・numpy・ビルドバックエンド（hatchling 等）は
+# 未承認のため、本ファイルには追加していない（学習ロジック未着手のため実行時依存も無し）。
+[project]
+name = "fandhe-edge-model-trainer"
+version = "0.0.0"
+description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口のスタブ）"
+requires-python = "==3.12.*"
+license = "MIT OR Apache-2.0"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff==0.16.9", "pytest==9.1.1"]
+
+[tool.uv]
+# `Cargo.toml` の `=x.y.z` 完全固定方針に合わせ、uv 自体のバージョンも固定する
+# （Makefile の UV_VERSION と同期させる。乖離時は本ファイルを正とし Makefile を追従させる）。
+required-version = "==0.12.19"
+# ビルドバックエンドを持たない（配布パッケージを作らないスタブのため）。
+# pytest はソース配置 + `[tool.pytest.ini_options] pythonpath` で解決する。
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# S（bandit 相当）で coding-python.md が禁じる pickle・eval/exec・非 safe yaml.load・
+# shell=True 等の危険な読み込み・実行パターンを機械検出する。
+select = ["E", "F", "W", "I", "B", "UP", "S", "PT", "RUF"]
+# 日本語コメント・docstring 中の全角記号（（）・：・〜等）は ambiguous-unicode 判定
+# （RUF001/002/003）に確実に抵触する。日本語での記述は
+# .claude/rules/japanese-style.md・code-comment-style.md の必須要件のため、
+# ASCII 記号への書き換えではなくルール側を無効化して対応する。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest の assert はテストの本質であり bandit S101（assert 使用）の対象外とする
+"tests/*" = ["S101"]

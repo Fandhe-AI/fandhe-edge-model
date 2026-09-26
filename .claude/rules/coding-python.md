@@ -1,18 +1,19 @@
 # Python コーディング規約（学習ワーカー）
 
-学習ワーカーの実装言語は未確定（Python〔MLX〕か Rust〔candle 等〕か。`04-requirements.md` L873 付近で「本フェーズでは確定しない」）。本規約は Python で実装する部分に適用し、配置・ツールの確定時に更新する。
+学習ワーカーは当面 Python（MLX）で実装する（オーナー判断 2026-09-27。Rust の環境調整中のため。spec は学習側の Rust 化範囲を「本フェーズでは確定しない」としている〔`04-requirements.md` L876 付近〕）。配置は `trainer/`（uv プロジェクト）。本規約は `trainer/` 配下に適用する。
 
 ## 位置づけと境界
 
 - Python は学習ワーカー（候補学習・選定・書き出し）にのみ使う。**推論ランタイム・配布パッケージ・CLI コアに Python を持ち込まない**（REQ-32。Python・MLX が PATH に無い `env -i` 環境でも推論が成功すること）
 - Rust 側（CLI・ジョブ管理）とは子プロセス＋JSON で通信する。入出力の JSON スキーマは Rust 側の定義を正とし、Python 側で独自のフィールドを増やさない
-- PoC の Python スクリプト（`calibrate.py`・`stats_mcnemar.py`・`split_train.py`・`train_mlx.py`・`selector.py` 等）のうち、評価器・分割・選定・統計は Rust へ書き直す計画（`06-roadmap.md` L324 付近）。Python 側に評価ロジックを再実装しない（評価器は TASK-24.1 の 1 つだけ）
+- ロードマップ（`06-roadmap.md` L322〜326 付近）は PoC の Python スクリプト（`calibrate.py`・`stats_mcnemar.py`・`split_train.py`・`train_mlx.py`・`selector.py` 等）の Rust への書き直しを想定している。当面 Python とする判断（2026-09-27）で Python 側に残すのは学習処理に限り、分割（データ契約）・統計・評価（評価器）は Rust 側の層に置く。Python 側に評価ロジックを再実装しない（評価器は TASK-24.1 の 1 つだけ）
 
 ## ツール
 
-- 整形・lint は ruff（`ruff format`・`ruff check`）、テストは pytest、環境・lock は uv を想定する（導入・バージョン固定は依存追加としてユーザー承認を経る。[dependency-policy](./dependency-policy.md)）
-- `pyproject.toml` で依存を `==x.y.z` 固定し、lock ファイルをコミットする。Python の版も固定する
-- ruff / pytest の Makefile ターゲット・CI 組み込みは Python コードの追加時に infra-builder が行う（[ci](./ci.md)）
+- 整形・lint は ruff（`ruff format`・`ruff check`。bandit 系の `S` ルールで `pickle`・`eval`・`shell=True` 等を機械検出する）、テストは pytest、環境・lock は uv（いずれも 2026-09-27 ユーザー承認済み。版は `trainer/pyproject.toml` と Makefile の `UV_VERSION` が正）
+- `trainer/pyproject.toml` で依存を `==x.y.z` 固定し、`trainer/uv.lock` をコミットする。Python の版は `trainer/.python-version` で固定する。依存の追加・更新はユーザー承認を経る（[dependency-policy](./dependency-policy.md)）
+- 検証は `make py-ci`（`py-fmt-check`・`py-lint`・`py-test`。`uv run --locked` で lock を暗黙更新しない）。CI は `.github/workflows/python-ci.yml`（[ci](./ci.md)）
+- MLX を導入したら、MLX を使うテストは macOS（arm64）で CPU 実行し、Metal に依存するテストは実機前提テストとして既定の集合から分離する
 
 ## コーディング
 

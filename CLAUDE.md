@@ -22,7 +22,7 @@ fandhe-edge-model/
 ├── LICENSE-MIT / LICENSE-APACHE   # MIT OR Apache-2.0 デュアルライセンス
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
-├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・ci・clean。`make help`）
+├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・py-*（ruff・pytest）・ci・clean。`make help`）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── .markdownlint.jsonc / .markdownlintignore / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── skills-lock.json               # 導入スキルのロックファイル
@@ -30,10 +30,10 @@ fandhe-edge-model/
 ├── lefthook.yml                    # git hooks 定義（`make hooks` で導入。未導入の間は動作しない）
 ├── Cargo.toml                      #（予定）workspace 定義
 ├── crates/                        #（予定）6 層に対応する crate 群（共通コア・データ契約・評価器・推論ランタイム・CLI 等）
-├── （学習ワーカー）               #（予定）Python（MLX）または Rust。配置・言語は未確定
+├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。学習ロジックは未実装の雛形
 ├── docs/
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external（稼働）/ ci・release（発火条件無効化中）
+├── .github/workflows/             # ai-review・python-ci・update-external（稼働）/ ci・release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義（research / implement / testing / quality / docs）
@@ -59,7 +59,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | explorer | evaluator-builder |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | explorer | runtime-builder |
 | 操作アダプター（CLI・TUI・MCP / Codex・ガード層。REQ-33/35〜39） | explorer | adapter-builder |
-| `Cargo.toml`・`pyproject.toml`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | explorer | infra-builder |
+| `Cargo.toml`・`trainer/pyproject.toml`・`trainer/uv.lock`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | explorer | infra-builder |
 | `docs/spec/`（private） | explorer | 変更しない（spec リポ側で管理） |
 | 外部仕様（ONNX / `ort`・MLX・candle / burn・MCP・統計手法）・依存候補 | reference-researcher | — |
 | テスト・lint | test-runner / linter | — |
@@ -121,7 +121,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **ローカル検証**: `make fmt-check`・`make lint`・`make test`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。環境診断は `make doctor`。Makefile の `skip:` を検証済みと扱わない。ビルド・テストは `docs/spec` 抜きで成立させる
+- **ローカル検証**: `make fmt-check`・`make lint`・`make test`（学習ワーカーは `make py-ci`。まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。環境診断は `make doctor`。Makefile の `skip:` を検証済みと扱わない。ビルド・テストは `docs/spec` 抜きで成立させる
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列・JSON は英語）
 - **Conventional Commits**: `--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋ガード層（REQ-39）・ローカル完結（REQ-38）を確認

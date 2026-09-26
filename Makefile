@@ -1,18 +1,22 @@
 # fandhe-edge-model の開発タスクランナー。
 #
-# `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
-# `make ci` でローカル検証（CI の ci.yml と同等のローカルゲート）を一括実行する。
-# `make doctor` は環境診断のみを行い、何も導入・変更しない。
+# `make setup` 一発で開発環境（サブモジュール・rustup・lefthook・学習ワーカーの
+# 仮想環境同期）を構築し、`make ci` でローカル検証（CI の ci.yml・python-ci.yml と
+# 同等のローカルゲート）を一括実行する。`make doctor` は環境診断のみを行い、
+# 何も導入・変更しない。
 #
-# Makefile は薄い入口（thin entry point）であり、実処理の定義は cargo・各 lint ツール・
-# CI（.github/workflows/ci.yml → Fandhe-AI/actions の reusable workflow）が持つ。
-# Make 側で独自の依存グラフ・増分判定は持たない（make スキルの責務分離方針）。
+# Makefile は薄い入口（thin entry point）であり、実処理の定義は cargo・uv・各 lint ツール・
+# CI（.github/workflows/ci.yml → Fandhe-AI/actions の reusable workflow・
+# .github/workflows/python-ci.yml）が持つ。Make 側で独自の依存グラフ・増分判定は
+# 持たない（make スキルの責務分離方針）。
 #
 # 実装は未着手（Cargo.toml・`crates/` 配下の実クレート未追加）のため、cargo 系ターゲットは
 # HAS_CARGO / HAS_MEMBERS 判定でスキップし、workspace 作成後に自動で有効化される
 # （冪等セルフヒール。deny も deny.toml + Cargo.toml + メンバー crate が揃った時点で、
-# hooks も lefthook.yml が追加された時点で有効化）。スキップ時は必ず `skip:` を表示し、
-# 実行したかのように黙って成功扱いにはしない。
+# hooks も lefthook.yml が追加された時点で有効化）。学習ワーカー（trainer/。Python・uv）の
+# py-* 系ターゲットも同様に HAS_PY（trainer/pyproject.toml の有無）判定でスキップし、
+# 追加時点で自動有効化される。スキップ時は必ず `skip:` を表示し、実行したかのように
+# 黙って成功扱いにはしない。
 # Fandhe-AI/fandhe-container の Makefile と同一方針。GNU Make 3.81 で動作する構文のみを使う。
 
 .DEFAULT_GOAL := help
@@ -33,6 +37,12 @@ HAS_LEFTHOOK := $(wildcard lefthook.yml)
 # 判定する。
 HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
 
+# 学習ワーカー（trainer/。Python・uv 管理。REQ-18〜20/19b）の有無。
+# 推論ランタイムは学習側に依存しない（REQ-32）ため、将来の Rust workspace ルートとは
+# 別ディレクトリに切り出している。未追加の間 py-* 系ターゲットはスキップする
+PY_DIR := trainer
+HAS_PY := $(wildcard trainer/pyproject.toml)
+
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
 # 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
 # EC_NPM_VERSION のみ npm ラッパーパッケージの版（CI は Go バイナリ release タグ v3.8.0 を
@@ -46,6 +56,10 @@ COMMITLINT_CONFIG_VERSION := 21.2.0
 # 導入系ツールの固定バージョン（`=x.y.z` 完全固定方針に合わせ exact 固定）。
 LEFTHOOK_VERSION := 2.1.10
 CARGO_DENY_VERSION := 0.20.2
+# trainer/pyproject.toml の [tool.uv] required-version と同一の値を維持する
+# （pyproject.toml 側を正とし、乖離したらこちらを追従させる。乖離したまま放置すると
+# uv 自身が required-version 違反で fail するため、更新時は 2 箇所を同時に直す）
+UV_VERSION := 0.12.19
 
 .PHONY: help
 help: ## ターゲット一覧を表示する
@@ -81,6 +95,16 @@ doctor: ## 開発環境を診断する（導入・変更は一切しない。必
 			printf 'warn  %-16s （任意。未導入の場合は該当ターゲットが導入案内または自動導入を行う）\n' "$$tool"; \
 		fi; \
 	done; \
+	if command -v uv >/dev/null 2>&1; then \
+		uv_ver=$$(uv --version 2>/dev/null | awk '{print $$2}'); \
+		if [ "$$uv_ver" = "$(UV_VERSION)" ]; then \
+			printf 'ok    %-16s %s\n' uv "$$uv_ver"; \
+		else \
+			printf 'warn  %-16s %s （固定版 $(UV_VERSION) と不一致。trainer/pyproject.toml の required-version が拒否します）\n' uv "$$uv_ver"; \
+		fi; \
+	else \
+		printf 'warn  %-16s （任意。py-* ターゲットに必要。brew install uv や https://docs.astral.sh/uv/ を参照）\n' uv; \
+	fi; \
 	if [ -f docs/spec/.git ] || [ -d docs/spec/.git ]; then \
 		echo 'ok    docs/spec        submodule 取得済み'; \
 	else \
@@ -92,12 +116,16 @@ doctor: ## 開発環境を診断する（導入・変更は一切しない。必
 	fi
 
 # 依存ターゲット並記だと -j 実行時に順序が保証されず、cargo フォールバックを持つ hooks が
-# rustup より先に走りうるため、再帰 make で「submodule → rustup → hooks」の順を明示する。
+# rustup より先に走りうるため、再帰 make で「submodule → rustup → hooks → py-sync」の
+# 順を明示する（py-sync は uv 未導入・trainer/pyproject.toml 未追加ならそれぞれ
+# 自身で fail-closed / skip する。hooks より後ろに置く積極的な理由は無いが、
+# 既存 3 ステップの後ろに素直に追加する）。
 .PHONY: setup
-setup: ## 開発環境を一括構築する（サブモジュール → rustup → lefthook の順を保証）
+setup: ## 開発環境を一括構築する（サブモジュール → rustup → lefthook → 学習ワーカー同期の順を保証）
 	$(MAKE) submodule
 	$(MAKE) rustup
 	$(MAKE) hooks
+	$(MAKE) py-sync
 	@echo "setup 完了"
 
 # rustup は前提条件として確認のみ行い、自動導入はしない。取得したインストーラを検証なしに
@@ -266,8 +294,72 @@ else
 	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
 
+# --------------------------------------------------
+# 品質チェック（Python 学習ワーカー。trainer/pyproject.toml 追加後に有効化）
+# --------------------------------------------------
+# uv 0.12.19 を経由してのみ実行する（uv 未導入時は curl|sh 等の自動導入をしない。
+# rustup ターゲットと同一のサプライチェーン方針）。`--locked` を必ず付け、
+# lock ファイルと pyproject.toml が食い違う場合は fail-closed で止める
+# （uv sync が lock を無言で書き換えることを防ぐ）。
+
+# uv 自体の有無を確認するヘルパ（無ければ導入方法を案内して停止する）
+define require_uv
+	if ! command -v uv >/dev/null 2>&1; then \
+		echo "error: uv が見つかりません。brew install uv（バージョン $(UV_VERSION) 系）または https://docs.astral.sh/uv/getting-started/installation/ の公式手順で導入してから再実行してください" >&2; \
+		exit 1; \
+	fi
+endef
+
+.PHONY: py-sync
+py-sync: ## uv sync --locked で学習ワーカーの仮想環境を lock どおりに同期する
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv sync --locked --directory $(PY_DIR)
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため py-sync をスキップ"
+endif
+
+.PHONY: py-fmt
+py-fmt: ## ruff format で学習ワーカーのソースを整形する（書き換える）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --locked --directory $(PY_DIR) ruff format .
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt をスキップ"
+endif
+
+.PHONY: py-fmt-check
+py-fmt-check: ## ruff format --check（整形差分の検出。書き換えない）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --locked --directory $(PY_DIR) ruff format --check .
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt-check をスキップ"
+endif
+
+.PHONY: py-lint
+py-lint: ## ruff check（学習ワーカーの lint ゲート。S ルールで危険な逆シリアル化等を検出）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --locked --directory $(PY_DIR) ruff check .
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため py-lint をスキップ"
+endif
+
+.PHONY: py-test
+py-test: ## pytest（学習ワーカーのテスト）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --locked --directory $(PY_DIR) pytest
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため py-test をスキップ"
+endif
+
+.PHONY: py-ci
+py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲートを一括実行する
+
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（CI の ci.yml と同等のチェック）を一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint test deny py-ci ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
 
 # --------------------------------------------------
 # 後片付け

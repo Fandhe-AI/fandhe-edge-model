@@ -4,7 +4,10 @@
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
-# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+# - trainer/pyproject.toml 未追加の間、学習ワーカー（Python）系ジョブも同様にスキップする
+#   （Makefile の HAS_PY 判定と同一方針）
+# - 重いチェック（clippy・test・ruff check・pytest）は pre-push に置き、
+#   pre-commit は整形チェックのみで軽量に保つ
 
 pre-commit:
   parallel: true
@@ -20,6 +23,19 @@ pre-commit:
           rustfmt --edition "${ed:-2024}" --check -- {staged_files}
         else
           echo "skip: Cargo.toml 未追加または rustfmt 未導入"
+        fi
+
+    # staged の trainer/**/*.py 変更を検出したら trainer プロジェクト全体を
+    # ruff format --check する（{staged_files} は uv run --directory の cwd 変更後は
+    # リポジトリルート相対のままになり、一部ファイルだけを渡すのは事故のもとのため、
+    # 軽量な単一プロジェクトの現状は全体チェックで代替する）
+    - name: ruff-format-check
+      glob: "trainer/**/*.py"
+      run: |
+        if [ -f trainer/pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+          uv run --locked --directory trainer ruff format --check .
+        else
+          echo "skip: trainer/pyproject.toml 未追加または uv 未導入"
         fi
 
     # 秘密情報の混入検査（.claude/rules/security.md）。資格情報ファイルの stage を拒否する。
@@ -144,4 +160,12 @@ pre-push:
           make test
         else
           echo "skip: Cargo.toml 未追加"
+        fi
+    # 学習ワーカー（trainer/）の lint・test。Cargo.toml 系と同様、未追加ならスキップする
+    - name: py-lint-test
+      run: |
+        if [ -f trainer/pyproject.toml ]; then
+          make py-lint py-test
+        else
+          echo "skip: trainer/pyproject.toml 未追加"
         fi

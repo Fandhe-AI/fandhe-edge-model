@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); [ -n \"$f\" ] && [ -f \"$f\" ] || exit 0; case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 || exit 0; ed=$(sed -n \"s/^edition *= *\\\"\\\\([0-9]\\\\{4\\\\}\\\\)\\\".*/\\\\1/p\" \"${CLAUDE_PROJECT_DIR:-.}/Cargo.toml\" 2>/dev/null | head -n1); rustfmt --edition \"${ed:-2024}\" \"$f\" || true ;; *.py) command -v ruff >/dev/null 2>&1 || exit 0; ruff format --quiet \"$f\" || true ;; esac; exit 0'"
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); [ -n \"$f\" ] && [ -f \"$f\" ] || exit 0; case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 || exit 0; ed=$(sed -n \"s/^edition *= *\\\"\\\\([0-9]\\\\{4\\\\}\\\\)\\\".*/\\\\1/p\" \"${CLAUDE_PROJECT_DIR:-.}/Cargo.toml\" 2>/dev/null | head -n1); rustfmt --edition \"${ed:-2024}\" \"$f\" || true ;; *.py) rb=\"${CLAUDE_PROJECT_DIR:-.}/trainer/.venv/bin/ruff\"; if [ -x \"$rb\" ]; then \"$rb\" format --quiet \"$f\" || true; elif command -v ruff >/dev/null 2>&1; then ruff format --quiet \"$f\" || true; fi ;; esac; exit 0'"
           }
         ]
       }
