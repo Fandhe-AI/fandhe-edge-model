@@ -6,19 +6,22 @@
 make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make test        # cargo test --workspace
+make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest
 make ci          # 上記 + lint-docs + check-workspace-manifest + deny を一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
 
 - テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed）
 - `Cargo.toml`・メンバー crate・`deny.toml` が未作成の間、cargo 系ターゲットは Makefile 側で `skip:` を表示してスキップされる（HAS_CARGO / HAS_MEMBERS / HAS_DENY）。スキップを「検証済み」と報告しない
-- Python の学習ワーカーを追加したら、ruff / pytest のターゲットを `Makefile` と `ci` に組み込む（[coding-python](./coding-python.md)。infra-builder の担当）
+- 学習ワーカー（Python）の ruff / pytest は `make py-ci` として `make ci` に組み込み済み（[coding-python](./coding-python.md)）。`trainer/pyproject.toml` が無い場合は `skip:` になるが、CI（python-ci.yml）は `trainer/` の欠落を失敗として扱う
 
 ## CI の構成
 
 - `.github/workflows/ci.yml`: lint-docs（Fandhe-AI/actions）・rust-ci（fmt / clippy / test / deny を 3 OS matrix）・rust-ci-default-features・集約ジョブ `ci-complete`。**発火条件は無効化中**（workspace・メンバー crate・`deny.toml` の作成後に有効化し、ruleset の必須チェックへ `ci-complete` を登録する）
 - `.github/workflows/release.yml`: crates.io 公開。**発火条件は無効化中**（公開 crate 名と公開方針の確定後に有効化）
+- `.github/workflows/python-ci.yml`: 稼働中。学習ワーカーの `make py-ci` を ubuntu で実行する（ci.yml の有効化後は `ci-complete` への統合を検討する）
 - `.github/workflows/ai-review.yml`・`update-external.yml`: 稼働中（ai-review は Actions 変数 `CODEX_HOME_DIR` 設定までスキップ）
+- ruleset `main-protection` の必須チェック: `codex / preflight`・`codex / review`・`codex / post_feedback`・`python-ci`（GitHub Actions に束縛）と `Cursor Bugbot`（Cursor App に束縛）。implement-issue-tree の自動マージ（`autoMerge: true`）は PR HEAD に報告される全チェックの必須化を前提とするため、チェックを追加・改名する workflow 変更では、マージ前に ruleset を新しいチェック名へ更新する
 
 ## 実機前提テスト
 
