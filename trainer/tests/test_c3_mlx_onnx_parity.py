@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 from onnx.reference import ReferenceEvaluator
 
-from conftest import ATOL_MLX_ONNX, export_onnx_to_path, make_examples, make_request
+from conftest import ATOL_MLX_ONNX, export_onnx_to_path, make_examples, make_request, train_c3
 from fandhe_edge_trainer.encoding import encode_bytes
 from fandhe_edge_trainer.kinds.c3 import C3Kind, _batchify
 
@@ -24,7 +24,7 @@ from fandhe_edge_trainer.kinds.c3 import C3Kind, _batchify
 def test_mlx_forward_matches_onnx_reference(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path)
-    trained = kind.train(make_examples(), req)
+    trained = train_c3(kind, make_examples(), req)
     onnx_path = tmp_path / "model.onnx"
     export_onnx_to_path(kind, trained, onnx_path)
 

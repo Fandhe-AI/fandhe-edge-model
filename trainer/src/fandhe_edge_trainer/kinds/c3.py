@@ -286,7 +286,16 @@ class C3TrainedModel:
 class C3Kind:
     """選択口（`kinds/__init__.py`）が呼ぶ C3 の学習・書き出し実装。"""
 
-    def train(self, examples: list[TrainExample], request: TrainRequest) -> C3TrainedModel:
+    def train(
+        self,
+        examples: list[TrainExample],
+        request: TrainRequest,
+        resource_budget: budget_mod.ResourceBudget,
+    ) -> C3TrainedModel:
+        """呼び出し元（`cli.py`）が生成した `resource_budget` をそのまま使う
+        （P0-1: 学習データの読み込み・学習・書き出しを 1 つの予算として扱う。
+        ここで新しい `ResourceBudget` を作らない）。
+        """
         cfg = {**DEFAULT_CONFIG, **request.config}
         _validate_config(cfg)
         widths = tuple(int(w) for w in cfg["widths"])
@@ -306,11 +315,6 @@ class C3Kind:
         # P0-1: エンコード前に総トークン数（examples 件数 × max_bytes）の見積もりで
         # 上限を検査する（Python のリストのリストとして無検査のまま確保しない）。
         budget_mod.check_total_tokens(len(examples), request.max_bytes)
-        resource_budget = budget_mod.ResourceBudget(
-            wall_seconds=float(request.time_limit_seconds),
-            rss_bytes=request.rss_limit_bytes,
-            device=request.device,
-        )
 
         mx.set_default_device(mx.cpu if request.device == "cpu" else mx.gpu)
         mx.random.seed(request.seed)

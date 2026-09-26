@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import IO, Any, Protocol
 
+from .. import budget
 from ..contract import TrainExample, TrainRequest
 from ..errors import WorkerError
 from ..exitcode import ExitCode
@@ -37,8 +38,20 @@ class TrainedModel(Protocol):
 class Kind(Protocol):
     """モデルの種類 1 つ分の実装契約（学習・ONNX 書き出し）。"""
 
-    def train(self, examples: list[TrainExample], request: TrainRequest) -> TrainedModel:
-        """train データだけを使って学習する（validation・test は読まない）。"""
+    def train(
+        self,
+        examples: list[TrainExample],
+        request: TrainRequest,
+        resource_budget: budget.ResourceBudget,
+    ) -> TrainedModel:
+        """train データだけを使って学習する（validation・test は読まない）。
+
+        `resource_budget` は呼び出し元（`cli.py`）がリクエスト処理の開始時に
+        1 つだけ生成したインスタンス（`contract.load_train_examples` の
+        データ読み込みとも共有する。P0-1）。学習ループの中で新しい
+        `ResourceBudget` を作らず、渡された物だけを使うこと（学習データの
+        読み込み・学習・書き出しを 1 つの予算として扱う契約）。
+        """
         ...
 
     def export_onnx(self, trained: TrainedModel, out: IO[bytes]) -> None:

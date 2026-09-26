@@ -87,7 +87,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from . import guard
+from . import budget, guard
 from .encoding import normalize_input
 from .errors import WorkerError
 from .exitcode import ExitCode
@@ -263,8 +263,14 @@ def _open_confined_regular_file(
     return f, st
 
 
-def load_request(path: Path) -> TrainRequest:
-    """学習リクエスト JSON ファイルを読み、検証したうえで `TrainRequest` を返す。"""
+def read_request_dict(path: Path) -> Any:
+    """学習リクエスト JSON ファイルを読み、パースだけ行う（フィールド検証はしない）。
+
+    `load_request` の内部処理と、`supervisor.py`（軽量なスーパーバイザー。
+    mlx・onnx・numpy を import しない設計。P0-2）が異常終了時の後始末のために
+    経路の文字列（`root`・`out_dir`）だけを覗き見る用途との両方から使う。
+    フィールド検証（`validate_request`）は行わないため、返り値は未検証の辞書。
+    """
     f, st = _open_regular_file(path, _invalid)
     try:
         if st.st_size > MAX_REQUEST_BYTES:
@@ -281,15 +287,20 @@ def load_request(path: Path) -> TrainRequest:
     except UnicodeDecodeError as e:
         raise _invalid(f"request file not readable as utf-8: {type(e).__name__}") from e
     try:
-        parsed = _json_loads_strict(text)
+        return _json_loads_strict(text)
     except json.JSONDecodeError as e:
         raise _invalid(f"request is not valid JSON: {e.msg} at line {e.lineno}") from e
     except ValueError as e:
         raise _invalid(f"request JSON rejected: {type(e).__name__}") from e
-    return _validate_request(parsed)
 
 
-def _validate_request(raw: Any) -> TrainRequest:
+def load_request(path: Path) -> TrainRequest:
+    """学習リクエスト JSON ファイルを読み、検証したうえで `TrainRequest` を返す。"""
+    parsed = read_request_dict(path)
+    return validate_request(parsed)
+
+
+def validate_request(raw: Any) -> TrainRequest:
     if not isinstance(raw, dict):
         raise _invalid("request must be a JSON object")
     unknown = set(raw) - _REQUEST_FIELDS
@@ -399,7 +410,13 @@ def _validate_label_order(label_order: Any) -> None:
         seen.add(label)
 
 
-def load_train_examples(entry: guard.ConfinedEntry, label_order: list[str]) -> list[TrainExample]:
+def load_train_examples(
+    entry: guard.ConfinedEntry,
+    label_order: list[str],
+    *,
+    resource_budget: budget.ResourceBudget | None = None,
+    check_every: int = 1024,
+) -> list[TrainExample]:
     """学習データ（JSONL）を読み、検証したうえで `TrainExample` の一覧を返す。
 
     `entry` は `guard.confine` で得た `train_path` の `ConfinedEntry`（本関数が
@@ -413,6 +430,13 @@ def load_train_examples(entry: guard.ConfinedEntry, label_order: list[str]) -> l
     バイト数（JSON パース・NFKC 正規化の前に検査。巨大な 1 行によるメモリ確保を
     防ぐ）、(2) 累積読み取りバイト数（`st_size` の後にファイルが伸長される場合に
     備え、実際に読んだ量でも判定する）、(3) 検証を通過した examples の件数。
+
+    `resource_budget` を渡すと、`check_every` 行ごと（既定 1024）に
+    `resource_budget.check()`（壁時計・RSS。`budget.py` 参照）を呼ぶ（P0-1:
+    最大 64 MiB・20 万件の学習データを読み込む処理自体も、学習ジョブ全体の
+    資源上限の対象にする。呼び出し元〔`cli.py`〕が学習ループ・ONNX 書き出しと
+    **同じ** `ResourceBudget` インスタンスを渡すことで、リクエスト全体を通じた
+    単一の予算として扱う）。
     """
     label_set = set(label_order)
     examples: list[TrainExample] = []
@@ -471,8 +495,13 @@ def load_train_examples(entry: guard.ConfinedEntry, label_order: list[str]) -> l
             if len(examples) >= MAX_TRAIN_EXAMPLES:
                 raise _limit(f"train data exceeds {MAX_TRAIN_EXAMPLES} examples limit")
             examples.append(TrainExample(input=text, label=label))
+            if resource_budget is not None and lineno % check_every == 0:
+                resource_budget.check()
     finally:
         f.close()
+
+    if resource_budget is not None:
+        resource_budget.check()  # 端数分（check_every の倍数に満たない残り）の確認
 
     if not examples:
         raise WorkerError(
@@ -546,7 +575,7 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         reserved_id: ReservedId = (st.st_dev, st.st_ino)
-        tmp_name = f".{name}.tmp-{secrets.token_hex(8)}"
+        tmp_name = f"{_tmp_name_prefix(name)}{secrets.token_hex(8)}"
         os.mkdir(tmp_name, 0o700, dir_fd=parent_fd)
         tmp_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except BaseException as e:
@@ -644,6 +673,48 @@ def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId
         return
     with contextlib.suppress(OSError):
         os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
+
+
+#: `prepare_out_dir` が作る作業用一時ディレクトリの接頭辞（`{name}` は out_dir の
+#: 最終コンポーネント名）。`cleanup_orphaned_reservation` がこの接頭辞に一致する
+#: ものだけを「自分のもの」とみなして掃除するために使う（名前一致だけを根拠にする）。
+def _tmp_name_prefix(name: str) -> str:
+    return f".{name}.tmp-"
+
+
+def cleanup_orphaned_reservation(entry: guard.ConfinedEntry) -> None:
+    """強制終了させた子プロセス（学習ワーカー）が残したかもしれない予約済み
+    出力を、経路の再構築（`entry` は呼び出し側が改めて `guard.confine` した
+    もの）と `entry.parent_fd` 経由の名前一致だけを根拠に片付ける。
+
+    `supervisor.py`（P0-2）が、壁時計・RSS の超過でワーカーを強制終了した直後に
+    使う。ワーカー内の `OutDirReservation`（`tmp_fd` を含む）はもう存在しない
+    （別プロセスの、既に終了したローカル変数）ため、`prepare_out_dir` と同じ
+    命名規則（`.{name}.tmp-*`）に一致するディレクトリと、空の予約済み `out_dir`
+    自体だけを対象にする。それ以外（他プロセスが書き込んだ形跡があるもの・
+    命名規則に一致しないもの）には一切触れない。
+    """
+    parent_fd = entry.parent_fd
+    name = entry.name
+    prefix = _tmp_name_prefix(name)
+    try:
+        list_fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)
+    except OSError:
+        list_fd = None
+    if list_fd is not None:
+        try:
+            candidates = [e.name for e in os.scandir(list_fd)]
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            if candidate.startswith(prefix):
+                _cleanup_tmp_contents(parent_fd, candidate)
+                with contextlib.suppress(OSError):
+                    os.rmdir(candidate, dir_fd=parent_fd)
+    with contextlib.suppress(OSError):
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
 
 
 def _release_tmp(reservation: OutDirReservation) -> None:

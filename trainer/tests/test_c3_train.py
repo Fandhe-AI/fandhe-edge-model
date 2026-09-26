@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 import pytest
 
-from conftest import TINY_CONFIG, export_onnx_to_path, make_examples, make_request
+from conftest import TINY_CONFIG, export_onnx_to_path, make_examples, make_request, train_c3
 from fandhe_edge_trainer import artifact as artifact_mod
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
@@ -21,7 +21,7 @@ def _train_and_export(tmp_path: Path, seed: int = 0) -> Path:
     kind = C3Kind()
     req = make_request(tmp_path, seed=seed)
     examples = make_examples()
-    trained = kind.train(examples, req)
+    trained = train_c3(kind, examples, req)
     onnx_path = tmp_path / f"model_{seed}.onnx"
     export_onnx_to_path(kind, trained, onnx_path)
     return onnx_path
@@ -52,7 +52,7 @@ def test_c3_artifact_fields(tmp_path: Path) -> None:
     """artifact.json が Rust 側 Artifact 構造体のフィールドと一致すること。"""
     kind = C3Kind()
     req = make_request(tmp_path)
-    trained = kind.train(make_examples(), req)
+    trained = train_c3(kind, make_examples(), req)
     art = artifact_mod.build_artifact(
         kind=req.kind,
         kind_version=req.kind_version,
@@ -91,7 +91,7 @@ def test_c3_train_rejects_wrong_type_config(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "epochs": "not-an-int"})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
@@ -101,7 +101,7 @@ def test_c3_train_rejects_even_width(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "widths": [3, 4]})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
 
 
@@ -112,7 +112,7 @@ def test_c3_train_rejects_config_upper_bound_violation(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "emb": MAX_C3_EMB + 1})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
@@ -122,7 +122,7 @@ def test_c3_train_rejects_nan_lr(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "lr": float("nan")})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
 
 
@@ -130,7 +130,7 @@ def test_c3_train_rejects_infinite_lr(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config={**TINY_CONFIG, "lr": float("inf")})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
 
 
@@ -141,7 +141,7 @@ def test_c3_train_rejects_too_many_widths(tmp_path: Path) -> None:
     widths = [2 * i + 1 for i in range(MAX_C3_WIDTHS + 1)]
     req = make_request(tmp_path, config={**TINY_CONFIG, "widths": widths})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
 
 
@@ -149,7 +149,7 @@ def test_c3_export_rejects_nonzero_pad_embedding_row(tmp_path: Path) -> None:
     """クラス docstring 3 番の不変条件（詰め物行は厳密ゼロ）を fail-closed で検証する。"""
     kind = C3Kind()
     req = make_request(tmp_path)
-    trained = kind.train(make_examples(), req)
+    trained = train_c3(kind, make_examples(), req)
 
     w = np.array(trained.model.embed.weight, dtype=np.float32)
     w[0, 0] = 1.0  # 不変条件を意図的に壊す
@@ -177,7 +177,7 @@ def test_c3_train_rejects_sample_steps_over_limit(tmp_path: Path) -> None:
     examples = [TrainExample(input="alpha beta", label="cat_a") for _ in range(n_examples)]
     req = make_request(tmp_path, config={**TINY_CONFIG, "epochs": epochs})
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(examples, req)
+        train_c3(kind, examples, req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
@@ -202,7 +202,7 @@ def test_c3_train_rejects_tiny_time_limit(tmp_path: Path, monkeypatch: pytest.Mo
     kind = C3Kind()
     req = make_request(tmp_path, config=TINY_CONFIG, time_limit_seconds=1)
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
@@ -212,7 +212,7 @@ def test_c3_train_rejects_tiny_rss_limit(tmp_path: Path) -> None:
     kind = C3Kind()
     req = make_request(tmp_path, config=TINY_CONFIG, rss_limit_bytes=1)
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
@@ -230,7 +230,7 @@ def test_c3_train_rejects_total_tokens_over_limit(tmp_path: Path) -> None:
     examples = [TrainExample(input="alpha beta", label="cat_a") for _ in range(n_examples)]
     req = make_request(tmp_path, config=TINY_CONFIG, max_bytes=max_bytes)
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(examples, req)
+        train_c3(kind, examples, req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
@@ -242,8 +242,8 @@ def test_c3_train_encoding_is_resource_bounded_and_order_preserving(tmp_path: Pa
     kind = C3Kind()
     req_a = make_request(tmp_path / "a", seed=0)
     req_b = make_request(tmp_path / "b", seed=0)
-    trained_a = kind.train(make_examples(), req_a)
-    trained_b = kind.train(make_examples(), req_b)
+    trained_a = train_c3(kind, make_examples(), req_a)
+    trained_b = train_c3(kind, make_examples(), req_b)
     onnx_a = tmp_path / "a.onnx"
     onnx_b = tmp_path / "b.onnx"
     export_onnx_to_path(kind, trained_a, onnx_a)
@@ -275,7 +275,7 @@ def test_c3_train_rejects_model_too_large_before_any_training_step(
         tmp_path, config={**TINY_CONFIG, "emb": MAX_C3_EMB, "filters": MAX_C3_FILTERS}
     )
     with pytest.raises(WorkerError) as exc_info:
-        kind.train(make_examples(), req)
+        train_c3(kind, make_examples(), req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 

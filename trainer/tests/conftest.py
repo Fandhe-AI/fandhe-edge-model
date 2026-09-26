@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from fandhe_edge_trainer import budget as budget_mod
 from fandhe_edge_trainer import guard
 from fandhe_edge_trainer.contract import TrainExample, TrainRequest
 from fandhe_edge_trainer.limits import MAX_TRAIN_RSS_BYTES, MAX_TRAIN_WALL_SECONDS
@@ -96,6 +97,25 @@ def export_onnx_to_path(kind, trained, path) -> None:
     """
     with open(path, "wb") as f:
         kind.export_onnx(trained, f)
+
+
+def make_budget(request: TrainRequest) -> budget_mod.ResourceBudget:
+    """`request` の資源上限から `ResourceBudget` を作る（本番の `cli.py::
+    run_worker_train` と同じ組み立て方。P0-1: 学習データの読み込み・学習・
+    書き出しで同じインスタンスを使い回す契約をテストでも踏襲する）。
+    """
+    return budget_mod.ResourceBudget(
+        wall_seconds=float(request.time_limit_seconds),
+        rss_bytes=request.rss_limit_bytes,
+        device=request.device,
+    )
+
+
+def train_c3(kind, examples: list[TrainExample], request: TrainRequest):
+    """`kind.train(examples, request, resource_budget)` を、テスト用に
+    `make_budget(request)` で組み立てた `ResourceBudget` を渡して呼ぶ。
+    """
+    return kind.train(examples, request, make_budget(request))
 
 
 @pytest.fixture(autouse=True)
