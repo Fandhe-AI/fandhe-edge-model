@@ -215,3 +215,80 @@ def test_c3_train_rejects_tiny_rss_limit(tmp_path: Path) -> None:
         kind.train(make_examples(), req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_c3_train_rejects_total_tokens_over_limit(tmp_path: Path) -> None:
+    """P0-1: examples 件数 × max_bytes の見積もりが上限を超える場合、
+    エンコード（Python のリストのリストとしての無制限確保）を一切行わず拒否する。
+    """
+    from fandhe_edge_trainer.contract import TrainExample
+    from fandhe_edge_trainer.limits import MAX_MAX_BYTES, MAX_TRAIN_TOTAL_TOKENS
+
+    kind = C3Kind()
+    max_bytes = MAX_MAX_BYTES  # 4096
+    n_examples = MAX_TRAIN_TOTAL_TOKENS // max_bytes + 10
+    examples = [TrainExample(input="alpha beta", label="cat_a") for _ in range(n_examples)]
+    req = make_request(tmp_path, config=TINY_CONFIG, max_bytes=max_bytes)
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(examples, req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_c3_train_encoding_is_resource_bounded_and_order_preserving(tmp_path: Path) -> None:
+    """P0-1: 資源上限を検査したエンコード経路でも、決定性（同一 seed で同一モデル）が
+    保たれること（`_encode_examples` が examples の並び順を変えないことの間接確認）。
+    """
+    kind = C3Kind()
+    req_a = make_request(tmp_path / "a", seed=0)
+    req_b = make_request(tmp_path / "b", seed=0)
+    trained_a = kind.train(make_examples(), req_a)
+    trained_b = kind.train(make_examples(), req_b)
+    onnx_a = tmp_path / "a.onnx"
+    onnx_b = tmp_path / "b.onnx"
+    kind.export_onnx(trained_a, onnx_a)
+    kind.export_onnx(trained_b, onnx_b)
+    assert (
+        hashlib.sha256(onnx_a.read_bytes()).hexdigest()
+        == hashlib.sha256(onnx_b.read_bytes()).hexdigest()
+    )
+
+
+def test_c3_train_rejects_model_too_large_before_any_training_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: パラメータ数から見積もったモデルサイズが上限（40 MiB）を超える場合、
+    `ByteCNN` を構築する前（＝ 1 バッチも学習する前）に拒否すること。
+    """
+    from fandhe_edge_trainer.kinds import c3 as c3_mod
+    from fandhe_edge_trainer.limits import MAX_C3_EMB, MAX_C3_FILTERS
+
+    def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("ByteCNN must not be instantiated when the model-size check fails")
+
+    monkeypatch.setattr(c3_mod, "ByteCNN", _must_not_be_called)
+
+    kind = C3Kind()
+    # emb・filters とも許容上限（1024）まで上げると、既定の widths=[3,5,7] で
+    # パラメータ数が 40 MiB（float32 換算）を大きく超える（実測 ≈ 61 MiB 相当）。
+    req = make_request(
+        tmp_path, config={**TINY_CONFIG, "emb": MAX_C3_EMB, "filters": MAX_C3_FILTERS}
+    )
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_c3_param_count_matches_actual_model() -> None:
+    """`_c3_param_count` の解析的な見積もりが、実際に構築したモデルの
+    パラメータ総数と一致すること（P0-2 の上限判定の前提が正しいことの確認）。
+    """
+    from mlx.utils import tree_flatten
+
+    from fandhe_edge_trainer.kinds.c3 import ByteCNN, _c3_param_count
+
+    n_classes, emb, filters, widths = 3, 8, 16, (3, 5, 7)
+    model = ByteCNN(n_classes, emb, filters, widths, dropout=0.0)
+    actual = sum(v.size for _, v in tree_flatten(model.parameters()))
+    assert _c3_param_count(n_classes, emb, filters, widths) == actual

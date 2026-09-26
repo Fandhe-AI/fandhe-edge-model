@@ -469,7 +469,17 @@ def prepare_out_dir(out_dir: Path) -> tuple[Path, ReservedId]:
     except OSError as e:
         raise _invalid(f"failed to create out_dir: {type(e).__name__}") from e
     reserved_id = _reserved_id_of(out_dir)
-    tmp = Path(tempfile.mkdtemp(prefix=f"{out_dir.name}.tmp-", dir=parent))
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix=f"{out_dir.name}.tmp-", dir=parent))
+    except OSError as e:
+        # P1: mkdtemp が失敗した時点で out_dir の予約（os.mkdir）は既に成功して
+        # いるため、ここで解放しないと空の予約済みディレクトリが残置される
+        # （呼び出し元は WorkerError を検出できても、その事実を知る術がない）。
+        # 「まだ自分の予約かつ空である」場合にのみ解放する
+        # `cleanup_reserved_out_dir` と同じ判定を使い、他プロセスが介入した
+        # 形跡があれば残す。
+        cleanup_reserved_out_dir(out_dir, reserved_id)
+        raise _invalid(f"failed to create temp dir for out_dir: {type(e).__name__}") from e
     return tmp, reserved_id
 
 

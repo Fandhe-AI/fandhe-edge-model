@@ -10,8 +10,9 @@ C3（`kinds/c3.py`）専用の実装にしない: 将来 C1 等を追加する�
 同じ形で使う想定（「拡張点の閉じ方」。資源監視ロジックを種類ごとの学習ループへ
 複製しない）。
 
-サンプルステップ数の上限（`check_sample_steps`）は学習開始前に 1 回だけ検査する
-（`examples 件数 × epochs` の見積もりで、実測を待たずに拒否できる）。
+サンプルステップ数の上限（`check_sample_steps`）・総トークン数の上限
+（`check_total_tokens`）・モデルサイズの上限（`check_model_bytes`）はいずれも
+学習開始前に 1 回だけ検査する（実測を待たずに拒否できる見積もりベースの防御）。
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 
 from .errors import WorkerError
 from .exitcode import ExitCode
-from .limits import MAX_TRAIN_SAMPLE_STEPS
+from .limits import MAX_MODEL_BYTES, MAX_TRAIN_SAMPLE_STEPS, MAX_TRAIN_TOTAL_TOKENS
 
 try:
     import resource
@@ -40,6 +41,38 @@ def check_sample_steps(n_examples: int, epochs: int) -> None:
             "limit_exceeded",
             f"estimated sample steps {steps} exceeds limit {MAX_TRAIN_SAMPLE_STEPS}"
             " (examples x epochs)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+
+def check_total_tokens(n_examples: int, max_bytes: int) -> None:
+    """`examples 件数 × max_bytes`（エンコード後の総トークン数の見積もり）が
+    `MAX_TRAIN_TOTAL_TOKENS` を超えないことを、エンコード開始前に検査する（P0-1）。
+
+    エンコード結果を Python のリストのリストとして保持すると、この見積もりを
+    経ずに際限なくメモリを確保してしまう（`kinds/c3.py` はこの検査を通過した
+    後、あらかじめ確保した numpy 配列へ行ごとに書き込む設計にしている）。
+    """
+    total = n_examples * max_bytes
+    if total > MAX_TRAIN_TOTAL_TOKENS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated total tokens {total} exceeds limit {MAX_TRAIN_TOTAL_TOKENS}"
+            " (examples x max_bytes)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+
+def check_model_bytes(param_count: int) -> None:
+    """モデルパラメータ数から見積もった float32 換算の総バイト数が
+    `MAX_MODEL_BYTES` を超えないことを、モデルの実体を作る前に検査する（P0-2）。
+    """
+    model_bytes = param_count * 4  # float32 = 4 bytes/要素
+    if model_bytes > MAX_MODEL_BYTES:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated model size {model_bytes} bytes exceeds limit {MAX_MODEL_BYTES} bytes"
+            f" ({param_count} params x 4 bytes)",
             ExitCode.LIMIT_EXCEEDED,
         )
 

@@ -422,6 +422,25 @@ def test_prepare_out_dir_rejects_existing_dir(tmp_path: Path) -> None:
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
 
+def test_prepare_out_dir_releases_reservation_when_mkdtemp_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: `os.mkdir(out_dir)` 成功後に `tempfile.mkdtemp` が失敗した場合、
+    予約済みの `out_dir` を残置せず解放すること（さもないと空の予約だけが残る）。
+    """
+    out_dir = tmp_path / "out"
+
+    def _boom(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated mkdtemp failure")
+
+    monkeypatch.setattr(contract.tempfile, "mkdtemp", _boom)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.prepare_out_dir(out_dir)
+    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    assert not out_dir.exists()  # 予約が残置されない
+
+
 def test_prepare_and_finalize_out_dir_roundtrip(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)

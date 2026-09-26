@@ -201,13 +201,67 @@ def _zero_pad_row(model: ByteCNN) -> None:
 
 
 def _batchify(id_lists: list[list[int]]) -> tuple[mx.array, mx.array]:
-    """可変長のトークン列を 0 パディングして (ids, mask) のバッチへ変換する。"""
+    """可変長のトークン列を 0 パディングして (ids, mask) のバッチへ変換する。
+
+    `C3Kind.train` の学習ループ自体はこの関数を使わない（`_encode_examples` が
+    あらかじめ確保した配列から直接スライスする。P0-1）。任意の可変長トークン列を
+    まとめてバッチ化したいテスト（`tests/test_c3_mlx_onnx_parity.py` 等）向けに
+    残してある小さなユーティリティ。
+    """
     length = max(1, max(len(s) for s in id_lists))
     arr = np.zeros((len(id_lists), length), dtype=np.int32)
     for i, s in enumerate(id_lists):
         arr[i, : len(s)] = s
     mask = (arr > 0).astype(np.float32)
     return mx.array(arr), mx.array(mask)
+
+
+def _encode_examples(
+    examples: list[TrainExample], max_bytes: int, resource_budget: budget_mod.ResourceBudget
+) -> np.ndarray:
+    """学習データ全体を、あらかじめ確保した numpy int32 配列へ行ごとにエンコードする。
+
+    P0-1: Python のリストのリスト（`[[encode_bytes(...)], ...]`）として全件を
+    保持すると、呼び出し前の `budget_mod.check_total_tokens` による見積もり
+    検査を経ずに、examples 件数 × max_bytes に比例したメモリを確保してしまう。
+    ここでは検査済みの上限に収まるサイズの配列を 1 回だけ確保し（`np.zeros`）、
+    行ごとに `encode_bytes` の結果を書き込む。1024 行ごとに
+    `resource_budget.check()` を呼び、エンコード自体が長時間・大量メモリに
+    ならないかも監視する。
+
+    戻り値は詰め物列を実際の最大長まで切り詰めた 2 次元配列（形状
+    `(len(examples), 実際の最大長)`）。詰め物 id=0 の行（`encode_bytes("")`）を
+    含め、既存の `_batchify` と同じ「id 0 = 詰め物」の規約に従う。
+    """
+    n = len(examples)
+    arr = np.zeros((n, max_bytes), dtype=np.int32)
+    max_len = 1
+    for i, ex in enumerate(examples):
+        row = encode_bytes(ex.input, max_bytes)
+        length = len(row)
+        arr[i, :length] = row
+        if length > max_len:
+            max_len = length
+        if (i + 1) % 1024 == 0:
+            resource_budget.check()
+    resource_budget.check()  # 端数分（1024 の倍数に満たない残り）の確認
+    return arr[:, :max_len]
+
+
+def _c3_param_count(n_classes: int, emb: int, filters: int, widths: tuple[int, ...]) -> int:
+    """`ByteCNN(n_classes, emb, filters, widths, dropout)` のパラメータ総数を、
+    モデルを実際に構築せずに解析的に求める（P0-2: サイズ超過のモデルを
+    構築する前に拒否するため）。
+
+    内訳: `embed`（`_N_TOKENS × emb`）・各 `convs[i]`（重み `filters × k × emb`
+    + バイアス `filters`。`k` はカーネル幅）・`out`（重み
+    `n_classes × (filters × len(widths))` + バイアス `n_classes`）。
+    `dropout` はパラメータを持たないため関与しない。
+    """
+    embed_params = _N_TOKENS * emb
+    conv_params = sum(filters * k * emb + filters for k in widths)
+    out_params = n_classes * (filters * len(widths)) + n_classes
+    return embed_params + conv_params + out_params
 
 
 @dataclass(frozen=True)
@@ -239,11 +293,20 @@ class C3Kind:
         widths = tuple(int(w) for w in cfg["widths"])
         label_order = request.label_order
         label_id = {label: i for i, label in enumerate(label_order)}
+        n_classes = len(label_order)
 
         epochs = int(cfg["epochs"])
+        emb = int(cfg["emb"])
+        filters = int(cfg["filters"])
+        # P0-2: モデルを実際に構築する前に、パラメータ数から見積もったサイズが
+        # 上限（REQ-30 の配布パッケージ容量目安 40MB を準用）を超えないか検査する。
+        budget_mod.check_model_bytes(_c3_param_count(n_classes, emb, filters, widths))
         # P0-B: 学習開始前に総ステップ数（examples 件数 × epochs）の見積もりで
         # 上限を検査する（REQ-39。1 ステップも回さずに reject できる）。
         budget_mod.check_sample_steps(len(examples), epochs)
+        # P0-1: エンコード前に総トークン数（examples 件数 × max_bytes）の見積もりで
+        # 上限を検査する（Python のリストのリストとして無検査のまま確保しない）。
+        budget_mod.check_total_tokens(len(examples), request.max_bytes)
         resource_budget = budget_mod.ResourceBudget(
             wall_seconds=float(request.time_limit_seconds),
             rss_bytes=request.rss_limit_bytes,
@@ -254,14 +317,17 @@ class C3Kind:
         mx.random.seed(request.seed)
         rng = np.random.default_rng(request.seed)
 
-        model = ByteCNN(len(label_order), cfg["emb"], cfg["filters"], widths, cfg["dropout"])
+        model = ByteCNN(n_classes, emb, filters, widths, cfg["dropout"])
         mx.eval(model.parameters())
         _zero_pad_row(model)
 
         opt = optim.AdamW(learning_rate=cfg["lr"], weight_decay=cfg["weight_decay"])
 
-        ids = [encode_bytes(ex.input, request.max_bytes) for ex in examples]
-        labels = [label_id[ex.label] for ex in examples]
+        # P0-1: あらかじめ確保した numpy 配列へエンコードする（Python のリストの
+        # リストにしない）。行の並びは examples の順序のまま（決定性テスト・
+        # rng.permutation の対象インデックスの意味を変えない）。
+        ids_arr = _encode_examples(examples, request.max_bytes, resource_budget)
+        labels_arr = np.array([label_id[ex.label] for ex in examples], dtype=np.int32)
 
         def loss_fn(mdl: ByteCNN, x: mx.array, m: mx.array, y: mx.array) -> mx.array:
             return nn.losses.cross_entropy(mdl(x, m), y, reduction="mean")
@@ -270,11 +336,14 @@ class C3Kind:
         batch_size = int(cfg["batch_size"])
         model.train()
         for _epoch in range(epochs):
-            order = rng.permutation(len(ids))
+            order = rng.permutation(len(examples))
             for start in range(0, len(order), batch_size):
                 batch_idx = order[start : start + batch_size]
-                x, m = _batchify([ids[j] for j in batch_idx])
-                y = mx.array(np.array([labels[j] for j in batch_idx], dtype=np.int32))
+                x_np = ids_arr[batch_idx]
+                m_np = (x_np > 0).astype(np.float32)
+                x = mx.array(x_np)
+                m = mx.array(m_np)
+                y = mx.array(labels_arr[batch_idx])
                 loss, grads = step(model, x, m, y)
                 opt.update(model, grads)
                 _zero_pad_row(model)
@@ -320,6 +389,12 @@ def _i64(arr: np.ndarray, name: str) -> TensorProto:
 
 
 def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
+    # P0-2: 書き出しの各段（テンソル抽出・グラフ構築・検証・保存）の間で
+    # 資源上限（REQ-39）を検査する。`resource_budget` は学習ループと同じ
+    # インスタンス（`C3Kind.export_onnx` が渡す）で、無い場合は検査をスキップする
+    # （テスト等で `resource_budget=None` の `C3TrainedModel` を直接構築した場合）。
+    budget_check = trained.resource_budget.check if trained.resource_budget is not None else None
+
     out_path = Path(out_path)
     widths = tuple(int(w) for w in trained.config["widths"])
     n_classes = len(trained.label_order)
@@ -334,6 +409,8 @@ def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
             "internal invariant violated: pad embedding row is not exactly zero",
             ExitCode.RUNTIME_ERROR,
         )
+    if budget_check is not None:
+        budget_check()  # 段 1: embedding の抽出後
 
     ids = helper.make_tensor_value_info("ids", TensorProto.INT64, ["N", "T"])
     probs_out = helper.make_tensor_value_info("probs", TensorProto.FLOAT, ["N", n_classes])
@@ -379,6 +456,8 @@ def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
             helper.make_node("ReduceMax", [f"masked{i}_out"], [f"pool{i}"], axes=[2], keepdims=0)
         )
         pooled_names.append(f"pool{i}")
+        if budget_check is not None:
+            budget_check()  # 段 2: 各 conv ブランチのテンソル抽出後
     nodes.append(helper.make_node("Concat", pooled_names, ["pooled"], axis=1))
 
     out_w = np.array(params["out"]["weight"], dtype=np.float32)  # (n_classes, filters*len(widths))
@@ -390,10 +469,16 @@ def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
         helper.make_node("Gemm", ["pooled", "out_wT", "out_b"], ["logits"], alpha=1.0, beta=1.0)
     )
     nodes.append(helper.make_node("Softmax", ["logits"], ["probs"], axis=1))
+    if budget_check is not None:
+        budget_check()  # 段 3: グラフ構築後（check_model の前）
 
     graph = helper.make_graph(nodes, "c3_cnn", [ids], [probs_out], initializer=initializers)
     model_proto = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model_proto.ir_version = 8
     onnx.checker.check_model(model_proto)
+    if budget_check is not None:
+        budget_check()  # 段 4: check_model 後（save の前）
     out_path.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model_proto, str(out_path))
+    if budget_check is not None:
+        budget_check()  # 段 5: save 後

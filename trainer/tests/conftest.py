@@ -49,6 +49,7 @@ def make_request(
     config: dict | None = None,
     seed: int = 0,
     out_name: str = "out",
+    max_bytes: int = 64,
     time_limit_seconds: int = MAX_TRAIN_WALL_SECONDS,
     rss_limit_bytes: int = MAX_TRAIN_RSS_BYTES,
 ) -> TrainRequest:
@@ -60,7 +61,7 @@ def make_request(
         kind_version=1,
         config=dict(config if config is not None else TINY_CONFIG),
         label_order=list(LABEL_ORDER),
-        max_bytes=64,
+        max_bytes=max_bytes,
         seed=seed,
         device="cpu",
         root=tmp_path,
