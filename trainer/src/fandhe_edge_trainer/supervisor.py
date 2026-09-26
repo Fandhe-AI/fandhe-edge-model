@@ -232,6 +232,11 @@ def monitor_child(
                 proc.wait(timeout=10)
             return "time"
         rss = _current_child_rss_bytes(proc.pid)
+        if rss is None and proc.poll() is not None:
+            # `wait` のタイムアウト直後に子が終了すると `ps` は PID を見つけられない。
+            # 終了済みなら監視失敗ではなく通常の終了として扱う（成功した学習の
+            # 成果物を monitor_failed で捨てない）。
+            return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         if rss is None:
             # 監視できないこと自体を fail-closed に扱う（上限を検査できない
             # まま子プロセスを走らせ続けない）。

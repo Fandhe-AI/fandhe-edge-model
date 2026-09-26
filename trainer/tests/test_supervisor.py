@@ -89,6 +89,36 @@ def test_monitor_child_returns_none_on_normal_completion() -> None:
     assert proc.wait(timeout=5) == 0
 
 
+def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`wait` のタイムアウト直後に子が正常終了し `ps` が PID を見つけられない
+    競合でも、監視失敗（monitor_failed）ではなく通常の終了として扱う。
+
+    `_current_child_rss_bytes` が「子の終了を待ってから None を返す」ように
+    差し替え、競合を決定的に再現する。
+    """
+    proc = _spawn("import time; time.sleep(0.3)")
+
+    def _ps_after_exit(pid: int) -> None:
+        proc.wait(timeout=5)
+        return None
+
+    monkeypatch.setattr(supervisor, "_current_child_rss_bytes", _ps_after_exit)
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason is None
+        assert proc.returncode == 0
+    finally:
+        _reap(proc)
+
+
 def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     """`ps` が使えない（監視できない）場合、野放しにせず子プロセスごと終了させる。"""
     monkeypatch.setattr(supervisor, "_PS_BIN", "/nonexistent/ps")
