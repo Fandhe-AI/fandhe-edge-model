@@ -13,10 +13,16 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
   "max_bytes": 512,
   "seed": 0,
   "device": "cpu",
+  "root": "/abs/path/to/project",
   "train_path": "train.jsonl",
   "out_dir": "out"
 }
 ```
+
+`root` は呼び出し元が許可する作業ルート（絶対パス）。`train_path`・`out_dir` は
+`root` からの**相対パス**でなければならない（絶対パス・`..` 構成要素・空文字列は
+拒否する）。`TrainRequest.train_path`・`TrainRequest.out_dir` は検証・解決済みの
+絶対パス（`root` 配下であることを確認済み）を保持する。
 
 学習データ（`train_path` が指す JSONL）は 1 行 1 オブジェクト `{"input": str,
 "label": str}`。label は label_order に含まれる必要がある。
@@ -25,11 +31,11 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 評価・選定・作り直し判定は評価器（TASK-24.1）・学習ワーカーの選定処理（別 TASK）の
 責務であり、ここでは扱わない）。
 
-経路の閉じ込め（REQ-39 のガード層）は Rust 側 CLI が担う設計とし、本ワーカーは
-Rust から渡された `train_path`・`out_dir` をそのまま信頼する（子プロセスの
-呼び出し元が経路を検証済みという前提。本ワーカー単体で `../` 等を拒否する
-経路検証は行わない。将来この前提が変わる場合は呼び出し元契約の見直しとして
-報告する）。
+**経路の閉じ込め（REQ-39 のガード層・PoC-20）は多層防御とする**: 一次防御は
+Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単独プロセスとしても
+起動されうるため、本ワーカー自身も `guard.py::safe_join` で `root` 配下への
+閉じ込めを検証する（Rust 側の検証済みという前提だけに頼らない）。詳細は
+`guard.py` のモジュール docstring を参照。
 
 **ジョブの再開・異常終了時の後片付けは本モジュールの責務ではない**（REQ-34）。
 `prepare_out_dir`/`finalize_out_dir` は「同一プロセス内で正常終了 or 例外終了する」
@@ -48,6 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
+from . import guard
 from .encoding import normalize_input
 from .errors import WorkerError
 from .exitcode import ExitCode
@@ -76,6 +83,7 @@ _REQUEST_FIELDS = {
     "max_bytes",
     "seed",
     "device",
+    "root",
     "train_path",
     "out_dir",
 }
@@ -100,6 +108,7 @@ class TrainRequest:
     max_bytes: int
     seed: int
     device: str
+    root: Path
     train_path: Path
     out_dir: Path
 
@@ -140,7 +149,9 @@ def _json_loads_strict(text: str) -> Any:
         raise ValueError(f"JSON nesting too deep: {type(e).__name__}") from e
 
 
-def _open_regular_file(path: Path, error_maker: Any) -> tuple[IO[bytes], os.stat_result]:
+def _open_regular_file(
+    path: Path, error_maker: Any, *, nofollow: bool = False
+) -> tuple[IO[bytes], os.stat_result]:
     """ファイルを開いたうえで、開いた fd に対して stat を取り「通常ファイルであること」
     を確認する（open → fstat の順にすることで、path に対する stat → open の間に
     別ファイルへ差し替えられる TOCTOU を避ける。REQ-39 ガード層の「形式の許可制」を
@@ -152,9 +163,20 @@ def _open_regular_file(path: Path, error_maker: Any) -> tuple[IO[bytes], os.stat
     返るため、その直後の `fstat`/`S_ISREG` 判定で確実に拒否できる。通常ファイルの
     読み取りには `O_NONBLOCK` は影響しない（意味を持つのは FIFO・一部のデバイス・
     ソケットのみ）。
+
+    `nofollow=True`（`guard.py::safe_join` で解決済みの経路を開く場合に指定）:
+    最終コンポーネントが実はシンボリックリンクだった場合に `ELOOP` で拒否する。
+    `safe_join` は解決時点の実体をすでに `realpath` で確認しているため、
+    これは「`safe_join` の呼び出しから実際の open までの間に最終コンポーネントが
+    シンボリックリンクへ差し替えられる」という残存 TOCTOU 一枚を狭めるだけの
+    追加防御であり、経路検証の主たる根拠ではない（guard.py のモジュール docstring
+    参照）。
     """
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if nofollow:
+        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, flags)
     except OSError as e:
         raise error_maker(f"file not readable: {type(e).__name__}") from e
     try:
@@ -239,13 +261,13 @@ def _validate_request(raw: Any) -> TrainRequest:
     if device not in _ALLOWED_DEVICES:
         raise _invalid(f"device must be one of {_ALLOWED_DEVICES}")
 
-    train_path_raw = raw.get("train_path")
-    if not isinstance(train_path_raw, str) or not train_path_raw:
-        raise _invalid("train_path must be a non-empty string")
-
-    out_dir_raw = raw.get("out_dir")
-    if not isinstance(out_dir_raw, str) or not out_dir_raw:
-        raise _invalid("out_dir must be a non-empty string")
+    # 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）:
+    # `root` を実体解決したうえで、`train_path`・`out_dir`（root からの相対パス）を
+    # その配下に閉じ込める。guard.safe_join は違反を WorkerError で送出する
+    # （構文違反は invalid_path、閉じ込め違反は path_outside_root。いずれも exit 64）。
+    root_real = guard.resolve_root(raw.get("root"))
+    train_path = guard.safe_join(root_real, raw.get("train_path"), "train_path")
+    out_dir = guard.safe_join(root_real, raw.get("out_dir"), "out_dir")
 
     return TrainRequest(
         kind=kind,
@@ -255,8 +277,9 @@ def _validate_request(raw: Any) -> TrainRequest:
         max_bytes=max_bytes,
         seed=seed,
         device=device,
-        train_path=Path(train_path_raw),
-        out_dir=Path(out_dir_raw),
+        root=root_real,
+        train_path=train_path,
+        out_dir=out_dir,
     )
 
 
@@ -282,17 +305,25 @@ def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainE
     データ本文（`input`・`label` の値）はエラーメッセージへ一切含めない
     （個人情報・機密情報を含みうる。security.md）。行番号・件数だけを報告する。
 
-    資源上限（REQ-39・limits.py）を 3 段で適用する: (1) 1 行あたりのバイト数
-    （JSON パース・NFKC 正規化の前に検査。巨大な 1 行によるメモリ確保を防ぐ）、
-    (2) 累積読み取りバイト数（ファイル全体のサイズを stat だけに頼らず、実際に
-    読んだ量で判定する）、(3) 検証を通過した examples の件数。
+    資源上限（REQ-39・limits.py）を 4 段で適用する: (0) `fstat` の `st_size` に
+    よる早期判定（1 行も読まずに拒否できる。読み取り前チェック）、(1) 1 行あたりの
+    バイト数（JSON パース・NFKC 正規化の前に検査。巨大な 1 行によるメモリ確保を
+    防ぐ）、(2) 累積読み取りバイト数（`st_size` の後にファイルが伸長される場合に
+    備え、実際に読んだ量でも判定する）、(3) 検証を通過した examples の件数。
     """
     label_set = set(label_order)
     examples: list[TrainExample] = []
     total_bytes = 0
     lineno = 0
 
-    f, _st = _open_regular_file(train_path, _invalid)
+    # nofollow=True: train_path は guard.safe_join が root 配下であることを
+    # 確認済みの経路だが、safe_join の呼び出しから open までの間隙
+    # （残存 TOCTOU。guard.py 参照）を狭めるため、最終コンポーネントの
+    # シンボリックリンクを追跡しない。
+    f, st = _open_regular_file(train_path, _invalid, nofollow=True)
+    if st.st_size > MAX_TRAIN_DATA_BYTES:
+        f.close()
+        raise _limit(f"train data exceeds {MAX_TRAIN_DATA_BYTES} bytes limit")
     try:
         while True:
             raw_line = f.readline(MAX_TRAIN_LINE_BYTES + 1)
@@ -361,12 +392,21 @@ def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainE
 def prepare_out_dir(out_dir: Path) -> Path:
     """`out_dir` が未作成であることを確認し、書き込み用の一時ディレクトリを作って返す。
 
+    `out_dir` は呼び出し元（`_validate_request`）で `guard.safe_join` によって
+    root 配下への閉じ込めを検証・解決済みの絶対パスである前提（`out_dir.parent` が
+    その時点で解決済みの実体パス）。一時ディレクトリはこの同じ親の配下に作るため、
+    root の外へ書き出す経路は生まれない。
+
     半端な書き込みを避けるため、実際の出力は一時ディレクトリへ行い、成功時に
     `os.replace` で `out_dir` へ確定させる（ジョブの再開・チェックポイント機構は
     Rust 側 REQ-34 の責務であり、本関数はその前提を壊さないための最小限の対処。
     本関数のモジュール docstring も参照）。
     """
-    if out_dir.exists():
+    # exists() ではなく lexists() を使う: 壊れたシンボリックリンク（リンク先が
+    # 存在しない）は exists() では検出できないが、out_dir の位置に何らかの
+    # エントリが既にあるという事実自体は lexists() で検出できる（REQ-39
+    # ガード層の「完全性」寄りの考え方。既存エントリを黙って上書きしない）。
+    if os.path.lexists(out_dir):
         raise _invalid("out_dir already exists")
     parent = out_dir.parent
     if not parent.is_dir():

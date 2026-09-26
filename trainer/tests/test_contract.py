@@ -1,4 +1,6 @@
-"""学習リクエスト・学習データの検証テスト（TASK-19.1 の入口・REQ-39 の資源上限）。"""
+"""学習リクエスト・学習データの検証テスト（TASK-19.1 の入口・REQ-39 の資源上限・
+経路の閉じ込め〔PoC-20〕）。
+"""
 
 from __future__ import annotations
 
@@ -13,18 +15,26 @@ from fandhe_edge_trainer import contract, limits
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 
-_BASE_REQUEST = {
-    "schema_version": 1,
-    "kind": "c3",
-    "kind_version": 1,
-    "config": {},
-    "label_order": ["a", "b"],
-    "max_bytes": 64,
-    "seed": 0,
-    "device": "cpu",
-    "train_path": "train.jsonl",
-    "out_dir": "out",
-}
+
+def _base_request(root: Path) -> dict:
+    """`root` 配下に閉じ込められた最小の妥当なリクエストを組み立てる。
+
+    `root` はテストごとの `tmp_path` を渡す（`train_path="train.jsonl"`・
+    `out_dir="out"` は root 直下の相対パス）。
+    """
+    return {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": {},
+        "label_order": ["a", "b"],
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(root),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
 
 
 def _write(path: Path, obj: dict) -> Path:
@@ -33,17 +43,31 @@ def _write(path: Path, obj: dict) -> Path:
 
 
 def test_load_request_accepts_valid_request(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", _BASE_REQUEST)
+    p = _write(tmp_path / "req.json", _base_request(tmp_path))
     req = contract.load_request(p)
     assert req.kind == "c3"
     assert req.label_order == ["a", "b"]
     assert req.max_bytes == 64
     assert req.seed == 0
     assert req.device == "cpu"
+    # root 配下（realpath 解決後）に閉じ込められていること。
+    root_real = Path(os.path.realpath(tmp_path))
+    assert req.root == root_real
+    assert req.train_path == root_real / "train.jsonl"
+    assert req.out_dir == root_real / "out"
+
+
+def test_load_request_accepts_nested_relative_path(tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir()
+    req_dict = {**_base_request(tmp_path), "train_path": "data/train.jsonl"}
+    p = _write(tmp_path / "req.json", req_dict)
+    req = contract.load_request(p)
+    root_real = Path(os.path.realpath(tmp_path))
+    assert req.train_path == root_real / "data" / "train.jsonl"
 
 
 def test_load_request_rejects_unknown_field(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", {**_BASE_REQUEST, "extra_field": 1})
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "extra_field": 1})
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "invalid_request"
@@ -52,7 +76,7 @@ def test_load_request_rejects_unknown_field(tmp_path: Path) -> None:
 
 
 def test_load_request_rejects_wrong_type(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", {**_BASE_REQUEST, "max_bytes": "512"})
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "max_bytes": "512"})
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "invalid_request"
@@ -63,11 +87,93 @@ def test_load_request_rejects_oversize_file(
 ) -> None:
     monkeypatch.setattr(limits, "MAX_REQUEST_BYTES", 8)
     monkeypatch.setattr(contract, "MAX_REQUEST_BYTES", 8)
-    p = _write(tmp_path / "req.json", _BASE_REQUEST)
+    p = _write(tmp_path / "req.json", _base_request(tmp_path))
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+# --------------------------------------------------------------------------
+# P0-1: 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）
+# --------------------------------------------------------------------------
+
+
+def test_load_request_rejects_absolute_train_path(tmp_path: Path) -> None:
+    req_dict = {**_base_request(tmp_path), "train_path": "/etc/passwd"}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_path"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_load_request_rejects_dotdot_train_path(tmp_path: Path) -> None:
+    req_dict = {**_base_request(tmp_path), "train_path": "../outside/train.jsonl"}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_path"
+
+
+def test_load_request_rejects_dotdot_out_dir(tmp_path: Path) -> None:
+    req_dict = {**_base_request(tmp_path), "out_dir": "../outside_out"}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_path"
+
+
+def test_load_request_rejects_root_not_a_directory(tmp_path: Path) -> None:
+    not_a_dir = tmp_path / "not_a_dir"
+    not_a_dir.write_text("x", encoding="utf-8")
+    req_dict = {**_base_request(tmp_path), "root": str(not_a_dir)}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_path"
+
+
+def test_load_request_rejects_root_relative_path(tmp_path: Path) -> None:
+    req_dict = {**_base_request(tmp_path), "root": "relative/path"}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_path"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
+def test_load_request_rejects_symlink_escape_for_train_path(tmp_path: Path) -> None:
+    """root 配下のシンボリックリンクが root の外を指す場合、train_path の親経路として
+    使うと path_outside_root で拒否されること（realpath による閉じ込め検証）。
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "train.jsonl").write_text('{"input": "x", "label": "a"}\n', encoding="utf-8")
+    (root / "escape").symlink_to(outside)
+
+    req_dict = {**_base_request(root), "train_path": "escape/train.jsonl"}
+    p = _write(root / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "path_outside_root"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
+def test_load_request_rejects_symlink_escape_for_out_dir(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "escape").symlink_to(outside)
+
+    req_dict = {**_base_request(root), "out_dir": "escape/out"}
+    p = _write(root / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "path_outside_root"
 
 
 def test_load_train_examples_reports_line_number_not_label_text(tmp_path: Path) -> None:
@@ -112,6 +218,27 @@ def test_load_train_examples_rejects_oversize_file(
     assert exc_info.value.code == "limit_exceeded"
 
 
+def test_load_train_examples_rejects_oversize_file_via_stat_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: `st_size` による判定が実際の行読み取りより先に行われること。
+
+    ファイル本文を不正な JSON にしておき、それでも `limit_exceeded` になる
+    （＝ 1 行も parse されていない）ことで、st_size チェックが読み取りより
+    先に効いていることを確認する。
+    """
+    monkeypatch.setattr(contract, "MAX_TRAIN_DATA_BYTES", 1 << 10)
+    train_path = tmp_path / "train.jsonl"
+    train_path.write_text("{not json\n", encoding="utf-8")
+    os.truncate(train_path, (1 << 10) + 1)  # スパースファイルで stat 上のサイズだけ超過させる
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_train_examples(train_path, ["a", "b"])
+    assert exc_info.value.code == "limit_exceeded"
+    # invalid_data（JSON パースエラー）ではなく limit_exceeded になっている時点で、
+    # パースに到達する前に stat のサイズ判定で弾かれていることの証拠になる。
+    assert "line" not in exc_info.value.message
+
+
 def test_load_train_examples_requires_at_least_two_distinct_labels(tmp_path: Path) -> None:
     train_path = tmp_path / "train.jsonl"
     train_path.write_text(
@@ -126,7 +253,7 @@ def test_load_request_rejects_nan(tmp_path: Path) -> None:
     """項目 4: JSON 標準外の数値トークン（NaN 等）は範囲比較をすり抜けるため明示的に拒否する。"""
     p = tmp_path / "req.json"
     p.write_text(
-        json.dumps({**_BASE_REQUEST, "max_bytes": 64}).replace(
+        json.dumps({**_base_request(tmp_path), "max_bytes": 64}).replace(
             '"max_bytes": 64', '"max_bytes": NaN'
         ),
         encoding="utf-8",
@@ -162,21 +289,21 @@ def test_load_request_rejects_fifo(tmp_path: Path) -> None:
 
 
 def test_load_request_rejects_seed_out_of_range(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", {**_BASE_REQUEST, "seed": -1})
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "seed": -1})
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "invalid_request"
 
 
 def test_load_request_rejects_seed_too_large(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", {**_BASE_REQUEST, "seed": 2**32})
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "seed": 2**32})
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "invalid_request"
 
 
 def test_load_request_rejects_bool_seed(tmp_path: Path) -> None:
-    p = _write(tmp_path / "req.json", {**_BASE_REQUEST, "seed": True})
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "seed": True})
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
     assert exc_info.value.code == "invalid_request"

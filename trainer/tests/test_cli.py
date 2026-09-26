@@ -82,6 +82,8 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     train_path = tmp_path / "train.jsonl"
     _write_train_data(train_path)
     out_dir = tmp_path / "out"
+    # root は絶対パス、train_path・out_dir は root からの相対パス
+    # （経路の閉じ込め。REQ-39・PoC-20・guard.py）。
     request = {
         "schema_version": 1,
         "kind": "c3",
@@ -91,8 +93,9 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
         "max_bytes": 64,
         "seed": 0,
         "device": "cpu",
-        "train_path": str(train_path),
-        "out_dir": str(out_dir),
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
     }
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")

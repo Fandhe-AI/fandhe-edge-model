@@ -45,6 +45,9 @@ TINY_CONFIG = {
 def make_request(
     tmp_path, *, config: dict | None = None, seed: int = 0, out_name: str = "out"
 ) -> TrainRequest:
+    """`TrainRequest` を直接構築する（`guard.safe_join` を経由しないテスト専用の近道。
+    経路の閉じ込め検証そのものは `test_contract.py` 側で個別に検証する）。
+    """
     return TrainRequest(
         kind="c3",
         kind_version=1,
@@ -53,6 +56,7 @@ def make_request(
         max_bytes=64,
         seed=seed,
         device="cpu",
+        root=tmp_path,
         train_path=tmp_path / "train.jsonl",
         out_dir=tmp_path / out_name,
     )
