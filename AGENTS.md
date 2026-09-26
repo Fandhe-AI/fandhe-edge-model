@@ -141,5 +141,5 @@ make doctor      # 環境診断のみ（何も導入しない）
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、集約ジョブ `ci-complete` の `needs` に全ジョブが含まれているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | 必須チェック名の変更 | ジョブ ID・`name:` の変更で check 名（`codex / *`・`python-ci`）が変わる差分に、ruleset の必須チェックの更新手順（マージ前の置換）が PR 本文に記載されているか。旧名のまま残ると全チェック pass でもマージがブロックされる | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象 crate 名・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
-| `python-ci.yml` の `runs-on: macos-15` | GitHub ホステッドの `macos-15` は Apple Silicon（arm64）の標準ランナーである（実行ログの `Image: macos-15-arm64` と、ジョブ内の `uname -m` = arm64 の fail-closed ガードで確認済み）。MLX の arm64 wheel を導入できないという前提で、arm64 用ラベルへの変更を求める指摘をしない | 指摘しない（実測で確認済み） |
+| `macos-15` ランナーの指定 | GitHub ホステッドの `macos-15` ラベルは Apple Silicon（arm64）の標準ランナー（runner イメージ `macos-15-arm64`）を指す。ジョブが `runs-on: macos-15` を指定し、かつ checkout 直後に `uname -m` が `arm64` であることを検査して不一致なら失敗する fail-closed ステップを持つ場合は、arm64 用ラベルへの変更を求める指摘をしない（アーキテクチャはこのガードで実行時に強制される）。ガードを持たない場合は通常どおりレビューする | 指摘しない（条件付き） |
 | `update-external.yml` の `runner-json` | `runner-json` は folded block scalar（`>-`）で JSON 文字列 `"ubuntu-latest"`（二重引用符込み、バックスラッシュなし）を渡す正しい記法であり、`fromJSON` で `ubuntu-latest` に解決される。エスケープの誤りとして指摘しない | 指摘しない（正しい記法） |
