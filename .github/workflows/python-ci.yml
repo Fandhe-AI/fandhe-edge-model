@@ -19,7 +19,12 @@ name: Python CI
 # MLX（macOS arm64 ランナー）について: TASK-19.2（既定候補 C3）の実装で
 # trainer/pyproject.toml の dependencies に mlx・numpy・onnx を追加した。
 # MLX の wheel は macosx_14_0_arm64 以降のみ提供されるため（[tool.uv] environments
-# の制約）、本 job は macos-15（arm64・GitHub ホステッド）で実行する。
+# の制約）、本 job は macos-15 で実行する。GitHub ホステッドランナーの `macos-15`
+# ラベルは arm64 標準ランナーである（x86_64 版ではない。実行結果で mlx の
+# インストール・import が成功していることを 2026-09-27 に確認済み）。念のため
+# 下記ステップでアーキテクチャを fail-closed に検査する（ランナーラベルの意味が
+# 将来変わった場合に、CI が気づかず x86_64 上で「MLX 無しでも py-ci が通る」
+# 状態へ静かに劣化するのを防ぐ）。
 # pytest はすべて request.device="cpu" で MLX の CPU 経路のみを使い、決定的に
 # 実行する（evaluation-contract.md: GPU〔Metal〕の非決定性をテストへ持ち込まない）。
 # GPU（Metal）依存の性能測定・長時間学習は実機前提テスト（.claude/rules/ci.md）
@@ -53,6 +58,17 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+
+      # fail-closed: `macos-15` ラベルが指す実体が将来変わっても、arm64 以外
+      # （MLX の wheel が存在しないアーキテクチャ）で「py-ci が通った」ことに
+      # ならないよう、アーキテクチャの前提をここで明示的に検査する。
+      - name: ランナーが arm64 であることを確認する（fail-closed）
+        run: |
+          arch="$(uname -m)"
+          if [ "$arch" != "arm64" ]; then
+            echo "error: expected arm64 runner (mlx wheel requires macosx_14_0_arm64), got: $arch" >&2
+            exit 1
+          fi
 
       # trainer/ が将来のリファクタで削除・改名された場合に、Makefile の
       # HAS_PY 判定による skip: を CI が「成功」として見逃さないための
