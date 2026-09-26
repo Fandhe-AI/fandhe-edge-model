@@ -30,12 +30,15 @@ pre-commit:
     # 検出範囲を維持するため追加している）。
     # {staged_files} は rename 後の名前しか含まないため、`.env` 等を無害な名前へ rename
     # すると素通りする。staged の name-status から rename / copy 元と先の両方を検査する。
+    # `-C -C`（--find-copies-harder 相当）で、今回変更していない追跡済みファイルからの
+    # コピーも copy として検出する（git 管理外のファイルからのコピーは git から元の名前を
+    # 知る手段がないため、内容検査の secrets-content-guard が担う）。
     # 一覧を取得できない場合は検査不能として失敗させる（fail-closed）
     - name: secrets-guard
       run: |
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        if ! status=$(git diff --cached --name-status -M --diff-filter=ACMR --no-ext-diff); then
+        if ! status=$(git diff --cached --name-status -M -C -C --diff-filter=ACMR --no-ext-diff); then
           echo "NG: staged ファイル一覧を取得できないため秘密情報の検査を実施できません" >&2
           exit 1
         fi
