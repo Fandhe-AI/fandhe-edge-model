@@ -1,0 +1,287 @@
+# fandhe-edge-model の開発タスクランナー。
+#
+# `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
+# `make ci` でローカル検証（CI の ci.yml と同等のローカルゲート）を一括実行する。
+# `make doctor` は環境診断のみを行い、何も導入・変更しない。
+#
+# Makefile は薄い入口（thin entry point）であり、実処理の定義は cargo・各 lint ツール・
+# CI（.github/workflows/ci.yml → Fandhe-AI/actions の reusable workflow）が持つ。
+# Make 側で独自の依存グラフ・増分判定は持たない（make スキルの責務分離方針）。
+#
+# 実装は未着手（Cargo.toml・`crates/` 配下の実クレート未追加）のため、cargo 系ターゲットは
+# HAS_CARGO / HAS_MEMBERS 判定でスキップし、workspace 作成後に自動で有効化される
+# （冪等セルフヒール。deny も deny.toml + Cargo.toml + メンバー crate が揃った時点で、
+# hooks も lefthook.yml が追加された時点で有効化）。スキップ時は必ず `skip:` を表示し、
+# 実行したかのように黙って成功扱いにはしない。
+# Fandhe-AI/fandhe-container の Makefile と同一方針。GNU Make 3.81 で動作する構文のみを使う。
+
+.DEFAULT_GOAL := help
+SHELL := /bin/bash
+
+# Cargo.toml の有無（無ければ cargo 系をスキップ。workspace 作成後に有効化）
+HAS_CARGO := $(wildcard Cargo.toml)
+HAS_DENY := $(wildcard deny.toml)
+# lefthook.yml の有無（無ければ hooks をスキップ。設定無しで `lefthook install` しない）
+HAS_LEFTHOOK := $(wildcard lefthook.yml)
+# workspace のメンバー crate（`crates/*/Cargo.toml`）の有無。member crate が
+# 1 つも無い仮想 workspace（`members = []`）に対しては `cargo fmt --all --check`・
+# `cargo clippy --workspace`・`cargo test --workspace`・`cargo deny check ...` の
+# いずれも「対象パッケージが無い」エラーで落ちる（cargo の仕様）ため、これらの
+# ターゲットは HAS_MEMBERS でスキップする。
+# 一方 Cargo.toml 自体の構文・workspace 定義としての妥当性は member の有無に
+# 依存せず常に検証可能なため、`check-workspace-manifest`（下記）は HAS_CARGO のみで
+# 判定する。
+HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
+
+# lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
+# 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
+# EC_NPM_VERSION のみ npm ラッパーパッケージの版（CI は Go バイナリ release タグ v3.8.0 を
+# 直接取得するため版番号体系が異なる。ローカル再現用の近似として npm 最新安定を固定する）。
+MARKDOWNLINT_VERSION := 0.49.1
+YAMLLINT_VERSION := 1.38.0
+EC_NPM_VERSION := 6.1.1
+COMMITLINT_VERSION := 21.2.1
+COMMITLINT_CONFIG_VERSION := 21.2.0
+
+# 導入系ツールの固定バージョン（`=x.y.z` 完全固定方針に合わせ exact 固定）。
+LEFTHOOK_VERSION := 2.1.10
+CARGO_DENY_VERSION := 0.20.2
+
+.PHONY: help
+help: ## ターゲット一覧を表示する
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+
+# --------------------------------------------------
+# 環境診断・環境構築
+# --------------------------------------------------
+
+# 診断のみ。何も導入・修復しない（導入は setup の責務）。必須ツールが欠けていれば
+# 非 0 で終了し、任意ツール（lint-docs 系・lefthook）は欠けていても警告に留める。
+.PHONY: doctor
+doctor: ## 開発環境を診断する（導入・変更は一切しない。必須ツール欠落時は非 0 終了）
+	@missing=0; \
+	for tool in git rustup cargo rustc; do \
+		if command -v "$$tool" >/dev/null 2>&1; then \
+			printf 'ok    %-16s %s\n' "$$tool" "$$("$$tool" --version 2>/dev/null | head -n 1)"; \
+		else \
+			printf 'miss  %-16s （必須）\n' "$$tool"; missing=1; \
+		fi; \
+	done; \
+	for comp in rustfmt cargo-clippy; do \
+		if command -v "$$comp" >/dev/null 2>&1 && "$$comp" --version >/dev/null 2>&1; then \
+			printf 'ok    %-16s %s\n' "$$comp" "$$("$$comp" --version 2>/dev/null | head -n 1)"; \
+		else \
+			printf 'miss  %-16s （必須。rust-toolchain.toml の components。rustup show で導入）\n' "$$comp"; missing=1; \
+		fi; \
+	done; \
+	for tool in npx lefthook yamllint uvx cargo-deny; do \
+		if command -v "$$tool" >/dev/null 2>&1; then \
+			printf 'ok    %-16s\n' "$$tool"; \
+		else \
+			printf 'warn  %-16s （任意。未導入の場合は該当ターゲットが導入案内または自動導入を行う）\n' "$$tool"; \
+		fi; \
+	done; \
+	if [ -f docs/spec/.git ] || [ -d docs/spec/.git ]; then \
+		echo 'ok    docs/spec        submodule 取得済み'; \
+	else \
+		echo 'warn  docs/spec        submodule 未取得（private。make submodule で取得を試行）'; \
+	fi; \
+	if [ "$$missing" -ne 0 ]; then \
+		echo "NG: 必須ツールが不足しています（make setup または公式手順で導入してください）" >&2; \
+		exit 1; \
+	fi
+
+# 依存ターゲット並記だと -j 実行時に順序が保証されず、cargo フォールバックを持つ hooks が
+# rustup より先に走りうるため、再帰 make で「submodule → rustup → hooks」の順を明示する。
+.PHONY: setup
+setup: ## 開発環境を一括構築する（サブモジュール → rustup → lefthook の順を保証）
+	$(MAKE) submodule
+	$(MAKE) rustup
+	$(MAKE) hooks
+	@echo "setup 完了"
+
+# rustup は前提条件として確認のみ行い、自動導入はしない。取得したインストーラを検証なしに
+# 実行する経路（curl | sh）を作らないため（サプライチェーン対策）。未導入時は
+# 公式の導入手順を案内して停止する。toolchain は rust-toolchain.toml が単一真実源。
+.PHONY: rustup
+rustup: ## rustup（cargo）の導入を確認する（未導入なら公式手順を案内して停止）
+	@if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$$HOME/.cargo/bin/rustup" ]; then \
+		echo "error: rustup が見つかりません。公式手順（https://rustup.rs/）で導入してから再実行してください" >&2; \
+		exit 1; \
+	fi
+
+# docs/spec（fandhe-edge-model-spec）は private リポジトリのため、アクセス権のない環境では
+# 取得に失敗する。実装コードのビルド・テストは docs/spec 抜きでも成立させる方針
+# （README.md）のため、失敗しても setup 全体は止めない。
+.PHONY: submodule
+submodule: ## docs/spec サブモジュールを初期化・更新する（private・アクセス権が無ければ警告のみ）
+	@git submodule update --init || \
+		echo "警告: docs/spec（private）の取得に失敗しました。アクセス権のない環境では想定内です（ビルド・テストは spec 抜きで成立します）"
+
+# lefthook（Go 製。crates.io には存在しないため cargo フォールバックは置かない）は
+# brew（バージョン固定不可だが常用導線）を優先し、無ければ npm 配布版を exact 固定の
+# npx ワンショットで実行する（lefthook が生成する hook スクリプトは PATH → npx の順で
+# 本体を解決するため、npx 経由の導入でもコミット時にフックが機能する）。
+# lefthook.yml が未追加の間は、設定の無い hooks を導入しないようスキップする。
+.PHONY: hooks
+hooks: ## lefthook の git hooks を導入する（未導入なら lefthook 本体も導入。lefthook.yml 未追加ならスキップ）
+ifneq ($(HAS_LEFTHOOK),)
+	@if command -v lefthook >/dev/null 2>&1; then \
+		lefthook install; \
+	elif command -v brew >/dev/null 2>&1; then \
+		echo "lefthook を導入します"; \
+		brew install lefthook && lefthook install; \
+	elif command -v npx >/dev/null 2>&1; then \
+		echo "lefthook（npx 固定版）で hooks を導入します"; \
+		npx --yes lefthook@$(LEFTHOOK_VERSION) install; \
+	else \
+		echo "brew / npx が見つかりません。https://lefthook.dev/installation/ を参照してください" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: lefthook.yml 未追加のため hooks をスキップ"
+endif
+
+# --------------------------------------------------
+# ドキュメント／設定ファイル系 lint（CI の lint-docs ジョブと同等の内容）
+# --------------------------------------------------
+
+.PHONY: lint-md
+lint-md: ## markdownlint（.markdownlint.jsonc / .markdownlintignore 参照）
+	npx --yes markdownlint-cli@$(MARKDOWNLINT_VERSION) --ignore-path .markdownlintignore "**/*.md"
+
+# yamllint は Python 製のため npx で賄えない。導入済みの実体（brew / pip）を優先し、
+# uvx があれば固定版のワンショット実行で代替する。いずれも無ければ fail-closed で
+# 導入方法を案内して失敗する（silent skip は CI との false-green 乖離になるため行わない）。
+.PHONY: lint-yaml
+lint-yaml: ## yamllint（.yamllint 参照）
+	@if command -v yamllint >/dev/null 2>&1; then \
+		yamllint .; \
+	elif command -v uvx >/dev/null 2>&1; then \
+		uvx yamllint==$(YAMLLINT_VERSION) .; \
+	else \
+		echo "yamllint 未導入: brew install yamllint / pip install yamllint==$(YAMLLINT_VERSION) で導入してください" >&2; \
+		exit 1; \
+	fi
+
+.PHONY: lint-editorconfig
+lint-editorconfig: ## editorconfig-checker（.editorconfig + .editorconfig-checker.json 参照）
+	npx --yes editorconfig-checker@$(EC_NPM_VERSION)
+
+# main からの分岐点以降のコミットを CI（lint-docs の commitlint ジョブ）と同じ
+# extends 構成で検証する。origin/main が未取得の環境では範囲を決められないためスキップする。
+# `git rev-parse --verify --quiet` は「参照が存在しない」場合に終了コード 1 を返すため、
+# これだけを skip 条件にし、それ以外の非 0（`fatal: detected dubious ownership` 等。
+# 典型的には終了コード 128）はエラーメッセージを表示して非 0 終了する（fail-closed）。
+.PHONY: lint-commits
+lint-commits: ## commitlint（origin/main からの分岐点以降のコミットを検証）
+	@out=$$(git rev-parse --verify --quiet refs/remotes/origin/main 2>&1 >/dev/null); st=$$?; \
+	if [ "$$st" -eq 1 ]; then \
+		echo "skip: origin/main が未取得のため commitlint をスキップ"; \
+		exit 0; \
+	elif [ "$$st" -ne 0 ]; then \
+		printf '%s\n' "$$out" >&2; \
+		echo "NG: origin/main の参照確認に失敗しました（git rev-parse exit=$$st ）" >&2; \
+		exit 1; \
+	fi; \
+	base=$$(git merge-base origin/main HEAD) || { \
+		echo "NG: git merge-base の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	npx --yes -p @commitlint/cli@$(COMMITLINT_VERSION) -p @commitlint/config-conventional@$(COMMITLINT_CONFIG_VERSION) \
+		commitlint --extends @commitlint/config-conventional --from "$$base" --to HEAD
+
+.PHONY: lint-docs
+lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメント／設定ファイル系 lint を一括実行する
+
+# --------------------------------------------------
+# 品質チェック（Rust。Cargo.toml 追加後に有効化）
+# --------------------------------------------------
+
+# workspace 仮想 manifest（Cargo.toml）自体の構文・定義としての妥当性を検証する。
+# `cargo verify-project` は member crate が 0 件の仮想 workspace でも成功するため、
+# HAS_MEMBERS を条件にせず HAS_CARGO のみで常時実行する。
+.PHONY: check-workspace-manifest
+check-workspace-manifest: ## cargo verify-project で workspace manifest の妥当性を検証する
+ifneq ($(HAS_CARGO),)
+	@out=$$(cargo verify-project 2>&1) || { \
+		echo "$$out" >&2; \
+		echo "NG: Cargo.toml が cargo にとって不正な manifest です" >&2; \
+		exit 1; \
+	}; \
+	if ! printf '%s\n' "$$out" | grep -q '"success"'; then \
+		echo "$$out" >&2; \
+		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
+		exit 1; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
+endif
+
+# ソースを書き換える唯一のターゲット（fmt-check / lint / test / ci は書き換えない）
+.PHONY: fmt
+fmt: ## cargo fmt --all で整形する（ソースを書き換える）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo fmt --all
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt をスキップ"
+endif
+
+.PHONY: fmt-check
+fmt-check: ## cargo fmt --check（整形差分の検出。書き換えない）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo fmt --all --check
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため fmt-check をスキップ"
+endif
+
+# 既定 feature のみで検証する（`--all-features` 込みの検証は CI の rust-ci ジョブが
+# 担う。CI の rust-ci-default-features ジョブと同一コマンド）。
+.PHONY: lint
+lint: ## cargo clippy -D warnings（既定 feature。lint ゲート）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo clippy --workspace --all-targets -- -D warnings
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため lint をスキップ"
+endif
+
+.PHONY: test
+test: ## cargo test（既定 feature。workspace 全体）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	cargo test --workspace
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
+endif
+
+.PHONY: deny
+deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
+ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "cargo-deny を導入します"; \
+		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
+	}; \
+	cargo deny --locked check advisories bans licenses sources
+else
+	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
+endif
+
+.PHONY: ci
+ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（CI の ci.yml と同等のチェック）を一括実行する
+
+# --------------------------------------------------
+# 後片付け
+# --------------------------------------------------
+
+# 素の `cargo clean` は CARGO_TARGET_DIR / build.target-dir が他 worktree と共有の
+# ディレクトリを指している場合にそれを丸ごと消すため、`--target-dir target` で本リポの
+# ./target に限定する。target/ が symlink（共有ディレクトリへの参照の可能性）なら
+# 辿らずに拒否する（make スキル rust-crate サンプルと同一方針）。
+.PHONY: clean
+clean: ## 本リポの ./target のみ削除する（共有 CARGO_TARGET_DIR には触れない）
+ifneq ($(HAS_CARGO),)
+	@if [ -L target ]; then echo "error: target/ が symlink です（共有ビルドディレクトリの可能性）。削除を拒否します" >&2; exit 1; fi
+	cargo clean --target-dir target
+else
+	@echo "skip: Cargo.toml 未追加のため clean をスキップ"
+endif
