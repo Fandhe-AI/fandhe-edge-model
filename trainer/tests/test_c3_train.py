@@ -1,0 +1,161 @@
+"""C3（TASK-19.2 の既定候補）の学習・ONNX 書き出しの end-to-end テスト。CPU・小規模データ限定。"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import mlx.core as mx
+import numpy as np
+import onnx
+import pytest
+
+from conftest import TINY_CONFIG, make_examples, make_request
+from fandhe_edge_trainer import artifact as artifact_mod
+from fandhe_edge_trainer.errors import WorkerError
+from fandhe_edge_trainer.exitcode import ExitCode
+from fandhe_edge_trainer.kinds.c3 import C3Kind
+
+
+def _train_and_export(tmp_path: Path, seed: int = 0) -> Path:
+    kind = C3Kind()
+    req = make_request(tmp_path, seed=seed)
+    examples = make_examples()
+    trained = kind.train(examples, req)
+    onnx_path = tmp_path / f"model_{seed}.onnx"
+    kind.export_onnx(trained, onnx_path)
+    return onnx_path
+
+
+def test_c3_train_produces_valid_onnx_model(tmp_path: Path) -> None:
+    """REQ-19b・TASK-19.2: 学習・ONNX 書き出しが onnx.checker を通ること。"""
+    onnx_path = _train_and_export(tmp_path)
+    model = onnx.load(str(onnx_path))
+    onnx.checker.check_model(model)
+
+    graph = model.graph
+    assert [i.name for i in graph.input] == ["ids"]
+    assert [o.name for o in graph.output] == ["probs"]
+
+    ids_info = graph.input[0].type.tensor_type
+    assert ids_info.elem_type == onnx.TensorProto.INT64
+    ids_dims = [d.dim_param or d.dim_value for d in ids_info.shape.dim]
+    assert ids_dims == ["N", "T"]
+
+    probs_info = graph.output[0].type.tensor_type
+    assert probs_info.elem_type == onnx.TensorProto.FLOAT
+    probs_dims = [d.dim_param or d.dim_value for d in probs_info.shape.dim]
+    assert probs_dims == ["N", 2]  # 2 == len(LABEL_ORDER)
+
+
+def test_c3_artifact_fields(tmp_path: Path) -> None:
+    """artifact.json が Rust 側 Artifact 構造体のフィールドと一致すること。"""
+    kind = C3Kind()
+    req = make_request(tmp_path)
+    trained = kind.train(make_examples(), req)
+    art = artifact_mod.build_artifact(
+        kind=req.kind,
+        kind_version=req.kind_version,
+        config=trained.config,
+        label_order=trained.label_order,
+        output_type="choice",
+        max_bytes=trained.max_bytes,
+        candidate_label="c3",
+    )
+    assert art["kind"] == "c3"
+    assert art["kind_version"] == 1
+    assert art["selector_version"] == artifact_mod.SELECTOR_VERSION
+    assert art["label_order"] == ["cat_a", "cat_b"]
+    assert art["output_type"] == "choice"
+    assert art["max_bytes"] == 64
+    assert art["onnx_file"] == "model.onnx"
+    assert art["candidate_label"] == "c3"
+    assert art["config"]["emb"] == TINY_CONFIG["emb"]
+    assert isinstance(art["created_utc"], str)
+    assert art["created_utc"].endswith("Z")
+
+
+def test_c3_training_is_deterministic_on_cpu(tmp_path: Path) -> None:
+    """evaluation-contract: 同一 seed・CPU の学習結果は sha256 一致（証拠種別: テストハーネス）。"""
+    onnx_a = _train_and_export(tmp_path / "run_a", seed=0)
+    onnx_b = _train_and_export(tmp_path / "run_b", seed=0)
+
+    def sha256(p: Path) -> str:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    assert sha256(onnx_a) == sha256(onnx_b)
+
+
+def test_c3_train_rejects_wrong_type_config(tmp_path: Path) -> None:
+    """TASK-19.1: config の上書きが不正な型なら invalid_config（exit 64）で拒否する。"""
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "epochs": "not-an-int"})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_c3_train_rejects_even_width(tmp_path: Path) -> None:
+    """偶数のカーネル幅は padding が出力長を +1 させ、REQ-28 の一致契約を壊すため拒否する。"""
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "widths": [3, 4]})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+
+
+def test_c3_train_rejects_config_upper_bound_violation(tmp_path: Path) -> None:
+    """項目 2: emb・filters・epochs・batch_size は上限を超えると invalid_config で拒否する。"""
+    from fandhe_edge_trainer.limits import MAX_C3_EMB
+
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "emb": MAX_C3_EMB + 1})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_c3_train_rejects_nan_lr(tmp_path: Path) -> None:
+    """項目 2: lr が NaN の場合、範囲比較（`nan <= x` は常に False）をすり抜けず拒否する。"""
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "lr": float("nan")})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+
+
+def test_c3_train_rejects_infinite_lr(tmp_path: Path) -> None:
+    kind = C3Kind()
+    req = make_request(tmp_path, config={**TINY_CONFIG, "lr": float("inf")})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+
+
+def test_c3_train_rejects_too_many_widths(tmp_path: Path) -> None:
+    from fandhe_edge_trainer.limits import MAX_C3_WIDTHS
+
+    kind = C3Kind()
+    widths = [2 * i + 1 for i in range(MAX_C3_WIDTHS + 1)]
+    req = make_request(tmp_path, config={**TINY_CONFIG, "widths": widths})
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train(make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+
+
+def test_c3_export_rejects_nonzero_pad_embedding_row(tmp_path: Path) -> None:
+    """クラス docstring 3 番の不変条件（詰め物行は厳密ゼロ）を fail-closed で検証する。"""
+    kind = C3Kind()
+    req = make_request(tmp_path)
+    trained = kind.train(make_examples(), req)
+
+    w = np.array(trained.model.embed.weight, dtype=np.float32)
+    w[0, 0] = 1.0  # 不変条件を意図的に壊す
+    trained.model.embed.weight = mx.array(w)
+
+    with pytest.raises(WorkerError) as exc_info:
+        kind.export_onnx(trained, tmp_path / "broken.onnx")
+    assert exc_info.value.code == "runtime_error"
+    assert exc_info.value.exit_code == ExitCode.RUNTIME_ERROR
