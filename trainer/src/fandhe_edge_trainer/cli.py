@@ -85,12 +85,23 @@ def _apply_rlimit_cpu_backstop(time_limit_seconds: int) -> None:
         pass
 
 
-def run_worker_train(request_path: Path) -> ExitCode:
+def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
     """`_worker` サブコマンドの本体（実際の学習・書き出し）。戻り値は終了コード。
+
+    **`out_dir` の名前・予約・確定・後始末には一切関与しない**（P0-1・P0-2 の
+    見直し。`contract.py` モジュール docstring・`OutDirReservation` のクラス
+    docstring 参照）。それらはすべてスーパーバイザー（`supervisor.py`）が担い、
+    本関数には `--out-fd` で「学習・書き出しの成果物を書き込んでよい、既に
+    予約済みの一時ディレクトリ」の fd 番号だけが渡される。`artifact.json`・
+    `model.onnx` はその fd へ `dir_fd` 相対（`O_CREAT|O_EXCL|O_NOFOLLOW`）で
+    新規作成するだけで、`out_dir` の名前を組み立てる経路は本関数のどこにも
+    無い。
 
     `request` が保持する fd（`root`・`train_path`・`out_dir`。
     `contract.py`・`guard.py` 参照）は、成功・失敗いずれの経路でも
-    `finally` で必ず閉じる（`TrainRequest.close_resources()`）。
+    `finally` で必ず閉じる（`TrainRequest.close_resources()`。`out_dir` 側の
+    fd はここで確認のためだけに開いたものであり、スーパーバイザー側が別途
+    保持している実体とは独立した fd なので、ここで閉じてよい）。
 
     `resource_budget`（`budget.py::ResourceBudget`）はリクエストの検証直後に
     1 つだけ生成し、学習データの読み込み（`contract.load_train_examples`）・
@@ -111,42 +122,33 @@ def run_worker_train(request_path: Path) -> ExitCode:
         )
         kind_impl = resolve_kind(request.kind, request.kind_version)
 
-        reservation = contract.prepare_out_dir(request.out_dir)
-        try:
-            trained = kind_impl.train(examples, request, resource_budget)
-            # ONNX 本体・artifact.json は、予約済み out_dir と同じ親ディレクトリ
-            # 配下の作業用一時ディレクトリ（`reservation.tmp_fd`）へ、経路文字列を
-            # 使わず dir_fd 相対で新規作成する（TOCTOU 対策。O_EXCL で上書きしない）。
-            onnx_fd = os.open(
-                artifact_mod.ONNX_FILE_NAME,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=reservation.tmp_fd,
-            )
-            with os.fdopen(onnx_fd, "wb") as onnx_file:
-                kind_impl.export_onnx(trained, onnx_file)
-            art = artifact_mod.build_artifact(
-                kind=request.kind,
-                kind_version=request.kind_version,
-                config=trained.config,
-                label_order=trained.label_order,
-                # "choice"（選択肢からの判定）は Rust 側 Artifact.output_type
-                # （artifact.rs）・selector_common.py の output.type 契約と同じ値。
-                # 生成型の種類（REQ-19b）を追加する際はここが "choice" 以外の値を
-                # 取りうるようになる（その値の集合・意味は共通コア〔REQ-15〕側で
-                # 定義されるべきで、本ワーカーは種類ごとに固定値を渡すだけに留める）。
-                output_type="choice",
-                max_bytes=trained.max_bytes,
-                candidate_label=request.kind,
-            )
-            artifact_mod.write_artifact(reservation.tmp_fd, art)
-        except BaseException:
-            # 一時ディレクトリ（自分の作業物）・予約済み out_dir（「まだ自分の
-            # 予約かつ空」の場合のみ）の両方を解放する（contract.cleanup_reservation
-            # のドキュメント参照。学習中に何者かが out_dir へ書き込んでいたら残す）。
-            contract.cleanup_reservation(reservation)
-            raise
-        contract.finalize_out_dir(reservation)
+        trained = kind_impl.train(examples, request, resource_budget)
+        # ONNX 本体・artifact.json は、スーパーバイザーが渡した一時ディレクトリの
+        # fd（`out_fd`）へ、経路文字列を使わず dir_fd 相対で新規作成する
+        # （TOCTOU 対策。O_EXCL で上書きしない）。
+        onnx_fd = os.open(
+            artifact_mod.ONNX_FILE_NAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=out_fd,
+        )
+        with os.fdopen(onnx_fd, "wb") as onnx_file:
+            kind_impl.export_onnx(trained, onnx_file)
+        art = artifact_mod.build_artifact(
+            kind=request.kind,
+            kind_version=request.kind_version,
+            config=trained.config,
+            label_order=trained.label_order,
+            # "choice"（選択肢からの判定）は Rust 側 Artifact.output_type
+            # （artifact.rs）・selector_common.py の output.type 契約と同じ値。
+            # 生成型の種類（REQ-19b）を追加する際はここが "choice" 以外の値を
+            # 取りうるようになる（その値の集合・意味は共通コア〔REQ-15〕側で
+            # 定義されるべきで、本ワーカーは種類ごとに固定値を渡すだけに留める）。
+            output_type="choice",
+            max_bytes=trained.max_bytes,
+            candidate_label=request.kind,
+        )
+        artifact_mod.write_artifact(out_fd, art)
     finally:
         request.close_resources()
 
@@ -164,9 +166,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train = sub.add_parser("train", add_help=False, exit_on_error=False)
     p_train.add_argument("--request", required=True)
     # `_worker`: 公開契約ではない内部サブコマンド（P0-2 のモジュール docstring参照）。
-    # `train`（supervisor.py）が子プロセスとして起動する実体。
+    # `train`（supervisor.py）が子プロセスとして起動する実体。`--out-fd` は
+    # スーパーバイザーが `pass_fds` で引き継いだ、出力用一時ディレクトリの fd 番号
+    # （`contract.py::OutDirReservation` 参照。`_worker` はこの fd 番号以外の
+    # 経路で `out_dir` を扱わない）。
     p_worker = sub.add_parser("_worker", add_help=False, exit_on_error=False)
     p_worker.add_argument("--request", required=True)
+    p_worker.add_argument("--out-fd", required=True, type=int)
     return parser
 
 
@@ -177,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "train":
             exit_code = supervisor_mod.run_supervised_train(Path(args.request))
         elif args.command == "_worker":
-            exit_code = run_worker_train(Path(args.request))
+            exit_code = run_worker_train(Path(args.request), args.out_fd)
         else:  # pragma: no cover - argparse の choices で到達しない
             raise WorkerError(
                 "invalid_request", f"unknown command: {args.command}", ExitCode.INVALID_INPUT

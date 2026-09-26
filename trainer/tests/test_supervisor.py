@@ -1,16 +1,18 @@
-"""`supervisor.py`（P0-2: 壁時計・RSS のプロセス外強制打ち切り）のテスト。
+"""`supervisor.py`（P0-2: 壁時計・RSS のプロセス外強制打ち切り。P1-1: 標準出力の
+並行読み出し）のテスト。
 
-`monitor_child` を、実際の学習ワーカーではなくダミーの子プロセス（`sys.executable
--c "..."`）に対して直接呼ぶことで、監視ロジックだけを高速・決定的に検証する
-（証拠種別: テストハーネス）。
+`monitor_child`・`_drain_stdout` を、実際の学習ワーカーではなくダミーの子プロセス
+（`sys.executable -c "..."`）に対して直接呼ぶことで、監視ロジックだけを
+高速・決定的に検証する（証拠種別: テストハーネス）。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
+import threading
+import time as time_mod
 from pathlib import Path
 
 import pytest
@@ -20,20 +22,24 @@ from fandhe_edge_trainer import supervisor
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
 
-def _spawn(code: str) -> subprocess.Popen:
+def _spawn(code: str, *, stdout: int = subprocess.DEVNULL) -> subprocess.Popen:
     return subprocess.Popen(  # noqa: S603 - テスト専用。引数は固定・shell 不使用
         [sys.executable, "-c", code],
-        stdout=subprocess.DEVNULL,
+        stdout=stdout,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
 
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_monitor_child_kills_on_time_limit() -> None:
     proc = _spawn("import time; time.sleep(60)")
     try:
-        import time as time_mod
-
         t0 = time_mod.monotonic()
         reason = supervisor.monitor_child(
             proc,
@@ -47,17 +53,13 @@ def test_monitor_child_kills_on_time_limit() -> None:
         assert elapsed < 5.0  # 60 秒スリープを待たずに打ち切られていること
         assert proc.poll() is not None  # 子プロセスが実際に終了している
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
+        _reap(proc)
 
 
 def test_monitor_child_kills_on_rss_limit() -> None:
     # 約 200MiB を確保してからスリープする（RSS が確実に上限を超えるようにする）。
     proc = _spawn("b = bytearray(200 * 1024 * 1024); import time; time.sleep(60)")
     try:
-        import time as time_mod
-
         t0 = time_mod.monotonic()
         reason = supervisor.monitor_child(
             proc,
@@ -71,9 +73,7 @@ def test_monitor_child_kills_on_rss_limit() -> None:
         assert elapsed < 10.0
         assert proc.poll() is not None
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
+        _reap(proc)
 
 
 def test_monitor_child_returns_none_on_normal_completion() -> None:
@@ -104,9 +104,7 @@ def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.Monk
         assert reason == "monitor_failed"
         assert proc.poll() is not None
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
+        _reap(proc)
 
 
 def test_parse_worker_stdout_accepts_single_json_object() -> None:
@@ -122,47 +120,57 @@ def test_parse_worker_stdout_rejects_non_json() -> None:
     assert supervisor._parse_worker_stdout(b"not json at all\n") is None
 
 
-def test_parse_worker_stdout_rejects_oversized() -> None:
-    huge = b'{"a": "' + b"x" * (supervisor._MAX_WORKER_STDOUT_BYTES + 16) + b'"}'
-    assert supervisor._parse_worker_stdout(huge) is None
+# --------------------------------------------------------------------------
+# P1-1: 標準出力の並行読み出し（パイプ詰まりによる誤判定の防止）
+# --------------------------------------------------------------------------
 
 
-def test_cleanup_orphaned_output_removes_only_reservation_artifacts(tmp_path: Path) -> None:
-    """予約済み一時ディレクトリ（`.out.tmp-*`）とその中身は消すが、無関係な
-    ファイル・出力先ディレクトリの外にあるものには一切触れないこと。
+def test_drain_stdout_prevents_pipe_block_during_slow_monitoring() -> None:
+    """子プロセスが大量の標準出力（一般的な OS のパイプ容量 64KiB を明確に
+    超える量）を書き込んでも、別スレッドで並行して読み進めていればブロックせず
+    正常に完了できること（監視が誤って `limit_exceeded` と判定しないこと）。
     """
-    from fandhe_edge_trainer import contract, guard
-
-    root_handle = guard.resolve_root(str(tmp_path))
-    entry = guard.confine(root_handle, "out", "out_dir")
-    reservation = contract.prepare_out_dir(entry)
-    fd = os.open(
-        "partial.onnx", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=reservation.tmp_fd
+    size = 200_000  # 64KiB のパイプ容量を明確に超える
+    proc = _spawn(
+        f"import sys; sys.stdout.write('x' * {size}); sys.stdout.flush()",
+        stdout=subprocess.PIPE,
     )
-    with os.fdopen(fd, "wb") as f:
-        f.write(b"partial data")
-    reservation.close_tmp_fd()
-    entry.close()
-    root_handle.close()
+    stdout_result: dict = {}
+    reader = threading.Thread(target=supervisor._drain_stdout, args=(proc.stdout, stdout_result))
+    reader.start()
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=10.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+    finally:
+        reader.join(timeout=10)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    assert reason is None  # パイプが詰まってブロックしたなら "time" になっていたはず
+    assert stdout_result["oversized"] is False
+    assert stdout_result["data"] == b"x" * size
 
-    # 無関係なファイル（out_dir の外）は触れられないことを確認する対照群。
-    (tmp_path / "unrelated.txt").write_text("keep me", encoding="utf-8")
 
-    supervisor._cleanup_orphaned_output(str(tmp_path), "out")
-
-    assert not (tmp_path / "out").exists()  # 空だった予約済み out_dir は消える
-    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
-    assert (tmp_path / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
-
-
-def test_cleanup_orphaned_output_leaves_unrelated_out_dir_untouched(tmp_path: Path) -> None:
-    """out_dir が（別の何かによって）予約と無関係な内容を持つ場合、削除しない。"""
-    (tmp_path / "out").mkdir()
-    (tmp_path / "out" / "already_here.txt").write_text("do not delete", encoding="utf-8")
-
-    supervisor._cleanup_orphaned_output(str(tmp_path), "out")
-
-    assert (tmp_path / "out" / "already_here.txt").read_text(encoding="utf-8") == "do not delete"
+def test_drain_stdout_caps_and_flags_oversized() -> None:
+    size = supervisor._MAX_WORKER_STDOUT_BYTES + 1000
+    proc = _spawn(
+        f"import sys; sys.stdout.write('x' * {size}); sys.stdout.flush()",
+        stdout=subprocess.PIPE,
+    )
+    result: dict = {}
+    try:
+        supervisor._drain_stdout(proc.stdout, result)
+        proc.wait(timeout=10)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        _reap(proc)
+    assert result["oversized"] is True
+    assert len(result["data"]) == supervisor._MAX_WORKER_STDOUT_BYTES
 
 
 def test_supervisor_module_does_not_import_mlx() -> None:

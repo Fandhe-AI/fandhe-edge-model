@@ -109,6 +109,54 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     assert payload["artifact"]["kind"] == "c3"
     assert (out_dir / "artifact.json").exists()
     assert (out_dir / "model.onnx").exists()
+    # 予約に使った作業用一時ディレクトリ（`.out.tmp-*`）が残置されていない
+    # （スーパーバイザーが確定〔rename〕まで正しく完了させたことの確認）。
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+def test_cli_train_exceeding_rss_limit_is_killed_and_cleaned_up(tmp_path: Path) -> None:
+    """P0-2: 実際にワーカー（mlx を import する本物のプロセス）を起動しても、
+    極小の `rss_limit_bytes` を与えればスーパーバイザーが強制終了し、
+    `limit_exceeded`（exit 20）を返すこと。かつ、出力先には何も残らない
+    （予約〔`out_dir`・作業用一時ディレクトリ〕が解放される。証拠種別:
+    テストハーネス〔本テスト実行機での実測〕）。
+
+    学習を人為的に遅くする代わりに RSS 上限を極小（10 MiB）にする設計にした
+    理由: Python・mlx を import した時点で RSS は 10 MiB を確実に上回るため、
+    学習の実際の所要時間に依存せず決定的にキルできる（本番コードにテスト専用の
+    遅延フックを仕込む必要が無い）。
+    """
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+        "rss_limit_bytes": 10 * 1024 * 1024,
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    result = _run_cli(request_path)
+    assert result.returncode == 20, (result.returncode, result.stdout, result.stderr)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "error"
+    assert payload["code"] == "limit_exceeded"
+    # 予約済み out_dir・作業用一時ディレクトリのいずれも残っていない
+    # （supervisor.py::cleanup_reservation が正しく解放したことの確認）。
+    assert not out_dir.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
 def test_cli_train_invalid_request_exits_64(tmp_path: Path) -> None:

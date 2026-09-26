@@ -121,6 +121,18 @@ def test_load_request_rejects_unknown_field(tmp_path: Path) -> None:
     assert "extra_field" in exc_info.value.message
 
 
+def test_load_request_rejects_unknown_field_with_bounded_message_length(tmp_path: Path) -> None:
+    """P1-1: 未知のフィールド名（リクエスト JSON の全体サイズ上限まで利用者が
+    自由に長くできる）を、切り詰めずにそのままエラーメッセージへ埋め込まない。
+    """
+    huge_field_name = "x" * 10_000
+    p = _write(tmp_path / "req.json", {**_base_request(tmp_path), huge_field_name: 1})
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "invalid_request"
+    assert len(exc_info.value.message) < 1000  # 切り詰められていることの目安
+
+
 def test_load_request_rejects_wrong_type(tmp_path: Path) -> None:
     p = _write(tmp_path / "req.json", {**_base_request(tmp_path), "max_bytes": "512"})
     with pytest.raises(WorkerError) as exc_info:
@@ -608,6 +620,57 @@ def test_cleanup_reserved_out_dir_leaves_nonempty_reservation(tmp_path: Path) ->
         assert (tmp_path / "out" / "foreign.txt").exists()
 
 
+def test_finalize_out_dir_rejects_when_tmp_dir_swapped(tmp_path: Path) -> None:
+    """P0-2: 予約後・確定前に、作業用一時ディレクトリの名前が別物（別 inode の
+    ディレクトリ）へすり替わっていた場合、`fstat(tmp_fd)` と
+    `stat(tmp_name)` の不一致で検出して拒否し、すり替わった側の中身には
+    一切触れないこと（`rename` は名前しか受け取らないため、fd を握っている
+    だけでは差し替えを防げない。直前の突き合わせが本質的な防御になる）。
+    """
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        tmp_path_on_disk = tmp_path / reservation.tmp_name
+
+        # 自分の一時ディレクトリを退避し、同名・別 inode のディレクトリへ
+        # 差し替える（別プロセスによる置き換えを模す）。
+        real_tmp = tmp_path / f"{reservation.tmp_name}.real"
+        tmp_path_on_disk.rename(real_tmp)
+        tmp_path_on_disk.mkdir()
+        (tmp_path_on_disk / "evidence.txt").write_text("foreign data", encoding="utf-8")
+
+        with pytest.raises(WorkerError) as exc_info:
+            contract.finalize_out_dir(reservation)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        # すり替わった側の中身には一切触れられていない。
+        assert (tmp_path_on_disk / "evidence.txt").read_text(encoding="utf-8") == "foreign data"
+        # out_dir 自体（予約済みの空ディレクトリ）にも触れられていない。
+        assert (tmp_path / "out").is_dir()
+        assert not any((tmp_path / "out").iterdir())
+
+
+def test_cleanup_reservation_never_touches_foreign_prefix_siblings(tmp_path: Path) -> None:
+    """P0-1: `cleanup_reservation` は自分の予約（`reservation.tmp_name`・
+    `reservation.entry.name`）だけを対象にし、たとえ同じ命名規則
+    （`.{name}.tmp-*`）に一致する無関係な兄弟ディレクトリがあっても一切
+    触れないこと（名前の前方一致だけを根拠にした一括削除は廃止済み。
+    以前の `cleanup_orphaned_reservation` はこの前方一致に依存していた）。
+    """
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+
+        foreign = tmp_path / ".out.tmp-deadbeefdeadbeef"
+        foreign.mkdir()
+        (foreign / "not_mine.txt").write_text("do not touch", encoding="utf-8")
+
+        contract.cleanup_reservation(reservation)
+
+        assert not (tmp_path / "out").exists()
+        assert not (tmp_path / reservation.tmp_name).exists()
+        assert foreign.exists()
+        assert (foreign / "not_mine.txt").read_text(encoding="utf-8") == "do not touch"
+
+
 # --------------------------------------------------------------------------
 # TOCTOU の核心確認: confine 後に経路をシンボリックリンクへ差し替えても、
 # fd に束縛された実体（confine 時点のディレクトリ）だけが使われること。
@@ -654,22 +717,26 @@ def test_prepare_out_dir_is_immune_to_parent_swap_after_confine(tmp_path: Path) 
         root_handle.close()
 
 
-def test_cleanup_tmp_contents_does_not_leak_fds(tmp_path: Path) -> None:
+def test_cleanup_tmp_contents_via_fd_does_not_leak_fds(tmp_path: Path) -> None:
     """一時ディレクトリの後始末（中身あり・空の両方）で fd を 1 つも漏らさない。
 
     失敗時クリーンアップのたびに fd が漏れると、長時間のジョブ管理下で
-    fd 枯渇を招く（`os.scandir(fd)` は渡した fd を閉じない）。
+    fd 枯渇を招く（`os.scandir(fd)` は渡した fd を閉じない。P0-2 では
+    「既に開いている fd」だけを使い、名前で開き直さない設計にしたため、
+    本関数自体は渡された fd を閉じない契約になっている＝呼び出し側の責務）。
     """
     (tmp_path / "full").mkdir()
     (tmp_path / "full" / "a.bin").write_bytes(b"x")
     (tmp_path / "empty").mkdir()
-    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    full_fd = os.open(tmp_path / "full", os.O_RDONLY | os.O_DIRECTORY)
+    empty_fd = os.open(tmp_path / "empty", os.O_RDONLY | os.O_DIRECTORY)
     try:
         before = len(os.listdir("/dev/fd"))
-        contract._cleanup_tmp_contents(parent_fd, "full")
-        contract._cleanup_tmp_contents(parent_fd, "empty")
+        contract._cleanup_tmp_contents_via_fd(full_fd)
+        contract._cleanup_tmp_contents_via_fd(empty_fd)
         after = len(os.listdir("/dev/fd"))
     finally:
-        os.close(parent_fd)
+        os.close(full_fd)
+        os.close(empty_fd)
     assert after == before
     assert list((tmp_path / "full").iterdir()) == []

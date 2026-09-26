@@ -28,7 +28,13 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 最終コンポーネント名」）を保持する（`Path` 文字列ではない。TOCTOU 対策。
 `guard.py` のモジュール docstring 参照）。`TrainRequest.root` は開いたままの
 `guard.RootHandle`。**いずれも使い終わったら `TrainRequest.close_resources()` で
-明示的に fd を閉じること**（`cli.py::run_train` が `finally` で行う）。
+明示的に fd を閉じること**（`_worker`〔`cli.py::run_worker_train`〕・
+スーパーバイザー〔`supervisor.py`〕がそれぞれ `finally` で行う）。
+
+**`validate_request` は `train`（スーパーバイザー）・`_worker`（実際の学習・
+書き出し）の両方から呼ばれる単一の検証経路**（`out_dir` の確認は本関数では
+行わない。スーパーバイザーが `request.out_dir` を使って `prepare_out_dir` を
+呼ぶ側であり、`_worker` は検証だけ行って `request.out_dir` を使わずに閉じる）。
 
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
 `MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
@@ -50,12 +56,24 @@ Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単�
 時点）と使用（実際の読み書き・`mkdir`・`rename`）を同じ fd に束縛することで、
 検証後に経路の途中がシンボリックリンクへ差し替えられる TOCTOU を防ぐ。
 
-**ジョブの再開・異常終了時の後片付けは本モジュールの責務ではない**（REQ-34）。
-`prepare_out_dir`/`finalize_out_dir` は「同一プロセス内で正常終了 or 例外終了する」
-場合の半端な書き込み防止だけを担う。本ワーカーが SIGKILL 等で強制終了した場合、
-空の予約済み `out_dir`・その一時ディレクトリが残置されうるが、その回収（次回実行前の
-掃除・再試行判断）はジョブ管理を担う Rust 側（TASK-34.x）の責務とする。予約済み
-`out_dir` が空のままであること自体が「成果物は公開されていない」ことの証拠になる。
+**`out_dir` の所有権はスーパーバイザーに一元化する**（P0-1・P0-2 の見直し）:
+`prepare_out_dir`・`finalize_out_dir`・`cleanup_reservation` は
+**スーパーバイザー（`supervisor.py`）だけが呼ぶ**。`_worker` は `out_dir` の
+予約・確定・後始末のいずれにも関与しない。理由: `_worker` は壁時計・RSS 超過で
+いつ強制終了されてもおかしくない別プロセスであり、強制終了された時点で
+`_worker` が持っていた fd はすべて失われる。強制終了後に「経路の名前を頼りに
+予約の後始末を再構築する」設計は、名前が一致するというだけの根拠で別物を
+消してしまう TOCTOU を生む（実際に P0-1 として指摘された）。スーパーバイザーは
+`_worker` を監視するだけで自身は強制終了されない前提のプロセスなので、
+予約に使った fd（`parent_fd`・`tmp_fd`）をジョブの最初から最後まで手放さずに
+持ち続けられる。強制終了は `_worker` だけに afflict し、スーパーバイザー自身が
+（SIGKILL 等で）道連れに終了した場合の後始末は、本モジュールの責務ではなく
+Rust 側ジョブ管理（TASK-34.x REQ-34）に委ねる。予約済み `out_dir` が空のまま
+残ることは「成果物は公開されていない」ことの証拠になる。
+
+`_worker` は、スーパーバイザーが `pass_fds` で渡した一時ディレクトリの fd
+（`--out-fd <n>`）へ `artifact.json`・`model.onnx` を書き込むだけで、`out_dir` の
+名前を一切扱わない（`cli.py::run_worker_train` 参照）。
 
 **`out_dir` の確定は「空ディレクトリの予約 → 別ディレクトリで作業 → アトミックな
 置き換え」の 3 段で行う**（TOCTOU 対策）。`prepare_out_dir` が `os.mkdir`
@@ -63,10 +81,11 @@ Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単�
 `FileExistsError` を検出できる。「存在確認 → 後で作成」という 2 手順では、
 その間に別プロセスが先に作成できてしまう）。学習・書き出しは兄弟の一時
 ディレクトリ（同じ `parent_fd` 配下）で行い、`finalize_out_dir` が予約時に
-記録した `(st_dev, st_ino)` と現在の `out_dir` のそれを突き合わせてから
-（別物にすり替わっていないか）`os.rename`（`dir_fd` 相対）で確定する。
-置き換え先が空ディレクトリでなくなっていた場合（何者かが書き込んだ）は
-`os.rename` 自体が `ENOTEMPTY` で失敗するため、その内容を消さずに残す。
+記録した `(st_dev, st_ino)` と現在の `out_dir`・一時ディレクトリのそれを
+突き合わせてから（別物にすり替わっていないか。`OutDirReservation` のクラス
+docstring 参照）`os.rename`（`dir_fd` 相対）で確定する。置き換え先が空
+ディレクトリでなくなっていた場合（何者かが書き込んだ）は `os.rename` 自体が
+`ENOTEMPTY` で失敗するため、その内容を消さずに残す。
 
 **`os.replace` ではなく `os.rename` を使う**: `os.replace` は `dir_fd` 引数を
 サポートしない（`os.replace not in os.supports_dir_fd`。本開発機の macOS で
@@ -89,7 +108,7 @@ from typing import IO, Any
 
 from . import budget, guard
 from .encoding import normalize_input
-from .errors import WorkerError
+from .errors import WorkerError, truncate_list_for_message
 from .exitcode import ExitCode
 from .limits import (
     MAX_LABEL_BYTES,
@@ -305,7 +324,9 @@ def validate_request(raw: Any) -> TrainRequest:
         raise _invalid("request must be a JSON object")
     unknown = set(raw) - _REQUEST_FIELDS
     if unknown:
-        raise _invalid(f"request has unknown fields: {sorted(unknown)}")
+        # フィールド名はリクエスト JSON の全体サイズ上限（MAX_REQUEST_BYTES）まで
+        # 利用者が自由に長くできるため、切り詰めてから埋め込む（P1-1）。
+        raise _invalid(f"request has unknown fields: {truncate_list_for_message(sorted(unknown))}")
 
     schema_version = raw.get("schema_version")
     if schema_version != SCHEMA_VERSION:
@@ -529,11 +550,24 @@ class OutDirReservation:
 
     `entry.parent_fd` を経由してのみ `out_dir`・一時ディレクトリを操作する
     （`entry` が指すディレクトリの外へ書き出す経路は無い）。
+
+    **本予約の全ライフサイクル（作成・子プロセスへの fd 引き渡し・確定・
+    後始末）はスーパーバイザー（`supervisor.py`）が一貫して保持する**
+    （P0-1・P0-2 の見直し。以前はワーカー〔`_worker`〕がこれを保持していたが、
+    ワーカーは強制終了されうる別プロセスであり、その場合ワーカー内の
+    `tmp_fd`・`OutDirReservation` は失われる。そのため、強制終了後の後始末を
+    「経路の名前を頼りに再構築する」処理が必要になり、名前が一致するというだけで
+    他人のディレクトリを消してしまう TOCTOU が残っていた。fd を最初から
+    最後まで手放さないスーパーバイザーだけがこの予約を扱うことで、
+    「経路を再構築して後始末する」処理自体が丸ごと不要になる。ワーカーは
+    `--out-fd <n>` で渡された一時ディレクトリの fd へ書き込むだけで、
+    `out_dir` の名前・予約・確定・後始末のいずれにも一切関与しない）。
     """
 
     entry: guard.ConfinedEntry
     tmp_name: str
     tmp_fd: int
+    tmp_id: ReservedId
     reserved_id: ReservedId
     _tmp_closed: bool = field(default=False, init=False, repr=False)
 
@@ -544,9 +578,18 @@ class OutDirReservation:
                 os.close(self.tmp_fd)
 
 
+def _tmp_name_prefix(name: str) -> str:
+    return f".{name}.tmp-"
+
+
 def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     """`out_dir` を空ディレクトリとして排他的に予約し、書き込み用の一時
     ディレクトリ（兄弟。同じ `entry.parent_fd` 配下）を作って返す。
+
+    呼び出し元は**スーパーバイザーに限る**（`OutDirReservation` のクラス
+    docstring 参照）。返り値の `tmp_fd`・`parent_fd` はジョブが終わる
+    （`finalize_out_dir` 成功 or `cleanup_reservation`）まで呼び出し元が
+    保持し続けること。
 
     「存在確認 → 後で作成」という 2 手順では、その間に別プロセスが先に
     `out_dir` を作れてしまう（TOCTOU）。`os.mkdir`（`dir_fd` 相対）は対象が
@@ -578,6 +621,8 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
         tmp_name = f"{_tmp_name_prefix(name)}{secrets.token_hex(8)}"
         os.mkdir(tmp_name, 0o700, dir_fd=parent_fd)
         tmp_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        tmp_st = os.fstat(tmp_fd)
+        tmp_id: ReservedId = (tmp_st.st_dev, tmp_st.st_ino)
     except BaseException as e:
         if tmp_fd is not None:
             with contextlib.suppress(OSError):
@@ -593,16 +638,25 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
             raise
         raise _invalid(f"failed to prepare out_dir: {type(e).__name__}") from e
 
-    return OutDirReservation(entry=entry, tmp_name=tmp_name, tmp_fd=tmp_fd, reserved_id=reserved_id)
+    return OutDirReservation(
+        entry=entry, tmp_name=tmp_name, tmp_fd=tmp_fd, tmp_id=tmp_id, reserved_id=reserved_id
+    )
 
 
 def finalize_out_dir(reservation: OutDirReservation) -> None:
     """予約済みの `out_dir`（空ディレクトリ）を一時ディレクトリの内容で確定させる。
 
-    確定前に `out_dir` が「予約時点と同じ実体（`st_dev`・`st_ino` が一致する
-    ディレクトリ。シンボリックリンクや別物にすり替わっていない）」であることを
-    確認する。一致しなければ、実体が何であれ触れずに `output_conflict`
-    （exit 64）とする。一致していれば `os.rename`（`dir_fd` 相対）で置き換える:
+    確定前に 2 つの実体を確認する（P0-2: `rename` は名前しか受け取らないため、
+    fd を握っているだけでは名前の差し替えを防げない。直前に必ず名前と fd の
+    実体を突き合わせる）:
+    1. `tmp_name` が今も自分の `tmp_fd` と同じ実体を指しているか
+       （`fstat(tmp_fd)` と `stat(tmp_name, follow_symlinks=False)` の
+       `(st_dev, st_ino)` が一致するか）。
+    2. `out_dir`（`name`）が予約時点と同じ実体（`reserved_id`）を指しているか
+       （シンボリックリンクや別物にすり替わっていないか）。
+
+    いずれか一致しなければ、実体が何であれ触れずに `output_conflict`
+    （exit 64）とする。両方一致すれば `os.rename`（`dir_fd` 相対）で置き換える:
     予約後に何者かが `out_dir` の中へファイルを書き込んでいた場合、`rename` は
     ディレクトリを空でない置き換え先へは適用できない（`ENOTEMPTY`）ため失敗する。
     この場合もその内容を削除せず残したまま `output_conflict` とする
@@ -613,6 +667,23 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
     entry = reservation.entry
     parent_fd = entry.parent_fd
     name = entry.name
+
+    try:
+        tmp_fd_st = os.fstat(reservation.tmp_fd)
+        tmp_name_st = os.stat(reservation.tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as e:
+        _release_tmp(reservation)
+        raise WorkerError(
+            "output_conflict",
+            f"tmp entry vanished before finalize: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if (tmp_fd_st.st_dev, tmp_fd_st.st_ino) != (tmp_name_st.st_dev, tmp_name_st.st_ino):
+        _release_tmp(reservation)
+        raise WorkerError(
+            "output_conflict", "tmp entry was replaced before finalize", ExitCode.INVALID_INPUT
+        )
+
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as e:
@@ -631,24 +702,23 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
             ExitCode.INVALID_INPUT,
         )
 
-    reservation.close_tmp_fd()  # rename に fd は不要（名前だけで足りる）
     try:
         os.rename(reservation.tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except OSError as e:
         # ENOTEMPTY（予約後に何者かが書き込んだ）等。out_dir の中身は触らない。
-        _cleanup_tmp_contents(parent_fd, reservation.tmp_name)
-        with contextlib.suppress(OSError):
-            os.rmdir(reservation.tmp_name, dir_fd=parent_fd)
+        _release_tmp(reservation)
         raise WorkerError(
             "output_conflict",
             f"failed to finalize out_dir: {type(e).__name__}",
             ExitCode.INVALID_INPUT,
         ) from e
+    reservation.close_tmp_fd()  # 成功: rename 後はもう不要
 
 
 def cleanup_reservation(reservation: OutDirReservation) -> None:
-    """学習・書き出しの失敗時に、確保済みの一時ディレクトリと予約済み `out_dir`
-    の両方を解放する（`cli.py::run_train` の失敗時クリーンアップから呼ぶ）。
+    """学習・書き出しの失敗時（ワーカーの異常終了・強制終了を含む）に、確保済みの
+    一時ディレクトリと予約済み `out_dir` の両方を解放する
+    （`supervisor.py::run_supervised_train` の失敗時クリーンアップから呼ぶ）。
     """
     _release_tmp(reservation)
     cleanup_reserved_out_dir(reservation.entry, reservation.reserved_id)
@@ -662,6 +732,10 @@ def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId
     すり替わっている場合は何もしない（残置は Rust 側ジョブ管理〔REQ-34〕が
     次回実行前に判断する。予約が空のまま残ることは「成果物は公開されていない」
     ことの証拠であり、安全側の残置である）。
+
+    stat と rmdir の間には小さな間隙が残るが、`rmdir` は空ディレクトリしか
+    削除できないため、この間隙で起こりうる最悪の事態は「空ディレクトリの
+    取り違え」であり、データ（ファイル）を失うことはない。
     """
     parent_fd = entry.parent_fd
     name = entry.name
@@ -675,77 +749,41 @@ def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId
         os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
 
 
-#: `prepare_out_dir` が作る作業用一時ディレクトリの接頭辞（`{name}` は out_dir の
-#: 最終コンポーネント名）。`cleanup_orphaned_reservation` がこの接頭辞に一致する
-#: ものだけを「自分のもの」とみなして掃除するために使う（名前一致だけを根拠にする）。
-def _tmp_name_prefix(name: str) -> str:
-    return f".{name}.tmp-"
-
-
-def cleanup_orphaned_reservation(entry: guard.ConfinedEntry) -> None:
-    """強制終了させた子プロセス（学習ワーカー）が残したかもしれない予約済み
-    出力を、経路の再構築（`entry` は呼び出し側が改めて `guard.confine` した
-    もの）と `entry.parent_fd` 経由の名前一致だけを根拠に片付ける。
-
-    `supervisor.py`（P0-2）が、壁時計・RSS の超過でワーカーを強制終了した直後に
-    使う。ワーカー内の `OutDirReservation`（`tmp_fd` を含む）はもう存在しない
-    （別プロセスの、既に終了したローカル変数）ため、`prepare_out_dir` と同じ
-    命名規則（`.{name}.tmp-*`）に一致するディレクトリと、空の予約済み `out_dir`
-    自体だけを対象にする。それ以外（他プロセスが書き込んだ形跡があるもの・
-    命名規則に一致しないもの）には一切触れない。
-    """
-    parent_fd = entry.parent_fd
-    name = entry.name
-    prefix = _tmp_name_prefix(name)
-    try:
-        list_fd = os.open(os.curdir, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)
-    except OSError:
-        list_fd = None
-    if list_fd is not None:
-        try:
-            candidates = [e.name for e in os.scandir(list_fd)]
-        except OSError:
-            candidates = []
-        for candidate in candidates:
-            if candidate.startswith(prefix):
-                _cleanup_tmp_contents(parent_fd, candidate)
-                with contextlib.suppress(OSError):
-                    os.rmdir(candidate, dir_fd=parent_fd)
-    with contextlib.suppress(OSError):
-        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if stat.S_ISDIR(st.st_mode):
-            os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
-
-
 def _release_tmp(reservation: OutDirReservation) -> None:
-    """作業用一時ディレクトリ（中身を含む）を解放する。`out_dir` 側には触れない。"""
+    """作業用一時ディレクトリ（中身を含む）を解放する。`out_dir` 側には触れない。
+
+    P0-2: 中身の削除は保持している `tmp_fd`（名前ではなく実体に束縛された fd）
+    経由でのみ行い、名前を再解決しない（`_cleanup_tmp_contents_via_fd`）。
+    `rmdir` の直前にだけ `tmp_name` が今も同じ実体（`tmp_id`）を指しているかを
+    確認する。この stat→rmdir の間隙は残るが、`cleanup_reserved_out_dir` と
+    同様に `rmdir` は空ディレクトリしか削除できないため、データを失うことはない。
+    """
+    _cleanup_tmp_contents_via_fd(reservation.tmp_fd)
     reservation.close_tmp_fd()
     parent_fd = reservation.entry.parent_fd
-    _cleanup_tmp_contents(parent_fd, reservation.tmp_name)
+    try:
+        st = os.stat(reservation.tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if (st.st_dev, st.st_ino) != reservation.tmp_id:
+        return
     with contextlib.suppress(OSError):
         os.rmdir(reservation.tmp_name, dir_fd=parent_fd)
 
 
-def _cleanup_tmp_contents(parent_fd: int, tmp_name: str) -> None:
-    """一時ディレクトリの中身（`kind_impl.export_onnx`/`artifact.write_artifact` が
-    書き込んだファイル）を、ファイル名を決め打ちせずに列挙して削除する。
+def _cleanup_tmp_contents_via_fd(tmp_fd: int) -> None:
+    """既に開いている一時ディレクトリの fd から中身を列挙して削除する。
 
-    `os.scandir(fd)` は内部で fd を複製して列挙し、渡した fd 自体は閉じない。
-    そのため 1 つの fd を列挙と削除（`dir_fd`）の両方に使い、どの経路でも
-    `finally` で必ず閉じる（失敗時クリーンアップのたびに fd を漏らさない）。
+    P0-2: 名前で再オープンしない（`tmp_fd` を閉じた後に同名で開き直すと、
+    その間に別プロセスがその名前を別のディレクトリへ差し替えていた場合、
+    無関係なディレクトリの中身を削除してしまう TOCTOU になる）。
+    渡された `tmp_fd` はここでは閉じない（呼び出し元が管理する）。
     """
     try:
-        dir_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        with os.scandir(tmp_fd) as it:
+            names = [e.name for e in it]
     except OSError:
         return
-    try:
-        try:
-            with os.scandir(dir_fd) as it:
-                names = [e.name for e in it]
-        except OSError:
-            names = []
-        for name in names:
-            with contextlib.suppress(OSError):
-                os.unlink(name, dir_fd=dir_fd)
-    finally:
-        os.close(dir_fd)
+    for name in names:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=tmp_fd)

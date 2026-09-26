@@ -10,32 +10,56 @@
 出力後始末だけなら本モジュールだけで完結する設計）。`tests/test_supervisor.py::
 test_supervisor_module_does_not_import_mlx` で検証する。
 
+**`out_dir` の所有権は本モジュールに一元化する**（P0-1・P0-2 の見直し。
+`contract.py`・`OutDirReservation` のモジュール/クラス docstring も参照）。
+`_worker` は強制終了されうる別プロセスであり、強制終了後に「経路の名前を
+頼りに後始末を再構築する」設計は、名前が一致するというだけの根拠で無関係な
+ディレクトリを消してしまう TOCTOU を生む。本モジュールは `_worker` を監視する
+側であり自身は強制終了されない前提のため、予約に使った fd
+（`OutDirReservation.entry.parent_fd`・`tmp_fd`）をジョブの最初から最後まで
+手放さずに持ち続けられる。`_worker` には `pass_fds` で一時ディレクトリの fd
+番号だけを渡し（`--out-fd <n>`）、`_worker` はその fd への書き込みしかしない
+（`out_dir` の名前・予約・確定・後始末のいずれにも関与しない）。
+
 流れ:
-1. リクエスト JSON を `contract.load_request`/`contract.validate_request` で
+1. リクエスト JSON を `contract.read_request_dict`/`contract.validate_request` で
    完全に検証する（`_worker` と同じ検証・同じエラーメッセージ。ここで失敗すれば
-   子プロセスは起動しない）。検証だけが目的なので、得た fd はすぐ閉じる。
-2. `python -m fandhe_edge_trainer _worker --request <path>` を子プロセスとして
-   起動する（新しいプロセスグループ。`os.killpg` で子とその子孫をまとめて
-   強制終了できるようにする）。
-3. 0.1 秒間隔でポーリングする: 壁時計（`time.monotonic`）が
+   子プロセスは起動しない）。検証のうち `train_path`・`root` の fd はここでは
+   使わない（`_worker` が独立に開き直す）ので閉じる。`out_dir` の fd
+   （`ConfinedEntry`）だけは、直後の予約のために保持し続ける。
+2. `contract.prepare_out_dir` で `out_dir` を排他的に予約し、作業用の一時
+   ディレクトリを作る（`OutDirReservation`。`tmp_fd` を含む）。
+3. `python -m fandhe_edge_trainer _worker --request <path> --out-fd <tmp_fd>` を
+   子プロセスとして起動する（新しいプロセスグループ。`os.killpg` で子とその
+   子孫をまとめて強制終了できるようにする。`pass_fds=(tmp_fd,)` で一時
+   ディレクトリの fd だけを引き継がせる）。
+4. 子プロセスの標準出力を、監視と並行して別スレッドで上限
+   （`_MAX_WORKER_STDOUT_BYTES`）まで保持しつつ読み進める（P1-1: 監視ループが
+   `stdout=PIPE` を読み出さないと、子プロセスがパイプを書き切れずに
+   ブロックし、実際には正常に進んでいるのに `limit_exceeded` と誤判定しうる）。
+5. 0.1 秒間隔でポーリングする: 壁時計（`time.monotonic`）が
    `time_limit_seconds` ＋ 猶予（`_TIME_LIMIT_GRACE_SECONDS`）を超えたか、
    `ps`（絶対パス `/bin/ps`）で読んだ子プロセスの RSS が `rss_limit_bytes` を
    超えたかを見る。`ps` の実行自体に失敗したら「監視ができない」ことを
    fail-closed に扱い、子プロセスを強制終了して `runtime_error` とする
    （安全側に倒す。上限を検査できないまま野放しにしない）。
-4. 超過を検出したら子プロセスのプロセスグループを `SIGKILL` し、`out_dir` の
-   予約（`.{name}.tmp-*` の一時ディレクトリ・空の予約済みディレクトリ）を
-   `guard.confine` で経路を再確認したうえで片付ける
-   （`contract.cleanup_orphaned_reservation`）。
-5. 子プロセスが自分で終了した場合: 標準出力を上限（`_MAX_WORKER_STDOUT_BYTES`）
-   付きで読み、「ちょうど 1 つの妥当な JSON オブジェクトである」ことを確認して
-   から、そのまま再出力する。子プロセスの終了コードが 7 種のいずれかであれば
-   それをそのまま使い、そうでなければ（シグナルによる終了を含め）
-   `runtime_error`（exit 70）とする。
+6. 超過を検出したら子プロセスのプロセスグループを `SIGKILL` し、予約
+   （一時ディレクトリとその中身・空の予約済みディレクトリ）を
+   `contract.cleanup_reservation` で解放する（本モジュールが保持し続けている
+   fd だけを使う。名前を再解決しない）。
+7. 子プロセスが自分で終了した場合: 標準出力が「ちょうど 1 つの妥当な JSON
+   オブジェクトである」ことを確認し、終了コードが 7 種のいずれかであることも
+   確認する。いずれかを満たさない、またはシグナルによる終了なら
+   `runtime_error`（exit 70）とし、予約を解放する。終了コードが 0 以外（7 種の
+   いずれかのエラー）なら、そのコード・JSON をそのまま使い、予約は解放する
+   （出力を確定させない）。終了コードが 0（成功）なら `contract.finalize_out_dir`
+   で確定させたうえで、そのまま出力する。
 
 Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパーバイザー」の役割を
 担う計画であり、本モジュールは Rust 側が無い・本ワーカーが単独プロセスとして
-起動される場合の多層防御（defense in depth）として存在する。
+起動される場合の多層防御（defense in depth）として存在する。本モジュール自身が
+SIGKILL 等で道連れに終了した場合の後始末は、本モジュールの責務ではなく
+Rust 側ジョブ管理（TASK-34.x）に委ねる。
 """
 
 from __future__ import annotations
@@ -46,11 +70,12 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from . import contract, guard
+from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
 
@@ -130,6 +155,11 @@ def monitor_child(
     （`"time"`/`"rss"`/`"monitor_failed"`）を返す（呼び出し元が `proc.wait()`
     済みであることを前提にせず、本関数が確実に終了させてから返る）。
 
+    **本関数は `proc.stdout` を一切読まない**（P1-1: 標準出力の読み出しは
+    呼び出し元が別スレッドで並行して行う。本関数が読み出しを兼ねると、
+    `stdout=PIPE` のバッファが埋まった子プロセスがブロックし、実際には
+    正常に進んでいるだけなのに監視が「反応しない」ように見えてしまう）。
+
     テスト（`tests/test_supervisor.py`）は本関数を直接、ダミーの子プロセス
     （`sys.executable -c "..."`）に対して呼ぶことで、実際の学習ワーカーを
     起動せずに監視ロジックを検証する。
@@ -161,37 +191,51 @@ def monitor_child(
             return "rss"
 
 
-def _cleanup_orphaned_output(root_raw: Any, out_dir_raw: Any) -> None:
-    """強制終了させたワーカーが残したかもしれない出力予約を片付ける。
+def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDOUT_BYTES) -> None:
+    """子プロセスの標準出力を、上限 `cap` バイトまで保持しつつ最後まで読み進める
+    （P1-1）。
 
-    `guard.confine` で経路を改めて確認したうえで（TOCTOU 対策。多層防御）、
-    `contract.cleanup_orphaned_reservation` に委ねる。`root`・`out_dir` 自体が
-    不正（既にリクエスト検証を通っているはずだが、念のため）なら何もしない
-    （最悪でも「掃除できなかった」だけで、経路の閉じ込めが破れることはない）。
+    `subprocess.Popen(stdout=PIPE)` はパイプに OS のバッファ容量（環境依存だが
+    数十 KiB 程度）分しか溜め込めない。監視ループ（`monitor_child`）が読み出しを
+    行わないまま長時間かかると、子プロセスが `stdout` への書き込みで
+    ブロックし、実際には壁時計・RSS の上限に達していないのに、監視から見ると
+    「反応が無い」状態になりうる。これを防ぐため、監視と並行する別スレッドで
+    バッファを溜めずに読み続ける（上限を超えた分は保持せず破棄するが、
+    読み出し自体は続けることで子プロセス側のブロックを防ぐ）。
+
+    `result` へ `"data"`（保持したバイト列。最大 `cap` バイト）・
+    `"oversized"`（上限を超えたか）を書き込む（スレッドの戻り値の代わり）。
     """
+    chunks: list[bytes] = []
+    kept = 0
+    oversized = False
     try:
-        root_handle = guard.resolve_root(root_raw)
-    except WorkerError:
-        return
-    try:
-        entry = guard.confine(root_handle, out_dir_raw, "out_dir")
-    except WorkerError:
-        root_handle.close()
-        return
-    try:
-        contract.cleanup_orphaned_reservation(entry)
-    finally:
-        entry.close()
-        root_handle.close()
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            if not oversized:
+                remaining = cap - kept
+                if len(chunk) <= remaining:
+                    chunks.append(chunk)
+                    kept += len(chunk)
+                else:
+                    if remaining > 0:
+                        chunks.append(chunk[:remaining])
+                        kept += remaining
+                    oversized = True
+    except (OSError, ValueError):
+        # 親側でパイプを閉じた等。読めた分だけを使う。
+        pass
+    result["data"] = b"".join(chunks)
+    result["oversized"] = oversized
 
 
 def _parse_worker_stdout(raw: bytes) -> dict[str, Any] | None:
     """子プロセスの標準出力が「ちょうど 1 つの妥当な JSON オブジェクト」で
-    あることを確認する。サイズ超過・複数行・JSON でない・オブジェクトでない
-    場合は `None` を返す（呼び出し側が `runtime_error` として扱う）。
+    あることを確認する。複数行・JSON でない・オブジェクトでない場合は `None` を
+    返す（サイズ上限超過は `_drain_stdout` の `oversized` で別途判定する）。
     """
-    if len(raw) > _MAX_WORKER_STDOUT_BYTES:
-        return None
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -209,7 +253,9 @@ def _parse_worker_stdout(raw: bytes) -> dict[str, Any] | None:
 
 
 def run_supervised_train(request_path: Path) -> ExitCode:
-    """`train` サブコマンドの本体。`_worker` を子プロセスとして起動・監視する。"""
+    """`train` サブコマンドの本体。`out_dir` を予約したうえで `_worker` を
+    子プロセスとして起動・監視し、結果に応じて確定または解放する。
+    """
     try:
         raw = contract.read_request_dict(request_path)
         request = contract.validate_request(raw)
@@ -219,21 +265,56 @@ def run_supervised_train(request_path: Path) -> ExitCode:
 
     time_limit_seconds = request.time_limit_seconds
     rss_limit_bytes = request.rss_limit_bytes
-    root_raw = raw.get("root")
-    out_dir_raw = raw.get("out_dir")
-    # 検証だけが目的で、実際の読み書きは子プロセス（_worker）が独立に行うため、
-    # ここで得た fd はすぐ閉じる（スーパーバイザーは fd を長時間保持しない）。
-    request.close_resources()
+    # train_path・root の fd はスーパーバイザーには不要（_worker が独立に
+    # 検証・open し直す）。out_dir の fd だけは、直後の予約のために保持する。
+    request.train_path.close()
+    request.root.close()
 
-    argv = [sys.executable, "-m", "fandhe_edge_trainer", "_worker", "--request", str(request_path)]
+    try:
+        reservation = contract.prepare_out_dir(request.out_dir)
+    except WorkerError as e:
+        request.out_dir.close()
+        _emit({"status": "error", "code": e.code, "message": e.message})
+        return e.exit_code
+
+    try:
+        return _spawn_worker_and_finalize(
+            request_path,
+            reservation,
+            time_limit_seconds=float(time_limit_seconds),
+            rss_limit_bytes=rss_limit_bytes,
+        )
+    finally:
+        reservation.entry.close()  # request.out_dir と同一オブジェクト
+
+
+def _spawn_worker_and_finalize(
+    request_path: Path,
+    reservation: contract.OutDirReservation,
+    *,
+    time_limit_seconds: float,
+    rss_limit_bytes: int,
+) -> ExitCode:
+    argv = [
+        sys.executable,
+        "-m",
+        "fandhe_edge_trainer",
+        "_worker",
+        "--request",
+        str(request_path),
+        "--out-fd",
+        str(reservation.tmp_fd),
+    ]
     try:
         proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
             argv,
             stdout=subprocess.PIPE,
             stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
+            pass_fds=(reservation.tmp_fd,),
             start_new_session=True,
         )
     except OSError as e:
+        contract.cleanup_reservation(reservation)
         _emit(
             {
                 "status": "error",
@@ -243,15 +324,31 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         )
         return ExitCode.RUNTIME_ERROR
 
+    # P1-1: 監視（proc.wait を繰り返す）と並行して、別スレッドで標準出力を
+    # 溜めずに読み進める。子プロセスがパイプを埋めてブロックするのを防ぐ。
+    stdout_result: dict[str, Any] = {}
+    reader_thread = threading.Thread(
+        target=_drain_stdout, args=(proc.stdout, stdout_result), daemon=True
+    )
+    reader_thread.start()
+
     killed_reason = monitor_child(
-        proc, time_limit_seconds=float(time_limit_seconds), rss_limit_bytes=rss_limit_bytes
+        proc, time_limit_seconds=time_limit_seconds, rss_limit_bytes=rss_limit_bytes
     )
 
+    reader_thread.join(timeout=10)
+    if reader_thread.is_alive() and proc.stdout is not None:
+        # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に
+        # 終わるはずだが、万一残っていたら pipe を閉じて読み出しを解除する。
+        with contextlib.suppress(OSError):
+            proc.stdout.close()
+        reader_thread.join(timeout=5)
+    if proc.stdout is not None:
+        with contextlib.suppress(OSError):
+            proc.stdout.close()
+
     if killed_reason is not None:
-        if proc.stdout is not None:
-            with contextlib.suppress(OSError):
-                proc.stdout.close()
-        _cleanup_orphaned_output(root_raw, out_dir_raw)
+        contract.cleanup_reservation(reservation)
         if killed_reason == "monitor_failed":
             _emit(
                 {
@@ -270,14 +367,10 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         )
         return ExitCode.LIMIT_EXCEEDED
 
-    stdout_bytes = proc.stdout.read(_MAX_WORKER_STDOUT_BYTES + 1) if proc.stdout else b""
-    if proc.stdout is not None:
-        proc.stdout.close()
     returncode = proc.returncode
-
     if returncode is not None and returncode < 0:
         # シグナルによる終了（例: OOM killer・外部からの kill）。
-        _cleanup_orphaned_output(root_raw, out_dir_raw)
+        contract.cleanup_reservation(reservation)
         _emit(
             {
                 "status": "error",
@@ -287,8 +380,20 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         )
         return ExitCode.RUNTIME_ERROR
 
-    payload = _parse_worker_stdout(stdout_bytes)
+    if stdout_result.get("oversized"):
+        contract.cleanup_reservation(reservation)
+        _emit(
+            {
+                "status": "error",
+                "code": "runtime_error",
+                "message": "worker stdout exceeded size limit",
+            }
+        )
+        return ExitCode.RUNTIME_ERROR
+
+    payload = _parse_worker_stdout(stdout_result.get("data", b""))
     if payload is None:
+        contract.cleanup_reservation(reservation)
         _emit(
             {
                 "status": "error",
@@ -299,6 +404,7 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         return ExitCode.RUNTIME_ERROR
 
     if returncode not in _VALID_EXIT_CODES:
+        contract.cleanup_reservation(reservation)
         _emit(
             {
                 "status": "error",
@@ -308,5 +414,18 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         )
         return ExitCode.RUNTIME_ERROR
 
+    if returncode != int(ExitCode.OK):
+        # ワーカー自身が 7 種のいずれかのエラーで終了した（例: invalid_config）。
+        # 出力は確定させず、予約を解放してからそのままエラーを伝える。
+        contract.cleanup_reservation(reservation)
+        _emit(payload)
+        return ExitCode(returncode)
+
+    try:
+        contract.finalize_out_dir(reservation)
+    except WorkerError as e:
+        _emit({"status": "error", "code": e.code, "message": e.message})
+        return e.exit_code
+
     _emit(payload)
-    return ExitCode(returncode)
+    return ExitCode.OK

@@ -18,7 +18,7 @@ from typing import IO, Any, Protocol
 
 from .. import budget
 from ..contract import TrainExample, TrainRequest
-from ..errors import WorkerError
+from ..errors import WorkerError, truncate_for_message
 from ..exitcode import ExitCode
 
 
@@ -77,17 +77,22 @@ def resolve_kind(kind: str, kind_version: int) -> Kind:
     """`kind`・`kind_version` から実装を選ぶ（TASK-19.1）。未対応は TASK-19.3 のエラーを返す。"""
     registry = _registry()
     versions = registry.get(kind)
+    # `kind` はリクエスト JSON の全体サイズ上限まで利用者が自由に長くできるため、
+    # エラーメッセージへ埋め込む前に切り詰める（P1-1。データ本文ではないが同じ
+    # 理由で無制限の長さを許さない。`contract.validate_request` が str であることを
+    # 検証済み）。
+    kind_for_message = truncate_for_message(kind)
     if versions is None:
         raise WorkerError(
             "unsupported_kind",
-            f"unsupported kind: {kind!r} (supported: {sorted(registry)})",
+            f"unsupported kind: {kind_for_message!r} (supported: {sorted(registry)})",
             ExitCode.INVALID_INPUT,
         )
     impl = versions.get(kind_version)
     if impl is None:
         raise WorkerError(
             "unsupported_kind_version",
-            f"unsupported kind_version {kind_version!r} for kind {kind!r} "
+            f"unsupported kind_version {kind_version!r} for kind {kind_for_message!r} "
             f"(supported: {sorted(versions)})",
             ExitCode.INVALID_INPUT,
         )

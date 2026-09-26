@@ -50,7 +50,7 @@ from onnx import TensorProto, helper, numpy_helper
 from .. import budget as budget_mod
 from ..contract import TrainExample, TrainRequest
 from ..encoding import encode_bytes
-from ..errors import WorkerError
+from ..errors import WorkerError, truncate_list_for_message
 from ..exitcode import ExitCode
 from ..limits import (
     MAX_C3_BATCH_SIZE,
@@ -127,8 +127,12 @@ def _validate_config(cfg: dict[str, Any]) -> None:
     """
     unknown = set(cfg) - _CONFIG_FIELDS
     if unknown:
+        # フィールド名はリクエスト JSON の全体サイズ上限まで利用者が自由に長く
+        # できるため、切り詰めてから埋め込む（P1-1）。
         raise WorkerError(
-            "invalid_config", f"unknown config fields: {sorted(unknown)}", ExitCode.INVALID_INPUT
+            "invalid_config",
+            f"unknown config fields: {truncate_list_for_message(sorted(unknown))}",
+            ExitCode.INVALID_INPUT,
         )
 
     def _bounded_int(name: str, upper: int) -> None:

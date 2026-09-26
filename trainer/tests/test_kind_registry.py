@@ -27,3 +27,13 @@ def test_resolve_kind_rejects_unsupported_kind_version() -> None:
         resolve_kind("c3", 999)
     assert exc_info.value.code == "unsupported_kind_version"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_resolve_kind_rejects_unsupported_kind_with_bounded_message_length() -> None:
+    """P1-1: `kind` はリクエスト JSON の全体サイズ上限まで利用者が自由に長く
+    できるため、切り詰めずにそのままエラーメッセージへ埋め込まない。
+    """
+    with pytest.raises(WorkerError) as exc_info:
+        resolve_kind("x" * 10_000, 1)
+    assert exc_info.value.code == "unsupported_kind"
+    assert len(exc_info.value.message) < 1000  # 切り詰められていることの目安
