@@ -125,4 +125,4 @@ make doctor      # 環境診断のみ（何も導入しない）
 | `ci.yml` の現状 | `ci.yml` は準備が整うまで発火条件を無効化中（`workflow_dispatch` のみ）であり、workspace（`Cargo.toml`）・メンバー crate・`deny.toml` の作成後に `pull_request` / `push` を有効化し、ruleset の必須チェックへ `ci-complete` を登録する設計であることを踏まえ、この無効化自体を指摘しない | 指摘しない（既知の暫定状態） |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、集約ジョブ `ci-complete` の `needs` に全ジョブが含まれているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象 crate 名・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
-| `update-external.yml` の `runner-json` | `runner-json: '"ubuntu-latest"'` は YAML の単一引用符内に JSON 文字列 `"ubuntu-latest"` を置く正しい記法（バックスラッシュは含まれない）であり、指摘しない | 指摘しない（正しい記法） |
+| `update-external.yml` の `runner-json` | `runner-json` は folded block scalar（`>-`）で JSON 文字列 `"ubuntu-latest"`（二重引用符込み、バックスラッシュなし）を渡す正しい記法であり、`fromJSON` で `ubuntu-latest` に解決される。エスケープの誤りとして指摘しない | 指摘しない（正しい記法） |
