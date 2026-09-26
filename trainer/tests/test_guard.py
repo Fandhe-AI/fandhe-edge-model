@@ -77,3 +77,20 @@ def test_confine_rejects_nul_byte(tmp_path: Path) -> None:
         assert exc_info.value.code == "invalid_path"
     finally:
         root_handle.close()
+
+
+def test_confine_rejects_fifo_parent_without_blocking(tmp_path: Path) -> None:
+    """親ディレクトリの構成要素が FIFO でも、書き手を待ってブロックせずに
+    `invalid_path`（exit 64）で拒否する（REQ-39 資源の上限: 無限待ちを作らない）。
+
+    `O_NONBLOCK` が無いと `open` が書き手を待ち続け、このテスト自体が終わらない。
+    """
+    os.mkfifo(tmp_path / "pipe")
+    root = guard.resolve_root(str(tmp_path))
+    try:
+        with pytest.raises(WorkerError) as exc_info:
+            guard.confine(root, "pipe/train.jsonl", "train_path")
+    finally:
+        root.close()
+    assert exc_info.value.code == "invalid_path"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT

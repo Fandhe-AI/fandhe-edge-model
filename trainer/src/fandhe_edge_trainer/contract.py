@@ -730,26 +730,22 @@ def _cleanup_tmp_contents(parent_fd: int, tmp_name: str) -> None:
     """一時ディレクトリの中身（`kind_impl.export_onnx`/`artifact.write_artifact` が
     書き込んだファイル）を、ファイル名を決め打ちせずに列挙して削除する。
 
-    列挙用に別途 fd を 1 つ開く（`os.scandir(fd)` はイテレータの終了時に自動で
-    その fd を閉じるため、削除操作用の fd とは分ける）。
+    `os.scandir(fd)` は内部で fd を複製して列挙し、渡した fd 自体は閉じない。
+    そのため 1 つの fd を列挙と削除（`dir_fd`）の両方に使い、どの経路でも
+    `finally` で必ず閉じる（失敗時クリーンアップのたびに fd を漏らさない）。
     """
     try:
-        list_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        dir_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError:
         return
     try:
-        names = [e.name for e in os.scandir(list_fd)]
-    except OSError:
-        names = []
-    if not names:
-        return
-    try:
-        work_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    except OSError:
-        return
-    try:
+        try:
+            with os.scandir(dir_fd) as it:
+                names = [e.name for e in it]
+        except OSError:
+            names = []
         for name in names:
             with contextlib.suppress(OSError):
-                os.unlink(name, dir_fd=work_fd)
+                os.unlink(name, dir_fd=dir_fd)
     finally:
-        os.close(work_fd)
+        os.close(dir_fd)

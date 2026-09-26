@@ -158,7 +158,9 @@ def _walk_parent(root_fd: int, parent_parts: tuple[str, ...], field_name: str) -
     cur = os.dup(root_fd)
     for part in parent_parts:
         try:
-            nxt = os.open(part, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+            # O_NONBLOCK: 途中の構成要素が FIFO の場合に書き手を待ってブロックしない
+            # （開けた後の fstat で S_ISDIR でなければ拒否する）
+            nxt = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)
         except OSError as e:
             os.close(cur)
             if e.errno == errno.ELOOP:

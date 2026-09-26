@@ -652,3 +652,24 @@ def test_prepare_out_dir_is_immune_to_parent_swap_after_confine(tmp_path: Path) 
     finally:
         entry.close()
         root_handle.close()
+
+
+def test_cleanup_tmp_contents_does_not_leak_fds(tmp_path: Path) -> None:
+    """一時ディレクトリの後始末（中身あり・空の両方）で fd を 1 つも漏らさない。
+
+    失敗時クリーンアップのたびに fd が漏れると、長時間のジョブ管理下で
+    fd 枯渇を招く（`os.scandir(fd)` は渡した fd を閉じない）。
+    """
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "a.bin").write_bytes(b"x")
+    (tmp_path / "empty").mkdir()
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        before = len(os.listdir("/dev/fd"))
+        contract._cleanup_tmp_contents(parent_fd, "full")
+        contract._cleanup_tmp_contents(parent_fd, "empty")
+        after = len(os.listdir("/dev/fd"))
+    finally:
+        os.close(parent_fd)
+    assert after == before
+    assert list((tmp_path / "full").iterdir()) == []
