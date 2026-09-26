@@ -1,9 +1,10 @@
 """学習リクエスト・学習データの検証テスト（TASK-19.1 の入口・REQ-39 の資源上限・
-経路の閉じ込め〔PoC-20〕）。
+経路の閉じ込め〔PoC-20〕。fd ベースの TOCTOU 対策を含む）。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from fandhe_edge_trainer import contract, limits
+from fandhe_edge_trainer import contract, guard, limits
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 
@@ -42,28 +43,73 @@ def _write(path: Path, obj: dict) -> Path:
     return path
 
 
+def _confine(
+    tmp_path: Path, rel: str, field_name: str
+) -> tuple[guard.RootHandle, guard.ConfinedEntry]:
+    """テスト用に `root=tmp_path` 配下の `rel` を閉じ込める（呼び出し側が戻り値の
+    `RootHandle`・`ConfinedEntry` を使い終わったら `close()` すること）。
+    """
+    root_handle = guard.resolve_root(str(tmp_path))
+    entry = guard.confine(root_handle, rel, field_name)
+    return root_handle, entry
+
+
+@contextlib.contextmanager
+def _confined_train_path(tmp_path: Path, rel: str = "train.jsonl"):
+    root_handle, entry = _confine(tmp_path, rel, "train_path")
+    try:
+        yield entry
+    finally:
+        entry.close()
+        root_handle.close()
+
+
+@contextlib.contextmanager
+def _confined_out_dir(tmp_path: Path, rel: str = "out"):
+    root_handle, entry = _confine(tmp_path, rel, "out_dir")
+    try:
+        yield entry
+    finally:
+        entry.close()
+        root_handle.close()
+
+
 def test_load_request_accepts_valid_request(tmp_path: Path) -> None:
+    (tmp_path / "train.jsonl").write_text(
+        '{"input": "x", "label": "a"}\n{"input": "y", "label": "b"}\n', encoding="utf-8"
+    )
     p = _write(tmp_path / "req.json", _base_request(tmp_path))
     req = contract.load_request(p)
-    assert req.kind == "c3"
-    assert req.label_order == ["a", "b"]
-    assert req.max_bytes == 64
-    assert req.seed == 0
-    assert req.device == "cpu"
-    # root 配下（realpath 解決後）に閉じ込められていること。
-    root_real = Path(os.path.realpath(tmp_path))
-    assert req.root == root_real
-    assert req.train_path == root_real / "train.jsonl"
-    assert req.out_dir == root_real / "out"
+    try:
+        assert req.kind == "c3"
+        assert req.label_order == ["a", "b"]
+        assert req.max_bytes == 64
+        assert req.seed == 0
+        assert req.device == "cpu"
+        assert req.train_path.name == "train.jsonl"
+        assert req.out_dir.name == "out"
+        # fd が実際に root 配下の実体を指していることを機能的に確認する
+        # （train_path の open・読み取りが成功する）。
+        examples = contract.load_train_examples(req.train_path, req.label_order)
+        assert len(examples) == 2
+    finally:
+        req.close_resources()
 
 
 def test_load_request_accepts_nested_relative_path(tmp_path: Path) -> None:
     (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "train.jsonl").write_text(
+        '{"input": "x", "label": "a"}\n{"input": "y", "label": "b"}\n', encoding="utf-8"
+    )
     req_dict = {**_base_request(tmp_path), "train_path": "data/train.jsonl"}
     p = _write(tmp_path / "req.json", req_dict)
     req = contract.load_request(p)
-    root_real = Path(os.path.realpath(tmp_path))
-    assert req.train_path == root_real / "data" / "train.jsonl"
+    try:
+        assert req.train_path.name == "train.jsonl"
+        examples = contract.load_train_examples(req.train_path, req.label_order)
+        assert len(examples) == 2
+    finally:
+        req.close_resources()
 
 
 def test_load_request_rejects_unknown_field(tmp_path: Path) -> None:
@@ -95,7 +141,7 @@ def test_load_request_rejects_oversize_file(
 
 
 # --------------------------------------------------------------------------
-# P0-1: 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）
+# 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）
 # --------------------------------------------------------------------------
 
 
@@ -145,7 +191,7 @@ def test_load_request_rejects_root_relative_path(tmp_path: Path) -> None:
 @pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
 def test_load_request_rejects_symlink_escape_for_train_path(tmp_path: Path) -> None:
     """root 配下のシンボリックリンクが root の外を指す場合、train_path の親経路として
-    使うと path_outside_root で拒否されること（realpath による閉じ込め検証）。
+    使うと拒否されること（`O_NOFOLLOW` による ELOOP 検出。symlink_not_allowed）。
     """
     root = tmp_path / "root"
     root.mkdir()
@@ -158,7 +204,7 @@ def test_load_request_rejects_symlink_escape_for_train_path(tmp_path: Path) -> N
     p = _write(root / "req.json", req_dict)
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
-    assert exc_info.value.code == "path_outside_root"
+    assert exc_info.value.code == "symlink_not_allowed"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
@@ -173,55 +219,75 @@ def test_load_request_rejects_symlink_escape_for_out_dir(tmp_path: Path) -> None
     p = _write(root / "req.json", req_dict)
     with pytest.raises(WorkerError) as exc_info:
         contract.load_request(p)
-    assert exc_info.value.code == "path_outside_root"
+    assert exc_info.value.code == "symlink_not_allowed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
+def test_load_request_rejects_symlink_pointing_inside_root_too(tmp_path: Path) -> None:
+    """経路の途中にシンボリックリンクがあれば、root 配下を指していても拒否する
+    （以前の実装より厳格な方針。TOCTOU を完全に塞ぐため、経路の途中の
+    シンボリックリンクを一切追跡しない。guard.py のモジュール docstring 参照）。
+    """
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "train.jsonl").write_text('{"input": "x", "label": "a"}\n', encoding="utf-8")
+    (tmp_path / "link").symlink_to(real_dir)  # root 配下の別の場所を指す（root の外ではない）
+
+    req_dict = {**_base_request(tmp_path), "train_path": "link/train.jsonl"}
+    p = _write(tmp_path / "req.json", req_dict)
+    with pytest.raises(WorkerError) as exc_info:
+        contract.load_request(p)
+    assert exc_info.value.code == "symlink_not_allowed"
 
 
 def test_load_train_examples_reports_line_number_not_label_text(tmp_path: Path) -> None:
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text(
+    (tmp_path / "train.jsonl").write_text(
         '{"input": "x1", "label": "a"}\n{"input": "x2", "label": "does-not-exist-label"}\n',
         encoding="utf-8",
     )
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_data"
-    assert "line 2" in exc_info.value.message
-    # データ本文（ラベル文字列そのもの）をメッセージへ含めない（security.md）。
-    assert "does-not-exist-label" not in exc_info.value.message
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_data"
+        assert "line 2" in exc_info.value.message
+        # データ本文（ラベル文字列そのもの）をメッセージへ含めない（security.md）。
+        assert "does-not-exist-label" not in exc_info.value.message
 
 
 def test_load_train_examples_rejects_invalid_json_line(tmp_path: Path) -> None:
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text('{"input": "x1", "label": "a"}\n{not json\n', encoding="utf-8")
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_data"
-    assert "line 2" in exc_info.value.message
+    (tmp_path / "train.jsonl").write_text(
+        '{"input": "x1", "label": "a"}\n{not json\n', encoding="utf-8"
+    )
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_data"
+        assert "line 2" in exc_info.value.message
 
 
 def test_load_train_examples_rejects_blank_line(tmp_path: Path) -> None:
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text('{"input": "x1", "label": "a"}\n\n', encoding="utf-8")
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert "line 2" in exc_info.value.message
+    (tmp_path / "train.jsonl").write_text('{"input": "x1", "label": "a"}\n\n', encoding="utf-8")
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert "line 2" in exc_info.value.message
 
 
 def test_load_train_examples_rejects_oversize_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(contract, "MAX_TRAIN_DATA_BYTES", 4)
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text('{"input": "x1", "label": "a"}\n', encoding="utf-8")
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "limit_exceeded"
+    (tmp_path / "train.jsonl").write_text('{"input": "x1", "label": "a"}\n', encoding="utf-8")
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "limit_exceeded"
 
 
 def test_load_train_examples_rejects_oversize_file_via_stat_before_any_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P0-2: `st_size` による判定が実際の行読み取りより先に行われること。
+    """`st_size` による判定が実際の行読み取りより先に行われること。
 
     ファイル本文を不正な JSON にしておき、それでも `limit_exceeded` になる
     （＝ 1 行も parse されていない）ことで、st_size チェックが読み取りより
@@ -231,26 +297,27 @@ def test_load_train_examples_rejects_oversize_file_via_stat_before_any_read(
     train_path = tmp_path / "train.jsonl"
     train_path.write_text("{not json\n", encoding="utf-8")
     os.truncate(train_path, (1 << 10) + 1)  # スパースファイルで stat 上のサイズだけ超過させる
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "limit_exceeded"
-    # invalid_data（JSON パースエラー）ではなく limit_exceeded になっている時点で、
-    # パースに到達する前に stat のサイズ判定で弾かれていることの証拠になる。
-    assert "line" not in exc_info.value.message
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "limit_exceeded"
+        # invalid_data（JSON パースエラー）ではなく limit_exceeded になっている時点で、
+        # パースに到達する前に stat のサイズ判定で弾かれていることの証拠になる。
+        assert "line" not in exc_info.value.message
 
 
 def test_load_train_examples_requires_at_least_two_distinct_labels(tmp_path: Path) -> None:
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text(
+    (tmp_path / "train.jsonl").write_text(
         '{"input": "x1", "label": "a"}\n{"input": "x2", "label": "a"}\n', encoding="utf-8"
     )
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_data"
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_data"
 
 
 def test_load_request_rejects_nan(tmp_path: Path) -> None:
-    """項目 4: JSON 標準外の数値トークン（NaN 等）は範囲比較をすり抜けるため明示的に拒否する。"""
+    """JSON 標準外の数値トークン（NaN 等）は範囲比較をすり抜けるため明示的に拒否する。"""
     p = tmp_path / "req.json"
     p.write_text(
         json.dumps({**_base_request(tmp_path), "max_bytes": 64}).replace(
@@ -265,7 +332,7 @@ def test_load_request_rejects_nan(tmp_path: Path) -> None:
 
 
 def test_load_request_rejects_deeply_nested_json(tmp_path: Path) -> None:
-    """項目 4: 過度なネストによる RecursionError を invalid_request（exit 64）へ正規化する。"""
+    """過度なネストによる RecursionError を invalid_request（exit 64）へ正規化する。"""
     # 20_000 段は CPython の既定再帰上限で確実に RecursionError になる水準（実測確認済み）。
     # 過度に大きくすると C 拡張の再帰実装がクラッシュしうるため、必要最小限に留める。
     nested = "[" * 20_000 + "]" * 20_000
@@ -279,7 +346,7 @@ def test_load_request_rejects_deeply_nested_json(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo は POSIX 限定")
 def test_load_request_rejects_fifo(tmp_path: Path) -> None:
-    """項目 5: 通常ファイル以外（FIFO 等）は S_ISREG 検査で拒否し、無制限待ちを防ぐ。"""
+    """通常ファイル以外（FIFO 等）は S_ISREG 検査で拒否し、無制限待ちを防ぐ。"""
     fifo_path = tmp_path / "req.fifo"
     os.mkfifo(fifo_path)
     with pytest.raises(WorkerError) as exc_info:
@@ -310,12 +377,15 @@ def test_load_request_rejects_bool_seed(tmp_path: Path) -> None:
 
 
 def test_load_request_accepts_lower_resource_limits(tmp_path: Path) -> None:
-    """P0-B: `time_limit_seconds`・`rss_limit_bytes` は既定の上限を下げるだけ許可する。"""
+    """`time_limit_seconds`・`rss_limit_bytes` は既定の上限を下げるだけ許可する。"""
     req_dict = {**_base_request(tmp_path), "time_limit_seconds": 60, "rss_limit_bytes": 1024}
     p = _write(tmp_path / "req.json", req_dict)
     req = contract.load_request(p)
-    assert req.time_limit_seconds == 60
-    assert req.rss_limit_bytes == 1024
+    try:
+        assert req.time_limit_seconds == 60
+        assert req.rss_limit_bytes == 1024
+    finally:
+        req.close_resources()
 
 
 def test_load_request_rejects_time_limit_above_max(tmp_path: Path) -> None:
@@ -339,173 +409,246 @@ def test_load_request_rejects_rss_limit_above_max(tmp_path: Path) -> None:
 
 
 def test_load_train_examples_rejects_nan_in_line(tmp_path: Path) -> None:
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text('{"input": NaN, "label": "a"}\n', encoding="utf-8")
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_data"
-    assert "line 1" in exc_info.value.message
+    (tmp_path / "train.jsonl").write_text('{"input": NaN, "label": "a"}\n', encoding="utf-8")
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_data"
+        assert "line 1" in exc_info.value.message
 
 
 def test_load_train_examples_rejects_whitespace_only_input(tmp_path: Path) -> None:
-    """項目 6: 正規化後に空となる入力（空白のみ等）を拒否する。メッセージに入力本文を含めない。"""
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text('{"input": "   \\t  ", "label": "a"}\n', encoding="utf-8")
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_data"
-    assert "line 1" in exc_info.value.message
+    """正規化後に空となる入力（空白のみ等）を拒否する。メッセージに入力本文を含めない。"""
+    (tmp_path / "train.jsonl").write_text('{"input": "   \\t  ", "label": "a"}\n', encoding="utf-8")
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_data"
+        assert "line 1" in exc_info.value.message
 
 
 def test_load_train_examples_rejects_oversize_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(contract, "MAX_TRAIN_LINE_BYTES", 16)
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text(
+    (tmp_path / "train.jsonl").write_text(
         '{"input": "much longer than sixteen bytes", "label": "a"}\n', encoding="utf-8"
     )
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "limit_exceeded"
-    assert "line 1" in exc_info.value.message
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "limit_exceeded"
+        assert "line 1" in exc_info.value.message
 
 
 def test_load_train_examples_rejects_too_many_examples(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(contract, "MAX_TRAIN_EXAMPLES", 1)
-    train_path = tmp_path / "train.jsonl"
-    train_path.write_text(
+    (tmp_path / "train.jsonl").write_text(
         '{"input": "x1", "label": "a"}\n{"input": "x2", "label": "b"}\n', encoding="utf-8"
     )
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(train_path, ["a", "b"])
-    assert exc_info.value.code == "limit_exceeded"
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "limit_exceeded"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo は POSIX 限定")
 def test_load_train_examples_rejects_fifo(tmp_path: Path) -> None:
-    fifo_path = tmp_path / "train.fifo"
-    os.mkfifo(fifo_path)
-    with pytest.raises(WorkerError) as exc_info:
-        contract.load_train_examples(fifo_path, ["a", "b"])
-    assert exc_info.value.code == "invalid_request"
+    os.mkfifo(tmp_path / "train.jsonl")
+    with _confined_train_path(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_train_examples(entry, ["a", "b"])
+        assert exc_info.value.code == "invalid_request"
+
+
+# --------------------------------------------------------------------------
+# out_dir の予約・確定（TOCTOU 対策。P0-A/P1）
+# --------------------------------------------------------------------------
 
 
 def test_finalize_out_dir_converts_os_error_to_worker_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """項目 8: `os.replace` の失敗を `WorkerError`（output_conflict・exit 64）へ変換する。"""
-    out_dir = tmp_path / "out"
-    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+    """`os.rename` の失敗を `WorkerError`（output_conflict・exit 64）へ変換する。"""
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
 
-    def _boom(_src: object, _dst: object) -> None:
-        raise OSError("simulated concurrent creation")
+        def _boom(*_a: object, **_k: object) -> None:
+            raise OSError("simulated concurrent creation")
 
-    monkeypatch.setattr(contract.os, "replace", _boom)
-    with pytest.raises(WorkerError) as exc_info:
-        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
-    assert exc_info.value.code == "output_conflict"
-    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    assert not tmp_dir.exists()  # 失敗時も一時ディレクトリ（自分のもの）は掃除される
-    assert out_dir.exists()  # 予約済み out_dir 自体は触れずに残る
+        monkeypatch.setattr(contract.os, "rename", _boom)
+        with pytest.raises(WorkerError) as exc_info:
+            contract.finalize_out_dir(reservation)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        assert (tmp_path / "out").is_dir()  # 予約済み out_dir 自体は触れずに残る
+        # 自分の一時ディレクトリ（隠しディレクトリ）は掃除される。
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
 def test_prepare_out_dir_rejects_existing_dir(tmp_path: Path) -> None:
-    """P0-A: `os.mkdir` の `FileExistsError` を検出する（存在確認 → 作成の 2 手順にしない）。"""
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    with pytest.raises(WorkerError) as exc_info:
-        contract.prepare_out_dir(out_dir)
-    assert exc_info.value.code == "output_conflict"
-    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    """`os.mkdir` の `FileExistsError` を検出する（存在確認 → 作成の 2 手順にしない）。"""
+    (tmp_path / "out").mkdir()
+    with _confined_out_dir(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.prepare_out_dir(entry)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
 
-def test_prepare_out_dir_releases_reservation_when_mkdtemp_fails(
+def test_prepare_out_dir_releases_reservation_when_tmp_mkdir_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P1: `os.mkdir(out_dir)` 成功後に `tempfile.mkdtemp` が失敗した場合、
-    予約済みの `out_dir` を残置せず解放すること（さもないと空の予約だけが残る）。
+    """`os.mkdir(out_dir)`（予約）成功後に、一時ディレクトリの `os.mkdir` が
+    失敗した場合、予約済みの `out_dir` を残置せず解放すること（さもないと
+    空の予約だけが残る。P1）。
     """
-    out_dir = tmp_path / "out"
+    real_mkdir = contract.os.mkdir
+    calls = {"n": 0}
 
-    def _boom(*_args: object, **_kwargs: object) -> str:
-        raise OSError("simulated mkdtemp failure")
+    def _flaky_mkdir(*args: object, **kwargs: object):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1 回目 = out_dir の予約（成功させる）、2 回目 = 一時ディレクトリ
+            raise OSError("simulated tmp mkdir failure")
+        return real_mkdir(*args, **kwargs)
 
-    monkeypatch.setattr(contract.tempfile, "mkdtemp", _boom)
-    with pytest.raises(WorkerError) as exc_info:
-        contract.prepare_out_dir(out_dir)
-    assert exc_info.value.code == "invalid_request"
-    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    assert not out_dir.exists()  # 予約が残置されない
+    with _confined_out_dir(tmp_path) as entry:
+        monkeypatch.setattr(contract.os, "mkdir", _flaky_mkdir)
+        with pytest.raises(WorkerError) as exc_info:
+            contract.prepare_out_dir(entry)
+        assert exc_info.value.code == "invalid_request"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        assert not (tmp_path / "out").exists()  # 予約が残置されない
 
 
 def test_prepare_and_finalize_out_dir_roundtrip(tmp_path: Path) -> None:
-    out_dir = tmp_path / "out"
-    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
-    assert tmp_dir.exists()
-    assert out_dir.is_dir()  # 予約済み（空ディレクトリとして先に作成されている）
-    assert not any(out_dir.iterdir())
-    (tmp_dir / "marker.txt").write_text("ok", encoding="utf-8")
-    contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
-    assert out_dir.exists()
-    assert (out_dir / "marker.txt").read_text(encoding="utf-8") == "ok"
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        assert (tmp_path / "out").is_dir()  # 予約済み（空ディレクトリとして先に作成されている）
+        assert not any((tmp_path / "out").iterdir())
+
+        fd = os.open(
+            "marker.txt",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=reservation.tmp_fd,
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"ok")
+        contract.finalize_out_dir(reservation)
+        assert (tmp_path / "out" / "marker.txt").read_text(encoding="utf-8") == "ok"
 
 
 def test_finalize_out_dir_rejects_when_reserved_dir_became_nonempty(tmp_path: Path) -> None:
-    """P0-A: 予約後に別プロセス（を模したテスト側の書き込み）が out_dir へ何かを
-    置いた場合、`os.replace` が ENOTEMPTY で失敗し、その内容を消さずに残すこと。
+    """予約後に別プロセス（を模したテスト側の書き込み）が out_dir へ何かを
+    置いた場合、`os.rename` が ENOTEMPTY で失敗し、その内容を消さずに残すこと。
     """
-    out_dir = tmp_path / "out"
-    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
-    (tmp_dir / "marker.txt").write_text("ok", encoding="utf-8")
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        fd = os.open(
+            "marker.txt",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=reservation.tmp_fd,
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"ok")
 
-    # 予約と確定の間に、別プロセスが out_dir の中身を書き換えたことを模す。
-    (out_dir / "foreign.txt").write_text("someone else's data", encoding="utf-8")
+        # 予約と確定の間に、別プロセスが out_dir の中身を書き換えたことを模す。
+        (tmp_path / "out" / "foreign.txt").write_text("someone else's data", encoding="utf-8")
 
-    with pytest.raises(WorkerError) as exc_info:
-        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
-    assert exc_info.value.code == "output_conflict"
-    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    # 他者が書いた内容は消さない。
-    assert (out_dir / "foreign.txt").read_text(encoding="utf-8") == "someone else's data"
+        with pytest.raises(WorkerError) as exc_info:
+            contract.finalize_out_dir(reservation)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        # 他者が書いた内容は消さない。
+        assert (tmp_path / "out" / "foreign.txt").read_text(
+            encoding="utf-8"
+        ) == "someone else's data"
 
 
 def test_finalize_out_dir_rejects_when_reserved_dir_replaced_by_different_dir(
     tmp_path: Path,
 ) -> None:
-    """P0-A: 予約後に out_dir が別物（別 inode のディレクトリ）へすり替わっていた場合、
-    `os.replace` を呼ぶ前に `(st_dev, st_ino)` の不一致で検出し拒否すること。
+    """予約後に out_dir が別物（別 inode のディレクトリ）へすり替わっていた場合、
+    `os.rename` を呼ぶ前に `(st_dev, st_ino)` の不一致で検出し拒否すること。
     """
-    out_dir = tmp_path / "out"
-    tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
 
-    # 予約済みディレクトリを削除し、同名の別ディレクトリへ差し替える
-    # （別プロセスによる置き換えを模す。inode が変わる）。
-    out_dir.rmdir()
-    out_dir.mkdir()
-    (out_dir / "someone_elses_file.txt").write_text("x", encoding="utf-8")
+        # 予約済みディレクトリを削除し、同名の別ディレクトリへ差し替える
+        # （別プロセスによる置き換えを模す。inode が変わる）。
+        (tmp_path / "out").rmdir()
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "someone_elses_file.txt").write_text("x", encoding="utf-8")
 
-    with pytest.raises(WorkerError) as exc_info:
-        contract.finalize_out_dir(tmp_dir, out_dir, reserved_id)
-    assert exc_info.value.code == "output_conflict"
-    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    # すり替わった側には触れない。
-    assert (out_dir / "someone_elses_file.txt").exists()
+        with pytest.raises(WorkerError) as exc_info:
+            contract.finalize_out_dir(reservation)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        # すり替わった側には触れない。
+        assert (tmp_path / "out" / "someone_elses_file.txt").exists()
 
 
 def test_cleanup_reserved_out_dir_removes_own_empty_reservation(tmp_path: Path) -> None:
-    out_dir = tmp_path / "out"
-    _tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
-    contract.cleanup_reserved_out_dir(out_dir, reserved_id)
-    assert not out_dir.exists()
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        contract.cleanup_reserved_out_dir(entry, reservation.reserved_id)
+        assert not (tmp_path / "out").exists()
 
 
 def test_cleanup_reserved_out_dir_leaves_nonempty_reservation(tmp_path: Path) -> None:
-    out_dir = tmp_path / "out"
-    _tmp_dir, reserved_id = contract.prepare_out_dir(out_dir)
-    (out_dir / "foreign.txt").write_text("x", encoding="utf-8")
-    contract.cleanup_reserved_out_dir(out_dir, reserved_id)
-    assert out_dir.exists()
-    assert (out_dir / "foreign.txt").exists()
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        (tmp_path / "out" / "foreign.txt").write_text("x", encoding="utf-8")
+        contract.cleanup_reserved_out_dir(entry, reservation.reserved_id)
+        assert (tmp_path / "out").exists()
+        assert (tmp_path / "out" / "foreign.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# TOCTOU の核心確認: confine 後に経路をシンボリックリンクへ差し替えても、
+# fd に束縛された実体（confine 時点のディレクトリ）だけが使われること。
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
+def test_prepare_out_dir_is_immune_to_parent_swap_after_confine(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    root_handle = guard.resolve_root(str(root))
+    entry = guard.confine(root_handle, "sub/out", "out_dir")
+    try:
+        # confine が完了した直後に、"sub" 自体を別物（outside への symlink）へ
+        # 差し替える（攻撃者が経路の途中を差し替える TOCTOU を模す）。
+        (root / "sub").rename(root / "sub_real")
+        (root / "sub").symlink_to(outside)
+
+        reservation = contract.prepare_out_dir(entry)
+        try:
+            fd = os.open(
+                "marker.txt",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=reservation.tmp_fd,
+            )
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"ok")
+            contract.finalize_out_dir(reservation)
+        except BaseException:
+            contract.cleanup_reservation(reservation)
+            raise
+
+        # 実際の書き込み先は confine 時点の実体（sub_real 配下）であり、
+        # 後から作られたシンボリックリンク（sub → outside）の先ではない。
+        assert (root / "sub_real" / "out" / "marker.txt").read_text(encoding="utf-8") == "ok"
+        assert not list(outside.iterdir())  # outside には何も書き込まれない
+        assert not (root / "sub" / "out").exists()  # symlink の先には何も無い
+    finally:
+        entry.close()
+        root_handle.close()

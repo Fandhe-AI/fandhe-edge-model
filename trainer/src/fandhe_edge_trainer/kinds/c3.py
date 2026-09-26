@@ -38,8 +38,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -374,10 +373,10 @@ class C3Kind:
             resource_budget=resource_budget,
         )
 
-    def export_onnx(self, trained: C3TrainedModel, path: Path) -> None:
+    def export_onnx(self, trained: C3TrainedModel, out: IO[bytes]) -> None:
         if trained.resource_budget is not None:
             trained.resource_budget.check()
-        _export_c3_onnx(trained, path)
+        _export_c3_onnx(trained, out)
 
 
 def _f32(arr: np.ndarray, name: str) -> TensorProto:
@@ -388,14 +387,13 @@ def _i64(arr: np.ndarray, name: str) -> TensorProto:
     return numpy_helper.from_array(np.ascontiguousarray(arr, dtype=np.int64), name=name)
 
 
-def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
+def _export_c3_onnx(trained: C3TrainedModel, out: IO[bytes]) -> None:
     # P0-2: 書き出しの各段（テンソル抽出・グラフ構築・検証・保存）の間で
     # 資源上限（REQ-39）を検査する。`resource_budget` は学習ループと同じ
     # インスタンス（`C3Kind.export_onnx` が渡す）で、無い場合は検査をスキップする
     # （テスト等で `resource_budget=None` の `C3TrainedModel` を直接構築した場合）。
     budget_check = trained.resource_budget.check if trained.resource_budget is not None else None
 
-    out_path = Path(out_path)
     widths = tuple(int(w) for w in trained.config["widths"])
     n_classes = len(trained.label_order)
     params = trained.model.parameters()
@@ -478,7 +476,13 @@ def _export_c3_onnx(trained: C3TrainedModel, out_path: Path) -> None:
     onnx.checker.check_model(model_proto)
     if budget_check is not None:
         budget_check()  # 段 4: check_model 後（save の前）
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save(model_proto, str(out_path))
+    # 経路は一切扱わない（呼び出し元が開いたファイルオブジェクトへ書き込むだけ。
+    # kinds/__init__.py::Kind.export_onnx の docstring 参照）。`onnx.save` ではなく
+    # 直接シリアライズする: `onnx.save` はファイルオブジェクトも受け付けるが、
+    # 明示的に protobuf バイト列を書き込む方が経路非依存の契約として単純で、
+    # `onnx.save` がファイルオブジェクトに対して行う内部実装（seek 等）へ
+    # 依存しない。決定性テスト（byte-identical）は `SerializeToString()` の
+    # 出力がそのまま `onnx.save` の protobuf 形式と同じであることに依存する。
+    out.write(model_proto.SerializeToString())
     if budget_check is not None:
         budget_check()  # 段 5: save 後

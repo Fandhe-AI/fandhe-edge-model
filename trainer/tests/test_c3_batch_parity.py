@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 from onnx.reference import ReferenceEvaluator
 
-from conftest import ATOL_BATCH_PARITY, make_examples, make_request
+from conftest import ATOL_BATCH_PARITY, export_onnx_to_path, make_examples, make_request
 from fandhe_edge_trainer.encoding import encode_bytes
 from fandhe_edge_trainer.kinds.c3 import C3Kind
 
@@ -30,7 +30,7 @@ def test_single_vs_batch_inference_match(tmp_path: Path) -> None:
     req = make_request(tmp_path)
     trained = kind.train(make_examples(), req)
     onnx_path = tmp_path / "model.onnx"
-    kind.export_onnx(trained, onnx_path)
+    export_onnx_to_path(kind, trained, onnx_path)
     session = ReferenceEvaluator(str(onnx_path))
 
     texts = [

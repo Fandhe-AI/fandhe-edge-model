@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 from onnx.reference import ReferenceEvaluator
 
-from conftest import ATOL_MLX_ONNX, make_examples, make_request
+from conftest import ATOL_MLX_ONNX, export_onnx_to_path, make_examples, make_request
 from fandhe_edge_trainer.encoding import encode_bytes
 from fandhe_edge_trainer.kinds.c3 import C3Kind, _batchify
 
@@ -26,7 +26,7 @@ def test_mlx_forward_matches_onnx_reference(tmp_path: Path) -> None:
     req = make_request(tmp_path)
     trained = kind.train(make_examples(), req)
     onnx_path = tmp_path / "model.onnx"
-    kind.export_onnx(trained, onnx_path)
+    export_onnx_to_path(kind, trained, onnx_path)
 
     texts = ["alpha alpha beta gamma", "delta delta epsilon zeta", "short"]
     id_lists = [encode_bytes(t, req.max_bytes) for t in texts]

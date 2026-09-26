@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
+from fandhe_edge_trainer import guard
 from fandhe_edge_trainer.contract import TrainExample, TrainRequest
 from fandhe_edge_trainer.limits import MAX_TRAIN_RSS_BYTES, MAX_TRAIN_WALL_SECONDS
 
@@ -42,6 +47,10 @@ TINY_CONFIG = {
     "dropout": 0.0,
 }
 
+#: `make_request` が作った `TrainRequest`（fd を保持する）を集め、テストごとに
+#: 自動で閉じる（`_close_confined_requests`）。fd リークで `EMFILE` に達するのを防ぐ。
+_created_requests: list[TrainRequest] = []
+
 
 def make_request(
     tmp_path,
@@ -53,10 +62,17 @@ def make_request(
     time_limit_seconds: int = MAX_TRAIN_WALL_SECONDS,
     rss_limit_bytes: int = MAX_TRAIN_RSS_BYTES,
 ) -> TrainRequest:
-    """`TrainRequest` を直接構築する（`guard.safe_join` を経由しないテスト専用の近道。
-    経路の閉じ込め検証そのものは `test_contract.py` 側で個別に検証する）。
+    """`TrainRequest` を、`guard.resolve_root`/`guard.confine` を実際に経由して
+    構築する（`root`＝`tmp_path`。fd の解放はテスト終了時に自動で行われる。
+    `_close_confined_requests` 参照）。経路の閉じ込め違反そのものの検証は
+    `test_contract.py` 側で個別に行う。
     """
-    return TrainRequest(
+    Path(tmp_path).mkdir(parents=True, exist_ok=True)  # root は存在するディレクトリが前提
+    root_handle = guard.resolve_root(str(tmp_path))
+    train_path_entry = guard.confine(root_handle, "train.jsonl", "train_path")
+    out_dir_entry = guard.confine(root_handle, out_name, "out_dir")
+    root_handle.close()  # train_path_entry/out_dir_entry は独立した fd を持つため不要になる
+    req = TrainRequest(
         kind="c3",
         kind_version=1,
         config=dict(config if config is not None else TINY_CONFIG),
@@ -64,9 +80,27 @@ def make_request(
         max_bytes=max_bytes,
         seed=seed,
         device="cpu",
-        root=tmp_path,
-        train_path=tmp_path / "train.jsonl",
-        out_dir=tmp_path / out_name,
+        root=root_handle,
+        train_path=train_path_entry,
+        out_dir=out_dir_entry,
         time_limit_seconds=time_limit_seconds,
         rss_limit_bytes=rss_limit_bytes,
     )
+    _created_requests.append(req)
+    return req
+
+
+def export_onnx_to_path(kind, trained, path) -> None:
+    """`Kind.export_onnx`（`IO[bytes]` を受け取る契約）をテストの `Path` 引数から
+    呼び出す小さなヘルパー（`kinds/__init__.py::Kind.export_onnx` 参照）。
+    """
+    with open(path, "wb") as f:
+        kind.export_onnx(trained, f)
+
+
+@pytest.fixture(autouse=True)
+def _close_confined_requests():
+    """`make_request` が作った `TrainRequest` の fd を、テストごとに解放する。"""
+    yield
+    while _created_requests:
+        _created_requests.pop().close_resources()

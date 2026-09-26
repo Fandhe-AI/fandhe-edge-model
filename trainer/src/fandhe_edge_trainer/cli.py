@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -50,51 +51,58 @@ def _emit(payload: dict) -> None:
 
 
 def run_train(request_path: Path) -> ExitCode:
-    """train サブコマンドの本体。戻り値は終了コード。"""
+    """train サブコマンドの本体。戻り値は終了コード。
+
+    `request` が保持する fd（`root`・`train_path`・`out_dir`。
+    `contract.py`・`guard.py` 参照）は、成功・失敗いずれの経路でも
+    `finally` で必ず閉じる（`TrainRequest.close_resources()`）。
+    """
     request = contract.load_request(request_path)
-    examples = contract.load_train_examples(request.train_path, request.label_order)
-    kind_impl = resolve_kind(request.kind, request.kind_version)
-
-    tmp_dir, reserved_id = contract.prepare_out_dir(request.out_dir)
     try:
-        trained = kind_impl.train(examples, request)
-        onnx_path = tmp_dir / artifact_mod.ONNX_FILE_NAME
-        kind_impl.export_onnx(trained, onnx_path)
-        art = artifact_mod.build_artifact(
-            kind=request.kind,
-            kind_version=request.kind_version,
-            config=trained.config,
-            label_order=trained.label_order,
-            # "choice"（選択肢からの判定）は Rust 側 Artifact.output_type
-            # （artifact.rs）・selector_common.py の output.type 契約と同じ値。
-            # 生成型の種類（REQ-19b）を追加する際はここが "choice" 以外の値を
-            # 取りうるようになる（その値の集合・意味は共通コア〔REQ-15〕側で
-            # 定義されるべきで、本ワーカーは種類ごとに固定値を渡すだけに留める）。
-            output_type="choice",
-            max_bytes=trained.max_bytes,
-            candidate_label=request.kind,
-        )
-        artifact_mod.write_artifact(tmp_dir, art)
-    except BaseException:
-        # tmp_dir（一時作業ディレクトリ）は必ず自分のものなので無条件に消す。
-        # 予約済み out_dir は「まだ自分の予約かつ空である場合のみ」解放する
-        # （P0-A: 学習中に何者かが out_dir へ書き込んでいたら残す。contract.py
-        # `cleanup_reserved_out_dir` のドキュメント参照）。
-        _cleanup(tmp_dir)
-        contract.cleanup_reserved_out_dir(request.out_dir, reserved_id)
-        raise
-    contract.finalize_out_dir(tmp_dir, request.out_dir, reserved_id)
+        examples = contract.load_train_examples(request.train_path, request.label_order)
+        kind_impl = resolve_kind(request.kind, request.kind_version)
 
-    artifact_path = request.out_dir / artifact_mod.ARTIFACT_FILE_NAME
-    art_written = json.loads(artifact_path.read_text(encoding="utf-8"))
-    _emit({"status": "ok", "artifact_dir": str(request.out_dir), "artifact": art_written})
+        reservation = contract.prepare_out_dir(request.out_dir)
+        try:
+            trained = kind_impl.train(examples, request)
+            # ONNX 本体・artifact.json は、予約済み out_dir と同じ親ディレクトリ
+            # 配下の作業用一時ディレクトリ（`reservation.tmp_fd`）へ、経路文字列を
+            # 使わず dir_fd 相対で新規作成する（TOCTOU 対策。O_EXCL で上書きしない）。
+            onnx_fd = os.open(
+                artifact_mod.ONNX_FILE_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=reservation.tmp_fd,
+            )
+            with os.fdopen(onnx_fd, "wb") as onnx_file:
+                kind_impl.export_onnx(trained, onnx_file)
+            art = artifact_mod.build_artifact(
+                kind=request.kind,
+                kind_version=request.kind_version,
+                config=trained.config,
+                label_order=trained.label_order,
+                # "choice"（選択肢からの判定）は Rust 側 Artifact.output_type
+                # （artifact.rs）・selector_common.py の output.type 契約と同じ値。
+                # 生成型の種類（REQ-19b）を追加する際はここが "choice" 以外の値を
+                # 取りうるようになる（その値の集合・意味は共通コア〔REQ-15〕側で
+                # 定義されるべきで、本ワーカーは種類ごとに固定値を渡すだけに留める）。
+                output_type="choice",
+                max_bytes=trained.max_bytes,
+                candidate_label=request.kind,
+            )
+            artifact_mod.write_artifact(reservation.tmp_fd, art)
+        except BaseException:
+            # 一時ディレクトリ（自分の作業物）・予約済み out_dir（「まだ自分の
+            # 予約かつ空」の場合のみ）の両方を解放する（contract.cleanup_reservation
+            # のドキュメント参照。学習中に何者かが out_dir へ書き込んでいたら残す）。
+            contract.cleanup_reservation(reservation)
+            raise
+        contract.finalize_out_dir(reservation)
+    finally:
+        request.close_resources()
+
+    _emit({"status": "ok", "artifact_dir": str(request.out_dir.display), "artifact": art})
     return ExitCode.OK
-
-
-def _cleanup(tmp_dir: Path) -> None:
-    import shutil
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:

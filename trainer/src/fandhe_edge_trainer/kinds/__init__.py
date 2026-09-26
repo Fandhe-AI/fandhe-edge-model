@@ -14,8 +14,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Protocol
+from typing import IO, Any, Protocol
 
 from ..contract import TrainExample, TrainRequest
 from ..errors import WorkerError
@@ -42,8 +41,15 @@ class Kind(Protocol):
         """train データだけを使って学習する（validation・test は読まない）。"""
         ...
 
-    def export_onnx(self, trained: TrainedModel, path: Path) -> None:
-        """学習結果を ONNX へ書き出す（推論ランタイムとの契約は runtime-builder と共有）。"""
+    def export_onnx(self, trained: TrainedModel, out: IO[bytes]) -> None:
+        """学習結果を ONNX として `out`（呼び出し元が開いた書き込み用バイナリファイル
+        オブジェクト）へ書き出す。**経路は一切扱わない**: どこへ書き出すか
+        （root 配下への閉じ込め・アトミックな確定）は呼び出し元（`cli.py`・
+        `contract.py`）の責務であり、本メソッドは `out.write(...)` するだけに
+        留める（TOCTOU を避けるための dir_fd ベースの経路解決を、種類ごとの
+        実装へ複製しない。推論ランタイムとの ONNX 形式の契約は runtime-builder
+        と共有する）。
+        """
         ...
 
 

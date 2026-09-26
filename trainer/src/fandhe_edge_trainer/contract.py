@@ -23,8 +23,12 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 
 `root` は呼び出し元が許可する作業ルート（絶対パス）。`train_path`・`out_dir` は
 `root` からの**相対パス**でなければならない（絶対パス・`..` 構成要素・空文字列は
-拒否する）。`TrainRequest.train_path`・`TrainRequest.out_dir` は検証・解決済みの
-絶対パス（`root` 配下であることを確認済み）を保持する。
+拒否する）。`TrainRequest.train_path`・`TrainRequest.out_dir` は
+`guard.ConfinedEntry`（root 配下へ dir_fd で閉じ込め済みの「親ディレクトリ fd +
+最終コンポーネント名」）を保持する（`Path` 文字列ではない。TOCTOU 対策。
+`guard.py` のモジュール docstring 参照）。`TrainRequest.root` は開いたままの
+`guard.RootHandle`。**いずれも使い終わったら `TrainRequest.close_resources()` で
+明示的に fd を閉じること**（`cli.py::run_train` が `finally` で行う）。
 
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
 `MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
@@ -41,36 +45,45 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 
 **経路の閉じ込め（REQ-39 のガード層・PoC-20）は多層防御とする**: 一次防御は
 Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単独プロセスとしても
-起動されうるため、本ワーカー自身も `guard.py::safe_join` で `root` 配下への
-閉じ込めを検証する（Rust 側の検証済みという前提だけに頼らない）。詳細は
-`guard.py` のモジュール docstring を参照。
+起動されうるため、本ワーカー自身も `guard.py::confine` で `root` 配下への
+閉じ込めを検証する（Rust 側の検証済みという前提だけに頼らない）。検証（fd を開く
+時点）と使用（実際の読み書き・`mkdir`・`rename`）を同じ fd に束縛することで、
+検証後に経路の途中がシンボリックリンクへ差し替えられる TOCTOU を防ぐ。
 
 **ジョブの再開・異常終了時の後片付けは本モジュールの責務ではない**（REQ-34）。
 `prepare_out_dir`/`finalize_out_dir` は「同一プロセス内で正常終了 or 例外終了する」
 場合の半端な書き込み防止だけを担う。本ワーカーが SIGKILL 等で強制終了した場合、
-空の予約済み `out_dir`・`<out_dir>.tmp-*` が残置されうるが、その回収（次回実行前の
+空の予約済み `out_dir`・その一時ディレクトリが残置されうるが、その回収（次回実行前の
 掃除・再試行判断）はジョブ管理を担う Rust 側（TASK-34.x）の責務とする。予約済み
-`out_dir` が空のままであること自体が「成果物は公開されていない」ことの証拠になる
-（後述の予約方式）。
+`out_dir` が空のままであること自体が「成果物は公開されていない」ことの証拠になる。
 
 **`out_dir` の確定は「空ディレクトリの予約 → 別ディレクトリで作業 → アトミックな
-置き換え」の 3 段で行う**（TOCTOU 対策）。`prepare_out_dir` が `os.mkdir` で
-`out_dir` そのものを排他的に作成する（既存なら `FileExistsError` を検出できる。
-`exists()` チェック → 後から作成という 2 手順では、その間に別プロセスが
-先に作成できてしまう）。学習・書き出しは兄弟の一時ディレクトリで行い、
-`finalize_out_dir` が予約時に記録した `(st_dev, st_ino)` と現在の `out_dir` の
-それを突き合わせてから（別物にすり替わっていないか）`os.replace` で確定する。
+置き換え」の 3 段で行う**（TOCTOU 対策）。`prepare_out_dir` が `os.mkdir`
+（`dir_fd` 相対）で `out_dir` そのものを排他的に作成する（既存なら
+`FileExistsError` を検出できる。「存在確認 → 後で作成」という 2 手順では、
+その間に別プロセスが先に作成できてしまう）。学習・書き出しは兄弟の一時
+ディレクトリ（同じ `parent_fd` 配下）で行い、`finalize_out_dir` が予約時に
+記録した `(st_dev, st_ino)` と現在の `out_dir` のそれを突き合わせてから
+（別物にすり替わっていないか）`os.rename`（`dir_fd` 相対）で確定する。
 置き換え先が空ディレクトリでなくなっていた場合（何者かが書き込んだ）は
-`os.replace` 自体が `ENOTEMPTY` で失敗するため、その内容を消さずに残す。
+`os.rename` 自体が `ENOTEMPTY` で失敗するため、その内容を消さずに残す。
+
+**`os.replace` ではなく `os.rename` を使う**: `os.replace` は `dir_fd` 引数を
+サポートしない（`os.replace not in os.supports_dir_fd`。本開発機の macOS で
+実測確認済み）。POSIX の `rename(2)` は元々、置き換え先が空ディレクトリであれば
+上書きする仕様のため（`os.replace` が Windows 向けに追加している「常に上書きする」
+という意味論は POSIX の `rename` に元から備わっている）、`dir_fd` に対応した
+`os.rename` で同じ効果が得られる。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import secrets
 import stat
-import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
@@ -123,7 +136,12 @@ class TrainExample:
 
 @dataclass(frozen=True)
 class TrainRequest:
-    """検証済みの学習リクエスト。"""
+    """検証済みの学習リクエスト。
+
+    `root`・`train_path`・`out_dir` は開いたままの fd を保持する
+    （`guard.RootHandle`・`guard.ConfinedEntry`）。使い終わったら必ず
+    `close_resources()` を呼ぶこと（`cli.py::run_train` が `finally` で行う）。
+    """
 
     kind: str
     kind_version: int
@@ -132,11 +150,21 @@ class TrainRequest:
     max_bytes: int
     seed: int
     device: str
-    root: Path
-    train_path: Path
-    out_dir: Path
+    root: guard.RootHandle
+    train_path: guard.ConfinedEntry
+    out_dir: guard.ConfinedEntry
     time_limit_seconds: int
     rss_limit_bytes: int
+
+    def close_resources(self) -> None:
+        """保持している fd（`train_path`・`out_dir`・`root`）をすべて閉じる。
+
+        各 `close()` は冪等なので、`load_train_examples`/`prepare_out_dir` 等が
+        個別に（用が済み次第）先に閉じていても問題ない。
+        """
+        self.train_path.close()
+        self.out_dir.close()
+        self.root.close()
 
 
 def _invalid(message: str) -> WorkerError:
@@ -175,36 +203,54 @@ def _json_loads_strict(text: str) -> Any:
         raise ValueError(f"JSON nesting too deep: {type(e).__name__}") from e
 
 
-def _open_regular_file(
-    path: Path, error_maker: Any, *, nofollow: bool = False
-) -> tuple[IO[bytes], os.stat_result]:
-    """ファイルを開いたうえで、開いた fd に対して stat を取り「通常ファイルであること」
-    を確認する（open → fstat の順にすることで、path に対する stat → open の間に
-    別ファイルへ差し替えられる TOCTOU を避ける。REQ-39 ガード層の「形式の許可制」を
-    学習ワーカー側でも最小限適用する）。
+def _open_regular_file(path: Path, error_maker: Any) -> tuple[IO[bytes], os.stat_result]:
+    """（root 非配下の）通常のパスからファイルを開く。`load_request` 専用。
 
-    `O_NONBLOCK` を付けて開く: 読み取り用に FIFO を通常どおり（ブロッキングで）開くと、
-    書き込み側が現れるまで `open()` 自体が無期限にブロックする（`無制限待ちを作らない`。
-    REQ-39）。`O_NONBLOCK` を付けると FIFO の open は書き込み側の有無によらず即座に
-    返るため、その直後の `fstat`/`S_ISREG` 判定で確実に拒否できる。通常ファイルの
-    読み取りには `O_NONBLOCK` は影響しない（意味を持つのは FIFO・一部のデバイス・
-    ソケットのみ）。
+    `--request <path>` は Rust 側 CLI が直接渡す絶対パスであり、`root` 配下への
+    閉じ込め対象ではない（root 配下の `train_path`/`out_dir` は
+    `_open_confined_regular_file`/`prepare_out_dir` が dir_fd ベースで扱う）。
 
-    `nofollow=True`（`guard.py::safe_join` で解決済みの経路を開く場合に指定）:
-    最終コンポーネントが実はシンボリックリンクだった場合に `ELOOP` で拒否する。
-    `safe_join` は解決時点の実体をすでに `realpath` で確認しているため、
-    これは「`safe_join` の呼び出しから実際の open までの間に最終コンポーネントが
-    シンボリックリンクへ差し替えられる」という残存 TOCTOU 一枚を狭めるだけの
-    追加防御であり、経路検証の主たる根拠ではない（guard.py のモジュール docstring
-    参照）。
+    open → fstat の順にすることで、path に対する stat → open の間に別ファイルへ
+    差し替えられる TOCTOU を避ける。`O_NONBLOCK` を付けて開く: 読み取り用に FIFO を
+    通常どおり（ブロッキングで）開くと、書き込み側が現れるまで `open()` 自体が
+    無期限にブロックする（`無制限待ちを作らない`。REQ-39）。`O_NONBLOCK` を付けると
+    FIFO の open は書き込み側の有無によらず即座に返るため、その直後の
+    `fstat`/`S_ISREG` 判定で確実に拒否できる。通常ファイルの読み取りには
+    `O_NONBLOCK` は影響しない（意味を持つのは FIFO・一部のデバイス・ソケットのみ）。
     """
-    flags = os.O_RDONLY | os.O_NONBLOCK
-    if nofollow:
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as e:
         raise error_maker(f"file not readable: {type(e).__name__}") from e
+    try:
+        st = os.fstat(fd)
+    except OSError as e:
+        os.close(fd)
+        raise error_maker(f"file not stat-able: {type(e).__name__}") from e
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise error_maker("file is not a regular file")
+    f = os.fdopen(fd, "rb")
+    return f, st
+
+
+def _open_confined_regular_file(
+    entry: guard.ConfinedEntry, error_maker: Any
+) -> tuple[IO[bytes], os.stat_result]:
+    """`guard.confine` で得た `ConfinedEntry`（親ディレクトリ fd + 最終コンポーネント名）
+    から、シンボリックリンクを追跡せずに通常ファイルとして開く（`train_path` 用）。
+
+    `parent_fd` はこの `open` 呼び出しのためだけに必要なので、成功・失敗いずれの
+    場合も呼び出し直後に閉じる（`entry.close()`。以後の読み取りは返されたファイル
+    オブジェクト自身の fd で完結する）。
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        fd = os.open(entry.name, flags, dir_fd=entry.parent_fd)
+    except OSError as e:
+        raise error_maker(f"file not readable: {type(e).__name__}") from e
+    finally:
+        entry.close()
     try:
         st = os.fstat(fd)
     except OSError as e:
@@ -287,14 +333,6 @@ def _validate_request(raw: Any) -> TrainRequest:
     if device not in _ALLOWED_DEVICES:
         raise _invalid(f"device must be one of {_ALLOWED_DEVICES}")
 
-    # 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）:
-    # `root` を実体解決したうえで、`train_path`・`out_dir`（root からの相対パス）を
-    # その配下に閉じ込める。guard.safe_join は違反を WorkerError で送出する
-    # （構文違反は invalid_path、閉じ込め違反は path_outside_root。いずれも exit 64）。
-    root_real = guard.resolve_root(raw.get("root"))
-    train_path = guard.safe_join(root_real, raw.get("train_path"), "train_path")
-    out_dir = guard.safe_join(root_real, raw.get("out_dir"), "out_dir")
-
     # ジョブ全体の資源上限（REQ-39・budget.py）。任意項目で「既定の上限より
     # 下げる」ことだけを許す（上限そのものを緩める経路は無い）。
     time_limit_seconds = raw.get("time_limit_seconds", MAX_TRAIN_WALL_SECONDS)
@@ -313,6 +351,22 @@ def _validate_request(raw: Any) -> TrainRequest:
     ):
         raise _invalid(f"rss_limit_bytes must be an integer in [1, {MAX_TRAIN_RSS_BYTES}]")
 
+    # 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）は最後に
+    # 行う: ここより前の検証で弾かれるリクエストのために fd を開いて後始末する
+    # 手間を避ける。ここから先で失敗したら、それまでに開いた fd をすべて
+    # 閉じてから再送出する。
+    root_handle = guard.resolve_root(raw.get("root"))
+    try:
+        train_path_entry = guard.confine(root_handle, raw.get("train_path"), "train_path")
+        try:
+            out_dir_entry = guard.confine(root_handle, raw.get("out_dir"), "out_dir")
+        except BaseException:
+            train_path_entry.close()
+            raise
+    except BaseException:
+        root_handle.close()
+        raise
+
     return TrainRequest(
         kind=kind,
         kind_version=kind_version,
@@ -321,9 +375,9 @@ def _validate_request(raw: Any) -> TrainRequest:
         max_bytes=max_bytes,
         seed=seed,
         device=device,
-        root=root_real,
-        train_path=train_path,
-        out_dir=out_dir,
+        root=root_handle,
+        train_path=train_path_entry,
+        out_dir=out_dir_entry,
         time_limit_seconds=time_limit_seconds,
         rss_limit_bytes=rss_limit_bytes,
     )
@@ -345,8 +399,11 @@ def _validate_label_order(label_order: Any) -> None:
         seen.add(label)
 
 
-def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainExample]:
+def load_train_examples(entry: guard.ConfinedEntry, label_order: list[str]) -> list[TrainExample]:
     """学習データ（JSONL）を読み、検証したうえで `TrainExample` の一覧を返す。
+
+    `entry` は `guard.confine` で得た `train_path` の `ConfinedEntry`（本関数が
+    ファイルを開いた直後に `parent_fd` を閉じる。`_open_confined_regular_file` 参照）。
 
     データ本文（`input`・`label` の値）はエラーメッセージへ一切含めない
     （個人情報・機密情報を含みうる。security.md）。行番号・件数だけを報告する。
@@ -362,11 +419,7 @@ def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainE
     total_bytes = 0
     lineno = 0
 
-    # nofollow=True: train_path は guard.safe_join が root 配下であることを
-    # 確認済みの経路だが、safe_join の呼び出しから open までの間隙
-    # （残存 TOCTOU。guard.py 参照）を狭めるため、最終コンポーネントの
-    # シンボリックリンクを追跡しない。
-    f, st = _open_regular_file(train_path, _invalid, nofollow=True)
+    f, st = _open_confined_regular_file(entry, _invalid)
     if st.st_size > MAX_TRAIN_DATA_BYTES:
         f.close()
         raise _limit(f"train data exceeds {MAX_TRAIN_DATA_BYTES} bytes limit")
@@ -437,95 +490,126 @@ def load_train_examples(train_path: Path, label_order: list[str]) -> list[TrainE
 
 #: `out_dir` の実体識別子（`st_dev`・`st_ino`）。予約時点のものを覚えておき、
 #: 確定（`finalize_out_dir`）の直前に「まだ自分が予約した実体と同じか」を
-#: 確認するために使う（P0-A: 予約と確定の間の TOCTOU 対策）。
+#: 確認するために使う（TOCTOU 対策）。
 ReservedId = tuple[int, int]
 
 
-def prepare_out_dir(out_dir: Path) -> tuple[Path, ReservedId]:
-    """`out_dir` を空ディレクトリとして排他的に予約し、書き込み用の一時
-    ディレクトリ（兄弟）を作って返す。
+@dataclass
+class OutDirReservation:
+    """予約済みの `out_dir` と、その作業用一時ディレクトリの一式。
 
-    `out_dir` は呼び出し元（`_validate_request`）で `guard.safe_join` によって
-    root 配下への閉じ込めを検証・解決済みの絶対パスである前提（`out_dir.parent` が
-    その時点で解決済みの実体パス）。一時ディレクトリはこの同じ親の配下に作るため、
-    root の外へ書き出す経路は生まれない。
+    `entry.parent_fd` を経由してのみ `out_dir`・一時ディレクトリを操作する
+    （`entry` が指すディレクトリの外へ書き出す経路は無い）。
+    """
+
+    entry: guard.ConfinedEntry
+    tmp_name: str
+    tmp_fd: int
+    reserved_id: ReservedId
+    _tmp_closed: bool = field(default=False, init=False, repr=False)
+
+    def close_tmp_fd(self) -> None:
+        if not self._tmp_closed:
+            self._tmp_closed = True
+            with contextlib.suppress(OSError):
+                os.close(self.tmp_fd)
+
+
+def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
+    """`out_dir` を空ディレクトリとして排他的に予約し、書き込み用の一時
+    ディレクトリ（兄弟。同じ `entry.parent_fd` 配下）を作って返す。
 
     「存在確認 → 後で作成」という 2 手順では、その間に別プロセスが先に
-    `out_dir` を作れてしまう（TOCTOU）。`os.mkdir` は対象が既に存在すれば
-    `FileExistsError` を返すことがカーネルにより保証されたアトミックな操作
-    のため、予約自体を 1 手順で行う。学習・書き出しは兄弟の一時ディレクトリで
-    行い、成功時に `finalize_out_dir` がこの予約済み空ディレクトリを
-    `os.replace` で置き換える（本関数のモジュール docstring も参照）。
+    `out_dir` を作れてしまう（TOCTOU）。`os.mkdir`（`dir_fd` 相対）は対象が
+    既に存在すれば `FileExistsError` を返すことがカーネルにより保証された
+    アトミックな操作のため、予約自体を 1 手順で行う。学習・書き出しは兄弟の
+    一時ディレクトリで行い、成功時に `finalize_out_dir` がこの予約済み空
+    ディレクトリを `os.rename` で置き換える（本モジュールの docstring も参照）。
+
+    `os.mkdir(name, dir_fd=...)` の成功後に発生したあらゆる例外（`stat` の失敗・
+    一時ディレクトリの作成・open の失敗）は、予約（`out_dir`・一時ディレクトリ）を
+    解放してから再送出する（残置しない）。
     """
-    parent = out_dir.parent
-    if not parent.is_dir():
-        raise _invalid("out_dir's parent directory does not exist")
+    parent_fd = entry.parent_fd
+    name = entry.name
     try:
-        os.mkdir(out_dir, 0o700)
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
     except FileExistsError as e:
         raise WorkerError(
             "output_conflict", "out_dir already exists", ExitCode.INVALID_INPUT
         ) from e
     except OSError as e:
         raise _invalid(f"failed to create out_dir: {type(e).__name__}") from e
-    reserved_id = _reserved_id_of(out_dir)
+
+    tmp_name: str | None = None
+    tmp_fd: int | None = None
     try:
-        tmp = Path(tempfile.mkdtemp(prefix=f"{out_dir.name}.tmp-", dir=parent))
-    except OSError as e:
-        # P1: mkdtemp が失敗した時点で out_dir の予約（os.mkdir）は既に成功して
-        # いるため、ここで解放しないと空の予約済みディレクトリが残置される
-        # （呼び出し元は WorkerError を検出できても、その事実を知る術がない）。
-        # 「まだ自分の予約かつ空である」場合にのみ解放する
-        # `cleanup_reserved_out_dir` と同じ判定を使い、他プロセスが介入した
-        # 形跡があれば残す。
-        cleanup_reserved_out_dir(out_dir, reserved_id)
-        raise _invalid(f"failed to create temp dir for out_dir: {type(e).__name__}") from e
-    return tmp, reserved_id
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        reserved_id: ReservedId = (st.st_dev, st.st_ino)
+        tmp_name = f".{name}.tmp-{secrets.token_hex(8)}"
+        os.mkdir(tmp_name, 0o700, dir_fd=parent_fd)
+        tmp_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except BaseException as e:
+        if tmp_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(tmp_fd)
+        if tmp_name is not None:
+            with contextlib.suppress(OSError):
+                os.rmdir(tmp_name, dir_fd=parent_fd)
+        # 予約直後で他プロセスの介入が無い限り必ず空のはずだが、万一に備えて
+        # 失敗は無視する（cleanup_reserved_out_dir と同じく安全側の残置）。
+        with contextlib.suppress(OSError):
+            os.rmdir(name, dir_fd=parent_fd)
+        if isinstance(e, WorkerError):
+            raise
+        raise _invalid(f"failed to prepare out_dir: {type(e).__name__}") from e
+
+    return OutDirReservation(entry=entry, tmp_name=tmp_name, tmp_fd=tmp_fd, reserved_id=reserved_id)
 
 
-def _reserved_id_of(out_dir: Path) -> ReservedId:
-    st = os.lstat(out_dir)
-    return (st.st_dev, st.st_ino)
-
-
-def finalize_out_dir(tmp_dir: Path, out_dir: Path, reserved_id: ReservedId) -> None:
+def finalize_out_dir(reservation: OutDirReservation) -> None:
     """予約済みの `out_dir`（空ディレクトリ）を一時ディレクトリの内容で確定させる。
 
     確定前に `out_dir` が「予約時点と同じ実体（`st_dev`・`st_ino` が一致する
     ディレクトリ。シンボリックリンクや別物にすり替わっていない）」であることを
     確認する。一致しなければ、実体が何であれ触れずに `output_conflict`
-    （exit 64）とする。一致していれば `os.replace` で置き換える: 予約後に
-    何者かが `out_dir` の中へファイルを書き込んでいた場合、`os.replace` は
-    ディレクトリを空でない置き換え先へは適用できない（`ENOTEMPTY`）ため
-    失敗する。この場合もその内容を削除せず残したまま `output_conflict` とする
+    （exit 64）とする。一致していれば `os.rename`（`dir_fd` 相対）で置き換える:
+    予約後に何者かが `out_dir` の中へファイルを書き込んでいた場合、`rename` は
+    ディレクトリを空でない置き換え先へは適用できない（`ENOTEMPTY`）ため失敗する。
+    この場合もその内容を削除せず残したまま `output_conflict` とする
     （利用者側の入力・実行環境に起因しうる競合であり、本ワーカーの内部バグでは
-    ないため `runtime_error`〔exit 70〕ではなく `invalid_request` 系の
-    `output_conflict`〔exit 64〕として扱う）。
+    ないため `runtime_error`〔exit 70〕ではなく `output_conflict`〔exit 64〕として
+    扱う）。
     """
+    entry = reservation.entry
+    parent_fd = entry.parent_fd
+    name = entry.name
     try:
-        st = os.lstat(out_dir)
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as e:
-        _cleanup_tmp_dir(tmp_dir)
+        _release_tmp(reservation)
         raise WorkerError(
             "output_conflict",
             f"reserved out_dir vanished before finalize: {type(e).__name__}",
             ExitCode.INVALID_INPUT,
         ) from e
     current_id = (st.st_dev, st.st_ino)
-    if not stat.S_ISDIR(st.st_mode) or current_id != reserved_id:
-        _cleanup_tmp_dir(tmp_dir)
+    if not stat.S_ISDIR(st.st_mode) or current_id != reservation.reserved_id:
+        _release_tmp(reservation)
         raise WorkerError(
             "output_conflict",
             "out_dir was replaced by a different entry before finalize",
             ExitCode.INVALID_INPUT,
         )
+
+    reservation.close_tmp_fd()  # rename に fd は不要（名前だけで足りる）
     try:
-        os.replace(tmp_dir, out_dir)
+        os.rename(reservation.tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except OSError as e:
-        # ENOTEMPTY（予約後に何者かが書き込んだ）等。out_dir の中身は触らない
-        # （foreign content を残す。cli.py::run_train の失敗時クリーンアップも
-        # 同様に「自分の予約かつ空である場合のみ」rmdir する設計にしてある）。
-        _cleanup_tmp_dir(tmp_dir)
+        # ENOTEMPTY（予約後に何者かが書き込んだ）等。out_dir の中身は触らない。
+        _cleanup_tmp_contents(parent_fd, reservation.tmp_name)
+        with contextlib.suppress(OSError):
+            os.rmdir(reservation.tmp_name, dir_fd=parent_fd)
         raise WorkerError(
             "output_conflict",
             f"failed to finalize out_dir: {type(e).__name__}",
@@ -533,8 +617,16 @@ def finalize_out_dir(tmp_dir: Path, out_dir: Path, reserved_id: ReservedId) -> N
         ) from e
 
 
-def cleanup_reserved_out_dir(out_dir: Path, reserved_id: ReservedId) -> None:
-    """学習失敗時などに予約を解放する。
+def cleanup_reservation(reservation: OutDirReservation) -> None:
+    """学習・書き出しの失敗時に、確保済みの一時ディレクトリと予約済み `out_dir`
+    の両方を解放する（`cli.py::run_train` の失敗時クリーンアップから呼ぶ）。
+    """
+    _release_tmp(reservation)
+    cleanup_reserved_out_dir(reservation.entry, reservation.reserved_id)
+
+
+def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId) -> None:
+    """予約済みの `out_dir` を解放する。
 
     まだ自分が予約した実体（`st_dev`・`st_ino` が一致）であり、かつ空である
     場合にのみ `os.rmdir` する。他プロセスが何か書き込んでいる・別物へ
@@ -542,19 +634,51 @@ def cleanup_reserved_out_dir(out_dir: Path, reserved_id: ReservedId) -> None:
     次回実行前に判断する。予約が空のまま残ることは「成果物は公開されていない」
     ことの証拠であり、安全側の残置である）。
     """
+    parent_fd = entry.parent_fd
+    name = entry.name
     try:
-        st = os.lstat(out_dir)
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
         return
     if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != reserved_id:
         return
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
+
+
+def _release_tmp(reservation: OutDirReservation) -> None:
+    """作業用一時ディレクトリ（中身を含む）を解放する。`out_dir` 側には触れない。"""
+    reservation.close_tmp_fd()
+    parent_fd = reservation.entry.parent_fd
+    _cleanup_tmp_contents(parent_fd, reservation.tmp_name)
+    with contextlib.suppress(OSError):
+        os.rmdir(reservation.tmp_name, dir_fd=parent_fd)
+
+
+def _cleanup_tmp_contents(parent_fd: int, tmp_name: str) -> None:
+    """一時ディレクトリの中身（`kind_impl.export_onnx`/`artifact.write_artifact` が
+    書き込んだファイル）を、ファイル名を決め打ちせずに列挙して削除する。
+
+    列挙用に別途 fd を 1 つ開く（`os.scandir(fd)` はイテレータの終了時に自動で
+    その fd を閉じるため、削除操作用の fd とは分ける）。
+    """
     try:
-        os.rmdir(out_dir)  # 空でなければ ENOTEMPTY → 例外を握りつぶして残置する
+        list_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError:
-        pass
-
-
-def _cleanup_tmp_dir(tmp_dir: Path) -> None:
-    import shutil
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+    try:
+        names = [e.name for e in os.scandir(list_fd)]
+    except OSError:
+        names = []
+    if not names:
+        return
+    try:
+        work_fd = os.open(tmp_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError:
+        return
+    try:
+        for name in names:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=work_fd)
+    finally:
+        os.close(work_fd)

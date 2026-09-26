@@ -10,8 +10,8 @@ artifact.rs`）とフィールド名・型を揃える。本ワーカーは C3 �
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 #: 選択口（本ワーカー）のバージョン。artifact.json の再現性の記録に使う。
@@ -51,8 +51,21 @@ def build_artifact(
     }
 
 
-def write_artifact(pkg_dir: Path, artifact: dict[str, Any]) -> None:
-    """`artifact.json` を書き出す（改行は LF 固定。`json.dumps` の既定どおり）。"""
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(artifact, ensure_ascii=False, indent=2)
-    (pkg_dir / ARTIFACT_FILE_NAME).write_text(text + "\n", encoding="utf-8")
+def write_artifact(tmp_fd: int, artifact: dict[str, Any]) -> None:
+    """`artifact.json` を書き出す（改行は LF 固定。`json.dumps` の既定どおり）。
+
+    `tmp_fd` は呼び出し元（`cli.py::run_train`）が `guard`/`contract` 経由で
+    root 配下に閉じ込め済みの作業用一時ディレクトリの fd。経路文字列ではなく
+    `dir_fd` 相対でファイルを作成することで、TOCTOU 無しに閉じ込めを保つ
+    （`contract.py`・`guard.py` のモジュール docstring 参照）。新規作成のみを
+    許す（`O_EXCL`。既に同名のファイルがあれば失敗させ、上書きしない）。
+    """
+    text = json.dumps(artifact, ensure_ascii=False, indent=2) + "\n"
+    fd = os.open(
+        ARTIFACT_FILE_NAME,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=tmp_fd,
+    )
+    with os.fdopen(fd, "wb") as f:
+        f.write(text.encode("utf-8"))

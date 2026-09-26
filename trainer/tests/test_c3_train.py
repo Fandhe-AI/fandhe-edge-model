@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 import pytest
 
-from conftest import TINY_CONFIG, make_examples, make_request
+from conftest import TINY_CONFIG, export_onnx_to_path, make_examples, make_request
 from fandhe_edge_trainer import artifact as artifact_mod
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
@@ -23,7 +23,7 @@ def _train_and_export(tmp_path: Path, seed: int = 0) -> Path:
     examples = make_examples()
     trained = kind.train(examples, req)
     onnx_path = tmp_path / f"model_{seed}.onnx"
-    kind.export_onnx(trained, onnx_path)
+    export_onnx_to_path(kind, trained, onnx_path)
     return onnx_path
 
 
@@ -156,7 +156,7 @@ def test_c3_export_rejects_nonzero_pad_embedding_row(tmp_path: Path) -> None:
     trained.model.embed.weight = mx.array(w)
 
     with pytest.raises(WorkerError) as exc_info:
-        kind.export_onnx(trained, tmp_path / "broken.onnx")
+        export_onnx_to_path(kind, trained, tmp_path / "broken.onnx")
     assert exc_info.value.code == "runtime_error"
     assert exc_info.value.exit_code == ExitCode.RUNTIME_ERROR
 
@@ -246,8 +246,8 @@ def test_c3_train_encoding_is_resource_bounded_and_order_preserving(tmp_path: Pa
     trained_b = kind.train(make_examples(), req_b)
     onnx_a = tmp_path / "a.onnx"
     onnx_b = tmp_path / "b.onnx"
-    kind.export_onnx(trained_a, onnx_a)
-    kind.export_onnx(trained_b, onnx_b)
+    export_onnx_to_path(kind, trained_a, onnx_a)
+    export_onnx_to_path(kind, trained_b, onnx_b)
     assert (
         hashlib.sha256(onnx_a.read_bytes()).hexdigest()
         == hashlib.sha256(onnx_b.read_bytes()).hexdigest()
