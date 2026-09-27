@@ -1,0 +1,617 @@
+//! 正解率・ラベル別指標（適合率・再現率・F1）・Macro-F1・混同行列の算出。
+//!
+//! CLI の `evaluate` 工程（REQ-33）から、データ契約層で検証済みの
+//! gold・推論結果を受け取って呼ばれる想定（本モジュール自体はファイル I/O・
+//! JSON 逆シリアル化を行わず、型付きのメモリ上のスライスだけを受け取る）。
+//! REQ-24（評価器の正しさ）の正常系・TASK-24.1-1・issue #59 に対応する。
+//!
+//! # 評価契約との関係
+//!
+//! - 分母が 0 の指標は `Option<f64>` の `None` として返し、0 や 1 で埋めない
+//!   （`.claude/rules/evaluation-contract.md`「有意性・指標」）。`None` を
+//!   JSON の `null` へ写す処理と、平均から除いたラベルの列挙
+//!   （`excluded_labels`）は TASK-24.2（issue #61）が担う
+//! - 入力（[`EvalRecord`]）は `&` 参照でのみ受け取り、書き換えない
+//!   （REQ-27: 評価の前後で評価データのハッシュが一致すること）
+//! - F1 は `2*TP / (2*TP + FP + FN)` で定義する（適合率・再現率の調和平均
+//!   ではない）。調和平均で書くと、適合率が未定義（`None`）のラベルの F1 まで
+//!   `None` になり、Macro-F1 の算出から誤って除外されてしまう
+//!   （PoC-9 manifest.md「11. 凍結前の修正」2026-09-23。この誤りにより
+//!   既知解データセットの Macro-F1 が 49/78・0.4 という誤った値になっていた
+//!   経緯がある。本実装ではこの誤りを再現しない）
+//!
+//! # 資源上限
+//!
+//! 計算量は `records` の長さとラベル数に比例し、確保するメモリは
+//! ラベル数の 2 乗程度（混同行列）に限られる。件数・ラベル数の上限検証
+//! （REQ-39）は呼び出し側（データ検査層。定義ファイルのサイズ上限
+//! `fandhe-edge-core::MAX_DEFINITION_FILE_BYTES` と入力スライスの長さで
+//! 決まる）の責務とする。
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// 予測 1 件の結果（PoC-9 の `type_valid_single` に相当する分類）。
+///
+/// `Label` の中身がラベル集合に存在しない場合（未知のラベル・空文字列）は、
+/// [`evaluate_single_select`] が混同行列の `Invalid` 列へ数える
+/// （PoC-9 既知解の ss-12 `"E"`・ss-18 `""` と同じ扱い）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// 推論が ok で、ラベル文字列を返した（ラベル集合に無い場合は Invalid 扱い）。
+    Label(String),
+    /// 推論は ok だが、ラベル以外の形（型が不正）を返した。
+    Invalid,
+    /// 推論が保留（判定不能）を返した。
+    Abstain,
+    /// 推論がエラーで終了した。
+    Error,
+}
+
+/// 評価 1 件（正解ラベルと予測結果の組）。所有権は取らない（REQ-27）。
+#[derive(Debug, Clone, Copy)]
+pub struct EvalRecord<'a> {
+    /// 正解ラベル ID。ラベル集合に存在しない場合 [`EvalError::UnknownGoldLabel`]。
+    pub gold: &'a str,
+    /// 推論結果。
+    pub outcome: &'a Outcome,
+}
+
+/// [`evaluate_single_select`] が返しうるエラー。
+///
+/// 外部入力（ラベル集合・評価レコード）の異常を fail-closed で表現し、
+/// panic させない（`.claude/rules/coding-rust.md`「エラーハンドリング・外部入力」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EvalError {
+    /// ラベル集合が空。
+    EmptyLabels,
+    /// ラベル集合に空文字列の ID が含まれる。
+    EmptyLabelId,
+    /// ラベル集合に重複した ID が含まれる。
+    DuplicateLabel {
+        /// 重複したラベル ID。
+        label: String,
+    },
+    /// 評価レコードが 0 件（0 除算を避け、評価済みを装わない）。
+    EmptyRecords,
+    /// 正解ラベルがラベル集合に存在しない（データ契約層で除外・警告される前提だが、
+    /// 本層は fail-closed でエラーを返す）。
+    UnknownGoldLabel {
+        /// `records` 内での位置（0 始まり）。
+        index: usize,
+    },
+}
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalError::EmptyLabels => write!(f, "label set must not be empty"),
+            EvalError::EmptyLabelId => write!(f, "label set must not contain an empty id"),
+            EvalError::DuplicateLabel { label } => {
+                write!(f, "duplicate label id: {label}")
+            }
+            EvalError::EmptyRecords => write!(f, "records must not be empty"),
+            EvalError::UnknownGoldLabel { index } => {
+                write!(f, "unknown gold label at record index {index}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+/// 分子・分母を保持する比率。分母 0 のときに `value` を作らせないため、
+/// 生成は [`Ratio::new`] に集約する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ratio {
+    /// 分子。
+    pub numerator: u64,
+    /// 分母。
+    pub denominator: u64,
+    /// `numerator as f64 / denominator as f64`。
+    pub value: f64,
+}
+
+impl Ratio {
+    /// 分母が 0 のとき `None` を返す（評価契約: 分母 0 は null）。
+    fn new(numerator: u64, denominator: u64) -> Option<Ratio> {
+        if denominator == 0 {
+            return None;
+        }
+        Some(Ratio {
+            numerator,
+            denominator,
+            value: numerator as f64 / denominator as f64,
+        })
+    }
+}
+
+/// 予測 1 件ずつの正解率算出に使う outcome の分類件数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutcomeCounts {
+    /// `Outcome::Label(s)` かつ `s` がラベル集合に存在する件数。
+    pub ok: u64,
+    /// `Outcome::Invalid`、または `Outcome::Label(s)` かつ `s` がラベル集合に無い件数。
+    pub invalid: u64,
+    /// `Outcome::Abstain` の件数。
+    pub abstain: u64,
+    /// `Outcome::Error` の件数。
+    pub error: u64,
+}
+
+/// 全体正解率・採用判断正解率をまとめた型。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Accuracy {
+    /// 分母を全件（abstain・error・invalid を不正解として数える）とする正解率。
+    pub overall: Ratio,
+    /// 分母を `n_total - abstain` とする正解率（error は分母に含める）。
+    /// 全件 abstain のときは `None`。
+    pub adopted_decision: Option<Ratio>,
+}
+
+/// 1 ラベル分の指標。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelMetrics {
+    /// ラベル ID。
+    pub label: String,
+    /// 正解件数（このラベルが gold である件数。混同行列の行和）。
+    pub support: u64,
+    /// このラベルが予測された件数（混同行列の列和）。
+    pub predicted_count: u64,
+    /// True Positive。
+    pub tp: u64,
+    /// False Positive。
+    pub fp: u64,
+    /// False Negative（Rust の予約語 `fn` を避けた命名）。
+    pub fn_: u64,
+    /// `tp / predicted_count`。`predicted_count == 0` のとき `None`。
+    pub precision: Option<f64>,
+    /// `tp / support`。`support == 0` のとき `None`。
+    pub recall: Option<f64>,
+    /// `2*tp / (2*tp + fp + fn_)`。分母が 0 のとき `None`。
+    pub f1: Option<f64>,
+}
+
+/// 混同行列の列（宣言順のラベル、または非ラベル outcome）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfusionColumn {
+    /// 宣言順のラベル添字（[`SingleSelectMetrics`] の `per_label` と対応）。
+    Label(usize),
+    /// 型が不正、または未知のラベルへの予測。
+    Invalid,
+    /// 保留。
+    Abstain,
+    /// 推論エラー。
+    Error,
+}
+
+/// 混同行列。行は正解ラベル（宣言順）、列は宣言順のラベル + `Invalid` + `Abstain` + `Error`。
+///
+/// 添字アクセス（`[]`）を公開せず、[`ConfusionMatrix::get`] 経由でのみ参照させる
+/// （外部入力由来の添字で panic させないため）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfusionMatrix {
+    /// `rows[gold_index][column_index]`。列の並びは `Label(0..n)`, `Invalid`, `Abstain`, `Error`。
+    rows: Vec<Vec<u64>>,
+    n_labels: usize,
+}
+
+impl ConfusionMatrix {
+    fn new(n_labels: usize) -> ConfusionMatrix {
+        // 列数はラベル数 + 3（Invalid・Abstain・Error）。
+        let n_columns = n_labels.saturating_add(3);
+        ConfusionMatrix {
+            rows: vec![vec![0u64; n_columns]; n_labels],
+            n_labels,
+        }
+    }
+
+    fn column_index(&self, column: ConfusionColumn) -> Option<usize> {
+        match column {
+            ConfusionColumn::Label(i) => (i < self.n_labels).then_some(i),
+            ConfusionColumn::Invalid => Some(self.n_labels),
+            ConfusionColumn::Abstain => Some(self.n_labels.saturating_add(1)),
+            ConfusionColumn::Error => Some(self.n_labels.saturating_add(2)),
+        }
+    }
+
+    /// `gold_index` 行・`column` 列の件数を返す。範囲外は `None`。
+    pub fn get(&self, gold_index: usize, column: ConfusionColumn) -> Option<u64> {
+        let col = self.column_index(column)?;
+        self.rows.get(gold_index)?.get(col).copied()
+    }
+
+    fn increment(&mut self, gold_index: usize, column: ConfusionColumn) -> Result<(), EvalError> {
+        let col = self
+            .column_index(column)
+            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
+        let cell = self
+            .rows
+            .get_mut(gold_index)
+            .and_then(|row| row.get_mut(col))
+            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
+        *cell = cell
+            .checked_add(1)
+            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
+        Ok(())
+    }
+
+    /// 行数（ラベル数）。
+    pub fn n_labels(&self) -> usize {
+        self.n_labels
+    }
+}
+
+/// 単一選択（single-select）の評価指標一式。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleSelectMetrics {
+    /// 評価件数（`records.len()`）。
+    pub n_total: u64,
+    /// outcome の分類件数。
+    pub outcome_counts: OutcomeCounts,
+    /// 正解率。
+    pub accuracy: Accuracy,
+    /// ラベル別指標（宣言順）。
+    pub per_label: Vec<LabelMetrics>,
+    /// F1 が定義できたラベルだけの算術平均。1 つも定義できなければ `None`。
+    /// 平均から除いたラベルの列挙（`excluded_labels`）は TASK-24.2（issue #61）が担う。
+    pub macro_f1: Option<f64>,
+    /// 混同行列。
+    pub confusion: ConfusionMatrix,
+}
+
+/// 正解率・ラベル別指標・Macro-F1・混同行列を算出する（REQ-24 正常系・TASK-24.1-1）。
+///
+/// - `labels`: 宣言順のラベル ID（`fandhe-edge-core::Definition::options()` の
+///   `id` を宣言順に渡す想定。空・空 ID・重複は [`EvalError`] を返す）
+/// - `records`: 評価 1 件ずつの gold・推論結果（0 件は [`EvalError::EmptyRecords`]）
+///
+/// 混同行列・`per_label` の行・列の並びは `labels` の宣言順に従う
+/// （PoC-9 のアルファベット順ソートとは異なる。`Definition::options` が
+/// 宣言順を保つ方針〔PoC-9 追補 A-10〕に合わせるため）。
+///
+/// 乱数は使わず、結果は `records` の走査順に依存しない（決定的）。
+pub fn evaluate_single_select(
+    labels: &[&str],
+    records: &[EvalRecord],
+) -> Result<SingleSelectMetrics, EvalError> {
+    if labels.is_empty() {
+        return Err(EvalError::EmptyLabels);
+    }
+    if records.is_empty() {
+        return Err(EvalError::EmptyRecords);
+    }
+
+    // ラベル ID → 宣言順の添字。`BTreeMap` を使い、`HashMap` によるハッシュ順の
+    // 非決定性を避ける（.claude/rules/coding-rust.md「数値・決定性」）。
+    let mut label_index: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, &label) in labels.iter().enumerate() {
+        if label.is_empty() {
+            return Err(EvalError::EmptyLabelId);
+        }
+        if label_index.insert(label, i).is_some() {
+            return Err(EvalError::DuplicateLabel {
+                label: label.to_string(),
+            });
+        }
+    }
+
+    let n_labels = labels.len();
+    let mut confusion = ConfusionMatrix::new(n_labels);
+    let mut support = vec![0u64; n_labels];
+    let mut predicted_count = vec![0u64; n_labels];
+    let mut outcome_counts = OutcomeCounts::default();
+    let mut correct: u64 = 0;
+
+    for (index, record) in records.iter().enumerate() {
+        let gold_index = *label_index
+            .get(record.gold)
+            .ok_or(EvalError::UnknownGoldLabel { index })?;
+        support[gold_index] = support
+            .get(gold_index)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(EvalError::UnknownGoldLabel { index })?;
+
+        let column = match record.outcome {
+            Outcome::Label(predicted) => match label_index.get(predicted.as_str()) {
+                Some(&predicted_index) => {
+                    outcome_counts.ok = outcome_counts
+                        .ok
+                        .checked_add(1)
+                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    if predicted_index == gold_index {
+                        correct = correct
+                            .checked_add(1)
+                            .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    }
+                    let slot = predicted_count
+                        .get_mut(predicted_index)
+                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    *slot = slot
+                        .checked_add(1)
+                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    ConfusionColumn::Label(predicted_index)
+                }
+                None => {
+                    // ラベル集合に無い予測（未知ラベル・空文字列）は invalid 扱い
+                    // （PoC-9 既知解 ss-12 "E"・ss-18 "" と同じ扱い）。
+                    outcome_counts.invalid = outcome_counts
+                        .invalid
+                        .checked_add(1)
+                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    ConfusionColumn::Invalid
+                }
+            },
+            Outcome::Invalid => {
+                outcome_counts.invalid = outcome_counts
+                    .invalid
+                    .checked_add(1)
+                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                ConfusionColumn::Invalid
+            }
+            Outcome::Abstain => {
+                outcome_counts.abstain = outcome_counts
+                    .abstain
+                    .checked_add(1)
+                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                ConfusionColumn::Abstain
+            }
+            Outcome::Error => {
+                outcome_counts.error = outcome_counts
+                    .error
+                    .checked_add(1)
+                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                ConfusionColumn::Error
+            }
+        };
+
+        confusion.increment(gold_index, column)?;
+    }
+
+    let n_total: u64 = records.len() as u64;
+
+    let mut per_label = Vec::with_capacity(n_labels);
+    let mut f1_sum = 0.0f64;
+    let mut f1_count: u64 = 0;
+    for (i, &label) in labels.iter().enumerate() {
+        let tp = confusion
+            .get(i, ConfusionColumn::Label(i))
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        let support_i = *support
+            .get(i)
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        let predicted_i = *predicted_count
+            .get(i)
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        let fp = predicted_i
+            .checked_sub(tp)
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        let fn_ = support_i
+            .checked_sub(tp)
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+
+        let precision = if predicted_i == 0 {
+            None
+        } else {
+            Some(tp as f64 / predicted_i as f64)
+        };
+        let recall = if support_i == 0 {
+            None
+        } else {
+            Some(tp as f64 / support_i as f64)
+        };
+        // F1 = 2TP / (2TP + FP + FN)。適合率・再現率の調和平均ではない
+        // （モジュール冒頭のドキュメントコメント参照）。
+        let f1_denominator = tp
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(fp))
+            .and_then(|v| v.checked_add(fn_))
+            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        let f1 = if f1_denominator == 0 {
+            None
+        } else {
+            let numerator = (tp as f64) * 2.0;
+            Some(numerator / f1_denominator as f64)
+        };
+        if let Some(f1_value) = f1 {
+            f1_sum += f1_value;
+            f1_count = f1_count
+                .checked_add(1)
+                .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+        }
+
+        per_label.push(LabelMetrics {
+            label: label.to_string(),
+            support: support_i,
+            predicted_count: predicted_i,
+            tp,
+            fp,
+            fn_,
+            precision,
+            recall,
+            f1,
+        });
+    }
+
+    let macro_f1 = if f1_count == 0 {
+        None
+    } else {
+        Some(f1_sum / f1_count as f64)
+    };
+
+    let overall = Ratio::new(correct, n_total).ok_or(EvalError::EmptyRecords)?;
+    let adopted_denominator = n_total
+        .checked_sub(outcome_counts.abstain)
+        .ok_or(EvalError::EmptyRecords)?;
+    let adopted_decision = Ratio::new(correct, adopted_denominator);
+
+    Ok(SingleSelectMetrics {
+        n_total,
+        outcome_counts,
+        accuracy: Accuracy {
+            overall,
+            adopted_decision,
+        },
+        per_label,
+        macro_f1,
+        confusion,
+    })
+}
+
+/// 浮動小数を許容差 1e-9 で比較する（テスト専用。評価契約の許容差に合わせる）。
+#[cfg(test)]
+fn approx_eq(a: f64, b: f64) -> bool {
+    const FLOAT_EPSILON: f64 = 1e-9;
+    (a - b).abs() < FLOAT_EPSILON
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REQ-24・TASK-24.1-1: 空のラベル集合はエラーになる。
+    #[test]
+    fn empty_labels_is_error() {
+        let records: Vec<EvalRecord> = vec![];
+        let outcome = Outcome::Label("A".to_string());
+        let record = EvalRecord {
+            gold: "A",
+            outcome: &outcome,
+        };
+        let records_with_one = vec![record];
+        let result = evaluate_single_select(&[], &records_with_one);
+        assert_eq!(result, Err(EvalError::EmptyLabels));
+        // records が空でも labels が空ならまず EmptyLabels を返す。
+        let result_both_empty = evaluate_single_select(&[], &records);
+        assert_eq!(result_both_empty, Err(EvalError::EmptyLabels));
+    }
+
+    /// REQ-24・TASK-24.1-1: ラベル ID の重複はエラーになる。
+    #[test]
+    fn duplicate_label_is_error() {
+        let outcome = Outcome::Label("A".to_string());
+        let records = vec![EvalRecord {
+            gold: "A",
+            outcome: &outcome,
+        }];
+        let result = evaluate_single_select(&["A", "B", "A"], &records);
+        assert_eq!(
+            result,
+            Err(EvalError::DuplicateLabel {
+                label: "A".to_string()
+            })
+        );
+    }
+
+    /// REQ-24・TASK-24.1-1: 空文字列のラベル ID はエラーになる。
+    #[test]
+    fn empty_label_id_is_error() {
+        let outcome = Outcome::Label("A".to_string());
+        let records = vec![EvalRecord {
+            gold: "A",
+            outcome: &outcome,
+        }];
+        let result = evaluate_single_select(&["A", ""], &records);
+        assert_eq!(result, Err(EvalError::EmptyLabelId));
+    }
+
+    /// REQ-24・TASK-24.1-1: 評価件数 0 はエラーになる（0 除算を避け、評価済みを装わない）。
+    #[test]
+    fn empty_records_is_error() {
+        let records: Vec<EvalRecord> = vec![];
+        let result = evaluate_single_select(&["A", "B"], &records);
+        assert_eq!(result, Err(EvalError::EmptyRecords));
+    }
+
+    /// REQ-24・TASK-24.1-1: 未知の正解ラベルはインデックス付きでエラーになる。
+    #[test]
+    fn unknown_gold_label_reports_index() {
+        let outcome_a = Outcome::Label("A".to_string());
+        let outcome_z = Outcome::Label("A".to_string());
+        let records = vec![
+            EvalRecord {
+                gold: "A",
+                outcome: &outcome_a,
+            },
+            EvalRecord {
+                gold: "Z",
+                outcome: &outcome_z,
+            },
+        ];
+        let result = evaluate_single_select(&["A", "B"], &records);
+        assert_eq!(result, Err(EvalError::UnknownGoldLabel { index: 1 }));
+    }
+
+    /// REQ-24・TASK-24.1-1: 全問正解（2 ラベル）で、正解率 1.0・Macro-F1 1.0・
+    /// 混同行列が対角だけになること。
+    #[test]
+    fn all_correct_two_labels() {
+        let out_a = Outcome::Label("A".to_string());
+        let out_b = Outcome::Label("B".to_string());
+        let records = vec![
+            EvalRecord {
+                gold: "A",
+                outcome: &out_a,
+            },
+            EvalRecord {
+                gold: "B",
+                outcome: &out_b,
+            },
+        ];
+        let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
+        assert_eq!(metrics.n_total, 2);
+        assert!(approx_eq(metrics.accuracy.overall.value, 1.0));
+        assert_eq!(metrics.accuracy.overall.numerator, 2);
+        assert_eq!(metrics.accuracy.overall.denominator, 2);
+        assert!(approx_eq(
+            metrics.accuracy.adopted_decision.expect("no abstain").value,
+            1.0
+        ));
+        assert!(approx_eq(metrics.macro_f1.expect("defined"), 1.0));
+        assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(0)), Some(1));
+        assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(1)), Some(0));
+        assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(0)), Some(0));
+        assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(1)), Some(1));
+    }
+
+    /// REQ-24・TASK-24.1-1: 宣言順（["B","A"]）に混同行列・per_label の並びが従う。
+    #[test]
+    fn declaration_order_controls_row_column_order() {
+        let out_a = Outcome::Label("A".to_string());
+        let out_b = Outcome::Label("B".to_string());
+        let records = vec![
+            EvalRecord {
+                gold: "A",
+                outcome: &out_a,
+            },
+            EvalRecord {
+                gold: "B",
+                outcome: &out_b,
+            },
+        ];
+        let metrics = evaluate_single_select(&["B", "A"], &records).expect("valid input");
+        // 宣言順 B, A なので per_label[0] は B、per_label[1] は A。
+        assert_eq!(metrics.per_label[0].label, "B");
+        assert_eq!(metrics.per_label[1].label, "A");
+        // gold="B" は宣言順で行 0、gold="A" は行 1。
+        assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(0)), Some(1)); // B行・B列
+        assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(1)), Some(1)); // A行・A列
+    }
+
+    /// REQ-24・TASK-24.1-1: 未知ラベルへの予測は invalid 列へ数える。
+    #[test]
+    fn unknown_predicted_label_counts_as_invalid() {
+        let out_unknown = Outcome::Label("Z".to_string());
+        let records = vec![EvalRecord {
+            gold: "A",
+            outcome: &out_unknown,
+        }];
+        let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
+        assert_eq!(metrics.outcome_counts.invalid, 1);
+        assert_eq!(metrics.confusion.get(0, ConfusionColumn::Invalid), Some(1));
+        assert!(approx_eq(metrics.accuracy.overall.value, 0.0));
+    }
+}
