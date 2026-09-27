@@ -1,0 +1,8 @@
+{
+  "case": "11-all-abstain",
+  "description": "全件保留",
+  "expected_action": "warn_include",
+  "expected_exit_code": 0,
+  "expected_reason_code": "all_abstain",
+  "note": "評価器は正常終了する（停止しない）。coverage = 0/3 = 0。全体正解率 = 0/3 = 0（分母は abstain を含む全件）。採用判定正解率は分母 (3-3=0) が 0 のため null。ラベル別 precision は predicted_count=0 のためすべて null。recall は support はあるが正解 0 のため A: 0/2=0, B: 0/1=0。"
+}

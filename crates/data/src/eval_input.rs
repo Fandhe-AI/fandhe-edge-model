@@ -24,12 +24,11 @@
 //!
 //! 挙動は PoC-9（`docs/spec/03-poc/evaluation-contract/`。private submodule）の
 //! `evaluator/metrics.py`・`evaluator/records.py` の v1.1 既定挙動と、
-//! `fixtures/known/single-select`・`fixtures/anomaly/01`〜`06`
+//! `fixtures/known/single-select`・`fixtures/anomaly/01`〜`12`
 //! （本リポには `fixtures/evaluation_contract/` として移植済み。出典は
 //! `fixtures/evaluation_contract/PROVENANCE.md`）の実測に基づいて固定した。
 //! ケース 7〜12（矛盾・ラベル順序・未出現クラス・不正なスコア・全件保留・
-//! 全件失敗）は本モジュールの対象外で、兄弟 issue（TASK-23.1-2）が拡張する
-//! （[`WarningCode`] の宣言時コメント参照）。PoC-9 との既知の差分:
+//! 全件失敗）は TASK-23.1-2（issue #56）で追加した。PoC-9 との既知の差分:
 //!
 //! - PoC-9 の評価器は終了コード `2` で停止を表すが、本リポの 7 種終了コード
 //!   契約（REQ-21）に `2` は無い。本モジュールは [`EvalInputStop`] という
@@ -38,7 +37,8 @@
 //!   数値をハードコードしない
 //! - PoC-9 は `excluded_ids` 等をレコードの `id` の値で列挙するが、本モジュールは
 //!   診断情報（[`EvalInputStop`]・[`EvalInputWarning`]）にデータの生値
-//!   （`id`・`label`・`input`）を一切含めず、行番号だけで位置を示す
+//!   （`id`・`label`・`input`）を一切含めず、行番号（または [`WarningCode::UnseenClass`]
+//!   の場合はラベル ID。定義ファイル由来でデータ本文ではない）だけで位置を示す
 //!   （`.claude/rules/security.md`「データ本文をログ・エラーメッセージへ転記しない」。
 //!   [`inspect`] モジュールの前例（issue #38・PR #191 のレビュー指摘）に倣う）
 //! - 正規化した `input` の重複検出（ケース 6）は「前後空白の除去＋内部の
@@ -59,6 +59,18 @@
 //!   視認できるテキストと異なる値で評価が進む安全性の問題になる。そのため
 //!   本モジュールは重複キーを検出した時点で [`EvalInputStop::DuplicateKey`]
 //!   として処理全体を停止する（安全側に倒す判断は `InvalidId` と同じ理由）
+//! - ケース 10（`anomaly/10-invalid-score`）の `expected.json` は PoC-9
+//!   **v1.0** 時点の記述（`warn_exclude`）のまま移植されている。v1.1
+//!   （addendum A-2）では「除外せず error として分母に含め、不正解として
+//!   数える」へ変更されており、本モジュールは v1.1 の挙動
+//!   （[`WarningAction::IncludeAsError`]・[`WarningCode::InvalidScore`]）を
+//!   固定する。addendum A-4 がスコア合計の許容差を `1e-6` と定めている
+//!   （[`SCORE_SUM_TOLERANCE`] の doc 参照）
+//! - pred 側の `NaN`・`Infinity`・`-Infinity`（JSON 標準外リテラル。PoC-9
+//!   の Python `json` は `allow_nan=True` で既定受理する）は、厳密パースが
+//!   失敗した場合に限り [`substitute_non_finite_literals`] で `null` へ
+//!   置換して再パースし、該当行を無条件に [`ErrorOrigin::InvalidScore`] へ
+//!   倒す（gold 側は緩和しない。詳細は同関数の doc 参照）
 //!
 //! # 前提条件（呼び出し元が守るべきこと）
 //!
@@ -179,12 +191,10 @@ impl WarningAction {
 
 /// 警告の種別。
 ///
-/// TASK-23.1-2（兄弟 issue）が `ContradictoryInput`（正規化 input が同じで
-/// gold ラベルが食い違うグループ。ケース 7）・`InvalidScore`（ケース 10）・
-/// `UnseenClass`（ケース 9）・`AllAbstain`（ケース 11）・`AllError`（ケース 12）を
-/// 追加する想定。本モジュールはそれらの分岐点（[`find_duplicate_input_lines`]
-/// が労合するグループのうちラベルが食い違うものを警告しないことで、追加の
-/// 分岐を差し込む余地を残している）だけを用意する。
+/// TASK-23.1-2（issue #56）が `ContradictoryInput`・`InvalidScore`・
+/// `UnseenClass`・`AllAbstain`・`AllError`（ケース 7・10・9・11・12）を追加した。
+/// [`UnseenClass`](WarningCode::UnseenClass) だけは行番号ではなくラベル ID で
+/// 対象を示す（[`EvalInputWarning::labels`] の doc 参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WarningCode {
     /// gold の正解が欠落している（`label` が無い・`null`。ケース 2）。
@@ -193,12 +203,32 @@ pub enum WarningCode {
     MalformedGold,
     /// gold の正解が有効なラベル ID の集合に含まれない（ケース 3）。
     UnknownGoldLabel,
+    /// 正規化した `input` が一致するが、gold ラベルが 2 種以上に分かれる
+    /// （矛盾。ケース 7）。[`DuplicateInputWithinSplit`](WarningCode::DuplicateInputWithinSplit)
+    /// （ラベルが一致する重複）とは異なり、分母から除外する
+    /// （[`find_duplicate_input_lines`] の doc 参照）。
+    ContradictoryInput,
     /// 正規化した `input` が一致し、gold ラベルも一致する行が複数ある
-    /// （ケース 6）。ラベルが食い違うグループ（矛盾）は対象外（TASK-23.1-2 が
-    /// `ContradictoryInput` として扱う）。
+    /// （ケース 6）。ラベルが食い違うグループ（矛盾）は
+    /// [`ContradictoryInput`](WarningCode::ContradictoryInput) が扱う。
     DuplicateInputWithinSplit,
     /// `active` な gold 行に対応する pred 行が無い。
     MissingPrediction,
+    /// pred の `scores` が不正（欠損の型・NaN・無限大・負値・合計が 1 から
+    /// 5e-7 を超えて外れる。ケース 10）。除外せず
+    /// [`PredictionOutcome::Error`]（[`ErrorOrigin::InvalidScore`]）として
+    /// 含め、不正解として数える（評価を甘く見せないため。addendum A-2）。
+    InvalidScore,
+    /// `active` な行がすべて [`PredictionOutcome::Abstain`]（ケース 11）。
+    AllAbstain,
+    /// `active` な行がすべて [`PredictionOutcome::Error`]（
+    /// [`PredictionOutcome::Invalid`] は対象外。ケース 12）。
+    AllError,
+    /// 定義済みラベル（`valid_label_ids`）のうち、`active` な gold 行に
+    /// 1 件も出現しないもの（ケース 9）。行番号では表せないため
+    /// [`EvalInputWarning::labels`]（ラベル ID の昇順・重複なし）で示す
+    /// （[`EvalInputWarning::lines`] は常に空にする）。
+    UnseenClass,
 }
 
 impl WarningCode {
@@ -207,8 +237,13 @@ impl WarningCode {
             WarningCode::MissingGold => "missing_gold",
             WarningCode::MalformedGold => "malformed_gold",
             WarningCode::UnknownGoldLabel => "unknown_gold_label",
+            WarningCode::ContradictoryInput => "contradictory_input",
             WarningCode::DuplicateInputWithinSplit => "duplicate_input_within_split",
             WarningCode::MissingPrediction => "missing_prediction",
+            WarningCode::InvalidScore => "invalid_score",
+            WarningCode::AllAbstain => "all_abstain",
+            WarningCode::AllError => "all_error",
+            WarningCode::UnseenClass => "unseen_class",
         }
     }
 
@@ -217,9 +252,15 @@ impl WarningCode {
         match self {
             WarningCode::MissingGold
             | WarningCode::MalformedGold
-            | WarningCode::UnknownGoldLabel => WarningAction::Exclude,
-            WarningCode::DuplicateInputWithinSplit => WarningAction::WarnInclude,
-            WarningCode::MissingPrediction => WarningAction::IncludeAsError,
+            | WarningCode::UnknownGoldLabel
+            | WarningCode::ContradictoryInput => WarningAction::Exclude,
+            WarningCode::DuplicateInputWithinSplit
+            | WarningCode::AllAbstain
+            | WarningCode::AllError
+            | WarningCode::UnseenClass => WarningAction::WarnInclude,
+            WarningCode::MissingPrediction | WarningCode::InvalidScore => {
+                WarningAction::IncludeAsError
+            }
         }
     }
 
@@ -228,9 +269,14 @@ impl WarningCode {
         match self {
             WarningCode::MissingGold
             | WarningCode::MalformedGold
-            | WarningCode::UnknownGoldLabel => Side::Gold,
-            WarningCode::DuplicateInputWithinSplit => Side::Gold,
-            WarningCode::MissingPrediction => Side::Prediction,
+            | WarningCode::UnknownGoldLabel
+            | WarningCode::ContradictoryInput
+            | WarningCode::DuplicateInputWithinSplit
+            | WarningCode::UnseenClass => Side::Gold,
+            WarningCode::MissingPrediction
+            | WarningCode::InvalidScore
+            | WarningCode::AllAbstain
+            | WarningCode::AllError => Side::Prediction,
         }
     }
 }
@@ -246,7 +292,13 @@ pub struct EvalInputWarning {
     pub side: Side,
     /// 該当した行番号（昇順・重複なし）。[`WarningCode::MissingPrediction`] の
     /// 場合は対応する pred 行が存在しないため、代わりに gold 側の行番号を指す。
+    /// [`WarningCode::UnseenClass`] の場合は行番号で表せないため常に空。
     pub lines: Vec<usize>,
+    /// [`WarningCode::UnseenClass`] のときだけ非空（ラベル ID の昇順・
+    /// 重複なし）。それ以外の `code` では常に空。ラベル ID は定義ファイル
+    /// 由来でデータ本文ではないため、生値を診断に含めない方針
+    /// （モジュール doc「PoC-9 との差分」）には抵触しない。
+    pub labels: Vec<String>,
 }
 
 /// 予測が無効だった理由。
@@ -278,6 +330,11 @@ pub enum ErrorOrigin {
     Reported,
     /// 対応する pred 行そのものが無かった（[`WarningCode::MissingPrediction`]）。
     MissingPrediction,
+    /// pred の `scores` が不正だった、または行に `NaN`／`Infinity`／
+    /// `-Infinity` の緩和パース痕跡があった（[`WarningCode::InvalidScore`]。
+    /// ケース 10）。`status` の値（`ok`／`abstain`／`error`／未知）に関わらず
+    /// 優先する。
+    InvalidScore,
 }
 
 impl ErrorOrigin {
@@ -285,6 +342,7 @@ impl ErrorOrigin {
         match self {
             ErrorOrigin::Reported => "reported",
             ErrorOrigin::MissingPrediction => "missing_prediction",
+            ErrorOrigin::InvalidScore => "invalid_score",
         }
     }
 }
@@ -322,6 +380,12 @@ pub struct EvalInputOutcome {
     /// 決定的な順序（モジュール doc・[`prepare_evaluation_input`] 参照）で
     /// 並んだ警告一覧。該当が無い [`WarningCode`] は含まれない。
     pub warnings: Vec<EvalInputWarning>,
+    /// 定義済みラベルのうち `active` な gold 行に 1 件も出現しないものの
+    /// 昇順リスト（ケース 9。PoC-9 `result.unseen_labels` 相当）。
+    /// [`WarningCode::UnseenClass`] が `warnings` に含まれる場合、同じ内容が
+    /// その `labels` にも入る。評価器（TASK-24.1）が Macro-F1 の除外ラベル
+    /// 列挙に使う想定で、本 crate はそれ以上の計算をしない。
+    pub unseen_labels: Vec<String>,
 }
 
 /// 1 行分の JSON レコード（パース済み・`id` 検証済み）。
@@ -329,15 +393,23 @@ struct ParsedRow {
     line: usize,
     id: String,
     fields: Map<String, Value>,
+    /// pred 行が緩和パース（[`substitute_non_finite_literals`]）を経由した
+    /// か（`NaN`・`Infinity`・`-Infinity` のリテラルを含んでいた印）。
+    /// gold 側は緩和パースを行わないため常に `false`。
+    non_finite_literal: bool,
 }
 
 /// 1 行 1 JSON（JSONL）の本文をパースする（gold・pred で共通の手順 1）。
 ///
 /// 前後空白を除いて空になる行は読み飛ばす（行番号のカウントは進める）。
+/// pred 側に限り、厳密なパースが失敗した場合だけ
+/// [`substitute_non_finite_literals`] による緩和パースを 1 回試す
+/// （ケース 10。gold 側は緩和しない。モジュール doc「PoC-9 との差分」参照）。
 /// トップレベルまたはネスト先に同一 JSON キーが複数回出現していた場合は
 /// [`EvalInputStop::DuplicateKey`] で打ち切る（`id` の抽出より前に検査する。
-/// `id` 自体が smuggling の対象になり得るため）。`id` が存在しない・
-/// 文字列でない・空文字列の場合は [`EvalInputStop::InvalidId`] で打ち切る。
+/// `id` 自体が smuggling の対象になり得るため。緩和パースを経由した場合は
+/// 置換後の文字列に対して検査する）。`id` が存在しない・文字列でない・
+/// 空文字列の場合は [`EvalInputStop::InvalidId`] で打ち切る。
 fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop> {
     let mut rows = Vec::new();
     for (idx, raw_line) in content.lines().enumerate() {
@@ -346,14 +418,28 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
             continue;
         }
 
-        let value: Value = serde_json::from_str(raw_line)
-            .map_err(|_| EvalInputStop::MalformedJson { side, line })?;
+        let mut non_finite_literal = false;
+        let mut substituted: Option<String> = None;
+        let value: Value = match serde_json::from_str(raw_line) {
+            Ok(v) => v,
+            Err(_) if side == Side::Prediction => {
+                let relaxed = substitute_non_finite_literals(raw_line)
+                    .ok_or(EvalInputStop::MalformedJson { side, line })?;
+                let v = serde_json::from_str(&relaxed)
+                    .map_err(|_| EvalInputStop::MalformedJson { side, line })?;
+                non_finite_literal = true;
+                substituted = Some(relaxed);
+                v
+            }
+            Err(_) => return Err(EvalInputStop::MalformedJson { side, line }),
+        };
 
         if !value.is_object() {
             return Err(EvalInputStop::MalformedRecord { side, line });
         }
 
-        if has_duplicate_key(raw_line, &value) {
+        let key_check_text = substituted.as_deref().unwrap_or(raw_line);
+        if has_duplicate_key(key_check_text, &value) {
             return Err(EvalInputStop::DuplicateKey { side, line });
         }
 
@@ -366,10 +452,142 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
             _ => return Err(EvalInputStop::InvalidId { side, line }),
         };
 
-        rows.push(ParsedRow { line, id, fields });
+        rows.push(ParsedRow {
+            line,
+            id,
+            fields,
+            non_finite_literal,
+        });
     }
     Ok(rows)
 }
+
+/// 文字列リテラル外に現れる `NaN`・`Infinity`・`-Infinity` のトークンを
+/// `null` へ置換する（pred 側限定の緩和パース。ケース 10・TASK-23.1-2）。
+///
+/// `serde_json` はこれらの JSON 標準外リテラルを受け付けず、そのままでは
+/// [`EvalInputStop::MalformedJson`] で評価全体を止めてしまう（PoC-9 の
+/// Python `json`（`allow_nan=True`）は受理したうえで invalid_score として
+/// 扱う。モジュール doc「PoC-9 との差分」参照）。値の位置（直前の非空白
+/// バイトが `:`・`[`・`,`、または行頭）にあり、直後が区切り（空白・`,`・
+/// `}`・`]`・行末）であるトークンだけを置換対象にする。文字列リテラルの
+/// 内外とエスケープをバイト列で追跡する線形スキャナで、再帰・バックトラック
+/// を行わない（OWASP 不安全な設計対策。トークンの置換後の文字列は必ず
+/// 呼び出し元で再パースし、キー重複検査もその文字列に対して行う）。
+/// バイト単位で処理する（`byte as char` 等の再解釈をしない）ため、
+/// マルチバイト UTF-8 文字を含む文字列リテラルを壊さない。1 つも置換
+/// しなかった場合は `None` を返す。
+fn substitute_non_finite_literals(raw_line: &str) -> Option<String> {
+    const TOKENS: [&str; 3] = ["-Infinity", "Infinity", "NaN"];
+
+    let bytes = raw_line.as_bytes();
+    let mut result: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut replaced = false;
+    // 値の位置（直前の非空白が `:`・`[`・`,`、または行頭）にいるかどうか。
+    let mut in_value_position = true;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+
+        if in_string {
+            result.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if byte == b'"' {
+            in_string = true;
+            in_value_position = false;
+            result.push(byte);
+            i += 1;
+            continue;
+        }
+
+        if in_value_position
+            && let Some(token) = TOKENS.iter().find(|t| bytes[i..].starts_with(t.as_bytes()))
+        {
+            let after = i + token.len();
+            let boundary_ok = after >= bytes.len()
+                || matches!(
+                    bytes[after],
+                    b' ' | b'\t' | b',' | b'}' | b']' | b'\r' | b'\n'
+                );
+            if boundary_ok {
+                result.extend_from_slice(b"null");
+                replaced = true;
+                i += token.len();
+                in_value_position = false;
+                continue;
+            }
+        }
+
+        match byte {
+            b':' | b'[' | b',' => in_value_position = true,
+            b' ' | b'\t' | b'\r' | b'\n' => {} // 空白は位置判定を変えない
+            _ => in_value_position = false,
+        }
+        result.push(byte);
+        i += 1;
+    }
+
+    if replaced {
+        String::from_utf8(result).ok()
+    } else {
+        None
+    }
+}
+
+/// pred の `scores` フィールドが不正か判定する（ケース 10・TASK-23.1-2）。
+///
+/// `scores` キーが無い、または `null` の場合は検査しない（正常）。object
+/// でない、値が JSON の数値でない（真偽値・文字列・null 等を含む）、
+/// 有限でない（NaN・±Infinity）、負値、のいずれかがあれば不正。合計が
+/// `1.0` から [`SCORE_SUM_TOLERANCE`] を超えて外れる場合も不正（空の
+/// object は合計 0 のため不正になる）。スコアのキーが定義済みラベルと
+/// 一致するかは検査しない（PoC-9 と同じ）。不正の理由は細分化せず
+/// [`ErrorOrigin::InvalidScore`] の 1 種にまとめ、理由文字列や値は
+/// 保持しない（生値を出さない方針）。
+fn scores_are_invalid(fields: &Map<String, Value>) -> bool {
+    let Some(scores) = fields.get("scores") else {
+        return false;
+    };
+    if scores.is_null() {
+        return false;
+    }
+    let Some(map) = scores.as_object() else {
+        return true;
+    };
+
+    let mut sum = 0.0f64;
+    for value in map.values() {
+        let Some(n) = value.as_f64() else {
+            return true;
+        };
+        if !n.is_finite() || n < 0.0 {
+            return true;
+        }
+        sum += n;
+    }
+    (sum - 1.0).abs() > SCORE_SUM_TOLERANCE
+}
+
+/// スコア合計が `1.0` から外れてよい許容差（ケース 10・TASK-23.1-2）。
+///
+/// PoC-9 addendum A-4 が定めた値であり、評価契約の指標一致判定の許容差
+/// `1e-9`（`.claude/rules/evaluation-contract.md`「決定性」）とは別物である。
+/// 前者は pred のスコアという外部入力の妥当性検査、後者は本ツールが計算した
+/// 指標の再現性検証という別の目的に使う値のため、混同して緩めない。
+const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
 /// 同じ側（gold または pred）の中で `id` が重複していないか検査する（手順 4）。
 ///
@@ -441,10 +659,15 @@ fn normalize_input(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 正規化した `input` が一致し、gold ラベルも一致するグループの行番号を集める
-/// （手順 7・ケース 6）。ラベルが食い違うグループは対象外とする
-/// （[`WarningCode::DuplicateInputWithinSplit`] の doc 参照）。
-fn find_duplicate_input_lines(rows: &[(usize, String, &Map<String, Value>)]) -> BTreeSet<usize> {
+/// 正規化した `input` でグループ化し、(重複行, 矛盾行) を返す（手順 6・
+/// ケース 6・7）。同じグループ内の gold ラベルがすべて一致すれば「重複」
+/// （除外しない。[`WarningCode::DuplicateInputWithinSplit`]）、2 種以上の
+/// ラベルが混在すれば「矛盾」（除外する。[`WarningCode::ContradictoryInput`]。
+/// ケース 7）とする。呼び出し元は矛盾行を `accepted` から取り除き、
+/// pred との突き合わせ（手順 7）へ進めない。
+fn find_duplicate_input_lines(
+    rows: &[(usize, String, &Map<String, Value>)],
+) -> (BTreeSet<usize>, BTreeSet<usize>) {
     // 正規化 input -> [(line, label)]。BTreeMap で決定的な順序を保つ。
     let mut groups: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
     for (line, label, fields) in rows {
@@ -456,17 +679,22 @@ fn find_duplicate_input_lines(rows: &[(usize, String, &Map<String, Value>)]) -> 
         }
     }
 
-    let mut warned = BTreeSet::new();
+    let mut duplicated = BTreeSet::new();
+    let mut contradictory = BTreeSet::new();
     for members in groups.values() {
         if members.len() < 2 {
             continue;
         }
-        let first_label = members[0].1;
+        let Some(&(_, first_label)) = members.first() else {
+            continue;
+        };
         if members.iter().all(|(_, label)| *label == first_label) {
-            warned.extend(members.iter().map(|(line, _)| *line));
+            duplicated.extend(members.iter().map(|(line, _)| *line));
+        } else {
+            contradictory.extend(members.iter().map(|(line, _)| *line));
         }
     }
-    warned
+    (duplicated, contradictory)
 }
 
 /// pred 1 行の `status`/`predicted_label` を分類する（手順 8）。
@@ -507,6 +735,7 @@ fn drain_warnings_in_order(
                 action: code.action(),
                 side: code.side(),
                 lines: lines.into_iter().collect(),
+                labels: Vec::new(),
             });
         }
     }
@@ -516,9 +745,10 @@ fn drain_warnings_in_order(
 /// gold（正解）・pred（予測）の JSONL 本文から評価対象の行を組み立てる
 /// （REQ-23・TASK-23.1-1）。
 ///
-/// # 手順（モジュール doc・PoC-9 `metrics.py` の手順 1〜5・7 を踏襲）
+/// # 手順（モジュール doc・PoC-9 `metrics.py` v1.1 の手順を踏襲）
 ///
-/// 1. gold・pred をそれぞれ行単位でパースする（[`parse_side`]）
+/// 1. gold・pred をそれぞれ行単位でパースする（[`parse_side`]。pred 側は
+///    厳密パース失敗時に限り NaN・Infinity の緩和パースを試みる）
 /// 2. gold が 0 レコードなら [`EvalInputStop::EmptyData`] で停止する
 /// 3. `valid_label_ids` が空集合なら [`EvalInputStop::EmptyLabelSet`] で停止する
 /// 4. gold 側・pred 側それぞれで `id` の重複を検査し、あれば
@@ -528,16 +758,31 @@ fn drain_warnings_in_order(
 ///    [`UnknownGoldLabel`](WarningCode::UnknownGoldLabel)）
 /// 6. 手順 5 の除外で評価対象が 0 件になったら [`EvalInputStop::NoValidGold`]
 ///    で停止する（評価契約の fail-closed。`Ok` で `active: []` を返さない）
-/// 7. 手順 5 を通過した行のうち、正規化した `input` が一致し gold ラベルも
-///    一致する行を [`WarningCode::DuplicateInputWithinSplit`] として警告する
-///    （除外しない）
-/// 8. 手順 5 を通過した行それぞれに対応する pred 行を突き合わせ、
-///    [`PredictionOutcome`] に分類する。対応する pred 行が無い場合は
-///    [`PredictionOutcome::Error`]（[`ErrorOrigin::MissingPrediction`]）とし、
-///    [`WarningCode::MissingPrediction`] を警告する。gold に存在しない `id` の
-///    pred 行は無視する
-/// 9. 警告は Exclude 系 → IncludeAsError 系 → WarnInclude 系の順、
-///    各群の中は [`WarningCode`] の宣言順に並べる（`lines` は昇順）
+/// 7. 手順 5 を通過した行を正規化 `input` でグループ化し
+///    （[`find_duplicate_input_lines`]）、gold ラベルが一致するグループは
+///    [`WarningCode::DuplicateInputWithinSplit`] として警告する（除外しない。
+///    ケース 6）。2 種以上に分かれるグループは [`WarningCode::ContradictoryInput`]
+///    として警告し、`accepted` から除外する（ケース 7。pred との突き合わせ・
+///    スコア検査へは進まない）
+/// 8. 手順 7 を通過した行それぞれに対応する pred 行を突き合わせる。対応する
+///    pred 行の `scores` が不正、または NaN・Infinity の緩和パースを経由して
+///    いた場合は `status` に関わらず [`PredictionOutcome::Error`]
+///    （[`ErrorOrigin::InvalidScore`]）とし [`WarningCode::InvalidScore`] を
+///    警告する（ケース 10）。それ以外は [`PredictionOutcome`] に分類する。
+///    対応する pred 行が無い場合は [`PredictionOutcome::Error`]
+///    （[`ErrorOrigin::MissingPrediction`]）とし、[`WarningCode::MissingPrediction`]
+///    を警告する。gold に存在しない `id` の pred 行は無視する
+/// 9. `active` が空でない場合に限り、データセット単位の警告を追加する
+///    （PoC-9 は `active` が 0 件なら早期に return しこれらを出さない）。
+///    全行が [`PredictionOutcome::Abstain`] なら [`WarningCode::AllAbstain`]
+///    （ケース 11）、全行が [`PredictionOutcome::Error`] なら
+///    [`WarningCode::AllError`]（[`PredictionOutcome::Invalid`] は対象外。
+///    ケース 12）、`valid_label_ids` のうち `active` な gold 行に出現しない
+///    ものがあれば [`WarningCode::UnseenClass`] とし [`EvalInputOutcome::unseen_labels`]
+///    にも同じ内容を入れる（ケース 9）
+/// 10. 警告は Exclude 系 → IncludeAsError 系 → WarnInclude 系の順、
+///     各群の中は [`WarningCode`] の宣言順に並べる（`lines` は昇順。
+///     [`WarningCode::UnseenClass`] は WarnInclude 系の最後）
 pub fn prepare_evaluation_input(
     gold_content: &str,
     pred_content: &str,
@@ -622,21 +867,36 @@ pub fn prepare_evaluation_input(
         });
     }
 
-    // 手順 7: 正規化 input による重複検出（除外しない）。
+    // 手順 7: 正規化 input によるグループ化（重複・矛盾の検出。ケース 6・7）。
     let dedup_input: Vec<(usize, String, &Map<String, Value>)> = accepted
         .iter()
         .zip(accepted_labels.iter())
         .map(|(row, label)| (row.line, label.clone(), &row.fields))
         .collect();
-    let duplicate_input_lines = find_duplicate_input_lines(&dedup_input);
+    let (duplicate_input_lines, contradictory_lines) = find_duplicate_input_lines(&dedup_input);
     if !duplicate_input_lines.is_empty() {
         lines_by_code
             .entry(WarningCode::DuplicateInputWithinSplit)
             .or_default()
             .extend(duplicate_input_lines);
     }
+    if !contradictory_lines.is_empty() {
+        lines_by_code
+            .entry(WarningCode::ContradictoryInput)
+            .or_default()
+            .extend(contradictory_lines.iter().copied());
+        // 矛盾したグループは分母から除外し、pred との突き合わせ・スコア検査へ
+        // 進めない（モジュール doc・[`WarningCode::ContradictoryInput`] 参照）。
+        let (filtered_rows, filtered_labels): (Vec<&ParsedRow>, Vec<String>) = accepted
+            .into_iter()
+            .zip(accepted_labels)
+            .filter(|(row, _)| !contradictory_lines.contains(&row.line))
+            .unzip();
+        accepted = filtered_rows;
+        accepted_labels = filtered_labels;
+    }
 
-    // 手順 8: pred との突き合わせ。
+    // 手順 8: pred との突き合わせ（スコア検査を含む）。
     let mut pred_by_id: BTreeMap<&str, &ParsedRow> = BTreeMap::new();
     for row in &pred_rows {
         pred_by_id.insert(row.id.as_str(), row);
@@ -646,11 +906,21 @@ pub fn prepare_evaluation_input(
     for (row, label) in accepted.into_iter().zip(accepted_labels) {
         match pred_by_id.get(row.id.as_str()) {
             Some(pred_row) => {
+                let prediction =
+                    if pred_row.non_finite_literal || scores_are_invalid(&pred_row.fields) {
+                        lines_by_code
+                            .entry(WarningCode::InvalidScore)
+                            .or_default()
+                            .insert(pred_row.line);
+                        PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+                    } else {
+                        classify_prediction(&pred_row.fields, valid_label_ids)
+                    };
                 active.push(ActiveRow {
                     gold_line: row.line,
                     id: row.id.clone(),
                     gold_label: label,
-                    prediction: classify_prediction(&pred_row.fields, valid_label_ids),
+                    prediction,
                     pred_line: Some(pred_row.line),
                 });
             }
@@ -670,17 +940,70 @@ pub fn prepare_evaluation_input(
         }
     }
 
-    // 手順 9: Exclude 系 → IncludeAsError 系 → WarnInclude 系の順に並べる。
-    const ORDER: [WarningCode; 5] = [
+    // 手順 9: データセット単位の警告（`active` が空でないときだけ。
+    // PoC-9 は `active` が 0 件なら早期に return しこれらを出さない挙動に揃える）。
+    let mut unseen_labels: Vec<String> = Vec::new();
+    if !active.is_empty() {
+        if active
+            .iter()
+            .all(|row| matches!(row.prediction, PredictionOutcome::Abstain))
+        {
+            let lines: BTreeSet<usize> = active.iter().map(|row| row.gold_line).collect();
+            lines_by_code
+                .entry(WarningCode::AllAbstain)
+                .or_default()
+                .extend(lines);
+        }
+        if active
+            .iter()
+            .all(|row| matches!(row.prediction, PredictionOutcome::Error(_)))
+        {
+            let lines: BTreeSet<usize> = active.iter().map(|row| row.gold_line).collect();
+            lines_by_code
+                .entry(WarningCode::AllError)
+                .or_default()
+                .extend(lines);
+        }
+
+        let present_labels: BTreeSet<&str> =
+            active.iter().map(|row| row.gold_label.as_str()).collect();
+        unseen_labels = valid_label_ids
+            .iter()
+            .filter(|label| !present_labels.contains(label.as_str()))
+            .cloned()
+            .collect();
+    }
+
+    // 手順 10: Exclude 系 → IncludeAsError 系 → WarnInclude 系の順に並べる。
+    // UnseenClass は行番号ではなくラベルで示すため `lines_by_code` に乗せず、
+    // WarnInclude 系の最後に個別に追加する。
+    const ORDER: [WarningCode; 9] = [
         WarningCode::MissingGold,
         WarningCode::MalformedGold,
         WarningCode::UnknownGoldLabel,
+        WarningCode::ContradictoryInput,
+        WarningCode::InvalidScore,
         WarningCode::MissingPrediction,
         WarningCode::DuplicateInputWithinSplit,
+        WarningCode::AllAbstain,
+        WarningCode::AllError,
     ];
-    let warnings = drain_warnings_in_order(&mut lines_by_code, &ORDER);
+    let mut warnings = drain_warnings_in_order(&mut lines_by_code, &ORDER);
+    if !unseen_labels.is_empty() {
+        warnings.push(EvalInputWarning {
+            code: WarningCode::UnseenClass,
+            action: WarningCode::UnseenClass.action(),
+            side: WarningCode::UnseenClass.side(),
+            lines: Vec::new(),
+            labels: unseen_labels.clone(),
+        });
+    }
 
-    Ok(EvalInputOutcome { active, warnings })
+    Ok(EvalInputOutcome {
+        active,
+        warnings,
+        unseen_labels,
+    })
 }
 
 /// 学習データが空（有効レコード 0 件）でないことを確認する（REQ-23 ケース 1 の
@@ -983,14 +1306,22 @@ mod tests {
         assert_eq!(outcome.warnings[0].lines, vec![1, 2]);
     }
 
-    /// ラベルが食い違うグループ（矛盾）は重複として警告しない。
+    /// ラベルが食い違うグループ（矛盾）は重複として警告せず、
+    /// [`WarningCode::ContradictoryInput`] として除外する（ケース 7・
+    /// TASK-23.1-2。issue #56 で `req23_contradictory_input_is_not_reported_as_duplicate`
+    /// から更新。以前は矛盾の専用扱いが未実装で、無警告のまま両方 active に
+    /// 残っていた）。
     #[test]
-    fn req23_contradictory_input_is_not_reported_as_duplicate() {
+    fn req23_contradictory_input_is_excluded_not_reported_as_duplicate() {
         let gold = "{\"id\":\"a\",\"input\":\"foo\",\"label\":\"A\"}\n{\"id\":\"b\",\"input\":\"foo\",\"label\":\"B\"}\n";
         let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n";
         let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B"])).unwrap();
-        assert!(outcome.warnings.is_empty());
-        assert_eq!(outcome.active.len(), 2);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.warnings[0].code, WarningCode::ContradictoryInput);
+        assert_eq!(outcome.warnings[0].action, WarningAction::Exclude);
+        assert_eq!(outcome.warnings[0].side, Side::Gold);
+        assert_eq!(outcome.warnings[0].lines, vec![1, 2]);
+        assert!(outcome.active.is_empty());
     }
 
     /// [`WarningCode::MissingPrediction`]: gold に対応する pred 行が無い場合、
@@ -1132,6 +1463,7 @@ mod tests {
                     action: WarningAction::Exclude,
                     side: Side::Gold,
                     lines: vec![1, 2],
+                    labels: Vec::new(),
                 }],
             })
         );
@@ -1153,6 +1485,7 @@ mod tests {
                     action: WarningAction::Exclude,
                     side: Side::Gold,
                     lines: vec![1],
+                    labels: Vec::new(),
                 }],
             })
         );
@@ -1185,18 +1518,21 @@ mod tests {
                         action: WarningAction::Exclude,
                         side: Side::Gold,
                         lines: vec![2],
+                        labels: Vec::new(),
                     },
                     EvalInputWarning {
                         code: WarningCode::MalformedGold,
                         action: WarningAction::Exclude,
                         side: Side::Gold,
                         lines: vec![3],
+                        labels: Vec::new(),
                     },
                     EvalInputWarning {
                         code: WarningCode::UnknownGoldLabel,
                         action: WarningAction::Exclude,
                         side: Side::Gold,
                         lines: vec![1],
+                        labels: Vec::new(),
                     },
                 ],
             })
@@ -1259,5 +1595,376 @@ mod tests {
             }],
         };
         assert_eq!(require_non_empty(&non_empty), Ok(()));
+    }
+
+    // --- TASK-23.1-2（issue #56）: ケース 7〜12 の単体テスト -----------------
+
+    /// 文字列リテラル内の `"NaN"`（値ではなく文字列本文）は置換されないこと。
+    #[test]
+    fn req23_substitute_non_finite_does_not_touch_string_literal_nan() {
+        let raw = r#"{"id":"a","input":"NaN","status":"ok","predicted_label":"A"}"#;
+        assert_eq!(substitute_non_finite_literals(raw), None);
+    }
+
+    /// `-Infinity` が値の位置にあれば置換されること。
+    #[test]
+    fn req23_substitute_non_finite_replaces_negative_infinity() {
+        let raw = r#"{"id":"a","scores":{"A":-Infinity,"B":0.0}}"#;
+        let substituted =
+            substitute_non_finite_literals(raw).expect("must replace -Infinity token");
+        let value: Value = serde_json::from_str(&substituted).expect("must reparse");
+        assert_eq!(value["scores"]["A"], Value::Null);
+        assert_eq!(value["scores"]["B"], serde_json::json!(0.0));
+    }
+
+    /// キー名として `"NaN"` が使われている場合は置換されないこと
+    /// （文字列リテラルの内側のため）。
+    #[test]
+    fn req23_substitute_non_finite_does_not_touch_key_named_nan() {
+        let raw = r#"{"id":"a","NaN":1}"#;
+        assert_eq!(substitute_non_finite_literals(raw), None);
+    }
+
+    /// gold 側は緩和パースを行わないため、NaN を含む行は MalformedJson で停止する
+    /// （評価契約の根幹データは安全側に倒す。モジュール doc「PoC-9 との差分」）。
+    #[test]
+    fn req23_gold_side_nan_stops_with_malformed_json() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\",\"scores\":{\"A\":NaN}}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::MalformedJson {
+                side: Side::Gold,
+                line: 1,
+            })
+        );
+    }
+
+    /// 緩和パースを試みても壊れた行（NaN 置換後も JSON として不正）は
+    /// MalformedJson で停止すること。
+    #[test]
+    fn req23_pred_side_still_malformed_after_substitution_stops() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        // NaN を置換しても波括弧が閉じておらず JSON として不正なまま。
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"scores\":{\"A\":NaN}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::MalformedJson {
+                side: Side::Prediction,
+                line: 1,
+            })
+        );
+    }
+
+    /// スコア境界: 許容差内（1±5e-7）は正常。
+    #[test]
+    fn req23_scores_sum_within_tolerance_is_valid() {
+        let fields = serde_json::json!({"scores": {"A": 0.50000025, "B": 0.49999975}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: 許容差を超える（1+2e-6）は不正。
+    #[test]
+    fn req23_scores_sum_beyond_tolerance_is_invalid() {
+        let fields = serde_json::json!({"scores": {"A": 1.000002, "B": 0.0}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: 空の object は合計 0 のため不正。
+    #[test]
+    fn req23_scores_empty_object_is_invalid() {
+        let fields = serde_json::json!({"scores": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: `scores: null` は検査しない（正常）。
+    #[test]
+    fn req23_scores_null_is_not_checked() {
+        let fields = serde_json::json!({"scores": null})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: `scores` が object でない（配列）は不正。
+    #[test]
+    fn req23_scores_array_is_invalid() {
+        let fields = serde_json::json!({"scores": [0.5, 0.5]})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: 値が真偽値（数値でない）は不正。
+    #[test]
+    fn req23_scores_bool_value_is_invalid() {
+        let fields = serde_json::json!({"scores": {"A": true, "B": 0.0}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(scores_are_invalid(&fields));
+    }
+
+    /// スコア境界: `-0.0` は負値ではなく正常。
+    #[test]
+    fn req23_scores_negative_zero_is_valid() {
+        let fields = serde_json::json!({"scores": {"A": -0.0, "B": 1.0}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!scores_are_invalid(&fields));
+    }
+
+    /// `status: "abstain"` でもスコアが不正なら Error(InvalidScore) が優先されること
+    /// （手順 8。status の値に関わらず検査する）。
+    #[test]
+    fn req23_invalid_score_takes_priority_over_abstain_status() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"abstain\",\"predicted_label\":null,\"scores\":{\"A\":-0.1}}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(
+            outcome.active[0].prediction,
+            PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+        );
+        let invalid_score = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::InvalidScore)
+            .expect("InvalidScore warning must be present");
+        assert_eq!(invalid_score.lines, vec![1]);
+        // 唯一の active 行が Error のため、AllError も同時に成立する
+        // （手順 9。UnseenClass は valid_label_ids が {A} だけなので出ない）。
+        assert_eq!(
+            outcome.warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
+            vec![WarningCode::InvalidScore, WarningCode::AllError]
+        );
+    }
+
+    /// 無関係なフィールドに NaN がある行も、場所を問わず Error(InvalidScore) として
+    /// 扱うこと（`scores` を null 扱いにしてスコア無しとして素通りさせない。
+    /// モジュール doc「4.4」参照）。
+    #[test]
+    fn req23_nan_in_unrelated_field_forces_invalid_score() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred =
+            "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"debug_note\":NaN}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(
+            outcome.active[0].prediction,
+            PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+        );
+    }
+
+    /// `1e400`（範囲外の数値）は `serde_json` がエラーにするため、NaN/Infinity
+    /// トークンではない以上、緩和パースの対象にもならず MalformedJson で
+    /// 停止する（既知の差分。モジュール doc「PoC-9 との差分」参照。
+    /// 証拠種別: テストハーネス。実測: `serde_json` は `1e400` を
+    /// `"number out of range"` としてエラーにする）。
+    #[test]
+    fn req23_out_of_range_number_stops_with_malformed_json() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred =
+            "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"scores\":{\"A\":1e400}}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::MalformedJson {
+                side: Side::Prediction,
+                line: 1,
+            })
+        );
+    }
+
+    /// 矛盾（ラベル不一致）と重複（ラベル一致）が同時にある入力で、
+    /// それぞれ正しい集合（[`WarningCode::ContradictoryInput`]・
+    /// [`WarningCode::DuplicateInputWithinSplit`]）に振り分けられること。
+    #[test]
+    fn req23_contradiction_and_duplicate_are_classified_separately() {
+        let gold = concat!(
+            "{\"id\":\"a\",\"input\":\"foo\",\"label\":\"A\"}\n", // 矛盾グループ
+            "{\"id\":\"b\",\"input\":\"foo\",\"label\":\"B\"}\n",
+            "{\"id\":\"c\",\"input\":\"bar\",\"label\":\"A\"}\n", // 重複グループ（ラベル一致）
+            "{\"id\":\"d\",\"input\":\"bar\",\"label\":\"A\"}\n",
+        );
+        let pred = concat!(
+            "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n",
+            "{\"id\":\"c\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"d\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B"])).unwrap();
+
+        let contradiction = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::ContradictoryInput)
+            .expect("ContradictoryInput warning must be present");
+        assert_eq!(contradiction.lines, vec![1, 2]);
+
+        let duplicate = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::DuplicateInputWithinSplit)
+            .expect("DuplicateInputWithinSplit warning must be present");
+        assert_eq!(duplicate.lines, vec![3, 4]);
+
+        // 矛盾グループ（1・2）は除外、重複グループ（3・4）は残る。
+        let gold_lines: std::collections::BTreeSet<usize> =
+            outcome.active.iter().map(|row| row.gold_line).collect();
+        assert_eq!(
+            gold_lines,
+            [3, 4]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// 除外の結果 `active` が空になった場合、[`WarningCode::AllAbstain`]・
+    /// [`WarningCode::AllError`]・[`WarningCode::UnseenClass`] は出さないこと
+    /// （PoC-9 は `active` が 0 件のとき早期に return しこれらを出さない
+    /// 挙動に揃える。モジュール doc・手順 9 参照）。
+    #[test]
+    fn req23_dataset_level_warnings_are_not_emitted_when_active_is_empty() {
+        // gold 2 行がともに同じ input で矛盾し、accepted が 0 件になる。
+        let gold = concat!(
+            "{\"id\":\"a\",\"input\":\"foo\",\"label\":\"A\"}\n",
+            "{\"id\":\"b\",\"input\":\"foo\",\"label\":\"B\"}\n",
+        );
+        let pred = concat!(
+            "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B", "C"])).unwrap();
+        assert!(outcome.active.is_empty());
+        let codes: Vec<WarningCode> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec![WarningCode::ContradictoryInput]);
+        assert!(outcome.unseen_labels.is_empty());
+    }
+
+    /// [`WarningCode::AllError`] は [`ErrorOrigin::MissingPrediction`]・
+    /// [`ErrorOrigin::InvalidScore`] が混在していても成立すること
+    /// （PoC-9 の `status_counts.error` と同じ数え方。[`PredictionOutcome::Invalid`]
+    /// は対象外）。
+    #[test]
+    fn req23_all_error_holds_across_missing_prediction_and_invalid_score() {
+        let gold = concat!(
+            "{\"id\":\"a\",\"label\":\"A\"}\n", // pred 行なし -> MissingPrediction
+            "{\"id\":\"b\",\"label\":\"A\"}\n", // scores 不正 -> InvalidScore
+        );
+        let pred =
+            "{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"A\",\"scores\":{\"A\":-1.0}}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 2);
+        assert!(
+            outcome
+                .active
+                .iter()
+                .all(|row| matches!(row.prediction, PredictionOutcome::Error(_)))
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::AllError)
+        );
+    }
+
+    /// [`PredictionOutcome::Invalid`] が 1 件でも混じると [`WarningCode::AllError`]
+    /// は成立しないこと。
+    #[test]
+    fn req23_all_error_does_not_hold_when_invalid_is_mixed_in() {
+        let gold = concat!(
+            "{\"id\":\"a\",\"label\":\"A\"}\n",
+            "{\"id\":\"b\",\"label\":\"A\"}\n",
+        );
+        let pred = concat!(
+            "{\"id\":\"a\",\"status\":\"error\",\"predicted_label\":null}\n",
+            // 未知ラベル -> Invalid（Error ではない）。
+            "{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"Z\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 2);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::AllError)
+        );
+    }
+
+    /// [`EvalInputWarning::labels`] と [`EvalInputWarning::lines`] の排他:
+    /// [`WarningCode::UnseenClass`] のときだけ `labels` が非空で `lines` が空、
+    /// それ以外の `code` では `labels` が常に空であること。
+    #[test]
+    fn req23_labels_and_lines_are_mutually_exclusive() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B"])).unwrap();
+        assert_eq!(outcome.warnings.len(), 1);
+        let warning = &outcome.warnings[0];
+        assert_eq!(warning.code, WarningCode::UnseenClass);
+        assert_eq!(warning.labels, vec!["B".to_string()]);
+        assert!(warning.lines.is_empty());
+    }
+
+    /// 診断（矛盾・スコア不正の警告）に生値（`id`・`input`・`label`）が
+    /// 含まれないこと（長い id を使った回帰テスト。ケース 7 の input を含む。
+    /// PR #191（issue #38）の前例に倣う）。
+    #[test]
+    fn req23_case7_and_case10_diagnostics_never_contain_raw_values() {
+        let long_id_a = "x".repeat(500);
+        let long_id_b = "y".repeat(500);
+        let long_id_c = "z".repeat(500);
+        let secret_input = "散歩の予定を追加したい（この文言が漏れてはならない）";
+        // a・b は矛盾（ContradictoryInput で除外）、c は active に残り
+        // NaN スコアで InvalidScore になる。両方の警告経路を 1 回で確認する。
+        let gold = format!(
+            "{{\"id\":\"{long_id_a}\",\"input\":\"{secret_input}\",\"label\":\"A\"}}\n{{\"id\":\"{long_id_b}\",\"input\":\"{secret_input}\",\"label\":\"B\"}}\n{{\"id\":\"{long_id_c}\",\"label\":\"A\"}}\n"
+        );
+        let pred = format!(
+            "{{\"id\":\"{long_id_a}\",\"status\":\"ok\",\"predicted_label\":\"A\"}}\n{{\"id\":\"{long_id_b}\",\"status\":\"ok\",\"predicted_label\":\"B\"}}\n{{\"id\":\"{long_id_c}\",\"status\":\"ok\",\"predicted_label\":\"A\",\"scores\":{{\"A\":NaN}}}}\n"
+        );
+        let outcome = prepare_evaluation_input(&gold, &pred, &labels(&["A", "B"])).unwrap();
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(
+            outcome.active[0].prediction,
+            PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ContradictoryInput)
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::InvalidScore)
+        );
+
+        // 「生値を診断に含めない」不変条件は EvalInputWarning（診断情報）に
+        // 適用される（`ActiveRow.id` は評価結果として `id` を保持する設計の
+        // ため対象外。モジュール doc「PoC-9 との差分」参照）。
+        let warnings_debug = format!("{:?}", outcome.warnings);
+        assert!(!warnings_debug.contains(&long_id_a));
+        assert!(!warnings_debug.contains(&long_id_b));
+        assert!(!warnings_debug.contains(&long_id_c));
+        assert!(!warnings_debug.contains(secret_input));
     }
 }
