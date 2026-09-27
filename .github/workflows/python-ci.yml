@@ -3,12 +3,12 @@ name: Python CI
 # 学習ワーカー（trainer/。Python・uv 管理。REQ-18〜20/19b）のローカルゲート
 # （make py-ci = ruff format --check・ruff check・pytest）を検証する。
 #
-# ci.yml とは別ファイルにしている理由: ci.yml は workspace（Cargo.toml）・
-# メンバー crate・deny.toml が揃うまで発火条件を無効化中（workflow_dispatch のみ）。
-# 学習ワーカーは Rust workspace と独立して先に用意できるため、ci.yml の有効化を
-# 待たずに本 workflow だけ先行して有効化する。ci.yml が有効化された時点で、
-# 本 workflow のジョブ（python-ci）も ci.yml の `ci-complete` 集約 needs に
-# 統合することを検討する（infra-builder が ci.yml 側の対応を行う）。
+# ci.yml とは別ファイルにしている理由: 学習ワーカーは Rust workspace と独立して
+# 先に用意できたため、ci.yml の有効化（#31）を待たずに本 workflow だけ先行して
+# 有効化した。ci.yml は現在稼働中で、必須チェックは `ci-complete` に集約している。
+# 本 workflow のジョブ（python-ci）は独立した必須チェックのまま残しており、
+# ci.yml の `ci-complete` 集約 needs への統合は検討中（統合する場合は ruleset の
+# 必須チェックから python-ci を外す作業と同時に行う）。
 #
 # paths フィルタを付けない理由: 本 workflow のジョブ名（python-ci）は
 # ruleset `main-protection` の必須チェックに登録しているため、trainer/ 以外
