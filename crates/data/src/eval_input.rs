@@ -122,6 +122,21 @@ pub enum EvalInputStop {
     /// 評価契約の根幹データのため、[`inspect`] とは異なり除外せず処理全体を
     /// 停止する（モジュール doc「PoC-9 との差分」参照）。
     DuplicateKey { side: Side, line: usize },
+    /// gold に行はあるが、手順 5 の除外（欠落・型不正・未知ラベル。
+    /// [`WarningCode::MissingGold`]・[`MalformedGold`](WarningCode::MalformedGold)・
+    /// [`UnknownGoldLabel`](WarningCode::UnknownGoldLabel)）ですべて除外され、
+    /// 評価対象（[`EvalInputOutcome::active`]）が 0 件になった。
+    /// `Ok(EvalInputOutcome { active: vec![], .. })` を返すと呼び出し側が
+    /// 評価済みと誤認するため、評価契約の fail-closed
+    /// （`.claude/rules/evaluation-contract.md`「評価データが無い場合は
+    /// status:"skipped"・exit 0」「判定不能時の fail-closed」。REQ-23・REQ-27）
+    /// に従い、`EmptyData`（gold が 0 レコード）とは区別して停止する。
+    /// `warnings` は除外理由の内訳（行番号のみ・生値は含めない）。
+    NoValidGold {
+        gold_rows: usize,
+        pred_rows: usize,
+        warnings: Vec<EvalInputWarning>,
+    },
 }
 
 impl EvalInputStop {
@@ -134,6 +149,7 @@ impl EvalInputStop {
             EvalInputStop::MalformedRecord { .. } => "malformed_record",
             EvalInputStop::InvalidId { .. } => "invalid_id",
             EvalInputStop::DuplicateKey { .. } => "duplicate_key",
+            EvalInputStop::NoValidGold { .. } => "no_valid_gold",
         }
     }
 }
@@ -426,7 +442,7 @@ fn normalize_input(raw: &str) -> String {
 }
 
 /// 正規化した `input` が一致し、gold ラベルも一致するグループの行番号を集める
-/// （手順 6・ケース 6）。ラベルが食い違うグループは対象外とする
+/// （手順 7・ケース 6）。ラベルが食い違うグループは対象外とする
 /// （[`WarningCode::DuplicateInputWithinSplit`] の doc 参照）。
 fn find_duplicate_input_lines(rows: &[(usize, String, &Map<String, Value>)]) -> BTreeSet<usize> {
     // 正規化 input -> [(line, label)]。BTreeMap で決定的な順序を保つ。
@@ -453,7 +469,7 @@ fn find_duplicate_input_lines(rows: &[(usize, String, &Map<String, Value>)]) -> 
     warned
 }
 
-/// pred 1 行の `status`/`predicted_label` を分類する（手順 7）。
+/// pred 1 行の `status`/`predicted_label` を分類する（手順 8）。
 fn classify_prediction(
     fields: &Map<String, Value>,
     valid_label_ids: &BTreeSet<String>,
@@ -474,6 +490,29 @@ fn classify_prediction(
     }
 }
 
+/// `lines_by_code` から `order` に列挙された [`WarningCode`] だけを、その順に
+/// 取り出して [`EvalInputWarning`] へ組み立てる（該当が無いものは含めない）。
+/// 取り出した entry は `lines_by_code` から取り除くため、部分的な `order`
+/// （手順 6 の Exclude 系のみ等）を渡しても、残りは後続の呼び出し
+/// （手順 9 の全体整列）へそのまま引き継がれる。
+fn drain_warnings_in_order(
+    lines_by_code: &mut BTreeMap<WarningCode, BTreeSet<usize>>,
+    order: &[WarningCode],
+) -> Vec<EvalInputWarning> {
+    let mut warnings = Vec::new();
+    for &code in order {
+        if let Some(lines) = lines_by_code.remove(&code) {
+            warnings.push(EvalInputWarning {
+                code,
+                action: code.action(),
+                side: code.side(),
+                lines: lines.into_iter().collect(),
+            });
+        }
+    }
+    warnings
+}
+
 /// gold（正解）・pred（予測）の JSONL 本文から評価対象の行を組み立てる
 /// （REQ-23・TASK-23.1-1）。
 ///
@@ -487,15 +526,17 @@ fn classify_prediction(
 /// 5. gold の欠陥（欠落・型不正・未知ラベル）を除外する
 ///    （[`WarningCode::MissingGold`]・[`MalformedGold`](WarningCode::MalformedGold)・
 ///    [`UnknownGoldLabel`](WarningCode::UnknownGoldLabel)）
-/// 6. 手順 5 を通過した行のうち、正規化した `input` が一致し gold ラベルも
+/// 6. 手順 5 の除外で評価対象が 0 件になったら [`EvalInputStop::NoValidGold`]
+///    で停止する（評価契約の fail-closed。`Ok` で `active: []` を返さない）
+/// 7. 手順 5 を通過した行のうち、正規化した `input` が一致し gold ラベルも
 ///    一致する行を [`WarningCode::DuplicateInputWithinSplit`] として警告する
 ///    （除外しない）
-/// 7. 手順 5 を通過した行それぞれに対応する pred 行を突き合わせ、
+/// 8. 手順 5 を通過した行それぞれに対応する pred 行を突き合わせ、
 ///    [`PredictionOutcome`] に分類する。対応する pred 行が無い場合は
 ///    [`PredictionOutcome::Error`]（[`ErrorOrigin::MissingPrediction`]）とし、
 ///    [`WarningCode::MissingPrediction`] を警告する。gold に存在しない `id` の
 ///    pred 行は無視する
-/// 8. 警告は Exclude 系 → IncludeAsError 系 → WarnInclude 系の順、
+/// 9. 警告は Exclude 系 → IncludeAsError 系 → WarnInclude 系の順、
 ///    各群の中は [`WarningCode`] の宣言順に並べる（`lines` は昇順）
 pub fn prepare_evaluation_input(
     gold_content: &str,
@@ -562,7 +603,26 @@ pub fn prepare_evaluation_input(
         }
     }
 
-    // 手順 6: 正規化 input による重複検出（除外しない）。
+    // 手順 6: 手順 5 の除外で評価対象が 0 件になっていないか確認する。
+    // gold に行があっても、全行が MissingGold・MalformedGold・UnknownGoldLabel の
+    // いずれかで除外されると `accepted` が空になる。ここで停止しないと
+    // 呼び出し側が `active: []` を「評価済みで対象 0 件」と区別できず、
+    // 評価契約の fail-closed（`.claude/rules/evaluation-contract.md`）に反する。
+    if accepted.is_empty() {
+        const EXCLUDE_ORDER: [WarningCode; 3] = [
+            WarningCode::MissingGold,
+            WarningCode::MalformedGold,
+            WarningCode::UnknownGoldLabel,
+        ];
+        let warnings = drain_warnings_in_order(&mut lines_by_code, &EXCLUDE_ORDER);
+        return Err(EvalInputStop::NoValidGold {
+            gold_rows: gold_rows.len(),
+            pred_rows: pred_rows.len(),
+            warnings,
+        });
+    }
+
+    // 手順 7: 正規化 input による重複検出（除外しない）。
     let dedup_input: Vec<(usize, String, &Map<String, Value>)> = accepted
         .iter()
         .zip(accepted_labels.iter())
@@ -576,7 +636,7 @@ pub fn prepare_evaluation_input(
             .extend(duplicate_input_lines);
     }
 
-    // 手順 7: pred との突き合わせ。
+    // 手順 8: pred との突き合わせ。
     let mut pred_by_id: BTreeMap<&str, &ParsedRow> = BTreeMap::new();
     for row in &pred_rows {
         pred_by_id.insert(row.id.as_str(), row);
@@ -610,7 +670,7 @@ pub fn prepare_evaluation_input(
         }
     }
 
-    // 手順 8: Exclude 系 → IncludeAsError 系 → WarnInclude 系の順に並べる。
+    // 手順 9: Exclude 系 → IncludeAsError 系 → WarnInclude 系の順に並べる。
     const ORDER: [WarningCode; 5] = [
         WarningCode::MissingGold,
         WarningCode::MalformedGold,
@@ -618,17 +678,7 @@ pub fn prepare_evaluation_input(
         WarningCode::MissingPrediction,
         WarningCode::DuplicateInputWithinSplit,
     ];
-    let mut warnings = Vec::new();
-    for code in ORDER {
-        if let Some(lines) = lines_by_code.remove(&code) {
-            warnings.push(EvalInputWarning {
-                code,
-                action: code.action(),
-                side: code.side(),
-                lines: lines.into_iter().collect(),
-            });
-        }
-    }
+    let warnings = drain_warnings_in_order(&mut lines_by_code, &ORDER);
 
     Ok(EvalInputOutcome { active, warnings })
 }
@@ -946,7 +996,7 @@ mod tests {
     /// [`WarningCode::MissingPrediction`]: gold に対応する pred 行が無い場合、
     /// 除外せず [`PredictionOutcome::Error`]（[`ErrorOrigin::MissingPrediction`]）
     /// として含め、[`WarningAction::IncludeAsError`] で警告すること
-    /// （手順 7。レビュー指摘: issue #55 の未カバー分岐）。
+    /// （手順 8。レビュー指摘: issue #55 の未カバー分岐）。
     #[test]
     fn req23_missing_prediction_is_included_as_error() {
         let gold = "{\"id\":\"a\",\"label\":\"A\"}\n{\"id\":\"b\",\"label\":\"A\"}\n";
@@ -974,7 +1024,7 @@ mod tests {
         assert_eq!(missing.pred_line, None);
     }
 
-    /// 手順 8: 複数種別の警告が同時発生した場合、Exclude 系
+    /// 手順 9: 複数種別の警告が同時発生した場合、Exclude 系
     /// （[`WarningCode::MissingGold`]）→ IncludeAsError 系
     /// （[`WarningCode::MissingPrediction`]）→ WarnInclude 系
     /// （[`WarningCode::DuplicateInputWithinSplit`]）の順に並ぶこと。
@@ -1042,19 +1092,144 @@ mod tests {
     }
 
     /// 警告に生値（`id`・`label`・`input`）が入らないこと（長い値を使った回帰テスト。
-    /// PR #191（issue #38）の前例に倣う）。
+    /// PR #191（issue #38）の前例に倣う）。除外対象（1 行目）のほかに有効な
+    /// gold 行（2 行目）を含め、[`EvalInputStop::NoValidGold`]（本テストの
+    /// 対象外。req23_no_valid_gold_* 系で別途検証する）に落ちないようにする。
     #[test]
     fn req23_warnings_never_contain_raw_values() {
         let long_id = "x".repeat(500);
-        let gold = format!("{{\"id\":\"{long_id}\",\"label\":null}}\n");
-        let pred =
-            format!("{{\"id\":\"{long_id}\",\"status\":\"ok\",\"predicted_label\":\"A\"}}\n");
+        let gold =
+            format!("{{\"id\":\"{long_id}\",\"label\":null}}\n{{\"id\":\"g2\",\"label\":\"A\"}}\n");
+        let pred = format!(
+            "{{\"id\":\"{long_id}\",\"status\":\"ok\",\"predicted_label\":\"A\"}}\n{{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}}\n"
+        );
         let outcome = prepare_evaluation_input(&gold, &pred, &labels(&["A"])).unwrap();
         assert_eq!(outcome.warnings.len(), 1);
         assert_eq!(outcome.warnings[0].lines, vec![1]);
-        assert!(outcome.active.is_empty());
+        assert_eq!(outcome.active.len(), 1);
         // EvalInputWarning のフィールドは code/action/side/lines のみで、
         // 生値を保持するフィールドが型として存在しないことをコンパイル時に保証する。
+    }
+
+    /// REQ-23・REQ-27: gold の全行が MissingGold で除外されると
+    /// [`EvalInputStop::NoValidGold`] で停止する（`Ok` で `active: []` を
+    /// 返して評価済みを装わない。評価契約の fail-closed）。
+    #[test]
+    fn req23_no_valid_gold_when_all_missing_gold() {
+        let gold = "{\"id\":\"g1\",\"label\":null}\n{\"id\":\"g2\",\"label\":null}\n";
+        let pred = concat!(
+            "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::NoValidGold {
+                gold_rows: 2,
+                pred_rows: 2,
+                warnings: vec![EvalInputWarning {
+                    code: WarningCode::MissingGold,
+                    action: WarningAction::Exclude,
+                    side: Side::Gold,
+                    lines: vec![1, 2],
+                }],
+            })
+        );
+    }
+
+    /// REQ-23: gold の全行が UnknownGoldLabel で除外された場合も同様に停止する。
+    #[test]
+    fn req23_no_valid_gold_when_all_unknown_label() {
+        let gold = "{\"id\":\"g1\",\"label\":\"Z\"}\n";
+        let pred = "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::NoValidGold {
+                gold_rows: 1,
+                pred_rows: 1,
+                warnings: vec![EvalInputWarning {
+                    code: WarningCode::UnknownGoldLabel,
+                    action: WarningAction::Exclude,
+                    side: Side::Gold,
+                    lines: vec![1],
+                }],
+            })
+        );
+    }
+
+    /// REQ-23: MissingGold・MalformedGold・UnknownGoldLabel が混在して全行を
+    /// 除外した場合、`warnings` は Exclude 系の宣言順（MissingGold →
+    /// MalformedGold → UnknownGoldLabel）で並ぶ。
+    #[test]
+    fn req23_no_valid_gold_warnings_are_ordered_when_mixed() {
+        let gold = concat!(
+            "{\"id\":\"g1\",\"label\":\"Z\"}\n", // UnknownGoldLabel
+            "{\"id\":\"g2\",\"label\":null}\n",  // MissingGold
+            "{\"id\":\"g3\",\"label\":123}\n",   // MalformedGold
+        );
+        let pred = concat!(
+            "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g3\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::NoValidGold {
+                gold_rows: 3,
+                pred_rows: 3,
+                warnings: vec![
+                    EvalInputWarning {
+                        code: WarningCode::MissingGold,
+                        action: WarningAction::Exclude,
+                        side: Side::Gold,
+                        lines: vec![2],
+                    },
+                    EvalInputWarning {
+                        code: WarningCode::MalformedGold,
+                        action: WarningAction::Exclude,
+                        side: Side::Gold,
+                        lines: vec![3],
+                    },
+                    EvalInputWarning {
+                        code: WarningCode::UnknownGoldLabel,
+                        action: WarningAction::Exclude,
+                        side: Side::Gold,
+                        lines: vec![1],
+                    },
+                ],
+            })
+        );
+    }
+
+    /// REQ-23: 1 件でも有効な gold 行があれば `NoValidGold` にはならず、
+    /// 通常どおり `Ok` を返す（正のコントロール）。
+    #[test]
+    fn req23_no_valid_gold_does_not_trigger_when_one_row_is_valid() {
+        let gold = "{\"id\":\"g1\",\"label\":null}\n{\"id\":\"g2\",\"label\":\"A\"}\n";
+        let pred = concat!(
+            "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.warnings[0].code, WarningCode::MissingGold);
+    }
+
+    /// `code()` に `no_valid_gold` が含まれる。
+    #[test]
+    fn req23_no_valid_gold_code_string() {
+        assert_eq!(
+            EvalInputStop::NoValidGold {
+                gold_rows: 0,
+                pred_rows: 0,
+                warnings: Vec::new(),
+            }
+            .code(),
+            "no_valid_gold"
+        );
     }
 
     /// `require_non_empty`。
