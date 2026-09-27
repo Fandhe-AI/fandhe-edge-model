@@ -4,8 +4,9 @@
 
 `docs/spec/03-poc/evaluation-contract/fixtures/`（PoC-9。private submodule）から、
 バイト単位でそのまま移植した（内容を加工していない）。ただし
-`anomaly/01-empty-data/expected.json`・`anomaly/05-duplicate-id/expected.json` の
-2 ファイルは例外で、キー名のみ改名している（詳細は後述の「PoC-9 との既知の差分」）。
+`anomaly/01-empty-data/expected.json`・`anomaly/05-duplicate-id/expected.json`・
+`anomaly/10-invalid-score/expected.json` の 3 ファイルは例外で、キー名・値を
+改名・更新している（詳細は後述の「PoC-9 との既知の差分」）。
 
 - `known/single-select/{gold.jsonl,pred.jsonl,labels.json,expected.json}`
 - `anomaly/01-empty-data/{gold.jsonl,pred.jsonl,expected.json}`
@@ -50,15 +51,19 @@ PoC-9 のフィクスチャは、評価契約（REQ-21〜27・REQ-29）の異常
   `insert_final_newline = true` は 0 バイトファイルには適用されない
   （editorconfig-checker は空ファイルを「改行なし」として指摘しないことを
   `make lint-docs` で確認済み。証拠種別: テストハーネス）。
-- `10-invalid-score` の `expected.json` は PoC-9 **v1.0** 時点の記述
-  （`expected_action: "warn_exclude"`）のまま移植している。v1.1
-  （addendum A-2）では「除外せず error として分母に含め、不正解として数える」
-  （`WarningAction::IncludeAsError`）へ変わっており、
+- `10-invalid-score` の `expected.json` は当初 PoC-9 **v1.0** 時点の記述
+  （`expected_action: "warn_exclude"`）のままバイト単位で移植していたが、
+  実装（v1.1・addendum A-2「除外せず error として分母に含め、不正解として
+  数える」＝`WarningAction::IncludeAsError`）と食い違い、期待値の新旧を
+  区別できないとのレビュー指摘（PR #204）を受けて `expected_action`・
+  `excluded_ids`・`included_ids` を v1.1 の挙動へ更新した（`01-empty-data`・
+  `05-duplicate-id` と同様にキー名・値を改名した例外ファイルとして扱う）。
   `crates/data/src/eval_input.rs` の `prepare_evaluation_input` は v1.1 の
   挙動を固定する（結合テスト `req23_case10_invalid_score_include_as_error` が
-  照合）。addendum A-4 がスコア合計の許容差を `1e-6` と定めている
-  （評価契約の指標一致判定の許容差 `1e-9` とは別物。
-  `.claude/rules/evaluation-contract.md`「決定性」参照）。
+  照合。ただし本ファイル自体は結合テストから参照されない参考データであり、
+  期待値の照合はテストコード側でハードコードしている）。addendum A-4 が
+  スコア合計の許容差を `1e-6` と定めている（評価契約の指標一致判定の許容差
+  `1e-9` とは別物。`.claude/rules/evaluation-contract.md`「決定性」参照）。
 - `07-contradiction` の PoC-9 ログは v1.0 で実行したもの。v1.1 ではラベル
   定義ファイルが無いと停止する（addendum A-6）ため、上記の
   「labels.json が無いケースの扱い」の規約（`known/single-select` を使う）を

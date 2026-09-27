@@ -1,16 +1,17 @@
 {
   "case": "10-invalid-score",
   "description": "NaN・無限大・負値・合計が 1 から外れる確率",
-  "expected_action": "warn_exclude",
+  "expected_action": "include_as_error",
   "expected_exit_code": 0,
   "expected_reason_code": "invalid_score",
-  "excluded_ids": ["an10-2", "an10-3", "an10-4", "an10-5"],
-  "included_ids": ["an10-1"],
-  "exclusion_reasons": {
+  "excluded_ids": [],
+  "included_ids": ["an10-1", "an10-2", "an10-3", "an10-4", "an10-5"],
+  "invalid_score_ids": ["an10-2", "an10-3", "an10-4", "an10-5"],
+  "invalid_score_reasons": {
     "an10-2": "scores.A が NaN",
     "an10-3": "scores.A が負値（-0.2）",
     "an10-4": "scores の合計が 1 から外れる（0.6）",
     "an10-5": "scores.A が無限大（Infinity）"
   },
-  "note": "scores フィールドが不正な行はレコード全体の信頼性が疑わしいため、全指標（正解率等）から除外する。pred.jsonl の NaN・Infinity は JSON 標準では不正だが Python の json モジュールは既定で受理する（allow_nan=True）ため、評価器側で明示的に検査する必要がある点を確認するためのケースでもある。"
+  "note": "本フィールドは PoC-9 v1.1（addendum A-2）の挙動を記録する（`excluded_ids`・`included_ids`・`expected_action` はレビュー指摘で v1.0 の `warn_exclude` から更新した。PR #204）。scores フィールドが不正な行は分母から除外せず、Error として含めたうえで不正解として数える（`WarningAction::IncludeAsError`・`WarningCode::InvalidScore`）。pred.jsonl の NaN・Infinity は JSON 標準では不正だが Python の json モジュールは既定で受理する（allow_nan=True）ため、評価器側で明示的に検査する必要がある点を確認するためのケースでもある。本ファイルは結合テスト（crates/data/tests/eval_input_anomaly.rs の req23_case10_invalid_score_include_as_error）からは参照されない参考データであり、期待値の照合はテストコード側でハードコードしている（fixtures/evaluation_contract/PROVENANCE.md「PoC-9 との既知の差分」参照）。"
 }
