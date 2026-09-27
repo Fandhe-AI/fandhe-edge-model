@@ -49,6 +49,16 @@
 //!   （[`EvalInputStop::InvalidId`]）のは PoC-9 に規定が無い、本リポとして
 //!   安全側に倒した判断である（`id` で一意に突き合わせられない入力を
 //!   評価しないため）
+//! - JSON オブジェクトキーの重複検出（Unicode エスケープによるキー重複
+//!   smuggling を含む）は PoC-9 に規定が無い。検出プリミティブは
+//!   [`crate::json_keys`] に集約し [`inspect`] と共有するが、検出後の扱いは
+//!   [`inspect`]（[`inspect::AnomalyCode::DuplicateKey`]。レコードを除外して
+//!   処理を継続する。issue #38・PR #191）とは正反対にする。gold・pred は
+//!   評価契約（REQ-21・REQ-27）の根幹データであり、`serde_json` が後勝ちで
+//!   潰した `id`／`label`／`predicted_label` を気付かず処理し続けることは、
+//!   視認できるテキストと異なる値で評価が進む安全性の問題になる。そのため
+//!   本モジュールは重複キーを検出した時点で [`EvalInputStop::DuplicateKey`]
+//!   として処理全体を停止する（安全側に倒す判断は `InvalidId` と同じ理由）
 //!
 //! # 前提条件（呼び出し元が守るべきこと）
 //!
@@ -59,6 +69,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
+
+use crate::json_keys::has_duplicate_key;
 
 /// gold（正解）側か pred（予測）側かを表す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +116,12 @@ pub enum EvalInputStop {
     /// `id` で一意に突き合わせられない入力を安全側に倒して停止する
     /// （モジュール doc「PoC-9 との差分」参照）。
     InvalidId { side: Side, line: usize },
+    /// トップレベルまたはネスト先（`output` 等）に同一 JSON キーが複数回
+    /// 出現し、`serde_json` のパース時点で後勝ちの値へ潰れていた
+    /// （Unicode エスケープによるキー重複 smuggling を含む）。gold・pred は
+    /// 評価契約の根幹データのため、[`inspect`] とは異なり除外せず処理全体を
+    /// 停止する（モジュール doc「PoC-9 との差分」参照）。
+    DuplicateKey { side: Side, line: usize },
 }
 
 impl EvalInputStop {
@@ -115,6 +133,7 @@ impl EvalInputStop {
             EvalInputStop::MalformedJson { .. } => "malformed_json",
             EvalInputStop::MalformedRecord { .. } => "malformed_record",
             EvalInputStop::InvalidId { .. } => "invalid_id",
+            EvalInputStop::DuplicateKey { .. } => "duplicate_key",
         }
     }
 }
@@ -299,8 +318,10 @@ struct ParsedRow {
 /// 1 行 1 JSON（JSONL）の本文をパースする（gold・pred で共通の手順 1）。
 ///
 /// 前後空白を除いて空になる行は読み飛ばす（行番号のカウントは進める）。
-/// `id` が存在しない・文字列でない・空文字列の場合は
-/// [`EvalInputStop::InvalidId`] で打ち切る。
+/// トップレベルまたはネスト先に同一 JSON キーが複数回出現していた場合は
+/// [`EvalInputStop::DuplicateKey`] で打ち切る（`id` の抽出より前に検査する。
+/// `id` 自体が smuggling の対象になり得るため）。`id` が存在しない・
+/// 文字列でない・空文字列の場合は [`EvalInputStop::InvalidId`] で打ち切る。
 fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop> {
     let mut rows = Vec::new();
     for (idx, raw_line) in content.lines().enumerate() {
@@ -311,6 +332,14 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
 
         let value: Value = serde_json::from_str(raw_line)
             .map_err(|_| EvalInputStop::MalformedJson { side, line })?;
+
+        if !value.is_object() {
+            return Err(EvalInputStop::MalformedRecord { side, line });
+        }
+
+        if has_duplicate_key(raw_line, &value) {
+            return Err(EvalInputStop::DuplicateKey { side, line });
+        }
 
         let Value::Object(fields) = value else {
             return Err(EvalInputStop::MalformedRecord { side, line });
@@ -705,6 +734,108 @@ mod tests {
                 line: 1,
             })
         );
+    }
+
+    /// REQ-23: gold のトップレベル重複キーは DuplicateKey で打ち切る。
+    #[test]
+    fn req23_duplicate_top_level_key_stops() {
+        let gold = "{\"id\":\"a\",\"id\":\"b\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::DuplicateKey {
+                side: Side::Gold,
+                line: 1,
+            })
+        );
+        assert_eq!(result.unwrap_err().code(), "duplicate_key");
+    }
+
+    /// REQ-23: ネスト先（`output.intent`）の重複キーも DuplicateKey で打ち切る。
+    #[test]
+    fn req23_duplicate_nested_key_stops() {
+        let gold = "{\"id\":\"a\",\"output\":{\"intent\":\"A\",\"intent\":\"B\"}}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A", "B"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::DuplicateKey {
+                side: Side::Gold,
+                line: 1,
+            })
+        );
+    }
+
+    /// REQ-23: Unicode エスケープによる `id` キー重複 smuggling
+    /// （`"id"` と `"\u0069d"` はいずれも `id` を指す）を検出して打ち切ること。
+    /// 視認できるテキストと異なる `id`（ここでは後勝ちの `"b"`）で評価が
+    /// 進むことを防ぐ（モジュール doc「PoC-9 との差分」参照）。
+    #[test]
+    fn req23_duplicate_key_via_unicode_escape_stops() {
+        let gold = "{\"id\":\"a\",\"\\u0069d\":\"b\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::DuplicateKey {
+                side: Side::Gold,
+                line: 1,
+            })
+        );
+    }
+
+    /// REQ-23: pred 側の重複キーも検出すること（gold は正常）。
+    #[test]
+    fn req23_duplicate_key_on_prediction_side_stops() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"predicted_label\":\"B\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A", "B"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::DuplicateKey {
+                side: Side::Prediction,
+                line: 1,
+            })
+        );
+    }
+
+    /// REQ-23: 重複キー検出は `id` の抽出より前に働くため、`id` 自体が
+    /// smuggling されて偶然重複した場合でも InvalidId ではなく DuplicateKey で
+    /// 打ち切ること（重複 id 判定〔手順 4〕より前の、パース段階〔手順 1〕の
+    /// 停止であることの確認）。
+    #[test]
+    fn req23_duplicate_key_is_detected_before_duplicate_id_check() {
+        let gold =
+            "{\"id\":\"a\",\"label\":\"A\"}\n{\"id\":\"a\",\"\\u0069d\":\"a\",\"label\":\"B\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A", "B"]));
+        assert_eq!(
+            result,
+            Err(EvalInputStop::DuplicateKey {
+                side: Side::Gold,
+                line: 2,
+            })
+        );
+    }
+
+    /// 重複キーの診断（[`EvalInputStop::DuplicateKey`]）に生値（`id`・`label`）が
+    /// 含まれないこと（PR #191（issue #38）の前例に倣う回帰テスト）。
+    #[test]
+    fn req23_duplicate_key_diagnostics_never_contain_raw_values() {
+        let long_id = "x".repeat(500);
+        let gold = format!("{{\"id\":\"{long_id}\",\"id\":\"other-{long_id}\"}}\n");
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let result = prepare_evaluation_input(&gold, pred, &labels(&["A"]));
+        let err = result.unwrap_err();
+        assert_eq!(
+            err,
+            EvalInputStop::DuplicateKey {
+                side: Side::Gold,
+                line: 1
+            }
+        );
+        assert!(!format!("{err:?}").contains(&long_id));
     }
 
     /// `output.intent` 形式の gold も読めること。
