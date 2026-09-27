@@ -134,6 +134,13 @@ pub enum JudgmentError {
     /// スコアの合計が 1.0 から許容差（[`SCORE_SUM_TOLERANCE`]）を超えて
     /// ずれている（API 契約「確率の列」を満たさない）。
     ScoreSumNotOne { sum: f64 },
+    /// `predicted_choice_id` が [`MAX_CHOICE_ID_BYTES`] を超える（REQ-39
+    /// 資源の上限）。未知の ID（`seen_ids` に存在しない）の場合、
+    /// [`JudgmentError::UnknownPredictedChoice`] へ複製する前にここで拒否
+    /// する。極端に長い値をそのまま複製・エラー文へ含めると、追加のメモ
+    /// リ確保と巨大なエラー出力が発生するため（PR #202 レビュー指摘・
+    /// P0）、`ChoiceIdTooLong` と同様に長さのみを保持し値自体は含めない。
+    PredictedChoiceIdTooLong { len: usize, limit: usize },
     /// `predicted_choice_id` が選択肢一覧に存在しない。
     UnknownPredictedChoice { id: String },
     /// `predicted_choice_id` は選択肢一覧に存在するが、最高スコアの選択肢
@@ -184,6 +191,12 @@ impl fmt::Display for JudgmentError {
             JudgmentError::ScoreSumNotOne { sum } => {
                 write!(f, "score sum must be 1.0 (within tolerance), got {sum}")
             }
+            JudgmentError::PredictedChoiceIdTooLong { len, limit } => {
+                write!(
+                    f,
+                    "predicted choice id too long: {len} bytes (limit: {limit})"
+                )
+            }
             JudgmentError::UnknownPredictedChoice { id } => {
                 write!(f, "unknown predicted choice id: {id}")
             }
@@ -223,6 +236,7 @@ impl JudgmentError {
             }
             JudgmentError::TooManyOptions { .. }
             | JudgmentError::ChoiceIdTooLong { .. }
+            | JudgmentError::PredictedChoiceIdTooLong { .. }
             | JudgmentError::TotalChoiceIdBytesExceeded { .. } => ExitCode::LimitExceeded,
             _ => ExitCode::RuntimeError,
         }
@@ -367,6 +381,19 @@ impl JudgmentResult {
         // （PR #202 レビュー指摘）。
         if (sum - 1.0).abs() > SCORE_SUM_TOLERANCE {
             return Err(JudgmentError::ScoreSumNotOne { sum });
+        }
+
+        // `predicted_choice_id` は公開 API の入力で、`seen_ids` に実在し
+        // ない未知の値になりうる。未知の場合に下で `to_string()` して
+        // `UnknownPredictedChoice` へ複製する前に長さを検証する（codex
+        // レビュー指摘・P0。REQ-39 資源の上限）。実在する ID は `options`
+        // のループで既に `MAX_CHOICE_ID_BYTES` 以下であることを検証済み
+        // のため、ここでの検証対象は実質的に未知の値のみである。
+        if predicted_choice_id.len() > MAX_CHOICE_ID_BYTES {
+            return Err(JudgmentError::PredictedChoiceIdTooLong {
+                len: predicted_choice_id.len(),
+                limit: MAX_CHOICE_ID_BYTES,
+            });
         }
 
         if !seen_ids.contains(predicted_choice_id) {
@@ -593,6 +620,23 @@ mod tests {
             JudgmentResult::new(&options, "row", "z", &[0.5, 0.5]),
             Err(JudgmentError::UnknownPredictedChoice {
                 id: "z".to_string()
+            })
+        );
+    }
+
+    /// REQ-39: 未知の `predicted_choice_id` が [`MAX_CHOICE_ID_BYTES`] を
+    /// 超える場合、`UnknownPredictedChoice` へ複製する前に長さ超過として
+    /// 拒否する（codex レビュー指摘・P0。エラーは長さのみ保持し値そのも
+    /// のは含めない）。
+    #[test]
+    fn req39_rejects_predicted_choice_id_exceeding_length_limit() {
+        let options = [choice("a"), choice("b")];
+        let over_limit = "z".repeat(MAX_CHOICE_ID_BYTES + 1);
+        assert_eq!(
+            JudgmentResult::new(&options, "row", &over_limit, &[0.5, 0.5]),
+            Err(JudgmentError::PredictedChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES,
             })
         );
     }
