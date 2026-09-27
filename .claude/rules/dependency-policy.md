@@ -16,6 +16,24 @@
 4. 推移的依存の概要（大量の間接依存・ネイティブビルド（C/C++）・プリビルドバイナリの自動ダウンロードを引き込まないか）
 5. 配布サイズ・推論レイテンシへの影響（容量の目安 40MB・p95 250ms 未満。REQ-30・REQ-31）
 
+## 承認済みの依存（Rust）
+
+実装前に承認を得た依存。導入する PR は本表の版で `[workspace.dependencies]` に `=x.y.z` 固定し、PR 本文から本節を参照する。表に無い依存・版の変更は改めて承認を得る。
+
+| crate | 版 | 目的 | 配置する層 | ライセンス | 承認 |
+| ----- | -- | ---- | ---------- | ---------- | ---- |
+| `serde`（`derive` feature） | `=1.0.229` | 定義ファイル・JSON 入出力の型への読み込み | 共通コア（TASK-15.3〜15.5・REQ-15） | MIT OR Apache-2.0 | 2026-09-27 オーナー承認 |
+| `serde_json` | `=1.0.151` | JSON の読み書き（定義ファイル・CLI の JSON 出力） | 同上 | MIT OR Apache-2.0 | 2026-09-27 オーナー承認 |
+| `sha2` | `=0.11.0` | 正準化ハッシュ（sha256）の計算。PoC-16 の `shasum` 子プロセス起動を置き換え、OS・外部コマンドに依存させない | 共通コア（TASK-15.5・REQ-15） | MIT OR Apache-2.0 | 2026-09-27 オーナー承認 |
+
+承認時に確認した推移的依存（2026-09-27 時点の crates.io。証拠種別: 一次情報の調査）:
+
+- `serde`（derive）: `serde_core`・`serde_derive`・`proc-macro2`・`quote`・`syn`（3.0 系）・`unicode-ident`（`(MIT OR Apache-2.0) AND Unicode-3.0`）。`syn` 3.0 系は PoC-16 の lock でも同じ
+- `serde_json`: `itoa`・`memchr`（Unlicense OR MIT）・`zmij`（MIT 単独。`ryu` の後継）
+- `sha2`: `cfg-if`・`cpufeatures`（Apple Silicon では `libc`）・`digest`・`block-buffer`・`crypto-common`・`hybrid-array`・`typenum`
+- いずれも `deny.toml` の許可ライセンスに収まり、C/C++ のネイティブビルド・プリビルドバイナリの自動ダウンロードは確認されなかった
+- `unicode-normalization`（PoC-16 で使用）は入力の前処理を Rust へ移植する時点まで見送り、その時点で改めて承認を得る
+
 ## 事前学習済み重み・外部データ
 
 - 事前学習済みモデルの重み・語彙・外部データセットの取得・同梱は依存追加と同様にユーザー承認事項とする（ライセンス・配布可否・容量を併せて提示する）
