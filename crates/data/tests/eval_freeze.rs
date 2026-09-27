@@ -120,15 +120,14 @@ fn freeze_eval_data_returns_too_large_for_oversized_file() {
 /// REQ-39 異常系（非通常ファイル）: `stat` 上のサイズが 0 のキャラクタデバイス
 /// （`/dev/zero`）は、ファイル種別の検証が無いと `TooLarge` 検査を素通りしたうえ
 /// `sha256_hex_of_reader` が EOF に到達せず無限に読み続ける。`FreezeError::NotAFile`
-/// で拒否することを確認する（Linux 実機・テストハーネス。`/dev/zero` が存在しない
-/// 環境では検証不能のため skip する）。
+/// で拒否することを確認する（Linux/macOS 実機・テストハーネス）。
+/// `/dev/zero` は Unix 系では常に存在するため `#[cfg(unix)]` で対象環境を絞り、
+/// 実行時の存在チェックによる非対応環境での暗黙 skip（false pass）を避ける
+/// （`.claude/rules/coding-rust.md`「テストの skip・ignore…で CI を通さない」）。
 #[test]
+#[cfg(unix)]
 fn freeze_eval_data_returns_not_a_file_for_character_device() {
     let dev_zero = Path::new("/dev/zero");
-    if !dev_zero.exists() {
-        eprintln!("skip: /dev/zero not available on this platform");
-        return;
-    }
 
     let result = freeze_eval_data(Some(dev_zero));
 

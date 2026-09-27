@@ -155,9 +155,12 @@ impl<R: Read> CountingReader<R> {
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read_len = self.inner.read(buf)?;
-        // u64 への変換失敗（32bit 環境で usize が u64 を超えることはないが、念のため
-        // checked 演算で明示する。REQ-39 系の外部入力パスでは `unwrap` を避ける方針）。
-        self.count = self.count.saturating_add(read_len as u64);
+        // `usize` から `u64` への変換は 32bit 環境でも失敗しないが、REQ-39 系の
+        // 外部入力パスでは `unwrap` / `as` の桁あふれ想定を避ける方針のため
+        // `try_from` で明示し、万一の変換失敗時は `count` を `u64::MAX` に
+        // 飽和させて `TooLarge` 判定側へ確実に倒す（panic させない）。
+        let read_len_u64 = u64::try_from(read_len).unwrap_or(u64::MAX);
+        self.count = self.count.saturating_add(read_len_u64);
         Ok(read_len)
     }
 }
