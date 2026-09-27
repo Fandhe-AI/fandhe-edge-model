@@ -33,7 +33,7 @@ const INPUT_REPRESENTATION_BYTES: &str = "bytes";
 pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
     let value: Value = serde_json::from_str(text).ok()?;
 
-    // 1. ルートが object であること（2.2 の走査順の最初のステップ）。
+    // 1. ルートが object であること（本関数内の走査順のステップ 1）。
     // 非 object の場合はここで確定的に `TypeMismatch(Root, Object, actual)`
     // を返す（`?` で無言の `None` に落とさない）。
     if let Some(err) = check_root_is_object(&value) {
@@ -291,6 +291,23 @@ fn json_type(value: &Value) -> JsonType {
 mod tests {
     use super::*;
 
+    /// `Definition::parse` の正常系テスト（`TWO_OPTIONS_JSON`）と同一構成の
+    /// 定義。ここに `KNOWN_TOP_LEVEL_KEYS`/`KNOWN_OPTION_KEYS` が
+    /// `RawDefinition`/`Choice` のフィールドと食い違っていないかを
+    /// 固定するための正常系専用の複製を持つ（フィールド追加時に
+    /// これらの一覧を更新し忘れると本テストが失敗して顕在化する）。
+    const VALID_DEFINITION_JSON: &str = r#"{
+        "schema": "fandhe-edge-model-definition/v1",
+        "name": "sample_topic",
+        "version": 1,
+        "judgment_type": "single_select",
+        "options": [
+            { "id": "yes", "display_name": "Yes", "description": "肯定" },
+            { "id": "no", "display_name": "No", "description": "否定" }
+        ],
+        "io": { "input": "bytes" }
+    }"#;
+
     /// diagnose の許可値定数が `JudgmentType`/`InputRepresentation` の serde
     /// 表現と食い違わないことを固定する（本ファイル冒頭の doc）。
     #[test]
@@ -304,5 +321,87 @@ mod tests {
 
         let input_json = serde_json::to_string(&super::super::InputRepresentation::Bytes).unwrap();
         assert_eq!(input_json, format!("{INPUT_REPRESENTATION_BYTES:?}"));
+    }
+
+    /// 正常系定義に対して `diagnose` が `None` を返すことを直接検証する。
+    /// `KNOWN_TOP_LEVEL_KEYS`/`KNOWN_OPTION_KEYS` のドリフト（フィールド
+    /// 追加の反映漏れ）を、他のエラー経路を介さず本テスト単体で検出する。
+    #[test]
+    fn diagnose_returns_none_for_valid_definition() {
+        assert!(diagnose(VALID_DEFINITION_JSON).is_none());
+    }
+
+    #[test]
+    fn diagnose_reports_type_mismatch_for_non_string_schema() {
+        let mut value: Value = serde_json::from_str(VALID_DEFINITION_JSON).unwrap();
+        value["schema"] = serde_json::json!(1);
+        let err = diagnose(&value.to_string()).expect("診断結果があるはず");
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Schema,
+                expected: ExpectedType::String,
+                actual: JsonType::Number,
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnose_reports_type_mismatch_for_non_string_judgment_type() {
+        let mut value: Value = serde_json::from_str(VALID_DEFINITION_JSON).unwrap();
+        value["judgment_type"] = serde_json::json!(true);
+        let err = diagnose(&value.to_string()).expect("診断結果があるはず");
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::JudgmentType,
+                expected: ExpectedType::String,
+                actual: JsonType::Bool,
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnose_reports_type_mismatch_for_non_object_io() {
+        let mut value: Value = serde_json::from_str(VALID_DEFINITION_JSON).unwrap();
+        value["io"] = serde_json::json!("bytes");
+        let err = diagnose(&value.to_string()).expect("診断結果があるはず");
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Io,
+                expected: ExpectedType::Object,
+                actual: JsonType::String,
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnose_reports_type_mismatch_for_non_string_io_input() {
+        let mut value: Value = serde_json::from_str(VALID_DEFINITION_JSON).unwrap();
+        value["io"]["input"] = serde_json::json!(1);
+        let err = diagnose(&value.to_string()).expect("診断結果があるはず");
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::IoInput,
+                expected: ExpectedType::String,
+                actual: JsonType::Number,
+            }
+        ));
+    }
+
+    #[test]
+    fn diagnose_reports_unknown_field_for_io_extra_key() {
+        let mut value: Value = serde_json::from_str(VALID_DEFINITION_JSON).unwrap();
+        value["io"]["extra"] = serde_json::json!("unexpected");
+        let err = diagnose(&value.to_string()).expect("診断結果があるはず");
+        match err {
+            DefinitionError::UnknownField { parent, name } => {
+                assert_eq!(parent, FieldPath::Io);
+                assert_eq!(name, "extra");
+            }
+            other => panic!("UnknownField を期待したが {other:?} だった"),
+        }
     }
 }

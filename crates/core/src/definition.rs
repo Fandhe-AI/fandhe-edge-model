@@ -1186,7 +1186,8 @@ mod tests {
         }
     }
 
-    /// 走査順（本ファイル冒頭 doc の 2.2）: `schema` が別形式で `io` も
+    /// 走査順（`diagnose::diagnose` 関数内のステップ 2〔schema〕を
+    /// ステップ 5〔io〕より先に評価する設計）: `schema` が別形式で `io` も
     /// 欠落している場合、誤誘導の `MissingField(Io)` ではなく
     /// `UnsupportedSchema` を返す。
     #[test]
