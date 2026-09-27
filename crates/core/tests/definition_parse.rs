@@ -71,3 +71,32 @@ fn req39_load_rejects_file_larger_than_size_limit() {
         other => panic!("TooLarge を期待したが {other:?} だった"),
     }
 }
+
+/// FIFO（名前付きパイプ）を指すパスを `Definition::load` に渡すと、書き手が
+/// 現れなくても即座に拒否されること（無期限に停止しない）を確認する
+/// （REQ-39・security.md「ガード層: 資源の上限」。PR #187 レビュー指摘）。
+/// テストが実際に無期限停止した場合は harness のタイムアウトで検出される。
+#[cfg(unix)]
+#[test]
+fn req39_load_rejects_fifo_without_blocking() {
+    let path = temp_file_path("load-fifo");
+    // std に mkfifo 相当の API が無いため、テスト専用に `mkfifo` コマンドで
+    // FIFO を作成する（本体コードでは子プロセスを起動しない）。
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo コマンドを起動できるはず");
+    assert!(status.success(), "mkfifo が成功するはず");
+
+    // 書き手が存在しない FIFO に対して呼ぶ。以前の実装（無条件の
+    // `File::open`）はここでプロセスごと無期限に停止しうる。
+    let result = Definition::load(&path);
+    std::fs::remove_file(&path).expect("FIFO を削除できるはず");
+
+    match result.expect_err("FIFO は通常ファイルではないため拒否されるはず") {
+        DefinitionError::NotRegularFile { path: rejected } => {
+            assert_eq!(rejected, path);
+        }
+        other => panic!("NotRegularFile を期待したが {other:?} だった"),
+    }
+}

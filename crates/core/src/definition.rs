@@ -7,7 +7,11 @@
 //!   （security.md「ガード層」）。`version` フィールドはカタログ形式のドキュメント
 //!   バージョン（`name` と並ぶ台帳上のメタ情報）であり、形式・版の識別は既に
 //!   `schema`/`SCHEMA_ID`（例: `.../v1` の版数を含む）が担うため、`version` を
-//!   第二のスキーマ固定値として拒否条件には使わない（PR #187 レビュー指摘）
+//!   第二のスキーマ固定値として拒否条件には使わない（PR #187 レビュー指摘）。
+//!   さらに同 PR の追加レビュー指摘に基づき、`Definition` を `Deserialize` させず
+//!   `parse` 限定の未検証中間型（`RawDefinition`）を経由させることでガード層の
+//!   迂回を防ぎ、`load` では FIFO 等の特殊ファイルに対する `File::open` の無期限
+//!   停止を避ける（`NotRegularFile`。Linux・macOS では `O_NONBLOCK` で開く）
 //! - TASK-15.3-2: 上記以外の必須項目欠落・不整合の詳細検証、エラー型の拡張
 //! - TASK-15.4: ラベル定義非同梱の `missing_labels` 判定
 //! - TASK-15.5: 正準化ハッシュ（`options`・`judgment_type` を用いた作り直し要否判定。
@@ -79,8 +83,7 @@ pub struct IoSchema {
 /// PoC-9 追補 A-10（`docs/spec/03-poc/evaluation-contract/README.md`）により、
 /// 下限基準（majority）のタイブレークはラベル定義の宣言順で解決するため、
 /// 順序の破壊は評価契約に影響する。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Definition {
     pub schema: String,
     pub name: String,
@@ -88,6 +91,25 @@ pub struct Definition {
     pub judgment_type: JudgmentType,
     pub options: Vec<Choice>,
     pub io: IoSchema,
+}
+
+/// `Definition` の未検証の中間表現（デシリアライズ専用）。
+///
+/// `Definition` 自体には `Deserialize` を実装しない。もし実装すると
+/// `serde_json::from_str::<Definition>(text)` のように `Definition::parse` を
+/// 経由しない直接デシリアライズが可能になり、`parse` が担うガード層の検証
+/// （サイズ上限・`schema` 照合・選択肢の整合性）を丸ごと迂回できてしまう
+/// （security.md「ガード層の迂回」。PR #187 レビュー指摘）。
+/// この中間型は `parse` の内部でのみ使い、検証を経ないまま外部へ返さない。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDefinition {
+    schema: String,
+    name: String,
+    version: u32,
+    judgment_type: JudgmentType,
+    options: Vec<Choice>,
+    io: IoSchema,
 }
 
 /// 定義ファイルの読み込み・パース時のエラー。
@@ -131,6 +153,12 @@ pub enum DefinitionError {
     DuplicateOptionId {
         id: String,
     },
+    /// パス先が通常ファイルではない（FIFO・ソケット・キャラクタデバイス等）。
+    /// これらを許すと `File::open`/`read_to_end` が書き手を待って無期限に
+    /// 停止しうる（security.md「ガード層: 資源の上限」。PR #187 レビュー指摘）。
+    NotRegularFile {
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for DefinitionError {
@@ -167,6 +195,9 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::DuplicateOptionId { id } => {
                 write!(f, "definition option id {id:?} is duplicated")
             }
+            DefinitionError::NotRegularFile { path } => {
+                write!(f, "definition path {path:?} is not a regular file")
+            }
         }
     }
 }
@@ -181,6 +212,7 @@ impl std::error::Error for DefinitionError {
             DefinitionError::EmptyOptions => None,
             DefinitionError::EmptyOptionId => None,
             DefinitionError::DuplicateOptionId { .. } => None,
+            DefinitionError::NotRegularFile { .. } => None,
         }
     }
 }
@@ -204,7 +236,11 @@ impl Definition {
             });
         }
 
-        let definition: Definition =
+        // `Definition` は `Deserialize` を実装しない（上記 `RawDefinition` の
+        // ドキュメンテーションコメントを参照）。ここで未検証の中間型へ
+        // デシリアライズしたうえで、以下の検証をすべて経てから初めて
+        // `Definition` を構築する。
+        let raw: RawDefinition =
             serde_json::from_str(text).map_err(|source| DefinitionError::Parse { source })?;
 
         // 完全性と版（security.md「ガード層: 完全性と版」）: 異なるスキーマ形式の
@@ -212,20 +248,18 @@ impl Definition {
         // フィールドはカタログ上のドキュメントバージョン（`name` と並ぶメタ情報）
         // であり、形式・版の識別を担う第二のスキーマ固定値としては扱わない
         // （PR #187 レビュー指摘。有効な定義の後続版を誤って拒否しないため）。
-        if definition.schema != SCHEMA_ID {
-            return Err(DefinitionError::UnsupportedSchema {
-                schema: definition.schema,
-            });
+        if raw.schema != SCHEMA_ID {
+            return Err(DefinitionError::UnsupportedSchema { schema: raw.schema });
         }
 
         // 選択肢の整合性: 固定選択肢からの選択・ラベル照合が成立する状態
         // （空でない・id が空でない・id が重複しない）であることを検証する
         // （REQ-15 の入出力契約）。
-        if definition.options.is_empty() {
+        if raw.options.is_empty() {
             return Err(DefinitionError::EmptyOptions);
         }
-        let mut seen_ids = std::collections::HashSet::with_capacity(definition.options.len());
-        for choice in &definition.options {
+        let mut seen_ids = std::collections::HashSet::with_capacity(raw.options.len());
+        for choice in &raw.options {
             if choice.id.is_empty() {
                 return Err(DefinitionError::EmptyOptionId);
             }
@@ -236,7 +270,14 @@ impl Definition {
             }
         }
 
-        Ok(definition)
+        Ok(Definition {
+            schema: raw.schema,
+            name: raw.name,
+            version: raw.version,
+            judgment_type: raw.judgment_type,
+            options: raw.options,
+            io: raw.io,
+        })
     }
 
     /// パスから定義ファイルを読み込む。サイズ確認と内容読み込みを同一の
@@ -249,19 +290,31 @@ impl Definition {
     /// ここでは 1 つの `File` から metadata 取得・`take` による打ち切り読み込みまで
     /// 行い、その間の再オープンを避けることでこの窓を閉じる。
     ///
+    /// FIFO・ソケット・キャラクタデバイス等を指すパスを渡されると、通常の
+    /// `File::open` は書き手が現れるまで無期限に停止しうる（security.md
+    /// 「ガード層: 資源の上限」。PR #187 レビュー指摘）。Linux・macOS では
+    /// `open(2)` に `O_NONBLOCK` を付けて開くことでこの停止を避け（POSIX:
+    /// `O_NONBLOCK` は通常ファイルの読み込み完了には影響しない）、開いた後に
+    /// 種別を確認して通常ファイル以外を拒否する。両 OS 以外（Windows 等。
+    /// 検証環境は Mac のみで Windows は M10 時点で対象外）では通常の
+    /// `File::open` にフォールバックする（coding-rust.md「クロスプラット
+    /// フォーム」）。
+    ///
     /// 経路の閉じ込め（`../` 等の拒否）は操作アダプターのガード層（TASK-39.x）の
     /// 責務であり、ここでは行わない。
     pub fn load(path: &Path) -> Result<Self, DefinitionError> {
         use std::io::Read as _;
 
-        let mut file = std::fs::File::open(path).map_err(|source| DefinitionError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut file = Self::open_for_read(path)?;
         let metadata = file.metadata().map_err(|source| DefinitionError::Read {
             path: path.to_path_buf(),
             source,
         })?;
+        if !metadata.file_type().is_file() {
+            return Err(DefinitionError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
         let reported_size = metadata.len();
         if reported_size > MAX_DEFINITION_FILE_BYTES {
             return Err(DefinitionError::TooLarge {
@@ -295,6 +348,43 @@ impl Definition {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
         })?;
         Self::parse(&text)
+    }
+
+    /// `load` の内部専用: FIFO 等での無期限停止を避けるため `O_NONBLOCK` 付きで
+    /// 開く（Linux・macOS）。`file_type().is_file()` の検査は `load` 側で行う。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_for_read(path: &Path) -> Result<std::fs::File, DefinitionError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // `O_NONBLOCK` はカーネル ABI の安定値（Linux は全対応アーキテクチャで
+        // 8進 0o4000、macOS（BSD 系）は 0x0004）。`libc` 等の新規依存を追加
+        // せず（dependency-policy.md）標準ライブラリの `custom_flags` のみで
+        // 実現するため、対応 OS を限定してハードコードする。
+        #[cfg(target_os = "linux")]
+        const O_NONBLOCK: i32 = 0o4000;
+        #[cfg(target_os = "macos")]
+        const O_NONBLOCK: i32 = 0x0004;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(path)
+            .map_err(|source| DefinitionError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
+    /// `load` の内部専用: Linux・macOS 以外（Windows 等）向けのフォールバック。
+    /// `O_NONBLOCK` 相当の対策は持たないが、Windows は M10 時点で対象外
+    /// （coding-rust.md「クロスプラットフォーム」）であり、`file_type().is_file()`
+    /// による通常ファイル以外の拒否は `load` 側で引き続き行う。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn open_for_read(path: &Path) -> Result<std::fs::File, DefinitionError> {
+        std::fs::File::open(path).map_err(|source| DefinitionError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
