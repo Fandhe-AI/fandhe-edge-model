@@ -1,9 +1,12 @@
-"""終了コード（REQ-21・REQ-33）の暫定ミラー。
+"""終了コード（REQ-21・REQ-33）のミラー。
 
-単一真実源は Rust 側（`docs/spec/03-poc/core-cli-vertical-slice/core/src/exitcode.rs`
-相当。本実装では TASK-15.x で確定する共通コア crate）。学習ワーカーは Rust の CLI から
-子プロセスとして起動され、この 7 種のいずれかで終了する契約に従う。値がここと
-Rust 側とで食い違わないよう、変更時は両方を同時に見直す。
+単一真実源は Rust 側の `crates/core/src/exitcode.rs`（`fandhe-edge-core`。
+TASK-21.1-1）。学習ワーカーは Rust の CLI から子プロセスとして起動され、
+この 7 種のいずれかで終了する契約に従う。値がここと Rust 側とで食い違わ
+ないことは、両者が共有する fixture `fixtures/exitcode/exit_codes.json` を
+介して `crates/core/tests/exitcode_fixture.rs`（Rust）と
+`trainer/tests/test_exitcode.py`（pytest）が機械照合する（TASK-21.1・
+#179）。変更時は Rust 側・fixture・本ファイルの 3 箇所を同時に見直す。
 """
 
 from __future__ import annotations
