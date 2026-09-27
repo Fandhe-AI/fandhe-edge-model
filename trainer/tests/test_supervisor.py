@@ -145,13 +145,17 @@ def test_monitor_child_maps_rlimit_cpu_self_kill_to_limit_exceeded() -> None:
     返り、呼び出し元〔`_spawn_worker_and_finalize`〕はこれを他の強制終了理由と
     同じく `ExitCode.LIMIT_EXCEEDED` へ写す）。
 
-    ダミーの子プロセスが自分で `resource.setrlimit(RLIMIT_CPU, (1, 1))` を
+    ダミーの子プロセスが自分で `resource.setrlimit(RLIMIT_CPU, (1, 3))` を
     設定してから busy-loop することで、監視側からの強制終了ではなく、
-    カーネルによる `SIGXCPU` での自己終了を再現する。
+    カーネルによる `SIGXCPU` での自己終了を再現する。soft(1) < hard(3) に
+    しているのは本番（`cli.py::_apply_rlimit_cpu_backstop`）と同じ形に
+    揃えるため。Linux は soft == hard だとソフト上限到達時に `SIGXCPU` を
+    送らず即 `SIGKILL` になり、`reason == "cpu"` を再現できない
+    （`SIGXCPU` はハード上限との間の猶予でのみ配送される）。
     """
     code = (
         "import resource\n"
-        "resource.setrlimit(resource.RLIMIT_CPU, (1, 1))\n"
+        "resource.setrlimit(resource.RLIMIT_CPU, (1, 3))\n"
         "x = 0\n"
         "while True:\n"
         "    x += 1\n"
