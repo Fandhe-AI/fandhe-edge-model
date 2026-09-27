@@ -5,21 +5,20 @@
 //! 本モジュールの対象外で、[`inspect_records`] は「型・必須項目・ラベル enum の
 //! 検査」と「妥当なレコードの抽出」のみを行う。
 //!
-//! # セキュリティ上の注意（データ本文の非転記）
+//! # セキュリティ上の注意（データ本文・識別子の非転記）
 //!
-//! [`RecordAnomaly`] はレコード本文（`input`・`output` の実際の値）を
-//! 一切保持しない。位置特定は行番号・`id`・フィールド名・JSON 型名のみで行う
+//! [`RecordAnomaly`] はレコード本文（`id`・`input`・`output` の実際の値）を
+//! 一切保持しない。位置特定は行番号・フィールド名・JSON 型名のみで行う
 //! （`.claude/rules/security.md`「データ本文をログ・エラーメッセージへ転記しない」）。
-//! `id`（`RecordAnomaly.id`）とラベル ID（`UnknownLabel` が保持する値）は
-//! 自由記述本文ではなく構造化された識別子であるため、例外として含めてよいと
-//! 判断している。ただし両者とも外部データの生値であり、検証に失敗した
-//! 場合（型不正・未知のラベル）はその生値自体が異常の原因であるため、
-//! 長さ・文字種の担保は無い。CLI/MCP が本構造体をそのままログ・Issue へ
-//! 出力する将来の用途を考え、[`RecordAnomaly`] に格納する `id`・`label_id` は
-//! [`cap_diagnostic_value`] で長さ上限（[`MAX_DIAGNOSTIC_VALUE_CHARS`]）に
-//! 切り詰めてから保持する。切り詰めは診断用の複製にのみ適用し、
+//! 学習・評価データの `id`・`output.intent` は利用者が自由に設定できる値で
+//! あり、個人情報・機密情報が混入しうる。検証に失敗した場合（型不正・未知の
+//! ラベル）であっても、その生値・生値の一部（先頭 N 文字等）を
+//! [`RecordAnomaly`]・[`AnomalyCode`] へ格納しない。CLI/MCP が本構造体を
+//! そのままログ・Issue へ出力する将来の用途を想定した安全側の設計であり、
+//! 同一 `id` の対応付けは値そのものではなく行番号
+//! （[`AnomalyCode::DuplicateId`] の `first_line`）で行う。
 //! [`ValidRecord`] が保持する実際の値（分割・ハッシュ・突き合わせのキーとして
-//! 使われる）は切り詰めない。
+//! 使われる）は本節の対象外で、検証を通過した値をそのまま保持する。
 //!
 //! # 既知の残存リスク（ガード層の責務）
 //!
@@ -35,26 +34,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
-
-/// [`RecordAnomaly`] に格納する診断用文字列（`id`・`label_id`）の上限文字数。
-///
-/// ログ・Issue への転記時に無制限の任意文字列が紛れ込むのを防ぐための上限で、
-/// 実データの `id`/ラベル ID の規約上の長さとは無関係の安全弁である
-/// （`.claude/rules/security.md`「データ本文をログ・エラーメッセージへ転記しない」）。
-const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 200;
-
-/// 診断（[`RecordAnomaly`]）にのみ使う複製を、文字数上限で切り詰める。
-///
-/// UTF-8 の文字境界で安全に切り詰め、切り詰めが発生した場合は末尾に
-/// マーカーを付けて「値が省略されている」ことを分かるようにする。
-/// [`ValidRecord`] に格納する実際の値には適用しない（上記モジュール doc 参照）。
-fn cap_diagnostic_value(s: &str) -> String {
-    if s.chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(MAX_DIAGNOSTIC_VALUE_CHARS).collect();
-    format!("{truncated}...(truncated)")
-}
 
 /// `inspect_records` の異常種別（本 crate の内部語彙）。
 ///
@@ -76,10 +55,13 @@ pub enum AnomalyCode {
         actual: &'static str,
     },
     /// `output.intent` が有効なラベル ID 集合に含まれない。
-    /// `label_id` は [`cap_diagnostic_value`] で長さ上限に切り詰めた
-    /// 診断用の複製（上記モジュール doc 参照）。
-    UnknownLabel { label_id: String },
-    /// `id` が既出の行と重複している。
+    /// 未知のラベル値そのものは保持しない（上記モジュール doc「セキュリティ上の
+    /// 注意」参照）。位置特定は [`RecordAnomaly::line`]・[`RecordAnomaly::field`]
+    /// （`"output.intent"`）で行う。
+    UnknownLabel,
+    /// `id` が既出の行と重複している。初出行（`first_line`）は `valid_records`
+    /// に残る場合があるが、2 回目以降の出現は `valid_records` から除外される
+    /// （`id` の一意性は分割・ハッシュ・突き合わせのキーとしての契約のため）。
     DuplicateId { first_line: usize },
 }
 
@@ -91,7 +73,7 @@ impl AnomalyCode {
             AnomalyCode::MalformedRecord => "malformed_record",
             AnomalyCode::MissingField => "missing_field",
             AnomalyCode::TypeMismatch { .. } => "type_mismatch",
-            AnomalyCode::UnknownLabel { .. } => "unknown_label",
+            AnomalyCode::UnknownLabel => "unknown_label",
             AnomalyCode::DuplicateId { .. } => "duplicate_id",
         }
     }
@@ -102,12 +84,9 @@ impl AnomalyCode {
 /// レコード本文（`input`・`output` の実値）は保持しない（上記モジュール doc 参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAnomaly {
-    /// 1 始まりの行番号。
+    /// 1 始まりの行番号。異常のあったレコードの特定はこの行番号のみで行う
+    /// （`id` 等の生値は保持しない。上記モジュール doc 参照）。
     pub line: usize,
-    /// 取得できた場合のみの `id`（型不正等で取得できないこともある）。
-    /// [`cap_diagnostic_value`] で長さ上限に切り詰めた診断用の複製であり、
-    /// [`ValidRecord::id`] の実値とは別物（上記モジュール doc 参照）。
-    pub id: Option<String>,
     /// 異常が生じたフィールド名（`"id"`・`"input"`・`"output"`・`"output.intent"`・
     /// `"tags"`・`"tags[]"`・`"group_id"`・レコード自体を指す `"<record>"`）。
     pub field: &'static str,
@@ -171,8 +150,10 @@ fn json_type_name(value: &Value) -> &'static str {
 ///   その行はそこで打ち切って次の行へ進む
 /// - 1 レコードにつき複数の異常をまとめて報告する（先頭の異常で打ち切らない）
 /// - 同一 `id` が複数行に現れた場合、2 回目以降の出現に
-///   [`AnomalyCode::DuplicateId`] を記録する。型検査に違反がなければ
-///   重複した行も含めて両方とも `valid_records` に残す（取捨選択はしない）
+///   [`AnomalyCode::DuplicateId`] を記録し、その行は `valid_records` から
+///   除外する（`id` は分割・ハッシュ・突き合わせのキーであり、
+///   `valid_records` 内で一意であることを保証する）。初出の行は他に
+///   異常が無ければ `valid_records` に残る
 /// - `anomalies`・`valid_records` はいずれも入力の行順で返す
 ///   （`HashMap`/`HashSet` を使わず決定的な順序を保つ）
 pub fn inspect_records(
@@ -199,7 +180,6 @@ pub fn inspect_records(
             Err(_) => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: None,
                     field: "<record>",
                     code: AnomalyCode::MalformedJson,
                 });
@@ -210,7 +190,6 @@ pub fn inspect_records(
         let Some(record) = value.as_object() else {
             anomalies.push(RecordAnomaly {
                 line,
-                id: None,
                 field: "<record>",
                 code: AnomalyCode::MalformedRecord,
             });
@@ -224,7 +203,6 @@ pub fn inspect_records(
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: None,
                     field: "id",
                     code: AnomalyCode::MissingField,
                 });
@@ -236,7 +214,6 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: None,
                         field: "id",
                         code: AnomalyCode::TypeMismatch {
                             expected: "string",
@@ -254,7 +231,6 @@ pub fn inspect_records(
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: id_opt.as_deref().map(cap_diagnostic_value),
                     field: "input",
                     code: AnomalyCode::MissingField,
                 });
@@ -266,7 +242,6 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "input",
                         code: AnomalyCode::TypeMismatch {
                             expected: "string",
@@ -284,7 +259,6 @@ pub fn inspect_records(
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: id_opt.as_deref().map(cap_diagnostic_value),
                     field: "output",
                     code: AnomalyCode::MissingField,
                 });
@@ -295,7 +269,6 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "output",
                         code: AnomalyCode::TypeMismatch {
                             expected: "object",
@@ -309,7 +282,6 @@ pub fn inspect_records(
                     None => {
                         anomalies.push(RecordAnomaly {
                             line,
-                            id: id_opt.as_deref().map(cap_diagnostic_value),
                             field: "output.intent",
                             code: AnomalyCode::MissingField,
                         });
@@ -320,7 +292,6 @@ pub fn inspect_records(
                         None => {
                             anomalies.push(RecordAnomaly {
                                 line,
-                                id: id_opt.as_deref().map(cap_diagnostic_value),
                                 field: "output.intent",
                                 code: AnomalyCode::TypeMismatch {
                                     expected: "string",
@@ -336,11 +307,8 @@ pub fn inspect_records(
                             } else {
                                 anomalies.push(RecordAnomaly {
                                     line,
-                                    id: id_opt.as_deref().map(cap_diagnostic_value),
                                     field: "output.intent",
-                                    code: AnomalyCode::UnknownLabel {
-                                        label_id: cap_diagnostic_value(intent),
-                                    },
+                                    code: AnomalyCode::UnknownLabel,
                                 });
                                 record_has_error = true;
                                 None
@@ -358,7 +326,6 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "tags",
                         code: AnomalyCode::TypeMismatch {
                             expected: "array",
@@ -377,7 +344,6 @@ pub fn inspect_records(
                             None => {
                                 anomalies.push(RecordAnomaly {
                                     line,
-                                    id: id_opt.as_deref().map(cap_diagnostic_value),
                                     field: "tags[]",
                                     code: AnomalyCode::TypeMismatch {
                                         expected: "string",
@@ -404,7 +370,6 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "group_id",
                         code: AnomalyCode::TypeMismatch {
                             expected: "string",
@@ -418,18 +383,18 @@ pub fn inspect_records(
         };
 
         // 重複 id の検出。id の一意性は後続処理（分割・ハッシュ・突き合わせ）の
-        // キーとしての契約の一部とみなし、コストが低いため本検査に含める。
-        // DuplicateId の有無は valid_records への追加可否に影響させない
-        // （値の取捨選択は TASK-16.2／分割側の責務）。
+        // キーとしての契約の一部であるため、2 回目以降の出現は record_has_error を
+        // 立てて valid_records から除外する（初出の行は他に異常が無ければ残る）。
+        // これにより valid_records 内で id が重複することはない。
         if let Some(ref id) = id_opt {
             match seen_ids.get(id) {
                 Some(&first_line) => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: Some(cap_diagnostic_value(id)),
                         field: "id",
                         code: AnomalyCode::DuplicateId { first_line },
                     });
+                    record_has_error = true;
                 }
                 None => {
                     seen_ids.insert(id.clone(), line);
@@ -512,7 +477,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: None,
                 field: "id",
                 code: AnomalyCode::MissingField,
             }]
@@ -531,7 +495,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: None,
                 field: "id",
                 code: AnomalyCode::TypeMismatch {
                     expected: "string",
@@ -552,7 +515,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "input",
                 code: AnomalyCode::MissingField,
             }]
@@ -571,7 +533,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "output",
                 code: AnomalyCode::TypeMismatch {
                     expected: "object",
@@ -592,15 +553,16 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "output.intent",
                 code: AnomalyCode::MissingField,
             }]
         );
     }
 
+    /// P0 修正の回帰確認（レビュー指摘）: 未知のラベル値そのものは
+    /// `RecordAnomaly`/`AnomalyCode` のどこにも保持されないこと。
     #[test]
-    fn unknown_label_is_reported() {
+    fn unknown_label_is_reported_without_raw_value() {
         let content = "{\"id\":\"r1\",\"input\":\"x\",\"output\":{\"intent\":\"nope\"}}";
         let valid = labels(&["ok"]);
 
@@ -610,13 +572,11 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "output.intent",
-                code: AnomalyCode::UnknownLabel {
-                    label_id: "nope".to_string(),
-                },
+                code: AnomalyCode::UnknownLabel,
             }]
         );
+        assert!(outcome.valid_records.is_empty());
     }
 
     #[test]
@@ -631,7 +591,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "tags",
                 code: AnomalyCode::TypeMismatch {
                     expected: "array",
@@ -653,7 +612,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "tags[]",
                 code: AnomalyCode::TypeMismatch {
                     expected: "string",
@@ -676,7 +634,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: Some("r1".to_string()),
                 field: "group_id",
                 code: AnomalyCode::TypeMismatch {
                     expected: "string",
@@ -698,8 +655,10 @@ mod tests {
         assert_eq!(outcome.valid_records[0].group_id, None);
     }
 
+    /// P1 修正の回帰確認（レビュー指摘）: 重複 `id` の 2 回目以降の出現は
+    /// `valid_records` から除外され、`id` の一意性が保たれること。
     #[test]
-    fn duplicate_id_is_reported_on_second_occurrence() {
+    fn duplicate_id_is_reported_and_excluded_from_valid_records() {
         let content = "\
 {\"id\":\"r1\",\"input\":\"a\",\"output\":{\"intent\":\"ok\"}}
 {\"id\":\"r1\",\"input\":\"b\",\"output\":{\"intent\":\"ok\"}}";
@@ -711,13 +670,14 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 2,
-                id: Some("r1".to_string()),
                 field: "id",
                 code: AnomalyCode::DuplicateId { first_line: 1 },
             }]
         );
-        // 型が正しければ両方とも valid_records に残す（取捨選択はしない）。
-        assert_eq!(outcome.valid_records.len(), 2);
+        // 初出（1 行目）のみ valid_records に残り、重複（2 行目）は除外される。
+        assert_eq!(outcome.valid_records.len(), 1);
+        assert_eq!(outcome.valid_records[0].line, 1);
+        assert_eq!(outcome.valid_records[0].input, "a".to_string());
     }
 
     #[test]
@@ -731,7 +691,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: None,
                 field: "<record>",
                 code: AnomalyCode::MalformedJson,
             }]
@@ -749,7 +708,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: None,
                 field: "<record>",
                 code: AnomalyCode::MalformedRecord,
             }]
@@ -779,33 +737,33 @@ mod tests {
         assert_eq!(result, Err(EmptyLabelSet));
     }
 
-    /// 検証に失敗した `output.intent` の生値が無制限に `RecordAnomaly` へ
-    /// 伝播しないこと（長さ上限で切り詰められること）。
+    /// 検証に失敗した `output.intent` の生値（極端に長い文字列）が
+    /// `RecordAnomaly`/`AnomalyCode` のどこにも伝播しないこと（P0 修正の回帰確認）。
     #[test]
-    fn unknown_label_id_is_capped_for_diagnostics() {
-        let long_label = "x".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
+    fn unknown_label_raw_value_never_reaches_diagnostics() {
+        let long_label = "x".repeat(500);
         let content =
             format!("{{\"id\":\"r1\",\"input\":\"x\",\"output\":{{\"intent\":\"{long_label}\"}}}}");
         let valid = labels(&["ok"]);
 
         let outcome = inspect_records(&content, &valid).unwrap();
 
-        assert_eq!(outcome.anomalies.len(), 1);
-        let AnomalyCode::UnknownLabel { label_id } = &outcome.anomalies[0].code else {
-            panic!("expected UnknownLabel");
-        };
         assert_eq!(
-            label_id.chars().count(),
-            MAX_DIAGNOSTIC_VALUE_CHARS + "...(truncated)".chars().count()
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "output.intent",
+                code: AnomalyCode::UnknownLabel,
+            }]
         );
-        assert!(label_id.ends_with("...(truncated)"));
     }
 
-    /// 検証に失敗した `id` の生値（型不正時ではなく重複検出時の複製）も
-    /// 同じ上限で切り詰められること。
+    /// 長い `id`（学習・評価データ利用者が自由に設定する値）が重複しても、
+    /// その生値が `RecordAnomaly` に伝播しないこと（P0 修正の回帰確認）。
+    /// `ValidRecord` 側は検証を通過した実値をそのまま保持する。
     #[test]
-    fn duplicate_id_value_is_capped_for_diagnostics() {
-        let long_id = "y".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
+    fn duplicate_id_raw_value_never_reaches_diagnostics() {
+        let long_id = "y".repeat(500);
         let content = format!(
             "{{\"id\":\"{long_id}\",\"input\":\"a\",\"output\":{{\"intent\":\"ok\"}}}}\n\
              {{\"id\":\"{long_id}\",\"input\":\"b\",\"output\":{{\"intent\":\"ok\"}}}}"
@@ -814,15 +772,17 @@ mod tests {
 
         let outcome = inspect_records(&content, &valid).unwrap();
 
-        assert_eq!(outcome.anomalies.len(), 1);
-        let anomaly_id = outcome.anomalies[0]
-            .id
-            .as_ref()
-            .expect("DuplicateId は id を保持する");
-        assert!(anomaly_id.ends_with("...(truncated)"));
-        // ValidRecord 側は切り詰めない実値を保持する（分割・突き合わせのキーのため）。
+        assert_eq!(
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 2,
+                field: "id",
+                code: AnomalyCode::DuplicateId { first_line: 1 },
+            }]
+        );
+        // 初出のみ valid_records に残り、実値（分割・突き合わせのキー）を保持する。
+        assert_eq!(outcome.valid_records.len(), 1);
         assert_eq!(outcome.valid_records[0].id, long_id);
-        assert_eq!(outcome.valid_records[1].id, long_id);
     }
 
     /// 200 段ネストした JSON は、スタックオーバーフローより先に
@@ -842,7 +802,6 @@ mod tests {
             outcome.anomalies,
             vec![RecordAnomaly {
                 line: 1,
-                id: None,
                 field: "<record>",
                 code: AnomalyCode::MalformedJson,
             }]
@@ -863,7 +822,6 @@ mod tests {
             vec![
                 RecordAnomaly {
                     line: 1,
-                    id: None,
                     field: "id",
                     code: AnomalyCode::TypeMismatch {
                         expected: "string",
@@ -872,21 +830,16 @@ mod tests {
                 },
                 RecordAnomaly {
                     line: 1,
-                    id: None,
                     field: "input",
                     code: AnomalyCode::MissingField,
                 },
                 RecordAnomaly {
                     line: 1,
-                    id: None,
                     field: "output.intent",
-                    code: AnomalyCode::UnknownLabel {
-                        label_id: "nope".to_string(),
-                    },
+                    code: AnomalyCode::UnknownLabel,
                 },
                 RecordAnomaly {
                     line: 1,
-                    id: None,
                     field: "group_id",
                     code: AnomalyCode::TypeMismatch {
                         expected: "string",
@@ -911,13 +864,7 @@ mod tests {
             .code(),
             "type_mismatch"
         );
-        assert_eq!(
-            AnomalyCode::UnknownLabel {
-                label_id: "x".to_string()
-            }
-            .code(),
-            "unknown_label"
-        );
+        assert_eq!(AnomalyCode::UnknownLabel.code(), "unknown_label");
         assert_eq!(
             AnomalyCode::DuplicateId { first_line: 1 }.code(),
             "duplicate_id"

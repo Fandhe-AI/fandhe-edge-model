@@ -75,14 +75,15 @@ fn mixed_anomalies_are_all_detected() {
 
     // 妥当なレコード: ok1・ok3（output 型不正で intent 検査自体スキップされるが id/input は妥当のため
     // valid_records には残らない点に注意）は record_has_error が立つため除外される。
-    // 妥当と判定されるのは ok1・dup（両方）・ok9 の 4 件。
+    // 重複 id（13・14 行目の "dup"）は 2 回目の出現（14 行目）が除外され、初出（13 行目）のみ残る。
+    // 妥当と判定されるのは ok1・dup（初出のみ）・ok9 の 3 件。
     let valid_ids: Vec<&str> = outcome
         .valid_records
         .iter()
         .map(|r| r.id.as_str())
         .collect();
-    assert_eq!(valid_ids, vec!["ok1", "dup", "dup", "ok9"]);
-    assert_eq!(outcome.valid_records.len(), 4);
+    assert_eq!(valid_ids, vec!["ok1", "dup", "ok9"]);
+    assert_eq!(outcome.valid_records.len(), 3);
 }
 
 /// 有効なラベル ID 集合が空の場合はエラーを返す。
