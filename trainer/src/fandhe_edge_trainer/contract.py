@@ -105,10 +105,13 @@ docstring 参照）`os.rename`（`dir_fd` 相対）で確定する。置き換�
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import json
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -617,6 +620,172 @@ def _tmp_name_prefix(name: str) -> str:
     return f".{name}.tmp-"
 
 
+# --------------------------------------------------------------------------
+# macOS 拡張 ACL 検査（Codex レビュー再指摘・オーナー承認 2026-09-27）。
+# `out_dir` の親ディレクトリへの書き込みが「所有者のみ」に限られていることを、
+# POSIX パーミッションビットに加えて macOS の拡張 ACL（`chmod +a` 等で
+# `group:everyone allow ...` のように付与される追加の許可）についても検査する。
+# ACL はパーミッションビットに現れないため、uid/mode 検査だけでは検出できない。
+#
+# FFI（ctypes）についての注記（Rust の `// SAFETY:` に相当。オーナー承認
+# 2026-09-27）:
+# - `acl_get_fd_np`・`acl_get_entry`・`acl_get_tag_type`・`acl_free` は
+#   macOS SDK の `<sys/acl.h>` で宣言されたシステム API。以下の
+#   `restype`/`argtypes` は `sys/acl.h` の宣言に一致させてある（`acl_t`・
+#   `acl_entry_t` は不透明なポインタ型のため `c_void_p` を割り当てる。
+#   `acl_tag_t`・`acl_type_t` は C の enum＝`int` サイズ）。
+# - 維持すべき不変条件: `acl_get_fd_np` が返すポインタ（非 NULL の場合）は
+#   `acl_free` を呼ぶまで有効な参照として扱い、成功・失敗いずれの経路でも
+#   `finally` で必ず 1 回だけ解放する（リーク・二重解放のいずれもしない）。
+# - `ctypes` は stdlib のため、本検査を追加しても学習ワーカー側の依存方針
+#   （dependency-policy.md）・`supervisor.py` の mlx・onnx・numpy 非依存
+#   （P0-2）を崩さない。
+# --------------------------------------------------------------------------
+
+_ACL_TYPE_EXTENDED = 0x00000100
+_ACL_FIRST_ENTRY = 0
+_ACL_NEXT_ENTRY = -1
+_ACL_EXTENDED_ALLOW = 1
+_ACL_EXTENDED_DENY = 2
+
+
+def _load_acl_functions() -> ctypes.CDLL | None:
+    """ACL API（libSystem 経由。現在のプロセスに既にリンクされている）の
+    関数ポインタを解決し、`restype`/`argtypes` を確定させる。失敗すれば
+    `None`（呼び出し側が fail-closed に扱う）。
+    """
+    try:
+        lib = ctypes.CDLL(None, use_errno=True)
+        lib.acl_get_fd_np.restype = ctypes.c_void_p
+        lib.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.acl_get_entry.restype = ctypes.c_int
+        lib.acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.acl_get_tag_type.restype = ctypes.c_int
+        lib.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        lib.acl_free.restype = ctypes.c_int
+        lib.acl_free.argtypes = [ctypes.c_void_p]
+    except (OSError, AttributeError):
+        return None
+    return lib
+
+
+def _reject_extended_acl_allow(fd: int) -> None:
+    """`fd` が指すディレクトリの拡張 ACL（`ACL_TYPE_EXTENDED`）に
+    `ACL_EXTENDED_ALLOW` エントリが 1 つでもあれば `output_conflict` で拒否する。
+
+    macOS の拡張 ACL（`chmod +a` で付与する `group:everyone allow ...` 等）は
+    POSIX のパーミッションビットに現れないため、uid/mode 検査だけでは検出
+    できない（Codex レビュー再指摘。オーナー承認 2026-09-27）。deny エントリ
+    のみ（例: Finder が既定で `~/Documents` 等に付与する
+    `group:everyone deny delete` 等）は追加の書き込み許可を与えないため合格
+    とする。
+
+    `sys.platform != "darwin"`・ACL API のシンボル解決の失敗・想定外の
+    戻り値やタグは、いずれも fail-closed（`output_conflict`）とする
+    （REQ-39 ガード層。「動くこと」より「検査の正しさ」を優先する）。
+    """
+    if sys.platform != "darwin":
+        raise WorkerError(
+            "output_conflict", "extended ACL check requires macOS", ExitCode.INVALID_INPUT
+        )
+    lib = _load_acl_functions()
+    if lib is None:
+        raise WorkerError(
+            "output_conflict", "failed to resolve the ACL API", ExitCode.INVALID_INPUT
+        )
+
+    ctypes.set_errno(0)
+    acl = lib.acl_get_fd_np(fd, _ACL_TYPE_EXTENDED)
+    if not acl:
+        err = ctypes.get_errno()
+        if err == errno.ENOENT:
+            return  # 拡張 ACL が無い（合格）。
+        raise WorkerError(
+            "output_conflict",
+            f"failed to read the extended ACL (errno={err})",
+            ExitCode.INVALID_INPUT,
+        )
+
+    try:
+        entry = ctypes.c_void_p()
+        entry_id = _ACL_FIRST_ENTRY
+        while True:
+            ctypes.set_errno(0)
+            if lib.acl_get_entry(acl, entry_id, ctypes.byref(entry)) != 0:
+                # 走査の終端は -1・errno=EINVAL（macOS の acl_get_entry の仕様。
+                # 実機で確認済み）。それ以外の失敗は途中のエントリを読み飛ばした
+                # 可能性があるため、終端と区別して fail-closed とする。
+                err = ctypes.get_errno()
+                if err == errno.EINVAL:
+                    break
+                raise WorkerError(
+                    "output_conflict",
+                    f"failed to enumerate ACL entries (errno={err})",
+                    ExitCode.INVALID_INPUT,
+                )
+            tag_type = ctypes.c_int()
+            if lib.acl_get_tag_type(entry, ctypes.byref(tag_type)) != 0:
+                raise WorkerError(
+                    "output_conflict", "failed to read an ACL entry tag", ExitCode.INVALID_INPUT
+                )
+            if tag_type.value == _ACL_EXTENDED_ALLOW:
+                raise WorkerError(
+                    "output_conflict",
+                    "out_dir parent has an ACL entry that allows additional write access",
+                    ExitCode.INVALID_INPUT,
+                )
+            if tag_type.value != _ACL_EXTENDED_DENY:
+                raise WorkerError(
+                    "output_conflict",
+                    f"unexpected ACL entry tag type: {tag_type.value}",
+                    ExitCode.INVALID_INPUT,
+                )
+            entry_id = _ACL_NEXT_ENTRY
+    finally:
+        lib.acl_free(acl)
+
+
+def _assert_parent_dir_exclusive(parent_fd: int) -> None:
+    """`parent_fd` が指す親ディレクトリへ、実行ユーザー以外が書き込めないことを
+    確認する（POSIX の uid/mode 検査 + 拡張 ACL 検査）。`prepare_out_dir`
+    （予約前）・`finalize_out_dir`（`os.rename` 直前）の 2 箇所から同じ検査を
+    呼ぶ（P0。Codex レビュー再指摘。オーナー承認 2026-09-27）。
+
+    親ディレクトリに書き込めるのは所有者（実行ユーザー）と root のみである
+    ことを、呼び出し側が保持し続けている fd を使って予約時と rename 直前の
+    両方で確認する。同一 uid の別プロセスはスーパーバイザー自身を ptrace 等で
+    直接操作できるため、これはプロセスの信頼境界そのものと同じであり、
+    本検査の対象外とする（検出しようとしても意味を持たない）。root は
+    POSIX パーミッション・ACL のいずれも無視できるため、本検査で防げるのは
+    「実行ユーザーと異なる非 root ユーザーによる書き込み」に限られる。
+    `finalize_out_dir` 側の `os.rename` 後の inode 照合は、本検査をすり抜けた
+    場合に備えた多層防御として残す（それ自体が公開の正しさを保証する根拠
+    ではない）。
+    """
+    try:
+        parent_st = os.fstat(parent_fd)
+    except OSError as e:
+        raise WorkerError(
+            "output_conflict",
+            f"out_dir parent not stat-able: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if parent_st.st_uid != os.geteuid() or (parent_st.st_mode & 0o022) != 0:
+        # 他ユーザーが所有する、または group/others に書き込み可能な親
+        # ディレクトリでは、確定直前の名前差し替え（TOCTOU）を防ぎきれない
+        # ため拒否する（何も作成しない・確定させない。REQ-39 ガード層）。
+        raise WorkerError(
+            "output_conflict",
+            "out_dir parent must be owned by the current user and not writable by group or others",
+            ExitCode.INVALID_INPUT,
+        )
+    _reject_extended_acl_allow(parent_fd)
+
+
 def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     """`out_dir` を空ディレクトリとして排他的に予約し、書き込み用の一時
     ディレクトリ（兄弟。同じ `entry.parent_fd` 配下）を作って返す。
@@ -633,28 +802,19 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     一時ディレクトリで行い、成功時に `finalize_out_dir` がこの予約済み空
     ディレクトリを `os.rename` で置き換える（本モジュールの docstring も参照）。
 
-    **予約前に親ディレクトリの所有者・書き込み権限を確認する**（P0。
-    `os.mkdir`・`os.rename` はいずれも `dir_fd` の指す実体そのものへは
-    書き込むが、その親ディレクトリに他ユーザーが書き込める場合、`finalize_out_dir`
-    の `stat` から `os.rename` までの間に、同じ親ディレクトリ配下で
-    `tmp_name`（予約した一時ディレクトリと同名）を差し替えられる余地が残る
-    〔`finalize_out_dir` のドキュメントコメント参照〕。親ディレクトリの実効的な
-    所有者が自分自身（`os.geteuid()`）であり、かつ group/others に書き込み
-    権限が無い（sticky な `/tmp` 型の共有ディレクトリを含め弾く）ことを
-    `os.fstat(parent_fd)` で確認してから初めて `os.mkdir` する。確認に失敗
-    した場合・条件を満たさない場合は、何も作成せず `output_conflict`
-    （fail-closed。REQ-39 ガード層）。
-
-    **既知の限界（セキュリティ監査指摘）**: 本チェックは POSIX のパーミッション
-    ビット（`st_mode`）のみを見る。macOS の ACL（`chmod +a` 等で付与される
-    追加の書き込み許可）はパーミッションビットに現れないため、ACL 経由で
-    group/others に書き込みを許可された親ディレクトリはここでは検出できない
-    （本チェックをすり抜けうる）。その場合でも、`finalize_out_dir` が
-    `os.rename` 成功後に実体の `(st_dev, st_ino)` を照合するため（本モジュールの
-    `finalize_out_dir` docstring 参照）、ACL によって差し替えられた実体が
-    そのまま公開されることはなく、不一致を検出して `output_conflict`
-    （fail-closed）になる。多層防御の 1 段目（本チェック）を回避されても、
-    2 段目（rename 後照合）が最終的な公開の正しさを担保する。
+    **予約前に親ディレクトリが排他的（実行ユーザーのみ書き込み可能）であることを
+    確認する**（P0。`os.mkdir`・`os.rename` はいずれも `dir_fd` の指す実体
+    そのものへは書き込むが、その親ディレクトリに他ユーザーが書き込める場合、
+    `finalize_out_dir` の `stat` から `os.rename` までの間に、同じ親
+    ディレクトリ配下で `tmp_name`（予約した一時ディレクトリと同名）を
+    差し替えられる余地が残る〔`finalize_out_dir` のドキュメントコメント
+    参照〕。`_assert_parent_dir_exclusive`（POSIX の uid/mode 検査 + 拡張 ACL
+    検査。関数 docstring 参照）を `os.mkdir` の前に呼ぶ。確認に失敗した
+    場合・条件を満たさない場合は、何も作成せず `output_conflict`
+    （fail-closed。REQ-39 ガード層）。同じ検査を `finalize_out_dir` の
+    `os.rename` 直前でも再度行う（保持中の fd に対して再検査することで、
+    予約からその時点までの間に親ディレクトリの状態が変わっていないかを
+    確かめる）。
     また、umask（例: `002`）の設定によっては `mkdir(parents=True)` 等で
     作られた親ディレクトリが `0o775`（group 書き込み可能）になりうる。
     その場合、たとえ自分が作った・自分が所有するディレクトリであっても
@@ -669,23 +829,9 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     parent_fd = entry.parent_fd
     name = entry.name
 
-    try:
-        parent_st = os.fstat(parent_fd)
-    except OSError as e:
-        raise WorkerError(
-            "output_conflict",
-            f"out_dir parent not stat-able: {type(e).__name__}",
-            ExitCode.INVALID_INPUT,
-        ) from e
-    if parent_st.st_uid != os.geteuid() or (parent_st.st_mode & 0o022) != 0:
-        # 他ユーザーが所有する、または group/others に書き込み可能な親
-        # ディレクトリでは、確定直前の名前差し替え（TOCTOU）を防ぎきれない
-        # ため、予約自体を拒否する（何も作成しない。REQ-39 ガード層）。
-        raise WorkerError(
-            "output_conflict",
-            "out_dir parent must be owned by the current user and not writable by group or others",
-            ExitCode.INVALID_INPUT,
-        )
+    # 予約前の排他性検査（uid/mode + 拡張 ACL）。何も作成する前に行う
+    # （`_assert_parent_dir_exclusive` docstring・本関数 docstring 参照）。
+    _assert_parent_dir_exclusive(parent_fd)
 
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
@@ -747,20 +893,33 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
     ないため `runtime_error`〔exit 70〕ではなく `output_conflict`〔exit 64〕として
     扱う）。
 
+    **`os.rename` の直前に、親ディレクトリの排他性（uid/mode + 拡張 ACL）を
+    保持中の `parent_fd` で再検査する**（P0。Codex レビュー再指摘。オーナー
+    承認 2026-09-27）: `prepare_out_dir` での予約時点から本関数が呼ばれる
+    までの間に、親ディレクトリの状態（所有者・パーミッション・ACL）が
+    変わっている可能性がある。`_assert_parent_dir_exclusive` を rename 直前に
+    もう一度呼び、失敗すれば作業用一時ディレクトリを解放
+    （`_release_tmp`）したうえで、この時点まで空ディレクトリであることを
+    直前の 2. で確認済みの予約済み `out_dir` 自体も
+    `cleanup_reserved_out_dir` で解放してから `output_conflict` とする
+    （まだ何も rename していないので、`out_dir` を安全に片付けられる）。
+
     **`os.rename` の成功後にも、公開した実体が検証した実体と同一かを再確認する**
-    （P0）: `stat` による事前確認から `os.rename` の呼び出しまでの間にも、同じ
-    親ディレクトリへ書き込める別プロセスが `tmp_name` を（別ディレクトリへ）
-    差し替える余地が理論上残る（`prepare_out_dir` の親ディレクトリ権限検査は
-    この余地を大きく減らすが、実行時点の TOCTOU そのものを消しはしない）。
-    `rename` は inode を保つため、成功直後に `os.stat(name, ...)` した実体の
+    （P0）: 親ディレクトリの排他性を直前に再検査した時点で、`rename` の瞬間に
+    `tmp_name` を差し替えられるのは実行ユーザー自身（プロセスの信頼境界と
+    同じであり、本モジュールの検査対象外。`_assert_parent_dir_exclusive`
+    docstring 参照）と root だけである。post-rename の inode 照合は、この
+    前提が何らかの理由（本関数の検査の不備・環境固有の想定外挙動等）で
+    破れた場合に備えた多層防御として残す（それ自体が公開の正しさを保証する
+    根拠ではない）。`rename` は inode を保つ性質を使って、成功直後に
+    `os.stat(name, ...)` した実体の
     `(st_dev, st_ino)` が `reservation.tmp_id`（`fstat(tmp_fd)` で得た、保持中の
     fd が指す実体の識別子）と一致することを確認する。不一致・stat 失敗の場合は
     `out_dir`（`name`）に公開された実体が何であれ一切削除・rename し戻さず
     （検証していない実体を消す・移動すること自体が別の TOCTOU になるため）、
     自分の一時ディレクトリの後始末（`_release_tmp`。fd 経由で本物の中身だけを
     消す）だけを行ってから `output_conflict` とし、成功を報告しない
-    （同一ユーザー内の残余競合であっても、検証していない実体の公開を成功
-    扱いにしない。fail-closed）。
+    （検証していない実体の公開を成功扱いにしない。fail-closed）。
     """
     entry = reservation.entry
     parent_fd = entry.parent_fd
@@ -799,6 +958,20 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
             "out_dir was replaced by a different entry before finalize",
             ExitCode.INVALID_INPUT,
         )
+
+    # P0: rename 直前に親ディレクトリの排他性を再検査する（本関数の
+    # ドキュメントコメント参照）。この時点までに out_dir が自分の予約と
+    # 一致することは確認済み（直前のブロック）なので、失敗時は out_dir 自体を
+    # 安全に片付けてよい（`cleanup_reserved_out_dir` は reserved_id 一致・
+    # 空の場合にのみ rmdir するため、二重に安全）。`WorkerError` に限らず
+    # あらゆる例外（`BaseException`。ACL API 呼び出し・ctypes 境界で
+    # 想定外の例外が起きた場合を含む）で予約を残置しない（監査指摘 P2）。
+    try:
+        _assert_parent_dir_exclusive(parent_fd)
+    except BaseException:
+        _release_tmp(reservation)
+        cleanup_reserved_out_dir(entry, reservation.reserved_id)
+        raise
 
     try:
         os.rename(reservation.tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)

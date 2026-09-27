@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -741,6 +744,251 @@ def test_prepare_out_dir_rejects_parent_not_owned_by_current_user(
         assert exc_info.value.code == "output_conflict"
         assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
         assert not (tmp_path / "out").exists()
+
+
+# --------------------------------------------------------------------------
+# P0: macOS 拡張 ACL 検査（Codex レビュー再指摘・オーナー承認 2026-09-27）。
+# uid/mode の POSIX 検査だけでは検出できない `chmod +a` 由来の追加の書き込み
+# 許可を、`prepare_out_dir`（予約前）・`finalize_out_dir`（rename 直前）の
+# 両方で拒否すること。
+# --------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _acl_grant(path: Path, spec: str):
+    """`/bin/chmod +a <spec> <path>` で拡張 ACL エントリを付与し、終了時に
+    `chmod -N`（全 ACL エントリの除去）で必ず元に戻す（テスト専用）。
+    """
+    subprocess.run(  # noqa: S603 - テスト専用。引数は固定リスト。shell 不使用。絶対パスの /bin/chmod のみ
+        ["/bin/chmod", "+a", spec, str(path)], check=True, capture_output=True
+    )
+    try:
+        yield
+    finally:
+        subprocess.run(  # noqa: S603 - テスト専用。引数は固定リスト。shell 不使用
+            ["/bin/chmod", "-N", str(path)], check=False, capture_output=True
+        )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS の拡張 ACL API を前提にテストする")
+def test_prepare_out_dir_rejects_parent_with_acl_allow_entry(tmp_path: Path) -> None:
+    """親ディレクトリの POSIX パーミッションビットは排他的（`0o700`）でも、
+    拡張 ACL（`chmod +a`）で `group:everyone allow add_subdirectory` のような
+    追加の書き込み許可が付与されている場合、`out_dir` を何も作らずに
+    `output_conflict` で拒否すること（uid/mode 検査だけではすり抜けてしまう
+    ため。Codex レビュー再指摘）。
+    """
+    with _acl_grant(tmp_path, "everyone allow add_subdirectory"):
+        with _confined_out_dir(tmp_path) as entry:
+            with pytest.raises(WorkerError) as exc_info:
+                contract.prepare_out_dir(entry)
+            assert exc_info.value.code == "output_conflict"
+            assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+            assert "ACL" in exc_info.value.message  # ACL 由来の拒否であることの確認
+            assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS の拡張 ACL API を前提にテストする")
+def test_prepare_out_dir_accepts_parent_with_acl_deny_entry_only(tmp_path: Path) -> None:
+    """拡張 ACL に `deny` エントリしか無い場合（例: Finder が既定で付与する
+    `group:everyone deny delete` 等）は、追加の書き込み許可を与えないため
+    予約を通過すること（回帰ガード。拒否を過度に広げていないことの確認）。
+    """
+    with _acl_grant(tmp_path, "everyone deny delete"):
+        with _confined_out_dir(tmp_path) as entry:
+            reservation = contract.prepare_out_dir(entry)
+            assert (tmp_path / "out").is_dir()
+            contract.cleanup_reservation(reservation)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS の拡張 ACL API を前提にテストする")
+def test_finalize_out_dir_rejects_when_parent_gains_acl_allow_after_reservation(
+    tmp_path: Path,
+) -> None:
+    """予約成功後・`os.rename` 前に親ディレクトリへ拡張 ACL の `allow` エントリ
+    が付与された場合、`finalize_out_dir` の rename 直前の再検査で検出し、
+    確定させず `output_conflict` とすること。公開（rename）は一切行われず、
+    予約済み `out_dir`・作業用一時ディレクトリのいずれも片付けられる。
+    """
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        with _acl_grant(tmp_path, "everyone allow add_subdirectory"):
+            with pytest.raises(WorkerError) as exc_info:
+                contract.finalize_out_dir(reservation)
+            assert exc_info.value.code == "output_conflict"
+            assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+            assert "ACL" in exc_info.value.message  # ACL 由来の拒否であることの確認
+        # rename 前に検出されたため、公開（rename）は行われていない。
+        # 予約済み out_dir・作業用一時ディレクトリのいずれも片付けられている。
+        assert not (tmp_path / "out").exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+def test_finalize_out_dir_cleans_up_when_parent_check_raises_non_worker_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2（監査指摘）: rename 直前の親ディレクトリ再検査
+    （`_assert_parent_dir_exclusive`）が `WorkerError` 以外の例外（ACL API・
+    ctypes 境界での想定外の例外を模す）を送出した場合でも、予約
+    （`out_dir`・作業用一時ディレクトリ）を残置せず解放し、例外はそのまま
+    （変換せず）呼び出し元へ伝播すること。
+    """
+
+    def _boom(_parent_fd: int) -> None:
+        raise RuntimeError("simulated unexpected failure in the ACL/ctypes boundary")
+
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        monkeypatch.setattr(contract, "_assert_parent_dir_exclusive", _boom)
+        with pytest.raises(RuntimeError, match="simulated unexpected failure"):
+            contract.finalize_out_dir(reservation)
+        assert not (tmp_path / "out").exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+# --------------------------------------------------------------------------
+# P2: `_reject_extended_acl_allow` の fail-closed 分岐を、実際の ACL API を
+# 一切呼ばずに機械照合する（監査指摘。ACL API のスタブは `_load_acl_functions`
+# を差し替えて注入する）。`_reject_extended_acl_allow` は `sys.platform` を
+# 最初に見て非 darwin なら（スタブへ到達する前に）拒否するため、スタブを
+# 使う各テストは `contract.sys.platform` を `"darwin"` へ固定してからスタブを
+# 注入する（macOS で実行する限り no-op だが、非 darwin 環境でもスタブ化した
+# 分岐を確実に踏むようにするため）。プラットフォーム判定そのものは別途
+# `test_reject_extended_acl_allow_rejects_non_darwin` で検証する。
+# --------------------------------------------------------------------------
+
+
+class _FakeAclAllocation:
+    """`_reject_extended_acl_allow` に渡す ACL API のスタブ（1 テストにつき 1 回の
+    走査だけを想定した最小実装）。`acl_get_entry`/`acl_get_tag_type` は
+    `ctypes.byref(...)` で渡されるポインタの参照先へ書き込む必要があるため、
+    `byref` の内部属性 `_obj`（値を保持する元の ctypes インスタンス）へ直接
+    代入する（本体コード〔`contract.py`〕の呼び出し方を変えずにスタブ化する
+    ための、テスト専用の実装詳細への依存）。
+    """
+
+    def __init__(
+        self,
+        *,
+        fd_np_result: int | None,
+        fd_np_errno: int = 0,
+        entry_result: int = -1,
+        entry_errno: int = errno.EINVAL,
+        entry_value: int = 0x1,
+        tag_type_result: int = 0,
+        tag_type_value: int = 0,
+    ) -> None:
+        self._fd_np_result = fd_np_result
+        self._fd_np_errno = fd_np_errno
+        self._entry_result = entry_result
+        self._entry_errno = entry_errno
+        self._entry_value = entry_value
+        self._tag_type_result = tag_type_result
+        self._tag_type_value = tag_type_value
+        self.free_calls: list[object] = []
+
+    def acl_get_fd_np(self, _fd: int, _acl_type: int) -> int | None:
+        ctypes.set_errno(self._fd_np_errno)
+        return self._fd_np_result
+
+    def acl_get_entry(self, _acl: object, _entry_id: int, entry_p: object) -> int:
+        ctypes.set_errno(self._entry_errno)
+        if self._entry_result == 0:
+            entry_p._obj.value = self._entry_value  # byref 内部属性へ直接代入
+        return self._entry_result
+
+    def acl_get_tag_type(self, _entry_d: object, tag_type_p: object) -> int:
+        if self._tag_type_result == 0:
+            tag_type_p._obj.value = self._tag_type_value  # byref 内部属性へ直接代入
+        return self._tag_type_result
+
+    def acl_free(self, obj_p: object) -> int:
+        self.free_calls.append(obj_p)
+        return 0
+
+
+def test_reject_extended_acl_allow_rejects_non_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sys.platform != "darwin"` は ACL API を一切呼ばずに fail-closed
+    （`output_conflict`）とすること。"""
+    monkeypatch.setattr(contract.sys, "platform", "linux")
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+    assert "ACL" in exc_info.value.message
+
+
+def test_reject_extended_acl_allow_rejects_when_symbol_resolution_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACL API のシンボル解決自体に失敗した場合（`_load_acl_functions` が
+    `None`）、fail-closed（`output_conflict`）とすること。"""
+    monkeypatch.setattr(contract.sys, "platform", "darwin")
+    monkeypatch.setattr(contract, "_load_acl_functions", lambda: None)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+
+
+def test_reject_extended_acl_allow_rejects_when_get_fd_np_fails_with_unexpected_errno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`acl_get_fd_np` が NULL を返しても、errno が `ENOENT`（ACL 無し）以外
+    なら、それを「ACL 無し」と混同せず fail-closed（`output_conflict`）と
+    すること。"""
+    monkeypatch.setattr(contract.sys, "platform", "darwin")
+    stub = _FakeAclAllocation(fd_np_result=None, fd_np_errno=errno.EACCES)
+    monkeypatch.setattr(contract, "_load_acl_functions", lambda: stub)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+    assert stub.free_calls == []  # NULL のため acl_free の対象が無い
+
+
+def test_reject_extended_acl_allow_rejects_when_get_entry_fails_unexpectedly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`acl_get_entry` が非 0 を返しても、errno が `EINVAL`（走査の正常終端）
+    以外なら、途中のエントリを読み飛ばした可能性があるため fail-closed
+    （`output_conflict`）とすること。`acl_get_fd_np` が非 NULL を返した以上、
+    `acl_free` は必ず 1 回だけ呼ばれること。"""
+    monkeypatch.setattr(contract.sys, "platform", "darwin")
+    stub = _FakeAclAllocation(fd_np_result=0x1234, entry_result=-1, entry_errno=errno.EACCES)
+    monkeypatch.setattr(contract, "_load_acl_functions", lambda: stub)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+    assert stub.free_calls == [0x1234]
+
+
+def test_reject_extended_acl_allow_rejects_when_get_tag_type_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`acl_get_tag_type` が非 0（失敗）を返した場合、fail-closed
+    （`output_conflict`）とし、`acl_free` を必ず 1 回だけ呼ぶこと。"""
+    monkeypatch.setattr(contract.sys, "platform", "darwin")
+    stub = _FakeAclAllocation(fd_np_result=0x1234, entry_result=0, tag_type_result=1)
+    monkeypatch.setattr(contract, "_load_acl_functions", lambda: stub)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+    assert stub.free_calls == [0x1234]
+
+
+def test_reject_extended_acl_allow_rejects_unknown_tag_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ACL_EXTENDED_ALLOW`（1）・`ACL_EXTENDED_DENY`（2）のいずれでもない
+    タグ値（例: 0）は、想定外の戻り値として fail-closed（`output_conflict`）
+    とし、`acl_free` を必ず 1 回だけ呼ぶこと。"""
+    monkeypatch.setattr(contract.sys, "platform", "darwin")
+    stub = _FakeAclAllocation(fd_np_result=0x1234, entry_result=0, tag_type_value=0)
+    monkeypatch.setattr(contract, "_load_acl_functions", lambda: stub)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_extended_acl_allow(3)
+    assert exc_info.value.code == "output_conflict"
+    assert stub.free_calls == [0x1234]
 
 
 # --------------------------------------------------------------------------
