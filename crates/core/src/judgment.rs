@@ -4,11 +4,13 @@
 //! ときに stdout へ書く JSON 1 行の中身を表す。終了コード（`exitcode`
 //! モジュール）とは別モジュールに分けているのは、終了コード自体は 7 種の
 //! 状態を表す薄い型であるのに対し、判定結果は「どの選択肢が選ばれ、各選択
-//! 肢のスコアは何か」という値を持つ型で、検証すべき不変条件（選択肢数の
-//! 上限・選択肢 ID の実在性・スコアの件数と範囲と合計・`predicted_choice_id`
-//! が最高スコアの選択肢と一致すること）が exitcode モジュールとは別だから
-//! である（PR #202 レビュー指摘で選択肢数の上限・合計・argmax 一致の検証
-//! を追加）。
+//! 肢のスコアは何か」という値を持つ型で、検証すべき不変条件（選択肢数・
+//! 選択肢 ID の長さと合計長の上限・選択肢 ID の実在性・スコアの件数と範
+//! 囲と合計・`predicted_choice_id` が最高スコアの選択肢と厳密に一致する
+//! こと）が exitcode モジュールとは別だからである（PR #202 レビュー指摘
+//! で選択肢数の上限・合計・argmax 一致の検証を追加し、その後のレビュー
+//! 指摘で argmax 比較の許容差を除去し、選択肢 ID 長・合計長の上限検証を
+//! 追加）。
 //!
 //! # 呼び出し文脈
 //!
@@ -71,12 +73,22 @@ pub const MAX_INPUT_ID_BYTES: usize = 1024;
 /// し、二乗時間のアロケーション・検査を未検証の件数に対して行わない）。
 pub const MAX_OPTIONS: usize = 1024;
 
+/// 選択肢 ID 1 件あたりのバイト長上限（暫定値。REQ-39 資源の上限が正式に
+/// 決まり次第、値を見直す）。`Choice.id` は公開 `String` で
+/// `Definition::parse` も長さを制限しないため（PR #202 レビュー指摘・P0）、
+/// [`JudgmentResult::new`] が `pairs`／JSON `scores` へ複製する前にここで
+/// 長さを検証する。
+pub const MAX_CHOICE_ID_BYTES: usize = 256;
+
+/// 選択肢 ID 全体（`pairs`／JSON `scores` へ複製する対象）の合計バイト長
+/// 上限（暫定値。REQ-39 資源の上限）。`MAX_OPTIONS`・[`MAX_CHOICE_ID_BYTES`]
+/// のいずれか一方だけでも出力全体のサイズは間接的に上限がかかるが、将来
+/// どちらかの定数だけを緩めても出力サイズが際限なく増えないよう、合計値
+/// を独立した定数として明示的に検証する（PR #202 レビュー指摘・P0）。
+pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
+
 /// 確率の列として扱うスコア合計の許容差（[coding-rust](../../../.claude/rules/coding-rust.md)。1e-9）。
 const SCORE_SUM_TOLERANCE: f64 = 1e-9;
-
-/// 最高スコアの選択肢を選ぶ際のタイブレーク（同点扱い）許容差。
-/// スコアの合計検証と同じ 1e-9 を用いる（`SCORE_SUM_TOLERANCE` 参照）。
-const ARGMAX_TIE_TOLERANCE: f64 = 1e-9;
 
 /// 判定結果の状態。現状は `Ok`（正常終了）のみを持つ（REQ-21 正常系）。
 ///
@@ -103,6 +115,13 @@ pub enum JudgmentError {
     TooManyOptions { len: usize, limit: usize },
     /// 選択肢 ID が空文字列。
     EmptyChoiceId,
+    /// 選択肢 ID が [`MAX_CHOICE_ID_BYTES`] を超える（REQ-39 資源の上限）。
+    /// 入力本文と異なり ID 自体は識別子のため値を含めてよいが、上限超過
+    /// の値は巨大になりうるためエラーには含めない（長さのみを保持する）。
+    ChoiceIdTooLong { len: usize, limit: usize },
+    /// 選択肢 ID の合計バイト長が [`MAX_TOTAL_CHOICE_ID_BYTES`] を超える
+    /// （REQ-39 資源の上限）。
+    TotalChoiceIdBytesExceeded { len: usize, limit: usize },
     /// 選択肢 ID が重複している。
     DuplicateChoiceId { id: String },
     /// スコアの件数が選択肢の件数と一致しない。
@@ -138,6 +157,15 @@ impl fmt::Display for JudgmentError {
                 write!(f, "too many options: {len} (limit: {limit})")
             }
             JudgmentError::EmptyChoiceId => write!(f, "choice id must not be empty"),
+            JudgmentError::ChoiceIdTooLong { len, limit } => {
+                write!(f, "choice id too long: {len} bytes (limit: {limit})")
+            }
+            JudgmentError::TotalChoiceIdBytesExceeded { len, limit } => {
+                write!(
+                    f,
+                    "total choice id bytes too large: {len} bytes (limit: {limit})"
+                )
+            }
             JudgmentError::DuplicateChoiceId { id } => {
                 write!(f, "duplicate choice id: {id}")
             }
@@ -183,17 +211,19 @@ impl std::error::Error for JudgmentError {}
 
 impl JudgmentError {
     /// REQ-21 の終了コードへの写像。入力 ID の不正（利用者が直せる外部入
-    /// 力の誤り）は `InvalidInput`、選択肢数の上限超過（REQ-39 資源の上
-    /// 限）は `LimitExceeded`、それ以外（ランタイムが返すスコアと定義
-    /// ファイルの不整合等、呼び出し側のバグに近い状態）は `RuntimeError`
-    /// とする。
+    /// 力の誤り）は `InvalidInput`、選択肢数・選択肢 ID 長の上限超過
+    /// （REQ-39 資源の上限）は `LimitExceeded`、それ以外（ランタイムが返
+    /// すスコアと定義ファイルの不整合等、呼び出し側のバグに近い状態）は
+    /// `RuntimeError` とする。
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
             JudgmentError::EmptyInputId | JudgmentError::InputIdTooLong { .. } => {
                 ExitCode::InvalidInput
             }
-            JudgmentError::TooManyOptions { .. } => ExitCode::LimitExceeded,
+            JudgmentError::TooManyOptions { .. }
+            | JudgmentError::ChoiceIdTooLong { .. }
+            | JudgmentError::TotalChoiceIdBytesExceeded { .. } => ExitCode::LimitExceeded,
             _ => ExitCode::RuntimeError,
         }
     }
@@ -271,9 +301,28 @@ impl JudgmentResult {
         // 1 パスで追跡する。
         let mut best: Option<(&str, f64)> = None;
         let mut sum = 0.0_f64;
+        // 選択肢 ID の合計バイト長（REQ-39 資源の上限。`pairs`／JSON
+        // `scores` へ複製する前に検証する。PR #202 レビュー指摘・P0）。
+        let mut total_choice_id_bytes: usize = 0;
         for (choice, score) in options.iter().zip(scores.iter()) {
             if choice.id.is_empty() {
                 return Err(JudgmentError::EmptyChoiceId);
+            }
+            // 個々の選択肢 ID の長さ・合計長は、`seen_ids`／`pairs` へ複製
+            // する（アロケーションを伴う）前に検証する（coding-rust.md
+            // 「サイズ・件数を上限検証してからアロケーションに使う」）。
+            if choice.id.len() > MAX_CHOICE_ID_BYTES {
+                return Err(JudgmentError::ChoiceIdTooLong {
+                    len: choice.id.len(),
+                    limit: MAX_CHOICE_ID_BYTES,
+                });
+            }
+            total_choice_id_bytes += choice.id.len();
+            if total_choice_id_bytes > MAX_TOTAL_CHOICE_ID_BYTES {
+                return Err(JudgmentError::TotalChoiceIdBytesExceeded {
+                    len: total_choice_id_bytes,
+                    limit: MAX_TOTAL_CHOICE_ID_BYTES,
+                });
             }
             if !seen_ids.insert(choice.id.as_str()) {
                 return Err(JudgmentError::DuplicateChoiceId {
@@ -293,11 +342,17 @@ impl JudgmentResult {
             }
 
             sum += *score;
-            // 宣言順を優先するタイブレーク: 既存の最高スコアを許容差
-            // （`ARGMAX_TIE_TOLERANCE`）を超えて更新する場合のみ更新する。
+            // 宣言順を優先するタイブレーク: 既存の最高スコアを厳密に（許
+            // 容差なしで）上回る場合のみ更新する。許容差を挟むと
+            // `predicted_choice_id` と最高スコアの一致という API 契約が
+            // 破れる（例: 先頭 0.4999999997・次点 0.5000000003 のように
+            // 差が許容差 1e-9 以下でも後者が真の最高値である場合、許容差
+            // 比較では先頭が argmax のまま残ってしまう。PR #202 レビュー
+            // 指摘・P1）。スコアの合計検証（`SCORE_SUM_TOLERANCE`）とは
+            // 目的が異なるため、ここでは許容差を用いない。
             let is_new_best = match best {
                 None => true,
-                Some((_, best_score)) => *score - best_score > ARGMAX_TIE_TOLERANCE,
+                Some((_, best_score)) => *score > best_score,
             };
             if is_new_best {
                 best = Some((choice.id.as_str(), *score));
@@ -761,5 +816,75 @@ mod tests {
                 expected: "a".to_string()
             })
         );
+    }
+
+    /// REQ-21・PR #202 レビュー指摘（P1）: argmax の追跡は許容差なしの厳密
+    /// な大小比較で行う。差が `ARGMAX_TIE_TOLERANCE`（旧定数。許容差比較）
+    /// 未満でも、より高いスコアの選択肢を argmax として扱う（先頭
+    /// 0.4999999997・次点 0.5000000003 のように差が 1e-9 未満でも後者が
+    /// 真の最高値であるケース）。
+    #[test]
+    fn req21_argmax_uses_strict_comparison_not_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let scores = [0.499_999_999_7, 0.500_000_000_3];
+
+        // 真の最高スコアである "b" を予測すれば受理される。
+        assert!(JudgmentResult::new(&options, "row", "b", &scores).is_ok());
+
+        // 許容差比較の下では誤って argmax 扱いされていた "a" は拒否される。
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &scores),
+            Err(JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "a".to_string(),
+                expected: "b".to_string()
+            })
+        );
+    }
+
+    /// REQ-39・PR #202 レビュー指摘（P0）: 選択肢 ID の長さ境界値
+    /// （[`MAX_CHOICE_ID_BYTES`] は受理、それを 1 バイト超えると拒否）。
+    #[test]
+    fn req39_choice_id_length_boundary() {
+        let at_limit = "x".repeat(MAX_CHOICE_ID_BYTES);
+        let options = [choice(&at_limit)];
+        assert!(JudgmentResult::new(&options, "row", &at_limit, &[1.0]).is_ok());
+
+        let over_limit = "x".repeat(MAX_CHOICE_ID_BYTES + 1);
+        let options = [choice(&over_limit), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "b", &[0.0, 1.0]),
+            Err(JudgmentError::ChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            })
+        );
+    }
+
+    /// REQ-39・PR #202 レビュー指摘（P0）: 個々の選択肢 ID は
+    /// [`MAX_CHOICE_ID_BYTES`] 以下でも、選択肢 ID の合計バイト長が
+    /// [`MAX_TOTAL_CHOICE_ID_BYTES`] を超える場合は `pairs`／JSON
+    /// `scores` へ複製する前に拒否する（巨大な定義ファイルからの過大メモ
+    /// リ消費・出力を防ぐ。security.md「ガード層: 資源の上限」）。
+    #[test]
+    fn req39_rejects_total_choice_id_bytes_exceeding_limit() {
+        const ID_LEN: usize = 94;
+        // 94 バイトの ID を 700 件（合計 65,800 バイト）用意する。1 件あ
+        // たりは MAX_CHOICE_ID_BYTES（256）未満、件数も MAX_OPTIONS
+        // （1024）未満のため、それぞれの上限では拒否されない。
+        const COUNT: usize = 700;
+        const { assert!(ID_LEN < MAX_CHOICE_ID_BYTES) };
+        const { assert!(COUNT < MAX_OPTIONS) };
+        const { assert!(ID_LEN * COUNT > MAX_TOTAL_CHOICE_ID_BYTES) };
+
+        let options: Vec<Choice> = (0..COUNT)
+            .map(|i| choice(&format!("{i:0>width$}", width = ID_LEN)))
+            .collect();
+        let scores = vec![0.0_f64; options.len()];
+
+        let result = JudgmentResult::new(&options, "row", &options[0].id, &scores);
+        assert!(matches!(
+            result,
+            Err(JudgmentError::TotalChoiceIdBytesExceeded { limit, .. }) if limit == MAX_TOTAL_CHOICE_ID_BYTES
+        ));
     }
 }
