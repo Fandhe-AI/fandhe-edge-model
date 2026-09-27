@@ -161,3 +161,36 @@ def test_verify_output_rejects_missing_model_file(tmp_path: Path) -> None:
     finally:
         contract.cleanup_reservation(reservation)
         root_handle.close()
+
+
+def test_verify_output_caps_bytes_read_even_if_model_grows_after_fstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39（資源の上限）: `fstat` のサイズ検査の後に `model.onnx` が伸長された
+    場合でも、実際の読み取り量を上限で打ち切り `integrity_check_failed` とする。
+
+    上限を 16 バイトに下げ、`fstat` が検査時点の小さいサイズ（8 バイト）を返す
+    ように差し替えて「検査後の伸長」を決定的に再現する。
+    """
+    monkeypatch.setattr(artifact, "_ONNX_READ_CAP_BYTES", 16)
+    root_handle, reservation = _make_reservation(tmp_path)
+    try:
+        _write_model_and_artifact(reservation.tmp_fd, b"x" * 32, onnx_sha256=None)
+        real_fstat = os.fstat
+
+        def _fstat_reporting_small_size(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            fields = list(st)
+            fields[6] = 8  # st_size（伸長前のサイズを装う）
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(artifact.os, "fstat", _fstat_reporting_small_size)
+        with pytest.raises(WorkerError) as exc_info:
+            artifact.verify_output(reservation.tmp_fd)
+        monkeypatch.undo()
+        assert exc_info.value.code == "integrity_check_failed"
+        assert exc_info.value.exit_code == ExitCode.RUNTIME_ERROR
+        assert "exceeds 16 bytes" in exc_info.value.message
+    finally:
+        reservation.entry.close()
+        root_handle.close()

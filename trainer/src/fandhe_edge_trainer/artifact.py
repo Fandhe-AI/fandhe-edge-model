@@ -171,12 +171,19 @@ def _sha256_of_onnx_via_fd(dir_fd: int) -> str:
         if st.st_size > _ONNX_READ_CAP_BYTES:
             raise _integrity_error(f"model.onnx exceeds {_ONNX_READ_CAP_BYTES} bytes")
         hasher = hashlib.sha256()
+        total = 0
         with os.fdopen(fd, "rb") as f:
             fd = -1  # fdopen が所有権を持つ（with 終了時に閉じる）。二重クローズを避ける。
             while True:
-                chunk = f.read(1024 * 1024)
+                # fstat 後にファイルが伸長されうる（TOCTOU）ため、実際の読み取り量も
+                # 上限で縛る。上限 +1 バイトまで読めた時点で超過として拒否する
+                # （REQ-39 ガード層: 資源の上限）。
+                chunk = f.read(min(1024 * 1024, _ONNX_READ_CAP_BYTES + 1 - total))
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > _ONNX_READ_CAP_BYTES:
+                    raise _integrity_error(f"model.onnx exceeds {_ONNX_READ_CAP_BYTES} bytes")
                 hasher.update(chunk)
         return hasher.hexdigest()
     finally:
