@@ -58,7 +58,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | 対象 | パス | 調査 | 作成・編集 |
 | ---- | ---- | ---- | ---------- |
 | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） | explorer | core-builder |
-| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | 未確定 | explorer | data-builder |
+| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`） | explorer | data-builder |
 | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python） | explorer | trainer-builder |
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | 未確定 | explorer | evaluator-builder |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 | explorer | runtime-builder |
