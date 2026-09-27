@@ -256,7 +256,6 @@ impl std::fmt::Display for JsonType {
 /// `Definition::parse` からも到達する。同レビュー指摘）を先行実装する。
 /// これ以外の必須項目欠落等の詳細な検証バリアントは TASK-15.3-2 が追加し、
 /// `missing_labels` 相当の判定は TASK-15.4 が追加する（`#[non_exhaustive]`）。
-#[derive(Debug)]
 #[non_exhaustive]
 pub enum DefinitionError {
     Read {
@@ -307,9 +306,11 @@ pub enum DefinitionError {
     },
     /// 定義ファイルのスキーマが許可しない未知のキーを含む（TASK-15.3-2）。
     /// `name`（利用者が任意に指定できるキー名）は秘密情報やデータ本文を
-    /// 含みうるため `Display` には一切出さず、親フィールドのパスと
-    /// `reason_code()`（`unknown_field`）のみで表す
-    /// （security.md「秘密情報の混入防止」。PR #197 レビュー指摘）。
+    /// 含みうるため `Display` にも `Debug`（`{:?}` によるログ出力を含む）
+    /// にも一切出さず、親フィールドのパスと `reason_code()`（`unknown_field`）
+    /// のみで表す（security.md「秘密情報の混入防止」。PR #197 レビュー指摘。
+    /// `DefinitionError` は `#[derive(Debug)]` を使わず本ファイル末尾で
+    /// `Debug` を手書き実装し、`name` を redacted 表示に固定している）。
     /// `name` はプログラム的な照合（テスト・診断）のためにのみ保持する。
     UnknownField { parent: FieldPath, name: String },
     /// フィールドは正しい型だが、許可された値の集合に含まれない
@@ -380,6 +381,72 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::EmptyName => {
                 write!(f, "definition name must not be empty")
             }
+        }
+    }
+}
+
+/// `Debug`（`{:?}`）を手書きする。`#[derive(Debug)]` は `UnknownField.name`
+/// （利用者が任意に指定できる未知キー名。秘密情報やデータ本文を含みうる）を
+/// そのまま出力してしまい、`Display` 側でキー名を伏せていてもログ等で
+/// 露出しうる（security.md「秘密情報の混入防止」。PR #197 レビュー指摘）。
+/// 他のバリアントは `derive(Debug)` と同等の出力形式にし、`UnknownField` の
+/// `name` だけ固定の redacted 表示に置き換える。
+impl std::fmt::Debug for DefinitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefinitionError::Read { path, source } => f
+                .debug_struct("Read")
+                .field("path", path)
+                .field("source", source)
+                .finish(),
+            DefinitionError::TooLarge { path, size, limit } => f
+                .debug_struct("TooLarge")
+                .field("path", path)
+                .field("size", size)
+                .field("limit", limit)
+                .finish(),
+            DefinitionError::Parse { source } => {
+                f.debug_struct("Parse").field("source", source).finish()
+            }
+            DefinitionError::UnsupportedSchema { schema } => f
+                .debug_struct("UnsupportedSchema")
+                .field("schema", schema)
+                .finish(),
+            DefinitionError::EmptyOptions => f.write_str("EmptyOptions"),
+            DefinitionError::EmptyOptionId => f.write_str("EmptyOptionId"),
+            DefinitionError::DuplicateOptionId { id } => {
+                f.debug_struct("DuplicateOptionId").field("id", id).finish()
+            }
+            DefinitionError::NotRegularFile { path } => f
+                .debug_struct("NotRegularFile")
+                .field("path", path)
+                .finish(),
+            DefinitionError::MissingField { field } => f
+                .debug_struct("MissingField")
+                .field("field", field)
+                .finish(),
+            DefinitionError::TypeMismatch {
+                field,
+                expected,
+                actual,
+            } => f
+                .debug_struct("TypeMismatch")
+                .field("field", field)
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            DefinitionError::UnknownField { parent, name: _ } => f
+                .debug_struct("UnknownField")
+                .field("parent", parent)
+                // `name` は秘密情報・データ本文を含みうるため常に redacted 表示に
+                // 固定する（実際の値は保持しているが Debug には出さない）。
+                .field("name", &"<redacted>")
+                .finish(),
+            DefinitionError::UnsupportedValue { field } => f
+                .debug_struct("UnsupportedValue")
+                .field("field", field)
+                .finish(),
+            DefinitionError::EmptyName => f.write_str("EmptyName"),
         }
     }
 }
@@ -1242,6 +1309,22 @@ mod tests {
         assert!(matches!(err, DefinitionError::UnknownField { .. }));
         assert!(!err.to_string().contains("s3cr3t-api-key-should-not-leak"));
         assert_eq!(err.reason_code(), "unknown_field");
+    }
+
+    /// PR #197 レビュー指摘（P0・codex/review 再指摘）: `Display` だけでなく
+    /// `{:?}`（`Debug`）でも未知キー名を出さないことを確認する。
+    /// `DefinitionError` は `#[derive(Debug)]` を使わず手書きの `Debug` 実装
+    /// （本ファイルの `impl std::fmt::Debug for DefinitionError`）を持つため、
+    /// ログ等が誤って `{:?}` でエラーを出力してもキー名は露出しない。
+    #[test]
+    fn req15_debug_does_not_leak_unknown_field_name() {
+        let mut value = valid_definition_value();
+        value["s3cr3t-api-key-should-not-leak"] = serde_json::json!(1);
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::UnknownField { .. }));
+        let debug_output = format!("{err:?}");
+        assert!(!debug_output.contains("s3cr3t-api-key-should-not-leak"));
+        assert!(debug_output.contains("<redacted>"));
     }
 
     #[test]
