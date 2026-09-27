@@ -37,9 +37,9 @@ fn req15_load_reads_definition_file_from_disk() {
     std::fs::remove_file(&path).expect("一時ファイルを削除できるはず");
 
     let def = result.expect("ファイルから正常にパースできるはず");
-    assert_eq!(def.options.len(), 2);
-    assert_eq!(def.options[0].id, "yes");
-    assert_eq!(def.options[1].id, "no");
+    assert_eq!(def.options().len(), 2);
+    assert_eq!(def.options()[0].id, "yes");
+    assert_eq!(def.options()[1].id, "no");
 }
 
 #[test]

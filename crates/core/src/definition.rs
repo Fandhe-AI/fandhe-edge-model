@@ -83,14 +83,22 @@ pub struct IoSchema {
 /// PoC-9 追補 A-10（`docs/spec/03-poc/evaluation-contract/README.md`）により、
 /// 下限基準（majority）のタイブレークはラベル定義の宣言順で解決するため、
 /// 順序の破壊は評価契約に影響する。
+///
+/// フィールドは非公開にしている。全フィールドが `pub` だと、別 crate が
+/// `schema` の不一致・空や重複した `options` を持つ値を `Definition { .. }`
+/// で直接構築でき、`parse`/`load` が行うガード層の検証（`schema` 照合・
+/// 選択肢の整合性・サイズ上限）を丸ごと迂回できてしまう（security.md
+/// 「ガード層の迂回」。PR #187 レビュー指摘）。検証済みの値を作る経路は
+/// `parse`（`load` も内部で `parse` を呼ぶ）に限定し、値の参照は下記の
+/// 読み取り専用アクセサ経由に限る（フィールドへの代入による事後改変も防ぐ）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Definition {
-    pub schema: String,
-    pub name: String,
-    pub version: u32,
-    pub judgment_type: JudgmentType,
-    pub options: Vec<Choice>,
-    pub io: IoSchema,
+    schema: String,
+    name: String,
+    version: u32,
+    judgment_type: JudgmentType,
+    options: Vec<Choice>,
+    io: IoSchema,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -373,6 +381,41 @@ impl Definition {
                 path: path.to_path_buf(),
                 source,
             })
+    }
+
+    /// 検証済みの `schema` フィールドを返す（`SCHEMA_ID` と一致することが
+    /// `parse` により保証済み）。フィールドが非公開のため、値の参照は
+    /// このアクセサ経由に限る（上記 `Definition` のドキュメンテーション
+    /// コメントを参照）。
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// カタログ上のドキュメントバージョン（`name` と並ぶメタ情報。
+    /// `schema`/`SCHEMA_ID` とは独立で、形式・版の識別には使わない）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// カタログ上のドキュメントバージョン番号。
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// 判定型（REQ-15 時点では `SingleSelect` のみ）。
+    pub fn judgment_type(&self) -> JudgmentType {
+        self.judgment_type
+    }
+
+    /// 検証済みの選択肢一覧（空でない・`id` が非空かつ重複しないことが
+    /// `parse` により保証済み。宣言順を保持）。
+    pub fn options(&self) -> &[Choice] {
+        &self.options
+    }
+
+    /// 入出力のデータ構造。
+    pub fn io(&self) -> &IoSchema {
+        &self.io
     }
 
     /// `load` の内部専用: Linux・macOS 以外（Windows 等）向けのフォールバック。
