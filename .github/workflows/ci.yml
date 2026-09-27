@@ -1,23 +1,13 @@
 name: CI
 
-# 準備が整うまで発火条件を無効化している（手動実行のみのプレースホルダ）。
-# 有効化時はこの on: を削除し、下のコメントアウトした on: ブロックを戻す。
-# 有効化前に必要な作業: workspace（Cargo.toml）とメンバー crate の作成、および
-# rust-ci の deny-checks が参照する deny.toml の追加（未作成のまま有効化すると
-# rust-ci / rust-ci-default-features が「対象パッケージが無い」エラーで毎回 fail する）。
-# lint-docs が参照する設定ファイル（.markdownlint.jsonc 等）・3 OS matrix
-# （ubuntu / macos / windows）・cache-key-prefix のリポ名化は
-# Fandhe-AI/fandhe-container の ci.yml から取り込み済み。
-# 有効化後は ruleset（branch protection）の必須チェックへ `ci-complete` 1 件を
-# 登録する（下の ci-complete ジョブのコメントを参照）
+# 手動実行（workflow_dispatch）・PR（pull_request）・main への push（push）で発火する。
+# 必須チェックは集約ジョブ `ci-complete` 1 件に集約し、ruleset（branch protection）の
+# 必須チェックへ登録済み（下の ci-complete ジョブのコメントを参照）。
 on:
   workflow_dispatch:
-
-# on:
-#   workflow_dispatch:
-#   pull_request:
-#   push:
-#     branches: [main]
+  pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -46,10 +36,11 @@ jobs:
   # OS ごとに別名のチェックが生成され、そのままでは branch protection の必須チェック
   # 一覧を OS 追加のたびに更新する必要がある。本 workflow 内の集約ジョブ
   # `ci-complete`（下部）が lint-docs・rust-ci・rust-ci-default-features の結果を
-  # まとめて fail-closed 判定するため、有効化後は ruleset（branch protection）の
-  # 必須チェックに `ci-complete` 1 件だけを登録する（現状は workflow_dispatch のみで
-  # PR に報告されないため、今は必須化しない。報告されない必須チェックを登録すると
-  # マージが永久にブロックされる）。
+  # まとめて fail-closed 判定するため、ruleset（branch protection）の
+  # 必須チェックには `ci-complete` 1 件だけを登録済み。ジョブ名（`ci-complete`）を
+  # 改名すると必須チェックが PR に報告されずマージが永久にブロックされるため、
+  # 改名する場合は先に ruleset 側の必須チェック名を更新してからこの workflow を
+  # 変更すること。
   lint-docs:
     # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
     # 参照する（組織現行標準）
@@ -91,7 +82,7 @@ jobs:
       # （public リポジトリの GitHub ホステッド runner 方針は維持）
       runner-label: ${{ matrix.os }}
       # make deny（Makefile の deny ターゲット）と同一のチェック集合。
-      # licenses チェックは deny.toml の [licenses] を参照する（deny.toml は未追加）
+      # licenses チェックは deny.toml の [licenses] を参照する
       deny-checks: advisories bans licenses sources
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
       # key は `**/Cargo.lock` のハッシュに加え `runner.os` を含む形で reusable
