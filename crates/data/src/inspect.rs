@@ -68,6 +68,13 @@ pub enum AnomalyCode {
         expected: &'static str,
         actual: &'static str,
     },
+    /// 文字列フィールドが空文字列（`""`）だった（`id`・`input`・`group_id`
+    /// （存在する場合）が対象。空文字列は分割・ハッシュ・突き合わせの
+    /// キーとして機能しないため、型は正しくても不正な値として扱う。
+    /// 空文字列の `id` はこのレコード自体を無効にする（`valid_records` から
+    /// 除外し、`id` の重複検出（[`AnomalyCode::DuplicateId`]）の対象にも
+    /// しない。空 `id` はそもそも突き合わせのキーになり得ないため）。
+    EmptyValue,
     /// `output.intent` が有効なラベル ID 集合に含まれない。
     /// 未知のラベル値そのものは保持しない（上記モジュール doc「セキュリティ上の
     /// 注意」参照）。位置特定は [`RecordAnomaly::line`]・[`RecordAnomaly::field`]
@@ -94,6 +101,7 @@ impl AnomalyCode {
             AnomalyCode::MalformedRecord => "malformed_record",
             AnomalyCode::MissingField => "missing_field",
             AnomalyCode::TypeMismatch { .. } => "type_mismatch",
+            AnomalyCode::EmptyValue => "empty_value",
             AnomalyCode::UnknownLabel => "unknown_label",
             AnomalyCode::DuplicateId { .. } => "duplicate_id",
             AnomalyCode::DuplicateKey => "duplicate_key",
@@ -217,8 +225,12 @@ fn count_tree_entries(value: &Value) -> usize {
 ///   複数回出現していた場合は [`AnomalyCode::DuplicateKey`] を記録し、
 ///   その行は個々のフィールド検査を行わずに次の行へ進む（モジュール doc
 ///   「重複 JSON キーの検出」参照。REQ-16）
+/// - `id`・`input`・`group_id`（存在する場合）が空文字列（`""`）の場合は
+///   [`AnomalyCode::EmptyValue`] を記録する。空文字列の `id` はそもそも
+///   突き合わせのキーになり得ないため、[`AnomalyCode::DuplicateId`] の
+///   判定対象（後述）にもしない
 /// - 1 レコードにつき複数の異常をまとめて報告する（先頭の異常で打ち切らない）
-/// - 同一 `id` が複数行に現れた場合、2 回目以降の出現に
+/// - 同一 `id`（空文字列を除く）が複数行に現れた場合、2 回目以降の出現に
 ///   [`AnomalyCode::DuplicateId`] を記録し、その行は `valid_records` から
 ///   除外する（`id` は分割・ハッシュ・突き合わせのキーであり、
 ///   `valid_records` 内で一意であることを保証する）。初出の行は他に
@@ -292,6 +304,15 @@ pub fn inspect_records(
                 None
             }
             Some(v) => match v.as_str() {
+                Some("") => {
+                    anomalies.push(RecordAnomaly {
+                        line,
+                        field: "id",
+                        code: AnomalyCode::EmptyValue,
+                    });
+                    record_has_error = true;
+                    None
+                }
                 Some(s) => Some(s.to_string()),
                 None => {
                     anomalies.push(RecordAnomaly {
@@ -320,6 +341,15 @@ pub fn inspect_records(
                 None
             }
             Some(v) => match v.as_str() {
+                Some("") => {
+                    anomalies.push(RecordAnomaly {
+                        line,
+                        field: "input",
+                        code: AnomalyCode::EmptyValue,
+                    });
+                    record_has_error = true;
+                    None
+                }
                 Some(s) => Some(s.to_string()),
                 None => {
                     anomalies.push(RecordAnomaly {
@@ -448,6 +478,15 @@ pub fn inspect_records(
         let group_id_opt: Option<String> = match record.get("group_id") {
             None => None,
             Some(v) => match v.as_str() {
+                Some("") => {
+                    anomalies.push(RecordAnomaly {
+                        line,
+                        field: "group_id",
+                        code: AnomalyCode::EmptyValue,
+                    });
+                    record_has_error = true;
+                    None
+                }
                 Some(s) => Some(s.to_string()),
                 None => {
                     anomalies.push(RecordAnomaly {
@@ -946,12 +985,95 @@ mod tests {
             .code(),
             "type_mismatch"
         );
+        assert_eq!(AnomalyCode::EmptyValue.code(), "empty_value");
         assert_eq!(AnomalyCode::UnknownLabel.code(), "unknown_label");
         assert_eq!(
             AnomalyCode::DuplicateId { first_line: 1 }.code(),
             "duplicate_id"
         );
         assert_eq!(AnomalyCode::DuplicateKey.code(), "duplicate_key");
+    }
+
+    /// REQ-16・TASK-16.1-1: `id`・`input`・`group_id` が空文字列の場合は
+    /// それぞれ `EmptyValue` として検出され、`valid_records` から除外される。
+    #[test]
+    fn empty_id_input_group_id_are_reported() {
+        let valid = labels(&["ok"]);
+
+        let id_outcome = inspect_records(
+            "{\"id\":\"\",\"input\":\"x\",\"output\":{\"intent\":\"ok\"}}",
+            &valid,
+        )
+        .unwrap();
+        assert_eq!(
+            id_outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "id",
+                code: AnomalyCode::EmptyValue,
+            }]
+        );
+        assert!(id_outcome.valid_records.is_empty());
+
+        let input_outcome = inspect_records(
+            "{\"id\":\"r1\",\"input\":\"\",\"output\":{\"intent\":\"ok\"}}",
+            &valid,
+        )
+        .unwrap();
+        assert_eq!(
+            input_outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "input",
+                code: AnomalyCode::EmptyValue,
+            }]
+        );
+        assert!(input_outcome.valid_records.is_empty());
+
+        let group_id_outcome = inspect_records(
+            "{\"id\":\"r1\",\"input\":\"x\",\"output\":{\"intent\":\"ok\"},\"group_id\":\"\"}",
+            &valid,
+        )
+        .unwrap();
+        assert_eq!(
+            group_id_outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "group_id",
+                code: AnomalyCode::EmptyValue,
+            }]
+        );
+        assert!(group_id_outcome.valid_records.is_empty());
+    }
+
+    /// REQ-16・TASK-16.1-1: 空文字列の `id` は突き合わせのキーになり得ないため、
+    /// 複数行に現れても `DuplicateId` にはせず、行ごとに独立して `EmptyValue`
+    /// を報告する（挙動節の規則そのものの確認）。
+    #[test]
+    fn empty_id_across_multiple_lines_is_not_duplicate_id() {
+        let content = "\
+{\"id\":\"\",\"input\":\"a\",\"output\":{\"intent\":\"ok\"}}
+{\"id\":\"\",\"input\":\"b\",\"output\":{\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![
+                RecordAnomaly {
+                    line: 1,
+                    field: "id",
+                    code: AnomalyCode::EmptyValue,
+                },
+                RecordAnomaly {
+                    line: 2,
+                    field: "id",
+                    code: AnomalyCode::EmptyValue,
+                },
+            ]
+        );
+        assert!(outcome.valid_records.is_empty());
     }
 
     /// P1 修正の回帰確認（レビュー指摘。PR #191）: トップレベルの `id` が
