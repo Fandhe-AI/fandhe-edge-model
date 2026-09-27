@@ -5,7 +5,7 @@
 # 深い階層（`crates/foo/bar`）には crate を置かない。
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/data"]
 
 [workspace.package]
 edition = "2024"
@@ -22,6 +22,7 @@ publish = false
 # workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
 # 外部の共通依存は現時点で承認済みのものが無い。
 fandhe-edge-core = { path = "crates/core" }
+fandhe-edge-data = { path = "crates/data" }
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で

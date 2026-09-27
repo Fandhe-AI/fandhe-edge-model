@@ -1,0 +1,11 @@
+[package]
+name = "fandhe-edge-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Data contract layer (record inspection, group-wise split and freeze, provenance) for fandhe-edge-model."
+
+[lints]
+workspace = true

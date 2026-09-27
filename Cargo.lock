@@ -12,3 +12,7 @@ dependencies = [
 [[package]]
 name = "fandhe-edge-core"
 version = "0.1.0"
+
+[[package]]
+name = "fandhe-edge-data"
+version = "0.1.0"
