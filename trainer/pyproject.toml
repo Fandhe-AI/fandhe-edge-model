@@ -13,10 +13,9 @@
 # safetensors パッケージは未承認のため追加していない。
 #
 # 推移的依存とライセンス（`uv.lock` 解決結果。importlib.metadata で確認。すべて
-# permissive ライセンスだが、typing_extensions の PSF-2.0・numpy が同梱する
-# 0BSD/CC0-1.0 コンポーネントは licensing.md の許可リスト（MIT/Apache-2.0/BSD/
-# ISC/Unlicense/Zlib 等）に文字どおりには列挙されていないため、オーナーによる
-# 明示的な許容確認が未了である点を記録する）:
+# permissive ライセンス。typing_extensions の PSF-2.0・numpy が同梱する
+# 0BSD/CC0-1.0 は 2026-09-27 のオーナー判断で licensing.md・deny.toml の
+# 許可リストへ追加済み）:
 #   - mlx==0.32.2: MIT
 #   - mlx-metal==0.32.2（mlx の推移的依存。macOS arm64 専用の Metal 実装。
 #     推論ランタイムには持ち込まない。REQ-32）: MIT

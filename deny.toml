@@ -40,6 +40,11 @@ allow = [
   "Zlib",
   "Unicode-3.0",
   "Unlicense",
+  # 2026-09-27 オーナー判断で追加（学習ワーカーの numpy・typing_extensions 由来。
+  # いずれも permissive。.claude/rules/licensing.md と同期する）
+  "0BSD",
+  "CC0-1.0",
+  "PSF-2.0",
 ]
 # allow・[licenses.exceptions] へ識別子を追加する際は、SPDX 識別子の機械判定だけに
 # 頼らず、対象クレートのライセンス文言（LICENSE ファイル・Cargo.toml license 欄）を
