@@ -3,7 +3,7 @@
 //! [`crate::inspect::inspect_records`] から呼ばれ、検査を通過した
 //! [`crate::inspect::ValidRecord`] の列とその時点で使ったラベル ID 集合から
 //! [`InspectReport`] を組み立てる。集計対象・呼び出し元は
-//! [`crate::inspect`] のモジュール doc・[`InspectOutcome::report`] を参照。
+//! [`crate::inspect`] のモジュール doc・[`crate::inspect::InspectOutcome::report`] を参照。
 //!
 //! # PoC-9 との差異（実装済みを装わない）
 //!
@@ -71,17 +71,19 @@ pub struct InspectReport {
 
 /// 検査を通過したレコード列からレポートを組み立てる。
 ///
-/// `total_rows`・`anomalous_rows` は呼び出し元（[`crate::inspect::inspect_records`]）
-/// が検査ループ中に数えた値をそのまま受け取る（1 行が複数の異常を出す・
-/// 空行は数えないため、`valid_records` や異常一覧の長さだけからは
-/// 復元できない。crate 内部関数のため `pub(crate)` とする）。
+/// `total_rows`（空行を除く行数）は呼び出し元（[`crate::inspect::inspect_records`]）
+/// が検査ループ中に数えた値をそのまま受け取る。`anomalous_rows`（1 件以上の
+/// 異常を出した行数）はここでは受け取らず、`total_rows - valid_records.len()`
+/// から導出する。非空行は検査ループの末尾で必ず「`valid_records` に残る
+/// （異常 0 件）」か「1 件以上の異常を出す」のいずれか一方に分類される
+/// （[`crate::inspect::inspect_records`] の実装上の不変条件）ため、この引き算で
+/// 過不足なく求まる（1 行が複数の異常を出しても行数としては 1 回だけ数える）。
 ///
 /// `valid_label_ids` は空でないことを呼び出し元が保証する
 /// （[`crate::inspect::inspect_records`] は空集合を [`crate::inspect::EmptyLabelSet`]
-/// として検査前に拒否する）。
+/// として検査前に拒否する）。crate 内部関数のため `pub(crate)` とする。
 pub(crate) fn summarize(
     total_rows: usize,
-    anomalous_rows: usize,
     valid_records: &[ValidRecord],
     valid_label_ids: &BTreeSet<String>,
 ) -> InspectReport {
@@ -111,6 +113,11 @@ pub(crate) fn summarize(
     // その保証が崩れた場合の安全側フォールバックであり、外部入力の
     // 経路で panic させないための措置（`.claude/rules/coding-rust.md`）。
     let min_label_count = label_counts.values().copied().min().unwrap_or(0);
+
+    // 不変条件（本関数 doc 参照）による導出。万一の前提崩れ（総行数を
+    // 下回るはずの妥当行数がそれを上回る等）でも panic させず `0` に倒す
+    // （`.claude/rules/coding-rust.md`）。
+    let anomalous_rows = total_rows.saturating_sub(valid_records.len());
 
     InspectReport {
         total_rows,
@@ -153,7 +160,7 @@ mod tests {
             record(3, "in3", "b"),
         ];
 
-        let report = summarize(3, 0, &records, &valid_label_ids);
+        let report = summarize(3, &records, &valid_label_ids);
 
         let mut expected = BTreeMap::new();
         expected.insert("a".to_string(), 2);
@@ -175,7 +182,7 @@ mod tests {
         let valid_label_ids = labels(&["a"]);
         let records = vec![record(1, "same", "a"), record(2, "same", "a")];
 
-        let report = summarize(2, 0, &records, &valid_label_ids);
+        let report = summarize(2, &records, &valid_label_ids);
 
         assert_eq!(report.unique_inputs, 1);
         assert_eq!(report.valid_rows, 2);

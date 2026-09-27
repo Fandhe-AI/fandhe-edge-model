@@ -70,6 +70,36 @@ fn req16_blank_and_anomalous_lines_are_counted_in_total_rows_only() {
     );
 }
 
+/// `MalformedJson`・`DuplicateKey` はいずれも検査ループの早期 `continue` 経路
+/// （`anomalous_rows` 導出元である `total_rows - valid_records.len()` が
+/// 数える対象）だが、通常の `MissingField` 等とは異なる分岐であるため
+/// それぞれ単独で `anomalous_rows` に反映されることを確認する。
+#[test]
+fn req16_malformed_json_and_duplicate_key_rows_count_as_anomalous_rows() {
+    let malformed_json = "{not json}\n\
+{\"id\":\"r1\",\"input\":\"in1\",\"output\":{\"intent\":\"ok\"}}";
+    let labels = valid_label_ids(&["ok"]);
+
+    let outcome = inspect_records(malformed_json, &labels).expect("有効なラベル集合");
+    assert_eq!(outcome.report.total_rows, 2);
+    assert_eq!(outcome.report.valid_rows, 1);
+    assert_eq!(
+        outcome.report.anomalous_rows, 1,
+        "MalformedJson の 1 行のみ異常"
+    );
+
+    let duplicate_key = "{\"id\":\"r1\",\"id\":\"r1\",\"input\":\"in1\",\"output\":{\"intent\":\"ok\"}}\n\
+{\"id\":\"r2\",\"input\":\"in2\",\"output\":{\"intent\":\"ok\"}}";
+
+    let outcome = inspect_records(duplicate_key, &labels).expect("有効なラベル集合");
+    assert_eq!(outcome.report.total_rows, 2);
+    assert_eq!(outcome.report.valid_rows, 1);
+    assert_eq!(
+        outcome.report.anomalous_rows, 1,
+        "DuplicateKey の 1 行のみ異常"
+    );
+}
+
 /// 異なる `id` で同一 `input` を持つ 2 行は異常として扱わず（重複入力検出は
 /// TASK-16.2 の範囲）、`unique_inputs` のみが減ること。
 #[test]

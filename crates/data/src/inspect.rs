@@ -256,12 +256,14 @@ pub fn inspect_records(
     let mut valid_records = Vec::new();
     // id の初出行を記録する。並列化されないため BTreeMap で決定的な順序を保つ。
     let mut seen_ids: BTreeMap<String, usize> = BTreeMap::new();
-    // 件数集計（TASK-16.1-2）向け。空行を除く行数と、1 件以上の異常を出した
-    // 行の数（異常の件数ではなく行数）をループ内で数える。1 行が複数の異常を
-    // 出し、かつ空行は `continue` で読み飛ばすため、`anomalies.len()` と
-    // `valid_records.len()` からは事後に復元できない（[`crate::report`] 参照）。
+    // 件数集計（TASK-16.1-2）向け。空行を除く行数をループ内で数える。
+    // 「1 件以上の異常を出した行の数」（`InspectReport::anomalous_rows`）は
+    // ここでは数えない。非空行は本ループの末尾で必ず `valid_records` に残る
+    // （異常 0 件）か 1 件以上の異常を出すかのいずれか一方に分類されるため、
+    // `total_rows - valid_records.len()` として [`crate::report::summarize`]
+    // 側で導出できる（1 行が複数の異常を出しても行数としては 1 回だけ数える
+    // 導出になる）。
     let mut total_rows = 0usize;
-    let mut anomalous_rows = 0usize;
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line = idx + 1;
@@ -269,9 +271,6 @@ pub fn inspect_records(
             continue;
         }
         total_rows += 1;
-        // この行の処理開始時点の異常件数。行末で比較し、1 件でも増えていれば
-        // この行を「異常を出した行」として 1 回だけ数える。
-        let anomalies_before_this_line = anomalies.len();
 
         let value: Value = match serde_json::from_str(raw_line) {
             Ok(value) => value,
@@ -281,7 +280,6 @@ pub fn inspect_records(
                     field: "<record>",
                     code: AnomalyCode::MalformedJson,
                 });
-                anomalous_rows += 1;
                 continue;
             }
         };
@@ -292,7 +290,6 @@ pub fn inspect_records(
                 field: "<record>",
                 code: AnomalyCode::MalformedRecord,
             });
-            anomalous_rows += 1;
             continue;
         };
 
@@ -306,7 +303,6 @@ pub fn inspect_records(
                 field: "<record>",
                 code: AnomalyCode::DuplicateKey,
             });
-            anomalous_rows += 1;
             continue;
         }
 
@@ -563,17 +559,9 @@ pub fn inspect_records(
                 group_id: group_id_opt,
             });
         }
-
-        // フィールド検査（id・input・output・tags・group_id・重複 id）で
-        // 1 件以上の異常が積まれていれば、この行を「異常を出した行」として
-        // 1 回だけ数える（`MalformedJson`・`MalformedRecord`・`DuplicateKey` は
-        // 上の早期 `continue` 側で既に数えているため、ここには到達しない）。
-        if anomalies.len() != anomalies_before_this_line {
-            anomalous_rows += 1;
-        }
     }
 
-    let report = report::summarize(total_rows, anomalous_rows, &valid_records, valid_label_ids);
+    let report = report::summarize(total_rows, &valid_records, valid_label_ids);
 
     Ok(InspectOutcome {
         anomalies,
