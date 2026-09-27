@@ -21,9 +21,10 @@ publish = false
 # 推論ランタイム側の crate に学習側の依存（Python 呼び出し・MLX 等）を持ち込まない（REQ-32）。
 # workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
 # 外部の共通依存（2026-09-27 オーナー承認済み。.claude/rules/dependency-policy.md
-# 「承認済みの依存（Rust）」表を参照）。
+# 「承認済みの依存（Rust）」表を参照）。serde_json は承認済みだが本 workspace の
+# どの crate からも未使用のため、実際に必要になった TASK（TASK-15.3〜15.5 等）で
+# 追加する（依存最小方針。.claude/rules/dependency-policy.md）。
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
 sha2 = "=0.11.0"
 fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
