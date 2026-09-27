@@ -45,14 +45,18 @@ impl Drop for TempDirGuard {
 
 /// REQ-17 正常系（具体値）: 固定フィクスチャを凍結すると、事前計算済みの
 /// sha256 具体値・ファイルサイズと一致する `FreezeRecord` が返る。
+/// `root` はフィクスチャの親ディレクトリ、`path` はそこからの相対パスとして渡す
+/// （REQ-39 経路の閉じ込め。`root` 配下であることを検証してから開く）。
 #[test]
 fn freeze_eval_data_returns_frozen_with_known_hash_for_fixture() {
     // リポジトリルートからの相対パス（`cargo test` は crate ディレクトリを
     // カレントにするため、CARGO_MANIFEST_DIR 経由でリポジトリルートへ辿る）。
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/data/eval_freeze/sample.jsonl");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/data/eval_freeze");
+    let relative = Path::new("sample.jsonl");
+    let canonical_fixture =
+        std::fs::canonicalize(root.join(relative)).expect("fixture must exist and canonicalize");
 
-    let status = freeze_eval_data(Some(&fixture)).expect("fixture must freeze successfully");
+    let status = freeze_eval_data(&root, Some(relative)).expect("fixture must freeze successfully");
 
     match status {
         EvalDataStatus::Frozen(record) => {
@@ -61,7 +65,9 @@ fn freeze_eval_data_returns_frozen_with_known_hash_for_fixture() {
                 "c7fd9e6fd863a5de11eef802552013905ba7ce328e22c8f5fcd03c456dfb45a2"
             );
             assert_eq!(record.byte_len, 66);
-            assert_eq!(record.path, fixture);
+            // 記録されるのは正規化後の実体パス（経路の閉じ込め検証の結果）であり、
+            // 呼び出し元が渡した相対パスそのものではない。
+            assert_eq!(record.path, canonical_fixture);
         }
         EvalDataStatus::NotProvided => panic!("expected Frozen, got NotProvided"),
         _ => panic!("unexpected EvalDataStatus variant"),
@@ -73,7 +79,8 @@ fn freeze_eval_data_returns_frozen_with_known_hash_for_fixture() {
 /// ライブラリレベルのテストハーネス証跡であり、CLI 配線自体は TASK-33.x の範囲）。
 #[test]
 fn freeze_eval_data_returns_not_provided_when_path_is_none() {
-    let status = freeze_eval_data(None).expect("None path must never fail");
+    let guard = TempDirGuard::new("none-path");
+    let status = freeze_eval_data(guard.path(), None).expect("None path must never fail");
     assert_eq!(status, EvalDataStatus::NotProvided);
 }
 
@@ -81,9 +88,9 @@ fn freeze_eval_data_returns_not_provided_when_path_is_none() {
 #[test]
 fn freeze_eval_data_returns_not_found_for_missing_path() {
     let guard = TempDirGuard::new("missing-path");
-    let missing = guard.path().join("does-not-exist.jsonl");
+    let missing = Path::new("does-not-exist.jsonl");
 
-    let result = freeze_eval_data(Some(&missing));
+    let result = freeze_eval_data(guard.path(), Some(missing));
 
     match result {
         Err(FreezeError::NotFound(_)) => {}
@@ -98,14 +105,15 @@ fn freeze_eval_data_returns_not_found_for_missing_path() {
 #[test]
 fn freeze_eval_data_returns_too_large_for_oversized_file() {
     let guard = TempDirGuard::new("oversized-file");
-    let oversized = guard.path().join("oversized.bin");
+    let relative = Path::new("oversized.bin");
+    let oversized = guard.path().join(relative);
 
     let file = std::fs::File::create(&oversized).expect("create oversized fixture file");
     file.set_len(MAX_EVAL_DATA_BYTES + 1)
         .expect("set_len must succeed to create a sparse file");
     drop(file);
 
-    let result = freeze_eval_data(Some(&oversized));
+    let result = freeze_eval_data(guard.path(), Some(relative));
 
     match result {
         Err(FreezeError::TooLarge { limit, actual }) => {
@@ -124,12 +132,15 @@ fn freeze_eval_data_returns_too_large_for_oversized_file() {
 /// `/dev/zero` は Unix 系では常に存在するため `#[cfg(unix)]` で対象環境を絞り、
 /// 実行時の存在チェックによる非対応環境での暗黙 skip（false pass）を避ける
 /// （`.claude/rules/coding-rust.md`「テストの skip・ignore…で CI を通さない」）。
+/// `root` に `/dev` を渡し、経路の閉じ込め検証自体は通過させたうえで
+/// ファイル種別の検証に到達することを確認する。
 #[test]
 #[cfg(unix)]
 fn freeze_eval_data_returns_not_a_file_for_character_device() {
-    let dev_zero = Path::new("/dev/zero");
+    let root = Path::new("/dev");
+    let relative = Path::new("zero");
 
-    let result = freeze_eval_data(Some(dev_zero));
+    let result = freeze_eval_data(root, Some(relative));
 
     match result {
         Err(FreezeError::NotAFile) => {}
@@ -140,7 +151,8 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
 
 /// REQ-39 異常系（TOCTOU / FIFO）: 書き手の無い FIFO を渡しても無限にブロックせず
 /// `FreezeError::NotAFile` で拒否することを確認する（codex レビュー P0 指摘の
-/// 回帰テスト。`metadata(path).is_file()` の後に `File::open(path)` するだけでは
+/// 回帰テスト）。
+/// `metadata(path).is_file()` の後に `File::open(path)` するだけでは
 /// この間にパスが FIFO へ差し替えられた場合に open(2) がブロックし得るため、
 /// 開いた fd 自体をノンブロッキングで開いて fstat 検証する実装へ修正した。
 /// 万一ブロッキング実装へ回帰した場合にテストスイート自体が無期限にハングしない
@@ -149,7 +161,8 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
 #[cfg(unix)]
 fn freeze_eval_data_returns_not_a_file_for_fifo_without_blocking() {
     let guard = TempDirGuard::new("fifo-path");
-    let fifo_path = guard.path().join("eval.fifo");
+    let relative = Path::new("eval.fifo");
+    let fifo_path = guard.path().join(relative);
 
     let status = std::process::Command::new("mkfifo")
         .arg(&fifo_path)
@@ -158,8 +171,10 @@ fn freeze_eval_data_returns_not_a_file_for_fifo_without_blocking() {
     assert!(status.success(), "mkfifo must exit successfully");
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let root = guard.path().to_path_buf();
+    let relative = relative.to_path_buf();
     std::thread::spawn(move || {
-        let result = freeze_eval_data(Some(&fifo_path));
+        let result = freeze_eval_data(&root, Some(&relative));
         // メインスレッドがタイムアウトで抜けた後に送信が失敗しても
         // （受信側が既に drop 済み）テストの成否には影響しないため無視する。
         let _ = tx.send(result);
@@ -182,12 +197,73 @@ fn freeze_eval_data_returns_not_a_file_for_fifo_without_blocking() {
 #[test]
 fn freeze_eval_data_returns_not_a_file_for_directory() {
     let guard = TempDirGuard::new("directory-path");
+    let relative = Path::new("subdir");
+    std::fs::create_dir_all(guard.path().join(relative)).expect("create subdirectory");
 
-    let result = freeze_eval_data(Some(guard.path()));
+    let result = freeze_eval_data(guard.path(), Some(relative));
 
     match result {
         Err(FreezeError::NotAFile) => {}
         Err(other) => panic!("expected NotAFile, got {other}"),
         Ok(_) => panic!("expected NotAFile error, got Ok"),
+    }
+}
+
+/// REQ-39 異常系（経路の閉じ込め・codex P0 回帰テスト）: 絶対パスを渡すと
+/// ファイルシステムへ触れる前に `FreezeError::OutsideRoot` で拒否する
+/// （`root.join(absolute_path)` は `root` を無視して絶対パスを返してしまうため、
+/// `join` の前に構文検証で弾く必要がある）。
+#[test]
+fn freeze_eval_data_returns_outside_root_for_absolute_path() {
+    let guard = TempDirGuard::new("outside-root-absolute");
+    let outside = guard.path().join("elsewhere.jsonl");
+    std::fs::write(&outside, b"outside root").expect("write file outside root");
+
+    let result = freeze_eval_data(guard.path(), Some(outside.as_path()));
+
+    match result {
+        Err(FreezeError::OutsideRoot) => {}
+        Err(other) => panic!("expected OutsideRoot, got {other}"),
+        Ok(_) => panic!("expected OutsideRoot error, got Ok"),
+    }
+}
+
+/// REQ-39 異常系（経路の閉じ込め・codex P0 回帰テスト）: `..` で親ディレクトリへ
+/// 脱出しようとするパスを `FreezeError::OutsideRoot` で拒否する。
+#[test]
+fn freeze_eval_data_returns_outside_root_for_parent_dir_component() {
+    let guard = TempDirGuard::new("outside-root-parent");
+    let escaping = Path::new("../escape.jsonl");
+
+    let result = freeze_eval_data(guard.path(), Some(escaping));
+
+    match result {
+        Err(FreezeError::OutsideRoot) => {}
+        Err(other) => panic!("expected OutsideRoot, got {other}"),
+        Ok(_) => panic!("expected OutsideRoot error, got Ok"),
+    }
+}
+
+/// REQ-39 異常系（経路の閉じ込め・codex P0 回帰テスト）: `path` 自体は `root` 配下の
+/// 表記でも、symlink の解決先が `root` の外にある場合は `FreezeError::OutsideRoot`
+/// で拒否する（`canonicalize` 後の実体パスで確認する検証の対象）。
+#[test]
+#[cfg(unix)]
+fn freeze_eval_data_returns_outside_root_for_symlink_escaping_root() {
+    let root_guard = TempDirGuard::new("symlink-root");
+    let outside_guard = TempDirGuard::new("symlink-outside-target");
+    let outside_file = outside_guard.path().join("secret.jsonl");
+    std::fs::write(&outside_file, b"secret").expect("write outside target file");
+
+    let relative = Path::new("link.jsonl");
+    std::os::unix::fs::symlink(&outside_file, root_guard.path().join(relative))
+        .expect("create symlink escaping root");
+
+    let result = freeze_eval_data(root_guard.path(), Some(relative));
+
+    match result {
+        Err(FreezeError::OutsideRoot) => {}
+        Err(other) => panic!("expected OutsideRoot, got {other}"),
+        Ok(_) => panic!("expected OutsideRoot error, got Ok"),
     }
 }

@@ -7,14 +7,19 @@
 //! （PoC-16 縦断 2 で実測した挙動・評価契約「評価データが無い場合、`evaluate` は
 //! `status:"skipped"`・exit 0 とし、評価済みを装わない」に対応する境界）。
 //!
+//! # 経路の閉じ込め（REQ-39・security.md「経路の閉じ込め」）
+//!
+//! [`freeze_eval_data`] は許可ルート（`root`）を受け取り、そのルート配下だけを
+//! 開く。絶対パス・`..`（親ディレクトリ参照）は正規化前に拒否し、正規化
+//! （`canonicalize`）後の実体パスがルート配下であることまで確認してから開くため、
+//! ルート外の実体を指す symlink も拒否する（`safe_join` 相当）。
+//!
 //! # 対象外（本 issue のスコープ外）
 //!
 //! - ハッシュ不一致時の停止判定（TASK-17.3）。本関数は記録するのみで、既存の
 //!   記録値との突き合わせ・検証は行わない
 //! - 読み取り専用配置（書き込み拒否）への変更（おそらく TASK-17.2-2）。本関数は
 //!   ファイルの権限を一切変更しない
-//! - パストラバーサル対策（経路の閉じ込め）。呼び出し元が既に確定させた単一パスを
-//!   受け取る前提とし、ガード層（REQ-39）相当の中途半端な検証をここでは行わない
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -41,6 +46,10 @@ pub enum FreezeError {
     /// ストリーミング読み込みが EOF に到達せず無限に読み続けてしまう
     /// （REQ-39「無制限の…無限待ちを作らない」）ため、サイズ検証の前に拒否する。
     NotAFile,
+    /// `path` が許可ルート（`root`）の外を指している（絶対パス・`..` による脱出、
+    /// または正規化後の実体がルート外にある symlink 等）。REQ-39「経路の閉じ込め」
+    /// （security.md）に基づき、ファイルを開く前に拒否する。
+    OutsideRoot,
     /// 上記以外の I/O エラー（メタデータ取得・読み込み中のエラー等）。
     Io(io::Error),
 }
@@ -56,6 +65,9 @@ impl std::fmt::Display for FreezeError {
             FreezeError::NotAFile => {
                 write!(f, "evaluation data path is not a regular file")
             }
+            FreezeError::OutsideRoot => {
+                write!(f, "evaluation data path escapes the allowed root")
+            }
             FreezeError::Io(err) => write!(f, "evaluation data I/O error: {err}"),
         }
     }
@@ -66,20 +78,30 @@ impl std::error::Error for FreezeError {}
 /// 評価データを凍結する。
 ///
 /// - `path` が `None` の場合: I/O を一切行わず `Ok(EvalDataStatus::NotProvided)` を返す。
-/// - `path` が `Some` の場合: 通常ファイルであること・ファイルサイズを確認してから
-///   （非通常ファイル・上限超過ならファイルを開かずに拒否）、ストリーミングで
-///   sha256 を計算し `EvalDataStatus::Frozen` を返す。読み込みは
-///   `MAX_EVAL_DATA_BYTES + 1` バイトで打ち切り、`metadata()` 取得後にファイルが
-///   成長する TOCTOU（実読み込み量が事前チェックしたサイズを上回るケース）も
-///   検出して拒否する（REQ-39「無制限のアロケーション・無限待ちを作らない」）。
+/// - `path` が `Some` の場合: まず `root` 配下への経路の閉じ込めを検証し
+///   （絶対パス・`..` を正規化前に拒否、正規化後の実体パスが `root` 配下である
+///   ことを確認。REQ-39「経路の閉じ込め」）、その後に通常ファイルであること・
+///   ファイルサイズを確認してから（非通常ファイル・上限超過ならファイルを
+///   開かずに拒否）、ストリーミングで sha256 を計算し `EvalDataStatus::Frozen` を
+///   返す。読み込みは `MAX_EVAL_DATA_BYTES + 1` バイトで打ち切り、`metadata()`
+///   取得後にファイルが成長する TOCTOU（実読み込み量が事前チェックしたサイズを
+///   上回るケース）も検出して拒否する（REQ-39「無制限のアロケーション・
+///   無限待ちを作らない」）。
+///
+/// `root` はあらかじめ存在するディレクトリであること（呼び出し元が確定させた
+/// 評価データの置き場。CLI 側配線時にどのディレクトリを渡すかは TASK-33.1 で
+/// 決める）。`path` は `root` からの相対パスとして扱う。
 ///
 /// ハッシュ計算対象のファイル内容（データ本文）は返り値・エラーメッセージに含めない
 /// （security.md「秘密情報の混入防止」「機微情報の露出」。学習・評価データに
 /// 個人情報が含まれうる前提のため）。
-pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeError> {
+pub fn freeze_eval_data(root: &Path, path: Option<&Path>) -> Result<EvalDataStatus, FreezeError> {
     let Some(path) = path else {
         return Ok(EvalDataStatus::NotProvided);
     };
+
+    let canonical_path = resolve_within_root(root, path)?;
+    let path = canonical_path.as_path();
 
     let metadata = std::fs::metadata(path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
@@ -135,6 +157,11 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
     }
 
     Ok(EvalDataStatus::Frozen(FreezeRecord {
+        // 呼び出し元が渡した相対パスではなく、経路の閉じ込め検証で確定させた
+        // 正規化後の実体パスを記録する。symlink 解決前の表記より、実際に
+        // ハッシュ対象にしたファイルの実体を一意に指す値の方が
+        // 記録整合性（REQ-17）にかなうため（`byte_len` を stat 値ではなく
+        // 実読み込み量にする判断と同じ理由）。
         path: path.to_path_buf(),
         sha256,
         // `metadata.len()` ではなく実際に読み込んだ（＝ハッシュした）バイト数を
@@ -142,6 +169,61 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
         // 食い違わないようにするため（REQ-17 の記録整合性）。
         byte_len: actual_read,
     }))
+}
+
+/// `path`（`root` からの相対パス）が `root` 配下に閉じ込められていることを
+/// 検証し、正規化後の実体パスを返す（REQ-39「経路の閉じ込め」・security.md
+/// 「`safe_join` 相当の検証（正規化後にルート配下であることの確認）」）。
+///
+/// 二段階で検証する:
+/// 1. 構文検証（ファイルシステムに触れる前）: `path` が絶対パスである場合、
+///    または `..`（親ディレクトリ参照）を含む場合は拒否する。`root.join(path)`
+///    は `path` が絶対パスだと `root` を無視して `path` そのものを返してしまう
+///    ため、`join` の前に弾く。
+/// 2. 意味検証（`canonicalize` 後）: `root` と `root.join(path)` の双方を
+///    正規化し、後者が前者の配下であることを確認する。symlink はここで解決
+///    されるため、`path` 自体は `..` を含まなくても、その実体（symlink の
+///    解決先）がルート外にある場合はここで拒否できる。`root` 自体を
+///    正規化するのは、`root` 自体が symlink（例: macOS の `/tmp`）の場合に
+///    `starts_with` の比較が正しく機能するようにするため。
+fn resolve_within_root(root: &Path, path: &Path) -> Result<std::path::PathBuf, FreezeError> {
+    if path.is_absolute() {
+        return Err(FreezeError::OutsideRoot);
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(FreezeError::OutsideRoot);
+            }
+        }
+    }
+
+    let joined = root.join(path);
+
+    let canonical_root = canonicalize_for_confinement(root)?;
+    let canonical_path = canonicalize_for_confinement(&joined)?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(FreezeError::OutsideRoot);
+    }
+
+    Ok(canonical_path)
+}
+
+/// [`resolve_within_root`] 用に `canonicalize` を呼び、`NotFound` を
+/// [`FreezeError::NotFound`] として区別する（他の I/O エラーと違い、
+/// 「評価データが見つからない」という既存の呼び出し元向けの意味を保つため）。
+fn canonicalize_for_confinement(path: &Path) -> Result<std::path::PathBuf, FreezeError> {
+    std::fs::canonicalize(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            FreezeError::NotFound(err)
+        } else {
+            FreezeError::Io(err)
+        }
+    })
 }
 
 /// 評価データのパスを通常ファイルとして安全に開く。
