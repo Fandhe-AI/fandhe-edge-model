@@ -14,7 +14,7 @@ tools: [Read, Edit, Write, Glob, Grep]
 - README.md・CLAUDE.md・`docs/design/` 配下（層構成・crate 配置・入出力契約の設計メモ等）のドキュメント更新
 - スキル一覧・リポジトリ構造ツリーの CLAUDE.md への反映
 - `AGENTS.md`（ビルド・検証コマンドと ai-review が読むレビュー観点集）の更新。レビュー観点の変更はマージ後の PR から有効になる（ai-review は PR の base コミットの AGENTS.md を読む）
-- `.claude/agents/`・`.claude/rules/`・`.claude/settings.json` の更新（Agent 定義・運用ルール・hooks）。crate 名確定（TASK-15.2）後の予定パスの実パスへの置き換えを含む
+- `.claude/agents/`・`.claude/rules/`・`.claude/settings.json` の更新（Agent 定義・運用ルール・hooks）。crate 追加時の各パス表・scope 表（`CLAUDE.md`・`.claude/rules/conventional-commits.md`・`delegation-impl.md`・`coding-rust.md`・`AGENTS.md`）の更新を含む
 
 ## 制約
 
