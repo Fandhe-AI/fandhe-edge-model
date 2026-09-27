@@ -1,0 +1,11 @@
+# Git 改行コード正規化。
+#
+# `.editorconfig` の `end_of_line = lf`（全ファイル共通）と、
+# `.claude/rules/coding-rust.md`「内部データファイルの改行は LF 固定」に対応する。
+# 指定が無いと Windows でのチェックアウト時に `core.autocrlf` の既定動作で
+# テキストファイルが CRLF へ変換され、`fixtures/` 配下のゴールデンハッシュ
+# フィクスチャ（例: sha256 を固定値で検証する評価データ凍結テスト）の
+# バイト列・ハッシュが変わってしまう（Windows 版 rust-ci で実際に発生した不具合）。
+# `eol=lf` により、リポジトリ内部でもチェックアウト後もテキストファイルは
+# 常に LF に統一される。
+* text=auto eol=lf
