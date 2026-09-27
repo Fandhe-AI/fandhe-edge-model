@@ -1,7 +1,9 @@
 """学習リクエスト（Rust 側 CLI が子プロセスへ渡す JSON）の解析・検証。
 
-schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け取る
-`--request <path>` の中身）:
+schema_version 1 の形（`__main__.py` の `train` サブコマンドが `--request <path>` で
+受け取る JSON ファイルの中身。スーパーバイザー〔`supervisor.py`〕はこのファイルを
+1 回だけ読み、検証済みの同じバイト列を子プロセス〔`_worker`〕の標準入力へ渡す。
+`_worker` はファイルパスからの再読込を行わない。P1）:
 
 ```json
 {
@@ -35,6 +37,11 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが受け�
 書き出し）の両方から呼ばれる単一の検証経路**（`out_dir` の確認は本関数では
 行わない。スーパーバイザーが `request.out_dir` を使って `prepare_out_dir` を
 呼ぶ側であり、`_worker` は検証だけ行って `request.out_dir` を使わずに閉じる）。
+スーパーバイザーは `read_request_bytes`（ファイル読み取り）→ `parse_request_bytes`
+（JSON パース）→ `validate_request`（フィールド検証）の 3 段を経てから、
+パース前の生バイト列を子プロセスの標準入力へ渡す。`_worker` は標準入力から
+読んだバイト列に対して `parse_request_bytes` → `validate_request` を呼ぶ
+（ファイルパスは一切受け取らない）。
 
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
 `MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
@@ -159,7 +166,7 @@ class TrainRequest:
 
     `root`・`train_path`・`out_dir` は開いたままの fd を保持する
     （`guard.RootHandle`・`guard.ConfinedEntry`）。使い終わったら必ず
-    `close_resources()` を呼ぶこと（`cli.py::run_train` が `finally` で行う）。
+    `close_resources()` を呼ぶこと（`cli.py::run_worker_train` が `finally` で行う）。
     """
 
     kind: str
@@ -223,7 +230,7 @@ def _json_loads_strict(text: str) -> Any:
 
 
 def _open_regular_file(path: Path, error_maker: Any) -> tuple[IO[bytes], os.stat_result]:
-    """（root 非配下の）通常のパスからファイルを開く。`load_request` 専用。
+    """（root 非配下の）通常のパスからファイルを開く。`read_request_bytes` 専用。
 
     `--request <path>` は Rust 側 CLI が直接渡す絶対パスであり、`root` 配下への
     閉じ込め対象ではない（root 配下の `train_path`/`out_dir` は
@@ -282,13 +289,15 @@ def _open_confined_regular_file(
     return f, st
 
 
-def read_request_dict(path: Path) -> Any:
-    """学習リクエスト JSON ファイルを読み、パースだけ行う（フィールド検証はしない）。
+def read_request_bytes(path: Path) -> bytes:
+    """学習リクエスト JSON ファイルをサイズ上限付きで読み、生バイト列を返す（パースしない）。
 
-    `load_request` の内部処理と、`supervisor.py`（軽量なスーパーバイザー。
-    mlx・onnx・numpy を import しない設計。P0-2）が異常終了時の後始末のために
-    経路の文字列（`root`・`out_dir`）だけを覗き見る用途との両方から使う。
-    フィールド検証（`validate_request`）は行わないため、返り値は未検証の辞書。
+    **`supervisor.py::run_supervised_train` はファイルをここで 1 回だけ読み、
+    その同じバイト列を `parse_request_bytes` でパース・検証したうえで、子プロセス
+    （`_worker`）の標準入力へそのまま渡す**（P1: リクエストファイルへの経路を
+    スーパーバイザーと子プロセスがそれぞれ再読込すると、検証後にファイルが
+    書き換えられた場合、両者が異なる内容を見てしまう TOCTOU になる。検証済みの
+    バイト列を固定して子へ渡すことでこれを防ぐ）。
     """
     f, st = _open_regular_file(path, _invalid)
     try:
@@ -299,6 +308,19 @@ def read_request_dict(path: Path) -> Any:
         raw = f.read(MAX_REQUEST_BYTES + 1)
     finally:
         f.close()
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise _limit(f"request file exceeds {MAX_REQUEST_BYTES} bytes limit")
+    return raw
+
+
+def parse_request_bytes(raw: bytes) -> Any:
+    """リクエストの生バイト列（`read_request_bytes` が返したもの、または子プロセスが
+    標準入力から読んだもの）をパースする（フィールド検証はしない）。
+
+    `_worker`（`cli.py::run_worker_train`）は標準入力から読んだバイト列を直接
+    本関数へ渡す（サイズ上限は呼び出し側〔標準入力からの読み取り量〕で既に
+    掛かっている前提。`limits.MAX_REQUEST_BYTES` は共通）。
+    """
     if len(raw) > MAX_REQUEST_BYTES:
         raise _limit(f"request file exceeds {MAX_REQUEST_BYTES} bytes limit")
     try:
@@ -314,8 +336,14 @@ def read_request_dict(path: Path) -> Any:
 
 
 def load_request(path: Path) -> TrainRequest:
-    """学習リクエスト JSON ファイルを読み、検証したうえで `TrainRequest` を返す。"""
-    parsed = read_request_dict(path)
+    """学習リクエスト JSON ファイルを読み、検証したうえで `TrainRequest` を返す。
+
+    `_worker` は本関数を使わず、標準入力から読んだバイト列を
+    `parse_request_bytes` → `validate_request` へ直接渡す（`cli.py::run_worker_train`
+    参照。ファイルパスから読み直さない。P1）。
+    """
+    raw = read_request_bytes(path)
+    parsed = parse_request_bytes(raw)
     return validate_request(parsed)
 
 
@@ -605,12 +633,60 @@ def prepare_out_dir(entry: guard.ConfinedEntry) -> OutDirReservation:
     一時ディレクトリで行い、成功時に `finalize_out_dir` がこの予約済み空
     ディレクトリを `os.rename` で置き換える（本モジュールの docstring も参照）。
 
+    **予約前に親ディレクトリの所有者・書き込み権限を確認する**（P0。
+    `os.mkdir`・`os.rename` はいずれも `dir_fd` の指す実体そのものへは
+    書き込むが、その親ディレクトリに他ユーザーが書き込める場合、`finalize_out_dir`
+    の `stat` から `os.rename` までの間に、同じ親ディレクトリ配下で
+    `tmp_name`（予約した一時ディレクトリと同名）を差し替えられる余地が残る
+    〔`finalize_out_dir` のドキュメントコメント参照〕。親ディレクトリの実効的な
+    所有者が自分自身（`os.geteuid()`）であり、かつ group/others に書き込み
+    権限が無い（sticky な `/tmp` 型の共有ディレクトリを含め弾く）ことを
+    `os.fstat(parent_fd)` で確認してから初めて `os.mkdir` する。確認に失敗
+    した場合・条件を満たさない場合は、何も作成せず `output_conflict`
+    （fail-closed。REQ-39 ガード層）。
+
+    **既知の限界（セキュリティ監査指摘）**: 本チェックは POSIX のパーミッション
+    ビット（`st_mode`）のみを見る。macOS の ACL（`chmod +a` 等で付与される
+    追加の書き込み許可）はパーミッションビットに現れないため、ACL 経由で
+    group/others に書き込みを許可された親ディレクトリはここでは検出できない
+    （本チェックをすり抜けうる）。その場合でも、`finalize_out_dir` が
+    `os.rename` 成功後に実体の `(st_dev, st_ino)` を照合するため（本モジュールの
+    `finalize_out_dir` docstring 参照）、ACL によって差し替えられた実体が
+    そのまま公開されることはなく、不一致を検出して `output_conflict`
+    （fail-closed）になる。多層防御の 1 段目（本チェック）を回避されても、
+    2 段目（rename 後照合）が最終的な公開の正しさを担保する。
+    また、umask（例: `002`）の設定によっては `mkdir(parents=True)` 等で
+    作られた親ディレクトリが `0o775`（group 書き込み可能）になりうる。
+    その場合、たとえ自分が作った・自分が所有するディレクトリであっても
+    本チェックは `output_conflict` として拒否する（緩和しない。呼び出し元が
+    `root` に渡すディレクトリは `0o700` 等、group/others に書き込み権限の
+    無い状態で用意すること）。
+
     `os.mkdir(name, dir_fd=...)` の成功後に発生したあらゆる例外（`stat` の失敗・
     一時ディレクトリの作成・open の失敗）は、予約（`out_dir`・一時ディレクトリ）を
     解放してから再送出する（残置しない）。
     """
     parent_fd = entry.parent_fd
     name = entry.name
+
+    try:
+        parent_st = os.fstat(parent_fd)
+    except OSError as e:
+        raise WorkerError(
+            "output_conflict",
+            f"out_dir parent not stat-able: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if parent_st.st_uid != os.geteuid() or (parent_st.st_mode & 0o022) != 0:
+        # 他ユーザーが所有する、または group/others に書き込み可能な親
+        # ディレクトリでは、確定直前の名前差し替え（TOCTOU）を防ぎきれない
+        # ため、予約自体を拒否する（何も作成しない。REQ-39 ガード層）。
+        raise WorkerError(
+            "output_conflict",
+            "out_dir parent must be owned by the current user and not writable by group or others",
+            ExitCode.INVALID_INPUT,
+        )
+
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
     except FileExistsError as e:
@@ -670,6 +746,21 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
     （利用者側の入力・実行環境に起因しうる競合であり、本ワーカーの内部バグでは
     ないため `runtime_error`〔exit 70〕ではなく `output_conflict`〔exit 64〕として
     扱う）。
+
+    **`os.rename` の成功後にも、公開した実体が検証した実体と同一かを再確認する**
+    （P0）: `stat` による事前確認から `os.rename` の呼び出しまでの間にも、同じ
+    親ディレクトリへ書き込める別プロセスが `tmp_name` を（別ディレクトリへ）
+    差し替える余地が理論上残る（`prepare_out_dir` の親ディレクトリ権限検査は
+    この余地を大きく減らすが、実行時点の TOCTOU そのものを消しはしない）。
+    `rename` は inode を保つため、成功直後に `os.stat(name, ...)` した実体の
+    `(st_dev, st_ino)` が `reservation.tmp_id`（`fstat(tmp_fd)` で得た、保持中の
+    fd が指す実体の識別子）と一致することを確認する。不一致・stat 失敗の場合は
+    `out_dir`（`name`）に公開された実体が何であれ一切削除・rename し戻さず
+    （検証していない実体を消す・移動すること自体が別の TOCTOU になるため）、
+    自分の一時ディレクトリの後始末（`_release_tmp`。fd 経由で本物の中身だけを
+    消す）だけを行ってから `output_conflict` とし、成功を報告しない
+    （同一ユーザー内の残余競合であっても、検証していない実体の公開を成功
+    扱いにしない。fail-closed）。
     """
     entry = reservation.entry
     parent_fd = entry.parent_fd
@@ -719,6 +810,29 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
             f"failed to finalize out_dir: {type(e).__name__}",
             ExitCode.INVALID_INPUT,
         ) from e
+
+    # P0: rename 成功後、公開された実体が検証済みの tmp_fd と同一かを再確認する
+    # （本関数のドキュメントコメント参照。検証していない実体を成功扱いにしない）。
+    try:
+        published_st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as e:
+        _release_tmp(reservation)
+        raise WorkerError(
+            "output_conflict",
+            f"out_dir not stat-able after finalize: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if (published_st.st_dev, published_st.st_ino) != reservation.tmp_id:
+        # 公開された実体（name）には触れない（検証していないものを削除・
+        # rename し戻すこと自体が別の TOCTOU になる）。自分の一時ディレクトリの
+        # 後始末だけ行う（rename 後なので通常は ENOENT で何もしないはず）。
+        _release_tmp(reservation)
+        raise WorkerError(
+            "output_conflict",
+            "published out_dir does not match the verified entry after finalize",
+            ExitCode.INVALID_INPUT,
+        )
+
     reservation.close_tmp_fd()  # 成功: rename 後はもう不要
 
 

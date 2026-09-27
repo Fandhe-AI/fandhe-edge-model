@@ -217,3 +217,56 @@ def test_cli_train_invalid_request_exits_64(tmp_path: Path) -> None:
     payload = json.loads(lines[0])
     assert payload["status"] == "error"
     assert payload["code"] == "invalid_request"
+
+
+def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> None:
+    """REQ-39: `_worker` は通常契約ではスーパーバイザーから無名一時ファイル
+    （通常ファイル）を標準入力として渡されるが、パイプ等の非通常ファイルが
+    標準入力に接続された場合は `read()` を試みる前に `invalid_request`
+    （exit 64）で拒否し、書き手が現れない標準入力を無期限に待たないこと
+    （`cli.py::_read_request_from_stdin` 参照。証拠種別: テストハーネス）。
+
+    **書き手側のパイプを意図的に開いたままにする**（識別力の核心）:
+    ここで標準入力をすぐ閉じてしまうと（`Popen.communicate()` は書き込み無しでも
+    呼び出し直後に子の標準入力を閉じる）、fstat による事前検査が無い実装でも
+    `read()` が EOF ですぐ返り `invalid_request`（exit 64）になってしまい、
+    本チェックの有無を区別できない。パイプを開いたまま `proc.wait()` する
+    ことで、fstat 検査が無い実装なら `read()` がブロックしたまま
+    `TimeoutExpired` になり、本テストが失敗して区別できるようにする。
+
+    `--out-fd` は本チェックより前に使われないため、実在しない fd 番号
+    （3）を渡してよい。
+    """
+    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "fandhe_edge_trainer", "_worker", "--out-fd", "3"],
+        stdin=subprocess.PIPE,  # 通常ファイルではない（S_ISREG ではない）標準入力
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        # 標準入力（パイプの書き込み側）はここでは閉じない。fstat による
+        # 事前検査があれば read() を試みる前に拒否されるため、これだけで
+        # 待たずに終了するはずである。
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+        raise
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+
+    stdout = proc.stdout.read() if proc.stdout is not None else ""
+    stderr = proc.stderr.read() if proc.stderr is not None else ""
+    assert proc.returncode == 64, (proc.returncode, stdout, stderr)
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "error"
+    assert payload["code"] == "invalid_request"
+    # message の内容まで確認し、（偶然 EOF で早期に invalid_request になる
+    # 経路ではなく）fstat による S_ISREG 検査で拒否されたことを裏付ける。
+    assert payload["message"] == "stdin must be a regular file"

@@ -22,17 +22,26 @@ test_supervisor_module_does_not_import_mlx` で検証する。
 （`out_dir` の名前・予約・確定・後始末のいずれにも関与しない）。
 
 流れ:
-1. リクエスト JSON を `contract.read_request_dict`/`contract.validate_request` で
-   完全に検証する（`_worker` と同じ検証・同じエラーメッセージ。ここで失敗すれば
-   子プロセスは起動しない）。検証のうち `train_path`・`root` の fd はここでは
-   使わない（`_worker` が独立に開き直す）ので閉じる。`out_dir` の fd
-   （`ConfinedEntry`）だけは、直後の予約のために保持し続ける。
+1. リクエスト JSON ファイルを `contract.read_request_bytes` で 1 回だけ読み、
+   その生バイト列を `contract.parse_request_bytes`・`contract.validate_request`
+   で完全に検証する（`_worker` と同じ検証・同じエラーメッセージ。ここで失敗
+   すれば子プロセスは起動しない）。検証のうち `train_path`・`root` の fd は
+   ここでは使わない（`_worker` が独立に開き直す）ので閉じる。`out_dir` の fd
+   （`ConfinedEntry`）だけは、直後の予約のために保持し続ける。**読み取り済みの
+   生バイト列（`raw`）は手元に保持し、後続の子プロセスへそのまま渡す**（P1:
+   ファイルパスを子へ渡して再読込させると、検証後にファイルが書き換えられた
+   場合、スーパーバイザーと子プロセスが異なる内容を見てしまう。検証済みの
+   内容を固定して渡すことでこれを防ぐ）。
 2. `contract.prepare_out_dir` で `out_dir` を排他的に予約し、作業用の一時
    ディレクトリを作る（`OutDirReservation`。`tmp_fd` を含む）。
-3. `python -m fandhe_edge_trainer _worker --request <path> --out-fd <tmp_fd>` を
-   子プロセスとして起動する（新しいプロセスグループ。`os.killpg` で子とその
-   子孫をまとめて強制終了できるようにする。`pass_fds=(tmp_fd,)` で一時
-   ディレクトリの fd だけを引き継がせる）。
+3. `python -m fandhe_edge_trainer _worker --out-fd <tmp_fd>` を子プロセスとして
+   起動する（新しいプロセスグループ。`os.killpg` で子とその子孫をまとめて
+   強制終了できるようにする。`pass_fds=(tmp_fd,)` で一時ディレクトリの fd
+   だけを引き継がせる）。リクエストの内容は `--request <path>` では渡さない。
+   代わりに `raw` を `tempfile.TemporaryFile()`（作成直後に unlink 済みの無名
+   一時ファイル。stdlib のみで完結し、`supervisor.py` が mlx・onnx・numpy を
+   import しない設計を崩さない）へ書き込み、`seek(0)` してから子プロセスの
+   標準入力（`stdin=`）として渡す（P1）。
 4. 子プロセスの標準出力を、監視と並行して別スレッドで上限
    （`_MAX_WORKER_STDOUT_BYTES`）まで保持しつつ読み進める（P1-1: 監視ループが
    `stdout=PIPE` を読み出さないと、子プロセスがパイプを書き切れずに
@@ -74,6 +83,7 @@ import resource
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -317,8 +327,12 @@ def run_supervised_train(request_path: Path) -> ExitCode:
     子プロセスとして起動・監視し、結果に応じて確定または解放する。
     """
     try:
-        raw = contract.read_request_dict(request_path)
-        request = contract.validate_request(raw)
+        # リクエストファイルはここで 1 回だけ読む。パース前の生バイト列
+        # （raw_request）を手元に残し、検証後もそのまま子プロセスへ渡す
+        # （P1: ファイルパスを子へ渡して再読込させない。モジュール docstring 参照）。
+        raw_request = contract.read_request_bytes(request_path)
+        parsed = contract.parse_request_bytes(raw_request)
+        request = contract.validate_request(parsed)
     except WorkerError as e:
         _emit({"status": "error", "code": e.code, "message": e.message})
         return e.exit_code
@@ -339,7 +353,7 @@ def run_supervised_train(request_path: Path) -> ExitCode:
 
     try:
         return _spawn_worker_and_finalize(
-            request_path,
+            raw_request,
             reservation,
             time_limit_seconds=float(time_limit_seconds),
             rss_limit_bytes=rss_limit_bytes,
@@ -349,7 +363,7 @@ def run_supervised_train(request_path: Path) -> ExitCode:
 
 
 def _spawn_worker_and_finalize(
-    request_path: Path,
+    raw_request: bytes,
     reservation: contract.OutDirReservation,
     *,
     time_limit_seconds: float,
@@ -360,29 +374,51 @@ def _spawn_worker_and_finalize(
         "-m",
         "fandhe_edge_trainer",
         "_worker",
-        "--request",
-        str(request_path),
         "--out-fd",
         str(reservation.tmp_fd),
     ]
+    # P1: 検証済みのリクエスト（raw_request）を、作成直後に unlink 済みの
+    # 無名一時ファイル（stdlib のみ。mlx・onnx・numpy を import しない設計を
+    # 崩さない）へ書いて子プロセスの標準入力として渡す。`--request <path>` は
+    # 使わない（検証後のファイル書き換えによる TOCTOU を防ぐ。モジュール
+    # docstring 参照）。
+    #
+    # セキュリティ監査指摘: `tempfile.TemporaryFile()`・`write`・`seek` は
+    # （ENOSPC 等で）例外を送出しうるが、この時点で `out_dir` の予約
+    # （空の予約済みディレクトリ・一時ディレクトリ）は既に確保済みである。
+    # ここで送出されたあらゆる例外（`BaseException`）を外側の `try` で捕捉し、
+    # `cleanup_reservation` で解放してから再送出することで、予約だけが
+    # 残置される事態を防ぐ（REQ-39）。内側の `except OSError`（`Popen` 失敗）は
+    # 既に cleanup 済みで `return` するため、外側には伝播せず二重 cleanup には
+    # ならない。
     try:
-        proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
-            pass_fds=(reservation.tmp_fd,),
-            start_new_session=True,
-        )
-    except OSError as e:
+        with tempfile.TemporaryFile() as req_file:
+            req_file.write(raw_request)
+            req_file.seek(0)
+            try:
+                proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
+                    argv,
+                    stdin=req_file,
+                    stdout=subprocess.PIPE,
+                    stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
+                    pass_fds=(reservation.tmp_fd,),
+                    start_new_session=True,
+                )
+            except OSError as e:
+                contract.cleanup_reservation(reservation)
+                _emit(
+                    {
+                        "status": "error",
+                        "code": "runtime_error",
+                        "message": f"failed to start worker: {type(e).__name__}",
+                    }
+                )
+                return ExitCode.RUNTIME_ERROR
+    except BaseException:
         contract.cleanup_reservation(reservation)
-        _emit(
-            {
-                "status": "error",
-                "code": "runtime_error",
-                "message": f"failed to start worker: {type(e).__name__}",
-            }
-        )
-        return ExitCode.RUNTIME_ERROR
+        raise
+    # `with` を抜けると req_file（親側の fd）は閉じるが、子プロセスは
+    # 起動時に複製した自分の fd を保持しているため読み取りに支障はない。
 
     # P1-1: 監視（proc.wait を繰り返す）と並行して、別スレッドで標準出力を
     # 溜めずに読み進める。子プロセスがパイプを埋めてブロックするのを防ぐ。

@@ -700,6 +700,106 @@ def test_cleanup_reservation_never_touches_foreign_prefix_siblings(tmp_path: Pat
 
 
 # --------------------------------------------------------------------------
+# P0: 親ディレクトリの所有者・書き込み権限検査（Codex レビュー指摘）。
+# 予約前に group/others 書き込み可能・他ユーザー所有の親ディレクトリを拒否する
+# ことで、確定直前の名前差し替え（TOCTOU）の余地そのものを狭める（REQ-39）。
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX のパーミッションビットを前提にテストする"
+)
+def test_prepare_out_dir_rejects_group_writable_parent(tmp_path: Path) -> None:
+    """親ディレクトリが group 書き込み可能な場合、`out_dir` を何も作らずに
+    `output_conflict` で拒否すること（REQ-39 ガード層）。
+    """
+    original_mode = tmp_path.stat().st_mode & 0o777
+    os.chmod(tmp_path, 0o757)  # noqa: S103 - テスト専用。group 書き込み可能な状態を意図的に作る
+    try:
+        with _confined_out_dir(tmp_path) as entry:
+            with pytest.raises(WorkerError) as exc_info:
+                contract.prepare_out_dir(entry)
+            assert exc_info.value.code == "output_conflict"
+            assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+            assert not (tmp_path / "out").exists()  # 予約前に拒否され、何も作られない
+    finally:
+        os.chmod(tmp_path, original_mode)
+
+
+def test_prepare_out_dir_rejects_parent_not_owned_by_current_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """親ディレクトリの所有者が実効ユーザーと異なる場合、`output_conflict` で
+    拒否すること（`os.geteuid()` を差し替えて「自分の所有ではない」状態を
+    決定的に再現する）。
+    """
+    real_euid = os.geteuid()
+    monkeypatch.setattr(contract.os, "geteuid", lambda: real_euid + 1)
+    with _confined_out_dir(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.prepare_out_dir(entry)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        assert not (tmp_path / "out").exists()
+
+
+# --------------------------------------------------------------------------
+# P0: rename 成功後の実体再確認（Codex レビュー指摘）。`os.rename` が返っても
+# 公開された実体が検証済みの tmp_fd と同一かを確かめるまで成功にしない。
+# --------------------------------------------------------------------------
+
+
+def test_finalize_out_dir_rejects_when_rename_publishes_a_different_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`os.rename` 自体が「別の実体」を `out_dir` の位置へ置いてしまった場合
+    （名前差し替えの TOCTOU を模す）、rename 呼び出しは成功していても
+    post-rename の `(st_dev, st_ino)` 突き合わせで検出し、`output_conflict` と
+    して成功を報告しないこと。公開された実体（decoy 側）には一切触れない。
+    """
+    real_rename = os.rename
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+
+        # 検証対象（tmp_fd の実体）へ marker を書く。
+        fd = os.open(
+            "marker.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=reservation.tmp_fd
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"verified content")
+
+        # decoy: 検証していない別ディレクトリ（別 inode）を用意する。
+        decoy_name = "decoy-dir"
+        os.mkdir(decoy_name, 0o700, dir_fd=entry.parent_fd)
+        decoy_fd = os.open(decoy_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=entry.parent_fd)
+        marker_fd = os.open(
+            "decoy_marker.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=decoy_fd
+        )
+        with os.fdopen(marker_fd, "wb") as f:
+            f.write(b"decoy content")
+        os.close(decoy_fd)
+
+        def _fake_rename(src: str, dst: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+            # 呼び出し元が意図した src（自分の tmp_name）を無視し、decoy を
+            # dst（out_dir の名前）へ rename する（rename 自体が偽の実体を
+            # 公開してしまう TOCTOU を模す）。
+            real_rename(decoy_name, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr(contract.os, "rename", _fake_rename)
+        with pytest.raises(WorkerError) as exc_info:
+            contract.finalize_out_dir(reservation)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        # 公開された実体（decoy）には触れられていない。
+        assert (tmp_path / "out" / "decoy_marker.txt").read_text(
+            encoding="utf-8"
+        ) == "decoy content"
+        # 自分の一時ディレクトリ（検証済みの実体）は _release_tmp によって
+        # 掃除される（残置しない）。
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+# --------------------------------------------------------------------------
 # TOCTOU の核心確認: confine 後に経路をシンボリックリンクへ差し替えても、
 # fd に束縛された実体（confine 時点のディレクトリ）だけが使われること。
 # --------------------------------------------------------------------------
@@ -708,7 +808,11 @@ def test_cleanup_reservation_never_touches_foreign_prefix_siblings(tmp_path: Pat
 @pytest.mark.skipif(sys.platform == "win32", reason="os.symlink は POSIX 限定を前提にテストする")
 def test_prepare_out_dir_is_immune_to_parent_swap_after_confine(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    (root / "sub").mkdir(parents=True)
+    # mode を明示する（umask 依存で group/others 書き込み可になると、P0 の
+    # 親ディレクトリ権限検査〔prepare_out_dir〕に本テストの主眼と無関係な
+    # 理由で弾かれてしまうため）。
+    root.mkdir(mode=0o700)
+    (root / "sub").mkdir(mode=0o700)
     outside = tmp_path / "outside"
     outside.mkdir()
 

@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from fandhe_edge_trainer import supervisor
+from conftest import LABEL_ORDER, TINY_CONFIG
+from fandhe_edge_trainer import contract, guard, supervisor
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
@@ -268,3 +269,122 @@ def test_run_supervised_train_rejects_invalid_request_without_spawning_worker(
     request_path.write_text(json.dumps({"schema_version": 1, "kind": "c3"}), encoding="utf-8")
     exit_code = supervisor.run_supervised_train(request_path)
     assert int(exit_code) == 64
+
+
+# --------------------------------------------------------------------------
+# P1: 検証済みリクエストを固定した内容として子プロセスへ渡す（Codex レビュー
+# 指摘）。予約後にリクエストファイルが書き換えられても、子プロセスは
+# 書き換え前の（検証済みの）内容で動くこと。
+# --------------------------------------------------------------------------
+
+
+def _write_train_data(path: Path) -> None:
+    rows = []
+    for i in range(12):
+        rows.append({"input": f"alpha alpha beta gamma {i}", "label": "cat_a"})
+        rows.append({"input": f"delta delta epsilon zeta {i}", "label": "cat_b"})
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_run_supervised_train_ignores_request_file_rewrite_after_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39・REQ-21: `contract.prepare_out_dir`（予約）の直後にリクエスト
+    ファイルの中身を別の `out_dir`（`out2`）を指すよう書き換えても、子プロセス
+    （`_worker`）は予約前に検証・確定した元の内容（`out`）で動作し、成果物が
+    元の `out_dir` に確定すること。`_worker` はファイルパスを再読込しない
+    （検証済みのバイト列を標準入力から渡される。`supervisor.py`・`cli.py` の
+    モジュール docstring 参照）。
+    """
+    monkeypatch.setenv("PYTHONPATH", _SRC_DIR)  # 子プロセスが src/ を解決できるようにする
+
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    other_out_dir = tmp_path / "out2"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    real_prepare_out_dir = contract.prepare_out_dir
+
+    def _rewrite_request_then_prepare(entry):
+        reservation = real_prepare_out_dir(entry)
+        # 予約成功の直後、検証済みリクエストの確定前に、ファイル側の内容だけを
+        # 別の out_dir（out2）・存在しない train_path を指すよう書き換える
+        # （別プロセスによる改変を模す）。旧実装（`_worker` がファイルパスを
+        # 再読込していた実装）であれば、この書き換え後の内容（存在しない
+        # train_path）を読んでしまい invalid_path で exit 64 になっていた。
+        # 本実装（検証済みのバイト列を固定して渡す）であれば、書き換え前の
+        # 内容のまま学習が成功し exit 0 になる。この違いが本テストの識別力。
+        rewritten = dict(request, out_dir="out2", train_path="nonexistent-train.jsonl")
+        request_path.write_text(json.dumps(rewritten), encoding="utf-8")
+        return reservation
+
+    monkeypatch.setattr(contract, "prepare_out_dir", _rewrite_request_then_prepare)
+
+    exit_code = supervisor.run_supervised_train(request_path)
+    assert int(exit_code) == 0
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "ok"
+    # 成功 JSON の artifact_dir は書き換え前（検証済み）の out_dir と一致する。
+    assert Path(payload["artifact_dir"]).resolve() == out_dir.resolve()
+    assert (out_dir / "model.onnx").exists()
+    assert (out_dir / "artifact.json").exists()
+    # 書き換え後に指定された out2 へは一切書き込まれていない。
+    assert not other_out_dir.exists()
+
+
+# --------------------------------------------------------------------------
+# セキュリティ監査指摘: `tempfile.TemporaryFile()`・write・seek が例外を送出
+# した場合に、予約済みの out_dir・作業用一時ディレクトリを残置しないこと。
+# --------------------------------------------------------------------------
+
+
+def test_spawn_worker_and_finalize_cleans_up_reservation_when_tempfile_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: `tempfile.TemporaryFile()`（作成・write・seek を含む）が
+    （ENOSPC 等で）例外を送出した場合でも、既に確保済みの予約（`out_dir`・
+    作業用一時ディレクトリ）が残置されず解放されること。実際の資源枯渇を
+    待たず、`tempfile.TemporaryFile` を差し替えて決定的に再現する
+    （証拠種別: テストハーネス）。
+    """
+    root_handle = guard.resolve_root(str(tmp_path))
+    entry = guard.confine(root_handle, "out", "out_dir")
+    root_handle.close()
+    reservation = contract.prepare_out_dir(entry)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated ENOSPC while creating the request temp file")
+
+    monkeypatch.setattr(supervisor.tempfile, "TemporaryFile", _boom)
+
+    try:
+        with pytest.raises(OSError, match="simulated ENOSPC"):
+            supervisor._spawn_worker_and_finalize(
+                b'{"schema_version": 1}',
+                reservation,
+                time_limit_seconds=30.0,
+                rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            )
+
+        # 予約済み out_dir・作業用一時ディレクトリのいずれも残っていない
+        # （cleanup_reservation が例外経路でも呼ばれたことの確認）。
+        assert not (tmp_path / "out").exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+    finally:
+        entry.close()

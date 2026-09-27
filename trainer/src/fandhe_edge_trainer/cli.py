@@ -12,6 +12,12 @@ Python コードへ制御が戻らないため）。そのため、壁時計・R
 プロセス境界の外側（`supervisor.py`。mlx・onnx・numpy を import しない）から行う。
 `_worker` は公開契約ではない（`--help` 自体を提供しないため文書化もしない）。
 
+**`_worker` はリクエスト JSON を標準入力から受け取る**（P1: ファイルパスを
+`--request <path>` で渡すと、スーパーバイザーが検証してから `_worker` が
+再読込するまでの間にファイルが書き換えられうる。スーパーバイザーは検証済みの
+バイト列を固定して子プロセスの標準入力へ渡す。`supervisor.py` モジュール
+docstring 参照）。`_worker` は `--out-fd <n>` だけを引数に取る。
+
 - 標準出力: 成功・失敗いずれも JSON 1 つだけ（進捗・ログは標準エラーへ出す）
 - 終了コード: 成功 0（ExitCode.OK）、`WorkerError` はその `exit_code`、
   想定外の例外は `runtime_error` として 70。**引数解析の失敗を含め、
@@ -31,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -41,6 +48,7 @@ from . import supervisor as supervisor_mod
 from .errors import WorkerError
 from .exitcode import ExitCode
 from .kinds import resolve_kind
+from .limits import MAX_REQUEST_BYTES
 
 
 class _NoExitArgumentParser(argparse.ArgumentParser):
@@ -85,7 +93,50 @@ def _apply_rlimit_cpu_backstop(time_limit_seconds: int) -> None:
         pass
 
 
-def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
+def _read_request_from_stdin() -> bytes:
+    """標準入力からリクエストの生バイト列を読む（P1。`_worker` 専用）。
+
+    スーパーバイザー（`supervisor.py::_spawn_worker_and_finalize`）は検証済みの
+    バイト列を無名一時ファイルへ書いて `stdin=` として渡す（通常ファイルなので
+    `read()` は EOF で確実に返る）。サイズ上限（`limits.MAX_REQUEST_BYTES`）は
+    読み取り量そのもので縛る（`+1` バイトまで読み、超過を検出できるようにする。
+    `contract.parse_request_bytes` 側でも同じ上限を再検査する）。
+
+    **標準入力が通常ファイルであることを検査する**（セキュリティ監査指摘・
+    REQ-39）: `_worker` は本来スーパーバイザーの子プロセスとしてのみ起動される
+    契約だが、`_worker` は「公開契約ではない」内部サブコマンドであるため、
+    仮に何者かがパイプ・端末（TTY）を標準入力に接続して直接起動した場合、
+    書き手が現れない・EOF が来ない標準入力に対する `read()` は無期限に
+    ブロックしうる（無制限待ちを作らない。REQ-39）。`os.fstat` で
+    `S_ISREG` を確認し、通常ファイルでなければ読み取りを試みずに
+    `invalid_request`（exit 64）で拒否する（fail-closed）。
+    """
+    stdin = sys.stdin.buffer if sys.stdin is not None else None
+    if stdin is None:
+        raise WorkerError(
+            "invalid_request", "stdin is not available for _worker", ExitCode.INVALID_INPUT
+        )
+    try:
+        st = os.fstat(stdin.fileno())
+    except OSError as e:
+        raise WorkerError(
+            "invalid_request",
+            f"stdin not stat-able: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if not stat.S_ISREG(st.st_mode):
+        raise WorkerError("invalid_request", "stdin must be a regular file", ExitCode.INVALID_INPUT)
+    try:
+        return stdin.read(MAX_REQUEST_BYTES + 1)
+    except OSError as e:
+        raise WorkerError(
+            "invalid_request",
+            f"failed to read request from stdin: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+
+
+def run_worker_train(out_fd: int) -> ExitCode:
     """`_worker` サブコマンドの本体（実際の学習・書き出し）。戻り値は終了コード。
 
     **`out_dir` の名前・予約・確定・後始末には一切関与しない**（P0-1・P0-2 の
@@ -96,6 +147,11 @@ def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
     `model.onnx` はその fd へ `dir_fd` 相対（`O_CREAT|O_EXCL|O_NOFOLLOW`）で
     新規作成するだけで、`out_dir` の名前を組み立てる経路は本関数のどこにも
     無い。
+
+    **リクエストはファイルパスではなく標準入力から受け取る**（P1: スーパーバイザーが
+    検証してから本関数が独自にファイルを再読込すると、検証後にファイルが
+    書き換えられた場合、両者が異なる内容を見てしまう。スーパーバイザーが
+    検証済みのバイト列を固定して渡す。`_read_request_from_stdin` 参照）。
 
     `request` が保持する fd（`root`・`train_path`・`out_dir`。
     `contract.py`・`guard.py` 参照）は、成功・失敗いずれの経路でも
@@ -109,7 +165,9 @@ def run_worker_train(request_path: Path, out_fd: int) -> ExitCode:
     すべてで同じインスタンスを使い回す（P0-1: 64 MiB・20 万件までの学習データを
     読み込む処理自体も、学習ジョブ全体の資源上限の対象にする）。
     """
-    request = contract.load_request(request_path)
+    raw = _read_request_from_stdin()
+    parsed = contract.parse_request_bytes(raw)
+    request = contract.validate_request(parsed)
     try:
         _apply_rlimit_cpu_backstop(request.time_limit_seconds)
         resource_budget = budget_mod.ResourceBudget(
@@ -174,9 +232,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # `train`（supervisor.py）が子プロセスとして起動する実体。`--out-fd` は
     # スーパーバイザーが `pass_fds` で引き継いだ、出力用一時ディレクトリの fd 番号
     # （`contract.py::OutDirReservation` 参照。`_worker` はこの fd 番号以外の
-    # 経路で `out_dir` を扱わない）。
+    # 経路で `out_dir` を扱わない）。リクエストの内容は `--request <path>` では
+    # 受け取らず標準入力から読む（P1: `_read_request_from_stdin` 参照）。
     p_worker = sub.add_parser("_worker", add_help=False, exit_on_error=False)
-    p_worker.add_argument("--request", required=True)
     p_worker.add_argument("--out-fd", required=True, type=int)
     return parser
 
@@ -188,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "train":
             exit_code = supervisor_mod.run_supervised_train(Path(args.request))
         elif args.command == "_worker":
-            exit_code = run_worker_train(Path(args.request), args.out_fd)
+            exit_code = run_worker_train(args.out_fd)
         else:  # pragma: no cover - argparse の choices で到達しない
             raise WorkerError(
                 "invalid_request", f"unknown command: {args.command}", ExitCode.INVALID_INPUT
