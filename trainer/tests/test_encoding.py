@@ -26,12 +26,21 @@ from fandhe_edge_trainer.encoding import encode_bytes, normalize_input
 # ローカル固定 fixture だが、想定外に巨大化した場合に無制限アロケーションへ繋げない。
 _MAX_FIXTURE_BYTES = 1024 * 1024
 
-_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[2] / "fixtures" / "preprocess" / "byte_encoding_vectors.json"
-)
+# 本ファイル（trainer/tests/test_encoding.py）からリポジトリ直下までの階層:
+# parents[0]=trainer/tests, parents[1]=trainer, parents[2]=リポジトリ直下。
+# `parents[N]` は配置が変わると静かに壊れるため、由来を明記した名前へ切り出す
+# （PR #14 レビューで `_FIXTURE_PATH` の参照先が疑われた経緯があるため）。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FIXTURE_PATH = _REPO_ROOT / "fixtures" / "preprocess" / "byte_encoding_vectors.json"
 
 
 def _load_fixture() -> dict[str, Any]:
+    if not _FIXTURE_PATH.is_file():
+        raise FileNotFoundError(
+            "共有ゴールデンベクタ fixture が見つからない: "
+            f"{_FIXTURE_PATH}（リポジトリ直下 {_REPO_ROOT} 起点で "
+            "fixtures/preprocess/byte_encoding_vectors.json を解決できるか確認する）"
+        )
     size = _FIXTURE_PATH.stat().st_size
     assert size <= _MAX_FIXTURE_BYTES, (
         f"byte_encoding_vectors.json が上限（{_MAX_FIXTURE_BYTES} バイト）を超えている: {size}"
