@@ -1,8 +1,8 @@
 name: CI
 
 # 手動実行（workflow_dispatch）・PR（pull_request）・main への push（push）で発火する。
-# 必須チェックは集約ジョブ `ci-complete` 1 件に集約し、ruleset（branch protection）の
-# 必須チェックへ登録済み（下の ci-complete ジョブのコメントを参照）。
+# ruleset（branch protection）の必須チェックには、集約ジョブ `ci-complete` に加えて
+# 各ジョブの check も個別に登録済み（下の lint-docs ジョブのコメントを参照）。
 on:
   workflow_dispatch:
   pull_request:
@@ -33,14 +33,16 @@ jobs:
   # if: を持つ条件付きジョブとして明示リストで skipped を判定する）で単一の result に
   # まとめられているため、本 workflow からは `needs.lint-docs.result` を信頼できる
   # 単一値として扱える。rust-ci・rust-ci-default-features は 3 OS matrix のため
-  # OS ごとに別名のチェックが生成され、そのままでは branch protection の必須チェック
-  # 一覧を OS 追加のたびに更新する必要がある。本 workflow 内の集約ジョブ
+  # OS ごとに別名のチェックが生成される。本 workflow 内の集約ジョブ
   # `ci-complete`（下部）が lint-docs・rust-ci・rust-ci-default-features の結果を
-  # まとめて fail-closed 判定するため、ruleset（branch protection）の
-  # 必須チェックには `ci-complete` 1 件だけを登録済み。ジョブ名（`ci-complete`）を
-  # 改名すると必須チェックが PR に報告されずマージが永久にブロックされるため、
-  # 改名する場合は先に ruleset 側の必須チェック名を更新してからこの workflow を
-  # 変更すること。
+  # まとめて fail-closed 判定する。ruleset（branch protection）の必須チェックには
+  # `ci-complete` に加えて、PR HEAD に報告される各ジョブの check（`lint-docs / *`・
+  # `rust-ci (<os>) / *`・`rust-ci-default-features (<os>)`）も個別に登録済み
+  # （implement-issue-tree の自動マージのゲートは、required に含まれない check が
+  # 1 件でもあるとマージを辞退するため。.claude/rules/ci.md）。ジョブ名・matrix の
+  # OS・reusable workflow 側のジョブ名が変わると旧名の必須チェックが PR に報告されず
+  # マージが永久にブロックされるため、変更する場合は先に ruleset 側の必須チェック名を
+  # 更新してからこの workflow を変更すること。
   lint-docs:
     # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
     # 参照する（組織現行標準）
