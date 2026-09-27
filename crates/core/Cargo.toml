@@ -7,5 +7,9 @@ repository.workspace = true
 publish.workspace = true
 description = "Core definitions shared by all layers of fandhe-edge-model."
 
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true
