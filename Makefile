@@ -45,11 +45,14 @@ HAS_PY := $(wildcard trainer/pyproject.toml)
 
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
 # 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
-# EC_NPM_VERSION のみ npm ラッパーパッケージの版（CI は Go バイナリ release タグ v3.8.0 を
-# 直接取得するため版番号体系が異なる。ローカル再現用の近似として npm 最新安定を固定する）。
+# EC_NPM_VERSION は npm ラッパーパッケージの版、EC_BIN_VERSION はラッパーが取得する Go バイナリの
+# release タグ（CI は v3.8.0 を直接取得する）。ラッパーは EC_VERSION 未指定だと latest を取得し、
+# v4 以降の asset 名変更（ec-* → editorconfig-checker-*）で 6.1.1 がバイナリを見つけられず
+# 失敗するうえ、CI と版がずれるため、EC_VERSION で CI と同じタグに固定する。
 MARKDOWNLINT_VERSION := 0.49.1
 YAMLLINT_VERSION := 1.38.0
 EC_NPM_VERSION := 6.1.1
+EC_BIN_VERSION := 3.8.0
 COMMITLINT_VERSION := 21.2.1
 COMMITLINT_CONFIG_VERSION := 21.2.0
 
@@ -194,7 +197,7 @@ lint-yaml: ## yamllint（.yamllint 参照）
 
 .PHONY: lint-editorconfig
 lint-editorconfig: ## editorconfig-checker（.editorconfig + .editorconfig-checker.json 参照）
-	npx --yes editorconfig-checker@$(EC_NPM_VERSION)
+	EC_VERSION=v$(EC_BIN_VERSION) npx --yes editorconfig-checker@$(EC_NPM_VERSION)
 
 # main からの分岐点以降のコミットを CI（lint-docs の commitlint ジョブ）と同じ
 # extends 構成で検証する。origin/main が未取得の環境では範囲を決められないためスキップする。
