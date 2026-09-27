@@ -10,19 +10,51 @@
 //! [`RecordAnomaly`] はレコード本文（`input`・`output` の実際の値）を
 //! 一切保持しない。位置特定は行番号・`id`・フィールド名・JSON 型名のみで行う
 //! （`.claude/rules/security.md`「データ本文をログ・エラーメッセージへ転記しない」）。
-//! ラベル ID（`UnknownLabel`・`DuplicateId` が保持する値）は自由記述本文ではなく
-//! 構造化された識別子であるため、例外として含めてよいと判断している。
+//! `id`（`RecordAnomaly.id`）とラベル ID（`UnknownLabel` が保持する値）は
+//! 自由記述本文ではなく構造化された識別子であるため、例外として含めてよいと
+//! 判断している。ただし両者とも外部データの生値であり、検証に失敗した
+//! 場合（型不正・未知のラベル）はその生値自体が異常の原因であるため、
+//! 長さ・文字種の担保は無い。CLI/MCP が本構造体をそのままログ・Issue へ
+//! 出力する将来の用途を考え、[`RecordAnomaly`] に格納する `id`・`label_id` は
+//! [`cap_diagnostic_value`] で長さ上限（[`MAX_DIAGNOSTIC_VALUE_CHARS`]）に
+//! 切り詰めてから保持する。切り詰めは診断用の複製にのみ適用し、
+//! [`ValidRecord`] が保持する実際の値（分割・ハッシュ・突き合わせのキーとして
+//! 使われる）は切り詰めない。
 //!
 //! # 既知の残存リスク（ガード層の責務）
 //!
-//! `serde_json::from_str::<Value>` は深いネストの JSON を再帰的に処理するため、
-//! 極端に深くネストした 1 行を渡すとスタックオーバーフローを起こしうる。
-//! 1 件あたりのサイズ・ネスト深さの上限（REQ-39）はガード層（パス未確定）の
-//! 責務であり、本関数はガード層を通過済みの入力を受け取る前提で実装している。
+//! `serde_json::from_str::<Value>` は深いネストの JSON を再帰的に処理する。
+//! serde_json の既定再帰上限（128）により、通常は極端なネストより先に
+//! [`AnomalyCode::MalformedJson`] としてパースエラーで止まることを
+//! `deeply_nested_json_is_rejected_before_stack_overflow` で確認している
+//! （200 段ネストでの実測。証拠種別: テストハーネス）。この上限は serde_json の
+//! 実装詳細であり本 crate が保証するものではないため、1 件あたりのサイズ・
+//! ネスト深さの明示的な上限（REQ-39）は引き続きガード層（パス未確定）の
+//! 責務とし、本関数はガード層を通過済みの入力を受け取る前提で実装している。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+
+/// [`RecordAnomaly`] に格納する診断用文字列（`id`・`label_id`）の上限文字数。
+///
+/// ログ・Issue への転記時に無制限の任意文字列が紛れ込むのを防ぐための上限で、
+/// 実データの `id`/ラベル ID の規約上の長さとは無関係の安全弁である
+/// （`.claude/rules/security.md`「データ本文をログ・エラーメッセージへ転記しない」）。
+const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 200;
+
+/// 診断（[`RecordAnomaly`]）にのみ使う複製を、文字数上限で切り詰める。
+///
+/// UTF-8 の文字境界で安全に切り詰め、切り詰めが発生した場合は末尾に
+/// マーカーを付けて「値が省略されている」ことを分かるようにする。
+/// [`ValidRecord`] に格納する実際の値には適用しない（上記モジュール doc 参照）。
+fn cap_diagnostic_value(s: &str) -> String {
+    if s.chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(MAX_DIAGNOSTIC_VALUE_CHARS).collect();
+    format!("{truncated}...(truncated)")
+}
 
 /// `inspect_records` の異常種別（本 crate の内部語彙）。
 ///
@@ -44,6 +76,8 @@ pub enum AnomalyCode {
         actual: &'static str,
     },
     /// `output.intent` が有効なラベル ID 集合に含まれない。
+    /// `label_id` は [`cap_diagnostic_value`] で長さ上限に切り詰めた
+    /// 診断用の複製（上記モジュール doc 参照）。
     UnknownLabel { label_id: String },
     /// `id` が既出の行と重複している。
     DuplicateId { first_line: usize },
@@ -71,6 +105,8 @@ pub struct RecordAnomaly {
     /// 1 始まりの行番号。
     pub line: usize,
     /// 取得できた場合のみの `id`（型不正等で取得できないこともある）。
+    /// [`cap_diagnostic_value`] で長さ上限に切り詰めた診断用の複製であり、
+    /// [`ValidRecord::id`] の実値とは別物（上記モジュール doc 参照）。
     pub id: Option<String>,
     /// 異常が生じたフィールド名（`"id"`・`"input"`・`"output"`・`"output.intent"`・
     /// `"tags"`・`"tags[]"`・`"group_id"`・レコード自体を指す `"<record>"`）。
@@ -218,7 +254,7 @@ pub fn inspect_records(
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: id_opt.clone(),
+                    id: id_opt.as_deref().map(cap_diagnostic_value),
                     field: "input",
                     code: AnomalyCode::MissingField,
                 });
@@ -230,7 +266,7 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.clone(),
+                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "input",
                         code: AnomalyCode::TypeMismatch {
                             expected: "string",
@@ -248,7 +284,7 @@ pub fn inspect_records(
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
-                    id: id_opt.clone(),
+                    id: id_opt.as_deref().map(cap_diagnostic_value),
                     field: "output",
                     code: AnomalyCode::MissingField,
                 });
@@ -259,7 +295,7 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.clone(),
+                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "output",
                         code: AnomalyCode::TypeMismatch {
                             expected: "object",
@@ -273,7 +309,7 @@ pub fn inspect_records(
                     None => {
                         anomalies.push(RecordAnomaly {
                             line,
-                            id: id_opt.clone(),
+                            id: id_opt.as_deref().map(cap_diagnostic_value),
                             field: "output.intent",
                             code: AnomalyCode::MissingField,
                         });
@@ -284,7 +320,7 @@ pub fn inspect_records(
                         None => {
                             anomalies.push(RecordAnomaly {
                                 line,
-                                id: id_opt.clone(),
+                                id: id_opt.as_deref().map(cap_diagnostic_value),
                                 field: "output.intent",
                                 code: AnomalyCode::TypeMismatch {
                                     expected: "string",
@@ -300,10 +336,10 @@ pub fn inspect_records(
                             } else {
                                 anomalies.push(RecordAnomaly {
                                     line,
-                                    id: id_opt.clone(),
+                                    id: id_opt.as_deref().map(cap_diagnostic_value),
                                     field: "output.intent",
                                     code: AnomalyCode::UnknownLabel {
-                                        label_id: intent.to_string(),
+                                        label_id: cap_diagnostic_value(intent),
                                     },
                                 });
                                 record_has_error = true;
@@ -322,7 +358,7 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.clone(),
+                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "tags",
                         code: AnomalyCode::TypeMismatch {
                             expected: "array",
@@ -341,7 +377,7 @@ pub fn inspect_records(
                             None => {
                                 anomalies.push(RecordAnomaly {
                                     line,
-                                    id: id_opt.clone(),
+                                    id: id_opt.as_deref().map(cap_diagnostic_value),
                                     field: "tags[]",
                                     code: AnomalyCode::TypeMismatch {
                                         expected: "string",
@@ -368,7 +404,7 @@ pub fn inspect_records(
                 None => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: id_opt.clone(),
+                        id: id_opt.as_deref().map(cap_diagnostic_value),
                         field: "group_id",
                         code: AnomalyCode::TypeMismatch {
                             expected: "string",
@@ -390,7 +426,7 @@ pub fn inspect_records(
                 Some(&first_line) => {
                     anomalies.push(RecordAnomaly {
                         line,
-                        id: Some(id.clone()),
+                        id: Some(cap_diagnostic_value(id)),
                         field: "id",
                         code: AnomalyCode::DuplicateId { first_line },
                     });
@@ -741,6 +777,125 @@ mod tests {
         let result = inspect_records(content, &empty);
 
         assert_eq!(result, Err(EmptyLabelSet));
+    }
+
+    /// 検証に失敗した `output.intent` の生値が無制限に `RecordAnomaly` へ
+    /// 伝播しないこと（長さ上限で切り詰められること）。
+    #[test]
+    fn unknown_label_id_is_capped_for_diagnostics() {
+        let long_label = "x".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
+        let content =
+            format!("{{\"id\":\"r1\",\"input\":\"x\",\"output\":{{\"intent\":\"{long_label}\"}}}}");
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(&content, &valid).unwrap();
+
+        assert_eq!(outcome.anomalies.len(), 1);
+        let AnomalyCode::UnknownLabel { label_id } = &outcome.anomalies[0].code else {
+            panic!("expected UnknownLabel");
+        };
+        assert_eq!(
+            label_id.chars().count(),
+            MAX_DIAGNOSTIC_VALUE_CHARS + "...(truncated)".chars().count()
+        );
+        assert!(label_id.ends_with("...(truncated)"));
+    }
+
+    /// 検証に失敗した `id` の生値（型不正時ではなく重複検出時の複製）も
+    /// 同じ上限で切り詰められること。
+    #[test]
+    fn duplicate_id_value_is_capped_for_diagnostics() {
+        let long_id = "y".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
+        let content = format!(
+            "{{\"id\":\"{long_id}\",\"input\":\"a\",\"output\":{{\"intent\":\"ok\"}}}}\n\
+             {{\"id\":\"{long_id}\",\"input\":\"b\",\"output\":{{\"intent\":\"ok\"}}}}"
+        );
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(&content, &valid).unwrap();
+
+        assert_eq!(outcome.anomalies.len(), 1);
+        let anomaly_id = outcome.anomalies[0]
+            .id
+            .as_ref()
+            .expect("DuplicateId は id を保持する");
+        assert!(anomaly_id.ends_with("...(truncated)"));
+        // ValidRecord 側は切り詰めない実値を保持する（分割・突き合わせのキーのため）。
+        assert_eq!(outcome.valid_records[0].id, long_id);
+        assert_eq!(outcome.valid_records[1].id, long_id);
+    }
+
+    /// 200 段ネストした JSON は、スタックオーバーフローより先に
+    /// serde_json のパースエラーとして `MalformedJson` になること
+    /// （証拠種別: テストハーネス。モジュール doc の「既知の残存リスク」参照）。
+    #[test]
+    fn deeply_nested_json_is_rejected_before_stack_overflow() {
+        const DEPTH: usize = 200;
+        let opens: String = "[".repeat(DEPTH);
+        let closes: String = "]".repeat(DEPTH);
+        let content = format!("{opens}1{closes}");
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(&content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                id: None,
+                field: "<record>",
+                code: AnomalyCode::MalformedJson,
+            }]
+        );
+    }
+
+    /// REQ-16: 1 レコードで複数フィールドが同時に不正な場合、先頭の異常で
+    /// 打ち切らずすべて報告すること（モジュール doc の「挙動」節）。
+    #[test]
+    fn multiple_anomalies_in_one_record_are_all_reported() {
+        let content = "{\"id\":1,\"output\":{\"intent\":\"nope\"},\"group_id\":2}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![
+                RecordAnomaly {
+                    line: 1,
+                    id: None,
+                    field: "id",
+                    code: AnomalyCode::TypeMismatch {
+                        expected: "string",
+                        actual: "number",
+                    },
+                },
+                RecordAnomaly {
+                    line: 1,
+                    id: None,
+                    field: "input",
+                    code: AnomalyCode::MissingField,
+                },
+                RecordAnomaly {
+                    line: 1,
+                    id: None,
+                    field: "output.intent",
+                    code: AnomalyCode::UnknownLabel {
+                        label_id: "nope".to_string(),
+                    },
+                },
+                RecordAnomaly {
+                    line: 1,
+                    id: None,
+                    field: "group_id",
+                    code: AnomalyCode::TypeMismatch {
+                        expected: "string",
+                        actual: "number",
+                    },
+                },
+            ]
+        );
+        assert!(outcome.valid_records.is_empty());
     }
 
     #[test]
