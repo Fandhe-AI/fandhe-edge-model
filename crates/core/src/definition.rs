@@ -2,9 +2,12 @@
 //!
 //! # 対応 TASK
 //! - TASK-15.3-1（本ファイル）: 型定義と正常系パーサ。加えて PR #187 のセキュリティ
-//!   レビュー（P0/P1）指摘に基づき、ガード層としての完全性検証（`schema`/`version`
-//!   の照合・選択肢の整合性検証）とサイズ上限の TOCTOU 対策を先行実装する
-//!   （security.md「ガード層」）
+//!   レビュー（P0/P1）指摘に基づき、ガード層としての完全性検証（`schema` の照合・
+//!   選択肢の整合性検証）とサイズ上限の TOCTOU 対策を先行実装する
+//!   （security.md「ガード層」）。`version` フィールドはカタログ形式のドキュメント
+//!   バージョン（`name` と並ぶ台帳上のメタ情報）であり、形式・版の識別は既に
+//!   `schema`/`SCHEMA_ID`（例: `.../v1` の版数を含む）が担うため、`version` を
+//!   第二のスキーマ固定値として拒否条件には使わない（PR #187 レビュー指摘）
 //! - TASK-15.3-2: 上記以外の必須項目欠落・不整合の詳細検証、エラー型の拡張
 //! - TASK-15.4: ラベル定義非同梱の `missing_labels` 判定
 //! - TASK-15.5: 正準化ハッシュ（`options`・`judgment_type` を用いた作り直し要否判定。
@@ -23,10 +26,13 @@ use std::path::{Path, PathBuf};
 /// 定義ファイルのスキーマ識別子（版が上がったら値も変える）。
 pub const SCHEMA_ID: &str = "fandhe-edge-model-definition/v1";
 
-/// `SCHEMA_ID` に対応する定義ファイルの版（`Definition::version` フィールドの
-/// 期待値）。異なる版・異なるスキーマ形式の定義ファイルを、検証なしに正常な
-/// `Definition` として後続処理（学習ワーカー・CLI）へ渡さないための照合値
-/// （security.md「ガード層: 完全性と版」）。
+/// `SCHEMA_ID` が表す形式・版の参考値（`SCHEMA_ID` 末尾の `/v1` と対応）。
+/// スキーマ形式・版の識別は `schema`/`SCHEMA_ID` の一致検査で行い、この定数は
+/// `Definition::version`（カタログ上のドキュメントバージョン。`name` と並ぶ
+/// メタ情報であり、スキーマ固定値ではない）とは照合しない
+/// （security.md「ガード層: 完全性と版」。PR #187 レビュー指摘で `version` の
+/// 拒否条件化を撤回）。
+#[allow(dead_code)]
 pub const DEFINITION_SCHEMA_VERSION: u32 = 1;
 
 /// 定義ファイル読み込み時のサイズ上限（暫定値。REQ-39 の資源上限が正式に
@@ -88,7 +94,8 @@ pub struct Definition {
 ///
 /// 本 TASK（TASK-15.3-1）は正常系のみを対象とするが、PR #187 のセキュリティ
 /// レビュー（P0/P1）指摘に基づき、ガード層としての完全性検証
-/// （`UnsupportedSchema`・`UnsupportedVersion`・選択肢の整合性）を先行実装する。
+/// （`UnsupportedSchema`・選択肢の整合性）とサイズ上限（`TooLarge`。
+/// `Definition::parse` からも到達する。同レビュー指摘）を先行実装する。
 /// これ以外の必須項目欠落等の詳細な検証バリアントは TASK-15.3-2 が追加し、
 /// `missing_labels` 相当の判定は TASK-15.4 が追加する（`#[non_exhaustive]`）。
 #[derive(Debug)]
@@ -98,8 +105,13 @@ pub enum DefinitionError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// サイズ上限超過（REQ-39）。`Definition::load` 経由ではファイルパスを
+    /// 持つが、`Definition::parse` に文字列を直接渡す呼び出し（パスを
+    /// 持たない公開 API 経由）でも同じ上限を適用するため `path` は `None` を
+    /// 取りうる（PR #187 レビュー指摘: 公開パース API にも入力サイズ上限を
+    /// 適用する）。
     TooLarge {
-        path: PathBuf,
+        path: Option<PathBuf>,
         size: u64,
         limit: u64,
     },
@@ -110,11 +122,6 @@ pub enum DefinitionError {
     /// security.md「ガード層: 完全性と版」）。
     UnsupportedSchema {
         schema: String,
-    },
-    /// `version` フィールドが `DEFINITION_SCHEMA_VERSION` と一致しない
-    /// （未対応の版。同上）。
-    UnsupportedVersion {
-        version: u32,
     },
     /// `options` が空で、固定選択肢からの判定が成立しない（REQ-15）。
     EmptyOptions,
@@ -132,10 +139,16 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::Read { path, source } => {
                 write!(f, "failed to read definition file {path:?}: {source}")
             }
-            DefinitionError::TooLarge { path, size, limit } => write!(
-                f,
-                "definition file {path:?} is too large: {size} bytes (limit: {limit} bytes)"
-            ),
+            DefinitionError::TooLarge { path, size, limit } => match path {
+                Some(path) => write!(
+                    f,
+                    "definition file {path:?} is too large: {size} bytes (limit: {limit} bytes)"
+                ),
+                None => write!(
+                    f,
+                    "definition input is too large: {size} bytes (limit: {limit} bytes)"
+                ),
+            },
             DefinitionError::Parse { source } => {
                 write!(f, "failed to parse definition file: {source}")
             }
@@ -143,12 +156,6 @@ impl std::fmt::Display for DefinitionError {
                 write!(
                     f,
                     "unsupported definition schema {schema:?} (expected {SCHEMA_ID:?})"
-                )
-            }
-            DefinitionError::UnsupportedVersion { version } => {
-                write!(
-                    f,
-                    "unsupported definition version {version} (expected {DEFINITION_SCHEMA_VERSION})"
                 )
             }
             DefinitionError::EmptyOptions => {
@@ -171,7 +178,6 @@ impl std::error::Error for DefinitionError {
             DefinitionError::TooLarge { .. } => None,
             DefinitionError::Parse { source } => Some(source),
             DefinitionError::UnsupportedSchema { .. } => None,
-            DefinitionError::UnsupportedVersion { .. } => None,
             DefinitionError::EmptyOptions => None,
             DefinitionError::EmptyOptionId => None,
             DefinitionError::DuplicateOptionId { .. } => None,
@@ -181,22 +187,34 @@ impl std::error::Error for DefinitionError {
 
 impl Definition {
     /// JSON 文字列から定義ファイルをパースし、ガード層としての完全性検証
-    /// （`schema`/`version` の照合・選択肢の整合性）を行う（REQ-15）。
+    /// （`schema` の照合・選択肢の整合性）を行う（REQ-15）。本関数は公開 API で
+    /// あり、`Definition::load` が担うファイル経由のサイズ検証（REQ-39）を
+    /// 経由しない呼び出し（文字列を直接渡す呼び出し）もありうるため、
+    /// `serde_json::from_str` へ渡す前に入力バイト数を `MAX_DEFINITION_FILE_BYTES`
+    /// と照合する（PR #187 レビュー指摘: 公開パース API にも入力サイズ上限を
+    /// 適用する。無制限のメモリ消費を防ぐ）。
     /// 必須項目欠落等のこれ以外の詳細検証は TASK-15.3-2 で追加する。
     pub fn parse(text: &str) -> Result<Self, DefinitionError> {
+        let size = text.len() as u64;
+        if size > MAX_DEFINITION_FILE_BYTES {
+            return Err(DefinitionError::TooLarge {
+                path: None,
+                size,
+                limit: MAX_DEFINITION_FILE_BYTES,
+            });
+        }
+
         let definition: Definition =
             serde_json::from_str(text).map_err(|source| DefinitionError::Parse { source })?;
 
-        // 完全性と版（security.md「ガード層: 完全性と版」）: 異なるスキーマ形式・
-        // 将来版の定義をそのまま正常な `Definition` として後続処理へ渡さない。
+        // 完全性と版（security.md「ガード層: 完全性と版」）: 異なるスキーマ形式の
+        // 定義をそのまま正常な `Definition` として後続処理へ渡さない。`version`
+        // フィールドはカタログ上のドキュメントバージョン（`name` と並ぶメタ情報）
+        // であり、形式・版の識別を担う第二のスキーマ固定値としては扱わない
+        // （PR #187 レビュー指摘。有効な定義の後続版を誤って拒否しないため）。
         if definition.schema != SCHEMA_ID {
             return Err(DefinitionError::UnsupportedSchema {
                 schema: definition.schema,
-            });
-        }
-        if definition.version != DEFINITION_SCHEMA_VERSION {
-            return Err(DefinitionError::UnsupportedVersion {
-                version: definition.version,
             });
         }
 
@@ -247,7 +265,7 @@ impl Definition {
         let reported_size = metadata.len();
         if reported_size > MAX_DEFINITION_FILE_BYTES {
             return Err(DefinitionError::TooLarge {
-                path: path.to_path_buf(),
+                path: Some(path.to_path_buf()),
                 size: reported_size,
                 limit: MAX_DEFINITION_FILE_BYTES,
             });
@@ -266,7 +284,7 @@ impl Definition {
         let actual_size = buf.len() as u64;
         if actual_size > MAX_DEFINITION_FILE_BYTES {
             return Err(DefinitionError::TooLarge {
-                path: path.to_path_buf(),
+                path: Some(path.to_path_buf()),
                 size: actual_size,
                 limit: MAX_DEFINITION_FILE_BYTES,
             });
@@ -352,10 +370,13 @@ mod tests {
         ));
     }
 
-    /// security.md「ガード層: 完全性と版」: `DEFINITION_SCHEMA_VERSION` と異なる
-    /// `version`（未対応の将来版を含む）は拒否する。
+    /// PR #187 レビュー指摘: `version` はカタログ上のドキュメントバージョン
+    /// （`name` と並ぶメタ情報）であり、`schema`/`SCHEMA_ID` とは独立した
+    /// 第二のスキーマ固定値として扱わない。`schema` が一致する限り、
+    /// `DEFINITION_SCHEMA_VERSION`（1）と異なる `version`（将来のドキュメント
+    /// 版）でも定義として受理する。
     #[test]
-    fn req15_rejects_unsupported_version() {
+    fn req15_accepts_definition_with_catalog_version_other_than_schema_version() {
         let json = r#"{
             "schema": "fandhe-edge-model-definition/v1",
             "name": "sample_topic",
@@ -366,11 +387,9 @@ mod tests {
             ],
             "io": { "input": "bytes" }
         }"#;
-        let err = Definition::parse(json).unwrap_err();
-        assert!(matches!(
-            err,
-            DefinitionError::UnsupportedVersion { version: 2 }
-        ));
+        let def =
+            Definition::parse(json).expect("version はカタログのメタ情報であり拒否対象ではない");
+        assert_eq!(def.version, 2);
     }
 
     /// REQ-15: `options` が空だと固定選択肢からの判定が成立しないため拒否する。
@@ -426,9 +445,25 @@ mod tests {
         ));
     }
 
+    /// PR #187 レビュー指摘（P0）: 公開パース API `Definition::parse` は
+    /// `Definition::load` のファイル経由サイズ検証を経由しない呼び出し
+    /// （文字列を直接渡す呼び出し）でも、`serde_json::from_str` へ渡す前に
+    /// `MAX_DEFINITION_FILE_BYTES` 超の入力を拒否することを確認する（REQ-39）。
+    /// `path` を持たない呼び出しのため `TooLarge.path` は `None` になる。
+    #[test]
+    fn req39_parse_rejects_oversized_input_without_path() {
+        let oversized_json = "a".repeat(usize::try_from(MAX_DEFINITION_FILE_BYTES).unwrap() + 1);
+        let err = Definition::parse(&oversized_json).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TooLarge { path: None, limit, .. } if limit == MAX_DEFINITION_FILE_BYTES
+        ));
+    }
+
     /// REQ-39: サイズ確認と読み込みを同一ファイルハンドルに対して行い、
     /// 上限（`MAX_DEFINITION_FILE_BYTES`）超のファイルを内容の全量読み込み
-    /// なしに拒否することを確認する（TOCTOU 対策の回帰）。
+    /// なしに拒否することを確認する（TOCTOU 対策の回帰）。`load` 経由では
+    /// ファイルパスを保持するため `TooLarge.path` は `Some` になる。
     #[test]
     fn req39_load_rejects_file_over_size_limit_without_full_read() {
         let dir = std::env::temp_dir().join(format!(
@@ -447,9 +482,10 @@ mod tests {
         std::fs::write(&path, &oversized).expect("テスト用ファイルを書き込めるはず");
 
         let err = Definition::load(&path).unwrap_err();
-        assert!(
-            matches!(err, DefinitionError::TooLarge { limit, .. } if limit == MAX_DEFINITION_FILE_BYTES)
-        );
+        assert!(matches!(
+            err,
+            DefinitionError::TooLarge { path: Some(_), limit, .. } if limit == MAX_DEFINITION_FILE_BYTES
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }
