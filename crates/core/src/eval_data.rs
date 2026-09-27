@@ -27,7 +27,10 @@ pub struct FreezeRecord {
     pub path: PathBuf,
     /// 生バイト列の sha256（小文字 16 進 64 桁）。
     pub sha256: String,
-    /// 凍結時点のファイルサイズ（バイト）。
+    /// 実際に読み込んで `sha256` の計算対象にしたバイト数。`stat` 由来の
+    /// メタデータ値ではなく、ストリーミング読み込みで実際にハッシュへ通したバイト数を
+    /// 記録する（`crates/data` の `eval_freeze` 実装が担う TOCTOU 対策。
+    /// `metadata()` 取得後にファイルが変化しても、この値は `sha256` と必ず対応する）。
     pub byte_len: u64,
 }
 

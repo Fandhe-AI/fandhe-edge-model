@@ -17,7 +17,7 @@
 //!   受け取る前提とし、ガード層（REQ-39）相当の中途半端な検証をここでは行わない
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 use fandhe_edge_core::eval_data::{EvalDataStatus, FreezeRecord};
@@ -32,7 +32,15 @@ pub enum FreezeError {
     NotFound(io::Error),
     /// ファイルサイズが上限（[`MAX_EVAL_DATA_BYTES`]）を超えている。
     /// REQ-39「読み込み前にサイズを確認する」ため、`File::open` の前に検出して拒否する。
+    /// `metadata()` 取得後にファイルが成長する TOCTOU に備え、実読み込み量が上限を
+    /// 超えた場合（後述の `.take()` 経由）にもこのバリアントで拒否する。
     TooLarge { limit: u64, actual: u64 },
+    /// 通常ファイルではないパス（キャラクタデバイス・FIFO・ディレクトリ・symlink の
+    /// 解決先等）が指定された。`/dev/zero` のようなキャラクタデバイスは `stat` 上の
+    /// サイズが 0 のため [`TooLarge`](FreezeError::TooLarge) 検査を素通りし、
+    /// ストリーミング読み込みが EOF に到達せず無限に読み続けてしまう
+    /// （REQ-39「無制限の…無限待ちを作らない」）ため、サイズ検証の前に拒否する。
+    NotAFile,
     /// 上記以外の I/O エラー（メタデータ取得・読み込み中のエラー等）。
     Io(io::Error),
 }
@@ -45,6 +53,9 @@ impl std::fmt::Display for FreezeError {
                 f,
                 "evaluation data exceeds size limit: limit={limit} actual={actual}"
             ),
+            FreezeError::NotAFile => {
+                write!(f, "evaluation data path is not a regular file")
+            }
             FreezeError::Io(err) => write!(f, "evaluation data I/O error: {err}"),
         }
     }
@@ -55,8 +66,12 @@ impl std::error::Error for FreezeError {}
 /// 評価データを凍結する。
 ///
 /// - `path` が `None` の場合: I/O を一切行わず `Ok(EvalDataStatus::NotProvided)` を返す。
-/// - `path` が `Some` の場合: ファイルサイズを確認してから（上限超過ならファイルを
-///   開かずに拒否）、ストリーミングで sha256 を計算し `EvalDataStatus::Frozen` を返す。
+/// - `path` が `Some` の場合: 通常ファイルであること・ファイルサイズを確認してから
+///   （非通常ファイル・上限超過ならファイルを開かずに拒否）、ストリーミングで
+///   sha256 を計算し `EvalDataStatus::Frozen` を返す。読み込みは
+///   `MAX_EVAL_DATA_BYTES + 1` バイトで打ち切り、`metadata()` 取得後にファイルが
+///   成長する TOCTOU（実読み込み量が事前チェックしたサイズを上回るケース）も
+///   検出して拒否する（REQ-39「無制限のアロケーション・無限待ちを作らない」）。
 ///
 /// ハッシュ計算対象のファイル内容（データ本文）は返り値・エラーメッセージに含めない
 /// （security.md「秘密情報の混入防止」「機微情報の露出」。学習・評価データに
@@ -73,6 +88,12 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
             FreezeError::Io(err)
         }
     })?;
+    // 通常ファイル以外（キャラクタデバイス・FIFO・ディレクトリ等）は、`stat` 上の
+    // サイズがハッシュ対象の実データ量と無関係（`/dev/zero` は 0 バイトだが読むと
+    // 終端しない）なため、サイズ検査より先に拒否する。
+    if !metadata.is_file() {
+        return Err(FreezeError::NotAFile);
+    }
     let byte_len = metadata.len();
     if byte_len > MAX_EVAL_DATA_BYTES {
         return Err(FreezeError::TooLarge {
@@ -88,11 +109,55 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
             FreezeError::Io(err)
         }
     })?;
-    let sha256 = sha256_hex_of_reader(io::BufReader::new(file)).map_err(FreezeError::Io)?;
+    // 実読み込み量にも上限を課す（`.take(limit + 1)`）。metadata 取得後にファイルが
+    // 成長した場合でも、上限超過分を読み進めた時点で確実に止まる。
+    let read_limit = MAX_EVAL_DATA_BYTES.saturating_add(1);
+    let mut counting = CountingReader::new(io::BufReader::new(file).take(read_limit));
+    let sha256 = sha256_hex_of_reader(&mut counting).map_err(FreezeError::Io)?;
+    let actual_read = counting.count();
+    if actual_read > MAX_EVAL_DATA_BYTES {
+        return Err(FreezeError::TooLarge {
+            limit: MAX_EVAL_DATA_BYTES,
+            actual: actual_read,
+        });
+    }
 
     Ok(EvalDataStatus::Frozen(FreezeRecord {
         path: path.to_path_buf(),
         sha256,
-        byte_len,
+        // `metadata.len()` ではなく実際に読み込んだ（＝ハッシュした）バイト数を
+        // 記録する。TOCTOU でファイルが縮んだ場合でも記録値とハッシュ対象が
+        // 食い違わないようにするため（REQ-17 の記録整合性）。
+        byte_len: actual_read,
     }))
+}
+
+/// 読み込んだバイト数を数えながら委譲する [`Read`] ラッパー。
+///
+/// `.take(limit)` と組み合わせ、上限ちょうどまで読ませた実バイト数を
+/// 呼び出し元が事後に検査できるようにするために使う（このモジュールの
+/// TOCTOU 対策専用の内部実装）。
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: Read> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read_len = self.inner.read(buf)?;
+        // u64 への変換失敗（32bit 環境で usize が u64 を超えることはないが、念のため
+        // checked 演算で明示する。REQ-39 系の外部入力パスでは `unwrap` を避ける方針）。
+        self.count = self.count.saturating_add(read_len as u64);
+        Ok(read_len)
+    }
 }

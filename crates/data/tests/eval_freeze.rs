@@ -116,3 +116,41 @@ fn freeze_eval_data_returns_too_large_for_oversized_file() {
         Ok(_) => panic!("expected TooLarge error, got Ok"),
     }
 }
+
+/// REQ-39 異常系（非通常ファイル）: `stat` 上のサイズが 0 のキャラクタデバイス
+/// （`/dev/zero`）は、ファイル種別の検証が無いと `TooLarge` 検査を素通りしたうえ
+/// `sha256_hex_of_reader` が EOF に到達せず無限に読み続ける。`FreezeError::NotAFile`
+/// で拒否することを確認する（Linux 実機・テストハーネス。`/dev/zero` が存在しない
+/// 環境では検証不能のため skip する）。
+#[test]
+fn freeze_eval_data_returns_not_a_file_for_character_device() {
+    let dev_zero = Path::new("/dev/zero");
+    if !dev_zero.exists() {
+        eprintln!("skip: /dev/zero not available on this platform");
+        return;
+    }
+
+    let result = freeze_eval_data(Some(dev_zero));
+
+    match result {
+        Err(FreezeError::NotAFile) => {}
+        Err(other) => panic!("expected NotAFile, got {other}"),
+        Ok(_) => panic!("expected NotAFile error, got Ok"),
+    }
+}
+
+/// REQ-39 異常系（非通常ファイル）: ディレクトリを渡しても `NotAFile` で拒否する
+/// （`metadata()` 自体は成功するため、`is_file()` による種別検証が効いていることの
+/// 確認）。
+#[test]
+fn freeze_eval_data_returns_not_a_file_for_directory() {
+    let guard = TempDirGuard::new("directory-path");
+
+    let result = freeze_eval_data(Some(guard.path()));
+
+    match result {
+        Err(FreezeError::NotAFile) => {}
+        Err(other) => panic!("expected NotAFile, got {other}"),
+        Ok(_) => panic!("expected NotAFile error, got Ok"),
+    }
+}
