@@ -943,6 +943,86 @@ mod tests {
         assert_eq!(outcome.active.len(), 2);
     }
 
+    /// [`WarningCode::MissingPrediction`]: gold に対応する pred 行が無い場合、
+    /// 除外せず [`PredictionOutcome::Error`]（[`ErrorOrigin::MissingPrediction`]）
+    /// として含め、[`WarningAction::IncludeAsError`] で警告すること
+    /// （手順 7。レビュー指摘: issue #55 の未カバー分岐）。
+    #[test]
+    fn req23_missing_prediction_is_included_as_error() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n{\"id\":\"b\",\"label\":\"A\"}\n";
+        // b に対応する pred 行が無い。
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+
+        assert_eq!(outcome.warnings.len(), 1);
+        let warning = &outcome.warnings[0];
+        assert_eq!(warning.code, WarningCode::MissingPrediction);
+        assert_eq!(warning.action, WarningAction::IncludeAsError);
+        assert_eq!(warning.side, Side::Prediction);
+        assert_eq!(warning.lines, vec![2]);
+
+        assert_eq!(outcome.active.len(), 2);
+        let missing = outcome
+            .active
+            .iter()
+            .find(|row| row.gold_line == 2)
+            .expect("gold_line=2 must be present as an active row");
+        assert_eq!(
+            missing.prediction,
+            PredictionOutcome::Error(ErrorOrigin::MissingPrediction)
+        );
+        assert_eq!(missing.pred_line, None);
+    }
+
+    /// 手順 8: 複数種別の警告が同時発生した場合、Exclude 系
+    /// （[`WarningCode::MissingGold`]）→ IncludeAsError 系
+    /// （[`WarningCode::MissingPrediction`]）→ WarnInclude 系
+    /// （[`WarningCode::DuplicateInputWithinSplit`]）の順に並ぶこと。
+    /// `ORDER` 定数は手動保守のため、`WarningCode` が追加された際に
+    /// 追加漏れがあればこのテストが検出する（レビュー指摘: issue #55）。
+    #[test]
+    fn req23_multiple_warning_kinds_are_ordered_exclude_then_error_then_warn() {
+        let gold = concat!(
+            "{\"id\":\"g1\",\"label\":null}\n", // MissingGold（除外）
+            "{\"id\":\"g2\",\"input\":\"dup\",\"label\":\"A\"}\n",
+            "{\"id\":\"g3\",\"input\":\"dup\",\"label\":\"A\"}\n", // g2 と重複（警告のみ）
+            "{\"id\":\"g4\",\"label\":\"A\"}\n",                   // pred 行なし
+        );
+        let pred = concat!(
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g3\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+
+        let codes: Vec<WarningCode> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                WarningCode::MissingGold,
+                WarningCode::MissingPrediction,
+                WarningCode::DuplicateInputWithinSplit,
+            ]
+        );
+        assert_eq!(outcome.warnings[0].action, WarningAction::Exclude);
+        assert_eq!(outcome.warnings[0].lines, vec![1]);
+        assert_eq!(outcome.warnings[1].action, WarningAction::IncludeAsError);
+        assert_eq!(outcome.warnings[1].lines, vec![4]);
+        assert_eq!(outcome.warnings[2].action, WarningAction::WarnInclude);
+        assert_eq!(outcome.warnings[2].lines, vec![2, 3]);
+
+        // g1 は除外、g2・g3・g4 は含まれる（g4 は Error として含まれる）。
+        assert_eq!(outcome.active.len(), 3);
+        let g4 = outcome
+            .active
+            .iter()
+            .find(|row| row.gold_line == 4)
+            .expect("gold_line=4 must be present as an active row");
+        assert_eq!(
+            g4.prediction,
+            PredictionOutcome::Error(ErrorOrigin::MissingPrediction)
+        );
+    }
+
     /// `code()` の文字列。
     #[test]
     fn req23_code_strings() {

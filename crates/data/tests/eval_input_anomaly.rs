@@ -17,7 +17,10 @@ use fandhe_edge_data::eval_input::{
 /// `fixtures/evaluation_contract/<case>` への絶対パスを組み立てる。
 fn fixture_dir(case: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/evaluation_contract")
+        .join("..")
+        .join("..")
+        .join("fixtures")
+        .join("evaluation_contract")
         .join(case)
 }
 
