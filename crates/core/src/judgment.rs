@@ -490,6 +490,35 @@ mod tests {
         );
     }
 
+    /// REQ-21: `id` に二重引用符・改行・制御文字を含む場合でも、
+    /// `serde_json` のエスケープにより JSON 1 行（改行 1 つのみ）という
+    /// 出力契約が保たれること（Review 指摘: id の値に依らず契約を守る）。
+    #[test]
+    fn req21_escapes_id_with_quotes_newlines_and_control_chars() {
+        let options = [choice("a")];
+        let raw_id = "row\"with\nquote\tand\u{0007}control";
+        let result = JudgmentResult::new(&options, raw_id, "a", &[1.0]).unwrap();
+
+        assert_eq!(result.id(), raw_id);
+
+        let json = result.to_json_line().unwrap();
+        // 出力全体が 1 行（改行を含まない）であること。
+        assert_eq!(
+            json.matches('\n').count(),
+            0,
+            "must not contain raw newline"
+        );
+        assert_eq!(
+            json,
+            r#"{"id":"row\"with\nquote\tand\u0007control","status":"ok","predicted_label":"a","scores":{"a":1.0}}"#
+        );
+
+        // 直列化した JSON をパースし戻すと元の `id` と一致すること
+        // （エスケープが可逆であることの確認）。
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], raw_id);
+    }
+
     /// REQ-21: `exit_code()` の写像（入力 ID の不正 → 64、それ以外 → 70）。
     #[test]
     fn req21_error_exit_code_mapping() {

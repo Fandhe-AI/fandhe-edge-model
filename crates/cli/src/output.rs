@@ -97,6 +97,35 @@ mod tests {
         );
     }
 
+    /// REQ-21: `id` に二重引用符・改行・制御文字を含む場合でも、
+    /// 書き込まれるのは JSON 1 行＋末尾の改行 1 つのみであること
+    /// （Review 指摘: id の値に依らず「出力は 1 呼び出しにつき JSON 1 つ」
+    /// という出力契約を保つ）。
+    #[test]
+    fn req21_writes_single_line_when_id_contains_quotes_and_control_chars() {
+        let options = [choice("a")];
+        let raw_id = "row\"with\nquote\tand\u{0007}control";
+        let result = JudgmentResult::new(&options, raw_id, "a", &[1.0]).unwrap();
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let exit_code = write_ok_judgment(&mut buffer, &result).unwrap();
+        assert_eq!(exit_code, ExitCode::Ok);
+
+        let text = String::from_utf8(buffer).unwrap();
+        assert_eq!(
+            text.matches('\n').count(),
+            1,
+            "must write exactly one line even when id contains raw control chars"
+        );
+        assert!(text.ends_with('\n'));
+
+        let line = text.trim_end_matches('\n');
+        assert_eq!(
+            line,
+            r#"{"id":"row\"with\nquote\tand\u0007control","status":"ok","predicted_label":"a","scores":{"a":1.0}}"#
+        );
+    }
+
     /// 書き込みに失敗する `Write` を渡した場合、`Err` が返り
     /// `ExitCode::Ok` は返らないこと。
     #[test]
