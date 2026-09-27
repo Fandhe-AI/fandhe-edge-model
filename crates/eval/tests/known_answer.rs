@@ -175,13 +175,13 @@ fn known_answer_single_select_matches_hand_calculated_values() {
     );
 
     // accuracy.overall = 12/24, adopted_decision = 12/23（分母は abstain を除いた 23）。
-    assert_eq!(metrics.accuracy.overall.numerator, 12);
-    assert_eq!(metrics.accuracy.overall.denominator, 24);
-    assert!(approx_eq(metrics.accuracy.overall.value, 12.0 / 24.0));
+    assert_eq!(metrics.accuracy.overall.numerator(), 12);
+    assert_eq!(metrics.accuracy.overall.denominator(), 24);
+    assert!(approx_eq(metrics.accuracy.overall.value(), 12.0 / 24.0));
     let adopted = metrics.accuracy.adopted_decision.expect("not all abstain");
-    assert_eq!(adopted.numerator, 12);
-    assert_eq!(adopted.denominator, 23);
-    assert!(approx_eq(adopted.value, 12.0 / 23.0));
+    assert_eq!(adopted.numerator(), 12);
+    assert_eq!(adopted.denominator(), 23);
+    assert!(approx_eq(adopted.value(), 12.0 / 23.0));
 }
 
 /// REQ-24 正常系・TASK-24.1-1: majority 下限基準（全件 "A" 予測）で
@@ -208,16 +208,16 @@ fn majority_baseline_matches_hand_calculated_values() {
     assert_eq!(metrics.outcome_counts.error, 0);
 
     // accuracy.overall = 6/24 = 0.25。
-    assert_eq!(metrics.accuracy.overall.numerator, 6);
-    assert_eq!(metrics.accuracy.overall.denominator, 24);
-    assert!(approx_eq(metrics.accuracy.overall.value, 6.0 / 24.0));
+    assert_eq!(metrics.accuracy.overall.numerator(), 6);
+    assert_eq!(metrics.accuracy.overall.denominator(), 24);
+    assert!(approx_eq(metrics.accuracy.overall.value(), 6.0 / 24.0));
     // abstain が 0 件なので adopted_decision は overall と同じ値。
     let adopted = metrics
         .accuracy
         .adopted_decision
         .expect("no abstain in majority baseline");
-    assert_eq!(adopted.numerator, 6);
-    assert_eq!(adopted.denominator, 24);
+    assert_eq!(adopted.numerator(), 6);
+    assert_eq!(adopted.denominator(), 24);
 
     // A: P=6/24, R=1.0, F1=2/5。B/C/D: precision=None, recall=0.0, F1=Some(0.0)。
     let a = &metrics.per_label[0];

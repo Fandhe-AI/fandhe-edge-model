@@ -81,6 +81,16 @@ pub enum EvalError {
         /// `records` 内での位置（0 始まり）。
         index: usize,
     },
+    /// 集計中の桁あふれ、またはラベル添字・行列添字の不整合。
+    ///
+    /// `labels`・`records` の事前検証を通った時点で理論上到達しないが、
+    /// fail-closed のため checked 演算・`Vec` の範囲外添字アクセスの
+    /// ガードとして用意する。`UnknownGoldLabel`（正解ラベルがラベル集合に
+    /// 存在しないという、入力そのものの異常）とは意味が異なるため分離した。
+    Internal {
+        /// 発生箇所の説明（人が読める短い文字列。機械照合はしない）。
+        detail: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -95,22 +105,24 @@ impl fmt::Display for EvalError {
             EvalError::UnknownGoldLabel { index } => {
                 write!(f, "unknown gold label at record index {index}")
             }
+            EvalError::Internal { detail } => {
+                write!(f, "internal aggregation error: {detail}")
+            }
         }
     }
 }
 
 impl std::error::Error for EvalError {}
 
-/// 分子・分母を保持する比率。分母 0 のときに `value` を作らせないため、
-/// 生成は [`Ratio::new`] に集約する。
+/// 分子・分母を保持する比率。フィールドは非公開にし、分母 0 の壊れた値
+/// （例: `denominator: 0` かつ `value: f64::NAN`）を外部から構築できない
+/// ようにする（`.claude/rules/coding-rust.md`「判定結果...は壊れた値を
+/// 表現できない型にする」）。生成は [`Ratio::new`] に集約する。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ratio {
-    /// 分子。
-    pub numerator: u64,
-    /// 分母。
-    pub denominator: u64,
-    /// `numerator as f64 / denominator as f64`。
-    pub value: f64,
+    numerator: u64,
+    denominator: u64,
+    value: f64,
 }
 
 impl Ratio {
@@ -124,6 +136,21 @@ impl Ratio {
             denominator,
             value: numerator as f64 / denominator as f64,
         })
+    }
+
+    /// 分子。
+    pub fn numerator(&self) -> u64 {
+        self.numerator
+    }
+
+    /// 分母（0 にはならない。0 になりうる場合は [`Ratio::new`] が `None` を返す）。
+    pub fn denominator(&self) -> u64 {
+        self.denominator
+    }
+
+    /// `numerator as f64 / denominator as f64`。
+    pub fn value(&self) -> f64 {
+        self.value
     }
 }
 
@@ -222,18 +249,32 @@ impl ConfusionMatrix {
         self.rows.get(gold_index)?.get(col).copied()
     }
 
-    fn increment(&mut self, gold_index: usize, column: ConfusionColumn) -> Result<(), EvalError> {
+    /// `record_index` はエラーメッセージにのみ使う（`records` 内での位置）。
+    fn increment(
+        &mut self,
+        gold_index: usize,
+        column: ConfusionColumn,
+        record_index: usize,
+    ) -> Result<(), EvalError> {
         let col = self
             .column_index(column)
-            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
+            .ok_or_else(|| EvalError::Internal {
+                detail: format!(
+                    "confusion matrix column out of range at record index {record_index}"
+                ),
+            })?;
         let cell = self
             .rows
             .get_mut(gold_index)
             .and_then(|row| row.get_mut(col))
-            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
-        *cell = cell
-            .checked_add(1)
-            .ok_or(EvalError::UnknownGoldLabel { index: gold_index })?;
+            .ok_or_else(|| EvalError::Internal {
+                detail: format!(
+                    "confusion matrix cell out of range at record index {record_index}"
+                ),
+            })?;
+        *cell = cell.checked_add(1).ok_or_else(|| EvalError::Internal {
+            detail: format!("confusion matrix count overflow at record index {record_index}"),
+        })?;
         Ok(())
     }
 
@@ -304,16 +345,25 @@ pub fn evaluate_single_select(
     let mut outcome_counts = OutcomeCounts::default();
     let mut correct: u64 = 0;
 
+    // checked 演算のオーバーフロー時に埋める `EvalError`。record 位置由来だが
+    // 「正解ラベル未知」ではなく内部の集計不整合なので `Internal` を使う
+    // （`UnknownGoldLabel` は record 中の `gold` がラベル集合に無い場合専用）。
+    let overflow_at = |index: usize, what: &str| EvalError::Internal {
+        detail: format!("{what} overflow at record index {index}"),
+    };
+
     for (index, record) in records.iter().enumerate() {
         let gold_index = *label_index
             .get(record.gold)
             .ok_or(EvalError::UnknownGoldLabel { index })?;
-        support[gold_index] = support
-            .get(gold_index)
-            .copied()
-            .unwrap_or(0)
+        let support_slot = support
+            .get_mut(gold_index)
+            .ok_or_else(|| EvalError::Internal {
+                detail: format!("support index out of range at record index {index}"),
+            })?;
+        *support_slot = support_slot
             .checked_add(1)
-            .ok_or(EvalError::UnknownGoldLabel { index })?;
+            .ok_or_else(|| overflow_at(index, "support"))?;
 
         let column = match record.outcome {
             Outcome::Label(predicted) => match label_index.get(predicted.as_str()) {
@@ -321,18 +371,22 @@ pub fn evaluate_single_select(
                     outcome_counts.ok = outcome_counts
                         .ok
                         .checked_add(1)
-                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                        .ok_or_else(|| overflow_at(index, "outcome_counts.ok"))?;
                     if predicted_index == gold_index {
                         correct = correct
                             .checked_add(1)
-                            .ok_or(EvalError::UnknownGoldLabel { index })?;
+                            .ok_or_else(|| overflow_at(index, "correct"))?;
                     }
-                    let slot = predicted_count
-                        .get_mut(predicted_index)
-                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    let slot = predicted_count.get_mut(predicted_index).ok_or_else(|| {
+                        EvalError::Internal {
+                            detail: format!(
+                                "predicted_count index out of range at record index {index}"
+                            ),
+                        }
+                    })?;
                     *slot = slot
                         .checked_add(1)
-                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                        .ok_or_else(|| overflow_at(index, "predicted_count"))?;
                     ConfusionColumn::Label(predicted_index)
                 }
                 None => {
@@ -341,7 +395,7 @@ pub fn evaluate_single_select(
                     outcome_counts.invalid = outcome_counts
                         .invalid
                         .checked_add(1)
-                        .ok_or(EvalError::UnknownGoldLabel { index })?;
+                        .ok_or_else(|| overflow_at(index, "outcome_counts.invalid"))?;
                     ConfusionColumn::Invalid
                 }
             },
@@ -349,29 +403,37 @@ pub fn evaluate_single_select(
                 outcome_counts.invalid = outcome_counts
                     .invalid
                     .checked_add(1)
-                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    .ok_or_else(|| overflow_at(index, "outcome_counts.invalid"))?;
                 ConfusionColumn::Invalid
             }
             Outcome::Abstain => {
                 outcome_counts.abstain = outcome_counts
                     .abstain
                     .checked_add(1)
-                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    .ok_or_else(|| overflow_at(index, "outcome_counts.abstain"))?;
                 ConfusionColumn::Abstain
             }
             Outcome::Error => {
                 outcome_counts.error = outcome_counts
                     .error
                     .checked_add(1)
-                    .ok_or(EvalError::UnknownGoldLabel { index })?;
+                    .ok_or_else(|| overflow_at(index, "outcome_counts.error"))?;
                 ConfusionColumn::Error
             }
         };
 
-        confusion.increment(gold_index, column)?;
+        confusion.increment(gold_index, column, index)?;
     }
 
     let n_total: u64 = records.len() as u64;
+
+    // ラベル添字 `i` に由来する内部不整合（`support`・`predicted_count` は
+    // `n_labels` 件で確保済みのため理論上到達しないが、外部入力の経路では
+    // `[]` を使わず fail-closed で扱う。`records` 内の位置とは無関係なので
+    // `EvalError::UnknownGoldLabel` ではなく `Internal` を使う）。
+    let label_internal = |label_index: usize, what: &str| EvalError::Internal {
+        detail: format!("{what} out of range at label index {label_index}"),
+    };
 
     let mut per_label = Vec::with_capacity(n_labels);
     let mut f1_sum = 0.0f64;
@@ -379,19 +441,17 @@ pub fn evaluate_single_select(
     for (i, &label) in labels.iter().enumerate() {
         let tp = confusion
             .get(i, ConfusionColumn::Label(i))
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
-        let support_i = *support
-            .get(i)
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+            .ok_or_else(|| label_internal(i, "confusion"))?;
+        let support_i = *support.get(i).ok_or_else(|| label_internal(i, "support"))?;
         let predicted_i = *predicted_count
             .get(i)
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+            .ok_or_else(|| label_internal(i, "predicted_count"))?;
         let fp = predicted_i
             .checked_sub(tp)
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+            .ok_or_else(|| label_internal(i, "false_positive"))?;
         let fn_ = support_i
             .checked_sub(tp)
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+            .ok_or_else(|| label_internal(i, "false_negative"))?;
 
         let precision = if predicted_i == 0 {
             None
@@ -409,7 +469,7 @@ pub fn evaluate_single_select(
             .checked_mul(2)
             .and_then(|v| v.checked_add(fp))
             .and_then(|v| v.checked_add(fn_))
-            .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+            .ok_or_else(|| label_internal(i, "f1_denominator"))?;
         let f1 = if f1_denominator == 0 {
             None
         } else {
@@ -420,7 +480,7 @@ pub fn evaluate_single_select(
             f1_sum += f1_value;
             f1_count = f1_count
                 .checked_add(1)
-                .ok_or(EvalError::UnknownGoldLabel { index: i })?;
+                .ok_or_else(|| label_internal(i, "f1_count"))?;
         }
 
         per_label.push(LabelMetrics {
@@ -563,11 +623,15 @@ mod tests {
         ];
         let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
         assert_eq!(metrics.n_total, 2);
-        assert!(approx_eq(metrics.accuracy.overall.value, 1.0));
-        assert_eq!(metrics.accuracy.overall.numerator, 2);
-        assert_eq!(metrics.accuracy.overall.denominator, 2);
+        assert!(approx_eq(metrics.accuracy.overall.value(), 1.0));
+        assert_eq!(metrics.accuracy.overall.numerator(), 2);
+        assert_eq!(metrics.accuracy.overall.denominator(), 2);
         assert!(approx_eq(
-            metrics.accuracy.adopted_decision.expect("no abstain").value,
+            metrics
+                .accuracy
+                .adopted_decision
+                .expect("no abstain")
+                .value(),
             1.0
         ));
         assert!(approx_eq(metrics.macro_f1.expect("defined"), 1.0));
@@ -612,6 +676,20 @@ mod tests {
         let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
         assert_eq!(metrics.outcome_counts.invalid, 1);
         assert_eq!(metrics.confusion.get(0, ConfusionColumn::Invalid), Some(1));
-        assert!(approx_eq(metrics.accuracy.overall.value, 0.0));
+        assert!(approx_eq(metrics.accuracy.overall.value(), 0.0));
+        // 評価契約（.claude/rules/evaluation-contract.md「有意性・指標」）:
+        // 分母 0 の指標は null（`None`）とし、平均から除外する。
+        // A: support=1・tp=0・fp=0・fn_=1 → f1 = 2*0/(2*0+0+1) = 0.0。
+        assert_eq!(metrics.per_label[0].label, "A");
+        assert_eq!(metrics.per_label[0].support, 1);
+        assert_eq!(metrics.per_label[0].f1, Some(0.0));
+        // B: support=0（predicted_count も 0）→ precision・recall・f1 いずれも None。
+        assert_eq!(metrics.per_label[1].label, "B");
+        assert_eq!(metrics.per_label[1].support, 0);
+        assert_eq!(metrics.per_label[1].precision, None);
+        assert_eq!(metrics.per_label[1].recall, None);
+        assert_eq!(metrics.per_label[1].f1, None);
+        // macro_f1 は f1 が定義できた A だけの平均（B は除外）。
+        assert_eq!(metrics.macro_f1, Some(0.0));
     }
 }
