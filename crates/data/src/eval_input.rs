@@ -183,8 +183,9 @@ impl WarningAction {
 /// gold ラベルが食い違うグループ。ケース 7）・`InvalidScore`（ケース 10）・
 /// `UnseenClass`（ケース 9）・`AllAbstain`（ケース 11）・`AllError`（ケース 12）を
 /// 追加する想定。本モジュールはそれらの分岐点（[`find_duplicate_input_lines`]
-/// が労合するグループのうちラベルが食い違うものを警告しないことで、追加の
-/// 分岐を差し込む余地を残している）だけを用意する。
+/// が正規化 input とラベルの組でグループ化し、ラベルが食い違う行同士を
+/// 警告対象に含めないことで、矛盾検出を差し込む余地を残している）だけを
+/// 用意する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WarningCode {
     /// gold の正解が欠落している（`label` が無い・`null`。ケース 2）。
@@ -441,29 +442,34 @@ fn normalize_input(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 正規化した `input` が一致し、gold ラベルも一致するグループの行番号を集める
-/// （手順 7・ケース 6）。ラベルが食い違うグループは対象外とする
-/// （[`WarningCode::DuplicateInputWithinSplit`] の doc 参照）。
+/// 正規化した `input` が一致し、かつ gold ラベルも一致する行番号を集める
+/// （手順 7・ケース 6）。同じ正規化 `input` でもラベルが異なる行同士は
+/// 対象外とする（[`WarningCode::DuplicateInputWithinSplit`] の doc 参照。
+/// 矛盾検出は TASK-23.1-2 の `ContradictoryInput` が扱う）。
+///
+/// 判定は「正規化 input」だけでなく「正規化 input とラベルの組」でグループ化
+/// することに注意する。例えば同じ input に対して gold ラベルが `A, A, B` の
+/// 3 行がある場合、先頭 2 行（ラベル `A` の重複）はケース 6 に該当するため
+/// 警告に含め、3 行目（ラベル `B`）は単独なので警告に含めない。以前の実装は
+/// 正規化 input 単位でグループ化し、グループ内の全行のラベルが一致する場合
+/// だけ警告していたため、この例のようにラベルが混在すると先頭 2 行の重複まで
+/// 警告から漏れていた（issue #55 レビュー指摘。#203）。
 fn find_duplicate_input_lines(rows: &[(usize, String, &Map<String, Value>)]) -> BTreeSet<usize> {
-    // 正規化 input -> [(line, label)]。BTreeMap で決定的な順序を保つ。
-    let mut groups: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
+    // (正規化 input, ラベル) -> [line]。BTreeMap で決定的な順序を保つ。
+    let mut groups: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
     for (line, label, fields) in rows {
         if let Some(input) = fields.get("input").and_then(Value::as_str) {
             groups
-                .entry(normalize_input(input))
+                .entry((normalize_input(input), label.as_str()))
                 .or_default()
-                .push((*line, label.as_str()));
+                .push(*line);
         }
     }
 
     let mut warned = BTreeSet::new();
-    for members in groups.values() {
-        if members.len() < 2 {
-            continue;
-        }
-        let first_label = members[0].1;
-        if members.iter().all(|(_, label)| *label == first_label) {
-            warned.extend(members.iter().map(|(line, _)| *line));
+    for lines in groups.values() {
+        if lines.len() >= 2 {
+            warned.extend(lines.iter().copied());
         }
     }
     warned
@@ -991,6 +997,27 @@ mod tests {
         let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B"])).unwrap();
         assert!(outcome.warnings.is_empty());
         assert_eq!(outcome.active.len(), 2);
+    }
+
+    /// 同じ正規化 input に対して同一ラベルの重複と、食い違うラベルの行が
+    /// 混在する場合（`A, A, B`）、同一ラベルの 2 行だけを重複として警告し、
+    /// 食い違う 1 行はどちらの警告にも含めない（PR #203 レビュー指摘: 旧実装は
+    /// グループ内の全行のラベルが一致する場合のみ警告しており、この例では
+    /// 先頭 2 行の重複警告まで消えてしまっていた）。
+    #[test]
+    fn req23_duplicate_and_contradictory_labels_can_coexist_in_one_group() {
+        let gold = "{\"id\":\"a\",\"input\":\"foo\",\"label\":\"A\"}\n{\"id\":\"b\",\"input\":\"foo\",\"label\":\"A\"}\n{\"id\":\"c\",\"input\":\"foo\",\"label\":\"B\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n{\"id\":\"c\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A", "B"])).unwrap();
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0].code,
+            WarningCode::DuplicateInputWithinSplit
+        );
+        // 3 行目（label=B）は先頭 2 行（label=A）との重複でも矛盾検出の対象でも
+        // ないため、警告の行番号に含まれない。
+        assert_eq!(outcome.warnings[0].lines, vec![1, 2]);
+        assert_eq!(outcome.active.len(), 3);
     }
 
     /// [`WarningCode::MissingPrediction`]: gold に対応する pred 行が無い場合、
