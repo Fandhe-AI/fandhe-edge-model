@@ -507,6 +507,12 @@ pub fn inspect_records(
         // キーとしての契約の一部であるため、2 回目以降の出現は record_has_error を
         // 立てて valid_records から除外する（初出の行は他に異常が無ければ残る）。
         // これにより valid_records 内で id が重複することはない。
+        //
+        // seen_ids へ登録するのはこの時点まで他に異常が無いレコード（other_fields_ok）
+        // に限る。無効な初出レコード（input 欠落等で record_has_error が既に立っている）
+        // の id を登録すると、後続の同一 id を持つ妥当なレコードまで DuplicateId として
+        // valid_records から誤って除外してしまうため（レビュー指摘。REQ-16）。
+        let other_fields_ok = !record_has_error;
         if let Some(ref id) = id_opt {
             match seen_ids.get(id) {
                 Some(&first_line) => {
@@ -518,7 +524,9 @@ pub fn inspect_records(
                     record_has_error = true;
                 }
                 None => {
-                    seen_ids.insert(id.clone(), line);
+                    if other_fields_ok {
+                        seen_ids.insert(id.clone(), line);
+                    }
                 }
             }
         }
@@ -799,6 +807,35 @@ mod tests {
         assert_eq!(outcome.valid_records.len(), 1);
         assert_eq!(outcome.valid_records[0].line, 1);
         assert_eq!(outcome.valid_records[0].input, "a".to_string());
+    }
+
+    /// P1 修正の回帰確認（PR #191 レビュー指摘・codex/review）: `input` 欠落等で
+    /// 無効な初出レコードの `id` を `seen_ids` へ登録してはならない。登録すると
+    /// 後続の同一 `id` を持つ妥当なレコードまで `DuplicateId` として誤って
+    /// `valid_records` から除外され、REQ-16 の妥当なレコード抽出を壊す。
+    #[test]
+    fn invalid_first_record_id_does_not_block_later_valid_record_with_same_id() {
+        let content = "\
+{\"id\":\"r1\",\"output\":{\"intent\":\"ok\"}}
+{\"id\":\"r1\",\"input\":\"b\",\"output\":{\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        // 1 行目は input 欠落で無効（MissingField 相当）であり、DuplicateId は
+        // 発生しない（2 行目は妥当なレコードとして残るべきである）。
+        assert!(
+            outcome
+                .anomalies
+                .iter()
+                .all(|a| !matches!(a.code, AnomalyCode::DuplicateId { .. })),
+            "無効な初出レコードの id が重複判定に使われてはならない: {:?}",
+            outcome.anomalies
+        );
+        assert_eq!(outcome.valid_records.len(), 1);
+        assert_eq!(outcome.valid_records[0].line, 2);
+        assert_eq!(outcome.valid_records[0].id, "r1".to_string());
+        assert_eq!(outcome.valid_records[0].input, "b".to_string());
     }
 
     #[test]
