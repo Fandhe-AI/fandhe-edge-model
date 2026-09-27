@@ -424,8 +424,8 @@ fn req23_case09_unseen_class_warn_include() {
 /// ケース 10: 不正なスコア（NaN・無限大・負値・合計が 1 から外れる）は
 /// 除外せず [`ErrorOrigin::InvalidScore`] として含め、不正解として数える
 /// （v1.1 addendum A-2。モジュール doc「PoC-9 との差分」参照。
-/// `expected.json` は v1.0 の `warn_exclude` のままだが、本テストは v1.1 の
-/// 挙動を照合する）。
+/// `expected.json` もレビュー指摘（PR #204）を受けて v1.1 の
+/// `include_as_error`（分母 5 件）へ更新済みで、本テストと同じ挙動を記録する）。
 #[test]
 fn req23_case10_invalid_score_include_as_error() {
     let gold = read_fixture("anomaly/10-invalid-score", "gold.jsonl");

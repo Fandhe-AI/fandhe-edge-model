@@ -59,12 +59,13 @@
 //!   視認できるテキストと異なる値で評価が進む安全性の問題になる。そのため
 //!   本モジュールは重複キーを検出した時点で [`EvalInputStop::DuplicateKey`]
 //!   として処理全体を停止する（安全側に倒す判断は `InvalidId` と同じ理由）
-//! - ケース 10（`anomaly/10-invalid-score`）の `expected.json` は PoC-9
-//!   **v1.0** 時点の記述（`warn_exclude`）のまま移植されている。v1.1
-//!   （addendum A-2）では「除外せず error として分母に含め、不正解として
-//!   数える」へ変更されており、本モジュールは v1.1 の挙動
-//!   （[`WarningAction::IncludeAsError`]・[`WarningCode::InvalidScore`]）を
-//!   固定する。addendum A-4 がスコア合計の許容差を `1e-6` と定めている
+//! - ケース 10（`anomaly/10-invalid-score`）は PoC-9 **v1.0** 時点の記述
+//!   （`warn_exclude`）ではなく、v1.1（addendum A-2）の「除外せず error として
+//!   分母に含め、不正解として数える」挙動を固定する
+//!   （[`WarningAction::IncludeAsError`]・[`WarningCode::InvalidScore`]）。
+//!   `expected.json` もレビュー指摘（PR #204）を受けて v1.1 の
+//!   `include_as_error`（分母 5 件）へ更新済みで、v1.0 の記述は残っていない。
+//!   addendum A-4 がスコア合計の許容差を `1e-6` と定めている
 //!   （[`SCORE_SUM_TOLERANCE`] の doc 参照）
 //! - pred 側の `NaN`・`Infinity`・`-Infinity`（JSON 標準外リテラル。PoC-9
 //!   の Python `json` は `allow_nan=True` で既定受理する）は、厳密パースが
@@ -218,7 +219,7 @@ pub enum WarningCode {
     /// `active` な gold 行に対応する pred 行が無い。
     MissingPrediction,
     /// pred の `scores` が不正（欠損の型・NaN・無限大・負値・合計が 1 から
-    /// 5e-7 を超えて外れる。ケース 10）。除外せず
+    /// [`SCORE_SUM_TOLERANCE`]（`1e-6`）を超えて外れる。ケース 10）。除外せず
     /// [`PredictionOutcome::Error`]（[`ErrorOrigin::InvalidScore`]）として
     /// 含め、不正解として数える（評価を甘く見せないため。addendum A-2）。
     InvalidScore,
