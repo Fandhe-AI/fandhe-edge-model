@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "description": "REQ-21 / TASK-21.1 exit codes (7 kinds). Single source of truth is crates/core/src/exitcode.rs. Both Rust and trainer tests cross-check against this fixture. Do not relax the values to make tests pass (#179)."
+  },
+  "exit_codes": [
+    { "name": "ok", "code": 0 },
+    { "name": "judged_fail", "code": 10 },
+    { "name": "out_of_scope", "code": 11 },
+    { "name": "pending", "code": 12 },
+    { "name": "limit_exceeded", "code": 20 },
+    { "name": "invalid_input", "code": 64 },
+    { "name": "runtime_error", "code": 70 }
+  ]
+}
