@@ -5,7 +5,9 @@
 //! 一気通貫で確認する。一時ファイルはリポジトリ外（`std::env::temp_dir()`）に
 //! 作成し、テスト終了時に削除する。
 
-use fandhe_edge_core::definition::{Definition, DefinitionError, MAX_DEFINITION_FILE_BYTES};
+use fandhe_edge_core::definition::{
+    Definition, DefinitionError, FieldPath, MAX_DEFINITION_FILE_BYTES,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -100,5 +102,36 @@ fn req39_load_rejects_fifo_without_blocking() {
             assert_eq!(rejected, path);
         }
         other => panic!("NotRegularFile を期待したが {other:?} だった"),
+    }
+}
+
+/// TASK-15.3-2: `Definition::load`（ファイル経由）でも `version` の欠落が
+/// 型付きエラー `MissingField { field: FieldPath::Version }` として返る
+/// ことを確認する（`parse` 単体のユニットテストとは別に、ファイル読み込み
+/// 経路まで通しで確認する結合テスト）。
+#[test]
+fn req15_load_rejects_definition_file_missing_required_field() {
+    let path = temp_file_path("load-missing-version");
+    // `version` を欠いた定義ファイル。
+    let json = r#"{
+        "schema": "fandhe-edge-model-definition/v1",
+        "name": "sample_topic",
+        "judgment_type": "single_select",
+        "options": [
+            { "id": "yes", "display_name": "Yes", "description": "肯定" }
+        ],
+        "io": { "input": "bytes" }
+    }"#;
+    std::fs::write(&path, json).expect("一時ファイルを書き込めるはず");
+
+    let result = Definition::load(&path);
+    std::fs::remove_file(&path).expect("一時ファイルを削除できるはず");
+
+    match result.expect_err("必須項目欠落は拒否されるはず") {
+        DefinitionError::MissingField { field } => {
+            assert_eq!(field, FieldPath::Version);
+            assert_eq!(field.to_string(), "version");
+        }
+        other => panic!("MissingField を期待したが {other:?} だった"),
     }
 }
