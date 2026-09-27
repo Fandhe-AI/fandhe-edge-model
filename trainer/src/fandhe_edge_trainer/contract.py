@@ -111,6 +111,7 @@ import json
 import os
 import secrets
 import stat
+import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -673,24 +674,175 @@ def _load_acl_functions() -> ctypes.CDLL | None:
     return lib
 
 
+# --------------------------------------------------------------------------
+# Linux POSIX ACL 検査（build/trainer-linux-uv。main 承認済み設計）。
+# macOS の拡張 ACL 検査と同じ検査意図を、Linux カーネルの POSIX ACL
+# （`setfacl` 等で付与する named user/group エントリ）に対して行う。
+# POSIX ACL は 2 種類の拡張属性で表現される:
+#   - `system.posix_acl_access`: そのディレクトリ自体への実効 ACL
+#   - `system.posix_acl_default`: そのディレクトリ配下に新規作成される
+#     子（ファイル・ディレクトリ）へ継承される既定 ACL
+# `prepare_out_dir`/`finalize_out_dir` は親ディレクトリ配下に子
+# （予約した一時ディレクトリ・最終的な `out_dir`）を作成するため、
+# access だけでなく default ACL も検査しないと、default ACL 経由で
+# 子が他ユーザーに書き込み可能になる余地を見逃す。
+#
+# xattr の値は Linux カーネルの `posix_acl_xattr` 形式（標準ライブラリの
+# `os.getxattr`/`os.setxattr` で読み書きする。追加依存なし）:
+#   - 先頭 4 バイト: little-endian u32 の version（2 のみ受け付ける）
+#   - 続く 8 バイト単位のエントリの並び: le16 e_tag・le16 e_perm・le32 e_id
+# タグ: ACL_USER_OBJ=0x01・ACL_USER=0x02・ACL_GROUP_OBJ=0x04・
+# ACL_GROUP=0x08・ACL_MASK=0x10・ACL_OTHER=0x20。perm の WRITE=0x02。
+# USER_OBJ・GROUP_OBJ・OTHER・MASK は既存の uid/mode 検査
+# （`_assert_parent_dir_exclusive`）の範囲に相当するため、本検査では
+# 名前付きエントリ（ACL_USER・ACL_GROUP）の書き込み許可のみを見る。
+# --------------------------------------------------------------------------
+
+_POSIX_ACL_XATTR_NAMES = ("system.posix_acl_access", "system.posix_acl_default")
+# NFSv4 ACL の xattr 名。`_reject_posix_acl_write_grant` は内容を評価できないため、
+# 存在すれば拒否する。
+_NFS4_ACL_XATTR_NAME = "system.nfs4_acl"
+_POSIX_ACL_XATTR_VERSION = 2
+_POSIX_ACL_XATTR_HEADER = struct.Struct("<I")
+_POSIX_ACL_XATTR_ENTRY = struct.Struct("<HHI")
+
+_ACL_USER_OBJ = 0x01
+_ACL_USER = 0x02
+_ACL_GROUP_OBJ = 0x04
+_ACL_GROUP = 0x08
+_ACL_MASK = 0x10
+_ACL_OTHER = 0x20
+_ACL_NAMED_TAGS = frozenset({_ACL_USER, _ACL_GROUP})
+_ACL_KNOWN_TAGS = frozenset(
+    {_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP, _ACL_MASK, _ACL_OTHER}
+)
+_ACL_PERM_WRITE = 0x02
+
+
+def _posix_acl_has_named_write_entry(data: bytes) -> bool:
+    """`posix_acl_xattr` 形式のバイト列を解析し、名前付きエントリ
+    （ACL_USER・ACL_GROUP）に書き込み許可（WRITE ビット）が 1 つでも
+    あれば `True` を返す（純粋関数。fd・OS に依存しない）。
+
+    長さ不足（ヘッダ未満・エントリの端数）・未対応 version・未知のタグは
+    いずれも `WorkerError`（`output_conflict`）で fail-closed とする
+    （REQ-39 ガード層。壊れた／想定外の ACL 表現を安全側と誤読しない）。
+    添字アクセスの範囲外を避けるため、`struct.unpack_from` の前に長さを
+    検証する。
+    """
+    if len(data) < _POSIX_ACL_XATTR_HEADER.size:
+        raise WorkerError(
+            "output_conflict", "malformed POSIX ACL xattr: too short", ExitCode.INVALID_INPUT
+        )
+    (version,) = _POSIX_ACL_XATTR_HEADER.unpack_from(data, 0)
+    if version != _POSIX_ACL_XATTR_VERSION:
+        raise WorkerError(
+            "output_conflict",
+            f"unsupported POSIX ACL xattr version: {version}",
+            ExitCode.INVALID_INPUT,
+        )
+    body = data[_POSIX_ACL_XATTR_HEADER.size :]
+    if len(body) % _POSIX_ACL_XATTR_ENTRY.size != 0:
+        raise WorkerError(
+            "output_conflict",
+            "malformed POSIX ACL xattr: truncated entry",
+            ExitCode.INVALID_INPUT,
+        )
+    has_write = False
+    for offset in range(0, len(body), _POSIX_ACL_XATTR_ENTRY.size):
+        tag, perm, _entry_id = _POSIX_ACL_XATTR_ENTRY.unpack_from(body, offset)
+        if tag not in _ACL_KNOWN_TAGS:
+            raise WorkerError(
+                "output_conflict",
+                f"unexpected POSIX ACL tag type: {tag}",
+                ExitCode.INVALID_INPUT,
+            )
+        if tag in _ACL_NAMED_TAGS and (perm & _ACL_PERM_WRITE) != 0:
+            has_write = True
+    return has_write
+
+
+def _reject_posix_acl_write_grant(fd: int) -> None:
+    """`fd` が指すディレクトリの POSIX ACL（access・default の両方）に
+    名前付きエントリの書き込み許可があれば `output_conflict` で拒否する
+    （Linux 版。`_reject_extended_acl_allow` から呼ばれる）。
+
+    属性が存在しない（`ENODATA`）・ファイルシステムが ACL 非対応
+    （`ENOTSUP`/`EOPNOTSUPP`。ACL が存在し得ないため合格扱いにできる。
+    ACL を無効にマウントした tmpfs・xattr 非対応の overlayfs upper 層など）は
+    合格として扱う。それ以外の `OSError` は fail-closed とする
+    （REQ-39 ガード層）。
+
+    NFSv4 ACL（NFS マウント等で `system.nfs4_acl` に置かれる）は POSIX ACL と
+    別体系で、`system.posix_acl_*` には現れない。本関数はその内容を評価
+    できないため、属性が存在するだけで fail-closed（拒否）とする。
+
+    判定は名前付きエントリ自身の perm ビットで行い、ACL_MASK による実効権限の
+    縮小（`perm & mask`）は計算しない。MASK は許可を縮める方向にしか働かない
+    ため、この省略は過剰拒否の方向にだけ倒れる（迂回にはならない）。
+
+    本検査の範囲外: root と同様に、`CAP_DAC_OVERRIDE`・`CAP_FOWNER` を持つ
+    プロセス（fakeroot・一部のコンテナ環境）はパーミッション・ACL に
+    関係なく書き込めるため、本検査では防げない。
+    """
+    try:
+        os.getxattr(fd, _NFS4_ACL_XATTR_NAME)
+    except OSError as e:
+        if e.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise WorkerError(
+                "output_conflict",
+                f"failed to read {_NFS4_ACL_XATTR_NAME} (errno={e.errno})",
+                ExitCode.INVALID_INPUT,
+            ) from e
+    else:
+        raise WorkerError(
+            "output_conflict",
+            "out_dir parent has an NFSv4 ACL, which this check cannot evaluate",
+            ExitCode.INVALID_INPUT,
+        )
+    for name in _POSIX_ACL_XATTR_NAMES:
+        try:
+            data = os.getxattr(fd, name)
+        except OSError as e:
+            if e.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+                continue
+            raise WorkerError(
+                "output_conflict",
+                f"failed to read {name} (errno={e.errno})",
+                ExitCode.INVALID_INPUT,
+            ) from e
+        if _posix_acl_has_named_write_entry(data):
+            raise WorkerError(
+                "output_conflict",
+                "out_dir parent has an ACL entry that allows additional write access",
+                ExitCode.INVALID_INPUT,
+            )
+
+
 def _reject_extended_acl_allow(fd: int) -> None:
-    """`fd` が指すディレクトリの拡張 ACL（`ACL_TYPE_EXTENDED`）に
-    `ACL_EXTENDED_ALLOW` エントリが 1 つでもあれば `output_conflict` で拒否する。
+    """`fd` が指すディレクトリの拡張 ACL に、追加の書き込み許可を与える
+    エントリが 1 つでもあれば `output_conflict` で拒否する。
 
-    macOS の拡張 ACL（`chmod +a` で付与する `group:everyone allow ...` 等）は
-    POSIX のパーミッションビットに現れないため、uid/mode 検査だけでは検出
-    できない（Codex レビュー再指摘。オーナー承認 2026-09-27）。deny エントリ
-    のみ（例: Finder が既定で `~/Documents` 等に付与する
-    `group:everyone deny delete` 等）は追加の書き込み許可を与えないため合格
-    とする。
+    macOS では `ACL_TYPE_EXTENDED` の `ACL_EXTENDED_ALLOW` エントリ
+    （`chmod +a` で付与する `group:everyone allow ...` 等）を、Linux では
+    POSIX ACL の名前付きエントリ（`_reject_posix_acl_write_grant` 参照）を
+    検査する。macOS の拡張 ACL・Linux の POSIX ACL は、いずれも POSIX の
+    パーミッションビットに現れないため、uid/mode 検査だけでは検出
+    できない（Codex レビュー再指摘。オーナー承認 2026-09-27）。macOS の
+    deny エントリのみ（例: Finder が既定で `~/Documents` 等に付与する
+    `group:everyone deny delete` 等）は追加の書き込み許可を与えないため
+    合格とする。
 
-    `sys.platform != "darwin"`・ACL API のシンボル解決の失敗・想定外の
+    macOS・Linux 以外の OS・ACL API のシンボル解決の失敗・想定外の
     戻り値やタグは、いずれも fail-closed（`output_conflict`）とする
     （REQ-39 ガード層。「動くこと」より「検査の正しさ」を優先する）。
     """
+    if sys.platform == "linux":
+        _reject_posix_acl_write_grant(fd)
+        return
     if sys.platform != "darwin":
         raise WorkerError(
-            "output_conflict", "extended ACL check requires macOS", ExitCode.INVALID_INPUT
+            "output_conflict", "ACL check requires macOS or Linux", ExitCode.INVALID_INPUT
         )
     lib = _load_acl_functions()
     if lib is None:
@@ -751,7 +903,8 @@ def _reject_extended_acl_allow(fd: int) -> None:
 
 def _assert_parent_dir_exclusive(parent_fd: int) -> None:
     """`parent_fd` が指す親ディレクトリへ、実行ユーザー以外が書き込めないことを
-    確認する（POSIX の uid/mode 検査 + 拡張 ACL 検査）。`prepare_out_dir`
+    確認する（POSIX の uid/mode 検査 + 拡張 ACL 検査。macOS は拡張 ACL、
+    Linux は POSIX ACL を検査する）。`prepare_out_dir`
     （予約前）・`finalize_out_dir`（`os.rename` 直前）の 2 箇所から同じ検査を
     呼ぶ（P0。Codex レビュー再指摘。オーナー承認 2026-09-27）。
 

@@ -9,6 +9,7 @@ import ctypes
 import errno
 import json
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -847,14 +848,243 @@ def test_finalize_out_dir_cleans_up_when_parent_check_raises_non_worker_error(
 
 
 # --------------------------------------------------------------------------
+# P0: Linux POSIX ACL 検査（build/trainer-linux-uv。REQ-39 ガード層）。
+# macOS の拡張 ACL 検査（上記）と同じ検査意図を、Linux カーネルの POSIX ACL
+# （`system.posix_acl_access`・`system.posix_acl_default`）に対して行う。
+# --------------------------------------------------------------------------
+
+
+def _posix_acl_xattr_bytes(entries: list[tuple[int, int, int]]) -> bytes:
+    """テスト用: `posix_acl_xattr` 形式（version=2 固定）のバイト列を組み立てる。
+
+    `entries` は `(tag, perm, entry_id)` の並び（`contract.py` の
+    `_posix_acl_has_named_write_entry` が読む形式そのもの）。
+    """
+    body = b"".join(struct.pack("<HHI", tag, perm, entry_id) for tag, perm, entry_id in entries)
+    return struct.pack("<I", contract._POSIX_ACL_XATTR_VERSION) + body
+
+
+class TestPosixAclHasNamedWriteEntry:
+    """`_posix_acl_has_named_write_entry`（純粋関数）の単体テスト（REQ-39）。
+    xattr のバイト列解析自体は OS 非依存のため全 OS で実行する。
+    """
+
+    def test_named_user_write_is_detected(self) -> None:
+        data = _posix_acl_xattr_bytes([(contract._ACL_USER, 0x02, 65534)])
+        assert contract._posix_acl_has_named_write_entry(data) is True
+
+    def test_named_group_write_is_detected(self) -> None:
+        data = _posix_acl_xattr_bytes([(contract._ACL_GROUP, 0x06, 65534)])
+        assert contract._posix_acl_has_named_write_entry(data) is True
+
+    def test_named_entry_read_only_is_not_write(self) -> None:
+        data = _posix_acl_xattr_bytes([(contract._ACL_USER, 0x04, 65534)])
+        assert contract._posix_acl_has_named_write_entry(data) is False
+
+    def test_unnamed_entries_with_write_are_ignored(self) -> None:
+        """USER_OBJ・GROUP_OBJ・OTHER・MASK は既存の uid/mode 検査の範囲の
+        ため、write ビットが立っていても本関数の対象外（False）とする。"""
+        data = _posix_acl_xattr_bytes(
+            [
+                (contract._ACL_USER_OBJ, 0x07, 0),
+                (contract._ACL_GROUP_OBJ, 0x07, 0),
+                (contract._ACL_MASK, 0x07, 0),
+                (contract._ACL_OTHER, 0x07, 0),
+            ]
+        )
+        assert contract._posix_acl_has_named_write_entry(data) is False
+
+    def test_rejects_too_short_header(self) -> None:
+        with pytest.raises(WorkerError) as exc_info:
+            contract._posix_acl_has_named_write_entry(b"\x02\x00\x00")
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+    def test_rejects_unsupported_version(self) -> None:
+        data = struct.pack("<I", 1) + struct.pack("<HHI", contract._ACL_USER, 0x02, 0)
+        with pytest.raises(WorkerError) as exc_info:
+            contract._posix_acl_has_named_write_entry(data)
+        assert exc_info.value.code == "output_conflict"
+
+    def test_rejects_truncated_entry(self) -> None:
+        data = struct.pack("<I", contract._POSIX_ACL_XATTR_VERSION) + b"\x00" * 5
+        with pytest.raises(WorkerError) as exc_info:
+            contract._posix_acl_has_named_write_entry(data)
+        assert exc_info.value.code == "output_conflict"
+
+    def test_rejects_unknown_tag(self) -> None:
+        data = _posix_acl_xattr_bytes([(0x40, 0x02, 0)])
+        with pytest.raises(WorkerError) as exc_info:
+            contract._posix_acl_has_named_write_entry(data)
+        assert exc_info.value.code == "output_conflict"
+
+
+def _try_setxattr(path: Path, name: str, data: bytes) -> None:
+    """`os.setxattr` を試み、対象ファイルシステムが ACL xattr に非対応
+    （`ENOTSUP`/`EOPNOTSUPP`）ならそのテストをスキップする（環境依存の
+    ファイルシステム制約をテスト失敗として扱わないため）。
+    """
+    try:
+        os.setxattr(str(path), name, data)
+    except OSError as e:
+        if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            pytest.skip(f"filesystem does not support the {name} xattr (errno={e.errno})")
+        raise
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux の POSIX ACL xattr を前提にテストする")
+def test_prepare_out_dir_rejects_parent_with_posix_acl_access_named_write_entry(
+    tmp_path: Path,
+) -> None:
+    """親ディレクトリの POSIX パーミッションビットは排他的（`0o700`）でも、
+    `system.posix_acl_access` に named user の書き込み許可が付与されている
+    場合、`out_dir` を何も作らずに `output_conflict` で拒否すること（REQ-39。
+    uid/mode 検査だけではすり抜けてしまうため）。
+    """
+    # MASK・GROUP_OBJ は write を含めない（write を含めると、生の setxattr
+    # 経由であってもカーネルが group の実効パーミッションをこのファイルの
+    # mode ビットへ同期し、`_assert_parent_dir_exclusive` の uid/mode 検査
+    # 側で先に拒否されてしまい、ACL 検査の分岐を通らなくなるため）。
+    data = _posix_acl_xattr_bytes(
+        [
+            (contract._ACL_USER_OBJ, 0x07, 0),
+            (contract._ACL_USER, 0x07, 65534),
+            (contract._ACL_GROUP_OBJ, 0x00, 0),
+            (contract._ACL_MASK, 0x05, 0),
+            (contract._ACL_OTHER, 0x00, 0),
+        ]
+    )
+    _try_setxattr(tmp_path, "system.posix_acl_access", data)
+    with _confined_out_dir(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.prepare_out_dir(entry)
+        assert exc_info.value.code == "output_conflict"
+        assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+        assert "ACL" in exc_info.value.message  # ACL 由来の拒否であることの確認
+        assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux の POSIX ACL xattr を前提にテストする")
+def test_prepare_out_dir_accepts_parent_with_posix_acl_named_read_only_entry(
+    tmp_path: Path,
+) -> None:
+    """named user エントリが read のみ（書き込み許可を追加しない）であれば
+    予約を通過すること（REQ-39。回帰ガード。拒否を過度に広げていないことの
+    確認）。"""
+    data = _posix_acl_xattr_bytes(
+        [
+            (contract._ACL_USER_OBJ, 0x07, 0),
+            (contract._ACL_USER, 0x04, 65534),
+            (contract._ACL_GROUP_OBJ, 0x00, 0),
+            (contract._ACL_MASK, 0x05, 0),
+            (contract._ACL_OTHER, 0x00, 0),
+        ]
+    )
+    _try_setxattr(tmp_path, "system.posix_acl_access", data)
+    with _confined_out_dir(tmp_path) as entry:
+        reservation = contract.prepare_out_dir(entry)
+        assert (tmp_path / "out").is_dir()
+        contract.cleanup_reservation(reservation)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux の POSIX ACL xattr を前提にテストする")
+def test_prepare_out_dir_rejects_parent_with_posix_acl_default_named_write_entry(
+    tmp_path: Path,
+) -> None:
+    """REQ-39: `system.posix_acl_default`（新規作成される子への継承用）に
+    named group の書き込み許可が付与されている場合も拒否すること。default
+    ACL は `os.mkdir` で作る予約済み一時ディレクトリへ継承され、他ユーザーに
+    書き込み可能な子を作りうるため、access と同様に検査する。default ACL は
+    親自体の実効パーミッション（mode）には影響しないため、uid/mode 検査
+    だけではこの経路をすり抜ける（access ACL 側と異なり、本検査でしか
+    検出できない）。
+    """
+    data = _posix_acl_xattr_bytes(
+        [
+            (contract._ACL_USER_OBJ, 0x07, 0),
+            (contract._ACL_GROUP_OBJ, 0x00, 0),
+            (contract._ACL_GROUP, 0x02, 65534),
+            (contract._ACL_MASK, 0x05, 0),
+            (contract._ACL_OTHER, 0x00, 0),
+        ]
+    )
+    _try_setxattr(tmp_path, "system.posix_acl_default", data)
+    with _confined_out_dir(tmp_path) as entry:
+        with pytest.raises(WorkerError) as exc_info:
+            contract.prepare_out_dir(entry)
+        assert exc_info.value.code == "output_conflict"
+        assert "ACL" in exc_info.value.message  # ACL 由来の拒否であることの確認
+        assert not (tmp_path / "out").exists()
+
+
+def _stub_getxattr(values: dict[str, bytes | int]):
+    """`os.getxattr` の差し替え。`values[name]` が bytes ならそれを返し、int なら
+    その errno の `OSError` を送出する。未登録の名前は `ENODATA`（属性なし）。
+    """
+
+    def fake(fd: int, name: str) -> bytes:
+        value = values.get(name, errno.ENODATA)
+        if isinstance(value, int):
+            raise OSError(value, os.strerror(value))
+        return value
+
+    return fake
+
+
+def test_reject_posix_acl_write_grant_rejects_nfs4_acl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: NFSv4 ACL（`system.nfs4_acl`）は POSIX ACL と別体系で内容を評価
+    できないため、属性が存在するだけで拒否すること（POSIX ACL 側が空でも
+    合格にしない。監査 P1）。実際の NFS マウントを用意できないため
+    `os.getxattr` を差し替えて照合する（全 OS で実行）。
+    """
+    monkeypatch.setattr(
+        contract.os, "getxattr", _stub_getxattr({"system.nfs4_acl": b"\x00" * 8}), raising=False
+    )
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_posix_acl_write_grant(0)
+    assert exc_info.value.code == "output_conflict"
+    assert exc_info.value.message == (
+        "out_dir parent has an NFSv4 ACL, which this check cannot evaluate"
+    )
+
+
+@pytest.mark.parametrize("name", ["system.nfs4_acl", "system.posix_acl_access"])
+def test_reject_posix_acl_write_grant_fails_closed_on_unexpected_errno(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """REQ-39: ENODATA・ENOTSUP・EOPNOTSUPP 以外の読み取り失敗（例: EIO）は、
+    ACL の有無を確認できないため fail-closed で拒否すること。
+    """
+    monkeypatch.setattr(contract.os, "getxattr", _stub_getxattr({name: errno.EIO}), raising=False)
+    with pytest.raises(WorkerError) as exc_info:
+        contract._reject_posix_acl_write_grant(0)
+    assert exc_info.value.code == "output_conflict"
+    assert exc_info.value.message == f"failed to read {name} (errno={errno.EIO})"
+
+
+def test_reject_posix_acl_write_grant_accepts_when_acls_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: ファイルシステムが xattr / ACL 非対応（ENOTSUP）なら ACL は存在し
+    得ないため合格とすること（例外を送出しない）。
+    """
+    unsupported = dict.fromkeys(
+        ["system.nfs4_acl", "system.posix_acl_access", "system.posix_acl_default"], errno.ENOTSUP
+    )
+    monkeypatch.setattr(contract.os, "getxattr", _stub_getxattr(unsupported), raising=False)
+    assert contract._reject_posix_acl_write_grant(0) is None
+
+
+# --------------------------------------------------------------------------
 # P2: `_reject_extended_acl_allow` の fail-closed 分岐を、実際の ACL API を
 # 一切呼ばずに機械照合する（監査指摘。ACL API のスタブは `_load_acl_functions`
 # を差し替えて注入する）。`_reject_extended_acl_allow` は `sys.platform` を
-# 最初に見て非 darwin なら（スタブへ到達する前に）拒否するため、スタブを
-# 使う各テストは `contract.sys.platform` を `"darwin"` へ固定してからスタブを
-# 注入する（macOS で実行する限り no-op だが、非 darwin 環境でもスタブ化した
-# 分岐を確実に踏むようにするため）。プラットフォーム判定そのものは別途
-# `test_reject_extended_acl_allow_rejects_non_darwin` で検証する。
+# 最初に見て macOS・Linux 以外なら（スタブへ到達する前に）拒否する（Linux は
+# `_reject_posix_acl_write_grant` へ委譲される）ため、スタブを使う各テストは
+# `contract.sys.platform` を `"darwin"` へ固定してからスタブを注入する
+# （macOS で実行する限り no-op だが、非 darwin 環境でもスタブ化した分岐を
+# 確実に踏むようにするため）。プラットフォーム判定そのものは別途
+# `test_reject_extended_acl_allow_rejects_unsupported_platform` で検証する。
 # --------------------------------------------------------------------------
 
 
@@ -907,12 +1137,14 @@ class _FakeAclAllocation:
         return 0
 
 
-def test_reject_extended_acl_allow_rejects_non_darwin(
+def test_reject_extended_acl_allow_rejects_unsupported_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`sys.platform != "darwin"` は ACL API を一切呼ばずに fail-closed
-    （`output_conflict`）とすること。"""
-    monkeypatch.setattr(contract.sys, "platform", "linux")
+    """macOS・Linux 以外の OS は ACL API を一切呼ばずに fail-closed
+    （`output_conflict`）とすること（REQ-39）。Linux は
+    `_reject_posix_acl_write_grant` に委譲されるようになったため、ここでは
+    それ以外の OS（例: Windows）を模す。"""
+    monkeypatch.setattr(contract.sys, "platform", "win32")
     with pytest.raises(WorkerError) as exc_info:
         contract._reject_extended_acl_allow(3)
     assert exc_info.value.code == "output_conflict"
