@@ -49,6 +49,13 @@
 //! 複製すると、外部データが持つ重複度に応じて出力サイズが増幅されうる
 //! （reviewer 指摘 PR #195）。[`InputLeak::train_ids`] は `Rc<[String]>` で
 //! 同じ ID 列を共有し、複製を ID 列の実体ではなく参照カウントの増加に留める。
+//!
+//! さらに `find_input_leaks` は train 側 ID の所有化（`&str` から `String` への
+//! 複製）自体を、実際に他の分割へ漏洩したと判明した入力についてのみ遅延して行う。
+//! 件数上限（[`MAX_LEAK_CHECK_RECORDS`]）と ID 長上限（[`MAX_LEAK_CHECK_ID_BYTES`]）を
+//! 満たす入力であっても、漏洩が 0 件の場合に train 側の全 ID を無条件で複製すると、
+//! 許容範囲内の件数・長さだけで数百 MB 規模のメモリを追加確保しうる
+//! （reviewer 指摘 PR #195 追加分・security.md「ガード層: 資源の上限」）。
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -280,6 +287,7 @@ pub fn find_input_leaks<R: LeakCheckable>(
     validate_resource_limits(partitions)?;
 
     // train: 入力 byte -> train 側の全 ID（同一入力の train 内重複も漏れなく保持する）。
+    // この時点では借用（`&str`）のみで、String の複製は発生しない。
     let mut train_index: BTreeMap<&[u8], Vec<&str>> = BTreeMap::new();
     for record in partitions.train {
         train_index
@@ -290,37 +298,55 @@ pub fn find_input_leaks<R: LeakCheckable>(
     for ids in train_index.values_mut() {
         ids.sort_unstable();
     }
-    // 入力 byte -> その入力の train 側 ID 列（所有権を持つ String に変換済み）を
-    // `Rc<[String]>` として 1 度だけ構築する。同じ入力が複数の相手分割へ漏洩しても
-    // この Rc を clone（参照カウントの増加のみ）して使い回し、ID 列本体の複製で
-    // 出力サイズが分割数倍に増幅するのを避ける（reviewer 指摘 PR #195・REQ-39）。
-    let train_ids_shared: BTreeMap<&[u8], Rc<[String]>> = train_index
-        .iter()
-        .map(|(input, ids)| {
-            let owned: Rc<[String]> = ids.iter().map(|id| (*id).to_string()).collect();
-            (*input, owned)
+
+    // 相手側（validation・test・evaluation）の索引を先に全分割分構築する
+    // （これも借用のみで、まだ train 側 ID の複製はしない）。実際に漏洩と
+    // 判定される入力の集合を先に確定させてから、その入力についてだけ
+    // train 側 ID を所有化するため（reviewer 指摘 PR #195 追加分・REQ-39
+    // 「資源の上限」: 漏洩が 0 件の入力に対しても train 側の全 ID を複製すると、
+    // 許容件数の上限〔`MAX_LEAK_CHECK_RECORDS`〕いっぱいに ID 長の上限
+    // 〔`MAX_LEAK_CHECK_ID_BYTES`〕の ID を与えるだけで漏洩の有無に関係なく
+    // 数百 MB 規模のメモリを追加確保してしまう）。
+    // 入力 byte -> その分割側の全 ID（借用）の索引。分割の種類ごとに 1 つ持つ。
+    type InputIndex<'a> = BTreeMap<&'a [u8], Vec<&'a str>>;
+
+    let other_indices: Vec<(Partition, InputIndex<'_>)> = partitions
+        .other_partitions()
+        .into_iter()
+        .map(|(partition, records)| {
+            let mut other_index: InputIndex<'_> = BTreeMap::new();
+            for record in records {
+                other_index
+                    .entry(record.input())
+                    .or_default()
+                    .push(record.id());
+            }
+            (partition, other_index)
         })
         .collect();
 
-    let mut leaks: Vec<InputLeak> = Vec::new();
-    for (partition, records) in partitions.other_partitions() {
-        // 入力 byte -> その分割側の全 ID（train 側と同様、複数行の漏洩を取りこぼさない）。
-        let mut other_index: BTreeMap<&[u8], Vec<&str>> = BTreeMap::new();
-        for record in records {
-            other_index
-                .entry(record.input())
-                .or_default()
-                .push(record.id());
-        }
+    // 入力 byte -> その入力の train 側 ID 列（所有権を持つ String に変換済み）を
+    // `Rc<[String]>` として遅延構築するキャッシュ。実際に他分割へ漏洩したと
+    // 判明した入力についてのみ 1 度だけ構築し、以降は clone（参照カウントの
+    // 増加のみ）で使い回す。漏洩していない train 入力は所有化しない。
+    let mut train_ids_shared: BTreeMap<&[u8], Rc<[String]>> = BTreeMap::new();
 
+    let mut leaks: Vec<InputLeak> = Vec::new();
+    for (partition, other_index) in &other_indices {
         for (input, other_ids) in other_index {
-            let Some(train_ids) = train_ids_shared.get(input) else {
+            let Some(train_ids_borrowed) = train_index.get(input) else {
                 continue;
             };
-            let mut other_ids = other_ids;
+            let train_ids = train_ids_shared.entry(input).or_insert_with(|| {
+                train_ids_borrowed
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect()
+            });
+            let mut other_ids = other_ids.clone();
             other_ids.sort_unstable();
             leaks.push(InputLeak {
-                partition,
+                partition: *partition,
                 train_ids: Rc::clone(train_ids),
                 other_ids: other_ids.into_iter().map(str::to_string).collect(),
             });
@@ -587,6 +613,32 @@ mod tests {
             Rc::ptr_eq(&report.leaks[0].train_ids, &report.leaks[1].train_ids),
             "同じ train 入力に対する train_ids は Rc で共有され、分割ごとに複製されない"
         );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195 追加分・REQ-39
+    /// 「ガード層: 資源の上限」）: 漏洩していない train 入力の ID は、漏洩と無関係な
+    /// 大量の train レコードが存在しても複製・報告されない。漏洩と判定されるのは
+    /// 実際に他分割へ入力が一致した 1 件のみで、レポートにはその ID だけが現れる
+    /// （train 側の全 ID を無条件で所有化する旧実装は、この境界に関係なく全件を
+    /// 複製していた）。
+    #[test]
+    fn req16_task16_2_1_non_leaking_train_records_are_not_materialized_into_report() {
+        let mut train: Vec<TestRecord> = (0..500)
+            .map(|i| record(&format!("t{i}"), &format!("only-in-train-{i}"), "g"))
+            .collect();
+        train.push(record("t_leak", "shared-input", "g_leak"));
+        let validation = vec![record("v1", "shared-input", "g_v")];
+        let partitions = Partitions {
+            train: &train,
+            validation: Some(&validation),
+            test: None,
+            evaluation: None,
+        };
+
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
+        assert_eq!(report.leak_pair_count(), 1);
+        assert_eq!(report.leaks[0].train_ids.as_ref(), ["t_leak".to_string()]);
+        assert_eq!(report.leaks[0].other_ids, vec!["v1".to_string()]);
     }
 
     /// REQ-16 異常系・TASK-16.2-1: byte が 1 つでも異なれば漏洩としない
