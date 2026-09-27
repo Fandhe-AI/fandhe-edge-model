@@ -24,6 +24,7 @@ from fandhe_edge_trainer.encoding import encode_bytes
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 from fandhe_edge_trainer.kinds.c1 import C1Kind
+from fandhe_edge_trainer.limits import MIN_C1_C
 
 
 def _train_and_export(
@@ -203,13 +204,35 @@ def test_c1_train_rejects_infinite_lr(tmp_path: Path) -> None:
 
 
 def test_c1_train_rejects_zero_c(tmp_path: Path) -> None:
-    """C は (0, MAX] の範囲。0 は下限の排他境界のため拒否する。"""
+    """C は [MIN_C1_C, MAX_C1_C] の範囲。0 は下限未満のため拒否する。"""
     kind = C1Kind()
     req = make_request(tmp_path, kind="c1", config={**TINY_C1_CONFIG, "C": 0.0})
     with pytest.raises(WorkerError) as exc_info:
         train_kind(kind, make_examples(), req)
     assert exc_info.value.code == "invalid_config"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("c_value", [5e-324, 1e-300, 9.9e-7])
+def test_c1_train_rejects_tiny_c_as_invalid_config(tmp_path: Path, c_value: float) -> None:
+    """REQ-21: 正の極小 C（罰則係数 `0.5 / (C * N)` が発散する値を含む）は、学習を
+    始めて `training_diverged`（exit 12）に化けるのではなく、設定誤りとして
+    `invalid_config`（exit 64）で拒否する。
+    """
+    kind = C1Kind()
+    req = make_request(tmp_path, kind="c1", config={**TINY_C1_CONFIG, "C": c_value})
+    with pytest.raises(WorkerError) as exc_info:
+        train_kind(kind, make_examples(), req)
+    assert exc_info.value.code == "invalid_config"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_c1_train_accepts_minimum_c(tmp_path: Path) -> None:
+    """下限ちょうどの C（MIN_C1_C）は受理され、学習が有限の損失で完了する。"""
+    kind = C1Kind()
+    req = make_request(tmp_path, kind="c1", config={**TINY_C1_CONFIG, "C": MIN_C1_C})
+    trained = train_kind(kind, make_examples(), req)
+    assert trained.config["C"] == MIN_C1_C
 
 
 def test_c1_train_excludes_ngrams_containing_pad_token(tmp_path: Path) -> None:

@@ -107,7 +107,11 @@ MAX_C1_MIN_DF = MAX_TRAIN_EXAMPLES
 #: 別途検査するため、ここでの上限はモデル構築前の一次的な妥当性検査に留める）。
 MAX_C1_MAX_FEATURES = 2_000_000
 
-#: sklearn 風の正則化強度 `C`（大きいほど正則化が弱い）の許容上限。
+#: sklearn 風の正則化強度 `C`（大きいほど正則化が弱い）の許容範囲。
+#: 下限は罰則係数 `0.5 / (C * n_examples)` が float32 でも有限に収まるための値
+#: （C=1e-6・n_examples=1 で係数 5e5）。これより小さい C は係数が発散し、設定
+#: 誤りが `training_diverged` に化けるため `invalid_config` で拒否する。
+MIN_C1_C = 1.0e-6
 MAX_C1_C = 1.0e6
 
 MAX_C1_EPOCHS = 1000

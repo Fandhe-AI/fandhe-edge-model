@@ -74,6 +74,7 @@ from ..limits import (
     MAX_C1_SPARSE_ELEMENTS,
     MAX_C1_VOCAB_CANDIDATES,
     MAX_C1_VOCAB_CHUNK_WINDOW_ELEMENTS,
+    MIN_C1_C,
     MIN_C1_MIN_DF,
 )
 
@@ -160,7 +161,7 @@ def _validate_config(cfg: dict[str, Any]) -> None:
                 ExitCode.INVALID_INPUT,
             )
 
-    _finite_number("C", 0.0, MAX_C1_C, lo_inclusive=False, hi_inclusive=True)
+    _finite_number("C", MIN_C1_C, MAX_C1_C, lo_inclusive=True, hi_inclusive=True)
     _finite_number("lr", 0.0, MAX_C1_LR, lo_inclusive=False, hi_inclusive=True)
 
 
@@ -629,6 +630,14 @@ class C1Kind:
         # 正則化が弱くなる sklearn の慣習を踏襲する（クラス docstring・
         # モジュール docstring 参照）。
         l2_coef = 0.5 / (c_value * n_examples)
+        # C の下限（MIN_C1_C）で有限になるはずだが、設定誤りを発散（training_diverged）
+        # と取り違えないよう、学習開始前にも確かめる。
+        if not math.isfinite(l2_coef):
+            raise WorkerError(
+                "invalid_config",
+                "config.C yields a non-finite regularization coefficient",
+                ExitCode.INVALID_INPUT,
+            )
 
         def loss_fn(mdl: TfidfLogReg, idx: mx.array, val: mx.array, y: mx.array) -> mx.array:
             logits = mdl(idx, val)
