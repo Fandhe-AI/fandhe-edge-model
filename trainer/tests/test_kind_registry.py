@@ -7,12 +7,19 @@ import pytest
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 from fandhe_edge_trainer.kinds import resolve_kind
+from fandhe_edge_trainer.kinds.c1 import C1Kind
 from fandhe_edge_trainer.kinds.c3 import C3Kind
 
 
 def test_resolve_kind_returns_c3_implementation() -> None:
     kind = resolve_kind("c3", 1)
     assert isinstance(kind, C3Kind)
+
+
+def test_resolve_kind_returns_c1_implementation() -> None:
+    """REQ-19・TASK-19.2: kind="c1"（バイト n-gram TF-IDF・ロジスティック回帰）が解決できること。"""
+    kind = resolve_kind("c1", 1)
+    assert isinstance(kind, C1Kind)
 
 
 def test_resolve_kind_rejects_unsupported_kind() -> None:
