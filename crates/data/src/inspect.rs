@@ -41,13 +41,19 @@
 //! key/value ペア数）とパース後の木に残ったエントリ総数を突き合わせ、両者が
 //! 一致しない場合（=重複キーで木のエントリが後勝ちに潰れている場合）に
 //! [`AnomalyCode::DuplicateKey`] を記録してその行を `valid_records` から
-//! 除外する（`count_raw_key_value_separators`・`count_tree_entries`。
-//! ネスト先を含め任意の深さの重複を検出できる。再帰は成功済みパースの木を
-//! たどるだけのため、上記の serde_json 再帰上限に既に収まっている）。
+//! 除外する。検出プリミティブ（生テキストの key/value 数とパース後の木の
+//! エントリ数の突き合わせ）は [`crate::json_keys`] に集約し、
+//! [`crate::eval_input`]（REQ-23）と共有する。ネスト先を含め任意の深さの
+//! 重複を検出できる（再帰は成功済みパースの木をたどるだけのため、上記の
+//! serde_json 再帰上限に既に収まっている）。重複検出後の扱い（本モジュールは
+//! レコードを除外して継続、[`crate::eval_input`] は処理全体を停止する）は
+//! モジュールごとに異なる（[`crate::json_keys`] のモジュール doc 参照）。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+
+use crate::json_keys::has_duplicate_key;
 
 /// `inspect_records` の異常種別（本 crate の内部語彙）。
 ///
@@ -173,41 +179,6 @@ fn json_type_name(value: &Value) -> &'static str {
 /// 引用符の開閉状態（エスケープを考慮）を追跡して除外する。バイト単位で
 /// 走査するため UTF-8 の継続バイト（0x80〜0xBF）が `"`・`\`・`:` と
 /// 衝突することはなく、多バイト文字境界を壊さない。
-fn count_raw_key_value_separators(raw_line: &str) -> usize {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut count = 0usize;
-    for byte in raw_line.bytes() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-        } else if byte == b'"' {
-            in_string = true;
-        } else if byte == b':' {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// パース済みの JSON 木に残ったオブジェクトのエントリ総数を数える。
-///
-/// 同一キーが複数回出現していた場合、`serde_json::Value` のパース時点で
-/// 後勝ちの 1 エントリへ潰れているため、この値は生テキスト上のキー数より
-/// 小さくなる（[`count_raw_key_value_separators`] との差分が重複検出の根拠）。
-fn count_tree_entries(value: &Value) -> usize {
-    match value {
-        Value::Object(map) => map.len() + map.values().map(count_tree_entries).sum::<usize>(),
-        Value::Array(items) => items.iter().map(count_tree_entries).sum(),
-        _ => 0,
-    }
-}
-
 /// 1 行 1 JSON（JSONL）の本文を検査する。
 ///
 /// ファイル読み込み・サイズ上限（REQ-39）はガード層／CLI 側の責務であり、
@@ -281,7 +252,7 @@ pub fn inspect_records(
         // パース後の木では後勝ちで潰れているため、生テキストの key/value 区切り数と
         // 突き合わせて初めて検出できる。検出した行は個々のフィールド検査に進まず、
         // レコード全体を無効として次の行へ進む（MalformedRecord と同じ扱い）。
-        if count_raw_key_value_separators(raw_line) != count_tree_entries(&value) {
+        if has_duplicate_key(raw_line, &value) {
             anomalies.push(RecordAnomaly {
                 line,
                 field: "<record>",

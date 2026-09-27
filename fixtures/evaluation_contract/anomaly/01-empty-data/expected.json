@@ -1,0 +1,8 @@
+{
+  "case": "01-empty-data",
+  "description": "0 行の学習データ・評価データ",
+  "expected_action": "stop",
+  "poc9_expected_exit_code": 2,
+  "expected_reason_code": "empty_data",
+  "note": "gold.jsonl・pred.jsonl とも 0 行。評価器は指標を計算せずに停止する。poc9_expected_exit_code は PoC-9（docs/spec/03-poc/evaluation-contract/）自身の終了コード契約の値であり、本リポの REQ-21 の 7 種終了コード（ok=0・judged_fail=10・out_of_scope=11・pending=12・limit_exceeded=20・invalid_input=64・runtime_error=70）には含まれない。本リポの結合テスト（crates/data/tests/eval_input_anomaly.rs）はこの値を使わず EvalInputStop::code()（'empty_data'）だけを照合しており、ExitCode への対応付けは CLI 側（TASK-21.2・TASK-33.x）の責務とする（crates/data/src/eval_input.rs モジュール doc「PoC-9 との既知の差分」参照）。"
+}
