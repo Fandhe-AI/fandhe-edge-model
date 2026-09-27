@@ -140,8 +140,8 @@ class ResourceBudget:
         プロセス RSS と GPU〔Metal〕の active memory）の上限として同じ数値を
         流用する。両者は別々のメモリ空間だが、本ワーカーでは 1 つの上限値
         （`limits.MAX_TRAIN_RSS_BYTES` 由来）で両方を検査する設計になっている
-        （この設計の妥当性は `limits.py` の `MAX_TRAIN_RSS_BYTES` に記載の論点
-        としてオーナー確認待ち。Issue #11）。
+        （この設計は `limits.py` の `MAX_TRAIN_RSS_BYTES` に記載の論点として
+        オーナー確認済み。2026-09-27。Issue #11。現行値のまま確定）。
         """
         if time.monotonic() > self._deadline:
             raise WorkerError(
