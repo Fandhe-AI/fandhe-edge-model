@@ -24,6 +24,8 @@
 //! `definition` モジュールは TASK-15.3-1 で型定義・正常系パーサ、
 //! TASK-15.3-2 で必須項目・型不整合の検証を実装済み。正準化ハッシュは
 //! 後続 TASK（TASK-15.5 以降）で追加する。
+//! `exitcode` モジュールは TASK-21.1-1 で 7 種の終了コード enum と
+//! 機械可読 JSON エラー型を実装済み。
 
 pub mod definition;
 pub mod exitcode;
