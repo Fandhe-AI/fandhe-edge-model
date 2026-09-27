@@ -16,12 +16,20 @@ name: Python CI
 # （paths フィルタで発火自体をスキップすると、必須チェックとして登録した場合に
 # その PR がいつまでも「保留中」のまま扱われ、マージがブロックされ続ける）。
 #
-# MLX 未導入について: 学習ロジック（MLX 依存）は本 workflow の対象に含まない
-# （trainer/pyproject.toml の dependencies は空。ツール整備のみ）ため、
-# OS 非依存な ubuntu-latest で足りる。将来 MLX を用いた学習テストを追加する際は、
-# MLX の wheel が macosx_14_0_arm64 以降のみ提供されるため pytest 実行を
-# macOS（arm64）ランナーへ分離し、GPU（Metal）依存のテストは実機前提テスト
-# （.claude/rules/ci.md）として既定のテスト集合から明示的に分ける。
+# MLX（macOS arm64 ランナー）について: TASK-19.2（既定候補 C3）の実装で
+# trainer/pyproject.toml の dependencies に mlx・numpy・onnx を追加した。
+# MLX の wheel は macosx_14_0_arm64 以降のみ提供されるため（[tool.uv] environments
+# の制約）、本 job は macos-14 で実行する。GitHub ホステッドランナーの `macos-14`
+# （および `macos-15`・`macos-latest`）は Apple Silicon（arm64）の標準ランナーである
+# （GitHub 公式ドキュメント about-github-hosted-runners の標準ランナー一覧）。
+# MLX の wheel が要求する macOS 14 以上を満たす最も古い arm64 ラベルを使う。
+# 念のため下記ステップでアーキテクチャを fail-closed に検査する（ランナーラベルの
+# 意味が将来変わった場合に、CI が気づかず x86_64 上で「MLX 無しでも py-ci が通る」
+# 状態へ静かに劣化するのを防ぐ）。
+# pytest はすべて request.device="cpu" で MLX の CPU 経路のみを使い、決定的に
+# 実行する（evaluation-contract.md: GPU〔Metal〕の非決定性をテストへ持ち込まない）。
+# GPU（Metal）依存の性能測定・長時間学習は実機前提テスト（.claude/rules/ci.md）
+# として本 workflow には含めない。
 #
 # Python の版: trainer/.python-version はマイナー版（3.12）までを固定し、patch 版は
 # 環境ごとに解決させる（ローカルは pyenv 等の 3.12.x、CI は uv が python-build-standalone
@@ -43,14 +51,25 @@ concurrency:
 jobs:
   python-ci:
     name: python-ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: macos-14
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+
+      # fail-closed: `macos-14` ラベルが指す実体が将来変わっても、arm64 以外
+      # （MLX の wheel が存在しないアーキテクチャ）で「py-ci が通った」ことに
+      # ならないよう、アーキテクチャの前提をここで明示的に検査する。
+      - name: ランナーが arm64 であることを確認する（fail-closed）
+        run: |
+          arch="$(uname -m)"
+          if [ "$arch" != "arm64" ]; then
+            echo "error: expected arm64 runner (mlx wheel requires macosx_14_0_arm64), got: $arch" >&2
+            exit 1
+          fi
 
       # trainer/ が将来のリファクタで削除・改名された場合に、Makefile の
       # HAS_PY 判定による skip: を CI が「成功」として見逃さないための
@@ -66,8 +85,8 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.12.19"
-          # 小規模プロジェクト（依存 3 件）のため、PR 間でのキャッシュ汚染
-          # リスクを避けて無効化する（ビルド時間への影響は軽微）
+          # PR 間でのキャッシュ汚染リスクを避けて無効化する（mlx-metal 等の
+          # ダウンロードで多少ビルド時間は伸びるが、汚染リスク回避を優先する）
           enable-cache: false
 
       - name: make py-ci

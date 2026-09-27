@@ -19,7 +19,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 - `.github/workflows/ci.yml`: lint-docs（Fandhe-AI/actions）・rust-ci（fmt / clippy / test / deny を 3 OS matrix）・rust-ci-default-features・集約ジョブ `ci-complete`。**発火条件は無効化中**（workspace・メンバー crate・`deny.toml` の作成後に有効化し、ruleset の必須チェックへ `ci-complete` を登録する）
 - `.github/workflows/release.yml`: crates.io 公開。**発火条件は無効化中**（公開 crate 名と公開方針の確定後に有効化）
-- `.github/workflows/python-ci.yml`: 稼働中。学習ワーカーの `make py-ci` を ubuntu で実行する（ci.yml の有効化後は `ci-complete` への統合を検討する）
+- `.github/workflows/python-ci.yml`: 稼働中。学習ワーカーの `make py-ci` を macos-14（arm64。MLX の wheel と出力先の拡張 ACL 検査が macOS 前提）で実行する（ci.yml の有効化後は `ci-complete` への統合を検討する）
 - `.github/workflows/ai-review.yml`・`update-external.yml`: 稼働中（ai-review は Actions 変数 `CODEX_HOME_DIR` 設定までスキップ）
 - ruleset `main-protection` の必須チェック: `codex / preflight`・`codex / review`・`codex / post_feedback`・`python-ci`（GitHub Actions に束縛）と `Cursor Bugbot`（Cursor App に束縛）。implement-issue-tree の自動マージ（`autoMerge: true`）は PR HEAD に報告される全チェックの必須化を前提とするため、チェックを追加・改名する workflow 変更では、マージ前に ruleset を新しいチェック名へ更新する
 

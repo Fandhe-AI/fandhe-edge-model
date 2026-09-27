@@ -7,17 +7,32 @@
 # ディレクトリ構造そのもので可視化する（依存関係の混入をレビューで見つけやすくする）。
 #
 # 依存方針（.claude/rules/dependency-policy.md）: 依存最小・ユーザー承認制・完全固定。
-# 2026-09-27 時点でオーナーが承認した依存は uv 0.12.19 / ruff 0.16.9 / pytest 9.1.1 の
-# 3 件のみ（pytest の推移的依存 iniconfig/packaging/pluggy/pygments は uv.lock 経由で
-# 付随。いずれも permissive ライセンス）。mlx・numpy・ビルドバックエンド（hatchling 等）は
-# 未承認のため、本ファイルには追加していない（学習ロジック未着手のため実行時依存も無し）。
+# 2026-09-27 時点でオーナーが承認した直接依存は次の 6 件（TASK-19.1/19.3・C3 の
+# 学習実装）: uv 0.12.19 / ruff 0.16.9 / pytest 9.1.1・学習/書き出し用の
+# mlx==0.32.2・numpy==2.5.3・onnx==1.23.0。scikit-learn・onnxruntime・torch・
+# safetensors パッケージは未承認のため追加していない。
+#
+# 推移的依存とライセンス（`uv.lock` 解決結果。importlib.metadata で確認。すべて
+# permissive ライセンス。typing_extensions の PSF-2.0・numpy が同梱する
+# 0BSD/CC0-1.0 は 2026-09-27 のオーナー判断で licensing.md・deny.toml の
+# 許可リストへ追加済み）:
+#   - mlx==0.32.2: MIT
+#   - mlx-metal==0.32.2（mlx の推移的依存。macOS arm64 専用の Metal 実装。
+#     推論ランタイムには持ち込まない。REQ-32）: MIT
+#   - numpy==2.5.3: License-Expression が
+#     "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0"（同梱コードの
+#     ライセンスを含む複合表記）
+#   - onnx==1.23.0: Apache-2.0
+#   - protobuf==7.36.2（onnx の推移的依存）: BSD-3-Clause
+#   - ml-dtypes==0.6.0（onnx の推移的依存）: Apache-2.0
+#   - typing-extensions==4.16.0（onnx の推移的依存）: PSF-2.0
 [project]
 name = "fandhe-edge-model-trainer"
 version = "0.0.0"
-description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口のスタブ）"
+description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口。C3=バイト CNN を実装）"
 requires-python = "==3.12.*"
 license = "MIT OR Apache-2.0"
-dependencies = []
+dependencies = ["mlx==0.32.2", "numpy==2.5.3", "onnx==1.23.0"]
 
 [dependency-groups]
 dev = ["ruff==0.16.9", "pytest==9.1.1"]
@@ -29,6 +44,10 @@ required-version = "==0.12.19"
 # ビルドバックエンドを持たない（配布パッケージを作らないスタブのため）。
 # pytest はソース配置 + `[tool.pytest.ini_options] pythonpath` で解決する。
 package = false
+# mlx の wheel は macOS 14 以降・arm64 のみ提供される（.claude/rules/coding-python.md・
+# python-ci.yml のコメント）。他プラットフォーム向けの解決を uv に試みさせず、
+# lock 対象環境をこの 1 通りに限定する。
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -52,5 +71,9 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "PT", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
-# pytest の assert はテストの本質であり bandit S101（assert 使用）の対象外とする
+# pytest の assert はテストの本質であり bandit S101（assert 使用）の対象外とする。
 "tests/*" = ["S101"]
+# S603（subprocess の呼び出し）は test_cli.py だけが `sys.executable` を引数リストで
+# （shell=True を使わず）呼ぶために必要で、危険な用法ではないため対象外とする
+# （他のテストファイルには subprocess 呼び出しが無いため、抑止範囲をここへ限定する）。
+"tests/test_cli.py" = ["S603"]
