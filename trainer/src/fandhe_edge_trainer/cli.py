@@ -2,7 +2,12 @@
 
 Rust 側 CLI（`docs/spec/03-poc/core-cli-vertical-slice/core/src/subprocess.rs`
 `run_logged` 相当。本実装では TASK-34.x のジョブ管理から呼ばれる）が子プロセスとして
-`python -m fandhe_edge_trainer train --request <path>` を起動する契約。
+`<venv の python> -I trainer/launch.py train --request <path>` を起動する契約
+（Issue #12。`trainer/launch.py` のモジュール docstring 参照。`trainer/` は
+`package = false` のため `python -m fandhe_edge_trainer ...` は呼び出し元が
+`PYTHONPATH` を自前で設定しない限り解決できない。`-m fandhe_edge_trainer` 形式は
+`__main__.py` 経由の開発時の内部利用としては残すが、外部からの公開契約では
+`trainer/launch.py` を必ず経由する）。
 
 **`train`（公開サブコマンド）はスーパーバイザー、実体は内部サブコマンド `_worker`**
 （P0-2）: `onnx.checker.check_model`・`SerializeToString`・単一の MLX 演算のような

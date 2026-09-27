@@ -34,6 +34,12 @@ git submodule update --init   # docs/spec（private・要アクセス権）
 
 `docs/spec`（`fandhe-edge-model-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
+学習ワーカー（`trainer/`）は `PYTHONPATH` の手動設定なしに、唯一の起動口 `trainer/launch.py` から起動できます（`-I` 隔離モード必須。Issue #12）:
+
+```bash
+trainer/.venv/bin/python3 -I trainer/launch.py train --request <request.json のパス>
+```
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。

@@ -43,6 +43,8 @@ dev = ["ruff==0.16.9", "pytest==9.1.1"]
 required-version = "==0.12.19"
 # ビルドバックエンドを持たない（配布パッケージを作らないスタブのため）。
 # pytest はソース配置 + `[tool.pytest.ini_options] pythonpath` で解決する。
+# 外部プロセスからの起動（Rust 側ジョブ管理・CLI・テスト）は `PYTHONPATH` の
+# 手動設定を前提にせず、唯一の起動口 `trainer/launch.py`（Issue #12）を使う。
 package = false
 # mlx の wheel は macOS 14 以降・arm64 のみ提供される（.claude/rules/coding-python.md・
 # python-ci.yml のコメント）。他プラットフォーム向けの解決を uv に試みさせず、

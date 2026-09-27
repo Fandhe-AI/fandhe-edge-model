@@ -1,9 +1,10 @@
-"""CLI（`python -m fandhe_edge_trainer train --request ...`）の統合テスト。
+"""CLI（`trainer/launch.py train --request ...`）の統合テスト。
 
 Rust 側 CLI が想定する子プロセス呼び出し方（`sys.executable` を引数リストで、
 `shell=True` を使わずに起動する。security.md）を模して subprocess で実行する。
 `trainer/pyproject.toml` は `package = false`（配布パッケージを持たない）ため、
-`PYTHONPATH` で `src/` を解決する。
+起動は唯一の起動口 `trainer/launch.py`（`-I` 隔離モード必須。Issue #12）を経由し、
+`PYTHONPATH` の手動設定には依存しない（`launch.py` のモジュール docstring 参照）。
 """
 
 from __future__ import annotations
@@ -15,14 +16,16 @@ import sys
 from pathlib import Path
 
 from conftest import LABEL_ORDER, TINY_CONFIG
+from fandhe_edge_trainer import supervisor
 
-_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
+_LAUNCH_SCRIPT = str(Path(__file__).resolve().parent.parent / "launch.py")
 
 
-def _run_cli(request_path: Path) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+def _run_cli(
+    request_path: Path, *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "fandhe_edge_trainer", "train", "--request", str(request_path)],
+        [sys.executable, "-I", _LAUNCH_SCRIPT, "train", "--request", str(request_path)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -32,13 +35,11 @@ def _run_cli(request_path: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _run_cli_argv(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
     return subprocess.run(
-        [sys.executable, "-m", "fandhe_edge_trainer", *argv],
+        [sys.executable, "-I", _LAUNCH_SCRIPT, *argv],
         capture_output=True,
         text=True,
         timeout=30,
-        env=env,
         check=False,
     )
 
@@ -237,14 +238,14 @@ def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> No
     `--out-fd` は本チェックより前に使われないため、実在しない fd 番号
     （3）を渡してよい。
     """
-    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+    # `supervisor.worker_argv` を再利用し、実際の起動経路（`-I` 付き
+    # `trainer/launch.py` 経由）と同じ argv で検証する（Issue #12）。
     proc = subprocess.Popen(
-        [sys.executable, "-m", "fandhe_edge_trainer", "_worker", "--out-fd", "3"],
+        supervisor.worker_argv(3),
         stdin=subprocess.PIPE,  # 通常ファイルではない（S_ISREG ではない）標準入力
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=env,
     )
     try:
         # 標準入力（パイプの書き込み側）はここでは閉じない。fstat による
@@ -270,3 +271,72 @@ def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> No
     # message の内容まで確認し、（偶然 EOF で早期に invalid_request になる
     # 経路ではなく）fstat による S_ISREG 検査で拒否されたことを裏付ける。
     assert payload["message"] == "stdin must be a regular file"
+
+
+def test_cli_train_ignores_polluted_pythonpath(tmp_path: Path) -> None:
+    """受け入れ条件 3（Issue #12）: 呼び出し元の `PYTHONPATH` に、import されると
+    即座に異常終了する偽の `mlx` パッケージを置いた状態でも、`kind="c3"`
+    （`kinds/c3.py` が `import mlx.core as mx` を eager import する）の学習が
+    exit 0 で成功すること。
+
+    `trainer/launch.py` 経由の起動（`-I` 隔離モード）が呼び出し元の
+    `PYTHONPATH` を無視して venv の本物の `mlx` を解決するため、この汚染は
+    影響しないはずである。`-I` が外れる退行が起きれば、偽の `mlx`
+    （`sys.exit(1)` するだけの `__init__.py`）が先に解決されて異常終了し、
+    本テストが検出する（証拠種別: テストハーネス）。
+
+    偽の `mlx` は学習を行う子プロセス（`_worker`）で初めて import されるため、
+    それだけでは公開プロセス（`trainer/launch.py train`）側の `-I` 欠落を
+    検出できない（PR #16 レビュー）。そこで同じ汚染ディレクトリへ
+    `sitecustomize.py` も置く。`site` モジュールは起動時に `sys.path` 上の
+    `sitecustomize` を import するため、`-I` の無いプロセスが 1 つでもあれば
+    （公開プロセス・`_worker` のどちらでも）マーカーファイルが作られる。
+    `-I` 付きでは `PYTHONPATH` が `sys.path` に入らず作られないことを実機で
+    確認済み（証拠種別: 実機）。
+    """
+    fake_mlx_root = tmp_path / "polluted-pythonpath"
+    fake_mlx_pkg = fake_mlx_root / "mlx"
+    fake_mlx_pkg.mkdir(parents=True)
+    (fake_mlx_pkg / "__init__.py").write_text(
+        "import sys\nsys.exit('fake mlx package must never be imported')\n",
+        encoding="utf-8",
+    )
+    # `-I` の無いプロセスが起動した時点で痕跡を残す（マーカーのパスは
+    # 環境変数経由にせずリテラルで埋め込み、検出経路を 1 つに保つ）。
+    sitecustomize_marker = tmp_path / "sitecustomize-imported"
+    (fake_mlx_root / "sitecustomize.py").write_text(
+        f"with open({str(sitecustomize_marker)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write('imported\\n')\n",
+        encoding="utf-8",
+    )
+
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    polluted_env = {**os.environ, "PYTHONPATH": str(fake_mlx_root)}
+    result = _run_cli(request_path, env=polluted_env)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    # 公開プロセス・`_worker` のいずれも汚染された `PYTHONPATH` を読んでいない。
+    assert not sitecustomize_marker.exists()
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "ok"
+    assert (out_dir / "artifact.json").exists()
+    assert (out_dir / "model.onnx").exists()

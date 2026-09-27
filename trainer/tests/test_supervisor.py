@@ -262,6 +262,21 @@ def test_supervisor_module_does_not_import_mlx() -> None:
     assert result.stdout.strip() == "", f"heavy deps imported: {result.stdout.strip()}"
 
 
+def test_worker_argv_uses_isolated_mode_and_launch_script() -> None:
+    """`supervisor.worker_argv`（Issue #12）が組み立てる argv が、`sys.executable`・
+    `-I`（隔離モード）・実在する `trainer/launch.py` の絶対パス・
+    `["_worker", "--out-fd", "<n>"]` から成ることを具体値で確認する。
+    """
+    argv = supervisor.worker_argv(7)
+    assert argv[0] == sys.executable
+    assert argv[1] == "-I"
+    launch_script = Path(argv[2])
+    assert launch_script.is_absolute()
+    assert launch_script.name == "launch.py"
+    assert launch_script.is_file()
+    assert argv[3:] == ["_worker", "--out-fd", "7"]
+
+
 def test_run_supervised_train_rejects_invalid_request_without_spawning_worker(
     tmp_path: Path,
 ) -> None:
@@ -296,7 +311,12 @@ def test_run_supervised_train_ignores_request_file_rewrite_after_reservation(
     （検証済みのバイト列を標準入力から渡される。`supervisor.py`・`cli.py` の
     モジュール docstring 参照）。
     """
-    monkeypatch.setenv("PYTHONPATH", _SRC_DIR)  # 子プロセスが src/ を解決できるようにする
+    # Issue #12: `_worker` の起動（`supervisor.worker_argv`）は `-I` 隔離モードで
+    # `trainer/launch.py` を経由するため `PYTHONPATH` は不要かつ無視される。
+    # 明らかに無効な値を設定しても子プロセスの起動・成功に影響しないことを示す
+    # （`PYTHONPATH` が実は必要という退行があれば、この不正な値のせいで
+    #  `fandhe_edge_trainer` の import に失敗し本テストが検出する）。
+    monkeypatch.setenv("PYTHONPATH", "/nonexistent/should-be-ignored-by-dash-i")
 
     train_path = tmp_path / "train.jsonl"
     _write_train_data(train_path)

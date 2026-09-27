@@ -45,6 +45,12 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 既定のテスト集合で動くはずのテストを、CI 通過のために実機前提テストへ移す差分は P0
 - 実機での測定・判定が「人間」担当のタスクを、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する
 
+### 学習ワーカーの起動契約（Issue #12）
+
+- 学習ワーカー（`trainer/`）は `package = false`（配布パッケージを持たないスタブ）のため、外部プロセスからの起動は唯一の起動口 `trainer/launch.py` を経由する契約とする: `<venv の python> -I trainer/launch.py train --request <path>`（`-I` 隔離モード必須。`trainer/launch.py`・`trainer/src/fandhe_edge_trainer/cli.py`・`trainer/src/fandhe_edge_trainer/supervisor.py::worker_argv` のモジュール docstring 参照）
+- `PYTHONPATH` の手動設定を前提にした呼び出し（`python -m fandhe_edge_trainer ...`）への回帰・新規追加は P1
+- Rust 側ジョブ管理（TASK-34.x）からの実際の呼び出しは本 Issue のスコープ外（将来 Rust 側が本契約を採用するかはオーナー確認事項）
+
 ## レビュー観点
 
 ### セキュリティ（P0 中心。`.claude/rules/security.md`・`.claude/rules/dependency-policy.md`・`.claude/rules/licensing.md`）
