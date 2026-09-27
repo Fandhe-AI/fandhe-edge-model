@@ -90,7 +90,9 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
     })?;
     // 通常ファイル以外（キャラクタデバイス・FIFO・ディレクトリ等）は、`stat` 上の
     // サイズがハッシュ対象の実データ量と無関係（`/dev/zero` は 0 バイトだが読むと
-    // 終端しない）なため、サイズ検査より先に拒否する。
+    // 終端しない）なため、サイズ検査より先に拒否する。この事前チェックは高速な
+    // 門前払い用であり、下の `open_without_blocking` の後段で fd を取り直して
+    // 再検証するまでがセキュリティ境界（TOCTOU 対策）である。
     if !metadata.is_file() {
         return Err(FreezeError::NotAFile);
     }
@@ -102,14 +104,24 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
         });
     }
 
-    let file = File::open(path).map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            FreezeError::NotFound(err)
-        } else {
-            FreezeError::Io(err)
-        }
-    })?;
-    // 実読み込み量にも上限を課す（`.take(limit + 1)`）。metadata 取得後にファイルが
+    // `metadata(path)` から open までの間にパスが FIFO 等へ差し替えられる
+    // TOCTOU に備え、Unix ではノンブロッキングで開く（書き手の無い FIFO の
+    // open(2) で無限にブロックしない。REQ-39「無制限の…無限待ちを作らない」）。
+    let file = open_without_blocking(path)?;
+    // 開いた fd 自体を fstat で再検証する（path ではなく file descriptor の種別・
+    // サイズを見るため、ここまでの間の差し替えを確実に検出できる）。
+    let fd_metadata = file.metadata().map_err(FreezeError::Io)?;
+    if !fd_metadata.is_file() {
+        return Err(FreezeError::NotAFile);
+    }
+    let fd_byte_len = fd_metadata.len();
+    if fd_byte_len > MAX_EVAL_DATA_BYTES {
+        return Err(FreezeError::TooLarge {
+            limit: MAX_EVAL_DATA_BYTES,
+            actual: fd_byte_len,
+        });
+    }
+    // 実読み込み量にも上限を課す（`.take(limit + 1)`）。fstat 後にファイルが
     // 成長した場合でも、上限超過分を読み進めた時点で確実に止まる。
     let read_limit = MAX_EVAL_DATA_BYTES.saturating_add(1);
     let mut counting = CountingReader::new(io::BufReader::new(file).take(read_limit));
@@ -130,6 +142,66 @@ pub fn freeze_eval_data(path: Option<&Path>) -> Result<EvalDataStatus, FreezeErr
         // 食い違わないようにするため（REQ-17 の記録整合性）。
         byte_len: actual_read,
     }))
+}
+
+/// 評価データのパスを通常ファイルとして安全に開く。
+///
+/// `std::fs::metadata(path)` によるファイル種別チェックと `File::open(path)` は
+/// 別々の操作であり、その間にパスが FIFO 等へ差し替えられると
+/// （TOCTOU）、単純な `File::open` は書き手が現れるまで無期限にブロックし得る
+/// （REQ-39「無制限の…無限待ちを作らない」への抵触）。Unix では `O_NONBLOCK` 付きで
+/// 開くことでこのブロックを避ける。通常ファイルに対する `O_NONBLOCK` は読み取り
+/// 挙動に影響しない（POSIX の規定）ため、正常系の動作は変わらない。
+///
+/// 値を `libc` クレートに頼らず OS ごとに直書きしているのは、新規依存の追加が
+/// ユーザー承認事項（[dependency-policy](../../../.claude/rules/dependency-policy.md)）
+/// であり、この 1 箇所のためだけに依存を増やさない判断による。
+///
+/// 呼び出し元（[`freeze_eval_data`]）はこの後さらに開いた fd 自体を fstat で
+/// 再検証するため、ここで返す `File` の種別・サイズはまだ信頼しない。
+#[cfg(unix)]
+fn open_without_blocking(path: &Path) -> Result<File, FreezeError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    const O_NONBLOCK: i32 = 0x0004;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                FreezeError::NotFound(err)
+            } else {
+                FreezeError::Io(err)
+            }
+        })
+}
+
+/// 評価データのパスを開く（Unix 以外）。
+///
+/// FIFO による無限ブロックは `mkfifo` が使える Unix 系環境に固有の攻撃経路のため、
+/// それ以外の環境では通常の `File::open` で足りる（呼び出し元が fd を fstat で
+/// 再検証する点は Unix 版と共通）。
+#[cfg(not(unix))]
+fn open_without_blocking(path: &Path) -> Result<File, FreezeError> {
+    File::open(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            FreezeError::NotFound(err)
+        } else {
+            FreezeError::Io(err)
+        }
+    })
 }
 
 /// 読み込んだバイト数を数えながら委譲する [`Read`] ラッパー。

@@ -138,6 +138,44 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
     }
 }
 
+/// REQ-39 異常系（TOCTOU / FIFO）: 書き手の無い FIFO を渡しても無限にブロックせず
+/// `FreezeError::NotAFile` で拒否することを確認する（codex レビュー P0 指摘の
+/// 回帰テスト。`metadata(path).is_file()` の後に `File::open(path)` するだけでは
+/// この間にパスが FIFO へ差し替えられた場合に open(2) がブロックし得るため、
+/// 開いた fd 自体をノンブロッキングで開いて fstat 検証する実装へ修正した。
+/// 万一ブロッキング実装へ回帰した場合にテストスイート自体が無期限にハングしない
+/// よう、判定は別スレッド＋タイムアウトで行う。Linux/macOS 実機・テストハーネス）。
+#[test]
+#[cfg(unix)]
+fn freeze_eval_data_returns_not_a_file_for_fifo_without_blocking() {
+    let guard = TempDirGuard::new("fifo-path");
+    let fifo_path = guard.path().join("eval.fifo");
+
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo command must be available on unix test runners");
+    assert!(status.success(), "mkfifo must exit successfully");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = freeze_eval_data(Some(&fifo_path));
+        // メインスレッドがタイムアウトで抜けた後に送信が失敗しても
+        // （受信側が既に drop 済み）テストの成否には影響しないため無視する。
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("freeze_eval_data must not block indefinitely on a writerless FIFO");
+
+    match result {
+        Err(FreezeError::NotAFile) => {}
+        Err(other) => panic!("expected NotAFile, got {other}"),
+        Ok(_) => panic!("expected NotAFile error, got Ok"),
+    }
+}
+
 /// REQ-39 異常系（非通常ファイル）: ディレクトリを渡しても `NotAFile` で拒否する
 /// （`metadata()` 自体は成功するため、`is_file()` による種別検証が効いていることの
 /// 確認）。
