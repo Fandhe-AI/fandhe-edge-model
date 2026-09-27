@@ -30,6 +30,20 @@
 //! 実装詳細であり本 crate が保証するものではないため、1 件あたりのサイズ・
 //! ネスト深さの明示的な上限（REQ-39）は引き続きガード層（パス未確定）の
 //! 責務とし、本関数はガード層を通過済みの入力を受け取る前提で実装している。
+//!
+//! # 重複 JSON キーの検出（REQ-16）
+//!
+//! `serde_json::Value` のパースはオブジェクトを `serde_json::Map` へ順に
+//! `insert` するため、同一キーが複数回出現する行（トップレベルの `id` の
+//! 重複・`output.intent` の重複を含む）は後勝ちの値のみが残り、パース結果
+//! だけでは重複の事実が分からない。[`inspect_records`] は
+//! パース成功後にもう一度、文字列リテラル外に現れる `:` の個数（生テキスト上の
+//! key/value ペア数）とパース後の木に残ったエントリ総数を突き合わせ、両者が
+//! 一致しない場合（=重複キーで木のエントリが後勝ちに潰れている場合）に
+//! [`AnomalyCode::DuplicateKey`] を記録してその行を `valid_records` から
+//! 除外する（`count_raw_key_value_separators`・`count_tree_entries`。
+//! ネスト先を含め任意の深さの重複を検出できる。再帰は成功済みパースの木を
+//! たどるだけのため、上記の serde_json 再帰上限に既に収まっている）。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,6 +77,13 @@ pub enum AnomalyCode {
     /// に残る場合があるが、2 回目以降の出現は `valid_records` から除外される
     /// （`id` の一意性は分割・ハッシュ・突き合わせのキーとしての契約のため）。
     DuplicateId { first_line: usize },
+    /// レコード内（トップレベルまたは `output` 等のネスト先）に同一キーが
+    /// 複数回出現した（例: `{"id":1,"id":"r1",...}`）。`serde_json::Value` への
+    /// パースはオブジェクトを `Map` へ挿入する際に後勝ちで上書きするため、
+    /// 重複キー自体は検出せず素通りする。これを個別に検出しないと、
+    /// 不正な重複キーを持つ行が型・enum 検査をすり抜けて `valid_records` へ
+    /// 混入する（REQ-16 のレビュー指摘。issue #38 PR #191）。
+    DuplicateKey,
 }
 
 impl AnomalyCode {
@@ -75,6 +96,7 @@ impl AnomalyCode {
             AnomalyCode::TypeMismatch { .. } => "type_mismatch",
             AnomalyCode::UnknownLabel => "unknown_label",
             AnomalyCode::DuplicateId { .. } => "duplicate_id",
+            AnomalyCode::DuplicateKey => "duplicate_key",
         }
     }
 }
@@ -135,6 +157,49 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// 生の JSON テキストのうち、文字列リテラルの外に現れる `:` の個数を数える。
+///
+/// 妥当な JSON では `:` はオブジェクトの key/value 区切りとしてのみ現れる
+/// （数値・`true`/`false`/`null` に `:` は含まれない）ため、この個数は
+/// 生テキスト上に書かれた key/value ペアの総数に一致する。文字列内の `:` は
+/// 引用符の開閉状態（エスケープを考慮）を追跡して除外する。バイト単位で
+/// 走査するため UTF-8 の継続バイト（0x80〜0xBF）が `"`・`\`・`:` と
+/// 衝突することはなく、多バイト文字境界を壊さない。
+fn count_raw_key_value_separators(raw_line: &str) -> usize {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0usize;
+    for byte in raw_line.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b':' {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// パース済みの JSON 木に残ったオブジェクトのエントリ総数を数える。
+///
+/// 同一キーが複数回出現していた場合、`serde_json::Value` のパース時点で
+/// 後勝ちの 1 エントリへ潰れているため、この値は生テキスト上のキー数より
+/// 小さくなる（[`count_raw_key_value_separators`] との差分が重複検出の根拠）。
+fn count_tree_entries(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => map.len() + map.values().map(count_tree_entries).sum::<usize>(),
+        Value::Array(items) => items.iter().map(count_tree_entries).sum(),
+        _ => 0,
+    }
+}
+
 /// 1 行 1 JSON（JSONL）の本文を検査する。
 ///
 /// ファイル読み込み・サイズ上限（REQ-39）はガード層／CLI 側の責務であり、
@@ -148,6 +213,10 @@ fn json_type_name(value: &Value) -> &'static str {
 /// - 1 行の JSON パースに失敗したら [`AnomalyCode::MalformedJson`]、
 ///   パースできたが object でなければ [`AnomalyCode::MalformedRecord`] を記録し、
 ///   その行はそこで打ち切って次の行へ進む
+/// - object であっても、トップレベルまたはネスト先（`output` 等）に同一キーが
+///   複数回出現していた場合は [`AnomalyCode::DuplicateKey`] を記録し、
+///   その行は個々のフィールド検査を行わずに次の行へ進む（モジュール doc
+///   「重複 JSON キーの検出」参照。REQ-16）
 /// - 1 レコードにつき複数の異常をまとめて報告する（先頭の異常で打ち切らない）
 /// - 同一 `id` が複数行に現れた場合、2 回目以降の出現に
 ///   [`AnomalyCode::DuplicateId`] を記録し、その行は `valid_records` から
@@ -195,6 +264,19 @@ pub fn inspect_records(
             });
             continue;
         };
+
+        // 重複 JSON キーの検出（モジュール doc「重複 JSON キーの検出」参照）。
+        // パース後の木では後勝ちで潰れているため、生テキストの key/value 区切り数と
+        // 突き合わせて初めて検出できる。検出した行は個々のフィールド検査に進まず、
+        // レコード全体を無効として次の行へ進む（MalformedRecord と同じ扱い）。
+        if count_raw_key_value_separators(raw_line) != count_tree_entries(&value) {
+            anomalies.push(RecordAnomaly {
+                line,
+                field: "<record>",
+                code: AnomalyCode::DuplicateKey,
+            });
+            continue;
+        }
 
         let mut record_has_error = false;
 
@@ -869,5 +951,85 @@ mod tests {
             AnomalyCode::DuplicateId { first_line: 1 }.code(),
             "duplicate_id"
         );
+        assert_eq!(AnomalyCode::DuplicateKey.code(), "duplicate_key");
+    }
+
+    /// P1 修正の回帰確認（レビュー指摘。PR #191）: トップレベルの `id` が
+    /// 重複しているレコードは、`serde_json::Value` パース時点の後勝ちで
+    /// 妥当なレコードとして混入せず、`DuplicateKey` として検出されること。
+    #[test]
+    fn duplicate_top_level_key_is_reported_and_excluded_from_valid_records() {
+        let content = "{\"id\":1,\"id\":\"r1\",\"input\":\"x\",\"output\":{\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "<record>",
+                code: AnomalyCode::DuplicateKey,
+            }]
+        );
+        assert!(outcome.valid_records.is_empty());
+    }
+
+    /// P1 修正の回帰確認: ネスト先（`output.intent`）の重複キーも検出されること。
+    #[test]
+    fn duplicate_nested_key_is_reported_and_excluded_from_valid_records() {
+        let content =
+            "{\"id\":\"r1\",\"input\":\"x\",\"output\":{\"intent\":\"nope\",\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "<record>",
+                code: AnomalyCode::DuplicateKey,
+            }]
+        );
+        assert!(outcome.valid_records.is_empty());
+    }
+
+    /// P1 修正の回帰確認: Unicode エスケープで書かれた重複キー
+    /// （`"id"` と `"\u0069d"` はいずれも文字列としては `"id"`）も検出されること。
+    #[test]
+    fn duplicate_key_via_unicode_escape_is_reported() {
+        let content =
+            "{\"id\":\"a\",\"\\u0069d\":\"b\",\"input\":\"x\",\"output\":{\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert_eq!(
+            outcome.anomalies,
+            vec![RecordAnomaly {
+                line: 1,
+                field: "<record>",
+                code: AnomalyCode::DuplicateKey,
+            }]
+        );
+        assert!(outcome.valid_records.is_empty());
+    }
+
+    /// 誤検出防止の対照実験: 文字列値の中に `:`・`"` を含むレコードは
+    /// （重複キーが実際には無いため）異常として検出されないこと
+    /// （`count_raw_key_value_separators` の文字列スキップが正しく働く確認）。
+    #[test]
+    fn colon_inside_string_values_is_not_a_false_positive() {
+        let content =
+            "{\"id\":\"a:b\\\"c:d\",\"input\":\"{\\\"x\\\":1}\",\"output\":{\"intent\":\"ok\"}}";
+        let valid = labels(&["ok"]);
+
+        let outcome = inspect_records(content, &valid).unwrap();
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(outcome.valid_records.len(), 1);
+        assert_eq!(outcome.valid_records[0].id, "a:b\"c:d");
+        assert_eq!(outcome.valid_records[0].input, "{\"x\":1}");
     }
 }
