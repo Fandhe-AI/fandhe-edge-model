@@ -207,8 +207,17 @@ fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
                 n_test = n.saturating_sub(n_train).saturating_sub(n_val);
             }
             if ratios.test == 0.0 {
-                // 余りを train へ戻し、test には割り付けない。
-                n_train += n_test;
+                // 余り（丸め誤差により test 用スロットとして残った件数）は、
+                // train が比率 0.0（利用者が「train を作らない」と明示した場合）
+                // なら train へ寄せず validation へ配る（codex/review 指摘・PR #189）。
+                // 例: train=0.0, validation=0.9999999995, test=0.0, n=10 のとき、
+                // 従来は残り 1 件が train（比率 0.0）へ配られ、公開 API の
+                // 「比率 0.0 の split には割り付けない」契約に反していた。
+                if ratios.train > 0.0 {
+                    n_train += n_test;
+                } else {
+                    n_val += n_test;
+                }
                 n_test = 0;
             }
 
@@ -537,6 +546,20 @@ mod tests {
             test: 1.0,
         };
         assert_eq!(alloc_counts(10, &test_only), (0, 0, 10));
+    }
+
+    /// REQ-17・TASK-17.1-1（codex/review 指摘・PR #189）: `n >= 3` の一般規則で、
+    /// 合計が許容差 1e-9 内で 1.0 に収まる比率（`train=0.0` を含む）を渡したとき、
+    /// 丸め誤差による余り 1 件が train（比率 0.0）へ割り付けられてはならない。
+    /// 残りは正の比率を持つ split（この例では validation）へ配る。
+    #[test]
+    fn req17_task17_1_1_alloc_counts_leftover_never_goes_to_zero_ratio_train() {
+        let ratios = SplitRatios {
+            train: 0.0,
+            validation: 0.999_999_999_5,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(10, &ratios), (0, 10, 0));
     }
 
     /// REQ-17・TASK-17.1-1（codex/review 指摘・PR #189）: `n` が 1・2 件の
