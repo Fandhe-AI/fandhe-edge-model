@@ -1,0 +1,4 @@
+{
+  "labels": ["A", "B", "C", "D"],
+  "description": "手計算用の単一選択ラベル定義（4 ラベル）。9 意図の schema.json とは独立した最小の label-definition file。"
+}

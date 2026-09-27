@@ -1,0 +1,9 @@
+{
+  "case": "05-duplicate-id",
+  "description": "id の重複",
+  "expected_action": "stop",
+  "expected_exit_code": 2,
+  "expected_reason_code": "duplicate_id",
+  "duplicated_ids": ["dup-1"],
+  "note": "gold.jsonl 内に id='dup-1' が 2 行あり、gold と prediction を id で一意に突き合わせられないため評価器は停止する。"
+}

@@ -1,0 +1,9 @@
+{
+  "case": "06-duplicate-input",
+  "description": "重複（正規化 input が同じ行。train 内・test 内・train と test の間）",
+  "expected_action": "warn_include",
+  "expected_exit_code": 0,
+  "expected_reason_code": "duplicate_input_within_split",
+  "warned_ids": ["an06-1", "an06-2"],
+  "note": "an06-1・an06-2 は正規化 input が完全一致（かつ正解も一致）する重複行。評価器は警告するが除外しない（無断で行を除去しない。除去するかは利用者判断）。件数（分母）には両方とも含める。"
+}

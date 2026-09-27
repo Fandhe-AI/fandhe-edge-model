@@ -1,0 +1,8 @@
+{
+  "case": "01-empty-data",
+  "description": "0 行の学習データ・評価データ",
+  "expected_action": "stop",
+  "expected_exit_code": 2,
+  "expected_reason_code": "empty_data",
+  "note": "gold.jsonl・pred.jsonl とも 0 行。評価器は指標を計算せずに停止する。"
+}
