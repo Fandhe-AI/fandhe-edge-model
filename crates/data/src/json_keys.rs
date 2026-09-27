@@ -100,8 +100,12 @@ mod tests {
         assert!(has_duplicate_key(raw, &value));
     }
 
-    /// Unicode エスケープによるキー重複 smuggling（`"id"` と `"id"` は
-    /// いずれも `id` を指す）を検出できること。
+    /// Unicode エスケープによるキー重複 smuggling（`"id"` は `i`
+    /// が `i` を指すため、素の `"id"` と同じキーへ潰れる）を検出できること。
+    /// 生テキスト上は 2 つの異なるキー表記（`id` と `id`）に見えるが、
+    /// `serde_json` のパース時点でどちらも `id` へデコードされ 1 エントリへ
+    /// 潰れる点が、素の重複キー（`duplicate_top_level_key_is_detected`）との
+    /// 違い（Cursor Bugbot 指摘。issue #55 PR #203 レビュー）。
     #[test]
     fn duplicate_key_via_unicode_escape_is_detected() {
         let raw = r#"{"id":"a","id":"b"}"#;
