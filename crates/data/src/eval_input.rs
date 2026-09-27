@@ -294,8 +294,10 @@ pub struct EvalInputWarning {
     pub code: WarningCode,
     pub action: WarningAction,
     pub side: Side,
-    /// 該当した行番号（昇順・重複なし）。[`WarningCode::MissingPrediction`] の
-    /// 場合は対応する pred 行が存在しないため、代わりに gold 側の行番号を指す。
+    /// 該当した行番号（昇順・重複なし）。[`WarningCode::MissingPrediction`]・
+    /// [`WarningCode::AllError`] は対応する pred 行が存在しない行を含みうる
+    /// ため、そのような行では代わりに gold 側の行番号を指す（対象行を
+    /// 特定できない警告を出さないため。レビュー指摘。PR #204）。
     /// [`WarningCode::UnseenClass`] の場合は行番号で表せないため常に空。
     pub lines: Vec<usize>,
     /// [`WarningCode::UnseenClass`] のときだけ非空（ラベル ID の昇順・
@@ -1127,10 +1129,17 @@ pub fn prepare_evaluation_input(
             .iter()
             .all(|row| matches!(row.prediction, PredictionOutcome::Error(_)))
         {
-            // 同上。`MissingPrediction` による Error は pred_line が
-            // 存在しない（予測行が無い）ため、そのような行は含めない
-            // （存在しない行番号を捏造しない）。
-            let lines: BTreeSet<usize> = active.iter().filter_map(|row| row.pred_line).collect();
+            // `side: Prediction` だが、`MissingPrediction` による Error は
+            // pred_line が存在しない（予測行が無い）。全行が
+            // `MissingPrediction` 起因の場合に `lines` が空になり、警告が
+            // 対象行を指せなくなる不具合の修正（レビュー指摘。PR #204）。
+            // [`EvalInputWarning::lines`] のドキュメント（`MissingPrediction`
+            // は代わりに gold 側の行番号を指す）と同じ規約に揃え、pred_line
+            // が無い行は gold_line にフォールバックする。
+            let lines: BTreeSet<usize> = active
+                .iter()
+                .map(|row| row.pred_line.unwrap_or(row.gold_line))
+                .collect();
             lines_by_code
                 .entry(WarningCode::AllError)
                 .or_default()
@@ -2168,6 +2177,33 @@ mod tests {
                 .iter()
                 .any(|w| w.code == WarningCode::AllError)
         );
+    }
+
+    /// `active` の全行が [`ErrorOrigin::MissingPrediction`] 起因の場合、
+    /// pred_line が 1 件も存在しないため、`AllError` の `lines` が空になり
+    /// 対象行を特定できなくなる不具合の修正確認（レビュー指摘。PR #204）。
+    /// gold 側の行番号にフォールバックし、`lines` が非空で gold の行番号と
+    /// 一致することを確認する。
+    #[test]
+    fn req23_all_error_lines_fall_back_to_gold_line_when_all_missing_prediction() {
+        let gold = concat!(
+            "{\"id\":\"a\",\"label\":\"A\"}\n", // pred 行なし -> MissingPrediction
+            "{\"id\":\"b\",\"label\":\"A\"}\n", // pred 行なし -> MissingPrediction
+        );
+        let pred = "";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 2);
+        assert!(outcome.active.iter().all(|row| matches!(
+            row.prediction,
+            PredictionOutcome::Error(ErrorOrigin::MissingPrediction)
+        ) && row.pred_line.is_none()));
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::AllError)
+            .expect("AllError warning must be present");
+        // gold 側の行番号（1・2 行目）にフォールバックしていること。
+        assert_eq!(warning.lines, vec![1, 2]);
     }
 
     /// [`PredictionOutcome::Invalid`] が 1 件でも混じると [`WarningCode::AllError`]
