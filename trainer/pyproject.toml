@@ -19,6 +19,8 @@
 #   - mlx==0.32.2: MIT
 #   - mlx-metal==0.32.2（mlx の推移的依存。macOS arm64 専用の Metal 実装。
 #     推論ランタイムには持ち込まない。REQ-32）: MIT
+#   - mlx-cpu==0.32.2（mlx の `cpu` extra。Linux 専用の CPU 実装。開発環境で
+#     `make py-ci` を動かすために追加。推論ランタイムには持ち込まない。REQ-32）: MIT
 #   - numpy==2.5.3: License-Expression が
 #     "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0"（同梱コードの
 #     ライセンスを含む複合表記）
@@ -32,7 +34,7 @@ version = "0.0.0"
 description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口。C1=バイト n-gram TF-IDF＋LR・C3=バイト CNN を実装）"
 requires-python = "==3.12.*"
 license = "MIT OR Apache-2.0"
-dependencies = ["mlx==0.32.2", "numpy==2.5.3", "onnx==1.23.0"]
+dependencies = ["mlx[cpu]==0.32.2", "numpy==2.5.3", "onnx==1.23.0"]
 
 [dependency-groups]
 dev = ["ruff==0.16.9", "pytest==9.1.1"]
@@ -46,10 +48,15 @@ required-version = "==0.12.19"
 # 外部プロセスからの起動（Rust 側ジョブ管理・CLI・テスト）は `PYTHONPATH` の
 # 手動設定を前提にせず、唯一の起動口 `trainer/launch.py`（Issue #12）を使う。
 package = false
-# mlx の wheel は macOS 14 以降・arm64 のみ提供される（.claude/rules/coding-python.md・
-# python-ci.yml のコメント）。他プラットフォーム向けの解決を uv に試みさせず、
-# lock 対象環境をこの 1 通りに限定する。
-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# lock 対象環境を macOS arm64（spec の検証環境。python-ci.yml が実行）と
+# Linux x86_64（開発環境でのローカル `make py-ci` 用）の 2 通りに限定する。
+# Linux では `mlx[cpu]` の extra で CPU 実装（mlx-cpu）が入る（macOS では extra の
+# マーカーが Linux 限定のため効かず、従来どおり mlx-metal が入る）。pytest は
+# request.device="cpu" で CPU 経路だけを使うため、どちらの環境でも同じテストが走る。
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
