@@ -57,19 +57,18 @@ pub enum Split {
 
 /// 分割比率（既定 0.8 / 0.1 / 0.1。PoC-9・PoC-10 の実測値）。
 ///
-/// # `alloc_counts` による丸めと非対称な最低件数保証
+/// # `alloc_counts` による丸めと最低件数保証
 ///
 /// `n`（group 件数）が 3 以上の場合、[`alloc_counts`] は各比率を `floor(n * ratio)`
-/// で丸めたのち、**validation にのみ**無条件で最低 1 件を保証する（不足分は train
-/// から差し引く）。test は train を差し引いた残りとして計算され、それでも 0 件に
-/// なる場合に限り train から 1 件を差し引いて補う（train が既に 0 件のときは補えず
-/// 0 件のままになる）。この結果、`validation` と `test` のどちらかが `0.0` の
-/// 比率でも、実際に割り付けられる件数は非対称になる
-/// （`train=1.0, validation=0.0, test=0.0` は `n=10` で `(8, 1, 1)` になる一方、
-/// `train=0.0, validation=1.0, test=0.0` は `n=10` で `(0, 10, 0)` のままになる）。
-/// `validate()` はこの非対称性を理由に比率を拒否しない（`0.0` 自体は許容区間内の
-/// 正当な値のため）。呼び出し側が正確な件数を必要とする場合は、`0.0` を含む比率
-/// を渡す前にこの丸め規則を踏まえて設計すること。
+/// で丸めたのち、比率が厳密に `0.0` でない split にのみ最低 1 件を保証する
+/// （validation の不足分は train から差し引き、test の不足分は train から 1 件を
+/// 差し引いて補う。train が既に 0 件のときは補えず 0 件のままになる）。
+/// 比率が厳密に `0.0` の split には、丸め誤差による繰り上げも最低件数保証も
+/// 一切適用せず、常に 0 件になる（`train=1.0, validation=0.0, test=0.0` は
+/// `n=10` で `(10, 0, 0)`）。公開 API の比率指定（`0.0` は利用者が「その split
+/// を作らない」という意図で渡せる正当な値）と実際の分割結果を一致させるための
+/// 規則であり、`0.0` 未満の極小な非ゼロ比率（丸めで 0 件になる値）には従来どおり
+/// 最低 1 件保証を適用する（意図しない空 split を避けるため）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitRatios {
     pub train: f64,
@@ -141,10 +140,20 @@ pub struct SplitResult {
 const RULE_ID: &str = "group-stratified-v1/alloc-poc9/splitmix64-fisher-yates";
 
 /// 分割の入力検証エラー。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitError {
     /// `SplitRatios` が区間外・NaN・合計が 1.0 から許容差を超えて外れている。
     InvalidRatios,
+    /// `records` 内に同一のレコード ID が複数回出現した。
+    ///
+    /// `by_record`（レコード ID -> split）は ID をキーにした
+    /// `BTreeMap` のため、重複 ID を検出せずに割り付けると先行レコードの
+    /// 割付が後続レコードで黙って上書きされ、`by_record` の件数が入力件数より
+    /// 少なくなる。これは後続 TASK-17.1-2（#45）の分割ハッシュ化でレコードを
+    /// 正しく対応づけられなくする（評価契約 REQ-17 の分割の正しさに関わる）ため、
+    /// レコード ID の一意性は本モジュールの入力契約として検証する
+    /// （`id()` の形式検査自体は呼び出し側の責務のまま。[`Groupable::id`]）。
+    DuplicateRecordId(String),
 }
 
 /// `n` 件の group を train / validation / test へ割り付ける件数を決める。
@@ -153,13 +162,13 @@ pub enum SplitError {
 /// `alloc_counts` と同じ割付規則を移植したもの。常に `train + validation + test == n` を保つ
 /// （呼び出し側の設定ミスでも panic しない。coding-rust.md）。
 ///
-/// `n >= 3` の場合、validation は `floor(n * ratios.validation)` が 0 でも
-/// 無条件で最低 1 件に底上げされ、不足分は train から差し引かれる。test には
-/// 同等の底上げは行われず、「train を差し引いた残りが 0 件のときに限り、
-/// train からさらに 1 件差し引いて補う」という弱い保証のみを持つ（train が
-/// 既に 0 件ならこの補いも効かない）。この非対称性は移植元 PoC-9 の
-/// `alloc_counts` の挙動をそのまま踏襲したもので、[`SplitRatios`] のドキュメントに
-/// 詳細と具体例を記載している。
+/// `n >= 3` の場合、validation は比率が厳密に `0.0` でない限り
+/// `floor(n * ratios.validation)` が 0 でも最低 1 件に底上げされ、不足分は
+/// train から差し引かれる。test も比率が厳密に `0.0` でない限り、
+/// 「train を差し引いた残りが 0 件のときに限り、train からさらに 1 件差し引いて
+/// 補う」という保証を持つ（train が既に 0 件ならこの補いも効かない）。
+/// validation・test いずれも比率が厳密に `0.0` の場合はこの底上げを一切適用せず
+/// 常に 0 件を返す（`SplitRatios` のドキュメントコメントに詳細と具体例を記載）。
 fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
     match n {
         0 => (0, 0, 0),
@@ -168,21 +177,34 @@ fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
         _ => {
             #[allow(clippy::cast_precision_loss)]
             let n_f64 = n as f64;
-            let n_train_raw = (n_f64 * ratios.train).floor();
-            let n_val_raw = (n_f64 * ratios.validation).floor();
             // 負値・NaN は validate() で既に拒否済みだが、境界値でも usize への
             // 変換が壊れないよう 0 未満にはならないことを前提にしつつ明示的に扱う。
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let n_train = n_train_raw.max(0.0) as usize;
+            let n_train_raw = (n_f64 * ratios.train).floor().max(0.0) as usize;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let n_val = (n_val_raw.max(0.0) as usize).max(1);
-            let n_val = n_val.min(n);
-            let mut n_train = n_train.min(n.saturating_sub(n_val));
+            let n_val_raw = (n_f64 * ratios.validation).floor().max(0.0) as usize;
+
+            // 比率が厳密に 0.0 の split には最低件数保証を適用しない（利用者が
+            // 明示的に「この split を作らない」と指定した場合の意図を尊重する）。
+            let mut n_val = if ratios.validation > 0.0 {
+                n_val_raw.max(1)
+            } else {
+                0
+            };
+            n_val = n_val.min(n);
+
+            let mut n_train = n_train_raw.min(n.saturating_sub(n_val));
             let mut n_test = n.saturating_sub(n_train).saturating_sub(n_val);
-            if n_test < 1 {
-                n_train = n_train.saturating_sub(1);
+            if ratios.test > 0.0 && n_test < 1 && n_train > 0 {
+                n_train -= 1;
                 n_test = n.saturating_sub(n_train).saturating_sub(n_val);
             }
+            if ratios.test == 0.0 {
+                // 余りを train へ戻し、test には割り付けない。
+                n_train += n_test;
+                n_test = 0;
+            }
+
             (n_train, n_val, n_test)
         }
     }
@@ -280,7 +302,8 @@ fn shuffle<T>(items: &mut [T], rng: &mut SplitMix64) {
 /// # Errors
 ///
 /// `ratios` が区間外・NaN・合計が 1.0 から許容差を超えて外れている場合、
-/// [`SplitError::InvalidRatios`] を返す。
+/// [`SplitError::InvalidRatios`] を返す。`records` 内に同一のレコード ID が
+/// 複数回出現した場合、[`SplitError::DuplicateRecordId`] を返す。
 pub fn split_by_group<T: Groupable>(
     records: &[T],
     seed: u64,
@@ -358,10 +381,15 @@ pub fn split_by_group<T: Groupable>(
     }
 
     // 5. レコード ID -> split（group の割付結果をレコードへ展開する）。
+    //    同一 ID が複数レコードに現れると `insert` が先行割付を黙って上書きし
+    //    `by_record` の件数が入力より少なくなるため、上書き前に検出して拒否する
+    //    （SplitError::DuplicateRecordId のドキュメントコメント参照）。
     let mut by_record: BTreeMap<String, Split> = BTreeMap::new();
     for record in records {
-        if let Some(split) = by_group.get(record.group_id()) {
-            by_record.insert(record.id().to_string(), *split);
+        if let Some(split) = by_group.get(record.group_id())
+            && by_record.insert(record.id().to_string(), *split).is_some()
+        {
+            return Err(SplitError::DuplicateRecordId(record.id().to_string()));
         }
     }
 
@@ -425,27 +453,48 @@ mod tests {
         assert_eq!(alloc_counts(10, &ratios), (8, 1, 1));
     }
 
-    /// REQ-17・TASK-17.1-1: alloc_counts の validation / test への最低 1 件保証は
-    /// 非対称であることをピン留めする（[`SplitRatios`] のドキュメントコメントで
-    /// 明記した仕様どおりの挙動であることの回帰確認）。
+    /// REQ-17・TASK-17.1-1: 比率が厳密に 0.0 の split には最低件数保証を適用せず、
+    /// 常に 0 件になる（公開 API の比率指定と実際の分割結果を一致させる）。
     #[test]
-    fn req17_task17_1_1_alloc_counts_min_guarantee_is_asymmetric() {
-        // validation=0.0 でも n>=3 なら無条件で 1 件に底上げされ、train から差し引かれる。
+    fn req17_task17_1_1_alloc_counts_zero_ratio_gets_zero_count() {
+        // validation=0.0, test=0.0 でも底上げされず、train が残り全件を受け取る。
         let train_only = SplitRatios {
             train: 1.0,
             validation: 0.0,
             test: 0.0,
         };
-        assert_eq!(alloc_counts(10, &train_only), (8, 1, 1));
+        assert_eq!(alloc_counts(10, &train_only), (10, 0, 0));
 
-        // validation=1.0 のときは test への同等の底上げは行われない
-        // （train が既に 0 件で補えないため test は 0 件のまま）。
+        // train=0.0, test=0.0 でも同様に底上げされない。
         let validation_only = SplitRatios {
             train: 0.0,
             validation: 1.0,
             test: 0.0,
         };
         assert_eq!(alloc_counts(10, &validation_only), (0, 10, 0));
+
+        // train=0.0, validation=0.0 でも同様に底上げされない。
+        let test_only = SplitRatios {
+            train: 0.0,
+            validation: 0.0,
+            test: 1.0,
+        };
+        assert_eq!(alloc_counts(10, &test_only), (0, 0, 10));
+    }
+
+    /// REQ-17・TASK-17.1-1: 丸めで 0 件になる極小な非ゼロ比率には、従来どおり
+    /// 最低 1 件保証を適用する（0.0 ちょうどの場合とは区別する）。
+    #[test]
+    fn req17_task17_1_1_alloc_counts_near_zero_ratio_still_gets_min_one() {
+        let near_zero = SplitRatios {
+            train: 0.9,
+            validation: 0.05,
+            test: 0.05,
+        };
+        let (train, validation, test) = alloc_counts(10, &near_zero);
+        assert_eq!(train + validation + test, 10);
+        assert!(validation >= 1);
+        assert!(test >= 1);
     }
 
     /// REQ-17・TASK-17.1-1: alloc_counts は常に train + validation + test == n を保つ。
@@ -632,5 +681,30 @@ mod tests {
         assert!(result.by_record.is_empty());
         assert!(result.by_group.is_empty());
         assert!(result.per_label.is_empty());
+    }
+
+    /// REQ-17・TASK-17.1-1: 異なる group に同一のレコード ID が現れた場合、
+    /// `by_record` を黙って上書きせず `SplitError::DuplicateRecordId` を返す。
+    #[test]
+    fn req17_task17_1_1_duplicate_record_id_across_groups_is_rejected() {
+        let records = vec![
+            record("dup", "g1", "a"),
+            record("dup", "g2", "a"),
+            record("r3", "g3", "a"),
+        ];
+        assert_eq!(
+            split_by_group(&records, 0, &SplitRatios::default()),
+            Err(SplitError::DuplicateRecordId("dup".to_string()))
+        );
+    }
+
+    /// REQ-17・TASK-17.1-1: 同一 group 内の同一レコード ID の重複も同様に拒否する。
+    #[test]
+    fn req17_task17_1_1_duplicate_record_id_within_group_is_rejected() {
+        let records = vec![record("dup", "g1", "a"), record("dup", "g1", "a")];
+        assert_eq!(
+            split_by_group(&records, 0, &SplitRatios::default()),
+            Err(SplitError::DuplicateRecordId("dup".to_string()))
+        );
     }
 }
