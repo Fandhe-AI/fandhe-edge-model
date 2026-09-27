@@ -135,6 +135,13 @@ class ResourceBudget:
 
         いずれかが上限を超えていれば `WorkerError`（limit_exceeded・exit 20）
         を送出する。学習ループの各バッチ・ONNX 書き出しの前後で呼ぶ想定。
+
+        `device="gpu"` の場合、`rss_bytes` は 2 つの異なる資源（ホスト側の
+        プロセス RSS と GPU〔Metal〕の active memory）の上限として同じ数値を
+        流用する。両者は別々のメモリ空間だが、本ワーカーでは 1 つの上限値
+        （`limits.MAX_TRAIN_RSS_BYTES` 由来）で両方を検査する設計になっている
+        （この設計の妥当性は `limits.py` の `MAX_TRAIN_RSS_BYTES` に記載の論点
+        としてオーナー確認待ち。Issue #11）。
         """
         if time.monotonic() > self._deadline:
             raise WorkerError(
