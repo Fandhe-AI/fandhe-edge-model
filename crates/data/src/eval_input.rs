@@ -521,10 +521,56 @@ fn substitute_non_finite_literals(raw_line: &str) -> Option<String> {
         let byte = bytes[i];
 
         if in_string {
-            result.push(byte);
             if escaped {
+                // 直前の `\` に続くエスケープ本体。トップレベルキー名の比較を
+                // `"scores"`（`scores` の Unicode エスケープ表記）のような
+                // 正当な JSON エスケープに対しても正しく行うため、string_buf
+                // にはデコード後のバイト列を積む（result は再パース用に元の
+                // 生バイト列のまま変更しない。レビュー指摘。PR #204）。
+                result.push(byte);
                 escaped = false;
-            } else if byte == b'\\' {
+                match byte {
+                    b'"' => string_buf.push(b'"'),
+                    b'\\' => string_buf.push(b'\\'),
+                    b'/' => string_buf.push(b'/'),
+                    b'b' => string_buf.push(0x08),
+                    b'f' => string_buf.push(0x0C),
+                    b'n' => string_buf.push(b'\n'),
+                    b'r' => string_buf.push(b'\r'),
+                    b't' => string_buf.push(b'\t'),
+                    b'u' => {
+                        // `\uXXXX`（サロゲートペアなら続く `\uXXXX` も）を読み、
+                        // 元のバイト列を result へそのまま複写しつつ、
+                        // string_buf にはデコードしたコードポイントの UTF-8 を
+                        // 積む。不正な形式（桁不足・非16進・孤立サロゲート）は
+                        // キー比較を諦めるだけに留め、実際の JSON 妥当性検証は
+                        // 呼び出し元の再パースに委ねる。
+                        if let Some((code_point, consumed)) = decode_unicode_escape(bytes, i + 1) {
+                            result.extend_from_slice(&bytes[i + 1..i + 1 + consumed]);
+                            if let Some(decoded_char) = char::from_u32(code_point) {
+                                let mut char_buf = [0u8; 4];
+                                string_buf.extend_from_slice(
+                                    decoded_char.encode_utf8(&mut char_buf).as_bytes(),
+                                );
+                            }
+                            i += consumed;
+                        } else {
+                            // 比較不能マーカー（"scores" とは一致しない任意の
+                            // バイト）を積み、以降このキー名の照合を諦める。
+                            string_buf.push(0);
+                        }
+                    }
+                    _ => {
+                        // JSON として不正なエスケープ文字。同様に比較不能
+                        // マーカーを積む（後続の再パースで自然に停止する）。
+                        string_buf.push(0);
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            result.push(byte);
+            if byte == b'\\' {
                 escaped = true;
             } else if byte == b'"' {
                 in_string = false;
@@ -607,6 +653,39 @@ fn substitute_non_finite_literals(raw_line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// `\uXXXX` エスケープ（`start` は `\u` 直後の16進4桁の開始位置）を読み、
+/// コードポイントと消費した16進バイト数（4、サロゲートペアなら10）を返す。
+/// 高サロゲート（`0xD800`〜`0xDBFF`）の直後に低サロゲート（`0xDC00`〜
+/// `0xDFFF`）の `\uXXXX` が続く場合は結合し、続かない場合は孤立サロゲートの
+/// コードポイントをそのまま返す（呼び出し元は `char::from_u32` が `None` に
+/// なることで無視する）。桁不足・非16進など形式が不正な場合は `None` を返す
+/// ([`substitute_non_finite_literals`] のトップレベルキー検出専用の
+/// 簡易デコーダで、JSON 全体の妥当性検証は呼び出し元の再パースに委ねる)。
+fn decode_unicode_escape(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    let high = parse_hex4(bytes, start)?;
+    if (0xD800..=0xDBFF).contains(&high) {
+        let low_start = start + 4;
+        if bytes.get(low_start) == Some(&b'\\')
+            && bytes.get(low_start + 1) == Some(&b'u')
+            && let Some(low) = parse_hex4(bytes, low_start + 2)
+            && (0xDC00..=0xDFFF).contains(&low)
+        {
+            let code_point = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+            return Some((code_point, 10));
+        }
+        return Some((high, 4));
+    }
+    Some((high, 4))
+}
+
+/// `bytes[start..start + 4]` を16進4桁として解釈する。範囲外・非16進なら
+/// `None`。
+fn parse_hex4(bytes: &[u8], start: usize) -> Option<u32> {
+    let slice = bytes.get(start..start + 4)?;
+    let text = std::str::from_utf8(slice).ok()?;
+    u32::from_str_radix(text, 16).ok()
 }
 
 /// pred の `scores` フィールドが不正か判定する（ケース 10・TASK-23.1-2）。
@@ -1042,7 +1121,10 @@ pub fn prepare_evaluation_input(
             .iter()
             .all(|row| matches!(row.prediction, PredictionOutcome::Abstain))
         {
-            let lines: BTreeSet<usize> = active.iter().map(|row| row.gold_line).collect();
+            // side: Prediction のため gold_line ではなく pred_line を使う
+            // （gold と pred の順序が異なる場合に別の予測行を指してしまう
+            // 不具合の修正。レビュー指摘。PR #204）。
+            let lines: BTreeSet<usize> = active.iter().filter_map(|row| row.pred_line).collect();
             lines_by_code
                 .entry(WarningCode::AllAbstain)
                 .or_default()
@@ -1052,7 +1134,10 @@ pub fn prepare_evaluation_input(
             .iter()
             .all(|row| matches!(row.prediction, PredictionOutcome::Error(_)))
         {
-            let lines: BTreeSet<usize> = active.iter().map(|row| row.gold_line).collect();
+            // 同上。`MissingPrediction` による Error は pred_line が
+            // 存在しない（予測行が無い）ため、そのような行は含めない
+            // （存在しない行番号を捏造しない）。
+            let lines: BTreeSet<usize> = active.iter().filter_map(|row| row.pred_line).collect();
             lines_by_code
                 .entry(WarningCode::AllError)
                 .or_default()
@@ -1933,6 +2018,34 @@ mod tests {
             outcome.active[0].prediction,
             PredictionOutcome::Error(ErrorOrigin::InvalidScore)
         );
+    }
+
+    /// トップレベルキーが `"\u0073cores"`（`scores` の Unicode エスケープ
+    /// 表記）で書かれていても、通常の `"scores"` 表記と同じく NaN が
+    /// 置換されて Error(InvalidScore) になること。`current_top_key` が
+    /// キーの生バイト列をそのまま比較していたため、この表記を `scores` と
+    /// 認識できず MalformedJson で全体停止していた（レビュー指摘。PR #204）。
+    #[test]
+    fn req23_escaped_scores_key_still_forces_invalid_score() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"\\u0073cores\":{\"A\":NaN}}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(
+            outcome.active[0].prediction,
+            PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+        );
+    }
+
+    /// [`substitute_non_finite_literals`] 単体でも、Unicode エスケープされた
+    /// `scores` キー配下の NaN を置換できること。
+    #[test]
+    fn req23_substitute_non_finite_handles_escaped_scores_key() {
+        let raw = r#"{"id":"a","\u0073cores":{"A":NaN}}"#;
+        let substituted =
+            substitute_non_finite_literals(raw).expect("must replace NaN under escaped key");
+        let value: Value = serde_json::from_str(&substituted).expect("must reparse");
+        assert_eq!(value["\u{73}cores"]["A"], Value::Null);
     }
 
     /// `1e400`（範囲外の数値）は `serde_json` がエラーにするため、NaN/Infinity
