@@ -28,7 +28,7 @@
 
 ## scope
 
-scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2 crate のパスが確定し、残りの層のパスは crate 追加時に本表へ反映する。
+scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の、TASK-17.2-1（#47）で data のパスが確定し、残りの層のパスは crate 追加時に本表へ反映する。
 
 | scope | 対象 | パス |
 | ----- | ---- | ---- |
