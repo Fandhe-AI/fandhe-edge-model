@@ -446,14 +446,6 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
             return Err(EvalInputStop::DuplicateKey { side, line });
         }
 
-        if !value.is_object() {
-            return Err(EvalInputStop::MalformedRecord { side, line });
-        }
-
-        if has_duplicate_key(raw_line, &value) {
-            return Err(EvalInputStop::DuplicateKey { side, line });
-        }
-
         let Value::Object(fields) = value else {
             return Err(EvalInputStop::MalformedRecord { side, line });
         };
