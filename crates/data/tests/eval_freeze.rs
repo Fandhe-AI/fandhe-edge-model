@@ -152,10 +152,18 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
 /// REQ-39 異常系（TOCTOU / FIFO）: 書き手の無い FIFO を渡しても無限にブロックせず
 /// `FreezeError::NotAFile` で拒否することを確認する（codex レビュー P0 指摘の
 /// 回帰テスト）。
-/// `metadata(path).is_file()` の後に `File::open(path)` するだけでは
-/// この間にパスが FIFO へ差し替えられた場合に open(2) がブロックし得るため、
-/// 開いた fd 自体をノンブロッキングで開いて fstat 検証する実装へ修正した。
-/// 万一ブロッキング実装へ回帰した場合にテストスイート自体が無期限にハングしない
+///
+/// 本テストが検証するのは `freeze_eval_data` 冒頭のパスレベルの `is_file()`
+/// 事前チェック（`metadata(path)` の時点で FIFO と判定して拒否する経路）であり、
+/// `open_without_blocking` 自体のノンブロッキング挙動（`metadata()` と `open()` の
+/// 間でパスが差し替えられる本来の TOCTOU）はここでは経由しない
+/// （このテストのパスは最初から FIFO のため、`open_without_blocking` に到達する前に
+/// 事前チェックで `NotAFile` が返る。Cursor Bugbot 指摘）。TOCTOU window 自体の
+/// ロックインは `crates/data/src/eval_freeze.rs` の
+/// `open_without_blocking_tests::open_without_blocking_returns_promptly_for_writerless_fifo`
+/// （`open_without_blocking` を直接呼ぶ単体テスト）が担う。
+/// 本テストは無限ブロックしないことの結合レベルでの確認として残す
+/// （万一ブロッキング実装へ回帰した場合にテストスイート自体が無期限にハングしない
 /// よう、判定は別スレッド＋タイムアウトで行う。Linux/macOS 実機・テストハーネス）。
 #[test]
 #[cfg(unix)]

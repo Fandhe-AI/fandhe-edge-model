@@ -318,3 +318,77 @@ impl<R: Read> Read for CountingReader<R> {
         Ok(read_len)
     }
 }
+
+/// `open_without_blocking` 自体の単体テスト（Cursor Bugbot 指摘への対応）。
+///
+/// `crates/data/tests/eval_freeze.rs` の結合テスト
+/// `freeze_eval_data_returns_not_a_file_for_fifo_without_blocking` は、渡すパスが
+/// 最初から FIFO であるため `freeze_eval_data` 冒頭の `metadata(path).is_file()`
+/// （経路の閉じ込め検証の直後・`open_without_blocking` 呼び出しより前）の時点で
+/// 既に `NotAFile` を返してしまい、`open_without_blocking` のノンブロッキング
+/// 実装そのものは経由しない。そのため `open_without_blocking` を `File::open` へ
+/// 差し戻す回帰が起きても、その結合テストは（別の分岐で）同じ `NotAFile` を返し
+/// 続けて検知できない。ここでは private 関数 `open_without_blocking` を直接呼び、
+/// 書き手の無い FIFO に対して実際にノンブロッキングで返ることを検証する
+/// （TOCTOU 対策のロックイン。REQ-39「無制限の…無限待ちを作らない」）。
+#[cfg(all(test, unix))]
+mod open_without_blocking_tests {
+    use super::open_without_blocking;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// プロセス ID・現在時刻（ナノ秒）から一意な一時ディレクトリを作る
+    /// （このモジュール専用。`std::env::temp_dir()` を親にし、テスト終了後に削除する）。
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-edge-data-open-without-blocking-{}-{tag}-{nanos}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir for open_without_blocking test");
+        dir
+    }
+
+    /// REQ-39 回帰テスト: 書き手の無い FIFO を `open_without_blocking` へ直接渡しても
+    /// 無期限にブロックせず、fd を返した上でその fd が通常ファイルでないと
+    /// 判定できることを確認する（Linux/macOS 実機・テストハーネス）。
+    #[test]
+    fn open_without_blocking_returns_promptly_for_writerless_fifo() {
+        let dir = unique_temp_dir("fifo");
+        let fifo_path = dir.join("eval.fifo");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo command must be available on unix test runners");
+        assert!(status.success(), "mkfifo must exit successfully");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_path_for_thread = fifo_path.clone();
+        std::thread::spawn(move || {
+            let result = open_without_blocking(&fifo_path_for_thread).map(|file| file.metadata());
+            // メインスレッドがタイムアウトで抜けた後に送信が失敗しても
+            // （受信側が既に drop 済み）テストの成否には影響しないため無視する。
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("open_without_blocking must not block indefinitely on a writerless FIFO");
+
+        match result {
+            Ok(Ok(metadata)) => {
+                assert!(
+                    !metadata.is_file(),
+                    "opened FIFO fd must not report as a regular file"
+                );
+            }
+            Ok(Err(err)) => panic!("fstat on opened FIFO fd failed: {err}"),
+            Err(err) => panic!("open_without_blocking returned an error: {err}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
