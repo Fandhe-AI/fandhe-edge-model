@@ -10,23 +10,48 @@
 //! # 経路の閉じ込め（REQ-39・security.md「経路の閉じ込め」）
 //!
 //! [`freeze_eval_data`] は許可ルート（`root`）を受け取り、そのルート配下だけを
-//! 開く。絶対パス・`..`（親ディレクトリ参照）は正規化前に拒否し、正規化
-//! （`canonicalize`）後の実体パスがルート配下であることまで確認してから開くため、
-//! ルート外の実体を指す symlink も拒否する（`safe_join` 相当）。
+//! 開く。絶対パス・`..`（親ディレクトリ参照）は構文検証（ファイルシステムに
+//! 触れる前）で拒否し、`path` は `root` 直下の 1 コンポーネント（`root` の
+//! 直接の子）に限定する（[`validate_within_root`] で強制する）。
 //!
-//! `path` は `root` 直下の 1 コンポーネント（`root` の直接の子）に限定する
-//! （[`resolve_within_root`] で強制する）。安定版 Rust の `std` には
+//! **`canonicalize` による事前解決は行わない。** 以前の実装は
+//! `canonicalize(root.join(path))` で実体パスを解決してから、その実体パスを
+//! `open` していた。しかしこの 2 段階（`canonicalize` → `open`）の間に、
+//! `path` の実体解決がまたがる中間ディレクトリ（`path` 自体が `root` 配下の
+//! ネストしたファイルへの symlink である場合、その解決先の親ディレクトリ）を
+//! ルート外への symlink に差し替えられると、最終コンポーネントにしか効かない
+//! `O_NOFOLLOW` ではこのすり替えを検出できず、ルート外のファイルを読み取れて
+//! しまう（TOCTOU。codex レビュー指摘 PRRT_kwDOUq-SxM6mb5Yq・REQ-39 P0）。
+//!
+//! この窓を作らないため、[`freeze_eval_data`] は `validate_within_root` が
+//! 返す未加工の結合パス（`root.join(path)`。`canonicalize` を挟まない）を
+//! **1 回の `open`** にそのまま渡す。安定版 Rust の `std` には
 //! `openat`/`fstatat` 相当が無く、`libc` 等の依存追加も `unsafe extern "C"` の
 //! FFI 追加もユーザー承認事項（[dependency-policy](../../../.claude/rules/dependency-policy.md)・
 //! [coding-rust](../../../.claude/rules/coding-rust.md)「unsafe・FFI」）のため、
-//! パス文字列を使い回す複数回の解決（`canonicalize` → `metadata` → `open`）が
-//! 生む TOCTOU（経路検証後・実際に開くまでの間に中間ディレクトリを symlink へ
-//! 差し替えられるレース）を openat 風のディレクトリ fd 走査では閉じられない。
-//! 代わりに、検証対象の可変要素を「`root` 直下の 1 エントリ」だけに縮退させ、
-//! その最終エントリを開く 1 回の `open` 呼び出しに Unix では `O_NOFOLLOW` を
-//! 付けて symlink への差し替えを検出し（[`open_without_blocking`]）、開いた fd
-//! 自体を `fstat` で再検証する。`root` 配下にネストしたパスは受け付けない
-//! （将来 openat 経由の実装に切り替える際に承認を得て拡張する）。
+//! 代わりに検証対象の可変要素を「`root` 直下の 1 エントリ」だけに縮退させ、
+//! `path` にネストしたコンポーネントを許さないことで、途中に差し替え可能な
+//! ディレクトリが一切存在しない状態を作る。
+//!
+//! - **Unix**: この 1 回の `open` に `O_NOFOLLOW` を付けて（[`open_without_blocking`]）、
+//!   最終エントリ自体が symlink であれば（`root` 内外どちらを指していても）
+//!   拒否し、開いた fd 自体を `fstat` で再検証する。検証と読み込みが
+//!   1 syscall に結合されるため、TOCTOU の窓は生まれない。
+//! - **Unix 以外（`O_NOFOLLOW` 相当が無い環境）**: [`confine_within_root_by_parent`]
+//!   で `canonicalize` 後の実体パスの親が `root` そのものであることを確認して
+//!   から `open` する。`canonicalize` とその直後の `open` の間に最終エントリを
+//!   差し替えられる TOCTOU の窓が残る（`.claude/rules/coding-rust.md`
+//!   「クロスプラットフォーム」: 検証環境は Mac のみで Windows/Linux は
+//!   M10 時点で対象外。この窓は本対応が導入される以前から Unix 以外に存在した
+//!   防御水準と同等で、後退させないための最小対応にとどめる）。
+//!
+//! いずれの経路も `path` が `root` 直下の生のファイルでない限り
+//! （＝symlink である限り、または実体の親が `root` でない限り）成功しない。
+//! 記録用の正規化パス（`FreezeRecord` の `path`）は、ハッシュ対象を確定させた
+//! **後**に `canonicalize` して求める（この時点の `canonicalize` は記録の
+//! 一意性のためだけで、経路の閉じ込め判定には使わない）。`root` 配下に
+//! ネストしたパスは受け付けない（将来 openat 経由の実装に切り替える際に承認を
+//! 得て拡張する）。
 //!
 //! # 対象外（本 issue のスコープ外）
 //!
@@ -97,19 +122,22 @@ impl std::error::Error for FreezeError {}
 /// 評価データを凍結する。
 ///
 /// - `path` が `None` の場合: I/O を一切行わず `Ok(EvalDataStatus::NotProvided)` を返す。
-/// - `path` が `Some` の場合: まず `root` 配下への経路の閉じ込めを検証する
-///   （絶対パス・`..` を正規化前に拒否、`root` 直下の 1 コンポーネントに
-///   限定、正規化後の実体パスが `root` 配下であることを確認。REQ-39
-///   「経路の閉じ込め」）。この検証後は、`open` 1 回（Unix では `O_NOFOLLOW`
-///   付き）で開いた fd に対する `fstat` だけを信頼して通常ファイルであること・
-///   ファイルサイズを確認し（非通常ファイル・上限超過ならデータを読まずに
-///   拒否）、その後ストリーミングで sha256 を計算し `EvalDataStatus::Frozen` を
-///   返す。パス文字列を使った `metadata()` の事前チェックは、検証と読み込みの
-///   間に別の path 解決を挟んで TOCTOU の窓を広げるため行わない（モジュール
-///   冒頭「経路の閉じ込め」参照）。読み込みは `MAX_EVAL_DATA_BYTES + 1` バイトで
-///   打ち切り、`fstat` 後にファイルが成長する TOCTOU（実読み込み量が事前
-///   チェックしたサイズを上回るケース）も検出して拒否する（REQ-39「無制限の
-///   アロケーション・無限待ちを作らない」）。
+/// - `path` が `Some` の場合: まず `root` 配下への経路の閉じ込めを構文検証する
+///   （絶対パス・`..` を拒否、`root` 直下の 1 コンポーネントに限定。
+///   [`validate_within_root`]。REQ-39「経路の閉じ込め」）。この検証は
+///   ファイルシステムに触れないため、ここまでの間に TOCTOU の窓は生まれない。
+///   検証後は、`validate_within_root` が返す未加工の結合パス（`canonicalize`
+///   を経由しない）を渡す `open` 1 回（Unix では `O_NOFOLLOW` 付き）で開いた
+///   fd に対する `fstat` だけを信頼して通常ファイルであること・ファイルサイズを
+///   確認し（非通常ファイル・上限超過ならデータを読まずに拒否）、その後
+///   ストリーミングで sha256 を計算し `EvalDataStatus::Frozen` を返す。
+///   `canonicalize` による事前解決を挟まないのは、解決後の実体パスを別途
+///   `open` し直す 2 段階構成が、その間に中間ディレクトリを symlink へ
+///   差し替えられる TOCTOU を生むため（モジュール冒頭「経路の閉じ込め」参照。
+///   codex レビュー指摘 PRRT_kwDOUq-SxM6mb5Yq への対応）。読み込みは
+///   `MAX_EVAL_DATA_BYTES + 1` バイトで打ち切り、`fstat` 後にファイルが
+///   成長する TOCTOU（実読み込み量が事前チェックしたサイズを上回るケース）も
+///   検出して拒否する（REQ-39「無制限のアロケーション・無限待ちを作らない」）。
 ///
 /// `root` はあらかじめ存在するディレクトリであること（呼び出し元が確定させた
 /// 評価データの置き場。CLI 側配線時にどのディレクトリを渡すかは TASK-33.1 で
@@ -123,18 +151,31 @@ pub fn freeze_eval_data(root: &Path, path: Option<&Path>) -> Result<EvalDataStat
         return Ok(EvalDataStatus::NotProvided);
     };
 
-    let canonical_path = resolve_within_root(root, path)?;
-    let path = canonical_path.as_path();
+    // 構文検証のみ（ファイルシステムに触れない）。返り値は `canonicalize` を
+    // 経由しない未加工の結合パスで、これを直接 `open` に渡す（TOCTOU 対策。
+    // モジュール冒頭「経路の閉じ込め」参照）。
+    let joined = validate_within_root(root, path)?;
 
-    // `resolve_within_root` が確認した実体パスを、パス文字列で何度も
+    // Windows 等（Unix 以外）には `O_NOFOLLOW` 相当が無いため、`open` の
+    // `O_NOFOLLOW` 1 syscall だけでは経路の閉じ込めを完結できない。代わりに
+    // `canonicalize` 後の実体パスの親が `root` そのものであることを確認する
+    // （`starts_with` ではなく `parent()` 比較にすることで、`path` が `root`
+    // 配下のネストしたファイルへの symlink だった場合も拒否し、中間ディレクトリを
+    // 経由する経路自体を無くす）。この確認と直後の `open` の間には、なお
+    // 最終エントリを差し替えられる TOCTOU の窓が残るが、これは本 PR 以前から
+    // 変わらない Unix 以外の既存の防御水準であり、後退させない
+    // （`open_without_blocking`〔Unix 以外〕のドキュメント参照）。
+    #[cfg(not(unix))]
+    confine_within_root_by_parent(root, &joined)?;
+
+    // `validate_within_root` が返した未加工パスを、パス文字列で何度も
     // 解決し直さず 1 回の `open` に直結させる（Unix では `O_NONBLOCK` で FIFO の
-    // 無限ブロックを、`O_NOFOLLOW` で検証後の symlink への差し替えを防ぐ。
-    // REQ-39「無制限の…無限待ちを作らない」「経路の閉じ込め」）。
-    let file = open_without_blocking(path)?;
+    // 無限ブロックを、`O_NOFOLLOW` で最終エントリが symlink（`root` 内外いずれを
+    // 指す場合も）であるケースを検出する。REQ-39「無制限の…無限待ちを作らない」
+    // 「経路の閉じ込め」）。
+    let file = open_without_blocking(&joined)?;
     // 開いた fd 自体を fstat で再検証する（path ではなく file descriptor の種別・
-    // サイズを見るため、`resolve_within_root` の検証からここまでの間の差し替えを
-    // 確実に検出できる。パスへの `metadata()` 事前チェックは行わない — 別の path
-    // 解決を挟むと TOCTOU の窓を広げるだけで、この fd 検証と二重になるため）。
+    // サイズを見るため、`open` が成功した時点の実体を確実に検証できる）。
     let fd_metadata = file.metadata().map_err(FreezeError::Io)?;
     if !fd_metadata.is_file() {
         return Err(FreezeError::NotAFile);
@@ -159,13 +200,18 @@ pub fn freeze_eval_data(root: &Path, path: Option<&Path>) -> Result<EvalDataStat
         });
     }
 
+    // 記録用の正規化後の実体パスは、ハッシュ対象を確定させた**後**に求める。
+    // ここでの `canonicalize` は記録の一意性（REQ-17）のためだけであり、経路の
+    // 閉じ込め判定にはもう使わない（判定は `open` 1 回で完結済み）ため、
+    // ここでの path 再解決が TOCTOU の窓を広げることはない。
+    let canonical_path = canonicalize_for_record(&joined)?;
+
     Ok(EvalDataStatus::Frozen(FreezeRecord {
-        // 呼び出し元が渡した相対パスではなく、経路の閉じ込め検証で確定させた
-        // 正規化後の実体パスを記録する。symlink 解決前の表記より、実際に
-        // ハッシュ対象にしたファイルの実体を一意に指す値の方が
-        // 記録整合性（REQ-17）にかなうため（`byte_len` を stat 値ではなく
-        // 実読み込み量にする判断と同じ理由）。
-        path: path.to_path_buf(),
+        // 呼び出し元が渡した相対パスではなく、正規化後の実体パスを記録する。
+        // symlink 解決前の表記より、実際にハッシュ対象にしたファイルの実体を
+        // 一意に指す値の方が記録整合性（REQ-17）にかなうため（`byte_len` を
+        // stat 値ではなく実読み込み量にする判断と同じ理由）。
+        path: canonical_path,
         sha256,
         // `metadata.len()` ではなく実際に読み込んだ（＝ハッシュした）バイト数を
         // 記録する。TOCTOU でファイルが縮んだ場合でも記録値とハッシュ対象が
@@ -174,31 +220,31 @@ pub fn freeze_eval_data(root: &Path, path: Option<&Path>) -> Result<EvalDataStat
     }))
 }
 
-/// `path`（`root` からの相対パス）が `root` 配下に閉じ込められていることを
-/// 検証し、正規化後の実体パスを返す（REQ-39「経路の閉じ込め」・security.md
-/// 「`safe_join` 相当の検証（正規化後にルート配下であることの確認）」）。
+/// `path`（`root` からの相対パス）が `root` 配下に閉じ込められた構文であることを
+/// 検証し、`canonicalize` を経由しない未加工の結合パス（`root.join(path)`）を
+/// 返す（REQ-39「経路の閉じ込め」・security.md「`safe_join` 相当の検証」）。
 ///
-/// 三段階で検証する:
-/// 1. 構文検証（ファイルシステムに触れる前）: `path` が絶対パスである場合、
-///    または `..`（親ディレクトリ参照）を含む場合は拒否する。`root.join(path)`
-///    は `path` が絶対パスだと `root` を無視して `path` そのものを返してしまう
-///    ため、`join` の前に弾く。
-/// 2. 構文検証（コンポーネント数）: `path` の実体的なコンポーネント
-///    （`Normal`）がちょうど 1 個であることを要求し、`root` 直下の直接の子
-///    以外（ネストしたパス）を拒否する。中間ディレクトリが存在すると、
-///    その中間ディレクトリを検証後に symlink へ差し替える TOCTOU が
-///    `canonicalize` と後段の `open` の間に残ってしまう。`root` 自体は
-///    呼び出し元が確定させた信頼できる起点であり、可変な経路要素を「`root`
-///    直下の 1 エントリ」だけに縮退させることで、その最終エントリの `open`
-///    （Unix では `O_NOFOLLOW` 付き）を検証と結合できる（モジュール冒頭
-///    「経路の閉じ込め」参照。安定版 `std` に `openat` 相当が無いための代替）。
-/// 3. 意味検証（`canonicalize` 後）: `root` と `root.join(path)` の双方を
-///    正規化し、後者が前者の配下であることを確認する。symlink はここで解決
-///    されるため、`path` 自体は `..` を含まなくても、その実体（symlink の
-///    解決先）がルート外にある場合はここで拒否できる。`root` 自体を
-///    正規化するのは、`root` 自体が symlink（例: macOS の `/tmp`）の場合に
-///    `starts_with` の比較が正しく機能するようにするため。
-fn resolve_within_root(root: &Path, path: &Path) -> Result<std::path::PathBuf, FreezeError> {
+/// 二段階で検証する（いずれもファイルシステムに触れない構文検証のみ）:
+/// 1. `path` が絶対パスである場合、または `..`（親ディレクトリ参照）を含む
+///    場合は拒否する。`root.join(path)` は `path` が絶対パスだと `root` を
+///    無視して `path` そのものを返してしまうため、`join` の前に弾く。
+/// 2. `path` の実体的なコンポーネント（`Normal`）がちょうど 1 個であることを
+///    要求し、`root` 直下の直接の子以外（ネストしたパス）を拒否する。
+///
+/// 意図的に `canonicalize` による意味検証（実体パスの解決）は行わない。
+/// 呼び出し元（[`freeze_eval_data`]）はこの関数が返す未加工パスをそのまま
+/// 1 回の `open`（Unix では `O_NOFOLLOW` 付き）に渡し、その `open` 自体が
+/// 「最終エントリが symlink なら拒否する」形で経路の閉じ込めを完結させる。
+/// `path` を `root` 直下の 1 コンポーネントへ制限しているため、この `open` が
+/// 辿るファイルシステム上の可変要素は「`root` 直下の 1 エントリ」だけであり、
+/// 差し替え可能な中間ディレクトリが経路上に存在しない。もし `canonicalize` で
+/// 事前に実体パスを解決し、その解決後のパスを別途 `open` し直す 2 段階構成に
+/// すると、解決からその `open` までの間に（`path` が `root` 配下のネストした
+/// ファイルへの symlink だった場合の）解決先の親ディレクトリを symlink へ
+/// 差し替えられる TOCTOU が生まれる（`O_NOFOLLOW` は最終コンポーネントにしか
+/// 効かないため検出できない。codex レビュー指摘 PRRT_kwDOUq-SxM6mb5Yq・
+/// REQ-39 P0 への対応。モジュール冒頭「経路の閉じ込め」参照）。
+fn validate_within_root(root: &Path, path: &Path) -> Result<std::path::PathBuf, FreezeError> {
     if path.is_absolute() {
         return Err(FreezeError::OutsideRoot);
     }
@@ -220,22 +266,45 @@ fn resolve_within_root(root: &Path, path: &Path) -> Result<std::path::PathBuf, F
         return Err(FreezeError::OutsideRoot);
     }
 
-    let joined = root.join(path);
-
-    let canonical_root = canonicalize_for_confinement(root)?;
-    let canonical_path = canonicalize_for_confinement(&joined)?;
-
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(FreezeError::OutsideRoot);
-    }
-
-    Ok(canonical_path)
+    Ok(root.join(path))
 }
 
-/// [`resolve_within_root`] 用に `canonicalize` を呼び、`NotFound` を
-/// [`FreezeError::NotFound`] として区別する（他の I/O エラーと違い、
-/// 「評価データが見つからない」という既存の呼び出し元向けの意味を保つため）。
-fn canonicalize_for_confinement(path: &Path) -> Result<std::path::PathBuf, FreezeError> {
+/// Unix 以外（`O_NOFOLLOW` 相当が無い環境）向けの意味検証: `joined`
+/// （`root.join(path)`）を `canonicalize` した実体パスの親ディレクトリが、
+/// 同じく `canonicalize` した `root` そのものであることを確認する
+/// （REQ-39「経路の閉じ込め」）。
+///
+/// `starts_with` ではなく `parent()` の一致で比較するのは、`path` が `root`
+/// 配下のネストしたファイルへの symlink であるケース（実体パスは `root`
+/// 配下だが、その親ディレクトリが `root` 自身ではない）まで拒否するため。
+/// これにより、この関数が通過した後に `open` が辿る経路は「`canonicalize`
+/// した `root`」＋「1 つの最終エントリ」だけに絞られ、`open` に至るまでの
+/// 間に差し替えられ得る中間ディレクトリを経路から無くす。
+///
+/// Unix では `open_without_blocking` の `O_NOFOLLOW` 1 syscall で経路の閉じ込め
+/// 検証と読み込みを結合できる（この関数は呼ばない）が、Unix 以外にはその手段が
+/// 無いため、この `canonicalize` と直後の `open` の間に最終エントリを
+/// 差し替えられる TOCTOU の窓が残る。これは本モジュールの TOCTOU 対策（codex
+/// レビュー指摘 PRRT_kwDOUq-SxM6mb5Yq）が導入される以前から Unix 以外に
+/// 存在していた防御水準と同等であり、後退させないための最小対応
+/// （`.claude/rules/coding-rust.md`「クロスプラットフォーム」: 検証環境は
+/// Mac のみで Windows/Linux は M10 時点で対象外。完全な close は openat 相当の
+/// 実装〔依存追加 or `unsafe extern "C"` FFI〕をユーザー承認のうえ拡張する）。
+#[cfg(not(unix))]
+fn confine_within_root_by_parent(root: &Path, joined: &Path) -> Result<(), FreezeError> {
+    let canonical_root = canonicalize_for_record(root)?;
+    let canonical_joined = canonicalize_for_record(joined)?;
+    if canonical_joined.parent() != Some(canonical_root.as_path()) {
+        return Err(FreezeError::OutsideRoot);
+    }
+    Ok(())
+}
+
+/// ハッシュ対象を確定させた**後**に、記録用の正規化済み実体パスを求める
+/// （REQ-17 の記録整合性のためだけに使う。経路の閉じ込め判定はすでに `open`
+/// 1 回で完結しているため、ここでの `canonicalize` が TOCTOU の窓を広げる
+/// ことはない）。`NotFound` を [`FreezeError::NotFound`] として区別する。
+fn canonicalize_for_record(path: &Path) -> Result<std::path::PathBuf, FreezeError> {
     std::fs::canonicalize(path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             FreezeError::NotFound(err)
@@ -255,11 +324,12 @@ fn canonicalize_for_confinement(path: &Path) -> Result<std::path::PathBuf, Freez
 /// 挙動に影響しない（POSIX の規定）ため、正常系の動作は変わらない。
 ///
 /// `O_NOFOLLOW` も付ける。呼び出し元（[`freeze_eval_data`]）は
-/// [`resolve_within_root`] で検証した実体パスをこの 1 回の `open` にそのまま
-/// 渡すが、検証（`canonicalize`）とこの `open` の間にも symlink への差し替えは
-/// 理論上可能なため、`open` 自体を「symlink なら失敗する」形にして最終エントリの
-/// 検証と読み込みを 1 syscall に結合する（`ELOOP` を [`FreezeError::OutsideRoot`]
-/// へ写す）。中間ディレクトリの差し替えは [`resolve_within_root`] が `path` を
+/// [`validate_within_root`] が返す未加工パス（`canonicalize` を経由しない
+/// `root.join(path)`）をこの 1 回の `open` にそのまま渡す。`open` 自体を
+/// 「最終エントリが symlink なら失敗する」形にすることで、経路の閉じ込め検証と
+/// 実際の読み込みを 1 syscall に結合し、検証後に別途 `open` し直す 2 段階構成が
+/// 生む TOCTOU（`ELOOP` を [`FreezeError::OutsideRoot`] へ写す）を作らない。
+/// 中間ディレクトリの差し替えは [`validate_within_root`] が `path` を
 /// `root` 直下の 1 コンポーネントへ制限することで経路自体を無くしている
 /// （モジュール冒頭「経路の閉じ込め」参照）。
 ///
@@ -335,12 +405,33 @@ fn open_without_blocking(path: &Path) -> Result<File, FreezeError> {
 ///
 /// FIFO による無限ブロックは `mkfifo` が使える Unix 系環境に固有の攻撃経路のため、
 /// それ以外の環境では通常の `File::open` で足りる（呼び出し元が fd を fstat で
-/// 再検証する点は Unix 版と共通）。
+/// 再検証する点は Unix 版と共通）。`O_NOFOLLOW` 相当が無いため symlink を
+/// そのまま辿ってしまうが、経路の閉じ込め（symlink がルート外・ネストした
+/// ファイルを指すケースの拒否）は呼び出し元（[`freeze_eval_data`]）がこの
+/// 関数を呼ぶ**前**に [`confine_within_root_by_parent`] で確定させている
+/// （モジュール冒頭「経路の閉じ込め」参照。ここでの `open` はその確認済みの
+/// 実体パスを開くだけで、新たな符号解決を行わない）。
+///
+/// Windows では `File::open` にディレクトリを渡すと（Unix と異なり fd は開けず）
+/// `ErrorKind::PermissionDenied`（`Access is denied.`）を返す。これをそのまま
+/// [`FreezeError::Io`] へ倒すと、ディレクトリを渡した場合に
+/// [`FreezeError::NotAFile`] を期待する呼び出し元・テストが Windows でのみ
+/// 失敗する（rust-ci windows-latest で実測。Cursor Bugbot 指摘
+/// PRRT_kwDOUq-SxM6mb6t-）。`open` 失敗後にパスの種別を確認するこの再検証は、
+/// 既に失敗した `open` の結果をどの [`FreezeError`] に分類するかの後始末に
+/// すぎず、確認結果を使って別の実体を開き直すわけではないため、経路の
+/// 閉じ込め判定を再び TOCTOU に晒すことはない。
 #[cfg(not(unix))]
 fn open_without_blocking(path: &Path) -> Result<File, FreezeError> {
     File::open(path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             FreezeError::NotFound(err)
+        } else if err.kind() == io::ErrorKind::PermissionDenied
+            && std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        {
+            FreezeError::NotAFile
         } else {
             FreezeError::Io(err)
         }
@@ -454,16 +545,16 @@ mod open_without_blocking_tests {
     }
 
     /// REQ-39 回帰テスト（TOCTOU 修正・codex/Cursor Bugbot 指摘
-    /// PRRT_kwDOUq-SxM6mbqce・PRRT_kwDOUq-SxM6mbtcp への対応）: `open_without_blocking`
-    /// に symlink を直接渡すと `O_NOFOLLOW` により `ELOOP` となり、
-    /// `FreezeError::OutsideRoot` を返すことを確認する。
+    /// PRRT_kwDOUq-SxM6mbqce・PRRT_kwDOUq-SxM6mbtcp・PRRT_kwDOUq-SxM6mb5Yq への
+    /// 対応）: `open_without_blocking` に symlink を直接渡すと `O_NOFOLLOW` により
+    /// `ELOOP` となり、`FreezeError::OutsideRoot` を返すことを確認する。
     ///
-    /// `resolve_within_root` の `canonicalize` 検証から `open_without_blocking` の
-    /// `open` に至るまでの間に、検証済みの実体パスが symlink へ差し替えられる
-    /// TOCTOU に対する最終防御線を検証する（`freeze_eval_data` 経由の結合テスト
-    /// `..._for_symlink_escaping_root` は `canonicalize` 側の検証で先に弾かれるため、
-    /// この `open` 側の防御は経由しない。ここでは `open_without_blocking` を直接
-    /// 呼び、`open` 自体が symlink を拒否する挙動をロックインする）。
+    /// `validate_within_root` は構文検証のみで `canonicalize` を行わないため、
+    /// `path`（`root` 直下の 1 エントリ）が symlink であるかどうかは、この
+    /// `open` 1 回（`O_NOFOLLOW` 付き）でのみ判定される。`freeze_eval_data`
+    /// 経由の結合テスト `..._for_symlink_escaping_root` はこの防御を実際に
+    /// 経由して `OutsideRoot` を返す。ここでは `open_without_blocking` を直接
+    /// 呼び、`open` 自体が symlink を拒否する挙動を単体レベルでロックインする。
     #[test]
     fn open_without_blocking_returns_outside_root_for_symlink() {
         let dir = unique_temp_dir("symlink");

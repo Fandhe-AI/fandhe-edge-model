@@ -156,7 +156,7 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
 ///
 /// `freeze_eval_data` はパス文字列への事前 `metadata()` チェックを持たず
 /// （TOCTOU の窓を広げるため廃止した。モジュール冒頭「経路の閉じ込め」参照）、
-/// `resolve_within_root` の検証後は `open_without_blocking` の 1 回の `open`
+/// `validate_within_root` の構文検証後は `open_without_blocking` の 1 回の `open`
 /// （`O_NONBLOCK` 付き）と、その fd に対する `fstat` だけで種別を判定する。
 /// 本テストはその経路を実際に通し、FIFO の `open` がノンブロッキングで返ったうえで
 /// `fstat` が `NotAFile` を確定させることを結合レベルで確認する
@@ -255,7 +255,9 @@ fn freeze_eval_data_returns_outside_root_for_parent_dir_component() {
 
 /// REQ-39 異常系（経路の閉じ込め・codex P0 回帰テスト）: `path` 自体は `root` 配下の
 /// 表記でも、symlink の解決先が `root` の外にある場合は `FreezeError::OutsideRoot`
-/// で拒否する（`canonicalize` 後の実体パスで確認する検証の対象）。
+/// で拒否する。`validate_within_root` は `canonicalize` を行わないため、この判定は
+/// `open_without_blocking` の `O_NOFOLLOW`（最終エントリが symlink であれば `ELOOP`）
+/// が担う（PRRT_kwDOUq-SxM6mb5Yq 対応後の経路）。
 #[test]
 #[cfg(unix)]
 fn freeze_eval_data_returns_outside_root_for_symlink_escaping_root() {
@@ -282,14 +284,15 @@ fn freeze_eval_data_returns_outside_root_for_symlink_escaping_root() {
 /// で拒否する。
 ///
 /// `path` を `root` 直下の 1 コンポーネントに制限するのは、安定版 `std` に
-/// `openat`/`fstatat` 相当が無く、中間ディレクトリを経由すると
-/// `resolve_within_root` の `canonicalize` と `open_without_blocking` の `open`
-/// の間で中間ディレクトリを symlink へ差し替える TOCTOU を閉じられないため
-/// （`crates/data/src/eval_freeze.rs` モジュール冒頭「経路の閉じ込め」参照。
-/// codex/Cursor Bugbot 指摘 PRRT_kwDOUq-SxM6mbqce・PRRT_kwDOUq-SxM6mbtcp への対応）。
-/// ネストしたレイアウトが将来必要になった場合は、`openat` 相当を実装する依存
-/// 追加または `unsafe extern "C"` FFI 追加についてユーザー承認を得たうえで
-/// 拡張する。
+/// `openat`/`fstatat` 相当が無く、`open` の `O_NOFOLLOW` は最終コンポーネントにしか
+/// 効かないため、`path` に中間ディレクトリを含めると、その中間ディレクトリが
+/// symlink（自身または差し替え後）であった場合に `open` 自身がそれを辿って
+/// ルート外へ抜けてしまう（TOCTOU の有無に関わらず発生し得る直接の経路の
+/// 閉じ込め違反）ため（`crates/data/src/eval_freeze.rs` モジュール冒頭
+/// 「経路の閉じ込め」参照。codex/Cursor Bugbot 指摘 PRRT_kwDOUq-SxM6mbqce・
+/// PRRT_kwDOUq-SxM6mbtcp・PRRT_kwDOUq-SxM6mb5Yq への対応）。ネストしたレイアウトが
+/// 将来必要になった場合は、`openat` 相当を実装する依存追加または
+/// `unsafe extern "C"` FFI 追加についてユーザー承認を得たうえで拡張する。
 #[test]
 fn freeze_eval_data_returns_outside_root_for_nested_path() {
     let guard = TempDirGuard::new("nested-path");
