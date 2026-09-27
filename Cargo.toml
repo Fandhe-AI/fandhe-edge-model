@@ -23,11 +23,11 @@ publish = false
 fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
 # serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
-# 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。承認記録の
-# 「配置する層」は共通コア（TASK-15.3〜15.5）だが、本 workspace 登録では serde_json を
-# データ契約層（crates/data。TASK-16.1-1・issue #38）にも配置する。バージョン・ライセンス
-# （MIT OR Apache-2.0）・推移的依存（itoa・memchr・zmij）は承認時の調査から変わらないため
-# 新規承認は求めないが、配置層の拡大である旨を PR 本文に明記する。
+# 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の
+# 「配置する層」は共通コア（TASK-15.3〜15.5）に加え、データ契約層（crates/data。
+# TASK-16.1-1・issue #38）にも 2026-09-27 オーナー承認済み（PR #191 のレビュー指摘への
+# 対応として PR #193 で承認記録を追記。バージョン・ライセンス（MIT OR Apache-2.0）・
+# 推移的依存（itoa・memchr・zmij）は変更なし）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 
