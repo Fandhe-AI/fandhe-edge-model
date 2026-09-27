@@ -3,7 +3,9 @@
 ## 出典
 
 `docs/spec/03-poc/evaluation-contract/fixtures/`（PoC-9。private submodule）から、
-バイト単位でそのまま移植した（内容を加工していない）。
+バイト単位でそのまま移植した（内容を加工していない）。ただし
+`anomaly/01-empty-data/expected.json`・`anomaly/05-duplicate-id/expected.json` の
+2 ファイルは例外で、キー名のみ改名している（詳細は後述の「PoC-9 との既知の差分」）。
 
 - `known/single-select/{gold.jsonl,pred.jsonl,labels.json,expected.json}`
 - `anomaly/01-empty-data/{gold.jsonl,pred.jsonl,expected.json}`
