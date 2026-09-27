@@ -284,12 +284,29 @@ def test_cli_train_ignores_polluted_pythonpath(tmp_path: Path) -> None:
     影響しないはずである。`-I` が外れる退行が起きれば、偽の `mlx`
     （`sys.exit(1)` するだけの `__init__.py`）が先に解決されて異常終了し、
     本テストが検出する（証拠種別: テストハーネス）。
+
+    偽の `mlx` は学習を行う子プロセス（`_worker`）で初めて import されるため、
+    それだけでは公開プロセス（`trainer/launch.py train`）側の `-I` 欠落を
+    検出できない（PR #16 レビュー）。そこで同じ汚染ディレクトリへ
+    `sitecustomize.py` も置く。`site` モジュールは起動時に `sys.path` 上の
+    `sitecustomize` を import するため、`-I` の無いプロセスが 1 つでもあれば
+    （公開プロセス・`_worker` のどちらでも）マーカーファイルが作られる。
+    `-I` 付きでは `PYTHONPATH` が `sys.path` に入らず作られないことを実機で
+    確認済み（証拠種別: 実機）。
     """
     fake_mlx_root = tmp_path / "polluted-pythonpath"
     fake_mlx_pkg = fake_mlx_root / "mlx"
     fake_mlx_pkg.mkdir(parents=True)
     (fake_mlx_pkg / "__init__.py").write_text(
         "import sys\nsys.exit('fake mlx package must never be imported')\n",
+        encoding="utf-8",
+    )
+    # `-I` の無いプロセスが起動した時点で痕跡を残す（マーカーのパスは
+    # 環境変数経由にせずリテラルで埋め込み、検出経路を 1 つに保つ）。
+    sitecustomize_marker = tmp_path / "sitecustomize-imported"
+    (fake_mlx_root / "sitecustomize.py").write_text(
+        f"with open({str(sitecustomize_marker)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write('imported\\n')\n",
         encoding="utf-8",
     )
 
@@ -315,6 +332,8 @@ def test_cli_train_ignores_polluted_pythonpath(tmp_path: Path) -> None:
     polluted_env = {**os.environ, "PYTHONPATH": str(fake_mlx_root)}
     result = _run_cli(request_path, env=polluted_env)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    # 公開プロセス・`_worker` のいずれも汚染された `PYTHONPATH` を読んでいない。
+    assert not sitecustomize_marker.exists()
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(lines) == 1
     payload = json.loads(lines[0])
