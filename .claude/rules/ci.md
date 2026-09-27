@@ -12,7 +12,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 ```
 
 - テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed）
-- `Cargo.toml`・メンバー crate・`deny.toml` が未作成の間、cargo 系ターゲットは Makefile 側で `skip:` を表示してスキップされる（HAS_CARGO / HAS_MEMBERS / HAS_DENY）。スキップを「検証済み」と報告しない
+- `Cargo.toml`・メンバー crate・`deny.toml` が欠けている場合、cargo 系ターゲットは Makefile 側で `skip:` を表示してスキップされる（HAS_CARGO / HAS_MEMBERS / HAS_DENY）。TASK-15.2 以降はいずれも揃っているため実行される。スキップを「検証済み」と報告しない
 - 学習ワーカー（Python）の ruff / pytest は `make py-ci` として `make ci` に組み込み済み（[coding-python](./coding-python.md)）。`trainer/pyproject.toml` が無い場合は `skip:` になるが、CI（python-ci.yml）は `trainer/` の欠落を失敗として扱う
 
 ## CI の構成
