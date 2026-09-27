@@ -143,9 +143,9 @@ make doctor      # 環境診断のみ（何も導入しない）
 | runner 方針 | public リポジトリのため既定は GitHub ホステッドランナー。self-hosted の使用が許可されるのは `ai-review.yml` の `codex / review` ジョブ（組織承認済み例外）のみで、`codex / preflight`・`codex / post_feedback` を含む他ジョブ・他 workflow は GitHub ホステッドランナーになっているか | P0 |
 | permissions | ワークフロー・ジョブの `permissions` が最小権限で明示されているか | P0 |
 | secrets の扱い | secrets が `pull_request` イベントのログへ出力されていないか。`${{ }}` を `run` へ直接埋め込まず `env` 経由で渡しているか | P0 |
-| `ci.yml` の現状 | `ci.yml` は準備が整うまで発火条件を無効化中（`workflow_dispatch` のみ）であり、workspace（`Cargo.toml`）・メンバー crate・`deny.toml` の作成後に `pull_request` / `push` を有効化し、ruleset の必須チェックへ `ci-complete` を登録する設計であることを踏まえ、この無効化自体を指摘しない | 指摘しない（既知の暫定状態） |
+| `ci.yml` の現状 | `ci.yml` は稼働中（`workflow_dispatch`・`pull_request`・main への `push` で発火）で、必須チェックは集約ジョブ `ci-complete` に集約されている。発火条件（`pull_request`・main への `push`）を外す・絞める差分がないか（外すと `ci-complete` が PR に報告されず、全 PR のマージがブロックされる）。ジョブ・check 名の観点は下 2 行で確認する | P1 |
 | `ci.yml` への変更 | `ci.yml` を変更する差分では、3 OS matrix（Linux・macOS・Windows）を維持しているか、集約ジョブ `ci-complete` の `needs` に全ジョブが含まれているか、本リポに存在しない `make` ターゲット・`scripts/` を前提にしたジョブが混入していないかを確認する | P1 |
-| 必須チェック名の変更 | ジョブ ID・`name:` の変更で check 名（`codex / *`・`python-ci`）が変わる差分に、ruleset の必須チェックの更新手順（マージ前の置換）が PR 本文に記載されているか。旧名のまま残ると全チェック pass でもマージがブロックされる | P1 |
+| 必須チェック名の変更 | ジョブ ID・`name:` の変更で check 名（`codex / *`・`python-ci`・`ci-complete`）が変わる差分に、ruleset の必須チェックの更新手順（マージ前の置換）が PR 本文に記載されているか。旧名のまま残ると全チェック pass でもマージがブロックされる | P1 |
 | `release.yml` | `workflow_dispatch` 限定のプレースホルダであり、有効化には公開対象 crate 名・crates.io 公開方針の確定を要する。現状のプレースホルダ状態自体は指摘しない | 指摘しない（既知の暫定状態） |
 | `macos-15` ランナーの指定 | GitHub 公式ドキュメント（https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners の標準ランナー一覧）では、`macos-15`・`macos-14`・`macos-latest` は ARM64（Apple Silicon）、Intel（x64）は `macos-15-intel`・`macos-13` 等の別ラベルである。したがって arm64 が必要なジョブの `runs-on: macos-15` は適切なラベルであり、arm64 用ラベルへの変更を求める指摘をしない。Intel 系ラベル（`-intel`・`-large`・`macos-13`）で arm64 を要するジョブを動かす差分は通常どおり P1 とする | 指摘しない（公式ドキュメントに基づく） |
 | `update-external.yml` の `runner-json` | `runner-json` は folded block scalar（`>-`）で JSON 文字列 `"ubuntu-latest"`（二重引用符込み、バックスラッシュなし）を渡す正しい記法であり、`fromJSON` で `ubuntu-latest` に解決される。エスケープの誤りとして指摘しない | 指摘しない（正しい記法） |

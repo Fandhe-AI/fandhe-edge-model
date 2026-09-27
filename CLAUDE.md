@@ -37,7 +37,7 @@ fandhe-edge-model/
 ├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）
 ├── docs/
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・python-ci・update-external（稼働）/ ci・release（発火条件無効化中）
+├── .github/workflows/             # ai-review・ci・python-ci・update-external（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義（research / implement / testing / quality / docs）
