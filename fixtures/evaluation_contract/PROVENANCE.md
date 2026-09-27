@@ -3,7 +3,9 @@
 ## 出典
 
 `docs/spec/03-poc/evaluation-contract/fixtures/`（PoC-9。private submodule）から、
-バイト単位でそのまま移植した（内容を加工していない）。
+バイト単位でそのまま移植した（内容を加工していない）。ただし
+`anomaly/01-empty-data/expected.json`・`anomaly/05-duplicate-id/expected.json` の
+2 ファイルは例外で、キー名のみ改名している（詳細は後述の「PoC-9 との既知の差分」）。
 
 - `known/single-select/{gold.jsonl,pred.jsonl,labels.json,expected.json}`
 - `anomaly/01-empty-data/{gold.jsonl,pred.jsonl,expected.json}`
@@ -73,3 +75,15 @@ PoC-9 のフィクスチャは、評価契約（REQ-21〜27・REQ-29）の異常
   対して active な gold 行がすべてのラベルをカバーしていないため、
   `unseen_class` 警告が追加で出るようになった（PoC-9 v1.1 の stderr ログと
   一致。結合テストの `assert_last_warning_is_unseen_class` 参照）。
+- `01-empty-data`・`05-duplicate-id` の `expected.json` は、PoC-9 が使う
+  キー名 `expected_exit_code`（値 `2`）を `poc9_expected_exit_code` へ改名した
+  （PR #203 レビュー指摘）。PoC-9 自身の終了コード契約は `2` を「停止」の
+  意味で使うが、本リポの REQ-21 は 7 種の終了コード
+  （`ok`=0・`judged_fail`=10・`out_of_scope`=11・`pending`=12・
+  `limit_exceeded`=20・`invalid_input`=64・`runtime_error`=70）に固定して
+  おり `2` は含まれない。元のキー名のままだと、本リポの評価器・CLI の
+  期待値として `2` を誤って踏襲しかねないため、PoC-9 由来の参考値である
+  ことが分かる名前に変更し、値そのもの（`2`）はバイト単位の移植として保持した
+  （ExitCode への対応付けは CLI 側（TASK-21.2・TASK-33.x）の責務で、
+  `crates/data/src/eval_input.rs` は `EvalInputStop::code()` の文字列
+  （`empty_data`・`duplicate_id`）だけを返す）。

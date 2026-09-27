@@ -443,6 +443,14 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
             return Err(EvalInputStop::DuplicateKey { side, line });
         }
 
+        if !value.is_object() {
+            return Err(EvalInputStop::MalformedRecord { side, line });
+        }
+
+        if has_duplicate_key(raw_line, &value) {
+            return Err(EvalInputStop::DuplicateKey { side, line });
+        }
+
         let Value::Object(fields) = value else {
             return Err(EvalInputStop::MalformedRecord { side, line });
         };
@@ -665,6 +673,14 @@ fn normalize_input(raw: &str) -> String {
 /// ラベルが混在すれば「矛盾」（除外する。[`WarningCode::ContradictoryInput`]。
 /// ケース 7）とする。呼び出し元は矛盾行を `accepted` から取り除き、
 /// pred との突き合わせ（手順 7）へ進めない。
+///
+/// TASK-23.1-1（issue #55・PR #203）時点ではラベルまで見ずに正規化 `input`
+/// だけでグループ化しており、`A, A, B` のように同じ `input` にラベルが混在
+/// する場合に重複行 `A, A` まで警告から漏れる不具合があった（issue #55
+/// レビュー指摘）。TASK-23.1-2（ケース 7）でラベル混在グループを丸ごと
+/// 「矛盾」として `accepted` から除外する仕様を追加したことで、混在グループを
+/// 部分的に「重複」扱いする経路が無くなり、上記の不具合は再現しなくなった
+/// （矛盾グループはそもそも重複警告の対象にしない）。
 fn find_duplicate_input_lines(
     rows: &[(usize, String, &Map<String, Value>)],
 ) -> (BTreeSet<usize>, BTreeSet<usize>) {
