@@ -5,7 +5,7 @@
 # 深い階層（`crates/foo/bar`）には crate を置かない。
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/data"]
 
 [workspace.package]
 edition = "2024"
@@ -20,8 +20,13 @@ publish = false
 # 依存は `=x.y.z` の完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 推論ランタイム側の crate に学習側の依存（Python 呼び出し・MLX 等）を持ち込まない（REQ-32）。
 # workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
-# 外部の共通依存は現時点で承認済みのものが無い。
 fandhe-edge-core = { path = "crates/core" }
+# serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md「承認済みの依存」）。
+# 承認記録の「配置する層」は共通コア（TASK-15.3〜15.5）だが、本 workspace 登録では
+# データ契約層（crates/data。TASK-16.1-1・issue #38）にも配置する。バージョン・ライセンス
+# （MIT OR Apache-2.0）・推移的依存（itoa・memchr・zmij）は承認時の調査から変わらないため
+# 新規承認は求めないが、配置層の拡大である旨を PR 本文に明記する。
+serde_json = "=1.0.151"
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で

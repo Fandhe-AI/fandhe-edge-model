@@ -1,0 +1,17 @@
+[package]
+name = "fandhe-edge-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Data contract layer: inspection of training/evaluation JSONL records."
+
+[dependencies]
+# 定義ファイルのスキーマ（TASK-15.3・#32〜#34）がこの時点で未実装のため、
+# `fandhe-edge-core` には依存しない。ラベル ID 集合は呼び出し側から
+# `BTreeSet<String>` として受け取る（crates/data/src/lib.rs の doc コメント参照）。
+serde_json.workspace = true
+
+[lints]
+workspace = true
