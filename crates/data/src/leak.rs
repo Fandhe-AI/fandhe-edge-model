@@ -33,10 +33,17 @@
 //! # 資源上限について
 //!
 //! 本モジュールは `Partitions` に渡されたスライス長の合計に比例した処理のみを行い、
-//! 入力 byte はすべて借用（コピーしない）。件数・サイズの上限検査（REQ-39）は
-//! 呼び出し側（データ検査層・ガード層）の責務とする（`split.rs` と同じ方針）。
+//! 入力 byte はすべて借用（コピーしない）。`split.rs` は件数・サイズの上限検査
+//! （REQ-39）を呼び出し側（データ検査層・ガード層）の責務としているが、本モジュールの
+//! 公開 API（[`find_input_leaks`]・[`find_group_straddles`]・[`inspect_leakage`]）は
+//! train 側 ID 列を複製・索引化する経路（下記）を持つため、呼び出し側へ委ねるだけでは
+//! この API を直接使う経路で上限を保証できない（reviewer 指摘 PR #195・
+//! security.md「ガード層: 資源の上限」）。そこで [`validate_resource_limits`] で
+//! レコード総件数・ID 長を入口で検証してから集計する（`crates/core/src/definition.rs`
+//! の `MAX_DEFINITION_FILE_BYTES` と同じく、REQ-39 の資源上限が正式に決まるまでの
+//! 暫定値。[`MAX_LEAK_CHECK_RECORDS`]・[`MAX_LEAK_CHECK_ID_BYTES`]）。
 //!
-//! ただし出力側では、同一の train 入力が複数の相手分割（validation・test・
+//! また出力側では、同一の train 入力が複数の相手分割（validation・test・
 //! evaluation）へ漏洩した場合、その入力に対応する train 側 ID 列を分割の数だけ
 //! 複製すると、外部データが持つ重複度に応じて出力サイズが増幅されうる
 //! （reviewer 指摘 PR #195）。[`InputLeak::train_ids`] は `Rc<[String]>` で
@@ -44,6 +51,29 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+
+/// 1 回の検査（[`find_input_leaks`]・[`find_group_straddles`]）で受け付ける
+/// レコード総件数（train + validation + test + evaluation）の上限。
+///
+/// 暫定値（REQ-39 の資源上限が正式に決まり次第見直す。
+/// `crates/core/src/definition.rs::MAX_DEFINITION_FILE_BYTES` と同じ方針）。
+pub const MAX_LEAK_CHECK_RECORDS: usize = 200_000;
+
+/// レコード ID・group ID 1 件あたりの byte 長の上限（暫定値。同上）。
+pub const MAX_LEAK_CHECK_ID_BYTES: usize = 4096;
+
+/// [`validate_resource_limits`] が検出する、公開 API の入口で拒否すべき違反
+/// （REQ-39・security.md「ガード層: 資源の上限」。reviewer 指摘 PR #195）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeakCheckError {
+    /// train・validation・test・evaluation の合計レコード件数が上限を超えた。
+    TooManyRecords { total: usize, limit: usize },
+    /// レコード ID または group ID の byte 長が上限を超えた。
+    ///
+    /// ID の内容そのものはエラーに含めない（データ本文・識別子をログ・
+    /// エラーメッセージへ転記しない。security.md「秘密情報の混入防止」）。
+    IdTooLong { len: usize, limit: usize },
+}
 
 /// 漏洩・group 跨ぎ検出の対象になるレコードが満たす最小の契約。
 ///
@@ -109,6 +139,61 @@ impl<'a, R> Partitions<'a, R> {
         }
         result
     }
+
+    /// train を含む全分割のスライスを 1 つの一覧として返す（総件数・ID 長の
+    /// 検証で全レコードを走査するための内部ヘルパー。[`validate_resource_limits`]
+    /// から使う）。
+    fn all_partitions(&self) -> Vec<&'a [R]> {
+        let mut result = vec![self.train];
+        result.extend(
+            self.other_partitions()
+                .into_iter()
+                .map(|(_, records)| records),
+        );
+        result
+    }
+}
+
+/// [`find_input_leaks`]・[`find_group_straddles`] の入口で、レコード総件数と
+/// ID・group ID の byte 長を検証する（REQ-39・security.md「ガード層: 資源の上限」。
+/// reviewer 指摘 PR #195。本モジュール先頭のドキュメントコメント参照）。
+///
+/// `partitions` に含まれるスライス長の合計にのみ比例した処理で、入力件数に
+/// 応じて増える追加アロケーションは行わない（分割数分〔最大 4 件〕の固定長
+/// `Vec` のみ使う。違反を検出したら即座に打ち切る）。
+pub fn validate_resource_limits<R: LeakCheckable>(
+    partitions: &Partitions<'_, R>,
+) -> Result<(), LeakCheckError> {
+    let all_partitions = partitions.all_partitions();
+
+    let total: usize = all_partitions.iter().map(|records| records.len()).sum();
+    if total > MAX_LEAK_CHECK_RECORDS {
+        return Err(LeakCheckError::TooManyRecords {
+            total,
+            limit: MAX_LEAK_CHECK_RECORDS,
+        });
+    }
+
+    for records in all_partitions {
+        for record in records {
+            let id_len = record.id().len();
+            if id_len > MAX_LEAK_CHECK_ID_BYTES {
+                return Err(LeakCheckError::IdTooLong {
+                    len: id_len,
+                    limit: MAX_LEAK_CHECK_ID_BYTES,
+                });
+            }
+            let group_id_len = record.group_id().len();
+            if group_id_len > MAX_LEAK_CHECK_ID_BYTES {
+                return Err(LeakCheckError::IdTooLong {
+                    len: group_id_len,
+                    limit: MAX_LEAK_CHECK_ID_BYTES,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// train の入力と byte 完全一致した 1 件（1 つの入力 × 1 つの相手分割）。
@@ -162,7 +247,17 @@ impl InputLeakReport {
 ///
 /// train 側の索引は入力 byte を借用したまま構築するため、`partitions` に含まれる
 /// レコードの total 件数に比例した処理になる（コピーは発生しない）。
-pub fn find_input_leaks<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> InputLeakReport {
+///
+/// # Errors
+///
+/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// 集計処理（train 側 ID の複製・索引化を含む）を一切行わずに [`LeakCheckError`] を返す
+/// （REQ-39・security.md「ガード層: 資源の上限」）。
+pub fn find_input_leaks<R: LeakCheckable>(
+    partitions: &Partitions<'_, R>,
+) -> Result<InputLeakReport, LeakCheckError> {
+    validate_resource_limits(partitions)?;
+
     // train: 入力 byte -> train 側の全 ID（同一入力の train 内重複も漏れなく保持する）。
     let mut train_index: BTreeMap<&[u8], Vec<&str>> = BTreeMap::new();
     for record in partitions.train {
@@ -219,7 +314,7 @@ pub fn find_input_leaks<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> Inp
         })
     });
 
-    InputLeakReport { leaks }
+    Ok(InputLeakReport { leaks })
 }
 
 /// 2 つ以上の分割に跨って現れた group を 1 件表す。
@@ -244,9 +339,17 @@ pub struct GroupStraddleReport {
 /// 入力が異なる場合（[`find_input_leaks`] では検出できないケース）でも、group が
 /// 一致していれば検出できることが本検出の存在意義（PoC-9 の group-straddle
 /// フィクスチャが示す観点）。
+///
+/// # Errors
+///
+/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// 索引化を一切行わずに [`LeakCheckError`] を返す（REQ-39・
+/// security.md「ガード層: 資源の上限」）。
 pub fn find_group_straddles<R: LeakCheckable>(
     partitions: &Partitions<'_, R>,
-) -> GroupStraddleReport {
+) -> Result<GroupStraddleReport, LeakCheckError> {
+    validate_resource_limits(partitions)?;
+
     // group_id -> (分割 -> その分割内の ID 一覧)。
     let mut by_group: BTreeMap<&str, BTreeMap<Partition, Vec<&str>>> = BTreeMap::new();
 
@@ -280,7 +383,7 @@ pub fn find_group_straddles<R: LeakCheckable>(
         });
     }
 
-    GroupStraddleReport { straddles }
+    Ok(GroupStraddleReport { straddles })
 }
 
 /// 漏洩と group 跨ぎをまとめて呼ぶ受け口。
@@ -294,11 +397,18 @@ pub struct LeakageReport {
 }
 
 /// [`find_input_leaks`] と [`find_group_straddles`] をまとめて実行する。
-pub fn inspect_leakage<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> LeakageReport {
-    LeakageReport {
-        input_leaks: find_input_leaks(partitions),
-        group_straddles: find_group_straddles(partitions),
-    }
+///
+/// # Errors
+///
+/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// 両方の検出を実行せずに [`LeakCheckError`] を返す。
+pub fn inspect_leakage<R: LeakCheckable>(
+    partitions: &Partitions<'_, R>,
+) -> Result<LeakageReport, LeakCheckError> {
+    Ok(LeakageReport {
+        input_leaks: find_input_leaks(partitions)?,
+        group_straddles: find_group_straddles(partitions)?,
+    })
 }
 
 #[cfg(test)]
@@ -347,8 +457,8 @@ mod tests {
     fn req16_task16_2_1_all_empty_yields_no_findings() {
         let train: Vec<TestRecord> = Vec::new();
         let partitions = empty_partitions(&train);
-        let leak_report = find_input_leaks(&partitions);
-        let straddle_report = find_group_straddles(&partitions);
+        let leak_report = find_input_leaks(&partitions).expect("上限以下の入力");
+        let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
         assert_eq!(leak_report.leaks, Vec::new());
         assert_eq!(straddle_report.straddles, Vec::new());
     }
@@ -358,8 +468,16 @@ mod tests {
     fn req16_task16_2_1_train_only_yields_no_findings() {
         let train = vec![record("t1", "hello", "g1")];
         let partitions = empty_partitions(&train);
-        assert_eq!(find_input_leaks(&partitions).leaks, Vec::new());
-        assert_eq!(find_group_straddles(&partitions).straddles, Vec::new());
+        assert_eq!(
+            find_input_leaks(&partitions).expect("上限以下の入力").leaks,
+            Vec::new()
+        );
+        assert_eq!(
+            find_group_straddles(&partitions)
+                .expect("上限以下の入力")
+                .straddles,
+            Vec::new()
+        );
     }
 
     /// REQ-16 異常系・TASK-16.2-1（PoC-9 の上書き欠陥の回帰防止）: train の t1 と
@@ -378,7 +496,7 @@ mod tests {
             evaluation: Some(&evaluation),
         };
 
-        let report = find_input_leaks(&partitions);
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
         assert_eq!(report.leaks.len(), 1);
         let leak = &report.leaks[0];
         assert_eq!(leak.partition, Partition::Evaluation);
@@ -405,7 +523,7 @@ mod tests {
             evaluation: None,
         };
 
-        let report = find_input_leaks(&partitions);
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
         assert_eq!(report.leaks.len(), 1);
         assert_eq!(
             &*report.leaks[0].train_ids,
@@ -438,7 +556,7 @@ mod tests {
             evaluation: None,
         };
 
-        let report = find_input_leaks(&partitions);
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
         assert_eq!(report.leaks.len(), 2);
         assert_eq!(report.leak_pair_count(), 2);
         assert_eq!(report.leaked_rows(), 2);
@@ -466,7 +584,10 @@ mod tests {
             test: Some(&test),
             evaluation: None,
         };
-        assert_eq!(find_input_leaks(&partitions).leaks, Vec::new());
+        assert_eq!(
+            find_input_leaks(&partitions).expect("上限以下の入力").leaks,
+            Vec::new()
+        );
     }
 
     /// REQ-16 異常系・TASK-16.2-1: validation・evaluation それぞれについて
@@ -483,7 +604,7 @@ mod tests {
             evaluation: Some(&evaluation),
         };
 
-        let report = find_input_leaks(&partitions);
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
         assert_eq!(report.leaks.len(), 2);
         assert_eq!(report.leaks[0].partition, Partition::Validation);
         assert_eq!(report.leaks[1].partition, Partition::Evaluation);
@@ -503,7 +624,7 @@ mod tests {
             evaluation: None,
         };
 
-        let report = find_group_straddles(&partitions);
+        let report = find_group_straddles(&partitions).expect("上限以下の入力");
         assert_eq!(report.straddles.len(), 1);
         let straddle = &report.straddles[0];
         assert_eq!(straddle.group_id, "shared-group");
@@ -521,7 +642,10 @@ mod tests {
         );
         // 入力が全て異なっていても group 一致だけで検出できることを確認する
         // （入力完全一致では検出できないケース。跨ぎ検出の存在意義）。
-        assert_eq!(find_input_leaks(&partitions).leaks, Vec::new());
+        assert_eq!(
+            find_input_leaks(&partitions).expect("上限以下の入力").leaks,
+            Vec::new()
+        );
     }
 
     /// REQ-16 異常系・TASK-16.2-1: validation と test の間だけの跨ぎ（train を
@@ -538,7 +662,7 @@ mod tests {
             evaluation: None,
         };
 
-        let report = find_group_straddles(&partitions);
+        let report = find_group_straddles(&partitions).expect("上限以下の入力");
         assert_eq!(report.straddles.len(), 1);
         let straddle = &report.straddles[0];
         assert_eq!(straddle.group_id, "shared-group");
@@ -559,11 +683,11 @@ mod tests {
             evaluation: Some(&evaluation),
         };
 
-        let leak_report = find_input_leaks(&partitions);
+        let leak_report = find_input_leaks(&partitions).expect("上限以下の入力");
         assert_eq!(leak_report.leaks.len(), 1);
         assert_eq!(leak_report.leaks[0].partition, Partition::Evaluation);
 
-        let straddle_report = find_group_straddles(&partitions);
+        let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
         assert_eq!(straddle_report.straddles.len(), 1);
         assert!(
             straddle_report.straddles[0]
@@ -632,8 +756,75 @@ mod tests {
             evaluation: None,
         };
 
-        let combined = inspect_leakage(&partitions);
-        assert_eq!(combined.input_leaks, find_input_leaks(&partitions));
-        assert_eq!(combined.group_straddles, find_group_straddles(&partitions));
+        let combined = inspect_leakage(&partitions).expect("上限以下の入力");
+        assert_eq!(
+            combined.input_leaks,
+            find_input_leaks(&partitions).expect("上限以下の入力")
+        );
+        assert_eq!(
+            combined.group_straddles,
+            find_group_straddles(&partitions).expect("上限以下の入力")
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195）: レコード総件数が
+    /// `MAX_LEAK_CHECK_RECORDS` を超えると、索引化・複製を一切行わずに
+    /// `LeakCheckError::TooManyRecords` を返す。
+    #[test]
+    fn req16_task16_2_1_rejects_record_count_over_limit() {
+        let train: Vec<TestRecord> = (0..=MAX_LEAK_CHECK_RECORDS)
+            .map(|i| record(&format!("t{i}"), "x", "g"))
+            .collect();
+        let partitions = empty_partitions(&train);
+
+        assert_eq!(
+            find_input_leaks(&partitions),
+            Err(LeakCheckError::TooManyRecords {
+                total: MAX_LEAK_CHECK_RECORDS + 1,
+                limit: MAX_LEAK_CHECK_RECORDS,
+            })
+        );
+        assert_eq!(
+            find_group_straddles(&partitions),
+            Err(LeakCheckError::TooManyRecords {
+                total: MAX_LEAK_CHECK_RECORDS + 1,
+                limit: MAX_LEAK_CHECK_RECORDS,
+            })
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195）: ID が
+    /// `MAX_LEAK_CHECK_ID_BYTES` を超える長さの場合、ID の内容を含めずに
+    /// `LeakCheckError::IdTooLong` を返す（security.md「秘密情報の混入防止」）。
+    #[test]
+    fn req16_task16_2_1_rejects_id_over_byte_limit() {
+        let long_id = "a".repeat(MAX_LEAK_CHECK_ID_BYTES + 1);
+        let train = vec![record(&long_id, "x", "g")];
+        let partitions = empty_partitions(&train);
+
+        assert_eq!(
+            find_input_leaks(&partitions),
+            Err(LeakCheckError::IdTooLong {
+                len: MAX_LEAK_CHECK_ID_BYTES + 1,
+                limit: MAX_LEAK_CHECK_ID_BYTES,
+            })
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195）: group ID が
+    /// `MAX_LEAK_CHECK_ID_BYTES` を超える長さの場合も同様に拒否する。
+    #[test]
+    fn req16_task16_2_1_rejects_group_id_over_byte_limit() {
+        let long_group_id = "g".repeat(MAX_LEAK_CHECK_ID_BYTES + 1);
+        let train = vec![record("t1", "x", &long_group_id)];
+        let partitions = empty_partitions(&train);
+
+        assert_eq!(
+            find_group_straddles(&partitions),
+            Err(LeakCheckError::IdTooLong {
+                len: MAX_LEAK_CHECK_ID_BYTES + 1,
+                limit: MAX_LEAK_CHECK_ID_BYTES,
+            })
+        );
     }
 }

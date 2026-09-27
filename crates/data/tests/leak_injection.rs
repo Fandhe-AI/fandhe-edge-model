@@ -73,8 +73,8 @@ fn req16_task16_2_1_clean_fixture_has_zero_leaks_and_zero_straddles() {
         evaluation: None,
     };
 
-    let leak_report = find_input_leaks(&partitions);
-    let straddle_report = find_group_straddles(&partitions);
+    let leak_report = find_input_leaks(&partitions).expect("上限以下の入力");
+    let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
     assert_eq!(leak_report.leak_pair_count(), 0, "誤検出（漏洩）が発生した");
     assert_eq!(leak_report.leaked_rows(), 0, "誤検出（漏洩）が発生した");
     assert_eq!(
@@ -108,7 +108,7 @@ fn req16_task16_2_1_leak_duplicate_fixture_detects_exact_leak_count() {
         evaluation: None,
     };
 
-    let report = find_input_leaks(&partitions);
+    let report = find_input_leaks(&partitions).expect("上限以下の入力");
     assert_eq!(
         report.leak_pair_count(),
         2,
@@ -133,7 +133,7 @@ fn req16_task16_2_1_leak_duplicate_fixture_detects_exact_leak_count() {
     assert_eq!(&*leak_b.train_ids, ["train-1".to_string()]);
 
     // group 跨ぎは注入していないため 0 件のまま。
-    let straddle_report = find_group_straddles(&partitions);
+    let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
     assert_eq!(straddle_report.straddles.len(), 0);
 }
 
@@ -164,14 +164,14 @@ fn req16_task16_2_1_group_straddle_fixture_detects_straddle_without_input_leak()
         evaluation: None,
     };
 
-    let leak_report = find_input_leaks(&partitions);
+    let leak_report = find_input_leaks(&partitions).expect("上限以下の入力");
     assert_eq!(
         leak_report.leak_pair_count(),
         0,
         "入力が異なるため漏洩は検出されない"
     );
 
-    let straddle_report = find_group_straddles(&partitions);
+    let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
     assert_eq!(straddle_report.straddles.len(), 1);
     let straddle = &straddle_report.straddles[0];
     assert_eq!(straddle.group_id, "train-group-0");
@@ -215,7 +215,7 @@ fn req16_task16_2_1_evaluation_partition_detects_leak_and_straddle() {
         evaluation: Some(&evaluation),
     };
 
-    let leak_report = find_input_leaks(&partitions);
+    let leak_report = find_input_leaks(&partitions).expect("上限以下の入力");
     let evaluation_leaks: Vec<_> = leak_report
         .leaks
         .iter()
@@ -224,7 +224,7 @@ fn req16_task16_2_1_evaluation_partition_detects_leak_and_straddle() {
     assert_eq!(evaluation_leaks.len(), 1);
     assert_eq!(evaluation_leaks[0].other_ids, vec!["eval-leak".to_string()]);
 
-    let straddle_report = find_group_straddles(&partitions);
+    let straddle_report = find_group_straddles(&partitions).expect("上限以下の入力");
     let evaluation_straddles: Vec<_> = straddle_report
         .straddles
         .iter()
