@@ -39,9 +39,10 @@
 //! train 側 ID 列を複製・索引化する経路（下記）を持つため、呼び出し側へ委ねるだけでは
 //! この API を直接使う経路で上限を保証できない（reviewer 指摘 PR #195・
 //! security.md「ガード層: 資源の上限」）。そこで [`validate_resource_limits`] で
-//! レコード総件数・ID 長を入口で検証してから集計する（`crates/core/src/definition.rs`
+//! レコード総件数・ID 長・入力 byte 長を入口で検証してから集計する（`crates/core/src/definition.rs`
 //! の `MAX_DEFINITION_FILE_BYTES` と同じく、REQ-39 の資源上限が正式に決まるまでの
-//! 暫定値。[`MAX_LEAK_CHECK_RECORDS`]・[`MAX_LEAK_CHECK_ID_BYTES`]）。
+//! 暫定値。[`MAX_LEAK_CHECK_RECORDS`]・[`MAX_LEAK_CHECK_ID_BYTES`]・
+//! [`MAX_LEAK_CHECK_INPUT_BYTES`]）。
 //!
 //! また出力側では、同一の train 入力が複数の相手分割（validation・test・
 //! evaluation）へ漏洩した場合、その入力に対応する train 側 ID 列を分割の数だけ
@@ -62,6 +63,14 @@ pub const MAX_LEAK_CHECK_RECORDS: usize = 200_000;
 /// レコード ID・group ID 1 件あたりの byte 長の上限（暫定値。同上）。
 pub const MAX_LEAK_CHECK_ID_BYTES: usize = 4096;
 
+/// レコード 1 件あたりの入力（[`LeakCheckable::input`]）の byte 長の上限（暫定値。同上）。
+///
+/// `find_input_leaks` は train 側の入力を `BTreeMap` のキーとして比較するため、
+/// 1 件の入力が極端に長いと、件数上限（[`MAX_LEAK_CHECK_RECORDS`]）を満たしていても
+/// 入力サイズに応じて比較処理の時間が線形に増える（reviewer 指摘 PR #195・REQ-39
+/// 「資源の上限」）。ID 長と同じ暫定値を流用する。
+pub const MAX_LEAK_CHECK_INPUT_BYTES: usize = 4096;
+
 /// [`validate_resource_limits`] が検出する、公開 API の入口で拒否すべき違反
 /// （REQ-39・security.md「ガード層: 資源の上限」。reviewer 指摘 PR #195）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +82,11 @@ pub enum LeakCheckError {
     /// ID の内容そのものはエラーに含めない（データ本文・識別子をログ・
     /// エラーメッセージへ転記しない。security.md「秘密情報の混入防止」）。
     IdTooLong { len: usize, limit: usize },
+    /// レコードの入力（[`LeakCheckable::input`]）の byte 長が上限を超えた。
+    ///
+    /// 入力そのものはエラーに含めない（データ本文をログ・エラーメッセージへ
+    /// 転記しない。security.md「秘密情報の混入防止」）。
+    InputTooLong { len: usize, limit: usize },
 }
 
 /// 漏洩・group 跨ぎ検出の対象になるレコードが満たす最小の契約。
@@ -155,7 +169,7 @@ impl<'a, R> Partitions<'a, R> {
 }
 
 /// [`find_input_leaks`]・[`find_group_straddles`] の入口で、レコード総件数と
-/// ID・group ID の byte 長を検証する（REQ-39・security.md「ガード層: 資源の上限」。
+/// ID・group ID・入力の byte 長を検証する（REQ-39・security.md「ガード層: 資源の上限」。
 /// reviewer 指摘 PR #195。本モジュール先頭のドキュメントコメント参照）。
 ///
 /// `partitions` に含まれるスライス長の合計にのみ比例した処理で、入力件数に
@@ -188,6 +202,13 @@ pub fn validate_resource_limits<R: LeakCheckable>(
                 return Err(LeakCheckError::IdTooLong {
                     len: group_id_len,
                     limit: MAX_LEAK_CHECK_ID_BYTES,
+                });
+            }
+            let input_len = record.input().len();
+            if input_len > MAX_LEAK_CHECK_INPUT_BYTES {
+                return Err(LeakCheckError::InputTooLong {
+                    len: input_len,
+                    limit: MAX_LEAK_CHECK_INPUT_BYTES,
                 });
             }
         }
@@ -250,7 +271,7 @@ impl InputLeakReport {
 ///
 /// # Errors
 ///
-/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// [`validate_resource_limits`] がレコード総件数・ID 長・入力 byte 長の上限超過を検出した場合、
 /// 集計処理（train 側 ID の複製・索引化を含む）を一切行わずに [`LeakCheckError`] を返す
 /// （REQ-39・security.md「ガード層: 資源の上限」）。
 pub fn find_input_leaks<R: LeakCheckable>(
@@ -342,7 +363,7 @@ pub struct GroupStraddleReport {
 ///
 /// # Errors
 ///
-/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// [`validate_resource_limits`] がレコード総件数・ID 長・入力 byte 長の上限超過を検出した場合、
 /// 索引化を一切行わずに [`LeakCheckError`] を返す（REQ-39・
 /// security.md「ガード層: 資源の上限」）。
 pub fn find_group_straddles<R: LeakCheckable>(
@@ -400,7 +421,7 @@ pub struct LeakageReport {
 ///
 /// # Errors
 ///
-/// [`validate_resource_limits`] がレコード総件数・ID 長の上限超過を検出した場合、
+/// [`validate_resource_limits`] がレコード総件数・ID 長・入力 byte 長の上限超過を検出した場合、
 /// 両方の検出を実行せずに [`LeakCheckError`] を返す。
 pub fn inspect_leakage<R: LeakCheckable>(
     partitions: &Partitions<'_, R>,
@@ -824,6 +845,32 @@ mod tests {
             Err(LeakCheckError::IdTooLong {
                 len: MAX_LEAK_CHECK_ID_BYTES + 1,
                 limit: MAX_LEAK_CHECK_ID_BYTES,
+            })
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（codex-review 指摘 PR #195）: 入力（`input()`）が
+    /// `MAX_LEAK_CHECK_INPUT_BYTES` を超える長さの場合、`BTreeMap` への索引化を
+    /// 行わずに `LeakCheckError::InputTooLong` を返す（security.md
+    /// 「ガード層: 資源の上限」・「秘密情報の混入防止」）。
+    #[test]
+    fn req16_task16_2_1_rejects_input_over_byte_limit() {
+        let long_input = "x".repeat(MAX_LEAK_CHECK_INPUT_BYTES + 1);
+        let train = vec![record("t1", &long_input, "g")];
+        let partitions = empty_partitions(&train);
+
+        assert_eq!(
+            find_input_leaks(&partitions),
+            Err(LeakCheckError::InputTooLong {
+                len: MAX_LEAK_CHECK_INPUT_BYTES + 1,
+                limit: MAX_LEAK_CHECK_INPUT_BYTES,
+            })
+        );
+        assert_eq!(
+            find_group_straddles(&partitions),
+            Err(LeakCheckError::InputTooLong {
+                len: MAX_LEAK_CHECK_INPUT_BYTES + 1,
+                limit: MAX_LEAK_CHECK_INPUT_BYTES,
             })
         );
     }
