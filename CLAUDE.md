@@ -13,7 +13,7 @@
 
 ## Repository Structure
 
-「（予定）」は spec のタスク定義に基づく計画上の配置で、まだ存在しない。crate・ディレクトリ名は TASK-15.2（雛形作成）で確定する。
+Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で core・cli の 2 crate を作成済みで、残りの層の crate は後続 TASK で追加する。
 
 ```text
 fandhe-edge-model/
@@ -26,10 +26,13 @@ fandhe-edge-model/
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── .markdownlint.jsonc / .markdownlintignore / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── deny.toml                       # cargo-deny 設定（HAS_CARGO 等が揃うまで Makefile 側でスキップ）
+├── deny.toml                       # cargo-deny 設定（`make deny`。ライセンス・ソース・advisory の検査）
 ├── lefthook.yml                    # git hooks 定義（`make hooks` で導入。未導入の間は動作しない）
-├── Cargo.toml                      #（予定）workspace 定義
-├── crates/                        #（予定）6 層に対応する crate 群（共通コア・データ契約・評価器・推論ランタイム・CLI 等）
+├── Cargo.toml                      # workspace 定義（resolver 3・edition 2024・license `MIT OR Apache-2.0`）
+├── Cargo.lock                      # 依存ロック
+├── crates/                         # 層に対応する crate 群（残りの層は後続 TASK で追加）
+│   ├── core/                       # `fandhe-edge-core`（lib。共通コア。REQ-15）
+│   └── cli/                        # `fandhe-edge-cli`（bin 名 `fandhe-edge`。操作アダプター - CLI。REQ-33）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）を実装済み（MLX 学習・ONNX 書き出し）。選定（TASK-18.x）・作り直し判定（TASK-20.x）・ジョブ管理（REQ-34）は未着手
 ├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）
 ├── docs/
@@ -50,21 +53,22 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ### パスベース切り替え表
 
-担当は spec の 6 層（`05-tasks.md`「実装計画の詳細」）で分ける。パスは TASK-15.2 で確定後に更新する。
+担当は spec の 6 層（`05-tasks.md`「実装計画の詳細」）で分ける。以下は確定済みまたは予定パス。未確定の層は後続 TASK で crate 追加時に更新する。
 
-| 対象 | 調査 | 作成・編集 |
-| ---- | ---- | ---------- |
-| 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | explorer | core-builder |
-| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | explorer | data-builder |
-| 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | explorer | trainer-builder |
-| 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | explorer | evaluator-builder |
-| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | explorer | runtime-builder |
-| 操作アダプター（CLI・TUI・MCP / Codex・ガード層。REQ-33/35〜39） | explorer | adapter-builder |
-| `Cargo.toml`・`trainer/pyproject.toml`・`trainer/uv.lock`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | explorer | infra-builder |
-| `docs/spec/`（private） | explorer | 変更しない（spec リポ側で管理） |
-| 外部仕様（ONNX / `ort`・MLX・candle / burn・MCP・統計手法）・依存候補 | reference-researcher | — |
-| テスト・lint | test-runner / linter | — |
-| ドキュメント・`AGENTS.md`・`.claude/`（agents・rules・settings.json） | explorer | docs-writer |
+| 対象 | パス | 調査 | 作成・編集 |
+| ---- | ---- | ---- | ---------- |
+| 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） | explorer | core-builder |
+| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | 未確定 | explorer | data-builder |
+| 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python） | explorer | trainer-builder |
+| 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | 未確定 | explorer | evaluator-builder |
+| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 | explorer | runtime-builder |
+| 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） | explorer | adapter-builder |
+| 操作アダプター - TUI・MCP・ガード層（REQ-35〜39） | 未確定 | explorer | adapter-builder |
+| `Cargo.toml`・`trainer/pyproject.toml`・`trainer/uv.lock`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | — | explorer | infra-builder |
+| `docs/spec/`（private） | — | explorer | 変更しない（spec リポ側で管理） |
+| 外部仕様（ONNX / `ort`・MLX・candle / burn・MCP・統計手法）・依存候補 | — | reference-researcher | — |
+| テスト・lint | — | test-runner / linter | — |
+| ドキュメント・`AGENTS.md`・`.claude/`（agents・rules・settings.json） | — | explorer | docs-writer |
 
 ### model 配分表
 

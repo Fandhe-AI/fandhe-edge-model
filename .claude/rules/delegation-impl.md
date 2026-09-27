@@ -6,16 +6,17 @@
 
 ## パスベース委譲マッピング（実装）
 
-担当は spec の 6 層（`05-tasks.md`「実装計画の詳細」）で分ける。crate・ディレクトリ名は未確定（TASK-15.2 で雛形作成時に確定）のため、下表のパスは予定であり、確定後に実際のパスへ更新する。
+担当は spec の 6 層（`05-tasks.md`「実装計画の詳細」）で分ける。TASK-15.2（#28）で core・cli の 2 crate のパスが確定した。残りの層のパスは crate 追加時に本表へ反映する。
 
-| 層（対象パス〔予定〕） | 委譲先 Agent | model |
-| ---------------------- | ------------ | ----- |
-| 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | core-builder | sonnet |
-| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | data-builder | sonnet |
-| 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34。Rust / Python） | trainer-builder | sonnet |
-| 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | evaluator-builder | sonnet |
-| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | runtime-builder | sonnet |
-| 操作アダプター（CLI・TUI・MCP / Codex・ガード層。REQ-33/35〜39） | adapter-builder | sonnet |
+| 層（対象パス） | 委譲先 Agent | model |
+| -------------- | ------------ | ----- |
+| 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15）。パス: `crates/core/`（`fandhe-edge-core`） | core-builder | sonnet |
+| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40）。パス: 未確定（後続 TASK で追加） | data-builder | sonnet |
+| 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34。Rust / Python）。パス: `trainer/`（Python） | trainer-builder | sonnet |
+| 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29）。パス: 未確定（後続 TASK で追加） | evaluator-builder | sonnet |
+| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32）。パス: 未確定（後続 TASK で追加） | runtime-builder | sonnet |
+| 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33）。パス: `crates/cli/`（`fandhe-edge-cli`） | adapter-builder | sonnet |
+| 操作アダプター - TUI・MCP・ガード層（REQ-35/36/37/39）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
 | ルート `Cargo.toml`・`pyproject.toml`・`.github/workflows/`・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | infra-builder | sonnet |
 | テスト実行・失敗解析（`make test` / `make lint`） | test-runner | sonnet |
 | コードレビュー | reviewer | sonnet |

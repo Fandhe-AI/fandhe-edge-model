@@ -1,0 +1,31 @@
+# fandhe-edge-model の Rust workspace 定義（REQ-15〜40。TASK-15.2）。
+# 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物/推論 SDK・操作アダプター）に
+# 対応する crate を `crates/<name>/` の 1 階層に置く。Makefile の
+# `HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)` が 1 階層のパターンを前提にしているため、
+# 深い階層（`crates/foo/bar`）には crate を置かない。
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Fandhe-AI/fandhe-edge-model"
+# crates.io の公開名・公開方針は未確定（release.yml は無効化中）。
+# 誤公開を防ぐため、当面すべての member crate で publish = false を継承する。
+publish = false
+
+[workspace.dependencies]
+# 依存は `=x.y.z` の完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
+# 推論ランタイム側の crate に学習側の依存（Python 呼び出し・MLX 等）を持ち込まない（REQ-32）。
+# workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
+# 外部の共通依存は現時点で承認済みのものが無い。
+fandhe-edge-core = { path = "crates/core" }
+
+[workspace.lints.rust]
+# unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で
+# やむを得ず必要な crate だけが、`#[allow(unsafe_code)]` と `// SAFETY:` コメントで
+# 局所的に許可する。`forbid` にすると crate 側で `#[allow]` による局所許可ができなくなるため
+# `deny` を採用する。
+unsafe_code = "deny"

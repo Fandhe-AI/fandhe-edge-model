@@ -1,0 +1,18 @@
+[package]
+name = "fandhe-edge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Thin CLI adapter for the register/inspect/train/evaluate/select/package/infer pipeline"
+
+[[bin]]
+name = "fandhe-edge"
+path = "src/main.rs"
+
+[dependencies]
+fandhe-edge-core.workspace = true
+
+[lints]
+workspace = true

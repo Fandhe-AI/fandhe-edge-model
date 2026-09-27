@@ -7,7 +7,7 @@
 - Codex の既定 prompt は **PR の base コミットの本書** を読む。そのため本書への変更は、当該 PR のレビューには反映されず、**マージ後の次の PR から実効** になる
 - 本書は日本語で記述する。プログラムの出力文字列（エラーメッセージ・ログ・CLI 出力・JSON）や識別子・コマンドは原語（英語）のままでよい
 - `docs/spec`（`fandhe-edge-model-spec` submodule）は private であり、レビュー実行環境からは読めない前提とする。レビューでは spec 本文との一致を判定材料にせず、**REQ-n・TASK-n・M-n・PoC-n の併記があるか** という、diff だけで確認できる観点に限定する。ID が欠けた spec 由来の変更は「spec 参照規約」観点（P1）として指摘する
-- 実装は未着手であり、crate・ディレクトリ名は TASK-15.2（雛形作成）で確定する。本書の層区分は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う
+- Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で `crates/core`（`fandhe-edge-core`。共通コア）と `crates/cli`（`fandhe-edge-cli`。操作アダプターの CLI）の 2 crate を雛形として作成済みで、残りの層の crate は後続 TASK で追加する。本書の層区分は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う
 - 本書の各観点の詳細な根拠は `.claude/rules/`（`security.md`・`evaluation-contract.md`・`coding-rust.md`・`coding-python.md`・`dependency-policy.md`・`licensing.md`・`ci.md` 等）にある。本書と `.claude/rules/` が食い違う場合は、本書の優先度判定を正としつつ、食い違い自体を P2 として指摘する
 
 ## 優先度定義
@@ -32,7 +32,7 @@ make ci          # lint-docs + check-workspace-manifest + 上記 5 つを一括�
 make doctor      # 環境診断のみ（何も導入しない）
 ```
 
-- `Cargo.toml`（workspace）が未作成の間、`fmt`/`lint`/`test` は対象がなく実行できない。`Cargo.toml` と `crates/*/Cargo.toml`（メンバー crate）の両方が揃うまで Makefile 側でこれらは `skip:` を表示してスキップされる。`deny` は加えて `deny.toml` の存在を要する。`skip:` を「検証済み」として扱う記述・変更は P1
+- Makefile の `fmt`/`lint`/`test` は `Cargo.toml`（workspace）と `crates/*/Cargo.toml`（メンバー crate）の両方が揃っている場合に実行され、欠けると `skip:` を表示してスキップする（`deny` は加えて `deny.toml` を要する）。TASK-15.2 以降は両方が揃っているため、これらは実行される。`skip:` を「検証済み」として扱う記述・変更は P1
 - workspace 作成後の PR からは、PR 本文にこれらのコマンドの実行結果が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#![allow(...)]` や、`unsafe` 関連 lint・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化・浮動小数の許容差の拡大で CI を通す差分は P0（回帰検出の後退を招くため）

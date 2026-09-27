@@ -28,23 +28,23 @@
 
 ## scope
 
-crate・ディレクトリ名は未確定（TASK-15.2 の雛形作成で確定する）のため、当面は spec の 6 層（`05-tasks.md`「実装計画の詳細」）に対応する scope を使う。crate 名確定後は本表を crate 短縮名に合わせて更新する。
+scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2 crate のパスが確定し、残りの層のパスは crate 追加時に本表へ反映する。
 
-| scope | 対象 |
-| ----- | ---- |
-| core | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） |
-| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） |
-| train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） |
-| eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） |
-| runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） |
-| cli | CLI（7 工程・JSON 入出力契約。REQ-33） |
-| tui | TUI（REQ-35） |
-| mcp | MCP / Codex 連携（REQ-36/37） |
-| guard | ガード層（経路・形式・資源・版の検査。REQ-39） |
-| deps | 依存の追加・更新（`Cargo.toml`・`Cargo.lock`・`pyproject.toml`・lock ファイル） |
-| spec | `docs/spec` submodule 参照の更新 |
-| claude | `CLAUDE.md`・`.claude/`（agents・rules・settings・workflows） |
-| skills | `.claude/skills`・`.agents/skills`・`skills-lock.json` |
+| scope | 対象 | パス |
+| ----- | ---- | ---- |
+| core | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） |
+| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | 未確定 |
+| train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python） |
+| eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | 未確定 |
+| runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 |
+| cli | CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） |
+| tui | TUI（REQ-35） | 未確定 |
+| mcp | MCP / Codex 連携（REQ-36/37） | 未確定 |
+| guard | ガード層（経路・形式・資源・版の検査。REQ-39） | 未確定 |
+| deps | 依存の追加・更新（`Cargo.toml`・`Cargo.lock`・`pyproject.toml`・lock ファイル） | — |
+| spec | `docs/spec` submodule 参照の更新 | — |
+| claude | `CLAUDE.md`・`.claude/`（agents・rules・settings・workflows） | — |
+| skills | `.claude/skills`・`.agents/skills`・`skills-lock.json` | — |
 
 CI・Makefile 等は type（`ci` / `build`）で表し、scope は省略してよい。複数層に跨る場合は scope を省略するか、主たる対象を選ぶ。
 
