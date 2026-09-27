@@ -13,7 +13,7 @@
 
 ## Repository Structure
 
-Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で core・cli の 2 crate を作成済みで、残りの層の crate は後続 TASK で追加する。
+Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で core・cli の 2 crate を、TASK-17.1-1（#44）で data crate（group 単位分割ロジックのみ）を作成済みで、残りの層の crate は後続 TASK で追加する。
 
 ```text
 fandhe-edge-model/
@@ -32,6 +32,7 @@ fandhe-edge-model/
 ├── Cargo.lock                      # 依存ロック
 ├── crates/                         # 層に対応する crate 群（残りの層は後続 TASK で追加）
 │   ├── core/                       # `fandhe-edge-core`（lib。共通コア。REQ-15）
+│   ├── data/                       # `fandhe-edge-data`（lib。データ契約層。REQ-16/17/40。現時点は group 単位分割のみ）
 │   └── cli/                        # `fandhe-edge-cli`（bin 名 `fandhe-edge`。操作アダプター - CLI。REQ-33）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）を実装済み（MLX 学習・ONNX 書き出し）。選定（TASK-18.x）・作り直し判定（TASK-20.x）・ジョブ管理（REQ-34）は未着手
 ├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）
