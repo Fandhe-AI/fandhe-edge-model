@@ -76,7 +76,9 @@ fn req39_load_rejects_file_larger_than_size_limit() {
 /// 現れなくても即座に拒否されること（無期限に停止しない）を確認する
 /// （REQ-39・security.md「ガード層: 資源の上限」。PR #187 レビュー指摘）。
 /// テストが実際に無期限停止した場合は harness のタイムアウトで検出される。
-#[cfg(unix)]
+/// `O_NONBLOCK` で開くのは Linux・macOS だけ（`Definition::open_for_read`）で、
+/// 他の Unix では書き手のいない FIFO を開く時点で停止するため、対象 OS を揃える。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn req39_load_rejects_fifo_without_blocking() {
     let path = temp_file_path("load-fifo");
