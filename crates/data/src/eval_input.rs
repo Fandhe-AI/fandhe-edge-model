@@ -75,6 +75,15 @@
 //!   `scores` 以外（無関係な metadata 等）に出現した該当トークンは置換
 //!   されず、再パース失敗として [`EvalInputStop::MalformedJson`] で停止する。
 //!   詳細は同関数の doc 参照）
+//! - pred 側の `scores` に `1e400` のような、構文自体は正しいが f64 の
+//!   表現範囲を超える数値トークンがあった場合も同じ緩和パース
+//!   （[`substitute_non_finite_literals`]。内部で
+//!   [`scan_json_number_token`] を使う）で `null` へ置換し、
+//!   [`ErrorOrigin::InvalidScore`] へ倒す。`serde_json::from_str` はこの
+//!   トークンを構文エラーではなく数値範囲外の `Err` として拒否するため、
+//!   `NaN`／`Infinity` リテラルの置換だけでは検出できず、無条件に
+//!   [`EvalInputStop::MalformedJson`] へ落ちて評価全体を止めてしまう不具合
+//!   だった（レビュー指摘。PR #204）
 //!
 //! # 前提条件（呼び出し元が守るべきこと）
 //!
@@ -294,10 +303,17 @@ pub struct EvalInputWarning {
     pub code: WarningCode,
     pub action: WarningAction,
     pub side: Side,
-    /// 該当した行番号（昇順・重複なし）。[`WarningCode::MissingPrediction`]・
-    /// [`WarningCode::AllError`] は対応する pred 行が存在しない行を含みうる
-    /// ため、そのような行では代わりに gold 側の行番号を指す（対象行を
+    /// 該当した行番号（昇順・重複なし）。[`WarningCode::MissingPrediction`]は
+    /// 対応する pred 行が存在しないため、常に gold 側の行番号を指す（対象行を
     /// 特定できない警告を出さないため。レビュー指摘。PR #204）。
+    /// [`WarningCode::AllError`] も同じ理由で pred 行が 1 件も無い場合
+    /// （全行が `MissingPrediction` 起因）は gold 側の行番号を指すが、
+    /// pred 行を持つ行が 1 件でもあれば pred 側の行番号だけを使う（gold・pred
+    /// は別々の採番空間のため、両者を同一集合に混在させると偶然同じ数値に
+    /// なった場合に 1 件へ潰れて対象行を取りこぼす。Bugbot 指摘。PR #204
+    /// threadId PRRT_kwDOUq-SxM6mfP3Y）。いずれの場合も `side` フィールドの
+    /// 値（常に [`Side::Prediction`]）自体は行番号がどちらの採番空間かを
+    /// 表さないため、行番号の実際の由来は本 doc の規約に従う。
     /// [`WarningCode::UnseenClass`] の場合は行番号で表せないため常に空。
     pub lines: Vec<usize>,
     /// [`WarningCode::UnseenClass`] のときだけ非空（ラベル ID の昇順・
@@ -469,13 +485,20 @@ fn parse_side(content: &str, side: Side) -> Result<Vec<ParsedRow>, EvalInputStop
 }
 
 /// トップレベルの `scores` キーの値の中に現れる `NaN`・`Infinity`・
-/// `-Infinity` のトークン（文字列リテラル外）を `null` へ置換する
-/// （pred 側限定の緩和パース。ケース 10・TASK-23.1-2）。
+/// `-Infinity` のトークン（文字列リテラル外）、および `1e400` のような
+/// 構文は正しいが f64 の表現範囲を超える（無限大になる）数値トークンを
+/// `null` へ置換する（pred 側限定の緩和パース。ケース 10・TASK-23.1-2）。
 ///
-/// `serde_json` はこれらの JSON 標準外リテラルを受け付けず、そのままでは
-/// [`EvalInputStop::MalformedJson`] で評価全体を止めてしまう（PoC-9 の
-/// Python `json`（`allow_nan=True`）は受理したうえで invalid_score として
-/// 扱う。モジュール doc「PoC-9 との差分」参照）。値の位置（直前の非空白
+/// `serde_json` は `NaN`・`Infinity` を JSON 標準外リテラルとして拒否し、
+/// `1e400` のような範囲外の数値は構文自体は妥当なため字句エラーではなく
+/// 数値範囲エラー（"number out of range"）として拒否する。いずれも
+/// そのままでは [`EvalInputStop::MalformedJson`] で評価全体を止めてしまう
+/// （PoC-9 の Python `json`（`allow_nan=True`）は前者を受理したうえで
+/// invalid_score として扱う。範囲外数値は後述のとおり本モジュール独自の
+/// 拡張。モジュール doc「PoC-9 との差分」参照）。範囲外数値の判定は
+/// [`scan_json_number_token`] で数値トークンの終端まで読み取ってから
+/// `str::parse::<f64>` の結果が有限かどうかで行う（有限なら置換せず raw の
+/// まま残す）。値の位置（直前の非空白
 /// バイトが `:`・`[`・`,`、または行頭）にあり、直後が区切り（空白・`,`・
 /// `}`・`]`・行末）であるトークンだけを置換候補にし、さらにトップレベル
 /// オブジェクトの現在のキーが `scores` であるときに限り実際に置換する。
@@ -617,6 +640,38 @@ fn substitute_non_finite_literals(raw_line: &str) -> Option<String> {
             }
         }
 
+        // `1e400` のような、JSON 数値としての構文自体は正しいが f64 の
+        // 表現範囲を超える（無限大になる）トークンを `null` へ置換する
+        // （レビュー指摘 PR #204 threadId PRRT_kwDOUq-SxM6mfO20）。
+        // `serde_json::from_str` はこの種のトークンを `Err`（"number out of
+        // range"）として拒否し、`NaN`／`Infinity` リテラルの置換（上記
+        // TOKENS）は対象外のため素通りして [`EvalInputStop::MalformedJson`]
+        // になり、ケース 10 の「不正スコアは error として分母に含める」契約
+        // （[`ErrorOrigin::InvalidScore`]）を破っていた。数値本体を
+        // [`scan_json_number_token`] で構文どおりに読み取り、`f64::parse`
+        // が無限大を返す場合だけ `null` に置換する（有限値はそのまま残し、
+        // 元々パースできていた数値の挙動を変えない）。
+        if in_value_position
+            && current_top_key.as_deref() == Some(SCORES_KEY)
+            && (byte == b'-' || byte.is_ascii_digit())
+            && let Some(token_len) = scan_json_number_token(&bytes[i..])
+        {
+            let token_bytes = &bytes[i..i + token_len];
+            let overflows = std::str::from_utf8(token_bytes)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .is_some_and(|v| !v.is_finite());
+            if overflows {
+                result.extend_from_slice(b"null");
+                replaced = true;
+            } else {
+                result.extend_from_slice(token_bytes);
+            }
+            i += token_len;
+            in_value_position = false;
+            continue;
+        }
+
         match byte {
             b'{' | b'[' => {
                 depth += 1;
@@ -681,6 +736,67 @@ fn parse_hex4(bytes: &[u8], start: usize) -> Option<u32> {
     let slice = bytes.get(start..start + 4)?;
     let text = std::str::from_utf8(slice).ok()?;
     u32::from_str_radix(text, 16).ok()
+}
+
+/// `bytes` の先頭から JSON 数値トークン（[RFC 8259] の `number` 生成規則:
+/// 先頭の `-`・整数部・任意の小数部・任意の指数部）を構文どおりに読み取り、
+/// 消費したバイト数を返す（[`substitute_non_finite_literals`] が `scores`
+/// フィールド内の数値オーバーフロー検出専用に呼ぶ。再帰・バックトラック
+/// をしない線形スキャン）。整数部が無い・小数部の `.` の後に数字が無い・
+/// 指数部の `e`／`E` の後に数字が無いなど、構文が不正な場合は不完全な
+/// 部分（`.`・`e` 自体）を消費せずに手前までの妥当な部分を返す（数値
+/// 全体が不正な場合は `None`）。呼び出し元は消費後の文字列を
+/// `str::parse::<f64>` で解釈するだけで、ここでは値の意味（有限性等）を
+/// 判定しない。
+///
+/// [RFC 8259]: https://www.rfc-editor.org/rfc/rfc8259
+fn scan_json_number_token(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    if bytes.first() == Some(&b'-') {
+        i += 1;
+    }
+
+    let int_start = i;
+    if bytes.get(i) == Some(&b'0') {
+        i += 1;
+    } else if bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if i == int_start {
+        // 整数部の数字が 1 桁もない（`-` のみ等）。数値トークンではない。
+        return None;
+    }
+
+    if bytes.get(i) == Some(&b'.') {
+        let frac_start = i + 1;
+        let mut j = frac_start;
+        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        if j > frac_start {
+            i = j;
+        }
+        // `.` の直後に数字が無ければ小数部を消費しない（整数部までを返す）。
+    }
+
+    if matches!(bytes.get(i), Some(b'e') | Some(b'E')) {
+        let mut j = i + 1;
+        if matches!(bytes.get(j), Some(b'+') | Some(b'-')) {
+            j += 1;
+        }
+        let exp_digits_start = j;
+        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        if j > exp_digits_start {
+            i = j;
+        }
+        // 指数部に数字が無ければ `e`／符号を消費しない。
+    }
+
+    Some(i)
 }
 
 /// pred の `scores` フィールドが不正か判定する（ケース 10・TASK-23.1-2）。
@@ -1133,13 +1249,21 @@ pub fn prepare_evaluation_input(
             // pred_line が存在しない（予測行が無い）。全行が
             // `MissingPrediction` 起因の場合に `lines` が空になり、警告が
             // 対象行を指せなくなる不具合の修正（レビュー指摘。PR #204）。
-            // [`EvalInputWarning::lines`] のドキュメント（`MissingPrediction`
-            // は代わりに gold 側の行番号を指す）と同じ規約に揃え、pred_line
-            // が無い行は gold_line にフォールバックする。
-            let lines: BTreeSet<usize> = active
-                .iter()
-                .map(|row| row.pred_line.unwrap_or(row.gold_line))
-                .collect();
+            // ただし pred_line を持つ行が 1 件でもあれば、そちらだけを使い
+            // gold_line へのフォールバックは行わない（gold 側の行番号と
+            // pred 側の行番号は別々の採番空間のため、両者を同じ
+            // `BTreeSet<usize>` へ混在させると偶然同じ数値になった場合に
+            // 1 件へ潰れてしまい、無関係な pred 行を指したり対象行を
+            // 取りこぼしたりする。Bugbot 指摘。PR #204
+            // threadId PRRT_kwDOUq-SxM6mfP3Y）。MissingPrediction 自体の
+            // 対象行は別途 `WarningCode::MissingPrediction`（常に gold_line
+            // 採番）が報告するため、混在させなくても情報は失われない。
+            let has_pred_line = active.iter().any(|row| row.pred_line.is_some());
+            let lines: BTreeSet<usize> = if has_pred_line {
+                active.iter().filter_map(|row| row.pred_line).collect()
+            } else {
+                active.iter().map(|row| row.gold_line).collect()
+            };
             lines_by_code
                 .entry(WarningCode::AllError)
                 .or_default()
@@ -2050,16 +2174,41 @@ mod tests {
         assert_eq!(value["\u{73}cores"]["A"], Value::Null);
     }
 
-    /// `1e400`（範囲外の数値）は `serde_json` がエラーにするため、NaN/Infinity
-    /// トークンではない以上、緩和パースの対象にもならず MalformedJson で
-    /// 停止する（既知の差分。モジュール doc「PoC-9 との差分」参照。
-    /// 証拠種別: テストハーネス。実測: `serde_json` は `1e400` を
-    /// `"number out of range"` としてエラーにする）。
+    /// `1e400`（構文は正しいが f64 の表現範囲を超え無限大になる数値）は
+    /// `serde_json` が `"number out of range"` としてエラーにするが、
+    /// [`scan_json_number_token`] による緩和パースで `null` へ置換され、
+    /// ケース 10 の契約どおり [`ErrorOrigin::InvalidScore`]（分母に含め
+    /// 不正解として扱う）に分類される（レビュー指摘。PR #204
+    /// threadId PRRT_kwDOUq-SxM6mfO20。以前は NaN/Infinity トークンでは
+    /// ない以上緩和パースの対象にならず MalformedJson で評価全体を止めて
+    /// いた）。
     #[test]
-    fn req23_out_of_range_number_stops_with_malformed_json() {
+    fn req23_out_of_range_number_is_invalid_score_not_malformed_json() {
         let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
         let pred =
             "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"scores\":{\"A\":1e400}}\n";
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).expect("must succeed");
+        assert_eq!(outcome.active.len(), 1);
+        assert_eq!(
+            outcome.active[0].prediction,
+            PredictionOutcome::Error(ErrorOrigin::InvalidScore)
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::InvalidScore)
+        );
+    }
+
+    /// `scores` 以外の無関係なフィールド（`metadata` 等）に `1e400` が
+    /// あっても置換対象にならず、`serde_json` の数値範囲エラーとして
+    /// 素通りし [`EvalInputStop::MalformedJson`] で停止すること（`scores`
+    /// 限定の緩和パース方針。モジュール doc「PoC-9 との差分」参照）。
+    #[test]
+    fn req23_out_of_range_number_outside_scores_stops_with_malformed_json() {
+        let gold = "{\"id\":\"a\",\"label\":\"A\"}\n";
+        let pred = "{\"id\":\"a\",\"status\":\"ok\",\"predicted_label\":\"A\",\"metadata\":{\"weight\":1e400}}\n";
         let result = prepare_evaluation_input(gold, pred, &labels(&["A"]));
         assert_eq!(
             result,
@@ -2068,6 +2217,32 @@ mod tests {
                 line: 1,
             })
         );
+    }
+
+    /// `scan_json_number_token` の境界値: 通常の有限な数値（負値・小数・
+    /// 指数表記含む）は範囲外判定に巻き込まれず、置換されないこと
+    /// （直接ユニットテストで検査。境界値テストは具体値で書く方針）。
+    #[test]
+    fn req23_scan_json_number_token_handles_finite_values() {
+        assert_eq!(scan_json_number_token(b"0}"), Some(1));
+        assert_eq!(scan_json_number_token(b"-0.5,"), Some(4));
+        assert_eq!(scan_json_number_token(b"1.5e-3]"), Some(6));
+        assert_eq!(scan_json_number_token(b"123 "), Some(3));
+        // `-` のみは数値トークンとして成立しない。
+        assert_eq!(scan_json_number_token(b"-,"), None);
+    }
+
+    /// 範囲外の数値（`1e400`）は `scan_json_number_token` でトークン全体を
+    /// 読み取れ、`str::parse::<f64>` が非有限値を返すことを直接検査する。
+    #[test]
+    fn req23_scan_json_number_token_reads_overflowing_exponent() {
+        let len = scan_json_number_token(b"1e400}").expect("must scan full token");
+        assert_eq!(len, 5);
+        let parsed: f64 = std::str::from_utf8(&b"1e400"[..len])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!parsed.is_finite());
     }
 
     /// 矛盾（ラベル不一致）と重複（ラベル一致）が同時にある入力で、
@@ -2171,12 +2346,44 @@ mod tests {
                 .iter()
                 .all(|row| matches!(row.prediction, PredictionOutcome::Error(_)))
         );
-        assert!(
-            outcome
-                .warnings
-                .iter()
-                .any(|w| w.code == WarningCode::AllError)
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::AllError)
+            .expect("AllError warning must be present");
+        // pred 行を 1 件でも持つ場合は pred 側の行番号だけを使う
+        // （"b" の pred 行番号は 1 行目）。gold_line（"a" は 1 行目）への
+        // フォールバックとは混在させない（Bugbot 指摘。PR #204
+        // threadId PRRT_kwDOUq-SxM6mfP3Y）。
+        assert_eq!(warning.lines, vec![1]);
+    }
+
+    /// gold 行番号（`MissingPrediction`）と pred 行番号（`InvalidScore`）が
+    /// たまたま異なる数値の場合、`AllError.lines` が pred 側の行番号だけを
+    /// 正しく列挙し、両者を混在させて誤った行を取りこぼさないこと
+    /// （Bugbot 指摘。PR #204 threadId PRRT_kwDOUq-SxM6mfP3Y の直接的な
+    /// 回帰テスト。pred 側に十分な行数を用意し、対象行が 2 行目であることを
+    /// 明示的に検査する）。
+    #[test]
+    fn req23_all_error_lines_use_pred_line_space_only_when_any_pred_line_exists() {
+        let gold = concat!(
+            "{\"id\":\"a\",\"label\":\"A\"}\n", // pred 行なし -> MissingPrediction（gold 1 行目）
+            "{\"id\":\"b\",\"label\":\"A\"}\n", // scores 不正 -> InvalidScore（pred 2 行目）
         );
+        let pred = concat!(
+            "{\"id\":\"z\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n", // "b" とは無関係の pred 1 行目
+            "{\"id\":\"b\",\"status\":\"ok\",\"predicted_label\":\"A\",\"scores\":{\"A\":-1.0}}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::AllError)
+            .expect("AllError warning must be present");
+        // gold 側の "a"（1 行目）を混在させず、pred 側の "b"（2 行目）だけを
+        // 指す。gold_line と pred_line を混在させていれば {1, 2} になるところ
+        // {2} だけになることを検査する。
+        assert_eq!(warning.lines, vec![2]);
     }
 
     /// `active` の全行が [`ErrorOrigin::MissingPrediction`] 起因の場合、
