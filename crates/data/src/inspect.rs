@@ -1,9 +1,10 @@
-//! JSONL 形式の学習・評価データを検査する（REQ-16・TASK-16.1-1）。
+//! JSONL 形式の学習・評価データを検査する（REQ-16・TASK-16.1-1・TASK-16.1-2）。
 //!
 //! CLI の `inspect` 工程（TASK-33.x で配線予定）から、ガード層を通過済みの
-//! JSONL 本文を受け取って呼ばれることを想定する。件数集計（TASK-16.1-2）は
-//! 本モジュールの対象外で、[`inspect_records`] は「型・必須項目・ラベル enum の
-//! 検査」と「妥当なレコードの抽出」のみを行う。
+//! JSONL 本文を受け取って呼ばれることを想定する。[`inspect_records`] は
+//! 「型・必須項目・ラベル enum の検査」「妥当なレコードの抽出」に加え、
+//! 件数集計は [`crate::report`] が行い、結果を [`InspectOutcome::report`] に
+//! 格納する（TASK-16.1-2・issue #39）。
 //!
 //! # セキュリティ上の注意（データ本文・識別子の非転記）
 //!
@@ -48,6 +49,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+
+use crate::report::{self, InspectReport};
 
 /// `inspect_records` の異常種別（本 crate の内部語彙）。
 ///
@@ -143,6 +146,10 @@ pub struct InspectOutcome {
     pub anomalies: Vec<RecordAnomaly>,
     /// 行番号順（入力順）に並んだ妥当なレコード一覧。
     pub valid_records: Vec<ValidRecord>,
+    /// 件数・ラベル別集計レポート（REQ-16・TASK-16.1-2）。
+    /// `valid_records` のみを集計対象とし、異常を出した行は含めない
+    /// （[`crate::report`] モジュール doc 参照）。
+    pub report: InspectReport,
 }
 
 /// 有効なラベル ID の集合が空であることを示すエラー。
@@ -249,12 +256,22 @@ pub fn inspect_records(
     let mut valid_records = Vec::new();
     // id の初出行を記録する。並列化されないため BTreeMap で決定的な順序を保つ。
     let mut seen_ids: BTreeMap<String, usize> = BTreeMap::new();
+    // 件数集計（TASK-16.1-2）向け。空行を除く行数と、1 件以上の異常を出した
+    // 行の数（異常の件数ではなく行数）をループ内で数える。1 行が複数の異常を
+    // 出し、かつ空行は `continue` で読み飛ばすため、`anomalies.len()` と
+    // `valid_records.len()` からは事後に復元できない（[`crate::report`] 参照）。
+    let mut total_rows = 0usize;
+    let mut anomalous_rows = 0usize;
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line = idx + 1;
         if raw_line.trim().is_empty() {
             continue;
         }
+        total_rows += 1;
+        // この行の処理開始時点の異常件数。行末で比較し、1 件でも増えていれば
+        // この行を「異常を出した行」として 1 回だけ数える。
+        let anomalies_before_this_line = anomalies.len();
 
         let value: Value = match serde_json::from_str(raw_line) {
             Ok(value) => value,
@@ -264,6 +281,7 @@ pub fn inspect_records(
                     field: "<record>",
                     code: AnomalyCode::MalformedJson,
                 });
+                anomalous_rows += 1;
                 continue;
             }
         };
@@ -274,6 +292,7 @@ pub fn inspect_records(
                 field: "<record>",
                 code: AnomalyCode::MalformedRecord,
             });
+            anomalous_rows += 1;
             continue;
         };
 
@@ -287,6 +306,7 @@ pub fn inspect_records(
                 field: "<record>",
                 code: AnomalyCode::DuplicateKey,
             });
+            anomalous_rows += 1;
             continue;
         }
 
@@ -543,11 +563,22 @@ pub fn inspect_records(
                 group_id: group_id_opt,
             });
         }
+
+        // フィールド検査（id・input・output・tags・group_id・重複 id）で
+        // 1 件以上の異常が積まれていれば、この行を「異常を出した行」として
+        // 1 回だけ数える（`MalformedJson`・`MalformedRecord`・`DuplicateKey` は
+        // 上の早期 `continue` 側で既に数えているため、ここには到達しない）。
+        if anomalies.len() != anomalies_before_this_line {
+            anomalous_rows += 1;
+        }
     }
+
+    let report = report::summarize(total_rows, anomalous_rows, &valid_records, valid_label_ids);
 
     Ok(InspectOutcome {
         anomalies,
         valid_records,
+        report,
     })
 }
 
