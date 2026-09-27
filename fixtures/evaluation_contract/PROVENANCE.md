@@ -66,10 +66,12 @@ PoC-9 のフィクスチャは、評価契約（REQ-21〜27・REQ-29）の異常
   変わらない。
 - pred 側の `NaN`・`Infinity`・`-Infinity`（JSON 標準外リテラル。10-invalid-score
   の `pred.jsonl` が使用）は、PoC-9 の Python `json`（`allow_nan=True`）は
-  受理するが `serde_json` は受け付けない。本リポは値の位置にある該当トークンを
-  `null` へ置換して再パースし、該当行を無条件に `invalid_score` として扱う
-  緩和パース（`eval_input::substitute_non_finite_literals`。pred 側限定・
-  gold 側は緩和しない）で吸収する。
+  受理するが `serde_json` は受け付けない。本リポはトップレベル `scores`
+  フィールドの値限定で該当トークンを `null` へ置換して再パースし、該当行を
+  無条件に `invalid_score` として扱う緩和パース
+  （`eval_input::substitute_non_finite_literals`。pred 側限定・gold 側は
+  緩和しない）で吸収する。`scores` 以外に出現した該当トークンは置換されず
+  `malformed_json` として停止する（レビュー指摘。PR #204）。
 - ケース 02・03・04・06 は、TASK-23.1-2 で `WarningCode::UnseenClass`
   （ケース 9 の未出現クラス検出）を追加した副作用として、既存のラベル定義に
   対して active な gold 行がすべてのラベルをカバーしていないため、
