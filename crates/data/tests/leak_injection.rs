@@ -75,7 +75,7 @@ fn req16_task16_2_1_clean_fixture_has_zero_leaks_and_zero_straddles() {
 
     let leak_report = find_input_leaks(&partitions);
     let straddle_report = find_group_straddles(&partitions);
-    assert_eq!(leak_report.distinct_inputs(), 0, "誤検出（漏洩）が発生した");
+    assert_eq!(leak_report.leak_pair_count(), 0, "誤検出（漏洩）が発生した");
     assert_eq!(leak_report.leaked_rows(), 0, "誤検出（漏洩）が発生した");
     assert_eq!(
         straddle_report.straddles.len(),
@@ -110,7 +110,7 @@ fn req16_task16_2_1_leak_duplicate_fixture_detects_exact_leak_count() {
 
     let report = find_input_leaks(&partitions);
     assert_eq!(
-        report.distinct_inputs(),
+        report.leak_pair_count(),
         2,
         "漏洩した入力の種類数が一致しない"
     );
@@ -123,14 +123,14 @@ fn req16_task16_2_1_leak_duplicate_fixture_detects_exact_leak_count() {
     let leak_a = &leaks[0];
     assert_eq!(leak_a.other_ids, vec!["leak-test-a".to_string()]);
     assert_eq!(
-        leak_a.train_ids,
-        vec!["train-0".to_string(), "train-0-dup".to_string()],
+        &*leak_a.train_ids,
+        ["train-0".to_string(), "train-0-dup".to_string()],
         "train 内の重複行も train_ids に含まれる"
     );
 
     let leak_b = &leaks[1];
     assert_eq!(leak_b.other_ids, vec!["leak-test-b".to_string()]);
-    assert_eq!(leak_b.train_ids, vec!["train-1".to_string()]);
+    assert_eq!(&*leak_b.train_ids, ["train-1".to_string()]);
 
     // group 跨ぎは注入していないため 0 件のまま。
     let straddle_report = find_group_straddles(&partitions);
@@ -166,7 +166,7 @@ fn req16_task16_2_1_group_straddle_fixture_detects_straddle_without_input_leak()
 
     let leak_report = find_input_leaks(&partitions);
     assert_eq!(
-        leak_report.distinct_inputs(),
+        leak_report.leak_pair_count(),
         0,
         "入力が異なるため漏洩は検出されない"
     );

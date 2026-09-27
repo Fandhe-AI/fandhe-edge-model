@@ -35,8 +35,15 @@
 //! 本モジュールは `Partitions` に渡されたスライス長の合計に比例した処理のみを行い、
 //! 入力 byte はすべて借用（コピーしない）。件数・サイズの上限検査（REQ-39）は
 //! 呼び出し側（データ検査層・ガード層）の責務とする（`split.rs` と同じ方針）。
+//!
+//! ただし出力側では、同一の train 入力が複数の相手分割（validation・test・
+//! evaluation）へ漏洩した場合、その入力に対応する train 側 ID 列を分割の数だけ
+//! 複製すると、外部データが持つ重複度に応じて出力サイズが増幅されうる
+//! （reviewer 指摘 PR #195）。[`InputLeak::train_ids`] は `Rc<[String]>` で
+//! 同じ ID 列を共有し、複製を ID 列の実体ではなく参照カウントの増加に留める。
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// 漏洩・group 跨ぎ検出の対象になるレコードが満たす最小の契約。
 ///
@@ -109,10 +116,16 @@ impl<'a, R> Partitions<'a, R> {
 /// `train_ids`・`other_ids` は該当する **全 ID** を昇順で保持する（PoC-9 の
 /// `find_train_test_leak` が入力をキーに `test_id` を上書きし、同一入力を持つ
 /// 評価側の複数行のうち最後の 1 件しか残せなかった欠陥を、本実装では直す）。
+///
+/// `train_ids` は `Rc<[String]>` にしている。同一の train 入力が複数の相手分割
+/// （validation・test・evaluation）へ漏洩すると、その入力に対応する
+/// `InputLeak` が分割の数だけ生成されるが、`Rc` で共有することで ID 列本体の
+/// 複製をせず参照カウントの増加のみに留める（reviewer 指摘 PR #195・REQ-39
+/// 資源の上限の観点。外部データの重複度に比例して出力サイズが増幅するのを防ぐ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputLeak {
     pub partition: Partition,
-    pub train_ids: Vec<String>,
+    pub train_ids: Rc<[String]>,
     pub other_ids: Vec<String>,
 }
 
@@ -128,9 +141,13 @@ pub struct InputLeakReport {
 impl InputLeakReport {
     /// 漏洩の組の件数（`(入力, 相手分割)` の組ごとに 1 件。同一入力が
     /// validation・test など複数分割へ漏洩した場合は、その分だけ重複して
-    /// 数える。「異なり入力数」ではない点に注意（後続の集計で入力単位の
-    /// 重複排除が必要な場合は、`leaks` から入力 byte 単位で別途数え直す）。
-    pub fn distinct_inputs(&self) -> usize {
+    /// 数える。
+    ///
+    /// 「異なり入力数」（reviewer 指摘 PR #195: 旧名 `distinct_inputs` は
+    /// この値を異なり入力数だと誤解させた）とは異なる。異なり入力数は
+    /// `leaks` から入力 byte 単位で別途数え直す必要があり、本メソッドは
+    /// その代わりにならない。
+    pub fn leak_pair_count(&self) -> usize {
         self.leaks.len()
     }
 
@@ -157,6 +174,17 @@ pub fn find_input_leaks<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> Inp
     for ids in train_index.values_mut() {
         ids.sort_unstable();
     }
+    // 入力 byte -> その入力の train 側 ID 列（所有権を持つ String に変換済み）を
+    // `Rc<[String]>` として 1 度だけ構築する。同じ入力が複数の相手分割へ漏洩しても
+    // この Rc を clone（参照カウントの増加のみ）して使い回し、ID 列本体の複製で
+    // 出力サイズが分割数倍に増幅するのを避ける（reviewer 指摘 PR #195・REQ-39）。
+    let train_ids_shared: BTreeMap<&[u8], Rc<[String]>> = train_index
+        .iter()
+        .map(|(input, ids)| {
+            let owned: Rc<[String]> = ids.iter().map(|id| (*id).to_string()).collect();
+            (*input, owned)
+        })
+        .collect();
 
     let mut leaks: Vec<InputLeak> = Vec::new();
     for (partition, records) in partitions.other_partitions() {
@@ -170,14 +198,14 @@ pub fn find_input_leaks<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> Inp
         }
 
         for (input, other_ids) in other_index {
-            let Some(train_ids) = train_index.get(input) else {
+            let Some(train_ids) = train_ids_shared.get(input) else {
                 continue;
             };
             let mut other_ids = other_ids;
             other_ids.sort_unstable();
             leaks.push(InputLeak {
                 partition,
-                train_ids: train_ids.iter().map(|id| (*id).to_string()).collect(),
+                train_ids: Rc::clone(train_ids),
                 other_ids: other_ids.into_iter().map(str::to_string).collect(),
             });
         }
@@ -354,17 +382,17 @@ mod tests {
         assert_eq!(report.leaks.len(), 1);
         let leak = &report.leaks[0];
         assert_eq!(leak.partition, Partition::Evaluation);
-        assert_eq!(leak.train_ids, vec!["t1".to_string()]);
+        assert_eq!(&*leak.train_ids, ["t1".to_string()]);
         assert_eq!(leak.other_ids, vec!["e1".to_string(), "e2".to_string()]);
-        assert_eq!(report.distinct_inputs(), 1);
+        assert_eq!(report.leak_pair_count(), 1);
         assert_eq!(report.leaked_rows(), 2);
     }
 
     /// REQ-16 異常系・TASK-16.2-1: train 側で複数行が同一入力の場合、`train_ids` に
-    /// すべて含まれ、`distinct_inputs` は 1 のままになる（train 内の重複は漏洩件数を
+    /// すべて含まれ、`leak_pair_count` は 1 のままになる（train 内の重複は漏洩件数を
     /// 増やしも減らしもしない。同一分割内の重複自体は #42 の担当）。
     #[test]
-    fn req16_task16_2_1_duplicate_train_input_all_ids_kept_distinct_inputs_unchanged() {
+    fn req16_task16_2_1_duplicate_train_input_all_ids_kept_leak_pair_count_unchanged() {
         let train = vec![
             record("t1", "dup input", "g1"),
             record("t2", "dup input", "g2"),
@@ -380,20 +408,24 @@ mod tests {
         let report = find_input_leaks(&partitions);
         assert_eq!(report.leaks.len(), 1);
         assert_eq!(
-            report.leaks[0].train_ids,
-            vec!["t1".to_string(), "t2".to_string()]
+            &*report.leaks[0].train_ids,
+            ["t1".to_string(), "t2".to_string()]
         );
-        assert_eq!(report.distinct_inputs(), 1);
+        assert_eq!(report.leak_pair_count(), 1);
         assert_eq!(report.leaked_rows(), 1);
     }
 
     /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘の回帰防止）: 同一入力が
     /// validation・test の複数分割へ漏洩した場合、`leaks` は分割ごとに 1 件
-    /// （組ごと）ずつ計 2 件になり、`distinct_inputs()`（= `leaks.len()`）は
+    /// （組ごと）ずつ計 2 件になり、`leak_pair_count()`（= `leaks.len()`）は
     /// 「異なり入力数」ではなく「漏洩の組の件数」として 2 を返す
-    /// （異なり入力数そのものは 1）。この差は `distinct_inputs` のドキュメント
+    /// （異なり入力数そのものは 1）。この差は `leak_pair_count` のドキュメント
     /// コメントに明記済み。#39（検査レポート集約）でこの値を異なり入力数として
     /// 使わないよう、値の意味をここで固定する。
+    ///
+    /// 同時に、`train_ids`（`Rc<[String]>`）が 2 件の `InputLeak` 間で同じ
+    /// アロケーションを共有していること（`Rc::ptr_eq`）も確認し、分割数に応じて
+    /// ID 列本体が複製されない（reviewer 指摘 PR #195・REQ-39）ことを回帰防止する。
     #[test]
     fn req16_task16_2_1_same_input_leaked_into_multiple_partitions_counts_per_partition() {
         let train = vec![record("t1", "x", "g_train")];
@@ -408,10 +440,14 @@ mod tests {
 
         let report = find_input_leaks(&partitions);
         assert_eq!(report.leaks.len(), 2);
-        assert_eq!(report.distinct_inputs(), 2);
+        assert_eq!(report.leak_pair_count(), 2);
         assert_eq!(report.leaked_rows(), 2);
         assert_eq!(report.leaks[0].partition, Partition::Validation);
         assert_eq!(report.leaks[1].partition, Partition::Test);
+        assert!(
+            Rc::ptr_eq(&report.leaks[0].train_ids, &report.leaks[1].train_ids),
+            "同じ train 入力に対する train_ids は Rc で共有され、分割ごとに複製されない"
+        );
     }
 
     /// REQ-16 異常系・TASK-16.2-1: byte が 1 つでも異なれば漏洩としない
