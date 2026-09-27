@@ -100,8 +100,9 @@ fn freeze_eval_data_returns_not_found_for_missing_path() {
 }
 
 /// REQ-39 境界値（サイズ超過）: `MAX_EVAL_DATA_BYTES` を超えるファイルを渡すと
-/// `FreezeError::TooLarge` を返す（`File::open` 前の `metadata()` で拒否するため、
-/// ファイルは疎ファイルとして作成し実データを書き込まずにサイズだけ確保する）。
+/// `FreezeError::TooLarge` を返す（開いた fd の `fstat` で実データを読む前に
+/// 拒否するため、ファイルは疎ファイルとして作成し実データを書き込まずに
+/// サイズだけ確保する）。
 #[test]
 fn freeze_eval_data_returns_too_large_for_oversized_file() {
     let guard = TempDirGuard::new("oversized-file");
@@ -153,18 +154,18 @@ fn freeze_eval_data_returns_not_a_file_for_character_device() {
 /// `FreezeError::NotAFile` で拒否することを確認する（codex レビュー P0 指摘の
 /// 回帰テスト）。
 ///
-/// 本テストが検証するのは `freeze_eval_data` 冒頭のパスレベルの `is_file()`
-/// 事前チェック（`metadata(path)` の時点で FIFO と判定して拒否する経路）であり、
-/// `open_without_blocking` 自体のノンブロッキング挙動（`metadata()` と `open()` の
-/// 間でパスが差し替えられる本来の TOCTOU）はここでは経由しない
-/// （このテストのパスは最初から FIFO のため、`open_without_blocking` に到達する前に
-/// 事前チェックで `NotAFile` が返る。Cursor Bugbot 指摘）。TOCTOU window 自体の
-/// ロックインは `crates/data/src/eval_freeze.rs` の
-/// `open_without_blocking_tests::open_without_blocking_returns_promptly_for_writerless_fifo`
-/// （`open_without_blocking` を直接呼ぶ単体テスト）が担う。
-/// 本テストは無限ブロックしないことの結合レベルでの確認として残す
+/// `freeze_eval_data` はパス文字列への事前 `metadata()` チェックを持たず
+/// （TOCTOU の窓を広げるため廃止した。モジュール冒頭「経路の閉じ込め」参照）、
+/// `resolve_within_root` の検証後は `open_without_blocking` の 1 回の `open`
+/// （`O_NONBLOCK` 付き）と、その fd に対する `fstat` だけで種別を判定する。
+/// 本テストはその経路を実際に通し、FIFO の `open` がノンブロッキングで返ったうえで
+/// `fstat` が `NotAFile` を確定させることを結合レベルで確認する
 /// （万一ブロッキング実装へ回帰した場合にテストスイート自体が無期限にハングしない
 /// よう、判定は別スレッド＋タイムアウトで行う。Linux/macOS 実機・テストハーネス）。
+/// `open_without_blocking` 自体のノンブロッキング挙動の単体レベルのロックインは
+/// `crates/data/src/eval_freeze.rs` の
+/// `open_without_blocking_tests::open_without_blocking_returns_promptly_for_writerless_fifo`
+/// が担う。
 #[test]
 #[cfg(unix)]
 fn freeze_eval_data_returns_not_a_file_for_fifo_without_blocking() {
@@ -268,6 +269,37 @@ fn freeze_eval_data_returns_outside_root_for_symlink_escaping_root() {
         .expect("create symlink escaping root");
 
     let result = freeze_eval_data(root_guard.path(), Some(relative));
+
+    match result {
+        Err(FreezeError::OutsideRoot) => {}
+        Err(other) => panic!("expected OutsideRoot, got {other}"),
+        Ok(_) => panic!("expected OutsideRoot error, got Ok"),
+    }
+}
+
+/// REQ-39 異常系（経路の閉じ込め・TOCTOU 修正の回帰テスト）: `root` 直下にネストした
+/// パス（`sub/data.jsonl`）は、ファイルが実在していても `FreezeError::OutsideRoot`
+/// で拒否する。
+///
+/// `path` を `root` 直下の 1 コンポーネントに制限するのは、安定版 `std` に
+/// `openat`/`fstatat` 相当が無く、中間ディレクトリを経由すると
+/// `resolve_within_root` の `canonicalize` と `open_without_blocking` の `open`
+/// の間で中間ディレクトリを symlink へ差し替える TOCTOU を閉じられないため
+/// （`crates/data/src/eval_freeze.rs` モジュール冒頭「経路の閉じ込め」参照。
+/// codex/Cursor Bugbot 指摘 PRRT_kwDOUq-SxM6mbqce・PRRT_kwDOUq-SxM6mbtcp への対応）。
+/// ネストしたレイアウトが将来必要になった場合は、`openat` 相当を実装する依存
+/// 追加または `unsafe extern "C"` FFI 追加についてユーザー承認を得たうえで
+/// 拡張する。
+#[test]
+fn freeze_eval_data_returns_outside_root_for_nested_path() {
+    let guard = TempDirGuard::new("nested-path");
+    let subdir = guard.path().join("sub");
+    std::fs::create_dir_all(&subdir).expect("create nested subdirectory");
+    let nested_file = subdir.join("data.jsonl");
+    std::fs::write(&nested_file, b"nested").expect("write nested fixture file");
+
+    let relative = Path::new("sub/data.jsonl");
+    let result = freeze_eval_data(guard.path(), Some(relative));
 
     match result {
         Err(FreezeError::OutsideRoot) => {}
