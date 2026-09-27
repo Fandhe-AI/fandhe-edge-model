@@ -126,7 +126,10 @@ pub struct InputLeakReport {
 }
 
 impl InputLeakReport {
-    /// 漏洩した入力の異なり数（分割を問わず全体で数える）。
+    /// 漏洩の組の件数（`(入力, 相手分割)` の組ごとに 1 件。同一入力が
+    /// validation・test など複数分割へ漏洩した場合は、その分だけ重複して
+    /// 数える。「異なり入力数」ではない点に注意（後続の集計で入力単位の
+    /// 重複排除が必要な場合は、`leaks` から入力 byte 単位で別途数え直す）。
     pub fn distinct_inputs(&self) -> usize {
         self.leaks.len()
     }
@@ -140,7 +143,7 @@ impl InputLeakReport {
 /// train の入力と、他の分割（validation・test・evaluation）の入力が byte 完全一致する
 /// 組を検出する（REQ-16 異常系・TASK-16.2-1。PoC-9 `find_train_test_leak` 相当）。
 ///
-/// train 側の索引は入力 byte を借用したまま構築するため、`records` に含まれる
+/// train 側の索引は入力 byte を借用したまま構築するため、`partitions` に含まれる
 /// レコードの total 件数に比例した処理になる（コピーは発生しない）。
 pub fn find_input_leaks<R: LeakCheckable>(partitions: &Partitions<'_, R>) -> InputLeakReport {
     // train: 入力 byte -> train 側の全 ID（同一入力の train 内重複も漏れなく保持する）。
@@ -382,6 +385,33 @@ mod tests {
         );
         assert_eq!(report.distinct_inputs(), 1);
         assert_eq!(report.leaked_rows(), 1);
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘の回帰防止）: 同一入力が
+    /// validation・test の複数分割へ漏洩した場合、`leaks` は分割ごとに 1 件
+    /// （組ごと）ずつ計 2 件になり、`distinct_inputs()`（= `leaks.len()`）は
+    /// 「異なり入力数」ではなく「漏洩の組の件数」として 2 を返す
+    /// （異なり入力数そのものは 1）。この差は `distinct_inputs` のドキュメント
+    /// コメントに明記済み。#39（検査レポート集約）でこの値を異なり入力数として
+    /// 使わないよう、値の意味をここで固定する。
+    #[test]
+    fn req16_task16_2_1_same_input_leaked_into_multiple_partitions_counts_per_partition() {
+        let train = vec![record("t1", "x", "g_train")];
+        let validation = vec![record("v1", "x", "g_v")];
+        let test = vec![record("x1", "x", "g_test")];
+        let partitions = Partitions {
+            train: &train,
+            validation: Some(&validation),
+            test: Some(&test),
+            evaluation: None,
+        };
+
+        let report = find_input_leaks(&partitions);
+        assert_eq!(report.leaks.len(), 2);
+        assert_eq!(report.distinct_inputs(), 2);
+        assert_eq!(report.leaked_rows(), 2);
+        assert_eq!(report.leaks[0].partition, Partition::Validation);
+        assert_eq!(report.leaks[1].partition, Partition::Test);
     }
 
     /// REQ-16 異常系・TASK-16.2-1: byte が 1 つでも異なれば漏洩としない
