@@ -268,7 +268,7 @@ impl JudgmentResult {
     /// [`JudgmentError`] の各 variant を参照。
     pub fn new(
         options: &[Choice],
-        id: impl Into<String>,
+        id: &str,
         predicted_choice_id: &str,
         scores: &[f64],
     ) -> Result<Self, JudgmentError> {
@@ -292,7 +292,12 @@ impl JudgmentResult {
             });
         }
 
-        let id = id.into();
+        // `id.to_string()` によるアロケーションより前に、借用した `&str`
+        // のまま空・上限超過を検証する（PR #202 レビュー指摘・P0。旧実装
+        // は `impl Into<String>` を受けて検証前に `.into()` していたため、
+        // 上限超過の巨大な外部入力に対しても検証前にメモリを確保してい
+        // た。coding-rust.md「サイズ・件数を上限検証してからアロケーショ
+        // ンに使う」）。
         if id.is_empty() {
             return Err(JudgmentError::EmptyInputId);
         }
@@ -302,6 +307,7 @@ impl JudgmentResult {
                 limit: MAX_INPUT_ID_BYTES,
             });
         }
+        let id = id.to_string();
 
         // 選択肢 ID の重複検査は `HashSet::insert` による線形時間（`O(n)`）
         // で行う。呼び出し側が渡す `options` は未検証の外部入力（定義ファ
@@ -678,11 +684,11 @@ mod tests {
     fn req21_input_id_length_boundary() {
         let options = [choice("a")];
         let at_limit = "x".repeat(MAX_INPUT_ID_BYTES);
-        assert!(JudgmentResult::new(&options, at_limit, "a", &[1.0]).is_ok());
+        assert!(JudgmentResult::new(&options, &at_limit, "a", &[1.0]).is_ok());
 
         let over_limit = "x".repeat(MAX_INPUT_ID_BYTES + 1);
         assert_eq!(
-            JudgmentResult::new(&options, over_limit, "a", &[1.0]),
+            JudgmentResult::new(&options, &over_limit, "a", &[1.0]),
             Err(JudgmentError::InputIdTooLong {
                 len: MAX_INPUT_ID_BYTES + 1,
                 limit: MAX_INPUT_ID_BYTES
