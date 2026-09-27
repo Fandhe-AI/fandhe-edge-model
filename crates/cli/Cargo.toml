@@ -12,7 +12,7 @@ name = "fandhe-edge"
 path = "src/main.rs"
 
 [dependencies]
-fandhe-edge-core = { path = "../core" }
+fandhe-edge-core.workspace = true
 
 [lints]
 workspace = true

@@ -19,7 +19,9 @@ publish = false
 [workspace.dependencies]
 # 依存は `=x.y.z` の完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 推論ランタイム側の crate に学習側の依存（Python 呼び出し・MLX 等）を持ち込まない（REQ-32）。
-# 現時点では承認済みの共通依存が無いため空。
+# workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
+# 外部の共通依存は現時点で承認済みのものが無い。
+fandhe-edge-core = { path = "crates/core" }
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で
