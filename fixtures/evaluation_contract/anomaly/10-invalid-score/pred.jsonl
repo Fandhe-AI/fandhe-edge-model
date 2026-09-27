@@ -1,0 +1,5 @@
+{"id": "an10-1", "status": "ok", "predicted_label": "A", "scores": {"A": 0.9, "B": 0.1}}
+{"id": "an10-2", "status": "ok", "predicted_label": "A", "scores": {"A": NaN, "B": 0.1}}
+{"id": "an10-3", "status": "ok", "predicted_label": "B", "scores": {"A": -0.2, "B": 1.2}}
+{"id": "an10-4", "status": "ok", "predicted_label": "B", "scores": {"A": 0.3, "B": 0.3}}
+{"id": "an10-5", "status": "ok", "predicted_label": "A", "scores": {"A": Infinity, "B": 0.0}}
