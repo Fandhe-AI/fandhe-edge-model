@@ -18,11 +18,12 @@ name: Python CI
 #
 # MLX（macOS arm64 ランナー）について: TASK-19.2（既定候補 C3）の実装で
 # trainer/pyproject.toml の dependencies に mlx・numpy・onnx を追加した。
-# MLX の wheel は macosx_14_0_arm64 以降のみ提供されるため（[tool.uv] environments
-# の制約）、本 job は macos-14 で実行する。GitHub ホステッドランナーの `macos-14`
+# spec の検証環境は macOS（Apple Silicon）であり、出力先の拡張 ACL 検査など macOS
+# 固有の経路もここでしか検証できないため、本 job は macos-14 で実行する
+# （[tool.uv] environments は開発環境向けに Linux x86_64 も含むが、CI の正は macOS arm64）。GitHub ホステッドランナーの `macos-14`
 # （および `macos-15`・`macos-latest`）は Apple Silicon（arm64）の標準ランナーである
 # （GitHub 公式ドキュメント about-github-hosted-runners の標準ランナー一覧）。
-# MLX の wheel が要求する macOS 14 以上を満たす最も古い arm64 ラベルを使う。
+# MLX の macOS 向け wheel が要求する macOS 14 以上を満たす最も古い arm64 ラベルを使う。
 # 念のため下記ステップでアーキテクチャを fail-closed に検査する（ランナーラベルの
 # 意味が将来変わった場合に、CI が気づかず x86_64 上で「MLX 無しでも py-ci が通る」
 # 状態へ静かに劣化するのを防ぐ）。
