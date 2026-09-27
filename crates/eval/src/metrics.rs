@@ -23,10 +23,12 @@
 //! # 資源上限
 //!
 //! 計算量は `records` の長さとラベル数に比例し、確保するメモリは
-//! ラベル数の 2 乗程度（混同行列）に限られる。件数・ラベル数の上限検証
-//! （REQ-39）は呼び出し側（データ検査層。定義ファイルのサイズ上限
-//! `fandhe-edge-core::MAX_DEFINITION_FILE_BYTES` と入力スライスの長さで
-//! 決まる）の責務とする。
+//! ラベル数の 2 乗程度（混同行列）に限られる。呼び出し側の定義ファイル検査
+//! （`fandhe-edge-core::MAX_DEFINITION_FILE_BYTES`）はファイルサイズの上限のみで
+//! ラベル（選択肢）件数の上限を持たないため、本モジュール自身が
+//! [`ConfusionMatrix::new`] の確保前に [`MAX_LABELS`] でラベル数を検証し、
+//! 超過時は確保せず [`EvalError::TooManyLabels`] を返す（REQ-39 ガード層
+//! 「資源の上限」。`records` の件数上限は呼び出し側の責務のまま）。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -91,6 +93,21 @@ pub enum EvalError {
         /// 発生箇所の説明（人が読める短い文字列。機械照合はしない）。
         detail: String,
     },
+    /// ラベル数が上限（[`MAX_LABELS`]）を超える。
+    ///
+    /// 混同行列は `n_labels * (n_labels + 3)` 個の `u64` を確保する
+    /// （[`ConfusionMatrix::new`]）ため、呼び出し側の定義ファイル検査
+    /// （`fandhe-edge-core::MAX_DEFINITION_FILE_BYTES`。ファイルサイズの
+    /// 上限のみでラベル（選択肢）件数の上限は無い）を通った入力でも
+    /// 巨大なラベル数を渡せば無制限のアロケーションになりうる。
+    /// ガード層の資源上限（REQ-39・`.claude/rules/security.md`）に従い、
+    /// 確保前にここで拒否する。
+    TooManyLabels {
+        /// 渡されたラベル数。
+        n_labels: usize,
+        /// 上限（[`MAX_LABELS`]）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -107,6 +124,9 @@ impl fmt::Display for EvalError {
             }
             EvalError::Internal { detail } => {
                 write!(f, "internal aggregation error: {detail}")
+            }
+            EvalError::TooManyLabels { n_labels, limit } => {
+                write!(f, "too many labels: {n_labels} exceeds limit {limit}")
             }
         }
     }
@@ -224,14 +244,45 @@ pub struct ConfusionMatrix {
     n_labels: usize,
 }
 
+/// 混同行列（ラベル数 `n_labels` の 2 乗程度）の確保前に許容するラベル数の上限。
+///
+/// `ConfusionMatrix::new` は `n_labels * (n_labels + 3)` 個の `u64`（8 byte）を
+/// 確保する。定義ファイルの検査（`fandhe-edge-core::MAX_DEFINITION_FILE_BYTES`）は
+/// ファイルサイズの上限のみでラベル（選択肢）件数の上限を持たないため、
+/// ここで確保前に拒否する（REQ-39 ガード層「資源の上限」）。
+/// `MAX_LABELS`（4096）の下での最大確保量は
+/// `4096 * 4099 * 8 byte` ≈ 134 MiB で、実用上の選択肢数（数十〜数百）に対して
+/// 十分な余裕を持ちつつ、単一の判定でプロセスを終了させうる規模の
+/// アロケーションを防ぐ。
+pub const MAX_LABELS: usize = 4096;
+
 impl ConfusionMatrix {
-    fn new(n_labels: usize) -> ConfusionMatrix {
+    /// 混同行列を確保する。`n_labels` が [`MAX_LABELS`] を超える場合、
+    /// または行列サイズの計算が桁あふれする場合は確保せずに
+    /// [`EvalError::TooManyLabels`] / [`EvalError::Internal`] を返す
+    /// （REQ-39: 確保前にサイズを検証する）。
+    fn new(n_labels: usize) -> Result<ConfusionMatrix, EvalError> {
+        if n_labels > MAX_LABELS {
+            return Err(EvalError::TooManyLabels {
+                n_labels,
+                limit: MAX_LABELS,
+            });
+        }
         // 列数はラベル数 + 3（Invalid・Abstain・Error）。
-        let n_columns = n_labels.saturating_add(3);
-        ConfusionMatrix {
+        let n_columns = n_labels.checked_add(3).ok_or_else(|| EvalError::Internal {
+            detail: "confusion matrix column count overflow".to_string(),
+        })?;
+        // 総セル数を確保前に checked 演算で確認する（`MAX_LABELS` の検証済み
+        // 範囲では桁あふれしないが、上限値そのものの整合性を守るため残す）。
+        n_labels
+            .checked_mul(n_columns)
+            .ok_or_else(|| EvalError::Internal {
+                detail: "confusion matrix cell count overflow".to_string(),
+            })?;
+        Ok(ConfusionMatrix {
             rows: vec![vec![0u64; n_columns]; n_labels],
             n_labels,
-        }
+        })
     }
 
     fn column_index(&self, column: ConfusionColumn) -> Option<usize> {
@@ -339,7 +390,7 @@ pub fn evaluate_single_select(
     }
 
     let n_labels = labels.len();
-    let mut confusion = ConfusionMatrix::new(n_labels);
+    let mut confusion = ConfusionMatrix::new(n_labels)?;
     let mut support = vec![0u64; n_labels];
     let mut predicted_count = vec![0u64; n_labels];
     let mut outcome_counts = OutcomeCounts::default();
@@ -584,6 +635,42 @@ mod tests {
         let records: Vec<EvalRecord> = vec![];
         let result = evaluate_single_select(&["A", "B"], &records);
         assert_eq!(result, Err(EvalError::EmptyRecords));
+    }
+
+    /// REQ-39・TASK-24.1-1（codex/review 指摘対応）: ラベル数が [`MAX_LABELS`]
+    /// を超える場合、混同行列を確保する前に `TooManyLabels` で拒否する。
+    #[test]
+    fn too_many_labels_is_rejected_before_allocation() {
+        let owned_labels: Vec<String> = (0..=MAX_LABELS).map(|i| format!("L{i}")).collect();
+        let labels: Vec<&str> = owned_labels.iter().map(String::as_str).collect();
+        let outcome = Outcome::Label("L0".to_string());
+        let records = vec![EvalRecord {
+            gold: "L0",
+            outcome: &outcome,
+        }];
+        let result = evaluate_single_select(&labels, &records);
+        assert_eq!(
+            result,
+            Err(EvalError::TooManyLabels {
+                n_labels: MAX_LABELS + 1,
+                limit: MAX_LABELS,
+            })
+        );
+    }
+
+    /// REQ-39・TASK-24.1-1: ちょうど [`MAX_LABELS`] 件のラベルは許容される
+    /// （境界値。超過のみを拒否し、上限そのものは正常に処理できることを確認する）。
+    #[test]
+    fn max_labels_boundary_is_accepted() {
+        let owned_labels: Vec<String> = (0..MAX_LABELS).map(|i| format!("L{i}")).collect();
+        let labels: Vec<&str> = owned_labels.iter().map(String::as_str).collect();
+        let outcome = Outcome::Label("L0".to_string());
+        let records = vec![EvalRecord {
+            gold: "L0",
+            outcome: &outcome,
+        }];
+        let result = evaluate_single_select(&labels, &records);
+        assert!(result.is_ok());
     }
 
     /// REQ-24・TASK-24.1-1: 未知の正解ラベルはインデックス付きでエラーになる。
