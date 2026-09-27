@@ -374,6 +374,16 @@ pub fn evaluate_single_select(
     if records.is_empty() {
         return Err(EvalError::EmptyRecords);
     }
+    // REQ-39（ガード層・資源の上限）: `labels` 件数の検証は索引（`BTreeMap`）
+    // 構築より前に行う。索引構築自体が `labels` 全件の挿入・文字列比較を伴う
+    // ため、`ConfusionMatrix::new` の確保前検証（後段）だけでは上限超過の
+    // 入力でも索引構築が先に走ってしまう（codex/review 指摘）。
+    if labels.len() > MAX_LABELS {
+        return Err(EvalError::TooManyLabels {
+            n_labels: labels.len(),
+            limit: MAX_LABELS,
+        });
+    }
 
     // ラベル ID → 宣言順の添字。`BTreeMap` を使い、`HashMap` によるハッシュ順の
     // 非決定性を避ける（.claude/rules/coding-rust.md「数値・決定性」）。
