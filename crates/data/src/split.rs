@@ -56,6 +56,20 @@ pub enum Split {
 }
 
 /// 分割比率（既定 0.8 / 0.1 / 0.1。PoC-9・PoC-10 の実測値）。
+///
+/// # `alloc_counts` による丸めと非対称な最低件数保証
+///
+/// `n`（group 件数）が 3 以上の場合、[`alloc_counts`] は各比率を `floor(n * ratio)`
+/// で丸めたのち、**validation にのみ**無条件で最低 1 件を保証する（不足分は train
+/// から差し引く）。test は train を差し引いた残りとして計算され、それでも 0 件に
+/// なる場合に限り train から 1 件を差し引いて補う（train が既に 0 件のときは補えず
+/// 0 件のままになる）。この結果、`validation` と `test` のどちらかが `0.0` の
+/// 比率でも、実際に割り付けられる件数は非対称になる
+/// （`train=1.0, validation=0.0, test=0.0` は `n=10` で `(8, 1, 1)` になる一方、
+/// `train=0.0, validation=1.0, test=0.0` は `n=10` で `(0, 10, 0)` のままになる）。
+/// `validate()` はこの非対称性を理由に比率を拒否しない（`0.0` 自体は許容区間内の
+/// 正当な値のため）。呼び出し側が正確な件数を必要とする場合は、`0.0` を含む比率
+/// を渡す前にこの丸め規則を踏まえて設計すること。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitRatios {
     pub train: f64,
@@ -138,6 +152,14 @@ pub enum SplitError {
 /// `docs/spec/03-poc/scratch-classifier/scripts/split_train.py`（PoC-9・PoC-10。REQ-17 根拠）の
 /// `alloc_counts` と同じ割付規則を移植したもの。常に `train + validation + test == n` を保つ
 /// （呼び出し側の設定ミスでも panic しない。coding-rust.md）。
+///
+/// `n >= 3` の場合、validation は `floor(n * ratios.validation)` が 0 でも
+/// 無条件で最低 1 件に底上げされ、不足分は train から差し引かれる。test には
+/// 同等の底上げは行われず、「train を差し引いた残りが 0 件のときに限り、
+/// train からさらに 1 件差し引いて補う」という弱い保証のみを持つ（train が
+/// 既に 0 件ならこの補いも効かない）。この非対称性は移植元 PoC-9 の
+/// `alloc_counts` の挙動をそのまま踏襲したもので、[`SplitRatios`] のドキュメントに
+/// 詳細と具体例を記載している。
 fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
     match n {
         0 => (0, 0, 0),
@@ -356,29 +378,38 @@ mod tests {
     use super::*;
 
     /// テスト用の最小レコード（`Groupable` の実装確認を兼ねる）。
+    ///
+    /// フィールドは `String` で保持する（`&'static str` + `Box::leak` は
+    /// テスト実行のたびにメモリを解放せず漏らすため使わない。テストのみの
+    /// 影響とはいえ、動的に生成する ID・group_id を扱うテストで漏れが
+    /// 積み上がるのを避ける）。
     struct TestRecord {
-        id: &'static str,
-        group_id: &'static str,
-        label: &'static str,
+        id: String,
+        group_id: String,
+        label: String,
     }
 
     impl Groupable for TestRecord {
         fn id(&self) -> &str {
-            self.id
+            &self.id
         }
         fn group_id(&self) -> &str {
-            self.group_id
+            &self.group_id
         }
         fn label(&self) -> &str {
-            self.label
+            &self.label
         }
     }
 
-    fn record(id: &'static str, group_id: &'static str, label: &'static str) -> TestRecord {
+    fn record(
+        id: impl Into<String>,
+        group_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> TestRecord {
         TestRecord {
-            id,
-            group_id,
-            label,
+            id: id.into(),
+            group_id: group_id.into(),
+            label: label.into(),
         }
     }
 
@@ -392,6 +423,29 @@ mod tests {
         assert_eq!(alloc_counts(3, &ratios), (1, 1, 1));
         assert_eq!(alloc_counts(4, &ratios), (2, 1, 1));
         assert_eq!(alloc_counts(10, &ratios), (8, 1, 1));
+    }
+
+    /// REQ-17・TASK-17.1-1: alloc_counts の validation / test への最低 1 件保証は
+    /// 非対称であることをピン留めする（[`SplitRatios`] のドキュメントコメントで
+    /// 明記した仕様どおりの挙動であることの回帰確認）。
+    #[test]
+    fn req17_task17_1_1_alloc_counts_min_guarantee_is_asymmetric() {
+        // validation=0.0 でも n>=3 なら無条件で 1 件に底上げされ、train から差し引かれる。
+        let train_only = SplitRatios {
+            train: 1.0,
+            validation: 0.0,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(10, &train_only), (8, 1, 1));
+
+        // validation=1.0 のときは test への同等の底上げは行われない
+        // （train が既に 0 件で補えないため test は 0 件のまま）。
+        let validation_only = SplitRatios {
+            train: 0.0,
+            validation: 1.0,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(10, &validation_only), (0, 10, 0));
     }
 
     /// REQ-17・TASK-17.1-1: alloc_counts は常に train + validation + test == n を保つ。
@@ -424,13 +478,11 @@ mod tests {
             } else {
                 "intent_b"
             };
-            let group_id: &'static str = Box::leak(format!("group-{group_index}").into_boxed_str());
+            let group_id = format!("group-{group_index}");
             let n_records_in_group = 2 + (group_index % 4);
             for record_index in 0..n_records_in_group {
-                let id: &'static str = Box::leak(
-                    format!("group-{group_index}-record-{record_index}").into_boxed_str(),
-                );
-                records.push(record(id, group_id, label));
+                let id = format!("group-{group_index}-record-{record_index}");
+                records.push(record(id, group_id.clone(), label));
             }
         }
 
@@ -493,6 +545,28 @@ mod tests {
             result_1.by_group, expected_by_group,
             "ピン留めした期待値と一致しない（PRNG の実装が変わった可能性がある）"
         );
+
+        // per_label もピン留めする（by_group だけでなく割付内訳の具体値を回帰確認する）。
+        let expected_per_label = vec![
+            LabelAllocation {
+                label: "a".to_string(),
+                n_groups: 4,
+                train: 2,
+                validation: 1,
+                test: 1,
+            },
+            LabelAllocation {
+                label: "b".to_string(),
+                n_groups: 3,
+                train: 1,
+                validation: 1,
+                test: 1,
+            },
+        ];
+        assert_eq!(
+            result_1.per_label, expected_per_label,
+            "per_label がピン留めした期待値と一致しない"
+        );
     }
 
     /// REQ-17・TASK-17.1-1: 異なる seed では少なくとも 1 group の割付が変わる。
@@ -500,8 +574,8 @@ mod tests {
     fn req17_task17_1_1_different_seed_can_change_allocation() {
         let mut records = Vec::new();
         for group_index in 0..12 {
-            let group_id: &'static str = Box::leak(format!("group-{group_index}").into_boxed_str());
-            let id: &'static str = Box::leak(format!("record-{group_index}").into_boxed_str());
+            let group_id = format!("group-{group_index}");
+            let id = format!("record-{group_index}");
             records.push(record(id, group_id, "a"));
         }
 
