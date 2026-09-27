@@ -1,4 +1,4 @@
-"""バイト入力へのエンコード（C3 のトークン化）。
+"""バイト入力へのエンコード（C1・C3 共通のトークン化）。
 
 Rust 側 `preprocess.rs`（PoC-16。`docs/spec/03-poc/core-cli-vertical-slice/core/src/
 preprocess.rs`）の `normalize_input` + `encode_bytes` と byte-identical になるよう
@@ -6,8 +6,18 @@ Python 側で独立に実装したもの。**この二重実装は意図的な�
 トークン化の規則を 1 箇所に集約する将来方針（REQ-15 は共通コアのハッシュ正準化が
 対象で、本エンコードはそれとは別の推論前処理だが同様に一元化が望ましい）に反する。
 学習ワーカー（Python）と推論ランタイム（Rust。REQ-32 により学習側を import できない）
-は別プロセス・別言語であるため、当面はテスト（本ファイルの単体テスト・
-`docs/spec` の PoC-16 テストベクタとの突き合わせ）で乖離を検出する。
+は別プロセス・別言語であるため、当面は本リポ内 SSOT（`fixtures/preprocess/
+byte_encoding_vectors.json`。`docs/spec` には依存しない。spec-reference.md）に対する
+テスト（`trainer/tests/test_encoding.py`）で乖離を検出する。
+
+将来仕様（Chore #10 Deliverable B。TASK-15.2 以降）: Rust workspace 作成後、推論
+ランタイム crate（`preprocess.rs` 由来）にも同じ `fixtures/preprocess/
+byte_encoding_vectors.json` を読み込んで一致検証するテストを追加し、両言語の
+実装を 1 つの SSOT ベクタで機械照合する。Rust 側で NFKC 正規化を行うには
+`unicode-normalization` crate の追加が要るが、これは依存追加であり
+dependency-policy.md によりユーザー承認事項（バージョンは実装着手時点の
+最新 0.1.x パッチ版を提示して確認する。PoC の `"0.1"` という範囲指定は
+本リポの完全固定方針〔`=x.y.z`〕に反するため、そのままでは使えない）。
 
 正規化: Unicode NFKC → 前後の空白除去 → 内部の連続空白を半角スペース 1 つへ圧縮
 （Python の `str.split()`/`str.strip()` は U+001C-U+001F の情報分離子も空白として

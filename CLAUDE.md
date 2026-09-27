@@ -31,6 +31,7 @@ fandhe-edge-model/
 ├── Cargo.toml                      #（予定）workspace 定義
 ├── crates/                        #（予定）6 層に対応する crate 群（共通コア・データ契約・評価器・推論ランタイム・CLI 等）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）を実装済み（MLX 学習・ONNX 書き出し）。選定（TASK-18.x）・作り直し判定（TASK-20.x）・ジョブ管理（REQ-34）は未着手
+├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）
 ├── docs/
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・python-ci・update-external（稼働）/ ci・release（発火条件無効化中）
