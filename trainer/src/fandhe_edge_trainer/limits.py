@@ -161,13 +161,17 @@ MAX_C3_WEIGHT_DECAY = 1.0
 # 以下の各定数は 現行値=既存実装のとおり／状態=オーナー確認待ち（Issue #11。
 # 現状維持を推奨する論点として提示）で共通する。根拠・証拠種別は定数ごとに
 # 異なる: `MAX_C1_NGRAM`（int64 演算の範囲からの計算根拠あり）・
-# `MAX_C1_C`（float32 の有限性からの計算根拠あり）・`MAX_C1_BATCH_ELEMENTS`
+# `MIN_C1_C`（float32 の有限性からの計算根拠あり）・`MAX_C1_BATCH_ELEMENTS`
 # （確保テンソルの積からの計算根拠あり）は証拠種別=推定（計算根拠あり）。
 # `MAX_C1_VOCAB_CANDIDATES`・`MAX_C1_VOCAB_CHUNK_WINDOW_ELEMENTS` は目標値から
 # 逆算したメモリ見積もりの記載があるため証拠種別=推定（計算根拠あり）。
-# `MIN_C1_MIN_DF`・`MAX_C1_MIN_DF`・`MAX_C1_MAX_FEATURES`・
+# `MIN_C1_MIN_DF`・`MAX_C1_MIN_DF`・`MAX_C1_MAX_FEATURES`・`MAX_C1_C`・
 # `MAX_C1_SPARSE_ELEMENTS`・`MAX_C1_EPOCHS`・`MAX_C1_BATCH_SIZE`・`MAX_C1_LR`
 # は具体的な数値を導く計算式を持たないため証拠種別=仮置き（根拠=仮置き）。
+# `MAX_C1_C` は `MIN_C1_C` と対で並べているが、下限のような有限性からの計算式は
+# 持たない（`l2_coef = 0.5 / (C * n_examples)` は C が大きいほど 0 に近づく
+# だけで非有限にはならないため、上限を導く計算根拠にはならない。レビュー
+# 指摘〔codex, Issue #11 PR #15〕）。
 # --------------------------------------------------------------------------
 
 #: n-gram の n の許容上限。base-257 キー化（`kinds/c1.py::_ngram_keys`）は
@@ -186,9 +190,18 @@ MAX_C1_MIN_DF = MAX_TRAIN_EXAMPLES
 MAX_C1_MAX_FEATURES = 2_000_000
 
 #: sklearn 風の正則化強度 `C`（大きいほど正則化が弱い）の許容範囲。
-#: 下限は罰則係数 `0.5 / (C * n_examples)` が float32 でも有限に収まるための値
-#: （C=1e-6・n_examples=1 で係数 5e5）。これより小さい C は係数が発散し、設定
-#: 誤りが `training_diverged` に化けるため `invalid_config` で拒否する。
+#: 下限（`MIN_C1_C`）は罰則係数 `0.5 / (C * n_examples)` が float32 でも
+#: 有限に収まるための値（C=1e-6・n_examples=1 で係数 5e5）。これより小さい C
+#: は係数が発散し、設定誤りが `training_diverged` に化けるため `invalid_config`
+#: で拒否する。根拠: REQ-39（計算式あり）。証拠種別: 推定（計算根拠あり）。
+#:
+#: 上限（`MAX_C1_C`）は `MIN_C1_C` と対称に置いているが、C が大きいほど
+#: 罰則係数は 0 に近づくだけで非有限にはならないため、下限と同種の計算根拠は
+#: 持たない（正則化が実質ゼロに近づく設定を許容し続けてよいかという妥当性の
+#: 論点であり、有限性の論点ではない）。現行値 1.0e6 は具体的な数値を導く
+#: 計算式を持たない暫定値。根拠: 仮置き。証拠種別: 仮置き。
+#: 状態: オーナー確認待ち（Issue #11。レビュー指摘〔codex, PR #15〕により
+#: 証拠種別を「推定」から「仮置き」へ訂正）。
 MIN_C1_C = 1.0e-6
 MAX_C1_C = 1.0e6
 
