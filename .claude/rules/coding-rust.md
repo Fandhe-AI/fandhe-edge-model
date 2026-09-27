@@ -8,7 +8,7 @@
 
 ## crate 構成と層の境界
 
-- 層は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う。crate は `crates/<name>/` の 1 階層に配置。確定済み: `crates/core/`（`fandhe-edge-core`）・`crates/data/`（`fandhe-edge-data`。現時点は group 単位分割のみ）・`crates/cli/`（`fandhe-edge-cli`）。残りの層の crate は後続 TASK で追加する（PoC-16 の `03-poc/core-cli-vertical-slice/core`〔`edge_core`〕を M6・M8・M9 の骨格として移植する計画。`06-roadmap.md`）
+- 層は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う。crate は `crates/<name>/` の 1 階層に配置。確定済み: `crates/core/`（`fandhe-edge-core`）・`crates/cli/`（`fandhe-edge-cli`）・`crates/data/`（`fandhe-edge-data`。検査・group 単位分割を実装済み。TASK-16.1-1・#38・TASK-17.1-1・#44）。残りの層の crate は後続 TASK で追加する（PoC-16 の `03-poc/core-cli-vertical-slice/core`〔`edge_core`〕を M6・M8・M9 の骨格として移植する計画。`06-roadmap.md`）
 - 依存は一方向に保つ: 共通コアはどの層にも依存しない。評価器は TASK-24.1 の 1 つだけに集約し、他の層で評価ロジックを再実装しない
 - **推論ランタイムは学習側（学習ワーカー・学習用依存）に依存しない**（REQ-32。[dependency-policy](./dependency-policy.md)）。推論経路のコードに学習用 crate・Python 呼び出しを持ち込まない
 - 操作アダプター（CLI・TUI・MCP）は薄く保ち、業務ロジックは下位層に置く。入出力契約は CLI の 1 つに集約し、TUI・MCP は CLI と同じ契約を使う（REQ-33・REQ-36・REQ-37）

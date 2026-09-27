@@ -28,12 +28,12 @@
 
 ## scope
 
-scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2 crate のパスが確定し、残りの層のパスは crate 追加時に本表へ反映する。
+scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2 crate、TASK-16.1-1（#38）・TASK-17.1-1（#44）で data crate（検査・group 単位分割ロジック）のパスが確定し、残りの層のパスは crate 追加時に本表へ反映する。
 
 | scope | 対象 | パス |
 | ----- | ---- | ---- |
 | core | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） |
-| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`） |
+| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割を実装済み。凍結・来歴・読み取り専用配置は未着手） |
 | train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python） |
 | eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | 未確定 |
 | runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 |

@@ -7,5 +7,12 @@ repository.workspace = true
 publish.workspace = true
 description = "Data contract layer (record inspection, group-wise split and freeze, provenance) for fandhe-edge-model."
 
+[dependencies]
+# 定義ファイルのスキーマ（TASK-15.3・#32〜#34）は実装済みだが、`inspect` は
+# 意図的に `fandhe-edge-core` に依存しない（crates/data/src/lib.rs の
+# doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う
+# （`split` は追加の外部依存を必要としない）。
+serde_json.workspace = true
+
 [lints]
 workspace = true
