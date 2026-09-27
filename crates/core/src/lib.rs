@@ -25,3 +25,5 @@
 //! 後続 TASK（TASK-15.3 以降）で追加する。
 
 pub mod definition;
+pub mod eval_data;
+pub mod hash;
