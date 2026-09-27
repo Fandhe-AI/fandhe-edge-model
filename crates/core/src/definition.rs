@@ -19,8 +19,13 @@
 //!   enum 外の値を型付きの `DefinitionError` バリアントで返す。`name` の
 //!   空文字列は `EmptyName` として拒否する
 //! - TASK-15.4: ラベル定義非同梱の `missing_labels` 判定
-//! - TASK-15.5: 正準化ハッシュ（`options`・`judgment_type` を用いた作り直し要否判定。
-//!   `docs/spec/03-poc/model-lifecycle/scripts/catalog.py` の `canon_hash`/`need_rebuild` を踏襲）
+//! - TASK-15.5（本ファイル + `canonical` モジュール）: 定義の同一性
+//!   （`DefinitionIdentity`。選択肢 ID の集合＋`judgment_type`）と、定義全体の
+//!   正準化ハッシュ（`DefinitionHash`）を提供する。正準化の規則・sha256 計算は
+//!   `canonical` モジュールに集約し（REQ-15「正準化の規則を1箇所に集約する」）、
+//!   本ファイルには薄いアクセサ（[`Definition::identity`]・
+//!   [`Definition::canonical_json`]・[`Definition::canonical_hash`]）のみを置く。
+//!   作り直し要否の判定そのもの（TASK-20.1〜20.3）は本 TASK の対象外
 //!
 //! # 出典
 //! フィールド構成は PoC-19（`03-poc/model-lifecycle/definitions/catalog_*.json`）の
@@ -743,6 +748,31 @@ impl Definition {
     /// 入出力のデータ構造。
     pub fn io(&self) -> &IoSchema {
         &self.io
+    }
+
+    /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
+    /// `version`・選択肢の宣言順は含めない。TASK-15.5・境界値。REQ-15）。
+    /// 失敗しない（既に検証済みのフィールドから組み立てるだけのため）。
+    #[must_use]
+    pub fn identity(&self) -> crate::canonical::DefinitionIdentity {
+        crate::canonical::DefinitionIdentity::from_definition(self)
+    }
+
+    /// 定義全体（表示名・説明を含む）を正準化した JSON 文字列。記録・デバッグ
+    /// 用（TASK-15.5）。正準化の規則は `canonical` モジュールに集約している。
+    pub fn canonical_json(&self) -> Result<String, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_json(self)
+    }
+
+    /// 定義全体を正準化した JSON の sha256（TASK-15.5）。TASK-20.3（#93）の
+    /// 「新旧定義の正準化ハッシュが完全一致したら変更なし」判定に使う。
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<crate::canonical::DefinitionHash, crate::canonical::CanonicalError> {
+        let json = self.canonical_json()?;
+        Ok(crate::canonical::DefinitionHash::from_json_bytes(
+            json.as_bytes(),
+        ))
     }
 
     /// `load` の内部専用: Linux・macOS 以外（Windows 等）向けのフォールバック。

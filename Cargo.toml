@@ -30,6 +30,10 @@ fandhe-edge-data = { path = "crates/data" }
 # 推移的依存（itoa・memchr・zmij）は変更なし）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+# sha2 は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
+# 「承認済みの依存」表。正準化ハッシュ〔TASK-15.5〕の sha256 計算に使う。
+# PoC-16 の `shasum` 子プロセス起動を置き換え、OS・外部コマンドに依存させない）。
+sha2 = "=0.11.0"
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で
