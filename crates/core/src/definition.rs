@@ -306,8 +306,11 @@ pub enum DefinitionError {
         actual: JsonType,
     },
     /// 定義ファイルのスキーマが許可しない未知のキーを含む（TASK-15.3-2）。
-    /// `name` は利用者入力のため、`Display` では先頭 64 文字に切り詰めて
-    /// エスケープする（security.md「秘密情報の混入防止」）。
+    /// `name`（利用者が任意に指定できるキー名）は秘密情報やデータ本文を
+    /// 含みうるため `Display` には一切出さず、親フィールドのパスと
+    /// `reason_code()`（`unknown_field`）のみで表す
+    /// （security.md「秘密情報の混入防止」。PR #197 レビュー指摘）。
+    /// `name` はプログラム的な照合（テスト・診断）のためにのみ保持する。
     UnknownField { parent: FieldPath, name: String },
     /// フィールドは正しい型だが、許可された値の集合に含まれない
     /// （例: `judgment_type: "multi_select"`。TASK-15.3-2）。値そのものは
@@ -368,12 +371,8 @@ impl std::fmt::Display for DefinitionError {
                     "definition field {field} has wrong type: expected {expected}, found {actual}"
                 )
             }
-            DefinitionError::UnknownField { parent, name } => {
-                write!(
-                    f,
-                    "definition field {parent} has unknown key {:?}",
-                    truncate_untrusted_key(name)
-                )
+            DefinitionError::UnknownField { parent, .. } => {
+                write!(f, "definition field {parent} has an unknown key")
             }
             DefinitionError::UnsupportedValue { field } => {
                 write!(f, "definition field {field} has an unsupported value")
@@ -382,23 +381,6 @@ impl std::fmt::Display for DefinitionError {
                 write!(f, "definition name must not be empty")
             }
         }
-    }
-}
-
-/// 未知キー名（利用者入力）を `Display` へ出す前に切り詰める
-/// （security.md「秘密情報の混入防止」: 学習・評価データ本文をエラー文へ
-/// 出さない方針を、定義ファイルの任意キー名にも適用する）。
-///
-/// 64 文字（`char` 単位）を超える場合は切り詰めて `...` を付ける。
-/// `{:?}`（呼び出し元）でエスケープされるため、ここでは長さのみ制御する。
-fn truncate_untrusted_key(name: &str) -> String {
-    const MAX_KEY_DISPLAY_CHARS: usize = 64;
-    if name.chars().count() <= MAX_KEY_DISPLAY_CHARS {
-        name.to_string()
-    } else {
-        let mut truncated: String = name.chars().take(MAX_KEY_DISPLAY_CHARS).collect();
-        truncated.push_str("...");
-        truncated
     }
 }
 
@@ -1247,6 +1229,19 @@ mod tests {
         type_mismatch_value["options"][0]["description"] = serde_json::json!(12345);
         let err = parse_value(&type_mismatch_value).unwrap_err();
         assert!(!err.to_string().contains("12345"));
+    }
+
+    /// PR #197 レビュー指摘（P0）: 未知キーの「名前」自体も利用者が任意に
+    /// 指定できる入力であり、秘密情報やデータ本文が入りうるため、
+    /// `Display` に一切出さない（security.md「秘密情報の混入防止」）。
+    #[test]
+    fn req15_display_does_not_leak_unknown_field_name() {
+        let mut value = valid_definition_value();
+        value["s3cr3t-api-key-should-not-leak"] = serde_json::json!(1);
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::UnknownField { .. }));
+        assert!(!err.to_string().contains("s3cr3t-api-key-should-not-leak"));
+        assert_eq!(err.reason_code(), "unknown_field");
     }
 
     #[test]
