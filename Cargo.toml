@@ -20,10 +20,14 @@ publish = false
 # 依存は `=x.y.z` の完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 推論ランタイム側の crate に学習側の依存（Python 呼び出し・MLX 等）を持ち込まない（REQ-32）。
 # workspace 内の crate 間依存（path 依存）もここへ集約し、各 crate は `workspace = true` で継承する。
-# 外部の共通依存: serde・serde_json（.claude/rules/dependency-policy.md「承認済みの依存」表。
-# 2026-09-27 オーナー承認。定義ファイル・JSON 入出力の型への読み込みに使う）。
 fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
+# serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
+# 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の
+# 「配置する層」は共通コア（TASK-15.3〜15.5）に加え、データ契約層（crates/data。
+# TASK-16.1-1・issue #38）にも 2026-09-27 オーナー承認済み（PR #191 のレビュー指摘への
+# 対応として PR #193 で承認記録を追記。バージョン・ライセンス（MIT OR Apache-2.0）・
+# 推移的依存（itoa・memchr・zmij）は変更なし）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 
