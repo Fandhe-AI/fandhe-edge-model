@@ -34,7 +34,9 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    内容を固定して渡すことでこれを防ぐ）。
 2. `contract.prepare_out_dir` で `out_dir` を排他的に予約し、作業用の一時
    ディレクトリを作る（`OutDirReservation`。`tmp_fd` を含む）。
-3. `python -m fandhe_edge_trainer _worker --out-fd <tmp_fd>` を子プロセスとして
+3. `<sys.executable> -I <trainer/launch.py の絶対パス> _worker --out-fd <tmp_fd>`
+   （`worker_argv` が組み立てる argv。Issue #12: `-I`〔隔離モード〕で呼び出し元の
+   `PYTHONPATH` 等に依存せず `trainer/src` を解決する）を子プロセスとして
    起動する（新しいプロセスグループ。`os.killpg` で子とその子孫をまとめて
    強制終了できるようにする。`pass_fds=(tmp_fd,)` で一時ディレクトリの fd
    だけを引き継がせる）。リクエストの内容は `--request <path>` では渡さない。
@@ -107,6 +109,11 @@ _MAX_WORKER_STDOUT_BYTES = 1 * 1024 * 1024
 
 #: `ps` の絶対パス（`shell=True` を使わず、`PATH` に依存しない）。
 _PS_BIN = "/bin/ps"
+
+#: `trainer/launch.py`（学習ワーカーの唯一の起動口。Issue #12）の絶対パス。
+#: 本ファイル（`src/fandhe_edge_trainer/supervisor.py`）から見て 2 階層上が
+#: `trainer/` になる。
+_LAUNCH_SCRIPT = Path(__file__).resolve().parent.parent.parent / "launch.py"
 
 #: 7 種の終了コード（REQ-21）。子プロセスの終了コードがこの集合に無ければ
 #: `runtime_error` として扱う。
@@ -362,6 +369,27 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         reservation.entry.close()  # request.out_dir と同一オブジェクト
 
 
+def worker_argv(out_fd: int) -> list[str]:
+    """`_worker` を起動する argv を組み立てる（Issue #12）。
+
+    `[sys.executable, "-I", <trainer/launch.py の絶対パス>, "_worker",
+    "--out-fd", str(out_fd)]` を返す。`-m fandhe_edge_trainer` ではなく
+    `trainer/launch.py`（`-I` 付き）を経由することで、呼び出し元の
+    `PYTHONPATH` の設定漏れ・汚染に左右されず `trainer/src` を解決できる
+    （`launch.py` のモジュール docstring 参照）。テスト（`tests/test_cli.py`
+    の `test_worker_rejects_non_regular_stdin_without_blocking`）も本関数を
+    再利用し、実際の起動経路と同じ argv で検証する。
+    """
+    return [
+        sys.executable,
+        "-I",
+        str(_LAUNCH_SCRIPT),
+        "_worker",
+        "--out-fd",
+        str(out_fd),
+    ]
+
+
 def _spawn_worker_and_finalize(
     raw_request: bytes,
     reservation: contract.OutDirReservation,
@@ -369,14 +397,7 @@ def _spawn_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
 ) -> ExitCode:
-    argv = [
-        sys.executable,
-        "-m",
-        "fandhe_edge_trainer",
-        "_worker",
-        "--out-fd",
-        str(reservation.tmp_fd),
-    ]
+    argv = worker_argv(reservation.tmp_fd)
     # P1: 検証済みのリクエスト（raw_request）を、作成直後に unlink 済みの
     # 無名一時ファイル（stdlib のみ。mlx・onnx・numpy を import しない設計を
     # 崩さない）へ書いて子プロセスの標準入力として渡す。`--request <path>` は
