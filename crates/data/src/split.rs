@@ -69,6 +69,12 @@ pub enum Split {
 /// を作らない」という意図で渡せる正当な値）と実際の分割結果を一致させるための
 /// 規則であり、`0.0` 未満の極小な非ゼロ比率（丸めで 0 件になる値）には従来どおり
 /// 最低 1 件保証を適用する（意図しない空 split を避けるため）。
+///
+/// `n` が 1・2 件の場合（[`alloc_counts_tiny`]）も同じ規則に従い、比率が厳密に
+/// `0.0` の split には一切割り付けない（`train=0.0, validation=1.0, test=0.0` は
+/// `n=1` で `(0, 1, 0)`、`n=2` で `(0, 2, 0)` になる）。比率が全て非ゼロの場合は
+/// 比率降順（同率は Train > Test > Validation の順）に 1 件ずつ配るため、
+/// 既定比率では `n=1` は `(1, 0, 0)`、`n=2` は `(1, 0, 1)` になる。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitRatios {
     pub train: f64,
@@ -162,18 +168,19 @@ pub enum SplitError {
 /// `alloc_counts` と同じ割付規則を移植したもの。常に `train + validation + test == n` を保つ
 /// （呼び出し側の設定ミスでも panic しない。coding-rust.md）。
 ///
-/// `n >= 3` の場合、validation は比率が厳密に `0.0` でない限り
-/// `floor(n * ratios.validation)` が 0 でも最低 1 件に底上げされ、不足分は
-/// train から差し引かれる。test も比率が厳密に `0.0` でない限り、
-/// 「train を差し引いた残りが 0 件のときに限り、train からさらに 1 件差し引いて
-/// 補う」という保証を持つ（train が既に 0 件ならこの補いも効かない）。
-/// validation・test いずれも比率が厳密に `0.0` の場合はこの底上げを一切適用せず
-/// 常に 0 件を返す（`SplitRatios` のドキュメントコメントに詳細と具体例を記載）。
+/// `n` が 1・2 件の場合は [`alloc_counts_tiny`] に委譲する（比率降順・同率は
+/// Train > Test > Validation の優先順で 1 件ずつ配る）。`n >= 3` の場合、
+/// validation は比率が厳密に `0.0` でない限り `floor(n * ratios.validation)` が
+/// 0 でも最低 1 件に底上げされ、不足分は train から差し引かれる。test も比率が
+/// 厳密に `0.0` でない限り、「train を差し引いた残りが 0 件のときに限り、
+/// train からさらに 1 件差し引いて補う」という保証を持つ（train が既に 0 件なら
+/// この補いも効かない）。validation・test いずれも比率が厳密に `0.0` の場合は
+/// この底上げを一切適用せず常に 0 件を返す（`SplitRatios` のドキュメントコメントに
+/// 詳細と具体例を記載）。
 fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
     match n {
         0 => (0, 0, 0),
-        1 => (1, 0, 0),
-        2 => (1, 0, 1),
+        1 | 2 => alloc_counts_tiny(n, ratios),
         _ => {
             #[allow(clippy::cast_precision_loss)]
             let n_f64 = n as f64;
@@ -208,6 +215,56 @@ fn alloc_counts(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
             (n_train, n_val, n_test)
         }
     }
+}
+
+/// `n` が 1 件・2 件の場合の割付規則（[`alloc_counts`] から委譲される）。
+///
+/// `n >= 3` の一般規則（floor 丸め + 最低件数保証）をそのまま 1〜2 件に適用すると
+/// 既定比率（0.8/0.1/0.1）でも group を validation へ配ってしまい、PoC-9 の想定
+/// （少数 group は train・test を優先する）から外れるため、別規則を用いる。
+/// 比率が厳密に `0.0` の split は候補から除外して割り付け対象にしない（公開 API の
+/// 比率指定を尊重する。codex/review 指摘 #44 対応）。残った候補を比率降順で並べ、
+/// 同率の場合は Train > Test > Validation の固定順でタイブレークする（既定比率は
+/// validation と test が同率 0.1 だが、`n=2` で train・test に 1 件ずつ配る PoC-9 の
+/// 挙動を保つための順序）。候補が 1 つしかない場合は `n` 件すべてをその split に配る。
+/// `ratios.validate()` が呼び出し元（`split_by_group`）で必ず先に呼ばれるため、
+/// 比率の合計は約 1.0 であり候補が空になることはない（万一空でも 0 件のまま返す）。
+fn alloc_counts_tiny(n: usize, ratios: &SplitRatios) -> (usize, usize, usize) {
+    let priority_rank = |split: Split| -> u8 {
+        match split {
+            Split::Train => 0,
+            Split::Test => 1,
+            Split::Validation => 2,
+        }
+    };
+
+    let mut candidates: Vec<(Split, f64)> = [
+        (Split::Train, ratios.train),
+        (Split::Validation, ratios.validation),
+        (Split::Test, ratios.test),
+    ]
+    .into_iter()
+    .filter(|(_, ratio)| *ratio > 0.0)
+    .collect();
+    candidates.sort_by(|(split_a, ratio_a), (split_b, ratio_b)| {
+        ratio_b
+            .partial_cmp(ratio_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| priority_rank(*split_a).cmp(&priority_rank(*split_b)))
+    });
+
+    let mut counts = (0usize, 0usize, 0usize);
+    for slot in 0..n {
+        let Some((split, _)) = candidates.get(slot.min(candidates.len().saturating_sub(1))) else {
+            break;
+        };
+        match split {
+            Split::Train => counts.0 += 1,
+            Split::Validation => counts.1 += 1,
+            Split::Test => counts.2 += 1,
+        }
+    }
+    counts
 }
 
 /// group 内のレコードのラベル最頻値を group の代表ラベルとする。
@@ -480,6 +537,49 @@ mod tests {
             test: 1.0,
         };
         assert_eq!(alloc_counts(10, &test_only), (0, 0, 10));
+    }
+
+    /// REQ-17・TASK-17.1-1（codex/review 指摘・PR #189）: `n` が 1・2 件の
+    /// 少数 group でも、比率が厳密に `0.0` の split には一切割り付けない。
+    /// `alloc_counts_tiny`（`n=1`・`n=2` の特殊分岐）が固定パターンで比率を
+    /// 無視していた回帰を防ぐ。
+    #[test]
+    fn req17_task17_1_1_alloc_counts_tiny_respects_zero_ratio() {
+        let train_only = SplitRatios {
+            train: 1.0,
+            validation: 0.0,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(1, &train_only), (1, 0, 0));
+        assert_eq!(alloc_counts(2, &train_only), (2, 0, 0));
+
+        // train=0.0 なら n=1・n=2 のどちらも train へ割り付けられてはならない
+        // （修正前は n=1 が (1,0,0)・n=2 が (1,0,1) に固定されていた）。
+        let validation_only = SplitRatios {
+            train: 0.0,
+            validation: 1.0,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(1, &validation_only), (0, 1, 0));
+        assert_eq!(alloc_counts(2, &validation_only), (0, 2, 0));
+
+        // test=0.0 なら n=2 で test へ割り付けられてはならない
+        // （修正前は n=2 が比率に関わらず (1,0,1) に固定されていた）。
+        let train_and_validation = SplitRatios {
+            train: 0.5,
+            validation: 0.5,
+            test: 0.0,
+        };
+        assert_eq!(alloc_counts(1, &train_and_validation), (1, 0, 0));
+        assert_eq!(alloc_counts(2, &train_and_validation), (1, 1, 0));
+
+        let test_only = SplitRatios {
+            train: 0.0,
+            validation: 0.0,
+            test: 1.0,
+        };
+        assert_eq!(alloc_counts(1, &test_only), (0, 0, 1));
+        assert_eq!(alloc_counts(2, &test_only), (0, 0, 2));
     }
 
     /// REQ-17・TASK-17.1-1: 丸めで 0 件になる極小な非ゼロ比率には、従来どおり
