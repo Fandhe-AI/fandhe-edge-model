@@ -101,11 +101,16 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         }
     }
 
+    // `options` キー自体の欠落は「ラベル定義が同梱されていない」
+    // （TASK-15.4・REQ-15 異常系。PoC-9 追補 v1.1 A-6）として `MissingLabels`
+    // を返す。`schema`/`name`/`version`/`judgment_type` の検査を通過した
+    // 後に判定するため、これらの不整合が優先される（本関数の固定走査順）。
+    // `options` キーはあるが値が空配列・不正な型のケースは区別し、後続の
+    // `as_array()` チェックと `check_option_entry` 呼び出し後の経路
+    // （`Definition::parse` 側の `EmptyOptions` 判定）に委ねる。
     let options_value = match root.get("options") {
         None => {
-            return Some(DefinitionError::MissingField {
-                field: FieldPath::Options,
-            });
+            return Some(DefinitionError::MissingLabels);
         }
         Some(v) => v,
     };
@@ -229,11 +234,10 @@ fn check_required_string(value: Option<&Value>, field: FieldPath) -> Option<Defi
 
 /// `options[index]` の 1 要素を検査する。
 ///
-/// **TASK-15.4 接続点**: `options` 自体の欠落は呼び出し元
-/// （`FieldPath::Options` の `MissingField`）で検出済みで、ここでは各要素の
-/// 必須項目のみを見る。TASK-15.4 の `missing_labels`（ラベル定義非同梱）は
-/// このモジュールの外側、`Definition::parse` 成功後の別判定として追加する
-/// 想定で、ここに手を加える必要はない。
+/// `options` キー自体の欠落は呼び出し元（`diagnose` 内、本関数の呼び出しより
+/// 前）で `DefinitionError::MissingLabels`（TASK-15.4）として検出済みで、
+/// ここには到達しない。本関数は `options` が配列として存在する場合の各要素の
+/// 必須項目のみを見る。
 fn check_option_entry(index: usize, entry: &Value) -> Option<DefinitionError> {
     let object = match entry.as_object() {
         None => {

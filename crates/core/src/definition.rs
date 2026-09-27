@@ -18,7 +18,10 @@
 //!   `serde_json::Value` として再走査し、必須項目欠落・型不整合・未知キー・
 //!   enum 外の値を型付きの `DefinitionError` バリアントで返す。`name` の
 //!   空文字列は `EmptyName` として拒否する
-//! - TASK-15.4: ラベル定義非同梱の `missing_labels` 判定
+//! - TASK-15.4（本ファイル + `diagnose` サブモジュール）: `options` キーが
+//!   同梱されていない定義入力を、既定のラベル集合へ補完せず
+//!   `DefinitionError::MissingLabels`（`reason_code() == "missing_labels"`）
+//!   で拒否する（REQ-15 異常系。根拠は PoC-9 追補 v1.1 A-6）
 //! - TASK-15.5: 正準化ハッシュ（`options`・`judgment_type` を用いた作り直し要否判定。
 //!   `docs/spec/03-poc/model-lifecycle/scripts/catalog.py` の `canon_hash`/`need_rebuild` を踏襲）
 //!
@@ -255,7 +258,8 @@ impl std::fmt::Display for JsonType {
 /// （`UnsupportedSchema`・選択肢の整合性）とサイズ上限（`TooLarge`。
 /// `Definition::parse` からも到達する。同レビュー指摘）を先行実装する。
 /// これ以外の必須項目欠落等の詳細な検証バリアントは TASK-15.3-2 が追加し、
-/// `missing_labels` 相当の判定は TASK-15.4 が追加する（`#[non_exhaustive]`）。
+/// `missing_labels` 相当の判定（`MissingLabels`）は TASK-15.4 が追加した
+/// （`#[non_exhaustive]`）。
 #[non_exhaustive]
 pub enum DefinitionError {
     Read {
@@ -291,11 +295,18 @@ pub enum DefinitionError {
     /// これらを許すと `File::open`/`read_to_end` が書き手を待って無期限に
     /// 停止しうる（security.md「ガード層: 資源の上限」。PR #187 レビュー指摘）。
     NotRegularFile { path: PathBuf },
-    /// 必須フィールドが欠落している（TASK-15.3-2）。`options` の欠落も
-    /// ここに含む。TASK-15.4 が `options` 欠落と「`options` はあるが
-    /// ラベル定義が非同梱」を区別する `MissingLabels` を追加する接続点は
-    /// `diagnose` モジュール内の該当箇所に注記する。
+    /// 必須フィールドが欠落している（TASK-15.3-2）。`options` キー自体の
+    /// 欠落は TASK-15.4 で `MissingLabels` へ切り出したため、ここには含まれ
+    /// ない（`diagnose` モジュールの走査順を参照）。
     MissingField { field: FieldPath },
+    /// 定義にラベル定義（`options`）が同梱されていない（TASK-15.4・REQ-15
+    /// 異常系。根拠は PoC-9 追補 v1.1 A-6）。既定のラベル集合へ補完する
+    /// フォールバックは行わず、fail-closed で停止する。`options` キーは
+    /// 存在するが値が不正（空配列・誤った型）な場合は区別して
+    /// `EmptyOptions`・`TypeMismatch` を返す（本バリアントには含めない）。
+    /// ペイロードを持たないため、`Display`/`Debug` は固定文のみで利用者
+    /// データを漏らさない（security.md「秘密情報の混入防止」）。
+    MissingLabels,
     /// フィールドの型が期待と異なる（TASK-15.3-2）。値そのものは保持せず、
     /// 期待した型と実測した型のみを保持する（security.md「秘密情報の混入
     /// 防止」: 利用者データをエラー文へ漏らさない）。
@@ -362,6 +373,10 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::MissingField { field } => {
                 write!(f, "definition field {field} is missing")
             }
+            DefinitionError::MissingLabels => write!(
+                f,
+                "definition has no label definition (options); a default label set is never substituted"
+            ),
             DefinitionError::TypeMismatch {
                 field,
                 expected,
@@ -425,6 +440,7 @@ impl std::fmt::Debug for DefinitionError {
                 .debug_struct("MissingField")
                 .field("field", field)
                 .finish(),
+            DefinitionError::MissingLabels => f.write_str("MissingLabels"),
             DefinitionError::TypeMismatch {
                 field,
                 expected,
@@ -463,6 +479,7 @@ impl std::error::Error for DefinitionError {
             DefinitionError::DuplicateOptionId { .. } => None,
             DefinitionError::NotRegularFile { .. } => None,
             DefinitionError::MissingField { .. } => None,
+            DefinitionError::MissingLabels => None,
             DefinitionError::TypeMismatch { .. } => None,
             DefinitionError::UnknownField { .. } => None,
             DefinitionError::UnsupportedValue { .. } => None,
@@ -476,10 +493,9 @@ impl DefinitionError {
     /// （REQ-21・REQ-33）へ配線する際の接続点。本 TASK では配線しない）。
     ///
     /// `missing_field`/`type_mismatch` は PR #191（データ契約層）の語彙と
-    /// 揃える。TASK-15.4 は新しいバリアント（例: `MissingLabels`）を足して
-    /// `missing_labels` を返すだけで済む。ワイルドカードなしの網羅 `match`
-    /// にすることで、バリアント追加時のコード漏れをコンパイルエラーで
-    /// 検出する。
+    /// 揃える。`MissingLabels`（TASK-15.4）は `missing_labels` を返す。
+    /// ワイルドカードなしの網羅 `match` にすることで、バリアント追加時の
+    /// コード漏れをコンパイルエラーで検出する。
     #[must_use]
     pub const fn reason_code(&self) -> &'static str {
         match self {
@@ -492,6 +508,7 @@ impl DefinitionError {
             DefinitionError::DuplicateOptionId { .. } => "duplicate_option_id",
             DefinitionError::NotRegularFile { .. } => "not_regular_file",
             DefinitionError::MissingField { .. } => "missing_field",
+            DefinitionError::MissingLabels => "missing_labels",
             DefinitionError::TypeMismatch { .. } => "type_mismatch",
             DefinitionError::UnknownField { .. } => "unknown_field",
             DefinitionError::UnsupportedValue { .. } => "unsupported_value",
@@ -521,6 +538,7 @@ impl DefinitionError {
             | DefinitionError::DuplicateOptionId { .. }
             | DefinitionError::NotRegularFile { .. }
             | DefinitionError::MissingField { .. }
+            | DefinitionError::MissingLabels
             | DefinitionError::TypeMismatch { .. }
             | DefinitionError::UnknownField { .. }
             | DefinitionError::UnsupportedValue { .. }
@@ -986,14 +1004,16 @@ mod tests {
         Definition::parse(&value.to_string())
     }
 
+    /// `options` の欠落は TASK-15.4 で `MissingLabels` に切り出したため、
+    /// このケース配列には含めない（`req15_missing_options_is_reported_as_missing_labels`
+    /// が専用に検証する）。
     #[test]
     fn req15_rejects_definition_missing_each_required_top_level_field() {
-        let cases: [(&str, FieldPath); 6] = [
+        let cases: [(&str, FieldPath); 5] = [
             ("schema", FieldPath::Schema),
             ("name", FieldPath::Name),
             ("version", FieldPath::Version),
             ("judgment_type", FieldPath::JudgmentType),
-            ("options", FieldPath::Options),
             ("io", FieldPath::Io),
         ];
         for (key, expected_field) in cases {
@@ -1062,8 +1082,10 @@ mod tests {
         assert_eq!(FieldPath::IoInput.to_string(), "io.input");
     }
 
-    /// TASK-15.4 の前提: `options` キーが無い場合はフォールバック（既定の
-    /// ラベル集合への補完）にならず、`MissingField { Options }` になる。
+    /// TASK-15.4（REQ-15 異常系、PoC-9 追補 v1.1 A-6）: `options` キーが無い
+    /// 場合はフォールバック（既定のラベル集合への補完）にならず、
+    /// `MissingLabels`（`reason_code() == "missing_labels"`・
+    /// `exit_code() == InvalidInput`）で停止する。
     #[test]
     fn req15_missing_options_does_not_fall_back_to_default_labels() {
         let mut value = valid_definition_value();
@@ -1073,12 +1095,85 @@ mod tests {
             .remove("options")
             .expect("既存キーのはず");
         let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+        assert_eq!(err.reason_code(), "missing_labels");
+        assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+    }
+
+    /// TASK-15.4（REQ-15 異常系、PoC-9 追補 v1.1 A-6）の A-6 ハーネスとして
+    /// 独立したテスト名を持たせる（上のテストと内容は重なるが、受け入れ
+    /// 基準への対応を名前で追跡できるようにする）。
+    #[test]
+    fn req15_missing_options_is_reported_as_missing_labels() {
+        let mut value = valid_definition_value();
+        value
+            .as_object_mut()
+            .expect("object のはず")
+            .remove("options")
+            .expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+        assert_eq!(err.reason_code(), "missing_labels");
+        assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+    }
+
+    /// TASK-15.4: `options` 欠落に加えて未知のトップレベルキーを含む場合も、
+    /// 走査順（`schema` → ... → `options` → 未知キー）により `MissingLabels`
+    /// が未知キー検出より先に返る。
+    #[test]
+    fn req15_missing_options_takes_priority_over_unknown_field() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.remove("options").expect("既存キーのはず");
+        object.insert(
+            "unexpected_key".to_string(),
+            serde_json::Value::String("x".to_string()),
+        );
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+    }
+
+    /// TASK-15.4: `schema` 不一致と `options` 欠落が同時に起きた場合は、
+    /// 走査順が `schema` を先に検査するため `UnsupportedSchema` が優先される。
+    #[test]
+    fn req15_unsupported_schema_takes_priority_over_missing_options() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.insert(
+            "schema".to_string(),
+            serde_json::Value::String("unknown-schema/v9".to_string()),
+        );
+        object.remove("options").expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
         assert!(matches!(
             err,
-            DefinitionError::MissingField {
-                field: FieldPath::Options
-            }
+            DefinitionError::UnsupportedSchema { schema } if schema == "unknown-schema/v9"
         ));
+    }
+
+    /// TASK-15.4: `MissingLabels` の `Display`/`Debug` は固定文で、利用者
+    /// データ（定義内の識別文字列）を含まない（security.md「秘密情報の
+    /// 混入防止」）。
+    #[test]
+    fn req15_missing_labels_display_and_debug_are_fixed_and_leak_nothing() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.insert(
+            "name".to_string(),
+            serde_json::Value::String("s3cr3t-topic-name-should-not-leak".to_string()),
+        );
+        object.remove("options").expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+
+        let display_output = err.to_string();
+        let debug_output = format!("{err:?}");
+        assert_eq!(
+            display_output,
+            "definition has no label definition (options); a default label set is never substituted"
+        );
+        assert_eq!(debug_output, "MissingLabels");
+        assert!(!display_output.contains("s3cr3t-topic-name-should-not-leak"));
+        assert!(!debug_output.contains("s3cr3t-topic-name-should-not-leak"));
     }
 
     #[test]
@@ -1331,7 +1426,7 @@ mod tests {
     fn req15_reason_code_and_exit_code_cover_all_variants() {
         use crate::exitcode::ExitCode;
 
-        let cases: [(DefinitionError, &str, ExitCode); 13] = [
+        let cases: [(DefinitionError, &str, ExitCode); 14] = [
             (
                 DefinitionError::Read {
                     path: PathBuf::from("x"),
@@ -1385,6 +1480,11 @@ mod tests {
                     field: FieldPath::Name,
                 },
                 "missing_field",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::MissingLabels,
+                "missing_labels",
                 ExitCode::InvalidInput,
             ),
             (
