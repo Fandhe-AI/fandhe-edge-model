@@ -13,12 +13,7 @@
 //! プターは薄く保ち、業務ロジックは下位層に置く」）。業務ロジックは
 //! `fandhe-edge-core` 側に置き、本 crate には持ち込まない。
 
-/// REQ-21 で固定された 7 種の終了コードのうち `runtime_error` の値。
-///
-/// 終了コードの型（enum 等）は TASK-21.1 で main が設計してから委譲する
-/// 対象のため、ここでは共通の型を先取りせずローカル定数に留める。
-/// TASK-21.1 で共通の型に置き換える。
-const RUNTIME_ERROR: u8 = 70;
+use fandhe_edge_core::exitcode::ExitCode;
 
 fn main() -> std::process::ExitCode {
     // 引数は読まない（工程を一切実行しないため std::env::args を使わない）。
@@ -26,5 +21,5 @@ fn main() -> std::process::ExitCode {
     // TASK-33.2）をここで先取りしないためで、stdout に何か出すこと自体が
     // 契約の先取りになる。
     eprintln!("fandhe-edge: not implemented yet (TASK-33.1)");
-    std::process::ExitCode::from(RUNTIME_ERROR)
+    ExitCode::RuntimeError.into()
 }
