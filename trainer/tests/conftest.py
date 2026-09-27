@@ -38,7 +38,7 @@ def make_examples(n_per_label: int = 12) -> list[TrainExample]:
 ATOL_BATCH_PARITY = 1e-6
 ATOL_MLX_ONNX = 1e-5
 
-#: ReferenceEvaluator（純 numpy）でも高速に回る極小アーキテクチャ設定。
+#: ReferenceEvaluator（純 numpy）でも高速に回る極小アーキテクチャ設定（C3 用）。
 TINY_CONFIG = {
     "epochs": 5,
     "batch_size": 8,
@@ -46,6 +46,18 @@ TINY_CONFIG = {
     "filters": 8,
     "widths": [3, 5, 7],
     "dropout": 0.0,
+}
+
+#: ReferenceEvaluator でも高速に回る極小設定（C1 用。`tests/test_c1_*.py` が共有する）。
+TINY_C1_CONFIG = {
+    "ngram_min": 1,
+    "ngram_max": 3,
+    "min_df": 1,
+    "max_features": 1000,
+    "C": 1.0,
+    "epochs": 40,
+    "batch_size": 8,
+    "lr": 0.5,
 }
 
 #: `make_request` が作った `TrainRequest`（fd を保持する）を集め、テストごとに
@@ -56,6 +68,7 @@ _created_requests: list[TrainRequest] = []
 def make_request(
     tmp_path,
     *,
+    kind: str = "c3",
     config: dict | None = None,
     seed: int = 0,
     out_name: str = "out",
@@ -67,6 +80,12 @@ def make_request(
     構築する（`root`＝`tmp_path`。fd の解放はテスト終了時に自動で行われる。
     `_close_confined_requests` 参照）。経路の閉じ込め違反そのものの検証は
     `test_contract.py` 側で個別に行う。
+
+    `kind`（既定 "c3"）は `TrainRequest.kind` へそのまま入るだけで、
+    `C3Kind.train`/`C1Kind.train` のいずれもこのフィールドを参照しない
+    （`kinds/__init__.py::resolve_kind` が呼び出し前に別途 kind 文字列を見て
+    実装を選ぶため）。artifact 側で種類名を記録したいテストは、この値ではなく
+    実際に学習した種類の名前を明示的に渡すこと。
     """
     Path(tmp_path).mkdir(parents=True, exist_ok=True)  # root は存在するディレクトリが前提
     root_handle = guard.resolve_root(str(tmp_path))
@@ -74,7 +93,7 @@ def make_request(
     out_dir_entry = guard.confine(root_handle, out_name, "out_dir")
     root_handle.close()  # train_path_entry/out_dir_entry は独立した fd を持つため不要になる
     req = TrainRequest(
-        kind="c3",
+        kind=kind,
         kind_version=1,
         config=dict(config if config is not None else TINY_CONFIG),
         label_order=list(LABEL_ORDER),
@@ -111,9 +130,13 @@ def make_budget(request: TrainRequest) -> budget_mod.ResourceBudget:
     )
 
 
-def train_c3(kind, examples: list[TrainExample], request: TrainRequest):
+def train_kind(kind, examples: list[TrainExample], request: TrainRequest):
     """`kind.train(examples, request, resource_budget)` を、テスト用に
     `make_budget(request)` で組み立てた `ResourceBudget` を渡して呼ぶ。
+
+    `kind` 引数（`C1Kind`・`C3Kind` のいずれのインスタンスでもよい）に依存
+    しない共通ヘルパーのため、種類非依存の名前にしている（以前は `train_c3`
+    という名前だったが、C1 のテストからも使われるようになったため改称した）。
     """
     return kind.train(examples, request, make_budget(request))
 
