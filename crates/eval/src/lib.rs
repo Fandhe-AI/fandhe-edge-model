@@ -17,6 +17,9 @@
 //!   issue #65）
 //! - [`significance`][]: 行ごとの正誤 → McNemar 検定 → α=0.05 での有意性
 //!   判定への接続（REQ-25・TASK-25.1-2・issue #65）
+//! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
+//!   issue #62。単一選択の 5 区分〔type_ok_meaning_ok / type_ok_meaning_ng /
+//!   type_ng_count / abstain / error〕のみ。multi-item は未対応）
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
@@ -28,9 +31,11 @@
 //!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
 //!   写す直列化は本 crate の責務ではなく、CLI の `evaluate` 工程
 //!   （TASK-33.1）が担う
-//! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 未実装
-//!   （TASK-24.3・issue #62）。[`metrics::Outcome`] を enum にしてあるのは
-//!   この後続実装が予測の種類を判定しやすくするため
+//! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 単一選択の
+//!   3 区分＋abstain/error を実装済み（TASK-24.3・issue #62）。multi-item の
+//!   型不正行の意味分割（`type_ng_intent_ok` / `type_ng_intent_ng`）は
+//!   未実装（core の multi-item 対応待ち。[`quadrant`] モジュールの
+//!   ドキュメントコメント参照）
 //! - McNemar 検定（REQ-25）: 統計計算コアは実装済み（TASK-25.1-1・issue #64）。
 //!   下限基準（majority）比較への接続・p<0.05 の判定は実装済み
 //!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
@@ -59,5 +64,6 @@
 pub mod baseline;
 pub mod mcnemar;
 pub mod metrics;
+pub mod quadrant;
 pub mod significance;
 pub mod wilson;
