@@ -92,14 +92,27 @@ def main() -> None:
     records = []
     for case in CASES:
         p = two_sided_p_exact(case.b, case.c)
-        # f64 相当の 17 桁精度で丸めた十進表現（テストの期待値と同じ書式）。
+        # 厳密な有理数値を 17 桁精度で丸めた十進表現（真値の記録用。
+        # 指数部が f64 の表現範囲〔約 4.9e-324 未満〕を下回る場合、
+        # この文字列を `f64` リテラルとしてパースすると 0.0 に
+        # アンダーフローする ―― その場合でも本フィールドは丸め前の
+        # 厳密値の 17 桁表現をそのまま記録する）。
         p_f64_repr = format(Decimal(p.numerator) / Decimal(p.denominator), ".17g")
+        # 実際に `f64` へ変換した後の値（Python の `float` も IEEE754
+        # binary64 なので Rust の `f64` と同じ丸め・アンダーフロー規則に
+        # 従う）。`p_two_sided_f64_repr` が真値の 17 桁表現であるのに対し、
+        # こちらは「テストコードの `f64` リテラルに実際に格納される値」
+        # そのもの。指数部がアンダーフローする既知値ケース（例: (1100, 0)）
+        # では `p_two_sided_f64_repr` は非ゼロの文字列のまま、本フィールドは
+        # `0.0` になり、両者が一致しないのは仕様どおり（PROVENANCE.md 参照）。
+        p_f64_actual = float(p_f64_repr)
         records.append(
             {
                 "b": case.b,
                 "c": case.c,
                 "p_two_sided_exact_fraction": f"{p.numerator}/{p.denominator}",
                 "p_two_sided_f64_repr": p_f64_repr,
+                "p_two_sided_f64_actual": p_f64_actual,
                 "note": case.note,
             }
         )

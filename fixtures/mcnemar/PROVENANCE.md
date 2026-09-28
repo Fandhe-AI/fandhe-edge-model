@@ -38,10 +38,31 @@ dependency-policy.md`）。本スクリプトは Rust のビルド・テスト�
 
 ## known_values.json との照合
 
-`known_values.json` は上記コマンドの実行結果をコミットしたもの。
+`known_values.json` は上記コマンドの実行結果をコミットしたもの。各ケースは
+次の 2 つの数値フィールドを持つ。
+
+- `p_two_sided_f64_repr`: 厳密な有理数値（`p_two_sided_exact_fraction`）を
+  17 桁精度で丸めた十進表現の**文字列**。真値をそのまま記録する目的のため、
+  `f64` の表現範囲（約 4.9e-324 未満）を下回るケースでもアンダーフローさせず
+  非ゼロの文字列を保持する
+- `p_two_sided_f64_actual`: その文字列を実際に `float()`（IEEE754 binary64。
+  Rust の `f64` と同じ丸め・アンダーフロー規則）へ変換した後の値。テストの
+  `f64` リテラルに実際に格納されるのはこちらの値
+
 `crates/eval/src/mcnemar.rs`（ユニットテスト）・
 `crates/eval/tests/mcnemar_known_answer.rs`（結合テスト）にハードコードした
-期待値は、本ファイルの `p_two_sided_f64_repr`（17 桁精度で丸めた十進表現）
-と全件一致することを確認済み（証拠の種別: テストハーネス。手動照合。
-2026-09-28）。値を変更する場合は `generate_known_values.py` の `CASES` と
-テストコード側の期待値を両方更新すること。
+期待値は、`p_two_sided_f64_actual` と全件一致することを確認済み（証拠の
+種別: テストハーネス。手動照合。2026-09-28）。
+
+**例外（アンダーフロー境界のケース）**: `(b=1100, c=0)` は真値が `2^-1099`
+（`p_two_sided_f64_repr` は `"1.4724303658045725e-331"`）だが、`f64` の
+最小の正の値（約 4.9e-324）を大きく下回るため `p_two_sided_f64_actual` は
+`0.0` になる。このケースに限り `p_two_sided_f64_repr` と
+`p_two_sided_f64_actual` は一致しない（前者は真値、後者は `f64` 変換後の
+値であり、両者が異なること自体が意図した仕様）。テスト側
+（`mcnemar_known_answer.rs::underflow_to_zero_is_not_an_error`）は
+`p_two_sided_f64_actual` の `0.0` と一致させており、「期待値は全件一致」と
+は `p_two_sided_f64_actual` を基準にした記述である。
+
+値を変更する場合は `generate_known_values.py` の `CASES` とテストコード側の
+期待値を両方更新すること。
