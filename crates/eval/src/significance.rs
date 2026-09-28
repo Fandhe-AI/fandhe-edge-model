@@ -7,8 +7,11 @@
 //!
 //! # 対象外（本 issue の範囲外）
 //!
-//! - Holm 補正（複数候補比較。REQ-26）は [`judge`] に `p` を引数で渡す形に
-//!   しておき、TASK-25.3 で補正後の p 値でも呼べるようにする
+//! - Holm 補正（複数候補比較。REQ-25）は [`judge`] に `p` を引数で渡す形に
+//!   なっているため、[`crate::holm`]（TASK-25.3・issue #67）が補正後の
+//!   p 値をそのまま渡して呼び直せる。[`BaselineComparison::required`] は
+//!   [`crate::holm::compare_candidates_with_holm`] が判定を出し直す際に
+//!   必要件数を取り違えないよう保持している
 //! - 件数不足による「判定不能」（[`BaselineVerdict::Undeterminable`]）は
 //!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`RequiredSampleSize`]）を事前登録の手続きから算出する関数
@@ -95,8 +98,11 @@ pub struct InsufficientSamples {
 
 /// 下限基準（majority）に対する判定。
 ///
-/// `#[non_exhaustive]` にしてあるのは、Holm 補正（TASK-25.3）等で
-/// variant が増える余地を残すため。
+/// `#[non_exhaustive]` にしてあるのは、将来 variant が増える余地を残す
+/// ためだが、Holm 補正（TASK-25.3・issue #67）は本 enum に variant を
+/// 追加していない。補正後の判定も同じ 3 状態（`SignificantlyBetter` /
+/// `NotSignificantlyBetter` / `Undeterminable`）で表せるため、
+/// [`crate::holm::HolmComparison::verdict`] は本 enum をそのまま返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BaselineVerdict {
@@ -124,7 +130,9 @@ pub enum BaselineVerdict {
 /// 3. それ以外は [`BaselineVerdict::NotSignificantlyBetter`]
 ///
 /// （PoC-10 `stats_mcnemar.py` の「有意に上回る」の定義に、件数不足の
-/// 判定不能〔TASK-25.2〕を加えたもの。Holm 補正は対象外）
+/// 判定不能〔TASK-25.2〕を加えたもの。複数候補の Holm 補正は
+/// [`crate::holm::compare_candidates_with_holm`] が本関数を補正後の p 値で
+/// 呼び直す形で行う〔TASK-25.3・issue #67〕）
 ///
 /// `n_evaluated` は比較に使う評価レコードの総件数 N（[`PairedCounts::n`]）
 /// であり、不一致ペア数 `b + c` ではない（PoC-10 事前登録の基準。
@@ -247,6 +255,7 @@ pub struct BaselineComparison {
     counts: PairedCounts,
     test: McNemarExact,
     verdict: BaselineVerdict,
+    required: RequiredSampleSize,
 }
 
 impl BaselineComparison {
@@ -276,6 +285,16 @@ impl BaselineComparison {
     /// α = 0.05 での有意性判定。
     pub fn verdict(&self) -> BaselineVerdict {
         self.verdict
+    }
+
+    /// この比較で使った必要件数（事前登録の値）。
+    ///
+    /// [`crate::holm::compare_candidates_with_holm`] が Holm 補正後の p 値で
+    /// [`judge`] を呼び直す際、比較時と同じ必要件数を使うために保持する
+    /// （TASK-25.3・issue #67。引数で再度受け取る設計にすると、比較時と
+    /// 補正時で必要件数が食い違う経路が生まれるため、型で防ぐ）。
+    pub fn required(&self) -> RequiredSampleSize {
+        self.required
     }
 }
 
@@ -344,6 +363,7 @@ pub fn compare_with_baseline(
         counts,
         test,
         verdict,
+        required,
     })
 }
 

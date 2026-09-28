@@ -33,6 +33,9 @@
 //!   必要評価件数の事前計算（Connor 式。REQ-25 異常系・TASK-25.2・
 //!   issue #66）。[`significance::RequiredSampleSize`] を
 //!   [`sample_size::required_sample_size_mcnemar`] で算出できる
+//! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
+//!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
+//!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -56,7 +59,9 @@
 //!   関数（Connor 式）も実装済み（[`sample_size::required_sample_size_mcnemar`]。
 //!   TASK-25.2・issue #66）。仮定値（`p_b`・`p_c`・`alpha`・`power`）を
 //!   定義ファイル・CLI 引数のどこから受け取るかは未確定（TASK-33.x）。
-//!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
+//!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
+//!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
+//!   統合は未実装）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -99,6 +104,7 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
+pub mod holm;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
