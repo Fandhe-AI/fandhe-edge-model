@@ -67,46 +67,55 @@ fn wrong_outcome_for_gold_b(i: u64) -> Outcome {
 /// `PairedCounts`（both_correct・b・c・both_wrong）の内訳から、対応する
 /// gold・候補・下限基準の予測列を決定的に組み立てる。
 ///
-/// 下限基準は常に `"A"` を予測する多数決分類器を模す（[`fit_majority`] が
-/// 学習データから求めた値をそのまま使う想定。gold が `"A"` の行でのみ
-/// 正解する）。
+/// 下限基準は常に `majority`（[`fit_majority`] が学習データから求めた
+/// 多数決ラベルの戻り値。呼び出し側から渡す）を予測する多数決分類器を模す
+/// （gold が `majority` の行でのみ正解する。Codex 指摘。PR #219。以前は
+/// `"A"` を関数内でハードコードしており、[`fit_majority`] の戻り値とは
+/// 独立に決め打ちしていた）。
 ///
-/// - both_correct 行: gold=`"A"`、候補・下限基準ともに `Label("A")`（正解）
-/// - c 行（下限基準のみ正解）: gold=`"A"`、下限基準は `Label("A")`（正解）、
-///   候補は不正解（[`wrong_outcome_for_gold_a`]）
+/// - both_correct 行: gold=`majority`、候補・下限基準ともに `Label(majority)`
+///   （正解）
+/// - c 行（下限基準のみ正解）: gold=`majority`、下限基準は `Label(majority)`
+///   （正解）、候補は不正解（[`wrong_outcome_for_gold_a`]）
 /// - b 行（候補のみ正解）: gold=`"B"`、候補は `Label("B")`（正解）、
-///   下限基準は `Label("A")`（不正解）
+///   下限基準は `Label(majority)`（不正解。`majority != "B"` が前提）
 /// - both_wrong 行: gold=`"B"`、候補は不正解（[`wrong_outcome_for_gold_b`]）、
-///   下限基準は `Label("A")`（不正解）
+///   下限基準は `Label(majority)`（不正解）
 fn build_rows(
+    majority: &'static str,
     both_correct: u64,
     b: u64,
     c: u64,
     both_wrong: u64,
 ) -> (Vec<&'static str>, Vec<Outcome>, Vec<Outcome>) {
+    assert_ne!(
+        majority, "B",
+        "b・both_wrong 行の gold=\"B\" は majority と異なる前提"
+    );
+
     let mut gold = Vec::new();
     let mut candidate = Vec::new();
     let mut baseline = Vec::new();
 
     for _ in 0..both_correct {
-        gold.push("A");
-        candidate.push(Outcome::Label("A".to_string()));
-        baseline.push(Outcome::Label("A".to_string()));
+        gold.push(majority);
+        candidate.push(Outcome::Label(majority.to_string()));
+        baseline.push(Outcome::Label(majority.to_string()));
     }
     for i in 0..c {
-        gold.push("A");
+        gold.push(majority);
         candidate.push(wrong_outcome_for_gold_a(i));
-        baseline.push(Outcome::Label("A".to_string()));
+        baseline.push(Outcome::Label(majority.to_string()));
     }
     for _ in 0..b {
         gold.push("B");
         candidate.push(Outcome::Label("B".to_string()));
-        baseline.push(Outcome::Label("A".to_string()));
+        baseline.push(Outcome::Label(majority.to_string()));
     }
     for i in 0..both_wrong {
         gold.push("B");
         candidate.push(wrong_outcome_for_gold_b(i));
-        baseline.push(Outcome::Label("A".to_string()));
+        baseline.push(Outcome::Label(majority.to_string()));
     }
 
     (gold, candidate, baseline)
@@ -212,13 +221,30 @@ const CASES: &[Case] = &[
 /// 受入基準: PoC-10 相当のデータで、4 方式・3 seed（C1・C2 は値が重複する
 /// ため 8 通り）のすべてが「有意」（`SignificantlyBetter`）と判定される
 /// （REQ-25・TASK-25.1-2・issue #65）。
+///
+/// Codex 指摘（PR #219）: 下限基準の予測列は [`fit_majority`] の戻り値
+/// （学習ラベルから求めた多数決ラベル）で生成し、その列を
+/// [`compare_with_baseline`] へ渡す。以前は `build_rows` 内部で `"A"` を
+/// 直接埋め込んでおり、`fit_majority` の結果とは独立に決め打ちしていた。
 #[test]
 fn all_poc10_cases_are_significantly_better_than_majority() {
     let labels = ["A", "B", "C"];
+    // 学習データでは "A" が最頻になるようにする（[`fit_majority`] が
+    // 実際に "A" を選ぶことをテストで確認したうえで `build_rows` へ渡す。
+    // 学習データの割合はここでの分割表〔both_correct・b・c・both_wrong〕とは
+    // 無関係。REQ-17・REQ-27: 下限基準は学習データのみから決め、評価データの
+    // gold・分割表からは求めない）。
+    let train_labels = ["A", "A", "A", "B", "C"];
+    let majority = fit_majority(&labels, &train_labels).unwrap();
+    assert_eq!(
+        majority, "A",
+        "build_rows は majority に対応する gold 行を組み立てるため、\
+         想定外のラベルに変わっていないことを確認する"
+    );
 
     for case in CASES {
         let (gold, candidate, baseline) =
-            build_rows(case.both_correct, case.b, case.c, case.both_wrong);
+            build_rows(majority, case.both_correct, case.b, case.c, case.both_wrong);
         let records = build_paired_records(&gold, &candidate, &baseline);
 
         let n = case.both_correct + case.b + case.c + case.both_wrong;
@@ -303,7 +329,7 @@ fn majority_is_fit_from_train_labels_only() {
 fn candidate_worse_than_majority_is_not_significantly_better() {
     let labels = ["A", "B", "C"];
     // b=3, c=12（下限基準のほうが強い）。
-    let (gold, candidate, baseline) = build_rows(50, 3, 12, 50);
+    let (gold, candidate, baseline) = build_rows("A", 50, 3, 12, 50);
     let records = build_paired_records(&gold, &candidate, &baseline);
 
     // 必要件数は本テストの主題（方向の確認）とは無関係のため最小値にする。
@@ -322,7 +348,7 @@ fn candidate_worse_than_majority_is_not_significantly_better() {
 #[test]
 fn compare_with_baseline_preserves_input_records() {
     let labels = ["A", "B", "C"];
-    let (gold, candidate, baseline) = build_rows(10, 5, 3, 12);
+    let (gold, candidate, baseline) = build_rows("A", 10, 5, 3, 12);
     let records = build_paired_records(&gold, &candidate, &baseline);
 
     let before: Vec<(&str, Outcome, Outcome)> = records
@@ -352,7 +378,7 @@ fn correctness_matches_compare_with_baseline_candidate_side() {
     use fandhe_edge_eval::significance::correctness;
 
     let labels = ["A", "B", "C"];
-    let (gold, candidate, _baseline) = build_rows(10, 5, 3, 12);
+    let (gold, candidate, _baseline) = build_rows("A", 10, 5, 3, 12);
     let eval_records: Vec<EvalRecord<'_>> = gold
         .iter()
         .zip(candidate.iter())
