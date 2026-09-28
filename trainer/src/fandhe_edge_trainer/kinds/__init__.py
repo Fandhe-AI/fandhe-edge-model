@@ -6,7 +6,7 @@
 扱う。推論側の選択口は推論ランタイム（runtime-builder 担当。REQ-32 によりここへは
 依存しない）。
 
-新しい種類を追加する手順（拡張点。C3・C1 はこの手順で追加済み）:
+新しい種類を追加する手順（拡張点。C3・C1・autoregressive はこの手順で追加済み）:
 1. `kinds/<name>.py` に `Kind` プロトコル（`train`・`export_onnx`・既定 `config`）を実装する
 2. `_REGISTRY` へ `{"<name>": {<kind_version>: <クラス>}}` を追記する
 既存の種類の実装・共通コア・評価器の改変を要しない。
@@ -68,10 +68,15 @@ class Kind(Protocol):
 
 def _registry() -> dict[str, dict[int, type]]:
     # 遅延 import: 種類ごとに必要な重い依存（mlx 等）を、実際に使う種類だけ読み込む。
+    from .autoregressive import AutoregressiveKind
     from .c1 import C1Kind
     from .c3 import C3Kind
 
-    return {"c3": {1: C3Kind}, "c1": {1: C1Kind}}
+    return {
+        "c3": {1: C3Kind},
+        "c1": {1: C1Kind},
+        "autoregressive": {1: AutoregressiveKind},
+    }
 
 
 def resolve_kind(kind: str, kind_version: int) -> Kind:

@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from conftest import LABEL_ORDER, TINY_CONFIG
+from conftest import LABEL_ORDER, TINY_AR_CONFIG, TINY_CONFIG
 from fandhe_edge_trainer import supervisor
 
 _LAUNCH_SCRIPT = str(Path(__file__).resolve().parent.parent / "launch.py")
@@ -112,6 +112,44 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     assert (out_dir / "model.onnx").exists()
     # 予約に使った作業用一時ディレクトリ（`.out.tmp-*`）が残置されていない
     # （スーパーバイザーが確定〔rename〕まで正しく完了させたことの確認）。
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+def test_cli_train_success_with_autoregressive_kind_emits_single_json_and_exit_0(
+    tmp_path: Path,
+) -> None:
+    """REQ-19b・TASK-19b.1-1・#79 受け入れ条件 1: `kind="autoregressive"` の
+    学習リクエストが選択口（`launch.py train` → `resolve_kind`）を経由して
+    エラーなく最後まで実行できること（合成データ・CPU）。
+    """
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "autoregressive",
+        "kind_version": 1,
+        "config": TINY_AR_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    result = _run_cli(request_path)
+    assert result.returncode == 0, result.stderr
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "ok"
+    assert payload["artifact"]["kind"] == "autoregressive"
+    assert (out_dir / "artifact.json").exists()
+    assert (out_dir / "model.onnx").exists()
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 

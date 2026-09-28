@@ -257,3 +257,112 @@ MAX_C1_BATCH_ELEMENTS = 200_000_000
 #: 下がるが、チャンク数（Python ループの反復回数）は増える。既定値は
 #: int64（8 bytes/要素）換算で 1 チャンクあたり概算 32 MiB 程度に収まる水準。
 MAX_C1_VOCAB_CHUNK_WINDOW_ELEMENTS = 4_000_000
+
+# --------------------------------------------------------------------------
+# kind="autoregressive" のアーキテクチャ・ハイパーパラメータ上限
+# （REQ-19b・TASK-19b.1-1・#79）。C1・C3 セクションと同じ考え方（拡張点を
+# 閉じるため、種類固有の上限もここへ集約する）で追加する。
+#
+# **状態: オーナー未確認（暫定値）**。C1・C3 セクションの各定数は Issue #11
+# でオーナー確認済みだが、本セクションの値は本 Issue（#79）の実装時に
+# 一次的に設定した仮置きであり、オーナー確認は未実施（`AGENTS.md`
+# 「ユーザー承認フロー」の資源上限緩和には該当しない新規追加だが、値の
+# 妥当性そのものは未検証）。C1/C3 の既存上限（`MAX_C1_EPOCHS`=1000 等）と
+# 桁を揃えた仮の値であり、実運用データでの計測後に見直す想定。
+# 根拠: 仮置き。証拠種別: 仮置き。状態: オーナー未確認。
+# --------------------------------------------------------------------------
+
+#: decoder のレイヤー数の許容上限。既定値（`DEFAULT_CONFIG["layers"]=2`）の
+#: 16 倍を仮の上限とする。
+MAX_AR_LAYERS = 32
+
+#: 埋め込み・隠れ層次元数の許容上限。
+MAX_AR_DIMS = 1024
+
+#: multi-head attention のヘッド数の許容上限。`dims % heads == 0` を別途検証する。
+MAX_AR_HEADS = 64
+
+MAX_AR_EPOCHS = 1000
+MAX_AR_BATCH_SIZE = 4096
+MAX_AR_LR = 10.0
+MAX_AR_WEIGHT_DECAY = 1.0
+
+#: 学習率 warmup のステップ数の許容上限。
+MAX_AR_WARMUP_STEPS = 100_000
+
+#: 学習 1 ステップで decoder attention が保持しうる要素数の上限
+#: （`batch_size × heads × L^2 × layers × _AR_TRAIN_ATTN_RETAINED_TENSORS`。
+#: `L` は 1 行の全長 = `max_bytes + 1 + max_label_len + 1`。`_AR_TRAIN_
+#: ATTN_RETAINED_TENSORS`＝2 は `scores`・`softmax` 出力の 2 テンソルが
+#: 逆伝播用に残ることの見積もり。`kinds/autoregressive.py::
+#: _AR_TRAIN_ATTN_RETAINED_TENSORS` docstring 参照）の上限
+#: （`MAX_C1_BATCH_ELEMENTS` と同じ考え方。セキュリティ監査 P0 相当）。
+#: 学習ループ開始前（1 バッチも確保する前）にこの上限で fail-closed に
+#: 拒否する（`limit_exceeded`・exit 20）。
+#:
+#: `layers` を乗じる理由: `ByteDecoder` は `layers` 個の `DecoderLayer` を
+#: 直列適用するが、MLX の自動微分は逆伝播のため各層のフォワード時の
+#: 中間テンソルを学習ステップ内で同時に保持しうる。旧式（`layers` を
+#: 含まない `batch_size × heads × L^2`）は `layers=32`・`heads=dims=64`・
+#: `batch_size=1`・`max_bytes≈1700` のような設定を通過させてしまい、
+#: attention テンソルの保持だけで `MAX_TRAIN_RSS_BYTES`（8 GiB）を超える
+#: 実例があった（Codex P0 指摘。`kinds/autoregressive.py::
+#: AutoregressiveKind.train` 参照。REQ-39）。値そのもの（200,000,000）は
+#: 変更せず、見積もり式のみを是正した。
+MAX_AR_ATTENTION_ELEMENTS = 200_000_000
+
+#: 推論 1 件（バッチ N=1）あたりで ONNX グラフが確保しうる、選択肢領域の
+#: 対数確率抽出用テンソル（`choice_logp`・`choice_onehot`・`masked_vocab`。
+#: いずれも `[K, M, VOCAB_SIZE]` 形状。`kinds/autoregressive.py::_export_ar_onnx`
+#: 参照）の要素数上限（`K × M × VOCAB_SIZE`）。書き出し前（グラフ構築前）に
+#: この上限で fail-closed に拒否する（`limit_exceeded`・exit 20）。
+#:
+#: バッチ件数 N 分の上限は、書き出し時に `MAX_AR_INFER_BATCH_N` との
+#: 組み合わせで `n_max = min(MAX_AR_INFER_BATCH_N, 本定数 // (本定数の
+#: N=1 相当値))` として算出し、ONNX グラフ内へ埋め込んだ固定長テーブルの
+#: `Gather`（`_export_ar_onnx` の `n_guard_table` 参照）で fail-closed に
+#: 検査する（推論時の実際の N がこの `n_max` を超えると Gather が範囲外
+#: 参照で失敗する。オーナー判断 2026-09-28。PR #222 レビュー指摘を受けて
+#: グラフ内で完結させる方針に変更。以前は推論ランタイム・ガード層側の
+#: 将来対応としていたが、ガード層は未実装のため空隙が残っていた）。
+#: ガード層（REQ-39。パス未確定）は実装後も、同じ条件を `invalid_input`
+#: として拒否すべき（グラフ内の失敗は `runtime_error`/exit 70 にしかならず、
+#: 機械可読な入力エラーにはならないため）。
+MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS = 200_000_000
+
+#: decoder の attention が確保しうる要素数（`N × K × heads × layers × L^2`。
+#: `L = T + 1 + M`）の上限（`kinds/autoregressive.py::
+#: _ar_export_attention_elements` 参照。PR #222 レビュー指摘。REQ-39）。
+#: 書き出す ONNX グラフは `ids: INT64 ["N","T"]` の `N`・`T` を動的軸として
+#: 受け取るため、いずれも書き出し時点では未確定である。
+#:
+#: `_export_ar_onnx` が組み込む `Slice(ids, 0, max_bytes, axis=1)`
+#: （`kinds/autoregressive.py` モジュール docstring 6 番）により、グラフ内で
+#: 実際に計算へ使われる `T` は、PAD の有無に関わらず学習時の `max_bytes` が
+#: 厳密な上限になる（以前は密な入力かつ PAD なしという限定的な近似
+#: だったが、Slice の導入でこの限定が外れた。PR #222 レビュー指摘）。
+#: 書き出し時点（`_check_ar_export_resources`）では `N=1`・`T=max_bytes`
+#: の 1 ケースを検査する。`N > 1` 分の上限は、`MAX_AR_EXPORT_CHOICE_
+#: LOGPROB_ELEMENTS` の docstring に記した `n_max` の算出式（本定数の
+#: N=1 相当値も分母に使う）を通じて、ONNX グラフ内へ埋め込んだ固定長
+#: テーブルの `Gather` で fail-closed に検査する（オーナー判断
+#: 2026-09-28。PR #222 レビュー指摘）。
+MAX_AR_EXPORT_ATTENTION_ELEMENTS = 200_000_000
+
+#: 推論バッチ件数 `N` の書き出し時ハードシーリング（モデル構成に依らない
+#: 固定上限。REQ-39。オーナー判断 2026-09-28・PR #222 レビュー指摘への対応）。
+#: `_export_ar_onnx` は、この値と `MAX_AR_EXPORT_ATTENTION_ELEMENTS`・
+#: `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS`（いずれも N=1 相当の見積もりから
+#: 逆算した N の上限）の最小値を「このモデル固有の n_max」として ONNX
+#: グラフへ埋め込む（`n_max + 1` 要素の定数テーブルを実際の N で `Gather`
+#: し、範囲外なら fail-closed に失敗する）。
+#:
+#: **状態: オーナー未確認（暫定値）**。本ファイル冒頭の共通形式に厳密には
+#: 従わない一時的な値で、`MAX_C1_BATCH_SIZE`・`MAX_C3_BATCH_SIZE`・
+#: `MAX_AR_BATCH_SIZE`（いずれも学習側のミニバッチサイズ上限。4096）と
+#: 桁を揃えた仮の値。根拠: 仮置き（学習側のバッチサイズ上限からの類推で、
+#: 推論バッチの実運用規模を計測した結果ではない）。証拠種別: 仮置き。
+#: 用途が異なる（学習ミニバッチ vs 推論バッチ）ため、実運用データでの
+#: 計測後に見直す想定。テーブルの初期化子サイズがこの値に比例するため、
+#: 際限なく大きくしないこと（書き出し時のメモリにも影響する）。
+MAX_AR_INFER_BATCH_N = 4096
