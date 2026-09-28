@@ -1,0 +1,18 @@
+{
+  "schema": "fandhe-edge-model-definition/v1",
+  "name": "topic_a",
+  "version": 1,
+  "judgment_type": "single_select",
+  "options": [
+    { "id": "tier-xs__low", "display_name": "XS low", "description": "最小規模・低優先度" },
+    { "id": "tier-xs__high", "display_name": "XS high", "description": "最小規模・高優先度" },
+    { "id": "tier-s__low", "display_name": "S low", "description": "小規模・低優先度" },
+    { "id": "tier-s__high", "display_name": "S high", "description": "小規模・高優先度" },
+    { "id": "tier-m__low", "display_name": "M low", "description": "中規模・低優先度" },
+    { "id": "tier-m__high", "display_name": "M high", "description": "中規模・高優先度" },
+    { "id": "tier-l__medium", "display_name": "L medium", "description": "大規模・中優先度" },
+    { "id": "tier-l__high", "display_name": "L high", "description": "大規模・高優先度" },
+    { "id": "tier-xl__high", "display_name": "XL high", "description": "最大規模・高優先度" }
+  ],
+  "io": { "input": "bytes" }
+}

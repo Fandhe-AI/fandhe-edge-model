@@ -66,11 +66,25 @@ pub const MAX_DEFINITION_FILE_BYTES: u64 = 1_048_576;
 
 /// 判定型。REQ-15 は「固定選択肢から1つを選ぶ判定」を起点とする（NR-1）。
 /// 複数選択（NR-2）・複数項目同時判定（NR-3）・順序値（NR-4）は
-/// REQ-15 の対象外（未検証の条件）のため、バリアントを増やさない。
+/// REQ-15 の対象外（未検証の条件）のため、本番ビルドのバリアントは増やさない。
+///
+/// `TestOnlyAlternate` は `#[cfg(test)]` 限定のバリアントで、TASK-20.1-2
+/// （issue #91・REQ-20）が `crates/core/src/rebuild.rs` の unit test から
+/// 「判定型が変わった」経路（`RebuildReason::JudgmentTypeChanged`）へ到達
+/// させるための seam。本番ビルド・依存 crate（`crates/train`・`crates/data`・
+/// `crates/eval`・`crates/cli` 等、非 test cfg で本 crate をビルドする側）には
+/// 現れない。本番の `JudgmentType` へ `multi_select` 等の実バリアントを追加
+/// することは判定型スキーマの変更（NR-2 は REQ-15 対象外）であり、ユーザー
+/// 承認事項として別途扱う（本 issue の対象外）。`multi_select` は
+/// 引き続き `Definition::parse`/`load` が `DefinitionError::UnsupportedValue`
+/// で拒否する（後述のテストで固定済み）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JudgmentType {
     SingleSelect,
+    /// テスト限定の seam（上記 doc を参照）。`serde` 名は `"test_only_alternate"`。
+    #[cfg(test)]
+    TestOnlyAlternate,
 }
 
 /// 選択肢1件（不変 ID・表示名・説明。REQ-15）。
