@@ -32,8 +32,8 @@
 //! ok 終了時の判定結果型（選択肢 ID・スコア）を実装済み（CLI 側の出力配線
 //! は TASK-33.1/33.2 の対象で未着手）。
 //! `hash` モジュールは生バイト列の sha256 ダイジェスト型 [`hash::Sha256Digest`]
-//! を実装済み（issue #69・TASK-27.1-1。評価データの凍結〔REQ-17・TASK-17.2〕
-//! 側の同種 issue の PR が先にマージされた場合はそちらを正とする）。
+//! を実装済み（issue #69・TASK-27.1-1・issue #47・TASK-17.2-1。評価データの
+//! 凍結〔REQ-17〕とモデルパッケージの評価前後比較〔REQ-27〕の双方が使う）。
 //! `fs` モジュールはサイズ上限付きの安全な通常ファイル読み込み
 //! （[`fs::open_regular_file_for_read`]・[`fs::read_bounded`]・
 //! [`fs::sha256_file_bounded`]）を実装済み（REQ-39・issue #214 codex/review 指摘。

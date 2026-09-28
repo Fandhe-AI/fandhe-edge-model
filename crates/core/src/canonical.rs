@@ -15,10 +15,12 @@
 //! 同士でしか比較できない）。真偽値だけを返す `is_same(...)` は作らない
 //! （`.claude/rules/coding-rust.md`「公開 API・型設計」）。
 //!
-//! [`crate::hash`]（PR #190。評価データの凍結〔REQ-17〕向けの生バイト列の
-//! sha256）とは用途が異なる。あちらは既に読み込んだバイト列をそのまま
+//! [`crate::hash`]（評価データの凍結〔REQ-17〕向けの生バイト列の sha256。
+//! TASK-17.2-1）とは用途が異なる。あちらは既に読み込んだバイト列をそのまま
 //! ハッシュするが、こちらは `Definition` を正準化 JSON へ変換してからハッシュ
-//! する。両者は独立したユーティリティで、片方をもう片方に依存させない。
+//! する。両者は独立したユーティリティで、片方をもう片方に依存させない
+//! （本モジュールの [`sha256_hex_bytes`] は `hash::sha256_hex_bytes` へ委譲し、
+//! sha256 の実装だけを 1 か所〔`hash` モジュール〕にまとめる）。
 //!
 //! # 正準化の規則（1 箇所に集約。REQ-15）
 //!
@@ -58,7 +60,6 @@
 //! 広げない）。
 
 use crate::definition::{Definition, JudgmentType};
-use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -277,10 +278,11 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), Ca
 }
 
 /// 正準化 JSON（UTF-8 バイト列）の sha256 を計算する。
+///
+/// 実装は [`crate::hash::sha256_hex_bytes`] に委譲する（sha256 の実装を
+/// 1 か所に集約する。本モジュール冒頭の doc 参照）。
 pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
+    crate::hash::sha256_hex_bytes(bytes)
 }
 
 /// 任意の `Serialize` 値を [`canonical_json`] で正準化してから sha256 を計算し、
@@ -295,9 +297,10 @@ pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> [u8; 32] {
 /// とは独立した用途であり、本関数はどちらの型にも依存しない汎用ユーティリティ
 /// として `canonical.rs` に置く（正準化ハッシュの規則を 1 箇所に集約する。REQ-15）。
 ///
-/// [`crate::hash::sha256_hex_of_reader`]（生バイト列のストリーミング sha256。
-/// 評価データの凍結〔REQ-17〕向け）とは別物であり、本関数は必ず
-/// [`canonical_json`] を経由した値のみを対象にする。
+/// [`crate::hash::Sha256Digest::of_bytes`]（生バイト列の sha256。評価データの
+/// 凍結〔REQ-17〕向け）・[`crate::fs::sha256_file_bounded`]（ストリーミング
+/// sha256）とは別物であり、本関数は必ず [`canonical_json`] を経由した値の
+/// みを対象にする。
 ///
 /// # エラー
 ///
