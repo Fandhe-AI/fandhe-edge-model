@@ -9,6 +9,77 @@
 //! 評価時の再計算（[`crate::eval_freeze::evaluate_gate`]）」。本モジュールは
 //! ハッシュ照合を一切行わない（凍結記録との結び付けは呼び出し側の責務）。
 //!
+//! # 設計（不変条件）
+//!
+//! 以前の実装は `path` が指す既存 inode へ直接 `chmod` していたが、それでは
+//! nlink 検査（`st_nlink == 1`）と `set_permissions` 呼び出しの間に、同じ
+//! inode へのハードリンクを許可ルート外へ追加されると、その `chmod` が
+//! ルート外の inode にも及んでしまう（issue #227 codex[bot] P0 指摘）。
+//!
+//! 本実装は既存 inode への `chmod` を一切行わない。代わりに [`place_read_only`]
+//! は次の不変条件を維持する:
+//!
+//! > **本関数が権限変更（`chmod` 相当）を行う inode は、本関数自身が
+//! > `create_new`（`O_EXCL`）で新規作成した inode に限る。その inode は、
+//! > 本関数が呼び出し直前に `mkdir(0700)` で作成した非公開ディレクトリの
+//! > 中にのみ存在し、本関数が `rename` で最終配置へ移すまで他のどのパスにも
+//! > 現れない。**
+//!
+//! `O_EXCL` は常に新規 inode を保証するため、`mkdir` と `create_new` の間に
+//! 親ディレクトリへの書き込み権限を持つ第三者がこの作業ディレクトリを
+//! 別物へ差し替えたとしても（親ディレクトリ自体が書き込み可能な場合の
+//! 残存リスク。後述）、`create_new` が返す inode は依然として第三者が
+//! 事前に用意した既存 inode ではあり得ない（`O_EXCL` は「既存なら失敗」で
+//! あり「既存を返す」ことはない）。作成直後に行う `st_nlink == 1` の再検査は、
+//! 万一を想定した検出であって、この不変条件そのものを担う主防御ではない。
+//!
+//! 手順（詳細は次節）:
+//!
+//! 1. `path` の内容を、新規に `mkdir(0700)` した非公開ディレクトリ内の
+//!    `create_new` ファイルへストリームでコピーする（事前に取得した
+//!    メタデータのサイズまでに制限する。後述「サイズの扱い」）
+//! 2. コピー先（他のどのパスにも露出していない新規 inode）だけを
+//!    読み取り専用へ `chmod` する
+//! 3. コピー先の nlink が 1 であることを確認する（想定外の共有を検出）
+//! 4. `rename` でコピー先を `path` の位置へ原子的に移す（同一ファイル
+//!    システム内。symlink の場合は symlink 自体を置き換えるだけでリンク先
+//!    には触れない）
+//! 5. 配置後の `path` に対して [`verify_direct_write_rejected`] 相当の
+//!    非破壊プローブで、実際に書き込みが拒否されることを確認する
+//!
+//! # サイズの扱い（読み込み前提の変更点）
+//!
+//! 旧実装は評価データ本体を一切読み込まなかったが、本実装は `path` の内容を
+//! ストリームでコピーする（[`std::io::copy`] を固定長バッファで進めるため、
+//! 保持するメモリはファイル全体ではなく一定量に収まる）。コピー量は
+//! `open` 直後に取得したメタデータのサイズ（`+1` バイト）で打ち切り、
+//! それを超えて読み進めない（[`fandhe_edge_core::fs::read_bounded`] と
+//! 同じ考え方）。ただし「業務上許容する最大サイズ」という上限方針そのものは
+//! 依然として本モジュールの対象外（issue #172）で、ここでの上限はあくまで
+//! 「メタデータ取得後にファイルが拡大・差し替えられても際限なく読み進め
+//! ない」ための打ち切りに過ぎない。
+//!
+//! この変更により、[`place_read_only`] の呼び出しには `path` の親
+//! ディレクトリへの書き込み・実行権限（一時ディレクトリの作成・
+//! ファイルの作成・`rename` に必要）が新たに要る（旧実装は `path` 自体への
+//! 権限操作だけで完結していた）。
+//!
+//! コピー内容の完全性は `std::io::copy` の返す転送バイト数と、事前に
+//! 取得したメタデータのサイズとの一致で確認する。sha256 等での再ハッシュ
+//! 照合は行わない（[`fandhe_edge_core::hash`] の sha256 実装は共通コア層に
+//! 閉じており、任意バイト列のストリームハッシュを取るための公開 API は
+//! 現時点で無い。本 crate から `sha2` を直接の依存に追加することは
+//! `.claude/rules/dependency-policy.md`「承認済みの依存」表にある配置層
+//! （共通コア）を超える新規追加になり、data-builder の裁量を超えるため
+//! 見送った。加えて、開いたままのハンドルへ結び付けたストリームハッシュは
+//! Linux の `/proc/self/fd` でしか安全に取れず〔macOS の `/dev/fd` は
+//! `dup()` 相当でオフセットを共有するため、`io::copy` で末尾まで読み進めた
+//! 後に取り直すと 0 バイトしか読めない〕、移植可能な形にできない。
+//! コピー内容の完全性照合を厳密にしたい場合は、共通コアへストリーム
+//! ハッシュの公開 API を追加するかどうかを main の設計判断とし、承認事項
+//! として報告する）。下流の内容整合性は凍結記録の sha256 による事後検知
+//! （[`crate::eval_freeze::evaluate_gate`]・issue #49）に委ねる。
+//!
 //! # 責務の境界（本モジュールが行わないこと）
 //!
 //! - **経路の閉じ込め（`../`・絶対パス・symlink によるルート外参照の拒否）は
@@ -16,26 +87,32 @@
 //!   `path` はガード層を通過済みであることを前提とする。crate 全体の前提
 //!   条件。`crates/data/src/lib.rs`）。ただし symlink そのものへの権限変更は
 //!   本モジュール自身の安全のため拒否する（後述）
-//! - **読み込み前のサイズ上限検査は行わない**（issue #172 の対象）。本
-//!   モジュールは評価データ本体を読み込まず、`chmod` 相当の権限変更のみ行う
+//! - **読み込み前のサイズ上限（業務上の最大値）検査は行わない**
+//!   （issue #172 の対象）。「サイズの扱い」節のとおり、コピー量は事前
+//!   取得サイズまでに打ち切るが、その値自体への上限は課さない
 //! - **ハッシュ不一致検知（凍結記録との突き合わせ）は行わない**
 //!   （TASK-17.3・issue #49 の対象）
-//! - **親ディレクトリ単位の読み取り専用化は行わない**。ファイルの mode だけ
-//!   では、書き込み可能な親ディレクトリ内での unlink・rename による
-//!   差し替えは防げない（PoC-20 もファイル単位の `chmod 444` のみを実測
-//!   している）。差し替えは凍結記録の sha256 による事後検知
-//!   （[`crate::eval_freeze::evaluate_gate`]・issue #49）で捕捉する
+//! - **親ディレクトリ単位の読み取り専用化は行わない**。本関数の呼び出しが
+//!   終わった後、その親ディレクトリ自体が書き込み可能であれば、`unlink`・
+//!   `rename` による差し替えは防げない（PoC-20 もファイル単位の
+//!   `chmod 444` のみを実測している）。差し替えは凍結記録の sha256 による
+//!   事後検知（[`crate::eval_freeze::evaluate_gate`]・issue #49）で捕捉する。
+//!   同じ理由で、`mkdir(0700)` から `create_new` までの間に親ディレクトリの
+//!   書き込み権限を持つ第三者が作業ディレクトリ名を奪い取ろうとしても、
+//!   「不変条件」節のとおり `O_EXCL` が新規 inode を保証するため、この
+//!   モジュールが chmod する対象が既存の（ルート外を含む）inode に
+//!   すり替わることはない
 //! - **root 実行下での書き込み防止は保証しない**。root は mode `0o444` でも
 //!   書き込めるため、[`place_read_only`] は書き込みを防げない配置を
 //!   「配置済み」と装わず、[`PlacementError::WriteNotRejected`] で
 //!   fail-closed に失敗させる（後述「root・ACL の扱い」）
-//! - **ハードリンクされたファイルへの権限変更は拒否する**（unix。
-//!   `st_nlink != 1`）。`(dev, ino)` の一致だけではハードリンクを検出
-//!   できず、許可ルート内のパスがルート外ファイルへのハードリンク
-//!   だった場合に `set_permissions` がそのルート外 inode の権限を
-//!   変更してしまう（issue #227 codex[bot] P0 指摘）。本モジュールは
-//!   経路の閉じ込め自体は行わない前提のため、リンク数を見て「単独の
-//!   実体か」を確認することでこの経路を閉じる
+//! - **ハードリンクされたコピー元ファイルへの配置は拒否する**（unix。
+//!   `st_nlink != 1`）。以前は「chmod がルート外 inode へ及ぶことを防ぐ」
+//!   ための検査だったが、本実装ではコピー元を chmod しないためその意味は
+//!   なくなった。代わりに「凍結対象のコピー元が単独の実体でない（別の
+//!   パスからも書き換えられうる可能性がある）場合は凍結を拒否する」という
+//!   保守的な判断として維持する（コピー中にもう一方のリンク経由で内容が
+//!   書き換えられる競合を避ける）
 //! - **非 unix では読み取り専用配置そのものを拒否する**
 //!   （[`PlacementError::UnsupportedPlatform`]）。Windows には
 //!   `(dev, ino)` 相当の安価な同一性検査手段が無く、検査用ハンドルを
@@ -51,34 +128,34 @@
 //! 1. `symlink_metadata` で symlink・非通常ファイルを拒否する（リンク先が
 //!    評価ディレクトリ外かもしれないファイルの権限を、本関数の副作用で
 //!    書き換えないため）
-//! 2. [`fandhe_edge_core::fs::open_regular_file_for_read`] で開く（非 unix
-//!    ではここで [`PlacementError::UnsupportedPlatform`] として拒否する）
+//! 2. [`fandhe_edge_core::fs::open_regular_file_for_read`] でコピー元を開く
+//!    （非 unix ではここで [`PlacementError::UnsupportedPlatform`] として
+//!    拒否する）
 //! 3. unix では、手順 1 の `(dev, ino)` と開いたハンドルのそれを突き合わせ、
 //!    検査からオープンまでの差し替え（TOCTOU）を検出する。続けて
 //!    ハンドルの `st_nlink` が 1 であることを確認し、ハードリンクされた
-//!    ファイル（ルート外ファイルへのハードリンクかもしれない）への
-//!    権限変更を拒否する
-//! 4. ハンドル経由で権限を `0o444`（読み取り専用・setuid/setgid/sticky・
-//!    実行ビットなし）に変更する（unix のみ。非 unix は手順 2 で既に
-//!    拒否済み）
-//! 5. 反映を確認する
-//! 6. [`verify_direct_write_rejected`] を呼び、実際に書き込みが拒否される
-//!    ことを確認できた場合に限り成功とする（fail-closed）
+//!    ファイル（内容が別パス経由で書き換えられうる）への凍結を拒否する
+//! 4. `path` の親ディレクトリの中に `mkdir(0700)` で非公開の作業
+//!    ディレクトリを新規作成し、その中に `create_new` で新規ファイルを作る
+//! 5. コピー元の内容を、事前取得したサイズまでに制限してストリームで
+//!    新規ファイルへコピーする（「サイズの扱い」節）
+//! 6. 新規ファイル（他のどのパスにも露出していない）だけを権限
+//!    `0o444`（読み取り専用・setuid/setgid/sticky・実行ビットなし）に
+//!    変更する（unix のみ。非 unix は手順 2 で既に拒否済み）
+//! 7. 新規ファイルの nlink が 1 であることを再確認する
+//! 8. `rename` で新規ファイルを `path` の位置へ原子的に移す
+//! 9. [`verify_direct_write_rejected`] 相当の非破壊プローブで、配置後の
+//!    `path` への直接書き込みが実際に拒否されることを確認できた場合に
+//!    限り成功とする（fail-closed）
 //!
 //! # 書き込みプローブの TOCTOU 対策（Linux）
 //!
-//! [`verify_direct_write_rejected`] は、対象への読み取り専用ハンドルを
-//! 開いて `(dev, ino)` を検査時点と突き合わせた後、その書き込みプローブ
-//! （`append` での再オープン）をパス経由ではなく
-//! `/proc/self/fd/<fd>` というカーネル提供の疑似シンボリックリンク経由で
-//! 行う（[`reopen_append_via_fd`]。Linux 限定）。これによりディレクトリ
-//! エントリの再探索が発生しないため、識別済みハンドルを得た後にパス上の
-//! ファイルが別実体へ差し替えられても、プローブは常に元の実体を対象に
-//! し続ける。単純にパスを再オープンして `PermissionDenied` 後に
-//! `(dev, ino)` を再検査するだけの実装では、「再検査までの間にファイルが
-//! 差し替えられ、たまたま同じ `(dev, ino)` に戻っていた」場合に、実際に
-//! 拒否されたのが差し替え後の別ファイルだったのかを区別できない（issue
-//! #227 codex[bot] P0 指摘）。macOS の `/dev/fd`（`fdescfs`）は同種の
+//! Linux では、手順 6 で権限変更したのと同じ（まだ開いたままの）ハンドルを
+//! そのまま使い、その書き込みプローブ（`append` での再オープン）をパス
+//! 経由ではなく `/proc/self/fd/<fd>` というカーネル提供の疑似シンボリック
+//! リンク経由で行う（[`reopen_append_via_fd`]）。これによりディレクトリ
+//! エントリの再探索が発生しないため、`rename` の前後を通じて一貫して
+//! 同じ inode を対象にできる。macOS の `/dev/fd`（`fdescfs`）は同種の
 //! 疑似シンボリックリンクに見えるが `dup()` 相当の実装であり、要求した
 //! フラグに関わらず元のディスクリプタのアクセスモードを越える再オープンを
 //! 拒否するため、対象ファイルの実際の権限を検査できない（issue #227
@@ -139,6 +216,12 @@ pub struct ReadOnlyPlacement {
     // 表すのみで、返り値を受け取った後の差し替え（TOCTOU）はこのフィールド
     // だけでは検出できない。その事後検知は凍結記録の sha256
     // （[`crate::eval_freeze::evaluate_gate`]・issue #49）に委ねる。
+    //
+    // 本関数は毎回 `create_new` で新規 inode を作ってから `rename` で
+    // `path` へ配置するため（モジュール doc「設計（不変条件）」）、同じ
+    // `path` に対して 2 回呼んでも `dev_ino` は毎回異なる（「冪等」とは
+    // 「もう一度呼んでも成功し mode 0o444 が得られる」という意味であり、
+    // 「同じ inode が返る」という意味ではない）。
     dev_ino: (u64, u64),
 }
 
@@ -151,7 +234,9 @@ impl ReadOnlyPlacement {
 
     /// 配置確認時点の `(dev, ino)`。呼び出し側が後から
     /// `std::fs::symlink_metadata` 等で同じ実体かどうかを突き合わせるために
-    /// 公開する（issue #227 codex[bot] P0 指摘への対応）。
+    /// 公開する（issue #227 codex[bot] P0 指摘への対応）。同じ `path` に
+    /// 対して [`place_read_only`] を複数回呼ぶと、呼ぶたびに新しい inode が
+    /// 作られるため値は変わる（構造体 doc参照）。
     #[must_use]
     pub fn dev_ino(&self) -> (u64, u64) {
         self.dev_ino
@@ -178,13 +263,17 @@ pub enum PlacementError {
     /// ファイルシステム等、mode ビットの設定だけでは書き込みを防げない
     /// 状況を検出する（fail-closed。モジュール doc「root・ACL の扱い」）。
     WriteNotRejected { path: PathBuf },
-    /// パス先がハードリンクされている（`st_nlink != 1`。unix 限定）。
+    /// コピー元がハードリンクされている（`st_nlink != 1`。unix 限定）か、
+    /// 本関数が新規作成したコピー先が想定外に複数リンクを持っていた
+    /// （後者は原理上起きないはずの検出用チェック。モジュール doc
+    /// 「設計（不変条件）」）。
     ///
-    /// `(dev, ino)` の一致だけではハードリンクを検出できず、許可ルート内の
-    /// パスがルート外ファイルへのハードリンクだった場合に権限変更がその
-    /// ルート外 inode に及んでしまう（issue #227 codex[bot] P0 指摘）。
-    /// 単独の実体（リンク数 1）であることを確認できない限り権限変更を
-    /// 拒否する（fail-closed）。
+    /// コピー元について: 別パスからも書き換えられうる内容を凍結すると、
+    /// コピー中に内容が変化する競合を許してしまうため、単独の実体
+    /// （リンク数 1）であることを確認できない限り凍結を拒否する
+    /// （fail-closed。issue #227 codex[bot] P0 指摘を受けて、以前の
+    /// 「chmod の副作用防止」目的から「凍結対象の単独性確認」目的へ
+    /// 意味を改めた）。
     HardLinked { path: PathBuf, nlink: u64 },
     /// 非 unix プラットフォームでは読み取り専用配置そのものを拒否する。
     ///
@@ -200,7 +289,9 @@ pub enum PlacementError {
     /// 本モジュールの前提条件（通常ファイル判定・開いての読み込み）を
     /// 満たせなかった（[`fandhe_edge_core::fs`] 由来）。
     Fs(FsError),
-    /// 権限変更・メタデータ取得などの I/O エラー。
+    /// 権限変更・メタデータ取得・コピー・`rename` などの I/O エラー
+    /// （コピー時のサイズ不一致の検出を含む。モジュール doc「サイズの
+    /// 扱い」）。
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -233,7 +324,7 @@ impl fmt::Display for PlacementError {
             PlacementError::HardLinked { path, nlink } => {
                 write!(
                     f,
-                    "{} has {nlink} hard links, refusing to change permissions",
+                    "{} has {nlink} hard links, refusing to freeze it",
                     path.display()
                 )
             }
@@ -246,7 +337,7 @@ impl fmt::Display for PlacementError {
             PlacementError::Io { path, source } => {
                 write!(
                     f,
-                    "failed to change permissions on {}: {source}",
+                    "failed to place {} as read-only: {source}",
                     path.display()
                 )
             }
@@ -318,12 +409,84 @@ fn nlink_count(meta: &std::fs::Metadata) -> u64 {
     meta.nlink()
 }
 
+/// [`place_read_only`] が使う非公開の作業領域（unix 限定）。
+///
+/// `dir` は `path` の親ディレクトリの中に `mkdir(0700)` で新規作成した
+/// ディレクトリで、他のどの利用者からも到達できない（実行ビットが無い
+/// ため、ディレクトリ名を知っていてもトラバースできない）。`file_path` は
+/// その中に `create_new`（`O_EXCL`）で作る予定のファイルパスで、この
+/// ディレクトリの外へ一切公開されない限り、他プロセスがこの inode への
+/// ハードリンクを作ることはできない（モジュール doc「設計（不変条件）」）。
+#[cfg(unix)]
+struct StagingArea {
+    dir: PathBuf,
+    file_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for StagingArea {
+    fn drop(&mut self) {
+        // `place_read_only` が成功した経路では、コピー先ファイルは既に
+        // `rename` で `path` へ移動済みのため、このディレクトリは空である。
+        // 失敗した経路では中身（コピー途中のファイル）ごと削除する。
+        //
+        // この削除は「後始末」であって「原状回復」ではない点が、issue #227
+        // codex[bot] P0 指摘が問題にした旧実装の `let _ = file.set_permissions(...)`
+        // （外部・ルート外 inode の権限を元に戻そうとして失敗を無視していた）
+        // とは性質が異なる。このディレクトリは作成された瞬間から 0700 で
+        // 他者から到達できない内輪の作業領域であり、削除に失敗して
+        // 残ったとしても外部（ルート外・呼び出し元が把握するパス）へは
+        // 一切影響しない。そのため削除失敗を `place_read_only` 全体の
+        // エラーへ混ぜず、ベストエフォートに留める。
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `parent` の中に `mkdir(0700)` で非公開の作業ディレクトリを新規作成する
+/// （unix 限定）。
+///
+/// `DirBuilderExt::mode` は `mkdir(2)` 呼び出し自体に渡すモードのため、
+/// 「作成した瞬間から 0700」であることが保証される（作成後に別途
+/// `chmod` する実装だと、その間だけ既定のモードで晒される窓ができる）。
+#[cfg(unix)]
+fn create_staging_area(parent: &Path) -> Result<StagingArea, PlacementError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let pid = std::process::id();
+    for attempt in 0..1000u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = parent.join(format!(
+            ".fandhe-edge-frozen-staging-{pid}-{attempt}-{nanos}"
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => {
+                let file_path = dir.join("frozen");
+                return Ok(StagingArea { dir, file_path });
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(PlacementError::Io { path: dir, source });
+            }
+        }
+    }
+    Err(PlacementError::Io {
+        path: parent.to_path_buf(),
+        source: std::io::Error::other("failed to create a unique staging directory"),
+    })
+}
+
 /// 評価データ本体を読み取り専用配置にする（REQ-39・REQ-17・TASK-17.2-2）。
 ///
-/// モジュール doc「手順」を参照。unix では冪等（既に `0o444` であるファイル
-/// に対して呼んでも成功する）。非 unix では常に
-/// [`PlacementError::UnsupportedPlatform`] を返す（モジュール doc
-/// 「責務の境界」）。
+/// モジュール doc「設計（不変条件）」「手順」を参照。unix では冪等（既に
+/// 読み取り専用のファイルに対して呼んでも成功する。ただし呼ぶたびに新しい
+/// inode を作り直すため `dev_ino` は変わる。[`ReadOnlyPlacement`] doc
+/// 参照）。非 unix では常に [`PlacementError::UnsupportedPlatform`] を返す
+/// （モジュール doc「責務の境界」）。
 pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError> {
     let pre_meta = check_not_symlink(path)?;
 
@@ -331,6 +494,8 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
 
     #[cfg(unix)]
     {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         // `pre_meta` は `check_not_symlink` が `open` より前に取得した
@@ -349,33 +514,86 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
             });
         }
 
-        // ハードリンクされたファイル（`st_nlink != 1`）への権限変更は
-        // 拒否する。`(dev, ino)` の一致検査はパスの差し替え（TOCTOU）は
-        // 検出できるが、パス自体がルート外ファイルへのハードリンク
-        // だった場合は検出できない（issue #227 codex[bot] P0 指摘）。
-        let nlink = nlink_count(&opened_meta);
-        if nlink != 1 {
+        // コピー元がハードリンクされている（`st_nlink != 1`）場合は凍結を
+        // 拒否する。別パス経由で内容が書き換えられうる実体をコピー中に
+        // 参照すると、コピーの完全性を保証できないため（モジュール doc
+        // 「責務の境界」。issue #227 codex[bot] P0 指摘を受けて、以前の
+        // 「chmod の副作用防止」目的から意味を改めた）。
+        let source_nlink = nlink_count(&opened_meta);
+        if source_nlink != 1 {
             return Err(PlacementError::HardLinked {
                 path: path.to_path_buf(),
-                nlink,
+                nlink: source_nlink,
             });
         }
-        // 権限変更前の mode を控える。直後の再検査（後述）でハードリンクの
-        // 発生を検出した場合、権限変更（副作用）を元に戻すために使う。
-        let original_mode = opened_meta.permissions().mode() & 0o7777;
 
-        const READ_ONLY_MODE: u32 = 0o444;
-        file.set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE))
+        // `path` の親ディレクトリの中に、他のどのパスからも到達できない
+        // 非公開の作業領域を作る（モジュール doc「設計（不変条件）」）。
+        // 同一ファイルシステム内であることを保証するため、無関係な
+        // ディレクトリ（`std::env::temp_dir()` 等）ではなく `path` と
+        // 同じ親ディレクトリを使う（`rename` はファイルシステムをまたげ
+        // ない）。
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let staging = create_staging_area(parent)?;
+
+        let mut staging_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staging.file_path)
             .map_err(|source| PlacementError::Io {
                 path: path.to_path_buf(),
                 source,
             })?;
 
-        let confirmed = file.metadata().map_err(|source| PlacementError::Io {
-            path: path.to_path_buf(),
-            source,
+        // コピー量は `open` 直後に取得した `opened_meta` のサイズ（+1
+        // バイト）で打ち切る。メタデータ取得後にコピー元が拡大・差し替え
+        // られても、読み進める量自体をここで頭打ちにする
+        // （`fandhe_edge_core::fs::read_bounded` と同じ考え方。モジュール
+        // doc「サイズの扱い」）。
+        let expected_len = opened_meta.len();
+        let mut bounded_source = (&file).take(expected_len.saturating_add(1));
+        let copied = std::io::copy(&mut bounded_source, &mut staging_file).map_err(|source| {
+            PlacementError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
-        let mode = confirmed.permissions().mode() & 0o7777;
+        if copied != expected_len {
+            return Err(PlacementError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(format!(
+                    "copied {copied} bytes but expected {expected_len} bytes"
+                )),
+            });
+        }
+        staging_file
+            .flush()
+            .and_then(|()| staging_file.sync_all())
+            .map_err(|source| PlacementError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        // ここまでで書き込んだのは、他のどのパスからも到達できない新規
+        // inode（`staging.file_path`）のみ。ここから先で権限変更するのは
+        // この inode 一つだけであり、既存の（ルート外かもしれない）inode
+        // には一切触れない（モジュール doc「設計（不変条件）」）。
+        const READ_ONLY_MODE: u32 = 0o444;
+        staging_file
+            .set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE))
+            .map_err(|source| PlacementError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        let staging_meta = staging_file
+            .metadata()
+            .map_err(|source| PlacementError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mode = staging_meta.permissions().mode() & 0o7777;
         if mode != READ_ONLY_MODE {
             return Err(PlacementError::Io {
                 path: path.to_path_buf(),
@@ -385,39 +603,57 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
             });
         }
 
-        // nlink の確認（手順 3）と `set_permissions`（直前）の間に、同じ
-        // 所有者が許可ルート外へこの inode へのハードリンクを追加した場合、
-        // 直前の権限変更はそのルート外パスにも及んでしまう（issue #227
-        // codex[bot] P0 指摘）。ここで nlink を取り直し、増えていれば
-        // 権限変更前の mode へ戻したうえで拒否する（検出と原状回復。
-        // 「後始末なしの post-check」だけでは、ルート外 inode を 0o444 の
-        // ままにして失敗を報告するだけになり、副作用が残ってしまうため）。
-        // これでも「取り直し」と「戻す」の間の窓は残るが、権限変更直後に
-        // 即座に取り直すことでその窓を可能な限り狭める。
-        let confirmed_nlink = nlink_count(&confirmed);
-        if confirmed_nlink != 1 {
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(original_mode));
+        // 新規作成した inode が想定外に複数リンクを持っていないかの検出用
+        // 再確認（原理上は起こり得ないはずだが、モジュール doc「不変条件」
+        // の想定が崩れていないことを最後まで確認する）。
+        let staging_nlink = nlink_count(&staging_meta);
+        if staging_nlink != 1 {
             return Err(PlacementError::HardLinked {
                 path: path.to_path_buf(),
-                nlink: confirmed_nlink,
+                nlink: staging_nlink,
+            });
+        }
+        let confirmed_dev_ino = dev_ino(&staging_meta);
+
+        // 読み取り専用にした新規ファイルを `path` の位置へ原子的に移す。
+        // 同一ファイルシステム内の `rename` はアトミックで、`path` が
+        // symlink であってもそのリンク自体を置き換えるだけでリンク先には
+        // 触れない。
+        std::fs::rename(&staging.file_path, path).map_err(|source| PlacementError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        // `rename` 直後、`path` の実体が期待どおり配置したばかりの inode で
+        // あることを確認する（`rename` 自体はアトミックだが、この関数が
+        // 返り値を確定する直前にもう一段確認しておく。これでも本関数が
+        // `Ok` を返した「後」の差し替えまでは防げない。その事後検知は
+        // 凍結記録の sha256〔[`crate::eval_freeze::evaluate_gate`]・
+        // issue #49〕に委ねる）。
+        let final_meta = std::fs::symlink_metadata(path).map_err(|source| PlacementError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if final_meta.file_type().is_symlink() {
+            return Err(PlacementError::Symlink {
+                path: path.to_path_buf(),
+            });
+        }
+        if dev_ino(&final_meta) != confirmed_dev_ino {
+            return Err(PlacementError::Replaced {
+                path: path.to_path_buf(),
             });
         }
 
-        let confirmed_dev_ino = dev_ino(&confirmed);
-
         #[cfg(target_os = "linux")]
         {
-            // 既に開いている読み取り専用ハンドル `file` の fd をそのまま
-            // 使い、`/proc/self/fd/<fd>` 経由で書き込みプローブを行う。
-            // ここまで一度も新たにパスを開き直していないため、`file` を
-            // 開いた時点（手順 2）以降、権限変更・書き込み確認のいずれも
-            // パス経由のディレクトリエントリ再探索を経由しない。これにより
-            // `verify_direct_write_rejected_checked` を（新たにパスを開き
-            // 直す形で）呼ぶ場合に残っていた、権限変更後・書き込み確認前の
-            // TOCTOU 窓そのものを構造的に閉じる（issue #227 codex[bot] P0
-            // 指摘: 検査後に対象パスを差し替えても `place_read_only` が
-            // 成功を返してしまう問題への対応）。
-            match reopen_append_via_fd(&file) {
+            // 手順 6 で権限変更したのと同じ、まだ開いたままのハンドル
+            // `staging_file` を使い、`/proc/self/fd/<fd>` 経由で書き込み
+            // プローブを行う。この inode は既に `rename` で `path` の位置に
+            // ある実体そのものであり、パス経由の再探索を経由しないため
+            // `rename` 前後を通じて対象がぶれない（issue #227 codex[bot]
+            // P0 指摘の TOCTOU 対策）。
+            match reopen_append_via_fd(&staging_file) {
                 Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
                 Ok(_opened) => {
                     return Err(PlacementError::WriteNotRejected {
@@ -437,38 +673,15 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
         {
             // macOS 等（Linux 以外の unix）では `/dev/fd` 等のハンドル直参照
             // 手法が使えない、または信頼できない（macOS の `/dev/fd` は
-            // dup 相当で、元のハンドルのアクセスモードを越える再オープンを
-            // 要求フラグに関わらず拒否するため、対象ファイルの実際の権限を
-            // 検査できない。issue #227 cursor[bot] 指摘）。そのためパスを
-            // 開き直すベストエフォートの確認に留める。このハンドルの
-            // `(dev, ino)` を期待値として渡し、権限変更後・書き込み確認前に
-            // パスが別のファイルへ差し替えられていないかも突き合わせる
-            // （issue #227 codex P1 指摘）。
+            // dup 相当で、元のディスクリプタのアクセスモードを越える
+            // 再オープンを要求フラグに関わらず拒否し、かつオフセットを
+            // 共有するため、コピー完了後の `staging_file` から読み直しても
+            // 0 バイトしか得られない。issue #227 cursor[bot] 指摘: Write
+            // probe broken on macOS）。そのためパスを開き直すベストエフォート
+            // の確認に留める。`confirmed_dev_ino` を期待値として渡し、
+            // 権限変更後・書き込み確認前にパスが別のファイルへ差し替え
+            // られていないかも突き合わせる（issue #227 codex P1 指摘）。
             verify_direct_write_rejected_checked(path, Some(confirmed_dev_ino))?;
-        }
-
-        // 関数の返り値が確定する直前に、パス上の実体が検査してきたものと
-        // 今もなお同一であることを最後にもう一度確認する（issue #227
-        // codex[bot] P0 指摘: 検査の「間」または「直後」に対象パスを
-        // 差し替えても成功を返してしまう問題）。これは関数内で起こり得る
-        // 差し替えを閉じるものであり、この関数が `Ok` を返した「後」の
-        // 差し替えまでは防げない（クライアント側の検査では原理的に防げ
-        // ない）。返り値を受け取った後の差し替えは、凍結記録の sha256 に
-        // よる事後検知（[`crate::eval_freeze::evaluate_gate`]・issue #49）
-        // に委ねる。
-        let final_meta = std::fs::symlink_metadata(path).map_err(|source| PlacementError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if final_meta.file_type().is_symlink() {
-            return Err(PlacementError::Symlink {
-                path: path.to_path_buf(),
-            });
-        }
-        if dev_ino(&final_meta) != confirmed_dev_ino {
-            return Err(PlacementError::Replaced {
-                path: path.to_path_buf(),
-            });
         }
 
         Ok(ReadOnlyPlacement {
@@ -795,7 +1008,12 @@ mod tests {
         }
     }
 
-    /// REQ-39: `place_read_only` は冪等（2 回呼んでも成功し mode が変わらない）。
+    /// REQ-39: `place_read_only` は冪等（2 回呼んでも成功し mode が
+    /// `0o444` のまま変わらない）。本実装は呼ぶたびに新規 inode を作り
+    /// `rename` で配置し直すため、`dev_ino` は毎回変わる（[`ReadOnlyPlacement`]
+    /// doc 参照。以前の「同じ inode を chmod するだけ」の実装では
+    /// `dev_ino` も一致していたが、issue #227 codex[bot] P0 指摘への対応で
+    /// 既存 inode への chmod をやめたことに伴う意味の変更）。
     #[cfg(unix)]
     #[test]
     fn req39_place_read_only_is_idempotent() {
@@ -806,8 +1024,15 @@ mod tests {
 
         let first = place_read_only(&guard.0).expect("1 回目は成功するはず");
         let second = place_read_only(&guard.0).expect("2 回目も成功するはず");
-        assert_eq!(first, second);
+        assert_eq!(first.mode(), 0o444);
         assert_eq!(second.mode(), 0o444);
+        assert_ne!(
+            first.dev_ino(),
+            second.dev_ino(),
+            "呼ぶたびに新規 inode を作り直すため dev_ino は変わるはず"
+        );
+        let content = std::fs::read(&guard.0).expect("読み取りは成功するはず");
+        assert_eq!(content, b"eval data");
     }
 
     /// REQ-39: 書き込み可能なファイル（所有者に書き込み権限がある通常の
@@ -929,6 +1154,71 @@ mod tests {
         }
     }
 
+    /// REQ-39・TASK-17.2-2: issue #227 codex[bot] P0 指摘の回帰テスト。
+    /// `place_read_only` 呼び出し前から握り続けている、コピー元ファイルへの
+    /// 読み取りハンドル越しに見える mode が、呼び出し後も変わっていない
+    /// ことを確認する（＝コピー元の既存 inode を `chmod` していない直接
+    /// 証拠）。あわせて、`path` が指す実体が呼び出し前とは異なる inode
+    /// （新規に作って `rename` で配置した実体）に変わっていることも確認する。
+    ///
+    /// 旧実装（既存 inode へ直接 `chmod` する実装）に対して本テストを
+    /// 実行すると、握り続けたハンドル越しの mode が `0o444` に変わって
+    /// しまい、かつ `path` の inode 番号も変化しないため失敗する。
+    #[cfg(unix)]
+    #[test]
+    fn req39_place_read_only_never_chmods_original_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let guard = write_unique_temp_file("original-inode-untouched", b"eval data");
+        if running_as_root(&guard.0) {
+            // root は mode に関わらず書き込めるため、他テストで扱う分岐と
+            // 重複させない。
+            return;
+        }
+
+        // `place_read_only` の呼び出し中もコピー元と同じ inode を指し
+        // 続ける読み取りハンドルを事前に握っておく。
+        let original_handle = std::fs::File::open(&guard.0).expect("元ファイルを開けるはず");
+        let original_meta_before = original_handle
+            .metadata()
+            .expect("元ファイルのメタデータを取得できるはず");
+        let original_mode_before = original_meta_before.permissions().mode() & 0o7777;
+        let original_ino = original_meta_before.ino();
+        assert_ne!(
+            original_mode_before, 0o444,
+            "元ファイルの初期 mode は 0o444 ではないはず"
+        );
+
+        let placement = place_read_only(&guard.0).expect("配置は成功するはず");
+        assert_eq!(placement.mode(), 0o444);
+
+        // 握り続けていたハンドル越しに見える元 inode の mode が変わって
+        // いないこと（chmod が及んでいない直接証拠）。
+        let original_meta_after = original_handle
+            .metadata()
+            .expect("ハンドル越しのメタデータ取得に失敗しないはず");
+        assert_eq!(
+            original_meta_after.permissions().mode() & 0o7777,
+            original_mode_before,
+            "place_read_only は元の inode を chmod してはならない"
+        );
+
+        // `path` は `rename` により新しい inode（読み取り専用配置後の実体）
+        // を指すようになっており、握り続けていた元 inode とは異なる。
+        let final_ino = std::fs::symlink_metadata(&guard.0)
+            .expect("配置後のメタデータを取得できるはず")
+            .ino();
+        assert_ne!(
+            final_ino, original_ino,
+            "place_read_only は新しい inode へ差し替えるはず（既存 inode への chmod ではない）"
+        );
+
+        // 内容は保持されている（コピーが正しく行われたこと）。
+        let content = std::fs::read(&guard.0).expect("読み取りは成功するはず");
+        assert_eq!(content, b"eval data");
+    }
+
     /// REQ-39: ディレクトリを渡すと `NotRegularFile` になる。
     #[test]
     fn req39_place_read_only_rejects_directory() {
@@ -1004,9 +1294,9 @@ mod tests {
 
     /// REQ-39: ハードリンクされたファイルを渡すと `HardLinked` として
     /// 拒否され、リンク先（同一 inode を指すもう一方のパス）の権限も
-    /// 変更されない（issue #227 codex[bot] P0 指摘。`(dev, ino)` の一致
-    /// 検査だけではハードリンクを検出できないため、別途 `st_nlink` を
-    /// 見て拒否することを確認する）。
+    /// 変更されない（issue #227 codex[bot] P0 指摘。コピー元が単独の
+    /// 実体でないと凍結の完全性を保証できないための検査であることを
+    /// 確認する。モジュール doc「責務の境界」）。
     #[cfg(unix)]
     #[test]
     fn req39_place_read_only_rejects_hard_linked_file() {
