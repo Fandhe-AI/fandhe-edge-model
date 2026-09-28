@@ -182,7 +182,12 @@ pub fn judge(
 /// `Outcome::Label(l)` で `l == gold` の場合のみ正解。未知ラベル・
 /// `Invalid`・`Abstain`・`Error` はすべて不正解として扱う（PoC-10:
 /// 予測の欠落・`status` が ok 以外・ラベル違いはすべて不正解）。
-fn is_correct(gold: &str, outcome: &Outcome) -> bool {
+///
+/// `pub(crate)`: [`crate::regression`]（旧モデルとの回帰件数算出。REQ-26・
+/// TASK-26.1-1・issue #100）も本関数と同じ正誤規則を使う。正誤規則を
+/// 1 箇所に集約し、評価ロジックを層内で再実装しない（crate ドキュメント
+/// 「評価器は TASK-24.1 の 1 つだけに集約する」）。
+pub(crate) fn is_correct(gold: &str, outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Label(l) if l == gold)
 }
 
