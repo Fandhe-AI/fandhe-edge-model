@@ -85,6 +85,19 @@
 //! `name`・`version`・選択肢の宣言順のみが原因で `NotRequired` になる場合は
 //! 両集合が空になる（`classify_display_only_change` の doc を参照）。
 //!
+//! ## 破壊的変更（BREAKING CHANGE）
+//!
+//! `RebuildDecision::NotRequired` は TASK-20.1-1（#237）時点では単位
+//! バリアント（`NotRequired,`）だったが、本 TASK-20.2 で
+//! `NotRequired(NotRequiredRebuild)` へ変更した。`RebuildDecision` に
+//! `#[non_exhaustive]` は付けていない（3 バリアントで固定する設計意図。
+//! 本ファイル冒頭のドキュメンテーションコメントを参照）ため、この型を
+//! 網羅的にパターンマッチしていた既存呼び出し元は本変更でコンパイル不能に
+//! なる。移行は `RebuildDecision::NotRequired(_)`（詳細が不要な場合）また
+//! は `RebuildDecision::NotRequired(detail)`（[`NotRequiredRebuild`] の
+//! アクセサ `display_name_changed`/`description_changed` を使う場合）へ
+//! パターンを書き換える。
+//!
 //! # 引き続き範囲外（各担当 TASK で追加する）
 //!
 //! - ハッシュ完全一致時に以降の比較処理そのものを実行しないことの保証と
