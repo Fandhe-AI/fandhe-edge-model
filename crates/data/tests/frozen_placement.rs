@@ -10,7 +10,7 @@
 //! 〔`docs/spec/03-poc/safety-hardening/scripts/case5_eval_integrity.py`〕の
 //! 再現。証拠の種別: テストハーネス）。
 //!
-//! 本ファイルのテストはすべて unix の permission bit（`0o444`）に依存する
+//! 本ファイルのテストはすべて unix の permission bit（`0o400`）に依存する
 //! ため `#![cfg(unix)]` でファイル全体を unix 限定にする（windows では
 //! `File::set_permissions` の挙動が異なるため。モジュール doc「設計」）。
 //! 個々のテストに `#[cfg(unix)]` を付けるだけでは、windows ビルドで
@@ -77,6 +77,10 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// `dest_dir` は呼び出し側が `0700` で用意する契約
+/// （[`fandhe_edge_data::frozen_placement`] モジュール doc「`dest_dir` の
+/// 機密性」）。テストヘルパーも同じ契約に従い、作成直後に明示的へ `0700`
+/// を設定する。
 fn make_temp_dir(label: &str) -> TempDirGuard {
     let pid = std::process::id();
     for attempt in 0..1000u32 {
@@ -88,7 +92,12 @@ fn make_temp_dir(label: &str) -> TempDirGuard {
             "fandhe-edge-data-frozen-placement-it-dir-{pid}-{label}-{attempt}-{nanos}"
         ));
         match std::fs::create_dir(&candidate) {
-            Ok(()) => return TempDirGuard(candidate),
+            Ok(()) => {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700))
+                    .expect("テスト用ディレクトリの権限設定に失敗しないはず");
+                return TempDirGuard(candidate);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => panic!("テスト用ディレクトリの作成に失敗しないはず: {err}"),
         }
@@ -106,7 +115,7 @@ fn running_as_root(path: &std::path::Path) -> bool {
 /// REQ-39・REQ-17・TASK-17.2-2: 凍結 → 配置 → 評価ゲートの一連の流れで、
 /// (a) append 書き込みが拒否される、(b) truncate 書き込みが拒否される、
 /// (c) 読み戻したバイト列が元の凍結記録と一致し `evaluate_gate` が
-/// `Proceed` になる、(d) unix では mode が `0o444` と完全一致する、
+/// `Proceed` になる、(d) unix では mode が `0o400` と完全一致する、
 /// (e) 利用者の `src` は変わらず書き込み可能なまま残る、ことを確認する
 /// （PoC-20 ケース 5 相当。証拠の種別: テストハーネス）。
 #[test]
@@ -130,8 +139,8 @@ fn req39_req17_freeze_then_place_read_only_then_evaluate_gate_proceeds() {
     .expect("非 root では配置が成功するはず");
     assert_eq!(
         placement.mode(),
-        0o444,
-        "(d) mode が 0o444 と完全一致すること"
+        0o400,
+        "(d) mode が 0o400 と完全一致すること"
     );
 
     // (a) append 書き込みは拒否される。
@@ -166,7 +175,7 @@ fn req39_req17_freeze_then_place_read_only_then_evaluate_gate_proceeds() {
         .permissions()
         .mode()
         & 0o7777;
-    assert_ne!(src_mode, 0o444, "src の権限は変更されないはず");
+    assert_ne!(src_mode, 0o400, "src の権限は変更されないはず");
     let src_content = std::fs::read(&src.0).expect("src の読み取りは成功するはず");
     assert_eq!(src_content, SAMPLE, "src の内容は変更されないはず");
 }

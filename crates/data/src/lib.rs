@@ -32,10 +32,13 @@
 //!   完走する型のゲート。REQ-17・TASK-17.2-1・issue #47）
 //! - [`frozen_placement`][]: 凍結済み評価データの読み取り専用配置（unix:
 //!   利用者の `src` は読み込むだけで一切書き換えず、本ツールが管理する
-//!   `dest_dir` の中に新規作成したファイルへ検証済みのバイト列を書き出して
-//!   `chmod 444` 相当にし、`std::fs::hard_link` で公開する。`src` に対する
-//!   `chmod`・`rename`・`unlink` はいずれも行わない）と、公開前の書き込み
-//!   拒否プローブ（REQ-39・REQ-17・TASK-17.2-2・issue #48。issue #227
+//!   `dest_dir`（呼び出し側が `0700`・自分所有で用意する契約。`mode &
+//!   0o077 != 0` または所有者が異なれば `InsecureDestDir` で拒否する）の
+//!   中に新規作成したファイルへ検証済みのバイト列を書き出して `chmod 400`
+//!   相当（所有者のみ読み取り可。評価データの機密性のため `444` にしない）
+//!   にし、`std::fs::hard_link` で公開する。`src` に対する `chmod`・
+//!   `rename`・`unlink` はいずれも行わない）と、公開前の書き込み拒否
+//!   プローブ（REQ-39・REQ-17・TASK-17.2-2・issue #48。issue #227
 //!   codex[bot]・cursor[bot] 指摘を受けた設計。詳細は [`frozen_placement`]
 //!   モジュール doc「設計」参照）
 //!
@@ -134,10 +137,13 @@
 //! （差し替えの事後検知は [`eval_freeze::evaluate_gate`]・TASK-17.3・
 //! issue #49 が担う）。呼び出しには `src` の読み取り権限に加え、`dest_dir`
 //! （本ツールが管理するディレクトリ）への書き込み・実行権限が要る
-//! （作業ディレクトリの作成・`hard_link` に必要）。`src`・`dest_dir` は
-//! ガード層（経路の閉じ込め。TASK-39.x）を通過済みであることを引き続き
-//! 前提とする（[`frozen_placement`] モジュール doc「設計」「責務の境界」
-//! 参照）。
+//! （作業ディレクトリの作成・`hard_link` に必要）。`dest_dir` は
+//! **呼び出し側が `0700`・自分所有で用意する契約**で、group・other 向けの
+//! 権限ビットがある、または所有者が異なる場合は `InsecureDestDir` で
+//! 拒否する（評価データの機密性。issue #227 codex[bot] P0 指摘）。
+//! `src`・`dest_dir` はガード層（経路の閉じ込め。TASK-39.x）を通過済みで
+//! あることを引き続き前提とする（[`frozen_placement`] モジュール doc
+//! 「設計」「責務の境界」「`dest_dir` の機密性」参照）。
 
 pub mod consistency;
 pub mod eval_freeze;
