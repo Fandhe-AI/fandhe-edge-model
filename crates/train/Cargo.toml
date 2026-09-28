@@ -1,0 +1,21 @@
+[package]
+name = "fandhe-edge-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Train worker request/result contract (JSON boundary types) for fandhe-edge-model."
+
+[dependencies]
+# 共通コアの定義ファイル型（`Definition`）から `label_order` を投影するために使う
+# （REQ-15・REQ-18・REQ-19。#177）。
+fandhe-edge-core.workspace = true
+# 学習リクエスト・結果 JSON の検証済み型への読み込み・直列化に使う（2026-09-27
+# オーナー承認済み。配置層に学習ワーカー層〔本 crate〕が加わることは
+# dependency-policy.md「承認済みの依存」の表更新と合わせてオーナー確認事項とする）。
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

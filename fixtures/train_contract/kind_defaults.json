@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "description": "Per-kind default config values (REQ-18/19/19b/21/39). Single source of truth is trainer/src/fandhe_edge_trainer/kinds/*.py::DEFAULT_CONFIG. Cross-checked by trainer/tests/test_kind_defaults_fixture.py (equality with each kind DEFAULT_CONFIG) and crates/train/src/result.rs (effective config = kind defaults overwritten by request.config, compared for full equality against the artifact config returned by the worker). Adding a new kind to the selection point (kinds/__init__.py::_registry) requires adding its DEFAULT_CONFIG here, or the Python fixture test fails."
+  },
+  "c1": {
+    "ngram_min": 1,
+    "ngram_max": 4,
+    "min_df": 2,
+    "max_features": 200000,
+    "C": 1.0,
+    "epochs": 30,
+    "batch_size": 64,
+    "lr": 0.5
+  },
+  "c3": {
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "epochs": 40,
+    "batch_size": 64,
+    "emb": 64,
+    "filters": 128,
+    "widths": [
+      3,
+      5,
+      7
+    ],
+    "dropout": 0.3
+  }
+}

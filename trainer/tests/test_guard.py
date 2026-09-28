@@ -69,6 +69,22 @@ def test_confine_rejects_empty_relative_path(tmp_path: Path) -> None:
         root_handle.close()
 
 
+def test_confine_rejects_dot_only_path(tmp_path: Path) -> None:
+    """`"."`（構成要素なしの相対パス）は `PurePosixPath(".").parts` が空
+    タプルになるため `not rel.parts` に引っかかり拒否される（REQ-39 P1・
+    Bugbot 指摘の確認。PR #220。共有 fixture `request_reject_cases.json` の
+    `train_path_dot_only` ケースが Rust・Python 両実装で一致することの
+    根拠を pin する）。
+    """
+    root_handle = guard.resolve_root(str(tmp_path))
+    try:
+        with pytest.raises(WorkerError) as exc_info:
+            guard.confine(root_handle, ".", "train_path")
+        assert exc_info.value.code == "invalid_path"
+    finally:
+        root_handle.close()
+
+
 def test_confine_rejects_nul_byte(tmp_path: Path) -> None:
     root_handle = guard.resolve_root(str(tmp_path))
     try:
