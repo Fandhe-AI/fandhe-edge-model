@@ -1,0 +1,13 @@
+{
+  "labels": [
+    "create_task",
+    "complete_task",
+    "delete_task",
+    "list_tasks",
+    "set_reminder",
+    "create_note",
+    "search_notes",
+    "schedule_event",
+    "none"
+  ]
+}

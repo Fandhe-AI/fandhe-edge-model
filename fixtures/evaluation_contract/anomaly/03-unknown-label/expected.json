@@ -1,0 +1,17 @@
+{
+  "case": "03-unknown-label",
+  "description": "定義した選択肢にない正解・予測",
+  "gold_side": {
+    "expected_action": "warn_exclude",
+    "expected_reason_code": "unknown_gold_label",
+    "excluded_ids": ["an03-1"],
+    "note": "an03-1 は gold の label='Z' が labels.json（A/B）に無いため除外する。"
+  },
+  "prediction_side": {
+    "expected_action": "include",
+    "note": "an03-2 は predicted_label='Z' が labels.json に無いため type_valid=false（invalid）と判定するが、行自体は除外せず不正解として数える。gold は A なので meaning は判定不能（invalid の行は常に meaning_ng）。"
+  },
+  "expected_exit_code": 0,
+  "included_ids": ["an03-2"],
+  "an03-2_type_invalid": true
+}

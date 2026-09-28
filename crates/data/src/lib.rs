@@ -2,12 +2,17 @@
 //!
 //! 利用者が用意した学習・評価データ（JSONL、1 行 1 レコード）の検査
 //! （REQ-16）・group 単位分割と凍結（REQ-17）・来歴（REQ-40）を担う層。
-//! 本 crate は現時点で以下の 2 つを実装する。
+//! 本 crate は現時点で以下の 3 つを実装する。
 //!
 //! - [`inspect`]: 型・必須項目・ラベル enum の検査ロジック
-//!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）。件数集計
-//!   （行数・ユニーク数・ラベル別件数。TASK-16.1-2・issue #39）は対象外
+//!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）
+//! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
+//!   TASK-16.1-2・issue #39）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
+//! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
+//!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
+//!   （ケース 7〜12。矛盾・ラベル順序・未出現クラス・不正なスコア・
+//!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -55,5 +60,8 @@
 //! doc コメントも参照）。`docs/spec` は参照せず、ビルド・テストは
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
 
+pub mod eval_input;
 pub mod inspect;
+mod json_keys;
+pub mod report;
 pub mod split;

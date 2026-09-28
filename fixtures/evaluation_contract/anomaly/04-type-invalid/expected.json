@@ -1,0 +1,17 @@
+{
+  "case": "04-type-invalid",
+  "description": "定義した型・enum に合わない値",
+  "gold_side": {
+    "expected_action": "warn_exclude",
+    "expected_reason_code": "malformed_gold",
+    "excluded_ids": ["an04-1"],
+    "note": "an04-1 は label が整数 1 で、定義された型（string, かつ labels.json の enum）に合わないため除外する。"
+  },
+  "prediction_side": {
+    "expected_action": "include",
+    "note": "an04-2 は predicted_label が配列 [\"A\"] で string 型ではないため type_valid=false（invalid）。行は除外せず不正解として数える。"
+  },
+  "expected_exit_code": 0,
+  "included_ids": ["an04-2"],
+  "an04-2_type_invalid": true
+}

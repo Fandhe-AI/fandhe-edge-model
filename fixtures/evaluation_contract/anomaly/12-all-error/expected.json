@@ -1,0 +1,8 @@
+{
+  "case": "12-all-error",
+  "description": "全件失敗（全件が推論エラー）",
+  "expected_action": "warn_include",
+  "expected_exit_code": 0,
+  "expected_reason_code": "all_error",
+  "note": "評価器は正常終了する（停止しない）。推論エラー率 = 3/3 = 1.0（100%）。全体正解率 = 0/3 = 0。採用判定正解率は分母から abstain を除くだけなので分母 3 のまま、0/3 = 0（error は分母に含め不正解として数える）。coverage = (3-0)/3 = 1.0（abstain が 0 件のため。coverage の定義は abstain のみに基づき、error は含めない）。"
+}

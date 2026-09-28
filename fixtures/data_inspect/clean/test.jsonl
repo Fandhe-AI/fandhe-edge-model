@@ -1,0 +1,10 @@
+{"id": "lora-train:2", "input": "プレゼン準備のタスク作ろう、期限は2026年7月15日で優先度は低いよ", "output": {"intent": "create_task", "arguments": {"title": "プレゼン準備", "due_date": "2026-07-15", "priority": "low"}}, "tags": ["intent:create_task", "source:lora-train"], "group_id": "g-102176cfb140"}
+{"id": "lora-train:36", "input": "タスク「散歩」作るよ", "output": {"intent": "create_task", "arguments": {"title": "散歩"}}, "tags": ["intent:create_task", "source:lora-train"], "group_id": "g-6f853c08403b"}
+{"id": "lora-train:48", "input": "タスク「資料のレビュー」やりたいなisexceed", "output": {"intent": "complete_task", "arguments": {"title": "資料のレビュー"}}, "tags": ["intent:complete_task", "source:lora-train"], "group_id": "g-6fdbc37d0bb2"}
+{"id": "lora-train:53", "input": "買い物リストを作り終えたいな", "output": {"intent": "complete_task", "arguments": {"title": "買い物リストの作成"}}, "tags": ["intent:complete_task", "source:lora-train"], "group_id": "g-2e065b4ca2fd"}
+{"id": "lora-train:63", "input": "資料のレビュータスクを終わらせたいね", "output": {"intent": "complete_task", "arguments": {"title": "資料のレビュー"}}, "tags": ["intent:complete_task", "source:lora-train"], "group_id": "g-6fdbc37d0bb2"}
+{"id": "lora-train:91", "input": "読書メモのタスク消すよ", "output": {"intent": "delete_task", "arguments": {"title": "読書メモ"}}, "tags": ["intent:delete_task", "source:lora-train"], "group_id": "g-ca4262ee4f91"}
+{"id": "lora-train:99", "input": "タスク「請求書の確認」を削除したい", "output": {"intent": "delete_task", "arguments": {"title": "請求書の確認"}}, "tags": ["intent:delete_task", "source:lora-train"], "group_id": "g-e12cd8f204be"}
+{"id": "lora-train:100", "input": "タスク「読書メモ」を削除したい", "output": {"intent": "delete_task", "arguments": {"title": "読書メモ"}}, "tags": ["intent:delete_task", "source:lora-train"], "group_id": "g-ca4262ee4f91"}
+{"id": "lora-train:133", "input": "完了したタスクを並べ替えて表示してよполнить", "output": {"intent": "list_tasks", "arguments": {"filter": "completed"}}, "tags": ["intent:list_tasks", "source:lora-train"], "group_id": "g-0d9ca034a648"}
+{"id": "lora-train:136", "input": "完了したタスクを全部見たいね", "output": {"intent": "list_tasks", "arguments": {"filter": "completed"}}, "tags": ["intent:list_tasks", "source:lora-train"], "group_id": "g-0d9ca034a648"}

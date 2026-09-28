@@ -1,0 +1,10 @@
+{
+  "case": "07-contradiction",
+  "description": "矛盾（同じ input に異なる正解）",
+  "expected_action": "warn_exclude",
+  "expected_exit_code": 0,
+  "expected_reason_code": "contradictory_input",
+  "excluded_ids": ["an07-1", "an07-2"],
+  "included_ids": ["an07-3"],
+  "note": "an07-1・an07-2 は正規化 input が同一だが label が A と B で矛盾するため、両方とも分母から除外して件数と ID を報告する。data/contradictions.json で参照データにも同種の矛盾が 6 個の input（57 行）検出されている（すべて schedule_event、duration_minutes の有無・値の違い）。データ検査（検証方法 10）はこの数値を再現できることを目標にする。"
+}

@@ -1,0 +1,10 @@
+{
+  "case": "09-unseen-class",
+  "description": "未出現クラス（定義にあるが train または test に 0 件のラベル）",
+  "expected_action": "warn_include",
+  "expected_exit_code": 0,
+  "expected_reason_code": "unseen_class",
+  "unseen_labels": ["C"],
+  "note": "labels.json は A/B/C の 3 ラベルを定義するが、gold・pred のいずれにも C は 0 件。評価器は警告を出したうえで通常どおり処理を続ける（件数には影響しない）。C の recall・precision・F1 はいずれも null（support=0 かつ predicted_count=0、すなわち TP+FP+FN=0）。A: precision=1/2, recall=1/2, f1=1/2。B: precision=1/2, recall=1/2, f1=1/2。Macro-F1 は A・B の平均 = 1/2（C を除外）。",
+  "reviewed_2026-09-23": "F1 の未定義規則の修正（TP+FP+FN=0 のときだけ null。support>=1 かつ predicted_count=0、またはその逆では F1=0 とし null にしない）を受けて確認した。C は support=0 かつ predicted_count=0（TP+FP+FN=0）で新規則の null 条件に厳密に一致するため、本ケースの期待値・Macro-F1 の除外は変更なし。"
+}
