@@ -63,10 +63,34 @@ const HASH_INPUT_RULE: &str = "canonical-json-sorted-record-ids-v1";
 /// 呼び出し側が対応しない `SplitResult` と `SplitRecord` を組み合わせて
 /// 新しい `RecordedSplit` を組み立てられてしまい、上記の対応保証を型で
 /// 強制できなくなるため（レビュー指摘。#210 Cursor Bugbot Medium）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`result`（[`SplitResult`]）は
+/// `by_record` にレコード ID を実キーとして持ち、`SplitResult` 自体は
+/// `derive(Debug)` のため `{:?}` でそのまま出力するとレコード ID が漏れる。
+/// `record`（[`SplitRecord`]）側は本モジュールの他の型が手動実装した
+/// `Debug` により既に ID を伏せているが、`result` はその redaction の
+/// 対象外だったため本型でも直接漏洩しうる状態だった
+/// （security.md「秘密情報の混入防止」。PR #210 Cursor Bugbot Medium 指摘）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecordedSplit {
     result: SplitResult,
     record: SplitRecord,
+}
+
+impl std::fmt::Debug for RecordedSplit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordedSplit")
+            .field(
+                "result",
+                &format_args!(
+                    "<redacted {} records, {} groups>",
+                    self.result.by_record.len(),
+                    self.result.by_group.len()
+                ),
+            )
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 impl RecordedSplit {
@@ -1712,6 +1736,34 @@ mod tests {
         assert_eq!(
             recorded.result().rule_id,
             recorded.record().rule().rule_id()
+        );
+    }
+
+    /// レビュー指摘（PR #210 Cursor Bugbot Medium）の回帰テスト:
+    /// `RecordedSplit` を `{:?}`（Debug）で出力しても、内包する
+    /// `SplitResult::by_record` の実際のレコード ID が漏れないことを確認する
+    /// （security.md「秘密情報の混入防止」）。
+    #[test]
+    fn req17_task17_1_2_recorded_split_debug_does_not_leak_record_ids() {
+        let records = vec![
+            record("secret-record-id-1", "g1", "a"),
+            record("secret-record-id-2", "g2", "a"),
+        ];
+        let recorded = split_and_record(&records, 1, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+
+        let debug_output = format!("{recorded:?}");
+        assert!(
+            !debug_output.contains("secret-record-id-1"),
+            "RecordedSplit の Debug 出力にレコード ID が含まれてはならない: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("secret-record-id-2"),
+            "RecordedSplit の Debug 出力にレコード ID が含まれてはならない: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("<redacted"),
+            "result フィールドは redacted 表示になるはず: {debug_output}"
         );
     }
 }
