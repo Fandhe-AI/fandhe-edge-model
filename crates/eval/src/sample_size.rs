@@ -6,9 +6,14 @@
 //! 未満なら判定を実行せず「判定不能」を返す分岐をすでに実装している
 //! （PR #219）。本モジュールはその `RequiredSampleSize` を、検出力（power）・
 //! 有意水準（α）・検出したい候補の正解率の差から事前に算出する関数を提供する
-//! （REQ-25 異常系・TASK-25.2・issue #66）。PoC-10
-//! `03-poc/scratch-classifier/scripts/required_n_mcnemar.py` の計算手順を
-//! Rust（std のみ）へ移植したもの。
+//! （REQ-25 異常系・TASK-25.2・issue #66）。[`mcnemar_sample_size_estimate`]
+//! は PoC-10 `03-poc/scratch-classifier/scripts/required_n_mcnemar.py` の
+//! 計算手順（Connor 1987 の正規近似）を Rust（std のみ）へ移植したもの。
+//! ただし [`required_sample_size_mcnemar`] は、この正規近似の `ceil(n)` を
+//! そのまま採用するのではなく、評価データ総件数を仮定した両側正確検定の
+//! 実際の検出力（[`power_given_total_n`]）で引き上げた値を返す（PR #230
+//! レビュー指摘・P0: 正規近似だけでは実際に使う正確検定の検出力を
+//! 保証できなかったため）。
 //!
 //! 呼び出し文脈は、CLI の `evaluate` 工程（将来・TASK-33.x）や事前登録手続き
 //! が、仮定した候補・下限基準の正解率の差（`p_b`・`p_c`）と α・power から
@@ -29,7 +34,6 @@
 //!   決めた値を渡す
 //! - JSON 入出力・ファイル I/O・CLI 統合は行わない
 
-use crate::mcnemar::mcnemar_exact_two_sided;
 use crate::significance::{MAX_EVAL_RECORDS, RequiredSampleSize};
 
 /// [`McNemarSampleSizeAssumption::new`]・[`required_sample_size_mcnemar`]が
@@ -79,6 +83,21 @@ pub enum SampleSizeError {
         /// [`MAX_EVAL_RECORDS`] の値。
         limit: usize,
     },
+    /// 正規近似の `ceil(n)` が [`EXACT_POWER_SEARCH_MAX_N`] を超えるため、
+    /// 正確検定に基づく検出力探索（[`required_sample_size_mcnemar`]）を
+    /// 行わずに拒否した。または、探索を行ったが上限内に目標検出力を
+    /// 満たす総件数が見つからなかった。
+    ///
+    /// いずれも fail-closed の計算量上限であり、`ExceedsRecordLimit` とは
+    /// 異なる（こちらは [`MAX_EVAL_RECORDS`] よりずっと小さい、正確検定の
+    /// 検出力探索固有の暫定上限）。
+    ExceedsExactSearchLimit {
+        /// 正規近似の `ceil(n)`（探索の起点。上限超過で拒否した場合に限り、
+        /// この値が [`EXACT_POWER_SEARCH_MAX_N`] を超えている）。
+        ceil_n: u64,
+        /// [`EXACT_POWER_SEARCH_MAX_N`] の値。
+        limit: u64,
+    },
     /// 理論上到達しないはずの内部不整合（非有限値の算出・負の平方根引数等）。
     /// fail-closed のガード（`crate::mcnemar::McNemarError::Internal` と
     /// 同じ位置づけ）。
@@ -122,6 +141,12 @@ impl std::fmt::Display for SampleSizeError {
                 write!(
                     f,
                     "required sample size {required} exceeds record limit {limit}"
+                )
+            }
+            SampleSizeError::ExceedsExactSearchLimit { ceil_n, limit } => {
+                write!(
+                    f,
+                    "normal-approximation ceil(n) {ceil_n} exceeds exact power search limit {limit}"
                 )
             }
             SampleSizeError::Internal { detail } => {
@@ -421,67 +446,265 @@ pub fn mcnemar_sample_size_estimate(
     Ok(n)
 }
 
-/// 正確検定（両側）で理論上到達しうる最小件数（下限）を求める。
+/// `exponent * log_base` を計算するが、`exponent == 0.0` のときは
+/// `log_base` の値（`-∞` を含む）に関わらず常に `0.0` を返す。
 ///
-/// Connor (1987) の正規近似は、`p_b`・`p_c` の差が極端（例:
-/// `p_b=1.0, p_c=0.0`）な仮定では、正規近似だけで求めた `ceil(n)` 件を
-/// 評価しても正確検定（[`crate::mcnemar::mcnemar_exact_two_sided`]）が
-/// 決して有意にならない値を返すことがある（PR #230 レビュー指摘・P0）。
-/// 例えば `p_b=1.0, p_c=0.0, alpha=0.05, power=0.8` では正規近似が 4 を
-/// 返すが、`n_discordant=4` 件すべて候補のみ正解でも両側正確検定は
-/// `p=0.125 >= 0.05` で有意にならない（検出力 0）。
+/// `x^0 = 1`（`ln(x^0) = 0`）は `x = 0` であっても成り立つ恒等式だが、
+/// 素朴に `exponent * log_base` を計算すると `0.0 * f64::NEG_INFINITY` が
+/// `NaN` になってしまう。`p_c = 0`（`theta = p_b / (p_b + p_c) = 1.0` と
+/// なり `ln(1 - theta) = -∞`）等、確率が厳密に 0 になる境界的な仮定で
+/// 対数尤度の項を計算する際に必要になる（PR #230 レビュー指摘・P0の
+/// 修正で判明した境界ケース。`p_b=0.95, p_c=0`・`p_b=1.0, p_c=0` の
+/// いずれも該当する）。
+fn ln_pow(exponent: f64, log_base: f64) -> f64 {
+    if exponent == 0.0 {
+        0.0
+    } else {
+        exponent * log_base
+    }
+}
+
+/// 不一致ペア数 `n` が与えられたときの、両側正確検定の条件付き検出力
+/// （power）を計算する。
 ///
-/// 本関数は、不一致ペアが `n` 件ともすべて候補のみ正解（`b=n, c=0`。
-/// 正確検定の両側 p 値が最小になる、最も有利な内訳）という理想的な場合に
-/// 限っても、正確検定が `p < alpha` に到達するために必要な最小の
-/// 不一致ペア数 `n` を、`n = 1, 2, ...` と順に
-/// [`crate::mcnemar::mcnemar_exact_two_sided`] を呼んで探索する
-/// （[`crate::significance::judge`] と同じ `p < alpha` の厳密な不等号を
-/// 使う）。この `n` は「この仮定のままではどれだけ都合よく内訳が偏っても
-/// 到達できない」ことを判定するための下限（真の必要件数はこれ以上）で
-/// あり、[`mcnemar_sample_size_estimate`] が仮定する検出力（power）を
-/// 満たす保証はしない（正確検定に基づく検出力の算出は本 issue の範囲外。
-/// モジュール冒頭の「対象外」節参照）。
+/// 対立仮説の下では、各不一致ペアが独立に確率
+/// `theta = p_b / (p_b + p_c)` で候補のみ正解（McNemar の `b` 側）になると
+/// 仮定する。つまり `n` 件の不一致ペアのうち候補favor件数
+/// `B ~ Binomial(n, theta)`、`C = n - B`。[`crate::significance::judge`]
+/// が「候補が有意に優れる」と判定するのは `b > c` かつ両側 p 値が `alpha`
+/// 未満のときだけであり、`b < c`（下限基準が有意に優れる）は判定不能でも
+/// 合格でもない別の結果のため、本関数の検出力には数えない。
 ///
-/// 探索は `n = `[`MAX_EVAL_RECORDS`]` + 1` に達しても見つからない場合に
-/// 打ち切り、`None` を返す（この仮定の `alpha` では、どれだけ都合よく
-/// 内訳が偏っても `MAX_EVAL_RECORDS` 以下では正確検定が有意にならない）。
-/// `MAX_EVAL_RECORDS`（1,000,000）は
-/// [`crate::mcnemar::MAX_DISCORDANT_PAIRS`]（10,000,000）を下回るため、
-/// 探索中に `mcnemar_exact_two_sided` の資源上限エラーには到達しない。
-fn exact_test_minimum_n(alpha: f64) -> Result<Option<u64>, SampleSizeError> {
-    for n in 1..=(MAX_EVAL_RECORDS as u64 + 1) {
-        let exact = mcnemar_exact_two_sided(n, 0).map_err(|e| SampleSizeError::Internal {
-            detail: format!("mcnemar_exact_two_sided failed during floor search: {e}"),
-        })?;
-        // `crate::significance::judge` と同じ厳密な `p < alpha`（`b > c`
-        // は `b=n>0=c` で自明に満たす）。
-        if exact.p_two_sided().value() < alpha {
-            return Ok(Some(n));
+/// 棄却域（`b > c` 方向）は [`crate::mcnemar::mcnemar_exact_two_sided`] と
+/// 同じ規則（帰無分布 `Binomial(n, 0.5)` の下で両側 p 値が `alpha` 未満）
+/// で決まる。`p_two_sided(b, n-b) = min(1, 2 * F(k; n, 0.5))`
+/// （`k = min(b, n-b)`、`F` は帰無分布の CDF）という関係を使い、
+/// `k = 0, 1, ...` と増やしながら `F(k)` を対数空間で逐次計算する
+/// （二項係数の対数を差分更新する手法は [`crate::mcnemar`] の内部関数と
+/// 同じ）。`F(k) < alpha / 2` を満たす間だけ、`b = n - k > c = k` 側
+/// （`k == n - k` のとき `b == c` となり `b > c` を満たさないため除外する）
+/// の `theta` 下の二項確率を足し込み、条件を外れた時点で打ち切る（`p` は
+/// `k` について単調非減少なので、それ以降は棄却域に入らない）。
+///
+/// `F(0) = 2^-n` は `n` が大きいとアンダーフローして `0.0` になりうるが、
+/// これは意図した挙動である。`k` が棄却域の境界（`alpha` に応じた
+/// 有意水準の閾値。おおむね `n/2` から `O(sqrt(n))` 離れた位置）に近づく
+/// までの小さい `k` での過小評価は、その `k` の真の寄与が実際に無視できる
+/// 大きさであることに対応するため、最終的な検出力の値を歪めない
+/// （[`crate::mcnemar`] の「アンダーフロー」節と同じ考え方）。
+///
+/// この検出力は「不一致ペアが厳密に `n` 件」という条件の下でのものであり
+/// （`n` に依存しない）、評価データ総件数 `N` を仮定したときの検出力は
+/// [`power_given_total_n`] が本関数を `N` に依存する形で加重平均する。
+///
+/// 計算量は棄却域の大きさ（`k <= n/2` 件）に比例する `O(n)` で、`Vec` 等の
+/// 確保はしない。
+fn exact_test_power(n: u64, theta: f64, alpha: f64) -> Result<f64, SampleSizeError> {
+    if n == 0 {
+        // `crate::mcnemar` の規約により n=0 では p_two_sided は常に 1.0
+        // であり、`alpha < 1.0`（構築時に検証済み）の下では決して有意に
+        // ならない。
+        return Ok(0.0);
+    }
+
+    let ln_theta = theta.ln();
+    let ln_one_minus_theta = (1.0 - theta).ln();
+    let ln_2 = std::f64::consts::LN_2;
+    let n_f = n as f64;
+    let half_threshold = alpha / 2.0;
+    let half_n = n / 2;
+
+    let mut ln_choose = 0.0_f64; // ln C(n, 0) = 0
+    let mut cdf_null = (-n_f * ln_2).exp(); // F(0) = C(n,0) * 2^-n
+    let mut power = 0.0_f64;
+
+    let mut k: u64 = 0;
+    loop {
+        if k > 0 {
+            let k_f = k as f64;
+            let n_minus_k_plus_1 = (n - k + 1) as f64;
+            ln_choose += n_minus_k_plus_1.ln() - k_f.ln();
+            let pmf_k = (ln_choose - n_f * ln_2).exp();
+            if !pmf_k.is_finite() {
+                return Err(SampleSizeError::Internal {
+                    detail: "non-finite null pmf in exact_test_power".to_string(),
+                });
+            }
+            cdf_null += pmf_k;
+            if !cdf_null.is_finite() {
+                return Err(SampleSizeError::Internal {
+                    detail: "non-finite null cdf in exact_test_power".to_string(),
+                });
+            }
+        }
+
+        if cdf_null >= half_threshold {
+            break;
+        }
+
+        let k_f = k as f64;
+        if k != n - k {
+            // b = n - k > c = k 側のみを数える（`judge` の `b > c` 方向。
+            // モジュールコメント参照）。
+            let ln_pmf_upper = ln_pow(n_f - k_f, ln_theta) + ln_pow(k_f, ln_one_minus_theta);
+            power += (ln_choose + ln_pmf_upper).exp();
+        }
+
+        if !power.is_finite() {
+            return Err(SampleSizeError::Internal {
+                detail: "non-finite power in exact_test_power".to_string(),
+            });
+        }
+
+        if k >= half_n {
+            break;
+        }
+        k += 1;
+    }
+
+    Ok(power.min(1.0))
+}
+
+/// 評価データ総件数 `total_n` を仮定したときの、両側正確検定の実際の
+/// 検出力（power）を計算する。
+///
+/// [`RequiredSampleSize`]・[`crate::significance::judge`] が扱う「件数」は
+/// 不一致ペア数ではなく評価データの**総件数**（`both_correct` 行も含む）
+/// である（`crates/eval/tests/required_sample_size.rs`
+/// `undeterminable_when_evaluated_count_is_one_below_required` 等が
+/// `total` として組み立てる件数と同じ）。したがって
+/// [`mcnemar_sample_size_estimate`]（Connor 式）が返す `n` も総件数を
+/// 指しており、[`exact_test_power`]（不一致ペア数が固定で `n` 件という
+/// 条件付き検出力）をそのまま総件数の検出力として使うのは誤り
+/// （PR #230 レビュー指摘・P0 の修正過程で判明。修正前の実装が
+/// `exact_test_power` を総件数にそのまま適用していたところ、
+/// `p_b=0.15, p_c=0.05` のような通常のケースで検出力が常に 1 に近い
+/// 誤った値になっていた）。
+///
+/// 正しくは、評価データ総件数 `total_n` 件のうち不一致ペア数
+/// `D ~ Binomial(total_n, p_b + p_c)`（各件が独立に確率 `p_b + p_c` で
+/// 不一致になると仮定）であり、`D = d` が与えられたときの候補favor件数の
+/// 条件付き分布は多項分布の性質により `Binomial(d, theta)`
+/// （`theta = p_b / (p_b + p_c)`）になる。両側正確検定は `D` の実現値
+/// だけから決まる（[`crate::mcnemar::mcnemar_exact_two_sided`] は `b`・`c`
+/// しか見ない）ため、総件数 `total_n` での検出力は `D` の周辺分布で
+/// [`exact_test_power`] を加重平均した値になる:
+///
+/// `power(total_n) = Σ_{d=0}^{total_n} P(D=d; total_n, p_b+p_c) * exact_test_power(d, theta, alpha)`
+///
+/// `cond_power` は呼び出し側が [`exact_test_power`] で事前計算した、
+/// 添字 `d` が条件付き検出力 `exact_test_power(d, theta, alpha)` に対応する
+/// キャッシュ（長さ `total_n + 1` 以上。複数の `total_n` にまたがって
+/// 再利用でき、二重計算を避ける。[`required_sample_size_mcnemar`] 参照）。
+///
+/// `D` の pmf（`Binomial(total_n, q)`。`q = p_b + p_c`）は対数空間で
+/// 逐次計算する。`q == 1.0`（`p_b + p_c == 1.0` ちょうど。
+/// [`McNemarSampleSizeAssumption::new`] が許容する境界値）では
+/// `ln(1 - q) = -∞` になるため、[`ln_pow`] で `exponent == 0.0` の場合を
+/// 個別に扱う。
+///
+/// 計算量は `O(total_n)`（`cond_power` の参照は `O(1)`）で、追加の `Vec`
+/// 確保はしない。
+fn power_given_total_n(total_n: u64, q: f64, cond_power: &[f64]) -> Result<f64, SampleSizeError> {
+    if total_n == 0 {
+        // 不一致ペアが発生しえず（D=0 のみ）、cond_power[0] は
+        // exact_test_power(0, ..) = 0.0 のはず。
+        return Ok(0.0);
+    }
+
+    let ln_q = q.ln();
+    let ln_one_minus_q = (1.0 - q).ln();
+    let n_f = total_n as f64;
+
+    let mut ln_choose = 0.0_f64; // ln C(total_n, 0) = 0
+    let mut total_power = 0.0_f64;
+
+    for d in 0..=total_n {
+        if d > 0 {
+            let d_f = d as f64;
+            let n_minus_d_plus_1 = (total_n - d + 1) as f64;
+            ln_choose += n_minus_d_plus_1.ln() - d_f.ln();
+        }
+
+        let d_f = d as f64;
+        let ln_pmf_d = ln_choose + ln_pow(d_f, ln_q) + ln_pow(n_f - d_f, ln_one_minus_q);
+        let pmf_d = ln_pmf_d.exp();
+        if !pmf_d.is_finite() {
+            return Err(SampleSizeError::Internal {
+                detail: "non-finite discordant-count pmf in power_given_total_n".to_string(),
+            });
+        }
+
+        let cond = *cond_power
+            .get(d as usize)
+            .ok_or_else(|| SampleSizeError::Internal {
+                detail: "cond_power cache is shorter than total_n + 1".to_string(),
+            })?;
+
+        total_power += pmf_d * cond;
+        if !total_power.is_finite() {
+            return Err(SampleSizeError::Internal {
+                detail: "non-finite total power in power_given_total_n".to_string(),
+            });
         }
     }
-    Ok(None)
+
+    Ok(total_power.min(1.0))
 }
+
+/// 正確検定に基づく検出力探索を行う際の評価データ総件数の上限（暫定値。
+/// REQ-39）。
+///
+/// [`exact_test_power`]・[`power_given_total_n`] は総件数に対して概ね
+/// `O(N)` だが、[`required_sample_size_mcnemar`] は候補となる総件数を
+/// 1 件ずつ増やしながらこれらを繰り返し呼ぶため、正規近似の `ceil(n)` が
+/// 大きい場合（効果量が小さい・`alpha` が小さい仮定）は計算コストが
+/// 増大する。[`MAX_EVAL_RECORDS`]（1,000,000）よりずっと小さい値に抑え、
+/// 正規近似の `ceil(n)` がこの上限を超える場合は正確検定の検出力探索を
+/// 行わずに拒否する（fail-closed。上限値自体は暫定であり、実測に基づく
+/// 調整は後続 TASK で行う）。
+pub const EXACT_POWER_SEARCH_MAX_N: u64 = 20_000;
 
 /// [`McNemarSampleSizeAssumption`] から必要件数（[`RequiredSampleSize`]）を
 /// 算出する。
 ///
-/// [`mcnemar_sample_size_estimate`] の結果を `ceil` した値と、
-/// [`exact_test_minimum_n`] が返す正確検定の下限のうち大きいほうを採用する
-/// （後者は前者を上回ることがある。上記ドキュメント参照。PR #230 レビュー
-/// 指摘・P0）。丸めに許容差は加えない（PoC-10 と同じ規則。許容差の導入は
-/// 評価契約〔[`crate::significance`]〕の変更にあたるため行わない）。`ceil`
-/// 自体は libm の `f64::ceil` に依存するが、PoC-10・PoC-24 の参照ケースは
-/// いずれも次の整数との距離が最小でも約 0.18 あり、OS ごとの丸めの
-/// 入れ替わりは想定していない（`fixtures/sample_size/PROVENANCE.md`
-/// 参照）。
+/// [`mcnemar_sample_size_estimate`]（Connor 式の正規近似）が返す `ceil(n)`
+/// を探索の起点とし、そこから評価データ総件数を 1 件ずつ増やしながら
+/// [`power_given_total_n`]（実際に使う両側正確検定の真の検出力）が
+/// 仮定した `power` 以上になる最小の総件数を探す（PR #230 レビュー
+/// 指摘・P0: 正規近似の `ceil(n)` と「正確検定で有意になりうる最小件数」の
+/// `max` を採用するだけの旧実装では、目標検出力を満たす保証がなかった。
+/// 例えば `p_b=0.95, p_c=0, alpha=0.05, power=0.8` では旧実装が 6 を
+/// 返すが、6 件全て候補のみ正解というケースで正確検定が有意になる確率は
+/// `0.95^6 ≈ 0.735 < 0.8` だった。正しい必要件数は 7 件
+/// `required_sample_size_matches_reviewed_p0_case` 参照）。
 ///
-/// 採用した値が [`MAX_EVAL_RECORDS`] を超える場合は
-/// [`SampleSizeError::ExceedsRecordLimit`] を返す（この仮定のままでは
-/// [`crate::significance::compare_with_baseline`] が確保前に拒否する件数を
-/// 超えており、判定不能から抜け出せないため）。`f64` から `u64` への変換は
-/// 上限検証を済ませた後にのみ行う（範囲外値を未検証のまま `as` で変換
-/// しない）。
+/// 正規近似の `ceil(n)` を探索の起点にできる根拠: [`mcnemar_sample_size_estimate`]
+/// は「これ未満では正規近似上も目標検出力に届かない」という下限を与える
+/// ため、真の必要件数がこれを下回ることは想定しない。起点から `1` ずつ
+/// 増やして最初に条件を満たした総件数を採用する（正確検定の検出力は
+/// 総件数について厳密に単調増加するとは限らない〔離散性による小さな
+/// 上下動がありうる〕が、[`power_given_total_n`] の `D` に関する加重平均が
+/// この上下動を平滑化するため、最初に条件を満たした点を採用する方法は
+/// 標準的な実務にならう）。
+///
+/// `cond_power` キャッシュ（[`exact_test_power`] の結果。総件数に依存
+/// しない）は候補の総件数をまたいで使い回し、総件数を 1 増やすごとに
+/// 新しい添字 1 件分だけ追加で計算する。これにより探索全体の計算量は
+/// キャッシュの構築が `O(N_final)`、[`power_given_total_n`] の呼び出しが
+/// 候補数 × `O(N_final)` に抑えられる（`N_final` は最終的に採用する
+/// 総件数）。
+///
+/// 丸めに許容差は加えない（PoC-10 と同じ規則。許容差の導入は評価契約
+/// 〔[`crate::significance`]〕の変更にあたるため行わない）。
+///
+/// 正規近似の `ceil(n)` が [`MAX_EVAL_RECORDS`] を超える場合は
+/// [`SampleSizeError::ExceedsRecordLimit`] を、[`EXACT_POWER_SEARCH_MAX_N`]
+/// を超える場合は [`SampleSizeError::ExceedsExactSearchLimit`] を返す
+/// （前者は [`crate::significance::compare_with_baseline`] が確保前に
+/// 拒否する件数を超えている場合、後者は正確検定の検出力探索の計算量上限。
+/// いずれも fail-closed）。`f64` から `u64` への変換は上限検証を済ませた
+/// 後にのみ行う（範囲外値を未検証のまま `as` で変換しない）。
 pub fn required_sample_size_mcnemar(
     assumption: &McNemarSampleSizeAssumption,
 ) -> Result<RequiredSampleSize, SampleSizeError> {
@@ -512,30 +735,38 @@ pub fn required_sample_size_mcnemar(
     // `as u64` は情報を失わない。
     let ceil_n_u64 = ceil_n as u64;
 
-    let exact_floor = exact_test_minimum_n(assumption.alpha)?;
-    let required_u64 = match exact_floor {
-        // `MAX_EVAL_RECORDS` 件以下では、最も有利な内訳（不一致ペア全件が
-        // 候補のみ正解）でも正確検定が有意にならない（`alpha` が極小）。
-        // 正規近似の `ceil_n` が上限内でも、この仮定のままでは判定不能から
-        // 抜け出せないため fail-closed で拒否する。
-        None => {
-            return Err(SampleSizeError::ExceedsRecordLimit {
-                required: MAX_EVAL_RECORDS as u64 + 1,
-                limit: MAX_EVAL_RECORDS,
-            });
-        }
-        Some(floor) => floor.max(ceil_n_u64),
-    };
-
-    if required_u64 > MAX_EVAL_RECORDS as u64 {
-        // `exact_test_minimum_n` の探索上限はちょうど `MAX_EVAL_RECORDS + 1`
-        // のため、下限がその値そのものだった場合はここで拒否する
-        // （`floor <= MAX_EVAL_RECORDS` に厳密に収まる場合のみ受理する）。
-        return Err(SampleSizeError::ExceedsRecordLimit {
-            required: MAX_EVAL_RECORDS as u64 + 1,
-            limit: MAX_EVAL_RECORDS,
+    if ceil_n_u64 > EXACT_POWER_SEARCH_MAX_N {
+        return Err(SampleSizeError::ExceedsExactSearchLimit {
+            ceil_n: ceil_n_u64,
+            limit: EXACT_POWER_SEARCH_MAX_N,
         });
     }
+
+    let q = assumption.p_b + assumption.p_c;
+    let theta = assumption.p_b / q;
+
+    // `cond_power[d]` は `exact_test_power(d, theta, alpha)`（総件数に
+    // 依存しない）。候補の総件数を増やすたびに末尾へ追加する。
+    let mut cond_power: Vec<f64> = Vec::new();
+    let mut required_u64: Option<u64> = None;
+
+    for candidate_n in ceil_n_u64..=EXACT_POWER_SEARCH_MAX_N {
+        while (cond_power.len() as u64) <= candidate_n {
+            let d = cond_power.len() as u64;
+            cond_power.push(exact_test_power(d, theta, assumption.alpha)?);
+        }
+
+        let power = power_given_total_n(candidate_n, q, &cond_power)?;
+        if power >= assumption.power {
+            required_u64 = Some(candidate_n);
+            break;
+        }
+    }
+
+    let required_u64 = required_u64.ok_or(SampleSizeError::ExceedsExactSearchLimit {
+        ceil_n: ceil_n_u64,
+        limit: EXACT_POWER_SEARCH_MAX_N,
+    })?;
 
     RequiredSampleSize::new(required_u64).ok_or_else(|| SampleSizeError::Internal {
         detail: "required sample size rounded to zero unexpectedly".to_string(),
@@ -545,6 +776,7 @@ pub fn required_sample_size_mcnemar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcnemar::mcnemar_exact_two_sided;
 
     /// 絶対誤差・相対誤差のいずれかが `tol` 以下なら一致とみなす
     /// （`.claude/rules/coding-rust.md`「浮動小数の比較は許容差を明示する」。
@@ -749,21 +981,26 @@ mod tests {
         assert!(approx_eq(n, 154.59856956021102, 1e-9), "n={n}");
     }
 
-    /// 同じ仮定での `required_sample_size_mcnemar` は 155
-    /// （fixtures/sample_size/known_values.json の `ceil_n`）。
+    /// `required_sample_size_mcnemar`（評価データ総件数を仮定した正確検定の
+    /// 検出力探索）は 168。正規近似の `ceil(n)`（155。
+    /// fixtures/sample_size/known_values.json の `ceil_n`）とは一致しない
+    /// （正確検定は正規近似より保守的なため、真の必要件数は正規近似を
+    /// 上回る。PR #230 レビュー指摘・P0 の修正）。
     #[test]
     fn required_sample_size_matches_poc10_simple_case() {
         let a = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.05, 0.8).unwrap();
         let required = required_sample_size_mcnemar(&a).unwrap();
-        assert_eq!(required.get(), 155);
+        assert_eq!(required.get(), 168);
     }
 
-    /// PoC-10 事前登録の下限（alpha=0.0125。Holm m=4 最厳段）は 221。
+    /// PoC-10 事前登録の下限（alpha=0.0125。Holm m=4 最厳段）の正規近似
+    /// `ceil(n)` は 221 だが、正確検定の検出力探索では 229 になる
+    /// （上記と同じ理由）。
     #[test]
     fn required_sample_size_matches_poc10_holm_m4() {
         let a = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.0125, 0.8).unwrap();
         let required = required_sample_size_mcnemar(&a).unwrap();
-        assert_eq!(required.get(), 221);
+        assert_eq!(required.get(), 229);
     }
 
     /// α が極小（`d = p_b - p_c = 0.01` は小さいが 0 ではない）だと、必要
@@ -860,20 +1097,50 @@ mod tests {
     }
 
     /// PoC-10・PoC-24 の 4 通りの仮定（差が緩やかで正規近似の `ceil(n)` が
-    /// もともと大きい）では、正確検定の下限がそれを上回らず、既存の参照値
-    /// （155・188・221・272）が変わらないことを固定する（回帰防止）。
+    /// もともと大きい）でも、正確検定の検出力探索は正規近似の `ceil(n)`
+    /// （155・188・221・272）を一貫して上回る（168・196・229・278。正確
+    /// 検定は正規近似より保守的なため。PR #230 レビュー指摘・P0 の修正で
+    /// 判明。修正前はこれらの値が正規近似と一致すると誤って固定していた）。
     #[test]
-    fn required_sample_size_poc_anchors_unaffected_by_exact_floor() {
+    fn required_sample_size_poc_anchors_exceed_normal_approximation_ceil() {
         let cases = [
-            (0.05, 155u64),
-            (0.025, 188u64),
-            (0.0125, 221u64),
-            (0.05 / 12.0, 272u64),
+            (0.05, 168u64),
+            (0.025, 196u64),
+            (0.0125, 229u64),
+            (0.05 / 12.0, 278u64),
         ];
         for (alpha, expected) in cases {
             let a = McNemarSampleSizeAssumption::new(0.15, 0.05, alpha, 0.8).unwrap();
             let required = required_sample_size_mcnemar(&a).unwrap();
             assert_eq!(required.get(), expected, "alpha={alpha}");
         }
+    }
+
+    /// PR #230 レビュー指摘（P0）そのものの再現ケース: `p_b=0.95, p_c=0,
+    /// alpha=0.05, power=0.8`。旧実装は 6 を返していたが、6 件全て候補のみ
+    /// 正解というケースで正確検定が有意になる確率は `0.95^6 ≈ 0.735 <
+    /// 0.8` で目標検出力を満たさない。正しい必要件数は 7
+    /// （`P[D>=6] = C(7,6)*0.95^6*0.05 + 0.95^7 ≈ 0.9556 >= 0.8`。
+    /// `D ~ Binomial(N, p_b+p_c=0.95)`、`theta=1.0` なので
+    /// `cond_power(d)` は `d>=6` で 1、`d<6` で 0。
+    /// [`power_given_total_n`] のドキュメント参照）。
+    #[test]
+    fn required_sample_size_matches_reviewed_p0_case() {
+        let a = McNemarSampleSizeAssumption::new(0.95, 0.0, 0.05, 0.8).unwrap();
+        let required = required_sample_size_mcnemar(&a).unwrap();
+        assert_eq!(required.get(), 7);
+
+        // N=6 では目標検出力に届かないことも固定する（旧実装の誤りの直接
+        // 再現）。
+        let theta = 1.0;
+        let cond_power_0_to_6: Vec<f64> = (0..=6)
+            .map(|d| exact_test_power(d, theta, a.alpha()).unwrap())
+            .collect();
+        let power_at_6 = power_given_total_n(6, a.p_b() + a.p_c(), &cond_power_0_to_6).unwrap();
+        assert!(
+            approx_eq(power_at_6, 0.95_f64.powi(6), 1e-9),
+            "power_at_6={power_at_6}"
+        );
+        assert!(power_at_6 < 0.8, "power_at_6={power_at_6}");
     }
 }

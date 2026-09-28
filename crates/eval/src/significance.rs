@@ -15,11 +15,16 @@
 //! - 件数不足による「判定不能」（[`BaselineVerdict::Undeterminable`]）は
 //!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`RequiredSampleSize`]）を事前登録の手続きから算出する関数
-//!   （Connor 式）は [`crate::sample_size::required_sample_size_mcnemar`]
-//!   として実装済み（REQ-25・TASK-25.2・issue #66）。呼び出し側はその戻り値
-//!   を [`judge`]・[`compare_with_baseline`] の引数として渡す（spec に固定の
-//!   必要件数は無く、事前登録時に算出する手続きだけが定められている。
-//!   `04-requirements.md` L503-517。PoC-10 の事前登録値は 221 件）
+//!   （Connor 式の正規近似を起点に、実際に使う両側正確検定の検出力で
+//!   引き上げる）は [`crate::sample_size::required_sample_size_mcnemar`]
+//!   として実装済み（REQ-25・TASK-25.2・issue #66・PR #230 レビュー
+//!   指摘・P0）。呼び出し側はその戻り値を [`judge`]・
+//!   [`compare_with_baseline`] の引数として渡す（spec に固定の必要件数は
+//!   無く、事前登録時に算出する手続きだけが定められている。
+//!   `04-requirements.md` L503-517。PoC-10 の事前登録値は正規近似の
+//!   `ceil(n)=221` 件だが、正確検定の検出力探索で求め直すと 229 件になる。
+//!   `crates/eval/tests/baseline_significance.rs`
+//!   `poc10_required_sample_size_is_229` 参照）
 //! - CLI の JSON 出力・終了コードへの写像は行わない（TASK-33.x / TASK-18.3）
 
 use crate::baseline::{self, BaselineError};

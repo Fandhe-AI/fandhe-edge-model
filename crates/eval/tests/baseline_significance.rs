@@ -23,28 +23,34 @@ use fandhe_edge_eval::significance::{
     BaselineVerdict, PairedRecord, RequiredSampleSize, compare_with_baseline,
 };
 
-/// PoC-10 の事前登録手続きで算出された必要件数を、算出関数
-/// （[`required_sample_size_mcnemar`]。TASK-25.2・issue #66）で求め直した値。
-/// 仮定（`p_b=0.15`・`p_c=0.05`・`power=0.8`・`alpha=0.0125`。Holm m=4
-/// 最厳段。`fixtures/sample_size/known_values.json` の
-/// `holm_m4`〔PoC-10 事前登録の下限〕相当）は PoC-10 の事前登録値であり、
-/// 算出結果が PoC-10 の記録どおり 221 になることを
-/// `poc10_required_sample_size_is_221` で確認する（転記ではなく算出値を
-/// 使うことを端から端まで示す。証拠の種別: テストハーネス）。
+/// PoC-10 の事前登録手続きの仮定（`p_b=0.15`・`p_c=0.05`・`power=0.8`・
+/// `alpha=0.0125`。Holm m=4 最厳段。`fixtures/sample_size/known_values.json`
+/// の `holm_m4`〔PoC-10 事前登録の下限〕相当）から、算出関数
+/// （[`required_sample_size_mcnemar`]。TASK-25.2・issue #66）で必要件数を
+/// 求め直した値。
+///
+/// PoC-10 の事前登録値は 221（正規近似〔Connor 式〕の `ceil(n)`）だが、
+/// 本関数が返す値はそれとは一致しない（PR #230 レビュー指摘・P0 の修正:
+/// 正規近似の `ceil(n)` をそのまま採用するだけでは、実際に使う正確検定の
+/// 検出力を保証できなかったため、評価データ総件数を仮定した正確検定の
+/// 検出力探索に置き換えた。正確検定は正規近似より保守的なため、真の必要
+/// 件数は正規近似を上回る229 になる。
+/// `poc10_required_sample_size_is_229` 参照）。
 fn poc10_required_sample_size() -> u64 {
     let assumption = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.0125, 0.8)
         .expect("PoC-10 の仮定は McNemarSampleSizeAssumption の検証を満たす");
     required_sample_size_mcnemar(&assumption)
-        .expect("PoC-10 の仮定から算出した必要件数は MAX_EVAL_RECORDS 以内")
+        .expect("PoC-10 の仮定から算出した必要件数は EXACT_POWER_SEARCH_MAX_N 以内")
         .get()
 }
 
-/// [`poc10_required_sample_size`] が PoC-10 の事前登録値（221）と一致する
-/// ことを固定する（REQ-25・TASK-25.2・issue #66。
-/// `fixtures/sample_size/known_values.json` の `ceil_n=221` と同じ値）。
+/// [`poc10_required_sample_size`] が正確検定の検出力探索で得られる値
+/// （229）と一致することを固定する（REQ-25・TASK-25.2・issue #66。
+/// PoC-10 の事前登録値〔正規近似の `ceil(n)=221`〕とは異なる。上記
+/// [`poc10_required_sample_size`] のドキュメント参照）。
 #[test]
-fn poc10_required_sample_size_is_221() {
-    assert_eq!(poc10_required_sample_size(), 221);
+fn poc10_required_sample_size_is_229() {
+    assert_eq!(poc10_required_sample_size(), 229);
 }
 
 const ABS_EPSILON: f64 = 1e-9;

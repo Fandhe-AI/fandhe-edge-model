@@ -7,6 +7,11 @@
 //! は TASK-25.1-2（issue #65・PR #219）で完了済みで、本テストは「事前計算
 //! した必要件数を使っても、件数不足なら合格扱いにならない」ことを固定する。
 //!
+//! `required_sample_size_mcnemar` は評価データ総件数を仮定した正確検定の
+//! 実際の検出力を探索して返すため、正規近似（Connor 式）の `ceil(n)` とは
+//! 一致しない（正確検定は正規近似より保守的なため、真の必要件数は正規
+//! 近似を上回る。PR #230 レビュー指摘・P0 の修正）。
+//!
 //! 証拠の種別: テストハーネス（PoC 実測なし。判定不能分岐が実際に発火した
 //! 実例は PoC に存在しない。`p_b=0.15`・`p_c=0.05`・`power=0.8` は PoC-10・
 //! PoC-24 の事前登録における仮定であり、実測値ではない）。
@@ -32,36 +37,41 @@ fn approx_eq(actual: f64, expected: f64) -> bool {
 }
 
 /// PoC-10・PoC-24 の事前登録の仮定（`p_b=0.15`・`p_c=0.05`・`power=0.8`。
-/// [仮定]）から、4 通りの α で必要件数を算出し、
+/// [仮定]）から、4 通りの α で正規近似（Connor 式）の丸め前の値が
 /// `fixtures/sample_size/known_values.json` の参照値と一致することを
-/// 確認する。
+/// 確認する。`required_sample_size_mcnemar`（正確検定の検出力探索）は
+/// 正規近似の `ceil(n)`（同フィクスチャの `ceil_n`）とは一致しない
+/// （正確検定は正規近似より保守的なため、真の必要件数は正規近似を上回る。
+/// PR #230 レビュー指摘・P0 の修正）ため、フィクスチャとは別に期待値を
+/// 固定する。
 #[test]
 fn poc10_poc24_required_sample_sizes_match_known_values() {
-    // (alpha, 丸め前の n の参照値, ceil 後の参照値)。
-    // fixtures/sample_size/known_values.json の `sample_sizes` と同じ値。
+    // (alpha, 丸め前の n の参照値〔fixtures/sample_size/known_values.json
+    // の `sample_sizes` と同じ値〕, 正確検定の検出力探索による必要件数
+    // 〔known_values.json の `ceil_n` より常に大きい〕, ラベル)。
     let cases = [
-        (0.05, 154.598_569_560_211_02, 155u64, "単純比較"),
+        (0.05, 154.598_569_560_211_02, 168u64, "単純比較"),
         (
             0.025,
             187.481_807_727_266_04,
-            188u64,
+            196u64,
             "Holm m=2 最厳段（PoC-24）",
         ),
         (
             0.0125,
             220.184_654_277_274_8,
-            221u64,
+            229u64,
             "Holm m=4 最厳段（PoC-10 事前登録の下限）",
         ),
         (
             0.05 / 12.0,
             271.668_693_520_934_2,
-            272u64,
+            278u64,
             "4 候補 x 3 seed を 1 族",
         ),
     ];
 
-    for (alpha, expected_n, expected_ceil, label) in cases {
+    for (alpha, expected_n, expected_required, label) in cases {
         let assumption = McNemarSampleSizeAssumption::new(0.15, 0.05, alpha, 0.8)
             .unwrap_or_else(|e| panic!("case {label}: 仮定の構築に失敗: {e}"));
 
@@ -76,8 +86,8 @@ fn poc10_poc24_required_sample_sizes_match_known_values() {
             .unwrap_or_else(|e| panic!("case {label}: 必要件数の算出に失敗: {e}"));
         assert_eq!(
             required.get(),
-            expected_ceil,
-            "case {label}: 必要件数が参照値と一致しない"
+            expected_required,
+            "case {label}: 必要件数が期待値と一致しない"
         );
     }
 }
@@ -136,7 +146,7 @@ fn build_paired_records<'a>(
 
 /// REQ-25 異常系・TASK-25.2 の端から端までの確認: 仮定
 /// （`p_b=0.15`・`p_c=0.05`・`power=0.8`・`alpha=0.05`）から算出した必要件数
-/// R=155 に対し、評価件数が `R - 1` 件だと `compare_with_baseline` は
+/// R=168 に対し、評価件数が `R - 1` 件だと `compare_with_baseline` は
 /// `Undeterminable` を返し、合格扱い（`SignificantlyBetter`）にしない。
 ///
 /// `b=30`・`c=5` は単独では `p ≈ 2.24e-5 < 0.05` かつ `b > c` で、件数さえ
@@ -145,12 +155,12 @@ fn build_paired_records<'a>(
 fn undeterminable_when_evaluated_count_is_one_below_required() {
     let assumption = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.05, 0.8).unwrap();
     let required = required_sample_size_mcnemar(&assumption).unwrap();
-    assert_eq!(required.get(), 155);
+    assert_eq!(required.get(), 168);
 
     let b = 30u64;
     let c = 5u64;
     let discordant = b + c;
-    let total = required.get() - 1; // R - 1 = 154
+    let total = required.get() - 1; // R - 1 = 167
     let both_correct = total - discordant;
 
     let labels = ["A", "B"];
@@ -176,18 +186,18 @@ fn undeterminable_when_evaluated_count_is_one_below_required() {
     );
 }
 
-/// 同じ `(b, c)` の内訳で、評価件数がちょうど必要件数 R=155 なら判定不能に
+/// 同じ `(b, c)` の内訳で、評価件数がちょうど必要件数 R=168 なら判定不能に
 /// ならず、`SignificantlyBetter` になる（境界値）。
 #[test]
 fn significantly_better_when_evaluated_count_equals_required() {
     let assumption = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.05, 0.8).unwrap();
     let required = required_sample_size_mcnemar(&assumption).unwrap();
-    assert_eq!(required.get(), 155);
+    assert_eq!(required.get(), 168);
 
     let b = 30u64;
     let c = 5u64;
     let discordant = b + c;
-    let total = required.get(); // R = 155
+    let total = required.get(); // R = 168
     let both_correct = total - discordant;
 
     let labels = ["A", "B"];

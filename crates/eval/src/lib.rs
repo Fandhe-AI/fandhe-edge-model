@@ -30,8 +30,9 @@
 //!   工程（将来）から評価処理を渡す想定。評価中に構成要素ファイルが削除
 //!   された場合は `Removed` として報告する（issue #226）
 //! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
-//!   必要評価件数の事前計算（Connor 式。REQ-25 異常系・TASK-25.2・
-//!   issue #66）。[`significance::RequiredSampleSize`] を
+//!   必要評価件数の事前計算（Connor 式を起点に、実際に使う両側正確検定の
+//!   検出力で引き上げる。REQ-25 異常系・TASK-25.2・issue #66・
+//!   PR #230 レビュー指摘・P0）。[`significance::RequiredSampleSize`] を
 //!   [`sample_size::required_sample_size_mcnemar`] で算出できる
 //! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
 //!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
@@ -56,8 +57,10 @@
 //!   件数不足による「判定不能」（`BaselineVerdict::Undeterminable`）は
 //!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
-//!   関数（Connor 式）も実装済み（[`sample_size::required_sample_size_mcnemar`]。
-//!   TASK-25.2・issue #66）。仮定値（`p_b`・`p_c`・`alpha`・`power`）を
+//!   関数（Connor 式の正規近似を起点に、実際に使う両側正確検定の検出力で
+//!   引き上げる）も実装済み（[`sample_size::required_sample_size_mcnemar`]。
+//!   TASK-25.2・issue #66・PR #230 レビュー指摘・P0）。
+//!   仮定値（`p_b`・`p_c`・`alpha`・`power`）を
 //!   定義ファイル・CLI 引数のどこから受け取るかは未確定（TASK-33.x）。
 //!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
 //!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への

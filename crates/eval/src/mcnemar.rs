@@ -19,7 +19,8 @@
 //! - 件数不足（評価件数 N が事前登録の必要件数未満）の「判定不能」の判定は
 //!   本モジュールの範囲外で、[`crate::significance::judge`]
 //!   （呼び出し側が渡す必要件数と比較する）が担う。必要件数自体を算出する
-//!   関数（Connor 式）は [`crate::sample_size::required_sample_size_mcnemar`]
+//!   関数（Connor 式の正規近似を起点に、実際に使う両側正確検定の検出力で
+//!   引き上げる）は [`crate::sample_size::required_sample_size_mcnemar`]
 //!   として実装済み（REQ-25・TASK-25.2・issue #66）。本モジュールはどんな
 //!   `b`・`c` の組でも計算を試み、資源上限を超える場合のみ
 //!   [`McNemarError::TooManyDiscordantPairs`] を返す
