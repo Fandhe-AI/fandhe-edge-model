@@ -30,11 +30,15 @@
 //!   凍結した最終 test を渡してはならない（最終 test の適用は 1 回限りで、
 //!   候補・しきい値の選び直しに使わない。TASK-27.3 で強制の仕組みを実装
 //!   予定だが、本モジュールは呼び出し元の責務として doc で明示するに留める）
-//! - [`ValidationScorer::predict_validation`] へは `candidate_id` と学習
-//!   成果物（[`crate::result::SuccessOutcome`]）だけを渡し、
-//!   `validation_gold`（正解ラベル）は渡さない（REQ-27「推論関数には
-//!   `input` だけを渡す」の学習ワーカー層での対応。gold を渡さない制約は
-//!   trait の引数リストという型のレベルで保証される）
+//! - [`ValidationScorer::predict_validation`] へは `candidate_id`・学習
+//!   成果物（[`crate::result::SuccessOutcome`]）・[`ValidationInputRecord`]
+//!   の列（record_id・byte 入力の組）を渡し、`validation_gold`
+//!   （正解ラベル）は渡さない（REQ-27「推論関数には `input` だけを渡す」の
+//!   学習ワーカー層での対応。gold を渡さない制約は trait の引数リストと
+//!   いう型のレベルで保証される）。入力そのものも `run_search` が権威ある
+//!   値として渡すのは、scorer が自身で保持する別データ（record_id は
+//!   揃っているが中身が異なる入力）を使ってしまうことを防ぐため
+//!   （P0 指摘対応。issue #84 PR #238 レビュー）
 //!
 //! # PoC-17 との差異
 //!
@@ -81,6 +85,7 @@ use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
 use crate::error::TrainRequestError;
+use crate::limits::{MAX_LABEL_BYTES, MAX_LABELS};
 use crate::request::{TrainRequest, TrainRequestParams};
 use crate::result::{SuccessOutcome, TrainOutcome};
 use crate::time_allotment::{
@@ -157,6 +162,28 @@ pub struct SearchInput<'a> {
     /// validation 分割の正解ラベル（**validation のみ**。凍結した最終 test
     /// を渡さない。モジュール doc「評価契約との関係」参照）。
     pub validation_gold: &'a [&'a str],
+    /// [`validation_gold`](Self::validation_gold) と同じ順・同じ件数の
+    /// validation レコード識別子（凍結済み validation split のレコード ID）。
+    /// [`ValidationScorer::predict_validation`] へ
+    /// [`validation_inputs`](Self::validation_inputs) と組にして渡し、戻り値の
+    /// [`ScoredOutcome::record_id`] 列と突き合わせることで、scorer が
+    /// `run_search` の意図した順序と異なる予測（件数は同じだが順序が違う・
+    /// 別の record_id の予測）を返していないかを検証する（REQ-27
+    /// 「評価の独立性」・P0 指摘対応。issue #84 PR #238 レビュー。scorer が
+    /// record_id は正しいが中身の異なる入力を独自に保持しているケースの
+    /// 防止は [`validation_inputs`](Self::validation_inputs) が担う）。
+    /// 正解ラベルは含まない。
+    pub validation_record_ids: &'a [&'a str],
+    /// [`validation_record_ids`](Self::validation_record_ids) と同じ順・
+    /// 同じ件数の byte 入力（README「入力表現は byte のみ」）。
+    /// [`run_search`] が [`ValidationScorer::predict_validation`] へ
+    /// `record_id`・`input` の組として渡す（正解ラベルは渡さない。REQ-27）。
+    /// scorer が凍結済み validation split とは異なる入力（自身が独自に
+    /// 保持していた古い・別のデータ）で推論することを防ぐため、`run_search`
+    /// が権威ある入力を明示的に渡す設計にしている（P0 指摘対応。issue #84
+    /// PR #238 レビュー: record_id の一致だけでは、scorer が record_id は
+    /// 揃っているが中身が異なる入力を保持していた場合を検出できない）。
+    pub validation_inputs: &'a [&'a [u8]],
     /// 探索対象の候補（宣言順に実行する。乱数は使わない）。
     pub candidates: Vec<SearchCandidate>,
     /// 探索予算全体（秒）。
@@ -171,10 +198,14 @@ pub struct SearchInput<'a> {
 /// 本 crate にはこの trait の実装を含めない（推論ランタイム・ジョブ管理が
 /// 実装する想定のスタブ。モジュール doc 参照）。
 ///
-/// `candidate_id` と学習成果物だけを受け取り、`validation_gold`
-/// （正解ラベル）は受け取らない（REQ-27。gold を渡さない制約は引数リスト
-/// という型のレベルで保証される）。validation 入力そのものは実装側が
-/// 自分で保持する。
+/// `candidate_id`・学習成果物・[`ValidationInputRecord`] の列（record_id・
+/// byte 入力の組）を受け取り、`validation_gold`（正解ラベル）は受け取らない
+/// （REQ-27。gold を渡さない制約は引数リストという型のレベルで保証される）。
+/// validation 入力そのものは [`run_search`] が [`SearchInput`] から権威ある
+/// 値として渡す（P0 指摘対応・REQ-27「評価の独立性」。issue #84 PR #238
+/// レビュー: 実装側が独自に入力を保持する設計だと、scorer が
+/// `run_search` の意図した validation 集合と異なるデータ〔件数・record_id
+/// は同じだが中身が違う〕を使って推論しても検出できない）。
 ///
 /// # 時間上限（REQ-39・P0 指摘対応）
 ///
@@ -207,16 +238,54 @@ pub struct SearchInput<'a> {
 pub trait ValidationScorer {
     /// 実装固有のエラー型。
     type Error;
-    /// `candidate_id` の学習成果物で validation 入力を推論し、
-    /// [`SearchInput::validation_gold`] と同じ順・同じ件数の [`Outcome`] 列を
-    /// 返す。`time_limit` はこの呼び出し時点で残っている探索予算全体
-    /// （trait doc「時間上限」参照）。
+    /// `candidate_id` の学習成果物で `records`（[`run_search`] が
+    /// [`SearchInput::validation_record_ids`]・[`SearchInput::validation_inputs`]
+    /// から組み立てて渡す権威ある validation 入力。**正解ラベルは含まない**。
+    /// REQ-27）を推論し、[`ScoredOutcome`] の列を返す。**戻り値の
+    /// `record_id` 列は `records` の `record_id` 列と（順序を含めて）完全に
+    /// 一致させなければならない**（位置で対応づける。実装は `records` の
+    /// 順に予測を並べて返す）。[`run_search`] はこの一致を検証し、一致しな
+    /// い場合は scorer のエラーと同じ扱い（選定対象外）にする（P0 指摘
+    /// 対応・issue #84 PR #238 レビュー: 件数だけを照合すると、件数が同じ
+    /// 別データ・順序違いの予測でも正解率を算出できてしまい、評価の独立性
+    /// 〔REQ-27〕が壊れる。`run_search` が入力そのものも渡すのは、scorer が
+    /// 自身で保持する別データ〔record_id は揃っているが中身が異なる〕を
+    /// 使うことも防ぐため）。`time_limit` はこの呼び出し時点で残っている
+    /// 探索予算全体（trait doc「時間上限」参照）。
     fn predict_validation(
         &mut self,
         candidate_id: &str,
         artifact: &SuccessOutcome,
+        records: &[ValidationInputRecord<'_>],
         time_limit: Duration,
-    ) -> Result<Vec<Outcome>, Self::Error>;
+    ) -> Result<Vec<ScoredOutcome>, Self::Error>;
+}
+
+/// [`ValidationScorer::predict_validation`] へ渡す validation 入力 1 件
+/// （record_id・byte 入力の組。正解ラベルは含まない。REQ-27・P0 指摘対応。
+/// issue #84 PR #238 レビュー）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationInputRecord<'a> {
+    /// validation レコード識別子（[`SearchInput::validation_record_ids`] の
+    /// 要素）。
+    pub record_id: &'a str,
+    /// byte 入力（README「入力表現は byte のみ」。
+    /// [`SearchInput::validation_inputs`] の要素）。
+    pub input: &'a [u8],
+}
+
+/// [`ValidationScorer::predict_validation`] が返す予測 1 件
+/// （record_id 付き。P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
+///
+/// `record_id` は [`SearchInput::validation_record_ids`] の要素と対応する
+/// 識別子で、[`run_search`] が戻り値の並びを検証するために使う。正解
+/// ラベルは含まない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredOutcome {
+    /// validation レコード識別子。
+    pub record_id: String,
+    /// 推論結果。
+    pub outcome: Outcome,
 }
 
 /// validation 正解率（[`Ratio`] の往復検証用の直列化可能な写像）。
@@ -271,8 +340,14 @@ pub enum CandidateSearchResult {
     /// 学習ワーカーが成功しなかった（[`CandidateTimeRecord::status`] に詳細）。
     /// validation 推論は行っていない。
     TrainingNotCompleted,
-    /// 学習は成功したが、[`ValidationScorer::predict_validation`] が失敗した。
-    /// エラー内容は記録しない（security.md）。
+    /// 学習は成功したが採点が無効だった。次の 2 通りをまとめて表す:
+    /// (1) [`ValidationScorer::predict_validation`] が `Err` を返した場合
+    /// （エラー内容は記録しない。security.md）。
+    /// (2) `predict_validation` は成功したが、戻り値の `record_id` 列が
+    /// `run_search` の渡した validation レコードと（順序を含めて）一致しな
+    /// かった場合（P0 指摘対応・REQ-27「評価の独立性」。issue #84 PR #238
+    /// レビュー。件数だけの照合では、別データ・順序違いの予測を見抜けない
+    /// ため、契約違反も採点失敗と同じ扱いにする）。
     ScoringFailed,
     /// 学習・validation 推論・正解率算出まで完了したが、採点
     /// （[`ValidationScorer::predict_validation`]）または評価器
@@ -423,6 +498,17 @@ pub enum SearchError<E> {
     InvalidLabelOrder,
     /// `validation_gold` の要素が `label_order` に存在しない。
     UnknownValidationGold { index: usize },
+    /// `validation_record_ids` の件数が `validation_gold` と一致しない
+    /// （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
+    ValidationRecordIdCountMismatch { expected: usize, actual: usize },
+    /// `validation_record_ids` に空文字列の要素が含まれる。
+    InvalidValidationRecordId { index: usize },
+    /// `validation_record_ids` に重複した要素が含まれる（scorer からの
+    /// 戻り値を順序で一意に対応づけられなくなるため拒否する）。
+    DuplicateValidationRecordId { index: usize },
+    /// `validation_inputs` の件数が `validation_gold` と一致しない
+    /// （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
+    ValidationInputCountMismatch { expected: usize, actual: usize },
     /// 候補 ID が空・[`MAX_CANDIDATE_ID_BYTES`] 超過・制御文字を含む。
     InvalidCandidateId { index: usize },
     /// 候補 ID が他の候補と重複している。
@@ -488,6 +574,20 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             SearchError::UnknownValidationGold { index } => {
                 write!(f, "unknown validation gold label at index {index}")
             }
+            SearchError::ValidationRecordIdCountMismatch { expected, actual } => write!(
+                f,
+                "validation_record_ids count mismatch: expected {expected}, got {actual}"
+            ),
+            SearchError::InvalidValidationRecordId { index } => {
+                write!(f, "invalid (empty) validation record id at index {index}")
+            }
+            SearchError::DuplicateValidationRecordId { index } => {
+                write!(f, "duplicate validation record id at index {index}")
+            }
+            SearchError::ValidationInputCountMismatch { expected, actual } => write!(
+                f,
+                "validation_inputs count mismatch: expected {expected}, got {actual}"
+            ),
             SearchError::InvalidCandidateId { index } => {
                 write!(f, "invalid candidate id at index {index}")
             }
@@ -629,8 +729,26 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         return Err(SearchError::TooManyOutcomeCells);
     }
 
-    // `label_order` の妥当性: 空・空文字列・重複を拒否する。
+    // `label_order` の妥当性: 空・件数上限・各要素のバイト長上限・空文字列・
+    // 重複を拒否する。件数・バイト長の上限確認は `BTreeSet` を作る前に行う
+    // （P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）: `label_order` は
+    // `SearchInput` の公開フィールドで、後段の `TrainRequest::new`
+    // （`LabelOrder::new`）による上限検証より前に集合を組み立てていたため、
+    // 上限を大きく超える入力を渡されると検証前に時間・メモリを消費して
+    // しまう。上限は新設せず、`TrainRequest`（学習リクエスト）の
+    // `label_order` と同じ契約の定数（[`MAX_LABELS`]・[`MAX_LABEL_BYTES`]。
+    // `crate::limits`）をそのまま再利用する。
     if input.label_order.is_empty() {
+        return Err(SearchError::InvalidLabelOrder);
+    }
+    if input.label_order.len() > MAX_LABELS {
+        return Err(SearchError::InvalidLabelOrder);
+    }
+    if input
+        .label_order
+        .iter()
+        .any(|label| label.len() > MAX_LABEL_BYTES)
+    {
         return Err(SearchError::InvalidLabelOrder);
     }
     let mut label_set: BTreeSet<&str> = BTreeSet::new();
@@ -645,6 +763,39 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         if !label_set.contains(gold) {
             return Err(SearchError::UnknownValidationGold { index });
         }
+    }
+
+    // `validation_record_ids` の妥当性（P0 指摘対応・REQ-27。issue #84
+    // PR #238 レビュー）: `validation_gold` と同じ件数・空文字列なし・重複
+    // なしを要求する。件数不一致・空文字列・重複のいずれも、
+    // `predict_validation` の戻り値と順序で対応づけられなくなるため事前に
+    // 拒否する（`validation_gold.len()` はすでに [`MAX_EVAL_RECORDS`] 以下と
+    // 確認済みのため、新たな上限は不要）。
+    if input.validation_record_ids.len() != input.validation_gold.len() {
+        return Err(SearchError::ValidationRecordIdCountMismatch {
+            expected: input.validation_gold.len(),
+            actual: input.validation_record_ids.len(),
+        });
+    }
+    let mut seen_record_ids: BTreeSet<&str> = BTreeSet::new();
+    for (index, &record_id) in input.validation_record_ids.iter().enumerate() {
+        if record_id.is_empty() {
+            return Err(SearchError::InvalidValidationRecordId { index });
+        }
+        if !seen_record_ids.insert(record_id) {
+            return Err(SearchError::DuplicateValidationRecordId { index });
+        }
+    }
+
+    // `validation_inputs` の件数も `validation_gold` と一致すること
+    // （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。1 レコードあたりの
+    // byte 入力のサイズ上限は、凍結済み validation split を組み立てる
+    // データ契約層（`crates/data`）の責務とし、本層では件数のみ検証する。
+    if input.validation_inputs.len() != input.validation_gold.len() {
+        return Err(SearchError::ValidationInputCountMismatch {
+            expected: input.validation_gold.len(),
+            actual: input.validation_inputs.len(),
+        });
     }
 
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
@@ -812,8 +963,8 @@ fn drain_remaining_as_not_started(
 ///
 /// 事前検証・候補の実行・評価器のいずれかが失敗した場合に
 /// [`SearchError`] を返す。候補単位の失敗（学習が完了しなかった・scorer が
-/// 失敗した）は探索全体を中断せず、その候補を該当する分類で記録して次の
-/// 候補へ進む。
+/// 失敗した・scorer の戻り値の record_id 列が一致しなかった〔REQ-27〕）は
+/// 探索全体を中断せず、その候補を該当する分類で記録して次の候補へ進む。
 pub fn run_search<R, S, C>(
     runner: &mut R,
     scorer: &mut S,
@@ -851,6 +1002,21 @@ where
                 })
             })
     };
+
+    // 全候補で共有する validation 入力（record_id・byte 入力の組）を 1 回
+    // だけ組み立てる（`validate_input` が件数一致を確認済みのため `zip` で
+    // 安全に構築できる。P0 指摘対応・REQ-27。issue #84 PR #238 レビュー:
+    // scorer へ権威ある入力を明示的に渡し、scorer 側が独自に保持する別
+    // データを使わせない）。候補ごとに毎回組み立て直す無駄を避ける。
+    let validation_scorer_records: Vec<ValidationInputRecord<'_>> = input
+        .validation_record_ids
+        .iter()
+        .zip(input.validation_inputs.iter())
+        .map(|(&record_id, &input_bytes)| ValidationInputRecord {
+            record_id,
+            input: input_bytes,
+        })
+        .collect();
 
     let mut candidates_iter = input.candidates.into_iter().enumerate();
     while let Some((index, candidate)) = candidates_iter.next() {
@@ -955,15 +1121,57 @@ where
                 }
 
                 let time_limit = Duration::from_millis(remaining_for_scoring_ms);
-                match scorer.predict_validation(&candidate.candidate_id, success, time_limit) {
-                    Ok(outcomes) => {
-                        if outcomes.len() != input.validation_gold.len() {
+                match scorer.predict_validation(
+                    &candidate.candidate_id,
+                    success,
+                    &validation_scorer_records,
+                    time_limit,
+                ) {
+                    Ok(scored_outcomes) => {
+                        if scored_outcomes.len() != input.validation_gold.len() {
                             return Err(SearchError::ScorerOutputMismatch {
                                 index,
                                 expected: input.validation_gold.len(),
-                                actual: outcomes.len(),
+                                actual: scored_outcomes.len(),
                             });
                         }
+
+                        // P0 指摘対応（REQ-27・評価の独立性。issue #84 PR #238
+                        // レビュー）: 件数の一致だけでは、件数が同じ別データや
+                        // 順序違いの予測でも `validation_gold` と突き合わせて
+                        // 正解率を算出し候補を選定できてしまう。戻り値の
+                        // `record_id` 列が `validation_record_ids` と（順序を
+                        // 含めて）完全に一致するかを検証し、一致しなければ
+                        // scorer のエラー（下の `Err` 分岐）と同じ扱いにする
+                        // （`ScoringFailed`。選定対象外。探索全体は中断せず
+                        // 次候補へ進む）。
+                        let record_ids_match = scored_outcomes
+                            .iter()
+                            .zip(input.validation_record_ids.iter())
+                            .all(|(scored, &expected_id)| scored.record_id == expected_id);
+                        if !record_ids_match {
+                            entries.push(CandidateSearchEntry {
+                                candidate_id: candidate.candidate_id,
+                                elapsed_at_start_ms: Some(elapsed_ms),
+                                time: Some(run.record().clone()),
+                                result: CandidateSearchResult::ScoringFailed,
+                                validation_outcomes: None,
+                            });
+
+                            // 下の `Err` 分岐と同じく、呼び出し後の経過時間を
+                            // 確認してから次候補へ進む（採点中に予算を使い
+                            // 切っていれば残り候補を未着手にして打ち切る）。
+                            let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
+                            if elapsed_after_scoring_ms >= budget_ms {
+                                drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                                break;
+                            }
+                            continue;
+                        }
+                        let outcomes: Vec<Outcome> = scored_outcomes
+                            .into_iter()
+                            .map(|scored| scored.outcome)
+                            .collect();
 
                         // P1 指摘対応（REQ-39。issue #84 PR #238 レビュー）:
                         // `predict_validation` から戻った直後、`EvalRecord`
@@ -1268,6 +1476,24 @@ mod tests {
         }
     }
 
+    /// `validation_gold` と同じ件数の record_id 列を生成する（`"r0"`・`"r1"`
+    /// ...）。テスト専用ヘルパーのため `'static` へ leak して返す（P0・
+    /// REQ-27 指摘対応。issue #84 PR #238 レビュー）。
+    fn make_record_ids(n: usize) -> &'static [&'static str] {
+        let ids: Vec<&'static str> = (0..n)
+            .map(|i| -> &'static str { Box::leak(format!("r{i}").into_boxed_str()) })
+            .collect();
+        Box::leak(ids.into_boxed_slice())
+    }
+
+    /// `validation_gold` と同じ件数の byte 入力を生成する（本モジュールの
+    /// 事前検証・件数検証は入力の中身を見ないため、空スライスの繰り返しで
+    /// 十分。P0・REQ-27 指摘対応。issue #84 PR #238 レビュー）。
+    fn make_validation_inputs(n: usize) -> &'static [&'static [u8]] {
+        let inputs: Vec<&'static [u8]> = (0..n).map(|_| -> &'static [u8] { &[] }).collect();
+        Box::leak(inputs.into_boxed_slice())
+    }
+
     fn base_input<'a>(
         label_order: &'a [&'a str],
         validation_gold: &'a [&'a str],
@@ -1276,6 +1502,8 @@ mod tests {
         SearchInput {
             label_order,
             validation_gold,
+            validation_record_ids: make_record_ids(validation_gold.len()),
+            validation_inputs: make_validation_inputs(validation_gold.len()),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1319,6 +1547,113 @@ mod tests {
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
         assert_eq!(err, SearchError::UnknownValidationGold { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-27（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_record_ids` の件数が `validation_gold` と一致しないと
+    /// `ValidationRecordIdCountMismatch`。
+    #[test]
+    fn task18_1_2_validate_input_rejects_validation_record_id_count_mismatch() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive", "negative"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: &["r0"],
+            validation_inputs: make_validation_inputs(2),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::ValidationRecordIdCountMismatch {
+                expected: 2,
+                actual: 1
+            }
+        );
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-27（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_record_ids` に空文字列が含まれると
+    /// `InvalidValidationRecordId`。
+    #[test]
+    fn task18_1_2_validate_input_rejects_empty_validation_record_id() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive", "negative"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: &["r0", ""],
+            validation_inputs: make_validation_inputs(2),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::InvalidValidationRecordId { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-27（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_record_ids` に重複があると `DuplicateValidationRecordId`。
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_validation_record_id() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive", "negative"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: &["r0", "r0"],
+            validation_inputs: make_validation_inputs(2),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateValidationRecordId { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-27（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_inputs` の件数が `validation_gold` と一致しないと
+    /// `ValidationInputCountMismatch`。
+    #[test]
+    fn task18_1_2_validate_input_rejects_validation_input_count_mismatch() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive", "negative"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: make_record_ids(2),
+            validation_inputs: make_validation_inputs(1),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::ValidationInputCountMismatch {
+                expected: 2,
+                actual: 1
+            }
+        );
     }
 
     /// REQ-18・TASK-18.1-2: 候補 ID の重複は `DuplicateCandidateId`。
@@ -1623,6 +1958,42 @@ mod tests {
             let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
             assert_eq!(err, SearchError::InvalidLabelOrder, "case: {label_order:?}");
         }
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `label_order` の件数が [`MAX_LABELS`] を 1 件超えると、`BTreeSet` を
+    /// 組み立てる前に `InvalidLabelOrder` として拒否する（巨大な
+    /// `label_order` を渡されても、後段の `TrainRequest::new` による上限
+    /// 検証を待たずに検証前の時間・メモリ消費を避ける）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_label_order_count_over_limit() {
+        let gold = ["positive"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let label_order: Vec<String> = (0..=MAX_LABELS).map(|i| format!("l{i}")).collect();
+        let label_order_refs: Vec<&str> = label_order.iter().map(String::as_str).collect();
+        let input = base_input(&label_order_refs, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::InvalidLabelOrder);
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P0 指摘対応。issue #84 PR #238 レビュー）:
+    /// `label_order` の 1 要素が [`MAX_LABEL_BYTES`] を超えると
+    /// `InvalidLabelOrder`。
+    #[test]
+    fn task18_1_2_validate_input_rejects_label_order_element_over_byte_limit() {
+        let gold = ["positive"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let long_label = "a".repeat(MAX_LABEL_BYTES + 1);
+        let label_order = vec![long_label.as_str(), "negative"];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::InvalidLabelOrder);
     }
 
     /// REQ-18・TASK-18.1-2・REQ-39: 候補 ID が不正（空・制御文字混入）だと

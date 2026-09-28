@@ -21,8 +21,9 @@ use fandhe_edge_eval::metrics::Outcome;
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 use fandhe_edge_train::result::{SuccessOutcome, TrainOutcome};
 use fandhe_edge_train::search::{
-    CandidateSearchResult, NotStartedReason, SearchBudget, SearchCandidate, SearchError,
-    SearchInput, SelectionDecision, ValidationScorer, run_search,
+    CandidateSearchResult, NotStartedReason, ScoredOutcome, SearchBudget, SearchCandidate,
+    SearchError, SearchInput, SelectionDecision, ValidationInputRecord, ValidationScorer,
+    run_search,
 };
 use fandhe_edge_train::time_allotment::{CandidateRunner, Clock, PerCandidatePolicy};
 
@@ -31,6 +32,24 @@ const MAX_FIXTURE_BYTES: u64 = 1024 * 1024;
 
 const LABEL_ORDER: [&str; 3] = ["positive", "negative", "neutral"];
 const VALIDATION_LEN: usize = 10;
+
+/// `validation_gold()` と同じ順・同じ件数の validation レコード識別子
+/// （REQ-27・P0 指摘対応。issue #84 PR #238 レビュー）。ほとんどのテストは
+/// `run_search` がこれを [`ValidationScorer::predict_validation`] へそのまま
+/// 渡すことのみ確認し、record_id 検証自体（不一致の拒否）は専用テストで
+/// 確認する。
+const VALIDATION_RECORD_IDS: [&str; VALIDATION_LEN] =
+    ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"];
+
+/// `validation_gold()`・`VALIDATION_RECORD_IDS` と同じ件数・同じ順の byte
+/// 入力。各要素を区別できる値にしておき、`run_search` が
+/// `SearchInput::validation_inputs` の要素を正しく
+/// `ValidationScorer::predict_validation` へ転送すること（`b""` 等の
+/// プレースホルダで置き換えても検出できない偽陰性を防ぐ）を機械照合できる
+/// ようにする（P0・REQ-27 指摘対応。issue #84 PR #238 レビュー）。
+const VALIDATION_INPUTS: [&[u8]; VALIDATION_LEN] = [
+    b"i0", b"i1", b"i2", b"i3", b"i4", b"i5", b"i6", b"i7", b"i8", b"i9",
+];
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -206,19 +225,32 @@ impl std::fmt::Display for FakeScorerError {
 }
 
 /// candidate_id ごとに事前登録した validation 予測（または失敗）を返す
-/// 推論器。呼び出し順・件数・受け取った `time_limit` を記録する
-/// （REQ-27: `validation_gold` を渡さないことは trait の署名で構造的に
-/// 保証されるため、ここでは呼び出し順のみ確認する）。
+/// 推論器。呼び出し順・件数・受け取った `time_limit`・`records`
+/// （record_id・byte 入力の組）を記録する（REQ-27:
+/// `validation_gold`〔正解ラベル〕を渡さないことは trait の署名で構造的に
+/// 保証される）。
 ///
 /// `advance_ms`（candidate_id ごと）を指定すると、`predict_validation` の
 /// 呼び出し中に `clock` を進める（P0・REQ-39: 採点が探索予算を超過する
 /// ケースを模擬する。呼び出し自体を打ち切れないことをテストでも示す）。
+///
+/// 既定では受け取った `records` の `record_id` をそのまま echo する
+/// （正直な実装を模擬）。`record_id_override`（candidate_id ごと）を指定
+/// すると、代わりに別の record_id 列を返す（P0・REQ-27: `run_search` が
+/// record_id の不一致を検出することを確認するテスト専用）。
 struct FakeScorer<'a> {
     clock: &'a FakeClock,
     responses: BTreeMap<String, Result<Vec<Outcome>, FakeScorerError>>,
     advance_ms: BTreeMap<String, u64>,
+    record_id_override: BTreeMap<String, Vec<String>>,
     calls: Vec<String>,
     time_limits: Vec<Duration>,
+    /// 呼び出しごとに受け取った `(record_id, input)` の組（P0・REQ-27:
+    /// `run_search` が `SearchInput::validation_inputs` を `record_id` と
+    /// 揃えて転送していることを機械照合するための記録。`input` を
+    /// プレースホルダ〔例: 全件 `b""`〕にすると転送漏れを検出できないため、
+    /// `VALIDATION_INPUTS` は要素ごとに異なる値にする）。
+    received_records: Vec<Vec<(String, Vec<u8>)>>,
 }
 
 impl<'a> FakeScorer<'a> {
@@ -230,8 +262,10 @@ impl<'a> FakeScorer<'a> {
             clock,
             responses,
             advance_ms: BTreeMap::new(),
+            record_id_override: BTreeMap::new(),
             calls: Vec::new(),
             time_limits: Vec::new(),
+            received_records: Vec::new(),
         }
     }
 
@@ -239,6 +273,17 @@ impl<'a> FakeScorer<'a> {
     /// 登録する（P0 テスト専用）。
     fn with_advance(mut self, candidate_id: &str, ms: u64) -> Self {
         self.advance_ms.insert(candidate_id.to_string(), ms);
+        self
+    }
+
+    /// `candidate_id` の戻り値の `record_id` 列を、受け取った `records` の
+    /// `record_id` とは無関係な `ids` へ差し替える（P0・REQ-27 テスト専用:
+    /// 件数は同じだが順序・内容が異なる予測を模擬する）。
+    fn with_record_id_override(mut self, candidate_id: &str, ids: Vec<&str>) -> Self {
+        self.record_id_override.insert(
+            candidate_id.to_string(),
+            ids.into_iter().map(str::to_string).collect(),
+        );
         self
     }
 }
@@ -250,17 +295,37 @@ impl ValidationScorer for FakeScorer<'_> {
         &mut self,
         candidate_id: &str,
         _artifact: &SuccessOutcome,
+        records: &[ValidationInputRecord<'_>],
         time_limit: Duration,
-    ) -> Result<Vec<Outcome>, Self::Error> {
+    ) -> Result<Vec<ScoredOutcome>, Self::Error> {
         self.calls.push(candidate_id.to_string());
         self.time_limits.push(time_limit);
+        self.received_records.push(
+            records
+                .iter()
+                .map(|record| (record.record_id.to_string(), record.input.to_vec()))
+                .collect(),
+        );
         if let Some(&ms) = self.advance_ms.get(candidate_id) {
             self.clock.advance_ms(ms);
         }
-        self.responses
-            .get(candidate_id)
-            .cloned()
-            .unwrap_or_else(|| panic!("unexpected scorer call for {candidate_id}"))
+        let outcomes = match self.responses.get(candidate_id).cloned() {
+            Some(Ok(outcomes)) => outcomes,
+            Some(Err(e)) => return Err(e),
+            None => panic!("unexpected scorer call for {candidate_id}"),
+        };
+        let ids: Vec<String> = match self.record_id_override.get(candidate_id) {
+            Some(overridden) => overridden.clone(),
+            None => records
+                .iter()
+                .map(|record| record.record_id.to_string())
+                .collect(),
+        };
+        Ok(ids
+            .into_iter()
+            .zip(outcomes)
+            .map(|(record_id, outcome)| ScoredOutcome { record_id, outcome })
+            .collect())
     }
 }
 
@@ -308,6 +373,8 @@ fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -393,6 +460,8 @@ fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::new(100).expect("non-zero"),
         policy: fixed_policy(50),
@@ -480,6 +549,8 @@ fn task18_1_2_tie_breaks_to_first_declared_candidate() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -531,6 +602,8 @@ fn task18_1_2_no_eligible_candidate_when_all_candidates_fail() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -582,6 +655,8 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -630,6 +705,8 @@ fn task18_1_2_scoring_failure_after_budget_exhausted_stops_remaining_candidates(
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -681,6 +758,8 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
         let input = SearchInput {
             label_order: &LABEL_ORDER,
             validation_gold: &gold,
+            validation_record_ids: &VALIDATION_RECORD_IDS,
+            validation_inputs: &VALIDATION_INPUTS,
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -704,6 +783,8 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
         let input = SearchInput {
             label_order: &LABEL_ORDER,
             validation_gold: &gold,
+            validation_record_ids: &VALIDATION_RECORD_IDS,
+            validation_inputs: &VALIDATION_INPUTS,
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -726,6 +807,8 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
         let input = SearchInput {
             label_order: &LABEL_ORDER,
             validation_gold: &bad_gold,
+            validation_record_ids: &VALIDATION_RECORD_IDS[..1],
+            validation_inputs: &VALIDATION_INPUTS[..1],
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -753,6 +836,8 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
         let input = SearchInput {
             label_order: &LABEL_ORDER,
             validation_gold: &gold,
+            validation_record_ids: &VALIDATION_RECORD_IDS,
+            validation_inputs: &VALIDATION_INPUTS,
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -785,6 +870,8 @@ fn task18_1_2_scorer_output_length_mismatch_aborts_search() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -798,6 +885,98 @@ fn task18_1_2_scorer_output_length_mismatch_aborts_search() {
             actual: 9,
         }
     );
+}
+
+/// (T8b・P0・REQ-27・評価の独立性。issue #84 PR #238 レビュー) scorer が
+/// 件数は一致するが `record_id` の順序が異なる予測を返した場合、
+/// `run_search` は `validation_gold` と誤って突き合わせて正解率を算出せず、
+/// `ScoringFailed`（採点エラーと同じ扱い）として選定対象から除外する。
+/// 探索全体は中断しない（次候補が宣言されていれば実行される）。
+#[test]
+fn task18_1_2_scorer_record_id_order_mismatch_excludes_candidate_from_selection() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
+    // record_id 列を逆順にして返す（件数は validation_record_ids と同じ
+    // だが順序が異なる。`run_search` が渡した `record_ids` を無視した実装を
+    // 模擬する）。
+    let mut reversed_ids: Vec<&str> = VALIDATION_RECORD_IDS.to_vec();
+    reversed_ids.reverse();
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
+    )
+    .with_record_id_override("c3-a", reversed_ids);
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    // scorer 自体は `run_search` が渡した正しい `(record_id, input)` の組を
+    // 受け取った（呼び出しは行われた。P0・REQ-27: `validation_inputs` が
+    // `record_id` と揃った状態で転送されていることの機械照合）。
+    assert_eq!(scorer.received_records.len(), 1);
+    let expected_records: Vec<(String, Vec<u8>)> = VALIDATION_RECORD_IDS
+        .iter()
+        .zip(VALIDATION_INPUTS.iter())
+        .map(|(&id, &input)| (id.to_string(), input.to_vec()))
+        .collect();
+    assert_eq!(scorer.received_records[0], expected_records);
+    assert_eq!(record.candidates.len(), 1);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringFailed
+    );
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
+/// (T8c・P0・REQ-27・評価の独立性。issue #84 PR #238 レビュー) scorer が
+/// 件数は一致するが全く別の（`validation_record_ids` に含まれない）
+/// `record_id` を返した場合も、`ScoringFailed` として選定対象から除外する。
+#[test]
+fn task18_1_2_scorer_record_id_foreign_ids_excludes_candidate_from_selection() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
+    let foreign_ids: Vec<&str> = (0..VALIDATION_LEN).map(|_| "unrelated-record").collect();
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
+    )
+    .with_record_id_override("c3-a", foreign_ids);
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringFailed
+    );
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
 }
 
 /// (T8・runner のエラー) runner が Err を返すと `SearchError::Candidate`。
@@ -815,6 +994,8 @@ fn task18_1_2_runner_failure_aborts_search() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -856,6 +1037,8 @@ fn task18_1_2_record_serializes_expected_json_shape() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::new(3600).expect("non-zero"),
         policy: PerCandidatePolicy::EvenSplit,
@@ -929,6 +1112,8 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -973,6 +1158,8 @@ fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1019,6 +1206,8 @@ fn task18_1_2_scoring_exceeding_budget_stops_remaining_candidates() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1072,6 +1261,8 @@ fn task18_1_2_scorer_receives_remaining_budget_as_time_limit() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::new(3_600).expect("non-zero"),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1136,6 +1327,8 @@ fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1191,6 +1384,8 @@ fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1246,6 +1441,8 @@ fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1318,6 +1515,8 @@ fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
@@ -1389,6 +1588,8 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: fixed_policy(100),
@@ -1424,6 +1625,8 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
         candidates,
         budget: SearchBudget::default(),
         policy: fixed_policy(100),
