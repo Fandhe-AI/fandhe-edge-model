@@ -33,7 +33,7 @@ fandhe-edge-model/
 ├── crates/                         # 層に対応する crate 群（残りの層は後続 TASK で追加）
 │   ├── core/                       # `fandhe-edge-core`（lib。共通コア。REQ-15）
 │   ├── cli/                        # `fandhe-edge-cli`（lib＋bin `fandhe-edge`。操作アダプター - CLI。REQ-33）
-│   ├── data/                       # `fandhe-edge-data`（lib。データ契約 - 検査・group 単位分割・来歴レコード型を実装済み。REQ-16/17/40。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-40.1-1・#74）
+│   ├── data/                       # `fandhe-edge-data`（lib。データ契約 - 検査・group 単位分割・来歴の記録型と取り込み記録・データ検査との接続を実装済み。REQ-16/17/40。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-40.1-1・#74・TASK-40.1-2・#75）
 │   ├── eval/                       # `fandhe-edge-eval`（lib。評価器 - 正解率・ラベル別指標・Macro-F1・混同行列を実装済み。REQ-24。TASK-24.1-1・#59）
 │   └── train/                      # `fandhe-edge-train`（lib。学習ワーカー層 - 学習リクエスト・結果 JSON の Rust 型を実装済み。REQ-18/19/34/39。issue #177。子プロセス起動・終了コード写像は #178 で未着手）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）を実装済み（MLX 学習・ONNX 書き出し）。選定（TASK-18.x）・作り直し判定（TASK-20.x）・ジョブ管理（REQ-34）は未着手
@@ -61,7 +61,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | 対象 | パス | 調査 | 作成・編集 |
 | ---- | ---- | ---- | ---------- |
 | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） | explorer | core-builder |
-| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・来歴レコード型を実装済み。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-40.1-1・#74） | explorer | data-builder |
+| データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・来歴の記録型と取り込み記録・データ検査との接続を実装済み。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-40.1-1・#74・TASK-40.1-2・#75） | explorer | data-builder |
 | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。Rust 側呼び出し元の JSON 境界型を実装済み。issue #177） | explorer | trainer-builder |
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列を実装済み。TASK-24.1-1・#59） | explorer | evaluator-builder |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 | explorer | runtime-builder |

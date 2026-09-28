@@ -31,8 +31,8 @@ fandhe-edge-train = { path = "crates/train" }
 # 対応として PR #193 で承認記録を追記。バージョン・ライセンス（MIT OR Apache-2.0）・
 # 推移的依存（itoa・memchr・zmij）は変更なし）。
 # #177 で学習ワーカー層（crates/train）への配置も加わる。版・ライセンス・推移的依存は
-# 変更しないが、この配置層の追加自体はオーナーが PR レビューで確認する事項とする
-# （.claude/rules/dependency-policy.md の表を書き換えていない。承認の記録は PR 本文へ残す）。
+# 変更せず、この配置層の追加は 2026-09-28 オーナー承認済み
+# （.claude/rules/dependency-policy.md「承認済みの依存」表に反映済み）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 # sha2 は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
