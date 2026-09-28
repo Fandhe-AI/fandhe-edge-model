@@ -7,6 +7,16 @@
 //! 順序を、実データ相当の JSONL を使って一貫して確認する（PoC-20 ケース 5
 //! 〔`docs/spec/03-poc/safety-hardening/scripts/case5_eval_integrity.py`〕の
 //! 再現。証拠の種別: テストハーネス）。
+//!
+//! 本ファイルのテストはすべて unix の permission bit（`0o444`）に依存する
+//! ため `#![cfg(unix)]` でファイル全体を unix 限定にする（windows では
+//! `File::set_permissions` の挙動が異なり読み取り専用ハンドル経由の
+//! chmod が成立しないため。モジュール doc「手順」）。個々のテストに
+//! `#[cfg(unix)]` を付けるだけでは、windows ビルドで import・ヘルパー
+//! 関数が未使用になり clippy `-D warnings` で fail する（issue #227 CI
+//! 指摘: rust-ci (windows-latest) / cargo clippy）。
+
+#![cfg(unix)]
 
 use fandhe_edge_data::eval_freeze::{EvalDataState, EvaluateGate, evaluate_gate, freeze_eval_data};
 use fandhe_edge_data::frozen_placement::{

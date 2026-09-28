@@ -197,7 +197,12 @@ impl From<FsError> for PlacementError {
 /// `std::fs::symlink_metadata` はリンクを辿らないため、symlink 自身の種別を
 /// 判定できる（`std::fs::metadata` はリンクを辿ってしまい、リンク先が
 /// 通常ファイルであれば symlink であることを見逃す）。
-fn check_not_symlink(path: &Path) -> Result<(), PlacementError> {
+///
+/// 呼び出し側が TOCTOU 検査（`open` 後の `(dev, ino)` 突き合わせ）に使える
+/// よう、取得したメタデータをそのまま返す（このメタデータを捨てて後で
+/// 取り直すと、検査からオープンまでの間の差し替えを見逃す。issue #227
+/// レビュー指摘）。
+fn check_not_symlink(path: &Path) -> Result<std::fs::Metadata, PlacementError> {
     let meta = std::fs::symlink_metadata(path).map_err(|source| PlacementError::Io {
         path: path.to_path_buf(),
         source,
@@ -212,7 +217,7 @@ fn check_not_symlink(path: &Path) -> Result<(), PlacementError> {
             path: path.to_path_buf(),
         });
     }
-    Ok(())
+    Ok(meta)
 }
 
 #[cfg(unix)]
@@ -226,7 +231,7 @@ fn dev_ino(meta: &std::fs::Metadata) -> (u64, u64) {
 /// モジュール doc「手順」を参照。冪等: 既に `0o444`（unix）／読み取り専用
 /// （非 unix）であるファイルに対して呼んでも成功する。
 pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError> {
-    check_not_symlink(path)?;
+    let pre_meta = check_not_symlink(path)?;
 
     let file = open_regular_file_for_read(path)?;
 
@@ -234,10 +239,12 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let pre_meta = std::fs::symlink_metadata(path).map_err(|source| PlacementError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        // `pre_meta` は `check_not_symlink` が `open` より前に取得した
+        // symlink_metadata（このスコープに入る前に別のファイルへ差し替え
+        // られていないかの基準）。ここで新たに `symlink_metadata` を取り
+        // 直すと、その取り直し自体が新しい TOCTOU 窓になる（issue #227
+        // codex P0 指摘）ため、必ず `check_not_symlink` が返したメタデータ
+        // を使う。
         let opened_meta = file.metadata().map_err(|source| PlacementError::Io {
             path: path.to_path_buf(),
             source,
@@ -269,7 +276,11 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
             });
         }
 
-        verify_direct_write_rejected(path)?;
+        // `verify_direct_write_rejected` にはこのハンドルの `(dev, ino)` を
+        // 期待値として渡し、権限変更後・書き込み確認前にパスが別の
+        // ファイルへ差し替えられていないかも突き合わせる（issue #227
+        // codex P1 指摘）。
+        verify_direct_write_rejected_checked(path, Some(dev_ino(&confirmed)))?;
         Ok(ReadOnlyPlacement { mode })
     }
 
@@ -279,7 +290,9 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
         // `FILE_WRITE_ATTRIBUTES` を要求され失敗しうるため、パス経由で行う
         // （モジュール doc「手順」参照）。事前検査（`check_not_symlink`・
         // `open_regular_file_for_read`）は既に通過済みだが、パス経由のため
-        // ここでの TOCTOU 対策は unix ほど強くない（M10 時点で対象外 OS）。
+        // ここでの TOCTOU 対策は unix ほど強くない（M10 時点で対象外 OS。
+        // `(dev, ino)` に相当する安価な同一性検査手段がないため）。
+        let _ = &pre_meta;
         drop(file);
         let mut perms = std::fs::metadata(path)
             .map_err(|source| PlacementError::Io {
@@ -318,14 +331,68 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
 /// `OpenOptions::new().append(true)` のみを使い `create`・`truncate` は
 /// 付けない。開けても 1 バイトも書かずに即座に閉じるため、呼び出し前後で
 /// ファイルの内容・mtime は変わらない。
+///
+/// 単独呼び出し（`expected_dev_ino` なし）でも、事前検査
+/// （`check_not_symlink`）で得た `(dev, ino)` と実際に書き込みを試みた
+/// ハンドルのそれを突き合わせ、検査からオープンの間の差し替えを検出する
+/// （unix 限定。issue #227 cursor[bot] 指摘: TOCTOU check uses post-open
+/// stat）。
 pub fn verify_direct_write_rejected(path: &Path) -> Result<(), PlacementError> {
-    check_not_symlink(path)?;
+    verify_direct_write_rejected_checked(path, None)
+}
+
+/// [`verify_direct_write_rejected`] の内部実装。`expected_dev_ino` が
+/// `Some` の場合（[`place_read_only`] からの呼び出し）、権限変更に使った
+/// ハンドルの `(dev, ino)` と、本関数が事前検査で得た `(dev, ino)` の一致も
+/// 要求する。これにより、権限変更後・本確認前にパスが別のファイルへ
+/// 差し替えられていた場合も差し替え前のファイルと同一であることを確認
+/// できなければ `Replaced` で拒否する（issue #227 codex P1 指摘）。
+fn verify_direct_write_rejected_checked(
+    path: &Path,
+    #[cfg_attr(not(unix), allow(unused_variables))] expected_dev_ino: Option<(u64, u64)>,
+) -> Result<(), PlacementError> {
+    let pre_meta = check_not_symlink(path)?;
+    #[cfg(unix)]
+    let pre_dev_ino = dev_ino(&pre_meta);
+    #[cfg(not(unix))]
+    let _ = &pre_meta;
+
+    #[cfg(unix)]
+    if let Some(expected) = expected_dev_ino
+        && pre_dev_ino != expected
+    {
+        return Err(PlacementError::Replaced {
+            path: path.to_path_buf(),
+        });
+    }
 
     match OpenOptions::new().append(true).open(path) {
         Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(()),
-        Ok(_) => Err(PlacementError::WriteNotRejected {
-            path: path.to_path_buf(),
-        }),
+        Ok(opened) => {
+            // 開けてしまった（＝書き込み可能）場合でも、それが検査時と
+            // 同一のファイルであることを確認してから `WriteNotRejected`
+            // として報告する。差し替え後の別ファイルが書き込み可能
+            // だっただけなら `Replaced` で区別する。
+            #[cfg(unix)]
+            {
+                let opened_meta = opened.metadata().map_err(|source| PlacementError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                if dev_ino(&opened_meta) != pre_dev_ino {
+                    return Err(PlacementError::Replaced {
+                        path: path.to_path_buf(),
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                drop(opened);
+            }
+            Err(PlacementError::WriteNotRejected {
+                path: path.to_path_buf(),
+            })
+        }
         Err(source) => Err(PlacementError::Io {
             path: path.to_path_buf(),
             source,
@@ -340,31 +407,23 @@ mod tests {
     /// テスト用の一時ファイルを、成否に関わらず削除するガード（RAII）。
     /// 削除の前に権限を書き込み可へ戻す（読み取り専用のままだと環境に
     /// よっては削除できないため、また後始末を確実にするため）。
+    ///
+    /// unix の permission bit（`0o444`）に依存するテストからしか使わない
+    /// ため `#[cfg(unix)]`。windows では未使用となり clippy `-D warnings`
+    /// で fail する（issue #227 CI 指摘）。
+    #[cfg(unix)]
     struct TempFileGuard(PathBuf);
 
+    #[cfg(unix)]
     impl Drop for TempFileGuard {
         fn drop(&mut self) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
-            }
-            #[cfg(not(unix))]
-            {
-                if let Ok(meta) = std::fs::metadata(&self.0) {
-                    let mut perms = meta.permissions();
-                    #[allow(
-                        clippy::permissions_set_readonly_false,
-                        reason = "テスト後片付けで Windows の読み取り専用属性を解除するため"
-                    )]
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(&self.0, perms);
-                }
-            }
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
             let _ = std::fs::remove_file(&self.0);
         }
     }
 
+    #[cfg(unix)]
     fn write_unique_temp_file(label: &str, bytes: &[u8]) -> TempFileGuard {
         let pid = std::process::id();
         for attempt in 0..1000u32 {
@@ -464,23 +523,21 @@ mod tests {
         assert_eq!(second.mode(), 0o444);
     }
 
-    /// REQ-39: 書き込み可能なファイルへ `verify_direct_write_rejected` を
-    /// 呼ぶと、root かどうかに関わらず決定的に判定される。
+    /// REQ-39: 書き込み可能なファイル（所有者に書き込み権限がある通常の
+    /// mode）へ `verify_direct_write_rejected` を呼ぶと、root かどうかに
+    /// 関わらず `WriteNotRejected` になる（所有者の書き込み権限は root で
+    /// なくても append open を成功させるため、root 分岐で期待値を変える
+    /// 理由がない。以前のテストは `result.is_ok()`〔＝書き込み拒否〕を
+    /// root の「append open に成功するはず」という逆の主張の根拠にして
+    /// おり期待値が反転していた。issue #227 cursor[bot] 指摘: Root test
+    /// inverts write-rejection result）。
     #[cfg(unix)]
     #[test]
     fn req39_verify_direct_write_rejected_on_writable_file() {
         let guard = write_unique_temp_file("writable-probe", b"eval data");
-        let result = verify_direct_write_rejected(&guard.0);
-        if running_as_root(&guard.0) {
-            assert!(
-                result.is_ok(),
-                "root は書き込み可能ファイルへの append open に成功するはず"
-            );
-        } else {
-            match result {
-                Err(PlacementError::WriteNotRejected { .. }) => {}
-                other => panic!("WriteNotRejected を期待したが {other:?} だった"),
-            }
+        match verify_direct_write_rejected(&guard.0) {
+            Err(PlacementError::WriteNotRejected { .. }) => {}
+            other => panic!("WriteNotRejected を期待したが {other:?} だった"),
         }
         // 非破壊プローブ: append open が成功しても中身は変わらない。
         assert_eq!(
