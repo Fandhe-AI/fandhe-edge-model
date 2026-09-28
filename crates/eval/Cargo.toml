@@ -5,17 +5,27 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Evaluator layer (accuracy, per-label metrics, macro-F1, confusion matrix, Wilson 95% CI, McNemar baseline significance, type/meaning quadrant, model package invariance) for fandhe-edge-model."
+description = "Evaluator layer (accuracy, per-label metrics, macro-F1, confusion matrix, Wilson 95% CI, McNemar baseline significance, type/meaning quadrant, model package invariance, eval data invariance) for fandhe-edge-model."
 
 [dependencies]
-# workspace 内の path 依存のみ（外部 crate は追加しない）。用途はモデルパッケージの
-# 評価前後比較（REQ-27・TASK-27.1-1・issue #69）で使う sha256 ダイジェスト型
-# （`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限付きの安全な通常
-# ファイル読み込み（`fandhe_edge_core::fs::sha256_file_bounded`。issue #214
-# codex/review 指摘: 通常ファイル判定・TOCTOU 対策の複製を解消するため共通コアへ
-# 集約）に限る。`fandhe-edge-core::definition` には依存しない
-# （crates/eval/src/lib.rs の「層の境界」参照）。
+# workspace 内の path 依存のみ（外部 crate は追加しない）。用途はモデルパッケージ・
+# 評価データの評価前後比較（REQ-27・TASK-27.1-1・issue #69・TASK-27.1-2・issue #70）で
+# 使う sha256 ダイジェスト型（`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限
+# 付きの安全な通常ファイル読み込み（`fandhe_edge_core::fs::read_bounded`・
+# `sha256_file_bounded`。issue #214 codex/review 指摘: 通常ファイル判定・TOCTOU 対策の
+# 複製を解消するため共通コアへ集約）に限る。`fandhe-edge-core::definition` には
+# 依存しない（crates/eval/src/lib.rs の「層の境界」参照）。
 fandhe-edge-core.workspace = true
+
+[dev-dependencies]
+# 結合テスト専用（issue #70・TASK-27.1-2）。`fandhe_edge_data::eval_freeze` の
+# `freeze_eval_data`/`evaluate_gate`/`EvalDataState`/`FreezeError` を使い、本 crate の
+# 評価データ不変性チェックが data 層の凍結記録・停止判定（TASK-17.3）と同じ条件で
+# 停止することをテストで確認する。workspace 内 path 依存であり、外部 crate の追加・
+# 版変更・[dependencies] への配置ではない（通常依存は fandhe-edge-core のみを維持し、
+# eval の本体ビルドへ data 側の serde・serde_json・unicode-normalization を
+# 引き込まない。crates/eval/src/lib.rs「層の境界」参照）。
+fandhe-edge-data.workspace = true
 
 [lints]
 workspace = true

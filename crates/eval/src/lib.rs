@@ -28,6 +28,10 @@
 //!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
 //!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
 //!   工程（将来）から評価処理を渡す想定
+//! - [`eval_data_invariance`][]: 評価データ（正解ラベルを含む本体）の評価前後
+//!   ハッシュ比較・データ契約層（`fandhe-edge-data`）の凍結記録との接続
+//!   （REQ-27 正常系・REQ-17・TASK-27.1-2・issue #70）。[`invariance`] のモデル
+//!   パッケージ側と対になる評価データ側の実装
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -54,10 +58,11 @@
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
-//! - 評価データのハッシュの前後比較・不一致時の停止（REQ-17・TASK-17.3）への
-//!   接続: 未実装（issue #70）。[`invariance`] と同じ
-//!   [`fandhe_edge_core::hash::Sha256Digest`] とスナップショット比較の形を
-//!   再利用できる想定
+//! - 評価データのハッシュの前後比較・凍結記録との接続（REQ-17・REQ-27）:
+//!   実装済み（TASK-27.1-2・issue #70。[`eval_data_invariance`]）。ただし
+//!   台帳との突き合わせ・来歴の記録（TASK-17.3 の停止分岐本体・issue #49）と
+//!   CLI `evaluate` 工程への配線（issue #140）・終了コードへの写像
+//!   （TASK-33.3）は未実装
 //! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2。PoC-9
 //!   `ArgumentRecordingPredictor` 相当）: 未実装
 //! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3）: 未実装
@@ -70,18 +75,24 @@
 //! # 層の境界・不変条件
 //!
 //! - 外部 crate への直接依存は持たない。workspace 内の `fandhe-edge-core` には
-//!   [`invariance`] が使う生バイト列の sha256 ダイジェスト型
-//!   （`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限付きの安全な
-//!   通常ファイル読み込み（`fandhe_edge_core::fs::sha256_file_bounded`）の
-//!   ためだけに依存する（`Cargo.toml` の `[dependencies]` を参照。issue #214
-//!   codex/review 指摘: 通常ファイル判定・TOCTOU 対策を本 crate 側に複製せず
-//!   共通コアと共有する）
+//!   [`invariance`]・[`eval_data_invariance`] が使う生バイト列の sha256
+//!   ダイジェスト型（`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限付きの
+//!   安全な通常ファイル読み込み（`fandhe_edge_core::fs::read_bounded`・
+//!   `sha256_file_bounded`）のためだけに依存する（`Cargo.toml` の
+//!   `[dependencies]` を参照。issue #214 codex/review 指摘: 通常ファイル判定・
+//!   TOCTOU 対策を本 crate 側に複製せず共通コアと共有する）。`fandhe-edge-data`
+//!   は `[dev-dependencies]` としてのみ依存する（[`eval_data_invariance`] の
+//!   結合テストが、data 層の凍結記録・停止判定〔`eval_freeze::evaluate_gate`〕と
+//!   同じ条件で停止することを確認するため。本体ビルド〔`[dependencies]`〕には
+//!   含めず、data 層の serde・serde_json・unicode-normalization を引き込まない）
 //! - ラベルは ID の文字列スライスで受け取り、`fandhe-edge-core::definition` には
 //!   依存しない。呼び出し側が `Definition::options()` の `id` を宣言順で渡す
-//! - 予測ファイル（JSONL）の読み込み・`status` 文字列の正規化・モデルパッケージの
-//!   ファイル読み込みはデータ契約層・CLI 層の責務であり、本 crate は型付きの
-//!   メモリ上のスライスだけを受け取る（REQ-27: 評価の前後でモデル・評価データの
-//!   ハッシュが一致すること。本 crate は入力を参照でのみ受け取り、書き換えない）
+//! - 予測ファイル（JSONL）の読み込み・`status` 文字列の正規化はデータ契約層・
+//!   CLI 層の責務であり、本 crate は型付きのメモリ上のスライスだけを受け取る
+//!   （REQ-27: 評価の前後でモデル・評価データのハッシュが一致すること。本 crate は
+//!   入力を参照でのみ受け取り、書き換えない）。一方、モデルパッケージ
+//!   （[`invariance`]）・評価データ（[`eval_data_invariance`]）のファイル読み込み
+//!   （上限付き）は、評価前後のハッシュ比較のために本 crate 自身が行う経路がある
 //! - レコード件数・ファイルサイズの上限検証（REQ-39）は呼び出し側（データ検査層・
 //!   ガード層）の責務。ラベル（選択肢）数の上限検証は本 crate 自身が行う
 //!   （[`metrics::evaluate_single_select`] がラベル索引の構築前に
@@ -93,6 +104,7 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
+pub mod eval_data_invariance;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
