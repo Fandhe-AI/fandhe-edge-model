@@ -17,17 +17,33 @@
 //! 場合の保険として働く（[`crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]
 //! のドキュメントに根拠を記す）。
 //!
-//! # 孤児化の限界
+//! # 孤児化の限界（codex/review 指摘。issue #178 PR #233 レビュー P0 対応）
 //!
-//! supervisor は `_worker` を別セッションで起動するため、本モジュールが
-//! supervisor プロセス（`python -I launch.py train ...`）を kill しても、
-//! 別セッションの `_worker` には SIGKILL が届かない。supervisor が Rust の
-//! 外側締め切りより先に自分の内側締め切りで `_worker` を kill・回収する
-//! 設計（[`crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]）で緩和する
-//! が、supervisor プロセス自体が応答不能になった極端なケースでは `_worker`
-//! が孤児として残りうる。Rust 側だけでプロセスグループ単位の kill を行う
-//! には依存追加（`nix`／`libc` 等）が要り、本 issue の対象外とする
-//! （issue #178 実装計画 8 章）。
+//! supervisor は `_worker` を別セッション（`start_new_session=True`）で
+//! 起動するため、supervisor プロセス（`python -I launch.py train ...`）を
+//! 直接 kill しただけでは、別セッションの `_worker` には SIGKILL が届かない。
+//! 本モジュールは外側の壁時計締め切り超過・`try_wait()` 自体のエラーの
+//! いずれの経路でも、[`kill_process_tree_best_effort`] で supervisor を
+//! 根とするプロセスツリー（`_worker` を含む子孫）を `/bin/ps`・`/bin/kill`
+//! （固定 argv・絶対パス。シェル不使用）で走査・強制終了してから、直接の
+//! 子（supervisor 自身）を `Child::kill()`／`wait()` で確実に回収する。
+//! native `kill(2)` を直接呼ぶには `libc` クレートの追加（新規依存。
+//! `.claude/rules/dependency-policy.md`。ユーザー承認事項）か `unsafe` な
+//! FFI（`.claude/rules/coding-rust.md`「unsafe・FFI」。同じくユーザー承認
+//! 事項）が要るため、いずれも承認を経ずに追加しない。代わりに
+//! `supervisor.py::_current_child_rss_bytes` が既に採用している「固定
+//! argv・絶対パスの外部コマンドを呼ぶ」方針に揃える
+//! （[`kill_process_tree_best_effort`] のドキュメントコメント参照）。
+//!
+//! 残る既知の限界: (1) supervisor プロセス自体が既に終了し PID が別プロセス
+//! へ再利用された後に `_worker` だけが孤児として残っているケース
+//! （`try_wait()` が `Ok(Some(status))` を返す通常の終了経路の後）は、
+//! 本モジュールが supervisor の生存を前提に `_worker` を辿る性質上、
+//! 対象にできない（この経路は「supervisor が応答不能」ではなく「supervisor
+//! は既に終了した」ケースであり、P0 指摘が指す「応答不能」とは別）。
+//! (2) Windows は対象外（`#[cfg(windows)]` は現状どおり直接の子だけを
+//! `Child::kill()` する。ジョブオブジェクト（`CreateJobObject`／
+//! `AssignProcessToJobObject`）によるプロセスツリー単位の終了は将来の課題）。
 //!
 //! # 推論ランタイムとの境界
 //!
@@ -362,6 +378,192 @@ impl TrainRun {
     }
 }
 
+/// `/bin/ps`（プロセス一覧の取得）の絶対パス。`supervisor.py::_PS_BIN` と
+/// 同じ方針（シェル不使用・絶対パス固定。`.claude/rules/security.md`
+/// 「インジェクション」）。
+#[cfg(unix)]
+const PS_BIN: &str = "/bin/ps";
+
+/// `/bin/kill`（個々の子孫プロセスへの `SIGKILL` 送出）の絶対パス。
+#[cfg(unix)]
+const KILL_BIN: &str = "/bin/kill";
+
+/// プロセスツリー走査・強制終了の 1 ステップ（`ps` の実行・`kill` の実行）
+/// あたりの上限（REQ-39「資源の上限」）。`ps`／`kill` 自体が固まった場合に
+/// 無限待ちにしない。
+#[cfg(unix)]
+const ORPHAN_SWEEP_STEP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `program`（絶対パス）を `args` で子プロセスとして起動し、標準出力を
+/// 上限 `cap` バイトまで読み取りつつ、`timeout` を超えたら強制終了する。
+/// [`kill_process_tree_best_effort`] が `ps` の出力を取得するために使う
+/// 内部ヘルパー（REQ-39「資源の上限」。無制限の待ち・読み取りを作らない）。
+///
+/// 起動・読み取り・終了待ちのいずれかに失敗した、`timeout` を超過した、
+/// または終了コードが非 0 の場合は `None`（呼び出し元は「取得できなかった」
+/// として安全側〔fail-closed。プロセスツリーの走査を諦めて直接の子だけを
+/// 回収する〕に倒す）。
+#[cfg(unix)]
+fn run_bounded_capture(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let rx = child.stdout.take().map(|pipe| spawn_reader(pipe, cap));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => break None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    if !status.success() {
+        return None;
+    }
+    let rx = rx?;
+    let drained = rx.recv_timeout(timeout).ok()?;
+    if drained.truncated {
+        return None;
+    }
+    Some(drained.kept)
+}
+
+/// `program`（絶対パス）を `args` で起動し、`timeout` の範囲でベストエフォート
+/// に完了を待つ（結果は捨てる）。[`kill_process_tree_best_effort`] が
+/// `/bin/kill` の起動に使う。起動失敗・タイムアウトは無視する（呼び出し元は
+/// 本関数の成否によらず直接の子を [`Child::kill`] で確実に回収するため、
+/// ここでの失敗は許容できる）。
+#[cfg(unix)]
+fn run_bounded_fire_and_forget(program: &str, args: &[&str], timeout: Duration) {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// `/bin/ps -eo pid=,ppid=` の出力を `(pid, ppid)` の一覧へ解析する
+/// （OS 全体のプロセス一覧。`supervisor.py::_current_child_rss_bytes` と
+/// 同じ `ps` 呼び出し方針）。解析できない行（ヘッダ・空行・想定外の書式）は
+/// 読み飛ばす（1 行の解析失敗でプロセスツリー走査全体を諦めない）。
+#[cfg(unix)]
+fn ps_pid_ppid_pairs() -> Option<Vec<(u32, u32)>> {
+    let raw = run_bounded_capture(
+        PS_BIN,
+        &["-eo", "pid=,ppid="],
+        ORPHAN_SWEEP_STEP_TIMEOUT,
+        MAX_RESULT_BYTES,
+    )?;
+    let text = String::from_utf8(raw).ok()?;
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid_str), Some(ppid_str)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_str.parse::<u32>(), ppid_str.parse::<u32>()) else {
+            continue;
+        };
+        pairs.push((pid, ppid));
+    }
+    Some(pairs)
+}
+
+/// `root`（supervisor の pid）を起点に、`pairs`（OS 全体の `(pid, ppid)`）
+/// から推移的な子孫（`_worker` を含む）の pid 一覧を求める。
+#[cfg(unix)]
+fn transitive_descendants(root: u32, pairs: &[(u32, u32)]) -> Vec<u32> {
+    let mut result = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(current) = frontier.pop() {
+        for &(pid, ppid) in pairs {
+            if ppid == current && pid != root && !result.contains(&pid) {
+                result.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    result
+}
+
+/// 外側の壁時計締め切り超過・`try_wait()` 自体のエラーの経路で、supervisor
+/// （直接の子プロセス）だけでなくその子孫（`_worker` が
+/// `start_new_session=True` で作る別セッション・別プロセスグループの
+/// プロセスを含む）もまとめて `SIGKILL` する（REQ-39「資源の上限」。
+/// codex/review 指摘 P0「外側のタイムアウト時に学習プロセスを停止できない」。
+/// issue #178 PR #233 レビュー。モジュール doc「孤児化の限界」参照）。
+///
+/// `root_pid`（= supervisor の pid）がまだ生きている前提で `ps` を実行し、
+/// 子孫の一覧を取得してから 1 件ずつ `/bin/kill -s KILL <pid>` を送る。
+/// 呼び出し元は本関数の後に必ず supervisor 自身を `Child::kill()`／
+/// `Child::wait()` で回収すること（本関数は supervisor 自身の回収を行わず、
+/// 子孫だけを対象にする）。
+///
+/// `ps`・`kill` 自体の失敗・タイムアウトは無視する（本関数はベストエフォート
+/// の多層防御であり、これが失敗しても呼び出し元による直接の子の回収は
+/// 妨げない。fail-closed ではなく fail-open だが、直接の子の回収という
+/// 主要な不変条件〔ゾンビを残さない〕は本関数の成否と独立に保たれる）。
+#[cfg(unix)]
+fn kill_process_tree_best_effort(root_pid: u32) {
+    let Some(pairs) = ps_pid_ppid_pairs() else {
+        return;
+    };
+    for pid in transitive_descendants(root_pid, &pairs) {
+        run_bounded_fire_and_forget(
+            KILL_BIN,
+            &["-s", "KILL", &pid.to_string()],
+            ORPHAN_SWEEP_STEP_TIMEOUT,
+        );
+    }
+}
+
+/// Windows では対象外（モジュール doc「孤児化の限界」参照）。ジョブ
+/// オブジェクト（`CreateJobObject`／`AssignProcessToJobObject`）による
+/// プロセスツリー単位の終了は将来の課題とする。
+#[cfg(windows)]
+fn kill_process_tree_best_effort(_root_pid: u32) {}
+
 /// [`Child::wait()`] の失敗を [`TrainProcessError::Wait`] へ写す。
 fn wait_child(child: &mut Child) -> Result<ExitStatus, TrainProcessError> {
     child
@@ -463,8 +665,13 @@ pub fn run_train(
                 // ている子プロセスを kill／wait せず放置してゾンビ化・孤児化
                 // させる（Cursor Bugbot 指摘「Child leaked on wait error」。
                 // issue #178 PR #233 レビュー）。エラーを返す前に必ず回収を
-                // 試みる。kill・wait 自体の失敗（既に終了済み等）は元の
-                // `try_wait` エラーの報告を妨げないよう無視する。
+                // 試みる。supervisor がまだ生きている前提でプロセスツリー
+                // （`_worker` を含む子孫）も先に掃除してから、直接の子
+                // （supervisor 自身）を回収する（codex/review 指摘 P0。
+                // モジュール doc「孤児化の限界」参照）。kill・wait 自体の
+                // 失敗（既に終了済み等）は元の `try_wait` エラーの報告を
+                // 妨げないよう無視する。
+                kill_process_tree_best_effort(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(TrainProcessError::Wait { kind: e.kind() });
@@ -475,9 +682,14 @@ pub fn run_train(
     let status = match status {
         Some(status) => status,
         None => {
-            // 締め切り超過: kill してから必ず `wait()` で回収する
-            // （ゾンビを残さない）。kill 自体の失敗（既に終了済み等）は
-            // 無視してよい。
+            // 締め切り超過: supervisor がまだ生きている前提でプロセス
+            // ツリー（`_worker` を含む子孫）を先に掃除してから、supervisor
+            // 自身を kill してから必ず `wait()` で回収する（ゾンビを残さ
+            // ない。codex/review 指摘 P0「外側のタイムアウト時に学習
+            // プロセスを停止できない」。issue #178 PR #233 レビュー。
+            // モジュール doc「孤児化の限界」参照）。kill 自体の失敗
+            // （既に終了済み等）は無視してよい。
+            kill_process_tree_best_effort(child.id());
             let _ = child.kill();
             wait_child(&mut child)?;
             return Err(TrainProcessError::WallTimeout {

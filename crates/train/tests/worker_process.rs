@@ -127,6 +127,67 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        "hang_with_orphan" => {
+            // codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・
+            // 検証用モード。`supervisor.py` が `_worker` を
+            // `start_new_session=True` で別セッションとして起動する状況を
+            // 模す: 自分自身（このテストバイナリ）を「孫プロセス」として
+            // 新しいセッション（`process_group(0)`。unix でのみ利用可能）で
+            // 起動し、孫の pid を `orphan.pid`（cwd = job_dir）へ書いてから、
+            // 自分（「supervisor 役」）は標準出力を閉じずに応答不能なまま
+            // 待ち続ける（外側の壁時計タイムアウトで kill されるまで自発的に
+            // 終了しない）。
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let exe = std::env::current_exe().expect("resolve current_exe for orphan");
+                let launch_script = std::env::current_dir()
+                    .expect("cwd")
+                    .join("orphan-launch.py");
+                std::fs::write(&launch_script, "orphan_hang").expect("write orphan launch.py");
+                let mut command = std::process::Command::new(&exe);
+                command
+                    .arg("-I")
+                    .arg(&launch_script)
+                    .arg("train")
+                    .arg("--request")
+                    .arg(request_path)
+                    .process_group(0);
+                let grandchild = command.spawn().expect("spawn orphan grandchild");
+                std::fs::write("orphan.pid", grandchild.id().to_string())
+                    .expect("write orphan.pid");
+                // 生成した `Child` を `wait()` せずに drop すると
+                // `clippy::zombie_processes` に抵触する。本テストの主眼は
+                // 「supervisor 役から見て孫プロセスが生きたまま応答不能に
+                // なる」状況の再現であり、`wait()` 自体は本題ではないため、
+                // 別スレッドへ切り出して回収する（孫プロセスは外側の
+                // タイムアウトで `SIGKILL` されるまで終了しないため、この
+                // `wait()` は `run_train` 側の強制終了後に完了する）。
+                std::thread::spawn(move || {
+                    let mut grandchild = grandchild;
+                    let _ = grandchild.wait();
+                });
+            }
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        "orphan_hang" => {
+            // `hang_with_orphan` が起動する「孫プロセス」役。`heartbeat.txt`
+            // （cwd = job_dir。親と同じ cwd を継承）へ書き続け、外側の
+            // タイムアウト経路が本プロセスも回収できたかをテストから
+            // 確認できるようにする。
+            loop {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("orphan-heartbeat.txt")
+                {
+                    let _ = f.write_all(b".");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         "record" => {
             // argv・受け取った request.json の内容・環境変数名の一覧を
             // cwd（= job_dir）の `record.json` へ書く（issue #178 実装計画
@@ -172,7 +233,7 @@ struct CaseResult {
 type CaseFn = fn(&Path) -> Result<(), String>;
 
 fn run_test_suite() -> ProcessExitCode {
-    let cases: Vec<(&'static str, CaseFn)> = vec![
+    let mut cases: Vec<(&'static str, CaseFn)> = vec![
         ("ok_outcome", case_ok_outcome),
         ("error_invalid_request", case_error_invalid_request),
         ("error_training_diverged", case_error_training_diverged),
@@ -186,6 +247,8 @@ fn run_test_suite() -> ProcessExitCode {
         ("invalid_job_dir", case_invalid_job_dir),
         ("existing_request_file_rejected", case_existing_request_file),
     ];
+    #[cfg(unix)]
+    cases.push(("timeout_hang_kills_orphan", case_timeout_hang_kills_orphan));
 
     let mut results = Vec::new();
     for (name, case_fn) in cases {
@@ -442,6 +505,66 @@ fn case_timeout_hang(case_dir: &Path) -> Result<(), String> {
         len_after_wait,
         len_after_return,
         "heartbeat must not grow after run_train returns (no orphaned process)",
+    )
+}
+
+/// codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・検証:
+/// supervisor 役（`hang_with_orphan`）が別セッションで起動した孫プロセス
+/// （`_worker` 役。応答不能な supervisor に代わって走り続ける）も、外側の
+/// 壁時計タイムアウトで確実に終了することを確認する。
+#[cfg(unix)]
+fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "hang_with_orphan");
+    let request = make_request(Some(1));
+    let limits = RunLimits::for_request(&request)
+        .with_wall_timeout(Duration::from_millis(500))
+        .expect("tighten wall timeout");
+
+    // 孫プロセスが実際に起動してから外側タイムアウトが発火するよう、
+    // `orphan.pid` の出現を短いポーリングで待つ（`run_train` 自体の
+    // タイムアウトとは独立の、このテストの起動待ちにすぎない）。
+    let orphan_pid_path = case_dir.join("orphan.pid");
+    let err = match run_train(&launcher, &request, case_dir, &limits) {
+        Err(e) => e,
+        Ok(_) => return Err("expected WallTimeout error".to_string()),
+    };
+    expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
+
+    let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
+        .map_err(|e| format!("read orphan.pid: {e} (grandchild may not have started in time)"))?;
+    let orphan_pid: u32 = orphan_pid_text
+        .trim()
+        .parse()
+        .map_err(|e| format!("parse orphan.pid {orphan_pid_text:?}: {e}"))?;
+
+    // 孫プロセスが生きていれば heartbeat が伸び続けるはずなので、少し待って
+    // `orphan-heartbeat.txt` が伸びていないことを確認する（`run_train` の
+    // 戻り値だけでなく、実際に孫プロセスが止まったことを外部から観測する）。
+    let heartbeat = case_dir.join("orphan-heartbeat.txt");
+    let len_after_return = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(500));
+    let len_after_wait = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    expect_eq(
+        len_after_wait,
+        len_after_return,
+        "orphan heartbeat must not grow after run_train returns (grandchild must be killed too)",
+    )?;
+
+    // `kill -0 <pid>` は送信対象が存在すれば 0、存在しなければ非 0 で
+    // 終了する（`/bin/kill` は本テストが検証対象とする `run_train` 側の
+    // 実装が使う同じバイナリ。テスト側の検証にも同じ絶対パスの外部
+    // コマンドを再利用する）。
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-0", &orphan_pid.to_string()])
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to run /bin/kill -0: {e}"))?;
+    expect_true(
+        !status.success(),
+        "orphan process must no longer exist after run_train returns",
     )
 }
 

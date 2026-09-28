@@ -40,10 +40,13 @@
 //!   引き続き担う
 //! - CLI `train` 工程への配線・`trainer_dir` の発見（CLI 引数・設定からの
 //!   解決。TASK-33.x）
-//! - Rust 側でのプロセスグループ単位の kill・RSS 監視（`_worker` が
-//!   supervisor と別セッションで起動されるため、Rust から直接は制御でき
-//!   ない。現状は学習ワーカー自身の `supervisor.py` が担う。[`process`]
-//!   モジュール doc「孤児化の限界」参照）
+//! - Rust 側での RSS 監視（学習ワーカー自身の `supervisor.py` が担う）。
+//!   外側の壁時計締め切り超過時のプロセスツリー単位の kill（`_worker` を
+//!   含む）は [`process::run_train`] が `/bin/ps`／`/bin/kill` を用いた
+//!   ベストエフォートで行う（issue #178 PR #233 レビュー codex/review P0。
+//!   [`process`] モジュール doc「孤児化の限界」参照。native `kill(2)` の
+//!   直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe` 新規導入のいずれも
+//!   ユーザー承認事項のため対象外）
 
 pub mod error;
 mod kind_defaults;
