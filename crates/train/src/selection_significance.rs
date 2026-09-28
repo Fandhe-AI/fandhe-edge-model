@@ -310,6 +310,31 @@ pub fn assess_selection_significance(
         return Err(SelectionSignificanceError::EmptyCandidates);
     }
 
+    // `family_size` を候補数に対して検証する（REQ-39。候補 ID 検証・
+    // McNemar 計算など候補数に比例する処理より前に置く）。
+    // `holm::compare_candidates_with_holm` 内でも同じ検証が行われるため
+    // 挙動は変わらない（`FamilySizeTooLarge`/`FamilySizeTooSmall` の
+    // 早期化のみ）。`coding-rust.md`「サイズ・件数を上限検証してから
+    // アロケーションに使う」・`security.md`「資源の上限」に従う。
+    let n_candidates = input.candidates.len();
+    let m = input.family_size.get();
+    if m > holm::MAX_FAMILY_SIZE {
+        return Err(SelectionSignificanceError::Holm(
+            HolmError::FamilySizeTooLarge {
+                family_size: m,
+                limit: holm::MAX_FAMILY_SIZE,
+            },
+        ));
+    }
+    if m < n_candidates {
+        return Err(SelectionSignificanceError::Holm(
+            HolmError::FamilySizeTooSmall {
+                family_size: m,
+                n_tests: n_candidates,
+            },
+        ));
+    }
+
     // 候補 ID の検証・重複検出（決定的な `BTreeSet` を使う）。
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
     for (i, candidate) in input.candidates.iter().enumerate() {
@@ -429,10 +454,9 @@ mod tests {
             gold.push("A");
             outcomes.push(Outcome::Label("A".to_string()));
         }
-        for i in 0..b {
+        for _ in 0..b {
             gold.push("B");
             outcomes.push(Outcome::Label("B".to_string()));
-            let _ = i;
         }
         let wrong_kinds = [
             Outcome::Label("B".to_string()),
@@ -644,7 +668,7 @@ mod tests {
         );
     }
 
-    /// 候補 ID が上限（129 バイト）を超えるとエラー。
+    /// 候補 ID が上限（128 バイト）を超えるとエラー。
     #[test]
     fn too_long_candidate_id_is_error() {
         let labels = ["A", "B"];
@@ -786,6 +810,39 @@ mod tests {
                 index: 0,
                 expected: 1,
                 actual: 2,
+            }
+        );
+    }
+
+    /// `validation_gold` の件数が上限（[`significance::MAX_EVAL_RECORDS`]）を
+    /// 超えると、`PairedRecord` の `Vec` を確保する前に `TooManyRecords` で
+    /// 拒否する（REQ-39 資源の上限。`crates/eval` 側の同種の上限テスト
+    /// `correctness_too_many_records_is_error` 等と対にする）。
+    #[test]
+    fn too_many_records_is_error() {
+        let labels = ["A"];
+        let train_labels = ["A"];
+        let outcomes = [Outcome::Label("A".to_string())];
+        let gold: Vec<&str> = vec!["A"; significance::MAX_EVAL_RECORDS + 1];
+        let candidates = [CandidateValidation {
+            candidate_id: "c1",
+            outcomes: &outcomes,
+        }];
+        let input = SelectionSignificanceInput {
+            label_order: &labels,
+            train_labels: &train_labels,
+            validation_gold: &gold,
+            candidates: &candidates,
+            selected_candidate_id: "c1",
+            required: req(1),
+            family_size: family(1),
+        };
+        let err = assess_selection_significance(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SelectionSignificanceError::TooManyRecords {
+                n_records: significance::MAX_EVAL_RECORDS + 1,
+                limit: significance::MAX_EVAL_RECORDS,
             }
         );
     }
