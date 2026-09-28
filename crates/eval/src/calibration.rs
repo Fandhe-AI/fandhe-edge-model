@@ -3,8 +3,9 @@
 //! REQ-22（保留・確率の校正）のうち、`validation` 分割から T と τ を
 //! **決める計算**だけを担当する（TASK-22.1-1・issue #95・親 #94）。保留状態
 //! （`Outcome::Abstain`）への接続と保留込み／保留なしの誤り率の比較は
-//! 兄弟 issue #96（TASK-22.1-2）、「対象外」ラベルは TASK-22.2、coverage の
-//! 記録と表示は TASK-22.3 が担当し、いずれも本モジュールの対象外。
+//! [`crate::abstention`]（TASK-22.1-2・issue #96）、「対象外」ラベルは
+//! TASK-22.2、coverage の記録と表示は TASK-22.3 が担当し、いずれも本モジュール
+//! の対象外。
 //!
 //! 移植元は PoC-12 の `03-poc/abstention-calibration/scripts/calibrate.py`
 //! （事前登録の 3〜4 節）。本実装は次の点で PoC-12 から変更している。
@@ -51,11 +52,13 @@
 //! ない。件数はいずれも確保・計算の前に検証する（`unwrap`・`expect`・
 //! `[]` 添字アクセスは使わない）。
 //!
+//! 確信度が τ 未満の入力を `Outcome::Abstain` として保留込み／保留なしの
+//! 誤り率を比べる処理は [`crate::abstention`]（TASK-22.1-2・issue #96）が
+//! 本モジュールの [`Calibration`]・[`top1_probability`]・[`preprocess_logits`]
+//! を再利用して実装する。
+//!
 //! # 対象外
 //!
-//! - 確信度が τ 未満の入力を `Outcome::Abstain` として保留込み／保留なしの
-//!   誤り率を比べること（#96。`crate::metrics::evaluate_single_select` へ
-//!   `Outcome::Abstain` を渡す想定）
 //! - 「対象外」ラベルによる処理（TASK-22.2）
 //! - T・τ の永続化・配布パッケージへの格納（REQ-30）・CLI への配線（issue #140）
 
@@ -157,7 +160,7 @@ pub enum CalibrationError {
     },
     /// [`select_threshold`] に渡された top1 確率に NaN・非有限値が含まれる
     /// （[`calibrate`] 内部の呼び出しでは発生しないが、公開関数として
-    /// 独立に呼ばれる場合〔#96・TASK-22.3〕の外部入力検証）。
+    /// 独立に呼ばれる場合〔`crate::abstention`・TASK-22.3〕の外部入力検証）。
     NonFiniteTop1 {
         /// `top1` スライス内での位置（0 始まり）。
         index: usize,
@@ -194,6 +197,21 @@ pub enum CalibrationError {
         /// 発生箇所の説明（人が読める短い文字列。機械照合はしない）。
         detail: String,
     },
+    /// [`crate::abstention::compare_abstention`] に渡されたラベル集合の件数が、
+    /// `calibration`（[`calibrate`] を呼んだときのラベル集合）と一致しない
+    /// （[`Calibration::n_labels`]。REQ-17・REQ-27: 校正した対象と異なるラベル
+    /// 集合で評価データを走査し、τ を暗黙に別の意味へ読み替えることを防ぐ）。
+    LabelCountMismatch {
+        /// 校正時のラベル数（[`Calibration::n_labels`]）。
+        calibrated: usize,
+        /// 渡されたラベル数。
+        given: usize,
+    },
+    /// [`crate::abstention::compare_abstention`] が内部で呼ぶ
+    /// [`crate::metrics::evaluate_single_select`] が返したエラー（評価ロジックを
+    /// 本モジュール・`abstention` モジュールで再実装せず、評価器の唯一の実装
+    /// 〔TASK-24.1〕へ委譲するために包む）。
+    Evaluation(EvalError),
 }
 
 impl fmt::Display for CalibrationError {
@@ -249,6 +267,15 @@ impl fmt::Display for CalibrationError {
             CalibrationError::Internal { detail } => {
                 write!(f, "internal calibration error: {detail}")
             }
+            CalibrationError::LabelCountMismatch { calibrated, given } => {
+                write!(
+                    f,
+                    "label count mismatch: calibrated with {calibrated}, got {given}"
+                )
+            }
+            CalibrationError::Evaluation(err) => {
+                write!(f, "evaluation failed: {err}")
+            }
         }
     }
 }
@@ -272,6 +299,7 @@ pub struct Calibration {
     ece_t1: f64,
     ece_t_star: f64,
     n_validation: u64,
+    n_labels: usize,
 }
 
 impl Calibration {
@@ -326,6 +354,28 @@ impl Calibration {
     pub fn n_validation(&self) -> u64 {
         self.n_validation
     }
+
+    /// 校正に使ったラベル数（[`calibrate`] に渡した `labels.len()`）。
+    ///
+    /// [`crate::abstention::compare_abstention`] が、評価データに渡された
+    /// ラベル集合の件数がこの校正結果と一致するかを確認するために使う
+    /// （REQ-17・REQ-27: 校正した対象と異なるラベル集合を暗黙に混ぜない）。
+    pub fn n_labels(&self) -> usize {
+        self.n_labels
+    }
+
+    /// `1.0 / chosen_temperature()`（β を求める式を 1 箇所に集約する。
+    /// [`beta_of_temperature`] を使う）。[`crate::abstention`] が確信度
+    /// （校正後の top1 確率）を計算する際に [`calibrate`] 内部と同じ β を
+    /// 使うために `pub(crate)` で公開する。
+    pub(crate) fn chosen_beta(&self) -> f64 {
+        beta_of_temperature(self.chosen_temperature)
+    }
+}
+
+/// `β = 1/T`（温度からベータへの変換式を 1 箇所に集約する）。
+fn beta_of_temperature(temperature: f64) -> f64 {
+    1.0 / temperature
 }
 
 /// 1 行分の前処理済みロジット。`d[k] = logits[k] - max`（有限値のみ）で、
@@ -341,27 +391,31 @@ struct RowData {
     argmax_index: usize,
 }
 
-/// 1 行の検証・前処理（3〜5 節の入力規則）。
-fn build_row(
+/// 1 行分のロジットの検証・前処理（3〜5 節の入力規則）のうち、**gold に
+/// 依存しない部分**（長さ検証・NaN/`+∞` 拒否・`d = z − max` の差分・argmax
+/// の決定・桁あふれ検出）を担う。[`build_row`]（[`calibrate`] 内部・gold 付き）
+/// と [`crate::abstention`] の判定（gold 無し。REQ-27: 推論関数へは `input`
+/// 由来の情報だけを渡す）が同じロジットの解釈を共有するための共通経路。
+///
+/// 戻り値は `(d, argmax_index)`。`d` は宣言順・`logits` と同じ長さで、
+/// 有限要素は `logits[k] - max_finite`、`−∞` だった要素は
+/// `f64::NEG_INFINITY` のまま保持する。
+pub(crate) fn preprocess_logits(
     index: usize,
-    record: &CalibrationRecord,
-    label_index: &std::collections::BTreeMap<&str, usize>,
+    logits: &[f64],
     n_labels: usize,
-) -> Result<RowData, CalibrationError> {
-    let gold_index = *label_index
-        .get(record.gold)
-        .ok_or(CalibrationError::UnknownGoldLabel { index })?;
-    if record.logits.len() != n_labels {
+) -> Result<(Vec<f64>, usize), CalibrationError> {
+    if logits.len() != n_labels {
         return Err(CalibrationError::LogitLengthMismatch {
             index,
             expected: n_labels,
-            actual: record.logits.len(),
+            actual: logits.len(),
         });
     }
 
     let mut max_finite = f64::NEG_INFINITY;
     let mut argmax_index: Option<usize> = None;
-    for (label_pos, &z) in record.logits.iter().enumerate() {
+    for (label_pos, &z) in logits.iter().enumerate() {
         if z.is_nan() || (z.is_infinite() && z.is_sign_positive()) {
             return Err(CalibrationError::NonFiniteLogit {
                 index,
@@ -375,8 +429,8 @@ fn build_row(
     }
     let argmax_index = argmax_index.ok_or(CalibrationError::NoFiniteLogit { index })?;
 
-    let mut d: Vec<f64> = Vec::with_capacity(record.logits.len());
-    for (label_pos, &z) in record.logits.iter().enumerate() {
+    let mut d: Vec<f64> = Vec::with_capacity(logits.len());
+    for (label_pos, &z) in logits.iter().enumerate() {
         if z.is_finite() {
             let diff = z - max_finite;
             // 有限のロジット同士の減算が `±∞` に桁あふれした場合（例:
@@ -397,6 +451,21 @@ fn build_row(
             d.push(z);
         }
     }
+
+    Ok((d, argmax_index))
+}
+
+/// 1 行の検証・前処理（gold を引いて [`RowData`] を組み立てる）。
+fn build_row(
+    index: usize,
+    record: &CalibrationRecord,
+    label_index: &std::collections::BTreeMap<&str, usize>,
+    n_labels: usize,
+) -> Result<RowData, CalibrationError> {
+    let gold_index = *label_index
+        .get(record.gold)
+        .ok_or(CalibrationError::UnknownGoldLabel { index })?;
+    let (d, argmax_index) = preprocess_logits(index, record.logits, n_labels)?;
     let d_gold_if_finite = d.get(gold_index).copied().filter(|v| v.is_finite());
 
     Ok(RowData {
@@ -410,7 +479,7 @@ fn build_row(
 /// `Σ_k exp(β·d_k)`（有限要素のみ）と `Σ_k exp(β·d_k)·d_k` を 1 回の走査で
 /// まとめて計算する。`d_k <= 0` のため `exp(β·d_k) ∈ (0, 1]` でオーバー
 /// フローしない（2 節）。
-fn sum_exp_and_weighted(beta: f64, d: &[f64]) -> (f64, f64) {
+pub(crate) fn sum_exp_and_weighted(beta: f64, d: &[f64]) -> (f64, f64) {
     let mut sum_exp = 0.0f64;
     let mut weighted = 0.0f64;
     for &dk in d {
@@ -425,7 +494,7 @@ fn sum_exp_and_weighted(beta: f64, d: &[f64]) -> (f64, f64) {
 
 /// 行ごとの top1 確率 `= 1 / Σ_k exp(β·d_k)`（`d` の最大値は 0 になるよう
 /// 正規化済みのため、`exp(β·0) = 1` が top1 の分子になる）。
-fn top1_probability(beta: f64, d: &[f64]) -> f64 {
+pub(crate) fn top1_probability(beta: f64, d: &[f64]) -> f64 {
     let (sum_exp, _) = sum_exp_and_weighted(beta, d);
     1.0 / sum_exp
 }
@@ -535,8 +604,9 @@ fn bin_of_confidence(conf: f64) -> usize {
 /// `floor(0.2*4)=0` 番目を返すが、1 番目〔昇順〕でも coverage=4/5=80% を
 /// 満たす）。
 ///
-/// [`calibrate`] の内部だけでなく、保留状態への接続（#96）・coverage の
-/// 記録と表示（TASK-22.3）からも再利用できるよう独立した公開関数にする。
+/// [`calibrate`] の内部だけでなく、保留状態への接続（[`crate::abstention`]・
+/// TASK-22.1-2・issue #96）・coverage の記録と表示（TASK-22.3）からも再利用
+/// できるよう独立した公開関数にする。
 pub fn select_threshold(top1: &[f64]) -> Result<f64, CalibrationError> {
     if top1.is_empty() {
         return Err(CalibrationError::EmptyTop1);
@@ -658,7 +728,7 @@ pub fn calibrate(
         1.0 / (lo + (hi - lo) / 2.0)
     };
 
-    let beta_star = 1.0 / temperature_star;
+    let beta_star = beta_of_temperature(temperature_star);
     let nll_t1 = mean_nll(1.0, &rows);
     let nll_t_star = mean_nll(beta_star, &rows);
     let ece_t1 = ece_of_beta(1.0, &rows);
@@ -682,7 +752,7 @@ pub fn calibrate(
     // 採否: 厳密な `<`（同値なら採用しない）。
     let adopted = ece_t_star < ece_t1;
     let chosen_temperature = if adopted { temperature_star } else { 1.0 };
-    let chosen_beta = 1.0 / chosen_temperature;
+    let chosen_beta = beta_of_temperature(chosen_temperature);
 
     let top1_values: Vec<f64> = rows
         .iter()
@@ -707,6 +777,7 @@ pub fn calibrate(
         ece_t1,
         ece_t_star,
         n_validation: records.len() as u64,
+        n_labels,
     })
 }
 
