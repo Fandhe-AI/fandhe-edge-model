@@ -75,6 +75,7 @@
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
@@ -174,16 +175,32 @@ pub struct SearchInput<'a> {
 /// （正解ラベル）は受け取らない（REQ-27。gold を渡さない制約は引数リスト
 /// という型のレベルで保証される）。validation 入力そのものは実装側が
 /// 自分で保持する。
+///
+/// # 時間上限（REQ-39・P0 指摘対応）
+///
+/// `time_limit` は [`run_search`] がこの呼び出し時点で残っている探索予算
+/// （探索予算全体 − ここまでの経過時間）を渡す。本 trait は同期呼び出しの
+/// ため `run_search` 側からこの呼び出し自体を打ち切ることはできない
+/// （[`crate::time_allotment::CandidateRunner`] のような子プロセス経由の
+/// 実行器ではなく、プロセス内の関数呼び出しであるため）。実装側
+/// （推論ランタイム・ジョブ管理。#178 等）が `time_limit` を守る責務を持つ。
+/// `run_search` は呼び出し前後の経過時間を計測し、`time_limit` を守れずに
+/// 探索予算全体を超過したことを事後検出した場合、その候補を選定対象から
+/// 除外し（[`CandidateSearchResult::ScoringExceededBudget`]）、以降の候補は
+/// 未着手として記録する（fail-closed。「呼び出し中の時間制限がないため
+/// 超過後も選定されてしまう」ことを防ぐ）。
 pub trait ValidationScorer {
     /// 実装固有のエラー型。
     type Error;
     /// `candidate_id` の学習成果物で validation 入力を推論し、
     /// [`SearchInput::validation_gold`] と同じ順・同じ件数の [`Outcome`] 列を
-    /// 返す。
+    /// 返す。`time_limit` はこの呼び出し時点で残っている探索予算全体
+    /// （trait doc「時間上限」参照）。
     fn predict_validation(
         &mut self,
         candidate_id: &str,
         artifact: &SuccessOutcome,
+        time_limit: Duration,
     ) -> Result<Vec<Outcome>, Self::Error>;
 }
 
@@ -242,6 +259,17 @@ pub enum CandidateSearchResult {
     /// 学習は成功したが、[`ValidationScorer::predict_validation`] が失敗した。
     /// エラー内容は記録しない（security.md）。
     ScoringFailed,
+    /// 学習・validation 推論・正解率算出まで完了したが、採点
+    /// （[`ValidationScorer::predict_validation`]）の呼び出しに時間がかかり
+    /// 探索予算全体を使い切った（P0 指摘対応。[`ValidationScorer`] trait doc
+    /// 「時間上限」参照）。正解率は算出できているが、探索予算を超過した後の
+    /// 結果を選定に使うと「合格・選定扱いにしてはならない」という REQ-39
+    /// の資源上限に反するため、[`select_best`] の対象から除外する
+    /// （選定対象外だが正解率自体は記録として残す）。
+    ScoringExceededBudget {
+        /// 参考値としての validation 正解率（選定には使わない）。
+        validation_accuracy: ValidationAccuracy,
+    },
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
         /// 未着手の理由。
@@ -605,6 +633,32 @@ pub fn select_best(
     })
 }
 
+/// 宣言順に残っている候補すべてを、実行順が回ってこなかった候補として
+/// `entries` へ記録する（P1 指摘対応・REQ-18「候補ごとの選定記録」）。
+///
+/// [`run_search`] が探索予算全体を使い切ったと判断した時点（[`Allotment::Exhausted`]
+/// または [`ValidationScorer::predict_validation`] の呼び出しが予算を超過した
+/// 時点）で、宣言順にまだ控えていた候補を `iter` から取り出し尽くす。
+/// これらの候補には「順番が回ってきた」時点の経過時間が存在しないため
+/// `elapsed_at_start_ms: None`・`time: None` とする
+/// （[`CandidateSearchEntry::elapsed_at_start_ms`] doc 参照）。
+fn drain_remaining_as_not_started(
+    entries: &mut Vec<CandidateSearchEntry>,
+    iter: &mut std::iter::Enumerate<std::vec::IntoIter<SearchCandidate>>,
+) {
+    for (_, candidate) in iter {
+        entries.push(CandidateSearchEntry {
+            candidate_id: candidate.candidate_id,
+            elapsed_at_start_ms: None,
+            time: None,
+            result: CandidateSearchResult::NotStarted {
+                reason: NotStartedReason::BudgetExhausted,
+            },
+            validation_outcomes: None,
+        });
+    }
+}
+
 /// 探索予算全体を管理し、複数候補を学習・比較し、選定結果を記録する
 /// （TASK-18.1-2・issue #84）。
 ///
@@ -643,18 +697,25 @@ where
     let mut evaluated_owned: Vec<(String, Ratio)> = Vec::new();
     let n_candidates = input.candidates.len();
 
-    for (index, candidate) in input.candidates.into_iter().enumerate() {
-        let now_mono = clock.monotonic();
-        let elapsed_ms = now_mono
+    // 探索開始からの単調経過時間（ミリ秒）を求める（複数箇所〔候補開始時・
+    // 採点呼び出し前後〕から呼ぶため共通化する）。
+    let elapsed_ms_since_start = |clock: &C| -> Result<u64, SearchError<R::Error>> {
+        clock
+            .monotonic()
             .checked_sub(started_mono)
-            .ok_or_else(|| {
-                SearchError::Clock(crate::time_allotment::TimeAllotmentError::ClockUnavailable)
-            })
+            .ok_or(SearchError::Clock(
+                crate::time_allotment::TimeAllotmentError::ClockUnavailable,
+            ))
             .and_then(|d| {
                 u64::try_from(d.as_millis()).map_err(|_| {
                     SearchError::Clock(crate::time_allotment::TimeAllotmentError::ClockUnavailable)
                 })
-            })?;
+            })
+    };
+
+    let mut candidates_iter = input.candidates.into_iter().enumerate();
+    while let Some((index, candidate)) = candidates_iter.next() {
+        let elapsed_ms = elapsed_ms_since_start(clock)?;
         let remaining_ms = budget_ms.saturating_sub(elapsed_ms);
         let remaining_seconds = remaining_ms / 1000;
         // 未着手候補数（本候補を含む残り件数）。`n_candidates >= index + 1`
@@ -680,6 +741,11 @@ where
                     },
                     validation_outcomes: None,
                 });
+                // P1 指摘対応（REQ-18）: 予算が尽きた時点で宣言順に控えていた
+                // 残り候補も、実行順が回ってこなかったこと（本候補を含まない）
+                // を記録に残す（宣言順の全候補記録という契約。モジュール doc
+                // `CandidateSearchEntry::elapsed_at_start_ms` 参照）。
+                drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
                 break;
             }
         };
@@ -689,7 +755,13 @@ where
 
         match run.outcome() {
             TrainOutcome::Ok(success) => {
-                match scorer.predict_validation(&candidate.candidate_id, success) {
+                // P0 指摘対応（REQ-39）: 採点呼び出しの直前に残っている探索
+                // 予算全体を `time_limit` として scorer へ渡す（trait doc
+                // 「時間上限」参照。呼び出し自体を打ち切ることはできない）。
+                let elapsed_before_scoring_ms = elapsed_ms_since_start(clock)?;
+                let remaining_for_scoring_ms = budget_ms.saturating_sub(elapsed_before_scoring_ms);
+                let time_limit = Duration::from_millis(remaining_for_scoring_ms);
+                match scorer.predict_validation(&candidate.candidate_id, success, time_limit) {
                     Ok(outcomes) => {
                         if outcomes.len() != input.validation_gold.len() {
                             return Err(SearchError::ScorerOutputMismatch {
@@ -708,6 +780,27 @@ where
                             metrics::evaluate_single_select(input.label_order, &eval_records)
                                 .map_err(SearchError::Eval)?;
                         let accuracy = metrics.accuracy.overall;
+
+                        // 採点呼び出しに時間がかかり、探索予算全体を使い切って
+                        // いたら選定対象から除外する（P0 指摘対応。「超過後も
+                        // 最後の候補なら Selected を返してしまう」ことを防ぐ。
+                        // fail-closed: 正解率自体は参考値として記録するが
+                        // `evaluated_owned` へは積まない）。
+                        let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
+                        if elapsed_after_scoring_ms > budget_ms {
+                            entries.push(CandidateSearchEntry {
+                                candidate_id: candidate.candidate_id,
+                                elapsed_at_start_ms: Some(elapsed_ms),
+                                time: Some(run.record().clone()),
+                                result: CandidateSearchResult::ScoringExceededBudget {
+                                    validation_accuracy: ValidationAccuracy::from(accuracy),
+                                },
+                                validation_outcomes: None,
+                            });
+                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                            break;
+                        }
+
                         evaluated_owned.push((candidate.candidate_id.clone(), accuracy));
                         entries.push(CandidateSearchEntry {
                             candidate_id: candidate.candidate_id,
