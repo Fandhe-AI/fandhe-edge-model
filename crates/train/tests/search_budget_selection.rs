@@ -943,25 +943,43 @@ fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring
     assert_eq!(scorer.calls.len(), 0);
 }
 
-/// (T7・契約違反) scorer が gold と異なる件数を返すと
-/// `ScorerOutputMismatch`。
+/// (T7・P1・REQ-27。issue #84 PR #238 レビュー) scorer が gold と異なる件数
+/// を返した場合、以前は `SearchError::ScorerOutputMismatch` で探索全体を
+/// 打ち切り、それまでの候補の記録を失っていた（非対称の指摘）。record_id
+/// 不一致と同じ `ScoringFailed`（候補単位の失敗）として記録し、探索を継続
+/// して後続候補を実行することを確認する。
 #[test]
-fn task18_1_2_scorer_output_length_mismatch_aborts_search() {
+fn task18_1_2_scorer_output_length_mismatch_is_recorded_and_search_continues() {
     let clock = FakeClock::new(0);
-    let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::Ok { advance_ms: 10 },
+            RunnerBehavior::Ok { advance_ms: 10 },
+        ],
+    );
     let mut scorer = FakeScorer::new(
         &clock,
-        BTreeMap::from([(
-            "c3-a".to_string(),
-            Ok(outcomes_with_correct(9)[..9].to_vec()),
-        )]),
+        BTreeMap::from([
+            (
+                "c3-a".to_string(),
+                Ok(outcomes_with_correct(9)[..9].to_vec()),
+            ),
+            ("c3-b".to_string(), Ok(outcomes_with_correct(7))),
+        ]),
     );
 
     let gold = validation_gold();
-    let candidates = vec![SearchCandidate {
-        candidate_id: "c3-a".to_string(),
-        params: candidate_params("out/c3-a", 1),
-    }];
+    let candidates = vec![
+        SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: candidate_params("out/c3-a", 1),
+        },
+        SearchCandidate {
+            candidate_id: "c3-b".to_string(),
+            params: candidate_params("out/c3-b", 2),
+        },
+    ];
     let input = SearchInput {
         label_order: &LABEL_ORDER,
         validation_gold: &gold,
@@ -971,13 +989,36 @@ fn task18_1_2_scorer_output_length_mismatch_aborts_search() {
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
-    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(record.candidates.len(), 2);
     assert_eq!(
-        err,
-        SearchError::ScorerOutputMismatch {
-            index: 0,
-            expected: 10,
-            actual: 9,
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringFailed
+    );
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    // 件数不一致の候補で探索が打ち切られず、後続候補（c3-b）が実行・評価
+    // されて選定されることを確認する（P1 指摘対応の核心: それまでの候補の
+    // 記録を失わない）。
+    match &record.candidates[1].result {
+        CandidateSearchResult::Evaluated {
+            validation_accuracy,
+        } => {
+            assert_eq!(validation_accuracy.correct, 7);
+            assert_eq!(validation_accuracy.total, 10);
+        }
+        other => panic!("expected Evaluated for c3-b, got {other:?}"),
+    }
+    assert_eq!(
+        record.selection,
+        SelectionDecision::Selected {
+            candidate_id: "c3-b".to_string(),
+            validation_accuracy: fandhe_edge_train::search::ValidationAccuracy {
+                correct: 7,
+                total: 10,
+                value: 0.7,
+            },
+            rule: "validation_accuracy_desc_then_candidate_order".to_string(),
+            tied_candidate_ids: vec!["c3-b".to_string()],
         }
     );
 }
@@ -1392,6 +1433,18 @@ fn task18_1_2_search_budget_default_matches_constant() {
         SearchBudget::default().get(),
         fandhe_edge_train::search::DEFAULT_SEARCH_BUDGET_SECONDS
     );
+}
+
+/// REQ-18・TASK-18.1-2・REQ-39（P0 指摘対応。issue #84 PR #238 レビュー）:
+/// `SearchBudget::new` は [`fandhe_edge_train::search::MAX_SEARCH_BUDGET_SECONDS`]
+/// ちょうどは受理し、1 秒でも超えると `None` を返す（探索全体を極端に長く
+/// 実行できる経路を閉じる）。
+#[test]
+fn task18_1_2_search_budget_rejects_over_max() {
+    let max = fandhe_edge_train::search::MAX_SEARCH_BUDGET_SECONDS;
+    assert_eq!(SearchBudget::new(max).map(SearchBudget::get), Some(max));
+    assert_eq!(SearchBudget::new(max + 1), None);
+    assert_eq!(SearchBudget::new(u64::MAX), None);
 }
 
 /// (T14・P0/P1・REQ-39・issue #84 PR #238 レビュー) 採点呼び出し中に経過時間が

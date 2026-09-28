@@ -111,15 +111,41 @@ pub const MAX_CANDIDATE_ID_BYTES: usize = 128;
 /// 事前に抑える。
 pub const MAX_SEARCH_OUTCOME_CELLS: u64 = 10_000_000;
 
+/// [`SearchBudget`] の最大値（秒。REQ-39 資源上限・P0 指摘対応。issue #84
+/// PR #238 レビュー）。
+///
+/// `SearchBudget::new` は非ゼロの `u64` を無条件に受理していたため、探索
+/// 全体を極端に長く（`u64::MAX` 秒 ≒ 5,800 億年）実行できる経路があった。
+/// 新しい値を作らず、1 候補あたりの持ち時間の上限
+/// （[`crate::limits::MAX_TRAIN_WALL_SECONDS`]）× 1 回の探索で許容する
+/// 候補数の上限（[`MAX_SEARCH_CANDIDATES`]）という、既存の 2 定数の積から
+/// 導く（コーディネーター指摘の提案どおり）。全候補が 1 候補あたりの上限
+/// いっぱいまで直列に時間を使っても届かない規模を意図した上限であり、
+/// 実際の探索はこれよりずっと早く完了する想定（既定値
+/// [`DEFAULT_SEARCH_BUDGET_SECONDS`] は 3600 秒で、本上限の 1/256）。
+///
+/// `as` によるキャストはコンパイル時定数同士の変換であり、外部入力の経路
+/// ではないため `.claude/rules/coding-rust.md`「外部入力では `as` を使わ
+/// ない」の対象外（`u64::from` は const 文脈でまだ安定化されていないため
+/// `as` を使う。`MAX_TRAIN_WALL_SECONDS`〔u32・3600〕・`MAX_SEARCH_CANDIDATES`
+/// 〔usize・256〕はいずれも `u64` への拡大変換で桁あふれしない）。
+pub const MAX_SEARCH_BUDGET_SECONDS: u64 =
+    crate::limits::MAX_TRAIN_WALL_SECONDS as u64 * MAX_SEARCH_CANDIDATES as u64;
+
 /// 探索予算全体（秒）。0 秒は表現できない（`allot` が 0 秒を
 /// [`Allotment::Exhausted`] として扱う契約と揃える）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchBudget(NonZeroU64);
 
 impl SearchBudget {
-    /// 秒数を指定して構築する。`seconds == 0` は `None`。
+    /// 秒数を指定して構築する。`seconds == 0`、または
+    /// [`MAX_SEARCH_BUDGET_SECONDS`] を超える場合は `None`（REQ-39 資源
+    /// 上限・P0 指摘対応。issue #84 PR #238 レビュー）。
     #[must_use]
     pub fn new(seconds: u64) -> Option<Self> {
+        if seconds > MAX_SEARCH_BUDGET_SECONDS {
+            return None;
+        }
         NonZeroU64::new(seconds).map(Self)
     }
 
@@ -172,7 +198,12 @@ pub struct SearchInput<'a> {
     /// 「評価の独立性」・P0 指摘対応。issue #84 PR #238 レビュー。scorer が
     /// record_id は正しいが中身の異なる入力を独自に保持しているケースの
     /// 防止は [`validation_inputs`](Self::validation_inputs) が担う）。
-    /// 正解ラベルは含まない。
+    /// 正解ラベルは含まない。`validate_input`（`crate::search`）が `BTreeSet`
+    /// へ追加する前に、1 件あたり
+    /// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`]・合計
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超えていないか
+    /// 検証する（P1 指摘対応・REQ-39「資源の上限」。issue #84 PR #238
+    /// レビュー）。
     pub validation_record_ids: &'a [&'a str],
     /// [`validation_record_ids`](Self::validation_record_ids) と同じ順・
     /// 同じ件数の byte 入力（README「入力表現は byte のみ」）。
@@ -250,11 +281,15 @@ pub trait ValidationScorer {
     /// REQ-27）を推論し、[`ScoredOutcome`] の列を返す。**戻り値の
     /// `record_id` 列は `records` の `record_id` 列と（順序を含めて）完全に
     /// 一致させなければならない**（位置で対応づける。実装は `records` の
-    /// 順に予測を並べて返す）。[`run_search`] はこの一致を検証し、一致しな
-    /// い場合は scorer のエラーと同じ扱い（選定対象外）にする（P0 指摘
-    /// 対応・issue #84 PR #238 レビュー: 件数だけを照合すると、件数が同じ
+    /// 順に予測を並べて返す）。[`run_search`] はこの一致（および件数の
+    /// 一致）を検証し、いずれかが崩れている場合は scorer のエラーと同じ
+    /// 扱い（[`CandidateSearchResult::ScoringFailed`]。候補単位で選定対象外
+    /// にし、探索全体は中断せず次候補へ進む）にする（P0/P1 指摘対応・
+    /// issue #84 PR #238 レビュー: 件数だけを照合すると、件数が同じ
     /// 別データ・順序違いの予測でも正解率を算出できてしまい、評価の独立性
-    /// 〔REQ-27〕が壊れる。`run_search` が入力そのものも渡すのは、scorer が
+    /// 〔REQ-27〕が壊れる。件数不一致を探索全体の致命的エラーにすると、
+    /// それまでの候補の記録を失う非対称が生じるため、record_id 不一致と
+    /// 同じ扱いに統一した。`run_search` が入力そのものも渡すのは、scorer が
     /// 自身で保持する別データ〔record_id は揃っているが中身が異なる〕を
     /// 使うことも防ぐため）。`time_limit` はこの呼び出し時点で残っている
     /// 探索予算全体（trait doc「時間上限」参照）。
@@ -346,14 +381,24 @@ pub enum CandidateSearchResult {
     /// 学習ワーカーが成功しなかった（[`CandidateTimeRecord::status`] に詳細）。
     /// validation 推論は行っていない。
     TrainingNotCompleted,
-    /// 学習は成功したが採点が無効だった。次の 2 通りをまとめて表す:
+    /// 学習は成功したが採点が無効だった。次の 3 通りをまとめて表す:
     /// (1) [`ValidationScorer::predict_validation`] が `Err` を返した場合
     /// （エラー内容は記録しない。security.md）。
-    /// (2) `predict_validation` は成功したが、戻り値の `record_id` 列が
+    /// (2) `predict_validation` は成功したが、戻り値の件数が
+    /// `validation_gold` と一致しなかった場合（P1 指摘対応。issue #84
+    /// PR #238 レビュー。以前は探索全体を打ち切る `SearchError` にしており、
+    /// それまでの候補の記録を失っていた非対称を解消した）。
+    /// (3) `predict_validation` は成功したが、戻り値の `record_id` 列が
     /// `run_search` の渡した validation レコードと（順序を含めて）一致しな
     /// かった場合（P0 指摘対応・REQ-27「評価の独立性」。issue #84 PR #238
-    /// レビュー。件数だけの照合では、別データ・順序違いの予測を見抜けない
-    /// ため、契約違反も採点失敗と同じ扱いにする）。
+    /// レビュー）。
+    ///
+    /// (2)・(3) はいずれも件数だけ・record_id だけの部分的な一致では
+    /// 別データ・順序違いの予測を見抜けないため、契約違反を採点失敗と同じ
+    /// 扱いにする。事前検証（`validate_input`）が検出する入力側の件数不一致
+    /// （`ValidationRecordIdCountMismatch`・`ValidationInputCountMismatch`）
+    /// とは別の契約層（scorer の実行時の戻り値）であり、そちらは引き続き
+    /// 致命的な `SearchError` のままにする。
     ScoringFailed,
     /// 学習・validation 推論・正解率算出まで完了したが、採点
     /// （[`ValidationScorer::predict_validation`]）または評価器
@@ -512,6 +557,18 @@ pub enum SearchError<E> {
     /// `validation_record_ids` に重複した要素が含まれる（scorer からの
     /// 戻り値を順序で一意に対応づけられなくなるため拒否する）。
     DuplicateValidationRecordId { index: usize },
+    /// `validation_record_ids` の 1 件が
+    /// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`] を超える
+    /// （P1 指摘対応・REQ-39「資源の上限」。issue #84 PR #238 レビュー）。
+    ValidationRecordIdTooLong {
+        index: usize,
+        size: usize,
+        limit: usize,
+    },
+    /// `validation_record_ids` の合計バイト数が
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超える
+    /// （P1 指摘対応・REQ-39「資源の上限」。issue #84 PR #238 レビュー）。
+    ValidationRecordIdTotalBytesExceeded { total: usize, limit: usize },
     /// `validation_inputs` の件数が `validation_gold` と一致しない
     /// （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
     ValidationInputCountMismatch { expected: usize, actual: usize },
@@ -550,14 +607,6 @@ pub enum SearchError<E> {
     Candidate {
         index: usize,
         source: CandidateTimeError<E>,
-    },
-    /// [`ValidationScorer::predict_validation`] が返した件数が
-    /// `validation_gold` と一致しない（契約違反。fail-closed で探索全体を
-    /// 中断する）。
-    ScorerOutputMismatch {
-        index: usize,
-        expected: usize,
-        actual: usize,
     },
     /// 評価器（[`fandhe_edge_eval::metrics::evaluate_single_select`]）が
     /// 失敗した。
@@ -602,6 +651,14 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             SearchError::DuplicateValidationRecordId { index } => {
                 write!(f, "duplicate validation record id at index {index}")
             }
+            SearchError::ValidationRecordIdTooLong { index, size, limit } => write!(
+                f,
+                "validation record id at index {index} is too long: {size} bytes exceeds limit {limit}"
+            ),
+            SearchError::ValidationRecordIdTotalBytesExceeded { total, limit } => write!(
+                f,
+                "validation_record_ids total size {total} bytes exceeds limit {limit}"
+            ),
             SearchError::ValidationInputCountMismatch { expected, actual } => write!(
                 f,
                 "validation_inputs count mismatch: expected {expected}, got {actual}"
@@ -634,14 +691,6 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             SearchError::Candidate { index, source } => {
                 write!(f, "candidate {index} failed: {source}")
             }
-            SearchError::ScorerOutputMismatch {
-                index,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "scorer output mismatch at index {index}: expected {expected}, got {actual}"
-            ),
             SearchError::Eval(e) => write!(f, "evaluator error: {e}"),
             SearchError::Internal { detail } => write!(f, "internal search error: {detail}"),
         }
@@ -791,12 +840,24 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         }
     }
 
-    // `validation_record_ids` の妥当性（P0 指摘対応・REQ-27。issue #84
-    // PR #238 レビュー）: `validation_gold` と同じ件数・空文字列なし・重複
-    // なしを要求する。件数不一致・空文字列・重複のいずれも、
-    // `predict_validation` の戻り値と順序で対応づけられなくなるため事前に
-    // 拒否する（`validation_gold.len()` はすでに [`MAX_EVAL_RECORDS`] 以下と
-    // 確認済みのため、新たな上限は不要）。
+    // `validation_record_ids` の妥当性（P0/P1 指摘対応・REQ-27・REQ-39。
+    // issue #84 PR #238 レビュー）: `validation_gold` と同じ件数・各要素の
+    // バイト長上限・合計バイト数上限・空文字列なし・重複なしを要求する。
+    // 件数不一致・空文字列・重複のいずれも、`predict_validation` の戻り値と
+    // 順序で対応づけられなくなるため事前に拒否する（`validation_gold.len()`
+    // はすでに [`MAX_EVAL_RECORDS`] 以下と確認済みのため、件数の上限は
+    // 新たに設けない）。1 件あたりのバイト長は、推論入力 1 件の識別子
+    // （`id`）の上限 [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`]
+    // （train・infer で共有する既存の ID 系上限）をそのまま使う
+    // （`validation_record_ids` は `crate::request::TrainRequest` の
+    // `label_order`／候補 ID とは別の識別子であり、性質が最も近いのは
+    // 推論入力 1 件の識別子であるため。P1 指摘対応）。合計バイト数は、
+    // 同じく公開 API `SearchInput` の集合サイズを抑える
+    // [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を再利用する
+    // （record_id 用に新しい定数は起こさず、同じ上限を「1 つの
+    // `SearchInput` フィールドが保持できる合計バイト数」の共通の目安として
+    // 適用する。承認事項として報告）。`BTreeSet` へ追加する前に長さ・合計を
+    // 検証する（REQ-39「集合へ追加する前の検証」）。
     if input.validation_record_ids.len() != input.validation_gold.len() {
         return Err(SearchError::ValidationRecordIdCountMismatch {
             expected: input.validation_gold.len(),
@@ -804,9 +865,30 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         });
     }
     let mut seen_record_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut record_ids_total_bytes: usize = 0;
     for (index, &record_id) in input.validation_record_ids.iter().enumerate() {
         if record_id.is_empty() {
             return Err(SearchError::InvalidValidationRecordId { index });
+        }
+        if record_id.len() > fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES {
+            return Err(SearchError::ValidationRecordIdTooLong {
+                index,
+                size: record_id.len(),
+                limit: fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES,
+            });
+        }
+        record_ids_total_bytes = record_ids_total_bytes
+            .checked_add(record_id.len())
+            // 理論上到達しない防御的分岐（直前の要素ごとの上限チェックと
+            // 同じ方針）。
+            .ok_or_else(|| SearchError::Internal {
+                detail: "validation_record_ids total bytes overflows usize".to_string(),
+            })?;
+        if record_ids_total_bytes > MAX_VALIDATION_INPUT_TOTAL_BYTES {
+            return Err(SearchError::ValidationRecordIdTotalBytesExceeded {
+                total: record_ids_total_bytes,
+                limit: MAX_VALIDATION_INPUT_TOTAL_BYTES,
+            });
         }
         if !seen_record_ids.insert(record_id) {
             return Err(SearchError::DuplicateValidationRecordId { index });
@@ -986,9 +1068,11 @@ pub fn select_best(
 /// 宣言順に残っている候補すべてを、実行順が回ってこなかった候補として
 /// `entries` へ記録する（P1 指摘対応・REQ-18「候補ごとの選定記録」）。
 ///
-/// [`run_search`] が探索予算全体を使い切ったと判断した時点（[`Allotment::Exhausted`]
-/// または [`ValidationScorer::predict_validation`] の呼び出しが予算を超過した
-/// 時点）で、宣言順にまだ控えていた候補を `iter` から取り出し尽くす。
+/// [`run_search`] が探索予算全体を使い切ったと判断した時点（[`Allotment::Exhausted`]、
+/// [`ValidationScorer::predict_validation`] の呼び出しが予算を超過した時点、
+/// または採点の戻り値が契約違反〔件数不一致・record_id 不一致〕だった後の
+/// 予算確認で使い切っていた時点。issue #84 PR #238 レビュー）で、宣言順に
+/// まだ控えていた候補を `iter` から取り出し尽くす。
 /// これらの候補には「順番が回ってきた」時点の経過時間が存在しないため
 /// `elapsed_at_start_ms: None`・`time: None` とする
 /// （[`CandidateSearchEntry::elapsed_at_start_ms`] doc 参照）。
@@ -1023,8 +1107,9 @@ fn drain_remaining_as_not_started(
 ///
 /// 事前検証・候補の実行・評価器のいずれかが失敗した場合に
 /// [`SearchError`] を返す。候補単位の失敗（学習が完了しなかった・scorer が
-/// 失敗した・scorer の戻り値の record_id 列が一致しなかった〔REQ-27〕）は
-/// 探索全体を中断せず、その候補を該当する分類で記録して次の候補へ進む。
+/// 失敗した・scorer の戻り値の件数または record_id 列が一致しなかった
+/// 〔REQ-27。issue #84 PR #238 レビュー〕）は探索全体を中断せず、その候補を
+/// 該当する分類で記録して次の候補へ進む。
 pub fn run_search<R, S, C>(
     runner: &mut R,
     scorer: &mut S,
@@ -1188,28 +1273,26 @@ where
                     time_limit,
                 ) {
                     Ok(scored_outcomes) => {
-                        if scored_outcomes.len() != input.validation_gold.len() {
-                            return Err(SearchError::ScorerOutputMismatch {
-                                index,
-                                expected: input.validation_gold.len(),
-                                actual: scored_outcomes.len(),
-                            });
-                        }
-
-                        // P0 指摘対応（REQ-27・評価の独立性。issue #84 PR #238
-                        // レビュー）: 件数の一致だけでは、件数が同じ別データや
-                        // 順序違いの予測でも `validation_gold` と突き合わせて
-                        // 正解率を算出し候補を選定できてしまう。戻り値の
-                        // `record_id` 列が `validation_record_ids` と（順序を
-                        // 含めて）完全に一致するかを検証し、一致しなければ
-                        // scorer のエラー（下の `Err` 分岐）と同じ扱いにする
-                        // （`ScoringFailed`。選定対象外。探索全体は中断せず
-                        // 次候補へ進む）。
-                        let record_ids_match = scored_outcomes
-                            .iter()
-                            .zip(input.validation_record_ids.iter())
-                            .all(|(scored, &expected_id)| scored.record_id == expected_id);
-                        if !record_ids_match {
+                        // P0/P1 指摘対応（REQ-27・評価の独立性。issue #84
+                        // PR #238 レビュー）: 戻り値の契約違反（件数不一致・
+                        // record_id の不一致）はいずれも候補単位の
+                        // `ScoringFailed`（scorer のエラーと同じ扱い）として
+                        // 記録し、探索全体は中断せず次候補へ進む。以前は件数
+                        // 不一致だけ `SearchError::ScorerOutputMismatch` で
+                        // 探索全体を打ち切っており、それまでの候補の記録が
+                        // 失われる非対称があった（前回報告の指摘。事前検証
+                        // `validate_input` 側の件数不一致〔入力そのものの
+                        // 契約違反〕は引き続き致命的エラーのままにする。
+                        // ここで扱うのは scorer の実行時の戻り値という別の
+                        // 契約層）。件数が一致しない場合は record_id の
+                        // `zip` が短い方に切り詰められて `false` になり得る
+                        // ため、件数チェックを先に行う。
+                        let outcomes_valid = scored_outcomes.len() == input.validation_gold.len()
+                            && scored_outcomes
+                                .iter()
+                                .zip(input.validation_record_ids.iter())
+                                .all(|(scored, &expected_id)| scored.record_id == expected_id);
+                        if !outcomes_valid {
                             entries.push(CandidateSearchEntry {
                                 candidate_id: candidate.candidate_id,
                                 elapsed_at_start_ms: Some(elapsed_ms),
@@ -1684,6 +1767,82 @@ mod tests {
         };
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
         assert_eq!(err, SearchError::DuplicateValidationRecordId { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_record_ids` の 1 件が
+    /// `fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES` を超えると
+    /// `ValidationRecordIdTooLong`（`BTreeSet` へ追加する前に拒否する）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_validation_record_id_too_long() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive", "negative"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let over_limit_id = "a".repeat(fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES + 1);
+        let record_ids = ["r0", over_limit_id.as_str()];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: &record_ids,
+            validation_inputs: make_validation_inputs(2),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::ValidationRecordIdTooLong {
+                index: 1,
+                size: fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES + 1,
+                limit: fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES,
+            }
+        );
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー）:
+    /// `validation_record_ids` の合計バイト数が
+    /// `MAX_VALIDATION_INPUT_TOTAL_BYTES` を超えると
+    /// `ValidationRecordIdTotalBytesExceeded`。個々の要素は
+    /// `MAX_INPUT_ID_BYTES` ちょうどに収まっているため、1 件あたりの上限
+    /// チェックだけでは検出できず合計チェックが必要なことを示す。
+    #[test]
+    fn task18_1_2_validate_input_rejects_validation_record_ids_total_bytes_exceeded() {
+        let label_order = ["positive", "negative"];
+        let per_id_bytes = fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES;
+        let n_records = MAX_VALIDATION_INPUT_TOTAL_BYTES / per_id_bytes + 1;
+        let gold: Vec<&str> = (0..n_records).map(|_| "positive").collect();
+        // 各要素は重複検出（`DuplicateValidationRecordId`）に先に引っかから
+        // ないよう、長さ `per_id_bytes` ちょうどのまま一意な値にする
+        // （先頭を index の 10 進表現で埋め、残りを `0` で埋める）。
+        let record_ids: Vec<String> = (0..n_records)
+            .map(|i| format!("{i:0>width$}", width = per_id_bytes))
+            .collect();
+        let record_id_refs: Vec<&str> = record_ids.iter().map(String::as_str).collect();
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params("/root", "out/a"),
+        }];
+        let input = SearchInput {
+            label_order: &label_order,
+            validation_gold: &gold,
+            validation_record_ids: &record_id_refs,
+            validation_inputs: make_validation_inputs(n_records),
+            candidates,
+            budget: SearchBudget::default(),
+            policy: PerCandidatePolicy::EvenSplit,
+        };
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::ValidationRecordIdTotalBytesExceeded {
+                total: per_id_bytes * n_records,
+                limit: MAX_VALIDATION_INPUT_TOTAL_BYTES,
+            }
+        );
     }
 
     /// REQ-18・TASK-18.1-2・REQ-27（P0 指摘対応。issue #84 PR #238 レビュー）:

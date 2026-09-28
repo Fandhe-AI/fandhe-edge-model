@@ -89,4 +89,11 @@ pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 /// 割り当てられない。実際の validation 入力の典型サイズ・件数の想定が
 /// この 2 つの上限とどう両立するかは検証していないため、64 MiB という
 /// 値自体の妥当性は承認事項として報告する。
+///
+/// `crate::search::SearchInput::validation_record_ids`（validation レコード
+/// 識別子の列。1 件あたりの上限は別途
+/// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`] を使う）の合計バイト
+/// 数上限にも本定数を流用する（P1 指摘対応。issue #84 PR #238 レビュー。
+/// record_id 専用の新しい定数を追加で起こさず、「1 つの `SearchInput`
+/// フィールドが保持できる合計バイト数」の共通の目安として扱う）。
 pub const MAX_VALIDATION_INPUT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
