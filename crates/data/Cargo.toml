@@ -10,8 +10,15 @@ description = "Data contract layer (record inspection, group-wise split and free
 [dependencies]
 # 定義ファイルのスキーマ（TASK-15.3・#32〜#34）は実装済みだが、`inspect` は
 # 意図的に `fandhe-edge-core` に依存しない（crates/data/src/lib.rs の
-# doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う
-# （`split` は追加の外部依存を必要としない）。
+# doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う。
+# `split_record`（TASK-17.1-2・#45）は分割記録のハッシュ計算に
+# `fandhe-edge-core::canonical::canonical_sha256_hex`（sha2 を内包）を使うため、
+# workspace 内のパス依存として `fandhe-edge-core` を追加する（外部依存の追加
+# ではなく、承認済み依存 serde・serde_json の配置を data 層へ広げる形。
+# dependency-policy.md「承認済みの依存（Rust）」2026-09-28 承認）。`inspect`・
+# `split` は引き続き `fandhe-edge-core` の定義ファイルスキーマに依存しない。
+fandhe-edge-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # unicode-normalization は 2026-09-28 オーナー承認済み（承認記録は PR #224。
 # ルート Cargo.toml の [workspace.dependencies] コメント参照）。矛盾検出
