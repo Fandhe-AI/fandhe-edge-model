@@ -585,8 +585,31 @@ mod tests {
         assert_eq!(s, "0".repeat(64));
     }
 
-    // `JudgmentType` は現状 `SingleSelect` の 1 バリアントしか持たないため、
-    // 「判定型が変わると同一性も変わる」ケースはテストで作れない
-    // （バリアントを増やせないと `match` を通さずには別の値を作れない）。
-    // バリアントが増えた時点（TASK-20.1 の範囲）でテストを追加する。
+    /// 判定型が変わると `DefinitionIdentity` も変わる（選択肢 ID 集合が
+    /// 同一でも `judgment_type` が異なれば不一致になる）ことの確認。
+    /// 本番の `JudgmentType` は `SingleSelect` の 1 バリアントしか持たない
+    /// ため、`#[cfg(test)]` 限定の `JudgmentType::TestOnlyAlternate`（本 issue
+    /// で `rebuild.rs` の `JudgmentTypeChanged` 経路確認用に追加した seam。
+    /// `definition.rs` の doc を参照）を使う（REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_identity_differs_when_judgment_type_differs() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(DEFINITION_A_JSON).expect("固定 fixture は valid JSON のはず");
+        value["judgment_type"] = serde_json::json!("test_only_alternate");
+        let changed_text = serde_json::to_string(&value).expect("Value の再直列化は失敗しないはず");
+
+        let def_single = definition_a();
+        let def_alternate = Definition::parse(&changed_text)
+            .expect("test_only_alternate は test cfg で有効な判定型のはず");
+
+        assert_eq!(
+            def_single.identity().option_ids(),
+            def_alternate.identity().option_ids()
+        );
+        assert_ne!(
+            def_single.identity().judgment_type(),
+            def_alternate.identity().judgment_type()
+        );
+        assert_ne!(def_single.identity(), def_alternate.identity());
+    }
 }
