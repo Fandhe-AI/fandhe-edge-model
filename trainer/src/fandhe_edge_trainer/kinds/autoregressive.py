@@ -89,14 +89,36 @@ LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention は�
 根拠を記す）。
 
 #79 の範囲はモデル・学習・ONNX 書き出し・選択口への登録までで、Python 側で
-1 件ずつの予測レコードを組み立てて評価器へ渡す処理（#80・TASK-19b.2）は
-含まない。`_score_choices_mlx`（対応づけ (b) の MLX 実装。一致試験・訓練後の
-簡易正解率確認に使う）は #80 が再利用できるよう公開関数として残す。
+1 件ずつの予測レコードを組み立てて評価器へ渡す処理は #80（TASK-19b.1-2）が
+担う。判定不能を別の status として区別する扱い（#81・TASK-19b.2）は含まない。
+`_score_choices_mlx`（対応づけ (b) の MLX 実装。一致試験・訓練後の簡易正解率
+確認に使う）は #80 がそのまま再利用する。
+
+## #80（TASK-19b.1-2）が追加する対応づけ・予測レコード組み立て
+
+`_score_choices_mlx` が返す `[N, K]` の生の対数尤度を、1 件ずつの予測レコード
+（評価器〔`crates/eval`〕・データ契約〔`crates/data::eval_input`〕が読める
+`{id, status, predicted_label, scores}`。`crates/core/src/judgment.rs` の
+正常系スキーマと同じ）へ変換する（`choice_posteriors` → `resolve_choice_id` →
+`map_scores_to_choice` → `build_prediction_record`。`predict_records` が
+この一連をチャンク処理でまとめる）。Issue #80 は当初「完全一致・前方一致等の
+規則」を挙げていたが、PoC-24 が事前登録した対応づけは (b)（本ファイルが実装
+する softmax ベースの方式）のみで、前方一致は PoC-24 のどの記録にも無いため
+採用しない（`docs/spec/03-poc/model-kind-selector/preregistration.md` 3 節）。
+「完全一致」は `resolve_choice_id`（選択された選択肢のトークン列を UTF-8
+バイト列として `label_order` の各要素のバイト列と完全一致させる）が (b) の
+最終段として担う。PoC-24 の `reason_code`（対応づけ不能の理由を JSON に含め
+る設計）は意図的に落とす（`crates/core::JudgmentStatus` が現状 `Ok` のみの
+ため、Rust 側スキーマに無いフィールドを Python 側で増やさない。
+coding-python.md）。対応づけ不能（`Unmapped`）は現状 `status:"error"` として
+評価の分母に含まれる。
 """
 
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -123,8 +145,12 @@ from ..limits import (
     MAX_AR_INFER_BATCH_N,
     MAX_AR_LAYERS,
     MAX_AR_LR,
+    MAX_AR_PREDICT_ROWS,
     MAX_AR_WARMUP_STEPS,
     MAX_AR_WEIGHT_DECAY,
+    MAX_TRAIN_LINE_BYTES,
+    MAX_TRAIN_RSS_BYTES,
+    MAX_TRAIN_WALL_SECONDS,
 )
 
 KIND = "autoregressive"
@@ -149,6 +175,13 @@ MAX_INPUT_ID = SEP - 1
 #: と同じ考え方）。MLX 側フォワード（`_build_additive_mask`）と ONNX 側グラフ
 #: （`_export_ar_onnx`）の両方がこの 1 箇所を参照する。
 _MASK_NEG_VALUE = -1e9
+
+#: `build_prediction_record` が受け付ける予測レコードの `id`（入力の識別子。
+#: 入力本文そのものは入れない。security.md）のバイト長上限（#80・REQ-39）。
+#: `crates/core/src/judgment.rs::MAX_INPUT_ID_BYTES` と同じ値を使う（Rust 側
+#: の `infer` 工程〔TASK-33.1。現状未配線〕が受理する `id` の上限と揃え、
+#: 学習ワーカー側で先に拒否できるようにする）。
+MAX_PREDICTION_ID_BYTES = 1024
 
 #: `DecoderLayer._attn` が 1 層あたりに保持する `[..., L, L]` 形状のテンソル数
 #: （`scores`＝`softmax` 適用前のスケール済みスコア、`attn`＝`softmax` の出力
@@ -428,10 +461,30 @@ def _score_choices_mlx(
     が返す、EOS・PAD を含まない可変長のトークン列）から、`[N, K]` の
     条件付き対数尤度合計（choice+EOS の対数尤度の合計。長さ正規化なし）を返す。
 
-    `#80`（TASK-19b.2）はこの関数を再利用して 1 件ずつの予測レコードを
-    組み立てる想定（モジュール docstring）。本関数自体は正規化前の対数尤度を
-    返すだけで、predicted_label・scores への変換は呼び出し側の責務とする
-    （`test_ar_train.py` の golden テスト・簡易正解率確認が呼び出し元）。
+    `predict_records`（#80・TASK-19b.1-2）がこの関数を再利用して 1 件ずつの
+    予測レコードを組み立てる（モジュール docstring）。本関数自体は正規化前の
+    対数尤度を返すだけで、predicted_label・scores への変換は呼び出し側
+    （`map_scores_to_choice`・`build_prediction_record`）の責務とする
+    （`test_ar_train.py` の golden テスト・簡易正解率確認も直接の呼び出し元）。
+
+    `full`（`[N*K, length]`）・decoder の attention（`[N*K, heads, length,
+    length]`）を確保する前に、確保見込み要素数を `MAX_AR_EXPORT_ATTENTION_
+    ELEMENTS`（`N × K × heads × layers × L^2`。書き出し時 `_check_ar_export_
+    resources` が同じ式で検査する上限を、実行時の同じ形状に対しても流用
+    する）で fail-closed に拒否する。`chunk_size`（`MAX_AR_BATCH_SIZE` 以下）
+    はチャンクあたりの計算量を抑えるが、選択肢数 `K`・系列長 `length` は
+    モデル構成・データに依存するため、`chunk_size` だけでは確保量を
+    抑えきれない（Codex レビュー指摘 P0・PR #234。REQ-39「資源の上限」）。
+
+    `logits`・`log_softmax`（いずれも `[N*K, length, VOCAB_SIZE]`）は
+    attention とは別に vocab 次元 `VOCAB_SIZE` 分の要素数を確保するため、
+    attention の見積もりだけでは vocab サイズが大きい構成を見逃す
+    （`_export_ar_onnx` の `choice_logprob_elements` 検査は書き出し時の
+    `[K, M, VOCAB_SIZE]` のみを見ており、本関数の `[N*K, length,
+    VOCAB_SIZE]`〔`length` は選択肢領域 `M` より広い〕には及ばない。
+    Cursor Bugbot 指摘・PR #234）。`full` を確保する前に、この形状の
+    見積もり要素数を `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` で
+    fail-closed に拒否する。
     """
     model.eval()
     n = len(ids_batch)
@@ -439,6 +492,26 @@ def _score_choices_mlx(
     k, m = choice_tokens.shape
     t = max(1, max(len(x) for x in ids_batch))
     length = t + 1 + m
+
+    layers_n = len(model.layers)
+    heads = model.layers[0].heads if model.layers else 0
+    attn_elements = n * k * heads * layers_n * length * length
+    if attn_elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated attention elements {attn_elements} exceeds limit"
+            f" {MAX_AR_EXPORT_ATTENTION_ELEMENTS} (N x K x heads x layers x length^2)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+    logprob_elements = n * k * length * VOCAB_SIZE
+    if logprob_elements > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated logits/log-softmax elements {logprob_elements} exceeds limit"
+            f" {MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS} (N x K x length x vocab_size)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
 
     full = np.zeros((n * k, length), dtype=np.int32)
     for row_n, ids in enumerate(ids_batch):
@@ -457,6 +530,553 @@ def _score_choices_mlx(
     summed = (gathered * valid_tile).sum(axis=1)  # [N*K]
     mx.eval(summed)
     return np.array(summed, dtype=np.float64).reshape(n, k)
+
+
+@dataclass(frozen=True)
+class Mapped:
+    """対応づけ (b) が選択肢 ID の解決まで成功したことを表す（#80）。
+
+    壊れた値（`choice_id` が `None` になりうる等）を表現できない型にする
+    ため、`Unmapped` と分けた 2 型で `ChoiceMapping` を構成する
+    （coding-rust.md「判定結果・状態は enum で表し壊れた値を表現できない
+    型にする」と同じ考え方を Python 側でも踏襲する）。
+
+    `probs` は `label_order` の宣言順に並べた事後確率
+    （`choice_posteriors` の出力をそのまま保持する）。`index` は argmax の
+    添字（タイブレークは宣言順。`crates/core/src/judgment.rs` の
+    `predicted_choice_id` タイブレーク規則と揃える）。
+    """
+
+    choice_id: str
+    index: int
+    probs: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class Unmapped:
+    """対応づけ (b) が選択肢 ID を解決できなかったことを表す（#80）。
+
+    `reason` はテストと将来の #81（TASK-19b.2。判定不能を別の status として
+    区別する扱い）のために保持するだけの内部値で、JSON の予測レコードには
+    出さない（`build_prediction_record` 参照。理由は
+    `"invalid_score"`〔`choice_posteriors` が非有限と判定〕・
+    `"no_exact_match"`〔`resolve_choice_id` が argmax の選択肢と一致する ID
+    を解決できない防御的経路。対応づけ (b) では理論上起こらない〕の 2 つ）。
+    """
+
+    reason: str
+
+
+#: 対応づけ (b) の結果を表す型（`map_scores_to_choice` の戻り値）。
+ChoiceMapping = Mapped | Unmapped
+
+
+def choice_posteriors(loglik_row: np.ndarray) -> np.ndarray | None:
+    """対応づけ (b) の事後確率（選択肢間の softmax）を求める（#80。PoC-24
+    `_predict_one` 相当。`docs/spec/03-poc/model-kind-selector/
+    preregistration.md` 3 節の事前登録どおり、長さ正規化を行わない
+    `_score_choices_mlx` の出力へそのまま softmax を適用する）。
+
+    `loglik_row` は `_score_choices_mlx` が返す `[N, K]` の 1 行。float64 で
+    `x - max` を引いてから `exp` を取り合計で割る、数値的に安定化した
+    softmax を計算する。入力が 1 次元・長さ 1 以上・全要素が有限であること
+    を事前に検証し、満たさなければ `None` を返す（呼び出し側で
+    `Unmapped("invalid_score")` にする。fail-closed）。出力も有限であること
+    を再確認し、満たさなければ同様に `None` を返す（`ok` を装わない）。
+    """
+    if loglik_row.ndim != 1 or loglik_row.shape[0] < 1:
+        return None
+    row = np.asarray(loglik_row, dtype=np.float64)
+    if not np.all(np.isfinite(row)):
+        return None
+    shifted = row - row.max()
+    exp = np.exp(shifted)
+    probs = exp / exp.sum()
+    if not np.all(np.isfinite(probs)):
+        return None
+    return probs
+
+
+def resolve_choice_id(choice_tokens: Sequence[int], label_order: Sequence[str]) -> str | None:
+    """選択肢のトークン列（バイト+1。`_encode_choices` と同じ表現）を、
+    `label_order` の中からバイト単位で完全一致する選択肢 ID へ解決する
+    （#80。受入基準の「完全一致する具体例」を担う純粋関数。前方一致・
+    NFKC 等の正規化・大小文字の同一視はしない。モジュール docstring 5 番の
+    「選択肢は NFKC 正規化しない」方針と整合させる）。
+
+    各トークンが `_encode_choices` が使う「バイト値+1」の語彙 `1..256` の
+    範囲内であることをまず確認する。PAD（0）・SEP（257）・EOS（258）・
+    範囲外の値が 1 つでも混ざっていれば、デコードを試みず `None` を返す
+    （例外は送出しない。「復号できない列」を単に「一致無し」として扱う）。
+    範囲内であれば `token - 1` へ戻したバイト列を組み立て、`label_order` の
+    各要素を UTF-8 エンコードしたバイト列と直接比較する（str へのデコード
+    を経由しないため、`choice_tokens` が有効な UTF-8 でなくても例外を出さず
+    「一致無し」を返せる）。
+    """
+    for token in choice_tokens:
+        if not (1 <= token <= 256):
+            return None
+    decoded_bytes = bytes(token - 1 for token in choice_tokens)
+    for label in label_order:
+        if decoded_bytes == label.encode("utf-8"):
+            return label
+    return None
+
+
+def map_scores_to_choice(
+    loglik_row: np.ndarray,
+    label_order: Sequence[str],
+    choice_ids_by_label: dict[str, list[int]],
+) -> ChoiceMapping:
+    """対応づけ (b) の最終段（#80）。`_score_choices_mlx` が返す 1 行の対数
+    尤度合計を、事後確率つきの選択肢 ID（`Mapped`）または対応づけ不能
+    （`Unmapped`）へ変換する。
+
+    手順: (1) `choice_posteriors` で事後確率を求める。非有限・不正な形なら
+    `Unmapped("invalid_score")` を返す。(2) 出力する `scores`（softmax 後の
+    事後確率）に対して `argmax`（タイブレークは `label_order` の宣言順で
+    先頭。`np.argmax` は同点のとき最初の添字を返すため追加の分岐は要らない）
+    で最大の選択肢を選ぶ。生の対数尤度ではなく事後確率で argmax を取るのは、
+    僅差の対数尤度が softmax 後の丸めで同値になった場合に `predicted_label`
+    と出力スコア上の最大値が食い違うことを防ぐため（Codex レビュー #234
+    指摘。`crates/core/src/judgment.rs::JudgmentResult::new` は同点を宣言順
+    で判定し `predicted_choice_id` と最大スコアの一致を要求する）。(3) その
+    選択肢の
+    トークン列を `resolve_choice_id` で実際に ID へ解決し、選んだ添字の
+    `label_order[idx]` と一致することを確認する。対応づけ (b) では
+    `choice_ids_by_label[label_order[idx]]` は `label_order[idx]` 自身の
+    トークン列なので理論上必ず一致するが、`_encode_choices` の呼び出し
+    契約が崩れた場合に `ok` を偽装しないよう、fail-closed に
+    `Unmapped("no_exact_match")` へ倒す経路を残す。
+
+    `len(loglik_row)` と `len(label_order)` の不一致は、呼び出し側が学習・
+    書き出し時と異なる選択肢集合を渡した実装バグであり、データの問題では
+    ないため `WorkerError`（runtime_error・exit 70）で即座に停止する
+    （黙って切り詰めない。coding-rust.md「外部入力の経路では添字アクセス
+    を使わず明示的に処理する」と同じ fail-closed の考え方）。
+    """
+    if len(loglik_row) != len(label_order):
+        raise WorkerError(
+            "runtime_error",
+            f"loglik row length {len(loglik_row)} does not match label_order length"
+            f" {len(label_order)}",
+            ExitCode.RUNTIME_ERROR,
+        )
+
+    probs = choice_posteriors(np.asarray(loglik_row))
+    if probs is None:
+        return Unmapped("invalid_score")
+
+    # argmax は出力する scores（softmax 後の事後確率）に対して行う。
+    # 生の対数尤度で argmax を決めると、僅差の対数尤度が softmax 後の
+    # 丸めで同値になった場合に predicted_label と最大スコアが食い違い、
+    # `crates/core/src/judgment.rs::JudgmentResult::new` の「同点は宣言順」
+    # 契約（predicted_choice_id は scores 中の最大値と一致する必要がある）
+    # に反する（Codex レビュー #234 指摘）。`np.argmax` は同点のとき最初の
+    # 添字を返すため、宣言順のタイブレークは追加の分岐なしに満たされる。
+    idx = int(np.argmax(probs))
+    label = label_order[idx]
+    resolved = resolve_choice_id(choice_ids_by_label[label], label_order)
+    if resolved != label:
+        return Unmapped("no_exact_match")
+    return Mapped(choice_id=resolved, index=idx, probs=tuple(float(p) for p in probs))
+
+
+def build_prediction_record(
+    record_id: str, mapping: ChoiceMapping, label_order: Sequence[str]
+) -> dict[str, Any]:
+    """1 件の予測レコード（評価器が採点できる形。`crates/core/src/
+    judgment.rs` の正常系スキーマ `{id, status, predicted_label, scores}` と
+    揃える。#80）を組み立てる。
+
+    `Mapped` のとき `status:"ok"`・`scores` は `label_order` の宣言順で
+    `{label: 事後確率}` を持つ dict にする（Python 3.7+ の dict は挿入順を
+    保つため、後から並べ替えない。`judgment.rs` の「`scores` のキー順は
+    定義ファイルの `options` の宣言順で固定する」契約と揃える）。
+    `Unmapped` のとき `status:"error"`・`predicted_label: None` とし、
+    `scores` は付けない（いずれも `crates/data/src/eval_input.rs` が受理
+    する値）。`reason_code` 等、Rust 側スキーマに無いフィールドは追加しない
+    （PoC-24 にあった `reason_code` は意図的に落とす。
+    coding-python.md「Python 側で独自のフィールドを増やさない」）。
+
+    `Unmapped` は現状 `status:"error"` として評価の分母に含まれる。#81・
+    TASK-19b.2 で「判定不能」を別の status として区別する場合は、Rust 側
+    （`crates/data::eval_input` の status 許可集合・
+    `crates/core::JudgmentStatus`）へ先に値を追加しなければ
+    `unknown_status` として拒否される。
+
+    `id` には入力本文を入れない契約（security.md）は呼び出し側
+    （`predict_records`）が守る前提で、ここでは型・非空・バイト長のみを
+    検証する（[`MAX_PREDICTION_ID_BYTES`]）。
+    """
+    if not isinstance(record_id, str) or not record_id:
+        raise WorkerError(
+            "invalid_request", "prediction id must be a non-empty string", ExitCode.INVALID_INPUT
+        )
+    # UTF-8 のバイト数は文字数（コードポイント数）以上であることを利用し、
+    # まず文字数で足切りする（`.encode("utf-8")` は文字数の取得と違い入力
+    # 全体を確保するため、検査より先に呼ぶと巨大な `id` でメモリを無制限に
+    # 消費しうる。`_guarded_encode_bytes` の P0 レビュー指摘〔PR #234〕と
+    # 同種の問題のため同じ順序で予防する。REQ-39）。
+    id_char_len = len(record_id)
+    if id_char_len > MAX_PREDICTION_ID_BYTES:
+        raise WorkerError(
+            "invalid_request",
+            f"prediction id exceeds {MAX_PREDICTION_ID_BYTES} utf-8 bytes"
+            f" ({id_char_len} chars, utf-8 encoding would be at least that many bytes)",
+            ExitCode.INVALID_INPUT,
+        )
+    try:
+        id_len = len(record_id.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        # `record_id` も呼び出し元（`predict_records`）が `rows` の `id` を
+        # そのまま渡すだけで、内容を検証しない値のため、孤立サロゲートを
+        # 含みうる（`_guarded_encode_bytes` と同種の問題。Codex レビュー
+        # 指摘 P1・PR #234 の横展開）。入力本文（`record_id` 自体）を
+        # メッセージへ含めずに拒否する（security.md）。
+        raise WorkerError(
+            "invalid_request",
+            "prediction id is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
+    if id_len > MAX_PREDICTION_ID_BYTES:
+        raise WorkerError(
+            "invalid_request",
+            f"prediction id exceeds {MAX_PREDICTION_ID_BYTES} utf-8 bytes ({id_len} bytes)",
+            ExitCode.INVALID_INPUT,
+        )
+
+    if isinstance(mapping, Mapped):
+        scores = {label: mapping.probs[i] for i, label in enumerate(label_order)}
+        return {
+            "id": record_id,
+            "status": "ok",
+            "predicted_label": mapping.choice_id,
+            "scores": scores,
+        }
+    return {"id": record_id, "status": "error", "predicted_label": None}
+
+
+def _guarded_encode_bytes(text: str, max_bytes: int) -> list[int]:
+    """`predict_records` から呼ぶ前に、正規化前の生入力のバイト数を検査
+    してから `encoding.encode_bytes` を呼ぶ（REQ-39）。
+
+    `encode_bytes` は NFKC 正規化・UTF-8 化を行った「後」に `max_bytes` へ
+    切り詰めるため、この検査を経ずに呼ぶと 1 件の巨大な入力で正規化コスト
+    （壁時計・メモリ）が無制限になる（Codex レビュー指摘 P0・PR #234）。
+    上限には学習データの行読み込み（`contract.py`）と同じ `MAX_TRAIN_
+    LINE_BYTES` を流用する（同じ「1 件の入力テキスト」という種類の上限を
+    2 箇所で別々の値として持たないため）。
+
+    `text.encode("utf-8")` そのものが入力全体のバイト列を新たに確保する
+    ため、検査の「前」にこれを呼ぶと上限判定より先に巨大な入力でメモリを
+    消費しうる（Codex レビュー指摘 P0・PR #234。#80 で `_guarded_encode_
+    bytes` を新設した際に混入した回帰）。UTF-8 のバイト数は文字数
+    （コードポイント数）以上であることを利用し、まず `len(text)`
+    （O(1)。`encode` を伴わない）で足切りしてから `encode("utf-8")` を
+    呼ぶことで、確保量を高々 `4 * MAX_TRAIN_LINE_BYTES`
+    （UTF-8 の 1 コードポイントあたり最大 4 バイト）に抑える。
+
+    `str` は孤立サロゲート（U+D800-U+DFFF 単体。有効な UTF-8 では表現
+    できない）を保持できてしまう（例: JSON の `\\ud800` を経由した学習
+    データ・予測入力。`json` モジュールはサロゲートペアでない `\\uXXXX`
+    もそのまま `str` へデコードする）ため、`text.encode("utf-8")`
+    （この関数と `encoding.encode_bytes` の内部呼び出しの両方）は
+    `UnicodeEncodeError` を送出しうる。捕捉せずに送出すると `_worker` の
+    想定外例外として `runtime_error`（exit 70）扱いになり、7 種の終了
+    コード契約（REQ-21）上は機械可読ではあるものの「利用者の入力が悪い」
+    という区別が付かない。ここで捕捉し、入力本文を含めずに
+    `invalid_request`（exit 64）へ倒す（Codex レビュー指摘 P1・PR #234。
+    security.md「データ本文をエラーメッセージへ転記しない」）。
+    """
+    char_len = len(text)
+    if char_len > MAX_TRAIN_LINE_BYTES:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction input {char_len} chars exceeds limit {MAX_TRAIN_LINE_BYTES} bytes"
+            " (utf-8 encoding would be at least that many bytes)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+    try:
+        raw_len = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise WorkerError(
+            "invalid_request",
+            "prediction input is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
+    if raw_len > MAX_TRAIN_LINE_BYTES:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction input {raw_len} bytes exceeds limit {MAX_TRAIN_LINE_BYTES} bytes",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+    try:
+        return encode_bytes(text, max_bytes)
+    except UnicodeEncodeError as exc:
+        raise WorkerError(
+            "invalid_request",
+            "prediction input is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
+
+
+def _default_predict_resource_budget() -> budget_mod.ResourceBudget:
+    """`predict_records` が `resource_budget` を省略され、かつ `trained.
+    resource_budget`（学習時に使ったインスタンス）も無い場合の、最後の
+    既定予算を作る（REQ-39。Codex レビュー指摘 P0・PR #234）。
+
+    `predict_records` はまず `trained.resource_budget`（`AutoregressiveKind.
+    train` が学習ループ全体で使い回したのと同じインスタンス。`device` は
+    そのジョブの実際のリクエスト値を反映する）を優先して使い、それも
+    `None`（`AutoregressiveTrainedModel` をテスト等で直接構築した場合）の
+    ときだけ本関数を呼ぶ（`predict_records` docstring 参照）。そのため
+    本関数が実際に使われるのは、学習の外で `AutoregressiveTrainedModel` を
+    独立に組み立てる経路（テスト等）に限られる。
+
+    `rows` は最大 `MAX_AR_PREDICT_ROWS`（数百万件のオーダー）まで受け付ける
+    ため、`_score_choices_mlx` 側の見積もりベースの検査（チャンク 1 つぶんの
+    確保量の上限）だけでは、チャンクを跨いだ全体の壁時計時間・実測 RSS を
+    制限できない。`resource_budget=None` のまま呼ぶと `_predict_records_
+    stream` の `resource_budget.check()` が実質無効化されていた（このヘルパー
+    導入前は `if resource_budget is not None` で丸ごとスキップしていた）ため、
+    未指定時でも必ず有効な予算で検査するよう、ここで既定値を生成する。
+
+    値は学習側が既に持つ既定（`contract.py::validate_request` がリクエストの
+    `time_limit_seconds`/`rss_limit_bytes` 省略時に使う `limits.py::
+    MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES`）をそのまま流用する
+    （学習・予測で別々の「1 ジョブあたりの資源上限」の既定値を持たないため）。
+    `device="cpu"` 固定（この経路に到達する時点でジョブの実際の `device` を
+    知る手掛かりが無いため、既定として CPU を仮定する。実運用の呼び出し元
+    〔`cli.py::run_worker_train` からの `predict_records` 呼び出しを想定〕は
+    常に `trained.resource_budget` を持つため、この固定値は実際には使われ
+    ない見込み）。
+    """
+    return budget_mod.ResourceBudget(
+        wall_seconds=float(MAX_TRAIN_WALL_SECONDS),
+        rss_bytes=MAX_TRAIN_RSS_BYTES,
+        device="cpu",
+    )
+
+
+def _max_safe_predict_chunk_size(*, heads: int, layers: int, k: int, m: int, max_bytes: int) -> int:
+    """`_score_choices_mlx` の 2 つの資源上限（REQ-39）を、チャンクの件数 N
+    側から逆算した安全な上限へ変換する（Cursor Bugbot 指摘・PR #234）。
+
+    既定のチャンクサイズ（`trained.config["batch_size"]`）は学習時のミニ
+    バッチサイズをそのまま流用しているが、学習ループは 1 系列＝1 選択肢
+    （`label`）しか同時に展開しないのに対し、予測は `K`（選択肢の総数）を
+    掛けた `N*K` 系列を 1 回の decoder 呼び出しへ展開する
+    （`_score_choices_mlx` docstring）。そのため既定の `batch_size`
+    （例: 32）・既定の `layers`（2）・`heads`（4）・`max_bytes`（512）の
+    ままラベル数が 3 以上あると、既定呼び出しだけで `_score_choices_mlx`
+    の見積もり検査（`MAX_AR_EXPORT_ATTENTION_ELEMENTS`・`MAX_AR_EXPORT_
+    CHOICE_LOGPROB_ELEMENTS`）を超過しうる。
+
+    ここでは `t`（チャンク内の実際の最大入力長）の最悪値として `max_bytes`
+    （`_export_ar_onnx` 冒頭の `Slice(ids, 0, max_bytes, axis=1)` と同じ、
+    学習時に固定した上限。モジュール docstring 6 番）を使い、実際のチャンクを
+    エンコードする前に安全な N の上限を求める。2 つの上限それぞれから
+    逆算した N の上限のうち小さい方を採る。**上限の値そのもの
+    （`MAX_AR_EXPORT_ATTENTION_ELEMENTS`・`MAX_AR_EXPORT_CHOICE_LOGPROB_
+    ELEMENTS`）は変更しない**（呼び出し元の要求どおり、資源上限自体は
+    緩めず、チャンクサイズ側を上限に収まるよう自動的に縮める）。
+    """
+    length = max_bytes + 1 + m
+    denom_attn = max(1, k * heads * layers * length * length)
+    denom_logprob = max(1, k * length * VOCAB_SIZE)
+    n_attn = MAX_AR_EXPORT_ATTENTION_ELEMENTS // denom_attn
+    n_logprob = MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS // denom_logprob
+    return max(1, min(n_attn, n_logprob))
+
+
+def predict_records(
+    trained: AutoregressiveTrainedModel,
+    rows: Sequence[tuple[str, str]],
+    *,
+    chunk_size: int | None = None,
+    resource_budget: budget_mod.ResourceBudget | None = None,
+) -> Iterator[dict[str, Any]]:
+    """学習ワーカー内で対応づけ (b) を確認するための推論経路（#80。PoC-24
+    `predict` 相当）。`rows` は `(id, input)` の列。
+
+    正解ラベル（gold）は受け取らない（REQ-27。推論関数へは `input` だけを
+    渡すという評価の独立性を、学習ワーカー内の確認経路でも維持する）。
+
+    戻り値はジェネレータ（呼び出し元が 1 件ずつ消費する）。以前は全件を
+    `records: list[dict]` へ蓄積してから返していたが、`chunk_size` は
+    1 チャンクあたりの計算量しか制限せず、`rows` 自体の件数上限
+    （`MAX_AR_PREDICT_ROWS`）は数百万件のオーダーになりうるため、全件を
+    リストへ蓄積する設計では上限内でも RSS が際限なく増える
+    （Codex レビュー指摘 P0・PR #234。security.md「ガード層: 資源の上限」）。
+    呼び出し元（将来の CLI `infer --input-file`。TASK-33.1）は
+    `prediction_record_to_json_line` で 1 件ずつ書き出す想定のため、
+    チャンクごとの逐次出力（yield）に変更し、全件保持を避ける。
+    **呼び出し元は必ずイテレートすること**（この関数はジェネレータ関数の
+    ため、呼ぶだけでは本体〔件数上限検査を除く〕は実行されない）。
+
+    件数上限検査（`MAX_AR_PREDICT_ROWS`）だけは呼び出し直後・同期的に行う
+    （fail-closed。呼び出し元がイテレートし忘れても、明らかに上限超過の
+    呼び出しは即座に拒否する）。件数上限検査より後は `rows`（`Sequence`）
+    をそのまま `_predict_records_stream` へ渡し、`list(rows)` による全件
+    コピーはしない（上限内の件数〔`MAX_AR_PREDICT_ROWS` は数百万件の
+    オーダー〕でも、コピーそのものが検査前に RSS を消費してしまうという
+    Codex レビュー指摘 P0・PR #234。呼び出し元は list・tuple 等スライス
+    可能な `Sequence` を渡す契約とする）。
+
+    `chunk_size`（既定は `trained.config["batch_size"]`、上限は
+    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼ぶ。既定・明示指定の
+    いずれの `chunk_size` も、`_max_safe_predict_chunk_size` で選択肢数
+    `K`・`heads`・`layers`・`max_bytes` から逆算した安全な上限へさらに
+    クランプする（Cursor Bugbot 指摘・PR #234。既定 `batch_size` は学習時の
+    ミニバッチサイズをそのまま流用しているが、学習ループは `K` 倍の展開を
+    しないため、既定の学習設定〔`layers=2, heads=4, max_bytes=512`〕でも
+    ラベル数が 3 以上だと既定呼び出しが `_score_choices_mlx` の見積もり
+    検査で拒否されうる。`_max_safe_predict_chunk_size` docstring 参照）。
+    `resource_budget.check()` は各チャンクにつき、(1) そのチャンクの
+    `id_lists`（正規化後のバイト列）を確保する「前」、(2) `_score_choices_
+    mlx` が `[N*K, L]`・attention `[N*K, heads, L, L]` を確保した直後・
+    最初の `yield` を呼ぶ「前」の 2 回呼ぶ（REQ-39）。計算後の検査を全件
+    `yield` した後まで遅らせると、呼び出し元が途中で反復を止めた場合に
+    検査自体が行われず、継続する場合も上限超過後の結果が先に呼び出し元へ
+    渡ってしまう（Codex レビュー指摘 P1・PR #234）。`_score_choices_mlx`
+    自体も確保前に `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で見積もりベースの
+    拒否を行うため、`resource_budget` は実測 RSS による最終防御として
+    併用する。
+
+    `resource_budget` を省略した場合（`None`）は、学習時に使ったのと同じ
+    `trained.resource_budget`（`device` がそのジョブの実際のリクエスト値を
+    反映する）を優先して使い、それも無ければ `_default_predict_resource_
+    budget`（device="cpu" 固定）が生成する既定予算を使う（REQ-39。Codex・
+    advisor レビュー指摘 P0・PR #234。`rows` は `MAX_AR_PREDICT_ROWS`
+    〔数百万件のオーダー〕まで受け付けるため、`_score_choices_mlx` の
+    チャンク単位の見積もり検査だけでは全処理の壁時計時間・実測 RSS を
+    制限できない。以前は `resource_budget=None` だと `_predict_records_
+    stream` の `check()` 呼び出し自体が丸ごとスキップされ、資源上限の検査が
+    事実上任意だった。`_default_predict_resource_budget` を device="cpu"
+    固定のまま無条件の既定にすると、`device="gpu"` のジョブで MLX active
+    memory 検査〔`ResourceBudget.check` の device="gpu" 分岐〕が働かなく
+    なるため、`trained.resource_budget` を優先する設計にした）。
+
+    各行の生テキストは `encode_bytes` を呼ぶ前（NFKC 正規化・UTF-8 化の前）
+    に `MAX_TRAIN_LINE_BYTES` でバイト数を検査する（`encode_bytes` は
+    `max_bytes` への切り詰めを正規化の「後」に行うため、検査なしでは
+    1 件の巨大な入力が正規化コストを無制限に消費しうる。学習データ側は
+    `contract.py` の行読み込みで同じ上限を既に保証しているため、予測経路
+    でも同じ上限値を流用する。Codex レビュー指摘 P0・PR #234）。
+
+    `id` の重複は検査しない（重複の検査はデータ契約層
+    `crates/data::eval_input` の責務であり、ここで評価ロジックを再実装
+    しない。coding-python.md「評価ロジックを Python に再実装しない」）。
+    """
+    if chunk_size is None:
+        chunk_size = int(trained.config.get("batch_size", DEFAULT_CONFIG["batch_size"]))
+    chunk_size = max(1, min(int(chunk_size), MAX_AR_BATCH_SIZE))
+
+    choice_id_list = [trained.choice_ids_by_label[label] for label in trained.label_order]
+
+    layers_n = len(trained.model.layers)
+    heads = trained.model.layers[0].heads if trained.model.layers else 0
+    k = len(choice_id_list)
+    safe_chunk_size = _max_safe_predict_chunk_size(
+        heads=heads, layers=layers_n, k=k, m=trained.max_label_len + 1, max_bytes=trained.max_bytes
+    )
+    chunk_size = min(chunk_size, safe_chunk_size)
+
+    if resource_budget is None:
+        # 学習時に使ったのと同じインスタンス（`device` が実際のリクエスト値
+        # 〔"cpu"/"gpu"〕を反映している）を優先する。`AutoregressiveKind.
+        # train` は必ず `resource_budget` を設定して `AutoregressiveTrained
+        # Model` を返すため、実運用の呼び出し元ではこちらが使われる。
+        # `trained.resource_budget` も無い場合（テスト等で `Autoregressive
+        # TrainedModel` を直接構築した場合）のみ `_default_predict_
+        # resource_budget`（device="cpu" 固定）へ倒す（advisor 指摘・PR #234
+        # フォローアップ。GPU ジョブで CPU 既定へ倒すと `ResourceBudget.
+        # check` の MLX active memory 検査〔device="gpu" 分岐〕が働かず、
+        # REQ-39 の資源検査が半分しか効かなくなるため）。
+        resource_budget = (
+            trained.resource_budget
+            if trained.resource_budget is not None
+            else _default_predict_resource_budget()
+        )
+
+    # `rows` は型上は `Sequence`（呼び出し元が既に全件を保持している前提）
+    # だが、ここで無制限にリスト化・レコード蓄積をしないよう、件数を
+    # 蓄積前に検査する（`chunk_size` は 1 チャンクの計算量しか制限しない。
+    # MAX_AR_PREDICT_ROWS docstring 参照）。この検査はジェネレータの外
+    # （呼び出しの時点で同期的）に置き、呼び出し元が結果をイテレートし
+    # 忘れても上限超過を確実に拒否する。
+    n_rows = len(rows)
+    if n_rows > MAX_AR_PREDICT_ROWS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction rows {n_rows} exceeds limit {MAX_AR_PREDICT_ROWS}",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+    # `list(rows)` で全件コピーしない（`rows` は既に上で件数検査済みだが、
+    # 上限内〔数百万件のオーダー〕でもコピー自体が検査前に RSS を消費する。
+    # Codex レビュー指摘 P0・PR #234）。`rows` をそのまま渡し、チャンクへの
+    # スライスは `_predict_records_stream` 側でチャンクぶんだけ行う。
+    return _predict_records_stream(trained, rows, chunk_size, choice_id_list, resource_budget)
+
+
+def _predict_records_stream(
+    trained: AutoregressiveTrainedModel,
+    rows: Sequence[tuple[str, str]],
+    chunk_size: int,
+    choice_id_list: list[list[int]],
+    resource_budget: budget_mod.ResourceBudget,
+) -> Iterator[dict[str, Any]]:
+    """`predict_records` のチャンクごとの逐次出力本体（件数上限検査済みの
+    `rows` を受け取る）。全件を `list` へ蓄積せず 1 件ずつ `yield` する。
+
+    `resource_budget` は `predict_records` が必ず有効なインスタンス
+    （呼び出し元の指定、または `_default_predict_resource_budget` の既定値）
+    へ解決してから渡す契約とする（REQ-39。以前は `None` を許容し、
+    `is not None` の条件分岐で検査自体を丸ごとスキップできたため、
+    呼び出し元が明示的な予算を渡さない限り予測時の資源検査が働かない
+    空隙があった。Codex レビュー指摘 P0・PR #234）。
+
+    `resource_budget.check()` はチャンクごとに 2 回呼ぶ: (1) そのチャンクの
+    `id_lists` を確保する「前」（チャンクのスライス・エンコードより前）、
+    (2) `_score_choices_mlx` の呼び出し「直後・最初の `yield` より前」
+    （Codex レビュー指摘 P1・PR #234。計算後の検査を全レコード `yield` した
+    後まで遅らせると、呼び出し元が途中で反復を止めた場合に検査されず、
+    継続する場合も上限超過後の結果が先に渡ってしまう）。
+    """
+    n_rows = len(rows)
+    for start in range(0, n_rows, chunk_size):
+        resource_budget.check()
+        chunk = rows[start : start + chunk_size]
+        id_lists = [_guarded_encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
+        scores = _score_choices_mlx(trained.model, id_lists, choice_id_list)
+        resource_budget.check()
+        for (row_id, _text), row in zip(chunk, scores, strict=True):
+            mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
+            yield build_prediction_record(row_id, mapping, trained.label_order)
+
+
+def prediction_record_to_json_line(record: dict[str, Any]) -> str:
+    """予測レコードを JSON 1 行へ直列化する（#80。CLI の `infer --input-file`
+    契約〔evaluation-contract.md「入出力契約」〕と同じ「1 行 1 JSON」の形）。
+
+    鍵の順序は `id → status → predicted_label → scores`（`judgment.rs` の
+    直列化順に揃える。`build_prediction_record` がこの順で dict を作り、
+    `json.dumps` はその挿入順をそのまま書き出す）。`allow_nan=False` を
+    指定し、NaN・Infinity が紛れ込んだレコードを `WorkerError`
+    （runtime_error・exit 70）へ倒す（既定の `json.dumps` は `NaN` という
+    構文上不正な JSON リテラルをそのまま出してしまうため。「ソフトウェア
+    とデータの完全性」security.md）。
+    """
+    try:
+        return json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except ValueError as exc:
+        raise WorkerError(
+            "runtime_error",
+            f"prediction record failed to serialize to valid JSON: {exc}",
+            ExitCode.RUNTIME_ERROR,
+        ) from exc
 
 
 def _encode_input_examples(
