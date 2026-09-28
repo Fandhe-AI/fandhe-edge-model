@@ -53,12 +53,26 @@ use crate::metrics::{self, EvalRecord, Outcome, Ratio};
 use crate::significance;
 
 /// 1 行分の保留判定結果。
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `Adopt` は判定時点で解決したラベル ID（`label`）を保持する（codex/review
+/// 指摘・PR #246・REQ-17・REQ-27）。`calibration` を引数に取って毎回
+/// 解決し直す設計だと、`decide_abstention(&calibration_a, ...)` の結果を
+/// 誤って別の `calibration_b`（ラベル数は同じだが宣言順が異なる）へ渡して
+/// 変換したとき、範囲検査だけでは検出できず別のラベルを正常な予測として
+/// 返してしまう（取り違えの経路が残る）。`label` を判定結果自体に持たせる
+/// ことで、この取り違えの経路そのものを無くす。
+#[derive(Debug, Clone, PartialEq)]
 pub enum AbstentionDecision {
-    /// 採用（確信度が τ 以上）。`label_index` は argmax の宣言順添字。
+    /// 採用（確信度が τ 以上）。
     Adopt {
         /// argmax の宣言順添字（同値は宣言順の先頭。`calibrate` と同じ規則）。
+        /// デバッグ・検証用に保持するが、ラベルの解決には使わない
+        /// （[`AbstentionDecision::to_outcome`] は `label` のみを使う）。
         label_index: usize,
+        /// 判定に使った `Calibration` の `labels()`（宣言順のラベル ID）から
+        /// `label_index` で判定時点に解決した文字列。他の `Calibration` の
+        /// ラベル集合で解決し直すことはない。
+        label: String,
         /// 校正後の top1 確率（確信度）。
         confidence: f64,
     },
@@ -80,60 +94,79 @@ impl AbstentionDecision {
 
     /// [`crate::metrics::Outcome`] へ変換する。
     ///
-    /// `label_index` の意味は「`calibration` に渡したのと同じ宣言順での
-    /// argmax 添字」であり（[`decide_abstention`] の契約）、ラベル ID の
-    /// 解決は `calibration.labels()`（校正時に保持した宣言順の ID。
-    /// [`Calibration::labels`]）からのみ行う。呼び出し元が任意のラベル集合を
-    /// 渡せる形にすると、校正時と異なる集合・並びを渡されたときに誤った
-    /// 添字を正常なラベルとして解釈しうる（`compare_abstention` が
-    /// `CalibrationError::LabelMismatch` で防いでいるのと同じ問題。
-    /// codex/review 指摘・REQ-17・REQ-27）。`self` がどの `Calibration` から
-    /// 得た決定かを型で保証できないため、`decide_abstention` に渡したのと
-    /// **同じ** `calibration` を渡す責務は呼び出し元にあるが、少なくとも
-    /// ラベル ID は外部から任意の値を渡せないようにする。
-    ///
-    /// [`compare_abstention`] は行ごとに `Outcome::Label(String)` を確保しない
-    /// 経路（モジュール冒頭「資源上限」参照）を使うため、この変換は独立した
-    /// 呼び出し元（CLI 配線・issue #140 等）向けの利便関数として用意する。
-    /// ラベル添字は `get()` で引き、範囲外は `[]` を使わず
-    /// [`CalibrationError::Internal`] を返す（`decide_abstention` が
-    /// `calibration.n_labels()` の範囲内でしか `label_index` を作らないため
-    /// 通常到達しないが、fail-closed のため検査する）。
-    pub fn to_outcome(&self, calibration: &Calibration) -> Result<Outcome, CalibrationError> {
+    /// 判定時点で解決済みの `label`（[`AbstentionDecision::Adopt::label`]）を
+    /// そのまま使うだけで、`Calibration` を新たに受け取って解決し直すことは
+    /// ない（構造上、別の校正結果のラベル集合と取り違えようがない。
+    /// codex/review 指摘・REQ-17・REQ-27）。解決に失敗する経路が無いため
+    /// 常に成功する（`Result` を返さない）。
+    pub fn to_outcome(&self) -> Outcome {
         match self {
-            AbstentionDecision::Adopt { label_index, .. } => {
-                let label = calibration.labels().get(*label_index).ok_or_else(|| {
-                    CalibrationError::Internal {
-                        detail: format!(
-                            "label index {label_index} out of range for to_outcome ({} labels)",
-                            calibration.n_labels()
-                        ),
-                    }
-                })?;
-                Ok(Outcome::Label(label.clone()))
-            }
-            AbstentionDecision::Abstain { .. } => Ok(Outcome::Abstain),
+            AbstentionDecision::Adopt { label, .. } => Outcome::Label(label.clone()),
+            AbstentionDecision::Abstain { .. } => Outcome::Abstain,
         }
     }
 }
 
+/// 判定結果の内部表現（`label_index` のみを持ち、ラベル文字列を確保しない）。
+/// [`compare_abstention`] の行ごとの処理専用で、外部へは公開しない
+/// （モジュール冒頭「資源上限」: 行ごとに `String` を確保しないための経路）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RawDecision {
+    Adopt { label_index: usize, confidence: f64 },
+    Abstain { confidence: f64 },
+}
+
 /// `records` 内での位置付きで保留判定する内部経路。[`decide_abstention`]
 /// （公開・1 行版）と [`compare_abstention`]（複数行）の両方がこれを使い、
-/// エラーメッセージの `index` を実際の行位置に揃える。
+/// エラーメッセージの `index` を実際の行位置に揃える。ラベル文字列は
+/// 解決せず添字のみを返す（`compare_abstention` の行ごとの追加確保を防ぐ。
+/// `decide_abstention` 側で公開型 [`AbstentionDecision`] へ解決する）。
 fn decide_abstention_at(
     index: usize,
     calibration: &Calibration,
     logits: &[f64],
-) -> Result<AbstentionDecision, CalibrationError> {
+) -> Result<RawDecision, CalibrationError> {
     let (d, argmax_index) = calibration::preprocess_logits(index, logits, calibration.n_labels())?;
     let confidence = calibration::top1_probability(calibration.chosen_beta(), &d);
     if confidence >= calibration.threshold() {
-        Ok(AbstentionDecision::Adopt {
+        Ok(RawDecision::Adopt {
             label_index: argmax_index,
             confidence,
         })
     } else {
-        Ok(AbstentionDecision::Abstain { confidence })
+        Ok(RawDecision::Abstain { confidence })
+    }
+}
+
+/// [`RawDecision`] を、判定に使った `calibration` の `labels()` から解決した
+/// [`AbstentionDecision`] へ変換する（[`decide_abstention`] 専用）。
+/// `label_index` は `preprocess_logits` が `calibration.n_labels()` の範囲内
+/// でしか作らないため通常は必ず解決できるが、`[]` を使わず `get()` と
+/// fail-closed の [`CalibrationError::Internal`] で防御する。
+fn resolve_decision(
+    calibration: &Calibration,
+    raw: RawDecision,
+) -> Result<AbstentionDecision, CalibrationError> {
+    match raw {
+        RawDecision::Adopt {
+            label_index,
+            confidence,
+        } => {
+            let label = calibration.labels().get(label_index).ok_or_else(|| {
+                CalibrationError::Internal {
+                    detail: format!(
+                        "label index {label_index} out of range while resolving decision ({} labels)",
+                        calibration.n_labels()
+                    ),
+                }
+            })?;
+            Ok(AbstentionDecision::Adopt {
+                label_index,
+                label: label.clone(),
+                confidence,
+            })
+        }
+        RawDecision::Abstain { confidence } => Ok(AbstentionDecision::Abstain { confidence }),
     }
 }
 
@@ -159,7 +192,8 @@ pub fn decide_abstention(
     calibration: &Calibration,
     logits: &[f64],
 ) -> Result<AbstentionDecision, CalibrationError> {
-    decide_abstention_at(0, calibration, logits)
+    let raw = decide_abstention_at(0, calibration, logits)?;
+    resolve_decision(calibration, raw)
 }
 
 /// 保留込み／保留なしの評価指標と、そこから導く誤り率の比較。
@@ -292,8 +326,8 @@ pub fn compare_abstention(
     for (index, record) in records.iter().enumerate() {
         let decision = decide_abstention_at(index, calibration, record.logits)?;
         let label_index = match decision {
-            AbstentionDecision::Adopt { label_index, .. } => label_index,
-            AbstentionDecision::Abstain { .. } => {
+            RawDecision::Adopt { label_index, .. } => label_index,
+            RawDecision::Abstain { .. } => {
                 // 保留の行でも「保留なし」側は argmax を採用するため、
                 // argmax の添字は判定結果に含まれない。`decide_abstention_at`
                 // 自体は argmax を常に計算しているが `Abstain` はそれを
@@ -317,8 +351,8 @@ pub fn compare_abstention(
             outcome: label_outcome,
         });
         let with_outcome = match decision {
-            AbstentionDecision::Adopt { .. } => label_outcome,
-            AbstentionDecision::Abstain { .. } => &abstain_outcome,
+            RawDecision::Adopt { .. } => label_outcome,
+            RawDecision::Abstain { .. } => &abstain_outcome,
         };
         with_records.push(EvalRecord {
             gold: record.gold,
@@ -1065,68 +1099,88 @@ mod tests {
         assert_eq!(argmax_index, 0);
     }
 
-    /// `to_outcome` がラベル添字から `Outcome::Label` を正しく組み立てる
-    /// （`calibration.labels()` から解決する。REQ-17・REQ-27）。
+    /// `to_outcome` が判定時点で解決済みの `label` から `Outcome::Label` を
+    /// 正しく組み立てる（引数を取らず、常に成功する。REQ-17・REQ-27）。
     #[test]
     fn req22_to_outcome_builds_label_and_abstain() {
-        let validation_rows = c1_validation();
-        let validation_records = as_records(&validation_rows);
-        let calibration = calibrate(&LABELS, &validation_records).unwrap();
-
         let adopt = AbstentionDecision::Adopt {
             label_index: 1,
+            label: "l1".to_string(),
             confidence: 0.9,
         };
-        assert_eq!(
-            adopt.to_outcome(&calibration).unwrap(),
-            Outcome::Label("l1".to_string())
-        );
+        assert_eq!(adopt.to_outcome(), Outcome::Label("l1".to_string()));
         let abstain = AbstentionDecision::Abstain { confidence: 0.1 };
-        assert_eq!(abstain.to_outcome(&calibration).unwrap(), Outcome::Abstain);
+        assert_eq!(abstain.to_outcome(), Outcome::Abstain);
     }
 
-    /// `to_outcome` は範囲外のラベル添字を `[]` ではなく `Internal` で拒否する。
+    /// 内部変換 `resolve_decision` は範囲外のラベル添字を `[]` ではなく
+    /// `Internal` で拒否する（fail-closed。`decide_abstention_at` が
+    /// `calibration.n_labels()` の範囲内でしか添字を作らないため通常は
+    /// 到達しないが、防御的に検査する）。
     #[test]
-    fn req39_to_outcome_rejects_out_of_range_label_index() {
+    fn req39_resolve_decision_rejects_out_of_range_label_index() {
         let validation_rows = c1_validation();
         let validation_records = as_records(&validation_rows);
         let calibration = calibrate(&LABELS, &validation_records).unwrap();
 
-        let adopt = AbstentionDecision::Adopt {
+        let raw = RawDecision::Adopt {
             label_index: 99,
             confidence: 0.9,
         };
-        let err = adopt
-            .to_outcome(&calibration)
+        let err = resolve_decision(&calibration, raw)
             .expect_err("out-of-range label index must be rejected");
         assert!(matches!(err, CalibrationError::Internal { .. }));
     }
 
-    /// `to_outcome` は `calibration.labels()` から解決するため、校正時と
-    /// 異なるラベル集合を外部から渡す経路自体が存在しない（REQ-17・REQ-27。
-    /// codex/review 指摘: 添字が範囲内かだけの確認では校正時のラベル集合との
-    /// 不一致を検出できず、誤った予測を正常な結果として評価しうる問題への
-    /// 対応）。校正時のラベルが宣言順どおりに解決されることを、並べ替えた
-    /// 集合で校正した `Calibration` に対して確認する。
+    /// REQ-17・REQ-27（codex/review 指摘・PR #246 の 2 件目の P1）:
+    /// `decide_abstention(&calibration_a, logits)` の結果を、ラベル数は
+    /// 同じだが宣言順が異なる `calibration_b` へ渡して変換する経路が
+    /// 存在しないことを確認する。`to_outcome` は引数を取らず、判定時点で
+    /// `calibration_a`／`calibration_b` それぞれの `labels()` から解決済みの
+    /// `label` をそのまま返すため、同じ `label_index`（ここでは argmax=0）
+    /// でも校正ごとに異なる文字列に解決され、取り違えようがない。
     #[test]
-    fn req27_to_outcome_resolves_from_calibration_labels_only() {
-        let permuted_labels = ["l2", "l0", "l1"];
+    fn req27_decision_label_is_resolved_at_decision_time_not_reresolvable() {
         let validation_rows = c1_validation();
-        // gold はそのままに、ラベル宣言順だけを並べ替えて校正する。
         let validation_records = as_records(&validation_rows);
-        let calibration = calibrate(&permuted_labels, &validation_records).unwrap();
+        let calibration_a = calibrate(&LABELS, &validation_records).unwrap();
+        // ラベル数は同じ 3 のまま、宣言順だけを入れ替えて校正する。
+        let permuted_labels = ["l1", "l2", "l0"];
+        let calibration_b = calibrate(&permuted_labels, &validation_records).unwrap();
 
-        // label_index=0 は permuted_labels 宣言順の "l2"（LABELS の "l0" では
-        // ない）。`to_outcome` は `calibration.labels()`（= permuted_labels）
-        // からのみ解決するため、渡しようのない外部 `labels` 引数によって
-        // 誤ったラベルへ解決される余地がない。
-        let adopt = AbstentionDecision::Adopt {
-            label_index: 0,
-            confidence: 0.9,
+        // 極端な margin で確信度を高くし、両方の校正で確実に Adopt させる
+        // （req27_calibration_not_recomputed_from_eval_data と同じ手法）。
+        let confident_logits = [5.0, 0.0, 0.0];
+        let decision_a = decide_abstention(&calibration_a, &confident_logits).unwrap();
+        let decision_b = decide_abstention(&calibration_b, &confident_logits).unwrap();
+
+        let (label_index_a, label_a) = match &decision_a {
+            AbstentionDecision::Adopt {
+                label_index, label, ..
+            } => (*label_index, label.clone()),
+            AbstentionDecision::Abstain { .. } => panic!("calibration_a must adopt"),
         };
-        assert_eq!(
-            adopt.to_outcome(&calibration).unwrap(),
-            Outcome::Label("l2".to_string())
-        );
+        let (label_index_b, label_b) = match &decision_b {
+            AbstentionDecision::Adopt {
+                label_index, label, ..
+            } => (*label_index, label.clone()),
+            AbstentionDecision::Abstain { .. } => panic!("calibration_b must adopt"),
+        };
+
+        // argmax の添字は両方とも 0（同じロジット）だが、校正時に解決された
+        // ラベルは宣言順に従いそれぞれ異なる（LABELS[0]="l0"・
+        // permuted_labels[0]="l1"）。
+        assert_eq!(label_index_a, 0);
+        assert_eq!(label_index_b, 0);
+        assert_eq!(label_a, "l0");
+        assert_eq!(label_b, "l1");
+        assert_ne!(label_a, label_b);
+
+        // `to_outcome` は `Calibration` を受け取らないため、`decision_a` を
+        // `calibration_b` のラベル集合で解決し直す呼び出し自体が書けない
+        // （コンパイル時に排除される）。それぞれの判定結果は自身が保持する
+        // `label` のみを返す。
+        assert_eq!(decision_a.to_outcome(), Outcome::Label("l0".to_string()));
+        assert_eq!(decision_b.to_outcome(), Outcome::Label("l1".to_string()));
     }
 }
