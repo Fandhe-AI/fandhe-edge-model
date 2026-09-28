@@ -61,12 +61,17 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    （一時ディレクトリとその中身・空の予約済みディレクトリ）を
    `contract.cleanup_reservation` で解放する（本モジュールが保持し続けている
    fd だけを使う。名前を再解決しない）。
-7. 子プロセスが自分で終了した場合: 標準出力が「ちょうど 1 つの妥当な JSON
-   オブジェクトである」ことを確認し、終了コードが 7 種のいずれかであることも
-   確認する。いずれかを満たさない、またはシグナルによる終了なら
-   `runtime_error`（exit 70）とし、予約を解放する。終了コードが 0 以外（7 種の
-   いずれかのエラー）なら、そのコード・JSON をそのまま使い、予約は解放する
-   （出力を確定させない）。終了コードが 0（成功）なら、確定の前に
+7. `_worker` が自分で終了した場合も、**回収（reap）より必ず先に**
+   `_terminate_worker`（`killpg`）を呼ぶ（`_current_child_status`・
+   `_terminate_and_reap_after_self_exit` 参照。issue #178 PR #233 レビュー
+   再指摘 P0「worker が先に終了すると子孫プロセスが残る」。`_worker` が
+   何かの理由で孫プロセスを残したまま正常終了したケースを取りこぼさない
+   ため）。回収後、標準出力が「ちょうど 1 つの妥当な JSON オブジェクトで
+   ある」ことを確認し、終了コードが 7 種のいずれかであることも確認する。
+   いずれかを満たさない、またはシグナルによる終了なら `runtime_error`
+   （exit 70）とし、予約を解放する。終了コードが 0 以外（7 種のいずれかの
+   エラー）なら、そのコード・JSON をそのまま使い、予約は解放する（出力を
+   確定させない）。終了コードが 0（成功）なら、確定の前に
    `artifact.verify_output` で `model.onnx` の SHA-256 が `artifact.json` の
    記録と一致するかを確認し（P0: AGENTS.md ガード層「完全性と版」・REQ-39。
    不一致・欠落は予約を解放して確定させない）、一致すれば
@@ -109,6 +114,30 @@ Rust 側 `run_train` が `_worker`（＝ Rust から見た孫プロセス）を�
   別セッションへ抜けた場合（lifeline の読み取り端を引き継がない独自の
   子プロセスを作った場合）は、この方式でも対象外である（限界として
   正直に記録する）。
+
+**不変条件: `_worker` のプロセスグループ掃除（`killpg`）は回収（reap）
+より必ず先に行う**（issue #178 PR #233 レビュー再指摘 P0「worker が先に
+終了すると、子孫プロセスが残る」）: `_worker` は `start_new_session=True`
+で起動されるため pgid は `_worker` 自身の pid と一致する。`_worker` が
+まだ回収されていない（ゾンビとして存在する）間は、この pgid は OS に
+返却されず、他のセッションへ再利用されることもない。回収（`Popen.wait()`
+等）を先に行ってしまうと、この保証が失われ、`killpg` が理論上は
+無関係な別プロセスグループを巻き込みうる。
+
+`monitor_child` は `_worker` の終了を **回収せずに** 検知する
+（`_current_child_status` の `is_zombie`）: 素直な実装は
+`os.waitid(..., os.WNOWAIT)` だが、CPython は macOS でこの関数を提供
+しない（`Modules/posixmodule.c` が `HAVE_WAITID && !defined(__APPLE__)`
+でガードしている。issue #178 PR #233 レビュー再指摘の中で確認した）ため
+使えない。代わりに、既存の RSS 監視が使う `ps -p <pid>` 呼び出しへ
+`stat=`（プロセス状態）を相乗りさせ、`Z`（ゾンビ）かどうかで判定する
+（ゾンビはプロセス表から消えないため `ps` に引き続き表示される。
+新しい依存・子プロセス起動は増やさない）。`_terminate_worker`
+（`killpg`）を呼んでから初めて `Popen.wait()` で回収する
+（`_terminate_and_reap_after_self_exit`）。この順序は、正常終了・
+`RLIMIT_CPU` 自己終了・タイムアウト・RSS 超過・監視失敗のいずれの経路でも
+例外なく守る。`ps` 自体が使えない・対象を見つけられない場合は、安全に
+検知する手段が無いため `monitor_failed` として fail-closed に扱う。
 """
 
 from __future__ import annotations
@@ -159,14 +188,28 @@ def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def _current_child_rss_bytes(pid: int) -> int | None:
-    """`ps -o rss= -p <pid>`（bytes 単位に変換済み）。取得できなければ None。
+def _current_child_status(pid: int) -> tuple[int, bool] | None:
+    """`ps -o rss=,stat= -p <pid>` で RSS（バイト単位に変換済み）とゾンビ
+    状態かどうかを 1 回の呼び出しでまとめて取得する。取得できなければ
+    `None`。
 
     `ps` の RSS 出力は KiB 単位（BSD/macOS・Linux とも `-o rss=` は KiB）。
+    `stat` の先頭が `Z`（Linux・macOS/BSD 共通の意味）であれば、対象は
+    終了しているがまだ回収（reap）されていない（ゾンビ）ことを示す。
+
+    ゾンビはプロセス表から消えないため（回収されるまで pid・
+    プロセスグループ ID が OS に返却されない）、`ps` に引き続き表示される。
+    これを利用して「回収せずに終了を検知する」手段とする（issue #178
+    PR #233 レビュー再指摘 P0「worker が先に終了すると、子孫プロセスが
+    残る」。本来は `os.waitid(..., os.WNOWAIT)` が素直だが、CPython は
+    macOS でこの関数を提供しない〔`Modules/posixmodule.c` が `HAVE_WAITID
+    && !defined(__APPLE__)` でガードしている〕ため使えない。既存の RSS
+    監視が使う `ps` 呼び出しへ相乗りすることで、新しい依存・子プロセス
+    起動を増やさずに実現する）。
     """
     try:
         result = subprocess.run(  # noqa: S603 - 引数は固定リスト。shell 不使用。絶対パスの /bin/ps のみを呼ぶ
-            [_PS_BIN, "-o", "rss=", "-p", str(pid)],
+            [_PS_BIN, "-o", "rss=,stat=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -179,38 +222,57 @@ def _current_child_rss_bytes(pid: int) -> int | None:
     text = result.stdout.strip()
     if not text:
         return None
+    parts = text.split(None, 1)
+    if len(parts) != 2:
+        return None
+    rss_text, stat_text = parts
     try:
-        kib = int(text)
+        kib = int(rss_text)
     except ValueError:
         return None
-    return kib * 1024
+    is_zombie = stat_text.startswith("Z")
+    return kib * 1024, is_zombie
 
 
 def _terminate_worker(proc: subprocess.Popen) -> None:
-    """`_worker` のプロセスグループ W 全体を `SIGKILL` する。
+    """`_worker` のプロセスグループ W 全体（pgid = `_worker` 自身の pid）へ
+    `SIGKILL` を送る。
 
     `_worker` は常に `start_new_session=True` で別プロセスグループ
     （リーダー = `_worker` 自身）として起動されるため（モジュール docstring
-    「lifeline」節参照。issue #178 PR #233 レビュー: Rust 側でのプロセス
-    グループ管理から worker 自身が親の死を検知する lifeline 方式へ全面
-    移行した際、単独起動・Rust 管理下のいずれでも `_worker` は常に別
-    セッションで起動する設計に統一した）、本モジュール自身は `os.killpg`
-    に巻き込まれない。`_worker` がさらに起動した孫プロセスもこのグループ W
-    に属する限り、まとめて終了する。プロセスグループの取得自体に失敗した
-    場合の保険として `proc.kill()` も呼ぶ。
+    「lifeline」節参照）、pgid は `_worker` の pid と一致する。本モジュール
+    自身はこのグループに属さないため `os.killpg` に巻き込まれない。
+    `_worker` がさらに起動した孫プロセスもこのグループ W に属する限り、
+    まとめて終了する。`_worker` がゾンビであっても `os.getpgid(proc.pid)`
+    自体は呼べるが、pgid = `_worker` の pid であることは呼び出し起動時から
+    確定している設計上の不変条件のため、`getpgid` は呼ばず `proc.pid` を
+    直接使う（`getpgid` の呼び出しと `killpg` の間に無用な窓を作らない）。
+
+    **呼び出し元が守るべき不変条件**: 本関数は必ず `Popen.wait()`（回収）
+    より先に呼ぶこと。`_worker` がまだ回収されていない（ゾンビとして存在
+    する）間は pgid が OS に返却されず再利用もされないため安全に
+    `killpg` できるが、先に回収してしまうと pgid が理論上は別のプロセス
+    グループへ再利用されうる（issue #178 PR #233 レビュー再指摘 P0
+    「回収より前に kill するのは、pgid が再利用されて別のプロセスを kill
+    しないため」）。対象が既に存在しない（`ProcessLookupError`）場合は
+    無視してよい。
+
+    `proc.kill()`（保険）は内部で `self.poll()` を呼ぶため、まだ回収されて
+    いなければこの時点で `_worker` を回収する副作用がある。これは
+    `os.killpg` の**後**に呼んでいるため、上記の不変条件（kill してから
+    回収する）は保たれる。
     """
     with contextlib.suppress(OSError):
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(OSError):
-        proc.kill()  # プロセスグループの取得自体に失敗した場合の保険
+        proc.kill()  # 上の killpg が何らかの理由で効かなかった場合の保険
 
 
 def _cpu_seconds_consumed_by_children(baseline: resource.struct_rusage) -> float:
     """`baseline`（監視開始時点の `RUSAGE_CHILDREN`）からの CPU 時間（user+sys 秒）の
     増分。`RUSAGE_CHILDREN` は「これまでに reap した子プロセス」の累積値のため、
     1 ジョブにつきワーカーを 1 つずつ順に起動する本モジュールの設計では、この
-    増分は基本的に当該ワーカーに帰属する（`_current_child_rss_bytes` が起動する
+    増分は基本的に当該ワーカーに帰属する（`_current_child_status` が起動する
     `ps` の CPU 消費もわずかに混入しうるが、しきい値との比較粒度に対して無視できる
     ほど小さい）。
     """
@@ -248,6 +310,24 @@ def _classify_self_exit(
     return None
 
 
+def _terminate_and_reap_after_self_exit(
+    proc: subprocess.Popen, cpu_baseline: resource.struct_rusage, soft_cpu_limit_seconds: float
+) -> str | None:
+    """`_worker` が自分で終了した（が、まだ回収されていない＝ゾンビとして
+    存在する）ことを `_current_child_status` の `is_zombie` で確認した
+    直後に呼ぶ。
+
+    **回収（`Popen.wait()`）より必ず先に** `_terminate_worker`（`killpg`）
+    を呼ぶ（issue #178 PR #233 レビュー再指摘 P0「worker が先に終了すると、
+    子孫プロセスが残る」。`_terminate_worker` のドキュメント参照）。
+    `_worker` が孫プロセスを残さずに終了していた場合、`killpg` は
+    ESRCH 相当（`ProcessLookupError`）になるだけで無害である。
+    """
+    _terminate_worker(proc)
+    proc.wait()  # 既に終了を確認済みのため即座に返る（回収を完了させる）。
+    return _classify_self_exit(proc, cpu_baseline, soft_cpu_limit_seconds)
+
+
 def monitor_child(
     proc: subprocess.Popen,
     *,
@@ -278,38 +358,46 @@ def monitor_child(
     テスト（`tests/test_supervisor.py`）は本関数を直接、ダミーの子プロセス
     （`sys.executable -c "..."`）に対して呼ぶことで、実際の学習ワーカーを
     起動せずに監視ロジックを検証する。
+
+    **`_worker` の終了検知は回収せずに行う**（`_current_child_status` の
+    `is_zombie`。`ps` が使えない場合と、対象が既に回収済み・存在しない
+    場合は `monitor_failed` として fail-closed に扱う。モジュール
+    docstring「不変条件」節参照。issue #178 PR #233 レビュー再指摘 P0）。
     """
     cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
     while True:
-        try:
-            proc.wait(timeout=poll_interval)
-            return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
-        except subprocess.TimeoutExpired:
-            pass
+        status = _current_child_status(proc.pid)
+        if status is None:
+            # `ps` がこの pid を見つけられなかった。本モジュールが `proc`
+            # を唯一の回収者であり続ける限り、通常は `ps` 自体の失敗を
+            # 意味する（`_worker` が既に回収済みなら、それは本関数か
+            # テストのモックが直接 `wait()` した場合に限られる）。
+            # `proc.poll()` で確認する: 既に終了していれば（`poll()` 自体が
+            # 回収を伴うが、この時点で pid は既に本関数の管理下から外れて
+            # いる可能性が高く、これ以上安全に `killpg` する手段が無いため）
+            # 通常の終了として分類する。そうでなければ監視できないことを
+            # fail-closed に扱う。
+            if proc.poll() is not None:
+                return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
+            _terminate_worker(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10)
+            return "monitor_failed"
+        rss, is_zombie = status
+        if is_zombie:
+            return _terminate_and_reap_after_self_exit(proc, cpu_baseline, time_limit_seconds)
         if time.monotonic() > deadline:
             _terminate_worker(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             return "time"
-        rss = _current_child_rss_bytes(proc.pid)
-        if rss is None and proc.poll() is not None:
-            # `wait` のタイムアウト直後に子が終了すると `ps` は PID を見つけられない。
-            # 終了済みなら監視失敗ではなく通常の終了として扱う（成功した学習の
-            # 成果物を monitor_failed で捨てない）。
-            return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
-        if rss is None:
-            # 監視できないこと自体を fail-closed に扱う（上限を検査できない
-            # まま子プロセスを走らせ続けない）。
-            _terminate_worker(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
-            return "monitor_failed"
         if rss > rss_limit_bytes:
             _terminate_worker(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             return "rss"
+        time.sleep(poll_interval)
 
 
 def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDOUT_BYTES) -> None:

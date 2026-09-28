@@ -97,7 +97,7 @@ def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
     """`wait` のタイムアウト直後に子が正常終了し `ps` が PID を見つけられない
     競合でも、監視失敗（monitor_failed）ではなく通常の終了として扱う。
 
-    `_current_child_rss_bytes` が「子の終了を待ってから None を返す」ように
+    `_current_child_status` が「子の終了を待ってから None を返す」ように
     差し替え、競合を決定的に再現する。
     """
     proc = _spawn("import time; time.sleep(0.3)")
@@ -106,7 +106,7 @@ def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
         proc.wait(timeout=5)
         return None
 
-    monkeypatch.setattr(supervisor, "_current_child_rss_bytes", _ps_after_exit)
+    monkeypatch.setattr(supervisor, "_current_child_status", _ps_after_exit)
     try:
         reason = supervisor.monitor_child(
             proc,
@@ -237,6 +237,79 @@ def test_terminate_worker_kills_grandchild_too(tmp_path: Path) -> None:
         assert heartbeat.stat().st_size == size_after_kill, (
             "grandchild must not still be writing after monitor_child returns"
         )
+    finally:
+        _reap(proc)
+
+
+def _process_alive(pid: int) -> bool:
+    """`os.kill(pid, 0)` でシグナルを送らずに対象の生存を確認する。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 権限の理由で確認できない場合は「存在する」とみなす（fail-closed）。
+        return True
+    return True
+
+
+def test_monitor_child_kills_grandchild_after_worker_exits_normally(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー再指摘 P0「worker が先に終了すると、
+    子孫プロセスが残る」への回帰テスト: `_worker` 役が孫プロセスを起動した
+    直後に自分自身はすぐ正常終了しても（孫を明示的に `wait()` しない）、
+    `monitor_child` が戻った後には孫プロセスも消えていること。
+
+    孫は supervisor（本テストプロセス）の子ではなく `_worker` 役の子である
+    ため、本テストプロセスからは回収されずゾンビ判定の問題は起きない
+    （`os.kill(pid, 0)` でそのまま生存確認できる）。ゾンビの残骸が一瞬
+    見えることがあるため、少し待ってからもう一度確認する。
+    """
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、孫プロセスを起動した直後（`wait()` せず）に
+    # 自分自身はすぐ正常終了する。孫は同じプロセスグループに残ったままに
+    # なる（`start_new_session` を指定しないため）。
+    code = (
+        "import subprocess, sys\n"
+        f"p = subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(p.pid))\n"
+    )
+    proc = _spawn(code)
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            heartbeat.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started"
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason is None
+        assert proc.returncode == 0
+
+        deadline = time_mod.monotonic() + 5.0
+        alive = _process_alive(grandchild_pid)
+        while alive and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+            alive = _process_alive(grandchild_pid)
+        assert not alive, "grandchild must be terminated after monitor_child returns"
     finally:
         _reap(proc)
 
