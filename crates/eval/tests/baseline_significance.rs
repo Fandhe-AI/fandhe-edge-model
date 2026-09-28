@@ -31,10 +31,14 @@ const REL_EPSILON: f64 = 1e-9;
 
 /// 絶対誤差・相対誤差の両方を満たす場合にのみ一致とみなす
 /// （`crates/eval/tests/mcnemar_known_answer.rs` と同じ方針）。
+///
+/// 期待値が 0.0 の既知値（f64 のアンダーフロー境界など）は許容差を設けず、
+/// 実値も厳密に 0.0 であることを要求する。絶対誤差だけで判定すると
+/// 1e-9 未満の任意の非ゼロ値を通してしまい、既知値を検証できないため。
 fn approx_eq(actual: f64, expected: f64) -> bool {
     let abs_diff = (actual - expected).abs();
     if expected == 0.0 {
-        return abs_diff < ABS_EPSILON;
+        return actual == 0.0;
     }
     let rel_diff = abs_diff / expected.abs();
     abs_diff < ABS_EPSILON && rel_diff < REL_EPSILON
