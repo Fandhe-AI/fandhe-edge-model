@@ -11,10 +11,12 @@
 //!
 //! - [`metrics`][]: 正解率・ラベル別指標（適合率・再現率・F1）・Macro-F1・
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）
+//! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
+//!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
+//!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - Wilson 95% 信頼区間・sklearn 照合: 未実装（TASK-24.1-2・issue #60）
 //! - 分母 0 の指標の JSON `null` 表示・平均から除いたラベルの列挙
 //!   （`excluded_labels`）: 未実装（TASK-24.2・issue #61）。本 crate は
 //!   `Option<f64>` として `None` を返すところまでを担う
@@ -43,3 +45,4 @@
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
 //!   モジュールの「資源上限」節を参照）
 pub mod metrics;
+pub mod wilson;
