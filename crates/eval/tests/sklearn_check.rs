@@ -169,7 +169,7 @@ fn check_case(
         assert_opt_close(actual.f1, expected.f1, &format!("f1[{}]", expected.label));
     }
 
-    assert_opt_close(metrics.macro_f1, expected_macro_f1, "macro_f1");
+    assert_opt_close(metrics.macro_f1.value(), expected_macro_f1, "macro_f1");
     assert!(
         approx_eq(metrics.accuracy.overall.value(), expected_overall),
         "overall accuracy: {} != {}",
