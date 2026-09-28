@@ -130,18 +130,19 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             }
         }
         "hang_with_orphan" => {
-            // codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・
-            // 検証用モード。`supervisor.py` が `_worker` を
-            // `start_new_session=True` で別セッションとして起動する状況を
-            // 模す: 自分自身（このテストバイナリ）を「孫プロセス」として
-            // 新しいセッション（`process_group(0)`。unix でのみ利用可能）で
-            // 起動し、孫の pid を `orphan.pid`（cwd = job_dir）へ書いてから、
-            // 自分（「supervisor 役」）は標準出力を閉じずに応答不能なまま
-            // 待ち続ける（外側の壁時計タイムアウトで kill されるまで自発的に
-            // 終了しない）。
+            // issue #178 PR #233 レビュー再々指摘の再現・検証用モード。
+            // 新しいアーキテクチャでは `_worker`（ここでは「孫プロセス」）を
+            // 別セッションへ切り離さない（`trainer/src/fandhe_edge_trainer/
+            // supervisor.py` が `start_new_session` を使わない設計に変えた
+            // ことのハーネス側の対応。`.process_group(0)` を**呼ばない**ことで、
+            // `run_train` が確立したプロセスグループへそのまま留まる）。
+            // 自分自身（このテストバイナリ）を「孫プロセス」として起動し、
+            // 孫の pid を `orphan.pid`（cwd = job_dir）へ書いてから、自分
+            // （「supervisor 役」）は標準出力を閉じずに応答不能なまま待ち
+            // 続ける（外側の壁時計タイムアウトで、プロセスグループごと
+            // `SIGKILL` されるまで自発的に終了しない）。
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
                 let exe = std::env::current_exe().expect("resolve current_exe for orphan");
                 let launch_script = std::env::current_dir()
                     .expect("cwd")
@@ -153,8 +154,7 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                     .arg(&launch_script)
                     .arg("train")
                     .arg("--request")
-                    .arg(request_path)
-                    .process_group(0);
+                    .arg(request_path);
                 let grandchild = command.spawn().expect("spawn orphan grandchild");
                 std::fs::write("orphan.pid", grandchild.id().to_string())
                     .expect("write orphan.pid");
@@ -175,20 +175,21 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             }
         }
         "exit_with_orphan" => {
-            // codex/review 指摘 P0（issue #178 PR #233 レビュー）「supervisor
-            // が先に終了すると孤児ワーカーを停止できない」の再現・検証用
-            // モード。`hang_with_orphan` と同様に孫プロセス（`_worker` 役）を
-            // 新しいセッションで起動し、孫の標準出力を自分（supervisor 役）
-            // の標準出力（`run_train` が読み取るパイプ）へ継承させたまま、
-            // supervisor 役自身は正常終了する。孫が標準出力の書き手を握り
-            // 続けるため、`run_train` は `StdoutIncomplete` を検知するはず
-            // だが、supervisor が既に終了しているため `ppid` チェーンは
-            // 辿れない（孫は reparent 済み）。`run_train` がポーリング中に
-            // 記録しておいた直近のスナップショットで孫を kill できることを
-            // 検証する（`case_exit_with_orphan_kills_orphan`）。
+            // issue #178 PR #233 レビュー再々指摘の再現・検証用モード。
+            // `hang_with_orphan` と同様に孫プロセス（`_worker` 役）を
+            // **同じプロセスグループに留めたまま**起動し（`.process_group(0)`
+            // を呼ばない）、孫の標準出力を自分（supervisor 役）の標準出力
+            // （`run_train` が読み取るパイプ）へ継承させたまま、supervisor
+            // 役自身は正常終了する。孫が標準出力の書き手を握り続けるため、
+            // `run_train` の標準出力読み取りは EOF に達せず、壁時計予算を
+            // 使い切って `WallTimeout` になる。旧実装（`ps` によるプロセス
+            // ツリー走査）で必要だった「孫プロセスの起動後に猶予を置いて
+            // からでないと supervisor が終了してはならない」という制約
+            // （スナップショットのタイミング依存）は、プロセスグループへの
+            // 一括 `SIGKILL` 方式では不要になったため削除した
+            // （`case_exit_with_orphan_kills_orphan` 参照）。
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
                 let exe = std::env::current_exe().expect("resolve current_exe for orphan");
                 let launch_script = std::env::current_dir()
                     .expect("cwd")
@@ -203,8 +204,7 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                     .arg(request_path)
                     // 標準エラー出力は継承させない（検証したいのは標準
                     // 出力側の読み取り未完了だけに絞るため）。
-                    .stderr(std::process::Stdio::null())
-                    .process_group(0);
+                    .stderr(std::process::Stdio::null());
                 let grandchild = command.spawn().expect("spawn orphan grandchild");
                 std::fs::write("orphan.pid", grandchild.id().to_string())
                     .expect("write orphan.pid");
@@ -212,10 +212,6 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                     let mut grandchild = grandchild;
                     let _ = grandchild.wait();
                 });
-                // `run_train` 側のポーリング（`DESCENDANT_SNAPSHOT_INTERVAL`
-                // = 200ms）が孫プロセスの起動後に少なくとも 1 回スナップ
-                // ショットを取れるよう、正常終了までに猶予を置く。
-                std::thread::sleep(Duration::from_millis(600));
             }
             print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
             std::process::exit(0);
@@ -581,10 +577,11 @@ fn case_timeout_hang(case_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・検証:
-/// supervisor 役（`hang_with_orphan`）が別セッションで起動した孫プロセス
+/// issue #178 PR #233 レビュー再々指摘の再現・検証: supervisor 役
+/// （`hang_with_orphan`）が同じプロセスグループ内で起動した孫プロセス
 /// （`_worker` 役。応答不能な supervisor に代わって走り続ける）も、外側の
-/// 壁時計タイムアウトで確実に終了することを確認する。
+/// 壁時計タイムアウト（プロセスグループへの一括 `SIGKILL`）で確実に終了
+/// することを確認する（REQ-39）。
 #[cfg(unix)]
 fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "hang_with_orphan");
@@ -593,16 +590,16 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
         .with_wall_timeout(Duration::from_millis(500))
         .expect("tighten wall timeout");
 
-    // 孫プロセスが実際に起動してから外側タイムアウトが発火するよう、
+    // 孫プロセスが実際に起動したことを確認してから検証したいため、
     // `run_train`（500ms の壁時計タイムアウト）を別スレッドで実行しつつ、
     // メインスレッドで `orphan.pid` の出現を短いポーリングで待つ
-    // （cursor[bot] 指摘「Orphan test skips startup wait」。issue #178
-    // PR #233 レビュー: 以前はポーリングを実装しておらず、遅い spawn で
-    // `ps` のスナップショットが孫プロセスの起動前に取られてしまい、木
-    // 単位の kill が正しくても偽陽性で fail しうる状態だった）。
-    // ポーリングの成否は木単位の kill の正しさとは別の検証であり、
-    // タイムアウト発火前に孫プロセスの起動を確認できなかった場合は
-    // 「起動待ちタイムアウト」として区別できるよう別メッセージで報告する。
+    // （プロセスグループへの一括 `SIGKILL` 方式では、掃除の成否はもはや
+    // `ps` スナップショットのタイミングに依存しないが、そもそも孫プロセスが
+    // 起動する前に検証してしまうと「生存していない」ことが偽陽性になる
+    // ため、本ポーリングは引き続き必要）。ポーリングの成否は掃除の正しさ
+    // とは別の検証であり、タイムアウト発火前に孫プロセスの起動を確認
+    // できなかった場合は「起動待ちタイムアウト」として区別できるよう
+    // 別メッセージで報告する。
     let orphan_pid_path = case_dir.join("orphan.pid");
     let run_train_handle = {
         let launcher = launcher.clone();
@@ -673,41 +670,45 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・検証:
-/// supervisor 役（`exit_with_orphan`）が正常終了した後も、別セッションで
+/// issue #178 PR #233 レビュー再々指摘の再現・検証: supervisor 役
+/// （`exit_with_orphan`）が正常終了した後も、同じプロセスグループ内で
 /// 起動した孫プロセス（`_worker` 役）が標準出力の書き手を握り続けている
-/// ケースで、`run_train` が読み取り未完了（`StdoutIncomplete`）を検知した
-/// うえで、孫プロセスを確実に停止できることを確認する（supervisor が既に
-/// 終了しているため `ppid` チェーンでは辿れず、`kill_process_tree_best_effort`
-/// と同じ方法では孫を見つけられない。ポーリング中に記録した pid スナップ
-/// ショットを使う [`kill_pids_best_effort`] 経路の検証）。
+/// ケースで、`run_train` の完了検知（標準出力の EOF 待ち）が壁時計予算を
+/// 使い切って `WallTimeout` になり、かつプロセスグループへの一括
+/// `SIGKILL` で孫プロセスを確実に停止できることを確認する（REQ-39）。
+///
+/// 以前（`ps` によるプロセスツリー走査方式）は、supervisor が既に終了して
+/// いると `ppid` チェーンを辿れず、ポーリング中に記録した pid スナップ
+/// ショットへの fallback が必要だった。プロセスグループへの一括シグナルに
+/// 全面移行したことで、supervisor の生死やタイミングに関係なく孫プロセスへ
+/// 確実に届く（モジュール doc「プロセスグループによる一括終了」参照）。
 #[cfg(unix)]
 fn case_exit_with_orphan_kills_orphan(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "exit_with_orphan");
-    let request = make_request(Some(30));
-    let limits = RunLimits::for_request(&request);
+    let request = make_request(Some(1));
+    let limits = RunLimits::for_request(&request)
+        .with_wall_timeout(Duration::from_millis(500))
+        .expect("tighten wall timeout");
 
     let orphan_pid_path = case_dir.join("orphan.pid");
     let started = std::time::Instant::now();
     let err = match run_train(&launcher, &request, case_dir, &limits) {
         Err(e) => e,
         Ok(_) => {
-            return Err(
-                "expected StdoutIncomplete error (orphan holds stdout pipe open)".to_string(),
-            );
+            return Err("expected WallTimeout error (orphan holds stdout pipe open)".to_string());
         }
     };
     expect_true(
         orphan_pid_path.exists(),
         "grandchild (orphan.pid) must have been spawned before supervisor exited",
     )?;
-    expect_eq(err.exit_code(), ExitCode::RuntimeError, "exit_code")?;
-    // supervisor 役は 600ms 後に正常終了するが、孫プロセスが標準出力を
-    // 握り続けるため `READER_DRAIN_TIMEOUT`（5秒）の読み取り未完了で
-    // `StdoutIncomplete` になるまで待つ。無期限のハングにはならないことを
-    // 安全マージン込みで確認する。
+    expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
+    // supervisor 役はほぼ即座に正常終了するが、孫プロセスが標準出力を
+    // 握り続けるため、`run_train` の標準出力読み取りは EOF に達せず、
+    // 壁時計予算（500ms）を使い切って `WallTimeout` になる。無期限の
+    // ハングにはならないことを安全マージン込みで確認する。
     expect_true(
-        started.elapsed() < Duration::from_secs(20),
+        started.elapsed() < Duration::from_secs(10),
         "must return well before an unbounded hang would",
     )?;
 

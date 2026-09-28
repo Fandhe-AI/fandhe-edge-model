@@ -50,12 +50,14 @@
 //! - CLI `train` 工程への配線・`trainer_dir` の発見（CLI 引数・設定からの
 //!   解決。TASK-33.x）
 //! - Rust 側での RSS 監視（学習ワーカー自身の `supervisor.py` が担う）。
-//!   外側の壁時計締め切り超過時のプロセスツリー単位の kill（`_worker` を
-//!   含む）は [`process::run_train`] が `/bin/ps`／`/bin/kill` を用いた
-//!   ベストエフォートで行う（issue #178 PR #233 レビュー codex/review P0。
-//!   [`process`] モジュール doc「孤児化の限界」参照。native `kill(2)` の
-//!   直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe` 新規導入のいずれも
-//!   ユーザー承認事項のため対象外）
+//!   外側の壁時計締め切り超過時のプロセスグループ単位の kill（`_worker` を
+//!   含む）は [`process::run_train`] が `process_group(0)` で確立した
+//!   プロセスグループへ `/bin/kill -KILL -- -<pgid>` を送ることで行う
+//!   （issue #178 PR #233 レビュー再々指摘。`ps` によるプロセスツリー走査
+//!   方式は全面撤去した。[`process`] モジュール doc「プロセスグループに
+//!   よる一括終了」参照。native `kill(2)` の直接呼び出し〔`libc`／
+//!   `unsafe`〕は依存追加・`unsafe` 新規導入のいずれもユーザー承認事項の
+//!   ため対象外）
 //! - 探索予算全体の積算・複数候補の比較・選定の記録（#84・TASK-18.1-2）
 //! - 「予算到達」を合格扱いしない判定（TASK-18.2）
 

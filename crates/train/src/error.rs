@@ -363,12 +363,15 @@ pub enum TrainProcessError {
     /// 子プロセスの終了待ち（`Child::try_wait`／`Child::wait`）に失敗した。
     ///
     /// `descendants_confirmed_clean` は、本エラーを返す前に実行した
-    /// [`crate::process::kill_process_tree_best_effort`]（supervisor を根と
-    /// するプロセスツリー掃除）が「子孫が残っていないことを確認できたか」を
-    /// 示す。`false` の場合、別セッションの `_worker` 等が生き残っている
-    /// 可能性がある（codex/review 指摘 P0「プロセスツリーの掃除に失敗しても
-    /// 子孫が動き続ける」。issue #178 PR #233 レビュー。呼び出し元へ確実に
-    /// 伝えるためフィールド化した。REQ-39「資源の上限」）。
+    /// [`crate::process::kill_process_group_best_effort`]（supervisor が
+    /// 属するプロセスグループへの一括 `SIGKILL`）が「掃除を試みて問題
+    /// なかったか」（`/bin/kill -KILL -- -<pgid>` の終了コードが 0〔送出
+    /// 成功〕・1〔多くの実装で ESRCH＝対象が既に存在しない、を含む一般
+    /// エラー〕のいずれか）を示す。`false` の場合、`_worker` 等が生き残って
+    /// いる可能性がある（issue #178 PR #233 レビュー再々指摘「ps 由来の
+    /// スナップショット方式そのものの欠陥」への対応でプロセスグループ
+    /// 一括終了へ全面移行した。呼び出し元へ確実に伝えるためフィールド化
+    /// した。REQ-39「資源の上限」）。
     Wait {
         kind: std::io::ErrorKind,
         descendants_confirmed_clean: bool,

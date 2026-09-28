@@ -74,12 +74,16 @@ pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 
 /// Rust 側の壁時計締め切りに足す猶予（秒）。REQ-34・REQ-39（#178）。
 ///
-/// `supervisor.py`（唯一の内側監視者）は `_worker` を別セッション
-/// （`start_new_session=True`）で起動するため、Rust 側が supervisor
-/// プロセスだけを kill しても、別セッションの `_worker` には SIGKILL が
-/// 届かない。そのため Rust 側の外側締め切りは、supervisor 自身が
-/// `time_limit_seconds` 超過を検出してから後始末を終えるまでの時間を
-/// 確実に上回る必要がある（さもないと `_worker` が孤児として残る）。
+/// `supervisor.py`（内側監視者）は `_worker` を自身と同じプロセスグループに
+/// 留めて起動する（`start_new_session` を使わない。issue #178 PR #233
+/// レビュー再々指摘。`crates/train/src/process.rs` モジュール doc
+/// 「プロセスグループによる一括終了」参照）ため、`_worker` の孫プロセスに
+/// 至るまでの確実な掃除は Rust 側 `run_train` のプロセスグループ一括
+/// `SIGKILL` が担う。Rust 側の外側締め切りは、supervisor 自身が
+/// `time_limit_seconds` 超過を検出してから、内側の後始末（`_worker` の
+/// kill・`ps` 呼び出し・reader スレッドの回収等）を終えるまでの時間を
+/// 確実に上回る必要がある（さもないと、まだ後始末中の supervisor を
+/// Rust 側が早期に打ち切ってしまう）。
 ///
 /// 内訳（`supervisor.py` の定数から算出。根拠を明示し、緩めずに保つ）:
 /// 内側の猶予 `_TIME_LIMIT_GRACE_SECONDS`（5 秒）＋ `ps` 呼び出しの
