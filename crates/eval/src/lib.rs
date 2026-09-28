@@ -19,9 +19,11 @@
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - 分母 0 の指標の JSON `null` 表示・平均から除いたラベルの列挙
-//!   （`excluded_labels`）: 未実装（TASK-24.2・issue #61）。本 crate は
-//!   `Option<f64>` として `None` を返すところまでを担う
+//! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
+//!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
+//!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
+//!   写す直列化は本 crate の責務ではなく、CLI の `evaluate` 工程
+//!   （TASK-33.1）が担う
 //! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 未実装
 //!   （TASK-24.3・issue #62）。[`metrics::Outcome`] を enum にしてあるのは
 //!   この後続実装が予測の種類を判定しやすくするため
