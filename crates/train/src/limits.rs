@@ -57,3 +57,33 @@ pub const ALLOWED_DEVICES: [&str; 2] = ["cpu", "gpu"];
 /// （REQ-39「完全性と版」・P1。codex review PR #220）。値を追加する場合は
 /// `artifact.py::SELECTOR_VERSION` の版付け方針と合わせて見直す。
 pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
+
+/// 学習ワーカーの標準エラー出力（stderr）の保持上限（バイト）。REQ-39
+/// 「資源の上限」（#178）。`_worker` は supervisor の stderr を継承する
+/// （`supervisor.py::_spawn_worker_and_finalize`）ため、Rust 側 stderr
+/// パイプの書き手は supervisor 自身と `_worker` の両方になりうる。stdout
+/// （[`MAX_RESULT_BYTES`]。契約上の結果 JSON）とは別に、診断用途の stderr
+/// にも無制限の保持を許さないための独立した上限を設ける。先頭から保持し、
+/// 超過分は読み捨てる（`crates/train/src/process.rs`）。
+pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
+
+/// Rust 側の壁時計締め切りに足す猶予（秒）。REQ-34・REQ-39（#178）。
+///
+/// `supervisor.py`（唯一の内側監視者）は `_worker` を別セッション
+/// （`start_new_session=True`）で起動するため、Rust 側が supervisor
+/// プロセスだけを kill しても、別セッションの `_worker` には SIGKILL が
+/// 届かない。そのため Rust 側の外側締め切りは、supervisor 自身が
+/// `time_limit_seconds` 超過を検出してから後始末を終えるまでの時間を
+/// 確実に上回る必要がある（さもないと `_worker` が孤児として残る）。
+///
+/// 内訳（`supervisor.py` の定数から算出。根拠を明示し、緩めずに保つ）:
+/// 内側の猶予 `_TIME_LIMIT_GRACE_SECONDS`（5 秒）＋ `ps` 呼び出しの
+/// タイムアウト（5 秒）＋ kill 後の `proc.wait()` 上限（10 秒）＋ reader
+/// スレッドの join 上限（10 秒＋5 秒）＝ 35 秒に、Python プロセス起動・
+/// OS のプロセス後始末のための余裕を加えて 60 秒とする。
+///
+/// この結果、既定値（`time_limit_seconds` = [`MAX_TRAIN_WALL_SECONDS`] =
+/// 3600 秒）では Rust 側の外側締め切りは 3660 秒となり、字義どおりの
+/// 「3600 秒を超えない」からは猶予分だけ外れる（issue #178 実装計画・
+/// オーナー確認事項 1。孤児プロセスを残さないことを優先する設計判断）。
+pub const SUPERVISOR_SHUTDOWN_GRACE_SECONDS: u32 = 60;

@@ -1,5 +1,6 @@
-//! 学習リクエスト JSON（Rust 側 CLI が学習ワーカーへ渡す入力。#178 で子プロセス
-//! へ配線予定）の検証済み型（REQ-18・REQ-19・REQ-39）。
+//! 学習リクエスト JSON（Rust 側 CLI が学習ワーカーへ渡す入力。子プロセスへの
+//! 配線は `crate::process::run_train`〔issue #178〕）の検証済み型
+//! （REQ-18・REQ-19・REQ-39）。
 //!
 //! スキーマは `trainer/src/fandhe_edge_trainer/contract.py`（schema_version 1）
 //! と同じ 13 項目を持つ。値の検証は同モジュール・`limits.py`・`guard.py` の

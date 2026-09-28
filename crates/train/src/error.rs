@@ -332,3 +332,137 @@ impl TrainResultError {
         ExitCode::RuntimeError
     }
 }
+
+/// 学習ワーカーの子プロセス起動・監視・終了コード写像（REQ-21・REQ-34・
+/// REQ-39・#178）で発生するエラー。[`crate::process::run_train`] が返す。
+///
+/// 呼び出し元・呼び出し先の文脈: Rust 側 CLI／ジョブ管理（未配線。TASK-33.x）
+/// が学習ワーカー（`trainer/launch.py`）を子プロセスとして起動する経路の
+/// エラーを表す。外部入力（子プロセスの終了コード・標準出力・OS のエラー）
+/// の経路のため `panic`・`unwrap` はせず、すべて `Result` で返す
+/// （`.claude/rules/coding-rust.md`）。
+///
+/// `Display` は英語で、フィールド名・数値・`io::ErrorKind` のみを含める。
+/// ワーカーの標準出力・標準エラー出力の中身、リクエスト・ジョブディレクト
+/// リのパス文字列は含めない（`.claude/rules/security.md`「秘密情報の混入
+/// 防止」。学習・評価データ本文が含まれうる値をエラー経由で漏らさない）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TrainProcessError {
+    /// [`crate::process::WorkerLauncher::new`]／`from_trainer_dir` の検証
+    /// 失敗（相対パス・`launch.py` 以外のファイル名・存在しない・通常
+    /// ファイルでない等）。
+    InvalidLauncher { field: &'static str },
+    /// 呼び出し元が渡した `job_dir` が絶対パスのディレクトリでない。
+    InvalidJobDir,
+    /// `job_dir/request.json` の作成・書き込みに失敗した（既存ファイルの
+    /// 上書き拒否〔`AlreadyExists`〕を含む）。
+    RequestWrite { kind: std::io::ErrorKind },
+    /// 子プロセスの起動（`Command::spawn`）に失敗した。
+    Spawn { kind: std::io::ErrorKind },
+    /// 子プロセスの終了待ち（`Child::try_wait`／`Child::wait`）に失敗した。
+    Wait { kind: std::io::ErrorKind },
+    /// 外側の壁時計締め切り（[`crate::process::RunLimits`]）を超過したため
+    /// 子プロセスを強制終了した（REQ-39「資源の上限」）。
+    WallTimeout { limit_ms: u64 },
+    /// 子プロセスがシグナルで終了し、終了コードを取得できなかった
+    /// （unix。`ExitStatus::code()` が `None` を返す場合）。
+    TerminatedBySignal,
+    /// 子プロセスの終了コードが REQ-21 の 7 種のいずれにも一致しない。
+    UnknownExitCode(i32),
+    /// 子プロセスの終了後、期限内に標準出力の読み取りが完了しなかった
+    /// （孤児プロセスがパイプを閉じずに残っている等。REQ-39）。
+    StdoutIncomplete,
+    /// 標準出力の内容が [`crate::result::TrainOutcome::from_worker_stdout`]
+    /// の検証を通らなかった（壊れたワーカー出力。fail-closed）。
+    Result(TrainResultError),
+    /// 子プロセスの実終了コードと、標準出力の JSON が示す結果
+    /// （[`crate::result::TrainOutcome::exit_code`]）が一致しない
+    /// （REQ-39「完全性と版」・fail-closed）。
+    ExitCodeMismatch {
+        process: ExitCode,
+        expected: ExitCode,
+    },
+}
+
+impl std::fmt::Display for TrainProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrainProcessError::InvalidLauncher { field } => {
+                write!(f, "invalid worker launcher field: {field}")
+            }
+            TrainProcessError::InvalidJobDir => {
+                write!(f, "job_dir must be an existing absolute directory")
+            }
+            TrainProcessError::RequestWrite { kind } => {
+                write!(f, "failed to write request file: {kind:?}")
+            }
+            TrainProcessError::Spawn { kind } => {
+                write!(f, "failed to spawn worker process: {kind:?}")
+            }
+            TrainProcessError::Wait { kind } => {
+                write!(f, "failed to wait for worker process: {kind:?}")
+            }
+            TrainProcessError::WallTimeout { limit_ms } => {
+                write!(f, "worker process exceeded wall timeout of {limit_ms} ms")
+            }
+            TrainProcessError::TerminatedBySignal => {
+                write!(f, "worker process was terminated by a signal")
+            }
+            TrainProcessError::UnknownExitCode(code) => {
+                write!(f, "worker process exited with unknown exit code {code}")
+            }
+            TrainProcessError::StdoutIncomplete => {
+                write!(f, "worker process stdout was not fully read in time")
+            }
+            TrainProcessError::Result(inner) => {
+                write!(f, "worker result is invalid: {inner}")
+            }
+            TrainProcessError::ExitCodeMismatch { process, expected } => {
+                write!(
+                    f,
+                    "worker process exit code {process:?} does not match result-derived exit code {expected:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TrainProcessError {}
+
+impl From<TrainResultError> for TrainProcessError {
+    fn from(value: TrainResultError) -> Self {
+        TrainProcessError::Result(value)
+    }
+}
+
+impl TrainProcessError {
+    /// REQ-21 の終了コードへの対応づけ。子プロセスの実終了コードを尊重する
+    /// のは [`TrainProcessError::ExitCodeMismatch`] 以外に存在しない
+    /// （`run_train` が実際の子プロセス終了コードと結果 JSON の一致を
+    /// 検証済みの場合のみ `Ok(TrainRun)` を返すため）。
+    #[must_use]
+    pub const fn exit_code(&self) -> ExitCode {
+        match self {
+            TrainProcessError::InvalidLauncher { .. } | TrainProcessError::InvalidJobDir => {
+                ExitCode::InvalidInput
+            }
+            TrainProcessError::RequestWrite { .. }
+            | TrainProcessError::Spawn { .. }
+            | TrainProcessError::Wait { .. }
+            | TrainProcessError::TerminatedBySignal
+            | TrainProcessError::UnknownExitCode(_)
+            | TrainProcessError::StdoutIncomplete
+            | TrainProcessError::ExitCodeMismatch { .. } => ExitCode::RuntimeError,
+            TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
+            TrainProcessError::Result(inner) => inner.exit_code(),
+        }
+    }
+
+    /// 学習ワーカーと同じ語彙の機械可読コード（[`ExitCode::name`] と同じ
+    /// 語彙）。
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        self.exit_code().name()
+    }
+}

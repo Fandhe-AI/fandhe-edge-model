@@ -2,8 +2,9 @@
 //!
 //! `trainer/src/fandhe_edge_trainer/cli.py::main`・`supervisor.py` が
 //! `print(json.dumps(...))` で出す JSON 1 行を、信頼しない外部入力として
-//! 解析する（学習ワーカーは Rust 側から見て子プロセス。#178 で子プロセス
-//! 起動へ配線予定）。成功時は `artifact.py::build_artifact` と同じ 11 項目の
+//! 解析する（学習ワーカーは Rust 側から見て子プロセス。起動そのものは
+//! `crate::process::run_train`〔issue #178〕が担う）。成功時は
+//! `artifact.py::build_artifact` と同じ 11 項目の
 //! 成果物記録、失敗時は `{"status":"error","code":...,"message":...}` を扱う。
 //!
 //! **ガード層（REQ-39「経路の閉じ込め」「完全性と版」）との関係**: 唯一の
@@ -25,6 +26,7 @@
 //! doc と同じ設計。詳細は [`expected_artifact_dir`]・
 //! [`canonicalize_root_best_effort`] 参照）。
 
+use fandhe_edge_core::exitcode::ExitCode;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::TrainResultError;
@@ -257,6 +259,30 @@ impl FailureCode {
             FailureCode::RuntimeError,
         ]
     }
+
+    /// 対応する終了コード（REQ-21）。`trainer/src/fandhe_edge_trainer/`
+    /// 配下の `WorkerError(code, ..., ExitCode.<NAME>)` 呼び出しを全数走査
+    /// して洗い出した対応表（issue #178 実装計画）。学習ワーカーが同じ
+    /// `code` に対して複数の終了コードを返すことはない（this の全 12
+    /// 種は 1 対 1）。この一致は
+    /// `crates/train/tests/failure_code_matches_trainer.rs` で Python 側の
+    /// `ExitCode.<NAME>` と機械照合する。
+    #[must_use]
+    pub const fn exit_code(self) -> ExitCode {
+        match self {
+            FailureCode::InvalidRequest
+            | FailureCode::InvalidData
+            | FailureCode::InvalidPath
+            | FailureCode::SymlinkNotAllowed
+            | FailureCode::OutputConflict
+            | FailureCode::UnsupportedKind
+            | FailureCode::UnsupportedKindVersion
+            | FailureCode::InvalidConfig => ExitCode::InvalidInput,
+            FailureCode::LimitExceeded => ExitCode::LimitExceeded,
+            FailureCode::TrainingDiverged => ExitCode::Pending,
+            FailureCode::IntegrityCheckFailed | FailureCode::RuntimeError => ExitCode::RuntimeError,
+        }
+    }
 }
 
 impl Serialize for FailureCode {
@@ -289,6 +315,14 @@ impl WorkerFailure {
 
     pub fn code(&self) -> &str {
         self.code.as_str()
+    }
+
+    /// 型付きの失敗コード（REQ-21・REQ-39・#178。`crates/train/src/process.rs`
+    /// が終了コード写像の突き合わせ〔ワーカーの終了コードと JSON の `code`
+    /// が対応する終了コードで一致するか〕に使う）。
+    #[must_use]
+    pub fn failure_code(&self) -> FailureCode {
+        self.code
     }
 
     pub fn message(&self) -> &str {
@@ -507,7 +541,8 @@ impl TrainOutcome {
     /// 種類・未対応の版・root 外のパス・別種類を名乗る成果物を返しても
     /// 成功扱いにしない）。いずれかを満たさない場合は `TrainResultError`
     /// （呼び出し元は `reason_code()=="runtime_error"`・
-    /// `exit_code()==RuntimeError` として扱う。#178 の対象）。
+    /// `exit_code()==RuntimeError` として扱う。`crate::process::run_train`
+    /// 〔issue #178〕がこの経路を子プロセスの実終了コードと突き合わせる）。
     ///
     /// `request` はこの標準出力を生成した学習ワーカーへ実際に渡したリクエスト
     /// でなければならない（呼び出し元の責務。本関数は同一性を検証しない）。
@@ -680,6 +715,19 @@ impl TrainOutcome {
                 Ok(TrainOutcome::Error(WorkerFailure::parse(code, message)?))
             }
             _ => Err(TrainResultError::MalformedOutcome),
+        }
+    }
+
+    /// この結果に対応する終了コード（REQ-21）。`Ok` は `ExitCode::Ok`
+    /// （プロセスの終了コード 0）、`Error` はワーカーの `code` に対応する
+    /// 終了コード（[`FailureCode::exit_code`]）。`crates/train/src/process.rs`
+    /// が、ワーカーの実プロセス終了コードとこの値の一致を検証する
+    /// （REQ-39「完全性と版」・#178）。
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            TrainOutcome::Ok(_) => ExitCode::Ok,
+            TrainOutcome::Error(failure) => failure.failure_code().exit_code(),
         }
     }
 }
