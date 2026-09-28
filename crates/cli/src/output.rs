@@ -27,6 +27,26 @@ use std::io::{self, Write};
 /// 合）は `out` へ何も書かずに `io::Error` を返す（stdout に不完全な JSON
 /// を残さない。REQ-21「出力は 1 呼び出しにつき JSON 1 つ」）。
 ///
+/// # 部分書き込み失敗時の方針（PR #202 レビュー指摘・P1）
+///
+/// `Write::write_all` は `out` の実装によっては、行の一部を書き込んだ後に
+/// エラーを返すことがある（例: パイプの相手側が先に閉じた stdout）。この
+/// 場合、`out` の内部状態には不完全な JSON バイト列が残り得るが、それを
+/// 本関数が検知・巻き戻す手段は `Write` トレイトの外側から存在しない
+/// （`out` は任意の書き込み先を表す汎用型で、シーク・トランザクション等
+/// の取り消し操作を持たない）。本関数が保証するのは次の 1 点のみである:
+/// **1 回の呼び出しにつき `write_all` を高々 1 回しか実行しない**（リト
+/// ライや、エラー後に別の内容を重ねて書くことをしない）。これにより
+/// 「不完全な JSON の後ろに別の JSON が連結される」事態を本関数の中では
+/// 起こさない。
+///
+/// 呼び出し側（CLI の `infer` 一括推論。TASK-33.1。現状は未配線）は、本
+/// 関数が `Err` を返した時点で **その入力ファイルに対する後続の呼び出し
+/// を打ち切り**、以降の入力に対して本関数を呼ばないこと。打ち切らずに
+/// 次の入力へ処理を進めると、直前の不完全な行の直後に次の JSON 行が書か
+/// れてしまい、「1 行 1 JSON」という出力契約を読み手側が復元できなくなる
+/// （壊れた行と正常な行の境界が改行だけでは判別できないため）。
+///
 /// # Errors
 /// 直列化エラー、または `out` への書き込み・flush の失敗を
 /// `io::Error`（`ErrorKind::Other` または下位の I/O エラー）として返す。
@@ -146,5 +166,68 @@ mod tests {
         let mut writer = FailingWriter;
         let outcome = write_ok_judgment(&mut writer, &result);
         assert!(outcome.is_err());
+    }
+
+    /// 部分書き込み後に失敗する `Write` を渡した場合でも、`out` には途中
+    /// までの不完全なバイト列以上のものが書かれず（リトライ・上書きをし
+    /// ない）、`flush` が呼ばれないこと（PR #202 レビュー指摘・P1: 部分
+    /// 書き込み失敗の経路を確認できていなかった）。
+    ///
+    /// `write_all` は内部で複数回 `write` を呼びうるため、このテストは
+    /// 「最初の `write` 呼び出しで成功して一部バイトを書き、2 回目の
+    /// `write` 呼び出しで失敗する」という部分書き込みの経路を模擬する。
+    #[test]
+    fn req21_stops_after_partial_write_failure_without_flush() {
+        struct PartialThenFailingWriter {
+            written: Vec<u8>,
+            write_calls: usize,
+            flush_calls: usize,
+        }
+        impl Write for PartialThenFailingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.write_calls += 1;
+                if self.write_calls == 1 {
+                    // 最初の呼び出しは先頭 4 バイトだけを書いたことにして
+                    // 成功させる（部分書き込み）。
+                    let n = buf.len().min(4);
+                    self.written.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                } else {
+                    Err(io::Error::other("simulated partial write failure"))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flush_calls += 1;
+                Ok(())
+            }
+        }
+
+        let options = [choice("a")];
+        let result = JudgmentResult::new(&options, "row-4", "a", &[1.0]).unwrap();
+
+        let mut writer = PartialThenFailingWriter {
+            written: Vec::new(),
+            write_calls: 0,
+            flush_calls: 0,
+        };
+        let outcome = write_ok_judgment(&mut writer, &result);
+
+        assert!(
+            outcome.is_err(),
+            "partial write followed by failure must surface as Err"
+        );
+        assert_eq!(
+            writer.write_calls, 2,
+            "write_all の内部リトライ以外に本関数が追加で write を呼んではならない"
+        );
+        assert_eq!(
+            writer.flush_calls, 0,
+            "書き込みに失敗した場合は flush を呼んではならない（不完全な行を確定させない）"
+        );
+        assert_eq!(
+            writer.written.len(),
+            4,
+            "out 側に残るのは write_all が内部で書いた分のみで、本関数がそれ以上書き足してはならない"
+        );
     }
 }
