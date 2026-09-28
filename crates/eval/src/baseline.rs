@@ -103,7 +103,12 @@ impl std::error::Error for BaselineError {}
 /// `DuplicateLabel`・`TooManyLabels`）と同じ規則を、本モジュール内で小さく
 /// 再実装したもの（`metrics.rs` は並行 PR〔TASK-24.3・issue #62〕が変更中
 /// のため、共通化はここでは行わない。後続の refactor 候補）。
-fn validate_label_order<'a>(
+///
+/// `pub(crate)`: [`crate::significance`] の `correctness`・
+/// `compare_with_baseline` も本関数でラベル集合を検証し、[`fit_majority`]
+/// と同じ検証規則（空・空 ID・重複・上限超過）に揃える（Review 指摘。
+/// TASK-25.1-2・issue #65）。
+pub(crate) fn validate_label_order<'a>(
     label_order: &[&'a str],
 ) -> Result<BTreeMap<&'a str, usize>, EvalError> {
     if label_order.is_empty() {

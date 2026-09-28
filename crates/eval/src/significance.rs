@@ -13,7 +13,7 @@
 //!   は `#[non_exhaustive]` にしてあり、後から `Undecidable` を追加できる
 //! - CLI の JSON 出力・終了コードへの写像は行わない（TASK-33.x / TASK-18.3）
 
-use crate::baseline::BaselineError;
+use crate::baseline::{self, BaselineError};
 use crate::mcnemar::{self, McNemarExact, PValue, PairedCounts};
 use crate::metrics::{EvalRecord, Outcome};
 
@@ -45,11 +45,21 @@ pub enum BaselineVerdict {
 /// （PoC-10 `stats_mcnemar.py` の「有意に上回る」の定義から Holm 補正を
 /// 除いたもの）。
 ///
-/// 比較は厳密な `<` とし、許容差は付けない。正確検定の p は `k / 2^n`
-/// の形の二進有理数であり、`0.05`（= 1/20。分母に 5 を含む）とちょうど
-/// 一致することは原理上ない（分母が 2 のべき乗と 5 のべき乗の両方を含む
-/// 有理数になり得ないため）。したがって `<` の境界値問題（浮動小数の
-/// ほぼ等しい値の扱い）は実質的に生じない。
+/// 比較は厳密な `<` とし、許容差は付けない。評価契約（REQ-24）が
+/// 「p < 0.05」を境界として定めており、判定を緩めない設計判断として
+/// 許容差を持ち込まないのが正しい（`.claude/rules/evaluation-contract.md`
+/// 「有意性・指標」）。
+///
+/// 数学的には正確検定の p 値は `k / 2^n` の形の二進有理数で、`0.05`
+/// （= 1/20。分母に素因数 5 を含む）とちょうど一致することは原理上ない。
+/// ただし [`mcnemar::two_sided_p_value`] の実装は `ln`/`exp`（f64 の
+/// libm）による近似計算であり、返る値はその厳密な有理数そのものではなく
+/// 浮動小数近似値である（Review 指摘。TASK-25.1-2・issue #65。以前の
+/// 記述は実装と不整合だった）。したがって上記の数学的事実だけを根拠に
+/// 「境界値問題が実質的に生じない」とは言えない。実際に `0.05` へ
+/// 極めて近づく `(b, c)` では近似誤差により判定が理論値と入れ替わる
+/// 余地があるが、`<` を許容差なしで使うという設計判断自体は変えない
+/// （評価契約の変更にあたり、緩和には main の設計判断とユーザー承認を要する）。
 pub fn judge(b: u64, c: u64, p: PValue) -> BaselineVerdict {
     if b > c && p.value() < SIGNIFICANCE_ALPHA {
         BaselineVerdict::SignificantlyBetter
@@ -69,6 +79,12 @@ fn is_correct(gold: &str, outcome: &Outcome) -> bool {
 
 /// 評価レコード列から、行ごとの正誤（`Outcome` が `gold` と一致するか）を求める。
 ///
+/// - `labels` 自体の検証（空・空 ID・重複・`MAX_LABELS` 超過）は
+///   [`baseline::validate_label_order`] に委ね、[`fit_majority`]（下限基準の
+///   予測生成）と同じ規則に揃える（Review 指摘。TASK-25.1-2・issue #65。
+///   以前は `labels.contains(&record.gold)` の素通し判定のみで、`labels`
+///   が空の場合に本来の [`crate::metrics::EvalError::EmptyLabels`] ではなく
+///   `UnknownGoldLabel { index: 0 }` を返し、重複ラベルも検出できなかった）
 /// - gold がラベル集合に存在しない場合は [`BaselineError::UnknownGoldLabel`]
 ///   を返す（`evaluate_single_select` と同じ fail-closed。PoC-10 の
 ///   `stats_mcnemar.py` のように黙って除外しない。正解側の欠陥はデータ契約層
@@ -77,17 +93,21 @@ fn is_correct(gold: &str, outcome: &Outcome) -> bool {
 ///   装わない。件数不足の判定不能は TASK-25.2 の担当）
 ///
 /// 入力は `&` 参照でのみ受け取り、書き換えない（REQ-27）。
+///
+/// [`fit_majority`]: crate::baseline::fit_majority
 pub fn correctness(
     labels: &[&str],
     records: &[EvalRecord<'_>],
 ) -> Result<Vec<bool>, BaselineError> {
+    let index = baseline::validate_label_order(labels)?;
+
     if records.is_empty() {
         return Err(BaselineError::EmptyRecords);
     }
 
     let mut result = Vec::with_capacity(records.len());
     for (i, record) in records.iter().enumerate() {
-        if !labels.contains(&record.gold) {
+        if !index.contains_key(record.gold) {
             return Err(BaselineError::UnknownGoldLabel { index: i });
         }
         result.push(is_correct(record.gold, record.outcome));
@@ -159,13 +179,21 @@ impl BaselineComparison {
 /// と同じ規則）→ [`mcnemar::paired_counts`] → [`mcnemar::mcnemar_exact_two_sided`]
 /// → [`judge`]。
 ///
+/// `labels` 自体の検証（空・空 ID・重複・`MAX_LABELS` 超過）は
+/// [`baseline::validate_label_order`] に委ね、[`correctness`]・
+/// [`fit_majority`] と同じ規則に揃える（Review 指摘。TASK-25.1-2・issue #65）。
+///
 /// gold がラベル集合に無い場合は [`BaselineError::UnknownGoldLabel`]、
 /// `records` が空の場合は [`BaselineError::EmptyRecords`] を返す
 /// （[`correctness`] と同じ規則）。
+///
+/// [`fit_majority`]: crate::baseline::fit_majority
 pub fn compare_with_baseline(
     labels: &[&str],
     records: &[PairedRecord<'_>],
 ) -> Result<BaselineComparison, BaselineError> {
+    let index = baseline::validate_label_order(labels)?;
+
     if records.is_empty() {
         return Err(BaselineError::EmptyRecords);
     }
@@ -173,7 +201,7 @@ pub fn compare_with_baseline(
     let mut candidate_correct = Vec::with_capacity(records.len());
     let mut baseline_correct = Vec::with_capacity(records.len());
     for (i, record) in records.iter().enumerate() {
-        if !labels.contains(&record.gold) {
+        if !index.contains_key(record.gold) {
             return Err(BaselineError::UnknownGoldLabel { index: i });
         }
         candidate_correct.push(is_correct(record.gold, record.candidate));
@@ -411,5 +439,63 @@ mod tests {
             .map(|r| (r.gold, r.candidate.clone(), r.baseline.clone()))
             .collect();
         assert_eq!(before, after);
+    }
+
+    /// Review 指摘（issue #65）: `correctness` は `labels` が空の場合
+    /// [`fit_majority`] と同じ [`crate::metrics::EvalError::EmptyLabels`]
+    /// を返す（以前は `UnknownGoldLabel { index: 0 }` になっていた）。
+    ///
+    /// [`fit_majority`]: crate::baseline::fit_majority
+    #[test]
+    fn correctness_empty_labels_is_eval_error() {
+        let labels: [&str; 0] = [];
+        let outcome = Outcome::Label("A".to_string());
+        let records = [EvalRecord {
+            gold: "A",
+            outcome: &outcome,
+        }];
+        let err = correctness(&labels, &records).unwrap_err();
+        assert_eq!(
+            err,
+            BaselineError::Eval(crate::metrics::EvalError::EmptyLabels)
+        );
+    }
+
+    /// Review 指摘（issue #65）: `correctness` は重複ラベルを検出する
+    /// （以前は `labels.contains` の素通し判定のみで重複を検出できなかった）。
+    #[test]
+    fn correctness_duplicate_labels_is_eval_error() {
+        let labels = ["A", "A"];
+        let outcome = Outcome::Label("A".to_string());
+        let records = [EvalRecord {
+            gold: "A",
+            outcome: &outcome,
+        }];
+        let err = correctness(&labels, &records).unwrap_err();
+        assert_eq!(
+            err,
+            BaselineError::Eval(crate::metrics::EvalError::DuplicateLabel {
+                label: "A".to_string()
+            })
+        );
+    }
+
+    /// Review 指摘（issue #65）: `compare_with_baseline` も `labels` が
+    /// 空の場合 `EmptyLabels` を返す（`correctness` と同じ規則）。
+    #[test]
+    fn compare_with_baseline_empty_labels_is_eval_error() {
+        let labels: [&str; 0] = [];
+        let cand = Outcome::Label("A".to_string());
+        let base = Outcome::Label("A".to_string());
+        let records = [PairedRecord {
+            gold: "A",
+            candidate: &cand,
+            baseline: &base,
+        }];
+        let err = compare_with_baseline(&labels, &records).unwrap_err();
+        assert_eq!(
+            err,
+            BaselineError::Eval(crate::metrics::EvalError::EmptyLabels)
+        );
     }
 }
