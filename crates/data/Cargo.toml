@@ -13,6 +13,10 @@ description = "Data contract layer (record inspection, group-wise split and free
 # doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う
 # （`split` は追加の外部依存を必要としない）。
 serde_json.workspace = true
+# unicode-normalization は 2026-09-28 オーナー承認済み（承認記録は PR #224。
+# ルート Cargo.toml の [workspace.dependencies] コメント参照）。矛盾検出
+# （src/normalize.rs）の既定正規化で NFKC を行うために使う。
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true
