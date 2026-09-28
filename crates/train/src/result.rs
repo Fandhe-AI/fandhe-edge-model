@@ -12,10 +12,11 @@
 //! がその `root`／`out_dir` 配下に閉じ込められていること、`kind`・
 //! `kind_version`・`config`・`label_order`・`max_bytes` が依頼内容と一致する
 //! ことを検査する（ワーカーが依頼と異なる種類・未対応の版・root 外のパスを
-//! 返しても成功扱いにしない）。ここでの照合は文字列レベルの検査に留まり、
-//! 実際の FS 上の閉じ込め（symlink 対策等）は学習ワーカー自身
-//! （`guard.py::confine`）が多層防御として担う（`crates/train/src/
-//! request.rs` のモジュール doc と同じ設計）。
+//! 返しても成功扱いにしない）。`root` の symlink 解決（`std::fs::canonicalize`）
+//! を挟む点を除き照合は文字列レベルの検査に留まり、実際の FS 上の閉じ込め
+//! （dir_fd 等の多層防御）は学習ワーカー自身（`guard.py::confine`）が担う
+//! （`crates/train/src/request.rs` のモジュール doc と同じ設計。詳細は
+//! [`expected_artifact_dir`]・[`canonicalize_root_best_effort`] 参照）。
 
 use serde::{Deserialize, Serialize};
 
@@ -223,7 +224,13 @@ struct RawArtifact {
     kind: String,
     kind_version: u32,
     selector_version: String,
-    #[serde(default)]
+    // `#[serde(default)]` を付けない: 11 項目の成果物契約（REQ-21）で
+    // `config` は必須フィールド。ワーカー出力に `config` が欠落した場合、
+    // 空オブジェクトへ暗黙補完すると契約を満たさない出力を成功として
+    // 受理してしまう（REQ-39「完全性と版」・P1。codex review PR #220）。
+    // 欠落時は `serde_json::from_str` がここでエラーになり、呼び出し元は
+    // `TrainResultError::NotJson` として拒否する（`kind`・`label_order` 等
+    // 他の必須フィールドと同じ扱い）。
     config: serde_json::Map<String, serde_json::Value>,
     label_order: Vec<String>,
     output_type: OutputType,
@@ -269,6 +276,11 @@ fn is_syntactically_valid_created_utc(value: &str) -> bool {
 /// 含む正当な絶対パスの場合、正規化しない文字列比較では正常な結果まで
 /// `runtime_error` にしてしまっていた（REQ-39・P1。codex review・cursor[bot]
 /// 重複指摘。PR #220）。
+///
+/// 本関数自体は `..`／`.`／連続スラッシュの除去のみを行い、symlink の解決は
+/// しない（ファイルシステムへ触れない純粋な文字列操作）。symlink を含む
+/// `root` の解決は [`expected_artifact_dir`] が `std::fs::canonicalize` で
+/// 別途行う（REQ-39・P1。codex 指摘 PR #220）。
 fn normalize_absolute_path(path: &str) -> String {
     let mut components: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -289,14 +301,17 @@ fn normalize_absolute_path(path: &str) -> String {
 /// で正規化した絶対パス文字列を組み立てる。`cli.py::run_worker_train` が
 /// `artifact_dir` として出す `str(request.out_dir.display)`
 /// （`guard.confine` の `display = root_handle.root_real.joinpath(*rel.parts)`。
-/// `root_real` は `os.path.realpath(root)`）と、`..`／`.`／連続スラッシュを
-/// 含まない限り一致する（symlink 解決の差異は残る。本関数 doc 参照）。
+/// `root_real` は `os.path.realpath(root)`）と一致させるため、`root` 部分は
+/// [`canonicalize_root_best_effort`] で symlink 解決を試みる（`rel.parts`
+/// 側は `..` を含まない構文検査済みの構成要素のみなので、`out_dir` 自体を
+/// realpath する必要はない。`guard.py::confine` と同じ非対称性）。
 /// `root`／`out_dir` はいずれも [`TrainRequest`] が構文検査済み（空・NUL・
 /// 絶対/相対の取り違えを含まない）だが、`root` 自体には `..`・連続スラッシュ
 /// の禁止までは課していない（[`TrainRequest`] のモジュール doc「経路の閉じ
-/// 込めについて」参照）ため、ここで正規化する。
+/// 込めについて」参照）ため、結合後に [`normalize_absolute_path`] でも
+/// 正規化する。
 fn expected_artifact_dir(request: &TrainRequest) -> String {
-    let mut joined = String::from(request.root());
+    let mut joined = canonicalize_root_best_effort(request.root());
     for part in request.out_dir().split('/') {
         if part.is_empty() || part == "." {
             continue;
@@ -305,6 +320,29 @@ fn expected_artifact_dir(request: &TrainRequest) -> String {
         joined.push_str(part);
     }
     normalize_absolute_path(&joined)
+}
+
+/// `root` の symlink 解決を試みる（`guard.py::resolve_root` の
+/// `os.path.realpath(root)` に相当）。
+///
+/// `root` は学習リクエストの一部として呼び出し元（本 crate の利用者）が
+/// 用意した値であり、ワーカーが返す `artifact_dir`（信頼しない外部入力）
+/// とは異なる（ここで実ファイルシステムへ触れるのは呼び出し元が既に
+/// 把握しているパスのみで、信頼しない入力からの経路トラバーサルにはならない）。
+/// `root` が存在しない・権限がない等で `canonicalize` が失敗した場合は
+/// 元の文字列のまま返す（symlink を含まない `root` や、実在しない `root`
+/// を使うテスト・開発時のフィクスチャでは従来どおり文字列正規化のみで
+/// 比較する。フォールバックは検証を緩めない: 実在する `root` の symlink を
+/// 解決できない場合に限られ、その場合でも実際のワーカー出力との不一致は
+/// 通常どおり `runtime_error` として拒否される）。
+fn canonicalize_root_best_effort(root: &str) -> String {
+    match std::fs::canonicalize(root) {
+        Ok(resolved) => match resolved.into_os_string().into_string() {
+            Ok(s) => s,
+            Err(_) => root.to_string(),
+        },
+        Err(_) => root.to_string(),
+    }
 }
 
 impl TrainOutcome {
@@ -787,5 +825,58 @@ mod tests {
                 "case: {bad:?}"
             );
         }
+    }
+
+    /// REQ-39・P1（codex 指摘 PR #220）: `root` の途中に symlink を含む正当な
+    /// リクエストで、`root` を `os.path.realpath` した先を `artifact_dir` と
+    /// して返すワーカー出力を拒否しない（symlink 解決なしの文字列正規化だけ
+    /// では実在パスの相違により `runtime_error` を誤検出していた）。
+    /// 実ファイルシステム上に symlink を作るため Unix 専用（本 crate の
+    /// クロスプラットフォーム方針は `.claude/rules/coding-rust.md` 参照。
+    /// 検証環境は Mac のみで、Windows 対応は対象外）。
+    #[cfg(unix)]
+    #[test]
+    fn req39_accepts_artifact_dir_when_root_contains_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-symlink-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let real_root = base.join("real-root");
+        let link_root = base.join("link-root");
+        std::fs::create_dir_all(&real_root).expect("create real root");
+        symlink(&real_root, &link_root).expect("create symlink root");
+
+        let request = test_request_with_root(link_root.to_str().expect("utf-8 path"));
+        let real_artifact_dir = real_root.join("out");
+        let json = VALID_OK_JSON.replace(
+            "/fandhe-edge-fixture-root/out",
+            real_artifact_dir.to_str().expect("utf-8 path"),
+        );
+
+        let result = TrainOutcome::from_worker_stdout(json.as_bytes(), &request);
+        std::fs::remove_dir_all(&base).expect("cleanup temp dirs");
+
+        match result.expect("symlink-resolved root must match worker's realpath artifact_dir") {
+            TrainOutcome::Ok(success) => {
+                assert_eq!(
+                    success.artifact_dir(),
+                    real_artifact_dir.to_str().expect("utf-8 path")
+                );
+            }
+            TrainOutcome::Error(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// REQ-21・REQ-39・P1（codex 指摘 PR #220）: 成功結果で `config` が欠落
+    /// している場合、空オブジェクトへ補完せず拒否する（11 項目の成果物契約を
+    /// 満たさない出力を成功扱いにしない）。
+    #[test]
+    fn req39_rejects_success_outcome_missing_config() {
+        let json = VALID_OK_JSON.replace(r#""config":{},"#, "");
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        assert!(matches!(err, TrainResultError::NotJson { .. }));
     }
 }
