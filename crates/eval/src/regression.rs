@@ -8,9 +8,28 @@
 //!
 //! 移植元は PoC-19（`03-poc/model-lifecycle/scripts/exp_rebuild.py` の
 //! `paired_bootstrap_ci` 内の `b`/`c` 集計）。ただし PoC のペアブートストラップ
-//! CI は移植しない。信頼区間の付与は Wilson 95% CI を採用する別 issue
-//! （TASK-26.1-2・issue #101）が担う（`.claude/rules/evaluation-contract.md`
-//! 「有意性・指標」）。
+//! CI は移植しない。信頼区間の付与は Wilson 95% CI を採用する
+//! （`.claude/rules/evaluation-contract.md`「有意性・指標」・
+//! TASK-26.1-2・issue #101）。
+//!
+//! # 信頼区間（TASK-26.1-2・issue #101）
+//!
+//! [`RegressionCounts::correct_to_incorrect_ci95`]・
+//! [`RegressionCounts::incorrect_to_correct_ci95`] は、それぞれの遷移件数を
+//! 比較対象の総件数 `n` で割った率（`correct_to_incorrect / n`・
+//! `incorrect_to_correct / n`）に対する Wilson 95% 信頼区間を返す。
+//! 評価契約（`.claude/rules/evaluation-contract.md`「有意性・指標」）が
+//! 採用する Wilson を [`crate::wilson`]（TASK-24.1-2・issue #60）から
+//! そのまま再利用し、評価器を層内で再実装しない。
+//!
+//! PoC-19 の `paired_bootstrap_ci` が出していたのは、正解率の差
+//! （`acc_new - acc_old`）に対する**ペアブートストラップ**信頼区間であり、
+//! 本モジュールが返す「遷移率（正解→不正解・不正解→正解）の Wilson 区間」
+//! とは対象が異なる。ペアブートストラップは移植せず、評価契約の定める
+//! Wilson を採用する。
+//!
+//! z は常に [`crate::wilson::WILSON_Z_95`]（1.96）を使う。任意の z を
+//! 受け取る API は公開しない（評価契約は 95% と定めている）。
 //!
 //! # 方向の対応（取り違え防止）
 //!
@@ -28,7 +47,6 @@
 //!
 //! # 対象外（本 issue の範囲外）
 //!
-//! - Wilson 95% 信頼区間の付与（TASK-26.1-2・issue #101）
 //! - 旧・新でラベル集合が異なる場合（PoC-19 P3 の統合パターン）の前提明記
 //!   （TASK-26.2）。[`compare_with_previous`] は旧・新が同一のラベル集合を
 //!   持つ場合の API で、ラベル集合が異なる比較は [`regression_counts`]
@@ -49,6 +67,7 @@ use crate::baseline;
 use crate::mcnemar::{self, McNemarError};
 use crate::metrics::Outcome;
 use crate::significance::MAX_EVAL_RECORDS;
+use crate::wilson::{self, WilsonInterval};
 use std::fmt;
 
 /// [`regression_counts`]・[`compare_with_previous`] が返しうるエラー。
@@ -211,6 +230,28 @@ impl RegressionCounts {
     /// 新モデルの正解件数（`both_correct + incorrect_to_correct`）。
     pub fn current_correct(&self) -> u64 {
         self.both_correct + self.incorrect_to_correct
+    }
+
+    /// 正解→不正解（回帰）の率 `correct_to_incorrect / n` の Wilson 95%
+    /// 信頼区間（REQ-26・TASK-26.1-2・issue #101）。
+    ///
+    /// `n`（[`RegressionCounts::n`]）は [`EmptyRecords`](RegressionError::EmptyRecords)
+    /// の検査で必ず 0 より大きく、`correct_to_incorrect` は
+    /// [`mcnemar::paired_counts`] の集計から `n` を超えないことが保証される
+    /// ため実際には常に `Some` を返すが、将来この不変条件が変わっても
+    /// panic させないよう [`crate::wilson::wilson_ci95`] と同じく `Option`
+    /// のまま返す。
+    pub fn correct_to_incorrect_ci95(&self) -> Option<WilsonInterval> {
+        wilson::wilson_ci95(self.correct_to_incorrect, self.n)
+    }
+
+    /// 不正解→正解（改善）の率 `incorrect_to_correct / n` の Wilson 95%
+    /// 信頼区間（REQ-26・TASK-26.1-2・issue #101）。
+    ///
+    /// `Option` を返す理由は
+    /// [`correct_to_incorrect_ci95`](Self::correct_to_incorrect_ci95) と同じ。
+    pub fn incorrect_to_correct_ci95(&self) -> Option<WilsonInterval> {
+        wilson::wilson_ci95(self.incorrect_to_correct, self.n)
     }
 }
 
@@ -518,6 +559,142 @@ mod tests {
         assert_eq!(counts.incorrect_to_correct(), 0);
         assert_eq!(counts.both_correct(), 1);
         assert_eq!(counts.both_wrong(), 1);
+    }
+
+    fn approx_eq(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// REQ-26・TASK-26.1-2: 遷移 0 件（全件一致）では回帰・改善どちらの率も
+    /// `k=0` の Wilson 区間になり、`lo` は `0.0` に完全一致する。
+    #[test]
+    fn zero_transitions_ci95_lo_is_zero() {
+        let labels = ["A", "B"];
+        let correct = Outcome::Label("A".to_string());
+        let wrong = Outcome::Label("B".to_string());
+        let records = [
+            RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &correct,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &wrong,
+                current: &wrong,
+            },
+        ];
+        let counts = compare_with_previous(&labels, &records).unwrap();
+
+        let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+        assert_eq!(regression_ci.lo(), 0.0);
+        assert!(approx_eq(regression_ci.hi(), 0.6576280471103807));
+
+        let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+        assert_eq!(improvement_ci.lo(), 0.0);
+        assert!(approx_eq(improvement_ci.hi(), 0.6576280471103807));
+    }
+
+    /// REQ-26・TASK-26.1-2: 全件が回帰（正解→不正解）の境界値では
+    /// `hi` が `1.0` に完全一致する。
+    #[test]
+    fn all_transitions_ci95_hi_is_one() {
+        let labels = ["A", "B"];
+        let correct = Outcome::Label("A".to_string());
+        let wrong = Outcome::Label("B".to_string());
+        let records: Vec<RegressionRecord<'_>> = (0..7)
+            .map(|_| RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &wrong,
+            })
+            .collect();
+        let counts = compare_with_previous(&labels, &records).unwrap();
+
+        let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+        assert!(approx_eq(regression_ci.lo(), 0.6456611570247934));
+        assert_eq!(regression_ci.hi(), 1.0);
+
+        let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+        assert_eq!(improvement_ci.lo(), 0.0);
+        assert!(approx_eq(improvement_ci.hi(), 0.35433884297520657));
+    }
+
+    /// REQ-26・TASK-26.1-2: 両メソッドとも `z = WILSON_Z_95`（1.96）を使う。
+    #[test]
+    fn ci95_uses_wilson_z_95() {
+        let labels = ["A", "B"];
+        let correct = Outcome::Label("A".to_string());
+        let wrong = Outcome::Label("B".to_string());
+        let records = [
+            RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &wrong,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &wrong,
+                current: &correct,
+            },
+        ];
+        let counts = compare_with_previous(&labels, &records).unwrap();
+
+        assert_eq!(
+            counts.correct_to_incorrect_ci95().unwrap().z(),
+            wilson::WILSON_Z_95
+        );
+        assert_eq!(
+            counts.incorrect_to_correct_ci95().unwrap().z(),
+            wilson::WILSON_Z_95
+        );
+    }
+
+    /// REQ-26・TASK-26.1-2: `correct_to_incorrect_ci95`・
+    /// `incorrect_to_correct_ci95` は `wilson::wilson_ci95(count, n)` の
+    /// 呼び出しと一致する（評価器を層内で二重に実装していないことの確認）。
+    #[test]
+    fn ci95_matches_wilson_module_directly() {
+        let labels = ["A", "B", "C"];
+        let correct = Outcome::Label("A".to_string());
+        let wrong = Outcome::Label("B".to_string());
+        let records = [
+            RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &correct,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &wrong,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &correct,
+                current: &wrong,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &wrong,
+                current: &correct,
+            },
+            RegressionRecord {
+                gold: "A",
+                previous: &wrong,
+                current: &wrong,
+            },
+        ];
+        let counts = compare_with_previous(&labels, &records).unwrap();
+
+        assert_eq!(
+            counts.correct_to_incorrect_ci95(),
+            wilson::wilson_ci95(counts.correct_to_incorrect(), counts.n())
+        );
+        assert_eq!(
+            counts.incorrect_to_correct_ci95(),
+            wilson::wilson_ci95(counts.incorrect_to_correct(), counts.n())
+        );
     }
 
     /// `Display` は英語で、データ本文を含まない（index・件数のみ）。
