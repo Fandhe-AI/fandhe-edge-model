@@ -130,9 +130,17 @@ fn req27_eval_data_hash_unchanged_across_real_evaluation_path() {
         byte_len: record.byte_len(),
     };
 
-    // 評価前後ダイジェストの hex を独立計算したゴールデン値と比較する。
-    let expected_hex = Sha256Digest::of_bytes(SYNTHETIC_EVAL_DATA).to_hex();
-    assert_eq!(record.sha256().to_hex(), expected_hex);
+    // 評価前後ダイジェストの hex を、実装と独立に（`sha256sum` で事前計算した）
+    // 既知の SHA-256 固定値と比較する（Codex/review 指摘・PR #229: 実装と同じ
+    // `Sha256Digest::of_bytes` で期待値を計算すると、ハッシュ実装自体が誤った
+    // 値を返す回帰を検出できないため）。
+    //   $ printf 'A\nA\nA\nA\nB\nB\n' | sha256sum
+    const EXPECTED_SYNTHETIC_EVAL_DATA_SHA256_HEX: &str =
+        "4bb47f0243549b25ea43b006b7017a93a9bfd79167abc2602a204f054ee81cb0";
+    assert_eq!(
+        record.sha256().to_hex(),
+        EXPECTED_SYNTHETIC_EVAL_DATA_SHA256_HEX
+    );
 
     let (correct, total) = evaluate_with_eval_data_invariance(&frozen, run_real_evaluation_path)
         .expect("成功するはず");
