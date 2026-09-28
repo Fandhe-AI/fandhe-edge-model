@@ -28,6 +28,10 @@
 //!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
 //!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
 //!   工程（将来）から評価処理を渡す想定
+//! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
+//!   必要評価件数の事前計算（Connor 式。REQ-25 異常系・TASK-25.2・
+//!   issue #66）。[`significance::RequiredSampleSize`] を
+//!   [`sample_size::required_sample_size_mcnemar`] で算出できる
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -46,10 +50,11 @@
 //!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
 //!   未実装。依存 `unicode-normalization` の承認と入力表現の整合の判断が要る）。
 //!   件数不足による「判定不能」（`BaselineVerdict::Undeterminable`）は
-//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
-//!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が
-//!   事前に算出した値を渡す必要がある（TASK-25.2）。
+//!   関数（Connor 式）も実装済み（[`sample_size::required_sample_size_mcnemar`]。
+//!   TASK-25.2・issue #66）。仮定値（`p_b`・`p_c`・`alpha`・`power`）を
+//!   定義ファイル・CLI 引数のどこから受け取るかは未確定（TASK-33.x）。
 //!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
@@ -97,5 +102,6 @@ pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;
+pub mod sample_size;
 pub mod significance;
 pub mod wilson;

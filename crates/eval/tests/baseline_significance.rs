@@ -18,13 +18,34 @@
 
 use fandhe_edge_eval::baseline::fit_majority;
 use fandhe_edge_eval::metrics::{EvalRecord, Outcome};
+use fandhe_edge_eval::sample_size::{McNemarSampleSizeAssumption, required_sample_size_mcnemar};
 use fandhe_edge_eval::significance::{
     BaselineVerdict, PairedRecord, RequiredSampleSize, compare_with_baseline,
 };
 
-/// PoC-10 の事前登録手続きで算出された必要件数（TASK-25.2 で算出関数が
-/// 実装されるまでは、証拠の種別: 転記〔PoC-10 実測値〕として固定値を使う）。
-const POC10_REQUIRED_SAMPLE_SIZE: u64 = 221;
+/// PoC-10 の事前登録手続きで算出された必要件数を、算出関数
+/// （[`required_sample_size_mcnemar`]。TASK-25.2・issue #66）で求め直した値。
+/// 仮定（`p_b=0.15`・`p_c=0.05`・`power=0.8`・`alpha=0.0125`。Holm m=4
+/// 最厳段。`fixtures/sample_size/known_values.json` の
+/// `holm_m4`〔PoC-10 事前登録の下限〕相当）は PoC-10 の事前登録値であり、
+/// 算出結果が PoC-10 の記録どおり 221 になることを
+/// `poc10_required_sample_size_is_221` で確認する（転記ではなく算出値を
+/// 使うことを端から端まで示す。証拠の種別: テストハーネス）。
+fn poc10_required_sample_size() -> u64 {
+    let assumption = McNemarSampleSizeAssumption::new(0.15, 0.05, 0.0125, 0.8)
+        .expect("PoC-10 の仮定は McNemarSampleSizeAssumption の検証を満たす");
+    required_sample_size_mcnemar(&assumption)
+        .expect("PoC-10 の仮定から算出した必要件数は MAX_EVAL_RECORDS 以内")
+        .get()
+}
+
+/// [`poc10_required_sample_size`] が PoC-10 の事前登録値（221）と一致する
+/// ことを固定する（REQ-25・TASK-25.2・issue #66。
+/// `fixtures/sample_size/known_values.json` の `ceil_n=221` と同じ値）。
+#[test]
+fn poc10_required_sample_size_is_221() {
+    assert_eq!(poc10_required_sample_size(), 221);
+}
 
 const ABS_EPSILON: f64 = 1e-9;
 const REL_EPSILON: f64 = 1e-9;
@@ -258,7 +279,7 @@ fn all_poc10_cases_are_significantly_better_than_majority() {
             case.label
         );
 
-        let required = RequiredSampleSize::new(POC10_REQUIRED_SAMPLE_SIZE).unwrap();
+        let required = RequiredSampleSize::new(poc10_required_sample_size()).unwrap();
         let comparison = compare_with_baseline(&labels, &records, required)
             .unwrap_or_else(|e| panic!("case {}: 比較に失敗: {e}", case.label));
 

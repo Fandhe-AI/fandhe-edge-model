@@ -10,13 +10,13 @@
 //! - Holm 補正（複数候補比較。REQ-26）は [`judge`] に `p` を引数で渡す形に
 //!   しておき、TASK-25.3 で補正後の p 値でも呼べるようにする
 //! - 件数不足による「判定不能」（[`BaselineVerdict::Undeterminable`]）は
-//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`RequiredSampleSize`]）を事前登録の手続きから算出する関数
-//!   （Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が事前に
-//!   算出した値を [`judge`]・[`compare_with_baseline`] の引数として渡す
-//!   必要がある（REQ-25・TASK-25.2。spec に固定の必要件数は無く、事前登録時に
-//!   算出する手続きだけが定められている。`04-requirements.md` L503-517。
-//!   PoC-10 の事前登録値は 221 件）
+//!   （Connor 式）は [`crate::sample_size::required_sample_size_mcnemar`]
+//!   として実装済み（REQ-25・TASK-25.2・issue #66）。呼び出し側はその戻り値
+//!   を [`judge`]・[`compare_with_baseline`] の引数として渡す（spec に固定の
+//!   必要件数は無く、事前登録時に算出する手続きだけが定められている。
+//!   `04-requirements.md` L503-517。PoC-10 の事前登録値は 221 件）
 //! - CLI の JSON 出力・終了コードへの写像は行わない（TASK-33.x / TASK-18.3）
 
 use crate::baseline::{self, BaselineError};
@@ -51,9 +51,11 @@ pub const SIGNIFICANCE_ALPHA: f64 = 0.05;
 ///
 /// 値は事前登録の手続き（PoC-10 相当）で算出したものを呼び出し側が用意する。
 /// spec（`04-requirements.md` L503-517。REQ-25）は固定の必要件数を定めておらず、
-/// 事前登録時に算出する手続きだけを定めている。算出関数（Connor 式・
-/// `required_n_mcnemar` 相当）自体は本モジュールでは実装しない（TASK-25.2。
-/// PoC-10 の事前登録値は 221 件）。
+/// 事前登録時に算出する手続きだけを定めている。算出関数（Connor 式）は
+/// [`crate::sample_size::required_sample_size_mcnemar`] として実装済み
+/// （TASK-25.2・issue #66。PoC-10 の事前登録値は 221 件）。本モジュール自体は
+/// 算出済みの値を受け取るだけで、算出ロジックには依存しない（循環依存を
+/// 避けるため `sample_size` → `significance` の一方向のみ）。
 ///
 /// 既定値は持たない。呼び出し側が必ず明示的に値を渡す
 /// （2026-09-28 オーナー承認の設計）。
