@@ -28,13 +28,19 @@
 //!
 //! [`time_allotment`] は探索予算（REQ-18。既定 1 時間）のうち候補 1 件へ
 //! 配分する持ち時間の算出・実行記録を担う（TASK-18.1-1・issue #83）。
+//! [`search`] はそれを繰り返し呼び、探索予算全体の消費を追跡し、
+//! validation 正解率が最も高い候補を選定する（TASK-18.1-2・issue #84）。
+//! 正解率の算出は評価器 `fandhe-edge-eval`
+//! （[`fandhe_edge_eval::metrics::evaluate_single_select`]）に委譲する
+//! （評価器は 1 つに集約し、他の層で再実装しない。
+//! `.claude/rules/coding-rust.md`「crate 構成と層の境界」）。
 //!
 //! # スコープ外（#178 以降）
 //!
 //! - 子プロセスの起動・タイムアウト・終了コード写像（ワーカーの `code` から
 //!   [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）。
-//!   [`time_allotment::CandidateRunner`] はこの実行器を差し込むための
-//!   接合点（trait）のみを用意する
+//!   [`time_allotment::CandidateRunner`]・[`search::ValidationScorer`] は
+//!   この実行器・推論器を差し込むための接合点（trait）のみを用意する
 //! - `kind` ごとの `config` 検証（`config` は「JSON オブジェクトであること」
 //!   だけを検査する。`kinds/c1.py`・`c3.py` の `_validate_config` は再実装
 //!   しない）
@@ -42,12 +48,15 @@
 //!   文字列としての構文検査に留め、存在確認・dir_fd による閉じ込めは学習
 //!   ワーカー自身の多層防御（`trainer/src/fandhe_edge_trainer/guard.py`）と
 //!   将来のガード層（TASK-39.x）が担う）
-//! - 探索予算全体の積算・複数候補の比較・選定の記録（#84・TASK-18.1-2）
-//! - 「予算到達」を合格扱いしない判定（TASK-18.2）
+//! - 「予算到達」を合格扱いしない判定（TASK-18.2・issue #85）
+//! - McNemar・Holm による有意性判定の選定記録への統合（TASK-18.3-1・issue #87）
+//! - 探索記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コード
+//!   への写像（TASK-33.x）
 
 pub mod error;
 mod kind_defaults;
 pub mod limits;
 pub mod request;
 pub mod result;
+pub mod search;
 pub mod time_allotment;
