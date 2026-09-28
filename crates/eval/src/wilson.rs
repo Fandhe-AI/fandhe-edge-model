@@ -1,8 +1,8 @@
 //! Wilson スコア法による 95% 信頼区間の算出（REQ-24・TASK-24.1-2・issue #60）。
 //!
 //! 再現性の判定（REQ-26: 3 seed 以上の Wilson 95% 信頼区間の重なりで再現性を
-//! 示す）・評価レポート（REQ-29）から再利用される想定で、[`metrics`][]
-//! モジュールの [`metrics::Ratio`] とは独立に、`(correct, n)` の組から
+//! 示す）・評価レポート（REQ-29）から再利用される想定で、[`crate::metrics`]
+//! モジュールの [`crate::metrics::Ratio`] とは独立に、`(correct, n)` の組から
 //! 直接計算できる関数として提供する。
 //!
 //! 式の出典は PoC-9 manifest（`wilson_confidence_interval.formula`。
