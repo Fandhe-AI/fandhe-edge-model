@@ -68,6 +68,22 @@ def test_fixture_unicode_version_matches_runtime() -> None:
     assert _FIXTURE["_meta"]["unicode_version"] == unicodedata.unidata_version
 
 
+def test_unicode_version_matches_rust_contract() -> None:
+    """Rust 側（crates/data の unicode-normalization）と Unicode 版を揃える契約（REQ-16）。
+
+    `crates/data/src/normalize.rs` の既定正規化規則は `unicode-normalization
+    =0.1.22`（`UNICODE_VERSION == (15, 0, 0)`）を使う（PR #188 Codex レビュー
+    P1 指摘を受け、Unicode 17.0 準拠の 0.1.25 から版を揃え直した）。本テストは
+    学習ワーカー実行環境の `unicodedata` が同じ Unicode 15.0.0 であることを
+    固定し、Rust 側（`crates/data/src/normalize.rs::
+    req16_unicode_normalization_version_matches_python_ucd_15_0_0`・
+    `crates/data/tests/nfkc_cross_check.rs::
+    req16_unicode_normalization_version_matches_fixture_meta`）と対で
+    版のずれを検出する。
+    """
+    assert unicodedata.unidata_version == "15.0.0"
+
+
 @pytest.mark.parametrize("vector", _VECTORS, ids=[v["name"] for v in _VECTORS])
 def test_normalize_input_matches_vector(vector: dict[str, Any]) -> None:
     assert normalize_input(vector["input"]) == vector["normalized"], vector["description"]
