@@ -43,8 +43,9 @@
 //!   長さの上限は [`MAX_INPUT_ID_BYTES`]（暫定値）
 //! - 選択肢数の上限は [`MAX_OPTIONS`]（暫定値。REQ-39 資源の上限）
 //! - `scores` は確率の列として扱う。各値は `[0.0, 1.0]`・合計はおよそ 1.0
-//!   （許容差 1e-9）であることを要求し、`predicted_choice_id` は最高スコ
-//!   アの選択肢（タイブレークは宣言順）と一致することを要求する
+//!   （許容差 [`SCORE_SUM_TOLERANCE`]。`1e-6`）であることを要求し、
+//!   `predicted_choice_id` は最高スコアの選択肢（タイブレークは宣言順）と
+//!   一致することを要求する
 //!
 //! `JudgmentStatus` の variant は現状 `Ok` のみ。保留・対象外
 //! （REQ-22。`abstain`／`out_of_scope` 等）は後続 TASK で追加する。
@@ -89,8 +90,26 @@ pub const MAX_CHOICE_ID_BYTES: usize = 256;
 /// を独立した定数として明示的に検証する（PR #202 レビュー指摘・P0）。
 pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
 
-/// 確率の列として扱うスコア合計の許容差（[coding-rust](../../../.claude/rules/coding-rust.md)。1e-9）。
-const SCORE_SUM_TOLERANCE: f64 = 1e-9;
+/// 確率の列として扱うスコア合計が `1.0` から外れてよい許容差。
+///
+/// `1e-6` は `crates/data/src/eval_input.rs` の `SCORE_SUM_TOLERANCE`
+/// （PoC-9 addendum A-4 が定めた値）と同じ値・同じ理由で揃えている。
+/// [`crate::judgment`] の `scores` は推論ランタイム（TASK-30.x/31.x。未実
+/// 装）が計算する確率の列で、float32 の ONNX 出力を f64 へ拡張した値が
+/// 典型的な入力になる想定である。float32 の softmax 出力を単純合計すると
+/// `1.0` から `1e-7`〜`1e-6` 程度ずれることは珍しくないため（`.claude/rules/coding-rust.md`
+/// が既定値として挙げる `1e-9` をそのまま使うと、この程度の float32 起因
+/// の丸め誤差だけで正常な確率列が `ScoreSumNotOne` として拒否され、
+/// `RuntimeError`（70）になってしまう。以前の実装は `1e-9` を採用してい
+/// たが、これは PR #202 レビュー指摘（Cursor Bugbot・Medium）で見つかった
+/// 誤りである）。[coding-rust](../../../.claude/rules/coding-rust.md) の
+/// `1e-9` は同一 seed・同一依存版での **予測ラベルの再現性比較**
+/// （[evaluation-contract](../../../.claude/rules/evaluation-contract.md)
+/// 「決定性」）に使う値で、本定数が検査する「float32 起源の確率列という
+/// 外部入力の妥当性」とは目的が異なるため、混同して両者を同じ値に揃えな
+/// い（`eval_input.rs` の `SCORE_SUM_TOLERANCE` のドキュメントコメントと
+/// 同じ区別）。
+const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
 /// 判定結果の状態。現状は `Ok`（正常終了）のみを持つ（REQ-21 正常系）。
 ///
@@ -928,14 +947,68 @@ mod tests {
         );
     }
 
-    /// REQ-21: 許容差（1e-9）内の合計は受理する。
+    /// REQ-21: 許容差（[`SCORE_SUM_TOLERANCE`]。1e-6）内の合計は受理する。
     #[test]
     fn req21_accepts_score_sum_within_tolerance() {
         let options = [choice("a"), choice("b"), choice("c")];
         // 0.1 + 0.2 + 0.7 は浮動小数演算で 1.0 からわずかにずれうるが、
-        // 許容差 1e-9 の範囲内であること。
+        // 許容差 1e-6 の範囲内であること。
         let result = JudgmentResult::new(&options, "row", "c", &[0.1, 0.2, 0.7]);
         assert!(result.is_ok());
+    }
+
+    /// PR #202 レビュー指摘（Cursor Bugbot・Medium）: float32 の ONNX 推論
+    /// 出力を f64 へ拡張した典型的な合計ずれ（3 択の softmax で `1e-7` 台）
+    /// を許容差内として受理する。旧実装（許容差 `1e-9`）ではこのケースが
+    /// `ScoreSumNotOne` として拒否され、正常な推論結果が `RuntimeError`
+    /// （70）になっていた。
+    #[test]
+    fn req21_accepts_typical_float32_softmax_rounding_error() {
+        let options = [choice("a"), choice("b"), choice("c")];
+        // 3 択の softmax が全選択肢で 1/3 になるケース。float32 では
+        // `1/3` を丸めた同一値を 3 回加算すると `1.0` から
+        // `2.98e-8`（`> 1e-9`・`< 1e-6`）ずれる（本コメント末尾の実測値）。
+        let third = f64::from(1.0_f32 / 3.0_f32);
+        let scores: [f64; 3] = [third, third, third];
+        let sum: f64 = scores.iter().sum();
+        assert!(
+            (sum - 1.0).abs() > 1e-9,
+            "このケースは旧許容差 1e-9 では拒否されることの前提確認（sum={sum}）"
+        );
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "このケースは新許容差 1e-6 では受理されることの前提確認（sum={sum}）"
+        );
+
+        // 3 値が全て等しいタイのため、宣言順の先頭 "a" が argmax になる。
+        let result = JudgmentResult::new(&options, "row", "a", &scores);
+        assert!(
+            result.is_ok(),
+            "float32 起源の丸め誤差は許容差 1e-6 内で受理する: {result:?}"
+        );
+    }
+
+    /// [`SCORE_SUM_TOLERANCE`]（1e-6）の境界値: 合計が `1.0 + 5e-7` は許容
+    /// 差内として受理する。各スコアは `[0.0, 1.0]` に収まる値にし、範囲外
+    /// 検証（`ScoreOutOfRange`）ではなく合計検証（`ScoreSumNotOne`）の境界
+    /// を確認する。
+    #[test]
+    fn req21_accepts_score_sum_just_within_1e_minus_6_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let result = JudgmentResult::new(&options, "row", "a", &[0.600_000_5, 0.4]);
+        assert!(result.is_ok());
+    }
+
+    /// [`SCORE_SUM_TOLERANCE`]（1e-6）の境界値: 合計が `1.0 + 2e-6` は許容
+    /// 差を超えるため拒否する。各スコアは `[0.0, 1.0]` に収まる値にする。
+    #[test]
+    fn req21_rejects_score_sum_beyond_1e_minus_6_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let sum = 0.600_002 + 0.4;
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.600_002, 0.4]),
+            Err(JudgmentError::ScoreSumNotOne { sum })
+        );
     }
 
     /// REQ-21・PR #202 レビュー指摘（P1）: 最高スコアと矛盾する
