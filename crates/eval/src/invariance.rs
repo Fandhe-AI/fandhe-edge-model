@@ -18,8 +18,8 @@
 //!
 //! # 資源上限
 //!
-//! 計算量は入力バイト列の長さの合計に比例し、追加のアロケーションは構成要素の
-//! 数（最大 4。[`ModelComponent`]）に比例する。構成要素ごとの入力サイズの
+//! 計算量は入力バイト列の長さの合計に比例し、追加のアロケーションは構成要素
+//! （[`ModelComponent`]）の数に比例する。構成要素ごとの入力サイズの
 //! 上限検証は、読み込み前に呼び出し側のガード層（REQ-39）で行う。
 //!
 //! # 現状（実装済みを装わない）
@@ -61,20 +61,48 @@ pub enum ModelComponent {
 }
 
 impl ModelComponent {
-    /// 全構成要素を宣言順で列挙した配列（[`ModelPackageBytes::entries`] が
-    /// 走査に使う）。ここに `#[non_exhaustive]` の外部拡張制限は掛からない
-    /// （crate 内であることに変わりないため）。新しいバリアントを追加した際は
-    /// この配列と `ModelPackageBytes::component_bytes` の `match` の両方を
-    /// 更新する必要があり、後者は wildcard 無しの exhaustive match なので
-    /// 更新を忘れるとコンパイルエラーになる（このためだけに配列自体の追加漏れを
-    /// 防ぐことはできないが、配列とフィールドの対応は `component_bytes` 側の
-    /// 網羅性チェックで実質的に検出できる）。
-    const ALL: [ModelComponent; 4] = [
-        ModelComponent::Weights,
-        ModelComponent::Vocab,
-        ModelComponent::Calibration,
-        ModelComponent::Thresholds,
-    ];
+    /// 列挙順を辿る状態遷移。`current` が `None` なら最初の構成要素
+    /// （[`ModelComponent::Weights`]）を返し、最後の構成要素
+    /// （[`ModelComponent::Thresholds`]）に達すると `None` を返して終了する。
+    ///
+    /// 以前は宣言順の配列 `ALL: [ModelComponent; 4]` を別途持っていたが、
+    /// 配列はただのリテラルなので新しいバリアントを追加しても配列側の
+    /// 更新をコンパイラが強制できず、`entries()` が新しい構成要素を黙って
+    /// 取りこぼす（fail-open になる）欠陥があった（codex/review 指摘。
+    /// PRRT_kwDOUq-SxM6mh13u）。この `match` は wildcard を持たない
+    /// exhaustive match で、`Some(...)` 側の各アームが全バリアントを
+    /// 一度ずつ列挙するため、新しいバリアントを追加すると
+    /// 「そのバリアントへ遷移してくる前段の枝」と「そのバリアントから
+    /// 次へ遷移する枝」の両方の追加が要求され、追加しない限りコンパイルが
+    /// 通らない。
+    ///
+    /// **この保証にも限界がある**: 新しいバリアント `Foo` を追加した際、
+    /// 既存の終端アーム（`Some(ModelComponent::Thresholds) => None`）を
+    /// `Some(ModelComponent::Thresholds) => Some(ModelComponent::Foo)` へ
+    /// 直さずに `Some(ModelComponent::Foo) => None` という新しい独立した
+    /// 終端アームだけを追加すれば構文的にはコンパイルが通り、`Foo` は
+    /// 列挙から孤立したまま（`all()` が辿らないまま）になりうる。この
+    /// 残存リスクはコンパイルだけでは塞ぎきれないため、テスト側
+    /// （`tests` モジュールの `req27_all_lists_each_component_exactly_once_in_declared_order`）
+    /// で列挙結果を具体値（宣言済みの全バリアントの一覧）と突き合わせ、
+    /// バリアント追加時にテストの期待値更新を要求することで実質的に検出する。
+    const fn next(current: Option<ModelComponent>) -> Option<ModelComponent> {
+        match current {
+            None => Some(ModelComponent::Weights),
+            Some(ModelComponent::Weights) => Some(ModelComponent::Vocab),
+            Some(ModelComponent::Vocab) => Some(ModelComponent::Calibration),
+            Some(ModelComponent::Calibration) => Some(ModelComponent::Thresholds),
+            Some(ModelComponent::Thresholds) => None,
+        }
+    }
+
+    /// 全構成要素を宣言順で決定的に列挙するイテレータ
+    /// （[`ModelPackageBytes::entries`] が走査に使う）。要素数を
+    /// 別途ハードコードせず [`Self::next`] の状態遷移をそのまま辿るため、
+    /// 要素数と列挙内容が二重管理にならない。
+    fn all() -> impl Iterator<Item = ModelComponent> {
+        std::iter::successors(Self::next(None), |&current| Self::next(Some(current)))
+    }
 
     /// JSON のキー等に使う英語の識別子（プログラム出力文字列は英語。
     /// `.claude/rules/japanese-style.md`）。
@@ -148,8 +176,9 @@ impl<'a> ModelPackageBytes<'a> {
     }
 
     /// 構成要素とその値を、[`ModelComponent`] の宣言順で決定的に列挙する。
-    fn entries(&self) -> [(ModelComponent, Option<&'a [u8]>); 4] {
-        ModelComponent::ALL.map(|component| (component, self.component_bytes(component)))
+    fn entries(&self) -> impl Iterator<Item = (ModelComponent, Option<&'a [u8]>)> + 'a {
+        let this = *self;
+        ModelComponent::all().map(move |component| (component, this.component_bytes(component)))
     }
 }
 
@@ -369,14 +398,35 @@ mod tests {
     }
 
     #[test]
-    fn req27_model_component_all_contains_each_variant_exactly_once() {
-        // `ModelComponent::ALL`（`ModelPackageBytes::entries` が走査に使う）が
-        // 全バリアントをちょうど 1 回ずつ含むことを確認する。`BTreeSet` へ
-        // 集約した件数が `ALL.len()` と一致すれば重複・欠落が無いと言える。
-        let unique: std::collections::BTreeSet<ModelComponent> =
-            ModelComponent::ALL.into_iter().collect();
-        assert_eq!(unique.len(), ModelComponent::ALL.len());
-        assert_eq!(ModelComponent::ALL.len(), 4);
+    fn req27_all_lists_each_component_exactly_once_in_declared_order() {
+        // `ModelComponent::all()` が宣言順に構成要素を 1 回ずつ列挙することを、
+        // 件数のみの検査（旧 `ALL.len() == 4`）ではなく実際の列挙内容との
+        // 具体値比較で確認する。件数だけの検査では、新しいバリアントの追加を
+        // `next()` の遷移に組み込み忘れて孤立させても検出できない
+        // （codex/review 指摘。PRRT_kwDOUq-SxM6mh13u）。列挙を高々 16 件で
+        // 打ち切るのは、`next()` の実装ミスで循環し無限に列挙し続ける事態を
+        // 避けるため（16 は現在の構成要素数 4 に対して十分な安全域）。
+        let components: Vec<ModelComponent> = ModelComponent::all().take(16).collect();
+        assert_eq!(
+            components,
+            vec![
+                ModelComponent::Weights,
+                ModelComponent::Vocab,
+                ModelComponent::Calibration,
+                ModelComponent::Thresholds,
+            ]
+        );
+    }
+
+    #[test]
+    fn req27_all_yields_strictly_increasing_order() {
+        // `ModelComponent::all()` が宣言順（`Ord` derive の順）に厳密単調
+        // 増加することを確認する。`next()` が誤って前の構成要素へ戻る
+        // （循環する）実装ミスがあれば、重複または逆順として検出できる。
+        let components: Vec<ModelComponent> = ModelComponent::all().take(16).collect();
+        for pair in components.windows(2) {
+            assert!(pair[0] < pair[1], "宣言順が単調増加でない: {pair:?}");
+        }
     }
 
     #[test]
