@@ -5,7 +5,7 @@
 //! での同じ結論の再確認は本テストの範囲外（issue #105）。
 
 use fandhe_edge_eval::reproducibility::{
-    DisjointPair, OverlapVerdict, SeedRun, judge_overlap, judge_reproducibility,
+    OverlapVerdict, SeedRun, judge_overlap, judge_reproducibility,
 };
 use fandhe_edge_eval::wilson;
 
@@ -21,6 +21,18 @@ fn run(seed: u64, correct: u64, total: u64) -> SeedRun {
         correct,
         total,
     }
+}
+
+/// `OverlapReport::disjoint_pairs()` の期待値確認用ヘルパー。
+/// `DisjointPair` はコンストラクタを crate 内部限定にしている
+/// （壊れた値を外部から組み立てられないようにするため）ため、
+/// 結合テスト側は `(first(), second())` のタプルへ写してから比較する。
+fn pair_tuples(report: &fandhe_edge_eval::reproducibility::OverlapReport) -> Vec<(usize, usize)> {
+    report
+        .disjoint_pairs()
+        .iter()
+        .map(|pair| (pair.first(), pair.second()))
+        .collect()
 }
 
 /// (a) PoC-19 の再現: `wilson_ci(correct, 650, 1.959964)` が PoC-19 実機結果の
@@ -63,14 +75,7 @@ fn all_pairs_disjoint_when_far_apart() {
     let runs = [run(0, 20, 100), run(1, 50, 100), run(2, 80, 100)];
     let report = judge_reproducibility(&runs).expect("3 valid runs");
     assert_eq!(report.verdict(), OverlapVerdict::SomePairsDisjoint);
-    assert_eq!(
-        report.disjoint_pairs(),
-        &[
-            DisjointPair::new(0, 1),
-            DisjointPair::new(0, 2),
-            DisjointPair::new(1, 2),
-        ]
-    );
+    assert_eq!(pair_tuples(&report), vec![(0, 1), (0, 2), (1, 2)]);
 }
 
 /// (d) 一部だけ重ならない例: (10,100)・(15,100)・(25,100) → (0,2) の 1 ペアのみ
@@ -81,7 +86,7 @@ fn only_one_pair_disjoint() {
     let runs = [run(0, 10, 100), run(1, 15, 100), run(2, 25, 100)];
     let report = judge_reproducibility(&runs).expect("3 valid runs");
     assert_eq!(report.verdict(), OverlapVerdict::SomePairsDisjoint);
-    assert_eq!(report.disjoint_pairs(), &[DisjointPair::new(0, 2)]);
+    assert_eq!(pair_tuples(&report), vec![(0, 2)]);
 }
 
 /// (e) 4 seed 以上（5 件）でも動作する。

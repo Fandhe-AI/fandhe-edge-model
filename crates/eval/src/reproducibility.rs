@@ -105,14 +105,14 @@ pub struct DisjointPair {
 }
 
 impl DisjointPair {
-    /// 診断・結合テスト用のコンストラクタ。呼び出し側が `first < second`
-    /// （入力順の添字を昇順に並べたもの）で渡す前提で、値そのものに
-    /// 不変条件はない（判定結果としての整合は [`OverlapReport`] 側が保証する）。
-    pub fn new(first: usize, second: usize) -> Self {
-        Self { first, second }
-    }
-
-    /// 組の 1 つ目の添字（`first < second`）。
+    /// 組の 1 つ目の添字（`first < second`）。フィールドは非公開で、
+    /// crate 内（[`judge_overlap`]）でのみ構造体リテラルから直接組み立てる。
+    /// 外部からは [`OverlapReport`] が返す値を経由してしか [`DisjointPair`]
+    /// を得られないため、`first < second` の前提が壊れた値を利用側が
+    /// 組み立てることはできない
+    /// （coding-rust.md「壊れた値を表現できない型にする」）。結合テストは
+    /// [`DisjointPair::first`]・[`DisjointPair::second`] のタプル比較で
+    /// 期待値を確認する。
     pub fn first(&self) -> usize {
         self.first
     }
@@ -333,8 +333,13 @@ pub fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, Repr
 /// （`z = `[`crate::wilson::WILSON_Z_95`]）を算出し、[`judge_overlap`] で
 /// 重なりを判定する。
 ///
-/// 検証順は 上限 → 下限 → seed の重複 → 評価総数の一致 → 区間の算出 →
-/// 全ペア走査（REQ-39。`Vec` の確保前に件数を検証する）。
+/// 検証順は 上限 → 下限 → (seed の重複・評価総数の一致を 1 走査で要素ごとに
+/// 検証) → 区間の算出 → 全ペア走査（REQ-39。`Vec` の確保前に件数を検証する）。
+/// seed の重複と評価総数の不一致は同じループの同じ添字で検証するため、
+/// 入力によってはどちらが先に成立するかは添字の並びに依存する
+/// （例: `[(0,_,5,10), (1,_,6,20), (1,_,7,10)]` は index=1 で
+/// `MismatchedTotals` が先に返り、その後方にある seed 重複は検出されない）。
+/// どちらのエラーも fail-closed に判定を止める点は変わらない。
 ///
 /// `total == 0` または `correct > total` の run があると Wilson 区間が
 /// 算出できない（`wilson::wilson_ci95` が `None`）。この場合「重なる」
@@ -562,6 +567,18 @@ mod tests {
             judge_overlap(&[a, b, c]).unwrap_err(),
             ReproducibilityError::MismatchedZ { index: 1 }
         );
+    }
+
+    /// REQ-26・TASK-26.3-1: z の差が [`OVERLAP_TOLERANCE`]（1e-9）未満
+    /// （5e-10）なら `MismatchedZ` にならず判定が進む（`intervals_overlap`
+    /// 側の許容差テストと対称の正常系。z の許容差判定にも境界を持たせる）。
+    #[test]
+    fn judge_overlap_z_within_tolerance_is_accepted() {
+        let a = wilson::wilson_ci(5, 10, 1.96).expect("valid interval");
+        let b = wilson::wilson_ci(5, 10, 1.96 + 5e-10).expect("valid interval");
+        let c = wilson::wilson_ci(5, 10, 1.96).expect("valid interval");
+        let report = judge_overlap(&[a, b, c]).expect("z 差が許容差未満のため成功する");
+        assert_eq!(report.verdict(), OverlapVerdict::AllPairsOverlap);
     }
 
     /// REQ-26・TASK-26.3-1: `total=0` は `UndefinedInterval`
