@@ -43,11 +43,11 @@
 //! 不正を検出し `invalid_input`／`limit_exceeded` へ写す型を実装済み
 //! （CLI バイナリへの配線は TASK-33.x の対象で未着手）。
 //! `rebuild` モジュールは TASK-20.1-1（issue #90）で作り直し判定
-//! （[`rebuild::RebuildDecision`]）の型と比較骨格を実装済み（REQ-20）。
-//! PoC-19 の判定規則（選択肢 ID 集合・判定型の変化を検出）を移植したが、
-//! 追加・削除・統合の網羅的なパターン検出（TASK-20.1-2）・表示名/説明の
-//! 差分詳細（TASK-20.2）・ハッシュ完全一致時の比較省略保証（TASK-20.3）は
-//! 後続 TASK で行う。
+//! （[`rebuild::RebuildDecision`]）の型と比較骨格を、TASK-20.1-2（issue #91）
+//! で追加・削除・統合の網羅的なパターン検出を、TASK-20.2（issue #92）で
+//! `NotRequired` の差分詳細（[`rebuild::NotRequiredRebuild`]）を実装済み
+//! （REQ-20 の正常系・異常系）。ハッシュ完全一致時の比較省略保証
+//! （TASK-20.3）は後続 TASK で行う。
 
 pub mod canonical;
 pub mod definition;
