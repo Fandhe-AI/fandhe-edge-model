@@ -16,6 +16,7 @@
 //!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
 //! - [`preprocess_boundary`][]: 空入力の前処理食い違いの検知・報告
 //!   （REQ-23 境界値・TASK-23.2・issue #57）
+//! - [`provenance`]: 来歴レコード型（REQ-40・TASK-40.1-1・issue #74）
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -28,7 +29,9 @@
 //!   [`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
 //!   [`split::Groupable`] を実装しないため、[`split::split_by_group`] へ渡す際は
 //!   呼び出し側（CLI 等）が変換する）
-//! - 来歴（REQ-40）: 未実装
+//! - 来歴（REQ-40）: レコード型と各項目の検証のみ実装（[`provenance`]・
+//!   TASK-40.1-1）。取り込み時の記録・JSON 入出力は #75（TASK-40.1-2）、
+//!   Jev 出力の既定拒否は TASK-40.2 で未実装
 //!
 //! # 層の境界
 //!
@@ -72,5 +75,6 @@ pub mod inspect;
 mod json_keys;
 pub mod leak;
 pub mod preprocess_boundary;
+pub mod provenance;
 pub mod report;
 pub mod split;
