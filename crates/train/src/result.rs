@@ -160,13 +160,47 @@ impl WorkerFailure {
 }
 
 /// 学習ワーカーの結果（成功／失敗の 2 択）。
+///
+/// `Ok` バリアントは [`SuccessOutcome`]（フィールド非公開・アクセサのみ公開）
+/// を保持する。フィールドを直接公開しないのは、公開されたバリアントの
+/// フィールドから別 crate が検証済み [`ArtifactRecord`] を使って任意の
+/// `artifact_dir` を持つ成功結果を直接組み立て、`from_worker_stdout` の経路
+/// 検証（ガード層「経路の閉じ込め」）を迂回できてしまうため
+/// （REQ-39・P0。codex review PR #220）。`enum` の `pub` バリアントは
+/// フィールド単位で非公開にできない（フィールドが public な struct-like
+/// variant になる）ため、フィールド非公開の struct を経由させて型で防ぐ
+/// （`crates/core/src/definition.rs`・本 crate の `TrainRequest` と同じ設計）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrainOutcome {
-    Ok {
-        artifact_dir: String,
-        artifact: Box<ArtifactRecord>,
-    },
+    Ok(SuccessOutcome),
     Error(WorkerFailure),
+}
+
+/// [`TrainOutcome::Ok`] の中身（成果物の配置先ディレクトリと成果物記録）。
+///
+/// フィールドは非公開。この型を構築できるのは本モジュール内
+/// （[`TrainOutcome::from_worker_stdout`]）だけで、別 crate は
+/// [`SuccessOutcome::artifact_dir`]・[`SuccessOutcome::artifact`] の読み取り
+/// 専用アクセサしか使えない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuccessOutcome {
+    artifact_dir: String,
+    artifact: Box<ArtifactRecord>,
+}
+
+impl SuccessOutcome {
+    /// 検証済みの成果物配置先ディレクトリ（`request` の `root`／`out_dir`
+    /// 配下に閉じ込められていることを `from_worker_stdout` が保証済み）。
+    #[must_use]
+    pub fn artifact_dir(&self) -> &str {
+        &self.artifact_dir
+    }
+
+    /// 検証済みの成果物記録。
+    #[must_use]
+    pub fn artifact(&self) -> &ArtifactRecord {
+        &self.artifact
+    }
 }
 
 /// `from_worker_stdout` の内部専用中間表現。`status` と各フィールドの組み
@@ -223,18 +257,46 @@ fn is_syntactically_valid_created_utc(value: &str) -> bool {
         && is_byte(19, b'Z')
 }
 
-/// `request.root()` を起点に `request.out_dir()`（正準化済みの構成要素）を
-/// 連結した絶対パス文字列を組み立てる。`cli.py::run_worker_train` が
+/// 絶対パス文字列を構成要素単位で正規化する（`os.path.normpath` 相当）。
+/// `.` 構成要素を除去し、`..` 構成要素は直前の構成要素を取り除く（ルートを
+/// 超える `..` は無視する）。連続する `/` は 1 つにまとめる。**symlink の解決
+/// は行わない**（ファイルシステムへ触れない純粋な文字列操作。symlink 対策は
+/// 学習ワーカー自身が `guard.py::confine` で多層防御として担う設計を変えない。
+/// 本モジュール doc 参照）。
+///
+/// `guard.py::resolve_root` は `root` に `os.path.realpath` を適用してから
+/// `artifact_dir` を組み立てるため、`root` が `..`・`.`・連続スラッシュを
+/// 含む正当な絶対パスの場合、正規化しない文字列比較では正常な結果まで
+/// `runtime_error` にしてしまっていた（REQ-39・P1。codex review・cursor[bot]
+/// 重複指摘。PR #220）。
+fn normalize_absolute_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(part),
+        }
+    }
+    let mut normalized = String::from("/");
+    normalized.push_str(&components.join("/"));
+    normalized
+}
+
+/// `request.root()` を起点に `request.out_dir()` を連結し、[`normalize_absolute_path`]
+/// で正規化した絶対パス文字列を組み立てる。`cli.py::run_worker_train` が
 /// `artifact_dir` として出す `str(request.out_dir.display)`
-/// （`guard.confine` の `display = root_handle.root_real.joinpath(*rel.parts)`）
-/// と同じ規則（`.` 構成要素の除去・区切り文字 `/`）だが、`realpath` による
-/// symlink 解決は行わない（文字列レベルの検査に留める。本モジュール doc
-/// 参照）。`root`／`out_dir` はいずれも [`TrainRequest`] が構文検査済み
-/// （空・NUL・絶対/相対の取り違え・`..` を含まない）のため、ここでは組み立て
-/// のみを行う。
+/// （`guard.confine` の `display = root_handle.root_real.joinpath(*rel.parts)`。
+/// `root_real` は `os.path.realpath(root)`）と、`..`／`.`／連続スラッシュを
+/// 含まない限り一致する（symlink 解決の差異は残る。本関数 doc 参照）。
+/// `root`／`out_dir` はいずれも [`TrainRequest`] が構文検査済み（空・NUL・
+/// 絶対/相対の取り違えを含まない）だが、`root` 自体には `..`・連続スラッシュ
+/// の禁止までは課していない（[`TrainRequest`] のモジュール doc「経路の閉じ
+/// 込めについて」参照）ため、ここで正規化する。
 fn expected_artifact_dir(request: &TrainRequest) -> String {
-    let root_trimmed = request.root().trim_end_matches('/');
-    let mut joined = String::from(root_trimmed);
+    let mut joined = String::from(request.root());
     for part in request.out_dir().split('/') {
         if part.is_empty() || part == "." {
             continue;
@@ -242,7 +304,7 @@ fn expected_artifact_dir(request: &TrainRequest) -> String {
         joined.push('/');
         joined.push_str(part);
     }
-    joined
+    normalize_absolute_path(&joined)
 }
 
 impl TrainOutcome {
@@ -348,6 +410,16 @@ impl TrainOutcome {
                 if raw_artifact.onnx_file != "model.onnx" {
                     return Err(TrainResultError::MalformedArtifact { field: "onnx_file" });
                 }
+                // 完全性と版（REQ-39・P1）: `selector_version` は対応版の許可
+                // リストで検証する。空文字列・未対応版の成功結果を検証済みと
+                // して受理しない（codex review PR #220）。
+                if !crate::limits::ALLOWED_SELECTOR_VERSIONS
+                    .contains(&raw_artifact.selector_version.as_str())
+                {
+                    return Err(TrainResultError::MalformedArtifact {
+                        field: "selector_version",
+                    });
+                }
                 if raw_artifact.candidate_label.is_empty() {
                     return Err(TrainResultError::MalformedArtifact {
                         field: "candidate_label",
@@ -359,7 +431,7 @@ impl TrainOutcome {
                     });
                 }
                 let onnx_sha256 = OnnxSha256::parse(raw_artifact.onnx_sha256)?;
-                Ok(TrainOutcome::Ok {
+                Ok(TrainOutcome::Ok(SuccessOutcome {
                     artifact_dir,
                     artifact: Box::new(ArtifactRecord {
                         kind: raw_artifact.kind,
@@ -374,7 +446,7 @@ impl TrainOutcome {
                         created_utc: raw_artifact.created_utc,
                         candidate_label: raw_artifact.candidate_label,
                     }),
-                })
+                }))
             }
             "error" => {
                 let (None, None, Some(code), Some(message)) =
@@ -396,14 +468,11 @@ impl Serialize for TrainOutcome {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
-            TrainOutcome::Ok {
-                artifact_dir,
-                artifact,
-            } => {
+            TrainOutcome::Ok(success) => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("status", "ok")?;
-                map.serialize_entry("artifact_dir", artifact_dir)?;
-                map.serialize_entry("artifact", artifact.as_ref())?;
+                map.serialize_entry("artifact_dir", success.artifact_dir())?;
+                map.serialize_entry("artifact", success.artifact())?;
                 map.end()
             }
             TrainOutcome::Error(failure) => {
@@ -450,14 +519,11 @@ mod tests {
         let outcome = TrainOutcome::from_worker_stdout(VALID_OK_JSON.as_bytes(), &test_request())
             .expect("valid outcome");
         match outcome {
-            TrainOutcome::Ok {
-                artifact_dir,
-                artifact,
-            } => {
-                assert_eq!(artifact_dir, "/fandhe-edge-fixture-root/out");
-                assert_eq!(artifact.kind(), "c3");
+            TrainOutcome::Ok(success) => {
+                assert_eq!(success.artifact_dir(), "/fandhe-edge-fixture-root/out");
+                assert_eq!(success.artifact().kind(), "c3");
                 assert_eq!(
-                    artifact.label_order().as_slice(),
+                    success.artifact().label_order().as_slice(),
                     &["a".to_string(), "b".to_string()]
                 );
             }
@@ -475,7 +541,7 @@ mod tests {
                 assert_eq!(failure.code(), "invalid_request");
                 assert_eq!(failure.message(), "file not readable: FileNotFoundError");
             }
-            TrainOutcome::Ok { .. } => panic!("expected Error"),
+            TrainOutcome::Ok(_) => panic!("expected Error"),
         }
     }
 
@@ -657,5 +723,69 @@ mod tests {
             err,
             TrainResultError::ArtifactMismatch { field: "config" }
         ));
+    }
+
+    /// `test_request()` と同じ内容だが `root` を差し替えたリクエストを作る
+    /// （正規化の検証用）。
+    fn test_request_with_root(root: &str) -> TrainRequest {
+        TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: None,
+            rss_limit_bytes: None,
+        })
+        .expect("test request params must be valid")
+    }
+
+    /// REQ-39・P1（codex review・cursor[bot] 重複指摘。PR #220）: `root` が
+    /// `..`・`.`・連続スラッシュを含む正当な絶対パスでも、正規化後に一致する
+    /// `artifact_dir` は拒否しない。
+    #[test]
+    fn req39_accepts_artifact_dir_when_root_needs_normalization() {
+        let request =
+            test_request_with_root("/fandhe-edge-fixture-root/../fandhe-edge-fixture-root/./sub//");
+        let json = VALID_OK_JSON.replace(
+            "/fandhe-edge-fixture-root/out",
+            "/fandhe-edge-fixture-root/sub/out",
+        );
+        let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &request)
+            .expect("normalized root must match worker's realpath-based artifact_dir");
+        match outcome {
+            TrainOutcome::Ok(success) => {
+                assert_eq!(success.artifact_dir(), "/fandhe-edge-fixture-root/sub/out");
+            }
+            TrainOutcome::Error(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// REQ-39・P1（完全性と版。codex review PR #220）: `selector_version` が
+    /// 対応版の許可リストに無い場合は成功扱いにしない（空文字列を含む）。
+    #[test]
+    fn req39_rejects_unsupported_selector_version() {
+        for bad in ["", "0.2", "9.9"] {
+            let json = VALID_OK_JSON.replace(
+                r#""selector_version":"0.1""#,
+                &format!(r#""selector_version":"{bad}""#),
+            );
+            let err =
+                TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TrainResultError::MalformedArtifact {
+                        field: "selector_version"
+                    }
+                ),
+                "case: {bad:?}"
+            );
+        }
     }
 }

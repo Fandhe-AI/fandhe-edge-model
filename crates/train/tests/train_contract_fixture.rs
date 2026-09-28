@@ -302,15 +302,12 @@ fn req21_result_ok_and_error_round_trip_fixture() {
     let outcome = TrainOutcome::from_worker_stdout(ok_line.as_bytes(), &request)
         .expect("result_ok.json must parse and match request_full.json");
     match &outcome {
-        TrainOutcome::Ok {
-            artifact_dir,
-            artifact,
-        } => {
-            assert_eq!(artifact_dir, "/fandhe-edge-fixture-root/out");
-            assert_eq!(artifact.kind(), "c3");
-            assert_eq!(artifact.onnx_file(), "model.onnx");
+        TrainOutcome::Ok(success) => {
+            assert_eq!(success.artifact_dir(), "/fandhe-edge-fixture-root/out");
+            assert_eq!(success.artifact().kind(), "c3");
+            assert_eq!(success.artifact().onnx_file(), "model.onnx");
             assert_eq!(
-                artifact.onnx_sha256().as_str(),
+                success.artifact().onnx_sha256().as_str(),
                 "ae2c3277fb02c187294c01f4e19e3eca57815d28e9ebc05f4d013a05a02ecfbe"
             );
         }
@@ -329,7 +326,7 @@ fn req21_result_ok_and_error_round_trip_fixture() {
             assert_eq!(failure.code(), "invalid_request");
             assert_eq!(failure.message(), "file not readable: FileNotFoundError");
         }
-        TrainOutcome::Ok { .. } => panic!("expected Error"),
+        TrainOutcome::Ok(_) => panic!("expected Error"),
     }
     let expected_error = load_fixture_value("result_error.json");
     let actual_error = serde_json::to_value(&error_outcome).expect("serialize outcome");

@@ -241,6 +241,52 @@ fn check_relative_path_syntax(value: &str, field: &'static str) -> Result<(), Tr
     Ok(())
 }
 
+/// [`TrainRequest::to_json_vec`] 専用の `Vec<u8>` ライター。書き込み総量が
+/// `limit` を超えた時点で `Err` を返し、以降の書き込み（`serde_json` の
+/// 直列化）を打ち切る。`config` に外部由来の巨大な値が入っていても、
+/// [`MAX_REQUEST_BYTES`] を大幅に超えるメモリを先に確保しないための資源上限
+/// （REQ-39「資源の上限」・P1。codex review PR #220）。
+struct LimitedVecWriter {
+    buf: Vec<u8>,
+    limit: usize,
+    limit_exceeded: bool,
+}
+
+impl LimitedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+            limit_exceeded: false,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+}
+
+impl std::io::Write for LimitedVecWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "train request serialization exceeds size limit",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl TrainRequest {
     /// [`TrainRequestParams`] を検証し、[`TrainRequest`] を組み立てる。
     ///
@@ -335,9 +381,14 @@ impl TrainRequest {
     }
 
     /// 検証済みの [`TrainRequest`] を、`contract.py` と同じスキーマの JSON
-    /// バイト列へ直列化する。直列化後のサイズも [`MAX_REQUEST_BYTES`] を
-    /// 超えないことを確認する（`config` は任意の JSON を保持しうるため、
-    /// 組み立て段階での再検査が必要。本モジュールの doc 参照）。
+    /// バイト列へ直列化する。`config` は [`TrainRequest::new`] の時点では
+    /// サイズを検査しない（任意の JSON を保持しうる。本モジュールの doc
+    /// 参照）ため、ここで検査する。[`LimitedVecWriter`] へ書き込みながら
+    /// [`MAX_REQUEST_BYTES`] 超過を検出した時点で直列化を打ち切ることで、
+    /// 外部由来の巨大な `config` を渡された場合でも上限を超える確保を
+    /// 先に行わない（REQ-39 ガード層「資源の上限」・P1。codex review
+    /// PR #220: 旧実装は `serde_json::to_vec` で全体を確保してから長さを
+    /// 検査していた）。
     pub fn to_json_vec(&self) -> Result<Vec<u8>, TrainRequestError> {
         let wire = WireTrainRequest {
             schema_version: REQUEST_SCHEMA_VERSION,
@@ -354,14 +405,19 @@ impl TrainRequest {
             time_limit_seconds: self.time_limit_seconds,
             rss_limit_bytes: self.rss_limit_bytes,
         };
-        let bytes = serde_json::to_vec(&wire).map_err(|_| TrainRequestError::SerializeFailed)?;
-        if bytes.len() > MAX_REQUEST_BYTES {
-            return Err(TrainRequestError::TooLarge {
-                size: bytes.len(),
+        let mut writer = LimitedVecWriter::new(MAX_REQUEST_BYTES);
+        match serde_json::to_writer(&mut writer, &wire) {
+            Ok(()) => Ok(writer.into_inner()),
+            // 上限超過による打ち切り（本 wire 型の値はいずれも JSON へ直列化
+            // 可能なため、他の直列化失敗要因では到達しない）。実際の最終
+            // サイズは打ち切りのため未確定だが、上限超過を示す下限値として
+            // 上限 + 1 を報告する。
+            Err(_) if writer.limit_exceeded() => Err(TrainRequestError::TooLarge {
+                size: MAX_REQUEST_BYTES + 1,
                 limit: MAX_REQUEST_BYTES,
-            });
+            }),
+            Err(_) => Err(TrainRequestError::SerializeFailed),
         }
-        Ok(bytes)
     }
 
     pub fn kind(&self) -> &str {
