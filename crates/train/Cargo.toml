@@ -16,6 +16,12 @@ fandhe-edge-core.workspace = true
 # dependency-policy.md「承認済みの依存」の表更新と合わせてオーナー確認事項とする）。
 serde.workspace = true
 serde_json.workspace = true
+# 選定結果への McNemar／Holm 有意性判定の付与に評価器を呼ぶために使う
+# （評価ロジックは再実装しない。REQ-18・TASK-18.3-1・#87）。workspace 内の
+# path 依存であり、外部 crate の追加ではない（dependency-policy.md「承認済みの
+# 依存」の対象外）。`fandhe-edge-eval` は `fandhe-edge-train` に依存しておらず
+# 循環しない。
+fandhe-edge-eval.workspace = true
 
 [lints]
 workspace = true
