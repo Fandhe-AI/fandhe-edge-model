@@ -30,7 +30,7 @@ PoC-19 の事前登録パターンと同じ組（`rebuild.rs` モジュール do
 | P1 追加 | `v2_8rm.json` | `v1_9.json` | `tier-xl__high` を追加（8→9 選択肢） | `Required(OptionIdsChanged)` |
 | P2 削除 | `v1_9.json` | `v2_8rm.json` | `tier-xl__high` を削除（9→8 選択肢） | `Required(OptionIdsChanged)` |
 | P3 統合 | `v1_9.json` | `v3_8merge.json` | `tier-l__medium` + `tier-l__high` → `tier-l__midhigh` に統合（9→8 選択肢） | `Required(OptionIdsChanged)`（統合を独立理由にしない判断は `rebuild.rs` モジュール doc を参照） |
-| P4 表示名・説明のみ | `v1_9.json` | `v4_rename.json` | `tier-xs__low` の `display_name`・`tier-xl__high` の `description` のみ変更（ID・件数は同一） | `NotRequired` |
+| P4 表示名・説明のみ | `v1_9.json` | `v4_rename.json` | `tier-xs__low` の `display_name`・`tier-xl__high` の `description` のみ変更（ID・件数は同一） | `NotRequired`（`display_name_changed={tier-xs__low}`・`description_changed={tier-xl__high}`。TASK-20.2・issue #92 の `crates/core/src/rebuild.rs`・`crates/core/tests/rebuild_decision.rs` でも利用） |
 | P5 判定型変更 | `v1_9.json` | `v5_multi.json` | `judgment_type` を `single_select` → `multi_select` に変更（ID・件数は同一） | 本番の `Definition::load`/`parse` は `multi_select` を `DefinitionError::UnsupportedValue { field: FieldPath::JudgmentType }` で拒否する（`definition.rs` の既存テストで固定済み）。`Required(JudgmentTypeChanged)` の具体値は本番バリアントではなく `crates/core/src/rebuild.rs` の `#[cfg(test)]` 限定の `JudgmentType::TestOnlyAlternate` で確認する（結合テストからは見えない。理由は `rebuild.rs` モジュール doc 2.2 節） |
 
 ## データの性質

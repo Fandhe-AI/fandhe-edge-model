@@ -45,6 +45,17 @@
 //! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
 //!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
 //!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
+//! - [`regression`][]: 旧モデルとの比較による回帰件数（正解→不正解）・
+//!   改善件数（不正解→正解）の算出（REQ-26 正常系・TASK-26.1-1・issue #100）。
+//!   [`significance::is_correct`] と同じ正誤規則・[`mcnemar::paired_counts`]
+//!   を再利用し、評価ロジックを層内で再実装しない
+//! - [`reproducibility`][]: 3 seed 以上の Wilson 95% 信頼区間の重なり判定
+//!   （REQ-26 境界値・TASK-26.3-1・issue #104）。公開 API は
+//!   `(seed, correct, total, eval_data_hash)` の組（[`reproducibility::SeedRun`]）
+//!   を受け取る [`reproducibility::judge_reproducibility`] のみで、区間
+//!   （[`wilson`] が返す型）を直接受け取る内部関数は seed・評価データの
+//!   由来を検証できないため crate 内部限定（issue #104 レビュー指摘・
+//!   PR #243）
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -77,6 +88,16 @@
 //!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
 //!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
 //!   統合は未実装）
+//! - 旧モデルとの回帰件数・改善件数（REQ-26）: 件数の算出は実装済み
+//!   （TASK-26.1-1・issue #100・[`regression`]）。Wilson 95% 信頼区間の付与
+//!   （TASK-26.1-2・issue #101）・ラベル集合相違の前提明記（TASK-26.2）・
+//!   作り直し判定（TASK-20.1）との接続・CLI `evaluate`
+//!   工程への配線（issue #140）は未実装
+//! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:
+//!   判定ロジックは実装済み（TASK-26.3-1・issue #104・[`reproducibility`]）。
+//!   CPU 決定性テスト・GPU 未確認の限界の詳しい記述は未実装（issue #105）。
+//!   CLI `evaluate` への配線・3 seed 再学習ジョブ（REQ-34）との接続・
+//!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -133,6 +154,8 @@ pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;
+pub mod regression;
+pub mod reproducibility;
 pub mod sample_size;
 pub mod significance;
 pub mod wilson;
