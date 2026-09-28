@@ -317,9 +317,12 @@ impl WorkerFailure {
         self.code.as_str()
     }
 
-    /// 型付きの失敗コード（REQ-21・REQ-39・#178。`crates/train/src/process.rs`
-    /// が終了コード写像の突き合わせ〔ワーカーの終了コードと JSON の `code`
-    /// が対応する終了コードで一致するか〕に使う）。
+    /// 型付きの失敗コード（[`FailureCode`]）。呼び出し元（`crates/train::time_allotment`
+    /// の `run_candidate`。TASK-18.1-1）が `code() == "limit_exceeded"` の
+    /// ような文字列比較を書かずに、許可リストの列挙値で分岐できるようにする。
+    /// `crates/train/src/process.rs`（REQ-21・REQ-39・#178）も終了コード写像の
+    /// 突き合わせ〔ワーカーの終了コードと JSON の `code` が対応する終了コードで
+    /// 一致するか〕にこの値を使う。
     #[must_use]
     pub fn failure_code(&self) -> FailureCode {
         self.code
@@ -1482,5 +1485,21 @@ mod tests {
         assert!(!display.contains("leak-me"));
         assert!(!debug.contains("secret_key_XYZ"));
         assert!(!debug.contains("leak-me"));
+    }
+
+    /// REQ-18・TASK-18.1-1: `WorkerFailure::failure_code()` は `code()` が
+    /// 表す文字列と同じ [`FailureCode`] を返す（`crates/train::time_allotment`
+    /// が `limit_exceeded` を型で判定するために使う）。
+    #[test]
+    fn task18_1_1_failure_code_returns_typed_variant_for_limit_exceeded() {
+        let json = r#"{"status":"error","code":"limit_exceeded","message":"training exceeded wall-clock budget of 2 seconds"}"#;
+        let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request())
+            .expect("valid error outcome");
+        match outcome {
+            TrainOutcome::Error(failure) => {
+                assert_eq!(failure.failure_code(), FailureCode::LimitExceeded);
+            }
+            TrainOutcome::Ok(_) => panic!("expected Error"),
+        }
     }
 }

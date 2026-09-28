@@ -27,6 +27,13 @@
 //! 推論ランタイムはこの crate に依存しない（推論経路に学習側の型を持ち込ま
 //! ない。REQ-32・`.claude/rules/coding-rust.md`）。
 //!
+//! [`time_allotment`] は探索予算（REQ-18。既定 1 時間）のうち候補 1 件へ
+//! 配分する持ち時間の算出・実行記録を担う（TASK-18.1-1・issue #83）。
+//! 子プロセスの起動・タイムアウト・終了コード写像（ワーカーの `code` から
+//! [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）は [`process`]
+//! モジュールが実装する（issue #178）。[`time_allotment::CandidateRunner`]
+//! はこの実行器を差し込むための接合点（trait）を提供する。
+//!
 //! # スコープ外（#178 以降も対象外）
 //!
 //! - `kind` ごとの `config` 検証（`config` は「JSON オブジェクトであること」
@@ -47,6 +54,8 @@
 //!   [`process`] モジュール doc「孤児化の限界」参照。native `kill(2)` の
 //!   直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe` 新規導入のいずれも
 //!   ユーザー承認事項のため対象外）
+//! - 探索予算全体の積算・複数候補の比較・選定の記録（#84・TASK-18.1-2）
+//! - 「予算到達」を合格扱いしない判定（TASK-18.2）
 
 pub mod error;
 mod kind_defaults;
@@ -54,3 +63,4 @@ pub mod limits;
 pub mod process;
 pub mod request;
 pub mod result;
+pub mod time_allotment;
