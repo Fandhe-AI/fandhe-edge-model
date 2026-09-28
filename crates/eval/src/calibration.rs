@@ -162,8 +162,33 @@ pub enum CalibrationError {
         /// `top1` スライス内での位置（0 始まり）。
         index: usize,
     },
+    /// [`select_threshold`] に渡された top1 確率が確率として不正な範囲
+    /// （`0.0..=1.0` の外）。有限だが `-1.0` や `2.0` のような値を確率・
+    /// 保留しきい値として扱わない（REQ-23 不正なスコアの扱い）。
+    Top1OutOfRange {
+        /// `top1` スライス内での位置（0 始まり）。
+        index: usize,
+    },
     /// top1 確率のスライスが空（0 件からは τ を決定できない）。
     EmptyTop1,
+    /// [`select_threshold`] に渡された `top1` の件数が上限
+    /// （[`significance::MAX_EVAL_RECORDS`]）を超える。[`calibrate`] を
+    /// 経由せず外部から直接呼べる公開関数のため、確保・ソート前に
+    /// 件数を検証する（REQ-39 ガード層「資源の上限」）。
+    TooManyTop1 {
+        /// 渡された件数。
+        n: usize,
+        /// 上限。
+        limit: usize,
+    },
+    /// 校正計算の中間・最終結果が非有限になった。個々のロジット・
+    /// ロジット差分（`d_k`）は有限でも、`β·d_gold` 等の掛け算・累積で
+    /// オーバーフローし `±∞` になりうるため、返却前に検証する
+    /// （評価契約の fail-closed 原則。REQ-27・`.claude/rules/evaluation-contract.md`）。
+    NonFiniteResult {
+        /// 発生箇所の説明（人が読める短い文字列。機械照合はしない）。
+        detail: String,
+    },
     /// 集計中の内部不整合（理論上到達しないが fail-closed のため用意する）。
     Internal {
         /// 発生箇所の説明（人が読める短い文字列。機械照合はしない）。
@@ -208,7 +233,19 @@ impl fmt::Display for CalibrationError {
             CalibrationError::NonFiniteTop1 { index } => {
                 write!(f, "non-finite top1 probability at index {index}")
             }
+            CalibrationError::Top1OutOfRange { index } => {
+                write!(
+                    f,
+                    "top1 probability out of range [0.0, 1.0] at index {index}"
+                )
+            }
             CalibrationError::EmptyTop1 => write!(f, "top1 slice must not be empty"),
+            CalibrationError::TooManyTop1 { n, limit } => {
+                write!(f, "too many top1 values: {n} exceeds limit {limit}")
+            }
+            CalibrationError::NonFiniteResult { detail } => {
+                write!(f, "non-finite calibration result: {detail}")
+            }
             CalibrationError::Internal { detail } => {
                 write!(f, "internal calibration error: {detail}")
             }
@@ -487,9 +524,21 @@ pub fn select_threshold(top1: &[f64]) -> Result<f64, CalibrationError> {
     if top1.is_empty() {
         return Err(CalibrationError::EmptyTop1);
     }
+    // `calibrate` を経由せず外部から直接呼べる公開関数のため、複製・
+    // ソート（確保・計算量が O(n log n)）の前に件数を検証する
+    // （REQ-39 ガード層「資源の上限」）。
+    if top1.len() > significance::MAX_EVAL_RECORDS {
+        return Err(CalibrationError::TooManyTop1 {
+            n: top1.len(),
+            limit: significance::MAX_EVAL_RECORDS,
+        });
+    }
     for (index, &v) in top1.iter().enumerate() {
         if !v.is_finite() {
             return Err(CalibrationError::NonFiniteTop1 { index });
+        }
+        if !(0.0..=1.0).contains(&v) {
+            return Err(CalibrationError::Top1OutOfRange { index });
         }
     }
 
@@ -598,6 +647,21 @@ pub fn calibrate(
     let ece_t1 = ece_of_beta(1.0, &rows);
     let ece_t_star = ece_of_beta(beta_star, &rows);
 
+    // 各ロジット・差分（`d_k`）は有限でも、`β·d_gold` の掛け算や
+    // `Σ exp(β·d_k)` の累積でオーバーフローし、NLL が `±∞` になりうる
+    // （例: `d_gold` が極端な有限の負値で `β` を掛けると桁あふれする）。
+    // 評価契約の fail-closed 原則（REQ-27）に従い、返却前に検証する。
+    if !nll_t1.is_finite() {
+        return Err(CalibrationError::NonFiniteResult {
+            detail: "mean_nll at T=1.0 is not finite".to_string(),
+        });
+    }
+    if !nll_t_star.is_finite() {
+        return Err(CalibrationError::NonFiniteResult {
+            detail: "mean_nll at T=T* is not finite".to_string(),
+        });
+    }
+
     // 採否: 厳密な `<`（同値なら採用しない）。
     let adopted = ece_t_star < ece_t1;
     let chosen_temperature = if adopted { temperature_star } else { 1.0 };
@@ -699,5 +763,71 @@ mod tests {
             argmax_index: 0,
         }];
         assert!(approx_eq(h_of_beta(1.0, &rows), 0.0));
+    }
+
+    /// REQ-39（ガード層「資源の上限」）: `select_threshold` は `calibrate`
+    /// を経由せず外部から直接渡された `top1` の件数を、確保・ソート前に
+    /// 上限（[`significance::MAX_EVAL_RECORDS`]）で検証し拒否する。
+    #[test]
+    fn req39_select_threshold_rejects_top1_exceeding_max_records() {
+        // 実際に上限件数の Vec を確保せず、上限超過を境界値のみで確認する
+        // （`MAX_EVAL_RECORDS` は 100 万件でテスト自体が重くなるため）。
+        let n = significance::MAX_EVAL_RECORDS + 1;
+        let top1 = vec![0.5_f64; n];
+        let err = select_threshold(&top1).expect_err("upper limit must be rejected");
+        assert_eq!(
+            err,
+            CalibrationError::TooManyTop1 {
+                n,
+                limit: significance::MAX_EVAL_RECORDS,
+            }
+        );
+    }
+
+    /// REQ-23（不正なスコアの扱い）: `select_threshold` は `0.0..=1.0` の
+    /// 範囲外の値を確率として受け入れない（有限だが不正な `-1.0`・`2.0`）。
+    #[test]
+    fn req23_select_threshold_rejects_out_of_range_probability() {
+        let err =
+            select_threshold(&[0.5, -1.0, 0.9]).expect_err("negative probability must be rejected");
+        assert_eq!(err, CalibrationError::Top1OutOfRange { index: 1 });
+
+        let err = select_threshold(&[0.5, 2.0, 0.9]).expect_err("probability > 1 must be rejected");
+        assert_eq!(err, CalibrationError::Top1OutOfRange { index: 1 });
+    }
+
+    /// REQ-23: `0.0`・`1.0` は範囲の境界として許可される。
+    #[test]
+    fn req23_select_threshold_accepts_boundary_probabilities() {
+        assert!(select_threshold(&[0.0, 1.0, 0.5]).is_ok());
+    }
+
+    /// REQ-27（評価契約の fail-closed 原則）: `calibrate` は個々のロジット
+    /// が有限でも、正規化後の差分 `d_gold` が極端な有限値になり `mean_nll`
+    /// の計算過程がオーバーフローする入力を `NonFiniteResult` として拒否
+    /// し、無限大の NLL を含む `Calibration` を返さない。gold ではない
+    /// ラベルのロジットが `f64::MAX / 2`（argmax）、gold のロジットが
+    /// `-f64::MAX / 2` のとき、正規化後の `d_gold = -f64::MAX / 2 -
+    /// f64::MAX / 2 = -f64::MAX` は有限（オーバーフローしない厳密な減算）
+    /// だが、`mean_nll` の `sum_exp.ln() − β·d_gold`（`β=1.0`）が 1 行あたり
+    /// `f64::MAX` になり、2 行分を合計する `Σ` でオーバーフローして
+    /// `+∞` になる（個々の値は有限でも合算で非有限になる例）。
+    #[test]
+    fn req27_calibrate_rejects_overflow_to_nonfinite_nll() {
+        let labels = ["a", "b"];
+        let logits: [f64; 2] = [-f64::MAX / 2.0, f64::MAX / 2.0];
+        let records = vec![
+            CalibrationRecord {
+                gold: "a",
+                logits: &logits,
+            },
+            CalibrationRecord {
+                gold: "a",
+                logits: &logits,
+            },
+        ];
+        let err =
+            calibrate(&labels, &records).expect_err("overflow to non-finite NLL must be rejected");
+        assert!(matches!(err, CalibrationError::NonFiniteResult { .. }));
     }
 }
