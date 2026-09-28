@@ -64,13 +64,16 @@ const HASH_INPUT_RULE: &str = "canonical-json-sorted-record-ids-v1";
 /// 新しい `RecordedSplit` を組み立てられてしまい、上記の対応保証を型で
 /// 強制できなくなるため（レビュー指摘。#210 Cursor Bugbot Medium）。
 ///
-/// `Debug` は派生させず手動実装する（下記）。`result`（[`SplitResult`]）は
-/// `by_record` にレコード ID を実キーとして持ち、`SplitResult` 自体は
-/// `derive(Debug)` のため `{:?}` でそのまま出力するとレコード ID が漏れる。
-/// `record`（[`SplitRecord`]）側は本モジュールの他の型が手動実装した
-/// `Debug` により既に ID を伏せているが、`result` はその redaction の
-/// 対象外だったため本型でも直接漏洩しうる状態だった
-/// （security.md「秘密情報の混入防止」。PR #210 Cursor Bugbot Medium 指摘）。
+/// `Debug` は手動実装する（下記。`derive(Debug)` でも安全になったが、
+/// フィールドを直接それぞれ列挙して伏せの根拠を明示するため維持する）。
+/// `result`（[`crate::split::SplitResult`]）・`record`（[`SplitRecord`]）
+/// はいずれも各自が手動実装した `Debug` でレコード ID・group ID・ラベルを
+/// 伏せているため、本型を `{:?}` で出力しても値は漏れない。当初は
+/// `SplitResult` が `derive(Debug)` のままで `by_record`（レコード ID を
+/// 実キーとして持つ）等をそのまま出力し、本型固有の redaction でしか
+/// 防げていなかった（PR #210 Cursor Bugbot Medium 指摘）。現在は
+/// `SplitResult` 自体を手動実装した `Debug` で伏せている
+/// （PR #210 codex レビュー追加 P0 指摘）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedSplit {
     result: SplitResult,
@@ -80,14 +83,7 @@ pub struct RecordedSplit {
 impl std::fmt::Debug for RecordedSplit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordedSplit")
-            .field(
-                "result",
-                &format_args!(
-                    "<redacted {} records, {} groups>",
-                    self.result.by_record.len(),
-                    self.result.by_group.len()
-                ),
-            )
+            .field("result", &self.result)
             .field("record", &self.record)
             .finish()
     }
@@ -1505,31 +1501,39 @@ mod tests {
     #[test]
     fn req17_task17_1_2_debug_output_does_not_leak_labels() {
         let records = vec![
-            record("r1", "g1", "secret-label"),
-            record("r2", "g2", "secret-label"),
-            record("r3", "g3", "other-label"),
-            record("r4", "g4", "other-label"),
+            record("r1", "secret-group-1", "secret-label"),
+            record("r2", "secret-group-2", "secret-label"),
+            record("r3", "secret-group-3", "other-label"),
+            record("r4", "secret-group-4", "other-label"),
         ];
         let recorded =
             split_and_record(&records, 5, &SplitRatios::default()).expect("valid ratios");
 
-        let rule_debug = format!("{:?}", recorded.record().rule());
-        assert!(
-            !rule_debug.contains("secret-label") && !rule_debug.contains("other-label"),
-            "SplitRule の Debug 出力にラベルが含まれてはならない: {rule_debug}"
-        );
+        let forbidden = ["secret-label", "other-label", "secret-group"];
+        let assert_no_leak = |label: &str, debug: &str| {
+            for needle in forbidden {
+                assert!(
+                    !debug.contains(needle),
+                    "{label} の Debug 出力に {needle} が含まれてはならない: {debug}"
+                );
+            }
+        };
 
-        let record_debug = format!("{:?}", recorded.record());
-        assert!(
-            !record_debug.contains("secret-label") && !record_debug.contains("other-label"),
-            "SplitRecord の Debug 出力にラベルが含まれてはならない: {record_debug}"
+        assert_no_leak("SplitRule", &format!("{:?}", recorded.record().rule()));
+        // `SplitRule::per_label()` が返すスライスを直接 `{:?}` した場合も
+        // `LabelAllocation` の手動 Debug 実装により伏せられることを確認する
+        // （PR #210 codex レビュー追加指摘: SplitRule のラップだけでなく
+        // 要素の `LabelAllocation` 自体を伏せる必要がある）。
+        assert_no_leak(
+            "[LabelAllocation]",
+            &format!("{:?}", recorded.record().rule().per_label()),
         );
-
-        let recorded_debug = format!("{recorded:?}");
-        assert!(
-            !recorded_debug.contains("secret-label") && !recorded_debug.contains("other-label"),
-            "RecordedSplit の Debug 出力にラベルが含まれてはならない: {recorded_debug}"
-        );
+        assert_no_leak("SplitRecord", &format!("{:?}", recorded.record()));
+        // `RecordedSplit::result()` が返す `SplitResult` を直接 `{:?}` した
+        // 場合も、レコード ID・group ID・ラベルのいずれも漏れないことを
+        // 確認する（PR #210 codex レビュー追加指摘）。
+        assert_no_leak("SplitResult", &format!("{:?}", recorded.result()));
+        assert_no_leak("RecordedSplit", &format!("{recorded:?}"));
     }
 
     /// レビュー指摘（Low。#45）の回帰テスト: JSON を改ざんして

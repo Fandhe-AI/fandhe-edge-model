@@ -146,7 +146,15 @@ impl SplitRatios {
 /// `SplitRecordDto` 経由で外部 JSON から復元する際、`per_label` の要素に
 /// 余分なキーが混入しても黙って無視せず拒否する（他の永続化用 DTO と
 /// 同じ厳格構造検証の契約。coding-rust.md「外部入力」）。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`label` は利用者のデータ由来の
+/// ラベル文字列であり、`derive(Debug)` のまま `{:?}` で出力するとそのまま
+/// ログへ漏れる（security.md「秘密情報の混入防止」。PR #210 codex レビュー
+/// P0 指摘: `SplitRule::per_label()` が返すスライスを直接 `{:?}` した場合も
+/// 同じ経路で漏れうるため、この型自体で伏せる）。`Serialize`/`Deserialize`
+/// は永続化用のため実値のまま維持する（Debug とは別の経路であり、
+/// 呼び出し元がファイル I/O を通じて意図的に読み書きする値のため）。
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LabelAllocation {
     pub label: String,
@@ -156,13 +164,33 @@ pub struct LabelAllocation {
     pub test: usize,
 }
 
+impl std::fmt::Debug for LabelAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabelAllocation")
+            .field("label", &"<redacted>")
+            .field("n_groups", &self.n_groups)
+            .field("train", &self.train)
+            .field("validation", &self.validation)
+            .field("test", &self.test)
+            .finish()
+    }
+}
+
 /// 分割結果一式。
 ///
 /// フィールドはすべて `BTreeMap` とし、反復順序が実行のたびに変わらないようにする
 /// （`HashMap` は使わない。決定性の不変条件を壊す典型的な原因のため。
 /// [evaluation-contract](../../../.claude/rules/evaluation-contract.md)）。
 /// 後続 #45（TASK-17.1-2）はこの型から各 split のレコード ID 集合を取り出してハッシュ化する。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`by_record`・`by_group` は
+/// レコード ID・group ID を実キーとして持ち、`per_label` は
+/// [`LabelAllocation`] 経由でラベル文字列を持つため、`derive(Debug)` の
+/// まま `{:?}` で出力するとそれらがすべてログへ漏れる（security.md
+/// 「秘密情報の混入防止」。PR #210 codex レビュー P0 指摘: この型を返す
+/// [`crate::split_record::RecordedSplit::result`] を直接 `{:?}` した場合に
+/// 漏れる経路があったため、この型自体で伏せる）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SplitResult {
     pub by_record: BTreeMap<String, Split>,
     pub by_group: BTreeMap<String, Split>,
@@ -170,6 +198,23 @@ pub struct SplitResult {
     /// 分割規則の識別子（#45 が記録する「規則」に含める）。
     /// アルゴリズム（割付規則・PRNG の種類）を変えたら値を変える。
     pub rule_id: &'static str,
+}
+
+impl std::fmt::Debug for SplitResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitResult")
+            .field(
+                "by_record",
+                &format_args!("<redacted {} records>", self.by_record.len()),
+            )
+            .field(
+                "by_group",
+                &format_args!("<redacted {} groups>", self.by_group.len()),
+            )
+            .field("per_label", &self.per_label)
+            .field("rule_id", &self.rule_id)
+            .finish()
+    }
 }
 
 /// 割付規則・PRNG 実装の識別子。値を変えたら過去の分割結果との互換性が失われる。
