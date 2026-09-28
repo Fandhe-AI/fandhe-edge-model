@@ -3,10 +3,12 @@
 //!
 //! `FakeClock`・`FakeRunner` で時計と学習ワーカーの実行を差し替え、
 //! `crates/train::time_allotment::run_candidate` が
-//! - 持ち時間を明示的に短くした候補が時間超過で打ち切られ、超過時刻が
-//!   記録されること（`TimeLimitReached`）
-//! - 持ち時間未満で打ち切られた場合は別分類（`OtherLimitExceeded`）になる
-//!   こと
+//! - 持ち時間を明示的に短くした候補が `limit_exceeded` で打ち切られ、
+//!   経過時間が持ち時間以上だった観測値が記録されること
+//!   （`LimitExceeded { elapsed_reached_time_limit: true }`。打ち切り原因
+//!   〔持ち時間か他の資源上限か〕は断定しない）
+//! - 経過時間が持ち時間未満で打ち切られた場合は観測値が `false` になる
+//!   こと（`LimitExceeded { elapsed_reached_time_limit: false }`）
 //! - 成功・その他の失敗・実行器のエラーを正しく扱うこと
 //!
 //! を検証する。`thread::sleep` や実時間には依存しない（3 OS の CI での
@@ -148,10 +150,10 @@ impl CandidateRunner for AlwaysFailingRunner {
 
 /// 受け入れ条件（本 Issue の主テスト）: `Fixed(2)` で 2 秒の持ち時間を
 /// 配分した候補が、7 秒経過後に `limit_exceeded` を返した場合、
-/// `TimeLimitReached` として記録され、超過時刻が
-/// `started_at_unix_ms + elapsed_ms` と一致する。
+/// `LimitExceeded { elapsed_reached_time_limit: true }` として記録される
+/// （経過時間が持ち時間以上だった観測値。打ち切り原因は断定しない）。
 #[test]
-fn task18_1_1_candidate_exceeding_time_limit_is_recorded_as_time_limit_reached() {
+fn task18_1_1_candidate_exceeding_time_limit_is_recorded_as_limit_exceeded() {
     const STARTED_AT_UNIX_MS: u64 = 1_700_000_000_000;
     let clock = FakeClock::new(STARTED_AT_UNIX_MS);
     let fixed = std::num::NonZeroU32::new(2).expect("non-zero");
@@ -191,26 +193,27 @@ fn task18_1_1_candidate_exceeding_time_limit_is_recorded_as_time_limit_reached()
     assert_eq!(run.record().elapsed_ms(), 7000);
     assert_eq!(
         run.record().status(),
-        CandidateTimeStatus::TimeLimitReached {
-            exceeded_at_unix_ms: STARTED_AT_UNIX_MS + 7000
+        CandidateTimeStatus::LimitExceeded {
+            elapsed_reached_time_limit: true
         }
     );
 
     let serialized = serde_json::to_value(run.record()).expect("serialize record");
     assert_eq!(
         serialized.get("status"),
-        Some(&serde_json::json!("time_limit_reached"))
+        Some(&serde_json::json!("limit_exceeded"))
     );
     assert_eq!(
-        serialized.get("exceeded_at_unix_ms"),
-        Some(&serde_json::json!(STARTED_AT_UNIX_MS + 7000))
+        serialized.get("elapsed_reached_time_limit"),
+        Some(&serde_json::json!(true))
     );
 }
 
 /// 判別のテスト: `limit_exceeded` でも、経過時間が持ち時間未満なら
-/// `OtherLimitExceeded`（RSS 等、持ち時間以外の資源上限による打ち切り）。
+/// `elapsed_reached_time_limit: false`（RSS 等、持ち時間以外の資源上限
+/// による打ち切りの可能性が高いが、ここでは断定しない）。
 #[test]
-fn task18_1_1_limit_exceeded_before_deadline_is_other_limit_exceeded() {
+fn task18_1_1_limit_exceeded_before_deadline_has_elapsed_reached_time_limit_false() {
     let clock = FakeClock::new(1_700_000_000_000);
     let fixed = std::num::NonZeroU32::new(2).expect("non-zero");
     let allotment = allot(
@@ -241,7 +244,9 @@ fn task18_1_1_limit_exceeded_before_deadline_is_other_limit_exceeded() {
 
     assert_eq!(
         run.record().status(),
-        CandidateTimeStatus::OtherLimitExceeded
+        CandidateTimeStatus::LimitExceeded {
+            elapsed_reached_time_limit: false
+        }
     );
 }
 

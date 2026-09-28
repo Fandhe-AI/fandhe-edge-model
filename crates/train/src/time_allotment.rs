@@ -283,22 +283,31 @@ pub trait CandidateRunner {
 
 /// 候補 1 件の打ち切り分類（TASK-18.2 の「予算到達を合格扱いしない」判定は
 /// 本モジュールの対象外。ここでは観測結果の記録に留める）。
+///
+/// `code == "limit_exceeded"` は学習ワーカー側で時間以外の資源上限
+/// （RSS・ステップ数・トークン数・モデルサイズ・`RLIMIT_CPU` 等）にも
+/// 使われる共通コードであり、本モジュールはワーカーから打ち切り原因を
+/// 型付きで受け取っていない（実行器 [`CandidateRunner`] は #178 が実装する
+/// スタブで、原因の受け渡しは未実装）。そのため `code == "limit_exceeded"`
+/// の打ち切りは [`LimitExceeded`](CandidateTimeStatus::LimitExceeded) 1 種
+/// にまとめ、単調時計で測った経過時間が持ち時間以上だったかを観測値として
+/// 添えるに留め、原因を断定しない（P1 指摘。#178 が原因を型付きで供給する
+/// ようになった時点で分類を分けられるようにする。REQ-18・REQ-39）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CandidateTimeStatus {
     /// 学習ワーカーが成功した。
     Completed,
-    /// 持ち時間超過による打ち切り（`code == "limit_exceeded"` かつ、
-    /// 単調時計で測った経過時間が持ち時間以上）。
-    TimeLimitReached {
-        /// 打ち切りを Rust 側が観測した壁時計時刻（UNIX ミリ秒）。
-        exceeded_at_unix_ms: u64,
+    /// `code == "limit_exceeded"` による打ち切り。原因（持ち時間・RSS 等の
+    /// 他の資源上限）はワーカー出力から特定できないため断定しない。
+    LimitExceeded {
+        /// 単調時計で測った経過時間が、配分した持ち時間以上だったかの
+        /// 観測値（原因の断定ではない。終了処理を含む `runner.run` の
+        /// 所要時間には時間以外の上限超過後の終了猶予も含まれうるため、
+        /// `true` は「時間超過の可能性が高い」ことを示すに留まる）。
+        elapsed_reached_time_limit: bool,
     },
-    /// `code == "limit_exceeded"` だが、経過時間が持ち時間未満の打ち切り
-    /// （RSS・ステップ数・トークン数・モデルサイズ・`RLIMIT_CPU` 等、
-    /// 持ち時間以外の資源上限による打ち切り）。
-    OtherLimitExceeded,
     /// 持ち時間超過以外のワーカー失敗。
     Failed {
         /// ワーカーが返した失敗コード。
@@ -314,7 +323,7 @@ pub enum CandidateTimeStatus {
 /// `Serialize` はテスト・将来の記録永続化（#84）向けの往復検証用。
 /// `status` は [`CandidateTimeStatus`] のタグをレコード直下へ展開する
 /// （`#[serde(flatten)]`）: `serde_json::to_value(record)["status"]` が
-/// `"time_limit_reached"` のようなタグ文字列そのものになる。
+/// `"limit_exceeded"` のようなタグ文字列そのものになる。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CandidateTimeRecord {
     /// 実際にリクエストへ渡した持ち時間（秒）。
@@ -467,7 +476,7 @@ where
     let elapsed_ms = u64::try_from(elapsed.as_millis())
         .map_err(|_| CandidateTimeError::Clock(TimeAllotmentError::ClockUnavailable))?;
 
-    let status = classify(&outcome, elapsed_ms, time_limit_seconds, ended_at_unix_ms);
+    let status = classify(&outcome, elapsed_ms, time_limit_seconds);
 
     Ok(CandidateRun {
         record: CandidateTimeRecord {
@@ -482,12 +491,14 @@ where
     })
 }
 
-/// [`run_candidate`] の分類規則（モジュール doc「打ち切り分類」参照）。
+/// [`run_candidate`] の分類規則（[`CandidateTimeStatus`] のドキュメント
+/// 参照）。`code == "limit_exceeded"` の打ち切り原因（持ち時間か、RSS 等の
+/// 他の資源上限か）はワーカー出力から特定できないため断定せず、経過時間が
+/// 持ち時間以上だったかの観測値だけを添える。
 fn classify(
     outcome: &TrainOutcome,
     elapsed_ms: u64,
     time_limit_seconds: u32,
-    ended_at_unix_ms: u64,
 ) -> CandidateTimeStatus {
     let TrainOutcome::Error(failure) = outcome else {
         return CandidateTimeStatus::Completed;
@@ -498,12 +509,8 @@ fn classify(
         };
     }
     let time_limit_ms = u64::from(time_limit_seconds).saturating_mul(1000);
-    if elapsed_ms >= time_limit_ms {
-        CandidateTimeStatus::TimeLimitReached {
-            exceeded_at_unix_ms: ended_at_unix_ms,
-        }
-    } else {
-        CandidateTimeStatus::OtherLimitExceeded
+    CandidateTimeStatus::LimitExceeded {
+        elapsed_reached_time_limit: elapsed_ms >= time_limit_ms,
     }
 }
 
