@@ -28,6 +28,9 @@
 //!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
 //!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
 //!   工程（将来）から評価処理を渡す想定
+//! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
+//!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
+//!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -50,7 +53,9 @@
 //!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
 //!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が
 //!   事前に算出した値を渡す必要がある（TASK-25.2）。
-//!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
+//!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
+//!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
+//!   統合は未実装）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -93,6 +98,7 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
+pub mod holm;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
