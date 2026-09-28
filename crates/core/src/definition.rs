@@ -494,6 +494,66 @@ impl std::error::Error for DefinitionError {
 }
 
 impl DefinitionError {
+    /// CLI／MCP の JSON 出力（`ErrorReport.message`）へそのまま載せてよい、
+    /// バリアントごとの固定の公開メッセージ（PR #217 レビュー指摘・P0）。
+    ///
+    /// [`std::fmt::Display`] 実装はパス（`Read`・`TooLarge`・`NotRegularFile`）
+    /// や利用者指定値（`UnsupportedSchema.schema`・`DuplicateOptionId.id`）を
+    /// そのまま含むため、外部（Claude Code・Codex 等）へ返す JSON の
+    /// `message` に使うと秘密情報・ファイルパスの混入防止
+    /// （security.md「秘密情報の混入防止（P0）」）に反する。本メソッドは
+    /// そうした値を一切含めず、`reason_code()` と対になる固定文のみを返す
+    /// （`Display` はサイズ・件数等の非秘匿値を含む詳細な内部診断表現とし
+    /// て残し、両者の用途を分離する）。`MissingField`・`TypeMismatch`・
+    /// `UnknownField`・`UnsupportedValue` の `field`／`parent`（[`FieldPath`]）
+    /// はスキーマが定義する固定の位置情報であり利用者データではないため、
+    /// 引き続き含めてよい。
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        match self {
+            DefinitionError::Read { .. } => "failed to read definition file".to_string(),
+            DefinitionError::TooLarge { size, limit, .. } => format!(
+                "definition input is too large: {size} bytes (limit: {limit} bytes)"
+            ),
+            DefinitionError::Parse { .. } => {
+                "failed to parse definition file: invalid JSON".to_string()
+            }
+            DefinitionError::UnsupportedSchema { .. } => {
+                format!("unsupported definition schema (expected {SCHEMA_ID:?})")
+            }
+            DefinitionError::EmptyOptions => "definition options must not be empty".to_string(),
+            DefinitionError::EmptyOptionId => {
+                "definition option id must not be empty".to_string()
+            }
+            DefinitionError::DuplicateOptionId { .. } => {
+                "definition option id is duplicated".to_string()
+            }
+            DefinitionError::NotRegularFile { .. } => {
+                "definition path is not a regular file".to_string()
+            }
+            DefinitionError::MissingField { field } => {
+                format!("definition field {field} is missing")
+            }
+            DefinitionError::MissingLabels => {
+                "definition has no label definition (options); a default label set is never substituted".to_string()
+            }
+            DefinitionError::TypeMismatch {
+                field,
+                expected,
+                actual,
+            } => format!(
+                "definition field {field} has wrong type: expected {expected}, found {actual}"
+            ),
+            DefinitionError::UnknownField { parent, .. } => {
+                format!("definition field {parent} has an unknown key")
+            }
+            DefinitionError::UnsupportedValue { field } => {
+                format!("definition field {field} has an unsupported value")
+            }
+            DefinitionError::EmptyName => "definition name must not be empty".to_string(),
+        }
+    }
+
     /// 機械可読な snake_case のエラーコード（CLI・MCP の JSON 出力契約
     /// （REQ-21・REQ-33）へ配線する際の接続点。本 TASK では配線しない）。
     ///
