@@ -14,7 +14,7 @@
 //!   本 crate への `sha2` 配置についてユーザー承認を得る想定）
 //! - `serde` の `Serialize`/`Deserialize` は派生しない（JSON 入出力は
 //!   issue #75 の範囲。`crates/data/Cargo.toml` に `serde` を追加していない）
-//! - 生成元（`source`）フィールド・Jev 出力の既定拒否は TASK-40.2 の範囲
+//! - 生成元（`source`）フィールド・外部 LLM 出力の既定拒否は TASK-40.2 の範囲
 //!   （[`ProvenanceRecord`] は `#[non_exhaustive]` のため非破壊で追加できる）
 //! - データ本文・指示文本文そのものは保持しない（[`PromptHash`] のみ保持する）
 //!
@@ -426,10 +426,12 @@ fn is_leap_year(year: u16) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-/// 指定した年月の日数（うるう年の 2 月を考慮する）。呼び出し側で
-/// `month` が 1〜12 の範囲であることを確認済みである前提（範囲外は
-/// `get` で `30` を返す実装にせず、フォールバックを `31` にして呼び出し側の
-/// 範囲チェックに必ず引っかからせる）。
+/// 指定した年月の日数（うるう年の 2 月を考慮する）。呼び出し側
+/// （[`GeneratedAt::parse_rfc3339_utc`]）で `month` が 1〜12 の範囲で
+/// あることを確認してから呼ばれる前提のため、`match` の `None` 腕
+/// （`month` が範囲外の場合のフォールバック `31`）は到達しない。
+/// 呼び出し順が変わった場合に誤った日数（黙って `30` や `0` 等）を
+/// 返さないよう、`unwrap` の代わりに明示的な分岐として残している。
 fn days_in_month(year: u16, month: u8) -> u8 {
     const DAYS: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     if month == 2 && is_leap_year(year) {
@@ -445,7 +447,8 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 ///
 /// cached／reasoning の内訳（PoC の `cached_input_tokens`・
 /// `reasoning_output_tokens`）は保持しない。必要になれば
-/// [`TokenCount`] が `#[non_exhaustive]` のため後から追加できる。
+/// [`TokenUsage`] へフィールドを追加する（本型は `#[non_exhaustive]` を
+/// 持たないため、追加時は破壊的変更として扱う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TokenUsage {
     input_tokens: u64,
