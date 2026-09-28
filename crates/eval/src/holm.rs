@@ -153,6 +153,28 @@ impl fmt::Display for HolmError {
 
 impl std::error::Error for HolmError {}
 
+/// `family_size` が件数 `n_tests` に対して妥当か検証する（上限超過 →
+/// 件数不足の順）。[`holm_adjust`]・[`compare_candidates_with_holm`] の
+/// 両方から、対象の `Vec` を確保する前に呼ぶ（REQ-39。空件数チェックの
+/// 直後・`collect()` より前に置くことで、上限超過の入力でもメモリ確保が
+/// 検証に先行しないようにする）。
+fn validate_family_size(family_size: FamilySize, n_tests: usize) -> Result<(), HolmError> {
+    let m = family_size.get();
+    if m > MAX_FAMILY_SIZE {
+        return Err(HolmError::FamilySizeTooLarge {
+            family_size: m,
+            limit: MAX_FAMILY_SIZE,
+        });
+    }
+    if m < n_tests {
+        return Err(HolmError::FamilySizeTooSmall {
+            family_size: m,
+            n_tests,
+        });
+    }
+    Ok(())
+}
+
 /// p 値の列を Holm 法で補正する（モジュールドキュメントの「手順」参照）。
 ///
 /// `family_size` は事前登録した族サイズ `m`。`p_values.len()` より
@@ -169,20 +191,8 @@ pub fn holm_adjust(p_values: &[PValue], family_size: FamilySize) -> Result<Vec<P
     if p_values.is_empty() {
         return Err(HolmError::EmptyPValues);
     }
-
+    validate_family_size(family_size, p_values.len())?;
     let m = family_size.get();
-    if m > MAX_FAMILY_SIZE {
-        return Err(HolmError::FamilySizeTooLarge {
-            family_size: m,
-            limit: MAX_FAMILY_SIZE,
-        });
-    }
-    if m < p_values.len() {
-        return Err(HolmError::FamilySizeTooSmall {
-            family_size: m,
-            n_tests: p_values.len(),
-        });
-    }
 
     // (入力インデックス, p 値) の組を p 値の昇順で安定ソートする。
     // `sort_by` は安定ソートのため、同値は入力順（インデックス昇順）を保つ。
@@ -267,6 +277,9 @@ impl HolmComparison {
 /// 戻り値は入力順。`comparisons` が空の場合は [`HolmError::EmptyPValues`]、
 /// `family_size` が `comparisons.len()` 未満の場合は
 /// [`HolmError::FamilySizeTooSmall`]（[`holm_adjust`] と同じ規則）を返す。
+/// これらの検証（空 → 上限超過 → 件数不足）は `comparisons` から p 値を
+/// 集める `Vec` の確保より前に行う（REQ-39。上限超過の入力でも確保が
+/// 検証に先行しないようにするため）。
 ///
 /// 脱落候補（事前登録した族に含まれるが今回評価しなかった候補）は
 /// 呼び出し側が本関数へ渡さない。`family_size` を固定したまま渡す候補数を
@@ -280,8 +293,11 @@ pub fn compare_candidates_with_holm(
     if comparisons.is_empty() {
         return Err(HolmError::EmptyPValues);
     }
+    validate_family_size(family_size, comparisons.len())?;
 
     let raw_p: Vec<PValue> = comparisons.iter().map(|c| c.test().p_two_sided()).collect();
+    // `validate_family_size` を通過済みのため `holm_adjust` 内の検証は
+    // 必ず成功する（同じ件数・`family_size` で再検証するだけ）。
     let adjusted_p = holm_adjust(&raw_p, family_size)?;
 
     let mut result = Vec::with_capacity(comparisons.len());
@@ -538,6 +554,62 @@ mod tests {
     fn compare_candidates_with_holm_empty_input_is_error() {
         let err = compare_candidates_with_holm(&[], family(1)).unwrap_err();
         assert_eq!(err, HolmError::EmptyPValues);
+    }
+
+    /// REQ-39（資源上限）: `family_size` が `MAX_FAMILY_SIZE` を超える場合、
+    /// `comparisons` から p 値を集める `Vec` を確保する前に
+    /// `FamilySizeTooLarge` を返す（issue #67 PR #231 レビュー指摘）。
+    /// 1 件の候補でも `family_size` 自体の上限超過を検出できることを
+    /// 確認し、検証が `collect()` に先行することを型のレベルで担保する。
+    #[test]
+    fn compare_candidates_with_holm_rejects_oversized_family_before_collecting() {
+        let labels = ["A", "B"];
+        let cand = Outcome::Label("B".to_string());
+        let base = Outcome::Label("A".to_string());
+        let records: Vec<PairedRecord<'_>> = (0..10)
+            .map(|_| PairedRecord {
+                gold: "B",
+                candidate: &cand,
+                baseline: &base,
+            })
+            .collect();
+        let comparison = compare_with_baseline(&labels, &records, req(1)).unwrap();
+
+        let err =
+            compare_candidates_with_holm(&[comparison], family(MAX_FAMILY_SIZE + 1)).unwrap_err();
+        assert_eq!(
+            err,
+            HolmError::FamilySizeTooLarge {
+                family_size: MAX_FAMILY_SIZE + 1,
+                limit: MAX_FAMILY_SIZE,
+            }
+        );
+    }
+
+    /// `family_size` が `comparisons.len()` 未満の場合も `collect()` より前に
+    /// `FamilySizeTooSmall` を返す。
+    #[test]
+    fn compare_candidates_with_holm_rejects_undersized_family_before_collecting() {
+        let labels = ["A", "B"];
+        let cand = Outcome::Label("B".to_string());
+        let base = Outcome::Label("A".to_string());
+        let records: Vec<PairedRecord<'_>> = (0..10)
+            .map(|_| PairedRecord {
+                gold: "B",
+                candidate: &cand,
+                baseline: &base,
+            })
+            .collect();
+        let comparison = compare_with_baseline(&labels, &records, req(1)).unwrap();
+
+        let err = compare_candidates_with_holm(&[comparison, comparison], family(1)).unwrap_err();
+        assert_eq!(
+            err,
+            HolmError::FamilySizeTooSmall {
+                family_size: 1,
+                n_tests: 2,
+            }
+        );
     }
 
     /// b <= c の候補は、補正後の p がどれだけ小さくても
