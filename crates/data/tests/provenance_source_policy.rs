@@ -177,7 +177,10 @@ fn req40_duplicate_source_key_is_rejected() {
 }
 
 /// 記録 JSON: `self`・欠落（`unspecified`）の各場合の `provenance_to_json`
-/// 出力キー `source` を完全一致で確認する。
+/// 出力に `"source":"<値>"` の部分文字列がキーと値の組として現れることを
+/// 確認する（JSON 全体の完全一致ではなく、`"source"` キーの断片一致で
+/// 判定する。他フィールドの追加・順序変更に対して脆くならないための
+/// 意図的な選択）。
 #[test]
 fn req40_provenance_to_json_includes_source_key() {
     let self_record = parse_provenance_json(&meta_json_with_source("self")).expect("valid");
@@ -185,6 +188,21 @@ fn req40_provenance_to_json_includes_source_key() {
 
     let unspecified_record = parse_provenance_json(&meta_json_without_source()).expect("valid");
     assert!(provenance_to_json(&unspecified_record).contains("\"source\":\"unspecified\""));
+}
+
+/// `provenance_to_json` の `JevOutput` シリアライズ経路（`as_wire_str` の
+/// `JevOutput` 腕）を単独で検証する。`check_default_training_source` は
+/// `ingest_records` の取り込み時点で `JevOutput` を拒否するため
+/// （[`req40_ingest_records_rejects_jev_output_source`]）、記録済みの
+/// `ProvenanceRecord` を経由した記録 JSON 化そのものは他のテストで
+/// 経由されない（Jev の来歴を意図的に保持したい将来の用途を想定した
+/// `with_source` 経由の直接構築で経路を通す）。
+#[test]
+fn req40_provenance_to_json_serializes_jev_output_source() {
+    let base = parse_provenance_json(&meta_json_without_source()).expect("valid");
+    let jev_record = base.with_source(GenerationSource::JevOutput);
+
+    assert!(provenance_to_json(&jev_record).contains("\"source\":\"jev_output\""));
 }
 
 /// エラー文言: `DisallowedSourceError`・`UnknownGenerationSource` の

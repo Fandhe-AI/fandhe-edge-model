@@ -24,8 +24,9 @@
 //!   [`check_default_training_source`] が単独で担う（来歴の記録と採用可否の
 //!   分離。CLI 接続時の終了コード写像（`invalid_input`=64 を想定）は
 //!   TASK-33.x の範囲で未実装）
-//! - Jev を許可する上書きフラグ・API は本モジュールに存在しない（自動運転
-//!   モードでの安全側の設計判断。追加は spec／ユーザー判断事項）
+//! - Jev を許可する上書きフラグ・API は本モジュールに存在しない
+//!   （fail-closed・上書き手段なしが REQ-40 受け入れ基準 2・NR-29 の
+//!   確定事項。追加は spec／ユーザー判断事項）
 //!
 //! # 呼び出し文脈
 //!
@@ -547,10 +548,21 @@ pub enum GenerationSource {
 }
 
 impl GenerationSource {
-    /// 来歴 JSON の `source` フィールド文字列から構築する（完全一致・
-    /// 大文字小文字を区別する許可リスト照合）。表記揺れ（`"Jev_output"`・
-    /// `"jev"` 等）・未知の値は拒否する（fail-closed。security.md
-    /// 「形式の許可制」）。
+    /// **外部入力（来歴 JSON の `source` フィールド）専用**の構築関数（完全
+    /// 一致・大文字小文字を区別する許可リスト照合）。表記揺れ
+    /// （`"Jev_output"`・`"jev"` 等）・未知の値は拒否する（fail-closed。
+    /// security.md「形式の許可制」）。
+    ///
+    /// `"unspecified"`（[`GenerationSource::Unspecified`] の
+    /// [`as_wire_str`](Self::as_wire_str) 表記）を意図的に許可リストへ
+    /// 含めない。`Unspecified` に至る唯一の経路は `source` キー欠落
+    /// （[`Default`] 実装）であり、外部入力が明示的に `"unspecified"` を
+    /// 指定できる契約にはなっていない。そのため本関数は
+    /// [`as_wire_str`](Self::as_wire_str) の出力を読み戻す用途には使えない
+    /// （非対称）。記録 JSON の読み戻し（現状未実装・YAGNI。本モジュール
+    /// doc の「スコープ境界」を参照）を実装する際は、この非対称性を踏まえ
+    /// 読み戻し専用の変換（`"unspecified"` を含む 3 値の許可リスト）を
+    /// 別に用意し、本関数を流用しないこと。
     pub fn from_wire(value: &str) -> Result<Self, ProvenanceError> {
         match value {
             "self" => Ok(GenerationSource::SelfPrepared),
@@ -560,6 +572,9 @@ impl GenerationSource {
     }
 
     /// 記録 JSON へ出力する際の表記（[`ingest::provenance_to_json`]）。
+    /// 書き込み専用の表記であり、[`from_wire`](Self::from_wire) は
+    /// `Unspecified` の表記 `"unspecified"` を受理しない（非対称。
+    /// [`from_wire`](Self::from_wire) のドキュメントを参照）。
     #[must_use]
     pub fn as_wire_str(&self) -> &'static str {
         match self {
