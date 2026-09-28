@@ -698,6 +698,19 @@ def build_prediction_record(
         raise WorkerError(
             "invalid_request", "prediction id must be a non-empty string", ExitCode.INVALID_INPUT
         )
+    # UTF-8 のバイト数は文字数（コードポイント数）以上であることを利用し、
+    # まず文字数で足切りする（`.encode("utf-8")` は文字数の取得と違い入力
+    # 全体を確保するため、検査より先に呼ぶと巨大な `id` でメモリを無制限に
+    # 消費しうる。`_guarded_encode_bytes` の P0 レビュー指摘〔PR #234〕と
+    # 同種の問題のため同じ順序で予防する。REQ-39）。
+    id_char_len = len(record_id)
+    if id_char_len > MAX_PREDICTION_ID_BYTES:
+        raise WorkerError(
+            "invalid_request",
+            f"prediction id exceeds {MAX_PREDICTION_ID_BYTES} utf-8 bytes"
+            f" ({id_char_len} chars, utf-8 encoding would be at least that many bytes)",
+            ExitCode.INVALID_INPUT,
+        )
     id_len = len(record_id.encode("utf-8"))
     if id_len > MAX_PREDICTION_ID_BYTES:
         raise WorkerError(
@@ -727,7 +740,24 @@ def _guarded_encode_bytes(text: str, max_bytes: int) -> list[int]:
     上限には学習データの行読み込み（`contract.py`）と同じ `MAX_TRAIN_
     LINE_BYTES` を流用する（同じ「1 件の入力テキスト」という種類の上限を
     2 箇所で別々の値として持たないため）。
+
+    `text.encode("utf-8")` そのものが入力全体のバイト列を新たに確保する
+    ため、検査の「前」にこれを呼ぶと上限判定より先に巨大な入力でメモリを
+    消費しうる（Codex レビュー指摘 P0・PR #234。#80 で `_guarded_encode_
+    bytes` を新設した際に混入した回帰）。UTF-8 のバイト数は文字数
+    （コードポイント数）以上であることを利用し、まず `len(text)`
+    （O(1)。`encode` を伴わない）で足切りしてから `encode("utf-8")` を
+    呼ぶことで、確保量を高々 `4 * MAX_TRAIN_LINE_BYTES`
+    （UTF-8 の 1 コードポイントあたり最大 4 バイト）に抑える。
     """
+    char_len = len(text)
+    if char_len > MAX_TRAIN_LINE_BYTES:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction input {char_len} chars exceeds limit {MAX_TRAIN_LINE_BYTES} bytes"
+            " (utf-8 encoding would be at least that many bytes)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
     raw_len = len(text.encode("utf-8"))
     if raw_len > MAX_TRAIN_LINE_BYTES:
         raise WorkerError(
@@ -765,16 +795,24 @@ def predict_records(
 
     件数上限検査（`MAX_AR_PREDICT_ROWS`）だけは呼び出し直後・同期的に行う
     （fail-closed。呼び出し元がイテレートし忘れても、明らかに上限超過の
-    呼び出しは即座に拒否する）。
+    呼び出しは即座に拒否する）。件数上限検査より後は `rows`（`Sequence`）
+    をそのまま `_predict_records_stream` へ渡し、`list(rows)` による全件
+    コピーはしない（上限内の件数〔`MAX_AR_PREDICT_ROWS` は数百万件の
+    オーダー〕でも、コピーそのものが検査前に RSS を消費してしまうという
+    Codex レビュー指摘 P0・PR #234。呼び出し元は list・tuple 等スライス
+    可能な `Sequence` を渡す契約とする）。
 
     `chunk_size`（既定は `trained.config["batch_size"]`、上限は
     `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼ぶ。`resource_budget.
-    check()` は各チャンクの計算「前」と「後」の両方で呼ぶ（REQ-39。計算後
-    だけの検査では、既に確保済みの `[N*K, L]`・attention `[N*K, heads, L, L]`
-    を検査する頃には資源を使い切っている。`_score_choices_mlx` 自体も
+    check()` は各チャンクにつき、(1) そのチャンクの `id_lists`（正規化後の
+    バイト列）を確保する「前」、(2) `_score_choices_mlx` が `[N*K, L]`・
+    attention `[N*K, heads, L, L]` を確保した直後・最初の `yield` を呼ぶ
+    「前」の 2 回呼ぶ（REQ-39）。計算後の検査を全件 `yield` した後まで
+    遅らせると、呼び出し元が途中で反復を止めた場合に検査自体が行われず、
+    継続する場合も上限超過後の結果が先に呼び出し元へ渡ってしまう
+    （Codex レビュー指摘 P1・PR #234）。`_score_choices_mlx` 自体も
     確保前に `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で見積もりベースの拒否を
     行うため、`resource_budget` は実測 RSS による最終防御として併用する。
-    Codex レビュー指摘 P0・PR #234）。
 
     各行の生テキストは `encode_bytes` を呼ぶ前（NFKC 正規化・UTF-8 化の前）
     に `MAX_TRAIN_LINE_BYTES` でバイト数を検査する（`encode_bytes` は
@@ -807,30 +845,42 @@ def predict_records(
             ExitCode.LIMIT_EXCEEDED,
         )
 
-    return _predict_records_stream(trained, list(rows), chunk_size, choice_id_list, resource_budget)
+    # `list(rows)` で全件コピーしない（`rows` は既に上で件数検査済みだが、
+    # 上限内〔数百万件のオーダー〕でもコピー自体が検査前に RSS を消費する。
+    # Codex レビュー指摘 P0・PR #234）。`rows` をそのまま渡し、チャンクへの
+    # スライスは `_predict_records_stream` 側でチャンクぶんだけ行う。
+    return _predict_records_stream(trained, rows, chunk_size, choice_id_list, resource_budget)
 
 
 def _predict_records_stream(
     trained: AutoregressiveTrainedModel,
-    rows: list[tuple[str, str]],
+    rows: Sequence[tuple[str, str]],
     chunk_size: int,
     choice_id_list: list[list[int]],
     resource_budget: budget_mod.ResourceBudget | None,
 ) -> Iterator[dict[str, Any]]:
     """`predict_records` のチャンクごとの逐次出力本体（件数上限検査済みの
     `rows` を受け取る）。全件を `list` へ蓄積せず 1 件ずつ `yield` する。
+
+    `resource_budget.check()` はチャンクごとに 2 回呼ぶ: (1) そのチャンクの
+    `id_lists` を確保する「前」（チャンクのスライス・エンコードより前）、
+    (2) `_score_choices_mlx` の呼び出し「直後・最初の `yield` より前」
+    （Codex レビュー指摘 P1・PR #234。計算後の検査を全レコード `yield` した
+    後まで遅らせると、呼び出し元が途中で反復を止めた場合に検査されず、
+    継続する場合も上限超過後の結果が先に渡ってしまう）。
     """
-    for start in range(0, len(rows), chunk_size):
-        chunk = rows[start : start + chunk_size]
-        id_lists = [_guarded_encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
+    n_rows = len(rows)
+    for start in range(0, n_rows, chunk_size):
         if resource_budget is not None:
             resource_budget.check()
+        chunk = rows[start : start + chunk_size]
+        id_lists = [_guarded_encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
         scores = _score_choices_mlx(trained.model, id_lists, choice_id_list)
+        if resource_budget is not None:
+            resource_budget.check()
         for (row_id, _text), row in zip(chunk, scores, strict=True):
             mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
             yield build_prediction_record(row_id, mapping, trained.label_order)
-        if resource_budget is not None:
-            resource_budget.check()
 
 
 def prediction_record_to_json_line(record: dict[str, Any]) -> str:

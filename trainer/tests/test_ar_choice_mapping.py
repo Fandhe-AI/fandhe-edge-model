@@ -56,6 +56,18 @@ def _load_score_sum_tolerance() -> float:
 _MULTIBYTE_LABEL_ORDER = ["cat_a", "cat_b", "犬"]
 
 
+class _AssertNoEncode(str):
+    """`encode` が呼ばれたら即座に失敗する `str` サブクラス（テスト専用）。
+
+    文字数（コードポイント数）による事前検査が `text.encode("utf-8")` より
+    先に機能し、上限超過の入力では `encode` が一度も呼ばれないことを、
+    実際に `encode` を失敗させて証明する（Codex レビュー指摘 P0・PR #234）。
+    """
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        raise AssertionError("encode() must not be called before the char-count pre-check")
+
+
 # --- ユニットテスト: resolve_choice_id --------------------------------------
 
 
@@ -262,6 +274,22 @@ def test_req39_prediction_id_validation() -> None:
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
 
 
+def test_req39_build_prediction_record_rejects_long_id_before_full_utf8_encode() -> None:
+    """`build_prediction_record` が `id` の文字数（コードポイント数）で
+    先に足切りしてから `record_id.encode("utf-8")` を呼ぶこと（REQ-39。
+    `_guarded_encode_bytes` と同種の予防で、検査より先に `encode` を呼ぶと
+    巨大な `id` でメモリを無制限に消費しうる）。
+    """
+    label_order = ["cat_a", "cat_b"]
+    mapping = Mapped(choice_id="cat_a", index=0, probs=(0.9, 0.1))
+    record_id = _AssertNoEncode("x" * (MAX_PREDICTION_ID_BYTES + 1))
+
+    with pytest.raises(WorkerError) as exc_info:
+        build_prediction_record(record_id, mapping, label_order)
+    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
 # --- 結合テスト: predict_records（TINY_AR_CONFIG・CPU・合成データ） ---------
 
 
@@ -415,6 +443,92 @@ def test_req39_predict_records_rejects_oversized_raw_input(
         list(predict_records(trained, rows))
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_req39_predict_records_rejects_oversized_raw_input_before_full_utf8_encode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1 行の生テキストが `MAX_TRAIN_LINE_BYTES` を超える場合、文字数
+    （コードポイント数）による足切りが `text.encode("utf-8")` より先に働き、
+    `encode` が一度も呼ばれずに拒否されること（REQ-39。UTF-8 のバイト数は
+    文字数以上であることを利用した事前検査。`text.encode("utf-8")` を検査
+    前に呼ぶと 1 件の巨大な入力でメモリを無制限に消費しうるという Codex
+    レビュー指摘 P0・PR #234 への回帰テスト）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    monkeypatch.setattr(ar_module, "MAX_TRAIN_LINE_BYTES", 4)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(kind, make_examples(), req)
+
+    text = _AssertNoEncode("this text is longer than 4 chars")
+    rows = [("row-0", text)]
+
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained, rows))
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_req39_predict_records_accepts_tuple_rows_without_full_list_copy(
+    tmp_path: Path,
+) -> None:
+    """`rows` に `list` 以外のスライス可能な `Sequence`（`tuple`）を渡しても
+    `list` を渡した場合と同じ結果になること（REQ-39。`predict_records` が
+    `list(rows)` で全件コピーしてから渡す設計をやめ、`rows` をそのまま
+    `_predict_records_stream` へ渡すようにした変更〔Codex レビュー指摘 P0・
+    PR #234〕への回帰テスト。上限内の件数でもコピー自体が検査前に RSS を
+    消費してしまうため、コピーをせずに動作することを確認する）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    rows_list = [(str(i), ex.input) for i, ex in enumerate(examples)]
+    rows_tuple = tuple(rows_list)
+
+    from_list = list(predict_records(trained, rows_list))
+    from_tuple = list(predict_records(trained, rows_tuple))
+
+    assert from_list == from_tuple
+
+
+def test_req39_predict_records_checks_budget_before_first_yield(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """計算後の `resource_budget.check()` が、チャンク内のレコードを 1 件でも
+    `yield` する前に呼ばれること（REQ-39。Codex レビュー指摘 P1・PR #234
+    への回帰テスト。計算後の検査を全件 `yield` した後まで遅らせると、
+    呼び出し元が途中で反復を止めた場合に検査自体が行われず、継続する場合も
+    上限超過後の結果が先に呼び出し元へ渡ってしまう）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    budget = budget_mod.ResourceBudget(wall_seconds=60.0, rss_bytes=1 << 30, device="cpu")
+    calls = {"n": 0}
+
+    def _raising_check() -> None:
+        calls["n"] += 1
+        # 1 回目はチャンク計算「前」の検査（通過させる）、2 回目は
+        # `_score_choices_mlx` 直後・最初の yield 前の検査（ここで拒否する）。
+        if calls["n"] == 2:
+            raise WorkerError("limit_exceeded", "budget exceeded (test)", ExitCode.LIMIT_EXCEEDED)
+
+    monkeypatch.setattr(budget, "check", _raising_check)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+    gen = predict_records(trained, rows, chunk_size=len(rows), resource_budget=budget)
+
+    with pytest.raises(WorkerError) as exc_info:
+        next(gen)
+    assert exc_info.value.code == "limit_exceeded"
+    assert calls["n"] == 2
 
 
 def test_req39_predict_records_rejects_oversized_attention_elements(
