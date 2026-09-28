@@ -66,6 +66,15 @@ impl WilsonInterval {
 /// `z` が有限な正の数でない場合は `None` を返し、panic・NaN・負の区間を
 /// 外部へ見せない。
 ///
+/// `z` 自体が有限でも `z * z` を経由する各中間値（`z_sq`・`denom`・`center`・
+/// `margin`）はオーバーフローで無限大・NaN になりうる（例: `z = 1e308` は
+/// `z.is_finite()` を通過するが `z * z` が `f64::INFINITY` になる）。最終的な
+/// `lo`・`hi` を含め、いずれかが有限でない、または `lo > hi` になった場合も
+/// `None` を返し、`WilsonInterval` が「壊れた値を表現できない型」という不変
+/// 条件を保つ（issue #60 PR #211 codex レビュー指摘。
+/// `.claude/rules/coding-rust.md`「判定結果は壊れた値を表現できない型にする」
+/// 「外部入力の経路では明示的に処理する」）。
+///
 /// `u64 → f64` の変換は `n` が `2^53` を超えると丸め誤差が生じうるが、
 /// レコード件数の上限検証は呼び出し側（データ検査層・REQ-39）の責務であり、
 /// 実用上の評価件数はこの範囲を大きく下回る。
@@ -81,12 +90,21 @@ pub fn wilson_ci(correct: u64, n: u64, z: f64) -> Option<WilsonInterval> {
     let correct_f = correct as f64;
     let p = correct_f / n_f;
     let z_sq = z * z;
+    if !z_sq.is_finite() {
+        return None;
+    }
     let denom = 1.0 + z_sq / n_f;
     let center = (p + z_sq / (2.0 * n_f)) / denom;
     let margin = (z / denom) * (p * (1.0 - p) / n_f + z_sq / (4.0 * n_f * n_f)).sqrt();
+    if !denom.is_finite() || !center.is_finite() || !margin.is_finite() {
+        return None;
+    }
 
     let lo = (center - margin).max(0.0);
     let hi = (center + margin).min(1.0);
+    if !lo.is_finite() || !hi.is_finite() || lo > hi {
+        return None;
+    }
 
     Some(WilsonInterval { lo, hi, z })
 }
@@ -171,6 +189,16 @@ mod tests {
         assert_eq!(wilson_ci(5, 10, -1.96), None);
         assert_eq!(wilson_ci(5, 10, f64::NAN), None);
         assert_eq!(wilson_ci(5, 10, f64::INFINITY), None);
+    }
+
+    /// REQ-24・TASK-24.1-2: `z` は `is_finite()` を通過する有限値でも、
+    /// `z * z` がオーバーフローして無限大になりうる（例: `z = 1e308`）。
+    /// その場合に `center`・`margin` が NaN になった壊れた `WilsonInterval` を
+    /// 外部へ返さず `None` になることを確認する（issue #60 PR #211 codex 指摘）。
+    #[test]
+    fn huge_finite_z_overflowing_square_is_none() {
+        assert_eq!(wilson_ci(5, 10, 1e308), None);
+        assert_eq!(wilson_ci(5, 10, f64::MAX), None);
     }
 
     /// REQ-24・TASK-24.1-2: `p=0` のときクランプ前の生値は負の極小値
