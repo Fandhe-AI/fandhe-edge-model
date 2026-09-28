@@ -48,6 +48,22 @@ TINY_CONFIG = {
     "dropout": 0.0,
 }
 
+#: ReferenceEvaluator でも高速に回る極小アーキテクチャ設定（autoregressive 用。
+#: `tests/test_ar_*.py` が共有する。dropout=0.0 は MLX/ONNX 一致試験で
+#: dropout の非決定性を混入させないため（`kinds/autoregressive.py` モジュール
+#: docstring・advisor 指摘の dropout/eval-mode 注意点）。
+TINY_AR_CONFIG = {
+    "layers": 1,
+    "dims": 8,
+    "heads": 2,
+    "dropout": 0.0,
+    "lr": 5e-4,
+    "warmup_steps": 1,
+    "weight_decay": 1e-4,
+    "batch_size": 8,
+    "epochs": 5,
+}
+
 #: ReferenceEvaluator でも高速に回る極小設定（C1 用。`tests/test_c1_*.py` が共有する）。
 TINY_C1_CONFIG = {
     "ngram_min": 1,

@@ -31,7 +31,7 @@
 [project]
 name = "fandhe-edge-model-trainer"
 version = "0.0.0"
-description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口。C1=バイト n-gram TF-IDF＋LR・C3=バイト CNN を実装）"
+description = "fandhe-edge-model の学習ワーカー（候補学習・選定・選択口。C1=バイト n-gram TF-IDF＋LR・C3=バイト CNN・autoregressive=バイト単位の小型自己回帰 decoder を実装）"
 requires-python = "==3.12.*"
 license = "MIT OR Apache-2.0"
 dependencies = ["mlx[cpu]==0.32.2", "numpy==2.5.3", "onnx==1.23.0"]
