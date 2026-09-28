@@ -379,7 +379,11 @@ pub enum ComponentChange {
         /// 評価後のダイジェスト。
         after: Sha256Digest,
     },
-    /// 評価前にはあったが、評価後に無くなった。
+    /// 評価前にはあったが、評価後に無くなった。[`evaluate_with_invariance`]
+    /// では、評価クロージャの実行中に構成要素ファイルが削除された（NotFound
+    /// になった）場合がこれに当たる（issue #226）。`std::fs::metadata` は
+    /// symlink を辿るため、ファイル自体の削除だけでなく、親ディレクトリの
+    /// 削除・symlink のリンク先の削除（dangling）でも同様に検出される。
     Removed {
         /// 削除された構成要素。
         component: ModelComponent,
@@ -451,6 +455,23 @@ pub struct ModelPackagePaths<'a> {
     pub thresholds: Option<&'a Path>,
 }
 
+impl<'a> ModelPackagePaths<'a> {
+    /// 指定した構成要素に対応するパス（`weights` は必ず `Some`）。wildcard
+    /// 無しの exhaustive match にしているため、[`ModelComponent`] へ将来
+    /// バリアントが増えた際にこの match の更新漏れがあればコンパイルエラーに
+    /// なり、[`capture_snapshot`]・評価後専用の取得ヘルパーが新しい構成要素を
+    /// 黙って取りこぼす（fail-open になる）のを防ぐ（[`ModelPackageBytes::component_bytes`]
+    /// と同じ方針。issue #226）。
+    fn component_path(&self, component: ModelComponent) -> Option<&'a Path> {
+        match component {
+            ModelComponent::Weights => Some(self.weights),
+            ModelComponent::Vocab => self.vocab,
+            ModelComponent::Calibration => self.calibration,
+            ModelComponent::Thresholds => self.thresholds,
+        }
+    }
+}
+
 /// [`evaluate_with_invariance`] が構成要素 1 件あたりに読み込むバイト数の上限
 /// （暫定値。REQ-30 が目標とする配布パッケージ全体の容量目安 40MB に対し、
 /// 構成要素単位の上限として十分な余裕を見込んだ 64MiB とする。REQ-39 の
@@ -500,8 +521,9 @@ fn hash_component<E>(
 
 /// `paths` が指す各構成要素ファイルを [`MAX_MODEL_COMPONENT_BYTES`] の上限付きで
 /// ディスクから読み込み、構成要素ごとの sha256 ダイジェストのみを保持する
-/// スナップショットを作る（[`evaluate_with_invariance`] が評価前後それぞれで
-/// 呼ぶ内部ヘルパー）。
+/// スナップショットを作る（[`evaluate_with_invariance`] が評価**前**の
+/// スナップショット取得に呼ぶ内部ヘルパー。評価**後**の取得は、削除
+/// （NotFound）を許容する [`capture_snapshot_after`] を使う。issue #226）。
 ///
 /// 読み込んだ生バイト列は構成要素 1 件ずつ処理が終わるたびに破棄され、
 /// 保持されるのは [`Sha256Digest`]（32 バイト）だけになる。評価前・評価後の
@@ -537,6 +559,81 @@ fn capture_snapshot<E>(
     ModelPackageSnapshot::from_digests(digests).map_err(EvaluationInvarianceError::Snapshot)
 }
 
+/// 評価後のディスク読み込み失敗が「構成要素の削除」を表すかどうかを判定する
+/// （issue #226・REQ-27）。判定対象は `hash_component` が返す
+/// [`EvaluationInvarianceError::Read`] のうち、根本原因が
+/// `io::ErrorKind::NotFound` のものに限る。権限エラー・特殊ファイル・
+/// サイズ上限超過・未知の `FsError`（`hash_component` が kind `Other` の
+/// `Read` へ写す）は対象にせず、そのまま呼び出し側へエラーとして伝える
+/// （fail-closed。「読めない状態」を安易に「削除された」へ丸めない）。
+fn is_not_found_read_error<E>(err: &EvaluationInvarianceError<E>) -> bool {
+    matches!(
+        err,
+        EvaluationInvarianceError::Read { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// 評価**後**専用のスナップショット取得ヘルパー（[`evaluate_with_invariance`]
+/// が評価クロージャ実行後に呼ぶ）。
+///
+/// [`capture_snapshot`] との違いは、構成要素ファイルの NotFound（評価クロージャ
+/// の実行中に削除された場合）を「読み込み失敗」として即座にエラーへ落とさず、
+/// `before`（評価前スナップショット）にその構成要素が存在していたことを
+/// 確認したうえでダイジェスト集合から除外する点。これにより、後段の
+/// [`ModelPackageSnapshot::verify_unchanged`] が `(Some, None)` の枝を通り、
+/// [`ComponentChange::Removed`] として報告できる（issue #226。従来は
+/// `capture_snapshot` の `?` がここで即座に `Read` エラーを返してしまい、
+/// `Removed` が [`evaluate_with_invariance`] の経路で一度も使われなかった）。
+///
+/// NotFound 以外の失敗（権限・特殊ファイル・サイズ上限超過・ENOTDIR・未知の
+/// `FsError` 等）は、これまでどおり即座にエラーとして返す（fail-closed。
+/// 正常に読めない状態を「変化の一覧」として偽らない）。
+///
+/// 戻り値の [`ModelPackageSnapshot`] は本関数専用の内部表現で、
+/// **[`verify_unchanged`](ModelPackageSnapshot::verify_unchanged) の引数として
+/// しか使わない**。重みが評価中に削除された場合はここで `digests` から
+/// 重みが欠落した状態のまま返すため、[`ModelPackageSnapshot`] の型が本来
+/// 約束する「重みは必ず含まれる」という不変条件（[`ModelPackageSnapshot::capture`]
+/// のドキュメントを参照）を満たさないことがある。この値を
+/// `verify_unchanged` 以外の用途へ流用しない。
+fn capture_snapshot_after<E>(
+    paths: &ModelPackagePaths<'_>,
+    before: &ModelPackageSnapshot,
+) -> Result<ModelPackageSnapshot, EvaluationInvarianceError<E>> {
+    let mut digests = BTreeMap::new();
+    for component in ModelComponent::all() {
+        let Some(path) = paths.component_path(component) else {
+            continue;
+        };
+        match hash_component(component, path) {
+            Ok(digest) => {
+                digests.insert(component, digest);
+            }
+            Err(err) if is_not_found_read_error(&err) => {
+                // `before` にこの構成要素が無かった場合、評価前の取得
+                // （`capture_snapshot`）は `paths` の全構成要素を必ず含むため
+                // 構造上は起こらないはずだが、fail-closed を保つための保険と
+                // して、防御的に元の NotFound エラーをそのまま返す
+                // （黙って「変化なし」扱いにしない）。
+                if before.digest(component).is_none() {
+                    return Err(err);
+                }
+                // 評価前には存在し、評価後に読めなくなった（NotFound）ため
+                // 「削除された」とみなし、ダイジェスト集合には含めない。
+                // 後段の `verify_unchanged` が `Removed` として報告する。
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    // `from_digests` を通さない（重みが削除された場合に `Snapshot(MissingWeights)`
+    // へ落ちてしまい、`Removed{Weights}` として報告できなくなるため。
+    // 本関数の戻り値は `verify_unchanged` の引数にのみ使う内部専用の値
+    // であり、`ModelPackageSnapshot` が本来課す「重み必須」の不変条件を
+    // ここでは緩めてよい）。
+    Ok(ModelPackageSnapshot { digests })
+}
+
 /// [`evaluate_with_invariance`] が返しうるエラー。評価クロージャ自身の
 /// エラー型 `E` を包んで一緒に返せるようにする。
 ///
@@ -545,7 +642,11 @@ fn capture_snapshot<E>(
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum EvaluationInvarianceError<E> {
-    /// 構成要素ファイルの読み込み（評価前・評価後どちらか一方）に失敗した。
+    /// 構成要素ファイルの読み込みに失敗した。評価**前**の読み込み失敗は
+    /// 種類を問わずここに入る。評価**後**の読み込み失敗は、NotFound
+    /// （削除。issue #226）は [`Self::Changed`] の [`ComponentChange::Removed`]
+    /// として報告され、NotFound 以外（権限・特殊ファイル・サイズ上限超過・
+    /// 未知の `FsError` 等）のみここに入る。
     Read {
         /// 読み込みに失敗した構成要素。
         component: ModelComponent,
@@ -578,8 +679,10 @@ pub enum EvaluationInvarianceError<E> {
     /// が返す [`InvarianceError`]。現状は重み欠如のみ）。
     Snapshot(InvarianceError),
     /// 評価の前後でモデルパッケージが変化した（REQ-27 の不変条件違反）。
-    /// fail-closed のため、この場合は評価クロージャの結果（`Ok` であっても）
-    /// を呼び出し側へ返さない。
+    /// 構成要素の削除（評価クロージャ実行中に構成要素ファイルが NotFound に
+    /// なった場合）も [`ComponentChange::Removed`] としてここに含まれる
+    /// （issue #226）。fail-closed のため、この場合は評価クロージャの結果
+    /// （`Ok` であっても）を呼び出し側へ返さない。
     Changed(InvarianceViolation),
     /// 評価クロージャ自体がエラーを返した。モデルパッケージに変化が無かった
     /// ことは確認済みで、評価そのものの失敗であることを示す。
@@ -645,12 +748,28 @@ impl<E: std::error::Error + 'static> std::error::Error for EvaluationInvarianceE
 ///    しない前提）
 /// 3. `eval` の成否に関わらず、**必ず** `paths` を改めてディスクから読み直して
 ///    評価後スナップショットを作る（fail-closed。評価が失敗した場合でも
-///    パッケージが改変されていないかは確認する）
+///    パッケージが改変されていないかは確認する）。この評価後の取得では
+///    構成要素ファイルの NotFound（評価クロージャの実行中に削除された場合）を
+///    「削除」として扱い、[`ComponentChange::Removed`] を含む
+///    [`EvaluationInvarianceError::Changed`] で返す（issue #226）。NotFound
+///    以外の読み込み失敗（権限・特殊ファイル・サイズ上限超過等）は、これまで
+///    どおり即座にエラーとして返す
 /// 4. 前後のスナップショットを比較する。変化があれば
 ///    [`EvaluationInvarianceError::Changed`] を返し、`eval` の結果（`Ok` で
 ///    あっても）は呼び出し側へ渡さない
 /// 5. 変化が無ければ、`eval` の結果をそのまま返す（`Err` だった場合は
 ///    [`EvaluationInvarianceError::Evaluation`] として包む）
+///
+/// # 複数の失敗が混在する場合の優先順位（issue #226）
+///
+/// 評価後の取得で NotFound 以外のエラーが 1 件でもあれば、そのエラーを
+/// [`EvaluationInvarianceError::Changed`] より優先して返す（正常に読めない
+/// 状態を「変化の一覧」として偽らない）。NotFound だけであれば、削除された
+/// 構成要素は [`ComponentChange::Removed`] として、他の構成要素の変化
+/// （[`ComponentChange::Modified`] 等）と合わせて宣言順に列挙する。
+/// [`EvaluationInvarianceError::Changed`] は、評価クロージャが `Err` を返した
+/// 場合の [`EvaluationInvarianceError::Evaluation`] より優先する（変化なしの
+/// ときのみ評価クロージャのエラーが表に出る）。
 ///
 /// 構成要素 1 件あたりの読み込み上限は [`MAX_MODEL_COMPONENT_BYTES`]。経路の
 /// 閉じ込め（`../` 等の拒否）・形式の許可リストは呼び出し側のガード層
@@ -665,7 +784,10 @@ pub fn evaluate_with_invariance<T, E>(
 
     // `eval_result` が `Err` でも、必ずディスクを読み直して評価後の状態を
     // 確認する（fail-closed。評価失敗時にパッケージ改変の検査を省略しない）。
-    let after = capture_snapshot(paths)?;
+    // NotFound（評価クロージャ実行中の削除）は `capture_snapshot_after` が
+    // `Removed` として `verify_unchanged` に委ねるため、ここでは打ち切らない
+    // （issue #226）。
+    let after = capture_snapshot_after(paths, &before)?;
 
     before
         .verify_unchanged(&after)
@@ -1251,6 +1373,38 @@ mod tests {
             });
 
         assert!(matches!(result, Err(EvaluationInvarianceError::Changed(_))));
+    }
+
+    #[test]
+    fn req27_evaluate_with_invariance_reports_removed_weights_during_evaluation() {
+        // issue #226: 評価クロージャの中で重みファイルを削除すると、
+        // `Snapshot(MissingWeights)` に落ちず `Changed(Removed{Weights})`
+        // として報告されることを確認する（回帰防止。重みは評価契約上
+        // 必須の構成要素であり、削除を「重み欠如のスナップショット」として
+        // 曖昧に扱わないことが本 Issue の主眼）。
+        let fixture = EvaluationFixture::new("removed-weights");
+        let paths = fixture.paths();
+        let weights_path = fixture.weights_path.clone();
+
+        let result: Result<(), EvaluationInvarianceError<StubEvalError>> =
+            evaluate_with_invariance(&paths, |_p| {
+                std::fs::remove_file(&weights_path).expect("削除に失敗しないはず");
+                Ok(())
+            });
+
+        match result {
+            Err(EvaluationInvarianceError::Changed(violation)) => {
+                assert_eq!(violation.changes.len(), 1);
+                match &violation.changes[0] {
+                    ComponentChange::Removed { component, before } => {
+                        assert_eq!(*component, ModelComponent::Weights);
+                        assert_eq!(*before, Sha256Digest::of_bytes(b"weights-v1"));
+                    }
+                    other => panic!("Removed(Weights) を期待したが {other:?} だった"),
+                }
+            }
+            other => panic!("Changed を期待したが {other:?} だった"),
+        }
     }
 
     #[test]

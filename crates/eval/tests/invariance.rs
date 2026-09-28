@@ -7,6 +7,12 @@
 //!
 //! 証拠の種別: テストハーネス（合成データによる結合テスト）。実機ではない。
 //!
+//! `req27_evaluate_with_invariance_reports_*_removed_by_evaluation_step`
+//! 系（削除系）は、評価クロージャの実行中に構成要素ファイルそのものを
+//! 削除することで、評価後の取得が NotFound を [`ComponentChange::Removed`]
+//! として報告することを確かめる（issue #226。TASK-27.1-1 の PR #214
+//! レビューで挙がった P2 指摘への対応）。
+//!
 //! # 本ファイルの 2 種類のテスト
 //!
 //! 1. **[`fandhe_edge_eval::invariance::evaluate_with_invariance`] を使う結合
@@ -291,6 +297,177 @@ fn req27_evaluate_with_invariance_detects_thresholds_tampered_by_evaluation_step
         b"tampered-thresholds-bytes-v2",
         b"synthetic-thresholds-bytes-v1",
     );
+}
+
+/// 評価クロージャの内側で `component` に対応するファイルを実際に削除した
+/// 場合に、`evaluate_with_invariance` が `Changed(Removed)` として検出する
+/// ことを確かめる（issue #226。`assert_evaluation_path_tampering_detected` と
+/// 同じ形の削除版）。
+fn assert_evaluation_path_removal_detected(
+    component: ModelComponent,
+    original_bytes: &'static [u8],
+) {
+    let fixture = PackageFixture::new(&format!("{}-removed", component.as_str()));
+    let paths = fixture.paths();
+    let target_path: PathBuf = match component {
+        ModelComponent::Weights => fixture.weights.clone(),
+        ModelComponent::Vocab => fixture.vocab.clone(),
+        ModelComponent::Calibration => fixture.calibration.clone(),
+        ModelComponent::Thresholds => fixture.thresholds.clone(),
+        other => {
+            panic!("assert_evaluation_path_removal_detected は {other:?} 用のパスを定義していない")
+        }
+    };
+
+    let result: Result<SingleSelectMetrics, EvaluationInvarianceError<EvalStepError>> =
+        evaluate_with_invariance(&paths, |p| {
+            let metrics = run_real_evaluation_path(p).map_err(EvalStepError)?;
+            fs::remove_file(&target_path).expect("削除に失敗しないはず");
+            Ok(metrics)
+        });
+
+    match result {
+        Err(EvaluationInvarianceError::Changed(violation)) => {
+            assert_eq!(violation.changes.len(), 1);
+            match &violation.changes[0] {
+                ComponentChange::Removed {
+                    component: removed,
+                    before,
+                } => {
+                    assert_eq!(*removed, component);
+                    assert_eq!(*before, Sha256Digest::of_bytes(original_bytes));
+                }
+                other => panic!("Removed({component:?}) を期待したが {other:?} だった"),
+            }
+        }
+        other => panic!("Changed({component:?}) を期待したが {other:?} だった"),
+    }
+}
+
+#[test]
+fn req27_evaluate_with_invariance_reports_weights_removed_by_evaluation_step() {
+    // 重みの削除は必須構成要素であり、`Snapshot(MissingWeights)` へ落ちず
+    // `Removed{Weights}` として報告されることが本 Issue の主眼（issue #226）。
+    assert_evaluation_path_removal_detected(ModelComponent::Weights, b"synthetic-weights-bytes-v1");
+}
+
+#[test]
+fn req27_evaluate_with_invariance_reports_vocab_removed_by_evaluation_step() {
+    assert_evaluation_path_removal_detected(ModelComponent::Vocab, b"synthetic-vocab-bytes-v1");
+}
+
+#[test]
+fn req27_evaluate_with_invariance_reports_calibration_removed_by_evaluation_step() {
+    assert_evaluation_path_removal_detected(
+        ModelComponent::Calibration,
+        b"synthetic-calibration-bytes-v1",
+    );
+}
+
+#[test]
+fn req27_evaluate_with_invariance_reports_thresholds_removed_by_evaluation_step() {
+    assert_evaluation_path_removal_detected(
+        ModelComponent::Thresholds,
+        b"synthetic-thresholds-bytes-v1",
+    );
+}
+
+#[test]
+fn req27_evaluate_with_invariance_reports_removed_and_modified_in_declared_order() {
+    // issue #226: 削除（Removed）と改変（Modified）が同時に起きた場合、
+    // `ModelComponent` の宣言順（Weights < Vocab < Calibration < Thresholds）
+    // で `changes` に並ぶことを確認する。
+    let fixture = PackageFixture::new("removed-and-modified");
+    let paths = fixture.paths();
+    let vocab_path = fixture.vocab.clone();
+    let thresholds_path = fixture.thresholds.clone();
+
+    let result: Result<SingleSelectMetrics, EvaluationInvarianceError<EvalStepError>> =
+        evaluate_with_invariance(&paths, |p| {
+            let metrics = run_real_evaluation_path(p).map_err(EvalStepError)?;
+            fs::remove_file(&vocab_path).expect("削除に失敗しないはず");
+            write_temp_file(&thresholds_path, b"tampered-thresholds-bytes-v2");
+            Ok(metrics)
+        });
+
+    match result {
+        Err(EvaluationInvarianceError::Changed(violation)) => {
+            assert_eq!(violation.changes.len(), 2);
+            match &violation.changes[0] {
+                ComponentChange::Removed { component, .. } => {
+                    assert_eq!(*component, ModelComponent::Vocab);
+                }
+                other => panic!("先頭は Removed(Vocab) を期待したが {other:?} だった"),
+            }
+            match &violation.changes[1] {
+                ComponentChange::Modified { component, .. } => {
+                    assert_eq!(*component, ModelComponent::Thresholds);
+                }
+                other => panic!("2 件目は Modified(Thresholds) を期待したが {other:?} だった"),
+            }
+        }
+        other => panic!("Changed を期待したが {other:?} だった"),
+    }
+}
+
+#[test]
+fn req27_evaluate_with_invariance_prefers_removed_over_evaluation_error() {
+    // issue #226: 評価クロージャが構成要素を削除したうえで Err を返しても、
+    // 削除の検出（Changed）が評価エラーより優先されることを確認する
+    // （`req27_evaluate_with_invariance_prefers_changed_over_evaluation_error`
+    // の削除版）。
+    let fixture = PackageFixture::new("removed-then-eval-error");
+    let paths = fixture.paths();
+    let calibration_path = fixture.calibration.clone();
+
+    let result: Result<SingleSelectMetrics, EvaluationInvarianceError<EvalStepError>> =
+        evaluate_with_invariance(&paths, |_p| {
+            fs::remove_file(&calibration_path).expect("削除に失敗しないはず");
+            Err(EvalStepError("boom".to_string()))
+        });
+
+    match result {
+        Err(EvaluationInvarianceError::Changed(violation)) => {
+            assert_eq!(violation.changes.len(), 1);
+            assert!(matches!(
+                &violation.changes[0],
+                ComponentChange::Removed {
+                    component: ModelComponent::Calibration,
+                    ..
+                }
+            ));
+        }
+        other => panic!("Changed を期待したが {other:?} だった"),
+    }
+}
+
+#[test]
+fn req27_req39_evaluate_with_invariance_keeps_non_not_found_error_after_evaluation() {
+    // 受け入れ条件 2（issue #226）: NotFound 以外の読み込み失敗（ここでは
+    // 通常ファイルの代わりにディレクトリが置かれた状態。ENOTDIR/特殊ファイル
+    // の一種）は `Changed` に丸めず、`NotRegularFile` として返すことを確認
+    // する。chmod によるアクセス権テストは root で実行される CI 環境
+    // （`.claude/rules/ci.md`）で成立しないため使わない。
+    let fixture = PackageFixture::new("not-found-vs-not-regular");
+    let paths = fixture.paths();
+    let thresholds_path = fixture.thresholds.clone();
+
+    let result: Result<SingleSelectMetrics, EvaluationInvarianceError<EvalStepError>> =
+        evaluate_with_invariance(&paths, |p| {
+            let metrics = run_real_evaluation_path(p).map_err(EvalStepError)?;
+            fs::remove_file(&thresholds_path).expect("削除に失敗しないはず");
+            fs::create_dir(&thresholds_path).expect("ディレクトリの作成に失敗しないはず");
+            Ok(metrics)
+        });
+
+    match result {
+        Err(EvaluationInvarianceError::NotRegularFile { component, .. }) => {
+            assert_eq!(component, ModelComponent::Thresholds);
+        }
+        other => panic!("NotRegularFile(Thresholds) を期待したが {other:?} だった"),
+    }
+    // `TempDirGuard`（`_guard`）の `remove_dir_all` が、置き換えた
+    // ディレクトリごと後始末できることを確認する（成否に関わらず削除）。
 }
 
 #[test]
