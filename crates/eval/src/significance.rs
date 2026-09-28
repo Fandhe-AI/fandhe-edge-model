@@ -17,6 +17,21 @@ use crate::baseline::{self, BaselineError};
 use crate::mcnemar::{self, McNemarExact, PValue, PairedCounts};
 use crate::metrics::{EvalRecord, Outcome};
 
+/// [`correctness`]・[`compare_with_baseline`] が受け付ける評価レコード数の上限
+/// （REQ-39 ガード層「資源の上限」）。
+///
+/// レコード件数の主たる上限検証はデータ契約層（呼び出し側）の責務だが
+/// （crate ドキュメント「層の境界・不変条件」参照）、本モジュールの 2 関数は
+/// 外部入力由来の `records.len()` をそのまま候補用・下限基準用の正誤 `Vec`
+/// の容量へ使うため、確保前に拒否する防御層をここにも置く（件数を上限検証
+/// してからアロケーションに使う。`.claude/rules/security.md`「資源の上限」。
+/// Review 指摘。TASK-25.1-2・issue #65）。値は [`metrics::MAX_LABELS`]・
+/// [`mcnemar::MAX_DISCORDANT_PAIRS`] と同様、データ契約層の確定値が無い
+/// 段階の暫定値（実測に基づく調整は後続 TASK）。
+///
+/// [`metrics::MAX_LABELS`]: crate::metrics::MAX_LABELS
+pub const MAX_EVAL_RECORDS: usize = 1_000_000;
+
 /// 下限基準（majority）に対する有意性判定の α（評価契約で固定。REQ-25）。
 ///
 /// `.claude/rules/evaluation-contract.md`「有意性・指標」で定めた値であり、
@@ -91,6 +106,9 @@ fn is_correct(gold: &str, outcome: &Outcome) -> bool {
 ///   の検査で扱う）
 /// - `records` が空の場合は [`BaselineError::EmptyRecords`]（評価済みを
 ///   装わない。件数不足の判定不能は TASK-25.2 の担当）
+/// - `records.len()` が [`MAX_EVAL_RECORDS`] を超える場合は確保前に
+///   [`BaselineError::TooManyRecords`] を返す（REQ-39。Review 指摘。
+///   TASK-25.1-2・issue #65）
 ///
 /// 入力は `&` 参照でのみ受け取り、書き換えない（REQ-27）。
 ///
@@ -103,6 +121,12 @@ pub fn correctness(
 
     if records.is_empty() {
         return Err(BaselineError::EmptyRecords);
+    }
+    if records.len() > MAX_EVAL_RECORDS {
+        return Err(BaselineError::TooManyRecords {
+            n_records: records.len(),
+            limit: MAX_EVAL_RECORDS,
+        });
     }
 
     let mut result = Vec::with_capacity(records.len());
@@ -184,8 +208,10 @@ impl BaselineComparison {
 /// [`fit_majority`] と同じ規則に揃える（Review 指摘。TASK-25.1-2・issue #65）。
 ///
 /// gold がラベル集合に無い場合は [`BaselineError::UnknownGoldLabel`]、
-/// `records` が空の場合は [`BaselineError::EmptyRecords`] を返す
-/// （[`correctness`] と同じ規則）。
+/// `records` が空の場合は [`BaselineError::EmptyRecords`]、
+/// `records.len()` が [`MAX_EVAL_RECORDS`] を超える場合は確保前に
+/// [`BaselineError::TooManyRecords`] を返す（[`correctness`] と同じ規則。
+/// REQ-39。Review 指摘。TASK-25.1-2・issue #65）。
 ///
 /// [`fit_majority`]: crate::baseline::fit_majority
 pub fn compare_with_baseline(
@@ -196,6 +222,12 @@ pub fn compare_with_baseline(
 
     if records.is_empty() {
         return Err(BaselineError::EmptyRecords);
+    }
+    if records.len() > MAX_EVAL_RECORDS {
+        return Err(BaselineError::TooManyRecords {
+            n_records: records.len(),
+            limit: MAX_EVAL_RECORDS,
+        });
     }
 
     let mut candidate_correct = Vec::with_capacity(records.len());
@@ -496,6 +528,54 @@ mod tests {
         assert_eq!(
             err,
             BaselineError::Eval(crate::metrics::EvalError::EmptyLabels)
+        );
+    }
+
+    /// codex/review 指摘（TASK-25.1-2・issue #65。PR #219）: `correctness` は
+    /// `records.len()` が [`MAX_EVAL_RECORDS`] を超える場合、正誤 `Vec` を
+    /// 確保する前に `TooManyRecords` で拒否する（REQ-39 資源の上限）。
+    #[test]
+    fn correctness_too_many_records_is_error() {
+        let labels = ["A"];
+        let outcome = Outcome::Label("A".to_string());
+        let records: Vec<EvalRecord<'_>> = (0..=MAX_EVAL_RECORDS)
+            .map(|_| EvalRecord {
+                gold: "A",
+                outcome: &outcome,
+            })
+            .collect();
+        let err = correctness(&labels, &records).unwrap_err();
+        assert_eq!(
+            err,
+            BaselineError::TooManyRecords {
+                n_records: MAX_EVAL_RECORDS + 1,
+                limit: MAX_EVAL_RECORDS,
+            }
+        );
+    }
+
+    /// codex/review 指摘（TASK-25.1-2・issue #65。PR #219）: `compare_with_baseline`
+    /// も同じ規則で `records.len()` を確保前に検証する（候補用・下限基準用の
+    /// 2 本の `Vec` の容量として使われるため）。
+    #[test]
+    fn compare_with_baseline_too_many_records_is_error() {
+        let labels = ["A", "B"];
+        let cand = Outcome::Label("A".to_string());
+        let base = Outcome::Label("A".to_string());
+        let records: Vec<PairedRecord<'_>> = (0..=MAX_EVAL_RECORDS)
+            .map(|_| PairedRecord {
+                gold: "A",
+                candidate: &cand,
+                baseline: &base,
+            })
+            .collect();
+        let err = compare_with_baseline(&labels, &records).unwrap_err();
+        assert_eq!(
+            err,
+            BaselineError::TooManyRecords {
+                n_records: MAX_EVAL_RECORDS + 1,
+                limit: MAX_EVAL_RECORDS,
+            }
         );
     }
 }

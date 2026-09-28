@@ -50,6 +50,14 @@ pub enum BaselineError {
     },
     /// 評価レコードが 0 件（0 除算を避け、評価済みを装わない）。
     EmptyRecords,
+    /// 評価レコード数が上限（[`crate::significance::MAX_EVAL_RECORDS`]）を
+    /// 超える（REQ-39 資源の上限。Review 指摘。TASK-25.1-2・issue #65）。
+    TooManyRecords {
+        /// 渡された件数。
+        n_records: usize,
+        /// 上限（[`crate::significance::MAX_EVAL_RECORDS`]）。
+        limit: usize,
+    },
     /// 正解ラベルがラベル集合に存在しない（データ契約層で除外・警告される
     /// 前提だが、本層は fail-closed でエラーを返す）。
     UnknownGoldLabel {
@@ -85,6 +93,9 @@ impl fmt::Display for BaselineError {
                 write!(f, "unknown train label at index {index}")
             }
             BaselineError::EmptyRecords => write!(f, "records must not be empty"),
+            BaselineError::TooManyRecords { n_records, limit } => {
+                write!(f, "too many records: {n_records} (limit: {limit})")
+            }
             BaselineError::UnknownGoldLabel { index } => {
                 write!(f, "unknown gold label at record index {index}")
             }

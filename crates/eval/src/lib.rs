@@ -55,12 +55,16 @@
 //!   ・CLI 層の責務であり、本 crate は型付きのメモリ上のスライスだけを
 //!   受け取る（REQ-27: 評価の前後で評価データのハッシュが一致すること。
 //!   本 crate は入力を参照でのみ受け取り、書き換えない）
-//! - レコード件数の上限検証（REQ-39）は呼び出し側（データ検査層）の責務。
-//!   ラベル（選択肢）数の上限検証は本 crate 自身が行う
+//! - レコード件数の主たる上限検証（REQ-39）は呼び出し側（データ検査層）の
+//!   責務。ラベル（選択肢）数の上限検証は本 crate 自身が行う
 //!   （[`metrics::evaluate_single_select`] がラベル索引の構築前に
 //!   [`metrics::MAX_LABELS`] を検証し、超過時は確保せず
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
-//!   モジュールの「資源上限」節を参照）
+//!   モジュールの「資源上限」節を参照）。ただし [`significance::correctness`]・
+//!   [`significance::compare_with_baseline`] は外部入力由来の `records.len()`
+//!   を正誤 `Vec` の容量へ直接使うため、確保前に
+//!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
+//!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
 pub mod mcnemar;
 pub mod metrics;
