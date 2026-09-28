@@ -16,3 +16,13 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# serde・serde_json は .claude/rules/dependency-policy.md「承認済みの依存」で
+# 2026-09-27 に承認済み（共通コアの JSON 入出力用途）。本 crate では
+# TASK-16.2-2 のテストハーネス（tests/support のローダ・PoC-9 由来 JSONL
+# フィクスチャの読み込み）にのみ使い、src 側では使わない（dev-dependency
+# として配置する層をデータ契約層のテストへ広げる。ルート Cargo.toml の
+# [workspace.dependencies] は変更しない）。
+serde = { workspace = true }
+serde_json = { workspace = true }

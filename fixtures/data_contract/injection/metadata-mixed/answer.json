@@ -1,0 +1,26 @@
+{
+  "description": "clean/train.jsonl・clean/test.jsonl（手書きの合成データ）の一部の input に、output（正解）や id を混入させたもの。",
+  "injections": [
+    {
+      "id": "syn-tr-1",
+      "split": "train",
+      "kind": "output_intent_in_input",
+      "original_input": "please schedule the weekly sync meeting"
+    },
+    {
+      "id": "syn-tr-2",
+      "split": "train",
+      "kind": "id_in_input",
+      "original_input": "remind me to water the plants tomorrow"
+    },
+    {
+      "id": "syn-te-1",
+      "split": "test",
+      "kind": "output_arguments_in_input",
+      "original_input": "book a table for two at the restaurant"
+    }
+  ],
+  "count": 3,
+  "detection_rule": "input の文字列中に、同一レコードの output（intent 名・arguments の値）や id が部分文字列として出現していないかを確認する（推論に正解が漏れていないかの検査）。",
+  "false_positive_expectation": 0
+}

@@ -8,6 +8,9 @@
 //!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）
 //! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
 //!   TASK-16.1-2・issue #39）
+//! - [`consistency`]・[`normalize`]: 矛盾レコード検出・メタデータ混入検出
+//!   （TASK-16.2-2）。正規化規則は既定で NFKC を含まない暫定実装
+//!   （[`normalize`] モジュールのドキュメントを参照）
 //! - [`leak`]: 漏洩・group 跨ぎ検出（REQ-16・TASK-16.2-1・issue #41）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
 //! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
@@ -25,10 +28,16 @@
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - データ検査（REQ-16）: 漏洩・group 跨ぎ検出（TASK-16.2-1・[`leak`]）は実装済み。
-//!   メタデータ混入・矛盾レコード検出（TASK-16.2-2）は未実装。正規化した
-//!   入力での漏洩照合（NFKC 等）も未実装（`unicode-normalization` の承認と
-//!   TASK-15.5 の完了が前提。[`leak`] のスコープの境界を参照）
+//! - データ検査（REQ-16）
+//!   - 矛盾レコード検出・メタデータ混入検出（TASK-16.2-2）: 実装済み
+//!   - 漏洩・group 跨ぎ検出（TASK-16.2-1・[`leak`]）: 実装済み
+//!   - 検査レポート（行数・ユニーク数・ラベル別件数の集計。TASK-16.1-2）:
+//!     実装済み
+//!   - JSONL の読み込み・型・必須項目の検査（TASK-16.1）: 未実装
+//!     （TASK-16.1 のローダがファイル I/O・サイズ上限検査（REQ-39）を担い、
+//!     [`consistency`]・[`leak`] の trait を実装したレコード列を渡す想定）
+//!   - 正規化した入力での漏洩照合（NFKC 等）: 未実装（`unicode-normalization`
+//!     の承認と TASK-15.5 の完了が前提。[`leak`] のスコープの境界を参照）
 //! - 分割結果のハッシュ計算・記録・凍結（REQ-17・TASK-17.1-2/17.2/17.3）: 未実装
 //!   （後続 #45 が [`split`] モジュールの出力を消費してハッシュ化する。
 //!   [`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
@@ -54,9 +63,11 @@
 //! 足す想定であり、本 crate 自体を `fandhe-edge-core` に依存させる変更は
 //! 別 issue の範囲とする。[`split`] は `id`・`group_id`・ラベルだけを要求する
 //! 独立したトレイト（[`split::Groupable`]）で結合を最小化しており、同様に
-//! `fandhe-edge-core` には依存しない。[`leak`] も同様に独立したトレイト
-//! （[`leak::LeakCheckable`]）で結合を最小化しており、学習ワーカー・
-//! 評価器・操作アダプターから呼ばれる想定。
+//! `fandhe-edge-core` には依存しない。[`consistency`] も同様に独立したトレイト
+//! （`InputRecord` 等）でレコード形状を抽象化し、`fandhe-edge-core` には
+//! 依存しない。[`leak`] も同様に独立したトレイト（[`leak::LeakCheckable`]）
+//! で結合を最小化しており、学習ワーカー・評価器・操作アダプターから
+//! 呼ばれる想定。
 //!
 //! # 出典
 //!
@@ -79,11 +90,13 @@
 //! doc コメントも参照）。`docs/spec` は参照せず、ビルド・テストは
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
 
+pub mod consistency;
 pub mod eval_input;
 pub mod ingest;
 pub mod inspect;
 mod json_keys;
 pub mod leak;
+pub mod normalize;
 pub mod preprocess_boundary;
 pub mod provenance;
 pub mod report;
