@@ -22,13 +22,17 @@
 //! 診断のため重ならないペアの添字をすべて列挙する（全ペア走査。
 //! [`OverlapReport::disjoint_pairs`]）。
 //!
-//! # z の一致
+//! # z の検証（issue #104 レビュー指摘・PR #243）
 //!
-//! [`judge_overlap`] は入力の [`crate::wilson::WilsonInterval`] が異なる
-//! z 値を混在させていないかを検証する（先頭の z との差が
-//! [`OVERLAP_TOLERANCE`] を超えたら [`ReproducibilityError::MismatchedZ`]）。
-//! [`judge_reproducibility`] は常に
-//! [`crate::wilson::WILSON_Z_95`]（1.96）を使う。
+//! 評価契約は「Wilson **95%** 信頼区間の重なり」を要求するため、
+//! [`judge_overlap`] は各区間の z が [`crate::wilson::WILSON_Z_95`]（1.96）と
+//! [`OVERLAP_TOLERANCE`] を超えて異ならないかを検証する
+//! （異なれば [`ReproducibilityError::NonWilson95Z`]）。[`wilson::wilson_ci`]
+//! は任意の正の z を受け付けるため、この検証が無いと z=0.1 のような
+//! 95% 以外の区間でも `AllPairsOverlap` を返し得てしまう。
+//! [`judge_reproducibility`] は常に `wilson::wilson_ci95`（z が常に
+//! [`crate::wilson::WILSON_Z_95`]）で区間を算出するため、この検証を
+//! 経由しても通常は失敗しない。
 //!
 //! # 資源上限（REQ-39）
 //!
@@ -188,11 +192,15 @@ pub enum ReproducibilityError {
         /// 上限値（[`MAX_REPRODUCIBILITY_RUNS`]）。
         limit: usize,
     },
-    /// `index` 番目の区間の z が、先頭（0 番目）の区間の z と
-    /// [`OVERLAP_TOLERANCE`] を超えて異なる（例: 1.96 と 1.959964 の混在）。
-    MismatchedZ {
+    /// `index` 番目の区間の z が [`crate::wilson::WILSON_Z_95`]（1.96）と
+    /// [`OVERLAP_TOLERANCE`] を超えて異なる。評価契約が要求する
+    /// 「Wilson 95% 信頼区間」以外（例: z=0.1・90%・99% 等）を再現性判定に
+    /// 使わせないための検査（issue #104 レビュー指摘・PR #243）。
+    NonWilson95Z {
         /// 不一致が見つかった区間の添字。
         index: usize,
+        /// 実際の z 値。
+        z: f64,
     },
     /// `index` 番目の run から Wilson 区間が算出できない
     /// （`total == 0` または `correct > total`）。「重なる」扱いにせず
@@ -229,10 +237,10 @@ impl fmt::Display for ReproducibilityError {
             ReproducibilityError::TooManyRuns { got, limit } => {
                 write!(f, "run count {got} exceeds limit {limit}")
             }
-            ReproducibilityError::MismatchedZ { index } => {
+            ReproducibilityError::NonWilson95Z { index, z } => {
                 write!(
                     f,
-                    "interval at index {index} uses a different z value than index 0"
+                    "interval at index {index} uses z={z}, which is not the required Wilson 95% z (WILSON_Z_95)"
                 )
             }
             ReproducibilityError::UndefinedInterval { index } => {
@@ -271,36 +279,10 @@ fn validate_run_count(len: usize) -> Result<(), ReproducibilityError> {
     Ok(())
 }
 
-/// 3 件以上の Wilson 信頼区間を受け取り、全ペアの重なりを判定する
-/// （評価契約「再現性は 3 seed 以上の Wilson 95% 信頼区間の重なりで示す」）。
-///
-/// 検証順は 上限 → 下限 → z の一致 → 全ペア走査（REQ-39。`Vec` の確保前に
-/// 件数を検証する）。
-///
-/// z の値は区間ごとに異なってよいが（`WilsonInterval` は z を保持する）、
-/// 同一の再現性判定に混在した z（例: 1.96 と 1.959964）を渡すと比較の意味が
-/// 崩れるため、先頭の z と [`OVERLAP_TOLERANCE`] を超えて異なる区間があれば
-/// [`ReproducibilityError::MismatchedZ`] を返す。
-pub fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, ReproducibilityError> {
-    validate_run_count(intervals.len())?;
-
-    let z0 = match intervals.first() {
-        Some(interval) => interval.z(),
-        // validate_run_count が MIN_REPRODUCIBILITY_RUNS (>=1) を保証するため
-        // 到達しないが、添字アクセスを避け fail-closed に倒す。
-        None => {
-            return Err(ReproducibilityError::TooFewRuns {
-                got: 0,
-                min: MIN_REPRODUCIBILITY_RUNS,
-            });
-        }
-    };
-    for (index, interval) in intervals.iter().enumerate() {
-        if (interval.z() - z0).abs() > OVERLAP_TOLERANCE {
-            return Err(ReproducibilityError::MismatchedZ { index });
-        }
-    }
-
+/// 全ペアの重なりを走査する（z の検証は行わない内部関数）。
+/// [`judge_overlap`]・PoC-19 実測値との照合ユニットテストの双方から使う
+/// （REQ-39。`Vec` の確保・走査は呼び出し側が件数検証を終えてから行う）。
+fn pairwise_overlap_report(intervals: &[WilsonInterval]) -> OverlapReport {
     let mut disjoint_pairs = Vec::new();
     for i in 0..intervals.len() {
         for j in (i + 1)..intervals.len() {
@@ -322,11 +304,38 @@ pub fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, Repr
         OverlapVerdict::SomePairsDisjoint
     };
 
-    Ok(OverlapReport {
+    OverlapReport {
         verdict,
         disjoint_pairs,
         run_count: intervals.len(),
-    })
+    }
+}
+
+/// 3 件以上の Wilson **95%** 信頼区間を受け取り、全ペアの重なりを判定する
+/// （評価契約「再現性は 3 seed 以上の Wilson 95% 信頼区間の重なりで示す」）。
+///
+/// 検証順は 上限 → 下限 → z が [`crate::wilson::WILSON_Z_95`] と一致するか
+/// → 全ペア走査（REQ-39。`Vec` の確保前に件数を検証する）。
+///
+/// `wilson::wilson_ci` は任意の正の z を受け付けるため、区間の z が
+/// [`crate::wilson::WILSON_Z_95`]（1.96）と [`OVERLAP_TOLERANCE`] を超えて
+/// 異なる場合は [`ReproducibilityError::NonWilson95Z`] を返し、95% 以外の
+/// 区間（例: z=0.1・90%・99% 等）を再現性ありと誤判定させない
+/// （issue #104 レビュー指摘・PR #243）。任意の z を扱う純粋な重なり判定は
+/// crate 内部専用の [`pairwise_overlap_report`] に分離してある。
+pub fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, ReproducibilityError> {
+    validate_run_count(intervals.len())?;
+
+    for (index, interval) in intervals.iter().enumerate() {
+        if (interval.z() - wilson::WILSON_Z_95).abs() > OVERLAP_TOLERANCE {
+            return Err(ReproducibilityError::NonWilson95Z {
+                index,
+                z: interval.z(),
+            });
+        }
+    }
+
+    Ok(pairwise_overlap_report(intervals))
 }
 
 /// 3 件以上の seed run（正解数・評価総数の組）から Wilson 95% 信頼区間
@@ -436,9 +445,14 @@ mod tests {
 
     /// REQ-26・TASK-26.3-1: PoC-19 の実機結果（`jobs/threeseed/result.json`。
     /// `wilson_ci(correct, 650, 1.959964)`）と 1e-9 で一致する。
+    /// 全ペアの重なり判定そのものは、z の検証を行わない内部関数
+    /// [`pairwise_overlap_report`] で確認する（PoC-19 は `1.96` を丸めない
+    /// より精度の高い z を使っており、公開 API [`judge_overlap`] は
+    /// [`ReproducibilityError::NonWilson95Z`] を返す前提のため。
+    /// `judge_overlap_rejects_non_wilson95_z` 参照）。
     /// 証拠の種別: テストハーネス（数値の出典は PoC-19 の実機結果）。
     #[test]
-    fn judge_overlap_matches_poc19_intervals() {
+    fn pairwise_overlap_report_matches_poc19_intervals() {
         let z = 1.959964_f64;
         let a = wilson::wilson_ci(214, 650, z).expect("valid interval");
         let b = wilson::wilson_ci(210, 650, z).expect("valid interval");
@@ -451,7 +465,7 @@ mod tests {
         assert!(approx_eq(c.lo(), 0.2912268876983092));
         assert!(approx_eq(c.hi(), 0.36312357152971286));
 
-        let report = judge_overlap(&[a, b, c]).expect("3 valid intervals");
+        let report = pairwise_overlap_report(&[a, b, c]);
         assert_eq!(report.verdict(), OverlapVerdict::AllPairsOverlap);
         assert!(report.disjoint_pairs().is_empty());
         assert_eq!(report.run_count(), 3);
@@ -557,21 +571,43 @@ mod tests {
         );
     }
 
-    /// REQ-26・TASK-26.3-1: z の混在（1.96 と 1.959964）は `MismatchedZ`。
+    /// REQ-26・TASK-26.3-1・issue #104 レビュー指摘（PR #243）:
+    /// `WILSON_Z_95`（1.96）から外れた z（1.959964。より精度の高い表現だが
+    /// [`OVERLAP_TOLERANCE`] を超えて異なる）は `NonWilson95Z`。
     #[test]
-    fn judge_overlap_mismatched_z_is_error() {
+    fn judge_overlap_non_wilson95_z_is_error() {
         let a = wilson::wilson_ci(5, 10, 1.96).expect("valid interval");
         let b = wilson::wilson_ci(5, 10, 1.959964).expect("valid interval");
         let c = wilson::wilson_ci(5, 10, 1.96).expect("valid interval");
         assert_eq!(
             judge_overlap(&[a, b, c]).unwrap_err(),
-            ReproducibilityError::MismatchedZ { index: 1 }
+            ReproducibilityError::NonWilson95Z {
+                index: 1,
+                z: 1.959964
+            }
+        );
+    }
+
+    /// REQ-26・TASK-26.3-1・issue #104 レビュー指摘（PR #243）: レビューが
+    /// 挙げた具体例そのもの。z=0.1 で統一された（区間同士は互いに一致する）
+    /// 3 区間を渡しても `AllPairsOverlap` を返さず `NonWilson95Z` で拒否する
+    /// （`wilson_ci` は任意の正の z を受け付けるため、この検証が無いと
+    /// 95% 以外の区間を再現性ありと誤判定できてしまっていた）。
+    #[test]
+    fn judge_overlap_rejects_uniform_non_wilson95_z() {
+        let a = wilson::wilson_ci(5, 10, 0.1).expect("valid interval");
+        let b = wilson::wilson_ci(5, 10, 0.1).expect("valid interval");
+        let c = wilson::wilson_ci(5, 10, 0.1).expect("valid interval");
+        assert_eq!(
+            judge_overlap(&[a, b, c]).unwrap_err(),
+            ReproducibilityError::NonWilson95Z { index: 0, z: 0.1 }
         );
     }
 
     /// REQ-26・TASK-26.3-1: z の差が [`OVERLAP_TOLERANCE`]（1e-9）未満
-    /// （5e-10）なら `MismatchedZ` にならず判定が進む（`intervals_overlap`
-    /// 側の許容差テストと対称の正常系。z の許容差判定にも境界を持たせる）。
+    /// （5e-10）なら `NonWilson95Z` にならず判定が進む（`intervals_overlap`
+    /// 側の許容差テストと対称の正常系。`WILSON_Z_95` との許容差判定にも
+    /// 境界を持たせる）。
     #[test]
     fn judge_overlap_z_within_tolerance_is_accepted() {
         let a = wilson::wilson_ci(5, 10, 1.96).expect("valid interval");

@@ -5,7 +5,7 @@
 //! での同じ結論の再確認は本テストの範囲外（issue #105）。
 
 use fandhe_edge_eval::reproducibility::{
-    OverlapVerdict, SeedRun, judge_overlap, judge_reproducibility,
+    OverlapVerdict, ReproducibilityError, SeedRun, judge_overlap, judge_reproducibility,
 };
 use fandhe_edge_eval::wilson;
 
@@ -36,9 +36,17 @@ fn pair_tuples(report: &fandhe_edge_eval::reproducibility::OverlapReport) -> Vec
 }
 
 /// (a) PoC-19 の再現: `wilson_ci(correct, 650, 1.959964)` が PoC-19 実機結果の
-/// lo/hi と 1e-9 で一致し、`judge_overlap` が `AllPairsOverlap` になる。
+/// lo/hi と 1e-9 で一致する。PoC-19 はより精度の高い z（1.959964）を使って
+/// おり、評価契約が要求する Wilson **95%**（`WILSON_Z_95` = 1.96）とは
+/// [`fandhe_edge_eval::reproducibility::OVERLAP_TOLERANCE`] を超えて異なる
+/// ため、公開 API `judge_overlap` はこれを 95% 区間として受け付けず
+/// `NonWilson95Z` を返す（issue #104 レビュー指摘・PR #243。
+/// `wilson_ci` が任意の正の z を受け付けるため、この検証が無いと
+/// 95% 以外の区間を再現性ありと誤判定できてしまっていた）。
+/// 同じ件数を `judge_reproducibility`（z = `WILSON_Z_95` 経路）に通した
+/// 重なり判定は `judge_reproducibility_matches_poc19_run_counts` で確認する。
 #[test]
-fn poc19_intervals_all_overlap() {
+fn poc19_intervals_use_non_wilson95_z_and_are_rejected() {
     let z = 1.959964_f64;
     let a = wilson::wilson_ci(214, 650, z).expect("valid interval");
     let b = wilson::wilson_ci(210, 650, z).expect("valid interval");
@@ -51,10 +59,10 @@ fn poc19_intervals_all_overlap() {
     assert!(approx_eq(c.lo(), 0.2912268876983092));
     assert!(approx_eq(c.hi(), 0.36312357152971286));
 
-    let report = judge_overlap(&[a, b, c]).expect("3 valid intervals");
-    assert_eq!(report.verdict(), OverlapVerdict::AllPairsOverlap);
-    assert!(report.disjoint_pairs().is_empty());
-    assert_eq!(report.run_count(), 3);
+    assert_eq!(
+        judge_overlap(&[a, b, c]).unwrap_err(),
+        ReproducibilityError::NonWilson95Z { index: 0, z }
+    );
 }
 
 /// (b) 同じ件数を `judge_reproducibility`（`z = WILSON_Z_95` = 1.96 の経路）に
