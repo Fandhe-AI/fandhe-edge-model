@@ -1,9 +1,10 @@
-//! JSONL 形式の学習・評価データを検査する（REQ-16・TASK-16.1-1）。
+//! JSONL 形式の学習・評価データを検査する（REQ-16・TASK-16.1-1・TASK-16.1-2）。
 //!
 //! CLI の `inspect` 工程（TASK-33.x で配線予定）から、ガード層を通過済みの
-//! JSONL 本文を受け取って呼ばれることを想定する。件数集計（TASK-16.1-2）は
-//! 本モジュールの対象外で、[`inspect_records`] は「型・必須項目・ラベル enum の
-//! 検査」と「妥当なレコードの抽出」のみを行う。
+//! JSONL 本文を受け取って呼ばれることを想定する。[`inspect_records`] は
+//! 「型・必須項目・ラベル enum の検査」「妥当なレコードの抽出」に加え、
+//! 件数集計は [`crate::report`] が行い、結果を [`InspectOutcome::report`] に
+//! 格納する（TASK-16.1-2・issue #39）。
 //!
 //! # セキュリティ上の注意（データ本文・識別子の非転記）
 //!
@@ -54,6 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::json_keys::has_duplicate_key;
+use crate::report::{self, InspectReport};
 
 /// `inspect_records` の異常種別（本 crate の内部語彙）。
 ///
@@ -138,6 +140,15 @@ pub struct ValidRecord {
     pub input: String,
     /// `output.intent` の値。
     pub label_id: String,
+    /// `output` オブジェクト全体を、キーを整列した JSON 文字列にしたもの
+    /// （[`crate::report`] の `unique_outputs` 集計専用。PoC-9
+    /// `evaluator/inspect.py` の `_record_output_str`〔`json.dumps(out,
+    /// sort_keys=True)`〕に相当。workspace の `serde_json` は
+    /// `preserve_order` feature を有効にしていない〔`Cargo.lock` に
+    /// `indexmap` が無い〕ため、`Value::to_string()` はオブジェクトの
+    /// キーを整列済みで出力する。この前提が崩れると
+    /// `output_key_is_independent_of_raw_json_key_order` が検知する）。
+    pub output_key: String,
     pub tags: Option<Vec<String>>,
     pub group_id: Option<String>,
 }
@@ -149,6 +160,10 @@ pub struct InspectOutcome {
     pub anomalies: Vec<RecordAnomaly>,
     /// 行番号順（入力順）に並んだ妥当なレコード一覧。
     pub valid_records: Vec<ValidRecord>,
+    /// 件数・ラベル別集計レポート（REQ-16・TASK-16.1-2）。
+    /// `valid_records` のみを集計対象とし、異常を出した行は含めない
+    /// （[`crate::report`] モジュール doc 参照）。
+    pub report: InspectReport,
 }
 
 /// 有効なラベル ID の集合が空であることを示すエラー。
@@ -220,12 +235,21 @@ pub fn inspect_records(
     let mut valid_records = Vec::new();
     // id の初出行を記録する。並列化されないため BTreeMap で決定的な順序を保つ。
     let mut seen_ids: BTreeMap<String, usize> = BTreeMap::new();
+    // 件数集計（TASK-16.1-2）向け。空行を除く行数をループ内で数える。
+    // 「1 件以上の異常を出した行の数」（`InspectReport::anomalous_rows`）は
+    // ここでは数えない。非空行は本ループの末尾で必ず `valid_records` に残る
+    // （異常 0 件）か 1 件以上の異常を出すかのいずれか一方に分類されるため、
+    // `total_rows - valid_records.len()` として [`crate::report::summarize`]
+    // 側で導出できる（1 行が複数の異常を出しても行数としては 1 回だけ数える
+    // 導出になる）。
+    let mut total_rows = 0usize;
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line = idx + 1;
         if raw_line.trim().is_empty() {
             continue;
         }
+        total_rows += 1;
 
         let value: Value = match serde_json::from_str(raw_line) {
             Ok(value) => value,
@@ -338,7 +362,11 @@ pub fn inspect_records(
         };
 
         // output: 必須・object。output.intent: 必須・string・有効ラベル集合に含まれること。
-        let label_id_opt: Option<String> = match record.get("output") {
+        // `output_key` は `output` オブジェクト全体の正準化文字列
+        // （[`ValidRecord::output_key`] doc を参照。`unique_outputs` 集計専用で、
+        // ここで `v.to_string()` を先取りしておく（`intent` の検証に成功した
+        // ときのみ `label_id_opt` へ載せる）。
+        let label_id_opt: Option<(String, String)> = match record.get("output") {
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
@@ -386,7 +414,7 @@ pub fn inspect_records(
                         }
                         Some(intent) => {
                             if valid_label_ids.contains(intent) {
-                                Some(intent.to_string())
+                                Some((intent.to_string(), v.to_string()))
                             } else {
                                 anomalies.push(RecordAnomaly {
                                     line,
@@ -503,22 +531,27 @@ pub fn inspect_records(
         }
 
         if !record_has_error
-            && let (Some(id), Some(input), Some(label_id)) = (id_opt, input_opt, label_id_opt)
+            && let (Some(id), Some(input), Some((label_id, output_key))) =
+                (id_opt, input_opt, label_id_opt)
         {
             valid_records.push(ValidRecord {
                 line,
                 id,
                 input,
                 label_id,
+                output_key,
                 tags: tags_opt,
                 group_id: group_id_opt,
             });
         }
     }
 
+    let report = report::summarize(total_rows, &valid_records, valid_label_ids);
+
     Ok(InspectOutcome {
         anomalies,
         valid_records,
+        report,
     })
 }
 
@@ -549,6 +582,7 @@ mod tests {
                 id: "r1".to_string(),
                 input: "hello".to_string(),
                 label_id: "tier-s__low".to_string(),
+                output_key: "{\"intent\":\"tier-s__low\"}".to_string(),
                 tags: None,
                 group_id: None,
             }
@@ -560,9 +594,39 @@ mod tests {
                 id: "r2".to_string(),
                 input: "world".to_string(),
                 label_id: "tier-s__high".to_string(),
+                output_key: "{\"intent\":\"tier-s__high\"}".to_string(),
                 tags: Some(vec!["a".to_string(), "b".to_string()]),
                 group_id: Some("g1".to_string()),
             }
+        );
+    }
+
+    /// REQ-16・TASK-16.1-2: `output` オブジェクトのキー出現順が生 JSON 上で
+    /// 異なっていても、`output_key` は同じ正準化文字列になること
+    /// （[`ValidRecord::output_key`] doc「`preserve_order` feature 未使用の
+    /// 前提が崩れるとこのテストが検知する」の実体）。`summarize` へ
+    /// 直接ハードコードした `output_key` を渡すのではなく、
+    /// `record.get("output")`（生テキストの `serde_json::Value`）から
+    /// `output_key` を生成する `inspect_records` を通すことで、実際のキー順
+    /// 依存が回帰した場合に検知できるようにしている。
+    #[test]
+    fn output_key_is_independent_of_raw_json_key_order() {
+        let content = "\
+{\"id\":\"r1\",\"input\":\"in1\",\"output\":{\"intent\":\"x\",\"arguments\":{\"p\":1}}}
+{\"id\":\"r2\",\"input\":\"in2\",\"output\":{\"arguments\":{\"p\":1},\"intent\":\"x\"}}";
+        let valid = labels(&["x"]);
+
+        let outcome = inspect_records(content, &valid).expect("valid_label_ids は空でない");
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(outcome.valid_records.len(), 2);
+        assert_eq!(
+            outcome.valid_records[0].output_key, outcome.valid_records[1].output_key,
+            "output オブジェクトのキー出現順が異なるだけで output_key が食い違ってはならない"
+        );
+        assert_eq!(
+            outcome.report.unique_outputs, 1,
+            "同じ output を意味の同じキー順違いは 1 件として集計されること"
         );
     }
 

@@ -1928,6 +1928,7 @@ mod tests {
         let empty = crate::inspect::InspectOutcome {
             anomalies: Vec::new(),
             valid_records: Vec::new(),
+            report: crate::report::summarize(0, &[], &labels(&["A"])),
         };
         assert_eq!(
             require_non_empty(&empty),
@@ -1937,16 +1938,19 @@ mod tests {
             })
         );
 
+        let valid_records = vec![crate::inspect::ValidRecord {
+            line: 1,
+            id: "a".to_string(),
+            input: "hello".to_string(),
+            label_id: "A".to_string(),
+            output_key: "{\"intent\":\"A\"}".to_string(),
+            tags: None,
+            group_id: None,
+        }];
         let non_empty = crate::inspect::InspectOutcome {
             anomalies: Vec::new(),
-            valid_records: vec![crate::inspect::ValidRecord {
-                line: 1,
-                id: "a".to_string(),
-                input: "hello".to_string(),
-                label_id: "A".to_string(),
-                tags: None,
-                group_id: None,
-            }],
+            report: crate::report::summarize(1, &valid_records, &labels(&["A"])),
+            valid_records,
         };
         assert_eq!(require_non_empty(&non_empty), Ok(()));
     }
