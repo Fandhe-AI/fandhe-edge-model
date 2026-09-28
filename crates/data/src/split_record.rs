@@ -117,9 +117,11 @@ impl RecordedSplit {
 /// （coding-rust.md「公開 API・型設計」）。
 ///
 /// `Debug` は派生のままでよい: `splits`（[`SplitDigests`] 経由で
-/// [`SplitDigest`]）が手動実装した `Debug` でレコード ID を伏せるため、
-/// 本型を `{:?}` で出力してもレコード ID は漏れない
-/// （PR #210 codex レビュー P0 指摘）。
+/// [`SplitDigest`]）が手動実装した `Debug` でレコード ID を伏せ、
+/// `rule`（[`SplitRule`]）も手動実装した `Debug` で `per_label` の
+/// ラベル文字列を伏せるため、本型を `{:?}` で出力してもレコード ID・
+/// ラベルのいずれも漏れない（PR #210 codex レビュー P0 指摘。
+/// レコード ID に加えてラベルも伏せていなかった指摘の修正）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitRecord {
     schema_version: u32,
@@ -131,11 +133,30 @@ pub struct SplitRecord {
 }
 
 /// 分割規則（seed 以外の、割付を決めるパラメータ一式）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`per_label`
+/// （[`LabelAllocation`]）の `label` フィールドは利用者のデータ由来の
+/// ラベル文字列であり、`derive(Debug)` のまま `{:?}` で出力すると
+/// そのままログへ漏れる（security.md「秘密情報の混入防止」。
+/// PR #210 codex レビュー P0 指摘）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SplitRule {
     rule_id: String,
     ratios: RecordedRatios,
     per_label: Vec<LabelAllocation>,
+}
+
+impl std::fmt::Debug for SplitRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitRule")
+            .field("rule_id", &self.rule_id)
+            .field("ratios", &self.ratios)
+            .field(
+                "per_label",
+                &format_args!("<redacted {} labels>", self.per_label.len()),
+            )
+            .finish()
+    }
 }
 
 impl SplitRule {
@@ -1472,6 +1493,42 @@ mod tests {
         assert!(
             !digest_debug.contains("secret-id"),
             "SplitDigest の Debug 出力にレコード ID が含まれてはならない: {digest_debug}"
+        );
+    }
+
+    /// PR #210 codex レビュー未解決 P0 指摘の回帰テスト: `SplitRule`
+    /// （`per_label` の `LabelAllocation.label`）はデータ由来のラベル
+    /// 文字列を保持するため、`SplitRule`・それを含む `SplitRecord`・
+    /// `RecordedSplit` の `Debug`（`{:?}`）出力に実際のラベル
+    /// （"secret-label"）が含まれてはならない（security.md
+    /// 「秘密情報の混入防止」）。
+    #[test]
+    fn req17_task17_1_2_debug_output_does_not_leak_labels() {
+        let records = vec![
+            record("r1", "g1", "secret-label"),
+            record("r2", "g2", "secret-label"),
+            record("r3", "g3", "other-label"),
+            record("r4", "g4", "other-label"),
+        ];
+        let recorded =
+            split_and_record(&records, 5, &SplitRatios::default()).expect("valid ratios");
+
+        let rule_debug = format!("{:?}", recorded.record().rule());
+        assert!(
+            !rule_debug.contains("secret-label") && !rule_debug.contains("other-label"),
+            "SplitRule の Debug 出力にラベルが含まれてはならない: {rule_debug}"
+        );
+
+        let record_debug = format!("{:?}", recorded.record());
+        assert!(
+            !record_debug.contains("secret-label") && !record_debug.contains("other-label"),
+            "SplitRecord の Debug 出力にラベルが含まれてはならない: {record_debug}"
+        );
+
+        let recorded_debug = format!("{recorded:?}");
+        assert!(
+            !recorded_debug.contains("secret-label") && !recorded_debug.contains("other-label"),
+            "RecordedSplit の Debug 出力にラベルが含まれてはならない: {recorded_debug}"
         );
     }
 
