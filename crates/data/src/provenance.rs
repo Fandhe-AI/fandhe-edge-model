@@ -2,27 +2,31 @@
 //!
 //! 学習・評価データを外部 LLM で生成した場合に、モデル名・指示文のハッシュ・
 //! 生成日時・token 数を後から追跡できるようにするための型を定義する。
-//! 本モジュールは**型と検証のみ**を提供し、取り込み時に来歴を記録する機構
-//! （ファイル読み込み・JSON 入出力・データ検査コマンドとの接続）は
-//! 後続の TASK-40.1-2（issue #75）で実装する（実装済みを装わない）。
+//! 本モジュール（`provenance.rs`）は型と検証のみを提供する。取り込み時に
+//! 来歴を記録する機構（来歴 JSON の検証・記録 JSON 生成・データ検査
+//! コマンドとの接続）は [`ingest`] サブモジュールで実装済み（TASK-40.1-2・
+//! issue #75）。
 //!
 //! # スコープ境界
 //!
 //! - 指示文本文から sha256 を計算する処理は持たない。[`PromptHash`] は
 //!   既に計算済みのハッシュ値（16 進文字列または生バイト列）を受け取る
-//!   （issue #75 で `fandhe-edge-core` のハッシュ計算を再利用するか、
-//!   本 crate への `sha2` 配置についてユーザー承認を得る想定）
-//! - `serde` の `Serialize`/`Deserialize` は派生しない（JSON 入出力は
-//!   issue #75 の範囲。`crates/data/Cargo.toml` に `serde` を追加していない）
+//!   （`sha2` の本 crate への配置または `fandhe-edge-core` のハッシュ計算の
+//!   再利用はユーザー承認事項のため、issue #75 では見送った。[`ingest`]
+//!   モジュール doc の「範囲外」を参照）
+//! - `serde` の `Serialize`/`Deserialize` は派生しない（`crates/data/Cargo.toml`
+//!   に `serde` を追加していない。[`ingest::provenance_to_json`] は
+//!   `serde_json::Value`／`Map` を手動で組み立てて JSON 化する）
 //! - 生成元（`source`）フィールド・外部 LLM 出力の既定拒否は TASK-40.2 の範囲
 //!   （[`ProvenanceRecord`] は `#[non_exhaustive]` のため非破壊で追加できる）
 //! - データ本文・指示文本文そのものは保持しない（[`PromptHash`] のみ保持する）
 //!
 //! # 呼び出し文脈
 //!
-//! 取り込み時の記録機構（issue #75）・データ検査コマンド（CLI 側。
-//! パス未確定）から呼ばれる想定。本 crate の他モジュール（[`crate::inspect`]
-//! 等）と同様、ファイル読み込み・サイズ上限検査（REQ-39）はガード層
+//! [`ingest::parse_provenance_json`]（→ [`crate::ingest::ingest_records`]）
+//! から呼ばれ、将来は CLI のデータ検査コマンド（パス未確定・TASK-33.x）
+//! から接続される想定。本 crate の他モジュール（[`crate::inspect`] 等）と
+//! 同様、ファイル読み込み・サイズ上限検査（REQ-39）はガード層
 //! （呼び出し側）の責務とし、本モジュールはガード層を通過済みの値
 //! （文字列・バイト列）を受け取るところから始まる。
 //!
@@ -38,6 +42,8 @@
 //! （`crates/data/src/lib.rs` の「層の境界」節を参照）。
 
 use std::fmt;
+
+pub mod ingest;
 
 /// モデル名の許容バイト長の上限。
 const MODEL_NAME_MAX_BYTES: usize = 256;
@@ -504,8 +510,8 @@ pub enum TokenCount {
 /// 外部 LLM で生成したデータ 1 件分の来歴レコード（REQ-40・TASK-40.1-1）。
 ///
 /// データ本文・指示文本文そのものは保持しない（[`PromptHash`] のみ保持）。
-/// 生成元（`source`）・データ種別（学習／評価）は TASK-40.2・issue #75 で
-/// 追加予定（`#[non_exhaustive]` のため非破壊で拡張できる）。
+/// 生成元（`source`）・データ種別（学習／評価）は TASK-40.2 で追加予定
+/// （`#[non_exhaustive]` のため非破壊で拡張できる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ProvenanceRecord {
