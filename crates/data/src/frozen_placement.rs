@@ -78,7 +78,7 @@
 //!   `dest_path` を差し替える・別の内容で上書きする、といった事後の改変
 //!   まではこのモジュールでは検出できない。その検出は、評価時に凍結記録
 //!   の sha256 と再計算した値を突き合わせる
-//!   [`crate::eval_freeze::evaluate_gate`]（REQ-27・issue #49）が担う
+//!   [`crate::eval_freeze::evaluate_gate`]（REQ-27・TASK-27.1・issue #49）が担う
 //! - **root 実行下での書き込み防止は保証しない**。root は mode `0o444` でも
 //!   書き込めるため、[`place_read_only`] は書き込みを防げない配置を
 //!   「配置済み」と装わず、[`PlacementError::WriteNotRejected`] を返して
@@ -495,15 +495,13 @@ pub fn place_read_only(
                 source,
             })?;
 
-        let staged_mode = staging_file
+        let staging_meta = staging_file
             .metadata()
             .map_err(|source| PlacementError::Io {
                 path: dest_path.clone(),
                 source,
-            })?
-            .permissions()
-            .mode()
-            & 0o7777;
+            })?;
+        let staged_mode = staging_meta.permissions().mode() & 0o7777;
         if staged_mode != READ_ONLY_MODE {
             return Err(PlacementError::Io {
                 path: dest_path.clone(),
@@ -512,6 +510,10 @@ pub fn place_read_only(
                 )),
             });
         }
+        // 公開後に「本当にこの inode が公開されたか」を突き合わせるための
+        // 基準値（issue #227 codex[bot] 指摘: `rename`/`hard_link` の後に
+        // 対象の同一性を確認しないまま成功を返さないこと）。
+        let staged_dev_ino = dev_ino(&staging_meta);
 
         // 公開前の書き込み拒否プローブ。`staging_file` は書き込みモードで
         // 開いたままのハンドルであり、unix の権限判定は `open` 時点で
@@ -552,15 +554,24 @@ pub fn place_read_only(
             }
         }
 
-        // 公開後の実体を `dest_path` 自身から確認する（`hard_link` の
-        // 戻り値だけに頼らず、実際に公開先で見える状態を返り値へ反映する）。
+        // 公開後、`dest_path` に現れた実体が本当に検証・chmod 済みの
+        // ステージング inode と同一であることを突き合わせる。`hard_link`
+        // の戻り値だけを信用して「成功したのだから同一のはず」と即座に
+        // `Ok` を返さない（issue #227 codex[bot] 指摘: `rename`/`hard_link`
+        // の直後に対象の同一性を確認しないまま成功を返さないこと）。
         let dest_meta =
             std::fs::symlink_metadata(&dest_path).map_err(|source| PlacementError::Io {
                 path: dest_path.clone(),
                 source,
             })?;
+        let dest_dev_ino = dev_ino(&dest_meta);
+        if dest_dev_ino != staged_dev_ino {
+            return Err(PlacementError::Io {
+                path: dest_path,
+                source: std::io::Error::other("published entry does not match the staged inode"),
+            });
+        }
         let mode = dest_meta.permissions().mode() & 0o7777;
-        let dev_ino = dev_ino(&dest_meta);
 
         // 作業領域の後始末。公開は既に完了しているため、失敗しても配置
         // 自体は有効。失敗を無視せず `cleanup_failed` に記録する
@@ -574,7 +585,7 @@ pub fn place_read_only(
         Ok(ReadOnlyPlacement {
             path: dest_path,
             mode,
-            dev_ino,
+            dev_ino: dest_dev_ino,
             cleanup_failed,
         })
     }
@@ -673,7 +684,7 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// REQ-17・REQ-39: 非 root 環境での正常系。`dest_dir` 直下に読み取り
+    /// REQ-17・REQ-39・TASK-17.2-2: 非 root 環境での正常系。`dest_dir` 直下に読み取り
     /// 専用ファイルが 1 件だけ公開され、内容が一致し、直接の書き込み
     /// （append・truncate 双方）が拒否される。
     #[cfg(unix)]
@@ -720,7 +731,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "dest_dir には公開先だけが残るはず");
     }
 
-    /// REQ-17・REQ-39: issue #227 の一連の指摘に対する回帰テスト。
+    /// REQ-17・REQ-39・TASK-17.2-2: issue #227 の一連の指摘に対する回帰テスト。
     /// `place_read_only` の呼び出し中も `src` と同じ inode を指し続ける
     /// 読み取りハンドルを事前に握っておき、呼び出し後も mode・inode が
     /// 変わっていないことを確認する（`src` に `chmod`・`rename`・`unlink`
@@ -770,7 +781,7 @@ mod tests {
         assert_eq!(src_content, b"eval data");
     }
 
-    /// REQ-17: `src` の内容がハッシュと食い違うと `HashMismatch` になり、
+    /// REQ-17・TASK-17.2-2: `src` の内容がハッシュと食い違うと `HashMismatch` になり、
     /// `dest_dir` には何も作られない（issue #227 P0 指摘: バイト数の一致
     /// だけでは同じ長さの差し替えを見逃す）。
     #[cfg(unix)]
@@ -793,7 +804,7 @@ mod tests {
         assert!(entries.is_empty(), "失敗時は dest_dir に何も残らないはず");
     }
 
-    /// REQ-39: 凍結記録が主張するバイト長が `max_bytes` を超えると、
+    /// REQ-39・TASK-17.2-2: 凍結記録が主張するバイト長が `max_bytes` を超えると、
     /// `src` を読み込む前に `TooLarge` として拒否される。
     #[cfg(unix)]
     #[test]
@@ -813,7 +824,7 @@ mod tests {
         assert!(!dest_dir.0.join("frozen.jsonl").exists());
     }
 
-    /// REQ-17: 宛先に既にファイルが存在する場合、`place_read_only` は
+    /// REQ-17・TASK-17.2-2: 宛先に既にファイルが存在する場合、`place_read_only` は
     /// それを上書きせず `AlreadyExists` を返す（issue #227 P0 指摘:
     /// `rename` による置き換えの禁止）。
     #[cfg(unix)]
@@ -837,7 +848,7 @@ mod tests {
         );
     }
 
-    /// REQ-39: `file_name` が単一の通常コンポーネントでない場合は
+    /// REQ-39・TASK-17.2-2: `file_name` が単一の通常コンポーネントでない場合は
     /// `InvalidFileName` として拒否される（区切り文字・`..`・空文字列・
     /// NUL バイトを含む代表的なケースをまとめて確認する）。
     #[test]
@@ -850,7 +861,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: `validate_file_name` の拒否が `place_read_only` 全体を
+    /// REQ-39・TASK-17.2-2: `validate_file_name` の拒否が `place_read_only` 全体を
     /// 通しても効くこと（統合的な確認。区切り文字を含む代表例のみ）。
     #[cfg(unix)]
     #[test]
@@ -864,7 +875,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: 存在しない `src` は `Fs(FsError::Read)` として報告される。
+    /// REQ-39・TASK-17.2-2: 存在しない `src` は `Fs(FsError::Read)` として報告される。
     #[cfg(unix)]
     #[test]
     fn req39_place_read_only_reports_fs_error_for_missing_src() {
@@ -878,7 +889,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: ディレクトリを `src` に渡すと `Fs(FsError::NotRegularFile)`
+    /// REQ-39・TASK-17.2-2: ディレクトリを `src` に渡すと `Fs(FsError::NotRegularFile)`
     /// になる（FIFO 等での無期限停止と同じ防御。`fandhe_edge_core::fs`）。
     #[cfg(unix)]
     #[test]
@@ -892,7 +903,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: `dest_dir` が存在しない場合は `Io` エラーになる。
+    /// REQ-39・TASK-17.2-2: `dest_dir` が存在しない場合は `Io` エラーになる。
     #[test]
     fn req39_place_read_only_reports_io_error_for_missing_dest_dir() {
         let src = write_unique_temp_file("missing-dest-dir-src", b"eval data");
@@ -905,7 +916,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: `dest_dir` が通常ファイルだと `InvalidDestDir` になる。
+    /// REQ-39・TASK-17.2-2: `dest_dir` が通常ファイルだと `InvalidDestDir` になる。
     #[test]
     fn req39_place_read_only_rejects_dest_dir_that_is_a_regular_file() {
         let not_a_dir = write_unique_temp_file("dest-dir-is-file", b"not a directory");
@@ -917,7 +928,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: `dest_dir` が symlink だと `InvalidDestDir` になる。
+    /// REQ-39・TASK-17.2-2: `dest_dir` が symlink だと `InvalidDestDir` になる。
     #[cfg(unix)]
     #[test]
     fn req39_place_read_only_rejects_symlinked_dest_dir() {
@@ -967,7 +978,7 @@ mod tests {
         );
     }
 
-    /// REQ-39: 非 unix では `place_read_only` が常に `UnsupportedPlatform`
+    /// REQ-39・TASK-17.2-2: 非 unix では `place_read_only` が常に `UnsupportedPlatform`
     /// を返す（モジュール doc「責務の境界」）。
     #[cfg(not(unix))]
     #[test]
@@ -981,7 +992,7 @@ mod tests {
         }
     }
 
-    /// REQ-39: `Display` が英語固定で、評価データ本文を含まない。
+    /// REQ-39・TASK-17.2-2: `Display` が英語固定で、評価データ本文を含まない。
     #[test]
     fn req39_display_is_english_and_excludes_data_body() {
         let path = PathBuf::from("/tmp/example-eval.jsonl");
