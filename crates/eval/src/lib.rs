@@ -71,8 +71,11 @@
 //!
 //! - 外部 crate への直接依存は持たない。workspace 内の `fandhe-edge-core` には
 //!   [`invariance`] が使う生バイト列の sha256 ダイジェスト型
-//!   （`fandhe_edge_core::hash::Sha256Digest`）のためだけに依存する
-//!   （`Cargo.toml` の `[dependencies]` を参照）
+//!   （`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限付きの安全な
+//!   通常ファイル読み込み（`fandhe_edge_core::fs::sha256_file_bounded`）の
+//!   ためだけに依存する（`Cargo.toml` の `[dependencies]` を参照。issue #214
+//!   codex/review 指摘: 通常ファイル判定・TOCTOU 対策を本 crate 側に複製せず
+//!   共通コアと共有する）
 //! - ラベルは ID の文字列スライスで受け取り、`fandhe-edge-core::definition` には
 //!   依存しない。呼び出し側が `Definition::options()` の `id` を宣言順で渡す
 //! - 予測ファイル（JSONL）の読み込み・`status` 文字列の正規化・モデルパッケージの

@@ -31,14 +31,22 @@
 //! （REQ-39）で行う。一方 [`evaluate_with_invariance`] は自らファイルを開くため、
 //! 構成要素 1 件あたり [`MAX_MODEL_COMPONENT_BYTES`] を超える読み込みを行わない
 //! （詳細は当該定数と [`evaluate_with_invariance`] のドキュメントを参照）。
+//!
 //! [`ModelPackagePaths`] が指すパスに FIFO・ソケット・ディレクトリ等の特殊
-//! ファイルが渡されても無期限に停止しないよう、本モジュールの内部読み込み
-//! 関数（`read_component_bounded`）自身が開く前に種別を確認して拒否し
-//! （さらに Linux・macOS では `O_NONBLOCK` で開いた上で開いた後にも再確認
-//! する TOCTOU 対策を重ねる）、[`EvaluationInvarianceError::NotRegularFile`]
-//! として公開 API から返す（issue #214 codex/review 指摘。
-//! `fandhe-edge-core::definition::Definition::load` と同じ方式）。経路の
-//! 閉じ込め（`../` 等の拒否）は引き続き呼び出し側のガード層
+//! ファイルが渡されても無期限に停止しない通常ファイル判定・サイズ上限・
+//! `O_NONBLOCK` を用いた TOCTOU 対策は、共通コアの [`fandhe_edge_core::fs`]
+//! モジュールへ集約済み（issue #214 codex/review 指摘: 本モジュールが独自に
+//! 複製していた防御ロジック〔旧 `read_component_bounded`・
+//! `open_component_for_read`〕を撤去し、`fandhe-edge-core::definition::Definition::load`
+//! と同じ関数を共有する）。本モジュールは
+//! [`fandhe_edge_core::fs::sha256_file_bounded`] を呼び、評価前後それぞれで
+//! 構成要素ファイルの sha256 を**ストリームで**計算する。読み込んだ生バイト列
+//! 全体は保持せず、保持するのは [`fandhe_edge_core::hash::Sha256Digest`]
+//! （32 バイト）だけにすることで、評価前後のスナップショットを同時に持っても
+//! 構成要素の生バイト列（最大で構成要素数 × [`MAX_MODEL_COMPONENT_BYTES`]）を
+//! 二重に保持しない（issue #214 codex/review 指摘: 4 構成要素が各 64 MiB の
+//! 場合、旧実装では評価前後で最大 512 MiB が同時にメモリへ残りえた）。
+//! 経路の閉じ込め（`../` 等の拒否）は引き続き呼び出し側のガード層
 //! （REQ-39・パス未確定）の責務であり、本モジュールはサイズ上限と通常
 //! ファイルであることの検査のみを扱う。
 //!
@@ -56,6 +64,7 @@
 //!   （配布パッケージ形式の契約を先取りしないため）。構成要素ごとの
 //!   ダイジェストの集合（[`ModelPackageSnapshot`]）までを提供する
 
+use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -263,6 +272,23 @@ impl ModelPackageSnapshot {
                 digests.insert(component, Sha256Digest::of_bytes(value));
             }
         }
+        Self::from_digests(digests)
+    }
+
+    /// 構成要素ごとに既に計算済みのダイジェストの集合から直接スナップショットを
+    /// 作る（[`evaluate_with_invariance`] がファイルをストリームで読み込みながら
+    /// [`fandhe_edge_core::fs::sha256_file_bounded`] で計算したダイジェストを
+    /// 渡す用途。生バイト列を経由しないため [`ModelPackageBytes`] を介さない）。
+    ///
+    /// [`Self::capture`] と同じ不変条件（重み〔[`ModelComponent::Weights`]〕が
+    /// 無ければ [`InvarianceError::MissingWeights`]）を課す。両関数とも最終的に
+    /// 本関数へ委譲することで、この不変条件の検査箇所を 1 つに保つ。
+    fn from_digests(
+        digests: BTreeMap<ModelComponent, Sha256Digest>,
+    ) -> Result<Self, InvarianceError> {
+        if !digests.contains_key(&ModelComponent::Weights) {
+            return Err(InvarianceError::MissingWeights);
+        }
         Ok(ModelPackageSnapshot { digests })
     }
 
@@ -433,202 +459,83 @@ pub struct ModelPackagePaths<'a> {
 /// と同じ位置づけの暫定値）。
 pub const MAX_MODEL_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// [`evaluate_with_invariance`] の内部でのファイル読み込みが失敗した理由。
-///
-/// 呼び出し側には公開せず、[`evaluate_with_invariance`] が
-/// [`EvaluationInvarianceError`] へ構成要素・パスの情報を添えて変換する
-/// （このエラー自体は構成要素・パスを知らないため、[`read_component_bounded`]
-/// を構成要素非依存の関数として単体テストしやすくするための中間表現）。
-#[derive(Debug)]
-enum ComponentReadError {
-    /// ファイルを開く・読み込む際の I/O エラー。
-    Io(std::io::Error),
-    /// 上限バイト数を超えていた（`size` は報告または実際に読んだバイト数）。
-    TooLarge { size: u64, limit: u64 },
-    /// パス先が通常ファイルではない（FIFO・ソケット・キャラクタデバイス・
-    /// ディレクトリ等）。`fandhe-edge-core::definition::DefinitionError::NotRegularFile`
-    /// と同じ位置づけ（issue #214 codex/review 指摘: `ModelPackagePaths` に
-    /// FIFO 等が渡ると、サイズ上限付きの読み込みへ進む前に無期限停止しうる）。
-    NotRegularFile,
-}
-
-/// FIFO・ソケット・キャラクタデバイス等での無期限停止を避けるため
-/// `O_NONBLOCK` 付きで開く（Linux・macOS）。`file_type().is_file()` の検査は
-/// 呼び出し元（[`read_component_bounded`]）で行う。
-///
-/// `fandhe-edge-core::definition::Definition::open_for_read` と同じ方針
-/// （issue #214 codex/review 指摘）。eval 層は core の `definition` モジュールに
-/// 依存しない方針（`lib.rs` の「層の境界」参照）のため、`hash::Sha256Digest`
-/// 以外の core API は再利用せず、本 crate 側に同じ実装を複製する。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn open_component_for_read(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    // `O_NONBLOCK` はカーネル ABI の安定値（Linux は全対応アーキテクチャで
-    // 8進 0o4000、macOS（BSD 系）は 0x0004）。`libc` 等の新規依存を追加せず
-    // （dependency-policy.md）標準ライブラリの `custom_flags` のみで実現する
-    // ため、対応 OS を限定してハードコードする
-    // （`fandhe-edge-core::definition::Definition::open_for_read` と同じ値）。
-    #[cfg(target_os = "linux")]
-    const O_NONBLOCK: i32 = 0o4000;
-    #[cfg(target_os = "macos")]
-    const O_NONBLOCK: i32 = 0x0004;
-
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(path)
-}
-
-/// Linux・macOS 以外（Windows 等）向けのフォールバック。`O_NONBLOCK` 相当の
-/// 対策は持たないが、Windows は M10 時点で対象外（coding-rust.md「クロス
-/// プラットフォーム」）であり、`file_type().is_file()` による通常ファイル
-/// 以外の拒否は呼び出し元（[`read_component_bounded`]）で引き続き行う。
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn open_component_for_read(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
-/// 1 ファイルを `limit` バイトまでの上限付きで読み込む。
-///
-/// `std::fs::metadata` でサイズを確認した後に別途読み込む実装は、確認後に
-/// ファイルが拡大・差し替えられると上限を超えて無制限にメモリへ読み込みうる
-/// （TOCTOU。`.claude/rules/security.md`「ガード層: 資源の上限」）。ここでは
-/// 1 つの `File` からメタデータ取得・`take` による打ち切り読み込みまで行い、
-/// その間の再オープンを避けることでこの窓を閉じる
-/// （`fandhe-edge-core::definition::Definition::load` と同じ方針）。
-///
-/// FIFO・ソケット・キャラクタデバイス等を指すパスを渡されると、通常の
-/// `File::open` は書き手が現れるまで無期限に停止しうる（security.md
-/// 「ガード層: 資源の上限」。issue #214 codex/review 指摘: `ModelPackagePaths`
-/// は本 crate の公開 API であり、呼び出し側のガード層を経由しない誤用でも
-/// 無期限停止しないことを本関数自身で保証する）。そのため開く前にまず
-/// `std::fs::metadata` で種別を確認し、通常ファイル以外は
-/// [`ComponentReadError::NotRegularFile`] として即座に拒否する（開く前の
-/// `stat` だけでは FIFO の無期限停止を防げない Linux・macOS 以外の OS でも、
-/// この事前チェックだけは効く）。Linux・macOS ではさらに
-/// [`open_component_for_read`] で `O_NONBLOCK` を付けて開くことで、事前の
-/// `metadata` 呼び出しの後にパスが FIFO へ差し替えられた場合の窓（TOCTOU）
-/// でも無期限停止を避け、開いた後に再度種別を確認して通常ファイル以外を
-/// 同じエラーで拒否する。経路の閉じ込め（`../` 等の拒否）は引き続き
-/// 呼び出し側のガード層（REQ-39・パス未確定）の責務とする。
-///
-/// `limit` を引数として受け取るのは、テストが小さな上限で
-/// [`ComponentReadError::TooLarge`] を確実に再現できるようにするため。
-fn read_component_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ComponentReadError> {
-    use std::io::Read as _;
-
-    // 開く前の事前チェック。FIFO 等は open(2) 自体が書き手を待って無期限に
-    // 停止しうるため、O_NONBLOCK を持たない OS（Windows 等）でもここで
-    // 拒否できるようにする（advisor 指摘: `open_component_for_read` の
-    // 素朴な `File::open` フォールバックはこの事前チェックが無いと無防備）。
-    let pre_metadata = std::fs::metadata(path).map_err(ComponentReadError::Io)?;
-    if !pre_metadata.file_type().is_file() {
-        return Err(ComponentReadError::NotRegularFile);
-    }
-
-    let mut file = open_component_for_read(path).map_err(ComponentReadError::Io)?;
-    // 事前チェックとオープンの間に差し替えられていないかの TOCTOU 対策
-    // （同一の `File` ハンドルへ再度問い合わせる）。
-    let metadata = file.metadata().map_err(ComponentReadError::Io)?;
-    if !metadata.file_type().is_file() {
-        return Err(ComponentReadError::NotRegularFile);
-    }
-    let reported_size = metadata.len();
-    if reported_size > limit {
-        return Err(ComponentReadError::TooLarge {
-            size: reported_size,
-            limit,
-        });
-    }
-
-    // 上限+1バイトまでしか読まない。開いた後にファイルが上限超へ拡大・
-    // 差し替えられていても、読み込み量自体を上限近傍で頭打ちにできる。
-    let mut buf = Vec::new();
-    (&mut file)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(ComponentReadError::Io)?;
-    let actual_size = buf.len() as u64;
-    if actual_size > limit {
-        return Err(ComponentReadError::TooLarge {
-            size: actual_size,
-            limit,
-        });
-    }
-    Ok(buf)
-}
-
-/// [`evaluate_with_invariance`] が内部で保持する、ディスクから読み込んだ
-/// 構成要素のバイト列（所有）。[`ModelPackageBytes`] は借用のみを持つ型
-/// なので、読み込んだバイト列の寿命を確保するために別の型として持つ。
-struct CapturedComponentBytes {
-    weights: Vec<u8>,
-    vocab: Option<Vec<u8>>,
-    calibration: Option<Vec<u8>>,
-    thresholds: Option<Vec<u8>>,
-}
-
-impl CapturedComponentBytes {
-    /// 保持しているバイト列を借用する [`ModelPackageBytes`] を作る。
-    fn as_model_package_bytes(&self) -> ModelPackageBytes<'_> {
-        ModelPackageBytes {
-            weights: Some(&self.weights),
-            vocab: self.vocab.as_deref(),
-            calibration: self.calibration.as_deref(),
-            thresholds: self.thresholds.as_deref(),
-        }
-    }
-}
-
-/// `paths` が指す各構成要素ファイルを [`MAX_MODEL_COMPONENT_BYTES`] の上限付きで
-/// ディスクから読み込む（[`evaluate_with_invariance`] が評価前後それぞれで
-/// 呼ぶ内部ヘルパー）。
-fn capture_component_bytes<E>(
-    paths: &ModelPackagePaths<'_>,
-) -> Result<CapturedComponentBytes, EvaluationInvarianceError<E>> {
-    let read = |component: ModelComponent,
-                path: &Path|
-     -> Result<Vec<u8>, EvaluationInvarianceError<E>> {
-        read_component_bounded(path, MAX_MODEL_COMPONENT_BYTES).map_err(|err| match err {
-            ComponentReadError::Io(source) => EvaluationInvarianceError::Read {
+/// 構成要素 1 件を [`fandhe_edge_core::fs::sha256_file_bounded`] でストリーム
+/// ハッシュ化し、失敗を構成要素・パスの情報を添えた [`EvaluationInvarianceError`]
+/// へ写す（[`capture_snapshot`] が評価前後それぞれで構成要素ごとに呼ぶ内部
+/// ヘルパー）。通常ファイル判定・サイズ上限・`O_NONBLOCK` による TOCTOU 対策は
+/// すべて共通コア側の実装に委ね、本 crate 側では複製しない
+/// （issue #214 codex/review 指摘）。
+fn hash_component<E>(
+    component: ModelComponent,
+    path: &Path,
+) -> Result<Sha256Digest, EvaluationInvarianceError<E>> {
+    fandhe_edge_core::fs::sha256_file_bounded(path, MAX_MODEL_COMPONENT_BYTES).map_err(|err| {
+        match err {
+            FsError::Read { path, source } => EvaluationInvarianceError::Read {
                 component,
-                path: path.to_path_buf(),
+                path,
                 source,
             },
-            ComponentReadError::TooLarge { size, limit } => EvaluationInvarianceError::TooLarge {
+            FsError::TooLarge { path, size, limit } => EvaluationInvarianceError::TooLarge {
                 component,
-                path: path.to_path_buf(),
+                path,
                 size,
                 limit,
             },
-            ComponentReadError::NotRegularFile => EvaluationInvarianceError::NotRegularFile {
+            FsError::NotRegularFile { path } => {
+                EvaluationInvarianceError::NotRegularFile { component, path }
+            }
+            // `FsError` は `#[non_exhaustive]`（共通コア側で将来バリアントが
+            // 増えうる）。未知のバリアントを fail-open で無視せず、内容を
+            // 保った I/O エラーとして fail-closed に扱う（`path` は本関数の
+            // 引数から補う。将来バリアントが `path` を持たない可能性がある
+            // ため、元エラーの `Display` 文字列だけを `source` に残す）。
+            other => EvaluationInvarianceError::Read {
                 component,
                 path: path.to_path_buf(),
+                source: std::io::Error::other(other.to_string()),
             },
-        })
-    };
-
-    let weights = read(ModelComponent::Weights, paths.weights)?;
-    let vocab = paths
-        .vocab
-        .map(|path| read(ModelComponent::Vocab, path))
-        .transpose()?;
-    let calibration = paths
-        .calibration
-        .map(|path| read(ModelComponent::Calibration, path))
-        .transpose()?;
-    let thresholds = paths
-        .thresholds
-        .map(|path| read(ModelComponent::Thresholds, path))
-        .transpose()?;
-
-    Ok(CapturedComponentBytes {
-        weights,
-        vocab,
-        calibration,
-        thresholds,
+        }
     })
+}
+
+/// `paths` が指す各構成要素ファイルを [`MAX_MODEL_COMPONENT_BYTES`] の上限付きで
+/// ディスクから読み込み、構成要素ごとの sha256 ダイジェストのみを保持する
+/// スナップショットを作る（[`evaluate_with_invariance`] が評価前後それぞれで
+/// 呼ぶ内部ヘルパー）。
+///
+/// 読み込んだ生バイト列は構成要素 1 件ずつ処理が終わるたびに破棄され、
+/// 保持されるのは [`Sha256Digest`]（32 バイト）だけになる。評価前・評価後の
+/// 両方のスナップショットを同時に持っても、旧実装（`CapturedComponentBytes`
+/// にバイト列を保持し続けていた実装）のように構成要素の生バイト列を二重に
+/// 持たない（issue #214 codex/review 指摘）。
+fn capture_snapshot<E>(
+    paths: &ModelPackagePaths<'_>,
+) -> Result<ModelPackageSnapshot, EvaluationInvarianceError<E>> {
+    let mut digests = BTreeMap::new();
+    digests.insert(
+        ModelComponent::Weights,
+        hash_component(ModelComponent::Weights, paths.weights)?,
+    );
+    if let Some(path) = paths.vocab {
+        digests.insert(
+            ModelComponent::Vocab,
+            hash_component(ModelComponent::Vocab, path)?,
+        );
+    }
+    if let Some(path) = paths.calibration {
+        digests.insert(
+            ModelComponent::Calibration,
+            hash_component(ModelComponent::Calibration, path)?,
+        );
+    }
+    if let Some(path) = paths.thresholds {
+        digests.insert(
+            ModelComponent::Thresholds,
+            hash_component(ModelComponent::Thresholds, path)?,
+        );
+    }
+    ModelPackageSnapshot::from_digests(digests).map_err(EvaluationInvarianceError::Snapshot)
 }
 
 /// [`evaluate_with_invariance`] が返しうるエラー。評価クロージャ自身の
@@ -753,17 +660,13 @@ pub fn evaluate_with_invariance<T, E>(
     paths: &ModelPackagePaths<'_>,
     eval: impl FnOnce(&ModelPackagePaths<'_>) -> Result<T, E>,
 ) -> Result<T, EvaluationInvarianceError<E>> {
-    let before_bytes = capture_component_bytes(paths)?;
-    let before = ModelPackageSnapshot::capture(&before_bytes.as_model_package_bytes())
-        .map_err(EvaluationInvarianceError::Snapshot)?;
+    let before = capture_snapshot(paths)?;
 
     let eval_result = eval(paths);
 
     // `eval_result` が `Err` でも、必ずディスクを読み直して評価後の状態を
     // 確認する（fail-closed。評価失敗時にパッケージ改変の検査を省略しない）。
-    let after_bytes = capture_component_bytes(paths)?;
-    let after = ModelPackageSnapshot::capture(&after_bytes.as_model_package_bytes())
-        .map_err(EvaluationInvarianceError::Snapshot)?;
+    let after = capture_snapshot(paths)?;
 
     before
         .verify_unchanged(&after)
@@ -1048,34 +951,52 @@ mod tests {
         panic!("一意な一時ファイルを作成できなかった");
     }
 
+    // 通常ファイル判定・FIFO での無期限停止回避・TOCTOU 対策そのものの単体
+    // テストは、防御ロジックの実体である `fandhe_edge_core::fs` 側
+    // （`crates/core/src/fs.rs` の `tests` モジュール）に集約済み
+    // （issue #214 codex/review 指摘。本 crate は旧 `read_component_bounded`・
+    // `ComponentReadError` を複製せず、`fandhe_edge_core::fs::sha256_file_bounded`
+    // をそのまま呼ぶだけになったため）。ここでは本 crate 独自の関心事
+    // （構成要素種別への写像・ストリーム計算したダイジェストが
+    // `Sha256Digest::of_bytes` と一致すること）だけを確認する。
+
     #[test]
-    fn req27_read_component_bounded_accepts_file_within_limit() {
-        let guard = write_unique_temp_file("within-limit", b"hello");
-        let bytes = read_component_bounded(&guard.0, 5).expect("上限内は成功するはず");
-        assert_eq!(bytes, b"hello");
+    fn req27_hash_component_matches_of_bytes_for_known_content() {
+        // ストリームで計算したダイジェスト（`hash_component` 経由）が、
+        // メモリ上のバイト列から計算した `Sha256Digest::of_bytes` と一致する
+        // ことを確認する（issue #214 codex/review 指摘。ストリーム計算経路と
+        // メモリ上バイト列の経路の食い違いを検出する）。
+        let guard = write_unique_temp_file("hash-component-weights", b"weights-v1");
+        let digest = hash_component::<StubEvalError>(ModelComponent::Weights, &guard.0)
+            .expect("上限内は成功するはず");
+        assert_eq!(digest, Sha256Digest::of_bytes(b"weights-v1"));
     }
 
     #[test]
-    fn req27_read_component_bounded_rejects_file_over_limit() {
-        // REQ-39 の資源上限: 上限を 1 バイトでも超えるファイルは拒否する。
-        let guard = write_unique_temp_file("over-limit", b"hello-world");
-        let err = read_component_bounded(&guard.0, 5).unwrap_err();
+    fn req27_hash_component_maps_missing_file_to_read_error_with_component() {
+        // `fandhe_edge_core::fs::FsError::Read` が構成要素の情報を添えて
+        // `EvaluationInvarianceError::Read` へ写ることを確認する（実際の
+        // I/O エラーの中身は core 側でテスト済みのため、ここでは写像先の
+        // `component` フィールドのみを確認する）。
+        let missing = std::env::temp_dir().join("fandhe-edge-eval-invariance-does-not-exist");
+        let err = hash_component::<StubEvalError>(ModelComponent::Vocab, &missing).unwrap_err();
         match err {
-            ComponentReadError::TooLarge { size, limit } => {
-                assert_eq!(size, 11);
-                assert_eq!(limit, 5);
+            EvaluationInvarianceError::Read { component, .. } => {
+                assert_eq!(component, ModelComponent::Vocab);
             }
-            other => panic!("TooLarge を期待したが {other:?} だった"),
+            other => panic!("Read(Vocab) を期待したが {other:?} だった"),
         }
     }
 
-    /// REQ-39: ディレクトリを指すパスは通常ファイルではないため、サイズ上限の
-    /// 検査に進む前に [`ComponentReadError::NotRegularFile`] で拒否される
-    /// （issue #214 codex/review 指摘）。
+    /// REQ-39: 通常ファイル判定そのものは `fandhe_edge_core::fs` 側で単体
+    /// テスト済み（`crates/core/src/fs.rs`）。ここでは `hash_component` が
+    /// `FsError::NotRegularFile` を構成要素の情報を添えて
+    /// `EvaluationInvarianceError::NotRegularFile` へ正しく写すことのみを
+    /// 確認する（写像漏れの検出。issue #214 codex/review 指摘）。
     #[test]
-    fn req39_read_component_bounded_rejects_directory() {
+    fn req39_hash_component_maps_directory_to_not_regular_file_with_component() {
         let dir = std::env::temp_dir().join(format!(
-            "fandhe-edge-eval-invariance-unit-{}-dir-{}",
+            "fandhe-edge-eval-invariance-unit-{}-hash-component-dir-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1084,61 +1005,17 @@ mod tests {
         ));
         std::fs::create_dir(&dir).expect("テスト用ディレクトリを作成できるはず");
 
-        let result = read_component_bounded(&dir, MAX_MODEL_COMPONENT_BYTES);
+        let result = hash_component::<StubEvalError>(ModelComponent::Calibration, &dir);
         std::fs::remove_dir(&dir).expect("テスト用ディレクトリを削除できるはず");
 
         match result.expect_err("ディレクトリは通常ファイルではないため拒否されるはず")
         {
-            ComponentReadError::NotRegularFile => {}
-            other => panic!("NotRegularFile を期待したが {other:?} だった"),
+            EvaluationInvarianceError::NotRegularFile { component, path } => {
+                assert_eq!(component, ModelComponent::Calibration);
+                assert_eq!(path, dir);
+            }
+            other => panic!("NotRegularFile(Calibration) を期待したが {other:?} だった"),
         }
-    }
-
-    /// REQ-39・REQ-27: FIFO（名前付きパイプ）を指すパスを渡しても、書き手が
-    /// 現れなくても即座に拒否されること（無期限に停止しない）を確認する
-    /// （`fandhe-edge-core::definition::Definition::load` の同名テストと同じ
-    /// 方針。issue #214 codex/review 指摘）。テストが実際に無期限停止した
-    /// 場合は harness のタイムアウトで検出される。`read_component_bounded` は
-    /// 開く前の `std::fs::metadata` による事前チェックで FIFO を拒否するため、
-    /// `open(2)` 自体は呼ばれず、Linux・macOS 限定の `O_NONBLOCK` 経路（TOCTOU
-    /// 対策の第 2 防御）には到達しない。テスト自体は `mkfifo` コマンド
-    /// （Unix 限定）に依存するため、対象 OS を Linux・macOS に絞る。
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn req39_read_component_bounded_rejects_fifo_without_blocking() {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-edge-eval-invariance-unit-{}-fifo-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        // std に mkfifo 相当の API が無いため、テスト専用に `mkfifo` コマンドで
-        // FIFO を作成する（本体コードでは子プロセスを起動しない）。
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .expect("mkfifo コマンドを起動できるはず");
-        assert!(status.success(), "mkfifo が成功するはず");
-
-        // 書き手が存在しない FIFO に対して呼ぶ。無条件の `File::open` は
-        // ここでプロセスごと無期限に停止しうる。
-        let result = read_component_bounded(&path, MAX_MODEL_COMPONENT_BYTES);
-        std::fs::remove_file(&path).expect("FIFO を削除できるはず");
-
-        match result.expect_err("FIFO は通常ファイルではないため拒否されるはず")
-        {
-            ComponentReadError::NotRegularFile => {}
-            other => panic!("NotRegularFile を期待したが {other:?} だった"),
-        }
-    }
-
-    #[test]
-    fn req27_read_component_bounded_reports_io_error_for_missing_file() {
-        let missing = std::env::temp_dir().join("fandhe-edge-eval-invariance-does-not-exist");
-        let err = read_component_bounded(&missing, MAX_MODEL_COMPONENT_BYTES).unwrap_err();
-        assert!(matches!(err, ComponentReadError::Io(_)));
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1399,11 +1276,12 @@ mod tests {
     fn req27_evaluate_with_invariance_reports_too_large_component() {
         // 構成要素が上限を超えている場合、評価クロージャを呼ぶ前に
         // TooLarge で拒否する（本テストは MAX_MODEL_COMPONENT_BYTES の実値では
-        // 現実的な時間で再現できないため、`capture_component_bytes` が使う
-        // 上限そのものではなく `read_component_bounded` 側の単体テスト
-        // （`req27_read_component_bounded_rejects_file_over_limit`）で
-        // 上限超過の検出を確認する。ここでは読み込み失敗（存在しないパス）が
-        // Read エラーとして伝播することを確認する）。
+        // 現実的な時間で再現できないため、`capture_snapshot` が使う上限
+        // そのものではなく `fandhe_edge_core::fs::sha256_file_bounded` 側の
+        // 単体テスト（`crates/core/src/fs.rs`
+        // `req39_sha256_file_bounded_rejects_file_over_limit`）で上限超過の
+        // 検出を確認する。ここでは読み込み失敗（存在しないパス）が Read
+        // エラーとして伝播することを確認する）。
         let weights_guard = write_unique_temp_file("read-error-weights", b"weights-v1");
         let missing_vocab = std::env::temp_dir().join("fandhe-edge-eval-invariance-missing-vocab");
         let paths = ModelPackagePaths {
@@ -1427,9 +1305,9 @@ mod tests {
     /// REQ-39・REQ-27: 公開 API [`evaluate_with_invariance`] 自身が、
     /// `ModelPackagePaths` にディレクトリ（特殊ファイルの一種）が渡された
     /// 場合に [`EvaluationInvarianceError::NotRegularFile`] として拒否する
-    /// ことを確認する（issue #214 codex/review 指摘: 内部ヘルパー
-    /// `read_component_bounded` の単体テストだけでなく、
-    /// `capture_component_bytes` を経由した公開 API レベルの伝播も確かめる）。
+    /// ことを確認する（issue #214 codex/review 指摘: 共通コアの
+    /// `fandhe_edge_core::fs` 側の単体テストだけでなく、`capture_snapshot` を
+    /// 経由した公開 API レベルの伝播も確かめる）。
     #[test]
     fn req39_evaluate_with_invariance_rejects_directory_as_weights() {
         let dir = std::env::temp_dir().join(format!(

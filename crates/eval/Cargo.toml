@@ -10,8 +10,11 @@ description = "Evaluator layer (accuracy, per-label metrics, macro-F1, confusion
 [dependencies]
 # workspace 内の path 依存のみ（外部 crate は追加しない）。用途はモデルパッケージの
 # 評価前後比較（REQ-27・TASK-27.1-1・issue #69）で使う sha256 ダイジェスト型
-# （`fandhe_edge_core::hash::Sha256Digest`）に限る。`fandhe-edge-core::definition`
-# には依存しない（crates/eval/src/lib.rs の「層の境界」参照）。
+# （`fandhe_edge_core::hash::Sha256Digest`）と、サイズ上限付きの安全な通常
+# ファイル読み込み（`fandhe_edge_core::fs::sha256_file_bounded`。issue #214
+# codex/review 指摘: 通常ファイル判定・TOCTOU 対策の複製を解消するため共通コアへ
+# 集約）に限る。`fandhe-edge-core::definition` には依存しない
+# （crates/eval/src/lib.rs の「層の境界」参照）。
 fandhe-edge-core.workspace = true
 
 [lints]
