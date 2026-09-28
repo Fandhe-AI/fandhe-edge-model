@@ -59,16 +59,17 @@
 //!    `rename` は使わない
 //! 6. 公開直後、`dest_path` に現れた実体が検証・chmod したステージング
 //!    inode と本当に同一であることを `(dev, ino)` で突き合わせる
-//!    （後述「公開後の検証」）。同一でなければ他者が既に差し替えたと
-//!    判断し、そのファイルには触れず [`PlacementError::DestReplacedAfterPublish`]
-//!    を返す。突き合わせ自体（`symlink_metadata`）が失敗した場合は
-//!    `dest_path` の撤去を試み、撤去できれば「何も残っていない」状態で
-//!    [`PlacementError::Io`] を、撤去にも失敗すれば
-//!    [`PlacementError::PublishedButUnverified`]（配置の成否を「不明」と
-//!    区別して返す）を返す。呼び出し側が単純に再試行すると
-//!    [`PlacementError::AlreadyExists`] になって配置の成否を誤認する、
-//!    という事態を避けるため、公開後の失敗経路は必ずこのいずれかへ着地
-//!    させ、宙ぶらりんの成功を返さない
+//!    （後述「公開後の検証」）。**この検証が通るまで、また通らなかった
+//!    場合も、`dest_path` を削除しない**。同一でなければ他者が既に
+//!    差し替えたと判断し、そのファイルには触れず
+//!    [`PlacementError::DestReplacedAfterPublish`] を返す。突き合わせ
+//!    自体（`symlink_metadata`）が失敗した場合は、`dest_path` が本当に
+//!    自分が公開した実体かをこの時点で確認できないため、撤去を試みず
+//!    [`PlacementError::PublishedButUnverified`]（配置の成否・
+//!    `dest_path` の残存状況が「不明」であることを表す）を返す。呼び出し
+//!    側が単純に再試行すると [`PlacementError::AlreadyExists`] になって
+//!    配置の成否を誤認する、という事態を避けるため、公開後の失敗経路は
+//!    必ずこのいずれかへ着地させ、宙ぶらりんの成功を返さない
 //! 7. 公開後、作業ディレクトリ（もう中身は無い）を片付ける。この後始末
 //!    に失敗しても配置自体は有効なため、[`ReadOnlyPlacement::cleanup_failed`]
 //!    に記録して成功を返す（無視はしない）
@@ -263,16 +264,20 @@ pub enum PlacementError {
     /// 実体が検証・chmod したステージング inode と一致しなかった
     /// （`(dev, ino)` 不一致）。他者が既に `dest_path` を差し替えたと
     /// 判断し、そのファイルには触れずに返す（削除しない。issue #227 P1
-    /// 指摘: 公開後の失敗経路を「何も残っていない」か「これは他者の
-    /// ものだ」のどちらかへ必ず着地させ、誤って上書き・削除しないこと。
-    /// モジュール doc「設計」手順 6）。
+    /// 指摘: 公開後の失敗経路を「これは他者のものだ」（本 variant）か
+    /// 「確認できない」（[`PlacementError::PublishedButUnverified`]）の
+    /// どちらかへ必ず着地させ、誤って上書き・削除しないこと。モジュール
+    /// doc「設計」手順 6）。
     DestReplacedAfterPublish { path: PathBuf },
     /// 公開（`hard_link`）には成功したが、公開直後の検証
-    /// （`symlink_metadata`）自体が失敗し、かつ `dest_path` の撤去
-    /// （`remove_file`）にも失敗した。`dest_path` に何が残っているか
-    /// 本関数の内部では確定できない状態（issue #227 P1 指摘）。
-    /// [`PlacementError::AlreadyExists`]（呼び出し側が単純に再試行して
-    /// 「既にある」と誤認する）とは区別し、呼び出し側に手動確認を促す。
+    /// （`symlink_metadata`）自体が失敗した。`dest_path` が本当に自分が
+    /// 公開した実体かをこの時点では確認できないため、`remove_file` で
+    /// 撤去を試みることもしない（issue #227 codex[bot] P1 指摘: 撤去を
+    /// 試みると、無関係な別ファイルをたまたま同じパスに見つけて削除して
+    /// しまう競合がありうる）。`dest_path` に何が残っているか本関数の
+    /// 内部では確定できない状態のまま返す。[`PlacementError::AlreadyExists`]
+    /// （呼び出し側が単純に再試行して「既にある」と誤認する）とは区別し、
+    /// 呼び出し側に手動確認を促す。
     PublishedButUnverified { path: PathBuf },
     /// 非 unix プラットフォームでは読み取り専用配置そのものを拒否する
     /// （モジュール doc「責務の境界」）。
@@ -281,9 +286,10 @@ pub enum PlacementError {
     /// TOCTOU 対策）由来のエラー（[`fandhe_edge_core::fs`]）。
     Fs(FsError),
     /// 作業ディレクトリの作成・ファイル作成・権限変更・`hard_link` などの
-    /// I/O エラー。公開直後の検証（`symlink_metadata`）が失敗し、かつ
-    /// `dest_path` の撤去（`remove_file`）に成功した場合もここに含める
-    /// （「何も残っていない」ことを撤去で確認できているため）。
+    /// I/O エラー。公開直後の検証（`symlink_metadata`）自体の失敗は
+    /// ここに含めない（[`PlacementError::PublishedButUnverified`] を
+    /// 返す。`dest_path` が本当に自分の公開した実体かをこの時点では
+    /// 確認できないため、`Io` として片付けたり削除したりしない）。
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -556,21 +562,27 @@ fn create_staging_area(dest_dir: &Path) -> Result<StagingArea, PlacementError> {
     })
 }
 
-/// 公開（`hard_link`）直後の検証と、失敗時の後始末をまとめて行う
-/// （unix 限定。REQ-17・REQ-39・TASK-17.2-2。issue #227 P1 指摘）。
+/// 公開（`hard_link`）直後の検証を行う（unix 限定。REQ-17・REQ-39・
+/// TASK-17.2-2。issue #227 P1 指摘）。
 ///
 /// `dest_path` に現れた実体が `expected_dev_ino`（検証・chmod 済みの
-/// ステージング inode）と一致すれば `(mode, dev_ino)` を返す。失敗経路は
-/// 次のいずれかへ必ず着地させ、呼び出し側が [`PlacementError::AlreadyExists`]
+/// ステージング inode）と一致すれば `(mode, dev_ino)` を返す。**公開後の
+/// 経路では `dest_path` を一切削除しない**（issue #227 codex[bot] P1
+/// 指摘: `symlink_metadata` が失敗した時点で `dest_path` が本当に自分が
+/// 公開した inode かは確認できておらず、`remove_file` で撤去すると
+/// 無関係な別ファイルを削除してしまう競合がありうる）。失敗経路は次の
+/// いずれかへ必ず着地させ、呼び出し側が [`PlacementError::AlreadyExists`]
 /// と誤認して単純に再試行する事態を避ける（モジュール doc「設計」手順 6）:
 ///
+/// - `(dev, ino)` が一致する場合のみ、それが自分の公開した実体だと確認
+///   できたことになるので、その実体には触れず `Ok` を返す
 /// - `(dev, ino)` が一致しない場合: 他者が既に `dest_path` を差し替えた
 ///   と判断し、そのファイルには触れず [`PlacementError::DestReplacedAfterPublish`]
 ///   を返す
-/// - 突き合わせ自体（`symlink_metadata`）が失敗した場合: `dest_path` の
-///   撤去（`remove_file`）を試み、撤去できれば「何も残っていない」状態で
-///   [`PlacementError::Io`] を、撤去にも失敗すれば
-///   [`PlacementError::PublishedButUnverified`] を返す
+/// - 突き合わせ自体（`symlink_metadata`）が失敗した場合: `dest_path` が
+///   自分の公開した実体かどうかをこの時点で確認できないため、削除を
+///   試みず [`PlacementError::PublishedButUnverified`]（配置の成否・
+///   `dest_path` に何が残っているかが不明であることを表す）を返す
 #[cfg(unix)]
 fn verify_and_finalize_publish(
     dest_path: &Path,
@@ -578,27 +590,19 @@ fn verify_and_finalize_publish(
 ) -> Result<(u32, (u64, u64)), PlacementError> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    match std::fs::symlink_metadata(dest_path) {
-        Ok(dest_meta) => {
-            let dest_dev_ino = dev_ino(&dest_meta);
-            if dest_dev_ino != expected_dev_ino {
-                return Err(PlacementError::DestReplacedAfterPublish {
-                    path: dest_path.to_path_buf(),
-                });
-            }
-            let mode = dest_meta.permissions().mode() & 0o7777;
-            Ok((mode, dest_dev_ino))
+    let dest_meta = std::fs::symlink_metadata(dest_path).map_err(|_source| {
+        PlacementError::PublishedButUnverified {
+            path: dest_path.to_path_buf(),
         }
-        Err(lstat_source) => match std::fs::remove_file(dest_path) {
-            Ok(()) => Err(PlacementError::Io {
-                path: dest_path.to_path_buf(),
-                source: lstat_source,
-            }),
-            Err(_remove_source) => Err(PlacementError::PublishedButUnverified {
-                path: dest_path.to_path_buf(),
-            }),
-        },
+    })?;
+    let dest_dev_ino = dev_ino(&dest_meta);
+    if dest_dev_ino != expected_dev_ino {
+        return Err(PlacementError::DestReplacedAfterPublish {
+            path: dest_path.to_path_buf(),
+        });
     }
+    let mode = dest_meta.permissions().mode() & 0o7777;
+    Ok((mode, dest_dev_ino))
 }
 
 /// 評価データ本体を読み取り専用配置にする（REQ-39・REQ-17・TASK-17.2-2）。
@@ -1232,23 +1236,51 @@ mod tests {
     }
 
     /// REQ-17・REQ-39・TASK-17.2-2: 公開直後の `symlink_metadata` 自体が
-    /// 失敗し、かつ撤去（`remove_file`）にも失敗する場合（`dest_path` が
-    /// 最初から存在しない状況で両方とも `NotFound` になる状況で決定的に
-    /// 再現する）、`PublishedButUnverified` を返す。呼び出し側が
-    /// `AlreadyExists` と誤認しないよう、専用の variant で区別する
-    /// （issue #227 P1 指摘）。
+    /// 失敗した場合、`dest_path` を削除しようとせず `PublishedButUnverified`
+    /// を返す（issue #227 codex[bot] P1 指摘: `dest_path` が本当に自分が
+    /// 公開した実体かをこの時点では確認できないため、撤去を試みると
+    /// 無関係な別ファイルを削除してしまう競合がありうる）。呼び出し側が
+    /// `AlreadyExists` と誤認しないよう、専用の variant で区別する。
+    ///
+    /// `dest_path` が最初から存在しない場合（`NotFound`）だけでなく、
+    /// **実際にはまだ存在するのに `symlink_metadata` が失敗する**状況
+    /// （`dest_dir` の実行ビットを一時的に外し `EACCES` を再現する）でも、
+    /// `dest_path` の内容が変更・削除されずに残ることを確認する（削除を
+    /// 一切試みなくなったことの直接証拠）。
     #[cfg(unix)]
     #[test]
-    fn req17_req39_verify_and_finalize_publish_reports_unverified_when_lstat_and_removal_both_fail()
-    {
+    fn req17_req39_verify_and_finalize_publish_reports_unverified_without_deleting_when_lstat_fails()
+     {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dest_dir = make_temp_dir("lstat-fails-dest");
         let dest_path = dest_dir.0.join("frozen.jsonl");
+        std::fs::write(&dest_path, b"still there").expect("dest を作成できるはず");
+        if running_as_root(&dest_path) {
+            // root は DAC 検査を無視するため、実行ビットを外しても
+            // `symlink_metadata` は失敗しない（別テストで扱う分岐ではない
+            // ため、この決定的な再現方法自体を諦めて返す）。
+            return;
+        }
         let staged_dev_ino = (0, 0);
 
-        match verify_and_finalize_publish(&dest_path, staged_dev_ino) {
+        // `dest_dir` の実行ビットを外し、`dest_path` 自体は存在するまま
+        // `symlink_metadata(dest_path)` だけが `EACCES` で失敗する状況を
+        // 決定的に再現する。
+        std::fs::set_permissions(&dest_dir.0, std::fs::Permissions::from_mode(0o600))
+            .expect("dest_dir の権限を一時的に変更できるはず");
+        let result = verify_and_finalize_publish(&dest_path, staged_dev_ino);
+        // 後始末（`TempDirGuard::drop` が中身を削除できるように）実行ビットを戻す。
+        std::fs::set_permissions(&dest_dir.0, std::fs::Permissions::from_mode(0o700))
+            .expect("dest_dir の権限を元に戻せるはず");
+
+        match result {
             Err(PlacementError::PublishedButUnverified { path }) => assert_eq!(path, dest_path),
             other => panic!("PublishedButUnverified を期待したが {other:?} だった"),
         }
+
+        let content = std::fs::read(&dest_path).expect("dest はまだ存在するはず（削除されない）");
+        assert_eq!(content, b"still there");
     }
 
     /// REQ-39・TASK-17.2-2: root 実行下では mode `0o400` でも書き込めるため、
