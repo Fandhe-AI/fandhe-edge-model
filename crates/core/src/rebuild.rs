@@ -127,6 +127,67 @@ pub enum RebuildReason {
 /// はそのまま伝播する。`Definition` は検証済みの型付きフィールドのみを
 /// 持つため実質的には起こらないが、ライブラリコードとして panic させず
 /// `Result` を返す（coding-rust.md）。
+///
+/// # 呼び出し例
+///
+/// 学習ワーカー層（`trainer/`・`crates/train/`）が定義ファイルの更新を検知した際、
+/// 新旧の [`Definition`] を読み込んで `decide_rebuild` に渡し、3 通りの判定結果を
+/// 次のように扱う想定（TASK-20.1-1 の範囲は型と比較骨格のみで、学習ワーカー側の
+/// 実際の呼び出し配線は REQ-18〜20 の後続 TASK で行う）。
+///
+/// ```
+/// use fandhe_edge_core::definition::Definition;
+/// use fandhe_edge_core::rebuild::{decide_rebuild, RebuildDecision};
+///
+/// let old = Definition::parse(
+///     r#"{
+///         "schema": "fandhe-edge-model-definition/v1",
+///         "name": "sample_topic",
+///         "version": 1,
+///         "judgment_type": "single_select",
+///         "options": [
+///             { "id": "yes", "display_name": "Yes", "description": "肯定" },
+///             { "id": "no", "display_name": "No", "description": "否定" }
+///         ],
+///         "io": { "input": "bytes" }
+///     }"#,
+/// ).expect("valid な定義ファイルのはず");
+/// let new = Definition::parse(
+///     r#"{
+///         "schema": "fandhe-edge-model-definition/v1",
+///         "name": "sample_topic",
+///         "version": 1,
+///         "judgment_type": "single_select",
+///         "options": [
+///             { "id": "yes", "display_name": "Yes", "description": "肯定" },
+///             { "id": "no", "display_name": "No", "description": "否定" },
+///             { "id": "maybe", "display_name": "Maybe", "description": "保留" }
+///         ],
+///         "io": { "input": "bytes" }
+///     }"#,
+/// ).expect("valid な定義ファイルのはず");
+///
+/// match decide_rebuild(&old, &new).expect("失敗しないはず") {
+///     // ハッシュ完全一致。定義ファイルに実質差分がなく、作り直し不要。
+///     RebuildDecision::Unchanged { hash } => {
+///         println!("unchanged: {}", hash.to_hex());
+///     }
+///     // 選択肢 ID 集合・判定型は変わらず、表示名等の差分のみ。作り直し不要。
+///     RebuildDecision::NotRequired => {
+///         println!("not required");
+///     }
+///     // 選択肢 ID 集合または判定型が変化。モデルの作り直しが必要。
+///     RebuildDecision::Required(required) => {
+///         for reason in required.reasons() {
+///             println!("rebuild reason: {reason:?}");
+///         }
+///     }
+/// }
+/// ```
+///
+/// 上記の例では選択肢が 1 件追加されているため `Required` に分岐し、
+/// `reasons()` から `RebuildReason::OptionIdsChanged { added: {"maybe"}, .. }` が
+/// 得られる。
 pub fn decide_rebuild(
     old: &Definition,
     new: &Definition,
