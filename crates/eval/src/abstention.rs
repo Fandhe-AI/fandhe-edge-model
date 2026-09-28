@@ -1001,14 +1001,26 @@ mod tests {
             })
             .collect();
         let calibration = calibrate(&labels, &records).unwrap();
-        // 完全に同値（a=0.0）のロジットは top1 が最小（0.5、T=1 のとき）に
-        // なり、τ（validation の最小値）以下になるはず。
+        // τ は validation 5 件の中で最も確信度が低い行（a=-1.0）の top1。
+        // 完全に同値（a=0.0）のロジットは 2 ラベルで理論上最小の
+        // top1=0.5（`top1_probability` は `sum_exp <= n_labels` から
+        // `>= 1/n_labels` を返す）になり、非同値の a=-1.0 行の
+        // 確信度（> 0.5）より明確に低い。τ 未満はしきい値ちょうどの
+        // `Adopt` を許容せず `Abstain` のみを期待する（この境界一致の
+        // 挙動は `req22_decide_adopts_at_exact_threshold` で別途確認済み）。
         let logits_low = [0.0, 0.0];
         let decision = decide_abstention(&calibration, &logits_low).unwrap();
-        assert!(
-            matches!(decision, AbstentionDecision::Abstain { .. })
-                || matches!(decision, AbstentionDecision::Adopt { confidence, .. } if approx_eq(confidence, calibration.threshold()))
-        );
+        match decision {
+            AbstentionDecision::Abstain { confidence } => {
+                assert!(confidence < calibration.threshold());
+            }
+            AbstentionDecision::Adopt { confidence, .. } => {
+                panic!(
+                    "confidence {confidence} below threshold {} must abstain, not adopt",
+                    calibration.threshold()
+                );
+            }
+        }
     }
 
     /// TASK-22.1-2: argmax の同値は宣言順の先頭を採用する。
