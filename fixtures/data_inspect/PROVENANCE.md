@@ -19,7 +19,11 @@
 ## 移植範囲
 
 issue #39（TASK-16.1-2）が検査レポート（件数・ラベル別集計）の受け入れテスト
-（`crates/data/tests/inspect_report_clean.rs`）向けに移植した。
+（`crates/data/tests/inspect_report_clean.rs`）向けに移植した。同テストが読み込むのは
+`train.jsonl`・`test.jsonl` のみで、ラベル集合は `nine_intent_labels()` 関数として
+コード側にハードコードしている（`labels.json` は読み込まない）。`clean/labels.json`
+はラベル集合の参照資料として PoC-9 から複製したもので、将来ラベル集合をファイルから
+読み込むテスト・実装を追加する際の移植元として残している。
 
 ## 生成元
 
