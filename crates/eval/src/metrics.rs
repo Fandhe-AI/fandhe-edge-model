@@ -8,9 +8,11 @@
 //! # 評価契約との関係
 //!
 //! - 分母が 0 の指標は `Option<f64>` の `None` として返し、0 や 1 で埋めない
-//!   （`.claude/rules/evaluation-contract.md`「有意性・指標」）。`None` を
-//!   JSON の `null` へ写す処理と、平均から除いたラベルの列挙
-//!   （`excluded_labels`）は TASK-24.2（issue #61）が担う
+//!   （`.claude/rules/evaluation-contract.md`「有意性・指標」）。平均から
+//!   除いたラベルの列挙は [`MacroF1::excluded_labels`] が担う（REQ-24 異常系・
+//!   TASK-24.2・issue #61）。`None` を JSON の `null` へ写す直列化は本 crate の
+//!   責務ではなく、CLI の `evaluate` 工程（TASK-33.1）が担う（本 crate は
+//!   JSON 逆シリアル化・直列化を行わない方針。モジュール冒頭参照）
 //! - 入力（[`EvalRecord`]）は `&` 参照でのみ受け取り、書き換えない
 //!   （REQ-27: 評価の前後で評価データのハッシュが一致すること）
 //! - F1 は `2*TP / (2*TP + FP + FN)` で定義する（適合率・再現率の調和平均
@@ -215,6 +217,11 @@ pub struct Accuracy {
 }
 
 /// 1 ラベル分の指標。
+///
+/// `precision`・`recall`・`f1` はいずれも分母が 0 のとき `None`（「未定義」。
+/// 評価契約 `.claude/rules/evaluation-contract.md`「有意性・指標」に従い、
+/// 0 や 1 で埋めない）。JSON では `null` として表す（直列化は CLI 側の責務。
+/// モジュール冒頭「評価契約との関係」参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelMetrics {
     /// ラベル ID。
@@ -229,11 +236,17 @@ pub struct LabelMetrics {
     pub fp: u64,
     /// False Negative（Rust の予約語 `fn` を避けた命名）。
     pub fn_: u64,
-    /// `tp / predicted_count`。`predicted_count == 0` のとき `None`。
+    /// `tp / predicted_count`。`predicted_count == 0`（このラベルが 1 件も
+    /// 予測されなかった）のとき `None`（未定義。受入基準 1: 予測 0 件の
+    /// ラベルの適合率が null として返る）。
     pub precision: Option<f64>,
-    /// `tp / support`。`support == 0` のとき `None`。
+    /// `tp / support`。`support == 0`（このラベルが 1 件も正解でない）のとき
+    /// `None`（未定義）。
     pub recall: Option<f64>,
-    /// `2*tp / (2*tp + fp + fn_)`。分母が 0 のとき `None`。
+    /// `2*tp / (2*tp + fp + fn_)`。`tp+fp+fn_ == 0`（このラベルが予測にも
+    /// 正解にも一度も現れない）のとき `None`（未定義）。[`MacroF1`] は
+    /// この `None` を「除外」の判定条件として使う（`precision`・`recall`
+    /// が `None` でも `f1` が `Some` なら除外しない）。
     pub f1: Option<f64>,
 }
 
@@ -352,6 +365,45 @@ impl ConfusionMatrix {
     }
 }
 
+/// Macro-F1 と、平均から除いたラベルの列挙（REQ-24 異常系・TASK-24.2・issue #61）。
+///
+/// 除外の条件は「F1 が定義できない（[`LabelMetrics::f1`] が `None`。
+/// `tp+fp+fn_ == 0`）」ラベルだけで、`precision`・`recall` 単独の `None`
+/// （予測 0 件・正解 0 件）では除外しない。PoC-9 manifest「11. 凍結前の
+/// 修正」（2026-09-23）で、この境界を誤って広げた（precision が None の
+/// ラベルまで除外した）ことで既知解データセットの Macro-F1 が
+/// 49/78（誤り）になった経緯があり、本実装ではこの誤りを再現しない。
+///
+/// フィールドは非公開にし、構築は [`evaluate_single_select`] 内に集約する
+/// （壊れた値、例えば `value.is_some()` なのに全ラベルが `excluded_labels`
+/// に含まれる状態を外部から作らせない）。
+///
+/// JSON への写し方（直列化は CLI の `evaluate` 工程・TASK-33.1 が担う）:
+/// `{"macro_f1": {"value": <number|null>, "excluded_labels": [...]}}`。
+/// `value` が `None` のときは `null`。`excluded_labels` は宣言順。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MacroF1 {
+    value: Option<f64>,
+    excluded_labels: Vec<String>,
+}
+
+impl MacroF1 {
+    /// F1 が定義できたラベルだけの算術平均。1 つも定義できなければ `None`
+    /// （評価契約: 分母 0 の指標は null。[`EvalRecord`] が 1 件以上あり、
+    /// gold が必ずラベル集合に含まれるため、support ≥ 1 のラベルが
+    /// 少なくとも 1 つ存在し、実際には到達しない分岐だが、型の誠実さの
+    /// ため `Option` のまま残す）。
+    pub fn value(&self) -> Option<f64> {
+        self.value
+    }
+
+    /// 平均から除いたラベル（宣言順）。F1 が定義できたラベルだけを
+    /// 使う場合は空になる。
+    pub fn excluded_labels(&self) -> &[String] {
+        &self.excluded_labels
+    }
+}
+
 /// 単一選択（single-select）の評価指標一式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SingleSelectMetrics {
@@ -363,9 +415,8 @@ pub struct SingleSelectMetrics {
     pub accuracy: Accuracy,
     /// ラベル別指標（宣言順）。
     pub per_label: Vec<LabelMetrics>,
-    /// F1 が定義できたラベルだけの算術平均。1 つも定義できなければ `None`。
-    /// 平均から除いたラベルの列挙（`excluded_labels`）は TASK-24.2（issue #61）が担う。
-    pub macro_f1: Option<f64>,
+    /// Macro-F1 と除外ラベルの列挙（REQ-24 異常系・TASK-24.2・issue #61）。
+    pub macro_f1: MacroF1,
     /// 混同行列。
     pub confusion: ConfusionMatrix,
 }
@@ -516,6 +567,9 @@ pub fn evaluate_single_select(
     let mut per_label = Vec::with_capacity(n_labels);
     let mut f1_sum = 0.0f64;
     let mut f1_count: u64 = 0;
+    // F1 が定義できなかった（`tp+fp+fn_ == 0`）ラベルの宣言順の列挙。
+    // 件数は検証済みの `n_labels`（MAX_LABELS 以下）を超えない。
+    let mut excluded_labels: Vec<String> = Vec::new();
     for (i, &label) in labels.iter().enumerate() {
         let tp = confusion
             .get(i, ConfusionColumn::Label(i))
@@ -559,6 +613,10 @@ pub fn evaluate_single_select(
             f1_count = f1_count
                 .checked_add(1)
                 .ok_or_else(|| label_internal(i, "f1_count"))?;
+        } else {
+            // 除外条件は f1 == None（tp+fp+fn_ == 0）だけ。precision・recall
+            // 単独の None では除外しない（MacroF1 のドキュメント参照）。
+            excluded_labels.push(label.to_string());
         }
 
         per_label.push(LabelMetrics {
@@ -574,10 +632,14 @@ pub fn evaluate_single_select(
         });
     }
 
-    let macro_f1 = if f1_count == 0 {
+    let macro_f1_value = if f1_count == 0 {
         None
     } else {
         Some(f1_sum / f1_count as f64)
+    };
+    let macro_f1 = MacroF1 {
+        value: macro_f1_value,
+        excluded_labels,
     };
 
     let overall = Ratio::new(correct, n_total).ok_or(EvalError::EmptyRecords)?;
@@ -748,7 +810,8 @@ mod tests {
                 .value(),
             1.0
         ));
-        assert!(approx_eq(metrics.macro_f1.expect("defined"), 1.0));
+        assert!(approx_eq(metrics.macro_f1.value().expect("defined"), 1.0));
+        assert!(metrics.macro_f1.excluded_labels().is_empty());
         assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(0)), Some(1));
         assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(1)), Some(0));
         assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(0)), Some(0));
@@ -804,6 +867,68 @@ mod tests {
         assert_eq!(metrics.per_label[1].recall, None);
         assert_eq!(metrics.per_label[1].f1, None);
         // macro_f1 は f1 が定義できた A だけの平均（B は除外）。
-        assert_eq!(metrics.macro_f1, Some(0.0));
+        assert_eq!(metrics.macro_f1.value(), Some(0.0));
+        assert_eq!(metrics.macro_f1.excluded_labels(), ["B".to_string()]);
+    }
+
+    /// REQ-24 異常系・TASK-24.2: `excluded_labels` は宣言順に列挙され、
+    /// アルファベット順にはソートされない。
+    #[test]
+    fn excluded_labels_follow_declaration_order() {
+        // 宣言順は C, A, B。C・B は gold にも予測にも一度も現れず f1 が
+        // None になる（tp+fp+fn_ == 0）ため除外され、A だけで評価する。
+        let out_a = Outcome::Label("A".to_string());
+        let records = vec![EvalRecord {
+            gold: "A",
+            outcome: &out_a,
+        }];
+        let metrics = evaluate_single_select(&["C", "A", "B"], &records).expect("valid input");
+        assert_eq!(
+            metrics.macro_f1.excluded_labels(),
+            ["C".to_string(), "B".to_string()],
+            "宣言順（C, A, B のうち A を除く）で列挙されること"
+        );
+        assert_eq!(metrics.macro_f1.value(), Some(1.0));
+    }
+
+    /// REQ-24 異常系・TASK-24.2: 正解が 1 件も無く予測だけあるラベルは、
+    /// recall が None・precision が Some(0.0) になるが、f1 は Some(0.0) の
+    /// ため `excluded_labels` には含まれない（除外条件は f1 == None のみ）。
+    #[test]
+    fn label_predicted_but_absent_from_gold_is_not_excluded() {
+        // gold は常に "A"。"B" は正解に一度も現れないが 1 回予測される。
+        let out_a = Outcome::Label("A".to_string());
+        let out_b = Outcome::Label("B".to_string());
+        let records = vec![
+            EvalRecord {
+                gold: "A",
+                outcome: &out_a,
+            },
+            EvalRecord {
+                gold: "A",
+                outcome: &out_b,
+            },
+        ];
+        let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
+        let b = &metrics.per_label[1];
+        assert_eq!(b.label, "B");
+        assert_eq!(b.recall, None, "B は support=0 のため recall は None");
+        assert_eq!(
+            b.precision,
+            Some(0.0),
+            "B は predicted_count=1・tp=0 のため precision は Some(0.0)"
+        );
+        assert_eq!(
+            b.f1,
+            Some(0.0),
+            "B は tp+fp+fn_=1 のため f1 は Some(0.0)（None ではない）"
+        );
+        assert!(
+            !metrics
+                .macro_f1
+                .excluded_labels()
+                .contains(&"B".to_string()),
+            "f1 が定義できるラベルは precision・recall が None でも除外されない"
+        );
     }
 }
