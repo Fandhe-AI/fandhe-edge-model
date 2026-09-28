@@ -135,6 +135,15 @@ pub struct ValidRecord {
     pub input: String,
     /// `output.intent` の値。
     pub label_id: String,
+    /// `output` オブジェクト全体を、キーを整列した JSON 文字列にしたもの
+    /// （[`crate::report`] の `unique_outputs` 集計専用。PoC-9
+    /// `evaluator/inspect.py` の `_record_output_str`〔`json.dumps(out,
+    /// sort_keys=True)`〕に相当。workspace の `serde_json` は
+    /// `preserve_order` feature を有効にしていない〔`Cargo.lock` に
+    /// `indexmap` が無い〕ため、`Value::to_string()` はオブジェクトの
+    /// キーを整列済みで出力する。この前提が崩れると `unique_outputs` の
+    /// キー順依存の回帰テストが検知する）。
+    pub output_key: String,
     pub tags: Option<Vec<String>>,
     pub group_id: Option<String>,
 }
@@ -383,7 +392,11 @@ pub fn inspect_records(
         };
 
         // output: 必須・object。output.intent: 必須・string・有効ラベル集合に含まれること。
-        let label_id_opt: Option<String> = match record.get("output") {
+        // `output_key` は `output` オブジェクト全体の正準化文字列
+        // （[`ValidRecord::output_key`] docを参照。`unique_outputs` 集計専用で、
+        // ここで `v.to_string()` を先取りしておく（`intent` の検証に成功した
+        // ときのみ `label_id_opt` へ載せる）。
+        let label_id_opt: Option<(String, String)> = match record.get("output") {
             None => {
                 anomalies.push(RecordAnomaly {
                     line,
@@ -431,7 +444,7 @@ pub fn inspect_records(
                         }
                         Some(intent) => {
                             if valid_label_ids.contains(intent) {
-                                Some(intent.to_string())
+                                Some((intent.to_string(), v.to_string()))
                             } else {
                                 anomalies.push(RecordAnomaly {
                                     line,
@@ -548,13 +561,15 @@ pub fn inspect_records(
         }
 
         if !record_has_error
-            && let (Some(id), Some(input), Some(label_id)) = (id_opt, input_opt, label_id_opt)
+            && let (Some(id), Some(input), Some((label_id, output_key))) =
+                (id_opt, input_opt, label_id_opt)
         {
             valid_records.push(ValidRecord {
                 line,
                 id,
                 input,
                 label_id,
+                output_key,
                 tags: tags_opt,
                 group_id: group_id_opt,
             });
@@ -597,6 +612,7 @@ mod tests {
                 id: "r1".to_string(),
                 input: "hello".to_string(),
                 label_id: "tier-s__low".to_string(),
+                output_key: "{\"intent\":\"tier-s__low\"}".to_string(),
                 tags: None,
                 group_id: None,
             }
@@ -608,6 +624,7 @@ mod tests {
                 id: "r2".to_string(),
                 input: "world".to_string(),
                 label_id: "tier-s__high".to_string(),
+                output_key: "{\"intent\":\"tier-s__high\"}".to_string(),
                 tags: Some(vec!["a".to_string(), "b".to_string()]),
                 group_id: Some("g1".to_string()),
             }

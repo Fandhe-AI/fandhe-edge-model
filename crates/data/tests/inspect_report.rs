@@ -39,7 +39,8 @@ fn req16_clean_data_report_has_concrete_counts() {
     expected_counts.insert("tier-s__high".to_string(), 2);
     expected_counts.insert("tier-s__low".to_string(), 3);
     assert_eq!(report.label_counts, expected_counts);
-    assert_eq!(report.min_label_count, 2);
+    assert_eq!(report.min_label_count, Some(2));
+    assert!(report.labels_without_records.is_empty());
 }
 
 /// 空行は `total_rows` に数えず、異常行は「異常を出した行の数」として
@@ -118,8 +119,10 @@ fn req16_exact_duplicate_input_reduces_unique_inputs_without_anomaly() {
     assert_eq!(report.unique_inputs, report.valid_rows - 1);
 }
 
-/// 定義済みラベルのうち観測が 0 件のものも `label_counts` に `0` として
-/// 残り、`min_label_count` がそれを反映すること（ラベル欠落の可視化）。
+/// 定義済みラベルのうち観測が 0 件のものは `label_counts` に現れず
+/// `labels_without_records` に列挙されること（ラベル欠落の可視化）。
+/// `min_label_count` は観測されたラベルのみが対象（PoC-9 `min_intent_count`
+/// と同じ意味）で、0 件ラベルの混入で `0` にはならないこと。
 #[test]
 fn req16_defined_label_without_records_has_zero_count() {
     let content = "{\"id\":\"r1\",\"input\":\"in1\",\"output\":{\"intent\":\"a\"}}";
@@ -129,9 +132,13 @@ fn req16_defined_label_without_records_has_zero_count() {
 
     let report = outcome.report;
     assert_eq!(report.label_counts.get("a").copied(), Some(1));
-    assert_eq!(report.label_counts.get("b").copied(), Some(0));
-    assert_eq!(report.label_counts.get("c").copied(), Some(0));
-    assert_eq!(report.min_label_count, 0);
+    assert_eq!(report.label_counts.get("b"), None);
+    assert_eq!(report.label_counts.get("c"), None);
+    assert_eq!(report.min_label_count, Some(1));
+    assert_eq!(
+        report.labels_without_records,
+        vec!["b".to_string(), "c".to_string()]
+    );
 }
 
 /// 空白の有無で異なる文字列は正規化せず別入力として数えること
