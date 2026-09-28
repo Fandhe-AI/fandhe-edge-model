@@ -9,9 +9,24 @@
 //! 証拠の種別: テストハーネス（受入基準データは決定的に組み立て、PoC-19 の
 //! 件数は実測値の転記。`jobs/rebuild/result.json` から整数のみを転記し、
 //! `docs/spec` は読まない）。
+//!
+//! Wilson 95% 信頼区間（TASK-26.1-2・issue #101）のテストについては、
+//! 区間の期待値は独立計算（テストハーネス）である。PoC-19 から転記したのは
+//! 整数の件数（58/22/531・44/45/650 等）だけで、PoC-19 自体は遷移率の
+//! Wilson 区間を出していない。区間の期待値は center／margin 形式と、
+//! 代数的に別の形（`(2k + z² ± z·sqrt(z² + 4k(n−k)/n)) / (2(n + z²))`）の
+//! 2 通りで独立に計算し（Python・z=1.96）、両者の差が最大 2.1e-17 であることを
+//! 本 issue の実装時に確認済み（`.claude/rules/evaluation-contract.md`
+//! 「決定性と証拠の種別」）。
 
 use fandhe_edge_eval::metrics::Outcome;
 use fandhe_edge_eval::regression::{RegressionRecord, compare_with_previous, regression_counts};
+
+const EPSILON: f64 = 1e-9;
+
+fn approx_eq(a: f64, b: f64) -> bool {
+    (a - b).abs() < EPSILON
+}
 
 /// 受入基準の合成データ: 「両方正解 2・正解→不正解 2・不正解→正解 1・
 /// 両方不正解 2」（n=7）。非対称な 2 対 1 で方向の取り違えを検出する。
@@ -71,6 +86,66 @@ fn compare_with_previous_matches_acceptance_criteria_counts() {
     assert_eq!(counts.both_wrong(), 2);
     assert_eq!(counts.previous_correct(), 4);
     assert_eq!(counts.current_correct(), 3);
+}
+
+/// REQ-26・TASK-26.1-2: 受入基準の合成データ（n=7・正解→不正解 2・
+/// 不正解→正解 1）の Wilson 95% 信頼区間が、独立計算の具体値と
+/// 許容差 1e-9 で一致する（証拠の種別: 独立計算によるテストハーネス）。
+#[test]
+fn compare_with_previous_attaches_wilson_ci95_to_acceptance_counts() {
+    let labels = ["A", "B", "C"];
+    let correct = Outcome::Label("A".to_string());
+    let wrong = Outcome::Label("B".to_string());
+
+    let records = [
+        RegressionRecord {
+            gold: "A",
+            previous: &correct,
+            current: &correct,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &correct,
+            current: &correct,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &correct,
+            current: &wrong,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &correct,
+            current: &wrong,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &wrong,
+            current: &correct,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &wrong,
+            current: &wrong,
+        },
+        RegressionRecord {
+            gold: "A",
+            previous: &wrong,
+            current: &wrong,
+        },
+    ];
+
+    let counts = compare_with_previous(&labels, &records).unwrap();
+
+    // 正解→不正解（回帰）2/7。
+    let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+    assert!(approx_eq(regression_ci.lo(), 0.0822171657090155));
+    assert!(approx_eq(regression_ci.hi(), 0.6410709098517873));
+
+    // 不正解→正解（改善）1/7。
+    let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+    assert!(approx_eq(improvement_ci.lo(), 0.02567895594897482));
+    assert!(approx_eq(improvement_ci.hi(), 0.5131345033190299));
 }
 
 /// 方向の取り違え検出: 上記と同じデータで `previous`/`current` を入れ替えると
@@ -177,6 +252,60 @@ fn poc19_p3_merge_counts() {
     assert_eq!(counts.both_wrong(), 391);
     assert_eq!(counts.previous_correct(), 214);
     assert_eq!(counts.current_correct(), 215);
+}
+
+/// REQ-26・TASK-26.1-2: PoC-19 P1（58/531・22/531）の Wilson 95% 信頼区間。
+/// 件数は PoC-19 の実測値の転記だが、区間自体は PoC-19 の出力ではなく
+/// 独立計算（テストハーネス。ファイル冒頭の doc コメント参照）。
+#[test]
+fn poc19_p1_wilson_ci95() {
+    let previous: Vec<bool> = build_correct_vec(100, 58, 22, 351, TransitionOrder::PoC19);
+    let current: Vec<bool> = build_current_vec(100, 58, 22, 351);
+    let counts = regression_counts(&previous, &current).unwrap();
+
+    let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+    assert!(approx_eq(regression_ci.lo(), 0.08545021452040413));
+    assert!(approx_eq(regression_ci.hi(), 0.1386191174088998));
+
+    let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+    assert!(approx_eq(improvement_ci.lo(), 0.027517252252540213));
+    assert!(approx_eq(improvement_ci.hi(), 0.06193278304763089));
+}
+
+/// REQ-26・TASK-26.1-2: PoC-19 P2（P1 の逆向き）では、正解→不正解・
+/// 不正解→正解の Wilson 区間が P1 と入れ替わることを確認する
+/// （方向の取り違え検出）。
+#[test]
+fn poc19_p2_wilson_ci95_is_swapped_from_p1() {
+    let previous: Vec<bool> = build_correct_vec(100, 22, 58, 351, TransitionOrder::PoC19);
+    let current: Vec<bool> = build_current_vec(100, 22, 58, 351);
+    let counts = regression_counts(&previous, &current).unwrap();
+
+    // P1 の不正解→正解（22/531）の区間と一致する。
+    let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+    assert!(approx_eq(regression_ci.lo(), 0.027517252252540213));
+    assert!(approx_eq(regression_ci.hi(), 0.06193278304763089));
+
+    // P1 の正解→不正解（58/531）の区間と一致する。
+    let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+    assert!(approx_eq(improvement_ci.lo(), 0.08545021452040413));
+    assert!(approx_eq(improvement_ci.hi(), 0.1386191174088998));
+}
+
+/// REQ-26・TASK-26.1-2: PoC-19 P3（44/650・45/650）の Wilson 95% 信頼区間。
+#[test]
+fn poc19_p3_wilson_ci95() {
+    let previous: Vec<bool> = build_correct_vec(170, 44, 45, 391, TransitionOrder::PoC19);
+    let current: Vec<bool> = build_current_vec(170, 44, 45, 391);
+    let counts = regression_counts(&previous, &current).unwrap();
+
+    let regression_ci = counts.correct_to_incorrect_ci95().unwrap();
+    assert!(approx_eq(regression_ci.lo(), 0.05080936994768587));
+    assert!(approx_eq(regression_ci.hi(), 0.08965523187636448));
+
+    let improvement_ci = counts.incorrect_to_correct_ci95().unwrap();
+    assert!(approx_eq(improvement_ci.lo(), 0.052140156934892226));
+    assert!(approx_eq(improvement_ci.hi(), 0.09138328972252448));
 }
 
 /// テストデータ組み立ての意図を示すためだけのマーカー型（現状は単一の並び
