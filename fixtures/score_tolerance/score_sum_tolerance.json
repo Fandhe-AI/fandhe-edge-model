@@ -1,0 +1,6 @@
+{
+  "_meta": {
+    "description": "Score-sum tolerance (PoC-9 addendum A-4). Single source of truth cross-checked by crates/core/tests/score_sum_tolerance_fixture.rs and crates/data/tests/score_sum_tolerance_fixture.rs against their own SCORE_SUM_TOLERANCE constants (see those constants' doc comments for rationale; PR #202). Do not relax."
+  },
+  "score_sum_tolerance": 1e-6
+}
