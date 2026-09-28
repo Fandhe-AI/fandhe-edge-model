@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::error::{TrainResultError, sanitize_serde_error};
+use crate::error::TrainResultError;
 use crate::limits::MAX_RESULT_BYTES;
 use crate::request::{LabelOrder, TrainRequest};
 
@@ -418,7 +418,9 @@ impl TrainOutcome {
         };
         let raw: RawOutcome =
             serde_json::from_str(only_line).map_err(|e| TrainResultError::NotJson {
-                message: sanitize_serde_error(&e),
+                line: e.line(),
+                column: e.column(),
+                category: e.classify(),
             })?;
 
         match raw.status.as_str() {
@@ -958,5 +960,25 @@ mod tests {
                 "extra: {extra:?}, err: {err:?}"
             );
         }
+    }
+
+    /// security.md「秘密情報の混入防止」・REQ-39: ワーカー出力に含まれる
+    /// 未知フィールド名（秘密風の文字列を想定）が、`Display`／`Debug` の
+    /// どちらにも現れない。`serde_json::Error::to_string()` を経由すると
+    /// `unknown field \`secret_key_XYZ\`, expected ...` のように出力の
+    /// キー名がそのまま出てしまうため、位置情報のみを保持する（PR #220
+    /// レビュー指摘 P0）。
+    #[test]
+    fn req39_unknown_field_secret_does_not_leak_into_error_text() {
+        let without_trailing_brace = &VALID_OK_JSON[..VALID_OK_JSON.len() - 1];
+        let json = format!(r#"{without_trailing_brace},"secret_key_XYZ":"leak-me"}}"#);
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        assert!(matches!(err, TrainResultError::NotJson { .. }));
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(!display.contains("secret_key_XYZ"));
+        assert!(!display.contains("leak-me"));
+        assert!(!debug.contains("secret_key_XYZ"));
+        assert!(!debug.contains("leak-me"));
     }
 }

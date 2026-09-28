@@ -27,8 +27,19 @@ pub enum TrainRequestError {
     TooLarge { size: usize, limit: usize },
     /// UTF-8 として読めない。
     NotUtf8,
-    /// JSON として解析できない（構文エラー・重複キー等）。
-    NotJson { message: String },
+    /// JSON として解析できない（構文エラー・重複キー・未知フィールド・型
+    /// 不一致等）。`serde_json::Error` の位置情報（`line`／`column`）と
+    /// `classify()` の分類のみを保持し、エラー文言（`err.to_string()`）は
+    /// 保持しない。エラー文言には解析対象のキー名・値がそのまま埋め込まれ
+    /// うるため（例: 未知フィールド名。`config` は利用者が任意のキーを
+    /// 指定できる）、位置情報だけを渡すことでデータ本文の転記を防ぐ
+    /// （`.claude/rules/security.md`「秘密情報の混入防止」。PR #220
+    /// レビュー指摘 P0）。
+    NotJson {
+        line: usize,
+        column: usize,
+        category: serde_json::error::Category,
+    },
     /// トップレベルが JSON オブジェクトでない。
     NotObject,
     /// `schema_version` が存在しない・整数でない・`1` 以外。
@@ -75,8 +86,15 @@ impl std::fmt::Display for TrainRequestError {
                 write!(f, "train request exceeds {limit} bytes limit (got {size})")
             }
             TrainRequestError::NotUtf8 => write!(f, "train request is not valid utf-8"),
-            TrainRequestError::NotJson { message } => {
-                write!(f, "train request is not valid JSON: {message}")
+            TrainRequestError::NotJson {
+                line,
+                column,
+                category,
+            } => {
+                write!(
+                    f,
+                    "train request is not valid JSON: {category:?} error at line {line}, column {column}"
+                )
             }
             TrainRequestError::NotObject => write!(f, "train request must be a JSON object"),
             TrainRequestError::UnsupportedSchemaVersion => {
@@ -203,8 +221,15 @@ pub enum TrainResultError {
     NotUtf8,
     /// 空行を除いた行数がちょうど 1 行でない（0 行または 2 行以上）。
     NotExactlyOneLine { lines: usize },
-    /// JSON として解析できない。
-    NotJson { message: String },
+    /// JSON として解析できない（構文エラー・重複キー・未知フィールド・型
+    /// 不一致等）。`TrainRequestError::NotJson` と同じ理由で、位置情報
+    /// （`line`／`column`）と `classify()` の分類のみを保持し、エラー文言
+    /// は保持しない（`.claude/rules/security.md`。PR #220 レビュー指摘 P0）。
+    NotJson {
+        line: usize,
+        column: usize,
+        category: serde_json::error::Category,
+    },
     /// トップレベルが JSON オブジェクトでない。
     NotObject,
     /// 未知のフィールドを含む。
@@ -239,8 +264,15 @@ impl std::fmt::Display for TrainResultError {
                 f,
                 "train result must be exactly one JSON line (got {lines})"
             ),
-            TrainResultError::NotJson { message } => {
-                write!(f, "train result is not valid JSON: {message}")
+            TrainResultError::NotJson {
+                line,
+                column,
+                category,
+            } => {
+                write!(
+                    f,
+                    "train result is not valid JSON: {category:?} error at line {line}, column {column}"
+                )
             }
             TrainResultError::NotObject => write!(f, "train result must be a JSON object"),
             TrainResultError::UnknownField { field } => {
@@ -272,31 +304,6 @@ impl std::fmt::Display for TrainResultError {
 }
 
 impl std::error::Error for TrainResultError {}
-
-/// `serde_json` のエラーメッセージをそのまま埋め込むと、失敗した値の一部が
-/// 引用符付きで含まれることがある（例: 型不一致の実測値）。データ本文では
-/// ないが念のため長さを上限で切り詰める（`errors.py::truncate_for_message`
-/// と同じ考え方。`.claude/rules/security.md`）。学習リクエスト
-/// （[`crate::request::TrainRequest::from_json_slice`]）・学習ワーカー標準
-/// 出力（[`crate::result::TrainOutcome::from_worker_stdout`]）の両方が同じ
-/// リスク（信頼しない外部入力を解析する serde_json のエラー）を持つため、
-/// ここに集約して両者から呼ぶ。
-const MAX_EMBEDDED_ERROR_MESSAGE_CHARS: usize = 200;
-
-/// [`MAX_EMBEDDED_ERROR_MESSAGE_CHARS`] を超える分を切り詰めた
-/// `serde_json::Error` の表示用メッセージを返す。
-pub(crate) fn sanitize_serde_error(err: &serde_json::Error) -> String {
-    let message = err.to_string();
-    if message.chars().count() <= MAX_EMBEDDED_ERROR_MESSAGE_CHARS {
-        message
-    } else {
-        let truncated: String = message
-            .chars()
-            .take(MAX_EMBEDDED_ERROR_MESSAGE_CHARS)
-            .collect();
-        format!("{truncated}...(truncated)")
-    }
-}
 
 impl TrainResultError {
     /// 壊れたワーカー出力はすべて `runtime_error`（supervisor.py が

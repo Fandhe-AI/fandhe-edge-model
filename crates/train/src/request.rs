@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use fandhe_edge_core::definition::{Definition, JudgmentType};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{TrainRequestError, sanitize_serde_error};
+use crate::error::TrainRequestError;
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_LABELS, MAX_MAX_BYTES, MAX_REQUEST_BYTES, MAX_SEED, MAX_TRAIN_RSS_BYTES,
     MAX_TRAIN_WALL_SECONDS, MIN_LABELS, MIN_MAX_BYTES, MIN_SEED, REQUEST_SCHEMA_VERSION,
@@ -355,7 +355,9 @@ impl TrainRequest {
         // `invalid_request` にしている）。
         let raw: RawTrainRequest =
             serde_json::from_str(text).map_err(|e| TrainRequestError::NotJson {
-                message: sanitize_serde_error(&e),
+                line: e.line(),
+                column: e.column(),
+                category: e.classify(),
             })?;
         // トップレベルが JSON オブジェクトであることは `RawTrainRequest` への
         // デシリアライズが成功した時点で保証されている（`serde` はオブジェクト
@@ -597,6 +599,37 @@ mod tests {
         let err = TrainRequest::from_json_slice(json).unwrap_err();
         assert_eq!(err.reason_code(), "invalid_request");
         assert!(matches!(err, TrainRequestError::NotJson { .. }));
+    }
+
+    /// security.md「秘密情報の混入防止」・REQ-39: 未知フィールド名に秘密
+    /// 風の文字列を含めても、`Display`／`Debug` のどちらにも現れない
+    /// （`serde_json::Error::to_string()` を経由すると
+    /// `unknown field \`secret_key_XYZ\`, expected ...` のように入力由来の
+    /// キー名がそのまま出てしまうため、位置情報のみを保持する。PR #220
+    /// レビュー指摘 P0）。
+    #[test]
+    fn req39_unknown_field_secret_does_not_leak_into_error_text() {
+        let json = br#"{
+            "schema_version": 1,
+            "kind": "c3",
+            "kind_version": 1,
+            "label_order": ["a", "b"],
+            "max_bytes": 512,
+            "seed": 0,
+            "device": "cpu",
+            "root": "/tmp/fandhe-edge-train-test",
+            "train_path": "train.jsonl",
+            "out_dir": "out",
+            "secret_key_XYZ": "leak-me"
+        }"#;
+        let err = TrainRequest::from_json_slice(json).unwrap_err();
+        assert!(matches!(err, TrainRequestError::NotJson { .. }));
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(!display.contains("secret_key_XYZ"));
+        assert!(!display.contains("leak-me"));
+        assert!(!debug.contains("secret_key_XYZ"));
+        assert!(!debug.contains("leak-me"));
     }
 
     /// path 構文検査: `.`・`..`・空文字列・絶対パス・NUL を個別に確認する。
