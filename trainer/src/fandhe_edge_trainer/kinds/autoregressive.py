@@ -50,6 +50,25 @@ PoC-24（`docs/spec/03-poc/model-kind-selector/scripts/kinds/autoregressive_kind
    共通）でエンコードするが、選択肢は選択肢 ID そのものであり、正規化で
    複数の表記が同一の選択肢へ縮退してよい対象ではないため、生の UTF-8
    バイト+1 でエンコードする（`_encode_choices`）。
+6. **`ids` の T 軸（動的軸）を ONNX グラフの内側で `max_bytes`（学習時の
+   最大長）へ Slice し、以降の全ての計算をこの切り詰め済みの列に対して
+   行う**（`_export_ar_onnx` 冒頭の `Slice(ids, 0, max_bytes, axis=1)`。
+   PR #222 セキュリティレビュー P0 指摘・REQ-39）。切り詰めは先頭
+   `max_bytes` バイトを残す（`encoding.encode_bytes` の
+   「先頭 max_bytes バイトで切り詰める」規則・`fixtures/preprocess/
+   byte_encoding_vectors.json` の `truncate_long_ascii` ケースと一致させる。
+   ONNX `Slice` は `ends` が実際の次元数を超える場合は次元数へ丸められる
+   ため〔onnx.reference で実測確認済み〕、`T ≤ max_bytes` の入力には
+   影響しない）。これにより、PAD を含む・含まないに関わらずグラフ内の
+   `T`（`Slice` 後）は常に `max_bytes` 以下となり、位置埋め込み表
+   `pos_table` への範囲外参照も、decoder attention の `L = T+1+M` の
+   二乗拡大も、学習時に固定した上限を超えない
+   （`_check_ar_export_resources`・`limits.py::
+   MAX_AR_EXPORT_ATTENTION_ELEMENTS` 参照）。`N`（バッチ件数）の上限と
+   `ids` の値域（`[0, 256]` の範囲外は SEP/EOS ID との衝突や ONNX
+   `Gather` の範囲外参照になりうる）の検査は、ONNX グラフの中では
+   実施しない。推論ランタイム側のガード層（REQ-39。パス未確定）の
+   責務とする（`_export_ar_onnx` 内の該当コメント参照）。
 
 opset 13 の制約（LayerNormalization は opset 17・Gelu は opset 20 から）により、
 LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention はいずれも
@@ -809,13 +828,17 @@ def _check_ar_export_resources(
     fail-closed に拒否する（REQ-39・PR #222 レビュー指摘）。グラフ構築前に
     呼ぶことで、過大な attention テンソルを実際に確保する前に停止する。
 
-    `t_bound` は「密な入力（詰め物を含まない入力）における `T` の構造上の
-    上限」であり、詰め物（PAD）を多く含む入力で `T` がこれを超えるケースは
-    本検査では検出できない（`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
-    docstring 参照）。`N`（バッチ件数）についても同様に本ワーカーは実測値を
-    観測できないため、`N=1` の最小ケースのみを検査する。いずれも推論
-    ランタイム・ガード層（REQ-39。パス未確定）側で `N`・`T` の実測値を
-    `_ar_export_attention_elements` と同じ計算式へ渡して検査する必要がある。
+    `t_bound`（`= trained.max_bytes`）は、`_export_ar_onnx` が組み込む
+    `Slice(ids, 0, max_bytes, axis=1)` により、推論時に渡される `T` が
+    どのような値（PAD を多く含む場合を含む）であっても、グラフ内部で
+    実際に計算に使われる長さの**厳密な上限**になる（モジュール docstring
+    6 番参照。以前はここが「密な入力かつ PAD なし」に限った近似だったが、
+    Slice の導入で PAD の有無に関わらず保証されるようになった）。
+    `N`（バッチ件数）についてのみ、本ワーカーは実測値を観測できないため
+    `N=1` の最小ケースを検査する。`N` 分の上限は推論ランタイム・
+    ガード層（REQ-39。パス未確定）側の責務であり、`N × (この上限)` が
+    線形に増える計算式（`_ar_export_attention_elements`）を使って
+    実測の `N`・`T` を検査する必要がある。
     """
     elements = _ar_export_attention_elements(1, k_classes, t_bound, m, layers, heads)
     if elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
@@ -872,18 +895,17 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
             ExitCode.LIMIT_EXCEEDED,
         )
 
-    # 推論時に渡されうる T（動的軸）を、密な入力（詰め物を含まない入力）
-    # における構造上の上限（学習時の `max_bytes`。密な入力ではこれを
-    # 超えると位置埋め込み表 `pos_table`〔行数 = 学習時に固定された
-    # `max_len = max_bytes + 1 + m`〕への Gather が範囲外参照になる）と見なし、
-    # N=1・T=t_bound（書き出し可能な最大構成）での decoder attention 要素数を
-    # 見積もって検査する（`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
-    # docstring・`_ar_export_attention_elements`/`_check_ar_export_resources`
-    # docstring 参照。REQ-39・PR #222 レビュー指摘）。詰め物（PAD）を多く含む
-    # 長い入力は位置 id が `CumSum(full_ids > 0) - 1` で頭打ちにならないため
-    # この構造上の上限では拒否できず、また バッチ件数 N（>1）分の上限も
-    # 本検査では検査できない（同 docstring 参照。いずれも推論ランタイム・
-    # ガード層側の将来対応）。
+    # 推論時に渡されうる T（動的軸）は、グラフ内で組み込む
+    # `Slice(ids, 0, max_bytes, axis=1)`（後述）により学習時の `max_bytes`
+    # を厳密な上限としてクランプされる（モジュール docstring 6 番・
+    # `_check_ar_export_resources` docstring 参照。PAD の有無に関わらず
+    # 成立する）。よって N=1・T=t_bound（`= trained.max_bytes`。Slice 後に
+    # グラフが取りうる最大の T）での decoder attention 要素数を見積もって
+    # 検査すれば、書き出し可能な最大構成を確実に拒否できる
+    # （`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring・
+    # `_ar_export_attention_elements` docstring 参照。REQ-39・PR #222
+    # レビュー指摘）。バッチ件数 N（>1）分の上限のみ、本検査では検査できず
+    # 推論ランタイム・ガード層側の将来対応となる（同 docstring 参照）。
     t_bound = trained.max_bytes
     _check_ar_export_resources(k_classes, t_bound, m, layers, heads)
 
@@ -913,6 +935,7 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
         _i64(np.array([1]), "one_vec"),
         _i64(np.array([k_classes]), "k_vec"),
         _i64(np.array([m]), "m_vec"),
+        _i64(np.array([trained.max_bytes]), "max_bytes_vec"),
         _f32(np.array(1.0), "one_f32"),
         _f32(np.array(_MASK_NEG_VALUE), "neg_big_f32"),
         numpy_helper.from_array(np.array(VOCAB_SIZE, dtype=np.int64), name="vocab_depth"),  # 0-d
@@ -922,8 +945,21 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     ]
     nodes: list = []
 
-    # --- N・T の取得（動的軸） ---
-    nodes.append(helper.make_node("Shape", ["ids"], ["shape_ids"]))
+    # --- T 軸（動的軸）を max_bytes へ Slice で切り詰める（モジュール
+    # docstring 6 番・REQ-39・PR #222 セキュリティレビュー P0 指摘）。
+    # PAD を含む・含まない入力に関わらず、以降のグラフ全体が参照する
+    # `ids_trunc` の T は常に `max_bytes` 以下になる。opset 13 の `Slice` は
+    # data・starts・ends・axes を入力で受ける（属性ではない）。`ends` が
+    # 実際の次元数を超える場合は次元数へ丸められる（ONNX 仕様。
+    # onnx.reference で実測確認済み）ため、`T ≤ max_bytes` の入力には
+    # 影響しない。切り詰めは先頭 `max_bytes` バイトを残す
+    # （`starts=[0]`）方向で、`encoding.encode_bytes` の切り詰め規則
+    # （`fixtures/preprocess/byte_encoding_vectors.json::
+    # truncate_long_ascii`）と一致させる。
+    nodes.append(helper.make_node("Slice", ["ids", "idx0", "max_bytes_vec", "idx1"], ["ids_trunc"]))
+
+    # --- N・T の取得（動的軸。T は Slice 後の値） ---
+    nodes.append(helper.make_node("Shape", ["ids_trunc"], ["shape_ids"]))
     nodes.append(helper.make_node("Gather", ["shape_ids", "idx0"], ["n_vec"], axis=0))
     nodes.append(helper.make_node("Gather", ["shape_ids", "idx1"], ["t_vec"], axis=0))
 
@@ -940,7 +976,7 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     nodes.append(helper.make_node("Concat", ["n_vec", "k_vec"], ["shape_nk"], axis=0))
 
     # --- K 個の選択肢へ展開してから [N*K, L] へ reshape する（§2.3） ---
-    nodes.append(helper.make_node("Unsqueeze", ["ids", "idx1"], ["ids_exp3"]))  # [N,1,T]
+    nodes.append(helper.make_node("Unsqueeze", ["ids_trunc", "idx1"], ["ids_exp3"]))  # [N,1,T]
     nodes.append(helper.make_node("Expand", ["ids_exp3", "shape_nkt"], ["ids_exp"]))  # [N,K,T]
 
     nodes.append(helper.make_node("Unsqueeze", ["choice_tokens", "idx0"], ["choice_exp3"]))
@@ -996,6 +1032,31 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     nodes.append(helper.make_node("Cast", ["pos_f_clamped"], ["pos_i64"], to=TensorProto.INT64))
 
     # --- 埋め込み ---
+    # `full_ids_2d` の値域は検査しない（REQ-39。PR #222 セキュリティ
+    # レビュー P0 指摘）。理由:
+    # 1. N（バッチ件数）×（1 件あたりの上限）は線形に増える
+    #    （`_ar_export_attention_elements` 参照）。この 1 件あたりの上限は
+    #    グラフ内の Slice（`ids_trunc`）で `T ≤ max_bytes` が保証されるため
+    #    書き出し時に固定できるが、N 倍された全体の上限は推論時にしか
+    #    決まらない。
+    # 2. ONNX には「入力を検査して拒否する」演算が無い。`ids` の値域
+    #    （本来は `encoding.encode_bytes` が返す `[0, 256]`）の外
+    #    （負数・`257`〔SEP〕・`258`〔EOS〕・`259` 以上）を機械可読な
+    #    入力エラー（`invalid_input`）として拒否するには、グラフの外
+    #    （推論入口）での検査が必要。ONNX 演算子仕様上、`Gather` の
+    #    負インデックスは `[-VOCAB_SIZE, -1]` の範囲で末尾から黙って
+    #    wrap し（例: `-1` は EOS 行）、SEP・EOS の ID 自体は語彙内の
+    #    正当な値のため、これらは「別の値として」何のエラーも無く
+    #    処理されてしまう（本記述は ONNX 演算子仕様に基づく。ONNX
+    #    Runtime を学習側へ追加できないため実機未検証。onnx.reference
+    #    では `-1`→EOS 行の wrap を実測確認済み。
+    #    `tests/test_ar_ids_range.py` 参照）。
+    # 3. 一方で `VOCAB_SIZE`（=259）以上・`-VOCAB_SIZE` 未満の値は
+    #    ONNX Runtime の `Gather` が範囲外としてエラーで失敗させる
+    #    （メモリ破壊にはならない。onnx.reference では `IndexError` に
+    #    なることを実測確認済み。`tests/test_ar_ids_range.py` 参照）。
+    # 以上より、N の上限と `ids` の値域検査は推論ランタイムのガード層
+    # （REQ-39。パス未確定）の責務とする。
     nodes.append(helper.make_node("Gather", ["embed_table", "full_ids_2d"], ["token_emb"], axis=0))
     nodes.append(helper.make_node("Gather", ["pos_table", "pos_i64"], ["pos_emb"], axis=0))
     nodes.append(helper.make_node("Add", ["token_emb", "pos_emb"], ["h0"]))
