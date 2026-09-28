@@ -373,6 +373,18 @@ pub enum TrainProcessError {
     /// 子プロセスの終了後、期限内に標準出力の読み取りが完了しなかった
     /// （孤児プロセスがパイプを閉じずに残っている等。REQ-39）。
     StdoutIncomplete,
+    /// [`crate::process::RunLimits::with_wall_timeout`] に渡した値が不正
+    /// （0、または既定の締め切り以上。「締める方向だけ」の制約に違反）。
+    /// `WorkerLauncher` の検証失敗（[`TrainProcessError::InvalidLauncher`]）
+    /// とは別の種類のため、独立したバリアントとして区別する。
+    InvalidRunLimits,
+    /// [`crate::request::TrainRequest::to_json_vec`] が直列化上限超過
+    /// （`TrainRequestError::TooLarge`）を返した（`config` は
+    /// `TrainRequest::new` の時点ではサイズ検査をしないため、巨大な
+    /// `config` を持つリクエストで到達しうる。REQ-39「資源の上限」）。
+    /// [`TrainRequestError::exit_code`] へそのまま委譲する（`LimitExceeded`
+    /// になりうる。「通常到達しない」と誤って丸めない）。
+    Request(TrainRequestError),
     /// 標準出力の内容が [`crate::result::TrainOutcome::from_worker_stdout`]
     /// の検証を通らなかった（壊れたワーカー出力。fail-closed）。
     Result(TrainResultError),
@@ -415,6 +427,12 @@ impl std::fmt::Display for TrainProcessError {
             TrainProcessError::StdoutIncomplete => {
                 write!(f, "worker process stdout was not fully read in time")
             }
+            TrainProcessError::InvalidRunLimits => {
+                write!(f, "run limits must only be tightened, never loosened")
+            }
+            TrainProcessError::Request(inner) => {
+                write!(f, "failed to serialize train request: {inner}")
+            }
             TrainProcessError::Result(inner) => {
                 write!(f, "worker result is invalid: {inner}")
             }
@@ -436,6 +454,12 @@ impl From<TrainResultError> for TrainProcessError {
     }
 }
 
+impl From<TrainRequestError> for TrainProcessError {
+    fn from(value: TrainRequestError) -> Self {
+        TrainProcessError::Request(value)
+    }
+}
+
 impl TrainProcessError {
     /// REQ-21 の終了コードへの対応づけ。子プロセスの実終了コードを尊重する
     /// のは [`TrainProcessError::ExitCodeMismatch`] 以外に存在しない
@@ -444,9 +468,9 @@ impl TrainProcessError {
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
-            TrainProcessError::InvalidLauncher { .. } | TrainProcessError::InvalidJobDir => {
-                ExitCode::InvalidInput
-            }
+            TrainProcessError::InvalidLauncher { .. }
+            | TrainProcessError::InvalidJobDir
+            | TrainProcessError::InvalidRunLimits => ExitCode::InvalidInput,
             TrainProcessError::RequestWrite { .. }
             | TrainProcessError::Spawn { .. }
             | TrainProcessError::Wait { .. }
@@ -455,6 +479,7 @@ impl TrainProcessError {
             | TrainProcessError::StdoutIncomplete
             | TrainProcessError::ExitCodeMismatch { .. } => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
+            TrainProcessError::Request(inner) => inner.exit_code(),
             TrainProcessError::Result(inner) => inner.exit_code(),
         }
     }

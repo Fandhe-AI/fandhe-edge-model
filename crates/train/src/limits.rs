@@ -8,6 +8,11 @@
 //! 同時に見直す（`crates/train/tests/train_contract_fixture.rs` が
 //! fixture との一致を機械照合する）。
 //!
+//! 例外: [`MAX_WORKER_STDERR_BYTES`]・[`SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]
+//! （issue #178）は Rust 側（子プロセスの起動・監視）固有の値で、
+//! 学習ワーカー側に対応する単一真実源を持たない（各定数の doc に根拠を
+//! 記す）。
+//!
 //! [`crate::limits`] の各定数は `fandhe_edge_core::judgment` の
 //! `MAX_OPTIONS`・`MAX_CHOICE_ID_BYTES` と値がたまたま同じでも、
 //! 契約としては別物であり結合しない（学習リクエストの `label_order` は

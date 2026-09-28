@@ -184,9 +184,7 @@ impl RunLimits {
     /// ことはできない）。
     pub fn with_wall_timeout(self, timeout: Duration) -> Result<Self, TrainProcessError> {
         if timeout.is_zero() || timeout >= self.wall_timeout {
-            return Err(TrainProcessError::InvalidLauncher {
-                field: "wall_timeout",
-            });
+            return Err(TrainProcessError::InvalidRunLimits);
         }
         Ok(Self {
             wall_timeout: timeout,
@@ -204,6 +202,7 @@ impl RunLimits {
 ///
 /// 削除失敗はエラーにしない（学習結果を失わせないための方針をコメントで
 /// 明示する。`.claude/rules/code-comment-style.md`「非自明な前提・副作用」）。
+#[derive(Debug)]
 struct RequestFileGuard {
     path: PathBuf,
 }
@@ -232,17 +231,15 @@ fn write_request_file(
         return Err(TrainProcessError::InvalidJobDir);
     }
     let path = job_dir.join("request.json");
-    // `to_json_vec` はリクエストの直列化上限超過（`TrainRequestError::TooLarge`）
-    // を返しうるが、`TrainRequest` は構築時点で各フィールドを検証済みのため
-    // 通常到達しない防御的な分岐である。ここでは資源上限超過として扱う
-    // （REQ-39「資源の上限」。呼び出し元に渡す前段の値ではなく、検証済み
-    // `TrainRequest` を書き込む処理のため `InvalidJobDir` ではなく
-    // `RequestWrite` に丸める）。
-    let bytes = request
-        .to_json_vec()
-        .map_err(|_| TrainProcessError::RequestWrite {
-            kind: std::io::ErrorKind::InvalidData,
-        })?;
+    // `TrainRequest::new` は `config` の値そのもののサイズを検査しない
+    // （`config` は任意の JSON を保持しうる。`request.rs` のモジュール
+    // doc 参照）ため、巨大な `config` を持つリクエストでは
+    // `to_json_vec` が直列化上限超過（`TrainRequestError::TooLarge`）を
+    // 返しうる（防御的な分岐ではなく到達しうる経路）。`TrainRequestError`
+    // の終了コード（`TooLarge` は `LimitExceeded`）をそのまま尊重するため
+    // `TrainProcessError::Request` へ委譲する（`?` は
+    // `From<TrainRequestError>` 経由）。
+    let bytes = request.to_json_vec()?;
 
     let mut open_options = std::fs::OpenOptions::new();
     open_options.write(true).create_new(true);
@@ -565,17 +562,66 @@ mod tests {
     fn req39_with_wall_timeout_rejects_loosening() {
         let request = test_request(Some(10));
         let limits = RunLimits::for_request(&request);
-        assert!(limits.with_wall_timeout(Duration::ZERO).is_err());
-        assert!(limits.with_wall_timeout(limits.wall_timeout()).is_err());
-        assert!(
+        assert!(matches!(
+            limits.with_wall_timeout(Duration::ZERO).unwrap_err(),
+            TrainProcessError::InvalidRunLimits
+        ));
+        assert!(matches!(
+            limits.with_wall_timeout(limits.wall_timeout()).unwrap_err(),
+            TrainProcessError::InvalidRunLimits
+        ));
+        assert!(matches!(
             limits
                 .with_wall_timeout(limits.wall_timeout() + Duration::from_secs(1))
-                .is_err()
-        );
+                .unwrap_err(),
+            TrainProcessError::InvalidRunLimits
+        ));
         let tightened = limits
             .with_wall_timeout(Duration::from_millis(500))
             .expect("tightening must be accepted");
         assert_eq!(tightened.wall_timeout(), Duration::from_millis(500));
+    }
+
+    /// REQ-39・issue #178 レビュー指摘: `config` が巨大なリクエストは
+    /// `write_request_file`（`run_train` 内部）が `TrainRequestError::TooLarge`
+    /// を `TrainProcessError::Request` として伝播し、`exit_code()` は
+    /// `LimitExceeded`（20）になる（`RequestWrite`〔`RuntimeError`〕へ
+    /// 丸めない）。
+    #[test]
+    fn req39_write_request_file_propagates_too_large_config_as_limit_exceeded() {
+        use crate::limits::MAX_REQUEST_BYTES;
+        use crate::request::TrainRequestParams;
+
+        let mut huge_config = serde_json::Map::new();
+        huge_config.insert(
+            "huge".to_string(),
+            serde_json::Value::String("x".repeat(MAX_REQUEST_BYTES * 2)),
+        );
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: huge_config,
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: "/fandhe-edge-fixture-root".to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: None,
+            rss_limit_bytes: None,
+        })
+        .expect("config size is not checked at construction time");
+
+        let job_dir = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-huge-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&job_dir).expect("create job dir");
+        let err = write_request_file(&job_dir, &request).unwrap_err();
+        let _ = std::fs::remove_dir_all(&job_dir);
+        assert!(matches!(err, TrainProcessError::Request(_)));
+        assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
     }
 
     /// `WorkerLauncher::new`: 相対パスの `python` は拒否する。
@@ -593,8 +639,9 @@ mod tests {
     #[test]
     fn req39_launcher_rejects_wrong_launch_script_name() {
         let dir = std::env::temp_dir();
-        let python = dir.join("fandhe-edge-train-test-python");
-        let wrong = dir.join("fandhe-edge-train-test-not-launch.py");
+        let pid = std::process::id();
+        let python = dir.join(format!("fandhe-edge-train-test-python-{pid}"));
+        let wrong = dir.join(format!("fandhe-edge-train-test-not-launch-{pid}.py"));
         std::fs::write(&python, b"").expect("write stub python");
         std::fs::write(&wrong, b"").expect("write stub script");
         let err = WorkerLauncher::new(python.clone(), wrong.clone()).unwrap_err();
@@ -629,7 +676,10 @@ mod tests {
         let dir = std::env::temp_dir();
         // `python` にディレクトリを渡す（通常ファイルではないため拒否される）。
         // 他テストと衝突しないよう固有名の一時ディレクトリを使う。
-        let fake_python_dir = dir.join("fandhe-edge-train-test-launcher-dir");
+        let fake_python_dir = dir.join(format!(
+            "fandhe-edge-train-test-launcher-dir-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&fake_python_dir).expect("create test dir");
         let launch_py_dir = fake_python_dir.join("launch.py");
         std::fs::create_dir_all(&launch_py_dir).expect("create launch.py dir");

@@ -208,6 +208,11 @@ fn run_test_suite() -> ProcessExitCode {
                 detail: format!("panicked: {}", panic_message(&panic)),
             },
         };
+        // ケース終了時に一時ディレクトリを削除する（issue #178 実装計画
+        // 3.8）。`run_train` が既に子プロセスを kill・回収済みのため
+        // （`timeout_hang` を含む）、削除は安全。失敗しても後続ケースの
+        // 判定には影響しないため無視する。
+        let _ = std::fs::remove_dir_all(&case_dir);
         results.push(result);
     }
 
