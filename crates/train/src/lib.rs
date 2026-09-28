@@ -21,10 +21,12 @@
 //! # 層の境界
 //!
 //! 学習ワーカー層（`trainer/` の呼び出し元）に位置し、共通コア
-//! （`fandhe-edge-core`）にのみ依存する（`label_order` を定義ファイル
-//! （`Definition`）から投影するため）。操作アダプター（CLI・TUI・MCP）・
-//! 推論ランタイムはこの crate に依存しない（推論経路に学習側の型を持ち込ま
-//! ない。REQ-32・`.claude/rules/coding-rust.md`）。
+//! （`fandhe-edge-core`）に加え、評価器（`fandhe-edge-eval`）にも依存する
+//! （[`selection_significance`] が選定結果への McNemar・Holm 有意性判定の
+//! 付与に評価器を呼ぶ。評価ロジックは再実装しない。REQ-18・TASK-18.3-1・
+//! #87）。操作アダプター（CLI・TUI・MCP）・推論ランタイムはこの crate に
+//! 依存しない（推論経路に学習側の型を持ち込まない。REQ-32・
+//! `.claude/rules/coding-rust.md`）。
 //!
 //! # スコープ外（#178 以降）
 //!
@@ -43,3 +45,6 @@ mod kind_defaults;
 pub mod limits;
 pub mod request;
 pub mod result;
+// 選定結果への McNemar・Holm 有意性判定の付与（評価器
+// `fandhe-edge-eval` を呼ぶ。REQ-18・REQ-25・TASK-18.3-1・#87）。
+pub mod selection_significance;
