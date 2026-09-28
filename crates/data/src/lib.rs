@@ -5,8 +5,9 @@
 //! 本 crate は現時点で以下を実装する。
 //!
 //! - [`inspect`]: 型・必須項目・ラベル enum の検査ロジック
-//!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）。件数集計
-//!   （行数・ユニーク数・ラベル別件数。TASK-16.1-2・issue #39）は対象外
+//!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）
+//! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
+//!   TASK-16.1-2・issue #39）
 //! - [`leak`]: 漏洩・group 跨ぎ検出（REQ-16・TASK-16.2-1・issue #41）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
 //! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
@@ -68,4 +69,5 @@ pub mod eval_input;
 pub mod inspect;
 mod json_keys;
 pub mod leak;
+pub mod report;
 pub mod split;
