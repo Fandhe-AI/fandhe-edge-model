@@ -118,7 +118,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -148,6 +148,7 @@ from ..limits import (
     MAX_AR_PREDICT_ROWS,
     MAX_AR_WARMUP_STEPS,
     MAX_AR_WEIGHT_DECAY,
+    MAX_TRAIN_LINE_BYTES,
 )
 
 KIND = "autoregressive"
@@ -463,6 +464,15 @@ def _score_choices_mlx(
     対数尤度を返すだけで、predicted_label・scores への変換は呼び出し側
     （`map_scores_to_choice`・`build_prediction_record`）の責務とする
     （`test_ar_train.py` の golden テスト・簡易正解率確認も直接の呼び出し元）。
+
+    `full`（`[N*K, length]`）・decoder の attention（`[N*K, heads, length,
+    length]`）を確保する前に、確保見込み要素数を `MAX_AR_EXPORT_ATTENTION_
+    ELEMENTS`（`N × K × heads × layers × L^2`。書き出し時 `_check_ar_export_
+    resources` が同じ式で検査する上限を、実行時の同じ形状に対しても流用
+    する）で fail-closed に拒否する。`chunk_size`（`MAX_AR_BATCH_SIZE` 以下）
+    はチャンクあたりの計算量を抑えるが、選択肢数 `K`・系列長 `length` は
+    モデル構成・データに依存するため、`chunk_size` だけでは確保量を
+    抑えきれない（Codex レビュー指摘 P0・PR #234。REQ-39「資源の上限」）。
     """
     model.eval()
     n = len(ids_batch)
@@ -470,6 +480,17 @@ def _score_choices_mlx(
     k, m = choice_tokens.shape
     t = max(1, max(len(x) for x in ids_batch))
     length = t + 1 + m
+
+    layers_n = len(model.layers)
+    heads = model.layers[0].heads if model.layers else 0
+    attn_elements = n * k * heads * layers_n * length * length
+    if attn_elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated attention elements {attn_elements} exceeds limit"
+            f" {MAX_AR_EXPORT_ATTENTION_ELEMENTS} (N x K x heads x layers x length^2)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
 
     full = np.zeros((n * k, length), dtype=np.int32)
     for row_n, ids in enumerate(ids_batch):
@@ -677,28 +698,71 @@ def build_prediction_record(
     return {"id": record_id, "status": "error", "predicted_label": None}
 
 
+def _guarded_encode_bytes(text: str, max_bytes: int) -> list[int]:
+    """`predict_records` から呼ぶ前に、正規化前の生入力のバイト数を検査
+    してから `encoding.encode_bytes` を呼ぶ（REQ-39）。
+
+    `encode_bytes` は NFKC 正規化・UTF-8 化を行った「後」に `max_bytes` へ
+    切り詰めるため、この検査を経ずに呼ぶと 1 件の巨大な入力で正規化コスト
+    （壁時計・メモリ）が無制限になる（Codex レビュー指摘 P0・PR #234）。
+    上限には学習データの行読み込み（`contract.py`）と同じ `MAX_TRAIN_
+    LINE_BYTES` を流用する（同じ「1 件の入力テキスト」という種類の上限を
+    2 箇所で別々の値として持たないため）。
+    """
+    raw_len = len(text.encode("utf-8"))
+    if raw_len > MAX_TRAIN_LINE_BYTES:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction input {raw_len} bytes exceeds limit {MAX_TRAIN_LINE_BYTES} bytes",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+    return encode_bytes(text, max_bytes)
+
+
 def predict_records(
     trained: AutoregressiveTrainedModel,
     rows: Sequence[tuple[str, str]],
     *,
     chunk_size: int | None = None,
     resource_budget: budget_mod.ResourceBudget | None = None,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     """学習ワーカー内で対応づけ (b) を確認するための推論経路（#80。PoC-24
     `predict` 相当）。`rows` は `(id, input)` の列。
 
     正解ラベル（gold）は受け取らない（REQ-27。推論関数へは `input` だけを
     渡すという評価の独立性を、学習ワーカー内の確認経路でも維持する）。
 
+    戻り値はジェネレータ（呼び出し元が 1 件ずつ消費する）。以前は全件を
+    `records: list[dict]` へ蓄積してから返していたが、`chunk_size` は
+    1 チャンクあたりの計算量しか制限せず、`rows` 自体の件数上限
+    （`MAX_AR_PREDICT_ROWS`）は数百万件のオーダーになりうるため、全件を
+    リストへ蓄積する設計では上限内でも RSS が際限なく増える
+    （Codex レビュー指摘 P0・PR #234。security.md「ガード層: 資源の上限」）。
+    呼び出し元（将来の CLI `infer --input-file`。TASK-33.1）は
+    `prediction_record_to_json_line` で 1 件ずつ書き出す想定のため、
+    チャンクごとの逐次出力（yield）に変更し、全件保持を避ける。
+    **呼び出し元は必ずイテレートすること**（この関数はジェネレータ関数の
+    ため、呼ぶだけでは本体〔件数上限検査を除く〕は実行されない）。
+
+    件数上限検査（`MAX_AR_PREDICT_ROWS`）だけは呼び出し直後・同期的に行う
+    （fail-closed。呼び出し元がイテレートし忘れても、明らかに上限超過の
+    呼び出しは即座に拒否する）。
+
     `chunk_size`（既定は `trained.config["batch_size"]`、上限は
-    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼び、チャンクの合間
-    で `resource_budget.check()` を呼ぶ（REQ-39。`_score_choices_mlx` は
-    `[N*K, L]` と attention の `[N*K, heads, L, L]` を確保するため、`N` を
-    無制限にしない）。`chunk_size` はこのチャンクあたりの計算量しか制限
-    しないため、`rows` の件数自体は `MAX_AR_PREDICT_ROWS` を超えないことを
-    一括リスト化・予測レコードの蓄積を始める前に検査する（`limit_exceeded`・
-    exit 20。Codex レビュー指摘 P0・PR #234。security.md「ガード層: 資源の
-    上限」）。
+    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼ぶ。`resource_budget.
+    check()` は各チャンクの計算「前」と「後」の両方で呼ぶ（REQ-39。計算後
+    だけの検査では、既に確保済みの `[N*K, L]`・attention `[N*K, heads, L, L]`
+    を検査する頃には資源を使い切っている。`_score_choices_mlx` 自体も
+    確保前に `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で見積もりベースの拒否を
+    行うため、`resource_budget` は実測 RSS による最終防御として併用する。
+    Codex レビュー指摘 P0・PR #234）。
+
+    各行の生テキストは `encode_bytes` を呼ぶ前（NFKC 正規化・UTF-8 化の前）
+    に `MAX_TRAIN_LINE_BYTES` でバイト数を検査する（`encode_bytes` は
+    `max_bytes` への切り詰めを正規化の「後」に行うため、検査なしでは
+    1 件の巨大な入力が正規化コストを無制限に消費しうる。学習データ側は
+    `contract.py` の行読み込みで同じ上限を既に保証しているため、予測経路
+    でも同じ上限値を流用する。Codex レビュー指摘 P0・PR #234）。
 
     `id` の重複は検査しない（重複の検査はデータ契約層
     `crates/data::eval_input` の責務であり、ここで評価ロジックを再実装
@@ -713,7 +777,9 @@ def predict_records(
     # `rows` は型上は `Sequence`（呼び出し元が既に全件を保持している前提）
     # だが、ここで無制限にリスト化・レコード蓄積をしないよう、件数を
     # 蓄積前に検査する（`chunk_size` は 1 チャンクの計算量しか制限しない。
-    # MAX_AR_PREDICT_ROWS docstring 参照）。
+    # MAX_AR_PREDICT_ROWS docstring 参照）。この検査はジェネレータの外
+    # （呼び出しの時点で同期的）に置き、呼び出し元が結果をイテレートし
+    # 忘れても上限超過を確実に拒否する。
     n_rows = len(rows)
     if n_rows > MAX_AR_PREDICT_ROWS:
         raise WorkerError(
@@ -722,18 +788,30 @@ def predict_records(
             ExitCode.LIMIT_EXCEEDED,
         )
 
-    rows = list(rows)
-    records: list[dict[str, Any]] = []
+    return _predict_records_stream(trained, list(rows), chunk_size, choice_id_list, resource_budget)
+
+
+def _predict_records_stream(
+    trained: AutoregressiveTrainedModel,
+    rows: list[tuple[str, str]],
+    chunk_size: int,
+    choice_id_list: list[list[int]],
+    resource_budget: budget_mod.ResourceBudget | None,
+) -> Iterator[dict[str, Any]]:
+    """`predict_records` のチャンクごとの逐次出力本体（件数上限検査済みの
+    `rows` を受け取る）。全件を `list` へ蓄積せず 1 件ずつ `yield` する。
+    """
     for start in range(0, len(rows), chunk_size):
         chunk = rows[start : start + chunk_size]
-        id_lists = [encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
+        id_lists = [_guarded_encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
+        if resource_budget is not None:
+            resource_budget.check()
         scores = _score_choices_mlx(trained.model, id_lists, choice_id_list)
         for (row_id, _text), row in zip(chunk, scores, strict=True):
             mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
-            records.append(build_prediction_record(row_id, mapping, trained.label_order))
+            yield build_prediction_record(row_id, mapping, trained.label_order)
         if resource_budget is not None:
             resource_budget.check()
-    return records
 
 
 def prediction_record_to_json_line(record: dict[str, Any]) -> str:

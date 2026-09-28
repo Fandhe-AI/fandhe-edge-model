@@ -276,7 +276,7 @@ def test_req19b_predict_records_learns_synthetic_task(tmp_path: Path) -> None:
     trained = train_kind(kind, examples, req)
 
     rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
-    records = predict_records(trained, rows)
+    records = list(predict_records(trained, rows))
 
     assert len(records) == len(rows)
     assert all(r["status"] == "ok" for r in records)
@@ -297,8 +297,8 @@ def test_req28_predict_records_chunking_invariant(tmp_path: Path) -> None:
     trained = train_kind(kind, examples, req)
 
     rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
-    single = predict_records(trained, rows, chunk_size=1)
-    batched = predict_records(trained, rows, chunk_size=len(rows))
+    single = list(predict_records(trained, rows, chunk_size=1))
+    batched = list(predict_records(trained, rows, chunk_size=len(rows)))
 
     assert [r["predicted_label"] for r in single] == [r["predicted_label"] for r in batched]
     for r_single, r_batched in zip(single, batched, strict=True):
@@ -321,7 +321,7 @@ def test_req19b_predict_records_matches_onnx_argmax(tmp_path: Path) -> None:
     export_onnx_to_path(kind, trained, onnx_path)
 
     rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
-    records = predict_records(trained, rows)
+    records = list(predict_records(trained, rows))
 
     id_lists = [encode_bytes(text, req.max_bytes) for _row_id, text in rows]
     max_len = max(len(ids) for ids in id_lists)
@@ -339,7 +339,9 @@ def test_req19b_predict_records_matches_onnx_argmax(tmp_path: Path) -> None:
 def test_req39_predict_records_checks_budget_between_chunks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`resource_budget.check` がチャンク数に応じて呼ばれること（REQ-39）。"""
+    """`resource_budget.check` が各チャンクの計算「前」と「後」の両方で
+    呼ばれること（REQ-39。計算後だけの検査では確保済みの資源を検査する
+    頃には手遅れという Codex レビュー指摘。PR #234）。"""
     kind = AutoregressiveKind()
     req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
     examples = make_examples()
@@ -357,10 +359,11 @@ def test_req39_predict_records_checks_budget_between_chunks(
 
     rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
     chunk_size = 3
-    predict_records(trained, rows, chunk_size=chunk_size, resource_budget=budget)
+    list(predict_records(trained, rows, chunk_size=chunk_size, resource_budget=budget))
 
     expected_chunks = math.ceil(len(rows) / chunk_size)
-    assert calls["n"] == expected_chunks
+    # チャンクごとに計算「前」と「後」の 2 回呼ぶ設計（PR #234 レビュー対応）。
+    assert calls["n"] == expected_chunks * 2
 
 
 def test_req39_predict_records_rejects_rows_over_limit(
@@ -390,6 +393,56 @@ def test_req39_predict_records_rejects_rows_over_limit(
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
+def test_req39_predict_records_rejects_oversized_raw_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1 行の生テキストが `MAX_TRAIN_LINE_BYTES` を超える場合、`encode_bytes`
+    （NFKC 正規化・UTF-8 化）を呼ぶ前に `limit_exceeded`・exit 20 で拒否する
+    （REQ-39。正規化前にサイズを検査すべきという Codex レビュー指摘への
+    回帰テスト。PR #234）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    monkeypatch.setattr(ar_module, "MAX_TRAIN_LINE_BYTES", 4)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(kind, make_examples(), req)
+
+    rows = [("row-0", "this text is longer than 4 bytes")]
+
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained, rows))
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_req39_predict_records_rejects_oversized_attention_elements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_score_choices_mlx` が `full`・attention テンソルを確保する前に、
+    見積もり要素数（`N x K x heads x layers x length^2`）を
+    `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で fail-closed に拒否すること
+    （REQ-39。`chunk_size` だけでは確保量を抑えきれないという Codex
+    レビュー指摘への回帰テスト。PR #234）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    monkeypatch.setattr(ar_module, "MAX_AR_EXPORT_ATTENTION_ELEMENTS", 1)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained, rows))
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
 def test_req19b_predict_records_empty_input(tmp_path: Path) -> None:
     """空文字列の入力（`encode_bytes("") == [0]`）でも有限の `scores` を持つ
     ok のレコードになること（REQ-28。詰め物のみの行でも NaN が伝播しない
@@ -399,7 +452,7 @@ def test_req19b_predict_records_empty_input(tmp_path: Path) -> None:
     req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
     trained = train_kind(kind, make_examples(), req)
 
-    records = predict_records(trained, [("empty-row", "")])
+    records = list(predict_records(trained, [("empty-row", "")]))
 
     assert len(records) == 1
     assert records[0]["status"] == "ok"
