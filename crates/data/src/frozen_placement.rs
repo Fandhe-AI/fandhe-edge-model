@@ -65,23 +65,29 @@
 //! 6. [`verify_direct_write_rejected`] を呼び、実際に書き込みが拒否される
 //!    ことを確認できた場合に限り成功とする（fail-closed）
 //!
-//! # 書き込みプローブの TOCTOU 対策（Linux・macOS）
+//! # 書き込みプローブの TOCTOU 対策（Linux）
 //!
 //! [`verify_direct_write_rejected`] は、対象への読み取り専用ハンドルを
 //! 開いて `(dev, ino)` を検査時点と突き合わせた後、その書き込みプローブ
 //! （`append` での再オープン）をパス経由ではなく
-//! `/proc/self/fd/<fd>`（Linux）・`/dev/fd/<fd>`（macOS）というカーネル
-//! 提供の疑似シンボリックリンク経由で行う（[`reopen_append_via_fd`]）。
-//! これによりディレクトリエントリの再探索が発生しないため、識別済み
-//! ハンドルを得た後にパス上のファイルが別実体へ差し替えられても、
-//! プローブは常に元の実体を対象にし続ける。単純にパスを再オープンして
-//! `PermissionDenied` 後に `(dev, ino)` を再検査するだけの実装では、
-//! 「再検査までの間にファイルが差し替えられ、たまたま同じ `(dev, ino)`
-//! に戻っていた」場合に、実際に拒否されたのが差し替え後の別ファイル
-//! だったのかを区別できない（issue #227 codex[bot] P0 指摘）。それ以外の
-//! unix・非 unix 環境（M10 時点で検証対象外）では、この fd 直参照が
-//! 使えないためパス再オープン＋再検査のベストエフォート対策に留める
-//! （[`verify_identity_after_permission_denied`]）。
+//! `/proc/self/fd/<fd>` というカーネル提供の疑似シンボリックリンク経由で
+//! 行う（[`reopen_append_via_fd`]。Linux 限定）。これによりディレクトリ
+//! エントリの再探索が発生しないため、識別済みハンドルを得た後にパス上の
+//! ファイルが別実体へ差し替えられても、プローブは常に元の実体を対象に
+//! し続ける。単純にパスを再オープンして `PermissionDenied` 後に
+//! `(dev, ino)` を再検査するだけの実装では、「再検査までの間にファイルが
+//! 差し替えられ、たまたま同じ `(dev, ino)` に戻っていた」場合に、実際に
+//! 拒否されたのが差し替え後の別ファイルだったのかを区別できない（issue
+//! #227 codex[bot] P0 指摘）。macOS の `/dev/fd`（`fdescfs`）は同種の
+//! 疑似シンボリックリンクに見えるが `dup()` 相当の実装であり、要求した
+//! フラグに関わらず元のディスクリプタのアクセスモードを越える再オープンを
+//! 拒否するため、対象ファイルの実際の権限を検査できない（issue #227
+//! cursor[bot] 指摘: Write probe broken on macOS。実際に CI の
+//! macOS 実行で「書き込み可能なはずのファイルへの直接書き込みが拒否と
+//! 誤判定される」形で顕在化した）。そのため macOS を含む Linux 以外の
+//! unix・非 unix 環境（M10 時点で macOS 以外は検証対象外）では、この fd
+//! 直参照が使えないためパス再オープン＋再検査のベストエフォート対策に
+//! 留める（[`verify_identity_after_permission_denied`]）。
 //!
 //! # root・ACL の扱い（安全側に倒した判断）
 //!
@@ -125,6 +131,15 @@ pub struct ReadOnlyPlacement {
     // `PlacementError::UnsupportedPlatform` を返すため本型は構築されない
     // （モジュール doc「責務の境界」）。
     mode: u32,
+    // 配置確認時点（`place_read_only` 内の最終検査）の `(dev, ino)`。
+    // 呼び出し側が「この戻り値が指す実体は今もこれか」を後から突き合わせ
+    // られるようにする（issue #227 codex[bot] P0 指摘: 戻り値だけでは
+    // 呼び出し元が使うパスの読み取り専用状態を保証できないため、検証手段
+    // 自体を戻り値に持たせる）。関数の返り値が確定した「その瞬間」の実体を
+    // 表すのみで、返り値を受け取った後の差し替え（TOCTOU）はこのフィールド
+    // だけでは検出できない。その事後検知は凍結記録の sha256
+    // （[`crate::eval_freeze::evaluate_gate`]・issue #49）に委ねる。
+    dev_ino: (u64, u64),
 }
 
 impl ReadOnlyPlacement {
@@ -132,6 +147,14 @@ impl ReadOnlyPlacement {
     #[must_use]
     pub fn mode(&self) -> u32 {
         self.mode
+    }
+
+    /// 配置確認時点の `(dev, ino)`。呼び出し側が後から
+    /// `std::fs::symlink_metadata` 等で同じ実体かどうかを突き合わせるために
+    /// 公開する（issue #227 codex[bot] P0 指摘への対応）。
+    #[must_use]
+    pub fn dev_ino(&self) -> (u64, u64) {
+        self.dev_ino
     }
 }
 
@@ -337,6 +360,9 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
                 nlink,
             });
         }
+        // 権限変更前の mode を控える。直後の再検査（後述）でハードリンクの
+        // 発生を検出した場合、権限変更（副作用）を元に戻すために使う。
+        let original_mode = opened_meta.permissions().mode() & 0o7777;
 
         const READ_ONLY_MODE: u32 = 0o444;
         file.set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE))
@@ -359,12 +385,96 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
             });
         }
 
-        // `verify_direct_write_rejected` にはこのハンドルの `(dev, ino)` を
-        // 期待値として渡し、権限変更後・書き込み確認前にパスが別の
-        // ファイルへ差し替えられていないかも突き合わせる（issue #227
-        // codex P1 指摘）。
-        verify_direct_write_rejected_checked(path, Some(dev_ino(&confirmed)))?;
-        Ok(ReadOnlyPlacement { mode })
+        // nlink の確認（手順 3）と `set_permissions`（直前）の間に、同じ
+        // 所有者が許可ルート外へこの inode へのハードリンクを追加した場合、
+        // 直前の権限変更はそのルート外パスにも及んでしまう（issue #227
+        // codex[bot] P0 指摘）。ここで nlink を取り直し、増えていれば
+        // 権限変更前の mode へ戻したうえで拒否する（検出と原状回復。
+        // 「後始末なしの post-check」だけでは、ルート外 inode を 0o444 の
+        // ままにして失敗を報告するだけになり、副作用が残ってしまうため）。
+        // これでも「取り直し」と「戻す」の間の窓は残るが、権限変更直後に
+        // 即座に取り直すことでその窓を可能な限り狭める。
+        let confirmed_nlink = nlink_count(&confirmed);
+        if confirmed_nlink != 1 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(original_mode));
+            return Err(PlacementError::HardLinked {
+                path: path.to_path_buf(),
+                nlink: confirmed_nlink,
+            });
+        }
+
+        let confirmed_dev_ino = dev_ino(&confirmed);
+
+        #[cfg(target_os = "linux")]
+        {
+            // 既に開いている読み取り専用ハンドル `file` の fd をそのまま
+            // 使い、`/proc/self/fd/<fd>` 経由で書き込みプローブを行う。
+            // ここまで一度も新たにパスを開き直していないため、`file` を
+            // 開いた時点（手順 2）以降、権限変更・書き込み確認のいずれも
+            // パス経由のディレクトリエントリ再探索を経由しない。これにより
+            // `verify_direct_write_rejected_checked` を（新たにパスを開き
+            // 直す形で）呼ぶ場合に残っていた、権限変更後・書き込み確認前の
+            // TOCTOU 窓そのものを構造的に閉じる（issue #227 codex[bot] P0
+            // 指摘: 検査後に対象パスを差し替えても `place_read_only` が
+            // 成功を返してしまう問題への対応）。
+            match reopen_append_via_fd(&file) {
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
+                Ok(_opened) => {
+                    return Err(PlacementError::WriteNotRejected {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(source) => {
+                    return Err(PlacementError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS 等（Linux 以外の unix）では `/dev/fd` 等のハンドル直参照
+            // 手法が使えない、または信頼できない（macOS の `/dev/fd` は
+            // dup 相当で、元のハンドルのアクセスモードを越える再オープンを
+            // 要求フラグに関わらず拒否するため、対象ファイルの実際の権限を
+            // 検査できない。issue #227 cursor[bot] 指摘）。そのためパスを
+            // 開き直すベストエフォートの確認に留める。このハンドルの
+            // `(dev, ino)` を期待値として渡し、権限変更後・書き込み確認前に
+            // パスが別のファイルへ差し替えられていないかも突き合わせる
+            // （issue #227 codex P1 指摘）。
+            verify_direct_write_rejected_checked(path, Some(confirmed_dev_ino))?;
+        }
+
+        // 関数の返り値が確定する直前に、パス上の実体が検査してきたものと
+        // 今もなお同一であることを最後にもう一度確認する（issue #227
+        // codex[bot] P0 指摘: 検査の「間」または「直後」に対象パスを
+        // 差し替えても成功を返してしまう問題）。これは関数内で起こり得る
+        // 差し替えを閉じるものであり、この関数が `Ok` を返した「後」の
+        // 差し替えまでは防げない（クライアント側の検査では原理的に防げ
+        // ない）。返り値を受け取った後の差し替えは、凍結記録の sha256 に
+        // よる事後検知（[`crate::eval_freeze::evaluate_gate`]・issue #49）
+        // に委ねる。
+        let final_meta = std::fs::symlink_metadata(path).map_err(|source| PlacementError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if final_meta.file_type().is_symlink() {
+            return Err(PlacementError::Symlink {
+                path: path.to_path_buf(),
+            });
+        }
+        if dev_ino(&final_meta) != confirmed_dev_ino {
+            return Err(PlacementError::Replaced {
+                path: path.to_path_buf(),
+            });
+        }
+
+        Ok(ReadOnlyPlacement {
+            mode,
+            dev_ino: confirmed_dev_ino,
+        })
     }
 
     #[cfg(not(unix))]
@@ -414,12 +524,14 @@ pub fn verify_direct_write_rejected(path: &Path) -> Result<(), PlacementError> {
 /// `open` 呼び出し直後に改めて `symlink_metadata` を取得し `(dev, ino)`
 /// が検査時と一致することを確認できて初めて、この拒否を検査対象の
 /// ファイルへの拒否とみなす。これでも「失敗した `open`」と「直後の
-/// 再検査」の間の窓は残る。Linux・macOS では [`reopen_append_via_fd`]
-/// がこの窓自体を構造的に閉じるため、本関数はそれらが使えない環境
-/// （M10 時点で検証対象外。`.claude/rules/coding-rust.md`
-/// 「クロスプラットフォーム」）向けのベストエフォートな代替としてのみ
-/// 使う（[`verify_direct_write_rejected_checked`] のフォールバック分岐）。
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+/// 再検査」の間の窓は残る。Linux では [`reopen_append_via_fd`]
+/// がこの窓自体を構造的に閉じるため、本関数は Linux 以外の環境（macOS を
+/// 含む。macOS の `/dev/fd` が書き込みプローブに使えない理由は
+/// [`fd_magic_path`] のドキュメント参照。M10 時点で macOS 以外は検証
+/// 対象外。`.claude/rules/coding-rust.md`「クロスプラットフォーム」）
+/// 向けのベストエフォートな代替としてのみ使う
+/// （[`verify_direct_write_rejected_checked`] のフォールバック分岐）。
+#[cfg(all(unix, not(target_os = "linux")))]
 fn verify_identity_after_permission_denied(
     path: &Path,
     pre_dev_ino: (u64, u64),
@@ -433,31 +545,34 @@ fn verify_identity_after_permission_denied(
     Ok(())
 }
 
-/// `/proc/self/fd/<fd>`（Linux）・`/dev/fd/<fd>`（macOS）を返す。これらは
-/// パス上のディレクトリエントリを再探索せず、既に開いているファイル
-/// ディスクリプタが指す実体を直接指すカーネル提供の疑似シンボリックリンク
-/// である。このパスを `open` すると、対象の inode そのものを（元のパスを
-/// 一切介さずに）別のアクセスモードで開き直せる。
+/// `/proc/self/fd/<fd>`（Linux 限定）を返す。パス上のディレクトリエントリを
+/// 再探索せず、既に開いているファイルディスクリプタが指す実体を直接指す
+/// カーネル提供の疑似シンボリックリンクである。このパスを `open` すると、
+/// 対象の inode そのものを（元のパスを一切介さずに）別のアクセスモードで
+/// 開き直せる。
+///
+/// macOS の `/dev/fd`（`fdescfs`）は同種の見た目を持つが `dup()` 相当の
+/// 実装で、要求したフラグに関わらず元のディスクリプタのアクセスモードを
+/// 越える再オープンを拒否する（対象ファイルの実際の権限を検査できない。
+/// issue #227 cursor[bot] 指摘: Write probe broken on macOS）。そのため
+/// macOS 向けの `fd_magic_path` は用意しない。macOS は
+/// [`verify_identity_after_permission_denied`] によるパス再オープン＋
+/// 再検査のベストエフォート経路を使う。
 #[cfg(target_os = "linux")]
 fn fd_magic_path(fd: std::os::unix::io::RawFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{fd}"))
 }
 
-/// [`fd_magic_path`]（Linux）参照。macOS 版（`fdescfs` による `/dev/fd`）。
-#[cfg(target_os = "macos")]
-fn fd_magic_path(fd: std::os::unix::io::RawFd) -> PathBuf {
-    PathBuf::from(format!("/dev/fd/{fd}"))
-}
-
 /// 事前に開いた読み取り専用ハンドル `read_handle` が指す実体そのものを、
-/// [`fd_magic_path`] 経由で `append` モードとして開き直す（Linux・macOS
-/// 限定）。パスの再探索を一切行わないため、`read_handle` を得た後にパス上の
-/// エントリが別ファイルへ差し替えられても、この再オープンは影響を受けない
-/// （issue #227 codex P0 指摘: `append` の `open` が `PermissionDenied` を
-/// 返した後、再検査までの間にファイルが差し替えられると、`(dev, ino)` が
-/// 一致していても実際に拒否されたのが別ファイルだった可能性がある、という
-/// TOCTOU 窓を構造的に閉じる）。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// [`fd_magic_path`] 経由で `append` モードとして開き直す（Linux 限定。
+/// 上記 `fd_magic_path` のドキュメント参照）。パスの再探索を一切行わない
+/// ため、`read_handle` を得た後にパス上のエントリが別ファイルへ
+/// 差し替えられても、この再オープンは影響を受けない（issue #227 codex P0
+/// 指摘: `append` の `open` が `PermissionDenied` を返した後、再検査までの
+/// 間にファイルが差し替えられると、`(dev, ino)` が一致していても実際に
+/// 拒否されたのが別ファイルだった可能性がある、という TOCTOU 窓を構造的に
+/// 閉じる）。
+#[cfg(target_os = "linux")]
 fn reopen_append_via_fd(read_handle: &std::fs::File) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd as _;
     OpenOptions::new()
@@ -472,13 +587,15 @@ fn reopen_append_via_fd(read_handle: &std::fs::File) -> std::io::Result<std::fs:
 /// 場合も差し替え前のファイルと同一であることを確認できなければ
 /// `Replaced` で拒否する（issue #227 codex P1 指摘）。
 ///
-/// Linux・macOS では、書き込みプローブそのものを [`reopen_append_via_fd`]
+/// Linux では、書き込みプローブそのものを [`reopen_append_via_fd`]
 /// で行い、対象を識別してから書き込みを試みるまでの間、パス経由の再
 /// オープンを一切行わない（issue #227 codex P0 指摘の TOCTOU 対策。上記
-/// ドキュメント参照）。それ以外の unix・非 unix 環境（M10 時点で検証対象外。
-/// `.claude/rules/coding-rust.md`「クロスプラットフォーム」）では、パスを
-/// 直接開いて `PermissionDenied` の直後に再検査するベストエフォートの
-/// 対策に留める（[`verify_identity_after_permission_denied`]）。
+/// ドキュメント参照）。Linux 以外の unix・非 unix 環境（macOS を含む。
+/// `/dev/fd` が使えない理由は [`fd_magic_path`] のドキュメント参照。M10
+/// 時点で macOS 以外は検証対象外。`.claude/rules/coding-rust.md`
+/// 「クロスプラットフォーム」）では、パスを直接開いて `PermissionDenied`
+/// の直後に再検査するベストエフォートの対策に留める
+/// （[`verify_identity_after_permission_denied`]）。
 fn verify_direct_write_rejected_checked(
     path: &Path,
     #[cfg_attr(not(unix), allow(unused_variables))] expected_dev_ino: Option<(u64, u64)>,
@@ -498,7 +615,7 @@ fn verify_direct_write_rejected_checked(
         });
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         // 読み取り専用ハンドルを開いて対象の inode に結び付ける。この
         // ハンドルの (dev, ino) が検査時と一致することを確認できて
@@ -529,7 +646,7 @@ fn verify_direct_write_rejected_checked(
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     {
         match OpenOptions::new().append(true).open(path) {
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
@@ -728,12 +845,13 @@ mod tests {
     /// 「開けなかった対象が検査時のファイルと異なる」状況を決定的に
     /// 再現する。
     ///
-    /// `verify_identity_after_permission_denied` は Linux・macOS では
+    /// `verify_identity_after_permission_denied` は Linux では
     /// フォールバック分岐でも使わなくなった（[`super::reopen_append_via_fd`]
-    /// が TOCTOU 窓を構造的に閉じるため）。本関数の定義と同じ cfg で
-    /// ゲートし、それ以外の unix 環境（M10 時点で検証対象外）向けの
-    /// テストとして残す。
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    /// が TOCTOU 窓を構造的に閉じるため）。macOS は `/dev/fd` が書き込み
+    /// プローブに使えない（issue #227 cursor[bot] 指摘）ためこの
+    /// フォールバックを使い続ける。本関数の定義と同じ cfg でゲートし、
+    /// macOS を含む Linux 以外の unix 環境向けのテストとして残す。
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn req39_verify_identity_after_permission_denied_detects_replacement() {
         use std::os::unix::fs::MetadataExt as _;
@@ -779,8 +897,10 @@ mod tests {
     /// codex P0 指摘: `append` の `open` が `PermissionDenied` を返した後、
     /// 再検査までにファイルが差し替えられると `(dev, ino)` の再検査だけ
     /// では別ファイルへの拒否を見逃しうる、という TOCTOU 窓そのものを
-    /// 構造的に閉じることを示す）。
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// 構造的に閉じることを示す）。Linux 限定（macOS では
+    /// `reopen_append_via_fd` 自体を用意していない。issue #227 cursor[bot]
+    /// 指摘: Write probe broken on macOS）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn req39_reopen_append_via_fd_ignores_path_replacement_after_handle_open() {
         let guard_a = write_unique_temp_file("fdbound-replace-a", b"file a");
