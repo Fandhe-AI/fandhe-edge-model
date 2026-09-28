@@ -167,11 +167,21 @@ fn known_answer_single_select_matches_hand_calculated_values() {
     );
 
     // Macro-F1 = 49/104（修正前の誤り 49/78 にはならないこと）。
-    let macro_f1 = metrics.macro_f1.expect("all four labels have Some(f1)");
+    let macro_f1 = metrics
+        .macro_f1
+        .value()
+        .expect("all four labels have Some(f1)");
     assert!(approx_eq(macro_f1, 49.0 / 104.0));
     assert!(
         !approx_eq(macro_f1, 49.0 / 78.0),
         "F1 を調和平均で定義したときの誤った値（49/78）を再現していないこと"
+    );
+    // D は precision が None だが f1 が Some(0.0) のため除外されない
+    // （REQ-24 異常系・TASK-24.2: 除外条件は f1 == None のみ）。
+    assert_eq!(
+        metrics.macro_f1.excluded_labels(),
+        &[] as &[String],
+        "全ラベルの f1 が定義できるため excluded_labels は空"
     );
 
     // accuracy.overall = 12/24, adopted_decision = 12/23（分母は abstain を除いた 23）。
@@ -239,10 +249,19 @@ fn majority_baseline_matches_hand_calculated_values() {
     }
 
     // Macro-F1 = 0.1（修正前の誤り 0.4 を再現しないこと）。
-    let macro_f1 = metrics.macro_f1.expect("all four labels have Some(f1)");
+    let macro_f1 = metrics
+        .macro_f1
+        .value()
+        .expect("all four labels have Some(f1)");
     assert!(approx_eq(macro_f1, 0.1));
     assert!(
         !approx_eq(macro_f1, 0.4),
         "F1 を調和平均で定義したときの誤った値（0.4）を再現していないこと"
+    );
+    // B・C・D は precision が None だが f1 が Some(0.0) のため除外されない。
+    assert_eq!(
+        metrics.macro_f1.excluded_labels(),
+        &[] as &[String],
+        "全ラベルの f1 が定義できるため excluded_labels は空"
     );
 }

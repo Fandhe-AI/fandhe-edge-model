@@ -11,6 +11,8 @@
 //!
 //! - [`metrics`][]: 正解率・ラベル別指標（適合率・再現率・F1）・Macro-F1・
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）
+//! - [`mcnemar`][]: McNemar の正確検定（両側）の統計計算コア
+//!   （REQ-25 正常系・TASK-25.1-1・issue #64）
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
@@ -19,14 +21,18 @@
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - 分母 0 の指標の JSON `null` 表示・平均から除いたラベルの列挙
-//!   （`excluded_labels`）: 未実装（TASK-24.2・issue #61）。本 crate は
-//!   `Option<f64>` として `None` を返すところまでを担う
+//! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
+//!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
+//!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
+//!   写す直列化は本 crate の責務ではなく、CLI の `evaluate` 工程
+//!   （TASK-33.1）が担う
 //! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 未実装
 //!   （TASK-24.3・issue #62）。[`metrics::Outcome`] を enum にしてあるのは
 //!   この後続実装が予測の種類を判定しやすくするため
-//! - McNemar 検定・Holm 補正（REQ-24・REQ-25）: 未実装（TASK-25.x）。
-//!   同じ crate 内の後続モジュールとして追加する想定
+//! - McNemar 検定（REQ-25）: 統計計算コアは実装済み（TASK-25.1-1・issue #64）。
+//!   下限基準比較への接続・p<0.05 の判定は未実装（TASK-25.1-2・issue #65）。
+//!   件数不足による「判定不能」の判定は未実装（TASK-25.2）。
+//!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -62,5 +68,6 @@
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
 //!   モジュールの「資源上限」節を参照）
 pub mod invariance;
+pub mod mcnemar;
 pub mod metrics;
 pub mod wilson;
