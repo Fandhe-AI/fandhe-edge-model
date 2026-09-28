@@ -16,8 +16,8 @@
 use std::collections::BTreeSet;
 
 use crate::inspect::{self, EmptyLabelSet, InspectOutcome};
-use crate::provenance::ProvenanceRecord;
 use crate::provenance::ingest::{ProvenanceIngestError, parse_provenance_json};
+use crate::provenance::{DisallowedSourceError, ProvenanceRecord, check_default_training_source};
 
 /// [`ingest_records`] の結果。
 ///
@@ -26,8 +26,9 @@ use crate::provenance::ingest::{ProvenanceIngestError, parse_provenance_json};
 /// 変更しない）。`provenance` は取り込み時に渡された来歴 JSON
 /// （[`ingest_records`] の `provenance_json` 引数）を検証した結果で、
 /// `provenance_json` が `None`（利用者自身が用意したデータ等、来歴が
-/// 無いデータ）の場合は `None` になる。来歴が無いデータを拒否するかどうか
-/// は TASK-40.2 の範囲であり、本モジュールでは判定しない。
+/// 無いデータ）の場合は `None` になる。来歴が無いデータは許可する
+/// （TASK-40.2 で判断済み。来歴が **ある** 場合のみ、生成元が Jev 出力なら
+/// 拒否する。主経路は利用者自身が用意したデータ〔来歴なし〕のため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestOutcome {
     pub inspect: InspectOutcome,
@@ -43,6 +44,10 @@ pub enum IngestError {
     EmptyLabelSet(EmptyLabelSet),
     /// 来歴 JSON の検証に失敗した。
     Provenance(ProvenanceIngestError),
+    /// 来歴は解析できたが、学習データの既定生成元として許可されない
+    /// 生成元だった（Jev 出力。REQ-40 受け入れ基準 2・TASK-40.2・
+    /// issue #76）。上書き手段は無く、常に拒否する。
+    DisallowedSource(DisallowedSourceError),
 }
 
 /// データ検査と来歴の取り込みを 1 回の呼び出しで行う（fail-closed）。
@@ -52,12 +57,18 @@ pub enum IngestError {
 /// 1. `provenance_json` が `Some` の場合、先にそれを解析する。解析に
 ///    失敗したら **データ検査を行わずに** [`IngestError::Provenance`] を
 ///    返す（来歴不正を黙って無視して検査だけ進めることはしない）。
-/// 2. [`inspect::inspect_records`] を呼び、[`EmptyLabelSet`] はそのまま
+/// 2. 来歴が解析できた場合、[`check_default_training_source`] で生成元の
+///    採用可否を判定する。Jev 出力なら **データ検査を行わずに**
+///    [`IngestError::DisallowedSource`] を返す（役割〔学習／評価〕を問わず
+///    無条件に拒否する。本関数は役割を知らないため）。
+/// 3. [`inspect::inspect_records`] を呼び、[`EmptyLabelSet`] はそのまま
 ///    [`IngestError::EmptyLabelSet`] として返す。
-/// 3. 両方成功したら [`IngestOutcome`] を返す。
+/// 4. すべて成功したら [`IngestOutcome`] を返す。
 ///
 /// ファイル読み込み・サイズ上限（REQ-39）は呼び出し側（ガード層）の責務
-/// （[`crate`] クレート doc「前提条件」節と同じ方針）。
+/// （[`crate`] クレート doc「前提条件」節と同じ方針）。CLI 接続時の終了
+/// コード写像（`invalid_input`=64 か `out_of_scope`=11 か）は TASK-33.x の
+/// 範囲で未実装。
 pub fn ingest_records(
     content: &str,
     valid_label_ids: &BTreeSet<String>,
@@ -67,6 +78,7 @@ pub fn ingest_records(
         None => None,
         Some(json) => {
             let record = parse_provenance_json(json).map_err(IngestError::Provenance)?;
+            check_default_training_source(&record).map_err(IngestError::DisallowedSource)?;
             Some(record)
         }
     };

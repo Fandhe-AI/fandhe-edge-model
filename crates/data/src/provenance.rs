@@ -17,9 +17,15 @@
 //! - `serde` の `Serialize`/`Deserialize` は派生しない（`crates/data/Cargo.toml`
 //!   に `serde` を追加していない。[`ingest::provenance_to_json`] は
 //!   `serde_json::Value`／`Map` を手動で組み立てて JSON 化する）
-//! - 生成元（`source`）フィールド・外部 LLM 出力の既定拒否は TASK-40.2 の範囲
-//!   （[`ProvenanceRecord`] は `#[non_exhaustive]` のため非破壊で追加できる）
 //! - データ本文・指示文本文そのものは保持しない（[`PromptHash`] のみ保持する）
+//! - 生成元（[`GenerationSource`]）は来歴に記録するだけで、採用可否の方針
+//!   （Jev 出力を学習データの既定生成元にしない。REQ-40 受け入れ基準 2・
+//!   TASK-40.2・issue #76）は関知しない。方針は
+//!   [`check_default_training_source`] が単独で担う（来歴の記録と採用可否の
+//!   分離。CLI 接続時の終了コード写像（`invalid_input`=64 を想定）は
+//!   TASK-33.x の範囲で未実装）
+//! - Jev を許可する上書きフラグ・API は本モジュールに存在しない（自動運転
+//!   モードでの安全側の設計判断。追加は spec／ユーザー判断事項）
 //!
 //! # 呼び出し文脈
 //!
@@ -75,6 +81,10 @@ pub enum ProvenanceError {
     /// 生成日時が RFC 3339（UTC 表記）として不正だった
     /// （形式・範囲・長さ超過のいずれか。入力値は含めない）。
     InvalidGeneratedAt,
+    /// 生成元（`source`）の値が許可リスト（[`GenerationSource::from_wire`]）
+    /// のいずれにも一致しなかった（表記揺れ・未知値を含む。TASK-40.2・
+    /// issue #76・PoC-20 ケース 9）。
+    UnknownGenerationSource,
 }
 
 impl fmt::Display for ProvenanceError {
@@ -94,6 +104,9 @@ impl fmt::Display for ProvenanceError {
             ProvenanceError::PromptHashInvalidHex => "prompt hash must be lowercase hexadecimal",
             ProvenanceError::InvalidGeneratedAt => {
                 "generated_at must be a valid UTC RFC 3339 timestamp"
+            }
+            ProvenanceError::UnknownGenerationSource => {
+                "source must be one of the allowed generation sources"
             }
         };
         f.write_str(message)
@@ -507,11 +520,128 @@ pub enum TokenCount {
     Unobserved,
 }
 
+/// 来歴レコードの生成元（REQ-40 受け入れ基準 2・TASK-40.2・issue #76）。
+///
+/// 許可リスト方式（[`GenerationSource::from_wire`]）で受理する値を限定する。
+/// モデル名の文字列照合（ヒューリスティック）はしない。Jev
+/// （TypeSafe AI のクラウド判定 API。MCA §2.3(b) で出力の蒸留・模倣学習を
+/// 禁止）の出力かどうかは、生成元を明示的に記録した利用者・生成ツールの
+/// 自己申告に依存する（本ツールは来歴を記録するだけで法務解釈はしない。
+/// NR-29）。
+///
+/// # 出典
+///
+/// PoC-20 ケース 9（模擬）で確認した許可リストと同じ 2 値
+/// （`"self"`・`"jev_output"`）を採用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GenerationSource {
+    /// 来歴 JSON に `source` キーが無かった場合の既定値。Jev 出力ではない
+    /// （[`check_default_training_source`] が許可する）。
+    Unspecified,
+    /// 利用者自身が用意したデータ（`"self"`）。
+    SelfPrepared,
+    /// Jev（クラウド判定 API）の出力（`"jev_output"`）。学習データの既定
+    /// 生成元としては拒否される（[`check_default_training_source`]）。
+    JevOutput,
+}
+
+impl GenerationSource {
+    /// 来歴 JSON の `source` フィールド文字列から構築する（完全一致・
+    /// 大文字小文字を区別する許可リスト照合）。表記揺れ（`"Jev_output"`・
+    /// `"jev"` 等）・未知の値は拒否する（fail-closed。security.md
+    /// 「形式の許可制」）。
+    pub fn from_wire(value: &str) -> Result<Self, ProvenanceError> {
+        match value {
+            "self" => Ok(GenerationSource::SelfPrepared),
+            "jev_output" => Ok(GenerationSource::JevOutput),
+            _ => Err(ProvenanceError::UnknownGenerationSource),
+        }
+    }
+
+    /// 記録 JSON へ出力する際の表記（[`ingest::provenance_to_json`]）。
+    #[must_use]
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            GenerationSource::Unspecified => "unspecified",
+            GenerationSource::SelfPrepared => "self",
+            GenerationSource::JevOutput => "jev_output",
+        }
+    }
+}
+
+impl Default for GenerationSource {
+    /// `source` キー欠落時の既定値は [`GenerationSource::Unspecified`]
+    /// （Jev にはならない。REQ-40 受け入れ基準 2 の直接の根拠）。
+    fn default() -> Self {
+        GenerationSource::Unspecified
+    }
+}
+
+/// [`check_default_training_source`] が学習データの生成元を拒否した理由。
+///
+/// `Display` は固定の英語文言のみを返し、入力値を含めない
+/// （[`ProvenanceError`] と同じ方針）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DisallowedSourceError {
+    /// 生成元が Jev 出力だった（REQ-40 受け入れ基準 2・NR-29・
+    /// 疑問点 23 の 16 回目回答で、開発〔学習〕には使わないことが確定
+    /// している）。
+    JevOutputAsTrainingSource,
+}
+
+impl fmt::Display for DisallowedSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DisallowedSourceError::JevOutputAsTrainingSource => {
+                f.write_str("Jev output is not allowed as a training data source")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DisallowedSourceError {}
+
+impl DisallowedSourceError {
+    /// CLI 等の上位層が機械判定に使う内部コード文字列を返す
+    /// （[`crate::provenance::ingest::ProvenanceIngestError::code`] と同じ
+    /// 流儀）。CLI 接続時の終了コード写像（`invalid_input`=64 を想定）は
+    /// TASK-33.x の範囲で未実装。
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        "provenance_disallowed_source"
+    }
+}
+
+/// 来歴レコードの生成元が、学習データの既定生成元として許可されるか判定
+/// する（REQ-40 受け入れ基準 2・TASK-40.2・issue #76）。
+///
+/// [`GenerationSource::JevOutput`] のみを拒否し、[`GenerationSource::Unspecified`]・
+/// [`GenerationSource::SelfPrepared`] は許可する。呼び出し元
+/// （[`crate::ingest::ingest_records`]）はデータ検査より前に本関数を呼び、
+/// 拒否時はデータ検査を行わない（fail-closed。上書きフラグ・API は
+/// 存在しない）。
+///
+/// `match` は `#[non_exhaustive]` な [`GenerationSource`] を自 crate 内から
+/// 網羅的に書いており、ワイルドカード腕を使わない。将来 variant を追加
+/// した際に本関数の判定漏れがコンパイルエラーとして検出されるようにする
+/// ためで、`_ => Ok(())` のような既定許可へ黙って倒さない。
+pub fn check_default_training_source(
+    record: &ProvenanceRecord,
+) -> Result<(), DisallowedSourceError> {
+    match record.source() {
+        GenerationSource::Unspecified => Ok(()),
+        GenerationSource::SelfPrepared => Ok(()),
+        GenerationSource::JevOutput => Err(DisallowedSourceError::JevOutputAsTrainingSource),
+    }
+}
+
 /// 外部 LLM で生成したデータ 1 件分の来歴レコード（REQ-40・TASK-40.1-1）。
 ///
 /// データ本文・指示文本文そのものは保持しない（[`PromptHash`] のみ保持）。
-/// 生成元（`source`）・データ種別（学習／評価）は TASK-40.2 で追加予定
-/// （`#[non_exhaustive]` のため非破壊で拡張できる）。
+/// 生成元（[`GenerationSource`]）は TASK-40.2 で追加済み。データ種別
+/// （学習／評価）は未追加（`#[non_exhaustive]` のため非破壊で拡張できる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ProvenanceRecord {
@@ -519,11 +649,14 @@ pub struct ProvenanceRecord {
     prompt_hash: PromptHash,
     generated_at: GeneratedAt,
     token_count: TokenCount,
+    source: GenerationSource,
 }
 
 impl ProvenanceRecord {
     /// 検証済みの各項目から来歴レコードを構築する。各項目は構築時点で
-    /// 検証済みのためここでは `Result` を返さない。
+    /// 検証済みのためここでは `Result` を返さない。生成元は
+    /// [`GenerationSource::Unspecified`]（既定値）で構築する。生成元を
+    /// 指定する場合は [`ProvenanceRecord::with_source`] を使う。
     #[must_use]
     pub fn new(
         model_name: ModelName,
@@ -536,7 +669,15 @@ impl ProvenanceRecord {
             prompt_hash,
             generated_at,
             token_count,
+            source: GenerationSource::Unspecified,
         }
+    }
+
+    /// 生成元を指定して構築し直す（builder 風の消費メソッド）。
+    #[must_use]
+    pub fn with_source(mut self, source: GenerationSource) -> Self {
+        self.source = source;
+        self
     }
 
     /// 生成時に指定したモデル名。
@@ -561,6 +702,12 @@ impl ProvenanceRecord {
     #[must_use]
     pub fn token_count(&self) -> &TokenCount {
         &self.token_count
+    }
+
+    /// 生成元。
+    #[must_use]
+    pub fn source(&self) -> GenerationSource {
+        self.source
     }
 }
 
@@ -602,5 +749,76 @@ mod tests {
         let err = ModelName::new(&marker).expect_err("上限超過で拒否されるはず");
         assert_eq!(err, ProvenanceError::ModelNameTooLong);
         assert!(!err.to_string().contains('X'));
+    }
+
+    /// TASK-40.2: 許可リストの 2 値（`"self"`・`"jev_output"`）を受理する。
+    #[test]
+    fn task40_2_generation_source_from_wire_accepts_allowed_values() {
+        assert_eq!(
+            GenerationSource::from_wire("self"),
+            Ok(GenerationSource::SelfPrepared)
+        );
+        assert_eq!(
+            GenerationSource::from_wire("jev_output"),
+            Ok(GenerationSource::JevOutput)
+        );
+    }
+
+    /// TASK-40.2: 表記揺れ・未知値・空文字は拒否する（fail-closed）。
+    #[test]
+    fn task40_2_generation_source_from_wire_rejects_unknown_values() {
+        for input in ["Jev_output", "jev", "JEV_OUTPUT", "", "distilled", "Self"] {
+            assert_eq!(
+                GenerationSource::from_wire(input),
+                Err(ProvenanceError::UnknownGenerationSource),
+                "input={input:?} は拒否されるはず"
+            );
+        }
+    }
+
+    /// TASK-40.2: `source` キー欠落時の既定値は `Unspecified`
+    /// （REQ-40 受け入れ基準 2「既定の生成元が Jev にならない」）。
+    #[test]
+    fn task40_2_generation_source_default_is_unspecified() {
+        assert_eq!(GenerationSource::default(), GenerationSource::Unspecified);
+    }
+
+    /// TASK-40.2: `check_default_training_source` は Jev 出力のみを拒否し、
+    /// 未指定・自己用意は許可する。
+    #[test]
+    fn task40_2_check_default_training_source_rejects_only_jev_output() {
+        let base = ProvenanceRecord::new(
+            ModelName::new("gpt-5.6-sol").expect("有効なモデル名のはず"),
+            PromptHash::from_hex(
+                "30382f17d2a33e6e40c9a6ce38563083ab4c788c83785fd70bff6b7e9c03f19c",
+            )
+            .expect("有効な 64 桁小文字 16 進のはず"),
+            GeneratedAt::parse_rfc3339_utc("2026-09-24T00:14:33.672492+00:00")
+                .expect("有効な RFC 3339 のはず"),
+            TokenCount::Unobserved,
+        );
+
+        assert_eq!(check_default_training_source(&base), Ok(()));
+        assert_eq!(
+            check_default_training_source(
+                &base.clone().with_source(GenerationSource::SelfPrepared)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_default_training_source(&base.with_source(GenerationSource::JevOutput)),
+            Err(DisallowedSourceError::JevOutputAsTrainingSource)
+        );
+    }
+
+    /// TASK-40.2: `DisallowedSourceError` の `Display`／`code()` を固定する。
+    #[test]
+    fn task40_2_disallowed_source_error_message_and_code_are_stable() {
+        let err = DisallowedSourceError::JevOutputAsTrainingSource;
+        assert_eq!(
+            err.to_string(),
+            "Jev output is not allowed as a training data source"
+        );
+        assert_eq!(err.code(), "provenance_disallowed_source");
     }
 }
