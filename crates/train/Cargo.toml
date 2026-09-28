@@ -12,8 +12,10 @@ description = "Train worker request/result contract (JSON boundary types) for fa
 # （REQ-15・REQ-18・REQ-19。#177）。
 fandhe-edge-core.workspace = true
 # workspace 内の path 依存（外部 crate の追加ではない）。`search` モジュール
-# （TASK-18.1-2・issue #84）が validation 正解率の算出を評価器へ委譲するために
-# 使う（`fandhe_edge_eval::metrics::evaluate_single_select`）。評価器は
+# （TASK-18.1-2・issue #84）が validation 正解率の算出を評価器へ委譲し、
+# `selection_significance` モジュール（TASK-18.3-1・issue #87）が選定結果への
+# McNemar／Holm 有意性判定の付与に評価器を呼ぶために使う
+# （`fandhe_edge_eval::metrics::evaluate_single_select` 等）。評価器は
 # 1 つに集約し、本 crate で再実装しない（`.claude/rules/coding-rust.md`）。
 # `fandhe-edge-eval` は本 crate に依存していないため循環しない。
 fandhe-edge-eval.workspace = true
