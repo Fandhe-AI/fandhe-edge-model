@@ -41,6 +41,9 @@
 //! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
 //!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
 //!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
+//! - [`reproducibility`][]: 3 seed 以上の Wilson 95% 信頼区間の重なり判定
+//!   （REQ-26 境界値・TASK-26.3-1・issue #104）。[`wilson`] が返す区間、
+//!   または `(seed, correct, total)` の組から全ペアの重なりを判定する
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -69,6 +72,11 @@
 //!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
 //!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
 //!   統合は未実装）
+//! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:
+//!   判定ロジックは実装済み（TASK-26.3-1・issue #104・[`reproducibility`]）。
+//!   CPU 決定性テスト・GPU 未確認の限界の詳しい記述は未実装（issue #105）。
+//!   CLI `evaluate` への配線・3 seed 再学習ジョブ（REQ-34）との接続・
+//!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -124,6 +132,7 @@ pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;
+pub mod reproducibility;
 pub mod sample_size;
 pub mod significance;
 pub mod wilson;
