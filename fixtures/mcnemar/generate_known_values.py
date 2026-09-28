@@ -85,6 +85,10 @@ CASES: list[Case] = [
     Case(123, 26, "PoC-10 seed0 C2 vs majority"),
     Case(161, 52, "PoC-10 seed0 C3 vs majority"),
     Case(108, 36, "PoC-10 seed0 C4 vs majority"),
+    Case(143, 43, "PoC-10 seed1 C3 vs majority（issue #65・TASK-25.1-2）"),
+    Case(125, 58, "PoC-10 seed1 C4 vs majority（issue #65・TASK-25.1-2）"),
+    Case(144, 40, "PoC-10 seed2 C3 vs majority（issue #65・TASK-25.1-2）"),
+    Case(134, 58, "PoC-10 seed2 C4 vs majority（issue #65・TASK-25.1-2）"),
 ]
 
 
