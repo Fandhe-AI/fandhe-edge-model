@@ -91,6 +91,11 @@ impl RecordedSplit {
 /// （構造検証を経た外部 JSON からのみ）に限定する。検証を経ていない値から
 /// `SplitRecord` を組み立てられないようにするための設計判断
 /// （coding-rust.md「公開 API・型設計」）。
+///
+/// `Debug` は派生のままでよい: `splits`（[`SplitDigests`] 経由で
+/// [`SplitDigest`]）が手動実装した `Debug` でレコード ID を伏せるため、
+/// 本型を `{:?}` で出力してもレコード ID は漏れない
+/// （PR #210 codex レビュー P0 指摘）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitRecord {
     schema_version: u32,
@@ -212,12 +217,32 @@ impl SplitDigests {
 
 /// 1 つの split（train / validation / test のいずれか）のハッシュと
 /// レコード ID 集合。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`record_ids` をそのまま
+/// 出力すると評価データのレコード ID がログへ漏れるため
+/// （security.md「秘密情報の混入防止」。PR #210 codex レビュー P0 指摘）。
+/// この型を含む [`SplitRecord`]（`splits` フィールド経由）の `derive(Debug)`
+/// も、本実装により record_ids を出力しなくなる。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SplitDigest {
     record_ids: Vec<String>,
     record_count: usize,
     group_count: usize,
     sha256: String,
+}
+
+impl std::fmt::Debug for SplitDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitDigest")
+            .field(
+                "record_ids",
+                &format_args!("<redacted {} ids>", self.record_ids.len()),
+            )
+            .field("record_count", &self.record_count)
+            .field("group_count", &self.group_count)
+            .field("sha256", &self.sha256)
+            .finish()
+    }
 }
 
 impl SplitDigest {
@@ -250,7 +275,11 @@ impl SplitDigest {
 ///
 /// `Display` は英語の固定文言のみを返し、レコード ID・具体的な期待値と
 /// 実際の値を含めない（security.md「秘密情報の混入防止」。学習データの
-/// 内容を漏らさないため）。
+/// 内容を漏らさないため）。`Debug` は派生のままでよい: `Split` が包む
+/// [`SplitError`] が手動実装した `Debug` で `DuplicateRecordId` の
+/// レコード ID を伏せるため、他のバリアント（レコード ID を保持しない）と
+/// 合わせて本型を `{:?}` で出力してもレコード ID は漏れない
+/// （PR #210 codex レビュー P0 指摘）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SplitRecordError {
@@ -1377,6 +1406,48 @@ mod tests {
         assert!(
             !message.contains("secret-id"),
             "エラーメッセージにレコード ID が含まれてはならない: {message}"
+        );
+    }
+
+    /// PR #210 codex レビュー P0 指摘の回帰テスト: `SplitRecordError`・
+    /// `SplitRecord`・`SplitDigest` の `Debug`（`{:?}`）出力にも実際の
+    /// レコード ID（"secret-id"）が含まれてはならない（security.md
+    /// 「秘密情報の混入防止」。`Display` だけでなく `Debug` 経由のログ出力
+    /// でもデータが混入しないことを保証する）。
+    #[test]
+    fn req17_task17_1_2_debug_output_does_not_leak_record_ids() {
+        let records = vec![
+            record("secret-id", "g1", "a"),
+            record("secret-id", "g2", "a"),
+        ];
+
+        let err = split_and_record(&records, 1, &SplitRatios::default())
+            .expect_err("重複 ID は Split エラーになるはず");
+        let debug_message = format!("{err:?}");
+        assert!(
+            !debug_message.contains("secret-id"),
+            "SplitRecordError の Debug 出力にレコード ID が含まれてはならない: {debug_message}"
+        );
+
+        let ok_records = vec![
+            record("secret-id", "g1", "a"),
+            record("r2", "g2", "a"),
+            record("r3", "g3", "b"),
+            record("r4", "g4", "b"),
+        ];
+        let recorded =
+            split_and_record(&ok_records, 5, &SplitRatios::default()).expect("valid ratios");
+
+        let record_debug = format!("{:?}", recorded.record());
+        assert!(
+            !record_debug.contains("secret-id"),
+            "SplitRecord の Debug 出力にレコード ID が含まれてはならない: {record_debug}"
+        );
+
+        let digest_debug = format!("{:?}", recorded.record().digest(Split::Train));
+        assert!(
+            !digest_debug.contains("secret-id"),
+            "SplitDigest の Debug 出力にレコード ID が含まれてはならない: {digest_debug}"
         );
     }
 

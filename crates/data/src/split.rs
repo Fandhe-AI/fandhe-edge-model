@@ -176,7 +176,12 @@ pub struct SplitResult {
 const RULE_ID: &str = "group-stratified-v1/alloc-poc9/splitmix64-fisher-yates";
 
 /// 分割の入力検証エラー。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`DuplicateRecordId` の実際の
+/// レコード ID を `{:?}` 経由で漏らさないため（security.md「秘密情報の混入防止」。
+/// PR #210 codex レビュー P0 指摘: `SplitRecordError` 等がこの型を包んで
+/// `derive(Debug)` すると、レコード ID がログへ漏れていた）。
+#[derive(Clone, PartialEq, Eq)]
 pub enum SplitError {
     /// `SplitRatios` が区間外・NaN・合計が 1.0 から許容差を超えて外れている。
     InvalidRatios,
@@ -209,6 +214,21 @@ impl std::fmt::Display for SplitError {
 }
 
 impl std::error::Error for SplitError {}
+
+/// `Display` と同じく固定の英語文言のみを出力し、`DuplicateRecordId` が
+/// 保持する実際のレコード ID は出力しない（security.md「秘密情報の混入防止」。
+/// PR #210 codex レビュー P0 指摘。`derive(Debug)` の既定実装はタプル要素を
+/// そのまま出力してしまうため、ここで手動実装して塞ぐ）。
+impl std::fmt::Debug for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::InvalidRatios => write!(f, "InvalidRatios"),
+            SplitError::DuplicateRecordId(_) => {
+                write!(f, "DuplicateRecordId(<redacted>)")
+            }
+        }
+    }
+}
 
 /// `n` 件の group を train / validation / test へ割り付ける件数を決める。
 ///
