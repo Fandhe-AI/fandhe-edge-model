@@ -13,7 +13,11 @@
 //! そのまま採用するのではなく、評価データ総件数を仮定した両側正確検定の
 //! 実際の検出力（[`power_given_total_n`]）で引き上げた値を返す（PR #230
 //! レビュー指摘・P0: 正規近似だけでは実際に使う正確検定の検出力を
-//! 保証できなかったため）。
+//! 保証できなかったため）。[`McNemarSampleSizeAssumption::new`] は
+//! `alpha <= `[`crate::significance::SIGNIFICANCE_ALPHA`]（実際に
+//! [`crate::significance::judge`] が使う固定の有意水準）を要求する（同じく
+//! PR #230 レビュー指摘・P0: 算出時に緩い α を仮定すると、実際の判定の
+//! 厳しい α では目標検出力を満たせない必要件数を返しかねないため）。
 //!
 //! 呼び出し文脈は、CLI の `evaluate` 工程（将来・TASK-33.x）や事前登録手続き
 //! が、仮定した候補・下限基準の正解率の差（`p_b`・`p_c`）と α・power から
@@ -34,7 +38,7 @@
 //!   決めた値を渡す
 //! - JSON 入出力・ファイル I/O・CLI 統合は行わない
 
-use crate::significance::{MAX_EVAL_RECORDS, RequiredSampleSize};
+use crate::significance::{MAX_EVAL_RECORDS, RequiredSampleSize, SIGNIFICANCE_ALPHA};
 
 /// [`McNemarSampleSizeAssumption::new`]・[`required_sample_size_mcnemar`]が
 /// 返しうるエラー。
@@ -58,6 +62,23 @@ pub enum SampleSizeError {
     /// `QuantileOutOfDomain` が返る（公開 API の入力契約と計算結果が
     /// 食い違う）事態を防ぐ（P1・PR #230 レビュー指摘）。
     AlphaTooSmallForQuantile,
+    /// `alpha` が `(0, 1)` の範囲内だが、[`crate::significance::SIGNIFICANCE_ALPHA`]
+    /// （実際に [`crate::significance::judge`] が使う両側有意水準。固定値
+    /// `0.05`）を超える。
+    ///
+    /// 本構造体が算出する必要件数は「検出力を `power` 以上にするには α が
+    /// 仮定どおりであることが前提」であり、実際の判定は常に
+    /// `SIGNIFICANCE_ALPHA` を使う（評価契約〔`evaluation-contract.md`
+    /// 「有意性・指標」〕・REQ-24〜26）。`alpha > SIGNIFICANCE_ALPHA` を
+    /// 許すと、算出時の α（緩い）で見積もった必要件数では実際の判定
+    /// （厳しい `SIGNIFICANCE_ALPHA`）で目標検出力を満たせない事態が起こる
+    /// （PR #230 レビュー指摘・P0。`p_b=1, p_c=0, alpha=0.9, power=0.8` では
+    /// 必要件数 2 と算出されるが、2 件の両側正確検定の p 値は 0.5 で
+    /// `SIGNIFICANCE_ALPHA=0.05` の下では有意にならない）。
+    /// `alpha <= SIGNIFICANCE_ALPHA`（Holm 補正後の最厳段の α 等、より
+    /// 厳しい値）は許容する。より厳しい α で満たす必要件数は、より緩い
+    /// `SIGNIFICANCE_ALPHA` でも必ず満たされる（棄却域が広がる方向のため）。
+    AlphaExceedsSignificanceThreshold,
     /// `power` が `(0, 1)` の範囲外。
     PowerOutOfRange,
     /// `p_c` が負。
@@ -98,6 +119,29 @@ pub enum SampleSizeError {
         /// [`EXACT_POWER_SEARCH_MAX_N`] の値。
         limit: u64,
     },
+    /// 正確検定に基づく検出力探索（[`required_sample_size_mcnemar`]）が、
+    /// 総件数が [`EXACT_POWER_SEARCH_MAX_N`] に達する前に、累計の反復回数が
+    /// [`EXACT_POWER_SEARCH_MAX_STEPS`] を超えたため拒否した。
+    ///
+    /// [`exact_test_power`]・[`power_given_total_n`] のループ本体はそれぞれ
+    /// おおむね引数（不一致ペア数 `d`・評価データ総件数 `candidate_n`）に
+    /// 比例する反復を行うため、[`required_sample_size_mcnemar`] がキャッシュ
+    /// 構築（`d = 0..=N_final`）と検出力評価（`candidate_n = ceil_n..=N_final`）
+    /// を繰り返す全体の反復回数は `N_final` に対しておおむね `O(N_final^2)`
+    /// になりうる（[`EXACT_POWER_SEARCH_MAX_N`] は総件数のみを制限しており、
+    /// この累積反復回数を制限しないため、上限付近では `O(N_final^2)`
+    /// ≈ 2 億回規模に達しうる。PR #230 レビュー指摘・P1）。
+    /// [`EXACT_POWER_SEARCH_MAX_STEPS`] はこの累積反復回数そのものに実効
+    /// 上限を設け、fail-closed に拒否する（`ExceedsExactSearchLimit` とは
+    /// 独立した計算量上限で、総件数が [`EXACT_POWER_SEARCH_MAX_N`] 未満の
+    /// うちに反復回数の上限へ先に到達することがある）。
+    ExceedsExactSearchStepBudget {
+        /// 拒否した時点までの累計反復回数（[`EXACT_POWER_SEARCH_MAX_STEPS`]
+        /// を超えた値）。
+        steps: u64,
+        /// [`EXACT_POWER_SEARCH_MAX_STEPS`] の値。
+        limit: u64,
+    },
     /// 理論上到達しないはずの内部不整合（非有限値の算出・負の平方根引数等）。
     /// fail-closed のガード（`crate::mcnemar::McNemarError::Internal` と
     /// 同じ位置づけ）。
@@ -120,6 +164,12 @@ impl std::fmt::Display for SampleSizeError {
                 write!(
                     f,
                     "alpha is too small: alpha / 2.0 underflows to 0.0, which is outside the domain of normal_quantile"
+                )
+            }
+            SampleSizeError::AlphaExceedsSignificanceThreshold => {
+                write!(
+                    f,
+                    "alpha must not exceed SIGNIFICANCE_ALPHA ({SIGNIFICANCE_ALPHA}), the threshold actually used by significance::judge"
                 )
             }
             SampleSizeError::PowerOutOfRange => {
@@ -147,6 +197,12 @@ impl std::fmt::Display for SampleSizeError {
                 write!(
                     f,
                     "normal-approximation ceil(n) {ceil_n} exceeds exact power search limit {limit}"
+                )
+            }
+            SampleSizeError::ExceedsExactSearchStepBudget { steps, limit } => {
+                write!(
+                    f,
+                    "exact power search step budget exceeded: {steps} steps exceeds limit {limit}"
                 )
             }
             SampleSizeError::Internal { detail } => {
@@ -187,10 +243,15 @@ impl McNemarSampleSizeAssumption {
     /// 3. `alpha / 2.0` が丸めで `0.0` にならない（非正規数等の極小 `alpha`
     ///    は `(0, 1)` の範囲内でも [`normal_quantile`] の定義域を満たせず、
     ///    構築後の計算が必ず失敗するため、構築時点で拒否する）
-    /// 4. `p_c >= 0`
-    /// 5. `p_b > p_c`（候補が下限基準を上回る方向の差 `d = p_b - p_c > 0` を
+    /// 4. `alpha <= `[`SIGNIFICANCE_ALPHA`]`（0.05）`。実際の判定
+    ///    （[`crate::significance::judge`]）が使う有意水準を超える α で
+    ///    算出した必要件数は実際の検出力を保証しない
+    ///    （[`SampleSizeError::AlphaExceedsSignificanceThreshold`] 参照。
+    ///    PR #230 レビュー指摘・P0）
+    /// 5. `p_c >= 0`
+    /// 6. `p_b > p_c`（候補が下限基準を上回る方向の差 `d = p_b - p_c > 0` を
     ///    検出する前提。`d <= 0` では検出力の計算が意味を持たない）
-    /// 6. `p_b + p_c <= 1.0`（2 つの排反な正解率の和として妥当な範囲）
+    /// 7. `p_b + p_c <= 1.0`（2 つの排反な正解率の和として妥当な範囲）
     pub fn new(p_b: f64, p_c: f64, alpha: f64, power: f64) -> Result<Self, SampleSizeError> {
         if !p_b.is_finite() {
             return Err(SampleSizeError::NonFiniteInput { field: "p_b" });
@@ -213,6 +274,12 @@ impl McNemarSampleSizeAssumption {
             // `normal_quantile` の定義域（開区間 `(0, 1)`）を満たせないため、
             // 計算に進む前にここで拒否する。
             return Err(SampleSizeError::AlphaTooSmallForQuantile);
+        }
+        if alpha > SIGNIFICANCE_ALPHA {
+            // 算出に使う α は実際の判定（`significance::judge`）が使う
+            // `SIGNIFICANCE_ALPHA` を上回ってはならない（フィールドの
+            // ドキュメント参照。PR #230 レビュー指摘・P0）。
+            return Err(SampleSizeError::AlphaExceedsSignificanceThreshold);
         }
         if !(power > 0.0 && power < 1.0) {
             return Err(SampleSizeError::PowerOutOfRange);
@@ -665,6 +732,22 @@ fn power_given_total_n(total_n: u64, q: f64, cond_power: &[f64]) -> Result<f64, 
 /// 調整は後続 TASK で行う）。
 pub const EXACT_POWER_SEARCH_MAX_N: u64 = 20_000;
 
+/// 正確検定に基づく検出力探索の累積反復回数の実効上限（暫定値。REQ-39）。
+///
+/// [`EXACT_POWER_SEARCH_MAX_N`] は評価データ総件数のみを制限するが、
+/// [`exact_test_power`]・[`power_given_total_n`] のループ本体はそれぞれ
+/// 引数（不一致ペア数 `d`・総件数 `candidate_n`）に比例する反復を行うため、
+/// [`required_sample_size_mcnemar`] の探索全体（キャッシュ構築 + 検出力
+/// 評価）の累積反復回数は総件数の上限付近で `O(EXACT_POWER_SEARCH_MAX_N^2)`
+/// （約 2 億回）になりうる（PR #230 レビュー指摘・P1。
+/// [`SampleSizeError::ExceedsExactSearchStepBudget`] 参照）。本定数は
+/// その累積反復回数そのものに上限を設け、超えた時点で fail-closed に拒否
+/// する。`4_000_000` は既存のテスト参照値（総件数 168〜278 件。1 件あたり
+/// 高々 `O(N)` 回の反復）を十分な余裕を持って通しつつ、`O(N^2)` の増大を
+/// 総件数 3,000 件前後（累積反復回数がこの桁に達する境界）で頭打ちにする
+/// 値として選んだ（実測に基づく調整は後続 TASK で行う）。
+pub const EXACT_POWER_SEARCH_MAX_STEPS: u64 = 4_000_000;
+
 /// [`McNemarSampleSizeAssumption`] から必要件数（[`RequiredSampleSize`]）を
 /// 算出する。
 ///
@@ -690,21 +773,28 @@ pub const EXACT_POWER_SEARCH_MAX_N: u64 = 20_000;
 ///
 /// `cond_power` キャッシュ（[`exact_test_power`] の結果。総件数に依存
 /// しない）は候補の総件数をまたいで使い回し、総件数を 1 増やすごとに
-/// 新しい添字 1 件分だけ追加で計算する。これにより探索全体の計算量は
-/// キャッシュの構築が `O(N_final)`、[`power_given_total_n`] の呼び出しが
-/// 候補数 × `O(N_final)` に抑えられる（`N_final` は最終的に採用する
-/// 総件数）。
+/// 新しい添字 1 件分だけ追加で計算する（二重計算は避ける）。ただし
+/// [`exact_test_power`] 自体は添字 `d` に対して `O(d)` かかるため、
+/// キャッシュ構築の総コストは `d = 0..=N_final` の総和で `O(N_final^2)`
+/// になる。[`power_given_total_n`] の呼び出しも 1 回あたり `O(candidate_n)`
+/// で、候補数 `(N_final - ceil_n + 1)` 回呼ぶため、探索全体は
+/// `N_final` の上限付近で `O(N_final^2)` の反復になりうる（`O(N_final)`
+/// ではない。PR #230 レビュー指摘・P1。以前のドキュメントの想定計算量は
+/// 誤りだった）。[`EXACT_POWER_SEARCH_MAX_STEPS`] がこの累積反復回数に
+/// 実効上限を設ける。
 ///
 /// 丸めに許容差は加えない（PoC-10 と同じ規則。許容差の導入は評価契約
 /// 〔[`crate::significance`]〕の変更にあたるため行わない）。
 ///
 /// 正規近似の `ceil(n)` が [`MAX_EVAL_RECORDS`] を超える場合は
 /// [`SampleSizeError::ExceedsRecordLimit`] を、[`EXACT_POWER_SEARCH_MAX_N`]
-/// を超える場合は [`SampleSizeError::ExceedsExactSearchLimit`] を返す
-/// （前者は [`crate::significance::compare_with_baseline`] が確保前に
-/// 拒否する件数を超えている場合、後者は正確検定の検出力探索の計算量上限。
-/// いずれも fail-closed）。`f64` から `u64` への変換は上限検証を済ませた
-/// 後にのみ行う（範囲外値を未検証のまま `as` で変換しない）。
+/// を超える場合は [`SampleSizeError::ExceedsExactSearchLimit`] を、探索途中で
+/// 累積反復回数が [`EXACT_POWER_SEARCH_MAX_STEPS`] を超える場合は
+/// [`SampleSizeError::ExceedsExactSearchStepBudget`] を返す（1 つ目は
+/// [`crate::significance::compare_with_baseline`] が確保前に拒否する件数を
+/// 超えている場合、2・3 つ目は正確検定の検出力探索の計算量上限。いずれも
+/// fail-closed）。`f64` から `u64` への変換は上限検証を済ませた後にのみ行う
+/// （範囲外値を未検証のまま `as` で変換しない）。
 pub fn required_sample_size_mcnemar(
     assumption: &McNemarSampleSizeAssumption,
 ) -> Result<RequiredSampleSize, SampleSizeError> {
@@ -750,10 +840,35 @@ pub fn required_sample_size_mcnemar(
     let mut cond_power: Vec<f64> = Vec::new();
     let mut required_u64: Option<u64> = None;
 
+    // 累積反復回数（[`EXACT_POWER_SEARCH_MAX_STEPS`] のドキュメント参照。
+    // PR #230 レビュー指摘・P1）。`exact_test_power(d, ..)` の内部ループは
+    // 最大 `d / 2 + 1` 回、`power_given_total_n(candidate_n, ..)` の内部
+    // ループは正確に `candidate_n + 1` 回（早期終了なし）反復するため、
+    // それぞれの呼び出し直前に加算して予算超過を検出してから実際に呼ぶ
+    // （呼び出し後に検出するのでは、既に予算を超える反復を実行してしまう）。
+    let mut total_steps: u64 = 0;
+
     for candidate_n in ceil_n_u64..=EXACT_POWER_SEARCH_MAX_N {
         while (cond_power.len() as u64) <= candidate_n {
             let d = cond_power.len() as u64;
+            let cache_step_cost = d / 2 + 1;
+            total_steps = total_steps.saturating_add(cache_step_cost);
+            if total_steps > EXACT_POWER_SEARCH_MAX_STEPS {
+                return Err(SampleSizeError::ExceedsExactSearchStepBudget {
+                    steps: total_steps,
+                    limit: EXACT_POWER_SEARCH_MAX_STEPS,
+                });
+            }
             cond_power.push(exact_test_power(d, theta, assumption.alpha)?);
+        }
+
+        let power_step_cost = candidate_n + 1;
+        total_steps = total_steps.saturating_add(power_step_cost);
+        if total_steps > EXACT_POWER_SEARCH_MAX_STEPS {
+            return Err(SampleSizeError::ExceedsExactSearchStepBudget {
+                steps: total_steps,
+                limit: EXACT_POWER_SEARCH_MAX_STEPS,
+            });
         }
 
         let power = power_given_total_n(candidate_n, q, &cond_power)?;
@@ -907,6 +1022,42 @@ mod tests {
         let alpha: f64 = 1e-300;
         assert!(alpha / 2.0 > 0.0, "前提: 1e-300 は正規数");
         assert!(McNemarSampleSizeAssumption::new(0.06, 0.05, alpha, 0.8).is_ok());
+    }
+
+    /// `alpha` が `(0, 1)` の範囲内でも `SIGNIFICANCE_ALPHA`（0.05）を超える
+    /// 場合は `AlphaExceedsSignificanceThreshold`（PR #230 レビュー指摘・
+    /// P0）。
+    #[test]
+    fn assumption_rejects_alpha_exceeding_significance_threshold() {
+        assert_eq!(
+            McNemarSampleSizeAssumption::new(1.0, 0.0, 0.9, 0.8),
+            Err(SampleSizeError::AlphaExceedsSignificanceThreshold)
+        );
+    }
+
+    /// 境界の受理: `alpha == SIGNIFICANCE_ALPHA`（0.05 ちょうど）は許容
+    /// される。
+    #[test]
+    fn assumption_accepts_alpha_equal_to_significance_threshold() {
+        assert!(McNemarSampleSizeAssumption::new(0.15, 0.05, SIGNIFICANCE_ALPHA, 0.8).is_ok());
+    }
+
+    /// レビュー指摘の再現ケースそのもの: `p_b=1.0, p_c=0.0, alpha=0.9,
+    /// power=0.8` は構築時点で拒否され、`required_sample_size_mcnemar` まで
+    /// 到達しない（修正前は必要件数 2 を返し、`significance::judge` が実際に
+    /// 使う `SIGNIFICANCE_ALPHA=0.05` の下では 2 件の両側正確検定 p 値
+    /// 0.5 が有意にならず、約束した検出力を満たしていなかった）。
+    #[test]
+    fn required_sample_size_review_p0_case_is_rejected_at_construction() {
+        let err = McNemarSampleSizeAssumption::new(1.0, 0.0, 0.9, 0.8).unwrap_err();
+        assert_eq!(err, SampleSizeError::AlphaExceedsSignificanceThreshold);
+
+        // 参考: 修正前の実装が返していた「必要件数 2」は、
+        // `SIGNIFICANCE_ALPHA=0.05` の下では有意にならないことを固定する
+        // （2 件全て候補のみ正解でも p=0.5 >= 0.05）。
+        let exact_2 = mcnemar_exact_two_sided(2, 0).unwrap();
+        assert!(approx_eq(exact_2.p_two_sided().value(), 0.5, 1e-9));
+        assert!(exact_2.p_two_sided().value() >= SIGNIFICANCE_ALPHA);
     }
 
     /// `power` が 0 または 1 は `PowerOutOfRange`。
@@ -1113,6 +1264,34 @@ mod tests {
             let a = McNemarSampleSizeAssumption::new(0.15, 0.05, alpha, 0.8).unwrap();
             let required = required_sample_size_mcnemar(&a).unwrap();
             assert_eq!(required.get(), expected, "alpha={alpha}");
+        }
+    }
+
+    /// PR #230 レビュー指摘（P1）の再現ケース: 正規近似の `ceil(n)` が
+    /// 約 19,500（[`EXACT_POWER_SEARCH_MAX_N`] のすぐ下）になる仮定では、
+    /// 最初の候補件数だけでもキャッシュ構築（`d = 0..=19500`）の累積反復
+    /// 回数が [`EXACT_POWER_SEARCH_MAX_STEPS`]（400 万）を大きく超えるため、
+    /// 実際に `O(N_final^2)`（約 2 億回）の反復を行う前に
+    /// `ExceedsExactSearchStepBudget` で拒否される（修正前は上限なく
+    /// 計算を進めていた）。
+    #[test]
+    fn required_sample_size_rejects_when_step_budget_exceeded() {
+        let a =
+            McNemarSampleSizeAssumption::new(0.056_548_377_305_855_324, 0.05, 0.05, 0.8).unwrap();
+
+        let n_normal_approx = mcnemar_sample_size_estimate(&a).unwrap();
+        assert!(
+            (18_000.0..=EXACT_POWER_SEARCH_MAX_N as f64).contains(&n_normal_approx.ceil()),
+            "前提: 正規近似の ceil(n) が EXACT_POWER_SEARCH_MAX_N 付近であること。n={n_normal_approx}"
+        );
+
+        let err = required_sample_size_mcnemar(&a).unwrap_err();
+        match err {
+            SampleSizeError::ExceedsExactSearchStepBudget { steps, limit } => {
+                assert_eq!(limit, EXACT_POWER_SEARCH_MAX_STEPS);
+                assert!(steps > limit, "steps={steps} limit={limit}");
+            }
+            other => panic!("ExceedsExactSearchStepBudget を期待したが {other:?} だった"),
         }
     }
 
