@@ -66,6 +66,19 @@ use fandhe_edge_eval::significance::{
 /// 後続 TASK で行う。
 pub const MAX_CANDIDATE_ID_BYTES: usize = 128;
 
+/// 候補数（`family_size`）× 評価件数（`validation_gold.len()`）の積の上限
+/// （REQ-39 資源の上限。reviewer 指摘 PR #236）。
+///
+/// [`holm::MAX_FAMILY_SIZE`]（10,000）・[`significance::MAX_EVAL_RECORDS`]
+/// （1,000,000）はそれぞれ単体の上限であり、両方が上限内でも積は最大
+/// 100 億（候補数×評価件数分の `PairedRecord` 生成＋McNemar 比較）に達し、
+/// 処理時間の上限（security.md「ガード層: 資源の上限」）を満たせない。
+/// [`assess_selection_significance`] は `PairedRecord` の `Vec` を確保する
+/// メインループより前に、この積を検証して超過時は計算を開始せず拒否する。
+/// [`fandhe_edge_eval::mcnemar::MAX_DISCORDANT_PAIRS`]（1000 万）と同じ
+/// オーダーの暫定値とし、実測に基づく調整は後続 TASK で行う。
+pub const MAX_CANDIDATE_RECORD_PRODUCT: u64 = 10_000_000;
+
 /// 1 候補分の validation 予測。
 ///
 /// `outcomes` は [`SelectionSignificanceInput::validation_gold`] と
@@ -134,6 +147,17 @@ pub enum SelectionSignificanceError {
         /// 上限（[`fandhe_edge_eval::significance::MAX_EVAL_RECORDS`]）。
         limit: usize,
     },
+    /// 候補数 × 評価件数の積が上限（[`MAX_CANDIDATE_RECORD_PRODUCT`]）を
+    /// 超える（REQ-39。`PairedRecord` の `Vec` を確保するメインループの
+    /// 前に拒否する）。
+    TooManyComparisons {
+        /// 候補数（`family_size` ではなく実際に渡された `candidates.len()`）。
+        n_candidates: usize,
+        /// 評価件数（`validation_gold.len()`）。
+        n_records: usize,
+        /// 上限（[`MAX_CANDIDATE_RECORD_PRODUCT`]）。
+        limit: u64,
+    },
     /// 下限基準（多数決）の導出に失敗した。
     Baseline(BaselineError),
     /// Holm 補正に失敗した。
@@ -178,6 +202,14 @@ impl fmt::Display for SelectionSignificanceError {
             SelectionSignificanceError::TooManyRecords { n_records, limit } => {
                 write!(f, "too many records: {n_records} (limit: {limit})")
             }
+            SelectionSignificanceError::TooManyComparisons {
+                n_candidates,
+                n_records,
+                limit,
+            } => write!(
+                f,
+                "too many comparisons: {n_candidates} candidates x {n_records} records (limit: {limit})"
+            ),
             SelectionSignificanceError::Baseline(err) => write!(f, "{err}"),
             SelectionSignificanceError::Holm(err) => write!(f, "{err}"),
         }
@@ -283,21 +315,29 @@ fn validate_candidate_id(id: &str) -> bool {
 ///    [`SelectionSignificanceError::SelectedCandidateNotFound`]
 /// 4. `validation_gold.len()` が上限
 ///    （[`fandhe_edge_eval::significance::MAX_EVAL_RECORDS`]）以下か確認
-///    （[`PairedRecord`] の `Vec` 確保前。REQ-39）。各候補の
-///    `outcomes.len() == validation_gold.len()` を確認 →
+///    （[`PairedRecord`] の `Vec` 確保前。REQ-39）。
+/// 5. 候補数（`n_candidates`）× `validation_gold.len()` の積が上限
+///    （[`MAX_CANDIDATE_RECORD_PRODUCT`]）以下か確認（メインループ〔6〕の
+///    前。REQ-39）→ [`SelectionSignificanceError::TooManyComparisons`]。
+///    各候補の `outcomes.len() == validation_gold.len()` を確認 →
 ///    [`SelectionSignificanceError::OutcomeCountMismatch`]
-/// 5. [`baseline::fit_majority`] で `train_labels` から多数決の下限基準を求める
-/// 6. 候補ごとに [`significance::compare_with_baseline`] を呼び、
+/// 6. [`baseline::fit_majority`] で `train_labels` から多数決の下限基準を求める
+/// 7. 候補ごとに [`significance::compare_with_baseline`] を呼び、
 ///    [`BaselineComparison`] を候補順に集める
-/// 7. [`holm::compare_candidates_with_holm`] で全候補を 1 つの族として
+/// 8. [`holm::compare_candidates_with_holm`] で全候補を 1 つの族として
 ///    Holm 補正し、選定候補の [`HolmComparison`] を取り出す
 ///
 /// # 資源上限（REQ-39）
 ///
 /// `validation_gold.len()` の上限検証を [`PairedRecord`] の作業用 `Vec` を
 /// 確保する前に行う。作業用 `Vec` は 1 本を候補ごとに `clear()` して再利用し、
-/// 候補数×件数の確保はしない。候補数・族サイズの上限は
-/// [`holm::compare_candidates_with_holm`]（[`holm::MAX_FAMILY_SIZE`]）に委ねる。
+/// 候補数×件数の確保はしない。候補数（`family_size`）・件数
+/// （`validation_gold.len()`）それぞれの上限は
+/// [`holm::compare_candidates_with_holm`]（[`holm::MAX_FAMILY_SIZE`]）・
+/// [`significance::MAX_EVAL_RECORDS`] に委ねるが、両方が上限内でも積が
+/// 候補数×件数に比例するメインループの処理時間を膨大にしうるため、
+/// 本関数が [`MAX_CANDIDATE_RECORD_PRODUCT`] で積を計算開始前に検証する
+/// （reviewer 指摘 PR #236）。
 ///
 /// # 評価契約（REQ-27）
 ///
@@ -363,6 +403,24 @@ pub fn assess_selection_significance(
             limit: significance::MAX_EVAL_RECORDS,
         });
     }
+
+    // 候補数 × 評価件数の積を検証する（REQ-39。reviewer 指摘 PR #236）。
+    // `n_candidates`（≤ MAX_FAMILY_SIZE）・`n`（≤ MAX_EVAL_RECORDS）が
+    // それぞれ単体の上限内でも、積はメインループ（`PairedRecord` 生成＋
+    // 候補ごとの McNemar 比較）の処理時間に比例するため、後続のメインループ
+    // より前に、単体の上限より小さい積の上限で計算開始前に拒否する。
+    // `u64` へ変換してから乗算し（`usize` のオーバーフローを避ける）、
+    // 実際の積が `u64::MAX` を超えることはない
+    // （n_candidates ≤ 10_000・n ≤ 1_000_000 のため）。
+    let comparison_product = (n_candidates as u64).saturating_mul(n as u64);
+    if comparison_product > MAX_CANDIDATE_RECORD_PRODUCT {
+        return Err(SelectionSignificanceError::TooManyComparisons {
+            n_candidates,
+            n_records: n,
+            limit: MAX_CANDIDATE_RECORD_PRODUCT,
+        });
+    }
+
     for (i, candidate) in input.candidates.iter().enumerate() {
         if candidate.outcomes.len() != n {
             return Err(SelectionSignificanceError::OutcomeCountMismatch {
@@ -843,6 +901,50 @@ mod tests {
             SelectionSignificanceError::TooManyRecords {
                 n_records: significance::MAX_EVAL_RECORDS + 1,
                 limit: significance::MAX_EVAL_RECORDS,
+            }
+        );
+    }
+
+    /// 候補数（`family_size` 上限一杯）と評価件数がそれぞれ
+    /// [`holm::MAX_FAMILY_SIZE`]・[`significance::MAX_EVAL_RECORDS`] の
+    /// 個別上限内でも、積が [`MAX_CANDIDATE_RECORD_PRODUCT`] を超えると
+    /// `PairedRecord` を組み立てるメインループの前に `TooManyComparisons`
+    /// で拒否する（REQ-39 資源の上限。reviewer 指摘 PR #236）。
+    #[test]
+    fn too_many_comparisons_is_error() {
+        let labels = ["A"];
+        let train_labels = ["A"];
+        let outcomes = [Outcome::Label("A".to_string())];
+        let n_candidates = holm::MAX_FAMILY_SIZE;
+        // 個々の上限（MAX_FAMILY_SIZE・MAX_EVAL_RECORDS）は満たすが、
+        // 積が MAX_CANDIDATE_RECORD_PRODUCT をわずかに超える件数にする。
+        let n_records = (MAX_CANDIDATE_RECORD_PRODUCT / n_candidates as u64) as usize + 1;
+        assert!(n_records <= significance::MAX_EVAL_RECORDS);
+        let candidate_ids: Vec<String> = (0..n_candidates).map(|i| format!("c{i}")).collect();
+        let candidates: Vec<CandidateValidation<'_>> = candidate_ids
+            .iter()
+            .map(|id| CandidateValidation {
+                candidate_id: id.as_str(),
+                outcomes: &outcomes,
+            })
+            .collect();
+        let gold: Vec<&str> = vec!["A"; n_records];
+        let input = SelectionSignificanceInput {
+            label_order: &labels,
+            train_labels: &train_labels,
+            validation_gold: &gold,
+            candidates: &candidates,
+            selected_candidate_id: candidate_ids[0].as_str(),
+            required: req(1),
+            family_size: family(n_candidates),
+        };
+        let err = assess_selection_significance(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SelectionSignificanceError::TooManyComparisons {
+                n_candidates,
+                n_records,
+                limit: MAX_CANDIDATE_RECORD_PRODUCT,
             }
         );
     }
