@@ -184,15 +184,26 @@ pub struct SearchInput<'a> {
 /// （[`crate::time_allotment::CandidateRunner`] のような子プロセス経由の
 /// 実行器ではなく、プロセス内の関数呼び出しであるため）。実装側
 /// （推論ランタイム・ジョブ管理。#178 等）が `time_limit` を守る責務を持つ。
-/// `run_search` は学習完了直後（この呼び出しの前）に残り予算がすでに 0 で
-/// あることを検出した場合は本呼び出しを行わず
-/// （[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）、呼び出し
-/// 前後の経過時間を計測して `time_limit` を守れずに探索予算全体を超過した
-/// ことを事後検出した場合は、その候補を選定対象から除外する
-/// （[`CandidateSearchResult::ScoringExceededBudget`]）。いずれの場合も
-/// 以降の候補は未着手として記録する（fail-closed。「呼び出し中の時間制限が
-/// ないため超過後も選定されてしまう」ことを防ぐ。P0 指摘対応・issue #84
-/// PR #238 レビュー）。
+/// `run_search` は次の 3 段階で経過時間を確認し、各段階で探索予算全体を
+/// 使い切っていることを検出した場合はそれ以降の重い処理を行わない
+/// （fail-closed。「呼び出し中の時間制限がないため超過後も選定されて
+/// しまう」「期限後も重い処理を続ける」ことを防ぐ。P0/P1 指摘対応・
+/// issue #84 PR #238 レビュー）:
+///
+/// 1. 学習完了直後（本呼び出しの前）にすでに 0 であることを検出した場合は
+///    本呼び出しを行わない（[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）
+/// 2. 本呼び出しから戻った直後、正解率算出（`EvalRecord` の構築・評価器
+///    `evaluate_single_select` の呼び出し）より前に検出した場合は、
+///    正解率を算出せずに打ち切る
+///    （同じく [`CandidateSearchResult::ScoringSkippedBudgetExhausted`]。
+///    P1 指摘対応: 評価器という重い処理〔最大 `MAX_SEARCH_OUTCOME_CELLS`
+///    件〕を予算超過後に呼び出さない）
+/// 3. 評価器の呼び出しまで完了し正解率を算出できた後に検出した場合は、
+///    その候補を選定対象から除外する
+///    （[`CandidateSearchResult::ScoringExceededBudget`]。正解率は参考値
+///    として記録する）
+///
+/// いずれの段階で打ち切っても以降の候補は未着手として記録する。
 pub trait ValidationScorer {
     /// 実装固有のエラー型。
     type Error;
@@ -264,24 +275,39 @@ pub enum CandidateSearchResult {
     /// エラー内容は記録しない（security.md）。
     ScoringFailed,
     /// 学習・validation 推論・正解率算出まで完了したが、採点
-    /// （[`ValidationScorer::predict_validation`]）の呼び出しに時間がかかり
-    /// 探索予算全体を使い切った（P0 指摘対応。[`ValidationScorer`] trait doc
-    /// 「時間上限」参照）。正解率は算出できているが、探索予算を超過した後の
-    /// 結果を選定に使うと「合格・選定扱いにしてはならない」という REQ-39
-    /// の資源上限に反するため、[`select_best`] の対象から除外する
-    /// （選定対象外だが正解率自体は記録として残す）。
+    /// （[`ValidationScorer::predict_validation`]）または評価器
+    /// （`evaluate_single_select`）の呼び出しに時間がかかり探索予算全体を
+    /// 使い切った（P0/P1 指摘対応。[`ValidationScorer`] trait doc「時間上限」
+    /// 参照）。正解率は算出できているが、探索予算を超過した後の結果を選定に
+    /// 使うと「合格・選定扱いにしてはならない」という REQ-39 の資源上限に
+    /// 反するため、[`select_best`] の対象から除外する（選定対象外だが正解率
+    /// 自体は記録として残す）。評価器の呼び出し前に超過が確定していた場合は
+    /// 評価器を呼ばずに正解率も算出しないため、代わりに
+    /// [`ScoringSkippedBudgetExhausted`](Self::ScoringSkippedBudgetExhausted)
+    /// になる（issue #84 PR #238 レビュー）。
     ScoringExceededBudget {
         /// 参考値としての validation 正解率（選定には使わない）。
         validation_accuracy: ValidationAccuracy,
     },
-    /// 学習は完了したが、採点（[`ValidationScorer::predict_validation`]）を
-    /// 呼び出す前の時点で探索予算全体を使い切っていたため、採点を呼び出さ
-    /// なかった（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
-    /// [`ScoringExceededBudget`](Self::ScoringExceededBudget) は採点の
-    /// 呼び出し自体は行い事後に超過を検出した場合だが、本バリアントは
-    /// 呼び出し前に超過が確定しているため呼び出さない。正解率が無いため
-    /// `0` 等の値で埋めない（evaluation-contract「分母が 0 の指標は
-    /// `null`」と同じ「実測できない値を捏造しない」方針）。選定対象外。
+    /// 探索予算全体を使い切ったため、正解率の算出につながる処理を打ち切った
+    /// （P0/P1 指摘対応・REQ-39。issue #84 PR #238 レビュー）。次の 2 通りを
+    /// まとめて表す:
+    ///
+    /// 1. 採点（[`ValidationScorer::predict_validation`]）を呼び出す前の
+    ///    時点で探索予算全体を使い切っていたため、採点自体を呼び出さな
+    ///    かった場合
+    /// 2. 採点は呼び出し・完了したが、直後に確認した時点で探索予算全体を
+    ///    使い切っていたため、正解率算出（`EvalRecord` の構築・
+    ///    `evaluate_single_select` の呼び出し。最大 `MAX_SEARCH_OUTCOME_CELLS`
+    ///    件）を行わなかった場合（P1 指摘対応。評価器の呼び出しは資源を
+    ///    要するため、予算超過が確定した時点でスキップし「期限後も重い処理を
+    ///    続ける」経路を作らない）
+    ///
+    /// いずれも正解率を算出していない（できない）ため `0` 等の値で埋めない
+    /// （evaluation-contract「分母が 0 の指標は `null`」と同じ「実測できない
+    /// 値を捏造しない」方針）。[`ScoringExceededBudget`](Self::ScoringExceededBudget)
+    /// は評価器の呼び出しまで完了し正解率を算出できた後に超過を検出した
+    /// 場合で、本バリアントとは正解率の有無で区別する。選定対象外。
     ScoringSkippedBudgetExhausted,
     /// 候補の実測時間（[`CandidateTimeRecord::elapsed_ms`]）が、その候補へ
     /// 配分した持ち時間（[`CandidateTimeRecord::time_limit_seconds`]）を
@@ -938,6 +964,36 @@ where
                                 actual: outcomes.len(),
                             });
                         }
+
+                        // P1 指摘対応（REQ-39。issue #84 PR #238 レビュー）:
+                        // `predict_validation` から戻った直後、`EvalRecord`
+                        // の構築（最大 `MAX_SEARCH_OUTCOME_CELLS` 件）・
+                        // `evaluate_single_select` の呼び出しより前に探索予算
+                        // 全体を確認する。ここで確認せずに評価器まで進めると、
+                        // 採点だけで予算を使い切っていても重い評価処理
+                        // （最大 1,000 万セル）を最後まで走らせてしまい、
+                        // 「期限後も重い処理を続ける」経路が残る（REQ-39
+                        // 「資源の上限」）。ここでは正解率をまだ算出していない
+                        // ため、呼び出し前に打ち切る既存経路
+                        // （[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）
+                        // と同じ「正解率を算出できないまま打ち切る」扱いにする
+                        // （評価器を呼ばない点は同じで、採点自体は呼び出し済み
+                        // という違いはあるが、公開結果型に新しいバリアントを
+                        // 増やさずに済む。JSON 契約の変更が要る場合は
+                        // 実装せず承認事項として報告する方針〔delegation-impl〕）。
+                        let elapsed_after_predict_ms = elapsed_ms_since_start(clock)?;
+                        if elapsed_after_predict_ms >= budget_ms {
+                            entries.push(CandidateSearchEntry {
+                                candidate_id: candidate.candidate_id,
+                                elapsed_at_start_ms: Some(elapsed_ms),
+                                time: Some(run.record().clone()),
+                                result: CandidateSearchResult::ScoringSkippedBudgetExhausted,
+                                validation_outcomes: None,
+                            });
+                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                            break;
+                        }
+
                         let eval_records: Vec<EvalRecord<'_>> = input
                             .validation_gold
                             .iter()
@@ -949,7 +1005,8 @@ where
                                 .map_err(SearchError::Eval)?;
                         let accuracy = metrics.accuracy.overall;
 
-                        // 採点呼び出しに時間がかかり、探索予算全体を使い切って
+                        // 評価器（`evaluate_single_select`）の呼び出しに時間が
+                        // かかり、探索予算全体を使い切って
                         // いたら選定対象から除外する（P0 指摘対応。「超過後も
                         // 最後の候補なら Selected を返してしまう」ことを防ぐ。
                         // fail-closed: 正解率自体は参考値として記録するが
@@ -993,12 +1050,13 @@ where
                         });
 
                         // P1 指摘対応（REQ-18・REQ-39。issue #84 PR #238
-                        // レビュー）: 採点が失敗した場合も、成功時
-                        // （`ScoringExceededBudget`）と同じく呼び出し後の
-                        // 経過時間を確認する。確認せずに次候補へ進むと、
-                        // 採点中に探索予算を使い切っていても次候補が
-                        // `run_candidate` に渡ってしまい、予算超過後の学習を
-                        // 防げない（採点の成否で「呼び出し後に予算を
+                        // レビュー）: 採点が失敗した場合も、成功時に
+                        // `predict_validation` から戻った直後へ移した判定
+                        // （成功時は `ScoringSkippedBudgetExhausted` を参照）
+                        // と同じく呼び出し後の経過時間を確認する。確認せずに
+                        // 次候補へ進むと、採点中に探索予算を使い切っていても
+                        // 次候補が `run_candidate` に渡ってしまい、予算超過後の
+                        // 学習を防げない（採点の成否で「呼び出し後に予算を
                         // 使い切ったか」の扱いを変えない）。
                         let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
                         if elapsed_after_scoring_ms >= budget_ms {

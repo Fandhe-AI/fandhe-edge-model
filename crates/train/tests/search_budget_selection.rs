@@ -601,8 +601,9 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
 
 /// (P1・REQ-18・REQ-39・issue #84 PR #238 レビュー) 採点
 /// （[`ValidationScorer::predict_validation`]）が `Err` を返した場合も、
-/// 成功時の `ScoringExceededBudget` と同じく呼び出し後の経過時間を確認する。
-/// 採点呼び出し中に探索予算全体を使い切っていれば、`ScoringFailed` の候補は
+/// 成功時に `predict_validation` から戻った直後へ移した判定
+/// （`ScoringSkippedBudgetExhausted`）と同じく呼び出し後の経過時間を確認
+/// する。採点呼び出し中に探索予算全体を使い切っていれば、`ScoringFailed` の候補は
 /// 記録しつつ残り候補を実行せず `NotStarted { reason: BudgetExhausted }` として
 /// 一括で未着手にする（`drain_remaining_as_not_started`）。
 #[test]
@@ -942,18 +943,22 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
     assert_eq!(record.candidates[1].validation_outcomes(), None);
 }
 
-/// (T11・P0・REQ-39) 採点（`predict_validation`）の呼び出し中に探索予算
-/// 全体を使い切った場合、その候補は `scoring_exceeded_budget` として記録
-/// され、選定対象（`evaluated_owned`）から除外される。1 候補しかない場合
-/// `NoEligibleCandidate` になる（超過後も最後の候補なら `Selected` を返して
-/// しまう不具合の再現・修正確認）。`validation_outcomes()` も `None`（#87 の
-/// McNemar 検定に使えないことを保証する）。
+/// (T11・P0/P1・REQ-39・issue #84 PR #238 レビュー) 採点（`predict_validation`）
+/// の呼び出し中に探索予算全体を使い切った場合、`predict_validation` から
+/// 戻った直後（`EvalRecord` の構築・評価器 `evaluate_single_select` の
+/// 呼び出しより前）に打ち切り、その候補は `scoring_skipped_budget_exhausted`
+/// として記録される（正解率は算出しない。P1 指摘対応: 期限後に評価器という
+/// 重い処理を呼び出さない）。選定対象（`evaluated_owned`）から除外され、
+/// 1 候補しかない場合 `NoEligibleCandidate` になる（超過後も最後の候補なら
+/// `Selected` を返してしまう不具合の再現・修正確認）。`validation_outcomes()`
+/// も `None`（#87 の McNemar 検定に使えないことを保証する）。
 #[test]
 fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
     let clock = FakeClock::new(0);
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
     // 採点呼び出し中に予算（3600 秒 = 3_600_000ms）を大きく超えて時計を
-    // 進める（採点自体は正解率を計算できるが、期限を守れなかった想定）。
+    // 進める（採点自体は完了するが、期限を守れなかった想定。戻り値
+    // 自体はあるが、戻った直後の予算確認で評価器を呼ばずに打ち切る）。
     let mut scorer = FakeScorer::new(
         &clock,
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
@@ -975,15 +980,14 @@ fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
 
     let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
     assert_eq!(record.candidates.len(), 1);
-    match &record.candidates[0].result {
-        CandidateSearchResult::ScoringExceededBudget {
-            validation_accuracy,
-        } => {
-            assert_eq!(validation_accuracy.correct, 9);
-            assert_eq!(validation_accuracy.total, 10);
-        }
-        other => panic!("expected ScoringExceededBudget, got {other:?}"),
-    }
+    // 採点自体は呼ばれている（`predict_validation` から戻ってきた）が、
+    // 評価器（`evaluate_single_select`）は呼ばれず正解率が存在しない
+    // ことを `ScoringSkippedBudgetExhausted`（accuracy を持たない）で示す。
+    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringSkippedBudgetExhausted
+    );
     assert_eq!(record.candidates[0].validation_outcomes(), None);
     assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
 }
@@ -1104,12 +1108,14 @@ fn task18_1_2_search_budget_default_matches_constant() {
     );
 }
 
-/// (T14・P0・REQ-39・issue #84 PR #238 レビュー) 採点呼び出し中に経過時間が
+/// (T14・P0/P1・REQ-39・issue #84 PR #238 レビュー) 採点呼び出し中に経過時間が
 /// ちょうど探索予算全体（3_600_000ms）に達した場合も「予算到達を合格扱いに
-/// しない」（evaluation-contract）に含める。post-scoring 判定を `>`（旧実装）
-/// のままにすると本テストは失敗し（`Evaluated`・`Selected` になる）、`>=`
-/// への修正で `ScoringExceededBudget`・`NoEligibleCandidate` になることを
-/// 確認する。
+/// しない」（evaluation-contract）に含める。`predict_validation` から戻った
+/// 直後の判定を `>`（旧実装）のままにすると本テストは失敗し（`Evaluated`・
+/// `Selected` になる）、`>=` への修正で `ScoringSkippedBudgetExhausted`・
+/// `NoEligibleCandidate` になることを確認する（P1 指摘対応で判定が
+/// 評価器呼び出し前へ移動したため、境界到達時に評価器を呼ばず正解率も
+/// 算出しないことも合わせて確認する）。
 #[test]
 fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
     let clock = FakeClock::new(0);
@@ -1137,15 +1143,73 @@ fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
 
     let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
     assert_eq!(record.candidates.len(), 1);
-    match &record.candidates[0].result {
-        CandidateSearchResult::ScoringExceededBudget {
-            validation_accuracy,
-        } => {
-            assert_eq!(validation_accuracy.correct, 9);
-            assert_eq!(validation_accuracy.total, 10);
+    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringSkippedBudgetExhausted
+    );
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
+/// (T16・P1・REQ-39・issue #84 PR #238 レビュー) `predict_validation` が
+/// 成功して戻ってきても、戻った直後の時点で探索予算全体を使い切っていれば、
+/// `EvalRecord` の構築・評価器（`evaluate_single_select`）の呼び出しを一切
+/// 行わずに打ち切る（採点結果を最後まで評価してから事後に打ち切っていた
+/// 旧実装は、最大 `MAX_SEARCH_OUTCOME_CELLS` 件分の評価処理を期限後も
+/// 実行してしまい REQ-39「資源の上限」に反していた）。`scorer.calls` に
+/// candidate_id が記録されている（採点自体は呼ばれた）一方で、結果に
+/// 正解率を持たないことにより評価器が呼ばれていないことを確認する。
+#[test]
+fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::Ok { advance_ms: 10 },
+            RunnerBehavior::Ok { advance_ms: 10 },
+        ],
+    );
+    // c3-a の採点で予算を使い切る。c3-b は宣言順で後ろのため、予算超過後
+    // 実行されず not_started になる（`drain_remaining_as_not_started`）。
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
+    )
+    .with_advance("c3-a", 3_600_000);
+
+    let gold = validation_gold();
+    let candidates = vec![
+        SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: candidate_params("out/c3-a", 1),
+        },
+        SearchCandidate {
+            candidate_id: "c3-b".to_string(),
+            params: candidate_params("out/c3-b", 2),
+        },
+    ];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(record.candidates.len(), 2);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringSkippedBudgetExhausted
+    );
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    assert_eq!(
+        record.candidates[1].result,
+        CandidateSearchResult::NotStarted {
+            reason: NotStartedReason::BudgetExhausted
         }
-        other => panic!("expected ScoringExceededBudget at exact boundary, got {other:?}"),
-    }
+    );
     assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
 }
 
