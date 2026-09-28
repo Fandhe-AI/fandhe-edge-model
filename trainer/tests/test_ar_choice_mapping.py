@@ -10,6 +10,7 @@ REQ-27・REQ-28・REQ-39・TASK-19b.1-2・#80）のテスト。CPU・合成デ�
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from pathlib import Path
@@ -33,15 +34,24 @@ from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 from fandhe_edge_trainer.kinds.autoregressive import (
     MAX_PREDICTION_ID_BYTES,
+    VOCAB_SIZE,
     AutoregressiveKind,
     Mapped,
     Unmapped,
+    _default_predict_resource_budget,
     _encode_choices,
+    _max_safe_predict_chunk_size,
     build_prediction_record,
     map_scores_to_choice,
     predict_records,
     prediction_record_to_json_line,
     resolve_choice_id,
+)
+from fandhe_edge_trainer.limits import (
+    MAX_AR_EXPORT_ATTENTION_ELEMENTS,
+    MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS,
+    MAX_TRAIN_RSS_BYTES,
+    MAX_TRAIN_WALL_SECONDS,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -314,6 +324,25 @@ def test_req39_build_prediction_record_rejects_long_id_before_full_utf8_encode()
         build_prediction_record(record_id, mapping, label_order)
     assert exc_info.value.code == "invalid_request"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_req39_build_prediction_record_rejects_lone_surrogate_id() -> None:
+    """`id` に孤立サロゲート（有効な UTF-8 で表現できない `str`）が含まれる
+    場合、`UnicodeEncodeError` を送出せず `invalid_request`・exit 64 で
+    拒否されること（advisor レビュー指摘・PR #234 フォローアップ。
+    `_guarded_encode_bytes` の同種の穴〔孤立サロゲート〕が `record_id.
+    encode("utf-8")` にも残っていた）。エラーメッセージに `id` 自体を
+    含めない（security.md）。
+    """
+    label_order = ["cat_a", "cat_b"]
+    mapping = Mapped(choice_id="cat_a", index=0, probs=(0.9, 0.1))
+    lone_surrogate_id = "row-\ud800"
+
+    with pytest.raises(WorkerError) as exc_info:
+        build_prediction_record(lone_surrogate_id, mapping, label_order)
+    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    assert lone_surrogate_id not in exc_info.value.message
 
 
 # --- 結合テスト: predict_records（TINY_AR_CONFIG・CPU・合成データ） ---------
@@ -628,6 +657,169 @@ def test_req19b_predict_records_empty_input(tmp_path: Path) -> None:
     assert len(records) == 1
     assert records[0]["status"] == "ok"
     assert all(math.isfinite(v) for v in records[0]["scores"].values())
+
+
+# --- ユニットテスト: _guarded_encode_bytes（孤立サロゲート） -----------------
+
+
+def test_req39_predict_records_rejects_lone_surrogate_input(tmp_path: Path) -> None:
+    """孤立サロゲート（有効な UTF-8 で表現できない `str`）を含む入力が
+    `UnicodeEncodeError` を送出せず `invalid_request`・exit 64 で拒否される
+    こと（Codex レビュー指摘 P1・PR #234。`json.loads('"\\ud800"')` 等で
+    生成されうる、サロゲートペアでない単体のサロゲートを想定する）。エラー
+    メッセージに入力本文を含めない（security.md）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(kind, make_examples(), req)
+
+    lone_surrogate = "abc\ud800def"
+    rows = [("row-0", lone_surrogate)]
+
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained, rows))
+    assert exc_info.value.code == "invalid_request"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+    assert lone_surrogate not in exc_info.value.message
+
+
+# --- ユニットテスト: predict_records の既定資源予算の解決順 -----------------
+
+
+def test_req39_predict_records_reuses_trained_resource_budget_by_default(
+    tmp_path: Path,
+) -> None:
+    """`resource_budget` を省略した場合、`_default_predict_resource_budget`
+    ではなく `trained.resource_budget`（学習時に使ったのと同じインスタンス）
+    が使われること（advisor レビュー指摘・PR #234 フォローアップ。`device`
+    がそのジョブの実際のリクエスト値を反映したインスタンスを優先する）。
+    `trained.resource_budget` を期限切れにすると、`resource_budget` 未指定
+    でも `limit_exceeded` で打ち切られることで確認する。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+    # 生成直後に必ず期限切れになる予算（壁時計 -1 秒。0.0 だと
+    # `time.monotonic()` の分解能次第でまだ期限内と判定されうるため、
+    # 確実に過去になる負値を使う）へ差し替える。
+    expired = budget_mod.ResourceBudget(
+        wall_seconds=-1.0, rss_bytes=MAX_TRAIN_RSS_BYTES, device="cpu"
+    )
+    trained_with_expired_budget = dataclasses.replace(trained, resource_budget=expired)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained_with_expired_budget, rows, chunk_size=1))
+
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_req39_predict_records_falls_back_to_default_budget_without_trained_budget(
+    tmp_path: Path,
+) -> None:
+    """`resource_budget` 省略かつ `trained.resource_budget` も `None`
+    （`AutoregressiveTrainedModel` を学習の外で直接構築した場合）のときだけ
+    `_default_predict_resource_budget` が使われること（advisor レビュー
+    指摘・PR #234 フォローアップ）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+    trained_without_budget = dataclasses.replace(trained, resource_budget=None)
+
+    def _expired_default_budget() -> budget_mod.ResourceBudget:
+        return budget_mod.ResourceBudget(
+            wall_seconds=-1.0, rss_bytes=MAX_TRAIN_RSS_BYTES, device="cpu"
+        )
+
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ar_module, "_default_predict_resource_budget", _expired_default_budget)
+        rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+        with pytest.raises(WorkerError) as exc_info:
+            list(predict_records(trained_without_budget, rows, chunk_size=1))
+
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_req39_default_predict_resource_budget_uses_train_defaults() -> None:
+    """既定予算が学習側の既定値（`MAX_TRAIN_WALL_SECONDS`・
+    `MAX_TRAIN_RSS_BYTES`）・`device="cpu"` をそのまま使うこと（学習・予測で
+    別々の既定値を持たない設計の確認）。
+    """
+    budget = _default_predict_resource_budget()
+    assert budget.wall_seconds == float(MAX_TRAIN_WALL_SECONDS)
+    assert budget.rss_bytes == MAX_TRAIN_RSS_BYTES
+    assert budget.device == "cpu"
+
+
+# --- ユニットテスト: _max_safe_predict_chunk_size ----------------------------
+
+
+def test_req39_max_safe_predict_chunk_size_bounds_default_ar_config() -> None:
+    """既定の学習設定（`layers=2, heads=4, max_bytes=512`）・3 ラベル・
+    短い選択肢（`max_label_len=8`）で、既定の `batch_size=32` がそのままでは
+    `_score_choices_mlx` の見積もり上限を超えるが、`_max_safe_predict_
+    chunk_size` が返す上限まで `chunk_size` を落とせば超えないこと
+    （Cursor Bugbot 指摘・PR #234 への回帰テスト。具体値で確認する）。
+    """
+    heads, layers, k, m, max_bytes = 4, 2, 3, 9, 512
+    length = max_bytes + 1 + m
+
+    unsafe_n = 32
+    unsafe_attn_elements = unsafe_n * k * heads * layers * length * length
+    assert unsafe_attn_elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS
+
+    safe_n = _max_safe_predict_chunk_size(heads=heads, layers=layers, k=k, m=m, max_bytes=max_bytes)
+    assert 0 < safe_n < unsafe_n
+
+    safe_attn_elements = safe_n * k * heads * layers * length * length
+    safe_logprob_elements = safe_n * k * length * VOCAB_SIZE
+    assert safe_attn_elements <= MAX_AR_EXPORT_ATTENTION_ELEMENTS
+    assert safe_logprob_elements <= MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS
+
+
+def test_req39_max_safe_predict_chunk_size_floors_at_one() -> None:
+    """どれだけ厳しい上限でも 0 ではなく 1 を返すこと（`chunk_size=0` は
+    `range(0, n_rows, 0)` で `ValueError` になり、既存の
+    `chunk_size = max(1, ...)` クランプと矛盾するため）。
+    """
+    safe_n = _max_safe_predict_chunk_size(heads=64, layers=32, k=4096, m=1024, max_bytes=1024)
+    assert safe_n == 1
+
+
+def test_req39_predict_records_auto_shrinks_chunk_size_to_stay_within_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """既定の `chunk_size`（`trained.config["batch_size"]`）が
+    `_score_choices_mlx` の見積もり上限を超える設定でも、`predict_records`
+    が自動的にチャンクサイズを縮めて全件を正常に処理できること（Cursor
+    Bugbot 指摘・PR #234。上限自体は変更しない）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    # TINY_AR_CONFIG（heads=2, layers=1）・2 ラベル（"cat_a"/"cat_b"。
+    # max_label_len=5 → m=6）・小さい max_bytes での length は
+    # 8 + 1 + 6 = 15。上限を極小値へ差し替え、既定の batch_size（8）が
+    # そのままでは超過するが、自動的に縮めたチャンクサイズなら収まる
+    # ようにする。
+    monkeypatch.setattr(ar_module, "MAX_AR_EXPORT_ATTENTION_ELEMENTS", 2_000)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG, max_bytes=8)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+    records = list(predict_records(trained, rows))
+
+    assert len(records) == len(rows)
+    assert all(r["status"] == "ok" for r in records)
 
 
 # --- 回帰確認: 既存の学習・書き出しロジックへ影響しないこと -----------------

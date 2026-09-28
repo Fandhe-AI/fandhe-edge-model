@@ -149,6 +149,8 @@ from ..limits import (
     MAX_AR_WARMUP_STEPS,
     MAX_AR_WEIGHT_DECAY,
     MAX_TRAIN_LINE_BYTES,
+    MAX_TRAIN_RSS_BYTES,
+    MAX_TRAIN_WALL_SECONDS,
 )
 
 KIND = "autoregressive"
@@ -724,7 +726,19 @@ def build_prediction_record(
             f" ({id_char_len} chars, utf-8 encoding would be at least that many bytes)",
             ExitCode.INVALID_INPUT,
         )
-    id_len = len(record_id.encode("utf-8"))
+    try:
+        id_len = len(record_id.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        # `record_id` も呼び出し元（`predict_records`）が `rows` の `id` を
+        # そのまま渡すだけで、内容を検証しない値のため、孤立サロゲートを
+        # 含みうる（`_guarded_encode_bytes` と同種の問題。Codex レビュー
+        # 指摘 P1・PR #234 の横展開）。入力本文（`record_id` 自体）を
+        # メッセージへ含めずに拒否する（security.md）。
+        raise WorkerError(
+            "invalid_request",
+            "prediction id is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
     if id_len > MAX_PREDICTION_ID_BYTES:
         raise WorkerError(
             "invalid_request",
@@ -762,6 +776,18 @@ def _guarded_encode_bytes(text: str, max_bytes: int) -> list[int]:
     （O(1)。`encode` を伴わない）で足切りしてから `encode("utf-8")` を
     呼ぶことで、確保量を高々 `4 * MAX_TRAIN_LINE_BYTES`
     （UTF-8 の 1 コードポイントあたり最大 4 バイト）に抑える。
+
+    `str` は孤立サロゲート（U+D800-U+DFFF 単体。有効な UTF-8 では表現
+    できない）を保持できてしまう（例: JSON の `\\ud800` を経由した学習
+    データ・予測入力。`json` モジュールはサロゲートペアでない `\\uXXXX`
+    もそのまま `str` へデコードする）ため、`text.encode("utf-8")`
+    （この関数と `encoding.encode_bytes` の内部呼び出しの両方）は
+    `UnicodeEncodeError` を送出しうる。捕捉せずに送出すると `_worker` の
+    想定外例外として `runtime_error`（exit 70）扱いになり、7 種の終了
+    コード契約（REQ-21）上は機械可読ではあるものの「利用者の入力が悪い」
+    という区別が付かない。ここで捕捉し、入力本文を含めずに
+    `invalid_request`（exit 64）へ倒す（Codex レビュー指摘 P1・PR #234。
+    security.md「データ本文をエラーメッセージへ転記しない」）。
     """
     char_len = len(text)
     if char_len > MAX_TRAIN_LINE_BYTES:
@@ -771,14 +797,97 @@ def _guarded_encode_bytes(text: str, max_bytes: int) -> list[int]:
             " (utf-8 encoding would be at least that many bytes)",
             ExitCode.LIMIT_EXCEEDED,
         )
-    raw_len = len(text.encode("utf-8"))
+    try:
+        raw_len = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise WorkerError(
+            "invalid_request",
+            "prediction input is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
     if raw_len > MAX_TRAIN_LINE_BYTES:
         raise WorkerError(
             "limit_exceeded",
             f"prediction input {raw_len} bytes exceeds limit {MAX_TRAIN_LINE_BYTES} bytes",
             ExitCode.LIMIT_EXCEEDED,
         )
-    return encode_bytes(text, max_bytes)
+    try:
+        return encode_bytes(text, max_bytes)
+    except UnicodeEncodeError as exc:
+        raise WorkerError(
+            "invalid_request",
+            "prediction input is not valid utf-8 (e.g. contains an unpaired surrogate)",
+            ExitCode.INVALID_INPUT,
+        ) from exc
+
+
+def _default_predict_resource_budget() -> budget_mod.ResourceBudget:
+    """`predict_records` が `resource_budget` を省略され、かつ `trained.
+    resource_budget`（学習時に使ったインスタンス）も無い場合の、最後の
+    既定予算を作る（REQ-39。Codex レビュー指摘 P0・PR #234）。
+
+    `predict_records` はまず `trained.resource_budget`（`AutoregressiveKind.
+    train` が学習ループ全体で使い回したのと同じインスタンス。`device` は
+    そのジョブの実際のリクエスト値を反映する）を優先して使い、それも
+    `None`（`AutoregressiveTrainedModel` をテスト等で直接構築した場合）の
+    ときだけ本関数を呼ぶ（`predict_records` docstring 参照）。そのため
+    本関数が実際に使われるのは、学習の外で `AutoregressiveTrainedModel` を
+    独立に組み立てる経路（テスト等）に限られる。
+
+    `rows` は最大 `MAX_AR_PREDICT_ROWS`（数百万件のオーダー）まで受け付ける
+    ため、`_score_choices_mlx` 側の見積もりベースの検査（チャンク 1 つぶんの
+    確保量の上限）だけでは、チャンクを跨いだ全体の壁時計時間・実測 RSS を
+    制限できない。`resource_budget=None` のまま呼ぶと `_predict_records_
+    stream` の `resource_budget.check()` が実質無効化されていた（このヘルパー
+    導入前は `if resource_budget is not None` で丸ごとスキップしていた）ため、
+    未指定時でも必ず有効な予算で検査するよう、ここで既定値を生成する。
+
+    値は学習側が既に持つ既定（`contract.py::validate_request` がリクエストの
+    `time_limit_seconds`/`rss_limit_bytes` 省略時に使う `limits.py::
+    MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES`）をそのまま流用する
+    （学習・予測で別々の「1 ジョブあたりの資源上限」の既定値を持たないため）。
+    `device="cpu"` 固定（この経路に到達する時点でジョブの実際の `device` を
+    知る手掛かりが無いため、既定として CPU を仮定する。実運用の呼び出し元
+    〔`cli.py::run_worker_train` からの `predict_records` 呼び出しを想定〕は
+    常に `trained.resource_budget` を持つため、この固定値は実際には使われ
+    ない見込み）。
+    """
+    return budget_mod.ResourceBudget(
+        wall_seconds=float(MAX_TRAIN_WALL_SECONDS),
+        rss_bytes=MAX_TRAIN_RSS_BYTES,
+        device="cpu",
+    )
+
+
+def _max_safe_predict_chunk_size(*, heads: int, layers: int, k: int, m: int, max_bytes: int) -> int:
+    """`_score_choices_mlx` の 2 つの資源上限（REQ-39）を、チャンクの件数 N
+    側から逆算した安全な上限へ変換する（Cursor Bugbot 指摘・PR #234）。
+
+    既定のチャンクサイズ（`trained.config["batch_size"]`）は学習時のミニ
+    バッチサイズをそのまま流用しているが、学習ループは 1 系列＝1 選択肢
+    （`label`）しか同時に展開しないのに対し、予測は `K`（選択肢の総数）を
+    掛けた `N*K` 系列を 1 回の decoder 呼び出しへ展開する
+    （`_score_choices_mlx` docstring）。そのため既定の `batch_size`
+    （例: 32）・既定の `layers`（2）・`heads`（4）・`max_bytes`（512）の
+    ままラベル数が 3 以上あると、既定呼び出しだけで `_score_choices_mlx`
+    の見積もり検査（`MAX_AR_EXPORT_ATTENTION_ELEMENTS`・`MAX_AR_EXPORT_
+    CHOICE_LOGPROB_ELEMENTS`）を超過しうる。
+
+    ここでは `t`（チャンク内の実際の最大入力長）の最悪値として `max_bytes`
+    （`_export_ar_onnx` 冒頭の `Slice(ids, 0, max_bytes, axis=1)` と同じ、
+    学習時に固定した上限。モジュール docstring 6 番）を使い、実際のチャンクを
+    エンコードする前に安全な N の上限を求める。2 つの上限それぞれから
+    逆算した N の上限のうち小さい方を採る。**上限の値そのもの
+    （`MAX_AR_EXPORT_ATTENTION_ELEMENTS`・`MAX_AR_EXPORT_CHOICE_LOGPROB_
+    ELEMENTS`）は変更しない**（呼び出し元の要求どおり、資源上限自体は
+    緩めず、チャンクサイズ側を上限に収まるよう自動的に縮める）。
+    """
+    length = max_bytes + 1 + m
+    denom_attn = max(1, k * heads * layers * length * length)
+    denom_logprob = max(1, k * length * VOCAB_SIZE)
+    n_attn = MAX_AR_EXPORT_ATTENTION_ELEMENTS // denom_attn
+    n_logprob = MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS // denom_logprob
+    return max(1, min(n_attn, n_logprob))
 
 
 def predict_records(
@@ -816,16 +925,38 @@ def predict_records(
     可能な `Sequence` を渡す契約とする）。
 
     `chunk_size`（既定は `trained.config["batch_size"]`、上限は
-    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼ぶ。`resource_budget.
-    check()` は各チャンクにつき、(1) そのチャンクの `id_lists`（正規化後の
-    バイト列）を確保する「前」、(2) `_score_choices_mlx` が `[N*K, L]`・
-    attention `[N*K, heads, L, L]` を確保した直後・最初の `yield` を呼ぶ
-    「前」の 2 回呼ぶ（REQ-39）。計算後の検査を全件 `yield` した後まで
-    遅らせると、呼び出し元が途中で反復を止めた場合に検査自体が行われず、
-    継続する場合も上限超過後の結果が先に呼び出し元へ渡ってしまう
-    （Codex レビュー指摘 P1・PR #234）。`_score_choices_mlx` 自体も
-    確保前に `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で見積もりベースの拒否を
-    行うため、`resource_budget` は実測 RSS による最終防御として併用する。
+    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼ぶ。既定・明示指定の
+    いずれの `chunk_size` も、`_max_safe_predict_chunk_size` で選択肢数
+    `K`・`heads`・`layers`・`max_bytes` から逆算した安全な上限へさらに
+    クランプする（Cursor Bugbot 指摘・PR #234。既定 `batch_size` は学習時の
+    ミニバッチサイズをそのまま流用しているが、学習ループは `K` 倍の展開を
+    しないため、既定の学習設定〔`layers=2, heads=4, max_bytes=512`〕でも
+    ラベル数が 3 以上だと既定呼び出しが `_score_choices_mlx` の見積もり
+    検査で拒否されうる。`_max_safe_predict_chunk_size` docstring 参照）。
+    `resource_budget.check()` は各チャンクにつき、(1) そのチャンクの
+    `id_lists`（正規化後のバイト列）を確保する「前」、(2) `_score_choices_
+    mlx` が `[N*K, L]`・attention `[N*K, heads, L, L]` を確保した直後・
+    最初の `yield` を呼ぶ「前」の 2 回呼ぶ（REQ-39）。計算後の検査を全件
+    `yield` した後まで遅らせると、呼び出し元が途中で反復を止めた場合に
+    検査自体が行われず、継続する場合も上限超過後の結果が先に呼び出し元へ
+    渡ってしまう（Codex レビュー指摘 P1・PR #234）。`_score_choices_mlx`
+    自体も確保前に `MAX_AR_EXPORT_ATTENTION_ELEMENTS` で見積もりベースの
+    拒否を行うため、`resource_budget` は実測 RSS による最終防御として
+    併用する。
+
+    `resource_budget` を省略した場合（`None`）は、学習時に使ったのと同じ
+    `trained.resource_budget`（`device` がそのジョブの実際のリクエスト値を
+    反映する）を優先して使い、それも無ければ `_default_predict_resource_
+    budget`（device="cpu" 固定）が生成する既定予算を使う（REQ-39。Codex・
+    advisor レビュー指摘 P0・PR #234。`rows` は `MAX_AR_PREDICT_ROWS`
+    〔数百万件のオーダー〕まで受け付けるため、`_score_choices_mlx` の
+    チャンク単位の見積もり検査だけでは全処理の壁時計時間・実測 RSS を
+    制限できない。以前は `resource_budget=None` だと `_predict_records_
+    stream` の `check()` 呼び出し自体が丸ごとスキップされ、資源上限の検査が
+    事実上任意だった。`_default_predict_resource_budget` を device="cpu"
+    固定のまま無条件の既定にすると、`device="gpu"` のジョブで MLX active
+    memory 検査〔`ResourceBudget.check` の device="gpu" 分岐〕が働かなく
+    なるため、`trained.resource_budget` を優先する設計にした）。
 
     各行の生テキストは `encode_bytes` を呼ぶ前（NFKC 正規化・UTF-8 化の前）
     に `MAX_TRAIN_LINE_BYTES` でバイト数を検査する（`encode_bytes` は
@@ -843,6 +974,31 @@ def predict_records(
     chunk_size = max(1, min(int(chunk_size), MAX_AR_BATCH_SIZE))
 
     choice_id_list = [trained.choice_ids_by_label[label] for label in trained.label_order]
+
+    layers_n = len(trained.model.layers)
+    heads = trained.model.layers[0].heads if trained.model.layers else 0
+    k = len(choice_id_list)
+    safe_chunk_size = _max_safe_predict_chunk_size(
+        heads=heads, layers=layers_n, k=k, m=trained.max_label_len + 1, max_bytes=trained.max_bytes
+    )
+    chunk_size = min(chunk_size, safe_chunk_size)
+
+    if resource_budget is None:
+        # 学習時に使ったのと同じインスタンス（`device` が実際のリクエスト値
+        # 〔"cpu"/"gpu"〕を反映している）を優先する。`AutoregressiveKind.
+        # train` は必ず `resource_budget` を設定して `AutoregressiveTrained
+        # Model` を返すため、実運用の呼び出し元ではこちらが使われる。
+        # `trained.resource_budget` も無い場合（テスト等で `Autoregressive
+        # TrainedModel` を直接構築した場合）のみ `_default_predict_
+        # resource_budget`（device="cpu" 固定）へ倒す（advisor 指摘・PR #234
+        # フォローアップ。GPU ジョブで CPU 既定へ倒すと `ResourceBudget.
+        # check` の MLX active memory 検査〔device="gpu" 分岐〕が働かず、
+        # REQ-39 の資源検査が半分しか効かなくなるため）。
+        resource_budget = (
+            trained.resource_budget
+            if trained.resource_budget is not None
+            else _default_predict_resource_budget()
+        )
 
     # `rows` は型上は `Sequence`（呼び出し元が既に全件を保持している前提）
     # だが、ここで無制限にリスト化・レコード蓄積をしないよう、件数を
@@ -870,10 +1026,17 @@ def _predict_records_stream(
     rows: Sequence[tuple[str, str]],
     chunk_size: int,
     choice_id_list: list[list[int]],
-    resource_budget: budget_mod.ResourceBudget | None,
+    resource_budget: budget_mod.ResourceBudget,
 ) -> Iterator[dict[str, Any]]:
     """`predict_records` のチャンクごとの逐次出力本体（件数上限検査済みの
     `rows` を受け取る）。全件を `list` へ蓄積せず 1 件ずつ `yield` する。
+
+    `resource_budget` は `predict_records` が必ず有効なインスタンス
+    （呼び出し元の指定、または `_default_predict_resource_budget` の既定値）
+    へ解決してから渡す契約とする（REQ-39。以前は `None` を許容し、
+    `is not None` の条件分岐で検査自体を丸ごとスキップできたため、
+    呼び出し元が明示的な予算を渡さない限り予測時の資源検査が働かない
+    空隙があった。Codex レビュー指摘 P0・PR #234）。
 
     `resource_budget.check()` はチャンクごとに 2 回呼ぶ: (1) そのチャンクの
     `id_lists` を確保する「前」（チャンクのスライス・エンコードより前）、
@@ -884,13 +1047,11 @@ def _predict_records_stream(
     """
     n_rows = len(rows)
     for start in range(0, n_rows, chunk_size):
-        if resource_budget is not None:
-            resource_budget.check()
+        resource_budget.check()
         chunk = rows[start : start + chunk_size]
         id_lists = [_guarded_encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
         scores = _score_choices_mlx(trained.model, id_lists, choice_id_list)
-        if resource_budget is not None:
-            resource_budget.check()
+        resource_budget.check()
         for (row_id, _text), row in zip(chunk, scores, strict=True):
             mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
             yield build_prediction_record(row_id, mapping, trained.label_order)
