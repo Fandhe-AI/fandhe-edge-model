@@ -253,11 +253,17 @@ pub enum TrainResultError {
     /// 未対応の版・別種類を名乗る成果物を返しても成功扱いにしないための検査。
     /// `kind` ごとの許可版一覧は本 crate の対象外〔未確定。PR #220 参照〕
     /// のため、ここでは「依頼内容と一致するか」だけを検査する）。`config`
-    /// のみ部分一致（`request` が明示したキーの値一致。`kind` ごとの既定値
-    /// 補完で増えたキーは許容する。
-    /// [`crate::result::config_matches_explicit_keys`] 参照。codex 指摘
-    /// PR #220「既定値で補完された config を正常な学習結果として受理する」）。
+    /// は「defaults(kind) に `request.config` を上書きした実効 config」との
+    /// 完全一致で検査する（[`crate::kind_defaults::effective_config`] 参照。
+    /// codex 指摘 PR #220 P1「成果物の追加 config 値を検証せず成功扱いに
+    /// している」。旧・部分一致の `config_matches_explicit_keys` は撤去した）。
     ArtifactMismatch { field: &'static str },
+    /// `kind` が [`crate::kind_defaults`] の共有 fixture
+    /// （`fixtures/train_contract/kind_defaults.json`）に登録されていない
+    /// ため、実効 config を算出できない（REQ-19・REQ-21・REQ-39・P1。
+    /// fixture に無い種類の成果物は `config` を検証できないため成功扱いに
+    /// しない。fail-closed）。
+    UnsupportedKindForConfigDefaults,
 }
 
 impl std::fmt::Display for TrainResultError {
@@ -302,6 +308,9 @@ impl std::fmt::Display for TrainResultError {
                     f,
                     "train result artifact field does not match the request: {field}"
                 )
+            }
+            TrainResultError::UnsupportedKindForConfigDefaults => {
+                write!(f, "train result kind has no known config defaults")
             }
         }
     }

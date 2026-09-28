@@ -13,9 +13,12 @@
 //! `kind_version`・`label_order`・`max_bytes`・`candidate_label` が依頼内容と
 //! 一致することを検査する（ワーカーが依頼と異なる種類・未対応の版・root 外
 //! のパス・別種類を名乗る成果物を返しても成功扱いにしない）。`config` は
-//! 完全一致ではなく部分一致で検査する（[`config_matches_explicit_keys`]
-//! 参照。`kinds/c1.py`・`kinds/c3.py::train` が `kind` ごとの既定値で
-//! 補完した実効 config を返すため）。`root` の symlink 解決
+//! 「`kind` ごとの既定値（共有 fixture `fixtures/train_contract/
+//! kind_defaults.json`）に `request.config` を上書きした実効 config」との
+//! 完全一致で検査する（[`crate::kind_defaults::effective_config`] 参照。
+//! `kinds/c1.py`・`kinds/c3.py::train` の `{**DEFAULT_CONFIG,
+//! **request.config}` と同じ上書き規則）。fixture に登録の無い `kind` は
+//! 実効 config を算出できないため拒否する。`root` の symlink 解決
 //! （`std::fs::canonicalize`）を挟む点を除き照合は文字列レベルの検査に留まり、
 //! 実際の FS 上の閉じ込め（dir_fd 等の多層防御）は学習ワーカー自身
 //! （`guard.py::confine`）が担う（`crates/train/src/request.rs` のモジュール
@@ -478,22 +481,6 @@ fn expected_artifact_dir(request: &TrainRequest) -> String {
 /// 比較する。フォールバックは検証を緩めない: 実在する `root` の symlink を
 /// 解決できない場合に限られ、その場合でも実際のワーカー出力との不一致は
 /// 通常どおり `runtime_error` として拒否される）。
-/// `config` の部分一致検査（REQ-19・REQ-21・REQ-39・P1。codex 指摘 PR #220）。
-///
-/// `requested` に明示されたキーはすべて `actual` に同じ値で存在することを
-/// 要求する。`requested` に無いキーが `actual` にだけ存在すること（学習
-/// ワーカーの `kind` ごとの既定値補完）は許容する。既定値の集合そのものは
-/// 本 crate では検証しない（正本は学習ワーカー側。層の境界を保つため、
-/// `kind` ごとの既定値を Rust 側へ複製しない）。
-pub(crate) fn config_matches_explicit_keys(
-    requested: &serde_json::Map<String, serde_json::Value>,
-    actual: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    requested
-        .iter()
-        .all(|(key, value)| actual.get(key) == Some(value))
-}
-
 fn canonicalize_root_best_effort(root: &str) -> String {
     match std::fs::canonicalize(root) {
         Ok(resolved) => match resolved.into_os_string().into_string() {
@@ -514,8 +501,8 @@ impl TrainOutcome {
     /// 場合に限り、`artifact_dir` が `request` の `root`／`out_dir` 配下に
     /// 閉じ込められていること、`kind`・`kind_version`・`label_order`・
     /// `max_bytes`・`candidate_label` が `request` と一致すること、`config`
-    /// が `request` の明示キーと部分一致すること（[`config_matches_explicit_keys`]。
-    /// `kind` ごとの既定値補完で増えたキーは許容する）を検査する（REQ-39
+    /// が「`kind` ごとの既定値（[`crate::kind_defaults`]）に `request` の
+    /// `config` を上書きした実効 config」と完全一致することを検査する（REQ-39
     /// ガード層「経路の閉じ込め」「完全性と版」。ワーカーが依頼と異なる
     /// 種類・未対応の版・root 外のパス・別種類を名乗る成果物を返しても
     /// 成功扱いにしない）。いずれかを満たさない場合は `TrainResultError`
@@ -592,22 +579,29 @@ impl TrainOutcome {
                         field: "kind_version",
                     });
                 }
-                // `config` は部分一致で検査する（REQ-19・REQ-21・REQ-39・P1。
-                // codex 指摘 PR #220）: `kinds/c1.py`・`kinds/c3.py::train` は
+                // `config` は完全一致で検査する（REQ-19・REQ-21・REQ-39・P1。
+                // codex 指摘 PR #220「成果物の追加 config 値を検証せず成功
+                // 扱いにしている」）: `kinds/c1.py`・`kinds/c3.py::train` は
                 // `{**DEFAULT_CONFIG, **request.config}` で `kind` ごとの既定値を
                 // 補完した実効 config を `trained.config` として返し、
                 // `cli.py::run_worker_train` はその値を成果物へ記録する。
-                // そのため `config` を省略した・一部だけ指定したリクエストでは
-                // 成果物の `config` がリクエストと完全一致しない（既定値の
-                // 分だけキーが増える）のが正しい挙動であり、完全一致を要求
-                // すると正常な成功結果まで拒否してしまう。
-                // `kind` ごとの既定値は学習ワーカー側が正本（本 crate・
-                // `fandhe-edge-core` で二重管理しない。層の境界。
-                // `.claude/rules/dependency-policy.md`）ため、Rust 側では
-                // 「リクエストが明示したキーの値が成果物でも保たれていること」
-                // だけを検査する（部分一致）。リクエストが明示していない
-                // キーは、既定値補完によって成果物側に新規に現れてよい。
-                if !config_matches_explicit_keys(request.config(), &raw_artifact.config) {
+                // `kind` ごとの既定値そのものは学習ワーカー側が正本（層の境界。
+                // `.claude/rules/dependency-policy.md`）だが、その値を共有
+                // fixture（`fixtures/train_contract/kind_defaults.json`。
+                // `trainer/tests/test_kind_defaults_fixture.py` が Python 側の
+                // `DEFAULT_CONFIG` との一致を機械照合する）経由で取り込み、
+                // 「defaults(kind) に request.config を上書きした実効 config」
+                // を Rust 側でも独立に算出して完全一致を要求する。これにより
+                // 未知のキーの追加・既定値の書き換え・明示値の書き換えを
+                // すべて拒否できる（旧 `config_matches_explicit_keys` の
+                // 部分一致では、`request.config` が空の場合に成果物の
+                // `config` を無検査で受理してしまっていた）。
+                let Some(expected_config) =
+                    crate::kind_defaults::effective_config(request.kind(), request.config())
+                else {
+                    return Err(TrainResultError::UnsupportedKindForConfigDefaults);
+                };
+                if raw_artifact.config != expected_config {
                     return Err(TrainResultError::ArtifactMismatch { field: "config" });
                 }
                 if raw_artifact.max_bytes != request.max_bytes() {
@@ -741,7 +735,20 @@ mod tests {
         .expect("test request params must be valid")
     }
 
-    const VALID_OK_JSON: &str = r#"{"status":"ok","artifact_dir":"/fandhe-edge-fixture-root/out","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"}}"#;
+    // `config` は `test_request()` の `config`（空オブジェクト）に対応する
+    // 実効 config、すなわち `c3.DEFAULT_CONFIG` そのもの
+    // （`fixtures/train_contract/kind_defaults.json` の `c3` と同じ値。
+    // REQ-19・REQ-21・REQ-39・P1。codex 指摘 PR #220「成果物の追加 config
+    // 値を検証せず成功扱いにしている」対応で完全一致検査に変更したため、
+    // 空オブジェクトのままでは拒否されてしまう）。
+    const VALID_OK_JSON: &str = r#"{"status":"ok","artifact_dir":"/fandhe-edge-fixture-root/out","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"}}"#;
+
+    /// `VALID_OK_JSON` 内の `config` フィールド全体（キーと値）。他のテストが
+    /// `config` だけを差し替える際、旧・部分一致検査の時代に使っていた
+    /// `"config":{}"` という置換対象がもう存在しない（完全一致検査に伴い
+    /// `test_request()`〔空の `config`〕に対応する実効 config を書いたため）
+    /// ので、この定数を置換対象として使う。
+    const VALID_OK_CONFIG_FRAGMENT: &str = r#""config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3}"#;
 
     #[test]
     fn req21_parses_valid_ok_outcome() {
@@ -1005,7 +1012,14 @@ mod tests {
         requested.insert("epochs".to_string(), serde_json::json!(2));
         let request = test_request_with_config(requested);
 
-        let json = VALID_OK_JSON.replace(r#""config":{}"#, r#""config":{"epochs":99}"#);
+        // 明示値（`epochs`）の書き換えだけを検出することを確認するため、
+        // それ以外のキーは既定値のまま（`c3_effective_config_json` が
+        // `epochs` の値だけを 99 に差し替える）にする。
+        let config_json = c3_effective_config_json(&[("epochs", serde_json::json!(99))]);
+        let json = VALID_OK_JSON.replace(
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
+        );
         let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
         assert!(matches!(
             err,
@@ -1013,36 +1027,214 @@ mod tests {
         ));
     }
 
+    /// c3 の `DEFAULT_CONFIG`（`fixtures/train_contract/kind_defaults.json`・
+    /// `trainer/src/fandhe_edge_trainer/kinds/c3.py` と一致する具体値）を
+    /// JSON の `config` フラグメント文字列として返す。`overrides` の各キーで
+    /// 値を上書きする（`{**DEFAULT_CONFIG, **request.config}` を模す）。
+    fn c3_effective_config_json(overrides: &[(&str, serde_json::Value)]) -> String {
+        let mut config = serde_json::json!({
+            "lr": 0.001,
+            "weight_decay": 0.0001,
+            "epochs": 40,
+            "batch_size": 64,
+            "emb": 64,
+            "filters": 128,
+            "widths": [3, 5, 7],
+            "dropout": 0.3,
+        });
+        let obj = config.as_object_mut().expect("object");
+        for (key, value) in overrides {
+            obj.insert((*key).to_string(), value.clone());
+        }
+        serde_json::to_string(&config).expect("serialize config fragment")
+    }
+
     /// REQ-18・REQ-19・REQ-21・REQ-39・P1（codex 指摘 PR #220）: `config` を
     /// 省略した・一部だけ指定したリクエストでは、`kinds/c1.py`・
-    /// `kinds/c3.py::train` が `kind` ごとの既定値で補完した実効 config
-    /// （リクエストに無いキーを含む）を成果物へ記録する。この既定値補完済み
-    /// の `config` は、リクエストが明示したキーの値さえ保たれていれば
-    /// 成功扱いにする（部分一致。完全一致を要求すると正常な学習結果を
-    /// `runtime_error` として拒否してしまっていた）。
+    /// `kinds/c3.py::train` が `kind` ごとの既定値で補完した実効 config を
+    /// 成果物へ記録する。「defaults(kind) に request.config を上書きした
+    /// 実効 config」と完全一致する成果物は受理する。
     #[test]
     fn req39_accepts_artifact_config_with_kind_default_filled_keys() {
         let mut requested = serde_json::Map::new();
         requested.insert("epochs".to_string(), serde_json::json!(2));
         let request = test_request_with_config(requested);
 
-        // ワーカーが `{**DEFAULT_CONFIG, **request.config}` で補完した実効
-        // config を模した値（リクエストに無い `lr`・`batch_size` を含む）。
+        let config_json = c3_effective_config_json(&[("epochs", serde_json::json!(2))]);
         let json = VALID_OK_JSON.replace(
-            r#""config":{}"#,
-            r#""config":{"epochs":2,"lr":0.001,"batch_size":64}"#,
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
         );
         let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &request)
-            .expect("kind-default-filled config must be accepted when explicit keys match");
+            .expect("full effective config must be accepted");
         match outcome {
             TrainOutcome::Ok(success) => {
                 assert_eq!(
                     success.artifact().config().get("lr"),
                     Some(&serde_json::json!(0.001))
                 );
+                assert_eq!(
+                    success.artifact().config().get("epochs"),
+                    Some(&serde_json::json!(2))
+                );
             }
             TrainOutcome::Error(_) => panic!("expected Ok"),
         }
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1: `config` を省略したリクエスト（空
+    /// オブジェクト）でも、成果物の `config` が `kind` の既定値そのものと
+    /// 完全一致すれば受理する。
+    #[test]
+    fn req39_accepts_artifact_config_matching_defaults_when_request_omits_config() {
+        let request = test_request_with_config(serde_json::Map::new());
+        let config_json = c3_effective_config_json(&[]);
+        let json = VALID_OK_JSON.replace(
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
+        );
+        let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &request)
+            .expect("defaults-only config must be accepted when request omits config");
+        assert!(matches!(outcome, TrainOutcome::Ok(_)));
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1: `request.config` が全キーを明示指定した
+    /// （既定値と異なる値を含む）場合でも、成果物の `config` がその実効
+    /// config と完全一致すれば受理する（accept: 全指定）。
+    #[test]
+    fn req39_accepts_artifact_config_when_request_specifies_all_keys() {
+        let overrides: &[(&str, serde_json::Value)] = &[
+            ("lr", serde_json::json!(0.01)),
+            ("weight_decay", serde_json::json!(0.001)),
+            ("epochs", serde_json::json!(5)),
+            ("batch_size", serde_json::json!(32)),
+            ("emb", serde_json::json!(16)),
+            ("filters", serde_json::json!(32)),
+            ("widths", serde_json::json!([3, 5])),
+            ("dropout", serde_json::json!(0.1)),
+        ];
+        let mut requested = serde_json::Map::new();
+        for (key, value) in overrides {
+            requested.insert((*key).to_string(), value.clone());
+        }
+        let request = test_request_with_config(requested);
+
+        let config_json = c3_effective_config_json(overrides);
+        let json = VALID_OK_JSON.replace(
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
+        );
+        let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &request)
+            .expect("fully explicit config must be accepted when it matches the request");
+        match outcome {
+            TrainOutcome::Ok(success) => {
+                assert_eq!(
+                    success.artifact().config().get("epochs"),
+                    Some(&serde_json::json!(5))
+                );
+                assert_eq!(
+                    success.artifact().config().get("widths"),
+                    Some(&serde_json::json!([3, 5]))
+                );
+            }
+            TrainOutcome::Error(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1（codex 指摘 PR #220 P1「成果物の追加
+    /// config 値を検証せず成功扱いにしている」）: `request.config` が空でも、
+    /// 成果物の `config` が `kind` の既定値と異なれば拒否する（空リクエスト
+    /// に対して任意の `config` を成功扱いにしない）。
+    #[test]
+    fn req39_rejects_artifact_config_arbitrary_when_request_omits_config() {
+        let request = test_request_with_config(serde_json::Map::new());
+        let json = VALID_OK_JSON.replace(VALID_OK_CONFIG_FRAGMENT, r#""config":{"anything":1}"#);
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
+        assert!(matches!(
+            err,
+            TrainResultError::ArtifactMismatch { field: "config" }
+        ));
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1: 既定値・明示値をすべて満たしていても、
+    /// 未知のキーが 1 つ増えていれば拒否する。
+    #[test]
+    fn req39_rejects_artifact_config_with_unknown_extra_key() {
+        let mut requested = serde_json::Map::new();
+        requested.insert("epochs".to_string(), serde_json::json!(2));
+        let request = test_request_with_config(requested);
+
+        let config_json = c3_effective_config_json(&[
+            ("epochs", serde_json::json!(2)),
+            ("extra", serde_json::json!(1)),
+        ]);
+        let json = VALID_OK_JSON.replace(
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
+        );
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
+        assert!(matches!(
+            err,
+            TrainResultError::ArtifactMismatch { field: "config" }
+        ));
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1: リクエストが明示していないキー（既定値
+    /// 側）が書き換えられている場合も拒否する（旧・部分一致では検出できな
+    /// かった。codex 指摘の中心ケース）。
+    #[test]
+    fn req39_rejects_artifact_config_with_altered_default_value() {
+        let mut requested = serde_json::Map::new();
+        requested.insert("epochs".to_string(), serde_json::json!(2));
+        let request = test_request_with_config(requested);
+
+        // `lr` はリクエストが明示していない既定値キー。ここを書き換える。
+        let config_json = c3_effective_config_json(&[
+            ("epochs", serde_json::json!(2)),
+            ("lr", serde_json::json!(999.0)),
+        ]);
+        let json = VALID_OK_JSON.replace(
+            VALID_OK_CONFIG_FRAGMENT,
+            &format!(r#""config":{config_json}"#),
+        );
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
+        assert!(matches!(
+            err,
+            TrainResultError::ArtifactMismatch { field: "config" }
+        ));
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1: fixture に無い `kind` は実効 config を
+    /// 算出できないため、成功結果でも拒否する（`kind`・`candidate_label` は
+    /// リクエストと一致させ、`config` 検査だけに到達させる）。
+    #[test]
+    fn req39_rejects_success_outcome_with_kind_unknown_to_config_defaults_fixture() {
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "unknown-kind".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: "/fandhe-edge-fixture-root".to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: None,
+            rss_limit_bytes: None,
+        })
+        .expect("test request params must be valid");
+        let json = VALID_OK_JSON
+            .replace(r#""kind":"c3""#, r#""kind":"unknown-kind""#)
+            .replace(
+                r#""candidate_label":"c3""#,
+                r#""candidate_label":"unknown-kind""#,
+            );
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
+        assert!(matches!(
+            err,
+            TrainResultError::UnsupportedKindForConfigDefaults
+        ));
     }
 
     /// REQ-21・REQ-39・P1（codex 指摘 PR #220）: `candidate_label` が依頼した
@@ -1181,7 +1373,7 @@ mod tests {
     /// 満たさない出力を成功扱いにしない）。
     #[test]
     fn req39_rejects_success_outcome_missing_config() {
-        let json = VALID_OK_JSON.replace(r#""config":{},"#, "");
+        let json = VALID_OK_JSON.replace(&format!("{VALID_OK_CONFIG_FRAGMENT},"), "");
         let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
         assert!(matches!(err, TrainResultError::NotJson { .. }));
     }

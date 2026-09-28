@@ -218,16 +218,18 @@ def test_req21_build_artifact_matches_result_ok_fixture() -> None:
 
 
 def test_req19_result_ok_config_matches_c3_default_merged_with_request_full() -> None:
-    """REQ-19・REQ-21・REQ-39（codex 指摘 PR #220「既定値で補完された config
-    を正常な学習結果として受理する」）: `result_ok.json` の `artifact.config`
+    """REQ-19・REQ-21・REQ-39（codex 指摘 PR #220 P1「成果物の追加 config 値を
+    検証せず成功扱いにしている」）: `result_ok.json` の `artifact.config`
     は `kinds/c3.py::train` が実際に返す実効 config
     （`{**DEFAULT_CONFIG, **request.config}`）と一致すること。
 
-    Rust 側（`crates/train/src/result.rs::config_matches_explicit_keys`）は
-    `config` を部分一致（`request` が明示したキーのみ照合）で検査するが、
-    その部分一致検査が想定する「既定値補完済みの実際のワーカー出力」の形が
-    このテストで固定される（`result_ok.json` を手で書き換えても、
-    `kinds/c3.py::DEFAULT_CONFIG` と乖離すれば検出できる）。
+    Rust 側（`crates/train/src/result.rs`・`crates/train/src/
+    kind_defaults.rs::effective_config`）は `config` を「`kind_defaults.json`
+    （`DEFAULT_CONFIG` をそのまま書き出した共有 fixture）に `request.config`
+    を上書きした実効 config」との完全一致で検査するが、その検査が想定する
+    「既定値補完済みの実際のワーカー出力」の形がこのテストで固定される
+    （`result_ok.json` を手で書き換えても、`kinds/c3.py::DEFAULT_CONFIG` と
+    乖離すれば検出できる）。
     """
     expected_config = {**c3.DEFAULT_CONFIG, **_REQUEST_FULL["config"]}
     assert _RESULT_OK["artifact"]["config"] == expected_config

@@ -39,6 +39,7 @@
 //!   将来のガード層（TASK-39.x）が担う）
 
 pub mod error;
+mod kind_defaults;
 pub mod limits;
 pub mod request;
 pub mod result;

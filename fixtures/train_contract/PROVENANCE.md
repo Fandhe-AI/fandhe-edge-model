@@ -21,6 +21,22 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `trainer/src/fandhe_edge_trainer/limits.py` の対応定数・
   `contract.py::SCHEMA_VERSION`・`contract.py::_ALLOWED_DEVICES`・
   `supervisor.py::_MAX_WORKER_STDOUT_BYTES` の値を並べたもの。
+- `kind_defaults.json`: `kind` ごとの config 既定値（REQ-18・REQ-19・
+  REQ-19b・REQ-21・REQ-39。codex review PR #220 P1「成果物の追加 config 値を
+  検証せず成功扱いにしている」対応）。選択口（`trainer/src/
+  fandhe_edge_trainer/kinds/__init__.py::_registry`）に登録済みで
+  `DEFAULT_CONFIG` を持つ種類（`c1`・`c3`）をすべて含む。値は各
+  `kinds/<kind>.py::DEFAULT_CONFIG` をそのまま `json.dump` して生成した
+  （生成コマンドは下記）。`crates/train/src/kind_defaults.rs` が
+  `include_str!` でビルド時に埋め込み、
+  `TrainOutcome::from_worker_stdout`（`crates/train/src/result.rs`）が
+  「`kind_defaults.json` の既定値に `request.config` を上書きした実効
+  config」と成果物の `artifact.config` の完全一致を検査するために使う
+  （未知のキーの追加・既定値の書き換え・明示値の書き換えをすべて拒否する）。
+  `trainer/tests/test_kind_defaults_fixture.py` が Python 側の
+  `DEFAULT_CONFIG` との一致を機械照合し、`kind` を選択口へ追加して本 fixture
+  の更新を忘れると同テストが落ちる。生成コマンドは下記「生成コマンド」節の
+  `kind_defaults.json` の項を参照。
 - `definition.json`: `fandhe-edge-model-definition/v1` 形式のダミー定義
   （選択肢 3 件: `positive`・`negative`・`neutral`）。
   `label_order_from_definition`（Rust）と `options[].id` の宣言順（pytest）が
@@ -67,19 +83,42 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   **request.config}`。`request_full.json` の `epochs: 2` で上書きした
   `c3.DEFAULT_CONFIG`）を反映した（REQ-19・REQ-21・REQ-39・P1。codex 指摘
   PR #220「既定値で補完された config を正常な学習結果として受理する」）。
-  `TrainOutcome::from_worker_stdout` は `config` を完全一致ではなく部分
-  一致（`request` が明示したキーの値のみ照合し、既定値補完で増えたキーは
-  許容する）で検査するため、この fixture は「`request.config` の明示キー
-  である `epochs` の値は保たれているが、他のキーは既定値のまま増えている」
-  という実際のワーカー挙動を表す。既定値の正本は学習ワーカー側（`kinds/
-  c1.py`・`kinds/c3.py` の `DEFAULT_CONFIG`）であり、本 crate 側では
-  `kind` ごとの既定値の集合を複製・検証しない（層の境界。
-  `.claude/rules/dependency-policy.md`）。
+  `TrainOutcome::from_worker_stdout` は `config` を「`kind_defaults.json`
+  （既定値の正本である学習ワーカー側 `kinds/c1.py`・`kinds/c3.py` の
+  `DEFAULT_CONFIG` をそのまま書き出した共有 fixture）に `request.config` を
+  上書きした実効 config」との完全一致で検査する
+  （[`kind_defaults.json`](#ファイル一覧) 参照。codex review PR #220 P1
+  「成果物の追加 config 値を検証せず成功扱いにしている」対応。旧・部分一致
+  検査〔`request` の明示キーのみ照合〕は撤去した）ため、この fixture は
+  「`request.config` の明示キーである `epochs` の値は保たれているが、他の
+  キーは既定値のまま増えている」という実際のワーカー挙動を表す。既定値
+  そのものの正本は引き続き学習ワーカー側であり、本 crate 側では値を
+  再定義しない（層の境界。`.claude/rules/dependency-policy.md`）。
 - `result_error.json`: `cli.main(["train", "--request",
   "/tmp/does-not-exist-train-request.json"])` を実行して得た標準出力
   （終了コード 64）をそのまま採用した（生成コマンドは下記）。
 
 ## 生成コマンド（証拠種別: テストハーネス。本開発機で実行・確認済み）
+
+`kind_defaults.json`（`c1`・`c3` の `DEFAULT_CONFIG` をそのまま書き出す）:
+
+```console
+$ cd trainer && uv run --locked python3 -c "
+import sys, json
+sys.path.insert(0, 'src')
+from fandhe_edge_trainer.kinds import c1, c3
+out = {
+    '_meta': {
+        'description': 'Per-kind default config values (REQ-18/19/19b/21/39). ...'
+    },
+    'c1': c1.DEFAULT_CONFIG,
+    'c3': c3.DEFAULT_CONFIG,
+}
+with open('../fixtures/train_contract/kind_defaults.json', 'w') as f:
+    json.dump(out, f, indent=2)
+    f.write('\n')
+"
+```
 
 ```console
 $ cd trainer && python3 -c "

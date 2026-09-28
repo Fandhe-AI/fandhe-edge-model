@@ -332,3 +332,37 @@ fn req21_result_ok_and_error_round_trip_fixture() {
     let actual_error = serde_json::to_value(&error_outcome).expect("serialize outcome");
     assert_eq!(actual_error, expected_error);
 }
+
+/// REQ-18・REQ-19・REQ-21・REQ-39・P1（codex 指摘 PR #220「成果物の追加
+/// config 値を検証せず成功扱いにしている」）: `result_ok.json` の
+/// `artifact.config` は「`kind_defaults.json` の `c3` に `request_full.json`
+/// の `config`（`{"epochs":2}`）を上書きした実効 config」と完全一致する。
+/// `crates/train/src/kind_defaults.rs` が埋め込む fixture の内容が
+/// `result_ok.json`（実際のワーカー出力を書き起こした値）と食い違っていない
+/// ことを、`from_worker_stdout` 経由（上のテスト）とは独立に、fixture 同士の
+/// 突き合わせでも確認する。
+#[test]
+fn req19_result_ok_config_matches_kind_defaults_fixture_merged_with_request_full() {
+    let kind_defaults = load_fixture_value("kind_defaults.json");
+    let request_full = load_fixture_value("request_full.json");
+    let result_ok = load_fixture_value("result_ok.json");
+
+    let kind = request_full["kind"]
+        .as_str()
+        .expect("kind must be a string");
+    let mut expected_config = kind_defaults[kind]
+        .as_object()
+        .unwrap_or_else(|| panic!("kind_defaults.json must have defaults for kind {kind:?}"))
+        .clone();
+    let request_config = request_full["config"]
+        .as_object()
+        .expect("config must be an object");
+    for (key, value) in request_config {
+        expected_config.insert(key.clone(), value.clone());
+    }
+
+    assert_eq!(
+        result_ok["artifact"]["config"],
+        Value::Object(expected_config)
+    );
+}
