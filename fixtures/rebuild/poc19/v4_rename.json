@@ -4,7 +4,7 @@
   "version": 4,
   "judgment_type": "single_select",
   "options": [
-    { "id": "tier-xs__low", "display_name": "極小・低", "description": "最小規模・低優先度（表示名のみ変更）" },
+    { "id": "tier-xs__low", "display_name": "極小・低", "description": "最小規模・低優先度" },
     { "id": "tier-xs__high", "display_name": "XS high", "description": "最小規模・高優先度" },
     { "id": "tier-s__low", "display_name": "S low", "description": "小規模・低優先度" },
     { "id": "tier-s__high", "display_name": "S high", "description": "小規模・高優先度" },
