@@ -13,6 +13,10 @@
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）
 //! - [`mcnemar`][]: McNemar の正確検定（両側）の統計計算コア
 //!   （REQ-25 正常系・TASK-25.1-1・issue #64）
+//! - [`baseline`][]: 下限基準（majority）の予測生成（REQ-25・TASK-25.1-2・
+//!   issue #65）
+//! - [`significance`][]: 行ごとの正誤 → McNemar 検定 → α=0.05 での有意性
+//!   判定への接続（REQ-25・TASK-25.1-2・issue #65）
 //! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
 //!   issue #62。単一選択の 5 区分〔type_ok_meaning_ok / type_ok_meaning_ng /
 //!   type_ng_count / abstain / error〕のみ。multi-item は未対応）
@@ -38,8 +42,14 @@
 //!   未実装（core の multi-item 対応待ち。[`quadrant`] モジュールの
 //!   ドキュメントコメント参照）
 //! - McNemar 検定（REQ-25）: 統計計算コアは実装済み（TASK-25.1-1・issue #64）。
-//!   下限基準比較への接続・p<0.05 の判定は未実装（TASK-25.1-2・issue #65）。
-//!   件数不足による「判定不能」の判定は未実装（TASK-25.2）。
+//!   下限基準（majority）比較への接続・p<0.05 の判定は実装済み
+//!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
+//!   未実装。依存 `unicode-normalization` の承認と入力表現の整合の判断が要る）。
+//!   件数不足による「判定不能」（`BaselineVerdict::Undeterminable`）は
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
+//!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が
+//!   事前に算出した値を渡す必要がある（TASK-25.2）。
 //!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
@@ -74,9 +84,15 @@
 //!   （[`metrics::evaluate_single_select`] がラベル索引の構築前に
 //!   [`metrics::MAX_LABELS`] を検証し、超過時は確保せず
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
-//!   モジュールの「資源上限」節を参照）
+//!   モジュールの「資源上限」節を参照）。ただし [`significance::correctness`]・
+//!   [`significance::compare_with_baseline`] は外部入力由来の `records.len()`
+//!   を正誤 `Vec` の容量へ直接使うため、確保前に
+//!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
+//!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
+pub mod baseline;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;
+pub mod significance;
 pub mod wilson;
