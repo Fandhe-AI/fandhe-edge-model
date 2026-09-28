@@ -29,6 +29,7 @@
 //!   決めた値を渡す
 //! - JSON 入出力・ファイル I/O・CLI 統合は行わない
 
+use crate::mcnemar::mcnemar_exact_two_sided;
 use crate::significance::{MAX_EVAL_RECORDS, RequiredSampleSize};
 
 /// [`McNemarSampleSizeAssumption::new`]・[`required_sample_size_mcnemar`]が
@@ -46,6 +47,13 @@ pub enum SampleSizeError {
     },
     /// `alpha` が `(0, 1)` の範囲外。
     AlphaOutOfRange,
+    /// `alpha` は `(0, 1)` の範囲内だが、非正規数（subnormal）等の極小値で
+    /// `alpha / 2.0` が丸めで `0.0` になり、[`normal_quantile`] の定義域
+    /// （開区間 `(0, 1)`）を満たせない。構築時点でこの矛盾を検出し、
+    /// [`mcnemar_sample_size_estimate`] の呼び出し時になって初めて
+    /// `QuantileOutOfDomain` が返る（公開 API の入力契約と計算結果が
+    /// 食い違う）事態を防ぐ（P1・PR #230 レビュー指摘）。
+    AlphaTooSmallForQuantile,
     /// `power` が `(0, 1)` の範囲外。
     PowerOutOfRange,
     /// `p_c` が負。
@@ -88,6 +96,12 @@ impl std::fmt::Display for SampleSizeError {
             }
             SampleSizeError::AlphaOutOfRange => {
                 write!(f, "alpha must be in the open interval (0, 1)")
+            }
+            SampleSizeError::AlphaTooSmallForQuantile => {
+                write!(
+                    f,
+                    "alpha is too small: alpha / 2.0 underflows to 0.0, which is outside the domain of normal_quantile"
+                )
             }
             SampleSizeError::PowerOutOfRange => {
                 write!(f, "power must be in the open interval (0, 1)")
@@ -145,10 +159,13 @@ impl McNemarSampleSizeAssumption {
     ///
     /// 1. `p_b`・`p_c`・`alpha`・`power` すべてが有限（NaN・±∞ を拒否）
     /// 2. `0 < alpha < 1`・`0 < power < 1`
-    /// 3. `p_c >= 0`
-    /// 4. `p_b > p_c`（候補が下限基準を上回る方向の差 `d = p_b - p_c > 0` を
+    /// 3. `alpha / 2.0` が丸めで `0.0` にならない（非正規数等の極小 `alpha`
+    ///    は `(0, 1)` の範囲内でも [`normal_quantile`] の定義域を満たせず、
+    ///    構築後の計算が必ず失敗するため、構築時点で拒否する）
+    /// 4. `p_c >= 0`
+    /// 5. `p_b > p_c`（候補が下限基準を上回る方向の差 `d = p_b - p_c > 0` を
     ///    検出する前提。`d <= 0` では検出力の計算が意味を持たない）
-    /// 5. `p_b + p_c <= 1.0`（2 つの排反な正解率の和として妥当な範囲）
+    /// 6. `p_b + p_c <= 1.0`（2 つの排反な正解率の和として妥当な範囲）
     pub fn new(p_b: f64, p_c: f64, alpha: f64, power: f64) -> Result<Self, SampleSizeError> {
         if !p_b.is_finite() {
             return Err(SampleSizeError::NonFiniteInput { field: "p_b" });
@@ -164,6 +181,13 @@ impl McNemarSampleSizeAssumption {
         }
         if !(alpha > 0.0 && alpha < 1.0) {
             return Err(SampleSizeError::AlphaOutOfRange);
+        }
+        if alpha / 2.0 <= 0.0 {
+            // `alpha` は上の検査で `(0, 1)` の範囲内と確認済みだが、非正規数
+            // 等の極小値では `alpha / 2.0` が丸めで `0.0` になりうる。
+            // `normal_quantile` の定義域（開区間 `(0, 1)`）を満たせないため、
+            // 計算に進む前にここで拒否する。
+            return Err(SampleSizeError::AlphaTooSmallForQuantile);
         }
         if !(power > 0.0 && power < 1.0) {
             return Err(SampleSizeError::PowerOutOfRange);
@@ -397,18 +421,62 @@ pub fn mcnemar_sample_size_estimate(
     Ok(n)
 }
 
+/// 正確検定（両側）で理論上到達しうる最小件数（下限）を求める。
+///
+/// Connor (1987) の正規近似は、`p_b`・`p_c` の差が極端（例:
+/// `p_b=1.0, p_c=0.0`）な仮定では、正規近似だけで求めた `ceil(n)` 件を
+/// 評価しても正確検定（[`crate::mcnemar::mcnemar_exact_two_sided`]）が
+/// 決して有意にならない値を返すことがある（PR #230 レビュー指摘・P0）。
+/// 例えば `p_b=1.0, p_c=0.0, alpha=0.05, power=0.8` では正規近似が 4 を
+/// 返すが、`n_discordant=4` 件すべて候補のみ正解でも両側正確検定は
+/// `p=0.125 >= 0.05` で有意にならない（検出力 0）。
+///
+/// 本関数は、不一致ペアが `n` 件ともすべて候補のみ正解（`b=n, c=0`。
+/// 正確検定の両側 p 値が最小になる、最も有利な内訳）という理想的な場合に
+/// 限っても、正確検定が `p < alpha` に到達するために必要な最小の
+/// 不一致ペア数 `n` を、`n = 1, 2, ...` と順に
+/// [`crate::mcnemar::mcnemar_exact_two_sided`] を呼んで探索する
+/// （[`crate::significance::judge`] と同じ `p < alpha` の厳密な不等号を
+/// 使う）。この `n` は「この仮定のままではどれだけ都合よく内訳が偏っても
+/// 到達できない」ことを判定するための下限（真の必要件数はこれ以上）で
+/// あり、[`mcnemar_sample_size_estimate`] が仮定する検出力（power）を
+/// 満たす保証はしない（正確検定に基づく検出力の算出は本 issue の範囲外。
+/// モジュール冒頭の「対象外」節参照）。
+///
+/// 探索は `n = `[`MAX_EVAL_RECORDS`]` + 1` に達しても見つからない場合に
+/// 打ち切り、`None` を返す（この仮定の `alpha` では、どれだけ都合よく
+/// 内訳が偏っても `MAX_EVAL_RECORDS` 以下では正確検定が有意にならない）。
+/// `MAX_EVAL_RECORDS`（1,000,000）は
+/// [`crate::mcnemar::MAX_DISCORDANT_PAIRS`]（10,000,000）を下回るため、
+/// 探索中に `mcnemar_exact_two_sided` の資源上限エラーには到達しない。
+fn exact_test_minimum_n(alpha: f64) -> Result<Option<u64>, SampleSizeError> {
+    for n in 1..=(MAX_EVAL_RECORDS as u64 + 1) {
+        let exact = mcnemar_exact_two_sided(n, 0).map_err(|e| SampleSizeError::Internal {
+            detail: format!("mcnemar_exact_two_sided failed during floor search: {e}"),
+        })?;
+        // `crate::significance::judge` と同じ厳密な `p < alpha`（`b > c`
+        // は `b=n>0=c` で自明に満たす）。
+        if exact.p_two_sided().value() < alpha {
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
 /// [`McNemarSampleSizeAssumption`] から必要件数（[`RequiredSampleSize`]）を
 /// 算出する。
 ///
-/// [`mcnemar_sample_size_estimate`] の結果を `ceil` してから
-/// [`RequiredSampleSize`] へ変換する。丸めに許容差は加えない（PoC-10 と同じ
-/// 規則。許容差の導入は評価契約〔[`crate::significance`]〕の変更にあたるため
-/// 行わない）。`ceil` 自体は libm の `f64::ceil` に依存するが、PoC-10・
-/// PoC-24 の参照ケースはいずれも次の整数との距離が最小でも約 0.18 あり、
-/// OS ごとの丸めの入れ替わりは想定していない（`fixtures/sample_size/
-/// PROVENANCE.md` 参照）。
+/// [`mcnemar_sample_size_estimate`] の結果を `ceil` した値と、
+/// [`exact_test_minimum_n`] が返す正確検定の下限のうち大きいほうを採用する
+/// （後者は前者を上回ることがある。上記ドキュメント参照。PR #230 レビュー
+/// 指摘・P0）。丸めに許容差は加えない（PoC-10 と同じ規則。許容差の導入は
+/// 評価契約〔[`crate::significance`]〕の変更にあたるため行わない）。`ceil`
+/// 自体は libm の `f64::ceil` に依存するが、PoC-10・PoC-24 の参照ケースは
+/// いずれも次の整数との距離が最小でも約 0.18 あり、OS ごとの丸めの
+/// 入れ替わりは想定していない（`fixtures/sample_size/PROVENANCE.md`
+/// 参照）。
 ///
-/// `ceil` 後の値が [`MAX_EVAL_RECORDS`] を超える場合は
+/// 採用した値が [`MAX_EVAL_RECORDS`] を超える場合は
 /// [`SampleSizeError::ExceedsRecordLimit`] を返す（この仮定のままでは
 /// [`crate::significance::compare_with_baseline`] が確保前に拒否する件数を
 /// 超えており、判定不能から抜け出せないため）。`f64` から `u64` への変換は
@@ -442,9 +510,35 @@ pub fn required_sample_size_mcnemar(
     // 上で `1.0 <= ceil_n <= MAX_EVAL_RECORDS as f64`（`MAX_EVAL_RECORDS`
     // は 1_000_000 で `u64` の範囲に十分収まる）であることを検証済みのため、
     // `as u64` は情報を失わない。
-    let required_u64 = ceil_n as u64;
+    let ceil_n_u64 = ceil_n as u64;
+
+    let exact_floor = exact_test_minimum_n(assumption.alpha)?;
+    let required_u64 = match exact_floor {
+        // `MAX_EVAL_RECORDS` 件以下では、最も有利な内訳（不一致ペア全件が
+        // 候補のみ正解）でも正確検定が有意にならない（`alpha` が極小）。
+        // 正規近似の `ceil_n` が上限内でも、この仮定のままでは判定不能から
+        // 抜け出せないため fail-closed で拒否する。
+        None => {
+            return Err(SampleSizeError::ExceedsRecordLimit {
+                required: MAX_EVAL_RECORDS as u64 + 1,
+                limit: MAX_EVAL_RECORDS,
+            });
+        }
+        Some(floor) => floor.max(ceil_n_u64),
+    };
+
+    if required_u64 > MAX_EVAL_RECORDS as u64 {
+        // `exact_test_minimum_n` の探索上限はちょうど `MAX_EVAL_RECORDS + 1`
+        // のため、下限がその値そのものだった場合はここで拒否する
+        // （`floor <= MAX_EVAL_RECORDS` に厳密に収まる場合のみ受理する）。
+        return Err(SampleSizeError::ExceedsRecordLimit {
+            required: MAX_EVAL_RECORDS as u64 + 1,
+            limit: MAX_EVAL_RECORDS,
+        });
+    }
+
     RequiredSampleSize::new(required_u64).ok_or_else(|| SampleSizeError::Internal {
-        detail: "ceil(n) rounded to zero unexpectedly".to_string(),
+        detail: "required sample size rounded to zero unexpectedly".to_string(),
     })
 }
 
@@ -552,6 +646,35 @@ mod tests {
             McNemarSampleSizeAssumption::new(0.15, 0.05, 1.0, 0.8),
             Err(SampleSizeError::AlphaOutOfRange)
         );
+    }
+
+    /// `alpha` が `(0, 1)` の範囲内でも、非正規数（subnormal）等の極小値で
+    /// `alpha / 2.0` が丸めで `0.0` になる場合は `AlphaTooSmallForQuantile`
+    /// を返す（P1・PR #230 レビュー指摘。`f64::from_bits(1)` は最小の正の
+    /// 非正規数で、`/ 2.0` は `0.0` に丸まる）。
+    #[test]
+    fn assumption_rejects_alpha_too_small_for_quantile() {
+        let tiny_subnormal = f64::from_bits(1);
+        assert_eq!(
+            tiny_subnormal / 2.0,
+            0.0,
+            "前提: この値は / 2.0 で 0.0 に丸まる"
+        );
+        assert_eq!(
+            McNemarSampleSizeAssumption::new(0.15, 0.05, tiny_subnormal, 0.8),
+            Err(SampleSizeError::AlphaTooSmallForQuantile)
+        );
+    }
+
+    /// 境界の受理: `alpha = 1e-300`（既存テスト
+    /// `required_sample_size_rejects_when_alpha_is_tiny` が使う値）は
+    /// 正規数であり `alpha / 2.0` がアンダーフローしないため、構築時点では
+    /// 引き続き受理される。
+    #[test]
+    fn assumption_accepts_alpha_1e_minus_300() {
+        let alpha: f64 = 1e-300;
+        assert!(alpha / 2.0 > 0.0, "前提: 1e-300 は正規数");
+        assert!(McNemarSampleSizeAssumption::new(0.06, 0.05, alpha, 0.8).is_ok());
     }
 
     /// `power` が 0 または 1 は `PowerOutOfRange`。
@@ -676,5 +799,81 @@ mod tests {
                 limit: MAX_EVAL_RECORDS,
             }
         );
+    }
+
+    /// 正確検定の境界値: `n=5` 件すべて候補のみ正解でも
+    /// `p=2^-4=0.0625 >= 0.05` で有意にならない。
+    #[test]
+    fn exact_two_sided_all_favor_candidate_n5_not_significant_at_alpha_0_05() {
+        let exact = mcnemar_exact_two_sided(5, 0).unwrap();
+        assert!(approx_eq(exact.p_two_sided().value(), 0.0625, 1e-9));
+        assert!(exact.p_two_sided().value() >= 0.05);
+    }
+
+    /// 正確検定の境界値: `n=6` 件すべて候補のみ正解なら
+    /// `p=2^-5=0.03125 < 0.05` で有意になる。
+    #[test]
+    fn exact_two_sided_all_favor_candidate_n6_significant_at_alpha_0_05() {
+        let exact = mcnemar_exact_two_sided(6, 0).unwrap();
+        assert!(approx_eq(exact.p_two_sided().value(), 0.03125, 1e-9));
+        assert!(exact.p_two_sided().value() < 0.05);
+    }
+
+    /// PR #230 レビュー指摘（P0）の再現ケース: `p_b=1.0, p_c=0.0, alpha=0.05,
+    /// power=0.8` では、正規近似（Connor 式）だけだと `ceil(n)=4` を返すが、
+    /// 4 件すべて候補のみ正解でも正確検定は `p=0.125 >= 0.05` で有意に
+    /// ならない（検出力 0）。修正後は正確検定で到達可能な下限 6 を返す
+    /// （`exact_two_sided_all_favor_candidate_n6_significant_at_alpha_0_05`
+    /// で `n=6` が正確検定で有意になる最小値であることを確認済み）。
+    #[test]
+    fn required_sample_size_uses_exact_test_floor_when_normal_approximation_is_too_small() {
+        let a = McNemarSampleSizeAssumption::new(1.0, 0.0, 0.05, 0.8).unwrap();
+
+        // 正規近似だけの丸め前推定値は約 3.84（ceil で 4）で、正確検定の
+        // 下限 6 を下回ることを確認する（この乖離が P0 指摘の原因）。
+        let n_normal_approx = mcnemar_sample_size_estimate(&a).unwrap();
+        assert!(approx_eq(n_normal_approx, 3.841_458_820_694_124, 1e-9));
+        assert!(n_normal_approx.ceil() < 6.0);
+
+        let required = required_sample_size_mcnemar(&a).unwrap();
+        assert_eq!(
+            required.get(),
+            6,
+            "正規近似の ceil(n)=4 ではなく、正確検定で有意になれる最小件数 6 を返すこと"
+        );
+    }
+
+    /// 同じ再現ケースを Holm 補正後の厳しい α（0.0125）で確認する。
+    /// 正確検定の下限は `2^(1-n) < 0.0125` を満たす最小の `n=8`
+    /// （`n=7`: `p=2^-6=0.015625 >= 0.0125`。`n=8`: `p=2^-7=0.0078125 <
+    /// 0.0125`）。
+    #[test]
+    fn required_sample_size_uses_exact_test_floor_with_stricter_alpha() {
+        let exact_7 = mcnemar_exact_two_sided(7, 0).unwrap();
+        assert!(exact_7.p_two_sided().value() >= 0.0125);
+        let exact_8 = mcnemar_exact_two_sided(8, 0).unwrap();
+        assert!(exact_8.p_two_sided().value() < 0.0125);
+
+        let a = McNemarSampleSizeAssumption::new(1.0, 0.0, 0.0125, 0.8).unwrap();
+        let required = required_sample_size_mcnemar(&a).unwrap();
+        assert_eq!(required.get(), 8);
+    }
+
+    /// PoC-10・PoC-24 の 4 通りの仮定（差が緩やかで正規近似の `ceil(n)` が
+    /// もともと大きい）では、正確検定の下限がそれを上回らず、既存の参照値
+    /// （155・188・221・272）が変わらないことを固定する（回帰防止）。
+    #[test]
+    fn required_sample_size_poc_anchors_unaffected_by_exact_floor() {
+        let cases = [
+            (0.05, 155u64),
+            (0.025, 188u64),
+            (0.0125, 221u64),
+            (0.05 / 12.0, 272u64),
+        ];
+        for (alpha, expected) in cases {
+            let a = McNemarSampleSizeAssumption::new(0.15, 0.05, alpha, 0.8).unwrap();
+            let required = required_sample_size_mcnemar(&a).unwrap();
+            assert_eq!(required.get(), expected, "alpha={alpha}");
+        }
     }
 }
