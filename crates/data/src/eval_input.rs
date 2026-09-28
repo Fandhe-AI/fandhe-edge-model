@@ -839,7 +839,18 @@ fn scores_are_invalid(fields: &Map<String, Value>) -> bool {
 /// `1e-9`（`.claude/rules/evaluation-contract.md`「決定性」）とは別物である。
 /// 前者は pred のスコアという外部入力の妥当性検査、後者は本ツールが計算した
 /// 指標の再現性検証という別の目的に使う値のため、混同して緩めない。
-const SCORE_SUM_TOLERANCE: f64 = 1e-6;
+///
+/// `crates/core/src/judgment.rs` の同名定数と値が重複しているが、
+/// 本 crate は `fandhe-edge-core` に依存しない設計（`crates/data/src/lib.rs`
+/// 「層の境界」参照）であるため、値を 1 箇所の定数へ集約する代わりに共有
+/// fixture `fixtures/score_tolerance/score_sum_tolerance.json` を単一真実源
+/// とし、両 crate のテスト（本 crate の `tests/score_sum_tolerance_fixture.rs`・
+/// `fandhe-edge-core` の `tests/score_sum_tolerance_fixture.rs`）が同じ
+/// fixture を読み込んで自身の定数と照合する（`fixtures/exitcode/exit_codes.json`
+/// による終了コードの Rust／学習ワーカー間照合〔#179〕と同じパターン）。
+/// 片方だけを変更すると fixture との不一致でテストが失敗するため、値の
+/// 乖離は機械的に検出される（PR #202 レビュー指摘・P1 対応）。
+pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
 /// 同じ側（gold または pred）の中で `id` が重複していないか検査する（手順 4）。
 ///

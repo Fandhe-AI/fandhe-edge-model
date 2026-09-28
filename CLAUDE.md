@@ -36,7 +36,7 @@ fandhe-edge-model/
 │   ├── data/                       # `fandhe-edge-data`（lib。データ契約 - 検査・group 単位分割を実装済み。REQ-16/17/40。TASK-16.1-1・#38・TASK-17.1-1・#44）
 │   └── eval/                       # `fandhe-edge-eval`（lib。評価器 - 正解率・ラベル別指標・Macro-F1・混同行列を実装済み。REQ-24。TASK-24.1-1・#59）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）を実装済み（MLX 学習・ONNX 書き出し）。選定（TASK-18.x）・作り直し判定（TASK-20.x）・ジョブ管理（REQ-34）は未着手
-├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）・`exitcode/exit_codes.json`（終了コード 7 種の共有 fixture。Rust と学習ワーカーの一致照合。#179）
+├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）・`exitcode/exit_codes.json`（終了コード 7 種の共有 fixture。Rust と学習ワーカーの一致照合。#179）・`score_tolerance/score_sum_tolerance.json`（`SCORE_SUM_TOLERANCE` の共有 fixture。`crates/core`・`crates/data` が独立に持つ同名定数の一致照合。PR #202）
 ├── docs/
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・ci・python-ci・update-external（稼働）/ release（発火条件無効化中）

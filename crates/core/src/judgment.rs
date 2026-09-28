@@ -109,7 +109,21 @@ pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
 /// 外部入力の妥当性」とは目的が異なるため、混同して両者を同じ値に揃えな
 /// い（`eval_input.rs` の `SCORE_SUM_TOLERANCE` のドキュメントコメントと
 /// 同じ区別）。
-const SCORE_SUM_TOLERANCE: f64 = 1e-6;
+///
+/// `crates/data/src/eval_input.rs` の同名定数と値が重複しているが、
+/// `fandhe-edge-data` は `fandhe-edge-core` に依存しない設計
+/// （`crates/data/src/lib.rs`「層の境界」参照。issue #38 時点で共通コアの
+/// 定義ファイルスキーマが未実装だったための意図的な分離であり、本 PR の
+/// スコープで crate 間依存を新設しない）であるため、値を 1 箇所の定数へ
+/// 集約する代わりに共有 fixture
+/// `fixtures/score_tolerance/score_sum_tolerance.json` を単一真実源とし、
+/// 両 crate のテスト（本 crate の `tests/score_sum_tolerance_fixture.rs`・
+/// `fandhe-edge-data` の `tests/score_sum_tolerance_fixture.rs`）が同じ
+/// fixture を読み込んで自身の定数と照合する（`fixtures/exitcode/exit_codes.json`
+/// による終了コードの Rust／学習ワーカー間照合〔#179〕と同じパターン）。
+/// 片方だけを変更すると fixture との不一致でテストが失敗するため、値の
+/// 乖離は機械的に検出される（PR #202 レビュー指摘・P1 対応）。
+pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
 /// 判定結果の状態。現状は `Ok`（正常終了）のみを持つ（REQ-21 正常系）。
 ///
