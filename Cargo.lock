@@ -81,6 +81,9 @@ dependencies = [
 [[package]]
 name = "fandhe-edge-eval"
 version = "0.1.0"
+dependencies = [
+ "fandhe-edge-core",
+]
 
 [[package]]
 name = "hybrid-array"

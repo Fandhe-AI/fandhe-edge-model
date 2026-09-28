@@ -126,7 +126,7 @@ impl DefinitionHash {
     /// 小文字 16 進 64 桁の文字列表現。
     #[must_use]
     pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
+        crate::hash::lower_hex(&self.0)
     }
 }
 
@@ -283,17 +283,6 @@ pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// 32 バイトのダイジェストを小文字 16 進 64 桁へ整形する
-/// （[`DefinitionHash::to_hex`] と同じ変換規則を共有する内部 helper）。
-fn hex_encode(bytes: &[u8; 32]) -> String {
-    use fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 /// 任意の `Serialize` 値を [`canonical_json`] で正準化してから sha256 を計算し、
 /// 小文字 16 進 64 桁で返す（REQ-15・REQ-17・TASK-17.1-2）。
 ///
@@ -317,7 +306,7 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 pub fn canonical_sha256_hex<T: serde::Serialize>(value: &T) -> Result<String, CanonicalError> {
     let json = canonical_json(value)?;
     let digest = sha256_hex_bytes(json.as_bytes());
-    Ok(hex_encode(&digest))
+    Ok(crate::hash::lower_hex(&digest))
 }
 
 #[cfg(test)]
