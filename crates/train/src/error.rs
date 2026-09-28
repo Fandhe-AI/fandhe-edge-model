@@ -378,9 +378,24 @@ pub enum TrainProcessError {
     ///
     /// `descendants_confirmed_clean` の意味は [`TrainProcessError::Wait`] と
     /// 同じ（codex/review 指摘 P0。issue #178 PR #233 レビュー）。
+    ///
+    /// `child_reaped` は、締め切り超過を検出して `Child::kill()` を送った
+    /// 後、直接の子（supervisor）の終了を
+    /// [`crate::process::wait_after_kill`] で回収できたかを示す。`false` は
+    /// 回収自体（`KillWaitTimedOut`／`Wait`）が失敗したことを意味するが、
+    /// その場合でも本バリアント（`exit_code()` は常に `LimitExceeded`）を
+    /// 返す。回収の失敗を理由に `WallTimeout` の代わりに回収エラーを返すと、
+    /// 壁時計タイムアウトが `LimitExceeded`（20）ではなく `RuntimeError`
+    /// （70）に化けてしまい REQ-21 の終了コード契約に違反する（codex/review
+    /// 指摘 P1「wall timeout 超過後 wait_after_kill(...)? 失敗で WallTimeout
+    /// が KillWaitTimedOut／Wait に化ける」。issue #178 PR #233 レビュー。
+    /// Cursor Bugbot 指摘 Medium も同一事象）。`child_reaped: false` は
+    /// プロセスが OS 上にゾンビとして残り続ける可能性があることを呼び出し元
+    /// へ伝える診断情報として使う。
     WallTimeout {
         limit_ms: u64,
         descendants_confirmed_clean: bool,
+        child_reaped: bool,
     },
     /// `SIGKILL` 送出後の直接の子プロセスの終了待ちが
     /// [`crate::process::KILL_WAIT_TIMEOUT`] 以内に完了しなかった
@@ -459,10 +474,11 @@ impl std::fmt::Display for TrainProcessError {
             TrainProcessError::WallTimeout {
                 limit_ms,
                 descendants_confirmed_clean,
+                child_reaped,
             } => {
                 write!(
                     f,
-                    "worker process exceeded wall timeout of {limit_ms} ms (descendants_confirmed_clean={descendants_confirmed_clean})"
+                    "worker process exceeded wall timeout of {limit_ms} ms (descendants_confirmed_clean={descendants_confirmed_clean}, child_reaped={child_reaped})"
                 )
             }
             TrainProcessError::KillWaitTimedOut => {
