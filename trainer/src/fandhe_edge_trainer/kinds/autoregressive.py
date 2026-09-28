@@ -66,9 +66,18 @@ PoC-24（`docs/spec/03-poc/model-kind-selector/scripts/kinds/autoregressive_kind
    （`_check_ar_export_resources`・`limits.py::
    MAX_AR_EXPORT_ATTENTION_ELEMENTS` 参照）。`N`（バッチ件数）の上限と
    `ids` の値域（`[0, 256]` の範囲外は SEP/EOS ID との衝突や ONNX
-   `Gather` の範囲外参照になりうる）の検査は、ONNX グラフの中では
-   実施しない。推論ランタイム側のガード層（REQ-39。パス未確定）の
-   責務とする（`_export_ar_onnx` 内の該当コメント参照）。
+   `Gather` の範囲外参照になりうる）は、いずれも ONNX グラフの内側で
+   fail-closed に検査する（オーナー判断 2026-09-28・PR #222 レビュー
+   指摘。以前は推論ランタイム・ガード層〔REQ-39。パス未確定〕の責務と
+   していたが、ガード層が未実装のため空隙が残っていた）。`ids` は
+   範囲外の値を `Where` で「必ず範囲外になる値」へ書き換えてから
+   埋め込みの `Gather` に渡し、`N` は書き出し時に決まる `n_max`（モデル
+   構成ごとに算出。`limits.py::MAX_AR_INFER_BATCH_N` docstring 参照）を
+   超えると固定長テーブルの `Gather` が範囲外参照で失敗する
+   （`_export_ar_onnx` 内の該当コメント参照）。ただし、この失敗は
+   `runtime_error`（exit 70）にしかならず機械可読な `invalid_input` には
+   ならないため、推論ランタイム・ガード層（REQ-39）でも同じ条件を
+   事前に `invalid_input` として拒否すべき点は変わらない。
 
 opset 13 の制約（LayerNormalization は opset 17・Gelu は opset 20 から）により、
 LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention はいずれも
@@ -111,6 +120,7 @@ from ..limits import (
     MAX_AR_EXPORT_ATTENTION_ELEMENTS,
     MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS,
     MAX_AR_HEADS,
+    MAX_AR_INFER_BATCH_N,
     MAX_AR_LAYERS,
     MAX_AR_LR,
     MAX_AR_WARMUP_STEPS,
@@ -126,6 +136,14 @@ KIND_VERSION = 1
 #: クラス docstring 3 番参照）。
 PAD, SEP, EOS = 0, 257, 258
 VOCAB_SIZE = 259
+
+#: 推論入力 `ids`（外部入力。ONNX グラフの `ids` テンソル）として許可する
+#: 値の上限（`encoding.encode_bytes` が返す「バイト値+1」語彙 1..256 と
+#: PAD=0 を合わせた `[0, MAX_INPUT_ID]`）。SEP（257）・EOS（258）はグラフが
+#: 選択肢展開の際に内部で挿入する特殊トークンであり、外部入力として
+#: 渡されてよい値ではない（`_export_ar_onnx` の `ids` 値域ガード参照。
+#: REQ-39・PR #222 レビュー指摘）。
+MAX_INPUT_ID = SEP - 1
 
 #: 詰め物位置をマスクする際に加える負の大きな値（`kinds/c3.py::_MASK_NEG_VALUE`
 #: と同じ考え方）。MLX 側フォワード（`_build_additive_mask`）と ONNX 側グラフ
@@ -835,10 +853,11 @@ def _check_ar_export_resources(
     6 番参照。以前はここが「密な入力かつ PAD なし」に限った近似だったが、
     Slice の導入で PAD の有無に関わらず保証されるようになった）。
     `N`（バッチ件数）についてのみ、本ワーカーは実測値を観測できないため
-    `N=1` の最小ケースを検査する。`N` 分の上限は推論ランタイム・
-    ガード層（REQ-39。パス未確定）側の責務であり、`N × (この上限)` が
-    線形に増える計算式（`_ar_export_attention_elements`）を使って
-    実測の `N`・`T` を検査する必要がある。
+    `N=1` の最小ケースを検査する。`N > 1` 分の上限は、この関数が返す
+    N=1 相当の見積もり（`elements`）を使って `_ar_export_max_batch_n` が
+    算出する `n_max` を ONNX グラフ内の固定長テーブル `Gather` へ埋め込み、
+    グラフの内側で fail-closed に検査する（オーナー判断 2026-09-28・
+    PR #222 レビュー指摘。`_export_ar_onnx` 参照）。
     """
     elements = _ar_export_attention_elements(1, k_classes, t_bound, m, layers, heads)
     if elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
@@ -849,6 +868,35 @@ def _check_ar_export_resources(
             " (n x k_classes x heads x layers x (t_bound+1+m)^2, n=1)",
             ExitCode.LIMIT_EXCEEDED,
         )
+
+
+def _ar_export_max_batch_n(
+    per_n_attention_elements: int, per_n_choice_logprob_elements: int
+) -> int:
+    """このモデル構成での推論バッチ件数 `N` の上限（`n_max`）を返す
+    （REQ-39・オーナー判断 2026-09-28・PR #222 レビュー指摘）。
+
+    `_export_ar_onnx` が ONNX グラフ内へ埋め込む固定長テーブル
+    `Gather` の長さ（`n_max + 1`）を決めるために使う。次の 3 値の
+    最小値を取る:
+
+    1. `MAX_AR_INFER_BATCH_N`（モデル構成に依らない固定シーリング。
+       `limits.py` docstring 参照）
+    2. `MAX_AR_EXPORT_ATTENTION_ELEMENTS // per_n_attention_elements`
+       （attention テンソルが `N` に比例して膨らむことから逆算した上限）
+    3. `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS // per_n_choice_logprob_elements`
+       （選択肢対数確率テンソルが `N` に比例して膨らむことから逆算した上限）
+
+    呼び出し側（`_export_ar_onnx`）は `_check_ar_export_resources`・
+    `choice_logprob_elements` の検査で `per_n_attention_elements ≤
+    MAX_AR_EXPORT_ATTENTION_ELEMENTS`・`per_n_choice_logprob_elements ≤
+    MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` を既に確認済みのため、2・3 の
+    商はいずれも 1 以上になる（`max(..., 1)` は 0 除算・0 除算相当の
+    n_max=0 を避ける防御であり、通常経路では発動しない）。
+    """
+    n_from_attention = MAX_AR_EXPORT_ATTENTION_ELEMENTS // max(per_n_attention_elements, 1)
+    n_from_choice = MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS // max(per_n_choice_logprob_elements, 1)
+    return max(1, min(MAX_AR_INFER_BATCH_N, n_from_attention, n_from_choice))
 
 
 def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None:
@@ -883,8 +931,9 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # docstring 参照。セキュリティ監査 P0 指摘。PR #222）。K（選択肢数）・
     # M（選択肢の最大バイト長+1）は学習時に固定される値のため、ここで
     # 拒否すれば N=1 でも過大な書き出しを fail-closed にできる。バッチ件数
-    # N 分の上限は推論ランタイム・ガード層側の責務であり、本チェックでは
-    # 検査できない（後述の out-of-scope 記録参照）。
+    # N 分の上限は、この N=1 相当の値を `_ar_export_max_batch_n` へ渡して
+    # 算出する `n_max` を、後述の ONNX グラフ内固定長テーブル `Gather` で
+    # 検査する（オーナー判断 2026-09-28・PR #222 レビュー指摘）。
     choice_logprob_elements = k_classes * m * VOCAB_SIZE
     if choice_logprob_elements > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS:
         raise WorkerError(
@@ -904,10 +953,18 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # 検査すれば、書き出し可能な最大構成を確実に拒否できる
     # （`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring・
     # `_ar_export_attention_elements` docstring 参照。REQ-39・PR #222
-    # レビュー指摘）。バッチ件数 N（>1）分の上限のみ、本検査では検査できず
-    # 推論ランタイム・ガード層側の将来対応となる（同 docstring 参照）。
+    # レビュー指摘）。
     t_bound = trained.max_bytes
     _check_ar_export_resources(k_classes, t_bound, m, layers, heads)
+
+    # このモデル構成での推論バッチ件数 N の上限（`n_max`）を算出し、後述の
+    # ONNX グラフ内固定長テーブル `Gather`（`n_guard_table`）へ埋め込む
+    # 長さとして使う（`_ar_export_max_batch_n` docstring 参照。REQ-39・
+    # オーナー判断 2026-09-28・PR #222 レビュー指摘）。
+    per_n_attention_elements = _ar_export_attention_elements(
+        1, k_classes, t_bound, m, layers, heads
+    )
+    n_max = _ar_export_max_batch_n(per_n_attention_elements, choice_logprob_elements)
 
     params = trained.model.parameters()
     embed = np.array(params["embed"]["weight"], dtype=np.float32)  # [VOCAB, dims]
@@ -928,6 +985,16 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
         numpy_helper.from_array(np.array([[[SEP]]], dtype=np.int64), name="sep_block"),  # [1,1,1]
         numpy_helper.from_array(np.array(0, dtype=np.int64), name="zero_scalar"),  # 0-d
         numpy_helper.from_array(np.array(1, dtype=np.int64), name="one_scalar"),  # 0-d
+        # `ids` 値域ガード用（`MAX_INPUT_ID` docstring・下記コメント参照。
+        # REQ-39・オーナー判断 2026-09-28・PR #222 レビュー指摘）。
+        numpy_helper.from_array(
+            np.array(MAX_INPUT_ID + 1, dtype=np.int64), name="max_input_id_plus_1"
+        ),  # 0-d
+        # `N` 上限ガード用の固定長テーブル（`n_max + 1` 要素の 0 埋め。
+        # `_ar_export_max_batch_n` が算出した `n_max` をこのモデルの
+        # 書き出し時に固定する。REQ-39・オーナー判断 2026-09-28・
+        # PR #222 レビュー指摘）。
+        _i64(np.zeros(n_max + 1, dtype=np.int64), "n_guard_table"),
         _i64(np.array([0]), "idx0"),
         _i64(np.array([1]), "idx1"),
         _i64(np.array([2]), "idx2"),
@@ -958,25 +1025,80 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # truncate_long_ascii`）と一致させる。
     nodes.append(helper.make_node("Slice", ["ids", "idx0", "max_bytes_vec", "idx1"], ["ids_trunc"]))
 
+    # --- `ids` の値域ガード（REQ-39・オーナー判断 2026-09-28・PR #222
+    # レビュー指摘。Slice の直後・選択肢展開より前に適用する）。外部入力
+    # `ids` として許可するのは `encoding.encode_bytes` の語彙 `[0,
+    # MAX_INPUT_ID]`（PAD=0・バイト値+1=1..256）のみで、SEP（257）・
+    # EOS（258）はグラフが選択肢展開の際に内部で挿入する特殊トークンの
+    # ため、外部入力としては許可しない。範囲外（負数・SEP・EOS・
+    # `VOCAB_SIZE` 以上いずれも）の値は `Where` で「必ず範囲外になる値」
+    # （`vocab_depth`=VOCAB_SIZE=259。埋め込み表 `embed_table` の行数と
+    # 同じ値のため、`Gather(embed_table, ...)` は必ず範囲外参照で失敗
+    # する）へ書き換えてから `ids_exp3`（選択肢展開の起点）へ渡す。
+    #
+    # 切り詰め（Slice）の**後**に検査する理由: `max_bytes` を超えた
+    # 部分は Slice で捨てられ、以降のどの演算にも一切使われない
+    # （モジュール docstring 6 番参照）ため、切り詰め前に検査しても
+    # 意味のある追加の安全性は無く、切り詰め後の短い列だけを検査すれば
+    # グラフに実際に効く全ての値を確実に検査できる（計算量も T ではなく
+    # 切り詰め後の長さで済む）。
+    #
+    # 負のインデックスを `Where` の前に弾く理由: ONNX の `Gather` は
+    # `[-VOCAB_SIZE, -1]` の負インデックスを末尾から「黙って」wrap する
+    # （例: `-1` は EOS 行）ため、`Where` を経由せずに負値が直接
+    # `Gather` へ渡ると、別の正当な値として何のエラーも無く処理されて
+    # しまう（`tests/test_ar_ids_range.py::
+    # test_ar_ids_negative_one_silently_wraps_to_last_vocab_row` で実測
+    # 確認済み）。`Where` によるガードはこの wrap 経路を経由させず、
+    # 範囲外の値をすべて「確実に範囲外になる」正の値（VOCAB_SIZE）へ
+    # 統一することで、負値・特殊 ID・VOCAB_SIZE 以上のいずれも同じ
+    # fail-closed な `Gather` 失敗に帰着させる。
+    nodes.append(helper.make_node("GreaterOrEqual", ["ids_trunc", "zero_scalar"], ["id_ge_zero"]))
+    nodes.append(helper.make_node("Less", ["ids_trunc", "max_input_id_plus_1"], ["id_lt_sep"]))
+    nodes.append(helper.make_node("And", ["id_ge_zero", "id_lt_sep"], ["id_in_range"]))
+    nodes.append(
+        helper.make_node("Where", ["id_in_range", "ids_trunc", "vocab_depth"], ["ids_guarded"])
+    )
+
     # --- N・T の取得（動的軸。T は Slice 後の値） ---
     nodes.append(helper.make_node("Shape", ["ids_trunc"], ["shape_ids"]))
     nodes.append(helper.make_node("Gather", ["shape_ids", "idx0"], ["n_vec"], axis=0))
     nodes.append(helper.make_node("Gather", ["shape_ids", "idx1"], ["t_vec"], axis=0))
+
+    # --- `N`（バッチ件数）上限ガード（REQ-39・オーナー判断 2026-09-28・
+    # PR #222 レビュー指摘）。`n_guard_table`（長さ `n_max + 1`。
+    # `_ar_export_max_batch_n` がこのモデル構成から算出した値を書き出し
+    # 時に固定する）を実際の `N`（`n_vec`）で `Gather` する。`N` は
+    # `Shape` から得られる非負の次元値であり、`n_max` を超えると
+    # `Gather` が範囲外参照で失敗する（負のインデックス wrap の懸念は
+    # ここでは生じない。`N` が負になることは無いため）。ガード結果
+    # （常に 0）を `n_vec` へ加算して `n_vec_checked` を作り、以降の
+    # 形状計算をすべてこちら経由にすることで、グラフ最適化による
+    # デッドコード除去でガードが消えない（`n_vec_checked` は最終出力
+    # `probs` の形状計算へ直結する依存経路に乗る）。
+    nodes.append(helper.make_node("Gather", ["n_guard_table", "n_vec"], ["n_guard_zero"], axis=0))
+    nodes.append(helper.make_node("Add", ["n_vec", "n_guard_zero"], ["n_vec_checked"]))
 
     # --- 派生する形状ベクトル（いずれも 1 要素以上の 1 次元 int64 配列） ---
     nodes.append(helper.make_node("Add", ["t_vec", "m_vec"], ["t_plus_m_vec"]))  # T+M
     nodes.append(helper.make_node("Add", ["t_vec", "one_vec"], ["t_plus_1_vec"]))  # T+1
     nodes.append(helper.make_node("Add", ["t_plus_1_vec", "m_vec"], ["l_vec"]))  # L=T+1+M
     nodes.append(helper.make_node("Squeeze", ["l_vec", "idx0"], ["l_scalar"]))
-    nodes.append(helper.make_node("Concat", ["n_vec", "k_vec", "t_vec"], ["shape_nkt"], axis=0))
-    nodes.append(helper.make_node("Concat", ["n_vec", "k_vec", "m_vec"], ["shape_nkm"], axis=0))
-    nodes.append(helper.make_node("Concat", ["n_vec", "k_vec", "one_vec"], ["shape_nk1"], axis=0))
+    nodes.append(
+        helper.make_node("Concat", ["n_vec_checked", "k_vec", "t_vec"], ["shape_nkt"], axis=0)
+    )
+    nodes.append(
+        helper.make_node("Concat", ["n_vec_checked", "k_vec", "m_vec"], ["shape_nkm"], axis=0)
+    )
+    nodes.append(
+        helper.make_node("Concat", ["n_vec_checked", "k_vec", "one_vec"], ["shape_nk1"], axis=0)
+    )
     nodes.append(helper.make_node("Concat", ["negidx", "l_vec"], ["shape_flat_l"], axis=0))
     nodes.append(helper.make_node("Concat", ["negidx", "m_vec"], ["shape_flat_m"], axis=0))
-    nodes.append(helper.make_node("Concat", ["n_vec", "k_vec"], ["shape_nk"], axis=0))
+    nodes.append(helper.make_node("Concat", ["n_vec_checked", "k_vec"], ["shape_nk"], axis=0))
 
     # --- K 個の選択肢へ展開してから [N*K, L] へ reshape する（§2.3） ---
-    nodes.append(helper.make_node("Unsqueeze", ["ids_trunc", "idx1"], ["ids_exp3"]))  # [N,1,T]
+    nodes.append(helper.make_node("Unsqueeze", ["ids_guarded", "idx1"], ["ids_exp3"]))  # [N,1,T]
     nodes.append(helper.make_node("Expand", ["ids_exp3", "shape_nkt"], ["ids_exp"]))  # [N,K,T]
 
     nodes.append(helper.make_node("Unsqueeze", ["choice_tokens", "idx0"], ["choice_exp3"]))
@@ -1032,31 +1154,22 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     nodes.append(helper.make_node("Cast", ["pos_f_clamped"], ["pos_i64"], to=TensorProto.INT64))
 
     # --- 埋め込み ---
-    # `full_ids_2d` の値域は検査しない（REQ-39。PR #222 セキュリティ
-    # レビュー P0 指摘）。理由:
-    # 1. N（バッチ件数）×（1 件あたりの上限）は線形に増える
-    #    （`_ar_export_attention_elements` 参照）。この 1 件あたりの上限は
-    #    グラフ内の Slice（`ids_trunc`）で `T ≤ max_bytes` が保証されるため
-    #    書き出し時に固定できるが、N 倍された全体の上限は推論時にしか
-    #    決まらない。
-    # 2. ONNX には「入力を検査して拒否する」演算が無い。`ids` の値域
-    #    （本来は `encoding.encode_bytes` が返す `[0, 256]`）の外
-    #    （負数・`257`〔SEP〕・`258`〔EOS〕・`259` 以上）を機械可読な
-    #    入力エラー（`invalid_input`）として拒否するには、グラフの外
-    #    （推論入口）での検査が必要。ONNX 演算子仕様上、`Gather` の
-    #    負インデックスは `[-VOCAB_SIZE, -1]` の範囲で末尾から黙って
-    #    wrap し（例: `-1` は EOS 行）、SEP・EOS の ID 自体は語彙内の
-    #    正当な値のため、これらは「別の値として」何のエラーも無く
-    #    処理されてしまう（本記述は ONNX 演算子仕様に基づく。ONNX
-    #    Runtime を学習側へ追加できないため実機未検証。onnx.reference
-    #    では `-1`→EOS 行の wrap を実測確認済み。
-    #    `tests/test_ar_ids_range.py` 参照）。
-    # 3. 一方で `VOCAB_SIZE`（=259）以上・`-VOCAB_SIZE` 未満の値は
-    #    ONNX Runtime の `Gather` が範囲外としてエラーで失敗させる
-    #    （メモリ破壊にはならない。onnx.reference では `IndexError` に
-    #    なることを実測確認済み。`tests/test_ar_ids_range.py` 参照）。
-    # 以上より、N の上限と `ids` の値域検査は推論ランタイムのガード層
-    # （REQ-39。パス未確定）の責務とする。
+    # `full_ids_2d` に含まれる外部入力由来の値は、上流の `ids` 値域ガード
+    # （`ids_guarded` を参照するコメント参照）で既に `[0, MAX_INPUT_ID]`
+    # へ矯正済み（範囲外は `vocab_depth`=VOCAB_SIZE へ書き換え済みのため、
+    # この `Gather` が範囲外参照で fail-closed に失敗する）。`full_ids_2d`
+    # にはグラフが内部で挿入する SEP（257）・選択肢トークン（`choice_flat`
+    # 由来。学習時に固定された語彙内の正当な値）も混在するが、これらは
+    # 外部入力ではなく検査対象外でよい（REQ-39・オーナー判断
+    # 2026-09-28・PR #222 レビュー指摘。以前はここで値域検査を一切行わず
+    # 推論ランタイム・ガード層側の将来対応としていたが、グラフ内で
+    # fail-closed にする方針へ変更した）。
+    #
+    # ただし、この `Gather` の失敗は `runtime_error`（exit 70）にしか
+    # ならず、機械可読な `invalid_input` エラーにはならない。推論
+    # ランタイム・ガード層（REQ-39。パス未確定）側でも、`ids` の値域
+    # （`[0, MAX_INPUT_ID]` 外）と `N`（`n_max` 超過）を事前に
+    # `invalid_input` として拒否すべき点は変わらない。
     nodes.append(helper.make_node("Gather", ["embed_table", "full_ids_2d"], ["token_emb"], axis=0))
     nodes.append(helper.make_node("Gather", ["pos_table", "pos_i64"], ["pos_emb"], axis=0))
     nodes.append(helper.make_node("Add", ["token_emb", "pos_emb"], ["h0"]))
