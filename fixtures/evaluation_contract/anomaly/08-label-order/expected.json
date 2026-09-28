@@ -1,0 +1,7 @@
+{
+  "case": "08-label-order",
+  "description": "ラベル集合の順序の違い（定義ファイルと予測側でラベルの並びが違っても、指標が変わらない）",
+  "expected_action": "include",
+  "expected_exit_code": 0,
+  "note": "gold.jsonl・pred.jsonl は fixtures/known/single-select と同一データ。labels.json（A,B,C,D の順）と labels_reordered.json（D,C,B,A の順）のどちらを label_definition_file として渡しても、全指標（正解率・ラベル別指標・Macro-F1・混同行列・信頼区間等）が fixtures/known/single-select/expected.json と完全に一致することを確認する不変性テスト。警告は出さない。"
+}

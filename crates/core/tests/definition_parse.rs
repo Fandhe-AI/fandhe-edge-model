@@ -5,7 +5,9 @@
 //! 一気通貫で確認する。一時ファイルはリポジトリ外（`std::env::temp_dir()`）に
 //! 作成し、テスト終了時に削除する。
 
-use fandhe_edge_core::definition::{Definition, DefinitionError, MAX_DEFINITION_FILE_BYTES};
+use fandhe_edge_core::definition::{
+    Definition, DefinitionError, FieldPath, MAX_DEFINITION_FILE_BYTES,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -101,4 +103,61 @@ fn req39_load_rejects_fifo_without_blocking() {
         }
         other => panic!("NotRegularFile を期待したが {other:?} だった"),
     }
+}
+
+/// TASK-15.3-2: `Definition::load`（ファイル経由）でも `version` の欠落が
+/// 型付きエラー `MissingField { field: FieldPath::Version }` として返る
+/// ことを確認する（`parse` 単体のユニットテストとは別に、ファイル読み込み
+/// 経路まで通しで確認する結合テスト）。
+#[test]
+fn req15_load_rejects_definition_file_missing_required_field() {
+    let path = temp_file_path("load-missing-version");
+    // `version` を欠いた定義ファイル。
+    let json = r#"{
+        "schema": "fandhe-edge-model-definition/v1",
+        "name": "sample_topic",
+        "judgment_type": "single_select",
+        "options": [
+            { "id": "yes", "display_name": "Yes", "description": "肯定" }
+        ],
+        "io": { "input": "bytes" }
+    }"#;
+    std::fs::write(&path, json).expect("一時ファイルを書き込めるはず");
+
+    let result = Definition::load(&path);
+    std::fs::remove_file(&path).expect("一時ファイルを削除できるはず");
+
+    match result.expect_err("必須項目欠落は拒否されるはず") {
+        DefinitionError::MissingField { field } => {
+            assert_eq!(field, FieldPath::Version);
+            assert_eq!(field.to_string(), "version");
+        }
+        other => panic!("MissingField を期待したが {other:?} だった"),
+    }
+}
+
+/// TASK-15.4（REQ-15 異常系、PoC-9 追補 v1.1 A-6）: `Definition::load`
+/// （ファイル経由）でも `options` キーが同梱されない定義ファイルを読むと、
+/// 既定のラベル集合へ補完せず `MissingLabels`（`reason_code() ==
+/// "missing_labels"`）で拒否されることを確認する（ファイル読み込み経路まで
+/// 通しで確認する結合テスト）。
+#[test]
+fn req15_load_rejects_definition_file_missing_labels() {
+    let path = temp_file_path("load-missing-options");
+    // `options` を欠いた定義ファイル（ラベル定義が非同梱）。
+    let json = r#"{
+        "schema": "fandhe-edge-model-definition/v1",
+        "name": "sample_topic",
+        "version": 1,
+        "judgment_type": "single_select",
+        "io": { "input": "bytes" }
+    }"#;
+    std::fs::write(&path, json).expect("一時ファイルを書き込めるはず");
+
+    let result = Definition::load(&path);
+    std::fs::remove_file(&path).expect("一時ファイルを削除できるはず");
+
+    let err = result.expect_err("ラベル定義非同梱は拒否されるはず");
+    assert!(matches!(err, DefinitionError::MissingLabels));
+    assert_eq!(err.reason_code(), "missing_labels");
 }

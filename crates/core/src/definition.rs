@@ -12,10 +12,23 @@
 //!   `parse` 限定の未検証中間型（`RawDefinition`）を経由させることでガード層の
 //!   迂回を防ぎ、`load` では FIFO 等の特殊ファイルに対する `File::open` の無期限
 //!   停止を避ける（`NotRegularFile`。Linux・macOS では `O_NONBLOCK` で開く）
-//! - TASK-15.3-2: 上記以外の必須項目欠落・不整合の詳細検証、エラー型の拡張
-//! - TASK-15.4: ラベル定義非同梱の `missing_labels` 判定
-//! - TASK-15.5: 正準化ハッシュ（`options`・`judgment_type` を用いた作り直し要否判定。
-//!   `docs/spec/03-poc/model-lifecycle/scripts/catalog.py` の `canon_hash`/`need_rebuild` を踏襲）
+//! - TASK-15.3-2（本ファイル + `diagnose` サブモジュール）: `RawDefinition` への
+//!   型付きデシリアライズが `serde_json::Error::classify()` で `Data`（構文
+//!   エラーではない）に分類される失敗を、`diagnose` モジュールで
+//!   `serde_json::Value` として再走査し、必須項目欠落・型不整合・未知キー・
+//!   enum 外の値を型付きの `DefinitionError` バリアントで返す。`name` の
+//!   空文字列は `EmptyName` として拒否する
+//! - TASK-15.4（本ファイル + `diagnose` サブモジュール）: `options` キーが
+//!   同梱されていない定義入力を、既定のラベル集合へ補完せず
+//!   `DefinitionError::MissingLabels`（`reason_code() == "missing_labels"`）
+//!   で拒否する（REQ-15 異常系。根拠は PoC-9 追補 v1.1 A-6）
+//! - TASK-15.5（本ファイル + `canonical` モジュール）: 定義の同一性
+//!   （`DefinitionIdentity`。選択肢 ID の集合＋`judgment_type`）と、定義全体の
+//!   正準化ハッシュ（`DefinitionHash`）を提供する。正準化の規則・sha256 計算は
+//!   `canonical` モジュールに集約し（REQ-15「正準化の規則を1箇所に集約する」）、
+//!   本ファイルには薄いアクセサ（[`Definition::identity`]・
+//!   [`Definition::canonical_json`]・[`Definition::canonical_hash`]）のみを置く。
+//!   作り直し要否の判定そのもの（TASK-20.1〜20.3）は本 TASK の対象外
 //!
 //! # 出典
 //! フィールド構成は PoC-19（`03-poc/model-lifecycle/definitions/catalog_*.json`）の
@@ -26,6 +39,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+// `diagnose` は `Definition::parse` の失敗経路（`Category::Data`）でのみ
+// 呼ばれる内部専用モジュール（TASK-15.3-2）。`super::` 経由で `FieldPath` 等の
+// 補助型・`SCHEMA_ID`・`JudgmentType`/`InputRepresentation` を参照する。
+mod diagnose;
 
 /// 定義ファイルのスキーマ識別子（版が上がったら値も変える）。
 pub const SCHEMA_ID: &str = "fandhe-edge-model-definition/v1";
@@ -120,6 +138,124 @@ struct RawDefinition {
     io: IoSchema,
 }
 
+/// 定義ファイル内のフィールドの位置を表すパス（TASK-15.3-2）。
+///
+/// 自由文字列ではなく enum にすることで、壊れた・でっち上げのパスを
+/// 表現できない型にする（`.claude/rules/coding-rust.md`「公開 API・型設計」）。
+/// `Display` は `diagnose` の走査順（本ファイル冒頭の doc）に対応する
+/// `"$"`・`"schema"`・`"options[2]"`・`"options[2].id"`・`"io.input"` の
+/// ようなドット記法のパス文字列を返す。値そのものは保持しない
+/// （security.md「秘密情報の混入防止」: 利用者データをエラー文へ漏らさない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldPath {
+    /// JSON ドキュメントのルート。
+    Root,
+    Schema,
+    Name,
+    Version,
+    JudgmentType,
+    Options,
+    /// `options` 配列の `index` 番目の要素全体。
+    OptionEntry {
+        index: usize,
+    },
+    /// `options[index]` の中の特定フィールド。
+    OptionField {
+        index: usize,
+        field: ChoiceField,
+    },
+    Io,
+    /// `io.input`。
+    IoInput,
+}
+
+impl std::fmt::Display for FieldPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldPath::Root => write!(f, "$"),
+            FieldPath::Schema => write!(f, "schema"),
+            FieldPath::Name => write!(f, "name"),
+            FieldPath::Version => write!(f, "version"),
+            FieldPath::JudgmentType => write!(f, "judgment_type"),
+            FieldPath::Options => write!(f, "options"),
+            FieldPath::OptionEntry { index } => write!(f, "options[{index}]"),
+            FieldPath::OptionField { index, field } => write!(f, "options[{index}].{field}"),
+            FieldPath::Io => write!(f, "io"),
+            FieldPath::IoInput => write!(f, "io.input"),
+        }
+    }
+}
+
+/// `options` の要素が持つフィールドの種別（[`FieldPath::OptionField`] で使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChoiceField {
+    Id,
+    DisplayName,
+    Description,
+}
+
+impl std::fmt::Display for ChoiceField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChoiceField::Id => write!(f, "id"),
+            ChoiceField::DisplayName => write!(f, "display_name"),
+            ChoiceField::Description => write!(f, "description"),
+        }
+    }
+}
+
+/// [`DefinitionError::TypeMismatch`] が期待していた型（診断側の許可規則の
+/// 語彙。実測された型は [`JsonType`] で表す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExpectedType {
+    Object,
+    Array,
+    String,
+    /// `version` フィールドの許容範囲（0 以上 `u32::MAX` 以下の整数）。
+    UnsignedInt32,
+}
+
+impl std::fmt::Display for ExpectedType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpectedType::Object => write!(f, "object"),
+            ExpectedType::Array => write!(f, "array"),
+            ExpectedType::String => write!(f, "string"),
+            ExpectedType::UnsignedInt32 => write!(f, "unsigned integer (u32)"),
+        }
+    }
+}
+
+/// JSON の実行時の型（PR #191 の `null`/`bool`/`number`/`string`/`array`/
+/// `object` と同じ語彙。データ契約層〔`crates/data`〕には依存せず、
+/// 語彙だけを合わせる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JsonType {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+impl std::fmt::Display for JsonType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonType::Null => write!(f, "null"),
+            JsonType::Bool => write!(f, "bool"),
+            JsonType::Number => write!(f, "number"),
+            JsonType::String => write!(f, "string"),
+            JsonType::Array => write!(f, "array"),
+            JsonType::Object => write!(f, "object"),
+        }
+    }
+}
+
 /// 定義ファイルの読み込み・パース時のエラー。
 ///
 /// 本 TASK（TASK-15.3-1）は正常系のみを対象とするが、PR #187 のセキュリティ
@@ -127,8 +263,8 @@ struct RawDefinition {
 /// （`UnsupportedSchema`・選択肢の整合性）とサイズ上限（`TooLarge`。
 /// `Definition::parse` からも到達する。同レビュー指摘）を先行実装する。
 /// これ以外の必須項目欠落等の詳細な検証バリアントは TASK-15.3-2 が追加し、
-/// `missing_labels` 相当の判定は TASK-15.4 が追加する（`#[non_exhaustive]`）。
-#[derive(Debug)]
+/// `missing_labels` 相当の判定（`MissingLabels`）は TASK-15.4 が追加した
+/// （`#[non_exhaustive]`）。
 #[non_exhaustive]
 pub enum DefinitionError {
     Read {
@@ -145,28 +281,61 @@ pub enum DefinitionError {
         size: u64,
         limit: u64,
     },
-    Parse {
-        source: serde_json::Error,
-    },
+    /// JSON 構文エラー（`serde_json::Error::classify()` が `Syntax`/`Eof`/`Io`）、
+    /// または `diagnose`（TASK-15.3-2）が分類できなかったデータエラー
+    /// （例: 重複フィールド。`serde_json::Value` は重複キーを後勝ちで黙って
+    /// 受理するため `diagnose` の対象外とし、fail-closed でここに落とす。
+    /// `Definition::parse` の doc を参照）。
+    Parse { source: serde_json::Error },
     /// `schema` フィールドが `SCHEMA_ID` と一致しない（未対応の形式。
     /// security.md「ガード層: 完全性と版」）。
-    UnsupportedSchema {
-        schema: String,
-    },
+    UnsupportedSchema { schema: String },
     /// `options` が空で、固定選択肢からの判定が成立しない（REQ-15）。
     EmptyOptions,
     /// `options` 内に空文字列の `id` を持つ選択肢がある（ラベル照合が成立しない）。
     EmptyOptionId,
     /// `options` 内で `id` が重複している（ラベル照合が一意に定まらない）。
-    DuplicateOptionId {
-        id: String,
-    },
+    DuplicateOptionId { id: String },
     /// パス先が通常ファイルではない（FIFO・ソケット・キャラクタデバイス等）。
     /// これらを許すと `File::open`/`read_to_end` が書き手を待って無期限に
     /// 停止しうる（security.md「ガード層: 資源の上限」。PR #187 レビュー指摘）。
-    NotRegularFile {
-        path: PathBuf,
+    NotRegularFile { path: PathBuf },
+    /// 必須フィールドが欠落している（TASK-15.3-2）。`options` キー自体の
+    /// 欠落は TASK-15.4 で `MissingLabels` へ切り出したため、ここには含まれ
+    /// ない（`diagnose` モジュールの走査順を参照）。
+    MissingField { field: FieldPath },
+    /// 定義にラベル定義（`options`）が同梱されていない（TASK-15.4・REQ-15
+    /// 異常系。根拠は PoC-9 追補 v1.1 A-6）。既定のラベル集合へ補完する
+    /// フォールバックは行わず、fail-closed で停止する。`options` キーは
+    /// 存在するが値が不正（空配列・誤った型）な場合は区別して
+    /// `EmptyOptions`・`TypeMismatch` を返す（本バリアントには含めない）。
+    /// ペイロードを持たないため、`Display`/`Debug` は固定文のみで利用者
+    /// データを漏らさない（security.md「秘密情報の混入防止」）。
+    MissingLabels,
+    /// フィールドの型が期待と異なる（TASK-15.3-2）。値そのものは保持せず、
+    /// 期待した型と実測した型のみを保持する（security.md「秘密情報の混入
+    /// 防止」: 利用者データをエラー文へ漏らさない）。
+    TypeMismatch {
+        field: FieldPath,
+        expected: ExpectedType,
+        actual: JsonType,
     },
+    /// 定義ファイルのスキーマが許可しない未知のキーを含む（TASK-15.3-2）。
+    /// `name`（利用者が任意に指定できるキー名）は秘密情報やデータ本文を
+    /// 含みうるため `Display` にも `Debug`（`{:?}` によるログ出力を含む）
+    /// にも一切出さず、親フィールドのパスと `reason_code()`（`unknown_field`）
+    /// のみで表す（security.md「秘密情報の混入防止」。PR #197 レビュー指摘。
+    /// `DefinitionError` は `#[derive(Debug)]` を使わず本ファイル末尾で
+    /// `Debug` を手書き実装し、`name` を redacted 表示に固定している）。
+    /// `name` はプログラム的な照合（テスト・診断）のためにのみ保持する。
+    UnknownField { parent: FieldPath, name: String },
+    /// フィールドは正しい型だが、許可された値の集合に含まれない
+    /// （例: `judgment_type: "multi_select"`。TASK-15.3-2）。値そのものは
+    /// 保持せず、許可値の一覧は `Display` に固定文字列で出す。
+    UnsupportedValue { field: FieldPath },
+    /// `name`（カタログ上の識別子。PoC-19 の `catalog_id` 相当）が空文字列
+    /// （TASK-15.3-2）。空文字列は実質的な欠落として扱う（REQ-15）。
+    EmptyName,
 }
 
 impl std::fmt::Display for DefinitionError {
@@ -206,6 +375,99 @@ impl std::fmt::Display for DefinitionError {
             DefinitionError::NotRegularFile { path } => {
                 write!(f, "definition path {path:?} is not a regular file")
             }
+            DefinitionError::MissingField { field } => {
+                write!(f, "definition field {field} is missing")
+            }
+            DefinitionError::MissingLabels => write!(
+                f,
+                "definition has no label definition (options); a default label set is never substituted"
+            ),
+            DefinitionError::TypeMismatch {
+                field,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "definition field {field} has wrong type: expected {expected}, found {actual}"
+                )
+            }
+            DefinitionError::UnknownField { parent, .. } => {
+                write!(f, "definition field {parent} has an unknown key")
+            }
+            DefinitionError::UnsupportedValue { field } => {
+                write!(f, "definition field {field} has an unsupported value")
+            }
+            DefinitionError::EmptyName => {
+                write!(f, "definition name must not be empty")
+            }
+        }
+    }
+}
+
+/// `Debug`（`{:?}`）を手書きする。`#[derive(Debug)]` は `UnknownField.name`
+/// （利用者が任意に指定できる未知キー名。秘密情報やデータ本文を含みうる）を
+/// そのまま出力してしまい、`Display` 側でキー名を伏せていてもログ等で
+/// 露出しうる（security.md「秘密情報の混入防止」。PR #197 レビュー指摘）。
+/// 他のバリアントは `derive(Debug)` と同等の出力形式にし、`UnknownField` の
+/// `name` だけ固定の redacted 表示に置き換える。
+impl std::fmt::Debug for DefinitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefinitionError::Read { path, source } => f
+                .debug_struct("Read")
+                .field("path", path)
+                .field("source", source)
+                .finish(),
+            DefinitionError::TooLarge { path, size, limit } => f
+                .debug_struct("TooLarge")
+                .field("path", path)
+                .field("size", size)
+                .field("limit", limit)
+                .finish(),
+            DefinitionError::Parse { source } => {
+                f.debug_struct("Parse").field("source", source).finish()
+            }
+            DefinitionError::UnsupportedSchema { schema } => f
+                .debug_struct("UnsupportedSchema")
+                .field("schema", schema)
+                .finish(),
+            DefinitionError::EmptyOptions => f.write_str("EmptyOptions"),
+            DefinitionError::EmptyOptionId => f.write_str("EmptyOptionId"),
+            DefinitionError::DuplicateOptionId { id } => {
+                f.debug_struct("DuplicateOptionId").field("id", id).finish()
+            }
+            DefinitionError::NotRegularFile { path } => f
+                .debug_struct("NotRegularFile")
+                .field("path", path)
+                .finish(),
+            DefinitionError::MissingField { field } => f
+                .debug_struct("MissingField")
+                .field("field", field)
+                .finish(),
+            DefinitionError::MissingLabels => f.write_str("MissingLabels"),
+            DefinitionError::TypeMismatch {
+                field,
+                expected,
+                actual,
+            } => f
+                .debug_struct("TypeMismatch")
+                .field("field", field)
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            DefinitionError::UnknownField { parent, name: _ } => f
+                .debug_struct("UnknownField")
+                .field("parent", parent)
+                // `name` は秘密情報・データ本文を含みうるため常に redacted 表示に
+                // 固定する（実際の値は保持しているが Debug には出さない）。
+                .field("name", &"<redacted>")
+                .finish(),
+            DefinitionError::UnsupportedValue { field } => f
+                .debug_struct("UnsupportedValue")
+                .field("field", field)
+                .finish(),
+            DefinitionError::EmptyName => f.write_str("EmptyName"),
         }
     }
 }
@@ -221,6 +483,71 @@ impl std::error::Error for DefinitionError {
             DefinitionError::EmptyOptionId => None,
             DefinitionError::DuplicateOptionId { .. } => None,
             DefinitionError::NotRegularFile { .. } => None,
+            DefinitionError::MissingField { .. } => None,
+            DefinitionError::MissingLabels => None,
+            DefinitionError::TypeMismatch { .. } => None,
+            DefinitionError::UnknownField { .. } => None,
+            DefinitionError::UnsupportedValue { .. } => None,
+            DefinitionError::EmptyName => None,
+        }
+    }
+}
+
+impl DefinitionError {
+    /// 機械可読な snake_case のエラーコード（CLI・MCP の JSON 出力契約
+    /// （REQ-21・REQ-33）へ配線する際の接続点。本 TASK では配線しない）。
+    ///
+    /// `missing_field`/`type_mismatch` は PR #191（データ契約層）の語彙と
+    /// 揃える。`MissingLabels`（TASK-15.4）は `missing_labels` を返す。
+    /// ワイルドカードなしの網羅 `match` にすることで、バリアント追加時の
+    /// コード漏れをコンパイルエラーで検出する。
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            DefinitionError::Read { .. } => "read_error",
+            DefinitionError::TooLarge { .. } => "too_large",
+            DefinitionError::Parse { .. } => "parse_error",
+            DefinitionError::UnsupportedSchema { .. } => "unsupported_schema",
+            DefinitionError::EmptyOptions => "empty_options",
+            DefinitionError::EmptyOptionId => "empty_option_id",
+            DefinitionError::DuplicateOptionId { .. } => "duplicate_option_id",
+            DefinitionError::NotRegularFile { .. } => "not_regular_file",
+            DefinitionError::MissingField { .. } => "missing_field",
+            DefinitionError::MissingLabels => "missing_labels",
+            DefinitionError::TypeMismatch { .. } => "type_mismatch",
+            DefinitionError::UnknownField { .. } => "unknown_field",
+            DefinitionError::UnsupportedValue { .. } => "unsupported_value",
+            DefinitionError::EmptyName => "empty_name",
+        }
+    }
+
+    /// REQ-21 の 7 種の終了コードへの対応づけ（CLI への配線〔TASK-33.x〕は
+    /// 本 TASK の対象外。`crate::exitcode::ExitCode` を参照）。
+    ///
+    /// `TooLarge` のみ資源上限超過（`LimitExceeded`）とし、それ以外
+    /// （`Read`・`NotRegularFile` を含む）はすべて外部入力の不正
+    /// （`InvalidInput`）として扱う（PoC-16 でも読めない定義は
+    /// invalid_input だった）。非対応の `judgment_type` を `OutOfScope`
+    /// ではなく `InvalidInput` にする点は PoC-16 と異なる判断で、定義ファイル
+    /// 自体が不正である（判定対象の範囲外の入力とは別の事象である）ことを
+    /// 理由とする。
+    #[must_use]
+    pub const fn exit_code(&self) -> crate::exitcode::ExitCode {
+        match self {
+            DefinitionError::TooLarge { .. } => crate::exitcode::ExitCode::LimitExceeded,
+            DefinitionError::Read { .. }
+            | DefinitionError::Parse { .. }
+            | DefinitionError::UnsupportedSchema { .. }
+            | DefinitionError::EmptyOptions
+            | DefinitionError::EmptyOptionId
+            | DefinitionError::DuplicateOptionId { .. }
+            | DefinitionError::NotRegularFile { .. }
+            | DefinitionError::MissingField { .. }
+            | DefinitionError::MissingLabels
+            | DefinitionError::TypeMismatch { .. }
+            | DefinitionError::UnknownField { .. }
+            | DefinitionError::UnsupportedValue { .. }
+            | DefinitionError::EmptyName => crate::exitcode::ExitCode::InvalidInput,
         }
     }
 }
@@ -248,8 +575,25 @@ impl Definition {
         // ドキュメンテーションコメントを参照）。ここで未検証の中間型へ
         // デシリアライズしたうえで、以下の検証をすべて経てから初めて
         // `Definition` を構築する。
-        let raw: RawDefinition =
-            serde_json::from_str(text).map_err(|source| DefinitionError::Parse { source })?;
+        //
+        // 型付きデシリアライズが失敗した場合（TASK-15.3-2）、`classify()` が
+        // `Syntax`/`Eof`/`Io` なら構文エラーとしてそのまま `Parse` を返す。
+        // `Data`（必須項目欠落・型不整合等）の場合のみ `diagnose` で
+        // `serde_json::Value` として再走査し、最初に見つかった構造エラーを
+        // 型付きバリアントで返す。`diagnose` が何も分類できなかった場合
+        // （重複フィールド等、`Value` 側では検出できない不整合）は元の
+        // `Parse { source }` を返す（fail-closed。`diagnose.rs` の doc を参照）。
+        let raw: RawDefinition = match serde_json::from_str(text) {
+            Ok(raw) => raw,
+            Err(source) => {
+                if source.classify() == serde_json::error::Category::Data
+                    && let Some(diagnosed) = diagnose::diagnose(text)
+                {
+                    return Err(diagnosed);
+                }
+                return Err(DefinitionError::Parse { source });
+            }
+        };
 
         // 完全性と版（security.md「ガード層: 完全性と版」）: 異なるスキーマ形式の
         // 定義をそのまま正常な `Definition` として後続処理へ渡さない。`version`
@@ -258,6 +602,12 @@ impl Definition {
         // （PR #187 レビュー指摘。有効な定義の後続版を誤って拒否しないため）。
         if raw.schema != SCHEMA_ID {
             return Err(DefinitionError::UnsupportedSchema { schema: raw.schema });
+        }
+
+        // `name` はカタログ上の識別子（PoC-19 の `catalog_id` 相当）で、
+        // 空文字列は実質的な欠落として扱う（REQ-15。TASK-15.3-2）。
+        if raw.name.is_empty() {
+            return Err(DefinitionError::EmptyName);
         }
 
         // 選択肢の整合性: 固定選択肢からの選択・ラベル照合が成立する状態
@@ -416,6 +766,31 @@ impl Definition {
     /// 入出力のデータ構造。
     pub fn io(&self) -> &IoSchema {
         &self.io
+    }
+
+    /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
+    /// `version`・選択肢の宣言順は含めない。TASK-15.5・境界値。REQ-15）。
+    /// 失敗しない（既に検証済みのフィールドから組み立てるだけのため）。
+    #[must_use]
+    pub fn identity(&self) -> crate::canonical::DefinitionIdentity {
+        crate::canonical::DefinitionIdentity::from_definition(self)
+    }
+
+    /// 定義全体（表示名・説明を含む）を正準化した JSON 文字列。記録・デバッグ
+    /// 用（TASK-15.5）。正準化の規則は `canonical` モジュールに集約している。
+    pub fn canonical_json(&self) -> Result<String, crate::canonical::CanonicalError> {
+        crate::canonical::canonical_json(self)
+    }
+
+    /// 定義全体を正準化した JSON の sha256（TASK-15.5）。TASK-20.3（#93）の
+    /// 「新旧定義の正準化ハッシュが完全一致したら変更なし」判定に使う。
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<crate::canonical::DefinitionHash, crate::canonical::CanonicalError> {
+        let json = self.canonical_json()?;
+        Ok(crate::canonical::DefinitionHash::from_json_bytes(
+            json.as_bytes(),
+        ))
     }
 
     /// `load` の内部専用: Linux・macOS 以外（Windows 等）向けのフォールバック。
@@ -643,5 +1018,546 @@ mod tests {
         assert_eq!(def.options.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // TASK-15.3-2: 必須項目欠落・型不整合・未知キー・enum 外の値の検証。
+    // ------------------------------------------------------------------
+
+    /// 正常な定義（`TWO_OPTIONS_JSON` 相当）をトップレベルの `Value` として
+    /// 返す。各テストはこれを変形して欠落・型不整合を作る。
+    fn valid_definition_value() -> serde_json::Value {
+        serde_json::from_str(TWO_OPTIONS_JSON).expect("固定 fixture は valid JSON のはず")
+    }
+
+    fn parse_value(value: &serde_json::Value) -> Result<Definition, DefinitionError> {
+        Definition::parse(&value.to_string())
+    }
+
+    /// `options` の欠落は TASK-15.4 で `MissingLabels` に切り出したため、
+    /// このケース配列には含めない（`req15_missing_options_is_reported_as_missing_labels`
+    /// が専用に検証する）。
+    #[test]
+    fn req15_rejects_definition_missing_each_required_top_level_field() {
+        let cases: [(&str, FieldPath); 5] = [
+            ("schema", FieldPath::Schema),
+            ("name", FieldPath::Name),
+            ("version", FieldPath::Version),
+            ("judgment_type", FieldPath::JudgmentType),
+            ("io", FieldPath::Io),
+        ];
+        for (key, expected_field) in cases {
+            let mut value = valid_definition_value();
+            value
+                .as_object_mut()
+                .expect("object のはず")
+                .remove(key)
+                .expect("既存キーのはず");
+            let err = parse_value(&value).unwrap_err();
+            assert!(
+                matches!(&err, DefinitionError::MissingField { field } if *field == expected_field),
+                "key {key} を削除した場合に MissingField({expected_field}) を期待したが {err:?} だった"
+            );
+            assert_eq!(err.reason_code(), "missing_field");
+        }
+    }
+
+    #[test]
+    fn req15_rejects_option_entry_missing_each_required_field() {
+        let cases: [(&str, ChoiceField); 3] = [
+            ("id", ChoiceField::Id),
+            ("display_name", ChoiceField::DisplayName),
+            ("description", ChoiceField::Description),
+        ];
+        for (key, expected_field) in cases {
+            let mut value = valid_definition_value();
+            let options = value
+                .get_mut("options")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("options は配列のはず");
+            let second = options
+                .get_mut(1)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("options[1] は object のはず");
+            second.remove(key).expect("既存キーのはず");
+
+            let err = parse_value(&value).unwrap_err();
+            match err {
+                DefinitionError::MissingField {
+                    field: FieldPath::OptionField { index, field },
+                } => {
+                    assert_eq!(index, 1);
+                    assert_eq!(field, expected_field);
+                    assert_eq!(
+                        FieldPath::OptionField { index, field }.to_string(),
+                        format!("options[1].{key}")
+                    );
+                }
+                other => panic!("MissingField(OptionField) を期待したが {other:?} だった"),
+            }
+        }
+    }
+
+    #[test]
+    fn req15_rejects_io_missing_input() {
+        let mut value = valid_definition_value();
+        value["io"] = serde_json::json!({});
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::MissingField {
+                field: FieldPath::IoInput
+            }
+        ));
+        assert_eq!(FieldPath::IoInput.to_string(), "io.input");
+    }
+
+    /// TASK-15.4（REQ-15 異常系、PoC-9 追補 v1.1 A-6）: `options` キーが無い
+    /// 場合はフォールバック（既定のラベル集合への補完）にならず、
+    /// `MissingLabels`（`reason_code() == "missing_labels"`・
+    /// `exit_code() == InvalidInput`）で停止する。
+    #[test]
+    fn req15_missing_options_does_not_fall_back_to_default_labels() {
+        let mut value = valid_definition_value();
+        value
+            .as_object_mut()
+            .expect("object のはず")
+            .remove("options")
+            .expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+        assert_eq!(err.reason_code(), "missing_labels");
+        assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+    }
+
+    /// TASK-15.4（REQ-15 異常系、PoC-9 追補 v1.1 A-6）の A-6 ハーネスとして
+    /// 独立したテスト名を持たせる（上のテストと内容は重なるが、受け入れ
+    /// 基準への対応を名前で追跡できるようにする）。
+    #[test]
+    fn req15_missing_options_is_reported_as_missing_labels() {
+        let mut value = valid_definition_value();
+        value
+            .as_object_mut()
+            .expect("object のはず")
+            .remove("options")
+            .expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+        assert_eq!(err.reason_code(), "missing_labels");
+        assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+    }
+
+    /// TASK-15.4: `options` 欠落に加えて未知のトップレベルキーを含む場合も、
+    /// 走査順（`schema` → ... → `options` → 未知キー）により `MissingLabels`
+    /// が未知キー検出より先に返る。
+    #[test]
+    fn req15_missing_options_takes_priority_over_unknown_field() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.remove("options").expect("既存キーのはず");
+        object.insert(
+            "unexpected_key".to_string(),
+            serde_json::Value::String("x".to_string()),
+        );
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::MissingLabels));
+    }
+
+    /// TASK-15.4: `schema` 不一致と `options` 欠落が同時に起きた場合は、
+    /// 走査順が `schema` を先に検査するため `UnsupportedSchema` が優先される。
+    #[test]
+    fn req15_unsupported_schema_takes_priority_over_missing_options() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.insert(
+            "schema".to_string(),
+            serde_json::Value::String("unknown-schema/v9".to_string()),
+        );
+        object.remove("options").expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::UnsupportedSchema { schema } if schema == "unknown-schema/v9"
+        ));
+    }
+
+    /// TASK-15.4: `MissingLabels` の `Display`/`Debug` は固定文で、利用者
+    /// データ（定義内の識別文字列）を含まない（security.md「秘密情報の
+    /// 混入防止」）。
+    #[test]
+    fn req15_missing_labels_display_and_debug_are_fixed_and_leak_nothing() {
+        let mut value = valid_definition_value();
+        let object = value.as_object_mut().expect("object のはず");
+        object.insert(
+            "name".to_string(),
+            serde_json::Value::String("s3cr3t-topic-name-should-not-leak".to_string()),
+        );
+        object.remove("options").expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+
+        let display_output = err.to_string();
+        let debug_output = format!("{err:?}");
+        assert_eq!(
+            display_output,
+            "definition has no label definition (options); a default label set is never substituted"
+        );
+        assert_eq!(debug_output, "MissingLabels");
+        assert!(!display_output.contains("s3cr3t-topic-name-should-not-leak"));
+        assert!(!debug_output.contains("s3cr3t-topic-name-should-not-leak"));
+    }
+
+    #[test]
+    fn req15_rejects_version_with_wrong_type() {
+        let mut value = valid_definition_value();
+        value["version"] = serde_json::json!("1");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Version,
+                expected: ExpectedType::UnsignedInt32,
+                actual: JsonType::String,
+            }
+        ));
+        assert_eq!(err.reason_code(), "type_mismatch");
+    }
+
+    #[test]
+    fn req15_rejects_version_out_of_u32_range() {
+        for version in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4_294_967_296i64),
+        ] {
+            let mut value = valid_definition_value();
+            value["version"] = version.clone();
+            let err = parse_value(&value).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DefinitionError::TypeMismatch {
+                        field: FieldPath::Version,
+                        expected: ExpectedType::UnsignedInt32,
+                        actual: JsonType::Number,
+                    }
+                ),
+                "version={version} で TypeMismatch(Version, UnsignedInt32, Number) を期待した"
+            );
+        }
+    }
+
+    #[test]
+    fn req15_rejects_options_with_wrong_type() {
+        let mut value = valid_definition_value();
+        value["options"] = serde_json::json!({});
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Options,
+                expected: ExpectedType::Array,
+                actual: JsonType::Object,
+            }
+        ));
+    }
+
+    #[test]
+    fn req15_rejects_option_entry_with_wrong_type() {
+        let mut value = valid_definition_value();
+        value["options"] = serde_json::json!(["yes"]);
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::OptionEntry { index: 0 },
+                expected: ExpectedType::Object,
+                actual: JsonType::String,
+            }
+        ));
+    }
+
+    #[test]
+    fn req15_rejects_null_name() {
+        let mut value = valid_definition_value();
+        value["name"] = serde_json::Value::Null;
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Name,
+                expected: ExpectedType::String,
+                actual: JsonType::Null,
+            }
+        ));
+    }
+
+    #[test]
+    fn req15_rejects_non_object_root() {
+        let err = Definition::parse("[]").unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Root,
+                expected: ExpectedType::Object,
+                actual: JsonType::Array,
+            }
+        ));
+        assert_eq!(FieldPath::Root.to_string(), "$");
+    }
+
+    #[test]
+    fn req15_rejects_unsupported_judgment_type_value() {
+        let mut value = valid_definition_value();
+        value["judgment_type"] = serde_json::json!("multi_select");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::UnsupportedValue {
+                field: FieldPath::JudgmentType
+            }
+        ));
+        assert_eq!(err.reason_code(), "unsupported_value");
+    }
+
+    #[test]
+    fn req15_rejects_unsupported_io_input_value() {
+        let mut value = valid_definition_value();
+        value["io"]["input"] = serde_json::json!("text");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::UnsupportedValue {
+                field: FieldPath::IoInput
+            }
+        ));
+    }
+
+    #[test]
+    fn req15_rejects_unknown_top_level_field() {
+        let mut value = valid_definition_value();
+        value["extra"] = serde_json::json!(1);
+        let err = parse_value(&value).unwrap_err();
+        match err {
+            DefinitionError::UnknownField { parent, name } => {
+                assert_eq!(parent, FieldPath::Root);
+                assert_eq!(name, "extra");
+            }
+            other => panic!("UnknownField を期待したが {other:?} だった"),
+        }
+    }
+
+    #[test]
+    fn req15_rejects_unknown_option_field() {
+        let mut value = valid_definition_value();
+        value["options"][0]["color"] = serde_json::json!("red");
+        let err = parse_value(&value).unwrap_err();
+        match err {
+            DefinitionError::UnknownField { parent, name } => {
+                assert_eq!(parent, FieldPath::OptionEntry { index: 0 });
+                assert_eq!(name, "color");
+            }
+            other => panic!("UnknownField を期待したが {other:?} だった"),
+        }
+    }
+
+    /// 走査順（`diagnose::diagnose` 関数内のステップ 2〔schema〕を
+    /// ステップ 5〔io〕より先に評価する設計）: `schema` が別形式で `io` も
+    /// 欠落している場合、誤誘導の `MissingField(Io)` ではなく
+    /// `UnsupportedSchema` を返す。
+    #[test]
+    fn req15_prioritizes_unsupported_schema_over_missing_field() {
+        let mut value = valid_definition_value();
+        value["schema"] = serde_json::json!("other-schema/v1");
+        value
+            .as_object_mut()
+            .expect("object のはず")
+            .remove("io")
+            .expect("既存キーのはず");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::UnsupportedSchema { schema } if schema == "other-schema/v1"
+        ));
+    }
+
+    /// 回帰防止: `serde_json::Value` は重複キーを後勝ちで黙って受理するため
+    /// `diagnose` の対象にせず、型付きデシリアライズ側の `duplicate field`
+    /// 拒否をそのまま活かす（`Definition::parse` の doc・`diagnose.rs` の doc）。
+    #[test]
+    fn req15_rejects_duplicate_top_level_key_as_parse_error() {
+        let json = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "name": "sample_topic_2",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "Yes", "description": "肯定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let err = Definition::parse(json).unwrap_err();
+        assert!(matches!(err, DefinitionError::Parse { .. }));
+    }
+
+    #[test]
+    fn req15_rejects_empty_name() {
+        let mut value = valid_definition_value();
+        value["name"] = serde_json::json!("");
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::EmptyName));
+        assert_eq!(err.reason_code(), "empty_name");
+    }
+
+    /// security.md「秘密情報の混入防止」: `Display` は値を漏らさない。
+    #[test]
+    fn req15_display_does_not_leak_field_values() {
+        let mut value = valid_definition_value();
+        value["description_typo_marker"] = serde_json::json!("s3cr3t-value");
+        let err = parse_value(&value).unwrap_err();
+        assert!(!err.to_string().contains("s3cr3t-value"));
+
+        let mut type_mismatch_value = valid_definition_value();
+        type_mismatch_value["options"][0]["description"] = serde_json::json!(12345);
+        let err = parse_value(&type_mismatch_value).unwrap_err();
+        assert!(!err.to_string().contains("12345"));
+    }
+
+    /// PR #197 レビュー指摘（P0）: 未知キーの「名前」自体も利用者が任意に
+    /// 指定できる入力であり、秘密情報やデータ本文が入りうるため、
+    /// `Display` に一切出さない（security.md「秘密情報の混入防止」）。
+    #[test]
+    fn req15_display_does_not_leak_unknown_field_name() {
+        let mut value = valid_definition_value();
+        value["s3cr3t-api-key-should-not-leak"] = serde_json::json!(1);
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::UnknownField { .. }));
+        assert!(!err.to_string().contains("s3cr3t-api-key-should-not-leak"));
+        assert_eq!(err.reason_code(), "unknown_field");
+    }
+
+    /// PR #197 レビュー指摘（P0・codex/review 再指摘）: `Display` だけでなく
+    /// `{:?}`（`Debug`）でも未知キー名を出さないことを確認する。
+    /// `DefinitionError` は `#[derive(Debug)]` を使わず手書きの `Debug` 実装
+    /// （本ファイルの `impl std::fmt::Debug for DefinitionError`）を持つため、
+    /// ログ等が誤って `{:?}` でエラーを出力してもキー名は露出しない。
+    #[test]
+    fn req15_debug_does_not_leak_unknown_field_name() {
+        let mut value = valid_definition_value();
+        value["s3cr3t-api-key-should-not-leak"] = serde_json::json!(1);
+        let err = parse_value(&value).unwrap_err();
+        assert!(matches!(err, DefinitionError::UnknownField { .. }));
+        let debug_output = format!("{err:?}");
+        assert!(!debug_output.contains("s3cr3t-api-key-should-not-leak"));
+        assert!(debug_output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn req15_reason_code_and_exit_code_cover_all_variants() {
+        use crate::exitcode::ExitCode;
+
+        let cases: [(DefinitionError, &str, ExitCode); 14] = [
+            (
+                DefinitionError::Read {
+                    path: PathBuf::from("x"),
+                    source: std::io::Error::other("boom"),
+                },
+                "read_error",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::TooLarge {
+                    path: None,
+                    size: 2,
+                    limit: 1,
+                },
+                "too_large",
+                ExitCode::LimitExceeded,
+            ),
+            (
+                DefinitionError::UnsupportedSchema {
+                    schema: "x".to_string(),
+                },
+                "unsupported_schema",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::EmptyOptions,
+                "empty_options",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::EmptyOptionId,
+                "empty_option_id",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::DuplicateOptionId {
+                    id: "x".to_string(),
+                },
+                "duplicate_option_id",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::NotRegularFile {
+                    path: PathBuf::from("x"),
+                },
+                "not_regular_file",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::MissingField {
+                    field: FieldPath::Name,
+                },
+                "missing_field",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::MissingLabels,
+                "missing_labels",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::TypeMismatch {
+                    field: FieldPath::Name,
+                    expected: ExpectedType::String,
+                    actual: JsonType::Null,
+                },
+                "type_mismatch",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::UnknownField {
+                    parent: FieldPath::Root,
+                    name: "x".to_string(),
+                },
+                "unknown_field",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::UnsupportedValue {
+                    field: FieldPath::JudgmentType,
+                },
+                "unsupported_value",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::EmptyName,
+                "empty_name",
+                ExitCode::InvalidInput,
+            ),
+            (
+                DefinitionError::Parse {
+                    source: serde_json::from_str::<()>("{not json").unwrap_err(),
+                },
+                "parse_error",
+                ExitCode::InvalidInput,
+            ),
+        ];
+
+        for (err, expected_reason, expected_exit) in cases {
+            assert_eq!(err.reason_code(), expected_reason);
+            assert_eq!(err.exit_code(), expected_exit);
+        }
     }
 }

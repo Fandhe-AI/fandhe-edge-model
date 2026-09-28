@@ -21,10 +21,14 @@
 //!
 //! # 現状
 //!
-//! `definition` モジュールは TASK-15.3-1 で型定義・正常系パーサを実装済み。
-//! 必須項目検証・ハッシュは後続 TASK（TASK-15.3-2 以降）で追加する。
+//! `definition` モジュールは TASK-15.3-1 で型定義・正常系パーサ、
+//! TASK-15.3-2 で必須項目・型不整合の検証、TASK-15.4 でラベル定義
+//! （`options`）非同梱時に `missing_labels` で停止する異常系を実装済み。
+//! 定義の同一性判定・正準化ハッシュは TASK-15.5 で `canonical` モジュールに
+//! 実装済み。
 //! `exitcode` モジュールは TASK-21.1-1 で 7 種の終了コード enum と
 //! 機械可読 JSON エラー型を実装済み。
 
+pub mod canonical;
 pub mod definition;
 pub mod exitcode;
