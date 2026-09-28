@@ -25,6 +25,17 @@
 //! メッセージへ転記しないことを求める。そのため [`ContradictionReport`]・
 //! [`MetadataMixedReport`] は id・件数・group_id・理由の enum のみを持ち、
 //! 正規化前後の入力本文は含めない。
+//!
+//! # `Debug`／`Display` はレコード ID・group ID を出力しない
+//!
+//! [`ContradictionEntry`]・[`ContradictionReport`]・[`MetadataMixedReport`]
+//! の公開フィールドは呼び出し側が意図して参照する（`pub` のまま）が、
+//! `{:?}`（`Debug`）はレコード ID・group ID を手動実装で伏せ、件数のみ
+//! 出力する（[`crate::split_record::SplitDigest`] と同じ方針。
+//! Cursor Bugbot Medium 指摘: `ConsistencyError::DuplicateRecordId` の
+//! `Display`／`derive(Debug)` が生のレコード ID をそのまま出力していた）。
+//! [`ConsistencyError`] も `Display`・`Debug` の両方でレコード ID を出力
+//! しない（[`crate::split::SplitError::DuplicateRecordId`] と同じ方針）。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,7 +72,12 @@ pub trait MetadataRecord {
 /// `SplitError::DuplicateRecordId` と同じ方針）。将来 REQ-21 の終了コード
 /// （`invalid_input`=64）へ写像するのは CLI 側の責務であり、本層では
 /// `Result::Err` を返すところまでを担う。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`DuplicateRecordId` が保持する
+/// 実際のレコード ID を `{:?}` 経由で漏らさないため（security.md
+/// 「秘密情報の混入防止」。Cursor Bugbot Medium 指摘: `Display` に加えて
+/// `derive(Debug)` もレコード ID をそのまま出力していた）。
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConsistencyError {
     /// `index` 番目のレコードの id が空文字列だった。
@@ -70,14 +86,34 @@ pub enum ConsistencyError {
     DuplicateRecordId(String),
 }
 
+/// `Display` は英語の固定文言のみを返し、`DuplicateRecordId` が保持する
+/// 実際のレコード ID を出力しない（security.md「秘密情報の混入防止」。
+/// 学習データの内容を漏らさないため）。
 impl std::fmt::Display for ConsistencyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsistencyError::EmptyRecordId { index } => {
                 write!(f, "record id is empty (index={index})")
             }
-            ConsistencyError::DuplicateRecordId(id) => {
-                write!(f, "duplicate record id: {id}")
+            ConsistencyError::DuplicateRecordId(_) => {
+                write!(f, "duplicate record id in input records")
+            }
+        }
+    }
+}
+
+/// `Display` と同じく固定の文言のみを出力し、`DuplicateRecordId` が保持する
+/// 実際のレコード ID は出力しない（`derive(Debug)` の既定実装はタプル要素を
+/// そのまま出力してしまうため、ここで手動実装して塞ぐ。
+/// [`crate::split::SplitError`] の `Debug` 実装と同じ方針）。
+impl std::fmt::Debug for ConsistencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsistencyError::EmptyRecordId { index } => {
+                write!(f, "EmptyRecordId {{ index: {index} }}")
+            }
+            ConsistencyError::DuplicateRecordId(_) => {
+                write!(f, "DuplicateRecordId(<redacted>)")
             }
         }
     }
@@ -102,7 +138,12 @@ fn validate_ids<'a, I: Iterator<Item = &'a str>>(ids: I) -> Result<(), Consisten
 }
 
 /// 矛盾検出（1 正規化入力に対する）1 件のエントリ。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`ids`・`group_ids` は
+/// レコード ID・group ID そのものであり、`derive(Debug)` のまま `{:?}` で
+/// 出力するとログへ漏れる（security.md「秘密情報の混入防止」。
+/// [`crate::split_record::SplitDigest`] と同じ方針）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct ContradictionEntry {
     /// 矛盾に属するレコード ID（昇順）。
     pub ids: Vec<String>,
@@ -112,8 +153,26 @@ pub struct ContradictionEntry {
     pub group_ids: BTreeSet<String>,
 }
 
+impl std::fmt::Debug for ContradictionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContradictionEntry")
+            .field("ids", &format_args!("<redacted {} ids>", self.ids.len()))
+            .field("distinct_gold_count", &self.distinct_gold_count)
+            .field(
+                "group_ids",
+                &format_args!("<redacted {} group_ids>", self.group_ids.len()),
+            )
+            .finish()
+    }
+}
+
 /// [`find_contradictions`] の結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`group_ids` は group ID
+/// そのもの、`entries`（[`ContradictionEntry`]）は手動実装した `Debug` で
+/// 既にレコード ID・group ID を伏せているため、本型を `{:?}` で出力しても
+/// 値は漏れない（security.md「秘密情報の混入防止」）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct ContradictionReport {
     /// 正規化に使った規則の ID（[`crate::normalize::InputNormalizer::rule_id`]）。
     pub normalizer_rule_id: &'static str,
@@ -127,6 +186,22 @@ pub struct ContradictionReport {
     pub rows_without_group_id: usize,
     /// 矛盾エントリ（各エントリの最小 id の昇順）。
     pub entries: Vec<ContradictionEntry>,
+}
+
+impl std::fmt::Debug for ContradictionReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContradictionReport")
+            .field("normalizer_rule_id", &self.normalizer_rule_id)
+            .field("distinct_inputs", &self.distinct_inputs)
+            .field("rows", &self.rows)
+            .field(
+                "group_ids",
+                &format_args!("<redacted {} group_ids>", self.group_ids.len()),
+            )
+            .field("rows_without_group_id", &self.rows_without_group_id)
+            .field("entries", &self.entries)
+            .finish()
+    }
 }
 
 /// 正規化した入力が同じなのに正解が異なるレコードを検出する（REQ-16）。
@@ -231,12 +306,29 @@ pub enum MetadataMixReason {
 }
 
 /// [`find_metadata_mixed`] の結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`hits` のキーはレコード ID
+/// そのものであり、`derive(Debug)` のまま `{:?}` で出力するとログへ漏れる
+/// （security.md「秘密情報の混入防止」。[`crate::split_record::SplitDigest`]
+/// と同じ方針）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetadataMixedReport {
     /// メタデータ混入が検出されたレコード数。
     pub count: usize,
     /// レコード ID -> 検出された理由の集合（複数の理由が同時に付きうる）。
     pub hits: BTreeMap<String, BTreeSet<MetadataMixReason>>,
+}
+
+impl std::fmt::Debug for MetadataMixedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataMixedReport")
+            .field("count", &self.count)
+            .field(
+                "hits",
+                &format_args!("<redacted {} record ids>", self.hits.len()),
+            )
+            .finish()
+    }
 }
 
 /// 直列化表現として判定対象にするかどうか（空・`"{}"`・`"null"` を除外する）。
@@ -456,6 +548,32 @@ mod tests {
         assert_eq!(err, ConsistencyError::DuplicateRecordId("dup".to_string()));
     }
 
+    /// 秘密情報風のレコード ID が `Display`・`Debug` のいずれにも
+    /// 出現しないことを確認する（security.md「秘密情報の混入防止」。
+    /// Cursor Bugbot Medium 指摘: `DuplicateRecordId` の `Display` に加えて
+    /// `derive(Debug)` も生のレコード ID を出力していた）。
+    #[test]
+    fn req16_duplicate_record_id_error_does_not_leak_id_in_display_or_debug() {
+        let secret_id = "user-email-secret@example.com";
+        let records = vec![
+            TestRecord {
+                id: secret_id,
+                input: "x",
+                gold_key: "g1",
+                group_id: None,
+            },
+            TestRecord {
+                id: secret_id,
+                input: "y",
+                gold_key: "g2",
+                group_id: None,
+            },
+        ];
+        let err = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap_err();
+        assert!(!format!("{err}").contains(secret_id));
+        assert!(!format!("{err:?}").contains(secret_id));
+    }
+
     /// 空 id は Err で、値（index）まで確認する。
     #[test]
     fn req16_contradiction_empty_id_is_err() {
@@ -598,6 +716,42 @@ mod tests {
         assert_eq!(report_forward, report_reversed);
     }
 
+    /// 秘密情報風のレコード ID・group ID が [`ContradictionReport`]（および
+    /// 内包する [`ContradictionEntry`]）の `Debug` 出力に含まれないことを
+    /// 確認する（security.md「秘密情報の混入防止」。公開フィールド
+    /// （`entries[].ids` 等）自体は引き続き参照できるが `{:?}` では伏せる）。
+    #[test]
+    fn req16_contradiction_report_debug_does_not_leak_ids_or_group_ids() {
+        let secret_id_a = "user-a-secret@example.com";
+        let secret_id_b = "user-b-secret@example.com";
+        let secret_group = "group-secret-42";
+        let records = vec![
+            TestRecord {
+                id: secret_id_a,
+                input: "x",
+                gold_key: "g1",
+                group_id: Some(secret_group),
+            },
+            TestRecord {
+                id: secret_id_b,
+                input: "x",
+                gold_key: "g2",
+                group_id: Some(secret_group),
+            },
+        ];
+        let report = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
+        let debug_output = format!("{report:?}");
+        assert!(!debug_output.contains(secret_id_a));
+        assert!(!debug_output.contains(secret_id_b));
+        assert!(!debug_output.contains(secret_group));
+        // 公開フィールド経由では引き続き値を参照できる（`Debug` を伏せる
+        // だけで、意図したアクセス経路は塞がない）。
+        assert_eq!(
+            report.entries[0].ids,
+            vec![secret_id_a.to_string(), secret_id_b.to_string()]
+        );
+    }
+
     struct TestMetadataRecord {
         id: &'static str,
         input: &'static str,
@@ -668,6 +822,25 @@ mod tests {
                 MetadataMixReason::GoldSerializationInInput,
             ]))
         );
+    }
+
+    /// 秘密情報風のレコード ID が [`MetadataMixedReport`] の `Debug` 出力に
+    /// 含まれないことを確認する（security.md「秘密情報の混入防止」。`hits`
+    /// のキーは公開フィールド経由では引き続き参照できるが `{:?}` では伏せる）。
+    #[test]
+    fn req16_metadata_report_debug_does_not_leak_record_ids() {
+        let secret_id = "user-secret-id@example.com";
+        let records = vec![TestMetadataRecord {
+            id: secret_id,
+            input: "user-secret-id@example.com を含む入力",
+            gold_label: None,
+            gold_serializations: vec![],
+        }];
+        let report = find_metadata_mixed(&records).unwrap();
+        let debug_output = format!("{report:?}");
+        assert!(!debug_output.contains(secret_id));
+        // 公開フィールド経由では引き続き値を参照できる。
+        assert!(report.hits.contains_key(secret_id));
     }
 
     /// 重複 id・空 id は Err で、値まで確認する。
