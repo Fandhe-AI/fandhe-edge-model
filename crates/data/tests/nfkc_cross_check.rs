@@ -11,17 +11,21 @@
 //! 「既定の矛盾検出が共通の NFKC 正規化規則と一致しない」状態
 //! （crates/data/src/normalize.rs:66・71 に対する P1 指摘）を再発させない。
 //!
-//! # Unicode 版の違いについて
+//! # Unicode 版を学習ワーカーと揃える
 //!
 //! fixture の `_meta.unicode_version` は Python 側実行環境（UCD 15.0.0）を
-//! 記録した値であり、本 crate が使う `unicode-normalization` 0.1.25 は
-//! Unicode 17.0.0 のデータテーブルを使う（`crates/data/src/normalize.rs`
-//! モジュール doc「Unicode 版の違い」参照）。NFKC の安定性ポリシーにより
-//! 既存の割り当て済み文字は変換結果が変わらないため、本テストでは
-//! `_meta.unicode_version` の一致は要求しない（Python 側のみ要求する。
-//! `trainer/tests/test_encoding.py::test_fixture_unicode_version_matches_runtime`）。
-//! 新規割当文字（Unicode 15.1〜17.0）を使うベクタが将来追加された場合は、
-//! 本テストの失敗によって版差を検出する。
+//! 記録した値であり、本 crate が使う `unicode-normalization` 0.1.22 も
+//! 同じ Unicode 15.0.0 のデータテーブルを使う（`crates/data/src/normalize.rs`
+//! モジュール doc「Unicode 版を学習ワーカーと揃える」参照。当初導入した
+//! 0.1.25 は Unicode 17.0.0 準拠で版がずれていたため、PR #188 Codex レビュー
+//! P1 指摘を受けて 0.1.22 へ固定し直した）。本テストは fixture の
+//! `_meta.unicode_version` と一致した版で動いていることを前提に既定の
+//! 正規化規則の出力を照合し、`crates/data/src/normalize.rs` の
+//! `req16_unicode_normalization_version_matches_python_ucd_15_0_0` が
+//! `unicode_normalization::UNICODE_VERSION == (15, 0, 0)` を固定する
+//! （Python 側は
+//! `trainer/tests/test_encoding.py::test_fixture_unicode_version_matches_runtime`・
+//! `test_unicode_version_matches_rust_contract` が固定する）。
 //!
 //! 証拠の種別: テストハーネス（実機測定なし）。
 
@@ -47,8 +51,9 @@ fn fixture_path() -> PathBuf {
         .join("byte_encoding_vectors.json")
 }
 
-/// fixture を読み込み `vectors` 配列を返す。
-fn load_vectors() -> Vec<Value> {
+/// fixture のルート JSON を読み込む（`vectors` 配列・`_meta` の両方を
+/// 参照する呼び出し元のための共通ローダ）。
+fn load_root() -> Value {
     let path = fixture_path();
     let metadata = fs::metadata(&path)
         .unwrap_or_else(|e| panic!("failed to stat preprocess vectors fixture {path:?}: {e}"));
@@ -59,8 +64,14 @@ fn load_vectors() -> Vec<Value> {
     );
     let content = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read preprocess vectors fixture {path:?}: {e}"));
-    let root: Value = serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("failed to parse preprocess vectors fixture {path:?}: {e}"));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|e| panic!("failed to parse preprocess vectors fixture {path:?}: {e}"))
+}
+
+/// fixture を読み込み `vectors` 配列を返す。
+fn load_vectors() -> Vec<Value> {
+    let path = fixture_path();
+    let root = load_root();
     root.get("vectors")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("preprocess vectors fixture {path:?} has no \"vectors\" array"))
@@ -148,4 +159,29 @@ fn req16_nfkc_requiring_vectors_present_and_match() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("vector {hangul_name:?} must have a string \"normalized\""));
     assert_eq!(normalizer.normalize(input).as_ref(), expected);
+}
+
+/// REQ-16: 本 crate が使う `unicode-normalization` の Unicode 版
+/// （`UNICODE_VERSION`）が、共有フィクスチャの `_meta.unicode_version`
+/// （Python 側実行環境の UCD 版）と一致することを確認する（学習ワーカーと
+/// 版を揃える契約。`crates/data/src/normalize.rs` モジュール doc
+/// 「Unicode 版を学習ワーカーと揃える」参照。Python 側の一致は
+/// `trainer/tests/test_encoding.py::test_fixture_unicode_version_matches_runtime`
+/// が別途確認する）。
+#[test]
+fn req16_unicode_normalization_version_matches_fixture_meta() {
+    let root = load_root();
+    let recorded = root
+        .get("_meta")
+        .and_then(|m| m.get("unicode_version"))
+        .and_then(Value::as_str)
+        .expect("fixture must have _meta.unicode_version");
+    assert_eq!(recorded, "15.0.0");
+
+    let (major, minor, patch) = unicode_normalization::UNICODE_VERSION;
+    let actual = format!("{major}.{minor}.{patch}");
+    assert_eq!(
+        actual, recorded,
+        "unicode-normalization's UNICODE_VERSION must match the fixture's recorded Python UCD version"
+    );
 }

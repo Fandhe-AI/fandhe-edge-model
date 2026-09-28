@@ -241,4 +241,15 @@ mod tests {
     fn req16_rule_id_is_nfkc_whitespace() {
         assert_eq!(NfkcWhitespaceNormalizer.rule_id(), "nfkc-whitespace-v1");
     }
+
+    /// `unicode-normalization` の版が Unicode 15.0.0 のデータテーブルを
+    /// 使っていることを固定する（REQ-16。学習ワーカー〔Python 3.12 の
+    /// `unicodedata`、UCD 15.0.0〕と版を揃える契約。この値が変わったら
+    /// `Cargo.toml` の `unicode-normalization` の版指定・
+    /// `trainer/tests/test_encoding.py::test_unicode_version_matches_rust_contract`
+    /// も合わせて確認する）。
+    #[test]
+    fn req16_unicode_normalization_version_matches_python_ucd_15_0_0() {
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (15, 0, 0));
+    }
 }
