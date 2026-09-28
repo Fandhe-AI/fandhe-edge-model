@@ -207,6 +207,20 @@ pub enum CalibrationError {
         /// 渡されたラベル数。
         given: usize,
     },
+    /// [`crate::abstention::compare_abstention`] に渡されたラベル集合が、件数は
+    /// 一致するものの宣言順の ID が一致しない（[`Calibration::labels`]。
+    /// REQ-17・REQ-27: 件数だけを見ると、同数の別ラベル集合や宣言順を
+    /// 並べ替えた集合でも検査を通過してしまい、校正時とは異なる添字を
+    /// 予測ラベルとして解釈しうる〔評価の独立性の抵触〕。最初に食い違う
+    /// 位置を返し、原因箇所を特定できるようにする）。
+    LabelMismatch {
+        /// 最初に食い違う宣言順添字。
+        index: usize,
+        /// 校正時のその位置のラベル ID。
+        calibrated: String,
+        /// 渡されたその位置のラベル ID。
+        given: String,
+    },
     /// [`crate::abstention::compare_abstention`] が内部で呼ぶ
     /// [`crate::metrics::evaluate_single_select`] が返したエラー（評価ロジックを
     /// 本モジュール・`abstention` モジュールで再実装せず、評価器の唯一の実装
@@ -273,6 +287,14 @@ impl fmt::Display for CalibrationError {
                     "label count mismatch: calibrated with {calibrated}, got {given}"
                 )
             }
+            CalibrationError::LabelMismatch {
+                index,
+                calibrated,
+                given,
+            } => write!(
+                f,
+                "label mismatch at index {index}: calibrated with \"{calibrated}\", got \"{given}\""
+            ),
             CalibrationError::Evaluation(err) => {
                 write!(f, "evaluation failed: {err}")
             }
@@ -287,7 +309,7 @@ impl std::error::Error for CalibrationError {}
 /// フィールドは非公開にし、構築は [`calibrate`] 内に集約する（壊れた値
 /// ―― 例えば `adopted() == true` なのに `chosen_temperature() != temperature_star()`
 /// ―― を外部から作らせない）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
     temperature_star: f64,
     chosen_temperature: f64,
@@ -299,7 +321,12 @@ pub struct Calibration {
     ece_t1: f64,
     ece_t_star: f64,
     n_validation: u64,
-    n_labels: usize,
+    /// 校正時のラベル ID（宣言順、[`calibrate`] に渡した `labels` と同じ
+    /// 並び）。件数だけでなく ID・宣言順そのものを保持し、
+    /// [`crate::abstention::compare_abstention`] が評価データのラベル集合と
+    /// 同一性で照合できるようにする（REQ-17・REQ-27。codex/review 指摘
+    /// 対応: 件数一致だけでは同数の別ラベル集合・並べ替えを見逃す）。
+    labels: Vec<String>,
 }
 
 impl Calibration {
@@ -361,7 +388,16 @@ impl Calibration {
     /// ラベル集合の件数がこの校正結果と一致するかを確認するために使う
     /// （REQ-17・REQ-27: 校正した対象と異なるラベル集合を暗黙に混ぜない）。
     pub fn n_labels(&self) -> usize {
-        self.n_labels
+        self.labels.len()
+    }
+
+    /// 校正時のラベル ID（宣言順、[`calibrate`] に渡した `labels` と同じ並び）。
+    ///
+    /// [`crate::abstention::compare_abstention`] が、評価データに渡された
+    /// ラベル集合を件数だけでなく ID・宣言順の同一性で照合するために使う
+    /// （REQ-17・REQ-27）。
+    pub fn labels(&self) -> &[String] {
+        &self.labels
     }
 
     /// `1.0 / chosen_temperature()`（β を求める式を 1 箇所に集約する。
@@ -777,7 +813,7 @@ pub fn calibrate(
         ece_t1,
         ece_t_star,
         n_validation: records.len() as u64,
-        n_labels,
+        labels: labels.iter().map(|&label| label.to_string()).collect(),
     })
 }
 

@@ -190,8 +190,11 @@ impl AbstentionComparison {
 /// - `labels`: 宣言順のラベル ID（[`crate::metrics::evaluate_single_select`]・
 ///   [`crate::calibration::calibrate`] と同じ規約）。`calibration` を計算した
 ///   ときの `labels.len()` と一致しなければ
-///   [`CalibrationError::LabelCountMismatch`]（校正した対象と異なるラベル
-///   集合で評価データを走査しない。REQ-17・REQ-27）
+///   [`CalibrationError::LabelCountMismatch`]、件数は一致しても宣言順の ID が
+///   一致しなければ [`CalibrationError::LabelMismatch`]（同数の別ラベル集合・
+///   並べ替えで検査を通過し、校正時とは異なる添字を予測ラベルとして解釈する
+///   ことを防ぐ。校正した対象と異なるラベル集合で評価データを走査しない。
+///   REQ-17・REQ-27）
 /// - `calibration`: [`crate::calibration::calibrate`] が返した T・τ。ここから
 ///   **読むだけ**で、`records` から τ を選び直すことはない
 /// - `records`: 評価 1 件ずつの gold・ロジット（validation に限らず、最終
@@ -215,6 +218,21 @@ pub fn compare_abstention(
             calibrated: calibration.n_labels(),
             given: n_labels,
         });
+    }
+    // 件数一致だけでは、同数の別ラベル集合や宣言順を並べ替えた集合でも
+    // 検査を通過してしまい、校正時とは異なる添字を予測ラベルとして解釈し
+    // うる（codex/review 指摘・REQ-17・REQ-27）。宣言順で ID そのものの
+    // 同一性を確認する。
+    for (index, (calibrated_label, &given_label)) in
+        calibration.labels().iter().zip(labels.iter()).enumerate()
+    {
+        if calibrated_label != given_label {
+            return Err(CalibrationError::LabelMismatch {
+                index,
+                calibrated: calibrated_label.clone(),
+                given: given_label.to_string(),
+            });
+        }
     }
     // ラベルは `label_index`（`build_label_index` の戻り値）で検証済みだが、
     // gold の照合自体は `evaluate_single_select` に委譲する（評価ロジックの
@@ -804,6 +822,73 @@ mod tests {
                 given: 2,
             }
         );
+    }
+
+    /// 異常系: 件数は一致するがラベル ID を並べ替えた集合（REQ-17・REQ-27。
+    /// codex/review 指摘対応: 件数一致だけでは、校正時と異なる添字を予測
+    /// ラベルとして解釈しうる誤りを見逃す）。
+    #[test]
+    fn req27_compare_abstention_rejects_permuted_labels() {
+        let validation_rows = c1_validation();
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&LABELS, &validation_records).unwrap();
+        let permuted_labels = ["l1", "l0", "l2"];
+        let logits = [0.0, 0.0, 0.0];
+        let records = vec![CalibrationRecord {
+            gold: "l0",
+            logits: &logits,
+        }];
+        let err = compare_abstention(&permuted_labels, &calibration, &records)
+            .expect_err("permuted label order must be rejected");
+        assert_eq!(
+            err,
+            CalibrationError::LabelMismatch {
+                index: 0,
+                calibrated: "l0".to_string(),
+                given: "l1".to_string(),
+            }
+        );
+    }
+
+    /// 異常系: 件数は一致するが末尾のラベル ID を別 ID に差し替えた集合
+    /// （REQ-17・REQ-27）。
+    #[test]
+    fn req27_compare_abstention_rejects_substituted_label() {
+        let validation_rows = c1_validation();
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&LABELS, &validation_records).unwrap();
+        let substituted_labels = ["l0", "l1", "l9"];
+        let logits = [0.0, 0.0, 0.0];
+        let records = vec![CalibrationRecord {
+            gold: "l0",
+            logits: &logits,
+        }];
+        let err = compare_abstention(&substituted_labels, &calibration, &records)
+            .expect_err("substituted label id must be rejected");
+        assert_eq!(
+            err,
+            CalibrationError::LabelMismatch {
+                index: 2,
+                calibrated: "l2".to_string(),
+                given: "l9".to_string(),
+            }
+        );
+    }
+
+    /// 正常系: 校正時と同一のラベル集合（宣言順一致）は通過する
+    /// （REQ-17・REQ-27。上記 2 件の異常系と対をなす境界確認）。
+    #[test]
+    fn req27_compare_abstention_accepts_identical_labels() {
+        let validation_rows = c1_validation();
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&LABELS, &validation_records).unwrap();
+        let logits = [1.0, 0.0, 0.0];
+        let records = vec![CalibrationRecord {
+            gold: "l0",
+            logits: &logits,
+        }];
+        compare_abstention(&LABELS, &calibration, &records)
+            .expect("identical label set must be accepted");
     }
 
     /// 異常系: 評価レコードが 0 件。
