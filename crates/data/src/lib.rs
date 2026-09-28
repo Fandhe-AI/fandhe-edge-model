@@ -62,10 +62,14 @@
 //! - 来歴（REQ-40）: レコード型・各項目の検証（[`provenance`]・
 //!   TASK-40.1-1）に加え、取り込み時の JSON 検証・記録 JSON 生成・
 //!   データ検査との接続（[`provenance::ingest`]・[`ingest`]・
-//!   TASK-40.1-2・issue #75）を実装済み。指示文本文からの sha256 計算
-//!   （`sha2` の data 層配置はユーザー承認待ち。計算済みハッシュの取り込みの
-//!   みサポート）・`source`（生成元）フィールド・外部 LLM 出力の既定拒否
-//!   （TASK-40.2）・CLI `inspect` 工程への配線（TASK-33.x）は未実装
+//!   TASK-40.1-2・issue #75）を実装済み。生成元（[`provenance::GenerationSource`]）
+//!   の記録と、Jev 出力を学習データの既定生成元にしない制約
+//!   （[`provenance::check_default_training_source`]・[`ingest::ingest_records`]・
+//!   REQ-40 受け入れ基準 2・TASK-40.2・issue #76）も実装済み（来歴なしは
+//!   許可。上書き手段は無い）。指示文本文からの sha256 計算（`sha2` の
+//!   data 層配置はユーザー承認待ち。計算済みハッシュの取り込みのみ
+//!   サポート）・CLI `inspect` 工程への配線・終了コード写像
+//!   （TASK-33.x）は未実装
 //!
 //! # 層の境界
 //!
