@@ -156,7 +156,7 @@ impl Ratio {
     /// を返す（評価契約: 分母 0 は null。本モジュール内の呼び出しは常に
     /// `numerator <= denominator` を満たすため挙動は変わらないが、型で
     /// 不変条件を守るための検証を追加する）。
-    fn new(numerator: u64, denominator: u64) -> Option<Ratio> {
+    pub(crate) fn new(numerator: u64, denominator: u64) -> Option<Ratio> {
         if denominator == 0 || numerator > denominator {
             return None;
         }
@@ -424,6 +424,40 @@ pub struct SingleSelectMetrics {
     pub type_meaning_quadrant: crate::quadrant::TypeMeaningQuadrant,
 }
 
+/// ラベル ID → 宣言順の添字を構築する（[`evaluate_single_select`] と
+/// [`crate::calibration`] で共有する。TASK-22.1-1・issue #95 で切り出し）。
+///
+/// `HashMap` によるハッシュ順の非決定性を避けるため `BTreeMap` を返す
+/// （`.claude/rules/coding-rust.md`「数値・決定性」）。REQ-39（ガード層・
+/// 資源の上限）に従い、[`MAX_LABELS`] の検証は挿入（文字列比較を伴う）より
+/// 前に行う。空・空 ID・重複はいずれも fail-closed でエラーにする。
+pub(crate) fn build_label_index<'a>(
+    labels: &[&'a str],
+) -> Result<BTreeMap<&'a str, usize>, EvalError> {
+    if labels.is_empty() {
+        return Err(EvalError::EmptyLabels);
+    }
+    if labels.len() > MAX_LABELS {
+        return Err(EvalError::TooManyLabels {
+            n_labels: labels.len(),
+            limit: MAX_LABELS,
+        });
+    }
+
+    let mut label_index: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, &label) in labels.iter().enumerate() {
+        if label.is_empty() {
+            return Err(EvalError::EmptyLabelId);
+        }
+        if label_index.insert(label, i).is_some() {
+            return Err(EvalError::DuplicateLabel {
+                label: label.to_string(),
+            });
+        }
+    }
+    Ok(label_index)
+}
+
 /// 正解率・ラベル別指標・Macro-F1・混同行列を算出する（REQ-24 正常系・TASK-24.1-1）。
 ///
 /// - `labels`: 宣言順のラベル ID（`fandhe-edge-core::Definition::options()` の
@@ -445,30 +479,7 @@ pub fn evaluate_single_select(
     if records.is_empty() {
         return Err(EvalError::EmptyRecords);
     }
-    // REQ-39（ガード層・資源の上限）: `labels` 件数の検証は索引（`BTreeMap`）
-    // 構築より前に行う。索引構築自体が `labels` 全件の挿入・文字列比較を伴う
-    // ため、`ConfusionMatrix::new` の確保前検証（後段）だけでは上限超過の
-    // 入力でも索引構築が先に走ってしまう（codex/review 指摘）。
-    if labels.len() > MAX_LABELS {
-        return Err(EvalError::TooManyLabels {
-            n_labels: labels.len(),
-            limit: MAX_LABELS,
-        });
-    }
-
-    // ラベル ID → 宣言順の添字。`BTreeMap` を使い、`HashMap` によるハッシュ順の
-    // 非決定性を避ける（.claude/rules/coding-rust.md「数値・決定性」）。
-    let mut label_index: BTreeMap<&str, usize> = BTreeMap::new();
-    for (i, &label) in labels.iter().enumerate() {
-        if label.is_empty() {
-            return Err(EvalError::EmptyLabelId);
-        }
-        if label_index.insert(label, i).is_some() {
-            return Err(EvalError::DuplicateLabel {
-                label: label.to_string(),
-            });
-        }
-    }
+    let label_index = build_label_index(labels)?;
 
     let n_labels = labels.len();
     let mut confusion = ConfusionMatrix::new(n_labels)?;
