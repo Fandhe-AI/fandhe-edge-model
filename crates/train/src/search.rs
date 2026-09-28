@@ -184,11 +184,15 @@ pub struct SearchInput<'a> {
 /// （[`crate::time_allotment::CandidateRunner`] のような子プロセス経由の
 /// 実行器ではなく、プロセス内の関数呼び出しであるため）。実装側
 /// （推論ランタイム・ジョブ管理。#178 等）が `time_limit` を守る責務を持つ。
-/// `run_search` は呼び出し前後の経過時間を計測し、`time_limit` を守れずに
-/// 探索予算全体を超過したことを事後検出した場合、その候補を選定対象から
-/// 除外し（[`CandidateSearchResult::ScoringExceededBudget`]）、以降の候補は
-/// 未着手として記録する（fail-closed。「呼び出し中の時間制限がないため
-/// 超過後も選定されてしまう」ことを防ぐ）。
+/// `run_search` は学習完了直後（この呼び出しの前）に残り予算がすでに 0 で
+/// あることを検出した場合は本呼び出しを行わず
+/// （[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）、呼び出し
+/// 前後の経過時間を計測して `time_limit` を守れずに探索予算全体を超過した
+/// ことを事後検出した場合は、その候補を選定対象から除外する
+/// （[`CandidateSearchResult::ScoringExceededBudget`]）。いずれの場合も
+/// 以降の候補は未着手として記録する（fail-closed。「呼び出し中の時間制限が
+/// ないため超過後も選定されてしまう」ことを防ぐ。P0 指摘対応・issue #84
+/// PR #238 レビュー）。
 pub trait ValidationScorer {
     /// 実装固有のエラー型。
     type Error;
@@ -270,6 +274,15 @@ pub enum CandidateSearchResult {
         /// 参考値としての validation 正解率（選定には使わない）。
         validation_accuracy: ValidationAccuracy,
     },
+    /// 学習は完了したが、採点（[`ValidationScorer::predict_validation`]）を
+    /// 呼び出す前の時点で探索予算全体を使い切っていたため、採点を呼び出さ
+    /// なかった（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
+    /// [`ScoringExceededBudget`](Self::ScoringExceededBudget) は採点の
+    /// 呼び出し自体は行い事後に超過を検出した場合だが、本バリアントは
+    /// 呼び出し前に超過が確定しているため呼び出さない。正解率が無いため
+    /// `0` 等の値で埋めない（evaluation-contract「分母が 0 の指標は
+    /// `null`」と同じ「実測できない値を捏造しない」方針）。選定対象外。
+    ScoringSkippedBudgetExhausted,
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
         /// 未着手の理由。
@@ -760,6 +773,26 @@ where
                 // 「時間上限」参照。呼び出し自体を打ち切ることはできない）。
                 let elapsed_before_scoring_ms = elapsed_ms_since_start(clock)?;
                 let remaining_for_scoring_ms = budget_ms.saturating_sub(elapsed_before_scoring_ms);
+
+                // P0 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 学習
+                // だけで探索予算全体を使い切っていた場合、採点
+                // （`predict_validation`）を呼び出さずに打ち切る。trait doc
+                // 「時間上限」の通り呼び出し自体を打ち切れないため、
+                // 予算が残っていないと分かっている呼び出しをそもそも行わない
+                // ことが唯一の資源上限の守り方になる（呼び出し後の事後検出
+                // だけに頼ると、無駄な呼び出し自体は防げない）。
+                if elapsed_before_scoring_ms >= budget_ms {
+                    entries.push(CandidateSearchEntry {
+                        candidate_id: candidate.candidate_id,
+                        elapsed_at_start_ms: Some(elapsed_ms),
+                        time: Some(run.record().clone()),
+                        result: CandidateSearchResult::ScoringSkippedBudgetExhausted,
+                        validation_outcomes: None,
+                    });
+                    drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                    break;
+                }
+
                 let time_limit = Duration::from_millis(remaining_for_scoring_ms);
                 match scorer.predict_validation(&candidate.candidate_id, success, time_limit) {
                     Ok(outcomes) => {
@@ -785,9 +818,12 @@ where
                         // いたら選定対象から除外する（P0 指摘対応。「超過後も
                         // 最後の候補なら Selected を返してしまう」ことを防ぐ。
                         // fail-closed: 正解率自体は参考値として記録するが
-                        // `evaluated_owned` へは積まない）。
+                        // `evaluated_owned` へは積まない）。ちょうど予算に
+                        // 達した時点（`==`）も「予算到達を合格扱いにしない」
+                        // （evaluation-contract）に含めるため `>=` で判定する
+                        // （issue #84 PR #238 レビュー・P0 指摘対応）。
                         let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
-                        if elapsed_after_scoring_ms > budget_ms {
+                        if elapsed_after_scoring_ms >= budget_ms {
                             entries.push(CandidateSearchEntry {
                                 candidate_id: candidate.candidate_id,
                                 elapsed_at_start_ms: Some(elapsed_ms),
