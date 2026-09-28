@@ -24,12 +24,14 @@
 //!    実際に依存すること（重みが変われば予測結果も変わること）を確かめ、
 //!    手順 3 の評価がモデルパッケージへ実質的に結合していることを示す
 
+use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_eval::invariance::{
     ComponentChange, ModelComponent, ModelPackageBytes, ModelPackageSnapshot,
 };
 use fandhe_edge_eval::metrics::{EvalRecord, Outcome, evaluate_single_select};
 use std::fs;
 use std::io::Write as _;
+use std::path::Path;
 
 const EPSILON: f64 = 1e-9;
 
@@ -267,4 +269,164 @@ fn req27_predict_using_package_reflects_weights_content() {
     assert_eq!(tampered_outcomes, vec![Outcome::Label("B".to_string()); 6]);
 
     assert_ne!(original_outcomes, tampered_outcomes);
+}
+
+/// `synthetic_package()` の各構成要素の初期バイト列
+/// （改変前にディスクへ書き込む内容と、期待するダイジェストの根拠に使う）。
+fn original_component_bytes(component: ModelComponent) -> &'static [u8] {
+    match component {
+        ModelComponent::Weights => b"synthetic-weights-bytes-v1",
+        ModelComponent::Vocab => b"synthetic-vocab-bytes-v1",
+        ModelComponent::Calibration => b"synthetic-calibration-bytes-v1",
+        ModelComponent::Thresholds => b"synthetic-thresholds-bytes-v1",
+        // `ModelComponent` は `#[non_exhaustive]` だが、本 crate 外に新規
+        // バリアントを追加する手段は無いため、この wildcard は将来
+        // 構成要素が増えた場合にのみ到達しうる。到達したら「改変の再現に
+        // 使う初期値が未定義」であることを明示して panic させ、テストの
+        // 期待値が古いまま黙って通る（fail-open になる）のを防ぐ。
+        other => panic!("original_component_bytes は {other:?} の初期値を定義していない"),
+    }
+}
+
+/// バイト列を一時ファイルへ書き込む（新規作成・上書きの両方に使う）。
+fn write_temp_file(path: &Path, bytes: &[u8]) {
+    let mut file = fs::File::create(path).expect("一時ファイルの作成に失敗しないはず");
+    file.write_all(bytes)
+        .expect("一時ファイルへの書き込みに失敗しないはず");
+}
+
+/// 一時ファイルをディスクから読み込む。
+fn read_temp_file(path: &Path) -> Vec<u8> {
+    fs::read(path).expect("一時ファイルの読み込みに失敗しないはず")
+}
+
+/// 指定した構成要素だけをディスク上で改変した場合に、評価前後の
+/// スナップショット比較（[`ModelPackageSnapshot::verify_unchanged`]）が
+/// 実際に `ComponentChange::Modified { component, .. }` を検出することを
+/// 確かめる（REQ-27「評価の独立性」。TASK-27.1-1・issue #69）。
+///
+/// これまでの `req27_task27_1_1_disk_round_trip_preserves_hash` は評価の
+/// 前後で同じファイルを書き換えずに読み直すだけだったため、評価工程が
+/// 実際にファイルを変更したときに前後比較が失敗することまでは検証できて
+/// いなかった（codex/review 指摘。issue #214 の PR コメント）。本関数は
+/// 評価前スナップショット取得 → 評価の実行 → **対象ファイルをディスク上で
+/// 上書き** → 評価後スナップショット取得、という順序でディスクファイルを
+/// 実際に変更し、変更した構成要素だけが `Modified` として検出されることを
+/// 具体値（変更前後の sha256 ダイジェスト）で確かめる。
+fn assert_disk_tampering_detected(component: ModelComponent, tampered_bytes: &'static [u8]) {
+    let dir = make_unique_temp_dir(component.as_str());
+    let _guard = TempDirGuard(dir.clone());
+
+    let weights_path = dir.join("weights.bin");
+    let vocab_path = dir.join("vocab.bin");
+    let calibration_path = dir.join("calibration.bin");
+    let thresholds_path = dir.join("thresholds.bin");
+
+    write_temp_file(
+        &weights_path,
+        original_component_bytes(ModelComponent::Weights),
+    );
+    write_temp_file(&vocab_path, original_component_bytes(ModelComponent::Vocab));
+    write_temp_file(
+        &calibration_path,
+        original_component_bytes(ModelComponent::Calibration),
+    );
+    write_temp_file(
+        &thresholds_path,
+        original_component_bytes(ModelComponent::Thresholds),
+    );
+
+    // 評価前: 改変前の内容をディスクから読み込んでスナップショットを作る。
+    let weights_bytes = read_temp_file(&weights_path);
+    let vocab_bytes = read_temp_file(&vocab_path);
+    let calibration_bytes = read_temp_file(&calibration_path);
+    let thresholds_bytes = read_temp_file(&thresholds_path);
+    let before_package = ModelPackageBytes {
+        weights: Some(&weights_bytes),
+        vocab: Some(&vocab_bytes),
+        calibration: Some(&calibration_bytes),
+        thresholds: Some(&thresholds_bytes),
+    };
+    let before = ModelPackageSnapshot::capture(&before_package).expect("失敗しないはず");
+
+    // 評価工程を実際に走らせ、改変前のバイト列を予測器に消費させる
+    // （手順 3 と同じく、before/after のスナップショット取得の間に実際の
+    // 評価経路を挟む）。
+    let outcomes = predict_using_package(&before_package);
+    let golds = golds();
+    let records: Vec<EvalRecord<'_>> = golds
+        .iter()
+        .zip(outcomes.iter())
+        .map(|(gold, outcome)| EvalRecord { gold, outcome })
+        .collect();
+    let labels = ["A", "B"];
+    let metrics =
+        evaluate_single_select(&labels, &records).expect("既知解データセットは失敗しないはず");
+    assert_eq!(metrics.n_total, 6);
+    assert!(approx_eq(metrics.accuracy.overall.value(), 4.0 / 6.0));
+
+    // 評価の途中で対象の構成要素だけがディスク上で改変されたことを模擬する。
+    let target_path: &Path = match component {
+        ModelComponent::Weights => &weights_path,
+        ModelComponent::Vocab => &vocab_path,
+        ModelComponent::Calibration => &calibration_path,
+        ModelComponent::Thresholds => &thresholds_path,
+        other => panic!("assert_disk_tampering_detected は {other:?} 用のパスを定義していない"),
+    };
+    write_temp_file(target_path, tampered_bytes);
+
+    // 評価後: 改変後のファイルをディスクから読み直す（改変前のバッファを
+    // 使い回さない。契約はモジュール冒頭の doc のとおり）。
+    let weights_bytes_after = read_temp_file(&weights_path);
+    let vocab_bytes_after = read_temp_file(&vocab_path);
+    let calibration_bytes_after = read_temp_file(&calibration_path);
+    let thresholds_bytes_after = read_temp_file(&thresholds_path);
+    let after_package = ModelPackageBytes {
+        weights: Some(&weights_bytes_after),
+        vocab: Some(&vocab_bytes_after),
+        calibration: Some(&calibration_bytes_after),
+        thresholds: Some(&thresholds_bytes_after),
+    };
+    let after = ModelPackageSnapshot::capture(&after_package).expect("失敗しないはず");
+
+    let violation = before.verify_unchanged(&after).unwrap_err();
+    assert_eq!(violation.changes.len(), 1);
+    match &violation.changes[0] {
+        ComponentChange::Modified {
+            component: changed,
+            before: before_digest,
+            after: after_digest,
+        } => {
+            assert_eq!(*changed, component);
+            assert_eq!(
+                *before_digest,
+                Sha256Digest::of_bytes(original_component_bytes(component))
+            );
+            assert_eq!(*after_digest, Sha256Digest::of_bytes(tampered_bytes));
+        }
+        other => panic!("Modified({component:?}) を期待したが {other:?} だった"),
+    }
+}
+
+#[test]
+fn req27_disk_tampering_of_weights_during_evaluation_is_detected() {
+    assert_disk_tampering_detected(ModelComponent::Weights, b"tampered-weights-bytes-v2");
+}
+
+#[test]
+fn req27_disk_tampering_of_vocab_during_evaluation_is_detected() {
+    assert_disk_tampering_detected(ModelComponent::Vocab, b"tampered-vocab-bytes-v2");
+}
+
+#[test]
+fn req27_disk_tampering_of_calibration_during_evaluation_is_detected() {
+    assert_disk_tampering_detected(
+        ModelComponent::Calibration,
+        b"tampered-calibration-bytes-v2",
+    );
+}
+
+#[test]
+fn req27_disk_tampering_of_thresholds_during_evaluation_is_detected() {
+    assert_disk_tampering_detected(ModelComponent::Thresholds, b"tampered-thresholds-bytes-v2");
 }
