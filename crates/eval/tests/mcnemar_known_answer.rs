@@ -3,7 +3,11 @@
 //! 参照値は独立実装（Python の `fractions.Fraction` と `math.comb` による
 //! 有理数の厳密計算）で計画時に算出したもの。`docs/spec` は読み込まず、
 //! 期待値はこのファイルへ直接書く（`.claude/rules/spec-reference.md` の
-//! ビルド独立方針）。
+//! ビルド独立方針）。生成元スクリプトと再現用のゴールデンベクタは
+//! `fixtures/mcnemar/`（`generate_known_values.py`・`known_values.json`・
+//! `PROVENANCE.md`）にあり、本ファイルの期待値と全件一致することを確認
+//! 済み（review 指摘。issue #64）。このテスト自体は `fixtures/` を実行時に
+//! 読み込まない（期待値は直書きのまま。ビルド・テストの独立性を保つ）。
 //!
 //! 証拠の種別: テストハーネス（有理数の厳密計算による独立実装との照合）。
 //!

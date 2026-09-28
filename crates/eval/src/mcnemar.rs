@@ -38,7 +38,12 @@
 //! 際限なく増えるため、[`MAX_DISCORDANT_PAIRS`] を超える場合は計算せず
 //! [`McNemarError::TooManyDiscordantPairs`] を返す。上限の下では
 //! `u64 → f64` の変換が `2^53` 未満に収まり、件数の表現に丸め誤差が
-//! 生じない。
+//! 生じない。ただし、この変換精度は「誤差の見積もり」節で述べる
+//! `ln_choose_n_k` の桁落ち（大きな値どうしの差を取ることによる相対誤差の
+//! 蓄積）を抑える根拠にはならない。上限値自体は主に計算量（ループ回数）を
+//! 抑えるために設定したものであり、その下で契約の許容差 1e-9
+//! （[`evaluation-contract`](../../../.claude/rules/evaluation-contract.md)）
+//! を満たすことを検証済みとは主張しない（下記「誤差の見積もり」参照）。
 //!
 //! # 数値精度・決定性
 //!
@@ -54,12 +59,21 @@
 //!   これはエラーとせずそのまま返す（`p < α` の判定は正しく保たれるため）。
 //!   `ln_p`（対数スケールの p 値）を公開するかどうかは、Holm 補正
 //!   （TASK-25.3）で必要になった時点で改めて検討する（本 issue の範囲外）。
-//! - **誤差の見積もり（証拠の種別: 推定）**: 相対誤差は `n`（不一致ペア数）
-//!   とともに増える傾向がある。計画時の試算（有理数の厳密値との比較）では
-//!   `n = 650` で相対誤差約 5e-14、`n = 9,700` で約 1e-11、`n = 39,000` で
-//!   約 2e-11 だった。[`MAX_DISCORDANT_PAIRS`]（1000 万）付近の極端な `n` では
-//!   相対誤差が 1e-9 に近づく可能性がある（実測ではなく推定）。テスト
-//!   （`tests/mcnemar_known_answer.rs`）は `n <= 9,700` の範囲で照合している。
+//! - **誤差の見積もり（証拠の種別: 推定・未検証）**: 相対誤差は `n`
+//!   （不一致ペア数）とともに増える傾向がある。計画時の試算（有理数の厳密値
+//!   との比較）では `n = 650` で相対誤差約 5e-14、`n = 9,700` で約 1e-11、
+//!   `n = 39,000` で約 2e-11 だった。実測しているのはこの範囲（最大
+//!   `n = 39,000`）までであり、[`MAX_DISCORDANT_PAIRS`]（1000 万）付近の
+//!   `n` での誤差は、この範囲からの外挿にすぎず実測していない。外挿は
+//!   `ln_choose_n_k`（`ln_2 + ln_choose_n_k - n * ln_2` の桁落ち）の傾向が
+//!   `n` の増加とともに単調である前提に基づくため、契約の許容差 1e-9 を
+//!   `n` の上限付近まで満たし続けることを保証しない（`.claude/rules/
+//!   coding-rust.md`「未実装・簡易実装の箇所は実装済みを装わない」）。
+//!   テスト（`tests/mcnemar_known_answer.rs`）は `n <= 9,700` の範囲で
+//!   照合している。`MAX_DISCORDANT_PAIRS` を許容差の実測範囲まで下げるか
+//!   どうかは、上限を狭める評価契約上の判断（`.claude/rules/
+//!   evaluation-contract.md`）にあたるため main の設計判断とし、本 issue の
+//!   範囲外とする。
 
 use std::fmt;
 
@@ -75,7 +89,12 @@ pub const MAX_DISCORDANT_PAIRS: u64 = 10_000_000;
 /// フィールドは非公開で、生成はモジュール内の関数（[`mcnemar_exact_two_sided`]）
 /// に限る。NaN・負・1 超の値を表現できない型にすることで、壊れた p 値が
 /// 上位層（CLI の `evaluate` 工程・Holm 補正）へ伝播しないようにする。
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `PartialEq` は意図的に derive しない（`.claude/rules/coding-rust.md`
+/// 「浮動小数の比較は許容差を明示し `==` で比較しない」）。呼び出し側
+/// （TASK-25.1-2 等）が `==` で比較する経路を型で塞ぎ、[`value`][Self::value]
+/// を取り出したうえで許容差付きの比較関数を使わせる。
+#[derive(Debug, Clone, Copy)]
 pub struct PValue(f64);
 
 impl PValue {
@@ -101,7 +120,11 @@ impl fmt::Display for PValue {
 }
 
 /// McNemar の正確検定（両側）の結果。
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// [`PValue`] を含むため `PartialEq` は derive しない（上記 [`PValue`] の
+/// ドキュメント参照）。件数（`b`・`c`・`n_discordant`）だけを比較したい
+/// 場合はそれぞれのアクセサ経由で比較する。
+#[derive(Debug, Clone, Copy)]
 pub struct McNemarExact {
     b: u64,
     c: u64,
@@ -463,6 +486,33 @@ mod tests {
         let result =
             mcnemar_exact_two_sided(counts.b_candidate_only, counts.c_baseline_only).unwrap();
         assert!(approx_eq(result.p_two_sided().value(), 1.0));
+    }
+
+    /// `b`・`c` の判定方向の取り違えを検出する非対称ケース。
+    ///
+    /// `paired_counts_matches_poc_selftest_example` は `b == c == 1` の
+    /// 対称ケースのみのため、`(true, false)` を `b`（候補のみ正解）に、
+    /// `(false, true)` を `c`（下限基準のみ正解）に数える向きを取り違えても
+    /// 検出できない。本テストは `b != c` にすることで、取り違えが起きれば
+    /// `b_candidate_only`・`c_baseline_only` の値が入れ替わって失敗する
+    /// ようにする。
+    #[test]
+    fn paired_counts_direction_is_not_swapped() {
+        // 候補: 正解, 正解, 不正解 / 下限基準: 不正解, 不正解, 不正解
+        // → 候補のみ正解した件（b）が 2、下限基準のみ正解した件（c）は 0。
+        let candidate = [true, true, false];
+        let baseline = [false, false, false];
+        let counts = paired_counts(&candidate, &baseline).unwrap();
+        assert_eq!(
+            counts,
+            PairedCounts {
+                n: 3,
+                both_correct: 0,
+                b_candidate_only: 2,
+                c_baseline_only: 0,
+                both_wrong: 1,
+            }
+        );
     }
 
     /// 既知値（有理数の厳密計算との照合）: b=3, c=1 → p = 5/8。
