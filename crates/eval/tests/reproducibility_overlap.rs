@@ -4,16 +4,7 @@
 //! 実機結果（`jobs/threeseed/result.json`。CPU device）で、GPU（Metal / MLX）
 //! での同じ結論の再確認は本テストの範囲外（issue #105）。
 
-use fandhe_edge_eval::reproducibility::{
-    OverlapVerdict, ReproducibilityError, SeedRun, judge_overlap, judge_reproducibility,
-};
-use fandhe_edge_eval::wilson;
-
-const EPSILON: f64 = 1e-9;
-
-fn approx_eq(a: f64, b: f64) -> bool {
-    (a - b).abs() < EPSILON
-}
+use fandhe_edge_eval::reproducibility::{OverlapVerdict, SeedRun, judge_reproducibility};
 
 fn run(seed: u64, correct: u64, total: u64) -> SeedRun {
     SeedRun {
@@ -35,39 +26,31 @@ fn pair_tuples(report: &fandhe_edge_eval::reproducibility::OverlapReport) -> Vec
         .collect()
 }
 
-/// (a) PoC-19 の再現: `wilson_ci(correct, 650, 1.959964)` が PoC-19 実機結果の
-/// lo/hi と 1e-9 で一致する。PoC-19 はより精度の高い z（1.959964）を使って
-/// おり、評価契約が要求する Wilson **95%**（`WILSON_Z_95` = 1.96）とは
-/// [`fandhe_edge_eval::reproducibility::OVERLAP_TOLERANCE`] を超えて異なる
-/// ため、公開 API `judge_overlap` はこれを 95% 区間として受け付けず
-/// `NonWilson95Z` を返す（issue #104 レビュー指摘・PR #243。
-/// `wilson_ci` が任意の正の z を受け付けるため、この検証が無いと
-/// 95% 以外の区間を再現性ありと誤判定できてしまっていた）。
-/// 同じ件数を `judge_reproducibility`（z = `WILSON_Z_95` 経路）に通した
-/// 重なり判定は `judge_reproducibility_matches_poc19_run_counts` で確認する。
+/// (a) 公開 API は seed を検証できる `judge_reproducibility` のみで、区間
+/// だけを受け取る内部関数 `judge_overlap` は crate 外から呼べない
+/// （issue #104 レビュー指摘・PR #243）。同一 seed を複数の run で渡すと、
+/// 全 run が同一の (correct, total) で区間も同一（重なりは必ず成立する）
+/// であっても `DuplicateSeed` で fail-closed に拒否され、区間だけを見て
+/// `AllPairsOverlap`（3 seed 以上の再現性ありと誤判定）を返す経路が無い
+/// ことを確認する。修正前は区間単位の公開関数へ同一区間を 3 回渡すことで
+/// この検証を迂回できていた。
 #[test]
-fn poc19_intervals_use_non_wilson95_z_and_are_rejected() {
-    let z = 1.959964_f64;
-    let a = wilson::wilson_ci(214, 650, z).expect("valid interval");
-    let b = wilson::wilson_ci(210, 650, z).expect("valid interval");
-    let c = wilson::wilson_ci(212, 650, z).expect("valid interval");
-
-    assert!(approx_eq(a.lo(), 0.29419969571312854));
-    assert!(approx_eq(a.hi(), 0.3662684545020082));
-    assert!(approx_eq(b.lo(), 0.28825582805163136));
-    assert!(approx_eq(b.hi(), 0.3599769401892761));
-    assert!(approx_eq(c.lo(), 0.2912268876983092));
-    assert!(approx_eq(c.hi(), 0.36312357152971286));
-
+fn duplicate_seed_cannot_bypass_reproducibility_check_via_identical_runs() {
+    let runs = [run(0, 214, 650), run(0, 214, 650), run(0, 214, 650)];
     assert_eq!(
-        judge_overlap(&[a, b, c]).unwrap_err(),
-        ReproducibilityError::NonWilson95Z { index: 0, z }
+        judge_reproducibility(&runs).unwrap_err(),
+        fandhe_edge_eval::reproducibility::ReproducibilityError::DuplicateSeed { seed: 0 }
     );
 }
 
-/// (b) 同じ件数を `judge_reproducibility`（`z = WILSON_Z_95` = 1.96 の経路）に
-/// 通しても `AllPairsOverlap` になる（区間の値は PoC の値と照合しない。
-/// z が異なるため）。
+/// PoC-19 の実機結果（`jobs/threeseed/result.json`）と同じ run 数（correct・
+/// total）を `judge_reproducibility`（`z = WILSON_Z_95` = 1.96 の経路）に
+/// 通すと `AllPairsOverlap` になる（区間の値は PoC の値と照合しない。
+/// PoC-19 はより精度の高い z（1.959964）を使っており、評価契約が要求する
+/// Wilson **95%** とは異なる区間になるため。この非 95% z の拒否
+/// 〔`NonWilson95Z`〕は crate 内部のユニットテスト
+/// `judge_overlap_non_wilson95_z_is_error`・`judge_overlap_rejects_uniform_non_wilson95_z`
+/// で確認する）。
 #[test]
 fn judge_reproducibility_matches_poc19_run_counts() {
     let runs = [run(0, 214, 650), run(1, 210, 650), run(2, 212, 650)];

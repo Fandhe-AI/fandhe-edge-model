@@ -22,17 +22,24 @@
 //! 診断のため重ならないペアの添字をすべて列挙する（全ペア走査。
 //! [`OverlapReport::disjoint_pairs`]）。
 //!
-//! # z の検証（issue #104 レビュー指摘・PR #243）
+//! # z の検証・公開 API の限定（issue #104 レビュー指摘・PR #243）
 //!
 //! 評価契約は「Wilson **95%** 信頼区間の重なり」を要求するため、
-//! [`judge_overlap`] は各区間の z が [`crate::wilson::WILSON_Z_95`]（1.96）と
-//! [`OVERLAP_TOLERANCE`] を超えて異ならないかを検証する
-//! （異なれば [`ReproducibilityError::NonWilson95Z`]）。[`wilson::wilson_ci`]
-//! は任意の正の z を受け付けるため、この検証が無いと z=0.1 のような
-//! 95% 以外の区間でも `AllPairsOverlap` を返し得てしまう。
+//! 区間だけを受け取る内部関数 `judge_overlap` は各区間の z が
+//! [`crate::wilson::WILSON_Z_95`]（1.96）と [`OVERLAP_TOLERANCE`] を超えて
+//! 異ならないかを検証する（異なれば [`ReproducibilityError::NonWilson95Z`]）。
+//! [`wilson::wilson_ci`] は任意の正の z を受け付けるため、この検証が無いと
+//! z=0.1 のような 95% 以外の区間でも `AllPairsOverlap` を返し得てしまう。
 //! [`judge_reproducibility`] は常に `wilson::wilson_ci95`（z が常に
 //! [`crate::wilson::WILSON_Z_95`]）で区間を算出するため、この検証を
 //! 経由しても通常は失敗しない。
+//!
+//! `judge_overlap` は区間の由来（seed）を検証できず、同一区間を 3 回渡しても
+//! 件数・z の条件は満たしてしまうため、[`judge_reproducibility`] が行う
+//! seed の重複検出・評価総数の一致検証を迂回する経路になり得る
+//! （レビュー指摘）。そのため `judge_overlap` は crate 内部専用（非公開）とし、
+//! 本モジュールの公開 API は seed を検証できる [`judge_reproducibility`] の
+//! みに限定する。
 //!
 //! # 資源上限（REQ-39）
 //!
@@ -323,7 +330,22 @@ fn pairwise_overlap_report(intervals: &[WilsonInterval]) -> OverlapReport {
 /// 区間（例: z=0.1・90%・99% 等）を再現性ありと誤判定させない
 /// （issue #104 レビュー指摘・PR #243）。任意の z を扱う純粋な重なり判定は
 /// crate 内部専用の [`pairwise_overlap_report`] に分離してある。
-pub fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, ReproducibilityError> {
+///
+/// # crate 内部限定にしている理由（issue #104 レビュー指摘・PR #243）
+///
+/// 区間（[`WilsonInterval`]）だけを受け取る本関数は、区間の由来（どの seed
+/// の run から算出したか）を検証できない。同一の区間を 3 回渡しても
+/// 「3 件」「z が Wilson 95%」という条件は満たしてしまうため、
+/// [`judge_reproducibility`] が行う seed の重複検出
+/// （[`ReproducibilityError::DuplicateSeed`]）・評価総数の一致検証
+/// （[`ReproducibilityError::MismatchedTotals`]）を経由せずに
+/// `AllPairsOverlap` を得られてしまい、評価契約が要求する「3 seed 以上」
+/// （REQ-26・`.claude/rules/evaluation-contract.md`「再現性は 3 seed 以上の
+/// Wilson 95% 信頼区間の重なりで示す」）を実質的に迂回できる。
+/// そのため公開 API は seed を検証できる [`judge_reproducibility`] のみとし、
+/// 本関数は crate 内部（[`judge_reproducibility`] からの呼び出しとユニット
+/// テスト）に限定する。
+fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, ReproducibilityError> {
     validate_run_count(intervals.len())?;
 
     for (index, interval) in intervals.iter().enumerate() {
