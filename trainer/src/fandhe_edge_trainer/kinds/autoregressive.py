@@ -89,14 +89,36 @@ LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention は�
 根拠を記す）。
 
 #79 の範囲はモデル・学習・ONNX 書き出し・選択口への登録までで、Python 側で
-1 件ずつの予測レコードを組み立てて評価器へ渡す処理（#80・TASK-19b.2）は
-含まない。`_score_choices_mlx`（対応づけ (b) の MLX 実装。一致試験・訓練後の
-簡易正解率確認に使う）は #80 が再利用できるよう公開関数として残す。
+1 件ずつの予測レコードを組み立てて評価器へ渡す処理は #80（TASK-19b.1-2）が
+担う。判定不能を別の status として区別する扱い（#81・TASK-19b.2）は含まない。
+`_score_choices_mlx`（対応づけ (b) の MLX 実装。一致試験・訓練後の簡易正解率
+確認に使う）は #80 がそのまま再利用する。
+
+## #80（TASK-19b.1-2）が追加する対応づけ・予測レコード組み立て
+
+`_score_choices_mlx` が返す `[N, K]` の生の対数尤度を、1 件ずつの予測レコード
+（評価器〔`crates/eval`〕・データ契約〔`crates/data::eval_input`〕が読める
+`{id, status, predicted_label, scores}`。`crates/core/src/judgment.rs` の
+正常系スキーマと同じ）へ変換する（`choice_posteriors` → `resolve_choice_id` →
+`map_scores_to_choice` → `build_prediction_record`。`predict_records` が
+この一連をチャンク処理でまとめる）。Issue #80 は当初「完全一致・前方一致等の
+規則」を挙げていたが、PoC-24 が事前登録した対応づけは (b)（本ファイルが実装
+する softmax ベースの方式）のみで、前方一致は PoC-24 のどの記録にも無いため
+採用しない（`docs/spec/03-poc/model-kind-selector/preregistration.md` 3 節）。
+「完全一致」は `resolve_choice_id`（選択された選択肢のトークン列を UTF-8
+バイト列として `label_order` の各要素のバイト列と完全一致させる）が (b) の
+最終段として担う。PoC-24 の `reason_code`（対応づけ不能の理由を JSON に含め
+る設計）は意図的に落とす（`crates/core::JudgmentStatus` が現状 `Ok` のみの
+ため、Rust 側スキーマに無いフィールドを Python 側で増やさない。
+coding-python.md）。対応づけ不能（`Unmapped`）は現状 `status:"error"` として
+評価の分母に含まれる。
 """
 
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -149,6 +171,13 @@ MAX_INPUT_ID = SEP - 1
 #: と同じ考え方）。MLX 側フォワード（`_build_additive_mask`）と ONNX 側グラフ
 #: （`_export_ar_onnx`）の両方がこの 1 箇所を参照する。
 _MASK_NEG_VALUE = -1e9
+
+#: `build_prediction_record` が受け付ける予測レコードの `id`（入力の識別子。
+#: 入力本文そのものは入れない。security.md）のバイト長上限（#80・REQ-39）。
+#: `crates/core/src/judgment.rs::MAX_INPUT_ID_BYTES` と同じ値を使う（Rust 側
+#: の `infer` 工程〔TASK-33.1。現状未配線〕が受理する `id` の上限と揃え、
+#: 学習ワーカー側で先に拒否できるようにする）。
+MAX_PREDICTION_ID_BYTES = 1024
 
 #: `DecoderLayer._attn` が 1 層あたりに保持する `[..., L, L]` 形状のテンソル数
 #: （`scores`＝`softmax` 適用前のスケール済みスコア、`attn`＝`softmax` の出力
@@ -428,10 +457,11 @@ def _score_choices_mlx(
     が返す、EOS・PAD を含まない可変長のトークン列）から、`[N, K]` の
     条件付き対数尤度合計（choice+EOS の対数尤度の合計。長さ正規化なし）を返す。
 
-    `#80`（TASK-19b.2）はこの関数を再利用して 1 件ずつの予測レコードを
-    組み立てる想定（モジュール docstring）。本関数自体は正規化前の対数尤度を
-    返すだけで、predicted_label・scores への変換は呼び出し側の責務とする
-    （`test_ar_train.py` の golden テスト・簡易正解率確認が呼び出し元）。
+    `predict_records`（#80・TASK-19b.1-2）がこの関数を再利用して 1 件ずつの
+    予測レコードを組み立てる（モジュール docstring）。本関数自体は正規化前の
+    対数尤度を返すだけで、predicted_label・scores への変換は呼び出し側
+    （`map_scores_to_choice`・`build_prediction_record`）の責務とする
+    （`test_ar_train.py` の golden テスト・簡易正解率確認も直接の呼び出し元）。
     """
     model.eval()
     n = len(ids_batch)
@@ -457,6 +487,258 @@ def _score_choices_mlx(
     summed = (gathered * valid_tile).sum(axis=1)  # [N*K]
     mx.eval(summed)
     return np.array(summed, dtype=np.float64).reshape(n, k)
+
+
+@dataclass(frozen=True)
+class Mapped:
+    """対応づけ (b) が選択肢 ID の解決まで成功したことを表す（#80）。
+
+    壊れた値（`choice_id` が `None` になりうる等）を表現できない型にする
+    ため、`Unmapped` と分けた 2 型で `ChoiceMapping` を構成する
+    （coding-rust.md「判定結果・状態は enum で表し壊れた値を表現できない
+    型にする」と同じ考え方を Python 側でも踏襲する）。
+
+    `probs` は `label_order` の宣言順に並べた事後確率
+    （`choice_posteriors` の出力をそのまま保持する）。`index` は argmax の
+    添字（タイブレークは宣言順。`crates/core/src/judgment.rs` の
+    `predicted_choice_id` タイブレーク規則と揃える）。
+    """
+
+    choice_id: str
+    index: int
+    probs: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class Unmapped:
+    """対応づけ (b) が選択肢 ID を解決できなかったことを表す（#80）。
+
+    `reason` はテストと将来の #81（TASK-19b.2。判定不能を別の status として
+    区別する扱い）のために保持するだけの内部値で、JSON の予測レコードには
+    出さない（`build_prediction_record` 参照。理由は
+    `"invalid_score"`〔`choice_posteriors` が非有限と判定〕・
+    `"no_exact_match"`〔`resolve_choice_id` が argmax の選択肢と一致する ID
+    を解決できない防御的経路。対応づけ (b) では理論上起こらない〕の 2 つ）。
+    """
+
+    reason: str
+
+
+#: 対応づけ (b) の結果を表す型（`map_scores_to_choice` の戻り値）。
+ChoiceMapping = Mapped | Unmapped
+
+
+def choice_posteriors(loglik_row: np.ndarray) -> np.ndarray | None:
+    """対応づけ (b) の事後確率（選択肢間の softmax）を求める（#80。PoC-24
+    `_predict_one` 相当。`docs/spec/03-poc/model-kind-selector/
+    preregistration.md` 3 節の事前登録どおり、長さ正規化を行わない
+    `_score_choices_mlx` の出力へそのまま softmax を適用する）。
+
+    `loglik_row` は `_score_choices_mlx` が返す `[N, K]` の 1 行。float64 で
+    `x - max` を引いてから `exp` を取り合計で割る、数値的に安定化した
+    softmax を計算する。入力が 1 次元・長さ 1 以上・全要素が有限であること
+    を事前に検証し、満たさなければ `None` を返す（呼び出し側で
+    `Unmapped("invalid_score")` にする。fail-closed）。出力も有限であること
+    を再確認し、満たさなければ同様に `None` を返す（`ok` を装わない）。
+    """
+    if loglik_row.ndim != 1 or loglik_row.shape[0] < 1:
+        return None
+    row = np.asarray(loglik_row, dtype=np.float64)
+    if not np.all(np.isfinite(row)):
+        return None
+    shifted = row - row.max()
+    exp = np.exp(shifted)
+    probs = exp / exp.sum()
+    if not np.all(np.isfinite(probs)):
+        return None
+    return probs
+
+
+def resolve_choice_id(choice_tokens: Sequence[int], label_order: Sequence[str]) -> str | None:
+    """選択肢のトークン列（バイト+1。`_encode_choices` と同じ表現）を、
+    `label_order` の中からバイト単位で完全一致する選択肢 ID へ解決する
+    （#80。受入基準の「完全一致する具体例」を担う純粋関数。前方一致・
+    NFKC 等の正規化・大小文字の同一視はしない。モジュール docstring 5 番の
+    「選択肢は NFKC 正規化しない」方針と整合させる）。
+
+    各トークンが `_encode_choices` が使う「バイト値+1」の語彙 `1..256` の
+    範囲内であることをまず確認する。PAD（0）・SEP（257）・EOS（258）・
+    範囲外の値が 1 つでも混ざっていれば、デコードを試みず `None` を返す
+    （例外は送出しない。「復号できない列」を単に「一致無し」として扱う）。
+    範囲内であれば `token - 1` へ戻したバイト列を組み立て、`label_order` の
+    各要素を UTF-8 エンコードしたバイト列と直接比較する（str へのデコード
+    を経由しないため、`choice_tokens` が有効な UTF-8 でなくても例外を出さず
+    「一致無し」を返せる）。
+    """
+    for token in choice_tokens:
+        if not (1 <= token <= 256):
+            return None
+    decoded_bytes = bytes(token - 1 for token in choice_tokens)
+    for label in label_order:
+        if decoded_bytes == label.encode("utf-8"):
+            return label
+    return None
+
+
+def map_scores_to_choice(
+    loglik_row: np.ndarray,
+    label_order: Sequence[str],
+    choice_ids_by_label: dict[str, list[int]],
+) -> ChoiceMapping:
+    """対応づけ (b) の最終段（#80）。`_score_choices_mlx` が返す 1 行の対数
+    尤度合計を、事後確率つきの選択肢 ID（`Mapped`）または対応づけ不能
+    （`Unmapped`）へ変換する。
+
+    手順: (1) `choice_posteriors` で事後確率を求める。非有限・不正な形なら
+    `Unmapped("invalid_score")` を返す。(2) `argmax`（タイブレークは
+    `label_order` の宣言順で先頭。`np.argmax` は同点のとき最初の添字を返す
+    ため追加の分岐は要らない）で最大の選択肢を選ぶ。(3) その選択肢の
+    トークン列を `resolve_choice_id` で実際に ID へ解決し、選んだ添字の
+    `label_order[idx]` と一致することを確認する。対応づけ (b) では
+    `choice_ids_by_label[label_order[idx]]` は `label_order[idx]` 自身の
+    トークン列なので理論上必ず一致するが、`_encode_choices` の呼び出し
+    契約が崩れた場合に `ok` を偽装しないよう、fail-closed に
+    `Unmapped("no_exact_match")` へ倒す経路を残す。
+
+    `len(loglik_row)` と `len(label_order)` の不一致は、呼び出し側が学習・
+    書き出し時と異なる選択肢集合を渡した実装バグであり、データの問題では
+    ないため `WorkerError`（runtime_error・exit 70）で即座に停止する
+    （黙って切り詰めない。coding-rust.md「外部入力の経路では添字アクセス
+    を使わず明示的に処理する」と同じ fail-closed の考え方）。
+    """
+    if len(loglik_row) != len(label_order):
+        raise WorkerError(
+            "runtime_error",
+            f"loglik row length {len(loglik_row)} does not match label_order length"
+            f" {len(label_order)}",
+            ExitCode.RUNTIME_ERROR,
+        )
+
+    probs = choice_posteriors(np.asarray(loglik_row))
+    if probs is None:
+        return Unmapped("invalid_score")
+
+    idx = int(np.argmax(np.asarray(loglik_row)))
+    label = label_order[idx]
+    resolved = resolve_choice_id(choice_ids_by_label[label], label_order)
+    if resolved != label:
+        return Unmapped("no_exact_match")
+    return Mapped(choice_id=resolved, index=idx, probs=tuple(float(p) for p in probs))
+
+
+def build_prediction_record(
+    record_id: str, mapping: ChoiceMapping, label_order: Sequence[str]
+) -> dict[str, Any]:
+    """1 件の予測レコード（評価器が採点できる形。`crates/core/src/
+    judgment.rs` の正常系スキーマ `{id, status, predicted_label, scores}` と
+    揃える。#80）を組み立てる。
+
+    `Mapped` のとき `status:"ok"`・`scores` は `label_order` の宣言順で
+    `{label: 事後確率}` を持つ dict にする（Python 3.7+ の dict は挿入順を
+    保つため、後から並べ替えない。`judgment.rs` の「`scores` のキー順は
+    定義ファイルの `options` の宣言順で固定する」契約と揃える）。
+    `Unmapped` のとき `status:"error"`・`predicted_label: None` とし、
+    `scores` は付けない（いずれも `crates/data/src/eval_input.rs` が受理
+    する値）。`reason_code` 等、Rust 側スキーマに無いフィールドは追加しない
+    （PoC-24 にあった `reason_code` は意図的に落とす。
+    coding-python.md「Python 側で独自のフィールドを増やさない」）。
+
+    `Unmapped` は現状 `status:"error"` として評価の分母に含まれる。#81・
+    TASK-19b.2 で「判定不能」を別の status として区別する場合は、Rust 側
+    （`crates/data::eval_input` の status 許可集合・
+    `crates/core::JudgmentStatus`）へ先に値を追加しなければ
+    `unknown_status` として拒否される。
+
+    `id` には入力本文を入れない契約（security.md）は呼び出し側
+    （`predict_records`）が守る前提で、ここでは型・非空・バイト長のみを
+    検証する（[`MAX_PREDICTION_ID_BYTES`]）。
+    """
+    if not isinstance(record_id, str) or not record_id:
+        raise WorkerError(
+            "invalid_request", "prediction id must be a non-empty string", ExitCode.INVALID_INPUT
+        )
+    id_len = len(record_id.encode("utf-8"))
+    if id_len > MAX_PREDICTION_ID_BYTES:
+        raise WorkerError(
+            "invalid_request",
+            f"prediction id exceeds {MAX_PREDICTION_ID_BYTES} utf-8 bytes ({id_len} bytes)",
+            ExitCode.INVALID_INPUT,
+        )
+
+    if isinstance(mapping, Mapped):
+        scores = {label: mapping.probs[i] for i, label in enumerate(label_order)}
+        return {
+            "id": record_id,
+            "status": "ok",
+            "predicted_label": mapping.choice_id,
+            "scores": scores,
+        }
+    return {"id": record_id, "status": "error", "predicted_label": None}
+
+
+def predict_records(
+    trained: AutoregressiveTrainedModel,
+    rows: Sequence[tuple[str, str]],
+    *,
+    chunk_size: int | None = None,
+    resource_budget: budget_mod.ResourceBudget | None = None,
+) -> list[dict[str, Any]]:
+    """学習ワーカー内で対応づけ (b) を確認するための推論経路（#80。PoC-24
+    `predict` 相当）。`rows` は `(id, input)` の列。
+
+    正解ラベル（gold）は受け取らない（REQ-27。推論関数へは `input` だけを
+    渡すという評価の独立性を、学習ワーカー内の確認経路でも維持する）。
+
+    `chunk_size`（既定は `trained.config["batch_size"]`、上限は
+    `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼び、チャンクの合間
+    で `resource_budget.check()` を呼ぶ（REQ-39。`_score_choices_mlx` は
+    `[N*K, L]` と attention の `[N*K, heads, L, L]` を確保するため、`N` を
+    無制限にしない）。
+
+    `id` の重複は検査しない（重複の検査はデータ契約層
+    `crates/data::eval_input` の責務であり、ここで評価ロジックを再実装
+    しない。coding-python.md「評価ロジックを Python に再実装しない」）。
+    """
+    if chunk_size is None:
+        chunk_size = int(trained.config.get("batch_size", DEFAULT_CONFIG["batch_size"]))
+    chunk_size = max(1, min(int(chunk_size), MAX_AR_BATCH_SIZE))
+
+    choice_id_list = [trained.choice_ids_by_label[label] for label in trained.label_order]
+
+    rows = list(rows)
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        id_lists = [encode_bytes(text, trained.max_bytes) for _row_id, text in chunk]
+        scores = _score_choices_mlx(trained.model, id_lists, choice_id_list)
+        for (row_id, _text), row in zip(chunk, scores, strict=True):
+            mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
+            records.append(build_prediction_record(row_id, mapping, trained.label_order))
+        if resource_budget is not None:
+            resource_budget.check()
+    return records
+
+
+def prediction_record_to_json_line(record: dict[str, Any]) -> str:
+    """予測レコードを JSON 1 行へ直列化する（#80。CLI の `infer --input-file`
+    契約〔evaluation-contract.md「入出力契約」〕と同じ「1 行 1 JSON」の形）。
+
+    鍵の順序は `id → status → predicted_label → scores`（`judgment.rs` の
+    直列化順に揃える。`build_prediction_record` がこの順で dict を作り、
+    `json.dumps` はその挿入順をそのまま書き出す）。`allow_nan=False` を
+    指定し、NaN・Infinity が紛れ込んだレコードを `WorkerError`
+    （runtime_error・exit 70）へ倒す（既定の `json.dumps` は `NaN` という
+    構文上不正な JSON リテラルをそのまま出してしまうため。「ソフトウェア
+    とデータの完全性」security.md）。
+    """
+    try:
+        return json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except ValueError as exc:
+        raise WorkerError(
+            "runtime_error",
+            f"prediction record failed to serialize to valid JSON: {exc}",
+            ExitCode.RUNTIME_ERROR,
+        ) from exc
 
 
 def _encode_input_examples(
