@@ -56,6 +56,17 @@
 //! 満たす入力であっても、漏洩が 0 件の場合に train 側の全 ID を無条件で複製すると、
 //! 許容範囲内の件数・長さだけで数百 MB 規模のメモリを追加確保しうる
 //! （reviewer 指摘 PR #195 追加分・security.md「ガード層: 資源の上限」）。
+//!
+//! 上記の件数上限（[`MAX_LEAK_CHECK_RECORDS`]）と 1 件あたりの ID・入力長上限
+//! （[`MAX_LEAK_CHECK_ID_BYTES`]・[`MAX_LEAK_CHECK_INPUT_BYTES`]）はいずれも
+//! 単独の値としては妥当でも、両方の上限いっぱいの入力（上限件数 ×
+//! 上限長の ID）を大量に漏洩・group 跨ぎと判定させると、複製された ID が
+//! 数百 MB 規模のメモリを確保しうる（reviewer 指摘 PR #195: 件数上限
+//! `MAX_LEAK_CHECK_RECORDS` 分の ID を ID 長上限いっぱいまで漏洩させると
+//! 約 800MB 超になりうる）。そこで ID・group ID・入力の byte 長の合計にも
+//! 別途 [`MAX_LEAK_CHECK_TOTAL_BYTES`] を設け、[`validate_resource_limits`] の
+//! 入口で拒否する（件数上限・個別長上限のどちらも満たしていても、合計が
+//! 上限を超えれば処理しない）。
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -78,6 +89,17 @@ pub const MAX_LEAK_CHECK_ID_BYTES: usize = 4096;
 /// 「資源の上限」）。ID 長と同じ暫定値を流用する。
 pub const MAX_LEAK_CHECK_INPUT_BYTES: usize = 4096;
 
+/// ID・group ID・入力（[`LeakCheckable::id`]・[`LeakCheckable::group_id`]・
+/// [`LeakCheckable::input`]）の byte 長の合計（train + validation + test +
+/// evaluation 全レコード分）の上限（暫定値。同上）。
+///
+/// 件数上限（[`MAX_LEAK_CHECK_RECORDS`]）・個別長上限（[`MAX_LEAK_CHECK_ID_BYTES`]・
+/// [`MAX_LEAK_CHECK_INPUT_BYTES`]）を両方満たす入力でも、上限いっぱいの長さの
+/// レコードを上限件数ぶん並べると `find_input_leaks`・`find_group_straddles` が
+/// ID を複製する経路で数百 MB 規模のメモリを追加確保しうる（reviewer 指摘 PR #195・
+/// REQ-39「ガード層: 資源の上限」）。本モジュール先頭のドキュメントコメント参照。
+pub const MAX_LEAK_CHECK_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// [`validate_resource_limits`] が検出する、公開 API の入口で拒否すべき違反
 /// （REQ-39・security.md「ガード層: 資源の上限」。reviewer 指摘 PR #195）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +116,13 @@ pub enum LeakCheckError {
     /// 入力そのものはエラーに含めない（データ本文をログ・エラーメッセージへ
     /// 転記しない。security.md「秘密情報の混入防止」）。
     InputTooLong { len: usize, limit: usize },
+    /// ID・group ID・入力の byte 長の合計（全レコード分）が
+    /// [`MAX_LEAK_CHECK_TOTAL_BYTES`] を超えた。
+    ///
+    /// 件数・個別長の上限を両方満たしていても、合計 byte 数が大きいと
+    /// ID の複製経路（[`InputLeak::train_ids`] 等）で数百 MB 規模のメモリを
+    /// 追加確保しうるため、個別の上限とは別に検証する（reviewer 指摘 PR #195）。
+    TotalBytesExceeded { total: usize, limit: usize },
 }
 
 /// 漏洩・group 跨ぎ検出の対象になるレコードが満たす最小の契約。
@@ -195,6 +224,11 @@ pub fn validate_resource_limits<R: LeakCheckable>(
         });
     }
 
+    // 個別長の検証と並行して、ID・group ID・入力の byte 長の合計（全レコード分）を
+    // 積算する。`saturating_add` を使い、万一の桁あふれでラップアラウンドして
+    // 上限判定をすり抜けることを防ぐ（オーバーフロー時は `usize::MAX` に張り付き、
+    // 以降 `MAX_LEAK_CHECK_TOTAL_BYTES` 判定に必ず抵触する）。
+    let mut total_bytes: usize = 0;
     for records in all_partitions {
         for record in records {
             let id_len = record.id().len();
@@ -216,6 +250,17 @@ pub fn validate_resource_limits<R: LeakCheckable>(
                 return Err(LeakCheckError::InputTooLong {
                     len: input_len,
                     limit: MAX_LEAK_CHECK_INPUT_BYTES,
+                });
+            }
+
+            total_bytes = total_bytes
+                .saturating_add(id_len)
+                .saturating_add(group_id_len)
+                .saturating_add(input_len);
+            if total_bytes > MAX_LEAK_CHECK_TOTAL_BYTES {
+                return Err(LeakCheckError::TotalBytesExceeded {
+                    total: total_bytes,
+                    limit: MAX_LEAK_CHECK_TOTAL_BYTES,
                 });
             }
         }
@@ -245,9 +290,17 @@ pub struct InputLeak {
 /// 入力漏洩の検出結果一式。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InputLeakReport {
-    /// 並び順は `(partition, other_ids の最小値)` の昇順で決定的にする。
+    /// 並び順は `(partition, other_ids 全体の辞書順)` の昇順で決定的にする。
     /// 入力 byte そのものの順には依存させない（本文の内容が並び順から
     /// 推測されることも避ける。security.md）。
+    ///
+    /// `other_ids` の最小値だけを比較キーにすると、ID の一意性が保証されない
+    /// 場合（同一 ID を持つ異なるレコードが複数の分割に存在する等）に
+    /// 最小値が同点になり得て、その際の順序が `other_index`（`BTreeMap`）の
+    /// 入力 byte の走査順に依存してしまう（reviewer 指摘 PR #195）。
+    /// `other_ids`（各要素は昇順ソート済み）を丸ごと辞書式比較することで、
+    /// 同点は「2 つの漏洩の ID 集合が完全に一致する」場合に限られ、その場合は
+    /// 元々区別する情報が無いため、入力 byte 順への依存は生じない。
     pub leaks: Vec<InputLeak>,
 }
 
@@ -354,11 +407,9 @@ pub fn find_input_leaks<R: LeakCheckable>(
     }
 
     leaks.sort_by(|a, b| {
-        a.partition.cmp(&b.partition).then_with(|| {
-            let a_min = a.other_ids.first();
-            let b_min = b.other_ids.first();
-            a_min.cmp(&b_min)
-        })
+        a.partition
+            .cmp(&b.partition)
+            .then_with(|| a.other_ids.cmp(&b.other_ids))
     });
 
     Ok(InputLeakReport { leaks })
@@ -924,6 +975,89 @@ mod tests {
                 len: MAX_LEAK_CHECK_INPUT_BYTES + 1,
                 limit: MAX_LEAK_CHECK_INPUT_BYTES,
             })
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195 P0）: 件数上限
+    /// （`MAX_LEAK_CHECK_RECORDS`）・個別長上限（`MAX_LEAK_CHECK_ID_BYTES`・
+    /// `MAX_LEAK_CHECK_INPUT_BYTES`）をいずれも満たす入力でも、ID・group ID・
+    /// 入力の byte 長の合計が `MAX_LEAK_CHECK_TOTAL_BYTES` を超えると、索引化・
+    /// 複製を行わずに `LeakCheckError::TotalBytesExceeded` を返す（複製された
+    /// ID が数百 MB 規模のメモリを確保しうる懸念への回帰防止）。
+    #[test]
+    fn req16_task16_2_1_rejects_total_bytes_over_limit_even_within_per_record_limits() {
+        // 1 件あたり id + group_id + input で MAX_LEAK_CHECK_ID_BYTES 分の長さを持つ
+        // レコードを、合計が MAX_LEAK_CHECK_TOTAL_BYTES を超えるだけの件数だけ
+        // 用意する（件数自体は MAX_LEAK_CHECK_RECORDS を大きく下回る）。
+        let per_record_bytes = MAX_LEAK_CHECK_ID_BYTES;
+        let record_count = MAX_LEAK_CHECK_TOTAL_BYTES / per_record_bytes + 1;
+        assert!(
+            record_count < MAX_LEAK_CHECK_RECORDS,
+            "件数上限にはまだ余裕がある入力で合計 byte 数だけを超過させるテスト前提が崩れている"
+        );
+
+        let long_id = "a".repeat(per_record_bytes);
+        let train: Vec<TestRecord> = (0..record_count)
+            .map(|_| TestRecord {
+                id: long_id.clone(),
+                input: Vec::new(),
+                group_id: String::new(),
+            })
+            .collect();
+        let partitions = empty_partitions(&train);
+
+        let result = find_input_leaks(&partitions);
+        match result {
+            Err(LeakCheckError::TotalBytesExceeded { total, limit }) => {
+                assert!(total > MAX_LEAK_CHECK_TOTAL_BYTES);
+                assert_eq!(limit, MAX_LEAK_CHECK_TOTAL_BYTES);
+            }
+            other => panic!("TotalBytesExceeded を期待したが {other:?} だった"),
+        }
+        assert!(matches!(
+            find_group_straddles(&partitions),
+            Err(LeakCheckError::TotalBytesExceeded { .. })
+        ));
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195 P2）: `other_ids` の
+    /// 最小値だけでなく列全体を比較キーにすることで、複数の漏洩の `other_ids`
+    /// 最小値が同点でも、実際の ID 集合が異なれば入力 byte の走査順（`BTreeMap`
+    /// の順）に依存せず一意に順序が決まる（ID の一意性が保証されない場合の
+    /// 並び順が入力 byte 順に依存しうるという懸念への回帰防止）。
+    #[test]
+    fn req16_task16_2_1_leak_order_uses_full_other_ids_not_only_minimum() {
+        // 2 つの train 入力がそれぞれ test 側の異なる入力へ漏洩し、両方の
+        // other_ids の最小値が同じ "id1" になるが、2 件目の集合には最小値の
+        // 他に "id2" が追加で含まれる（最小値だけの比較では順序が同点になり、
+        // その場合の実装依存の tie-break が入力 byte 順に依存しうる）。
+        let train = vec![
+            record("t_z", "z-input", "g1"),
+            record("t_a", "a-input", "g2"),
+        ];
+        let test = vec![
+            // "z-input"（BTreeMap 走査順では後）が other_ids = ["id1"] のみ。
+            record("id1", "z-input", "gx1"),
+            // "a-input"（BTreeMap 走査順では先）が other_ids = ["id1", "id2"]
+            // （同一 ID "id1" が別レコードにも使われている、一意性非保証のケース）。
+            record("id1", "a-input", "gx2"),
+            record("id2", "a-input", "gx2"),
+        ];
+        let partitions = Partitions {
+            train: &train,
+            validation: None,
+            test: Some(&test),
+            evaluation: None,
+        };
+
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
+        assert_eq!(report.leaks.len(), 2);
+        // 全体比較では ["id1"] < ["id1", "id2"]（短い方が辞書式に先）となり、
+        // 入力 byte の走査順（"a-input" が先）とは無関係に一意に定まる。
+        assert_eq!(report.leaks[0].other_ids, vec!["id1".to_string()]);
+        assert_eq!(
+            report.leaks[1].other_ids,
+            vec!["id1".to_string(), "id2".to_string()]
         );
     }
 }
