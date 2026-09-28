@@ -290,17 +290,20 @@ pub struct InputLeak {
 /// 入力漏洩の検出結果一式。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InputLeakReport {
-    /// 並び順は `(partition, other_ids 全体の辞書順)` の昇順で決定的にする。
-    /// 入力 byte そのものの順には依存させない（本文の内容が並び順から
-    /// 推測されることも避ける。security.md）。
+    /// 並び順は `(partition, other_ids 全体の辞書順, train_ids 全体の辞書順)` の
+    /// 昇順で決定的にする。入力 byte そのものの順には依存させない（本文の内容が
+    /// 並び順から推測されることも避ける。security.md）。
     ///
     /// `other_ids` の最小値だけを比較キーにすると、ID の一意性が保証されない
     /// 場合（同一 ID を持つ異なるレコードが複数の分割に存在する等）に
     /// 最小値が同点になり得て、その際の順序が `other_index`（`BTreeMap`）の
     /// 入力 byte の走査順に依存してしまう（reviewer 指摘 PR #195）。
-    /// `other_ids`（各要素は昇順ソート済み）を丸ごと辞書式比較することで、
-    /// 同点は「2 つの漏洩の ID 集合が完全に一致する」場合に限られ、その場合は
-    /// 元々区別する情報が無いため、入力 byte 順への依存は生じない。
+    /// `other_ids`（各要素は昇順ソート済み）を丸ごと辞書式比較しても、
+    /// `partition` と `other_ids` の両方が同点になり得る（同一の `other_ids`
+    /// 集合を持つ異なる入力が、異なる `train_ids` を伴って複数存在する場合。
+    /// Bugbot / Codex 指摘 PR #195）。この場合に区別する情報を欠くと
+    /// `other_index`（`BTreeMap`）の入力 byte 走査順が残ってしまうため、
+    /// `train_ids` も比較キーへ加えて入力 byte 順への依存を断つ。
     pub leaks: Vec<InputLeak>,
 }
 
@@ -410,6 +413,7 @@ pub fn find_input_leaks<R: LeakCheckable>(
         a.partition
             .cmp(&b.partition)
             .then_with(|| a.other_ids.cmp(&b.other_ids))
+            .then_with(|| a.train_ids.cmp(&b.train_ids))
     });
 
     Ok(InputLeakReport { leaks })
@@ -866,6 +870,44 @@ mod tests {
             find_group_straddles(&partitions_a),
             find_group_straddles(&partitions_b)
         );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195・Bugbot / Codex）:
+    /// `partition`・`other_ids` が同点でも `train_ids` が異なれば、その
+    /// `train_ids` の辞書順で並び順が決まり、`other_index`（`BTreeMap`）の
+    /// 入力 byte 走査順には依存しない。
+    ///
+    /// 2 つの入力 `"leak-input-A"`・`"leak-input-B"`（byte 順で A < B）を
+    /// それぞれ異なる train ID（"tZ"・"tA"）に対応させ、両方とも test 側で
+    /// 同じ ID `"x1"` から漏洩したことにして `other_ids` を同点にする。
+    /// `train_ids` を比較キーに加えないと、押し込み順（`other_index` の
+    /// 入力 byte 順 = A→B）がそのまま安定ソートで残り、A（train_ids=["tZ"]）
+    /// が先頭に来てしまう。`train_ids` の辞書順（"tA" < "tZ"）で正しく
+    /// B・A の順になることを確認する。
+    #[test]
+    fn req16_task16_2_1_leak_order_breaks_tie_by_train_ids() {
+        let train = vec![
+            record("tZ", "leak-input-A", "gz"),
+            record("tA", "leak-input-B", "ga"),
+        ];
+        let test = vec![
+            record("x1", "leak-input-A", "gz"),
+            record("x1", "leak-input-B", "ga"),
+        ];
+        let partitions = Partitions {
+            train: &train,
+            validation: None,
+            test: Some(&test),
+            evaluation: None,
+        };
+
+        let report = find_input_leaks(&partitions).expect("上限以下の入力");
+        assert_eq!(report.leaks.len(), 2);
+        // 同点（partition・other_ids）の 2 件が train_ids の辞書順（"tA" < "tZ"）で並ぶ。
+        assert_eq!(report.leaks[0].train_ids.as_ref(), ["tA".to_string()]);
+        assert_eq!(report.leaks[0].other_ids, vec!["x1".to_string()]);
+        assert_eq!(report.leaks[1].train_ids.as_ref(), ["tZ".to_string()]);
+        assert_eq!(report.leaks[1].other_ids, vec!["x1".to_string()]);
     }
 
     /// REQ-16 異常系・TASK-16.2-1: `inspect_leakage` が両方の検出結果をまとめて返す。
