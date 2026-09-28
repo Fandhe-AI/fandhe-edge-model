@@ -29,6 +29,21 @@
 //!   書き込めるため、[`place_read_only`] は書き込みを防げない配置を
 //!   「配置済み」と装わず、[`PlacementError::WriteNotRejected`] で
 //!   fail-closed に失敗させる（後述「root・ACL の扱い」）
+//! - **ハードリンクされたファイルへの権限変更は拒否する**（unix。
+//!   `st_nlink != 1`）。`(dev, ino)` の一致だけではハードリンクを検出
+//!   できず、許可ルート内のパスがルート外ファイルへのハードリンク
+//!   だった場合に `set_permissions` がそのルート外 inode の権限を
+//!   変更してしまう（issue #227 codex[bot] P0 指摘）。本モジュールは
+//!   経路の閉じ込め自体は行わない前提のため、リンク数を見て「単独の
+//!   実体か」を確認することでこの経路を閉じる
+//! - **非 unix では読み取り専用配置そのものを拒否する**
+//!   （[`PlacementError::UnsupportedPlatform`]）。Windows には
+//!   `(dev, ino)` 相当の安価な同一性検査手段が無く、検査用ハンドルを
+//!   閉じてパス経由で権限変更する実装は検査後の差し替え（TOCTOU）を
+//!   防げない（issue #227 codex[bot] P1 指摘）。ハンドルに結び付けた
+//!   権限変更（Win32 API・`unsafe` FFI が必要）は M10 時点で対象外の
+//!   OS 向けの実装として見送り、「実装済みを装わない」
+//!   （`.claude/rules/coding-rust.md`）ため fail-closed に拒否する
 //! - **CLI の出力 JSON 全体の形は決めない**。入出力契約は TASK-33.3 に委ねる
 //!
 //! # 手順（[`place_read_only`]）
@@ -36,13 +51,16 @@
 //! 1. `symlink_metadata` で symlink・非通常ファイルを拒否する（リンク先が
 //!    評価ディレクトリ外かもしれないファイルの権限を、本関数の副作用で
 //!    書き換えないため）
-//! 2. [`fandhe_edge_core::fs::open_regular_file_for_read`] で開く
+//! 2. [`fandhe_edge_core::fs::open_regular_file_for_read`] で開く（非 unix
+//!    ではここで [`PlacementError::UnsupportedPlatform`] として拒否する）
 //! 3. unix では、手順 1 の `(dev, ino)` と開いたハンドルのそれを突き合わせ、
-//!    検査からオープンまでの差し替え（TOCTOU）を検出する
+//!    検査からオープンまでの差し替え（TOCTOU）を検出する。続けて
+//!    ハンドルの `st_nlink` が 1 であることを確認し、ハードリンクされた
+//!    ファイル（ルート外ファイルへのハードリンクかもしれない）への
+//!    権限変更を拒否する
 //! 4. ハンドル経由で権限を `0o444`（読み取り専用・setuid/setgid/sticky・
-//!    実行ビットなし）に変更する（unix）。非 unix ではパス経由で
-//!    読み取り専用属性を立てる（Windows の `File::set_permissions` は
-//!    読み取り専用ハンドルでは失敗しうるため）
+//!    実行ビットなし）に変更する（unix のみ。非 unix は手順 2 で既に
+//!    拒否済み）
 //! 5. 反映を確認する
 //! 6. [`verify_direct_write_rejected`] を呼び、実際に書き込みが拒否される
 //!    ことを確認できた場合に限り成功とする（fail-closed）
@@ -85,25 +103,17 @@ use std::path::{Path, PathBuf};
 /// （形だけの「配置済み」偽装を防ぐ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOnlyPlacement {
-    #[cfg(unix)]
+    // unix のみ。非 unix では `place_read_only` が
+    // `PlacementError::UnsupportedPlatform` を返すため本型は構築されない
+    // （モジュール doc「責務の境界」）。
     mode: u32,
-    #[cfg(not(unix))]
-    readonly: bool,
 }
 
 impl ReadOnlyPlacement {
     /// 配置後の unix パーミッションビット（`mode & 0o7777`）。
-    #[cfg(unix)]
     #[must_use]
     pub fn mode(&self) -> u32 {
         self.mode
-    }
-
-    /// 配置後に読み取り専用属性が立っているか（非 unix）。
-    #[cfg(not(unix))]
-    #[must_use]
-    pub fn is_readonly(&self) -> bool {
-        self.readonly
     }
 }
 
@@ -127,6 +137,25 @@ pub enum PlacementError {
     /// ファイルシステム等、mode ビットの設定だけでは書き込みを防げない
     /// 状況を検出する（fail-closed。モジュール doc「root・ACL の扱い」）。
     WriteNotRejected { path: PathBuf },
+    /// パス先がハードリンクされている（`st_nlink != 1`。unix 限定）。
+    ///
+    /// `(dev, ino)` の一致だけではハードリンクを検出できず、許可ルート内の
+    /// パスがルート外ファイルへのハードリンクだった場合に権限変更がその
+    /// ルート外 inode に及んでしまう（issue #227 codex[bot] P0 指摘）。
+    /// 単独の実体（リンク数 1）であることを確認できない限り権限変更を
+    /// 拒否する（fail-closed）。
+    HardLinked { path: PathBuf, nlink: u64 },
+    /// 非 unix プラットフォームでは読み取り専用配置そのものを拒否する。
+    ///
+    /// Windows には `(dev, ino)` 相当の安価な同一性検査手段が無く、検査用
+    /// ハンドルを閉じてパス経由で権限変更すると検査後の差し替え
+    /// （TOCTOU）を防げない（issue #227 codex[bot] P1 指摘）。ハンドルに
+    /// 結び付けた権限変更には Win32 API 呼び出し（`unsafe` FFI）が要るが
+    /// M10 時点で Windows は対象外 OS のため実装せず、「実装済みを装わ
+    /// ない」（`.claude/rules/coding-rust.md`）方針で fail-closed に拒否
+    /// する。将来 Windows 対応する際は、ハンドルに結び付けた同一性検査
+    /// 付きの実装に置き換える（TASK-17.2-2 の将来仕様）。
+    UnsupportedPlatform { path: PathBuf },
     /// 本モジュールの前提条件（通常ファイル判定・開いての読み込み）を
     /// 満たせなかった（[`fandhe_edge_core::fs`] 由来）。
     Fs(FsError),
@@ -160,6 +189,18 @@ impl fmt::Display for PlacementError {
                 "{} is still writable after setting read-only permissions",
                 path.display()
             ),
+            PlacementError::HardLinked { path, nlink } => {
+                write!(
+                    f,
+                    "{} has {nlink} hard links, refusing to change permissions",
+                    path.display()
+                )
+            }
+            PlacementError::UnsupportedPlatform { path } => write!(
+                f,
+                "{} cannot be placed read-only on this platform",
+                path.display()
+            ),
             PlacementError::Fs(source) => write!(f, "{source}"),
             PlacementError::Io { path, source } => {
                 write!(
@@ -180,7 +221,9 @@ impl std::error::Error for PlacementError {
             PlacementError::Symlink { .. }
             | PlacementError::NotRegularFile { .. }
             | PlacementError::Replaced { .. }
-            | PlacementError::WriteNotRejected { .. } => None,
+            | PlacementError::WriteNotRejected { .. }
+            | PlacementError::HardLinked { .. }
+            | PlacementError::UnsupportedPlatform { .. } => None,
         }
     }
 }
@@ -226,10 +269,20 @@ fn dev_ino(meta: &std::fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
+/// ハードリンク数（`st_nlink`）を返す（unix 限定。[`PlacementError::HardLinked`]
+/// の判定に使う）。
+#[cfg(unix)]
+fn nlink_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink()
+}
+
 /// 評価データ本体を読み取り専用配置にする（REQ-39・REQ-17・TASK-17.2-2）。
 ///
-/// モジュール doc「手順」を参照。冪等: 既に `0o444`（unix）／読み取り専用
-/// （非 unix）であるファイルに対して呼んでも成功する。
+/// モジュール doc「手順」を参照。unix では冪等（既に `0o444` であるファイル
+/// に対して呼んでも成功する）。非 unix では常に
+/// [`PlacementError::UnsupportedPlatform`] を返す（モジュール doc
+/// 「責務の境界」）。
 pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError> {
     let pre_meta = check_not_symlink(path)?;
 
@@ -252,6 +305,18 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
         if dev_ino(&pre_meta) != dev_ino(&opened_meta) {
             return Err(PlacementError::Replaced {
                 path: path.to_path_buf(),
+            });
+        }
+
+        // ハードリンクされたファイル（`st_nlink != 1`）への権限変更は
+        // 拒否する。`(dev, ino)` の一致検査はパスの差し替え（TOCTOU）は
+        // 検出できるが、パス自体がルート外ファイルへのハードリンク
+        // だった場合は検出できない（issue #227 codex[bot] P0 指摘）。
+        let nlink = nlink_count(&opened_meta);
+        if nlink != 1 {
+            return Err(PlacementError::HardLinked {
+                path: path.to_path_buf(),
+                nlink,
             });
         }
 
@@ -286,42 +351,21 @@ pub fn place_read_only(path: &Path) -> Result<ReadOnlyPlacement, PlacementError>
 
     #[cfg(not(unix))]
     {
-        // SAFETY(非 unix): 読み取り専用ハンドル経由の権限変更は Windows で
-        // `FILE_WRITE_ATTRIBUTES` を要求され失敗しうるため、パス経由で行う
-        // （モジュール doc「手順」参照）。事前検査（`check_not_symlink`・
-        // `open_regular_file_for_read`）は既に通過済みだが、パス経由のため
-        // ここでの TOCTOU 対策は unix ほど強くない（M10 時点で対象外 OS。
-        // `(dev, ino)` に相当する安価な同一性検査手段がないため）。
-        let _ = &pre_meta;
-        drop(file);
-        let mut perms = std::fs::metadata(path)
-            .map_err(|source| PlacementError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(path, perms).map_err(|source| PlacementError::Io {
+        // 非 unix（Windows）では読み取り専用配置そのものを拒否する
+        // （[`PlacementError::UnsupportedPlatform`]。モジュール doc
+        // 「手順」・「責務の境界」参照）。検査用ハンドルを閉じてパス経由で
+        // 権限変更する実装は、検査（`check_not_symlink`）とオープン
+        // （`open_regular_file_for_read`）の後に path が symlink や
+        // 別ファイルへ差し替えられても検出できない（issue #227
+        // codex[bot] P1 指摘）。Windows には unix の `(dev, ino)` に相当する
+        // 安価な同一性検査手段が無く、ハンドルに結び付けた権限変更には
+        // `unsafe` な Win32 API 呼び出しが要るため、M10 時点で対象外の
+        // Windows 向けに未検証の実装を「実装済みを装う」形で残さず、
+        // fail-closed に拒否する。
+        let _ = (&pre_meta, file);
+        Err(PlacementError::UnsupportedPlatform {
             path: path.to_path_buf(),
-            source,
-        })?;
-
-        let readonly = std::fs::metadata(path)
-            .map_err(|source| PlacementError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions()
-            .readonly();
-        if !readonly {
-            return Err(PlacementError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::other("read-only attribute did not converge"),
-            });
-        }
-
-        verify_direct_write_rejected(path)?;
-        Ok(ReadOnlyPlacement { readonly })
+        })
     }
 }
 
@@ -698,6 +742,74 @@ mod tests {
             target_mode, 0o444,
             "symlink 拒否がリンク先の権限を変えてはならない"
         );
+    }
+
+    /// REQ-39: ハードリンクされたファイルを渡すと `HardLinked` として
+    /// 拒否され、リンク先（同一 inode を指すもう一方のパス）の権限も
+    /// 変更されない（issue #227 codex[bot] P0 指摘。`(dev, ino)` の一致
+    /// 検査だけではハードリンクを検出できないため、別途 `st_nlink` を
+    /// 見て拒否することを確認する）。
+    #[cfg(unix)]
+    #[test]
+    fn req39_place_read_only_rejects_hard_linked_file() {
+        let original = write_unique_temp_file("hardlink-original", b"eval data");
+        let link_path = std::env::temp_dir().join(format!(
+            "fandhe-edge-data-frozen-placement-unit-{}-hardlink-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::hard_link(&original.0, &link_path).expect("ハードリンクを作成できるはず");
+
+        let result = place_read_only(&link_path);
+        let _ = std::fs::remove_file(&link_path);
+
+        match result.expect_err("ハードリンクされたファイルは拒否されるはず") {
+            PlacementError::HardLinked { nlink, .. } => assert_eq!(nlink, 2),
+            other => panic!("HardLinked を期待したが {other:?} だった"),
+        }
+
+        // 元ファイル（同一 inode）の mode が元のまま（書き込み可）で
+        // あることを確認する（本モジュールの副作用がルート外実体へ
+        // 及んでいないことの直接証拠）。
+        use std::os::unix::fs::PermissionsExt as _;
+        let original_mode = std::fs::metadata(&original.0)
+            .expect("元ファイルのメタデータを取得できるはず")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_ne!(
+            original_mode, 0o444,
+            "ハードリンク拒否が元ファイルの権限を変えてはならない"
+        );
+    }
+
+    /// REQ-39: 非 unix では `place_read_only` が常に `UnsupportedPlatform`
+    /// を返す（issue #227 codex[bot] P1 指摘。ハンドルに結び付けない
+    /// パス経由の権限変更は TOCTOU を防げないため fail-closed に拒否する
+    /// 方針。モジュール doc「責務の境界」）。
+    #[cfg(not(unix))]
+    #[test]
+    fn req39_place_read_only_is_unsupported_on_non_unix() {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-edge-data-frozen-placement-unit-{}-non-unix-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"eval data").expect("テスト用ファイルを作成できるはず");
+
+        let result = place_read_only(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match result.expect_err("非 unix では常に拒否されるはず") {
+            PlacementError::UnsupportedPlatform { .. } => {}
+            other => panic!("UnsupportedPlatform を期待したが {other:?} だった"),
+        }
     }
 
     /// REQ-39: FIFO（名前付きパイプ）を渡しても無期限に停止せず
