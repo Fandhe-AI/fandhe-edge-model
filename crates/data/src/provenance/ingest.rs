@@ -25,6 +25,7 @@
 //! | `prompt_sha256` | [`crate::provenance::PromptHash`]（計算済みハッシュを受け取るのみ） |
 //! | `started_utc` | [`crate::provenance::GeneratedAt`]（`Z`／`+00:00` のみ） |
 //! | `usage_observed` | `null` → [`crate::provenance::TokenCount::Unobserved`]、object → `Observed`（`input_tokens`・`output_tokens` のみ採用） |
+//! | `source`（任意。TASK-40.2・issue #76） | [`crate::provenance::GenerationSource`]（許可リスト。欠落時は `Unspecified`） |
 //!
 //! 上記以外のキー（`cmd`・`cwd`・`ended_utc`・`returncode`・`prompt_file`
 //! 等。`cmd`・`cwd` には絶対パス等が入りうる）は読み取らず、記録にも
@@ -34,15 +35,21 @@
 //!
 //! `usage_observed` キー自体が欠落している場合は
 //! [`ProvenanceIngestError::MissingField`] とする（明示的な `null` =
-//! 観測できなかった、と区別するため）。
+//! 観測できなかった、と区別するため）。`source` キー自体が欠落している
+//! 場合は [`crate::provenance::GenerationSource::Unspecified`]（非 Jev）を
+//! 既定値とし、エラーにしない（PoC-10／PoC-11 の `meta.json` には `source`
+//! が無く、既存の生成ログの取り込みを壊さない判断。TASK-40.2）。
 //!
 //! # 範囲外（本モジュールでは実装しない）
 //!
 //! - 指示文本文から sha256 を計算する処理（`sha2` の data 層配置・
 //!   `data → core` 依存はユーザー承認事項。本モジュールは計算済みハッシュ
 //!   〔`prompt_sha256`〕の取り込みのみ行う）
-//! - `source`（生成元）フィールド・来歴が無いデータの拒否・外部 LLM 出力の
-//!   既定拒否（TASK-40.2 の範囲。PoC-20 ケース 9）
+//! - 来歴が無いデータ（`provenance_json` が `None`）の拒否可否は
+//!   TASK-40.2 で「許可する」と判断済み（[`crate::ingest::ingest_records`]
+//!   の doc を参照）。来歴が **ある** 場合の採用可否の方針は
+//!   [`crate::provenance::check_default_training_source`] が担い、本モジュールは
+//!   来歴 JSON の解析のみを行う
 //! - 記録 JSON（[`provenance_to_json`] の出力）を読み戻す関数
 //!   （必要になった時点で追加する。YAGNI）
 
@@ -52,7 +59,8 @@ use serde_json::{Map, Value};
 
 use crate::json_keys::has_duplicate_key;
 use crate::provenance::{
-    GeneratedAt, ModelName, ProvenanceError, ProvenanceRecord, TokenCount, TokenUsage,
+    GeneratedAt, GenerationSource, ModelName, ProvenanceError, ProvenanceRecord, TokenCount,
+    TokenUsage,
 };
 
 /// 来歴 JSON の検証・構築時のエラー。
@@ -220,12 +228,29 @@ pub fn parse_provenance_json(content: &str) -> Result<ProvenanceRecord, Provenan
         }
     };
 
-    Ok(ProvenanceRecord::new(
-        model_name,
-        prompt_hash,
-        generated_at,
-        token_count,
-    ))
+    // source: キー自体の欠落は Unspecified（非 Jev）とし、明示的な値は
+    // 許可リスト照合する（モジュール doc「受け付けるキー」参照。
+    // TASK-40.2・issue #76）。null・非文字列は型不正として拒否する
+    // （欠落〔許可〕と null〔拒否〕を区別する）。
+    let source = match object.get("source") {
+        None => GenerationSource::Unspecified,
+        Some(value) => {
+            let source_str = value
+                .as_str()
+                .ok_or(ProvenanceIngestError::InvalidFieldType("source"))?;
+            GenerationSource::from_wire(source_str).map_err(|source| {
+                ProvenanceIngestError::InvalidField {
+                    field: "source",
+                    source,
+                }
+            })?
+        }
+    };
+
+    Ok(
+        ProvenanceRecord::new(model_name, prompt_hash, generated_at, token_count)
+            .with_source(source),
+    )
 }
 
 /// `usage_observed` オブジェクトから 1 フィールド（`input_tokens`・
@@ -268,6 +293,10 @@ pub fn provenance_to_json(record: &ProvenanceRecord) -> String {
     root.insert(
         "prompt_sha256".to_string(),
         Value::String(record.prompt_hash().to_hex()),
+    );
+    root.insert(
+        "source".to_string(),
+        Value::String(record.source().as_wire_str().to_string()),
     );
 
     let mut token_count = Map::new();

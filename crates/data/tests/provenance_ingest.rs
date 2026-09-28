@@ -77,7 +77,7 @@ fn req40_provenance_to_json_matches_canonical_form() {
     let json = provenance_to_json(&record);
 
     let expected = format!(
-        "{{\"generated_at\":\"{SAMPLE_GENERATED_AT_CANONICAL}\",\"model_name\":\"{SAMPLE_MODEL_NAME}\",\"prompt_sha256\":\"{SAMPLE_PROMPT_HASH_HEX}\",\"token_count\":{{\"input_tokens\":14095,\"output_tokens\":6795,\"status\":\"observed\"}}}}"
+        "{{\"generated_at\":\"{SAMPLE_GENERATED_AT_CANONICAL}\",\"model_name\":\"{SAMPLE_MODEL_NAME}\",\"prompt_sha256\":\"{SAMPLE_PROMPT_HASH_HEX}\",\"source\":\"unspecified\",\"token_count\":{{\"input_tokens\":14095,\"output_tokens\":6795,\"status\":\"observed\"}}}}"
     );
     assert_eq!(json, expected);
 }
@@ -126,7 +126,8 @@ fn req40_ingest_records_with_provenance_matches_standalone_inspect() {
 }
 
 /// `provenance_json = None` の場合、`provenance` は `None` になり、
-/// `inspect` は同一であること（来歴が無いデータの拒否は TASK-40.2 の範囲）。
+/// `inspect` は同一であること（来歴が無いデータは TASK-40.2 で許可と判断
+/// 済み。issue #76）。
 #[test]
 fn req40_ingest_records_without_provenance_json_is_not_rejected() {
     let content = "{\"id\":\"r1\",\"input\":\"hello\",\"output\":{\"intent\":\"ok\"}}";
