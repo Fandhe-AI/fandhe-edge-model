@@ -20,6 +20,9 @@
 //!   既知解データセットの Macro-F1 が 49/78・0.4 という誤った値になっていた
 //!   経緯がある。本実装ではこの誤りを再現しない）
 //!
+//! Wilson 95% 信頼区間は本モジュールではなく [`crate::wilson`] に実装し、
+//! [`Ratio::ci95`] から呼び出す（TASK-24.1-2・issue #60）。
+//!
 //! # 資源上限
 //!
 //! 計算量は `records` の長さとラベル数に比例し、確保するメモリは
@@ -135,9 +138,10 @@ impl fmt::Display for EvalError {
 impl std::error::Error for EvalError {}
 
 /// 分子・分母を保持する比率。フィールドは非公開にし、分母 0 の壊れた値
-/// （例: `denominator: 0` かつ `value: f64::NAN`）を外部から構築できない
-/// ようにする（`.claude/rules/coding-rust.md`「判定結果...は壊れた値を
-/// 表現できない型にする」）。生成は [`Ratio::new`] に集約する。
+/// （例: `denominator: 0` かつ `value: f64::NAN`）や `numerator > denominator`
+/// の壊れた値を外部から構築できないようにする（`.claude/rules/coding-rust.md`
+/// 「判定結果...は壊れた値を表現できない型にする」）。生成は [`Ratio::new`] に
+/// 集約する。不変条件: `0 < denominator` かつ `numerator <= denominator`。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ratio {
     numerator: u64,
@@ -146,9 +150,12 @@ pub struct Ratio {
 }
 
 impl Ratio {
-    /// 分母が 0 のとき `None` を返す（評価契約: 分母 0 は null）。
+    /// 分母が 0、または `numerator > denominator`（壊れた比率）のとき `None`
+    /// を返す（評価契約: 分母 0 は null。本モジュール内の呼び出しは常に
+    /// `numerator <= denominator` を満たすため挙動は変わらないが、型で
+    /// 不変条件を守るための検証を追加する）。
     fn new(numerator: u64, denominator: u64) -> Option<Ratio> {
-        if denominator == 0 {
+        if denominator == 0 || numerator > denominator {
             return None;
         }
         Some(Ratio {
@@ -171,6 +178,16 @@ impl Ratio {
     /// `numerator as f64 / denominator as f64`。
     pub fn value(&self) -> f64 {
         self.value
+    }
+
+    /// Wilson 95% 信頼区間（REQ-24・REQ-26・TASK-24.1-2・issue #60）。
+    ///
+    /// `Ratio` の不変条件（`0 < denominator`・`numerator <= denominator`）の
+    /// 下では常に `Some` を返すが、`unwrap`/`expect` で panic させないため
+    /// `Option` のまま返す（`.claude/rules/coding-rust.md`「エラーハンドリング」）。
+    /// 算出は [`crate::wilson`] モジュールに集約する。
+    pub fn ci95(&self) -> Option<crate::wilson::WilsonInterval> {
+        crate::wilson::ratio_ci95(self)
     }
 }
 
