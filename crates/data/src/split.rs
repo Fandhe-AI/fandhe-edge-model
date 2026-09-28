@@ -186,6 +186,24 @@ pub enum SplitError {
     DuplicateRecordId(String),
 }
 
+/// `Display` は英語の固定文言のみを返し、`DuplicateRecordId` が保持する
+/// 実際のレコード ID を出力しない（security.md「秘密情報の混入防止」。
+/// 学習データの内容を漏らさないため。`{:?}` での表示はこの契約を破るため、
+/// 呼び出し側〔[`crate::split_record::SplitRecordError`]〕は必ずこの
+/// `Display` 実装（`{}`）経由でメッセージを組み立てること）。
+impl std::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::InvalidRatios => write!(f, "invalid split ratios"),
+            SplitError::DuplicateRecordId(_) => {
+                write!(f, "duplicate record id in input records")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitError {}
+
 /// `n` 件の group を train / validation / test へ割り付ける件数を決める。
 ///
 /// `docs/spec/03-poc/scratch-classifier/scripts/split_train.py`（PoC-9・PoC-10。REQ-17 根拠）の

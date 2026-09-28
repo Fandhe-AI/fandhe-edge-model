@@ -259,7 +259,12 @@ pub enum SplitRecordError {
 impl std::fmt::Display for SplitRecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SplitRecordError::Split(source) => write!(f, "split failed: {source:?}"),
+            // `source`（`SplitError`）は固定の英語文言のみを返す `Display`
+            // 実装（`crate::split` 参照）を持つため、`{}` で表示する。
+            // `{:?}`（Debug）は `DuplicateRecordId` の実際のレコード ID を
+            // そのまま出力してしまい security.md「秘密情報の混入防止」に
+            // 違反するため、この経路では絶対に使わない。
+            SplitRecordError::Split(source) => write!(f, "split failed: {source}"),
             SplitRecordError::Canonical(source) => {
                 write!(f, "failed to hash split record ids: {source}")
             }
@@ -296,6 +301,7 @@ impl std::fmt::Display for SplitRecordError {
 impl std::error::Error for SplitRecordError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            SplitRecordError::Split(source) => Some(source),
             SplitRecordError::Canonical(source) => Some(source),
             _ => None,
         }
@@ -391,7 +397,11 @@ impl SplitRecord {
             let actual_ids = record_ids_for_split(&result, split);
             let actual_hash =
                 canonical_sha256_hex(&actual_ids).map_err(SplitRecordError::Canonical)?;
-            if actual_ids != expected.record_ids || actual_hash != expected.sha256 {
+            let actual_group_count = group_count_for_split(&result, split);
+            if actual_ids != expected.record_ids
+                || actual_hash != expected.sha256
+                || actual_group_count != expected.group_count
+            {
                 return Err(SplitRecordError::SplitMismatch { split });
             }
         }
@@ -700,6 +710,20 @@ fn digest_from_dto(dto: SplitDigestDto) -> Result<SplitDigest, SplitRecordError>
     if !is_lowercase_hex_64(&dto.sha256) {
         return Err(SplitRecordError::InvalidRecord {
             reason: "sha256 must be 64 lowercase hex characters",
+        });
+    }
+    // `group_count` は「この split に割り付けられた group の件数」であり、
+    // 各 group は少なくとも 1 件のレコードをこの split へ割り付ける
+    // （`group_count_for_split` 参照）。そのため
+    // `record_count == 0 <=> group_count == 0` かつ `group_count <=
+    // record_count` が必ず成り立つ。JSON を直接改ざんしてこの範囲外の値
+    // （例: レコードが 0 件なのに group_count > 0、または group 件数が
+    // レコード件数を超える）を混入させても、`record_ids` 単体からは
+    // 検出できないためここで拒否する（record_count 自身は直前で
+    // `record_ids.len()` と一致検証済み）。
+    if dto.group_count > dto.record_count || (dto.group_count == 0) != (dto.record_count == 0) {
+        return Err(SplitRecordError::InvalidRecord {
+            reason: "group_count is inconsistent with record_count",
         });
     }
 
@@ -1210,5 +1234,127 @@ mod tests {
             !message.contains("secret-id"),
             "エラーメッセージにレコード ID が含まれてはならない: {message}"
         );
+    }
+
+    /// レビュー指摘（High。#45）の回帰テスト: `split_and_record` に重複
+    /// レコード ID を渡すと `SplitRecordError::Split(SplitError::
+    /// DuplicateRecordId)` 経路に入るが、その `Display` にも実際の
+    /// レコード ID（"secret-id"）が含まれてはならない
+    /// （security.md「秘密情報の混入防止」）。
+    #[test]
+    fn req17_task17_1_2_duplicate_record_id_error_display_does_not_leak_record_id() {
+        let records = vec![
+            record("secret-id", "g1", "a"),
+            record("secret-id", "g2", "a"),
+        ];
+
+        let err = split_and_record(&records, 1, &SplitRatios::default())
+            .expect_err("重複 ID は Split エラーになるはず");
+        assert!(matches!(err, SplitRecordError::Split(_)));
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret-id"),
+            "エラーメッセージにレコード ID が含まれてはならない: {message}"
+        );
+    }
+
+    /// レビュー指摘（Low。#45）の回帰テスト: JSON を改ざんして
+    /// `record_count` が 0 なのに `group_count` を非 0 にした場合、
+    /// `record_ids` 単体からは検出できない矛盾を `from_json_str` が
+    /// 拒否する（`InvalidRecord` で fail-closed）。
+    #[test]
+    fn req17_task17_1_2_from_json_rejects_group_count_inconsistent_with_zero_records() {
+        let records = vec![record("r1", "g1", "a")];
+        let recorded = split_and_record(&records, 1, &SplitRatios::default())
+            .expect("1 件でも既定比率で分割できるはず");
+        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+
+        // 1 件のレコードは 1 つの split にしか割り付けられないため、他の
+        // 2 split は record_count: 0 のはず（この改ざんの前提。
+        // どの split が空かはレコード割付の詳細に依存するため、
+        // 空だった split の group_count を 1 件に改ざんする）。
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
+        let splits = value
+            .get_mut("splits")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("splits が存在するはず");
+        let empty_split = ["train", "validation", "test"]
+            .into_iter()
+            .find(|name| {
+                splits
+                    .get(*name)
+                    .and_then(|s| s.get("record_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+            })
+            .expect("1 件のレコードでは必ずどこかの split が空になるはず");
+        splits
+            .get_mut(empty_split)
+            .expect("直前に存在を確認した split")["group_count"] = serde_json::json!(1);
+        let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
+
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("record_count と矛盾する group_count は拒否されるはず");
+        assert!(matches!(
+            err,
+            SplitRecordError::InvalidRecord {
+                reason: "group_count is inconsistent with record_count"
+            }
+        ));
+    }
+
+    /// レビュー指摘（Low。#45）の回帰テスト: `verify_against` は
+    /// `record_ids`・`sha256` が一致していても `group_count` が
+    /// 再分割結果と食い違えば `SplitMismatch` を返す。
+    #[test]
+    fn req17_task17_1_2_verify_against_detects_tampered_group_count() {
+        let records = vec![
+            record("r1", "g1", "a"),
+            record("r2", "g1", "a"),
+            record("r3", "g2", "a"),
+            record("r4", "g3", "a"),
+            record("r5", "g4", "b"),
+            record("r6", "g5", "b"),
+            record("r7", "g6", "b"),
+            record("r8", "g7", "b"),
+        ];
+        let recorded = split_and_record(&records, 7, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+
+        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
+        let test_split = value
+            .get_mut("splits")
+            .and_then(|v| v.get_mut("test"))
+            .expect("splits.test が存在するはず");
+        let original_group_count = test_split
+            .get("group_count")
+            .and_then(serde_json::Value::as_u64)
+            .expect("group_count は数値のはず");
+        let record_count = test_split
+            .get("record_count")
+            .and_then(serde_json::Value::as_u64)
+            .expect("record_count は数値のはず");
+        assert!(
+            record_count >= 2,
+            "group_count を record_ids から検出不能な形で改ざんするには test に 2 件以上必要"
+        );
+        // record_ids・record_count・sha256 は一切変えず、group_count のみを
+        // 1 減らす（record_ids だけを見る検証では検出できない改ざん）。
+        test_split["group_count"] = serde_json::json!(original_group_count.saturating_sub(1));
+        let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
+
+        let restored = SplitRecord::from_json_str(&tampered)
+            .expect("group_count 単体の改ざんは復元時には検出されない");
+        let err = restored
+            .verify_against(&records)
+            .expect_err("group_count の食い違いは再分割との照合で検出されるはず");
+        assert!(matches!(
+            err,
+            SplitRecordError::SplitMismatch { split: Split::Test }
+        ));
     }
 }
