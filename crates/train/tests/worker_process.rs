@@ -172,6 +172,52 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        "exit_with_orphan" => {
+            // codex/review 指摘 P0（issue #178 PR #233 レビュー）「supervisor
+            // が先に終了すると孤児ワーカーを停止できない」の再現・検証用
+            // モード。`hang_with_orphan` と同様に孫プロセス（`_worker` 役）を
+            // 新しいセッションで起動し、孫の標準出力を自分（supervisor 役）
+            // の標準出力（`run_train` が読み取るパイプ）へ継承させたまま、
+            // supervisor 役自身は正常終了する。孫が標準出力の書き手を握り
+            // 続けるため、`run_train` は `StdoutIncomplete` を検知するはず
+            // だが、supervisor が既に終了しているため `ppid` チェーンは
+            // 辿れない（孫は reparent 済み）。`run_train` がポーリング中に
+            // 記録しておいた直近のスナップショットで孫を kill できることを
+            // 検証する（`case_exit_with_orphan_kills_orphan`）。
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let exe = std::env::current_exe().expect("resolve current_exe for orphan");
+                let launch_script = std::env::current_dir()
+                    .expect("cwd")
+                    .join("orphan-launch.py");
+                std::fs::write(&launch_script, "orphan_hang").expect("write orphan launch.py");
+                let mut command = std::process::Command::new(&exe);
+                command
+                    .arg("-I")
+                    .arg(&launch_script)
+                    .arg("train")
+                    .arg("--request")
+                    .arg(request_path)
+                    // 標準エラー出力は継承させない（検証したいのは標準
+                    // 出力側の読み取り未完了だけに絞るため）。
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0);
+                let grandchild = command.spawn().expect("spawn orphan grandchild");
+                std::fs::write("orphan.pid", grandchild.id().to_string())
+                    .expect("write orphan.pid");
+                std::thread::spawn(move || {
+                    let mut grandchild = grandchild;
+                    let _ = grandchild.wait();
+                });
+                // `run_train` 側のポーリング（`DESCENDANT_SNAPSHOT_INTERVAL`
+                // = 200ms）が孫プロセスの起動後に少なくとも 1 回スナップ
+                // ショットを取れるよう、正常終了までに猶予を置く。
+                std::thread::sleep(Duration::from_millis(600));
+            }
+            print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
+            std::process::exit(0);
+        }
         "orphan_hang" => {
             // `hang_with_orphan` が起動する「孫プロセス」役。`heartbeat.txt`
             // （cwd = job_dir。親と同じ cwd を継承）へ書き続け、外側の
@@ -253,6 +299,11 @@ fn run_test_suite() -> ProcessExitCode {
     ];
     #[cfg(unix)]
     cases.push(("timeout_hang_kills_orphan", case_timeout_hang_kills_orphan));
+    #[cfg(unix)]
+    cases.push((
+        "exit_with_orphan_kills_orphan",
+        case_exit_with_orphan_kills_orphan,
+    ));
 
     let mut results = Vec::new();
     for (name, case_fn) in cases {
@@ -590,6 +641,77 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     // 終了する（`/bin/kill` は本テストが検証対象とする `run_train` 側の
     // 実装が使う同じバイナリ。テスト側の検証にも同じ絶対パスの外部
     // コマンドを再利用する）。
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-0", &orphan_pid.to_string()])
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to run /bin/kill -0: {e}"))?;
+    expect_true(
+        !status.success(),
+        "orphan process must no longer exist after run_train returns",
+    )
+}
+
+/// codex/review 指摘 P0（issue #178 PR #233 レビュー）の再現・検証:
+/// supervisor 役（`exit_with_orphan`）が正常終了した後も、別セッションで
+/// 起動した孫プロセス（`_worker` 役）が標準出力の書き手を握り続けている
+/// ケースで、`run_train` が読み取り未完了（`StdoutIncomplete`）を検知した
+/// うえで、孫プロセスを確実に停止できることを確認する（supervisor が既に
+/// 終了しているため `ppid` チェーンでは辿れず、`kill_process_tree_best_effort`
+/// と同じ方法では孫を見つけられない。ポーリング中に記録した pid スナップ
+/// ショットを使う [`kill_pids_best_effort`] 経路の検証）。
+#[cfg(unix)]
+fn case_exit_with_orphan_kills_orphan(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "exit_with_orphan");
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+
+    let orphan_pid_path = case_dir.join("orphan.pid");
+    let started = std::time::Instant::now();
+    let err = match run_train(&launcher, &request, case_dir, &limits) {
+        Err(e) => e,
+        Ok(_) => {
+            return Err(
+                "expected StdoutIncomplete error (orphan holds stdout pipe open)".to_string(),
+            );
+        }
+    };
+    expect_true(
+        orphan_pid_path.exists(),
+        "grandchild (orphan.pid) must have been spawned before supervisor exited",
+    )?;
+    expect_eq(err.exit_code(), ExitCode::RuntimeError, "exit_code")?;
+    // supervisor 役は 600ms 後に正常終了するが、孫プロセスが標準出力を
+    // 握り続けるため `READER_DRAIN_TIMEOUT`（5秒）の読み取り未完了で
+    // `StdoutIncomplete` になるまで待つ。無期限のハングにはならないことを
+    // 安全マージン込みで確認する。
+    expect_true(
+        started.elapsed() < Duration::from_secs(20),
+        "must return well before an unbounded hang would",
+    )?;
+
+    let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
+        .map_err(|e| format!("read orphan.pid: {e} (grandchild may not have started in time)"))?;
+    let orphan_pid: u32 = orphan_pid_text
+        .trim()
+        .parse()
+        .map_err(|e| format!("parse orphan.pid {orphan_pid_text:?}: {e}"))?;
+
+    // 孫プロセスが生きていれば heartbeat が伸び続けるはずなので、少し待って
+    // `orphan-heartbeat.txt` が伸びていないことを確認する。
+    let heartbeat = case_dir.join("orphan-heartbeat.txt");
+    let len_after_return = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(500));
+    let len_after_wait = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    expect_eq(
+        len_after_wait,
+        len_after_return,
+        "orphan heartbeat must not grow after run_train returns (grandchild must be killed too)",
+    )?;
+
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", &orphan_pid.to_string()])
         .env_clear()

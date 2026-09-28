@@ -35,14 +35,32 @@
 //! argv・絶対パスの外部コマンドを呼ぶ」方針に揃える
 //! （[`kill_process_tree_best_effort`] のドキュメントコメント参照）。
 //!
-//! 残る既知の限界: (1) supervisor プロセス自体が既に終了し PID が別プロセス
-//! へ再利用された後に `_worker` だけが孤児として残っているケース
-//! （`try_wait()` が `Ok(Some(status))` を返す通常の終了経路の後）は、
-//! 本モジュールが supervisor の生存を前提に `_worker` を辿る性質上、
-//! 対象にできない（この経路は「supervisor が応答不能」ではなく「supervisor
-//! は既に終了した」ケースであり、P0 指摘が指す「応答不能」とは別）。
-//! (2) Windows は対象外（`#[cfg(windows)]` は現状どおり直接の子だけを
-//! `Child::kill()` する。ジョブオブジェクト（`CreateJobObject`／
+//! [`kill_process_tree_best_effort`] は「掃除を確認できたか」（`bool`）を
+//! 呼び出し元へ返し、[`TrainProcessError::Wait`]・[`TrainProcessError::WallTimeout`]
+//! の `descendants_confirmed_clean` フィールドとして伝わる（codex/review
+//! 指摘 P0「プロセスツリーの掃除に失敗しても子孫が動き続ける」。issue #178
+//! PR #233 レビュー。以前は戻り値を持たず、確認できなくても常に成功した
+//! ものとして扱っていた）。
+//!
+//! supervisor 自体が既に正常終了した後（`try_wait()` が `Ok(Some(status))`
+//! を返す通常の終了経路）に `_worker` だけが孤児として残っているケースは、
+//! `_worker` の `ppid` チェーンが supervisor の終了と同時に切れてしまう
+//! （最も近い subreaper／init へ reparent 済みになる）ため、
+//! `kill_process_tree_best_effort` と同じ「`ppid` を辿り直す」方法では
+//! 見つけられない。[`run_train`] は壁時計タイムアウトのポーリング中
+//! （supervisor がまだ生きている間）に `ps` で子孫 pid のスナップショットを
+//! 定期的に記録しておき（[`DESCENDANT_SNAPSHOT_INTERVAL`]）、パイプ読み取り
+//! が期限内に完了しなかった場合はそのスナップショットへ
+//! [`kill_pids_best_effort`] で直接 `SIGKILL` を送る（codex/review 指摘 P0
+//! 「supervisor が先に終了すると孤児ワーカーを停止できない」。issue #178
+//! PR #233 レビュー。結合テスト `case_exit_with_orphan_kills_orphan` 参照）。
+//!
+//! 残る既知の限界: (1) supervisor が最初のスナップショット間隔
+//! （[`DESCENDANT_SNAPSHOT_INTERVAL`]）より短い時間で正常終了した場合、
+//! `_worker` の pid を一度も記録できず対象にできない（現実的な学習ワーカーの
+//! 起動・初期化時間に対しては十分短い間隔を採っているが、理論上の窓は
+//! 残る）。(2) Windows は対象外（`#[cfg(windows)]` は現状どおり直接の子
+//! だけを `Child::kill()` する。ジョブオブジェクト（`CreateJobObject`／
 //! `AssignProcessToJobObject`）によるプロセスツリー単位の終了は将来の課題）。
 //!
 //! # 推論ランタイムとの境界
@@ -311,7 +329,13 @@ struct DrainedOutput {
 ///
 /// `read()` のエラーは EOF（`Ok(0)`）と区別し、`DrainedOutput::read_error` へ
 /// 記録する（`kept` を最後まで読み切れなかった可能性があるため。codex/review
-/// 指摘 P1。issue #178 PR #233 レビュー）。
+/// 指摘 P1。issue #178 PR #233 レビュー）。ただし `ErrorKind::Interrupted`
+/// （`EINTR`。シグナル配送等で発生しうる retryable なエラー）は読み取り
+/// 未完了の証拠にならないため打ち切らず、同じ `read()` をやり直す（Cursor
+/// Bugbot 指摘 Medium「Pipe reads fail on interrupt」。issue #178 PR #233
+/// レビュー: 修正前は `EINTR` も他の `read()` エラーと同列に扱い、ワーカーが
+/// 実際には正常終了していても `StdoutIncomplete`／`StderrIncomplete` に
+/// 分類してしまっていた）。
 fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
     let mut kept = Vec::new();
     let mut truncated = false;
@@ -332,6 +356,10 @@ fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
                 } else {
                     truncated = true;
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // retryable: シグナル配送等による一時的な中断。読み取り
+                // 未完了として扱わず、同じ read() をやり直す。
             }
             Err(_) => {
                 read_error = true;
@@ -476,6 +504,28 @@ const ORPHAN_SWEEP_MAX_ROUNDS: u32 = 5;
 /// 短い猶予を置く。
 #[cfg(unix)]
 const ORPHAN_SWEEP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// [`run_train`] が壁時計タイムアウトのポーリング中に子孫プロセスの pid
+/// スナップショット（`ps` の `ppid` チェーン走査）を取り直す最小間隔。
+/// supervisor が正常終了した後にパイプ読み取りが完了しない場合
+/// （[`kill_pids_best_effort`] が使う経路）に備え、supervisor がまだ生きて
+/// いる間の子孫 pid を記録しておく（供給元の `ppid` チェーンは supervisor
+/// の終了と同時に切れる〔reparent 済みになる〕ため、終了後には辿れない。
+/// codex/review 指摘 P0「supervisor が先に終了すると孤児ワーカーを停止
+/// できない」。issue #178 PR #233 レビュー）。`POLL_INTERVAL`（50ms）ごとに
+/// 毎回 `ps` を起動すると学習時間全体（最大 3660 秒）にわたって大量の
+/// 子プロセスを起動し続けることになるため、この間隔で間引く（REQ-39
+/// 「資源の上限」。実際の学習ワーカーの起動・初期化に要する時間に対して
+/// 十分短く、この間隔内に終了する supervisor は現実的な想定の外とする）。
+#[cfg(unix)]
+const DESCENDANT_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// `SIGKILL` 送出後、直接の子プロセスの終了を待つ上限（REQ-39「資源の
+/// 上限」）。通常 `SIGKILL` は即座に効くため、この上限に達するのは
+/// 割り込み不可能な OS 側の待ち（D state）等の極めて稀なケースに限られる
+/// （Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
+/// #178 PR #233 レビュー。[`wait_after_kill`] 参照）。
+const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `program`（絶対パス）を `args` で子プロセスとして起動し、標準出力を
 /// 上限 `cap` バイトまで読み取りつつ、`timeout` を超えたら強制終了する。
@@ -631,19 +681,27 @@ fn transitive_descendants(root: u32, pairs: &[(u32, u32)]) -> Vec<u32> {
 ///
 /// `ps`・`kill` 自体の失敗・タイムアウトは無視する（本関数はベストエフォート
 /// の多層防御であり、これが失敗しても呼び出し元による直接の子の回収は
-/// 妨げない。fail-closed ではなく fail-open だが、直接の子の回収という
-/// 主要な不変条件〔ゾンビを残さない〕は本関数の成否と独立に保たれる。
-/// 全ラウンドを終えても `ps` で子孫が確認できてしまう場合の残る限界は
-/// モジュール doc「孤児化の限界」に明記する）。
+/// 妨げない。fail-open だが、直接の子の回収という主要な不変条件〔ゾンビを
+/// 残さない〕は本関数の成否と独立に保たれる）。
+///
+/// 戻り値 `true` は、最終確認の `ps` で子孫が 1 件も見つからなかった（掃除を
+/// 確認できた）ことを示す。`false` は `ps` 自体の失敗・全ラウンドを終えても
+/// 子孫が残っていたことを示し、呼び出し元は「別セッションの `_worker` 等が
+/// 生き残っている可能性がある」ことを認識したうえで後続の判断
+/// （エラー型への反映等）に用いること（codex/review 指摘 P0「プロセス
+/// ツリーの掃除に失敗しても子孫が動き続ける」。issue #178 PR #233 レビュー:
+/// 修正前は本関数が戻り値を持たず、呼び出し元（[`run_train`]）は掃除の成否
+/// によらず常に直接の子だけを kill/wait して締め切り超過エラーを返して
+/// いた。モジュール doc「孤児化の限界」参照）。
 #[cfg(unix)]
-fn kill_process_tree_best_effort(root_pid: u32) {
+fn kill_process_tree_best_effort(root_pid: u32) -> bool {
     for round in 0..ORPHAN_SWEEP_MAX_ROUNDS {
         let Some(pairs) = ps_pid_ppid_pairs() else {
-            return;
+            return false;
         };
         let descendants = transitive_descendants(root_pid, &pairs);
         if descendants.is_empty() {
-            return;
+            return true;
         }
         for pid in descendants {
             run_bounded_fire_and_forget(
@@ -658,19 +716,110 @@ fn kill_process_tree_best_effort(root_pid: u32) {
             std::thread::sleep(ORPHAN_SWEEP_RETRY_DELAY);
         }
     }
+    // 全ラウンドを終えた後の最終確認。`kill` 送出直後の終了処理中だった
+    // 子孫が、この時点までに実際に消えている可能性があるため、諦める前に
+    // もう一度だけ確認する。
+    match ps_pid_ppid_pairs() {
+        Some(pairs) => transitive_descendants(root_pid, &pairs).is_empty(),
+        None => false,
+    }
+}
+
+/// 既知の pid（[`run_train`] がポーリング中に記録した直近のスナップ
+/// ショット。[`transitive_descendants`] 参照）へ直接 `SIGKILL` を送る。
+///
+/// [`kill_process_tree_best_effort`] は `root_pid`（supervisor）がまだ
+/// 生きている前提で `ppid` チェーンを辿るが、supervisor が既に終了・
+/// 回収済みの場合はチェーンが切れており（子孫は最も近い subreaper／init
+/// へ reparent 済み）同じ方法では見つけられない。代わりに、supervisor が
+/// まだ生きていた時点で確認できていた子孫の pid を直接指定して kill する
+/// （codex/review 指摘 P0「supervisor が先に終了すると孤児ワーカーを停止
+/// できない」。issue #178 PR #233 レビュー。REQ-39「資源の上限」）。
+///
+/// 各ラウンドで `ps` により `pids` のうちまだ存在するものだけへ再送し、
+/// 全滅を確認できるかベストエフォートで試みる（`kill_process_tree_best_effort`
+/// と同じ再送方針）。`pid` が既に別プロセスへ再開されていた場合に無関係な
+/// プロセスを kill してしまう理論上の窓はゼロにできないが、本関数が呼ばれる
+/// のは「子プロセス終了検出の直後、読み取り未完了を検知した時点」に限られ、
+/// 窓は極めて短い（ベストエフォートの範囲。`.claude/rules/security.md`）。
+#[cfg(unix)]
+fn kill_pids_best_effort(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    for round in 0..ORPHAN_SWEEP_MAX_ROUNDS {
+        let Some(pairs) = ps_pid_ppid_pairs() else {
+            return;
+        };
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| pairs.iter().any(|&(p, _)| p == *pid))
+            .collect();
+        if alive.is_empty() {
+            return;
+        }
+        for pid in &alive {
+            run_bounded_fire_and_forget(
+                KILL_BIN,
+                &["-s", "KILL", &pid.to_string()],
+                ORPHAN_SWEEP_STEP_TIMEOUT,
+            );
+        }
+        if round + 1 < ORPHAN_SWEEP_MAX_ROUNDS {
+            std::thread::sleep(ORPHAN_SWEEP_RETRY_DELAY);
+        }
+    }
 }
 
 /// Windows では対象外（モジュール doc「孤児化の限界」参照）。ジョブ
 /// オブジェクト（`CreateJobObject`／`AssignProcessToJobObject`）による
-/// プロセスツリー単位の終了は将来の課題とする。
+/// プロセスツリー単位の終了は将来の課題とする。常に「確認できなかった」
+/// （`false`）を返す（unix 版と戻り値の意味を揃える）。
 #[cfg(windows)]
-fn kill_process_tree_best_effort(_root_pid: u32) {}
+fn kill_process_tree_best_effort(_root_pid: u32) -> bool {
+    false
+}
 
-/// [`Child::wait()`] の失敗を [`TrainProcessError::Wait`] へ写す。
-fn wait_child(child: &mut Child) -> Result<ExitStatus, TrainProcessError> {
-    child
-        .wait()
-        .map_err(|e| TrainProcessError::Wait { kind: e.kind() })
+/// `child.kill()`（`SIGKILL` 送出）の直後に呼び、終了を最大
+/// [`KILL_WAIT_TIMEOUT`] までポーリングして待つ。
+///
+/// `SIGKILL` は通常即座に効くが、ディスク I/O 等での割り込み不可能な待ち
+/// （D state）に入っているプロセスは、シグナル配送後もしばらく（理論上は
+/// 無期限に）終了しないことがある。素朴な `Child::wait()` はこの間ブロック
+/// し続け、呼び出しスレッド自体が資源の上限なく固まってしまう（Cursor
+/// Bugbot 指摘 Medium「Timeout wait can block forever」。issue #178 PR #233
+/// レビュー）。`try_wait()` を上限つきでポーリングし、上限に達しても終了
+/// しない場合は [`TrainProcessError::KillWaitTimedOut`] を返して呼び出し元
+/// へ制御を返す（この場合プロセスは OS 上にゾンビとして残り続ける可能性が
+/// あり、確実な後始末を主張しない。fail-closed。REQ-39「資源の上限」）。
+///
+/// `descendants_confirmed_clean` は、この直前に実行した
+/// [`kill_process_tree_best_effort`] の戻り値をそのまま
+/// [`TrainProcessError::Wait`] へ伝播するために受け取る（`Child::wait()`
+/// 自体が失敗した場合のみ使う。issue #178 PR #233 レビュー）。
+fn wait_after_kill(
+    child: &mut Child,
+    descendants_confirmed_clean: bool,
+) -> Result<ExitStatus, TrainProcessError> {
+    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Err(TrainProcessError::KillWaitTimedOut);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                return Err(TrainProcessError::Wait {
+                    kind: e.kind(),
+                    descendants_confirmed_clean,
+                });
+            }
+        }
+    }
 }
 
 /// 子プロセスの終了コード（unix はシグナル終了で `None` になりうる）を
@@ -762,14 +911,46 @@ pub fn run_train(
     let stderr_rx = stderr_pipe.map(|pipe| spawn_reader(pipe, MAX_WORKER_STDERR_BYTES));
 
     // 壁時計タイムアウトまで `try_wait()` をポーリングする（std に
-    // `wait_timeout` 相当が無いため）。
+    // `wait_timeout` 相当が無いため）。supervisor が生きている間、`ps` の
+    // `ppid` チェーンで確認できた子孫 pid の直近スナップショットを記録して
+    // おく。supervisor が正常終了した後（下の「子は既に終了している」経路）
+    // にパイプ読み取りが完了しない場合、`_worker` の `ppid` チェーンは
+    // supervisor の終了と同時に切れてしまう（reparent 済みになる）ため、
+    // 終了後に辿り直すことができない。生きている間の最後のスナップショット
+    // を使って直接 pid を kill する（codex/review 指摘 P0「supervisor が
+    // 先に終了すると孤児ワーカーを停止できない」。issue #178 PR #233
+    // レビュー。[`kill_pids_best_effort`] 参照。unix のみ:
+    // `kill_process_tree_best_effort` 自体が unix 専用のため windows では
+    // 常に空のまま）。
+    #[cfg(unix)]
+    let mut last_known_descendants: Vec<u32> = Vec::new();
+    #[cfg(unix)]
+    let mut last_descendant_snapshot_at: Option<Instant> = None;
+
     let deadline = started + limits.wall_timeout();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     break None;
+                }
+                #[cfg(unix)]
+                {
+                    let need_snapshot = match last_descendant_snapshot_at {
+                        Some(t) => now.duration_since(t) >= DESCENDANT_SNAPSHOT_INTERVAL,
+                        None => true,
+                    };
+                    if need_snapshot {
+                        if let Some(pairs) = ps_pid_ppid_pairs() {
+                            let descendants = transitive_descendants(child.id(), &pairs);
+                            if !descendants.is_empty() {
+                                last_known_descendants = descendants;
+                            }
+                        }
+                        last_descendant_snapshot_at = Some(now);
+                    }
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -782,13 +963,22 @@ pub fn run_train(
                 // 試みる。supervisor がまだ生きている前提でプロセスツリー
                 // （`_worker` を含む子孫）も先に掃除してから、直接の子
                 // （supervisor 自身）を回収する（codex/review 指摘 P0。
-                // モジュール doc「孤児化の限界」参照）。kill・wait 自体の
-                // 失敗（既に終了済み等）は元の `try_wait` エラーの報告を
-                // 妨げないよう無視する。
-                kill_process_tree_best_effort(child.id());
+                // モジュール doc「孤児化の限界」参照）。kill 自体の失敗
+                // （既に終了済み等）は元の `try_wait` エラーの報告を妨げない
+                // よう無視する。掃除の成否（子孫が残っていないことを
+                // 確認できたか）は `descendants_confirmed_clean` として
+                // 呼び出し元へ伝える（codex/review 指摘 P0「プロセス
+                // ツリーの掃除に失敗しても子孫が動き続ける」。issue #178
+                // PR #233 レビュー）。直接の子の最終回収も無期限に待たず
+                // `wait_after_kill` で上限を掛ける（Cursor Bugbot 指摘
+                // Medium「Timeout wait can block forever」）。
+                let descendants_confirmed_clean = kill_process_tree_best_effort(child.id());
                 let _ = child.kill();
-                let _ = child.wait();
-                return Err(TrainProcessError::Wait { kind: e.kind() });
+                let _ = wait_after_kill(&mut child, descendants_confirmed_clean);
+                return Err(TrainProcessError::Wait {
+                    kind: e.kind(),
+                    descendants_confirmed_clean,
+                });
             }
         }
     };
@@ -802,12 +992,16 @@ pub fn run_train(
             // ない。codex/review 指摘 P0「外側のタイムアウト時に学習
             // プロセスを停止できない」。issue #178 PR #233 レビュー。
             // モジュール doc「孤児化の限界」参照）。kill 自体の失敗
-            // （既に終了済み等）は無視してよい。
-            kill_process_tree_best_effort(child.id());
+            // （既に終了済み等）は無視してよい。掃除の成否は
+            // `descendants_confirmed_clean` として呼び出し元へ伝える
+            // （codex/review 指摘 P0「プロセスツリーの掃除に失敗しても
+            // 子孫が動き続ける」。issue #178 PR #233 レビュー）。
+            let descendants_confirmed_clean = kill_process_tree_best_effort(child.id());
             let _ = child.kill();
-            wait_child(&mut child)?;
+            wait_after_kill(&mut child, descendants_confirmed_clean)?;
             return Err(TrainProcessError::WallTimeout {
                 limit_ms: u64::try_from(limits.wall_timeout().as_millis()).unwrap_or(u64::MAX),
+                descendants_confirmed_clean,
             });
         }
     };
@@ -834,7 +1028,18 @@ pub fn run_train(
     // レビュー）も同じ「読み取り未完了」として扱う。たまたま `kept` が
     // 有効な結果 JSON に見えても、読み切れていない出力を成功として
     // 受理しない（fail-closed。REQ-39「資源の上限」）。
+    //
+    // supervisor は既に正常終了しているため（`status` を取得済み）、読み
+    // 取り未完了は「`_worker` が別セッションで生き残ってパイプの書き手を
+    // 握り続けている」ケースを主に想定する。`kill_process_tree_best_effort`
+    // が使う `ppid` チェーンは supervisor の終了と同時に切れてしまい
+    // 使えないため、ポーリング中に記録しておいた最後の子孫スナップショット
+    // （`last_known_descendants`）へ直接 kill を送ってから、読み取り未完了
+    // として返す（codex/review 指摘 P0「supervisor が先に終了すると孤児
+    // ワーカーを停止できない」。issue #178 PR #233 レビュー）。
     let Some(stdout_drain) = stdout_drain.filter(|d| !d.read_error) else {
+        #[cfg(unix)]
+        kill_pids_best_effort(&last_known_descendants);
         return Err(TrainProcessError::StdoutIncomplete);
     };
     // 標準エラー出力の読み取りタイムアウトも標準出力と同様にエラーとして
@@ -843,6 +1048,8 @@ pub fn run_train(
     // には継続中でも成功と区別できなくなる（codex/review 指摘。issue #178
     // PR #233 レビュー。REQ-39「資源の上限」）。
     let Some(stderr_drain) = stderr_drain.filter(|d| !d.read_error) else {
+        #[cfg(unix)]
+        kill_pids_best_effort(&last_known_descendants);
         return Err(TrainProcessError::StderrIncomplete);
     };
     let (worker_stderr, stderr_truncated) = (stderr_drain.kept, stderr_drain.truncated);

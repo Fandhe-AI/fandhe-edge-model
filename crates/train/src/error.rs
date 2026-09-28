@@ -361,10 +361,37 @@ pub enum TrainProcessError {
     /// 子プロセスの起動（`Command::spawn`）に失敗した。
     Spawn { kind: std::io::ErrorKind },
     /// 子プロセスの終了待ち（`Child::try_wait`／`Child::wait`）に失敗した。
-    Wait { kind: std::io::ErrorKind },
+    ///
+    /// `descendants_confirmed_clean` は、本エラーを返す前に実行した
+    /// [`crate::process::kill_process_tree_best_effort`]（supervisor を根と
+    /// するプロセスツリー掃除）が「子孫が残っていないことを確認できたか」を
+    /// 示す。`false` の場合、別セッションの `_worker` 等が生き残っている
+    /// 可能性がある（codex/review 指摘 P0「プロセスツリーの掃除に失敗しても
+    /// 子孫が動き続ける」。issue #178 PR #233 レビュー。呼び出し元へ確実に
+    /// 伝えるためフィールド化した。REQ-39「資源の上限」）。
+    Wait {
+        kind: std::io::ErrorKind,
+        descendants_confirmed_clean: bool,
+    },
     /// 外側の壁時計締め切り（[`crate::process::RunLimits`]）を超過したため
     /// 子プロセスを強制終了した（REQ-39「資源の上限」）。
-    WallTimeout { limit_ms: u64 },
+    ///
+    /// `descendants_confirmed_clean` の意味は [`TrainProcessError::Wait`] と
+    /// 同じ（codex/review 指摘 P0。issue #178 PR #233 レビュー）。
+    WallTimeout {
+        limit_ms: u64,
+        descendants_confirmed_clean: bool,
+    },
+    /// `SIGKILL` 送出後の直接の子プロセスの終了待ちが
+    /// [`crate::process::KILL_WAIT_TIMEOUT`] 以内に完了しなかった
+    /// （割り込み不可能な OS 側の待ち〔D state〕等、極めて稀なケース。
+    /// Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
+    /// #178 PR #233 レビュー）。無期限に `Child::wait()` を待ち続けると
+    /// 呼び出しスレッド自体が資源の上限なくブロックしてしまうため、上限で
+    /// 打ち切って呼び出し元へ制御を返す（プロセス自体は OS 上にゾンビ
+    /// として残り続ける可能性があり、確実な後始末を主張しない。fail-closed。
+    /// REQ-39「資源の上限」）。
+    KillWaitTimedOut,
     /// 子プロセスがシグナルで終了し、終了コードを取得できなかった
     /// （unix。`ExitStatus::code()` が `None` を返す場合）。
     TerminatedBySignal,
@@ -420,11 +447,29 @@ impl std::fmt::Display for TrainProcessError {
             TrainProcessError::Spawn { kind } => {
                 write!(f, "failed to spawn worker process: {kind:?}")
             }
-            TrainProcessError::Wait { kind } => {
-                write!(f, "failed to wait for worker process: {kind:?}")
+            TrainProcessError::Wait {
+                kind,
+                descendants_confirmed_clean,
+            } => {
+                write!(
+                    f,
+                    "failed to wait for worker process: {kind:?} (descendants_confirmed_clean={descendants_confirmed_clean})"
+                )
             }
-            TrainProcessError::WallTimeout { limit_ms } => {
-                write!(f, "worker process exceeded wall timeout of {limit_ms} ms")
+            TrainProcessError::WallTimeout {
+                limit_ms,
+                descendants_confirmed_clean,
+            } => {
+                write!(
+                    f,
+                    "worker process exceeded wall timeout of {limit_ms} ms (descendants_confirmed_clean={descendants_confirmed_clean})"
+                )
+            }
+            TrainProcessError::KillWaitTimedOut => {
+                write!(
+                    f,
+                    "worker process did not exit within the bounded wait after SIGKILL"
+                )
             }
             TrainProcessError::TerminatedBySignal => {
                 write!(f, "worker process was terminated by a signal")
@@ -485,6 +530,7 @@ impl TrainProcessError {
             TrainProcessError::RequestWrite { .. }
             | TrainProcessError::Spawn { .. }
             | TrainProcessError::Wait { .. }
+            | TrainProcessError::KillWaitTimedOut
             | TrainProcessError::TerminatedBySignal
             | TrainProcessError::UnknownExitCode(_)
             | TrainProcessError::StdoutIncomplete
