@@ -89,6 +89,7 @@ from ..limits import (
     MAX_AR_BATCH_SIZE,
     MAX_AR_DIMS,
     MAX_AR_EPOCHS,
+    MAX_AR_EXPORT_ATTENTION_ELEMENTS,
     MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS,
     MAX_AR_HEADS,
     MAX_AR_LAYERS,
@@ -777,6 +778,45 @@ def _onnx_decoder_layer(
     return resid2
 
 
+def _ar_export_attention_elements(
+    k_classes: int, t_bound: int, m: int, layers: int, heads: int
+) -> int:
+    """書き出す ONNX グラフが `N=1`・`T=t_bound`（書き出し時点で構造上
+    許容される最大の入力長。`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
+    docstring 参照）で推論されたときの、decoder attention の要素数の
+    見積もり（`K × heads × layers × L^2`。`L = T + 1 + M`）を返す
+    （REQ-39・PR #222 レビュー指摘）。
+
+    decoder は選択肢展開後の `[N*K, L, L]` 形状で attention を計算するため
+    `K` を乗じ、各層で同形状のテンソルを確保しうるため `layers` を乗じる
+    （層間でメモリが解放される実装でも、上限側は保守的に見積もる）。
+    引数はすべて 0 以上の整数であること（負数・非整数は呼び出し側の
+    バグであり、ここでは検査しない。すべて学習時に確定する固定値のみを
+    渡す契約のため）。
+    """
+    length = t_bound + 1 + m
+    return k_classes * heads * layers * length * length
+
+
+def _check_ar_export_resources(
+    k_classes: int, t_bound: int, m: int, layers: int, heads: int
+) -> None:
+    """`_ar_export_attention_elements` の見積もりが
+    `MAX_AR_EXPORT_ATTENTION_ELEMENTS` を超えるとき `limit_exceeded` で
+    fail-closed に拒否する（REQ-39・PR #222 レビュー指摘）。グラフ構築前に
+    呼ぶことで、過大な attention テンソルを実際に確保する前に停止する。
+    """
+    elements = _ar_export_attention_elements(k_classes, t_bound, m, layers, heads)
+    if elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated per-example attention elements {elements} (at N=1, T={t_bound})"
+            f" exceeds limit {MAX_AR_EXPORT_ATTENTION_ELEMENTS}"
+            " (k_classes x heads x layers x (t_bound+1+m)^2)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+
 def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None:
     """§2.1〜2.3 のグラフを手組みし、`out` へ ONNX protobuf を書き出す
     （`kinds/c3.py::_export_c3_onnx` と同じ「経路は一切扱わない」契約。
@@ -820,6 +860,17 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
             " vocab_size)",
             ExitCode.LIMIT_EXCEEDED,
         )
+
+    # 推論時に渡されうる T（動的軸）を、位置埋め込み表 `pos_table` の行数
+    # （学習時に固定された `max_len = max_bytes + 1 + m`）から構造上の
+    # 上限へ落とし込み、N=1・T=t_bound（書き出し可能な最大構成）での
+    # decoder attention 要素数を見積もって検査する
+    # （`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring・
+    # `_ar_export_attention_elements` docstring 参照。REQ-39・PR #222
+    # レビュー指摘）。バッチ件数 N（>1）分の上限は本検査では検査できない
+    # （同 docstring 参照。推論ランタイム・ガード層側の将来対応）。
+    t_bound = trained.max_bytes
+    _check_ar_export_resources(k_classes, t_bound, m, layers, heads)
 
     params = trained.model.parameters()
     embed = np.array(params["embed"]["weight"], dtype=np.float32)  # [VOCAB, dims]

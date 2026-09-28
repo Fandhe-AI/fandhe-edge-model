@@ -336,6 +336,69 @@ def test_ar_export_rejects_choice_logprob_elements_over_limit(tmp_path: Path) ->
     )
 
 
+def test_ar_export_attention_elements_formula() -> None:
+    """`_ar_export_attention_elements`: `K x heads x layers x (T+1+M)^2` を
+    具体値で計算すること（REQ-39・PR #222 レビュー指摘）。
+
+    `k_classes=3, t_bound=10, m=4, layers=2, heads=4` のとき
+    `L = 10+1+4 = 15`・`3 x 4 x 2 x 15^2 = 5400`。
+    """
+    from fandhe_edge_trainer.kinds.autoregressive import _ar_export_attention_elements
+
+    assert _ar_export_attention_elements(k_classes=3, t_bound=10, m=4, layers=2, heads=4) == 5400
+
+
+def test_ar_export_rejects_attention_elements_over_limit(tmp_path: Path) -> None:
+    """`MAX_AR_EXPORT_ATTENTION_ELEMENTS`: `T`（動的軸）を `pos_table` の
+    構造上の上限（学習時の `max_bytes`）まで広げたときの推論 1 件（N=1）
+    あたりの decoder attention 要素数（`K x heads x layers x (T+1+M)^2`）が
+    上限を超える場合、グラフ構築前に拒否すること（REQ-39・PR #222 レビュー
+    指摘。ONNX 推論時の動的入力 N・T に資源上限が無いという P0 指摘への
+    対応）。
+
+    実際の学習は極小データ（`TINY_AR_CONFIG`）で行い、書き出し直前に
+    `max_bytes` だけを大きな合成値へ差し替えて T の構造上の上限を広げる
+    （`_export_ar_onnx` は `trained.max_bytes` を `t_bound` としてこの検査に
+    使うため、この差し替えでも `_export_ar_onnx` の検査対象は変わらない）。
+    合成した `max_bytes=20000` は、K x M x VOCAB_SIZE で決まる
+    `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` の検査（T に依存しない）は
+    超えないが、T を含む attention 要素数の検査は超える値として選んでいる。
+    """
+    import dataclasses
+
+    from fandhe_edge_trainer.kinds.autoregressive import _ar_export_attention_elements
+    from fandhe_edge_trainer.limits import (
+        MAX_AR_EXPORT_ATTENTION_ELEMENTS,
+        MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS,
+    )
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(kind, make_examples(), req)
+
+    huge_max_bytes = 20000
+    m = trained.max_label_len + 1
+    k_classes = len(trained.label_order)
+    heads = int(trained.config["heads"])
+    layers = int(trained.config["layers"])
+
+    assert k_classes * m * 259 <= MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS
+    elements = _ar_export_attention_elements(k_classes, huge_max_bytes, m, layers, heads)
+    assert elements == 1_601_120_196
+    assert elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS
+
+    huge_trained = dataclasses.replace(trained, max_bytes=huge_max_bytes)
+
+    with pytest.raises(WorkerError) as exc_info:
+        export_onnx_to_path(kind, huge_trained, tmp_path / "should_not_be_written2.onnx")
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+    assert (
+        not (tmp_path / "should_not_be_written2.onnx").exists()
+        or (tmp_path / "should_not_be_written2.onnx").stat().st_size == 0
+    )
+
+
 def test_ar_encode_choices_assigns_distinct_sequences() -> None:
     """`_encode_choices` が相異なるラベルへ相異なる系列を割り当てること。"""
     ids_by_label = _encode_choices(["a", "b"])
