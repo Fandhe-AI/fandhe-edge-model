@@ -84,6 +84,12 @@
 //!   `NaN`／`Infinity` リテラルの置換だけでは検出できず、無条件に
 //!   [`EvalInputStop::MalformedJson`] へ落ちて評価全体を止めてしまう不具合
 //!   だった（レビュー指摘。PR #204）
+//! - [`WarningCode::EmptyInput`]（REQ-23 境界値・TASK-23.2・issue #57）は
+//!   PoC-9 に規定が無い、本リポで追加した警告である。gold の `input` が
+//!   学習ワーカーの正規化後に空となる行は、推論経路と評価経路で前処理結果が
+//!   食い違いうる境界（[`crate::preprocess_boundary`] モジュール doc・
+//!   PoC-16 の `[0]` vs `[]` 参照）であり、両経路の挙動の統一は「検討中」の
+//!   まま対象外のため、除外せず警告のみ行う
 //!
 //! # 前提条件（呼び出し元が守るべきこと）
 //!
@@ -237,6 +243,14 @@ pub enum WarningCode {
     /// `active` な行がすべて [`PredictionOutcome::Error`]（
     /// [`PredictionOutcome::Invalid`] は対象外。ケース 12）。
     AllError,
+    /// gold の `input` が学習ワーカーの正規化後に空となる行
+    /// （[`crate::preprocess_boundary::is_empty_after_normalization`] が真。
+    /// REQ-23 境界値・TASK-23.2・issue #57）。推論経路と評価経路で前処理
+    /// 結果が食い違いうる境界（PoC-16 で `[0]` vs `[]` の食い違いを実測。
+    /// [`crate::preprocess_boundary`] モジュール doc 参照）であり、両経路の
+    /// 統一は対象外（「検討中」）のため除外せず警告のみ行う。行番号のみを
+    /// 報告し `input` の値は含めない。
+    EmptyInput,
     /// 定義済みラベル（`valid_label_ids`）のうち、`active` な gold 行に
     /// 1 件も出現しないもの（ケース 9）。行番号では表せないため
     /// [`EvalInputWarning::labels`]（ラベル ID の昇順・重複なし）で示す
@@ -256,6 +270,7 @@ impl WarningCode {
             WarningCode::InvalidScore => "invalid_score",
             WarningCode::AllAbstain => "all_abstain",
             WarningCode::AllError => "all_error",
+            WarningCode::EmptyInput => "empty_input",
             WarningCode::UnseenClass => "unseen_class",
         }
     }
@@ -270,6 +285,7 @@ impl WarningCode {
             WarningCode::DuplicateInputWithinSplit
             | WarningCode::AllAbstain
             | WarningCode::AllError
+            | WarningCode::EmptyInput
             | WarningCode::UnseenClass => WarningAction::WarnInclude,
             WarningCode::MissingPrediction | WarningCode::InvalidScore => {
                 WarningAction::IncludeAsError
@@ -285,6 +301,7 @@ impl WarningCode {
             | WarningCode::UnknownGoldLabel
             | WarningCode::ContradictoryInput
             | WarningCode::DuplicateInputWithinSplit
+            | WarningCode::EmptyInput
             | WarningCode::UnseenClass => Side::Gold,
             WarningCode::MissingPrediction
             | WarningCode::InvalidScore
@@ -1003,7 +1020,7 @@ fn drain_warnings_in_order(
 }
 
 /// gold（正解）・pred（予測）の JSONL 本文から評価対象の行を組み立てる
-/// （REQ-23・TASK-23.1-1）。
+/// （REQ-23・TASK-23.1-1・REQ-23 境界値・TASK-23.2）。
 ///
 /// # 手順（モジュール doc・PoC-9 `metrics.py` v1.1 の手順を踏襲）
 ///
@@ -1018,7 +1035,11 @@ fn drain_warnings_in_order(
 ///    [`UnknownGoldLabel`](WarningCode::UnknownGoldLabel)）
 /// 6. 手順 5 の除外で評価対象が 0 件になったら [`EvalInputStop::NoValidGold`]
 ///    で停止する（評価契約の fail-closed。`Ok` で `active: []` を返さない）
-/// 7. 手順 5 を通過した行を正規化 `input` でグループ化し
+/// 7. 手順 5 を通過した行のうち、`input` が
+///    [`crate::preprocess_boundary::is_empty_after_normalization`] を満たす
+///    行を [`WarningCode::EmptyInput`] として警告する（除外しない。矛盾除外
+///    より前に検出するため、後述の矛盾除外に巻き込まれた行も報告される。
+///    REQ-23 境界値・TASK-23.2）。続けて正規化 `input` でグループ化し
 ///    （[`find_duplicate_input_lines`]）、gold ラベルが一致するグループは
 ///    [`WarningCode::DuplicateInputWithinSplit`] として警告する（除外しない。
 ///    ケース 6）。2 種以上に分かれるグループは [`WarningCode::ContradictoryInput`]
@@ -1044,7 +1065,8 @@ fn drain_warnings_in_order(
 ///    にも同じ内容を入れる（ケース 9）
 /// 10. 警告は Exclude 系 → IncludeAsError 系 → WarnInclude 系の順、
 ///     各群の中は [`WarningCode`] の宣言順に並べる（`lines` は昇順。
-///     [`WarningCode::UnseenClass`] は WarnInclude 系の最後）
+///     [`WarningCode::EmptyInput`] は WarnInclude 系の末尾から 2 番目、
+///     [`WarningCode::UnseenClass`] が WarnInclude 系の最後）
 pub fn prepare_evaluation_input(
     gold_content: &str,
     pred_content: &str,
@@ -1135,6 +1157,28 @@ pub fn prepare_evaluation_input(
         .zip(accepted_labels.iter())
         .map(|(row, label)| (row.line, label.clone(), &row.fields))
         .collect();
+
+    // 手順 7（REQ-23 境界値・TASK-23.2・issue #57）: gold の `input` が学習
+    // ワーカーの正規化後に空となる行（推論経路と評価経路で前処理結果が
+    // 食い違いうる境界。`crate::preprocess_boundary` モジュール doc・
+    // PoC-16 の `[0]` vs `[]` 参照）を検出する。矛盾除外（本手順の後半）より
+    // 前に積むことで、空白のみの `input` が複数あり異なるラベルで矛盾扱いに
+    // なった場合も報告が漏れない。`input` フィールドが無い・文字列でない行は
+    // 対象外（[`find_duplicate_input_lines`] と同じ扱い）。
+    let empty_input_lines: BTreeSet<usize> = dedup_input
+        .iter()
+        .filter_map(|(line, _, fields)| {
+            let input = fields.get("input")?.as_str()?;
+            crate::preprocess_boundary::is_empty_after_normalization(input).then_some(*line)
+        })
+        .collect();
+    if !empty_input_lines.is_empty() {
+        lines_by_code
+            .entry(WarningCode::EmptyInput)
+            .or_default()
+            .extend(empty_input_lines);
+    }
+
     let (duplicate_input_lines, contradictory_lines) = find_duplicate_input_lines(&dedup_input);
     if !duplicate_input_lines.is_empty() {
         lines_by_code
@@ -1282,7 +1326,7 @@ pub fn prepare_evaluation_input(
     // 手順 10: Exclude 系 → IncludeAsError 系 → WarnInclude 系の順に並べる。
     // UnseenClass は行番号ではなくラベルで示すため `lines_by_code` に乗せず、
     // WarnInclude 系の最後に個別に追加する。
-    const ORDER: [WarningCode; 9] = [
+    const ORDER: [WarningCode; 10] = [
         WarningCode::MissingGold,
         WarningCode::MalformedGold,
         WarningCode::UnknownGoldLabel,
@@ -1292,6 +1336,7 @@ pub fn prepare_evaluation_input(
         WarningCode::DuplicateInputWithinSplit,
         WarningCode::AllAbstain,
         WarningCode::AllError,
+        WarningCode::EmptyInput,
     ];
     let mut warnings = drain_warnings_in_order(&mut lines_by_code, &ORDER);
     if !unseen_labels.is_empty() {
@@ -2499,5 +2544,89 @@ mod tests {
         assert!(!warnings_debug.contains(&long_id_b));
         assert!(!warnings_debug.contains(&long_id_c));
         assert!(!warnings_debug.contains(secret_input));
+    }
+
+    /// REQ-23 境界値・TASK-23.2（issue #57）: gold に空白のみの `input` 行が
+    /// 複数あると、対応する行番号がすべて [`WarningCode::EmptyInput`]
+    /// （`warn_include`・`side: gold`）として報告され、`active` から除外
+    /// されない。
+    #[test]
+    fn req23_empty_input_warns_include_without_excluding() {
+        let gold = concat!(
+            "{\"id\":\"g1\",\"input\":\"  \",\"label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"input\":\"\\u001c\",\"label\":\"A\"}\n",
+            "{\"id\":\"g3\",\"input\":\"hello\",\"label\":\"A\"}\n",
+        );
+        let pred = concat!(
+            "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g3\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+        );
+        let outcome = prepare_evaluation_input(gold, pred, &labels(&["A"])).unwrap();
+
+        assert_eq!(outcome.active.len(), 3);
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == WarningCode::EmptyInput)
+            .expect("EmptyInput warning must be present");
+        assert_eq!(warning.action, WarningAction::WarnInclude);
+        assert_eq!(warning.side, Side::Gold);
+        assert_eq!(warning.lines, vec![1, 2]);
+        assert!(warning.labels.is_empty());
+
+        // EmptyInput は他の WarnInclude 系（DuplicateInputWithinSplit・
+        // AllAbstain・AllError）の後、UnseenClass の前に並ぶ（手順 10）。
+        let codes: Vec<WarningCode> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec![WarningCode::EmptyInput]);
+    }
+
+    /// 空白のみの `input` を持つ行が 2 行あり異なるラベルの場合、
+    /// [`WarningCode::ContradictoryInput`] で `active` から除外されつつ、
+    /// [`WarningCode::EmptyInput`] にも両行が報告される（矛盾除外より前に
+    /// 検出するため報告が漏れない。REQ-23 境界値・TASK-23.2）。
+    #[test]
+    fn req23_empty_input_reported_even_when_contradictory_excludes_rows() {
+        let gold = concat!(
+            "{\"id\":\"g1\",\"input\":\" \",\"label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"input\":\" \",\"label\":\"B\"}\n",
+        );
+        let pred = concat!(
+            "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n",
+            "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n",
+        );
+        let result = prepare_evaluation_input(gold, pred, &labels(&["A", "B"]));
+        // 2 行とも矛盾除外され `active` が 0 件になるため NoValidGold で停止する
+        // （手順 7b）。`NoValidGold::warnings` には ContradictoryInput が含まれる
+        // （EXCLUDE_ORDER に EmptyInput は含めない。手順 6 と同じ判断）。
+        match result {
+            Err(EvalInputStop::NoValidGold { warnings, .. }) => {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.code == WarningCode::ContradictoryInput
+                            && w.lines == vec![1, 2])
+                );
+            }
+            other => panic!("expected NoValidGold, got {other:?}"),
+        }
+    }
+
+    /// 警告に `input` の値そのものは含まれない（診断情報に生値を含めない
+    /// 方針。モジュール doc「PoC-9 との差分」）。
+    #[test]
+    fn req23_empty_input_warning_does_not_leak_raw_input_value() {
+        let secret_marker = "\u{3000}\u{3000}";
+        let gold = format!("{{\"id\":\"g1\",\"input\":\"{secret_marker}\",\"label\":\"A\"}}\n");
+        let pred = "{\"id\":\"g1\",\"status\":\"ok\",\"predicted_label\":\"A\"}\n";
+        let outcome = prepare_evaluation_input(&gold, pred, &labels(&["A"])).unwrap();
+        let warnings_debug = format!("{:?}", outcome.warnings);
+        assert!(!warnings_debug.contains(secret_marker));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::EmptyInput)
+        );
     }
 }
