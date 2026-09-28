@@ -26,7 +26,9 @@ use std::process::ExitCode as ProcessExitCode;
 use std::time::Duration;
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_train::process::{ENV_ALLOWLIST, RunLimits, WorkerLauncher, run_train};
+#[cfg(unix)]
+use fandhe_edge_train::process::ENV_ALLOWLIST;
+use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 
 /// [`TrainRequest`] の `root`（実在しない絶対パス。`root` の symlink 解決は
@@ -279,10 +281,14 @@ struct CaseResult {
 type CaseFn = fn(&Path) -> Result<(), String>;
 
 fn run_test_suite() -> ProcessExitCode {
-    // windows では `cases.push` を行う `#[cfg(unix)]` ブロックが無いため
-    // `mut` が不要になり、`-D warnings` 経由の `unused_mut` で clippy が
-    // fail する（PR #233 レビュー・rust-ci windows-latest 実測）。
-    #[cfg_attr(not(unix), allow(unused_mut))]
+    // `run_train` は unix 限定（issue #178 PR #233 レビュー再指摘 P0
+    // 「Windows で正常終了後の孤児ワーカーを停止できない」への対応として
+    // windows 等は `UnsupportedPlatform` を返す fail-closed 版へ差し替えた。
+    // そのため、実ワーカー起動を前提とするケース群は unix 限定とし、
+    // windows 等では fail-closed の確認ケースだけを実行する
+    // （`crate::process` モジュール doc「windows（対象外・fail-closed）」
+    // 参照）。
+    #[cfg(unix)]
     let mut cases: Vec<(&'static str, CaseFn)> = vec![
         ("ok_outcome", case_ok_outcome),
         ("error_invalid_request", case_error_invalid_request),
@@ -304,6 +310,9 @@ fn run_test_suite() -> ProcessExitCode {
         "exit_with_orphan_kills_orphan",
         case_exit_with_orphan_kills_orphan,
     ));
+    #[cfg(not(unix))]
+    let cases: Vec<(&'static str, CaseFn)> =
+        vec![("unsupported_platform", case_unsupported_platform)];
 
     let mut results = Vec::new();
     for (name, case_fn) in cases {
@@ -419,6 +428,7 @@ fn expect_true(cond: bool, what: &str) -> Result<(), String> {
 }
 
 /// 受け入れ条件 1: 正常終了時に結果 JSON を `TrainOutcome` として受け取れる。
+#[cfg(unix)]
 fn case_ok_outcome(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "ok");
     let request = make_request(Some(30));
@@ -447,6 +457,7 @@ fn case_ok_outcome(case_dir: &Path) -> Result<(), String> {
 
 /// 受け入れ条件 3: ワーカーのエラー（`invalid_request`）が `InvalidInput`
 /// （64）へ写る。
+#[cfg(unix)]
 fn case_error_invalid_request(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "error_invalid_request");
     let request = make_request(Some(30));
@@ -457,6 +468,7 @@ fn case_error_invalid_request(case_dir: &Path) -> Result<(), String> {
 }
 
 /// 受け入れ条件 3: `training_diverged` が `Pending`（12）へ写る。
+#[cfg(unix)]
 fn case_error_training_diverged(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "error_training_diverged");
     let request = make_request(Some(30));
@@ -468,6 +480,7 @@ fn case_error_training_diverged(case_dir: &Path) -> Result<(), String> {
 
 /// 受け入れ条件 3: 結果 JSON（成功）とプロセスの実終了コード（64）が
 /// 食い違う場合は `ExitCodeMismatch`（→ `RuntimeError`）として拒否する。
+#[cfg(unix)]
 fn case_mismatch_ok_exit64(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "mismatch_ok_exit64");
     let request = make_request(Some(30));
@@ -480,6 +493,7 @@ fn case_mismatch_ok_exit64(case_dir: &Path) -> Result<(), String> {
 
 /// 受け入れ条件 3: 7 種以外のプロセス終了コード（3）は `RuntimeError` へ
 /// 写る。
+#[cfg(unix)]
 fn case_unknown_exit_code(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "exit3");
     let request = make_request(Some(30));
@@ -493,6 +507,7 @@ fn case_unknown_exit_code(case_dir: &Path) -> Result<(), String> {
 /// `abort()` はシグナル終了（unix）／`STATUS_STACK_BUFFER_OVERRUN`
 /// 相当の非標準終了コード（windows）のいずれであっても `RuntimeError`
 /// （70）へ写る。
+#[cfg(unix)]
 fn case_abort(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "abort");
     let request = make_request(Some(30));
@@ -505,6 +520,7 @@ fn case_abort(case_dir: &Path) -> Result<(), String> {
 
 /// 巨大出力: `MAX_RESULT_BYTES` を超える標準出力は締め切り前に `TooLarge`
 /// として拒否される（パイプ詰まりで固まらない）。
+#[cfg(unix)]
 fn case_big_stdout(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "big_stdout");
     let request = make_request(Some(30));
@@ -517,6 +533,7 @@ fn case_big_stdout(case_dir: &Path) -> Result<(), String> {
 
 /// 巨大 stderr: `MAX_WORKER_STDERR_BYTES` を超えた分は読み捨てられ、正常な
 /// 標準出力は成功として受理される。
+#[cfg(unix)]
 fn case_big_stderr(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "big_stderr");
     let request = make_request(Some(30));
@@ -535,6 +552,7 @@ fn case_big_stderr(case_dir: &Path) -> Result<(), String> {
 /// 受け入れ条件 2: タイムアウトで子プロセスを確実に終了させ、
 /// `LimitExceeded`（20）で返る。返った後に heartbeat が伸びない
 /// （子プロセスが残っていない）ことも確認する。
+#[cfg(unix)]
 fn case_timeout_hang(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "hang");
     let request = make_request(Some(1));
@@ -728,6 +746,7 @@ fn case_exit_with_orphan_kills_orphan(case_dir: &Path) -> Result<(), String> {
 
 /// `record` モード: argv・request.json の内容・環境変数名の許可リスト
 /// 準拠を確認する（issue #178 実装計画 3.1〜3.3・6.1「record」ケース）。
+#[cfg(unix)]
 fn case_record(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "record");
     let request = make_request(Some(30));
@@ -792,6 +811,7 @@ fn case_record(case_dir: &Path) -> Result<(), String> {
 
 /// 起動口・job_dir の不正: 存在しない `job_dir` は `InvalidJobDir` として
 /// 拒否する（子プロセスを起動しない）。
+#[cfg(unix)]
 fn case_invalid_job_dir(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "ok");
     let request = make_request(Some(30));
@@ -805,6 +825,7 @@ fn case_invalid_job_dir(case_dir: &Path) -> Result<(), String> {
 
 /// 既存の `request.json` は上書きしない（`RequestFileGuard` の
 /// `create_new`。issue #178 実装計画 3.2）。
+#[cfg(unix)]
 fn case_existing_request_file(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "ok");
     let request = make_request(Some(30));
@@ -821,5 +842,28 @@ fn case_existing_request_file(case_dir: &Path) -> Result<(), String> {
     match result {
         Err(e) => expect_eq(e.exit_code(), ExitCode::RuntimeError, "exit_code"),
         Ok(_) => Err("expected RequestWrite(AlreadyExists) error".to_string()),
+    }
+}
+
+/// issue #178 PR #233 レビュー再指摘 P0「Windows で正常終了後の孤児ワーカー
+/// を停止できない」への対応: unix 以外では `run_train` は子プロセスを一切
+/// 起動せず、即座に `UnsupportedPlatform`（`RuntimeError`＝70）を返す
+/// （fail-closed。`crate::process` モジュール doc「windows（対象外・
+/// fail-closed）」参照）。偽ワーカー（`ok` モード）を指す起動口を渡しても
+/// 起動されないことを、`request.json` が書き込まれないことで確認する。
+#[cfg(not(unix))]
+fn case_unsupported_platform(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok");
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+    match run_train(&launcher, &request, case_dir, &limits) {
+        Err(e) => {
+            expect_eq(e.exit_code(), ExitCode::RuntimeError, "exit_code")?;
+            expect_true(
+                !case_dir.join("request.json").exists(),
+                "request.json must not be written when platform is unsupported",
+            )
+        }
+        Ok(_) => Err("expected UnsupportedPlatform error".to_string()),
     }
 }

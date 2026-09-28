@@ -87,33 +87,75 @@
 //! pid を安全側でそのまま kill 対象とする（同レビューの別 P0「`ps` 失敗時に
 //! 既知孤児 PID を一度も停止しない」への対応）。
 //!
-//! Windows は `taskkill /T /F /PID <root_pid>`（固定の絶対パス
-//! `%SystemRoot%\System32\taskkill.exe`）でサブツリーごと終了する
-//! （codex/review 指摘 P0「Windows 版が常に false を返し何もしない」。
-//! issue #178 PR #233 レビュー）。Windows は unix と異なり親の終了時に子を
-//! reparent しないため、`root_pid` が生きている・既に終了済みのいずれの
-//! 時点で呼んでも `/T` がツリー全体に効く。
+//! [`kill_process_tree_best_effort`]（`ppid` チェーン走査）自体は、`ps`
+//! （[`ps_pid_ppid_pairs`]）が失敗しても最初のラウンドで即座に諦めない
+//! （codex/review 指摘 P0「`ps_pid_ppid_pairs()` 失敗時、関数が即 `false` を
+//! 返し、呼び出し元は直接の子だけを kill する」。issue #178 PR #233 レビュー
+//! 再指摘）。判断ロジックは [`sweep_with`] へ切り出しており、`ps` に相当する
+//! 問い合わせ（`query`）が失敗する各ラウンドでも、[`run_train`] が保持する
+//! 直近のスナップショット（`last_known_descendants`）へ
+//! [`kill_pids_best_effort`] で直接 `SIGKILL` を送る（fallback。Cursor
+//! Bugbot 指摘 Medium「壁時計タイムアウト時の掃除にポーリング中の
+//! `last_known_descendants` が適用されない」と同じ fallback を、`ppid`
+//! チェーン走査自体の失敗時にも用いる）。`descendants_confirmed_clean` は
+//! `ppid` チェーン側・スナップショット側の両方が掃除を確認できた場合のみ
+//! `true` になる（片方だけの確認を「確認できた」と誤って伝えない）。
 //!
-//! 残る既知の限界: supervisor が `spawn()` 直後（最初のスナップショットの
-//! `ps` 実行が完了する前）に正常終了した場合は、依然として `_worker` の pid
-//! を一度も記録できず対象にできない（現実的な学習ワーカーの起動・初期化
-//! 時間に対しては極めて狭い窓だが、理論上は残る）。
+//! `try_wait()` が `Ok(Some(status))` を返しても、それを観測した時刻が既に
+//! 締め切りを過ぎていれば成功として受理しない（codex/review 指摘 P1
+//! 「try_wait() の Ok(Some(status)) を締め切り判定より先に受理するため、
+//! 期限超過後に終了したプロセスを成功扱いしうる」。issue #178 PR #233
+//! レビュー再指摘）。この場合 `try_wait()` は既に子（supervisor）を
+//! 回収済みのため、その pid は OS に返却され再利用されうる。同じ pid を対象に
+//! `kill_process_tree_best_effort`（`ppid` で再検索する）や `Child::kill()`
+//! を再度呼ぶと、無関係なプロセスを誤って終了させる恐れがあるため、
+//! [`WaitOutcome::LateExit`] 経路では `pid` に触れず、生存確認済みの子孫
+//! スナップショットだけを対象に `kill_pids_best_effort` を呼ぶ。
+//!
+//! # windows（対象外・fail-closed。issue #178 PR #233 レビュー再指摘 P0）
+//!
+//! 以前の実装は `taskkill /T /F /PID <root_pid>` でサブツリーごと終了を
+//! 試みていたが、supervisor が正常終了した「後」に `_worker` だけが別
+//! セッションの孤児として残るケース（本モジュール doc の
+//! `kill_pids_best_effort` の節を参照）には対応できていなかった。unix 側は
+//! ポーリング中に記録した `(pid, lstart)` スナップショットへ直接
+//! `SIGKILL` を送ることでこれを検出・停止するが、windows で同等の恒久対応を
+//! 行うにはジョブオブジェクト（`CreateJobObject`／`AssignProcessToJobObject`／
+//! `TerminateJobObject`。将来仕様。REQ-39）が要り、`windows` crate 等の新規
+//! 依存を追加する必要がある（`.claude/rules/dependency-policy.md` のユーザー
+//! 承認事項）。承認を経ずに追加しないため、本 issue では windows を資源上限
+//! （REQ-39）を保証できない環境として扱い、[`run_train`]（`cfg(not(unix))`
+//! 版）は子プロセスを一切起動せず即座に
+//! [`TrainProcessError::UnsupportedPlatform`] を返す（fail-closed。
+//! codex/review 指摘 P0「Windows で正常終了後の孤児ワーカーを停止できない」）。
+//!
+//! 残る既知の限界（unix）: supervisor が `spawn()` 直後（最初のスナップ
+//! ショットの `ps` 実行が完了する前）に正常終了した場合は、依然として
+//! `_worker` の pid を一度も記録できず対象にできない（現実的な学習ワーカー
+//! の起動・初期化時間に対しては極めて狭い窓だが、理論上は残る）。
 //!
 //! # 推論ランタイムとの境界
 //!
 //! 本モジュールは学習ワーカー層（`crates/train`）に閉じる。推論ランタイム・
 //! CLI コアはこの crate に依存しない（REQ-32。`.claude/rules/coding-rust.md`）。
 
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use fandhe_edge_core::exitcode::ExitCode;
 
 use crate::error::TrainProcessError;
-use crate::limits::{MAX_RESULT_BYTES, MAX_WORKER_STDERR_BYTES, SUPERVISOR_SHUTDOWN_GRACE_SECONDS};
+use crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS;
+#[cfg(unix)]
+use crate::limits::{MAX_RESULT_BYTES, MAX_WORKER_STDERR_BYTES};
 use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
 
@@ -122,10 +164,12 @@ use crate::result::TrainOutcome;
 /// 上限」）。`_worker` が supervisor の標準エラー出力を継承しているため、
 /// 孤児が残っているとパイプが閉じず読み取りが終わらないことへの対策
 /// （issue #178 実装計画 3.5）。
+#[cfg(unix)]
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `Child::try_wait()` のポーリング間隔（ミリ秒）。std に `wait_timeout`
 /// 相当が無いため、短い間隔で非同期にポーリングする。
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 子プロセスの環境変数の許可リスト（OS ごと）。`env_clear()` のうえで
@@ -148,6 +192,12 @@ pub const ENV_ALLOWLIST: &[&str] = &["SystemRoot", "TEMP", "TMP"];
 /// を経由した値だけが構築でき、絶対パスの通常ファイルであることが型で
 /// 保証される（PATH 検索はしない。PATH 乗っ取り対策。
 /// `.claude/rules/security.md`「インジェクション」）。
+// unix 以外では [`run_train`] がこれらのフィールドを一切読まない
+// （`UnsupportedPlatform` を即座に返す fail-closed 版のため。モジュール doc
+// 「windows（対象外・fail-closed）」参照）が、`WorkerLauncher::new` に
+// よる起動口の検証自体はプラットフォームによらず意味を持つ（将来 CLI 層が
+// 事前検証に使いうる）ため、型自体は cfg で分けない。
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct WorkerLauncher {
     python: PathBuf,
@@ -215,6 +265,8 @@ impl WorkerLauncher {
 
     /// このランチャーで起動する固定 argv（`Command::args` へそのまま渡す。
     /// シェルを介さない。`.claude/rules/security.md`「インジェクション」）。
+    /// unix 限定（[`run_train`] 参照）。
+    #[cfg(unix)]
     fn argv(&self, request_path: &Path) -> Vec<std::ffi::OsString> {
         vec![
             "-I".into(),
@@ -282,11 +334,13 @@ impl RunLimits {
 ///
 /// 削除失敗はエラーにしない（学習結果を失わせないための方針をコメントで
 /// 明示する。`.claude/rules/code-comment-style.md`「非自明な前提・副作用」）。
+#[cfg(unix)]
 #[derive(Debug)]
 struct RequestFileGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for RequestFileGuard {
     fn drop(&mut self) {
         // 削除に失敗しても学習結果（`run_train` が既に得た `TrainRun`／
@@ -299,6 +353,7 @@ impl Drop for RequestFileGuard {
 
 /// `job_dir`（既存の絶対パスディレクトリ）へ検証済みリクエストを書き込む。
 /// 既存の `request.json` は上書きしない（`OpenOptions::create_new`）。
+#[cfg(unix)]
 fn write_request_file(
     job_dir: &Path,
     request: &TrainRequest,
@@ -344,6 +399,7 @@ fn write_request_file(
 }
 
 /// 上限つきで読み進める出力読み取りスレッドの結果。
+#[cfg(unix)]
 struct DrainedOutput {
     /// 保持したバイト列（上限超過分は含まない）。
     kept: Vec<u8>,
@@ -372,6 +428,7 @@ struct DrainedOutput {
 /// レビュー: 修正前は `EINTR` も他の `read()` エラーと同列に扱い、ワーカーが
 /// 実際には正常終了していても `StdoutIncomplete`／`StderrIncomplete` に
 /// 分類してしまっていた）。
+#[cfg(unix)]
 fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
     let mut kept = Vec::new();
     let mut truncated = false;
@@ -412,6 +469,7 @@ fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
 
 /// パイプ読み取りを専用スレッドへ切り出し、`mpsc::Receiver` を返す
 /// （呼び出し元は `recv_timeout` で上限付きに待つ）。
+#[cfg(unix)]
 fn spawn_reader<R>(reader: R, cap: usize) -> mpsc::Receiver<DrainedOutput>
 where
     R: Read + Send + 'static,
@@ -561,6 +619,7 @@ const DESCENDANT_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// 割り込み不可能な OS 側の待ち（D state）等の極めて稀なケースに限られる
 /// （Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
 /// #178 PR #233 レビュー。[`wait_after_kill`] 参照）。
+#[cfg(unix)]
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `program`（絶対パス）を `args` で子プロセスとして起動し、標準出力を
@@ -779,31 +838,80 @@ fn transitive_descendants_with_start(root: u32, pairs: &[(u32, u32)]) -> Vec<(u3
 /// 妨げない。fail-open だが、直接の子の回収という主要な不変条件〔ゾンビを
 /// 残さない〕は本関数の成否と独立に保たれる）。
 ///
-/// 戻り値 `true` は、最終確認の `ps` で子孫が 1 件も見つからなかった（掃除を
-/// 確認できた）ことを示す。`false` は `ps` 自体の失敗・全ラウンドを終えても
-/// 子孫が残っていたことを示し、呼び出し元は「別セッションの `_worker` 等が
-/// 生き残っている可能性がある」ことを認識したうえで後続の判断
-/// （エラー型への反映等）に用いること（codex/review 指摘 P0「プロセス
-/// ツリーの掃除に失敗しても子孫が動き続ける」。issue #178 PR #233 レビュー:
-/// 修正前は本関数が戻り値を持たず、呼び出し元（[`run_train`]）は掃除の成否
-/// によらず常に直接の子だけを kill/wait して締め切り超過エラーを返して
-/// いた。モジュール doc「孤児化の限界」参照）。
+/// 戻り値 `true` は、最終確認の `ps` で子孫が 1 件も見つからず（`ppid` チェ
+/// ーン経由の掃除を確認できた）、かつ `fallback` スナップショット（`(pid,
+/// lstart)`。[`run_train`] がポーリング中に記録した直近の子孫一覧）についても
+/// [`kill_pids_best_effort`] で生存を確認できなかったことを示す。`false` は
+/// いずれかが「確認できなかった」ことを示し、呼び出し元は「別セッションの
+/// `_worker` 等が生き残っている可能性がある」ことを認識したうえで後続の判断
+/// （エラー型への反映等）に用いること。
+///
+/// `ps_pid_ppid_pairs()` が失敗しても即座に諦めない: `ppid` チェーンでの
+/// 確認ができない各ラウンドでも `fallback` へ直接 `SIGKILL` を送ることで、
+/// 直接の子（supervisor）だけでなく子孫も止められるようにする（codex/review
+/// 指摘 P0「`ps_pid_ppid_pairs()` 失敗時、関数が即 `false` を返し、呼び出し
+/// 元は直接の子だけを kill する」。issue #178 PR #233 レビュー再指摘。
+/// 修正前は最初のラウンドで `ps` が失敗すると即 `return false` し、後続
+/// ラウンド・fallback のいずれも試みなかった）。
+///
+/// 純粋なリトライ・fallback 呼び出しの判断ロジックは [`sweep_with`] へ切り
+/// 出し、実プロセスを使わずに単体テストできるようにしてある
+/// （`tests::req39_sweep_with_retries_and_falls_back_when_ps_fails` 参照）。
 #[cfg(unix)]
-fn kill_process_tree_best_effort(root_pid: u32) -> bool {
+fn kill_process_tree_best_effort(root_pid: u32, fallback: &[(u32, String)]) -> bool {
+    sweep_with(
+        || ps_pid_ppid_pairs().map(|pairs| transitive_descendants(root_pid, &pairs)),
+        |descendants| {
+            for pid in descendants {
+                run_bounded_fire_and_forget(
+                    KILL_BIN,
+                    &["-s", "KILL", &pid.to_string()],
+                    ORPHAN_SWEEP_STEP_TIMEOUT,
+                );
+            }
+        },
+        fallback,
+    )
+}
+
+/// [`kill_process_tree_best_effort`] のリトライ・fallback 判断ロジック
+/// （`ps` 呼び出し・`kill` 送出そのものは引数のクロージャへ委譲する）。
+///
+/// `query`: 現在の子孫一覧を取得する（`ps` 失敗時は `None`）。
+/// `kill_descendants`: `query` が返した子孫一覧へ `SIGKILL` を送る。
+/// `fallback`: `ppid` チェーンでは辿れない孤児（supervisor 終了後に
+/// reparent 済みの `_worker` 等）に備えた `(pid, lstart)` スナップショット。
+///
+/// `query` が失敗するラウンドでも `fallback` への
+/// [`kill_pids_best_effort`] 呼び出しは必ず行う（fallback が空なら
+/// 呼び出しても副作用は無く `true` を返す）。全ラウンドを終えても `query`
+/// による確認が一度も取れなかった場合は `false`（確認できなかった）を返す。
+#[cfg(unix)]
+fn sweep_with(
+    mut query: impl FnMut() -> Option<Vec<u32>>,
+    mut kill_descendants: impl FnMut(&[u32]),
+    fallback: &[(u32, String)],
+) -> bool {
+    let mut tree_clean = false;
     for round in 0..ORPHAN_SWEEP_MAX_ROUNDS {
-        let Some(pairs) = ps_pid_ppid_pairs() else {
-            return false;
-        };
-        let descendants = transitive_descendants(root_pid, &pairs);
-        if descendants.is_empty() {
-            return true;
+        match query() {
+            Some(descendants) if descendants.is_empty() => {
+                tree_clean = true;
+            }
+            Some(descendants) => {
+                kill_descendants(&descendants);
+            }
+            None => {
+                // `ps` 自体が失敗: `ppid` チェーンでの確認はできないが、
+                // 直近まで判明していた子孫スナップショットへは引き続き
+                // `SIGKILL` を送る（fallback。ここで諦めない）。
+            }
         }
-        for pid in descendants {
-            run_bounded_fire_and_forget(
-                KILL_BIN,
-                &["-s", "KILL", &pid.to_string()],
-                ORPHAN_SWEEP_STEP_TIMEOUT,
-            );
+        if tree_clean {
+            break;
+        }
+        if !fallback.is_empty() {
+            kill_pids_best_effort(fallback);
         }
         // 最終ラウンドの後に確認待ちしても無意味なので、最後の反復では
         // 待たずに抜ける（呼び出し元をこれ以上待たせない）。
@@ -811,13 +919,14 @@ fn kill_process_tree_best_effort(root_pid: u32) -> bool {
             std::thread::sleep(ORPHAN_SWEEP_RETRY_DELAY);
         }
     }
-    // 全ラウンドを終えた後の最終確認。`kill` 送出直後の終了処理中だった
-    // 子孫が、この時点までに実際に消えている可能性があるため、諦める前に
-    // もう一度だけ確認する。
-    match ps_pid_ppid_pairs() {
-        Some(pairs) => transitive_descendants(root_pid, &pairs).is_empty(),
-        None => false,
+    if !tree_clean {
+        // 全ラウンドを終えた後の最終確認。`kill` 送出直後の終了処理中
+        // だった子孫が、この時点までに実際に消えている可能性があるため、
+        // 諦める前にもう一度だけ確認する。
+        tree_clean = matches!(query(), Some(descendants) if descendants.is_empty());
     }
+    let fallback_clean = fallback.is_empty() || kill_pids_best_effort(fallback);
+    tree_clean && fallback_clean
 }
 
 /// 既知の `(pid, lstart)`（[`run_train`] がポーリング中に記録した直近の
@@ -848,22 +957,33 @@ fn kill_process_tree_best_effort(root_pid: u32) -> bool {
 /// 「ps_pid_ppid_pairs() 失敗時に既知孤児 PID を停止しない」。issue #178
 /// PR #233 レビュー。誤 kill のリスクは `ps` 障害時に限定されるベスト
 /// エフォートの範囲として許容する）。
+///
+/// 戻り値 `true` は、最終確認で `pids` のいずれも生存を確認できなかった
+/// （掃除を確認できた）ことを示す。`pids` が空なら対象が無いため無条件に
+/// `true`（[`sweep_with`] がこの戻り値をそのまま「fallback 側の掃除の成否」
+/// として合成できるようにするための取り決め）。`false` は `ps` 自体の失敗が
+/// 続いた・全ラウンドを終えても生存が確認されたことを示す（codex/review
+/// 指摘 P0「`descendants_confirmed_clean: false` は通知だけで上限を強制
+/// しない」。issue #178 PR #233 レビュー再指摘: 修正前は戻り値を持たず、
+/// 呼び出し元は本関数の掃除が実際に効いたかを一切確認できなかった）。
 #[cfg(unix)]
-fn kill_pids_best_effort(pids: &[(u32, String)]) {
+fn kill_pids_best_effort(pids: &[(u32, String)]) -> bool {
     if pids.is_empty() {
-        return;
+        return true;
     }
     for round in 0..ORPHAN_SWEEP_MAX_ROUNDS {
-        let alive: Vec<u32> = match ps_pid_start_pairs() {
-            Some(current) => pids
-                .iter()
-                .filter(|(pid, start)| current.iter().any(|(p, s)| p == pid && s == start))
-                .map(|(pid, _)| *pid)
-                .collect(),
-            None => pids.iter().map(|(pid, _)| *pid).collect(),
+        let (alive, confirmed): (Vec<u32>, bool) = match ps_pid_start_pairs() {
+            Some(current) => (
+                pids.iter()
+                    .filter(|(pid, start)| current.iter().any(|(p, s)| p == pid && s == start))
+                    .map(|(pid, _)| *pid)
+                    .collect(),
+                true,
+            ),
+            None => (pids.iter().map(|(pid, _)| *pid).collect(), false),
         };
-        if alive.is_empty() {
-            return;
+        if alive.is_empty() && confirmed {
+            return true;
         }
         for pid in &alive {
             run_bounded_fire_and_forget(
@@ -876,63 +996,9 @@ fn kill_pids_best_effort(pids: &[(u32, String)]) {
             std::thread::sleep(ORPHAN_SWEEP_RETRY_DELAY);
         }
     }
-}
-
-/// Windows では対象外（モジュール doc「孤児化の限界」参照）。ジョブ
-/// オブジェクト（`CreateJobObject`／`AssignProcessToJobObject`）による
-/// プロセスツリー単位の終了は、Windows の `taskkill /T /F` サブツリー終了で
-/// 行う（codex/review 指摘 P0「Windows 版が常に false を返し何もしない」。
-/// issue #178 PR #233 レビュー）。Windows は unix と異なり親の終了時に子を
-/// reparent しない（`start_new_session` 相当の概念がなく、`_worker` は
-/// supervisor の子プロセスツリーに留まる）ため、supervisor（`root_pid`）が
-/// まだ生きている・既に終了済みのいずれの時点で呼んでも `/T` がツリー全体に
-/// 効く。`%SystemRoot%\System32\taskkill.exe` を固定の絶対パスで呼び、シェル
-/// を介さない（`.claude/rules/security.md`「インジェクション」）。
-///
-/// `SystemRoot` が環境に無い・`taskkill.exe` が通常ファイルとして存在しない・
-/// 起動に失敗した場合は `false`（確認できなかった）を返す。`taskkill` の終了
-/// を待つ間も無期限にブロックしないよう [`poll_wait_bounded`] で
-/// [`KILL_WAIT_TIMEOUT`] を掛ける（Cursor Bugbot 指摘 Medium と同じ理由。
-/// [`wait_after_kill`] 参照）。戻り値は「`taskkill` が成功終了コードを返した
-/// か」であり、unix 版のように `ps` で再列挙して確認するわけではない点に注意
-/// （taskkill 自体がツリーの列挙・終了を行うため、二重に列挙するコストを
-/// 避ける。ベストエフォートの範囲。REQ-39「資源の上限」）。
-#[cfg(windows)]
-fn kill_process_tree_best_effort(root_pid: u32) -> bool {
-    let Ok(system_root) = std::env::var("SystemRoot") else {
-        return false;
-    };
-    let taskkill = PathBuf::from(system_root)
-        .join("System32")
-        .join("taskkill.exe");
-    let Ok(metadata) = std::fs::metadata(&taskkill) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    let mut command = Command::new(&taskkill);
-    command
-        .args(["/T", "/F", "/PID", &root_pid.to_string()])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // taskkill・配下の DLL 探索に必要な最小限の環境変数のみを引き継ぐ
-    // （`ENV_ALLOWLIST`（windows）と同じ許可リスト）。
-    for key in ENV_ALLOWLIST {
-        if let Ok(value) = std::env::var(key) {
-            command.env(key, value);
-        }
-    }
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
-    match poll_wait_bounded(&mut child, deadline) {
-        Ok(Some(status)) => status.success(),
-        Ok(None) | Err(_) => false,
-    }
+    // 全ラウンドを終えた後の最終確認。
+    matches!(ps_pid_start_pairs(), Some(current)
+        if !pids.iter().any(|(pid, start)| current.iter().any(|(p, s)| p == pid && s == start)))
 }
 
 /// `Child::try_wait()` を `deadline` までポーリングする共通ヘルパー。
@@ -948,6 +1014,7 @@ fn kill_process_tree_best_effort(root_pid: u32) -> bool {
 /// 戻り値: `Ok(Some(status))` は終了を確認できた、`Ok(None)` は `deadline`
 /// まで待っても終了しなかった（呼び出し元は上限超過として扱う）、
 /// `Err(e)`（`EINTR` 以外）は `try_wait()` 自体が失敗したことを示す。
+#[cfg(unix)]
 fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
     loop {
         match child.try_wait() {
@@ -985,6 +1052,7 @@ fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Op
 /// [`kill_process_tree_best_effort`] の戻り値をそのまま
 /// [`TrainProcessError::Wait`] へ伝播するために受け取る（`Child::wait()`
 /// 自体が失敗した場合のみ使う。issue #178 PR #233 レビュー）。
+#[cfg(unix)]
 fn wait_after_kill(
     child: &mut Child,
     descendants_confirmed_clean: bool,
@@ -1003,6 +1071,7 @@ fn wait_after_kill(
 /// 子プロセスの終了コード（unix はシグナル終了で `None` になりうる）を
 /// [`ExitCode`] へ写す。JSON 側の判定（`classify_result_exit_code`）とは
 /// 独立に、まず「プロセスがどう終了したか」だけを判定する。
+#[cfg(unix)]
 fn classify_process_exit_status(status: ExitStatus) -> Result<ExitCode, TrainProcessError> {
     let Some(code) = status.code() else {
         return Err(TrainProcessError::TerminatedBySignal);
@@ -1013,6 +1082,7 @@ fn classify_process_exit_status(status: ExitStatus) -> Result<ExitCode, TrainPro
 /// 標準出力（信頼しない外部入力）を検証済みの [`TrainOutcome`] へ解析し、
 /// その結果が示す終了コードと、子プロセスの実終了コード（`process_exit`）
 /// が一致することを確認する（issue #178 実装計画 3.6・表の 6〜8 行目）。
+#[cfg(unix)]
 fn classify_exit(
     process_exit: ExitCode,
     stdout: &[u8],
@@ -1029,6 +1099,48 @@ fn classify_exit(
     Ok(outcome)
 }
 
+/// unix 以外（windows 等）では [`TrainProcessError::UnsupportedPlatform`]
+/// を返す（fail-closed。モジュール doc「windows（対象外・fail-closed）」
+/// 参照。issue #178 PR #233 レビュー再指摘 P0）。子プロセスは一切起動せず、
+/// `job_dir` への書き込みも行わない。
+#[cfg(not(unix))]
+pub fn run_train(
+    _launcher: &WorkerLauncher,
+    _request: &TrainRequest,
+    _job_dir: &Path,
+    _limits: &RunLimits,
+) -> Result<TrainRun, TrainProcessError> {
+    Err(TrainProcessError::UnsupportedPlatform)
+}
+
+/// `try_wait()` を 1 回ポーリングした結果を、壁時計締め切りとの関係で
+/// 分類したもの（[`run_train`] のポーリングループが使う）。
+#[cfg(unix)]
+enum WaitOutcome {
+    /// 締め切り内に終了を観測できた。
+    Exited(ExitStatus),
+    /// 終了はしていたが、観測できた時刻が既に締め切りを過ぎていた
+    /// （codex/review 指摘 P1「try_wait() の Ok(Some(status)) を締め切り
+    /// 判定より先に受理するため、期限超過後に終了したプロセスを成功扱い
+    /// しうる」。issue #178 PR #233 レビュー再指摘）。`try_wait()` は既に
+    /// `waitpid` 相当で子を回収済みのため、この時点で `root_pid`（＝
+    /// `child.id()`）を再利用した無関係なプロセスが存在しうる。以後
+    /// `kill_process_tree_best_effort`（`root_pid` を `ps` の `ppid` で
+    /// 再検索する）や `Child::kill()` を呼んではならない。
+    LateExit,
+    /// 締め切りまでに終了を確認できなかった。
+    TimedOut,
+}
+
+/// `observed_at`（`try_wait()` が `Ok(Some(status))` を返した時点の時刻）が
+/// `deadline` より前かどうかを判定する。[`run_train`] のポーリングループ
+/// から純粋関数として切り出し、実プロセスを使わずに単体テストできるように
+/// する（issue #178 PR #233 レビュー再指摘 P1）。
+#[cfg(unix)]
+fn observed_within_deadline(observed_at: Instant, deadline: Instant) -> bool {
+    observed_at < deadline
+}
+
 /// 学習ワーカーを子プロセスとして起動し、壁時計タイムアウトと出力の読み
 /// 取り上限を掛けたうえで、検証済みの結果 [`TrainRun`] を得る（REQ-21・
 /// REQ-34・REQ-39。issue #178 の公開入口）。
@@ -1039,7 +1151,9 @@ fn classify_exit(
 /// 超過時は kill して回収 → (4) 標準出力／標準エラー出力を上限つきで
 /// 読み取り → (5) [`classify_exit`] で結果を検証。すべての経路
 /// （成功・失敗・タイムアウト）で `request.json` を削除する
-/// （[`RequestFileGuard`]）。
+/// （[`RequestFileGuard`]）。unix 限定（windows 版は上記の
+/// `#[cfg(not(unix))]` 版を参照）。
+#[cfg(unix)]
 pub fn run_train(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
@@ -1091,21 +1205,21 @@ pub fn run_train(
     // 壁時計タイムアウトまで `try_wait()` をポーリングする（std に
     // `wait_timeout` 相当が無いため）。supervisor が生きている間、`ps` の
     // `ppid` チェーンで確認できた子孫 pid の直近スナップショットを記録して
-    // おく。supervisor が正常終了した後（下の「子は既に終了している」経路）
-    // にパイプ読み取りが完了しない場合、`_worker` の `ppid` チェーンは
-    // supervisor の終了と同時に切れてしまう（reparent 済みになる）ため、
-    // 終了後に辿り直すことができない。生きている間の最後のスナップショット
-    // を使って直接 pid を kill する（codex/review 指摘 P0「supervisor が
-    // 先に終了すると孤児ワーカーを停止できない」。issue #178 PR #233
-    // レビュー。[`kill_pids_best_effort`] 参照。unix のみ:
-    // `kill_process_tree_best_effort` 自体が unix 専用のため windows では
-    // 常に空のまま）。`(pid, ppid)` で記録するのは、後で
-    // `kill_pids_best_effort` が「記録時と同一プロセスか」を `ppid` 一致で
-    // 確認するため（codex/review 指摘 P0「PID 再利用時の誤 kill」。issue #178
-    // PR #233 レビュー）。
-    #[cfg(unix)]
+    // おく。supervisor が正常終了した後にパイプ読み取りが完了しない場合、
+    // `_worker` の `ppid` チェーンは supervisor の終了と同時に切れてしまう
+    // （reparent 済みになる）ため、終了後に辿り直すことができない。生きて
+    // いる間の最後のスナップショットを使って直接 pid を kill する
+    // （codex/review 指摘 P0「supervisor が先に終了すると孤児ワーカーを
+    // 停止できない」。issue #178 PR #233 レビュー。[`kill_pids_best_effort`]
+    // 参照）。以下のすべての異常系（`Err`・締め切り超過・期限超過後の
+    // 終了観測）で、このスナップショットを [`kill_process_tree_best_effort`]
+    // の fallback として渡す（Cursor Bugbot 指摘 Medium「壁時計タイムアウト
+    // 時の掃除にポーリング中の last_known_descendants が適用されない」。
+    // issue #178 PR #233 レビュー再指摘）。`(pid, lstart)` で記録するのは、
+    // 後で `kill_pids_best_effort` が「記録時と同一プロセスか」を `lstart`
+    // 一致で確認するため（`ppid` は reparent で変わるため使えない。
+    // [`transitive_descendants_with_start`] のドキュメント参照）。
     let mut last_known_descendants: Vec<(u32, String)> = Vec::new();
-    #[cfg(unix)]
     let mut last_descendant_snapshot_at: Instant;
 
     // `try_wait()` を一度も呼ぶ前に最初のスナップショットを取る。ポーリング
@@ -1118,39 +1232,38 @@ pub fn run_train(
     // レビュー）。残る既知の限界: `spawn()` 直後から本スナップショットの
     // `ps` 実行までの間に supervisor が終了した場合は、この対策でも
     // 取りこぼす（モジュール doc「孤児化の限界」参照）。
-    #[cfg(unix)]
-    {
-        if let Some(pairs) = ps_pid_ppid_pairs() {
-            let descendants = transitive_descendants_with_start(child.id(), &pairs);
-            if !descendants.is_empty() {
-                last_known_descendants = descendants;
-            }
+    if let Some(pairs) = ps_pid_ppid_pairs() {
+        let descendants = transitive_descendants_with_start(child.id(), &pairs);
+        if !descendants.is_empty() {
+            last_known_descendants = descendants;
         }
-        last_descendant_snapshot_at = Instant::now();
     }
+    last_descendant_snapshot_at = Instant::now();
 
     let deadline = started + limits.wall_timeout();
-    let status = loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                if observed_within_deadline(Instant::now(), deadline) {
+                    break WaitOutcome::Exited(status);
+                }
+                break WaitOutcome::LateExit;
+            }
             Ok(None) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    break None;
+                    break WaitOutcome::TimedOut;
                 }
-                #[cfg(unix)]
-                {
-                    let need_snapshot = now.duration_since(last_descendant_snapshot_at)
-                        >= DESCENDANT_SNAPSHOT_INTERVAL;
-                    if need_snapshot {
-                        if let Some(pairs) = ps_pid_ppid_pairs() {
-                            let descendants = transitive_descendants_with_start(child.id(), &pairs);
-                            if !descendants.is_empty() {
-                                last_known_descendants = descendants;
-                            }
+                let need_snapshot =
+                    now.duration_since(last_descendant_snapshot_at) >= DESCENDANT_SNAPSHOT_INTERVAL;
+                if need_snapshot {
+                    if let Some(pairs) = ps_pid_ppid_pairs() {
+                        let descendants = transitive_descendants_with_start(child.id(), &pairs);
+                        if !descendants.is_empty() {
+                            last_known_descendants = descendants;
                         }
-                        last_descendant_snapshot_at = now;
                     }
+                    last_descendant_snapshot_at = now;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -1164,7 +1277,7 @@ pub fn run_train(
                 // EINTR を恒久エラー扱いする」と同種の欠陥がこのループにも
                 // あった）。
                 if Instant::now() >= deadline {
-                    break None;
+                    break WaitOutcome::TimedOut;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -1186,7 +1299,8 @@ pub fn run_train(
                 // PR #233 レビュー）。直接の子の最終回収も無期限に待たず
                 // `wait_after_kill` で上限を掛ける（Cursor Bugbot 指摘
                 // Medium「Timeout wait can block forever」）。
-                let descendants_confirmed_clean = kill_process_tree_best_effort(child.id());
+                let descendants_confirmed_clean =
+                    kill_process_tree_best_effort(child.id(), &last_known_descendants);
                 let _ = child.kill();
                 let _ = wait_after_kill(&mut child, descendants_confirmed_clean);
                 return Err(TrainProcessError::Wait {
@@ -1197,9 +1311,27 @@ pub fn run_train(
         }
     };
 
-    let status = match status {
-        Some(status) => status,
-        None => {
+    let status = match outcome {
+        WaitOutcome::Exited(status) => status,
+        WaitOutcome::LateExit => {
+            // `try_wait()` が既に子（supervisor）を回収済みのため、`pid`
+            // （= `child.id()`）は OS に返却され再利用されうる。この pid を
+            // 対象に `kill_process_tree_best_effort`（`ps` の `ppid` で
+            // 再検索する）や `Child::kill()` を再度呼ぶと、無関係な
+            // プロセスを誤って終了させる恐れがある（codex/review 指摘 P1
+            // 「try_wait() の成功を締め切り判定より先に受理する」。issue
+            // #178 PR #233 レビュー再指摘）。生存確認済みの子孫スナップ
+            // ショット（`lstart` で識別する [`kill_pids_best_effort`]）
+            // だけを対象に直接 `SIGKILL` を送る。
+            let descendants_confirmed_clean = kill_pids_best_effort(&last_known_descendants);
+            return Err(TrainProcessError::WallTimeout {
+                limit_ms: u64::try_from(limits.wall_timeout().as_millis()).unwrap_or(u64::MAX),
+                descendants_confirmed_clean,
+                // supervisor は `try_wait()` で既に回収済み。
+                child_reaped: true,
+            });
+        }
+        WaitOutcome::TimedOut => {
             // 締め切り超過: supervisor がまだ生きている前提でプロセス
             // ツリー（`_worker` を含む子孫）を先に掃除してから、supervisor
             // 自身を kill してから必ず `wait()` で回収する（ゾンビを残さ
@@ -1210,7 +1342,8 @@ pub fn run_train(
             // `descendants_confirmed_clean` として呼び出し元へ伝える
             // （codex/review 指摘 P0「プロセスツリーの掃除に失敗しても
             // 子孫が動き続ける」。issue #178 PR #233 レビュー）。
-            let descendants_confirmed_clean = kill_process_tree_best_effort(child.id());
+            let descendants_confirmed_clean =
+                kill_process_tree_best_effort(child.id(), &last_known_descendants);
             let _ = child.kill();
             // `wait_after_kill` の失敗（`KillWaitTimedOut`／`Wait`）を `?` で
             // そのまま伝播すると、壁時計タイムアウトが検出された事実が
@@ -1264,8 +1397,7 @@ pub fn run_train(
     // として返す（codex/review 指摘 P0「supervisor が先に終了すると孤児
     // ワーカーを停止できない」。issue #178 PR #233 レビュー）。
     let Some(stdout_drain) = stdout_drain.filter(|d| !d.read_error) else {
-        #[cfg(unix)]
-        kill_pids_best_effort(&last_known_descendants);
+        let _ = kill_pids_best_effort(&last_known_descendants);
         return Err(TrainProcessError::StdoutIncomplete);
     };
     // 標準エラー出力の読み取りタイムアウトも標準出力と同様にエラーとして
@@ -1274,8 +1406,7 @@ pub fn run_train(
     // には継続中でも成功と区別できなくなる（codex/review 指摘。issue #178
     // PR #233 レビュー。REQ-39「資源の上限」）。
     let Some(stderr_drain) = stderr_drain.filter(|d| !d.read_error) else {
-        #[cfg(unix)]
-        kill_pids_best_effort(&last_known_descendants);
+        let _ = kill_pids_best_effort(&last_known_descendants);
         return Err(TrainProcessError::StderrIncomplete);
     };
     let (worker_stderr, stderr_truncated) = (stderr_drain.kept, stderr_drain.truncated);
@@ -1373,7 +1504,8 @@ mod tests {
     /// `write_request_file`（`run_train` 内部）が `TrainRequestError::TooLarge`
     /// を `TrainProcessError::Request` として伝播し、`exit_code()` は
     /// `LimitExceeded`（20）になる（`RequestWrite`〔`RuntimeError`〕へ
-    /// 丸めない）。
+    /// 丸めない）。`write_request_file` は unix 限定（[`run_train`] 参照）。
+    #[cfg(unix)]
     #[test]
     fn req39_write_request_file_propagates_too_large_config_as_limit_exceeded() {
         use crate::limits::MAX_REQUEST_BYTES;
@@ -1476,7 +1608,9 @@ mod tests {
     }
 
     /// `classify_exit`: プロセス終了コードと結果 JSON が示す終了コードが
-    /// 一致しない場合は `ExitCodeMismatch` を返す。
+    /// 一致しない場合は `ExitCodeMismatch` を返す。`classify_exit` は unix
+    /// 限定（[`run_train`] 参照）。
+    #[cfg(unix)]
     #[test]
     fn req39_classify_exit_rejects_process_result_mismatch() {
         let request = test_request(None);
@@ -1493,6 +1627,7 @@ mod tests {
 
     /// `classify_exit`: プロセス終了コードと結果 JSON が一致する場合は
     /// 受理する。
+    #[cfg(unix)]
     #[test]
     fn req39_classify_exit_accepts_matching_error_result() {
         let request = test_request(None);
@@ -1500,5 +1635,109 @@ mod tests {
         let outcome = classify_exit(ExitCode::InvalidInput, json.as_bytes(), &request)
             .expect("matching exit code must be accepted");
         assert_eq!(outcome.exit_code(), ExitCode::InvalidInput);
+    }
+
+    /// REQ-39・issue #178 PR #233 レビュー再指摘 P0「Windows で正常終了後の
+    /// 孤児ワーカーを停止できない」: unix 以外では `run_train` が子プロセス
+    /// を一切起動せず `UnsupportedPlatform`（`RuntimeError`＝70）を返す
+    /// （fail-closed）。
+    #[cfg(not(unix))]
+    #[test]
+    fn req39_run_train_rejects_unsupported_platform() {
+        let dir = std::env::temp_dir();
+        let launch_script = dir.join(format!(
+            "fandhe-edge-train-test-unsupported-platform-{}.py",
+            std::process::id()
+        ));
+        std::fs::write(&launch_script, b"").expect("write stub launch.py");
+        let python = std::env::current_exe().expect("resolve current_exe");
+        let launcher =
+            WorkerLauncher::new(python, launch_script.clone()).expect("valid launcher fields");
+        let request = test_request(Some(30));
+        let limits = RunLimits::for_request(&request);
+        let err = run_train(&launcher, &request, &dir, &limits).unwrap_err();
+        let _ = std::fs::remove_file(&launch_script);
+        assert!(matches!(err, TrainProcessError::UnsupportedPlatform));
+        assert_eq!(err.exit_code(), ExitCode::RuntimeError);
+        assert!(
+            !dir.join("request.json").exists(),
+            "request.json must not be written when platform is unsupported"
+        );
+    }
+
+    /// `TrainProcessError::UnsupportedPlatform` の終了コードは常に
+    /// `RuntimeError`（70）（プラットフォームに依存せず確認できる契約）。
+    #[test]
+    fn req39_unsupported_platform_maps_to_runtime_error() {
+        assert_eq!(
+            TrainProcessError::UnsupportedPlatform.exit_code(),
+            ExitCode::RuntimeError
+        );
+    }
+
+    /// issue #178 PR #233 レビュー再指摘 P1「try_wait() の Ok(Some(status))
+    /// を締め切り判定より先に受理するため、期限超過後に終了したプロセスを
+    /// 成功扱いしうる」: 観測時刻が締め切りより前なら受理してよいが、
+    /// 締め切りちょうど・締め切り後は受理してはならない。
+    #[cfg(unix)]
+    #[test]
+    fn req39_observed_within_deadline_rejects_late_observation() {
+        let deadline = Instant::now();
+        let before = deadline - Duration::from_millis(1);
+        let after = deadline + Duration::from_millis(1);
+        assert!(observed_within_deadline(before, deadline));
+        assert!(!observed_within_deadline(deadline, deadline));
+        assert!(!observed_within_deadline(after, deadline));
+    }
+
+    /// `kill_pids_best_effort`: 対象が空なら（掃除すべき子孫が無いため）
+    /// 無条件に「確認できた」（`true`）を返す。
+    #[cfg(unix)]
+    #[test]
+    fn req39_kill_pids_best_effort_empty_is_confirmed_clean() {
+        assert!(kill_pids_best_effort(&[]));
+    }
+
+    /// issue #178 PR #233 レビュー再指摘 P0「`ps_pid_ppid_pairs()` 失敗時、
+    /// 関数が即 `false` を返し、呼び出し元は直接の子だけを kill する」:
+    /// `ps` 相当の問い合わせ（`query`）が全ラウンドにわたって失敗し続けても、
+    /// `sweep_with` は 1 回で諦めず、`fallback` への掃除（`kill_fallback`）を
+    /// 複数回試みたうえで「確認できなかった」（`false`）を返す。
+    #[cfg(unix)]
+    #[test]
+    fn req39_sweep_with_retries_and_falls_back_when_ps_fails() {
+        // 実在しない pid・起動時刻の組み合わせ（実際の `ps` 出力には決して
+        // 現れない）。`kill_pids_best_effort` が内部で呼ぶ実際の `/bin/ps` は
+        // これを「生存していない」と判定するため、無関係なプロセスを誤って
+        // `SIGKILL` する心配はない。
+        let fallback = vec![(u32::MAX, "unreachable-lstart".to_string())];
+        let query_calls = std::cell::Cell::new(0_u32);
+        let cleaned = sweep_with(
+            || {
+                query_calls.set(query_calls.get() + 1);
+                None
+            },
+            |_descendants: &[u32]| unreachable!("query always fails; must not report descendants"),
+            &fallback,
+        );
+        // 修正前は最初の `query()` 失敗で即 `return false` していたため
+        // `query_calls` は高々 1 回しか増えなかった。全ラウンド
+        // （`ORPHAN_SWEEP_MAX_ROUNDS`）＋最終確認の 1 回まで retry しつつ
+        // fallback を試みることを、呼び出し回数で確認する。
+        assert_eq!(query_calls.get(), ORPHAN_SWEEP_MAX_ROUNDS + 1);
+        assert!(!cleaned);
+    }
+
+    /// `sweep_with`: `query` が最初から空の子孫一覧を返す場合は、
+    /// `fallback` が空であれば直ちに「確認できた」（`true`）を返す。
+    #[cfg(unix)]
+    #[test]
+    fn req39_sweep_with_confirms_clean_when_tree_already_empty() {
+        let cleaned = sweep_with(
+            || Some(Vec::new()),
+            |_descendants: &[u32]| unreachable!("no descendants to kill"),
+            &[],
+        );
+        assert!(cleaned);
     }
 }

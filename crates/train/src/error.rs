@@ -445,6 +445,19 @@ pub enum TrainProcessError {
         process: ExitCode,
         expected: ExitCode,
     },
+    /// unix 以外（windows 等）の環境で [`crate::process::run_train`] が呼ば
+    /// れた。プロセスツリー（`_worker` を含む子孫）を壁時計タイムアウト時に
+    /// 確実に束ねて終了させる手段が unix の `ps`／`kill` 走査以外に無く、
+    /// windows 版（`taskkill /T /F`）は supervisor が既に終了した後に別
+    /// セッションへ抜けた孤児を発見できないという不変条件違反があった
+    /// （codex/review 指摘 P0「Windows で正常終了後の孤児ワーカーを停止
+    /// できない」。issue #178 PR #233 レビュー）。ジョブオブジェクト
+    /// （`CreateJobObject`／`AssignProcessToJobObject`）による恒久対応は
+    /// 新規依存（`windows` crate 等）を要しユーザー承認事項
+    /// （`.claude/rules/dependency-policy.md`）のため本 issue の対象外とし、
+    /// 資源上限（REQ-39）を保証できないまま子プロセスを起動しない
+    /// （fail-closed。子プロセスは一切起動しない）。
+    UnsupportedPlatform,
 }
 
 impl std::fmt::Display for TrainProcessError {
@@ -514,6 +527,12 @@ impl std::fmt::Display for TrainProcessError {
                     "worker process exit code {process:?} does not match result-derived exit code {expected:?}"
                 )
             }
+            TrainProcessError::UnsupportedPlatform => {
+                write!(
+                    f,
+                    "worker process resource limits are not supported on this platform"
+                )
+            }
         }
     }
 }
@@ -551,7 +570,8 @@ impl TrainProcessError {
             | TrainProcessError::UnknownExitCode(_)
             | TrainProcessError::StdoutIncomplete
             | TrainProcessError::StderrIncomplete
-            | TrainProcessError::ExitCodeMismatch { .. } => ExitCode::RuntimeError,
+            | TrainProcessError::ExitCodeMismatch { .. }
+            | TrainProcessError::UnsupportedPlatform => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
             TrainProcessError::Request(inner) => inner.exit_code(),
             TrainProcessError::Result(inner) => inner.exit_code(),
