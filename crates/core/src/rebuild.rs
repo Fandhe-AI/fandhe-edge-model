@@ -100,12 +100,24 @@
 //!
 //! # 引き続き範囲外（各担当 TASK で追加する）
 //!
-//! - ハッシュ完全一致時に以降の比較処理そのものを実行しないことの保証と
-//!   専用テスト（TASK-20.3・#93。本実装は早期 return する骨格のみ）
 //! - JSON 入出力契約（`serde::Serialize` の配線・CLI 出力）への接続
 //!   （CLI 側 TASK-33.x の対象。本 issue では Rust 型の追加に留める）
 //!
 //! 判定型変更（`JudgmentTypeChanged`）経路のテスト方針は上記 2.2 節を参照。
+//!
+//! # TASK-20.3（issue #93）で追加した内容
+//!
+//! ハッシュ完全一致時に以降の比較処理（[`DefinitionIdentity`] の算出・
+//! 選択肢の表示名／説明比較を含む）を一切実行しないことを保証する。
+//! [`decide_rebuild`] を、ハッシュ判定のみを行う private seam
+//! [`decide_rebuild_with`] と、ハッシュ不一致時にのみ呼ばれる比較本体
+//! [`compare_definitions`] へ分割した。`decide_rebuild_with` はハッシュが
+//! 一致すれば `compare` 引数を一度も呼ばずに `Unchanged` を返すため、
+//! テストからクロージャの呼び出し回数を数える・panic するクロージャを
+//! 渡すことで「比較処理を実行しない」ことを機械照合できる
+//! （`mod tests` の `req20_task20_3_*`）。`decide_rebuild_with`・
+//! `compare_definitions` はいずれも private のため、外部 crate から比較
+//! 関数を注入したり判定結果を偽造したりできない。
 
 use crate::canonical::{CanonicalError, DefinitionHash, DefinitionIdentity};
 use crate::definition::{Choice, Definition, JudgmentType};
@@ -222,13 +234,16 @@ pub enum RebuildReason {
     },
 }
 
-/// 新旧定義を比較し、作り直しの要否を判定する（REQ-20・TASK-20.1-1）。
+/// 新旧定義を比較し、作り直しの要否を判定する
+/// （REQ-20・TASK-20.1-1・TASK-20.3・#93）。
 ///
 /// 処理順:
 /// 1. 新旧の定義全体の正準化ハッシュ（[`Definition::canonical_hash`]）が
-///    一致すれば、以降の比較をせずに [`RebuildDecision::Unchanged`] を返す
+///    一致すれば、比較処理（[`DefinitionIdentity`] の算出を含む）を一切
+///    実行せずに [`RebuildDecision::Unchanged`] を返す（[`decide_rebuild_with`]
+///    の seam で機械照合済み。TASK-20.3）
 /// 2. 一致しなければ、同一性（[`DefinitionIdentity`]）を比較し、選択肢 ID
-///    集合・判定型の差から理由を集める（[`classify_change`]）
+///    集合・判定型の差から理由を集める（[`compare_definitions`]）
 /// 3. 理由が 1 件以上なら [`RebuildDecision::Required`]、0 件なら
 ///    [`RebuildDecision::NotRequired`] を返す
 ///
@@ -303,6 +318,25 @@ pub fn decide_rebuild(
     old: &Definition,
     new: &Definition,
 ) -> Result<RebuildDecision, CanonicalError> {
+    decide_rebuild_with(old, new, compare_definitions)
+}
+
+/// ハッシュ判定と比較処理の分岐を担う private seam（TASK-20.3・#93）。
+///
+/// ハッシュが一致する場合は `compare` を一切呼ばずに `Unchanged` を返す。
+/// これにより「ハッシュ完全一致時は比較処理を実行しない」という REQ-20
+/// 境界値の不変条件を、テストから `compare` を差し替えて呼び出し回数や
+/// panic の有無を機械照合できる形にしている（`mod tests` の
+/// `req20_task20_3_*`）。private のため外部 crate から比較関数を注入できず、
+/// `Unchanged`・`Required`／`NotRequired` を偽造できない。
+fn decide_rebuild_with<F>(
+    old: &Definition,
+    new: &Definition,
+    compare: F,
+) -> Result<RebuildDecision, CanonicalError>
+where
+    F: FnOnce(&Definition, &Definition) -> RebuildDecision,
+{
     let old_hash = old.canonical_hash()?;
     let new_hash = new.canonical_hash()?;
 
@@ -310,13 +344,20 @@ pub fn decide_rebuild(
         return Ok(RebuildDecision::Unchanged { hash: new_hash });
     }
 
+    Ok(compare(old, new))
+}
+
+/// ハッシュ不一致時にのみ呼ばれる比較処理本体（TASK-20.1・20.2・20.3）。
+/// 同一性（[`DefinitionIdentity`]）を算出し、選択肢 ID 集合・判定型の差から
+/// 作り直し理由を集める（[`classify_change`]）。理由が無ければ表示名・
+/// 説明の差分詳細（[`classify_display_only_change`]）を伴う `NotRequired`
+/// を返す。
+fn compare_definitions(old: &Definition, new: &Definition) -> RebuildDecision {
     let reasons = classify_change(&old.identity(), &new.identity());
 
     match RequiredRebuild::from_reasons(reasons) {
-        Some(required) => Ok(RebuildDecision::Required(required)),
-        None => Ok(RebuildDecision::NotRequired(classify_display_only_change(
-            old, new,
-        ))),
+        Some(required) => RebuildDecision::Required(required),
+        None => RebuildDecision::NotRequired(classify_display_only_change(old, new)),
     }
 }
 
@@ -378,7 +419,6 @@ fn classify_display_only_change(old: &Definition, new: &Definition) -> NotRequir
 
     NotRequiredRebuild::new(display_name_changed, description_changed)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +950,146 @@ mod tests {
                 );
             }
             other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+    /// AC1: ハッシュ完全一致時、比較関数（呼び出し回数を数えるクロージャ）が
+    /// 一度も呼ばれず `Unchanged { hash }` が返る（証拠種別: テストハーネス。
+    /// REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_identical_hash_does_not_invoke_comparison() {
+        let old = definition_a();
+        let new = definition_a();
+        let call_count = std::cell::Cell::new(0u32);
+
+        let decision = decide_rebuild_with(&old, &new, |_, _| {
+            call_count.set(call_count.get() + 1);
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
+        })
+        .expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::Unchanged { hash } => {
+                assert_eq!(hash.to_hex(), DEFINITION_A_HASH_HEX);
+            }
+            other => panic!("Unchanged を期待したが {other:?} だった"),
+        }
+        assert_eq!(call_count.get(), 0);
+    }
+
+    /// ハッシュ一致時は比較関数が呼ばれないため、panic するクロージャを
+    /// 渡しても `Unchanged` が返る（比較が実行されないことの最も強い確認。
+    /// REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_identical_hash_with_panicking_comparator_is_unchanged() {
+        let old = definition_a();
+        let new = definition_a();
+
+        let decision = decide_rebuild_with(&old, &new, |_, _| {
+            panic!("比較関数は呼ばれないはず");
+        })
+        .expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::Unchanged { hash } => {
+                assert_eq!(hash.to_hex(), DEFINITION_A_HASH_HEX);
+            }
+            other => panic!("Unchanged を期待したが {other:?} だった"),
+        }
+    }
+
+    /// ハッシュ一致が比較関数の戻り値より優先される: 比較関数が `Required`
+    /// を返す実装であっても、ハッシュ一致なら `Unchanged` になる
+    /// （REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_unchanged_takes_precedence_over_comparator_result() {
+        let old = definition_a();
+        let new = definition_a();
+
+        let decision = decide_rebuild_with(&old, &new, |_, _| {
+            let reasons = vec![RebuildReason::OptionIdsChanged {
+                added: BTreeSet::new(),
+                removed: BTreeSet::new(),
+            }];
+            RebuildDecision::Required(RequiredRebuild::from_reasons(reasons).expect("非空のはず"))
+        })
+        .expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::Unchanged { hash } => {
+                assert_eq!(hash.to_hex(), DEFINITION_A_HASH_HEX);
+            }
+            other => panic!("Unchanged を期待したが {other:?} だった"),
+        }
+    }
+
+    /// キー順・空白だけが異なる（生バイトは異なるが正準化ハッシュは一致する）
+    /// 入力でも、比較関数の呼び出し回数が 0 のまま `Unchanged` になる
+    /// （REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_key_order_whitespace_variant_does_not_invoke_comparison() {
+        let reordered = "{\n  \"version\" : 1,\n  \"io\": { \"input\" : \"bytes\" },\n  \"name\": \"sample_topic\",\n  \"schema\": \"fandhe-edge-model-definition/v1\",\n  \"judgment_type\": \"single_select\",\n  \"options\": [\n    { \"description\": \"肯定\", \"id\": \"yes\", \"display_name\": \"Yes\" },\n    { \"display_name\": \"No\", \"description\": \"否定\", \"id\": \"no\" }\n  ]\n}\n";
+        let old = definition_a();
+        let new = Definition::parse(reordered).expect("valid なはず");
+        let call_count = std::cell::Cell::new(0u32);
+
+        let decision = decide_rebuild_with(&old, &new, |_, _| {
+            call_count.set(call_count.get() + 1);
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
+        })
+        .expect("失敗しないはず");
+
+        assert!(matches!(decision, RebuildDecision::Unchanged { .. }));
+        assert_eq!(call_count.get(), 0);
+    }
+
+    /// ハッシュ不一致時は比較関数がちょうど 1 回呼ばれ、その戻り値がそのまま
+    /// `decide_rebuild_with` の結果になる（seam が「常に呼ばれない」だけの
+    /// 自明なものではないことの確認。REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_different_hash_invokes_comparison_exactly_once() {
+        let renamed_json = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "はい", "description": "肯定" },
+                { "id": "no", "display_name": "No", "description": "否定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let old = definition_a();
+        let new = Definition::parse(renamed_json).expect("valid なはず");
+        let call_count = std::cell::Cell::new(0u32);
+
+        let decision = decide_rebuild_with(&old, &new, |_, _| {
+            call_count.set(call_count.get() + 1);
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
+        })
+        .expect("失敗しないはず");
+
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(
+            decision,
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
+        );
+    }
+
+    /// `Unchanged { hash }` は新旧双方の `canonical_hash()` と一致する
+    /// （REQ-20 境界値・TASK-20.3・issue #93）。
+    #[test]
+    fn req20_task20_3_unchanged_hash_equals_both_canonical_hashes() {
+        let old = definition_a();
+        let new = definition_a();
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::Unchanged { hash } => {
+                assert_eq!(hash, old.canonical_hash().expect("失敗しないはず"));
+                assert_eq!(hash, new.canonical_hash().expect("失敗しないはず"));
+            }
+            other => panic!("Unchanged を期待したが {other:?} だった"),
         }
     }
 }

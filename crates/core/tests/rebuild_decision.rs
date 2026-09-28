@@ -1,6 +1,6 @@
 //! `rebuild::decide_rebuild`（公開 API）の結合テスト
 //! （REQ-20・TASK-20.1-1・issue #90／TASK-20.1-2・issue #91／
-//! TASK-20.2・issue #92）。
+//! TASK-20.2・issue #92／TASK-20.3・issue #93）。
 //!
 //! - AC1（#90）: 同一の定義ファイルを 2 つ渡すと「変更なし」を表す値が
 //!   返ることを、公開 API 経由の具体値で確認する（ファイル I/O は使わない）
@@ -15,6 +15,12 @@
 //!   の具体値は `#[cfg(test)]` 限定の seam を使う都合上、結合テストからは
 //!   見えない `crates/core/src/rebuild.rs` の unit test で確認する
 //!   （`rebuild.rs` モジュール doc 2.2 節を参照）。
+//! - ハッシュ完全一致時に比較処理を実行しないことの保証（#93）:
+//!   `decide_rebuild_with` の seam を使った呼び出し回数の機械照合は private
+//!   関数を扱うため `rebuild.rs` の unit test（`req20_task20_3_*`）で行う。
+//!   本ファイルでは公開 API（`Definition::load`）経由でファイルから読み込んだ
+//!   同一の定義ファイルが `Unchanged` になり、そのハッシュが両者の
+//!   `canonical_hash()` と一致することを確認する。
 
 use fandhe_edge_core::definition::{Definition, DefinitionError, FieldPath};
 use fandhe_edge_core::rebuild::{RebuildDecision, RebuildReason, decide_rebuild};
@@ -203,5 +209,58 @@ fn req20_task20_1_2_poc19_p5_multi_select_definition_is_rejected() {
             assert_eq!(field, FieldPath::JudgmentType);
         }
         other => panic!("UnsupportedValue を期待したが {other:?} だった"),
+    }
+}
+
+/// ハッシュ完全一致時の「変更なし」扱い（REQ-20 境界値）を、公開 API のみで
+/// 確認する。`fixtures/rebuild/poc19/v1_9.json` を `Definition::load` で
+/// 2 回読み込み、`Unchanged { hash }` が返り、その `hash` が新旧双方の
+/// `canonical_hash()` と一致することを確認する（比較処理を実行しないことの
+/// 呼び出し回数の機械照合は private seam を扱うため `rebuild.rs` の
+/// unit test（`req20_task20_3_*`）で行う。証拠種別: テストハーネス。
+/// REQ-20・TASK-20.3・issue #93）。
+#[test]
+fn req20_task20_3_public_api_identical_definition_files_are_unchanged() {
+    let old = load_poc19_fixture("v1_9.json");
+    let new = load_poc19_fixture("v1_9.json");
+
+    let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+    match decision {
+        RebuildDecision::Unchanged { hash } => {
+            assert_eq!(hash, old.canonical_hash().expect("失敗しないはず"));
+            assert_eq!(hash, new.canonical_hash().expect("失敗しないはず"));
+        }
+        other => panic!("Unchanged を期待したが {other:?} だった"),
+    }
+}
+
+/// キー順・空白が異なる（`serde_json::Value` 経由で再直列化した）入力でも、
+/// 正準化ハッシュが一致すれば `Unchanged` になることを公開 API のみで確認する
+/// （REQ-20 境界値・TASK-20.3・issue #93）。
+#[test]
+fn req20_task20_3_public_api_reserialized_definition_is_unchanged() {
+    let old = load_poc19_fixture("v1_9.json");
+    let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("fixtures")
+        .join("rebuild")
+        .join("poc19")
+        .join("v1_9.json");
+    let raw = std::fs::read_to_string(&path).expect("固定 fixture は読み込めるはず");
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).expect("固定 fixture は valid JSON のはず");
+    let reserialized = serde_json::to_string(&value).expect("Value の再直列化は失敗しないはず");
+    let new = Definition::parse(&reserialized).expect("valid なはず");
+
+    let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+    match decision {
+        RebuildDecision::Unchanged { hash } => {
+            assert_eq!(hash, old.canonical_hash().expect("失敗しないはず"));
+            assert_eq!(hash, new.canonical_hash().expect("失敗しないはず"));
+        }
+        other => panic!("Unchanged を期待したが {other:?} だった"),
     }
 }
