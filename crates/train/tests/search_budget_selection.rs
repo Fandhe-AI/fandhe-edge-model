@@ -599,6 +599,63 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
     }
 }
 
+/// (P1・REQ-18・REQ-39・issue #84 PR #238 レビュー) 採点
+/// （[`ValidationScorer::predict_validation`]）が `Err` を返した場合も、
+/// 成功時の `ScoringExceededBudget` と同じく呼び出し後の経過時間を確認する。
+/// 採点呼び出し中に探索予算全体を使い切っていれば、`ScoringFailed` の候補は
+/// 記録しつつ残り候補を実行せず `NotStarted { reason: BudgetExhausted }` として
+/// 一括で未着手にする（`drain_remaining_as_not_started`）。
+#[test]
+fn task18_1_2_scoring_failure_after_budget_exhausted_stops_remaining_candidates() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-a".to_string(), Err(FakeScorerError))]),
+    )
+    .with_advance("c3-a", 4_000_000);
+
+    let gold = validation_gold();
+    let candidates = vec![
+        SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: candidate_params("out/c3-a", 1),
+        },
+        SearchCandidate {
+            candidate_id: "c3-b".to_string(),
+            params: candidate_params("out/c3-b", 2),
+        },
+    ];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(
+        runner.calls, 1,
+        "c3-b は採点失敗後の予算超過により実行されない"
+    );
+    assert_eq!(record.candidates.len(), 2);
+    assert_eq!(record.candidates[0].candidate_id, "c3-a");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringFailed
+    );
+    assert_eq!(record.candidates[1].candidate_id, "c3-b");
+    assert_eq!(record.candidates[1].elapsed_at_start_ms, None);
+    assert_eq!(
+        record.candidates[1].result,
+        CandidateSearchResult::NotStarted {
+            reason: NotStartedReason::BudgetExhausted
+        }
+    );
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
 /// (T6・事前検証) ID 重複・`label_order` の不一致・gold の未知ラベル・
 /// `out_dir` の重複はそれぞれ Err になり、runner の呼び出しは 0 回。
 #[test]

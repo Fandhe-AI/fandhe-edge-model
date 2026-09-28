@@ -876,6 +876,20 @@ where
                             result: CandidateSearchResult::ScoringFailed,
                             validation_outcomes: None,
                         });
+
+                        // P1 指摘対応（REQ-18・REQ-39。issue #84 PR #238
+                        // レビュー）: 採点が失敗した場合も、成功時
+                        // （`ScoringExceededBudget`）と同じく呼び出し後の
+                        // 経過時間を確認する。確認せずに次候補へ進むと、
+                        // 採点中に探索予算を使い切っていても次候補が
+                        // `run_candidate` に渡ってしまい、予算超過後の学習を
+                        // 防げない（採点の成否で「呼び出し後に予算を
+                        // 使い切ったか」の扱いを変えない）。
+                        let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
+                        if elapsed_after_scoring_ms >= budget_ms {
+                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                            break;
+                        }
                     }
                 }
             }
