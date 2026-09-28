@@ -141,8 +141,8 @@ pub struct ValidRecord {
     /// sort_keys=True)`〕に相当。workspace の `serde_json` は
     /// `preserve_order` feature を有効にしていない〔`Cargo.lock` に
     /// `indexmap` が無い〕ため、`Value::to_string()` はオブジェクトの
-    /// キーを整列済みで出力する。この前提が崩れると `unique_outputs` の
-    /// キー順依存の回帰テストが検知する）。
+    /// キーを整列済みで出力する。この前提が崩れると
+    /// `output_key_is_independent_of_raw_json_key_order` が検知する）。
     pub output_key: String,
     pub tags: Option<Vec<String>>,
     pub group_id: Option<String>,
@@ -393,7 +393,7 @@ pub fn inspect_records(
 
         // output: 必須・object。output.intent: 必須・string・有効ラベル集合に含まれること。
         // `output_key` は `output` オブジェクト全体の正準化文字列
-        // （[`ValidRecord::output_key`] docを参照。`unique_outputs` 集計専用で、
+        // （[`ValidRecord::output_key`] doc を参照。`unique_outputs` 集計専用で、
         // ここで `v.to_string()` を先取りしておく（`intent` の検証に成功した
         // ときのみ `label_id_opt` へ載せる）。
         let label_id_opt: Option<(String, String)> = match record.get("output") {
@@ -628,6 +628,35 @@ mod tests {
                 tags: Some(vec!["a".to_string(), "b".to_string()]),
                 group_id: Some("g1".to_string()),
             }
+        );
+    }
+
+    /// REQ-16・TASK-16.1-2: `output` オブジェクトのキー出現順が生 JSON 上で
+    /// 異なっていても、`output_key` は同じ正準化文字列になること
+    /// （[`ValidRecord::output_key`] doc「`preserve_order` feature 未使用の
+    /// 前提が崩れるとこのテストが検知する」の実体）。`summarize` へ
+    /// 直接ハードコードした `output_key` を渡すのではなく、
+    /// `record.get("output")`（生テキストの `serde_json::Value`）から
+    /// `output_key` を生成する `inspect_records` を通すことで、実際のキー順
+    /// 依存が回帰した場合に検知できるようにしている。
+    #[test]
+    fn output_key_is_independent_of_raw_json_key_order() {
+        let content = "\
+{\"id\":\"r1\",\"input\":\"in1\",\"output\":{\"intent\":\"x\",\"arguments\":{\"p\":1}}}
+{\"id\":\"r2\",\"input\":\"in2\",\"output\":{\"arguments\":{\"p\":1},\"intent\":\"x\"}}";
+        let valid = labels(&["x"]);
+
+        let outcome = inspect_records(content, &valid).expect("valid_label_ids は空でない");
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(outcome.valid_records.len(), 2);
+        assert_eq!(
+            outcome.valid_records[0].output_key, outcome.valid_records[1].output_key,
+            "output オブジェクトのキー出現順が異なるだけで output_key が食い違ってはならない"
+        );
+        assert_eq!(
+            outcome.report.unique_outputs, 1,
+            "同じ output を意味の同じキー順違いは 1 件として集計されること"
         );
     }
 
