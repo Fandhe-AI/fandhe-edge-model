@@ -78,25 +78,39 @@ impl AbstentionDecision {
         }
     }
 
-    /// [`crate::metrics::Outcome`] へ変換する（`labels` は宣言順のラベル ID）。
+    /// [`crate::metrics::Outcome`] へ変換する。
+    ///
+    /// `label_index` の意味は「`calibration` に渡したのと同じ宣言順での
+    /// argmax 添字」であり（[`decide_abstention`] の契約）、ラベル ID の
+    /// 解決は `calibration.labels()`（校正時に保持した宣言順の ID。
+    /// [`Calibration::labels`]）からのみ行う。呼び出し元が任意のラベル集合を
+    /// 渡せる形にすると、校正時と異なる集合・並びを渡されたときに誤った
+    /// 添字を正常なラベルとして解釈しうる（`compare_abstention` が
+    /// `CalibrationError::LabelMismatch` で防いでいるのと同じ問題。
+    /// codex/review 指摘・REQ-17・REQ-27）。`self` がどの `Calibration` から
+    /// 得た決定かを型で保証できないため、`decide_abstention` に渡したのと
+    /// **同じ** `calibration` を渡す責務は呼び出し元にあるが、少なくとも
+    /// ラベル ID は外部から任意の値を渡せないようにする。
     ///
     /// [`compare_abstention`] は行ごとに `Outcome::Label(String)` を確保しない
     /// 経路（モジュール冒頭「資源上限」参照）を使うため、この変換は独立した
     /// 呼び出し元（CLI 配線・issue #140 等）向けの利便関数として用意する。
-    /// ラベル添字は `labels.get()` で引き、範囲外は `[]` を使わず
-    /// [`CalibrationError::Internal`] を返す。
-    pub fn to_outcome(&self, labels: &[&str]) -> Result<Outcome, CalibrationError> {
+    /// ラベル添字は `get()` で引き、範囲外は `[]` を使わず
+    /// [`CalibrationError::Internal`] を返す（`decide_abstention` が
+    /// `calibration.n_labels()` の範囲内でしか `label_index` を作らないため
+    /// 通常到達しないが、fail-closed のため検査する）。
+    pub fn to_outcome(&self, calibration: &Calibration) -> Result<Outcome, CalibrationError> {
         match self {
             AbstentionDecision::Adopt { label_index, .. } => {
-                let label = labels
-                    .get(*label_index)
-                    .ok_or_else(|| CalibrationError::Internal {
+                let label = calibration.labels().get(*label_index).ok_or_else(|| {
+                    CalibrationError::Internal {
                         detail: format!(
                             "label index {label_index} out of range for to_outcome ({} labels)",
-                            labels.len()
+                            calibration.n_labels()
                         ),
-                    })?;
-                Ok(Outcome::Label((*label).to_string()))
+                    }
+                })?;
+                Ok(Outcome::Label(label.clone()))
             }
             AbstentionDecision::Abstain { .. } => Ok(Outcome::Abstain),
         }
@@ -1051,31 +1065,68 @@ mod tests {
         assert_eq!(argmax_index, 0);
     }
 
-    /// `to_outcome` がラベル添字から `Outcome::Label` を正しく組み立てる。
+    /// `to_outcome` がラベル添字から `Outcome::Label` を正しく組み立てる
+    /// （`calibration.labels()` から解決する。REQ-17・REQ-27）。
     #[test]
     fn req22_to_outcome_builds_label_and_abstain() {
+        let validation_rows = c1_validation();
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&LABELS, &validation_records).unwrap();
+
         let adopt = AbstentionDecision::Adopt {
             label_index: 1,
             confidence: 0.9,
         };
         assert_eq!(
-            adopt.to_outcome(&LABELS).unwrap(),
+            adopt.to_outcome(&calibration).unwrap(),
             Outcome::Label("l1".to_string())
         );
         let abstain = AbstentionDecision::Abstain { confidence: 0.1 };
-        assert_eq!(abstain.to_outcome(&LABELS).unwrap(), Outcome::Abstain);
+        assert_eq!(abstain.to_outcome(&calibration).unwrap(), Outcome::Abstain);
     }
 
     /// `to_outcome` は範囲外のラベル添字を `[]` ではなく `Internal` で拒否する。
     #[test]
     fn req39_to_outcome_rejects_out_of_range_label_index() {
+        let validation_rows = c1_validation();
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&LABELS, &validation_records).unwrap();
+
         let adopt = AbstentionDecision::Adopt {
             label_index: 99,
             confidence: 0.9,
         };
         let err = adopt
-            .to_outcome(&LABELS)
+            .to_outcome(&calibration)
             .expect_err("out-of-range label index must be rejected");
         assert!(matches!(err, CalibrationError::Internal { .. }));
+    }
+
+    /// `to_outcome` は `calibration.labels()` から解決するため、校正時と
+    /// 異なるラベル集合を外部から渡す経路自体が存在しない（REQ-17・REQ-27。
+    /// codex/review 指摘: 添字が範囲内かだけの確認では校正時のラベル集合との
+    /// 不一致を検出できず、誤った予測を正常な結果として評価しうる問題への
+    /// 対応）。校正時のラベルが宣言順どおりに解決されることを、並べ替えた
+    /// 集合で校正した `Calibration` に対して確認する。
+    #[test]
+    fn req27_to_outcome_resolves_from_calibration_labels_only() {
+        let permuted_labels = ["l2", "l0", "l1"];
+        let validation_rows = c1_validation();
+        // gold はそのままに、ラベル宣言順だけを並べ替えて校正する。
+        let validation_records = as_records(&validation_rows);
+        let calibration = calibrate(&permuted_labels, &validation_records).unwrap();
+
+        // label_index=0 は permuted_labels 宣言順の "l2"（LABELS の "l0" では
+        // ない）。`to_outcome` は `calibration.labels()`（= permuted_labels）
+        // からのみ解決するため、渡しようのない外部 `labels` 引数によって
+        // 誤ったラベルへ解決される余地がない。
+        let adopt = AbstentionDecision::Adopt {
+            label_index: 0,
+            confidence: 0.9,
+        };
+        assert_eq!(
+            adopt.to_outcome(&calibration).unwrap(),
+            Outcome::Label("l2".to_string())
+        );
     }
 }
