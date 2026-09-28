@@ -18,11 +18,27 @@
 //! （`crates/train/src/request.rs` のモジュール doc と同じ設計。詳細は
 //! [`expected_artifact_dir`]・[`canonicalize_root_best_effort`] 参照）。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{TrainResultError, sanitize_serde_error};
 use crate::limits::MAX_RESULT_BYTES;
 use crate::request::{LabelOrder, TrainRequest};
+
+/// `#[serde(default, deserialize_with = "deserialize_present")]` と組み合わせ、
+/// 「キーが無い」（既定値 `None`）と「キーが `null`」（`Some(None)`）を区別する
+/// ための deserializer（いわゆる double-Option イディオム）。
+///
+/// [`RawOutcome`] の各フィールドは素の `Option<T>` のままだと、キー欠落時の
+/// `None` とキーはあるが値が `null` の場合の `None` を区別できない。結果
+/// `"status":"ok"` に余分な `"code":null` を足した出力まで正当な成功結果として
+/// 受理してしまっていた（REQ-21・REQ-39・P1。codex 指摘 PR #220）。
+fn deserialize_present<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 /// `artifact.py::build_artifact` の `output_type` フィールド。現状は
 /// `"choice"`（固定選択肢からの単一選択の出力）のみが有効。
@@ -212,10 +228,20 @@ impl SuccessOutcome {
 #[serde(deny_unknown_fields)]
 struct RawOutcome {
     status: String,
-    artifact_dir: Option<String>,
-    artifact: Option<RawArtifact>,
-    code: Option<String>,
-    message: Option<String>,
+    // `Option<Option<T>>`（キーの有無と `null` を区別する double-Option。
+    // [`deserialize_present`] 参照）: `None` はキー欠落、`Some(None)` は
+    // `"key":null` が明示された場合。`TrainOutcome::from_worker_stdout` は
+    // どちらも「値が確定していない」として拒否するが、フィールドの組み合わせ
+    // 検査自体は「キーが無いこと」だけを許可し、「値が null であること」は
+    // 許可しない（REQ-21・REQ-39・P1。codex 指摘 PR #220）。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    artifact_dir: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    artifact: Option<Option<RawArtifact>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    code: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    message: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -397,7 +423,12 @@ impl TrainOutcome {
 
         match raw.status.as_str() {
             "ok" => {
-                let (Some(artifact_dir), Some(raw_artifact), None, None) =
+                // `artifact_dir`／`artifact` はキーがあり値も入っていること
+                // （`Some(Some(_))`）、`code`／`message` はキー自体が無いこと
+                // （`None`）を要求する。`"code":null` のようにキーは在るが値が
+                // `null` の場合（`Some(None)`）は、キー欠落と区別してここで
+                // 拒否する（REQ-21・REQ-39・P1。codex 指摘 PR #220）。
+                let (Some(Some(artifact_dir)), Some(Some(raw_artifact)), None, None) =
                     (raw.artifact_dir, raw.artifact, raw.code, raw.message)
                 else {
                     return Err(TrainResultError::MalformedOutcome);
@@ -487,7 +518,9 @@ impl TrainOutcome {
                 }))
             }
             "error" => {
-                let (None, None, Some(code), Some(message)) =
+                // 対称的に、`code`／`message` はキーがあり値も入っていること、
+                // `artifact_dir`／`artifact` はキー自体が無いことを要求する。
+                let (None, None, Some(Some(code)), Some(Some(message))) =
                     (raw.artifact_dir, raw.artifact, raw.code, raw.message)
                 else {
                     return Err(TrainResultError::MalformedOutcome);
@@ -847,10 +880,19 @@ mod tests {
         let real_root = base.join("real-root");
         let link_root = base.join("link-root");
         std::fs::create_dir_all(&real_root).expect("create real root");
+        // `base` 自体が symlink 経由（macOS の `TMPDIR` は `/var/...` が
+        // `/private/var/...` への symlink）の場合があるため、`real_root` も
+        // 事前に `canonicalize` してから `link_root` の期待値を組み立てる。
+        // ワーカー（`os.path.realpath`）は経路上の全 symlink を解決するため、
+        // `link-root` 側だけでなく比較対象の実体パスも完全に解決しておかないと
+        // macOS で `/var` と `/private/var` の食い違いにより誤って
+        // `runtime_error` になる（REQ-39・P1。CI #220 で実際に検出）。
+        let real_root_canonical =
+            std::fs::canonicalize(&real_root).expect("canonicalize real root");
         symlink(&real_root, &link_root).expect("create symlink root");
 
         let request = test_request_with_root(link_root.to_str().expect("utf-8 path"));
-        let real_artifact_dir = real_root.join("out");
+        let real_artifact_dir = real_root_canonical.join("out");
         let json = VALID_OK_JSON.replace(
             "/fandhe-edge-fixture-root/out",
             real_artifact_dir.to_str().expect("utf-8 path"),
@@ -878,5 +920,43 @@ mod tests {
         let json = VALID_OK_JSON.replace(r#""config":{},"#, "");
         let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
         assert!(matches!(err, TrainResultError::NotJson { .. }));
+    }
+
+    /// REQ-21・REQ-39・P1（codex 指摘 PR #220「成功結果の余分な null フィール
+    /// ドを拒否する」）: `status:"ok"` に `"code":null`／`"message":null` を
+    /// 加えた出力を成功扱いにしない。`Option<String>` のままだとキー欠落と
+    /// 区別できず誤って受理していた（[`deserialize_present`] 参照）。
+    #[test]
+    fn req39_rejects_success_outcome_with_null_code_or_message() {
+        // 末尾の `}`（トップレベルオブジェクトの閉じ括弧）の直前へ追加のキーを
+        // 挿入する。`str::replace('}', ...)` だと `"config":{}` 等ネストした
+        // `}` にもマッチしてしまうため使わない。
+        let without_trailing_brace = &VALID_OK_JSON[..VALID_OK_JSON.len() - 1];
+        for extra in [r#","code":null"#, r#","message":null"#] {
+            let json = format!("{without_trailing_brace}{extra}}}");
+            let err =
+                TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+            assert!(
+                matches!(err, TrainResultError::MalformedOutcome),
+                "extra: {extra:?}, err: {err:?}"
+            );
+        }
+    }
+
+    /// 上と対称: `status:"error"` に `"artifact_dir":null`／`"artifact":null`
+    /// を加えた出力も成功結果同様に拒否する。
+    #[test]
+    fn req39_rejects_error_outcome_with_null_artifact_dir_or_artifact() {
+        let base = r#"{"status":"error","code":"invalid_request","message":"m"}"#;
+        let without_trailing_brace = &base[..base.len() - 1];
+        for extra in [r#","artifact_dir":null"#, r#","artifact":null"#] {
+            let json = format!("{without_trailing_brace}{extra}}}");
+            let err =
+                TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+            assert!(
+                matches!(err, TrainResultError::MalformedOutcome),
+                "extra: {extra:?}, err: {err:?}"
+            );
+        }
     }
 }
