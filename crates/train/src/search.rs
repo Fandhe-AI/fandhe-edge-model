@@ -483,6 +483,26 @@ fn validate_candidate_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_CANDIDATE_ID_BYTES && !id.chars().any(|c| c.is_control())
 }
 
+/// `(root, out_dir)` 重複検出用に、パスを構成要素の列へ正規化する
+/// （REQ-39 経路の検証。codex review PR #238 P1 指摘）。
+///
+/// `crates/train/src/request.rs` の `check_relative_path_syntax` と同じ
+/// 「`/` 区切りの構成要素のうち空要素・`.` 単体は無視する」規則で比較用の
+/// 表現を作る。これにより `out/a`・`out/./a`・`out//a`・`out/a/` は同一の
+/// 出力先として重複検出される。`..` 構成要素はスタックを使った解決
+/// （親ディレクトリへの遡上）が必要で、ここでは行わない。`..` は
+/// [`TrainRequest::new`]（`check_relative_path_syntax`）が別途拒否するため、
+/// 本関数の比較結果に `..` を含む値が紛れ込んでも最終的にはエラーとなり、
+/// 実ディレクトリの誤同定にはつながらない。ファイルシステムへの実際の
+/// 閉じ込め（symlink 解決等）は行わない点も `request.rs` の doc と同じ
+/// 設計（多層防御は学習ワーカー・Rust 側ガード層〔TASK-39.x〕が別途担う）。
+fn normalized_path_components(value: &str) -> Vec<&str> {
+    value
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
+}
+
 /// 事前検証（予算・runner を一切消費しない。fail-closed）。
 fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
     if input.candidates.is_empty() {
@@ -537,7 +557,7 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
     // リクエストとしての妥当性。
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
-    let mut seen_out_dirs: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut seen_out_dirs: BTreeSet<(Vec<&str>, Vec<&str>)> = BTreeSet::new();
     for (index, candidate) in input.candidates.iter().enumerate() {
         if !validate_candidate_id(&candidate.candidate_id) {
             return Err(SearchError::InvalidCandidateId { index });
@@ -557,8 +577,8 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
             return Err(SearchError::LabelOrderMismatch { index });
         }
         let out_dir_key = (
-            candidate.params.root.as_str(),
-            candidate.params.out_dir.as_str(),
+            normalized_path_components(candidate.params.root.as_str()),
+            normalized_path_components(candidate.params.out_dir.as_str()),
         );
         if !seen_out_dirs.insert(out_dir_key) {
             return Err(SearchError::DuplicateOutDir { index });
@@ -1164,6 +1184,38 @@ mod tests {
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
                 params: valid_params("/root", "out/a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39: `out/a` と `out/./a`（`.` 構成要素）・
+    /// `out//a`（連続スラッシュ）・`out/a/`（末尾スラッシュ）は正規化後に
+    /// 同一の出力先を指すため、正規化前の文字列が異なっていても
+    /// `DuplicateOutDir` として検出する（codex review PR #238 P1 指摘の
+    /// 回帰テスト）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_after_normalization() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/root", "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/root", "out/./a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-c".to_string(),
+                params: valid_params("/root", "out//a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-d".to_string(),
+                params: valid_params("/root", "out/a/"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
