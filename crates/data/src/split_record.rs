@@ -700,9 +700,58 @@ impl SplitRecordDto {
             }
         }
 
+        // ラベルの重複を検出する（同じラベルが `per_label` に 2 行以上
+        // 現れると、直前の合計検証をすり抜けたまま下の split 別合計照合が
+        // 二重計上・過小計上のどちらの向きにも壊れうる。レビュー指摘。
+        // #210 codex/review P1）。
+        let mut seen_labels: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for allocation in &self.rule.per_label {
+            if !seen_labels.insert(allocation.label.as_str()) {
+                return Err(SplitRecordError::InvalidRecord {
+                    reason: "per_label contains a duplicate label",
+                });
+            }
+        }
+
         let train = digest_from_dto(self.splits.train)?;
         let validation = digest_from_dto(self.splits.validation)?;
         let test = digest_from_dto(self.splits.test)?;
+
+        // `per_label` の各行の内訳合計（既に上で検証済み）を split ごとに
+        // 積み上げ、各 split の `group_count` と一致するかを確認する。
+        // ラベル行の欠落（`per_label` が実際より少ないラベルしか持たない）は
+        // 行ごとの内訳検証だけでは検出できず、積み上げ合計が `group_count`
+        // を下回ることで初めて検出できる（レビュー指摘。#210 codex/review
+        // P1）。`usize` の加算は `checked_add` で行い、外部入力由来の値の
+        // オーバーフローで panic せず拒否する（coding-rust.md「外部入力」）。
+        let mut per_label_train_total: usize = 0;
+        let mut per_label_validation_total: usize = 0;
+        let mut per_label_test_total: usize = 0;
+        for allocation in &self.rule.per_label {
+            per_label_train_total = per_label_train_total.checked_add(allocation.train).ok_or(
+                SplitRecordError::InvalidRecord {
+                    reason: "per_label train total overflows usize",
+                },
+            )?;
+            per_label_validation_total = per_label_validation_total
+                .checked_add(allocation.validation)
+                .ok_or(SplitRecordError::InvalidRecord {
+                    reason: "per_label validation total overflows usize",
+                })?;
+            per_label_test_total = per_label_test_total.checked_add(allocation.test).ok_or(
+                SplitRecordError::InvalidRecord {
+                    reason: "per_label test total overflows usize",
+                },
+            )?;
+        }
+        if per_label_train_total != train.group_count
+            || per_label_validation_total != validation.group_count
+            || per_label_test_total != test.group_count
+        {
+            return Err(SplitRecordError::InvalidRecord {
+                reason: "per_label allocation totals do not match each split's group_count",
+            });
+        }
 
         // split をまたいだ ID の重複を検出する（同一レコードが 2 つの split に
         // 属する記録は、分割が group を跨いだ証拠であり REQ-17 に反する）。
@@ -1419,14 +1468,18 @@ mod tests {
         test_split["group_count"] = serde_json::json!(original_group_count.saturating_sub(1));
         let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
 
-        let restored = SplitRecord::from_json_str(&tampered)
-            .expect("group_count 単体の改ざんは復元時には検出されない");
-        let err = restored
-            .verify_against(&records)
-            .expect_err("group_count の食い違いは再分割との照合で検出されるはず");
+        // レビュー指摘（#210 codex/review P1）の回帰テスト: `group_count`
+        // 単体の改ざんは、`per_label` の内訳合計との照合（`from_json_str`
+        // 内）で復元時に検出されるようになった（以前は `record_ids` だけを
+        // 見る検証をすり抜け、`verify_against` の再分割照合まで検出されずに
+        // 素通りしていた）。
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("per_label 合計との不一致は復元時に検出されるはず");
         assert!(matches!(
             err,
-            SplitRecordError::SplitMismatch { split: Split::Test }
+            SplitRecordError::InvalidRecord {
+                reason: "per_label allocation totals do not match each split's group_count"
+            }
         ));
     }
 
@@ -1477,6 +1530,96 @@ mod tests {
             err,
             SplitRecordError::InvalidRecord {
                 reason: "per_label allocation train + validation + test does not equal n_groups"
+            }
+        ));
+    }
+
+    /// レビュー指摘（#210 codex/review P1）の回帰テスト: `per_label` に
+    /// 同じラベルが 2 行存在する（1 行を複製する）改ざんを `from_json_str`
+    /// が拒否する。各行内の合計検証・split 別合計照合のどちらもすり抜け
+    /// うる改ざん（複製した行の値をそのまま複製すると各行の内訳合計は
+    /// 保たれ、複製元のラベルを除いた分の合計だけを見れば一致してしまう
+    /// 場合がある）のため、ラベルの一意性を専用に検証する。
+    #[test]
+    fn req17_task17_1_2_from_json_rejects_duplicate_label_in_per_label() {
+        let records = vec![
+            record("r1", "g1", "a"),
+            record("r2", "g2", "a"),
+            record("r3", "g3", "b"),
+            record("r4", "g4", "b"),
+        ];
+        let recorded = split_and_record(&records, 7, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
+        let per_label = value
+            .get_mut("rule")
+            .and_then(|r| r.get_mut("per_label"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("per_label が存在するはず");
+        let first = per_label
+            .first()
+            .cloned()
+            .expect("per_label は少なくとも 1 件のはず");
+        // 先頭のラベル行をそのまま複製する（合計は 2 倍になるため、
+        // split 別合計照合でも本来は検出されるが、ラベルの一意性検証を
+        // 専用に持つことで改ざんの種類を問わず fail-closed にする）。
+        per_label.push(first);
+        let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
+
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("per_label 内のラベル重複は拒否されるはず");
+        assert!(matches!(
+            err,
+            SplitRecordError::InvalidRecord {
+                reason: "per_label contains a duplicate label"
+            }
+        ));
+    }
+
+    /// レビュー指摘（#210 codex/review P1）の回帰テスト: `per_label` から
+    /// 1 行を丸ごと削除する（ラベルの欠落）改ざんを `from_json_str` が
+    /// 拒否する。削除された行の `record_ids`・`group_count` はそのまま
+    /// 残るため、split 別の `per_label` 合計が `group_count` を下回ることで
+    /// 検出する（各行内の合計検証だけでは、削除された行自体が存在しない
+    /// ため検出できない改ざん）。
+    #[test]
+    fn req17_task17_1_2_from_json_rejects_missing_label_in_per_label() {
+        let records = vec![
+            record("r1", "g1", "a"),
+            record("r2", "g2", "a"),
+            record("r3", "g3", "b"),
+            record("r4", "g4", "b"),
+        ];
+        let recorded = split_and_record(&records, 7, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
+        let per_label = value
+            .get_mut("rule")
+            .and_then(|r| r.get_mut("per_label"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("per_label が存在するはず");
+        assert!(
+            per_label.len() >= 2,
+            "ラベル欠落を再現するには per_label に 2 件以上必要"
+        );
+        // 先頭のラベル行を丸ごと削除する。対応する split の record_ids・
+        // group_count は変えないため、残りの行だけの合計は group_count を
+        // 下回る。
+        per_label.remove(0);
+        let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
+
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("per_label のラベル欠落は拒否されるはず");
+        assert!(matches!(
+            err,
+            SplitRecordError::InvalidRecord {
+                reason: "per_label allocation totals do not match each split's group_count"
             }
         ));
     }
