@@ -61,6 +61,21 @@ pub enum ModelComponent {
 }
 
 impl ModelComponent {
+    /// 全構成要素を宣言順で列挙した配列（[`ModelPackageBytes::entries`] が
+    /// 走査に使う）。ここに `#[non_exhaustive]` の外部拡張制限は掛からない
+    /// （crate 内であることに変わりないため）。新しいバリアントを追加した際は
+    /// この配列と `ModelPackageBytes::component_bytes` の `match` の両方を
+    /// 更新する必要があり、後者は wildcard 無しの exhaustive match なので
+    /// 更新を忘れるとコンパイルエラーになる（このためだけに配列自体の追加漏れを
+    /// 防ぐことはできないが、配列とフィールドの対応は `component_bytes` 側の
+    /// 網羅性チェックで実質的に検出できる）。
+    const ALL: [ModelComponent; 4] = [
+        ModelComponent::Weights,
+        ModelComponent::Vocab,
+        ModelComponent::Calibration,
+        ModelComponent::Thresholds,
+    ];
+
     /// JSON のキー等に使う英語の識別子（プログラム出力文字列は英語。
     /// `.claude/rules/japanese-style.md`）。
     #[must_use]
@@ -118,14 +133,23 @@ impl fmt::Debug for ModelPackageBytes<'_> {
 }
 
 impl<'a> ModelPackageBytes<'a> {
+    /// 指定した構成要素に対応するフィールドの値を返す。wildcard 無しの
+    /// exhaustive match にしているため、[`ModelComponent`] へ将来バリアントを
+    /// 追加した際にこの match の更新漏れがあればコンパイルエラーになり、
+    /// `entries()`（延いては [`ModelPackageSnapshot::capture`]）が新しい
+    /// 構成要素を黙って取りこぼす（fail-open になる）のを防ぐ。
+    fn component_bytes(&self, component: ModelComponent) -> Option<&'a [u8]> {
+        match component {
+            ModelComponent::Weights => self.weights,
+            ModelComponent::Vocab => self.vocab,
+            ModelComponent::Calibration => self.calibration,
+            ModelComponent::Thresholds => self.thresholds,
+        }
+    }
+
     /// 構成要素とその値を、[`ModelComponent`] の宣言順で決定的に列挙する。
     fn entries(&self) -> [(ModelComponent, Option<&'a [u8]>); 4] {
-        [
-            (ModelComponent::Weights, self.weights),
-            (ModelComponent::Vocab, self.vocab),
-            (ModelComponent::Calibration, self.calibration),
-            (ModelComponent::Thresholds, self.thresholds),
-        ]
+        ModelComponent::ALL.map(|component| (component, self.component_bytes(component)))
     }
 }
 
@@ -328,6 +352,17 @@ mod tests {
             calibration: Some(b"calibration-v1"),
             thresholds: Some(b"thresholds-v1"),
         }
+    }
+
+    #[test]
+    fn req27_model_component_all_contains_each_variant_exactly_once() {
+        // `ModelComponent::ALL`（`ModelPackageBytes::entries` が走査に使う）が
+        // 全バリアントをちょうど 1 回ずつ含むことを確認する。`BTreeSet` へ
+        // 集約した件数が `ALL.len()` と一致すれば重複・欠落が無いと言える。
+        let unique: std::collections::BTreeSet<ModelComponent> =
+            ModelComponent::ALL.into_iter().collect();
+        assert_eq!(unique.len(), ModelComponent::ALL.len());
+        assert_eq!(ModelComponent::ALL.len(), 4);
     }
 
     #[test]
