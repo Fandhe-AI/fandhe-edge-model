@@ -41,12 +41,27 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   一致しないケース（Rust の方が厳格な `kind_version` の負値・JSON の重複
   キー等）はここに含めず、`crates/train/src/request.rs` の単体テストへ
   分離した（issue #177 実装計画「Rust の方が厳しいケース」）。
+  `time_limit_seconds_null`・`rss_limit_bytes_null`（PR #220 Bugbot 指摘対応）:
+  キーが存在し値が JSON `null` の場合、両実装とも「省略時の既定値」へは
+  解決せず `invalid_request` で拒否する（`contract.py::validate_request` の
+  `raw.get(field, DEFAULT)` は値が `null` なら `DEFAULT` を使わず
+  `isinstance(None, int)` で弾く。Rust 側は `crates/train/src/request.rs`
+  の `deserialize_present` で同じ区別を行う）。
 - `result_ok.json`: 成功時の結果 JSON。`onnx_sha256` はダミーバイト列
   `b"dummy-onnx-bytes-for-fixture"` の SHA-256（形式が妥当な値であること
   だけを確認するためのダミーで、実際の `model.onnx` とは対応しない）。
-  他のフィールドは `trainer/src/fandhe_edge_trainer/artifact.py::
+  `artifact` の各フィールドは `trainer/src/fandhe_edge_trainer/artifact.py::
   build_artifact` を実行して得た出力をそのまま採用し、`created_utc` のみ
   固定値 `2026-09-28T00:00:00Z` に置き換えた（生成コマンドは下記）。
+  `kind`・`kind_version`・`config`・`label_order`・`max_bytes` は
+  `request_full.json` と意図的に一致させてある（REQ-39・P1。PR #220
+  レビュー対応: `TrainOutcome::from_worker_stdout` がワーカー出力を
+  依頼内容と照合するため。`crates/train/tests/train_contract_fixture.rs`
+  参照）。`artifact_dir` は `cli.py::run_worker_train` が実際に出す形
+  （`str(request.out_dir.display)` = `guard.py::confine` の
+  `root_handle.root_real.joinpath(*rel.parts)`。絶対パス）に合わせ、
+  `request_full.json` の `root`（`/fandhe-edge-fixture-root`）と `out_dir`
+  （`out`）を結合した `/fandhe-edge-fixture-root/out` にした（REQ-39・P0）。
 - `result_error.json`: `cli.main(["train", "--request",
   "/tmp/does-not-exist-train-request.json"])` を実行して得た標準出力
   （終了コード 64）をそのまま採用した（生成コマンドは下記）。
@@ -81,7 +96,12 @@ art = artifact.build_artifact(
     max_bytes=512, candidate_label='c3', onnx_sha256=sha,
 )
 art['created_utc'] = '2026-09-28T00:00:00Z'
-print(json.dumps({'status': 'ok', 'artifact_dir': 'out', 'artifact': art}, indent=2))
+# artifact_dir は cli.py::run_worker_train が実際に出す形（root + out_dir の
+# 絶対パス）に合わせた手作業の値（request_full.json の root/out_dir と対応）。
+print(json.dumps(
+    {'status': 'ok', 'artifact_dir': '/fandhe-edge-fixture-root/out', 'artifact': art},
+    indent=2,
+))
 "
 ```
 

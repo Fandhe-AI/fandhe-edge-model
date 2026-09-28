@@ -152,8 +152,30 @@ struct RawTrainRequest {
     root: String,
     train_path: String,
     out_dir: String,
+    /// キー省略時は `None`（既定値に解決）だが、明示的な JSON `null` は
+    /// 拒否する（`deserialize_present` 参照）。`contract.py::validate_request`
+    /// が `raw.get(field, DEFAULT)` を使うため、キーが存在して値が `null` の
+    /// 場合は `DEFAULT` へ解決されず `isinstance(None, int)` が `False` に
+    /// なって `invalid_request` を返すことと揃える（REQ-39・Bugbot 指摘。
+    /// PR #220）。
+    #[serde(default, deserialize_with = "deserialize_present")]
     time_limit_seconds: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
     rss_limit_bytes: Option<u64>,
+}
+
+/// `Option<T>` フィールド用の `deserialize_with`。キー省略時は
+/// `#[serde(default)]`（`None`）に任せ、キーが存在する場合は必ず `T` として
+/// 解析する（`T::deserialize` は JSON `null` を受け付けないため、明示的な
+/// `null` はここでエラーになる）。`Option<T>::deserialize` を素の型で使うと
+/// 「省略」と「明示的な `null`」を区別できず、どちらも `None` になってしまう
+/// ため必要（REQ-39・Bugbot 指摘。PR #220。標準的な serde イディオム）。
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// [`TrainRequest::to_json_vec`] の内部専用の直列化表現。フィールド順は

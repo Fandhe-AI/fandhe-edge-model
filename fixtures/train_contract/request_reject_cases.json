@@ -1284,6 +1284,22 @@
       "expected_exit": 64
     },
     {
+      "name": "time_limit_seconds_null",
+      "patch": {
+        "time_limit_seconds": null
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "rss_limit_bytes_null",
+      "patch": {
+        "rss_limit_bytes": null
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
       "name": "root_not_absolute",
       "patch": {
         "root": "relative/root"

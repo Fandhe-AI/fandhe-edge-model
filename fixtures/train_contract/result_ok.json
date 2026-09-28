@@ -1,6 +1,6 @@
 {
   "status": "ok",
-  "artifact_dir": "out",
+  "artifact_dir": "/fandhe-edge-fixture-root/out",
   "artifact": {
     "kind": "c3",
     "kind_version": 1,

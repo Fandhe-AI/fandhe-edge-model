@@ -285,19 +285,28 @@ fn req39_to_json_vec_rejects_oversized_config() {
 
 /// REQ-21(g): `result_ok.json`／`result_error.json` を `from_worker_stdout`
 /// で読むと各項目が具体値と一致し、Serialize し直した Value が fixture と
-/// 一致する。
+/// 一致する。`result_ok.json` の `artifact` の各値（`kind`・`kind_version`・
+/// `config`・`label_order`・`max_bytes`）と `artifact_dir`（`root`＋`out_dir`
+/// の結合）は `request_full.json` と揃えてある（REQ-39・P0/P1。PR #220
+/// レビュー対応。`crates/train/src/result.rs` の `from_worker_stdout` doc
+/// 参照）ため、ここでは `request_full.json` から組み立てた `TrainRequest`
+/// を渡して検証する。
 #[test]
 fn req21_result_ok_and_error_round_trip_fixture() {
+    let request_full_bytes = load_fixture_bytes("request_full.json");
+    let request = TrainRequest::from_json_slice(&request_full_bytes)
+        .expect("request_full.json must parse into a TrainRequest");
+
     let ok_bytes = load_fixture_bytes("result_ok.json");
     let ok_line = String::from_utf8(ok_bytes).unwrap().replace('\n', "");
-    let outcome =
-        TrainOutcome::from_worker_stdout(ok_line.as_bytes()).expect("result_ok.json must parse");
+    let outcome = TrainOutcome::from_worker_stdout(ok_line.as_bytes(), &request)
+        .expect("result_ok.json must parse and match request_full.json");
     match &outcome {
         TrainOutcome::Ok {
             artifact_dir,
             artifact,
         } => {
-            assert_eq!(artifact_dir, "out");
+            assert_eq!(artifact_dir, "/fandhe-edge-fixture-root/out");
             assert_eq!(artifact.kind(), "c3");
             assert_eq!(artifact.onnx_file(), "model.onnx");
             assert_eq!(
@@ -313,7 +322,7 @@ fn req21_result_ok_and_error_round_trip_fixture() {
 
     let error_bytes = load_fixture_bytes("result_error.json");
     let error_line = String::from_utf8(error_bytes).unwrap().replace('\n', "");
-    let error_outcome = TrainOutcome::from_worker_stdout(error_line.as_bytes())
+    let error_outcome = TrainOutcome::from_worker_stdout(error_line.as_bytes(), &request)
         .expect("result_error.json must parse");
     match &error_outcome {
         TrainOutcome::Error(failure) => {

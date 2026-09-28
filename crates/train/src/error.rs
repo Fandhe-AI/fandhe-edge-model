@@ -219,6 +219,13 @@ pub enum TrainResultError {
     InvalidFailureCode,
     /// `message` が上限（4 KiB）を超える。
     FailureMessageTooLong,
+    /// 成果物の `kind`／`kind_version`／`config`／`label_order`／`max_bytes`
+    /// が、この結果に対応する [`crate::request::TrainRequest`] の値と一致
+    /// しない（REQ-39 ガード層「完全性と版」・REQ-21 入出力契約。ワーカーが
+    /// 依頼と異なる種類・未対応の版を返しても成功扱いにしないための検査。
+    /// `kind` ごとの許可版一覧は本 crate の対象外〔未確定。PR #220 参照〕
+    /// のため、ここでは「依頼内容と一致するか」だけを検査する）。
+    ArtifactMismatch { field: &'static str },
 }
 
 impl std::fmt::Display for TrainResultError {
@@ -253,6 +260,12 @@ impl std::fmt::Display for TrainResultError {
             }
             TrainResultError::FailureMessageTooLong => {
                 write!(f, "train result message exceeds size limit")
+            }
+            TrainResultError::ArtifactMismatch { field } => {
+                write!(
+                    f,
+                    "train result artifact field does not match the request: {field}"
+                )
             }
         }
     }
