@@ -373,6 +373,14 @@ pub enum TrainProcessError {
     /// 子プロセスの終了後、期限内に標準出力の読み取りが完了しなかった
     /// （孤児プロセスがパイプを閉じずに残っている等。REQ-39）。
     StdoutIncomplete,
+    /// 子プロセスの終了後、期限内に標準エラー出力の読み取りが完了しなかった
+    /// （`StdoutIncomplete` と同じ原因〔孤児プロセスがパイプを保持〕で
+    /// 起こりうる。標準出力側だけを検査し標準エラー側のタイムアウトを
+    /// `stderr_truncated: true` のまま成功扱いにすると、学習が継続中でも
+    /// 成功として返してしまう〔codex/review 指摘。issue #178 PR #233
+    /// レビュー〕ため、読み取り未完了は標準出力と同様にエラーとして扱う。
+    /// REQ-39「資源の上限」）。
+    StderrIncomplete,
     /// [`crate::process::RunLimits::with_wall_timeout`] に渡した値が不正
     /// （0、または既定の締め切り以上。「締める方向だけ」の制約に違反）。
     /// `WorkerLauncher` の検証失敗（[`TrainProcessError::InvalidLauncher`]）
@@ -427,6 +435,9 @@ impl std::fmt::Display for TrainProcessError {
             TrainProcessError::StdoutIncomplete => {
                 write!(f, "worker process stdout was not fully read in time")
             }
+            TrainProcessError::StderrIncomplete => {
+                write!(f, "worker process stderr was not fully read in time")
+            }
             TrainProcessError::InvalidRunLimits => {
                 write!(f, "run limits must only be tightened, never loosened")
             }
@@ -477,6 +488,7 @@ impl TrainProcessError {
             | TrainProcessError::TerminatedBySignal
             | TrainProcessError::UnknownExitCode(_)
             | TrainProcessError::StdoutIncomplete
+            | TrainProcessError::StderrIncomplete
             | TrainProcessError::ExitCodeMismatch { .. } => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
             TrainProcessError::Request(inner) => inner.exit_code(),

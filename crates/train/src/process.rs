@@ -251,11 +251,16 @@ fn write_request_file(
     let mut file = open_options
         .open(&path)
         .map_err(|e| TrainProcessError::RequestWrite { kind: e.kind() })?;
+    // `create_new` の成功直後（`write_all`／`sync_all` より前）にガードを
+    // 確立する。書き込み・同期の失敗時にも作成済みファイルを必ず削除し、
+    // 残置による次回同一 `job_dir` での `AlreadyExists` 衝突を防ぐ
+    // （codex/Cursor Bugbot 指摘。issue #178 PR #233 レビュー）。
+    let guard = RequestFileGuard { path };
     file.write_all(&bytes)
         .map_err(|e| TrainProcessError::RequestWrite { kind: e.kind() })?;
     file.sync_all()
         .map_err(|e| TrainProcessError::RequestWrite { kind: e.kind() })?;
-    Ok(RequestFileGuard { path })
+    Ok(guard)
 }
 
 /// 上限つきで読み進める出力読み取りスレッドの結果。
@@ -452,7 +457,18 @@ pub fn run_train(
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(e) => return Err(TrainProcessError::Wait { kind: e.kind() }),
+            Err(e) => {
+                // `try_wait()` 自体のエラー（unix では `EINTR` 等で到達しう
+                // る）で即座に返すと `child` が drop され、実際にはまだ生き
+                // ている子プロセスを kill／wait せず放置してゾンビ化・孤児化
+                // させる（Cursor Bugbot 指摘「Child leaked on wait error」。
+                // issue #178 PR #233 レビュー）。エラーを返す前に必ず回収を
+                // 試みる。kill・wait 自体の失敗（既に終了済み等）は元の
+                // `try_wait` エラーの報告を妨げないよう無視する。
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TrainProcessError::Wait { kind: e.kind() });
+            }
         }
     };
 
@@ -488,10 +504,15 @@ pub fn run_train(
     let Some(stdout_drain) = stdout_drain else {
         return Err(TrainProcessError::StdoutIncomplete);
     };
-    let (worker_stderr, stderr_truncated) = match stderr_drain {
-        Some(drained) => (drained.kept, drained.truncated),
-        None => (Vec::new(), true),
+    // 標準エラー出力の読み取りタイムアウトも標準出力と同様にエラーとして
+    // 扱う。`stderr_truncated: true` のまま `Ok(TrainRun)` を返すと、孤児化
+    // した `_worker`（「孤児化の限界」節）がパイプを握り続けて学習が実際
+    // には継続中でも成功と区別できなくなる（codex/review 指摘。issue #178
+    // PR #233 レビュー。REQ-39「資源の上限」）。
+    let Some(stderr_drain) = stderr_drain else {
+        return Err(TrainProcessError::StderrIncomplete);
     };
+    let (worker_stderr, stderr_truncated) = (stderr_drain.kept, stderr_drain.truncated);
 
     let process_exit = classify_process_exit_status(status)?;
     let outcome = classify_exit(process_exit, &stdout_drain.kept, request)?;
