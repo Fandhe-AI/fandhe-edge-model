@@ -341,6 +341,33 @@ pub fn verify_direct_write_rejected(path: &Path) -> Result<(), PlacementError> {
     verify_direct_write_rejected_checked(path, None)
 }
 
+/// `append` 用の `open` が `PermissionDenied` を返した直後に、検査時点
+/// （[`check_not_symlink`]）の `(dev, ino)`（`pre_dev_ino`）と、現在の
+/// パスの実体が同一であることを確認する（unix 限定）。
+///
+/// `PermissionDenied` というだけでは、検査時と同一のファイルへの拒否
+/// なのか、検査後に「別の読み取り専用ファイル」へ差し替えられ、その
+/// 別ファイルへの拒否を検査対象への拒否と誤認しているのかを区別
+/// できない（issue #227 codex P0 指摘。fail-closed の TOCTOU 対策）。
+/// `open` 呼び出し直後に改めて `symlink_metadata` を取得し `(dev, ino)`
+/// が検査時と一致することを確認できて初めて、この拒否を検査対象の
+/// ファイルへの拒否とみなす。これでも「失敗した `open`」と「直後の
+/// 再検査」の間の窓は残るが、少なくとも「差し替え後の別ファイルへの
+/// 拒否」を「配置成功」として返すことは防げる。
+#[cfg(unix)]
+fn verify_identity_after_permission_denied(
+    path: &Path,
+    pre_dev_ino: (u64, u64),
+) -> Result<(), PlacementError> {
+    let post_meta = check_not_symlink(path)?;
+    if dev_ino(&post_meta) != pre_dev_ino {
+        return Err(PlacementError::Replaced {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 /// [`verify_direct_write_rejected`] の内部実装。`expected_dev_ino` が
 /// `Some` の場合（[`place_read_only`] からの呼び出し）、権限変更に使った
 /// ハンドルの `(dev, ino)` と、本関数が事前検査で得た `(dev, ino)` の一致も
@@ -367,7 +394,11 @@ fn verify_direct_write_rejected_checked(
     }
 
     match OpenOptions::new().append(true).open(path) {
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(()),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            #[cfg(unix)]
+            verify_identity_after_permission_denied(path, pre_dev_ino)?;
+            Ok(())
+        }
         Ok(opened) => {
             // 開けてしまった（＝書き込み可能）場合でも、それが検査時と
             // 同一のファイルであることを確認してから `WriteNotRejected`
@@ -544,6 +575,56 @@ mod tests {
             std::fs::read(&guard.0).expect("読み取りに失敗しないはず"),
             b"eval data"
         );
+    }
+
+    /// REQ-39・TASK-17.2-2: `append` open が `PermissionDenied` を返した
+    /// 場合でも、事前検査で得た `(dev, ino)`（`pre_dev_ino`）と現在のパス
+    /// の実体が一致しなければ `Replaced` として拒否する（issue #227 codex
+    /// P0 指摘: 書き込み拒否確認は `(dev, ino)` 未確認で `Ok` を返す）。
+    ///
+    /// 実際の TOCTOU（`check_not_symlink` と `open` の間の差し替え）を
+    /// 再現する代わりに、`place_read_only` で読み取り専用配置済みの
+    /// ファイル A の `pre_dev_ino` を握った状態で、パス上のファイルを
+    /// 別の読み取り専用ファイル B へ差し替えてから呼び出すことで、
+    /// 「開けなかった対象が検査時のファイルと異なる」状況を決定的に
+    /// 再現する。
+    #[cfg(unix)]
+    #[test]
+    fn req39_verify_identity_after_permission_denied_detects_replacement() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let guard_a = write_unique_temp_file("permdenied-replace-a", b"file a");
+        if running_as_root(&guard_a.0) {
+            // root では append open 自体が PermissionDenied にならない。
+            return;
+        }
+        let placement = place_read_only(&guard_a.0).expect("A の読み取り専用配置は成功するはず");
+        assert_eq!(placement.mode(), 0o444);
+        let pre_meta =
+            std::fs::symlink_metadata(&guard_a.0).expect("A のメタデータを取得できるはず");
+        let pre_dev_ino = (pre_meta.dev(), pre_meta.ino());
+
+        // A とは別 inode の読み取り専用ファイル B を用意し、A のパスへ
+        // rename で差し替える（検査からオープンの間の差し替えと同じ
+        // 効果を、決定的な手順で再現する）。
+        let guard_b = write_unique_temp_file("permdenied-replace-b", b"file b");
+        let placement_b = place_read_only(&guard_b.0).expect("B の読み取り専用配置は成功するはず");
+        assert_eq!(placement_b.mode(), 0o444);
+        let b_meta = std::fs::symlink_metadata(&guard_b.0).expect("B のメタデータを取得できるはず");
+        assert_ne!(
+            (b_meta.dev(), b_meta.ino()),
+            pre_dev_ino,
+            "A と B の (dev, ino) は異なるはず"
+        );
+        std::fs::rename(&guard_b.0, &guard_a.0).expect("B を A のパスへ差し替えられるはず");
+        // rename 済みで guard_b のパスはもう存在しないため、Drop での
+        // 後始末を A 側の guard に任せる（guard_b の Drop は空振りになる）。
+        std::mem::forget(guard_b);
+
+        match verify_identity_after_permission_denied(&guard_a.0, pre_dev_ino) {
+            Err(PlacementError::Replaced { .. }) => {}
+            other => panic!("Replaced を期待したが {other:?} だった"),
+        }
     }
 
     /// REQ-39: ディレクトリを渡すと `NotRegularFile` になる。
