@@ -24,13 +24,55 @@
 //! 2. `judgment_type` が変わったら「必要」
 //! 3. それ以外（表示名・説明だけの差、または差なし）は「不要／変更なし」
 //!
-//! # 本 issue（#90・TASK-20.1-1）の範囲
+//! # TASK-20.1-2（issue #91）で追加した内容
 //!
-//! 判定結果の型と比較関数の骨格のみを実装する。次は範囲外とし、実装済みを
-//! 装わない（各担当 TASK で追加する）:
+//! #90（TASK-20.1-1）が残した「PoC-19 の 5 パターンの網羅的な具体値テスト」
+//! 「統合を独立の理由として区別するかの判断」の 2 点を本 issue で解決する。
 //!
-//! - PoC-19 の 5 パターン（追加・削除・統合・判定型変更・rename）の網羅的な
-//!   具体値テスト、統合を独立の理由として区別するかの判断（TASK-20.1-2・#91）
+//! ## 2.1 統合は独立の理由にしない（`OptionIdsChanged` のまま）
+//!
+//! 本番の定義ファイルスキーマ（`fandhe-edge-model-definition/v1`。
+//! [`crate::definition::RawDefinition`] は `deny_unknown_fields`）には
+//! PoC-19 の `merges` 欄が無い。`merges` の追加は定義ファイルスキーマの変更
+//! （ユーザー承認事項）にあたるため行わない。ID 集合（削除 2・追加 1 等）
+//! から統合を推定するのも不確実（「削除＋無関係な追加」と区別できない）。
+//! よって統合パターン（fixture: `v3_8merge.json`）は
+//! `OptionIdsChanged { added, removed }` の `added`・`removed` が両方
+//! 非空の形で現れることをテストで固定する。`RebuildReason` は
+//! `#[non_exhaustive]` のため、将来スキーマに `merges` 相当の情報が入った
+//! 時点で独立の理由を追加できる。
+//!
+//! ## 2.2 判定型変更（P5）の扱い
+//!
+//! 本番の [`crate::definition::JudgmentType`] は `SingleSelect` の 1
+//! バリアントのみで、`Definition::parse`/`load` は `"multi_select"` を
+//! `DefinitionError::UnsupportedValue { field: FieldPath::JudgmentType }`
+//! で拒否する（`definition.rs` の既存テストで固定済み）。本番バリアントへ
+//! `multi_select` 等を追加することは判定型スキーマの変更（NR-2 は REQ-15
+//! 対象外）であり、ユーザー承認事項として本 issue では行わない。
+//!
+//! 代わりに `JudgmentType` の `#[cfg(test)]` 限定バリアント
+//! `TestOnlyAlternate` を経路確認の seam として使う（`definition.rs` の
+//! doc を参照）。`#[cfg(test)]` は本 crate のユニットテストビルドにしか
+//! 効かず、依存 crate（`crates/train`・`crates/data`・`crates/eval`・
+//! `crates/cli` 等）の非 test ビルドには現れないため、それらの網羅
+//! `match`（例: `crates/train/src/request.rs` の判定型分岐）に影響しない。
+//! したがって `Required(JudgmentTypeChanged)` の具体値テストは本ファイルの
+//! `mod tests`（unit test）に置く（`crates/core/tests/` の結合テストからは
+//! この seam は見えない）。結合テスト側では PoC-19 の P5 相当の入力
+//! （`judgment_type: "multi_select"`）が `Definition::load` の時点で拒否
+//! されることを確認し、本番の観測挙動（学習へ進まない＝PoC-19 の
+//! 「必要（案内のみ）」と整合）を示す。
+//!
+//! ## 2.3 PoC との意図的な差
+//!
+//! PoC-19 の `need_rebuild` は選択肢 ID 集合の変化を見つけた時点で早期
+//! return する（理由は常に 1 件）。本モジュールの `classify_change` は
+//! ID 集合 → 判定型の固定順で両方の理由を集める（理由が複数件になりうる）。
+//! PoC-19 の 5 パターンはいずれか一方しか変えないため、結果には影響しない。
+//!
+//! # 引き続き範囲外（各担当 TASK で追加する）
+//!
 //! - `NotRequired` への差分詳細（表示名・説明が変わった選択肢 ID）の追加
 //!   （TASK-20.2・#92）
 //! - ハッシュ完全一致時に以降の比較処理そのものを実行しないことの保証と
@@ -97,9 +139,9 @@ impl RequiredRebuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RebuildReason {
-    /// 選択肢 ID 集合の変化（追加・削除。統合は「削除＋（場合により）追加」
-    /// として現れる。統合を独立の理由として区別するかは TASK-20.1-2（#91）
-    /// の対象）。
+    /// 選択肢 ID 集合の変化（追加・削除）。統合は `added`・`removed` の
+    /// 双方が非空の値として現れる（独立の理由にしない判断はモジュール doc
+    /// 2.1 節・TASK-20.1-2・#91 を参照）。
     OptionIdsChanged {
         added: BTreeSet<String>,
         removed: BTreeSet<String>,
@@ -350,9 +392,185 @@ mod tests {
         assert_eq!(decision, RebuildDecision::NotRequired);
     }
 
-    // `JudgmentType` は現状 `SingleSelect` の 1 バリアントしか持たないため、
-    // `JudgmentTypeChanged` 経路（clippy に「常に偽」と判定されない代入元が
-    // 存在しない状態）はテストで到達させられない
-    // （`canonical.rs` 末尾のコメントと同じ制約。TASK-20.1 の範囲で
-    // バリアントが増えた時点でテストを追加する）。
+    // PoC-19（`03-poc/model-lifecycle/`）の事前固定 5 パターンを本番の定義
+    // ファイルスキーマへ変換した fixture（出典・変換規則は
+    // `fixtures/rebuild/poc19/PROVENANCE.md` を参照。REQ-20・TASK-20.1-2・
+    // issue #91）。ビルド時にコンパイル済みバイナリへ埋め込む
+    // （`include_str!` はコンパイル時にのみファイルシステムへアクセスし、
+    // 実行時の I/O ではないため資源上限〔REQ-39〕の対象外）。
+
+    const POC19_V1_9: &str = include_str!("../../../fixtures/rebuild/poc19/v1_9.json");
+    const POC19_V2_8RM: &str = include_str!("../../../fixtures/rebuild/poc19/v2_8rm.json");
+    const POC19_V3_8MERGE: &str = include_str!("../../../fixtures/rebuild/poc19/v3_8merge.json");
+    const POC19_V4_RENAME: &str = include_str!("../../../fixtures/rebuild/poc19/v4_rename.json");
+
+    /// P1（追加）: `v2_8rm.json` → `v1_9.json` で `tier-xl__high` が追加され、
+    /// `Required` の理由が `OptionIdsChanged` の 1 件のみになる
+    /// （証拠種別: テストハーネス。出典: `fixtures/rebuild/poc19/PROVENANCE.md`。
+    /// REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_p1_added_option_requires_rebuild() {
+        let old = Definition::parse(POC19_V2_8RM).expect("固定 fixture は valid なはず");
+        let new = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        let expected_added: BTreeSet<String> = ["tier-xl__high".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::Required(required) => {
+                assert_eq!(
+                    required.reasons(),
+                    &[RebuildReason::OptionIdsChanged {
+                        added: expected_added,
+                        removed: BTreeSet::new(),
+                    }]
+                );
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+
+    /// P2（削除）: `v1_9.json` → `v2_8rm.json` で `tier-xl__high` が削除され、
+    /// `Required` の理由が `OptionIdsChanged` の 1 件のみになる
+    /// （証拠種別: テストハーネス。REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_p2_removed_option_requires_rebuild() {
+        let old = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+        let new = Definition::parse(POC19_V2_8RM).expect("固定 fixture は valid なはず");
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        let expected_removed: BTreeSet<String> =
+            ["tier-xl__high".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::Required(required) => {
+                assert_eq!(
+                    required.reasons(),
+                    &[RebuildReason::OptionIdsChanged {
+                        added: BTreeSet::new(),
+                        removed: expected_removed,
+                    }]
+                );
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+
+    /// P3（統合）: `v1_9.json` → `v3_8merge.json` で `tier-l__medium` +
+    /// `tier-l__high` が `tier-l__midhigh` へ統合され、`added`・`removed` の
+    /// 双方が非空の `OptionIdsChanged` 1 件になる（統合を独立の理由に
+    /// しない判断はモジュール doc 2.1 節を参照。REQ-20・TASK-20.1-2・
+    /// issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_p3_merged_options_require_rebuild() {
+        let old = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+        let new = Definition::parse(POC19_V3_8MERGE).expect("固定 fixture は valid なはず");
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        let expected_added: BTreeSet<String> =
+            ["tier-l__midhigh".to_string()].into_iter().collect();
+        let expected_removed: BTreeSet<String> =
+            ["tier-l__medium".to_string(), "tier-l__high".to_string()]
+                .into_iter()
+                .collect();
+        match decision {
+            RebuildDecision::Required(required) => {
+                assert_eq!(
+                    required.reasons(),
+                    &[RebuildReason::OptionIdsChanged {
+                        added: expected_added,
+                        removed: expected_removed,
+                    }]
+                );
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+
+    /// P4（表示名・説明のみ）: `v1_9.json` → `v4_rename.json` は選択肢 ID
+    /// 集合・判定型が同一で、表示名・説明のみが変わる。`NotRequired` になる
+    /// （REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_p4_display_only_change_is_not_required() {
+        let old = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+        let new = Definition::parse(POC19_V4_RENAME).expect("固定 fixture は valid なはず");
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        assert_eq!(decision, RebuildDecision::NotRequired);
+    }
+
+    /// P5（判定型変更）: 選択肢 ID 集合を変えず `judgment_type` だけを
+    /// 変更すると、`Required` の理由が `JudgmentTypeChanged` の 1 件のみに
+    /// なる。本番の `JudgmentType` は `SingleSelect` の 1 バリアントしか
+    /// 持たないため、`#[cfg(test)]` 限定の `TestOnlyAlternate`（モジュール
+    /// doc 2.2 節）を経路確認の seam として使う。この seam は本 crate の
+    /// ユニットテストビルドにしか存在せず、`crates/core/tests/` の結合
+    /// テストからは見えない（PoC-19 の P5 相当・本番の観測挙動〔`multi_select`
+    /// の拒否〕は `crates/core/tests/rebuild_decision.rs` で確認する。
+    /// REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_p5_judgment_type_change_requires_rebuild() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(POC19_V1_9).expect("固定 fixture は valid JSON のはず");
+        value["judgment_type"] = serde_json::json!("test_only_alternate");
+        let new_text = serde_json::to_string(&value).expect("Value の再直列化は失敗しないはず");
+
+        let old = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+        let new = Definition::parse(&new_text)
+            .expect("test_only_alternate は test cfg で有効な判定型のはず");
+
+        let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::Required(required) => {
+                assert_eq!(
+                    required.reasons(),
+                    &[RebuildReason::JudgmentTypeChanged {
+                        old: JudgmentType::SingleSelect,
+                        new: JudgmentType::TestOnlyAlternate,
+                    }]
+                );
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+
+    /// PoC-19 の 5 パターンを 1 本で集計し、P1・P2・P3・P5 の 4 件が
+    /// `Required`、P4 の 1 件が `NotRequired` になることを具体値で確認する
+    /// （受入基準: PoC-19 の 5 パターンのうち 4 パターンで「作り直しが必要」
+    /// と判定されること。REQ-20・TASK-20.1-2・issue #91）。
+    #[test]
+    fn req20_task20_1_2_poc19_five_patterns_four_required_one_not_required() {
+        let v1 = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
+        let v2 = Definition::parse(POC19_V2_8RM).expect("固定 fixture は valid なはず");
+        let v3 = Definition::parse(POC19_V3_8MERGE).expect("固定 fixture は valid なはず");
+        let v4 = Definition::parse(POC19_V4_RENAME).expect("固定 fixture は valid なはず");
+        let mut v5_value: serde_json::Value =
+            serde_json::from_str(POC19_V1_9).expect("固定 fixture は valid JSON のはず");
+        v5_value["judgment_type"] = serde_json::json!("test_only_alternate");
+        let v5_text = serde_json::to_string(&v5_value).expect("Value の再直列化は失敗しないはず");
+        let v5 = Definition::parse(&v5_text).expect("test cfg で有効な判定型のはず");
+
+        let decisions = [
+            decide_rebuild(&v2, &v1).expect("P1 は失敗しないはず"),
+            decide_rebuild(&v1, &v2).expect("P2 は失敗しないはず"),
+            decide_rebuild(&v1, &v3).expect("P3 は失敗しないはず"),
+            decide_rebuild(&v1, &v4).expect("P4 は失敗しないはず"),
+            decide_rebuild(&v1, &v5).expect("P5 は失敗しないはず"),
+        ];
+
+        let required_count = decisions
+            .iter()
+            .filter(|d| matches!(d, RebuildDecision::Required(_)))
+            .count();
+        let not_required_count = decisions
+            .iter()
+            .filter(|d| matches!(d, RebuildDecision::NotRequired))
+            .count();
+
+        assert_eq!(required_count, 4);
+        assert_eq!(not_required_count, 1);
+    }
 }
