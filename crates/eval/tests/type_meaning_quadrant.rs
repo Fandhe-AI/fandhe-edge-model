@@ -89,15 +89,18 @@ fn type_invalid_single_record_counts_as_type_ng() {
     assert_eq!(quadrant.total(), Some(1));
 }
 
-/// PoC-9 anomaly-03（unknown-label。1 件）: ラベル集合に無い予測は
-/// type_ng_count に数える。gold と偶然同じ文字列でも、ラベル集合に
-/// 宣言されていなければ意味の正しさのセルには数えない
-/// （型不正の行は意味を判定できないため）。
+/// PoC-9 anomaly-03（unknown-label。1 件）: 宣言済みラベル集合に無い
+/// 予測（"C"）は、gold の値とは無関係に type_ng_count に数える
+/// （型不正の行は意味を判定できないため、意味の正しさのセルには数えない）。
+/// `evaluate_single_select` はラベル集合外の gold を拒否するため、
+/// ラベル集合に無い文字列を gold に使うケースは有効な入力として
+/// 再現できない。よってこのテストは gold・予測が一致するかどうかではなく、
+/// 「ラベル集合に無い予測は type_ng_count に数える」挙動のみを検証する。
 #[test]
-fn unknown_label_not_in_label_set_counts_as_type_ng_even_when_string_matches_gold() {
-    // gold は "C" だが、宣言済みラベルは ["A","B"] のみ。予測 "C" は
-    // ラベル集合に無いため、gold と文字列が一致していても type_ng_count に
-    // 数える（意味の正しさのセルへは数えない）。
+fn unknown_label_prediction_not_in_label_set_counts_as_type_ng() {
+    // gold は宣言済みラベル ["A","B"] 内の "A"。2 件目の予測 "C" は
+    // ラベル集合に無いため、gold の値によらず type_ng_count に数える
+    // （意味の正しさのセルへは数えない）。
     let out_correct = Outcome::Label("A".to_string());
     let outcome = Outcome::Label("C".to_string());
     let records = vec![
@@ -110,8 +113,6 @@ fn unknown_label_not_in_label_set_counts_as_type_ng_even_when_string_matches_gol
             outcome: &outcome,
         },
     ];
-    // "C" は gold としても許容されないため、labels に含めず A のみの
-    // gold で構成する（gold は宣言済みラベル集合に存在する必要がある）。
     let metrics = evaluate_single_select(&["A", "B"], &records).expect("valid input");
     let quadrant = &metrics.type_meaning_quadrant;
     assert_eq!(quadrant.type_ok_meaning_ok(), 1);
