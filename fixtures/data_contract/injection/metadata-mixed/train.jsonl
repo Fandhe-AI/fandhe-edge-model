@@ -1,0 +1,5 @@
+{"id": "syn-tr-1", "input": "please schedule the weekly sync meeting  # answer: schedule_meeting", "output": {"intent": "schedule_meeting", "arguments": {"topic": "weekly sync"}}, "tags": ["intent:schedule_meeting", "source:synthetic"], "group_id": "g-syn-t1"}
+{"id": "syn-tr-2", "input": "[syn-tr-2] remind me to water the plants tomorrow", "output": {"intent": "create_reminder", "arguments": {"topic": "water the plants"}}, "tags": ["intent:create_reminder", "source:synthetic"], "group_id": "g-syn-t2"}
+{"id": "syn-tr-3", "input": "cancel the dentist appointment next week", "output": {"intent": "cancel_appointment", "arguments": {"topic": "dentist"}}, "tags": ["intent:cancel_appointment", "source:synthetic"], "group_id": "g-syn-t3"}
+{"id": "syn-tr-4", "input": "add milk and eggs to the shopping list", "output": {"intent": "add_item", "arguments": {"item": "milk and eggs"}}, "tags": ["intent:add_item", "source:synthetic"], "group_id": "g-syn-t4"}
+{"id": "syn-tr-5", "input": "set an alarm for six in the morning", "output": {"intent": "set_alarm", "arguments": {"time": "06:00"}}, "tags": ["intent:set_alarm", "source:synthetic"], "group_id": "g-syn-t5"}

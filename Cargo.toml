@@ -5,7 +5,7 @@
 # 深い階層（`crates/foo/bar`）には crate を置かない。
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/data", "crates/eval"]
+members = ["crates/core", "crates/cli", "crates/data", "crates/eval", "crates/train"]
 
 [workspace.package]
 edition = "2024"
@@ -23,18 +23,32 @@ publish = false
 fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
 fandhe-edge-eval = { path = "crates/eval" }
+fandhe-edge-train = { path = "crates/train" }
 # serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の
 # 「配置する層」は共通コア（TASK-15.3〜15.5）に加え、データ契約層（crates/data。
 # TASK-16.1-1・issue #38）にも 2026-09-27 オーナー承認済み（PR #191 のレビュー指摘への
 # 対応として PR #193 で承認記録を追記。バージョン・ライセンス（MIT OR Apache-2.0）・
 # 推移的依存（itoa・memchr・zmij）は変更なし）。
+# #177 で学習ワーカー層（crates/train）への配置も加わる。版・ライセンス・推移的依存は
+# 変更せず、この配置層の追加は 2026-09-28 オーナー承認済み
+# （.claude/rules/dependency-policy.md「承認済みの依存」表に反映済み）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 # sha2 は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。正準化ハッシュ〔TASK-15.5〕の sha256 計算に使う。
 # PoC-16 の `shasum` 子プロセス起動を置き換え、OS・外部コマンドに依存させない）。
 sha2 = "=0.11.0"
+# unicode-normalization は 2026-09-28 オーナー承認済み（.claude/rules/dependency-policy.md
+# 「承認済みの依存」表。承認記録は PR #224）。データ契約層（crates/data）の矛盾検出
+# （TASK-16.2-2・#42・REQ-16）で NFKC 正規化を行い、学習ワーカー（Python `unicodedata`）
+# と同じ規則にするために使う。推論側には配置しない。
+# 版は =0.1.22 に固定する（`UNICODE_VERSION == (15, 0, 0)`）。学習ワーカー
+# （Python 3.12 の `unicodedata`。UCD 15.0.0 準拠）と Unicode 版を一致させ、
+# NFKC の版差による結果の食い違いを避けるための選択（0.1.25 は Unicode 17.0
+# 準拠で版がずれていた。PR #188 Codex レビュー P1 指摘・オーナー承認記録は
+# PR #225）。
+unicode-normalization = "=0.1.22"
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で

@@ -8,11 +8,38 @@ publish.workspace = true
 description = "Data contract layer (record inspection, group-wise split and freeze, provenance) for fandhe-edge-model."
 
 [dependencies]
-# 定義ファイルのスキーマ（TASK-15.3・#32〜#34）は実装済みだが、`inspect` は
+# 定義ファイルのスキーマ（TASK-15.3・#32〜#34）は実装済みだが、`inspect`・`split` は
 # 意図的に `fandhe-edge-core` に依存しない（crates/data/src/lib.rs の
-# doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う
-# （`split` は追加の外部依存を必要としない）。
+# doc コメント参照）。`serde_json` は `inspect` の JSONL パースにのみ使う。
+# `split_record`（TASK-17.1-2・#45）は分割記録のハッシュ計算に
+# `fandhe-edge-core::canonical::canonical_sha256_hex`（sha2 を内包）を使い、
+# `eval_freeze`（TASK-17.2-1・issue #47）は `fandhe-edge-core::hash::Sha256Digest`
+# と `fandhe-edge-core::exitcode::ExitCode` を使うため、workspace 内のパス依存
+# として `fandhe-edge-core` を追加する（外部依存の追加ではなく、承認済み依存
+# serde・serde_json の配置を data 層へ広げる形。dependency-policy.md
+# 「承認済みの依存（Rust）」2026-09-28 承認）。`inspect`・`split` は引き続き
+# `fandhe-edge-core` の定義ファイルスキーマに依存しない。
+# `serde`（derive）: dependency-policy.md「承認済みの依存」表。データ契約層への
+# 配置は 2026-09-28 オーナー承認済み（#207）。`eval_freeze::FreezeRecord` の
+# JSON 直列化・逆直列化に使う。
+fandhe-edge-core.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
+# unicode-normalization は 2026-09-28 オーナー承認済み（承認記録は PR #224・
+# 版を =0.1.22 に変えた承認記録は PR #225。ルート Cargo.toml の
+# [workspace.dependencies] コメント参照）。矛盾検出（src/normalize.rs）の
+# 既定正規化で NFKC を行うために使う。
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# serde・serde_json は .claude/rules/dependency-policy.md「承認済みの依存」で
+# 2026-09-27 に承認済み（共通コアの JSON 入出力用途）。本 crate では
+# TASK-16.2-2 のテストハーネス（tests/support のローダ・PoC-9 由来 JSONL
+# フィクスチャの読み込み）にのみ使い、src 側では使わない（dev-dependency
+# として配置する層をデータ契約層のテストへ広げる。ルート Cargo.toml の
+# [workspace.dependencies] は変更しない）。
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,5 @@
+{"id": "syn-te-1", "input": "book a table for two at the restaurant ({\"party_size\": \"2\"})", "output": {"intent": "make_reservation", "arguments": {"party_size": "2"}}, "tags": ["intent:make_reservation", "source:synthetic"], "group_id": "g-syn-t6"}
+{"id": "syn-te-2", "input": "move the standup meeting to three pm", "output": {"intent": "reschedule_meeting", "arguments": {"time": "15:00"}}, "tags": ["intent:reschedule_meeting", "source:synthetic"], "group_id": "g-syn-t7"}
+{"id": "syn-te-3", "input": "delete the old draft document", "output": {"intent": "delete_document", "arguments": {"name": "old draft"}}, "tags": ["intent:delete_document", "source:synthetic"], "group_id": "g-syn-t8"}
+{"id": "syn-te-4", "input": "mark the laundry task as done", "output": {"intent": "complete_task", "arguments": {"name": "laundry"}}, "tags": ["intent:complete_task", "source:synthetic"], "group_id": "g-syn-t9"}
+{"id": "syn-te-5", "input": "list all tasks due this week", "output": {"intent": "list_tasks", "arguments": {"range": "this_week"}}, "tags": ["intent:list_tasks", "source:synthetic"], "group_id": "g-syn-t10"}
