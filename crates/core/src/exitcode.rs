@@ -16,8 +16,9 @@
 //! # 本モジュールのスコープ
 //!
 //! ここで定義するのは終了コードの型と最小の JSON エラー型のみ。CLI の各工
-//! 程が `ok` 時に実際に出す判定結果 JSON（選択肢 ID・スコア等）の配線は
-//! TASK-21.1-2（TASK-33.2）の対象で、本モジュールには含めない。PoC-16 の
+//! 程が `ok` 時に実際に出す判定結果 JSON（選択肢 ID・スコア等）の型は
+//! `judgment` モジュール（TASK-21.1-2）が持つ。CLI バイナリへの実配線は
+//! TASK-33.1・TASK-33.2 の対象で、いずれも本モジュールには含めない。PoC-16 の
 //! `fail()` が出していた `step` / `status` / `exit_code_name` / `error` と
 //! いった CLI 工程ごとの出力契約もここでは踏襲しない。
 //!
@@ -156,6 +157,22 @@ impl ErrorReport {
             message: message.into(),
         }
     }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// [`crate::judgment::JudgmentResult::to_json_line`] と対称の API。
+    /// 呼び出し側（`fandhe-edge-cli` の出力関数。TASK-21.2）が改行を付けて
+    /// stdout／stderr へ書く想定で、本 crate は I/O を行わない（層の境界を
+    /// 保つ。`.claude/rules/coding-rust.md`）。cli crate に `serde_json` を
+    /// 新規依存として追加せずに済むよう、直列化を core 側に閉じる
+    /// （`.claude/rules/dependency-policy.md`「承認済みの依存」で
+    /// `serde_json` の配置層に cli を含めていない）。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +251,33 @@ mod tests {
         assert_eq!(
             json,
             r#"{"code":"invalid_input","message":"missing required field: labels"}"#
+        );
+    }
+
+    /// TASK-21.2: `to_json_line` が `serde_json::to_string` と同じ 1 行の
+    /// JSON を返すこと。`message` に二重引用符・改行・制御文字が入っても
+    /// 出力全体が 1 行になること（`judgment::JudgmentResult` の同種テスト
+    /// と同じ確認）。
+    #[test]
+    fn req21_to_json_line_matches_serialize_and_stays_one_line() {
+        let report = ErrorReport::new(ExitCode::InvalidInput, "missing required field: labels");
+        let json = report.to_json_line().expect("to_json_line");
+        assert_eq!(
+            json,
+            r#"{"code":"invalid_input","message":"missing required field: labels"}"#
+        );
+
+        let with_control_chars =
+            ErrorReport::new(ExitCode::InvalidInput, "bad\"value\nwith\tcontrol");
+        let json = with_control_chars.to_json_line().expect("to_json_line");
+        assert_eq!(
+            json.matches('\n').count(),
+            0,
+            "must not contain raw newline"
+        );
+        assert_eq!(
+            json,
+            r#"{"code":"invalid_input","message":"bad\"value\nwith\tcontrol"}"#
         );
     }
 }

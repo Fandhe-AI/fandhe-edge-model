@@ -2,12 +2,13 @@
 //!
 //! 利用者が用意した学習・評価データ（JSONL、1 行 1 レコード）の検査
 //! （REQ-16）・group 単位分割と凍結（REQ-17）・来歴（REQ-40）を担う層。
-//! 本 crate は現時点で以下の 3 つを実装する。
+//! 本 crate は現時点で以下を実装する。
 //!
 //! - [`inspect`]: 型・必須項目・ラベル enum の検査ロジック
 //!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）
 //! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
 //!   TASK-16.1-2・issue #39）
+//! - [`leak`]: 漏洩・group 跨ぎ検出（REQ-16・TASK-16.2-1・issue #41）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
 //! - [`split_record`]: 分割の seed・規則・各分割のハッシュの記録と永続化
 //!   （TASK-17.1-2・issue #45）
@@ -15,18 +16,34 @@
 //!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
 //!   （ケース 7〜12。矛盾・ラベル順序・未出現クラス・不正なスコア・
 //!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
+//! - [`preprocess_boundary`][]: 空入力の前処理食い違いの検知・報告
+//!   （REQ-23 境界値・TASK-23.2・issue #57）
+//! - [`provenance`]: 来歴レコード型（REQ-40・TASK-40.1-1・issue #74）。
+//!   [`provenance::ingest`] で取り込み時の JSON 検証・記録 JSON 生成を実装
+//!   （TASK-40.1-2・issue #75）
+//! - [`ingest`][]: データ検査（[`inspect::inspect_records`]）と来歴の取り込み
+//!   （[`provenance::ingest::parse_provenance_json`]）の接続点
+//!   （REQ-40・TASK-40.1-2・issue #75）
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - データ検査のうち漏洩・group 跨ぎ・メタデータ混入・矛盾・正規化入力の
-//!   重複検出（REQ-16・TASK-16.2）: 未実装
+//! - データ検査（REQ-16）: 漏洩・group 跨ぎ検出（TASK-16.2-1・[`leak`]）は実装済み。
+//!   メタデータ混入・矛盾レコード検出（TASK-16.2-2）は未実装。正規化した
+//!   入力での漏洩照合（NFKC 等）も未実装（`unicode-normalization` の承認と
+//!   TASK-15.5 の完了が前提。[`leak`] のスコープの境界を参照）
 //! - 分割結果のハッシュ計算・記録は [`split_record`] で実装済み
 //!   （REQ-17・TASK-17.1-2・issue #45）。評価データの凍結（読み取り専用配置・
 //!   ハッシュ不一致時の停止。REQ-17・TASK-17.2・TASK-17.3）は未実装
 //!   （[`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
 //!   [`split::Groupable`] を実装しないため、[`split::split_by_group`]・
 //!   [`split_record::split_and_record`] へ渡す際は呼び出し側（CLI 等）が変換する）
-//! - 来歴（REQ-40）: 未実装
+//! - 来歴（REQ-40）: レコード型・各項目の検証（[`provenance`]・
+//!   TASK-40.1-1）に加え、取り込み時の JSON 検証・記録 JSON 生成・
+//!   データ検査との接続（[`provenance::ingest`]・[`ingest`]・
+//!   TASK-40.1-2・issue #75）を実装済み。指示文本文からの sha256 計算
+//!   （`sha2` の data 層配置はユーザー承認待ち。計算済みハッシュの取り込みの
+//!   みサポート）・`source`（生成元）フィールド・外部 LLM 出力の既定拒否
+//!   （TASK-40.2）・CLI `inspect` 工程への配線（TASK-33.x）は未実装
 //!
 //! # 層の境界
 //!
@@ -40,11 +57,13 @@
 //! 足す想定であり、[`inspect`] 自体を `fandhe-edge-core` に依存させる変更は
 //! 別 issue の範囲とする。[`split`] は `id`・`group_id`・ラベルだけを要求する
 //! 独立したトレイト（[`split::Groupable`]）で結合を最小化しており、同様に
-//! `fandhe-edge-core` には依存しない。一方 [`split_record`]（issue #45）は
+//! `fandhe-edge-core` には依存しない。[`leak`] も同様に独立したトレイト
+//! （[`leak::LeakCheckable`]）で結合を最小化しており、学習ワーカー・
+//! 評価器・操作アダプターから呼ばれる想定。一方 [`split_record`]（issue #45）は
 //! 分割記録のハッシュ計算に `fandhe-edge-core::canonical::canonical_sha256_hex`
 //! （sha2 を内包）を使うため、workspace 内のパス依存として `fandhe-edge-core`
 //! に依存する（dependency-policy.md「承認済みの依存（Rust）」2026-09-28 承認。
-//! `inspect`・`split` は引き続き `fandhe-edge-core` に依存しない）。
+//! `inspect`・`split`・`leak` は引き続き `fandhe-edge-core` に依存しない）。
 //!
 //! # 出典
 //!
@@ -68,8 +87,12 @@
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
 
 pub mod eval_input;
+pub mod ingest;
 pub mod inspect;
 mod json_keys;
+pub mod leak;
+pub mod preprocess_boundary;
+pub mod provenance;
 pub mod report;
 pub mod split;
 pub mod split_record;

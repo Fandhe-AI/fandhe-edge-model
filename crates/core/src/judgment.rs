@@ -1,0 +1,1128 @@
+//! ok 終了時の判定結果型（REQ-21 正常系・TASK-21.1-2）。
+//!
+//! CLI の `infer` 工程（TASK-33.1。現状は未配線）が単一選択の判定に成功した
+//! ときに stdout へ書く JSON 1 行の中身を表す。終了コード（`exitcode`
+//! モジュール）とは別モジュールに分けているのは、終了コード自体は 7 種の
+//! 状態を表す薄い型であるのに対し、判定結果は「どの選択肢が選ばれ、各選択
+//! 肢のスコアは何か」という値を持つ型で、検証すべき不変条件（選択肢数・
+//! 選択肢 ID の長さと合計長の上限・選択肢 ID の実在性・スコアの件数と範
+//! 囲と合計・`predicted_choice_id` が最高スコアの選択肢と厳密に一致する
+//! こと）が exitcode モジュールとは別だからである（PR #202 レビュー指摘
+//! で選択肢数の上限・合計・argmax 一致の検証を追加し、その後のレビュー
+//! 指摘で argmax 比較の許容差を除去し、選択肢 ID 長・合計長の上限検証を
+//! 追加。さらに後続のレビュー指摘（P1）で `JudgmentError::exit_code()` の
+//! 定義ファイル由来の不正〔`EmptyOptions`・`EmptyChoiceId`・
+//! `DuplicateChoiceId`〕を `RuntimeError` から `InvalidInput` へ修正した）。
+//!
+//! # 呼び出し文脈
+//!
+//! - 呼び出し元（想定・TASK-33.1 で配線）: CLI の `infer` サブコマンド。
+//!   [`crate::definition::Definition::options`] と、推論ランタイム
+//!   （TASK-30.x/31.x。未実装）が返す確率の列から [`JudgmentResult::new`] を
+//!   呼んで組み立てる
+//! - 呼び出し先（想定）: `fandhe-edge-cli` の出力関数
+//!   （`crates/cli/src/output.rs`）が [`JudgmentResult::to_json_line`] を
+//!   stdout へ書き、`ExitCode::Ok` を返す
+//!
+//! # スキーマ（本 TASK で確定。呼び出し側で変更しない）
+//!
+//! ```json
+//! {"id":"<入力の識別子>","status":"ok","predicted_label":"<Choice.id>","scores":{"<Choice.id>":<f64>,...}}
+//! ```
+//!
+//! - 基準は PoC-16 `PredictionRow`（`{id, status, predicted_label, scores}`）。
+//!   REQ-21 の受け入れ基準が「PoC-16 実測相当」のため、PoC-16 のキー名を維持する
+//! - `predicted_label` は定義ファイルの `Choice.id`（不変 ID）。`display_name` は
+//!   入れない
+//! - `scores` のキー順は定義ファイルの `options` の宣言順で固定する（PoC-9
+//!   追補 A-10 の majority タイブレークの根拠と同じ理由。`definition.rs` の
+//!   `Definition` ドキュメント参照）。`serde_json::Map`／`HashMap` はキー順を
+//!   保持しない（`preserve_order` 無しではソートされる）ため使わず、
+//!   `Vec<(String, f64)>` を保持して独自の `Serialize` で宣言順に書き出す
+//! - `id` には入力本文を入れない（security.md「データ本文を出力しない」）。
+//!   長さの上限は [`MAX_INPUT_ID_BYTES`]（暫定値）
+//! - 選択肢数の上限は [`MAX_OPTIONS`]（暫定値。REQ-39 資源の上限）
+//! - `scores` は確率の列として扱う。各値は `[0.0, 1.0]`・合計はおよそ 1.0
+//!   （許容差 [`SCORE_SUM_TOLERANCE`]。`1e-6`）であることを要求し、
+//!   `predicted_choice_id` は最高スコアの選択肢（タイブレークは宣言順）と
+//!   一致することを要求する
+//!
+//! `JudgmentStatus` の variant は現状 `Ok` のみ。保留・対象外
+//! （REQ-22。`abstain`／`out_of_scope` 等）は後続 TASK で追加する。
+//!
+//! # 検証（fail-closed）
+//!
+//! [`JudgmentResult`] は `Deserialize` を実装しない。フィールドは非公開に
+//! し、検証を通る唯一の構築経路は [`JudgmentResult::new`] のみとする
+//! （`definition.rs` の `Definition`／`RawDefinition` の関係に倣う。ガード
+//! 層の迂回を防ぐ。security.md）。
+
+use crate::definition::Choice;
+use crate::exitcode::ExitCode;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
+use std::collections::HashSet;
+use std::fmt;
+
+/// `id` フィールドのバイト長上限（暫定値。REQ-39 の資源上限が正式に決まり
+/// 次第、値を見直す）。
+pub const MAX_INPUT_ID_BYTES: usize = 1024;
+
+/// 選択肢数の上限（暫定値。REQ-39 の資源上限が正式に決まり次第、値を見直
+/// す。`docs/spec` は本環境で未解決のため、確定した REQ-39 の数値を引用せ
+/// ず暫定的な安全側の値を置く。ガード層の資源上限〔security.md「ガード層:
+/// 資源の上限」〕が課すのと同じ理由で、[`JudgmentResult::new`] が
+/// `Vec::with_capacity(options.len())` を 2 回アロケーションする前に検証
+/// し、二乗時間のアロケーション・検査を未検証の件数に対して行わない）。
+pub const MAX_OPTIONS: usize = 1024;
+
+/// 選択肢 ID 1 件あたりのバイト長上限（暫定値。REQ-39 資源の上限が正式に
+/// 決まり次第、値を見直す）。`Choice.id` は公開 `String` で
+/// `Definition::parse` も長さを制限しないため（PR #202 レビュー指摘・P0）、
+/// [`JudgmentResult::new`] が `pairs`／JSON `scores` へ複製する前にここで
+/// 長さを検証する。
+pub const MAX_CHOICE_ID_BYTES: usize = 256;
+
+/// 選択肢 ID 全体（`pairs`／JSON `scores` へ複製する対象）の合計バイト長
+/// 上限（暫定値。REQ-39 資源の上限）。`MAX_OPTIONS`・[`MAX_CHOICE_ID_BYTES`]
+/// のいずれか一方だけでも出力全体のサイズは間接的に上限がかかるが、将来
+/// どちらかの定数だけを緩めても出力サイズが際限なく増えないよう、合計値
+/// を独立した定数として明示的に検証する（PR #202 レビュー指摘・P0）。
+pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
+
+/// 確率の列として扱うスコア合計が `1.0` から外れてよい許容差。
+///
+/// `1e-6` は `crates/data/src/eval_input.rs` の `SCORE_SUM_TOLERANCE`
+/// （PoC-9 addendum A-4 が定めた値）と同じ値・同じ理由で揃えている。
+/// [`crate::judgment`] の `scores` は推論ランタイム（TASK-30.x/31.x。未実
+/// 装）が計算する確率の列で、float32 の ONNX 出力を f64 へ拡張した値が
+/// 典型的な入力になる想定である。float32 の softmax 出力を単純合計すると
+/// `1.0` から `1e-7`〜`1e-6` 程度ずれることは珍しくないため（`.claude/rules/coding-rust.md`
+/// が既定値として挙げる `1e-9` をそのまま使うと、この程度の float32 起因
+/// の丸め誤差だけで正常な確率列が `ScoreSumNotOne` として拒否され、
+/// `RuntimeError`（70）になってしまう。以前の実装は `1e-9` を採用してい
+/// たが、これは PR #202 レビュー指摘（Cursor Bugbot・Medium）で見つかった
+/// 誤りである）。[coding-rust](../../../.claude/rules/coding-rust.md) の
+/// `1e-9` は同一 seed・同一依存版での **予測ラベルの再現性比較**
+/// （[evaluation-contract](../../../.claude/rules/evaluation-contract.md)
+/// 「決定性」）に使う値で、本定数が検査する「float32 起源の確率列という
+/// 外部入力の妥当性」とは目的が異なるため、混同して両者を同じ値に揃えな
+/// い（`eval_input.rs` の `SCORE_SUM_TOLERANCE` のドキュメントコメントと
+/// 同じ区別）。
+///
+/// `crates/data/src/eval_input.rs` の同名定数と値が重複しているが、
+/// `fandhe-edge-data` は `fandhe-edge-core` に依存しない設計
+/// （`crates/data/src/lib.rs`「層の境界」参照。issue #38 時点で共通コアの
+/// 定義ファイルスキーマが未実装だったための意図的な分離であり、本 PR の
+/// スコープで crate 間依存を新設しない）であるため、値を 1 箇所の定数へ
+/// 集約する代わりに共有 fixture
+/// `fixtures/score_tolerance/score_sum_tolerance.json` を単一真実源とし、
+/// 両 crate のテスト（本 crate の `tests/score_sum_tolerance_fixture.rs`・
+/// `fandhe-edge-data` の `tests/score_sum_tolerance_fixture.rs`）が同じ
+/// fixture を読み込んで自身の定数と照合する（`fixtures/exitcode/exit_codes.json`
+/// による終了コードの Rust／学習ワーカー間照合〔#179〕と同じパターン）。
+/// 片方だけを変更すると fixture との不一致でテストが失敗するため、値の
+/// 乖離は機械的に検出される（PR #202 レビュー指摘・P1 対応）。
+pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
+
+/// 判定結果の状態。現状は `Ok`（正常終了）のみを持つ（REQ-21 正常系）。
+///
+/// `#[non_exhaustive]` にはしない。CLI 側で全 variant を網羅した `match` を
+/// 書けるようにし、REQ-22 で variant を追加する際にコンパイルエラーで
+/// 気付けるようにするため（`exitcode::ExitCode` と同じ設計）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentStatus {
+    /// 単一選択の判定に成功した（REQ-21 正常系。終了コード `ok` に対応）。
+    Ok,
+}
+
+/// [`JudgmentResult::new`] が拒否する入力の種類。
+///
+/// 値そのものではなく種別と選択肢 ID のみを保持する（security.md「秘密情
+/// 報の混入防止」: 入力本文・学習/評価データをエラー文へ漏らさない）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum JudgmentError {
+    /// 定義ファイルの選択肢一覧が空。
+    EmptyOptions,
+    /// 選択肢数が [`MAX_OPTIONS`] を超える（REQ-39 資源の上限）。
+    TooManyOptions { len: usize, limit: usize },
+    /// 選択肢 ID が空文字列。
+    EmptyChoiceId,
+    /// 選択肢 ID が [`MAX_CHOICE_ID_BYTES`] を超える（REQ-39 資源の上限）。
+    /// 入力本文と異なり ID 自体は識別子のため値を含めてよいが、上限超過
+    /// の値は巨大になりうるためエラーには含めない（長さのみを保持する）。
+    ChoiceIdTooLong { len: usize, limit: usize },
+    /// 選択肢 ID の合計バイト長が [`MAX_TOTAL_CHOICE_ID_BYTES`] を超える
+    /// （REQ-39 資源の上限）。
+    TotalChoiceIdBytesExceeded { len: usize, limit: usize },
+    /// 選択肢 ID が重複している。
+    DuplicateChoiceId { id: String },
+    /// スコアの件数が選択肢の件数と一致しない。
+    ScoreCountMismatch { expected: usize, actual: usize },
+    /// スコアが非有限（NaN・±inf）。serde_json は NaN を `null` として書く
+    /// ため、「スコアを含む」という契約が黙って壊れるのを防ぐ。
+    NonFiniteScore { choice_id: String },
+    /// スコアが確率として扱える範囲 `[0.0, 1.0]` の外。
+    ScoreOutOfRange { choice_id: String },
+    /// スコアの合計が 1.0 から許容差（[`SCORE_SUM_TOLERANCE`]）を超えて
+    /// ずれている（API 契約「確率の列」を満たさない）。
+    ScoreSumNotOne { sum: f64 },
+    /// `predicted_choice_id` が [`MAX_CHOICE_ID_BYTES`] を超える（REQ-39
+    /// 資源の上限）。未知の ID（`seen_ids` に存在しない）の場合、
+    /// [`JudgmentError::UnknownPredictedChoice`] へ複製する前にここで拒否
+    /// する。極端に長い値をそのまま複製・エラー文へ含めると、追加のメモ
+    /// リ確保と巨大なエラー出力が発生するため（PR #202 レビュー指摘・
+    /// P0）、`ChoiceIdTooLong` と同様に長さのみを保持し値自体は含めない。
+    PredictedChoiceIdTooLong { len: usize, limit: usize },
+    /// `predicted_choice_id` が選択肢一覧に存在しない。
+    UnknownPredictedChoice { id: String },
+    /// `predicted_choice_id` は選択肢一覧に存在するが、最高スコアの選択肢
+    /// （タイブレークは定義ファイルの `options` 宣言順。`definition.rs`
+    /// 「下限基準（majority）のタイブレークはラベル定義の宣言順」と同じ
+    /// 規則）と一致しない。
+    PredictedChoiceNotArgmax { predicted: String, expected: String },
+    /// 入力の識別子（`id`）が空文字列。
+    EmptyInputId,
+    /// 入力の識別子が [`MAX_INPUT_ID_BYTES`] を超える。
+    InputIdTooLong { len: usize, limit: usize },
+    /// JSON への直列化に失敗した（`serde_json` 側のエラー）。
+    Serialize(String),
+}
+
+impl fmt::Display for JudgmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JudgmentError::EmptyOptions => write!(f, "options must not be empty"),
+            JudgmentError::TooManyOptions { len, limit } => {
+                write!(f, "too many options: {len} (limit: {limit})")
+            }
+            JudgmentError::EmptyChoiceId => write!(f, "choice id must not be empty"),
+            JudgmentError::ChoiceIdTooLong { len, limit } => {
+                write!(f, "choice id too long: {len} bytes (limit: {limit})")
+            }
+            JudgmentError::TotalChoiceIdBytesExceeded { len, limit } => {
+                write!(
+                    f,
+                    "total choice id bytes too large: {len} bytes (limit: {limit})"
+                )
+            }
+            JudgmentError::DuplicateChoiceId { id } => {
+                write!(f, "duplicate choice id: {id}")
+            }
+            JudgmentError::ScoreCountMismatch { expected, actual } => {
+                write!(f, "score count mismatch: expected {expected}, got {actual}")
+            }
+            JudgmentError::NonFiniteScore { choice_id } => {
+                write!(f, "non-finite score for choice id: {choice_id}")
+            }
+            JudgmentError::ScoreOutOfRange { choice_id } => {
+                write!(
+                    f,
+                    "score out of range [0.0, 1.0] for choice id: {choice_id}"
+                )
+            }
+            JudgmentError::ScoreSumNotOne { sum } => {
+                write!(f, "score sum must be 1.0 (within tolerance), got {sum}")
+            }
+            JudgmentError::PredictedChoiceIdTooLong { len, limit } => {
+                write!(
+                    f,
+                    "predicted choice id too long: {len} bytes (limit: {limit})"
+                )
+            }
+            JudgmentError::UnknownPredictedChoice { id } => {
+                write!(f, "unknown predicted choice id: {id}")
+            }
+            JudgmentError::PredictedChoiceNotArgmax {
+                predicted,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "predicted choice id {predicted} does not match the highest-scoring choice {expected}"
+                )
+            }
+            JudgmentError::EmptyInputId => write!(f, "input id must not be empty"),
+            JudgmentError::InputIdTooLong { len, limit } => {
+                write!(f, "input id too long: {len} bytes (limit: {limit})")
+            }
+            JudgmentError::Serialize(message) => {
+                write!(f, "failed to serialize judgment result: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JudgmentError {}
+
+impl JudgmentError {
+    /// REQ-21 の終了コードへの写像。3 分類に従う（PR #202 レビュー指摘・
+    /// P1。旧実装は定義ファイル由来の不正〔`EmptyOptions`・
+    /// `EmptyChoiceId`・`DuplicateChoiceId`〕を `RuntimeError` に誤分類し
+    /// ていた）。
+    ///
+    /// 1. 利用者が直せる外部入力（定義ファイル・入力 ID）の不正 →
+    ///    `InvalidInput`（64）。[`crate::definition::DefinitionError::exit_code`]
+    ///    が `EmptyOptions`・`EmptyOptionId`・`DuplicateOptionId` を
+    ///    `InvalidInput` にしている前例に揃える
+    /// 2. REQ-39 資源の上限超過 → `LimitExceeded`（20）
+    /// 3. 推論ランタイムの出力と定義の不整合・内部エラー →
+    ///    `RuntimeError`（70）
+    ///
+    /// `#[non_exhaustive]` な enum だが、定義している本 crate 内では網羅的
+    /// な `match` を書ける。ワイルドカード `_ =>` は使わない
+    /// （`exitcode.rs` が PoC-16 の `_ => "unknown"` を排除した方針に揃え
+    /// る）。新しい variant を追加すると、この `match` がコンパイルエラー
+    /// になり分類漏れに気付ける。
+    #[must_use]
+    pub const fn exit_code(&self) -> ExitCode {
+        match self {
+            // 1. 利用者が直せる外部入力の不正。
+            JudgmentError::EmptyOptions
+            | JudgmentError::EmptyChoiceId
+            | JudgmentError::DuplicateChoiceId { .. }
+            | JudgmentError::EmptyInputId
+            | JudgmentError::InputIdTooLong { .. } => ExitCode::InvalidInput,
+            // 2. REQ-39 資源の上限超過。
+            JudgmentError::TooManyOptions { .. }
+            | JudgmentError::ChoiceIdTooLong { .. }
+            | JudgmentError::TotalChoiceIdBytesExceeded { .. }
+            | JudgmentError::PredictedChoiceIdTooLong { .. } => ExitCode::LimitExceeded,
+            // 3. 推論ランタイムの出力と定義の不整合・内部エラー。
+            JudgmentError::ScoreCountMismatch { .. }
+            | JudgmentError::NonFiniteScore { .. }
+            | JudgmentError::ScoreOutOfRange { .. }
+            | JudgmentError::ScoreSumNotOne { .. }
+            | JudgmentError::UnknownPredictedChoice { .. }
+            | JudgmentError::PredictedChoiceNotArgmax { .. }
+            | JudgmentError::Serialize(_) => ExitCode::RuntimeError,
+        }
+    }
+}
+
+/// ok 終了時の判定結果（選択肢 ID・スコア。REQ-21 正常系）。
+///
+/// フィールドは非公開。検証済みの値を作る経路は [`JudgmentResult::new`] に
+/// 限定する（モジュール冒頭のドキュメント参照）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgmentResult {
+    id: String,
+    predicted_choice_id: String,
+    /// 定義ファイルの `options` 宣言順を保った (選択肢 ID, スコア) の列。
+    scores: Vec<(String, f64)>,
+}
+
+impl JudgmentResult {
+    /// 定義ファイルの選択肢一覧・入力の識別子・推論ランタイムが返した確率
+    /// の列（`options` と同じ宣言順）から [`JudgmentResult`] を組み立てる。
+    ///
+    /// `options` の各フィールドは `pub`（`Choice`）のため、呼び出し側が任
+    /// 意のスライスを渡してくる前提ですべて再検証する（添字アクセスは使
+    /// わず `iter().zip()`／`get()` で処理する。coding-rust.md「外部入力の
+    /// 経路」）。
+    ///
+    /// # Errors
+    /// [`JudgmentError`] の各 variant を参照。
+    pub fn new(
+        options: &[Choice],
+        id: &str,
+        predicted_choice_id: &str,
+        scores: &[f64],
+    ) -> Result<Self, JudgmentError> {
+        if options.is_empty() {
+            return Err(JudgmentError::EmptyOptions);
+        }
+        // 資源の上限（REQ-39）: `Vec::with_capacity(options.len())` を伴う
+        // アロケーション・以降の重複検査の前に選択肢数を検証する
+        // （PR #202 レビュー指摘。上限検証を後回しにすると、上限超過の入
+        // 力に対しても検証前にメモリを確保してしまう）。
+        if options.len() > MAX_OPTIONS {
+            return Err(JudgmentError::TooManyOptions {
+                len: options.len(),
+                limit: MAX_OPTIONS,
+            });
+        }
+        if scores.len() != options.len() {
+            return Err(JudgmentError::ScoreCountMismatch {
+                expected: options.len(),
+                actual: scores.len(),
+            });
+        }
+
+        // `id.to_string()` によるアロケーションより前に、借用した `&str`
+        // のまま空・上限超過を検証する（PR #202 レビュー指摘・P0。旧実装
+        // は `impl Into<String>` を受けて検証前に `.into()` していたため、
+        // 上限超過の巨大な外部入力に対しても検証前にメモリを確保してい
+        // た。coding-rust.md「サイズ・件数を上限検証してからアロケーショ
+        // ンに使う」）。
+        if id.is_empty() {
+            return Err(JudgmentError::EmptyInputId);
+        }
+        if id.len() > MAX_INPUT_ID_BYTES {
+            return Err(JudgmentError::InputIdTooLong {
+                len: id.len(),
+                limit: MAX_INPUT_ID_BYTES,
+            });
+        }
+        let id = id.to_string();
+
+        // 選択肢 ID の重複検査は `HashSet::insert` による線形時間（`O(n)`）
+        // で行う。呼び出し側が渡す `options` は未検証の外部入力（定義ファ
+        // イル由来）であり、`Vec::contains` の線形探索を選択肢ごとに繰り
+        // 返すと選択肢数に対して二乗時間になる（PR #202 レビュー指摘。
+        // security.md「ガード層: 資源の上限」）。
+        let mut seen_ids: HashSet<&str> = HashSet::with_capacity(options.len());
+        let mut pairs: Vec<(String, f64)> = Vec::with_capacity(options.len());
+        // 最高スコアの選択肢（タイブレークは宣言順。`definition.rs` の
+        // majority タイブレークと同じ規則）を、スコアの妥当性検査と同じ
+        // 1 パスで追跡する。
+        let mut best: Option<(&str, f64)> = None;
+        let mut sum = 0.0_f64;
+        // 選択肢 ID の合計バイト長（REQ-39 資源の上限。`pairs`／JSON
+        // `scores` へ複製する前に検証する。PR #202 レビュー指摘・P0）。
+        let mut total_choice_id_bytes: usize = 0;
+        for (choice, score) in options.iter().zip(scores.iter()) {
+            if choice.id.is_empty() {
+                return Err(JudgmentError::EmptyChoiceId);
+            }
+            // 個々の選択肢 ID の長さ・合計長は、`seen_ids`／`pairs` へ複製
+            // する（アロケーションを伴う）前に検証する（coding-rust.md
+            // 「サイズ・件数を上限検証してからアロケーションに使う」）。
+            if choice.id.len() > MAX_CHOICE_ID_BYTES {
+                return Err(JudgmentError::ChoiceIdTooLong {
+                    len: choice.id.len(),
+                    limit: MAX_CHOICE_ID_BYTES,
+                });
+            }
+            total_choice_id_bytes += choice.id.len();
+            if total_choice_id_bytes > MAX_TOTAL_CHOICE_ID_BYTES {
+                return Err(JudgmentError::TotalChoiceIdBytesExceeded {
+                    len: total_choice_id_bytes,
+                    limit: MAX_TOTAL_CHOICE_ID_BYTES,
+                });
+            }
+            if !seen_ids.insert(choice.id.as_str()) {
+                return Err(JudgmentError::DuplicateChoiceId {
+                    id: choice.id.clone(),
+                });
+            }
+
+            if !score.is_finite() {
+                return Err(JudgmentError::NonFiniteScore {
+                    choice_id: choice.id.clone(),
+                });
+            }
+            if *score < 0.0 || *score > 1.0 {
+                return Err(JudgmentError::ScoreOutOfRange {
+                    choice_id: choice.id.clone(),
+                });
+            }
+
+            sum += *score;
+            // 宣言順を優先するタイブレーク: 既存の最高スコアを厳密に（許
+            // 容差なしで）上回る場合のみ更新する。許容差を挟むと
+            // `predicted_choice_id` と最高スコアの一致という API 契約が
+            // 破れる（例: 先頭 0.4999999997・次点 0.5000000003 のように
+            // 差が許容差 1e-9 以下でも後者が真の最高値である場合、許容差
+            // 比較では先頭が argmax のまま残ってしまう。PR #202 レビュー
+            // 指摘・P1）。スコアの合計検証（`SCORE_SUM_TOLERANCE`）とは
+            // 目的が異なるため、ここでは許容差を用いない。
+            let is_new_best = match best {
+                None => true,
+                Some((_, best_score)) => *score > best_score,
+            };
+            if is_new_best {
+                best = Some((choice.id.as_str(), *score));
+            }
+
+            pairs.push((choice.id.clone(), *score));
+        }
+
+        // API 契約「確率の列」（モジュール冒頭ドキュメント）を満たすことを
+        // 検証する。個々のスコアが `[0.0, 1.0]` に収まっていても合計が 1
+        // からずれる列（例: `[0.9, 0.9]`）は確率列として扱えない
+        // （PR #202 レビュー指摘）。
+        if (sum - 1.0).abs() > SCORE_SUM_TOLERANCE {
+            return Err(JudgmentError::ScoreSumNotOne { sum });
+        }
+
+        // `predicted_choice_id` は公開 API の入力で、`seen_ids` に実在し
+        // ない未知の値になりうる。未知の場合に下で `to_string()` して
+        // `UnknownPredictedChoice` へ複製する前に長さを検証する（codex
+        // レビュー指摘・P0。REQ-39 資源の上限）。実在する ID は `options`
+        // のループで既に `MAX_CHOICE_ID_BYTES` 以下であることを検証済み
+        // のため、ここでの検証対象は実質的に未知の値のみである。
+        if predicted_choice_id.len() > MAX_CHOICE_ID_BYTES {
+            return Err(JudgmentError::PredictedChoiceIdTooLong {
+                len: predicted_choice_id.len(),
+                limit: MAX_CHOICE_ID_BYTES,
+            });
+        }
+
+        if !seen_ids.contains(predicted_choice_id) {
+            return Err(JudgmentError::UnknownPredictedChoice {
+                id: predicted_choice_id.to_string(),
+            });
+        }
+
+        // `predicted_choice_id` は選択肢一覧に実在するだけでなく、最高ス
+        // コアの選択肢（宣言順タイブレーク）と一致することを検証する
+        // （PR #202 レビュー指摘。矛盾する ID を `status:"ok"` として通さ
+        // ない）。
+        if let Some((expected_id, _)) = best
+            && expected_id != predicted_choice_id
+        {
+            return Err(JudgmentError::PredictedChoiceNotArgmax {
+                predicted: predicted_choice_id.to_string(),
+                expected: expected_id.to_string(),
+            });
+        }
+
+        Ok(Self {
+            id,
+            predicted_choice_id: predicted_choice_id.to_string(),
+            scores: pairs,
+        })
+    }
+
+    /// 入力の識別子。入力本文は含まない（security.md）。
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 判定結果の状態。現状は常に `Ok`（TASK-21.1-2 の対象は正常系のみ）。
+    #[must_use]
+    pub const fn status(&self) -> JudgmentStatus {
+        JudgmentStatus::Ok
+    }
+
+    /// 選ばれた選択肢の ID（`Choice.id`）。
+    #[must_use]
+    pub fn predicted_choice_id(&self) -> &str {
+        &self.predicted_choice_id
+    }
+
+    /// 各選択肢のスコアを、定義ファイルの `options` 宣言順で返す。
+    pub fn scores(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.scores.iter().map(|(id, score)| (id.as_str(), *score))
+    }
+
+    /// 対応する終了コード。判定結果が構築できた時点で常に `ExitCode::Ok`。
+    #[must_use]
+    pub const fn exit_code(&self) -> ExitCode {
+        ExitCode::Ok
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// 呼び出し側（`fandhe-edge-cli` の出力関数）が改行を付けて stdout へ
+    /// 書く想定（本 crate は I/O を行わない。層の境界を保つため）。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーを [`JudgmentError::Serialize`] として返す。
+    pub fn to_json_line(&self) -> Result<String, JudgmentError> {
+        serde_json::to_string(self).map_err(|error| JudgmentError::Serialize(error.to_string()))
+    }
+}
+
+/// スキーマ順（`id` → `status` → `predicted_label` → `scores`）を固定する
+/// ための手書き `Serialize`。`derive` にすると `scores` に `HashMap`／
+/// `serde_json::Map` を使わない限りフィールド順は宣言順になるが、`scores`
+/// 自体のキー順（宣言順）を保つために `Vec<(String, f64)>` を独自の
+/// `serialize_map` で書く必要があるため、`JudgmentResult` 全体も手書きに
+/// 揃えている。
+impl Serialize for JudgmentResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        struct ScoresMap<'a>(&'a [(String, f64)]);
+        impl Serialize for ScoresMap<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mut map = serializer.serialize_map(Some(self.0.len()))?;
+                for (id, score) in self.0 {
+                    map.serialize_entry(id, score)?;
+                }
+                map.end()
+            }
+        }
+
+        let mut state = serializer.serialize_struct("JudgmentResult", 4)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("status", &self.status())?;
+        state.serialize_field("predicted_label", &self.predicted_choice_id)?;
+        state.serialize_field("scores", &ScoresMap(&self.scores))?;
+        state.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::definition::Choice;
+
+    fn choice(id: &str) -> Choice {
+        Choice {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            description: String::new(),
+        }
+    }
+
+    /// REQ-21: 3 選択肢の完全一致（PoC-16 `PredictionRow` 相当のキー名）。
+    #[test]
+    fn req21_ok_judgment_serializes_to_expected_json() {
+        let options = [choice("a"), choice("b"), choice("c")];
+        let result = JudgmentResult::new(&options, "row-1", "a", &[0.7, 0.2, 0.1]).unwrap();
+
+        assert_eq!(result.id(), "row-1");
+        assert_eq!(result.status(), JudgmentStatus::Ok);
+        assert_eq!(result.predicted_choice_id(), "a");
+        assert_eq!(result.exit_code(), ExitCode::Ok);
+
+        let json = result.to_json_line().unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"row-1","status":"ok","predicted_label":"a","scores":{"a":0.7,"b":0.2,"c":0.1}}"#
+        );
+    }
+
+    /// REQ-21: `scores` のキー順は辞書順ではなく `options` の宣言順を保つ。
+    #[test]
+    fn req21_scores_preserve_declaration_order_not_lexical_order() {
+        let options = [choice("z"), choice("a"), choice("m")];
+        let result = JudgmentResult::new(&options, "row-2", "z", &[0.5, 0.3, 0.2]).unwrap();
+
+        let json = result.to_json_line().unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"row-2","status":"ok","predicted_label":"z","scores":{"z":0.5,"a":0.3,"m":0.2}}"#
+        );
+
+        let collected: Vec<(&str, f64)> = result.scores().collect();
+        assert_eq!(collected, vec![("z", 0.5), ("a", 0.3), ("m", 0.2)]);
+    }
+
+    /// REQ-21: `status` の直列化値が `ExitCode::Ok.name()` と一致すること。
+    #[test]
+    fn req21_status_matches_exit_code_name() {
+        let json = serde_json::to_string(&JudgmentStatus::Ok).unwrap();
+        assert_eq!(json, format!("\"{}\"", ExitCode::Ok.name()));
+    }
+
+    /// REQ-21: 空の `options` は拒否する。
+    #[test]
+    fn req21_rejects_empty_options() {
+        let result = JudgmentResult::new(&[], "row", "a", &[]);
+        assert_eq!(result, Err(JudgmentError::EmptyOptions));
+    }
+
+    /// REQ-21: スコアの件数不一致（多い・少ない両方）を拒否する。
+    #[test]
+    fn req21_rejects_score_count_mismatch() {
+        let options = [choice("a"), choice("b"), choice("c")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.5, 0.5]),
+            Err(JudgmentError::ScoreCountMismatch {
+                expected: 3,
+                actual: 2
+            })
+        );
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.5, 0.3, 0.1, 0.1]),
+            Err(JudgmentError::ScoreCountMismatch {
+                expected: 3,
+                actual: 4
+            })
+        );
+    }
+
+    /// REQ-21: NaN・+inf・-inf を個別に拒否する。
+    #[test]
+    fn req21_rejects_non_finite_scores() {
+        let options = [choice("a"), choice("b")];
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                JudgmentResult::new(&options, "row", "a", &[bad, 0.5]),
+                Err(JudgmentError::NonFiniteScore {
+                    choice_id: "a".to_string()
+                })
+            );
+        }
+    }
+
+    /// REQ-21: 範囲外のスコア（負・1 超）を拒否する。
+    #[test]
+    fn req21_rejects_out_of_range_scores() {
+        let options = [choice("a"), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[-0.1, 0.5]),
+            Err(JudgmentError::ScoreOutOfRange {
+                choice_id: "a".to_string()
+            })
+        );
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[1.1, 0.5]),
+            Err(JudgmentError::ScoreOutOfRange {
+                choice_id: "a".to_string()
+            })
+        );
+    }
+
+    /// REQ-21: 未知の `predicted_choice_id` を拒否する。
+    #[test]
+    fn req21_rejects_unknown_predicted_choice() {
+        let options = [choice("a"), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "z", &[0.5, 0.5]),
+            Err(JudgmentError::UnknownPredictedChoice {
+                id: "z".to_string()
+            })
+        );
+    }
+
+    /// REQ-39: 未知の `predicted_choice_id` が [`MAX_CHOICE_ID_BYTES`] を
+    /// 超える場合、`UnknownPredictedChoice` へ複製する前に長さ超過として
+    /// 拒否する（codex レビュー指摘・P0。エラーは長さのみ保持し値そのも
+    /// のは含めない）。
+    #[test]
+    fn req39_rejects_predicted_choice_id_exceeding_length_limit() {
+        let options = [choice("a"), choice("b")];
+        let over_limit = "z".repeat(MAX_CHOICE_ID_BYTES + 1);
+        assert_eq!(
+            JudgmentResult::new(&options, "row", &over_limit, &[0.5, 0.5]),
+            Err(JudgmentError::PredictedChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES,
+            })
+        );
+    }
+
+    /// REQ-21: 選択肢 ID の重複を拒否する。
+    #[test]
+    fn req21_rejects_duplicate_choice_id() {
+        let options = [choice("a"), choice("a")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.5, 0.5]),
+            Err(JudgmentError::DuplicateChoiceId {
+                id: "a".to_string()
+            })
+        );
+    }
+
+    /// REQ-21: 選択肢 ID の空文字列を拒否する。
+    #[test]
+    fn req21_rejects_empty_choice_id() {
+        let options = [choice(""), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "b", &[0.5, 0.5]),
+            Err(JudgmentError::EmptyChoiceId)
+        );
+    }
+
+    /// REQ-21: 空の入力 ID を拒否する。
+    #[test]
+    fn req21_rejects_empty_input_id() {
+        let options = [choice("a")];
+        assert_eq!(
+            JudgmentResult::new(&options, "", "a", &[0.5]),
+            Err(JudgmentError::EmptyInputId)
+        );
+    }
+
+    /// REQ-21: 入力 ID の長さ境界値（1024 バイトは受理、1025 バイトは拒否）。
+    #[test]
+    fn req21_input_id_length_boundary() {
+        let options = [choice("a")];
+        let at_limit = "x".repeat(MAX_INPUT_ID_BYTES);
+        assert!(JudgmentResult::new(&options, &at_limit, "a", &[1.0]).is_ok());
+
+        let over_limit = "x".repeat(MAX_INPUT_ID_BYTES + 1);
+        assert_eq!(
+            JudgmentResult::new(&options, &over_limit, "a", &[1.0]),
+            Err(JudgmentError::InputIdTooLong {
+                len: MAX_INPUT_ID_BYTES + 1,
+                limit: MAX_INPUT_ID_BYTES
+            })
+        );
+    }
+
+    /// REQ-21: `id` に二重引用符・改行・制御文字を含む場合でも、
+    /// `serde_json` のエスケープにより JSON 1 行（改行 1 つのみ）という
+    /// 出力契約が保たれること（Review 指摘: id の値に依らず契約を守る）。
+    #[test]
+    fn req21_escapes_id_with_quotes_newlines_and_control_chars() {
+        let options = [choice("a")];
+        let raw_id = "row\"with\nquote\tand\u{0007}control";
+        let result = JudgmentResult::new(&options, raw_id, "a", &[1.0]).unwrap();
+
+        assert_eq!(result.id(), raw_id);
+
+        let json = result.to_json_line().unwrap();
+        // 出力全体が 1 行（改行を含まない）であること。
+        assert_eq!(
+            json.matches('\n').count(),
+            0,
+            "must not contain raw newline"
+        );
+        assert_eq!(
+            json,
+            r#"{"id":"row\"with\nquote\tand\u0007control","status":"ok","predicted_label":"a","scores":{"a":1.0}}"#
+        );
+
+        // 直列化した JSON をパースし戻すと元の `id` と一致すること
+        // （エスケープが可逆であることの確認）。
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], raw_id);
+    }
+
+    /// REQ-21・REQ-39: `exit_code()` の 3 分類写像（定義・入力 ID の不正
+    /// → 64、資源の上限超過 → 20、推論出力の不整合・内部エラー → 70）。
+    /// PR #202 レビュー指摘（P1）: `EmptyOptions`・`EmptyChoiceId`・
+    /// `DuplicateChoiceId` は定義ファイル由来の不正のため `InvalidInput`
+    /// に分類する（旧実装は `RuntimeError` に誤分類していた）。
+    #[test]
+    fn req21_error_exit_code_mapping() {
+        // 1. 利用者が直せる外部入力（定義ファイル・入力 ID）の不正 → 64。
+        assert_eq!(
+            JudgmentError::EmptyOptions.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(ExitCode::InvalidInput.code(), 64);
+        assert_eq!(
+            JudgmentError::EmptyChoiceId.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(
+            JudgmentError::DuplicateChoiceId {
+                id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(
+            JudgmentError::EmptyInputId.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(
+            JudgmentError::InputIdTooLong {
+                len: 2000,
+                limit: MAX_INPUT_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::InvalidInput
+        );
+
+        // 2. REQ-39 資源の上限超過 → 20。
+        assert_eq!(
+            JudgmentError::TooManyOptions {
+                len: MAX_OPTIONS + 1,
+                limit: MAX_OPTIONS
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+        assert_eq!(ExitCode::LimitExceeded.code(), 20);
+        assert_eq!(
+            JudgmentError::ChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+        assert_eq!(
+            JudgmentError::TotalChoiceIdBytesExceeded {
+                len: MAX_TOTAL_CHOICE_ID_BYTES + 1,
+                limit: MAX_TOTAL_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+        assert_eq!(
+            JudgmentError::PredictedChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+
+        // 3. 推論ランタイムの出力と定義の不整合・内部エラー → 70。
+        assert_eq!(
+            JudgmentError::ScoreCountMismatch {
+                expected: 1,
+                actual: 2
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(ExitCode::RuntimeError.code(), 70);
+        assert_eq!(
+            JudgmentError::NonFiniteScore {
+                choice_id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::ScoreOutOfRange {
+                choice_id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::ScoreSumNotOne { sum: 0.5 }.exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::UnknownPredictedChoice {
+                id: "z".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "b".to_string(),
+                expected: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::Serialize("boom".to_string()).exit_code(),
+            ExitCode::RuntimeError
+        );
+    }
+
+    /// REQ-39・PR #202 レビュー指摘（P0）: 選択肢数が [`MAX_OPTIONS`] を
+    /// 超える場合は重複検査に入る前に拒否する。
+    #[test]
+    fn req39_rejects_options_exceeding_max_options() {
+        let options: Vec<Choice> = (0..=MAX_OPTIONS)
+            .map(|i| choice(&format!("choice-{i}")))
+            .collect();
+        let scores = vec![0.0_f64; options.len()];
+
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "choice-0", &scores),
+            Err(JudgmentError::TooManyOptions {
+                len: MAX_OPTIONS + 1,
+                limit: MAX_OPTIONS
+            })
+        );
+    }
+
+    /// PR #202 レビュー指摘（P0）: 選択肢 ID の重複検査は選択肢数に対して
+    /// 線形時間（`HashSet` ベース）であること。二乗時間だと本テストの
+    /// 件数でも極端に遅くなるため、実行時間そのものを検証する代わりに
+    /// [`MAX_OPTIONS`] 件のユニーク ID が実際に受理される（重複検査で誤検
+    /// 出しない）ことを確認する。
+    #[test]
+    fn req39_accepts_max_options_unique_ids() {
+        let options: Vec<Choice> = (0..MAX_OPTIONS)
+            .map(|i| choice(&format!("choice-{i}")))
+            .collect();
+        let mut scores = vec![0.0_f64; options.len()];
+        scores[0] = 1.0;
+
+        let result = JudgmentResult::new(&options, "row", "choice-0", &scores);
+        assert!(result.is_ok());
+    }
+
+    /// REQ-21・PR #202 レビュー指摘（P1）: 各スコアは `[0.0, 1.0]` に収ま
+    /// るが合計が 1 を超える列（確率列として不正）を拒否する。
+    #[test]
+    fn req21_rejects_score_sum_greater_than_one() {
+        let options = [choice("a"), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.9, 0.9]),
+            Err(JudgmentError::ScoreSumNotOne { sum: 1.8 })
+        );
+    }
+
+    /// REQ-21: スコアの合計が 1 未満の列も拒否する。
+    #[test]
+    fn req21_rejects_score_sum_less_than_one() {
+        let options = [choice("a"), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.3, 0.3]),
+            Err(JudgmentError::ScoreSumNotOne { sum: 0.6 })
+        );
+    }
+
+    /// REQ-21: 許容差（[`SCORE_SUM_TOLERANCE`]。1e-6）内の合計は受理する。
+    #[test]
+    fn req21_accepts_score_sum_within_tolerance() {
+        let options = [choice("a"), choice("b"), choice("c")];
+        // 0.1 + 0.2 + 0.7 は浮動小数演算で 1.0 からわずかにずれうるが、
+        // 許容差 1e-6 の範囲内であること。
+        let result = JudgmentResult::new(&options, "row", "c", &[0.1, 0.2, 0.7]);
+        assert!(result.is_ok());
+    }
+
+    /// PR #202 レビュー指摘（Cursor Bugbot・Medium）: float32 の ONNX 推論
+    /// 出力を f64 へ拡張した典型的な合計ずれ（3 択の softmax で `1e-7` 台）
+    /// を許容差内として受理する。旧実装（許容差 `1e-9`）ではこのケースが
+    /// `ScoreSumNotOne` として拒否され、正常な推論結果が `RuntimeError`
+    /// （70）になっていた。
+    #[test]
+    fn req21_accepts_typical_float32_softmax_rounding_error() {
+        let options = [choice("a"), choice("b"), choice("c")];
+        // 3 択の softmax が全選択肢で 1/3 になるケース。float32 では
+        // `1/3` を丸めた同一値を 3 回加算すると `1.0` から
+        // `2.98e-8`（`> 1e-9`・`< 1e-6`）ずれる（本コメント末尾の実測値）。
+        let third = f64::from(1.0_f32 / 3.0_f32);
+        let scores: [f64; 3] = [third, third, third];
+        let sum: f64 = scores.iter().sum();
+        assert!(
+            (sum - 1.0).abs() > 1e-9,
+            "このケースは旧許容差 1e-9 では拒否されることの前提確認（sum={sum}）"
+        );
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "このケースは新許容差 1e-6 では受理されることの前提確認（sum={sum}）"
+        );
+
+        // 3 値が全て等しいタイのため、宣言順の先頭 "a" が argmax になる。
+        let result = JudgmentResult::new(&options, "row", "a", &scores);
+        assert!(
+            result.is_ok(),
+            "float32 起源の丸め誤差は許容差 1e-6 内で受理する: {result:?}"
+        );
+    }
+
+    /// [`SCORE_SUM_TOLERANCE`]（1e-6）の境界値: 合計が `1.0 + 5e-7` は許容
+    /// 差内として受理する。各スコアは `[0.0, 1.0]` に収まる値にし、範囲外
+    /// 検証（`ScoreOutOfRange`）ではなく合計検証（`ScoreSumNotOne`）の境界
+    /// を確認する。
+    #[test]
+    fn req21_accepts_score_sum_just_within_1e_minus_6_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let result = JudgmentResult::new(&options, "row", "a", &[0.600_000_5, 0.4]);
+        assert!(result.is_ok());
+    }
+
+    /// [`SCORE_SUM_TOLERANCE`]（1e-6）の境界値: 合計が `1.0 + 2e-6` は許容
+    /// 差を超えるため拒否する。各スコアは `[0.0, 1.0]` に収まる値にする。
+    #[test]
+    fn req21_rejects_score_sum_beyond_1e_minus_6_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let sum = 0.600_002 + 0.4;
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &[0.600_002, 0.4]),
+            Err(JudgmentError::ScoreSumNotOne { sum })
+        );
+    }
+
+    /// REQ-21・PR #202 レビュー指摘（P1）: 最高スコアと矛盾する
+    /// `predicted_choice_id`（選択肢一覧には存在する）を拒否する。
+    #[test]
+    fn req21_rejects_predicted_choice_not_matching_argmax() {
+        let options = [choice("a"), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "b", &[0.9, 0.1]),
+            Err(JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "b".to_string(),
+                expected: "a".to_string()
+            })
+        );
+    }
+
+    /// REQ-21: 同点（タイ）の場合は宣言順で最初の選択肢が argmax になる。
+    #[test]
+    fn req21_argmax_tie_break_uses_declaration_order() {
+        let options = [choice("a"), choice("b")];
+
+        // 宣言順で先の "a" を予測すれば受理される。
+        assert!(JudgmentResult::new(&options, "row", "a", &[0.5, 0.5]).is_ok());
+
+        // 同点でも宣言順で後の "b" を予測すると拒否される。
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "b", &[0.5, 0.5]),
+            Err(JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "b".to_string(),
+                expected: "a".to_string()
+            })
+        );
+    }
+
+    /// REQ-21・PR #202 レビュー指摘（P1）: argmax の追跡は許容差なしの厳密
+    /// な大小比較で行う。差が 1e-9 未満でも、より高いスコアの選択肢を
+    /// argmax として扱う（先頭 0.4999999997・次点 0.5000000003 のように差
+    /// が 1e-9 未満でも後者が真の最高値であるケース）。
+    #[test]
+    fn req21_argmax_uses_strict_comparison_not_tolerance() {
+        let options = [choice("a"), choice("b")];
+        let scores = [0.499_999_999_7, 0.500_000_000_3];
+
+        // 真の最高スコアである "b" を予測すれば受理される。
+        assert!(JudgmentResult::new(&options, "row", "b", &scores).is_ok());
+
+        // 許容差比較の下では誤って argmax 扱いされていた "a" は拒否される。
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "a", &scores),
+            Err(JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "a".to_string(),
+                expected: "b".to_string()
+            })
+        );
+    }
+
+    /// REQ-39・PR #202 レビュー指摘（P0）: 選択肢 ID の長さ境界値
+    /// （[`MAX_CHOICE_ID_BYTES`] は受理、それを 1 バイト超えると拒否）。
+    #[test]
+    fn req39_choice_id_length_boundary() {
+        let at_limit = "x".repeat(MAX_CHOICE_ID_BYTES);
+        let options = [choice(&at_limit)];
+        assert!(JudgmentResult::new(&options, "row", &at_limit, &[1.0]).is_ok());
+
+        let over_limit = "x".repeat(MAX_CHOICE_ID_BYTES + 1);
+        let options = [choice(&over_limit), choice("b")];
+        assert_eq!(
+            JudgmentResult::new(&options, "row", "b", &[0.0, 1.0]),
+            Err(JudgmentError::ChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            })
+        );
+    }
+
+    /// REQ-39・PR #202 レビュー指摘（P0）: 個々の選択肢 ID は
+    /// [`MAX_CHOICE_ID_BYTES`] 以下でも、選択肢 ID の合計バイト長が
+    /// [`MAX_TOTAL_CHOICE_ID_BYTES`] を超える場合は `pairs`／JSON
+    /// `scores` へ複製する前に拒否する（巨大な定義ファイルからの過大メモ
+    /// リ消費・出力を防ぐ。security.md「ガード層: 資源の上限」）。
+    #[test]
+    fn req39_rejects_total_choice_id_bytes_exceeding_limit() {
+        const ID_LEN: usize = 94;
+        // 94 バイトの ID を 700 件（合計 65,800 バイト）用意する。1 件あ
+        // たりは MAX_CHOICE_ID_BYTES（256）未満、件数も MAX_OPTIONS
+        // （1024）未満のため、それぞれの上限では拒否されない。
+        const COUNT: usize = 700;
+        const { assert!(ID_LEN < MAX_CHOICE_ID_BYTES) };
+        const { assert!(COUNT < MAX_OPTIONS) };
+        const { assert!(ID_LEN * COUNT > MAX_TOTAL_CHOICE_ID_BYTES) };
+
+        let options: Vec<Choice> = (0..COUNT)
+            .map(|i| choice(&format!("{i:0>width$}", width = ID_LEN)))
+            .collect();
+        let scores = vec![0.0_f64; options.len()];
+
+        let result = JudgmentResult::new(&options, "row", &options[0].id, &scores);
+        assert!(matches!(
+            result,
+            Err(JudgmentError::TotalChoiceIdBytesExceeded { limit, .. }) if limit == MAX_TOTAL_CHOICE_ID_BYTES
+        ));
+    }
+}

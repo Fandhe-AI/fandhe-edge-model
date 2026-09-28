@@ -167,11 +167,21 @@ fn known_answer_single_select_matches_hand_calculated_values() {
     );
 
     // Macro-F1 = 49/104（修正前の誤り 49/78 にはならないこと）。
-    let macro_f1 = metrics.macro_f1.expect("all four labels have Some(f1)");
+    let macro_f1 = metrics
+        .macro_f1
+        .value()
+        .expect("all four labels have Some(f1)");
     assert!(approx_eq(macro_f1, 49.0 / 104.0));
     assert!(
         !approx_eq(macro_f1, 49.0 / 78.0),
         "F1 を調和平均で定義したときの誤った値（49/78）を再現していないこと"
+    );
+    // D は precision が None だが f1 が Some(0.0) のため除外されない
+    // （REQ-24 異常系・TASK-24.2: 除外条件は f1 == None のみ）。
+    assert_eq!(
+        metrics.macro_f1.excluded_labels(),
+        &[] as &[String],
+        "全ラベルの f1 が定義できるため excluded_labels は空"
     );
 
     // accuracy.overall = 12/24, adopted_decision = 12/23（分母は abstain を除いた 23）。
@@ -182,6 +192,29 @@ fn known_answer_single_select_matches_hand_calculated_values() {
     assert_eq!(adopted.numerator(), 12);
     assert_eq!(adopted.denominator(), 23);
     assert!(approx_eq(adopted.value(), 12.0 / 23.0));
+
+    // REQ-24 境界値・TASK-24.3: type_meaning_quadrant は
+    // 12/8/2/1/1（type_ok_meaning_ok/type_ok_meaning_ng/type_ng_count/abstain/error）。
+    let quadrant = &metrics.type_meaning_quadrant;
+    assert_eq!(quadrant.type_ok_meaning_ok(), 12);
+    assert_eq!(quadrant.type_ok_meaning_ng(), 8);
+    assert_eq!(quadrant.type_ng_count(), 2);
+    assert_eq!(quadrant.abstain(), 1);
+    assert_eq!(quadrant.error(), 1);
+    assert_eq!(quadrant.total(), Some(24));
+    // 整合性: type_ok_meaning_ok は正解率の分子と一致し、
+    // type_ok_meaning_ok + type_ok_meaning_ng は outcome_counts.ok と一致する。
+    assert_eq!(
+        quadrant.type_ok_meaning_ok(),
+        metrics.accuracy.overall.numerator()
+    );
+    assert_eq!(
+        quadrant.type_ok_meaning_ok() + quadrant.type_ok_meaning_ng(),
+        metrics.outcome_counts.ok
+    );
+    assert_eq!(quadrant.type_ng_count(), metrics.outcome_counts.invalid);
+    assert_eq!(quadrant.abstain(), metrics.outcome_counts.abstain);
+    assert_eq!(quadrant.error(), metrics.outcome_counts.error);
 }
 
 /// REQ-24 正常系・TASK-24.1-1: majority 下限基準（全件 "A" 予測）で
@@ -239,10 +272,29 @@ fn majority_baseline_matches_hand_calculated_values() {
     }
 
     // Macro-F1 = 0.1（修正前の誤り 0.4 を再現しないこと）。
-    let macro_f1 = metrics.macro_f1.expect("all four labels have Some(f1)");
+    let macro_f1 = metrics
+        .macro_f1
+        .value()
+        .expect("all four labels have Some(f1)");
     assert!(approx_eq(macro_f1, 0.1));
     assert!(
         !approx_eq(macro_f1, 0.4),
         "F1 を調和平均で定義したときの誤った値（0.4）を再現していないこと"
     );
+    // B・C・D は precision が None だが f1 が Some(0.0) のため除外されない。
+    assert_eq!(
+        metrics.macro_f1.excluded_labels(),
+        &[] as &[String],
+        "全ラベルの f1 が定義できるため excluded_labels は空"
+    );
+
+    // REQ-24 境界値・TASK-24.3: type_meaning_quadrant は
+    // 6/18/0/0/0（全件 outcome=ok。invalid・abstain・error は無し）。
+    let quadrant = &metrics.type_meaning_quadrant;
+    assert_eq!(quadrant.type_ok_meaning_ok(), 6);
+    assert_eq!(quadrant.type_ok_meaning_ng(), 18);
+    assert_eq!(quadrant.type_ng_count(), 0);
+    assert_eq!(quadrant.abstain(), 0);
+    assert_eq!(quadrant.error(), 0);
+    assert_eq!(quadrant.total(), Some(24));
 }

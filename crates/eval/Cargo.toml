@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Evaluator layer (accuracy, per-label metrics, macro-F1, confusion matrix) for fandhe-edge-model."
+description = "Evaluator layer (accuracy, per-label metrics, macro-F1, confusion matrix, Wilson 95% CI, type/meaning quadrant) for fandhe-edge-model."
 
 [dependencies]
 
