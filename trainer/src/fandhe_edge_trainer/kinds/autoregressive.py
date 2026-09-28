@@ -145,6 +145,7 @@ from ..limits import (
     MAX_AR_INFER_BATCH_N,
     MAX_AR_LAYERS,
     MAX_AR_LR,
+    MAX_AR_PREDICT_ROWS,
     MAX_AR_WARMUP_STEPS,
     MAX_AR_WEIGHT_DECAY,
 )
@@ -693,7 +694,11 @@ def predict_records(
     `MAX_AR_BATCH_SIZE`）ごとに `_score_choices_mlx` を呼び、チャンクの合間
     で `resource_budget.check()` を呼ぶ（REQ-39。`_score_choices_mlx` は
     `[N*K, L]` と attention の `[N*K, heads, L, L]` を確保するため、`N` を
-    無制限にしない）。
+    無制限にしない）。`chunk_size` はこのチャンクあたりの計算量しか制限
+    しないため、`rows` の件数自体は `MAX_AR_PREDICT_ROWS` を超えないことを
+    一括リスト化・予測レコードの蓄積を始める前に検査する（`limit_exceeded`・
+    exit 20。Codex レビュー指摘 P0・PR #234。security.md「ガード層: 資源の
+    上限」）。
 
     `id` の重複は検査しない（重複の検査はデータ契約層
     `crates/data::eval_input` の責務であり、ここで評価ロジックを再実装
@@ -704,6 +709,18 @@ def predict_records(
     chunk_size = max(1, min(int(chunk_size), MAX_AR_BATCH_SIZE))
 
     choice_id_list = [trained.choice_ids_by_label[label] for label in trained.label_order]
+
+    # `rows` は型上は `Sequence`（呼び出し元が既に全件を保持している前提）
+    # だが、ここで無制限にリスト化・レコード蓄積をしないよう、件数を
+    # 蓄積前に検査する（`chunk_size` は 1 チャンクの計算量しか制限しない。
+    # MAX_AR_PREDICT_ROWS docstring 参照）。
+    n_rows = len(rows)
+    if n_rows > MAX_AR_PREDICT_ROWS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"prediction rows {n_rows} exceeds limit {MAX_AR_PREDICT_ROWS}",
+            ExitCode.LIMIT_EXCEEDED,
+        )
 
     rows = list(rows)
     records: list[dict[str, Any]] = []

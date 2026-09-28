@@ -363,6 +363,33 @@ def test_req39_predict_records_checks_budget_between_chunks(
     assert calls["n"] == expected_chunks
 
 
+def test_req39_predict_records_rejects_rows_over_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`rows` の件数が `MAX_AR_PREDICT_ROWS` を超える場合、一括リスト化・
+    予測レコードの蓄積を始める前に `limit_exceeded`・exit 20 で拒否する
+    （REQ-39。`chunk_size` はチャンクあたりの計算量しか制限しないため、
+    件数自体の上限は別に必要という Codex レビュー指摘への回帰テスト。
+    PR #234）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    monkeypatch.setattr(ar_module, "MAX_AR_PREDICT_ROWS", 2)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+    assert len(rows) > 2
+
+    with pytest.raises(WorkerError) as exc_info:
+        predict_records(trained, rows)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
 def test_req19b_predict_records_empty_input(tmp_path: Path) -> None:
     """空文字列の入力（`encode_bytes("") == [0]`）でも有限の `scores` を持つ
     ok のレコードになること（REQ-28。詰め物のみの行でも NaN が伝播しない
