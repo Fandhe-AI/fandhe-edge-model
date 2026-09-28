@@ -632,6 +632,43 @@ mod tests {
         assert!(!debug.contains("leak-me"));
     }
 
+    /// REQ-39: `config` の値に JSON 以外の数値トークン（`NaN`・`Infinity`・
+    /// `-Infinity`）を含むリクエストは、`serde_json::Value` へのデシリアライズ
+    /// 自体が構文エラーとして拒否する（学習ワーカーの
+    /// `contract.py::parse_request_bytes` が同じトークンを全体として拒否する
+    /// ことと揃える。PR #220 Bugbot 指摘の確認）。
+    #[test]
+    fn req39_rejects_non_json_number_tokens_in_config() {
+        for token in ["NaN", "Infinity", "-Infinity"] {
+            let json = format!(
+                r#"{{
+                    "schema_version": 1,
+                    "kind": "c3",
+                    "kind_version": 1,
+                    "config": {{"lr": {token}}},
+                    "label_order": ["a", "b"],
+                    "max_bytes": 512,
+                    "seed": 0,
+                    "device": "cpu",
+                    "root": "/tmp/fandhe-edge-train-test",
+                    "train_path": "train.jsonl",
+                    "out_dir": "out"
+                }}"#
+            );
+            let err = TrainRequest::from_json_slice(json.as_bytes()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TrainRequestError::NotJson {
+                        category: serde_json::error::Category::Syntax,
+                        ..
+                    }
+                ),
+                "token {token} must be rejected as a JSON syntax error"
+            );
+        }
+    }
+
     /// path 構文検査: `.`・`..`・空文字列・絶対パス・NUL を個別に確認する。
     #[test]
     fn req39_rejects_malformed_relative_paths() {
