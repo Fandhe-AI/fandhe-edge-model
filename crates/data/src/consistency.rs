@@ -310,7 +310,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::normalize::PyWhitespaceNormalizer;
+    use crate::normalize::NfkcWhitespaceNormalizer;
 
     struct TestRecord {
         id: &'static str,
@@ -371,7 +371,7 @@ mod tests {
                 group_id: None,
             },
         ];
-        let report = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
+        let report = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
         assert_eq!(report.distinct_inputs, 1);
         assert_eq!(report.rows, 2);
         assert_eq!(report.entries.len(), 1);
@@ -406,7 +406,7 @@ mod tests {
                 group_id: Some("grp"),
             },
         ];
-        let report = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
+        let report = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].distinct_gold_count, 3);
         assert_eq!(report.rows, 3);
@@ -429,7 +429,7 @@ mod tests {
                 group_id: Some("grp"),
             },
         ];
-        let report = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
+        let report = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
         assert_eq!(report.rows, 2);
         assert_eq!(report.rows_without_group_id, 1);
         assert_eq!(report.group_ids, BTreeSet::from(["grp".to_string()]));
@@ -452,7 +452,7 @@ mod tests {
                 group_id: None,
             },
         ];
-        let err = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap_err();
+        let err = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap_err();
         assert_eq!(err, ConsistencyError::DuplicateRecordId("dup".to_string()));
     }
 
@@ -465,39 +465,16 @@ mod tests {
             gold_key: "g1",
             group_id: None,
         }];
-        let err = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap_err();
+        let err = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap_err();
         assert_eq!(err, ConsistencyError::EmptyRecordId { index: 0 });
     }
 
-    /// 独自の正規化（全角英数字 -> 半角）を渡すと矛盾を検出し、
-    /// 既定の正規化（NFKC 非対応）では検出しないことを示す契約テスト。
-    struct FullwidthToHalfwidthNormalizer;
-    impl crate::normalize::InputNormalizer for FullwidthToHalfwidthNormalizer {
-        fn rule_id(&self) -> &'static str {
-            "test-fullwidth-to-halfwidth"
-        }
-        fn normalize<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
-            let mapped: String = text
-                .chars()
-                .map(|c| {
-                    let code = c as u32;
-                    if (0xff21..=0xff3a).contains(&code) {
-                        // 全角英大文字 -> 半角
-                        char::from_u32(code - 0xfee0).unwrap_or(c)
-                    } else if (0xff10..=0xff19).contains(&code) {
-                        // 全角数字 -> 半角
-                        char::from_u32(code - 0xfee0).unwrap_or(c)
-                    } else {
-                        c
-                    }
-                })
-                .collect();
-            std::borrow::Cow::Owned(mapped)
-        }
-    }
-
+    /// 既定の正規化（NFKC）で「Ａ１」（全角）と「A1」（半角）が同一入力として
+    /// 扱われ、正解が異なれば矛盾として検出されることを確認する（REQ-16。
+    /// `fixtures/preprocess/byte_encoding_vectors.json` の
+    /// `fullwidth_alnum_nfkc` ベクタと同じ入力）。
     #[test]
-    fn req16_contradiction_custom_normalizer_detects_fullwidth_variant() {
+    fn req16_contradiction_default_normalizer_detects_fullwidth_variant() {
         let records = vec![
             TestRecord {
                 id: "a",
@@ -512,14 +489,52 @@ mod tests {
                 group_id: None,
             },
         ];
-        let with_custom = find_contradictions(&records, &FullwidthToHalfwidthNormalizer).unwrap();
-        assert_eq!(with_custom.distinct_inputs, 1);
+        let report = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
+        assert_eq!(report.distinct_inputs, 1);
+        assert_eq!(report.rows, 2);
+        assert_eq!(report.normalizer_rule_id, "nfkc-whitespace-v1");
         assert_eq!(
-            with_custom.normalizer_rule_id,
-            "test-fullwidth-to-halfwidth"
+            report.entries[0].ids,
+            vec!["a".to_string(), "b".to_string()]
         );
+        assert_eq!(report.entries[0].distinct_gold_count, 2);
+    }
 
-        let with_default = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
+    /// 独自の正規化（大文字・小文字を無視）を渡すと、NFKC だけでは統合され
+    /// ない揺れ（大文字・小文字）も矛盾として検出できることを示す契約テスト
+    /// （既定の [`NfkcWhitespaceNormalizer`] は大文字・小文字を区別するため、
+    /// 独自実装との違いが確認できる）。
+    struct CaseInsensitiveNormalizer;
+    impl crate::normalize::InputNormalizer for CaseInsensitiveNormalizer {
+        fn rule_id(&self) -> &'static str {
+            "test-case-insensitive"
+        }
+        fn normalize<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+            std::borrow::Cow::Owned(text.to_ascii_lowercase())
+        }
+    }
+
+    #[test]
+    fn req16_contradiction_custom_normalizer_detects_case_variant() {
+        let records = vec![
+            TestRecord {
+                id: "a",
+                input: "HELLO",
+                gold_key: "g1",
+                group_id: None,
+            },
+            TestRecord {
+                id: "b",
+                input: "hello",
+                gold_key: "g2",
+                group_id: None,
+            },
+        ];
+        let with_custom = find_contradictions(&records, &CaseInsensitiveNormalizer).unwrap();
+        assert_eq!(with_custom.distinct_inputs, 1);
+        assert_eq!(with_custom.normalizer_rule_id, "test-case-insensitive");
+
+        let with_default = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
         assert_eq!(with_default.distinct_inputs, 0);
     }
 
@@ -578,8 +593,8 @@ mod tests {
                 group_id: None,
             },
         ];
-        let report_forward = find_contradictions(&forward, &PyWhitespaceNormalizer).unwrap();
-        let report_reversed = find_contradictions(&reversed, &PyWhitespaceNormalizer).unwrap();
+        let report_forward = find_contradictions(&forward, &NfkcWhitespaceNormalizer).unwrap();
+        let report_reversed = find_contradictions(&reversed, &NfkcWhitespaceNormalizer).unwrap();
         assert_eq!(report_forward, report_reversed);
     }
 

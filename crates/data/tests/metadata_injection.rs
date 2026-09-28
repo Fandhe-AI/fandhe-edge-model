@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use fandhe_edge_data::consistency::{MetadataMixReason, find_contradictions, find_metadata_mixed};
-use fandhe_edge_data::normalize::PyWhitespaceNormalizer;
+use fandhe_edge_data::normalize::NfkcWhitespaceNormalizer;
 use support::{ContradictionTestRecord, MetadataTestRecord, load_jsonl_pool};
 
 fn load_pool(dir_name: &str) -> Vec<support::RawRecord> {
@@ -47,8 +47,9 @@ fn req16_metadata_injection_clean_has_no_false_positives() {
         .into_iter()
         .map(ContradictionTestRecord::from_raw)
         .collect();
-    let contradiction_report = find_contradictions(&contradiction_records, &PyWhitespaceNormalizer)
-        .expect("id は重複・空のはず無し");
+    let contradiction_report =
+        find_contradictions(&contradiction_records, &NfkcWhitespaceNormalizer)
+            .expect("id は重複・空のはず無し");
     assert_eq!(
         contradiction_report.distinct_inputs, 0,
         "clean データで矛盾を誤検出した"

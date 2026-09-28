@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use fandhe_edge_data::consistency::find_contradictions;
-use fandhe_edge_data::normalize::PyWhitespaceNormalizer;
+use fandhe_edge_data::normalize::NfkcWhitespaceNormalizer;
 
 /// テスト専用の [`fandhe_edge_data::consistency::ContradictionRecord`] 実装
 /// （`gold_key` は呼び出し側が正準化済みの文字列を渡す契約なので、ここでは
@@ -151,12 +151,12 @@ fn synthetic_pool() -> Vec<SyntheticRecord> {
 fn req16_synthetic_pool_counts() {
     let records = synthetic_pool();
     let report =
-        find_contradictions(&records, &PyWhitespaceNormalizer).expect("id は重複・空のはず無し");
+        find_contradictions(&records, &NfkcWhitespaceNormalizer).expect("id は重複・空のはず無し");
 
     assert_eq!(report.distinct_inputs, 4);
     assert_eq!(report.rows, 10);
     assert_eq!(report.rows_without_group_id, 1);
-    assert_eq!(report.normalizer_rule_id, "py-whitespace-v1/no-nfkc");
+    assert_eq!(report.normalizer_rule_id, "nfkc-whitespace-v1");
 
     let expected_group_ids: BTreeSet<String> = ["g-a", "g-b", "g-e", "g-f", "g-g"]
         .into_iter()
@@ -183,7 +183,7 @@ fn req16_synthetic_pool_counts() {
 fn req16_synthetic_pool_whitespace_variant_entry_matches() {
     let records = synthetic_pool();
     let report =
-        find_contradictions(&records, &PyWhitespaceNormalizer).expect("id は重複・空のはず無し");
+        find_contradictions(&records, &NfkcWhitespaceNormalizer).expect("id は重複・空のはず無し");
 
     let matched = report
         .entries
@@ -202,7 +202,7 @@ fn req16_synthetic_pool_whitespace_variant_entry_matches() {
 fn req16_synthetic_pool_three_way_gold_entry_matches() {
     let records = synthetic_pool();
     let report =
-        find_contradictions(&records, &PyWhitespaceNormalizer).expect("id は重複・空のはず無し");
+        find_contradictions(&records, &NfkcWhitespaceNormalizer).expect("id は重複・空のはず無し");
 
     let matched = report
         .entries
@@ -224,7 +224,7 @@ fn req16_synthetic_pool_three_way_gold_entry_matches() {
 #[test]
 fn req16_synthetic_pool_is_deterministic_across_runs() {
     let records = synthetic_pool();
-    let report_a = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
-    let report_b = find_contradictions(&records, &PyWhitespaceNormalizer).unwrap();
+    let report_a = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
+    let report_b = find_contradictions(&records, &NfkcWhitespaceNormalizer).unwrap();
     assert_eq!(report_a, report_b);
 }

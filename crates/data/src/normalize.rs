@@ -1,32 +1,47 @@
 //! 入力正規化（REQ-16・TASK-16.2-2）。
 //!
-//! [`crate::consistency::find_contradictions`]（矛盾検出）は、表記ゆれ（空白の
-//! 数・種類の違いなど）を無視して同一入力と判定する必要がある。本モジュールは
-//! その正規化規則を差し替え可能な trait として切り出し、既定実装
-//! ([`PyWhitespaceNormalizer`]) を提供する。[`crate::consistency::find_metadata_mixed`]
+//! [`crate::consistency::find_contradictions`]（矛盾検出）は、表記ゆれ（全角・
+//! 半角の違い・空白の数や種類の違いなど）を無視して同一入力と判定する必要が
+//! ある。本モジュールはその正規化規則を差し替え可能な trait として切り出し、
+//! 既定実装（[`NfkcWhitespaceNormalizer`]）を提供する。[`crate::consistency::find_metadata_mixed`]
 //! （メタデータ混入検出）は正規化を行わず、生の `input` に対する
 //! `str::contains` のみで判定するため本モジュールには依存しない
 //! （[`crate::consistency`] モジュール doc・`find_metadata_mixed` の
 //! ドキュメンテーションコメント参照）。
 //!
-//! # 既定実装は NFKC を含まない
+//! # 既定実装は学習ワーカーと同じ NFKC＋空白規則
 //!
-//! 既定の [`PyWhitespaceNormalizer`] は前後の空白除去・内部の連続空白の圧縮
-//! （Python の `str.split()` と同じ空白判定）のみを行い、Unicode 正規化
-//! （NFKC）は行わない。`Ａ１` と `A1` のような全角・半角の揺れは統合されない。
-//! これは PoC-16 由来の共通正規化（`fixtures/preprocess/byte_encoding_vectors.json`・
-//! `trainer/.../encoding.py` が契約の正）が NFKC を含むのに対し、本 crate は
-//! `unicode-normalization` の依存承認を得るまでの暫定実装であるため
-//! （[dependency-policy](../../../.claude/rules/dependency-policy.md)）。
-//! [`InputNormalizer::rule_id`] に `\"py-whitespace-v1/no-nfkc\"` のように
-//! NFKC を含まないことが読み取れる名前を付け、検出レポートに埋め込むことで、
-//! 出力が NFKC 済みであるかのように読める余地を残さない。
+//! 既定の [`NfkcWhitespaceNormalizer`] は Unicode NFKC 正規化 → 前後の空白
+//! 除去 → 内部の連続空白の半角スペース 1 つへの圧縮、の順で行う。これは
+//! 学習ワーカー（Python）`trainer/src/fandhe_edge_trainer/encoding.py` の
+//! `normalize_input`（`unicodedata.normalize("NFKC", text)` →
+//! `" ".join(nfkc.split())`）と同じ順序・同じ規則であり、
+//! `fixtures/preprocess/byte_encoding_vectors.json`（共有ゴールデンベクタ・
+//! SSOT）の NFKC を伴うケース（`fullwidth_alnum_nfkc`・`ligature_fi` 等）を
+//! 含めて両実装の一致を機械照合する（`tests/nfkc_cross_check.rs`）。
+//! `unicode-normalization =0.1.25` は 2026-09-28 オーナー承認済み
+//! （`.claude/rules/dependency-policy.md`「承認済みの依存」表。承認記録は
+//! PR #224）。
 //!
-//! NFKC が必要な呼び出し側は、独自の [`InputNormalizer`] 実装を渡せる。
-//! `unicode-normalization` が承認された後は、共通の正規化（TASK-15.x・
-//! 推論前処理）へ差し替える想定。
+//! # Unicode 版の違い
+//!
+//! `unicode-normalization` 0.1.25 は Unicode 17.0.0 のデータテーブルを使う。
+//! 一方 Python 3.12 の `unicodedata` は UCD 15.0.0（`fixtures/preprocess/
+//! byte_encoding_vectors.json` の `_meta.unicode_version` が記録する値。
+//! `trainer/tests/test_encoding.py::test_fixture_unicode_version_matches_runtime`
+//! が実行環境の版と一致することを確認する）。NFKC の分解・合成規則は
+//! Unicode の安定性ポリシーにより既存の割り当て済み文字に対して変更されない
+//! ため、両実装は既存文字について一致する。Unicode 15.1〜17.0 で新規に
+//! 割り当てられた文字（フィクスチャ策定後に追加された文字）に対してのみ、
+//! 結果が異なりうる。この差は共有フィクスチャによる交差照合テストで監視する
+//! （新規割当文字を使うベクタが追加された場合はここで検出される）。
+//!
+//! NFKC 以外の規則が必要な呼び出し側は、独自の [`InputNormalizer`] 実装を
+//! 渡せる。
 
 use std::borrow::Cow;
+
+use unicode_normalization::UnicodeNormalization;
 
 /// 入力文字列の正規化規則。
 ///
@@ -43,8 +58,12 @@ pub trait InputNormalizer {
     fn normalize<'a>(&self, text: &'a str) -> Cow<'a, str>;
 }
 
-/// Python の `str.split()` と同じ空白判定で、前後の空白除去・内部の連続空白の
-/// 半角スペース 1 つへの圧縮のみを行う正規化規則（NFKC は行わない）。
+/// Unicode NFKC 正規化 → 前後の空白除去 → 内部の連続空白の半角スペース 1 つ
+/// への圧縮を行う既定の正規化規則。
+///
+/// 学習ワーカー（Python）`encoding.py::normalize_input` と同じ順序・同じ
+/// 規則にする（モジュール doc「既定実装は学習ワーカーと同じ NFKC＋空白規則」
+/// 参照）。
 ///
 /// 空白の判定は `char::is_whitespace()` に U+001C〜U+001F（情報分離子）を
 /// 加えた集合とする（`char::is_whitespace` だけでは不足しており、
@@ -54,24 +73,26 @@ pub trait InputNormalizer {
 /// （同ベクタの `zero_width_space_200b`・`bom_feff`・`null_byte`・`control_0001`
 /// が期待する「空白扱いされず保持される」という挙動と一致させる）。
 #[derive(Debug, Clone, Copy, Default)]
-pub struct PyWhitespaceNormalizer;
+pub struct NfkcWhitespaceNormalizer;
 
-impl PyWhitespaceNormalizer {
+impl NfkcWhitespaceNormalizer {
     /// `c` が「Python 互換の空白」として扱われるかを判定する。
     fn is_py_whitespace(c: char) -> bool {
         c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
     }
 }
 
-impl InputNormalizer for PyWhitespaceNormalizer {
+impl InputNormalizer for NfkcWhitespaceNormalizer {
     fn rule_id(&self) -> &'static str {
-        "py-whitespace-v1/no-nfkc"
+        "nfkc-whitespace-v1"
     }
 
     fn normalize<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        // Python の `" ".join(text.split())` と同じ結果になるよう、
-        // 空白区切りのトークン列を作ってから半角スペースで結合する。
-        let tokens: Vec<&str> = text
+        // Python の `" ".join(unicodedata.normalize("NFKC", text).split())` と
+        // 同じ結果になるよう、NFKC 正規化した文字列を空白区切りのトークン列に
+        // してから半角スペースで結合する。
+        let nfkc: String = text.nfkc().collect();
+        let tokens: Vec<&str> = nfkc
             .split(Self::is_py_whitespace)
             .filter(|s| !s.is_empty())
             .collect();
@@ -90,11 +111,12 @@ impl InputNormalizer for PyWhitespaceNormalizer {
 mod tests {
     use super::*;
 
-    /// `fixtures/preprocess/byte_encoding_vectors.json` の各ベクタ（NFKC を
-    /// 伴わないもの）に対し、既定の正規化規則が同じ `normalized` を返すことを
-    /// 確認する（REQ-16。ベクタ名をテスト名・コメントに記す）。
+    /// `fixtures/preprocess/byte_encoding_vectors.json` の各ベクタに対し、
+    /// 既定の正規化規則が同じ `normalized` を返すことを確認する（REQ-16。
+    /// ベクタ名をテスト名・コメントに記す）。NFKC を伴うベクタの機械照合は
+    /// `tests/nfkc_cross_check.rs` に集約する。
     fn normalize(text: &str) -> String {
-        PyWhitespaceNormalizer.normalize(text).into_owned()
+        NfkcWhitespaceNormalizer.normalize(text).into_owned()
     }
 
     #[test]
@@ -159,8 +181,9 @@ mod tests {
 
     #[test]
     fn req16_vector_nbsp_00a0() {
-        // NBSP（U+00A0）は `char::is_whitespace()` が真を返すため、
-        // NFKC を経由せずとも本規則で空白として扱われる。
+        // NBSP（U+00A0）は `char::is_whitespace()` が真を返すため空白として
+        // 扱われる（NFKC は U+00A0 を半角スペースへ変換しないため、この
+        // ケースでは空白判定側の効果が主）。
         assert_eq!(normalize("a\u{00a0}b"), "a b");
     }
 
@@ -200,23 +223,23 @@ mod tests {
         assert_eq!(normalize("\u{1c}\u{1d}"), "");
     }
 
-    /// NFKC を要するベクタ（`fullwidth_alnum_nfkc`・`ligature_fi`・
-    /// `compat_hangul_parenthesized` 等）は、既定の正規化では変換されない
-    /// ことを明示する（未対応であることをテストで示し、実装済みを装わない）。
+    /// NFKC を要するベクタ（全角英数字の半角化）を既定の正規化規則が
+    /// 変換することを確認する（REQ-16。以前の暫定実装〔NFKC 非対応〕からの
+    /// 変更点。`fullwidth_alnum_nfkc` ベクタと同じ入出力）。
     #[test]
-    fn req16_vector_fullwidth_alnum_nfkc_not_applied_by_default() {
-        assert_eq!(normalize("\u{ff21}\u{ff11}"), "\u{ff21}\u{ff11}");
-        assert_ne!(normalize("\u{ff21}\u{ff11}"), "A1");
+    fn req16_vector_fullwidth_alnum_nfkc_applied() {
+        assert_eq!(normalize("\u{ff21}\u{ff11}"), "A1");
+    }
+
+    /// NFKC を要するベクタ（合字の分解）を既定の正規化規則が変換することを
+    /// 確認する（REQ-16。`ligature_fi` ベクタと同じ入出力）。
+    #[test]
+    fn req16_vector_ligature_fi_applied() {
+        assert_eq!(normalize("\u{fb01}le"), "file");
     }
 
     #[test]
-    fn req16_vector_ligature_fi_not_applied_by_default() {
-        assert_eq!(normalize("\u{fb01}le"), "\u{fb01}le");
-        assert_ne!(normalize("\u{fb01}le"), "file");
-    }
-
-    #[test]
-    fn req16_rule_id_is_no_nfkc() {
-        assert_eq!(PyWhitespaceNormalizer.rule_id(), "py-whitespace-v1/no-nfkc");
+    fn req16_rule_id_is_nfkc_whitespace() {
+        assert_eq!(NfkcWhitespaceNormalizer.rule_id(), "nfkc-whitespace-v1");
     }
 }
