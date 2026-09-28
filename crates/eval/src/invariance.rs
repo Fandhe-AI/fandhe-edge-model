@@ -87,7 +87,7 @@ impl fmt::Display for ModelComponent {
 /// 凍結〔REQ-17〕向けに引いた線と同じ。空バイト列は `Sha256Digest::of_bytes(&[])`
 /// で計算できる有効な入力として扱う）。C3（バイト CNN）のように語彙を
 /// 持たないモデルでは `vocab` を `None` にする。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct ModelPackageBytes<'a> {
     /// モデルの重み。
     pub weights: Option<&'a [u8]>,
@@ -97,6 +97,24 @@ pub struct ModelPackageBytes<'a> {
     pub calibration: Option<&'a [u8]>,
     /// しきい値。無ければ `None`。
     pub thresholds: Option<&'a [u8]>,
+}
+
+impl fmt::Debug for ModelPackageBytes<'_> {
+    /// バイト長のみを出し、モデル・語彙・校正・しきい値の生の中身は出さない
+    /// （`.claude/rules/security.md`「秘密情報の混入防止」。derive Debug は
+    /// `Option<&[u8]>` をそのまま出力するため、`{:?}` によるデバッグ出力が
+    /// 将来ログ等へ追加された場合の漏洩を避ける）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn len_or_none(value: Option<&[u8]>) -> Option<usize> {
+            value.map(<[u8]>::len)
+        }
+        f.debug_struct("ModelPackageBytes")
+            .field("weights_len", &len_or_none(self.weights))
+            .field("vocab_len", &len_or_none(self.vocab))
+            .field("calibration_len", &len_or_none(self.calibration))
+            .field("thresholds_len", &len_or_none(self.thresholds))
+            .finish()
+    }
 }
 
 impl<'a> ModelPackageBytes<'a> {
@@ -470,5 +488,26 @@ mod tests {
         // ダイジェストの 16 進表現は含まれる。
         let after_digest = Sha256Digest::of_bytes(b"SECRET-VALUE-should-not-leak");
         assert!(displayed.contains(&after_digest.to_hex()));
+    }
+
+    #[test]
+    fn req27_model_package_bytes_debug_does_not_leak_raw_content() {
+        // `ModelPackageBytes` の Debug 出力にモデル・語彙・校正・しきい値の
+        // 生バイト列（機密情報を含みうる）が出ないことを確認する
+        // （`.claude/rules/security.md`「秘密情報の混入防止」）。バイト長のみが
+        // 出ることを確かめる。
+        let bytes = ModelPackageBytes {
+            weights: Some(b"SECRET-WEIGHTS-should-not-leak"),
+            vocab: None,
+            calibration: Some(b"SECRET-CALIBRATION"),
+            thresholds: Some(b""),
+        };
+        let debugged = format!("{bytes:?}");
+        assert!(!debugged.contains("SECRET-WEIGHTS-should-not-leak"));
+        assert!(!debugged.contains("SECRET-CALIBRATION"));
+        assert!(debugged.contains("weights_len: Some(30)"));
+        assert!(debugged.contains("vocab_len: None"));
+        assert!(debugged.contains("calibration_len: Some(18)"));
+        assert!(debugged.contains("thresholds_len: Some(0)"));
     }
 }
