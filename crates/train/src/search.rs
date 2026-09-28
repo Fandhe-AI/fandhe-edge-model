@@ -403,7 +403,9 @@ pub enum SearchError<E> {
     DuplicateCandidateId { index: usize },
     /// 候補の `params.label_order` が `label_order` と一致しない。
     LabelOrderMismatch { index: usize },
-    /// 候補間で `(root, out_dir)` が重複している。
+    /// 候補間で `root` と `out_dir` を結合した出力先が重複、または一方が
+    /// 他方の祖先（親ディレクトリ）になっている（codex review PR #238 P1
+    /// 指摘。`normalized_joined_components`・`out_dirs_conflict` 参照）。
     DuplicateOutDir { index: usize },
     /// 候補のリクエスト構成要素が [`TrainRequest::new`] の検証を満たさない。
     InvalidRequest {
@@ -507,18 +509,65 @@ fn validate_candidate_id(id: &str) -> bool {
 /// `crates/train/src/request.rs` の `check_relative_path_syntax` と同じ
 /// 「`/` 区切りの構成要素のうち空要素・`.` 単体は無視する」規則で比較用の
 /// 表現を作る。これにより `out/a`・`out/./a`・`out//a`・`out/a/` は同一の
-/// 出力先として重複検出される。`..` 構成要素はスタックを使った解決
-/// （親ディレクトリへの遡上）が必要で、ここでは行わない。`..` は
-/// [`TrainRequest::new`]（`check_relative_path_syntax`）が別途拒否するため、
-/// 本関数の比較結果に `..` を含む値が紛れ込んでも最終的にはエラーとなり、
-/// 実ディレクトリの誤同定にはつながらない。ファイルシステムへの実際の
-/// 閉じ込め（symlink 解決等）は行わない点も `request.rs` の doc と同じ
-/// 設計（多層防御は学習ワーカー・Rust 側ガード層〔TASK-39.x〕が別途担う）。
+/// 出力先として重複検出される。本関数は分割・除去のみを行い、`..` 構成要素
+/// はそのまま残す。`..` の字句上の解決（親ディレクトリへの遡上）は
+/// [`normalized_joined_components`] が呼び出し元として行う（`root` 側に
+/// `..` が含まれうるため、単に「`TrainRequest::new` が拒否する」とは言え
+/// ない。同関数の doc 参照）。
 fn normalized_path_components(value: &str) -> Vec<&str> {
     value
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect()
+}
+
+/// `root` と `out_dir` を結合した後の出力先を、構成要素の列へ正規化する
+/// （codex review PR #238 P1 指摘: `root` と `out_dir` を別々に正規化して
+/// 組として比較すると、`root="/a", out_dir="out/x"` と
+/// `root="/a/out", out_dir="x"` が同じ `/a/out/x` を指していても
+/// 別物として扱われてしまう）。
+///
+/// `out_dir` は `..` を含まない相対パスであることを [`TrainRequest::new`]
+/// が強制するが、`root` は絶対パスであること（`check_root_syntax`）しか
+/// 強制しておらず `..` 構成要素を含みうる（`root="/root/x/..", out_dir=
+/// "out/a"` は `root="/root", out_dir="out/a"` と同じ `/root/out/a` を
+/// 指す）。そのため単純な連結では不十分で、結合後の構成要素列に対して
+/// スタックによる字句上の `..` 解決（一つ前の構成要素を取り除く。スタック
+/// が空のまま `..` に出会った場合は無視してそれ以上遡らない）を行う。
+/// これは文字列としての字句解決であり、途中の構成要素が symlink である
+/// 場合の実体解決（`canonicalize`）とは異なる。実ディレクトリの閉じ込め
+/// （symlink 解決等）は行わない点は `request.rs` の doc と同じ設計
+/// （多層防御は学習ワーカー・Rust 側ガード層〔TASK-39.x〕が別途担う）。
+///
+/// 呼び出し元（[`validate_input`]）は本関数を呼ぶ前に必ず
+/// [`TrainRequest::new`] を通す。`out_dir` が空・`..` を含む等の不正な値の
+/// まま本関数へ渡すと、正規化後の構成要素列が空や root 側へ食い込んだ値に
+/// なり得て、無関係な候補との間に偽陽性の重複判定を招くため。
+fn normalized_joined_components<'a>(root: &'a str, out_dir: &'a str) -> Vec<&'a str> {
+    let mut resolved: Vec<&'a str> = Vec::new();
+    for part in normalized_path_components(root)
+        .into_iter()
+        .chain(normalized_path_components(out_dir))
+    {
+        if part == ".." {
+            resolved.pop();
+        } else {
+            resolved.push(part);
+        }
+    }
+    resolved
+}
+
+/// 2 つの正規化済み出力先が同一か、一方が他方の祖先（親ディレクトリ）に
+/// あたるかを判定する。
+///
+/// 完全一致だけでなく祖先・子孫関係も衝突として扱う。一方の出力先が
+/// 他方の配下にある場合、学習ワーカーの成果物書き出し（ディレクトリ丸ごと
+/// の書き込み）が他方の候補の成果物と混在・上書きし得るため（REQ-39
+/// 「経路の閉じ込め」）。外部入力由来のパスを扱うため添字アクセス
+/// （`[]`）は使わず `zip` で比較する（`.claude/rules/coding-rust.md`）。
+fn out_dirs_conflict(a: &[&str], b: &[&str]) -> bool {
+    a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
 
 /// 事前検証（予算・runner を一切消費しない。fail-closed）。
@@ -575,7 +624,10 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
     // リクエストとしての妥当性。
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
-    let mut seen_out_dirs: BTreeSet<(Vec<&str>, Vec<&str>)> = BTreeSet::new();
+    // 完全一致だけでなく祖先・子孫関係も検出するため、`BTreeSet` ではなく
+    // これまでに見た正規化済み出力先の一覧を保持して総当たりで比較する
+    // （`MAX_SEARCH_CANDIDATES` で件数上限があるため O(n^2) で問題ない）。
+    let mut seen_out_dirs: Vec<Vec<&str>> = Vec::new();
     for (index, candidate) in input.candidates.iter().enumerate() {
         if !validate_candidate_id(&candidate.candidate_id) {
             return Err(SearchError::InvalidCandidateId { index });
@@ -594,15 +646,25 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         if !params_label_order_matches {
             return Err(SearchError::LabelOrderMismatch { index });
         }
-        let out_dir_key = (
-            normalized_path_components(candidate.params.root.as_str()),
-            normalized_path_components(candidate.params.out_dir.as_str()),
-        );
-        if !seen_out_dirs.insert(out_dir_key) {
-            return Err(SearchError::DuplicateOutDir { index });
-        }
+        // `(root, out_dir)` の重複判定より先に `TrainRequest::new` を通す。
+        // `out_dir` が空・`..` を含む等の不正な値のまま
+        // `normalized_joined_components` へ渡すと、正規化後の構成要素列が
+        // 空（またはロールバックで root 側へ食い込む）になり得て、
+        // 無関係な候補と偽陽性の `DuplicateOutDir` を報告してしまう
+        // （codex review PR #238 P1 指摘のレビューで判明）。
         TrainRequest::new(candidate.params.clone())
             .map_err(|source| SearchError::InvalidRequest { index, source })?;
+        let out_dir_key = normalized_joined_components(
+            candidate.params.root.as_str(),
+            candidate.params.out_dir.as_str(),
+        );
+        if seen_out_dirs
+            .iter()
+            .any(|seen| out_dirs_conflict(seen, &out_dir_key))
+        {
+            return Err(SearchError::DuplicateOutDir { index });
+        }
+        seen_out_dirs.push(out_dir_key);
     }
 
     Ok(())
@@ -1288,6 +1350,119 @@ mod tests {
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39: `root` と `out_dir` の境界をずらしても
+    /// 結合後の出力先が一致すれば `DuplicateOutDir`（
+    /// `root="/root", out_dir="out/a"` と `root="/root/out", out_dir="a"` は
+    /// いずれも `/root/out/a` を指す。codex review PR #238 P1 指摘の
+    /// 回帰テスト）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_across_root_boundary() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/root", "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/root/out", "a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39: 一方の出力先が他方の祖先（親ディレクト
+    /// リ）にあたる場合も、成果物の混在・上書きが起こり得るため
+    /// `DuplicateOutDir` として拒否する（codex review PR #238 P1 指摘）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_nested_out_dir() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/root", "out"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/root", "out/sub"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39: `root` に `..` 構成要素が含まれていても
+    /// 結合後の出力先を字句上で解決してから重複判定する
+    /// （`root="/root/x/.."` は `root="/root"` と同じ。`check_root_syntax`
+    /// は `..` を拒否しないため、`out_dir` 側だけでなく `root` 側の `..` も
+    /// 考慮する必要がある。codex review PR #238 P1 指摘の対応中に判明した回帰テスト）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_dotdot_in_root() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/root", "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/root/x/..", "out/a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39: `root` の `..` がルートより上へ遡ろうと
+    /// してもスタックが空のまま無視され（クランプ）、`root="/.."` は
+    /// `root="/"` と同じ出力先として扱われる（codex review PR #238 P1 指摘の対応中に判明した回帰テスト）。
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_dotdot_clamped_at_root() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/", "a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/..", "a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2: 兄弟ディレクトリ（互いの祖先・子孫にならない
+    /// 別出力先）は重複として扱わない（`out_dirs_conflict` が偽陽性を出さ
+    /// ないことの確認）。
+    #[test]
+    fn task18_1_2_validate_input_accepts_sibling_out_dirs() {
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params("/root", "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params("/root", "out/b"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        assert!(validate_input::<std::convert::Infallible>(&input).is_ok());
     }
 
     /// REQ-18・TASK-18.1-2: リクエストとして不正な構成要素は
