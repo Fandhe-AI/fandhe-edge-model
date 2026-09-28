@@ -296,3 +296,14 @@ MAX_AR_WARMUP_STEPS = 100_000
 #: 学習ループ開始前（1 バッチも確保する前）にこの上限で fail-closed に
 #: 拒否する（`limit_exceeded`・exit 20）。
 MAX_AR_ATTENTION_ELEMENTS = 200_000_000
+
+#: 推論 1 件（バッチ N=1）あたりで ONNX グラフが確保しうる、選択肢領域の
+#: 対数確率抽出用テンソル（`choice_logp`・`choice_onehot`・`masked_vocab`。
+#: いずれも `[K, M, VOCAB_SIZE]` 形状。`kinds/autoregressive.py::_export_ar_onnx`
+#: 参照）の要素数上限（`K × M × VOCAB_SIZE`）。ONNX グラフの `N` 軸は動的
+#: なので、この上限は N=1 でも成立しなければならない最低ラインであり、
+#: バッチ件数 N 分の上限は推論ランタイム・ガード層（REQ-39。パス未確定）の
+#: 責務として別途設ける必要がある（本リポの `crates/` 側に未実装。
+#: セキュリティ監査 P0 指摘。PR #222）。書き出し前（グラフ構築前）に
+#: この上限で fail-closed に拒否する（`limit_exceeded`・exit 20）。
+MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS = 200_000_000

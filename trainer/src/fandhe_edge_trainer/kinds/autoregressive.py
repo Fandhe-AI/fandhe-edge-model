@@ -89,6 +89,7 @@ from ..limits import (
     MAX_AR_BATCH_SIZE,
     MAX_AR_DIMS,
     MAX_AR_EPOCHS,
+    MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS,
     MAX_AR_HEADS,
     MAX_AR_LAYERS,
     MAX_AR_LR,
@@ -801,6 +802,24 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     choice_id_list = [trained.choice_ids_by_label[label] for label in label_order]
     choice_tokens, choice_valid = _build_choice_block(choice_id_list)
     m = choice_tokens.shape[1]
+
+    # 推論 1 件（N=1）あたりの選択肢対数確率抽出テンソル（`choice_logp`・
+    # `choice_onehot`・`masked_vocab`。いずれも [K,M,VOCAB_SIZE]）の要素数を
+    # グラフ構築前に検査する（`limits.py::MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS`
+    # docstring 参照。セキュリティ監査 P0 指摘。PR #222）。K（選択肢数）・
+    # M（選択肢の最大バイト長+1）は学習時に固定される値のため、ここで
+    # 拒否すれば N=1 でも過大な書き出しを fail-closed にできる。バッチ件数
+    # N 分の上限は推論ランタイム・ガード層側の責務であり、本チェックでは
+    # 検査できない（後述の out-of-scope 記録参照）。
+    choice_logprob_elements = k_classes * m * VOCAB_SIZE
+    if choice_logprob_elements > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated per-example choice log-prob elements {choice_logprob_elements}"
+            f" exceeds limit {MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS} (k_classes x m x"
+            " vocab_size)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
 
     params = trained.model.parameters()
     embed = np.array(params["embed"]["weight"], dtype=np.float32)  # [VOCAB, dims]

@@ -293,6 +293,49 @@ def test_ar_train_rejects_attention_elements_over_limit(tmp_path: Path) -> None:
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
+def test_ar_export_rejects_choice_logprob_elements_over_limit(tmp_path: Path) -> None:
+    """`MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS`: 選択肢の展開幅（`k_classes x m x
+    VOCAB_SIZE`）が上限を超える場合、グラフ構築前（N=1 でも過大な書き出しに
+    なる時点）で拒否すること（セキュリティ監査 P0 指摘。PR #222）。
+
+    実際の学習は極小データで行い、書き出し直前に `label_order`・
+    `choice_ids_by_label` だけを合成の大量ラベルへ差し替えて上限超過を再現する
+    （K x M x VOCAB_SIZE は学習後にモデルへ触れる前に判定できるため、この
+    差し替えでも `_export_ar_onnx` の検査対象は変わらない）。
+    """
+    import dataclasses
+
+    from fandhe_edge_trainer.kinds.autoregressive import _encode_choices
+    from fandhe_edge_trainer.limits import MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(kind, make_examples(), req)
+
+    # k_classes x m x VOCAB_SIZE (259) > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS を
+    # 満たす合成ラベル集合（1000 ラベル x 800 バイトの選択肢文字列）。
+    huge_label_order = [f"label_{i}" + ("x" * 799) for i in range(1000)]
+    huge_choice_ids_by_label = _encode_choices(huge_label_order)
+    max_label_len = max(len(c) for c in huge_choice_ids_by_label.values())
+    assert len(huge_label_order) * (max_label_len + 1) * 259 > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS
+
+    huge_trained = dataclasses.replace(
+        trained,
+        label_order=huge_label_order,
+        choice_ids_by_label=huge_choice_ids_by_label,
+        max_label_len=max_label_len,
+    )
+
+    with pytest.raises(WorkerError) as exc_info:
+        export_onnx_to_path(kind, huge_trained, tmp_path / "should_not_be_written.onnx")
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+    assert (
+        not (tmp_path / "should_not_be_written.onnx").exists()
+        or (tmp_path / "should_not_be_written.onnx").stat().st_size == 0
+    )
+
+
 def test_ar_encode_choices_assigns_distinct_sequences() -> None:
     """`_encode_choices` が相異なるラベルへ相異なる系列を割り当てること。"""
     ids_by_label = _encode_choices(["a", "b"])
