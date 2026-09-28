@@ -8,6 +8,8 @@
 //!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）。件数集計
 //!   （行数・ユニーク数・ラベル別件数。TASK-16.1-2・issue #39）は対象外
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
+//! - [`split_record`]: 分割の seed・規則・各分割のハッシュの記録と永続化
+//!   （TASK-17.1-2・issue #45）
 //! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
 //!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
 //!   （ケース 7〜12。矛盾・ラベル順序・未出現クラス・不正なスコア・
@@ -17,11 +19,12 @@
 //!
 //! - データ検査のうち漏洩・group 跨ぎ・メタデータ混入・矛盾・正規化入力の
 //!   重複検出（REQ-16・TASK-16.2）: 未実装
-//! - 分割結果のハッシュ計算・記録・凍結（REQ-17・TASK-17.1-2/17.2/17.3）: 未実装
-//!   （後続 #45 が [`split`] モジュールの出力を消費してハッシュ化する。
-//!   [`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
-//!   [`split::Groupable`] を実装しないため、[`split::split_by_group`] へ渡す際は
-//!   呼び出し側（CLI 等）が変換する）
+//! - 分割結果のハッシュ計算・記録は [`split_record`] で実装済み
+//!   （REQ-17・TASK-17.1-2・issue #45）。評価データの凍結（読み取り専用配置・
+//!   ハッシュ不一致時の停止。REQ-17・TASK-17.2・TASK-17.3）は未実装
+//!   （[`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
+//!   [`split::Groupable`] を実装しないため、[`split::split_by_group`]・
+//!   [`split_record::split_and_record`] へ渡す際は呼び出し側（CLI 等）が変換する）
 //! - 来歴（REQ-40）: 未実装
 //!
 //! # 層の境界
@@ -33,10 +36,14 @@
 //! （将来的には CLI 等の上位層）から `BTreeSet<String>` として受け取る形で
 //! 設計を分離している。`fandhe-edge-core::definition` の型から
 //! `BTreeSet<String>` へ変換する 1 行のアダプタを呼び出し側（CLI 等）に
-//! 足す想定であり、本 crate 自体を `fandhe-edge-core` に依存させる変更は
+//! 足す想定であり、[`inspect`] 自体を `fandhe-edge-core` に依存させる変更は
 //! 別 issue の範囲とする。[`split`] は `id`・`group_id`・ラベルだけを要求する
 //! 独立したトレイト（[`split::Groupable`]）で結合を最小化しており、同様に
-//! `fandhe-edge-core` には依存しない。
+//! `fandhe-edge-core` には依存しない。一方 [`split_record`]（issue #45）は
+//! 分割記録のハッシュ計算に `fandhe-edge-core::canonical::canonical_sha256_hex`
+//! （sha2 を内包）を使うため、workspace 内のパス依存として `fandhe-edge-core`
+//! に依存する（dependency-policy.md「承認済みの依存（Rust）」2026-09-28 承認。
+//! `inspect`・`split` は引き続き `fandhe-edge-core` に依存しない）。
 //!
 //! # 出典
 //!
@@ -63,3 +70,4 @@ pub mod eval_input;
 pub mod inspect;
 mod json_keys;
 pub mod split;
+pub mod split_record;

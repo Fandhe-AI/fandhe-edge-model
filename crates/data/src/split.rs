@@ -6,8 +6,9 @@
 //! （REQ-16 の漏洩検出と対をなす不変条件）。本モジュールは group を跨がない
 //! 決定的な分割アルゴリズムのみを提供する。
 //!
-//! 分割の seed・規則・各分割のハッシュの記録と永続化・凍結は後続
-//! TASK-17.1-2（#45）・TASK-17.2・TASK-17.3 の責務であり、本モジュールは
+//! 分割の seed・規則・各分割のハッシュの記録と永続化は [`crate::split_record`]
+//! （TASK-17.1-2・#45）が担う。凍結（読み取り専用配置・ハッシュ不一致での
+//! 停止）は後続 TASK-17.2・TASK-17.3 の責務であり、本モジュールは
 //! それらが消費できる構造化された分割結果（[`SplitResult`]）を返すところまでを担う。
 //!
 //! # Python 実装との関係
@@ -48,11 +49,33 @@ pub trait Groupable {
 }
 
 /// 分割先（REQ-17: train / validation / test の 3 分割）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `serde` の派生は [`crate::split_record`]（TASK-17.1-2・#45）の永続化
+/// （`SplitRecord::to_json` / `from_json_str`）専用で、`rename_all = "lowercase"`
+/// により PoC-9・PoC-10 と同じ `"train"` / `"validation"` / `"test"` の文字列と
+/// 対応させる。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Split {
     Train,
     Validation,
     Test,
+}
+
+impl Split {
+    /// `"train"` / `"validation"` / `"test"`（[`crate::split_record`] が
+    /// レコード ID をハッシュ入力へ正準化する際、分割名を文字列として
+    /// 扱うために使う）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Split::Train => "train",
+            Split::Validation => "validation",
+            Split::Test => "test",
+        }
+    }
 }
 
 /// 分割比率（既定 0.8 / 0.1 / 0.1。PoC-9・PoC-10 の実測値）。
@@ -75,7 +98,7 @@ pub enum Split {
 /// `n=1` で `(0, 1, 0)`、`n=2` で `(0, 2, 0)` になる）。比率が全て非ゼロの場合は
 /// 比率降順（同率は Train > Test > Validation の順）に 1 件ずつ配るため、
 /// 既定比率では `n=1` は `(1, 0, 0)`、`n=2` は `(1, 0, 1)` になる。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SplitRatios {
     pub train: f64,
     pub validation: f64,
@@ -100,7 +123,7 @@ impl SplitRatios {
     ///
     /// NaN・負値・区間外・合計の逸脱を `unwrap` / `expect` を使わず `Result` で拒否する
     /// （外部由来の設定値であっても panic させない。coding-rust.md）。
-    fn validate(&self) -> Result<(), SplitError> {
+    pub(crate) fn validate(&self) -> Result<(), SplitError> {
         let values = [self.train, self.validation, self.test];
         for value in values {
             if !(0.0..=1.0).contains(&value) {
@@ -116,8 +139,9 @@ impl SplitRatios {
     }
 }
 
-/// 1 ラベルあたりの group 件数の割付内訳（#45 が分割規則の記録に使う）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 1 ラベルあたりの group 件数の割付内訳（[`crate::split_record`]・#45 が
+/// 分割規則の記録に使う）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LabelAllocation {
     pub label: String,
     pub n_groups: usize,
