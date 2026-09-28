@@ -1,0 +1,43 @@
+{
+  "n_total": 24,
+  "status_counts": {"ok": 20, "abstain": 1, "error": 1},
+  "type_invalid_count": 2,
+  "confusion_matrix": {
+    "rows": "gold label",
+    "columns": ["A", "B", "C", "D", "invalid", "abstain", "error"],
+    "A": {"A": 3, "B": 1, "C": 0, "D": 0, "invalid": 0, "abstain": 1, "error": 1},
+    "B": {"A": 1, "B": 4, "C": 0, "D": 0, "invalid": 1, "abstain": 0, "error": 0},
+    "C": {"A": 0, "B": 0, "C": 5, "D": 0, "invalid": 1, "abstain": 0, "error": 0},
+    "D": {"A": 2, "B": 2, "C": 2, "D": 0, "invalid": 0, "abstain": 0, "error": 0}
+  },
+  "support": {"A": 6, "B": 6, "C": 6, "D": 6},
+  "predicted_count": {"A": 6, "B": 7, "C": 7, "D": 0},
+  "per_label": {
+    "A": {"precision": 0.5, "precision_fraction": "3/6", "recall": 0.5, "recall_fraction": "3/6", "f1": 0.5, "f1_fraction": "1/2"},
+    "B": {"precision": 0.5714285714285714, "precision_fraction": "4/7", "recall": 0.6666666666666666, "recall_fraction": "4/6", "f1": 0.6153846153846154, "f1_fraction": "8/13"},
+    "C": {"precision": 0.7142857142857143, "precision_fraction": "5/7", "recall": 0.8333333333333334, "recall_fraction": "5/6", "f1": 0.7692307692307693, "f1_fraction": "10/13"},
+    "D": {"precision": null, "precision_fraction": null, "recall": 0.0, "recall_fraction": "0/6", "f1": 0.0, "f1_fraction": "0", "f1_note": "TP=0, FP=0, FN=6 なので TP+FP+FN=6>0。F1=2×0/(0+0+6)=0（precision は predicted_count=0 のため null だが、F1 は 0 という定義できる値。2026-09-23 修正、旧値は null だった）"}
+  },
+  "macro_f1": {
+    "value": 0.47115384615384615,
+    "fraction": "49/104",
+    "excluded_labels": [],
+    "note": "D は predicted_count=0 のため precision は未定義（null）だが、F1=2×TP/(2×TP+FP+FN)=0（TP+FP+FN=6>0 のため定義できる）。Macro-F1 は A・B・C・D の 4 ラベルすべての平均。gold にも予測にも一件も出現しないラベルはこのフィクスチャに存在しないため、除外ラベルは無い。",
+    "superseded_value": {"value": 0.6282051282051282, "fraction": "49/78", "note": "2026-09-23 修正前の誤った値（当時は D の F1 を null として Macro-F1 から除外していた）。誤りの経緯は manifest.md『11. 凍結前の修正』・本フィクスチャの expected-derivation.md を参照。"}
+  },
+  "accuracy": {
+    "overall": {"value": 0.5, "fraction": "12/24", "denominator": 24, "numerator": 12, "note": "分母は評価対象の全 24 件（abstain・error を含む）。abstain・error は不正解として数える。"},
+    "adopted_decision": {"value": 0.5217391304347826, "fraction": "12/23", "denominator": 23, "numerator": 12, "note": "分母から abstain の 1 件を除く（error は含める）。"}
+  },
+  "coverage": {"value": 0.9583333333333334, "fraction": "23/24", "note": "coverage = (n - abstain件数) / n。"},
+  "abstain_rate": {"value": 0.041666666666666664, "fraction": "1/24"},
+  "error_rate": {"value": 0.041666666666666664, "fraction": "1/24"},
+  "type_meaning_quadrant": {
+    "type_ok_meaning_ok": 12,
+    "type_ok_meaning_ng": 8,
+    "type_ng_count": 2,
+    "abstain": 1,
+    "error": 1,
+    "note": "single-select では type_ng（invalid）の行はラベル集合外の値のため意味の正しさを判定できず、常に meaning_ng 扱いとする。multi-item フィクスチャでは type_ng でも intent 名から意味を判定できる場合がある（type_ng_meaning_ok の例を multi-item/expected.json に用意する）。"
+  }
+}

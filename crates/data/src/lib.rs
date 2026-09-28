@@ -9,6 +9,10 @@
 //! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
 //!   TASK-16.1-2・issue #39）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
+//! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
+//!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
+//!   （ケース 7〜12。矛盾・ラベル順序・未出現クラス・不正なスコア・
+//!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -56,6 +60,8 @@
 //! doc コメントも参照）。`docs/spec` は参照せず、ビルド・テストは
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
 
+pub mod eval_input;
 pub mod inspect;
+mod json_keys;
 pub mod report;
 pub mod split;

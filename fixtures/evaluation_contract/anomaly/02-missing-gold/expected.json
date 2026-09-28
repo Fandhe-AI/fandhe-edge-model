@@ -1,0 +1,10 @@
+{
+  "case": "02-missing-gold",
+  "description": "output（正解）がない、または空",
+  "expected_action": "warn_exclude",
+  "expected_exit_code": 0,
+  "expected_reason_code": "missing_gold",
+  "excluded_ids": ["an02-1"],
+  "included_ids": ["an02-2", "an02-3"],
+  "note": "an02-1 は label が null のため除外する。残り 2 件は通常どおり評価対象（an02-2: 正解, an02-3: 正解）。"
+}
