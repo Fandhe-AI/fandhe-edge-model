@@ -233,6 +233,10 @@ struct CaseResult {
 type CaseFn = fn(&Path) -> Result<(), String>;
 
 fn run_test_suite() -> ProcessExitCode {
+    // windows では `cases.push` を行う `#[cfg(unix)]` ブロックが無いため
+    // `mut` が不要になり、`-D warnings` 経由の `unused_mut` で clippy が
+    // fail する（PR #233 レビュー・rust-ci windows-latest 実測）。
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cases: Vec<(&'static str, CaseFn)> = vec![
         ("ok_outcome", case_ok_outcome),
         ("error_invalid_request", case_error_invalid_request),
@@ -521,14 +525,46 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
         .expect("tighten wall timeout");
 
     // 孫プロセスが実際に起動してから外側タイムアウトが発火するよう、
-    // `orphan.pid` の出現を短いポーリングで待つ（`run_train` 自体の
-    // タイムアウトとは独立の、このテストの起動待ちにすぎない）。
+    // `run_train`（500ms の壁時計タイムアウト）を別スレッドで実行しつつ、
+    // メインスレッドで `orphan.pid` の出現を短いポーリングで待つ
+    // （cursor[bot] 指摘「Orphan test skips startup wait」。issue #178
+    // PR #233 レビュー: 以前はポーリングを実装しておらず、遅い spawn で
+    // `ps` のスナップショットが孫プロセスの起動前に取られてしまい、木
+    // 単位の kill が正しくても偽陽性で fail しうる状態だった）。
+    // ポーリングの成否は木単位の kill の正しさとは別の検証であり、
+    // タイムアウト発火前に孫プロセスの起動を確認できなかった場合は
+    // 「起動待ちタイムアウト」として区別できるよう別メッセージで報告する。
     let orphan_pid_path = case_dir.join("orphan.pid");
-    let err = match run_train(&launcher, &request, case_dir, &limits) {
+    let run_train_handle = {
+        let launcher = launcher.clone();
+        let request = request.clone();
+        let case_dir = case_dir.to_path_buf();
+        std::thread::spawn(move || run_train(&launcher, &request, &case_dir, &limits))
+    };
+
+    let poll_deadline = std::time::Instant::now() + Duration::from_millis(450);
+    let mut orphan_spawned = false;
+    while std::time::Instant::now() < poll_deadline {
+        if orphan_pid_path.exists() {
+            orphan_spawned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let err = match run_train_handle
+        .join()
+        .map_err(|_| "run_train thread panicked".to_string())?
+    {
         Err(e) => e,
         Ok(_) => return Err("expected WallTimeout error".to_string()),
     };
     expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
+    expect_true(
+        orphan_spawned,
+        "grandchild (orphan.pid) must appear before the wall timeout fires \
+         (otherwise the tree-kill snapshot cannot have included it)",
+    )?;
 
     let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
         .map_err(|e| format!("read orphan.pid: {e} (grandchild may not have started in time)"))?;

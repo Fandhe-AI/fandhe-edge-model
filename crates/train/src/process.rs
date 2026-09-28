@@ -179,6 +179,16 @@ impl WorkerLauncher {
 /// [`RunLimits::with_wall_timeout`] は **締める方向だけ** を許す型で、
 /// 呼び出し元が誤って上限を緩めることができないようにする（テストで
 /// タイムアウトを短くする用途に使う）。
+///
+/// 本型自体は組み立てに使った [`TrainRequest`] を覚えていない（型として
+/// 「どの `request` に対応する上限か」を保持しない）ため、[`run_train`] へ
+/// 渡す `request` と `limits` の対応は呼び出し元の責務になる。誤って
+/// 別リクエスト（長い `time_limit_seconds`）から作った `RunLimits` を
+/// 短い `request` に渡すと、外側の壁時計上限を実質的に緩めてしまいうる
+/// （codex/review 指摘 P0。issue #178 PR #233 レビュー）。[`run_train`] は
+/// 呼び出し時に `limits.wall_timeout()` が `RunLimits::for_request(request)`
+/// の値を超えないことを検証し、超える場合は
+/// [`TrainProcessError::InvalidRunLimits`] を返す（fail-closed）。
 #[derive(Debug, Clone, Copy)]
 pub struct RunLimits {
     wall_timeout: Duration,
@@ -285,15 +295,27 @@ struct DrainedOutput {
     kept: Vec<u8>,
     /// 上限を超えて読み捨てた分があるか。
     truncated: bool,
+    /// `read()` 自体がエラーを返して読み取りを終えたか（EOF による正常終了
+    /// ではない）。`true` の場合、`kept` は最後まで読み切れていない可能性が
+    /// あり、たまたま有効な結果 JSON に見えても呼び出し元は成功として扱っては
+    /// ならない（codex/review 指摘 P1「パイプ読み取りエラーを EOF として
+    /// 扱う」。issue #178 PR #233 レビュー。REQ-39「資源の上限」・エラー
+    /// ハンドリングの基準）。
+    read_error: bool,
 }
 
 /// パイプから上限 `cap` バイトまで保持しつつ読み進める（超過分は読み捨てる
 /// が、読み取り自体は EOF まで続ける。子プロセスがパイプ書き込みで
 /// ブロックしないようにするため。`supervisor.py::_drain_stdout` と同じ
 /// 理由）。別スレッドで実行する想定（[`spawn_reader`]）。
+///
+/// `read()` のエラーは EOF（`Ok(0)`）と区別し、`DrainedOutput::read_error` へ
+/// 記録する（`kept` を最後まで読み切れなかった可能性があるため。codex/review
+/// 指摘 P1。issue #178 PR #233 レビュー）。
 fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
     let mut kept = Vec::new();
     let mut truncated = false;
+    let mut read_error = false;
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -311,10 +333,17 @@ fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
                     truncated = true;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                read_error = true;
+                break;
+            }
         }
     }
-    DrainedOutput { kept, truncated }
+    DrainedOutput {
+        kept,
+        truncated,
+        read_error,
+    }
 }
 
 /// パイプ読み取りを専用スレッドへ切り出し、`mpsc::Receiver` を返す
@@ -339,13 +368,49 @@ where
 /// [`TrainRun::worker_stderr`] 経由でのみ公開し、データ由来の文字列を
 /// 含みうるためログ・エラーメッセージへ転記しないこと
 /// （`.claude/rules/security.md`「秘密情報の混入防止」）。
-#[derive(Debug)]
+///
+/// `Debug` は手書きする（`#[derive(Debug)]` を使わない）: `worker_stderr` の
+/// バイト列と、失敗時は `outcome` 内の `message`（[`crate::result::WorkerFailure::message`]）
+/// が学習データ由来の内容を含みうるため、呼び出し元が本型をそのまま
+/// デバッグログへ出すだけでデータが記録されてしまう（codex/review 指摘 P0
+/// 「TrainRun の Debug 表示でワーカー出力が漏れる」。issue #178 PR #233
+/// レビュー。`.claude/rules/security.md`「秘密情報の混入防止」）。
 pub struct TrainRun {
     outcome: TrainOutcome,
     exit_code: ExitCode,
     elapsed: Duration,
     worker_stderr: Vec<u8>,
     stderr_truncated: bool,
+}
+
+impl std::fmt::Debug for TrainRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrainRun")
+            .field("outcome", &RedactedOutcome(&self.outcome))
+            .field("exit_code", &self.exit_code)
+            .field("elapsed", &self.elapsed)
+            .field("worker_stderr_len", &self.worker_stderr.len())
+            .field("stderr_truncated", &self.stderr_truncated)
+            .finish()
+    }
+}
+
+/// [`TrainRun`] の手書き `Debug` 実装が使う補助型。`outcome` の中身を、
+/// データ由来の値（`message`）を伏せた形で整形する。
+struct RedactedOutcome<'a>(&'a TrainOutcome);
+
+impl std::fmt::Debug for RedactedOutcome<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            TrainOutcome::Ok(_) => write!(f, "Ok(<redacted: worker-provided artifact record>)"),
+            TrainOutcome::Error(failure) => write!(
+                f,
+                "Error {{ code: {:?}, message: <redacted: worker-provided, {} bytes> }}",
+                failure.code(),
+                failure.message().len()
+            ),
+        }
+    }
 }
 
 impl TrainRun {
@@ -393,6 +458,24 @@ const KILL_BIN: &str = "/bin/kill";
 /// 無限待ちにしない。
 #[cfg(unix)]
 const ORPHAN_SWEEP_STEP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// [`kill_process_tree_best_effort`] が `ps` による子孫確認・`kill` 送出を
+/// 繰り返す最大ラウンド数（REQ-39「資源の上限」。codex/review 指摘 P0
+/// 「プロセスツリーの掃除に失敗しても孫プロセスが動き続ける」。issue #178
+/// PR #233 レビュー）。単発の `kill` 送出だけでは、送出直後にまだ終了処理中
+/// だった子孫や、`kill` コマンド自体が一時的に失敗したケースを取りこぼす
+/// ため、`ps` で子孫が消えたことを確認できるまで（最大この回数まで）
+/// 再送する。全ラウンドを終えても子孫が残っている場合は、これ以上待たずに
+/// 呼び出し元（直接の子＝supervisor の回収）へ制御を返す（ベストエフォート。
+/// モジュール doc「孤児化の限界」参照）。
+#[cfg(unix)]
+const ORPHAN_SWEEP_MAX_ROUNDS: u32 = 5;
+
+/// [`kill_process_tree_best_effort`] の各ラウンドの間隔。`kill` 送出直後は
+/// プロセスの終了処理が完了していないことがあるため、次の `ps` 確認まで
+/// 短い猶予を置く。
+#[cfg(unix)]
+const ORPHAN_SWEEP_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// `program`（絶対パス）を `args` で子プロセスとして起動し、標準出力を
 /// 上限 `cap` バイトまで読み取りつつ、`timeout` を超えたら強制終了する。
@@ -443,7 +526,7 @@ fn run_bounded_capture(
     }
     let rx = rx?;
     let drained = rx.recv_timeout(timeout).ok()?;
-    if drained.truncated {
+    if drained.truncated || drained.read_error {
         return None;
     }
     Some(drained.kept)
@@ -540,21 +623,40 @@ fn transitive_descendants(root: u32, pairs: &[(u32, u32)]) -> Vec<u32> {
 /// `Child::wait()` で回収すること（本関数は supervisor 自身の回収を行わず、
 /// 子孫だけを対象にする）。
 ///
+/// 単発の `kill` 送出では、送出直後に終了処理中だった子孫や `kill`
+/// コマンド自体の一時的な失敗を取りこぼしうるため、`ps` で子孫が消えたことを
+/// 確認できるまで最大 [`ORPHAN_SWEEP_MAX_ROUNDS`] 回、`ps`→`kill` を繰り返す
+/// （codex/review 指摘 P0「プロセスツリーの掃除に失敗しても孫プロセスが
+/// 動き続ける」。issue #178 PR #233 レビュー。REQ-39「資源の上限」）。
+///
 /// `ps`・`kill` 自体の失敗・タイムアウトは無視する（本関数はベストエフォート
 /// の多層防御であり、これが失敗しても呼び出し元による直接の子の回収は
 /// 妨げない。fail-closed ではなく fail-open だが、直接の子の回収という
-/// 主要な不変条件〔ゾンビを残さない〕は本関数の成否と独立に保たれる）。
+/// 主要な不変条件〔ゾンビを残さない〕は本関数の成否と独立に保たれる。
+/// 全ラウンドを終えても `ps` で子孫が確認できてしまう場合の残る限界は
+/// モジュール doc「孤児化の限界」に明記する）。
 #[cfg(unix)]
 fn kill_process_tree_best_effort(root_pid: u32) {
-    let Some(pairs) = ps_pid_ppid_pairs() else {
-        return;
-    };
-    for pid in transitive_descendants(root_pid, &pairs) {
-        run_bounded_fire_and_forget(
-            KILL_BIN,
-            &["-s", "KILL", &pid.to_string()],
-            ORPHAN_SWEEP_STEP_TIMEOUT,
-        );
+    for round in 0..ORPHAN_SWEEP_MAX_ROUNDS {
+        let Some(pairs) = ps_pid_ppid_pairs() else {
+            return;
+        };
+        let descendants = transitive_descendants(root_pid, &pairs);
+        if descendants.is_empty() {
+            return;
+        }
+        for pid in descendants {
+            run_bounded_fire_and_forget(
+                KILL_BIN,
+                &["-s", "KILL", &pid.to_string()],
+                ORPHAN_SWEEP_STEP_TIMEOUT,
+            );
+        }
+        // 最終ラウンドの後に確認待ちしても無意味なので、最後の反復では
+        // 待たずに抜ける（呼び出し元をこれ以上待たせない）。
+        if round + 1 < ORPHAN_SWEEP_MAX_ROUNDS {
+            std::thread::sleep(ORPHAN_SWEEP_RETRY_DELAY);
+        }
     }
 }
 
@@ -617,6 +719,18 @@ pub fn run_train(
     job_dir: &Path,
     limits: &RunLimits,
 ) -> Result<TrainRun, TrainProcessError> {
+    // `request` と `limits` は呼び出し元が別々の引数として渡すため、型では
+    // 対応関係を強制できない。検証なしに `limits.wall_timeout()` を採用すると、
+    // 短い `time_limit_seconds` の `request` に、別の（長い）リクエストから
+    // 作った `RunLimits` を渡すことで外側の壁時計上限を実質的に緩められて
+    // しまう（codex/review 指摘 P0「別のリクエスト用 RunLimits で壁時計上限を
+    // 緩められる」。issue #178 PR #233 レビュー。REQ-39「資源の上限」）。
+    // `RunLimits::for_request(request)` から導かれる上限を超える `limits` は
+    // 拒否する（`RunLimits::with_wall_timeout` が保証する「締める方向だけ」の
+    // 不変条件を、`request` との対応についても同様に守る）。
+    if limits.wall_timeout() > RunLimits::for_request(request).wall_timeout() {
+        return Err(TrainProcessError::InvalidRunLimits);
+    }
     let guard = write_request_file(job_dir, request)?;
     let started = Instant::now();
 
@@ -713,7 +827,14 @@ pub fn run_train(
         None => None,
     };
 
-    let Some(stdout_drain) = stdout_drain else {
+    // `recv_timeout` の失敗（期限内に届かない）だけでなく、届いた
+    // `DrainedOutput::read_error`（`read()` 自体のエラーで打ち切られ、
+    // `kept` を最後まで読み切れていない可能性がある。codex/review 指摘 P1
+    // 「パイプ読み取りエラーを EOF として扱う」。issue #178 PR #233
+    // レビュー）も同じ「読み取り未完了」として扱う。たまたま `kept` が
+    // 有効な結果 JSON に見えても、読み切れていない出力を成功として
+    // 受理しない（fail-closed。REQ-39「資源の上限」）。
+    let Some(stdout_drain) = stdout_drain.filter(|d| !d.read_error) else {
         return Err(TrainProcessError::StdoutIncomplete);
     };
     // 標準エラー出力の読み取りタイムアウトも標準出力と同様にエラーとして
@@ -721,7 +842,7 @@ pub fn run_train(
     // した `_worker`（「孤児化の限界」節）がパイプを握り続けて学習が実際
     // には継続中でも成功と区別できなくなる（codex/review 指摘。issue #178
     // PR #233 レビュー。REQ-39「資源の上限」）。
-    let Some(stderr_drain) = stderr_drain else {
+    let Some(stderr_drain) = stderr_drain.filter(|d| !d.read_error) else {
         return Err(TrainProcessError::StderrIncomplete);
     };
     let (worker_stderr, stderr_truncated) = (stderr_drain.kept, stderr_drain.truncated);
