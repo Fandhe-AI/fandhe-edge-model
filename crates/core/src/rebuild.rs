@@ -71,35 +71,57 @@
 //! ID 集合 → 判定型の固定順で両方の理由を集める（理由が複数件になりうる）。
 //! PoC-19 の 5 パターンはいずれか一方しか変えないため、結果には影響しない。
 //!
-//! # TASK-20.3（issue #93）で追加した内容
+//! # TASK-20.2（issue #92）で追加した内容
 //!
-//! ハッシュ完全一致時に以降の比較処理（[`DefinitionIdentity`] の算出を含む）
-//! を一切実行しないことを、機械照合できる構造で保証する。
-//! [`decide_rebuild`] のハッシュ不一致時の処理を private 関数
-//! [`compare_definitions`] へ切り出し、ハッシュ判定と比較の分岐を private
-//! ジェネリック関数 [`decide_rebuild_with`] へ移した。テストからは
-//! [`decide_rebuild_with`] へ「呼び出し回数を数える」「常に panic する」等の
-//! 比較関数を注入し、ハッシュ一致時にそれらが一度も呼ばれないことを
-//! 具体値で確認する（`mod tests` の `req20_task20_3_*`）。
-//! 公開シグネチャ（`decide_rebuild(&Definition, &Definition) ->
-//! Result<RebuildDecision, CanonicalError>`）は変更していない（非破壊）。
-//! seam（[`decide_rebuild_with`]・[`compare_definitions`]）はどちらも
-//! private（`pub(crate)` にもしない）にし、外部 crate が任意の比較関数を
-//! 注入して `Unchanged` を偽造できないようにしている。証拠の種別は
-//! テストハーネス。
+//! `RebuildDecision::NotRequired` に差分詳細（[`NotRequiredRebuild`]）を追加した。
+//! PoC-19（`need_rebuild`）は表示名・説明の変化を見つけた時点で「変更あり」の
+//! 選択肢 ID を返すが、変化が無ければ何も返さず「変更なし」を表す
+//! （本モジュールの `NotRequired` 1 本と等価）。本実装は PoC と異なり、
+//! 表示名・説明どちらの変化かを型で区別した 2 つの ID 集合として返す
+//! （出典: `fixtures/rebuild/poc19/PROVENANCE.md`）。
+//!
+//! 保持するのは選択肢 ID のみで、旧・新の表示名・説明の文字列は持たない
+//! （データ本文をログ等へ持ち出さない方針。security.md「秘密情報の混入防止」）。
+//! `name`・`version`・選択肢の宣言順のみが原因で `NotRequired` になる場合は
+//! 両集合が空になる（`classify_display_only_change` の doc を参照）。
+//!
+//! ## 破壊的変更（BREAKING CHANGE）
+//!
+//! `RebuildDecision::NotRequired` は TASK-20.1-1（#237）時点では単位
+//! バリアント（`NotRequired,`）だったが、本 TASK-20.2 で
+//! `NotRequired(NotRequiredRebuild)` へ変更した。`RebuildDecision` に
+//! `#[non_exhaustive]` は付けていない（3 バリアントで固定する設計意図。
+//! 本ファイル冒頭のドキュメンテーションコメントを参照）ため、この型を
+//! 網羅的にパターンマッチしていた既存呼び出し元は本変更でコンパイル不能に
+//! なる。移行は `RebuildDecision::NotRequired(_)`（詳細が不要な場合）また
+//! は `RebuildDecision::NotRequired(detail)`（[`NotRequiredRebuild`] の
+//! アクセサ `display_name_changed`/`description_changed` を使う場合）へ
+//! パターンを書き換える。
 //!
 //! # 引き続き範囲外（各担当 TASK で追加する）
 //!
-//! - `NotRequired` への差分詳細（表示名・説明が変わった選択肢 ID）の追加
-//!   （TASK-20.2・#92）
 //! - JSON 入出力契約（`serde::Serialize` の配線・CLI 出力）への接続
 //!   （CLI 側 TASK-33.x の対象。本 issue では Rust 型の追加に留める）
 //!
 //! 判定型変更（`JudgmentTypeChanged`）経路のテスト方針は上記 2.2 節を参照。
+//!
+//! # TASK-20.3（issue #93）で追加した内容
+//!
+//! ハッシュ完全一致時に以降の比較処理（[`DefinitionIdentity`] の算出・
+//! 選択肢の表示名／説明比較を含む）を一切実行しないことを保証する。
+//! [`decide_rebuild`] を、ハッシュ判定のみを行う private seam
+//! [`decide_rebuild_with`] と、ハッシュ不一致時にのみ呼ばれる比較本体
+//! [`compare_definitions`] へ分割した。`decide_rebuild_with` はハッシュが
+//! 一致すれば `compare` 引数を一度も呼ばずに `Unchanged` を返すため、
+//! テストからクロージャの呼び出し回数を数える・panic するクロージャを
+//! 渡すことで「比較処理を実行しない」ことを機械照合できる
+//! （`mod tests` の `req20_task20_3_*`）。`decide_rebuild_with`・
+//! `compare_definitions` はいずれも private のため、外部 crate から比較
+//! 関数を注入したり判定結果を偽造したりできない。
 
 use crate::canonical::{CanonicalError, DefinitionHash, DefinitionIdentity};
-use crate::definition::{Definition, JudgmentType};
-use std::collections::BTreeSet;
+use crate::definition::{Choice, Definition, JudgmentType};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 作り直し判定の結果（REQ-20）。取りうる区分を 3 つの enum バリアントで
 /// 固定し、壊れた値（理由が空の「必要」等）を表現できないようにする
@@ -107,15 +129,13 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildDecision {
     /// 新旧の定義全体の正準化ハッシュが完全一致した（REQ-20 境界値）。
-    /// この場合は同一性の比較を行わずに早期 return する（[`decide_rebuild_with`]
-    /// の seam により、比較関数が一度も呼ばれないことを機械照合済み。
-    /// TASK-20.3・#93）。
+    /// この場合は同一性の比較を行わずに早期 return する
+    /// （比較を実行しないことの機械照合テストは TASK-20.3・#93 が扱う）。
     Unchanged { hash: DefinitionHash },
     /// 同一性（選択肢 ID 集合＋判定型）は変わらず、ハッシュだけが違う
-    /// （表示名・説明・`name`・`version` の差）。作り直しは不要。
-    /// 差分の詳細（どの選択肢の表示名・説明が変わったか）は
-    /// TASK-20.2（#92）で追加する。
-    NotRequired,
+    /// （表示名・説明・`name`・`version`・選択肢の宣言順の差）。作り直しは
+    /// 不要。差分の詳細は [`NotRequiredRebuild`] を参照（TASK-20.2・#92）。
+    NotRequired(NotRequiredRebuild),
     /// 作り直しが必要（理由は 1 件以上。空の理由では組み立てられない）。
     Required(RequiredRebuild),
 }
@@ -144,6 +164,53 @@ impl RequiredRebuild {
         } else {
             Some(RequiredRebuild { reasons })
         }
+    }
+}
+
+/// 作り直し「不要」の詳細（REQ-20 異常系・TASK-20.2・issue #92）。
+///
+/// 表示名が変わった選択肢 ID・説明が変わった選択肢 ID をそれぞれ集合で持つ
+/// （同一 ID が両方に入ることもある）。保持するのは ID のみで、旧・新の
+/// 表示名・説明の文字列は持たない（データ本文を持ち出さない方針。
+/// security.md「秘密情報の混入防止」）。
+///
+/// 両集合が空になることもある。ハッシュ不一致（[`RebuildDecision::NotRequired`]
+/// に分岐する時点でハッシュは必ず不一致）かつ同一性一致は、`name`・
+/// `version`・選択肢の宣言順のみの差でも起こる（`canonical.rs` の
+/// `req15_task15_5_name_or_version_change_keeps_identity`・
+/// `req15_task15_5_option_order_change_same_identity_different_hash` で固定済み。
+/// PoC-19 も同ケースを「変更なし」として扱う）。その場合は両集合を空にする
+/// （fail-closed の `Required` 理由やエラー経路を新設しない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotRequiredRebuild {
+    display_name_changed: BTreeSet<String>,
+    description_changed: BTreeSet<String>,
+}
+
+impl NotRequiredRebuild {
+    /// crate 内限定の構築経路（[`classify_display_only_change`] のみが呼ぶ）。
+    /// 外部 crate が任意内容の「不要」判定を偽造できないようにする
+    /// （`RequiredRebuild::from_reasons` と同じ方針）。
+    pub(crate) fn new(
+        display_name_changed: BTreeSet<String>,
+        description_changed: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            display_name_changed,
+            description_changed,
+        }
+    }
+
+    /// 表示名が変わった選択肢 ID の集合（辞書順で決定的に走査できる）。
+    #[must_use]
+    pub fn display_name_changed(&self) -> &BTreeSet<String> {
+        &self.display_name_changed
+    }
+
+    /// 説明が変わった選択肢 ID の集合（辞書順で決定的に走査できる）。
+    #[must_use]
+    pub fn description_changed(&self) -> &BTreeSet<String> {
+        &self.description_changed
     }
 }
 
@@ -232,8 +299,8 @@ pub enum RebuildReason {
 ///         println!("unchanged: {}", hash.to_hex());
 ///     }
 ///     // 選択肢 ID 集合・判定型は変わらず、表示名等の差分のみ。作り直し不要。
-///     RebuildDecision::NotRequired => {
-///         println!("not required");
+///     RebuildDecision::NotRequired(not_required) => {
+///         println!("display name changed: {:?}", not_required.display_name_changed());
 ///     }
 ///     // 選択肢 ID 集合または判定型が変化。モデルの作り直しが必要。
 ///     RebuildDecision::Required(required) => {
@@ -280,15 +347,17 @@ where
     Ok(compare(old, new))
 }
 
-/// ハッシュ不一致時にのみ呼ばれる比較処理本体（TASK-20.1・20.2）。
+/// ハッシュ不一致時にのみ呼ばれる比較処理本体（TASK-20.1・20.2・20.3）。
 /// 同一性（[`DefinitionIdentity`]）を算出し、選択肢 ID 集合・判定型の差から
-/// 作り直し理由を集める（[`classify_change`]）。
+/// 作り直し理由を集める（[`classify_change`]）。理由が無ければ表示名・
+/// 説明の差分詳細（[`classify_display_only_change`]）を伴う `NotRequired`
+/// を返す。
 fn compare_definitions(old: &Definition, new: &Definition) -> RebuildDecision {
     let reasons = classify_change(&old.identity(), &new.identity());
 
     match RequiredRebuild::from_reasons(reasons) {
         Some(required) => RebuildDecision::Required(required),
-        None => RebuildDecision::NotRequired,
+        None => RebuildDecision::NotRequired(classify_display_only_change(old, new)),
     }
 }
 
@@ -315,6 +384,41 @@ fn classify_change(old: &DefinitionIdentity, new: &DefinitionIdentity) -> Vec<Re
     reasons
 }
 
+/// 同一性一致（`classify_change` の理由が空）と分かった後にのみ呼ばれ、
+/// 表示名・説明のみの差分を選択肢 ID 単位で集める（TASK-20.2・issue #92）。
+///
+/// `old`・`new` は選択肢 ID 集合が同一であることが呼び出し前提
+/// （[`decide_rebuild`] の分岐順）。`&Definition` を受けるのは
+/// `DefinitionIdentity` が表示名・説明を保持しないため。添字アクセス
+/// （`[]`）・`unwrap`/`expect` は使わず `get()` で処理し、万一 ID が
+/// 見つからない場合も panic せず「差分なし」として扱う
+/// （coding-rust.md「外部入力」。同一性一致後のため実際には起こらない）。
+///
+/// `name`・`version`・選択肢の宣言順のみの差では両集合が空になる
+/// （[`NotRequiredRebuild`] の doc を参照）。
+fn classify_display_only_change(old: &Definition, new: &Definition) -> NotRequiredRebuild {
+    let old_by_id: BTreeMap<&str, &Choice> =
+        old.options().iter().map(|c| (c.id.as_str(), c)).collect();
+    let new_by_id: BTreeMap<&str, &Choice> =
+        new.options().iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let mut display_name_changed = BTreeSet::new();
+    let mut description_changed = BTreeSet::new();
+
+    for (id, old_choice) in &old_by_id {
+        let Some(new_choice) = new_by_id.get(id) else {
+            continue;
+        };
+        if old_choice.display_name != new_choice.display_name {
+            display_name_changed.insert((*id).to_string());
+        }
+        if old_choice.description != new_choice.description {
+            description_changed.insert((*id).to_string());
+        }
+    }
+
+    NotRequiredRebuild::new(display_name_changed, description_changed)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,8 +516,9 @@ mod tests {
         }
     }
 
-    /// 表示名だけを変えると `NotRequired` が返る（分岐の骨格のみを確認する。
-    /// 差分の詳細検証は TASK-20.2・#92 の対象。REQ-20・TASK-20.1-1）。
+    /// 表示名だけを変えると `NotRequired` が返り、`display_name_changed` に
+    /// 変更した選択肢 ID が、`description_changed` は空集合になる
+    /// （REQ-20・TASK-20.1-1・差分詳細は TASK-20.2・#92）。
     #[test]
     fn req20_task20_1_1_display_name_only_change_is_not_required() {
         let display_changed = r#"{
@@ -432,7 +537,18 @@ mod tests {
 
         let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
 
-        assert_eq!(decision, RebuildDecision::NotRequired);
+        let expected_display_name_changed: BTreeSet<String> =
+            ["yes".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(
+                    not_required.display_name_changed(),
+                    &expected_display_name_changed
+                );
+                assert_eq!(not_required.description_changed(), &BTreeSet::new());
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
     }
 
     // PoC-19（`03-poc/model-lifecycle/`）の事前固定 5 パターンを本番の定義
@@ -532,8 +648,10 @@ mod tests {
     }
 
     /// P4（表示名・説明のみ）: `v1_9.json` → `v4_rename.json` は選択肢 ID
-    /// 集合・判定型が同一で、表示名・説明のみが変わる。`NotRequired` になる
-    /// （REQ-20・TASK-20.1-2・issue #91）。
+    /// 集合・判定型が同一で、`tier-xs__low` の表示名・`tier-xl__high` の
+    /// 説明のみが変わる（出典: `fixtures/rebuild/poc19/PROVENANCE.md`）。
+    /// `NotRequired` になり、差分の選択肢 ID が具体値で一致する
+    /// （REQ-20 異常系・TASK-20.1-2・issue #91・TASK-20.2・issue #92）。
     #[test]
     fn req20_task20_1_2_poc19_p4_display_only_change_is_not_required() {
         let old = Definition::parse(POC19_V1_9).expect("固定 fixture は valid なはず");
@@ -541,7 +659,23 @@ mod tests {
 
         let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
 
-        assert_eq!(decision, RebuildDecision::NotRequired);
+        let expected_display_name_changed: BTreeSet<String> =
+            ["tier-xs__low".to_string()].into_iter().collect();
+        let expected_description_changed: BTreeSet<String> =
+            ["tier-xl__high".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(
+                    not_required.display_name_changed(),
+                    &expected_display_name_changed
+                );
+                assert_eq!(
+                    not_required.description_changed(),
+                    &expected_description_changed
+                );
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
     }
 
     /// P5（判定型変更）: 選択肢 ID 集合を変えず `judgment_type` だけを
@@ -610,13 +744,214 @@ mod tests {
             .count();
         let not_required_count = decisions
             .iter()
-            .filter(|d| matches!(d, RebuildDecision::NotRequired))
+            .filter(|d| matches!(d, RebuildDecision::NotRequired(_)))
             .count();
 
         assert_eq!(required_count, 4);
         assert_eq!(not_required_count, 1);
     }
 
+    /// 説明のみを変えると `NotRequired` が返り、`description_changed` に
+    /// 変更した選択肢 ID が、`display_name_changed` は空集合になる
+    /// （REQ-20 異常系・TASK-20.2・issue #92）。
+    #[test]
+    fn req20_task20_2_description_only_change_is_not_required() {
+        let description_changed = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "Yes", "description": "肯定" },
+                { "id": "no", "display_name": "No", "description": "いいえ" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_changed = Definition::parse(description_changed).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
+
+        let expected_description_changed: BTreeSet<String> =
+            ["no".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(not_required.display_name_changed(), &BTreeSet::new());
+                assert_eq!(
+                    not_required.description_changed(),
+                    &expected_description_changed
+                );
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+
+    /// 同一 ID の表示名・説明を両方変更すると、両集合に同じ ID が入る
+    /// （REQ-20 異常系・TASK-20.2・issue #92）。
+    #[test]
+    fn req20_task20_2_both_display_name_and_description_changed_for_same_id() {
+        let both_changed = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "はい", "description": "肯定的" },
+                { "id": "no", "display_name": "No", "description": "否定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_changed = Definition::parse(both_changed).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
+
+        let expected: BTreeSet<String> = ["yes".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(not_required.display_name_changed(), &expected);
+                assert_eq!(not_required.description_changed(), &expected);
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+
+    /// 複数 ID の表示名変更が辞書順（`BTreeSet`）で決定的に得られる
+    /// （REQ-20 異常系・TASK-20.2・issue #92。coding-rust.md「数値・決定性」）。
+    #[test]
+    fn req20_task20_2_multiple_display_name_changes_are_sorted_deterministically() {
+        let multi_changed = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "はい", "description": "肯定" },
+                { "id": "no", "display_name": "いいえ", "description": "否定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_changed = Definition::parse(multi_changed).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
+
+        let expected: BTreeSet<String> =
+            ["no".to_string(), "yes".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(not_required.display_name_changed(), &expected);
+                assert_eq!(
+                    not_required
+                        .display_name_changed()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec!["no", "yes"]
+                );
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+
+    /// `version` のみの変更（選択肢は不変）はハッシュ不一致・同一性一致の
+    /// 境界にあたり、`NotRequired` の両集合が空になる（`canonical.rs` の
+    /// `req15_task15_5_name_or_version_change_keeps_identity` と同じ境界。
+    /// REQ-20 異常系・TASK-20.2・issue #92）。
+    #[test]
+    fn req20_task20_2_version_only_change_has_empty_diff_sets() {
+        let version_changed = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 2,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "Yes", "description": "肯定" },
+                { "id": "no", "display_name": "No", "description": "否定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_changed = Definition::parse(version_changed).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(not_required.display_name_changed(), &BTreeSet::new());
+                assert_eq!(not_required.description_changed(), &BTreeSet::new());
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+
+    /// 選択肢の宣言順のみの変更（ID・表示名・説明は不変）は `NotRequired` の
+    /// 両集合が空になる（現行挙動の固定。宣言順が評価契約の majority
+    /// タイブレークに使われる点との整合は spec レベルの論点であり、本
+    /// テストでは挙動を変えず固定するに留める。REQ-20 異常系・TASK-20.2・
+    /// issue #92）。
+    #[test]
+    fn req20_task20_2_option_order_only_change_has_empty_diff_sets() {
+        let reordered = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "no", "display_name": "No", "description": "否定" },
+                { "id": "yes", "display_name": "Yes", "description": "肯定" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_reordered = Definition::parse(reordered).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_reordered).expect("失敗しないはず");
+
+        match decision {
+            RebuildDecision::NotRequired(not_required) => {
+                assert_eq!(not_required.display_name_changed(), &BTreeSet::new());
+                assert_eq!(not_required.description_changed(), &BTreeSet::new());
+            }
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+
+    /// 表示名変更と ID 追加が同時に起きた場合は `Required(OptionIdsChanged)`
+    /// のまま（不要判定は同一性一致時のみ走ることの確認。表示名の差分は
+    /// 集計されない。REQ-20 異常系・TASK-20.2・issue #92）。
+    #[test]
+    fn req20_task20_2_display_name_change_with_added_option_stays_required() {
+        let added_and_renamed = r#"{
+            "schema": "fandhe-edge-model-definition/v1",
+            "name": "sample_topic",
+            "version": 1,
+            "judgment_type": "single_select",
+            "options": [
+                { "id": "yes", "display_name": "はい", "description": "肯定" },
+                { "id": "no", "display_name": "No", "description": "否定" },
+                { "id": "maybe", "display_name": "Maybe", "description": "保留" }
+            ],
+            "io": { "input": "bytes" }
+        }"#;
+        let def_a = definition_a();
+        let def_changed = Definition::parse(added_and_renamed).expect("valid なはず");
+
+        let decision = decide_rebuild(&def_a, &def_changed).expect("失敗しないはず");
+
+        let expected_added: BTreeSet<String> = ["maybe".to_string()].into_iter().collect();
+        match decision {
+            RebuildDecision::Required(required) => {
+                assert_eq!(
+                    required.reasons(),
+                    &[RebuildReason::OptionIdsChanged {
+                        added: expected_added,
+                        removed: BTreeSet::new(),
+                    }]
+                );
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
     /// AC1: ハッシュ完全一致時、比較関数（呼び出し回数を数えるクロージャ）が
     /// 一度も呼ばれず `Unchanged { hash }` が返る（証拠種別: テストハーネス。
     /// REQ-20 境界値・TASK-20.3・issue #93）。
@@ -628,7 +963,7 @@ mod tests {
 
         let decision = decide_rebuild_with(&old, &new, |_, _| {
             call_count.set(call_count.get() + 1);
-            RebuildDecision::NotRequired
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
         })
         .expect("失敗しないはず");
 
@@ -699,7 +1034,7 @@ mod tests {
 
         let decision = decide_rebuild_with(&old, &new, |_, _| {
             call_count.set(call_count.get() + 1);
-            RebuildDecision::NotRequired
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
         })
         .expect("失敗しないはず");
 
@@ -729,12 +1064,15 @@ mod tests {
 
         let decision = decide_rebuild_with(&old, &new, |_, _| {
             call_count.set(call_count.get() + 1);
-            RebuildDecision::NotRequired
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
         })
         .expect("失敗しないはず");
 
         assert_eq!(call_count.get(), 1);
-        assert_eq!(decision, RebuildDecision::NotRequired);
+        assert_eq!(
+            decision,
+            RebuildDecision::NotRequired(NotRequiredRebuild::new(BTreeSet::new(), BTreeSet::new()))
+        );
     }
 
     /// `Unchanged { hash }` は新旧双方の `canonical_hash()` と一致する

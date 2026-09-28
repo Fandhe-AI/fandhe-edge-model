@@ -1,12 +1,13 @@
 //! `rebuild::decide_rebuild`（公開 API）の結合テスト
 //! （REQ-20・TASK-20.1-1・issue #90／TASK-20.1-2・issue #91／
-//! TASK-20.3・issue #93）。
+//! TASK-20.2・issue #92／TASK-20.3・issue #93）。
 //!
 //! - AC1（#90）: 同一の定義ファイルを 2 つ渡すと「変更なし」を表す値が
 //!   返ることを、公開 API 経由の具体値で確認する（ファイル I/O は使わない）
-//! - PoC-19 の 5 パターンのうち P1〜P4（#91）: `fixtures/rebuild/poc19/`
-//!   （出典・変換規則は同ディレクトリの `PROVENANCE.md` を参照）を
-//!   `Definition::load` 経由で読み込み、公開 API のみで判定結果を確認する
+//! - PoC-19 の 5 パターンのうち P1〜P4（#91・P4 の差分詳細は #92）:
+//!   `fixtures/rebuild/poc19/`（出典・変換規則は同ディレクトリの
+//!   `PROVENANCE.md` を参照）を `Definition::load` 経由で読み込み、
+//!   公開 API のみで判定結果を確認する
 //! - P5（判定型変更）: 本番の `Definition::load` は `judgment_type:
 //!   "multi_select"` を `DefinitionError::UnsupportedValue` で拒否する。
 //!   これは本番の観測挙動（学習へ進まない）で、PoC-19 P5 の「必要
@@ -155,15 +156,34 @@ fn req20_task20_1_2_public_api_poc19_p3_merged_options_require_rebuild() {
 }
 
 /// P4（表示名・説明のみ）: `v1_9.json` → `v4_rename.json`。選択肢 ID 集合・
-/// 判定型は同一で `NotRequired` になる（REQ-20・TASK-20.1-2・issue #91）。
+/// 判定型は同一で `NotRequired` になり、`tier-xs__low` の表示名・
+/// `tier-xl__high` の説明が変わったことが公開 API・アクセサのみで具体値
+/// 照合できる（AC1 の主証拠。出典: `fixtures/rebuild/poc19/PROVENANCE.md`。
+/// REQ-20 異常系・TASK-20.1-2・issue #91・TASK-20.2・issue #92）。
 #[test]
-fn req20_task20_1_2_public_api_poc19_p4_display_only_change_is_not_required() {
+fn req20_task20_2_public_api_poc19_p4_display_only_change_is_not_required() {
     let old = load_poc19_fixture("v1_9.json");
     let new = load_poc19_fixture("v4_rename.json");
 
     let decision = decide_rebuild(&old, &new).expect("失敗しないはず");
 
-    assert_eq!(decision, RebuildDecision::NotRequired);
+    let expected_display_name_changed: BTreeSet<String> =
+        ["tier-xs__low".to_string()].into_iter().collect();
+    let expected_description_changed: BTreeSet<String> =
+        ["tier-xl__high".to_string()].into_iter().collect();
+    match decision {
+        RebuildDecision::NotRequired(not_required) => {
+            assert_eq!(
+                not_required.display_name_changed(),
+                &expected_display_name_changed
+            );
+            assert_eq!(
+                not_required.description_changed(),
+                &expected_description_changed
+            );
+        }
+        other => panic!("NotRequired を期待したが {other:?} だった"),
+    }
 }
 
 /// P5（判定型変更）: `v5_multi.json`（`judgment_type: "multi_select"`）は
