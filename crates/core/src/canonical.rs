@@ -126,15 +126,7 @@ impl DefinitionHash {
     /// 小文字 16 進 64 桁の文字列表現。
     #[must_use]
     pub fn to_hex(&self) -> String {
-        use fmt::Write as _;
-        let mut out = String::with_capacity(self.0.len() * 2);
-        for byte in self.0 {
-            // `write!` は `String` への書き込みで失敗しないため `unwrap`/`expect`
-            // を使わず戻り値を無視できる（`Result` を捨てるのではなく、この
-            // 書き込み先に限り失敗しえないことが保証されている）。
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
+        crate::hash::lower_hex(&self.0)
     }
 }
 

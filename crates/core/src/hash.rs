@@ -44,15 +44,27 @@ impl Sha256Digest {
     /// 小文字 16 進 64 桁の文字列表現。
     #[must_use]
     pub fn to_hex(&self) -> String {
-        use fmt::Write as _;
-        let mut out = String::with_capacity(self.0.len() * 2);
-        for byte in self.0 {
-            // `write!` は `String` への書き込みで失敗しないため `unwrap`/`expect`
-            // を使わず戻り値を無視できる（この書き込み先に限り失敗しえない）。
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
+        lower_hex(&self.0)
     }
+}
+
+/// バイト列を小文字 16 進文字列に変換する（[`Sha256Digest::to_hex`]・
+/// [`crate::canonical::DefinitionHash::to_hex`] の共通実装）。
+///
+/// [`crate::canonical::DefinitionHash`] と本モジュールの [`Sha256Digest`] は
+/// 「正準化済みハッシュ」と「生バイト列ハッシュ」の誤用防止のため別の型に
+/// 分けているが（各モジュールの doc を参照）、16 進エンコードそのものは
+/// どちらのハッシュ値にも意味の違いが無いため、ここへ 1 箇所に集約する
+/// （crate 内限定。両モジュールとも sha256 の 32 バイト出力を渡す前提）。
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    use fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // `write!` は `String` への書き込みで失敗しないため `unwrap`/`expect`
+        // を使わず戻り値を無視できる（この書き込み先に限り失敗しえない）。
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 impl fmt::Display for Sha256Digest {
