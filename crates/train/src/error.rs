@@ -240,7 +240,9 @@ pub enum TrainResultError {
     /// `artifact` 内のフィールドが不正（型・範囲・許可値のいずれか）。
     MalformedArtifact { field: &'static str },
     /// `code`（[`crate::result::WorkerFailure::code`]）が
-    /// `[a-z_]+`・非空・64 バイト以下の規則を満たさない。
+    /// [`crate::result::FailureCode`] の許可リストに一致しない（REQ-21・
+    /// REQ-39。未知のコードを検証済みとして受理しない。PR #220 レビュー
+    /// 指摘 P1）。
     InvalidFailureCode,
     /// `message` が上限（4 KiB）を超える。
     FailureMessageTooLong,
@@ -285,10 +287,7 @@ impl std::fmt::Display for TrainResultError {
                 write!(f, "train result artifact field is malformed: {field}")
             }
             TrainResultError::InvalidFailureCode => {
-                write!(
-                    f,
-                    "train result code must match [a-z_]+ and be 1..=64 bytes"
-                )
+                write!(f, "train result code is not a known failure code")
             }
             TrainResultError::FailureMessageTooLong => {
                 write!(f, "train result message exceeds size limit")

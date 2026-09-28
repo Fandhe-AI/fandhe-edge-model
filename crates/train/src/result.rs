@@ -139,28 +139,141 @@ impl ArtifactRecord {
     }
 }
 
+/// 学習ワーカーが返しうる既知の失敗コード（REQ-21・REQ-39）。
+///
+/// `trainer/src/fandhe_edge_trainer/` 配下（`kinds/` サブディレクトリを含む）
+/// の `WorkerError(code, ...)` 呼び出し箇所を全数 grep して洗い出した 12 種類
+/// に限定する（`errors.py`・`contract.py`・`guard.py`・`artifact.py`・
+/// `cli.py`・`supervisor.py`・`budget.py`・`kinds/__init__.py`・`kinds/c1.py`・
+/// `kinds/c3.py`）。任意の `[a-z_]+` 文字列を検証済みとして受理すると、
+/// ワーカーが本来返さないコード（例: `"success"`）を許してしまう（PR #220
+/// レビュー指摘 P1）ため、許可リストで検証し、未知のコードは
+/// [`TrainResultError::InvalidFailureCode`]（呼び出し元は
+/// `runtime_error`／`RuntimeError`〔70〕として扱う）として拒否する
+/// （fail-closed）。この一致は `crates/train/tests/failure_code_matches_trainer.rs`
+/// で Python 側の grep 結果（`kinds/` を含む再帰走査）と機械照合する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailureCode {
+    /// `contract.py::_invalid_request` 等。リクエストの構文・型・範囲が不正。
+    InvalidRequest,
+    /// `contract.py::_invalid_data`・`kinds/c1.py`。学習データの構造が不正。
+    InvalidData,
+    /// `contract.py::_limit_exceeded`・`budget.py`・`kinds/c1.py`。資源上限
+    /// 超過（REQ-39）。
+    LimitExceeded,
+    /// `guard.py`。経路の構文検証・閉じ込め検証の失敗（REQ-39「経路の閉じ込め」）。
+    InvalidPath,
+    /// `guard.py`。閉じ込め対象の経路に symlink を許さない検証の失敗。
+    SymlinkNotAllowed,
+    /// `artifact.py`。成果物 ONNX の sha256 検証・読み込み失敗
+    /// （REQ-39「完全性と版」）。
+    IntegrityCheckFailed,
+    /// `contract.py`。`out_dir` の予約・確定処理での競合・不整合。
+    OutputConflict,
+    /// `kinds/__init__.py`。未対応の `kind`（学習ワーカー側のレジストリに
+    /// 存在しない種類）。
+    UnsupportedKind,
+    /// `kinds/__init__.py`。指定 `kind` に対応する `kind_version` が未対応。
+    UnsupportedKindVersion,
+    /// `kinds/c1.py`・`kinds/c3.py`。`config` の値が当該 `kind` の許可範囲・
+    /// 許可フィールドを満たさない（本 crate の `TrainRequest` は「JSON
+    /// オブジェクトであること」だけを検査し、`kind` ごとの `config` 検証は
+    /// 再実装しない。モジュール doc「スコープ外」参照）。
+    InvalidConfig,
+    /// `kinds/c1.py`・`kinds/c3.py`。学習ループの損失が非有限値になった
+    /// （作り直し判定・再学習の対象。`ExitCode::Pending`〔12〕に対応）。
+    TrainingDiverged,
+    /// 上記以外のワーカー内部エラー（`supervisor.py` が子プロセスの異常終了・
+    /// 不正な標準出力を検出した場合を含む）。
+    RuntimeError,
+}
+
+impl FailureCode {
+    /// ワーカー出力の `code` 文字列（`errors.py::WorkerError.code`）と同じ
+    /// 語彙。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FailureCode::InvalidRequest => "invalid_request",
+            FailureCode::InvalidData => "invalid_data",
+            FailureCode::LimitExceeded => "limit_exceeded",
+            FailureCode::InvalidPath => "invalid_path",
+            FailureCode::SymlinkNotAllowed => "symlink_not_allowed",
+            FailureCode::IntegrityCheckFailed => "integrity_check_failed",
+            FailureCode::OutputConflict => "output_conflict",
+            FailureCode::UnsupportedKind => "unsupported_kind",
+            FailureCode::UnsupportedKindVersion => "unsupported_kind_version",
+            FailureCode::InvalidConfig => "invalid_config",
+            FailureCode::TrainingDiverged => "training_diverged",
+            FailureCode::RuntimeError => "runtime_error",
+        }
+    }
+
+    /// 許可リストに一致する場合だけ `Some` を返す（fail-closed。未知の
+    /// コードは `None`）。
+    #[must_use]
+    fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "invalid_request" => FailureCode::InvalidRequest,
+            "invalid_data" => FailureCode::InvalidData,
+            "limit_exceeded" => FailureCode::LimitExceeded,
+            "invalid_path" => FailureCode::InvalidPath,
+            "symlink_not_allowed" => FailureCode::SymlinkNotAllowed,
+            "integrity_check_failed" => FailureCode::IntegrityCheckFailed,
+            "output_conflict" => FailureCode::OutputConflict,
+            "unsupported_kind" => FailureCode::UnsupportedKind,
+            "unsupported_kind_version" => FailureCode::UnsupportedKindVersion,
+            "invalid_config" => FailureCode::InvalidConfig,
+            "training_diverged" => FailureCode::TrainingDiverged,
+            "runtime_error" => FailureCode::RuntimeError,
+            _ => return None,
+        })
+    }
+
+    /// 本 crate・`crates/train/tests/failure_code_matches_trainer.rs` が共有
+    /// する全許可コードの一覧（宣言順を安定させ、機械照合テストで走査する）。
+    #[must_use]
+    pub const fn all() -> &'static [FailureCode] {
+        &[
+            FailureCode::InvalidRequest,
+            FailureCode::InvalidData,
+            FailureCode::LimitExceeded,
+            FailureCode::InvalidPath,
+            FailureCode::SymlinkNotAllowed,
+            FailureCode::IntegrityCheckFailed,
+            FailureCode::OutputConflict,
+            FailureCode::UnsupportedKind,
+            FailureCode::UnsupportedKindVersion,
+            FailureCode::InvalidConfig,
+            FailureCode::TrainingDiverged,
+            FailureCode::RuntimeError,
+        ]
+    }
+}
+
+impl Serialize for FailureCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// 失敗時のエラー（`{"status":"error","code":...,"message":...}`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerFailure {
-    code: String,
+    code: FailureCode,
     message: String,
 }
 
-/// `code` の上限バイト数（Rust 側だけの防御。共有スキーマに定義はないが、
-/// リクエストの `MAX_LABEL_BYTES` と同水準に抑える）。
-const MAX_FAILURE_CODE_BYTES: usize = 64;
 /// `message` の上限バイト数（Rust 側だけの防御。`errors.py` はメッセージへ
 /// データ本文を含めない方針だが、想定外の長大化に備える）。
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4 * 1024;
 
 impl WorkerFailure {
     fn parse(code: String, message: String) -> Result<Self, TrainResultError> {
-        let code_is_valid = !code.is_empty()
-            && code.len() <= MAX_FAILURE_CODE_BYTES
-            && code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase());
-        if !code_is_valid {
+        let Some(code) = FailureCode::parse(&code) else {
             return Err(TrainResultError::InvalidFailureCode);
-        }
+        };
         if message.len() > MAX_FAILURE_MESSAGE_BYTES {
             return Err(TrainResultError::FailureMessageTooLong);
         }
@@ -168,7 +281,7 @@ impl WorkerFailure {
     }
 
     pub fn code(&self) -> &str {
-        &self.code
+        self.code.as_str()
     }
 
     pub fn message(&self) -> &str {
@@ -615,6 +728,36 @@ mod tests {
                 assert_eq!(failure.message(), "file not readable: FileNotFoundError");
             }
             TrainOutcome::Ok(_) => panic!("expected Error"),
+        }
+    }
+
+    /// REQ-21・REQ-39・P1（codex 指摘 PR #220）: `code` は許可リスト
+    /// （[`FailureCode`]）に一致する値のみ受理する。ワーカーが返しえない
+    /// コード（`"[a-z_]+"` には一致するが許可リスト外。例: `"success"`）は
+    /// `InvalidFailureCode` として拒否し、検証済みとして受理しない。
+    #[test]
+    fn req39_rejects_unknown_failure_code_not_in_allowlist() {
+        let json = r#"{"status":"error","code":"success","message":"m"}"#;
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        assert!(matches!(err, TrainResultError::InvalidFailureCode));
+        assert_eq!(err.reason_code(), "runtime_error");
+    }
+
+    /// [`FailureCode::all`] の全件が [`FailureCode::as_str`] →
+    /// [`WorkerFailure::parse`] を往復できる（許可リストとパース規則の整合）。
+    #[test]
+    fn req21_all_known_failure_codes_round_trip() {
+        for code in FailureCode::all() {
+            let json = format!(
+                r#"{{"status":"error","code":"{}","message":"m"}}"#,
+                code.as_str()
+            );
+            let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request())
+                .expect("known failure code must be accepted");
+            match outcome {
+                TrainOutcome::Error(failure) => assert_eq!(failure.code(), code.as_str()),
+                TrainOutcome::Ok(_) => panic!("expected Error"),
+            }
         }
     }
 
