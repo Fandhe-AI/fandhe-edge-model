@@ -1209,12 +1209,21 @@ pub fn prepare_evaluation_input(
     // Exclude 系警告に加え、DuplicateInputWithinSplit・ContradictoryInput も
     // 積まれているため、[`NoValidGold::warnings`] には Exclude 系だけでなく
     // 矛盾除外の内訳も含める。
+    //
+    // EmptyInput も含める（codex レビュー指摘。PR #212）: [`drain_warnings_in_order`]
+    // は `order` に列挙されなかった code を `lines_by_code` へ残したまま
+    // 返るが、この関数はここで早期 return するため、含めなかった code は
+    // 呼び出し元へ届かず消える。手順 7 で `accepted` 全行が矛盾除外されると
+    // EmptyInput（空白のみの `input`）の検知が報告されないまま停止し、
+    // REQ-23 境界値・TASK-23.2 の「検知・報告」を満たさなくなるため、
+    // EXCLUDE_ORDER の末尾へ加えて必ず持ち出す。
     if accepted.is_empty() {
-        const EXCLUDE_ORDER: [WarningCode; 4] = [
+        const EXCLUDE_ORDER: [WarningCode; 5] = [
             WarningCode::MissingGold,
             WarningCode::MalformedGold,
             WarningCode::UnknownGoldLabel,
             WarningCode::ContradictoryInput,
+            WarningCode::EmptyInput,
         ];
         let warnings = drain_warnings_in_order(&mut lines_by_code, &EXCLUDE_ORDER);
         return Err(EvalInputStop::NoValidGold {
@@ -2585,6 +2594,12 @@ mod tests {
     /// [`WarningCode::ContradictoryInput`] で `active` から除外されつつ、
     /// [`WarningCode::EmptyInput`] にも両行が報告される（矛盾除外より前に
     /// 検出するため報告が漏れない。REQ-23 境界値・TASK-23.2）。
+    /// 2 行とも矛盾除外され `active` が 0 件になり
+    /// [`EvalInputStop::NoValidGold`] で停止しても、`warnings` に
+    /// ContradictoryInput・EmptyInput の両方が含まれること（codex レビュー
+    /// 指摘・PR #212。修正前は EXCLUDE_ORDER に EmptyInput が無く、
+    /// `drain_warnings_in_order` の対象外として `lines_by_code` に残ったまま
+    /// 破棄され、報告が漏れていた）。
     #[test]
     fn req23_empty_input_reported_even_when_contradictory_excludes_rows() {
         let gold = concat!(
@@ -2596,9 +2611,6 @@ mod tests {
             "{\"id\":\"g2\",\"status\":\"ok\",\"predicted_label\":\"B\"}\n",
         );
         let result = prepare_evaluation_input(gold, pred, &labels(&["A", "B"]));
-        // 2 行とも矛盾除外され `active` が 0 件になるため NoValidGold で停止する
-        // （手順 7b）。`NoValidGold::warnings` には ContradictoryInput が含まれる
-        // （EXCLUDE_ORDER に EmptyInput は含めない。手順 6 と同じ判断）。
         match result {
             Err(EvalInputStop::NoValidGold { warnings, .. }) => {
                 assert!(
@@ -2606,6 +2618,11 @@ mod tests {
                         .iter()
                         .any(|w| w.code == WarningCode::ContradictoryInput
                             && w.lines == vec![1, 2])
+                );
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.code == WarningCode::EmptyInput && w.lines == vec![1, 2])
                 );
             }
             other => panic!("expected NoValidGold, got {other:?}"),
