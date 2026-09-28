@@ -283,6 +283,32 @@ pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// 任意の `Serialize` 値を [`canonical_json`] で正準化してから sha256 を計算し、
+/// 小文字 16 進 64 桁で返す（REQ-15・REQ-17・TASK-17.1-2）。
+///
+/// # 呼び出し文脈
+///
+/// データ契約層（`crates/data`。TASK-17.1-2・issue #45）の分割記録
+/// （`split_record` モジュール想定）が、各 split に属するレコード ID 集合
+/// （`Vec<String>` を正準化 JSON にしたもの）のハッシュを計算するために使う。
+/// `Definition` の正準化ハッシュ（[`DefinitionHash`]・[`DefinitionIdentity`]）
+/// とは独立した用途であり、本関数はどちらの型にも依存しない汎用ユーティリティ
+/// として `canonical.rs` に置く（正準化ハッシュの規則を 1 箇所に集約する。REQ-15）。
+///
+/// [`crate::hash::sha256_hex_of_reader`]（生バイト列のストリーミング sha256。
+/// 評価データの凍結〔REQ-17〕向け）とは別物であり、本関数は必ず
+/// [`canonical_json`] を経由した値のみを対象にする。
+///
+/// # エラー
+///
+/// [`canonical_json`] と同じ理由（`Serialize` の失敗・浮動小数の混入）で
+/// [`CanonicalError`] を返す。
+pub fn canonical_sha256_hex<T: serde::Serialize>(value: &T) -> Result<String, CanonicalError> {
+    let json = canonical_json(value)?;
+    let digest = sha256_hex_bytes(json.as_bytes());
+    Ok(crate::hash::lower_hex(&digest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +531,42 @@ mod tests {
     fn canonical_json_rejects_floating_point_numbers() {
         let value = serde_json::json!({ "x": 1.5 });
         let err = canonical_json(&value).unwrap_err();
+        assert!(matches!(err, CanonicalError::UnsupportedNumber));
+    }
+
+    /// REQ-17・TASK-17.1-2（#45）: 空配列の正準化ハッシュは
+    /// `printf '%s' '[]' | sha256sum` で独立に確認した具体値と一致する
+    /// （データ契約層の分割記録が「空 split」のハッシュとして期待する値）。
+    #[test]
+    fn req15_task17_1_2_canonical_sha256_hex_empty_array() {
+        let empty: Vec<String> = Vec::new();
+        let hash = canonical_sha256_hex(&empty).expect("失敗しないはず");
+        assert_eq!(
+            hash,
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+    }
+
+    /// REQ-17・TASK-17.1-2（#45）: レコード ID の配列を正準化してからハッシュする
+    /// （`canonical_json` を経由せず直接 `["r3","r5","r7"]` を sha256 した値と
+    /// 一致することを、独立に `sha256sum` で確認済み）。
+    #[test]
+    fn req15_task17_1_2_canonical_sha256_hex_record_id_array() {
+        let ids = vec!["r3".to_string(), "r5".to_string(), "r7".to_string()];
+        let hash = canonical_sha256_hex(&ids).expect("失敗しないはず");
+        assert_eq!(
+            hash,
+            "ee2e2d9dc6ea31ad72a86008dd1f78ff9360db159455c5456ebf973fc123168e"
+        );
+    }
+
+    /// REQ-15・TASK-17.1-2（#45）: 浮動小数を含む値は `canonical_json` と同じく
+    /// `UnsupportedNumber` で拒否する（正準化ハッシュの規則を 1 箇所に集約する
+    /// という設計を、新しいエントリポイントでも維持することの確認）。
+    #[test]
+    fn canonical_sha256_hex_rejects_floating_point_numbers() {
+        let value = serde_json::json!({ "x": 1.5 });
+        let err = canonical_sha256_hex(&value).unwrap_err();
         assert!(matches!(err, CanonicalError::UnsupportedNumber));
     }
 
