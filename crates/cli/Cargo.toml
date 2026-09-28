@@ -7,6 +7,10 @@ repository.workspace = true
 publish.workspace = true
 description = "Thin CLI adapter for the register/inspect/train/evaluate/select/package/infer pipeline"
 
+[lib]
+name = "fandhe_edge_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fandhe-edge"
 path = "src/main.rs"
