@@ -20,7 +20,10 @@
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
 //! - [`invariance`][]: モデルパッケージ（重み・語彙・校正・しきい値）の
-//!   評価前後ハッシュ比較（REQ-27 正常系・TASK-27.1-1・issue #69）
+//!   評価前後ハッシュ比較（REQ-27 正常系・TASK-27.1-1・issue #69）。
+//!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
+//!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
+//!   工程（将来）から評価処理を渡す想定
 //!
 //! # 現状（実装済みを装わない）
 //!
