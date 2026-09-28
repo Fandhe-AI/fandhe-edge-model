@@ -10,8 +10,11 @@
 //!   第二のスキーマ固定値として拒否条件には使わない（PR #187 レビュー指摘）。
 //!   さらに同 PR の追加レビュー指摘に基づき、`Definition` を `Deserialize` させず
 //!   `parse` 限定の未検証中間型（`RawDefinition`）を経由させることでガード層の
-//!   迂回を防ぎ、`load` では FIFO 等の特殊ファイルに対する `File::open` の無期限
-//!   停止を避ける（`NotRegularFile`。Linux・macOS では `O_NONBLOCK` で開く）
+//!   迂回を防ぐ。`load` の通常ファイル判定・サイズ上限・FIFO 等の特殊ファイルに
+//!   対する無期限停止の回避（`NotRegularFile`。Linux・macOS では `O_NONBLOCK` で
+//!   開く）は [`crate::fs`] モジュールへ集約済み（issue #214 codex/review 指摘:
+//!   評価器〔`crates/eval`〕が同じ防御を個別複製していた状態を解消し、両者が
+//!   [`crate::fs::read_bounded`] を共有する）
 //! - TASK-15.3-2（本ファイル + `diagnose` サブモジュール）: `RawDefinition` への
 //!   型付きデシリアライズが `serde_json::Error::classify()` で `Data`（構文
 //!   エラーではない）に分類される失敗を、`diagnose` モジュールで
@@ -702,95 +705,23 @@ impl Definition {
     /// ファイルハンドルに対して行い、`MAX_DEFINITION_FILE_BYTES` を超える
     /// 場合は上限+1バイトを超えた時点で打ち切って拒否する（REQ-39）。
     ///
-    /// `std::fs::metadata` でサイズを確認した後に `read_to_string` がパスを
-    /// 再度開く実装は、確認後にファイルが拡大・差し替えられると上限を超えて
-    /// 無制限にメモリへ読み込みうる（TOCTOU。security.md「ガード層: 資源の上限」）。
-    /// ここでは 1 つの `File` から metadata 取得・`take` による打ち切り読み込みまで
-    /// 行い、その間の再オープンを避けることでこの窓を閉じる。
-    ///
-    /// FIFO・ソケット・キャラクタデバイス等を指すパスを渡されると、通常の
-    /// `File::open` は書き手が現れるまで無期限に停止しうる（security.md
-    /// 「ガード層: 資源の上限」。PR #187 レビュー指摘）。Linux・macOS では
-    /// `open(2)` に `O_NONBLOCK` を付けて開くことでこの停止を避け（POSIX:
-    /// `O_NONBLOCK` は通常ファイルの読み込み完了には影響しない）、開いた後に
-    /// 種別を確認して通常ファイル以外を拒否する。両 OS 以外（Windows 等。
-    /// 検証環境は Mac のみで Windows は M10 時点で対象外）では通常の
-    /// `File::open` にフォールバックする（coding-rust.md「クロスプラット
-    /// フォーム」）。
+    /// 通常ファイル判定・TOCTOU 対策（`std::fs::metadata` でのサイズ確認後に
+    /// ファイルが拡大・差し替えられても無制限に読み込まない）・FIFO 等での
+    /// 無期限停止の回避（Linux・macOS では `O_NONBLOCK` で開く）は
+    /// [`crate::fs::read_bounded`] へ集約済み。以前はこの防御を本モジュールと
+    /// 評価器（`fandhe-edge-eval` の `invariance` モジュール）が個別に複製して
+    /// おり、一方だけを直すと他方が古いままになりうる状態だった
+    /// （issue #214 codex/review 指摘）。
     ///
     /// 経路の閉じ込め（`../` 等の拒否）は操作アダプターのガード層（TASK-39.x）の
     /// 責務であり、ここでは行わない。
     pub fn load(path: &Path) -> Result<Self, DefinitionError> {
-        use std::io::Read as _;
-
-        let mut file = Self::open_for_read(path)?;
-        let metadata = file.metadata().map_err(|source| DefinitionError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if !metadata.file_type().is_file() {
-            return Err(DefinitionError::NotRegularFile {
-                path: path.to_path_buf(),
-            });
-        }
-        let reported_size = metadata.len();
-        if reported_size > MAX_DEFINITION_FILE_BYTES {
-            return Err(DefinitionError::TooLarge {
-                path: Some(path.to_path_buf()),
-                size: reported_size,
-                limit: MAX_DEFINITION_FILE_BYTES,
-            });
-        }
-
-        // 上限+1バイトまでしか読まない。開いた後にファイルが上限超へ拡大・
-        // 差し替えられていても、読み込み量自体を上限近傍で頭打ちにできる。
-        let mut buf = Vec::new();
-        (&mut file)
-            .take(MAX_DEFINITION_FILE_BYTES.saturating_add(1))
-            .read_to_end(&mut buf)
-            .map_err(|source| DefinitionError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let actual_size = buf.len() as u64;
-        if actual_size > MAX_DEFINITION_FILE_BYTES {
-            return Err(DefinitionError::TooLarge {
-                path: Some(path.to_path_buf()),
-                size: actual_size,
-                limit: MAX_DEFINITION_FILE_BYTES,
-            });
-        }
-
-        let text = String::from_utf8(buf).map_err(|err| DefinitionError::Read {
+        let bytes = crate::fs::read_bounded(path, MAX_DEFINITION_FILE_BYTES)?;
+        let text = String::from_utf8(bytes).map_err(|err| DefinitionError::Read {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
         })?;
         Self::parse(&text)
-    }
-
-    /// `load` の内部専用: FIFO 等での無期限停止を避けるため `O_NONBLOCK` 付きで
-    /// 開く（Linux・macOS）。`file_type().is_file()` の検査は `load` 側で行う。
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn open_for_read(path: &Path) -> Result<std::fs::File, DefinitionError> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        // `O_NONBLOCK` はカーネル ABI の安定値（Linux は全対応アーキテクチャで
-        // 8進 0o4000、macOS（BSD 系）は 0x0004）。`libc` 等の新規依存を追加
-        // せず（dependency-policy.md）標準ライブラリの `custom_flags` のみで
-        // 実現するため、対応 OS を限定してハードコードする。
-        #[cfg(target_os = "linux")]
-        const O_NONBLOCK: i32 = 0o4000;
-        #[cfg(target_os = "macos")]
-        const O_NONBLOCK: i32 = 0x0004;
-
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK)
-            .open(path)
-            .map_err(|source| DefinitionError::Read {
-                path: path.to_path_buf(),
-                source,
-            })
     }
 
     /// 検証済みの `schema` フィールドを返す（`SCHEMA_ID` と一致することが
@@ -852,17 +783,24 @@ impl Definition {
             json.as_bytes(),
         ))
     }
+}
 
-    /// `load` の内部専用: Linux・macOS 以外（Windows 等）向けのフォールバック。
-    /// `O_NONBLOCK` 相当の対策は持たないが、Windows は M10 時点で対象外
-    /// （coding-rust.md「クロスプラットフォーム」）であり、`file_type().is_file()`
-    /// による通常ファイル以外の拒否は `load` 側で引き続き行う。
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn open_for_read(path: &Path) -> Result<std::fs::File, DefinitionError> {
-        std::fs::File::open(path).map_err(|source| DefinitionError::Read {
-            path: path.to_path_buf(),
-            source,
-        })
+/// [`crate::fs::FsError`] を [`DefinitionError`] へ写す（[`Definition::load`] が
+/// [`crate::fs::read_bounded`] のエラーをそのまま呼び出し元へ返せるようにする。
+/// `FsError::TooLarge` はファイルパス経由の呼び出しに限られる（本 crate 内で
+/// `read_bounded` を呼ぶのは `load` のみで、`path` 無しの呼び出しは無い）ため、
+/// `DefinitionError::TooLarge` の `path` は必ず `Some` になる）。
+impl From<crate::fs::FsError> for DefinitionError {
+    fn from(err: crate::fs::FsError) -> Self {
+        match err {
+            crate::fs::FsError::Read { path, source } => DefinitionError::Read { path, source },
+            crate::fs::FsError::TooLarge { path, size, limit } => DefinitionError::TooLarge {
+                path: Some(path),
+                size,
+                limit,
+            },
+            crate::fs::FsError::NotRegularFile { path } => DefinitionError::NotRegularFile { path },
+        }
     }
 }
 
