@@ -27,7 +27,8 @@
 //!   評価前後ハッシュ比較（REQ-27 正常系・TASK-27.1-1・issue #69）。
 //!   `invariance::evaluate_with_invariance` は評価経路そのものを前後の
 //!   ディスク再読み込み＋ハッシュ比較で包む公開 API で、CLI の `evaluate`
-//!   工程（将来）から評価処理を渡す想定
+//!   工程（将来）から評価処理を渡す想定。評価中に構成要素ファイルが削除
+//!   された場合は `Removed` として報告する（issue #226）
 //! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
 //!   必要評価件数の事前計算（Connor 式。REQ-25 異常系・TASK-25.2・
 //!   issue #66）。[`significance::RequiredSampleSize`] を
