@@ -38,9 +38,10 @@
 //! # 対象外（本 issue の範囲外）
 //!
 //! - 選定記録型・探索予算の積算・最高正解率の選定そのもの（TASK-18.1-2・#84）
-//! - 件数不足時の「判定不能」を選定が合格扱いにしないことの確認テスト
-//!   （TASK-18.3-2・#88。`verdict()` が [`fandhe_edge_eval::significance::BaselineVerdict`]
-//!   をそのまま返すため #88 は API 変更なしでテストを書ける）
+//! - 件数不足時の「判定不能」を選定が合格扱いにしないことの確認は
+//!   `crates/train/tests/selection_undeterminable.rs`（TASK-18.3-2・#88）で
+//!   行う。`verdict()` が [`fandhe_edge_eval::significance::BaselineVerdict`]
+//!   をそのまま返すため #88 は本モジュールの API 変更なしでテストできる
 //! - 「予算到達」候補を合格扱いにしない判定（TASK-18.2・#85）
 //! - 「3 seed すべてで有意」の集約
 //! - 脱落候補を個別に「有意でない」と記録・報告する規則（本モジュールは
