@@ -6,8 +6,9 @@
 //! （REQ-16 の漏洩検出と対をなす不変条件）。本モジュールは group を跨がない
 //! 決定的な分割アルゴリズムのみを提供する。
 //!
-//! 分割の seed・規則・各分割のハッシュの記録と永続化・凍結は後続
-//! TASK-17.1-2（#45）・TASK-17.2・TASK-17.3 の責務であり、本モジュールは
+//! 分割の seed・規則・各分割のハッシュの記録と永続化は [`crate::split_record`]
+//! （TASK-17.1-2・#45）が担う。凍結（読み取り専用配置・ハッシュ不一致での
+//! 停止）は後続 TASK-17.2・TASK-17.3 の責務であり、本モジュールは
 //! それらが消費できる構造化された分割結果（[`SplitResult`]）を返すところまでを担う。
 //!
 //! # Python 実装との関係
@@ -48,11 +49,33 @@ pub trait Groupable {
 }
 
 /// 分割先（REQ-17: train / validation / test の 3 分割）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `serde` の派生は [`crate::split_record`]（TASK-17.1-2・#45）の永続化
+/// （`SplitRecord::to_json` / `from_json_str`）専用で、`rename_all = "lowercase"`
+/// により PoC-9・PoC-10 と同じ `"train"` / `"validation"` / `"test"` の文字列と
+/// 対応させる。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Split {
     Train,
     Validation,
     Test,
+}
+
+impl Split {
+    /// `"train"` / `"validation"` / `"test"`（[`crate::split_record`] が
+    /// レコード ID をハッシュ入力へ正準化する際、分割名を文字列として
+    /// 扱うために使う）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Split::Train => "train",
+            Split::Validation => "validation",
+            Split::Test => "test",
+        }
+    }
 }
 
 /// 分割比率（既定 0.8 / 0.1 / 0.1。PoC-9・PoC-10 の実測値）。
@@ -75,7 +98,7 @@ pub enum Split {
 /// `n=1` で `(0, 1, 0)`、`n=2` で `(0, 2, 0)` になる）。比率が全て非ゼロの場合は
 /// 比率降順（同率は Train > Test > Validation の順）に 1 件ずつ配るため、
 /// 既定比率では `n=1` は `(1, 0, 0)`、`n=2` は `(1, 0, 1)` になる。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SplitRatios {
     pub train: f64,
     pub validation: f64,
@@ -100,7 +123,7 @@ impl SplitRatios {
     ///
     /// NaN・負値・区間外・合計の逸脱を `unwrap` / `expect` を使わず `Result` で拒否する
     /// （外部由来の設定値であっても panic させない。coding-rust.md）。
-    fn validate(&self) -> Result<(), SplitError> {
+    pub(crate) fn validate(&self) -> Result<(), SplitError> {
         let values = [self.train, self.validation, self.test];
         for value in values {
             if !(0.0..=1.0).contains(&value) {
@@ -116,8 +139,23 @@ impl SplitRatios {
     }
 }
 
-/// 1 ラベルあたりの group 件数の割付内訳（#45 が分割規則の記録に使う）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 1 ラベルあたりの group 件数の割付内訳（[`crate::split_record`]・#45 が
+/// 分割規則の記録に使う）。
+///
+/// `deny_unknown_fields` を指定し、[`crate::split_record`] の
+/// `SplitRecordDto` 経由で外部 JSON から復元する際、`per_label` の要素に
+/// 余分なキーが混入しても黙って無視せず拒否する（他の永続化用 DTO と
+/// 同じ厳格構造検証の契約。coding-rust.md「外部入力」）。
+///
+/// `Debug` は派生させず手動実装する（下記）。`label` は利用者のデータ由来の
+/// ラベル文字列であり、`derive(Debug)` のまま `{:?}` で出力するとそのまま
+/// ログへ漏れる（security.md「秘密情報の混入防止」。PR #210 codex レビュー
+/// P0 指摘: `SplitRule::per_label()` が返すスライスを直接 `{:?}` した場合も
+/// 同じ経路で漏れうるため、この型自体で伏せる）。`Serialize`/`Deserialize`
+/// は永続化用のため実値のまま維持する（Debug とは別の経路であり、
+/// 呼び出し元がファイル I/O を通じて意図的に読み書きする値のため）。
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LabelAllocation {
     pub label: String,
     pub n_groups: usize,
@@ -126,13 +164,33 @@ pub struct LabelAllocation {
     pub test: usize,
 }
 
+impl std::fmt::Debug for LabelAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabelAllocation")
+            .field("label", &"<redacted>")
+            .field("n_groups", &self.n_groups)
+            .field("train", &self.train)
+            .field("validation", &self.validation)
+            .field("test", &self.test)
+            .finish()
+    }
+}
+
 /// 分割結果一式。
 ///
 /// フィールドはすべて `BTreeMap` とし、反復順序が実行のたびに変わらないようにする
 /// （`HashMap` は使わない。決定性の不変条件を壊す典型的な原因のため。
 /// [evaluation-contract](../../../.claude/rules/evaluation-contract.md)）。
 /// 後続 #45（TASK-17.1-2）はこの型から各 split のレコード ID 集合を取り出してハッシュ化する。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`by_record`・`by_group` は
+/// レコード ID・group ID を実キーとして持ち、`per_label` は
+/// [`LabelAllocation`] 経由でラベル文字列を持つため、`derive(Debug)` の
+/// まま `{:?}` で出力するとそれらがすべてログへ漏れる（security.md
+/// 「秘密情報の混入防止」。PR #210 codex レビュー P0 指摘: この型を返す
+/// [`crate::split_record::RecordedSplit::result`] を直接 `{:?}` した場合に
+/// 漏れる経路があったため、この型自体で伏せる）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SplitResult {
     pub by_record: BTreeMap<String, Split>,
     pub by_group: BTreeMap<String, Split>,
@@ -142,11 +200,33 @@ pub struct SplitResult {
     pub rule_id: &'static str,
 }
 
+impl std::fmt::Debug for SplitResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitResult")
+            .field(
+                "by_record",
+                &format_args!("<redacted {} records>", self.by_record.len()),
+            )
+            .field(
+                "by_group",
+                &format_args!("<redacted {} groups>", self.by_group.len()),
+            )
+            .field("per_label", &self.per_label)
+            .field("rule_id", &self.rule_id)
+            .finish()
+    }
+}
+
 /// 割付規則・PRNG 実装の識別子。値を変えたら過去の分割結果との互換性が失われる。
 const RULE_ID: &str = "group-stratified-v1/alloc-poc9/splitmix64-fisher-yates";
 
 /// 分割の入力検証エラー。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は派生させず手動実装する（下記）。`DuplicateRecordId` の実際の
+/// レコード ID を `{:?}` 経由で漏らさないため（security.md「秘密情報の混入防止」。
+/// PR #210 codex レビュー P0 指摘: `SplitRecordError` 等がこの型を包んで
+/// `derive(Debug)` すると、レコード ID がログへ漏れていた）。
+#[derive(Clone, PartialEq, Eq)]
 pub enum SplitError {
     /// `SplitRatios` が区間外・NaN・合計が 1.0 から許容差を超えて外れている。
     InvalidRatios,
@@ -160,6 +240,39 @@ pub enum SplitError {
     /// レコード ID の一意性は本モジュールの入力契約として検証する
     /// （`id()` の形式検査自体は呼び出し側の責務のまま。[`Groupable::id`]）。
     DuplicateRecordId(String),
+}
+
+/// `Display` は英語の固定文言のみを返し、`DuplicateRecordId` が保持する
+/// 実際のレコード ID を出力しない（security.md「秘密情報の混入防止」。
+/// 学習データの内容を漏らさないため。`{:?}` での表示はこの契約を破るため、
+/// 呼び出し側〔[`crate::split_record::SplitRecordError`]〕は必ずこの
+/// `Display` 実装（`{}`）経由でメッセージを組み立てること）。
+impl std::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::InvalidRatios => write!(f, "invalid split ratios"),
+            SplitError::DuplicateRecordId(_) => {
+                write!(f, "duplicate record id in input records")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitError {}
+
+/// `Display` と同じく固定の英語文言のみを出力し、`DuplicateRecordId` が
+/// 保持する実際のレコード ID は出力しない（security.md「秘密情報の混入防止」。
+/// PR #210 codex レビュー P0 指摘。`derive(Debug)` の既定実装はタプル要素を
+/// そのまま出力してしまうため、ここで手動実装して塞ぐ）。
+impl std::fmt::Debug for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::InvalidRatios => write!(f, "InvalidRatios"),
+            SplitError::DuplicateRecordId(_) => {
+                write!(f, "DuplicateRecordId(<redacted>)")
+            }
+        }
+    }
 }
 
 /// `n` 件の group を train / validation / test へ割り付ける件数を決める。
