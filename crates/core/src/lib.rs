@@ -31,8 +31,12 @@
 //! 機械可読 JSON エラー型を実装済み。`judgment` モジュールは TASK-21.1-2 で
 //! ok 終了時の判定結果型（選択肢 ID・スコア）を実装済み（CLI 側の出力配線
 //! は TASK-33.1/33.2 の対象で未着手）。
+//! `infer_input` モジュールは TASK-21.2 で推論入力レコードの未知形式・型
+//! 不正を検出し `invalid_input`／`limit_exceeded` へ写す型を実装済み
+//! （CLI バイナリへの配線は TASK-33.x の対象で未着手）。
 
 pub mod canonical;
 pub mod definition;
 pub mod exitcode;
+pub mod infer_input;
 pub mod judgment;

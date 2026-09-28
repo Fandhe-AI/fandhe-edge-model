@@ -1,23 +1,36 @@
-//! ok 終了時の判定結果 JSON を stdout 相当の `Write` へ書き出す出力関数
-//! （REQ-21 正常系・TASK-21.1-2）。
+//! 判定結果・エラーの JSON を stdout／stderr 相当の `Write` へ書き出す出力
+//! 関数（REQ-21 正常系・TASK-21.1-2。異常系・TASK-21.2）。
 //!
 //! # 呼び出し文脈
 //!
 //! 呼び出し元は CLI の `infer` サブコマンド（TASK-33.1。現状は未配線。
 //! `main.rs` は依然として引数を読まず exit 70 を返すスタブのまま）。配線後
-//! は `std::io::stdout().lock()` を渡し、戻り値の [`ExitCode::Ok`] を
+//! は `std::io::stdout().lock()` を渡し、戻り値の [`ExitCode`] を
 //! `main` の戻り値としてそのまま使う想定。`--input-file` 経由の一括推論
 //! （evaluation-contract.md が認める「1 行 1 JSON」の例外）でも、入力 1 件
 //! ごとに本関数を 1 回呼ぶ形で同じ契約を再利用する想定。
 //!
-//! 業務ロジック（選択肢・スコアの検証）は `fandhe-edge-core` の
-//! `judgment::JudgmentResult::new` 側が担い、本関数は「検証済みの値を 1 行
-//! の JSON として書く」だけの薄いアダプターに留める
+//! 業務ロジック（選択肢・スコアの検証、推論入力の型検証）は
+//! `fandhe-edge-core` の `judgment::JudgmentResult::new`・
+//! `infer_input::InferInput::parse` 側が担い、本モジュールは「検証済みの
+//! 値・エラーを 1 行の JSON として書く」だけの薄いアダプターに留める
 //! （`.claude/rules/coding-rust.md`「操作アダプターは薄く保ち、業務ロジッ
 //! クは下位層に置く」）。
+//!
+//! # 異常系（TASK-21.2）
+//!
+//! [`write_error_report`] は [`ErrorReport`] を JSON 1 行として書き出す。
+//! `ErrorReport` のスキーマ（`{"code","message"}`）はここでは拡張しない
+//! （REQ-21・REQ-33 の入出力契約の変更はユーザー承認事項。
+//! `.claude/rules/evaluation-contract.md`）。`infer_input_error_report`・
+//! `judgment_error_report`・`definition_error_report` は各層のエラー型を
+//! `ErrorReport` へ変換するだけの薄い関数で、`message` の生成規則
+//! （`Display`）自体は各エラー型の実装に委ねる。
 
-use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::judgment::JudgmentResult;
+use fandhe_edge_core::definition::DefinitionError;
+use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::infer_input::InferInputError;
+use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
 use std::io::{self, Write};
 
 /// [`JudgmentResult`] を JSON 1 行＋改行として `out` へ書き、
@@ -60,6 +73,63 @@ pub fn write_ok_judgment<W: Write>(out: &mut W, result: &JudgmentResult) -> io::
     out.flush()?;
 
     Ok(result.exit_code())
+}
+
+/// [`ErrorReport`] を JSON 1 行＋改行として `out` へ書き、
+/// `report.code` を返す（TASK-21.2）。
+///
+/// [`write_ok_judgment`] と同じ保証を持つ: 直列化に失敗した場合は `out` へ
+/// 何も書かず `Err` を返し、`write_all` は 1 回の呼び出しにつき高々 1 回
+/// しか実行しない（部分書き込み失敗時にリトライ・追記・flush をしない。
+/// `write_ok_judgment` のドキュメントコメント「部分書き込み失敗時の方
+/// 針」と同じ理由・同じ呼び出し側の責務）。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を
+/// `io::Error`（`ErrorKind::Other` または下位の I/O エラー）として返す。
+pub fn write_error_report<W: Write>(out: &mut W, report: &ErrorReport) -> io::Result<ExitCode> {
+    let mut line = report
+        .to_json_line()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(report.code)
+}
+
+/// [`InferInputError`] を [`ErrorReport`] へ変換する薄い関数。
+///
+/// 業務ロジックは持たない（`code = err.exit_code()`、
+/// `message = err.to_string()`）。`InferInputError::Display` は入力本文・
+/// `id` の値・未知キー名を含めないため（`infer_input.rs` のドキュメント
+/// 参照）、本関数を経由しても秘密情報の混入防止（security.md）は保たれ
+/// る。
+#[must_use]
+pub fn infer_input_error_report(err: &InferInputError) -> ErrorReport {
+    ErrorReport::new(err.exit_code(), err.to_string())
+}
+
+/// [`JudgmentError`] を [`ErrorReport`] へ変換する薄い関数
+/// （[`infer_input_error_report`] と対称）。
+#[must_use]
+pub fn judgment_error_report(err: &JudgmentError) -> ErrorReport {
+    ErrorReport::new(err.exit_code(), err.to_string())
+}
+
+/// [`DefinitionError`] を [`ErrorReport`] へ変換する薄い関数
+/// （[`infer_input_error_report`] と対称）。
+///
+/// `DefinitionError::Display` は `DefinitionError::Read`／
+/// `DefinitionError::NotRegularFile` でパスを含みうるが、これは
+/// `definition.rs` 側で確定済みの既存の `Display` 実装の挙動であり、本
+/// 変換関数はそれを変更しない（TASK-21.2 のスコープはエラー型から
+/// `ErrorReport` への薄い変換に限り、`Display` の内容自体の見直しは対象
+/// 外）。
+#[must_use]
+pub fn definition_error_report(err: &DefinitionError) -> ErrorReport {
+    ErrorReport::new(err.exit_code(), err.to_string())
 }
 
 #[cfg(test)]
@@ -229,5 +299,124 @@ mod tests {
             4,
             "out 側に残るのは write_all が内部で書いた分のみで、本関数がそれ以上書き足してはならない"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TASK-21.2: write_error_report・エラー変換関数
+    // ------------------------------------------------------------------
+
+    /// TASK-21.2: `write_error_report` がバッファに JSON 1 行＋改行のみを
+    /// 書き、戻り値が `ExitCode::InvalidInput`（`.code() == 64`）であるこ
+    /// と（厳密な文字列一致）。
+    #[test]
+    fn req21_write_error_report_writes_single_json_line_and_returns_code() {
+        let report = fandhe_edge_core::exitcode::ErrorReport::new(
+            ExitCode::InvalidInput,
+            "missing required field: input",
+        );
+
+        let mut buffer: Vec<u8> = Vec::new();
+        let exit_code = write_error_report(&mut buffer, &report).unwrap();
+
+        assert_eq!(exit_code, ExitCode::InvalidInput);
+        assert_eq!(exit_code.code(), 64);
+
+        let text = String::from_utf8(buffer).unwrap();
+        assert_eq!(
+            text,
+            "{\"code\":\"invalid_input\",\"message\":\"missing required field: input\"}\n"
+        );
+        assert_eq!(text.matches('\n').count(), 1, "must write exactly one line");
+    }
+
+    /// TASK-21.2: 書き込みに失敗する `Write` を渡した場合、`Err` が返るこ
+    /// と（`write_ok_judgment` の同種テストと同じ確認）。
+    #[test]
+    fn req21_write_error_report_propagates_write_failure() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let report = fandhe_edge_core::exitcode::ErrorReport::new(ExitCode::InvalidInput, "boom");
+        let mut writer = FailingWriter;
+        let outcome = write_error_report(&mut writer, &report);
+        assert!(outcome.is_err());
+    }
+
+    /// TASK-21.2: 部分書き込み後に失敗する `Write` を渡した場合でも、本
+    /// 関数が追加で `write` を呼ばず `flush` を呼ばないこと
+    /// （`write_ok_judgment` の同種テストと同じ確認）。
+    #[test]
+    fn req21_write_error_report_stops_after_partial_write_failure_without_flush() {
+        struct PartialThenFailingWriter {
+            written: Vec<u8>,
+            write_calls: usize,
+            flush_calls: usize,
+        }
+        impl Write for PartialThenFailingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.write_calls += 1;
+                if self.write_calls == 1 {
+                    let n = buf.len().min(4);
+                    self.written.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                } else {
+                    Err(io::Error::other("simulated partial write failure"))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flush_calls += 1;
+                Ok(())
+            }
+        }
+
+        let report = fandhe_edge_core::exitcode::ErrorReport::new(ExitCode::InvalidInput, "boom");
+        let mut writer = PartialThenFailingWriter {
+            written: Vec::new(),
+            write_calls: 0,
+            flush_calls: 0,
+        };
+        let outcome = write_error_report(&mut writer, &report);
+
+        assert!(outcome.is_err());
+        assert_eq!(writer.write_calls, 2);
+        assert_eq!(writer.flush_calls, 0);
+        assert_eq!(writer.written.len(), 4);
+    }
+
+    /// TASK-21.2: `infer_input_error_report` が `code`／`message` を
+    /// `InferInputError` から正しく写すこと。
+    #[test]
+    fn req21_infer_input_error_report_maps_code_and_message() {
+        let err = InferInputError::EmptyId;
+        let report = infer_input_error_report(&err);
+        assert_eq!(report.code, ExitCode::InvalidInput);
+        assert_eq!(report.message, err.to_string());
+    }
+
+    /// TASK-21.2: `judgment_error_report` が `code`／`message` を
+    /// `JudgmentError` から正しく写すこと。
+    #[test]
+    fn req21_judgment_error_report_maps_code_and_message() {
+        let err = JudgmentError::EmptyOptions;
+        let report = judgment_error_report(&err);
+        assert_eq!(report.code, ExitCode::InvalidInput);
+        assert_eq!(report.message, err.to_string());
+    }
+
+    /// TASK-21.2: `definition_error_report` が `code`／`message` を
+    /// `DefinitionError` から正しく写すこと。
+    #[test]
+    fn req21_definition_error_report_maps_code_and_message() {
+        let err = DefinitionError::EmptyOptions;
+        let report = definition_error_report(&err);
+        assert_eq!(report.code, ExitCode::InvalidInput);
+        assert_eq!(report.message, err.to_string());
     }
 }
