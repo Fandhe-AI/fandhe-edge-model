@@ -15,6 +15,10 @@
 //!   （REQ-25 正常系・TASK-25.1-1・issue #64）
 //! - [`baseline`][]: 下限基準（majority）の予測生成（REQ-25・TASK-25.1-2・
 //!   issue #65）
+//! - [`calibration`][]: 温度スケーリング（T）と保留しきい値（τ）の校正計算
+//!   （REQ-22 正常系・TASK-22.1-1・issue #95。PoC-12 移植。保留状態への
+//!   接続と誤り率の比較は #96、「対象外」ラベルは TASK-22.2、coverage の
+//!   記録と表示は TASK-22.3 が担当し未実装）
 //! - [`significance`][]: 行ごとの正誤 → McNemar 検定 → α=0.05 での有意性
 //!   判定への接続（REQ-25・TASK-25.1-2・issue #65）
 //! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
@@ -44,6 +48,10 @@
 //!
 //! # 現状（実装済みを装わない）
 //!
+//! - T・τ の校正計算（REQ-22）: 実装済み（TASK-22.1-1・issue #95。
+//!   [`calibration::calibrate`]）。保留状態への接続と誤り率の比較（#96）、
+//!   「対象外」ラベル（TASK-22.2）、coverage の記録と表示（TASK-22.3）は
+//!   未実装
 //! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
 //!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
 //!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
@@ -118,6 +126,7 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
+pub mod calibration;
 pub mod eval_data_invariance;
 pub mod holm;
 pub mod invariance;
