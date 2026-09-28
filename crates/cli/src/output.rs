@@ -24,8 +24,10 @@
 //! （REQ-21・REQ-33 の入出力契約の変更はユーザー承認事項。
 //! `.claude/rules/evaluation-contract.md`）。`infer_input_error_report`・
 //! `judgment_error_report`・`definition_error_report` は各層のエラー型を
-//! `ErrorReport` へ変換するだけの薄い関数で、`message` の生成規則
-//! （`Display`）自体は各エラー型の実装に委ねる。
+//! `ErrorReport` へ変換するだけの薄い関数で、`message` の生成規則自体は
+//! 各エラー型の実装に委ねる（`InferInputError`／`JudgmentError` は
+//! `Display`、`DefinitionError` はパス・利用者指定値を含まない
+//! `public_message`。PR #217 レビュー指摘・P0）。
 
 use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
@@ -121,15 +123,14 @@ pub fn judgment_error_report(err: &JudgmentError) -> ErrorReport {
 /// [`DefinitionError`] を [`ErrorReport`] へ変換する薄い関数
 /// （[`infer_input_error_report`] と対称）。
 ///
-/// `DefinitionError::Display` は `DefinitionError::Read`／
-/// `DefinitionError::NotRegularFile` でパスを含みうるが、これは
-/// `definition.rs` 側で確定済みの既存の `Display` 実装の挙動であり、本
-/// 変換関数はそれを変更しない（TASK-21.2 のスコープはエラー型から
-/// `ErrorReport` への薄い変換に限り、`Display` の内容自体の見直しは対象
-/// 外）。
+/// `message` には `DefinitionError::Display`（パス・`UnsupportedSchema` の
+/// 値・`DuplicateOptionId` の ID 等、秘密情報混入防止の対象になりうる値を
+/// 含む内部診断表現）ではなく、[`DefinitionError::public_message`]（バリ
+/// アントごとの固定文のみ）を使う（PR #217 レビュー指摘・P0。
+/// security.md「秘密情報の混入防止（P0）」）。
 #[must_use]
 pub fn definition_error_report(err: &DefinitionError) -> ErrorReport {
-    ErrorReport::new(err.exit_code(), err.to_string())
+    ErrorReport::new(err.exit_code(), err.public_message())
 }
 
 #[cfg(test)]
@@ -411,12 +412,61 @@ mod tests {
     }
 
     /// TASK-21.2: `definition_error_report` が `code`／`message` を
-    /// `DefinitionError` から正しく写すこと。
+    /// `DefinitionError` から正しく写すこと（`message` は
+    /// `DefinitionError::public_message`。PR #217 レビュー指摘後は
+    /// `Display` と一致しないため、`Display` との比較はしない）。
     #[test]
     fn req21_definition_error_report_maps_code_and_message() {
         let err = DefinitionError::EmptyOptions;
         let report = definition_error_report(&err);
         assert_eq!(report.code, ExitCode::InvalidInput);
-        assert_eq!(report.message, err.to_string());
+        assert_eq!(report.message, err.public_message());
+    }
+
+    /// security.md「秘密情報の混入防止（P0）」: `definition_error_report`
+    /// の `message` に、`DefinitionError::Display` が含みうるパス・利用者
+    /// 指定値（`UnsupportedSchema` のスキーマ値・`DuplicateOptionId` の
+    /// ID）が混入しないこと（PR #217 レビュー指摘）。
+    #[test]
+    fn req21_definition_error_report_does_not_leak_path_or_user_values() {
+        let secret_path = "/home/alice/.ssh/secret-definition.json";
+        let secret_schema = "sk-test-dummy-schema-marker";
+        let secret_id = "row-secret-option-id-marker";
+
+        let read_err = DefinitionError::Read {
+            path: std::path::PathBuf::from(secret_path),
+            source: io::Error::other("boom"),
+        };
+        let schema_err = DefinitionError::UnsupportedSchema {
+            schema: secret_schema.to_string(),
+        };
+        let dup_err = DefinitionError::DuplicateOptionId {
+            id: secret_id.to_string(),
+        };
+        let not_regular_err = DefinitionError::NotRegularFile {
+            path: std::path::PathBuf::from(secret_path),
+        };
+
+        for err in [&read_err, &schema_err, &dup_err, &not_regular_err] {
+            // 前提確認: `Display` は実際に秘匿すべき値を含む（本テストが
+            // 意味のある回帰検知になっていることの確認）。
+            let display = err.to_string();
+            assert!(
+                display.contains(secret_path)
+                    || display.contains(secret_schema)
+                    || display.contains(secret_id),
+                "Display のフィクスチャ想定が崩れている（テストが無意味化していないか確認）: {display}"
+            );
+
+            let report = definition_error_report(err);
+            assert!(!report.message.contains(secret_path));
+            assert!(!report.message.contains(secret_schema));
+            assert!(!report.message.contains(secret_id));
+
+            let line = report.to_json_line().unwrap();
+            assert!(!line.contains(secret_path));
+            assert!(!line.contains(secret_schema));
+            assert!(!line.contains(secret_id));
+        }
     }
 }

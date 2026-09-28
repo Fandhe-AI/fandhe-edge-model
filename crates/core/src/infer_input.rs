@@ -86,10 +86,24 @@ impl fmt::Display for InferInputField {
 ///
 /// フィールドは非公開。検証を通る唯一の構築経路は [`InferInput::parse`]
 /// に限定する（モジュール冒頭のドキュメント参照）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は `#[derive]` せず手書きする。`input`（推論データ本文）・`id`
+/// はいずれも利用者入力で個人情報・機密情報を含みうるため、`{:?}` による
+/// 診断表示（ログ等）でそのまま転記されないよう値を伏せる
+/// （security.md「秘密情報の混入防止（P0）」。PR #217 レビュー指摘）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct InferInput {
     id: String,
     input: String,
+}
+
+impl fmt::Debug for InferInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InferInput")
+            .field("id", &"<redacted>")
+            .field("input", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `InferInput` の未検証の中間表現（デシリアライズ専用）。
@@ -663,5 +677,25 @@ mod tests {
         let bad_text = format!(r#"{{"id":"a","input":{{"nested":"{secret}"}}}}"#);
         let err = InferInput::parse(&bad_text, &io_bytes()).unwrap_err();
         assert!(!err.to_string().contains(secret));
+    }
+
+    /// security.md「秘密情報の混入防止（P0）」: `InferInput` の `Debug`
+    /// （`{:?}`）に `id`・`input` の実値が含まれないこと（PR #217 レビュー
+    /// 指摘。`#[derive(Debug)]` は非公開フィールドをそのまま出力してしま
+    /// い、診断表示〔ログ等〕で推論データ本文が転記されうる）。
+    #[test]
+    fn req21_debug_never_contains_id_or_input_body() {
+        let secret_id = "row-secret-id-marker";
+        let secret_input = "sk-test-dummy-not-a-real-secret-0123456789";
+        let text = format!(r#"{{"id":"{secret_id}","input":"{secret_input}"}}"#);
+        let parsed = InferInput::parse(&text, &io_bytes()).unwrap();
+
+        let debug = format!("{parsed:?}");
+        assert!(!debug.contains(secret_id));
+        assert!(!debug.contains(secret_input));
+        assert_eq!(
+            debug,
+            r#"InferInput { id: "<redacted>", input: "<redacted>" }"#
+        );
     }
 }
