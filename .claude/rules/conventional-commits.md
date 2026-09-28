@@ -33,7 +33,7 @@ scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2
 | scope | 対象 | パス |
 | ----- | ---- | ---- |
 | core | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） |
-| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割を実装済み。凍結・来歴・読み取り専用配置は未着手） |
+| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・来歴レコード型を実装済み。凍結・来歴の取り込み記録・読み取り専用配置は未着手） |
 | train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。学習リクエスト・結果 JSON の型を実装済み。issue #177） |
 | eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列を実装済み。有意性・回帰・診断は未着手） |
 | runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 |
