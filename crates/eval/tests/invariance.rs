@@ -10,13 +10,19 @@
 //! 手順:
 //! 1. 合成のモデルパッケージ（重み・語彙・校正・しきい値の 4 構成要素）を用意する
 //! 2. 評価前のスナップショットを作る
-//! 3. そのパッケージを最頻値（majority）スタブ予測器で使い、
-//!    `fandhe_edge_eval::metrics::evaluate_single_select` で評価を実行し、
-//!    具体的な正解率を確かめる
+//! 3. **そのスナップショットの取得元と同じモデルパッケージ（[`ModelPackageBytes`]）を
+//!    実際に読み取る** 最頻値（majority）スタブ予測器（[`predict_using_package`]）で
+//!    予測を作り、`fandhe_edge_eval::metrics::evaluate_single_select` で評価を
+//!    実行し、具体的な正解率を確かめる（評価経路がモデルパッケージから
+//!    独立した固定値を返すだけだと、評価工程がモデルを書き換える回帰を
+//!    このテストで検出できないため。codex/review 指摘。PRRT_kwDOUq-SxM6mhunl）
 //! 4. 評価後のスナップショットを（メモリ上・ディスク経由の 2 通りで）作り直し、
 //!    `verify_unchanged` が `Ok(())` であることを確かめる
 //! 5. 対比として、評価の途中でしきい値が書き換わったことを模擬すると
 //!    `Modified { component: Thresholds, .. }` が検出されることを確かめる
+//! 6. 追加の対比として、[`predict_using_package`] が重みバイト列の内容に
+//!    実際に依存すること（重みが変われば予測結果も変わること）を確かめ、
+//!    手順 3 の評価がモデルパッケージへ実質的に結合していることを示す
 
 use fandhe_edge_eval::invariance::{
     ComponentChange, ModelComponent, ModelPackageBytes, ModelPackageSnapshot,
@@ -41,11 +47,25 @@ fn synthetic_package() -> ModelPackageBytes<'static> {
     }
 }
 
-/// 最頻値（majority）スタブ予測器（PoC-9 の majority baseline に相当）を使い、
-/// gold 6 件（A×4, B×2）に対する予測を作る。予測は常に多数派の "A" を返す
-/// ため、正解率は 4/6 になる。
-fn majority_predictions() -> Vec<Outcome> {
-    vec![Outcome::Label("A".to_string()); 6]
+/// 最頻値（majority）スタブ予測器（PoC-9 の majority baseline に相当）。
+///
+/// 実際の推論関数と同じ形で、モデルパッケージ（ここでは重み
+/// [`ModelComponent::Weights`]）のバイト列を実際に読み取り、その内容から
+/// 予測ラベルを決める。`synthetic_package()` の重み（`-v1` 終わり）を渡すと
+/// 多数派の "A" を、それ以外（改変された重み）を渡すと "B" を返す。
+///
+/// 評価前後のスナップショット比較（[`ModelPackageSnapshot::capture`]）の
+/// 間に、実際にモデルパッケージのバイト列を消費する評価経路を挟むための
+/// ヘルパー（codex/review 指摘。PRRT_kwDOUq-SxM6mhunl。固定値を返すだけの
+/// スタブだと、評価工程がモデルパッケージを書き換える回帰をこのテストで
+/// 検出できない）。gold 6 件（A×4, B×2）に対して使う前提で、多数派 "A" の
+/// 場合の正解率は 4/6 になる。
+fn predict_using_package(package: &ModelPackageBytes<'_>) -> Vec<Outcome> {
+    let weights = package
+        .weights
+        .expect("呼び出し側は capture と同じく weights を渡す契約");
+    let majority_label = if weights.ends_with(b"-v1") { "A" } else { "B" };
+    vec![Outcome::Label(majority_label.to_string()); 6]
 }
 
 fn golds() -> Vec<&'static str> {
@@ -59,9 +79,11 @@ fn req27_task27_1_1_evaluation_does_not_change_model_package_hash() {
     // 1. 評価前のスナップショット。
     let before = ModelPackageSnapshot::capture(&package).expect("合成データは失敗しないはず");
 
-    // 2. 評価器を経由して推論結果を集計する（モデルパッケージのバイト列自体は
-    //    評価器へ渡さない。評価器が触れるのはラベル文字列のみ）。
-    let outcomes = majority_predictions();
+    // 2. モデルパッケージ（重み）を実際に読み取る予測器で推論結果を集計する。
+    //    評価器（`evaluate_single_select`）自体が触れるのはラベル文字列のみ
+    //    だが、その手前の予測器はモデルパッケージのバイト列を消費しており、
+    //    before/after のスナップショット取得の間に実際の評価経路が挟まる。
+    let outcomes = predict_using_package(&package);
     let golds = golds();
     let records: Vec<EvalRecord<'_>> = golds
         .iter()
@@ -100,18 +122,42 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// 排他的に作成できる一意な一時ディレクトリを作る。
+///
+/// プロセス ID と固定文字列だけを名前に使うと、PID の再利用や同一プロセス内
+/// での並行テスト実行時に既存ディレクトリと衝突しうる
+/// （`create_dir_all` は既存ディレクトリも受け入れてしまうため検出できない。
+/// codex/review 指摘。PRRT_kwDOUq-SxM6mhunp）。ここではナノ秒精度の
+/// タイムスタンプと試行回数を名前へ加え、`fs::create_dir`（`create_dir_all`
+/// と異なり既存ディレクトリではエラーを返す排他的な作成）が
+/// `AlreadyExists` を返した場合だけ名前を変えて再試行することで、
+/// 名前の衝突を検出できる形にする（外部 crate〔tempfile 等〕は追加しない）。
+fn make_unique_temp_dir(label: &str) -> std::path::PathBuf {
+    let pid = std::process::id();
+    for attempt in 0..1000u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let candidate = std::env::temp_dir().join(format!(
+            "fandhe-edge-eval-invariance-test-{pid}-{label}-{attempt}-{nanos}"
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("一時ディレクトリの作成に失敗しないはず: {err}"),
+        }
+    }
+    panic!("一意な一時ディレクトリを {pid} 回試行しても作成できなかった");
+}
+
 #[test]
 fn req27_task27_1_1_disk_round_trip_preserves_hash() {
     // ファイルへ書く → 読む → 評価 → 読み直す、という経路でも一致することを
     // 確認する（外部 crate〔tempfile 等〕を追加せず、標準ライブラリの
     // `std::env::temp_dir` のみを使う）。
     let package = synthetic_package();
-    let dir = std::env::temp_dir().join(format!(
-        "fandhe-edge-eval-invariance-test-{}-{}",
-        std::process::id(),
-        "req27-task27-1-1"
-    ));
-    fs::create_dir_all(&dir).expect("一時ディレクトリの作成に失敗しないはず");
+    let dir = make_unique_temp_dir("req27-task27-1-1");
     let _guard = TempDirGuard(dir.clone());
 
     let write_component = |name: &str, bytes: &[u8]| -> std::path::PathBuf {
@@ -145,10 +191,11 @@ fn req27_task27_1_1_disk_round_trip_preserves_hash() {
     let before =
         ModelPackageSnapshot::capture(&read_back_before).expect("合成データは失敗しないはず");
 
-    // このスナップショットとスナップショット取得元のバイト列とは無関係に、
-    // 評価器を経由して推論結果を集計する（PoC-9 InvarianceTest の手順どおり、
-    // スナップショット取得と評価の間に実際の評価工程を挟む）。
-    let outcomes = majority_predictions();
+    // ディスクから読み直したモデルパッケージ（`read_back_before`）を実際に
+    // 読み取る予測器で推論結果を集計する（PoC-9 InvarianceTest の手順どおり、
+    // スナップショット取得と評価の間に実際の評価工程を挟む。
+    // codex/review 指摘。PRRT_kwDOUq-SxM6mhunl）。
+    let outcomes = predict_using_package(&read_back_before);
     let golds = golds();
     let records: Vec<EvalRecord<'_>> = golds
         .iter()
@@ -198,4 +245,26 @@ fn req27_task27_1_1_threshold_tampering_during_evaluation_is_detected() {
         }
         other => panic!("Modified(Thresholds) を期待したが {other:?} だった"),
     }
+}
+
+#[test]
+fn req27_predict_using_package_reflects_weights_content() {
+    // `predict_using_package` が実際にモデルパッケージ（重み）の内容に依存する
+    // ことを確かめる。これにより、手順 3（
+    // `req27_task27_1_1_evaluation_does_not_change_model_package_hash` /
+    // `req27_task27_1_1_disk_round_trip_preserves_hash`）で before/after の
+    // スナップショット取得の間に挟む評価が、モデルパッケージへ実質的に
+    // 結合した経路であることを示す（固定値を返すだけの評価経路では
+    // 検出できない回帰の対比。codex/review 指摘。PRRT_kwDOUq-SxM6mhunl）。
+    let original = synthetic_package();
+    let original_outcomes = predict_using_package(&original);
+    assert_eq!(original_outcomes, vec![Outcome::Label("A".to_string()); 6]);
+
+    let tampered_weights: &[u8] = b"tampered-weights-bytes-v2";
+    let mut tampered = original;
+    tampered.weights = Some(tampered_weights);
+    let tampered_outcomes = predict_using_package(&tampered);
+    assert_eq!(tampered_outcomes, vec![Outcome::Label("B".to_string()); 6]);
+
+    assert_ne!(original_outcomes, tampered_outcomes);
 }

@@ -157,16 +157,21 @@ impl<'a> ModelPackageBytes<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvarianceError {
-    /// 構成要素が 1 つも無い（すべて `None`）。空のパッケージを
-    /// 「不変」と偽らないよう fail-closed で拒否する。
-    EmptyPackage,
+    /// 重み（[`ModelComponent::Weights`]）が `None`。重みは判定結果を
+    /// 直接左右する構成要素であり、REQ-27（評価の独立性）が求める
+    /// 「評価前後でモデルのハッシュが一致すること」は重みを含めて初めて
+    /// 意味を持つ。重み以外の構成要素（語彙・校正・しきい値）だけが
+    /// 揃っていても、重みの改変を検出できないスナップショットを
+    /// 「検証済み」と偽らないよう fail-closed で拒否する
+    /// （codex/review 指摘。PRRT_kwDOUq-SxM6mhunj）。
+    MissingWeights,
 }
 
 impl fmt::Display for InvarianceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InvarianceError::EmptyPackage => {
-                write!(f, "model package has no components to hash")
+            InvarianceError::MissingWeights => {
+                write!(f, "model package is missing required component: weights")
             }
         }
     }
@@ -187,17 +192,26 @@ pub struct ModelPackageSnapshot {
 }
 
 impl ModelPackageSnapshot {
-    /// バイト列の束からスナップショットを作る。構成要素が 1 つも無ければ
-    /// [`InvarianceError::EmptyPackage`] を返す。
+    /// バイト列の束からスナップショットを作る。重み
+    /// （[`ModelComponent::Weights`]）が無ければ
+    /// [`InvarianceError::MissingWeights`] を返す。
+    ///
+    /// 重みを必須にするのは、重み以外の構成要素（語彙・校正・しきい値）
+    /// だけが揃った状態を「検証済みのモデルパッケージ」として受理すると、
+    /// 評価前後で重みが書き換わっても [`Self::verify_unchanged`] が
+    /// 検出できず REQ-27（評価の独立性）を満たせないため
+    /// （codex/review 指摘。PRRT_kwDOUq-SxM6mhunj）。重みが `Some` なら
+    /// 必ず 1 件以上ダイジェストが入るため、空のパッケージという状態は
+    /// この必須化によって構造的に起こりえない。
     pub fn capture(bytes: &ModelPackageBytes<'_>) -> Result<Self, InvarianceError> {
+        if bytes.weights.is_none() {
+            return Err(InvarianceError::MissingWeights);
+        }
         let mut digests = BTreeMap::new();
         for (component, value) in bytes.entries() {
             if let Some(value) = value {
                 digests.insert(component, Sha256Digest::of_bytes(value));
             }
-        }
-        if digests.is_empty() {
-            return Err(InvarianceError::EmptyPackage);
         }
         Ok(ModelPackageSnapshot { digests })
     }
@@ -366,6 +380,28 @@ mod tests {
     }
 
     #[test]
+    fn req27_capture_rejects_missing_weights_even_with_other_components() {
+        // 重み以外の 3 構成要素が揃っていても、重みが無ければ拒否する
+        // （codex/review 指摘。重み以外だけの「検証済み」を偽装させない）。
+        let mut bytes = sample_bytes();
+        bytes.weights = None;
+        assert_eq!(
+            ModelPackageSnapshot::capture(&bytes),
+            Err(InvarianceError::MissingWeights)
+        );
+    }
+
+    #[test]
+    fn req27_capture_rejects_empty_package() {
+        // 全構成要素が `None`（重みも含む）の場合も MissingWeights で拒否する。
+        let bytes = ModelPackageBytes::default();
+        assert_eq!(
+            ModelPackageSnapshot::capture(&bytes),
+            Err(InvarianceError::MissingWeights)
+        );
+    }
+
+    #[test]
     fn req27_capture_same_bytes_is_unchanged() {
         let bytes = sample_bytes();
         let before = ModelPackageSnapshot::capture(&bytes).expect("失敗しないはず");
@@ -460,15 +496,6 @@ mod tests {
             }
             other => panic!("Added を期待したが {other:?} だった"),
         }
-    }
-
-    #[test]
-    fn req27_empty_package_is_rejected() {
-        let bytes = ModelPackageBytes::default();
-        assert_eq!(
-            ModelPackageSnapshot::capture(&bytes),
-            Err(InvarianceError::EmptyPackage)
-        );
     }
 
     #[test]
