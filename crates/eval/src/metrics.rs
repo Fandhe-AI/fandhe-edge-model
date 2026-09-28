@@ -368,6 +368,9 @@ pub struct SingleSelectMetrics {
     pub macro_f1: Option<f64>,
     /// 混同行列。
     pub confusion: ConfusionMatrix,
+    /// 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・issue #62）。
+    /// 詳細な定義は [`crate::quadrant`] モジュールのドキュメントコメント参照。
+    pub type_meaning_quadrant: crate::quadrant::TypeMeaningQuadrant,
 }
 
 /// 正解率・ラベル別指標・Macro-F1・混同行列を算出する（REQ-24 正常系・TASK-24.1-1）。
@@ -422,6 +425,7 @@ pub fn evaluate_single_select(
     let mut predicted_count = vec![0u64; n_labels];
     let mut outcome_counts = OutcomeCounts::default();
     let mut correct: u64 = 0;
+    let mut quadrant = crate::quadrant::TypeMeaningQuadrant::default();
 
     // checked 演算のオーバーフロー時に埋める `EvalError`。record 位置由来だが
     // 「正解ラベル未知」ではなく内部の集計不整合なので `Internal` を使う
@@ -501,9 +505,30 @@ pub fn evaluate_single_select(
         };
 
         confusion.increment(gold_index, column, index)?;
+
+        // 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3）。
+        // `column` は直前の match で決定済みの分類（ラベル一致・型不正・
+        // abstain・error）を再利用し、判定基準を重複させない。
+        let cell = match column {
+            ConfusionColumn::Label(predicted_index) if predicted_index == gold_index => {
+                crate::quadrant::TypeMeaningCell::TypeOkMeaningOk
+            }
+            ConfusionColumn::Label(_) => crate::quadrant::TypeMeaningCell::TypeOkMeaningNg,
+            ConfusionColumn::Invalid => crate::quadrant::TypeMeaningCell::TypeNg,
+            ConfusionColumn::Abstain => crate::quadrant::TypeMeaningCell::Abstain,
+            ConfusionColumn::Error => crate::quadrant::TypeMeaningCell::Error,
+        };
+        quadrant.increment(cell, index)?;
     }
 
+    // fail-closed: 5 セルの合計が評価件数と一致しない場合は内部不整合として
+    // 拒否する（評価済みを装わない。`.claude/rules/coding-rust.md`）。
     let n_total: u64 = records.len() as u64;
+    if quadrant.total() != Some(n_total) {
+        return Err(EvalError::Internal {
+            detail: "type_meaning_quadrant total mismatch".to_string(),
+        });
+    }
 
     // ラベル添字 `i` に由来する内部不整合（`support`・`predicted_count` は
     // `n_labels` 件で確保済みのため理論上到達しないが、外部入力の経路では
@@ -596,6 +621,7 @@ pub fn evaluate_single_select(
         per_label,
         macro_f1,
         confusion,
+        type_meaning_quadrant: quadrant,
     })
 }
 
@@ -753,6 +779,14 @@ mod tests {
         assert_eq!(metrics.confusion.get(0, ConfusionColumn::Label(1)), Some(0));
         assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(0)), Some(0));
         assert_eq!(metrics.confusion.get(1, ConfusionColumn::Label(1)), Some(1));
+        // REQ-24 境界値・TASK-24.3: 全問正解なので type_ok_meaning_ok=2、
+        // 他のセルは 0。
+        assert_eq!(metrics.type_meaning_quadrant.type_ok_meaning_ok(), 2);
+        assert_eq!(metrics.type_meaning_quadrant.type_ok_meaning_ng(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.type_ng_count(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.abstain(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.error(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.total(), Some(2));
     }
 
     /// REQ-24・TASK-24.1-1: 宣言順（["B","A"]）に混同行列・per_label の並びが従う。
@@ -805,5 +839,11 @@ mod tests {
         assert_eq!(metrics.per_label[1].f1, None);
         // macro_f1 は f1 が定義できた A だけの平均（B は除外）。
         assert_eq!(metrics.macro_f1, Some(0.0));
+        // REQ-24 境界値・TASK-24.3: 未知ラベルへの予測は type_ng_count=1。
+        // 意味の 2 セルには数えない（型不正の行は意味を判定できないため）。
+        assert_eq!(metrics.type_meaning_quadrant.type_ng_count(), 1);
+        assert_eq!(metrics.type_meaning_quadrant.type_ok_meaning_ok(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.type_ok_meaning_ng(), 0);
+        assert_eq!(metrics.type_meaning_quadrant.total(), Some(1));
     }
 }

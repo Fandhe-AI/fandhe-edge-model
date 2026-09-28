@@ -11,6 +11,9 @@
 //!
 //! - [`metrics`][]: 正解率・ラベル別指標（適合率・再現率・F1）・Macro-F1・
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）
+//! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
+//!   issue #62。単一選択の 5 区分〔type_ok_meaning_ok / type_ok_meaning_ng /
+//!   type_ng_count / abstain / error〕のみ。multi-item は未対応）
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
@@ -20,9 +23,11 @@
 //! - 分母 0 の指標の JSON `null` 表示・平均から除いたラベルの列挙
 //!   （`excluded_labels`）: 未実装（TASK-24.2・issue #61）。本 crate は
 //!   `Option<f64>` として `None` を返すところまでを担う
-//! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 未実装
-//!   （TASK-24.3・issue #62）。[`metrics::Outcome`] を enum にしてあるのは
-//!   この後続実装が予測の種類を判定しやすくするため
+//! - `type_meaning_quadrant`（型と意味の正しさの分離集計）: 単一選択の
+//!   3 区分＋abstain/error を実装済み（TASK-24.3・issue #62）。multi-item の
+//!   型不正行の意味分割（`type_ng_intent_ok` / `type_ng_intent_ng`）は
+//!   未実装（core の multi-item 対応待ち。[`quadrant`] モジュールの
+//!   ドキュメントコメント参照）
 //! - McNemar 検定・Holm 補正（REQ-24・REQ-25）: 未実装（TASK-25.x）。
 //!   同じ crate 内の後続モジュールとして追加する想定
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
@@ -45,4 +50,5 @@
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
 //!   モジュールの「資源上限」節を参照）
 pub mod metrics;
+pub mod quadrant;
 pub mod wilson;

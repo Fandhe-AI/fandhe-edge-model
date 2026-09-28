@@ -26,7 +26,9 @@
 //! 再構成できず、Rust 評価器に multi-item モードも無いため対象外
 //! （`known/multi-item`・`v1.1/extra-key` の 2 対象は `intent_only` の
 //! 混同行列のみを `evaluate_single_select` に展開して照合し、`adopted_decision`
-//! は検証しない。sklearn の記録が無いため）。
+//! は検証しない。sklearn の記録が無いため）。`type_meaning_quadrant`
+//! （REQ-24 境界値・TASK-24.3）も Wilson と同様 sklearn に相当する実装が無く、
+//! 照合対象外（`tests/type_meaning_quadrant.rs` を参照）。
 
 use fandhe_edge_eval::metrics::{ConfusionColumn, EvalRecord, Outcome, evaluate_single_select};
 use fandhe_edge_eval::wilson::wilson_ci95;
