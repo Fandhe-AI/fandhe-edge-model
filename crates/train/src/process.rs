@@ -39,28 +39,41 @@
 //!    走査・再送ラウンドは不要になった。これに伴い `MAX_RESULT_BYTES` の
 //!    サイズ上限流用問題も解消する）。
 //!
-//! # 不変条件: グループ kill は reap（回収）より必ず先に行う
+//! # 不変条件: グループ kill と reap（回収）の順序
 //!
 //! `Child::try_wait()`／`Child::wait()` は `waitpid(2)` 相当で、
 //! `Ok(Some(status))` を返した時点で supervisor（= プロセスグループの
-//! リーダー）は reap 済みになり、その pid（= pgid）は OS に返却されて
-//! 再利用されうる。reap 済みの pgid へ後から `kill(-pgid)` を送ると、
-//! 無関係な新しいプロセスグループを巻き込みかねない（codex 指摘 P0 x2。
-//! issue #178 PR #233 レビュー再々指摘）。
+//! リーダー）は reap 済みになる。
 //!
-//! そのため [`run_train`] は、supervisor の完了検知に `try_wait()` の
-//! ポーリングを一切使わない。代わりに、標準出力の読み取りスレッド
-//! （[`spawn_reader`]）が EOF・読み取り上限超過・エラーのいずれかで完了
-//! するのを、残りの壁時計予算だけ [`std::sync::mpsc::Receiver::recv_timeout`]
-//! で待つ。この待機が時間切れになった場合も、`_worker` が標準出力を握り
-//! 続けているだけで供給元自体は既に正常終了している場合も、区別せず同じ
-//! 経路で扱う: **正常系・異常系を問わず、reap の前に必ず
-//! [`kill_process_group_best_effort`] を呼び、その後で初めて
-//! [`wait_after_kill`] により reap する**（[`kill_group_then_reap`] が
-//! この順序を関数として固定する）。壁時計予算内に読み取りが完了しな
-//! かった場合は [`TrainProcessError::WallTimeout`] を返す（`try_wait()` を
-//! 使わないため、以前あった「観測時刻が締め切り後でも成功扱いしてしまう」
-//! という種類の競合は構造的に発生しない）。
+//! [`run_train`] は、標準出力の読み取りスレッド（[`spawn_reader`]）が
+//! EOF・読み取り上限超過・エラーのいずれかで完了するのを、残りの壁時計
+//! 予算だけ [`std::sync::mpsc::Receiver::recv_timeout`] で待つ。しかし
+//! **標準出力の EOF は supervisor の終了そのものを保証しない**
+//! （インタプリタのシャットダウン処理・バッファのフラッシュ等で、fd が
+//! 閉じてから実際にプロセスが終了するまで短い時間差がありうる。issue
+//! #178 PR #233 レビュー再々々指摘 P1）。そこで EOF（または壁時計予算の
+//! 消費）の直後、[`EOF_EXIT_GRACE`] の間だけ `try_wait()` をポーリングし、
+//! 供給元が自発的に終了するのを確認してから、以下の 2 経路のいずれかで
+//! グループを掃除する:
+//!
+//! - **猶予内に終了を確認できた場合**（reap 済み）: [`wait_after_kill`]
+//!   を呼ばずに [`kill_process_group_best_effort`] を直接呼ぶ。POSIX
+//!   では、あるプロセスグループが存続する（＝生存メンバーが 1 つでも
+//!   いる）間、そのグループの pgid と同じ値の pid は他のプロセスへ
+//!   再利用されない。したがって `_worker` 等がまだグループに残っていれば
+//!   pgid は予約されたままで、この時点で `kill(-pgid)` を送っても安全
+//!   （グループが既に空なら ESRCH になるだけで害はない）。**残る理論上の
+//!   窓**: グループが消滅してから本呼び出しまでの一瞬に pid が一周し、
+//!   かつそのプロセスが偶然新しいグループのリーダーになった場合だけは
+//!   無関係なグループを巻き込みうる（正直に記録する。極めて狭い窓）。
+//! - **猶予内に終了を確認できなかった場合**（本来のタイムアウト、または
+//!   EOF 後に想定より長く終了処理がかかっている場合）: 従来どおり
+//!   [`kill_group_then_reap`] で、reap の前に必ず
+//!   [`kill_process_group_best_effort`] を呼んでからリーダーを reap する
+//!   （pgid が reap 済みで再利用されうる状態になる前に、確実にグループへ
+//!   シグナルを届ける。codex 指摘 P0 x2。issue #178 PR #233 レビュー
+//!   再々指摘）。この経路は既存の語彙のとおり `WallTimeout` として分類
+//!   する。
 //!
 //! # windows（対象外・fail-closed）
 //!
@@ -111,6 +124,19 @@ const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// 標準出力の EOF（または壁時計予算の消費）を観測した直後、supervisor
+/// 自身が自発的に終了するのを `try_wait()` で確認する猶予（REQ-39）。
+/// 標準出力への書き込み（EOF の観測条件）と実際のプロセス終了の間には、
+/// インタプリタのシャットダウン処理（バッファのフラッシュ・GC 等）に
+/// 要する時間差がありうるため、この猶予の間に終了を確認できれば、まだ
+/// 終了処理中の健全な supervisor を誤って `SIGKILL` する事故を避けられる
+/// （codex 指摘 P1「stdout の EOF は supervisor の終了を保証しない」。
+/// issue #178 PR #233 レビュー再々々指摘。モジュール doc「不変条件」
+/// 参照）。実際に使う猶予は本定数と残りの壁時計予算の小さい方
+/// （`Duration::min`）で、壁時計予算を超えて待つことはない。
+#[cfg(unix)]
+const EOF_EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// 子プロセスの環境変数の許可リスト（OS ごと）。`env_clear()` のうえで
 /// これらのキーだけを、親プロセスに存在する場合に限り引き継ぐ。
 ///
@@ -128,6 +154,30 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const ENV_ALLOWLIST: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
 pub const ENV_ALLOWLIST: &[&str] = &["SystemRoot", "TEMP", "TMP"];
+
+/// Rust 側 `run_train` がプロセスグループを管理していることを
+/// `trainer/src/fandhe_edge_trainer/supervisor.py` へ伝える環境変数名
+/// （issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めて
+/// いる」）。値が厳密に `"1"` の場合だけ「Rust 管理下」とみなし、`_worker`
+/// を supervisor と同じプロセスグループに留める（`start_new_session` を
+/// 使わない）。未設定・その他の値は安全側（単独起動時の従来の防御。
+/// `_worker` を別セッションで起動し、supervisor 自身がプロセスグループ
+/// 単位で掃除する）に倒す。
+///
+/// Python 側の同名の定数
+/// （`supervisor.py::SUPERVISOR_GROUP_MANAGED_ENV`）と一致することを、
+/// 共有 fixture `fixtures/train_contract/supervisor_group_managed_env.json`
+/// 経由で `crates/train/tests/train_contract_fixture.rs`・
+/// `trainer/tests/test_train_contract_fixture.py` の双方から照合する。
+/// 本 crate から学習ワーカーへの内部境界であり、JSON 入出力契約
+/// （学習リクエスト・結果）には含まれない。
+#[cfg(unix)]
+pub const SUPERVISOR_GROUP_MANAGED_ENV: &str = "FANDHE_EDGE_SUPERVISOR_GROUP_MANAGED";
+
+/// [`SUPERVISOR_GROUP_MANAGED_ENV`] に設定する値。「管理下」を示すのは
+/// この文字列と完全一致する場合だけ。
+#[cfg(unix)]
+pub const SUPERVISOR_GROUP_MANAGED_VALUE: &str = "1";
 
 /// 学習ワーカーの起動口（`<python> -I <launch.py> train --request <path>`）
 /// を表す検証済みの型（issue #178 実装計画 3.1）。
@@ -523,6 +573,89 @@ const KILL_BIN: &str = "/bin/kill";
 #[cfg(unix)]
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `kill -KILL` 送出後、実際に消えたか（`kill -0`）を確認して「まだ生存
+/// している」場合に再送する最大回数（REQ-39「資源の上限」。issue #178
+/// PR #233 レビュー再々々指摘 P0「終了コード 1 は ESRCH 以外でも返るのに
+/// 掃除済み扱いしている」への対応）。
+#[cfg(unix)]
+const KILL_VERIFY_MAX_ROUNDS: u32 = 5;
+
+/// [`KILL_VERIFY_MAX_ROUNDS`] の各ラウンドの間隔。
+#[cfg(unix)]
+const KILL_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// `/bin/kill` の標準エラー出力の読み取り上限（バイト）。1 行程度の短い
+/// メッセージしか出さないため小さく抑える（REQ-39「資源の上限」）。
+#[cfg(unix)]
+const KILL_STDERR_CAP: usize = 4096;
+
+/// `program`（絶対パス）を `args` で子プロセスとして起動し、
+/// `LC_ALL=C`（メッセージのロケール依存を排除する）のもとで実行して、
+/// 終了ステータスと標準エラー出力（上限 `cap` バイト）を返す。
+/// 起動・終了待ち・読み取りのいずれかに失敗した場合は `None`。
+#[cfg(unix)]
+fn run_bounded_capture_stderr(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    cap: usize,
+) -> Option<(ExitStatus, Vec<u8>)> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let stderr_pipe = child.stderr.take();
+    let rx = stderr_pipe.map(|pipe| spawn_reader(pipe, cap));
+    let deadline = Instant::now() + timeout;
+    let status = match poll_wait_bounded(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => {
+            // タイムアウト・`try_wait()` 自体のエラーのいずれでも、`kill()`
+            // 後の回収を無期限に待たない（Cursor Bugbot 指摘 Medium「kill 後
+            // wait が無期限ブロックしうる」。issue #178 PR #233 レビュー）。
+            let _ = child.kill();
+            let kill_deadline = Instant::now() + timeout;
+            let _ = poll_wait_bounded(&mut child, kill_deadline);
+            return None;
+        }
+    };
+    let stderr_bytes = match rx {
+        Some(rx) => rx.recv_timeout(timeout).ok()?.kept,
+        None => Vec::new(),
+    };
+    Some((status, stderr_bytes))
+}
+
+/// `stderr` に、対象プロセス（グループ）が既に存在しない（ESRCH）ことを
+/// 示すメッセージが含まれるかを判定する。Linux（procps・util-linux）・
+/// macOS（BSD）の `kill(1)` はいずれも `LC_ALL=C` のもとで "No such
+/// process" を含むメッセージを返す（出力書式の細部〔`kill: (-123) - No
+/// such process` 等〕は実装依存のため、部分一致で判定する。issue #178
+/// PR #233 レビュー再々々指摘 P0）。
+#[cfg(unix)]
+fn stderr_indicates_no_such_process(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains("No such process")
+}
+
+/// `kill(1)` の 1 回の呼び出し結果（送出成功かどうか・stderr）から、
+/// 対象が「既に存在しない」（ESRCH 相当）と判定できるかを返す純粋関数。
+/// [`kill_process_group_best_effort`] から実プロセスを使わずに単体
+/// テストできるよう切り出してある
+/// （`tests::req39_kill_call_indicates_absent_*` 参照。issue #178 PR #233
+/// レビュー再々々指摘 P0「終了コード 1 は ESRCH 以外（EPERM・引数エラー
+/// 等）でも返るのに掃除済み扱いしている」）。送出に成功した
+/// （`success == true`）場合は、対象が生存していたことの証拠であり
+/// ESRCH ではありえないため常に `false`。
+#[cfg(unix)]
+fn kill_call_indicates_absent(success: bool, stderr: &[u8]) -> bool {
+    !success && stderr_indicates_no_such_process(stderr)
+}
+
 /// `pgid`（[`run_train`] が起動した supervisor のプロセスグループ ID。
 /// `process_group(0)` により supervisor 自身の pid と一致する）へ
 /// `SIGKILL` を送る（`/bin/kill -KILL -- -<pgid>`。固定 argv・絶対パス、
@@ -532,9 +665,7 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// （`trainer/src/fandhe_edge_trainer/supervisor.py` が `start_new_session`
 /// を使わない。モジュール doc「プロセスグループによる一括終了」参照）の
 /// ため、この 1 回の呼び出しで supervisor 自身・`_worker`・その子孫の
-/// すべてへ `SIGKILL` が届く。カーネルがプロセスグループ単位でシグナルを
-/// 配送するため、`ps` による個別の走査・再送ラウンドは不要である
-/// （旧実装との違い。issue #178 PR #233 レビュー再々指摘）。
+/// すべてへ `SIGKILL` が届く。
 ///
 /// **呼び出し元が守るべき不変条件**: 本関数は、対象の `pgid`（= supervisor
 /// の pid）をまだ `try_wait()`／`wait()` で回収（reap）していない間に
@@ -542,48 +673,74 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 再利用されうるため、reap 後に同じ pgid へ送ると無関係なプロセス
 /// グループを巻き込みかねない（codex 指摘 P0 x2。issue #178 PR #233
 /// レビュー再々指摘）。[`run_train`] は本関数を [`kill_group_then_reap`]
-/// 経由でのみ呼び、`wait_after_kill`（reap）より必ず先に実行する。
+/// 経由でのみ呼ぶか、既に reap 済みの経路（EOF 後の猶予内に supervisor が
+/// 自発的に終了した場合）では POSIX の「プロセスグループが存続する間、
+/// その pgid と同じ pid 番号は再利用されない」という性質に基づいて安全に
+/// 呼ぶ（[`run_train`] のコメント参照。残る理論上の窓についても明記する）。
 ///
-/// `/bin/kill` の終了コード 0（送出成功）・1（多くの実装で ESRCH＝対象が
-/// 既に存在しない、を含む一般エラー）のいずれも「掃除を試みて問題
-/// なかった」として `true` を返す（ESRCH は「既に何も残っていない」ことを
-/// 意味し正常。他の一般エラー〔EPERM・引数不正等〕も同じ終了コード 1 の
-/// ため区別できないが、ベストエフォートの範囲として許容する）。起動失敗・
-/// タイムアウト・その他の終了コードは `false`（確認できなかった）。
+/// **「確認できた」（`true`）とみなすのは次のいずれかのみ**（issue #178
+/// PR #233 レビュー再々々指摘 P0「終了コード 1 は ESRCH 以外（EPERM・
+/// 引数エラー等）でも返るのに掃除済み扱いしている」への対応。以前は
+/// 終了コード 0・1 のいずれも無条件に確認できたものとして扱っていた）:
+/// - 最初の `kill -KILL` が送出成功（終了コード 0）で、その後の
+///   `kill -0`（シグナルを送らず存在確認だけを行う）が ESRCH を返した
+///   場合（[`kill_call_indicates_absent`]）。
+/// - 最初から ESRCH だった場合。
+///
+/// それ以外（EPERM・引数エラー・判別できないメッセージ・`kill` 自体の
+/// 起動失敗など）は「未確認」として扱う。`kill -0` の確認で「まだ生存して
+/// いる」（送出成功かつ ESRCH でない）と分かった場合は、
+/// [`KILL_VERIFY_MAX_ROUNDS`] 回まで kill→確認を繰り返し、それでも残って
+/// いれば `false` を返す。
 #[cfg(unix)]
 fn kill_process_group_best_effort(pgid: u32) -> bool {
     let pgid_arg = format!("-{pgid}");
-    let mut command = Command::new(KILL_BIN);
-    command
-        .args(["-KILL", "--", pgid_arg.as_str()])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
-    match poll_wait_bounded(&mut child, deadline) {
-        Ok(Some(status)) => matches!(status.code(), Some(0) | Some(1)),
-        Ok(None) | Err(_) => {
-            // タイムアウト・`try_wait()` 自体のエラーのいずれでも、`kill()`
-            // 後の回収を無期限に待たない（Cursor Bugbot 指摘 Medium「kill 後
-            // wait が無期限ブロックしうる」。issue #178 PR #233 レビュー）。
-            let _ = child.kill();
-            let kill_deadline = Instant::now() + KILL_WAIT_TIMEOUT;
-            let _ = poll_wait_bounded(&mut child, kill_deadline);
-            false
+    for round in 0..KILL_VERIFY_MAX_ROUNDS {
+        let Some((kill_status, kill_stderr)) = run_bounded_capture_stderr(
+            KILL_BIN,
+            &["-KILL", "--", pgid_arg.as_str()],
+            KILL_WAIT_TIMEOUT,
+            KILL_STDERR_CAP,
+        ) else {
+            return false;
+        };
+        if !kill_status.success() {
+            // 最初から ESRCH だった場合のみ確認できたとする。EPERM・
+            // 引数エラー等は「未確認」（リトライしても状況は変わらない）。
+            return kill_call_indicates_absent(kill_status.success(), &kill_stderr);
+        }
+        // 送出に成功した。実際に消えたかを `-0`（シグナル送出無し）で
+        // 確認する。
+        let Some((verify_status, verify_stderr)) = run_bounded_capture_stderr(
+            KILL_BIN,
+            &["-0", "--", pgid_arg.as_str()],
+            KILL_WAIT_TIMEOUT,
+            KILL_STDERR_CAP,
+        ) else {
+            return false;
+        };
+        if kill_call_indicates_absent(verify_status.success(), &verify_stderr) {
+            return true;
+        }
+        // まだ生存している（あるいは確認コマンド自体が判別できないエラー
+        // を返した）。最終ラウンドでなければ再送する。
+        if round + 1 < KILL_VERIFY_MAX_ROUNDS {
+            std::thread::sleep(KILL_VERIFY_RETRY_DELAY);
         }
     }
+    false
 }
 
-/// [`run_train`] の異常系共通処理: プロセスグループへの一括 `SIGKILL`
+/// [`run_train`] が、[`EOF_EXIT_GRACE`] の猶予内に supervisor の自発的な
+/// 終了を確認**できなかった**経路（モジュール doc「不変条件」の 2 経路の
+/// うち後者）で使う共通処理: プロセスグループへの一括 `SIGKILL`
 /// （`kill_group`）を**必ず**直接の子（supervisor）の reap（`reap`）より
-/// 先に呼ぶ、という順序を関数として固定する（モジュール doc「不変条件」
-/// 参照。issue #178 PR #233 レビュー再々指摘 6「kill がリーダー回収前に
-/// 行われる順序を確認する」）。`kill_group` の戻り値（掃除を確認できたか）
-/// を `reap`（`descendants_confirmed_clean` として使う）へそのまま渡す。
+/// 先に呼ぶ、という順序を関数として固定する（issue #178 PR #233 レビュー
+/// 再々指摘 6「kill がリーダー回収前に行われる順序を確認する」）。
+/// `kill_group` の戻り値（掃除を確認できたか）を `reap`
+/// （`descendants_confirmed_clean` として使う）へそのまま渡す。猶予内に
+/// 終了を確認できた（既に reap 済みの）経路では、本関数を使わずに
+/// [`kill_process_group_best_effort`] を直接呼ぶ（[`run_train`] 参照）。
 ///
 /// 実プロセスを使わずに呼び出し順序を検証できるよう、`kill_group`・`reap`
 /// を引数として受け取る形に切り出してある
@@ -759,6 +916,12 @@ pub fn run_train(
             command.env(key, value);
         }
     }
+    // Rust 側がプロセスグループを管理していることを supervisor.py へ伝える
+    // （[`SUPERVISOR_GROUP_MANAGED_ENV`] のドキュメント参照。issue #178
+    // PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めている」）。
+    // これを設定した場合だけ、supervisor.py は `_worker` を
+    // `start_new_session` なしで起動し、本プロセスグループに留める。
+    command.env(SUPERVISOR_GROUP_MANAGED_ENV, SUPERVISOR_GROUP_MANAGED_VALUE);
     // supervisor を新しいプロセスグループの先頭として起動する（`pgid` =
     // supervisor 自身の pid）。`_worker` は python 側で `start_new_session`
     // を使わない設計に変えたため（`trainer/src/fandhe_edge_trainer/
@@ -800,22 +963,54 @@ pub fn run_train(
     // 場合だが、本関数は常に `stdout(Stdio::piped())` を指定するため
     // 到達しない防御的分岐。到達したとしても後続の `match` が
     // `StdoutIncomplete` として安全側に倒す。
-    let timed_out = matches!(
+    let stdout_timed_out = matches!(
         stdout_wait,
         Some(Err(mpsc::RecvTimeoutError::Timeout)) | None
     );
 
-    // 正常系・異常系（タイムアウトを含む）を問わず、reap の前に必ず
-    // プロセスグループ全体へ `SIGKILL` を送る。`_worker` が同じグループに
-    // 残っていれば道連れに終了させる（ESRCH 相当＝既に何も残っていない、は
-    // 正常な結果として扱う。issue #178 PR #233 レビュー再々指摘「ps 由来の
-    // スナップショット方式そのものの欠陥」への対応として、`ps` による
-    // プロセスツリー走査を全廃し、プロセスグループへの一括シグナルへ
-    // 置き換えた）。
-    let (descendants_confirmed_clean, reap_result) = kill_group_then_reap(
-        || kill_process_group_best_effort(pgid),
-        |confirmed| wait_after_kill(&mut child, confirmed),
-    );
+    // 標準出力の EOF（または壁時計予算の消費）は supervisor の終了を保証
+    // しない（codex 指摘 P1。モジュール doc「不変条件」参照）。ここで
+    // `EOF_EXIT_GRACE` と残りの壁時計予算の小さい方だけ `try_wait()` を
+    // ポーリングし、供給元が自発的に終了するのを確認する。
+    let grace_budget = EOF_EXIT_GRACE.min(deadline.saturating_duration_since(Instant::now()));
+    let grace_deadline = Instant::now() + grace_budget;
+    let grace_wait = poll_wait_bounded(&mut child, grace_deadline);
+    let exited_in_grace = matches!(grace_wait, Ok(Some(_)));
+
+    let (descendants_confirmed_clean, reap_result): (bool, Result<ExitStatus, TrainProcessError>) =
+        match grace_wait {
+            Ok(Some(status)) => {
+                // 猶予内に自発的に終了した（`try_wait()` で既に reap 済み）。
+                // グループにまだ生存メンバー（`_worker` 等）がいる限り、
+                // POSIX の性質により pgid は予約されたままなので、reap 後に
+                // `kill(-pgid)` を送っても安全（グループが既に空なら ESRCH
+                // になるだけで害はない。モジュール doc「不変条件」参照。
+                // 残る理論上の窓もそこに明記した）。ここで掃除を確認
+                // できなければ fail-closed で `GroupCleanupUnconfirmed` を
+                // 返す（学習自体が成功していても、資源上限を守れたと
+                // 言えない状態を成功として返さない）。
+                if !kill_process_group_best_effort(pgid) {
+                    return Err(TrainProcessError::GroupCleanupUnconfirmed);
+                }
+                (true, Ok(status))
+            }
+            Ok(None) | Err(_) => {
+                // 猶予内に終了を確認できなかった（本来のタイムアウト、
+                // または EOF 後に想定より長く終了処理がかかっている場合）。
+                // 従来どおりリーダーが未回収のままグループ kill してから
+                // reap する（[`kill_group_then_reap`] のドキュメント参照）。
+                kill_group_then_reap(
+                    || kill_process_group_best_effort(pgid),
+                    |confirmed| wait_after_kill(&mut child, confirmed),
+                )
+            }
+        };
+
+    // 元々のタイムアウト（stdout 読み取りが壁時計予算内に完了しなかった）
+    // だけでなく、猶予内に supervisor の終了を確認できなかった場合も、
+    // 既存の語彙のとおり `WallTimeout` として分類する（issue #178 PR #233
+    // レビュー再々々指摘 P1。モジュール doc「不変条件」参照）。
+    let timed_out = stdout_timed_out || !exited_in_grace;
 
     if timed_out {
         return Err(TrainProcessError::WallTimeout {
@@ -1166,5 +1361,67 @@ mod tests {
         );
         assert!(!confirmed);
         assert!(reaped.is_ok());
+    }
+
+    /// issue #178 PR #233 レビュー再々々指摘 P0「`/bin/kill` の終了コード
+    /// 1 は ESRCH 以外（EPERM・引数エラー等）でも返るのに掃除済み扱いして
+    /// いる」への回帰テスト（REQ-39）: 終了コード 1（送出失敗）と
+    /// "Operation not permitted"（EPERM のメッセージ）の組み合わせは、
+    /// ESRCH ではないため「未確認」（`false`）とすること。
+    #[cfg(unix)]
+    #[test]
+    fn req39_kill_call_indicates_absent_rejects_eperm() {
+        assert!(!kill_call_indicates_absent(
+            false,
+            b"kill: (-123) - Operation not permitted\n"
+        ));
+    }
+
+    /// 終了コード 1（送出失敗）で、かつメッセージが判別できない（空・
+    /// 想定外の文言）場合も「未確認」（`false`）とすること。
+    #[cfg(unix)]
+    #[test]
+    fn req39_kill_call_indicates_absent_rejects_unrecognized_message() {
+        assert!(!kill_call_indicates_absent(false, b""));
+        assert!(!kill_call_indicates_absent(
+            false,
+            b"kill: (-123) - Unknown error\n"
+        ));
+    }
+
+    /// 終了コード 1（送出失敗）で、メッセージに "No such process"
+    /// （ESRCH 相当）を含む場合だけ「確認できた」（`true`）とすること。
+    #[cfg(unix)]
+    #[test]
+    fn req39_kill_call_indicates_absent_accepts_esrch_message() {
+        assert!(kill_call_indicates_absent(
+            false,
+            b"kill: (-123) - No such process\n"
+        ));
+        // BSD/macOS 系の書式（先頭の "kill:" プレフィックスが無い等）でも
+        // 部分一致で判定できること。
+        assert!(kill_call_indicates_absent(false, b"No such process\n"));
+    }
+
+    /// 送出に成功した（終了コード 0）場合、対象は生存していたことの証拠
+    /// であり ESRCH ではありえないため、stderr の内容によらず常に
+    /// `false`（「まだ生存している」と扱う）こと。
+    #[cfg(unix)]
+    #[test]
+    fn req39_kill_call_indicates_absent_rejects_successful_send() {
+        assert!(!kill_call_indicates_absent(true, b""));
+        assert!(!kill_call_indicates_absent(true, b"No such process\n"));
+    }
+
+    /// [`stderr_indicates_no_such_process`] 自体の部分一致判定。
+    #[cfg(unix)]
+    #[test]
+    fn req39_stderr_indicates_no_such_process_is_substring_match() {
+        assert!(stderr_indicates_no_such_process(
+            b"kill: (-123) - No such process\n"
+        ));
+        assert!(!stderr_indicates_no_such_process(
+            b"kill: (-123) - Operation not permitted\n"
+        ));
     }
 }

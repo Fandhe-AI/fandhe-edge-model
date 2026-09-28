@@ -37,18 +37,10 @@ test_supervisor_module_does_not_import_mlx` で検証する。
 3. `<sys.executable> -I <trainer/launch.py の絶対パス> _worker --out-fd <tmp_fd>`
    （`worker_argv` が組み立てる argv。Issue #12: `-I`〔隔離モード〕で呼び出し元の
    `PYTHONPATH` 等に依存せず `trainer/src` を解決する）を子プロセスとして
-   起動する。**新しいセッション・プロセスグループへは切り離さない**
-   （`start_new_session` を指定しない）。`_worker` は fork した瞬間から本
-   `supervisor.py` プロセスと同じプロセスグループに留まる（issue #178 PR #233
-   レビュー再々指摘: `start_new_session=True` で別セッションに切り離すと、
-   `_worker` が本プロセスの終了後も生き残った場合に Rust 側から見つけられ
-   なくなる〔`ppid` チェーンが切れる〕・`ps` によるプロセスツリー走査が環境
-   依存で失敗しうる、という 2 種の欠陥があった。Rust 側 `run_train` が
-   supervisor 自身をプロセスグループの先頭として起動し〔`pgid` = supervisor
-   の pid〕、タイムアウト時に `kill(-pgid, SIGKILL)` でグループ全体を一括
-   終了させることで、`_worker` を含む子孫の確実な掃除を担う）。`pass_fds=
-   (tmp_fd,)` で一時ディレクトリの fd だけを引き継がせる。リクエストの
-   内容は `--request <path>` では渡さない。
+   起動する。**`start_new_session` の要否は `SUPERVISOR_GROUP_MANAGED_ENV`
+   環境変数で切り替える**（`_is_group_managed_by_rust` 参照。issue #178
+   PR #233 レビュー再々々指摘 P0）。`pass_fds=(tmp_fd,)` で一時ディレクトリの
+   fd だけを引き継がせる。リクエストの内容は `--request <path>` では渡さない。
    代わりに `raw` を `tempfile.TemporaryFile()`（作成直後に unlink 済みの無名
    一時ファイル。stdlib のみで完結し、`supervisor.py` が mlx・onnx・numpy を
    import しない設計を崩さない）へ書き込み、`seek(0)` してから子プロセスの
@@ -63,14 +55,11 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    超えたかを見る。`ps` の実行自体に失敗したら「監視ができない」ことを
    fail-closed に扱い、子プロセスを強制終了して `runtime_error` とする
    （安全側に倒す。上限を検査できないまま野放しにしない）。
-6. 超過を検出したら `_worker`（本モジュールの未回収の直接の子。`pid` の
-   再利用は起こらない）だけへ `SIGKILL` を送り、予約（一時ディレクトリと
-   その中身・空の予約済みディレクトリ）を `contract.cleanup_reservation` で
-   解放する（本モジュールが保持し続けている fd だけを使う。名前を再解決
-   しない）。**`_worker` がさらに起動した孫プロセスの確実な掃除は本モジュール
-   の責務ではない**（`_worker` は本プロセスと同じプロセスグループに留まる
-   ため、Rust 側 `run_train` のプロセスグループ一括 `SIGKILL` が孫プロセスを
-   含めて掃除する。issue #178 PR #233 レビュー再々指摘）。
+6. 超過を検出したら `_terminate_worker` を呼ぶ（モードによって挙動が
+   異なる。後述の「単独モード／管理モード」節参照）うえで、予約
+   （一時ディレクトリとその中身・空の予約済みディレクトリ）を
+   `contract.cleanup_reservation` で解放する（本モジュールが保持し続けている
+   fd だけを使う。名前を再解決しない）。
 7. 子プロセスが自分で終了した場合: 標準出力が「ちょうど 1 つの妥当な JSON
    オブジェクトである」ことを確認し、終了コードが 7 種のいずれかであることも
    確認する。いずれかを満たさない、またはシグナルによる終了なら
@@ -88,24 +77,36 @@ Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパ
 終了した場合の後始末は、本モジュールの責務ではなく Rust 側ジョブ管理
 （TASK-34.x）に委ねる。
 
-**`_worker` を単独（Rust 側ジョブ管理なし）で起動した場合の既知の限界**
-（issue #178 PR #233 レビュー再々指摘。`_worker` を自身と同じプロセス
-グループに留める設計へ変更したことに伴う）: 本モジュールの `monitor_child`
-は `time_limit_seconds`／`rss_limit_bytes` 超過時に `_worker`（本モジュールの
-直接の子）だけへ `SIGKILL` を送り、`_worker` がさらに起動した孫プロセスまでは
-掃除しない（`_kill_worker` 参照）。孫プロセスに至るまでの確実な一括終了は、
-Rust 側 `run_train` が `_worker` を含むプロセスグループ全体へ `SIGKILL` を
-送ることで担う（`crates/train/src/process.rs` モジュール doc「プロセス
-グループによる一括終了」参照）。したがって、本モジュールを Rust 側ジョブ
-管理を経由せず単独で起動する運用（テスト・手動実行を含む）では、`_worker`
-の孫プロセスが本モジュール終了後も残る可能性があり、単体では完全な
-多層防御（defense in depth）を提供しない。
+**単独モード／管理モード（`SUPERVISOR_GROUP_MANAGED_ENV`。issue #178 PR
+#233 レビュー再々々指摘 P0「単独起動時の防御を弱めている」）**:
+`_worker` をどのプロセスグループへ属させるか、`monitor_child` の内部
+タイムアウトで何を kill するかは、環境変数
+`SUPERVISOR_GROUP_MANAGED_ENV`（値が厳密に `"1"` の場合だけ「管理モード」。
+未設定・その他の値は安全側の「単独モード」）で切り替える。
+
+- **単独モード（既定・安全側）**: 本モジュールを単独で起動する運用
+  （Rust 側ジョブ管理を経由しないテスト・手動実行を含む）を想定し、
+  以前の挙動（`_worker` を `start_new_session=True` で別セッション・
+  プロセスグループとして起動し、内部タイムアウト時に本モジュール自身が
+  `os.killpg` でそのグループごと終了させる）を維持する。`_worker` の
+  孫プロセスまで本モジュール単体で確実に掃除できる。
+- **管理モード（Rust 側 `run_train` が起動した場合）**: `_worker` を
+  `start_new_session` なしで起動し、本モジュールと同じプロセスグループ
+  （Rust 側が `process_group(0)` で確立したもの）に留める。内部タイムアウト
+  時は `_worker`（本モジュールの未回収の直接の子。`pid` の再利用は起こら
+  ない）だけへ `SIGKILL` を送り、`_worker` がさらに起動した孫プロセスの
+  確実な掃除は行わない。これは Rust 側 `run_train` が `_worker` を含む
+  プロセスグループ全体へ `SIGKILL` を送ることで担う責務移動であり
+  （`crates/train/src/process.rs` モジュール doc「プロセスグループによる
+  一括終了」参照）、管理モードで単独起動された場合（通常あり得ないが）は
+  孫プロセスが残りうる。
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import os
 import resource
 import signal
 import subprocess
@@ -120,6 +121,32 @@ from . import artifact as artifact_mod
 from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
+
+#: Rust 側 `run_train` がプロセスグループを管理していることを伝える環境
+#: 変数名（issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を
+#: 弱めている」）。Rust 側の同名の定数
+#: （`crates/train/src/process.rs::SUPERVISOR_GROUP_MANAGED_ENV`）と
+#: 一致することを、共有 fixture
+#: `fixtures/train_contract/supervisor_group_managed_env.json` 経由で
+#: `trainer/tests/test_train_contract_fixture.py`・
+#: `crates/train/tests/train_contract_fixture.rs` の双方から照合する。
+SUPERVISOR_GROUP_MANAGED_ENV = "FANDHE_EDGE_SUPERVISOR_GROUP_MANAGED"
+
+#: [`SUPERVISOR_GROUP_MANAGED_ENV`] が「管理モード」を示す値。この文字列と
+#: 完全一致する場合だけ管理モードとみなす（未設定・その他の値は安全側の
+#: 単独モード）。
+_SUPERVISOR_GROUP_MANAGED_VALUE = "1"
+
+
+def _is_group_managed_by_rust() -> bool:
+    """Rust 側 `run_train` がプロセスグループを管理しているか。
+
+    厳密に `SUPERVISOR_GROUP_MANAGED_ENV` が `"1"` の場合だけ `True`
+    （未設定・その他の値は `False`＝安全側の単独モード。issue #178 PR #233
+    レビュー再々々指摘 P0）。
+    """
+    return os.environ.get(SUPERVISOR_GROUP_MANAGED_ENV) == _SUPERVISOR_GROUP_MANAGED_VALUE
+
 
 #: 監視ループのポーリング間隔（秒）。
 _POLL_INTERVAL_SECONDS = 0.1
@@ -176,24 +203,36 @@ def _current_child_rss_bytes(pid: int) -> int | None:
     return kib * 1024
 
 
-def _kill_worker(proc: subprocess.Popen) -> None:
-    """`_worker`（本モジュールの未回収の直接の子）だけへ `SIGKILL` を送る。
+def _terminate_worker(proc: subprocess.Popen) -> None:
+    """モード（[`_is_group_managed_by_rust`]）に応じて `_worker` を終了させる
+    （issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めて
+    いる」）。
 
-    以前は `os.killpg` でプロセスグループ全体を終了させていたが、`_worker` を
-    `start_new_session=True` で別グループへ切り離すのをやめたため（モジュール
-    docstring 参照）、本モジュール自身も `_worker` と同じプロセスグループに
-    属する。`killpg` をそのまま使うと監視ループを実行している本プロセス自身も
-    巻き込んで終了してしまうため、`proc.kill()`（`os.kill(proc.pid, SIGKILL)`
-    と同等）で直接の子だけを対象にする（issue #178 PR #233 レビュー再々指摘）。
-    `proc` は本プロセスの未回収の直接の子であり、`wait()` するまで `pid` が
-    OS に返却されない（＝再利用されない）ため、`pid` ベースの kill でも
-    無関係なプロセスを誤って終了させる心配はない。
-
-    `_worker` がさらに起動した孫プロセスはここでは掃除しない
-    （Rust 側 `run_train` のプロセスグループ一括 `SIGKILL` の責務）。
+    - **単独モード**（既定・安全側）: `_worker` は `start_new_session=True`
+      で別プロセスグループとして起動されているため、本モジュール自身は
+      巻き込まれない。`os.killpg` でそのグループごと終了させ、`_worker` が
+      さらに起動した孫プロセスまで本モジュール単体で掃除する（以前の挙動
+      を維持）。プロセスグループの取得自体に失敗した場合の保険として
+      `proc.kill()` も呼ぶ。
+    - **管理モード**: `_worker` は本モジュールと同じプロセスグループに
+      留まる設計のため、`os.killpg` を使うと監視ループを実行している
+      本プロセス自身も巻き込んで終了してしまう。`proc.kill()`
+      （`os.kill(proc.pid, SIGKILL)` と同等）で直接の子だけを対象にする。
+      `proc` は本プロセスの未回収の直接の子であり、`wait()` するまで
+      `pid` が OS に返却されない（＝再利用されない）ため、`pid` ベースの
+      kill でも無関係なプロセスを誤って終了させる心配はない。孫プロセスは
+      ここでは掃除しない（Rust 側 `run_train` のプロセスグループ一括
+      `SIGKILL` の責務）。
     """
+    if _is_group_managed_by_rust():
+        with contextlib.suppress(OSError):
+            proc.kill()
+        return
     with contextlib.suppress(OSError):
-        proc.kill()
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()  # プロセスグループの取得自体に失敗した場合の保険
 
 
 def _cpu_seconds_consumed_by_children(baseline: resource.struct_rusage) -> float:
@@ -278,7 +317,7 @@ def monitor_child(
         except subprocess.TimeoutExpired:
             pass
         if time.monotonic() > deadline:
-            _kill_worker(proc)
+            _terminate_worker(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             return "time"
@@ -291,12 +330,12 @@ def monitor_child(
         if rss is None:
             # 監視できないこと自体を fail-closed に扱う（上限を検査できない
             # まま子プロセスを走らせ続けない）。
-            _kill_worker(proc)
+            _terminate_worker(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             return "monitor_failed"
         if rss > rss_limit_bytes:
-            _kill_worker(proc)
+            _terminate_worker(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
             return "rss"
@@ -451,17 +490,21 @@ def _spawn_worker_and_finalize(
             req_file.write(raw_request)
             req_file.seek(0)
             try:
+                # 管理モード（Rust 側 `run_train` が起動した場合）だけ
+                # `_worker` を本モジュールと同じプロセスグループに留める
+                # （`start_new_session=False`）。単独モード（既定・安全側）
+                # では従来どおり別セッションへ切り離し、本モジュール単体で
+                # 孫プロセスまで掃除できるようにする（モジュール docstring
+                # 「単独モード／管理モード」参照。issue #178 PR #233
+                # レビュー再々々指摘 P0「単独起動時の防御を弱めている」）。
+                group_managed = _is_group_managed_by_rust()
                 proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
                     argv,
                     stdin=req_file,
                     stdout=subprocess.PIPE,
                     stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
                     pass_fds=(reservation.tmp_fd,),
-                    # `start_new_session` は指定しない: `_worker` を本
-                    # プロセスと同じプロセスグループに留める（モジュール
-                    # docstring「新しいセッション・プロセスグループへは
-                    # 切り離さない」参照。issue #178 PR #233 レビュー再々
-                    # 指摘）。
+                    start_new_session=not group_managed,
                 )
             except OSError as e:
                 contract.cleanup_reservation(reservation)

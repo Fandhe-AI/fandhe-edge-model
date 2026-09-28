@@ -461,6 +461,16 @@ pub enum TrainProcessError {
     /// 資源上限（REQ-39）を保証できないまま子プロセスを起動しない
     /// （fail-closed。子プロセスは一切起動しない）。
     UnsupportedPlatform,
+    /// supervisor が [`crate::process::EOF_EXIT_GRACE`] の猶予内に自発的に
+    /// 終了したものの、その後の
+    /// [`crate::process::kill_process_group_best_effort`] がプロセス
+    /// グループの掃除を確認できなかった（`/bin/kill -KILL` が ESRCH 以外の
+    /// 理由〔EPERM・引数エラー等〕で失敗した、または有界回数のリトライ後も
+    /// まだ生存が確認された）。学習自体は成功していた可能性があっても、
+    /// 資源上限（REQ-39）を確実に守れたと言えない状態を成功として返さない
+    /// （fail-closed。issue #178 PR #233 レビュー再々々指摘 P0「終了コード
+    /// 1 は ESRCH 以外でも返るのに掃除済み扱いしている」）。
+    GroupCleanupUnconfirmed,
 }
 
 impl std::fmt::Display for TrainProcessError {
@@ -536,6 +546,12 @@ impl std::fmt::Display for TrainProcessError {
                     "worker process resource limits are not supported on this platform"
                 )
             }
+            TrainProcessError::GroupCleanupUnconfirmed => {
+                write!(
+                    f,
+                    "worker process group cleanup could not be confirmed after graceful exit"
+                )
+            }
         }
     }
 }
@@ -574,7 +590,8 @@ impl TrainProcessError {
             | TrainProcessError::StdoutIncomplete
             | TrainProcessError::StderrIncomplete
             | TrainProcessError::ExitCodeMismatch { .. }
-            | TrainProcessError::UnsupportedPlatform => ExitCode::RuntimeError,
+            | TrainProcessError::UnsupportedPlatform
+            | TrainProcessError::GroupCleanupUnconfirmed => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
             TrainProcessError::Request(inner) => inner.exit_code(),
             TrainProcessError::Result(inner) => inner.exit_code(),

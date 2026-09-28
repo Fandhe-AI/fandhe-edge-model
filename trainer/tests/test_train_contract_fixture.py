@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from fandhe_edge_trainer import artifact, cli, contract, limits
+from fandhe_edge_trainer import artifact, cli, contract, limits, supervisor
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 from fandhe_edge_trainer.kinds import c3
@@ -266,3 +266,15 @@ def test_req21_missing_request_file_matches_result_error_fixture(
     captured = capsys.readouterr()
     printed = json.loads(captured.out.strip())
     assert printed == _RESULT_ERROR
+
+
+def test_supervisor_group_managed_env_matches_rust_constant() -> None:
+    """issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めて
+    いる」: `supervisor.py::SUPERVISOR_GROUP_MANAGED_ENV` が、共有 fixture
+    （`fixtures/train_contract/supervisor_group_managed_env.json`）経由で
+    Rust 側 `crates/train/src/process.rs::SUPERVISOR_GROUP_MANAGED_ENV` と
+    一致すること。対になるテストは
+    `crates/train/tests/train_contract_fixture.rs`。
+    """
+    fixture = _load_json_fixture("supervisor_group_managed_env.json")
+    assert supervisor.SUPERVISOR_GROUP_MANAGED_ENV == fixture["env_var"]

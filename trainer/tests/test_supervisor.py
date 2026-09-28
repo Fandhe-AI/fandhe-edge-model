@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -174,6 +175,124 @@ def test_monitor_child_maps_rlimit_cpu_self_kill_to_limit_exceeded() -> None:
         assert reason == "cpu"
         assert elapsed < 10.0  # ソフト上限（1 秒）＋ポーリング遅延程度で終わっていること
         assert proc.poll() is not None
+    finally:
+        _reap(proc)
+
+
+# --------------------------------------------------------------------------
+# 単独モード／管理モード（SUPERVISOR_GROUP_MANAGED_ENV。issue #178 PR #233
+# レビュー再々々指摘 P0「単独起動時の防御を弱めている」）
+# --------------------------------------------------------------------------
+
+
+def test_is_group_managed_by_rust_requires_exact_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`SUPERVISOR_GROUP_MANAGED_ENV` は厳密に `"1"` の場合だけ管理モードと
+    みなす（未設定・空文字列・他の値はすべて安全側の単独モード）。REQ-39。
+    """
+    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
+    assert supervisor._is_group_managed_by_rust() is False
+
+    for other_value in ("", "0", "true", "TRUE", "yes"):
+        monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, other_value)
+        assert supervisor._is_group_managed_by_rust() is False
+
+    monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, "1")
+    assert supervisor._is_group_managed_by_rust() is True
+
+
+def test_worker_start_new_session_depends_on_managed_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`start_new_session=not _is_group_managed_by_rust()` という
+    `_spawn_worker_and_finalize` の呼び出し方どおり、管理モードでは worker
+    相当のプロセスが本プロセスと同じグループに留まり、単独モードでは別
+    グループへ切り離されること（issue #178 PR #233 レビュー再々々指摘 P0）。
+    """
+    own_pgid = os.getpgid(os.getpid())
+
+    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
+    standalone_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(1)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=not supervisor._is_group_managed_by_rust(),
+    )
+    try:
+        assert os.getpgid(standalone_proc.pid) != own_pgid
+    finally:
+        _reap(standalone_proc)
+
+    monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, "1")
+    managed_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(1)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=not supervisor._is_group_managed_by_rust(),
+    )
+    try:
+        assert os.getpgid(managed_proc.pid) == own_pgid
+    finally:
+        _reap(managed_proc)
+
+
+def test_terminate_worker_standalone_mode_kills_grandchild_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """REQ-39・issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を
+    弱めている」への回帰テスト: 単独モード（`SUPERVISOR_GROUP_MANAGED_ENV`
+    未設定）では、内部タイムアウト時に `_worker` 役（`monitor_child` に渡す
+    `proc`）だけでなく、その子（孫プロセス）も一括して終了すること
+    （`_worker` を `start_new_session=True` で別グループへ切り離し、
+    `os.killpg` でグループごと終了させる、以前の防御を復元したことの
+    確認）。
+    """
+    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、自分の子（孫プロセス）を「同じグループに
+    # 残したまま」（`start_new_session` を指定しない＝デフォルトで継承）
+    # 起動する。孫は heartbeat ファイルへ書き続ける。
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        "time.sleep(60)\n"
+    )
+    proc = _spawn(code)
+    try:
+        # `monitor_child` 自身の壁時計（`time_limit_seconds=0.2`）が起動する
+        # 前に、孫プロセスが実際に起動済み（heartbeat が書かれ始めている）
+        # ことを確認しておく。冷えた CI ランナーでは `python -c` の起動に
+        # 100〜300ms かかることがあり、確認せずに `monitor_child` を呼ぶと
+        # 「孫がまだ起動していないうちにタイムアウトが発火し、heartbeat が
+        # 一度も作られない」という無関係な理由でテストが flaky になる。
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not heartbeat.exists():
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started before invoking monitor_child"
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=0.2,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason == "time"
+
+        size_after_kill = heartbeat.stat().st_size
+        time_mod.sleep(0.3)
+        assert heartbeat.stat().st_size == size_after_kill, (
+            "grandchild must not still be writing after monitor_child returns"
+        )
     finally:
         _reap(proc)
 

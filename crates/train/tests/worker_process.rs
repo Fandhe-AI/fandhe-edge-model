@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
-use fandhe_edge_train::process::ENV_ALLOWLIST;
+use fandhe_edge_train::process::{ENV_ALLOWLIST, SUPERVISOR_GROUP_MANAGED_ENV};
 use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 
@@ -75,6 +75,29 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
     match mode {
         "ok" => {
             print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
+            std::process::exit(0);
+        }
+        "ok_slow_exit" => {
+            // issue #178 PR #233 レビュー再々々指摘 P1「stdout の EOF は
+            // supervisor の終了を保証しない」の再現・検証用モード。結果
+            // JSON を出力（フラッシュ）した後、実際にプロセスが終了する
+            // までの間に短い遅延（インタプリタのシャットダウン処理を
+            // 模す）を挟む。`EOF_EXIT_GRACE`（2 秒）より十分短くすることで、
+            // `run_train` が猶予内に自発的な終了を確認し、成功として
+            // 扱うことを検証する。
+            //
+            // 標準ライブラリだけでは自プロセスの stdout（fd 1）を
+            // `exit()` に先立って明示的に閉じる安全な手段が無い
+            // （`unsafe` な生 fd 操作が要る。依存・`unsafe` の追加は
+            // 禁止）ため、本モードは「EOF の観測が実際のプロセス終了より
+            // 先行する」という codex 指摘の競合そのものではなく、
+            // `run_train` 側の猶予ポーリング（`poll_wait_bounded` が複数
+            // 回ポーリングしてから終了を確認する経路）を確実に運動させる
+            // ことで、猶予の導入が正常系を壊していないことを検証する。
+            print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::thread::sleep(Duration::from_millis(300));
             std::process::exit(0);
         }
         "error_invalid_request" => {
@@ -287,6 +310,7 @@ fn run_test_suite() -> ProcessExitCode {
     #[cfg(unix)]
     let mut cases: Vec<(&'static str, CaseFn)> = vec![
         ("ok_outcome", case_ok_outcome),
+        ("ok_slow_exit", case_ok_slow_exit),
         ("error_invalid_request", case_error_invalid_request),
         ("error_training_diverged", case_error_training_diverged),
         ("mismatch_ok_exit64", case_mismatch_ok_exit64),
@@ -449,6 +473,21 @@ fn case_ok_outcome(case_dir: &Path) -> Result<(), String> {
         !case_dir.join("request.json").exists(),
         "request.json must be deleted after success",
     )
+}
+
+/// issue #178 PR #233 レビュー再々々指摘 P1「stdout の EOF は supervisor の
+/// 終了を保証しない」への回帰テスト（REQ-39）: 結果 JSON を出力してから
+/// 少し（`EOF_EXIT_GRACE` より十分短い時間）遅れて `exit(0)` する供給元を、
+/// 誤って `TerminatedBySignal`／`WallTimeout` 等に分類せず、正しく `Ok` と
+/// 判定できること。
+#[cfg(unix)]
+fn case_ok_slow_exit(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok_slow_exit");
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+    let run = run_train(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("run_train failed: {e}"))?;
+    expect_eq(run.exit_code(), ExitCode::Ok, "exit_code")
 }
 
 /// 受け入れ条件 3: ワーカーのエラー（`invalid_request`）が `InvalidInput`
@@ -802,11 +841,26 @@ fn case_record(case_dir: &Path) -> Result<(), String> {
         .ok_or("record.env_names missing")?;
     for name in env_names {
         let name = name.as_str().unwrap_or_default();
+        // `SUPERVISOR_GROUP_MANAGED_ENV` は `ENV_ALLOWLIST`（親環境からの
+        // 継承リスト）には含まれない。`run_train` が固定値
+        // （`SUPERVISOR_GROUP_MANAGED_VALUE`）を明示的に設定する内部境界の
+        // 環境変数であり、親プロセスの環境値を継承するものではないため
+        // （issue #178 PR #233 レビュー再々々指摘 P0）。
         expect_true(
-            ENV_ALLOWLIST.contains(&name),
-            &format!("child env var {name:?} must be in ENV_ALLOWLIST"),
+            ENV_ALLOWLIST.contains(&name) || name == SUPERVISOR_GROUP_MANAGED_ENV,
+            &format!(
+                "child env var {name:?} must be in ENV_ALLOWLIST or be the group-managed marker"
+            ),
         )?;
     }
+    let env_names_set: Vec<&str> = env_names
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    expect_true(
+        env_names_set.contains(&SUPERVISOR_GROUP_MANAGED_ENV),
+        "run_train must always set SUPERVISOR_GROUP_MANAGED_ENV on the worker process",
+    )?;
     Ok(())
 }
 
