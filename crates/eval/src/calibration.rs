@@ -375,11 +375,28 @@ fn build_row(
     }
     let argmax_index = argmax_index.ok_or(CalibrationError::NoFiniteLogit { index })?;
 
-    let d: Vec<f64> = record
-        .logits
-        .iter()
-        .map(|&z| if z.is_finite() { z - max_finite } else { z })
-        .collect();
+    let mut d: Vec<f64> = Vec::with_capacity(record.logits.len());
+    for (label_pos, &z) in record.logits.iter().enumerate() {
+        if z.is_finite() {
+            let diff = z - max_finite;
+            // 有限のロジット同士の減算が `±∞` に桁あふれした場合（例:
+            // `z = -f64::MAX`・`max_finite = f64::MAX`）、この後段は
+            // `diff.is_finite()` を「gold のロジットが正当な `−∞` 入力
+            // だった」ケースと区別できず、silently 除外（確率 0 扱い）
+            // してしまう。REQ-27 の fail-closed 原則に反するため、有限
+            // 入力から非有限差分が生じた時点でここで拒否する。
+            if !diff.is_finite() {
+                return Err(CalibrationError::NonFiniteResult {
+                    detail: format!(
+                        "finite logit difference overflowed to non-finite at record index {index}, label index {label_pos} (logit={z}, max_finite={max_finite})"
+                    ),
+                });
+            }
+            d.push(diff);
+        } else {
+            d.push(z);
+        }
+    }
     let d_gold_if_finite = d.get(gold_index).copied().filter(|v| v.is_finite());
 
     Ok(RowData {
@@ -828,6 +845,27 @@ mod tests {
         ];
         let err =
             calibrate(&labels, &records).expect_err("overflow to non-finite NLL must be rejected");
+        assert!(matches!(err, CalibrationError::NonFiniteResult { .. }));
+    }
+
+    /// REQ-27（評価契約の fail-closed 原則）: gold のロジットと argmax の
+    /// ロジットがともに有限でも、正規化の減算 `z - max_finite` 自体が
+    /// `−∞` へ桁あふれする入力（`z = -f64::MAX`・`max_finite = f64::MAX`）
+    /// では、`d_gold_if_finite` が「gold が正当な `−∞` 入力だった」場合と
+    /// 区別できなくなり、silently 除外（gold の確率が 0 であるかのように
+    /// `mean_nll` の clip 定数を適用）してしまう回帰を防ぐ。`calibrate` は
+    /// この桁あふれを `NonFiniteResult` として拒否しなければならない
+    /// （codex/review 指摘: PR #241 threadId PRRT_kwDOUq-SxM6ms6lh）。
+    #[test]
+    fn req27_calibrate_rejects_finite_logit_difference_overflow() {
+        let labels = ["a", "b"];
+        let logits: [f64; 2] = [-f64::MAX, f64::MAX];
+        let records = vec![CalibrationRecord {
+            gold: "a",
+            logits: &logits,
+        }];
+        let err = calibrate(&labels, &records)
+            .expect_err("finite logit difference overflow must be rejected, not silently excluded");
         assert!(matches!(err, CalibrationError::NonFiniteResult { .. }));
     }
 }
