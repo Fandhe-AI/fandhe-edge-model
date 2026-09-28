@@ -50,8 +50,12 @@
 //!   [`significance::is_correct`] と同じ正誤規則・[`mcnemar::paired_counts`]
 //!   を再利用し、評価ロジックを層内で再実装しない
 //! - [`reproducibility`][]: 3 seed 以上の Wilson 95% 信頼区間の重なり判定
-//!   （REQ-26 境界値・TASK-26.3-1・issue #104）。[`wilson`] が返す区間、
-//!   または `(seed, correct, total)` の組から全ペアの重なりを判定する
+//!   （REQ-26 境界値・TASK-26.3-1・issue #104）。公開 API は
+//!   `(seed, correct, total, eval_data_hash)` の組（[`reproducibility::SeedRun`]）
+//!   を受け取る [`reproducibility::judge_reproducibility`] のみで、区間
+//!   （[`wilson`] が返す型）を直接受け取る内部関数は seed・評価データの
+//!   由来を検証できないため crate 内部限定（issue #104 レビュー指摘・
+//!   PR #243）
 //!
 //! # 現状（実装済みを装わない）
 //!

@@ -4,13 +4,22 @@
 //! 実機結果（`jobs/threeseed/result.json`。CPU device）で、GPU（Metal / MLX）
 //! での同じ結論の再確認は本テストの範囲外（issue #105）。
 
+use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_eval::reproducibility::{OverlapVerdict, SeedRun, judge_reproducibility};
+
+/// 全テスト共通の「同一凍結評価データ」を表す固定ハッシュ。値そのものに
+/// 意味はなく、`run` ヘルパーの全呼び出しが同じ評価データへ適用した体で
+/// 動作させるための定数（REQ-17。issue #104 レビュー指摘・PR #243）。
+fn same_eval_data_hash() -> Sha256Digest {
+    Sha256Digest::of_bytes(b"reproducibility_overlap test fixture eval data")
+}
 
 fn run(seed: u64, correct: u64, total: u64) -> SeedRun {
     SeedRun {
         seed,
         correct,
         total,
+        eval_data_hash: same_eval_data_hash(),
     }
 }
 
@@ -78,6 +87,32 @@ fn only_one_pair_disjoint() {
     let report = judge_reproducibility(&runs).expect("3 valid runs");
     assert_eq!(report.verdict(), OverlapVerdict::SomePairsDisjoint);
     assert_eq!(pair_tuples(&report), vec![(0, 2)]);
+}
+
+/// (f) `total`・`correct` が全 run で一致していても、`eval_data_hash` が
+/// 異なれば「別の凍結評価データへ適用した run」として fail-closed に拒否し、
+/// `AllPairsOverlap`（再現性あり）を返さない（REQ-17。issue #104 レビュー
+/// 指摘・PR #243: 修正前は `total` の一致のみで判定でき、異なる凍結評価
+/// データでも件数が偶然一致すれば再現性ありと誤判定できていた）。
+#[test]
+fn mismatched_eval_data_hash_is_rejected_even_when_totals_match() {
+    let other_hash = Sha256Digest::of_bytes(b"a different frozen eval data snapshot");
+    let runs = [
+        run(0, 214, 650),
+        run(1, 214, 650),
+        SeedRun {
+            seed: 2,
+            correct: 214,
+            total: 650,
+            eval_data_hash: other_hash,
+        },
+    ];
+    assert_eq!(
+        judge_reproducibility(&runs).unwrap_err(),
+        fandhe_edge_eval::reproducibility::ReproducibilityError::MismatchedEvalDataHash {
+            index: 2
+        }
+    );
 }
 
 /// (e) 4 seed 以上（5 件）でも動作する。

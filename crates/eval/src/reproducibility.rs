@@ -72,6 +72,8 @@
 
 use std::fmt;
 
+use fandhe_edge_core::hash::Sha256Digest;
+
 use crate::wilson::{self, WilsonInterval};
 
 /// 評価契約が要求する再現性判定の最小 seed 数（3 seed 以上）。
@@ -96,8 +98,16 @@ fn intervals_overlap(a_lo: f64, a_hi: f64, b_lo: f64, b_hi: f64) -> bool {
     !disjoint
 }
 
-/// 1 seed 分の評価件数（正解数・評価総数）。[`judge_reproducibility`] の
-/// 入力単位。
+/// 1 seed 分の評価件数（正解数・評価総数）と、適用した評価データの
+/// sha256（[`fandhe_edge_core::hash::Sha256Digest`]）。[`judge_reproducibility`]
+/// の入力単位。
+///
+/// `eval_data_hash` は呼び出し側（CLI `evaluate` 工程・データ契約層
+/// `fandhe_edge_data::eval_freeze::FreezeRecord`）が凍結評価データから
+/// 算出した sha256 を渡す想定で、`total`・`correct` だけでは区別できない
+/// 「別データなのに件数が偶然一致する」ケースを検出するために使う
+/// （issue #104 レビュー指摘・PR #243。REQ-17「評価データの凍結・ハッシュ
+/// 不変」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeedRun {
     /// この run を識別する seed 値（重複検出・診断用）。
@@ -106,6 +116,9 @@ pub struct SeedRun {
     pub correct: u64,
     /// 評価総数（分母）。
     pub total: u64,
+    /// この run が適用した凍結評価データ本体の sha256。全 run で一致する
+    /// ことを [`judge_reproducibility`] が検証する（REQ-17・REQ-26）。
+    pub eval_data_hash: Sha256Digest,
 }
 
 /// 重ならなかった区間の組（入力順の添字。`first < second`）。
@@ -230,6 +243,14 @@ pub enum ReproducibilityError {
         /// 不一致が見つかった run の添字。
         index: usize,
     },
+    /// `index` 番目の run の `eval_data_hash` が、先頭（0 番目）の run と
+    /// 異なる。`total`・`correct` が偶然一致しても、別の凍結評価データへ
+    /// 適用した run を再現性ありと誤判定しないための検査（REQ-17。
+    /// issue #104 レビュー指摘・PR #243）。
+    MismatchedEvalDataHash {
+        /// 不一致が見つかった run の添字。
+        index: usize,
+    },
 }
 
 impl fmt::Display for ReproducibilityError {
@@ -261,6 +282,12 @@ impl fmt::Display for ReproducibilityError {
             }
             ReproducibilityError::MismatchedTotals { index } => {
                 write!(f, "run at index {index} has a different total than index 0")
+            }
+            ReproducibilityError::MismatchedEvalDataHash { index } => {
+                write!(
+                    f,
+                    "run at index {index} has a different eval_data_hash than index 0"
+                )
             }
         }
     }
@@ -360,17 +387,23 @@ fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, Reproduc
     Ok(pairwise_overlap_report(intervals))
 }
 
-/// 3 件以上の seed run（正解数・評価総数の組）から Wilson 95% 信頼区間
-/// （`z = `[`crate::wilson::WILSON_Z_95`]）を算出し、[`judge_overlap`] で
-/// 重なりを判定する。
+/// 3 件以上の seed run（正解数・評価総数・適用した評価データの sha256 の組）
+/// から Wilson 95% 信頼区間（`z = `[`crate::wilson::WILSON_Z_95`]）を算出し、
+/// [`judge_overlap`] で重なりを判定する。
 ///
-/// 検証順は 上限 → 下限 → (seed の重複・評価総数の一致を 1 走査で要素ごとに
-/// 検証) → 区間の算出 → 全ペア走査（REQ-39。`Vec` の確保前に件数を検証する）。
-/// seed の重複と評価総数の不一致は同じループの同じ添字で検証するため、
-/// 入力によってはどちらが先に成立するかは添字の並びに依存する
-/// （例: `[(0,_,5,10), (1,_,6,20), (1,_,7,10)]` は index=1 で
+/// 検証順は 上限 → 下限 → (seed の重複・評価総数の一致・評価データ sha256 の
+/// 一致を 1 走査で要素ごとに検証) → 区間の算出 → 全ペア走査（REQ-39。`Vec` の
+/// 確保前に件数を検証する）。seed の重複・評価総数の不一致・評価データ
+/// sha256 の不一致は同じループの同じ添字で検証するため、入力によっては
+/// どれが先に成立するかは添字の並びに依存する（例:
+/// `[(0,_,5,10,H0), (1,_,6,20,H0), (1,_,7,10,H0)]` は index=1 で
 /// `MismatchedTotals` が先に返り、その後方にある seed 重複は検出されない）。
-/// どちらのエラーも fail-closed に判定を止める点は変わらない。
+/// どのエラーも fail-closed に判定を止める点は変わらない。
+///
+/// `total`・`correct` が全 run で一致しても `eval_data_hash` が異なる場合は
+/// [`ReproducibilityError::MismatchedEvalDataHash`] を返し、別の凍結評価
+/// データへ適用した run を「再現性あり」と誤判定しない（REQ-17。issue #104
+/// レビュー指摘・PR #243）。
 ///
 /// `total == 0` または `correct > total` の run があると Wilson 区間が
 /// 算出できない（`wilson::wilson_ci95` が `None`）。この場合「重なる」
@@ -379,8 +412,8 @@ fn judge_overlap(intervals: &[WilsonInterval]) -> Result<OverlapReport, Reproduc
 pub fn judge_reproducibility(runs: &[SeedRun]) -> Result<OverlapReport, ReproducibilityError> {
     validate_run_count(runs.len())?;
 
-    let first_total = match runs.first() {
-        Some(run) => run.total,
+    let (first_total, first_eval_data_hash) = match runs.first() {
+        Some(run) => (run.total, run.eval_data_hash),
         None => {
             return Err(ReproducibilityError::TooFewRuns {
                 got: 0,
@@ -398,6 +431,10 @@ pub fn judge_reproducibility(runs: &[SeedRun]) -> Result<OverlapReport, Reproduc
 
         if run.total != first_total {
             return Err(ReproducibilityError::MismatchedTotals { index });
+        }
+
+        if run.eval_data_hash != first_eval_data_hash {
+            return Err(ReproducibilityError::MismatchedEvalDataHash { index });
         }
     }
 
@@ -457,11 +494,19 @@ mod tests {
         assert_eq!(forward, backward);
     }
 
+    /// ユニットテスト共通の「同一凍結評価データ」を表す固定ハッシュ。
+    /// `run` ヘルパーの全呼び出しが同じ評価データへ適用した体で動作させる
+    /// （REQ-17。issue #104 レビュー指摘・PR #243）。
+    fn same_eval_data_hash() -> Sha256Digest {
+        Sha256Digest::of_bytes(b"reproducibility unit test fixture eval data")
+    }
+
     fn run(seed: u64, correct: u64, total: u64) -> SeedRun {
         SeedRun {
             seed,
             correct,
             total,
+            eval_data_hash: same_eval_data_hash(),
         }
     }
 
@@ -680,6 +725,29 @@ mod tests {
         assert_eq!(
             judge_reproducibility(&runs).unwrap_err(),
             ReproducibilityError::MismatchedTotals { index: 1 }
+        );
+    }
+
+    /// REQ-26・TASK-26.3-1・REQ-17: `total`・`correct` が一致していても、
+    /// `eval_data_hash` が異なれば `MismatchedEvalDataHash`（fail-closed）。
+    /// 別の凍結評価データへ適用した run を「再現性あり」と誤判定しない
+    /// ことを確認する（issue #104 レビュー指摘・PR #243）。
+    #[test]
+    fn judge_reproducibility_mismatched_eval_data_hash_is_error() {
+        let other_hash = Sha256Digest::of_bytes(b"a different frozen eval data snapshot");
+        let runs = [
+            run(0, 214, 650),
+            run(1, 214, 650),
+            SeedRun {
+                seed: 2,
+                correct: 214,
+                total: 650,
+                eval_data_hash: other_hash,
+            },
+        ];
+        assert_eq!(
+            judge_reproducibility(&runs).unwrap_err(),
+            ReproducibilityError::MismatchedEvalDataHash { index: 2 }
         );
     }
 }
