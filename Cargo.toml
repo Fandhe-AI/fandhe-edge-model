@@ -5,7 +5,7 @@
 # 深い階層（`crates/foo/bar`）には crate を置かない。
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/data", "crates/eval"]
+members = ["crates/core", "crates/cli", "crates/data", "crates/eval", "crates/train"]
 
 [workspace.package]
 edition = "2024"
@@ -23,12 +23,16 @@ publish = false
 fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
 fandhe-edge-eval = { path = "crates/eval" }
+fandhe-edge-train = { path = "crates/train" }
 # serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の
 # 「配置する層」は共通コア（TASK-15.3〜15.5）に加え、データ契約層（crates/data。
 # TASK-16.1-1・issue #38）にも 2026-09-27 オーナー承認済み（PR #191 のレビュー指摘への
 # 対応として PR #193 で承認記録を追記。バージョン・ライセンス（MIT OR Apache-2.0）・
 # 推移的依存（itoa・memchr・zmij）は変更なし）。
+# #177 で学習ワーカー層（crates/train）への配置も加わる。版・ライセンス・推移的依存は
+# 変更しないが、この配置層の追加自体はオーナーが PR レビューで確認する事項とする
+# （.claude/rules/dependency-policy.md の表を書き換えていない。承認の記録は PR 本文へ残す）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 # sha2 は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md

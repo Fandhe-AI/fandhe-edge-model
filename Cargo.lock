@@ -80,6 +80,15 @@ name = "fandhe-edge-eval"
 version = "0.1.0"
 
 [[package]]
+name = "fandhe-edge-train"
+version = "0.1.0"
+dependencies = [
+ "fandhe-edge-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

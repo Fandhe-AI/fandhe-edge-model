@@ -1,0 +1,5 @@
+{
+  "status": "error",
+  "code": "invalid_request",
+  "message": "file not readable: FileNotFoundError"
+}

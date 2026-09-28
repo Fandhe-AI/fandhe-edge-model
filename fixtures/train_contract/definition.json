@@ -1,0 +1,12 @@
+{
+  "schema": "fandhe-edge-model-definition/v1",
+  "name": "train_contract_fixture_sample",
+  "version": 1,
+  "judgment_type": "single_select",
+  "options": [
+    { "id": "positive", "display_name": "Positive", "description": "Positive sample label (dummy, ASCII only)." },
+    { "id": "negative", "display_name": "Negative", "description": "Negative sample label (dummy, ASCII only)." },
+    { "id": "neutral", "display_name": "Neutral", "description": "Neutral sample label (dummy, ASCII only)." }
+  ],
+  "io": { "input": "bytes" }
+}

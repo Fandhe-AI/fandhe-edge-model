@@ -1,0 +1,17 @@
+{
+  "status": "ok",
+  "artifact_dir": "out",
+  "artifact": {
+    "kind": "c3",
+    "kind_version": 1,
+    "selector_version": "0.1",
+    "config": { "epochs": 2 },
+    "label_order": ["positive", "negative", "neutral"],
+    "output_type": "choice",
+    "max_bytes": 512,
+    "onnx_file": "model.onnx",
+    "onnx_sha256": "ae2c3277fb02c187294c01f4e19e3eca57815d28e9ebc05f4d013a05a02ecfbe",
+    "created_utc": "2026-09-28T00:00:00Z",
+    "candidate_label": "c3"
+  }
+}
