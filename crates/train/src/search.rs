@@ -893,23 +893,26 @@ fn out_dirs_conflict<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// symlink）を見分けられない。本関数は結合後のパスのうち、存在する
 /// 最も深い祖先ディレクトリを [`std::fs::canonicalize`] で実体パスへ
 /// 解決し、まだ存在しない残りの構成要素をそのまま連結することで、
-/// symlink 越しの重複も検出できるようにする（`root` は絶対パスのため
-/// `/`（ファイルシステムのルート）は通常必ず存在し、祖先を遡る過程は
-/// 必ず終端する）。
+/// symlink 越しの重複も検出できるようにする。祖先を遡る過程は「存在しない」
+/// （`NotFound`）ことが確定している間だけ続け、`root` は絶対パスのため
+/// 最終的に必ず `/`（ファイルシステムのルート。通常必ず存在する）で終端
+/// する。`NotFound` 以外の理由（権限不足等）での失敗は、より浅い祖先へ
+/// 読み替えずに即座に拒否する（P1 指摘対応・issue #84 PR #238 レビュー。
+/// 関数 doc「# Errors」参照）。
 ///
 /// # Errors
 ///
-/// すべての祖先（`/` を含む）の `canonicalize` が失敗した場合、最後に
-/// 観測した `io::Error` を fail-closed でそのまま返す（コーディネーター
-/// 指摘どおり「canonicalize に失敗したら止める側へ倒す」）。`/` は通常の
-/// 環境では必ず存在し読み取り可能なため、実務上はこの経路に到達しない
-/// 想定（理論上到達しない防御的分岐）。存在しない・確認できない
-/// （権限不足で `PermissionDenied` になる場合を含む）祖先は、より浅い
-/// 祖先で再試行するためエラーにしない（PermissionDenied は「存在しない」
-/// と POSIX では確実には区別できないため。関数 doc 参照）。
+/// `canonicalize` が `NotFound`（対象が存在しないことが確定している）以外の
+/// 理由で失敗した場合、その `io::Error` を fail-closed でそのまま返す
+/// （P1 指摘対応・issue #84 PR #238 レビュー: 「存在しない」ことが確かな
+/// 場合だけより浅い祖先を試し、`PermissionDenied` 等それ以外のエラーは
+/// 権限不足で symlink かどうか判定できない可能性があるため、黙ってより
+/// 浅い祖先へ読み替えず拒否する）。`NotFound` が続いた場合、最終的に
+/// `/`（ファイルシステムのルート）を試す。`/` は通常の環境では必ず存在し
+/// 読み取り可能なため、`/` 自体の `canonicalize` が失敗する経路は理論上
+/// 到達しない防御的分岐とする。
 fn canonicalized_out_dir_key(root: &str, out_dir: &str) -> std::io::Result<Vec<String>> {
     let components = normalized_joined_components(root, out_dir);
-    let mut last_error: Option<std::io::Error> = None;
     for existing_len in (0..=components.len()).rev() {
         let mut candidate = PathBuf::from("/");
         for part in &components[..existing_len] {
@@ -923,28 +926,24 @@ fn canonicalized_out_dir_key(root: &str, out_dir: &str) -> std::io::Result<Vec<S
                 }
                 return Ok(path_components_to_strings(&resolved));
             }
-            // まだ存在しない祖先、または存在の確認自体ができない祖先
-            // （例: `/root` のように途中のディレクトリの検索〔execute〕
-            // 権限が無い場合、実際には存在しない配下パスでも OS は
-            // `NotFound` ではなく `PermissionDenied` を返すことがある。
-            // POSIX の性質上「存在しない」と「権限不足で確認できない」を
-            // 確実に区別する手段は無いため、いずれもより浅い祖先で
-            // 再試行する。最終的に必ず試す `/`（ファイルシステムの
-            // ルート）はどの OS でも通常読み取り可能なため、実務上この
-            // ループは必ずどこかで成功する）。
-            Err(e) => {
-                last_error = Some(e);
-                continue;
-            }
+            // 「存在しない」ことが確定している場合だけ、より浅い祖先で
+            // 再試行する（P1 指摘対応・issue #84 PR #238 レビュー）。
+            // `PermissionDenied` 等それ以外の理由による失敗は、対象が
+            // 実際には存在するのに中身を確認できない可能性がある
+            // （symlink かどうかも含めて判定できない）ため、より浅い祖先へ
+            // 黙って読み替えず fail-closed で拒否する（下の
+            // `Err(e) => return Err(e)`）。`existing_len == 0` は
+            // ファイルシステムのルート `/` で、通常はどの環境でも読み取り
+            // 可能なため、実務上この分岐（`NotFound` での再試行）は
+            // `existing_len > 0` の間だけで完結する想定。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && existing_len > 0 => continue,
+            Err(e) => return Err(e),
         }
     }
-    // 理論上到達しない防御的分岐: `/` の canonicalize にすら失敗した場合
-    // （極端に制限された実行環境等）は、直前に観測した失敗を
-    // fail-closed でそのまま返す（コーディネーター指摘どおり「canonicalize
-    // に失敗したら止める側へ倒す」）。
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::other("failed to canonicalize any ancestor of out_dir, including \"/\"")
-    }))
+    // 理論上到達しない防御的分岐: 上のループは `existing_len == 0`
+    // （`/`）まで必ず 1 度は試行し、その時点で `Ok` か `Err` のいずれかを
+    // 返すため、ループを抜けて本行へ到達することはない。
+    std::fs::canonicalize("/").map(|p| path_components_to_strings(&p))
 }
 
 /// [`Path`] の通常の構成要素（ルート・カレントディレクトリ・親ディレクトリ
@@ -2066,7 +2065,7 @@ mod tests {
         let gold: [&str; 0] = [];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
@@ -2081,7 +2080,7 @@ mod tests {
         let gold = ["positive", "unknown"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
@@ -2097,7 +2096,7 @@ mod tests {
         let gold = ["positive", "negative"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = SearchInput {
             label_order: &label_order,
@@ -2128,7 +2127,7 @@ mod tests {
         let gold = ["positive", "negative"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = SearchInput {
             label_order: &label_order,
@@ -2152,7 +2151,7 @@ mod tests {
         let gold = ["positive", "negative"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = SearchInput {
             label_order: &label_order,
@@ -2178,7 +2177,7 @@ mod tests {
         let gold = ["positive", "negative"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let over_limit_id = "a".repeat(fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES + 1);
         let record_ids = ["r0", over_limit_id.as_str()];
@@ -2224,7 +2223,7 @@ mod tests {
         let record_id_refs: Vec<&str> = record_ids.iter().map(String::as_str).collect();
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = SearchInput {
             label_order: &label_order,
@@ -2255,7 +2254,7 @@ mod tests {
         let gold = ["positive", "negative"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = SearchInput {
             label_order: &label_order,
@@ -2285,11 +2284,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/b"),
+                params: valid_params("/nonexistent-fandhe-root", "out/b"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2302,7 +2301,7 @@ mod tests {
     fn task18_1_2_validate_input_rejects_label_order_mismatch() {
         let label_order = ["positive", "negative"];
         let gold = ["positive"];
-        let mut params = valid_params("/root", "out/a");
+        let mut params = valid_params("/nonexistent-fandhe-root", "out/a");
         params.label_order = vec!["negative".to_string(), "positive".to_string()];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
@@ -2322,11 +2321,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2346,19 +2345,19 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root", "out/./a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/./a"),
             },
             SearchCandidate {
                 candidate_id: "c3-c".to_string(),
-                params: valid_params("/root", "out//a"),
+                params: valid_params("/nonexistent-fandhe-root", "out//a"),
             },
             SearchCandidate {
                 candidate_id: "c3-d".to_string(),
-                params: valid_params("/root", "out/a/"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a/"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2378,11 +2377,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root/out", "a"),
+                params: valid_params("/nonexistent-fandhe-root/out", "a"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2400,11 +2399,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out"),
+                params: valid_params("/nonexistent-fandhe-root", "out"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root", "out/sub"),
+                params: valid_params("/nonexistent-fandhe-root", "out/sub"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2424,11 +2423,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root/x/..", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root/x/..", "out/a"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2468,11 +2467,11 @@ mod tests {
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
-                params: valid_params("/root", "out/a"),
+                params: valid_params("/nonexistent-fandhe-root", "out/a"),
             },
             SearchCandidate {
                 candidate_id: "c3-b".to_string(),
-                params: valid_params("/root", "out/b"),
+                params: valid_params("/nonexistent-fandhe-root", "out/b"),
             },
         ];
         let input = base_input(&label_order, &gold, candidates);
@@ -2518,13 +2517,87 @@ mod tests {
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
     }
 
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238
+    /// レビュー）: `canonicalize` が権限不足（`PermissionDenied`）で失敗する
+    /// 祖先は、より浅い祖先へ黙って読み替えず `OutDirCanonicalizeFailed` で
+    /// 拒否する（`NotFound` だけを再試行対象にする）。
+    ///
+    /// root で実行された場合、DAC（パーミッションビット）が無視されるため
+    /// 本来期待する `PermissionDenied` が発生しない。その場合はテストを
+    /// skip せず、実測した挙動（`NotFound` として解決され検証を通過する）
+    /// に期待値を切り替える（コーディネーター指摘: 「root で実行された
+    /// 場合は skip ではなく、条件に合わせて期待値を変える」）。
+    #[cfg(unix)]
+    #[test]
+    fn task18_1_2_validate_input_rejects_out_dir_when_canonicalize_denies_permission() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-permission-{}-{}",
+            std::process::id(),
+            "task18_1_2_validate_input_rejects_out_dir_when_canonicalize_denies_permission"
+        ));
+        let restricted_dir = base.join("restricted");
+        std::fs::create_dir_all(&restricted_dir).expect("create restricted dir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&restricted_dir)
+                .expect("stat restricted dir")
+                .permissions();
+            perms.set_mode(0o000);
+            std::fs::set_permissions(&restricted_dir, perms).expect("chmod 000");
+        }
+
+        // 実際に権限チェックが効くかどうかを、同じ形の probe 操作で実測する
+        // （root 実行時は DAC を無視するため `PermissionDenied` にならない）。
+        let probe_path = restricted_dir.join("sub").join("a");
+        let permission_enforced = matches!(
+            std::fs::canonicalize(&probe_path),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
+
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: valid_params(restricted_dir.to_str().expect("utf-8 path"), "sub/a"),
+        }];
+        let input = base_input(&label_order, &gold, candidates);
+        let result = validate_input::<std::convert::Infallible>(&input);
+
+        // 後片付け: chmod を戻してから削除する（0o000 のままだと
+        // `remove_dir_all` 自体が失敗しうるため）。best-effort。
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&restricted_dir) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o700);
+                let _ = std::fs::set_permissions(&restricted_dir, perms);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        if permission_enforced {
+            assert_eq!(
+                result.unwrap_err(),
+                SearchError::OutDirCanonicalizeFailed { index: 0 }
+            );
+        } else {
+            // root 実行など、権限チェックが効かない環境では検証を通過する
+            // （`NotFound` としてより浅い祖先〔`restricted_dir` 自身〕へ
+            // 解決できるため）。
+            assert!(
+                result.is_ok(),
+                "expected validate_input to succeed when permission is not enforced (e.g. running as root), got {result:?}"
+            );
+        }
+    }
+
     /// REQ-18・TASK-18.1-2: リクエストとして不正な構成要素は
     /// `InvalidRequest`。
     #[test]
     fn task18_1_2_validate_input_rejects_invalid_request() {
         let label_order = ["positive", "negative"];
         let gold = ["positive"];
-        let mut params = valid_params("/root", "out/a");
+        let mut params = valid_params("/nonexistent-fandhe-root", "out/a");
         params.kind = String::new();
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
@@ -2550,7 +2623,7 @@ mod tests {
         let candidates: Vec<SearchCandidate> = (0..=MAX_SEARCH_CANDIDATES)
             .map(|i| SearchCandidate {
                 candidate_id: format!("c{i}"),
-                params: valid_params("/root", &format!("out/{i}")),
+                params: valid_params("/nonexistent-fandhe-root", &format!("out/{i}")),
             })
             .collect();
         let input = base_input(&label_order, &gold, candidates);
@@ -2571,7 +2644,7 @@ mod tests {
         let gold: Vec<&str> = vec!["positive"; MAX_EVAL_RECORDS + 1];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
@@ -2594,7 +2667,7 @@ mod tests {
         let candidates: Vec<SearchCandidate> = (0..MAX_SEARCH_CANDIDATES)
             .map(|i| SearchCandidate {
                 candidate_id: format!("c{i}"),
-                params: valid_params("/root", &format!("out/{i}")),
+                params: valid_params("/nonexistent-fandhe-root", &format!("out/{i}")),
             })
             .collect();
         assert!(candidates.len() <= MAX_SEARCH_CANDIDATES);
@@ -2611,7 +2684,7 @@ mod tests {
         let gold = ["positive"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         for label_order in [vec!["positive", ""], vec!["positive", "positive"]] {
             let input = base_input(&label_order, &gold, candidates.clone());
@@ -2630,7 +2703,7 @@ mod tests {
         let gold = ["positive"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let label_order: Vec<String> = (0..=MAX_LABELS).map(|i| format!("l{i}")).collect();
         let label_order_refs: Vec<&str> = label_order.iter().map(String::as_str).collect();
@@ -2647,7 +2720,7 @@ mod tests {
         let gold = ["positive"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let long_label = "a".repeat(MAX_LABEL_BYTES + 1);
         let label_order = vec![long_label.as_str(), "negative"];
@@ -2664,7 +2737,7 @@ mod tests {
         let gold = ["positive"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3\na".to_string(),
-            params: valid_params("/root", "out/a"),
+            params: valid_params("/nonexistent-fandhe-root", "out/a"),
         }];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
