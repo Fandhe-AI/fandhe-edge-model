@@ -19,22 +19,21 @@
 //! `fixtures/preprocess/byte_encoding_vectors.json`（共有ゴールデンベクタ・
 //! SSOT）の NFKC を伴うケース（`fullwidth_alnum_nfkc`・`ligature_fi` 等）を
 //! 含めて両実装の一致を機械照合する（`tests/nfkc_cross_check.rs`）。
-//! `unicode-normalization =0.1.25` は 2026-09-28 オーナー承認済み
-//! （`.claude/rules/dependency-policy.md`「承認済みの依存」表。承認記録は
-//! PR #224）。
+//! `unicode-normalization =0.1.22` は 2026-09-28 オーナー承認済み
+//! （`.claude/rules/dependency-policy.md`「承認済みの依存」表。初回導入の
+//! 承認記録は PR #224、0.1.22 への版変更の承認記録は PR #225）。
 //!
-//! # Unicode 版の違い
+//! # Unicode 版を学習ワーカーと揃える
 //!
-//! `unicode-normalization` 0.1.25 は Unicode 17.0.0 のデータテーブルを使う。
-//! 一方 Python 3.12 の `unicodedata` は UCD 15.0.0（`fixtures/preprocess/
-//! byte_encoding_vectors.json` の `_meta.unicode_version` が記録する値。
+//! `unicode-normalization` 0.1.22（`UNICODE_VERSION == (15, 0, 0)`）と
+//! Python 3.12 の `unicodedata`（UCD 15.0.0。`fixtures/preprocess/
+//! byte_encoding_vectors.json` の `_meta.unicode_version` が記録する値）は
+//! 同じ Unicode 版のデータテーブルを使う。当初導入した 0.1.25 は
+//! Unicode 17.0.0 準拠で版がずれていたため（PR #188 Codex レビュー P1
+//! 指摘）、0.1.22 へ固定し直した。版の一致は
+//! `tests/nfkc_cross_check.rs`（Rust 側。`UNICODE_VERSION` を assert）と
 //! `trainer/tests/test_encoding.py::test_fixture_unicode_version_matches_runtime`
-//! が実行環境の版と一致することを確認する）。NFKC の分解・合成規則は
-//! Unicode の安定性ポリシーにより既存の割り当て済み文字に対して変更されない
-//! ため、両実装は既存文字について一致する。Unicode 15.1〜17.0 で新規に
-//! 割り当てられた文字（フィクスチャ策定後に追加された文字）に対してのみ、
-//! 結果が異なりうる。この差は共有フィクスチャによる交差照合テストで監視する
-//! （新規割当文字を使うベクタが追加された場合はここで検出される）。
+//! （Python 側）で機械照合する。
 //!
 //! NFKC 以外の規則が必要な呼び出し側は、独自の [`InputNormalizer`] 実装を
 //! 渡せる。
