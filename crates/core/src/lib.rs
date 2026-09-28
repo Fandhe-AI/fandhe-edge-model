@@ -28,7 +28,11 @@
 //! 実装済み。
 //! `exitcode` モジュールは TASK-21.1-1 で 7 種の終了コード enum と
 //! 機械可読 JSON エラー型を実装済み。
+//! `hash` モジュールは生バイト列の sha256 ダイジェスト型 [`hash::Sha256Digest`]
+//! を実装済み（issue #69・TASK-27.1-1。評価データの凍結〔REQ-17・TASK-17.2〕
+//! 側の同種 issue の PR が先にマージされた場合はそちらを正とする）。
 
 pub mod canonical;
 pub mod definition;
 pub mod exitcode;
+pub mod hash;
