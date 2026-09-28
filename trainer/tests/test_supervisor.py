@@ -91,22 +91,38 @@ def test_monitor_child_returns_none_on_normal_completion() -> None:
     assert proc.wait(timeout=5) == 0
 
 
-def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
+def test_monitor_child_fails_closed_when_status_race_with_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`wait` のタイムアウト直後に子が正常終了し `ps` が PID を見つけられない
-    競合でも、監視失敗（monitor_failed）ではなく通常の終了として扱う。
+    """issue #178 PR #233 レビュー再々指摘 P0: `_current_child_status` が
+    `None` を返す場合（`wait` のタイムアウト直後に子が正常終了し `ps` が
+    PID を見つけられない競合を含む）は、正常終了かどうかを安全に区別する
+    手段が無いため、常に `monitor_failed` として fail-closed に扱う
+    （以前は `proc.poll()` で確認して通常終了として扱っていたが、これは
+    `killpg` を経由しない回収経路になっていたため廃止した）。
 
-    `_current_child_status` が「子の終了を待ってから None を返す」ように
-    差し替え、競合を決定的に再現する。
+    `_current_child_status` が「子がゾンビになるまで（＝回収せずに）待って
+    から None を返す」ように差し替え、競合を決定的に再現する。**回収
+    （`proc.wait()`）はしない**: `_terminate_and_reap` が呼ぶ `killpg` は
+    「対象がまだ回収されていない（実行中またはゾンビ）」ことを前提に
+    安全とされているため、このモック自身が先に回収してしまうと
+    `_terminate_and_reap` が既に無効な pid へ `killpg` する形になり、
+    検証したい不変条件と矛盾する（本物の `_current_child_status` を使って
+    ゾンビになるのを待つだけで、回収は一切行わない）。
     """
     proc = _spawn("import time; time.sleep(0.3)")
+    real_status = supervisor._current_child_status
 
-    def _ps_after_exit(pid: int) -> None:
-        proc.wait(timeout=5)
+    def _none_after_zombie(pid: int) -> tuple[int, bool] | None:
+        deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < deadline:
+            status = real_status(pid)
+            if status is not None and status[1]:  # is_zombie
+                break
+            time_mod.sleep(0.01)
         return None
 
-    monkeypatch.setattr(supervisor, "_current_child_status", _ps_after_exit)
+    monkeypatch.setattr(supervisor, "_current_child_status", _none_after_zombie)
     try:
         reason = supervisor.monitor_child(
             proc,
@@ -115,8 +131,7 @@ def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
             poll_interval=0.05,
             grace_seconds=0.0,
         )
-        assert reason is None
-        assert proc.returncode == 0
+        assert reason == "monitor_failed"
     finally:
         _reap(proc)
 
@@ -310,6 +325,66 @@ def test_monitor_child_kills_grandchild_after_worker_exits_normally(tmp_path: Pa
             time_mod.sleep(0.05)
             alive = _process_alive(grandchild_pid)
         assert not alive, "grandchild must be terminated after monitor_child returns"
+    finally:
+        _reap(proc)
+
+
+def test_monitor_child_kills_grandchild_when_status_always_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #178 PR #233 レビュー再々指摘 P0 への回帰テスト: `_current_child_status`
+    が常に `None`（`ps` の恒常的な失敗を模す）を返す場合でも、`monitor_child` は
+    `proc.poll()` で正常終了を装って回収するのではなく、必ず `killpg` してから
+    `monitor_failed` を返し、`_worker` 役が残した孫プロセスも終了させること。
+    """
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、孫プロセスを起動した直後に自分自身はすぐ
+    # 正常終了する（孫は同じプロセスグループに残ったままになる）。
+    code = (
+        "import subprocess, sys\n"
+        f"p = subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(p.pid))\n"
+    )
+    proc = _spawn(code)
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: None)
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            heartbeat.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started"
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        # `ps` が常に失敗する以上、正常終了として扱ってはならない
+        # （`proc.poll()` を代替の確認手段に使っていた旧実装は、これを
+        # 「正常終了」として誤って返していた）。
+        assert reason == "monitor_failed"
+
+        deadline = time_mod.monotonic() + 5.0
+        alive = _process_alive(grandchild_pid)
+        while alive and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+            alive = _process_alive(grandchild_pid)
+        assert not alive, "grandchild must be terminated even when status is unknown"
     finally:
         _reap(proc)
 

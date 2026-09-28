@@ -48,6 +48,7 @@ import stat
 import sys
 import threading
 from pathlib import Path
+from typing import BinaryIO
 
 from . import artifact as artifact_mod
 from . import budget as budget_mod
@@ -101,6 +102,38 @@ def _apply_rlimit_cpu_backstop(time_limit_seconds: int) -> None:
         pass
 
 
+def _lifeline_watch_loop(pipe: BinaryIO) -> None:
+    """lifeline 読み取りループの本体（`_start_lifeline_thread` から
+    テスト可能な形で切り出したもの。issue #178 PR #233 レビュー
+    再々指摘 P0）。
+
+    `pipe` を block read し続け、EOF（supervisor の終了。正常終了・
+    内部タイムアウトによる `killpg`・Rust 側からの `SIGKILL` を含め、
+    カーネルが書き込み端の最後の複製を自動的に閉じるため必ず EOF で返る）
+    を観測したら、本プロセス自身のプロセスグループ（`start_new_session=True`
+    で起動されているため pgid は本プロセス自身の pid）へ `SIGKILL` を送り、
+    自分自身とその孫プロセスをまとめて終了させる。
+
+    **`read` が例外を送出した場合も EOF と同じ扱いにする**（監視対象を
+    見失った以上、supervisor の生死を確認する手段が無く、安全側に倒して
+    自己終了する。黙って戻って監視を止めたままにしない）。`finally` で
+    `killpg` を行うことで、ループを抜ける経路（EOF・例外のどちらでも）
+    必ず自己終了させる。
+    """
+    try:
+        with pipe:
+            while True:
+                chunk = pipe.read(1)
+                if not chunk:
+                    break
+    except Exception:  # noqa: S110 - 例外の種別を問わず EOF 相当として扱う（fail-closed）。
+        # finally 節で必ず killpg するため、ここでは何もしない。
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
 def _start_lifeline_thread(lifeline_fd: int) -> None:
     """lifeline（supervisor の生死監視）の daemon スレッドを起動する
     （issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理から
@@ -108,34 +141,39 @@ def _start_lifeline_thread(lifeline_fd: int) -> None:
     `supervisor.py` モジュール docstring「lifeline」節参照）。
 
     起動直後に、supervisor が `pass_fds` で引き継いだ読み取り専用の pipe fd
-    （`lifeline_fd`）を別スレッドで block read する。supervisor（本プロセスの
-    親）がどのような形で終了しても（正常終了・内部タイムアウトによる
-    `killpg`・Rust 側からの `SIGKILL` を含む）、カーネルが書き込み端の最後の
-    複製を自動的に閉じるため、read は必ず EOF（0 バイト）で返る。EOF を
-    観測したら、本プロセス自身のプロセスグループ（`start_new_session=True`
-    で起動されているため pgid は本プロセス自身の pid）へ `SIGKILL` を送り、
-    自分自身とその孫プロセスをまとめて終了させる。
+    （`lifeline_fd`）を検証し、別スレッドで block read する
+    （`_lifeline_watch_loop` 参照）。
 
-    `lifeline_fd` が無効（fstat・read が失敗する）な場合は、監視対象が
-    存在しないものとして何もしない（本来の起動経路〔`supervisor.worker_argv`
-    経由〕では常に有効な fd が渡される契約だが、`_worker` を直接起動する
-    テスト等ではダミーの fd 番号が渡されうるため、そのような呼び出しを
-    クラッシュさせない）。
+    **`lifeline_fd` を学習開始前に検証する**（issue #178 PR #233 レビュー
+    再々指摘 P0「lifeline fd が無効な場合、`_worker` が監視なしで学習を
+    続けてしまう」）: `os.fstat` で取得できること・パイプ（`S_ISFIFO`）で
+    あることを確認し、`os.fdopen` で開けることも確認する。いずれかに
+    失敗した場合は `WorkerError`（`invalid_request`・exit 64。
+    `_read_request_from_stdin` の標準入力検証と同じ扱い）を送出し、
+    学習を一切開始させない（fail-closed。呼び出し元の `main()` が
+    `WorkerError` を捕捉して JSON エラーを出力し、非ゼロで終了する）。
     """
-
-    def _watch() -> None:
-        try:
-            with os.fdopen(lifeline_fd, "rb", buffering=0) as pipe:
-                while True:
-                    chunk = pipe.read(1)
-                    if not chunk:
-                        break
-        except OSError:
-            return
-        with contextlib.suppress(OSError):
-            os.killpg(os.getpgrp(), signal.SIGKILL)
-
-    threading.Thread(target=_watch, name="lifeline-watch", daemon=True).start()
+    try:
+        st = os.fstat(lifeline_fd)
+    except OSError as e:
+        raise WorkerError(
+            "invalid_request",
+            f"lifeline fd not stat-able: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if not stat.S_ISFIFO(st.st_mode):
+        raise WorkerError("invalid_request", "lifeline fd must be a pipe", ExitCode.INVALID_INPUT)
+    try:
+        pipe = os.fdopen(lifeline_fd, "rb", buffering=0)
+    except OSError as e:
+        raise WorkerError(
+            "invalid_request",
+            f"failed to open lifeline fd: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    threading.Thread(
+        target=_lifeline_watch_loop, args=(pipe,), name="lifeline-watch", daemon=True
+    ).start()
 
 
 def _read_request_from_stdin() -> bytes:

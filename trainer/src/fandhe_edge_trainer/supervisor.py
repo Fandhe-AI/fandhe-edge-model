@@ -63,11 +63,15 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    fd だけを使う。名前を再解決しない）。
 7. `_worker` が自分で終了した場合も、**回収（reap）より必ず先に**
    `_terminate_worker`（`killpg`）を呼ぶ（`_current_child_status`・
-   `_terminate_and_reap_after_self_exit` 参照。issue #178 PR #233 レビュー
+   `_terminate_and_reap` 参照。issue #178 PR #233 レビュー
    再指摘 P0「worker が先に終了すると子孫プロセスが残る」。`_worker` が
    何かの理由で孫プロセスを残したまま正常終了したケースを取りこぼさない
-   ため）。回収後、標準出力が「ちょうど 1 つの妥当な JSON オブジェクトで
-   ある」ことを確認し、終了コードが 7 種のいずれかであることも確認する。
+   ため）。**`_worker` の状態自体を確認できない場合（`ps` の失敗等）も
+   正常終了として扱わず、同じく `killpg` してから `monitor_failed` とする**
+   （issue #178 PR #233 レビュー再々指摘 P0。回収を伴う `poll()`／`wait()`
+   を代替の確認手段として使わない）。回収後、標準出力が「ちょうど 1 つの
+   妥当な JSON オブジェクトである」ことを確認し、終了コードが 7 種の
+   いずれかであることも確認する。
    いずれかを満たさない、またはシグナルによる終了なら `runtime_error`
    （exit 70）とし、予約を解放する。終了コードが 0 以外（7 種のいずれかの
    エラー）なら、そのコード・JSON をそのまま使い、予約は解放する（出力を
@@ -134,10 +138,14 @@ Rust 側 `run_train` が `_worker`（＝ Rust から見た孫プロセス）を�
 （ゾンビはプロセス表から消えないため `ps` に引き続き表示される。
 新しい依存・子プロセス起動は増やさない）。`_terminate_worker`
 （`killpg`）を呼んでから初めて `Popen.wait()` で回収する
-（`_terminate_and_reap_after_self_exit`）。この順序は、正常終了・
-`RLIMIT_CPU` 自己終了・タイムアウト・RSS 超過・監視失敗のいずれの経路でも
-例外なく守る。`ps` 自体が使えない・対象を見つけられない場合は、安全に
-検知する手段が無いため `monitor_failed` として fail-closed に扱う。
+（`_terminate_and_reap`。**`monitor_child` はこの関数だけを通じて `proc`
+を回収し、他の箇所で `poll()`／`wait()`／`communicate()` を直接呼ばない**。
+issue #178 PR #233 レビュー再々指摘 P0「`_current_child_status()` が
+`None` を返す場合に `proc.poll()` が worker を回収してしまい `killpg` を
+経由しない」への対応）。この順序は、正常終了・`RLIMIT_CPU` 自己終了・
+タイムアウト・RSS 超過・監視失敗のいずれの経路でも例外なく守る。`ps`
+自体が使えない・対象を見つけられない場合は、安全に検知する手段が無いため
+リトライせず 1 回の失敗で `monitor_failed` として fail-closed に扱う。
 """
 
 from __future__ import annotations
@@ -310,22 +318,24 @@ def _classify_self_exit(
     return None
 
 
-def _terminate_and_reap_after_self_exit(
-    proc: subprocess.Popen, cpu_baseline: resource.struct_rusage, soft_cpu_limit_seconds: float
-) -> str | None:
-    """`_worker` が自分で終了した（が、まだ回収されていない＝ゾンビとして
-    存在する）ことを `_current_child_status` の `is_zombie` で確認した
-    直後に呼ぶ。
+def _terminate_and_reap(proc: subprocess.Popen) -> None:
+    """`_terminate_worker`（`killpg`）を呼んでから `Popen.wait()` で回収
+    する、**`proc` を回収する唯一の経路**（issue #178 PR #233 レビュー
+    再々指摘 P0「`_current_child_status()` が `None` を返す場合に
+    `proc.poll()` が worker を回収してしまい、`killpg` を通らず子孫が
+    残る」）。
 
-    **回収（`Popen.wait()`）より必ず先に** `_terminate_worker`（`killpg`）
-    を呼ぶ（issue #178 PR #233 レビュー再指摘 P0「worker が先に終了すると、
-    子孫プロセスが残る」。`_terminate_worker` のドキュメント参照）。
-    `_worker` が孫プロセスを残さずに終了していた場合、`killpg` は
-    ESRCH 相当（`ProcessLookupError`）になるだけで無害である。
+    `monitor_child` は `proc` を `poll()`／`wait()`／`communicate()` 等で
+    直接回収してはならず、**すべての回収呼び出しを本関数に一元化する**。
+    本モジュールが `proc` の唯一の回収者であるため、本関数が呼ばれる
+    時点で `proc` はまだ回収されていない（実行中、またはゾンビとして
+    存在する）ことが保証されており、`killpg`（回収より必ず先に行う）は
+    常に安全である。`_worker` が孫プロセスを残さずに終了していた場合、
+    `killpg` は ESRCH 相当（`ProcessLookupError`）になるだけで無害である。
     """
     _terminate_worker(proc)
-    proc.wait()  # 既に終了を確認済みのため即座に返る（回収を完了させる）。
-    return _classify_self_exit(proc, cpu_baseline, soft_cpu_limit_seconds)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
 
 
 def monitor_child(
@@ -338,10 +348,11 @@ def monitor_child(
 ) -> str | None:
     """`proc` を監視する。正常終了したら `None` を返す。
 
-    壁時計・RSS のいずれかが上限を超えた場合、または RSS の監視自体が失敗した
-    場合（`ps` の失敗）はプロセスグループを強制終了し、理由
-    （`"time"`/`"rss"`/`"monitor_failed"`）を返す（呼び出し元が `proc.wait()`
-    済みであることを前提にせず、本関数が確実に終了させてから返る）。
+    壁時計・RSS のいずれかが上限を超えた場合、または `_worker` の状態
+    自体を確認できない場合（`ps` の失敗・タイムアウト・出力を解釈できない）
+    はプロセスグループを強制終了し、理由（`"time"`/`"rss"`/
+    `"monitor_failed"`）を返す（呼び出し元が `proc.wait()` 済みであることを
+    前提にせず、本関数が確実に終了させてから返る）。
 
     **`RLIMIT_CPU`（`cli.py::_apply_rlimit_cpu_backstop`）による自己終了は
     `"cpu"` として返す**（P1）: ワーカー内の kernel レベルの CPU 時間上限は
@@ -360,42 +371,30 @@ def monitor_child(
     起動せずに監視ロジックを検証する。
 
     **`_worker` の終了検知は回収せずに行う**（`_current_child_status` の
-    `is_zombie`。`ps` が使えない場合と、対象が既に回収済み・存在しない
-    場合は `monitor_failed` として fail-closed に扱う。モジュール
-    docstring「不変条件」節参照。issue #178 PR #233 レビュー再指摘 P0）。
+    `is_zombie`。モジュール docstring「不変条件」節参照。issue #178
+    PR #233 レビュー再指摘 P0）。**状態を確認できない（`None`）場合は
+    正常終了として扱わず、`_terminate_and_reap` → `monitor_failed` に
+    fail-closed する**（issue #178 PR #233 レビュー再々指摘 P0。`ps` の
+    一時的な失敗であっても、区別する安全な手段が無いため 1 回の失敗で
+    打ち切る〔既存の「監視できないこと自体を fail-closed に扱う」方針を
+    踏襲し、リトライで猶予を与えない〕）。
     """
     cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
     while True:
         status = _current_child_status(proc.pid)
         if status is None:
-            # `ps` がこの pid を見つけられなかった。本モジュールが `proc`
-            # を唯一の回収者であり続ける限り、通常は `ps` 自体の失敗を
-            # 意味する（`_worker` が既に回収済みなら、それは本関数か
-            # テストのモックが直接 `wait()` した場合に限られる）。
-            # `proc.poll()` で確認する: 既に終了していれば（`poll()` 自体が
-            # 回収を伴うが、この時点で pid は既に本関数の管理下から外れて
-            # いる可能性が高く、これ以上安全に `killpg` する手段が無いため）
-            # 通常の終了として分類する。そうでなければ監視できないことを
-            # fail-closed に扱う。
-            if proc.poll() is not None:
-                return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
-            _terminate_worker(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
+            _terminate_and_reap(proc)
             return "monitor_failed"
         rss, is_zombie = status
         if is_zombie:
-            return _terminate_and_reap_after_self_exit(proc, cpu_baseline, time_limit_seconds)
+            _terminate_and_reap(proc)
+            return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         if time.monotonic() > deadline:
-            _terminate_worker(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
+            _terminate_and_reap(proc)
             return "time"
         if rss > rss_limit_bytes:
-            _terminate_worker(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
+            _terminate_and_reap(proc)
             return "rss"
         time.sleep(poll_interval)
 
