@@ -260,6 +260,31 @@ impl std::fmt::Display for TrainResultError {
 
 impl std::error::Error for TrainResultError {}
 
+/// `serde_json` のエラーメッセージをそのまま埋め込むと、失敗した値の一部が
+/// 引用符付きで含まれることがある（例: 型不一致の実測値）。データ本文では
+/// ないが念のため長さを上限で切り詰める（`errors.py::truncate_for_message`
+/// と同じ考え方。`.claude/rules/security.md`）。学習リクエスト
+/// （[`crate::request::TrainRequest::from_json_slice`]）・学習ワーカー標準
+/// 出力（[`crate::result::TrainOutcome::from_worker_stdout`]）の両方が同じ
+/// リスク（信頼しない外部入力を解析する serde_json のエラー）を持つため、
+/// ここに集約して両者から呼ぶ。
+const MAX_EMBEDDED_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// [`MAX_EMBEDDED_ERROR_MESSAGE_CHARS`] を超える分を切り詰めた
+/// `serde_json::Error` の表示用メッセージを返す。
+pub(crate) fn sanitize_serde_error(err: &serde_json::Error) -> String {
+    let message = err.to_string();
+    if message.chars().count() <= MAX_EMBEDDED_ERROR_MESSAGE_CHARS {
+        message
+    } else {
+        let truncated: String = message
+            .chars()
+            .take(MAX_EMBEDDED_ERROR_MESSAGE_CHARS)
+            .collect();
+        format!("{truncated}...(truncated)")
+    }
+}
+
 impl TrainResultError {
     /// 壊れたワーカー出力はすべて `runtime_error`（supervisor.py が
     /// 妥当な JSON 1 個・既知の終了コードでない出力を扱う場合と同じ扱い）。

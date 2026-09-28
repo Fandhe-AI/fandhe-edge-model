@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use fandhe_edge_core::definition::{Definition, JudgmentType};
 use serde::{Deserialize, Serialize};
 
-use crate::error::TrainRequestError;
+use crate::error::{TrainRequestError, sanitize_serde_error};
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_LABELS, MAX_MAX_BYTES, MAX_REQUEST_BYTES, MAX_SEED, MAX_TRAIN_RSS_BYTES,
     MAX_TRAIN_WALL_SECONDS, MIN_LABELS, MIN_MAX_BYTES, MIN_SEED, REQUEST_SCHEMA_VERSION,
@@ -183,25 +183,6 @@ fn is_default_wall_seconds(value: &u32) -> bool {
 
 fn is_default_rss_bytes(value: &u64) -> bool {
     *value == MAX_TRAIN_RSS_BYTES
-}
-
-/// `serde_json` のエラーメッセージをそのまま埋め込むと、失敗した値の一部が
-/// 引用符付きで含まれることがある（例: 型不一致の実測値）。データ本文では
-/// ないが念のため長さを上限で切り詰める（`errors.py::truncate_for_message`
-/// と同じ考え方。`.claude/rules/security.md`）。
-const MAX_EMBEDDED_ERROR_MESSAGE_CHARS: usize = 200;
-
-fn sanitize_serde_error(err: &serde_json::Error) -> String {
-    let message = err.to_string();
-    if message.chars().count() <= MAX_EMBEDDED_ERROR_MESSAGE_CHARS {
-        message
-    } else {
-        let truncated: String = message
-            .chars()
-            .take(MAX_EMBEDDED_ERROR_MESSAGE_CHARS)
-            .collect();
-        format!("{truncated}...(truncated)")
-    }
 }
 
 /// `root`（絶対パス）の構文検査。`guard.py::resolve_root` の文字列レベルの

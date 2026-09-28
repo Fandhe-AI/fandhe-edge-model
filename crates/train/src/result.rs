@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::TrainResultError;
+use crate::error::{TrainResultError, sanitize_serde_error};
 use crate::limits::MAX_RESULT_BYTES;
 use crate::request::LabelOrder;
 
@@ -197,18 +197,19 @@ fn is_syntactically_valid_created_utc(value: &str) -> bool {
         return false;
     }
     let is_digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    let is_byte = |i: usize, expected: u8| bytes.get(i) == Some(&expected);
     (0..4).all(is_digit)
-        && bytes[4] == b'-'
+        && is_byte(4, b'-')
         && (5..7).all(is_digit)
-        && bytes[7] == b'-'
+        && is_byte(7, b'-')
         && (8..10).all(is_digit)
-        && bytes[10] == b'T'
+        && is_byte(10, b'T')
         && (11..13).all(is_digit)
-        && bytes[13] == b':'
+        && is_byte(13, b':')
         && (14..16).all(is_digit)
-        && bytes[16] == b':'
+        && is_byte(16, b':')
         && (17..19).all(is_digit)
-        && bytes[19] == b'Z'
+        && is_byte(19, b'Z')
 }
 
 impl TrainOutcome {
@@ -237,9 +238,16 @@ impl TrainOutcome {
                 lines: non_empty_lines.len(),
             });
         }
+        let Some(only_line) = non_empty_lines.first() else {
+            // 直前の長さ検査（`non_empty_lines.len() != 1`）により到達しない
+            // 防御的な分岐。添字アクセス `[0]` を避け、外部入力の経路で
+            // `unwrap`／`expect`／添字アクセスを使わない方針を保つ
+            // （`.claude/rules/coding-rust.md`）。
+            return Err(TrainResultError::NotExactlyOneLine { lines: 0 });
+        };
         let raw: RawOutcome =
-            serde_json::from_str(non_empty_lines[0]).map_err(|e| TrainResultError::NotJson {
-                message: e.to_string(),
+            serde_json::from_str(only_line).map_err(|e| TrainResultError::NotJson {
+                message: sanitize_serde_error(&e),
             })?;
 
         match raw.status.as_str() {
