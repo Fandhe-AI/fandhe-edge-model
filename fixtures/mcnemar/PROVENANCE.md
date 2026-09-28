@@ -14,12 +14,18 @@
 
 合成された（手計算・厳密計算で導出した）数値ケースであり、実データではない
 （個人情報・機密情報を含まない）。`(130, 29)`・`(123, 26)`・`(161, 52)`・
-`(108, 36)` の 4 件のみ PoC-10 の実行結果（`logs/eval/summary.json`
+`(108, 36)` の 4 件は PoC-10 の実行結果（`logs/eval/summary.json`
 seed0・n=650）に由来する `b`・`c`（不一致ペア数）を使うが、`p` 値自体は
 本スクリプトの厳密計算で独立に求め直した値であり、`summary.json` の
 `lgamma` 由来の値をそのまま転記したものではない（
 `crates/eval/tests/mcnemar_known_answer.rs` の
 `poc10_seed0_majority_comparisons` のコメント参照）。
+
+同様に `(143, 43)`・`(125, 58)`・`(144, 40)`・`(134, 58)` の 4 件
+（issue #65・TASK-25.1-2 で追加）は PoC-10 `eval_incat` の seed1・seed2
+実行結果（`summary.json` の C3・C4 vs majority、n=650）に由来する `b`・`c`
+で、`p` 値は同じく本スクリプトの厳密計算で独立に求め直した値である
+（`crates/eval/tests/baseline_significance.rs` 参照）。
 
 ## 生成方法
 

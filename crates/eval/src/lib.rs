@@ -13,6 +13,10 @@
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）
 //! - [`mcnemar`][]: McNemar の正確検定（両側）の統計計算コア
 //!   （REQ-25 正常系・TASK-25.1-1・issue #64）
+//! - [`baseline`][]: 下限基準（majority）の予測生成（REQ-25・TASK-25.1-2・
+//!   issue #65）
+//! - [`significance`][]: 行ごとの正誤 → McNemar 検定 → α=0.05 での有意性
+//!   判定への接続（REQ-25・TASK-25.1-2・issue #65）
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
@@ -28,7 +32,9 @@
 //!   （TASK-24.3・issue #62）。[`metrics::Outcome`] を enum にしてあるのは
 //!   この後続実装が予測の種類を判定しやすくするため
 //! - McNemar 検定（REQ-25）: 統計計算コアは実装済み（TASK-25.1-1・issue #64）。
-//!   下限基準比較への接続・p<0.05 の判定は未実装（TASK-25.1-2・issue #65）。
+//!   下限基準（majority）比較への接続・p<0.05 の判定は実装済み
+//!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
+//!   未実装。依存 `unicode-normalization` の承認と入力表現の整合の判断が要る）。
 //!   件数不足による「判定不能」の判定は未実装（TASK-25.2）。
 //!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
@@ -50,6 +56,8 @@
 //!   [`metrics::MAX_LABELS`] を検証し、超過時は確保せず
 //!   [`metrics::EvalError::TooManyLabels`] を返す。詳細は [`metrics`]
 //!   モジュールの「資源上限」節を参照）
+pub mod baseline;
 pub mod mcnemar;
 pub mod metrics;
+pub mod significance;
 pub mod wilson;
