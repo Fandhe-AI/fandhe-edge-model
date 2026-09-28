@@ -16,6 +16,12 @@
 //!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
 //! - [`preprocess_boundary`][]: 空入力の前処理食い違いの検知・報告
 //!   （REQ-23 境界値・TASK-23.2・issue #57）
+//! - [`provenance`]: 来歴レコード型（REQ-40・TASK-40.1-1・issue #74）。
+//!   [`provenance::ingest`] で取り込み時の JSON 検証・記録 JSON 生成を実装
+//!   （TASK-40.1-2・issue #75）
+//! - [`ingest`][]: データ検査（[`inspect::inspect_records`]）と来歴の取り込み
+//!   （[`provenance::ingest::parse_provenance_json`]）の接続点
+//!   （REQ-40・TASK-40.1-2・issue #75）
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -28,7 +34,13 @@
 //!   [`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
 //!   [`split::Groupable`] を実装しないため、[`split::split_by_group`] へ渡す際は
 //!   呼び出し側（CLI 等）が変換する）
-//! - 来歴（REQ-40）: 未実装
+//! - 来歴（REQ-40）: レコード型・各項目の検証（[`provenance`]・
+//!   TASK-40.1-1）に加え、取り込み時の JSON 検証・記録 JSON 生成・
+//!   データ検査との接続（[`provenance::ingest`]・[`ingest`]・
+//!   TASK-40.1-2・issue #75）を実装済み。指示文本文からの sha256 計算
+//!   （`sha2` の data 層配置はユーザー承認待ち。計算済みハッシュの取り込みの
+//!   みサポート）・`source`（生成元）フィールド・外部 LLM 出力の既定拒否
+//!   （TASK-40.2）・CLI `inspect` 工程への配線（TASK-33.x）は未実装
 //!
 //! # 層の境界
 //!
@@ -68,9 +80,11 @@
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
 
 pub mod eval_input;
+pub mod ingest;
 pub mod inspect;
 mod json_keys;
 pub mod leak;
 pub mod preprocess_boundary;
+pub mod provenance;
 pub mod report;
 pub mod split;
