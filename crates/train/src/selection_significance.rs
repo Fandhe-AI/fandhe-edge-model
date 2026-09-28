@@ -79,6 +79,18 @@ pub const MAX_CANDIDATE_ID_BYTES: usize = 128;
 /// オーダーの暫定値とし、実測に基づく調整は後続 TASK で行う。
 pub const MAX_CANDIDATE_RECORD_PRODUCT: u64 = 10_000_000;
 
+/// `train_labels`（学習データの正解ラベル列）の件数上限
+/// （REQ-39 資源の上限。Codex 指摘 PR #236・thread PRRT_kwDOUq-SxM6mrgbM）。
+///
+/// [`assess_selection_significance`] の `validation_gold`（評価データ）は
+/// [`significance::MAX_EVAL_RECORDS`] で確保前に上限検証しているが、
+/// `train_labels` は検証なしで [`baseline::fit_majority`] へ渡され全件走査
+/// されていた。`train_labels` に比例したアロケーションは発生しないものの、
+/// 走査自体の処理時間に上限が無いままだったため、[`significance::MAX_EVAL_RECORDS`]
+/// と同じ数量オーダーの暫定値を計算開始前の上限として設ける。実測に基づく
+/// 調整は後続 TASK で行う。
+pub const MAX_TRAIN_LABELS: usize = significance::MAX_EVAL_RECORDS;
+
 /// 1 候補分の validation 予測。
 ///
 /// `outcomes` は [`SelectionSignificanceInput::validation_gold`] と
@@ -158,6 +170,14 @@ pub enum SelectionSignificanceError {
         /// 上限（[`MAX_CANDIDATE_RECORD_PRODUCT`]）。
         limit: u64,
     },
+    /// `train_labels` の件数が上限（[`MAX_TRAIN_LABELS`]）を超える
+    /// （REQ-39。[`baseline::fit_majority`] の全件走査より前に拒否する）。
+    TooManyTrainLabels {
+        /// 渡された件数。
+        n_labels: usize,
+        /// 上限（[`MAX_TRAIN_LABELS`]）。
+        limit: usize,
+    },
     /// 下限基準（多数決）の導出に失敗した。
     Baseline(BaselineError),
     /// Holm 補正に失敗した。
@@ -210,6 +230,9 @@ impl fmt::Display for SelectionSignificanceError {
                 f,
                 "too many comparisons: {n_candidates} candidates x {n_records} records (limit: {limit})"
             ),
+            SelectionSignificanceError::TooManyTrainLabels { n_labels, limit } => {
+                write!(f, "too many train labels: {n_labels} (limit: {limit})")
+            }
             SelectionSignificanceError::Baseline(err) => write!(f, "{err}"),
             SelectionSignificanceError::Holm(err) => write!(f, "{err}"),
         }
@@ -321,10 +344,13 @@ fn validate_candidate_id(id: &str) -> bool {
 ///    前。REQ-39）→ [`SelectionSignificanceError::TooManyComparisons`]。
 ///    各候補の `outcomes.len() == validation_gold.len()` を確認 →
 ///    [`SelectionSignificanceError::OutcomeCountMismatch`]
-/// 6. [`baseline::fit_majority`] で `train_labels` から多数決の下限基準を求める
-/// 7. 候補ごとに [`significance::compare_with_baseline`] を呼び、
+/// 6. `train_labels.len()` が上限（[`MAX_TRAIN_LABELS`]）以下か確認
+///    （[`baseline::fit_majority`] の全件走査より前。REQ-39）→
+///    [`SelectionSignificanceError::TooManyTrainLabels`]
+/// 7. [`baseline::fit_majority`] で `train_labels` から多数決の下限基準を求める
+/// 8. 候補ごとに [`significance::compare_with_baseline`] を呼び、
 ///    [`BaselineComparison`] を候補順に集める
-/// 8. [`holm::compare_candidates_with_holm`] で全候補を 1 つの族として
+/// 9. [`holm::compare_candidates_with_holm`] で全候補を 1 つの族として
 ///    Holm 補正し、選定候補の [`HolmComparison`] を取り出す
 ///
 /// # 資源上限（REQ-39）
@@ -337,7 +363,9 @@ fn validate_candidate_id(id: &str) -> bool {
 /// [`significance::MAX_EVAL_RECORDS`] に委ねるが、両方が上限内でも積が
 /// 候補数×件数に比例するメインループの処理時間を膨大にしうるため、
 /// 本関数が [`MAX_CANDIDATE_RECORD_PRODUCT`] で積を計算開始前に検証する
-/// （reviewer 指摘 PR #236）。
+/// （reviewer 指摘 PR #236）。`train_labels`（[`baseline::fit_majority`] が
+/// 全件走査する）も同様に [`MAX_TRAIN_LABELS`] で計算開始前に件数上限を
+/// 検証する（Codex 指摘 PR #236）。
 ///
 /// # 評価契約（REQ-27）
 ///
@@ -429,6 +457,16 @@ pub fn assess_selection_significance(
                 actual: candidate.outcomes.len(),
             });
         }
+    }
+
+    // `train_labels` の件数上限を [`baseline::fit_majority`] の全件走査より
+    // 前に検証する（REQ-39。Codex 指摘 PR #236・thread PRRT_kwDOUq-SxM6mrgbM）。
+    let n_train_labels = input.train_labels.len();
+    if n_train_labels > MAX_TRAIN_LABELS {
+        return Err(SelectionSignificanceError::TooManyTrainLabels {
+            n_labels: n_train_labels,
+            limit: MAX_TRAIN_LABELS,
+        });
     }
 
     // 下限基準（多数決）は学習ラベルからのみ導出する（評価の独立性）。
@@ -945,6 +983,39 @@ mod tests {
                 n_candidates,
                 n_records,
                 limit: MAX_CANDIDATE_RECORD_PRODUCT,
+            }
+        );
+    }
+
+    /// `train_labels` の件数が上限（[`MAX_TRAIN_LABELS`]）を超えると、
+    /// [`baseline::fit_majority`] の全件走査より前に `TooManyTrainLabels`
+    /// で拒否する（REQ-39 資源の上限。Codex 指摘 PR #236・
+    /// thread PRRT_kwDOUq-SxM6mrgbM。`too_many_records_is_error` と対にする）。
+    #[test]
+    fn too_many_train_labels_is_error() {
+        let labels = ["A"];
+        let train_labels: Vec<&str> = vec!["A"; MAX_TRAIN_LABELS + 1];
+        let outcomes = [Outcome::Label("A".to_string())];
+        let gold = ["A"];
+        let candidates = [CandidateValidation {
+            candidate_id: "c1",
+            outcomes: &outcomes,
+        }];
+        let input = SelectionSignificanceInput {
+            label_order: &labels,
+            train_labels: &train_labels,
+            validation_gold: &gold,
+            candidates: &candidates,
+            selected_candidate_id: "c1",
+            required: req(1),
+            family_size: family(1),
+        };
+        let err = assess_selection_significance(&input).unwrap_err();
+        assert_eq!(
+            err,
+            SelectionSignificanceError::TooManyTrainLabels {
+                n_labels: MAX_TRAIN_LABELS + 1,
+                limit: MAX_TRAIN_LABELS,
             }
         );
     }
