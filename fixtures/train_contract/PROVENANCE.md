@@ -97,16 +97,14 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
 - `result_error.json`: `cli.main(["train", "--request",
   "/tmp/does-not-exist-train-request.json"])` を実行して得た標準出力
   （終了コード 64）をそのまま採用した（生成コマンドは下記）。
-- `supervisor_group_managed_env.json`: Rust 側 `run_train` がプロセス
-  グループを管理していることを Python 側 `supervisor.py` へ伝える環境変数名
-  （`env_var`）と、その「管理モード」を示す値（`managed_value`）の手作成
-  fixture（issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を
-  弱めている」）。生成コマンドは無く、`crates/train/src/process.rs::
-  SUPERVISOR_GROUP_MANAGED_ENV`／`SUPERVISOR_GROUP_MANAGED_VALUE` と
-  `supervisor.py::SUPERVISOR_GROUP_MANAGED_ENV` の値をそのまま書き起こした
-  定数値。`crates/train/tests/train_contract_fixture.rs`・
-  `trainer/tests/test_train_contract_fixture.py` の双方が本 fixture を
-  介して両定数の一致を機械照合する。
+
+（`supervisor_group_managed_env.json` は issue #178 PR #233 レビューの
+過程で導入したが、Rust 側でのプロセスグループ管理〔`process_group(0)`・
+`/bin/kill` 呼び出し〕自体を全面撤去し、worker 自身が親の死を検知して
+自己終了する lifeline 方式へ移行したことに伴い、対応する環境変数
+（`FANDHE_EDGE_SUPERVISOR_GROUP_MANAGED`）ごと削除した。
+`supervisor.py`・`crates/train/src/process.rs` のモジュール doc「lifeline」
+節参照。）
 
 ## 生成コマンド（証拠種別: テストハーネス。本開発機で実行・確認済み）
 

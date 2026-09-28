@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
-use fandhe_edge_train::process::{ENV_ALLOWLIST, SUPERVISOR_GROUP_MANAGED_ENV};
+use fandhe_edge_train::process::ENV_ALLOWLIST;
 use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 
@@ -78,22 +78,20 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             std::process::exit(0);
         }
         "ok_slow_exit" => {
-            // issue #178 PR #233 レビュー再々々指摘 P1「stdout の EOF は
-            // supervisor の終了を保証しない」の再現・検証用モード。結果
-            // JSON を出力（フラッシュ）した後、実際にプロセスが終了する
-            // までの間に短い遅延（インタプリタのシャットダウン処理を
-            // 模す）を挟む。`EOF_EXIT_GRACE`（2 秒）より十分短くすることで、
-            // `run_train` が猶予内に自発的な終了を確認し、成功として
-            // 扱うことを検証する。
+            // issue #178 PR #233 レビュー: 結果 JSON を出力（フラッシュ）
+            // した後、実際にプロセスが終了するまでの間に短い遅延
+            // （インタプリタのシャットダウン処理を模す）を挟んでも、
+            // `run_train` が正しく成功として扱うことを検証する。
             //
-            // 標準ライブラリだけでは自プロセスの stdout（fd 1）を
-            // `exit()` に先立って明示的に閉じる安全な手段が無い
-            // （`unsafe` な生 fd 操作が要る。依存・`unsafe` の追加は
-            // 禁止）ため、本モードは「EOF の観測が実際のプロセス終了より
-            // 先行する」という codex 指摘の競合そのものではなく、
-            // `run_train` 側の猶予ポーリング（`poll_wait_bounded` が複数
-            // 回ポーリングしてから終了を確認する経路）を確実に運動させる
-            // ことで、猶予の導入が正常系を壊していないことを検証する。
+            // `run_train` は標準出力の EOF を待った後、残りの壁時計予算の
+            // 範囲で `try_wait()` をポーリングして実際の終了を待つ
+            // （モジュール doc「完了検知・タイムアウト時の回収順序」
+            // 参照）。標準ライブラリだけでは自プロセスの stdout（fd 1）を
+            // `exit()` に先立って明示的に閉じる安全な手段が無い（`unsafe`
+            // な生 fd 操作が要る。依存・`unsafe` の追加は禁止）ため、本
+            // モードでは EOF の観測とプロセスの実終了がほぼ同時になるが、
+            // 「出力後すぐには終了しない供給元」が誤ってタイムアウト扱いに
+            // ならないことを確認する回帰テストとして意味を持つ。
             print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
@@ -152,72 +150,32 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        "hang_with_orphan" => {
-            // issue #178 PR #233 レビュー再々指摘の再現・検証用モード。
-            // 新しいアーキテクチャでは `_worker`（ここでは「孫プロセス」）を
-            // 別セッションへ切り離さない（`trainer/src/fandhe_edge_trainer/
-            // supervisor.py` が `start_new_session` を使わない設計に変えた
-            // ことのハーネス側の対応。`.process_group(0)` を**呼ばない**ことで、
-            // `run_train` が確立したプロセスグループへそのまま留まる）。
-            // 自分自身（このテストバイナリ）を「孫プロセス」として起動し、
-            // 孫の pid を `orphan.pid`（cwd = job_dir）へ書いてから、自分
-            // （「supervisor 役」）は標準出力を閉じずに応答不能なまま待ち
-            // 続ける（外側の壁時計タイムアウトで、プロセスグループごと
-            // `SIGKILL` されるまで自発的に終了しない）。
+        "hang_with_lifeline_orphan" => {
+            // issue #178 PR #233 レビュー: Rust 側は直接の子（supervisor 役
+            // ＝このプロセス）だけを把握・終了させればよく、孫プロセス
+            // （`_worker` 役）の掃除は学習ワーカー側の lifeline に委ねる、
+            // という新しい設計の核心を、実プロセスを使って end-to-end で
+            // 検証する（`case_timeout_hang_kills_orphan` 参照）。
+            //
+            // 実際の `_worker`（`cli.py::_start_lifeline_thread`）は、
+            // supervisor が `pass_fds` で渡した pipe の読み取り端を
+            // block read し、supervisor の死（＝書き込み端の自動クローズ）
+            // を EOF として検知して自己終了する。本モードはこれを Rust の
+            // `Child::stdin`（`Stdio::piped()`）で模す: 孫の標準入力
+            // （読み取り端）だけを孫へ渡し、書き込み端（`ChildStdin`）は
+            // このプロセス（supervisor 役）が握り続ける。このプロセスが
+            // 外側の壁時計タイムアウトで `Child::kill()`（`SIGKILL`）
+            // されると、カーネルが書き込み端を含む全 fd を自動的に閉じる
+            // ため、孫は何もしなくても EOF を観測できる。
             #[cfg(unix)]
-            {
+            let _lifeline_write_end_keepalive = {
+                use std::os::unix::process::CommandExt;
                 let exe = std::env::current_exe().expect("resolve current_exe for orphan");
                 let launch_script = std::env::current_dir()
                     .expect("cwd")
                     .join("orphan-launch.py");
-                std::fs::write(&launch_script, "orphan_hang").expect("write orphan launch.py");
-                let mut command = std::process::Command::new(&exe);
-                command
-                    .arg("-I")
-                    .arg(&launch_script)
-                    .arg("train")
-                    .arg("--request")
-                    .arg(request_path);
-                let grandchild = command.spawn().expect("spawn orphan grandchild");
-                std::fs::write("orphan.pid", grandchild.id().to_string())
-                    .expect("write orphan.pid");
-                // 生成した `Child` を `wait()` せずに drop すると
-                // `clippy::zombie_processes` に抵触する。本テストの主眼は
-                // 「supervisor 役から見て孫プロセスが生きたまま応答不能に
-                // なる」状況の再現であり、`wait()` 自体は本題ではないため、
-                // 別スレッドへ切り出して回収する（孫プロセスは外側の
-                // タイムアウトで `SIGKILL` されるまで終了しないため、この
-                // `wait()` は `run_train` 側の強制終了後に完了する）。
-                std::thread::spawn(move || {
-                    let mut grandchild = grandchild;
-                    let _ = grandchild.wait();
-                });
-            }
-            loop {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-        "exit_with_orphan" => {
-            // issue #178 PR #233 レビュー再々指摘の再現・検証用モード。
-            // `hang_with_orphan` と同様に孫プロセス（`_worker` 役）を
-            // **同じプロセスグループに留めたまま**起動し（`.process_group(0)`
-            // を呼ばない）、孫の標準出力を自分（supervisor 役）の標準出力
-            // （`run_train` が読み取るパイプ）へ継承させたまま、supervisor
-            // 役自身は正常終了する。孫が標準出力の書き手を握り続けるため、
-            // `run_train` の標準出力読み取りは EOF に達せず、壁時計予算を
-            // 使い切って `WallTimeout` になる。旧実装（`ps` によるプロセス
-            // ツリー走査）で必要だった「孫プロセスの起動後に猶予を置いて
-            // からでないと supervisor が終了してはならない」という制約
-            // （スナップショットのタイミング依存）は、プロセスグループへの
-            // 一括 `SIGKILL` 方式では不要になったため削除した
-            // （`case_exit_with_orphan_kills_orphan` 参照）。
-            #[cfg(unix)]
-            {
-                let exe = std::env::current_exe().expect("resolve current_exe for orphan");
-                let launch_script = std::env::current_dir()
-                    .expect("cwd")
-                    .join("orphan-launch.py");
-                std::fs::write(&launch_script, "orphan_hang").expect("write orphan launch.py");
+                std::fs::write(&launch_script, "orphan_lifeline_hang")
+                    .expect("write orphan launch.py");
                 let mut command = std::process::Command::new(&exe);
                 command
                     .arg("-I")
@@ -225,25 +183,64 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                     .arg("train")
                     .arg("--request")
                     .arg(request_path)
-                    // 標準エラー出力は継承させない（検証したいのは標準
-                    // 出力側の読み取り未完了だけに絞るため）。
-                    .stderr(std::process::Stdio::null());
-                let grandchild = command.spawn().expect("spawn orphan grandchild");
+                    // 孫を自分自身のプロセスグループのリーダーにする
+                    // （実際の `_worker` が `start_new_session=True` で
+                    // 別セッションのリーダーになるのと同じ理由: lifeline の
+                    // EOF 検知時に「自分自身のグループ」へ `SIGKILL` できる
+                    // ようにする）。
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped());
+                let mut grandchild = command.spawn().expect("spawn orphan grandchild");
                 std::fs::write("orphan.pid", grandchild.id().to_string())
                     .expect("write orphan.pid");
+                // 標準入力（lifeline の書き込み端）を取り出し、この変数に
+                // 束縛したまま関数の最後（＝無限ループで戻らない）まで
+                // 保持する。孫には渡さない複製であり、このプロセスが
+                // 終了する（正常終了・`SIGKILL` のいずれでも）まで開いた
+                // ままになる。
+                let stdin_keepalive = grandchild.stdin.take();
+                // `wait()` せずに drop すると `clippy::zombie_processes` に
+                // 抵触するため、別スレッドへ切り出して回収する（孫は
+                // lifeline 経由の自己終了、または外側のタイムアウトで
+                // `SIGKILL` されるまで終了しない）。
                 std::thread::spawn(move || {
                     let mut grandchild = grandchild;
                     let _ = grandchild.wait();
                 });
+                stdin_keepalive
+            };
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
             }
-            print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
-            std::process::exit(0);
         }
-        "orphan_hang" => {
-            // `hang_with_orphan` が起動する「孫プロセス」役。`heartbeat.txt`
-            // （cwd = job_dir。親と同じ cwd を継承）へ書き続け、外側の
-            // タイムアウト経路が本プロセスも回収できたかをテストから
-            // 確認できるようにする。
+        "orphan_lifeline_hang" => {
+            // `hang_with_lifeline_orphan` が起動する「孫プロセス」
+            // （`_worker` 役）。実際の `cli.py::_start_lifeline_thread` と
+            // 同じ仕組み（標準入力＝lifeline の読み取り端を別スレッドで
+            // block read し、EOF を観測したら自分自身のプロセスグループへ
+            // `SIGKILL` を送って自己終了する）を再現する。それまでの間は
+            // `orphan-heartbeat.txt`（cwd = job_dir。親と同じ cwd を継承）
+            // へ書き続け、外側からテストが生存を確認できるようにする。
+            let pid = std::process::id();
+            std::thread::spawn(move || {
+                let mut stdin = std::io::stdin();
+                let mut buf = [0u8; 1];
+                loop {
+                    match std::io::Read::read(&mut stdin, &mut buf) {
+                        Ok(0) => break, // EOF: 親（supervisor 役）が死んだ。
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", "--", &format!("-{pid}")])
+                    .env_clear()
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            });
             loop {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
@@ -325,11 +322,6 @@ fn run_test_suite() -> ProcessExitCode {
     ];
     #[cfg(unix)]
     cases.push(("timeout_hang_kills_orphan", case_timeout_hang_kills_orphan));
-    #[cfg(unix)]
-    cases.push((
-        "exit_with_orphan_kills_orphan",
-        case_exit_with_orphan_kills_orphan,
-    ));
     #[cfg(not(unix))]
     let cases: Vec<(&'static str, CaseFn)> =
         vec![("unsupported_platform", case_unsupported_platform)];
@@ -475,11 +467,10 @@ fn case_ok_outcome(case_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// issue #178 PR #233 レビュー再々々指摘 P1「stdout の EOF は supervisor の
-/// 終了を保証しない」への回帰テスト（REQ-39）: 結果 JSON を出力してから
-/// 少し（`EOF_EXIT_GRACE` より十分短い時間）遅れて `exit(0)` する供給元を、
-/// 誤って `TerminatedBySignal`／`WallTimeout` 等に分類せず、正しく `Ok` と
-/// 判定できること。
+/// issue #178 PR #233 レビューへの回帰テスト（REQ-39）: 結果 JSON を出力
+/// してから少し（壁時計予算に対して十分短い時間）遅れて `exit(0)` する
+/// 供給元を、誤って `TerminatedBySignal`／`WallTimeout` 等に分類せず、
+/// 正しく `Ok` と判定できること。
 #[cfg(unix)]
 fn case_ok_slow_exit(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "ok_slow_exit");
@@ -616,14 +607,24 @@ fn case_timeout_hang(case_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// issue #178 PR #233 レビュー再々指摘の再現・検証: supervisor 役
-/// （`hang_with_orphan`）が同じプロセスグループ内で起動した孫プロセス
-/// （`_worker` 役。応答不能な supervisor に代わって走り続ける）も、外側の
-/// 壁時計タイムアウト（プロセスグループへの一括 `SIGKILL`）で確実に終了
-/// することを確認する（REQ-39）。
+/// issue #178 PR #233 レビュー: Rust 側は直接の子（supervisor 役）だけを
+/// 把握・`SIGKILL` すればよく、孫プロセス（`_worker` 役。lifeline を模した
+/// もの）の掃除は Rust の関与なしに、カーネルが供給元の死で lifeline の
+/// 書き込み端を自動的に閉じることを通じて、孫プロセス自身が自己終了する
+/// ことを end-to-end で確認する（REQ-39）。`run_train` はこの孫プロセスの
+/// 存在を一切知らない。
+///
+/// 実際の supervisor.py・`_worker` を Rust のテストハーネスから直接
+/// 起動できないため、lifeline の仕組み自体（fd の継承・EOF 検知・自己
+/// `killpg`）は Rust のフェイクワーカーで再現している
+/// （`hang_with_lifeline_orphan`・`orphan_lifeline_hang` モード参照）。
+/// 実際の supervisor.py・`_worker` を用いた同等の確認は
+/// `trainer/tests/test_supervisor.py::
+/// test_lifeline_worker_and_grandchild_die_when_supervisor_is_killed`
+/// （Python 側）で行う。
 #[cfg(unix)]
 fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
-    let launcher = make_launcher(case_dir, "hang_with_orphan");
+    let launcher = make_launcher(case_dir, "hang_with_lifeline_orphan");
     let request = make_request(Some(1));
     let limits = RunLimits::for_request(&request)
         .with_wall_timeout(Duration::from_millis(500))
@@ -632,13 +633,11 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     // 孫プロセスが実際に起動したことを確認してから検証したいため、
     // `run_train`（500ms の壁時計タイムアウト）を別スレッドで実行しつつ、
     // メインスレッドで `orphan.pid` の出現を短いポーリングで待つ
-    // （プロセスグループへの一括 `SIGKILL` 方式では、掃除の成否はもはや
-    // `ps` スナップショットのタイミングに依存しないが、そもそも孫プロセスが
-    // 起動する前に検証してしまうと「生存していない」ことが偽陽性になる
-    // ため、本ポーリングは引き続き必要）。ポーリングの成否は掃除の正しさ
-    // とは別の検証であり、タイムアウト発火前に孫プロセスの起動を確認
-    // できなかった場合は「起動待ちタイムアウト」として区別できるよう
-    // 別メッセージで報告する。
+    // （そもそも孫プロセスが起動する前に検証してしまうと「生存していない」
+    // ことが偽陽性になるため）。ポーリングの成否は lifeline の正しさとは
+    // 別の検証であり、タイムアウト発火前に孫プロセスの起動を確認できな
+    // かった場合は「起動待ちタイムアウト」として区別できるよう別
+    // メッセージで報告する。
     let orphan_pid_path = case_dir.join("orphan.pid");
     let run_train_handle = {
         let launcher = launcher.clone();
@@ -667,8 +666,7 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
     expect_true(
         orphan_spawned,
-        "grandchild (orphan.pid) must appear before the wall timeout fires \
-         (otherwise the tree-kill snapshot cannot have included it)",
+        "grandchild (orphan.pid) must appear before the wall timeout fires",
     )?;
 
     let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
@@ -695,81 +693,6 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     // 終了する（`/bin/kill` は本テストが検証対象とする `run_train` 側の
     // 実装が使う同じバイナリ。テスト側の検証にも同じ絶対パスの外部
     // コマンドを再利用する）。
-    let status = std::process::Command::new("/bin/kill")
-        .args(["-0", &orphan_pid.to_string()])
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to run /bin/kill -0: {e}"))?;
-    expect_true(
-        !status.success(),
-        "orphan process must no longer exist after run_train returns",
-    )
-}
-
-/// issue #178 PR #233 レビュー再々指摘の再現・検証: supervisor 役
-/// （`exit_with_orphan`）が正常終了した後も、同じプロセスグループ内で
-/// 起動した孫プロセス（`_worker` 役）が標準出力の書き手を握り続けている
-/// ケースで、`run_train` の完了検知（標準出力の EOF 待ち）が壁時計予算を
-/// 使い切って `WallTimeout` になり、かつプロセスグループへの一括
-/// `SIGKILL` で孫プロセスを確実に停止できることを確認する（REQ-39）。
-///
-/// 以前（`ps` によるプロセスツリー走査方式）は、supervisor が既に終了して
-/// いると `ppid` チェーンを辿れず、ポーリング中に記録した pid スナップ
-/// ショットへの fallback が必要だった。プロセスグループへの一括シグナルに
-/// 全面移行したことで、supervisor の生死やタイミングに関係なく孫プロセスへ
-/// 確実に届く（モジュール doc「プロセスグループによる一括終了」参照）。
-#[cfg(unix)]
-fn case_exit_with_orphan_kills_orphan(case_dir: &Path) -> Result<(), String> {
-    let launcher = make_launcher(case_dir, "exit_with_orphan");
-    let request = make_request(Some(1));
-    let limits = RunLimits::for_request(&request)
-        .with_wall_timeout(Duration::from_millis(500))
-        .expect("tighten wall timeout");
-
-    let orphan_pid_path = case_dir.join("orphan.pid");
-    let started = std::time::Instant::now();
-    let err = match run_train(&launcher, &request, case_dir, &limits) {
-        Err(e) => e,
-        Ok(_) => {
-            return Err("expected WallTimeout error (orphan holds stdout pipe open)".to_string());
-        }
-    };
-    expect_true(
-        orphan_pid_path.exists(),
-        "grandchild (orphan.pid) must have been spawned before supervisor exited",
-    )?;
-    expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
-    // supervisor 役はほぼ即座に正常終了するが、孫プロセスが標準出力を
-    // 握り続けるため、`run_train` の標準出力読み取りは EOF に達せず、
-    // 壁時計予算（500ms）を使い切って `WallTimeout` になる。無期限の
-    // ハングにはならないことを安全マージン込みで確認する。
-    expect_true(
-        started.elapsed() < Duration::from_secs(10),
-        "must return well before an unbounded hang would",
-    )?;
-
-    let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
-        .map_err(|e| format!("read orphan.pid: {e} (grandchild may not have started in time)"))?;
-    let orphan_pid: u32 = orphan_pid_text
-        .trim()
-        .parse()
-        .map_err(|e| format!("parse orphan.pid {orphan_pid_text:?}: {e}"))?;
-
-    // 孫プロセスが生きていれば heartbeat が伸び続けるはずなので、少し待って
-    // `orphan-heartbeat.txt` が伸びていないことを確認する。
-    let heartbeat = case_dir.join("orphan-heartbeat.txt");
-    let len_after_return = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(500));
-    let len_after_wait = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
-    expect_eq(
-        len_after_wait,
-        len_after_return,
-        "orphan heartbeat must not grow after run_train returns (grandchild must be killed too)",
-    )?;
-
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", &orphan_pid.to_string()])
         .env_clear()
@@ -841,26 +764,11 @@ fn case_record(case_dir: &Path) -> Result<(), String> {
         .ok_or("record.env_names missing")?;
     for name in env_names {
         let name = name.as_str().unwrap_or_default();
-        // `SUPERVISOR_GROUP_MANAGED_ENV` は `ENV_ALLOWLIST`（親環境からの
-        // 継承リスト）には含まれない。`run_train` が固定値
-        // （`SUPERVISOR_GROUP_MANAGED_VALUE`）を明示的に設定する内部境界の
-        // 環境変数であり、親プロセスの環境値を継承するものではないため
-        // （issue #178 PR #233 レビュー再々々指摘 P0）。
         expect_true(
-            ENV_ALLOWLIST.contains(&name) || name == SUPERVISOR_GROUP_MANAGED_ENV,
-            &format!(
-                "child env var {name:?} must be in ENV_ALLOWLIST or be the group-managed marker"
-            ),
+            ENV_ALLOWLIST.contains(&name),
+            &format!("child env var {name:?} must be in ENV_ALLOWLIST"),
         )?;
     }
-    let env_names_set: Vec<&str> = env_names
-        .iter()
-        .map(|v| v.as_str().unwrap_or_default())
-        .collect();
-    expect_true(
-        env_names_set.contains(&SUPERVISOR_GROUP_MANAGED_ENV),
-        "run_train must always set SUPERVISOR_GROUP_MANAGED_ENV on the worker process",
-    )?;
     Ok(())
 }
 

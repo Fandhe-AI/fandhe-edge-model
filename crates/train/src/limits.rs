@@ -74,16 +74,24 @@ pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 
 /// Rust 側の壁時計締め切りに足す猶予（秒）。REQ-34・REQ-39（#178）。
 ///
-/// `supervisor.py`（内側監視者）は `_worker` を自身と同じプロセスグループに
-/// 留めて起動する（`start_new_session` を使わない。issue #178 PR #233
-/// レビュー再々指摘。`crates/train/src/process.rs` モジュール doc
-/// 「プロセスグループによる一括終了」参照）ため、`_worker` の孫プロセスに
-/// 至るまでの確実な掃除は Rust 側 `run_train` のプロセスグループ一括
-/// `SIGKILL` が担う。Rust 側の外側締め切りは、supervisor 自身が
-/// `time_limit_seconds` 超過を検出してから、内側の後始末（`_worker` の
-/// kill・`ps` 呼び出し・reader スレッドの回収等）を終えるまでの時間を
-/// 確実に上回る必要がある（さもないと、まだ後始末中の supervisor を
-/// Rust 側が早期に打ち切ってしまう）。
+/// `supervisor.py`（内側監視者）は `_worker` を別セッション・別プロセス
+/// グループ（W）で起動する（`start_new_session=True`）。内側の壁時計・RSS
+/// タイムアウトでは supervisor 自身が `killpg(W)` でそのグループごと掃除
+/// する。Rust 側の外側締め切りは、supervisor 自身が `time_limit_seconds`
+/// 超過を検出してから、内側の後始末（`killpg`・`ps` 呼び出し・reader
+/// スレッドの回収等）を終えるまでの時間を確実に上回る必要がある（さもない
+/// と、まだ後始末中の supervisor を Rust 側が早期に打ち切ってしまう）。
+///
+/// Rust 側が外側締め切りで直接の子（supervisor）を `SIGKILL` した場合
+/// （＝ supervisor が自身の後始末を終える前に終了させられた場合）でも、
+/// `_worker` は孤児として残らない: `_worker` は起動直後から「lifeline」
+/// （supervisor が握り続ける pipe の書き込み端）を監視しており、supervisor
+/// がどのような形で終了しても、カーネルが書き込み端を自動的に閉じるため
+/// `_worker` は必ず EOF を観測して自己終了する（issue #178 PR #233
+/// レビュー。`trainer/src/fandhe_edge_trainer/supervisor.py` モジュール
+/// docstring「lifeline」節参照。Rust 側でのプロセスグループ管理
+/// 〔`process_group(0)`・`/bin/kill` 呼び出し〕は構造的な欠陥が収束せず
+/// 全面撤去した）。
 ///
 /// 内訳（`supervisor.py` の定数から算出。根拠を明示し、緩めずに保つ）:
 /// 内側の猶予 `_TIME_LIMIT_GRACE_SECONDS`（5 秒）＋ `ps` 呼び出しの

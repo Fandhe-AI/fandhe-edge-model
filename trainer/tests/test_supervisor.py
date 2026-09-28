@@ -180,73 +180,17 @@ def test_monitor_child_maps_rlimit_cpu_self_kill_to_limit_exceeded() -> None:
 
 
 # --------------------------------------------------------------------------
-# 単独モード／管理モード（SUPERVISOR_GROUP_MANAGED_ENV。issue #178 PR #233
-# レビュー再々々指摘 P0「単独起動時の防御を弱めている」）
+# `_terminate_worker`: `_worker` のプロセスグループ全体を終了させること
+# （REQ-39。issue #178 PR #233 レビュー）
 # --------------------------------------------------------------------------
 
 
-def test_is_group_managed_by_rust_requires_exact_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`SUPERVISOR_GROUP_MANAGED_ENV` は厳密に `"1"` の場合だけ管理モードと
-    みなす（未設定・空文字列・他の値はすべて安全側の単独モード）。REQ-39。
+def test_terminate_worker_kills_grandchild_too(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー: 内部タイムアウト時に `_worker` 役
+    （`monitor_child` に渡す `proc`）だけでなく、その子（孫プロセス）も
+    一括して終了すること（`_worker` を `start_new_session=True` で別
+    グループへ切り離し、`os.killpg` でグループごと終了させる）。
     """
-    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
-    assert supervisor._is_group_managed_by_rust() is False
-
-    for other_value in ("", "0", "true", "TRUE", "yes"):
-        monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, other_value)
-        assert supervisor._is_group_managed_by_rust() is False
-
-    monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, "1")
-    assert supervisor._is_group_managed_by_rust() is True
-
-
-def test_worker_start_new_session_depends_on_managed_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`start_new_session=not _is_group_managed_by_rust()` という
-    `_spawn_worker_and_finalize` の呼び出し方どおり、管理モードでは worker
-    相当のプロセスが本プロセスと同じグループに留まり、単独モードでは別
-    グループへ切り離されること（issue #178 PR #233 レビュー再々々指摘 P0）。
-    """
-    own_pgid = os.getpgid(os.getpid())
-
-    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
-    standalone_proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(1)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=not supervisor._is_group_managed_by_rust(),
-    )
-    try:
-        assert os.getpgid(standalone_proc.pid) != own_pgid
-    finally:
-        _reap(standalone_proc)
-
-    monkeypatch.setenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, "1")
-    managed_proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(1)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=not supervisor._is_group_managed_by_rust(),
-    )
-    try:
-        assert os.getpgid(managed_proc.pid) == own_pgid
-    finally:
-        _reap(managed_proc)
-
-
-def test_terminate_worker_standalone_mode_kills_grandchild_too(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """REQ-39・issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を
-    弱めている」への回帰テスト: 単独モード（`SUPERVISOR_GROUP_MANAGED_ENV`
-    未設定）では、内部タイムアウト時に `_worker` 役（`monitor_child` に渡す
-    `proc`）だけでなく、その子（孫プロセス）も一括して終了すること
-    （`_worker` を `start_new_session=True` で別グループへ切り離し、
-    `os.killpg` でグループごと終了させる、以前の防御を復元したことの
-    確認）。
-    """
-    monkeypatch.delenv(supervisor.SUPERVISOR_GROUP_MANAGED_ENV, raising=False)
     heartbeat = tmp_path / "grandchild-heartbeat.txt"
     grandchild_script = tmp_path / "grandchild.py"
     grandchild_script.write_text(
@@ -295,6 +239,123 @@ def test_terminate_worker_standalone_mode_kills_grandchild_too(
         )
     finally:
         _reap(proc)
+
+
+# --------------------------------------------------------------------------
+# lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理から
+# worker 自身が親の死を検知する方式への全面移行）
+# --------------------------------------------------------------------------
+
+
+def test_lifeline_write_end_not_passed_to_worker() -> None:
+    """REQ-39・issue #178 PR #233 レビュー: lifeline パイプの書き込み端は
+    `_worker` へ渡さない（`_spawn_worker_and_finalize` の `pass_fds` には
+    読み取り端だけを含める）こと。`_worker` 役の子プロセスが書き込み端の
+    fd 番号へ書き込もうとすると `OSError`（対象の fd が存在しない）に
+    なることで確認する。書き込み端が漏れていると、`_worker` 自身がその
+    複製を保持し続けるため、supervisor が終了してもカーネルが書き込み端を
+    閉じられず、lifeline の EOF が届かなくなる。
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        code = (
+            "import os\n"
+            "try:\n"
+            f"    os.write({write_fd}, b'x')\n"
+            "except OSError:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        )
+        result = subprocess.run(  # noqa: S603 - テスト専用。引数は固定・shell 不使用
+            [sys.executable, "-c", code],
+            pass_fds=(read_fd,),
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, "worker role must not have access to the lifeline write end"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_lifeline_worker_and_grandchild_die_when_supervisor_is_killed(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー: supervisor 役を `SIGKILL` すると、
+    lifeline により worker 役・孫プロセスが有界時間内に消滅すること。
+
+    supervisor がどのような形で終了しても（正常終了・内部タイムアウトに
+    よる `killpg`・外側からの `SIGKILL` を含む）、カーネルが lifeline の
+    書き込み端を自動的に閉じるため、worker 側の EOF 検知は必ず働く、という
+    設計の核心を検証する（`cli.py::_start_lifeline_thread` を実プロセスへ
+    組み込んで確認する。証拠種別: テストハーネス）。
+    """
+    worker_pid_path = tmp_path / "worker.pid"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+
+    worker_script = tmp_path / "worker_role.py"
+    worker_script.write_text(
+        "import os, subprocess, sys, time\n"
+        f"sys.path.insert(0, {_SRC_DIR!r})\n"
+        "from fandhe_edge_trainer import cli\n"
+        "lifeline_fd = int(sys.argv[1])\n"
+        "cli._start_lifeline_thread(lifeline_fd)\n"
+        f"open({str(worker_pid_path)!r}, 'w').write(str(os.getpid()))\n"
+        "grandchild = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time\\nwhile True: time.sleep(0.05)']\n"
+        ")\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(grandchild.pid))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    supervisor_script = tmp_path / "supervisor_role.py"
+    supervisor_script.write_text(
+        "import os, subprocess, sys, time\n"
+        "r, w = os.pipe()\n"
+        f"subprocess.Popen(\n"
+        f"    [sys.executable, {str(worker_script)!r}, str(r)],\n"
+        "    pass_fds=(r,),\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "os.close(r)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    supervisor_proc = subprocess.Popen(  # noqa: S603 - テスト専用。引数は固定・shell 不使用
+        [sys.executable, str(supervisor_script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            worker_pid_path.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert worker_pid_path.exists(), "worker role must have started"
+        assert grandchild_pid_path.exists(), "grandchild must have started"
+
+        worker_pid = int(worker_pid_path.read_text().strip())
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        supervisor_proc.kill()  # SIGKILL
+        supervisor_proc.wait(timeout=5)
+
+        for role, pid in (("worker", worker_pid), ("grandchild", grandchild_pid)):
+            death_deadline = time_mod.monotonic() + 5.0
+            while time_mod.monotonic() < death_deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time_mod.sleep(0.02)
+            else:
+                pytest.fail(
+                    f"{role} (pid {pid}) did not die within the bound after supervisor SIGKILL"
+                )
+    finally:
+        if supervisor_proc.poll() is None:
+            supervisor_proc.kill()
+            supervisor_proc.wait(timeout=5)
 
 
 def test_parse_worker_stdout_accepts_single_json_object() -> None:
@@ -388,16 +449,17 @@ def test_supervisor_module_does_not_import_mlx() -> None:
 def test_worker_argv_uses_isolated_mode_and_launch_script() -> None:
     """`supervisor.worker_argv`（Issue #12）が組み立てる argv が、`sys.executable`・
     `-I`（隔離モード）・実在する `trainer/launch.py` の絶対パス・
-    `["_worker", "--out-fd", "<n>"]` から成ることを具体値で確認する。
+    `["_worker", "--out-fd", "<n>", "--lifeline-fd", "<n>"]` から成ることを
+    具体値で確認する（`--lifeline-fd`: issue #178 PR #233 レビュー）。
     """
-    argv = supervisor.worker_argv(7)
+    argv = supervisor.worker_argv(7, 8)
     assert argv[0] == sys.executable
     assert argv[1] == "-I"
     launch_script = Path(argv[2])
     assert launch_script.is_absolute()
     assert launch_script.name == "launch.py"
     assert launch_script.is_file()
-    assert argv[3:] == ["_worker", "--out-fd", "7"]
+    assert argv[3:] == ["_worker", "--out-fd", "7", "--lifeline-fd", "8"]
 
 
 def test_run_supervised_train_rejects_invalid_request_without_spawning_worker(

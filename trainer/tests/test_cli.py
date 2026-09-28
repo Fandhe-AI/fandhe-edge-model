@@ -273,13 +273,15 @@ def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> No
     ことで、fstat 検査が無い実装なら `read()` がブロックしたまま
     `TimeoutExpired` になり、本テストが失敗して区別できるようにする。
 
-    `--out-fd` は本チェックより前に使われないため、実在しない fd 番号
-    （3）を渡してよい。
+    `--out-fd`・`--lifeline-fd` は本チェックより前に使われないため、実在
+    しない fd 番号（3・4）を渡してよい（`--lifeline-fd` に無効な fd を
+    渡した場合、`cli.py::_start_lifeline_thread` の監視スレッドは何もせず
+    終了する契約。issue #178 PR #233 レビュー参照）。
     """
     # `supervisor.worker_argv` を再利用し、実際の起動経路（`-I` 付き
     # `trainer/launch.py` 経由）と同じ argv で検証する（Issue #12）。
     proc = subprocess.Popen(
-        supervisor.worker_argv(3),
+        supervisor.worker_argv(3, 4),
         stdin=subprocess.PIPE,  # 通常ファイルではない（S_ISREG ではない）標準入力
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

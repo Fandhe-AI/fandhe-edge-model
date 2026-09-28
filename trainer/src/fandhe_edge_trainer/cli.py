@@ -40,10 +40,13 @@ docstring 参照）。`_worker` は `--out-fd <n>` だけを引数に取る。
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import stat
 import sys
+import threading
 from pathlib import Path
 
 from . import artifact as artifact_mod
@@ -96,6 +99,43 @@ def _apply_rlimit_cpu_backstop(time_limit_seconds: int) -> None:
         # 壁時計監視（supervisor.py）が最終防波堤になるため、ここでの失敗で
         # ワーカーの起動自体は妨げない（フェイルクローズにはしない）。
         pass
+
+
+def _start_lifeline_thread(lifeline_fd: int) -> None:
+    """lifeline（supervisor の生死監視）の daemon スレッドを起動する
+    （issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理から
+    worker 自身が親の死を検知する方式へ全面移行した。
+    `supervisor.py` モジュール docstring「lifeline」節参照）。
+
+    起動直後に、supervisor が `pass_fds` で引き継いだ読み取り専用の pipe fd
+    （`lifeline_fd`）を別スレッドで block read する。supervisor（本プロセスの
+    親）がどのような形で終了しても（正常終了・内部タイムアウトによる
+    `killpg`・Rust 側からの `SIGKILL` を含む）、カーネルが書き込み端の最後の
+    複製を自動的に閉じるため、read は必ず EOF（0 バイト）で返る。EOF を
+    観測したら、本プロセス自身のプロセスグループ（`start_new_session=True`
+    で起動されているため pgid は本プロセス自身の pid）へ `SIGKILL` を送り、
+    自分自身とその孫プロセスをまとめて終了させる。
+
+    `lifeline_fd` が無効（fstat・read が失敗する）な場合は、監視対象が
+    存在しないものとして何もしない（本来の起動経路〔`supervisor.worker_argv`
+    経由〕では常に有効な fd が渡される契約だが、`_worker` を直接起動する
+    テスト等ではダミーの fd 番号が渡されうるため、そのような呼び出しを
+    クラッシュさせない）。
+    """
+
+    def _watch() -> None:
+        try:
+            with os.fdopen(lifeline_fd, "rb", buffering=0) as pipe:
+                while True:
+                    chunk = pipe.read(1)
+                    if not chunk:
+                        break
+        except OSError:
+            return
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    threading.Thread(target=_watch, name="lifeline-watch", daemon=True).start()
 
 
 def _read_request_from_stdin() -> bytes:
@@ -237,10 +277,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # `train`（supervisor.py）が子プロセスとして起動する実体。`--out-fd` は
     # スーパーバイザーが `pass_fds` で引き継いだ、出力用一時ディレクトリの fd 番号
     # （`contract.py::OutDirReservation` 参照。`_worker` はこの fd 番号以外の
-    # 経路で `out_dir` を扱わない）。リクエストの内容は `--request <path>` では
-    # 受け取らず標準入力から読む（P1: `_read_request_from_stdin` 参照）。
+    # 経路で `out_dir` を扱わない）。`--lifeline-fd` は同じく `pass_fds` で
+    # 引き継いだ lifeline パイプの読み取り端の fd 番号（`_start_lifeline_thread`
+    # 参照。issue #178 PR #233 レビュー）。リクエストの内容は `--request <path>`
+    # では受け取らず標準入力から読む（P1: `_read_request_from_stdin` 参照）。
     p_worker = sub.add_parser("_worker", add_help=False, exit_on_error=False)
     p_worker.add_argument("--out-fd", required=True, type=int)
+    p_worker.add_argument("--lifeline-fd", required=True, type=int)
     return parser
 
 
@@ -251,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "train":
             exit_code = supervisor_mod.run_supervised_train(Path(args.request))
         elif args.command == "_worker":
+            _start_lifeline_thread(args.lifeline_fd)
             exit_code = run_worker_train(args.out_fd)
         else:  # pragma: no cover - argparse の choices で到達しない
             raise WorkerError(

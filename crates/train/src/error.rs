@@ -361,33 +361,24 @@ pub enum TrainProcessError {
     /// 子プロセスの起動（`Command::spawn`）に失敗した。
     Spawn { kind: std::io::ErrorKind },
     /// 子プロセスの終了待ち（`Child::try_wait`／`Child::wait`）に失敗した。
-    ///
-    /// `descendants_confirmed_clean` は、本エラーを返す前に実行した
-    /// [`crate::process::kill_process_group_best_effort`]（supervisor が
-    /// 属するプロセスグループへの一括 `SIGKILL`）が「掃除を試みて問題
-    /// なかったか」（`/bin/kill -KILL -- -<pgid>` の終了コードが 0〔送出
-    /// 成功〕・1〔多くの実装で ESRCH＝対象が既に存在しない、を含む一般
-    /// エラー〕のいずれか）を示す。`false` の場合、`_worker` 等が生き残って
-    /// いる可能性がある（issue #178 PR #233 レビュー再々指摘「ps 由来の
-    /// スナップショット方式そのものの欠陥」への対応でプロセスグループ
-    /// 一括終了へ全面移行した。呼び出し元へ確実に伝えるためフィールド化
-    /// した。REQ-39「資源の上限」）。
-    Wait {
-        kind: std::io::ErrorKind,
-        descendants_confirmed_clean: bool,
-    },
-    /// 外側の壁時計締め切り（[`crate::process::RunLimits`]）を超過したため
-    /// 子プロセスを強制終了した（REQ-39「資源の上限」）。
-    ///
-    /// `descendants_confirmed_clean` の意味は [`TrainProcessError::Wait`] と
-    /// 同じ（codex/review 指摘 P0。issue #178 PR #233 レビュー）。
+    /// Rust が扱うのは直接の子（supervisor）だけであり、子孫プロセスの
+    /// 掃除は学習ワーカー側の lifeline に委ねる設計（issue #178 PR #233
+    /// レビュー。`crates/train/src/process.rs` モジュール doc 参照）のため、
+    /// 子孫の掃除確認フィールドは持たない。
+    Wait { kind: std::io::ErrorKind },
+    /// 外側の壁時計締め切り（[`crate::process::RunLimits`]）を超過した、
+    /// または `try_wait()` の観測が締め切り後になった経路（`WaitOutcome::
+    /// LateExit`。再利用されうる pid への誤った `kill()` を避けるため）
+    /// で、子プロセスを強制終了した（REQ-39「資源の上限」）。
     ///
     /// `child_reaped` は、締め切り超過を検出して `Child::kill()` を送った
     /// 後、直接の子（supervisor）の終了を
-    /// [`crate::process::wait_after_kill`] で回収できたかを示す。`false` は
-    /// 回収自体（`KillWaitTimedOut`／`Wait`）が失敗したことを意味するが、
-    /// その場合でも本バリアント（`exit_code()` は常に `LimitExceeded`）を
-    /// 返す。回収の失敗を理由に `WallTimeout` の代わりに回収エラーを返すと、
+    /// [`crate::process::wait_after_kill`] で回収できたかを示す
+    /// （`LateExit` 経路では既に reap 済みのため常に `true`）。`false` は
+    /// 回収自体
+    /// （`KillWaitTimedOut`／`Wait`）が失敗したことを意味するが、その場合
+    /// でも本バリアント（`exit_code()` は常に `LimitExceeded`）を返す。
+    /// 回収の失敗を理由に `WallTimeout` の代わりに回収エラーを返すと、
     /// 壁時計タイムアウトが `LimitExceeded`（20）ではなく `RuntimeError`
     /// （70）に化けてしまい REQ-21 の終了コード契約に違反する（codex/review
     /// 指摘 P1「wall timeout 超過後 wait_after_kill(...)? 失敗で WallTimeout
@@ -395,11 +386,7 @@ pub enum TrainProcessError {
     /// Cursor Bugbot 指摘 Medium も同一事象）。`child_reaped: false` は
     /// プロセスが OS 上にゾンビとして残り続ける可能性があることを呼び出し元
     /// へ伝える診断情報として使う。
-    WallTimeout {
-        limit_ms: u64,
-        descendants_confirmed_clean: bool,
-        child_reaped: bool,
-    },
+    WallTimeout { limit_ms: u64, child_reaped: bool },
     /// `SIGKILL` 送出後の直接の子プロセスの終了待ちが
     /// [`crate::process::KILL_WAIT_TIMEOUT`] 以内に完了しなかった
     /// （割り込み不可能な OS 側の待ち〔D state〕等、極めて稀なケース。
@@ -449,28 +436,14 @@ pub enum TrainProcessError {
         expected: ExitCode,
     },
     /// unix 以外（windows 等）の環境で [`crate::process::run_train`] が呼ば
-    /// れた。プロセスツリー（`_worker` を含む子孫）を壁時計タイムアウト時に
-    /// 確実に束ねて終了させる手段が unix の `ps`／`kill` 走査以外に無く、
-    /// windows 版（`taskkill /T /F`）は supervisor が既に終了した後に別
-    /// セッションへ抜けた孤児を発見できないという不変条件違反があった
-    /// （codex/review 指摘 P0「Windows で正常終了後の孤児ワーカーを停止
-    /// できない」。issue #178 PR #233 レビュー）。ジョブオブジェクト
-    /// （`CreateJobObject`／`AssignProcessToJobObject`）による恒久対応は
-    /// 新規依存（`windows` crate 等）を要しユーザー承認事項
-    /// （`.claude/rules/dependency-policy.md`）のため本 issue の対象外とし、
-    /// 資源上限（REQ-39）を保証できないまま子プロセスを起動しない
-    /// （fail-closed。子プロセスは一切起動しない）。
+    /// れた。子孫プロセス（`_worker` を含む）の確実な掃除は学習ワーカー側の
+    /// lifeline（`_worker` が親の死を検知して自己終了する。
+    /// `trainer/src/fandhe_edge_trainer/supervisor.py` モジュール docstring
+    /// 参照）に委ねる設計へ移行したが、windows は本 issue の対象外のまま
+    /// とし（未検証。将来対応時に改めて検討する）、
+    /// [`crate::process::run_train`]（`cfg(not(unix))` 版）は子プロセスを
+    /// 一切起動せず即座に本バリアントを返す（fail-closed）。
     UnsupportedPlatform,
-    /// supervisor が [`crate::process::EOF_EXIT_GRACE`] の猶予内に自発的に
-    /// 終了したものの、その後の
-    /// [`crate::process::kill_process_group_best_effort`] がプロセス
-    /// グループの掃除を確認できなかった（`/bin/kill -KILL` が ESRCH 以外の
-    /// 理由〔EPERM・引数エラー等〕で失敗した、または有界回数のリトライ後も
-    /// まだ生存が確認された）。学習自体は成功していた可能性があっても、
-    /// 資源上限（REQ-39）を確実に守れたと言えない状態を成功として返さない
-    /// （fail-closed。issue #178 PR #233 レビュー再々々指摘 P0「終了コード
-    /// 1 は ESRCH 以外でも返るのに掃除済み扱いしている」）。
-    GroupCleanupUnconfirmed,
 }
 
 impl std::fmt::Display for TrainProcessError {
@@ -488,23 +461,16 @@ impl std::fmt::Display for TrainProcessError {
             TrainProcessError::Spawn { kind } => {
                 write!(f, "failed to spawn worker process: {kind:?}")
             }
-            TrainProcessError::Wait {
-                kind,
-                descendants_confirmed_clean,
-            } => {
-                write!(
-                    f,
-                    "failed to wait for worker process: {kind:?} (descendants_confirmed_clean={descendants_confirmed_clean})"
-                )
+            TrainProcessError::Wait { kind } => {
+                write!(f, "failed to wait for worker process: {kind:?}")
             }
             TrainProcessError::WallTimeout {
                 limit_ms,
-                descendants_confirmed_clean,
                 child_reaped,
             } => {
                 write!(
                     f,
-                    "worker process exceeded wall timeout of {limit_ms} ms (descendants_confirmed_clean={descendants_confirmed_clean}, child_reaped={child_reaped})"
+                    "worker process exceeded wall timeout of {limit_ms} ms (child_reaped={child_reaped})"
                 )
             }
             TrainProcessError::KillWaitTimedOut => {
@@ -546,12 +512,6 @@ impl std::fmt::Display for TrainProcessError {
                     "worker process resource limits are not supported on this platform"
                 )
             }
-            TrainProcessError::GroupCleanupUnconfirmed => {
-                write!(
-                    f,
-                    "worker process group cleanup could not be confirmed after graceful exit"
-                )
-            }
         }
     }
 }
@@ -590,8 +550,7 @@ impl TrainProcessError {
             | TrainProcessError::StdoutIncomplete
             | TrainProcessError::StderrIncomplete
             | TrainProcessError::ExitCodeMismatch { .. }
-            | TrainProcessError::UnsupportedPlatform
-            | TrainProcessError::GroupCleanupUnconfirmed => ExitCode::RuntimeError,
+            | TrainProcessError::UnsupportedPlatform => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
             TrainProcessError::Request(inner) => inner.exit_code(),
             TrainProcessError::Result(inner) => inner.exit_code(),

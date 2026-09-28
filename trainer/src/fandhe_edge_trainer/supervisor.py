@@ -34,17 +34,18 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    内容を固定して渡すことでこれを防ぐ）。
 2. `contract.prepare_out_dir` で `out_dir` を排他的に予約し、作業用の一時
    ディレクトリを作る（`OutDirReservation`。`tmp_fd` を含む）。
-3. `<sys.executable> -I <trainer/launch.py の絶対パス> _worker --out-fd <tmp_fd>`
-   （`worker_argv` が組み立てる argv。Issue #12: `-I`〔隔離モード〕で呼び出し元の
-   `PYTHONPATH` 等に依存せず `trainer/src` を解決する）を子プロセスとして
-   起動する。**`start_new_session` の要否は `SUPERVISOR_GROUP_MANAGED_ENV`
-   環境変数で切り替える**（`_is_group_managed_by_rust` 参照。issue #178
-   PR #233 レビュー再々々指摘 P0）。`pass_fds=(tmp_fd,)` で一時ディレクトリの
-   fd だけを引き継がせる。リクエストの内容は `--request <path>` では渡さない。
-   代わりに `raw` を `tempfile.TemporaryFile()`（作成直後に unlink 済みの無名
-   一時ファイル。stdlib のみで完結し、`supervisor.py` が mlx・onnx・numpy を
-   import しない設計を崩さない）へ書き込み、`seek(0)` してから子プロセスの
-   標準入力（`stdin=`）として渡す（P1）。
+3. `<sys.executable> -I <trainer/launch.py の絶対パス> _worker --out-fd <tmp_fd>
+   --lifeline-fd <n>`（`worker_argv` が組み立てる argv。Issue #12: `-I`
+   〔隔離モード〕で呼び出し元の `PYTHONPATH` 等に依存せず `trainer/src` を
+   解決する）を、**常に新しいセッション**（`start_new_session=True`）で
+   子プロセスとして起動する。`_worker` はこの新しいプロセスグループ W の
+   リーダーになる。`pass_fds=(tmp_fd, lifeline_read_fd)` で一時ディレクトリの
+   fd と lifeline パイプの読み取り端だけを引き継がせる（`lifeline_read_fd`
+   は下記「lifeline」節参照）。リクエストの内容は `--request <path>` では
+   渡さない。代わりに `raw` を `tempfile.TemporaryFile()`（作成直後に
+   unlink 済みの無名一時ファイル。stdlib のみで完結し、`supervisor.py` が
+   mlx・onnx・numpy を import しない設計を崩さない）へ書き込み、`seek(0)`
+   してから子プロセスの標準入力（`stdin=`）として渡す（P1）。
 4. 子プロセスの標準出力を、監視と並行して別スレッドで上限
    （`_MAX_WORKER_STDOUT_BYTES`）まで保持しつつ読み進める（P1-1: 監視ループが
    `stdout=PIPE` を読み出さないと、子プロセスがパイプを書き切れずに
@@ -55,8 +56,8 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    超えたかを見る。`ps` の実行自体に失敗したら「監視ができない」ことを
    fail-closed に扱い、子プロセスを強制終了して `runtime_error` とする
    （安全側に倒す。上限を検査できないまま野放しにしない）。
-6. 超過を検出したら `_terminate_worker` を呼ぶ（モードによって挙動が
-   異なる。後述の「単独モード／管理モード」節参照）うえで、予約
+6. 超過を検出したら `_terminate_worker` で `_worker` のプロセスグループ W
+   全体を `os.killpg` で終了させ（孫プロセスまで含めて掃除する）、予約
    （一時ディレクトリとその中身・空の予約済みディレクトリ）を
    `contract.cleanup_reservation` で解放する（本モジュールが保持し続けている
    fd だけを使う。名前を再解決しない）。
@@ -77,29 +78,37 @@ Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパ
 終了した場合の後始末は、本モジュールの責務ではなく Rust 側ジョブ管理
 （TASK-34.x）に委ねる。
 
-**単独モード／管理モード（`SUPERVISOR_GROUP_MANAGED_ENV`。issue #178 PR
-#233 レビュー再々々指摘 P0「単独起動時の防御を弱めている」）**:
-`_worker` をどのプロセスグループへ属させるか、`monitor_child` の内部
-タイムアウトで何を kill するかは、環境変数
-`SUPERVISOR_GROUP_MANAGED_ENV`（値が厳密に `"1"` の場合だけ「管理モード」。
-未設定・その他の値は安全側の「単独モード」）で切り替える。
+**lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
+〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕からの全面移行）**:
+Rust 側 `run_train` が `_worker`（＝ Rust から見た孫プロセス）を直接把握・
+終了させる設計（`process_group(0)`・`kill(-pgid)`）は、次のような構造的な
+欠陥が収束しなかった: 回収済み（reap 済み）pgid への誤送出・環境変数だけで
+単独起動時の掃除を無効化できてしまう・回収前のゾンビがグループに残るため
+`kill -0` が常に「生存している」と誤判定する・`WallTimeout` が別のエラー
+（`GroupCleanupUnconfirmed`）に化ける、等。これらは「Rust 側が worker の
+プロセスグループを外部から観測・操作する」という設計そのものに起因する
+ため、代わりに **worker 自身が supervisor（本プロセス）の死を検知して
+自己終了する** 方式（lifeline）へ全面移行した。
 
-- **単独モード（既定・安全側）**: 本モジュールを単独で起動する運用
-  （Rust 側ジョブ管理を経由しないテスト・手動実行を含む）を想定し、
-  以前の挙動（`_worker` を `start_new_session=True` で別セッション・
-  プロセスグループとして起動し、内部タイムアウト時に本モジュール自身が
-  `os.killpg` でそのグループごと終了させる）を維持する。`_worker` の
-  孫プロセスまで本モジュール単体で確実に掃除できる。
-- **管理モード（Rust 側 `run_train` が起動した場合）**: `_worker` を
-  `start_new_session` なしで起動し、本モジュールと同じプロセスグループ
-  （Rust 側が `process_group(0)` で確立したもの）に留める。内部タイムアウト
-  時は `_worker`（本モジュールの未回収の直接の子。`pid` の再利用は起こら
-  ない）だけへ `SIGKILL` を送り、`_worker` がさらに起動した孫プロセスの
-  確実な掃除は行わない。これは Rust 側 `run_train` が `_worker` を含む
-  プロセスグループ全体へ `SIGKILL` を送ることで担う責務移動であり
-  （`crates/train/src/process.rs` モジュール doc「プロセスグループによる
-  一括終了」参照）、管理モードで単独起動された場合（通常あり得ないが）は
-  孫プロセスが残りうる。
+- 本プロセスは `os.pipe()` を作り、**読み取り端だけ**を `pass_fds` で
+  `_worker` へ渡す。**書き込み端は本プロセスが保持し続け、`_worker` には
+  一切渡さない**（`_spawn_worker_and_finalize` 参照）。
+- `_worker`（`cli.py::_start_lifeline_thread`）は起動直後から daemon
+  スレッドで読み取り端を block read する。本プロセスがどのような形で
+  終了しても（正常終了・内部タイムアウトによる `killpg`・Rust 側からの
+  `SIGKILL` を含む）、カーネルが書き込み端の最後の複製を自動的に閉じるため、
+  read は必ず EOF（0 バイト）で返る。
+- EOF を観測した `_worker` は、自分自身のプロセスグループ W
+  （`start_new_session=True` で起動されているため pgid は `_worker` 自身の
+  pid）へ `SIGKILL` を送り（`os.killpg(os.getpgrp(), signal.SIGKILL)`）、
+  自分自身とその孫プロセスをまとめて終了させる。
+- この設計により、**Rust 側は直接の子（本プロセス）だけを把握すればよい**
+  （`crates/train/src/process.rs` モジュール doc 参照）。孫プロセス
+  （`_worker` とその子）に至るまでの確実な掃除は、Rust 側の関与なしに
+  worker 自身が担う。孫プロセスがさらに `start_new_session`／`setsid` で
+  別セッションへ抜けた場合（lifeline の読み取り端を引き継がない独自の
+  子プロセスを作った場合）は、この方式でも対象外である（限界として
+  正直に記録する）。
 """
 
 from __future__ import annotations
@@ -121,32 +130,6 @@ from . import artifact as artifact_mod
 from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
-
-#: Rust 側 `run_train` がプロセスグループを管理していることを伝える環境
-#: 変数名（issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を
-#: 弱めている」）。Rust 側の同名の定数
-#: （`crates/train/src/process.rs::SUPERVISOR_GROUP_MANAGED_ENV`）と
-#: 一致することを、共有 fixture
-#: `fixtures/train_contract/supervisor_group_managed_env.json` 経由で
-#: `trainer/tests/test_train_contract_fixture.py`・
-#: `crates/train/tests/train_contract_fixture.rs` の双方から照合する。
-SUPERVISOR_GROUP_MANAGED_ENV = "FANDHE_EDGE_SUPERVISOR_GROUP_MANAGED"
-
-#: [`SUPERVISOR_GROUP_MANAGED_ENV`] が「管理モード」を示す値。この文字列と
-#: 完全一致する場合だけ管理モードとみなす（未設定・その他の値は安全側の
-#: 単独モード）。
-_SUPERVISOR_GROUP_MANAGED_VALUE = "1"
-
-
-def _is_group_managed_by_rust() -> bool:
-    """Rust 側 `run_train` がプロセスグループを管理しているか。
-
-    厳密に `SUPERVISOR_GROUP_MANAGED_ENV` が `"1"` の場合だけ `True`
-    （未設定・その他の値は `False`＝安全側の単独モード。issue #178 PR #233
-    レビュー再々々指摘 P0）。
-    """
-    return os.environ.get(SUPERVISOR_GROUP_MANAGED_ENV) == _SUPERVISOR_GROUP_MANAGED_VALUE
-
 
 #: 監視ループのポーリング間隔（秒）。
 _POLL_INTERVAL_SECONDS = 0.1
@@ -204,30 +187,18 @@ def _current_child_rss_bytes(pid: int) -> int | None:
 
 
 def _terminate_worker(proc: subprocess.Popen) -> None:
-    """モード（[`_is_group_managed_by_rust`]）に応じて `_worker` を終了させる
-    （issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めて
-    いる」）。
+    """`_worker` のプロセスグループ W 全体を `SIGKILL` する。
 
-    - **単独モード**（既定・安全側）: `_worker` は `start_new_session=True`
-      で別プロセスグループとして起動されているため、本モジュール自身は
-      巻き込まれない。`os.killpg` でそのグループごと終了させ、`_worker` が
-      さらに起動した孫プロセスまで本モジュール単体で掃除する（以前の挙動
-      を維持）。プロセスグループの取得自体に失敗した場合の保険として
-      `proc.kill()` も呼ぶ。
-    - **管理モード**: `_worker` は本モジュールと同じプロセスグループに
-      留まる設計のため、`os.killpg` を使うと監視ループを実行している
-      本プロセス自身も巻き込んで終了してしまう。`proc.kill()`
-      （`os.kill(proc.pid, SIGKILL)` と同等）で直接の子だけを対象にする。
-      `proc` は本プロセスの未回収の直接の子であり、`wait()` するまで
-      `pid` が OS に返却されない（＝再利用されない）ため、`pid` ベースの
-      kill でも無関係なプロセスを誤って終了させる心配はない。孫プロセスは
-      ここでは掃除しない（Rust 側 `run_train` のプロセスグループ一括
-      `SIGKILL` の責務）。
+    `_worker` は常に `start_new_session=True` で別プロセスグループ
+    （リーダー = `_worker` 自身）として起動されるため（モジュール docstring
+    「lifeline」節参照。issue #178 PR #233 レビュー: Rust 側でのプロセス
+    グループ管理から worker 自身が親の死を検知する lifeline 方式へ全面
+    移行した際、単独起動・Rust 管理下のいずれでも `_worker` は常に別
+    セッションで起動する設計に統一した）、本モジュール自身は `os.killpg`
+    に巻き込まれない。`_worker` がさらに起動した孫プロセスもこのグループ W
+    に属する限り、まとめて終了する。プロセスグループの取得自体に失敗した
+    場合の保険として `proc.kill()` も呼ぶ。
     """
-    if _is_group_managed_by_rust():
-        with contextlib.suppress(OSError):
-            proc.kill()
-        return
     with contextlib.suppress(OSError):
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGKILL)
@@ -442,15 +413,18 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         reservation.entry.close()  # request.out_dir と同一オブジェクト
 
 
-def worker_argv(out_fd: int) -> list[str]:
+def worker_argv(out_fd: int, lifeline_fd: int) -> list[str]:
     """`_worker` を起動する argv を組み立てる（Issue #12）。
 
     `[sys.executable, "-I", <trainer/launch.py の絶対パス>, "_worker",
-    "--out-fd", str(out_fd)]` を返す。`-m fandhe_edge_trainer` ではなく
-    `trainer/launch.py`（`-I` 付き）を経由することで、呼び出し元の
-    `PYTHONPATH` の設定漏れ・汚染に左右されず `trainer/src` を解決できる
-    （`launch.py` のモジュール docstring 参照）。テスト（`tests/test_cli.py`
-    の `test_worker_rejects_non_regular_stdin_without_blocking`）も本関数を
+    "--out-fd", str(out_fd), "--lifeline-fd", str(lifeline_fd)]` を返す。
+    `-m fandhe_edge_trainer` ではなく `trainer/launch.py`（`-I` 付き）を
+    経由することで、呼び出し元の `PYTHONPATH` の設定漏れ・汚染に左右されず
+    `trainer/src` を解決できる（`launch.py` のモジュール docstring 参照）。
+    `lifeline_fd` は本モジュールが `pass_fds` で引き継いだ lifeline パイプの
+    読み取り端の fd 番号（`_spawn_worker_and_finalize` 参照。issue #178
+    PR #233 レビュー）。テスト（`tests/test_cli.py` の
+    `test_worker_rejects_non_regular_stdin_without_blocking`）も本関数を
     再利用し、実際の起動経路と同じ argv で検証する。
     """
     return [
@@ -460,6 +434,8 @@ def worker_argv(out_fd: int) -> list[str]:
         "_worker",
         "--out-fd",
         str(out_fd),
+        "--lifeline-fd",
+        str(lifeline_fd),
     ]
 
 
@@ -470,58 +446,103 @@ def _spawn_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
 ) -> ExitCode:
-    argv = worker_argv(reservation.tmp_fd)
-    # P1: 検証済みのリクエスト（raw_request）を、作成直後に unlink 済みの
-    # 無名一時ファイル（stdlib のみ。mlx・onnx・numpy を import しない設計を
-    # 崩さない）へ書いて子プロセスの標準入力として渡す。`--request <path>` は
-    # 使わない（検証後のファイル書き換えによる TOCTOU を防ぐ。モジュール
-    # docstring 参照）。
+    # lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
+    # 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕は PID
+    # 再利用・ESRCH 誤判定・reap 済み pgid への誤送出等の構造的な欠陥が
+    # 収束しなかったため全面撤去し、代わりに worker 自身が「親（本プロセス）
+    # の死」を検知して自己終了する lifeline 方式へ移行した）。
     #
-    # セキュリティ監査指摘: `tempfile.TemporaryFile()`・`write`・`seek` は
-    # （ENOSPC 等で）例外を送出しうるが、この時点で `out_dir` の予約
-    # （空の予約済みディレクトリ・一時ディレクトリ）は既に確保済みである。
-    # ここで送出されたあらゆる例外（`BaseException`）を外側の `try` で捕捉し、
-    # `cleanup_reservation` で解放してから再送出することで、予約だけが
-    # 残置される事態を防ぐ（REQ-39）。内側の `except OSError`（`Popen` 失敗）は
-    # 既に cleanup 済みで `return` するため、外側には伝播せず二重 cleanup には
-    # ならない。
+    # `os.pipe()` の読み取り端だけを `pass_fds` で worker へ渡す。書き込み端
+    # （`lifeline_write_fd`）は本プロセスが本関数の最後まで（＝worker の
+    # 監視・後始末が終わるまで）保持し続け、worker には一切渡さない。
+    # worker 側（`cli.py::_start_lifeline_thread`）は起動直後から daemon
+    # スレッドで読み取り端を block read し、本プロセスがどのような形で
+    # 終了しても（Rust 側からの `SIGKILL` を含む）カーネルが書き込み端を
+    # 自動的に閉じるため、read は必ず EOF で返る。EOF を観測した worker は
+    # 自分自身のプロセスグループ（`start_new_session=True` で起動している
+    # ため pgid は worker 自身の pid）へ `SIGKILL` を送り、worker 自身と
+    # その孫プロセスをまとめて終了させる。
+    lifeline_read_fd, lifeline_write_fd = os.pipe()
     try:
-        with tempfile.TemporaryFile() as req_file:
-            req_file.write(raw_request)
-            req_file.seek(0)
-            try:
-                # 管理モード（Rust 側 `run_train` が起動した場合）だけ
-                # `_worker` を本モジュールと同じプロセスグループに留める
-                # （`start_new_session=False`）。単独モード（既定・安全側）
-                # では従来どおり別セッションへ切り離し、本モジュール単体で
-                # 孫プロセスまで掃除できるようにする（モジュール docstring
-                # 「単独モード／管理モード」参照。issue #178 PR #233
-                # レビュー再々々指摘 P0「単独起動時の防御を弱めている」）。
-                group_managed = _is_group_managed_by_rust()
-                proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
-                    argv,
-                    stdin=req_file,
-                    stdout=subprocess.PIPE,
-                    stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
-                    pass_fds=(reservation.tmp_fd,),
-                    start_new_session=not group_managed,
-                )
-            except OSError as e:
-                contract.cleanup_reservation(reservation)
-                _emit(
-                    {
-                        "status": "error",
-                        "code": "runtime_error",
-                        "message": f"failed to start worker: {type(e).__name__}",
-                    }
-                )
-                return ExitCode.RUNTIME_ERROR
-    except BaseException:
-        contract.cleanup_reservation(reservation)
-        raise
-    # `with` を抜けると req_file（親側の fd）は閉じるが、子プロセスは
-    # 起動時に複製した自分の fd を保持しているため読み取りに支障はない。
+        argv = worker_argv(reservation.tmp_fd, lifeline_read_fd)
+        # P1: 検証済みのリクエスト（raw_request）を、作成直後に unlink 済みの
+        # 無名一時ファイル（stdlib のみ。mlx・onnx・numpy を import しない設計を
+        # 崩さない）へ書いて子プロセスの標準入力として渡す。`--request <path>` は
+        # 使わない（検証後のファイル書き換えによる TOCTOU を防ぐ。モジュール
+        # docstring 参照）。
+        #
+        # セキュリティ監査指摘: `tempfile.TemporaryFile()`・`write`・`seek` は
+        # （ENOSPC 等で）例外を送出しうるが、この時点で `out_dir` の予約
+        # （空の予約済みディレクトリ・一時ディレクトリ）は既に確保済みである。
+        # ここで送出されたあらゆる例外（`BaseException`）を外側の `try` で捕捉し、
+        # `cleanup_reservation` で解放してから再送出することで、予約だけが
+        # 残置される事態を防ぐ（REQ-39）。内側の `except OSError`（`Popen` 失敗）は
+        # 既に cleanup 済みで `return` するため、外側には伝播せず二重 cleanup には
+        # ならない。
+        try:
+            with tempfile.TemporaryFile() as req_file:
+                req_file.write(raw_request)
+                req_file.seek(0)
+                try:
+                    # `_worker` は常に新しいセッション（`start_new_session=True`）
+                    # で起動する。worker はこのグループ W のリーダーになり、
+                    # lifeline の EOF 検知時に自分自身のプロセスグループ
+                    # （= 自分の pid）を `os.killpg` で終了させられる
+                    # （モジュール docstring・本関数冒頭のコメント参照）。
+                    proc = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。sys.executable は絶対パス
+                        argv,
+                        stdin=req_file,
+                        stdout=subprocess.PIPE,
+                        stderr=None,  # 継承（親の stderr へ直接流す。パイプを溜めて詰まらせない）
+                        pass_fds=(reservation.tmp_fd, lifeline_read_fd),
+                        start_new_session=True,
+                    )
+                except OSError as e:
+                    contract.cleanup_reservation(reservation)
+                    _emit(
+                        {
+                            "status": "error",
+                            "code": "runtime_error",
+                            "message": f"failed to start worker: {type(e).__name__}",
+                        }
+                    )
+                    return ExitCode.RUNTIME_ERROR
+        except BaseException:
+            contract.cleanup_reservation(reservation)
+            raise
+        finally:
+            # 子プロセスは起動時に読み取り端の複製を保持しているため、
+            # 親側の複製はここで（起動の成否によらず）閉じてよい。
+            # 書き込み端（`lifeline_write_fd`）は関数末尾まで開いたまま
+            # にする（下記 `finally` 参照）。
+            with contextlib.suppress(OSError):
+                os.close(lifeline_read_fd)
+        # `with` を抜けると req_file（親側の fd）は閉じるが、子プロセスは
+        # 起動時に複製した自分の fd を保持しているため読み取りに支障はない。
 
+        return _monitor_worker_and_finalize(
+            proc,
+            reservation,
+            time_limit_seconds=time_limit_seconds,
+            rss_limit_bytes=rss_limit_bytes,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(lifeline_write_fd)
+
+
+def _monitor_worker_and_finalize(
+    proc: subprocess.Popen,
+    reservation: contract.OutDirReservation,
+    *,
+    time_limit_seconds: float,
+    rss_limit_bytes: int,
+) -> ExitCode:
+    """`_spawn_worker_and_finalize` が起動した `proc`（`_worker`）を監視し、
+    結果に応じて `out_dir` の予約を確定または解放する（分離した理由:
+    呼び出し元が lifeline パイプの書き込み端を `finally` で確実に閉じられる
+    よう、本体を別関数へ切り出した）。
+    """
     # P1-1: 監視（proc.wait を繰り返す）と並行して、別スレッドで標準出力を
     # 溜めずに読み進める。子プロセスがパイプを埋めてブロックするのを防ぐ。
     stdout_result: dict[str, Any] = {}

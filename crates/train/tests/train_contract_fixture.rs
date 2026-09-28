@@ -366,30 +366,3 @@ fn req19_result_ok_config_matches_kind_defaults_fixture_merged_with_request_full
         Value::Object(expected_config)
     );
 }
-
-/// issue #178 PR #233 レビュー再々々指摘 P0「単独起動時の防御を弱めている」:
-/// Rust 側 `SUPERVISOR_GROUP_MANAGED_ENV`／`SUPERVISOR_GROUP_MANAGED_VALUE`
-/// が、共有 fixture（`fixtures/train_contract/supervisor_group_managed_env.json`）
-/// 経由で Python 側 `supervisor.py::SUPERVISOR_GROUP_MANAGED_ENV` と一致する
-/// こと。対になるテストは `trainer/tests/test_train_contract_fixture.py`。
-/// unix 限定（当該定数が unix 限定のため。`fandhe_edge_train::process` 参照）。
-#[cfg(unix)]
-#[test]
-fn req39_supervisor_group_managed_env_matches_python_constant() {
-    let fixture = load_fixture_value("supervisor_group_managed_env.json");
-    let expected_env_var = fixture["env_var"]
-        .as_str()
-        .expect("env_var must be a string");
-    let expected_managed_value = fixture["managed_value"]
-        .as_str()
-        .expect("managed_value must be a string");
-
-    assert_eq!(
-        fandhe_edge_train::process::SUPERVISOR_GROUP_MANAGED_ENV,
-        expected_env_var
-    );
-    assert_eq!(
-        fandhe_edge_train::process::SUPERVISOR_GROUP_MANAGED_VALUE,
-        expected_managed_value
-    );
-}
