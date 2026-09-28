@@ -150,6 +150,16 @@ MAX_INPUT_ID = SEP - 1
 #: （`_export_ar_onnx`）の両方がこの 1 箇所を参照する。
 _MASK_NEG_VALUE = -1e9
 
+#: `DecoderLayer._attn` が 1 層あたりに保持する `[..., L, L]` 形状のテンソル数
+#: （`scores`＝`softmax` 適用前のスケール済みスコア、`attn`＝`softmax` の出力
+#: 確率）。MLX の自動微分は逆伝播で `softmax` の勾配計算に出力（`attn`）を、
+#: `*scale + mask` の勾配計算に入力（`scores`）を、それぞれ必要とするため、
+#: 学習時はこの 2 テンソルが同時にメモリ上に残り得る（Codex P0 指摘。
+#: `AutoregressiveKind.train` の資源上限検査 `attn_elements` 参照。REQ-39）。
+#: `ctx`（`attn @ v`）は `[..., L, head_dim]` で `head_dim ≤ L` の典型的な
+#: 設定では `L^2` より小さいため、保守的な見積もりとして数えない。
+_AR_TRAIN_ATTN_RETAINED_TENSORS = 2
+
 #: 既定ハイパーパラメータ（クラス docstring 1 番。PoC-24 の S サイズ・学習設定を踏襲）。
 DEFAULT_CONFIG: dict[str, Any] = {
     "layers": 2,
@@ -557,12 +567,24 @@ class AutoregressiveKind:
         budget_mod.check_model_bytes(_ar_param_count(layers, dims, heads, max_len))
         budget_mod.check_sample_steps(len(examples), epochs)
         budget_mod.check_total_tokens(len(examples), request.max_bytes)
-        attn_elements = batch_size * heads * max_len * max_len
+        # `layers` を乗じる理由: `ByteDecoder.__call__` は `layers` 個の
+        # `DecoderLayer` を直列に適用するが、MLX の自動微分は逆伝播のために
+        # 各層のフォワード時の中間テンソルを保持する。全層分が学習ループの
+        # 1 ステップ内で同時にメモリ上に残り得るため、1 層あたりの見積もりに
+        # `layers` を掛けないと過小評価になる（Codex P0 指摘。修正前は
+        # `layers` を含まず、`layers=32`・`heads=dims=64`・`batch_size=1`・
+        # `max_bytes≈1700` のような設定が判定を素通りしていた。REQ-39）。
+        # `_AR_TRAIN_ATTN_RETAINED_TENSORS`（=2）を乗じる理由は同定数の
+        # docstring 参照（`scores`・`attn` の 2 テンソルが逆伝播用に残る）。
+        attn_elements = (
+            batch_size * heads * max_len * max_len * layers * _AR_TRAIN_ATTN_RETAINED_TENSORS
+        )
         if attn_elements > MAX_AR_ATTENTION_ELEMENTS:
             raise WorkerError(
                 "limit_exceeded",
                 f"estimated attention elements {attn_elements} exceeds limit"
-                f" {MAX_AR_ATTENTION_ELEMENTS} (batch_size x heads x max_len^2)",
+                f" {MAX_AR_ATTENTION_ELEMENTS} (batch_size x heads x max_len^2 x layers x"
+                f" {_AR_TRAIN_ATTN_RETAINED_TENSORS})",
                 ExitCode.LIMIT_EXCEEDED,
             )
 
@@ -833,6 +855,18 @@ def _ar_export_attention_elements(
     引数はすべて 0 以上の整数であること（負数・非整数は呼び出し側の
     バグであり、ここでは検査しない。すべて学習時に確定する固定値、
     または呼び出し側が検証済みの `N`・`T` のみを渡す契約のため）。
+
+    **学習側の見積もり（`AutoregressiveKind.train` の `attn_elements`）との
+    違い**: 学習側は `_AR_TRAIN_ATTN_RETAINED_TENSORS`（=2）を追加で乗じる
+    （逆伝播のため `scores`・`softmax` 出力の 2 テンソルを同時に保持しうる
+    ため。Codex P0 指摘・REQ-39）。推論（本関数が担う ONNX 書き出し）には
+    逆伝播が無く、ONNX ランタイムは各層の attention 出力を次の層へ渡した
+    後に解放できる（1 層のフォワード計算に必要な一時テンソルだけを保持
+    すればよい）ため、学習側と同じ「保持テンソル数」の乗数は不要と判断
+    した。本関数はそれでも `layers` を乗じる保守的な見積もりを維持して
+    いる（上記コメント参照。実際に層ごとに解放される実装でも上限側は
+    安全側に倒す）ため、学習側の追加乗数を持ち込まなくても fail-closed な
+    安全側の見積もりを保てる。
     """
     length = t_bound + 1 + m
     return n * k_classes * heads * layers * length * length

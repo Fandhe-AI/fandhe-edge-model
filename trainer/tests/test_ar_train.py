@@ -275,8 +275,9 @@ def test_ar_train_rejects_model_too_large_before_any_training_step(
 
 
 def test_ar_train_rejects_attention_elements_over_limit(tmp_path: Path) -> None:
-    """`MAX_AR_ATTENTION_ELEMENTS`: `batch_size x heads x max_len^2` の見積もりが
-    上限を超える場合、1 バッチも回さず拒否すること。
+    """`MAX_AR_ATTENTION_ELEMENTS`: `batch_size x heads x max_len^2 x layers x
+    _AR_TRAIN_ATTN_RETAINED_TENSORS` の見積もりが上限を超える場合、1 バッチも
+    回さず拒否すること（REQ-39）。
     """
     from fandhe_edge_trainer.limits import MAX_AR_BATCH_SIZE
 
@@ -291,6 +292,58 @@ def test_ar_train_rejects_attention_elements_over_limit(tmp_path: Path) -> None:
         train_kind(kind, make_examples(), req)
     assert exc_info.value.code == "limit_exceeded"
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_ar_train_rejects_attention_elements_over_limit_via_layers(tmp_path: Path) -> None:
+    """`MAX_AR_ATTENTION_ELEMENTS`: `batch_size` を小さくしても、`layers`（＝
+    逆伝播で同時に保持されうる decoder 層数）が大きければ見積もりの積が
+    上限を超え、拒否されること（REQ-39・Codex P0 指摘。修正前は `layers` を
+    見積もりに含めておらず、`layers=32`・`heads=dims=64`・`batch_size=1`・
+    `max_bytes≈1700` のような設定を素通りさせ、attention テンソルの保持
+    だけで `MAX_TRAIN_RSS_BYTES`〔8 GiB〕を超えていた）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(
+        tmp_path,
+        kind="autoregressive",
+        config={
+            **TINY_AR_CONFIG,
+            "layers": 32,
+            "dims": 64,
+            "heads": 64,
+            "batch_size": 1,
+        },
+        max_bytes=1700,
+    )
+    with pytest.raises(WorkerError) as exc_info:
+        train_kind(kind, make_examples(), req)
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_ar_train_accepts_small_multi_layer_config_under_attention_limit(
+    tmp_path: Path,
+) -> None:
+    """`MAX_AR_ATTENTION_ELEMENTS`: 複数層（`layers=4`）でも見積もりが上限内に
+    収まる小さな構成は、`layers` を見積もりへ含めた後も学習が最後まで進む
+    こと（REQ-39。`layers` を加えたことで正当な小規模構成まで誤って拒否
+    しないことの確認）。
+    """
+    kind = AutoregressiveKind()
+    req = make_request(
+        tmp_path,
+        kind="autoregressive",
+        config={
+            **TINY_AR_CONFIG,
+            "layers": 4,
+            "dims": 32,
+            "heads": 4,
+            "batch_size": 8,
+        },
+        max_bytes=64,
+    )
+    trained = train_kind(kind, make_examples(), req)
+    assert trained.config["layers"] == 4
 
 
 def test_ar_export_rejects_choice_logprob_elements_over_limit(tmp_path: Path) -> None:

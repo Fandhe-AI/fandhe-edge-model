@@ -290,11 +290,25 @@ MAX_AR_WEIGHT_DECAY = 1.0
 #: 学習率 warmup のステップ数の許容上限。
 MAX_AR_WARMUP_STEPS = 100_000
 
-#: 1 ミニバッチの attention が確保しうる要素数（`batch_size × heads × L^2`。
-#: `L` は 1 行の全長 = `max_bytes + 1 + max_label_len + 1`）の上限
+#: 学習 1 ステップで decoder attention が保持しうる要素数の上限
+#: （`batch_size × heads × L^2 × layers × _AR_TRAIN_ATTN_RETAINED_TENSORS`。
+#: `L` は 1 行の全長 = `max_bytes + 1 + max_label_len + 1`。`_AR_TRAIN_
+#: ATTN_RETAINED_TENSORS`＝2 は `scores`・`softmax` 出力の 2 テンソルが
+#: 逆伝播用に残ることの見積もり。`kinds/autoregressive.py::
+#: _AR_TRAIN_ATTN_RETAINED_TENSORS` docstring 参照）の上限
 #: （`MAX_C1_BATCH_ELEMENTS` と同じ考え方。セキュリティ監査 P0 相当）。
 #: 学習ループ開始前（1 バッチも確保する前）にこの上限で fail-closed に
 #: 拒否する（`limit_exceeded`・exit 20）。
+#:
+#: `layers` を乗じる理由: `ByteDecoder` は `layers` 個の `DecoderLayer` を
+#: 直列適用するが、MLX の自動微分は逆伝播のため各層のフォワード時の
+#: 中間テンソルを学習ステップ内で同時に保持しうる。旧式（`layers` を
+#: 含まない `batch_size × heads × L^2`）は `layers=32`・`heads=dims=64`・
+#: `batch_size=1`・`max_bytes≈1700` のような設定を通過させてしまい、
+#: attention テンソルの保持だけで `MAX_TRAIN_RSS_BYTES`（8 GiB）を超える
+#: 実例があった（Codex P0 指摘。`kinds/autoregressive.py::
+#: AutoregressiveKind.train` 参照。REQ-39）。値そのもの（200,000,000）は
+#: 変更せず、見積もり式のみを是正した。
 MAX_AR_ATTENTION_ELEMENTS = 200_000_000
 
 #: 推論 1 件（バッチ N=1）あたりで ONNX グラフが確保しうる、選択肢領域の
