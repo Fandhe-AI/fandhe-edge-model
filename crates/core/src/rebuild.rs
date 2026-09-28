@@ -80,9 +80,7 @@
 //! - JSON 入出力契約（`serde::Serialize` の配線・CLI 出力）への接続
 //!   （CLI 側 TASK-33.x の対象。本 issue では Rust 型の追加に留める）
 //!
-//! [`crate::definition::JudgmentType`] は現状 `SingleSelect` の 1 バリアント
-//! しか持たないため、「判定型が変わった」経路は分岐として実装するが、現状の
-//! 型ではテストで到達させられない（`canonical.rs` 末尾のコメントと同じ制約）。
+//! 判定型変更（`JudgmentTypeChanged`）経路のテスト方針は上記 2.2 節を参照。
 
 use crate::canonical::{CanonicalError, DefinitionHash, DefinitionIdentity};
 use crate::definition::{Definition, JudgmentType};
