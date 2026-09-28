@@ -179,7 +179,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// windows: 完全に空の環境は CRT・Python の DLL 探索を壊しうるため、
 /// `SystemRoot`・`TEMP`・`TMP` を許可する（issue #178 実装計画 3.3 を
 /// Windows でも安全に動くよう拡張。根拠: Python ランタイムは
-/// Windows で `SystemRoot` が無いと DLL 探索に失敗しうる）。
+/// Windows で `SystemRoot` が無いと DLL 探索に失敗しうる）。現時点では
+/// windows 版 [`run_train`] が子プロセスを起動しない（`UnsupportedPlatform`
+/// を即座に返す。モジュール doc「windows（対象外・fail-closed）」参照）
+/// ため、この許可リストは実際には使われていない。将来ジョブオブジェクトで
+/// windows 対応する際に使う想定で残す（REQ-39。実装済みを装わないための
+/// 明記）。
 #[cfg(unix)]
 pub const ENV_ALLOWLIST: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
@@ -1644,25 +1649,30 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn req39_run_train_rejects_unsupported_platform() {
-        let dir = std::env::temp_dir();
-        let launch_script = dir.join(format!(
-            "fandhe-edge-train-test-unsupported-platform-{}.py",
+        // `WorkerLauncher::new` はファイル名がちょうど `launch.py` である
+        // ことを要求する（`req39_launcher_rejects_wrong_launch_script_name`
+        // 参照）ため、他テストと衝突しない専用ディレクトリの下に
+        // `launch.py` という名前で置く。
+        let case_dir = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-unsupported-platform-{}",
             std::process::id()
         ));
+        std::fs::create_dir_all(&case_dir).expect("create case dir");
+        let launch_script = case_dir.join("launch.py");
         std::fs::write(&launch_script, b"").expect("write stub launch.py");
         let python = std::env::current_exe().expect("resolve current_exe");
         let launcher =
             WorkerLauncher::new(python, launch_script.clone()).expect("valid launcher fields");
         let request = test_request(Some(30));
         let limits = RunLimits::for_request(&request);
-        let err = run_train(&launcher, &request, &dir, &limits).unwrap_err();
-        let _ = std::fs::remove_file(&launch_script);
+        let err = run_train(&launcher, &request, &case_dir, &limits).unwrap_err();
         assert!(matches!(err, TrainProcessError::UnsupportedPlatform));
         assert_eq!(err.exit_code(), ExitCode::RuntimeError);
         assert!(
-            !dir.join("request.json").exists(),
+            !case_dir.join("request.json").exists(),
             "request.json must not be written when platform is unsupported"
         );
+        let _ = std::fs::remove_dir_all(&case_dir);
     }
 
     /// `TrainProcessError::UnsupportedPlatform` の終了コードは常に
