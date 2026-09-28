@@ -62,8 +62,10 @@ pub enum RegressionError {
     Labels(crate::metrics::EvalError),
     /// 比較対象の行が 0 件（評価済みを装わない）。
     EmptyRecords,
-    /// 件数が [`MAX_EVAL_RECORDS`] を超える（REQ-39 資源の上限。2 本の
-    /// `Vec<bool>` を確保する前に拒否する）。
+    /// 件数が [`MAX_EVAL_RECORDS`] を超える（REQ-39 資源の上限。
+    /// [`compare_with_previous`] では 2 本の `Vec<bool>` を確保する前に、
+    /// [`regression_counts`] では（追加のアロケーションを行わないが）
+    /// 処理前に、同じ上限規則で拒否する）。
     TooManyRecords {
         /// 渡された件数。
         n_records: usize,
@@ -220,13 +222,20 @@ impl RegressionCounts {
 /// （ラベル集合相違の前提明記自体は TASK-26.2 の対象で、本関数はその前提を
 /// 検査しない）。
 ///
+/// 本関数自体は受け取ったスライスをそのまま検査するだけで、追加の
+/// `Vec` を確保しない（2 本の `Vec<bool>` を確保するのは呼び出し元
+/// [`compare_with_previous`] 側）。ただし件数の上限規則は
+/// [`compare_with_previous`] と揃え、検査前に同じ [`MAX_EVAL_RECORDS`]
+/// で拒否する。
+///
 /// # エラー
 ///
-/// - `previous`・`current` がともに空 → [`RegressionError::EmptyRecords`]
-///   （評価済みを装わない。0 件は [`mcnemar::paired_counts`] のように
-///   「全件 0」を黙って返さない）
-/// - `previous.len()` が [`MAX_EVAL_RECORDS`] を超える → 2 本の `Vec` を
-///   確保する前に [`RegressionError::TooManyRecords`]（REQ-39）
+/// - `previous_correct`・`current_correct` がともに空 →
+///   [`RegressionError::EmptyRecords`]（評価済みを装わない。0 件は
+///   [`mcnemar::paired_counts`] のように「全件 0」を黙って返さない）
+/// - `previous_correct`・`current_correct` のいずれかの長さが
+///   [`MAX_EVAL_RECORDS`] を超える → [`RegressionError::TooManyRecords`]
+///   （REQ-39）
 /// - 長さが一致しない → [`RegressionError::LengthMismatch`]
 pub fn regression_counts(
     previous_correct: &[bool],
