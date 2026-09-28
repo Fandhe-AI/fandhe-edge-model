@@ -53,7 +53,7 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `artifact` の各フィールドは `trainer/src/fandhe_edge_trainer/artifact.py::
   build_artifact` を実行して得た出力をそのまま採用し、`created_utc` のみ
   固定値 `2026-09-28T00:00:00Z` に置き換えた（生成コマンドは下記）。
-  `kind`・`kind_version`・`config`・`label_order`・`max_bytes` は
+  `kind`・`kind_version`・`label_order`・`max_bytes`・`candidate_label` は
   `request_full.json` と意図的に一致させてある（REQ-39・P1。PR #220
   レビュー対応: `TrainOutcome::from_worker_stdout` がワーカー出力を
   依頼内容と照合するため。`crates/train/tests/train_contract_fixture.rs`
@@ -62,6 +62,19 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `root_handle.root_real.joinpath(*rel.parts)`。絶対パス）に合わせ、
   `request_full.json` の `root`（`/fandhe-edge-fixture-root`）と `out_dir`
   （`out`）を結合した `/fandhe-edge-fixture-root/out` にした（REQ-39・P0）。
+  `config` は `request_full.json` の `config`（`{"epochs": 2}`）と完全一致
+  させず、`kinds/c3.py::train` が実際に返す実効 config（`{**DEFAULT_CONFIG,
+  **request.config}`。`request_full.json` の `epochs: 2` で上書きした
+  `c3.DEFAULT_CONFIG`）を反映した（REQ-19・REQ-21・REQ-39・P1。codex 指摘
+  PR #220「既定値で補完された config を正常な学習結果として受理する」）。
+  `TrainOutcome::from_worker_stdout` は `config` を完全一致ではなく部分
+  一致（`request` が明示したキーの値のみ照合し、既定値補完で増えたキーは
+  許容する）で検査するため、この fixture は「`request.config` の明示キー
+  である `epochs` の値は保たれているが、他のキーは既定値のまま増えている」
+  という実際のワーカー挙動を表す。既定値の正本は学習ワーカー側（`kinds/
+  c1.py`・`kinds/c3.py` の `DEFAULT_CONFIG`）であり、本 crate 側では
+  `kind` ごとの既定値の集合を複製・検証しない（層の境界。
+  `.claude/rules/dependency-policy.md`）。
 - `result_error.json`: `cli.main(["train", "--request",
   "/tmp/does-not-exist-train-request.json"])` を実行して得た標準出力
   （終了コード 64）をそのまま採用した（生成コマンドは下記）。
@@ -85,13 +98,18 @@ OUT= '{"status": "error", "code": "invalid_request", "message": "file not readab
 ```
 
 ```console
-$ cd trainer && python3 -c "
+$ cd trainer && uv run python3 -c "
 import sys, hashlib, json
 sys.path.insert(0, 'src')
 from fandhe_edge_trainer import artifact
+from fandhe_edge_trainer.kinds import c3
 sha = hashlib.sha256(b'dummy-onnx-bytes-for-fixture').hexdigest()
+# cli.py::run_worker_train が実際に artifact へ渡す config は
+# kinds/c3.py::train が返す trained.config（= {**DEFAULT_CONFIG,
+# **request.config}）であり、request.config そのものではない。
+cfg = {**c3.DEFAULT_CONFIG, **{'epochs': 2}}
 art = artifact.build_artifact(
-    kind='c3', kind_version=1, config={'epochs': 2},
+    kind='c3', kind_version=1, config=cfg,
     label_order=['positive', 'negative', 'neutral'], output_type='choice',
     max_bytes=512, candidate_label='c3', onnx_sha256=sha,
 )

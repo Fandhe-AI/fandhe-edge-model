@@ -21,6 +21,7 @@ import pytest
 from fandhe_edge_trainer import artifact, cli, contract, limits
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
+from fandhe_edge_trainer.kinds import c3
 
 # 読み込み前にファイルサイズの上限を確認する（外部入力読み込みの作法。
 # coding-python.md）。ローカル固定 fixture だが、想定外に巨大化した場合に
@@ -214,6 +215,33 @@ def test_req21_build_artifact_matches_result_ok_fixture() -> None:
     )
     art["created_utc"] = expected["created_utc"]  # now_utc() は時刻依存のため固定する。
     assert art == expected
+
+
+def test_req19_result_ok_config_matches_c3_default_merged_with_request_full() -> None:
+    """REQ-19・REQ-21・REQ-39（codex 指摘 PR #220「既定値で補完された config
+    を正常な学習結果として受理する」）: `result_ok.json` の `artifact.config`
+    は `kinds/c3.py::train` が実際に返す実効 config
+    （`{**DEFAULT_CONFIG, **request.config}`）と一致すること。
+
+    Rust 側（`crates/train/src/result.rs::config_matches_explicit_keys`）は
+    `config` を部分一致（`request` が明示したキーのみ照合）で検査するが、
+    その部分一致検査が想定する「既定値補完済みの実際のワーカー出力」の形が
+    このテストで固定される（`result_ok.json` を手で書き換えても、
+    `kinds/c3.py::DEFAULT_CONFIG` と乖離すれば検出できる）。
+    """
+    expected_config = {**c3.DEFAULT_CONFIG, **_REQUEST_FULL["config"]}
+    assert _RESULT_OK["artifact"]["config"] == expected_config
+
+
+def test_req21_result_ok_candidate_label_matches_request_full_kind() -> None:
+    """REQ-21・REQ-39（codex 指摘 PR #220「成果物の candidate_label が依頼と
+    異なっても成功扱いになる」）: `cli.py::run_worker_train` は
+    `candidate_label=request.kind` を記録するため、`result_ok.json` の
+    `artifact.candidate_label` は `request_full.json` の `kind` と一致する
+    こと（Rust 側 `TrainOutcome::from_worker_stdout` の一致検査が想定する
+    Python 側の出力規則をここで固定する）。
+    """
+    assert _RESULT_OK["artifact"]["candidate_label"] == _REQUEST_FULL["kind"]
 
 
 def test_req21_missing_request_file_matches_result_error_fixture(

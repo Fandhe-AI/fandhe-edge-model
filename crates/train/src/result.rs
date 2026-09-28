@@ -10,13 +10,17 @@
 //! 公開の組み立て経路 [`TrainOutcome::from_worker_stdout`] は、この結果に
 //! 対応する [`crate::request::TrainRequest`] を必須で受け取り、`artifact_dir`
 //! がその `root`／`out_dir` 配下に閉じ込められていること、`kind`・
-//! `kind_version`・`config`・`label_order`・`max_bytes` が依頼内容と一致する
-//! ことを検査する（ワーカーが依頼と異なる種類・未対応の版・root 外のパスを
-//! 返しても成功扱いにしない）。`root` の symlink 解決（`std::fs::canonicalize`）
-//! を挟む点を除き照合は文字列レベルの検査に留まり、実際の FS 上の閉じ込め
-//! （dir_fd 等の多層防御）は学習ワーカー自身（`guard.py::confine`）が担う
-//! （`crates/train/src/request.rs` のモジュール doc と同じ設計。詳細は
-//! [`expected_artifact_dir`]・[`canonicalize_root_best_effort`] 参照）。
+//! `kind_version`・`label_order`・`max_bytes`・`candidate_label` が依頼内容と
+//! 一致することを検査する（ワーカーが依頼と異なる種類・未対応の版・root 外
+//! のパス・別種類を名乗る成果物を返しても成功扱いにしない）。`config` は
+//! 完全一致ではなく部分一致で検査する（[`config_matches_explicit_keys`]
+//! 参照。`kinds/c1.py`・`kinds/c3.py::train` が `kind` ごとの既定値で
+//! 補完した実効 config を返すため）。`root` の symlink 解決
+//! （`std::fs::canonicalize`）を挟む点を除き照合は文字列レベルの検査に留まり、
+//! 実際の FS 上の閉じ込め（dir_fd 等の多層防御）は学習ワーカー自身
+//! （`guard.py::confine`）が担う（`crates/train/src/request.rs` のモジュール
+//! doc と同じ設計。詳細は [`expected_artifact_dir`]・
+//! [`canonicalize_root_best_effort`] 参照）。
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -474,6 +478,22 @@ fn expected_artifact_dir(request: &TrainRequest) -> String {
 /// 比較する。フォールバックは検証を緩めない: 実在する `root` の symlink を
 /// 解決できない場合に限られ、その場合でも実際のワーカー出力との不一致は
 /// 通常どおり `runtime_error` として拒否される）。
+/// `config` の部分一致検査（REQ-19・REQ-21・REQ-39・P1。codex 指摘 PR #220）。
+///
+/// `requested` に明示されたキーはすべて `actual` に同じ値で存在することを
+/// 要求する。`requested` に無いキーが `actual` にだけ存在すること（学習
+/// ワーカーの `kind` ごとの既定値補完）は許容する。既定値の集合そのものは
+/// 本 crate では検証しない（正本は学習ワーカー側。層の境界を保つため、
+/// `kind` ごとの既定値を Rust 側へ複製しない）。
+pub(crate) fn config_matches_explicit_keys(
+    requested: &serde_json::Map<String, serde_json::Value>,
+    actual: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    requested
+        .iter()
+        .all(|(key, value)| actual.get(key) == Some(value))
+}
+
 fn canonicalize_root_best_effort(root: &str) -> String {
     match std::fs::canonicalize(root) {
         Ok(resolved) => match resolved.into_os_string().into_string() {
@@ -492,13 +512,15 @@ impl TrainOutcome {
     /// (3) 空行を除いてちょうど 1 行 → (4) JSON として解析可能 →
     /// (5) `status`／各フィールドの組み合わせが妥当 → (6) `status:"ok"` の
     /// 場合に限り、`artifact_dir` が `request` の `root`／`out_dir` 配下に
-    /// 閉じ込められていること、`kind`・`kind_version`・`config`・
-    /// `label_order`・`max_bytes` が `request` と一致することを検査する
-    /// （REQ-39 ガード層「経路の閉じ込め」「完全性と版」。ワーカーが依頼と
-    /// 異なる種類・未対応の版・root 外のパスを返しても成功扱いにしない）。
-    /// いずれかを満たさない場合は `TrainResultError`（呼び出し元は
-    /// `reason_code()=="runtime_error"`・`exit_code()==RuntimeError` として
-    /// 扱う。#178 の対象）。
+    /// 閉じ込められていること、`kind`・`kind_version`・`label_order`・
+    /// `max_bytes`・`candidate_label` が `request` と一致すること、`config`
+    /// が `request` の明示キーと部分一致すること（[`config_matches_explicit_keys`]。
+    /// `kind` ごとの既定値補完で増えたキーは許容する）を検査する（REQ-39
+    /// ガード層「経路の閉じ込め」「完全性と版」。ワーカーが依頼と異なる
+    /// 種類・未対応の版・root 外のパス・別種類を名乗る成果物を返しても
+    /// 成功扱いにしない）。いずれかを満たさない場合は `TrainResultError`
+    /// （呼び出し元は `reason_code()=="runtime_error"`・
+    /// `exit_code()==RuntimeError` として扱う。#178 の対象）。
     ///
     /// `request` はこの標準出力を生成した学習ワーカーへ実際に渡したリクエスト
     /// でなければならない（呼び出し元の責務。本関数は同一性を検証しない）。
@@ -570,7 +592,22 @@ impl TrainOutcome {
                         field: "kind_version",
                     });
                 }
-                if raw_artifact.config != *request.config() {
+                // `config` は部分一致で検査する（REQ-19・REQ-21・REQ-39・P1。
+                // codex 指摘 PR #220）: `kinds/c1.py`・`kinds/c3.py::train` は
+                // `{**DEFAULT_CONFIG, **request.config}` で `kind` ごとの既定値を
+                // 補完した実効 config を `trained.config` として返し、
+                // `cli.py::run_worker_train` はその値を成果物へ記録する。
+                // そのため `config` を省略した・一部だけ指定したリクエストでは
+                // 成果物の `config` がリクエストと完全一致しない（既定値の
+                // 分だけキーが増える）のが正しい挙動であり、完全一致を要求
+                // すると正常な成功結果まで拒否してしまう。
+                // `kind` ごとの既定値は学習ワーカー側が正本（本 crate・
+                // `fandhe-edge-core` で二重管理しない。層の境界。
+                // `.claude/rules/dependency-policy.md`）ため、Rust 側では
+                // 「リクエストが明示したキーの値が成果物でも保たれていること」
+                // だけを検査する（部分一致）。リクエストが明示していない
+                // キーは、既定値補完によって成果物側に新規に現れてよい。
+                if !config_matches_explicit_keys(request.config(), &raw_artifact.config) {
                     return Err(TrainResultError::ArtifactMismatch { field: "config" });
                 }
                 if raw_artifact.max_bytes != request.max_bytes() {
@@ -604,8 +641,14 @@ impl TrainOutcome {
                         field: "selector_version",
                     });
                 }
-                if raw_artifact.candidate_label.is_empty() {
-                    return Err(TrainResultError::MalformedArtifact {
+                // 依頼内容との一致（REQ-21・REQ-39・P1。codex 指摘 PR #220）:
+                // `cli.py::run_worker_train` は `candidate_label=request.kind`
+                // を記録する（`artifact.py` モジュール doc「複数候補からの
+                // 選定は行わないため `candidate_label` は `kind` と同じ」）。
+                // 非空性だけの検査では、依頼と異なる種類を名乗る成果物まで
+                // 成功扱いにしてしまう。
+                if raw_artifact.candidate_label != request.kind() {
+                    return Err(TrainResultError::ArtifactMismatch {
                         field: "candidate_label",
                     });
                 }
@@ -930,14 +973,90 @@ mod tests {
         ));
     }
 
-    /// REQ-39・P1: `config` が依頼内容と異なる場合は成功扱いにしない。
+    /// `test_request()` と同じ内容だが `config` を差し替えたリクエストを作る
+    /// （`config` 部分一致検査の検証用）。
+    fn test_request_with_config(
+        config: serde_json::Map<String, serde_json::Value>,
+    ) -> TrainRequest {
+        TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config,
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: "/fandhe-edge-fixture-root".to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: None,
+            rss_limit_bytes: None,
+        })
+        .expect("test request params must be valid")
+    }
+
+    /// REQ-19・REQ-21・REQ-39・P1（codex 指摘 PR #220）: リクエストが明示した
+    /// `config` のキーが成果物で書き換わっている場合は成功扱いにしない
+    /// （`kind` ごとの既定値補完の陰に、依頼したハイパーパラメータの書き換え
+    /// を隠せてはいけない）。
     #[test]
-    fn req39_rejects_artifact_config_mismatching_request() {
+    fn req39_rejects_artifact_config_mismatching_explicit_request_key() {
+        let mut requested = serde_json::Map::new();
+        requested.insert("epochs".to_string(), serde_json::json!(2));
+        let request = test_request_with_config(requested);
+
         let json = VALID_OK_JSON.replace(r#""config":{}"#, r#""config":{"epochs":99}"#);
-        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &request).unwrap_err();
         assert!(matches!(
             err,
             TrainResultError::ArtifactMismatch { field: "config" }
+        ));
+    }
+
+    /// REQ-18・REQ-19・REQ-21・REQ-39・P1（codex 指摘 PR #220）: `config` を
+    /// 省略した・一部だけ指定したリクエストでは、`kinds/c1.py`・
+    /// `kinds/c3.py::train` が `kind` ごとの既定値で補完した実効 config
+    /// （リクエストに無いキーを含む）を成果物へ記録する。この既定値補完済み
+    /// の `config` は、リクエストが明示したキーの値さえ保たれていれば
+    /// 成功扱いにする（部分一致。完全一致を要求すると正常な学習結果を
+    /// `runtime_error` として拒否してしまっていた）。
+    #[test]
+    fn req39_accepts_artifact_config_with_kind_default_filled_keys() {
+        let mut requested = serde_json::Map::new();
+        requested.insert("epochs".to_string(), serde_json::json!(2));
+        let request = test_request_with_config(requested);
+
+        // ワーカーが `{**DEFAULT_CONFIG, **request.config}` で補完した実効
+        // config を模した値（リクエストに無い `lr`・`batch_size` を含む）。
+        let json = VALID_OK_JSON.replace(
+            r#""config":{}"#,
+            r#""config":{"epochs":2,"lr":0.001,"batch_size":64}"#,
+        );
+        let outcome = TrainOutcome::from_worker_stdout(json.as_bytes(), &request)
+            .expect("kind-default-filled config must be accepted when explicit keys match");
+        match outcome {
+            TrainOutcome::Ok(success) => {
+                assert_eq!(
+                    success.artifact().config().get("lr"),
+                    Some(&serde_json::json!(0.001))
+                );
+            }
+            TrainOutcome::Error(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// REQ-21・REQ-39・P1（codex 指摘 PR #220）: `candidate_label` が依頼した
+    /// `kind` と異なる場合は成功扱いにしない
+    /// （`cli.py::run_worker_train` は `candidate_label=request.kind` を記録する）。
+    #[test]
+    fn req39_rejects_artifact_candidate_label_mismatching_request_kind() {
+        let json = VALID_OK_JSON.replace(r#""candidate_label":"c3""#, r#""candidate_label":"c1""#);
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        assert!(matches!(
+            err,
+            TrainResultError::ArtifactMismatch {
+                field: "candidate_label"
+            }
         ));
     }
 

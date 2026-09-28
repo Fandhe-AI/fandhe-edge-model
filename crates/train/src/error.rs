@@ -246,12 +246,17 @@ pub enum TrainResultError {
     InvalidFailureCode,
     /// `message` が上限（4 KiB）を超える。
     FailureMessageTooLong,
-    /// 成果物の `kind`／`kind_version`／`config`／`label_order`／`max_bytes`
-    /// が、この結果に対応する [`crate::request::TrainRequest`] の値と一致
-    /// しない（REQ-39 ガード層「完全性と版」・REQ-21 入出力契約。ワーカーが
-    /// 依頼と異なる種類・未対応の版を返しても成功扱いにしないための検査。
+    /// 成果物の `kind`／`kind_version`／`label_order`／`max_bytes`／
+    /// `candidate_label` が、この結果に対応する
+    /// [`crate::request::TrainRequest`] の値と完全一致しない（REQ-39 ガード層
+    /// 「完全性と版」・REQ-21 入出力契約。ワーカーが依頼と異なる種類・
+    /// 未対応の版・別種類を名乗る成果物を返しても成功扱いにしないための検査。
     /// `kind` ごとの許可版一覧は本 crate の対象外〔未確定。PR #220 参照〕
-    /// のため、ここでは「依頼内容と一致するか」だけを検査する）。
+    /// のため、ここでは「依頼内容と一致するか」だけを検査する）。`config`
+    /// のみ部分一致（`request` が明示したキーの値一致。`kind` ごとの既定値
+    /// 補完で増えたキーは許容する。
+    /// [`crate::result::config_matches_explicit_keys`] 参照。codex 指摘
+    /// PR #220「既定値で補完された config を正常な学習結果として受理する」）。
     ArtifactMismatch { field: &'static str },
 }
 

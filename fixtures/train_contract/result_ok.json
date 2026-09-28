@@ -5,7 +5,16 @@
     "kind": "c3",
     "kind_version": 1,
     "selector_version": "0.1",
-    "config": { "epochs": 2 },
+    "config": {
+      "lr": 0.001,
+      "weight_decay": 0.0001,
+      "epochs": 2,
+      "batch_size": 64,
+      "emb": 64,
+      "filters": 128,
+      "widths": [3, 5, 7],
+      "dropout": 0.3
+    },
     "label_order": ["positive", "negative", "neutral"],
     "output_type": "choice",
     "max_bytes": 512,
