@@ -14,6 +14,8 @@
 //!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
 //!   （ケース 7〜12。矛盾・ラベル順序・未出現クラス・不正なスコア・
 //!   全件保留・全件失敗）で全 12 ケースの挙動を固定済み
+//! - [`preprocess_boundary`][]: 空入力の前処理食い違いの検知・報告
+//!   （REQ-23 境界値・TASK-23.2・issue #57）
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -69,5 +71,6 @@ pub mod eval_input;
 pub mod inspect;
 mod json_keys;
 pub mod leak;
+pub mod preprocess_boundary;
 pub mod report;
 pub mod split;
