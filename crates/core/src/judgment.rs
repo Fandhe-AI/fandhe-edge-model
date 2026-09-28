@@ -10,7 +10,9 @@
 //! こと）が exitcode モジュールとは別だからである（PR #202 レビュー指摘
 //! で選択肢数の上限・合計・argmax 一致の検証を追加し、その後のレビュー
 //! 指摘で argmax 比較の許容差を除去し、選択肢 ID 長・合計長の上限検証を
-//! 追加）。
+//! 追加。さらに後続のレビュー指摘（P1）で `JudgmentError::exit_code()` の
+//! 定義ファイル由来の不正〔`EmptyOptions`・`EmptyChoiceId`・
+//! `DuplicateChoiceId`〕を `RuntimeError` から `InvalidInput` へ修正した）。
 //!
 //! # 呼び出し文脈
 //!
@@ -223,22 +225,46 @@ impl fmt::Display for JudgmentError {
 impl std::error::Error for JudgmentError {}
 
 impl JudgmentError {
-    /// REQ-21 の終了コードへの写像。入力 ID の不正（利用者が直せる外部入
-    /// 力の誤り）は `InvalidInput`、選択肢数・選択肢 ID 長の上限超過
-    /// （REQ-39 資源の上限）は `LimitExceeded`、それ以外（ランタイムが返
-    /// すスコアと定義ファイルの不整合等、呼び出し側のバグに近い状態）は
-    /// `RuntimeError` とする。
+    /// REQ-21 の終了コードへの写像。3 分類に従う（PR #202 レビュー指摘・
+    /// P1。旧実装は定義ファイル由来の不正〔`EmptyOptions`・
+    /// `EmptyChoiceId`・`DuplicateChoiceId`〕を `RuntimeError` に誤分類し
+    /// ていた）。
+    ///
+    /// 1. 利用者が直せる外部入力（定義ファイル・入力 ID）の不正 →
+    ///    `InvalidInput`（64）。[`crate::definition::DefinitionError::exit_code`]
+    ///    が `EmptyOptions`・`EmptyOptionId`・`DuplicateOptionId` を
+    ///    `InvalidInput` にしている前例に揃える
+    /// 2. REQ-39 資源の上限超過 → `LimitExceeded`（20）
+    /// 3. 推論ランタイムの出力と定義の不整合・内部エラー →
+    ///    `RuntimeError`（70）
+    ///
+    /// `#[non_exhaustive]` な enum だが、定義している本 crate 内では網羅的
+    /// な `match` を書ける。ワイルドカード `_ =>` は使わない
+    /// （`exitcode.rs` が PoC-16 の `_ => "unknown"` を排除した方針に揃え
+    /// る）。新しい variant を追加すると、この `match` がコンパイルエラー
+    /// になり分類漏れに気付ける。
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
-            JudgmentError::EmptyInputId | JudgmentError::InputIdTooLong { .. } => {
-                ExitCode::InvalidInput
-            }
+            // 1. 利用者が直せる外部入力の不正。
+            JudgmentError::EmptyOptions
+            | JudgmentError::EmptyChoiceId
+            | JudgmentError::DuplicateChoiceId { .. }
+            | JudgmentError::EmptyInputId
+            | JudgmentError::InputIdTooLong { .. } => ExitCode::InvalidInput,
+            // 2. REQ-39 資源の上限超過。
             JudgmentError::TooManyOptions { .. }
             | JudgmentError::ChoiceIdTooLong { .. }
-            | JudgmentError::PredictedChoiceIdTooLong { .. }
-            | JudgmentError::TotalChoiceIdBytesExceeded { .. } => ExitCode::LimitExceeded,
-            _ => ExitCode::RuntimeError,
+            | JudgmentError::TotalChoiceIdBytesExceeded { .. }
+            | JudgmentError::PredictedChoiceIdTooLong { .. } => ExitCode::LimitExceeded,
+            // 3. 推論ランタイムの出力と定義の不整合・内部エラー。
+            JudgmentError::ScoreCountMismatch { .. }
+            | JudgmentError::NonFiniteScore { .. }
+            | JudgmentError::ScoreOutOfRange { .. }
+            | JudgmentError::ScoreSumNotOne { .. }
+            | JudgmentError::UnknownPredictedChoice { .. }
+            | JudgmentError::PredictedChoiceNotArgmax { .. }
+            | JudgmentError::Serialize(_) => ExitCode::RuntimeError,
         }
     }
 }
@@ -725,10 +751,30 @@ mod tests {
         assert_eq!(parsed["id"], raw_id);
     }
 
-    /// REQ-21: `exit_code()` の写像（入力 ID の不正 → 64、選択肢数の上限
-    /// 超過 → 20、それ以外 → 70）。
+    /// REQ-21・REQ-39: `exit_code()` の 3 分類写像（定義・入力 ID の不正
+    /// → 64、資源の上限超過 → 20、推論出力の不整合・内部エラー → 70）。
+    /// PR #202 レビュー指摘（P1）: `EmptyOptions`・`EmptyChoiceId`・
+    /// `DuplicateChoiceId` は定義ファイル由来の不正のため `InvalidInput`
+    /// に分類する（旧実装は `RuntimeError` に誤分類していた）。
     #[test]
     fn req21_error_exit_code_mapping() {
+        // 1. 利用者が直せる外部入力（定義ファイル・入力 ID）の不正 → 64。
+        assert_eq!(
+            JudgmentError::EmptyOptions.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(ExitCode::InvalidInput.code(), 64);
+        assert_eq!(
+            JudgmentError::EmptyChoiceId.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(
+            JudgmentError::DuplicateChoiceId {
+                id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::InvalidInput
+        );
         assert_eq!(
             JudgmentError::EmptyInputId.exit_code(),
             ExitCode::InvalidInput
@@ -741,6 +787,8 @@ mod tests {
             .exit_code(),
             ExitCode::InvalidInput
         );
+
+        // 2. REQ-39 資源の上限超過 → 20。
         assert_eq!(
             JudgmentError::TooManyOptions {
                 len: MAX_OPTIONS + 1,
@@ -749,10 +797,33 @@ mod tests {
             .exit_code(),
             ExitCode::LimitExceeded
         );
+        assert_eq!(ExitCode::LimitExceeded.code(), 20);
         assert_eq!(
-            JudgmentError::EmptyOptions.exit_code(),
-            ExitCode::RuntimeError
+            JudgmentError::ChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
         );
+        assert_eq!(
+            JudgmentError::TotalChoiceIdBytesExceeded {
+                len: MAX_TOTAL_CHOICE_ID_BYTES + 1,
+                limit: MAX_TOTAL_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+        assert_eq!(
+            JudgmentError::PredictedChoiceIdTooLong {
+                len: MAX_CHOICE_ID_BYTES + 1,
+                limit: MAX_CHOICE_ID_BYTES
+            }
+            .exit_code(),
+            ExitCode::LimitExceeded
+        );
+
+        // 3. 推論ランタイムの出力と定義の不整合・内部エラー → 70。
         assert_eq!(
             JudgmentError::ScoreCountMismatch {
                 expected: 1,
@@ -761,11 +832,42 @@ mod tests {
             .exit_code(),
             ExitCode::RuntimeError
         );
+        assert_eq!(ExitCode::RuntimeError.code(), 70);
+        assert_eq!(
+            JudgmentError::NonFiniteScore {
+                choice_id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::ScoreOutOfRange {
+                choice_id: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::ScoreSumNotOne { sum: 0.5 }.exit_code(),
+            ExitCode::RuntimeError
+        );
         assert_eq!(
             JudgmentError::UnknownPredictedChoice {
                 id: "z".to_string()
             }
             .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::PredictedChoiceNotArgmax {
+                predicted: "b".to_string(),
+                expected: "a".to_string()
+            }
+            .exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            JudgmentError::Serialize("boom".to_string()).exit_code(),
             ExitCode::RuntimeError
         );
     }
@@ -869,10 +971,9 @@ mod tests {
     }
 
     /// REQ-21・PR #202 レビュー指摘（P1）: argmax の追跡は許容差なしの厳密
-    /// な大小比較で行う。差が `ARGMAX_TIE_TOLERANCE`（旧定数。許容差比較）
-    /// 未満でも、より高いスコアの選択肢を argmax として扱う（先頭
-    /// 0.4999999997・次点 0.5000000003 のように差が 1e-9 未満でも後者が
-    /// 真の最高値であるケース）。
+    /// な大小比較で行う。差が 1e-9 未満でも、より高いスコアの選択肢を
+    /// argmax として扱う（先頭 0.4999999997・次点 0.5000000003 のように差
+    /// が 1e-9 未満でも後者が真の最高値であるケース）。
     #[test]
     fn req21_argmax_uses_strict_comparison_not_tolerance() {
         let options = [choice("a"), choice("b")];
