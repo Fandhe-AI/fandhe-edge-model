@@ -1087,6 +1087,11 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # 範囲外の値をすべて「確実に範囲外になる」正の値（VOCAB_SIZE）へ
     # 統一することで、負値・特殊 ID・VOCAB_SIZE 以上のいずれも同じ
     # fail-closed な `Gather` 失敗に帰着させる。
+    #
+    # このガードは「範囲外 Gather はエラーになる」という前提（下の
+    # embed_table への `Gather` 直前のコメント参照）に依存する。その前提の
+    # 根拠・適用範囲・多層防御としての位置づけは、同コメントへ集約する
+    # （Cursor Medium 指摘）。
     nodes.append(helper.make_node("GreaterOrEqual", ["ids_trunc", "zero_scalar"], ["id_ge_zero"]))
     nodes.append(helper.make_node("Less", ["ids_trunc", "max_input_id_plus_1"], ["id_lt_sep"]))
     nodes.append(helper.make_node("And", ["id_ge_zero", "id_lt_sep"], ["id_in_range"]))
@@ -1109,7 +1114,9 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # （常に 0）を `n_vec` へ加算して `n_vec_checked` を作り、以降の
     # 形状計算をすべてこちら経由にすることで、グラフ最適化による
     # デッドコード除去でガードが消えない（`n_vec_checked` は最終出力
-    # `probs` の形状計算へ直結する依存経路に乗る）。
+    # `probs` の形状計算へ直結する依存経路に乗る）。「範囲外 Gather は
+    # エラーになる」という前提の根拠・適用範囲は、下の embed_table への
+    # `Gather` 直前のコメントへ集約する（Cursor Medium 指摘）。
     nodes.append(helper.make_node("Gather", ["n_guard_table", "n_vec"], ["n_guard_zero"], axis=0))
     nodes.append(helper.make_node("Add", ["n_vec", "n_guard_zero"], ["n_vec_checked"]))
 
@@ -1199,11 +1206,30 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
     # 推論ランタイム・ガード層側の将来対応としていたが、グラフ内で
     # fail-closed にする方針へ変更した）。
     #
-    # ただし、この `Gather` の失敗は `runtime_error`（exit 70）にしか
-    # ならず、機械可読な `invalid_input` エラーにはならない。推論
-    # ランタイム・ガード層（REQ-39。パス未確定）側でも、`ids` の値域
-    # （`[0, MAX_INPUT_ID]` 外）と `N`（`n_max` 超過）を事前に
-    # `invalid_input` として拒否すべき点は変わらない。
+    # 上記の `ids` 値域ガード・`N` 上限ガードは、いずれも「範囲外
+    # インデックスの `Gather` はエラーになる」ことを安全側の前提にしている
+    # （Cursor Medium 指摘。この前提の根拠・適用範囲・多層防御としての
+    # 位置づけを次の 3 点として明記する）。
+    #
+    # (a) 根拠: ONNX の `Gather` 演算子仕様（opset 13。opset 1 以来不変）は
+    #     "It is an error if any of the index values are out of bounds"
+    #     と明記しており、範囲外インデックスの挙動は実装依存の未規定
+    #     ではなく仕様違反（エラーにすべき条件）として定義されている。
+    #     onnx.reference は実際に `IndexError` を送出する（本ファイルの
+    #     `tests/test_ar_ids_range.py` で実測確認済み）。
+    # (b) 適用範囲: 配布先の推論ランタイムは CPU 上の ONNX Runtime（`ort`
+    #     crate）を前提とし、CPU Execution Provider は上記仕様どおり
+    #     エラーを返す（本ワーカーは学習側であり `ort` を持たないため
+    #     onnx.reference までが実機未検証の範囲。証拠種別: テスト
+    #     ハーネス）。仕様に厳密に従わない Execution Provider（一部の
+    #     GPU EP 等、範囲外インデックスを clamp・wrap する可能性がある
+    #     実装）への依存は本ガードの前提外とする。
+    # (c) 位置づけ: 本ガードはグラフ内での fail-closed な多層防御の
+    #     一層であり、これに加えて推論ランタイム・ガード層（REQ-39。
+    #     パス未確定）が推論の入口で `ids` の値域（`[0, MAX_INPUT_ID]`
+    #     外）と `N`（`n_max` 超過）を `invalid_input` として事前検査
+    #     する必要がある（本ガードの `Gather` 失敗は `runtime_error`・
+    #     exit 70 にしかならず、機械可読な入力エラーにはならないため）。
     nodes.append(helper.make_node("Gather", ["embed_table", "full_ids_2d"], ["token_emb"], axis=0))
     nodes.append(helper.make_node("Gather", ["pos_table", "pos_i64"], ["pos_emb"], axis=0))
     nodes.append(helper.make_node("Add", ["token_emb", "pos_emb"], ["h0"]))
