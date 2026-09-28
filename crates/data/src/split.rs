@@ -141,7 +141,13 @@ impl SplitRatios {
 
 /// 1 ラベルあたりの group 件数の割付内訳（[`crate::split_record`]・#45 が
 /// 分割規則の記録に使う）。
+///
+/// `deny_unknown_fields` を指定し、[`crate::split_record`] の
+/// `SplitRecordDto` 経由で外部 JSON から復元する際、`per_label` の要素に
+/// 余分なキーが混入しても黙って無視せず拒否する（他の永続化用 DTO と
+/// 同じ厳格構造検証の契約。coding-rust.md「外部入力」）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LabelAllocation {
     pub label: String,
     pub n_groups: usize,

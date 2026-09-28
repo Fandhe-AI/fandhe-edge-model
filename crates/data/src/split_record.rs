@@ -57,10 +57,31 @@ const HASH_INPUT_RULE: &str = "canonical-json-sorted-record-ids-v1";
 /// 呼び出しから作られると、記録の seed・比率が実際の分割と食い違う誤用が
 /// 起こりうる。[`split_and_record`] だけがこの型を作れるようにし、両者が
 /// 常に同じ入力（`records`・`seed`・`ratios`）から生成されたことを型で保証する。
+///
+/// フィールドは非公開にし、[`RecordedSplit::result`]・[`RecordedSplit::record`]
+/// の読み取り専用アクセサのみを公開する。フィールドを `pub` にすると、
+/// 呼び出し側が対応しない `SplitResult` と `SplitRecord` を組み合わせて
+/// 新しい `RecordedSplit` を組み立てられてしまい、上記の対応保証を型で
+/// 強制できなくなるため（レビュー指摘。#210 Cursor Bugbot Medium）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedSplit {
-    pub result: SplitResult,
-    pub record: SplitRecord,
+    result: SplitResult,
+    record: SplitRecord,
+}
+
+impl RecordedSplit {
+    /// `split_and_record` に渡した `records`・`seed`・`ratios` そのものの
+    /// 分割結果（メモリ上の割付。[`crate::split::SplitResult`]）。
+    #[must_use]
+    pub fn result(&self) -> &SplitResult {
+        &self.result
+    }
+
+    /// 上記 `result` と対応する記録（seed・規則・各分割のハッシュ）。
+    #[must_use]
+    pub fn record(&self) -> &SplitRecord {
+        &self.record
+    }
 }
 
 /// 分割の seed・規則・各分割のハッシュを保持する記録（REQ-17）。
@@ -659,6 +680,26 @@ impl SplitRecordDto {
                 reason: "rule.ratios do not form a valid SplitRatios (range/NaN/sum)",
             })?;
 
+        // `per_label` の各エントリの `n_groups` が `train + validation + test`
+        // と一致することを検証する。`group_count`（split 単位の合計）の
+        // 整合性は `digest_from_dto` で検査済みだが、`per_label`（ラベル単位の
+        // 内訳）はここでしか読まないため、改ざんされた割付表（合計が
+        // `n_groups` と食い違う値）が `verify_against` 実行まで検出されずに
+        // 素通りしてしまう（レビュー指摘。#210 Cursor Bugbot Low）。
+        // `usize` の加算は `checked_add` で行い、外部入力由来の値でオーバー
+        // フローしても panic せず拒否する（coding-rust.md「外部入力」）。
+        for allocation in &self.rule.per_label {
+            let sum = allocation
+                .train
+                .checked_add(allocation.validation)
+                .and_then(|partial| partial.checked_add(allocation.test));
+            if sum != Some(allocation.n_groups) {
+                return Err(SplitRecordError::InvalidRecord {
+                    reason: "per_label allocation train + validation + test does not equal n_groups",
+                });
+            }
+        }
+
         let train = digest_from_dto(self.splits.train)?;
         let validation = digest_from_dto(self.splits.validation)?;
         let test = digest_from_dto(self.splits.test)?;
@@ -806,10 +847,10 @@ mod tests {
         let ratios = SplitRatios::default();
 
         let recorded = split_and_record(&records, 7, &ratios).expect("valid ratios");
-        let record = recorded.record;
+        let record = recorded.record().clone();
 
         assert_eq!(record.seed(), 7);
-        assert_eq!(record.rule().rule_id(), recorded.result.rule_id);
+        assert_eq!(record.rule().rule_id(), recorded.result().rule_id);
 
         let train = record.digest(Split::Train);
         assert_eq!(train.record_ids(), ["r3", "r5", "r7"]);
@@ -844,14 +885,14 @@ mod tests {
             split_and_record(&records, 0, &SplitRatios::default()).expect("valid ratios");
 
         for split in [Split::Train, Split::Validation, Split::Test] {
-            let digest = recorded.record.digest(split);
+            let digest = recorded.record().digest(split);
             assert!(digest.record_ids().is_empty());
             assert_eq!(
                 digest.sha256(),
                 "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
             );
         }
-        assert!(recorded.record.verify_hashes().is_ok());
+        assert!(recorded.record().verify_hashes().is_ok());
     }
 
     /// REQ-17・TASK-17.1-2: `to_json` → `from_json_str` で内容が保たれ、
@@ -866,19 +907,22 @@ mod tests {
         let recorded =
             split_and_record(&records, 42, &SplitRatios::default()).expect("valid ratios");
 
-        let json_1 = recorded.record.to_json().expect("直列化に失敗しないはず");
-        let json_2 = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json_1 = recorded.record().to_json().expect("直列化に失敗しないはず");
+        let json_2 = recorded.record().to_json().expect("直列化に失敗しないはず");
         assert_eq!(json_1, json_2, "to_json の出力が決定的でない");
 
         let restored = SplitRecord::from_json_str(&json_1).expect("復元に失敗しないはず");
-        assert_eq!(restored.seed(), recorded.record.seed());
-        assert_eq!(restored.rule().rule_id(), recorded.record.rule().rule_id());
+        assert_eq!(restored.seed(), recorded.record().seed());
+        assert_eq!(
+            restored.rule().rule_id(),
+            recorded.record().rule().rule_id()
+        );
         assert_eq!(
             restored.rule().per_label(),
-            recorded.record.rule().per_label()
+            recorded.record().rule().per_label()
         );
 
-        let original_ratios = recorded.record.rule().ratios();
+        let original_ratios = recorded.record().rule().ratios();
         let restored_ratios = restored.rule().ratios();
         assert!((original_ratios.train - restored_ratios.train).abs() < 1e-9);
         assert!((original_ratios.validation - restored_ratios.validation).abs() < 1e-9);
@@ -887,11 +931,11 @@ mod tests {
         for split in [Split::Train, Split::Validation, Split::Test] {
             assert_eq!(
                 restored.digest(split).record_ids(),
-                recorded.record.digest(split).record_ids()
+                recorded.record().digest(split).record_ids()
             );
             assert_eq!(
                 restored.digest(split).sha256(),
-                recorded.record.digest(split).sha256()
+                recorded.record().digest(split).sha256()
             );
         }
         assert!(restored.verify_hashes().is_ok());
@@ -911,10 +955,10 @@ mod tests {
         let recorded = split_and_record(&records, 99, &ratios).expect("valid ratios");
 
         let reproduced = recorded
-            .record
+            .record()
             .verify_against(&records)
             .expect("同じ入力での再分割は一致するはず");
-        assert_eq!(reproduced, recorded.result);
+        assert_eq!(reproduced, *recorded.result());
     }
 
     /// REQ-17・TASK-17.1-2: レコードを 1 件足す（group を追加する）と、
@@ -933,7 +977,7 @@ mod tests {
         changed_records.push(record("r4", "g4", "b"));
 
         let err = recorded
-            .record
+            .record()
             .verify_against(&changed_records)
             .expect_err("group を追加すると割付が変わるはず");
         assert!(matches!(
@@ -956,12 +1000,12 @@ mod tests {
         ];
         let recorded =
             split_and_record(&records, 7, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         // test split の record_ids の末尾（辞書順で最大）の ID を、まだ使われて
         // いない・かつソート順を保ったままの ID（"zzz-tampered" は他のどの
         // レコード ID よりも辞書順で大きい）へ書き換える（record_count は保つ）。
-        let test_ids = recorded.record.digest(Split::Test).record_ids().to_vec();
+        let test_ids = recorded.record().digest(Split::Test).record_ids().to_vec();
         let target = test_ids.last().cloned().unwrap_or_default();
         let tampered_json = json.replacen(&format!("\"{target}\""), "\"zzz-tampered\"", 1);
         assert_ne!(
@@ -987,7 +1031,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         if let Some(obj) = value.as_object_mut() {
             obj.insert("unexpected_field".to_string(), serde_json::json!(true));
@@ -999,13 +1043,41 @@ mod tests {
         assert!(matches!(err, SplitRecordError::Json));
     }
 
+    /// レビュー指摘（#210 codex-review P2 / Cursor Bugbot Low）の回帰テスト:
+    /// `per_label`（`LabelAllocation`）の要素に混入した未知のフィールドも、
+    /// 他の永続化用 DTO と同じく拒否される（`LabelAllocation` への
+    /// `deny_unknown_fields` 追加の受け入れ条件）。
+    #[test]
+    fn req17_task17_1_2_rejects_unknown_field_in_per_label_entry() {
+        let records = vec![record("r1", "g1", "a")];
+        let recorded =
+            split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let per_label = value
+            .get_mut("rule")
+            .and_then(|r| r.get_mut("per_label"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("per_label が存在するはず");
+        let first = per_label
+            .first_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("per_label は少なくとも 1 件のはず");
+        first.insert("unexpected_field".to_string(), serde_json::json!(true));
+        let tampered = serde_json::to_string(&value).expect("直列化に失敗しないはず");
+
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("per_label 要素の未知フィールドは拒否されるはず");
+        assert!(matches!(err, SplitRecordError::Json));
+    }
+
     /// REQ-17・TASK-17.1-2（形式の異常）: `schema_version` の不一致は拒否される。
     #[test]
     fn req17_task17_1_2_rejects_unsupported_schema_version() {
         let records = vec![record("r1", "g1", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         if let Some(obj) = value.as_object_mut() {
             obj.insert("schema_version".to_string(), serde_json::json!(2));
@@ -1022,7 +1094,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         // 大文字混入。
         let uppercase = replace_first_sha256_with(&json, &"A".repeat(64));
@@ -1059,7 +1131,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         if let Some(train) = value
             .get_mut("splits")
@@ -1081,7 +1153,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a"), record("r2", "g2", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         // train の record_ids を未ソートに書き換える。
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
@@ -1104,7 +1176,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a"), record("r2", "g2", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let train_ids = value["splits"]["train"]["record_ids"].clone();
@@ -1132,7 +1204,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a")];
         let recorded =
             split_and_record(&records, 1, &SplitRatios::default()).expect("valid ratios");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         for bad_train in ["NaN", "abc"] {
             let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
@@ -1196,7 +1268,7 @@ mod tests {
 
         for ratios in cases {
             let recorded = split_and_record(&records, 1, &ratios).expect("valid ratios");
-            let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+            let json = recorded.record().to_json().expect("直列化に失敗しないはず");
             let restored = SplitRecord::from_json_str(&json).expect("復元に失敗しないはず");
             let restored_ratios = restored.rule().ratios();
 
@@ -1226,7 +1298,7 @@ mod tests {
         changed_records.push(record("r5", "g5", "b"));
 
         let err = recorded
-            .record
+            .record()
             .verify_against(&changed_records)
             .expect_err("group を追加すると不一致になるはず");
         let message = err.to_string();
@@ -1268,7 +1340,7 @@ mod tests {
         let records = vec![record("r1", "g1", "a")];
         let recorded = split_and_record(&records, 1, &SplitRatios::default())
             .expect("1 件でも既定比率で分割できるはず");
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
 
         // 1 件のレコードは 1 つの split にしか割り付けられないため、他の
         // 2 split は record_count: 0 のはず（この改ざんの前提。
@@ -1323,7 +1395,7 @@ mod tests {
         let recorded = split_and_record(&records, 7, &SplitRatios::default())
             .expect("既定比率で分割できるはず");
 
-        let json = recorded.record.to_json().expect("直列化に失敗しないはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
         let mut value: serde_json::Value =
             serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
         let test_split = value
@@ -1356,5 +1428,76 @@ mod tests {
             err,
             SplitRecordError::SplitMismatch { split: Split::Test }
         ));
+    }
+
+    /// レビュー指摘（#210 Cursor Bugbot Low）の回帰テスト: `per_label` の
+    /// 1 エントリで `train + validation + test != n_groups` に改ざんすると、
+    /// `record_ids` 単体からは検出できない矛盾を `from_json_str` が拒否する
+    /// （`InvalidRecord` で fail-closed。`verify_against` 実行を待たない）。
+    #[test]
+    fn req17_task17_1_2_from_json_rejects_per_label_sum_mismatch() {
+        let records = vec![
+            record("r1", "g1", "a"),
+            record("r2", "g2", "a"),
+            record("r3", "g3", "b"),
+            record("r4", "g4", "b"),
+        ];
+        let recorded = split_and_record(&records, 7, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+        let json = recorded.record().to_json().expect("直列化に失敗しないはず");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("直列化した JSON は解析できるはず");
+        let per_label = value
+            .get_mut("rule")
+            .and_then(|r| r.get_mut("per_label"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("per_label が存在するはず");
+        let first = per_label
+            .first_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("per_label は少なくとも 1 件のはず");
+        // `n_groups` を保ったまま `train` だけを 1 件水増しし、
+        // `train + validation + test` が `n_groups` と食い違う状態にする
+        // （`record_ids`・`group_count` は一切変えないため、他の検証では
+        // 検出できない改ざん）。
+        let original_train = first
+            .get("train")
+            .and_then(serde_json::Value::as_u64)
+            .expect("train は数値のはず");
+        first.insert(
+            "train".to_string(),
+            serde_json::json!(original_train.saturating_add(1)),
+        );
+        let tampered = serde_json::to_string(&value).expect("再直列化に失敗しないはず");
+
+        let err = SplitRecord::from_json_str(&tampered)
+            .expect_err("per_label の内訳合計が n_groups と食い違う場合は拒否されるはず");
+        assert!(matches!(
+            err,
+            SplitRecordError::InvalidRecord {
+                reason: "per_label allocation train + validation + test does not equal n_groups"
+            }
+        ));
+    }
+
+    /// レビュー指摘（#210 Cursor Bugbot Medium）の回帰テスト:
+    /// `RecordedSplit` のフィールドが非公開のため、対応しない
+    /// `SplitResult` と `SplitRecord` の組み合わせを外部から組み立てられない
+    /// （型で保証する契約。アクセサ経由でのみ参照できることを確認する）。
+    #[test]
+    fn req17_task17_1_2_recorded_split_fields_are_read_only_via_accessors() {
+        let records = vec![record("r1", "g1", "a"), record("r2", "g2", "a")];
+        let recorded = split_and_record(&records, 1, &SplitRatios::default())
+            .expect("既定比率で分割できるはず");
+
+        // アクセサ経由の参照が split_by_group 由来の同一結果を指す
+        // （`result()`・`record()` はいずれも読み取り専用の `&` 参照であり、
+        // 呼び出し側が `RecordedSplit { result: ..., record: ... }` の形で
+        // 不整合な組を新規に作れないことはコンパイル時に保証される）。
+        assert_eq!(
+            recorded.result().rule_id,
+            recorded.record().rule().rule_id()
+        );
     }
 }
