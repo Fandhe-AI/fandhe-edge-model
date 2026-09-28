@@ -848,6 +848,101 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
     }
 }
 
+/// (T6b・P0・REQ-39。issue #84 PR #238 レビュー) `validation_inputs` の
+/// 1 件が [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`] を超える
+/// と `ValidationInputTooLarge` として拒否され、runner・scorer のいずれも
+/// 呼び出されない（`SearchInput` はデータ契約層を経由しない呼び出し元も
+/// 直接組み立てられる公開 API のため、`run_search` 自身が予算・runner・
+/// scorer を消費する前に検証する）。
+#[test]
+fn task18_1_2_validation_input_exceeding_per_record_limit_is_rejected_before_scoring() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+
+    let over_limit_len = fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES + 1;
+    let oversized_input = vec![0u8; over_limit_len];
+    let mut validation_inputs: Vec<&[u8]> = VALIDATION_INPUTS.to_vec();
+    validation_inputs[0] = oversized_input.as_slice();
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &validation_inputs,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    assert_eq!(
+        err,
+        SearchError::ValidationInputTooLarge {
+            index: 0,
+            size: over_limit_len,
+            limit: fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES,
+        }
+    );
+    assert_eq!(runner.calls, 0);
+    assert_eq!(scorer.calls.len(), 0);
+}
+
+/// (T6c・P0・REQ-39。issue #84 PR #238 レビュー) `validation_inputs` の合計
+/// バイト数が [`fandhe_edge_train::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`]
+/// を超えると `ValidationInputTotalBytesExceeded` として拒否され、
+/// runner・scorer のいずれも呼び出されない。個々の要素は
+/// `MAX_INFER_INPUT_BYTES`（1 件あたりの上限）ちょうどに収まっているため、
+/// 1 件あたりの上限チェックだけでは検出できず合計チェックが必要なことを
+/// 示す。
+#[test]
+fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+
+    // 1 件あたりはちょうど上限（超過しない）だが、件数を増やして合計が
+    // 上限を超えるようにする。
+    let per_record_bytes = fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
+    let n_records =
+        fandhe_edge_train::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES / per_record_bytes + 1;
+    let buffer = vec![0u8; per_record_bytes * n_records];
+    let validation_inputs: Vec<&[u8]> = buffer.chunks(per_record_bytes).collect();
+    let gold: Vec<&str> = (0..n_records).map(|_| "positive").collect();
+    let record_ids: Vec<String> = (0..n_records).map(|i| format!("r{i}")).collect();
+    let record_id_refs: Vec<&str> = record_ids.iter().map(String::as_str).collect();
+
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &record_id_refs,
+        validation_inputs: &validation_inputs,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    assert_eq!(
+        err,
+        SearchError::ValidationInputTotalBytesExceeded {
+            total: per_record_bytes * n_records,
+            limit: fandhe_edge_train::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES,
+        }
+    );
+    assert_eq!(runner.calls, 0);
+    assert_eq!(scorer.calls.len(), 0);
+}
+
 /// (T7・契約違反) scorer が gold と異なる件数を返すと
 /// `ScorerOutputMismatch`。
 #[test]

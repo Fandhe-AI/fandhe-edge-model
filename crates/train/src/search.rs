@@ -85,7 +85,7 @@ use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
 use crate::error::TrainRequestError;
-use crate::limits::{MAX_LABEL_BYTES, MAX_LABELS};
+use crate::limits::{MAX_LABEL_BYTES, MAX_LABELS, MAX_VALIDATION_INPUT_TOTAL_BYTES};
 use crate::request::{TrainRequest, TrainRequestParams};
 use crate::result::{SuccessOutcome, TrainOutcome};
 use crate::time_allotment::{
@@ -183,6 +183,12 @@ pub struct SearchInput<'a> {
     /// が権威ある入力を明示的に渡す設計にしている（P0 指摘対応。issue #84
     /// PR #238 レビュー: record_id の一致だけでは、scorer が record_id は
     /// 揃っているが中身が異なる入力を保持していた場合を検出できない）。
+    /// `validate_input`（`crate::search`）が scorer 呼び出し前に、1 件あたり
+    /// [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`]・合計
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超えていないか
+    /// 検証する（`SearchInput` はデータ契約層を経由しない呼び出し元も直接
+    /// 組み立てられる公開 API のため。REQ-39「資源の上限」・P0 指摘対応。
+    /// issue #84 PR #238 レビュー）。
     pub validation_inputs: &'a [&'a [u8]],
     /// 探索対象の候補（宣言順に実行する。乱数は使わない）。
     pub candidates: Vec<SearchCandidate>,
@@ -509,6 +515,18 @@ pub enum SearchError<E> {
     /// `validation_inputs` の件数が `validation_gold` と一致しない
     /// （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
     ValidationInputCountMismatch { expected: usize, actual: usize },
+    /// `validation_inputs` の 1 件が
+    /// [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`] を超える
+    /// （P0 指摘対応・REQ-39「資源の上限」。issue #84 PR #238 レビュー）。
+    ValidationInputTooLarge {
+        index: usize,
+        size: usize,
+        limit: usize,
+    },
+    /// `validation_inputs` の合計バイト数が
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超える
+    /// （P0 指摘対応・REQ-39「資源の上限」。issue #84 PR #238 レビュー）。
+    ValidationInputTotalBytesExceeded { total: usize, limit: usize },
     /// 候補 ID が空・[`MAX_CANDIDATE_ID_BYTES`] 超過・制御文字を含む。
     InvalidCandidateId { index: usize },
     /// 候補 ID が他の候補と重複している。
@@ -587,6 +605,14 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             SearchError::ValidationInputCountMismatch { expected, actual } => write!(
                 f,
                 "validation_inputs count mismatch: expected {expected}, got {actual}"
+            ),
+            SearchError::ValidationInputTooLarge { index, size, limit } => write!(
+                f,
+                "validation input at index {index} is too large: {size} bytes exceeds limit {limit}"
+            ),
+            SearchError::ValidationInputTotalBytesExceeded { total, limit } => write!(
+                f,
+                "validation_inputs total size {total} bytes exceeds limit {limit}"
             ),
             SearchError::InvalidCandidateId { index } => {
                 write!(f, "invalid candidate id at index {index}")
@@ -788,14 +814,48 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
     }
 
     // `validation_inputs` の件数も `validation_gold` と一致すること
-    // （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。1 レコードあたりの
-    // byte 入力のサイズ上限は、凍結済み validation split を組み立てる
-    // データ契約層（`crates/data`）の責務とし、本層では件数のみ検証する。
+    // （P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
     if input.validation_inputs.len() != input.validation_gold.len() {
         return Err(SearchError::ValidationInputCountMismatch {
             expected: input.validation_gold.len(),
             actual: input.validation_inputs.len(),
         });
+    }
+
+    // `validation_inputs` の 1 件あたり・合計のバイト数上限（P0 指摘対応・
+    // REQ-39「資源の上限」。issue #84 PR #238 レビュー）: `SearchInput` は
+    // 公開 API で、データ契約層（`crates/data`）を経由しない呼び出し元が
+    // 直接値を渡せるため、`ValidationScorer::predict_validation` を呼び出す
+    // 前に本層でも検証する（データ契約層の検証に依存しない。fail-closed）。
+    // 1 件あたりは推論入力 1 件の上限
+    // （`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`。train・infer
+    // で共有）をそのまま使う。合計は `crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`
+    // を使う（doc コメント参照）。
+    let mut validation_inputs_total_bytes: usize = 0;
+    for (index, &validation_input) in input.validation_inputs.iter().enumerate() {
+        if validation_input.len() > fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES {
+            return Err(SearchError::ValidationInputTooLarge {
+                index,
+                size: validation_input.len(),
+                limit: fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES,
+            });
+        }
+        validation_inputs_total_bytes = validation_inputs_total_bytes
+            .checked_add(validation_input.len())
+            // 理論上到達しない防御的分岐: 各要素は直前で
+            // `MAX_INFER_INPUT_BYTES`（1 MiB）以下と確認済みで、累積も
+            // 上限（`MAX_VALIDATION_INPUT_TOTAL_BYTES`）を超えた時点で
+            // 早期に拒否するため、`usize` の桁あふれには到達しない
+            // （`validate_input` の他の桁あふれガードと同じ方針）。
+            .ok_or_else(|| SearchError::Internal {
+                detail: "validation_inputs total bytes overflows usize".to_string(),
+            })?;
+        if validation_inputs_total_bytes > MAX_VALIDATION_INPUT_TOTAL_BYTES {
+            return Err(SearchError::ValidationInputTotalBytesExceeded {
+                total: validation_inputs_total_bytes,
+                limit: MAX_VALIDATION_INPUT_TOTAL_BYTES,
+            });
+        }
     }
 
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
