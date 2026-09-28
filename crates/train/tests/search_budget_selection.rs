@@ -1213,3 +1213,167 @@ fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
     );
     assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
 }
+/// (P0・REQ-39・issue #84 PR #238 レビュー) 候補の学習が成功
+/// （`TrainOutcome::Ok`）しても、実測時間（`elapsed_ms`）がその候補へ配分
+/// した持ち時間（`time_limit_seconds`）以上だった場合は、採点
+/// （`predict_validation`）を呼び出さずに `TrainingExceededTimeLimit` として
+/// 選定対象から除外する。探索予算 3600 秒を 2 候補へ均等配分（各 1800 秒）
+/// し、最初の候補が割当を超えて 2000 秒で成功した場合の再現（指摘本文の
+/// シナリオそのもの）。探索全体の予算はまだ残っている（2000 秒 <
+/// 3600 秒）ため、2 番目の候補は通常どおり実行・評価され選定される。
+#[test]
+fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
+    let clock = FakeClock::new(0);
+    // c3-a: 割当 1800 秒に対し 2000 秒かけて成功する（超過）。
+    // c3-b: 残り予算（3600 - 2000 = 1600 秒）内に収まり、評価まで完了する。
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::Ok {
+                advance_ms: 2_000_000,
+            },
+            RunnerBehavior::Ok { advance_ms: 10 },
+        ],
+    );
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-b".to_string(), Ok(outcomes_with_correct(9)))]),
+    );
+
+    let gold = validation_gold();
+    let candidates = vec![
+        SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: candidate_params("out/c3-a", 1),
+        },
+        SearchCandidate {
+            candidate_id: "c3-b".to_string(),
+            params: candidate_params("out/c3-b", 2),
+        },
+    ];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(
+        scorer.calls,
+        vec!["c3-b".to_string()],
+        "c3-a is excluded before scoring; c3-b is scored normally"
+    );
+    assert_eq!(record.candidates.len(), 2);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::TrainingExceededTimeLimit
+    );
+    assert!(record.candidates[0].time.is_some());
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    match &record.candidates[1].result {
+        CandidateSearchResult::Evaluated {
+            validation_accuracy,
+        } => {
+            assert_eq!(validation_accuracy.correct, 9);
+            assert_eq!(validation_accuracy.total, 10);
+        }
+        other => panic!("expected Evaluated for c3-b, got {other:?}"),
+    }
+    match &record.selection {
+        SelectionDecision::Selected {
+            candidate_id,
+            validation_accuracy,
+            tied_candidate_ids,
+            ..
+        } => {
+            assert_eq!(candidate_id, "c3-b");
+            assert_eq!(validation_accuracy.correct, 9);
+            assert_eq!(validation_accuracy.total, 10);
+            assert_eq!(tied_candidate_ids, &vec!["c3-b".to_string()]);
+        }
+        other => panic!("expected Selected(c3-b), got {other:?}"),
+    }
+}
+
+/// (P0・REQ-39・issue #84 PR #238 レビュー) 候補の実測時間が割当持ち時間に
+/// ちょうど一致した場合（`==`）は超過扱いにしない（単調時計はミリ秒単位で
+/// 丸まり、割当時間ぴったりで完了する候補は珍しくないため。`run_search`
+/// 実装のコメント参照）。1ms でも超えれば `TrainingExceededTimeLimit` に
+/// なることを対比で確認する。
+#[test]
+fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over_is() {
+    // ちょうど一致（100_000ms）: 超過扱いにせず採点まで進む。
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![RunnerBehavior::Ok {
+            advance_ms: 100_000,
+        }],
+    );
+    let mut scorer = FakeScorer::new(
+        &clock,
+        BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
+    );
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: fixed_policy(100),
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert_eq!(
+        scorer.calls,
+        vec!["c3-a".to_string()],
+        "exactly-at-limit training must still be scored"
+    );
+    assert_eq!(record.candidates.len(), 1);
+    assert!(matches!(
+        record.candidates[0].result,
+        CandidateSearchResult::Evaluated { .. }
+    ));
+
+    // 1ms でも超過（100_001ms）: 採点せず `TrainingExceededTimeLimit` になる。
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![RunnerBehavior::Ok {
+            advance_ms: 100_001,
+        }],
+    );
+    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: fixed_policy(100),
+    };
+
+    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    assert!(
+        scorer.calls.is_empty(),
+        "over-limit training must not be scored"
+    );
+    assert_eq!(record.candidates.len(), 1);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::TrainingExceededTimeLimit
+    );
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}

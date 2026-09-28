@@ -283,6 +283,24 @@ pub enum CandidateSearchResult {
     /// `0` 等の値で埋めない（evaluation-contract「分母が 0 の指標は
     /// `null`」と同じ「実測できない値を捏造しない」方針）。選定対象外。
     ScoringSkippedBudgetExhausted,
+    /// 候補の実測時間（[`CandidateTimeRecord::elapsed_ms`]）が、その候補へ
+    /// 配分した持ち時間（[`CandidateTimeRecord::time_limit_seconds`]）を
+    /// 超えていた（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー。ちょうど
+    /// 一致した場合は含めない。[`run_search`] 実装のコメント参照）。
+    /// `run_candidate`（[`crate::time_allotment::run_candidate`]）は
+    /// ワーカーが `Ok` を返せば `TrainOutcome::Ok` を返すだけで、実測時間が
+    /// 割当時間を超えていても `TrainOutcome` 単体では判別できない
+    /// （[`crate::time_allotment::CandidateTimeStatus::Completed`] は
+    /// 持ち時間超過の有無を問わない）。持ち時間を超えた成功結果を採点・
+    /// 選定へ進めると、資源の上限（ガード層）を守らずに「予算到達を合格
+    /// 扱いにしない」契約に反するため、採点（[`ValidationScorer`]）を
+    /// 呼び出す前に除外する。正解率は算出していないため `0` 等の値で
+    /// 埋めない（[`ScoringSkippedBudgetExhausted`](Self::ScoringSkippedBudgetExhausted)
+    /// と同じ方針）。選定対象外。探索全体の予算はまだ残っている可能性が
+    /// あるため、この候補だけを除外して次候補へ進む（探索全体を打ち切る
+    /// `NotStarted`・`ScoringSkippedBudgetExhausted` とは異なり、以降の
+    /// `while` ループは継続する）。
+    TrainingExceededTimeLimit,
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
         /// 未着手の理由。
@@ -811,6 +829,41 @@ where
                     });
                     drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
                     break;
+                }
+
+                // P0 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 探索
+                // 予算全体はまだ残っていても、この候補自身の実測時間
+                // （`elapsed_ms`）が、この候補へ配分した持ち時間
+                // （`time_limit_seconds`）を超えていないかを、採点
+                // （`predict_validation`）を呼び出す前に確認する。
+                // `run_candidate` はワーカーが `Ok` を返せば実測時間を問わず
+                // `TrainOutcome::Ok` を返す（`CandidateTimeStatus::Completed`
+                // も持ち時間超過の有無を区別しない）ため、ここで確認せずに
+                // 採点・選定へ進めると、持ち時間を超えた成功結果が選定され
+                // 得る（指摘本文のシナリオ: 予算 3600 秒を 2 候補へ均等配分
+                // し、最初の候補が割当 1800 秒を超えて 2000 秒で成功した
+                // 場合）。ちょうど持ち時間に達した時点（`==`）は超過扱いに
+                // しない（`>` の厳密不等号）: 単調時計はミリ秒単位で丸まり、
+                // 割当時間ぴったりで完了する候補は珍しくない（本モジュール
+                // doc「実機での確認手順」の
+                // 「持ち時間 + supervisor.py の猶予 5 秒」のとおり、
+                // わずかな超過は学習ワーカー側の終了処理に想定内で含まれる）。
+                // 探索予算全体の判定（直前の `elapsed_before_scoring_ms >=
+                // budget_ms`。ちょうど到達した時点も合格にしない）とは
+                // 意図的に異なる規則: あちらは探索予算という共有資源の枯渇を
+                // 検出するもので、こちらは候補 1 件へ配分した持ち時間からの
+                // 逸脱を検出するものであり、境界の扱いを揃える必要はない。
+                let candidate_time_limit_ms =
+                    u64::from(run.record().time_limit_seconds()).saturating_mul(1000);
+                if run.record().elapsed_ms() > candidate_time_limit_ms {
+                    entries.push(CandidateSearchEntry {
+                        candidate_id: candidate.candidate_id,
+                        elapsed_at_start_ms: Some(elapsed_ms),
+                        time: Some(run.record().clone()),
+                        result: CandidateSearchResult::TrainingExceededTimeLimit,
+                        validation_outcomes: None,
+                    });
+                    continue;
                 }
 
                 let time_limit = Duration::from_millis(remaining_for_scoring_ms);
