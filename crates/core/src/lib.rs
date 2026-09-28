@@ -34,6 +34,11 @@
 //! `hash` モジュールは生バイト列の sha256 ダイジェスト型 [`hash::Sha256Digest`]
 //! を実装済み（issue #69・TASK-27.1-1。評価データの凍結〔REQ-17・TASK-17.2〕
 //! 側の同種 issue の PR が先にマージされた場合はそちらを正とする）。
+//! `fs` モジュールはサイズ上限付きの安全な通常ファイル読み込み
+//! （[`fs::open_regular_file_for_read`]・[`fs::read_bounded`]・
+//! [`fs::sha256_file_bounded`]）を実装済み（REQ-39・issue #214 codex/review 指摘。
+//! `definition::Definition::load` と評価器〔`crates/eval` の `invariance`
+//! モジュール〕が個別に複製していた防御をここへ集約した）。
 //! `infer_input` モジュールは TASK-21.2 で推論入力レコードの未知形式・型
 //! 不正を検出し `invalid_input`／`limit_exceeded` へ写す型を実装済み
 //! （CLI バイナリへの配線は TASK-33.x の対象で未着手）。
@@ -41,6 +46,7 @@
 pub mod canonical;
 pub mod definition;
 pub mod exitcode;
+pub mod fs;
 pub mod hash;
 pub mod infer_input;
 pub mod judgment;

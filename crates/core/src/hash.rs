@@ -35,6 +35,18 @@ impl Sha256Digest {
         Sha256Digest(hasher.finalize().into())
     }
 
+    /// 既に計算済みの生の 32 バイトから直接構築する（crate 内限定）。
+    ///
+    /// [`crate::fs::sha256_file_bounded`] がストリームで sha256 を計算した
+    /// 結果（`sha2::Sha256::finalize()` の出力）を本型へ変換するために使う。
+    /// フィールドを非公開にしたままこの用途だけを許すため、`pub(crate)` に
+    /// 留める（外部 crate から任意の 32 バイトを「有効なダイジェスト」として
+    /// 偽装できないようにする）。
+    #[must_use]
+    pub(crate) fn from_array(bytes: [u8; 32]) -> Self {
+        Sha256Digest(bytes)
+    }
+
     /// 生の 32 バイトを返す。
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
