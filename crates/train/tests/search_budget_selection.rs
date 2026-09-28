@@ -1541,6 +1541,65 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
     assert_eq!(record.candidates[1].validation_outcomes(), None);
 }
 
+/// (T10b・P0・security.md「秘密情報の混入防止」。issue #84 PR #238 レビュー)
+/// `CandidateSearchEntry`・`SearchRecord` の `{:?}`（Debug）出力に、
+/// scorer が返した予測ラベルの文字列が含まれないことを確認する。
+/// `#[serde(skip)]` で JSON には出していなかったが、`derive(Debug)` の
+/// ままでは `{:?}` から素通りしていた（P0 指摘対応）。
+#[test]
+fn task18_1_2_candidate_search_entry_debug_does_not_leak_predicted_labels() {
+    const MARKER_LABEL: &str = "UNIQUE_PREDICTED_LABEL_MARKER_ZZQX";
+    let clock = Arc::new(FakeClock::new(0));
+    let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
+        BTreeMap::from([(
+            "c3-a".to_string(),
+            Ok((0..VALIDATION_LEN)
+                .map(|_| Outcome::Label(MARKER_LABEL.to_string()))
+                .collect()),
+        )]),
+    );
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
+    // 前提: この候補は実際に評価済みで、予測ラベルを保持している
+    // （`validation_outcomes()` が `Some` を返す）ことを確認してから、
+    // その内容が Debug 出力に現れないことを確かめる。
+    assert!(record.candidates[0].validation_outcomes().is_some());
+
+    let entry_debug = format!("{:?}", record.candidates[0]);
+    assert!(
+        !entry_debug.contains(MARKER_LABEL),
+        "CandidateSearchEntry Debug output must not leak predicted labels: {entry_debug}"
+    );
+    assert!(
+        entry_debug.contains("redacted"),
+        "CandidateSearchEntry Debug output should indicate redaction: {entry_debug}"
+    );
+
+    let record_debug = format!("{record:?}");
+    assert!(
+        !record_debug.contains(MARKER_LABEL),
+        "SearchRecord Debug output must not leak predicted labels: {record_debug}"
+    );
+}
+
 /// (T11・P0/P1・REQ-39・issue #84 PR #238 レビュー) 採点（`predict_validation`）
 /// の呼び出し中に探索予算全体を使い切った場合、`predict_validation` から
 /// 戻った直後（`EvalRecord` の構築・評価器 `evaluate_single_select` の

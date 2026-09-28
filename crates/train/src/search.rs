@@ -513,7 +513,14 @@ pub enum CandidateSearchResult {
 }
 
 /// 候補 1 件の探索記録（時刻・打ち切り分類・探索結果の組）。
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+///
+/// `Debug` は手書きする（下記）。`validation_outcomes`（[`Outcome`] の列。
+/// `Outcome::Label` は scorer が返す予測ラベル文字列を保持する）を
+/// `derive(Debug)` のまま `{:?}` で出力すると、`#[serde(skip)]` で JSON へは
+/// 出していないにもかかわらず、デバッグ出力（ログ等）から予測ラベルの
+/// 内容がそのまま漏れてしまう（security.md「秘密情報の混入防止」。P0
+/// 指摘対応。issue #84 PR #238 レビュー）。
+#[derive(Clone, PartialEq, serde::Serialize)]
 pub struct CandidateSearchEntry {
     /// 候補 ID。
     pub candidate_id: String,
@@ -532,6 +539,35 @@ pub struct CandidateSearchEntry {
     /// 参照）。
     #[serde(skip)]
     validation_outcomes: Option<Vec<Outcome>>,
+}
+
+/// [`CandidateSearchEntry`] の手書き `Debug` が使う補助型。
+/// `validation_outcomes` の要素数だけを表示し、予測ラベルの内容
+/// （`Outcome::Label` の文字列）は一切出さない。
+struct RedactedOutcomeCount(usize);
+
+impl std::fmt::Debug for RedactedOutcomeCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted: {} outcome(s)>", self.0)
+    }
+}
+
+impl std::fmt::Debug for CandidateSearchEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateSearchEntry")
+            .field("candidate_id", &self.candidate_id)
+            .field("elapsed_at_start_ms", &self.elapsed_at_start_ms)
+            .field("time", &self.time)
+            .field("result", &self.result)
+            .field(
+                "validation_outcomes",
+                &self
+                    .validation_outcomes
+                    .as_ref()
+                    .map(|outcomes| RedactedOutcomeCount(outcomes.len())),
+            )
+            .finish()
+    }
 }
 
 impl CandidateSearchEntry {
