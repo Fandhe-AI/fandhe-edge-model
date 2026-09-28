@@ -631,9 +631,15 @@ def map_scores_to_choice(
     （`Unmapped`）へ変換する。
 
     手順: (1) `choice_posteriors` で事後確率を求める。非有限・不正な形なら
-    `Unmapped("invalid_score")` を返す。(2) `argmax`（タイブレークは
-    `label_order` の宣言順で先頭。`np.argmax` は同点のとき最初の添字を返す
-    ため追加の分岐は要らない）で最大の選択肢を選ぶ。(3) その選択肢の
+    `Unmapped("invalid_score")` を返す。(2) 出力する `scores`（softmax 後の
+    事後確率）に対して `argmax`（タイブレークは `label_order` の宣言順で
+    先頭。`np.argmax` は同点のとき最初の添字を返すため追加の分岐は要らない）
+    で最大の選択肢を選ぶ。生の対数尤度ではなく事後確率で argmax を取るのは、
+    僅差の対数尤度が softmax 後の丸めで同値になった場合に `predicted_label`
+    と出力スコア上の最大値が食い違うことを防ぐため（Codex レビュー #234
+    指摘。`crates/core/src/judgment.rs::JudgmentResult::new` は同点を宣言順
+    で判定し `predicted_choice_id` と最大スコアの一致を要求する）。(3) その
+    選択肢の
     トークン列を `resolve_choice_id` で実際に ID へ解決し、選んだ添字の
     `label_order[idx]` と一致することを確認する。対応づけ (b) では
     `choice_ids_by_label[label_order[idx]]` は `label_order[idx]` 自身の
@@ -659,7 +665,14 @@ def map_scores_to_choice(
     if probs is None:
         return Unmapped("invalid_score")
 
-    idx = int(np.argmax(np.asarray(loglik_row)))
+    # argmax は出力する scores（softmax 後の事後確率）に対して行う。
+    # 生の対数尤度で argmax を決めると、僅差の対数尤度が softmax 後の
+    # 丸めで同値になった場合に predicted_label と最大スコアが食い違い、
+    # `crates/core/src/judgment.rs::JudgmentResult::new` の「同点は宣言順」
+    # 契約（predicted_choice_id は scores 中の最大値と一致する必要がある）
+    # に反する（Codex レビュー #234 指摘）。`np.argmax` は同点のとき最初の
+    # 添字を返すため、宣言順のタイブレークは追加の分岐なしに満たされる。
+    idx = int(np.argmax(probs))
     label = label_order[idx]
     resolved = resolve_choice_id(choice_ids_by_label[label], label_order)
     if resolved != label:

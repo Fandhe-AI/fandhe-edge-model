@@ -150,6 +150,32 @@ def test_req19b_map_scores_tie_breaks_by_declaration_order() -> None:
     assert mapping.index == 0
 
 
+def test_req19b_map_scores_argmax_uses_softmax_probs_not_raw_loglik() -> None:
+    """`loglik=[-1e-17, 0.0, -100.0]` は生の対数尤度では 2 番目
+    （`"cat_b"`）が最大だが、softmax 後は丸めにより `probs[0] == probs[1]`
+    の同点になる（1e-17 は float64 の丸め誤差未満のため）。出力する
+    `scores`（softmax 後）に対して宣言順タイブレークで argmax を取ると
+    先頭の `"cat_a"` になるべきで、`predicted_label` は
+    `max(mapping.probs)` を実現する最初の添字と一致しなければならない
+    （Codex レビュー #234 指摘の回帰テスト。生の対数尤度で argmax を
+    決めていた旧実装では `"cat_b"`（index 1）になり、
+    `crates/core/src/judgment.rs::JudgmentResult::new` の
+    `predicted_choice_id` と最大スコア一致の契約に反していた）。
+    """
+    label_order = ["cat_a", "cat_b", "cat_c"]
+    choice_ids_by_label = _encode_choices(label_order)
+    loglik = np.array([-1e-17, 0.0, -100.0])
+
+    mapping = map_scores_to_choice(loglik, label_order, choice_ids_by_label)
+
+    assert isinstance(mapping, Mapped)
+    assert mapping.probs[0] == mapping.probs[1]
+    assert mapping.index == 0
+    assert mapping.choice_id == "cat_a"
+    max_prob = max(mapping.probs)
+    assert mapping.probs[mapping.index] == max_prob
+
+
 @pytest.mark.parametrize(
     "loglik",
     [
