@@ -1,0 +1,10 @@
+{
+  "description": "手書きの合成データ（5 件ずつ）。漏洩・重複・メタデータ混入のない clean なデータ。",
+  "train_test_leak": {"count": 0},
+  "duplicate_within_train": {"count": 0},
+  "duplicate_within_test": {"count": 0},
+  "group_straddle": {"count": 0},
+  "metadata_mixed_into_input": {"count": 0},
+  "false_positive_expectation": 0,
+  "note": "metadata-mixed/ の注入フィクスチャは、この clean データを基に作られている。データ検査はこの clean データに対して誤検出 0 件であることを確認する。"
+}
