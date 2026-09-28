@@ -141,7 +141,15 @@ pub trait LeakCheckable {
     fn input(&self) -> &[u8];
 
     /// group ID（データ準備側で付与済みのもの。本モジュールでは導出しない）。
-    fn group_id(&self) -> &str;
+    ///
+    /// `inspect::ValidRecord::group_id` が `Option<String>`（group_id は任意項目。
+    /// `inspect.rs`「group_id: 任意。必須化・自動算出は TASK-17.1 の検討事項」）で
+    /// あるのに合わせて `Option<&str>` にする（reviewer 指摘 PR #195・crates/data/src/leak.rs:172）。
+    /// 呼び出し側が欠損値を空文字列などの番兵値へ置き換えて実装すると、
+    /// 無関係な複数レコードが同一 group（空文字列）として誤って群跨ぎ判定される
+    /// おそれがあるため、欠損を表現できる契約にして [`find_group_straddles`] 側で
+    /// `None` を判定から除外する（下記参照）。
+    fn group_id(&self) -> Option<&str>;
 }
 
 /// レコードが属する分割の種類。
@@ -238,7 +246,11 @@ pub fn validate_resource_limits<R: LeakCheckable>(
                     limit: MAX_LEAK_CHECK_ID_BYTES,
                 });
             }
-            let group_id_len = record.group_id().len();
+            // group_id は任意項目（`inspect::ValidRecord::group_id` が
+            // `Option<String>`）のため、存在する場合のみ長さを検証する。
+            // 欠損（`None`）はここでは 0 byte として扱い、合計 byte 数
+            // （`total_bytes`）にも加算しない。
+            let group_id_len = record.group_id().map(str::len).unwrap_or(0);
             if group_id_len > MAX_LEAK_CHECK_ID_BYTES {
                 return Err(LeakCheckError::IdTooLong {
                     len: group_id_len,
@@ -442,6 +454,12 @@ pub struct GroupStraddleReport {
 /// 一致していれば検出できることが本検出の存在意義（PoC-9 の group-straddle
 /// フィクスチャが示す観点）。
 ///
+/// `group_id` が欠損（[`LeakCheckable::group_id`] が `None`）のレコードは
+/// 群跨ぎ判定の対象から除外する。欠損値を空文字列等の番兵値へ揃えて比較すると、
+/// 元々 group が無関係な複数レコードが同一 group として誤検出されるため
+/// （reviewer 指摘 PR #195・crates/data/src/leak.rs:172）、除外することで
+/// 誤検出を避ける。
+///
 /// # Errors
 ///
 /// [`validate_resource_limits`] がレコード総件数・ID 長・入力 byte 長の上限超過を検出した場合、
@@ -460,8 +478,14 @@ pub fn find_group_straddles<R: LeakCheckable>(
 
     for (partition, records) in all_partitions {
         for record in records {
+            // group_id が欠損しているレコードは群跨ぎ判定から除外する
+            // （上記ドキュメントコメント参照。欠損値を番兵値へ揃えないことで
+            // 無関係なレコード同士を誤って同一 group と扱わない）。
+            let Some(group_id) = record.group_id() else {
+                continue;
+            };
             by_group
-                .entry(record.group_id())
+                .entry(group_id)
                 .or_default()
                 .entry(partition)
                 .or_default()
@@ -522,7 +546,7 @@ mod tests {
     struct TestRecord {
         id: String,
         input: Vec<u8>,
-        group_id: String,
+        group_id: Option<String>,
     }
 
     impl LeakCheckable for TestRecord {
@@ -532,8 +556,8 @@ mod tests {
         fn input(&self) -> &[u8] {
             &self.input
         }
-        fn group_id(&self) -> &str {
-            &self.group_id
+        fn group_id(&self) -> Option<&str> {
+            self.group_id.as_deref()
         }
     }
 
@@ -541,7 +565,18 @@ mod tests {
         TestRecord {
             id: id.to_string(),
             input: input.as_bytes().to_vec(),
-            group_id: group_id.to_string(),
+            group_id: Some(group_id.to_string()),
+        }
+    }
+
+    /// `inspect::ValidRecord::group_id` が `None`（group_id 未指定）の場合に
+    /// 相当するレコードを作る（reviewer 指摘 PR #195・crates/data/src/leak.rs:172
+    /// の回帰防止用ヘルパー）。
+    fn record_without_group_id(id: &str, input: &str) -> TestRecord {
+        TestRecord {
+            id: id.to_string(),
+            input: input.as_bytes().to_vec(),
+            group_id: None,
         }
     }
 
@@ -798,6 +833,56 @@ mod tests {
         assert!(!straddle.members.contains_key(&Partition::Train));
     }
 
+    /// REQ-16 異常系・TASK-16.2-1（reviewer 指摘 PR #195・crates/data/src/leak.rs:172
+    /// の回帰防止）: `group_id` が欠損（`None`）しているレコードは、
+    /// 他のレコードも `group_id` が欠損している場合であっても同一 group として
+    /// 誤って群跨ぎ判定されない（欠損値を空文字列等の番兵値へ揃えて比較すると、
+    /// 無関係なレコード同士が誤検出されてしまう懸念への回帰防止）。
+    #[test]
+    fn req16_task16_2_1_missing_group_id_is_excluded_from_straddle_detection() {
+        let train = vec![record_without_group_id("t1", "train-input")];
+        let test = vec![record_without_group_id("x1", "test-input")];
+        let partitions = Partitions {
+            train: &train,
+            validation: None,
+            test: Some(&test),
+            evaluation: None,
+        };
+
+        let report = find_group_straddles(&partitions).expect("上限以下の入力");
+        assert_eq!(
+            report.straddles,
+            Vec::new(),
+            "group_id 欠損レコード同士が誤って同一 group として検出された"
+        );
+    }
+
+    /// REQ-16 異常系・TASK-16.2-1（同上の回帰防止）: `group_id` が実際に一致する
+    /// レコードの跨ぎ検出は、他に `group_id` 欠損のレコードが混在していても
+    /// 影響を受けない（欠損レコードは判定から除外されるのみで、有効な group_id
+    /// を持つレコード間の検出には影響しない）。
+    #[test]
+    fn req16_task16_2_1_missing_group_id_does_not_affect_other_straddle_detection() {
+        let train = vec![
+            record("t1", "input-t", "shared-group"),
+            record_without_group_id("t2", "no-group-input"),
+        ];
+        let test = vec![
+            record("x1", "input-x", "shared-group"),
+            record_without_group_id("x2", "another-no-group-input"),
+        ];
+        let partitions = Partitions {
+            train: &train,
+            validation: None,
+            test: Some(&test),
+            evaluation: None,
+        };
+
+        let report = find_group_straddles(&partitions).expect("上限以下の入力");
+        assert_eq!(report.straddles.len(), 1);
+        assert_eq!(report.straddles[0].group_id, "shared-group");
+    }
+
     /// REQ-16 異常系・TASK-16.2-1: 利用者の評価データ（Evaluation）側への漏洩と
     /// 跨ぎも、partition = Evaluation として検出される。
     #[test]
@@ -1043,7 +1128,7 @@ mod tests {
             .map(|_| TestRecord {
                 id: long_id.clone(),
                 input: Vec::new(),
-                group_id: String::new(),
+                group_id: Some(String::new()),
             })
             .collect();
         let partitions = empty_partitions(&train);

@@ -12,10 +12,14 @@
 use fandhe_edge_data::leak::{LeakCheckable, Partitions, find_group_straddles, find_input_leaks};
 
 /// テスト用の最小レコード。
+///
+/// `group_id` は `inspect::ValidRecord::group_id`（`Option<String>`。任意項目）
+/// に合わせて `Option<String>` で保持する（reviewer 指摘 PR #195・
+/// crates/data/src/leak.rs:172）。
 struct Record {
     id: String,
     input: Vec<u8>,
-    group_id: String,
+    group_id: Option<String>,
 }
 
 impl LeakCheckable for Record {
@@ -25,8 +29,8 @@ impl LeakCheckable for Record {
     fn input(&self) -> &[u8] {
         &self.input
     }
-    fn group_id(&self) -> &str {
-        &self.group_id
+    fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
     }
 }
 
@@ -34,7 +38,7 @@ fn record(id: &str, input: &str, group_id: &str) -> Record {
     Record {
         id: id.to_string(),
         input: input.as_bytes().to_vec(),
-        group_id: group_id.to_string(),
+        group_id: Some(group_id.to_string()),
     }
 }
 
