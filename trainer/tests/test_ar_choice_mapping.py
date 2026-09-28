@@ -443,6 +443,37 @@ def test_req39_predict_records_rejects_oversized_attention_elements(
     assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
+def test_req39_predict_records_rejects_oversized_logprob_elements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_score_choices_mlx` が `logits`・`log_softmax`（`[N*K, length,
+    VOCAB_SIZE]`）を確保する前に、見積もり要素数（`N x K x length x
+    vocab_size`）を `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` で fail-closed
+    に拒否すること（REQ-39。attention の見積もりだけでは vocab 次元の
+    確保量を見逃すという Cursor Bugbot 指摘への回帰テスト。PR #234）。
+
+    `MAX_AR_EXPORT_ATTENTION_ELEMENTS` は十分大きいまま
+    （attention 側の検査を通過させる）にし、
+    `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` のみを絞ることで、
+    vocab 次元の検査が単独で機能することを確認する。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar_module
+
+    monkeypatch.setattr(ar_module, "MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS", 1)
+
+    kind = AutoregressiveKind()
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    examples = make_examples()
+    trained = train_kind(kind, examples, req)
+
+    rows = [(str(i), ex.input) for i, ex in enumerate(examples)]
+
+    with pytest.raises(WorkerError) as exc_info:
+        list(predict_records(trained, rows))
+    assert exc_info.value.code == "limit_exceeded"
+    assert exc_info.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
 def test_req19b_predict_records_empty_input(tmp_path: Path) -> None:
     """空文字列の入力（`encode_bytes("") == [0]`）でも有限の `scores` を持つ
     ok のレコードになること（REQ-28。詰め物のみの行でも NaN が伝播しない

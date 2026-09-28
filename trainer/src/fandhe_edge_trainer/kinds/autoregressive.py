@@ -473,6 +473,16 @@ def _score_choices_mlx(
     はチャンクあたりの計算量を抑えるが、選択肢数 `K`・系列長 `length` は
     モデル構成・データに依存するため、`chunk_size` だけでは確保量を
     抑えきれない（Codex レビュー指摘 P0・PR #234。REQ-39「資源の上限」）。
+
+    `logits`・`log_softmax`（いずれも `[N*K, length, VOCAB_SIZE]`）は
+    attention とは別に vocab 次元 `VOCAB_SIZE` 分の要素数を確保するため、
+    attention の見積もりだけでは vocab サイズが大きい構成を見逃す
+    （`_export_ar_onnx` の `choice_logprob_elements` 検査は書き出し時の
+    `[K, M, VOCAB_SIZE]` のみを見ており、本関数の `[N*K, length,
+    VOCAB_SIZE]`〔`length` は選択肢領域 `M` より広い〕には及ばない。
+    Cursor Bugbot 指摘・PR #234）。`full` を確保する前に、この形状の
+    見積もり要素数を `MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS` で
+    fail-closed に拒否する。
     """
     model.eval()
     n = len(ids_batch)
@@ -489,6 +499,15 @@ def _score_choices_mlx(
             "limit_exceeded",
             f"estimated attention elements {attn_elements} exceeds limit"
             f" {MAX_AR_EXPORT_ATTENTION_ELEMENTS} (N x K x heads x layers x length^2)",
+            ExitCode.LIMIT_EXCEEDED,
+        )
+
+    logprob_elements = n * k * length * VOCAB_SIZE
+    if logprob_elements > MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS:
+        raise WorkerError(
+            "limit_exceeded",
+            f"estimated logits/log-softmax elements {logprob_elements} exceeds limit"
+            f" {MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS} (N x K x length x vocab_size)",
             ExitCode.LIMIT_EXCEEDED,
         )
 
