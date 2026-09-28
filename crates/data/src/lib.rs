@@ -30,6 +30,17 @@
 //! - [`eval_freeze`][]: 評価データ本体の凍結記録（sha256・バイト長）と、
 //!   評価データなしの境界動作（`evaluate` が `status:"skipped"`・exit 0 で
 //!   完走する型のゲート。REQ-17・TASK-17.2-1・issue #47）
+//! - [`frozen_placement`][]: 凍結済み評価データの読み取り専用配置（unix:
+//!   利用者の `src` は読み込むだけで一切書き換えず、本ツールが管理する
+//!   `dest_dir`（呼び出し側が `0700`・自分所有で用意する契約。`mode &
+//!   0o077 != 0` または所有者が異なれば `InsecureDestDir` で拒否する）の
+//!   中に新規作成したファイルへ検証済みのバイト列を書き出して `chmod 400`
+//!   相当（所有者のみ読み取り可。評価データの機密性のため `444` にしない）
+//!   にし、`std::fs::hard_link` で公開する。`src` に対する `chmod`・
+//!   `rename`・`unlink` はいずれも行わない）と、公開前の書き込み拒否
+//!   プローブ（REQ-39・REQ-17・TASK-17.2-2・issue #48。issue #227
+//!   codex[bot]・cursor[bot] 指摘を受けた設計。詳細は [`frozen_placement`]
+//!   モジュール doc「設計」参照）
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -47,9 +58,10 @@
 //!   （REQ-17・TASK-17.1-2・issue #45）。評価データの凍結（[`eval_freeze`]・
 //!   REQ-17・TASK-17.2-1・issue #47）は「実データバイト列から独立に再計算
 //!   したハッシュとの一致確認」「評価データなしの境界動作」までを実装済み。
-//!   凍結後のハッシュ不一致検知で処理を止める分岐（過去の記録台帳との突き
-//!   合わせ・版管理。REQ-17・TASK-17.3・issue #49）と読み取り専用配置・
-//!   書き込み拒否（TASK-17.2-2・issue #48）は未実装。CLI `evaluate` 工程
+//!   読み取り専用配置・直接書き込みの拒否確認（[`frozen_placement`]・
+//!   REQ-39・TASK-17.2-2・issue #48）も実装済み。凍結後のハッシュ不一致検知
+//!   で処理を止める分岐（過去の記録台帳との突き合わせ・版管理。REQ-17・
+//!   TASK-17.3・issue #49）は未実装。CLI `evaluate` 工程
 //!   への配線・学習・パッケージ化・推論を通した完走確認（TASK-33.3・
 //!   issue #140）も未実装。（[`inspect::inspect_records`] が返す
 //!   [`inspect::ValidRecord`] は [`split::Groupable`] を実装しないため、
@@ -114,10 +126,29 @@
 //! 生の外部入力を本 crate へ直結してはならない（各モジュールの
 //! doc コメントも参照）。`docs/spec` は参照せず、ビルド・テストは
 //! `docs/spec` 抜きで成立する（spec-reference のビルド独立方針）。
+//!
+//! **例外**: [`frozen_placement`] は評価データ本体を（読み取り専用配置の
+//! ために）呼び出し側が指定した上限（`max_bytes`）まで全量メモリへ読み込み、
+//! ファイルシステムへの副作用（`dest_dir` 配下への新規ファイルの作成・
+//! 権限変更・`hard_link`）を持つ点で他モジュールと異なる。業務上の最大
+//! サイズの既定値そのものはこのモジュールの対象外（issue #172）で、
+//! `max_bytes` は呼び出し側の方針として受け取るだけ。利用者の `src` には
+//! 一切書き込まず、`chmod`・`rename`・`unlink` のいずれも行わない
+//! （差し替えの事後検知は [`eval_freeze::evaluate_gate`]・TASK-17.3・
+//! issue #49 が担う）。呼び出しには `src` の読み取り権限に加え、`dest_dir`
+//! （本ツールが管理するディレクトリ）への書き込み・実行権限が要る
+//! （作業ディレクトリの作成・`hard_link` に必要）。`dest_dir` は
+//! **呼び出し側が `0700`・自分所有で用意する契約**で、group・other 向けの
+//! 権限ビットがある、または所有者が異なる場合は `InsecureDestDir` で
+//! 拒否する（評価データの機密性。issue #227 codex[bot] P0 指摘）。
+//! `src`・`dest_dir` はガード層（経路の閉じ込め。TASK-39.x）を通過済みで
+//! あることを引き続き前提とする（[`frozen_placement`] モジュール doc
+//! 「設計」「責務の境界」「`dest_dir` の機密性」参照）。
 
 pub mod consistency;
 pub mod eval_freeze;
 pub mod eval_input;
+pub mod frozen_placement;
 pub mod ingest;
 pub mod inspect;
 mod json_keys;
