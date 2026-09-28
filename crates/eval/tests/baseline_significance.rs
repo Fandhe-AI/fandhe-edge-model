@@ -18,7 +18,13 @@
 
 use fandhe_edge_eval::baseline::fit_majority;
 use fandhe_edge_eval::metrics::{EvalRecord, Outcome};
-use fandhe_edge_eval::significance::{BaselineVerdict, PairedRecord, compare_with_baseline};
+use fandhe_edge_eval::significance::{
+    BaselineVerdict, PairedRecord, RequiredSampleSize, compare_with_baseline,
+};
+
+/// PoC-10 の事前登録手続きで算出された必要件数（TASK-25.2 で算出関数が
+/// 実装されるまでは、証拠の種別: 転記〔PoC-10 実測値〕として固定値を使う）。
+const POC10_REQUIRED_SAMPLE_SIZE: u64 = 221;
 
 const ABS_EPSILON: f64 = 1e-9;
 const REL_EPSILON: f64 = 1e-9;
@@ -222,7 +228,8 @@ fn all_poc10_cases_are_significantly_better_than_majority() {
             case.label
         );
 
-        let comparison = compare_with_baseline(&labels, &records)
+        let required = RequiredSampleSize::new(POC10_REQUIRED_SAMPLE_SIZE).unwrap();
+        let comparison = compare_with_baseline(&labels, &records, required)
             .unwrap_or_else(|e| panic!("case {}: 比較に失敗: {e}", case.label));
 
         let counts = comparison.counts();
@@ -299,7 +306,9 @@ fn candidate_worse_than_majority_is_not_significantly_better() {
     let (gold, candidate, baseline) = build_rows(50, 3, 12, 50);
     let records = build_paired_records(&gold, &candidate, &baseline);
 
-    let comparison = compare_with_baseline(&labels, &records).unwrap();
+    // 必要件数は本テストの主題（方向の確認）とは無関係のため最小値にする。
+    let required = RequiredSampleSize::new(1).unwrap();
+    let comparison = compare_with_baseline(&labels, &records, required).unwrap();
     assert_eq!(comparison.counts().b_candidate_only, 3);
     assert_eq!(comparison.counts().c_baseline_only, 12);
     assert_eq!(
@@ -321,7 +330,8 @@ fn compare_with_baseline_preserves_input_records() {
         .map(|r| (r.gold, r.candidate.clone(), r.baseline.clone()))
         .collect();
 
-    let _ = compare_with_baseline(&labels, &records).unwrap();
+    let required = RequiredSampleSize::new(1).unwrap();
+    let _ = compare_with_baseline(&labels, &records, required).unwrap();
 
     let after: Vec<(&str, Outcome, Outcome)> = records
         .iter()

@@ -40,7 +40,11 @@
 //!   下限基準（majority）比較への接続・p<0.05 の判定は実装済み
 //!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
 //!   未実装。依存 `unicode-normalization` の承認と入力表現の整合の判断が要る）。
-//!   件数不足による「判定不能」の判定は未実装（TASK-25.2）。
+//!   件数不足による「判定不能」（`BaselineVerdict::Undeterminable`）は
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
+//!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が
+//!   事前に算出した値を渡す必要がある（TASK-25.2）。
 //!   複数候補比較の Holm 補正（REQ-26）は未実装（TASK-25.3）
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を

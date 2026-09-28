@@ -13,8 +13,11 @@
 //!   [`mcnemar_exact_two_sided`] の戻り値を使って呼び出し側が行う
 //!   （TASK-25.1-2・issue #65）
 //! - Holm 補正（複数候補の比較。REQ-26）は未実装（TASK-25.3）
-//! - 件数不足（不一致ペアが少なすぎる場合）の「判定不能」の判定は未実装
-//!   （TASK-25.2）。本モジュールはどんな `b`・`c` の組でも計算を試み、
+//! - 件数不足（評価件数 N が事前登録の必要件数未満）の「判定不能」の判定は
+//!   本モジュールの範囲外で、[`crate::significance::judge`]
+//!   （呼び出し側が渡す必要件数と比較する）が担う。必要件数自体を算出する
+//!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装（REQ-25・
+//!   TASK-25.2）。本モジュールはどんな `b`・`c` の組でも計算を試み、
 //!   資源上限を超える場合のみ [`McNemarError::TooManyDiscordantPairs`] を返す
 //! - [`paired_counts`] は、渡された 2 本の真偽値スライス（各件が正解なら
 //!   `true`）から対応のある正誤の件数を数えるだけで、[`EvalRecord`][crate::metrics::EvalRecord]
@@ -245,7 +248,8 @@ impl std::error::Error for McNemarError {}
 ///
 /// 長さが一致しない場合は [`McNemarError::LengthMismatch`] を返す。
 /// 空スライス（`n = 0`）はエラーにせず、全件 0 の [`PairedCounts`] を返す
-/// （「件数不足」の判定は TASK-25.2 が担う）。
+/// （必要件数との比較による「判定不能」の判定は
+/// [`crate::significance::judge`] が担う）。
 pub fn paired_counts(
     candidate_correct: &[bool],
     baseline_correct: &[bool],

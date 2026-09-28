@@ -9,8 +9,14 @@
 //!
 //! - Holm 補正（複数候補比較。REQ-26）は [`judge`] に `p` を引数で渡す形に
 //!   しておき、TASK-25.3 で補正後の p 値でも呼べるようにする
-//! - 件数不足による「判定不能」は未実装（TASK-25.2）。[`BaselineVerdict`]
-//!   は `#[non_exhaustive]` にしてあり、後から `Undecidable` を追加できる
+//! - 件数不足による「判定不能」（[`BaselineVerdict::Undeterminable`]）は
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   （[`RequiredSampleSize`]）を事前登録の手続きから算出する関数
+//!   （Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が事前に
+//!   算出した値を [`judge`]・[`compare_with_baseline`] の引数として渡す
+//!   必要がある（REQ-25・TASK-25.2。spec に固定の必要件数は無く、事前登録時に
+//!   算出する手続きだけが定められている。`04-requirements.md` L503-517。
+//!   PoC-10 の事前登録値は 221 件）
 //! - CLI の JSON 出力・終了コードへの写像は行わない（TASK-33.x / TASK-18.3）
 
 use crate::baseline::{self, BaselineError};
@@ -39,11 +45,56 @@ pub const MAX_EVAL_RECORDS: usize = 1_000_000;
 /// main の設計判断とユーザー承認を要する）。
 pub const SIGNIFICANCE_ALPHA: f64 = 0.05;
 
+/// 下限基準比較に必要な最小評価件数（N）。0 を拒否し、壊れた値
+/// （未設定・0 件）を表現できないようにする（`.claude/rules/coding-rust.md`
+/// 「公開 API・型設計」）。
+///
+/// 値は事前登録の手続き（PoC-10 相当）で算出したものを呼び出し側が用意する。
+/// spec（`04-requirements.md` L503-517。REQ-25）は固定の必要件数を定めておらず、
+/// 事前登録時に算出する手続きだけを定めている。算出関数（Connor 式・
+/// `required_n_mcnemar` 相当）自体は本モジュールでは実装しない（TASK-25.2。
+/// PoC-10 の事前登録値は 221 件）。
+///
+/// 既定値は持たない。呼び出し側が必ず明示的に値を渡す
+/// （2026-09-28 オーナー承認の設計）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RequiredSampleSize(u64);
+
+impl RequiredSampleSize {
+    /// `required` が 1 以上なら `Some` を返す。0 は「必要件数が未設定」と
+    /// 区別できず壊れた値になるため拒否する。
+    pub fn new(required: u64) -> Option<Self> {
+        if required == 0 {
+            None
+        } else {
+            Some(Self(required))
+        }
+    }
+
+    /// 中身の `u64` 値を取り出す。
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+/// 件数不足で判定不能になった理由。
+///
+/// [`BaselineVerdict::Undeterminable`] の内側に持たせる。テストが期待値を
+/// `assert_eq!` で構築できるよう `#[non_exhaustive]` は付けない
+/// （`required`・`actual` の両方が固定フィールドで、将来の拡張は本 struct
+/// 自体を非網羅にするより variant 追加で扱う想定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsufficientSamples {
+    /// 事前登録で算出した必要件数。
+    pub required: RequiredSampleSize,
+    /// 実際の評価件数（N。不一致ペア数 `b + c` ではなく比較対象レコードの総数）。
+    pub actual: u64,
+}
+
 /// 下限基準（majority）に対する判定。
 ///
-/// `#[non_exhaustive]` にしてあるのは、件数不足の「判定不能」
-/// （TASK-25.2・`Undecidable`）を後から追加できるようにするため。
-/// 現時点では判定不能は未実装（実装済みを装わない）。
+/// `#[non_exhaustive]` にしてあるのは、Holm 補正（TASK-25.3）等で
+/// variant が増える余地を残すため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BaselineVerdict {
@@ -51,14 +102,31 @@ pub enum BaselineVerdict {
     SignificantlyBetter,
     /// 有意に上回るとは言えない（`b <= c`、または `p >= `[`SIGNIFICANCE_ALPHA`]）。
     NotSignificantlyBetter,
+    /// 評価件数が必要件数（[`RequiredSampleSize`]）未満で判定できない
+    /// （REQ-25・TASK-25.2）。p 値・`b`・`c` の値によらず、合格扱い
+    /// （[`BaselineVerdict::SignificantlyBetter`]）にはならない。
+    Undeterminable(InsufficientSamples),
 }
 
 /// `α = `[`SIGNIFICANCE_ALPHA`]`` での有意性判定（純粋関数）。
 ///
-/// 規則: `b > c` かつ `p < α` なら [`BaselineVerdict::SignificantlyBetter`]、
-/// それ以外は [`BaselineVerdict::NotSignificantlyBetter`]
-/// （PoC-10 `stats_mcnemar.py` の「有意に上回る」の定義から Holm 補正を
-/// 除いたもの）。
+/// 規則（優先順）:
+///
+/// 1. `n_evaluated < required.get()`（評価件数が必要件数未満）なら
+///    [`BaselineVerdict::Undeterminable`]（`b`・`c`・`p` の値、`b > c` の
+///    向きによらず判定不能。REQ-25・TASK-25.2。件数不足の下限基準比較は、
+///    `(b, c) = (6, 0)`（p = 0.03125 < 0.05）のように p 値だけを見れば
+///    有意に見える場合でも合格扱い〔`SignificantlyBetter`〕にしない）
+/// 2. それ以外で `b > c` かつ `p < α` なら
+///    [`BaselineVerdict::SignificantlyBetter`]
+/// 3. それ以外は [`BaselineVerdict::NotSignificantlyBetter`]
+///
+/// （PoC-10 `stats_mcnemar.py` の「有意に上回る」の定義に、件数不足の
+/// 判定不能〔TASK-25.2〕を加えたもの。Holm 補正は対象外）
+///
+/// `n_evaluated` は比較に使う評価レコードの総件数 N（[`PairedCounts::n`]）
+/// であり、不一致ペア数 `b + c` ではない（PoC-10 事前登録の基準。
+/// `required` は [`RequiredSampleSize`] のドキュメント参照）。
 ///
 /// 比較は厳密な `<` とし、許容差は付けない。評価契約（REQ-24）が
 /// 「p < 0.05」を境界として定めており、判定を緩めない設計判断として
@@ -75,8 +143,19 @@ pub enum BaselineVerdict {
 /// 極めて近づく `(b, c)` では近似誤差により判定が理論値と入れ替わる
 /// 余地があるが、`<` を許容差なしで使うという設計判断自体は変えない
 /// （評価契約の変更にあたり、緩和には main の設計判断とユーザー承認を要する）。
-pub fn judge(b: u64, c: u64, p: PValue) -> BaselineVerdict {
-    if b > c && p.value() < SIGNIFICANCE_ALPHA {
+pub fn judge(
+    b: u64,
+    c: u64,
+    p: PValue,
+    n_evaluated: u64,
+    required: RequiredSampleSize,
+) -> BaselineVerdict {
+    if n_evaluated < required.get() {
+        BaselineVerdict::Undeterminable(InsufficientSamples {
+            required,
+            actual: n_evaluated,
+        })
+    } else if b > c && p.value() < SIGNIFICANCE_ALPHA {
         BaselineVerdict::SignificantlyBetter
     } else {
         BaselineVerdict::NotSignificantlyBetter
@@ -105,7 +184,8 @@ fn is_correct(gold: &str, outcome: &Outcome) -> bool {
 ///   `stats_mcnemar.py` のように黙って除外しない。正解側の欠陥はデータ契約層
 ///   の検査で扱う）
 /// - `records` が空の場合は [`BaselineError::EmptyRecords`]（評価済みを
-///   装わない。件数不足の判定不能は TASK-25.2 の担当）
+///   装わない。0 件は必要件数の多寡によらず判定できないため、[`judge`]の
+///   `Undeterminable` ではなくエラーとして扱う）
 /// - `records.len()` が [`MAX_EVAL_RECORDS`] を超える場合は確保前に
 ///   [`BaselineError::TooManyRecords`] を返す（REQ-39。Review 指摘。
 ///   TASK-25.1-2・issue #65）
@@ -201,7 +281,14 @@ impl BaselineComparison {
 ///
 /// 手順: ラベル検証 → 行ごとの正誤（候補・下限基準それぞれ [`is_correct`]
 /// と同じ規則）→ [`mcnemar::paired_counts`] → [`mcnemar::mcnemar_exact_two_sided`]
-/// → [`judge`]。
+/// → [`judge`]（評価件数 N として `counts.n` を渡す）。
+///
+/// `required` は事前登録で算出した必要件数（[`RequiredSampleSize`] の
+/// ドキュメント参照。REQ-25・TASK-25.2）。既定値は無く、呼び出し側が必ず
+/// 明示的に渡す。McNemar の統計量（`b`・`c`・p 値）は件数不足の場合も
+/// 計算して返す（CLI の JSON 出力が判定不能の場合でも統計量を提示できる
+/// ようにするため。判定〔[`BaselineComparison::verdict`]〕だけが
+/// `Undeterminable` になる）。
 ///
 /// `labels` 自体の検証（空・空 ID・重複・`MAX_LABELS` 超過）は
 /// [`baseline::validate_label_order`] に委ね、[`correctness`]・
@@ -217,6 +304,7 @@ impl BaselineComparison {
 pub fn compare_with_baseline(
     labels: &[&str],
     records: &[PairedRecord<'_>],
+    required: RequiredSampleSize,
 ) -> Result<BaselineComparison, BaselineError> {
     let index = baseline::validate_label_order(labels)?;
 
@@ -246,6 +334,8 @@ pub fn compare_with_baseline(
         counts.b_candidate_only,
         counts.c_baseline_only,
         test.p_two_sided(),
+        counts.n,
+        required,
     );
 
     Ok(BaselineComparison {
@@ -260,13 +350,20 @@ mod tests {
     use super::*;
     use crate::mcnemar::mcnemar_exact_two_sided;
 
+    /// テスト用の [`RequiredSampleSize`] 生成ヘルパー（不正値は使わない前提）。
+    fn req(n: u64) -> RequiredSampleSize {
+        RequiredSampleSize::new(n).expect("test helper requires a non-zero value")
+    }
+
     /// (13,4) は α のすぐ下（p = 0.049041748046875 < 0.05）→ Better。
+    /// 評価件数 N=221 は必要件数（PoC-10 の事前登録値）ちょうどで、
+    /// 件数不足による判定不能は起きない。
     #[test]
     fn judge_significantly_better_just_under_alpha() {
         let result = mcnemar_exact_two_sided(13, 4).unwrap();
         assert!(result.p_two_sided().value() < SIGNIFICANCE_ALPHA);
         assert_eq!(
-            judge(13, 4, result.p_two_sided()),
+            judge(13, 4, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::SignificantlyBetter
         );
     }
@@ -277,17 +374,17 @@ mod tests {
         let result = mcnemar_exact_two_sided(22, 10).unwrap();
         assert!(result.p_two_sided().value() >= SIGNIFICANCE_ALPHA);
         assert_eq!(
-            judge(22, 10, result.p_two_sided()),
+            judge(22, 10, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::NotSignificantlyBetter
         );
     }
 
-    /// (6,0) は p = 0.03125 → Better。
+    /// (6,0) は p = 0.03125 → Better（評価件数が必要件数以上の場合）。
     #[test]
     fn judge_significantly_better_small_case() {
         let result = mcnemar_exact_two_sided(6, 0).unwrap();
         assert_eq!(
-            judge(6, 0, result.p_two_sided()),
+            judge(6, 0, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::SignificantlyBetter
         );
     }
@@ -297,7 +394,7 @@ mod tests {
     fn judge_not_significantly_better_small_case() {
         let result = mcnemar_exact_two_sided(5, 0).unwrap();
         assert_eq!(
-            judge(5, 0, result.p_two_sided()),
+            judge(5, 0, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::NotSignificantlyBetter
         );
     }
@@ -307,7 +404,7 @@ mod tests {
     fn judge_not_significantly_better_moderate_p() {
         let result = mcnemar_exact_two_sided(9, 3).unwrap();
         assert_eq!(
-            judge(9, 3, result.p_two_sided()),
+            judge(9, 3, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::NotSignificantlyBetter
         );
     }
@@ -319,7 +416,7 @@ mod tests {
         // p = 0.03515625 < 0.05 だが b < c なので Not。
         assert!(result.p_two_sided().value() < SIGNIFICANCE_ALPHA);
         assert_eq!(
-            judge(3, 12, result.p_two_sided()),
+            judge(3, 12, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::NotSignificantlyBetter
         );
     }
@@ -329,9 +426,74 @@ mod tests {
     fn judge_not_significantly_better_zero_discordant() {
         let result = mcnemar_exact_two_sided(0, 0).unwrap();
         assert_eq!(
-            judge(0, 0, result.p_two_sided()),
+            judge(0, 0, result.p_two_sided(), 221, req(221)),
             BaselineVerdict::NotSignificantlyBetter
         );
+    }
+
+    /// REQ-25・TASK-25.2: 評価件数 N が必要件数未満なら、`(b,c)=(6,0)`
+    /// （p = 0.03125 < 0.05。単独では `SignificantlyBetter` になる値）でも
+    /// 判定不能（`Undeterminable`）になり、合格扱いにならないことを確認する。
+    #[test]
+    fn judge_undeterminable_when_below_required_sample_size() {
+        let result = mcnemar_exact_two_sided(6, 0).unwrap();
+        assert!(result.p_two_sided().value() < SIGNIFICANCE_ALPHA);
+        assert_eq!(
+            judge(6, 0, result.p_two_sided(), 220, req(221)),
+            BaselineVerdict::Undeterminable(InsufficientSamples {
+                required: req(221),
+                actual: 220,
+            })
+        );
+    }
+
+    /// REQ-25・TASK-25.2: 評価件数 N がちょうど必要件数なら判定不能にならない
+    /// （境界値）。
+    #[test]
+    fn judge_significantly_better_at_required_sample_size_boundary() {
+        let result = mcnemar_exact_two_sided(6, 0).unwrap();
+        assert_eq!(
+            judge(6, 0, result.p_two_sided(), 221, req(221)),
+            BaselineVerdict::SignificantlyBetter
+        );
+    }
+
+    /// REQ-25・TASK-25.2: 評価件数 N が必要件数を上回っても判定不能にならない。
+    #[test]
+    fn judge_significantly_better_above_required_sample_size() {
+        let result = mcnemar_exact_two_sided(6, 0).unwrap();
+        assert_eq!(
+            judge(6, 0, result.p_two_sided(), 222, req(221)),
+            BaselineVerdict::SignificantlyBetter
+        );
+    }
+
+    /// REQ-25・TASK-25.2: 件数不足は `b > c` の向きに関係なく判定不能になる
+    /// （下限基準が優勢な `(b,c)=(3,12)` でも `NotSignificantlyBetter` では
+    /// なく `Undeterminable` になることの確認）。
+    #[test]
+    fn judge_undeterminable_regardless_of_direction() {
+        let result = mcnemar_exact_two_sided(3, 12).unwrap();
+        assert_eq!(
+            judge(3, 12, result.p_two_sided(), 220, req(221)),
+            BaselineVerdict::Undeterminable(InsufficientSamples {
+                required: req(221),
+                actual: 220,
+            })
+        );
+    }
+
+    /// `RequiredSampleSize::new(0)` は不正値として拒否される。
+    #[test]
+    fn required_sample_size_rejects_zero() {
+        assert_eq!(RequiredSampleSize::new(0), None);
+    }
+
+    /// `RequiredSampleSize::new(1)` は最小の正当値として受け付けられる。
+    #[test]
+    fn required_sample_size_accepts_one() {
+        let size = RequiredSampleSize::new(1).unwrap();
+        assert_eq!(size.get(), 1);
     }
 
     /// `correctness`: `Label` 一致は正解。
@@ -422,7 +584,7 @@ mod tests {
     #[test]
     fn compare_with_baseline_empty_records_is_error() {
         let labels = ["A", "B"];
-        let err = compare_with_baseline(&labels, &[]).unwrap_err();
+        let err = compare_with_baseline(&labels, &[], req(1)).unwrap_err();
         assert_eq!(err, BaselineError::EmptyRecords);
     }
 
@@ -437,7 +599,7 @@ mod tests {
             candidate: &cand,
             baseline: &base,
         }];
-        let err = compare_with_baseline(&labels, &records).unwrap_err();
+        let err = compare_with_baseline(&labels, &records, req(1)).unwrap_err();
         assert_eq!(err, BaselineError::UnknownGoldLabel { index: 0 });
     }
 
@@ -465,7 +627,7 @@ mod tests {
             .iter()
             .map(|r| (r.gold, r.candidate.clone(), r.baseline.clone()))
             .collect();
-        let _ = compare_with_baseline(&labels, &records).unwrap();
+        let _ = compare_with_baseline(&labels, &records, req(1)).unwrap();
         let after: Vec<(&str, Outcome, Outcome)> = records
             .iter()
             .map(|r| (r.gold, r.candidate.clone(), r.baseline.clone()))
@@ -524,7 +686,7 @@ mod tests {
             candidate: &cand,
             baseline: &base,
         }];
-        let err = compare_with_baseline(&labels, &records).unwrap_err();
+        let err = compare_with_baseline(&labels, &records, req(1)).unwrap_err();
         assert_eq!(
             err,
             BaselineError::Eval(crate::metrics::EvalError::EmptyLabels)
@@ -569,7 +731,7 @@ mod tests {
                 baseline: &base,
             })
             .collect();
-        let err = compare_with_baseline(&labels, &records).unwrap_err();
+        let err = compare_with_baseline(&labels, &records, req(1)).unwrap_err();
         assert_eq!(
             err,
             BaselineError::TooManyRecords {
@@ -577,5 +739,54 @@ mod tests {
                 limit: MAX_EVAL_RECORDS,
             }
         );
+    }
+
+    /// REQ-25・TASK-25.2: `compare_with_baseline` を通しても、評価件数 N が
+    /// 必要件数未満なら判定不能になる（`(b,c)=(6,0)`。単体では p=0.03125 で
+    /// `SignificantlyBetter` になる値だが、N=6 < required=7 で判定できない）。
+    #[test]
+    fn compare_with_baseline_undeterminable_when_below_required_sample_size() {
+        let labels = ["A", "B"];
+        let cand = Outcome::Label("B".to_string());
+        let base = Outcome::Label("A".to_string());
+        // 6 件とも候補のみ正解（gold="B"）、下限基準は "A" を予測し不正解。
+        let records: Vec<PairedRecord<'_>> = (0..6)
+            .map(|_| PairedRecord {
+                gold: "B",
+                candidate: &cand,
+                baseline: &base,
+            })
+            .collect();
+
+        let comparison = compare_with_baseline(&labels, &records, req(7)).unwrap();
+        assert_eq!(comparison.counts().n, 6);
+        assert_eq!(comparison.counts().b_candidate_only, 6);
+        assert_eq!(comparison.counts().c_baseline_only, 0);
+        assert_eq!(
+            comparison.verdict(),
+            BaselineVerdict::Undeterminable(InsufficientSamples {
+                required: req(7),
+                actual: 6,
+            })
+        );
+    }
+
+    /// 同じ 6 件データで必要件数がちょうど 6 なら判定不能にならず、
+    /// 従来どおり `SignificantlyBetter` になる（境界値）。
+    #[test]
+    fn compare_with_baseline_significantly_better_at_required_sample_size_boundary() {
+        let labels = ["A", "B"];
+        let cand = Outcome::Label("B".to_string());
+        let base = Outcome::Label("A".to_string());
+        let records: Vec<PairedRecord<'_>> = (0..6)
+            .map(|_| PairedRecord {
+                gold: "B",
+                candidate: &cand,
+                baseline: &base,
+            })
+            .collect();
+
+        let comparison = compare_with_baseline(&labels, &records, req(6)).unwrap();
+        assert_eq!(comparison.verdict(), BaselineVerdict::SignificantlyBetter);
     }
 }
