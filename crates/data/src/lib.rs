@@ -2,12 +2,13 @@
 //!
 //! 利用者が用意した学習・評価データ（JSONL、1 行 1 レコード）の検査
 //! （REQ-16）・group 単位分割と凍結（REQ-17）・来歴（REQ-40）を担う層。
-//! 本 crate は現時点で以下の 3 つを実装する。
+//! 本 crate は現時点で以下を実装する。
 //!
 //! - [`inspect`]: 型・必須項目・ラベル enum の検査ロジック
 //!   （TASK-16.1（親 issue #37）のうち TASK-16.1-1・issue #38）
 //! - [`report`][]: 検査レポート（行数・ユニーク数・ラベル別件数の集計。
 //!   TASK-16.1-2・issue #39）
+//! - [`leak`]: 漏洩・group 跨ぎ検出（REQ-16・TASK-16.2-1・issue #41）
 //! - [`split`]: group 単位分割ロジック（TASK-17.1-1・issue #44）
 //! - [`eval_input`][]: 評価入力（gold・pred）の異常系処理（REQ-23・
 //!   TASK-23.1-1・issue #55（ケース 1〜6）・TASK-23.1-2・issue #56
@@ -16,8 +17,10 @@
 //!
 //! # 現状（実装済みを装わない）
 //!
-//! - データ検査のうち漏洩・group 跨ぎ・メタデータ混入・矛盾・正規化入力の
-//!   重複検出（REQ-16・TASK-16.2）: 未実装
+//! - データ検査（REQ-16）: 漏洩・group 跨ぎ検出（TASK-16.2-1・[`leak`]）は実装済み。
+//!   メタデータ混入・矛盾レコード検出（TASK-16.2-2）は未実装。正規化した
+//!   入力での漏洩照合（NFKC 等）も未実装（`unicode-normalization` の承認と
+//!   TASK-15.5 の完了が前提。[`leak`] のスコープの境界を参照）
 //! - 分割結果のハッシュ計算・記録・凍結（REQ-17・TASK-17.1-2/17.2/17.3）: 未実装
 //!   （後続 #45 が [`split`] モジュールの出力を消費してハッシュ化する。
 //!   [`inspect::inspect_records`] が返す [`inspect::ValidRecord`] は
@@ -37,7 +40,9 @@
 //! 足す想定であり、本 crate 自体を `fandhe-edge-core` に依存させる変更は
 //! 別 issue の範囲とする。[`split`] は `id`・`group_id`・ラベルだけを要求する
 //! 独立したトレイト（[`split::Groupable`]）で結合を最小化しており、同様に
-//! `fandhe-edge-core` には依存しない。
+//! `fandhe-edge-core` には依存しない。[`leak`] も同様に独立したトレイト
+//! （[`leak::LeakCheckable`]）で結合を最小化しており、学習ワーカー・
+//! 評価器・操作アダプターから呼ばれる想定。
 //!
 //! # 出典
 //!
@@ -63,5 +68,6 @@
 pub mod eval_input;
 pub mod inspect;
 mod json_keys;
+pub mod leak;
 pub mod report;
 pub mod split;
