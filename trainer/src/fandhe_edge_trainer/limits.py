@@ -308,24 +308,27 @@ MAX_AR_ATTENTION_ELEMENTS = 200_000_000
 #: この上限で fail-closed に拒否する（`limit_exceeded`・exit 20）。
 MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS = 200_000_000
 
-#: 推論 1 件（バッチ N=1）あたりで decoder の attention が確保しうる要素数
-#: （`K × heads × layers × L^2`。`L = T + 1 + M`）の上限
-#: （`kinds/autoregressive.py::_ar_export_attention_elements` 参照。PR #222
-#: レビュー指摘。REQ-39）。書き出す ONNX グラフは `ids: INT64 ["N","T"]` の
-#: `N`・`T` を動的軸として受け取るため、`T` は書き出し時点では未確定だが、
-#: 位置埋め込み表 `pos_table` の行数が学習時の `max_len = max_bytes + 1 + M`
-#: で固定されているため、`T` が学習時の `max_bytes` を超えると位置 id が
-#: `pos_table` の範囲外を参照する（`_export_ar_onnx` の `Gather(pos_table,
-#: pos_i64)` 参照）。この構造上の上限（`T <= max_bytes`）を使い、`N=1` かつ
-#: `T = max_bytes`（= 書き出し可能な最大構成）での attention 要素数を
-#: グラフ構築前に見積もって fail-closed に拒否する（`limit_exceeded`・
-#: exit 20）。K（選択肢数）・M（選択肢の最大バイト長+1）・layers・heads は
-#: 学習時に固定される値なので、この検査は書き出し時点で完結する。
-#: **バッチ件数 N（>1）分の上限は本検査では検査できない**。ONNX グラフの
-#: `N` 軸は推論時までサイズが決まらず、本ワーカー（Python）は実際に
-#: 渡される N を観測する手段を持たない（onnxruntime 等の推論依存を
-#: 学習側に追加しない方針・REQ-32）。N の上限は推論ランタイム・ガード層
-#: （REQ-39。パス未確定）側で、この定数と同じ計算式
-#: （`N × K × heads × layers × L^2` ≦ 本定数）を使って別途検査する必要が
-#: ある（本リポの `crates/` 側に未実装。将来対応。PR #222 レビュー指摘）。
+#: decoder の attention が確保しうる要素数（`N × K × heads × layers × L^2`。
+#: `L = T + 1 + M`）の上限（`kinds/autoregressive.py::
+#: _ar_export_attention_elements` 参照。PR #222 レビュー指摘。REQ-39）。
+#: 書き出す ONNX グラフは `ids: INT64 ["N","T"]` の `N`・`T` を動的軸として
+#: 受け取るため、いずれも書き出し時点では未確定であり、本ワーカー
+#: （Python）は実際の推論時に渡される `N`・`T` を観測する手段を持たない
+#: （onnxruntime 等の推論依存を学習側に追加しない方針・REQ-32）。
+#:
+#: 書き出し時点（`_check_ar_export_resources`）では、次の近似で `N=1`・
+#: `T=max_bytes` の 1 ケースのみを検査する: 位置埋め込み表 `pos_table` の
+#: 行数が学習時の `max_len = max_bytes + 1 + M` で固定されているため、
+#: **詰め物（PAD）を含まない密な入力**では `T` が学習時の `max_bytes` を
+#: 超えると位置 id（`CumSum(full_ids > 0) - 1`）が `pos_table` の範囲外を
+#: 参照する（`_export_ar_onnx` の `Gather(pos_table, pos_i64)` 参照）。
+#: **この構造上の上限は詰め物を多く含む長い入力には効かない**（PAD の
+#: 位置は `full_ids > 0` が偽になるため `CumSum` が進まず、位置 id は
+#: 頭打ちのまま `T` だけが伸びる。つまり `T` そのものへの上限にはならない）。
+#: よって本定数による書き出し時検査は「密な入力かつ N=1」という限定的な
+#: 最悪ケースの近似に過ぎず、`N > 1` や PAD を多く含む長い入力を実際に
+#: 拒否するには、推論ランタイム・ガード層（REQ-39。パス未確定）側で実測の
+#: `N`・`T` をこの定数と同じ計算式（`N × K × heads × layers × L^2` ≦
+#: 本定数）へ渡して検査する必要がある（本リポの `crates/` 側に未実装。
+#: 将来対応。PR #222 レビュー指摘）。
 MAX_AR_EXPORT_ATTENTION_ELEMENTS = 200_000_000

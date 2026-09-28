@@ -779,40 +779,51 @@ def _onnx_decoder_layer(
 
 
 def _ar_export_attention_elements(
-    k_classes: int, t_bound: int, m: int, layers: int, heads: int
+    n: int, k_classes: int, t_bound: int, m: int, layers: int, heads: int
 ) -> int:
-    """書き出す ONNX グラフが `N=1`・`T=t_bound`（書き出し時点で構造上
-    許容される最大の入力長。`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
-    docstring 参照）で推論されたときの、decoder attention の要素数の
-    見積もり（`K × heads × layers × L^2`。`L = T + 1 + M`）を返す
-    （REQ-39・PR #222 レビュー指摘）。
+    """decoder attention が確保しうる要素数の見積もり（`N × K × heads ×
+    layers × L^2`。`L = T + 1 + M`）を返す（REQ-39・PR #222 レビュー指摘）。
+
+    推論ランタイム側で `N`・`T` の実測値を使ってそのまま検査できるよう、
+    `N`・`T` を固定値に決め打ちしない計算式として実装している（本ワーカー
+    〔Python〕は実際の推論時の `N`・`T` を観測できないため、書き出し時には
+    `_check_ar_export_resources` が `N=1` を渡す。呼び出し側の docstring
+    参照）。
 
     decoder は選択肢展開後の `[N*K, L, L]` 形状で attention を計算するため
-    `K` を乗じ、各層で同形状のテンソルを確保しうるため `layers` を乗じる
-    （層間でメモリが解放される実装でも、上限側は保守的に見積もる）。
+    `N`・`K` を乗じ、各層で同形状のテンソルを確保しうるため `layers` を
+    乗じる（層間でメモリが解放される実装でも、上限側は保守的に見積もる）。
     引数はすべて 0 以上の整数であること（負数・非整数は呼び出し側の
-    バグであり、ここでは検査しない。すべて学習時に確定する固定値のみを
-    渡す契約のため）。
+    バグであり、ここでは検査しない。すべて学習時に確定する固定値、
+    または呼び出し側が検証済みの `N`・`T` のみを渡す契約のため）。
     """
     length = t_bound + 1 + m
-    return k_classes * heads * layers * length * length
+    return n * k_classes * heads * layers * length * length
 
 
 def _check_ar_export_resources(
     k_classes: int, t_bound: int, m: int, layers: int, heads: int
 ) -> None:
-    """`_ar_export_attention_elements` の見積もりが
+    """`_ar_export_attention_elements` の `N=1`・`T=t_bound` での見積もりが
     `MAX_AR_EXPORT_ATTENTION_ELEMENTS` を超えるとき `limit_exceeded` で
     fail-closed に拒否する（REQ-39・PR #222 レビュー指摘）。グラフ構築前に
     呼ぶことで、過大な attention テンソルを実際に確保する前に停止する。
+
+    `t_bound` は「密な入力（詰め物を含まない入力）における `T` の構造上の
+    上限」であり、詰め物（PAD）を多く含む入力で `T` がこれを超えるケースは
+    本検査では検出できない（`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
+    docstring 参照）。`N`（バッチ件数）についても同様に本ワーカーは実測値を
+    観測できないため、`N=1` の最小ケースのみを検査する。いずれも推論
+    ランタイム・ガード層（REQ-39。パス未確定）側で `N`・`T` の実測値を
+    `_ar_export_attention_elements` と同じ計算式へ渡して検査する必要がある。
     """
-    elements = _ar_export_attention_elements(k_classes, t_bound, m, layers, heads)
+    elements = _ar_export_attention_elements(1, k_classes, t_bound, m, layers, heads)
     if elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS:
         raise WorkerError(
             "limit_exceeded",
             f"estimated per-example attention elements {elements} (at N=1, T={t_bound})"
             f" exceeds limit {MAX_AR_EXPORT_ATTENTION_ELEMENTS}"
-            " (k_classes x heads x layers x (t_bound+1+m)^2)",
+            " (n x k_classes x heads x layers x (t_bound+1+m)^2, n=1)",
             ExitCode.LIMIT_EXCEEDED,
         )
 
@@ -861,14 +872,18 @@ def _export_ar_onnx(trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None
             ExitCode.LIMIT_EXCEEDED,
         )
 
-    # 推論時に渡されうる T（動的軸）を、位置埋め込み表 `pos_table` の行数
-    # （学習時に固定された `max_len = max_bytes + 1 + m`）から構造上の
-    # 上限へ落とし込み、N=1・T=t_bound（書き出し可能な最大構成）での
-    # decoder attention 要素数を見積もって検査する
-    # （`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring・
-    # `_ar_export_attention_elements` docstring 参照。REQ-39・PR #222
-    # レビュー指摘）。バッチ件数 N（>1）分の上限は本検査では検査できない
-    # （同 docstring 参照。推論ランタイム・ガード層側の将来対応）。
+    # 推論時に渡されうる T（動的軸）を、密な入力（詰め物を含まない入力）
+    # における構造上の上限（学習時の `max_bytes`。密な入力ではこれを
+    # 超えると位置埋め込み表 `pos_table`〔行数 = 学習時に固定された
+    # `max_len = max_bytes + 1 + m`〕への Gather が範囲外参照になる）と見なし、
+    # N=1・T=t_bound（書き出し可能な最大構成）での decoder attention 要素数を
+    # 見積もって検査する（`limits.py::MAX_AR_EXPORT_ATTENTION_ELEMENTS`
+    # docstring・`_ar_export_attention_elements`/`_check_ar_export_resources`
+    # docstring 参照。REQ-39・PR #222 レビュー指摘）。詰め物（PAD）を多く含む
+    # 長い入力は位置 id が `CumSum(full_ids > 0) - 1` で頭打ちにならないため
+    # この構造上の上限では拒否できず、また バッチ件数 N（>1）分の上限も
+    # 本検査では検査できない（同 docstring 参照。いずれも推論ランタイム・
+    # ガード層側の将来対応）。
     t_bound = trained.max_bytes
     _check_ar_export_resources(k_classes, t_bound, m, layers, heads)
 

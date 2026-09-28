@@ -337,24 +337,35 @@ def test_ar_export_rejects_choice_logprob_elements_over_limit(tmp_path: Path) ->
 
 
 def test_ar_export_attention_elements_formula() -> None:
-    """`_ar_export_attention_elements`: `K x heads x layers x (T+1+M)^2` を
-    具体値で計算すること（REQ-39・PR #222 レビュー指摘）。
+    """`_ar_export_attention_elements`: `N x K x heads x layers x (T+1+M)^2`
+    を具体値で計算すること（REQ-39・PR #222 レビュー指摘）。`N` を含む
+    計算式であることを N=1・N=2 の 2 通りで確認する（推論ランタイム側が
+    実測の `N`・`T` をそのまま渡せる形にするため。`limits.py::
+    MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring 参照）。
 
     `k_classes=3, t_bound=10, m=4, layers=2, heads=4` のとき
-    `L = 10+1+4 = 15`・`3 x 4 x 2 x 15^2 = 5400`。
+    `L = 10+1+4 = 15`・`N=1: 3 x 4 x 2 x 15^2 = 5400`・
+    `N=2: 2 x 5400 = 10800`。
     """
     from fandhe_edge_trainer.kinds.autoregressive import _ar_export_attention_elements
 
-    assert _ar_export_attention_elements(k_classes=3, t_bound=10, m=4, layers=2, heads=4) == 5400
+    assert (
+        _ar_export_attention_elements(n=1, k_classes=3, t_bound=10, m=4, layers=2, heads=4) == 5400
+    )
+    assert (
+        _ar_export_attention_elements(n=2, k_classes=3, t_bound=10, m=4, layers=2, heads=4) == 10800
+    )
 
 
 def test_ar_export_rejects_attention_elements_over_limit(tmp_path: Path) -> None:
-    """`MAX_AR_EXPORT_ATTENTION_ELEMENTS`: `T`（動的軸）を `pos_table` の
-    構造上の上限（学習時の `max_bytes`）まで広げたときの推論 1 件（N=1）
-    あたりの decoder attention 要素数（`K x heads x layers x (T+1+M)^2`）が
-    上限を超える場合、グラフ構築前に拒否すること（REQ-39・PR #222 レビュー
-    指摘。ONNX 推論時の動的入力 N・T に資源上限が無いという P0 指摘への
-    対応）。
+    """`MAX_AR_EXPORT_ATTENTION_ELEMENTS`: `T`（動的軸）を、密な入力（詰め物
+    を含まない入力）における構造上の上限（学習時の `max_bytes`）まで
+    広げたときの推論 1 件（N=1）あたりの decoder attention 要素数
+    （`K x heads x layers x (T+1+M)^2`）が上限を超える場合、グラフ構築前に
+    拒否すること（REQ-39・PR #222 レビュー指摘。ONNX 推論時の動的入力 N・T
+    に資源上限が無いという P0 指摘への対応。詰め物を多く含む長い入力・
+    N>1 の上限は本検査では検査できない。`limits.py::
+    MAX_AR_EXPORT_ATTENTION_ELEMENTS` docstring 参照）。
 
     実際の学習は極小データ（`TINY_AR_CONFIG`）で行い、書き出し直前に
     `max_bytes` だけを大きな合成値へ差し替えて T の構造上の上限を広げる
@@ -383,7 +394,7 @@ def test_ar_export_rejects_attention_elements_over_limit(tmp_path: Path) -> None
     layers = int(trained.config["layers"])
 
     assert k_classes * m * 259 <= MAX_AR_EXPORT_CHOICE_LOGPROB_ELEMENTS
-    elements = _ar_export_attention_elements(k_classes, huge_max_bytes, m, layers, heads)
+    elements = _ar_export_attention_elements(1, k_classes, huge_max_bytes, m, layers, heads)
     assert elements == 1_601_120_196
     assert elements > MAX_AR_EXPORT_ATTENTION_ELEMENTS
 
