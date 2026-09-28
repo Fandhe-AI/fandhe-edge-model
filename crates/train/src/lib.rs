@@ -21,15 +21,22 @@
 //! # 層の境界
 //!
 //! 学習ワーカー層（`trainer/` の呼び出し元）に位置し、共通コア
-//! （`fandhe-edge-core`）にのみ依存する（`label_order` を定義ファイル
-//! （`Definition`）から投影するため）。操作アダプター（CLI・TUI・MCP）・
-//! 推論ランタイムはこの crate に依存しない（推論経路に学習側の型を持ち込ま
-//! ない。REQ-32・`.claude/rules/coding-rust.md`）。
+//! （`fandhe-edge-core`）に加え、評価器（`fandhe-edge-eval`）にも依存する
+//! （[`selection_significance`] が選定結果への McNemar・Holm 有意性判定の
+//! 付与に評価器を呼ぶ。評価ロジックは再実装しない。REQ-18・TASK-18.3-1・
+//! #87）。操作アダプター（CLI・TUI・MCP）・推論ランタイムはこの crate に
+//! 依存しない（推論経路に学習側の型を持ち込まない。REQ-32・
+//! `.claude/rules/coding-rust.md`）。
+//!
+//! [`time_allotment`] は探索予算（REQ-18。既定 1 時間）のうち候補 1 件へ
+//! 配分する持ち時間の算出・実行記録を担う（TASK-18.1-1・issue #83）。
 //!
 //! # スコープ外（#178 以降）
 //!
 //! - 子プロセスの起動・タイムアウト・終了コード写像（ワーカーの `code` から
-//!   [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）
+//!   [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）。
+//!   [`time_allotment::CandidateRunner`] はこの実行器を差し込むための
+//!   接合点（trait）のみを用意する
 //! - `kind` ごとの `config` 検証（`config` は「JSON オブジェクトであること」
 //!   だけを検査する。`kinds/c1.py`・`c3.py` の `_validate_config` は再実装
 //!   しない）
@@ -37,9 +44,15 @@
 //!   文字列としての構文検査に留め、存在確認・dir_fd による閉じ込めは学習
 //!   ワーカー自身の多層防御（`trainer/src/fandhe_edge_trainer/guard.py`）と
 //!   将来のガード層（TASK-39.x）が担う）
+//! - 探索予算全体の積算・複数候補の比較・選定の記録（#84・TASK-18.1-2）
+//! - 「予算到達」を合格扱いしない判定（TASK-18.2）
 
 pub mod error;
 mod kind_defaults;
 pub mod limits;
 pub mod request;
 pub mod result;
+// 選定結果への McNemar・Holm 有意性判定の付与（評価器
+// `fandhe-edge-eval` を呼ぶ。REQ-18・REQ-25・TASK-18.3-1・#87）。
+pub mod selection_significance;
+pub mod time_allotment;

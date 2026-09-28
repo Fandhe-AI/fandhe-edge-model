@@ -15,6 +15,10 @@
 //!   （REQ-25 正常系・TASK-25.1-1・issue #64）
 //! - [`baseline`][]: 下限基準（majority）の予測生成（REQ-25・TASK-25.1-2・
 //!   issue #65）
+//! - [`calibration`][]: 温度スケーリング（T）と保留しきい値（τ）の校正計算
+//!   （REQ-22 正常系・TASK-22.1-1・issue #95。PoC-12 移植。保留状態への
+//!   接続と誤り率の比較は #96、「対象外」ラベルは TASK-22.2、coverage の
+//!   記録と表示は TASK-22.3 が担当し未実装）
 //! - [`significance`][]: 行ごとの正誤 → McNemar 検定 → α=0.05 での有意性
 //!   判定への接続（REQ-25・TASK-25.1-2・issue #65）
 //! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
@@ -33,12 +37,32 @@
 //!   ハッシュ比較・データ契約層（`fandhe-edge-data`）の凍結記録との接続
 //!   （REQ-27 正常系・REQ-17・TASK-27.1-2・issue #70）。[`invariance`] のモデル
 //!   パッケージ側と対になる評価データ側の実装
+//! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
+//!   必要評価件数の事前計算（Connor 式を起点に、実際に使う両側正確検定の
+//!   検出力で引き上げる。REQ-25 異常系・TASK-25.2・issue #66・
+//!   PR #230 レビュー指摘・P0）。[`significance::RequiredSampleSize`] を
+//!   [`sample_size::required_sample_size_mcnemar`] で算出できる
 //! - [`holm`][]: 複数候補比較の Holm 法による多重比較補正
 //!   （REQ-25 境界値・TASK-25.3・issue #67）。[`significance`] が返す
 //!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
+//! - [`regression`][]: 旧モデルとの比較による回帰件数（正解→不正解）・
+//!   改善件数（不正解→正解）の算出（REQ-26 正常系・TASK-26.1-1・issue #100）。
+//!   [`significance::is_correct`] と同じ正誤規則・[`mcnemar::paired_counts`]
+//!   を再利用し、評価ロジックを層内で再実装しない
+//! - [`reproducibility`][]: 3 seed 以上の Wilson 95% 信頼区間の重なり判定
+//!   （REQ-26 境界値・TASK-26.3-1・issue #104）。公開 API は
+//!   `(seed, correct, total, eval_data_hash)` の組（[`reproducibility::SeedRun`]）
+//!   を受け取る [`reproducibility::judge_reproducibility`] のみで、区間
+//!   （[`wilson`] が返す型）を直接受け取る内部関数は seed・評価データの
+//!   由来を検証できないため crate 内部限定（issue #104 レビュー指摘・
+//!   PR #243）
 //!
 //! # 現状（実装済みを装わない）
 //!
+//! - T・τ の校正計算（REQ-22）: 実装済み（TASK-22.1-1・issue #95。
+//!   [`calibration::calibrate`]）。保留状態への接続と誤り率の比較（#96）、
+//!   「対象外」ラベル（TASK-22.2）、coverage の記録と表示（TASK-22.3）は
+//!   未実装
 //! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
 //!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
 //!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
@@ -54,13 +78,26 @@
 //!   （TASK-25.1-2・issue #65。文字 n-gram 規則等の `simple_rule` 下限基準は
 //!   未実装。依存 `unicode-normalization` の承認と入力表現の整合の判断が要る）。
 //!   件数不足による「判定不能」（`BaselineVerdict::Undeterminable`）は
-//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`significance::RequiredSampleSize`]）を事前登録の手続きから算出する
-//!   関数（Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が
-//!   事前に算出した値を渡す必要がある（TASK-25.2）。
+//!   関数（Connor 式の正規近似を起点に、実際に使う両側正確検定の検出力で
+//!   引き上げる）も実装済み（[`sample_size::required_sample_size_mcnemar`]。
+//!   TASK-25.2・issue #66・PR #230 レビュー指摘・P0）。
+//!   仮定値（`p_b`・`p_c`・`alpha`・`power`）を
+//!   定義ファイル・CLI 引数のどこから受け取るかは未確定（TASK-33.x）。
 //!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
 //!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
 //!   統合は未実装）
+//! - 旧モデルとの回帰件数・改善件数（REQ-26）: 件数の算出は実装済み
+//!   （TASK-26.1-1・issue #100・[`regression`]）。Wilson 95% 信頼区間の付与
+//!   （TASK-26.1-2・issue #101）・ラベル集合相違の前提明記（TASK-26.2）・
+//!   作り直し判定（TASK-20.1）との接続・CLI `evaluate`
+//!   工程への配線（issue #140）は未実装
+//! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:
+//!   判定ロジックは実装済み（TASK-26.3-1・issue #104・[`reproducibility`]）。
+//!   CPU 決定性テスト・GPU 未確認の限界の詳しい記述は未実装（issue #105）。
+//!   CLI `evaluate` への配線・3 seed 再学習ジョブ（REQ-34）との接続・
+//!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
 //!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -110,11 +147,15 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod baseline;
+pub mod calibration;
 pub mod eval_data_invariance;
 pub mod holm;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;
+pub mod regression;
+pub mod reproducibility;
+pub mod sample_size;
 pub mod significance;
 pub mod wilson;

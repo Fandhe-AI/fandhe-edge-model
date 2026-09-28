@@ -42,6 +42,12 @@
 //! `infer_input` モジュールは TASK-21.2 で推論入力レコードの未知形式・型
 //! 不正を検出し `invalid_input`／`limit_exceeded` へ写す型を実装済み
 //! （CLI バイナリへの配線は TASK-33.x の対象で未着手）。
+//! `rebuild` モジュールは TASK-20.1-1（issue #90）で作り直し判定
+//! （[`rebuild::RebuildDecision`]）の型と比較骨格を、TASK-20.1-2（issue #91）
+//! で追加・削除・統合の網羅的なパターン検出を、TASK-20.2（issue #92）で
+//! `NotRequired` の差分詳細（[`rebuild::NotRequiredRebuild`]）を、
+//! TASK-20.3（issue #93）でハッシュ完全一致時に比較処理を一切実行しない
+//! ことの保証と専用テストを実装済み（REQ-20 の正常系・異常系・境界値）。
 
 pub mod canonical;
 pub mod definition;
@@ -50,3 +56,4 @@ pub mod fs;
 pub mod hash;
 pub mod infer_input;
 pub mod judgment;
+pub mod rebuild;

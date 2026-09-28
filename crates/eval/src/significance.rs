@@ -13,13 +13,18 @@
 //!   [`crate::holm::compare_candidates_with_holm`] が判定を出し直す際に
 //!   必要件数を取り違えないよう保持している
 //! - 件数不足による「判定不能」（[`BaselineVerdict::Undeterminable`]）は
-//!   実装済み（TASK-25.1-2・issue #65・PR #219）。ただし必要件数
+//!   実装済み（TASK-25.1-2・issue #65・PR #219）。必要件数
 //!   （[`RequiredSampleSize`]）を事前登録の手続きから算出する関数
-//!   （Connor 式・`required_n_mcnemar` 相当）は未実装で、呼び出し側が事前に
-//!   算出した値を [`judge`]・[`compare_with_baseline`] の引数として渡す
-//!   必要がある（REQ-25・TASK-25.2。spec に固定の必要件数は無く、事前登録時に
-//!   算出する手続きだけが定められている。`04-requirements.md` L503-517。
-//!   PoC-10 の事前登録値は 221 件）
+//!   （Connor 式の正規近似を起点に、実際に使う両側正確検定の検出力で
+//!   引き上げる）は [`crate::sample_size::required_sample_size_mcnemar`]
+//!   として実装済み（REQ-25・TASK-25.2・issue #66・PR #230 レビュー
+//!   指摘・P0）。呼び出し側はその戻り値を [`judge`]・
+//!   [`compare_with_baseline`] の引数として渡す（spec に固定の必要件数は
+//!   無く、事前登録時に算出する手続きだけが定められている。
+//!   `04-requirements.md` L503-517。PoC-10 の事前登録値は正規近似の
+//!   `ceil(n)=221` 件だが、正確検定の検出力探索で求め直すと 229 件になる。
+//!   `crates/eval/tests/baseline_significance.rs`
+//!   `poc10_required_sample_size_is_229` 参照）
 //! - CLI の JSON 出力・終了コードへの写像は行わない（TASK-33.x / TASK-18.3）
 
 use crate::baseline::{self, BaselineError};
@@ -54,9 +59,11 @@ pub const SIGNIFICANCE_ALPHA: f64 = 0.05;
 ///
 /// 値は事前登録の手続き（PoC-10 相当）で算出したものを呼び出し側が用意する。
 /// spec（`04-requirements.md` L503-517。REQ-25）は固定の必要件数を定めておらず、
-/// 事前登録時に算出する手続きだけを定めている。算出関数（Connor 式・
-/// `required_n_mcnemar` 相当）自体は本モジュールでは実装しない（TASK-25.2。
-/// PoC-10 の事前登録値は 221 件）。
+/// 事前登録時に算出する手続きだけを定めている。算出関数（Connor 式）は
+/// [`crate::sample_size::required_sample_size_mcnemar`] として実装済み
+/// （TASK-25.2・issue #66。PoC-10 の事前登録値は 221 件）。本モジュール自体は
+/// 算出済みの値を受け取るだけで、算出ロジックには依存しない（循環依存を
+/// 避けるため `sample_size` → `significance` の一方向のみ）。
 ///
 /// 既定値は持たない。呼び出し側が必ず明示的に値を渡す
 /// （2026-09-28 オーナー承認の設計）。
@@ -175,7 +182,12 @@ pub fn judge(
 /// `Outcome::Label(l)` で `l == gold` の場合のみ正解。未知ラベル・
 /// `Invalid`・`Abstain`・`Error` はすべて不正解として扱う（PoC-10:
 /// 予測の欠落・`status` が ok 以外・ラベル違いはすべて不正解）。
-fn is_correct(gold: &str, outcome: &Outcome) -> bool {
+///
+/// `pub(crate)`: [`crate::regression`]（旧モデルとの回帰件数算出。REQ-26・
+/// TASK-26.1-1・issue #100）も本関数と同じ正誤規則を使う。正誤規則を
+/// 1 箇所に集約し、評価ロジックを層内で再実装しない（crate ドキュメント
+/// 「評価器は TASK-24.1 の 1 つだけに集約する」）。
+pub(crate) fn is_correct(gold: &str, outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Label(l) if l == gold)
 }
 
