@@ -19,6 +19,18 @@ fandhe-edge-core.workspace = true
 # 1 つに集約し、本 crate で再実装しない（`.claude/rules/coding-rust.md`）。
 # `fandhe-edge-eval` は本 crate に依存していないため循環しない。
 fandhe-edge-eval.workspace = true
+# workspace 内の path 依存（外部 crate の追加ではない。ユーザー承認済み・
+# issue #84 PR #238 レビュー・P0 指摘対応）。`search` モジュールが
+# validation split の凍結記録（`SplitRecord`・REQ-17）を `SearchInput` の
+# 一部として受け取り、`validate_input` が validation_record_ids から
+# 同じ規則で再計算したハッシュと記録済みのハッシュを照合するために使う
+# （REQ-27「評価の独立性」。凍結した最終 test 分割を validation として
+# 渡す誤用を拒否する）。ハッシュの正準化規則は `fandhe-edge-core::canonical`
+# の 1 箇所に集約されたままで、本 crate では再実装しない。
+# `fandhe-edge-eval` も同じ理由で `fandhe-edge-data` に依存しており
+# （`crates/eval/Cargo.toml`）、依存の向きは core → data → eval → train の
+# 一方向のまま循環しない。
+fandhe-edge-data.workspace = true
 # 学習リクエスト・結果 JSON の検証済み型への読み込み・直列化に使う（2026-09-27
 # オーナー承認済み。配置層に学習ワーカー層〔本 crate〕が加わることは
 # dependency-policy.md「承認済みの依存」の表更新と合わせてオーナー確認事項とする）。

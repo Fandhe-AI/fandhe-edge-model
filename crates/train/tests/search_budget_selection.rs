@@ -2,21 +2,33 @@
 //! 複数候補の比較・選定の記録の受け入れ条件を確認する結合テスト
 //! （証拠種別: テストハーネス）。
 //!
-//! `FakeClock`（`crates/train/tests/candidate_time_limit.rs` と同じ `Cell`
-//! 方式）・`FakeRunner`（呼び出しごとの所要 ms と結果種別を事前登録した
-//! 実行器）・`FakeScorer`（candidate_id ごとの validation 予測を返す推論器）
-//! で `fandhe_edge_train::search::run_search` を検証する。`thread::sleep`・
-//! 実時間には依存しない（3 OS の CI での決定性のため。`.claude/rules/ci.md`）。
-//! 本テストは `crates/train`・`crates/eval`・`fandhe-edge-core` の範囲に
-//! 閉じており、`docs/spec` は参照しない。
+//! `FakeClock`（`Mutex` で内部可変性を持つ仮想時計）・`FakeRunner`（呼び出し
+//! ごとの所要 ms と結果種別を事前登録した実行器）・`FakeScorer`
+//! （candidate_id ごとの validation 予測を返す推論器）で
+//! `fandhe_edge_train::search::run_search` を検証する。`ValidationScorer:
+//! Send + 'static`（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）に
+//! なったことに伴い、`run_search` は scorer を締め切り付きの専用スレッドへ
+//! 渡すため、`FakeClock`・`FakeScorer` はスレッド境界を越えられるよう
+//! `candidate_time_limit.rs` と異なり `Cell` ではなく `Mutex`／`Arc` を使う
+//! （モジュール内の各型 doc 参照）。ほとんどのテストは `thread::sleep`・
+//! 実時間に依存しない（3 OS の CI での決定性のため。`.claude/rules/ci.md`）。
+//! **例外は 1 件**（締め切りを守らない scorer を確認するテスト。
+//! `task18_1_2_scorer_exceeding_deadline_is_recorded_as_timed_out`）で、
+//! 締め切り超過を実際に発生させるため意図的に実時間の `thread::sleep` を
+//! 使う（当該テストの doc コメント参照）。本テストは `crates/train`・
+//! `crates/data`・`crates/eval`・`fandhe-edge-core` の範囲に閉じており、
+//! `docs/spec` は参照しない。
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
+use fandhe_edge_data::split::{Groupable, Split, SplitRatios};
+use fandhe_edge_data::split_record::{SplitRecord, split_and_record};
 use fandhe_edge_eval::metrics::Outcome;
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 use fandhe_edge_train::result::{SuccessOutcome, TrainOutcome};
@@ -50,6 +62,57 @@ const VALIDATION_RECORD_IDS: [&str; VALIDATION_LEN] =
 const VALIDATION_INPUTS: [&[u8]; VALIDATION_LEN] = [
     b"i0", b"i1", b"i2", b"i3", b"i4", b"i5", b"i6", b"i7", b"i8", b"i9",
 ];
+
+/// [`Groupable`] の最小実装（`fandhe_edge_data::split_record` のテストと
+/// 同じ設計）。
+struct SplitGroupable {
+    id: String,
+    group_id: String,
+    label: String,
+}
+
+impl Groupable for SplitGroupable {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn group_id(&self) -> &str {
+        &self.group_id
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// `VALIDATION_RECORD_IDS` を validation split の record_ids として持つ
+/// [`SplitRecord`] を組み立てる（P0 指摘対応・REQ-17・REQ-27。issue #84
+/// PR #238 レビュー）。比率 `validation: 1.0`（train・test は `0.0`）を
+/// 指定すると、`fandhe_edge_data::split::alloc_counts` の契約
+/// （比率が厳密に `0.0` の split には一切割り付けない）により、全レコード
+/// が validation split に入る。各レコードを別 group にして group 単位分割の
+/// 影響を受けないようにする。
+fn validation_split_record_fixture() -> SplitRecord {
+    let records: Vec<SplitGroupable> = VALIDATION_RECORD_IDS
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| SplitGroupable {
+            id: id.to_string(),
+            group_id: format!("g{i}"),
+            label: "positive".to_string(),
+        })
+        .collect();
+    let ratios = SplitRatios {
+        train: 0.0,
+        validation: 1.0,
+        test: 0.0,
+    };
+    let recorded = split_and_record(&records, 0, &ratios).expect("valid ratios");
+    let record = recorded.record().clone();
+    assert_eq!(
+        record.digest(Split::Validation).record_ids(),
+        VALIDATION_RECORD_IDS
+    );
+    record
+}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -108,34 +171,41 @@ fn candidate_params(out_dir: &str, seed: u32) -> TrainRequestParams {
     }
 }
 
-/// テストが自由に進められる仮想時計（`candidate_time_limit.rs` と同じ設計）。
+/// テストが自由に進められる仮想時計。
+///
+/// `ValidationScorer: Send + 'static`（P0 指摘対応・REQ-39。issue #84
+/// PR #238 レビュー）になったことに伴い、`FakeScorer` は `Arc<FakeClock>`
+/// で本時計を共有する（`predict_validation` が専用スレッドで実行されるため、
+/// `Cell`〔`candidate_time_limit.rs` と同じ従来設計〕のような `Sync` でない
+/// 内部可変性は使えない）。`Mutex` で保護する。
 struct FakeClock {
-    elapsed: Cell<Duration>,
-    unix_ms: Cell<u64>,
+    elapsed: Mutex<Duration>,
+    unix_ms: Mutex<u64>,
 }
 
 impl FakeClock {
     fn new(start_unix_ms: u64) -> Self {
         Self {
-            elapsed: Cell::new(Duration::ZERO),
-            unix_ms: Cell::new(start_unix_ms),
+            elapsed: Mutex::new(Duration::ZERO),
+            unix_ms: Mutex::new(start_unix_ms),
         }
     }
 
     fn advance_ms(&self, ms: u64) {
-        self.elapsed
-            .set(self.elapsed.get() + Duration::from_millis(ms));
-        self.unix_ms.set(self.unix_ms.get() + ms);
+        let mut elapsed = self.elapsed.lock().expect("fake clock mutex poisoned");
+        *elapsed += Duration::from_millis(ms);
+        let mut unix_ms = self.unix_ms.lock().expect("fake clock mutex poisoned");
+        *unix_ms += ms;
     }
 }
 
 impl Clock for FakeClock {
     fn monotonic(&self) -> Duration {
-        self.elapsed.get()
+        *self.elapsed.lock().expect("fake clock mutex poisoned")
     }
 
     fn unix_millis(&self) -> Result<u64, fandhe_edge_train::time_allotment::TimeAllotmentError> {
-        Ok(self.unix_ms.get())
+        Ok(*self.unix_ms.lock().expect("fake clock mutex poisoned"))
     }
 }
 
@@ -224,25 +294,19 @@ impl std::fmt::Display for FakeScorerError {
     }
 }
 
-/// candidate_id ごとに事前登録した validation 予測（または失敗）を返す
-/// 推論器。呼び出し順・件数・受け取った `time_limit`・`records`
-/// （record_id・byte 入力の組）を記録する（REQ-27:
-/// `validation_gold`〔正解ラベル〕を渡さないことは trait の署名で構造的に
-/// 保証される）。
+/// [`FakeScorer`] の呼び出し履歴（P0 指摘対応・REQ-39。issue #84 PR #238
+/// レビュー）。
 ///
-/// `advance_ms`（candidate_id ごと）を指定すると、`predict_validation` の
-/// 呼び出し中に `clock` を進める（P0・REQ-39: 採点が探索予算を超過する
-/// ケースを模擬する。呼び出し自体を打ち切れないことをテストでも示す）。
-///
-/// 既定では受け取った `records` の `record_id` をそのまま echo する
-/// （正直な実装を模擬）。`record_id_override`（candidate_id ごと）を指定
-/// すると、代わりに別の record_id 列を返す（P0・REQ-27: `run_search` が
-/// record_id の不一致を検出することを確認するテスト専用）。
-struct FakeScorer<'a> {
-    clock: &'a FakeClock,
-    responses: BTreeMap<String, Result<Vec<Outcome>, FakeScorerError>>,
-    advance_ms: BTreeMap<String, u64>,
-    record_id_override: BTreeMap<String, Vec<String>>,
+/// `ValidationScorer: Send + 'static` になったことに伴い、`run_search` は
+/// `scorer`（[`FakeScorer`]）の所有権を締め切り付きの専用スレッドへ渡す
+/// （`call_predict_validation_with_deadline` 参照）。呼び出し後に
+/// `FakeScorer` 自身を直接検査できなくなる（所有権が `run_search` 側へ
+/// 移り、スレッドを介して返るか、締め切り超過時は戻ってこない）ため、
+/// `Arc<Mutex<_>>` で共有する別データとして呼び出し履歴を保持し、
+/// `run_search` へ `scorer` を渡す前に [`FakeScorer::probe`] で複製した
+/// ハンドルをテスト側に残しておく。
+#[derive(Debug, Default)]
+struct FakeScorerProbe {
     calls: Vec<String>,
     time_limits: Vec<Duration>,
     /// 呼び出しごとに受け取った `(record_id, input)` の組（P0・REQ-27:
@@ -253,26 +317,67 @@ struct FakeScorer<'a> {
     received_records: Vec<Vec<(String, Vec<u8>)>>,
 }
 
-impl<'a> FakeScorer<'a> {
+/// candidate_id ごとに事前登録した validation 予測（または失敗）を返す
+/// 推論器。呼び出し順・件数・受け取った `time_limit`・`records`
+/// （record_id・byte 入力の組）を [`FakeScorerProbe`] へ記録する（REQ-27:
+/// `validation_gold`〔正解ラベル〕を渡さないことは trait の署名で構造的に
+/// 保証される）。
+///
+/// `advance_ms`（candidate_id ごと）を指定すると、`predict_validation` の
+/// 呼び出し中に `clock`（[`Arc<FakeClock>`]。全候補・`run_search` 本体と
+/// 共有する）を進める（P0・REQ-39: 採点が探索予算を超過するケースを模擬
+/// する。呼び出し自体を打ち切れないことをテストでも示す）。`sleep_ms`
+/// （candidate_id ごと）を指定すると、`predict_validation` の呼び出し中に
+/// 実時間で `thread::sleep` する（P0 指摘対応・REQ-39: 締め切りを守らない
+/// 実装が `ScoringTimedOut` として打ち切られることを確認するテスト専用。
+/// 本テストのみ実時間に依存する）。
+///
+/// 既定では受け取った `records` の `record_id` をそのまま echo する
+/// （正直な実装を模擬）。`record_id_override`（candidate_id ごと）を指定
+/// すると、代わりに別の record_id 列を返す（P0・REQ-27: `run_search` が
+/// record_id の不一致を検出することを確認するテスト専用）。
+struct FakeScorer {
+    clock: Arc<FakeClock>,
+    responses: BTreeMap<String, Result<Vec<Outcome>, FakeScorerError>>,
+    advance_ms: BTreeMap<String, u64>,
+    sleep_ms: BTreeMap<String, u64>,
+    record_id_override: BTreeMap<String, Vec<String>>,
+    probe: Arc<Mutex<FakeScorerProbe>>,
+}
+
+impl FakeScorer {
     fn new(
-        clock: &'a FakeClock,
+        clock: Arc<FakeClock>,
         responses: BTreeMap<String, Result<Vec<Outcome>, FakeScorerError>>,
     ) -> Self {
         Self {
             clock,
             responses,
             advance_ms: BTreeMap::new(),
+            sleep_ms: BTreeMap::new(),
             record_id_override: BTreeMap::new(),
-            calls: Vec::new(),
-            time_limits: Vec::new(),
-            received_records: Vec::new(),
+            probe: Arc::new(Mutex::new(FakeScorerProbe::default())),
         }
+    }
+
+    /// 呼び出し履歴を検査するための共有ハンドルを複製する。`run_search`
+    /// （所有権を取る）へ `self` を渡す**前**に呼ぶこと。
+    fn probe(&self) -> Arc<Mutex<FakeScorerProbe>> {
+        Arc::clone(&self.probe)
     }
 
     /// `candidate_id` の採点呼び出し中に `clock` を `ms` だけ進めるよう
     /// 登録する（P0 テスト専用）。
     fn with_advance(mut self, candidate_id: &str, ms: u64) -> Self {
         self.advance_ms.insert(candidate_id.to_string(), ms);
+        self
+    }
+
+    /// `candidate_id` の採点呼び出し中に実時間で `ms` ミリ秒 `thread::sleep`
+    /// するよう登録する（P0 指摘対応・REQ-39 テスト専用: 締め切りを守らない
+    /// 実装を模擬する）。
+    fn with_sleep(mut self, candidate_id: &str, ms: u64) -> Self {
+        self.sleep_ms.insert(candidate_id.to_string(), ms);
         self
     }
 
@@ -288,7 +393,7 @@ impl<'a> FakeScorer<'a> {
     }
 }
 
-impl ValidationScorer for FakeScorer<'_> {
+impl ValidationScorer for FakeScorer {
     type Error = FakeScorerError;
 
     fn predict_validation(
@@ -298,14 +403,24 @@ impl ValidationScorer for FakeScorer<'_> {
         records: &[ValidationInputRecord<'_>],
         time_limit: Duration,
     ) -> Result<Vec<ScoredOutcome>, Self::Error> {
-        self.calls.push(candidate_id.to_string());
-        self.time_limits.push(time_limit);
-        self.received_records.push(
-            records
-                .iter()
-                .map(|record| (record.record_id.to_string(), record.input.to_vec()))
-                .collect(),
-        );
+        {
+            let mut probe = self.probe.lock().expect("fake scorer probe poisoned");
+            probe.calls.push(candidate_id.to_string());
+            probe.time_limits.push(time_limit);
+            probe.received_records.push(
+                records
+                    .iter()
+                    .map(|record| (record.record_id.to_string(), record.input.to_vec()))
+                    .collect(),
+            );
+        }
+        if let Some(&ms) = self.sleep_ms.get(candidate_id) {
+            // P0 指摘対応（REQ-39）: 締め切りを守らない scorer を模擬する
+            // ため、本テストに限り実時間で待つ（`call_predict_validation_with_deadline`
+            // が別スレッドで本メソッドを呼ぶため、ここで実時間 sleep しても
+            // 呼び出し元（`recv_timeout`）は待たされない）。
+            thread::sleep(Duration::from_millis(ms));
+        }
         if let Some(&ms) = self.advance_ms.get(candidate_id) {
             self.clock.advance_ms(ms);
         }
@@ -337,7 +452,7 @@ fn fixed_policy(seconds: u32) -> PerCandidatePolicy {
 /// うち最高正解率の候補（9/10）が選ばれる。
 #[test]
 fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -346,8 +461,8 @@ fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
             RunnerBehavior::Ok { advance_ms: 1_000 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             ("c3-a".to_string(), Ok(outcomes_with_correct(7))),
             ("c3-b".to_string(), Ok(outcomes_with_correct(9))),
@@ -375,12 +490,14 @@ fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
 
     match &record.selection {
         SelectionDecision::Selected {
@@ -409,7 +526,10 @@ fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
         );
     }
     assert_eq!(runner.calls, 3);
-    assert_eq!(scorer.calls, vec!["c3-a", "c3-b", "c3-c"]);
+    assert_eq!(
+        probe.lock().expect("probe poisoned").calls,
+        vec!["c3-a", "c3-b", "c3-c"]
+    );
 }
 
 /// (T2・予算の消費) 予算 100 秒・`Fixed(50)`・4 候補（各 50,000ms）。
@@ -422,7 +542,7 @@ fn task18_1_2_default_budget_selects_highest_accuracy_candidate() {
 /// でなく、さらにその後ろの候補」も記録されることを検証するため）。
 #[test]
 fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -430,8 +550,8 @@ fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
             RunnerBehavior::Ok { advance_ms: 50_000 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             ("c3-a".to_string(), Ok(outcomes_with_correct(6))),
             ("c3-b".to_string(), Ok(outcomes_with_correct(7))),
@@ -462,12 +582,14 @@ fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::new(100).expect("non-zero"),
         policy: fixed_policy(50),
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
 
     assert_eq!(runner.calls, 2);
     assert_eq!(record.total_elapsed_ms, 100_000);
@@ -485,7 +607,10 @@ fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
         CandidateSearchResult::ScoringSkippedBudgetExhausted
     );
     assert!(record.candidates[1].time.is_some());
-    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(
+        probe.lock().expect("probe poisoned").calls,
+        vec!["c3-a".to_string()]
+    );
     // c3-b の時点で探索予算全体を使い切ったため、c3-c・c3-d はどちらも
     // 実行順が回ってこず（`drain_remaining_as_not_started`）、
     // `elapsed_at_start_ms` は `None` になる。
@@ -519,7 +644,7 @@ fn task18_1_2_budget_exhaustion_marks_remaining_candidates_not_started() {
 /// 両方が入る。
 #[test]
 fn task18_1_2_tie_breaks_to_first_declared_candidate() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -527,8 +652,8 @@ fn task18_1_2_tie_breaks_to_first_declared_candidate() {
             RunnerBehavior::Ok { advance_ms: 100 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             ("c3-a".to_string(), Ok(outcomes_with_correct(8))),
             ("c3-b".to_string(), Ok(outcomes_with_correct(8))),
@@ -551,12 +676,13 @@ fn task18_1_2_tie_breaks_to_first_declared_candidate() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     match &record.selection {
         SelectionDecision::Selected {
             candidate_id,
@@ -578,7 +704,7 @@ fn task18_1_2_tie_breaks_to_first_declared_candidate() {
 /// scorer は 1 回も呼ばれない。
 #[test]
 fn task18_1_2_no_eligible_candidate_when_all_candidates_fail() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -586,7 +712,7 @@ fn task18_1_2_no_eligible_candidate_when_all_candidates_fail() {
             RunnerBehavior::LimitExceeded { advance_ms: 10 },
         ],
     );
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     let gold = validation_gold();
     let candidates = vec![
@@ -604,14 +730,16 @@ fn task18_1_2_no_eligible_candidate_when_all_candidates_fail() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
-    assert!(scorer.calls.is_empty());
+    assert!(probe.lock().expect("probe poisoned").calls.is_empty());
     for entry in &record.candidates {
         let time = entry.time.as_ref().expect("candidate must have run");
         assert!(matches!(
@@ -625,7 +753,7 @@ fn task18_1_2_no_eligible_candidate_when_all_candidates_fail() {
 /// `scoring_failed` になり、残りの候補から選定される。
 #[test]
 fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -633,8 +761,8 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
             RunnerBehavior::Ok { advance_ms: 100 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             ("c3-a".to_string(), Err(FakeScorerError)),
             ("c3-b".to_string(), Ok(outcomes_with_correct(6))),
@@ -657,12 +785,13 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(
         record.candidates[0].result,
         CandidateSearchResult::ScoringFailed
@@ -683,10 +812,10 @@ fn task18_1_2_scoring_failure_is_recorded_and_search_continues() {
 /// 一括で未着手にする（`drain_remaining_as_not_started`）。
 #[test]
 fn task18_1_2_scoring_failure_after_budget_exhausted_stops_remaining_candidates() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Err(FakeScorerError))]),
     )
     .with_advance("c3-a", 4_000_000);
@@ -707,12 +836,13 @@ fn task18_1_2_scoring_failure_after_budget_exhausted_stops_remaining_candidates(
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(
         runner.calls, 1,
         "c3-b は採点失敗後の予算超過により実行されない"
@@ -734,6 +864,136 @@ fn task18_1_2_scoring_failure_after_budget_exhausted_stops_remaining_candidates(
     assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
 }
 
+/// `VALIDATION_RECORD_IDS` とは異なる record_ids（"x0".."x9"）を validation
+/// split として持つ [`SplitRecord`] を組み立てる（P0 指摘対応・REQ-17・
+/// REQ-27 テスト専用。issue #84 PR #238 レビュー: `validation_split_record_fixture`
+/// との不一致を確認するための対照）。
+fn mismatched_split_record_fixture() -> SplitRecord {
+    let records: Vec<SplitGroupable> = (0..VALIDATION_LEN)
+        .map(|i| SplitGroupable {
+            id: format!("x{i}"),
+            group_id: format!("g{i}"),
+            label: "positive".to_string(),
+        })
+        .collect();
+    let ratios = SplitRatios {
+        train: 0.0,
+        validation: 1.0,
+        test: 0.0,
+    };
+    let recorded = split_and_record(&records, 0, &ratios).expect("valid ratios");
+    recorded.record().clone()
+}
+
+/// (T5b・P0・REQ-17・REQ-27。issue #84 PR #238 レビュー) `validation_record_ids`
+/// から再計算したハッシュが、`validation_split_record`（凍結済み validation
+/// split の記録）の `validation` split のハッシュと一致しない場合、
+/// `ValidationSplitHashMismatch` として拒否され、runner・scorer のいずれも
+/// 呼び出されない（採点を呼び出す前の fail-closed な事前検証）。
+#[test]
+fn task18_1_2_validation_split_hash_mismatch_is_rejected_before_scoring() {
+    let clock = Arc::new(FakeClock::new(0));
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
+
+    let gold = validation_gold();
+    let candidates = vec![SearchCandidate {
+        candidate_id: "c3-a".to_string(),
+        params: candidate_params("out/c3-a", 1),
+    }];
+    let mismatched_record = mismatched_split_record_fixture();
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &mismatched_record,
+        candidates,
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+
+    let probe = scorer.probe();
+    let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
+    assert_eq!(err, SearchError::ValidationSplitHashMismatch);
+    assert_eq!(runner.calls, 0);
+    assert!(probe.lock().expect("probe poisoned").calls.is_empty());
+}
+
+/// (T5c・P0・REQ-39。issue #84 PR #238 レビュー) 採点（`predict_validation`）
+/// が締め切り（`time_limit`）以内に戻らない scorer は `ScoringTimedOut` と
+/// して打ち切られ、戻り値は使われない。締め切りを守らない実装を
+/// `thread::sleep` で模擬する（本テストのみ実時間に依存する。trait doc
+/// 「時間上限」参照）。以降の候補も採点できないため未着手になる。
+#[test]
+fn task18_1_2_scorer_exceeding_deadline_is_recorded_as_timed_out() {
+    let clock = Arc::new(FakeClock::new(0));
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::Ok { advance_ms: 0 },
+            RunnerBehavior::Ok { advance_ms: 0 },
+        ],
+    );
+    // 予算 1 秒（1000ms）に対し、scorer は実時間で 2 秒 sleep する
+    // （締め切りを大きく超える。CI が多少遅くても誤判定しないよう十分な
+    // 余裕を持たせる）。
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
+        BTreeMap::from([
+            ("c3-a".to_string(), Ok(outcomes_with_correct(9))),
+            ("c3-b".to_string(), Ok(outcomes_with_correct(9))),
+        ]),
+    )
+    .with_sleep("c3-a", 2_000);
+
+    let gold = validation_gold();
+    let candidates = vec![
+        SearchCandidate {
+            candidate_id: "c3-a".to_string(),
+            params: candidate_params("out/c3-a", 1),
+        },
+        SearchCandidate {
+            candidate_id: "c3-b".to_string(),
+            params: candidate_params("out/c3-b", 2),
+        },
+    ];
+    let input = SearchInput {
+        label_order: &LABEL_ORDER,
+        validation_gold: &gold,
+        validation_record_ids: &VALIDATION_RECORD_IDS,
+        validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
+        candidates,
+        budget: SearchBudget::new(1).expect("non-zero"),
+        // `EvenSplit` だと 1 秒を候補 2 件で割って 0 秒（`Allotment::Exhausted`）
+        // になり、採点まで到達せず本テストの意図（締め切り超過）を検証
+        // できない。`Fixed(1)` は `allot` が残り予算（1 秒）で頭打ちにしつつ
+        // 候補ごとに 1 秒を配分するため、学習自体は完了して採点まで進む。
+        policy: fixed_policy(1),
+    };
+
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
+    assert_eq!(record.candidates.len(), 2);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringTimedOut
+    );
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    // scorer の所有権を取り戻せないため、c3-b は実行順が回ってこない
+    // （既存の予算切れと同じ「残り候補を未着手にする」扱い）。
+    assert_eq!(record.candidates[1].candidate_id, "c3-b");
+    assert_eq!(record.candidates[1].elapsed_at_start_ms, None);
+    assert_eq!(
+        record.candidates[1].result,
+        CandidateSearchResult::NotStarted {
+            reason: NotStartedReason::BudgetExhausted
+        }
+    );
+    assert_eq!(runner.calls, 1, "c3-b は締め切り超過後に実行されない");
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
 /// (T6・事前検証) ID 重複・`label_order` の不一致・gold の未知ラベル・
 /// `out_dir` の重複はそれぞれ Err になり、runner の呼び出しは 0 回。
 #[test]
@@ -742,9 +1002,9 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
 
     // ID 重複。
     {
-        let clock = FakeClock::new(0);
+        let clock = Arc::new(FakeClock::new(0));
         let mut runner = FakeRunner::new(&clock, Vec::new());
-        let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+        let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
@@ -760,20 +1020,21 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
             validation_gold: &gold,
             validation_record_ids: &VALIDATION_RECORD_IDS,
             validation_inputs: &VALIDATION_INPUTS,
+            validation_split_record: &validation_split_record_fixture(),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
         };
-        let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+        let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
         assert_eq!(err, SearchError::DuplicateCandidateId { index: 1 });
         assert_eq!(runner.calls, 0);
     }
 
     // label_order の不一致。
     {
-        let clock = FakeClock::new(0);
+        let clock = Arc::new(FakeClock::new(0));
         let mut runner = FakeRunner::new(&clock, Vec::new());
-        let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+        let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
         let mut params = candidate_params("out/c3-a", 1);
         params.label_order = vec!["negative".to_string(), "positive".to_string()];
         let candidates = vec![SearchCandidate {
@@ -785,20 +1046,21 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
             validation_gold: &gold,
             validation_record_ids: &VALIDATION_RECORD_IDS,
             validation_inputs: &VALIDATION_INPUTS,
+            validation_split_record: &validation_split_record_fixture(),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
         };
-        let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+        let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
         assert_eq!(err, SearchError::LabelOrderMismatch { index: 0 });
         assert_eq!(runner.calls, 0);
     }
 
     // gold の未知ラベル。
     {
-        let clock = FakeClock::new(0);
+        let clock = Arc::new(FakeClock::new(0));
         let mut runner = FakeRunner::new(&clock, Vec::new());
-        let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+        let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
         let bad_gold = ["unknown_label"];
         let candidates = vec![SearchCandidate {
             candidate_id: "c3-a".to_string(),
@@ -809,20 +1071,21 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
             validation_gold: &bad_gold,
             validation_record_ids: &VALIDATION_RECORD_IDS[..1],
             validation_inputs: &VALIDATION_INPUTS[..1],
+            validation_split_record: &validation_split_record_fixture(),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
         };
-        let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+        let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
         assert_eq!(err, SearchError::UnknownValidationGold { index: 0 });
         assert_eq!(runner.calls, 0);
     }
 
     // out_dir の重複。
     {
-        let clock = FakeClock::new(0);
+        let clock = Arc::new(FakeClock::new(0));
         let mut runner = FakeRunner::new(&clock, Vec::new());
-        let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+        let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
         let candidates = vec![
             SearchCandidate {
                 candidate_id: "c3-a".to_string(),
@@ -838,11 +1101,12 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
             validation_gold: &gold,
             validation_record_ids: &VALIDATION_RECORD_IDS,
             validation_inputs: &VALIDATION_INPUTS,
+            validation_split_record: &validation_split_record_fixture(),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
         };
-        let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+        let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
         assert_eq!(runner.calls, 0);
     }
@@ -856,9 +1120,9 @@ fn task18_1_2_precondition_violations_do_not_consume_budget() {
 /// scorer を消費する前に検証する）。
 #[test]
 fn task18_1_2_validation_input_exceeding_per_record_limit_is_rejected_before_scoring() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, Vec::new());
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     let over_limit_len = fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES + 1;
     let oversized_input = vec![0u8; over_limit_len];
@@ -875,12 +1139,14 @@ fn task18_1_2_validation_input_exceeding_per_record_limit_is_rejected_before_sco
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &validation_inputs,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    let probe = scorer.probe();
+    let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
     assert_eq!(
         err,
         SearchError::ValidationInputTooLarge {
@@ -890,7 +1156,7 @@ fn task18_1_2_validation_input_exceeding_per_record_limit_is_rejected_before_sco
         }
     );
     assert_eq!(runner.calls, 0);
-    assert_eq!(scorer.calls.len(), 0);
+    assert_eq!(probe.lock().expect("probe poisoned").calls.len(), 0);
 }
 
 /// (T6c・P0・REQ-39。issue #84 PR #238 レビュー) `validation_inputs` の合計
@@ -902,9 +1168,9 @@ fn task18_1_2_validation_input_exceeding_per_record_limit_is_rejected_before_sco
 /// 示す。
 #[test]
 fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, Vec::new());
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     // 1 件あたりはちょうど上限（超過しない）だが、件数を増やして合計が
     // 上限を超えるようにする。
@@ -926,12 +1192,14 @@ fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring
         validation_gold: &gold,
         validation_record_ids: &record_id_refs,
         validation_inputs: &validation_inputs,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    let probe = scorer.probe();
+    let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
     assert_eq!(
         err,
         SearchError::ValidationInputTotalBytesExceeded {
@@ -940,7 +1208,7 @@ fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring
         }
     );
     assert_eq!(runner.calls, 0);
-    assert_eq!(scorer.calls.len(), 0);
+    assert_eq!(probe.lock().expect("probe poisoned").calls.len(), 0);
 }
 
 /// (T7・P1・REQ-27。issue #84 PR #238 レビュー) scorer が gold と異なる件数
@@ -950,7 +1218,7 @@ fn task18_1_2_validation_inputs_exceeding_total_limit_is_rejected_before_scoring
 /// して後続候補を実行することを確認する。
 #[test]
 fn task18_1_2_scorer_output_length_mismatch_is_recorded_and_search_continues() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -958,8 +1226,8 @@ fn task18_1_2_scorer_output_length_mismatch_is_recorded_and_search_continues() {
             RunnerBehavior::Ok { advance_ms: 10 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             (
                 "c3-a".to_string(),
@@ -985,11 +1253,12 @@ fn task18_1_2_scorer_output_length_mismatch_is_recorded_and_search_continues() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(record.candidates.len(), 2);
     assert_eq!(
         record.candidates[0].result,
@@ -1030,15 +1299,15 @@ fn task18_1_2_scorer_output_length_mismatch_is_recorded_and_search_continues() {
 /// 探索全体は中断しない（次候補が宣言されていれば実行される）。
 #[test]
 fn task18_1_2_scorer_record_id_order_mismatch_excludes_candidate_from_selection() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
     // record_id 列を逆順にして返す（件数は validation_record_ids と同じ
     // だが順序が異なる。`run_search` が渡した `record_ids` を無視した実装を
     // 模擬する）。
     let mut reversed_ids: Vec<&str> = VALIDATION_RECORD_IDS.to_vec();
     reversed_ids.reverse();
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
     )
     .with_record_id_override("c3-a", reversed_ids);
@@ -1053,22 +1322,25 @@ fn task18_1_2_scorer_record_id_order_mismatch_excludes_candidate_from_selection(
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     // scorer 自体は `run_search` が渡した正しい `(record_id, input)` の組を
     // 受け取った（呼び出しは行われた。P0・REQ-27: `validation_inputs` が
     // `record_id` と揃った状態で転送されていることの機械照合）。
-    assert_eq!(scorer.received_records.len(), 1);
+    let probe = probe.lock().expect("probe poisoned");
+    assert_eq!(probe.received_records.len(), 1);
     let expected_records: Vec<(String, Vec<u8>)> = VALIDATION_RECORD_IDS
         .iter()
         .zip(VALIDATION_INPUTS.iter())
         .map(|(&id, &input)| (id.to_string(), input.to_vec()))
         .collect();
-    assert_eq!(scorer.received_records[0], expected_records);
+    assert_eq!(probe.received_records[0], expected_records);
     assert_eq!(record.candidates.len(), 1);
     assert_eq!(
         record.candidates[0].result,
@@ -1083,11 +1355,11 @@ fn task18_1_2_scorer_record_id_order_mismatch_excludes_candidate_from_selection(
 /// `record_id` を返した場合も、`ScoringFailed` として選定対象から除外する。
 #[test]
 fn task18_1_2_scorer_record_id_foreign_ids_excludes_candidate_from_selection() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
     let foreign_ids: Vec<&str> = (0..VALIDATION_LEN).map(|_| "unrelated-record").collect();
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
     )
     .with_record_id_override("c3-a", foreign_ids);
@@ -1102,12 +1374,13 @@ fn task18_1_2_scorer_record_id_foreign_ids_excludes_candidate_from_selection() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(
         record.candidates[0].result,
         CandidateSearchResult::ScoringFailed
@@ -1118,9 +1391,9 @@ fn task18_1_2_scorer_record_id_foreign_ids_excludes_candidate_from_selection() {
 /// (T8・runner のエラー) runner が Err を返すと `SearchError::Candidate`。
 #[test]
 fn task18_1_2_runner_failure_aborts_search() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::RunnerError]);
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     let gold = validation_gold();
     let candidates = vec![SearchCandidate {
@@ -1132,11 +1405,12 @@ fn task18_1_2_runner_failure_aborts_search() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
-    let err = run_search(&mut runner, &mut scorer, &clock, input).unwrap_err();
+    let err = run_search(&mut runner, scorer, &*clock, input).unwrap_err();
     assert!(matches!(err, SearchError::Candidate { index: 0, .. }));
 }
 
@@ -1144,7 +1418,7 @@ fn task18_1_2_runner_failure_aborts_search() {
 /// される。
 #[test]
 fn task18_1_2_record_serializes_expected_json_shape() {
-    let clock = FakeClock::new(1_700_000_000_000);
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -1154,8 +1428,8 @@ fn task18_1_2_record_serializes_expected_json_shape() {
             },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
     );
 
@@ -1175,12 +1449,13 @@ fn task18_1_2_record_serializes_expected_json_shape() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::new(3600).expect("non-zero"),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     let json = serde_json::to_value(&record).expect("serialize record");
 
     assert_eq!(json["budget_seconds"], serde_json::json!(3600));
@@ -1218,7 +1493,7 @@ fn task18_1_2_record_serializes_expected_json_shape() {
 /// `ValidationScorer` へ渡さないことは trait の署名で構造的に保証される。
 #[test]
 fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_gold() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -1229,8 +1504,8 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
         ],
     );
     let expected_outcomes = outcomes_with_correct(7);
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(expected_outcomes.clone()))]),
     );
 
@@ -1250,13 +1525,15 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
-    assert_eq!(scorer.calls, vec!["c3-a"]);
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
+    assert_eq!(probe.lock().expect("probe poisoned").calls, vec!["c3-a"]);
     assert_eq!(
         record.candidates[0].validation_outcomes(),
         Some(expected_outcomes.as_slice())
@@ -1275,13 +1552,13 @@ fn task18_1_2_evaluated_candidate_exposes_validation_outcomes_without_leaking_go
 /// も `None`（#87 の McNemar 検定に使えないことを保証する）。
 #[test]
 fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
     // 採点呼び出し中に予算（3600 秒 = 3_600_000ms）を大きく超えて時計を
     // 進める（採点自体は完了するが、期限を守れなかった想定。戻り値
     // 自体はあるが、戻った直後の予算確認で評価器を呼ばずに打ち切る）。
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
     )
     .with_advance("c3-a", 4_000_000);
@@ -1296,17 +1573,22 @@ fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(record.candidates.len(), 1);
     // 採点自体は呼ばれている（`predict_validation` から戻ってきた）が、
     // 評価器（`evaluate_single_select`）は呼ばれず正解率が存在しない
     // ことを `ScoringSkippedBudgetExhausted`（accuracy を持たない）で示す。
-    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(
+        probe.lock().expect("probe poisoned").calls,
+        vec!["c3-a".to_string()]
+    );
     assert_eq!(
         record.candidates[0].result,
         CandidateSearchResult::ScoringSkippedBudgetExhausted
@@ -1320,10 +1602,10 @@ fn task18_1_2_scoring_exceeding_budget_is_excluded_from_selection() {
 /// `drain_remaining_as_not_started` が P0 の超過経路でも呼ばれることの確認）。
 #[test]
 fn task18_1_2_scoring_exceeding_budget_stops_remaining_candidates() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
     )
     .with_advance("c3-a", 4_000_000);
@@ -1344,12 +1626,13 @@ fn task18_1_2_scoring_exceeding_budget_stops_remaining_candidates() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(runner.calls, 1, "c3-b はスコアリング超過後に実行されない");
     assert_eq!(record.candidates.len(), 2);
     assert_eq!(record.candidates[1].candidate_id, "c3-b");
@@ -1367,7 +1650,7 @@ fn task18_1_2_scoring_exceeding_budget_stops_remaining_candidates() {
 /// 残っている探索予算全体（`budget - elapsed`）と一致する。
 #[test]
 fn task18_1_2_scorer_receives_remaining_budget_as_time_limit() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -1375,8 +1658,8 @@ fn task18_1_2_scorer_receives_remaining_budget_as_time_limit() {
             RunnerBehavior::Ok { advance_ms: 2_000 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([
             ("c3-a".to_string(), Ok(outcomes_with_correct(6))),
             ("c3-b".to_string(), Ok(outcomes_with_correct(7))),
@@ -1399,22 +1682,25 @@ fn task18_1_2_scorer_receives_remaining_budget_as_time_limit() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::new(3_600).expect("non-zero"),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
-    assert_eq!(scorer.time_limits.len(), 2);
+    let probe = scorer.probe();
+    run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
+    let probe = probe.lock().expect("probe poisoned");
+    assert_eq!(probe.time_limits.len(), 2);
     // budget = 3_600_000ms。c3-a の採点呼び出し時点では 1_000ms 経過。
     assert_eq!(
-        scorer.time_limits[0],
+        probe.time_limits[0],
         Duration::from_millis(3_600_000 - 1_000)
     );
     // c3-b の採点呼び出し時点では c3-a の学習（1_000ms）＋ c3-b の学習
     // （2_000ms）で 3_000ms 経過。
     assert_eq!(
-        scorer.time_limits[1],
+        probe.time_limits[1],
         Duration::from_millis(3_600_000 - 3_000)
     );
 }
@@ -1457,12 +1743,12 @@ fn task18_1_2_search_budget_rejects_over_max() {
 /// 算出しないことも合わせて確認する）。
 #[test]
 fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(&clock, vec![RunnerBehavior::Ok { advance_ms: 10 }]);
     // 学習で 10ms 経過済み。採点呼び出し中に残り全体（3_600_000 - 10ms）を
     // 使い切り、採点終了時点でちょうど budget_ms（3_600_000ms）に一致させる。
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
     )
     .with_advance("c3-a", 3_600_000 - 10);
@@ -1477,14 +1763,19 @@ fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(record.candidates.len(), 1);
-    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    assert_eq!(
+        probe.lock().expect("probe poisoned").calls,
+        vec!["c3-a".to_string()]
+    );
     assert_eq!(
         record.candidates[0].result,
         CandidateSearchResult::ScoringSkippedBudgetExhausted
@@ -1502,7 +1793,7 @@ fn task18_1_2_scoring_exceeding_budget_exactly_at_boundary_is_excluded() {
 /// 正解率を持たないことにより評価器が呼ばれていないことを確認する。
 #[test]
 fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![
@@ -1512,8 +1803,8 @@ fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
     );
     // c3-a の採点で予算を使い切る。c3-b は宣言順で後ろのため、予算超過後
     // 実行されず not_started になる（`drain_remaining_as_not_started`）。
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(10)))]),
     )
     .with_advance("c3-a", 3_600_000);
@@ -1534,13 +1825,18 @@ fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
-    assert_eq!(scorer.calls, vec!["c3-a".to_string()]);
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
+    assert_eq!(
+        probe.lock().expect("probe poisoned").calls,
+        vec!["c3-a".to_string()]
+    );
     assert_eq!(record.candidates.len(), 2);
     assert_eq!(
         record.candidates[0].result,
@@ -1565,7 +1861,7 @@ fn task18_1_2_scoring_returns_but_budget_exhausted_skips_evaluator() {
 /// ことを直接検証する）。
 #[test]
 fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     // 学習だけでちょうど探索予算全体（3_600_000ms）を使い切る。
     let mut runner = FakeRunner::new(
         &clock,
@@ -1573,7 +1869,7 @@ fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
             advance_ms: 3_600_000,
         }],
     );
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     let gold = validation_gold();
     let candidates = vec![
@@ -1591,14 +1887,16 @@ fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert!(
-        scorer.calls.is_empty(),
+        probe.lock().expect("probe poisoned").calls.is_empty(),
         "budget exhausted before scoring must not call predict_validation"
     );
     assert_eq!(
@@ -1632,7 +1930,7 @@ fn task18_1_2_training_exhausts_budget_skips_scoring_call() {
 /// 3600 秒）ため、2 番目の候補は通常どおり実行・評価され選定される。
 #[test]
 fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     // c3-a: 割当 1800 秒に対し 2000 秒かけて成功する（超過）。
     // c3-b: 残り予算（3600 - 2000 = 1600 秒）内に収まり、評価まで完了する。
     let mut runner = FakeRunner::new(
@@ -1644,8 +1942,8 @@ fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
             RunnerBehavior::Ok { advance_ms: 10 },
         ],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-b".to_string(), Ok(outcomes_with_correct(9)))]),
     );
 
@@ -1665,14 +1963,16 @@ fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: PerCandidatePolicy::EvenSplit,
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(
-        scorer.calls,
+        probe.lock().expect("probe poisoned").calls,
         vec!["c3-b".to_string()],
         "c3-a is excluded before scoring; c3-b is scored normally"
     );
@@ -1716,15 +2016,15 @@ fn task18_1_2_training_exceeds_own_time_limit_is_excluded_from_selection() {
 #[test]
 fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over_is() {
     // ちょうど一致（100_000ms）: 超過扱いにせず採点まで進む。
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![RunnerBehavior::Ok {
             advance_ms: 100_000,
         }],
     );
-    let mut scorer = FakeScorer::new(
-        &clock,
+    let scorer = FakeScorer::new(
+        Arc::clone(&clock),
         BTreeMap::from([("c3-a".to_string(), Ok(outcomes_with_correct(9)))]),
     );
 
@@ -1738,14 +2038,16 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: fixed_policy(100),
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert_eq!(
-        scorer.calls,
+        probe.lock().expect("probe poisoned").calls,
         vec!["c3-a".to_string()],
         "exactly-at-limit training must still be scored"
     );
@@ -1756,14 +2058,14 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
     ));
 
     // 1ms でも超過（100_001ms）: 採点せず `TrainingExceededTimeLimit` になる。
-    let clock = FakeClock::new(0);
+    let clock = Arc::new(FakeClock::new(0));
     let mut runner = FakeRunner::new(
         &clock,
         vec![RunnerBehavior::Ok {
             advance_ms: 100_001,
         }],
     );
-    let mut scorer = FakeScorer::new(&clock, BTreeMap::new());
+    let scorer = FakeScorer::new(Arc::clone(&clock), BTreeMap::new());
 
     let gold = validation_gold();
     let candidates = vec![SearchCandidate {
@@ -1775,14 +2077,16 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
         validation_gold: &gold,
         validation_record_ids: &VALIDATION_RECORD_IDS,
         validation_inputs: &VALIDATION_INPUTS,
+        validation_split_record: &validation_split_record_fixture(),
         candidates,
         budget: SearchBudget::default(),
         policy: fixed_policy(100),
     };
 
-    let record = run_search(&mut runner, &mut scorer, &clock, input).expect("search succeeds");
+    let probe = scorer.probe();
+    let record = run_search(&mut runner, scorer, &*clock, input).expect("search succeeds");
     assert!(
-        scorer.calls.is_empty(),
+        probe.lock().expect("probe poisoned").calls.is_empty(),
         "over-limit training must not be scored"
     );
     assert_eq!(record.candidates.len(), 1);

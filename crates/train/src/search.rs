@@ -79,6 +79,10 @@
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
@@ -221,6 +225,25 @@ pub struct SearchInput<'a> {
     /// 組み立てられる公開 API のため。REQ-39「資源の上限」・P0 指摘対応。
     /// issue #84 PR #238 レビュー）。
     pub validation_inputs: &'a [&'a [u8]],
+    /// 凍結済み validation split の記録（REQ-17・REQ-27。P0 指摘対応。
+    /// issue #84 PR #238 レビュー）。`validate_input` は
+    /// [`validation_record_ids`](Self::validation_record_ids) を昇順に並べ
+    /// 直した上で、[`crate::split_record`] と同じ正準化ハッシュ規則
+    /// （[`fandhe_edge_core::canonical::canonical_sha256_hex`]。新しい規則は
+    /// 作らず、`crates/data::split_record` が使うのと同じ関数を再利用する）
+    /// で再計算し、この記録の `validation` split のハッシュ
+    /// （[`fandhe_edge_data::split_record::SplitRecord::digest`]・
+    /// `fandhe_edge_data::split::Split::Validation`）と一致するかを、採点
+    /// （[`ValidationScorer::predict_validation`]）を呼び出す前に確認する。
+    /// 一致しなければ [`SearchError::ValidationSplitHashMismatch`] で
+    /// fail-closed に停止する。凍結した最終 test 分割の record_ids を誤って
+    /// validation として渡した場合も、その記録の `validation` split の
+    /// ハッシュとは一致しないため同じ経路で拒否される（`SplitRecord` は
+    /// train・validation・test の 3 split をまとめて保持する 1 つの記録
+    /// であり、常に `Split::Validation` の digest だけと比較することで
+    /// 「どの split の記録として渡されたか」を暗黙に検証する。分割ごとに
+    /// 別の "kind" フィールドを持たないため、追加の種別照合は不要）。
+    pub validation_split_record: &'a fandhe_edge_data::split_record::SplitRecord,
     /// 探索対象の候補（宣言順に実行する。乱数は使わない）。
     pub candidates: Vec<SearchCandidate>,
     /// 探索予算全体（秒）。
@@ -244,19 +267,38 @@ pub struct SearchInput<'a> {
 /// `run_search` の意図した validation 集合と異なるデータ〔件数・record_id
 /// は同じだが中身が違う〕を使って推論しても検出できない）。
 ///
-/// # 時間上限（REQ-39・P0 指摘対応）
+/// # 時間上限（REQ-39・P0 指摘対応。issue #84 PR #238 レビュー）
 ///
 /// `time_limit` は [`run_search`] がこの呼び出し時点で残っている探索予算
-/// （探索予算全体 − ここまでの経過時間）を渡す。本 trait は同期呼び出しの
-/// ため `run_search` 側からこの呼び出し自体を打ち切ることはできない
-/// （[`crate::time_allotment::CandidateRunner`] のような子プロセス経由の
-/// 実行器ではなく、プロセス内の関数呼び出しであるため）。実装側
-/// （推論ランタイム・ジョブ管理。#178 等）が `time_limit` を守る責務を持つ。
-/// `run_search` は次の 3 段階で経過時間を確認し、各段階で探索予算全体を
-/// 使い切っていることを検出した場合はそれ以降の重い処理を行わない
-/// （fail-closed。「呼び出し中の時間制限がないため超過後も選定されて
-/// しまう」「期限後も重い処理を続ける」ことを防ぐ。P0/P1 指摘対応・
-/// issue #84 PR #238 レビュー）:
+/// （探索予算全体 − ここまでの経過時間）を渡す。**この締め切りは
+/// `run_search` が強制する契約であり、実装が守ることを期待するだけの
+/// 助言ではない**（旧版は「実装側が守る責務を持つ」とする助言的な契約
+/// だったが、締め切りを守らない実装を信用してよい理由がなく、fail-closed
+/// にならなかったため強制する契約へ改めた）。
+///
+/// 具体的には、`run_search` は本メソッドの呼び出しを、`self`（scorer 自身の
+/// 所有権）を専用スレッドへ渡して実行し、`time_limit` を
+/// `std::sync::mpsc::Receiver::recv_timeout` の待ち時間として使う。
+/// `time_limit` 以内に戻り値が届かなかった場合、`run_search` は戻り値を
+/// 一切使わず、その候補を
+/// [`CandidateSearchResult::ScoringTimedOut`]（既存の探索予算超過と同じ
+/// 「以降の候補を未着手にして探索を終える」扱い）として記録する。
+/// **締め切りを過ぎて実行中のスレッドは取り残す**（`join` を待たない。
+/// 実装が `time_limit` を過ぎても戻らない場合、そのスレッドはプロセスが
+/// 終了するまで動き続けうる。`run_search` はその後の呼び出しで scorer の
+/// 所有権を取り戻せないため、以降の候補も採点できない。「時間上限を守る
+/// 実装だけを受け付ける」契約であり、本 trait を実装する側は
+/// `time_limit` 以内に必ず戻ることが要求される）。
+///
+/// この専用スレッドへ渡す都合上、本 trait は `Send + 'static` を要求する
+/// （実装・[`SuccessOutcome`]・[`ValidationInputRecord`] の所有データは
+/// いずれもスレッド境界を越えられる必要がある。`records` はスレッド内で
+/// 所有データから組み立て直す）。
+///
+/// 締め切り内に戻った場合、`run_search` は次の 3 段階で経過時間を確認し、
+/// 各段階で探索予算全体を使い切っていることを検出した場合はそれ以降の
+/// 重い処理を行わない（fail-closed。「期限後も重い処理を続ける」ことを
+/// 防ぐ）:
 ///
 /// 1. 学習完了直後（本呼び出しの前）にすでに 0 であることを検出した場合は
 ///    本呼び出しを行わない（[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）
@@ -272,9 +314,11 @@ pub struct SearchInput<'a> {
 ///    として記録する）
 ///
 /// いずれの段階で打ち切っても以降の候補は未着手として記録する。
-pub trait ValidationScorer {
-    /// 実装固有のエラー型。
-    type Error;
+pub trait ValidationScorer: Send + 'static {
+    /// 実装固有のエラー型。専用スレッドから
+    /// `std::sync::mpsc::Sender::send` で送り返すため `Send + 'static` を
+    /// 要求する（trait doc「時間上限」参照）。
+    type Error: Send + 'static;
     /// `candidate_id` の学習成果物で `records`（[`run_search`] が
     /// [`SearchInput::validation_record_ids`]・[`SearchInput::validation_inputs`]
     /// から組み立てて渡す権威ある validation 入力。**正解ラベルは含まない**。
@@ -453,6 +497,14 @@ pub enum CandidateSearchResult {
     /// `NotStarted`・`ScoringSkippedBudgetExhausted` とは異なり、以降の
     /// `while` ループは継続する）。
     TrainingExceededTimeLimit,
+    /// 採点（[`ValidationScorer::predict_validation`]）が締め切り
+    /// （`time_limit`）内に戻らなかった（P0 指摘対応・REQ-39。issue #84
+    /// PR #238 レビュー。trait doc「時間上限」参照）。`run_search` は
+    /// 戻り値を待たずに諦め、呼び出しスレッドを取り残す（正解率は算出して
+    /// いないため `0` 等の値で埋めない）。scorer の所有権を取り戻せないため
+    /// 以降の候補も採点できず、既存の探索予算超過と同じ扱いで残り候補を
+    /// 未着手として記録し探索を終える。選定対象外。
+    ScoringTimedOut,
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
         /// 未着手の理由。
@@ -584,16 +636,29 @@ pub enum SearchError<E> {
     /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超える
     /// （P0 指摘対応・REQ-39「資源の上限」。issue #84 PR #238 レビュー）。
     ValidationInputTotalBytesExceeded { total: usize, limit: usize },
+    /// `validation_record_ids` から再計算したハッシュが、
+    /// [`SearchInput::validation_split_record`] の `validation` split の
+    /// ハッシュと一致しない（REQ-17・REQ-27・P0 指摘対応。issue #84
+    /// PR #238 レビュー。凍結した最終 test 分割を validation として渡した
+    /// 場合もこの経路で拒否される。採点〔`ValidationScorer::predict_validation`〕
+    /// を呼び出す前に fail-closed で停止する）。
+    ValidationSplitHashMismatch,
     /// 候補 ID が空・[`MAX_CANDIDATE_ID_BYTES`] 超過・制御文字を含む。
     InvalidCandidateId { index: usize },
     /// 候補 ID が他の候補と重複している。
     DuplicateCandidateId { index: usize },
     /// 候補の `params.label_order` が `label_order` と一致しない。
     LabelOrderMismatch { index: usize },
-    /// 候補間で `root` と `out_dir` を結合した出力先が重複、または一方が
-    /// 他方の祖先（親ディレクトリ）になっている（codex review PR #238 P1
-    /// 指摘。`normalized_joined_components`・`out_dirs_conflict` 参照）。
+    /// 候補間で `root` と `out_dir` を結合した出力先（symlink 解決後）が
+    /// 重複、または一方が他方の祖先（親ディレクトリ）になっている
+    /// （codex review PR #238 P1 指摘。`canonicalized_out_dir_key`・
+    /// `out_dirs_conflict` 参照）。
     DuplicateOutDir { index: usize },
+    /// 出力先の symlink 解決（[`canonicalized_out_dir_key`]）が失敗した
+    /// （P1 指摘対応・REQ-39。issue #84 PR #238 レビュー。「存在しない」
+    /// 以外の理由での失敗を fail-closed に倒す。権限不足・symlink ループ
+    /// 等）。
+    OutDirCanonicalizeFailed { index: usize },
     /// 候補のリクエスト構成要素が [`TrainRequest::new`] の検証を満たさない。
     InvalidRequest {
         index: usize,
@@ -671,6 +736,10 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
                 f,
                 "validation_inputs total size {total} bytes exceeds limit {limit}"
             ),
+            SearchError::ValidationSplitHashMismatch => write!(
+                f,
+                "validation_record_ids hash does not match the frozen validation split record"
+            ),
             SearchError::InvalidCandidateId { index } => {
                 write!(f, "invalid candidate id at index {index}")
             }
@@ -682,6 +751,9 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             }
             SearchError::DuplicateOutDir { index } => {
                 write!(f, "duplicate (root, out_dir) at index {index}")
+            }
+            SearchError::OutDirCanonicalizeFailed { index } => {
+                write!(f, "failed to canonicalize out_dir at index {index}")
             }
             SearchError::InvalidRequest { index, source } => {
                 write!(f, "invalid train request at index {index}: {source}")
@@ -735,10 +807,11 @@ fn normalized_path_components(value: &str) -> Vec<&str> {
 /// 指す）。そのため単純な連結では不十分で、結合後の構成要素列に対して
 /// スタックによる字句上の `..` 解決（一つ前の構成要素を取り除く。スタック
 /// が空のまま `..` に出会った場合は無視してそれ以上遡らない）を行う。
-/// これは文字列としての字句解決であり、途中の構成要素が symlink である
-/// 場合の実体解決（`canonicalize`）とは異なる。実ディレクトリの閉じ込め
-/// （symlink 解決等）は行わない点は `request.rs` の doc と同じ設計
-/// （多層防御は学習ワーカー・Rust 側ガード層〔TASK-39.x〕が別途担う）。
+/// これは文字列としての字句解決のみであり、途中の構成要素が symlink で
+/// ある場合の実体解決（`canonicalize`）は行わない。symlink の解決は
+/// 呼び出し元（[`canonicalized_out_dir_key`]）の責務とする（P1 指摘対応・
+/// issue #84 PR #238 レビュー: 字句上の正規化だけでは、symlink を経由して
+/// 同じ実ディレクトリを指す 2 候補を重複として検出できなかった）。
 ///
 /// 呼び出し元（[`validate_input`]）は本関数を呼ぶ前に必ず
 /// [`TrainRequest::new`] を通す。`out_dir` が空・`..` を含む等の不正な値の
@@ -767,8 +840,89 @@ fn normalized_joined_components<'a>(root: &'a str, out_dir: &'a str) -> Vec<&'a 
 /// の書き込み）が他方の候補の成果物と混在・上書きし得るため（REQ-39
 /// 「経路の閉じ込め」）。外部入力由来のパスを扱うため添字アクセス
 /// （`[]`）は使わず `zip` で比較する（`.claude/rules/coding-rust.md`）。
-fn out_dirs_conflict(a: &[&str], b: &[&str]) -> bool {
+/// `T` は構成要素の型（字句上の比較には `&str`、symlink 解決後の比較
+/// には `String`〔[`canonicalized_out_dir_key`] 参照〕を使う）。
+fn out_dirs_conflict<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
+/// `root`・`out_dir` を結合した出力先を、symlink を解決した実体パスの
+/// 構成要素列へ正規化する（P1 指摘対応・REQ-39。issue #84 PR #238
+/// レビュー）。
+///
+/// [`normalized_joined_components`] による字句上の正規化（`.`・`..`・
+/// 空要素の解決）だけでは、symlink を経由して同じ実ディレクトリを指す
+/// 2 つの候補（例: `root="/tmp/link", out_dir="x"` と
+/// `root="/tmp/real", out_dir="x"`。`/tmp/link` が `/tmp/real` への
+/// symlink）を見分けられない。本関数は結合後のパスのうち、存在する
+/// 最も深い祖先ディレクトリを [`std::fs::canonicalize`] で実体パスへ
+/// 解決し、まだ存在しない残りの構成要素をそのまま連結することで、
+/// symlink 越しの重複も検出できるようにする（`root` は絶対パスのため
+/// `/`（ファイルシステムのルート）は通常必ず存在し、祖先を遡る過程は
+/// 必ず終端する）。
+///
+/// # Errors
+///
+/// すべての祖先（`/` を含む）の `canonicalize` が失敗した場合、最後に
+/// 観測した `io::Error` を fail-closed でそのまま返す（コーディネーター
+/// 指摘どおり「canonicalize に失敗したら止める側へ倒す」）。`/` は通常の
+/// 環境では必ず存在し読み取り可能なため、実務上はこの経路に到達しない
+/// 想定（理論上到達しない防御的分岐）。存在しない・確認できない
+/// （権限不足で `PermissionDenied` になる場合を含む）祖先は、より浅い
+/// 祖先で再試行するためエラーにしない（PermissionDenied は「存在しない」
+/// と POSIX では確実には区別できないため。関数 doc 参照）。
+fn canonicalized_out_dir_key(root: &str, out_dir: &str) -> std::io::Result<Vec<String>> {
+    let components = normalized_joined_components(root, out_dir);
+    let mut last_error: Option<std::io::Error> = None;
+    for existing_len in (0..=components.len()).rev() {
+        let mut candidate = PathBuf::from("/");
+        for part in &components[..existing_len] {
+            candidate.push(part);
+        }
+        match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => {
+                let mut resolved = canonical;
+                for part in &components[existing_len..] {
+                    resolved.push(part);
+                }
+                return Ok(path_components_to_strings(&resolved));
+            }
+            // まだ存在しない祖先、または存在の確認自体ができない祖先
+            // （例: `/root` のように途中のディレクトリの検索〔execute〕
+            // 権限が無い場合、実際には存在しない配下パスでも OS は
+            // `NotFound` ではなく `PermissionDenied` を返すことがある。
+            // POSIX の性質上「存在しない」と「権限不足で確認できない」を
+            // 確実に区別する手段は無いため、いずれもより浅い祖先で
+            // 再試行する。最終的に必ず試す `/`（ファイルシステムの
+            // ルート）はどの OS でも通常読み取り可能なため、実務上この
+            // ループは必ずどこかで成功する）。
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        }
+    }
+    // 理論上到達しない防御的分岐: `/` の canonicalize にすら失敗した場合
+    // （極端に制限された実行環境等）は、直前に観測した失敗を
+    // fail-closed でそのまま返す（コーディネーター指摘どおり「canonicalize
+    // に失敗したら止める側へ倒す」）。
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other("failed to canonicalize any ancestor of out_dir, including \"/\"")
+    }))
+}
+
+/// [`Path`] の通常の構成要素（ルート・カレントディレクトリ・親ディレクトリ
+/// 参照を除く）を所有文字列の列にする（[`canonicalized_out_dir_key`] 用）。
+/// 非 UTF-8 のパス（他候補との比較にのみ使い、ファイルを開かないため
+/// 情報を失っても安全側に倒れる。`to_string_lossy` で復元不能文字は
+/// 置換文字に変換する）。
+fn path_components_to_strings(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 事前検証（予算・runner を一切消費しない。fail-closed）。
@@ -940,13 +1094,50 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         }
     }
 
+    // `validation_record_ids` が凍結済み validation split の記録と一致する
+    // ことを、採点（scorer）を呼び出す前に確認する（P0 指摘対応・REQ-17・
+    // REQ-27「評価の独立性」。issue #84 PR #238 レビュー）。`SearchInput`
+    // は公開 API で、呼び出し元が凍結済み分割と無関係な・または凍結した
+    // 最終 test 分割の record_ids を validation として渡す経路を塞げない
+    // ため、`run_search` 自身が権威ある記録
+    // （[`SearchInput::validation_split_record`]）と突き合わせる。
+    //
+    // ハッシュの計算規則は `fandhe_edge_data::split_record` が使うのと
+    // 同じ [`fandhe_edge_core::canonical::canonical_sha256_hex`]
+    // （「各 split のレコード ID を昇順に並べた正準化 JSON をハッシュする」
+    // 規則。`crates/data/src/split_record.rs` モジュール doc 参照）をそのまま
+    // 再利用し、新しい正準化規則は作らない。`validation_record_ids` は
+    // 重複なし・空文字列なしを検証済みのため、ここでは並べ替えのみ行う。
+    let mut sorted_record_ids: Vec<String> = input
+        .validation_record_ids
+        .iter()
+        .map(|&id| id.to_string())
+        .collect();
+    sorted_record_ids.sort();
+    let recomputed_hash = fandhe_edge_core::canonical::canonical_sha256_hex(&sorted_record_ids)
+        // 理論上到達しない防御的分岐: `Vec<String>` は常に有効な JSON へ
+        // 正準化できるため、失敗はしない想定（`split_record.rs` の
+        // `verify_hashes` も同じ関数を同じ理由で `Result` のまま伝播する）。
+        .map_err(|_| SearchError::Internal {
+            detail: "failed to canonicalize validation_record_ids for hashing".to_string(),
+        })?;
+    let expected_digest = input
+        .validation_split_record
+        .digest(fandhe_edge_data::split::Split::Validation);
+    if recomputed_hash != expected_digest.sha256() {
+        return Err(SearchError::ValidationSplitHashMismatch);
+    }
+
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
     // リクエストとしての妥当性。
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
     // 完全一致だけでなく祖先・子孫関係も検出するため、`BTreeSet` ではなく
     // これまでに見た正規化済み出力先の一覧を保持して総当たりで比較する
     // （`MAX_SEARCH_CANDIDATES` で件数上限があるため O(n^2) で問題ない）。
-    let mut seen_out_dirs: Vec<Vec<&str>> = Vec::new();
+    // `String` を保持するのは、symlink 解決（`canonicalized_out_dir_key`）
+    // が実体パスを新たに構築するため、`candidate.params` を借用したままでは
+    // 表現できないため（P1 指摘対応・issue #84 PR #238 レビュー）。
+    let mut seen_out_dirs: Vec<Vec<String>> = Vec::new();
     for (index, candidate) in input.candidates.iter().enumerate() {
         if !validate_candidate_id(&candidate.candidate_id) {
             return Err(SearchError::InvalidCandidateId { index });
@@ -967,16 +1158,19 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         }
         // `(root, out_dir)` の重複判定より先に `TrainRequest::new` を通す。
         // `out_dir` が空・`..` を含む等の不正な値のまま
-        // `normalized_joined_components` へ渡すと、正規化後の構成要素列が
+        // `canonicalized_out_dir_key` へ渡すと、正規化後の構成要素列が
         // 空（またはロールバックで root 側へ食い込む）になり得て、
         // 無関係な候補と偽陽性の `DuplicateOutDir` を報告してしまう
         // （codex review PR #238 P1 指摘のレビューで判明）。
         TrainRequest::new(candidate.params.clone())
             .map_err(|source| SearchError::InvalidRequest { index, source })?;
-        let out_dir_key = normalized_joined_components(
+        // symlink を解決した実体パスで重複を判定する（P1 指摘対応・REQ-39。
+        // issue #84 PR #238 レビュー）。
+        let out_dir_key = canonicalized_out_dir_key(
             candidate.params.root.as_str(),
             candidate.params.out_dir.as_str(),
-        );
+        )
+        .map_err(|_| SearchError::OutDirCanonicalizeFailed { index })?;
         if seen_out_dirs
             .iter()
             .any(|seen| out_dirs_conflict(seen, &out_dir_key))
@@ -1065,6 +1259,84 @@ pub fn select_best(
     })
 }
 
+/// [`ValidationInputRecord`] の所有版（`'static`・`Send`）。
+///
+/// [`call_predict_validation_with_deadline`] が scorer 呼び出し専用スレッド
+/// へ渡すために使う（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
+/// スレッド境界を越えるには所有データが必要で、[`SearchInput`] から借用した
+/// `&str`／`&[u8]` のまま渡すことはできない。呼び出しスレッド内で
+/// [`ValidationInputRecord`]（借用版）を本データから組み立て直して
+/// [`ValidationScorer::predict_validation`] へ渡す。
+#[derive(Debug, Clone)]
+struct OwnedValidationInputRecord {
+    record_id: String,
+    input: Vec<u8>,
+}
+
+/// [`ValidationScorer::predict_validation`] を締め切り付きで呼び出した結果
+/// （P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
+enum TimedPredictOutcome<E> {
+    /// 締め切り内に戻った。
+    Completed(Result<Vec<ScoredOutcome>, E>),
+    /// 締め切りを過ぎても戻らなかった（呼び出しスレッドは取り残す）。
+    TimedOut,
+}
+
+/// `scorer`（所有権）を専用スレッドへ渡して
+/// [`ValidationScorer::predict_validation`] を呼び出し、`time_limit` を
+/// 締め切りとして強制する（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー。
+/// trait doc「時間上限」参照）。
+///
+/// # 所有権の設計（判断理由）
+///
+/// `std::thread::spawn`（非スコープ）へ渡すクロージャは `'static` でなければ
+/// ならない。`run_search` は締め切りを過ぎたスレッドを `join` せずに取り残す
+/// 設計（trait doc参照）のため、`std::thread::scope` のようなスコープ付き
+/// スレッド（関数を抜ける前に必ず `join` される）は使えない（スコープを
+/// 抜けようとすると実行中のスレッドの完了を待ってしまい、締め切りを
+/// 強制する意味がなくなる）。そのため呼び出し側が借用している
+/// `&SuccessOutcome`・`&[ValidationInputRecord<'_>]` をそのまま渡すことは
+/// できず、`scorer: S`（所有権ごと）・`artifact: SuccessOutcome`
+/// （`.clone()` 済み）・`records: Arc<Vec<OwnedValidationInputRecord>>`
+/// （全候補で共有するため複製せず `Arc` で参照カウントする）を渡す。
+/// 締め切り内に戻れば `scorer` の所有権をチャネル経由で呼び出し元へ返し、
+/// 次候補の呼び出しに使い回す。締め切りを過ぎた場合は `scorer` を含む
+/// スレッドを丸ごと諦め、`run_search` はそれ以降 scorer を持たない
+/// （呼び出し元の [`Option<S>`] が `None` のままになる。「時間上限を守る
+/// 実装だけを受け付ける」契約〔trait doc〕の帰結として、以降の候補は
+/// 採点できない）。
+fn call_predict_validation_with_deadline<S: ValidationScorer>(
+    mut scorer: S,
+    candidate_id: String,
+    artifact: SuccessOutcome,
+    records: Arc<Vec<OwnedValidationInputRecord>>,
+    time_limit: Duration,
+) -> (Option<S>, TimedPredictOutcome<S::Error>) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let borrowed_records: Vec<ValidationInputRecord<'_>> = records
+            .iter()
+            .map(|record| ValidationInputRecord {
+                record_id: record.record_id.as_str(),
+                input: record.input.as_slice(),
+            })
+            .collect();
+        let result =
+            scorer.predict_validation(&candidate_id, &artifact, &borrowed_records, time_limit);
+        // 受信側が締め切りを過ぎて `rx` を破棄済みなら送信は失敗するが、
+        // その場合はこの結果を使う相手がいないだけなので無視してよい
+        // （取り残したスレッドをここで正常終了させる。trait doc参照）。
+        let _ = tx.send((scorer, result));
+    });
+    match rx.recv_timeout(time_limit) {
+        Ok((returned_scorer, result)) => (
+            Some(returned_scorer),
+            TimedPredictOutcome::Completed(result),
+        ),
+        Err(_timeout_or_disconnected) => (None, TimedPredictOutcome::TimedOut),
+    }
+}
+
 /// 宣言順に残っている候補すべてを、実行順が回ってこなかった候補として
 /// `entries` へ記録する（P1 指摘対応・REQ-18「候補ごとの選定記録」）。
 ///
@@ -1112,7 +1384,7 @@ fn drain_remaining_as_not_started(
 /// 該当する分類で記録して次の候補へ進む。
 pub fn run_search<R, S, C>(
     runner: &mut R,
-    scorer: &mut S,
+    scorer: S,
     clock: &C,
     input: SearchInput<'_>,
 ) -> Result<SearchRecord, SearchError<R::Error>>
@@ -1148,20 +1420,31 @@ where
             })
     };
 
-    // 全候補で共有する validation 入力（record_id・byte 入力の組）を 1 回
-    // だけ組み立てる（`validate_input` が件数一致を確認済みのため `zip` で
-    // 安全に構築できる。P0 指摘対応・REQ-27。issue #84 PR #238 レビュー:
-    // scorer へ権威ある入力を明示的に渡し、scorer 側が独自に保持する別
-    // データを使わせない）。候補ごとに毎回組み立て直す無駄を避ける。
-    let validation_scorer_records: Vec<ValidationInputRecord<'_>> = input
-        .validation_record_ids
-        .iter()
-        .zip(input.validation_inputs.iter())
-        .map(|(&record_id, &input_bytes)| ValidationInputRecord {
-            record_id,
-            input: input_bytes,
-        })
-        .collect();
+    // 全候補で共有する validation 入力（record_id・byte 入力の組）を
+    // 所有データとして 1 回だけ組み立てる（`validate_input` が件数一致を
+    // 確認済みのため `zip` で安全に構築できる。P0 指摘対応・REQ-27・
+    // REQ-39。issue #84 PR #238 レビュー: scorer へ権威ある入力を明示的に
+    // 渡し、scorer 側が独自に保持する別データを使わせない）。所有データに
+    // するのは、採点の締め切りを強制するために scorer 呼び出しを専用
+    // スレッドへ渡す必要があり（[`call_predict_validation_with_deadline`]
+    // 参照）、借用データのまま `'static` を要求するスレッド境界を越えられ
+    // ないため（[`OwnedValidationInputRecord`] doc 参照）。`Arc` で包み、
+    // 候補ごとに複製せず参照カウントだけ増やす。
+    let validation_scorer_records: Arc<Vec<OwnedValidationInputRecord>> = Arc::new(
+        input
+            .validation_record_ids
+            .iter()
+            .zip(input.validation_inputs.iter())
+            .map(|(&record_id, &input_bytes)| OwnedValidationInputRecord {
+                record_id: record_id.to_string(),
+                input: input_bytes.to_vec(),
+            })
+            .collect(),
+    );
+    // 締め切りを過ぎて scorer を取り残した後は `None` になり、以降の候補は
+    // 採点できない（`call_predict_validation_with_deadline` doc・trait doc
+    // 「時間上限」参照）。
+    let mut scorer_holder: Option<S> = Some(scorer);
 
     let mut candidates_iter = input.candidates.into_iter().enumerate();
     while let Some((index, candidate)) = candidates_iter.next() {
@@ -1266,12 +1549,45 @@ where
                 }
 
                 let time_limit = Duration::from_millis(remaining_for_scoring_ms);
-                match scorer.predict_validation(
-                    &candidate.candidate_id,
-                    success,
-                    &validation_scorer_records,
+                // P0 指摘対応（REQ-39。issue #84 PR #238 レビュー）: scorer
+                // の所有権を取り出し、締め切り付きの専用スレッドで呼び出す
+                // （`call_predict_validation_with_deadline` doc・trait doc
+                // 「時間上限」参照）。`scorer_holder` が `None` になるのは
+                // 直前の候補で締め切りを過ぎて scorer を取り残した場合のみ
+                // だが、その場合は必ずその場で残り候補を未着手にして
+                // `break` しているため、次の周回に到達した時点では常に
+                // `Some` のはずである（理論上到達しない防御的分岐）。
+                let current_scorer = scorer_holder.take().ok_or_else(|| SearchError::Internal {
+                    detail: "scorer was unavailable after a previous timeout".to_string(),
+                })?;
+                let (returned_scorer, timed_outcome) = call_predict_validation_with_deadline(
+                    current_scorer,
+                    candidate.candidate_id.clone(),
+                    success.clone(),
+                    Arc::clone(&validation_scorer_records),
                     time_limit,
-                ) {
+                );
+                scorer_holder = returned_scorer;
+                let predict_result = match timed_outcome {
+                    TimedPredictOutcome::Completed(result) => result,
+                    TimedPredictOutcome::TimedOut => {
+                        // P0 指摘対応（REQ-39。issue #84 PR #238 レビュー）:
+                        // 締め切りを過ぎた戻り値は使わず、既存の探索予算
+                        // 超過と同じ「残り候補を未着手にして探索を終える」
+                        // 扱いにする（`scorer_holder` はすでに `None` で、
+                        // 以降の候補も採点できないため）。
+                        entries.push(CandidateSearchEntry {
+                            candidate_id: candidate.candidate_id,
+                            elapsed_at_start_ms: Some(elapsed_ms),
+                            time: Some(run.record().clone()),
+                            result: CandidateSearchResult::ScoringTimedOut,
+                            validation_outcomes: None,
+                        });
+                        drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                        break;
+                    }
+                };
+                match predict_result {
                     Ok(scored_outcomes) => {
                         // P0/P1 指摘対応（REQ-27・評価の独立性。issue #84
                         // PR #238 レビュー）: 戻り値の契約違反（件数不一致・
@@ -1637,6 +1953,49 @@ mod tests {
         Box::leak(inputs.into_boxed_slice())
     }
 
+    /// [`fandhe_edge_data::split::Groupable`] の最小実装（テスト専用）。
+    struct TestGroupable {
+        id: String,
+        group_id: String,
+    }
+
+    impl fandhe_edge_data::split::Groupable for TestGroupable {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn group_id(&self) -> &str {
+            &self.group_id
+        }
+        fn label(&self) -> &str {
+            "positive"
+        }
+    }
+
+    /// [`make_record_ids`] と同じ `["r0", "r1", ...]` を validation split の
+    /// record_ids として持つ [`fandhe_edge_data::split_record::SplitRecord`]
+    /// を組み立てる（P0 指摘対応・REQ-17・REQ-27。issue #84 PR #238
+    /// レビュー）。`validation: 1.0`（train・test は `0.0`）を指定すると、
+    /// 比率が厳密に `0.0` の split には一切割り付けない契約
+    /// （`fandhe_edge_data::split::alloc_counts` doc）により、全レコードが
+    /// validation split に入る。テスト専用ヘルパーのため `'static` へ leak
+    /// して返す。
+    fn make_split_record(n: usize) -> &'static fandhe_edge_data::split_record::SplitRecord {
+        let records: Vec<TestGroupable> = (0..n)
+            .map(|i| TestGroupable {
+                id: format!("r{i}"),
+                group_id: format!("g{i}"),
+            })
+            .collect();
+        let ratios = fandhe_edge_data::split::SplitRatios {
+            train: 0.0,
+            validation: 1.0,
+            test: 0.0,
+        };
+        let recorded = fandhe_edge_data::split_record::split_and_record(&records, 0, &ratios)
+            .expect("valid ratios");
+        Box::leak(Box::new(recorded.record().clone()))
+    }
+
     fn base_input<'a>(
         label_order: &'a [&'a str],
         validation_gold: &'a [&'a str],
@@ -1647,6 +2006,7 @@ mod tests {
             validation_gold,
             validation_record_ids: make_record_ids(validation_gold.len()),
             validation_inputs: make_validation_inputs(validation_gold.len()),
+            validation_split_record: make_split_record(validation_gold.len()),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1708,6 +2068,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: &["r0"],
             validation_inputs: make_validation_inputs(2),
+            validation_split_record: make_split_record(2),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1738,6 +2099,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: &["r0", ""],
             validation_inputs: make_validation_inputs(2),
+            validation_split_record: make_split_record(2),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1761,6 +2123,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: &["r0", "r0"],
             validation_inputs: make_validation_inputs(2),
+            validation_split_record: make_split_record(2),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1788,6 +2151,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: &record_ids,
             validation_inputs: make_validation_inputs(2),
+            validation_split_record: make_split_record(2),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1831,6 +2195,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: &record_id_refs,
             validation_inputs: make_validation_inputs(n_records),
+            validation_split_record: make_split_record(n_records),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -1861,6 +2226,7 @@ mod tests {
             validation_gold: &gold,
             validation_record_ids: make_record_ids(2),
             validation_inputs: make_validation_inputs(1),
+            validation_split_record: make_split_record(2),
             candidates,
             budget: SearchBudget::default(),
             policy: PerCandidatePolicy::EvenSplit,
@@ -2075,6 +2441,45 @@ mod tests {
         ];
         let input = base_input(&label_order, &gold, candidates);
         assert!(validate_input::<std::convert::Infallible>(&input).is_ok());
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238
+    /// レビュー）: symlink を経由して同じ実ディレクトリを指す 2 候補は
+    /// `DuplicateOutDir` になる（`canonicalized_out_dir_key` が symlink を
+    /// 解決することの確認。`cfg(unix)`: symlink 作成に
+    /// `std::os::unix::fs::symlink` を使うため）。
+    #[cfg(unix)]
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_via_symlink() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-symlink-{}-{}",
+            std::process::id(),
+            "task18_1_2_validate_input_rejects_duplicate_out_dir_via_symlink"
+        ));
+        let real_dir = base.join("real");
+        let link_path = base.join("link");
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+        std::os::unix::fs::symlink(&real_dir, &link_path).expect("create symlink");
+
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params(real_dir.to_str().expect("utf-8 path"), "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params(link_path.to_str().expect("utf-8 path"), "out/a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+
+        // 後片付け（テスト失敗時も best-effort で削除する）。
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
     }
 
     /// REQ-18・TASK-18.1-2: リクエストとして不正な構成要素は
