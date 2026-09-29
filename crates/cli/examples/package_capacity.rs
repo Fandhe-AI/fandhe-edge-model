@@ -5,103 +5,40 @@
 //! `label_table`・`calibration`・`metadata`）。成功時は `capacity` の JSON 1 行を出して exit 0、
 //! 失敗時は `{"code","message"}` を出して対応する終了コードで終える。
 //!
-//! 対応 OS: Unix のみ。非 Unix（M10 時点で対象外）では、開いた後の差し替え検出に要る
-//! ファイル同一性を stable の std だけでは取れないため、近似せず全ファイルを拒否する（fail-closed。REQ-39）。
+//! 対応 OS: Linux・macOS のみ。それ以外（M10 時点で対象外）は、ガード層の経路の閉じ込めが
+//! `UnsupportedPlatform`（終了コード 70）で全ファイルを拒否する（fail-closed。REQ-39）。
 //!
 //! 位置づけ: 配布物・推論経路には入らず、`package` 工程の正式な CLI 契約でもない。
-//! argv は untrusted のため、パスはカレントディレクトリ（計測対象ルート）配下の相対パスに限り、
-//! 絶対パス・`..`・親経由の symlink によるルート外参照を拒否する（REQ-39）。非 UTF-8 の引数は
-//! InvalidInput として返す。引数は 16 件までで、開く前に件数を検証する。経路違反以外のファイル系の失敗
-//! （不在・権限・ディレクトリ・FIFO・末尾 symlink）は `capacity_error_report` の公開メッセージへ写し、
-//! 重複は計測コアが拒否する。構成要素の分類は配布パッケージ形式
+//! argv は untrusted のため、パスの検証と open はガード層の `open_confined`（ルート fd 起点の
+//! `openat`＋`O_NOFOLLOW`）に一体で委ね、ルート（カレントディレクトリ）外への `..`・絶対パス・
+//! symlink 参照を拒否する（REQ-39）。拒否理由は `reason_code` だけを固定文で返す。非 UTF-8 の引数は
+//! InvalidInput として返す。引数は 16 件までで、開く前に件数を検証する。ファイルサイズは開いた直後と
+//! 計測直前に上限（1GiB）と照合し、重複は計測コアが拒否する。構成要素の分類は配布パッケージ形式
 //! （TASK-28・32）が確定するまでの暫定で、C1 は `model.onnx` を `weights`、`artifact.json` を
 //! `metadata` として渡す（語彙は ONNX 内に保持されるため `vocab_or_feature_transform` は 0 件）。
 
 use fandhe_edge_cli::output::{capacity_error_report, write_error_report, write_package_capacity};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
+use fandhe_edge_core::fs::FsError;
+use fandhe_edge_guard::path::open_confined as guard_open_confined;
 use fandhe_edge_runtime::capacity::{CapacityError, PackageComponent, measure_opened_files};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-/// 計測対象ルート（カレントディレクトリ）配下のファイルを検証つきで開き、ハンドルを返す。
+/// 計測対象ルート配下のファイルを、ガード層の経路の閉じ込めつきで開いてハンドルを返す。
 ///
-/// 絶対パス・`..` 成分は拒否する。親ディレクトリは正規化（symlink 解決）してルート配下を確認し、
-/// 通常ファイルとして開いたのち、開いたハンドルが「正規化後もルート配下の同じパスに実在する
-/// 同一ファイル」であることを再確認する。検証後・オープン前に親ディレクトリがルート外への
-/// symlink に差し替えられても、開いたハンドルは再解決したパスと一致せず拒否される
-/// （検証と取得の間の TOCTOU 対策。REQ-39）。以降の計測はパスではなくこのハンドルで行う。
+/// 検証と open は `fandhe_edge_guard::path::open_confined` に一体で委ねる。ルートの fd を起点に
+/// 各成分を `openat`（`O_NOFOLLOW`）で開くため、検証後に親ディレクトリや対象が symlink へ
+/// 差し替えられてもルート外は開けない（TOCTOU 対策。REQ-39・TASK-39.4-1）。Linux・macOS 以外は
+/// `UnsupportedPlatform`（終了コード 70）で拒否される（fail-closed）。以降の計測はパスではなく
+/// このハンドルで行う。拒否は `reason_code` だけを英語の固定文へ写し、パスは JSON へ出さない。
 fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport> {
-    let denied = || {
-        ErrorReport::new(
-            ExitCode::InvalidInput,
-            "path must be a relative path inside the working directory",
-        )
-    };
-    // 経路の閉じ込めを満たした後のファイル系の失敗は、REQ-21 の公開メッセージへ写す
-    // （不在・権限・FIFO・ディレクトリ・symlink を「経路違反」に丸めない）
-    let read_failure = |path: &Path, source: std::io::Error| {
-        capacity_error_report(&CapacityError::File(FsError::Read {
-            path: path.to_path_buf(),
-            source,
-        }))
-    };
-    if raw.is_absolute()
-        || !raw
-            .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(denied());
-    }
-    let joined = root.join(raw);
-    let name = joined.file_name().ok_or_else(denied)?;
-    let parent = joined.parent().ok_or_else(denied)?;
-    let parent = parent
-        .canonicalize()
-        .map_err(|e| read_failure(&joined, e))?;
-    if !parent.starts_with(root) {
-        return Err(denied());
-    }
-    let path = parent.join(name);
-    // 末尾が symlink の場合は開く前に拒否する（開いた後の再確認でも検出される）
-    let link_meta = std::fs::symlink_metadata(&path).map_err(|e| read_failure(&path, e))?;
-    if link_meta.file_type().is_symlink() {
-        return Err(capacity_error_report(&CapacityError::SymlinkRejected {
-            path: path.clone(),
-        }));
-    }
-    let file = open_regular_file_for_read(&path)
-        .map_err(|e| capacity_error_report(&CapacityError::File(e)))?;
-    // 開いた後に同じパスを再解決し、ルート配下・同一パス・同一ファイルであることを確認する。
-    // 差し替えの兆候は経路違反ではなく symlink 差し替え（計測コアと同じ扱い）として拒否する
-    let replaced = || capacity_error_report(&CapacityError::SymlinkRejected { path: path.clone() });
-    let resolved = path.canonicalize().map_err(|_| replaced())?;
-    if resolved != path || !resolved.starts_with(root) {
-        return Err(replaced());
-    }
-    let opened = file.metadata().map_err(|e| read_failure(&path, e))?;
-    enforce_size_limit(&path, opened.len(), MAX_FILE_BYTES)?;
-    let current = std::fs::metadata(&resolved).map_err(|_| replaced())?;
-    if !same_file(&opened, &current) {
-        return Err(replaced());
-    }
-    Ok((path, file))
-}
-
-/// 2 つのメタデータが同一ファイルのものか（Unix ではデバイス・inode の一致）。
-/// Unix 以外は標準ライブラリだけではハンドル由来のファイル ID を取れないため、近似せず
-/// 常に「同一と証明できない」として拒否する（fail-closed。M10 時点で対象外。REQ-39）。
-#[cfg(unix)]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
-    false
+    let (file, confined) = guard_open_confined(root, raw).map_err(|e| {
+        ErrorReport::new(e.exit_code(), format!("path rejected: {}", e.reason_code()))
+    })?;
+    Ok((confined.into_path_buf(), file))
 }
 
 /// 計測対象 1 ファイルの大きさの上限（バイト）。配布物の容量目安（40MB。REQ-30）を大きく
@@ -235,35 +172,33 @@ mod tests {
         panic!("could not create a unique temp dir");
     }
 
-    /// REQ-39: ルート配下の相対パスは受理され、絶対パス・`..` は InvalidInput になる。
+    /// REQ-39: Linux・macOS ではルート配下の相対パスは受理され、`..`・ルート外の絶対パス・
+    /// ルート外を指す末尾 symlink は InvalidInput（64）で拒否される。ルート配下の実体へ解決される
+    /// symlink はガード層の仕様どおり実体として受理される。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn req39_open_confined_rejects_absolute_and_parent_paths() {
+    fn req39_open_confined_accepts_inside_and_rejects_escapes() {
         let root = root();
-        // Unix: ルート配下の通常ファイルは受理される
-        #[cfg(unix)]
         assert!(open_confined(&root, Path::new("sub/m.json")).is_ok());
-        // 非 Unix: 開いた後の差し替え検出に要るファイル同一性を std だけでは取れないため、
-        // 受理せず常に拒否する（fail-closed の契約。SymlinkRejected 相当 = 終了コード 64）
-        #[cfg(not(unix))]
-        {
-            let e = open_confined(&root, Path::new("sub/m.json")).unwrap_err();
-            assert_eq!(e.code, ExitCode::InvalidInput);
-            assert_eq!(
-                e.message,
-                "package file is a symlink or was replaced during measurement"
-            );
+        std::os::unix::fs::symlink(root.join("sub").join("m.json"), root.join("sub/in_link"))
+            .unwrap();
+        assert!(open_confined(&root, Path::new("sub/in_link")).is_ok());
+        std::os::unix::fs::symlink("/etc/passwd", root.join("sub/out_link")).unwrap();
+        for bad in ["sub/out_link", "/etc/passwd", "../x", "sub/../../x"] {
+            let e = open_confined(&root, Path::new(bad)).unwrap_err();
+            assert_eq!(e.code, ExitCode::InvalidInput, "{bad}");
+            assert!(e.message.starts_with("path rejected: "), "{bad}");
         }
-        // 末尾が symlink のファイルは拒否される（ルート配下の別ファイルへの link でも）
-        #[cfg(unix)]
-        {
-            let l = root.join("sub").join("tail_link");
-            let _ = std::fs::remove_file(&l);
-            std::os::unix::fs::symlink(root.join("sub").join("m.json"), &l).unwrap();
-            assert!(open_confined(&root, Path::new("sub/tail_link")).is_err());
-        }
-        assert!(open_confined(&root, Path::new("/etc/passwd")).is_err());
-        assert!(open_confined(&root, Path::new("../x")).is_err());
-        assert!(open_confined(&root, Path::new("sub/../../x")).is_err());
+    }
+
+    /// REQ-39: 上記以外の OS は UnsupportedPlatform（70・固定文）で常に拒否する（fail-closed）。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn req39_open_confined_is_unsupported_on_other_platforms() {
+        let root = root();
+        let e = open_confined(&root, Path::new("sub/m.json")).unwrap_err();
+        assert_eq!(e.code, ExitCode::RuntimeError);
+        assert_eq!(e.message, "path rejected: unsupported_platform");
     }
 
     /// REQ-39: 上限を超えるサイズは LimitExceeded（終了コード 20）で拒否し、上限ちょうどは通す。
@@ -294,14 +229,13 @@ mod tests {
     }
 
     /// REQ-39: 親ディレクトリ経由のリンクによるルート外参照は拒否される。
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn req39_open_confined_rejects_linked_parent_outside_root() {
         let root = root();
-        let link = root.join("escape");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink("/etc", &link).unwrap();
-        assert!(open_confined(&root, Path::new("escape/passwd")).is_err());
+        std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
+        let e = open_confined(&root, Path::new("escape/passwd")).unwrap_err();
+        assert_eq!(e.code, ExitCode::InvalidInput);
     }
 
     /// REQ-39: 引数件数の上限を超えたら、ファイルを開く前に InvalidInput で拒否する。
@@ -315,26 +249,17 @@ mod tests {
         assert_eq!(err.message, "too many arguments");
     }
 
-    /// REQ-21: 経路内の不在ファイル・ディレクトリ・末尾 symlink は経路違反ではなく
-    /// 容量計測の公開メッセージになる。
+    /// REQ-21: 不在ファイル・ディレクトリは InvalidInput の固定文（パスを含まない）になる。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn req21_file_errors_are_not_path_confinement() {
+    fn req21_missing_and_directory_are_invalid_input() {
         let root = root();
         let missing = open_confined(&root, Path::new("sub/none.json")).unwrap_err();
-        assert_eq!(missing.message, "package file is not readable");
-        #[cfg(unix)]
-        {
-            let dir = open_confined(&root, Path::new("sub")).unwrap_err();
-            assert_eq!(dir.message, "package file is not a regular file");
-            let l = root.join("sub").join("tail_link2");
-            let _ = std::fs::remove_file(&l);
-            std::os::unix::fs::symlink(root.join("sub").join("m.json"), &l).unwrap();
-            let e = open_confined(&root, Path::new("sub/tail_link2")).unwrap_err();
-            assert_eq!(
-                e.message,
-                "package file is a symlink or was replaced during measurement"
-            );
-        }
+        assert_eq!(missing.code, ExitCode::InvalidInput);
+        assert_eq!(missing.message, "path rejected: path_unresolvable");
+        let dir = open_confined(&root, Path::new("sub")).unwrap_err();
+        assert_eq!(dir.code, ExitCode::InvalidInput);
+        assert_eq!(dir.message, "path rejected: not_regular_file");
     }
 
     /// REQ-21: 非 UTF-8 の引数は panic せず InvalidInput の ErrorReport になる。

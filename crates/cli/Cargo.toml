@@ -26,5 +26,10 @@ fandhe-edge-train.workspace = true
 # workspace 内 path 依存。runtime は core にしか依存せず、学習側依存は入らない（REQ-32）。
 fandhe-edge-runtime.workspace = true
 
+[dev-dependencies]
+# 容量計測 example（開発用ツール。配布物・推論経路に入らない）の経路の閉じ込めに
+# guard の open_confined を使う（workspace 内 path 依存のみ。REQ-39・#123）。
+fandhe-edge-guard.workspace = true
+
 [lints]
 workspace = true
