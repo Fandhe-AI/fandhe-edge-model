@@ -1,0 +1,128 @@
+//! 版管理台帳の結合テスト（REQ-39・PoC-20 ケース 7・TASK-39.3-1・#167。
+//! 証拠種別: テストハーネス。合成ファイル・一時ディレクトリ）。
+
+use std::fs;
+use std::path::PathBuf;
+
+use fandhe_edge_core::exitcode::ExitCode;
+use fandhe_edge_core::fs::FsError;
+use fandhe_edge_guard::version_ledger::{
+    ArtifactKind, CreatedAt, LedgerError, VersionId, VersionLedger,
+};
+
+const V1_HEX: &str = "1a1f4502024df8a68d12e64bb2364ad6308d04ed0a7d5e8300a676ec70867140";
+const EMPTY_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// 一時ディレクトリ（Drop で削除）。
+struct Sandbox(PathBuf);
+
+impl Sandbox {
+    fn new(label: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "fandhe-guard-ledger-{}-{}",
+            std::process::id(),
+            label
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).expect("mkdir");
+        Sandbox(p)
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn id(s: &str) -> VersionId {
+    VersionId::new(s).expect("valid id")
+}
+
+fn at() -> CreatedAt {
+    CreatedAt::from_unix_seconds(1_790_000_000).expect("valid time")
+}
+
+/// REQ-39: ファイルから記録したハッシュが具体値と一致する。
+#[test]
+fn req39_record_file_hash_and_time() {
+    let sb = Sandbox::new("ok");
+    let p = sb.0.join("model.onnx");
+    fs::write(&p, b"model-v1").unwrap();
+    fs::write(sb.0.join("empty"), b"").unwrap();
+    let mut l = VersionLedger::new();
+    let e = l
+        .record_file(ArtifactKind::Model, id("v1"), &p, 1024, at())
+        .unwrap();
+    assert_eq!(e.sha256().to_hex(), V1_HEX);
+    assert_eq!(e.created_at().to_rfc3339_utc(), "2026-09-21T14:13:20Z");
+    let e = l
+        .record_file(
+            ArtifactKind::Data,
+            id("d1"),
+            &sb.0.join("empty"),
+            1024,
+            at(),
+        )
+        .unwrap();
+    assert_eq!(e.sha256().to_hex(), EMPTY_HEX);
+    assert_eq!(l.len(), 2);
+}
+
+/// REQ-39: サイズ超過・非通常ファイル・不存在は台帳を変えずに拒否される。
+#[test]
+fn req39_record_file_failures_leave_ledger_empty() {
+    let sb = Sandbox::new("fail");
+    let big = sb.0.join("big");
+    fs::write(&big, b"12345678").unwrap();
+    let mut l = VersionLedger::new();
+
+    let err = l
+        .record_file(ArtifactKind::Model, id("v1"), &big, 4, at())
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::Io(FsError::TooLarge { .. })));
+    assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
+
+    let err = l
+        .record_file(ArtifactKind::Model, id("v1"), &sb.0, 1024, at())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::Io(FsError::NotRegularFile { .. })
+    ));
+    assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+
+    let err = l
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0.join("nope"),
+            1024,
+            at(),
+        )
+        .unwrap_err();
+    assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+    assert!(l.is_empty());
+}
+
+/// REQ-39: 重複は、ファイルを読む前に拒否される。
+#[test]
+fn req39_duplicate_checked_before_reading_file() {
+    let sb = Sandbox::new("dup");
+    let p = sb.0.join("model.onnx");
+    fs::write(&p, b"model-v1").unwrap();
+    let mut l = VersionLedger::new();
+    l.record_file(ArtifactKind::Model, id("v1"), &p, 1024, at())
+        .unwrap();
+    let err = l
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0.join("nope"),
+            1024,
+            at(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::DuplicateVersion { .. }));
+    assert_eq!(l.len(), 1);
+}
