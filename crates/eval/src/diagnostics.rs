@@ -97,6 +97,14 @@ pub trait InputNormalizer {
     /// [`OutputLimitExceeded`] として検出されるため、短い入力から巨大な文字列を
     /// 生成する規則でも、確保が上限を超える前に打ち切れる（REQ-39）。実装は
     /// `push_str` / `push` の `Err` を `?` で呼び出し元へ返すこと。
+    ///
+    /// **中間確保の契約（REQ-39）**: 本メソッドへ渡す `input` は呼び出し前に
+    /// [`MAX_STATS_INPUT_BYTES`] 以下であると検証済みである。実装は文字単位などで逐次に
+    /// 処理して `out` へ追記し、中間確保（トークン配列・一時 `String` 等）を `input` の
+    /// 長さに比例する範囲（定数倍。NFKC の 1 文字あたりの展開は有限）に収めること。
+    /// `input` の長さと無関係に増える確保（繰り返し展開・無制限のバッファリング）や、
+    /// `out` を経由せず全出力を先に確保してから追記する実装は契約違反として扱う。
+    /// 処理量も `input` の長さに対して線形（またはそれに準ずる）に収めること。
     fn normalize(&self, input: &str, out: &mut BoundedString) -> Result<(), OutputLimitExceeded>;
 }
 
