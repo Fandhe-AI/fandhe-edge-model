@@ -581,6 +581,17 @@ pub struct CancelledRun {
 }
 
 impl CancelledRun {
+    /// 子プロセスを起動する前にキャンセル済みだった場合の結果
+    /// （`Queued` のまま取り消されたジョブ。REQ-34・#144）。
+    pub(crate) fn before_start() -> Self {
+        Self {
+            elapsed: Duration::ZERO,
+            child_spawned: false,
+            child_reaped: true,
+            signal: None,
+        }
+    }
+
     /// 開始からキャンセル完了までの経過時間。
     #[must_use]
     pub fn elapsed(&self) -> Duration {
@@ -906,12 +917,7 @@ pub fn run_train_cancellable(
     // 起動前にキャンセル済みなら、子プロセスも `request.json` も作らずに
     // 返す（`Queued` のまま取り消されたジョブ。REQ-34・#144）。
     if cancel.is_cancelled() {
-        return Ok(TrainRunEnd::Cancelled(CancelledRun {
-            elapsed: Duration::ZERO,
-            child_spawned: false,
-            child_reaped: true,
-            signal: None,
-        }));
+        return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
     }
     let guard = write_request_file(job_dir, request)?;
     let started = Instant::now();
@@ -1115,23 +1121,44 @@ pub fn run_train_cancellable(
     let stderr_wait_budget = deadline
         .saturating_duration_since(Instant::now())
         .min(READER_DRAIN_TIMEOUT);
+    // 待機中もキャンセル要求へ応答するため、短い間隔でトークンを確認する
+    // （codex/review 指摘 P1「標準エラー出力の待機中にキャンセル要求を処理
+    // できない」。REQ-34・#144）。直接の子は既に reap 済みのため、キャンセルは
+    // 送出すべきシグナルの無い `Cancelled`（`child_reaped: true`）として返す
+    // （`Cancelling` からは `Cancelled` 確定も `Completed` も有効遷移）。
+    let stderr_wait_deadline = Instant::now() + stderr_wait_budget;
     let stderr_drain = match stderr_rx {
-        Some(rx) => match rx.recv_timeout(stderr_wait_budget) {
-            Ok(drained) => Some(drained),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    // 直接の子（supervisor）は既に reap 済み（`timed_out`
-                    // が `false` でここへ到達した以上、`outcome` は
-                    // `WaitOutcome::Exited` であり `child_reaped == true`）。
-                    return Err(TrainProcessError::WallTimeout {
-                        limit_ms: u64::try_from(limits.wall_timeout().as_millis())
-                            .unwrap_or(u64::MAX),
-                        child_reaped,
-                    });
-                }
-                None
+        Some(rx) => loop {
+            if cancel.is_cancelled() {
+                return Ok(TrainRunEnd::Cancelled(CancelledRun {
+                    elapsed: started.elapsed(),
+                    child_spawned: true,
+                    child_reaped,
+                    signal: None,
+                }));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            let slice = stderr_wait_deadline
+                .saturating_duration_since(Instant::now())
+                .min(POLL_INTERVAL);
+            match rx.recv_timeout(slice) {
+                Ok(drained) => break Some(drained),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        // 直接の子（supervisor）は既に reap 済み（`timed_out`
+                        // が `false` でここへ到達した以上、`outcome` は
+                        // `WaitOutcome::Exited` であり `child_reaped == true`）。
+                        return Err(TrainProcessError::WallTimeout {
+                            limit_ms: u64::try_from(limits.wall_timeout().as_millis())
+                                .unwrap_or(u64::MAX),
+                            child_reaped,
+                        });
+                    }
+                    if Instant::now() >= stderr_wait_deadline {
+                        break None;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            }
         },
         None => None,
     };

@@ -33,7 +33,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::TrainProcessError;
-use crate::process::{CancelToken, RunLimits, TrainRunEnd, WorkerLauncher, run_train_cancellable};
+use crate::process::{
+    CancelToken, CancelledRun, RunLimits, TrainRunEnd, WorkerLauncher, run_train_cancellable,
+};
 use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
 
@@ -208,9 +210,14 @@ impl TrainJob {
         limits: &RunLimits,
     ) -> Result<TrainRunEnd, TrainProcessError> {
         // `Queued` のままキャンセル済みなら `Start` は無効遷移になり、状態は
-        // `Cancelled` のまま。トークンが立っているため
-        // `run_train_cancellable` は子を起動せず `Cancelled` を返す。
+        // `Cancelled`（終端）のまま。この場合は入力検証（`InvalidRunLimits`）
+        // より取り消しを優先し、子を起動せず `Cancelled` を返す。検証エラーを
+        // 返すと、終端 `Cancelled` からの `FailedRun` は無効遷移として捨てられ、
+        // 戻り値と観測状態が食い違うため。
         self.apply(JobEvent::Start);
+        if self.token.is_cancelled() && *lock(&self.state) == JobState::Cancelled {
+            return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
+        }
         let result = run_train_cancellable(launcher, request, job_dir, limits, &self.token);
         let event = match &result {
             Ok(TrainRunEnd::Completed(run)) => match run.outcome() {
@@ -334,5 +341,53 @@ mod tests {
         assert!(!b.is_cancelled());
         a.cancel();
         assert!(b.is_cancelled());
+    }
+
+    /// REQ-34・レビュー指摘 P1: `Queued` のままキャンセルされたジョブは、
+    /// 他の入力検証エラーがあっても `Cancelled` を返し、観測状態と一致する
+    /// （戻り値と状態の食い違いを防ぐ）。
+    #[test]
+    fn req34_pre_start_cancel_wins_over_invalid_limits() {
+        use crate::request::{Device, TrainRequestParams};
+        use std::time::Duration;
+
+        let make = |limit: u32| {
+            TrainRequest::new(TrainRequestParams {
+                kind: "c3".to_string(),
+                kind_version: 1,
+                config: serde_json::Map::new(),
+                label_order: vec!["a".to_string(), "b".to_string()],
+                max_bytes: 512,
+                seed: 0,
+                device: Device::Cpu,
+                root: "/fandhe-edge-fixture-root".to_string(),
+                train_path: "train.jsonl".to_string(),
+                out_dir: "out".to_string(),
+                time_limit_seconds: Some(limit),
+                rss_limit_bytes: None,
+            })
+            .expect("valid request params")
+        };
+        let request = make(10);
+        // 別リクエスト由来の緩い RunLimits（実行されていれば InvalidRunLimits）。
+        let long = RunLimits::for_request(&make(3000));
+        assert!(long.wall_timeout() > Duration::from_secs(10));
+
+        let dir =
+            std::env::temp_dir().join(format!("fandhe-edge-train-job-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let python = dir.join("python");
+        let script = dir.join("launch.py");
+        std::fs::write(&python, b"").expect("stub python");
+        std::fs::write(&script, b"").expect("stub script");
+        let launcher = WorkerLauncher::new(python, script).expect("launcher");
+
+        let job = TrainJob::new();
+        let handle = job.handle();
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        let result = job.run(&launcher, &request, &dir, &long);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Ok(TrainRunEnd::Cancelled(_))));
+        assert_eq!(handle.state(), S::Cancelled);
     }
 }
