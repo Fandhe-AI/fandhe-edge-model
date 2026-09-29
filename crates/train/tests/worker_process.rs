@@ -28,8 +28,8 @@ use std::time::Duration;
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
 use fandhe_edge_train::process::ENV_ALLOWLIST;
-use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
-use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
+use fandhe_edge_train::process::{RunLimits, WorkerCandidateRunner, WorkerLauncher, run_train};
+use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams, ValidationInput};
 
 /// [`TrainRequest`] の `root`（実在しない絶対パス。`root` の symlink 解決は
 /// ベストエフォートで、存在しない場合は文字列のまま扱われる。
@@ -305,6 +305,54 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             std::thread::sleep(Duration::from_secs(2));
             std::process::exit(0);
         }
+        "ok_validation" | "ok_validation_big" | "ok_validation_over_cap" => {
+            // issue #84 PR #238・選択肢 2: リクエストの `validation_inputs` の
+            // `id` から `validation_predictions` を組み立てて返す（実際の
+            // 学習ワーカーが学習直後に行う予測の代役）。`artifact_dir` は
+            // リクエストの `root`／`out_dir` から作る（候補ごとに `out_dir` が
+            // 異なるため）。`ok_validation_big` は予測ラベルを 250 文字にして
+            // 結果を既定上限（1 MiB）より大きくする。`ok_validation_over_cap` は
+            // さらに 70 MiB の空白を続けて validation 付きの上限（64 MiB）も超える。
+            let request_json: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(request_path).unwrap_or_else(|e| panic!("read request: {e}")),
+            )
+            .expect("request json");
+            let root = request_json["root"].as_str().expect("root");
+            let out_dir = request_json["out_dir"].as_str().expect("out_dir");
+            let mut value: serde_json::Value =
+                serde_json::from_str(&ok_json(&format!("{root}/{out_dir}")))
+                    .expect("ok json template");
+            let inputs = request_json["validation_inputs"]
+                .as_array()
+                .expect("validation_inputs must be present");
+            let big_label = "l".repeat(250);
+            let predictions: Vec<serde_json::Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    // 各要素は `id`・`input` の 2 キーだけ（正解ラベルを持たない。REQ-27）。
+                    assert_eq!(item.as_object().expect("object").len(), 2);
+                    let label = if mode == "ok_validation" {
+                        if i % 2 == 0 { "a" } else { "b" }
+                    } else {
+                        big_label.as_str()
+                    };
+                    serde_json::json!({
+                        "id": item["id"],
+                        "status": "ok",
+                        "predicted_label": label,
+                    })
+                })
+                .collect();
+            value["validation_predictions"] = serde_json::Value::Array(predictions);
+            print!("{}", serde_json::to_string(&value).expect("serialize"));
+            if mode == "ok_validation_over_cap" {
+                let padding = vec![b' '; 70 * 1024 * 1024];
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(&padding);
+            }
+            std::process::exit(0);
+        }
         "record" => {
             // argv・受け取った request.json の内容・環境変数名の一覧を
             // cwd（= job_dir）の `record.json` へ書く（issue #178 実装計画
@@ -374,6 +422,26 @@ fn run_test_suite() -> ProcessExitCode {
             case_wall_timeout_when_grandchild_holds_stderr_open,
         ),
         ("record_argv_and_request", case_record),
+        (
+            "validation_predictions_are_returned",
+            case_validation_predictions_are_returned,
+        ),
+        (
+            "validation_result_above_default_cap_is_accepted",
+            case_validation_result_above_default_cap_is_accepted,
+        ),
+        (
+            "validation_result_above_validation_cap_is_rejected",
+            case_validation_result_above_validation_cap_is_rejected,
+        ),
+        (
+            "search_scores_inside_the_training_job",
+            case_search_scores_inside_the_training_job,
+        ),
+        (
+            "search_records_wall_timeout_as_candidate_timeout",
+            case_search_records_wall_timeout_as_candidate_timeout,
+        ),
         ("invalid_job_dir", case_invalid_job_dir),
         ("existing_request_file_rejected", case_existing_request_file),
     ];
@@ -663,6 +731,249 @@ fn case_wall_timeout_when_grandchild_holds_stderr_open(case_dir: &Path) -> Resul
         started.elapsed() < Duration::from_millis(1500),
         "must return around the wall timeout, not after waiting ~2s for the \
          grandchild holding stderr open to exit on its own",
+    )
+}
+
+fn make_request_with_validation(n: usize) -> TrainRequest {
+    make_request(Some(30))
+        .with_validation_inputs(
+            (0..n)
+                .map(|i| ValidationInput::new(format!("r{i}"), format!("input {i}")))
+                .collect(),
+        )
+        .expect("valid validation inputs")
+}
+
+/// 選択肢 2（issue #84 PR #238・REQ-18・REQ-27）: `validation_inputs` を付けた
+/// リクエストに対し、子プロセスの結果 JSON から `validation_predictions` を
+/// `SuccessOutcome` として受け取れる（`id` は入力と同順・同件数）。
+#[cfg(unix)]
+fn case_validation_predictions_are_returned(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok_validation");
+    let request = make_request_with_validation(4);
+    let limits = RunLimits::for_request(&request);
+    let run = run_train(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("run_train failed: {e}"))?;
+    expect_eq(run.exit_code(), ExitCode::Ok, "exit_code")?;
+    let fandhe_edge_train::result::TrainOutcome::Ok(success) = run.outcome() else {
+        return Err("expected Ok outcome".to_string());
+    };
+    let predictions = success
+        .validation_predictions()
+        .ok_or_else(|| "validation_predictions must be present".to_string())?;
+    let actual: Vec<(String, Option<String>)> = predictions
+        .iter()
+        .map(|p| (p.id().to_string(), p.predicted_label().map(str::to_string)))
+        .collect();
+    let expected: Vec<(String, Option<String>)> =
+        [("r0", "a"), ("r1", "b"), ("r2", "a"), ("r3", "b")]
+            .iter()
+            .map(|(id, label)| ((*id).to_string(), Some((*label).to_string())))
+            .collect();
+    expect_eq(actual, expected, "validation_predictions")
+}
+
+/// 予測列を含む結果は、`validation_inputs` 付きのときだけ既定の上限
+/// （`MAX_RESULT_BYTES` = 1 MiB）を超えても受理される
+/// （`MAX_RESULT_BYTES_WITH_VALIDATION`）。5000 件 × 250 文字のラベルで約 1.4 MB。
+#[cfg(unix)]
+fn case_validation_result_above_default_cap_is_accepted(case_dir: &Path) -> Result<(), String> {
+    const N: usize = 5000;
+    expect_true(
+        N * 250 > fandhe_edge_train::limits::MAX_RESULT_BYTES,
+        "the test result must exceed the default cap",
+    )?;
+    let launcher = make_launcher(case_dir, "ok_validation_big");
+    let request = make_request_with_validation(N);
+    let limits = RunLimits::for_request(&request);
+    let run = run_train(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("run_train failed: {e}"))?;
+    let fandhe_edge_train::result::TrainOutcome::Ok(success) = run.outcome() else {
+        return Err("expected Ok outcome".to_string());
+    };
+    expect_eq(
+        success.validation_predictions().map(<[_]>::len),
+        Some(N),
+        "prediction count",
+    )
+}
+
+/// validation 付きの上限（`MAX_RESULT_BYTES_WITH_VALIDATION` = 64 MiB）を超える
+/// 標準出力は `TooLarge` として拒否される（`RuntimeError`）。
+#[cfg(unix)]
+fn case_validation_result_above_validation_cap_is_rejected(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok_validation_over_cap");
+    let request = make_request_with_validation(2);
+    let limits = RunLimits::for_request(&request);
+    match run_train(&launcher, &request, case_dir, &limits) {
+        Err(e) => expect_eq(e.exit_code(), ExitCode::RuntimeError, "exit_code"),
+        Ok(_) => Err("expected the oversized result to be rejected".to_string()),
+    }
+}
+
+/// [`fandhe_edge_data::split::Groupable`] の最小実装（search の結合テストと同じ設計）。
+#[cfg(unix)]
+struct SplitItem {
+    id: String,
+    group_id: String,
+}
+
+#[cfg(unix)]
+impl fandhe_edge_data::split::Groupable for SplitItem {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn group_id(&self) -> &str {
+        &self.group_id
+    }
+    fn label(&self) -> &str {
+        "a"
+    }
+}
+
+/// `record_ids` を validation split として持つ凍結記録を作る（比率 validation: 1.0）。
+#[cfg(unix)]
+fn frozen_validation_split(record_ids: &[&str]) -> fandhe_edge_data::split_record::SplitRecord {
+    let items: Vec<SplitItem> = record_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| SplitItem {
+            id: (*id).to_string(),
+            group_id: format!("g{i}"),
+        })
+        .collect();
+    let ratios = fandhe_edge_data::split::SplitRatios {
+        train: 0.0,
+        validation: 1.0,
+        test: 0.0,
+    };
+    fandhe_edge_data::split_record::split_and_record(&items, 0, &ratios)
+        .expect("valid ratios")
+        .record()
+        .clone()
+}
+
+/// 探索の入力（label_order は偽ワーカーの成果物と同じ `["a","b"]`）。
+#[cfg(unix)]
+fn search_candidates(ids: &[&str]) -> Vec<fandhe_edge_train::search::SearchCandidate> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| fandhe_edge_train::search::SearchCandidate {
+            candidate_id: (*id).to_string(),
+            params: TrainRequestParams {
+                kind: "c3".to_string(),
+                kind_version: 1,
+                config: serde_json::Map::new(),
+                label_order: vec!["a".to_string(), "b".to_string()],
+                max_bytes: 512,
+                seed: i as u32,
+                device: Device::Cpu,
+                root: FIXTURE_ROOT.to_string(),
+                train_path: "train.jsonl".to_string(),
+                out_dir: format!("out-{id}"),
+                time_limit_seconds: None,
+                rss_limit_bytes: None,
+            },
+        })
+        .collect()
+}
+
+/// 選択肢 2（issue #84 PR #238）の結合: `run_search` が `WorkerCandidateRunner`
+/// （実際の子プロセス経路〔`run_train`〕）で候補を実行し、学習ジョブの結果に
+/// 含まれる予測列から validation 正解率を算出して選定できる。
+#[cfg(unix)]
+fn case_search_scores_inside_the_training_job(case_dir: &Path) -> Result<(), String> {
+    use fandhe_edge_train::search::{CandidateSearchResult, SearchBudget, SearchInput, run_search};
+    use fandhe_edge_train::time_allotment::{PerCandidatePolicy, SystemClock};
+
+    let launcher = make_launcher(case_dir, "ok_validation");
+    let mut runner = WorkerCandidateRunner::new(&launcher, case_dir);
+    let record_ids = ["r0", "r1", "r2", "r3"];
+    let inputs: [&[u8]; 4] = [b"input 0", b"input 1", b"input 2", b"input 3"];
+    // 偽ワーカーは a,b,a,b と予測する。gold は 3/4 が一致する並び。
+    let gold = ["a", "b", "a", "a"];
+    let split = frozen_validation_split(&record_ids);
+    let input = SearchInput {
+        label_order: &["a", "b"],
+        validation_gold: &gold,
+        validation_record_ids: &record_ids,
+        validation_inputs: &inputs,
+        validation_split_record: &split,
+        candidates: search_candidates(&["c3-a", "c3-b"]),
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::EvenSplit,
+    };
+    let record = run_search(&mut runner, &SystemClock::new(), input)
+        .map_err(|e| format!("run_search failed: {e}"))?;
+    expect_eq(record.candidates.len(), 2, "candidate count")?;
+    for entry in &record.candidates {
+        match &entry.result {
+            CandidateSearchResult::Evaluated {
+                validation_accuracy,
+            } => {
+                expect_eq(validation_accuracy.correct, 3, "correct")?;
+                expect_eq(validation_accuracy.total, 4, "total")?;
+            }
+            other => return Err(format!("expected Evaluated, got {other:?}")),
+        }
+    }
+    match &record.selection {
+        fandhe_edge_train::search::SelectionDecision::Selected { candidate_id, .. } => {
+            expect_eq(candidate_id.as_str(), "c3-a", "selected candidate")
+        }
+        other => Err(format!("expected Selected, got {other:?}")),
+    }
+}
+
+/// 選択肢 2（issue #84 PR #238・REQ-39）の結合: 子プロセスが壁時計の締め切りで
+/// 強制終了された候補は、探索全体の失敗ではなく `training_timed_out` として
+/// 記録され、以降の候補は未着手になる（スレッド・`recv_timeout` は使わない）。
+#[cfg(unix)]
+fn case_search_records_wall_timeout_as_candidate_timeout(case_dir: &Path) -> Result<(), String> {
+    use fandhe_edge_train::search::{CandidateSearchResult, SearchBudget, SearchInput, run_search};
+    use fandhe_edge_train::time_allotment::{PerCandidatePolicy, SystemClock};
+
+    let launcher = make_launcher(case_dir, "hang");
+    let mut runner = WorkerCandidateRunner::new(&launcher, case_dir)
+        .with_wall_timeout(Duration::from_millis(500));
+    let record_ids = ["r0", "r1"];
+    let inputs: [&[u8]; 2] = [b"input 0", b"input 1"];
+    let gold = ["a", "b"];
+    let split = frozen_validation_split(&record_ids);
+    let input = SearchInput {
+        label_order: &["a", "b"],
+        validation_gold: &gold,
+        validation_record_ids: &record_ids,
+        validation_inputs: &inputs,
+        validation_split_record: &split,
+        candidates: search_candidates(&["c3-a", "c3-b"]),
+        budget: SearchBudget::default(),
+        policy: PerCandidatePolicy::Fixed(std::num::NonZeroU32::new(1).expect("non-zero")),
+    };
+    let started = std::time::Instant::now();
+    let record = run_search(&mut runner, &SystemClock::new(), input)
+        .map_err(|e| format!("run_search must not fail on a candidate timeout: {e}"))?;
+    expect_true(
+        started.elapsed() < Duration::from_secs(10),
+        "must return well before the 10s safety margin",
+    )?;
+    expect_eq(record.candidates.len(), 2, "candidate count")?;
+    expect_eq(
+        record.candidates[0].result.clone(),
+        CandidateSearchResult::TrainingTimedOut,
+        "first candidate",
+    )?;
+    expect_eq(
+        record.candidates[1].result.clone(),
+        CandidateSearchResult::NotStarted {
+            reason: fandhe_edge_train::search::NotStartedReason::BudgetExhausted,
+        },
+        "second candidate",
+    )?;
+    expect_eq(
+        record.selection.clone(),
+        fandhe_edge_train::search::SelectionDecision::NoEligibleCandidate,
+        "selection",
     )
 }
 

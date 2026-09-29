@@ -40,11 +40,15 @@
 //!
 //! 子プロセスの起動・タイムアウト・終了コード写像（ワーカーの `code` から
 //! [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）は [`process`]
-//! モジュールが実装する（issue #178。学習は [`process::run_train`]、
-//! validation 採点は [`process::run_predict`]。issue #84 PR #238 レビュー
-//! 案 A: [`search`] は in-process の trait ではなく、この [`process`] の
-//! 子プロセス実行を直接呼ぶ）。[`time_allotment::CandidateRunner`] はこの
-//! 実行器を差し込むための接合点（trait）を提供する。
+//! モジュールが実装する（issue #178。学習は [`process::run_train`]）。
+//! [`time_allotment::CandidateRunner`] はこの実行器を差し込むための接合点
+//! （trait）で、[`process::WorkerCandidateRunner`] が `run_train` を使う実装。
+//! validation の採点は別プロセスではなく**学習ジョブの中**で行う（issue #84
+//! PR #238 レビュー・選択肢 2）: 学習リクエストの任意項目 `validation_inputs`
+//! （[`request::ValidationInput`]。`id`・`input` のみで正解ラベルは持たない。
+//! REQ-27）を学習ワーカーが学習直後に予測し、結果の `validation_predictions`
+//! （[`result::SuccessOutcome::validation_predictions`]）として返す。
+//! [`search`] はその予測列を validation gold と突き合わせる。
 //!
 //! # スコープ外（#178 以降も対象外）
 //!
@@ -60,9 +64,9 @@
 //! - CLI `train`／`select` 工程への配線・`trainer_dir` の発見（CLI 引数・
 //!   設定からの解決。TASK-33.x）
 //! - Rust 側での RSS 監視（学習ワーカー自身の `supervisor.py` が担う）。
-//!   外側の壁時計締め切り超過時、[`process::run_train`]・[`process::run_predict`]
-//!   は直接の子（supervisor）だけを `Child::kill()` で終了させる。`_worker`・
-//!   `_predict_worker` を含む子孫プロセスの確実な掃除は Rust 側の関与なしに、
+//!   外側の壁時計締め切り超過時、[`process::run_train`] は直接の子
+//!   （supervisor）だけを `Child::kill()` で終了させる。`_worker` を含む
+//!   子孫プロセスの確実な掃除は Rust 側の関与なしに、
 //!   学習ワーカー自身が supervisor の死を検知して自己終了する「lifeline」
 //!   方式に委ねる（issue #178 PR #233 レビュー: `process_group(0)`・
 //!   `/bin/kill` 呼び出しによる Rust 側でのプロセスグループ管理は、PID

@@ -95,6 +95,7 @@ use crate::limits::MAX_WORKER_STDERR_BYTES;
 use crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS;
 use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
+use crate::time_allotment::CandidateRunner;
 
 /// 出力読み取りスレッドが完了を待つ上限（秒）。子プロセスの終了後、
 /// パイプが閉じてスレッドが `recv` から戻るまでの猶予（REQ-39「資源の
@@ -620,6 +621,64 @@ pub fn run_train(
     _limits: &RunLimits,
 ) -> Result<TrainRun, TrainProcessError> {
     Err(TrainProcessError::UnsupportedPlatform)
+}
+
+/// [`run_train`] を [`CandidateRunner`]（[`crate::search::run_search`] が候補を
+/// 実行する接合点）として使うアダプター（REQ-18・REQ-34・REQ-39。issue #84
+/// PR #238・選択肢 2）。
+///
+/// 各候補を、その `request.time_limit_seconds()` に基づく既定の壁時計締め切り
+/// （[`RunLimits::for_request`]）で子プロセス実行する。リクエストが
+/// `validation_inputs` を持つ場合、学習直後の validation 予測も同じ子プロセス・
+/// 同じ締め切りの中で行われる（予測時間も締め切りに含まれる）。壁時計超過は
+/// [`TrainProcessError::WallTimeout`] で、[`CandidateRunner::is_wall_timeout`]
+/// がそれを候補単位の時間切れとして見分ける。`job_dir` はジョブ管理側が
+/// 用意した専用ディレクトリで、候補は逐次実行されるため共有できる
+/// （`request.json` は実行のたびに新規作成・削除される。[`run_train`] 参照）。
+#[derive(Debug)]
+pub struct WorkerCandidateRunner<'a> {
+    launcher: &'a WorkerLauncher,
+    job_dir: &'a Path,
+    wall_timeout_override: Option<Duration>,
+}
+
+impl<'a> WorkerCandidateRunner<'a> {
+    /// 既定の締め切り（各リクエストの `time_limit_seconds` ＋
+    /// [`SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]）で実行するアダプターを作る。
+    #[must_use]
+    pub fn new(launcher: &'a WorkerLauncher, job_dir: &'a Path) -> Self {
+        Self {
+            launcher,
+            job_dir,
+            wall_timeout_override: None,
+        }
+    }
+
+    /// 外側の壁時計締め切りを、既定より **短い** 固定値へ上書きする
+    /// （テスト用途。[`RunLimits::with_wall_timeout`] と同じく、既定以上の
+    /// 値は実行時に [`TrainProcessError::InvalidRunLimits`] になる）。
+    #[must_use]
+    pub fn with_wall_timeout(mut self, timeout: Duration) -> Self {
+        self.wall_timeout_override = Some(timeout);
+        self
+    }
+}
+
+impl CandidateRunner for WorkerCandidateRunner<'_> {
+    type Error = TrainProcessError;
+
+    fn run(&mut self, request: &TrainRequest) -> Result<TrainOutcome, Self::Error> {
+        let mut limits = RunLimits::for_request(request);
+        if let Some(timeout) = self.wall_timeout_override {
+            limits = limits.with_wall_timeout(timeout)?;
+        }
+        let run = run_train(self.launcher, request, self.job_dir, &limits)?;
+        Ok(run.outcome().clone())
+    }
+
+    fn is_wall_timeout(error: &Self::Error) -> bool {
+        matches!(error, TrainProcessError::WallTimeout { .. })
+    }
 }
 
 /// `try_wait()` を 1 回ポーリングした結果を、壁時計締め切りとの関係で

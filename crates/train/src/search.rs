@@ -8,16 +8,25 @@
 //! 記録する」部分を担うのに対し、本モジュールはそれを候補の宣言順に
 //! 繰り返し呼び、探索予算全体の消費を追跡し、validation 正解率が最も
 //! 高い候補を選ぶ上位ロジックを実装する。学習ワーカー（`trainer/`）を
-//! 子プロセスとして実際に起動する処理（[`crate::time_allotment::CandidateRunner`]
-//! の実装）は #178（REQ-34）の対象で、本モジュールには含まない。
+//! 子プロセスとして起動する実行器は [`crate::time_allotment::CandidateRunner`]
+//! で、実装は [`crate::process::WorkerCandidateRunner`]（`run_train` を使う）。
 //!
-//! validation の推論も同様にスタブ（[`ValidationScorer`]）とする。Rust の
-//! 推論ランタイムはまだ存在せず（REQ-28/30〜32 は未着手）、本 crate は
-//! 学習ワーカー層に位置するため推論経路の型を持ち込まない
-//! （`.claude/rules/coding-rust.md`「推論ランタイムは学習側に依存しない」の
-//! 逆方向。学習ワーカー層が推論ランタイムに依存するのも層の境界違反）。
-//! [`ValidationScorer`] の実装は推論ランタイム（REQ-28 系）またはジョブ管理
-//! （#178）が担う。
+//! # validation の採点は学習ジョブの中で行う（選択肢 2）
+//!
+//! 候補の validation 予測は、その候補の学習ジョブ（子プロセス）の**内側**で
+//! 学習直後に行う（issue #84 PR #238 レビュー・オーナー承認の選択肢 2）。
+//! 学習済みモデルはそのプロセスのメモリ上にしか無く、成果物（ONNX）から
+//! 読み戻す経路は学習ワーカーに存在しないため、別プロセス・別スレッドでの
+//! 採点は成立しない。各候補の学習リクエストへ validation 入力
+//! （[`crate::request::ValidationInput`]。`{id, input}` のみ）を付け、結果の
+//! [`crate::result::SuccessOutcome::validation_predictions`] を
+//! [`SearchInput::validation_gold`] と突き合わせて正解率を算出する。
+//!
+//! - 予測時間は学習と同じ持ち時間・壁時計の締め切りに含まれる。締め切り超過は
+//!   実行器が強制終了する（[`crate::time_allotment::CandidateRunner::is_wall_timeout`]）
+//!   ため、本モジュールはスレッドも `recv_timeout` も持たない
+//! - 予測経路を持たない `kind` は学習ワーカーが学習前に拒否する
+//!   （`invalid_request`。候補は [`CandidateSearchResult::TrainingNotCompleted`]）
 //!
 //! 正解率の算出は評価器 [`fandhe_edge_eval::metrics::evaluate_single_select`]
 //! に委譲し、本 crate では再実装しない（`.claude/rules/coding-rust.md`
@@ -29,16 +38,17 @@
 //! - [`SearchInput::validation_gold`] は **validation 分割のみ**を渡す想定。
 //!   凍結した最終 test を渡してはならない（最終 test の適用は 1 回限りで、
 //!   候補・しきい値の選び直しに使わない。TASK-27.3 で強制の仕組みを実装
-//!   予定だが、本モジュールは呼び出し元の責務として doc で明示するに留める）
-//! - [`ValidationScorer::predict_validation`] へは `candidate_id`・学習
-//!   成果物（[`crate::result::SuccessOutcome`]）・[`ValidationInputRecord`]
-//!   の列（record_id・byte 入力の組）を渡し、`validation_gold`
-//!   （正解ラベル）は渡さない（REQ-27「推論関数には `input` だけを渡す」の
-//!   学習ワーカー層での対応。gold を渡さない制約は trait の引数リストと
-//!   いう型のレベルで保証される）。入力そのものも `run_search` が権威ある
-//!   値として渡すのは、scorer が自身で保持する別データ（record_id は
-//!   揃っているが中身が異なる入力）を使ってしまうことを防ぐため
-//!   （P0 指摘対応。issue #84 PR #238 レビュー）
+//!   予定だが、本モジュールは呼び出し元の責務として doc で明示するに留める）。
+//!   `validation_record_ids` は凍結済み validation split の記録と照合する
+//!   （[`SearchError::ValidationSplitHashMismatch`]。学習を始める前に検査する）
+//! - 学習ワーカーへ渡すのは validation の `id` と `input` だけで、
+//!   `validation_gold`（正解ラベル）は渡さない（REQ-27「推論関数には `input`
+//!   だけを渡す」。[`crate::request::ValidationInput`] は gold を持てない型）。
+//!   予測列の `id` 列・件数が [`SearchInput::validation_record_ids`] と
+//!   （順序を含めて）一致しない場合は、その候補を
+//!   [`CandidateSearchResult::ScoringFailed`] として選定対象外にする
+//! - 予測ラベル・入力本文は `Debug` にも記録の JSON にも出さない
+//!   （security.md「データ本文を転記しない」）
 //!
 //! # PoC-17 との差異
 //!
@@ -55,8 +65,8 @@
 //!   issue #87）
 //! - 「予算到達」を合格扱いにしない判定・記録上のラベル付け（TASK-18.2・
 //!   issue #85）
-//! - [`ValidationScorer`]・[`crate::time_allotment::CandidateRunner`] の実装
-//!   （推論ランタイム REQ-28 系、子プロセス起動 #178）
+//! - 推論ランタイム（REQ-28 系）を使った採点（本モジュールの採点は学習ワーカー
+//!   内の学習直後の予測。ONNX 書き出しモデルとの一致は各 kind のテストで確認する）
 //! - 記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コードへの
 //!   写像（TASK-33.x）
 //! - `package_bytes`・速度（p95）を使う PoC-17 の threshold／pareto 選定
@@ -80,21 +90,17 @@
 use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
 use crate::error::TrainRequestError;
 use crate::limits::{MAX_LABEL_BYTES, MAX_LABELS, MAX_VALIDATION_INPUT_TOTAL_BYTES};
-use crate::request::{TrainRequest, TrainRequestParams};
-use crate::result::{SuccessOutcome, TrainOutcome};
+use crate::request::{TrainRequest, TrainRequestParams, ValidationInput};
+use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
 use crate::time_allotment::{
-    Allotment, CandidateRunner, CandidateTimeError, CandidateTimeRecord, Clock, PerCandidatePolicy,
-    allot, run_candidate,
+    Allotment, CandidateRunner, CandidateTimeError, CandidateTimeRecord, CandidateTimeStatus,
+    Clock, PerCandidatePolicy, allot, run_candidate_with_validation_inputs,
 };
 
 /// 探索予算の既定値（秒）。全候補の合計に対する予算（2026-09-27 オーナー
@@ -194,36 +200,33 @@ pub struct SearchInput<'a> {
     pub validation_gold: &'a [&'a str],
     /// [`validation_gold`](Self::validation_gold) と同じ順・同じ件数の
     /// validation レコード識別子（凍結済み validation split のレコード ID）。
-    /// [`ValidationScorer::predict_validation`] へ
-    /// [`validation_inputs`](Self::validation_inputs) と組にして渡し、戻り値の
-    /// [`ScoredOutcome::record_id`] 列と突き合わせることで、scorer が
-    /// `run_search` の意図した順序と異なる予測（件数は同じだが順序が違う・
-    /// 別の record_id の予測）を返していないかを検証する（REQ-27
-    /// 「評価の独立性」・P0 指摘対応。issue #84 PR #238 レビュー。scorer が
-    /// record_id は正しいが中身の異なる入力を独自に保持しているケースの
-    /// 防止は [`validation_inputs`](Self::validation_inputs) が担う）。
-    /// 正解ラベルは含まない。`validate_input`（`crate::search`）が `BTreeSet`
-    /// へ追加する前に、1 件あたり
+    /// 各候補の学習リクエストへ [`validation_inputs`](Self::validation_inputs)
+    /// と組（[`ValidationInput`]）にして渡し、結果の予測列の `id` 列と
+    /// （順序を含めて）突き合わせることで、学習ワーカーが意図した順序と異なる
+    /// 予測（件数は同じだが順序が違う・別の record_id の予測）を返していない
+    /// かを検証する（REQ-27「評価の独立性」・P0 指摘対応。issue #84 PR #238
+    /// レビュー）。正解ラベルは含まない。`validate_input`（`crate::search`）が
+    /// `BTreeSet` へ追加する前に、1 件あたり
     /// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`]・合計
     /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超えていないか
     /// 検証する（P1 指摘対応・REQ-39「資源の上限」。issue #84 PR #238
     /// レビュー）。
     pub validation_record_ids: &'a [&'a str],
     /// [`validation_record_ids`](Self::validation_record_ids) と同じ順・
-    /// 同じ件数の byte 入力（README「入力表現は byte のみ」）。
-    /// [`run_search`] が [`ValidationScorer::predict_validation`] へ
-    /// `record_id`・`input` の組として渡す（正解ラベルは渡さない。REQ-27）。
-    /// scorer が凍結済み validation split とは異なる入力（自身が独自に
-    /// 保持していた古い・別のデータ）で推論することを防ぐため、`run_search`
-    /// が権威ある入力を明示的に渡す設計にしている（P0 指摘対応。issue #84
-    /// PR #238 レビュー: record_id の一致だけでは、scorer が record_id は
-    /// 揃っているが中身が異なる入力を保持していた場合を検出できない）。
-    /// `validate_input`（`crate::search`）が scorer 呼び出し前に、1 件あたり
+    /// 同じ件数の入力（README「入力表現は byte のみ」）。各候補の学習リクエストの
+    /// `validation_inputs`（[`ValidationInput`]。`id` と `input` のみ。正解
+    /// ラベルは渡さない。REQ-27）として学習ワーカーへ渡され、学習直後に
+    /// 予測される。**UTF-8 でなければならない**（リクエスト JSON の文字列に
+    /// 載せるため。UTF-8 でない入力は、子プロセスを起動する前に
+    /// [`SearchError::ValidationInputNotUtf8`]〔`invalid_input`〕で拒否する）。
+    /// `validate_input`（`crate::search`）が学習を始める前に、1 件あたり
     /// [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`]・合計
-    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超えていないか
-    /// 検証する（`SearchInput` はデータ契約層を経由しない呼び出し元も直接
-    /// 組み立てられる公開 API のため。REQ-39「資源の上限」・P0 指摘対応。
-    /// issue #84 PR #238 レビュー）。
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超えていないか、
+    /// および各候補のリクエストに収まる大きさか（実効上限は
+    /// [`crate::limits::MAX_REQUEST_BYTES`]。同定数の doc 参照）を検証する
+    /// （`SearchInput` はデータ契約層を経由しない呼び出し元も直接組み立てられる
+    /// 公開 API のため。REQ-39「資源の上限」・P0 指摘対応。issue #84 PR #238
+    /// レビュー）。
     pub validation_inputs: &'a [&'a [u8]],
     /// 凍結済み validation split の記録（REQ-17・REQ-27。P0 指摘対応。
     /// issue #84 PR #238 レビュー）。`validate_input` は
@@ -233,16 +236,17 @@ pub struct SearchInput<'a> {
     /// 作らず、`crates/data::split_record` が使うのと同じ関数を再利用する）
     /// で再計算し、この記録の `validation` split のハッシュ
     /// （[`fandhe_edge_data::split_record::SplitRecord::digest`]・
-    /// `fandhe_edge_data::split::Split::Validation`）と一致するかを、採点
-    /// （[`ValidationScorer::predict_validation`]）を呼び出す前に確認する。
-    /// 一致しなければ [`SearchError::ValidationSplitHashMismatch`] で
-    /// fail-closed に停止する。凍結した最終 test 分割の record_ids を誤って
-    /// validation として渡した場合も、その記録の `validation` split の
-    /// ハッシュとは一致しないため同じ経路で拒否される（`SplitRecord` は
-    /// train・validation・test の 3 split をまとめて保持する 1 つの記録
-    /// であり、常に `Split::Validation` の digest だけと比較することで
-    /// 「どの split の記録として渡されたか」を暗黙に検証する。分割ごとに
-    /// 別の "kind" フィールドを持たないため、追加の種別照合は不要）。
+    /// `fandhe_edge_data::split::Split::Validation`）と一致するかを、**学習を
+    /// 始める前**に確認する（採点は学習ジョブの中で行うため、この検査が
+    /// ジョブ全体の前提になる）。一致しなければ
+    /// [`SearchError::ValidationSplitHashMismatch`] で fail-closed に停止する。
+    /// 凍結した最終 test 分割の record_ids を誤って validation として渡した
+    /// 場合も、その記録の `validation` split のハッシュとは一致しないため
+    /// 同じ経路で拒否される（`SplitRecord` は train・validation・test の
+    /// 3 split をまとめて保持する 1 つの記録であり、常に `Split::Validation`
+    /// の digest だけと比較することで「どの split の記録として渡されたか」を
+    /// 暗黙に検証する。分割ごとに別の "kind" フィールドを持たないため、追加の
+    /// 種別照合は不要）。
     pub validation_split_record: &'a fandhe_edge_data::split_record::SplitRecord,
     /// 探索対象の候補（宣言順に実行する。乱数は使わない）。
     pub candidates: Vec<SearchCandidate>,
@@ -251,126 +255,6 @@ pub struct SearchInput<'a> {
     /// 候補 1 件あたりの持ち時間の決め方（[`crate::time_allotment::allot`]
     /// へそのまま渡す）。
     pub policy: PerCandidatePolicy,
-}
-
-/// 学習済み候補で validation 入力を推論する接合点（trait）。
-///
-/// 本 crate にはこの trait の実装を含めない（推論ランタイム・ジョブ管理が
-/// 実装する想定のスタブ。モジュール doc 参照）。
-///
-/// `candidate_id`・学習成果物・[`ValidationInputRecord`] の列（record_id・
-/// byte 入力の組）を受け取り、`validation_gold`（正解ラベル）は受け取らない
-/// （REQ-27。gold を渡さない制約は引数リストという型のレベルで保証される）。
-/// validation 入力そのものは [`run_search`] が [`SearchInput`] から権威ある
-/// 値として渡す（P0 指摘対応・REQ-27「評価の独立性」。issue #84 PR #238
-/// レビュー: 実装側が独自に入力を保持する設計だと、scorer が
-/// `run_search` の意図した validation 集合と異なるデータ〔件数・record_id
-/// は同じだが中身が違う〕を使って推論しても検出できない）。
-///
-/// # 時間上限（REQ-39・P0 指摘対応。issue #84 PR #238 レビュー）
-///
-/// `time_limit` は [`run_search`] がこの呼び出し時点で残っている探索予算
-/// （探索予算全体 − ここまでの経過時間）を渡す。**この締め切りは
-/// `run_search` が強制する契約であり、実装が守ることを期待するだけの
-/// 助言ではない**（旧版は「実装側が守る責務を持つ」とする助言的な契約
-/// だったが、締め切りを守らない実装を信用してよい理由がなく、fail-closed
-/// にならなかったため強制する契約へ改めた）。
-///
-/// 具体的には、`run_search` は本メソッドの呼び出しを、`self`（scorer 自身の
-/// 所有権）を専用スレッドへ渡して実行し、`time_limit` を
-/// `std::sync::mpsc::Receiver::recv_timeout` の待ち時間として使う。
-/// `time_limit` 以内に戻り値が届かなかった場合、`run_search` は戻り値を
-/// 一切使わず、その候補を
-/// [`CandidateSearchResult::ScoringTimedOut`]（既存の探索予算超過と同じ
-/// 「以降の候補を未着手にして探索を終える」扱い）として記録する。
-/// **締め切りを過ぎて実行中のスレッドは取り残す**（`join` を待たない。
-/// 実装が `time_limit` を過ぎても戻らない場合、そのスレッドはプロセスが
-/// 終了するまで動き続けうる。`run_search` はその後の呼び出しで scorer の
-/// 所有権を取り戻せないため、以降の候補も採点できない。「時間上限を守る
-/// 実装だけを受け付ける」契約であり、本 trait を実装する側は
-/// `time_limit` 以内に必ず戻ることが要求される）。
-///
-/// この専用スレッドへ渡す都合上、本 trait は `Send + 'static` を要求する
-/// （実装・[`SuccessOutcome`]・[`ValidationInputRecord`] の所有データは
-/// いずれもスレッド境界を越えられる必要がある。`records` はスレッド内で
-/// 所有データから組み立て直す）。
-///
-/// 締め切り内に戻った場合、`run_search` は次の 3 段階で経過時間を確認し、
-/// 各段階で探索予算全体を使い切っていることを検出した場合はそれ以降の
-/// 重い処理を行わない（fail-closed。「期限後も重い処理を続ける」ことを
-/// 防ぐ）:
-///
-/// 1. 学習完了直後（本呼び出しの前）にすでに 0 であることを検出した場合は
-///    本呼び出しを行わない（[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）
-/// 2. 本呼び出しから戻った直後、正解率算出（`EvalRecord` の構築・評価器
-///    `evaluate_single_select` の呼び出し）より前に検出した場合は、
-///    正解率を算出せずに打ち切る
-///    （同じく [`CandidateSearchResult::ScoringSkippedBudgetExhausted`]。
-///    P1 指摘対応: 評価器という重い処理〔最大 `MAX_SEARCH_OUTCOME_CELLS`
-///    件〕を予算超過後に呼び出さない）
-/// 3. 評価器の呼び出しまで完了し正解率を算出できた後に検出した場合は、
-///    その候補を選定対象から除外する
-///    （[`CandidateSearchResult::ScoringExceededBudget`]。正解率は参考値
-///    として記録する）
-///
-/// いずれの段階で打ち切っても以降の候補は未着手として記録する。
-pub trait ValidationScorer: Send + 'static {
-    /// 実装固有のエラー型。専用スレッドから
-    /// `std::sync::mpsc::Sender::send` で送り返すため `Send + 'static` を
-    /// 要求する（trait doc「時間上限」参照）。
-    type Error: Send + 'static;
-    /// `candidate_id` の学習成果物で `records`（[`run_search`] が
-    /// [`SearchInput::validation_record_ids`]・[`SearchInput::validation_inputs`]
-    /// から組み立てて渡す権威ある validation 入力。**正解ラベルは含まない**。
-    /// REQ-27）を推論し、[`ScoredOutcome`] の列を返す。**戻り値の
-    /// `record_id` 列は `records` の `record_id` 列と（順序を含めて）完全に
-    /// 一致させなければならない**（位置で対応づける。実装は `records` の
-    /// 順に予測を並べて返す）。[`run_search`] はこの一致（および件数の
-    /// 一致）を検証し、いずれかが崩れている場合は scorer のエラーと同じ
-    /// 扱い（[`CandidateSearchResult::ScoringFailed`]。候補単位で選定対象外
-    /// にし、探索全体は中断せず次候補へ進む）にする（P0/P1 指摘対応・
-    /// issue #84 PR #238 レビュー: 件数だけを照合すると、件数が同じ
-    /// 別データ・順序違いの予測でも正解率を算出できてしまい、評価の独立性
-    /// 〔REQ-27〕が壊れる。件数不一致を探索全体の致命的エラーにすると、
-    /// それまでの候補の記録を失う非対称が生じるため、record_id 不一致と
-    /// 同じ扱いに統一した。`run_search` が入力そのものも渡すのは、scorer が
-    /// 自身で保持する別データ〔record_id は揃っているが中身が異なる〕を
-    /// 使うことも防ぐため）。`time_limit` はこの呼び出し時点で残っている
-    /// 探索予算全体（trait doc「時間上限」参照）。
-    fn predict_validation(
-        &mut self,
-        candidate_id: &str,
-        artifact: &SuccessOutcome,
-        records: &[ValidationInputRecord<'_>],
-        time_limit: Duration,
-    ) -> Result<Vec<ScoredOutcome>, Self::Error>;
-}
-
-/// [`ValidationScorer::predict_validation`] へ渡す validation 入力 1 件
-/// （record_id・byte 入力の組。正解ラベルは含まない。REQ-27・P0 指摘対応。
-/// issue #84 PR #238 レビュー）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidationInputRecord<'a> {
-    /// validation レコード識別子（[`SearchInput::validation_record_ids`] の
-    /// 要素）。
-    pub record_id: &'a str,
-    /// byte 入力（README「入力表現は byte のみ」。
-    /// [`SearchInput::validation_inputs`] の要素）。
-    pub input: &'a [u8],
-}
-
-/// [`ValidationScorer::predict_validation`] が返す予測 1 件
-/// （record_id 付き。P0 指摘対応・REQ-27。issue #84 PR #238 レビュー）。
-///
-/// `record_id` は [`SearchInput::validation_record_ids`] の要素と対応する
-/// 識別子で、[`run_search`] が戻り値の並びを検証するために使う。正解
-/// ラベルは含まない。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScoredOutcome {
-    /// validation レコード識別子。
-    pub record_id: String,
-    /// 推論結果。
-    pub outcome: Outcome,
 }
 
 /// validation 正解率（[`Ratio`] の往復検証用の直列化可能な写像）。
@@ -425,55 +309,44 @@ pub enum CandidateSearchResult {
     /// 学習ワーカーが成功しなかった（[`CandidateTimeRecord::status`] に詳細）。
     /// validation 推論は行っていない。
     TrainingNotCompleted,
-    /// 学習は成功したが採点が無効だった。次の 3 通りをまとめて表す:
-    /// (1) [`ValidationScorer::predict_validation`] が `Err` を返した場合
-    /// （エラー内容は記録しない。security.md）。
-    /// (2) `predict_validation` は成功したが、戻り値の件数が
-    /// `validation_gold` と一致しなかった場合（P1 指摘対応。issue #84
-    /// PR #238 レビュー。以前は探索全体を打ち切る `SearchError` にしており、
-    /// それまでの候補の記録を失っていた非対称を解消した）。
-    /// (3) `predict_validation` は成功したが、戻り値の `record_id` 列が
-    /// `run_search` の渡した validation レコードと（順序を含めて）一致しな
-    /// かった場合（P0 指摘対応・REQ-27「評価の独立性」。issue #84 PR #238
-    /// レビュー）。
+    /// 学習ジョブは成功したが、採点（学習直後の validation 予測列）が無効
+    /// だった。次の 2 通りをまとめて表す:
+    /// (1) 成功結果に予測列が無い（リクエストに `validation_inputs` を付けて
+    /// いるため通常到達しないが、結果を信頼せず fail-closed に倒す）。
+    /// (2) 予測列の件数、または `id` 列が `run_search` の渡した validation
+    /// レコードと（順序を含めて）一致しなかった（P0/P1 指摘対応・REQ-27
+    /// 「評価の独立性」。issue #84 PR #238 レビュー: 件数だけを照合すると、
+    /// 件数が同じ別データ・順序違いの予測でも正解率を算出できてしまう。
+    /// 探索全体を打ち切る `SearchError` にするとそれまでの候補の記録を失う
+    /// 非対称が生じるため、候補単位の失敗に統一した）。
     ///
-    /// (2)・(3) はいずれも件数だけ・record_id だけの部分的な一致では
-    /// 別データ・順序違いの予測を見抜けないため、契約違反を採点失敗と同じ
-    /// 扱いにする。事前検証（`validate_input`）が検出する入力側の件数不一致
+    /// 事前検証（`validate_input`）が検出する入力側の件数不一致
     /// （`ValidationRecordIdCountMismatch`・`ValidationInputCountMismatch`）
-    /// とは別の契約層（scorer の実行時の戻り値）であり、そちらは引き続き
+    /// とは別の契約層（ワーカーの実行時の戻り値）であり、そちらは引き続き
     /// 致命的な `SearchError` のままにする。
     ScoringFailed,
-    /// 学習・validation 推論・正解率算出まで完了したが、採点
-    /// （[`ValidationScorer::predict_validation`]）または評価器
+    /// 学習・予測・正解率算出まで完了したが、評価器
     /// （`evaluate_single_select`）の呼び出しに時間がかかり探索予算全体を
-    /// 使い切った（P0/P1 指摘対応。[`ValidationScorer`] trait doc「時間上限」
-    /// 参照）。正解率は算出できているが、探索予算を超過した後の結果を選定に
-    /// 使うと「合格・選定扱いにしてはならない」という REQ-39 の資源上限に
-    /// 反するため、[`select_best`] の対象から除外する（選定対象外だが正解率
-    /// 自体は記録として残す）。評価器の呼び出し前に超過が確定していた場合は
-    /// 評価器を呼ばずに正解率も算出しないため、代わりに
+    /// 使い切った（P0/P1 指摘対応。issue #84 PR #238 レビュー）。正解率は
+    /// 算出できているが、探索予算を超過した後の結果を選定に使うと「合格・選定
+    /// 扱いにしてはならない」という REQ-39 の資源上限に反するため、
+    /// [`select_best`] の対象から除外する（選定対象外だが正解率自体は記録として
+    /// 残す）。評価器の呼び出し前に超過が確定していた場合は評価器を呼ばずに
+    /// 正解率も算出しないため、代わりに
     /// [`ScoringSkippedBudgetExhausted`](Self::ScoringSkippedBudgetExhausted)
-    /// になる（issue #84 PR #238 レビュー）。
+    /// になる。
     ScoringExceededBudget {
         /// 参考値としての validation 正解率（選定には使わない）。
         validation_accuracy: ValidationAccuracy,
     },
-    /// 探索予算全体を使い切ったため、正解率の算出につながる処理を打ち切った
-    /// （P0/P1 指摘対応・REQ-39。issue #84 PR #238 レビュー）。次の 2 通りを
-    /// まとめて表す:
+    /// 学習ジョブ（学習＋学習直後の validation 予測）が終わった時点で探索予算
+    /// 全体を使い切っていたため、正解率算出（`EvalRecord` の構築・
+    /// `evaluate_single_select` の呼び出し。最大 `MAX_SEARCH_OUTCOME_CELLS`
+    /// 件）を行わなかった（P1 指摘対応・REQ-39。評価器の呼び出しは資源を
+    /// 要するため、予算超過が確定した時点でスキップし「期限後も重い処理を
+    /// 続ける」経路を作らない）。
     ///
-    /// 1. 採点（[`ValidationScorer::predict_validation`]）を呼び出す前の
-    ///    時点で探索予算全体を使い切っていたため、採点自体を呼び出さな
-    ///    かった場合
-    /// 2. 採点は呼び出し・完了したが、直後に確認した時点で探索予算全体を
-    ///    使い切っていたため、正解率算出（`EvalRecord` の構築・
-    ///    `evaluate_single_select` の呼び出し。最大 `MAX_SEARCH_OUTCOME_CELLS`
-    ///    件）を行わなかった場合（P1 指摘対応。評価器の呼び出しは資源を
-    ///    要するため、予算超過が確定した時点でスキップし「期限後も重い処理を
-    ///    続ける」経路を作らない）
-    ///
-    /// いずれも正解率を算出していない（できない）ため `0` 等の値で埋めない
+    /// 正解率を算出していない（できない）ため `0` 等の値で埋めない
     /// （evaluation-contract「分母が 0 の指標は `null`」と同じ「実測できない
     /// 値を捏造しない」方針）。[`ScoringExceededBudget`](Self::ScoringExceededBudget)
     /// は評価器の呼び出しまで完了し正解率を算出できた後に超過を検出した
@@ -489,22 +362,30 @@ pub enum CandidateSearchResult {
     /// （[`crate::time_allotment::CandidateTimeStatus::Completed`] は
     /// 持ち時間超過の有無を問わない）。持ち時間を超えた成功結果を採点・
     /// 選定へ進めると、資源の上限（ガード層）を守らずに「予算到達を合格
-    /// 扱いにしない」契約に反するため、採点（[`ValidationScorer`]）を
-    /// 呼び出す前に除外する。正解率は算出していないため `0` 等の値で
+    /// 扱いにしない」契約に反するため、正解率の算出（評価器の呼び出し）の前に
+    /// 除外する。正解率は算出していないため `0` 等の値で
     /// 埋めない（[`ScoringSkippedBudgetExhausted`](Self::ScoringSkippedBudgetExhausted)
     /// と同じ方針）。選定対象外。探索全体の予算はまだ残っている可能性が
     /// あるため、この候補だけを除外して次候補へ進む（探索全体を打ち切る
     /// `NotStarted`・`ScoringSkippedBudgetExhausted` とは異なり、以降の
     /// `while` ループは継続する）。
     TrainingExceededTimeLimit,
-    /// 採点（[`ValidationScorer::predict_validation`]）が締め切り
-    /// （`time_limit`）内に戻らなかった（P0 指摘対応・REQ-39。issue #84
-    /// PR #238 レビュー。trait doc「時間上限」参照）。`run_search` は
-    /// 戻り値を待たずに諦め、呼び出しスレッドを取り残す（正解率は算出して
-    /// いないため `0` 等の値で埋めない）。scorer の所有権を取り戻せないため
-    /// 以降の候補も採点できず、既存の探索予算超過と同じ扱いで残り候補を
+    /// 学習ジョブ（学習＋学習直後の validation 予測。予測時間も同じ持ち時間の
+    /// 中）が、その候補の持ち時間を使い切って打ち切られた（P0 指摘対応・
+    /// REQ-39。issue #84 PR #238・選択肢 2）。次の 2 通りをまとめて表す:
+    ///
+    /// 1. 実行器が壁時計の締め切りで子プロセスを強制終了した
+    ///    （[`CandidateRunner::is_wall_timeout`]。`time` は `None`）
+    /// 2. 学習ワーカー自身が `limit_exceeded` を報告し、Rust 側で測った経過時間が
+    ///    持ち時間に達していた
+    ///    （[`CandidateTimeStatus::LimitExceeded`] の `elapsed_reached_time_limit`
+    ///    が `true`。学習後・予測の最初の資源検査で持ち時間超過が検出された
+    ///    場合を含む。RSS 等の他の資源上限は、経過時間が持ち時間に達して
+    ///    いなければこちらではなく [`TrainingNotCompleted`](Self::TrainingNotCompleted)）
+    ///
+    /// 正解率は算出していない。既存の探索予算超過と同じ扱いで、以降の候補を
     /// 未着手として記録し探索を終える。選定対象外。
-    ScoringTimedOut,
+    TrainingTimedOut,
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
         /// 未着手の理由。
@@ -676,9 +557,12 @@ pub enum SearchError<E> {
     /// [`SearchInput::validation_split_record`] の `validation` split の
     /// ハッシュと一致しない（REQ-17・REQ-27・P0 指摘対応。issue #84
     /// PR #238 レビュー。凍結した最終 test 分割を validation として渡した
-    /// 場合もこの経路で拒否される。採点〔`ValidationScorer::predict_validation`〕
-    /// を呼び出す前に fail-closed で停止する）。
+    /// 場合もこの経路で拒否される。学習を始める前に fail-closed で停止する）。
     ValidationSplitHashMismatch,
+    /// `validation_inputs[index]` が UTF-8 として読めない（REQ-27・REQ-39。
+    /// 学習リクエスト JSON の文字列に載せられないため、子プロセスを起動する
+    /// 前に `invalid_input` として拒否する。issue #84 PR #238・選択肢 2）。
+    ValidationInputNotUtf8 { index: usize },
     /// 候補 ID が空・[`MAX_CANDIDATE_ID_BYTES`] 超過・制御文字を含む。
     InvalidCandidateId { index: usize },
     /// 候補 ID が他の候補と重複している。
@@ -776,6 +660,9 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
                 f,
                 "validation_record_ids hash does not match the frozen validation split record"
             ),
+            SearchError::ValidationInputNotUtf8 { index } => {
+                write!(f, "validation input at index {index} is not valid utf-8")
+            }
             SearchError::InvalidCandidateId { index } => {
                 write!(f, "invalid candidate id at index {index}")
             }
@@ -961,7 +848,7 @@ fn path_components_to_strings(path: &Path) -> Vec<String> {
 }
 
 /// 事前検証（予算・runner を一切消費しない。fail-closed）。
-fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
+fn validate_input<E>(input: &SearchInput<'_>) -> Result<Vec<ValidationInput>, SearchError<E>> {
     if input.candidates.is_empty() {
         return Err(SearchError::EmptyCandidates);
     }
@@ -1096,7 +983,7 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
     // `validation_inputs` の 1 件あたり・合計のバイト数上限（P0 指摘対応・
     // REQ-39「資源の上限」。issue #84 PR #238 レビュー）: `SearchInput` は
     // 公開 API で、データ契約層（`crates/data`）を経由しない呼び出し元が
-    // 直接値を渡せるため、`ValidationScorer::predict_validation` を呼び出す
+    // 直接値を渡せるため、学習を始める
     // 前に本層でも検証する（データ契約層の検証に依存しない。fail-closed）。
     // 1 件あたりは推論入力 1 件の上限
     // （`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`。train・infer
@@ -1127,6 +1014,28 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
                 limit: MAX_VALIDATION_INPUT_TOTAL_BYTES,
             });
         }
+    }
+
+    // `validation_inputs` を UTF-8 の `String` へ変換する（REQ-27・REQ-39。
+    // 選択肢 2: 学習ワーカーへはリクエスト JSON の文字列として渡すため、UTF-8
+    // でない入力は子プロセスを起動する前に拒否する）。`validation_record_ids`
+    // と組にした [`ValidationInput`]（`id` と `input` だけ。正解ラベルを持てない
+    // 型）を作り、全候補のリクエストへ共有する。件数・各要素の長さ・合計は
+    // 直前までに検証済み。
+    let mut validation_request_inputs: Vec<ValidationInput> =
+        Vec::with_capacity(input.validation_inputs.len());
+    for (index, (&record_id, &input_bytes)) in input
+        .validation_record_ids
+        .iter()
+        .zip(input.validation_inputs.iter())
+        .enumerate()
+    {
+        let text = std::str::from_utf8(input_bytes)
+            .map_err(|_| SearchError::ValidationInputNotUtf8 { index })?;
+        validation_request_inputs.push(ValidationInput::new(
+            record_id.to_string(),
+            text.to_string(),
+        ));
     }
 
     // `validation_record_ids` が凍結済み validation split の記録と一致する
@@ -1197,7 +1106,16 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         // 空（またはロールバックで root 側へ食い込む）になり得て、
         // 無関係な候補と偽陽性の `DuplicateOutDir` を報告してしまう
         // （codex review PR #238 P1 指摘のレビューで判明）。
-        TrainRequest::new(candidate.params.clone())
+        // 学習ジョブ内採点用の validation 入力を付けた形でも検証する
+        // （選択肢 2）。件数・長さ・重複は上で検証済みだが、リクエスト全体の
+        // 大きさ（実効上限は `MAX_REQUEST_BYTES`）は候補の `config` 等との
+        // 合計で決まるため、実際に JSON へ直列化して確認する（学習を始めてから
+        // 大きさ超過に気づくことを避ける。fail-closed）。
+        let candidate_request = TrainRequest::new(candidate.params.clone())
+            .and_then(|request| request.with_validation_inputs(validation_request_inputs.clone()))
+            .map_err(|source| SearchError::InvalidRequest { index, source })?;
+        candidate_request
+            .to_json_vec()
             .map_err(|source| SearchError::InvalidRequest { index, source })?;
         // symlink を解決した実体パスで重複を判定する（P1 指摘対応・REQ-39。
         // issue #84 PR #238 レビュー）。
@@ -1215,7 +1133,7 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<(), SearchError<E>> {
         seen_out_dirs.push(out_dir_key);
     }
 
-    Ok(())
+    Ok(validation_request_inputs)
 }
 
 /// 評価済み候補 1 件（[`select_best`] への入力）。
@@ -1294,92 +1212,14 @@ pub fn select_best(
     })
 }
 
-/// [`ValidationInputRecord`] の所有版（`'static`・`Send`）。
-///
-/// [`call_predict_validation_with_deadline`] が scorer 呼び出し専用スレッド
-/// へ渡すために使う（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
-/// スレッド境界を越えるには所有データが必要で、[`SearchInput`] から借用した
-/// `&str`／`&[u8]` のまま渡すことはできない。呼び出しスレッド内で
-/// [`ValidationInputRecord`]（借用版）を本データから組み立て直して
-/// [`ValidationScorer::predict_validation`] へ渡す。
-#[derive(Debug, Clone)]
-struct OwnedValidationInputRecord {
-    record_id: String,
-    input: Vec<u8>,
-}
-
-/// [`ValidationScorer::predict_validation`] を締め切り付きで呼び出した結果
-/// （P0 指摘対応・REQ-39。issue #84 PR #238 レビュー）。
-enum TimedPredictOutcome<E> {
-    /// 締め切り内に戻った。
-    Completed(Result<Vec<ScoredOutcome>, E>),
-    /// 締め切りを過ぎても戻らなかった（呼び出しスレッドは取り残す）。
-    TimedOut,
-}
-
-/// `scorer`（所有権）を専用スレッドへ渡して
-/// [`ValidationScorer::predict_validation`] を呼び出し、`time_limit` を
-/// 締め切りとして強制する（P0 指摘対応・REQ-39。issue #84 PR #238 レビュー。
-/// trait doc「時間上限」参照）。
-///
-/// # 所有権の設計（判断理由）
-///
-/// `std::thread::spawn`（非スコープ）へ渡すクロージャは `'static` でなければ
-/// ならない。`run_search` は締め切りを過ぎたスレッドを `join` せずに取り残す
-/// 設計（trait doc参照）のため、`std::thread::scope` のようなスコープ付き
-/// スレッド（関数を抜ける前に必ず `join` される）は使えない（スコープを
-/// 抜けようとすると実行中のスレッドの完了を待ってしまい、締め切りを
-/// 強制する意味がなくなる）。そのため呼び出し側が借用している
-/// `&SuccessOutcome`・`&[ValidationInputRecord<'_>]` をそのまま渡すことは
-/// できず、`scorer: S`（所有権ごと）・`artifact: SuccessOutcome`
-/// （`.clone()` 済み）・`records: Arc<Vec<OwnedValidationInputRecord>>`
-/// （全候補で共有するため複製せず `Arc` で参照カウントする）を渡す。
-/// 締め切り内に戻れば `scorer` の所有権をチャネル経由で呼び出し元へ返し、
-/// 次候補の呼び出しに使い回す。締め切りを過ぎた場合は `scorer` を含む
-/// スレッドを丸ごと諦め、`run_search` はそれ以降 scorer を持たない
-/// （呼び出し元の [`Option<S>`] が `None` のままになる。「時間上限を守る
-/// 実装だけを受け付ける」契約〔trait doc〕の帰結として、以降の候補は
-/// 採点できない）。
-fn call_predict_validation_with_deadline<S: ValidationScorer>(
-    mut scorer: S,
-    candidate_id: String,
-    artifact: SuccessOutcome,
-    records: Arc<Vec<OwnedValidationInputRecord>>,
-    time_limit: Duration,
-) -> (Option<S>, TimedPredictOutcome<S::Error>) {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let borrowed_records: Vec<ValidationInputRecord<'_>> = records
-            .iter()
-            .map(|record| ValidationInputRecord {
-                record_id: record.record_id.as_str(),
-                input: record.input.as_slice(),
-            })
-            .collect();
-        let result =
-            scorer.predict_validation(&candidate_id, &artifact, &borrowed_records, time_limit);
-        // 受信側が締め切りを過ぎて `rx` を破棄済みなら送信は失敗するが、
-        // その場合はこの結果を使う相手がいないだけなので無視してよい
-        // （取り残したスレッドをここで正常終了させる。trait doc参照）。
-        let _ = tx.send((scorer, result));
-    });
-    match rx.recv_timeout(time_limit) {
-        Ok((returned_scorer, result)) => (
-            Some(returned_scorer),
-            TimedPredictOutcome::Completed(result),
-        ),
-        Err(_timeout_or_disconnected) => (None, TimedPredictOutcome::TimedOut),
-    }
-}
-
 /// 宣言順に残っている候補すべてを、実行順が回ってこなかった候補として
 /// `entries` へ記録する（P1 指摘対応・REQ-18「候補ごとの選定記録」）。
 ///
 /// [`run_search`] が探索予算全体を使い切ったと判断した時点（[`Allotment::Exhausted`]、
-/// [`ValidationScorer::predict_validation`] の呼び出しが予算を超過した時点、
-/// または採点の戻り値が契約違反〔件数不一致・record_id 不一致〕だった後の
-/// 予算確認で使い切っていた時点。issue #84 PR #238 レビュー）で、宣言順に
-/// まだ控えていた候補を `iter` から取り出し尽くす。
+/// 学習ジョブ〔学習＋予測〕が終わった時点で予算を使い切っていた場合、
+/// 候補が持ち時間を使い切って打ち切られた場合
+/// 〔[`CandidateSearchResult::TrainingTimedOut`]〕。issue #84 PR #238
+/// レビュー）で、宣言順にまだ控えていた候補を `iter` から取り出し尽くす。
 /// これらの候補には「順番が回ってきた」時点の経過時間が存在しないため
 /// `elapsed_at_start_ms: None`・`time: None` とする
 /// （[`CandidateSearchEntry::elapsed_at_start_ms`] doc 参照）。
@@ -1400,35 +1240,66 @@ fn drain_remaining_as_not_started(
     }
 }
 
+/// 学習ジョブの成功結果の予測列（[`ValidationPrediction`]）を、
+/// [`SearchInput::validation_record_ids`] と突き合わせて [`Outcome`] の列へ
+/// 変換する（REQ-27）。件数、または `id` 列が（順序を含めて）一致しない場合は
+/// `None`（呼び出し元が [`CandidateSearchResult::ScoringFailed`] にする）。
+/// `Ok` は予測ラベル、`Abstain`・`Error` はそれぞれ対応する [`Outcome`]。
+fn outcomes_from_predictions(
+    predictions: &[ValidationPrediction],
+    record_ids: &[&str],
+) -> Option<Vec<Outcome>> {
+    if predictions.len() != record_ids.len() {
+        return None;
+    }
+    let mut outcomes = Vec::with_capacity(predictions.len());
+    for (prediction, &expected_id) in predictions.iter().zip(record_ids.iter()) {
+        if prediction.id() != expected_id {
+            return None;
+        }
+        let outcome = match (prediction.status(), prediction.predicted_label()) {
+            (ValidationPredictionStatus::Ok, Some(label)) => Outcome::Label(label.to_string()),
+            (ValidationPredictionStatus::Abstain, _) => Outcome::Abstain,
+            // `Ok` なのにラベルが無い組み合わせは、結果の解析
+            // （`crate::result`）が拒否済みで通常到達しない。予測を信用せず
+            // `Error` として数える。
+            (ValidationPredictionStatus::Error | ValidationPredictionStatus::Ok, _) => {
+                Outcome::Error
+            }
+        };
+        outcomes.push(outcome);
+    }
+    Some(outcomes)
+}
+
 /// 探索予算全体を管理し、複数候補を学習・比較し、選定結果を記録する
 /// （TASK-18.1-2・issue #84）。
 ///
 /// 手順: (1) 予算・runner を消費する前にすべての事前検証を行う
-/// （[`validate_input`]） → (2) 候補を宣言順に実行し、探索予算の消費を
-/// 追跡する → (3) 学習が成功した候補について
-/// [`ValidationScorer::predict_validation`] を呼び、評価器で正解率を
-/// 算出する → (4) 評価済みの候補から最高正解率の候補を選ぶ
-/// （[`select_best`]）。
+/// （[`validate_input`]。凍結済み validation split とのハッシュ照合を含む） →
+/// (2) 候補を宣言順に実行し、探索予算の消費を追跡する。各候補の学習リクエストへ
+/// validation 入力を付け、学習ジョブが学習直後に予測して返す
+/// （モジュール doc「validation の採点は学習ジョブの中で行う」） →
+/// (3) 予測列を validation gold と突き合わせ、評価器で正解率を算出する →
+/// (4) 評価済みの候補から最高正解率の候補を選ぶ（[`select_best`]）。
 ///
 /// # Errors
 ///
 /// 事前検証・候補の実行・評価器のいずれかが失敗した場合に
-/// [`SearchError`] を返す。候補単位の失敗（学習が完了しなかった・scorer が
-/// 失敗した・scorer の戻り値の件数または record_id 列が一致しなかった
+/// [`SearchError`] を返す。候補単位の失敗（学習が完了しなかった・持ち時間を
+/// 使い切った・予測列の件数または `id` 列が一致しなかった
 /// 〔REQ-27。issue #84 PR #238 レビュー〕）は探索全体を中断せず、その候補を
-/// 該当する分類で記録して次の候補へ進む。
-pub fn run_search<R, S, C>(
+/// 該当する分類で記録する（持ち時間切れは以降の候補を未着手にして終える）。
+pub fn run_search<R, C>(
     runner: &mut R,
-    scorer: S,
     clock: &C,
     input: SearchInput<'_>,
 ) -> Result<SearchRecord, SearchError<R::Error>>
 where
     R: CandidateRunner,
-    S: ValidationScorer,
     C: Clock,
 {
-    validate_input(&input)?;
+    let validation_request_inputs = validate_input(&input)?;
 
     let budget_seconds = input.budget.get();
     let budget_ms = budget_seconds.saturating_mul(1000);
@@ -1439,8 +1310,8 @@ where
     let mut evaluated_owned: Vec<(String, Ratio)> = Vec::new();
     let n_candidates = input.candidates.len();
 
-    // 探索開始からの単調経過時間（ミリ秒）を求める（複数箇所〔候補開始時・
-    // 採点呼び出し前後〕から呼ぶため共通化する）。
+    // 探索開始からの単調経過時間（ミリ秒）を求める（複数箇所から呼ぶため
+    // 共通化する）。
     let elapsed_ms_since_start = |clock: &C| -> Result<u64, SearchError<R::Error>> {
         clock
             .monotonic()
@@ -1454,32 +1325,6 @@ where
                 })
             })
     };
-
-    // 全候補で共有する validation 入力（record_id・byte 入力の組）を
-    // 所有データとして 1 回だけ組み立てる（`validate_input` が件数一致を
-    // 確認済みのため `zip` で安全に構築できる。P0 指摘対応・REQ-27・
-    // REQ-39。issue #84 PR #238 レビュー: scorer へ権威ある入力を明示的に
-    // 渡し、scorer 側が独自に保持する別データを使わせない）。所有データに
-    // するのは、採点の締め切りを強制するために scorer 呼び出しを専用
-    // スレッドへ渡す必要があり（[`call_predict_validation_with_deadline`]
-    // 参照）、借用データのまま `'static` を要求するスレッド境界を越えられ
-    // ないため（[`OwnedValidationInputRecord`] doc 参照）。`Arc` で包み、
-    // 候補ごとに複製せず参照カウントだけ増やす。
-    let validation_scorer_records: Arc<Vec<OwnedValidationInputRecord>> = Arc::new(
-        input
-            .validation_record_ids
-            .iter()
-            .zip(input.validation_inputs.iter())
-            .map(|(&record_id, &input_bytes)| OwnedValidationInputRecord {
-                record_id: record_id.to_string(),
-                input: input_bytes.to_vec(),
-            })
-            .collect(),
-    );
-    // 締め切りを過ぎて scorer を取り残した後は `None` になり、以降の候補は
-    // 採点できない（`call_predict_validation_with_deadline` doc・trait doc
-    // 「時間上限」参照）。
-    let mut scorer_holder: Option<S> = Some(scorer);
 
     let mut candidates_iter = input.candidates.into_iter().enumerate();
     while let Some((index, candidate)) = candidates_iter.next() {
@@ -1518,25 +1363,44 @@ where
             }
         };
 
-        let run = run_candidate(runner, clock, candidate.params, allotted)
-            .map_err(|source| SearchError::Candidate { index, source })?;
+        // 学習ジョブ（学習＋学習直後の validation 予測）を実行する。予測時間も
+        // この候補の持ち時間・壁時計の締め切りに含まれる。
+        let run = match run_candidate_with_validation_inputs(
+            runner,
+            clock,
+            candidate.params,
+            allotted,
+            Some(validation_request_inputs.clone()),
+        ) {
+            Ok(run) => run,
+            Err(CandidateTimeError::Runner(error)) if R::is_wall_timeout(&error) => {
+                // 実行器が壁時計の締め切りで子プロセスを強制終了した。探索全体の
+                // 失敗ではなく候補単位の時間切れとして記録し、既存の探索予算
+                // 超過と同じ扱い（以降の候補を未着手にして終える）にする
+                // （REQ-39。実行器の記録〔`CandidateTimeRecord`〕は作られない）。
+                entries.push(CandidateSearchEntry {
+                    candidate_id: candidate.candidate_id,
+                    elapsed_at_start_ms: Some(elapsed_ms),
+                    time: None,
+                    result: CandidateSearchResult::TrainingTimedOut,
+                    validation_outcomes: None,
+                });
+                drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                break;
+            }
+            Err(source) => return Err(SearchError::Candidate { index, source }),
+        };
 
         match run.outcome() {
             TrainOutcome::Ok(success) => {
-                // P0 指摘対応（REQ-39）: 採点呼び出しの直前に残っている探索
-                // 予算全体を `time_limit` として scorer へ渡す（trait doc
-                // 「時間上限」参照。呼び出し自体を打ち切ることはできない）。
-                let elapsed_before_scoring_ms = elapsed_ms_since_start(clock)?;
-                let remaining_for_scoring_ms = budget_ms.saturating_sub(elapsed_before_scoring_ms);
-
-                // P0 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 学習
-                // だけで探索予算全体を使い切っていた場合、採点
-                // （`predict_validation`）を呼び出さずに打ち切る。trait doc
-                // 「時間上限」の通り呼び出し自体を打ち切れないため、
-                // 予算が残っていないと分かっている呼び出しをそもそも行わない
-                // ことが唯一の資源上限の守り方になる（呼び出し後の事後検出
-                // だけに頼ると、無駄な呼び出し自体は防げない）。
-                if elapsed_before_scoring_ms >= budget_ms {
+                // P1 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 学習ジョブが
+                // 終わった時点で探索予算全体を使い切っていた場合、評価器
+                // （`EvalRecord` の構築・`evaluate_single_select`。最大
+                // `MAX_SEARCH_OUTCOME_CELLS` 件）を呼び出さずに打ち切る（「期限後も
+                // 重い処理を続ける」経路を作らない）。ちょうど予算に達した時点
+                // （`==`）も「予算到達を合格扱いにしない」ため `>=`。
+                let elapsed_after_job_ms = elapsed_ms_since_start(clock)?;
+                if elapsed_after_job_ms >= budget_ms {
                     entries.push(CandidateSearchEntry {
                         candidate_id: candidate.candidate_id,
                         elapsed_at_start_ms: Some(elapsed_ms),
@@ -1548,28 +1412,21 @@ where
                     break;
                 }
 
-                // P0 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 探索
-                // 予算全体はまだ残っていても、この候補自身の実測時間
-                // （`elapsed_ms`）が、この候補へ配分した持ち時間
-                // （`time_limit_seconds`）を超えていないかを、採点
-                // （`predict_validation`）を呼び出す前に確認する。
-                // `run_candidate` はワーカーが `Ok` を返せば実測時間を問わず
-                // `TrainOutcome::Ok` を返す（`CandidateTimeStatus::Completed`
-                // も持ち時間超過の有無を区別しない）ため、ここで確認せずに
-                // 採点・選定へ進めると、持ち時間を超えた成功結果が選定され
-                // 得る（指摘本文のシナリオ: 予算 3600 秒を 2 候補へ均等配分
-                // し、最初の候補が割当 1800 秒を超えて 2000 秒で成功した
-                // 場合）。ちょうど持ち時間に達した時点（`==`）は超過扱いに
-                // しない（`>` の厳密不等号）: 単調時計はミリ秒単位で丸まり、
-                // 割当時間ぴったりで完了する候補は珍しくない（本モジュール
-                // doc「実機での確認手順」の
-                // 「持ち時間 + supervisor.py の猶予 5 秒」のとおり、
-                // わずかな超過は学習ワーカー側の終了処理に想定内で含まれる）。
-                // 探索予算全体の判定（直前の `elapsed_before_scoring_ms >=
-                // budget_ms`。ちょうど到達した時点も合格にしない）とは
-                // 意図的に異なる規則: あちらは探索予算という共有資源の枯渇を
-                // 検出するもので、こちらは候補 1 件へ配分した持ち時間からの
-                // 逸脱を検出するものであり、境界の扱いを揃える必要はない。
+                // P0 指摘対応（REQ-39・issue #84 PR #238 レビュー）: 探索予算全体
+                // はまだ残っていても、この候補自身の実測時間（`elapsed_ms`）が
+                // 配分した持ち時間（`time_limit_seconds`）を超えていないかを、
+                // 正解率の算出前に確認する。`run_candidate` はワーカーが `Ok` を
+                // 返せば実測時間を問わず `TrainOutcome::Ok` を返す
+                // （`CandidateTimeStatus::Completed` も持ち時間超過の有無を区別
+                // しない）ため、ここで確認せずに進めると、持ち時間を超えた成功
+                // 結果が選定され得る。学習ジョブは予測時間を含むため、予測が
+                // 持ち時間を食った場合もここで除外される。ちょうど持ち時間に
+                // 達した時点（`==`）は超過扱いにしない（`>` の厳密不等号）:
+                // 単調時計はミリ秒単位で丸まり、割当時間ぴったりで完了する候補は
+                // 珍しくなく、わずかな超過は学習ワーカーの終了処理に想定内で
+                // 含まれる。探索予算全体の判定（上の `>=`）とは意図的に異なる
+                // 規則: あちらは共有資源の枯渇、こちらは候補 1 件へ配分した
+                // 持ち時間からの逸脱を検出する。
                 let candidate_time_limit_ms =
                     u64::from(run.record().time_limit_seconds()).saturating_mul(1000);
                 if run.record().elapsed_ms() > candidate_time_limit_ms {
@@ -1583,199 +1440,94 @@ where
                     continue;
                 }
 
-                let time_limit = Duration::from_millis(remaining_for_scoring_ms);
-                // P0 指摘対応（REQ-39。issue #84 PR #238 レビュー）: scorer
-                // の所有権を取り出し、締め切り付きの専用スレッドで呼び出す
-                // （`call_predict_validation_with_deadline` doc・trait doc
-                // 「時間上限」参照）。`scorer_holder` が `None` になるのは
-                // 直前の候補で締め切りを過ぎて scorer を取り残した場合のみ
-                // だが、その場合は必ずその場で残り候補を未着手にして
-                // `break` しているため、次の周回に到達した時点では常に
-                // `Some` のはずである（理論上到達しない防御的分岐）。
-                let current_scorer = scorer_holder.take().ok_or_else(|| SearchError::Internal {
-                    detail: "scorer was unavailable after a previous timeout".to_string(),
-                })?;
-                let (returned_scorer, timed_outcome) = call_predict_validation_with_deadline(
-                    current_scorer,
-                    candidate.candidate_id.clone(),
-                    success.clone(),
-                    Arc::clone(&validation_scorer_records),
-                    time_limit,
-                );
-                scorer_holder = returned_scorer;
-                let predict_result = match timed_outcome {
-                    TimedPredictOutcome::Completed(result) => result,
-                    TimedPredictOutcome::TimedOut => {
-                        // P0 指摘対応（REQ-39。issue #84 PR #238 レビュー）:
-                        // 締め切りを過ぎた戻り値は使わず、既存の探索予算
-                        // 超過と同じ「残り候補を未着手にして探索を終える」
-                        // 扱いにする（`scorer_holder` はすでに `None` で、
-                        // 以降の候補も採点できないため）。
-                        entries.push(CandidateSearchEntry {
-                            candidate_id: candidate.candidate_id,
-                            elapsed_at_start_ms: Some(elapsed_ms),
-                            time: Some(run.record().clone()),
-                            result: CandidateSearchResult::ScoringTimedOut,
-                            validation_outcomes: None,
-                        });
-                        drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                        break;
-                    }
+                // 予測列を validation gold・record_id と突き合わせる（REQ-27）。
+                // 不一致・欠落は候補単位の `ScoringFailed`（探索全体は中断しない）。
+                let outcomes = success.validation_predictions().and_then(|predictions| {
+                    outcomes_from_predictions(predictions, input.validation_record_ids)
+                });
+                let Some(outcomes) = outcomes else {
+                    entries.push(CandidateSearchEntry {
+                        candidate_id: candidate.candidate_id,
+                        elapsed_at_start_ms: Some(elapsed_ms),
+                        time: Some(run.record().clone()),
+                        result: CandidateSearchResult::ScoringFailed,
+                        validation_outcomes: None,
+                    });
+                    continue;
                 };
-                match predict_result {
-                    Ok(scored_outcomes) => {
-                        // P0/P1 指摘対応（REQ-27・評価の独立性。issue #84
-                        // PR #238 レビュー）: 戻り値の契約違反（件数不一致・
-                        // record_id の不一致）はいずれも候補単位の
-                        // `ScoringFailed`（scorer のエラーと同じ扱い）として
-                        // 記録し、探索全体は中断せず次候補へ進む。以前は件数
-                        // 不一致だけ `SearchError::ScorerOutputMismatch` で
-                        // 探索全体を打ち切っており、それまでの候補の記録が
-                        // 失われる非対称があった（前回報告の指摘。事前検証
-                        // `validate_input` 側の件数不一致〔入力そのものの
-                        // 契約違反〕は引き続き致命的エラーのままにする。
-                        // ここで扱うのは scorer の実行時の戻り値という別の
-                        // 契約層）。件数が一致しない場合は record_id の
-                        // `zip` が短い方に切り詰められて `false` になり得る
-                        // ため、件数チェックを先に行う。
-                        let outcomes_valid = scored_outcomes.len() == input.validation_gold.len()
-                            && scored_outcomes
-                                .iter()
-                                .zip(input.validation_record_ids.iter())
-                                .all(|(scored, &expected_id)| scored.record_id == expected_id);
-                        if !outcomes_valid {
-                            entries.push(CandidateSearchEntry {
-                                candidate_id: candidate.candidate_id,
-                                elapsed_at_start_ms: Some(elapsed_ms),
-                                time: Some(run.record().clone()),
-                                result: CandidateSearchResult::ScoringFailed,
-                                validation_outcomes: None,
-                            });
 
-                            // 下の `Err` 分岐と同じく、呼び出し後の経過時間を
-                            // 確認してから次候補へ進む（採点中に予算を使い
-                            // 切っていれば残り候補を未着手にして打ち切る）。
-                            let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
-                            if elapsed_after_scoring_ms >= budget_ms {
-                                drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                                break;
-                            }
-                            continue;
-                        }
-                        let outcomes: Vec<Outcome> = scored_outcomes
-                            .into_iter()
-                            .map(|scored| scored.outcome)
-                            .collect();
+                let eval_records: Vec<EvalRecord<'_>> = input
+                    .validation_gold
+                    .iter()
+                    .zip(outcomes.iter())
+                    .map(|(&gold, outcome)| EvalRecord { gold, outcome })
+                    .collect();
+                let metrics = metrics::evaluate_single_select(input.label_order, &eval_records)
+                    .map_err(SearchError::Eval)?;
+                let accuracy = metrics.accuracy.overall;
 
-                        // P1 指摘対応（REQ-39。issue #84 PR #238 レビュー）:
-                        // `predict_validation` から戻った直後、`EvalRecord`
-                        // の構築（最大 `MAX_SEARCH_OUTCOME_CELLS` 件）・
-                        // `evaluate_single_select` の呼び出しより前に探索予算
-                        // 全体を確認する。ここで確認せずに評価器まで進めると、
-                        // 採点だけで予算を使い切っていても重い評価処理
-                        // （最大 1,000 万セル）を最後まで走らせてしまい、
-                        // 「期限後も重い処理を続ける」経路が残る（REQ-39
-                        // 「資源の上限」）。ここでは正解率をまだ算出していない
-                        // ため、呼び出し前に打ち切る既存経路
-                        // （[`CandidateSearchResult::ScoringSkippedBudgetExhausted`]）
-                        // と同じ「正解率を算出できないまま打ち切る」扱いにする
-                        // （評価器を呼ばない点は同じで、採点自体は呼び出し済み
-                        // という違いはあるが、公開結果型に新しいバリアントを
-                        // 増やさずに済む。JSON 契約の変更が要る場合は
-                        // 実装せず承認事項として報告する方針〔delegation-impl〕）。
-                        let elapsed_after_predict_ms = elapsed_ms_since_start(clock)?;
-                        if elapsed_after_predict_ms >= budget_ms {
-                            entries.push(CandidateSearchEntry {
-                                candidate_id: candidate.candidate_id,
-                                elapsed_at_start_ms: Some(elapsed_ms),
-                                time: Some(run.record().clone()),
-                                result: CandidateSearchResult::ScoringSkippedBudgetExhausted,
-                                validation_outcomes: None,
-                            });
-                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                            break;
-                        }
-
-                        let eval_records: Vec<EvalRecord<'_>> = input
-                            .validation_gold
-                            .iter()
-                            .zip(outcomes.iter())
-                            .map(|(&gold, outcome)| EvalRecord { gold, outcome })
-                            .collect();
-                        let metrics =
-                            metrics::evaluate_single_select(input.label_order, &eval_records)
-                                .map_err(SearchError::Eval)?;
-                        let accuracy = metrics.accuracy.overall;
-
-                        // 評価器（`evaluate_single_select`）の呼び出しに時間が
-                        // かかり、探索予算全体を使い切って
-                        // いたら選定対象から除外する（P0 指摘対応。「超過後も
-                        // 最後の候補なら Selected を返してしまう」ことを防ぐ。
-                        // fail-closed: 正解率自体は参考値として記録するが
-                        // `evaluated_owned` へは積まない）。ちょうど予算に
-                        // 達した時点（`==`）も「予算到達を合格扱いにしない」
-                        // （evaluation-contract）に含めるため `>=` で判定する
-                        // （issue #84 PR #238 レビュー・P0 指摘対応）。
-                        let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
-                        if elapsed_after_scoring_ms >= budget_ms {
-                            entries.push(CandidateSearchEntry {
-                                candidate_id: candidate.candidate_id,
-                                elapsed_at_start_ms: Some(elapsed_ms),
-                                time: Some(run.record().clone()),
-                                result: CandidateSearchResult::ScoringExceededBudget {
-                                    validation_accuracy: ValidationAccuracy::from(accuracy),
-                                },
-                                validation_outcomes: None,
-                            });
-                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                            break;
-                        }
-
-                        evaluated_owned.push((candidate.candidate_id.clone(), accuracy));
-                        entries.push(CandidateSearchEntry {
-                            candidate_id: candidate.candidate_id,
-                            elapsed_at_start_ms: Some(elapsed_ms),
-                            time: Some(run.record().clone()),
-                            result: CandidateSearchResult::Evaluated {
-                                validation_accuracy: ValidationAccuracy::from(accuracy),
-                            },
-                            validation_outcomes: Some(outcomes),
-                        });
-                    }
-                    Err(_scorer_error) => {
-                        entries.push(CandidateSearchEntry {
-                            candidate_id: candidate.candidate_id,
-                            elapsed_at_start_ms: Some(elapsed_ms),
-                            time: Some(run.record().clone()),
-                            result: CandidateSearchResult::ScoringFailed,
-                            validation_outcomes: None,
-                        });
-
-                        // P1 指摘対応（REQ-18・REQ-39。issue #84 PR #238
-                        // レビュー）: 採点が失敗した場合も、成功時に
-                        // `predict_validation` から戻った直後へ移した判定
-                        // （成功時は `ScoringSkippedBudgetExhausted` を参照）
-                        // と同じく呼び出し後の経過時間を確認する。確認せずに
-                        // 次候補へ進むと、採点中に探索予算を使い切っていても
-                        // 次候補が `run_candidate` に渡ってしまい、予算超過後の
-                        // 学習を防げない（採点の成否で「呼び出し後に予算を
-                        // 使い切ったか」の扱いを変えない）。
-                        let elapsed_after_scoring_ms = elapsed_ms_since_start(clock)?;
-                        if elapsed_after_scoring_ms >= budget_ms {
-                            drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                            break;
-                        }
-                    }
+                // 評価器（`evaluate_single_select`）の呼び出しに時間がかかり、
+                // 探索予算全体を使い切っていたら選定対象から除外する
+                // （P0 指摘対応。「超過後も最後の候補なら Selected を返して
+                // しまう」ことを防ぐ。fail-closed: 正解率自体は参考値として
+                // 記録するが `evaluated_owned` へは積まない）。ちょうど予算に
+                // 達した時点（`==`）も合格にしないため `>=` で判定する
+                // （issue #84 PR #238 レビュー・P0 指摘対応）。
+                let elapsed_after_eval_ms = elapsed_ms_since_start(clock)?;
+                if elapsed_after_eval_ms >= budget_ms {
+                    entries.push(CandidateSearchEntry {
+                        candidate_id: candidate.candidate_id,
+                        elapsed_at_start_ms: Some(elapsed_ms),
+                        time: Some(run.record().clone()),
+                        result: CandidateSearchResult::ScoringExceededBudget {
+                            validation_accuracy: ValidationAccuracy::from(accuracy),
+                        },
+                        validation_outcomes: None,
+                    });
+                    drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                    break;
                 }
-            }
-            TrainOutcome::Error(_) => {
+
+                evaluated_owned.push((candidate.candidate_id.clone(), accuracy));
                 entries.push(CandidateSearchEntry {
                     candidate_id: candidate.candidate_id,
                     elapsed_at_start_ms: Some(elapsed_ms),
                     time: Some(run.record().clone()),
-                    result: CandidateSearchResult::TrainingNotCompleted,
+                    result: CandidateSearchResult::Evaluated {
+                        validation_accuracy: ValidationAccuracy::from(accuracy),
+                    },
+                    validation_outcomes: Some(outcomes),
+                });
+            }
+            TrainOutcome::Error(_) => {
+                // 学習ワーカー自身が `limit_exceeded` を報告し、Rust 側で測った
+                // 経過時間が持ち時間に達していた場合は、実行器が強制終了した
+                // 場合（上の `is_wall_timeout`）と同じ候補単位の時間切れとして
+                // 扱う（学習後・予測の最初の資源検査で持ち時間超過が検出された
+                // 場合など。REQ-39。issue #84 PR #238・選択肢 2）。RSS 等の他の
+                // 資源上限による `limit_exceeded` は、経過時間が持ち時間に達して
+                // いなければここに入らず、通常の学習失敗として次候補へ進む。
+                let timed_out = matches!(
+                    run.record().status(),
+                    CandidateTimeStatus::LimitExceeded {
+                        elapsed_reached_time_limit: true
+                    }
+                );
+                entries.push(CandidateSearchEntry {
+                    candidate_id: candidate.candidate_id,
+                    elapsed_at_start_ms: Some(elapsed_ms),
+                    time: Some(run.record().clone()),
+                    result: if timed_out {
+                        CandidateSearchResult::TrainingTimedOut
+                    } else {
+                        CandidateSearchResult::TrainingNotCompleted
+                    },
                     validation_outcomes: None,
                 });
+                if timed_out {
+                    drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
+                    break;
+                }
             }
         }
     }

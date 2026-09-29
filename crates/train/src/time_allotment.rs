@@ -52,7 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::TrainRequestError;
 use crate::limits::MAX_TRAIN_WALL_SECONDS;
-use crate::request::{TrainRequest, TrainRequestParams};
+use crate::request::{TrainRequest, TrainRequestParams, ValidationInput};
 use crate::result::{FailureCode, TrainOutcome};
 
 /// 候補 1 件あたりの持ち時間の決め方（呼び出し元が選ぶ方針）。
@@ -211,8 +211,25 @@ pub fn allot(
 /// [`TrainRequest::new`] の検証を満たさない場合に
 /// [`TrainRequestError`] を返す。
 pub fn build_request_with_allotment(
+    params: TrainRequestParams,
+    allotted: AllottedSeconds,
+) -> Result<TrainRequest, TrainRequestError> {
+    build_request_with_allotment_and_validation(params, allotted, None)
+}
+
+/// [`build_request_with_allotment`] に、学習ジョブ内での採点用 validation 入力
+/// （REQ-18・REQ-27。正解ラベルを持たない [`ValidationInput`]）を付けたもの。
+/// `validation_inputs` が `None` なら [`build_request_with_allotment`] と同じ。
+///
+/// # Errors
+///
+/// [`build_request_with_allotment`] の条件に加え、`validation_inputs` が
+/// [`TrainRequest::with_validation_inputs`] の検証を満たさない場合に
+/// [`TrainRequestError`] を返す。
+pub fn build_request_with_allotment_and_validation(
     mut params: TrainRequestParams,
     allotted: AllottedSeconds,
+    validation_inputs: Option<Vec<ValidationInput>>,
 ) -> Result<TrainRequest, TrainRequestError> {
     if let Some(requested) = params.time_limit_seconds
         && !(1..=MAX_TRAIN_WALL_SECONDS).contains(&requested)
@@ -221,7 +238,11 @@ pub fn build_request_with_allotment(
     }
     let requested = params.time_limit_seconds.unwrap_or(MAX_TRAIN_WALL_SECONDS);
     params.time_limit_seconds = Some(requested.min(allotted.get()));
-    TrainRequest::new(params)
+    let request = TrainRequest::new(params)?;
+    match validation_inputs {
+        Some(inputs) => request.with_validation_inputs(inputs),
+        None => Ok(request),
+    }
 }
 
 /// 経過時間・記録用の壁時計時刻を取得する（テストで差し替え可能にする
@@ -282,6 +303,18 @@ pub trait CandidateRunner {
     type Error;
     /// `request` を学習ワーカーへ渡して実行し、結果を返す。
     fn run(&mut self, request: &TrainRequest) -> Result<TrainOutcome, Self::Error>;
+
+    /// `error`（[`run`](Self::run) が返したエラー）が、実行器が課した壁時計の
+    /// 締め切り超過による強制終了かどうかを返す（REQ-39。issue #84 PR #238・
+    /// 選択肢 2）。学習ジョブ内での validation 予測も同じ締め切りに含まれる
+    /// ため、[`crate::search::run_search`] はこれが `true` のエラーを探索全体の
+    /// 失敗ではなく候補単位の時間切れとして記録する。既定は `false`
+    /// （時間切れを型で見分けられない実行器は、従来どおりエラーを致命的に扱う）。
+    /// 子プロセス実装は [`crate::process::WorkerCandidateRunner`]。
+    fn is_wall_timeout(error: &Self::Error) -> bool {
+        let _ = error;
+        false
+    }
 }
 
 /// 候補 1 件の打ち切り分類（TASK-18.2 の「予算到達を合格扱いしない」判定は
@@ -451,8 +484,31 @@ where
     R: CandidateRunner,
     C: Clock,
 {
-    let request =
-        build_request_with_allotment(params, allotted).map_err(CandidateTimeError::Request)?;
+    run_candidate_with_validation_inputs(runner, clock, params, allotted, None)
+}
+
+/// [`run_candidate`] に、学習ジョブ内での採点用 validation 入力
+/// （REQ-18・REQ-27。正解ラベルを持たない）を付けたもの（issue #84 PR #238・
+/// 選択肢 2）。`validation_inputs` が `Some` のとき、成功結果
+/// （[`crate::result::SuccessOutcome::validation_predictions`]）に学習直後の
+/// 予測列が入る。予測時間は学習と同じ持ち時間・壁時計の締め切りに含まれる。
+///
+/// # Errors
+///
+/// [`run_candidate`] と同じ。
+pub fn run_candidate_with_validation_inputs<R, C>(
+    runner: &mut R,
+    clock: &C,
+    params: TrainRequestParams,
+    allotted: AllottedSeconds,
+    validation_inputs: Option<Vec<ValidationInput>>,
+) -> Result<CandidateRun, CandidateTimeError<R::Error>>
+where
+    R: CandidateRunner,
+    C: Clock,
+{
+    let request = build_request_with_allotment_and_validation(params, allotted, validation_inputs)
+        .map_err(CandidateTimeError::Request)?;
     let time_limit_seconds = request.time_limit_seconds();
 
     let started_mono = clock.monotonic();
