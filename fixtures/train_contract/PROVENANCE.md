@@ -98,6 +98,14 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   "/tmp/does-not-exist-train-request.json"])` を実行して得た標準出力
   （終了コード 64）をそのまま採用した（生成コマンドは下記）。
 
+（`supervisor_group_managed_env.json` は issue #178 PR #233 レビューの
+過程で導入したが、Rust 側でのプロセスグループ管理〔`process_group(0)`・
+`/bin/kill` 呼び出し〕自体を全面撤去し、worker 自身が親の死を検知して
+自己終了する lifeline 方式へ移行したことに伴い、対応する環境変数
+（`FANDHE_EDGE_SUPERVISOR_GROUP_MANAGED`）ごと削除した。
+`supervisor.py`・`crates/train/src/process.rs` のモジュール doc「lifeline」
+節参照。）
+
 ## 生成コマンド（証拠種別: テストハーネス。本開発機で実行・確認済み）
 
 `kind_defaults.json`（`c1`・`c3` の `DEFAULT_CONFIG` をそのまま書き出す）:

@@ -9,14 +9,18 @@ Rust 側 CLI が想定する子プロセス呼び出し方（`sys.executable` �
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from conftest import LABEL_ORDER, TINY_AR_CONFIG, TINY_CONFIG
-from fandhe_edge_trainer import supervisor
+from fandhe_edge_trainer import cli, supervisor
 
 _LAUNCH_SCRIPT = str(Path(__file__).resolve().parent.parent / "launch.py")
 
@@ -273,18 +277,34 @@ def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> No
     ことで、fstat 検査が無い実装なら `read()` がブロックしたまま
     `TimeoutExpired` になり、本テストが失敗して区別できるようにする。
 
-    `--out-fd` は本チェックより前に使われないため、実在しない fd 番号
-    （3）を渡してよい。
+    **`--lifeline-fd` には検証を通過する本物のパイプの読み取り端を渡す**
+    （issue #178 PR #233 レビュー再々指摘 P0 で `_start_lifeline_thread` が
+    起動時に `--lifeline-fd` を検証するようになったため、実在しないダミー
+    fd を渡すと本チェックへ到達する前に lifeline 側の `invalid_request` で
+    拒否されてしまい、本テストが検証したい stdin の S_ISREG 検査を通らなく
+    なる。本テストの間は書き込み端を閉じずに開いたままにして lifeline の
+    EOF を発生させない）。`--out-fd` は本チェックより前に使われないため、
+    実在しないダミー fd 番号（3）のままでよい。
     """
+    lifeline_read_fd, lifeline_write_fd = os.pipe()
     # `supervisor.worker_argv` を再利用し、実際の起動経路（`-I` 付き
     # `trainer/launch.py` 経由）と同じ argv で検証する（Issue #12）。
+    # `start_new_session=True`: 本番の起動契約（`_worker` は常に別
+    # プロセスグループのリーダーとして起動される。`supervisor.py`
+    # モジュール docstring「lifeline」節参照）に合わせる。lifeline
+    # スレッドは自分自身の pgid へ `killpg` するため、これを指定しないと
+    # 万一 lifeline スレッドが誤発火した場合に本テストプロセス（pytest）
+    # 自身の pgid を巻き込みうる。
     proc = subprocess.Popen(
-        supervisor.worker_argv(3),
+        supervisor.worker_argv(3, lifeline_read_fd),
         stdin=subprocess.PIPE,  # 通常ファイルではない（S_ISREG ではない）標準入力
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        pass_fds=(lifeline_read_fd,),
+        start_new_session=True,
     )
+    os.close(lifeline_read_fd)  # 子へ複製済み。親側の複製は不要。
     try:
         # 標準入力（パイプの書き込み側）はここでは閉じない。fstat による
         # 事前検査があれば read() を試みる前に拒否されるため、これだけで
@@ -297,6 +317,7 @@ def test_worker_rejects_non_regular_stdin_without_blocking(tmp_path: Path) -> No
     finally:
         if proc.stdin is not None:
             proc.stdin.close()
+        os.close(lifeline_write_fd)
 
     stdout = proc.stdout.read() if proc.stdout is not None else ""
     stderr = proc.stderr.read() if proc.stderr is not None else ""
@@ -378,3 +399,86 @@ def test_cli_train_ignores_polluted_pythonpath(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert (out_dir / "artifact.json").exists()
     assert (out_dir / "model.onnx").exists()
+
+
+# --------------------------------------------------------------------------
+# lifeline fd の起動時検証（issue #178 PR #233 レビュー再々指摘 P0
+# 「lifeline fd が無効な場合、`_worker` が監視なしで学習を続けてしまう」）。
+#
+# `cli.main` を直接（同一プロセス内で）呼び、`run_worker_train` を
+# 呼び出しがあれば失敗させるダミーへ差し替えることで、「学習が一切
+# 開始されないこと」を無効な lifeline fd の 3 パターン（無効な fd・
+# 非パイプ fd・未指定）それぞれについて直接的に確認する。
+# --------------------------------------------------------------------------
+
+
+def _fail_if_called(_out_fd: int) -> int:
+    raise AssertionError("run_worker_train must not be called when lifeline fd is invalid")
+
+
+def test_lifeline_fd_invalid_fails_before_training_starts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "run_worker_train", _fail_if_called)
+    # 現在のプロセスでは開かれていないであろう、大きな fd 番号を渡す。
+    exit_code = cli.main(["_worker", "--out-fd", "3", "--lifeline-fd", "999999"])
+    assert exit_code == 64
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["status"] == "error"
+    assert payload["code"] == "invalid_request"
+    assert payload["message"] == "lifeline fd not stat-able: OSError"
+
+
+def test_lifeline_fd_non_pipe_fails_before_training_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "run_worker_train", _fail_if_called)
+    regular_file = tmp_path / "not-a-pipe.txt"
+    regular_file.write_text("x", encoding="utf-8")
+    fd = os.open(regular_file, os.O_RDONLY)
+    try:
+        exit_code = cli.main(["_worker", "--out-fd", "3", "--lifeline-fd", str(fd)])
+        assert exit_code == 64
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["status"] == "error"
+        assert payload["code"] == "invalid_request"
+        assert payload["message"] == "lifeline fd must be a pipe"
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def test_lifeline_fd_missing_argument_fails_before_training_starts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "run_worker_train", _fail_if_called)
+    exit_code = cli.main(["_worker", "--out-fd", "3"])
+    assert exit_code == 64
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["status"] == "error"
+    assert payload["code"] == "invalid_request"
+
+
+def test_lifeline_watch_loop_read_exception_triggers_group_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_lifeline_watch_loop` は `read` が例外を送出した場合も EOF と同じ
+    扱い（自分自身のプロセスグループへ `SIGKILL`）にすること（issue #178
+    PR #233 レビュー再々指摘 P0。黙って戻って監視を止めたままにしない）。
+    """
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "getpgrp", lambda: 4242)
+    monkeypatch.setattr(cli.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    class _RaisingPipe:
+        def read(self, size: int) -> bytes:
+            raise OSError("simulated read failure")
+
+        def __enter__(self) -> _RaisingPipe:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    cli._lifeline_watch_loop(_RaisingPipe())
+    assert calls == [(4242, signal.SIGKILL)]

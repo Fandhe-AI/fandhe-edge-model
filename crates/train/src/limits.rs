@@ -8,6 +8,11 @@
 //! 同時に見直す（`crates/train/tests/train_contract_fixture.rs` が
 //! fixture との一致を機械照合する）。
 //!
+//! 例外: [`MAX_WORKER_STDERR_BYTES`]・[`SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]
+//! （issue #178）は Rust 側（子プロセスの起動・監視）固有の値で、
+//! 学習ワーカー側に対応する単一真実源を持たない（各定数の doc に根拠を
+//! 記す）。
+//!
 //! [`crate::limits`] の各定数は `fandhe_edge_core::judgment` の
 //! `MAX_OPTIONS`・`MAX_CHOICE_ID_BYTES` と値がたまたま同じでも、
 //! 契約としては別物であり結合しない（学習リクエストの `label_order` は
@@ -97,3 +102,44 @@ pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 /// record_id 専用の新しい定数を追加で起こさず、「1 つの `SearchInput`
 /// フィールドが保持できる合計バイト数」の共通の目安として扱う）。
 pub const MAX_VALIDATION_INPUT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// 学習ワーカーの標準エラー出力（stderr）の保持上限（バイト）。REQ-39
+/// 「資源の上限」（#178）。`_worker` は supervisor の stderr を継承する
+/// （`supervisor.py::_spawn_worker_and_finalize`）ため、Rust 側 stderr
+/// パイプの書き手は supervisor 自身と `_worker` の両方になりうる。stdout
+/// （[`MAX_RESULT_BYTES`]。契約上の結果 JSON）とは別に、診断用途の stderr
+/// にも無制限の保持を許さないための独立した上限を設ける。先頭から保持し、
+/// 超過分は読み捨てる（`crates/train/src/process.rs`）。
+pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
+
+/// Rust 側の壁時計締め切りに足す猶予（秒）。REQ-34・REQ-39（#178）。
+///
+/// `supervisor.py`（内側監視者）は `_worker` を別セッション・別プロセス
+/// グループ（W）で起動する（`start_new_session=True`）。内側の壁時計・RSS
+/// タイムアウトでは supervisor 自身が `killpg(W)` でそのグループごと掃除
+/// する。Rust 側の外側締め切りは、supervisor 自身が `time_limit_seconds`
+/// 超過を検出してから、内側の後始末（`killpg`・`ps` 呼び出し・reader
+/// スレッドの回収等）を終えるまでの時間を確実に上回る必要がある（さもない
+/// と、まだ後始末中の supervisor を Rust 側が早期に打ち切ってしまう）。
+///
+/// Rust 側が外側締め切りで直接の子（supervisor）を `SIGKILL` した場合
+/// （＝ supervisor が自身の後始末を終える前に終了させられた場合）でも、
+/// `_worker` は孤児として残らない: `_worker` は起動直後から「lifeline」
+/// （supervisor が握り続ける pipe の書き込み端）を監視しており、supervisor
+/// がどのような形で終了しても、カーネルが書き込み端を自動的に閉じるため
+/// `_worker` は必ず EOF を観測して自己終了する（issue #178 PR #233
+/// レビュー。`trainer/src/fandhe_edge_trainer/supervisor.py` モジュール
+/// docstring「lifeline」節参照。Rust 側でのプロセスグループ管理
+/// 〔`process_group(0)`・`/bin/kill` 呼び出し〕は構造的な欠陥が収束せず
+/// 全面撤去した）。
+///
+/// 内訳（`supervisor.py` の定数から算出。根拠を明示し、緩めずに保つ）:
+/// 内側の猶予 `_TIME_LIMIT_GRACE_SECONDS`（5 秒）＋ `ps` 呼び出しの
+/// タイムアウト（5 秒）＋ kill 後の `proc.wait()` 上限（10 秒）＋ reader
+/// スレッドの join 上限（10 秒＋5 秒）＝ 35 秒に、Python プロセス起動・
+/// OS のプロセス後始末のための余裕を加えて 60 秒とする。
+///
+/// この結果、既定値（`time_limit_seconds` = [`MAX_TRAIN_WALL_SECONDS`] =
+/// 3600 秒）では Rust 側の外側締め切りは 3660 秒となり、字義どおりの
+/// 「3600 秒を超えない」からは猶予分だけ外れる（issue #178 実装計画・
+/// オーナー確認事項 1。孤児プロセスを残さないことを優先する設計判断）。
+pub const SUPERVISOR_SHUTDOWN_GRACE_SECONDS: u32 = 60;
