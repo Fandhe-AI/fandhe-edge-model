@@ -1318,7 +1318,7 @@ type CancelRunResult = (CancelOutcome, TrainRunEnd, JobState, Duration);
 /// 壁時計起因の停止を区別できるようにする。協調の猶予は 1 秒へ締め（
 /// `SIGKILL` フォールバックの確認を速くする）、協調する supervisor を模す
 /// ケースは 1 秒以内に終了するため影響しない。`request` の `root` は
-/// `FIXTURE_ROOT`（実在しない）。
+/// ケースの一時ディレクトリ（実在する。残置観測が起動前の実体を記録できる。REQ-34・#145）。
 #[cfg(unix)]
 fn run_and_cancel_when(
     case_dir: &Path,
@@ -1329,7 +1329,7 @@ fn run_and_cancel_when(
         case_dir,
         mode,
         ready,
-        make_request(Some(30)),
+        make_request_in(case_dir, Some(30)),
         Duration::from_secs(1),
     )
 }
@@ -1383,7 +1383,7 @@ fn case_cancel_hang(case_dir: &Path) -> Result<(), String> {
     expect_eq(run.child_reaped(), true, "child_reaped")?;
     expect_eq(run.signal(), Some(9), "signal")?;
     // 協調しない supervisor は猶予（1 秒）内に終了せず `SIGKILL` へ
-    // フォールバックする。`out_dir`（実在しない root 配下）は存在しない。
+    // フォールバックする。`out_dir`（root 配下）は存在しない。
     expect_eq(run.stop(), CancelStop::ForcedKill, "stop")?;
     expect_eq(
         run.out_dir_residue(),

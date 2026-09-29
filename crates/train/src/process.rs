@@ -779,12 +779,80 @@ impl CancelledRun {
     }
 }
 
+/// ディレクトリ実体の識別子（`dev`・`ino`）。名前ではなく実体で同一性を判断する
+/// ために使う（REQ-34・#145）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl DirId {
+    /// `path`（symlink は名前解決と同じく辿る）がディレクトリなら、その識別子。
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_dir().then(|| Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// 子プロセスを起動する**前**に記録する、`root` と `out_dir` の親ディレクトリの
+/// 実体（`dev`・`ino`）。supervisor の確定処理は自分が保持する親ディレクトリの
+/// fd に束縛されるが、Rust 側の残置観測は名前で再解決するため、実行中に root が
+/// 改名・差し替えされると、公開済みの実体を見ずに `Absent` と誤観測しうる。
+/// 観測時に再解決した実体がここへ記録した実体と一致する場合だけ、`Absent`・
+/// `EmptyReservation` を「未公開の証拠」として採用する（REQ-34・#145。
+/// fail-closed）。記録できなかった場合は常に不一致（`Unknown`）になる。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct OutDirAnchor {
+    root: Option<DirId>,
+    parent: Option<DirId>,
+}
+
+#[cfg(unix)]
+impl OutDirAnchor {
+    fn paths(request: &TrainRequest) -> (PathBuf, PathBuf) {
+        let root = PathBuf::from(request.root());
+        let out = root.join(request.out_dir());
+        let parent = out.parent().map_or_else(|| root.clone(), Path::to_path_buf);
+        (root, parent)
+    }
+
+    /// 起動前の実体を記録する（読み取りのみ）。
+    fn capture(request: &TrainRequest) -> Self {
+        let (root, parent) = Self::paths(request);
+        Self {
+            root: DirId::of(&root),
+            parent: DirId::of(&parent),
+        }
+    }
+
+    /// 名前を再解決した実体が、記録した実体と一致するか。
+    fn still_matches(&self, request: &TrainRequest) -> bool {
+        let (root, parent) = Self::paths(request);
+        matches!((self.root, DirId::of(&root)), (Some(a), Some(b)) if a == b)
+            && matches!((self.parent, DirId::of(&parent)), (Some(a), Some(b)) if a == b)
+    }
+}
+
 /// `SIGKILL` フォールバック後の `out_dir` を読み取り専用で観測する
 /// （[`OutDirResidue`]）。`symlink_metadata` でディレクトリかを確かめ、`read_dir`
 /// は最初の 1 件だけ読む（件数上限 1。REQ-39）。symlink は辿らず `Unknown`。
 /// **削除・rename はしない**（REQ-34・#145）。
+///
+/// 名前の再解決だけで「未公開」を断定しない**唯一の場所**: root・親ディレクトリの
+/// 実体が起動前の記録（[`OutDirAnchor`]）と一致しなければ `Unknown` を返す。
 #[cfg(unix)]
-fn inspect_out_dir_residue(request: &TrainRequest) -> OutDirResidue {
+fn inspect_out_dir_residue(request: &TrainRequest, anchor: &OutDirAnchor) -> OutDirResidue {
+    if !anchor.still_matches(request) {
+        return OutDirResidue::Unknown;
+    }
     let path = Path::new(request.root()).join(request.out_dir());
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -1395,6 +1463,9 @@ pub fn run_train_cancellable(
     if cancel.is_cancelled() {
         return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
     }
+    // 残置観測の同一性確認用に、起動前の root・親ディレクトリの実体を記録する
+    // （REQ-34・#145）。
+    let anchor = OutDirAnchor::capture(request);
     let mut child = command
         .spawn()
         .map_err(|e| TrainProcessError::Spawn { kind: e.kind() })?;
@@ -1438,7 +1509,7 @@ pub fn run_train_cancellable(
                     &mut cancel_signalled,
                 ) {
                     CancelStep::Cancelled(run) => {
-                        return forced_kill_run(run, request).map(TrainRunEnd::Cancelled);
+                        return forced_kill_run(run, request, &anchor).map(TrainRunEnd::Cancelled);
                     }
                     // キャンセルが間に合わず子は既に終了していた（kill しない）、
                     // または協調キャンセルで自ら終了した。通常経路へ合流し、
@@ -1495,7 +1566,7 @@ pub fn run_train_cancellable(
                 &mut cancel_signalled,
             ) {
                 CancelStep::Cancelled(run) => {
-                    return forced_kill_run(run, request).map(TrainRunEnd::Cancelled);
+                    return forced_kill_run(run, request, &anchor).map(TrainRunEnd::Cancelled);
                 }
                 CancelStep::AlreadyExited(status) | CancelStep::ExitedAfterSignal(status) => {
                     pre_exited = Some(status);
@@ -1598,7 +1669,7 @@ pub fn run_train_cancellable(
         limits,
         request,
     });
-    conclude_run(finished, cancel_signalled, started, request)
+    conclude_run(finished, cancel_signalled, started, request, &anchor)
 }
 
 /// `SIGKILL` フォールバックの `Cancelled` に `out_dir` の読み取り専用の観測結果を
@@ -1613,8 +1684,9 @@ pub fn run_train_cancellable(
 fn forced_kill_run(
     run: CancelledRun,
     request: &TrainRequest,
+    anchor: &OutDirAnchor,
 ) -> Result<CancelledRun, TrainProcessError> {
-    let residue = inspect_out_dir_residue(request);
+    let residue = inspect_out_dir_residue(request, anchor);
     ensure_not_published(residue)?;
     Ok(run.with_out_dir_residue(residue))
 }
@@ -1661,11 +1733,12 @@ fn conclude_run(
     cancel_signalled: bool,
     started: Instant,
     request: &TrainRequest,
+    anchor: &OutDirAnchor,
 ) -> Result<TrainRunEnd, TrainProcessError> {
     // 所定のキャンセル応答でない終了は `Unconfirmed` とし、残置を観測して報告する
     // （supervisor のクラッシュ等を協調キャンセル完了として扱わない）。
     let unconfirmed = || {
-        let residue = inspect_out_dir_residue(request);
+        let residue = inspect_out_dir_residue(request, anchor);
         ensure_not_published(residue)?;
         Ok(TrainRunEnd::Cancelled(CancelledRun::unconfirmed(
             started.elapsed(),
@@ -1682,7 +1755,7 @@ fn conclude_run(
         // 残置があれば通常の `Unconfirmed` 経路（公開済み・判定不能ならエラー）へ回す
         // （fail-closed。REQ-34・#145）。
         Ok(run) if is_cancel_ack(&run) => {
-            if inspect_out_dir_residue(request) == OutDirResidue::Absent {
+            if inspect_out_dir_residue(request, anchor) == OutDirResidue::Absent {
                 Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
                     started.elapsed(),
                 )))
@@ -2511,19 +2584,28 @@ mod tests {
             rss_limit_bytes: None,
         })
         .expect("valid request");
-        assert_eq!(inspect_out_dir_residue(&request), OutDirResidue::Absent);
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::Absent
+        );
         std::fs::create_dir(root.join("out")).expect("create out");
         assert_eq!(
-            inspect_out_dir_residue(&request),
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
             OutDirResidue::EmptyReservation
         );
         std::fs::write(root.join("out").join("model.onnx"), b"x").expect("write");
-        assert_eq!(inspect_out_dir_residue(&request), OutDirResidue::NonEmpty);
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::NonEmpty
+        );
         // 観測は何も削除しない。
         assert!(root.join("out").join("model.onnx").exists());
         std::fs::remove_dir_all(root.join("out")).expect("rm out");
         std::os::unix::fs::symlink(&root, root.join("out")).expect("symlink");
-        assert_eq!(inspect_out_dir_residue(&request), OutDirResidue::Unknown);
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::Unknown
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2540,7 +2622,7 @@ mod tests {
         let request = test_request(None);
         // 送出前は従来どおり（エラーはエラー）。
         assert!(matches!(
-            conclude_run(
+            conclude_run_t(
                 Err(TrainProcessError::StdoutIncomplete),
                 false,
                 started,
@@ -2549,7 +2631,7 @@ mod tests {
             Err(TrainProcessError::StdoutIncomplete)
         ));
         // 送出後の別の失敗（クラッシュ等）は `Unconfirmed`（残置を観測して報告する）。
-        match conclude_run(
+        match conclude_run_t(
             Err(TrainProcessError::StdoutIncomplete),
             true,
             started,
@@ -2565,7 +2647,7 @@ mod tests {
         }
         // 壁時計超過は送出後でもキャンセルより優先する。
         assert!(matches!(
-            conclude_run(Err(wall()), true, started, &request),
+            conclude_run_t(Err(wall()), true, started, &request),
             Err(TrainProcessError::WallTimeout { .. })
         ));
     }
@@ -2591,7 +2673,7 @@ mod tests {
                 stderr_truncated: false,
             }
         };
-        match conclude_run(Ok(run_of(CANCEL_ACK_MESSAGE)), true, started, &request) {
+        match conclude_run_t(Ok(run_of(CANCEL_ACK_MESSAGE)), true, started, &request) {
             Ok(TrainRunEnd::Cancelled(run)) => {
                 assert_eq!(run.stop(), CancelStop::Cooperative);
                 assert_eq!(run.out_dir_residue(), None);
@@ -2599,7 +2681,7 @@ mod tests {
             _ => panic!("expected Cancelled(Cooperative)"),
         }
         // 別のエラー JSON は隠さず `Completed`（エラー結果）のまま保持する。
-        match conclude_run(Ok(run_of("worker crashed")), true, started, &request) {
+        match conclude_run_t(Ok(run_of("worker crashed")), true, started, &request) {
             Ok(TrainRunEnd::Completed(run)) => {
                 assert!(matches!(run.outcome, TrainOutcome::Error(_)));
                 assert_eq!(run.exit_code, ExitCode::RuntimeError);
@@ -2649,12 +2731,12 @@ mod tests {
         };
         // 残置なし: 本物の応答として Cooperative。
         assert!(matches!(
-            conclude_run(Ok(make_run()), true, Instant::now(), &request),
+            conclude_run_t(Ok(make_run()), true, Instant::now(), &request),
             Ok(TrainRunEnd::Cancelled(run)) if run.stop() == CancelStop::Cooperative
         ));
         // 空の予約が残る: Cooperative ではなく Unconfirmed（残置を報告）。
         std::fs::create_dir(root.join("out")).expect("create out");
-        match conclude_run(Ok(make_run()), true, Instant::now(), &request) {
+        match conclude_run_t(Ok(make_run()), true, Instant::now(), &request) {
             Ok(TrainRunEnd::Cancelled(run)) => {
                 assert_eq!(run.stop(), CancelStop::Unconfirmed);
                 assert_eq!(run.out_dir_residue(), Some(OutDirResidue::EmptyReservation));
@@ -2664,12 +2746,100 @@ mod tests {
         // 中身が残る: 公開済みの可能性があるため Cancelled としない。
         std::fs::write(root.join("out").join("model.onnx"), b"x").expect("write");
         assert!(matches!(
-            conclude_run(Ok(make_run()), true, Instant::now(), &request),
+            conclude_run_t(Ok(make_run()), true, Instant::now(), &request),
             Err(TrainProcessError::CancelOutcomeUnconfirmed {
                 residue: OutDirResidue::NonEmpty
             })
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REQ-34・#145 回帰: 実行中に root が改名され、同じ名前に空ディレクトリが
+    /// 置き直された場合、名前の再解決では `Absent` に見えても実体が起動前の記録と
+    /// 違うため `Unknown` 扱いになり、`Cancelled` にならない（元の実体には成果物が
+    /// 公開済みでありうる）。
+    #[cfg(unix)]
+    #[test]
+    fn req34_swapped_root_is_not_observed_as_unpublished() {
+        let root = unique_root();
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        let anchor = OutDirAnchor::capture(&request);
+        assert_eq!(
+            inspect_out_dir_residue(&request, &anchor),
+            OutDirResidue::Absent
+        );
+        // 実行中に root を改名し、同じ名前に空ディレクトリを置き直す。
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).expect("rename root");
+        std::fs::create_dir(&root).expect("recreate root");
+        std::fs::create_dir(moved.join("out")).expect("published in original");
+        std::fs::write(moved.join("out").join("model.onnx"), b"x").expect("write");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &anchor),
+            OutDirResidue::Unknown
+        );
+        // SIGKILL 経路・協調キャンセル経路のどちらも Cancelled としない。
+        let run = CancelledRun::before_start();
+        assert!(matches!(
+            forced_kill_run(run, &request, &anchor),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::Unknown
+            })
+        ));
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+        );
+        let outcome =
+            classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+        let ack = TrainRun {
+            outcome,
+            exit_code: ExitCode::RuntimeError,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        assert!(matches!(
+            conclude_run(Ok(ack), true, Instant::now(), &request, &anchor),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::Unknown
+            })
+        ));
+        // 起動前に root を記録できなかった場合も fail-closed。
+        let missing = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.join("nonexistent").to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        assert_eq!(
+            inspect_out_dir_residue(&missing, &OutDirAnchor::capture(&missing)),
+            OutDirResidue::Unknown
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 
     /// REQ-34・#145: supervisor が予約の解放を確認できなかった旨（固定メッセージ）を
@@ -2691,7 +2861,7 @@ mod tests {
             stderr_truncated: false,
         };
         assert!(is_cleanup_incomplete(&run));
-        match conclude_run(Ok(run), true, Instant::now(), &request) {
+        match conclude_run_t(Ok(run), true, Instant::now(), &request) {
             Ok(TrainRunEnd::Cancelled(run)) => assert_eq!(run.stop(), CancelStop::Unconfirmed),
             Err(TrainProcessError::CancelOutcomeUnconfirmed { .. }) => {}
             _ => panic!("expected Unconfirmed handling, not Completed"),
@@ -2714,7 +2884,7 @@ mod tests {
             worker_stderr: Vec::new(),
             stderr_truncated: false,
         };
-        match conclude_run(Ok(run), true, Instant::now(), &request) {
+        match conclude_run_t(Ok(run), true, Instant::now(), &request) {
             Ok(TrainRunEnd::Completed(run)) => {
                 assert_eq!(run.exit_code, ExitCode::InvalidInput);
                 assert!(matches!(run.outcome, TrainOutcome::Error(_)));
@@ -2737,6 +2907,37 @@ mod tests {
         }
     }
 
+    /// 呼び出し時点の実体を記録して [`conclude_run`] を呼ぶ（実体の差し替えを
+    /// 伴わないテスト用）。
+    #[cfg(unix)]
+    fn conclude_run_t(
+        finished: Result<TrainRun, TrainProcessError>,
+        cancel_signalled: bool,
+        started: Instant,
+        request: &TrainRequest,
+    ) -> Result<TrainRunEnd, TrainProcessError> {
+        conclude_run(
+            finished,
+            cancel_signalled,
+            started,
+            request,
+            &OutDirAnchor::capture(request),
+        )
+    }
+
+    /// 実在する一意な root（残置観測が実体を記録できるようにする）。
+    fn unique_root() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fandhe-train-root-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        root
+    }
+
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
         TrainRequest::new(TrainRequestParams {
             kind: "c3".to_string(),
@@ -2746,7 +2947,7 @@ mod tests {
             max_bytes: 512,
             seed: 0,
             device: Device::Cpu,
-            root: "/fandhe-edge-fixture-root".to_string(),
+            root: unique_root().to_string_lossy().to_string(),
             train_path: "train.jsonl".to_string(),
             out_dir: "out".to_string(),
             time_limit_seconds,
