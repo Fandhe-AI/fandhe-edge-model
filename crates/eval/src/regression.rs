@@ -45,12 +45,28 @@
 //! PoC-19 の `b_correct_to_incorrect`（旧→新で「正解→不正解」を `b` と
 //! 呼んでいた）とは文字（b/c）の対応が逆になる点に注意する。
 //!
+//! # ラベル集合相違時の前提明記（TASK-26.2・issue #102）
+//!
+//! 選択肢の追加・削除・統合で旧・新の `label_order` が異なる場合、回帰件数・
+//! 改善件数は「同じ問題での差分」ではない（PoC-19「main のレビュー」節。
+//! P3 の統合は旧 9 ラベル・新 8 ラベルをそれぞれ自分のラベル空間で採点して
+//! おり、統合後のほうが問題がやさしい。P1・P2 は共通レコードに絞った比較）。
+//! [`regression_report`] は件数（[`RegressionCounts`]）と比較の前提
+//! （[`ComparisonPremise`]）を [`RegressionReport`] にまとめ、前提を落として
+//! 件数だけが独り歩きしないようにする。
+//!
+//! - 相違はエラーにしない（REQ-26 異常系は「明記すること」を求めており、拒否は
+//!   求めていない）。警告付きのレポートとして返す
+//! - 比較はラベルの集合として行い、並び順の違いだけなら同一集合として扱う
+//!   （正誤判定はラベルの並び順に依存しないため）
+//! - 集合差分からは「削除＋追加」と「統合」を区別できず、評価器層は定義ファイル
+//!   の `merges` に依存しないため、統合と断定せず削除側・追加側の差分を返す
+//!
 //! # 対象外（本 issue の範囲外）
 //!
-//! - 旧・新でラベル集合が異なる場合（PoC-19 P3 の統合パターン）の前提明記
-//!   （TASK-26.2）。[`compare_with_previous`] は旧・新が同一のラベル集合を
-//!   持つ場合の API で、ラベル集合が異なる比較は [`regression_counts`]
-//!   （各モデル自身のラベル空間で正誤を求めた bool 列を渡す経路）を使う
+//! - `merges` 対応表で旧の予測を統合後のラベルへ写して比較する処理
+//!   （PoC-19 でも未実施。未実装）
+//! - どのレコードを比較対象にするかの決定（共通レコードの抽出は呼び出し側）
 //! - 再現性（3 seed の CI 重なり。TASK-26.3）
 //! - TASK-20.1 の作り直し判定（`RebuildDecision`）を受けて作り直し後にのみ
 //!   比較する接続（親 #99 / 後続）
@@ -79,6 +95,12 @@ use std::fmt;
 pub enum RegressionError {
     /// ラベル集合の検証エラー（空・空 ID・重複・上限超過）。
     Labels(crate::metrics::EvalError),
+    /// 旧モデル側のラベル集合の検証エラー（[`compare_label_sets`]・
+    /// [`regression_report`]。TASK-26.2）。
+    PreviousLabels(crate::metrics::EvalError),
+    /// 新モデル側のラベル集合の検証エラー（[`compare_label_sets`]・
+    /// [`regression_report`]。TASK-26.2）。
+    CurrentLabels(crate::metrics::EvalError),
     /// 比較対象の行が 0 件（評価済みを装わない）。
     EmptyRecords,
     /// 件数が [`MAX_EVAL_RECORDS`] を超える（REQ-39 資源の上限。
@@ -141,6 +163,8 @@ impl fmt::Display for RegressionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RegressionError::Labels(err) => write!(f, "{err}"),
+            RegressionError::PreviousLabels(err) => write!(f, "previous label order: {err}"),
+            RegressionError::CurrentLabels(err) => write!(f, "current label order: {err}"),
             RegressionError::EmptyRecords => write!(f, "records must not be empty"),
             RegressionError::TooManyRecords { n_records, limit } => {
                 write!(f, "too many records: {n_records} (limit: {limit})")
@@ -259,9 +283,9 @@ impl RegressionCounts {
 /// [`RegressionCounts`] を求める。
 ///
 /// 各モデル自身のラベル空間で求めた正誤ビットを渡す経路のため、旧・新で
-/// ラベル集合が異なる場合（PoC-19 P3 の統合パターン）もここへ渡せる
-/// （ラベル集合相違の前提明記自体は TASK-26.2 の対象で、本関数はその前提を
-/// 検査しない）。
+/// ラベル集合が異なる場合（PoC-19 P3 の統合パターン）もここへ渡せるが、
+/// 本関数はラベル集合の前提を検査しない。旧・新でラベル集合が異なりうる
+/// 呼び出し元は、前提を明記する [`regression_report`]（TASK-26.2）を使う。
 ///
 /// 本関数自体は受け取ったスライスをそのまま検査するだけで、追加の
 /// `Vec` を確保しない（2 本の `Vec<bool>` を確保するのは呼び出し元
@@ -316,7 +340,8 @@ pub fn regression_counts(
 }
 
 /// ラベル集合・旧モデル・新モデルの対応データから [`RegressionCounts`] を
-/// 求める（旧・新が同一のラベル集合を持つ場合の record 単位 API）。
+/// 求める（旧・新が同一のラベル集合を持つ場合の record 単位 API。ラベル集合が
+/// 異なる比較は [`regression_report`] を使う）。
 ///
 /// 手順: [`baseline::validate_label_order`] でラベル検証 →（空・上限）
 /// チェック → 各行で gold を検証しつつ [`crate::significance::is_correct`]
@@ -366,6 +391,130 @@ pub fn compare_with_previous(
     }
 
     regression_counts(&previous_correct, &current_correct)
+}
+
+/// 旧・新モデルのラベル集合から判定した比較の前提（REQ-26 異常系・
+/// TASK-26.2・issue #102）。
+///
+/// 件数を単純な差分として読んでよいかを表す。`#[non_exhaustive]` のため、
+/// 将来 `merges` 対応表による統合の明示などを追加しても破壊的変更にならない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ComparisonPremise {
+    /// 旧・新が同一のラベル集合（並び順は問わない）。件数は単純な差分として読める。
+    SameLabelSet,
+    /// ラベル集合が異なる。件数は同じ問題での比較ではない。
+    LabelSetDiffers {
+        /// 旧のみにあるラベル（旧の宣言順）。
+        removed: Vec<String>,
+        /// 新のみにあるラベル（新の宣言順）。
+        added: Vec<String>,
+    },
+}
+
+impl ComparisonPremise {
+    /// 機械可読な識別子（英語。CLI の JSON 化は #140 の責務）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ComparisonPremise::SameLabelSet => "same_label_set",
+            ComparisonPremise::LabelSetDiffers { .. } => "label_set_differs",
+        }
+    }
+
+    /// 旧・新が同一のラベル集合なら `true`。
+    pub fn is_same_label_set(&self) -> bool {
+        matches!(self, ComparisonPremise::SameLabelSet)
+    }
+
+    /// 前提相違の明記（英語の固定文）。同一集合なら `None`。
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            ComparisonPremise::SameLabelSet => None,
+            ComparisonPremise::LabelSetDiffers { .. } => Some(
+                "label sets differ between previous and current models; counts are not a like-for-like diff",
+            ),
+        }
+    }
+}
+
+/// 回帰件数と比較の前提をまとめたレポート（前提を落とせない型。TASK-26.2）。
+///
+/// フィールドは非公開で、[`regression_report`] だけが構築する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegressionReport {
+    counts: RegressionCounts,
+    premise: ComparisonPremise,
+}
+
+impl RegressionReport {
+    /// 回帰・改善などの件数。
+    pub fn counts(&self) -> &RegressionCounts {
+        &self.counts
+    }
+
+    /// 比較の前提。
+    pub fn premise(&self) -> &ComparisonPremise {
+        &self.premise
+    }
+}
+
+/// 旧・新のラベル集合を検証し、比較の前提を判定する（TASK-26.2）。
+///
+/// 各側を [`baseline::validate_label_order`]（空・空 ID・重複・上限超過を
+/// 確保の前に拒否。REQ-39）で検証する。差分は各側の宣言順で作り、
+/// 反復順に依存しない決定的な結果にする。
+///
+/// # エラー
+///
+/// - 旧側が不正 → [`RegressionError::PreviousLabels`]
+/// - 新側が不正 → [`RegressionError::CurrentLabels`]
+pub fn compare_label_sets(
+    previous_labels: &[&str],
+    current_labels: &[&str],
+) -> Result<ComparisonPremise, RegressionError> {
+    let previous_index =
+        baseline::validate_label_order(previous_labels).map_err(RegressionError::PreviousLabels)?;
+    let current_index =
+        baseline::validate_label_order(current_labels).map_err(RegressionError::CurrentLabels)?;
+
+    let removed: Vec<String> = previous_labels
+        .iter()
+        .filter(|l| !current_index.contains_key(**l))
+        .map(|l| (*l).to_string())
+        .collect();
+    let added: Vec<String> = current_labels
+        .iter()
+        .filter(|l| !previous_index.contains_key(**l))
+        .map(|l| (*l).to_string())
+        .collect();
+
+    if removed.is_empty() && added.is_empty() {
+        Ok(ComparisonPremise::SameLabelSet)
+    } else {
+        Ok(ComparisonPremise::LabelSetDiffers { removed, added })
+    }
+}
+
+/// 各モデル自身のラベル空間での正誤列と両側のラベル集合から、前提付きの
+/// [`RegressionReport`] を作る（REQ-26 異常系・TASK-26.2）。
+///
+/// ラベル集合を先に検証し（[`compare_label_sets`]）、続けて
+/// [`regression_counts`] に委ねる（評価ロジックを再実装しない）。ラベル集合が
+/// 異なる場合もエラーにせず、レポートの [`ComparisonPremise`] に明記する。
+///
+/// # エラー
+///
+/// [`compare_label_sets`] と [`regression_counts`] のエラーをそのまま返す
+/// （ラベルのエラーが先）。
+pub fn regression_report(
+    previous_labels: &[&str],
+    current_labels: &[&str],
+    previous_correct: &[bool],
+    current_correct: &[bool],
+) -> Result<RegressionReport, RegressionError> {
+    let premise = compare_label_sets(previous_labels, current_labels)?;
+    let counts = regression_counts(previous_correct, current_correct)?;
+    Ok(RegressionReport { counts, premise })
 }
 
 #[cfg(test)]
@@ -708,5 +857,100 @@ mod tests {
             limit: 3,
         };
         assert_eq!(err.to_string(), "too many records: 5 (limit: 3)");
+    }
+
+    /// REQ-26・TASK-26.2: 同一集合は並び順が違っても `SameLabelSet`。
+    #[test]
+    fn same_label_set_ignores_order() {
+        let p = compare_label_sets(&["A", "B", "C"], &["C", "A", "B"]).unwrap();
+        assert_eq!(p, ComparisonPremise::SameLabelSet);
+        assert_eq!(p.as_str(), "same_label_set");
+        assert!(p.is_same_label_set());
+        assert_eq!(p.note(), None);
+    }
+
+    /// REQ-26・TASK-26.2: 相違時は removed/added が宣言順の具体値になる。
+    #[test]
+    fn differing_label_sets_report_declaration_order_diff() {
+        let p = compare_label_sets(&["A", "B", "C", "D"], &["Z", "A", "Y", "C"]).unwrap();
+        assert_eq!(
+            p,
+            ComparisonPremise::LabelSetDiffers {
+                removed: vec!["B".to_string(), "D".to_string()],
+                added: vec!["Z".to_string(), "Y".to_string()],
+            }
+        );
+        assert_eq!(p.as_str(), "label_set_differs");
+        assert!(!p.is_same_label_set());
+        assert_eq!(
+            p.note(),
+            Some(
+                "label sets differ between previous and current models; counts are not a like-for-like diff"
+            )
+        );
+    }
+
+    /// REQ-26・TASK-26.2: 両側のラベル検証エラーはどちら側かを区別する。
+    #[test]
+    fn label_errors_identify_the_side() {
+        use crate::metrics::EvalError;
+        assert_eq!(
+            compare_label_sets(&[], &["A"]),
+            Err(RegressionError::PreviousLabels(EvalError::EmptyLabels))
+        );
+        assert_eq!(
+            compare_label_sets(&["A"], &[""]),
+            Err(RegressionError::CurrentLabels(EvalError::EmptyLabelId))
+        );
+        assert_eq!(
+            compare_label_sets(&["A", "A"], &["A"]),
+            Err(RegressionError::PreviousLabels(EvalError::DuplicateLabel {
+                label: "A".to_string()
+            }))
+        );
+        let many: Vec<String> = (0..crate::metrics::MAX_LABELS + 1)
+            .map(|i| format!("L{i}"))
+            .collect();
+        let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches!(
+            compare_label_sets(&["A"], &many_refs),
+            Err(RegressionError::CurrentLabels(
+                EvalError::TooManyLabels { .. }
+            ))
+        ));
+    }
+
+    /// REQ-26・TASK-26.2: 件数は `regression_counts` と一致し、前提が付く。
+    /// ラベル異常と長さ不一致が同時ならラベルのエラーが先。
+    #[test]
+    fn report_wraps_counts_and_validates_labels_first() {
+        let prev = [true, true, false, false];
+        let cur = [true, false, true, false];
+        let report = regression_report(&["A", "B"], &["A", "C"], &prev, &cur).unwrap();
+        assert_eq!(report.counts(), &regression_counts(&prev, &cur).unwrap());
+        assert_eq!(report.counts().correct_to_incorrect(), 1);
+        assert_eq!(report.counts().incorrect_to_correct(), 1);
+        assert_eq!(report.premise().as_str(), "label_set_differs");
+
+        assert!(matches!(
+            regression_report(&["A"], &["A"], &prev, &cur[..3]),
+            Err(RegressionError::LengthMismatch {
+                previous: 4,
+                current: 3
+            })
+        ));
+        assert!(matches!(
+            regression_report(&[], &["A"], &prev, &cur[..3]),
+            Err(RegressionError::PreviousLabels(_))
+        ));
+    }
+
+    /// REQ-26・TASK-26.2: Display は英語の固定文で、データ本文を含まない。
+    #[test]
+    fn side_error_display_is_english() {
+        let e = compare_label_sets(&[], &["A"]).unwrap_err();
+        assert!(e.to_string().starts_with("previous label order: "));
+        let e = compare_label_sets(&["A"], &[""]).unwrap_err();
+        assert!(e.to_string().starts_with("current label order: "));
     }
 }
