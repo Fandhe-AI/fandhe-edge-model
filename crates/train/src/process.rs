@@ -630,7 +630,8 @@ enum CancelStep {
     /// `kill()` の送出に失敗し、直後の `try_wait()` でも終了を確認できなかった
     /// （子はまだ生きている可能性がある）。`Child` を drop しても子は止まらない
     /// ため、呼び出し元は監視を続け、壁時計の上限で改めて回収する
-    /// （codex/review 指摘 P0。REQ-39「資源の上限」）。
+    /// （codex/review 指摘 P0。REQ-39「資源の上限」）。壁時計の期限で kill 後の
+    /// 回収待ちを打ち切った場合も同じ扱いで、`WallTimeout` として回収する。
     StillRunning,
 }
 
@@ -656,6 +657,11 @@ fn cancel_child(
         Err(e) => {
             let _ = child.kill();
             let _ = wait_after_kill_until(child, deadline);
+            // `Interrupted` が壁時計の期限まで続いた場合も、期限超過として
+            // 呼び出し元の `WallTimeout` 回収へ委ねる。
+            if e.kind() == std::io::ErrorKind::Interrupted && Instant::now() >= wall_deadline {
+                return Ok(CancelStep::StillRunning);
+            }
             return Err(TrainProcessError::Wait { kind: e.kind() });
         }
     }
@@ -670,7 +676,18 @@ fn cancel_child(
             _ => Ok(CancelStep::StillRunning),
         };
     }
-    let status = wait_after_kill_until(child, deadline)?;
+    let status = match wait_after_kill_until(child, deadline) {
+        Ok(status) => status,
+        // 壁時計の期限で待ちを打ち切った場合は実行時エラーにせず、
+        // `StillRunning` として呼び出し元へ返す。呼び出し元は期限超過を
+        // `TimedOut`（`WallTimeout`）として回収する（Cursor Bugbot 指摘 Medium。
+        // 期限前に受理したキャンセルの回収が期限に間に合わなかっただけで、
+        // 実行時エラー扱いにしない。REQ-39）。
+        Err(TrainProcessError::KillWaitTimedOut) if Instant::now() >= wall_deadline => {
+            return Ok(CancelStep::StillRunning);
+        }
+        Err(e) => return Err(e),
+    };
     // `try_wait()` が `None` を返した直後に子が自然終了すると、未回収（ゾンビ）
     // の子への `kill()` は成功しうる。回収した状態が `SIGKILL` 終了でなければ
     // 自然終了なので、`Cancelled` とせず通常の結果分類へ戻す（成功した学習を
@@ -1360,7 +1377,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         match r {
             Ok(CancelStep::Cancelled(run)) => assert_eq!(run.signal(), Some(SIGKILL)),
-            Err(TrainProcessError::KillWaitTimedOut) => {}
+            // 壁時計の期限で打ち切った場合は実行時エラーではなく `StillRunning`
+            // （呼び出し元が `WallTimeout` として回収する）。
+            Ok(CancelStep::StillRunning) => {}
             _ => panic!("unexpected cancel step"),
         }
         let _ = child.kill();
