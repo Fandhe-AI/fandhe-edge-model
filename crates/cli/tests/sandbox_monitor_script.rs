@@ -102,6 +102,7 @@ impl Env {
                 "#!/bin/sh\n\
                  [ $# -eq 5 ] && [ \"$1\" = stream ] && [ \"$2\" = --style ] && [ \"$3\" = ndjson ] \
                  && [ \"$4\" = --predicate ] && [ \"$5\" = '{PREDICATE}' ] || exit 99\n\
+                 [ \"${{FAKE_LOG_MODE:-}}\" != flood_err ] || head -c 300000 /dev/zero >&2\n\
                  cat \"$FAKE_STREAM_FIXTURE\"\n\
                  [ \"${{FAKE_LOG_MODE:-}}\" = early ] && exit 0\n\
                  exec sleep 300\n"
@@ -566,6 +567,23 @@ fn req38_raw_stream_file_is_owner_only() {
 // ---- 集計器の直接テスト（`python3 -I scripts/sandbox_deny_report.py`） ----
 
 fn run_report(dir: &Path, stream: &Path, meta: Option<&str>, start: &str, stop: &str) -> Out {
+    // 記録の exit_code と同じ値を「実際の終了コード」として渡す（一致するふつうの実行）
+    let actual = meta
+        .and_then(|m| m.split("\"exit_code\":").nth(1))
+        .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+        .unwrap_or("0")
+        .to_string();
+    run_report_with_actual(dir, stream, meta, start, stop, &actual)
+}
+
+fn run_report_with_actual(
+    dir: &Path,
+    stream: &Path,
+    meta: Option<&str>,
+    start: &str,
+    stop: &str,
+    actual_exit: &str,
+) -> Out {
     let meta_path = dir.join("run.meta.json");
     let _ = fs::remove_file(&meta_path);
     if let Some(m) = meta {
@@ -585,6 +603,7 @@ fn run_report(dir: &Path, stream: &Path, meta: Option<&str>, start: &str, stop: 
             "--monitor-stopped-utc",
             stop,
         ])
+        .args(["--run-exit-code", actual_exit])
         .arg("--report-out")
         .arg(dir.join("report.json"))
         .stdin(Stdio::null())
@@ -731,4 +750,80 @@ fn req39_report_records_are_capped_but_counts_are_exact() {
     let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
     assert!(report.contains("\"network_denials_truncated\": true"));
     assert_eq!(report.matches("\"attribution\"").count(), 1000);
+}
+
+/// 記録（run.meta.json）の exit_code と実行スクリプトの実際の終了コードが食い違う場合は、
+/// 拒否 0 件でも判定不能(70)にする（完走の誤認を防ぐ。fail-closed）。
+#[test]
+fn req38_report_run_exit_code_mismatch_is_undeterminable() {
+    let e = Env::new();
+    let o = run_report_with_actual(
+        &e.dir,
+        &fixture("clean.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+        "70",
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "\"network_verdict\": \"undeterminable\"");
+    has(
+        &o,
+        "run record exit_code does not match the actual exit status",
+    );
+    let ok = run_report_with_actual(
+        &e.dir,
+        &fixture("clean.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+        "0",
+    );
+    assert_eq!(ok.code, Some(0), "{}", ok.stdout);
+}
+
+/// 本ツール起因の判定はマスキング前の生のプロセス名と PID で行い、出力は `attribution` と
+/// 固定語彙だけ。許可リスト内の名前・PID 一致なら judged_fail(10)、生の名前は出力しない語彙
+/// （`other`）へ丸めた後でも判定は変わらない。
+#[test]
+fn req38_attribution_uses_raw_name_before_masking() {
+    let e = Env::new();
+    let stream = e.dir.join("attr.ndjson");
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let body = "{\"eventMessage\":\"Sandbox: fandhe-edge(4242) deny(1) network-outbound 10.0.0.9:1\"}\n\
+                {\"eventMessage\":\"Sandbox: PrivateAppName(4243) deny(1) network-outbound 10.0.0.9:1\"}\n";
+    fs::write(&stream, format!("{header}\n{body}")).expect("write");
+    let o = run_report(
+        &e.dir,
+        &stream,
+        Some(&meta_with_pids(0, T1, T2, "[4242, 4243]")),
+        T0,
+        T3,
+    );
+    // 許可リスト外の名前は PID が一致しても本ツール起因とみなさない
+    assert_eq!(o.code, Some(10), "{}", o.stdout);
+    has(&o, "\"tool_network_deny_events\": 1");
+    has(&o, "\"unattributed_network_deny_events\": 1");
+    let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
+    assert!(report.contains("\"attribution\": \"tool\""), "{report}");
+    assert!(!report.contains("PrivateAppName"));
+}
+
+/// `log` の stderr が上限（64 KiB）を超えて書かれても、書き込み時点で打ち切られ、
+/// 監視は判定不能(70)になる（無制限の追記を許さない。REQ-39）。
+#[test]
+fn req39_log_stderr_is_capped_at_write_time() {
+    let e = Env::new();
+    let o = e.run(
+        "clean.ndjson",
+        &e.base_args(),
+        &[("FAKE_LOG_MODE", "flood_err")],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    let size = fs::metadata(e.out().join("log_stream.stderr.log"))
+        .expect("stat")
+        .len();
+    assert!(size <= 65_537, "stderr file grew to {size}");
+    assert!(size > 0);
 }

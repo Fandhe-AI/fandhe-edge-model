@@ -67,6 +67,8 @@ DEFAULT_LOG_CMD=/usr/bin/log
 PREDICATE='process == "kernel" AND eventMessage CONTAINS "deny"'
 # 生ログの容量上限（sandbox_deny_report.py の MAX_STREAM_BYTES と揃える）
 MAX_STREAM_BYTES=268435456
+# `log` の stderr の容量上限（超過は判定不能。REQ-39）
+MAX_STREAM_ERR_BYTES=65536
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 # 固定メッセージの JSON を 1 行出して終了する。$1=終了コード $2=code 名 $3=固定メッセージ
@@ -246,8 +248,12 @@ trap 'exit 70' TERM INT HUP
 monitor_started=$(utc_now)
 set -m
 (
-    exec "$log_cmd" stream --style ndjson --predicate "$PREDICATE" \
-        </dev/null >"$stream_file" 2>"$stream_err"
+    # stdout・stderr とも head -c で書き込み時点に上限 +1 バイトで打ち切る（REQ-39。
+    # sandbox-run.sh・cli-infer-noninteractive.sh と同じ方式）。head も同じグループ。
+    # 上限に達すると head が終了して log は書き込み失敗で止まり、超過は下の検査で判定不能になる
+    exec "$log_cmd" stream --style ndjson --predicate "$PREDICATE" </dev/null \
+        > >(head -c $((MAX_STREAM_BYTES + 1)) >"$stream_file") \
+        2> >(head -c $((MAX_STREAM_ERR_BYTES + 1)) >"$stream_err")
 ) </dev/null >/dev/null 2>&1 &
 logpid=$!
 # 監視役（独立グループ）: 本スクリプトが突然死しても log を KILL し、容量超過でも KILL する
@@ -255,7 +261,8 @@ wrapper_pid=$$
 (
     while kill -0 "$wrapper_pid" 2>/dev/null; do
         _sz=$(wc -c <"$stream_file" 2>/dev/null || echo 0)
-        if [ "${_sz:-0}" -gt "$MAX_STREAM_BYTES" ]; then
+        _esz=$(wc -c <"$stream_err" 2>/dev/null || echo 0)
+        if [ "${_sz:-0}" -gt "$MAX_STREAM_BYTES" ] || [ "${_esz:-0}" -gt "$MAX_STREAM_ERR_BYTES" ]; then
             kill -s KILL -- "-$logpid" 2>/dev/null || true
         fi
         sleep 1
@@ -321,7 +328,11 @@ set -- --stream "$stream_file" --run-meta "$out_dir/run/run.meta.json" \
     --warmup-secs "$warmup" --tail-secs "$tail_secs" --report-out "$report_file"
 [ "$log_override" = false ] || set -- "$@" --log-override
 [ "$stream_ok" -eq 1 ] || set -- "$@" --stream-died
-[ "${size:-0}" -le "$MAX_STREAM_BYTES" ] || set -- "$@" --stream-overflow
+esize=$(wc -c <"$stream_err" 2>/dev/null || echo 0)
+{ [ "${size:-0}" -le "$MAX_STREAM_BYTES" ] && [ "${esize:-0}" -le "$MAX_STREAM_ERR_BYTES" ]; } \
+    || set -- "$@" --stream-overflow
+# run の実際の終了コードを渡し、集計器が run.meta.json の exit_code と照合する（不一致は判定不能）
+set -- "$@" --run-exit-code "$run_rc"
 rep_rc=0
 rep_out=$(python3 -I "$report_script" "$@" </dev/null 2>/dev/null) || rep_rc=$?
 

@@ -236,6 +236,26 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 70' TERM INT HUP
 
+# 工程グループ（pgid = $child）に属するプロセスの PID を run_pids へ集める。拒否ログ
+# （sandbox-monitor.sh・sandbox_deny_report.py）が「本ツール起因」を PID で照合するための
+# 記録で、run.meta.json の process_pids に書く（REQ-38・TASK-38.1-2）。ps の一覧取得は
+# ポーリング間隔（0.1 秒）ごとで、それより短命なプロセスは記録できない（その拒否は
+# 帰属不明として pending になる。過大に本ツール起因と断定しない側）。上限 MAX_RUN_PIDS 件。
+run_pids=
+run_pid_n=0
+MAX_RUN_PIDS=4096
+sample_pids() {
+    [ "$run_pid_n" -lt "$MAX_RUN_PIDS" ] || return 0
+    _new=$(ps -A -o pid= -o pgid= 2>/dev/null | awk -v g="$child" -v seen="$run_pids" '
+        BEGIN { n = split(seen, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 }
+        $1 ~ /^[0-9]+$/ && $2 == g && !($1 in s) { s[$1] = 1; printf "%s ", $1 }') || return 0
+    for _p in $_new; do
+        [ "$run_pid_n" -lt "$MAX_RUN_PIDS" ] || break
+        run_pids="$run_pids$_p "
+        run_pid_n=$((run_pid_n + 1))
+    done
+}
+
 # 工程グループに生存プロセスが残っているか。0=生存 1=なし 2=一覧取得失敗（生存不明）
 group_alive() {
     _ps=$(ps -A -o pgid= -o stat= 2>/dev/null) || return 2
@@ -302,6 +322,7 @@ run_step() {
 
     limit_kind=
     while :; do
+        sample_pids
         if [ -e "$rcf" ]; then
             alive=0
             group_alive || alive=$?
@@ -459,8 +480,10 @@ launcher_label=$DEFAULT_LAUNCHER
 [ "$override" = false ] || launcher_label=override
 [ "$override" = false ] || hint=test_harness
 
-if ! printf '{"started_utc":"%s","ended_utc":"%s","exit_code":%s,"failed_step":%s,"sandbox_exec":"%s","sandbox_profile":"%s","sandbox_exec_override":%s,"evidence_hint":"%s","steps":[%s]}\n' \
-    "$started" "$ended" "$final_rc" "$failed_step" "$launcher_label" "$PROFILE" "$override" "$hint" "$steps_meta" \
+pids_json=
+for _p in $run_pids; do pids_json="${pids_json:+$pids_json,}$_p"; done
+if ! printf '{"started_utc":"%s","ended_utc":"%s","exit_code":%s,"failed_step":%s,"sandbox_exec":"%s","sandbox_profile":"%s","sandbox_exec_override":%s,"evidence_hint":"%s","process_pids":[%s],"steps":[%s]}\n' \
+    "$started" "$ended" "$final_rc" "$failed_step" "$launcher_label" "$PROFILE" "$override" "$hint" "$pids_json" "$steps_meta" \
     >"$out_dir/run.meta.json" 2>/dev/null; then
     # 記録の書き込み失敗も契約どおりの JSON（runtime_error・exit 70）で返す
     fail 70 runtime_error "cannot write run record"

@@ -81,6 +81,7 @@ impl Env {
                  prev=$a\n\
                  done\n\
                  echo \"$stage $cand\" >> \"{}\"\n\
+                 [ -z \"${{FAKE_SLEEP_SECS:-}}\" ] || sleep \"$FAKE_SLEEP_SECS\"\n\
                  if [ \"${{FAKE_HANG_STAGE:-}}\" = \"$stage\" ]; then\n\
                  case \"${{FAKE_HANG_KIND:-sleep}}\" in\n\
                  yes) exec yes ;;\n\
@@ -657,5 +658,24 @@ fn req33_zero_exit_with_invalid_stage_output_stops_with_70() {
             o.stdout
         );
         assert_eq!(e.cli_calls().len(), 1, "out={out:?}");
+    }
+}
+
+/// run.meta.json の `process_pids` に、工程グループのプロセスの PID（数値の配列）を記録する。
+/// 拒否ログの帰属判定（`sandbox_deny_report.py`）が PID で本ツール起因を照合するための記録
+/// （REQ-38・TASK-38.1-2）。工程が 0.1 秒のポーリングより長く動く場合に少なくとも 1 件入る。
+#[test]
+fn req38_run_meta_records_process_pids_of_step_group() {
+    let e = Env::new();
+    let o = e.run(&e.base_args(), &[("FAKE_SLEEP_SECS", "1")]);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    let meta = fs::read_to_string(e.out().join("run.meta.json")).expect("meta");
+    let start =
+        meta.find("\"process_pids\":[").expect("process_pids key") + "\"process_pids\":[".len();
+    let end = start + meta[start..].find(']').expect("closing bracket");
+    let pids: Vec<&str> = meta[start..end].split(',').collect();
+    assert!(!pids.is_empty() && !pids[0].is_empty(), "{meta}");
+    for p in pids {
+        assert!(p.parse::<u32>().is_ok(), "non-numeric pid {p:?} in {meta}");
     }
 }

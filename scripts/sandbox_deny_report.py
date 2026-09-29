@@ -20,12 +20,15 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
 出力: stdout に JSON 1 行（REQ-33。固定の文字列と件数だけ。利用者の値は出さない）、
 `--report-out` に詳細レポート。終了コードは 7 種（0・10・11・12・20・64・70。REQ-21）。
 
-帰属（本ツール起因か）: プロセス名だけでは断定しない（無関係な python3・sh の拒否で誤って
-judged_fail にしないため）。`run.meta.json` の任意キー `process_pids`（本ツールが起動した
-プロセスの PID の配列）に PID が含まれ、かつ名前が許可リストにある場合だけ tool とする。
-`process_pids` が無い・照合できない場合は帰属不明（unattributed）で、判定は pending(12)
-（現状の `sandbox-run.sh` は PID を記録しないため、通信拒否があれば常に 12 になる。
-PID 記録は将来仕様。REQ-38・TASK-38.2 で扱う）。
+帰属（本ツール起因か）の根拠: 拒否行 `Sandbox: <プロセス名>(<pid>) deny(...)` の**マスキング前の
+生のプロセス名**が許可リスト（TOOL_PROCESSES）にあり、かつその PID が `run.meta.json` の
+`process_pids`（`sandbox-run.sh` が工程のプロセスグループから 0.1 秒間隔で採取した PID）に
+含まれる場合だけ tool とする。名前だけでは断定しない（無関係な python3・sh の拒否で誤って
+judged_fail にしないため）。PID が採取できなかった短命プロセスの拒否は帰属不明（unattributed）で
+pending(12)（過大に本ツール起因と断定しない側）。判定はマスキングの前に行い、出力へ出すのは
+判定結果（`attribution`）と固定語彙だけで、生のプロセス名は出さない。
+実ログの形式: 上の形式は PoC-16 で観測した macOS の `log stream` の出力に基づく。本リポの
+fixture は合成データで、実機の出力そのものではない（証拠種別: テストハーネス）。
 
 件数の意味: `network_deny_events` 等の通信拒否件数は**拒否の発生回数**。元の 1 行は 1 回、
 `N duplicate reports for` の要約行は、同一イベント（`event_key`）の元の行が先にあれば N 回、
@@ -149,6 +152,17 @@ def load_run_meta(path: str) -> dict:
     ):
         raise Undeterminable("run record process_pids is invalid")
     return meta
+
+
+def reconcile_run_exit(recorded: int, actual: int) -> int:
+    """run.meta.json の exit_code と実行スクリプトの実際の終了コードを照合する（唯一の規則）。
+
+    一致しなければ、記録後に実行スクリプトが異常終了した等で完走を誤認しうるため
+    判定不能（fail-closed）にする。
+    """
+    if recorded != actual:
+        raise Undeterminable("run record exit_code does not match the actual exit status")
+    return recorded
 
 
 def target_digest(salt: bytes, text: str) -> str:
@@ -347,7 +361,7 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
     hint = "requires_human_review"
     try:
         meta = load_run_meta(args.run_meta)
-        run_exit = meta["exit_code"]
+        run_exit = reconcile_run_exit(meta["exit_code"], args.run_exit_code)
         if meta["sandbox_exec_override"] or args.log_override:
             hint = "test_harness"
         if args.warmup_secs != 3 or args.tail_secs != 60:
@@ -426,6 +440,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--log-override", action="store_true")
     p.add_argument("--stream-overflow", action="store_true")
     p.add_argument("--stream-died", action="store_true")
+    p.add_argument("--run-exit-code", type=int, required=True)
     p.add_argument("--report-out", required=True)
     # argparse 既定のエラーは不正な値を stderr へ複写するため、固定の出力に置き換える
     p.error = lambda _message: (_ for _ in ()).throw(SystemExit(2))  # type: ignore[method-assign]
