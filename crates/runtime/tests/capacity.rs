@@ -94,6 +94,20 @@ fn req30_duplicate_path_and_empty_are_rejected() {
     ));
 }
 
+/// 別表記（`./a`・`sub/../a`）の同一ファイルも二重計上せず DuplicatePath にする。
+#[test]
+fn req30_alias_spelling_of_same_file_is_duplicate() {
+    let d = TempDir::new("alias");
+    let p = write(d.path(), "a", 1);
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let alias = d.path().join("sub").join("..").join("a");
+    let r = measure_package(&[
+        pf(PackageComponent::Weights, p),
+        pf(PackageComponent::Metadata, alias),
+    ]);
+    assert!(matches!(r, Err(CapacityError::DuplicatePath { .. })));
+}
+
 #[cfg(unix)]
 #[test]
 fn req30_symlink_is_rejected() {

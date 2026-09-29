@@ -21,7 +21,7 @@
 use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
 use std::collections::HashSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// パッケージの構成要素（REQ-30 の内訳 5 種）。宣言順が内訳の並び順になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,7 +97,8 @@ pub struct CapacityBreakdown {
 pub enum CapacityError {
     /// 計測対象が 1 件も無い。
     EmptyPackage,
-    /// 同じパスが複数回渡された（二重計上の防止。ハードリンク等の別名は検出しない）。
+    /// 同じファイルが複数回渡された（正規化パスで判定し、`a` と `./a` の別表記も検出する。
+    /// ハードリンクの別名は検出しない）。
     DuplicatePath { path: PathBuf },
     /// 構成要素が symlink だった。
     SymlinkRejected { path: PathBuf },
@@ -207,14 +208,9 @@ pub struct PackageFile {
 /// symlink 確認から開くまでの差し替え（TOCTOU）は残るが、`open_regular_file_for_read` が
 /// 開いた後に種別を再確認し、FIFO 等で停止しない。
 pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, CapacityError> {
-    let mut seen: HashSet<&Path> = HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut sizes = Vec::with_capacity(files.len());
     for f in files {
-        if !seen.insert(f.path.as_path()) {
-            return Err(CapacityError::DuplicatePath {
-                path: f.path.clone(),
-            });
-        }
         let read_err = |source| {
             CapacityError::File(FsError::Read {
                 path: f.path.clone(),
@@ -224,6 +220,14 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
         let meta = std::fs::symlink_metadata(&f.path).map_err(read_err)?;
         if meta.file_type().is_symlink() {
             return Err(CapacityError::SymlinkRejected {
+                path: f.path.clone(),
+            });
+        }
+        // `a.onnx` と `./a.onnx` のような別表記の同一ファイルも重複として検出するため、
+        // 正規化（親ディレクトリの symlink 解決を含む）した絶対パスで判定する。
+        let canonical = std::fs::canonicalize(&f.path).map_err(read_err)?;
+        if !seen.insert(canonical) {
+            return Err(CapacityError::DuplicatePath {
                 path: f.path.clone(),
             });
         }
