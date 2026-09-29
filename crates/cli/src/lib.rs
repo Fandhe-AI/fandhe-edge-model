@@ -5,20 +5,21 @@
 //! ハーネスから直接呼べるようにする（`main.rs` の `[[bin]]` は
 //! `CARGO_BIN_EXE_fandhe-edge` としてしか結合テストから叩けないため）。
 //!
-//! # 現状（TASK-21.1-2・TASK-21.2）
+//! # 現状（TASK-21.1-2・TASK-21.2・TASK-33.1-1）
 //!
-//! [`output`] モジュールに、`fandhe-edge-core` の
-//! `judgment::JudgmentResult` を JSON 1 行として書き出す
-//! [`output::write_ok_judgment`]（TASK-21.1-2）と、`ErrorReport` を JSON 1
-//! 行として書き出す [`output::write_error_report`]・各層のエラー型を
-//! `ErrorReport` へ変換する薄い関数（`infer_input_error_report`・
-//! `judgment_error_report`・`definition_error_report`。TASK-21.2）を実装
-//! 済み。CLI バイナリ（`src/main.rs`）の 7 工程ディスパッチ（`register →
-//! inspect → train → evaluate → select → package → infer`）への実配線・
-//! 推論入力の受け取り（`--text`／`--input-file` の引数解析）は TASK-33.1、
-//! stdout・stderr・終了コードの入出力契約全体の統合は TASK-33.2 の対象
-//! で、いずれも本 crate ではまだ行っていない。`main.rs` は引き続き exit
-//! 70・stdout 空のスタブ契約のまま（`.claude/rules/coding-rust.md`「操作
-//! アダプターは薄く保つ」）。
+//! [`output`] は `JudgmentResult` / `ErrorReport` を JSON 1 行として書き出す
+//! （TASK-21.1-2・TASK-21.2）。[`args`] は 7 工程サブコマンドの引数定義と
+//! パーサ・help 生成（TASK-33.1-1）。各工程の下位層への接続と完走は
+//! TASK-33.1-2（#136）、入出力契約全体の統合は TASK-33.2 の対象で、
+//! `main.rs` は解析成功後も工程を実行せず `runtime_error` を返す。
+//!
+//! TASK-33.2-2（#139）で、`package` の結果を stdout の JSON 1 つへ写す
+//! [`stage_output`] と、stderr へテキストログを出す [`log`] を追加した。
+//! stdout（結果 JSON）と stderr（ログ）は別の書き込み先として扱う。`package` の
+//! 実処理への接続は #136 の範囲で、現状はテストハーネスでのみ確認している。
 
+pub mod args;
+pub mod error_report;
+pub mod log;
 pub mod output;
+pub mod stage_output;
