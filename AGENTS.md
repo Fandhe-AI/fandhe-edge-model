@@ -49,7 +49,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
 - `crates/train/tests/real_trainer.rs` は実 `trainer/`（MLX・C1/C3・ONNX 書き出し）を Rust の `run_train` から起動して学習ジョブを完走させる（REQ-18/19/34/39。証拠種別: テストハーネス・合成データ・CPU）。`make py-sync` 済みの `trainer/.venv` と MLX CPU が必要で、`rust-ci` の 3 OS runner には無いため `#[ignore]` で既定の `make test` から分離している
-- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 2 件を実行し、出力の `2 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
+- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 2 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
 - `rust-ci` では `ignored` と報告され、Windows は `#![cfg(unix)]` で対象外（`run_train` が `UnsupportedPlatform`）
 
 ### 学習ワーカーの起動契約（Issue #12）
