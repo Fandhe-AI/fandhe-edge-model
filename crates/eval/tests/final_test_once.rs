@@ -10,8 +10,8 @@ use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::freeze_eval_data;
 use fandhe_edge_eval::eval_data_invariance::{EvalDataInvarianceError, FrozenEvalData};
 use fandhe_edge_eval::final_test_once::{
-    AcquireError, AppliedBy, ApplyOnceError, FinalTestLedger, RegisteredConfig,
-    RepresentativeConfigId, apply_once,
+    AcquireError, AppliedBy, AppliedOnce, ApplyOnceError, FinalTestLedger, LabeledInput,
+    RegisteredConfig, RepresentativeConfigId, apply_once,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
 use std::cell::Cell;
@@ -90,8 +90,22 @@ impl Model {
 
 const DATA: &[u8] = b"A\nA\nB\n";
 
-type Outcome =
-    Result<(), EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<String>>>>;
+type Outcome = Result<
+    AppliedOnce<()>,
+    EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<String>>>,
+>;
+
+/// 評価データを 1 行 1 件として分解する: `input` は行そのもの、正解は `gold-<行>`。
+fn dec(bytes: &[u8]) -> Result<Vec<LabeledInput>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "not utf-8".to_string())?;
+    Ok(text
+        .lines()
+        .map(|l| LabeledInput {
+            input: l.to_string(),
+            gold: format!("gold-{l}"),
+        })
+        .collect())
+}
 
 fn id(raw: &str) -> RepresentativeConfigId {
     RepresentativeConfigId::parse(raw).unwrap()
@@ -132,7 +146,8 @@ fn run(
         &frozen,
         id(config),
         &model.paths(),
-        |_t, _bytes, _paths| {
+        dec,
+        |_t, _inputs, _paths| {
             calls.set(calls.get() + 1);
             Ok::<_, String>(())
         },
@@ -204,6 +219,7 @@ fn req27_concurrent_apply_exactly_one_wins() {
                         &frozen,
                         id("c1:seed0"),
                         &m.paths(),
+                        dec,
                         |_t, _b, _p| {
                             hits.fetch_add(1, Ordering::SeqCst);
                             Ok::<_, String>(())
@@ -239,6 +255,7 @@ fn req27_prediction_error_still_consumes_application() {
         &frozen,
         id("c1:seed0"),
         &m.paths(),
+        dec,
         |_t, _b, _p| Err::<(), _>("boom".to_string()),
     );
     assert!(matches!(
@@ -292,6 +309,7 @@ fn req27_frozen_hash_mismatch_does_not_consume_application() {
             &frozen,
             id("c1:seed0"),
             &m.paths(),
+            dec,
             |_t, _b, _p| {
                 hits.set(hits.get() + 1);
                 Ok::<_, String>(())
@@ -338,6 +356,7 @@ fn req27_cannot_bypass_lock_with_different_digest() {
         &frozen,
         id("c1:seed0"),
         &m.paths(),
+        dec,
         |_t, _b, _p| {
             hits.set(hits.get() + 1);
             Ok::<_, String>(())
@@ -484,11 +503,18 @@ fn req27_model_mutation_during_prediction_is_rejected() {
         byte_len: record.byte_len(),
     };
     let m = Model::new(b"w1", None);
-    let r = apply_once(&ledger, &frozen, id("c1:seed0"), &m.paths(), |_t, _b, p| {
-        assert_eq!(p.weights, m.weights.as_path());
-        fs::write(p.weights, b"swapped").unwrap();
-        Ok::<_, String>(())
-    });
+    let r = apply_once(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &m.paths(),
+        dec,
+        |_t, _b, p| {
+            assert_eq!(p.weights, m.weights.as_path());
+            fs::write(p.weights, b"swapped").unwrap();
+            Ok::<_, String>(())
+        },
+    );
     assert!(matches!(
         r,
         Err(EvalDataInvarianceError::Evaluation(
@@ -604,10 +630,16 @@ fn req27_record_contains_digests_and_id_only() {
         byte_len: record.byte_len(),
     };
     let m = Model::new(b"w1", None);
-    let lock_path = apply_once(&ledger, &frozen, id("c1:seed0"), &m.paths(), |t, _b, _p| {
-        Ok::<_, String>(t.config_lock_path().to_path_buf())
-    })
-    .unwrap();
+    let lock_path = apply_once(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &m.paths(),
+        dec,
+        |t, _b, _p| Ok::<_, String>(t.config_lock_path().to_path_buf()),
+    )
+    .unwrap()
+    .output;
     let body = fs::read_to_string(&lock_path).unwrap();
     assert!(body.starts_with("fandhe-edge-final-test-application v1\nlock=config\n"));
     assert!(body.contains(&format!(
@@ -799,4 +831,75 @@ fn req27_from_package_binds_all_components() {
         .unwrap();
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "a", &model, &calls).is_ok());
+}
+
+/// REQ-27: 予測関数へは各件の `input` だけが渡り、正解ラベルは評価器側が返す。
+#[test]
+fn req27_predict_receives_inputs_only_and_golds_stay_with_evaluator() {
+    let dir = TempDir::new("ledger");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let m = Model::new(b"w1", None);
+    let data_dir = TempDir::new("data");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let record = freeze_eval_data(DATA).unwrap();
+    let frozen = FrozenEvalData {
+        path: &path,
+        sha256: record.sha256(),
+        byte_len: record.byte_len(),
+    };
+    let r = apply_once(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &m.paths(),
+        dec,
+        |_t, inputs, _p| Ok::<_, String>(inputs.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+    )
+    .unwrap();
+    assert_eq!(r.output, vec!["A", "A", "B"]);
+    assert_eq!(r.golds, vec!["gold-A", "gold-A", "gold-B"]);
+    assert!(r.output.iter().all(|i| !i.contains("gold-")));
+}
+
+/// REQ-27: 分解に失敗しても適用は消費されず、予測は呼ばれない。
+#[test]
+fn req27_decode_failure_does_not_consume_application() {
+    let dir = TempDir::new("ledger");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let m = Model::new(b"w1", None);
+    let data_dir = TempDir::new("data");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let record = freeze_eval_data(DATA).unwrap();
+    let frozen = FrozenEvalData {
+        path: &path,
+        sha256: record.sha256(),
+        byte_len: record.byte_len(),
+    };
+    let calls = Cell::new(0u32);
+    let r = apply_once(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &m.paths(),
+        |_b| Err("bad format".to_string()),
+        |_t, _i, _p| {
+            calls.set(calls.get() + 1);
+            Ok::<_, String>(())
+        },
+    );
+    assert!(matches!(
+        r,
+        Err(EvalDataInvarianceError::Evaluation(
+            EvaluationInvarianceError::Evaluation(ApplyOnceError::Decode { .. })
+        ))
+    ));
+    assert_eq!(calls.get(), 0);
+    // ロックが残っていないので、正しい分解での適用は 1 回成功する。
+    let ok = run(&ledger, DATA, "c1:seed0", &m, &calls);
+    assert!(ok.is_ok());
+    assert_eq!(calls.get(), 1);
 }

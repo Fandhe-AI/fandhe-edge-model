@@ -33,6 +33,10 @@
 //!   追加できない。PoC-10 の `APPLIED.json` 事前登録に相当）。登録後は集合を変更できない
 //!   （`create_new`）。
 //!
+//! - **推論への入力**: 照合済みの評価データ本体は評価器側の `decode` で `input` と
+//!   正解に分け、`predict` へは `input` の列だけを渡す（REQ-27）。正解・評価データ
+//!   本体は予測側から見えず、正解は [`AppliedOnce::golds`] として評価器側へ返す。
+//!
 //! # 順序の不変条件
 //!
 //! 1. 凍結記録との照合（`evaluate_with_eval_data_invariance`）が通ってから
@@ -455,6 +459,12 @@ impl std::error::Error for AcquireError {}
 pub enum ApplyOnceError<E> {
     /// ロック取得に失敗（予測は呼ばれていない）。
     Acquire(AcquireError),
+    /// 評価データの分解に失敗した（予測は呼ばれておらず、ロックも作られていない）。
+    /// `reason` に評価データの本文は含めない（英語の固定文言。REQ-39）。
+    Decode {
+        /// 失敗理由（本文を含まない）。
+        reason: String,
+    },
     /// 予測クロージャが失敗した。ロックは残るため再試行は拒否される。
     Prediction(E),
 }
@@ -463,6 +473,9 @@ impl<E: fmt::Display> fmt::Display for ApplyOnceError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApplyOnceError::Acquire(e) => write!(f, "{e}"),
+            ApplyOnceError::Decode { reason } => {
+                write!(f, "failed to decode eval data: {reason}")
+            }
             ApplyOnceError::Prediction(e) => write!(f, "prediction failed: {e}"),
         }
     }
@@ -601,9 +614,30 @@ impl FinalTestLedger {
     }
 }
 
+/// 評価データ 1 件を評価器側で `input` と正解に分けた所有値（REQ-27）。
+///
+/// 分解は呼び出し側の `decode`（CLI の `evaluate` 配線。issue #140）が行い、
+/// `gold` は評価器側にのみ残して予測関数へは渡さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledInput {
+    /// 推論関数へ渡す入力。
+    pub input: String,
+    /// 正解ラベル（評価器側でのみ保持し、推論側へは渡さない）。
+    pub gold: String,
+}
+
+/// [`apply_once`] の成功値。予測結果と、評価器側に残した正解ラベル（レコード順）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedOnce<T> {
+    /// 予測クロージャの戻り値（`inputs` と同順であること）。
+    pub output: T,
+    /// 各レコードの正解ラベル（レコード順。指標計算は評価器側で行う）。
+    pub golds: Vec<String>,
+}
+
 /// [`apply_once`] の戻り値。外側が評価データ、内側がモデルの不変性検証。
 pub type ApplyOnceResult<T, E> =
-    Result<T, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
+    Result<AppliedOnce<T>, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
 
 /// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を 1 行ずつ）。
 fn registry_body(entries: &[RegisteredConfig]) -> String {
@@ -732,15 +766,19 @@ impl FinalTestLedger {
 /// - `model` の重みファイルは本関数が自らハッシュしてキーにし、`predict` へは同じ
 ///   `model` を渡す。評価前後のモデル不変性も本関数が検証する（REQ-27）。
 /// - `config_id` は [`FinalTestLedger::register_configs`] で事前登録済みの ID に限る。
-/// - `predict` には適用権・照合済み評価データ本体・`model` を渡す（推論関数へ渡す
-///   情報の絞り込みは TASK-27.2 の責務）。`predict` は渡された `model` のパスから
-///   モデルを読むこと。ロックは `model` の重みに対して消費される。
+/// - `decode` は照合済みの評価データ本体を [`LabeledInput`] の列へ分ける（評価器側の責務）。
+///   失敗時はロックを作らず、適用を消費しない。
+/// - `predict` には適用権・各レコードの `input` のみ・`model` を渡す。正解ラベルと評価データ
+///   本体は渡さない（REQ-27「推論関数には `input` だけを渡す」）。`predict` は渡された
+///   `model` のパスからモデルを読むこと。ロックは `model` の重みに対して消費される。
+///   正解ラベルは戻り値の [`AppliedOnce::golds`] として評価器側へ返す。
 pub fn apply_once<T, E>(
     ledger: &FinalTestLedger,
     frozen: &FrozenEvalData<'_>,
     config_id: RepresentativeConfigId,
     model: &ModelPackagePaths<'_>,
-    predict: impl FnOnce(ApplicationTicket, &[u8], &ModelPackagePaths<'_>) -> Result<T, E>,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, String>,
+    predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
 ) -> ApplyOnceResult<T, E> {
     evaluate_with_eval_data_invariance(frozen, |bytes| {
         // ここに来た時点で bytes の sha256 == frozen.sha256（照合済み）。
@@ -770,9 +808,15 @@ pub fn apply_once<T, E>(
                     ));
                 }
             }
+            // 分解はロック取得前に行い、失敗しても適用を消費しない。
+            let records = decode(bytes).map_err(|reason| ApplyOnceError::Decode { reason })?;
+            let (inputs, golds): (Vec<String>, Vec<String>) =
+                records.into_iter().map(|r| (r.input, r.gold)).unzip();
+            let input_refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
             let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
-            predict(ticket, bytes, paths).map_err(ApplyOnceError::Prediction)
+            let output = predict(ticket, &input_refs, paths).map_err(ApplyOnceError::Prediction)?;
+            Ok(AppliedOnce { output, golds })
         })
     })
 }
