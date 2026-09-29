@@ -7,12 +7,13 @@
 # crates/cli/tests/bash_noninteractive.rs（結合テスト）。
 #
 # 契約:
-#   - 引数はすべて `fandhe-edge infer` へそのまま渡す（"$@" のみ。eval しない）
+#   - 引数はすべて `fandhe-edge infer` へそのまま渡す（${1+"$@"} のみ。eval しない）
 #   - stdin は /dev/null に閉じ、入力待ちを作らない（非対話の要点）
 #   - stdout は CLI の出力を無加工で中継する（1 呼び出し 1 JSON。REQ-33）
 #   - stderr は CLI の stderr に続けて診断 `exit_code=<N>` を 1 行だけ出す
 #     （引数値・入力テキストは出さない）
-#   - 終了コードは CLI のものをそのまま返す。バイナリが無ければ 70
+#   - 終了コードは CLI のものをそのまま返す。バイナリが無ければ
+#     runtime_error の JSON を stdout に出して 70
 #
 # バイナリ: 環境変数 FANDHE_EDGE_BIN、無ければ
 #   ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge
@@ -30,11 +31,15 @@ else
 fi
 
 if [ ! -x "$bin" ]; then
-    echo "fandhe-edge binary not found or not executable" >&2
+    # 契約（stdout 1 JSON・stderr に exit_code）を欠けさせず runtime_error を返す
+    echo "fandhe-edge: binary not found or not executable" >&2
+    printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge binary not found or not executable"}'
+    echo "exit_code=70" >&2
     exit 70
 fi
 
-if "$bin" infer "$@" </dev/null; then
+# ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
+if "$bin" infer ${1+"$@"} </dev/null; then
     rc=0
 else
     rc=$?
