@@ -4,7 +4,8 @@
 //! # 呼び出し文脈
 //!
 //! 呼び出し元は CLI の `infer` サブコマンド（TASK-33.1。現状は未配線。
-//! `main.rs` は依然として引数を読まず exit 70 を返すスタブのまま）。配線後
+//! `main.rs` は引数解析までで、解析成功後は工程を実行せず未実装の
+//! `ErrorReport` を書いて exit 70 を返す）。配線後
 //! は `std::io::stdout().lock()` を渡し、戻り値の [`ExitCode`] を
 //! `main` の戻り値としてそのまま使う想定。`--input-file` 経由の一括推論
 //! （evaluation-contract.md が認める「1 行 1 JSON」の例外）でも、入力 1 件
