@@ -264,6 +264,10 @@ pub enum ArgsError {
     IncompatibleOption {
         option: &'static str,
     },
+    /// パス値（`PATH` / `DIR`）が空文字列。空の `PathBuf` を後段へ渡さない。
+    EmptyValue {
+        option: &'static str,
+    },
     NonUtf8Argument,
 }
 
@@ -311,6 +315,9 @@ impl fmt::Display for ArgsError {
                     f,
                     "option {option} cannot be used with the chosen input source"
                 )
+            }
+            ArgsError::EmptyValue { option } => {
+                write!(f, "option {option} requires a non-empty value")
             }
             ArgsError::NonUtf8Argument => f.write_str("argument is not valid UTF-8"),
         }
@@ -378,6 +385,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
         } else {
             OsString::new()
         };
+        if matches!(spec.value, Some("PATH" | "DIR")) && value.is_empty() {
+            return Err(ArgsError::EmptyValue { option: spec.name });
+        }
         values.push((spec.name, value));
     }
 
@@ -418,14 +428,26 @@ fn split_option(tok: &OsString, sub: Subcommand) -> Result<(String, Option<OsStr
     }
     #[cfg(not(unix))]
     {
-        let s = tok.to_str().ok_or(ArgsError::NonUtf8Argument)?;
-        if !s.starts_with("--") {
-            return Err(ArgsError::UnexpectedPositional { subcommand: sub });
+        // UTF-16 単位で `=` を探し、キー部分だけ UTF-8 を要求する。値は
+        // `OsString` のまま保持し、非 UTF-8 のパスを損失なく受理する。
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let wide: Vec<u16> = tok.encode_wide().collect();
+        let dashes = [u16::from(b'-'), u16::from(b'-')];
+        if !wide.starts_with(&dashes) {
+            return match tok.to_str() {
+                Some(_) => Err(ArgsError::UnexpectedPositional { subcommand: sub }),
+                None => Err(ArgsError::NonUtf8Argument),
+            };
         }
-        Ok(match s.split_once('=') {
-            Some((k, v)) => (k.to_string(), Some(OsString::from(v))),
-            None => (s.to_string(), None),
-        })
+        let (k, v) = match wide.iter().position(|c| *c == u16::from(b'=')) {
+            Some(i) => (
+                wide.get(..i).unwrap_or_default(),
+                Some(OsString::from_wide(wide.get(i + 1..).unwrap_or_default())),
+            ),
+            None => (wide.as_slice(), None),
+        };
+        let key = String::from_utf16(k).map_err(|_| ArgsError::NonUtf8Argument)?;
+        Ok((key, v))
     }
 }
 
@@ -721,6 +743,18 @@ mod tests {
                 option: "--project-dir"
             }
         );
+        // 空のパス値は invalid_input（空 PathBuf を通さない）。
+        for args in [
+            &["inspect", "--project-dir="][..],
+            &["inspect", "--project-dir", ""][..],
+            &["register", "--definition", "", "--project-dir", "p"][..],
+            &["infer", "--package", "p", "--input-file="][..],
+        ] {
+            assert!(
+                matches!(err(args), ArgsError::EmptyValue { .. }),
+                "{args:?}"
+            );
+        }
         assert_eq!(
             err(&["inspect", "--project-dir", "a", "--project-dir", "b"]),
             ArgsError::DuplicateOption {
