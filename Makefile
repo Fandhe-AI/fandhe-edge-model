@@ -366,20 +366,27 @@ py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲー�
 # REQ-18/19/34/39）。crates/train/tests/real_trainer.rs は #[ignore] で既定の
 # `make test` から分離してあり、ここで --ignored 付きで実行する（python-ci.yml と
 # `make ci` の両方で実行するため、CI を通すための skip ではない）。
-# --exact で列挙したテスト名がずれると 0 件実行で成功してしまうため、出力の
-# 「2 passed」を検査して fail-closed にする（テスト名を変えたらここも更新する）。
+# libtest のテスト名フィルタは 1 回の起動につき 1 つしか渡せないため、テストごとに
+# 個別に起動する。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
+# 一時ファイルへ出力してから表示する。--exact のテスト名がずれると 0 件実行で
+# 成功してしまうため、出力の「1 passed」も検査して fail-closed にする
+# （テスト名を変えたらここも更新する）。
 test-trainer-integration: py-sync ## 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
 	@$(require_uv)
-	@out="$$(mktemp)"; \
-	cargo test -p fandhe-edge-train --test real_trainer -- --ignored --exact \
-		req18_real_trainer_c1_job_completes_with_typed_outcome \
-		req18_real_trainer_c3_job_completes_with_validation_predictions 2>&1 | tee "$$out"; \
-	status=$$?; \
-	if [ "$$status" -eq 0 ] && ! grep -q "test result: ok. 2 passed" "$$out"; then \
-		echo "error: real_trainer の 2 件が実行・成功していません（テスト名の不一致の可能性）" >&2; status=1; \
-	fi; \
-	rm -f "$$out"; exit $$status
+	@out="$$(mktemp)"; overall=0; \
+	for t in req18_real_trainer_c1_job_completes_with_typed_outcome \
+		req18_real_trainer_c3_job_completes_with_validation_predictions; do \
+		cargo test -p fandhe-edge-train --test real_trainer -- --ignored --exact "$$t" >"$$out" 2>&1; \
+		status=$$?; \
+		cat "$$out"; \
+		if [ "$$status" -ne 0 ]; then \
+			echo "error: real_trainer の $$t が失敗しました（終了コード $$status）" >&2; overall=1; \
+		elif ! grep -q "test result: ok. 1 passed" "$$out"; then \
+			echo "error: real_trainer の $$t が実行・成功していません（テスト名の不一致の可能性）" >&2; overall=1; \
+		fi; \
+	done; \
+	rm -f "$$out"; exit $$overall
 else
 	@echo "skip: Cargo.toml / メンバー crate / trainer/pyproject.toml のいずれかが無いため test-trainer-integration をスキップ"
 endif
