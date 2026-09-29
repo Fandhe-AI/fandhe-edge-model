@@ -275,3 +275,93 @@ fn req39_output_over_limit_returns_runtime_error_70() {
     );
     assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
 }
+
+/// stderr が容量上限（64 KiB）を超えた子は終了され、runtime_error(70) の JSON 1 つが
+/// 返ること。stderr へ本文は中継されない（REQ-39・REQ-21）。
+#[test]
+fn req39_stderr_over_limit_returns_runtime_error_70() {
+    let o = run_with_fake_bin("bigerr", "exec yes 1>&2");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge stderr exceeded size limit\"}\n"
+    );
+    assert_eq!(o.stderr, "exit_code=70\n");
+}
+
+/// 許可された終了コードでも、複数 JSON・途中切れの stdout は中継されず
+/// runtime_error(70) の JSON 1 つへ置き換わること（REQ-33）。
+#[test]
+fn req33_invalid_json_stdout_is_replaced_by_runtime_error_json() {
+    let cases = [
+        (
+            "twojson",
+            "echo '{\"code\":\"ok\"}'\necho '{\"code\":\"ok\"}'\nexit 0",
+        ),
+        (
+            "sameline",
+            "echo '{\"code\":\"ok\"}{\"code\":\"ok\"}'\nexit 0",
+        ),
+        (
+            "truncated",
+            "printf '{\"code\":\"ok\",\"message\":\"a'\nexit 0",
+        ),
+        ("notobject", "echo 'hello'\nexit 10"),
+    ];
+    for (name, body) in cases {
+        let o = run_with_fake_bin(name, body);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge produced invalid output\"}\n",
+            "{name}"
+        );
+        assert_eq!(o.stderr.lines().last(), Some("exit_code=70"), "{name}");
+    }
+}
+
+/// 文字列内の括弧・エスケープを含む正しい JSON 1 つは、許可された終了コードのまま中継されること。
+#[test]
+fn req33_valid_json_with_braces_in_strings_is_relayed() {
+    let o = run_with_fake_bin(
+        "validjson",
+        "echo '{\"code\":\"judged_fail\",\"message\":\"a}{ \\\"q\\\" ]\"}'\nexit 10",
+    );
+    assert_eq!(o.code, Some(10));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"judged_fail\",\"message\":\"a}{ \\\"q\\\" ]\"}\n"
+    );
+    assert_eq!(o.stderr, "exit_code=10\n");
+}
+
+/// 先頭 0 の期限指定（08 など）は 8 進数として解釈されず既定値へ戻り、異常終了しないこと。
+#[test]
+fn req39_leading_zero_timeout_falls_back_to_default() {
+    for v in ["08", "09", "00"] {
+        let o = run_with_fake_bin_env(
+            "leadzero",
+            "echo '{\"code\":\"ok\"}'\nexit 0",
+            &[("FANDHE_EDGE_TIMEOUT_SECS", v)],
+        );
+        assert_eq!(o.code, Some(0), "{v}");
+        assert_eq!(o.stdout, "{\"code\":\"ok\"}\n", "{v}");
+        assert_eq!(o.stderr, "exit_code=0\n", "{v}");
+    }
+}
+
+/// 期限超過時は子孫プロセスもプロセスグループごと終了されること（REQ-39）。
+#[test]
+fn req39_timeout_kills_descendants() {
+    let marker = std::env::temp_dir().join(format!("fandhe-desc-{}", std::process::id()));
+    let body = format!(
+        "(sleep 3; echo alive >'{}') &\nexec sleep 60",
+        marker.display()
+    );
+    let o = run_with_fake_bin_env("desc", &body, &[("FANDHE_EDGE_TIMEOUT_SECS", "1")]);
+    assert_eq!(o.code, Some(70));
+    std::thread::sleep(Duration::from_secs(4));
+    let survived = marker.exists();
+    std::fs::remove_file(&marker).ok();
+    assert!(!survived, "descendant survived the timeout");
+}
