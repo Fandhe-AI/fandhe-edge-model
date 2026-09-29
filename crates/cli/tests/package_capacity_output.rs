@@ -9,10 +9,26 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("fandhe-cli-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
+        // 予測可能なパスを削除しない。create_dir は既存パスで失敗するため、
+        // 衝突時は名前を変えて再試行し、自分が作ったものだけを後片付けする。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "fandhe-cli-{tag}-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&p) {
+                Ok(()) => return Self(p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
+        }
+        panic!("could not create a unique temp dir");
     }
     fn path(&self) -> &Path {
         &self.0
@@ -63,4 +79,16 @@ fn req30_duplicate_file_maps_to_invalid_input_without_path() {
     assert_eq!(report.code.code(), 64);
     let dir = d.path().to_string_lossy().into_owned();
     assert!(!report.message.contains(&dir), "{}", report.message);
+}
+
+/// 一時ディレクトリは既存パスを消さずに一意に作る（レビュー指摘 P0・REQ-39 の完全性）。
+#[test]
+fn temp_dir_is_unique_and_never_removes_existing_content() {
+    let a = TempDir::new("uniq");
+    let b = TempDir::new("uniq");
+    assert_ne!(a.path(), b.path());
+    let marker = a.path().join("keep.txt");
+    std::fs::write(&marker, b"x").unwrap();
+    let _c = TempDir::new("uniq");
+    assert_eq!(std::fs::read(&marker).unwrap(), b"x");
 }

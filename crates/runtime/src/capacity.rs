@@ -409,8 +409,29 @@ mod tests {
     /// REQ-30・REQ-39: ハンドル渡しの計測はサイズを集計し、同一ファイルの重複は拒否する。
     #[test]
     fn req30_measure_opened_files_sums_and_rejects_duplicates() {
-        let path = std::env::temp_dir().join(format!("fandhe_cap_opened_{}", std::process::id()));
-        std::fs::write(&path, b"abcd").unwrap();
+        // 予測可能な名前へ上書きしない。一意なディレクトリを排他作成し、その中へ create_new する
+        let dir_path = (0..100)
+            .find_map(|i| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let p = std::env::temp_dir().join(format!(
+                    "fandhe_cap_opened_{}_{nanos}_{i}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&p).ok().map(|()| p)
+            })
+            .expect("unique temp dir");
+        let path = dir_path.join("f.bin");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"abcd").unwrap();
+        }
         let open = || std::fs::File::open(&path).unwrap();
         let one = measure_opened_files(&[(Weights, path.clone(), open())]).unwrap();
         assert_eq!(one.total_bytes(), 4);
@@ -431,6 +452,7 @@ mod tests {
         ]);
         assert!(matches!(dup, Err(CapacityError::DuplicatePath { .. })));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir_path);
     }
 
     #[test]

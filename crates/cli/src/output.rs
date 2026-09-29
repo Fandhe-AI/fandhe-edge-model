@@ -45,8 +45,8 @@ use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
-use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use fandhe_edge_core::stage_report::PackageReport;
+use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use std::io::{self, Write};
 
 /// [`JudgmentResult`] を JSON 1 行＋改行として `out` へ書き、
