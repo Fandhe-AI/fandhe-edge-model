@@ -21,6 +21,10 @@
 //! stdout（結果 JSON）と stderr（ログ）は別の書き込み先として扱う。`package` の
 //! 実処理への接続は #136 の範囲で、現状はテストハーネスでのみ確認している。
 //!
+//! TASK-33.4（#141）で、`infer --input-file` の一括推論と 1 行 1 JSON 出力（REQ-33 の唯一の
+//! 例外）を [`infer_batch`] に追加した。それ以外のコマンドの出力は 1 呼び出し 1 JSON のまま
+//! （[`infer_batch::output_mode`] で型として固定）。`main.rs` への配線は #136 の範囲。
+//!
 //! TASK-39.4-2（#159）で、`infer` の `--package` と `artifact.json` の `onnx_file` を
 //! ガード層の経路検証へ通す [`infer_guard`] を追加し、`main.rs` の `infer` 分岐へ接続した。
 //! 拒否は `invalid_input`（64）の JSON 1 行。経路・形式の検査のみを通過した後の推論本体は #136 で未接続（sha256・kind_version は未検証。#168・#174）。
@@ -30,6 +34,7 @@
 
 pub mod args;
 pub mod error_report;
+pub mod infer_batch;
 pub mod infer_guard;
 pub mod log;
 pub mod output;

@@ -20,6 +20,17 @@
 //! - 実装は呼び出し間で結果に影響する状態を持たないこと（REQ-28）。trait は `&self` だが
 //!   内部可変性は型で塞げないため契約として明記する
 //!
+//! # 時間上限の責務（REQ-39・REQ-32）
+//!
+//! 本 crate は同期のライブラリで、スレッドもプロセスも持たない依存最小の推論 SDK である。
+//! `infer_batch`・`infer_batch_until`・`infer_batch_partial_until` の期限は「件と件の間で確認する
+//! 協調的な期限」で、**1 件の処理そのものが止まった場合の上限は保証しない**（期限超過後に完了した
+//! 1 件を成功として返さないことだけを保証する）。止まった 1 件を回収する実行境界を本 crate に
+//! 設けると、回収できないスレッドが公開 API に移るだけになるため設けない。強制的な時間上限が要る
+//! 呼び出し元は、プロセス境界で強制する CLI を子プロセスとして使う（または同様にプロセスで隔離
+//! する）。CLI は計算スレッドの期限待ちとプロセス終了で上限を強制する（`fandhe-edge-cli` の
+//! `infer_batch`。REQ-33・REQ-39）。
+//!
 //! # 終了コードとの関係
 //!
 //! エラーの 7 種終了コードへの写像は CLI 側（TASK-33.x）の責務で、本モジュールは
@@ -30,6 +41,7 @@ use crate::prediction_provenance::ReferenceBatchPredictions;
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::judgment::{MAX_OPTIONS, SCORE_SUM_TOLERANCE};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// 1 回のバッチ推論で受け付ける件数の上限（暫定値。REQ-39 の資源上限が正式に決まるまで暫定）。
 /// `Vec` の確保前に検査する。
@@ -38,6 +50,15 @@ pub const MAX_INFER_BATCH_LEN: usize = 100_000;
 /// 1 回のバッチ推論の総入力バイト数の上限（暫定値。REQ-39）。
 /// 件数上限だけでは 100,000 件 × 1 MiB で約 100 GB になるため、処理前に総量を検査する。
 pub const MAX_INFER_BATCH_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// 1 回のバッチ推論の処理時間（壁時計）の上限（暫定値。REQ-39）。
+/// 1 件ごとの処理の前後（最後の 1 件の後も含む）に期限を確認し、超過したら以降を処理せず
+/// バッチ全体を失敗とする（`limit_exceeded`）。CLI は入力の読み取り開始時点から期限を数え、
+/// 読み取り・推論・出力の全体へ同じ期限を適用する。協調的な打ち切りで、1 件の呼び出しの
+/// 内部で止まったバックエンドを中断する仕組みではない（ONNX 推論の実装〔#113〕で 1 件の
+/// 上限〔session の中断〕を別途扱う。未対応の間は、期限超過した 1 件の結果を成功として返さない
+/// ことだけを保証する）。
+pub const MAX_INFER_BATCH_DURATION: Duration = Duration::from_secs(600);
 
 /// 前処理後のトークン数の上限（暫定値。REQ-39）。NFKC 正規化による膨張を見込み、
 /// 入力上限 [`MAX_INFER_INPUT_BYTES`] の 4 倍とする。バックエンド呼び出し前に検査する。
@@ -214,6 +235,8 @@ pub enum BatchError {
         /// 上限。
         limit: usize,
     },
+    /// 処理時間が期限を超えた（REQ-39）。部分結果は返さず、バッチ全体を失敗とする。
+    DeadlineExceeded,
 }
 
 impl BatchError {
@@ -223,6 +246,7 @@ impl BatchError {
             Self::TooManyInputs { .. } => "too_many_inputs",
             Self::TotalInputTooLarge { .. } => "total_input_too_large",
             Self::ResultTooLarge { .. } => "result_too_large",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 }
@@ -256,6 +280,27 @@ impl fmt::Debug for Prediction {
 /// バッチ推論の戻り値。要素ごとの成否を持つ。
 pub type BatchResult = Vec<Result<Prediction, InferError>>;
 
+/// バッチ推論の部分結果（REQ-33。[`InferencePipeline::infer_batch_partial_until`]）。
+///
+/// `failure` の発生位置は `results.len()` 件目で、それより前の `results` の失敗は入力順で
+/// 先に起きている。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartialBatch {
+    /// 処理済みの先頭からの各件の成否。
+    pub results: BatchResult,
+    /// バッチ全体の失敗（件数・総バイト・スコア総数・期限）。`None` なら全件を処理済み。
+    pub failure: Option<BatchError>,
+}
+
+impl PartialBatch {
+    fn failed_at_start(error: BatchError) -> Self {
+        Self {
+            results: Vec::new(),
+            failure: Some(error),
+        }
+    }
+}
+
 /// 前処理とスコア計算を束ねた推論パイプライン。呼び出し間で状態を持たない。
 pub struct InferencePipeline<P, B> {
     preprocessor: P,
@@ -288,9 +333,48 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
     /// バッチ推論。件数・総入力バイト数を処理前に検査し、1 件ずつ `run_single` を呼ぶだけ。
     /// 結果スコアの総数が上限を超えたら、以降を処理せずバッチ全体を失敗とする。
     /// 1 件の失敗は他要素へ波及しない。
+    /// 処理時間は [`MAX_INFER_BATCH_DURATION`] で打ち切る（REQ-39）。
+    ///
+    /// 期限は件と件の間で確認する協調的なもので、1 件の処理が止まった場合の上限は保証しない
+    /// （モジュール doc「時間上限の責務」）。強制的な時間上限が要る呼び出し元は、CLI を子プロセス
+    /// として使うなど、プロセスで隔離すること（REQ-39・REQ-32）。
     pub fn infer_batch(&self, inputs: &[&str]) -> Result<BatchResult, BatchError> {
+        let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
+        self.infer_batch_until(inputs, deadline)
+    }
+
+    /// [`Self::infer_batch`] の期限を指定できる版。`deadline` が `None` なら期限なし
+    /// （`Instant` の加算がオーバーフローした場合のみ。呼び出し側は通常 `Some` を渡す）。
+    /// 期限は各件の処理の前後に確認する協調的なもので（1 件の処理が止まった場合の上限は保証
+    /// しない。モジュール doc「時間上限の責務」）、超過なら `DeadlineExceeded` を返す。
+    ///
+    /// 処理は [`Self::infer_batch_partial_until`] と同じで、バッチ全体の失敗があれば部分結果を
+    /// 捨てて `Err` にする。
+    pub fn infer_batch_until(
+        &self,
+        inputs: &[&str],
+        deadline: Option<Instant>,
+    ) -> Result<BatchResult, BatchError> {
+        let partial = self.infer_batch_partial_until(inputs, deadline);
+        match partial.failure {
+            Some(error) => Err(error),
+            None => Ok(partial.results),
+        }
+    }
+
+    /// [`Self::infer_batch_until`] の部分結果を返す版（REQ-33 の「入力順で最初の失敗」を呼び出し側が
+    /// 決めるため。REQ-28: 各件の処理は単体推論と同じ `run_single`）。
+    ///
+    /// `results` は処理済みの先頭からの各件の成否で、`failure` はバッチ全体の失敗（件数・総入力
+    /// バイト・スコア総数・期限）。失敗の発生位置は `results.len()` 件目（0 始まりの index）で、
+    /// それより前の件の失敗は入力順で先に起きたものとして比較できる。
+    pub fn infer_batch_partial_until(
+        &self,
+        inputs: &[&str],
+        deadline: Option<Instant>,
+    ) -> PartialBatch {
         if inputs.len() > MAX_INFER_BATCH_LEN {
-            return Err(BatchError::TooManyInputs {
+            return PartialBatch::failed_at_start(BatchError::TooManyInputs {
                 len: inputs.len(),
                 limit: MAX_INFER_BATCH_LEN,
             });
@@ -299,7 +383,7 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
             .iter()
             .fold(0usize, |acc, x| acc.saturating_add(x.len()));
         if total > MAX_INFER_BATCH_TOTAL_BYTES {
-            return Err(BatchError::TotalInputTooLarge {
+            return PartialBatch::failed_at_start(BatchError::TotalInputTooLarge {
                 total,
                 limit: MAX_INFER_BATCH_TOTAL_BYTES,
             });
@@ -307,18 +391,37 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
         let mut results = Vec::with_capacity(inputs.len());
         let mut retained_scores = 0usize;
         for input in inputs {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return PartialBatch {
+                    results,
+                    failure: Some(BatchError::DeadlineExceeded),
+                };
+            }
             let result = self.run_single(input, None);
             if let Ok(p) = &result {
                 retained_scores = retained_scores.saturating_add(p.scores.len());
                 if retained_scores > MAX_INFER_BATCH_TOTAL_SCORES {
-                    return Err(BatchError::ResultTooLarge {
-                        limit: MAX_INFER_BATCH_TOTAL_SCORES,
-                    });
+                    return PartialBatch {
+                        results,
+                        failure: Some(BatchError::ResultTooLarge {
+                            limit: MAX_INFER_BATCH_TOTAL_SCORES,
+                        }),
+                    };
                 }
             }
             results.push(result);
+            // 最後の 1 件が期限を超えて完了した場合も成功を返さない（この件の結果は保持する）。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return PartialBatch {
+                    results,
+                    failure: Some(BatchError::DeadlineExceeded),
+                };
+            }
         }
-        Ok(results)
+        PartialBatch {
+            results,
+            failure: None,
+        }
     }
 
     /// 参考測定（判定に使わない目的）でバッチ API を使うときの入口（REQ-28 境界値・TASK-28.3・#120）。
@@ -500,5 +603,68 @@ mod tests {
             format!("{:?}", TokenIds::new(vec![7, 8])),
             "TokenIds(len=2)"
         );
+    }
+
+    struct StubPre;
+    impl Preprocessor for StubPre {
+        fn preprocess(&self, _input: &str) -> Result<TokenIds, PreprocessError> {
+            Ok(TokenIds::new(vec![1]))
+        }
+    }
+
+    struct StubBackend;
+    impl ScoringBackend for StubBackend {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            Ok(vec![0.25, 0.75])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は本テストの対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+
+    /// REQ-39: 期限が過ぎていれば 1 件も処理せず `DeadlineExceeded`、期限内なら全件成功。
+    #[test]
+    fn req39_batch_deadline_is_enforced() {
+        let pipeline = InferencePipeline::new(StubPre, StubBackend);
+        let past = Instant::now();
+        let err = pipeline
+            .infer_batch_until(&["a", "b"], Some(past))
+            .unwrap_err();
+        assert_eq!(err, BatchError::DeadlineExceeded);
+        assert_eq!(err.code(), "deadline_exceeded");
+        let future = Instant::now().checked_add(Duration::from_secs(60));
+        let ok = pipeline.infer_batch_until(&["a", "b"], future).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert_eq!(pipeline.infer_batch(&["a"]).unwrap().len(), 1);
+    }
+
+    struct SlowBackend;
+    impl ScoringBackend for SlowBackend {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(vec![0.25, 0.75])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は本テストの対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+
+    /// REQ-39: 最後の 1 件が期限を超えて完了した場合も成功を返さない。
+    #[test]
+    fn req39_batch_deadline_covers_last_item() {
+        let pipeline = InferencePipeline::new(StubPre, SlowBackend);
+        let deadline = Instant::now().checked_add(Duration::from_millis(10));
+        let err = pipeline.infer_batch_until(&["a"], deadline).unwrap_err();
+        assert_eq!(err, BatchError::DeadlineExceeded);
     }
 }

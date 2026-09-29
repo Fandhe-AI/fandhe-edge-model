@@ -95,3 +95,36 @@ fn req33_non_utf8_argument_does_not_panic() {
     assert_eq!(o.status.code(), Some(64));
     one_json_line(&o, "invalid_input");
 }
+
+/// REQ-33: 解析に成功した 7 サブコマンドはいずれも stdout へちょうど 1 行の JSON だけを出す
+/// （1 行 1 JSON の例外は `infer --input-file` の実行が接続される #136 以降で、成功時のみ
+/// `infer_batch` が担う。それ以外の出力形を変えていないことの回帰確認。TASK-33.4）。
+#[test]
+fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
+    let cases: [&[&str]; 8] = [
+        &["register", "--definition", "d.json", "--project-dir", "p"],
+        &["inspect", "--project-dir", "p"],
+        &["train", "--project-dir", "p", "--candidate", "0"],
+        &["evaluate", "--project-dir", "p", "--candidate", "0"],
+        &["select", "--project-dir", "p"],
+        &["package", "--project-dir", "p"],
+        &["infer", "--package", "p", "--text", "hello"],
+        &["infer", "--package", "p", "--input-file", "in.jsonl"],
+    ];
+    for args in cases {
+        let o = run(args);
+        assert_eq!(
+            o.stdout.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "args: {args:?}"
+        );
+        // infer は経路ガード（REQ-39・#159）が未存在の package を先に拒否する。それ以外は
+        // 工程未接続の runtime_error（#136 で置き換える）。
+        let expected = if args[0] == "infer" {
+            "invalid_input"
+        } else {
+            "runtime_error"
+        };
+        one_json_line(&o, expected);
+    }
+}
