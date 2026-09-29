@@ -27,8 +27,15 @@
 //! （validation 誤り上位を `(gold, pred, count)` の有向で記録）に対応する（定義の出典であり
 //! 期待値の出典ではない）。混同行列は再計算しない（評価ロジックの再実装をしない）。
 //!
-//! 未実装: 診断限界の明記（TASK-29.2・#109）、データ量水準別報告（TASK-29.3・#110）、
-//! group 数、JSON 直列化（CLI 層。`evaluate` 配線は #140）。
+//! 診断限界の明記（REQ-29 異常系・TASK-29.2・issue #109）: 旧（前回の定義・モデル）と
+//! 新（今回）で宣言ラベル数が異なる場合、出力の定義自体が変わるため正解率の単純比較には
+//! 限界がある（PoC-11「限界と所見」5 項・「要因ごとの判定」）。[`note_label_count_change`]
+//! が [`DiagnosticReport`] へ [`DiagnosticLimitation`] の注記を付与する。ラベル数が同じで
+//! ラベル ID だけが異なる場合は本タスクでは注記しない（後続の検討事項。REQ-26 の
+//! `regression` モジュールの `ComparisonPremise` を参照）。
+//!
+//! 未実装: データ量水準別報告（TASK-29.3・#110）、group 数、JSON 直列化
+//! （CLI 層。`evaluate` 配線は #140）。
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -337,6 +344,22 @@ fn internal(detail: &str) -> DiagnosticsError {
     }
 }
 
+/// ラベル ID 列を検証し、重複は値を含めず位置のみのエラーへ写す（値を含めない契約）。
+///
+/// [`basic_stats`] と [`note_label_count_change`] が共有する。
+fn validate_labels<'a>(
+    labels: &[&'a str],
+) -> Result<std::collections::BTreeMap<&'a str, usize>, DiagnosticsError> {
+    validate_label_order(labels).map_err(|err| match err {
+        EvalError::DuplicateLabel { .. } => {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let dup = labels.iter().position(|l| !seen.insert(l)).unwrap_or(0);
+            DiagnosticsError::DuplicateLabel { index: dup }
+        }
+        other => DiagnosticsError::Labels(other),
+    })
+}
+
 /// 基礎統計を集計する（REQ-29 正常系・TASK-29.1-1）。
 ///
 /// `labels` は宣言順のラベル ID。学習データ・評価データそれぞれで 1 回ずつ呼ぶ。
@@ -352,15 +375,7 @@ pub fn basic_stats(
             limit: MAX_EVAL_RECORDS,
         });
     }
-    let index = validate_label_order(labels).map_err(|err| match err {
-        // 重複ラベルの値はエラーへ載せず、位置のみ返す（値を含めない契約）。
-        EvalError::DuplicateLabel { .. } => {
-            let mut seen: BTreeSet<&str> = BTreeSet::new();
-            let dup = labels.iter().position(|l| !seen.insert(l)).unwrap_or(0);
-            DiagnosticsError::DuplicateLabel { index: dup }
-        }
-        other => DiagnosticsError::Labels(other),
-    })?;
+    let index = validate_labels(labels)?;
     if rows.is_empty() {
         return Err(DiagnosticsError::EmptyRows);
     }
@@ -569,6 +584,42 @@ pub struct DiagnosticReport {
     train: BasicStats,
     eval: BasicStats,
     confusable_pairs: Vec<ConfusablePair>,
+    limitations: Vec<DiagnosticLimitation>,
+}
+
+/// 診断レポートの読み方の限界（REQ-29 異常系・TASK-29.2・issue #109）。
+///
+/// PoC-11「限界と所見」5 項に対応する。`#[non_exhaustive]` のため、ラベル集合の相違や
+/// データ量水準（TASK-29.3）などの限界を後から追加しても破壊的変更にならない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiagnosticLimitation {
+    /// 旧・新で宣言ラベル数が異なる（ラベル統合等）。出力の定義が変わるため、正解率の
+    /// 単純比較には限界がある（下限基準 majority も変わる）。
+    LabelCountChanged {
+        /// 旧の宣言ラベル数。
+        previous: u64,
+        /// 新（今回）の宣言ラベル数。
+        current: u64,
+    },
+}
+
+impl DiagnosticLimitation {
+    /// 機械可読な ID（CLI の JSON 出力用。英語・固定）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiagnosticLimitation::LabelCountChanged { .. } => "label_count_changed",
+        }
+    }
+
+    /// 人間向けの英語固定文（ラベル値・入力本文を含めない）。
+    pub fn note(&self) -> &'static str {
+        match self {
+            DiagnosticLimitation::LabelCountChanged { .. } => {
+                "label count differs between previous and current label sets; accuracy is not directly comparable because the output definition changed"
+            }
+        }
+    }
 }
 
 impl DiagnosticReport {
@@ -586,6 +637,40 @@ impl DiagnosticReport {
     pub fn confusable_pairs(&self) -> &[ConfusablePair] {
         &self.confusable_pairs
     }
+
+    /// 診断の限界の注記（付与が無ければ空）。
+    pub fn limitations(&self) -> &[DiagnosticLimitation] {
+        &self.limitations
+    }
+}
+
+/// 旧のラベル集合と比べ、宣言ラベル数が異なれば限界注記を付与する（REQ-29 異常系・
+/// TASK-29.2・issue #109）。
+///
+/// CLI の `evaluate` 工程（配線は #140）が、前回パッケージの選択肢 ID 等を
+/// `previous_labels`（宣言順）として渡す想定。比較は宣言ラベル数（観測数ではない）で行い、
+/// 評価データで未出現のラベルがあるだけでは注記しない。レポートは値で受け取り返す
+/// （共有入力を書き換えない。REQ-27）。冪等: 既存の
+/// [`DiagnosticLimitation::LabelCountChanged`] は置き換え、同数なら取り除く
+/// （最後の比較結果だけを反映する）。診断専用で合否判定には使わない。
+pub fn note_label_count_change(
+    mut report: DiagnosticReport,
+    previous_labels: &[&str],
+) -> Result<DiagnosticReport, DiagnosticsError> {
+    validate_labels(previous_labels)?;
+    let previous = u64::try_from(previous_labels.len())
+        .map_err(|_| internal("previous label count conversion"))?;
+    let current = u64::try_from(report.eval.label_counts.len())
+        .map_err(|_| internal("current label count conversion"))?;
+    report
+        .limitations
+        .retain(|l| !matches!(l, DiagnosticLimitation::LabelCountChanged { .. }));
+    if previous != current {
+        report
+            .limitations
+            .push(DiagnosticLimitation::LabelCountChanged { previous, current });
+    }
+    Ok(report)
 }
 
 fn check_label_order(
@@ -643,6 +728,7 @@ pub fn diagnostic_report(
         train,
         eval,
         confusable_pairs,
+        limitations: Vec::new(),
     })
 }
 
@@ -822,5 +908,81 @@ mod tests {
         let msg = err.to_string();
         assert_eq!(msg, "duplicate label at label index 2");
         assert!(!msg.contains("secret"));
+    }
+
+    fn report_with_labels(labels: &[&str]) -> DiagnosticReport {
+        use crate::metrics::{EvalRecord, Outcome, evaluate_single_select};
+        let first = labels[0];
+        let rows = [StatsRow {
+            input: "x",
+            label: first,
+        }];
+        let stats = basic_stats(labels, &rows, InputKey::ByteExact).unwrap();
+        let outcome = Outcome::Label(first.to_string());
+        let recs = [EvalRecord {
+            gold: first,
+            outcome: &outcome,
+        }];
+        let m = evaluate_single_select(labels, &recs).unwrap();
+        diagnostic_report(stats.clone(), stats, &m, 5).unwrap()
+    }
+
+    /// REQ-29 異常系・TASK-29.2: 件数が異なれば注記、同じなら空。
+    #[test]
+    fn label_count_change_is_noted_only_when_counts_differ() {
+        let r = report_with_labels(&["AB", "C"]);
+        assert!(r.limitations().is_empty());
+        let noted = note_label_count_change(r.clone(), &["A", "B", "C"]).unwrap();
+        assert_eq!(
+            noted.limitations(),
+            &[DiagnosticLimitation::LabelCountChanged {
+                previous: 3,
+                current: 2
+            }]
+        );
+        let l = &noted.limitations()[0];
+        assert_eq!(l.as_str(), "label_count_changed");
+        assert_eq!(
+            l.note(),
+            "label count differs between previous and current label sets; accuracy is not directly comparable because the output definition changed"
+        );
+        let same = note_label_count_change(r, &["X", "Y"]).unwrap();
+        assert!(same.limitations().is_empty());
+    }
+
+    /// REQ-29 異常系・TASK-29.2: 冪等（重ねず、最後の比較結果だけを反映）。
+    #[test]
+    fn label_count_change_is_idempotent() {
+        let r = report_with_labels(&["AB", "C"]);
+        let once = note_label_count_change(r, &["A", "B", "C"]).unwrap();
+        let twice = note_label_count_change(once.clone(), &["A", "B", "C"]).unwrap();
+        assert_eq!(once, twice);
+        let replaced = note_label_count_change(twice, &["A", "B", "C", "D"]).unwrap();
+        assert_eq!(
+            replaced.limitations(),
+            &[DiagnosticLimitation::LabelCountChanged {
+                previous: 4,
+                current: 2
+            }]
+        );
+        let cleared = note_label_count_change(replaced, &["P", "Q"]).unwrap();
+        assert!(cleared.limitations().is_empty());
+    }
+
+    /// REQ-29・REQ-39: 旧ラベルの検証。重複は位置のみでラベル値を含めない。
+    #[test]
+    fn label_count_change_validates_previous_labels() {
+        let r = report_with_labels(&["AB", "C"]);
+        assert!(matches!(
+            note_label_count_change(r.clone(), &[]),
+            Err(DiagnosticsError::Labels(_))
+        ));
+        assert!(matches!(
+            note_label_count_change(r.clone(), &["A", ""]),
+            Err(DiagnosticsError::Labels(_))
+        ));
+        let err = note_label_count_change(r, &["secret-label", "B", "secret-label"]).unwrap_err();
+        assert_eq!(err, DiagnosticsError::DuplicateLabel { index: 2 });
+        assert!(!err.to_string().contains("secret"));
     }
 }
