@@ -3,6 +3,7 @@
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_guard::format::{
     AllowedFormat, FileFormat, FormatAllowlist, FormatRejection, check_file_format,
+    open_checked_file,
 };
 use std::path::PathBuf;
 
@@ -73,5 +74,25 @@ fn req39_onnx_truncated_after_graph_is_rejected() {
         FormatRejection::NotAllowed { detected, .. } => assert_eq!(detected, FileFormat::Unknown),
         other => panic!("unexpected: {other}"),
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// REQ-39・TASK-39.2-1: 検査済みハンドルは先頭位置で返り、検査後にパスが差し替えられても
+/// 検査した内容（ONNX 形）を読める（TOCTOU 対策）。
+#[test]
+fn req39_open_checked_file_keeps_inspected_handle() {
+    use std::io::Read as _;
+    let dir = temp_dir("handle");
+    let path = dir.join("m.onnx");
+    let body = [0x08, 0x07, 0x3a, 0x00];
+    std::fs::write(&path, body).unwrap();
+    let checked = open_checked_file(&path, &FormatAllowlist::onnx_only()).unwrap();
+    assert_eq!(checked.format().format(), FileFormat::Onnx);
+    // 検査後にパスを pickle へ差し替える。
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, [0x80, 0x04, 0x95, 0x00]).unwrap();
+    let mut read = Vec::new();
+    checked.into_file().read_to_end(&mut read).unwrap();
+    assert_eq!(read, body);
     std::fs::remove_dir_all(&dir).unwrap();
 }

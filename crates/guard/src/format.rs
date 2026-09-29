@@ -394,21 +394,44 @@ impl fmt::Display for FormatRejection {
 
 impl std::error::Error for FormatRejection {}
 
-/// ファイルの先頭だけを読んで形式を判定し、許可リストと照合する。
+/// 形式検査を通したファイルハンドル。検査に使った `File` をそのまま後続の読み込みへ渡すための型。
 ///
+/// パスを開き直すと検査後に pickle 等へ差し替えられる（TOCTOU）ため、検査と読み込みは
+/// 同一のハンドルで行う（REQ-39「形式の許可制」）。ハンドルの位置は先頭に戻してある。
+#[derive(Debug)]
+pub struct CheckedFile {
+    file: File,
+    format: AllowedFormat,
+}
+
+impl CheckedFile {
+    /// 検査を通った形式。
+    pub const fn format(&self) -> AllowedFormat {
+        self.format
+    }
+
+    /// 検査済みのハンドルを取り出す（位置は先頭）。以降の読み込みはこのハンドルで行うこと。
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
+/// ファイルを開き、同じハンドルの内容から形式を判定して許可リストと照合する。
+///
+/// 通った場合は検査済みの [`CheckedFile`] を返す。後続の読み込み（ONNX Runtime への
+/// 受け渡し等）は返されたハンドルで行い、パスを開き直さない（TOCTOU 対策。REQ-39）。
 /// 経路の検証・サイズ上限を通したパスを渡すこと（責務外。モジュール doc 参照）。
-pub fn check_file_format(
+pub fn open_checked_file(
     path: &Path,
     allowlist: &FormatAllowlist,
-) -> Result<AllowedFormat, FormatRejection> {
-    let file = open_regular_file_for_read(path).map_err(FormatRejection::Io)?;
+) -> Result<CheckedFile, FormatRejection> {
+    let mut file = open_regular_file_for_read(path).map_err(FormatRejection::Io)?;
     let read_err = |source| {
         FormatRejection::Io(FsError::Read {
             path: path.to_path_buf(),
             source,
         })
     };
-    let mut file = file;
     let total_len = file.metadata().map_err(read_err)?.len();
     let mut prefix = Vec::new();
     (&mut file)
@@ -424,7 +447,20 @@ pub fn check_file_format(
             _ => FileFormat::Unknown,
         },
     };
-    allowlist.check(detected)
+    let format = allowlist.check(detected)?;
+    file.seek(SeekFrom::Start(0)).map_err(read_err)?;
+    Ok(CheckedFile { file, format })
+}
+
+/// 形式の判定結果だけが要る場合の検査（ファイルは閉じる）。
+///
+/// 返るのは判定結果のみで、検査済みファイルとは結び付かない。後でパスを開き直して読む用途には
+/// 使わず、[`open_checked_file`] を使うこと（TOCTOU。REQ-39）。
+pub fn check_file_format(
+    path: &Path,
+    allowlist: &FormatAllowlist,
+) -> Result<AllowedFormat, FormatRejection> {
+    open_checked_file(path, allowlist).map(|c| c.format())
 }
 
 #[cfg(test)]
