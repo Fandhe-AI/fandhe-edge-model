@@ -523,10 +523,11 @@ pub fn compare_label_sets(
     }
 }
 
-/// 行 ID 1 件あたりの最大 UTF-8 バイト数（`fandhe_edge_core` の
-/// `MAX_INPUT_ID_BYTES` と同値。REQ-39 資源の上限）。
+/// 行 ID 1 件あたりの最大 UTF-8 バイト数。共通コアの
+/// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`] を再定義せず参照し、入力検証と
+/// 評価で受理条件が分かれないようにする（契約値の集約。REQ-39 資源の上限）。
 /// [`regression_report`] が重複判定のハッシュ計算より前に検証する。
-pub const MAX_RECORD_ID_BYTES: usize = 1024;
+pub const MAX_RECORD_ID_BYTES: usize = fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES;
 
 /// [`regression_report`] の入力 1 行（旧・新の正誤を record ID で 1 行に対応
 /// させる。REQ-26・TASK-26.2）。

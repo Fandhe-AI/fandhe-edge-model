@@ -308,6 +308,8 @@ pub const MAX_LABELS: usize = 4096;
 
 /// ラベル ID 1 件あたりの最大 UTF-8 バイト数（学習ワーカー側
 /// `fandhe-edge-train` の `MAX_LABEL_BYTES` と同値。REQ-39）。
+/// 評価器は学習層より下位のため参照できず、値の一致は train 側の結合テスト
+/// （`crates/train/tests/train_contract_fixture.rs`）で機械照合する。
 /// ラベル ID を複製・保持する前に検証する。
 pub const MAX_LABEL_BYTES: usize = 256;
 
