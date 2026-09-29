@@ -1,0 +1,16 @@
+[package]
+name = "fandhe-edge-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Guard layer (input validation before processing) for fandhe-edge-model."
+
+[dependencies]
+# workspace 内の path 依存のみ（外部 crate は追加しない。REQ-39・TASK-39.2-1・#153）。
+# 通常ファイル検証つきオープン（`fandhe_edge_core::fs`）と終了コード（`ExitCode`）を使う。
+fandhe-edge-core.workspace = true
+
+[lints]
+workspace = true

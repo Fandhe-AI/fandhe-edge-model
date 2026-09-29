@@ -16,7 +16,7 @@
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29）。パス: `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は未実装。TASK-24.1-1・#59） | evaluator-builder | sonnet |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32）。パス: `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目〔#117〕・容量計測コア〔TASK-30.1-1・#122〕を実装済み。前処理と ONNX 推論は未着手） | runtime-builder | sonnet |
 | 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33）。パス: `crates/cli/`（`fandhe-edge-cli`） | adapter-builder | sonnet |
-| 操作アダプター - TUI・MCP・ガード層（REQ-35/36/37/39）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
+| 操作アダプター - ガード層（REQ-39）。パス: `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定を実装済み。TASK-39.2-1・#153）／TUI・MCP（REQ-35/36/37）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
 | ルート `Cargo.toml`・`pyproject.toml`・`.github/workflows/`・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | infra-builder | sonnet |
 | テスト実行・失敗解析（`make test` / `make lint`） | test-runner | sonnet |
 | コードレビュー | reviewer | sonnet |
