@@ -20,9 +20,14 @@
 //! [`stage_output`] と、stderr へテキストログを出す [`log`] を追加した。
 //! stdout（結果 JSON）と stderr（ログ）は別の書き込み先として扱う。`package` の
 //! 実処理への接続は #136 の範囲で、現状はテストハーネスでのみ確認している。
+//!
+//! TASK-33.4（#141）で、`infer --input-file` の一括推論と 1 行 1 JSON 出力（REQ-33 の唯一の
+//! 例外）を [`infer_batch`] に追加した。それ以外のコマンドの出力は 1 呼び出し 1 JSON のまま
+//! （[`infer_batch::output_mode`] で型として固定）。`main.rs` への配線は #136 の範囲。
 
 pub mod args;
 pub mod error_report;
+pub mod infer_batch;
 pub mod log;
 pub mod output;
 pub mod stage_output;

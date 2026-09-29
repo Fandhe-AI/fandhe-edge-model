@@ -204,7 +204,8 @@ pub struct PackageArgs {
 pub enum InferSource {
     /// `--text`（任意で `--id`）。
     Text { text: String, id: Option<String> },
-    /// `--input-file`（任意で `--out`）。1 行 1 JSON の一括推論は TASK-33.4。
+    /// `--input-file`（任意で `--out`）。1 行 1 JSON の一括推論は `infer_batch` モジュール（TASK-33.4）。`--out` の
+    /// 実処理は未実装（後続）。
     InputFile { path: PathBuf, out: Option<PathBuf> },
 }
 

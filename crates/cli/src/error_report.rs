@@ -36,6 +36,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
+use fandhe_edge_runtime::pipeline::{BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchError;
@@ -167,6 +168,38 @@ impl<E> ToErrorReport for SearchError<E> {
     }
 }
 
+/// 推論 1 件の失敗。上限超過は `limit_exceeded`、それ以外は `runtime_error`。message は固定語彙
+/// （長さ・入力本文を含めない）。`InferError` は他 crate の `non_exhaustive` で網羅 `match` を
+/// 書けないため、将来の variant は `runtime_error` へ倒す（fail-closed。`Ok` は返さない）。
+impl ToErrorReport for InferError {
+    fn to_error_report(&self) -> ErrorReport {
+        let code = match self {
+            InferError::InputTooLarge { .. }
+            | InferError::TooManyTokens { .. }
+            | InferError::TooManyScores { .. } => ExitCode::LimitExceeded,
+            InferError::Preprocess(_) | InferError::Backend(_) | InferError::InvalidScores => {
+                ExitCode::RuntimeError
+            }
+            _ => ExitCode::RuntimeError,
+        };
+        ErrorReport::new(code, default_message(code))
+    }
+}
+
+/// バッチ全体の失敗。上限超過は `limit_exceeded`。`non_exhaustive` のため将来の variant は
+/// `runtime_error` へ倒す（fail-closed）。
+impl ToErrorReport for BatchError {
+    fn to_error_report(&self) -> ErrorReport {
+        let code = match self {
+            BatchError::TooManyInputs { .. }
+            | BatchError::TotalInputTooLarge { .. }
+            | BatchError::ResultTooLarge { .. } => ExitCode::LimitExceeded,
+            _ => ExitCode::RuntimeError,
+        };
+        ErrorReport::new(code, default_message(code))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +247,42 @@ mod tests {
             let report = ErrorReport::new(code, default_message(code));
             assert_eq!(emit_error_report(&mut buffer, &report).unwrap(), code);
             assert_eq!(buffer.iter().filter(|b| **b == b'\n').count(), 1);
+        }
+    }
+
+    /// REQ-21・REQ-39: 推論・バッチの失敗は固定語彙の code/message に写り `Ok` にならない。
+    #[test]
+    fn req21_infer_and_batch_errors_map_to_fixed_reports() {
+        use fandhe_edge_runtime::pipeline::{BackendError, PreprocessError};
+        let limit = ErrorReport::new(ExitCode::LimitExceeded, "resource limit exceeded");
+        let runtime = ErrorReport::new(ExitCode::RuntimeError, "runtime error");
+        let infer_cases = [
+            (
+                InferError::InputTooLarge { len: 2, limit: 1 },
+                limit.clone(),
+            ),
+            (
+                InferError::TooManyTokens { len: 2, limit: 1 },
+                limit.clone(),
+            ),
+            (
+                InferError::TooManyScores { len: 2, limit: 1 },
+                limit.clone(),
+            ),
+            (InferError::Backend(BackendError::Failed), runtime.clone()),
+            (InferError::InvalidScores, runtime.clone()),
+        ];
+        for (error, expected) in infer_cases {
+            assert_eq!(error.to_error_report(), expected);
+        }
+        let _ = PreprocessError::Failed;
+        let batch_cases = [
+            BatchError::TooManyInputs { len: 2, limit: 1 },
+            BatchError::TotalInputTooLarge { total: 2, limit: 1 },
+            BatchError::ResultTooLarge { limit: 1 },
+        ];
+        for error in batch_cases {
+            assert_eq!(error.to_error_report(), limit);
         }
     }
 }

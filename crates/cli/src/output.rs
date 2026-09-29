@@ -8,8 +8,8 @@
 //! `ErrorReport` を書いて exit 70 を返す）。配線後
 //! は `std::io::stdout().lock()` を渡し、戻り値の [`ExitCode`] を
 //! `main` の戻り値としてそのまま使う想定。`--input-file` 経由の一括推論
-//! （evaluation-contract.md が認める「1 行 1 JSON」の例外）でも、入力 1 件
-//! ごとに本関数を 1 回呼ぶ形で同じ契約を再利用する想定。
+//! （evaluation-contract.md が認める「1 行 1 JSON」の例外）は
+//! `infer_batch::emit_infer_batch` が入力 1 件ごとに本関数を 1 回呼ぶ形で同じ契約を再利用する。
 //!
 //! 業務ロジック（選択肢・スコアの検証、推論入力の型検証）は
 //! `fandhe-edge-core` の `judgment::JudgmentResult::new`・
