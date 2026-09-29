@@ -256,6 +256,12 @@ fn req38_clean_stream_reports_zero_network_denials() {
     has(&o, "\"unattributed_network_deny_events\": 0");
     assert!(e.out().join("network_report.json").is_file());
     assert!(e.out().join("monitor.meta.json").is_file());
+    // predicate の引用符が JSON として正しくエスケープされている（`\"` の 1 重）
+    let meta = std::fs::read_to_string(e.out().join("monitor.meta.json")).unwrap();
+    assert!(
+        meta.contains(r#""predicate":"process == \"kernel\" AND eventMessage CONTAINS \"deny\"""#),
+        "{meta}"
+    );
     assert!(e.out().join("run").join("run.meta.json").is_file());
     assert_eq!(e.cli_calls().len(), 7);
 }
@@ -330,13 +336,14 @@ fn req38_unparseable_line_is_undeterminable() {
     has(&o, "\"network_verdict\": \"undeterminable\"");
 }
 
-/// ヘッダ行が無い（`log stream` が機能していない）出力は判定不能（70）。
+/// ヘッダ行が無い（`log stream` が機能していない）ときは sandbox-run.sh を起動せず 70（fail-closed）。
 #[test]
-fn req38_missing_header_is_undeterminable() {
+fn req38_missing_header_fails_closed_without_running_cli() {
     let e = Env::new();
     let o = e.run("no_header.ndjson", &e.base_args(), &[]);
     assert_eq!(o.code, Some(70), "{}", o.stdout);
-    has(&o, "\"network_verdict\": \"undeterminable\"");
+    assert!(e.cli_calls().is_empty());
+    assert!(!e.out().join("run").exists());
 }
 
 /// log が無ければ sandbox-run.sh（CLI）を起動せず 70（監視なしで実行して証拠を装わない）。
@@ -350,9 +357,9 @@ fn req38_missing_log_command_fails_closed_without_running_cli() {
     assert!(!e.out().join("run").exists());
 }
 
-/// stream が停止前に終了していたら判定不能（70）。
+/// stream が実行の前に終了していたら sandbox-run.sh を起動せず 70（fail-closed）。
 #[test]
-fn req38_stream_dying_early_is_undeterminable() {
+fn req38_stream_dying_early_fails_closed_without_running_cli() {
     let e = Env::new();
     let o = e.run(
         "clean.ndjson",
@@ -360,7 +367,7 @@ fn req38_stream_dying_early_is_undeterminable() {
         &[("FAKE_LOG_MODE", "early")],
     );
     assert_eq!(o.code, Some(70), "{}", o.stdout);
-    has(&o, "\"network_verdict\": \"undeterminable\"");
+    assert!(e.cli_calls().is_empty());
 }
 
 /// 拒否 0 件でも run が失敗していたら終了コードを伝搬する（完走を装わない）。

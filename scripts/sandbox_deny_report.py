@@ -230,7 +230,7 @@ def iter_stream(path: str, stats: dict) -> Iterator[str]:
     try:
         if os.stat(path).st_size > MAX_STREAM_BYTES:
             raise Undeterminable("input file exceeds size limit")
-        f = open(path, "rb")  # noqa: SIM115 -- ジェネレータの寿命に合わせて finally で閉じる
+        f = open(path, "rb")  # ジェネレータの寿命に合わせて finally で閉じる
     except OSError as e:
         raise Undeterminable("cannot read input file") from e
     total = 0

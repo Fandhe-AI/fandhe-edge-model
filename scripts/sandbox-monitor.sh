@@ -33,7 +33,9 @@
 #     network_report.json を記録する）。工程の stdout・stderr・--infer-text・パスは保存しない
 #   - stdout は集計 JSON を 1 行だけ出す（REQ-33。固定の文字列と件数のみ。利用者の値は出さない）。
 #     終了コードは 7 種のみ（REQ-21）。判定の意味は sandbox_deny_report.py を参照
-#   - 監視が無効になる条件（stream の早期終了・容量超過・ヘッダ欠落・集計器の異常終了）は
+#   - 待機の後、log の生存とヘッダ行の出力を確認できなければ sandbox-run.sh を起動せず
+#     runtime_error(70)（fail-closed）
+#   - 監視が無効になる条件（stream の実行中の終了・容量超過・ヘッダ欠落・集計器の異常終了）は
 #     network_verdict:"undeterminable"・runtime_error(70)
 #   - 資源上限（REQ-39）: 生ログの容量上限（超過で log を KILL して判定不能）・停止の期限
 #     （TERM の後 5 秒で KILL）・独立プロセスグループと監視役（本スクリプトが突然死しても
@@ -265,6 +267,24 @@ set +m
 
 sleep "$warmup"
 
+# 監視が有効であることを確認してから実行する（fail-closed。REQ-38）。log が生きていて、
+# ヘッダ行が生ログの先頭に出るまで最大 5 秒待つ。満たせなければ sandbox-run.sh を起動せず 70
+# （後始末は EXIT trap が行う）。
+gate_ok=0
+i=0
+while [ "$i" -le 50 ]; do
+    kill -0 "$logpid" 2>/dev/null || break
+    if [ "$(head -c 22 -- "$stream_file" 2>/dev/null)" = "Filtering the log data" ]; then
+        # ヘッダ出力直後の即終了を拾うため、短い猶予の後にもう一度生存を確認する
+        sleep 0.3
+        kill -0 "$logpid" 2>/dev/null && gate_ok=1
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+[ "$gate_ok" -eq 1 ] || fail 70 runtime_error "log stream is not active; sandbox run was not started"
+
 # ---- 実行 ----
 set -- --definition "$definition" --project-dir "$project_dir" --out-dir "$out_dir/run"
 [ "$has_candidates" -eq 0 ] || set -- "$@" --candidates "$candidates"
@@ -311,9 +331,11 @@ if [ -z "$rep_out" ]; then
     rep_out='{"code":"runtime_error","message":"report generator failed","network_verdict":"undeterminable","positive_control":"not_run"}'
 fi
 
-if ! printf '{"monitor_started_utc":"%s","monitor_stopped_utc":"%s","warmup_secs":%s,"tail_secs":%s,"log_stream_override":%s,"stream_alive_at_stop":%s,"sandbox_run_exit_code":%s,"report_exit_code":%s,"predicate":"process == \\"kernel\\" AND eventMessage CONTAINS \\"deny\\""}\n' \
+# 述語は PREDICATE から JSON エスケープして埋め込む（定数のため `"` の置換のみで足りる）
+predicate_json=$(printf '%s' "$PREDICATE" | sed 's/"/\\"/g')
+if ! printf '{"monitor_started_utc":"%s","monitor_stopped_utc":"%s","warmup_secs":%s,"tail_secs":%s,"log_stream_override":%s,"stream_alive_at_stop":%s,"sandbox_run_exit_code":%s,"report_exit_code":%s,"predicate":"%s"}\n' \
     "$monitor_started" "$stopped" "$warmup" "$tail_secs" "$log_override" \
-    "$([ "$stream_ok" -eq 1 ] && echo true || echo false)" "$run_rc" "$rep_rc" \
+    "$([ "$stream_ok" -eq 1 ] && echo true || echo false)" "$run_rc" "$rep_rc" "$predicate_json" \
     >"$meta_file" 2>/dev/null; then
     fail 70 runtime_error "cannot write monitor record"
 fi
