@@ -35,6 +35,7 @@ fandhe-edge-model/
 │   ├── cli/                        # `fandhe-edge-cli`（lib＋bin `fandhe-edge`。操作アダプター - CLI。REQ-33）
 │   ├── data/                       # `fandhe-edge-data`（lib。データ契約 - 検査・group 単位分割・凍結記録・読み取り専用配置・ハッシュ不一致時の停止・分割記録のレコード内容ハッシュ・来歴の記録型と取り込み記録・データ検査との接続を実装済み。REQ-16/17/40。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-17.2-2・#227・TASK-17.3・#251・TASK-40.1-1・#74・TASK-40.1-2・#75・TASK-40.2・#76）
 │   ├── eval/                       # `fandhe-edge-eval`（lib。評価器 - 正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は未実装。REQ-24〜27。TASK-24.1-1・#59）
+│   ├── guard/                      # `fandhe-edge-guard`（lib。ガード層。許可リストによるファイル形式判定〔TASK-39.2-1・#153〕・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕を実装済み。CLI への組み込みは #159 で未着手。REQ-39）
 │   ├── runtime/                    # `fandhe-edge-runtime`（lib。成果物・推論 SDK。単体/バッチ共通の推論経路の継ぎ目〔REQ-28・#117〕と容量計測コア〔構成要素ごとの内訳集計。REQ-30。TASK-30.1-1・#122〕を実装済み。単体/バッチ/評価器経路の全件一致テストを追加済み・#118）
 │   └── train/                      # `fandhe-edge-train`（lib。学習ワーカー層 - 学習リクエスト・結果 JSON の型・子プロセス起動と終了コード写像〔#178〕・探索予算内の候補選定〔TASK-18.1・#83・#84〕・選定結果の有意性判定〔TASK-18.3-1・#87〕・kind 省略時の既定候補の解決〔TASK-19.2・#77〕を実装済み。CLI `train` 工程への配線〔TASK-33.x〕は未着手。REQ-18/19/34/39。issue #177）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）・autoregressive（バイト単位の小型自己回帰 decoder。対応づけ (b) を ONNX グラフ内で計算。REQ-19b・TASK-19b.1-1・#79）と対応づけ (b) の選択肢 ID 対応づけ・判定不能扱い（TASK-19b.1-2・#234、TASK-19b.2・#250）を実装済み（MLX 学習・ONNX 書き出し）。lifeline による子孫プロセスの終了（`supervisor.py`）・学習直後の validation 予測（`predict.py`）・資源上限（`budget.py`）も実装済み。選定は Rust 側 `crates/train`、作り直し判定（TASK-20.x）は `crates/core` の `rebuild` で実装済みで、CLI `train` 工程への配線（TASK-33.x）は未着手
@@ -67,7 +68,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は未実装。TASK-24.1-1・#59） | explorer | evaluator-builder |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32） | `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目〔#117〕・容量計測コア〔TASK-30.1-1・#122〕を実装済み。前処理と ONNX 推論は未着手。全件一致テスト #118） | explorer | runtime-builder |
 | 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） | explorer | adapter-builder |
-| 操作アダプター - TUI・MCP・ガード層（REQ-35〜39） | 未確定 | explorer | adapter-builder |
+| 操作アダプター - ガード層（REQ-39） | `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕を実装済み。TASK-39.2-1・#153） | explorer | adapter-builder |
+| 操作アダプター - TUI・MCP（REQ-35〜37） | 未確定 | explorer | adapter-builder |
 | `Cargo.toml`・`trainer/pyproject.toml`・`trainer/uv.lock`・CI・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | — | explorer | infra-builder |
 | `docs/spec/`（private） | — | explorer | 変更しない（spec リポ側で管理） |
 | 外部仕様（ONNX / `ort`・MLX・candle / burn・MCP・統計手法）・依存候補 | — | reference-researcher | — |
