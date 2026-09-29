@@ -42,7 +42,8 @@
 //!   `crates/train/tests/selection_undeterminable.rs`（TASK-18.3-2・#88）で
 //!   行う。`verdict()` が [`fandhe_edge_eval::significance::BaselineVerdict`]
 //!   をそのまま返すため #88 は本モジュールの API 変更なしでテストできる
-//! - 「予算到達」候補を合格扱いにしない判定（TASK-18.2・#85）
+//! - 「予算到達」候補の判定は `crate::search`（TASK-18.2・#85）が行う。予算到達の
+//!   候補は `validation_outcomes` を持たず、事前登録した `family_size` の脱落候補として数える
 //! - 「3 seed すべてで有意」の集約
 //! - 脱落候補を個別に「有意でない」と記録・報告する規則（本モジュールは
 //!   族サイズを事前登録値で固定する保守側の補正のみ行う）
