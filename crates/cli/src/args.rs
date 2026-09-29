@@ -20,7 +20,8 @@
 //! - 重複・未知のオプション・余分な位置引数は黙殺せず拒否する（fail-closed）。
 //! - `--text` と `--input-file` は [`InferSource`] の enum で排他を型に表す。
 //! - argv 経路では `unwrap` / `expect` / 添字アクセスを使わない。パス値は
-//!   `OsString` から損失なく `PathBuf` へ変換し、それ以外は UTF-8 を要求する。
+//!   `OsString` から損失なく `PathBuf` へ変換し（`--key=value` 形式でも同様）、
+//!   それ以外は UTF-8 を要求する。
 //! - [`ArgsError`] の `Display` は固定の英語文で、利用者が渡したトークンや値を
 //!   含めない（表に載る既知のオプション名・サブコマンド名のみ）。
 
@@ -357,17 +358,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
     let mut values: Vec<(&'static str, OsString)> = Vec::new();
     let mut toks = rest.into_iter();
     while let Some(tok) = toks.next() {
-        let s = tok.to_str().ok_or(ArgsError::NonUtf8Argument)?;
-        if !s.starts_with("--") {
-            return Err(ArgsError::UnexpectedPositional { subcommand: sub });
-        }
-        let (key, inline) = match s.split_once('=') {
-            Some((k, v)) => (k, Some(OsString::from(v))),
-            None => (s, None),
-        };
+        let (key, inline) = split_option(&tok, sub)?;
         let spec = specs
             .iter()
-            .find(|o| o.name == key)
+            .find(|o| o.name == key.as_str())
             .ok_or(ArgsError::UnknownOption { subcommand: sub })?;
         if values.iter().any(|(n, _)| *n == spec.name) {
             return Err(ArgsError::DuplicateOption { option: spec.name });
@@ -393,6 +387,46 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
         }
     }
     build(sub, values).map(Invocation::Run)
+}
+
+/// トークンを `--key` と `=` 以降の値に分ける。キーは UTF-8 を要求し、値は
+/// `OsString` のまま（unix ではバイト列レベルで分割）返す。空白区切り形式と
+/// `--key=value` 形式でパス値の扱いを揃えるため。
+fn split_option(tok: &OsString, sub: Subcommand) -> Result<(String, Option<OsString>), ArgsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = tok.as_bytes();
+        if !bytes.starts_with(b"--") {
+            // 位置引数。非 UTF-8 の位置引数は従来どおり NonUtf8Argument とする。
+            return match tok.to_str() {
+                Some(_) => Err(ArgsError::UnexpectedPositional { subcommand: sub }),
+                None => Err(ArgsError::NonUtf8Argument),
+            };
+        }
+        let (k, v) = match bytes.iter().position(|b| *b == b'=') {
+            Some(i) => (
+                bytes.get(..i).unwrap_or_default(),
+                Some(OsString::from_vec(
+                    bytes.get(i + 1..).unwrap_or_default().to_vec(),
+                )),
+            ),
+            None => (bytes, None),
+        };
+        let key = std::str::from_utf8(k).map_err(|_| ArgsError::NonUtf8Argument)?;
+        Ok((key.to_string(), v))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = tok.to_str().ok_or(ArgsError::NonUtf8Argument)?;
+        if !s.starts_with("--") {
+            return Err(ArgsError::UnexpectedPositional { subcommand: sub });
+        }
+        Ok(match s.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(OsString::from(v))),
+            None => (s.to_string(), None),
+        })
+    }
 }
 
 /// 値の取り出し手。表で必須検証済みのため、欠落は `MissingRequired` で返す。
@@ -768,6 +802,19 @@ mod tests {
             OsString::from("inspect"),
             OsString::from("--project-dir"),
             bad.clone(),
+        ]);
+        assert_eq!(
+            r,
+            Ok(Invocation::Run(Command::Inspect(InspectArgs {
+                project_dir: PathBuf::from(bad.clone())
+            })))
+        );
+        // `--key=value` 形式でも同じく損失なく受理する。
+        let mut eq = b"--project-dir=".to_vec();
+        eq.push(0xff);
+        let r = parse([
+            OsString::from("inspect"),
+            std::ffi::OsStr::from_bytes(&eq).to_os_string(),
         ]);
         assert_eq!(
             r,
