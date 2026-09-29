@@ -48,7 +48,7 @@
 //! 終了状態をそのまま使う。
 //!
 //! 期限内に終了しなかった、または `try_wait()` 自体が失敗した場合は
-//! `Child::kill()` で直接の子を `SIGKILL` してから [`wait_after_kill`] で
+//! `Child::kill()` で直接の子を `SIGKILL` してから [`wait_after_kill_until`] で
 //! 回収し、[`TrainProcessError::WallTimeout`]（`LimitExceeded`＝20）として
 //! 分類する（この分類は変えない）。直接の子は Rust 自身の未回収の子である
 //! ため、`wait()` するまで pid が OS に返却されない（＝再利用されない）。
@@ -59,6 +59,26 @@
 //! P1。以前の「観測時刻が締め切り後でも成功扱いしてしまう」種類の競合と
 //! 同根）。[`run_train`] はこの観測を [`WaitOutcome::LateExit`] として
 //! 区別し、`Child::kill()` を呼ばずに `WallTimeout` として扱う。
+//!
+//! # キャンセル（REQ-34・TASK-34.1-1・#144）
+//!
+//! [`run_train_cancellable`] は [`CancelToken`] が立つと、直接の子
+//! （supervisor）へ `Child::kill()`（`SIGKILL`）を送って回収し
+//! [`TrainRunEnd::Cancelled`] を返す。送るシグナルは std だけで送れる
+//! `SIGKILL` に限る（`SIGTERM` による graceful cancel は `libc`／`unsafe`
+//! が要り、ユーザー承認事項）。kill は未回収の直接の子にだけ送り、
+//! `try_wait()` で既に終了していたら kill せず通常経路へ合流する。
+//! キャンセルと壁時計締め切りが同時に成立したらキャンセルを優先する。
+//! kill の送出失敗で終了も確認できない場合は `Cancelled` とせず監視を続け、
+//! 壁時計の上限で回収する。SIGKILL 後の回収確認の失敗（上限超過）は
+//! エラーで返し、ジョブは `Failed` になる（生存した子を残したまま終端の
+//! キャンセル完了にしない。REQ-39）。子の終了・回収後に届いたキャンセルは
+//! 結果の分類を完了して `Completed` を返す（`Cancelling` → `Completed`）。
+//!
+//! 未実装（実装済みを装わない）: supervisor は `SIGKILL` されると後始末を
+//! しないため、予約済み `out_dir`・tmp の残置と、finalize 完了後に kill
+//! した場合の整合は #145（TASK-34.1-2）で扱う。キャンセルの終了コード写像
+//! は TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
 //!
 //! # windows（対象外・fail-closed）
 //!
@@ -507,11 +527,352 @@ impl TrainRun {
     }
 }
 
+/// 学習ジョブのキャンセル要求を運ぶ共有フラグ（REQ-34・TASK-34.1-1・#144）。
+///
+/// [`crate::job::JobHandle::cancel`] が立て、[`run_train_cancellable`] が
+/// 待ちの刻みごとに確認する。クローン間で同じフラグを共有し、`Send + Sync`
+/// なのでスレッドをまたいで使える。一度立てたら戻せない。
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// 立っていないトークンを作る。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// キャンセルを要求する（冪等）。
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// キャンセルが要求されたか。
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`run_train_cancellable`] の終わり方。キャンセルはエラーではない
+/// 終わり方として表す。
+///
+/// キャンセルを REQ-21 の 7 種の終了コードのどれへ写すかは CLI の入出力契約
+/// の設計事項で、TASK-33.x での承認事項（本 issue では決めない。そのため
+/// [`TrainProcessError`] にはバリアントを足していない）。
+#[derive(Debug)]
+pub enum TrainRunEnd {
+    /// 子が最後まで走り、結果を得た。
+    Completed(TrainRun),
+    /// キャンセルで止めた。成果物は持たない（成功として扱わない）。
+    Cancelled(CancelledRun),
+}
+
+/// キャンセルで止めた実行の診断情報。ワーカーの出力は保持しない
+/// （データ由来の文字列を持たない。`.claude/rules/security.md`）。
+///
+/// 予約済み `out_dir`・tmp の残置と、finalize 完了後に kill した場合の
+/// 整合は #145（TASK-34.1-2）で扱う。本型は公開場所に何も残らないことを
+/// 主張しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledRun {
+    elapsed: Duration,
+    child_spawned: bool,
+    child_reaped: bool,
+    signal: Option<i32>,
+}
+
+impl CancelledRun {
+    /// 子プロセスを起動する前にキャンセル済みだった場合の結果
+    /// （`Queued` のまま取り消されたジョブ。REQ-34・#144）。
+    pub(crate) fn before_start() -> Self {
+        Self {
+            elapsed: Duration::ZERO,
+            child_spawned: false,
+            child_reaped: true,
+            signal: None,
+        }
+    }
+
+    /// 開始からキャンセル完了までの経過時間。
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// 子プロセスを起動したか（起動前にキャンセルされたら `false`）。
+    #[must_use]
+    pub fn child_spawned(&self) -> bool {
+        self.child_spawned
+    }
+
+    /// 直接の子を回収（wait）できたか。回収を確認できない場合は
+    /// `Cancelled` ではなくエラーで返すため、`Cancelled` では常に `true`。
+    #[must_use]
+    pub fn child_reaped(&self) -> bool {
+        self.child_reaped
+    }
+
+    /// 子を止めたシグナル番号（`SIGKILL` なら `Some(9)`）。
+    #[must_use]
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+}
+
+/// [`cancel_child`] の結果。
+#[cfg(unix)]
+enum CancelStep {
+    /// 確認した時点で子は既に終了していた（回収済み。kill していない）。
+    AlreadyExited(ExitStatus),
+    /// `SIGKILL` を送って止めた。
+    Cancelled(CancelledRun),
+    /// `kill()` の送出に失敗し、直後の `try_wait()` でも終了を確認できなかった
+    /// （子はまだ生きている可能性がある）。`Child` を drop しても子は止まらない
+    /// ため、呼び出し元は監視を続け、壁時計の上限で改めて回収する
+    /// （codex/review 指摘 P0。REQ-39「資源の上限」）。壁時計の期限で kill 後の
+    /// 回収待ちを打ち切った場合も同じ扱いで、`WallTimeout` として回収する。
+    StillRunning,
+    /// kill 後の回収待ちが壁時計の期限に達して打ち切られた（または期限後に
+    /// 回収を試みた）。`WallTimeout { child_reaped }` として返す。回収の成否は
+    /// `child_reaped` で示す。回収失敗は経路を問わず
+    /// `WallTimeout`（limit_exceeded）へ写し、runtime_error にしない
+    /// （Cursor Bugbot 指摘 Medium。REQ-21・REQ-39）。
+    WallDeadline { child_reaped: bool },
+}
+
+/// 子の回収結果（状態・観測時刻・自分の `kill()` が成功したか）。
+/// [`classify_cancel_outcome`] の入力（REQ-34・REQ-39）。
+#[cfg(unix)]
+struct Reaped {
+    status: ExitStatus,
+    at: Instant,
+    /// 回収までに自分の `kill()` が成功したか。失敗した・kill 前に終了していた
+    /// 場合の `SIGKILL` 終了は外部由来の可能性があり `Cancelled` にしない。
+    kill_delivered: bool,
+}
+
+/// キャンセル結末の分類。キャンセルと壁時計期限の優先規則を持つ**唯一**の
+/// 関数で、すべてのキャンセル経路が回収結果をここへ渡す（経路ごとに分岐を
+/// 散らさない。codex/review 指摘 P1。REQ-34・REQ-39）。
+///
+/// 規則は「子の回収を観測した時刻が壁時計の期限より前か後か」だけで決める。
+/// - 回収を確認できなかった: `WallDeadline { child_reaped: false }`
+/// - 期限以後に回収した（キャンセル要求が先でも）: `WallDeadline { child_reaped: true }`
+/// - 期限前に回収し、自分の kill が成功して `SIGKILL` 終了だった: `Cancelled`
+/// - 期限前に回収したが、自然終了・外部由来の `SIGKILL`（kill 失敗・kill 前に
+///   終了）だった: `AlreadyExited`（通常の結果分類へ戻す。成功した学習を `Cancelled` と
+///   誤記録しない）
+///
+/// `Cancelled` は自分の `kill()` の成功（`kill_delivered`）を条件にする。
+#[cfg(unix)]
+fn classify_cancel_outcome(
+    reaped: Option<Reaped>,
+    wall_deadline: Instant,
+    started: Instant,
+) -> CancelStep {
+    use std::os::unix::process::ExitStatusExt;
+    match reaped {
+        None => CancelStep::WallDeadline {
+            child_reaped: false,
+        },
+        Some(r) if r.at >= wall_deadline => CancelStep::WallDeadline { child_reaped: true },
+        Some(r) if !r.kill_delivered || r.status.signal() != Some(SIGKILL) => {
+            CancelStep::AlreadyExited(r.status)
+        }
+        Some(r) => CancelStep::Cancelled(CancelledRun {
+            elapsed: started.elapsed(),
+            child_spawned: true,
+            child_reaped: true,
+            signal: r.status.signal(),
+        }),
+    }
+}
+
+/// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収のときに
+/// 限り kill（`SIGKILL`）を送って回収する。既に回収済みの子へ kill を送らない
+/// （pid 再利用で無関係なプロセスを止めない。モジュール doc「完了検知・
+/// タイムアウト時の回収順序」と同じ不変条件）。子孫は lifeline に委ねる。
+/// 待機エラー・回収失敗でも `Child` を手放さず壁時計の期限まで再試行し、
+/// 結末は [`classify_cancel_outcome`] で 1 か所で決める。
+/// `final_grace` は期限後の最後の回収待ち（通常は [`KILL_WAIT_TIMEOUT`]）。
+#[cfg(unix)]
+fn cancel_child<C: ChildControl>(
+    child: &mut C,
+    started: Instant,
+    wall_deadline: Instant,
+    final_grace: Duration,
+) -> CancelStep {
+    // キャンセル処理全体の待機を `min(KILL_WAIT_TIMEOUT, 壁時計の残り)` で
+    // 抑える（REQ-39「資源の上限」）。
+    let deadline = bounded_deadline(Instant::now(), wall_deadline);
+    // kill 成功の記録。全経路・全再試行で持ち回る単調な状態（`ensure_reaped` へ
+    // `&mut` で渡し、戻り値で上書きしない）。
+    let mut kill_delivered = false;
+    match try_wait_interrupt_bounded(|| child.try_wait(), deadline) {
+        Ok(Some(status)) => {
+            let reaped = Some(Reaped {
+                status,
+                at: Instant::now(),
+                kill_delivered: false,
+            });
+            return classify_cancel_outcome(reaped, wall_deadline, started);
+        }
+        Ok(None) => {}
+        Err(_) => {
+            let reaped = ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered);
+            return classify_cancel_outcome(reaped, wall_deadline, started);
+        }
+    }
+    // `kill()` の送出に失敗して終了も確認できないときは `StillRunning` を返し、
+    // 呼び出し元が監視を続けて壁時計の上限で回収する。
+    if child.kill().is_err() {
+        // kill 送出に失敗しても、直前に既に終了していた可能性を再確認する。
+        return match child.try_wait() {
+            Ok(Some(status)) => {
+                let reaped = Some(Reaped {
+                    status,
+                    at: Instant::now(),
+                    kill_delivered: false,
+                });
+                classify_cancel_outcome(reaped, wall_deadline, started)
+            }
+            _ => CancelStep::StillRunning,
+        };
+    }
+    kill_delivered = true;
+    let reaped = match wait_after_kill_until(child, deadline) {
+        Some(status) => Some(Reaped {
+            status,
+            at: Instant::now(),
+            kill_delivered,
+        }),
+        None => ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered),
+    };
+    classify_cancel_outcome(reaped, wall_deadline, started)
+}
+
+/// `try_wait` を 1 回確認する。`Interrupted`（`EINTR`）は再試行するが、毎回
+/// `deadline` を確認し、到達したら `Interrupted` のエラーで返す（無限ループ
+/// 防止。REQ-39）。`Ok(None)` は「まだ生きている」。
+#[cfg(unix)]
+fn try_wait_interrupt_bounded(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+    deadline: Instant,
+) -> std::io::Result<Option<ExitStatus>> {
+    loop {
+        match try_wait() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// 壁時計超過のエラー（`limit_exceeded`）を作る。
+#[cfg(unix)]
+fn wall_timeout_error(limits: &RunLimits, child_reaped: bool) -> TrainProcessError {
+    TrainProcessError::WallTimeout {
+        limit_ms: u64::try_from(limits.wall_timeout().as_millis()).unwrap_or(u64::MAX),
+        child_reaped,
+    }
+}
+
+/// キャンセルを採用するか。壁時計の期限（`deadline`）より前に観測した
+/// キャンセルだけを採用し、期限後は `WallTimeout` の分類を優先する
+/// （codex/review 指摘 P1。REQ-34・REQ-39）。
+#[cfg(unix)]
+fn cancel_applies(now: Instant, deadline: Instant, cancel: &CancelToken) -> bool {
+    now < deadline && cancel.is_cancelled()
+}
+
+/// 子プロセスの操作（`Child` の kill・非ブロッキング待ち）。エラー注入
+/// テストのための差し替え点で、実運用は [`Child`] の実装のみ。
+#[cfg(unix)]
+trait ChildControl {
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+}
+
+#[cfg(unix)]
+impl ChildControl for Child {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+}
+
+/// 待機エラー後に、子が回収されたと確認できるまで `Child` を手放さない。
+/// `retry_until`（壁時計の期限）まで `kill()` と `try_wait()` を毎周回
+/// 再試行し、期限後は最後の `kill()` と `final_grace` 以内の有界な回収待ちを
+/// する。回収を確認できなければ `None`、確認できれば状態と観測時刻。`None` は常に
+/// 壁時計の期限を過ぎた後なので、呼び出し側は経路を問わず
+/// `WallTimeout { child_reaped: false }`（limit_exceeded）で返す。観測時刻が
+/// 期限以後なら `child_reaped: true` の `WallTimeout`（REQ-21・REQ-39）。
+#[cfg(unix)]
+fn ensure_reaped<C: ChildControl>(
+    child: &mut C,
+    retry_until: Instant,
+    final_grace: Duration,
+    kill_delivered: &mut bool,
+) -> Option<Reaped> {
+    // `kill_delivered` は単調（一度 true になったら戻さない）。再試行の kill が
+    // 「既に終了」で失敗しても、それ以前に成功した kill の記録を消さない
+    // （codex/review 指摘 P1・Cursor Bugbot 指摘。REQ-34）。
+    loop {
+        *kill_delivered |= child.kill().is_ok();
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(Reaped {
+                status,
+                at: Instant::now(),
+                kill_delivered: *kill_delivered,
+            });
+        }
+        if Instant::now() >= retry_until {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    *kill_delivered |= child.kill().is_ok();
+    let grace_deadline = Instant::now() + final_grace;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(Reaped {
+                status,
+                at: Instant::now(),
+                kill_delivered: *kill_delivered,
+            });
+        }
+        if Instant::now() >= grace_deadline {
+            return None;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 壁時計超過後の回収。期限は既に過ぎているため、`ensure_reaped` の最後の
+/// kill と `final_grace` 以内の有界な回収待ちに当たる。回収できたかを返し、
+/// できなくても呼び出し側は `WallTimeout { child_reaped: false }` を返す
+/// （超過を `runtime_error` に化けさせない。REQ-21・REQ-39）。
+#[cfg(unix)]
+fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration) -> bool {
+    ensure_reaped(child, Instant::now(), final_grace, &mut false).is_some()
+}
+
+/// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
 /// `SIGKILL` 送出後、直接の子プロセスの終了待ちあたりの上限（REQ-39
 /// 「資源の上限」）。`SIGKILL` は通常即座に効くため、この上限に達するのは
 /// 割り込み不可能な OS 側の待ち（D state）等の極めて稀なケースに限られる
 /// （Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
-/// #178 PR #233 レビュー。[`wait_after_kill`] 参照）。
+/// #178 PR #233 レビュー。[`wait_after_kill_until`] 参照）。
 #[cfg(unix)]
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -520,7 +881,7 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `try_wait()` 自体が `ErrorKind::Interrupted`（`EINTR`。シグナル配送等で
 /// 発生しうる retryable なエラー）を返した場合は打ち切らず再試行する
 /// （[`drain_capped`] の `EINTR` 扱いと同じ理由。Cursor Bugbot 指摘 Medium
-/// 「Pipe reads fail on interrupt」と同種の欠陥が [`wait_after_kill`] にも
+/// 「Pipe reads fail on interrupt」と同種の欠陥が [`wait_after_kill_until`] にも
 /// あった：修正前は `EINTR` を他の `try_wait()` エラーと同列に扱い、
 /// `SIGKILL` 送出後で実際にはまだ生きているだけのプロセスを、回収に失敗した
 /// ものとして即座にエラー化していた。issue #178 PR #233 レビュー）。
@@ -529,7 +890,10 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// まで待っても終了しなかった（呼び出し元は上限超過として扱う）、
 /// `Err(e)`（`EINTR` 以外）は `try_wait()` 自体が失敗したことを示す。
 #[cfg(unix)]
-fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
+fn poll_wait_bounded<C: ChildControl>(
+    child: &mut C,
+    deadline: Instant,
+) -> std::io::Result<Option<ExitStatus>> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(Some(status)),
@@ -549,32 +913,23 @@ fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Op
     }
 }
 
-/// `child.kill()`（`SIGKILL` 送出）の直後に呼び、終了を最大
-/// [`KILL_WAIT_TIMEOUT`] までポーリングして待つ。
-///
-/// `SIGKILL` は通常即座に効くが、ディスク I/O 等での割り込み不可能な待ち
-/// （D state）に入っているプロセスは、シグナル配送後もしばらく（理論上は
-/// 無期限に）終了しないことがある。素朴な `Child::wait()` はこの間ブロック
-/// し続け、呼び出しスレッド自体が資源の上限なく固まってしまう（Cursor
-/// Bugbot 指摘 Medium「Timeout wait can block forever」。issue #178 PR #233
-/// レビュー）。[`poll_wait_bounded`] で上限つきでポーリングし、上限に達しても
-/// 終了しない場合は [`TrainProcessError::KillWaitTimedOut`] を返して呼び出し
-/// 元へ制御を返す（この場合プロセスは OS 上にゾンビとして残り続ける可能性が
-/// あり、確実な後始末を主張しない。fail-closed。REQ-39「資源の上限」）。
-///
-/// 呼び出し元は、対象の `child` がまだ reap（回収）されていないことを
-/// 保証すること（Rust が扱うのは直接の子〔supervisor〕だけであり、子孫
-/// プロセスの掃除は学習ワーカー側の lifeline に委ねる設計へ移行したため、
-/// `descendants_confirmed_clean` のような子孫掃除の確認フィールドはもはや
-/// 持たない。issue #178 PR #233 レビュー。モジュール doc 参照）。
+/// キャンセル待機の期限。`now + KILL_WAIT_TIMEOUT` と壁時計の期限の早い方
+/// （壁時計の上限を超えて待たない。REQ-39）。
 #[cfg(unix)]
-fn wait_after_kill(child: &mut Child) -> Result<ExitStatus, TrainProcessError> {
-    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
-    match poll_wait_bounded(child, deadline) {
-        Ok(Some(status)) => Ok(status),
-        Ok(None) => Err(TrainProcessError::KillWaitTimedOut),
-        Err(e) => Err(TrainProcessError::Wait { kind: e.kind() }),
-    }
+fn bounded_deadline(now: Instant, wall_deadline: Instant) -> Instant {
+    (now + KILL_WAIT_TIMEOUT).min(wall_deadline)
+}
+
+/// kill（`SIGKILL` 送出）の直後に呼び、終了を `deadline` までポーリングして
+/// 待つ。素朴な `wait()` は D state 等で無期限にブロックしうるため上限つきに
+/// する（Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
+/// #178 PR #233 レビュー。REQ-39「資源の上限」）。回収できれば `Some(status)`、
+/// 期限に達した・`try_wait()` が失敗した場合は `None`（呼び出し元は
+/// [`ensure_reaped`] で再試行し、回収を主張しない）。子孫の掃除は学習ワーカー
+/// 側の lifeline に委ねる（モジュール doc 参照）。
+#[cfg(unix)]
+fn wait_after_kill_until<C: ChildControl>(child: &mut C, deadline: Instant) -> Option<ExitStatus> {
+    poll_wait_bounded(child, deadline).ok().flatten()
 }
 
 /// 子プロセスの終了コード（unix はシグナル終了で `None` になりうる）を
@@ -619,6 +974,25 @@ pub fn run_train(
     _job_dir: &Path,
     _limits: &RunLimits,
 ) -> Result<TrainRun, TrainProcessError> {
+    Err(TrainProcessError::UnsupportedPlatform)
+}
+
+/// unix 以外では子を起動せず、キャンセル済みなら `Cancelled`（起動前キャンセル）、
+/// そうでなければ [`TrainProcessError::UnsupportedPlatform`] を返す（fail-closed）。
+/// 起動前キャンセルを未対応プラットフォームより優先し、unix 版と同じ結果に
+/// そろえる（`Start` 直後にキャンセルが届いても戻り値とジョブ状態が OS に
+/// よらず一致する。codex/review 指摘 P1。REQ-34）。
+#[cfg(not(unix))]
+pub fn run_train_cancellable(
+    _launcher: &WorkerLauncher,
+    _request: &TrainRequest,
+    _job_dir: &Path,
+    _limits: &RunLimits,
+    cancel: &CancelToken,
+) -> Result<TrainRunEnd, TrainProcessError> {
+    if cancel.is_cancelled() {
+        return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
+    }
     Err(TrainProcessError::UnsupportedPlatform)
 }
 
@@ -722,12 +1096,13 @@ fn observed_within_deadline(observed_at: Instant, deadline: Instant) -> bool {
 /// 関与しない**（学習ワーカー側の lifeline に委ねる設計。モジュール doc
 /// 参照）。unix 限定（windows 版は上記の `#[cfg(not(unix))]` 版を参照）。
 #[cfg(unix)]
-pub fn run_train(
+pub fn run_train_cancellable(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
     job_dir: &Path,
     limits: &RunLimits,
-) -> Result<TrainRun, TrainProcessError> {
+    cancel: &CancelToken,
+) -> Result<TrainRunEnd, TrainProcessError> {
     // `request` と `limits` は呼び出し元が別々の引数として渡すため、型では
     // 対応関係を強制できない。検証なしに `limits.wall_timeout()` を採用すると、
     // 短い `time_limit_seconds` の `request` に、別の（長い）リクエストから
@@ -739,6 +1114,11 @@ pub fn run_train(
     // 不変条件を、`request` との対応についても同様に守る）。
     if limits.wall_timeout() > RunLimits::for_request(request).wall_timeout() {
         return Err(TrainProcessError::InvalidRunLimits);
+    }
+    // 起動前にキャンセル済みなら、子プロセスも `request.json` も作らずに
+    // 返す（`Queued` のまま取り消されたジョブ。REQ-34・#144）。
+    if cancel.is_cancelled() {
+        return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
     }
     let guard = write_request_file(job_dir, request)?;
     let started = Instant::now();
@@ -757,6 +1137,13 @@ pub fn run_train(
         }
     }
 
+    // 最初の確認から `write_request_file`・環境構築を経る間にキャンセルが
+    // 要求された場合も、子プロセスを起動しない。`guard` は return で drop され
+    // `request.json` が削除される（REQ-34・#144。codex/review 指摘 P1）。
+    // 本確認以降の要求は、起動後の監視ループが子の kill として処理する。
+    if cancel.is_cancelled() {
+        return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
+    }
     let mut child = command
         .spawn()
         .map_err(|e| TrainProcessError::Spawn { kind: e.kind() })?;
@@ -774,11 +1161,38 @@ pub fn run_train(
     let deadline = started + limits.wall_timeout();
 
     // 標準出力の読み取りスレッドが完了する（EOF・上限超過・エラーの
-    // いずれか）のを、残りの壁時計予算だけ待つ。
-    let stdout_wait = stdout_rx.map(|rx| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        rx.recv_timeout(remaining)
-    });
+    // いずれか）のを、残りの壁時計予算だけ待つ。hang 中でもキャンセルに
+    // 反応できるよう、待ちを [`POLL_INTERVAL`] 刻みに分割し、各刻みで
+    // トークンを確認する（壁時計の上限そのものは緩めない）。
+    let mut pre_exited: Option<ExitStatus> = None;
+    let mut stdout_wait = None;
+    if let Some(rx) = stdout_rx.as_ref() {
+        // キャンセルは各刻みで確認する。`StillRunning`（kill 送出失敗で停止を
+        // 確認できない）の場合も待ちを一括せず、次の刻みで kill を再試行する
+        // （codex/review 指摘 P1。REQ-34・REQ-39）。壁時計の上限は緩めない。
+        let first = loop {
+            // 壁時計の期限後に観測したキャンセルは採用しない（期限超過を
+            // `Cancelled` で隠さない。codex/review 指摘 P1。REQ-39）。
+            if pre_exited.is_none() && cancel_applies(Instant::now(), deadline, cancel) {
+                match cancel_child(&mut child, started, deadline, KILL_WAIT_TIMEOUT) {
+                    CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
+                    // キャンセルが間に合わず子は既に終了していた（kill しない）。
+                    // 通常経路へ合流し、stdout を締め切りまで待つ。
+                    CancelStep::AlreadyExited(status) => pre_exited = Some(status),
+                    CancelStep::StillRunning => {}
+                    CancelStep::WallDeadline { child_reaped } => {
+                        return Err(wall_timeout_error(limits, child_reaped));
+                    }
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining.min(POLL_INTERVAL)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                other => break other,
+            }
+        };
+        stdout_wait = Some(first);
+    }
     // `stdout_wait` が `None` になるのは `stdout_pipe` を取得できなかった
     // 場合だが、本関数は常に `stdout(Stdio::piped())` を指定するため
     // 到達しない防御的分岐。到達したとしても後続の `match` が
@@ -795,6 +1209,36 @@ pub fn run_train(
     // モジュール doc「完了検知・タイムアウト時の回収順序」参照）。
     let wait_deadline = deadline;
     let outcome = loop {
+        if let Some(status) = pre_exited.take() {
+            if observed_within_deadline(Instant::now(), wait_deadline) {
+                break WaitOutcome::Exited(status);
+            }
+            break WaitOutcome::LateExit;
+        }
+        // キャンセルは期限内に観測した場合だけ採用する。期限後に観測した
+        // キャンセルより壁時計超過（`WallTimeout`）を優先し、超過を
+        // `Cancelled` で隠さない（codex/review 指摘 P1。REQ-39）。
+        if cancel_applies(Instant::now(), wait_deadline, cancel) {
+            match cancel_child(&mut child, started, wait_deadline, KILL_WAIT_TIMEOUT) {
+                CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
+                CancelStep::AlreadyExited(status) => {
+                    pre_exited = Some(status);
+                    continue;
+                }
+                CancelStep::WallDeadline { child_reaped } => {
+                    return Err(wall_timeout_error(limits, child_reaped));
+                }
+                CancelStep::StillRunning => {
+                    // 生存中の子の監視を続ける（次の周回で kill を再試行し、
+                    // 壁時計の上限に達すれば `TimedOut` として回収する）。
+                    if Instant::now() >= wait_deadline {
+                        break WaitOutcome::TimedOut;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 if observed_within_deadline(Instant::now(), wait_deadline) {
@@ -824,9 +1268,17 @@ pub fn run_train(
                 // 子プロセスを kill／wait せず放置してゾンビ化させる
                 // （Cursor Bugbot 指摘「Child leaked on wait error」）。
                 // エラーを返す前に必ず回収を試みる。
-                let _ = child.kill();
-                let _ = wait_after_kill(&mut child);
-                return Err(TrainProcessError::Wait { kind: e.kind() });
+                // 回収を確認できるまで `Child` を手放さず、壁時計の期限まで
+                // kill と回収を再試行する。確認できなければ
+                // `WallTimeout { child_reaped: false }`（codex/review 指摘 P0。REQ-39）。
+                return match ensure_reaped(&mut child, wait_deadline, KILL_WAIT_TIMEOUT, &mut false)
+                {
+                    // 回収を観測したのが期限以後なら壁時計超過（キャンセルと
+                    // 同じ規則。[`classify_cancel_outcome`]）。
+                    Some(r) if r.at >= wait_deadline => Err(wall_timeout_error(limits, true)),
+                    Some(_) => Err(TrainProcessError::Wait { kind: e.kind() }),
+                    None => Err(wall_timeout_error(limits, false)),
+                };
             }
         }
     };
@@ -844,8 +1296,7 @@ pub fn run_train(
             // 必ず `wait()` で回収する（ゾンビを残さない）。子孫プロセス
             // （`_worker` を含む）の掃除は学習ワーカー側の lifeline に
             // 委ねる（モジュール doc 参照）。
-            let _ = child.kill();
-            let child_reaped = wait_after_kill(&mut child).is_ok();
+            let child_reaped = reap_after_wall_timeout(&mut child, KILL_WAIT_TIMEOUT);
             (None, true, child_reaped)
         }
     };
@@ -898,23 +1349,35 @@ pub fn run_train(
     let stderr_wait_budget = deadline
         .saturating_duration_since(Instant::now())
         .min(READER_DRAIN_TIMEOUT);
+    // 直接の子は既に終了・回収済みで、キャンセルで止めるものが無い。この時点
+    // 以降にキャンセルが要求されても結果の分類を完了して `Completed` を返す
+    // （codex/review 指摘 P1・Bugbot High。正常終了したジョブを `Cancelled` と
+    // 記録しない。`Cancelling` → `Completed` は有効遷移。REQ-34・#144）。
+    let stderr_wait_deadline = Instant::now() + stderr_wait_budget;
     let stderr_drain = match stderr_rx {
-        Some(rx) => match rx.recv_timeout(stderr_wait_budget) {
-            Ok(drained) => Some(drained),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    // 直接の子（supervisor）は既に reap 済み（`timed_out`
-                    // が `false` でここへ到達した以上、`outcome` は
-                    // `WaitOutcome::Exited` であり `child_reaped == true`）。
-                    return Err(TrainProcessError::WallTimeout {
-                        limit_ms: u64::try_from(limits.wall_timeout().as_millis())
-                            .unwrap_or(u64::MAX),
-                        child_reaped,
-                    });
+        Some(rx) => loop {
+            let slice = stderr_wait_deadline
+                .saturating_duration_since(Instant::now())
+                .min(POLL_INTERVAL);
+            match rx.recv_timeout(slice) {
+                Ok(drained) => break Some(drained),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        // 直接の子（supervisor）は既に reap 済み（`timed_out`
+                        // が `false` でここへ到達した以上、`outcome` は
+                        // `WaitOutcome::Exited` であり `child_reaped == true`）。
+                        return Err(TrainProcessError::WallTimeout {
+                            limit_ms: u64::try_from(limits.wall_timeout().as_millis())
+                                .unwrap_or(u64::MAX),
+                            child_reaped,
+                        });
+                    }
+                    if Instant::now() >= stderr_wait_deadline {
+                        break None;
+                    }
                 }
-                None
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => None,
         },
         None => None,
     };
@@ -926,13 +1389,34 @@ pub fn run_train(
     let process_exit = classify_process_exit_status(status)?;
     let outcome = classify_exit(process_exit, &stdout_drain.kept, request)?;
 
-    Ok(TrainRun {
+    Ok(TrainRunEnd::Completed(TrainRun {
         outcome,
         exit_code: process_exit,
         elapsed,
         worker_stderr,
         stderr_truncated,
-    })
+    }))
+}
+
+/// [`run_train_cancellable`] を、キャンセルされない前提で呼ぶ従来の入口
+/// （挙動は #178 から変えない）。
+///
+/// 立てられることのないトークンを渡すため `Cancelled` には到達しない。
+/// それでもライブラリで panic しない方針（`.claude/rules/coding-rust.md`）
+/// により、到達時は `Wait { kind: Interrupted }` を返して安全側に倒す。
+#[cfg(unix)]
+pub fn run_train(
+    launcher: &WorkerLauncher,
+    request: &TrainRequest,
+    job_dir: &Path,
+    limits: &RunLimits,
+) -> Result<TrainRun, TrainProcessError> {
+    match run_train_cancellable(launcher, request, job_dir, limits, &CancelToken::new())? {
+        TrainRunEnd::Completed(run) => Ok(run),
+        TrainRunEnd::Cancelled(_) => Err(TrainProcessError::Wait {
+            kind: std::io::ErrorKind::Interrupted,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1424,369 @@ mod tests {
     use super::*;
     use crate::limits::MAX_TRAIN_WALL_SECONDS;
     use crate::request::{Device, TrainRequestParams};
+
+    /// REQ-34・REQ-39: `try_wait()` が `Interrupted` を返し続けても、期限で
+    /// 抜けて `Interrupted` のエラーを返す（無限ループしない）。
+    #[cfg(unix)]
+    #[test]
+    fn try_wait_interrupt_bounded_gives_up_at_deadline() {
+        let started = Instant::now();
+        let mut calls = 0u64;
+        let r = try_wait_interrupt_bounded(
+            || {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            },
+            Instant::now() + Duration::from_millis(50),
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(calls >= 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REQ-34: 期限前の `Interrupted` は再試行し、その後の結果を返す。
+    #[cfg(unix)]
+    #[test]
+    fn try_wait_interrupt_bounded_retries_before_deadline() {
+        let mut calls = 0;
+        let r = try_wait_interrupt_bounded(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(None)
+                }
+            },
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(r, Ok(None)));
+        assert_eq!(calls, 3);
+    }
+
+    /// REQ-34・REQ-39: 期限後に観測したキャンセルは採用せず、壁時計超過を
+    /// 優先する。期限前なら採用する。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_applies_only_before_wall_deadline() {
+        let token = CancelToken::new();
+        let now = Instant::now();
+        assert!(!cancel_applies(now, now + Duration::from_secs(1), &token));
+        token.cancel();
+        assert!(cancel_applies(now, now + Duration::from_secs(1), &token));
+        assert!(!cancel_applies(now, now, &token));
+        assert!(!cancel_applies(now + Duration::from_secs(1), now, &token));
+    }
+
+    /// REQ-39: キャンセル待機の期限は壁時計の残りで抑える。
+    #[cfg(unix)]
+    #[test]
+    fn bounded_deadline_is_min_of_kill_wait_and_wall_remaining() {
+        let now = Instant::now();
+        let short = now + Duration::from_millis(100);
+        assert_eq!(bounded_deadline(now, short), short);
+        let long = now + KILL_WAIT_TIMEOUT + Duration::from_secs(60);
+        assert_eq!(bounded_deadline(now, long), now + KILL_WAIT_TIMEOUT);
+        assert_eq!(bounded_deadline(now, now), now);
+    }
+
+    /// REQ-34・REQ-39: 壁時計の残りが短いとき、SIGKILL を受けない子に対する
+    /// キャンセルの回収待ちが `KILL_WAIT_TIMEOUT` ではなく残り時間内で終わる。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_wait_is_bounded_by_wall_remaining() {
+        // SIGKILL は無視できないため、子が終了しない状況は作れない。代わりに
+        // 期限切れの壁時計でも、生きている子の kill 後の回収が
+        // 5 秒より十分早く（即時に）終わることと、結果が有限であることを確かめる。
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let r = cancel_child(
+            &mut child,
+            started,
+            started + Duration::from_millis(200),
+            KILL_WAIT_TIMEOUT,
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        match r {
+            CancelStep::Cancelled(run) => assert_eq!(run.signal(), Some(SIGKILL)),
+            // 壁時計の期限で打ち切った場合は実行時エラーではなく `StillRunning`
+            // （呼び出し元が `WallTimeout` として回収する）。
+            CancelStep::StillRunning | CancelStep::WallDeadline { .. } => {}
+            _ => panic!("unexpected cancel step"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FakeChild {
+        kill_results: Vec<std::io::Result<()>>,
+        wait_results: Vec<std::io::Result<Option<ExitStatus>>>,
+        kills: usize,
+        always_err: bool,
+        /// この時刻以後の `try_wait()` は `SIGKILL` 終了を返す。
+        reap_at: Option<Instant>,
+    }
+
+    #[cfg(unix)]
+    impl ChildControl for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills += 1;
+            if self.kill_results.is_empty() {
+                Ok(())
+            } else {
+                self.kill_results.remove(0)
+            }
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            if self.always_err {
+                Err(io_err())
+            } else if !self.wait_results.is_empty() {
+                self.wait_results.remove(0)
+            } else if self.reap_at.is_some_and(|t| Instant::now() >= t) {
+                use std::os::unix::process::ExitStatusExt;
+                Ok(Some(ExitStatus::from_raw(SIGKILL)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn io_err() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// REQ-39: kill が失敗し try_wait がエラーでも、再試行して回収できたら
+    /// 成功する（Child を手放さない）。
+    #[cfg(unix)]
+    #[test]
+    fn ensure_reaped_retries_after_kill_and_wait_errors() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut c = FakeChild {
+            kill_results: vec![Err(io_err()), Err(io_err())],
+            wait_results: vec![Err(io_err()), Ok(None), Ok(Some(ExitStatus::from_raw(9)))],
+            kills: 0,
+            always_err: false,
+            reap_at: None,
+        };
+        let r = ensure_reaped(
+            &mut c,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(50),
+            &mut false,
+        );
+        assert_eq!(r.and_then(|r| r.status.signal()), Some(9));
+        assert!(c.kills >= 3);
+    }
+
+    /// REQ-39: 回収を確認できない場合は `None`（呼び出し側が `WallTimeout` にする）。
+    #[cfg(unix)]
+    #[test]
+    fn ensure_reaped_returns_none_when_never_reaped() {
+        let mut c = FakeChild {
+            kill_results: vec![],
+            wait_results: vec![],
+            kills: 0,
+            always_err: false,
+            reap_at: None,
+        };
+        let started = Instant::now();
+        let r = ensure_reaped(
+            &mut c,
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_millis(100),
+            &mut false,
+        );
+        assert!(r.is_none());
+        assert!(c.kills >= 2);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// REQ-21・REQ-39: 壁時計超過後の回収は kill 失敗を再試行して回収でき、
+    /// 回収できなければ `false`（呼び出し側は `WallTimeout` を維持する）。
+    #[cfg(unix)]
+    #[test]
+    fn reap_after_wall_timeout_reports_reaped_flag() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut ok = FakeChild {
+            kill_results: vec![Err(io_err())],
+            wait_results: vec![Err(io_err()), Ok(Some(ExitStatus::from_raw(9)))],
+            kills: 0,
+            always_err: false,
+            reap_at: None,
+        };
+        assert!(reap_after_wall_timeout(&mut ok, Duration::from_millis(500)));
+        assert!(ok.kills >= 2);
+        let mut never = FakeChild {
+            kill_results: vec![],
+            wait_results: vec![],
+            kills: 0,
+            always_err: false,
+            reap_at: None,
+        };
+        assert!(!reap_after_wall_timeout(
+            &mut never,
+            Duration::from_millis(100)
+        ));
+    }
+
+    /// REQ-21・REQ-34・REQ-39: 期限より前に回収が完了したキャンセルだけが
+    /// `Cancelled`（唯一の規則 `classify_cancel_outcome`）。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_reaped_before_deadline_is_cancelled() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            wait_results: vec![Ok(None)],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(step, CancelStep::Cancelled(_)));
+    }
+
+    /// REQ-21・REQ-39: キャンセル要求が先でも、回収を期限後に観測したら
+    /// `WallDeadline { child_reaped: true }`（`WallTimeout`）で `Cancelled` にしない。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_reaped_after_deadline_is_wall_timeout_reaped() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            wait_results: vec![Ok(None)],
+            reap_at: Some(started + Duration::from_millis(250)),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(
+            step,
+            CancelStep::WallDeadline { child_reaped: true }
+        ));
+    }
+
+    /// REQ-21・REQ-39: キャンセル中の `try_wait()` エラーが続き期限までに
+    /// 回収を確定できなければ `WallDeadline { child_reaped: false }`。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_persistent_wait_errors_are_wall_timeout_not_reaped() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            always_err: true,
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(
+            step,
+            CancelStep::WallDeadline {
+                child_reaped: false
+            }
+        ));
+        assert!(c.kills >= 2);
+    }
+
+    /// REQ-21・REQ-39: 待機エラー後に期限後に回収できた場合は
+    /// `WallDeadline { child_reaped: true }`（`runtime_error` にしない）。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_wait_error_then_late_reap_is_wall_timeout_reaped() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            wait_results: vec![Err(io_err())],
+            reap_at: Some(started + Duration::from_millis(250)),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(
+            step,
+            CancelStep::WallDeadline { child_reaped: true }
+        ));
+    }
+
+    /// REQ-34: 自分の kill が成功して `SIGKILL` 終了なら `Cancelled`。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_with_delivered_kill_is_cancelled() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            wait_results: vec![Ok(None)],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(step, CancelStep::Cancelled(_)));
+    }
+
+    /// REQ-34: kill が失敗したのに `SIGKILL` で終わった子（外部由来）は
+    /// `Cancelled` にせず `AlreadyExited`（通常の結果分類へ戻す）。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_with_failed_kill_and_external_sigkill_is_not_cancelled() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            kill_results: vec![Err(io_err())],
+            wait_results: vec![Ok(None)],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(step, CancelStep::AlreadyExited(_)));
+    }
+
+    /// REQ-34: 1 回目の kill が成功し、回収が一時エラーになり、再試行の kill が
+    /// 「既に終了」で失敗して `SIGKILL` 終了として回収された場合も、送信済みの
+    /// kill を記録しているので `Cancelled`。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_keeps_earlier_kill_record_across_retries() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            kill_results: vec![Ok(()), Err(io_err()), Err(io_err())],
+            wait_results: vec![Ok(None), Err(io_err())],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(step, CancelStep::Cancelled(_)));
+    }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
         TrainRequest::new(TrainRequestParams {

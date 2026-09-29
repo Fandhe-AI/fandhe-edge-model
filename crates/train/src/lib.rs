@@ -54,6 +54,16 @@
 //! オーナー承認前の暫定値）を探索候補の集合へ解決する（REQ-19・TASK-19.2・
 //! issue #77）。学習ワーカーには常に解決済みの `kind` を渡す。
 //!
+//! # キャンセル操作（TASK-34.1-1・issue #144）
+//!
+//! [`process::run_train_cancellable`] と [`job`]（状態遷移・
+//! [`job::JobHandle::cancel`]）が、学習ジョブへのキャンセル（直接の子への
+//! `SIGKILL`）と状態遷移（実行中 → キャンセル中 → キャンセル済み）を担う
+//! （REQ-34）。後続・未実装: `SIGTERM` による graceful cancel（依存追加か
+//! `unsafe` が要りユーザー承認事項）・キャンセルの終了コード写像
+//! （TASK-33.x）・探索途中のキャンセル伝播・キャンセル後に残る予約済み
+//! `out_dir` の扱い（#145）・`job.json` 永続化とクラッシュ検出（#146）。
+//!
 //! # スコープ外（#178 以降も対象外）
 //!
 //! - 解決記録（[`kind_resolution::KindResolutionRecord`]）の CLI 出力への反映
@@ -88,6 +98,7 @@
 //!   への写像（TASK-33.x）
 
 pub mod error;
+pub mod job;
 mod kind_defaults;
 // kind 省略時の既定候補の解決（REQ-19・TASK-19.2・#77）。
 pub mod kind_resolution;
