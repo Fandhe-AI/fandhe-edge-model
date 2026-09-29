@@ -701,6 +701,14 @@ fn try_wait_interrupt_bounded(
     }
 }
 
+/// キャンセルを採用するか。壁時計の期限（`deadline`）より前に観測した
+/// キャンセルだけを採用し、期限後は `WallTimeout` の分類を優先する
+/// （codex/review 指摘 P1。REQ-34・REQ-39）。
+#[cfg(unix)]
+fn cancel_applies(now: Instant, deadline: Instant, cancel: &CancelToken) -> bool {
+    now < deadline && cancel.is_cancelled()
+}
+
 /// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
@@ -1008,7 +1016,9 @@ pub fn run_train_cancellable(
         // 確認できない）の場合も待ちを一括せず、次の刻みで kill を再試行する
         // （codex/review 指摘 P1。REQ-34・REQ-39）。壁時計の上限は緩めない。
         let first = loop {
-            if pre_exited.is_none() && cancel.is_cancelled() {
+            // 壁時計の期限後に観測したキャンセルは採用しない（期限超過を
+            // `Cancelled` で隠さない。codex/review 指摘 P1。REQ-39）。
+            if pre_exited.is_none() && cancel_applies(Instant::now(), deadline, cancel) {
                 match cancel_child(&mut child, started)? {
                     CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
                     // キャンセルが間に合わず子は既に終了していた（kill しない）。
@@ -1047,9 +1057,10 @@ pub fn run_train_cancellable(
             }
             break WaitOutcome::LateExit;
         }
-        // キャンセルは締め切り判定より先に確認する（利用者の明示操作を
-        // 優先する。両方が同時に成立した場合は `Cancelled`）。
-        if cancel.is_cancelled() {
+        // キャンセルは期限内に観測した場合だけ採用する。期限後に観測した
+        // キャンセルより壁時計超過（`WallTimeout`）を優先し、超過を
+        // `Cancelled` で隠さない（codex/review 指摘 P1。REQ-39）。
+        if cancel_applies(Instant::now(), wait_deadline, cancel) {
             match cancel_child(&mut child, started)? {
                 CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
                 CancelStep::AlreadyExited(status) => {
@@ -1283,6 +1294,20 @@ mod tests {
         );
         assert!(matches!(r, Ok(None)));
         assert_eq!(calls, 3);
+    }
+
+    /// REQ-34・REQ-39: 期限後に観測したキャンセルは採用せず、壁時計超過を
+    /// 優先する。期限前なら採用する。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_applies_only_before_wall_deadline() {
+        let token = CancelToken::new();
+        let now = Instant::now();
+        assert!(!cancel_applies(now, now + Duration::from_secs(1), &token));
+        token.cancel();
+        assert!(cancel_applies(now, now + Duration::from_secs(1), &token));
+        assert!(!cancel_applies(now, now, &token));
+        assert!(!cancel_applies(now + Duration::from_secs(1), now, &token));
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
