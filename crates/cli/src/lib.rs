@@ -14,4 +14,5 @@
 //! `main.rs` は解析成功後も工程を実行せず `runtime_error` を返す。
 
 pub mod args;
+pub mod error_report;
 pub mod output;
