@@ -44,6 +44,14 @@ fn window_scores(ids: &[i64]) -> Vec<f64> {
 
 struct WindowBackend;
 impl ScoringBackend for WindowBackend {
+    /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+    fn scores_limited(
+        &self,
+        ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+        self.scores(ids)
+    }
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         Ok(window_scores(ids.as_slice()))
     }
@@ -58,6 +66,14 @@ impl Preprocessor for SpyPre {
 }
 struct SpyBackend(Rc<RefCell<Vec<Vec<i64>>>>);
 impl ScoringBackend for SpyBackend {
+    /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+    fn scores_limited(
+        &self,
+        ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+        self.scores(ids)
+    }
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         self.0.borrow_mut().push(ids.as_slice().to_vec());
         Ok(window_scores(ids.as_slice()))
@@ -276,6 +292,14 @@ fn req39_token_count_limit_rejected_before_backend() {
 
 struct FixedBackend(Vec<f64>);
 impl ScoringBackend for FixedBackend {
+    /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+    fn scores_limited(
+        &self,
+        ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+        self.scores(ids)
+    }
     fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         Ok(self.0.clone())
     }
