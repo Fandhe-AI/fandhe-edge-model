@@ -1,0 +1,9 @@
+{
+  "_meta": {
+    "description": "Default candidate set used when the user omits kind (REQ-19, TASK-19.2). Element order is also the tie-break order on equal validation accuracy (declaration order). Cross-checked by crates/train/src/kind_resolution.rs and trainer/tests/test_default_candidates_fixture.py. PROVISIONAL: the choice of default candidates is pending owner approval; change this file only."
+  },
+  "default_candidates": [
+    { "kind": "c1", "kind_version": 1 },
+    { "kind": "c3", "kind_version": 1 }
+  ]
+}
