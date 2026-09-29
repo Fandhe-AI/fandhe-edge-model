@@ -829,15 +829,20 @@ fn req39_output_caps_are_enforced_at_write_time() {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let counter = dir.join("chunks");
         let body = format!(
-            "i=0\nwhile [ $i -lt {TOTAL_CHUNKS} ]; do\n  head -c {CHUNK} /dev/zero {redirect} || exit 0\n  i=$((i+1))\n  echo $i >>'{}'\ndone\nexit 0",
+            "i=0\necho 0 >'{0}'\nwhile [ $i -lt {TOTAL_CHUNKS} ]; do\n  head -c {CHUNK} /dev/zero {redirect} || exit 0\n  i=$((i+1))\n  echo $i >>'{0}'\ndone\nexit 0",
             counter.display()
         );
         let o = run_with_fake_bin(name, &body);
-        // 追記方式のため、子が停止直前に書き込み途中でも最終行の完全な値だけを採用する
-        let chunks: u64 = std::fs::read_to_string(&counter)
-            .ok()
-            .and_then(|s| s.lines().rev().find_map(|l| l.trim().parse().ok()))
-            .unwrap_or(0);
+        // 追記方式のため、子が停止直前に書き込み途中でも最終行の完全な値だけを採用する。
+        // 子は開始直後に 0 を書くので完全な値は必ず 1 行以上ある。読めない・有効行が無い場合は
+        // 計測不能として失敗させる（0 に丸めて上限検証を通さない）
+        let raw = std::fs::read_to_string(&counter)
+            .unwrap_or_else(|e| panic!("{name}: cannot read chunk counter: {e}"));
+        let chunks: u64 = raw
+            .lines()
+            .rev()
+            .find_map(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name}: chunk counter has no complete value"));
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(o.code, Some(70), "{name}");
         assert_eq!(

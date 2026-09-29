@@ -215,7 +215,9 @@ esac
 
 mkdir -p -- "$out_dir" || fail 70 runtime_error "cannot create output directory"
 # 書き込み不能な既存の空ディレクトリを工程実行の前に検出する（set -e で JSON なしに終了させない。REQ-21・REQ-33）
-{ : >"$out_dir/run.meta.json"; } 2>/dev/null || fail 70 runtime_error "cannot write run record"
+probe="$out_dir/.write-probe.$$"
+{ : >"$probe"; } 2>/dev/null || fail 70 runtime_error "cannot write run record"
+rm -f -- "$probe"
 
 work=$(mktemp -d) || fail 70 runtime_error "cannot create temporary directory"
 child=
@@ -443,6 +445,10 @@ ended=$(utc_now)
 if [ "$final_rc" -eq 0 ]; then
     top_code=ok
     msg="all stages completed under sandbox"
+    # 評価が skipped の工程を含むなら、評価未実施を集計の文言にも明示する（REQ-17）
+    case "$steps_json" in
+        *'"step":"evaluate"'*'"status":"skipped"'*) msg="stages completed under sandbox but evaluation was skipped" ;;
+    esac
 else
     top_code=$(code_name "$final_rc")
     msg="stopped at a failing stage"
