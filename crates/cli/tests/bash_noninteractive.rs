@@ -547,7 +547,7 @@ fn req39_descendant_output_after_parent_exit_hits_output_limit() {
 }
 
 /// 他オプションの値として現れた `--input-file` はバッチ指定とみなさず、複数行は拒否する。
-/// 値として消費された `--out` 等の後に本物の `--input-file` があればバッチ（REQ-33）。
+/// 値として消費された `--id` 等の後に本物の `--input-file` があればバッチ（REQ-33）。
 #[test]
 fn req33_input_file_as_option_value_is_not_batch() {
     let body = "echo '{\"code\":\"ok\"}'\necho '{\"code\":\"ok\"}'\nexit 0";
@@ -563,24 +563,116 @@ fn req33_input_file_as_option_value_is_not_batch() {
     let o = run_with_fake_bin_args(
         "realbatch",
         body,
-        &["--package", "p", "--out", "o", "--input-file", "f"],
+        &["--package", "p", "--id", "i", "--input-file", "f"],
         &[],
     );
     assert_eq!(o.code, Some(0));
 }
 
-/// エスケープを含む top-level のキー・`code` は復号せず拒否する（REQ-21）。
+/// top-level のキー・`code` の値のエスケープは復号してから判定する（REQ-21）。
+/// `code` 以外のキーはエスケープがあっても素通しし、`code` に復号されるキーは照合対象になる。
 #[test]
-fn req21_escaped_code_or_key_is_rejected() {
+fn req21_escaped_keys_and_code_values_are_decoded_before_comparison() {
+    // (名前, JSON, 終了コード, 期待する終了コード, 中継されるか)
     let cases = [
-        ("esc_value", r#"{"code":"\u006fk"}"#),
-        ("esc_key", r#"{"co\u0064e":"runtime_error"}"#),
+        ("esc_normal_key", r#"{"code":"ok","name":"x"}"#, 0, 0, true),
+        ("esc_simple_key", r#"{"code":"ok","a\nb":"x"}"#, 0, 0, true),
+        ("esc_surrogate_key", r#"{"code":"ok","😀":1}"#, 0, 0, true),
+        ("esc_code_key_match", r#"{"code":"ok"}"#, 0, 0, true),
+        (
+            "esc_code_key_upper_hex",
+            r#"{"code":"runtime_error"}"#,
+            70,
+            70,
+            true,
+        ),
+        (
+            "esc_code_key_mismatch",
+            r#"{"code":"runtime_error"}"#,
+            0,
+            70,
+            false,
+        ),
+        ("esc_value_match", r#"{"code":"ok"}"#, 0, 0, true),
+        (
+            "esc_value_underscore",
+            r#"{"code":"runtime_error"}"#,
+            70,
+            70,
+            true,
+        ),
+        (
+            "esc_value_mismatch",
+            r#"{"code":"runtime_error"}"#,
+            0,
+            70,
+            false,
+        ),
+        ("esc_dup_code", r#"{"code":"ok","code":"ok"}"#, 0, 70, false),
     ];
-    for (name, json) in cases {
+    for (name, json, exit, expected, relayed) in cases {
+        let o = run_with_fake_bin(name, &format!("printf '%s\\n' '{json}'\nexit {exit}"));
+        assert_eq!(o.code, Some(expected), "{name}");
+        if relayed {
+            assert_eq!(o.stdout, format!("{json}\n"), "{name}");
+        } else {
+            assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+        }
+    }
+}
+
+/// 復号できない不正なエスケープはキーでも値でも 70（不正な出力）になる（REQ-33）。
+#[test]
+fn req33_invalid_escapes_in_keys_and_values_are_rejected() {
+    for (name, json) in [
+        ("badkeyhex", r#"{"code":"ok","a\u12G4":1}"#),
+        ("badkeyesc", r#"{"code":"ok","a\qb":1}"#),
+        ("badvaluehex", r#"{"code":"o\u00zzk"}"#),
+    ] {
         let o = run_with_fake_bin(name, &format!("printf '%s\\n' '{json}'\nexit 0"));
         assert_eq!(o.code, Some(70), "{name}");
-        assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+        assert_eq!(o.stdout, INVALID_OUTPUT, "{name}");
     }
+}
+
+/// `--out`（`--out=...` 形式を含む）は CLI を起動せず invalid_input(64) で拒否し、
+/// 出力を stdout 経由だけに閉じ込める。値として現れる `--out` は誤検出しない（REQ-39・REQ-33）。
+#[test]
+fn req39_out_option_is_rejected_without_launching_cli() {
+    let dir = std::env::temp_dir().join(format!("fandhe-out-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let launched = dir.join("launched");
+    let target = dir.join("secret-out-path");
+    let body = format!(
+        "echo x >'{}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        launched.display()
+    );
+    let t = target.display().to_string();
+    let t_eq = format!("--out={t}");
+    for args in [
+        vec!["--input-file", "f", "--out", t.as_str()],
+        vec!["--input-file", "f", t_eq.as_str()],
+    ] {
+        let o = run_with_fake_bin_args("outopt", &body, &args, &[]);
+        assert_eq!(o.code, Some(64), "{args:?}");
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"invalid_input\",\"message\":\"--out is not supported by the non-interactive wrapper\"}\n"
+        );
+        assert!(!o.stdout.contains(&t) && !o.stderr.contains(&t));
+        assert_eq!(o.stderr.lines().last(), Some("exit_code=64"));
+        assert!(!launched.exists(), "CLI must not be launched");
+    }
+    // 他オプションの値として現れる `--out` は拒否しない（引数走査は CLI と同じ規則）
+    for args in [
+        vec!["--text", "--out"],
+        vec!["--text=--out"],
+        vec!["--id", "--out", "--text", "a"],
+    ] {
+        let o = run_with_fake_bin_args("outvalue", &body, &args, &[]);
+        assert_eq!(o.code, Some(0), "{args:?}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 末尾に改行の無い出力は 1 行 1 JSON の契約に反するため置き換える（REQ-33）。

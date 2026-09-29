@@ -64,6 +64,7 @@ fi
 # バッチ指定とみなさない（infer のオプションはすべて値を取る）
 batch=0
 skip=0
+out_requested=0
 for a in ${1+"$@"}; do
     if [ "$skip" -eq 1 ]; then
         skip=0
@@ -72,7 +73,9 @@ for a in ${1+"$@"}; do
     case "$a" in
         --input-file) batch=1; skip=1 ;;
         --input-file=*) batch=1 ;;
-        --package | --text | --id | --out) skip=1 ;;
+        --out) out_requested=1; skip=1 ;;
+        --out=*) out_requested=1 ;;
+        --package | --text | --id) skip=1 ;;
     esac
 done
 
@@ -85,6 +88,17 @@ if [ -n "${FANDHE_EDGE_BIN:-}" ]; then
 else
     root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
     bin="${CARGO_TARGET_DIR:-$root/target}/debug/fandhe-edge"
+fi
+
+# 出力は stdout 経由だけに閉じ込める（REQ-39）。infer の `--out`（ファイル出力。`--input-file`
+# 専用）を渡すと CLI が出力ファイルへ直接書き、本スクリプトの容量上限を迂回するため、
+# CLI を起動せず invalid_input(64) で拒否する（fail-closed。メッセージは固定でパスを含めない。
+# TASK-36.1-1 は終了コードと stdout の取得のみを要求し、ファイル出力は対象外）
+if [ "$out_requested" -eq 1 ]; then
+    echo "fandhe-edge: --out is not supported by this wrapper" >&3
+    printf '%s\n' '{"code":"invalid_input","message":"--out is not supported by the non-interactive wrapper"}'
+    echo "exit_code=64" >&3
+    exit 64
 fi
 
 # 起動不能（不在・ディレクトリ・実行権限なし）でも契約（stdout 1 JSON・
@@ -268,8 +282,9 @@ esac
 # 単一モードは 1 行 1 オブジェクトのみ、バッチは各行がオブジェクト。終了値: 0=正常・
 # 1=JSON 不正・2=`code` と終了コードの不一致（REQ-21・REQ-33）。
 # 対応表は fixtures/exitcode/exit_codes.json と同一（bash_noninteractive.rs が照合する）。
-# エスケープを含む top-level のキー・`code` の値は復号せず不一致として拒否する
-# （CLI は escape した `code` を出さない。REQ-21）
+# top-level のキーと `code` の値は、エスケープ（\uXXXX・サロゲートペア・単純エスケープ）を
+# 復号してから `code` との一致・既知の名前かを判定する（生の文字列比較で正当な JSON を
+# 誤判定しない。ASCII 印字可能文字以外は "?" に写すため、名前と一致しない。REQ-21）
 check_output() {
     # RFC 8259 は JSON テキストを UTF-8 と定める。不正なバイト列（awk は LC_ALL=C で
     # バイトのまま扱うため検出できない）は iconv で検査し、iconv が無い環境も fail-closed で
@@ -350,24 +365,47 @@ check_output() {
         if (c == "n") return pliteral("null")
         return pnumber()
     }
-    function pobject(depth,   key, first, c, keyesc) {
+    function hexval(h,   i, n, d) {
+        n = 0
+        for (i = 1; i <= length(h); i++) {
+            d = index("0123456789abcdef", tolower(substr(h, i, 1)))
+            n = n * 16 + d - 1
+        }
+        return n
+    }
+    # 文字列の生表記を復号する。比較対象（ASCII の名前）に必要な範囲だけを正確に扱い、
+    # ASCII 印字可能文字以外（制御文字・非 ASCII・サロゲートペア・単純エスケープ）は "?" に写す
+    function decode(raw,   i, n, c, d, out, v) {
+        out = ""; i = 1; n = length(raw)
+        while (i <= n) {
+            c = substr(raw, i, 1)
+            if (c != "\\") { out = out c; i++; continue }
+            d = substr(raw, i + 1, 1)
+            if (d == "u") {
+                v = hexval(substr(raw, i + 2, 4))
+                out = out ((v >= 32 && v <= 126) ? substr(asc, v - 31, 1) : "?")
+                if (v >= 55296 && v <= 56319 && substr(raw, i + 6, 2) == "\\u") i += 12
+                else i += 6
+            } else { out = out "?"; i += 2 }
+        }
+        return out
+    }
+    function pobject(depth,   key, first, c) {
         pos++; skipws()
         if (substr(s, pos, 1) == "}") { pos++; return 1 }
         while (1) {
             skipws()
             if (substr(s, pos, 1) != "\"") return 0
             if (!pstring()) return 0
-            key = strval
-            keyesc = hasesc
+            key = hasesc ? decode(strval) : strval
             skipws()
             if (substr(s, pos, 1) != ":") return 0
             pos++; skipws()
             first = substr(s, pos, 1)
             if (!pvalue(depth + 1)) return 0
-            if (depth == 0 && keyesc) { codebad = 1; hascode = 1 }
             if (depth == 0 && key == "code") {
-                if (hascode || first != "\"" || hasesc) codebad = 1
-                else code = strval
+                if (hascode || first != "\"") codebad = 1
+                else code = hasesc ? decode(strval) : strval
                 hascode = 1
             }
             skipws()
@@ -390,6 +428,7 @@ check_output() {
         }
     }
     BEGIN {
+        for (i = 32; i <= 126; i++) asc = asc sprintf("%c", i)
         split("ok=0 judged_fail=10 out_of_scope=11 pending=12 limit_exceeded=20 invalid_input=64 runtime_error=70", pairs, " ")
         for (i in pairs) { split(pairs[i], kv, "="); known[kv[1]] = 1; if (kv[2] == rc) expect = kv[1] }
     }
