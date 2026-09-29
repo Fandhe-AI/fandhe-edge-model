@@ -62,10 +62,12 @@ impl FileFormat {
 
 /// ModelProto（onnx.proto3）の top-level フィールドの wire type。未知の field 番号は `None`。
 /// 1 ir_version・5 model_version は varint(0)、それ以外は LEN(2)。
+/// 26 configuration（repeated DeviceConfigurationProto。IR 10 以降）を含む。ローカルの onnx 1.23.0 の
+/// onnx.proto から ModelProto の全フィールド（1〜8・14・20・25・26）を確認済み。
 fn model_field_wire_type(field: u64) -> Option<u64> {
     match field {
         1 | 5 => Some(0),
-        2 | 3 | 4 | 6 | 7 | 8 | 14 | 20 | 25 => Some(2),
+        2 | 3 | 4 | 6 | 7 | 8 | 14 | 20 | 25 | 26 => Some(2),
         _ => None,
     }
 }
@@ -639,6 +641,19 @@ mod tests {
         let err = open_checked_file(&pkl, &al, 1 << 20).unwrap_err();
         assert_eq!(err.exit_code(), ExitCode::InvalidInput);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// REQ-39・TASK-39.2-1: ModelProto の field 26（configuration。LEN）を持つ ONNX を通し、
+    /// wire type が違う field 26（varint）は拒否する。
+    #[test]
+    fn req39_model_field_26_configuration() {
+        let base = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
+        let mut ok = base.to_vec();
+        ok.extend_from_slice(&[0xd2, 0x01, 0x02, 0x0a, 0x00]); // field 26, LEN 2
+        assert_eq!(d(&ok), FileFormat::Onnx);
+        let mut bad = base.to_vec();
+        bad.extend_from_slice(&[0xd0, 0x01, 0x01]); // field 26, varint
+        assert_eq!(d(&bad), FileFormat::Unknown);
     }
 
     /// REQ-39・TASK-39.2-1: graph の後ろに未検査の末尾（長さ付きフィールドの中身が無い・LEN が
