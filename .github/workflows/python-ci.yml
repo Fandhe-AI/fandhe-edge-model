@@ -32,6 +32,13 @@ name: Python CI
 # GPU（Metal）依存の性能測定・長時間学習は実機前提テスト（.claude/rules/ci.md）
 # として本 workflow には含めない。
 #
+# Rust から実 trainer を起動する結合テスト（make test-trainer-integration。issue #258・
+# REQ-18/19/34/39）もここで実行する。crates/train/tests/real_trainer.rs は #[ignore] で
+# 既定の `make test` から分離しており、uv venv と mlx が無い rust-ci の 3 OS runner では
+# 動かせないため。証拠の種別はテストハーネス（合成データ・CPU）で、実機測定ではない。
+# Rust のコールドビルドが加わるため timeout-minutes を 30 にしている。ジョブ ID・name は
+# 変えない（ruleset の必須チェック名を維持するため）。
+#
 # Python の版: trainer/.python-version はマイナー版（3.12）までを固定し、patch 版は
 # 環境ごとに解決させる（ローカルは pyenv 等の 3.12.x、CI は uv が python-build-standalone
 # から取得する管理版 3.12.x）。uv の管理版マニフェストに無い patch 版を固定すると CI で
@@ -53,7 +60,7 @@ jobs:
   python-ci:
     name: python-ci
     runs-on: macos-14
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -92,3 +99,11 @@ jobs:
 
       - name: make py-ci
         run: make py-ci
+
+      # ci.yml と同じ SHA 固定。Rust 側の結合テスト（make test-trainer-integration）に必要。
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+
+      - name: make test-trainer-integration
+        run: make test-trainer-integration
