@@ -30,12 +30,18 @@ else
     bin="${CARGO_TARGET_DIR:-$root/target}/debug/fandhe-edge"
 fi
 
-if [ ! -x "$bin" ]; then
-    # 契約（stdout 1 JSON・stderr に exit_code）を欠けさせず runtime_error を返す
+# 起動不能（不在・ディレクトリ・実行権限なし）でも契約（stdout 1 JSON・
+# stderr に exit_code）を欠けさせず runtime_error を返す
+launch_failed() {
     echo "fandhe-edge: binary not found or not executable" >&2
     printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge binary not found or not executable"}'
     echo "exit_code=70" >&2
     exit 70
+}
+
+# -x はディレクトリにも成功するため、通常ファイル（-f）であることも確認する
+if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
+    launch_failed
 fi
 
 # ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
@@ -43,6 +49,11 @@ if "$bin" infer ${1+"$@"} </dev/null; then
     rc=0
 else
     rc=$?
+fi
+# CLI の終了コードは 7 種（0/10/11/12/20/64/70）に固定のため、126（実行不能）・
+# 127（見つからない。壊れた shebang 等）は起動失敗とみなして runtime_error にする
+if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    launch_failed
 fi
 echo "exit_code=$rc" >&2
 exit "$rc"

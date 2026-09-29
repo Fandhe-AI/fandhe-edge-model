@@ -126,6 +126,28 @@ fn req36_missing_binary_returns_json_and_exit_code_70() {
     );
 }
 
+/// FANDHE_EDGE_BIN にディレクトリを指定しても（-x は通る）通常ファイル検査で弾かれ、
+/// runtime_error の JSON と exit 70 になること（REQ-21・REQ-36）。
+#[test]
+fn req36_directory_as_binary_returns_json_and_exit_code_70() {
+    let out = Command::new("sh")
+        .arg(script_path())
+        .arg("--help")
+        .env("FANDHE_EDGE_BIN", env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(70));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge binary not found or not executable\"}\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).lines().last(),
+        Some("exit_code=70")
+    );
+}
+
 /// 引数なしでも set -u で abort せず exit_code 行が出ること。
 #[test]
 fn req36_no_args_still_reports_exit_code() {
