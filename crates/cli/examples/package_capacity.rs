@@ -12,16 +12,15 @@
 //! argv は untrusted のため、パスの検証と open はガード層の `open_confined`（ルート fd 起点の
 //! `openat`＋`O_NOFOLLOW`）に一体で委ね、ルート（カレントディレクトリ）外への `..`・絶対パス・
 //! symlink 参照を拒否する（REQ-39）。拒否理由は `reason_code` だけを固定文で返す。非 UTF-8 の引数は
-//! InvalidInput として返す。引数は 16 件までで、開く前に件数を検証する。ファイルサイズは開いた直後と
-//! 計測直前に上限（1GiB）と照合し、重複は計測コアが拒否する。構成要素の分類は配布パッケージ形式
+//! InvalidInput として返す。引数は 16 件までで、開く前に件数を検証する。ファイルサイズの上限
+//! （1GiB）と重複は、計測コア（`measure_opened_files`）が計測で得た値に対して拒否する。構成要素の分類は配布パッケージ形式
 //! （TASK-28・32）が確定するまでの暫定で、C1 は `model.onnx` を `weights`、`artifact.json` を
 //! `metadata` として渡す（語彙は ONNX 内に保持されるため `vocab_or_feature_transform` は 0 件）。
 
 use fandhe_edge_cli::output::{capacity_error_report, write_error_report, write_package_capacity};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::fs::FsError;
 use fandhe_edge_guard::path::open_confined as guard_open_confined;
-use fandhe_edge_runtime::capacity::{CapacityError, PackageComponent, measure_opened_files};
+use fandhe_edge_runtime::capacity::{PackageComponent, measure_opened_files};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
@@ -41,44 +40,8 @@ fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport
     Ok((confined.into_path_buf(), file))
 }
 
-/// 計測対象 1 ファイルの大きさの上限（バイト）。配布物の容量目安（40MB。REQ-30）を大きく
-/// 上回る値で、異常に大きい入力を開いたハンドルのメタデータ段階で拒否する（REQ-39）。
-const MAX_FILE_BYTES: u64 = 1 << 30;
-
-/// 開いたハンドルのサイズが `limit` を超えたら [`FsError::TooLarge`] で拒否する（REQ-39）。
-fn enforce_size_limit(path: &Path, size: u64, limit: u64) -> Result<(), ErrorReport> {
-    if size > limit {
-        return Err(capacity_error_report(&CapacityError::File(
-            FsError::TooLarge {
-                path: path.to_path_buf(),
-                size,
-                limit,
-            },
-        )));
-    }
-    Ok(())
-}
-
 /// 受け付ける引数の上限。構成要素の種類数（5）に余裕を持たせた値で、重複指定は計測コアが拒否する。
 const MAX_ARGS: usize = 16;
-
-/// 計測直前に、保持しているハンドルの現在のサイズを `limit` と再照合する（REQ-39）。
-/// オープン後に追記されて上限を超えたファイルを、計測値として受理しない。
-fn enforce_measured_sizes(
-    files: &[(PackageComponent, PathBuf, File)],
-    limit: u64,
-) -> Result<(), ErrorReport> {
-    for (_, path, file) in files {
-        let meta = file.metadata().map_err(|e| {
-            capacity_error_report(&CapacityError::File(FsError::Read {
-                path: path.clone(),
-                source: e,
-            }))
-        })?;
-        enforce_size_limit(path, meta.len(), limit)?;
-    }
-    Ok(())
-}
 
 fn parse(
     args: &[OsString],
@@ -122,10 +85,7 @@ fn main() -> std::process::ExitCode {
         .and_then(|d| d.canonicalize())
         .map_err(|_| ErrorReport::new(ExitCode::RuntimeError, "cannot resolve working directory"))
         .and_then(|root| parse(&args, &root))
-        .and_then(|files| {
-            enforce_measured_sizes(&files, MAX_FILE_BYTES)?;
-            measure_opened_files(&files).map_err(|e| capacity_error_report(&e))
-        });
+        .and_then(|files| measure_opened_files(&files).map_err(|e| capacity_error_report(&e)));
     let code = match result {
         Ok(breakdown) => write_package_capacity(&mut out, &breakdown),
         Err(report) => write_error_report(&mut out, &report),
@@ -199,33 +159,6 @@ mod tests {
         let e = open_confined(&root, Path::new("sub/m.json")).unwrap_err();
         assert_eq!(e.code, ExitCode::RuntimeError);
         assert_eq!(e.message, "path rejected: unsupported_platform");
-    }
-
-    /// REQ-39: 上限を超えるサイズは LimitExceeded（終了コード 20）で拒否し、上限ちょうどは通す。
-    #[test]
-    fn req39_size_limit_rejects_oversized_file() {
-        let p = Path::new("x");
-        assert!(enforce_size_limit(p, 10, 10).is_ok());
-        let e = enforce_size_limit(p, 11, 10).unwrap_err();
-        assert_eq!(e.code, ExitCode::LimitExceeded);
-    }
-
-    /// REQ-39: オープン後に上限を超えて成長したファイルは、計測時の再検証で拒否される。
-    #[test]
-    fn req39_measure_time_size_recheck_rejects_grown_file() {
-        use std::io::Write as _;
-        let root = root();
-        let path = root.join("sub").join("m.json");
-        let file = File::open(&path).unwrap();
-        let files = vec![(PackageComponent::Metadata, path.clone(), file)];
-        assert!(enforce_measured_sizes(&files, 2).is_ok());
-        let mut w = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        w.write_all(b"xxxx").unwrap();
-        let e = enforce_measured_sizes(&files, 2).unwrap_err();
-        assert_eq!(e.code, ExitCode::LimitExceeded);
     }
 
     /// REQ-39: 親ディレクトリ経由のリンクによるルート外参照は拒否される。

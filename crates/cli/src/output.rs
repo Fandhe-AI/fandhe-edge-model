@@ -716,7 +716,7 @@ mod tests {
         assert!(!line.contains("secret-marker"), "{line}");
         assert_eq!(
             capacity_error_report(&CapacityError::Overflow).code.code(),
-            70
+            20
         );
     }
 }

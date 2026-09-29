@@ -135,17 +135,28 @@ impl fmt::Display for CapacityError {
 }
 
 impl CapacityError {
-    /// 7 種の終了コードへの写像（REQ-21・REQ-30・#123）。
+    /// 7 種の終了コードへの写像（REQ-21・REQ-30・#123）。分類はここ 1 か所に集約する。
     ///
-    /// - 読み込み上限超過（`FsError::TooLarge`）は `LimitExceeded`（core の `DefinitionError` と同じ扱い）
-    /// - 内部カウンタのあふれは `RuntimeError`。利用者が設定した上限の超過
-    ///   （TASK-30.2・#124 の `limit_exceeded`）ではないため、その意味を先取りしない
-    /// - 外部入力（パッケージ構成）の不正は `InvalidInput`。将来増える `FsError` も同様に倒す
+    /// - 資源超過 `LimitExceeded`（20）: 1 ファイルの上限超過（`FsError::TooLarge`）・合計の
+    ///   あふれ（`Overflow`）。利用者が設定した合計容量の上限（TASK-30.2・#124）ではない
+    /// - 実行時エラー `RuntimeError`（70）: 計測中の I/O 障害（権限・EIO 等。`NotFound`・
+    ///   `InvalidInput` 以外の `io::ErrorKind` はすべて環境起因として扱う fail-closed）と、
+    ///   プラットフォームの機能不足（`IdentityUnavailable`）。入力を直しても解消しない
+    /// - 入力不正 `InvalidInput`（64）: 上記以外の利用者が直せる不正（不在・非通常ファイル・
+    ///   symlink・重複・空のパッケージ）。将来増える `FsError` も入力不正に倒す
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            CapacityError::File(FsError::TooLarge { .. }) => ExitCode::LimitExceeded,
-            CapacityError::Overflow => ExitCode::RuntimeError,
+            CapacityError::File(FsError::TooLarge { .. }) | CapacityError::Overflow => {
+                ExitCode::LimitExceeded
+            }
+            CapacityError::IdentityUnavailable => ExitCode::RuntimeError,
+            CapacityError::File(FsError::Read { source, .. }) => match source.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+                    ExitCode::InvalidInput
+                }
+                _ => ExitCode::RuntimeError,
+            },
             _ => ExitCode::InvalidInput,
         }
     }
@@ -282,6 +293,22 @@ fn metadata_snapshot_matches(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bo
         && a.created().ok() == b.created().ok()
 }
 
+/// 計測対象 1 ファイルの大きさの上限（バイト。REQ-39）。配布物の容量目安（40MB。REQ-30）を
+/// 大きく上回る値で、異常に大きい入力を計測値の段階で拒否する。
+pub const MAX_FILE_BYTES: u64 = 1 << 30;
+
+/// 計測で得たサイズを合計へ加算する前に上限と照合する（REQ-39）。事前検査には依存しない。
+fn check_size(path: &std::path::Path, size: u64, limit: u64) -> Result<(), CapacityError> {
+    if size > limit {
+        return Err(CapacityError::File(FsError::TooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
 /// 実ファイルのサイズを構成要素ごとに集計する。中身は読まない。
 ///
 /// symlink は拒否する。検査から計測までの間にパスが差し替えられても（TOCTOU。REQ-39）
@@ -296,6 +323,14 @@ fn metadata_snapshot_matches(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bo
 /// 重複判定は Unix ではハンドルの (デバイス, inode) で行うため、`a` と `./a` の別表記や
 /// ハードリンクの別名も [`CapacityError::DuplicatePath`] になる。
 pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, CapacityError> {
+    measure_package_with_limit(files, MAX_FILE_BYTES)
+}
+
+/// [`measure_package`] の 1 ファイル上限を指定する版（上限は計測で得たサイズに適用する）。
+pub fn measure_package_with_limit(
+    files: &[PackageFile],
+    limit: u64,
+) -> Result<CapacityBreakdown, CapacityError> {
     let mut seen: HashSet<FileId> = HashSet::new();
     let mut sizes = Vec::with_capacity(files.len());
     for f in files {
@@ -342,6 +377,7 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
                 path: f.path.clone(),
             });
         }
+        check_size(&f.path, meta.len(), limit)?;
         sizes.push((f.component, meta.len()));
     }
     CapacityBreakdown::from_sizes(sizes)
@@ -360,6 +396,15 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
 /// [`CapacityError::IdentityUnavailable`] で拒否する（fail-closed。M10 時点で対象外）。
 pub fn measure_opened_files(
     files: &[(PackageComponent, PathBuf, std::fs::File)],
+) -> Result<CapacityBreakdown, CapacityError> {
+    measure_opened_files_with_limit(files, MAX_FILE_BYTES)
+}
+
+/// [`measure_opened_files`] の 1 ファイル上限を指定する版。集計に使うメタデータのサイズ自体を
+/// 上限と照合する（オープン後に成長したファイルも合計へ加算する前に拒否。REQ-39）。
+pub fn measure_opened_files_with_limit(
+    files: &[(PackageComponent, PathBuf, std::fs::File)],
+    limit: u64,
 ) -> Result<CapacityBreakdown, CapacityError> {
     let mut seen: HashSet<FileId> = HashSet::new();
     let mut sizes = Vec::with_capacity(files.len());
@@ -394,6 +439,7 @@ pub fn measure_opened_files(
                 return Err(CapacityError::IdentityUnavailable);
             }
         }
+        check_size(label, meta.len(), limit)?;
         sizes.push((*component, meta.len()));
     }
     CapacityBreakdown::from_sizes(sizes)
@@ -421,9 +467,9 @@ mod tests {
 
     /// REQ-30・REQ-39: 同一性を取得できない環境の拒否は InvalidInput・固定文で報告される。
     #[test]
-    fn req39_identity_unavailable_maps_to_invalid_input() {
+    fn req39_identity_unavailable_maps_to_runtime_error() {
         let e = CapacityError::IdentityUnavailable;
-        assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(e.exit_code(), ExitCode::RuntimeError);
         assert_eq!(
             e.public_message(),
             "file identity is unavailable on this platform"
@@ -567,12 +613,29 @@ mod tests {
         assert_eq!(
             CapacityError::File(FsError::Read {
                 path: p(),
-                source: std::io::Error::other("e")
+                source: std::io::Error::from(std::io::ErrorKind::NotFound)
             })
             .exit_code()
             .code(),
             64
         );
+        // 計測中の I/O 障害（EIO・権限等）は入力不正ではなく実行時エラー
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                CapacityError::File(FsError::Read {
+                    path: p(),
+                    source: std::io::Error::from(kind)
+                })
+                .exit_code()
+                .code(),
+                70,
+                "{kind:?}"
+            );
+        }
         assert_eq!(
             CapacityError::File(FsError::TooLarge {
                 path: p(),
@@ -583,7 +646,8 @@ mod tests {
             .code(),
             20
         );
-        assert_eq!(CapacityError::Overflow.exit_code().code(), 70);
+        assert_eq!(CapacityError::Overflow.exit_code().code(), 20);
+        assert_eq!(CapacityError::IdentityUnavailable.exit_code().code(), 70);
     }
 
     #[test]
@@ -618,5 +682,63 @@ mod tests {
             CapacityError::Overflow.public_message(),
             "package size counters overflow"
         );
+    }
+
+    /// REQ-39: 計測で得たサイズが上限を超えたら、合計へ加算する前に TooLarge（20）で拒否する。
+    /// オープン後に成長したファイル（事前検査の後で値だけが上限を超える状況）を再現する。
+    #[test]
+    fn req39_measured_size_over_limit_is_limit_exceeded() {
+        use std::io::Write as _;
+        let dir = (0..100)
+            .find_map(|i| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let p = std::env::temp_dir().join(format!(
+                    "fandhe_cap_limit_{}_{nanos}_{i}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&p).ok().map(|()| p)
+            })
+            .expect("unique temp dir");
+        let path = dir.join("f.bin");
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        w.write_all(b"ab").unwrap();
+        let files = [(Weights, path.clone(), std::fs::File::open(&path).unwrap())];
+        assert_eq!(
+            measure_opened_files_with_limit(&files, 2)
+                .unwrap()
+                .total_bytes(),
+            2
+        );
+        w.write_all(b"cd").unwrap();
+        let e = measure_opened_files_with_limit(&files, 2).unwrap_err();
+        assert!(matches!(
+            e,
+            CapacityError::File(FsError::TooLarge {
+                size: 4,
+                limit: 2,
+                ..
+            })
+        ));
+        assert_eq!(e.exit_code().code(), 20);
+        let pf = [PackageFile {
+            component: Weights,
+            path: path.clone(),
+        }];
+        assert_eq!(
+            measure_package_with_limit(&pf, 3)
+                .unwrap_err()
+                .exit_code()
+                .code(),
+            20
+        );
+        assert_eq!(measure_package_with_limit(&pf, 4).unwrap().total_bytes(), 4);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
