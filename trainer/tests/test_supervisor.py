@@ -1367,3 +1367,122 @@ def test_req39_status_timeout_is_bounded_by_remaining_deadline(
         assert seen == [1.5]
     finally:
         _reap(proc)
+
+
+def test_req34_run_ps_maps_kill_race_to_unknown_and_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34 回帰（codex P1）: タイムアウト直後に `ps` が終了して
+    `kill()` が `ProcessLookupError` を出しても、例外を出さず `None`（不明）を
+    返し、`ps` を回収してパイプを閉じる。"""
+    made: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _RacyPopen(real_popen):  # type: ignore[misc, valid-type]
+        def kill(self) -> None:
+            super().kill()
+            self.wait()
+            raise ProcessLookupError
+
+    def _factory(*a: object, **k: object) -> subprocess.Popen:
+        p = _RacyPopen(*a, **k)  # type: ignore[arg-type]
+        made.append(p)
+        return p
+
+    # `sleep -o rss=,stat= -p <pid>` は即失敗するため、確実に待つコマンドへ差し替える。
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda argv, **k: _factory(["/bin/sleep", "30"], **k),
+    )
+    event = threading.Event()
+    event.set()
+    assert supervisor._run_ps(os.getpid(), 5.0, event) is None
+    assert len(made) == 1
+    assert made[0].returncode is not None  # 回収済み
+    assert made[0].stdout is not None
+    assert made[0].stdout.closed
+
+
+def test_req34_run_ps_maps_communicate_errors_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39 回帰（Bugbot）: `communicate` が `OSError`／`ValueError` を出しても
+    例外を外へ出さず `None`（不明）にする。"""
+    real_popen = subprocess.Popen
+    for exc in (OSError("boom"), ValueError("closed pipe")):
+
+        class _BadPopen(real_popen):  # type: ignore[misc, valid-type]
+            err = exc
+            first = True
+
+            def communicate(self, *a: object, **k: object):  # type: ignore[no-untyped-def]
+                if type(self).first:
+                    type(self).first = False
+                    raise type(self).err
+                return super().communicate(*a, **k)
+
+        monkeypatch.setattr(
+            supervisor.subprocess,
+            "Popen",
+            lambda argv, **k: _BadPopen(["/bin/sleep", "30"], **k),
+        )
+        assert supervisor._run_ps(os.getpid(), 5.0, None) is None
+
+
+def test_req34_communicate_error_still_releases_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34・REQ-39: `ps` の待機が例外を出しても、予約（out_dir・tmp）は
+    解放され、`monitor_failed` の `runtime_error` で終わる。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "hang")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", _wrap_popen_ps_fails())
+    code = supervisor.run_supervised_train(request_path)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert code == ExitCode.RUNTIME_ERROR
+    assert payload["message"].startswith("resource monitoring failed")
+    assert not out_dir.exists()
+    assert not list(out_dir.parent.glob(f".{out_dir.name}*"))
+
+
+def _wrap_popen_ps_fails():  # type: ignore[no-untyped-def]
+    """`/bin/ps` の起動だけを `OSError` にし、ワーカー起動は本物へ委ねる。"""
+    real = subprocess.Popen
+
+    def _factory(argv, *a, **k):  # type: ignore[no-untyped-def]
+        if argv and argv[0] == supervisor._PS_BIN:
+            raise OSError("ps unavailable")
+        return real(argv, *a, **k)
+
+    return _factory
+
+
+def test_req39_deadline_expiry_with_unknown_status_is_time_not_monitor_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39 回帰（Bugbot）: 状態確認が締め切り切れで `None` になった場合は
+    `monitor_failed` ではなく `"time"`（`limit_exceeded`）。締め切りはキャンセル
+    より優先する（`classify_cancel_outcome` と同じ）。"""
+    proc = _spawn("import time; time.sleep(60)")
+    now = {"t": 100.0}
+    event = threading.Event()
+
+    def _status(pid: int, **_kw: object) -> None:
+        now["t"] += 10.0  # 状態確認の最中に締め切りを過ぎ、同時にキャンセルも届く
+        event.set()
+        return None
+
+    monkeypatch.setattr(supervisor, "_current_child_status", _status)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: now["t"])
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=1.0,
+            grace_seconds=0.0,
+            rss_limit_bytes=1 << 40,
+            cancel_event=event,
+        )
+        assert reason == "time"
+    finally:
+        _reap(proc)

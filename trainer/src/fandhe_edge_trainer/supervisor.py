@@ -264,6 +264,73 @@ def _wait_cancel(cancel_event: threading.Event | None, timeout: float) -> bool:
     return cancel_event.wait(timeout)
 
 
+def _run_ps(pid: int, timeout: float, cancel_event: threading.Event | None) -> str | None:
+    """`ps -o rss=,stat= -p <pid>` を実行して標準出力を返す。**例外を外へ出さない**。
+
+    起動・待機・kill・回収・パイプの後始末をこの関数に閉じ込める。返り値は
+    標準出力（成功）か `None`（不明）のどちらかで、起動失敗・タイムアウト・
+    キャンセルによる中断・kill と終了の競合（`ProcessLookupError`）・
+    `communicate` の `OSError`／`ValueError`（閉じたパイプ）・非ゼロ終了は
+    すべて `None` に写す。終了時は必ず `ps` を回収しパイプを閉じる。呼び出し側
+    （`monitor_child`）は `None` を既存の fail-closed 方針で扱い、予約の解放
+    経路へ進む（REQ-34・REQ-39）。
+    """
+    try:
+        ps = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。絶対パスの /bin/ps のみを呼ぶ
+            [_PS_BIN, "-o", "rss=,stat=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, ValueError):
+        return None
+    result: str | None = None
+    try:
+        # `timeout`（締め切りの残りで切り詰め済み）まで、キャンセルを短い刻みで
+        # 確認しながら待つ。キャンセルが来たら即座に戻り、協調キャンセルの猶予を
+        # 状態確認で使い切らない（REQ-34）。
+        stop_at = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                out, _ = ps.communicate(timeout=min(0.05, _remaining(stop_at)))
+            except subprocess.TimeoutExpired:
+                if _is_cancelled(cancel_event) or _remaining(stop_at) <= 0.0:
+                    return None
+                continue
+            if ps.returncode == 0:
+                result = out
+            return result
+    except (OSError, ValueError):
+        return None
+    finally:
+        # 成功・失敗・例外のいずれでも、`ps` を止めて回収し、パイプを閉じる。
+        with contextlib.suppress(OSError):
+            if ps.poll() is None:
+                ps.kill()
+        with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+            ps.communicate(timeout=1)
+        with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+            ps.wait(timeout=1)
+        for pipe in (ps.stdout, ps.stdin, ps.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    pipe.close()
+
+
+def _stop_reason(deadline: float, cancel_event: threading.Event | None) -> str | None:
+    """監視を打ち切るべき理由（`"time"`／`"cancelled"`／`None`）を 1 つの規則で決める。
+
+    壁時計の締め切りをキャンセルより優先する（`crates/train` の
+    `classify_cancel_outcome` と同じ優先関係。REQ-34・REQ-39）。締め切りの判定は
+    `_remaining` と同じ時計を使う。
+    """
+    if _remaining(deadline) <= 0.0:
+        return "time"
+    if _is_cancelled(cancel_event):
+        return "cancelled"
+    return None
+
+
 def _current_child_status(
     pid: int,
     *,
@@ -288,31 +355,8 @@ def _current_child_status(
     監視が使う `ps` 呼び出しへ相乗りすることで、新しい依存・子プロセス
     起動を増やさずに実現する）。
     """
-    try:
-        ps = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。絶対パスの /bin/ps のみを呼ぶ
-            [_PS_BIN, "-o", "rss=,stat=", "-p", str(pid)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except OSError:
-        return None
-    # `timeout`（呼び出し側が締め切りの残りで切り詰めた値）まで、キャンセルを
-    # 短い刻みで確認しながら待つ。キャンセルが来たら `ps` を止めて即座に戻り、
-    # 協調キャンセルの猶予を状態確認で使い切らない（REQ-34）。
-    stop_at = time.monotonic() + max(0.0, timeout)
-    stdout_text = ""
-    while True:
-        try:
-            stdout_text, _ = ps.communicate(timeout=min(0.05, _remaining(stop_at)))
-            break
-        except subprocess.TimeoutExpired:
-            if _is_cancelled(cancel_event) or _remaining(stop_at) <= 0.0:
-                ps.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-                    ps.communicate(timeout=1)
-                return None
-    if ps.returncode != 0:
+    stdout_text = _run_ps(pid, timeout, cancel_event)
+    if stdout_text is None:
         return None
     text = stdout_text.strip()
     if not text:
@@ -493,15 +537,11 @@ def monitor_child(
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
     while True:
         # ブロックする呼び出し（`ps`・待機）の前に、非ブロッキングの確認を
-        # 先に済ませる。壁時計の締め切りをキャンセルより優先する
-        # （`crates/train` の `classify_cancel_outcome` と同じ優先関係。締め切り
-        # 以後に終了を観測した場合は成果物を確定させない）。
-        if _remaining(deadline) <= 0.0:
+        # 先に済ませる（規則は `_stop_reason` の 1 か所）。
+        reason = _stop_reason(deadline, cancel_event)
+        if reason is not None:
             _terminate_and_reap(proc)
-            return "time"
-        if _is_cancelled(cancel_event):
-            _terminate_and_reap(proc)
-            return "cancelled"
+            return reason
         # `ps` の待ちは締め切りの残りとキャンセル要求で打ち切る。
         status = _current_child_status(
             proc.pid,
@@ -510,12 +550,11 @@ def monitor_child(
         )
         if status is None:
             _terminate_and_reap(proc)
-            # キャンセル済みなら監視失敗より優先する。`monitor_failed` の経路は
-            # stdout の drain 待ちを含み Rust 側の猶予を超えうるため、高速な
-            # キャンセル経路で予約を解放させる（REQ-34・#145）。
-            if _is_cancelled(cancel_event):
-                return "cancelled"
-            return "monitor_failed"
+            # 状態が不明になった理由が締め切り切れ・キャンセルなら、監視失敗
+            # ではなくそちらで報告する。`monitor_failed` は本当に `ps` が使えない
+            # 場合だけ（stdout の drain 待ちを含み Rust 側の猶予を超えうるため、
+            # キャンセルは高速な経路で予約を解放させる。REQ-34・#145）。
+            return _stop_reason(deadline, cancel_event) or "monitor_failed"
         rss, is_zombie = status
         if is_zombie:
             # issue #178 PR #233 レビュー再々々指摘 P1: ゾンビ（終了済み）を
@@ -525,17 +564,14 @@ def monitor_child(
             # 超過（`"time"`）として fail-closed に扱う（REQ-39）。締め切り内なら
             # `_classify_self_exit` で通常終了か `RLIMIT_CPU` 自己終了かを判定する。
             _terminate_and_reap(proc)
-            if _remaining(deadline) <= 0.0:
-                return "time"
-            if _is_cancelled(cancel_event):
-                return "cancelled"
+            reason = _stop_reason(deadline, cancel_event)
+            if reason is not None:
+                return reason
             return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
-        if _remaining(deadline) <= 0.0:
+        reason = _stop_reason(deadline, cancel_event)
+        if reason is not None:
             _terminate_and_reap(proc)
-            return "time"
-        if _is_cancelled(cancel_event):
-            _terminate_and_reap(proc)
-            return "cancelled"
+            return reason
         if rss > rss_limit_bytes:
             _terminate_and_reap(proc)
             return "rss"
