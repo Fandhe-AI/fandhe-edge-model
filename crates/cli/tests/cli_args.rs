@@ -23,12 +23,13 @@ fn one_json_line(o: &Output, code: &str) {
 }
 
 #[test]
-fn req33_every_subcommand_help_lists_options_on_stderr() {
+fn req33_every_subcommand_help_lists_options_as_one_json_line() {
     for sub in Subcommand::ALL {
         let o = run(&[sub.name(), "--help"]);
         assert_eq!(o.status.code(), Some(0));
-        assert!(o.stdout.is_empty());
-        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.stderr.is_empty());
+        one_json_line(&o, "ok");
+        let err = String::from_utf8_lossy(&o.stdout);
         for opt in options(sub) {
             assert!(err.contains(opt.name), "{} lacks {}", sub.name(), opt.name);
         }
@@ -39,8 +40,9 @@ fn req33_every_subcommand_help_lists_options_on_stderr() {
 fn req33_top_level_help_lists_seven_subcommands() {
     let o = run(&["--help"]);
     assert_eq!(o.status.code(), Some(0));
-    assert!(o.stdout.is_empty());
-    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.stderr.is_empty());
+    one_json_line(&o, "ok");
+    let err = String::from_utf8_lossy(&o.stdout);
     for sub in Subcommand::ALL {
         assert!(err.contains(sub.name()));
     }
