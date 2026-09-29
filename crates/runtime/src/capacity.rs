@@ -3,13 +3,14 @@
 //! モデルパッケージの非圧縮合計バイト数を、構成要素（重み・語彙または特徴量変換の
 //! 定義・選択肢表・校正設定・メタデータ）ごとの内訳として集計する。CLI の `package`
 //! 工程（#123・TASK-30.1-2）が JSON 出力へ接続する際の下位ロジックで、本モジュールは
-//! 値の型と集計だけを持つ。
+//! 値の型と集計、およびエラーの終了コード・公開メッセージへの写像（#123）を持つ。
+//! JSON への直列化は CLI 側の責務（`fandhe-edge-cli` の `output` モジュール）。
 //!
 //! # 範囲外（後続 TASK の責務）
 //!
 //! - 上限との照合と `limit_exceeded`（TASK-30.2・#124）。40MB は目安であり、本モジュールは
 //!   合否の真偽値を持たない
-//! - JSON 出力・CLI への接続、7 種の終了コードへの写像（#123）
+//! - JSON 直列化・CLI 工程への配線（CLI 側。#123・TASK-33.1）
 //! - 経路の閉じ込め（`../`・ルート外参照。ガード層 REQ-39）と sha256 検証（TASK-28・39）。
 //!   呼び出し側が渡すパスは検証済みである前提
 //! - 構成要素の分類。どのファイルをどの要素に数えるかは呼び出し側が明示する
@@ -18,6 +19,7 @@
 //! 実機での C1・C3 の実測は人の作業であり、本モジュールのテストは生成物によるテスト
 //! ハーネスの証拠にとどまる。
 
+use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
 use std::collections::HashSet;
 use std::fmt;
@@ -121,6 +123,45 @@ impl fmt::Display for CapacityError {
             CapacityError::File(e) => write!(f, "{e}"),
             CapacityError::Overflow => write!(f, "package size counters overflow"),
         }
+    }
+}
+
+impl CapacityError {
+    /// 7 種の終了コードへの写像（REQ-21・REQ-30・#123）。
+    ///
+    /// - 読み込み上限超過（`FsError::TooLarge`）は `LimitExceeded`（core の `DefinitionError` と同じ扱い）
+    /// - 内部カウンタのあふれは `RuntimeError`。利用者が設定した上限の超過
+    ///   （TASK-30.2・#124 の `limit_exceeded`）ではないため、その意味を先取りしない
+    /// - 外部入力（パッケージ構成）の不正は `InvalidInput`。将来増える `FsError` も同様に倒す
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            CapacityError::File(FsError::TooLarge { .. }) => ExitCode::LimitExceeded,
+            CapacityError::Overflow => ExitCode::RuntimeError,
+            _ => ExitCode::InvalidInput,
+        }
+    }
+
+    /// パス・io エラー本文を含まない固定文（英語）。エラー JSON の `message` 用。
+    ///
+    /// `Display` は診断用にパス等を含むため `message` には使わない（security.md の
+    /// 秘密情報混入防止 P0）。
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        let text = match self {
+            CapacityError::EmptyPackage => "package has no files to measure",
+            CapacityError::DuplicatePath { .. } => "package file is listed more than once",
+            CapacityError::SymlinkRejected { .. } => {
+                "package file is a symlink or was replaced during measurement"
+            }
+            CapacityError::File(FsError::TooLarge { .. }) => "package file exceeds size limit",
+            CapacityError::File(FsError::NotRegularFile { .. }) => {
+                "package file is not a regular file"
+            }
+            CapacityError::File(_) => "package file is not readable",
+            CapacityError::Overflow => "package size counters overflow",
+        };
+        text.to_string()
     }
 }
 
@@ -374,5 +415,83 @@ mod tests {
         let b = CapacityBreakdown::from_sizes([(Metadata, 2), (Weights, 1)]).unwrap();
         let order: Vec<_> = b.entries().iter().map(|(c, _)| *c).collect();
         assert_eq!(order, PackageComponent::all());
+    }
+
+    #[test]
+    fn req21_capacity_error_exit_codes() {
+        let p = || PathBuf::from("/x");
+        assert_eq!(CapacityError::EmptyPackage.exit_code().code(), 64);
+        assert_eq!(
+            CapacityError::DuplicatePath { path: p() }
+                .exit_code()
+                .code(),
+            64
+        );
+        assert_eq!(
+            CapacityError::SymlinkRejected { path: p() }
+                .exit_code()
+                .code(),
+            64
+        );
+        assert_eq!(
+            CapacityError::File(FsError::NotRegularFile { path: p() })
+                .exit_code()
+                .code(),
+            64
+        );
+        assert_eq!(
+            CapacityError::File(FsError::Read {
+                path: p(),
+                source: std::io::Error::other("e")
+            })
+            .exit_code()
+            .code(),
+            64
+        );
+        assert_eq!(
+            CapacityError::File(FsError::TooLarge {
+                path: p(),
+                size: 2,
+                limit: 1
+            })
+            .exit_code()
+            .code(),
+            20
+        );
+        assert_eq!(CapacityError::Overflow.exit_code().code(), 70);
+    }
+
+    #[test]
+    fn req21_capacity_public_message_does_not_leak() {
+        let p = || PathBuf::from("/home/alice/secret-marker.onnx");
+        let errs = [
+            CapacityError::DuplicatePath { path: p() },
+            CapacityError::SymlinkRejected { path: p() },
+            CapacityError::File(FsError::NotRegularFile { path: p() }),
+            CapacityError::File(FsError::TooLarge {
+                path: p(),
+                size: 2,
+                limit: 1,
+            }),
+            CapacityError::File(FsError::Read {
+                path: p(),
+                source: std::io::Error::other("secret-io-marker"),
+            }),
+        ];
+        for e in &errs {
+            let shown = e.to_string();
+            assert!(shown.contains("secret"), "{shown}");
+            let m = e.public_message();
+            assert!(!m.contains("secret"), "{m}");
+            assert!(!m.contains("alice"), "{m}");
+        }
+        assert_eq!(
+            CapacityError::EmptyPackage.public_message(),
+            "package has no files to measure"
+        );
+        assert_eq!(
+            CapacityError::Overflow.public_message(),
+            "package size counters overflow"
+        );
     }
 }
