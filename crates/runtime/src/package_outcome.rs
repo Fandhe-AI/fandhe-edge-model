@@ -8,7 +8,8 @@
 //!
 //! 1. 上限超過が 1 件でもあれば `LimitExceeded`（20）。合否判定は見ない
 //! 2. それ以外で合否判定が不合格なら `JudgedFail`（10）
-//! 3. それ以外は `Ok`（0）
+//! 3. それ以外で合否判定が判定不能（件数不足等）なら `Pending`（12。合格扱いにしない）
+//! 4. それ以外は `Ok`（0）
 //!
 //! 超過を合格扱いにする経路は作らない（fail-closed。`quality` が `Pass` でも 20）。
 //!
@@ -18,8 +19,8 @@
 //!   TASK-30.2（#124）の責務で、本モジュールは [`LimitBreach`] を入力として受け取る。
 //!   #124 のマージ後に `measure_package` からの結線確認を行う
 //! - 利用者が設定する容量上限の定義ファイルへの取り込み（読み込みと範囲検証）は未実装
-//! - 評価器の判定から [`PackageQualityJudgment`] への変換、`Undeterminable` から `Pending`
-//!   への対応づけ、CLI・JSON 出力への配線は TASK-33.x の責務
+//! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
+//!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務
 //! - 待ち時間の上限超過（[`LimitBreach`] への追加）は #133 の責務
 //!
 //! 証拠の種別: テストハーネス。本番データでの `limit_exceeded` の再実演は未実施
@@ -34,6 +35,8 @@ pub enum PackageQualityJudgment {
     Pass,
     /// 合否基準を満たさない（`judged_fail`）。
     Fail,
+    /// 判定不能（評価器の `Undeterminable`。件数不足等。合格扱いにせず `pending` へ写す。REQ-24・REQ-21）。
+    Undeterminable,
     /// 合否基準が未設定（PoC-16 の acceptance なしに相当。`ok`）。
     NotDefined,
 }
@@ -60,6 +63,8 @@ pub enum PackageVerdict {
     Fail,
     /// 上限超過（合否判定に優先する）。
     LimitExceeded,
+    /// 判定不能（終了コード 12）。
+    Undeterminable,
     /// 合否基準が未設定。
     NotDefined,
 }
@@ -85,6 +90,9 @@ pub fn resolve_package_outcome(
     } else {
         match quality {
             PackageQualityJudgment::Fail => (ExitCode::JudgedFail, PackageVerdict::Fail),
+            PackageQualityJudgment::Undeterminable => {
+                (ExitCode::Pending, PackageVerdict::Undeterminable)
+            }
             PackageQualityJudgment::Pass => (ExitCode::Ok, PackageVerdict::Pass),
             PackageQualityJudgment::NotDefined => (ExitCode::Ok, PackageVerdict::NotDefined),
         }
@@ -112,6 +120,7 @@ mod tests {
         for q in [
             PackageQualityJudgment::Pass,
             PackageQualityJudgment::Fail,
+            PackageQualityJudgment::Undeterminable,
             PackageQualityJudgment::NotDefined,
         ] {
             let o = resolve_package_outcome(&over(), q);
@@ -127,6 +136,15 @@ mod tests {
         let o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         assert_eq!(o.exit_code.code(), 10);
         assert_eq!(o.verdict, PackageVerdict::Fail);
+        assert!(o.breaches.is_empty());
+    }
+
+    #[test]
+    fn req21_no_breach_undeterminable_is_pending_12() {
+        let o = resolve_package_outcome(&[], PackageQualityJudgment::Undeterminable);
+        assert_eq!(o.exit_code, ExitCode::Pending);
+        assert_eq!(o.exit_code.code(), 12);
+        assert_eq!(o.verdict, PackageVerdict::Undeterminable);
         assert!(o.breaches.is_empty());
     }
 
