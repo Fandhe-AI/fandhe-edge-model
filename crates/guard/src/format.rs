@@ -181,6 +181,9 @@ const MAX_TOP_LEVEL_FIELDS: usize = 65_536;
 /// GraphProto 内のフィールド数の上限（`node` の繰り返しを考慮した余裕値）。超えたら未検査。
 const MAX_GRAPH_FIELDS: usize = 1 << 20;
 
+/// ValueInfoProto 内のフィールド数の上限（`metadata_props` の繰り返しを考慮した余裕値）。超えたら未検査。
+const MAX_VALUE_INFO_FIELDS: usize = 4096;
+
 /// GraphProto（onnx.proto3）のフィールドの wire type。全て LEN(2)。未知の field 番号は `None`。
 /// 1 node・2 name・5 initializer・10 doc_string・11 input・12 output・13 value_info・
 /// 14 quantization_annotation・15 sparse_initializer・16 metadata_props。
@@ -225,9 +228,53 @@ fn read_field<S: ByteSource>(src: &mut S, pos: u64) -> io::Result<FieldStep> {
     )))
 }
 
+/// ValueInfoProto（onnx.proto3）のフィールドの wire type。全て LEN(2)。未知の field 番号は `None`。
+/// 1 name・2 type・3 doc_string・4 metadata_props。
+fn value_info_field_wire_type(field: u64) -> Option<u64> {
+    match field {
+        1..=4 => Some(2),
+        _ => None,
+    }
+}
+
+/// ValueInfoProto の本体 `[start, end)` の top-level 構造を検査する。
+/// 全フィールドが既知の LEN で `end` ちょうどで終わり、空でない `name`（field 1）を持てば妥当な形。
+fn scan_value_info<S: ByteSource>(src: &mut S, start: u64, end: u64) -> io::Result<OnnxScan> {
+    let mut pos = start;
+    let mut seen_name = false;
+    for _ in 0..MAX_VALUE_INFO_FIELDS {
+        if pos == end {
+            return Ok(if seen_name {
+                OnnxScan::Onnx
+            } else {
+                OnnxScan::NotOnnx
+            });
+        }
+        let (field, wire, len, after) = match read_field(src, pos)? {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        };
+        if value_info_field_wire_type(field) != Some(wire) {
+            return Ok(OnnxScan::NotOnnx);
+        }
+        let Some(next) = after.checked_add(len) else {
+            return Ok(OnnxScan::NotOnnx);
+        };
+        if next > end {
+            return Ok(OnnxScan::NotOnnx);
+        }
+        if field == 1 && len > 0 {
+            seen_name = true;
+        }
+        pos = next;
+    }
+    Ok(OnnxScan::Exhausted)
+}
+
 /// GraphProto の本体 `[start, end)` を、LEN の中身を飛ばしながら走査する。
 /// 全フィールドが既知の LEN で `end` を超えず、ちょうど `end` で終わり、
-/// `output`（field 12。有効なグラフは 1 つ以上の出力を持つ）が現れれば妥当な形。
+/// `output`（field 12。有効なグラフは 1 つ以上の出力を持つ）が現れ、各 output が有効な
+/// ValueInfoProto（空でない name を持つ）であれば妥当な形。
 fn scan_graph_proto<S: ByteSource>(src: &mut S, start: u64, end: u64) -> io::Result<OnnxScan> {
     let mut pos = start;
     let mut seen_output = false;
@@ -253,7 +300,11 @@ fn scan_graph_proto<S: ByteSource>(src: &mut S, start: u64, end: u64) -> io::Res
             return Ok(OnnxScan::NotOnnx);
         }
         if field == 12 {
-            seen_output = true;
+            // output は ValueInfoProto。必須の name を持たない空の output を許可しない。
+            match scan_value_info(src, after, next)? {
+                OnnxScan::Onnx => seen_output = true,
+                other => return Ok(other),
+            }
         }
         pos = next;
     }
@@ -399,13 +450,14 @@ impl FormatAllowlist {
     }
 }
 
-/// 許可リストの検査を通った形式。外部から直接は作れない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 許可リストの検査を通った形式。外部から直接は作れず、`Copy`・`Clone` でもない
+/// （検査済みのハンドルから切り離して持ち回さない。TOCTOU 対策。REQ-39）。
+#[derive(Debug, PartialEq, Eq)]
 pub struct AllowedFormat(FileFormat);
 
 impl AllowedFormat {
     /// 通った形式。
-    pub const fn format(self) -> FileFormat {
+    pub const fn format(&self) -> FileFormat {
         self.0
     }
 }
@@ -479,15 +531,33 @@ pub struct CheckedFile {
 }
 
 impl CheckedFile {
-    /// 検査を通った形式。
-    pub const fn format(&self) -> AllowedFormat {
-        self.format
+    /// 検査を通った形式（ハンドルへの借用。`CheckedFile` を手放さずに参照する）。
+    pub const fn format(&self) -> &AllowedFormat {
+        &self.format
+    }
+
+    /// 検査済みのハンドルと形式を一緒に取り出す（位置は先頭）。形式はハンドルの読み込みにだけ
+    /// 使い、パスを開き直さないこと。
+    pub fn into_parts(self) -> (File, AllowedFormat) {
+        (self.file, self.format)
     }
 
     /// 検査済みのハンドルを取り出す（位置は先頭）。以降の読み込みはこのハンドルで行うこと。
     /// 形式だけを返してパスを開き直させる公開 API は設けない（検査後の差し替え = TOCTOU の防止）。
     pub fn into_file(self) -> File {
         self.file
+    }
+}
+
+impl io::Read for CheckedFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl io::Seek for CheckedFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
     }
 }
 
@@ -538,12 +608,15 @@ mod tests {
     /// REQ-39・TASK-39.2-1: 最小の ONNX 形と実物に近い先頭を Onnx と判定する。
     #[test]
     fn req39_detects_onnx() {
-        assert_eq!(d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00]), FileFormat::Onnx);
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]),
+            FileFormat::Onnx
+        );
         let mut b = vec![0x08, 0x03, 0x12, 7];
         b.extend_from_slice(b"pytorch");
         b.extend_from_slice(&[0x1a, 3]);
         b.extend_from_slice(b"0.3");
-        b.extend_from_slice(&[0x3a, 2, 0x62, 0x00]);
+        b.extend_from_slice(&[0x3a, 5, 0x62, 0x03, 0x0a, 0x01, 0x78]);
         assert_eq!(d(&b), FileFormat::Onnx);
     }
 
@@ -569,7 +642,42 @@ mod tests {
             FileFormat::Unknown
         ); // 子の LEN が graph 超過
         assert_eq!(
-            d(&[0x08, 0x07, 0x3a, 0x04, 0x0a, 0x00, 0x62, 0x00]),
+            d(&[
+                0x08, 0x07, 0x3a, 0x07, 0x0a, 0x00, 0x62, 0x03, 0x0a, 0x01, 0x78
+            ]),
+            FileFormat::Onnx
+        );
+    }
+
+    /// REQ-39・TASK-39.2-1: output の ValueInfoProto は空でない name が必須。空の output・
+    /// name 無し・空 name・未知フィールドを含む output は ONNX と認めない。
+    #[test]
+    fn req39_output_value_info_is_validated() {
+        // 空の output（LEN 0）
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00]),
+            FileFormat::Unknown
+        );
+        // name 無し（field 2 type だけ）
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x04, 0x62, 0x02, 0x12, 0x00]),
+            FileFormat::Unknown
+        );
+        // 空 name
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x04, 0x62, 0x02, 0x0a, 0x00]),
+            FileFormat::Unknown
+        );
+        // 未知フィールド（field 5）
+        assert_eq!(
+            d(&[
+                0x08, 0x07, 0x3a, 0x07, 0x62, 0x05, 0x0a, 0x01, 0x78, 0x2a, 0x00
+            ]),
+            FileFormat::Unknown
+        );
+        // 有効な output は通る
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]),
             FileFormat::Onnx
         );
     }
@@ -580,7 +688,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fe-guard-fmt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let onnx = dir.join("m.onnx");
-        std::fs::write(&onnx, [0x08, 0x07, 0x3a, 0x02, 0x62, 0x00]).unwrap();
+        std::fs::write(
+            &onnx,
+            [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78],
+        )
+        .unwrap();
         let pkl = dir.join("m.onnx.pkl");
         std::fs::write(&pkl, [0x80, 0x04, 0x95]).unwrap();
         let al = FormatAllowlist::onnx_only();
@@ -599,7 +711,10 @@ mod tests {
         assert_eq!(detect_format(&prefix, 1 << 30), FileFormat::Unknown);
         assert_eq!(detect_format(&prefix, 100), FileFormat::Unknown);
         assert_eq!(
-            detect_format(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00], 1 << 30),
+            detect_format(
+                &[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78],
+                1 << 30
+            ),
             FileFormat::Unknown
         );
     }
@@ -608,19 +723,21 @@ mod tests {
     #[test]
     fn req39_truncated_at_real_eof_after_graph_is_unknown() {
         assert_eq!(
-            d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00, 0x12, 0x80]),
+            d(&[
+                0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78, 0x12, 0x80
+            ]),
             FileFormat::Unknown
         ); // 値の varint が途中
         assert_eq!(
-            d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00, 0x92]),
+            d(&[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78, 0x92]),
             FileFormat::Unknown
         ); // tag が途中
         assert_eq!(
-            d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00, 0x12]),
+            d(&[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78, 0x12]),
             FileFormat::Unknown
         ); // 長さが無い
         assert_eq!(
-            d(&[0x08, 0x07, 0x3a, 0x02, 0x62, 0x00, 0x08]),
+            d(&[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78, 0x08]),
             FileFormat::Unknown
         ); // 値が無い
     }
@@ -648,11 +765,13 @@ mod tests {
         assert_eq!(d(&[0x3a, 0x00]), FileFormat::Unknown); // 先頭が ir_version でない
         assert_eq!(d(&[0x08, 0x07, 0x3a, 0x05, 0x00]), FileFormat::Unknown); // LEN 超過
         assert_eq!(
-            d(&[0x08, 0x07, 0x78, 0x01, 0x3a, 0x02, 0x62, 0x00]),
+            d(&[
+                0x08, 0x07, 0x78, 0x01, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78
+            ]),
             FileFormat::Unknown
         ); // 未知 field 15
         assert_eq!(
-            d(&[0x08, 0x00, 0x3a, 0x02, 0x62, 0x00]),
+            d(&[0x08, 0x00, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]),
             FileFormat::Unknown
         ); // ir_version 0
         let mut long = vec![0x08];
@@ -679,12 +798,12 @@ mod tests {
         let mut bad = vec![0x08, 0x07, 0x28];
         bad.extend_from_slice(&[0x80; 9]);
         bad.push(0x02);
-        bad.extend_from_slice(&[0x3a, 0x02, 0x62, 0x00]);
+        bad.extend_from_slice(&[0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]);
         assert_eq!(d(&bad), FileFormat::Unknown);
         let mut ok = vec![0x08, 0x07, 0x28];
         ok.extend_from_slice(&[0x80; 9]);
         ok.push(0x01);
-        ok.extend_from_slice(&[0x3a, 0x02, 0x62, 0x00]);
+        ok.extend_from_slice(&[0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]);
         assert_eq!(d(&ok), FileFormat::Onnx);
     }
 
