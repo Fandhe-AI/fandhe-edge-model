@@ -253,7 +253,6 @@ pub enum FreezeError {
     /// fail-closed の中核（`.claude/rules/evaluation-contract.md`
     /// 「データの分割と凍結」: 「ハッシュが記録と一致しなければ処理を
     /// 停止する」）。呼び出し側（将来の CLI `evaluate` 工程）はこの
-    /// 呼び出し側（将来の CLI `evaluate` 工程）はこの
     /// variant を受け取ったら評価を進めず、下記の内容を報告して
     /// 非ゼロ終了で停止すること（REQ-17 異常系・TASK-17.3・issue #49。
     /// 終了コードは [`FreezeError::exit_code`]）。
