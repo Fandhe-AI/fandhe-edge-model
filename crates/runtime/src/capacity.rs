@@ -222,6 +222,16 @@ fn file_id(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::io::Result
     std::fs::canonicalize(path)
 }
 
+/// 検査時と開いた後のメタデータが同一ファイルのものと見なせるかを近似判定する
+/// （Unix 以外の差し替え検出用。REQ-39）。時刻が取得できない環境では取得可否の一致を要求する。
+#[cfg(not(unix))]
+fn metadata_snapshot_matches(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.file_type() == b.file_type()
+        && a.len() == b.len()
+        && a.modified().ok() == b.modified().ok()
+        && a.created().ok() == b.created().ok()
+}
+
 /// 実ファイルのサイズを構成要素ごとに集計する。中身は読まない。
 ///
 /// symlink は拒否する。検査から計測までの間にパスが差し替えられても（TOCTOU。REQ-39）
@@ -263,8 +273,20 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
                 path: f.path.clone(),
             });
         }
+        // Unix 以外では標準ライブラリだけでは開いたハンドルの同一性（ボリューム通し番号・
+        // ファイル index）を安定版で取得できない（取得には依存追加か `unsafe` が要り、
+        // どちらもユーザー承認事項）。代替として、検査時のメタデータと開いたハンドルの
+        // メタデータの種別・サイズ・更新時刻・作成時刻を突き合わせ、差し替えの兆候があれば
+        // 拒否する（fail-closed。近似であり同一性の証明ではない。M10 時点で対象外）。
         #[cfg(not(unix))]
-        let _ = checked_id;
+        {
+            let _ = checked_id;
+            if !metadata_snapshot_matches(&link_meta, &meta) {
+                return Err(CapacityError::SymlinkRejected {
+                    path: f.path.clone(),
+                });
+            }
+        }
         if !seen.insert(opened_id) {
             return Err(CapacityError::DuplicatePath {
                 path: f.path.clone(),
