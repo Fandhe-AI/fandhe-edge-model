@@ -414,13 +414,17 @@ mod tests {
         let open = || std::fs::File::open(&path).unwrap();
         let one = measure_opened_files(&[(Weights, path.clone(), open())]).unwrap();
         assert_eq!(one.total_bytes(), 4);
-        // ディレクトリのハンドルは NotRegularFile（"not a regular file"）で拒否される
-        let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
-        let not_regular = measure_opened_files(&[(Weights, path.clone(), dir)]);
-        assert!(matches!(
-            not_regular,
-            Err(CapacityError::File(FsError::NotRegularFile { .. }))
-        ));
+        // ディレクトリのハンドルは NotRegularFile（"not a regular file"）で拒否される。
+        // Windows は File::open でディレクトリを開けないため Unix のみで検証する
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+            let not_regular = measure_opened_files(&[(Weights, path.clone(), dir)]);
+            assert!(matches!(
+                not_regular,
+                Err(CapacityError::File(FsError::NotRegularFile { .. }))
+            ));
+        }
         let dup = measure_opened_files(&[
             (Weights, path.clone(), open()),
             (Metadata, path.clone(), open()),

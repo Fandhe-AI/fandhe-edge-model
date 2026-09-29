@@ -212,10 +212,10 @@ mod tests {
         let root = root();
         let missing = open_confined(&root, Path::new("sub/none.json")).unwrap_err();
         assert_eq!(missing.message, "package file is not readable");
-        let dir = open_confined(&root, Path::new("sub")).unwrap_err();
-        assert_eq!(dir.message, "package file is not a regular file");
         #[cfg(unix)]
         {
+            let dir = open_confined(&root, Path::new("sub")).unwrap_err();
+            assert_eq!(dir.message, "package file is not a regular file");
             let l = root.join("sub").join("tail_link2");
             let _ = std::fs::remove_file(&l);
             std::os::unix::fs::symlink(root.join("sub").join("m.json"), &l).unwrap();
