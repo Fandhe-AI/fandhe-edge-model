@@ -42,6 +42,7 @@ fandhe-edge-model/
 ├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）・`exitcode/exit_codes.json`（終了コード 7 種の共有 fixture。Rust と学習ワーカーの一致照合。#179）・`train_contract/`（学習リクエスト・結果 JSON・既定候補 `default_candidates.json` の共有 fixture。`crates/train`・`trainer` の一致照合。issue #177）・`score_tolerance/score_sum_tolerance.json`（`SCORE_SUM_TOLERANCE` の共有 fixture。`crates/core`・`crates/data` が独立に持つ同名定数の一致照合。PR #202）・`onnx_parity/`（C1・C3 の ONNX と MLX 内推論の予測ラベル。`trainer/tools/gen_onnx_parity_fixture.py` が生成し、`crates/runtime` の全件一致テストが読む。REQ-32・#113）
 ├── scripts/                       # `cli-infer-noninteractive.sh`（Bash 経由の非対話実行確認スクリプト。REQ-36・TASK-36.1-1・#149）
 ├── docs/
+│   ├── design/                    # 設計・運用手順（`runtime-batch-mismatch-procedure.md`: 推論の不一致発見時の原因特定・記録手順。REQ-28・TASK-28.2・#119）
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・ci・python-ci・update-external（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

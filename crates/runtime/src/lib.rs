@@ -33,6 +33,9 @@
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と
 //! 実モデルでの待ち時間計測は未実施（#113 の実装で可能になった。`tests/onnx_parity.rs` は fixture の
 //! 全件で単体・バッチ・評価器用関数の一致まで確認する）。
+//!
+//! 不一致を検出した場合の原因特定・記録の手順は `docs/design/runtime-batch-mismatch-procedure.md`
+//! （REQ-28 異常系・TASK-28.2・#119）に従う。
 
 pub mod capacity;
 pub mod latency;
