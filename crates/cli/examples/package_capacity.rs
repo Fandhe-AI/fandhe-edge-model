@@ -5,6 +5,9 @@
 //! `label_table`・`calibration`・`metadata`）。成功時は `capacity` の JSON 1 行を出して exit 0、
 //! 失敗時は `{"code","message"}` を出して対応する終了コードで終える。
 //!
+//! 対応 OS: Unix のみ。非 Unix（M10 時点で対象外）では、開いた後の差し替え検出に要る
+//! ファイル同一性を stable の std だけでは取れないため、近似せず全ファイルを拒否する（fail-closed。REQ-39）。
+//!
 //! 位置づけ: 配布物・推論経路には入らず、`package` 工程の正式な CLI 契約でもない。
 //! argv は untrusted のため、パスはカレントディレクトリ（計測対象ルート）配下の相対パスに限り、
 //! 絶対パス・`..`・親経由の symlink によるルート外参照を拒否する（REQ-39）。非 UTF-8 の引数は
@@ -215,7 +218,20 @@ mod tests {
     #[test]
     fn req39_open_confined_rejects_absolute_and_parent_paths() {
         let root = root();
+        // Unix: ルート配下の通常ファイルは受理される
+        #[cfg(unix)]
         assert!(open_confined(&root, Path::new("sub/m.json")).is_ok());
+        // 非 Unix: 開いた後の差し替え検出に要るファイル同一性を std だけでは取れないため、
+        // 受理せず常に拒否する（fail-closed の契約。SymlinkRejected 相当 = 終了コード 64）
+        #[cfg(not(unix))]
+        {
+            let e = open_confined(&root, Path::new("sub/m.json")).unwrap_err();
+            assert_eq!(e.code, ExitCode::InvalidInput);
+            assert_eq!(
+                e.message,
+                "package file is a symlink or was replaced during measurement"
+            );
+        }
         // 末尾が symlink のファイルは拒否される（ルート配下の別ファイルへの link でも）
         #[cfg(unix)]
         {
