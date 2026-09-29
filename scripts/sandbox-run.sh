@@ -39,8 +39,13 @@
 #     1〜86400 の整数秒、不正値は既定 3600）、stdout 1 MiB・stderr 8 MiB の容量。超過時は
 #     工程のプロセスグループごと KILL して 70。stdin は /dev/null。
 #     プロセス管理の構造は cli-infer-noninteractive.sh（#149）と同じ（共通化は別課題）
-#   - 出力先: <out-dir>/steps/<NN>_<工程>[_c<i>].stdout|stderr と <out-dir>/run.meta.json
-#     （sandbox 下で実行した時間帯 started_utc/ended_utc を #163 へ引き渡す）
+#   - 出力先: <out-dir>/run.meta.json のみ（sandbox 下で実行した時間帯 started_utc/ended_utc
+#     と工程ごとのバイト数を #163 へ引き渡す）。工程の stdout・stderr の本文は永続化しない
+#     （推論結果・エラーに学習・評価データの本文が含まれうるため。security.md）。
+#     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
+#   - evaluate の skipped 判定は stdout を JSON として解析し、トップレベルの status だけを
+#     見る（python3 の json で構造検証）。解析できない・JSON オブジェクトでない場合は
+#     判定不能として runtime_error(70)（fail-closed。REQ-17・REQ-21）
 #
 # 前提条件（通信を伴う準備は sandbox の外で先に済ませる。REQ-38。本スクリプトは
 # cargo build・uv sync を実行しない）: ビルド済みバイナリ
@@ -172,7 +177,7 @@ case "$step_timeout" in
 esac
 [ "$step_timeout" -le 86400 ] || step_timeout=3600
 
-mkdir -p -- "$out_dir/steps" || fail 70 runtime_error "cannot create output directory"
+mkdir -p -- "$out_dir" || fail 70 runtime_error "cannot create output directory"
 
 work=$(mktemp -d) || fail 70 runtime_error "cannot create temporary directory"
 child=
@@ -227,8 +232,8 @@ step_rc=0
 run_step() {
     prefix=$1
     shift
-    so="$out_dir/steps/$prefix.stdout"
-    se="$out_dir/steps/$prefix.stderr"
+    so="$work/$prefix.stdout"
+    se="$work/$prefix.stderr"
     rcf="$work/rc"
     rm -f "$rcf" "$rcf.tmp"
     : >"$so"
@@ -329,15 +334,30 @@ do_step() {
     t1=$(utc_now)
     status=null
     if [ "$name" = "evaluate" ] && [ "$step_rc" -eq 0 ]; then
-        if grep -q '"status":"skipped"' "$out_dir/steps/$prefix.stdout" 2>/dev/null; then
-            status='"skipped"'
-        else
-            status='"ok"'
-        fi
+        # stdout を JSON として解析し、トップレベルの status だけを見る。
+        # 出力は skipped / other / invalid のいずれかの固定語
+        verdict=$(python3 -c '
+import json, sys
+try:
+    v = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except Exception:
+    print("invalid")
+    sys.exit(0)
+if not isinstance(v, dict):
+    print("invalid")
+else:
+    print("skipped" if v.get("status") == "skipped" else "other")
+' <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
+        case "$verdict" in
+            skipped) status='"skipped"' ;;
+            other) status='"ok"' ;;
+            *) step_rc=70 ;;
+        esac
     fi
     cn=$(code_name "$step_rc")
-    obytes=$(wc -c <"$out_dir/steps/$prefix.stdout" | tr -d ' ')
-    ebytes=$(wc -c <"$out_dir/steps/$prefix.stderr" | tr -d ' ')
+    obytes=$(wc -c <"$work/$prefix.stdout" | tr -d ' ')
+    ebytes=$(wc -c <"$work/$prefix.stderr" | tr -d ' ')
+    rm -f "$work/$prefix.stdout" "$work/$prefix.stderr"
     entry=$(printf '{"step":"%s","candidate":%s,"exit_code":%s,"code":"%s","status":%s}' \
         "$name" "$cand_json" "$step_rc" "$cn" "$status")
     steps_json="${steps_json:+$steps_json,}$entry"

@@ -92,6 +92,10 @@ impl Env {
                  if [ \"${{FAKE_FAIL_STAGE:-}}\" = \"$stage\" ]; then\n\
                  exit \"${{FAKE_FAIL_RC:-70}}\"\n\
                  fi\n\
+                 if [ \"$stage\" = evaluate ] && [ -n \"${{FAKE_EVAL_OUT:-}}\" ]; then\n\
+                 printf '%s\\n' \"$FAKE_EVAL_OUT\"\n\
+                 exit 0\n\
+                 fi\n\
                  if [ \"$stage\" = evaluate ] && [ -n \"${{FAKE_EVAL_SKIPPED:-}}\" ]; then\n\
                  echo '{{\"code\":\"ok\",\"status\":\"skipped\"}}'\n\
                  exit 0\n\
@@ -380,6 +384,43 @@ fn req17_evaluate_skipped_is_reported_distinctly() {
         "{}",
         o.stdout
     );
+}
+
+/// skipped 判定は JSON の構造で行う。空白入りの正当な JSON は検出し、入れ子の status・文字列中の
+/// 断片は誤検出しない。解析できない出力は判定不能として 70（REQ-17・REQ-21）。
+#[test]
+fn req17_evaluate_skipped_detection_is_structural() {
+    let e = Env::new();
+    let o = e.run(
+        &e.base_args(),
+        &[(
+            "FAKE_EVAL_OUT",
+            "{ \"code\" : \"ok\", \"status\" : \"skipped\" }",
+        )],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(o.stdout.contains("\"status\":\"skipped\"}"), "{}", o.stdout);
+
+    let e = Env::new();
+    let o = e.run(
+        &e.base_args(),
+        &[(
+            "FAKE_EVAL_OUT",
+            "{\"code\":\"ok\",\"note\":\"\\\"status\\\":\\\"skipped\\\"\",\"inner\":{\"status\":\"skipped\"}}",
+        )],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        o.stdout
+            .contains("\"step\":\"evaluate\",\"candidate\":0,\"exit_code\":0,\"code\":\"ok\",\"status\":\"ok\""),
+        "{}",
+        o.stdout
+    );
+
+    let e = Env::new();
+    let o = e.run(&e.base_args(), &[("FAKE_EVAL_OUT", "not json")]);
+    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
+    assert!(o.stdout.contains("\"failed_step\":\"evaluate\""));
 }
 
 /// 工程の期限切れで工程グループごと終了し 70 を返す。
