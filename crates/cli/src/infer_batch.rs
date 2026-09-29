@@ -45,12 +45,14 @@
 //! 数える。読み取り・推論・出力量の検証は専用スレッドで行い、呼び出し側が期限で待つため、
 //! 改行が来ない低速な `Read` や 1 件の推論の内部でブロックしても、超過は `limit_exceeded`
 //! で返る（スレッドは強制終了できず切り離して残る。CLI は 1 呼び出し 1 プロセスで、結果を
-//! 書いたら終了する前提）。協調的な確認（1 行ごと・1 件ごと）も併用する。
+//! 書いたら終了する前提）。協調的な確認（1 行ごと・1 件ごと）も併用する。CLI 経路は
+//! [`BatchLimits::for_cli_process`] を使い、切り離したスレッドはプロセス終了で回収する。
 //!
 //! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
 //! 出力段階は行の間で `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は書き込み失敗と同じ
 //! `io::Error`（出力が壊れるため `ErrorReport` は追記しない）。1 回の `write` 自体が読み手の
-//! 停止でブロックする場合は中断できないが、量は上限内に有界。
+//! 停止でブロックする場合は `Write` では中断できないため、CLI 経路（`for_cli_process`）では
+//! ウォッチドッグが期限でプロセスを exit 70 で終了する。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
 
@@ -251,6 +253,27 @@ pub struct BatchLimits {
     pub output_bytes: usize,
     /// 出力段階の時間上限。
     pub output_duration: Duration,
+    /// `true` なら、中断できない停止（出力先への書き込みのブロック・期限超過で切り離した
+    /// 計算スレッド）をプロセスの終了で回収する（REQ-39）。CLI の 1 呼び出し 1 プロセス専用
+    /// （[`BatchLimits::for_cli_process`]）。`false`（既定）は同一プロセスから繰り返し呼べるが、
+    /// 停止した書き込みは中断できず、切り離したスレッドは残る。
+    pub terminate_process_on_stall: bool,
+}
+
+impl BatchLimits {
+    /// CLI の 1 呼び出し 1 プロセス向けの上限（既定値 + プロセス終了による回収）。
+    ///
+    /// 出力段階が `output_duration` を超えて書き込みでブロックしたら、ウォッチドッグが
+    /// exit 70（`runtime_error`。出力が壊れた書き込み失敗と同じ写像）でプロセスを終える。
+    /// 期限超過で計算スレッドを切り離した場合は、`limit_exceeded` の `ErrorReport` を書いた
+    /// 直後に exit 20 でプロセスを終え、スレッド・reader・pipeline を確実に回収する。
+    #[must_use]
+    pub fn for_cli_process() -> Self {
+        Self {
+            terminate_process_on_stall: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for BatchLimits {
@@ -259,7 +282,35 @@ impl Default for BatchLimits {
             duration: MAX_INFER_BATCH_DURATION,
             output_bytes: MAX_INFER_BATCH_OUTPUT_BYTES,
             output_duration: MAX_INFER_BATCH_OUTPUT_DURATION,
+            terminate_process_on_stall: false,
         }
+    }
+}
+
+/// 出力段階のウォッチドッグ。drop（正常完了・エラー）で解除される。
+///
+/// `write_all` / `flush` が出力先の停止でブロックしても、協調的な期限確認は戻らないため、
+/// 別スレッドが期限で `process::exit` して回収する（REQ-39。CLI の 1 プロセス専用）。
+struct OutputWatchdog {
+    _disarm: mpsc::Sender<()>,
+}
+
+impl OutputWatchdog {
+    /// `enabled` なら `duration` 後にプロセスを終了するウォッチドッグを起動する。
+    fn arm(enabled: bool, duration: Duration) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel::<()>();
+        let spawned = thread::Builder::new()
+            .name("infer-batch-watchdog".to_string())
+            .spawn(move || {
+                // 送信側の drop（解除）は Disconnected で返る。Timeout のときだけ終了する。
+                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(duration) {
+                    std::process::exit(i32::from(ExitCode::RuntimeError.code()));
+                }
+            });
+        spawned.ok().map(|_| Self { _disarm: tx })
     }
 }
 
@@ -352,8 +403,11 @@ where
 /// 期限超過で `limit_exceeded` を返せる（スレッドは強制終了できないため、超過時は切り離して
 /// 残す。呼び出し側は結果を書いたらプロセスを終了する前提で、CLI は 1 呼び出し 1 プロセス）。
 /// 書き込みは総量（`limits.output_bytes`）を事前に検査済みで、行の間で `limits.output_duration`
-/// を確認する。ただし 1 回の `write` 自体が読み手の停止でブロックする場合は中断できない
-/// （OS のパイプ背圧。出力量が有界なので待つのは最大でも上限内の量）。
+/// を確認する。1 回の `write` 自体が読み手の停止でブロックする場合、`Write` は中断できない。
+/// `limits.terminate_process_on_stall`（[`BatchLimits::for_cli_process`]）が真なら、ウォッチドッグが
+/// 期限でプロセスを終了して回収する。偽（既定）の間は中断できず、期限切れで切り離した計算
+/// スレッドも残るため、同一プロセスからの繰り返し呼び出しでは資源が蓄積しうる。本番の CLI 経路は
+/// 必ず `for_cli_process` を使う（REQ-39）。
 ///
 /// # Errors
 /// 書き込み・flush の失敗、および出力段階の期限超過（`ErrorKind::TimedOut`）を `io::Error` で
@@ -395,6 +449,7 @@ where
             // 受信側が期限で去っていれば送信は失敗する。捨てる。
             let _ = tx.send(outcome);
         });
+    let mut abandoned = false;
     let outcome = match spawned {
         Err(_) => Err(report(ExitCode::RuntimeError)),
         Ok(_) => {
@@ -404,12 +459,17 @@ where
             };
             match received {
                 Ok(outcome) => outcome,
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(report(ExitCode::LimitExceeded)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    abandoned = true;
+                    Err(report(ExitCode::LimitExceeded))
+                }
                 // 計算スレッドの panic。
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(report(ExitCode::RuntimeError)),
             }
         }
     };
+    // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
+    let _watchdog = OutputWatchdog::arm(limits.terminate_process_on_stall, limits.output_duration);
     match outcome {
         Ok((records, predictions)) => {
             let output_deadline = Instant::now().checked_add(limits.output_duration);
@@ -428,7 +488,17 @@ where
             }
             Ok(ExitCode::Ok)
         }
-        Err(error) => emit_error_report(out, &error),
+        Err(error) => {
+            let written = emit_error_report(out, &error);
+            if abandoned && limits.terminate_process_on_stall {
+                // 切り離した計算スレッド（ブロック中の Read・推論）はここでしか回収できない。
+                // 書いた行を失わないよう flush してからプロセスを終える。
+                let _ = out.flush();
+                let code = written.as_ref().map_or(ExitCode::RuntimeError, |c| *c);
+                std::process::exit(i32::from(code.code()));
+            }
+            written
+        }
     }
 }
 
@@ -530,5 +600,25 @@ mod tests {
         let err = read_batch_records_until(line.as_bytes(), &io_schema(), Some(Instant::now()))
             .unwrap_err();
         assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
+    /// REQ-39: CLI 向け上限は既定値にプロセス終了による回収だけを足し、既定は無効。
+    #[test]
+    fn req39_cli_process_limits_enable_termination_only() {
+        let cli = BatchLimits::for_cli_process();
+        assert!(cli.terminate_process_on_stall);
+        assert!(!BatchLimits::default().terminate_process_on_stall);
+        assert_eq!(cli.duration, BatchLimits::default().duration);
+        assert_eq!(cli.output_bytes, BatchLimits::default().output_bytes);
+    }
+
+    /// REQ-39: 期限内に解除（drop）したウォッチドッグはプロセスを終了しない。
+    #[test]
+    fn req39_watchdog_disarmed_before_deadline_does_not_exit() {
+        let guard = OutputWatchdog::arm(true, Duration::from_millis(50));
+        assert!(guard.is_some());
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(OutputWatchdog::arm(false, Duration::from_millis(1)).is_none());
     }
 }
