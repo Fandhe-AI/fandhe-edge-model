@@ -666,6 +666,13 @@ fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, Train
         };
     }
     let status = wait_after_kill(child)?;
+    // `try_wait()` が `None` を返した直後に子が自然終了すると、未回収（ゾンビ）
+    // の子への `kill()` は成功しうる。回収した状態が `SIGKILL` 終了でなければ
+    // 自然終了なので、`Cancelled` とせず通常の結果分類へ戻す（成功した学習を
+    // `Cancelled` と誤記録しない。codex/review 指摘 P1）。
+    if status.signal() != Some(SIGKILL) {
+        return Ok(CancelStep::AlreadyExited(status));
+    }
     Ok(CancelStep::Cancelled(CancelledRun {
         elapsed: started.elapsed(),
         child_spawned: true,
@@ -673,6 +680,10 @@ fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, Train
         signal: status.signal(),
     }))
 }
+
+/// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
 
 /// `SIGKILL` 送出後、直接の子プロセスの終了待ちあたりの上限（REQ-39
 /// 「資源の上限」）。`SIGKILL` は通常即座に効くため、この上限に達するのは
