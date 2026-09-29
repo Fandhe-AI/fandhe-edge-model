@@ -361,8 +361,31 @@ endif
 .PHONY: py-ci
 py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲートを一括実行する
 
+.PHONY: test-trainer-integration
+# 実 trainer（MLX CPU）を Rust の run_train から起動する結合テスト（issue #258。
+# REQ-18/19/34/39）。crates/train/tests/real_trainer.rs は #[ignore] で既定の
+# `make test` から分離してあり、ここで --ignored 付きで実行する（python-ci.yml と
+# `make ci` の両方で実行するため、CI を通すための skip ではない）。
+# --exact で列挙したテスト名がずれると 0 件実行で成功してしまうため、出力の
+# 「2 passed」を検査して fail-closed にする（テスト名を変えたらここも更新する）。
+test-trainer-integration: py-sync ## 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
+	@$(require_uv)
+	@out="$$(mktemp)"; \
+	cargo test -p fandhe-edge-train --test real_trainer -- --ignored --exact \
+		req18_real_trainer_c1_job_completes_with_typed_outcome \
+		req18_real_trainer_c3_job_completes_with_validation_predictions 2>&1 | tee "$$out"; \
+	status=$$?; \
+	if [ "$$status" -eq 0 ] && ! grep -q "test result: ok. 2 passed" "$$out"; then \
+		echo "error: real_trainer の 2 件が実行・成功していません（テスト名の不一致の可能性）" >&2; status=1; \
+	fi; \
+	rm -f "$$out"; exit $$status
+else
+	@echo "skip: Cargo.toml / メンバー crate / trainer/pyproject.toml のいずれかが無いため test-trainer-integration をスキップ"
+endif
+
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint test deny py-ci ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint test deny py-ci test-trainer-integration ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
 
 # --------------------------------------------------
 # 後片付け
