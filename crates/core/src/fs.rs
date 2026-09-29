@@ -272,9 +272,42 @@ fn read_bounded_from_file(
 /// 読み進める途中で累計が上限を超えた時点（メタデータ取得後にファイルが
 /// 拡大・差し替えられた場合）で即座に拒否し、それ以上読み進めない。
 pub fn sha256_file_bounded(path: &Path, limit: u64) -> Result<Sha256Digest, FsError> {
+    let (file, metadata) = open_regular_file_with_metadata(path)?;
+    sha256_from_file(file, &metadata, path, limit)
+}
+
+/// 既に開いた通常ファイルのハンドルの sha256 を `limit` バイトまでの上限付きでストリーム計算する
+/// （REQ-39）。
+///
+/// [`sha256_file_bounded`] と同じ上限検査を、パスを開き直さずに行う。閉じ込め検証済みのハンドル
+/// （`fandhe_edge_guard::path::open_confined` の戻り値）をそのまま渡すための入口
+/// （[`read_bounded_open_file`] のハッシュ版）。`path` はエラー表示専用で、開き直しには使わない。
+/// ハンドルが通常ファイルでなければ [`FsError::NotRegularFile`]。
+pub fn sha256_open_file_bounded(
+    file: File,
+    path: &Path,
+    limit: u64,
+) -> Result<Sha256Digest, FsError> {
+    let metadata = file.metadata().map_err(|source| FsError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(FsError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    sha256_from_file(file, &metadata, path, limit)
+}
+
+fn sha256_from_file(
+    mut file: File,
+    metadata: &Metadata,
+    path: &Path,
+    limit: u64,
+) -> Result<Sha256Digest, FsError> {
     use sha2::{Digest as _, Sha256};
 
-    let (mut file, metadata) = open_regular_file_with_metadata(path)?;
     let reported_size = metadata.len();
     if reported_size > limit {
         return Err(FsError::TooLarge {
@@ -311,6 +344,36 @@ pub fn sha256_file_bounded(path: &Path, limit: u64) -> Result<Sha256Digest, FsEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39: 開いた File の上限付き読み込み。上限ちょうどは通り、+1 は拒否、空は空 Vec。
+    #[test]
+    fn req39_read_bounded_open_file_limits() {
+        let dir = std::env::temp_dir().join(format!("fandhe-core-rofb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("f.bin");
+        std::fs::write(&path, [7u8; 4]).expect("write");
+        let f = File::open(&path).expect("open");
+        assert_eq!(
+            read_bounded_open_file(f, Path::new("x"), 4).expect("ok"),
+            vec![7u8; 4]
+        );
+        let f = File::open(&path).expect("open");
+        assert!(matches!(
+            read_bounded_open_file(f, Path::new("x"), 3),
+            Err(FsError::TooLarge {
+                size: 4,
+                limit: 3,
+                ..
+            })
+        ));
+        std::fs::write(&path, []).expect("write");
+        let f = File::open(&path).expect("open");
+        assert_eq!(
+            read_bounded_open_file(f, Path::new("x"), 3).expect("ok"),
+            Vec::<u8>::new()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// テスト用の一時ファイルを、成否に関わらず削除するガード（RAII）。
     struct TempFileGuard(PathBuf);
