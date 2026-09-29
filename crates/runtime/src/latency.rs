@@ -594,6 +594,14 @@ mod tests {
 
     struct StubBackend;
     impl ScoringBackend for StubBackend {
+        /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+        fn scores_limited(
+            &self,
+            ids: &crate::pipeline::TokenIds,
+            _limit: std::time::Duration,
+        ) -> Result<Vec<f64>, crate::pipeline::BackendError> {
+            self.scores(ids)
+        }
         fn scores(
             &self,
             _ids: &crate::pipeline::TokenIds,

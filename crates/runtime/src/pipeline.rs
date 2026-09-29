@@ -88,15 +88,15 @@ pub trait ScoringBackend {
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError>;
 
     /// 計算時間を `limit` 以内に打ち切る版（超過は [`BackendError::TimeLimitExceeded`]。REQ-39）。
-    /// 既定実装は打ち切りを持たない `scores` と同じ。時間上限を強制できるバックエンドは上書きする。
+    ///
+    /// 既定実装は置かない。時間上限を強制できないバックエンドが `scores` へ委譲して
+    /// `InferencePipeline::infer_one_within` の上限を黙って無効化することを防ぐため、
+    /// 各実装が打ち切りを実装するか、保証できない場合は明示的にエラーを返す。
     fn scores_limited(
         &self,
         ids: &TokenIds,
         limit: std::time::Duration,
-    ) -> Result<Vec<f64>, BackendError> {
-        let _ = limit;
-        self.scores(ids)
-    }
+    ) -> Result<Vec<f64>, BackendError>;
 }
 
 /// 前処理の失敗（本文を保持しない）。

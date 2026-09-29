@@ -256,6 +256,11 @@ impl C1Model {
         for (acc, b) in logits.iter_mut().zip(&self.bias) {
             *acc += b;
         }
+        // 反復境界の検査は CHECK_INTERVAL 回ごとのため、短い入力でも softmax の前に必ず 1 回検査する
+        // （残り時間が極小のとき、推論が確認点に到達せず打ち切りを逃さないため。REQ-39）
+        if started.elapsed() >= limit {
+            return Err(BackendError::TimeLimitExceeded);
+        }
         softmax_f64(&logits)
     }
 }
