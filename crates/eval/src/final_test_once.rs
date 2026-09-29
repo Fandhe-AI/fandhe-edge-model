@@ -9,15 +9,27 @@
 //!
 //! # 呼び出し文脈
 //!
-//! CLI の `evaluate` 工程（issue #140 で配線予定・未配線）が、
-//! [`crate::eval_data_invariance::evaluate_with_eval_data_invariance`] の `eval`
-//! クロージャの中で [`apply_once`] を呼び、その中で予測を当てる想定。
+//! CLI の `evaluate` 工程（issue #140 で配線予定・未配線）が、データ契約層の
+//! 凍結記録から組み立てた [`FrozenEvalData`] を渡して [`apply_once`] を呼ぶ想定。
+//!
+//! # 唯一の公開経路（ロックと凍結記録の結び付け）
+//!
+//! ロックのキー（`FinalTestKey`）は非公開型で、コンストラクタも非公開。
+//! 公開の入口は [`apply_once`] だけで、内部で
+//! [`evaluate_with_eval_data_invariance`] を呼び、**実データから計算した sha256 が
+//! 凍結記録と一致した後にのみ**、その照合済みダイジェストからキーを作る。
+//! 呼び出し側が任意のダイジェストでキーを作って別ロックを取得し、2 回目の
+//! 予測を通すことはできない（レビュー指摘 P0 への対応）。
 //!
 //! # 順序の不変条件
 //!
 //! 1. 凍結記録との照合（`evaluate_with_eval_data_invariance`）が通ってから
-//! 2. ロックを取得し
+//! 2. ロックを取得し、永続化（ファイル・ディレクトリの `sync_all`）まで確認し
 //! 3. 予測を当てる
+//!
+//! 永続化の確認に失敗したら予測は呼ばずエラーを返す（fail-closed）。ディレクトリの
+//! fsync ができない環境（非 Unix 等）では永続性を保証できないため、
+//! [`AcquireError::DurabilityUnsupported`] で拒否する（サポート外を成功扱いにしない）。
 //!
 //! 凍結ハッシュ不一致では `eval` クロージャが呼ばれないためロックは作られず、
 //! 1 回の適用を消費しない。ロック取得後に予測が失敗しても、ロックは残す
@@ -44,6 +56,9 @@
 //! - seed は独自フィールドにせず、呼び出し側が事前登録（PoC-10: 代表構成を seed ごとに
 //!   1 回）に従って構成 ID へ畳み込む（例 `c1:seed0`）。
 
+use crate::eval_data_invariance::{
+    EvalDataInvarianceError, FrozenEvalData, evaluate_with_eval_data_invariance,
+};
 use crate::invariance::{ModelComponent, ModelPackageSnapshot};
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
@@ -89,17 +104,20 @@ impl RepresentativeConfigId {
 }
 
 /// 最終 test 適用の識別キー（評価データ × 代表構成 × 重み）。
+///
+/// 非公開型。評価データのダイジェストは [`apply_once`] が凍結記録と照合した値だけが
+/// 入る（外部から任意ダイジェストで作れない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalTestKey {
+struct FinalTestKey {
     eval_data_sha256: Sha256Digest,
     config_id: RepresentativeConfigId,
     weights_sha256: Sha256Digest,
 }
 
 impl FinalTestKey {
-    /// 凍結済み評価データの sha256・代表構成 ID・モデルスナップショットから作る。
-    /// 重みのダイジェストが取れなければ fail-closed でエラーにする。
-    pub fn new(
+    /// 凍結記録との照合を通過した評価データの sha256・代表構成 ID・モデル
+    /// スナップショットから作る。重みのダイジェストが取れなければ fail-closed。
+    fn from_verified(
         frozen_eval_sha256: Sha256Digest,
         config_id: RepresentativeConfigId,
         model: &ModelPackageSnapshot,
@@ -179,6 +197,17 @@ pub enum AcquireError {
         /// 台帳ディレクトリのパス。
         path: PathBuf,
     },
+    /// ロックの永続化（ロックファイルまたは台帳ディレクトリの `sync_all`）に失敗した。
+    /// 予測は呼ばれない。ロックは残る（適用を試みた事実として消費扱い）。
+    DurabilityFailed {
+        /// 対象パス。
+        path: PathBuf,
+        /// 原因。
+        source: std::io::Error,
+    },
+    /// 台帳ディレクトリの fsync ができない環境（非 Unix）で、ロックの永続性を
+    /// 保証できない。予測は呼ばれない。
+    DurabilityUnsupported,
     /// ロックの作成に失敗した。
     Io {
         /// 対象パス。
@@ -217,6 +246,15 @@ impl fmt::Display for AcquireError {
             AcquireError::LedgerDirInvalid { path } => {
                 write!(f, "ledger path is not a real directory: {}", path.display())
             }
+            AcquireError::DurabilityFailed { path, source } => write!(
+                f,
+                "failed to persist lock (application consumed) {}: {source}",
+                path.display()
+            ),
+            AcquireError::DurabilityUnsupported => write!(
+                f,
+                "cannot guarantee lock durability on this platform (directory fsync unsupported)"
+            ),
             AcquireError::Io { path, source } => {
                 write!(f, "failed to create lock {}: {source}", path.display())
             }
@@ -315,8 +353,26 @@ impl FinalTestLedger {
             })
     }
 
+    /// 台帳ディレクトリのエントリを永続化する。失敗を握りつぶさない（予測後の
+    /// クラッシュでロックのエントリが失われると再適用できてしまうため）。
+    #[cfg(unix)]
+    fn sync_dir(&self) -> Result<(), AcquireError> {
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|source| AcquireError::DurabilityFailed {
+                path: self.dir.clone(),
+                source,
+            })
+    }
+
+    /// 非 Unix ではディレクトリの fsync 手段が無く、永続性を保証できないため拒否する。
+    #[cfg(not(unix))]
+    fn sync_dir(&self) -> Result<(), AcquireError> {
+        Err(AcquireError::DurabilityUnsupported)
+    }
+
     /// 適用権を取得する（代表構成ロック → 重みロックの順）。
-    pub fn acquire(&self, key: &FinalTestKey) -> Result<ApplicationTicket, AcquireError> {
+    fn acquire(&self, key: &FinalTestKey) -> Result<ApplicationTicket, AcquireError> {
         let (cfg_file, cfg_path) =
             self.create_lock(&key.config_lock_name(), AppliedBy::RepresentativeConfig)?;
         // 以降、失敗してもロールバックしない（適用を試みた事実として消費扱い）。
@@ -324,26 +380,33 @@ impl FinalTestLedger {
             self.create_lock(&key.weights_lock_name(), AppliedBy::ModelWeights)?;
         Self::write_record(cfg_file, &cfg_path, &key.record("config"))?;
         Self::write_record(w_file, &w_path, &key.record("weights"))?;
-        #[cfg(unix)]
-        if let Ok(dir) = File::open(&self.dir) {
-            let _ = dir.sync_all();
-        }
+        self.sync_dir()?;
         Ok(ApplicationTicket {
             config_lock: cfg_path,
         })
     }
 }
 
-/// ロックを取得できた場合のみ `predict` を 1 回呼ぶ。
+/// 凍結記録との照合 → ロック取得・永続化 → 予測の順で、`predict` を高々 1 回呼ぶ。
 ///
-/// 凍結記録の照合（`evaluate_with_eval_data_invariance`）の内側で呼ぶこと。
+/// 唯一の公開経路。`frozen` の sha256・バイト長と実データが一致した場合のみ、
+/// その照合済み sha256 でロックのキーを作る。`predict` には適用権と、照合済みの
+/// 評価データ本体を渡す（評価データ本体は評価器側の経路。推論関数へ渡す情報の
+/// 絞り込みは TASK-27.2 の責務）。
 pub fn apply_once<T, E>(
     ledger: &FinalTestLedger,
-    key: &FinalTestKey,
-    predict: impl FnOnce(ApplicationTicket) -> Result<T, E>,
-) -> Result<T, ApplyOnceError<E>> {
-    let ticket = ledger.acquire(key).map_err(ApplyOnceError::Acquire)?;
-    predict(ticket).map_err(ApplyOnceError::Prediction)
+    frozen: &FrozenEvalData<'_>,
+    config_id: RepresentativeConfigId,
+    model: &ModelPackageSnapshot,
+    predict: impl FnOnce(ApplicationTicket, &[u8]) -> Result<T, E>,
+) -> Result<T, EvalDataInvarianceError<ApplyOnceError<E>>> {
+    evaluate_with_eval_data_invariance(frozen, |bytes| {
+        // ここに来た時点で bytes の sha256 == frozen.sha256（照合済み）。
+        let key = FinalTestKey::from_verified(frozen.sha256, config_id, model)
+            .map_err(ApplyOnceError::Acquire)?;
+        let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
+        predict(ticket, bytes).map_err(ApplyOnceError::Prediction)
+    })
 }
 
 #[cfg(test)]
