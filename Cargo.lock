@@ -90,6 +90,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fandhe-edge-guard"
+version = "0.1.0"
+dependencies = [
+ "fandhe-edge-core",
+]
+
+[[package]]
 name = "fandhe-edge-runtime"
 version = "0.1.0"
 dependencies = [
