@@ -52,7 +52,15 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 実機確認は `scripts/sandbox-run.sh` を macOS 実機（Apple Silicon・`/usr/bin/sandbox-exec`）で**人が手動実行**する。sandbox の外で先に `cargo build` と `make py-sync` を済ませ、定義ファイルとデータを用意する。例: `scripts/sandbox-run.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke`
 - 既定の `make test` に含まれる `crates/cli/tests/sandbox_run_script.rs` は偽の launcher を使うテストハーネスで、実際の通信遮断は行わない。実機の証拠にはならない（証拠種別: テストハーネス）
 - 実バイナリは TASK-33.1-2（#136）の完了まで `register` で `runtime_error`(70) になる。完走を装っていないことの確認に留まる
-- 拒否ログの監視と 0 件判定は TASK-38.1-2（#163）、陽性対照は TASK-38.2 の担当
+- 陽性対照（sandbox 下で curl を実行して拒否の検出を確かめる）は TASK-38.2 の担当
+
+#### 拒否ログの監視・集計（REQ-38・TASK-38.1-2・#163）
+
+- 実機確認は `scripts/sandbox-monitor.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> [--candidates N] [--smoke]` を macOS 実機で**人が手動実行**する（前提は `sandbox-run.sh` と同じ）。`log stream` を実行の前に開始し後に止め（`log show` では Sandbox の拒否ログが取れない。PoC-16）、`scripts/sandbox_deny_report.py`（標準ライブラリのみ）が操作トークン（`network*` で始まる操作）で通信拒否を機械判定する。部分文字列 `network` では判定しない（PoC-16 の誤検出の回避）
+- 判定と終了コード: 本ツール起因の通信拒否あり `judged_fail`(10)・帰属不明の通信拒否あり `pending`(12)・監視の無効や読めない行や時刻の不整合 `runtime_error`(70。`network_verdict:"undeterminable"`)・拒否 0 件は run の終了コードを伝搬（合格は run も 0 のときのみ）
+- 出力先: `<out-dir>/network_report.json`（件数・通信拒否のレコード）・`log_stream.ndjson`（生ログ。0600）・`monitor.meta.json`・`run/run.meta.json`。生ログには他アプリのイベントが含まれるため、PR・Issue へは転記せず `network_report.json` の件数を記録する
+- `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
+- 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
 
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 

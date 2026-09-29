@@ -6,9 +6,9 @@
 # monitored_vertical.sh）。
 #
 # 呼び出し元: 人が macOS 実機で直接実行する（REQ-38 の実機確認は人の担当）／
-# 拒否ログ監視スクリプト（TASK-38.1-2・#163。このスクリプトを `log stream` で包む）／
+# `scripts/sandbox-monitor.sh`（TASK-38.1-2・#163。このスクリプトを `log stream` で包む）／
 # crates/cli/tests/sandbox_run_script.rs（偽の launcher を使うテストハーネス）。
-# 本スクリプトは拒否ログの監視・0 件の集計をしない（#163 の担当）。
+# 本スクリプトは拒否ログの監視・0 件の集計をしない（sandbox-monitor.sh と sandbox_deny_report.py の担当）。
 #
 # 使い方:
 #   sandbox-run.sh --definition PATH --project-dir DIR --out-dir DIR
@@ -40,7 +40,7 @@
 #     工程のプロセスグループごと KILL して 70。stdin は /dev/null。
 #     プロセス管理の構造は cli-infer-noninteractive.sh（#149）と同じ（共通化は別課題）
 #   - 出力先: <out-dir>/run.meta.json のみ（sandbox 下で実行した時間帯 started_utc/ended_utc
-#     と工程ごとのバイト数を #163 へ引き渡す）。工程の stdout・stderr の本文は永続化しない
+#     と工程ごとのバイト数を sandbox-monitor.sh へ引き渡す）。工程の stdout・stderr の本文は永続化しない
 #     （推論結果・エラーに学習・評価データの本文が含まれうるため。security.md）。
 #     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
 #   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。単一の JSON オブジェクトで

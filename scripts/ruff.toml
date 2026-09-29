@@ -1,0 +1,3 @@
+# scripts/ 配下の Python（検証用スクリプト）にも trainer と同じ ruff 設定（S ルール含む）を適用する。
+# Makefile の py-fmt-check・py-lint と PostToolUse hook の ruff format が同じ設定を解決するための継承。
+extend = "../trainer/pyproject.toml"
