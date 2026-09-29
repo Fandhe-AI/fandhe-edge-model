@@ -47,28 +47,31 @@
 //! 改行が来ない低速な `Read` や 1 件の推論の内部でブロックしても、超過は `limit_exceeded`
 //! で返る（スレッドは強制終了できず切り離して残る。CLI は 1 呼び出し 1 プロセスで、結果を
 //! 書いたら終了する前提）。協調的な確認（1 行ごと・1 件ごと）も併用する。CLI 経路は
-//! [`BatchLimits::for_cli_process`] を使い、切り離したスレッドはプロセス終了で回収する。
+//! 公開経路は常にプロセス終了で回収する（下の「公開経路は回収を保証するモードだけ」）。
 //!
 //! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
 //!
 //! 時間上限の確定点は計算段階（読み取り・推論・出力量の検証）の 1 つだけで、期限内に全件の
 //! 計算が済んだ時点で結果は成功として確定する。計算中の超過は結果行なしの `ErrorReport`
 //! （`limit_exceeded`・exit 20）。書き出しと flush の完了後に期限を理由に失敗へ変えない。
-//! 書き出しの段階は、CLI 経路（`for_cli_process`）のウォッチドッグだけが扱う: 出力先が停止して
+//! 書き出しの段階は、CLI 経路のウォッチドッグだけが扱う: 出力先が停止して
 //! `MAX_INFER_BATCH_OUTPUT_DURATION` を超えたらプロセスを exit 20（`limit_exceeded`）で終える。
 //! 既知の制限: 出力先が停止しているため `ErrorReport` は書けず、途中までの行が残りうる。この
 //! 場合は終了コードが唯一の判定根拠になる（書き込みをブロックしたまま待たないため）。
 //! ウォッチドッグの起動に失敗したら、上限なしで書かず `io::Error`（exit 70）で終える。
 //!
-//! # 長寿命プロセスから呼ぶ場合の制約（REQ-39）
+//! # 公開経路は回収を保証するモードだけ（REQ-39）
 //!
 //! Rust のスレッドは外から止められない。期限超過後は計算スレッドを join せず結果を捨てて戻り
 //! （計算スレッドは 1 呼び出しにつき 1 本で、期限超過後に次の計算を起動しない）、停止した
-//! スレッドの回収は「エラー JSON を書いて flush した直後の `process::exit`」
-//! （[`BatchLimits::for_cli_process`]）に頼る。既定の [`emit_infer_batch`] は回収しないため、
-//! 将来の MCP サーバなど長寿命のプロセスから繰り返し呼ぶと、期限超過のたびに停止したスレッドと
-//! 保持資源（reader・pipeline）が残る。そうした呼び出し元は、子プロセスで実行するなど別の
-//! 回収手段を用意すること（本 PR の対象外。配線は #136）。
+//! スレッドの回収は「エラー JSON を書いて flush した直後の `process::exit`」に頼る。この回収を
+//! 保証するため、crate の外から呼べる [`emit_infer_batch`]・[`emit_infer_batch_with_limits`] は
+//! 常にプロセス終了で回収するモード（CLI の 1 呼び出し 1 プロセス専用）で動き、回収しない
+//! モード（`StallPolicy::Leak`）は crate 内部（`pub(crate)`）とそのユニットテストに閉じ込める。
+//!
+//! 長く動き続けるプロセス（将来の MCP サーバ。REQ-36・REQ-37）から推論する場合は、スレッドを
+//! 強制終了できないため、本関数を直接呼ばず CLI を子プロセスとして起動して隔離する前提とする
+//! （配線は #136）。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
 
@@ -302,35 +305,17 @@ pub const MAX_INFER_BATCH_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_INFER_BATCH_OUTPUT_DURATION: Duration = Duration::from_secs(60);
 
 /// [`emit_infer_batch_with_limits`] の資源上限。既定は本モジュールの定数（REQ-39）。
+///
+/// 停止時の回収方式（プロセス終了）は公開の型からは変えられない（`StallPolicy` は crate 内部）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimits {
     /// 読み取り開始から出力開始までの時間上限。
     pub duration: Duration,
     /// 総出力バイト数の上限。
     pub output_bytes: usize,
-    /// 出力段階の時間上限。
+    /// 出力段階の時間上限。超過して書き込みがブロックしたら、ウォッチドッグが exit 20
+    /// （`limit_exceeded`。ErrorReport は書けない）でプロセスを終える。
     pub output_duration: Duration,
-    /// `true` なら、中断できない停止（出力先への書き込みのブロック・期限超過で切り離した
-    /// 計算スレッド）をプロセスの終了で回収する（REQ-39）。CLI の 1 呼び出し 1 プロセス専用
-    /// （[`BatchLimits::for_cli_process`]）。`false`（既定）は同一プロセスから繰り返し呼べるが、
-    /// 停止した書き込みは中断できず、切り離したスレッドは残る。
-    pub terminate_process_on_stall: bool,
-}
-
-impl BatchLimits {
-    /// CLI の 1 呼び出し 1 プロセス向けの上限（既定値 + プロセス終了による回収）。
-    ///
-    /// 出力段階が `output_duration` を超えて書き込みでブロックしたら、ウォッチドッグが
-    /// exit 20（`limit_exceeded`。時間上限の超過。ErrorReport は書けない）でプロセスを終える。
-    /// 期限超過で計算スレッドを切り離した場合は、`limit_exceeded` の `ErrorReport` を書いた
-    /// 直後に exit 20 でプロセスを終え、スレッド・reader・pipeline を確実に回収する。
-    #[must_use]
-    pub fn for_cli_process() -> Self {
-        Self {
-            terminate_process_on_stall: true,
-            ..Self::default()
-        }
-    }
 }
 
 impl Default for BatchLimits {
@@ -339,7 +324,27 @@ impl Default for BatchLimits {
             duration: MAX_INFER_BATCH_DURATION,
             output_bytes: MAX_INFER_BATCH_OUTPUT_BYTES,
             output_duration: MAX_INFER_BATCH_OUTPUT_DURATION,
-            terminate_process_on_stall: false,
+        }
+    }
+}
+
+/// 中断できない停止（出力先への書き込みのブロック・期限超過で切り離した計算スレッド）の回収方式。
+/// crate 内部の型で、公開経路は常に [`StallPolicy::TerminateProcess`]（REQ-39）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StallPolicy {
+    /// プロセスの終了で回収する（CLI の 1 呼び出し 1 プロセス）。
+    TerminateProcess,
+    /// 回収しない（切り離したスレッド・停止した書き込みが残りうる）。ユニットテスト専用。
+    #[cfg(test)]
+    Leak,
+}
+
+impl StallPolicy {
+    const fn terminates(self) -> bool {
+        match self {
+            Self::TerminateProcess => true,
+            #[cfg(test)]
+            Self::Leak => false,
         }
     }
 }
@@ -474,7 +479,7 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
 }
 
 /// 入力を読み・推論し、成功なら結果を 1 行 1 JSON で、失敗なら `ErrorReport` を 1 行で書く。
-/// 資源上限は [`BatchLimits::default`]。
+/// 資源上限は [`BatchLimits::default`]。停止はプロセス終了で回収する（CLI 専用。モジュール doc）。
 ///
 /// # Errors
 /// [`emit_infer_batch_with_limits`] と同じ。
@@ -502,10 +507,8 @@ where
 /// 残す。呼び出し側は結果を書いたらプロセスを終了する前提で、CLI は 1 呼び出し 1 プロセス）。
 /// 書き込みは総量（`limits.output_bytes`）を事前に検査済み。計算段階で確定した成功は、書き出し後に
 /// 期限を理由に覆さない。読み手の停止で `write` がブロックする場合、`Write` は中断できない。
-/// `limits.terminate_process_on_stall`（[`BatchLimits::for_cli_process`]）が真なら、ウォッチドッグが
-/// 期限でプロセスを終了して回収する。偽（既定）の間は中断できず、期限切れで切り離した計算
-/// スレッドも残るため、同一プロセスからの繰り返し呼び出しでは資源が蓄積しうる。本番の CLI 経路は
-/// 必ず `for_cli_process` を使う（REQ-39）。
+/// 停止はウォッチドッグとプロセス終了で回収する（常に。呼び出し側は CLI の 1 呼び出し 1
+/// プロセス。長寿命プロセスからは直接呼ばず CLI を子プロセスで起動する。モジュール doc）。
 ///
 /// # Errors
 /// 書き込み・flush の失敗（および 1 行ごとの再構築失敗）を `io::Error` で返す。部分書き込み後は
@@ -518,6 +521,33 @@ pub fn emit_infer_batch_with_limits<W, R, P, B>(
     options: &[Choice],
     pipeline: Arc<InferencePipeline<P, B>>,
     limits: BatchLimits,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_batch_inner(
+        out,
+        reader,
+        io,
+        options,
+        pipeline,
+        limits,
+        StallPolicy::TerminateProcess,
+    )
+}
+
+/// [`emit_infer_batch_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
+pub(crate) fn emit_infer_batch_inner<W, R, P, B>(
+    out: &mut W,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+    limits: BatchLimits,
+    policy: StallPolicy,
 ) -> io::Result<ExitCode>
 where
     W: Write,
@@ -568,7 +598,7 @@ where
     };
     // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
     // 起動に失敗したら上限なしで書かず、何も書かずに Err（exit 70）で終える。
-    let _watchdog = OutputWatchdog::arm(limits.terminate_process_on_stall, limits.output_duration)?;
+    let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
     match outcome {
         Ok((records, predictions)) => {
             // 計算段階で期限内に全件が済んだ時点で結果は成功として確定している。書き出しと
@@ -585,7 +615,7 @@ where
         }
         Err(error) => {
             let written = emit_error_report(out, &error);
-            if abandoned && limits.terminate_process_on_stall {
+            if abandoned && policy.terminates() {
                 // 切り離した計算スレッド（ブロック中の Read・推論）はここでしか回収できない。
                 // 書いた行を失わないよう flush してからプロセスを終える。
                 let _ = out.flush();
@@ -697,16 +727,6 @@ mod tests {
         assert_eq!(err.code, ExitCode::LimitExceeded);
     }
 
-    /// REQ-39: CLI 向け上限は既定値にプロセス終了による回収だけを足し、既定は無効。
-    #[test]
-    fn req39_cli_process_limits_enable_termination_only() {
-        let cli = BatchLimits::for_cli_process();
-        assert!(cli.terminate_process_on_stall);
-        assert!(!BatchLimits::default().terminate_process_on_stall);
-        assert_eq!(cli.duration, BatchLimits::default().duration);
-        assert_eq!(cli.output_bytes, BatchLimits::default().output_bytes);
-    }
-
     /// REQ-39: 期限内に解除（drop）したウォッチドッグはプロセスを終了しない。
     #[test]
     fn req39_watchdog_disarmed_before_deadline_does_not_exit() {
@@ -745,5 +765,87 @@ mod tests {
             ExitCode::InvalidInput
         );
         assert!(first_failure(Ok(()), None).is_ok());
+    }
+
+    /// 書き込みのたびに一定時間止まる出力先。
+    struct SlowWriter(Vec<u8>);
+    impl Write for SlowWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(150));
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct UnitPre;
+    impl Preprocessor for UnitPre {
+        fn preprocess(
+            &self,
+            input: &str,
+        ) -> Result<
+            fandhe_edge_runtime::pipeline::TokenIds,
+            fandhe_edge_runtime::pipeline::PreprocessError,
+        > {
+            Ok(fandhe_edge_runtime::pipeline::TokenIds::new(
+                input.bytes().map(i64::from).collect(),
+            ))
+        }
+    }
+
+    struct UnitBackend;
+    impl ScoringBackend for UnitBackend {
+        fn scores(
+            &self,
+            _ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            Ok(vec![0.5, 0.25, 0.25])
+        }
+        fn scores_limited(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+
+    /// REQ-21・REQ-39: 計算段階で全件が期限内に済んだら成功が確定し、書き出しが出力期限より
+    /// 遅くても結果行は全件そろって exit 0 のまま（失敗へ覆さない）。回収しない内部モードで
+    /// 確かめる（公開経路ではウォッチドッグが停止を終了させるため）。
+    #[test]
+    fn req39_success_is_committed_after_compute_even_if_writing_is_slow() {
+        let definition = fandhe_edge_core::definition::Definition::parse(
+            r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,
+"judgment_type":"single_select","options":[
+{"id":"a","display_name":"A","description":"a"},
+{"id":"b","display_name":"B","description":"b"},
+{"id":"c","display_name":"C","description":"c"}],"io":{"input":"bytes"}}"#,
+        )
+        .expect("valid definition");
+        let pipeline = Arc::new(InferencePipeline::new(UnitPre, UnitBackend));
+        let mut out = SlowWriter(Vec::new());
+        let code = emit_infer_batch_inner(
+            &mut out,
+            std::io::Cursor::new(
+                b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n".to_vec(),
+            ),
+            definition.io(),
+            definition.options(),
+            pipeline,
+            BatchLimits {
+                output_duration: Duration::from_millis(50),
+                ..BatchLimits::default()
+            },
+            StallPolicy::Leak,
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::Ok);
+        let text = String::from_utf8(out.0).unwrap();
+        assert_eq!(text.matches('\n').count(), 2);
+        assert!(!text.contains("\"code\""));
     }
 }
