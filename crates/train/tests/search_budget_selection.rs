@@ -1232,6 +1232,7 @@ fn task18_1_2_runner_failure_aborts_search() {
     let split = validation_split_record_fixture();
     let err = run_search(&mut runner, &clock, default_input(&gold, &split, &["c3-a"])).unwrap_err();
     assert!(matches!(err, SearchError::Candidate { index: 0, .. }));
+    assert_eq!(err.exit_code().code(), 70);
 }
 
 /// (T9・記録の JSON) 選定・候補ごとの記録が期待どおりのキー・値で直列化される
