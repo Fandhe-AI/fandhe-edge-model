@@ -125,6 +125,24 @@ fn enforce_size_limit(path: &Path, size: u64, limit: u64) -> Result<(), ErrorRep
 /// 受け付ける引数の上限。構成要素の種類数（5）に余裕を持たせた値で、重複指定は計測コアが拒否する。
 const MAX_ARGS: usize = 16;
 
+/// 計測直前に、保持しているハンドルの現在のサイズを `limit` と再照合する（REQ-39）。
+/// オープン後に追記されて上限を超えたファイルを、計測値として受理しない。
+fn enforce_measured_sizes(
+    files: &[(PackageComponent, PathBuf, File)],
+    limit: u64,
+) -> Result<(), ErrorReport> {
+    for (_, path, file) in files {
+        let meta = file.metadata().map_err(|e| {
+            capacity_error_report(&CapacityError::File(FsError::Read {
+                path: path.clone(),
+                source: e,
+            }))
+        })?;
+        enforce_size_limit(path, meta.len(), limit)?;
+    }
+    Ok(())
+}
+
 fn parse(
     args: &[OsString],
     root: &Path,
@@ -167,7 +185,10 @@ fn main() -> std::process::ExitCode {
         .and_then(|d| d.canonicalize())
         .map_err(|_| ErrorReport::new(ExitCode::RuntimeError, "cannot resolve working directory"))
         .and_then(|root| parse(&args, &root))
-        .and_then(|files| measure_opened_files(&files).map_err(|e| capacity_error_report(&e)));
+        .and_then(|files| {
+            enforce_measured_sizes(&files, MAX_FILE_BYTES)?;
+            measure_opened_files(&files).map_err(|e| capacity_error_report(&e))
+        });
     let code = match result {
         Ok(breakdown) => write_package_capacity(&mut out, &breakdown),
         Err(report) => write_error_report(&mut out, &report),
@@ -251,6 +272,24 @@ mod tests {
         let p = Path::new("x");
         assert!(enforce_size_limit(p, 10, 10).is_ok());
         let e = enforce_size_limit(p, 11, 10).unwrap_err();
+        assert_eq!(e.code, ExitCode::LimitExceeded);
+    }
+
+    /// REQ-39: オープン後に上限を超えて成長したファイルは、計測時の再検証で拒否される。
+    #[test]
+    fn req39_measure_time_size_recheck_rejects_grown_file() {
+        use std::io::Write as _;
+        let root = root();
+        let path = root.join("sub").join("m.json");
+        let file = File::open(&path).unwrap();
+        let files = vec![(PackageComponent::Metadata, path.clone(), file)];
+        assert!(enforce_measured_sizes(&files, 2).is_ok());
+        let mut w = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        w.write_all(b"xxxx").unwrap();
+        let e = enforce_measured_sizes(&files, 2).unwrap_err();
         assert_eq!(e.code, ExitCode::LimitExceeded);
     }
 
