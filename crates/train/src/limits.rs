@@ -18,6 +18,12 @@
 //! 契約としては別物であり結合しない（学習リクエストの `label_order` は
 //! 学習ワーカー固有の契約であり、推論 1 件あたりの判定結果契約とは独立に
 //! 変更されうる）。
+//!
+//! 例外: [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] は Python 側（`limits.py`）に
+//! 対応する値を持たず、共有 fixture（`fixtures/train_contract/limits.json`・
+//! `train_contract_fixture.rs`）の機械照合の対象にも含めない。
+//! `crate::search::SearchInput` は Rust 内部でのみ使う型（issue #84）で、
+//! 学習ワーカーとの JSON 境界には現れないため。
 
 /// 学習リクエスト JSON の `schema_version`（`contract.py::SCHEMA_VERSION`）。
 pub const REQUEST_SCHEMA_VERSION: u32 = 1;
@@ -63,6 +69,69 @@ pub const ALLOWED_DEVICES: [&str; 2] = ["cpu", "gpu"];
 /// `artifact.py::SELECTOR_VERSION` の版付け方針と合わせて見直す。
 pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 
+/// [`crate::search::SearchInput::validation_inputs`]（validation 入力
+/// 1 件分）の合計バイト数の上限（REQ-39「資源の上限」・P0 指摘対応。
+/// codex review PR #238）。
+///
+/// `SearchInput` は公開 API で、データ契約層（`crates/data`）を経由しない
+/// 呼び出し元が直接値を渡せるため、`validate_input`（`crate::search`）が
+/// 学習を始める前に（採点は学習ジョブの中で行うため。[`crate::search`]
+/// モジュール doc 参照）合計バイト数を検証する。1 件あたりの上限は
+/// `fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`（推論入力 1 件の
+/// 上限。train・infer で共有）をそのまま使うため train 側に重複定義しない
+/// が、合計バイト数の上限は train・data のいずれにも既存の定数が無いため
+/// 本ファイルに新設する（承認事項として報告。issue #84 PR #238 レビュー）。
+/// 値は `crates/data::leak::MAX_LEAK_CHECK_TOTAL_BYTES`（学習・評価データの
+/// 矛盾検出で合計バイト数に用いる上限。64 MiB）と同じ値に揃えた
+/// （`crates/train` は `crates/data` に依存しないため定数を共有できず、
+/// 値のみ揃えて重複定義する。新規の crate 間依存の追加はユーザー承認が
+/// 必要なため、値の一致に留めた）。
+///
+/// 1 件あたりの上限（1 MiB）と本定数（64 MiB）を単純に割ると、64 件までは
+/// 1 件あたり上限ぎりぎりのサイズでも許容できる。一方 validation 件数の
+/// 上限は [`fandhe_edge_eval::significance::MAX_EVAL_RECORDS`]（100 万件）
+/// で、100 万件に本定数を均等配分すると 1 件あたり平均 67 バイト程度しか
+/// 割り当てられない。実際の validation 入力の典型サイズ・件数の想定が
+/// この 2 つの上限とどう両立するかは検証していないため、64 MiB という
+/// 値自体の妥当性は承認事項として報告する。
+///
+/// `crate::search::SearchInput::validation_record_ids`（validation レコード
+/// 識別子の列。1 件あたりの上限は別途
+/// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`] を使う）の合計バイト
+/// 数上限にも本定数を流用する（P1 指摘対応。issue #84 PR #238 レビュー。
+/// record_id 専用の新しい定数を追加で起こさず、「1 つの `SearchInput`
+/// フィールドが保持できる合計バイト数」の共通の目安として扱う）。
+///
+/// 学習リクエスト JSON の `validation_inputs`（学習ジョブ内での採点用の
+/// validation 入力。[`crate::request::ValidationInput`]）にも、同じ定数を
+/// 合計バイト数（`id`＋`input`）の上限として使う（issue #84 PR #238・
+/// 選択肢 2）。ただし validation 入力はリクエスト JSON の**内側**を通るため、
+/// 実際に効く上限は [`MAX_REQUEST_BYTES`]（1 MiB。リクエスト全体）であり、
+/// 本定数（64 MiB）はそれより緩い。すなわち 1 リクエストで運べる validation
+/// 入力は、リクエストの他の項目を除いておよそ 1 MiB 以内（短いレコードで
+/// 数千件規模）に限られる。1 件あたり [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`]
+/// （1 MiB）ちょうどのレコードも、リクエスト全体の上限を超えるため 1 件でも
+/// 拒否される。本定数は「`SearchInput` が保持できる合計」の上限として
+/// 変更せず、リクエスト側の実効上限との差はオーナー判断で据え置いた
+/// （選択肢 (a)。上限を緩めるなら `MAX_REQUEST_BYTES` の見直しが別途必要）。
+pub const MAX_VALIDATION_INPUT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// `validation_inputs` を含むリクエストの結果 JSON（`validation_predictions`
+/// を含む）の読み取り上限の**天井**（バイト）。実際の上限はリクエストごとに
+/// [`crate::request::validation_result_bytes_bound`] で正確に計算する
+/// （`TrainRequest::max_result_bytes`。許可するラベル・id から求める）。計算値が
+/// この天井を超えるリクエストは、学習を始める前に `limit_exceeded` で拒否する
+/// （P1 指摘対応。issue #84 PR #238 レビュー: 以前の固定の見積もりは、エスケープで
+/// 大きくなる許可済みのラベルの結果を収容できなかった）。したがって、受理された
+/// リクエストの正常な結果が上限で弾かれることはない。
+/// `validation_inputs` を持たないリクエストの結果には [`MAX_RESULT_BYTES`]（1 MiB）
+/// を使い続ける。Python 側の対応は `limits.py::MAX_RESULT_BYTES_WITH_VALIDATION`。
+///
+/// 値 64 MiB は [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] と同じで、新しい桁を増やさない
+/// （根拠: 仮置き。実用上の validation 件数・ラベル長は、この天井の内側に収まる
+/// ことをテストで確認している。ただし制御文字だけの最長ラベルと多数の短い入力の
+/// 組み合わせは拒否されうる）。
+pub const MAX_RESULT_BYTES_WITH_VALIDATION: usize = 64 * 1024 * 1024;
 /// 学習ワーカーの標準エラー出力（stderr）の保持上限（バイト）。REQ-39
 /// 「資源の上限」（#178）。`_worker` は supervisor の stderr を継承する
 /// （`supervisor.py::_spawn_worker_and_finalize`）ため、Rust 側 stderr

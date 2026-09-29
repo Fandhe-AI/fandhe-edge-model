@@ -20,7 +20,10 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
 - `limits.json`: `crates/train/src/limits.rs` の各定数・
   `trainer/src/fandhe_edge_trainer/limits.py` の対応定数・
   `contract.py::SCHEMA_VERSION`・`contract.py::_ALLOWED_DEVICES`・
-  `supervisor.py::_MAX_WORKER_STDOUT_BYTES` の値を並べたもの。
+  `supervisor.py::_MAX_WORKER_STDOUT_BYTES`・`_MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION`
+  と、validation 入力の上限 4 件（`max_validation_input_bytes`・
+  `max_validation_id_bytes`・`max_validation_input_total_bytes`・
+  `max_result_bytes_with_validation`。issue #84 PR #238）の値を並べたもの。
 - `kind_defaults.json`: `kind` ごとの config 既定値（REQ-18・REQ-19・
   REQ-19b・REQ-21・REQ-39。codex review PR #220 P1「成果物の追加 config 値を
   検証せず成功扱いにしている」対応）。選択口（`trainer/src/
@@ -41,7 +44,8 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   （選択肢 3 件: `positive`・`negative`・`neutral`）。
   `label_order_from_definition`（Rust）と `options[].id` の宣言順（pytest）が
   一致することの確認に使う。
-- `request_full.json`: 13 項目すべてを含む正常な学習リクエスト。`root` は
+- `request_full.json`: 任意項目 `validation_inputs` を除く 13 項目すべてを含む
+  正常な学習リクエスト。`root` は
   プレースホルダー `/fandhe-edge-fixture-root`（絶対パス文字列）で、
   `trainer/tests/test_train_contract_fixture.py` はこの値と完全一致する
   場合に限り `str(tmp_path)` へ置き換えてから `validate_request` を呼ぶ
@@ -49,6 +53,24 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   側は文字列としての構文検査のみ行うため置き換えない。
 - `request_minimal.json`: 任意項目（`config`・`time_limit_seconds`・
   `rss_limit_bytes`）を省略した正常なリクエスト。
+- `request_with_validation.json`: `request_full.json` に任意項目
+  `validation_inputs`（学習ジョブ内での採点用 validation 入力。`{id,input}`
+  の 3 件。**正解ラベルは持たない**。REQ-18・REQ-27。issue #84 PR #238・
+  選択肢 2）を足した正常なリクエスト。手作成のダミー ASCII 値。`contract.py::
+  _REQUEST_FIELDS` の全項目を網羅することを pytest が確認する。
+- `result_ok_with_validation.json`: `result_ok.json` に
+  `validation_predictions`（`{id,status,predicted_label}` の列。`scores` は
+  含めない）を足した成功結果。`id` は `request_with_validation.json` の
+  `validation_inputs[].id` と同順・同件数。手作成。`result_ok.json` と
+  同様に `request_full.json` 由来の `artifact` を持ち、Rust 側は
+  `request_with_validation.json` から組み立てたリクエストに対して読む。
+- `result_cap_cases.json`: リクエストごとの結果上限（`validation_inputs` 付きの
+  結果 JSON の最大バイト数。Rust `validation_result_bytes_bound`・Python
+  `contract.validation_result_bytes_bound`。issue #84 PR #238 レビュー）の計算例。
+  `MAX_RESULT_BYTES`（1048576）＋ 余裕 64 ＋ Σ（固定 50 ＋ JSON エスケープ後の id 長 ＋
+  エスケープ後に最長のラベル長）を、実装とは独立に手計算した期待値（制御文字は 6、
+  `"`・`\` は 2、その他は UTF-8 のバイト長）。制御文字だけのラベル・引用符・
+  バックスラッシュ・多バイト文字・多数の短い id を含む。両言語のテストが再現する。
 - `request_reject_cases.json`: `base`（`request_full.json` と同じ内容）に
   1 フィールドずつ `patch` または `raw_text`（JSON 外の数値トークンを含む
   生テキスト）を適用した異常系一覧。各ケースの `expected_code`／
@@ -57,6 +79,10 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   一致しないケース（Rust の方が厳格な `kind_version` の負値・JSON の重複
   キー等）はここに含めず、`crates/train/src/request.rs` の単体テストへ
   分離した（issue #177 実装計画「Rust の方が厳しいケース」）。
+  `validation_inputs_*`（issue #84 PR #238）: 空配列・`null`・非配列・要素が
+  オブジェクトでない・要素に正解ラベル（`label`）を紛れ込ませる・`input` 欠落・
+  `input` が文字列でない・`id` が空／1025 文字・`id` 重複を、いずれも
+  `invalid_request`／64 で拒否する（Python・Rust で一致）。
   `time_limit_seconds_null`・`rss_limit_bytes_null`（PR #220 Bugbot 指摘対応）:
   キーが存在し値が JSON `null` の場合、両実装とも「省略時の既定値」へは
   解決せず `invalid_request` で拒否する（`contract.py::validate_request` の

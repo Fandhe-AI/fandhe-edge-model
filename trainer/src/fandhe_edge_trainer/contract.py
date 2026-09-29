@@ -43,6 +43,13 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが `--req
 読んだバイト列に対して `parse_request_bytes` → `validate_request` を呼ぶ
 （ファイルパスは一切受け取らない）。
 
+`validation_inputs` は任意項目（学習ジョブ内での採点用 validation 入力。
+`[{"id": str, "input": str}, ...]`。**正解ラベルは受け取らない**〔REQ-27。要素に
+他のキーがあれば拒否する〕。検証は `_validate_validation_inputs`。あれば学習直後に
+同じプロセス内で予測し、結果の `validation_predictions` として返す。issue #84
+PR #238）。リクエスト全体が `MAX_REQUEST_BYTES` で縛られるため、運べる量の実効上限は
+そちらで決まる。
+
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
 `MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
 指定する場合は、その上限を**下げる**ことしかできない（上限より大きい値は
@@ -126,12 +133,17 @@ from .limits import (
     MAX_LABELS,
     MAX_MAX_BYTES,
     MAX_REQUEST_BYTES,
+    MAX_RESULT_BYTES,
+    MAX_RESULT_BYTES_WITH_VALIDATION,
     MAX_SEED,
     MAX_TRAIN_DATA_BYTES,
     MAX_TRAIN_EXAMPLES,
     MAX_TRAIN_LINE_BYTES,
     MAX_TRAIN_RSS_BYTES,
     MAX_TRAIN_WALL_SECONDS,
+    MAX_VALIDATION_ID_BYTES,
+    MAX_VALIDATION_INPUT_BYTES,
+    MAX_VALIDATION_INPUT_TOTAL_BYTES,
     MIN_LABELS,
     MIN_MAX_BYTES,
     MIN_SEED,
@@ -153,6 +165,7 @@ _REQUEST_FIELDS = {
     "out_dir",
     "time_limit_seconds",
     "rss_limit_bytes",
+    "validation_inputs",
 }
 
 
@@ -185,6 +198,13 @@ class TrainRequest:
     out_dir: guard.ConfinedEntry
     time_limit_seconds: int
     rss_limit_bytes: int
+    #: 学習ジョブ内での採点用 validation 入力 `(id, input)` の列（任意。無ければ
+    #: `None`）。**正解ラベルは持たない**（REQ-27）。`validate_request` が
+    #: `_validate_validation_inputs` で検証済み。
+    validation_inputs: tuple[tuple[str, str], ...] | None = None
+    #: このリクエストの結果 JSON の標準出力上限（bytes。`validation_inputs` が無ければ
+    #: `MAX_RESULT_BYTES`。あれば `validation_result_bytes_bound`）。
+    max_result_bytes: int = MAX_RESULT_BYTES
 
     def close_resources(self) -> None:
         """保持している fd（`train_path`・`out_dir`・`root`）をすべて閉じる。
@@ -422,6 +442,23 @@ def validate_request(raw: Any) -> TrainRequest:
     ):
         raise _invalid(f"rss_limit_bytes must be an integer in [1, {MAX_TRAIN_RSS_BYTES}]")
 
+    validation_inputs = _validate_validation_inputs(
+        raw.get("validation_inputs"), "validation_inputs" in raw
+    )
+    max_result_bytes = MAX_RESULT_BYTES
+    if validation_inputs is not None:
+        # 結果の上限をリクエストごとに正確に計算し、天井を超えるなら学習を始める前に
+        # 拒否する（正常な結果が上限で弾かれる状況を作らない。P1 指摘対応。
+        # `crates/train/src/request.rs::with_validation_inputs` と同じ）。
+        max_result_bytes = validation_result_bytes_bound(
+            label_order, [rid for rid, _text in validation_inputs]
+        )
+        if max_result_bytes > MAX_RESULT_BYTES_WITH_VALIDATION:
+            raise _limit(
+                "result for validation_inputs could exceed "
+                f"{MAX_RESULT_BYTES_WITH_VALIDATION} bytes"
+            )
+
     # 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）は最後に
     # 行う: ここより前の検証で弾かれるリクエストのために fd を開いて後始末する
     # 手間を避ける。ここから先で失敗したら、それまでに開いた fd をすべて
@@ -451,7 +488,98 @@ def validate_request(raw: Any) -> TrainRequest:
         out_dir=out_dir_entry,
         time_limit_seconds=time_limit_seconds,
         rss_limit_bytes=rss_limit_bytes,
+        validation_inputs=validation_inputs,
+        max_result_bytes=max_result_bytes,
     )
+
+
+#: 予測 1 件の JSON の固定部分の最大バイト数（Rust 側 `VALIDATION_PREDICTION_FIXED_BYTES`
+#: と同じ。`{"id":` 6・引用符 2・`,"status":` 10・`"abstain"` 9・`,"predicted_label":` 19・
+#: 引用符 2・`}` 1・区切り `,` 1）。
+_VALIDATION_PREDICTION_FIXED_BYTES = 50
+
+#: 予測列のキー・括弧の余裕（Rust 側 `VALIDATION_PREDICTIONS_ARRAY_SLACK_BYTES`）。
+_VALIDATION_PREDICTIONS_ARRAY_SLACK_BYTES = 64
+
+
+def _json_escaped_len_bound(text: str) -> int:
+    """JSON 文字列（引用符を除く）のエスケープ後の最大バイト長。制御文字は
+    `\\uXXXX` の 6 バイトとする最悪値、`"`・`\\` は 2 バイト、それ以外は UTF-8 の
+    バイト長（`json.dumps(ensure_ascii=False)` は非 ASCII をエスケープしない）。
+    Rust 側 `json_escaped_len_bound` と同じ規則。
+    """
+    total = 0
+    for ch in text:
+        code = ord(ch)
+        if ch in '"\\':
+            total += 2
+        elif code < 0x20:
+            total += 6
+        else:
+            total += len(ch.encode("utf-8"))
+    return total
+
+
+def validation_result_bytes_bound(label_order: list[str], ids: list[str]) -> int:
+    """`validation_inputs` 付きリクエストの結果 JSON の最大バイト数（標準出力の上限）。
+
+    `MAX_RESULT_BYTES` ＋ 配列の余裕 ＋ Σ（予測 1 件の固定部分 ＋ その `id` の
+    エスケープ後の最大長 ＋ ラベル集合のうちエスケープ後に最長のラベルの長さ）。
+    Rust 側 `validation_result_bytes_bound` と同じ式（共有 fixture
+    `result_cap_cases.json` で一致を確認する。issue #84 PR #238 レビュー）。
+    """
+    longest_label = max((_json_escaped_len_bound(label) for label in label_order), default=0)
+    total = MAX_RESULT_BYTES + _VALIDATION_PREDICTIONS_ARRAY_SLACK_BYTES
+    for rid in ids:
+        total += _VALIDATION_PREDICTION_FIXED_BYTES + _json_escaped_len_bound(rid) + longest_label
+    return total
+
+
+def _validate_validation_inputs(value: Any, present: bool) -> tuple[tuple[str, str], ...] | None:
+    """`validation_inputs`（任意。REQ-18・REQ-27・REQ-39）を検証する。
+
+    キーが無ければ `None`。あれば 1 件以上の `{"id": str, "input": str}` の
+    リストで、要素は他のキーを持てない（正解ラベルを紛れ込ませない。REQ-27）。
+    `id` は非空・UTF-8 で `MAX_VALIDATION_ID_BYTES` 以下・重複なし、`input` は
+    UTF-8 で `MAX_VALIDATION_INPUT_BYTES` 以下、`id`＋`input` の合計は
+    `MAX_VALIDATION_INPUT_TOTAL_BYTES` 以下（`crates/train/src/request.rs` の
+    `validate_validation_inputs` と同じ規則。リクエスト全体は既に
+    `MAX_REQUEST_BYTES` で縛られているため実効上限はそちら）。エラーメッセージへ
+    `id`・`input` の中身を含めない（security.md）。
+    """
+    if not present:
+        return None
+    if not isinstance(value, list) or not value:
+        raise _invalid("validation_inputs must be a non-empty list")
+    seen: set[str] = set()
+    total = 0
+    out: list[tuple[str, str]] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {"id", "input"}:
+            raise _invalid(f"validation_inputs[{i}] must be an object with exactly id and input")
+        rid = item["id"]
+        text = item["input"]
+        if not isinstance(rid, str) or not isinstance(text, str):
+            raise _invalid(f"validation_inputs[{i}] id and input must be strings")
+        # UTF-8 バイト数は文字数以上のため、`encode` の前に文字数で足切りして
+        # 巨大な値の再確保を避ける。孤立サロゲートは `encode` が失敗する。
+        if not rid or len(rid) > MAX_VALIDATION_ID_BYTES or len(text) > MAX_VALIDATION_INPUT_BYTES:
+            raise _invalid(f"validation_inputs[{i}] id is empty or a size limit is exceeded")
+        try:
+            id_len = len(rid.encode("utf-8"))
+            input_len = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise _invalid(f"validation_inputs[{i}] is not valid utf-8") from exc
+        if id_len > MAX_VALIDATION_ID_BYTES or input_len > MAX_VALIDATION_INPUT_BYTES:
+            raise _invalid(f"validation_inputs[{i}] exceeds a size limit")
+        total += id_len + input_len
+        if total > MAX_VALIDATION_INPUT_TOTAL_BYTES:
+            raise _invalid("validation_inputs total bytes exceed the limit")
+        if rid in seen:
+            raise _invalid(f"validation_inputs[{i}] id is a duplicate")
+        seen.add(rid)
+        out.append((rid, text))
+    return tuple(out)
 
 
 def _validate_label_order(label_order: Any) -> None:

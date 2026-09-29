@@ -53,6 +53,7 @@ from typing import BinaryIO
 from . import artifact as artifact_mod
 from . import budget as budget_mod
 from . import contract
+from . import predict as predict_mod
 from . import supervisor as supervisor_mod
 from .errors import WorkerError
 from .exitcode import ExitCode
@@ -258,12 +259,26 @@ def run_worker_train(out_fd: int) -> ExitCode:
             rss_bytes=request.rss_limit_bytes,
             device=request.device,
         )
+        if request.validation_inputs is not None:
+            # 採点できない kind は、学習時間を使う前に拒否する（fail-closed）。
+            predict_mod.require_validation_prediction_support(request.kind)
         examples = contract.load_train_examples(
             request.train_path, request.label_order, resource_budget=resource_budget
         )
         kind_impl = resolve_kind(request.kind, request.kind_version)
 
         trained = kind_impl.train(examples, request, resource_budget)
+        # 学習直後・同じプロセス内で、メモリ上の `trained` を使って validation 入力
+        # （`(id, input)` のみ。正解ラベルは持たない。REQ-27）を予測する
+        # （issue #84 PR #238・選択肢 2。予測時間も同じ `resource_budget`＝学習の
+        # 壁時計上限の対象）。
+        validation_predictions = (
+            predict_mod.predict_validation(
+                request.kind, trained, request.validation_inputs, resource_budget
+            )
+            if request.validation_inputs is not None
+            else None
+        )
         # ONNX 本体・artifact.json は、スーパーバイザーが渡した一時ディレクトリの
         # fd（`out_fd`）へ、経路文字列を使わず dir_fd 相対で新規作成する
         # （TOCTOU 対策。O_EXCL で上書きしない）。
@@ -298,7 +313,14 @@ def run_worker_train(out_fd: int) -> ExitCode:
     finally:
         request.close_resources()
 
-    _emit({"status": "ok", "artifact_dir": str(request.out_dir.display), "artifact": art})
+    payload: dict[str, object] = {
+        "status": "ok",
+        "artifact_dir": str(request.out_dir.display),
+        "artifact": art,
+    }
+    if validation_predictions is not None:
+        payload["validation_predictions"] = validation_predictions
+    _emit(payload)
     return ExitCode.OK
 
 

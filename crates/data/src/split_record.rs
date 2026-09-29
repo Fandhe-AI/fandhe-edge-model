@@ -14,10 +14,19 @@
 //!   [`SplitRecord::verify_against`] を CLI 側から呼び、不一致時に
 //!   `judged_fail` 等へ倒す判断に使う想定
 //!
-//! **本モジュールが検出するのは「どのレコード ID がどの split に属するか」の
-//! 改ざん・不一致のみ**であり、レコード本文（`input`・`output`）が変わって
-//! いないことの保証はしない（評価データファイル本体のハッシュは TASK-17.2 の
-//! 凍結ハッシュ、レコード内容の同一性は TASK-27.x の担当。責務を混同しない）。
+//! # 2 種類のハッシュ
+//!
+//! - **ID ハッシュ**（[`SplitDigest::sha256`]）: 「どのレコード ID がどの split に
+//!   属するか」の改ざん・不一致を検出する。
+//! - **中身のハッシュ**（[`SplitDigest::content_sha256`]。issue #84 PR #238
+//!   レビュー・REQ-17・REQ-27）: 各 split の `id`・`input`（byte 列）・正解ラベル
+//!   を束ねて検出する。ID を変えずに `input` や正解ラベルだけを差し替えても
+//!   ハッシュが変わる。計算は [`content_sha256_hex`] の 1 関数だけで、分割を作る
+//!   側（[`split_and_record`]）と、`run_search`（`fandhe-edge-train`）の両方が
+//!   同じ関数を呼ぶ。
+//!
+//! 評価データファイル本体のハッシュは TASK-17.2 の凍結ハッシュ、推論時の
+//! モデル・データの前後一致は TASK-27.x の担当（責務を混同しない）。
 //!
 //! # ハッシュ入力の定義
 //!
@@ -50,6 +59,64 @@ const HASH_ALGORITHM: &str = "sha256";
 /// 規則の版であり、規則を変えたら値を変える（TASK-17.3 が「値」だけでなく
 /// 「計算方法」も検証できるようにするため）。
 const HASH_INPUT_RULE: &str = "canonical-json-sorted-record-ids-v1";
+
+/// 中身のハッシュの計算規則の識別子。ハッシュ入力の JSON に埋め込むため、
+/// 規則を変えるとハッシュも変わる（版違いの記録を取り違えない）。
+pub const CONTENT_HASH_RULE: &str = "canonical-json-sorted-id-input-hex-label-v1";
+
+/// 中身のハッシュの入力 1 件（[`content_sha256_hex`]）。
+#[derive(Clone, Copy)]
+pub struct ContentRecord<'a> {
+    /// レコード ID。
+    pub id: &'a str,
+    /// 入力（byte 列）。
+    pub input: &'a [u8],
+    /// 正解ラベル。
+    pub label: &'a str,
+}
+
+/// split の**中身のハッシュ**（小文字 16 進 64 桁。REQ-17・REQ-27）を計算する
+/// 唯一の関数。
+///
+/// `records` を `id` の昇順（バイト順。`record_ids` と同じ）に並べ、
+/// `{"rule": CONTENT_HASH_RULE, "records": [{"id", "input", "label"}, ...]}` を
+/// [`canonical_sha256_hex`]（core の既存の正準化ハッシュ。新しい正準化規則は
+/// 作らない）へ渡す。`input` は byte 列をそのまま JSON 文字列にできない（UTF-8 と
+/// 限らない）ため、**小文字 16 進文字列**で表す（無損失・追加依存なし・
+/// 正準化 JSON がそのまま扱える）。呼び出し順に依存しない。
+///
+/// # Errors
+///
+/// 正準化に失敗した場合（実務上は起こらない想定）。
+pub fn content_sha256_hex(records: &[ContentRecord<'_>]) -> Result<String, CanonicalError> {
+    let mut sorted: Vec<&ContentRecord<'_>> = records.iter().collect();
+    sorted.sort_by(|a, b| a.id.cmp(b.id));
+    let entries: Vec<serde_json::Value> = sorted
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "input": bytes_to_lower_hex(r.input),
+                "label": r.label,
+            })
+        })
+        .collect();
+    canonical_sha256_hex(&serde_json::json!({
+        "rule": CONTENT_HASH_RULE,
+        "records": entries,
+    }))
+}
+
+/// byte 列を小文字 16 進文字列にする。
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    out
+}
 
 /// 分割の生成と記録をひとまとめにした結果。
 ///
@@ -270,6 +337,8 @@ pub struct SplitDigest {
     record_count: usize,
     group_count: usize,
     sha256: String,
+    /// 中身のハッシュ。この機能の導入前に作られた記録（JSON に無い）では `None`。
+    content_sha256: Option<String>,
 }
 
 impl std::fmt::Debug for SplitDigest {
@@ -282,6 +351,7 @@ impl std::fmt::Debug for SplitDigest {
             .field("record_count", &self.record_count)
             .field("group_count", &self.group_count)
             .field("sha256", &self.sha256)
+            .field("content_sha256", &self.content_sha256)
             .finish()
     }
 }
@@ -309,6 +379,14 @@ impl SplitDigest {
     #[must_use]
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    /// 中身（`id`・`input`・正解ラベル）のハッシュ（[`content_sha256_hex`]。
+    /// 小文字 16 進 64 桁）。中身のハッシュを持たない古い記録では `None`
+    /// （呼び出し側は、中身の同一性を要する場面では `None` を拒否する）。
+    #[must_use]
+    pub fn content_sha256(&self) -> Option<&str> {
+        self.content_sha256.as_deref()
     }
 }
 
@@ -489,9 +567,18 @@ impl SplitRecord {
             let actual_hash =
                 canonical_sha256_hex(&actual_ids).map_err(SplitRecordError::Canonical)?;
             let actual_group_count = group_count_for_split(&result, split);
+            // 中身のハッシュを持つ記録では、`id`・`input`・正解ラベルの差し替えも
+            // 検出する（持たない古い記録では ID・group のみ照合する）。
+            let content_matches = match expected.content_sha256.as_deref() {
+                Some(expected_content) => {
+                    content_hash_for_split(records, &result, split)? == expected_content
+                }
+                None => true,
+            };
             if actual_ids != expected.record_ids
                 || actual_hash != expected.sha256
                 || actual_group_count != expected.group_count
+                || !content_matches
             {
                 return Err(SplitRecordError::SplitMismatch { split });
             }
@@ -554,6 +641,7 @@ fn group_count_for_split(result: &SplitResult, split: Split) -> usize {
 fn build_digest(
     record_ids: Vec<String>,
     group_count: usize,
+    content_sha256: String,
 ) -> Result<SplitDigest, SplitRecordError> {
     let sha256 = canonical_sha256_hex(&record_ids).map_err(SplitRecordError::Canonical)?;
     let record_count = record_ids.len();
@@ -562,7 +650,26 @@ fn build_digest(
         record_count,
         group_count,
         sha256,
+        content_sha256: Some(content_sha256),
     })
+}
+
+/// `split` に属するレコードの中身のハッシュ（[`content_sha256_hex`]）を計算する。
+fn content_hash_for_split<T: Groupable>(
+    records: &[T],
+    result: &SplitResult,
+    split: Split,
+) -> Result<String, SplitRecordError> {
+    let members: Vec<ContentRecord<'_>> = records
+        .iter()
+        .filter(|r| result.by_record.get(r.id()) == Some(&split))
+        .map(|r| ContentRecord {
+            id: r.id(),
+            input: r.input(),
+            label: r.label(),
+        })
+        .collect();
+    content_sha256_hex(&members).map_err(SplitRecordError::Canonical)
 }
 
 /// `records` を group 単位で分割し、seed・分割規則・各分割のハッシュを
@@ -589,7 +696,8 @@ pub fn split_and_record<T: Groupable>(
     for split in [Split::Train, Split::Validation, Split::Test] {
         let ids = record_ids_for_split(&result, split);
         let group_count = group_count_for_split(&result, split);
-        digests.insert(split, build_digest(ids, group_count)?);
+        let content = content_hash_for_split(records, &result, split)?;
+        digests.insert(split, build_digest(ids, group_count, content)?);
     }
 
     // 直前のループで 3 split すべてを挿入済みのため、`remove` は必ず成功する。
@@ -635,6 +743,7 @@ fn empty_digest() -> SplitDigest {
         record_count: 0,
         group_count: 0,
         sha256: String::new(),
+        content_sha256: None,
     }
 }
 
@@ -684,6 +793,10 @@ struct SplitDigestDto {
     record_count: usize,
     group_count: usize,
     sha256: String,
+    /// 中身のハッシュ。古い記録の JSON には無く、その場合は読み込み時に `None`、
+    /// 直列化でも省略する（既存の記録の JSON を壊さない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<String>,
 }
 
 impl SplitRecordDto {
@@ -693,6 +806,7 @@ impl SplitRecordDto {
             record_count: digest.record_count,
             group_count: digest.group_count,
             sha256: digest.sha256.clone(),
+            content_sha256: digest.content_sha256.clone(),
         };
         SplitRecordDto {
             schema_version: record.schema_version,
@@ -887,11 +1001,20 @@ fn digest_from_dto(dto: SplitDigestDto) -> Result<SplitDigest, SplitRecordError>
         });
     }
 
+    if let Some(content) = &dto.content_sha256
+        && !is_lowercase_hex_64(content)
+    {
+        return Err(SplitRecordError::InvalidRecord {
+            reason: "content_sha256 must be 64 lowercase hex characters",
+        });
+    }
+
     Ok(SplitDigest {
         record_ids: dto.record_ids,
         record_count: dto.record_count,
         group_count: dto.group_count,
         sha256: dto.sha256,
+        content_sha256: dto.content_sha256,
     })
 }
 
@@ -920,6 +1043,7 @@ mod tests {
         id: String,
         group_id: String,
         label: String,
+        input: Vec<u8>,
     }
 
     impl Groupable for TestRecord {
@@ -932,13 +1056,19 @@ mod tests {
         fn label(&self) -> &str {
             &self.label
         }
+        fn input(&self) -> &[u8] {
+            &self.input
+        }
     }
 
+    /// 入力は `in-<id>` の byte 列（テストが `input` だけを差し替えられるよう
+    /// フィールドとして持つ）。
     fn record(id: &str, group_id: &str, label: &str) -> TestRecord {
         TestRecord {
             id: id.to_string(),
             group_id: group_id.to_string(),
             label: label.to_string(),
+            input: format!("in-{id}").into_bytes(),
         }
     }
 
@@ -1826,5 +1956,129 @@ mod tests {
             debug_output.contains("<redacted"),
             "result フィールドは redacted 表示になるはず: {debug_output}"
         );
+    }
+
+    // ---- 中身のハッシュ（REQ-17・REQ-27。issue #84 PR #238 レビュー）----
+
+    fn content(
+        id: &'static str,
+        input: &'static [u8],
+        label: &'static str,
+    ) -> ContentRecord<'static> {
+        ContentRecord { id, input, label }
+    }
+
+    /// 独立に `sha256sum` で計算した具体値（入力は 16 進、空入力は空文字列、
+    /// キーは辞書順の正準化 JSON）と一致し、呼び出し順に依存しない。
+    /// 再計算: `printf '%s' '{"records":[{"id":"r1","input":"0061","label":"x"},
+    /// {"id":"r2","input":"","label":"y"}],"rule":"canonical-json-sorted-id-input-hex-label-v1"}' | sha256sum`
+    #[test]
+    fn req17_content_hash_matches_independent_sha256sum_and_ignores_order() {
+        let expected = "76fc3f262babc3a7cb9eb33404bb8f6a5c0281be7f4db8e8cff2184e1e333f26";
+        let a = content("r1", b"\x00a", "x");
+        let b = content("r2", b"", "y");
+        assert_eq!(content_sha256_hex(&[a, b]).expect("hash"), expected);
+        assert_eq!(content_sha256_hex(&[b, a]).expect("hash"), expected);
+    }
+
+    /// ID を変えずに `input` だけ、または正解ラベルだけを差し替えるとハッシュが変わる。
+    #[test]
+    fn req17_content_hash_changes_when_input_or_label_alone_changes() {
+        let base = content_sha256_hex(&[content("r1", b"aa", "x")]).expect("hash");
+        let other_input = content_sha256_hex(&[content("r1", b"ab", "x")]).expect("hash");
+        let other_label = content_sha256_hex(&[content("r1", b"aa", "y")]).expect("hash");
+        assert_ne!(base, other_input);
+        assert_ne!(base, other_label);
+        assert_ne!(other_input, other_label);
+    }
+
+    /// 分割記録は各 split の中身のハッシュを持ち、[`content_sha256_hex`] と同じ値になる。
+    /// 中身（`input`・ラベル）を差し替えた records は `verify_against` で
+    /// `SplitMismatch` になる（ID と group 割付は変えない）。
+    #[test]
+    fn req17_split_record_content_hash_detects_input_and_label_swaps() {
+        let records = vec![
+            record("r1", "g1", "a"),
+            record("r2", "g2", "a"),
+            record("r3", "g3", "b"),
+            record("r4", "g4", "b"),
+        ];
+        let ratios = SplitRatios {
+            train: 0.0,
+            validation: 1.0,
+            test: 0.0,
+        };
+        let recorded = split_and_record(&records, 1, &ratios).expect("split");
+        let digest = recorded.record().digest(Split::Validation);
+        let members: Vec<ContentRecord<'_>> = records
+            .iter()
+            .map(|r| ContentRecord {
+                id: &r.id,
+                input: &r.input,
+                label: &r.label,
+            })
+            .collect();
+        assert_eq!(
+            digest.content_sha256(),
+            Some(content_sha256_hex(&members).expect("hash").as_str())
+        );
+        recorded
+            .record()
+            .verify_against(&records)
+            .expect("same content verifies");
+
+        let mut swapped_input = records
+            .iter()
+            .map(|r| record(&r.id, &r.group_id, &r.label))
+            .collect::<Vec<_>>();
+        swapped_input[1].input = b"tampered".to_vec();
+        assert!(matches!(
+            recorded.record().verify_against(&swapped_input),
+            Err(SplitRecordError::SplitMismatch { .. })
+        ));
+
+        // 正解ラベルだけの差し替え（同じ group・同じ割付になる範囲で）。
+        let mut swapped_label = records
+            .iter()
+            .map(|r| record(&r.id, &r.group_id, &r.label))
+            .collect::<Vec<_>>();
+        swapped_label[0].label = "b".to_string();
+        assert!(recorded.record().verify_against(&swapped_label).is_err());
+    }
+
+    /// JSON 往復で中身のハッシュが保たれる。中身のハッシュを持たない古い記録の
+    /// JSON（`content_sha256` キー無し）も読め、`None` になり、再直列化しても
+    /// キーは現れない（既存の記録を壊さない）。不正な形式は拒否する。
+    #[test]
+    fn req17_split_record_json_compat_for_content_hash() {
+        let records = vec![record("r1", "g1", "a"), record("r2", "g2", "b")];
+        let recorded = split_and_record(&records, 3, &SplitRatios::default()).expect("split");
+        let json = recorded.record().to_json().expect("to_json");
+        assert!(json.contains("content_sha256"));
+        let restored = SplitRecord::from_json_str(&json).expect("from_json");
+        assert_eq!(&restored, recorded.record());
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        for split in ["train", "validation", "test"] {
+            value["splits"][split]
+                .as_object_mut()
+                .expect("object")
+                .remove("content_sha256");
+        }
+        let legacy = SplitRecord::from_json_str(&value.to_string()).expect("legacy record loads");
+        assert_eq!(legacy.digest(Split::Train).content_sha256(), None);
+        assert!(
+            !legacy
+                .to_json()
+                .expect("to_json")
+                .contains("content_sha256")
+        );
+        // 古い記録でも ID・group の照合（`verify_against`）は従来どおり通る。
+        legacy
+            .verify_against(&records)
+            .expect("legacy verifies by ids");
+
+        value["splits"]["train"]["content_sha256"] = serde_json::json!("NOT-HEX");
+        assert!(SplitRecord::from_json_str(&value.to_string()).is_err());
     }
 }

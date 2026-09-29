@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from conftest import LABEL_ORDER, TINY_AR_CONFIG, TINY_CONFIG
+from conftest import LABEL_ORDER, TINY_AR_CONFIG, TINY_C1_CONFIG, TINY_CONFIG
 from fandhe_edge_trainer import cli, supervisor
+from fandhe_edge_trainer.prediction import PREDICTION_FIELDS
 
 _LAUNCH_SCRIPT = str(Path(__file__).resolve().parent.parent / "launch.py")
 
@@ -482,3 +483,92 @@ def test_lifeline_watch_loop_read_exception_triggers_group_kill(
 
     cli._lifeline_watch_loop(_RaisingPipe())
     assert calls == [(4242, signal.SIGKILL)]
+
+
+# ---- 学習直後の validation 予測（REQ-18・REQ-27。issue #84 PR #238・選択肢 2）----
+
+
+def _write_validation_request(tmp_path: Path, kind: str, config: dict, extra: dict) -> Path:
+    rows = []
+    for i in range(12):
+        rows.append({"input": f"alpha alpha beta gamma {i}", "label": "cat_a"})
+        rows.append({"input": f"delta delta epsilon zeta {i}", "label": "cat_b"})
+    (tmp_path / "train.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    request = {
+        "schema_version": 1,
+        "kind": kind,
+        "kind_version": 1,
+        "config": config,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+        **extra,
+    }
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(request), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("kind", "config"),
+    [("c1", TINY_C1_CONFIG), ("c3", TINY_CONFIG), ("autoregressive", TINY_AR_CONFIG)],
+)
+def test_req18_cli_returns_validation_predictions_in_request_order(
+    tmp_path: Path, kind: str, config: dict
+) -> None:
+    """REQ-18・REQ-27: `launch.py train` がリクエストの `validation_inputs`
+    （`{id, input}` のみ）を学習直後に予測し、結果 JSON（1 行）の
+    `validation_predictions` として入力と同じ順序・件数で返す。
+    """
+    validation = [
+        {"id": "v-b", "input": "delta delta epsilon zeta 7"},
+        {"id": "v-a", "input": "alpha alpha beta gamma 7"},
+    ]
+    request_path = _write_validation_request(
+        tmp_path, kind, config, {"validation_inputs": validation}
+    )
+    result = _run_cli(request_path)
+    assert result.returncode == 0, (result.stdout[:500], result.stderr[:2000])
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "ok"
+    predictions = payload["validation_predictions"]
+    assert [p["id"] for p in predictions] == ["v-b", "v-a"]
+    assert all(list(p) == list(PREDICTION_FIELDS) for p in predictions)
+    assert all(p["status"] in {"ok", "error"} for p in predictions)
+    assert all(p["predicted_label"] in [*LABEL_ORDER, None] for p in predictions)
+    if kind != "autoregressive":
+        # c1・c3 は合成データを確実に分離できる。
+        assert [p["predicted_label"] for p in predictions] == ["cat_b", "cat_a"]
+
+
+def test_req18_cli_without_validation_inputs_has_no_predictions_key(tmp_path: Path) -> None:
+    """`validation_inputs` を付けなければ結果に `validation_predictions` は現れない
+    （既存の消費者を壊さない）。
+    """
+    result = _run_cli(_write_validation_request(tmp_path, "c3", TINY_CONFIG, {}))
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert "validation_predictions" not in payload
+
+
+def test_req27_cli_rejects_gold_label_in_validation_inputs(tmp_path: Path) -> None:
+    """REQ-27: `validation_inputs` の要素に正解ラベルを混ぜたリクエストは、学習に
+    入る前に `invalid_request`／64 で拒否される。
+    """
+    validation = [{"id": "v", "input": "alpha", "label": "cat_a"}]
+    request_path = _write_validation_request(
+        tmp_path, "c3", TINY_CONFIG, {"validation_inputs": validation}
+    )
+    result = _run_cli(request_path)
+    assert result.returncode == 64, (result.stdout[:500], result.stderr[:500])
+    payload = json.loads(result.stdout.strip())
+    assert payload["code"] == "invalid_request"
+    assert not (tmp_path / "out").exists()

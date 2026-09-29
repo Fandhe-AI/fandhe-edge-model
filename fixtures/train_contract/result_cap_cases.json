@@ -1,0 +1,105 @@
+{
+  "_meta": {
+    "description": "Cases for the per-request result size bound (validation_result_bytes_bound / TrainRequest::max_result_bytes). Expected values were computed independently (MAX_RESULT_BYTES 1048576 + 64 slack + sum(50 fixed + JSON-escaped id length + JSON-escaped longest label length)); a control character counts as 6 bytes, a quote or backslash as 2, other characters as their UTF-8 length. Both crates/train/tests/train_contract_fixture.rs and trainer/tests/test_train_contract_fixture.py must reproduce them. Do not relax values to make a test pass."
+  },
+  "cases": [
+    {
+      "name": "plain_ascii",
+      "label_order": [
+        "a",
+        "b"
+      ],
+      "ids": [
+        "r1"
+      ],
+      "expected_max_result_bytes": 1048693
+    },
+    {
+      "name": "control_characters_only_longest_label",
+      "label_order": [
+        "\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001\u0001",
+        "b"
+      ],
+      "ids": [
+        "r0",
+        "r1"
+      ],
+      "expected_max_result_bytes": 1051816
+    },
+    {
+      "name": "quotes_backslash_and_multibyte",
+      "label_order": [
+        "say \"hi\"\\",
+        "\u00e9\u00e9",
+        "\ud83d\ude00"
+      ],
+      "ids": [
+        "id\"q",
+        "id\\b",
+        "id\n",
+        "\u00e9\ud83d\ude00"
+      ],
+      "expected_max_result_bytes": 1048912
+    },
+    {
+      "name": "many_short_ids",
+      "label_order": [
+        "x",
+        "yy"
+      ],
+      "ids": [
+        "r0",
+        "r1",
+        "r2",
+        "r3",
+        "r4",
+        "r5",
+        "r6",
+        "r7",
+        "r8",
+        "r9",
+        "r10",
+        "r11",
+        "r12",
+        "r13",
+        "r14",
+        "r15",
+        "r16",
+        "r17",
+        "r18",
+        "r19",
+        "r20",
+        "r21",
+        "r22",
+        "r23",
+        "r24",
+        "r25",
+        "r26",
+        "r27",
+        "r28",
+        "r29",
+        "r30",
+        "r31",
+        "r32",
+        "r33",
+        "r34",
+        "r35",
+        "r36",
+        "r37",
+        "r38",
+        "r39",
+        "r40",
+        "r41",
+        "r42",
+        "r43",
+        "r44",
+        "r45",
+        "r46",
+        "r47",
+        "r48",
+        "r49"
+      ],
+      "expected_max_result_bytes": 1051380
+    }
+  ]
+}

@@ -35,6 +35,37 @@ from __future__ import annotations
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_REQUEST_BYTES = 1 * 1024 * 1024
 
+#: 学習ジョブ内での採点用 validation 入力（リクエストの `validation_inputs`。
+#: REQ-18・REQ-27。issue #84 PR #238・選択肢 2）の上限。値は Rust 側の
+#: `crates/train/src/limits.rs` および `fandhe_edge_core`（`MAX_INFER_INPUT_BYTES`・
+#: `judgment::MAX_INPUT_ID_BYTES`）と揃え、共有 fixture
+#: （`fixtures/train_contract/limits.json`）で照合する。
+#:
+#: `MAX_VALIDATION_INPUT_BYTES`: 1 件の入力の UTF-8 バイト数（現行値 1 MiB。
+#: 推論入力 1 件の上限）。`MAX_VALIDATION_ID_BYTES`: 1 件の `id` の UTF-8
+#: バイト数（現行値 1024）。`MAX_VALIDATION_INPUT_TOTAL_BYTES`: `id`＋`input`
+#: の合計（現行値 64 MiB）。validation 入力はリクエスト JSON の内側を通るため、
+#: 実際に効く上限は `MAX_REQUEST_BYTES`（1 MiB）であり、合計上限（64 MiB）は
+#: それより緩い（オーナー判断で据え置き。選択肢 (a)）。1 MiB ちょうどの
+#: 入力 1 件もリクエスト全体の上限を超えるため運べない。
+#: 根拠: Rust 側と同じ値を独立に持つ（推定ではなく既存上限の流用）。
+#: 証拠種別: 仮置き（既存上限の流用）。
+MAX_VALIDATION_INPUT_BYTES = 1_048_576
+MAX_VALIDATION_ID_BYTES = 1024
+MAX_VALIDATION_INPUT_TOTAL_BYTES = 64 * 1024 * 1024
+
+#: 学習結果 JSON（ワーカーの標準出力）の上限（bytes）。現行値: 1 MiB
+#: （`crates/train/src/limits.rs::MAX_RESULT_BYTES`。根拠: 仮置き）。
+MAX_RESULT_BYTES = 1 * 1024 * 1024
+
+#: `validation_inputs` を持つリクエストの結果 JSON（`validation_predictions`
+#: を含む）の標準出力上限の**天井**（bytes）。実際の上限はリクエストごとに
+#: `contract.py::validation_result_bytes_bound`（許可するラベル・id から正確に
+#: 計算。Rust 側 `validation_result_bytes_bound` と同じ式。共有 fixture
+#: `result_cap_cases.json` で照合）で決め、この天井を超えるリクエストは
+#: `validate_request` が `limit_exceeded` で拒否する（issue #84 PR #238 レビュー）。
+MAX_RESULT_BYTES_WITH_VALIDATION = 64 * 1024 * 1024
+
 #: 現行値: 64 MiB（累積読み取りバイト数で判定する）。根拠: 仮置き（実運用データ
 #: 規模の実測値が無いため、想定データ規模から見繕った暫定値）。証拠種別: 仮置き。
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。

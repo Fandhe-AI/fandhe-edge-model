@@ -31,10 +31,24 @@
 //!
 //! [`time_allotment`] は探索予算（REQ-18。既定 1 時間）のうち候補 1 件へ
 //! 配分する持ち時間の算出・実行記録を担う（TASK-18.1-1・issue #83）。
+//! [`search`] はそれを繰り返し呼び、探索予算全体の消費を追跡し、
+//! validation 正解率が最も高い候補を選定する（TASK-18.1-2・issue #84）。
+//! 正解率の算出は評価器 `fandhe-edge-eval`
+//! （[`fandhe_edge_eval::metrics::evaluate_single_select`]）に委譲する
+//! （評価器は 1 つに集約し、他の層で再実装しない。
+//! `.claude/rules/coding-rust.md`「crate 構成と層の境界」）。
+//!
 //! 子プロセスの起動・タイムアウト・終了コード写像（ワーカーの `code` から
 //! [`fandhe_edge_core::exitcode::ExitCode`] への対応づけ）は [`process`]
-//! モジュールが実装する（issue #178）。[`time_allotment::CandidateRunner`]
-//! はこの実行器を差し込むための接合点（trait）を提供する。
+//! モジュールが実装する（issue #178。学習は [`process::run_train`]）。
+//! [`time_allotment::CandidateRunner`] はこの実行器を差し込むための接合点
+//! （trait）で、[`process::WorkerCandidateRunner`] が `run_train` を使う実装。
+//! validation の採点は別プロセスではなく**学習ジョブの中**で行う（issue #84
+//! PR #238 レビュー・選択肢 2）: 学習リクエストの任意項目 `validation_inputs`
+//! （[`request::ValidationInput`]。`id`・`input` のみで正解ラベルは持たない。
+//! REQ-27）を学習ワーカーが学習直後に予測し、結果の `validation_predictions`
+//! （[`result::SuccessOutcome::validation_predictions`]）として返す。
+//! [`search`] はその予測列を validation gold と突き合わせる。
 //!
 //! # スコープ外（#178 以降も対象外）
 //!
@@ -47,22 +61,24 @@
 //!   将来のガード層（TASK-39.x）が担う）。子プロセス起動後の `artifact_dir`
 //!   の閉じ込め検証は [`result::TrainOutcome::from_worker_stdout`]（#177）が
 //!   引き続き担う
-//! - CLI `train` 工程への配線・`trainer_dir` の発見（CLI 引数・設定からの
-//!   解決。TASK-33.x）
+//! - CLI `train`／`select` 工程への配線・`trainer_dir` の発見（CLI 引数・
+//!   設定からの解決。TASK-33.x）
 //! - Rust 側での RSS 監視（学習ワーカー自身の `supervisor.py` が担う）。
 //!   外側の壁時計締め切り超過時、[`process::run_train`] は直接の子
 //!   （supervisor）だけを `Child::kill()` で終了させる。`_worker` を含む
-//!   子孫プロセスの確実な掃除は Rust 側の関与なしに、学習ワーカー自身が
-//!   supervisor の死を検知して自己終了する「lifeline」方式に委ねる
-//!   （issue #178 PR #233 レビュー: `process_group(0)`・`/bin/kill` 呼び出し
-//!   による Rust 側でのプロセスグループ管理は、PID 再利用・ゾンビ起因の
-//!   誤判定等の構造的な欠陥が収束しなかったため全面撤去した。
-//!   [`process`] モジュール doc・`trainer/src/fandhe_edge_trainer/
+//!   子孫プロセスの確実な掃除は Rust 側の関与なしに、
+//!   学習ワーカー自身が supervisor の死を検知して自己終了する「lifeline」
+//!   方式に委ねる（issue #178 PR #233 レビュー: `process_group(0)`・
+//!   `/bin/kill` 呼び出しによる Rust 側でのプロセスグループ管理は、PID
+//!   再利用・ゾンビ起因の誤判定等の構造的な欠陥が収束しなかったため全面
+//!   撤去した。[`process`] モジュール doc・`trainer/src/fandhe_edge_trainer/
 //!   supervisor.py` モジュール docstring「lifeline」節参照。native
 //!   `kill(2)` の直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe`
 //!   新規導入のいずれもユーザー承認事項のため対象外）
-//! - 探索予算全体の積算・複数候補の比較・選定の記録（#84・TASK-18.1-2）
-//! - 「予算到達」を合格扱いしない判定（TASK-18.2）
+//! - 「予算到達」を合格扱いしない判定（TASK-18.2・issue #85）
+//! - McNemar・Holm による有意性判定の選定記録への統合（TASK-18.3-1・issue #87）
+//! - 探索記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コード
+//!   への写像（TASK-33.x）
 
 pub mod error;
 mod kind_defaults;
@@ -70,6 +86,7 @@ pub mod limits;
 pub mod process;
 pub mod request;
 pub mod result;
+pub mod search;
 // 選定結果への McNemar・Holm 有意性判定の付与（評価器
 // `fandhe-edge-eval` を呼ぶ。REQ-18・REQ-25・TASK-18.3-1・#87）。
 pub mod selection_significance;

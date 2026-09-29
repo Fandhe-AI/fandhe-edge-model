@@ -47,6 +47,7 @@ docstring 末尾・`_export_c1_onnx` 参照）。学習側の numpy 特徴量計
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -77,6 +78,7 @@ from ..limits import (
     MIN_C1_C,
     MIN_C1_MIN_DF,
 )
+from ..prediction import ok_prediction_record
 
 KIND = "c1"
 KIND_VERSION = 1
@@ -449,7 +451,17 @@ class TfidfLogReg(nn.Module):
 def _encode_examples(
     examples: list[TrainExample], max_bytes: int, resource_budget: budget_mod.ResourceBudget
 ) -> tuple[np.ndarray, np.ndarray]:
-    """学習データ全体を固定幅 int32 配列へエンコードし、各行の実長も返す。
+    """学習データ全体を固定幅 int32 配列へエンコードし、各行の実長も返す
+    （`_encode_texts` へ入力本文だけを渡す。ラベルは使わない）。
+    """
+    return _encode_texts([ex.input for ex in examples], max_bytes, resource_budget)
+
+
+def _encode_texts(
+    texts: Sequence[str], max_bytes: int, resource_budget: budget_mod.ResourceBudget
+) -> tuple[np.ndarray, np.ndarray]:
+    """入力本文の列を固定幅 int32 配列へエンコードし、各行の実長も返す
+    （学習データ・学習直後の validation 予測〔`predict_labels`〕で共有する）。
 
     C3 の `_encode_examples`（P0-1: あらかじめ確保した配列へ行ごとに書き込む
     設計）と同じ理由・同じパターン。C1 は詰め物より前の実長（`doc_lens`）を
@@ -467,12 +479,12 @@ def _encode_examples(
     語彙が id=0 を含む n-gram を持ちうる（クラス docstring の不変条件が
     崩れる。REQ-28 の一致契約に関わる）。
     """
-    n = len(examples)
+    n = len(texts)
     arr = np.zeros((n, max_bytes), dtype=np.int32)
     lens = np.zeros((n,), dtype=np.int32)
     max_len = 1
-    for i, ex in enumerate(examples):
-        row = encode_bytes(ex.input, max_bytes)
+    for i, text in enumerate(texts):
+        row = encode_bytes(text, max_bytes)
         length = len(row)
         arr[i, :length] = row
         lens[i] = 0 if (length == 1 and row[0] == 0) else length
@@ -692,6 +704,57 @@ class C1Kind:
         if trained.resource_budget is not None:
             trained.resource_budget.check()
         _export_c1_onnx(trained, out)
+
+
+def predict_labels(
+    trained: C1TrainedModel,
+    rows: Sequence[tuple[str, str]],
+    resource_budget: budget_mod.ResourceBudget | None = None,
+) -> list[dict[str, Any]]:
+    """学習直後の validation 予測（REQ-18・REQ-27。`predict.py` から呼ばれる）。
+
+    `rows` は `(id, input)` の列で、**正解ラベルは受け取らない**。学習時と同じ
+    特徴量計算（`_encode_texts`・`_build_sparse_features`）と順伝播
+    （`TfidfLogReg.__call__`）を通し、argmax のラベルを返す（同点は
+    `label_order` の先頭側。numpy の `argmax` は最初の最大値を返す）。戻り値は
+    入力と同じ順序・件数の `{id, status:"ok", predicted_label}`。
+
+    チャンクは学習と同じ `batch_size` を、`MAX_C1_BATCH_ELEMENTS`（ミニバッチの
+    活性化要素数の上限。学習開始前に検査済みの `batch_size × max_nnz ×
+    n_classes`）を超えない範囲へ縮めたもの。チャンクごとに `resource_budget` を
+    検査する（REQ-39。省略時は学習で使ったインスタンス）。
+    """
+    budget = resource_budget if resource_budget is not None else trained.resource_budget
+    if budget is None:
+        raise WorkerError(
+            "runtime_error",
+            "prediction requires a resource budget",
+            ExitCode.RUNTIME_ERROR,
+        )
+    cfg = trained.config
+    ngram_min = int(cfg["ngram_min"])
+    ngram_max = int(cfg["ngram_max"])
+    n_features = trained.vocab.ns.shape[0]
+    n_classes = len(trained.label_order)
+    max_nnz = max(1, min(n_features, trained.max_bytes * (ngram_max - ngram_min + 1)))
+    chunk_size = max(1, min(int(cfg["batch_size"]), MAX_C1_BATCH_ELEMENTS // (max_nnz * n_classes)))
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(rows), chunk_size):
+        budget.check()
+        chunk = rows[start : start + chunk_size]
+        ids_arr, doc_lens = _encode_texts([text for _rid, text in chunk], trained.max_bytes, budget)
+        idx_arr, val_arr = _build_sparse_features(
+            ids_arr, doc_lens, trained.vocab, ngram_min, ngram_max, max_nnz, budget
+        )
+        batch_max_nnz = max(1, int(np.count_nonzero(val_arr, axis=1).max()))
+        logits = trained.model(
+            mx.array(idx_arr[:, :batch_max_nnz]), mx.array(val_arr[:, :batch_max_nnz])
+        )
+        chosen = np.argmax(np.array(logits, dtype=np.float32), axis=1)
+        budget.check()
+        for (rid, _text), label_index in zip(chunk, chosen, strict=True):
+            records.append(ok_prediction_record(rid, trained.label_order[int(label_index)]))
+    return records
 
 
 def _f32(arr: np.ndarray, name: str) -> TensorProto:

@@ -77,6 +77,24 @@ pub enum TrainRequestError {
     InvalidPath { field: &'static str },
     /// `serde_json` による直列化に失敗した（通常到達しない防御的な分岐）。
     SerializeFailed,
+    /// `validation_inputs` が空配列（付けるなら 1 件以上）。
+    ValidationInputsEmpty,
+    /// `validation_inputs[index].id` が空、または
+    /// `fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES` を超える。
+    ValidationInputInvalidId { index: usize },
+    /// `validation_inputs[index].input` が
+    /// `fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES` を超える。
+    ValidationInputTooLarge { index: usize },
+    /// `validation_inputs` の `id`＋`input` の合計が
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超える。
+    ValidationInputsTotalBytesExceeded,
+    /// `validation_inputs[index].id` が先行する要素と重複する。
+    ValidationInputDuplicateId { index: usize },
+    /// `validation_inputs` の結果 JSON の最大長（許可するラベル・id から計算。
+    /// [`crate::request::validation_result_bytes_bound`]）が
+    /// [`crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION`] を超える。学習を始める
+    /// 前に `limit_exceeded` で拒否する。
+    ValidationResultTooLarge,
 }
 
 impl std::fmt::Display for TrainRequestError {
@@ -163,6 +181,26 @@ impl std::fmt::Display for TrainRequestError {
             TrainRequestError::SerializeFailed => {
                 write!(f, "failed to serialize train request")
             }
+            TrainRequestError::ValidationInputsEmpty => {
+                write!(f, "validation_inputs must not be empty")
+            }
+            TrainRequestError::ValidationInputInvalidId { index } => {
+                write!(f, "validation_inputs[{index}].id is empty or too long")
+            }
+            TrainRequestError::ValidationInputTooLarge { index } => {
+                write!(f, "validation_inputs[{index}].input is too large")
+            }
+            TrainRequestError::ValidationInputsTotalBytesExceeded => {
+                write!(f, "validation_inputs total bytes exceed the limit")
+            }
+            TrainRequestError::ValidationInputDuplicateId { index } => {
+                write!(f, "validation_inputs[{index}].id is a duplicate")
+            }
+            TrainRequestError::ValidationResultTooLarge => write!(
+                f,
+                "the result for validation_inputs could exceed {} bytes",
+                crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION
+            ),
         }
     }
 }
@@ -175,7 +213,9 @@ impl TrainRequestError {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             TrainRequestError::InvalidPath { .. } => "invalid_path",
-            TrainRequestError::TooLarge { .. } => "limit_exceeded",
+            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
+                "limit_exceeded"
+            }
             TrainRequestError::NotUtf8
             | TrainRequestError::NotJson { .. }
             | TrainRequestError::NotObject
@@ -194,6 +234,11 @@ impl TrainRequestError {
             | TrainRequestError::InvalidDevice
             | TrainRequestError::InvalidTimeLimitSeconds
             | TrainRequestError::InvalidRssLimitBytes
+            | TrainRequestError::ValidationInputsEmpty
+            | TrainRequestError::ValidationInputInvalidId { .. }
+            | TrainRequestError::ValidationInputTooLarge { .. }
+            | TrainRequestError::ValidationInputsTotalBytesExceeded
+            | TrainRequestError::ValidationInputDuplicateId { .. }
             | TrainRequestError::SerializeFailed => "invalid_request",
         }
     }
@@ -203,7 +248,9 @@ impl TrainRequestError {
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
-            TrainRequestError::TooLarge { .. } => ExitCode::LimitExceeded,
+            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
+                ExitCode::LimitExceeded
+            }
             _ => ExitCode::InvalidInput,
         }
     }
