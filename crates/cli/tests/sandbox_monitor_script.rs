@@ -260,27 +260,46 @@ fn req38_clean_stream_reports_zero_network_denials() {
     assert_eq!(e.cli_calls().len(), 7);
 }
 
-/// 本ツール起因のプロセス（python3.12）の通信拒否は judged_fail(10)。
+/// プロセス名が許可リストでも PID を照合できなければ帰属不明で pending(12)（名前だけで
+/// 本ツール起因と断定しない。現状の sandbox-run.sh は PID を記録しない）。
 #[test]
-fn req38_tool_process_network_denial_is_judged_fail() {
+fn req38_name_only_match_is_unattributed_not_judged_fail() {
     let e = Env::new();
     let o = e.run("tool_python.ndjson", &e.base_args(), &[]);
-    assert_eq!(o.code, Some(10), "{}", o.stdout);
-    has(&o, "\"network_verdict\": \"tool_network_denials_found\"");
-    has(&o, "\"tool_network_deny_events\": 1");
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_verdict\": \"unattributed_network_denials\"");
+    has(&o, "\"tool_network_deny_events\": 0");
+    has(&o, "\"unattributed_network_deny_events\": 1");
     let report = fs::read_to_string(e.out().join("network_report.json")).expect("report");
     assert!(report.contains("\"process\": \"python3.12\""));
     assert!(report.contains("\"operation\": \"network-outbound\""));
 }
 
-/// 重複報告（`3 duplicate reports for`）は件数として数える。
+/// 重複報告（`3 duplicate reports for`）は元の 1 件と合算して発生回数（4）に数える。
 #[test]
-fn req38_duplicate_report_for_tool_counts() {
+fn req38_duplicate_report_is_merged_into_network_events() {
     let e = Env::new();
     let o = e.run("tool_duplicate.ndjson", &e.base_args(), &[]);
-    assert_eq!(o.code, Some(10), "{}", o.stdout);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
     has(&o, "\"duplicate_reports\": 3");
-    has(&o, "\"tool_network_deny_events\": 1");
+    has(&o, "\"network_deny_events\": 4");
+    has(&o, "\"unattributed_network_deny_events\": 4");
+}
+
+/// `--candidates` は log stream を開始する前に 1〜16 を検証し、範囲外は 64（CLI も起動しない）。
+#[test]
+fn req33_candidates_range_is_validated_before_monitoring() {
+    for bad in ["0", "17", "abc", "-1", "01", ""] {
+        let e = Env::new();
+        let mut args = e.base_args();
+        args.extend(s(&["--candidates", bad]));
+        let started = Instant::now();
+        let o = e.run("clean.ndjson", &args, &[]);
+        assert_eq!(o.code, Some(64), "candidates={bad}: {}", o.stdout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(e.cli_calls().is_empty());
+        assert!(!e.out().join("log_stream.ndjson").exists());
+    }
 }
 
 /// 帰属不明のプロセスの通信拒否は合格にせず pending(12)。
@@ -480,26 +499,33 @@ fn meta(exit_code: i32, started: &str, ended: &str) -> String {
     )
 }
 
+fn meta_with_pids(exit_code: i32, started: &str, ended: &str, pids: &str) -> String {
+    let base = meta(exit_code, started, ended);
+    let trimmed = base.trim_end_matches('}');
+    format!("{trimmed},\"process_pids\":{pids}}}")
+}
+
 const T0: &str = "2026-01-01T00:00:00Z";
 const T1: &str = "2026-01-01T00:00:10Z";
 const T2: &str = "2026-01-01T00:00:20Z";
 const T3: &str = "2026-01-01T00:01:00Z";
 
 /// 正規表現の境界: 括弧を含むプロセス名・単数形の重複報告・`network-bind`・`network*`。
-/// `sh` は許可リストの本ツール起因、`Foo(bar)` は帰属不明。実機の証拠にはならない。
+/// `sh(55)` は許可リストの名前かつ `process_pids` に含まれるため本ツール起因（重複 1 件を
+/// 合算して 2 回）、`Foo(bar)` は帰属不明。実機の証拠にはならない。
 #[test]
 fn req38_report_regex_boundaries() {
     let e = Env::new();
     let o = run_report(
         &e.dir,
         &fixture("edge_cases.ndjson"),
-        Some(&meta(0, T1, T2)),
+        Some(&meta_with_pids(0, T1, T2, "[55]")),
         T0,
         T3,
     );
     assert_eq!(o.code, Some(10), "{}", o.stdout);
-    has(&o, "\"network_deny_events\": 2");
-    has(&o, "\"tool_network_deny_events\": 1");
+    has(&o, "\"network_deny_events\": 3");
+    has(&o, "\"tool_network_deny_events\": 2");
     has(&o, "\"unattributed_network_deny_events\": 1");
     has(&o, "\"duplicate_reports\": 1");
     has(&o, "\"evidence_hint\": \"requires_human_review\"");
@@ -545,4 +571,61 @@ fn req38_report_time_window_must_cover_run() {
     assert_eq!(early_stop.code, Some(70), "{}", early_stop.stdout);
     let ok = run_report(&e.dir, &clean, Some(&meta(0, T1, T2)), T0, T3);
     assert_eq!(ok.code, Some(0), "{}", ok.stdout);
+}
+
+/// PID が `process_pids` に無ければ、名前が許可リストでも帰属不明（pending）。
+#[test]
+fn req38_report_pid_mismatch_is_unattributed() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("tool_python.ndjson"),
+        Some(&meta_with_pids(0, T1, T2, "[1, 2]")),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    let o2 = run_report(
+        &e.dir,
+        &fixture("tool_python.ndjson"),
+        Some(&meta_with_pids(0, T1, T2, "[5001]")),
+        T0,
+        T3,
+    );
+    assert_eq!(o2.code, Some(10), "{}", o2.stdout);
+    has(&o2, "\"tool_network_deny_events\": 1");
+}
+
+/// `process_pids` が配列でない・負数を含む場合は判定不能。
+#[test]
+fn req38_report_invalid_process_pids_is_undeterminable() {
+    let e = Env::new();
+    for bad in ["\"x\"", "[-1]", "[true]"] {
+        let o = run_report(
+            &e.dir,
+            &fixture("clean.ndjson"),
+            Some(&meta_with_pids(0, T1, T2, bad)),
+            T0,
+            T3,
+        );
+        assert_eq!(o.code, Some(70), "{bad}: {}", o.stdout);
+    }
+}
+
+/// 保持するレコードは 1000 件まで。超過分も件数には含め、切り詰めを明示する（REQ-39）。
+#[test]
+fn req39_report_records_are_capped_but_counts_are_exact() {
+    let e = Env::new();
+    let stream = e.dir.join("many.ndjson");
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let line = "{\"eventMessage\":\"Sandbox: zz(9) deny(1) network-outbound 10.0.0.1:1\"}\n";
+    fs::write(&stream, format!("{header}\n{}", line.repeat(1500))).expect("write");
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 1500");
+    has(&o, "\"stream_lines\": 1501");
+    let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
+    assert!(report.contains("\"network_denials_truncated\": true"));
+    assert_eq!(report.matches("\"attribution\"").count(), 1000);
 }

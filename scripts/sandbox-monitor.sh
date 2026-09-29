@@ -78,6 +78,7 @@ definition=
 project_dir=
 out_dir=
 candidates=
+has_candidates=0
 infer_text=
 has_infer_text=0
 smoke=0
@@ -121,7 +122,10 @@ while [ $# -gt 0 ]; do
         --definition) definition=$val ;;
         --project-dir) project_dir=$val ;;
         --out-dir) out_dir=$val ;;
-        --candidates) candidates=$val ;;
+        --candidates)
+            candidates=$val
+            has_candidates=1
+            ;;
         --infer-text)
             infer_text=$val
             has_infer_text=1
@@ -132,6 +136,15 @@ done
 [ -n "$definition" ] || fail 64 invalid_input "--definition is required"
 [ -n "$project_dir" ] || fail 64 invalid_input "--project-dir is required"
 [ -n "$out_dir" ] || fail 64 invalid_input "--out-dir is required"
+# sandbox-run.sh と同じ範囲検証。log stream を開始する前に拒否する（不正値のまま待機して
+# 判定不能になるのを避ける。sandbox-run.sh 側の検証との共通化は別課題）
+if [ "$has_candidates" -eq 1 ]; then
+    case "$candidates" in
+        [1-9] | [1-9][0-9]) ;;
+        *) fail 64 invalid_input "--candidates must be an integer from 1 to 16" ;;
+    esac
+    [ "$candidates" -le 16 ] || fail 64 invalid_input "--candidates must be an integer from 1 to 16"
+fi
 if [ -e "$project_dir" ] || [ -L "$project_dir" ]; then
     fail 64 invalid_input "project directory already exists"
 fi
@@ -254,7 +267,7 @@ sleep "$warmup"
 
 # ---- 実行 ----
 set -- --definition "$definition" --project-dir "$project_dir" --out-dir "$out_dir/run"
-[ -z "$candidates" ] || set -- "$@" --candidates "$candidates"
+[ "$has_candidates" -eq 0 ] || set -- "$@" --candidates "$candidates"
 [ "$has_infer_text" -eq 0 ] || set -- "$@" --infer-text "$infer_text"
 [ "$smoke" -eq 0 ] || set -- "$@" --smoke
 run_rc=0

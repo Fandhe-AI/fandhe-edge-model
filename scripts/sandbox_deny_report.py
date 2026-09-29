@@ -20,9 +20,23 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
 出力: stdout に JSON 1 行（REQ-33。固定の文字列と件数だけ。利用者の値は出さない）、
 `--report-out` に詳細レポート。終了コードは 7 種（0・10・11・12・20・64・70。REQ-21）。
 
+帰属（本ツール起因か）: プロセス名だけでは断定しない（無関係な python3・sh の拒否で誤って
+judged_fail にしないため）。`run.meta.json` の任意キー `process_pids`（本ツールが起動した
+プロセスの PID の配列）に PID が含まれ、かつ名前が許可リストにある場合だけ tool とする。
+`process_pids` が無い・照合できない場合は帰属不明（unattributed）で、判定は pending(12)
+（現状の `sandbox-run.sh` は PID を記録しないため、通信拒否があれば常に 12 になる。
+PID 記録は将来仕様。REQ-38・TASK-38.2 で扱う）。
+
+件数の意味: `network_deny_events` 等の通信拒否件数は、元の 1 行 + `N duplicate reports for`
+の重複分 N を合算した**拒否の発生回数**。`duplicate_reports` は重複分だけの合計（内訳）。
+`deny_events`・`parsed_events` はイベント行数。
+
+資源: ログは 1 行ずつ読み（一括読み込みしない）、保持するレコードは MAX_RECORDS 件まで
+（超過分は件数だけ数え、レポートの `network_denials_truncated` を true にする。REQ-39）。
+
 判定（優先順 70 > 10 > 12 > run の終了コード > 0）:
   - 監視が無効・読めない行・時刻の不整合 -> undeterminable(70)（fail-closed）
-  - 本ツール起因の通信拒否あり -> judged_fail(10)
+  - 本ツール起因（PID 照合済み）の通信拒否あり -> judged_fail(10)
   - 帰属不明の通信拒否あり -> pending(12。人が確認する)
   - 全プロセスで通信拒否 0 件 -> zero_network_denials。run の終了コードを伝搬する
 陽性対照（検出手段が機能することの確認）は TASK-38.2 の担当で、本スクリプトは実行しない
@@ -36,12 +50,16 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable, Iterator
 
 # 1 行の長さの上限（REQ-39）。超えたら判定不能
 MAX_LINE_BYTES = 64 * 1024
 # ログ全体の上限（sandbox-monitor.sh の head -c と揃える）
 MAX_STREAM_BYTES = 256 * 1024 * 1024
 MAX_META_BYTES = 1024 * 1024
+# レポートに保持する通信拒否レコードの上限（超過分は件数のみ。REQ-39）
+MAX_RECORDS = 1000
+MAX_PIDS = 4096
 MAX_TARGET_BYTES = 256
 HEADER_PREFIX = "Filtering the log data"
 VALID_EXIT_CODES = {0, 10, 11, 12, 20, 64, 70}
@@ -112,6 +130,13 @@ def load_run_meta(path: str) -> dict:
         raise Undeterminable("run record evidence_hint is invalid")
     if not isinstance(meta.get("sandbox_exec_override"), bool):
         raise Undeterminable("run record sandbox_exec_override is invalid")
+    pids = meta.get("process_pids", [])
+    if (
+        not isinstance(pids, list)
+        or len(pids) > MAX_PIDS
+        or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in pids)
+    ):
+        raise Undeterminable("run record process_pids is invalid")
     return meta
 
 
@@ -123,8 +148,12 @@ def truncate_target(text: str) -> str:
     return raw[:MAX_TARGET_BYTES].decode("utf-8", errors="ignore")
 
 
-def classify(events_raw: list[str]) -> dict:
-    """`eventMessage` の一覧を分類して件数とレコードを返す。"""
+def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset()) -> dict:
+    """`eventMessage` を 1 件ずつ分類して件数とレコード（上限あり）を返す。
+
+    `tool_pids` に含まれる PID かつ許可リストのプロセス名だけを tool とし、それ以外は
+    帰属不明にする（名前だけでは断定しない）。通信拒否の件数は重複報告分を合算する。
+    """
     counts = {
         "parsed_events": 0,
         "deny_events": 0,
@@ -135,6 +164,15 @@ def classify(events_raw: list[str]) -> dict:
         "unrecognized_deny_events": 0,
     }
     records: list[dict] = []
+    truncated = False
+
+    def keep(rec: dict) -> None:
+        nonlocal truncated
+        if len(records) < MAX_RECORDS:
+            records.append(rec)
+        else:
+            truncated = True
+
     for msg in events_raw:
         counts["parsed_events"] += 1
         if "deny" not in msg:
@@ -147,7 +185,7 @@ def classify(events_raw: list[str]) -> dict:
                 # 形式外でも network を含む拒否は fail-closed で帰属不明の通信拒否とする
                 counts["network_deny_events"] += 1
                 counts["unattributed_network_deny_events"] += 1
-                records.append(
+                keep(
                     {
                         "process": None,
                         "pid": None,
@@ -159,56 +197,81 @@ def classify(events_raw: list[str]) -> dict:
                 )
             continue
         dup, proc, pid, _n, op, target = m.groups()
-        if dup is not None:
-            counts["duplicate_reports"] += int(dup)
+        dup_n = int(dup) if dup is not None else 0
+        counts["duplicate_reports"] += dup_n
         if not op.startswith("network"):
             continue
-        counts["network_deny_events"] += 1
-        tool = proc in TOOL_PROCESSES
-        counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += 1
-        records.append(
+        occurrences = 1 + dup_n
+        counts["network_deny_events"] += occurrences
+        tool = proc in TOOL_PROCESSES and int(pid) in tool_pids
+        counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += (
+            occurrences
+        )
+        keep(
             {
                 "process": proc,
                 "pid": int(pid),
                 "operation": op,
                 "target": truncate_target(target or ""),
+                "occurrences": occurrences,
                 "attribution": "tool" if tool else "unattributed",
                 "recognized": True,
             }
         )
-    return {"counts": counts, "records": records}
+    return {"counts": counts, "records": records, "truncated": truncated}
 
 
-def parse_stream(path: str) -> tuple[list[str], int]:
-    """ndjson を読み、`eventMessage` 一覧と総行数を返す。読めない行は判定不能。"""
-    data = read_bounded(path, MAX_STREAM_BYTES)
-    if not data:
+def iter_stream(path: str, stats: dict) -> Iterator[str]:
+    """ndjson を 1 行ずつ読んで `eventMessage` を返す。総行数は `stats["lines"]` に入れる。
+
+    ファイル全体を読み込まず、1 行の読み込みも MAX_LINE_BYTES + 1 で打ち切る（REQ-39）。
+    読めない行・ヘッダ欠落・空出力は判定不能。
+    """
+    try:
+        if os.stat(path).st_size > MAX_STREAM_BYTES:
+            raise Undeterminable("input file exceeds size limit")
+        f = open(path, "rb")  # noqa: SIM115 -- ジェネレータの寿命に合わせて finally で閉じる
+    except OSError as e:
+        raise Undeterminable("cannot read input file") from e
+    total = 0
+    try:
+        while True:
+            try:
+                raw = f.readline(MAX_LINE_BYTES + 1)
+            except OSError as e:
+                raise Undeterminable("cannot read input file") from e
+            if not raw:
+                break
+            total += len(raw)
+            if total > MAX_STREAM_BYTES:
+                raise Undeterminable("input file exceeds size limit")
+            if len(raw) > MAX_LINE_BYTES:
+                raise Undeterminable("log stream line exceeds length limit")
+            if raw.endswith(b"\n"):
+                raw = raw[:-1]
+            i = stats["lines"]
+            stats["lines"] = i + 1
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as e:
+                raise Undeterminable("log stream line is not utf-8") from e
+            if i == 0:
+                # 先頭はヘッダ行がちょうど 1 行。ヘッダが無ければ監視が機能していない
+                if not text.startswith(HEADER_PREFIX):
+                    raise Undeterminable("log stream header is missing")
+                continue
+            try:
+                obj = json.loads(text)
+            except ValueError as e:
+                raise Undeterminable("log stream line is not valid json") from e
+            msg = obj.get("eventMessage") if isinstance(obj, dict) else None
+            if not isinstance(msg, str):
+                raise Undeterminable("log stream event has no eventMessage")
+            yield msg
+    finally:
+        f.close()
+    if stats["lines"] == 0:
         raise Undeterminable("log stream output is empty")
-    lines = data.split(b"\n")
-    if lines and lines[-1] == b"":
-        lines.pop()
-    messages: list[str] = []
-    for i, raw in enumerate(lines):
-        if len(raw) > MAX_LINE_BYTES:
-            raise Undeterminable("log stream line exceeds length limit")
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise Undeterminable("log stream line is not utf-8") from e
-        if i == 0:
-            # 先頭はヘッダ行がちょうど 1 行。ヘッダが無ければ監視が機能していない
-            if not text.startswith(HEADER_PREFIX):
-                raise Undeterminable("log stream header is missing")
-            continue
-        try:
-            obj = json.loads(text)
-        except ValueError as e:
-            raise Undeterminable("log stream line is not valid json") from e
-        msg = obj.get("eventMessage") if isinstance(obj, dict) else None
-        if not isinstance(msg, str):
-            raise Undeterminable("log stream event has no eventMessage")
-        messages.append(msg)
-    return messages, len(lines)
 
 
 def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
@@ -225,6 +288,7 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
     }
     counts = dict(counts_zero)
     records: list[dict] = []
+    truncated = False
     run_exit: int | None = None
     hint = "requires_human_review"
     try:
@@ -238,11 +302,15 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
             raise Undeterminable("log stream output exceeded capacity")
         if args.stream_died:
             raise Undeterminable("log stream ended before the monitoring window closed")
-        messages, nlines = parse_stream(args.stream)
-        result = classify(messages)
+        stats = {"lines": 0}
+        result = classify(
+            iter_stream(args.stream, stats),
+            frozenset(int(x) for x in meta.get("process_pids", [])),
+        )
         counts.update(result["counts"])
-        counts["stream_lines"] = nlines
+        counts["stream_lines"] = stats["lines"]
         records = result["records"]
+        truncated = result["truncated"]
         for key in (args.monitor_started_utc, args.monitor_stopped_utc):
             if not UTC_RE.match(key):
                 raise Undeterminable("monitor timestamp is invalid")
@@ -287,6 +355,7 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
         "warmup_secs": args.warmup_secs,
         "tail_secs": args.tail_secs,
         "network_denials": records,
+        "network_denials_truncated": truncated,
     }
     return rc, summary, report
 
