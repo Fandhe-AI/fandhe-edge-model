@@ -33,9 +33,9 @@ scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2
 | scope | 対象 | パス |
 | ----- | ---- | ---- |
 | core | 共通コア（定義ファイル・選択肢・判定型・正準化ハッシュ。REQ-15） | `crates/core/`（`fandhe-edge-core`） |
-| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・凍結記録・読み取り専用配置・来歴の記録型と取り込み記録・データ検査との接続を実装済み） |
-| train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。学習リクエスト・結果 JSON の型を実装済み。issue #177） |
-| eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列を実装済み。有意性・回帰・診断は未着手） |
+| data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・凍結記録・読み取り専用配置・ハッシュ不一致時の停止・分割記録のレコード内容ハッシュ・来歴の記録型と取り込み記録・データ検査との接続を実装済み） |
+| train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。学習リクエスト・結果 JSON の型・子プロセス起動と終了コード写像・探索予算内の候補選定・選定結果の有意性判定を実装済み。CLI 配線は未着手。issue #177） |
+| eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。指標・McNemar / Holm・回帰・再現性・不変性・校正と棄権などを実装済み。対象外ラベル・coverage・レポート系は未実装） |
 | runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | 未確定 |
 | cli | CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） |
 | tui | TUI（REQ-35） | 未確定 |
