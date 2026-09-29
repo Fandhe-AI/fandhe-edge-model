@@ -338,6 +338,42 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
     CapacityBreakdown::from_sizes(sizes)
 }
 
+/// 呼び出し側が検証つきで開いた通常ファイルのハンドルから、構成要素ごとのサイズを集計する。
+///
+/// 検証（経路の閉じ込め等）とファイル取得の間でパスを再解決させないための入口（TOCTOU 対策。
+/// REQ-39）。サイズと重複判定の鍵は渡されたハンドルの `fstat` 相当から得る。ハンドルが通常
+/// ファイルであることの保証は呼び出し側（`open_regular_file_for_read` 等）が負う。
+/// `label` はエラー表示用のパスで、再度開くことはしない。
+pub fn measure_opened_files(
+    files: &[(PackageComponent, PathBuf, std::fs::File)],
+) -> Result<CapacityBreakdown, CapacityError> {
+    let mut seen: HashSet<FileId> = HashSet::new();
+    let mut sizes = Vec::with_capacity(files.len());
+    for (component, label, file) in files {
+        let read_err = |source| {
+            CapacityError::File(FsError::Read {
+                path: label.clone(),
+                source,
+            })
+        };
+        let meta = file.metadata().map_err(read_err)?;
+        if !meta.is_file() {
+            return Err(CapacityError::File(FsError::Read {
+                path: label.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+            }));
+        }
+        let id = file_id(label, &meta).map_err(read_err)?;
+        if !seen.insert(id) {
+            return Err(CapacityError::DuplicatePath {
+                path: label.clone(),
+            });
+        }
+        sizes.push((*component, meta.len()));
+    }
+    CapacityBreakdown::from_sizes(sizes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::PackageComponent::*;
@@ -368,6 +404,22 @@ mod tests {
                 file_count: 2
             }
         );
+    }
+
+    /// REQ-30・REQ-39: ハンドル渡しの計測はサイズを集計し、同一ファイルの重複は拒否する。
+    #[test]
+    fn req30_measure_opened_files_sums_and_rejects_duplicates() {
+        let path = std::env::temp_dir().join(format!("fandhe_cap_opened_{}", std::process::id()));
+        std::fs::write(&path, b"abcd").unwrap();
+        let open = || std::fs::File::open(&path).unwrap();
+        let one = measure_opened_files(&[(Weights, path.clone(), open())]).unwrap();
+        assert_eq!(one.total_bytes(), 4);
+        let dup = measure_opened_files(&[
+            (Weights, path.clone(), open()),
+            (Metadata, path.clone(), open()),
+        ]);
+        assert!(matches!(dup, Err(CapacityError::DuplicatePath { .. })));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

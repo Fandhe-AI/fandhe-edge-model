@@ -14,17 +14,21 @@
 
 use fandhe_edge_cli::output::{capacity_error_report, write_error_report, write_package_capacity};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_runtime::capacity::{PackageComponent, PackageFile, measure_package};
+use fandhe_edge_core::fs::open_regular_file_for_read;
+use fandhe_edge_runtime::capacity::{PackageComponent, measure_opened_files};
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-/// 計測対象ルート（カレントディレクトリ）配下であることを検証し、計測に渡すパスを返す。
+/// 計測対象ルート（カレントディレクトリ）配下のファイルを検証つきで開き、ハンドルを返す。
 ///
-/// 絶対パス・`..` 成分は拒否し、親ディレクトリを正規化（symlink 解決）してルート配下であることを
-/// 確認する（親経由の symlink によるルート外参照を拒否。REQ-39）。末尾の要素は正規化せず
-/// 計測コア側の symlink 拒否に委ねる。
-fn confine(root: &Path, raw: &Path) -> Result<PathBuf, ErrorReport> {
+/// 絶対パス・`..` 成分は拒否する。親ディレクトリは正規化（symlink 解決）してルート配下を確認し、
+/// 通常ファイルとして開いたのち、開いたハンドルが「正規化後もルート配下の同じパスに実在する
+/// 同一ファイル」であることを再確認する。検証後・オープン前に親ディレクトリがルート外への
+/// symlink に差し替えられても、開いたハンドルは再解決したパスと一致せず拒否される
+/// （検証と取得の間の TOCTOU 対策。REQ-39）。以降の計測はパスではなくこのハンドルで行う。
+fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport> {
     let denied = || {
         ErrorReport::new(
             ExitCode::InvalidInput,
@@ -45,10 +49,43 @@ fn confine(root: &Path, raw: &Path) -> Result<PathBuf, ErrorReport> {
     if !parent.starts_with(root) {
         return Err(denied());
     }
-    Ok(parent.join(name))
+    let path = parent.join(name);
+    // 末尾が symlink の場合は開く前に拒否する（開いた後の再確認でも検出される）
+    let link_meta = std::fs::symlink_metadata(&path).map_err(|_| denied())?;
+    if link_meta.file_type().is_symlink() {
+        return Err(denied());
+    }
+    let file = open_regular_file_for_read(&path).map_err(|_| denied())?;
+    // 開いた後に同じパスを再解決し、ルート配下・同一パス・同一ファイルであることを確認する
+    let resolved = path.canonicalize().map_err(|_| denied())?;
+    if resolved != path || !resolved.starts_with(root) {
+        return Err(denied());
+    }
+    let opened = file.metadata().map_err(|_| denied())?;
+    let current = std::fs::metadata(&resolved).map_err(|_| denied())?;
+    if !same_file(&opened, &current) {
+        return Err(denied());
+    }
+    Ok((path, file))
 }
 
-fn parse(args: &[OsString], root: &Path) -> Result<Vec<PackageFile>, ErrorReport> {
+/// 2 つのメタデータが同一ファイルのものか（Unix ではデバイス・inode の一致）。
+/// Unix 以外は M10 時点で対象外のため、種別とサイズの一致で近似する（fail-closed 側の近似）。
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.file_type() == b.file_type() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
+}
+
+fn parse(
+    args: &[OsString],
+    root: &Path,
+) -> Result<Vec<(PackageComponent, PathBuf, File)>, ErrorReport> {
     let invalid = || {
         ErrorReport::new(
             ExitCode::InvalidInput,
@@ -64,10 +101,8 @@ fn parse(args: &[OsString], root: &Path) -> Result<Vec<PackageFile>, ErrorReport
             .into_iter()
             .find(|c| c.as_str() == name)
             .ok_or_else(invalid)?;
-        files.push(PackageFile {
-            component,
-            path: confine(root, Path::new(path))?,
-        });
+        let (path, file) = open_confined(root, Path::new(path))?;
+        files.push((component, path, file));
     }
     Ok(files)
 }
@@ -79,7 +114,7 @@ fn main() -> std::process::ExitCode {
         .and_then(|d| d.canonicalize())
         .map_err(|_| ErrorReport::new(ExitCode::RuntimeError, "cannot resolve working directory"))
         .and_then(|root| parse(&args, &root))
-        .and_then(|files| measure_package(&files).map_err(|e| capacity_error_report(&e)));
+        .and_then(|files| measure_opened_files(&files).map_err(|e| capacity_error_report(&e)));
     let code = match result {
         Ok(breakdown) => write_package_capacity(&mut out, &breakdown),
         Err(report) => write_error_report(&mut out, &report),
@@ -104,23 +139,31 @@ mod tests {
 
     /// REQ-39: ルート配下の相対パスは受理され、絶対パス・`..` は InvalidInput になる。
     #[test]
-    fn req39_confine_rejects_absolute_and_parent_paths() {
+    fn req39_open_confined_rejects_absolute_and_parent_paths() {
         let root = root();
-        assert!(confine(&root, Path::new("sub/m.json")).is_ok());
-        assert!(confine(&root, Path::new("/etc/passwd")).is_err());
-        assert!(confine(&root, Path::new("../x")).is_err());
-        assert!(confine(&root, Path::new("sub/../../x")).is_err());
+        assert!(open_confined(&root, Path::new("sub/m.json")).is_ok());
+        // 末尾が symlink のファイルは拒否される（ルート配下の別ファイルへの link でも）
+        #[cfg(unix)]
+        {
+            let l = root.join("sub").join("tail_link");
+            let _ = std::fs::remove_file(&l);
+            std::os::unix::fs::symlink(root.join("sub").join("m.json"), &l).unwrap();
+            assert!(open_confined(&root, Path::new("sub/tail_link")).is_err());
+        }
+        assert!(open_confined(&root, Path::new("/etc/passwd")).is_err());
+        assert!(open_confined(&root, Path::new("../x")).is_err());
+        assert!(open_confined(&root, Path::new("sub/../../x")).is_err());
     }
 
     /// REQ-39: 親ディレクトリ経由のリンクによるルート外参照は拒否される。
     #[cfg(unix)]
     #[test]
-    fn req39_confine_rejects_linked_parent_outside_root() {
+    fn req39_open_confined_rejects_linked_parent_outside_root() {
         let root = root();
         let link = root.join("escape");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink("/etc", &link).unwrap();
-        assert!(confine(&root, Path::new("escape/passwd")).is_err());
+        assert!(open_confined(&root, Path::new("escape/passwd")).is_err());
     }
 
     /// REQ-21: 非 UTF-8 の引数は panic せず InvalidInput の ErrorReport になる。
