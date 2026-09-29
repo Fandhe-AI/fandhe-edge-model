@@ -107,6 +107,9 @@ pub enum CapacityError {
     SymlinkRejected { path: PathBuf },
     /// 通常ファイル以外・I/O エラー。
     File(FsError),
+    /// ハンドル由来のファイル同一性を取得できない環境（Unix 以外）で、重複がないことを
+    /// 証明できない複数ファイルの計測を求められた。近似せず fail-closed で拒否する（REQ-39）。
+    IdentityUnavailable,
     /// 合計が `u64`（またはファイル数が `u32`）を超えた。
     Overflow,
 }
@@ -122,6 +125,10 @@ impl fmt::Display for CapacityError {
                 write!(f, "package file is a symlink: {}", path.display())
             }
             CapacityError::File(e) => write!(f, "{e}"),
+            CapacityError::IdentityUnavailable => write!(
+                f,
+                "file identity is unavailable on this platform; cannot verify duplicates"
+            ),
             CapacityError::Overflow => write!(f, "package size counters overflow"),
         }
     }
@@ -160,6 +167,7 @@ impl CapacityError {
                 "package file is not a regular file"
             }
             CapacityError::File(_) => "package file is not readable",
+            CapacityError::IdentityUnavailable => "file identity is unavailable on this platform",
             CapacityError::Overflow => "package size counters overflow",
         };
         text.to_string()
@@ -348,7 +356,8 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
 ///
 /// 制約（REQ-39）: 同一ファイルの重複検出（[`CapacityError::DuplicatePath`]）は Unix
 /// （デバイス・inode）のみ。Unix 以外ではハンドルの同一性を標準ライブラリだけでは取得できない
-/// ため重複判定を行わず、そのまま合算する（M10 時点で対象外。呼び出し側が重複を避けること）。
+/// ため、重複がないことを証明できない複数ファイル（2 件以上）は近似せず
+/// [`CapacityError::IdentityUnavailable`] で拒否する（fail-closed。M10 時点で対象外）。
 pub fn measure_opened_files(
     files: &[(PackageComponent, PathBuf, std::fs::File)],
 ) -> Result<CapacityBreakdown, CapacityError> {
@@ -381,6 +390,9 @@ pub fn measure_opened_files(
         #[cfg(not(unix))]
         {
             let _ = (&mut seen, read_err);
+            if files.len() > 1 {
+                return Err(CapacityError::IdentityUnavailable);
+            }
         }
         sizes.push((*component, meta.len()));
     }
@@ -405,6 +417,17 @@ mod tests {
         );
         assert_eq!(b.component(Calibration).file_count, 0);
         assert_eq!(b.total_bytes(), 1549);
+    }
+
+    /// REQ-30・REQ-39: 同一性を取得できない環境の拒否は InvalidInput・固定文で報告される。
+    #[test]
+    fn req39_identity_unavailable_maps_to_invalid_input() {
+        let e = CapacityError::IdentityUnavailable;
+        assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(
+            e.public_message(),
+            "file identity is unavailable on this platform"
+        );
     }
 
     #[test]
@@ -465,9 +488,9 @@ mod tests {
         ]);
         #[cfg(unix)]
         assert!(matches!(dup, Err(CapacityError::DuplicatePath { .. })));
-        // Unix 以外は重複判定を行わず合算する（API 契約。doc 参照）
+        // Unix 以外は同一性を証明できないため複数件を拒否する（API 契約。doc 参照）
         #[cfg(not(unix))]
-        assert_eq!(dup.unwrap().total_bytes(), 8);
+        assert!(matches!(dup, Err(CapacityError::IdentityUnavailable)));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir_path);
     }

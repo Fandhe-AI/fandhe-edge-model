@@ -79,6 +79,7 @@ fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport
         return Err(replaced());
     }
     let opened = file.metadata().map_err(|e| read_failure(&path, e))?;
+    enforce_size_limit(&path, opened.len(), MAX_FILE_BYTES)?;
     let current = std::fs::metadata(&resolved).map_err(|_| replaced())?;
     if !same_file(&opened, &current) {
         return Err(replaced());
@@ -87,7 +88,8 @@ fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport
 }
 
 /// 2 つのメタデータが同一ファイルのものか（Unix ではデバイス・inode の一致）。
-/// Unix 以外は M10 時点で対象外のため、種別とサイズの一致で近似する（fail-closed 側の近似）。
+/// Unix 以外は標準ライブラリだけではハンドル由来のファイル ID を取れないため、近似せず
+/// 常に「同一と証明できない」として拒否する（fail-closed。M10 時点で対象外。REQ-39）。
 #[cfg(unix)]
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -95,8 +97,26 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    a.file_type() == b.file_type() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// 計測対象 1 ファイルの大きさの上限（バイト）。配布物の容量目安（40MB。REQ-30）を大きく
+/// 上回る値で、異常に大きい入力を開いたハンドルのメタデータ段階で拒否する（REQ-39）。
+const MAX_FILE_BYTES: u64 = 1 << 30;
+
+/// 開いたハンドルのサイズが `limit` を超えたら [`FsError::TooLarge`] で拒否する（REQ-39）。
+fn enforce_size_limit(path: &Path, size: u64, limit: u64) -> Result<(), ErrorReport> {
+    if size > limit {
+        return Err(capacity_error_report(&CapacityError::File(
+            FsError::TooLarge {
+                path: path.to_path_buf(),
+                size,
+                limit,
+            },
+        )));
+    }
+    Ok(())
 }
 
 /// 受け付ける引数の上限。構成要素の種類数（5）に余裕を持たせた値で、重複指定は計測コアが拒否する。
@@ -207,6 +227,15 @@ mod tests {
         assert!(open_confined(&root, Path::new("/etc/passwd")).is_err());
         assert!(open_confined(&root, Path::new("../x")).is_err());
         assert!(open_confined(&root, Path::new("sub/../../x")).is_err());
+    }
+
+    /// REQ-39: 上限を超えるサイズは LimitExceeded（終了コード 20）で拒否し、上限ちょうどは通す。
+    #[test]
+    fn req39_size_limit_rejects_oversized_file() {
+        let p = Path::new("x");
+        assert!(enforce_size_limit(p, 10, 10).is_ok());
+        let e = enforce_size_limit(p, 11, 10).unwrap_err();
+        assert_eq!(e.code, ExitCode::LimitExceeded);
     }
 
     /// REQ-39: 親ディレクトリ経由のリンクによるルート外参照は拒否される。
