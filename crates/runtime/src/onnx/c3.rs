@@ -12,7 +12,8 @@
 //! 1 系列（バッチ次元なし）について、埋め込み → 相互相関（左右に `k/2` のゼロ詰め。`k` は奇数で
 //! 出力長が系列長と一致）＋バイアス → ReLU → 詰め物位置（id=0）への大きな負値の加算 → 時間方向の
 //! 最大値 → 連結 → `Gemm` を f32 で計算し、最後だけ f64 で softmax する（[`super`] の「数値」）。
-//! 詰め物の埋め込み行は厳密に 0（読み込み時に検査）で、詰め物位置は最大値から除かれるため、
+//! 詰め物の埋め込み行は厳密に 0（読み込み時に検査）で、詰め物位置は負値の加算により最大値から外れる
+//! （ONNX と同じ f32 加算で計算する。REQ-32）ため、
 //! 系列長をそろえるためのパディングが結果へ混入しない。バッチ推論は 1 系列ずつ本関数を呼ぶだけ
 //! （[`crate::pipeline`]）。
 //!
@@ -351,12 +352,12 @@ impl C3Model {
                             acc += wv * xv;
                         }
                     }
-                    // 詰め物位置は最大値の候補から明示的に除外する。加算によるマスクでは
-                    // 有限でも巨大な重み・バイアスで詰め物位置が選ばれうる（REQ-28）
-                    if real {
-                        let relu = (acc + bias).max(0.0);
-                        best = best.max(relu);
-                    }
+                    // ONNX グラフと同じく、ReLU 出力へ詰め物位置のみ負値（-1e9）を加えてから最大値を取る。
+                    // 詰め物位置を無条件に除外すると、ReLU 出力が 1e9 を超える有限な重み・バイアスで
+                    // ONNX 側の最大値と食い違う（REQ-32 の推論一致）ため、加算の f32 演算まで揃える
+                    let relu = (acc + bias).max(0.0);
+                    let penalty = if real { 0.0 } else { self.neg_big };
+                    best = best.max(relu + penalty);
                 }
                 // 実トークンが 1 つも無い系列のみ、書き出し器のマスク値へ倒す（候補なしの -inf を出さない）
                 pooled.push(if best == f32::NEG_INFINITY {
@@ -398,6 +399,34 @@ impl C3Model {
 mod tests {
     use super::*;
     use crate::onnx::{ModelKind, OnnxBackend};
+
+    /// REQ-32: 詰め物位置の ReLU 出力が 1e9 を超える場合、ONNX（-1e9 加算後の ReduceMax）と同じく
+    /// 詰め物位置が最大値になりうる（無条件除外だとスコアがずれる）。
+    #[test]
+    fn req32_c3_padding_position_follows_onnx_additive_mask() {
+        let mut embed = vec![0.0f32; 257];
+        embed[1] = 1.0;
+        let m = C3Model {
+            emb: 1,
+            embed,
+            branches: vec![Branch {
+                kernel: 3,
+                filters: 1,
+                // 位置 t の出力は x[t+1] のみを見る（t=0 の詰め物位置は実トークン 1 の値 1e10 を受ける）
+                weight: vec![0.0, 0.0, 1e10],
+                bias: vec![0.0],
+            }],
+            neg_big: MASK_NEG_VALUE,
+            out_w: vec![1.0, 0.0],
+            out_b: vec![0.0, 0.0],
+            n_classes: 2,
+        };
+        // ONNX: 詰め物位置 = 1e10 - 1e9 = 9e9、実位置 = 0 → 最大 9e9 → logits [9e9, 0] → softmax [1, 0]
+        let s = m
+            .scores_within(&[0, 1], MAX_INFER_DURATION)
+            .expect("scores");
+        assert_eq!(s, vec![1.0, 0.0]);
+    }
 
     /// REQ-39: 時間上限 0 では最初の位置で打ち切られる（超過時に打ち切れる経路）。
     #[test]
