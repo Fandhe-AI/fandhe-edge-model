@@ -28,7 +28,7 @@ use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::{ArtifactOnnxRef, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::fs::read_open_file_bounded;
+use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_guard::format::{CheckedFile, FormatAllowlist, FormatRejection, check_open_file};
 use fandhe_edge_guard::model_file::MODEL_FILE_EXTENSION;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
@@ -64,11 +64,11 @@ pub fn guard_infer_paths(
     args: &InferArgs,
 ) -> Result<GuardedInferInputs, ErrorReport> {
     let package = confine_package(workspace, &args.package).map_err(|e| e.to_error_report())?;
-    let (mut meta_file, _) = package
+    let (meta_file, _) = package
         .open_member(Path::new(ARTIFACT_META_FILE))
         .map_err(|e| e.to_error_report())?;
-    let bytes = read_open_file_bounded(
-        &mut meta_file,
+    let bytes = read_bounded_open_file(
+        meta_file,
         Path::new(ARTIFACT_META_FILE),
         MAX_ARTIFACT_META_BYTES,
     )
