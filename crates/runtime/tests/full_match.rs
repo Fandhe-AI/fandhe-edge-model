@@ -8,6 +8,7 @@
 //! （系列長・窓に敏感）で、650 件について 3 経路（単体・バッチ・評価器内）の予測ラベルを
 //! 突き合わせ、不一致 index の一覧が空であることを具体値で確認する（fail-closed）。
 //! 失敗メッセージは index・件数のみで入力本文を出さない（security.md）。
+//! 不一致を検出したら `docs/design/runtime-batch-mismatch-procedure.md`（REQ-28 異常系・TASK-28.2）に従う。
 
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_eval::input_only::{EvalItem, run_inference_input_only};

@@ -18,6 +18,8 @@
 //! - 超過の生成元となる上限との照合（`total_bytes > limit_bytes`。上限ちょうどは超過でない）は
 //!   TASK-30.2（#124）の責務で、本モジュールは [`LimitBreach`] を入力として受け取る。
 //!   #124 のマージ後に `measure_package` からの結線確認を行う
+//! - 待ち時間上限の検証済み型 `LatencyLimit` と照合 `check_latency_limit` は #129 で追加済み
+//!   （`latency_limit` モジュール）。定義ファイルへの取り込みは未実装
 //! - 利用者が設定する容量上限の定義ファイルへの取り込み（読み込みと範囲検証）は未実装
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
 //!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務
@@ -30,7 +32,8 @@
 //! p95 が上限を超える（`>`）ときだけ [`LimitBreach::Latency`] とし、上限ちょうど（`==`）は
 //! 合格とする。規則は [`LimitBreach::latency_if_exceeded`] の 1 箇所に集約し、
 //! TASK-31.2（#129）・TASK-31.3（#130）は再実装せずこれを再利用する。250ms は目安の
-//! 参考値であり、合否のしきい値としてここへ定数化しない。
+//! 参考値であり、合否のしきい値としてここへ定数化しない。上限ちょうどの扱いは、計測経路を通した
+//! 結合テスト（`tests/latency_limit_boundary.rs`。TASK-31.3・#130）で確認済み。
 //!
 //! infer 1 回ごとの処理時間上限（REQ-39 の資源上限。core の `infer_input` 等が
 //! `LimitExceeded` へ写す）は別の仕組みで、REQ-31 の p95 照合とは別物である。
@@ -76,7 +79,8 @@ pub enum LimitBreach {
 
 impl LimitBreach {
     /// p95 が上限を超える（`>`）ときだけ待ち時間超過を返す。上限ちょうどは超過でない
-    /// （REQ-31 の境界値・TASK-31.3）。
+    /// （REQ-31 の境界値・TASK-31.3）。計測経路を通した境界確認は
+    /// `tests/latency_limit_boundary.rs`（#130。証拠種別はテストハーネス）。
     ///
     /// 整数の比較のみで算術をしないため overflow・panic しない。上限値の範囲検証は
     /// 上限を取り込む側の責務。
