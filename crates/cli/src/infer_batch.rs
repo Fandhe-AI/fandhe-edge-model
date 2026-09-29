@@ -596,6 +596,12 @@ where
             }
         }
     };
+    // 計算スレッドを切り離した後は、どの失敗経路を通っても最後に必ず process::exit へ到達する
+    // （`?`・return で公開関数から戻らない。切り離したスレッドはプロセス終了でしか回収できない）。
+    if abandoned && policy.terminates() {
+        let watchdog = OutputWatchdog::arm(true, limits.output_duration);
+        std::process::exit(finish_abandoned(out, &outcome, watchdog));
+    }
     // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
     // 起動に失敗したら上限なしで書かず、何も書かずに Err（exit 70）で終える。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
@@ -613,18 +619,31 @@ where
             }
             Ok(ExitCode::Ok)
         }
-        Err(error) => {
-            let written = emit_error_report(out, &error);
-            if abandoned && policy.terminates() {
-                // 切り離した計算スレッド（ブロック中の Read・推論）はここでしか回収できない。
-                // 書いた行を失わないよう flush してからプロセスを終える。
-                let _ = out.flush();
-                let code = written.as_ref().map_or(ExitCode::RuntimeError, |c| *c);
-                std::process::exit(i32::from(code.code()));
-            }
-            written
-        }
+        Err(error) => emit_error_report(out, &error),
     }
+}
+
+/// 計算スレッドを切り離した後の終了処理。ErrorReport を書いて flush し、終了コード（常に
+/// `limit_exceeded` の 20。時間上限の超過）を返す。呼び出し側が `process::exit` する。
+///
+/// ウォッチドッグの起動に失敗している（`watchdog` が `Err`）場合は、停止した出力先への書き込みを
+/// 中断できないため ErrorReport を書かず、終了コードだけで返す（無期限に待たない。REQ-39）。
+/// 書き込みの間はウォッチドッグを保持し、停止を終了へ倒す。
+fn finish_abandoned<W: Write>(
+    out: &mut W,
+    outcome: &Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport>,
+    watchdog: io::Result<Option<OutputWatchdog>>,
+) -> i32 {
+    if let Ok(_guard) = watchdog {
+        // 切り離した場合の outcome は常に Err(limit_exceeded)。念のため同じ報告にする。
+        let error = match outcome {
+            Err(error) => error.clone(),
+            Ok(_) => report(ExitCode::LimitExceeded),
+        };
+        let _ = emit_error_report(out, &error);
+        let _ = out.flush();
+    }
+    i32::from(ExitCode::LimitExceeded.code())
 }
 
 #[cfg(test)]
@@ -847,5 +866,21 @@ mod tests {
         let text = String::from_utf8(out.0).unwrap();
         assert_eq!(text.matches('\n').count(), 2);
         assert!(!text.contains("\"code\""));
+    }
+
+    /// REQ-39: 切り離しの後は、ウォッチドッグの起動に失敗しても終了コードは 20 で、停止しうる
+    /// 書き込みはしない。起動できていれば ErrorReport を 1 行書いて 20。
+    #[test]
+    fn req39_finish_abandoned_always_yields_limit_exceeded_exit_code() {
+        let outcome = Err(report(ExitCode::LimitExceeded));
+        let mut out: Vec<u8> = Vec::new();
+        let code = finish_abandoned(&mut out, &outcome, Err(io::Error::other("spawn failed")));
+        assert_eq!(code, 20);
+        assert!(out.is_empty());
+        let code = finish_abandoned(&mut out, &outcome, Ok(None));
+        assert_eq!(code, 20);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.starts_with("{\"code\":\"limit_exceeded\""));
     }
 }

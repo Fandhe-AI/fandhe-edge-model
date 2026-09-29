@@ -427,7 +427,10 @@ fn req39_cli_process_exits_20_when_output_stalls() {
             },
         );
         // ウォッチドッグが先に終了させるため、ここへは戻らない。
-        std::process::exit(if result.is_ok() { 0 } else { 70 });
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 70,
+        });
     }
     let exe = std::env::current_exe().expect("current exe");
     let started = std::time::Instant::now();
@@ -485,7 +488,10 @@ fn req39_cli_process_exits_at_deadline_when_inference_stalls() {
                 ..BatchLimits::default()
             },
         );
-        std::process::exit(if result.is_ok() { 0 } else { 70 });
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 70,
+        });
     }
     let exe = std::env::current_exe().expect("current exe");
     let started = std::time::Instant::now();
@@ -508,14 +514,14 @@ fn req39_cli_process_exits_at_deadline_when_inference_stalls() {
     );
 }
 
-/// `f` は推論失敗、`s` は 60 ms 止まる（期限をまたぐ）バックエンド。
+/// `f` は推論失敗、`s` は 500 ms 止まる（期限をまたぐ）バックエンド。
 struct FailOrSlow;
 impl ScoringBackend for FailOrSlow {
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         match ids.as_slice().first().copied() {
             Some(102) => Err(BackendError::Failed),
             Some(115) => {
-                std::thread::sleep(Duration::from_millis(60));
+                std::thread::sleep(Duration::from_millis(500));
                 Ok(vec![0.5, 0.25, 0.25])
             }
             _ => Ok(vec![0.5, 0.25, 0.25]),
@@ -554,9 +560,9 @@ fn predict_with_deadline(inputs: &[&str], deadline_ms: u64) -> Result<usize, Exi
 /// `runtime_error` を採る（後続の `limit_exceeded` に上書きしない）。
 #[test]
 fn req33_earlier_record_failure_wins_over_later_batch_limit() {
-    // r0 は失敗、r1 は 60 ms 止まり期限（30 ms）を超えて、r2 の位置で期限超過になる。
+    // r0 は失敗、r1 は 500 ms 止まり期限（250 ms）を超えて、r2 の位置で期限超過になる。
     assert_eq!(
-        predict_with_deadline(&["f", "s", "a"], 30),
+        predict_with_deadline(&["f", "s", "a"], 250),
         Err(ExitCode::RuntimeError)
     );
 }
@@ -566,7 +572,7 @@ fn req33_earlier_record_failure_wins_over_later_batch_limit() {
 #[test]
 fn req33_earlier_batch_limit_wins_over_later_record_failure() {
     assert_eq!(
-        predict_with_deadline(&["s", "a", "f"], 30),
+        predict_with_deadline(&["s", "a", "f"], 250),
         Err(ExitCode::LimitExceeded)
     );
 }
@@ -616,7 +622,10 @@ fn req39_cli_process_exits_20_with_error_when_reader_stalls() {
                 ..BatchLimits::default()
             },
         );
-        std::process::exit(if result.is_ok() { 0 } else { 70 });
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 70,
+        });
     }
     let (code, stdout, elapsed) = run_in_child(
         "req39_cli_process_exits_20_with_error_when_reader_stalls",
@@ -637,7 +646,7 @@ fn req39_cli_process_exits_20_with_no_rows_when_compute_exceeds_deadline() {
     struct Slow;
     impl ScoringBackend for Slow {
         fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(400));
             Ok(vec![0.5, 0.25, 0.25])
         }
         fn scores_limited(
@@ -671,7 +680,10 @@ fn req39_cli_process_exits_20_with_no_rows_when_compute_exceeds_deadline() {
                 ..BatchLimits::default()
             },
         );
-        std::process::exit(if result.is_ok() { 0 } else { 70 });
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 70,
+        });
     }
     let (code, stdout, elapsed) = run_in_child(
         "req39_cli_process_exits_20_with_no_rows_when_compute_exceeds_deadline",

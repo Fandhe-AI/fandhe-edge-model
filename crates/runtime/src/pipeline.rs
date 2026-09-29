@@ -20,6 +20,17 @@
 //! - 実装は呼び出し間で結果に影響する状態を持たないこと（REQ-28）。trait は `&self` だが
 //!   内部可変性は型で塞げないため契約として明記する
 //!
+//! # 時間上限の責務（REQ-39・REQ-32）
+//!
+//! 本 crate は同期のライブラリで、スレッドもプロセスも持たない依存最小の推論 SDK である。
+//! `infer_batch`・`infer_batch_until`・`infer_batch_partial_until` の期限は「件と件の間で確認する
+//! 協調的な期限」で、**1 件の処理そのものが止まった場合の上限は保証しない**（期限超過後に完了した
+//! 1 件を成功として返さないことだけを保証する）。止まった 1 件を回収する実行境界を本 crate に
+//! 設けると、回収できないスレッドが公開 API に移るだけになるため設けない。強制的な時間上限が要る
+//! 呼び出し元は、プロセス境界で強制する CLI を子プロセスとして使う（または同様にプロセスで隔離
+//! する）。CLI は計算スレッドの期限待ちとプロセス終了で上限を強制する（`fandhe-edge-cli` の
+//! `infer_batch`。REQ-33・REQ-39）。
+//!
 //! # 終了コードとの関係
 //!
 //! エラーの 7 種終了コードへの写像は CLI 側（TASK-33.x）の責務で、本モジュールは
@@ -323,6 +334,10 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
     /// 結果スコアの総数が上限を超えたら、以降を処理せずバッチ全体を失敗とする。
     /// 1 件の失敗は他要素へ波及しない。
     /// 処理時間は [`MAX_INFER_BATCH_DURATION`] で打ち切る（REQ-39）。
+    ///
+    /// 期限は件と件の間で確認する協調的なもので、1 件の処理が止まった場合の上限は保証しない
+    /// （モジュール doc「時間上限の責務」）。強制的な時間上限が要る呼び出し元は、CLI を子プロセス
+    /// として使うなど、プロセスで隔離すること（REQ-39・REQ-32）。
     pub fn infer_batch(&self, inputs: &[&str]) -> Result<BatchResult, BatchError> {
         let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
         self.infer_batch_until(inputs, deadline)
@@ -330,7 +345,8 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
 
     /// [`Self::infer_batch`] の期限を指定できる版。`deadline` が `None` なら期限なし
     /// （`Instant` の加算がオーバーフローした場合のみ。呼び出し側は通常 `Some` を渡す）。
-    /// 期限は各件の処理の前に確認し、超過なら `DeadlineExceeded` を返す。
+    /// 期限は各件の処理の前後に確認する協調的なもので（1 件の処理が止まった場合の上限は保証
+    /// しない。モジュール doc「時間上限の責務」）、超過なら `DeadlineExceeded` を返す。
     ///
     /// 処理は [`Self::infer_batch_partial_until`] と同じで、バッチ全体の失敗があれば部分結果を
     /// 捨てて `Err` にする。
