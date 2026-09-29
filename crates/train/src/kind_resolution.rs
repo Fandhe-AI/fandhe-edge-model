@@ -40,7 +40,7 @@ use serde_json::{Map, Value};
 use crate::error::TrainRequestError;
 use crate::kind_defaults;
 use crate::request::{Device, TrainRequest, TrainRequestParams};
-use crate::search::{MAX_SEARCH_CANDIDATES, SearchCandidate};
+use crate::search::{MAX_SEARCH_CANDIDATES, SearchCandidate, validate_candidate_id};
 
 /// 既定候補の共有 fixture（Python 側の選択口との一致は
 /// `trainer/tests/test_default_candidates_fixture.py` が照合する）。
@@ -144,6 +144,10 @@ pub enum KindResolutionError {
     DefaultCandidatesUnavailable { reason: String },
     /// 組み立てた学習リクエストの構文検査に失敗した。
     InvalidParams(TrainRequestError),
+    /// 明示した `kind` が候補 ID として不正（空・`MAX_CANDIDATE_ID_BYTES` 超過・
+    /// 制御文字を含む）。`run_search` が同じ規則で拒否するため、解決時点で
+    /// 先に `invalid_input` にする。`kind` の内容はメッセージに含めない。
+    InvalidKindId,
 }
 
 impl std::fmt::Display for KindResolutionError {
@@ -153,6 +157,7 @@ impl std::fmt::Display for KindResolutionError {
                 write!(f, "default candidates are unavailable: {reason}")
             }
             Self::InvalidParams(e) => write!(f, "invalid train parameters: {e}"),
+            Self::InvalidKindId => write!(f, "kind is not a valid candidate id"),
         }
     }
 }
@@ -167,7 +172,10 @@ impl KindResolutionError {
         use fandhe_edge_core::exitcode::ExitCode;
         match self {
             Self::DefaultCandidatesUnavailable { .. } => ExitCode::RuntimeError,
-            Self::InvalidParams(_) => ExitCode::InvalidInput,
+            Self::InvalidParams(TrainRequestError::ConfigTooLarge { .. }) => {
+                ExitCode::LimitExceeded
+            }
+            Self::InvalidParams(_) | Self::InvalidKindId => ExitCode::InvalidInput,
         }
     }
 
@@ -177,6 +185,7 @@ impl KindResolutionError {
         match self {
             Self::DefaultCandidatesUnavailable { .. } => "default_candidates_unavailable",
             Self::InvalidParams(_) => "invalid_request",
+            Self::InvalidKindId => "invalid_kind",
         }
     }
 }
@@ -273,6 +282,9 @@ pub fn resolve_kind_candidates(
 ) -> Result<KindResolution, KindResolutionError> {
     match explicit {
         Some(e) => {
+            if !validate_candidate_id(&e.kind) {
+                return Err(KindResolutionError::InvalidKindId);
+            }
             let params = build_params(
                 &common,
                 e.kind.clone(),
@@ -414,6 +426,41 @@ mod tests {
         assert!(
             parse_default_candidates(r#"{"default_candidates":[{"kind":"c3","kind_version":1}]}"#)
                 .is_ok()
+        );
+    }
+
+    /// REQ-19・REQ-39: 候補 ID として不正な明示 kind は解決時に invalid_input。
+    #[test]
+    fn req19_explicit_kind_invalid_candidate_id_is_rejected() {
+        for kind in [
+            "x".repeat(crate::search::MAX_CANDIDATE_ID_BYTES + 1),
+            "a\nb".to_string(),
+        ] {
+            let err = resolve_kind_candidates(
+                Some(ExplicitKind {
+                    kind,
+                    kind_version: 1,
+                    config: Map::new(),
+                }),
+                common(),
+            )
+            .unwrap_err();
+            assert_eq!(err.reason_code(), "invalid_kind");
+            assert_eq!(
+                err.exit_code(),
+                fandhe_edge_core::exitcode::ExitCode::InvalidInput
+            );
+        }
+    }
+
+    /// REQ-21: config 過大は limit_exceeded（20）。
+    #[test]
+    fn req21_config_too_large_maps_to_limit_exceeded() {
+        let err =
+            KindResolutionError::InvalidParams(TrainRequestError::ConfigTooLarge { limit: 1 });
+        assert_eq!(
+            err.exit_code(),
+            fandhe_edge_core::exitcode::ExitCode::LimitExceeded
         );
     }
 

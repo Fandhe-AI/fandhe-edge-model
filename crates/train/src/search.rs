@@ -775,7 +775,7 @@ impl<E> SearchError<E> {
 }
 
 /// 候補 ID の検証（非空・[`MAX_CANDIDATE_ID_BYTES`] 以下・制御文字なし）。
-fn validate_candidate_id(id: &str) -> bool {
+pub(crate) fn validate_candidate_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_CANDIDATE_ID_BYTES && !id.chars().any(|c| c.is_control())
 }
 
