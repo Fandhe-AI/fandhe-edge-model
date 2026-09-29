@@ -2,7 +2,8 @@
 //!
 //! 証拠の種別: テストハーネス（Linux x86_64・CPU）。数値の出典は PoC-19 の
 //! 実機結果（`jobs/threeseed/result.json`。CPU device）で、GPU（Metal / MLX）
-//! での同じ結論の再確認は本テストの範囲外（issue #105）。
+//! での同じ結論の再確認は人間担当の作業（#103 の人の対応予定）で未実施。
+//! CPU 決定性は `tests/reproducibility_determinism.rs`（issue #105）で確認する。
 
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_eval::reproducibility::{OverlapVerdict, SeedRun, judge_reproducibility};
