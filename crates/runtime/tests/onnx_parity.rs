@@ -84,48 +84,65 @@ fn check_kind(kind: ModelKind) {
     assert!(distinct.len() >= 2, "{}: labels not diverse", kind.as_str());
 
     // 単体推論: MLX ラベルと全件一致
-    let mut mismatched: Vec<String> = Vec::new();
+    // 以降の 4 種の比較（MLX ラベル・確率差・バッチ・評価器用関数）はすべて集計してから
+    // 最後に 1 回だけ失敗させ、1 回の実行で全種の不一致件数を得られるようにする
+    // （docs/design/runtime-batch-mismatch-procedure.md）。記録するのはケース名と件数のみ。
+    let mut label_mismatched: Vec<String> = Vec::new();
+    let mut score_count_mismatched: Vec<String> = Vec::new();
     let mut max_diff = 0.0f64;
     let mut singles = Vec::new();
     for c in &cases {
         let p = pipeline.infer_one(&c.input).expect("infer_one");
         if p.label_index() != c.label {
-            mismatched.push(c.name.clone());
+            label_mismatched.push(c.name.clone());
         }
-        assert_eq!(p.scores().len(), c.probs.len(), "{}: score count", c.name);
+        if p.scores().len() != c.probs.len() {
+            score_count_mismatched.push(c.name.clone());
+        }
         for (a, b) in p.scores().iter().zip(&c.probs) {
             max_diff = max_diff.max((a - b).abs());
         }
         singles.push(p);
     }
-    assert!(
-        mismatched.is_empty(),
-        "{}: {} of {} labels differ from MLX: {:?}",
-        kind.as_str(),
-        mismatched.len(),
-        cases.len(),
-        mismatched
-    );
-    assert!(
-        max_diff <= PROB_TOLERANCE,
-        "{}: max prob diff {max_diff} exceeds {PROB_TOLERANCE}",
-        kind.as_str()
-    );
 
     // REQ-28: バッチ推論・評価器用関数が単体推論と全件一致（スコアも同一）
     let inputs: Vec<&str> = cases.iter().map(|c| c.input.as_str()).collect();
     let batch = pipeline.infer_batch(&inputs).expect("infer_batch");
     let predict = pipeline.as_predict_fn();
+    let mut batch_mismatched: Vec<String> = Vec::new();
+    let mut fn_mismatched: Vec<String> = Vec::new();
     for ((c, single), b) in cases.iter().zip(&singles).zip(&batch) {
         let b = b.as_ref().expect("batch item");
-        assert_eq!(b, single, "{}: batch differs from single", c.name);
+        if b != single {
+            batch_mismatched.push(c.name.clone());
+        }
         let via_fn = predict(&c.input).expect("predict fn");
-        assert_eq!(
-            &via_fn, single,
-            "{}: predict fn differs from single",
-            c.name
-        );
+        if &via_fn != single {
+            fn_mismatched.push(c.name.clone());
+        }
     }
+
+    let mut failures: Vec<String> = Vec::new();
+    let total = cases.len();
+    for (what, list) in [
+        ("labels differ from MLX", &label_mismatched),
+        ("score count differs from MLX", &score_count_mismatched),
+        ("batch differs from single", &batch_mismatched),
+        ("predict fn differs from single", &fn_mismatched),
+    ] {
+        if !list.is_empty() {
+            failures.push(format!("{what}: {} of {total} cases: {list:?}", list.len()));
+        }
+    }
+    if max_diff > PROB_TOLERANCE {
+        failures.push(format!("max prob diff {max_diff} exceeds {PROB_TOLERANCE}"));
+    }
+    assert!(
+        failures.is_empty(),
+        "{}: {}",
+        kind.as_str(),
+        failures.join("; ")
+    );
 }
 
 /// REQ-32 正常系: C1 の書き出し ONNX を推論ランタイムで読み、MLX 内推論と予測ラベルが全件一致する。
