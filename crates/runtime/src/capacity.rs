@@ -97,10 +97,10 @@ pub struct CapacityBreakdown {
 pub enum CapacityError {
     /// 計測対象が 1 件も無い。
     EmptyPackage,
-    /// 同じファイルが複数回渡された（正規化パスで判定し、`a` と `./a` の別表記も検出する。
-    /// ハードリンクの別名は検出しない）。
+    /// 同じファイルが複数回渡された（開いたハンドルの同一性で判定し、Unix では `a` と `./a`
+    /// の別表記・ハードリンクの別名も検出する）。
     DuplicatePath { path: PathBuf },
-    /// 構成要素が symlink だった。
+    /// 構成要素が symlink だった、または検査後に別ファイルへ差し替えられた。
     SymlinkRejected { path: PathBuf },
     /// 通常ファイル以外・I/O エラー。
     File(FsError),
@@ -202,13 +202,41 @@ pub struct PackageFile {
     pub path: PathBuf,
 }
 
+/// 開いたファイルハンドル自体の同一性（重複判定の鍵）。
+///
+/// Unix では (デバイス, inode)。パスの別表記・ハードリンクの別名を同一ファイルとして
+/// 検出できる。それ以外の OS（M10 時点で対象外）では、開いた後に正規化したパスで代用する。
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(not(unix))]
+type FileId = PathBuf;
+
+#[cfg(unix)]
+fn file_id(_path: &std::path::Path, meta: &std::fs::Metadata) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::io::Result<FileId> {
+    std::fs::canonicalize(path)
+}
+
 /// 実ファイルのサイズを構成要素ごとに集計する。中身は読まない。
 ///
-/// symlink は拒否し、通常ファイル検証つきで開いたハンドルの `metadata().len()` を使う。
-/// symlink 確認から開くまでの差し替え（TOCTOU）は残るが、`open_regular_file_for_read` が
-/// 開いた後に種別を再確認し、FIFO 等で停止しない。
+/// symlink は拒否する。検査から計測までの間にパスが差し替えられても（TOCTOU。REQ-39）
+/// 検証済み以外のファイルを計上しないよう、次の順で行う。
+///
+/// 1. `symlink_metadata` で symlink を拒否し、そのメタデータを控える
+/// 2. `open_regular_file_for_read` で通常ファイル検証つきに開く（FIFO 等で停止しない）
+/// 3. 開いたハンドルの `fstat` 相当（`file.metadata()`）が 1 と同一のファイルであること
+///    （Unix ではデバイス・inode の一致）を確認し、不一致なら symlink 差し替えとして拒否する
+/// 4. サイズと重複判定の鍵は、パスではなく開いたハンドルから得る
+///
+/// 重複判定は Unix ではハンドルの (デバイス, inode) で行うため、`a` と `./a` の別表記や
+/// ハードリンクの別名も [`CapacityError::DuplicatePath`] になる。
 pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, CapacityError> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: HashSet<FileId> = HashSet::new();
     let mut sizes = Vec::with_capacity(files.len());
     for f in files {
         let read_err = |source| {
@@ -217,23 +245,32 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
                 source,
             })
         };
-        let meta = std::fs::symlink_metadata(&f.path).map_err(read_err)?;
-        if meta.file_type().is_symlink() {
+        let link_meta = std::fs::symlink_metadata(&f.path).map_err(read_err)?;
+        if link_meta.file_type().is_symlink() {
             return Err(CapacityError::SymlinkRejected {
                 path: f.path.clone(),
             });
         }
-        // `a.onnx` と `./a.onnx` のような別表記の同一ファイルも重複として検出するため、
-        // 正規化（親ディレクトリの symlink 解決を含む）した絶対パスで判定する。
-        let canonical = std::fs::canonicalize(&f.path).map_err(read_err)?;
-        if !seen.insert(canonical) {
+        let file = open_regular_file_for_read(&f.path)?;
+        let meta = file.metadata().map_err(read_err)?;
+        let opened_id = file_id(&f.path, &meta).map_err(read_err)?;
+        let checked_id = file_id(&f.path, &link_meta).map_err(read_err)?;
+        // 検査後に別ファイル（symlink 先など）へ差し替えられていたら、検証済みの
+        // 対象ではないため計測しない。
+        #[cfg(unix)]
+        if opened_id != checked_id {
+            return Err(CapacityError::SymlinkRejected {
+                path: f.path.clone(),
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = checked_id;
+        if !seen.insert(opened_id) {
             return Err(CapacityError::DuplicatePath {
                 path: f.path.clone(),
             });
         }
-        let file = open_regular_file_for_read(&f.path)?;
-        let len = file.metadata().map_err(read_err)?.len();
-        sizes.push((f.component, len));
+        sizes.push((f.component, meta.len()));
     }
     CapacityBreakdown::from_sizes(sizes)
 }
