@@ -70,6 +70,9 @@ impl Groupable for SplitGroupable {
     fn label(&self) -> &str {
         &self.label
     }
+    fn input(&self) -> &[u8] {
+        &[]
+    }
 }
 
 /// `VALIDATION_RECORD_IDS` を validation split の record_ids として持つ

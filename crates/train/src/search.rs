@@ -1818,6 +1818,9 @@ mod tests {
         fn label(&self) -> &str {
             "positive"
         }
+        fn input(&self) -> &[u8] {
+            &[]
+        }
     }
 
     /// [`make_record_ids`] と同じ `["r0", "r1", ...]` を validation split の

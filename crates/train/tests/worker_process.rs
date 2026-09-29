@@ -829,6 +829,9 @@ impl fandhe_edge_data::split::Groupable for SplitItem {
     fn label(&self) -> &str {
         "a"
     }
+    fn input(&self) -> &[u8] {
+        &[]
+    }
 }
 
 /// `record_ids` を validation split として持つ凍結記録を作る（比率 validation: 1.0）。

@@ -46,6 +46,13 @@ pub trait Groupable {
     /// group 内の最頻ラベルを group の代表ラベルとして扱う
     /// （PoC-9 の `group_intent` 相当）。
     fn label(&self) -> &str;
+
+    /// レコードの入力（byte 列。README「入力表現は byte のみ」）。
+    ///
+    /// 分割記録の**中身のハッシュ**（[`crate::split_record::content_sha256_hex`]。
+    /// id・input・正解ラベル〔[`label`](Self::label)〕を束ねる。REQ-17・REQ-27）
+    /// の入力にだけ使う。分割の割付そのものには影響しない。
+    fn input(&self) -> &[u8];
 }
 
 /// 分割先（REQ-17: train / validation / test の 3 分割）。
@@ -605,6 +612,9 @@ mod tests {
         }
         fn label(&self) -> &str {
             &self.label
+        }
+        fn input(&self) -> &[u8] {
+            self.id.as_bytes()
         }
     }
 
