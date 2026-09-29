@@ -271,13 +271,18 @@ fn build_params(
 /// 1 つのパス構成要素の最大バイト数（POSIX の `NAME_MAX`。Linux・macOS で 255）。
 const MAX_PATH_COMPONENT_BYTES: usize = 255;
 
+/// 学習ワーカーの `prepare_out_dir` が作る一時兄弟ディレクトリ名 `.{name}.tmp-<16hex>` が
+/// 元の名前へ足すバイト数（先頭 `.` 1 + `.tmp-` 5 + 16 進 16 = 22）。
+/// 名前の上限検査はこの分も含めて行う（`trainer/.../contract.py` の `_tmp_name_prefix` と揃える）。
+const TMP_SIBLING_OVERHEAD_BYTES: usize = 22;
+
 /// `out_dir` の最後の構成要素へ `-{kind}` を付けた出力先を返す。
 ///
 /// 末尾の `/`・`.` を正規化してから最後の構成要素へ接尾辞を付け、親ディレクトリは
 /// 元の `out_dir` と同じに保つ（`out/`・`out/.` を単純連結すると `out/-c1`・`out/.-c1`
 /// になり、未作成の `out` が親になって学習ワーカーが `invalid_path` を返すため）。
-/// 最後の構成要素が無い（`..`・`/` 等）場合、または接尾辞付与後の構成要素が
-/// [`MAX_PATH_COMPONENT_BYTES`] を超える場合は `InvalidParams` として拒否する（REQ-39）。
+/// 最後の構成要素が無い（`..`・`/` 等）場合、または接尾辞付与後の構成要素に一時兄弟名の
+/// 増分（[`TMP_SIBLING_OVERHEAD_BYTES`]）を足した長さが [`MAX_PATH_COMPONENT_BYTES`] を超える場合は `InvalidParams` として拒否する（REQ-39）。
 /// `out_dir` は POSIX 形式の文字列なので、結果は `/` 区切りで組み立てる。
 fn suffixed_out_dir(out_dir: &str, kind: &str) -> Result<String, KindResolutionError> {
     let invalid =
@@ -294,7 +299,7 @@ fn suffixed_out_dir(out_dir: &str, kind: &str) -> Result<String, KindResolutionE
     let leaf = format!("{name}-{kind}");
     // 接尾辞で構成要素が名前長の上限を超えると、明示 kind なら使える出力先でも
     // 学習ワーカーのディレクトリ作成が OS エラーになるため、ここで拒否する。
-    if leaf.len() > MAX_PATH_COMPONENT_BYTES {
+    if leaf.len() + TMP_SIBLING_OVERHEAD_BYTES > MAX_PATH_COMPONENT_BYTES {
         return Err(invalid());
     }
     let mut result = String::new();
@@ -472,8 +477,8 @@ mod tests {
         }
         assert!(suffixed_out_dir("..", "c1").is_err());
         assert!(suffixed_out_dir("a/..", "c1").is_err());
-        // 接尾辞付与後にちょうど上限なら受理し、1 バイト超過なら拒否する。
-        let fit = "x".repeat(MAX_PATH_COMPONENT_BYTES - "-c1".len());
+        // 一時兄弟名（+22 バイト）まで含めてちょうど上限なら受理し、1 バイト超過なら拒否する。
+        let fit = "x".repeat(MAX_PATH_COMPONENT_BYTES - TMP_SIBLING_OVERHEAD_BYTES - "-c1".len());
         assert_eq!(
             suffixed_out_dir(&format!("out/{fit}"), "c1").expect("ok"),
             format!("out/{fit}-c1")
