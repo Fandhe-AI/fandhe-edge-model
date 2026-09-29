@@ -167,6 +167,7 @@ from . import artifact as artifact_mod
 from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
+from .limits import MAX_RESULT_BYTES_WITH_VALIDATION
 
 #: 監視ループのポーリング間隔（秒）。
 _POLL_INTERVAL_SECONDS = 0.1
@@ -178,6 +179,11 @@ _TIME_LIMIT_GRACE_SECONDS = 5.0
 
 #: 子プロセスの標準出力の上限（bytes）。
 _MAX_WORKER_STDOUT_BYTES = 1 * 1024 * 1024
+
+#: `validation_inputs` を持つリクエストの子プロセス標準出力の上限（bytes）。
+#: 値は `limits.py::MAX_RESULT_BYTES_WITH_VALIDATION`（Rust 側の
+#: `MAX_RESULT_BYTES_WITH_VALIDATION` と同じ。共有 fixture で照合）。
+_MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION = MAX_RESULT_BYTES_WITH_VALIDATION
 
 #: `ps` の絶対パス（`shell=True` を使わず、`PATH` に依存しない）。
 _PS_BIN = "/bin/ps"
@@ -504,6 +510,13 @@ def run_supervised_train(request_path: Path) -> ExitCode:
 
     time_limit_seconds = request.time_limit_seconds
     rss_limit_bytes = request.rss_limit_bytes
+    # `validation_inputs` を持つリクエストだけ、予測列を含む結果 JSON のぶん
+    # 標準出力の保持上限を緩める（Rust 側 `TrainRequest::max_result_bytes` と同じ）。
+    stdout_cap = (
+        _MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION
+        if request.validation_inputs is not None
+        else _MAX_WORKER_STDOUT_BYTES
+    )
     # train_path・root の fd はスーパーバイザーには不要（_worker が独立に
     # 検証・open し直す）。out_dir の fd だけは、直後の予約のために保持する。
     request.train_path.close()
@@ -522,6 +535,7 @@ def run_supervised_train(request_path: Path) -> ExitCode:
             reservation,
             time_limit_seconds=float(time_limit_seconds),
             rss_limit_bytes=rss_limit_bytes,
+            stdout_cap=stdout_cap,
         )
     finally:
         reservation.entry.close()  # request.out_dir と同一オブジェクト
@@ -559,6 +573,7 @@ def _spawn_worker_and_finalize(
     *,
     time_limit_seconds: float,
     rss_limit_bytes: int,
+    stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
 ) -> ExitCode:
     # lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
     # 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕は PID
@@ -657,6 +672,7 @@ def _spawn_worker_and_finalize(
             reservation,
             time_limit_seconds=time_limit_seconds,
             rss_limit_bytes=rss_limit_bytes,
+            stdout_cap=stdout_cap,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -669,6 +685,7 @@ def _monitor_worker_and_finalize(
     *,
     time_limit_seconds: float,
     rss_limit_bytes: int,
+    stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
 ) -> ExitCode:
     """`_spawn_worker_and_finalize` が起動した `proc`（`_worker`）を監視し、
     結果に応じて `out_dir` の予約を確定または解放する（分離した理由:
@@ -679,7 +696,7 @@ def _monitor_worker_and_finalize(
     # 溜めずに読み進める。子プロセスがパイプを埋めてブロックするのを防ぐ。
     stdout_result: dict[str, Any] = {}
     reader_thread = threading.Thread(
-        target=_drain_stdout, args=(proc.stdout, stdout_result), daemon=True
+        target=_drain_stdout, args=(proc.stdout, stdout_result, stdout_cap), daemon=True
     )
     reader_thread.start()
 

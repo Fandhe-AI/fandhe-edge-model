@@ -90,9 +90,9 @@ use std::time::Instant;
 use fandhe_edge_core::exitcode::ExitCode;
 
 use crate::error::TrainProcessError;
-use crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS;
 #[cfg(unix)]
-use crate::limits::{MAX_RESULT_BYTES, MAX_WORKER_STDERR_BYTES};
+use crate::limits::MAX_WORKER_STDERR_BYTES;
+use crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS;
 use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
 
@@ -709,7 +709,8 @@ pub fn run_train(
     // ことがある）。
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_rx = stdout_pipe.map(|pipe| spawn_reader(pipe, MAX_RESULT_BYTES + 1));
+    let stdout_rx =
+        stdout_pipe.map(|pipe| spawn_reader(pipe, request.max_result_bytes().saturating_add(1)));
     let stderr_rx = stderr_pipe.map(|pipe| spawn_reader(pipe, MAX_WORKER_STDERR_BYTES));
 
     let deadline = started + limits.wall_timeout();

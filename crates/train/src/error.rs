@@ -77,6 +77,19 @@ pub enum TrainRequestError {
     InvalidPath { field: &'static str },
     /// `serde_json` による直列化に失敗した（通常到達しない防御的な分岐）。
     SerializeFailed,
+    /// `validation_inputs` が空配列（付けるなら 1 件以上）。
+    ValidationInputsEmpty,
+    /// `validation_inputs[index].id` が空、または
+    /// `fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES` を超える。
+    ValidationInputInvalidId { index: usize },
+    /// `validation_inputs[index].input` が
+    /// `fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES` を超える。
+    ValidationInputTooLarge { index: usize },
+    /// `validation_inputs` の `id`＋`input` の合計が
+    /// [`crate::limits::MAX_VALIDATION_INPUT_TOTAL_BYTES`] を超える。
+    ValidationInputsTotalBytesExceeded,
+    /// `validation_inputs[index].id` が先行する要素と重複する。
+    ValidationInputDuplicateId { index: usize },
 }
 
 impl std::fmt::Display for TrainRequestError {
@@ -163,6 +176,21 @@ impl std::fmt::Display for TrainRequestError {
             TrainRequestError::SerializeFailed => {
                 write!(f, "failed to serialize train request")
             }
+            TrainRequestError::ValidationInputsEmpty => {
+                write!(f, "validation_inputs must not be empty")
+            }
+            TrainRequestError::ValidationInputInvalidId { index } => {
+                write!(f, "validation_inputs[{index}].id is empty or too long")
+            }
+            TrainRequestError::ValidationInputTooLarge { index } => {
+                write!(f, "validation_inputs[{index}].input is too large")
+            }
+            TrainRequestError::ValidationInputsTotalBytesExceeded => {
+                write!(f, "validation_inputs total bytes exceed the limit")
+            }
+            TrainRequestError::ValidationInputDuplicateId { index } => {
+                write!(f, "validation_inputs[{index}].id is a duplicate")
+            }
         }
     }
 }
@@ -194,6 +222,11 @@ impl TrainRequestError {
             | TrainRequestError::InvalidDevice
             | TrainRequestError::InvalidTimeLimitSeconds
             | TrainRequestError::InvalidRssLimitBytes
+            | TrainRequestError::ValidationInputsEmpty
+            | TrainRequestError::ValidationInputInvalidId { .. }
+            | TrainRequestError::ValidationInputTooLarge { .. }
+            | TrainRequestError::ValidationInputsTotalBytesExceeded
+            | TrainRequestError::ValidationInputDuplicateId { .. }
             | TrainRequestError::SerializeFailed => "invalid_request",
         }
     }

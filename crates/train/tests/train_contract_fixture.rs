@@ -108,6 +108,22 @@ fn req39_limits_fixture_matches_rust_constants() {
         fixture["max_result_bytes"].as_u64(),
         Some(limits::MAX_RESULT_BYTES as u64)
     );
+    assert_eq!(
+        fixture["max_validation_input_bytes"].as_u64(),
+        Some(fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES as u64)
+    );
+    assert_eq!(
+        fixture["max_validation_id_bytes"].as_u64(),
+        Some(fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES as u64)
+    );
+    assert_eq!(
+        fixture["max_validation_input_total_bytes"].as_u64(),
+        Some(limits::MAX_VALIDATION_INPUT_TOTAL_BYTES as u64)
+    );
+    assert_eq!(
+        fixture["max_result_bytes_with_validation"].as_u64(),
+        Some(limits::MAX_RESULT_BYTES_WITH_VALIDATION as u64)
+    );
     let devices: Vec<String> = fixture["allowed_devices"]
         .as_array()
         .expect("allowed_devices must be an array")
@@ -365,4 +381,47 @@ fn req19_result_ok_config_matches_kind_defaults_fixture_merged_with_request_full
         result_ok["artifact"]["config"],
         Value::Object(expected_config)
     );
+}
+
+/// REQ-27・REQ-18: `request_with_validation.json` は `validation_inputs` を
+/// `{id,input}` の列として読み、JSON へ往復しても同じ値になる。
+/// 結果側 `result_ok_with_validation.json` は予測列を具体値で保ち、往復できる。
+#[test]
+fn req27_validation_request_and_result_round_trip_fixtures() {
+    let request_bytes = load_fixture_bytes("request_with_validation.json");
+    let request = TrainRequest::from_json_slice(&request_bytes)
+        .expect("request_with_validation.json must parse");
+    let inputs = request.validation_inputs().expect("validation_inputs");
+    let ids: Vec<&str> = inputs.iter().map(|v| v.id()).collect();
+    assert_eq!(ids, ["val-001", "val-002", "val-003"]);
+    assert_eq!(inputs[0].input(), "great product, works well");
+    assert_eq!(
+        request.max_result_bytes(),
+        limits::MAX_RESULT_BYTES_WITH_VALIDATION
+    );
+    let expected_request = load_fixture_value("request_with_validation.json");
+    let actual_request: Value =
+        serde_json::from_slice(&request.to_json_vec().expect("serialize")).expect("valid json");
+    assert_eq!(actual_request, expected_request);
+
+    let ok_line = String::from_utf8(load_fixture_bytes("result_ok_with_validation.json"))
+        .unwrap()
+        .replace('\n', "");
+    let outcome = TrainOutcome::from_worker_stdout(ok_line.as_bytes(), &request)
+        .expect("result_ok_with_validation.json must parse against the request");
+    let TrainOutcome::Ok(success) = &outcome else {
+        panic!("expected Ok");
+    };
+    let predictions = success.validation_predictions().expect("predictions");
+    assert_eq!(predictions.len(), 3);
+    assert_eq!(predictions[0].id(), "val-001");
+    assert_eq!(predictions[0].predicted_label(), Some("positive"));
+    assert_eq!(predictions[2].predicted_label(), None);
+    let actual = serde_json::to_value(&outcome).expect("serialize outcome");
+    assert_eq!(actual, load_fixture_value("result_ok_with_validation.json"));
+
+    // 予測列を要求していないリクエストに対する同じ結果は拒否される。
+    let plain = TrainRequest::from_json_slice(&load_fixture_bytes("request_full.json"))
+        .expect("request_full.json must parse");
+    assert!(TrainOutcome::from_worker_stdout(ok_line.as_bytes(), &plain).is_err());
 }

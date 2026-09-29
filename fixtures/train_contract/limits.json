@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "description": "Train request/result contract limits (REQ-18/19/34/39). Single source of truth is crates/train/src/limits.rs (fandhe-edge-train). Cross-checked by crates/train/tests/train_contract_fixture.rs against those constants, and by trainer/tests/test_train_contract_fixture.py against trainer/src/fandhe_edge_trainer/limits.py, contract.py::SCHEMA_VERSION, contract.py::_ALLOWED_DEVICES, and supervisor.py::_MAX_WORKER_STDOUT_BYTES. Do not relax values to make a test pass; both sides implement identical values independently and a mismatch here means an intentional design change, not a bug in one side."
+    "description": "Train request/result contract limits (REQ-18/19/34/39). Single source of truth is crates/train/src/limits.rs (fandhe-edge-train). Cross-checked by crates/train/tests/train_contract_fixture.rs against those constants, and by trainer/tests/test_train_contract_fixture.py against trainer/src/fandhe_edge_trainer/limits.py, contract.py::SCHEMA_VERSION, contract.py::_ALLOWED_DEVICES, supervisor.py::_MAX_WORKER_STDOUT_BYTES and _MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION. The max_validation_input_bytes / max_validation_id_bytes values are additionally cross-checked on the Rust side against fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES / judgment::MAX_INPUT_ID_BYTES. Do not relax values to make a test pass; both sides implement identical values independently and a mismatch here means an intentional design change, not a bug in one side."
   },
   "request_schema_version": 1,
   "max_request_bytes": 1048576,
@@ -14,5 +14,9 @@
   "max_train_wall_seconds": 3600,
   "max_train_rss_bytes": 8589934592,
   "max_result_bytes": 1048576,
+  "max_validation_input_bytes": 1048576,
+  "max_validation_id_bytes": 1024,
+  "max_validation_input_total_bytes": 67108864,
+  "max_result_bytes_with_validation": 67108864,
   "allowed_devices": ["cpu", "gpu"]
 }

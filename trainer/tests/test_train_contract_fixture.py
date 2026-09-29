@@ -61,6 +61,8 @@ _LIMITS = _load_json_fixture("limits.json")
 _DEFINITION = _load_json_fixture("definition.json")
 _REQUEST_FULL = _load_json_fixture("request_full.json")
 _REQUEST_MINIMAL = _load_json_fixture("request_minimal.json")
+_REQUEST_WITH_VALIDATION = _load_json_fixture("request_with_validation.json")
+_RESULT_OK_WITH_VALIDATION = _load_json_fixture("result_ok_with_validation.json")
 _REJECT_CASES = _load_json_fixture("request_reject_cases.json")
 _RESULT_OK = _load_json_fixture("result_ok.json")
 _RESULT_ERROR = _load_json_fixture("result_error.json")
@@ -85,6 +87,15 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
     from fandhe_edge_trainer import supervisor
 
     assert _LIMITS["max_result_bytes"] == supervisor._MAX_WORKER_STDOUT_BYTES
+    # 学習ジョブ内採点用の validation 入力（REQ-18・REQ-27。issue #84 PR #238）。
+    assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
+    assert _LIMITS["max_validation_id_bytes"] == limits.MAX_VALIDATION_ID_BYTES
+    assert _LIMITS["max_validation_input_total_bytes"] == limits.MAX_VALIDATION_INPUT_TOTAL_BYTES
+    assert _LIMITS["max_result_bytes_with_validation"] == limits.MAX_RESULT_BYTES_WITH_VALIDATION
+    assert (
+        _LIMITS["max_result_bytes_with_validation"]
+        == supervisor._MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION
+    )
     assert list(_LIMITS["allowed_devices"]) == list(contract._ALLOWED_DEVICES)
 
 
@@ -92,7 +103,51 @@ def test_req18_request_full_fixture_has_exactly_the_contract_fields() -> None:
     """REQ-18: `request_full.json` のキー集合が `contract.py::_REQUEST_FIELDS`
     と完全一致する（Python 側でフィールドが増減したら検出する）。
     """
-    assert set(_REQUEST_FULL.keys()) == contract._REQUEST_FIELDS
+    # `validation_inputs` は任意項目のため `request_full.json` には含めず、
+    # `request_with_validation.json` 側で全項目を網羅する。
+    assert set(_REQUEST_FULL.keys()) == contract._REQUEST_FIELDS - {"validation_inputs"}
+    assert set(_REQUEST_WITH_VALIDATION.keys()) == contract._REQUEST_FIELDS
+
+
+def test_req27_validate_request_accepts_validation_inputs_without_gold(tmp_path: Path) -> None:
+    """REQ-27: `request_with_validation.json` の `validation_inputs` が
+    `(id, input)` の列として検証を通り、正解ラベルを持たないこと。
+    """
+    resolved = _resolve_root(_REQUEST_WITH_VALIDATION, tmp_path)
+    req = contract.validate_request(resolved)
+    try:
+        assert req.validation_inputs == (
+            ("val-001", "great product, works well"),
+            ("val-002", "terrible, broke on day one"),
+            ("val-003", "it is fine"),
+        )
+    finally:
+        req.close_resources()
+
+
+def test_req18_validation_inputs_absent_resolves_to_none(tmp_path: Path) -> None:
+    """`validation_inputs` を省略したリクエストは `None`（採点なし）になる。"""
+    req = contract.validate_request(_resolve_root(_REQUEST_FULL, tmp_path))
+    try:
+        assert req.validation_inputs is None
+    finally:
+        req.close_resources()
+
+
+def test_req27_result_ok_with_validation_fixture_matches_request_ids() -> None:
+    """REQ-27: `result_ok_with_validation.json` は `result_ok.json` に
+    `validation_predictions` だけを足したもので、予測の `id` は
+    `request_with_validation.json` の `validation_inputs[].id` と同順・同件数、
+    各予測は `id`・`status`・`predicted_label` のみを持つ（`scores` は含めない）。
+    """
+    without = {k: v for k, v in _RESULT_OK_WITH_VALIDATION.items() if k != "validation_predictions"}
+    assert without == _RESULT_OK
+    predictions = _RESULT_OK_WITH_VALIDATION["validation_predictions"]
+    assert [p["id"] for p in predictions] == [
+        v["id"] for v in _REQUEST_WITH_VALIDATION["validation_inputs"]
+    ]
+    for prediction in predictions:
+        assert list(prediction) == ["id", "status", "predicted_label"]
 
 
 def _resolve_root(request_obj: dict, tmp_path: Path) -> dict:

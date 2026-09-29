@@ -3,7 +3,9 @@
 //! （REQ-18・REQ-19・REQ-39）。
 //!
 //! スキーマは `trainer/src/fandhe_edge_trainer/contract.py`（schema_version 1）
-//! と同じ 13 項目を持つ。値の検証は同モジュール・`limits.py`・`guard.py` の
+//! と同じ 13 項目に加え、任意項目 `validation_inputs`（学習ジョブ内での採点用
+//! validation 入力。`{id,input}` のみで正解ラベルは持たない。[`ValidationInput`]・
+//! REQ-27）を持つ。値の検証は同モジュール・`limits.py`・`guard.py` の
 //! 実装を書き起こしたもので、Python 側が返す `code`／終了コードと一致する
 //! ことを共有 fixture（`fixtures/train_contract/`）で照合する
 //! （`crates/train/tests/train_contract_fixture.rs`）。
@@ -21,12 +23,15 @@
 use std::collections::HashSet;
 
 use fandhe_edge_core::definition::{Definition, JudgmentType};
+use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
+use fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES;
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrainRequestError;
 use crate::limits::{
-    MAX_LABEL_BYTES, MAX_LABELS, MAX_MAX_BYTES, MAX_REQUEST_BYTES, MAX_SEED, MAX_TRAIN_RSS_BYTES,
-    MAX_TRAIN_WALL_SECONDS, MIN_LABELS, MIN_MAX_BYTES, MIN_SEED, REQUEST_SCHEMA_VERSION,
+    MAX_LABEL_BYTES, MAX_LABELS, MAX_MAX_BYTES, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    MAX_RESULT_BYTES_WITH_VALIDATION, MAX_SEED, MAX_TRAIN_RSS_BYTES, MAX_TRAIN_WALL_SECONDS,
+    MAX_VALIDATION_INPUT_TOTAL_BYTES, MIN_LABELS, MIN_MAX_BYTES, MIN_SEED, REQUEST_SCHEMA_VERSION,
 };
 
 /// 学習の実行デバイス。`contract.py::_ALLOWED_DEVICES`。
@@ -83,6 +88,87 @@ impl LabelOrder {
     }
 }
 
+/// 学習ジョブ内での採点用に、学習ワーカーへ渡す validation 入力 1 件
+/// （`{"id","input"}`。REQ-27・REQ-18。issue #84 PR #238・選択肢 2）。
+///
+/// **正解ラベルは持たない**（REQ-27「推論関数には `input` だけを渡す」。
+/// 学習ワーカーへ gold を渡さないことを型で保証する）。`id` は
+/// validation レコードの識別子で、結果の `validation_predictions` の
+/// 突き合わせに使う。`input` は `String`（UTF-8 保証）で、UTF-8 でない
+/// バイト列はこの型を作る前に呼び出し元が拒否する
+/// （`crate::search` の `SearchError::ValidationInputNotUtf8`。
+/// 子プロセスを起動する前に `invalid_input` で拒否する）。
+///
+/// `Debug` は件数・長さのみで、`id`・`input` の内容（学習・評価データ本文に
+/// なりうる）を出力しない（`.claude/rules/security.md`）。
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ValidationInput {
+    id: String,
+    input: String,
+}
+
+impl ValidationInput {
+    /// 構築のみ。検証は [`TrainRequest::with_validation_inputs`]・
+    /// [`TrainRequest::from_json_slice`] が行う。
+    #[must_use]
+    pub fn new(id: String, input: String) -> Self {
+        Self { id, input }
+    }
+
+    /// validation レコードの識別子。
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 推論関数へ渡す入力本文。
+    #[must_use]
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+impl std::fmt::Debug for ValidationInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidationInput")
+            .field("id_len", &self.id.len())
+            .field("input_len", &self.input.len())
+            .finish()
+    }
+}
+
+/// `validation_inputs` の検証（`contract.py::_validate_validation_inputs` と
+/// 同じ規則）。件数は 1 件以上、`id` は非空・[`MAX_INPUT_ID_BYTES`] 以下・
+/// 重複なし、`input` は [`MAX_INFER_INPUT_BYTES`] 以下、`id`＋`input` の
+/// 合計は [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] 以下。リクエスト JSON の内側を
+/// 通るため実効上限は [`MAX_REQUEST_BYTES`] が決める
+/// （[`MAX_VALIDATION_INPUT_TOTAL_BYTES`] の doc 参照）。
+fn validate_validation_inputs(inputs: &[ValidationInput]) -> Result<(), TrainRequestError> {
+    if inputs.is_empty() {
+        return Err(TrainRequestError::ValidationInputsEmpty);
+    }
+    let mut seen: HashSet<&str> = HashSet::with_capacity(inputs.len().min(4096));
+    let mut total: usize = 0;
+    for (index, item) in inputs.iter().enumerate() {
+        if item.id.is_empty() || item.id.len() > MAX_INPUT_ID_BYTES {
+            return Err(TrainRequestError::ValidationInputInvalidId { index });
+        }
+        if item.input.len() > MAX_INFER_INPUT_BYTES {
+            return Err(TrainRequestError::ValidationInputTooLarge { index });
+        }
+        total = total
+            .saturating_add(item.id.len())
+            .saturating_add(item.input.len());
+        if total > MAX_VALIDATION_INPUT_TOTAL_BYTES {
+            return Err(TrainRequestError::ValidationInputsTotalBytesExceeded);
+        }
+        if !seen.insert(item.id.as_str()) {
+            return Err(TrainRequestError::ValidationInputDuplicateId { index });
+        }
+    }
+    Ok(())
+}
+
 /// 未検証の学習リクエストの構成要素（呼び出し元が組み立てる入力）。
 ///
 /// [`TrainRequest::new`] へ渡す前段の値で、フィールドはすべて公開だが
@@ -128,6 +214,16 @@ pub struct TrainRequest {
     out_dir: String,
     time_limit_seconds: u32,
     rss_limit_bytes: u64,
+    /// 学習ジョブ内での採点用 validation 入力（任意。gold は持たない）。
+    validation_inputs: Option<Vec<ValidationInput>>,
+}
+
+/// [`ValidationInput`] の JSON 読み込み用中間表現（未知フィールドを拒否する）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawValidationInput {
+    id: String,
+    input: String,
 }
 
 /// `TrainRequest::from_json_slice` の内部専用中間表現（デシリアライズ専用）。
@@ -163,6 +259,9 @@ struct RawTrainRequest {
     time_limit_seconds: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_present")]
     rss_limit_bytes: Option<u64>,
+    /// キー省略時は `None`。明示的な `null` は拒否する（他の任意項目と同じ）。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    validation_inputs: Option<Vec<RawValidationInput>>,
 }
 
 /// `Option<T>` フィールド用の `deserialize_with`。キー省略時は
@@ -198,6 +297,8 @@ struct WireTrainRequest<'a> {
     time_limit_seconds: u32,
     #[serde(skip_serializing_if = "is_default_rss_bytes")]
     rss_limit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_inputs: Option<&'a [ValidationInput]>,
 }
 
 fn is_default_wall_seconds(value: &u32) -> bool {
@@ -329,7 +430,22 @@ impl TrainRequest {
             out_dir: params.out_dir,
             time_limit_seconds,
             rss_limit_bytes,
+            validation_inputs: None,
         })
+    }
+
+    /// 学習ジョブ内での採点用 validation 入力を付ける（REQ-18・REQ-27。
+    /// issue #84 PR #238・選択肢 2）。正解ラベルは受け取らない。検証は
+    /// [`validate_validation_inputs`] と同じ規則で fail-closed に行い、
+    /// 入力は 1 件以上でなければならない（付けない場合は
+    /// `validation_inputs` キー自体を出力しない）。
+    pub fn with_validation_inputs(
+        mut self,
+        inputs: Vec<ValidationInput>,
+    ) -> Result<Self, TrainRequestError> {
+        validate_validation_inputs(&inputs)?;
+        self.validation_inputs = Some(inputs);
+        Ok(self)
     }
 
     /// 生バイト列（学習リクエスト JSON ファイルの中身）から検証済みの
@@ -380,7 +496,16 @@ impl TrainRequest {
             time_limit_seconds: raw.time_limit_seconds,
             rss_limit_bytes: raw.rss_limit_bytes,
         };
-        Self::new(params)
+        let request = Self::new(params)?;
+        match raw.validation_inputs {
+            None => Ok(request),
+            Some(items) => request.with_validation_inputs(
+                items
+                    .into_iter()
+                    .map(|item| ValidationInput::new(item.id, item.input))
+                    .collect(),
+            ),
+        }
     }
 
     /// 検証済みの [`TrainRequest`] を、`contract.py` と同じスキーマの JSON
@@ -407,6 +532,7 @@ impl TrainRequest {
             out_dir: &self.out_dir,
             time_limit_seconds: self.time_limit_seconds,
             rss_limit_bytes: self.rss_limit_bytes,
+            validation_inputs: self.validation_inputs.as_deref(),
         };
         let mut writer = LimitedVecWriter::new(MAX_REQUEST_BYTES);
         match serde_json::to_writer(&mut writer, &wire) {
@@ -471,6 +597,24 @@ impl TrainRequest {
     /// 既定値解決後の RSS 上限（バイト）。
     pub fn rss_limit_bytes(&self) -> u64 {
         self.rss_limit_bytes
+    }
+
+    /// 学習ジョブ内での採点用 validation 入力（付けていなければ `None`）。
+    #[must_use]
+    pub fn validation_inputs(&self) -> Option<&[ValidationInput]> {
+        self.validation_inputs.as_deref()
+    }
+
+    /// このリクエストに対する結果 JSON（ワーカーの標準出力）の読み込み上限
+    /// （バイト）。`validation_inputs` を持つ場合だけ、予測列を含むぶん緩い
+    /// [`MAX_RESULT_BYTES_WITH_VALIDATION`]、それ以外は [`MAX_RESULT_BYTES`]。
+    #[must_use]
+    pub fn max_result_bytes(&self) -> usize {
+        if self.validation_inputs.is_some() {
+            MAX_RESULT_BYTES_WITH_VALIDATION
+        } else {
+            MAX_RESULT_BYTES
+        }
     }
 }
 
@@ -792,5 +936,141 @@ mod tests {
                 "neutral".to_string()
             ]
         );
+    }
+
+    // ---- validation_inputs（REQ-18・REQ-27・REQ-39。issue #84 PR #238・選択肢 2）----
+
+    fn vi(id: &str, input: &str) -> ValidationInput {
+        ValidationInput::new(id.to_string(), input.to_string())
+    }
+
+    /// REQ-27: `validation_inputs` は `{id,input}` のみを運び（gold は持てない）、
+    /// JSON 往復で値が保たれる。付けていないリクエストにはキー自体が現れない。
+    #[test]
+    fn req27_validation_inputs_round_trip_and_key_omitted_when_absent() {
+        let plain = TrainRequest::new(valid_params()).expect("valid");
+        let plain_json = String::from_utf8(plain.to_json_vec().expect("serialize")).expect("utf8");
+        assert!(!plain_json.contains("validation_inputs"));
+        assert_eq!(plain.validation_inputs(), None);
+        assert_eq!(plain.max_result_bytes(), MAX_RESULT_BYTES);
+
+        let request = plain
+            .with_validation_inputs(vec![vi("r1", "alpha"), vi("r2", "beta")])
+            .expect("valid validation inputs");
+        assert_eq!(request.max_result_bytes(), MAX_RESULT_BYTES_WITH_VALIDATION);
+        let bytes = request.to_json_vec().expect("serialize");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            value["validation_inputs"],
+            serde_json::json!([
+                {"id": "r1", "input": "alpha"},
+                {"id": "r2", "input": "beta"}
+            ])
+        );
+        let parsed = TrainRequest::from_json_slice(&bytes).expect("round trip");
+        assert_eq!(parsed, request);
+    }
+
+    /// REQ-39: `validation_inputs` の各規則（空配列・空 id・長すぎる id・
+    /// 重複 id・1 件の巨大入力・合計超過）は fail-closed で拒否される。
+    #[test]
+    fn req39_validation_inputs_rejections() {
+        let base = || TrainRequest::new(valid_params()).expect("valid");
+        assert_eq!(
+            base().with_validation_inputs(vec![]).unwrap_err(),
+            TrainRequestError::ValidationInputsEmpty
+        );
+        assert_eq!(
+            base()
+                .with_validation_inputs(vec![vi("ok", "a"), vi("", "b")])
+                .unwrap_err(),
+            TrainRequestError::ValidationInputInvalidId { index: 1 }
+        );
+        let long_id = "x".repeat(MAX_INPUT_ID_BYTES + 1);
+        assert_eq!(
+            base()
+                .with_validation_inputs(vec![vi(&long_id, "a")])
+                .unwrap_err(),
+            TrainRequestError::ValidationInputInvalidId { index: 0 }
+        );
+        assert_eq!(
+            base()
+                .with_validation_inputs(vec![vi("a", "1"), vi("a", "2")])
+                .unwrap_err(),
+            TrainRequestError::ValidationInputDuplicateId { index: 1 }
+        );
+        let huge = "y".repeat(MAX_INFER_INPUT_BYTES + 1);
+        assert_eq!(
+            base()
+                .with_validation_inputs(vec![vi("a", &huge)])
+                .unwrap_err(),
+            TrainRequestError::ValidationInputTooLarge { index: 0 }
+        );
+        // 合計超過: 1 件あたり上限ちょうどの入力を、合計上限を超える件数だけ並べる。
+        let max_each = "z".repeat(MAX_INFER_INPUT_BYTES);
+        let count = MAX_VALIDATION_INPUT_TOTAL_BYTES / MAX_INFER_INPUT_BYTES + 1;
+        let many: Vec<ValidationInput> = (0..count)
+            .map(|i| ValidationInput::new(format!("id{i}"), max_each.clone()))
+            .collect();
+        assert_eq!(
+            base().with_validation_inputs(many).unwrap_err(),
+            TrainRequestError::ValidationInputsTotalBytesExceeded
+        );
+    }
+
+    /// REQ-39: 実効上限は `MAX_REQUEST_BYTES`（リクエスト全体）。`with_validation_inputs`
+    /// は通る 1 MiB ちょうどの入力でも、直列化で `TooLarge` になる。
+    #[test]
+    fn req39_validation_inputs_effective_cap_is_max_request_bytes() {
+        let max_each = "z".repeat(MAX_INFER_INPUT_BYTES);
+        let request = TrainRequest::new(valid_params())
+            .expect("valid")
+            .with_validation_inputs(vec![vi("a", &max_each)])
+            .expect("per-record limit satisfied");
+        assert!(matches!(
+            request.to_json_vec(),
+            Err(TrainRequestError::TooLarge { .. })
+        ));
+    }
+
+    /// REQ-39: JSON 経由でも要素の未知フィールド（gold を紛れ込ませる等）・
+    /// 明示的な `null`・型違いは拒否され、重複 id は検証で拒否される。
+    #[test]
+    fn req27_validation_inputs_json_rejects_gold_and_null() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"schema_version":1,"kind":"c3","kind_version":1,"label_order":["a","b"],"max_bytes":512,"seed":0,"device":"cpu","root":"/r","train_path":"t.jsonl","out_dir":"o",{extra}}}"#
+            )
+        };
+        let gold = base(r#""validation_inputs":[{"id":"r1","input":"x","label":"a"}]"#);
+        assert!(matches!(
+            TrainRequest::from_json_slice(gold.as_bytes()),
+            Err(TrainRequestError::NotJson { .. })
+        ));
+        let null = base(r#""validation_inputs":null"#);
+        assert!(matches!(
+            TrainRequest::from_json_slice(null.as_bytes()),
+            Err(TrainRequestError::NotJson { .. })
+        ));
+        let dup = base(r#""validation_inputs":[{"id":"r","input":"x"},{"id":"r","input":"y"}]"#);
+        assert_eq!(
+            TrainRequest::from_json_slice(dup.as_bytes()).unwrap_err(),
+            TrainRequestError::ValidationInputDuplicateId { index: 1 }
+        );
+    }
+
+    /// セキュリティ: `Debug` は `id`・`input` の内容を出力しない。
+    #[test]
+    fn req39_validation_input_debug_does_not_leak_content() {
+        let request = TrainRequest::new(valid_params())
+            .expect("valid")
+            .with_validation_inputs(vec![vi("secret-id-MARKER", "secret-input-MARKER")])
+            .expect("valid");
+        let debug = format!(
+            "{request:?} {:?}",
+            vi("secret-id-MARKER", "secret-input-MARKER")
+        );
+        assert!(!debug.contains("MARKER"), "{debug}");
+        assert!(debug.contains("input_len"));
     }
 }

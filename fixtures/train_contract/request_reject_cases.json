@@ -1306,6 +1306,125 @@
       },
       "expected_code": "invalid_path",
       "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_empty_list",
+      "patch": {
+        "validation_inputs": []
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_null",
+      "patch": {
+        "validation_inputs": null
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_not_list",
+      "patch": {
+        "validation_inputs": {
+          "id": "a",
+          "input": "x"
+        }
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_element_not_object",
+      "patch": {
+        "validation_inputs": [
+          "x"
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_element_with_gold_label",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "a",
+            "input": "x",
+            "label": "positive"
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_element_missing_input",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "a"
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_input_not_string",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "a",
+            "input": 1
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_id_empty",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "",
+            "input": "x"
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_id_too_long",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "input": "x"
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
+    },
+    {
+      "name": "validation_inputs_id_duplicate",
+      "patch": {
+        "validation_inputs": [
+          {
+            "id": "a",
+            "input": "x"
+          },
+          {
+            "id": "a",
+            "input": "y"
+          }
+        ]
+      },
+      "expected_code": "invalid_request",
+      "expected_exit": 64
     }
   ]
 }

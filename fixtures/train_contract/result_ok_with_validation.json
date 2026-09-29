@@ -1,0 +1,51 @@
+{
+  "status": "ok",
+  "artifact_dir": "/fandhe-edge-fixture-root/out",
+  "artifact": {
+    "kind": "c3",
+    "kind_version": 1,
+    "selector_version": "0.1",
+    "config": {
+      "lr": 0.001,
+      "weight_decay": 0.0001,
+      "epochs": 2,
+      "batch_size": 64,
+      "emb": 64,
+      "filters": 128,
+      "widths": [
+        3,
+        5,
+        7
+      ],
+      "dropout": 0.3
+    },
+    "label_order": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "output_type": "choice",
+    "max_bytes": 512,
+    "onnx_file": "model.onnx",
+    "onnx_sha256": "ae2c3277fb02c187294c01f4e19e3eca57815d28e9ebc05f4d013a05a02ecfbe",
+    "created_utc": "2026-09-28T00:00:00Z",
+    "candidate_label": "c3"
+  },
+  "validation_predictions": [
+    {
+      "id": "val-001",
+      "status": "ok",
+      "predicted_label": "positive"
+    },
+    {
+      "id": "val-002",
+      "status": "ok",
+      "predicted_label": "negative"
+    },
+    {
+      "id": "val-003",
+      "status": "error",
+      "predicted_label": null
+    }
+  ]
+}

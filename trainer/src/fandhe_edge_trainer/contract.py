@@ -43,6 +43,13 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが `--req
 読んだバイト列に対して `parse_request_bytes` → `validate_request` を呼ぶ
 （ファイルパスは一切受け取らない）。
 
+`validation_inputs` は任意項目（学習ジョブ内での採点用 validation 入力。
+`[{"id": str, "input": str}, ...]`。**正解ラベルは受け取らない**〔REQ-27。要素に
+他のキーがあれば拒否する〕。検証は `_validate_validation_inputs`。あれば学習直後に
+同じプロセス内で予測し、結果の `validation_predictions` として返す。issue #84
+PR #238）。リクエスト全体が `MAX_REQUEST_BYTES` で縛られるため、運べる量の実効上限は
+そちらで決まる。
+
 `time_limit_seconds`・`rss_limit_bytes` は任意項目（省略時は `limits.py` の
 `MAX_TRAIN_WALL_SECONDS`・`MAX_TRAIN_RSS_BYTES` を既定値として使う）。
 指定する場合は、その上限を**下げる**ことしかできない（上限より大きい値は
@@ -132,6 +139,9 @@ from .limits import (
     MAX_TRAIN_LINE_BYTES,
     MAX_TRAIN_RSS_BYTES,
     MAX_TRAIN_WALL_SECONDS,
+    MAX_VALIDATION_ID_BYTES,
+    MAX_VALIDATION_INPUT_BYTES,
+    MAX_VALIDATION_INPUT_TOTAL_BYTES,
     MIN_LABELS,
     MIN_MAX_BYTES,
     MIN_SEED,
@@ -153,6 +163,7 @@ _REQUEST_FIELDS = {
     "out_dir",
     "time_limit_seconds",
     "rss_limit_bytes",
+    "validation_inputs",
 }
 
 
@@ -185,6 +196,10 @@ class TrainRequest:
     out_dir: guard.ConfinedEntry
     time_limit_seconds: int
     rss_limit_bytes: int
+    #: 学習ジョブ内での採点用 validation 入力 `(id, input)` の列（任意。無ければ
+    #: `None`）。**正解ラベルは持たない**（REQ-27）。`validate_request` が
+    #: `_validate_validation_inputs` で検証済み。
+    validation_inputs: tuple[tuple[str, str], ...] | None = None
 
     def close_resources(self) -> None:
         """保持している fd（`train_path`・`out_dir`・`root`）をすべて閉じる。
@@ -422,6 +437,10 @@ def validate_request(raw: Any) -> TrainRequest:
     ):
         raise _invalid(f"rss_limit_bytes must be an integer in [1, {MAX_TRAIN_RSS_BYTES}]")
 
+    validation_inputs = _validate_validation_inputs(
+        raw.get("validation_inputs"), "validation_inputs" in raw
+    )
+
     # 経路の閉じ込め（REQ-39 ガード層・PoC-20。多層防御。guard.py 参照）は最後に
     # 行う: ここより前の検証で弾かれるリクエストのために fd を開いて後始末する
     # 手間を避ける。ここから先で失敗したら、それまでに開いた fd をすべて
@@ -451,7 +470,55 @@ def validate_request(raw: Any) -> TrainRequest:
         out_dir=out_dir_entry,
         time_limit_seconds=time_limit_seconds,
         rss_limit_bytes=rss_limit_bytes,
+        validation_inputs=validation_inputs,
     )
+
+
+def _validate_validation_inputs(value: Any, present: bool) -> tuple[tuple[str, str], ...] | None:
+    """`validation_inputs`（任意。REQ-18・REQ-27・REQ-39）を検証する。
+
+    キーが無ければ `None`。あれば 1 件以上の `{"id": str, "input": str}` の
+    リストで、要素は他のキーを持てない（正解ラベルを紛れ込ませない。REQ-27）。
+    `id` は非空・UTF-8 で `MAX_VALIDATION_ID_BYTES` 以下・重複なし、`input` は
+    UTF-8 で `MAX_VALIDATION_INPUT_BYTES` 以下、`id`＋`input` の合計は
+    `MAX_VALIDATION_INPUT_TOTAL_BYTES` 以下（`crates/train/src/request.rs` の
+    `validate_validation_inputs` と同じ規則。リクエスト全体は既に
+    `MAX_REQUEST_BYTES` で縛られているため実効上限はそちら）。エラーメッセージへ
+    `id`・`input` の中身を含めない（security.md）。
+    """
+    if not present:
+        return None
+    if not isinstance(value, list) or not value:
+        raise _invalid("validation_inputs must be a non-empty list")
+    seen: set[str] = set()
+    total = 0
+    out: list[tuple[str, str]] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {"id", "input"}:
+            raise _invalid(f"validation_inputs[{i}] must be an object with exactly id and input")
+        rid = item["id"]
+        text = item["input"]
+        if not isinstance(rid, str) or not isinstance(text, str):
+            raise _invalid(f"validation_inputs[{i}] id and input must be strings")
+        # UTF-8 バイト数は文字数以上のため、`encode` の前に文字数で足切りして
+        # 巨大な値の再確保を避ける。孤立サロゲートは `encode` が失敗する。
+        if not rid or len(rid) > MAX_VALIDATION_ID_BYTES or len(text) > MAX_VALIDATION_INPUT_BYTES:
+            raise _invalid(f"validation_inputs[{i}] id is empty or a size limit is exceeded")
+        try:
+            id_len = len(rid.encode("utf-8"))
+            input_len = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise _invalid(f"validation_inputs[{i}] is not valid utf-8") from exc
+        if id_len > MAX_VALIDATION_ID_BYTES or input_len > MAX_VALIDATION_INPUT_BYTES:
+            raise _invalid(f"validation_inputs[{i}] exceeds a size limit")
+        total += id_len + input_len
+        if total > MAX_VALIDATION_INPUT_TOTAL_BYTES:
+            raise _invalid("validation_inputs total bytes exceed the limit")
+        if rid in seen:
+            raise _invalid(f"validation_inputs[{i}] id is a duplicate")
+        seen.add(rid)
+        out.append((rid, text))
+    return tuple(out)
 
 
 def _validate_label_order(label_order: Any) -> None:

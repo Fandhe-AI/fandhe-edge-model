@@ -30,7 +30,8 @@ use fandhe_edge_core::exitcode::ExitCode;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::TrainResultError;
-use crate::limits::MAX_RESULT_BYTES;
+use fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES;
+
 use crate::request::{LabelOrder, TrainRequest};
 
 /// `#[serde(default, deserialize_with = "deserialize_present")]` と組み合わせ、
@@ -350,16 +351,84 @@ pub enum TrainOutcome {
     Error(WorkerFailure),
 }
 
-/// [`TrainOutcome::Ok`] の中身（成果物の配置先ディレクトリと成果物記録）。
+/// 学習ジョブ内で採点した validation の予測 1 件の `status`
+/// （`kinds/autoregressive.py::build_prediction_record` の語彙のうち、
+/// `crates/data/src/eval_input.rs` が受理する `ok`／`abstain`／`error`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationPredictionStatus {
+    Ok,
+    Abstain,
+    Error,
+}
+
+/// 学習ジョブ内で採点した validation の予測 1 件（`{id,status,predicted_label}`。
+/// 既存の推論出力〔`prediction_record_to_json_line`〕と同じ形から `scores` を
+/// 除いたもの。REQ-27・issue #84 PR #238・選択肢 2）。
+///
+/// `Debug` は `status` のみで、`id`・`predicted_label`（学習・評価データ由来の
+/// 予測ラベル）を出力しない（`.claude/rules/security.md`）。構築できるのは
+/// 本モジュール（[`TrainOutcome::from_worker_stdout`]）だけ。
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ValidationPrediction {
+    id: String,
+    status: ValidationPredictionStatus,
+    predicted_label: Option<String>,
+}
+
+impl ValidationPrediction {
+    /// validation レコードの識別子（リクエストの `validation_inputs[].id` と対応）。
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 予測の状態。
+    #[must_use]
+    pub fn status(&self) -> ValidationPredictionStatus {
+        self.status
+    }
+
+    /// 予測ラベル（`status` が `Ok` のときだけ `Some`）。
+    #[must_use]
+    pub fn predicted_label(&self) -> Option<&str> {
+        self.predicted_label.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ValidationPrediction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidationPrediction")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`TrainOutcome::Ok`] の中身（成果物の配置先ディレクトリ・成果物記録・
+/// 任意の validation 予測列）。
 ///
 /// フィールドは非公開。この型を構築できるのは本モジュール内
-/// （[`TrainOutcome::from_worker_stdout`]）だけで、別 crate は
-/// [`SuccessOutcome::artifact_dir`]・[`SuccessOutcome::artifact`] の読み取り
-/// 専用アクセサしか使えない。
-#[derive(Debug, Clone, PartialEq)]
+/// （[`TrainOutcome::from_worker_stdout`]）だけで、別 crate は読み取り専用
+/// アクセサしか使えない。`Debug` は予測列の件数のみを出力し、内容
+/// （予測ラベル）を出力しない。
+#[derive(Clone, PartialEq)]
 pub struct SuccessOutcome {
     artifact_dir: String,
     artifact: Box<ArtifactRecord>,
+    validation_predictions: Option<Vec<ValidationPrediction>>,
+}
+
+impl std::fmt::Debug for SuccessOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuccessOutcome")
+            .field("artifact_dir", &self.artifact_dir)
+            .field("artifact", &self.artifact)
+            .field(
+                "validation_prediction_count",
+                &self.validation_predictions.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
 }
 
 impl SuccessOutcome {
@@ -374,6 +443,15 @@ impl SuccessOutcome {
     #[must_use]
     pub fn artifact(&self) -> &ArtifactRecord {
         &self.artifact
+    }
+
+    /// 学習ジョブ内で採点した validation の予測列。リクエストが
+    /// `validation_inputs` を持っていた場合だけ `Some`（件数は入力件数以下。
+    /// 件数・`id` の順序が入力と一致するかは呼び出し元〔`crate::search`〕が
+    /// 照合する）。
+    #[must_use]
+    pub fn validation_predictions(&self) -> Option<&[ValidationPrediction]> {
+        self.validation_predictions.as_deref()
     }
 }
 
@@ -399,6 +477,18 @@ struct RawOutcome {
     code: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_present")]
     message: Option<Option<String>>,
+    /// `status:"ok"` のとき、リクエストが `validation_inputs` を持つ場合に
+    /// 限り現れる。`null` は拒否する（キー欠落と区別する double-Option）。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    validation_predictions: Option<Option<Vec<RawValidationPrediction>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawValidationPrediction {
+    id: String,
+    status: ValidationPredictionStatus,
+    predicted_label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -528,11 +618,45 @@ fn canonicalize_root_best_effort(root: &str) -> String {
     }
 }
 
+/// `validation_predictions` の検証（REQ-27・REQ-39）。件数は入力件数
+/// （`max_count`）以下、`id` は非空・[`MAX_INPUT_ID_BYTES`] 以下、`status:"ok"`
+/// は `predicted_label` が文字列、`abstain`／`error` は `null` でなければならない。
+/// `id` の順序・件数の一致は検査しない（呼び出し元の `crate::search` が
+/// 既存の record_id 照合で候補単位に処理する）。
+fn parse_validation_predictions(
+    items: Vec<RawValidationPrediction>,
+    max_count: usize,
+) -> Result<Vec<ValidationPrediction>, TrainResultError> {
+    let malformed = || TrainResultError::MalformedArtifact {
+        field: "validation_predictions",
+    };
+    if items.len() > max_count {
+        return Err(malformed());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.id.is_empty() || item.id.len() > MAX_INPUT_ID_BYTES {
+            return Err(malformed());
+        }
+        match (item.status, item.predicted_label.as_ref()) {
+            (ValidationPredictionStatus::Ok, Some(_))
+            | (ValidationPredictionStatus::Abstain | ValidationPredictionStatus::Error, None) => {}
+            _ => return Err(malformed()),
+        }
+        out.push(ValidationPrediction {
+            id: item.id,
+            status: item.status,
+            predicted_label: item.predicted_label,
+        });
+    }
+    Ok(out)
+}
+
 impl TrainOutcome {
     /// 学習ワーカーの標準出力（信頼しない外部入力）から結果を解析する。
     ///
     /// `supervisor.py`（子プロセスが自分で終了した場合の検査）と同じ規則:
-    /// (1) バイト長を [`MAX_RESULT_BYTES`] と照合 → (2) UTF-8 として読める →
+    /// (1) バイト長を [`TrainRequest::max_result_bytes`]（既定 [`crate::limits::MAX_RESULT_BYTES`]。`validation_inputs` 付きは [`crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION`]）と照合 → (2) UTF-8 として読める →
     /// (3) 空行を除いてちょうど 1 行 → (4) JSON として解析可能 →
     /// (5) `status`／各フィールドの組み合わせが妥当 → (6) `status:"ok"` の
     /// 場合に限り、`artifact_dir` が `request` の `root`／`out_dir` 配下に
@@ -553,10 +677,11 @@ impl TrainOutcome {
         bytes: &[u8],
         request: &TrainRequest,
     ) -> Result<Self, TrainResultError> {
-        if bytes.len() > MAX_RESULT_BYTES {
+        let max_result_bytes = request.max_result_bytes();
+        if bytes.len() > max_result_bytes {
             return Err(TrainResultError::TooLarge {
                 size: bytes.len(),
-                limit: MAX_RESULT_BYTES,
+                limit: max_result_bytes,
             });
         }
         let text = std::str::from_utf8(bytes).map_err(|_| TrainResultError::NotUtf8)?;
@@ -595,6 +720,18 @@ impl TrainOutcome {
                 else {
                     return Err(TrainResultError::MalformedOutcome);
                 };
+                // `validation_predictions` は、リクエストが `validation_inputs`
+                // を持つときは必須、持たないときは存在してはならない
+                // （REQ-27・REQ-39。要求していない採点結果を受理しない・
+                // 要求した採点結果の欠落を成功扱いにしない。fail-closed）。
+                let validation_predictions =
+                    match (request.validation_inputs(), raw.validation_predictions) {
+                        (None, None) => None,
+                        (Some(inputs), Some(Some(items))) => {
+                            Some(parse_validation_predictions(items, inputs.len())?)
+                        }
+                        _ => return Err(TrainResultError::MalformedOutcome),
+                    };
                 // 経路の閉じ込め（REQ-39・P0）: 空文字・絶対パスの取り違え・
                 // `..` を含む値はもちろん、`request` の `root`／`out_dir` と
                 // 無関係な絶対パスもここで拒否する。
@@ -705,14 +842,19 @@ impl TrainOutcome {
                         created_utc: raw_artifact.created_utc,
                         candidate_label: raw_artifact.candidate_label,
                     }),
+                    validation_predictions,
                 }))
             }
             "error" => {
                 // 対称的に、`code`／`message` はキーがあり値も入っていること、
                 // `artifact_dir`／`artifact` はキー自体が無いことを要求する。
-                let (None, None, Some(Some(code)), Some(Some(message))) =
-                    (raw.artifact_dir, raw.artifact, raw.code, raw.message)
-                else {
+                let (None, None, Some(Some(code)), Some(Some(message)), None) = (
+                    raw.artifact_dir,
+                    raw.artifact,
+                    raw.code,
+                    raw.message,
+                    raw.validation_predictions,
+                ) else {
                     return Err(TrainResultError::MalformedOutcome);
                 };
                 Ok(TrainOutcome::Error(WorkerFailure::parse(code, message)?))
@@ -743,10 +885,18 @@ impl Serialize for TrainOutcome {
         use serde::ser::SerializeMap;
         match self {
             TrainOutcome::Ok(success) => {
-                let mut map = serializer.serialize_map(Some(3))?;
+                let entries = if success.validation_predictions().is_some() {
+                    4
+                } else {
+                    3
+                };
+                let mut map = serializer.serialize_map(Some(entries))?;
                 map.serialize_entry("status", "ok")?;
                 map.serialize_entry("artifact_dir", success.artifact_dir())?;
                 map.serialize_entry("artifact", success.artifact())?;
+                if let Some(predictions) = success.validation_predictions() {
+                    map.serialize_entry("validation_predictions", predictions)?;
+                }
                 map.end()
             }
             TrainOutcome::Error(failure) => {
@@ -763,6 +913,7 @@ impl Serialize for TrainOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::MAX_RESULT_BYTES;
     use crate::request::{Device, TrainRequestParams};
 
     /// `VALID_OK_JSON` に対応するリクエスト（`root`＋`out_dir` の結合が
@@ -1501,5 +1652,141 @@ mod tests {
             }
             TrainOutcome::Ok(_) => panic!("expected Error"),
         }
+    }
+
+    // ---- validation_predictions（REQ-18・REQ-27・REQ-39。issue #84 PR #238・選択肢 2）----
+
+    fn request_with_validation(n: usize) -> TrainRequest {
+        let inputs = (0..n)
+            .map(|i| crate::request::ValidationInput::new(format!("r{i}"), format!("input {i}")))
+            .collect();
+        test_request()
+            .with_validation_inputs(inputs)
+            .expect("valid validation inputs")
+    }
+
+    fn ok_json_with_predictions(predictions: &str) -> String {
+        let without_trailing_brace = &VALID_OK_JSON[..VALID_OK_JSON.len() - 1];
+        format!(r#"{without_trailing_brace},"validation_predictions":{predictions}}}"#)
+    }
+
+    /// 要求どおりの予測列は受理され、内容が保たれる。`Debug` は予測ラベル
+    /// （`LABEL_MARKER`）を出力せず件数だけを示し、直列化は往復できる。
+    #[test]
+    fn req27_parses_validation_predictions_and_debug_hides_labels() {
+        let request = request_with_validation(3);
+        let json = ok_json_with_predictions(
+            r#"[{"id":"r0","status":"ok","predicted_label":"a"},{"id":"r1","status":"abstain","predicted_label":null},{"id":"r2","status":"error","predicted_label":null}]"#,
+        );
+        let outcome =
+            TrainOutcome::from_worker_stdout(json.as_bytes(), &request).expect("valid outcome");
+        let TrainOutcome::Ok(success) = &outcome else {
+            panic!("expected Ok");
+        };
+        let predictions = success.validation_predictions().expect("present");
+        assert_eq!(predictions.len(), 3);
+        assert_eq!(predictions[0].id(), "r0");
+        assert_eq!(predictions[0].status(), ValidationPredictionStatus::Ok);
+        assert_eq!(predictions[0].predicted_label(), Some("a"));
+        assert_eq!(predictions[1].status(), ValidationPredictionStatus::Abstain);
+        assert_eq!(predictions[2].predicted_label(), None);
+        // `config` のキー順は正規化されるため、文字列ではなく値で比較する。
+        let round_trip = serde_json::to_value(&outcome).expect("serialize");
+        let expected: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(round_trip, expected);
+
+        let marker_json = ok_json_with_predictions(
+            r#"[{"id":"r0","status":"ok","predicted_label":"LABEL_MARKER"}]"#,
+        );
+        let marker =
+            TrainOutcome::from_worker_stdout(marker_json.as_bytes(), &request_with_validation(1))
+                .expect("valid outcome");
+        let debug = format!("{marker:?}");
+        assert!(!debug.contains("LABEL_MARKER"), "{debug}");
+        assert!(debug.contains("validation_prediction_count"));
+    }
+
+    /// 要求したのに無い・要求していないのに有る・`null` は拒否する（fail-closed）。
+    #[test]
+    fn req39_validation_predictions_presence_must_match_request() {
+        let requested = request_with_validation(1);
+        assert_eq!(
+            TrainOutcome::from_worker_stdout(VALID_OK_JSON.as_bytes(), &requested).unwrap_err(),
+            TrainResultError::MalformedOutcome
+        );
+        let json = ok_json_with_predictions(r#"[{"id":"r0","status":"ok","predicted_label":"a"}]"#);
+        assert_eq!(
+            TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err(),
+            TrainResultError::MalformedOutcome
+        );
+        let null_json = ok_json_with_predictions("null");
+        assert_eq!(
+            TrainOutcome::from_worker_stdout(null_json.as_bytes(), &requested).unwrap_err(),
+            TrainResultError::MalformedOutcome
+        );
+    }
+
+    /// 件数超過・空 id・status とラベルの不整合・未知フィールドは拒否する。
+    #[test]
+    fn req39_validation_predictions_shape_rejections() {
+        let malformed = TrainResultError::MalformedArtifact {
+            field: "validation_predictions",
+        };
+        let cases = [
+            r#"[{"id":"r0","status":"ok","predicted_label":"a"},{"id":"r1","status":"ok","predicted_label":"a"}]"#,
+            r#"[{"id":"","status":"ok","predicted_label":"a"}]"#,
+            r#"[{"id":"r0","status":"ok","predicted_label":null}]"#,
+            r#"[{"id":"r0","status":"error","predicted_label":"a"}]"#,
+        ];
+        for predictions in cases {
+            let json = ok_json_with_predictions(predictions);
+            assert_eq!(
+                TrainOutcome::from_worker_stdout(json.as_bytes(), &request_with_validation(1))
+                    .unwrap_err(),
+                malformed,
+                "{predictions}"
+            );
+        }
+        let unknown = ok_json_with_predictions(
+            r#"[{"id":"r0","status":"ok","predicted_label":"a","scores":{"a":1.0}}]"#,
+        );
+        assert!(matches!(
+            TrainOutcome::from_worker_stdout(unknown.as_bytes(), &request_with_validation(1)),
+            Err(TrainResultError::NotJson { .. })
+        ));
+        let bad_status =
+            ok_json_with_predictions(r#"[{"id":"r0","status":"nope","predicted_label":null}]"#);
+        assert!(matches!(
+            TrainOutcome::from_worker_stdout(bad_status.as_bytes(), &request_with_validation(1)),
+            Err(TrainResultError::NotJson { .. })
+        ));
+    }
+
+    /// 結果の読み込み上限は、`validation_inputs` 付きのときだけ緩む。
+    #[test]
+    fn req39_result_size_limit_depends_on_validation_inputs() {
+        let over_default = " ".repeat(MAX_RESULT_BYTES + 1);
+        let plain_err =
+            TrainOutcome::from_worker_stdout(over_default.as_bytes(), &test_request()).unwrap_err();
+        assert_eq!(
+            plain_err,
+            TrainResultError::TooLarge {
+                size: MAX_RESULT_BYTES + 1,
+                limit: MAX_RESULT_BYTES
+            }
+        );
+        // 検証付きでは同じサイズは TooLarge にならない（空白のみ → 行数エラー）。
+        assert!(matches!(
+            TrainOutcome::from_worker_stdout(over_default.as_bytes(), &request_with_validation(1)),
+            Err(TrainResultError::NotExactlyOneLine { .. })
+        ));
+        let over_validation = " ".repeat(crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION + 1);
+        assert!(matches!(
+            TrainOutcome::from_worker_stdout(
+                over_validation.as_bytes(),
+                &request_with_validation(1)
+            ),
+            Err(TrainResultError::TooLarge { .. })
+        ));
     }
 }

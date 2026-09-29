@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "c3",
+  "kind_version": 1,
+  "config": {
+    "epochs": 2
+  },
+  "label_order": [
+    "positive",
+    "negative",
+    "neutral"
+  ],
+  "max_bytes": 512,
+  "seed": 42,
+  "device": "cpu",
+  "root": "/fandhe-edge-fixture-root",
+  "train_path": "train.jsonl",
+  "out_dir": "out",
+  "time_limit_seconds": 600,
+  "rss_limit_bytes": 1073741824,
+  "validation_inputs": [
+    {
+      "id": "val-001",
+      "input": "great product, works well"
+    },
+    {
+      "id": "val-002",
+      "input": "terrible, broke on day one"
+    },
+    {
+      "id": "val-003",
+      "input": "it is fine"
+    }
+  ]
+}

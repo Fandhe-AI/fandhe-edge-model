@@ -101,7 +101,36 @@ pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 /// 数上限にも本定数を流用する（P1 指摘対応。issue #84 PR #238 レビュー。
 /// record_id 専用の新しい定数を追加で起こさず、「1 つの `SearchInput`
 /// フィールドが保持できる合計バイト数」の共通の目安として扱う）。
+///
+/// 学習リクエスト JSON の `validation_inputs`（学習ジョブ内での採点用の
+/// validation 入力。[`crate::request::ValidationInput`]）にも、同じ定数を
+/// 合計バイト数（`id`＋`input`）の上限として使う（issue #84 PR #238・
+/// 選択肢 2）。ただし validation 入力はリクエスト JSON の**内側**を通るため、
+/// 実際に効く上限は [`MAX_REQUEST_BYTES`]（1 MiB。リクエスト全体）であり、
+/// 本定数（64 MiB）はそれより緩い。すなわち 1 リクエストで運べる validation
+/// 入力は、リクエストの他の項目を除いておよそ 1 MiB 以内（短いレコードで
+/// 数千件規模）に限られる。1 件あたり [`fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`]
+/// （1 MiB）ちょうどのレコードも、リクエスト全体の上限を超えるため 1 件でも
+/// 拒否される。本定数は「`SearchInput` が保持できる合計」の上限として
+/// 変更せず、リクエスト側の実効上限との差はオーナー判断で据え置いた
+/// （選択肢 (a)。上限を緩めるなら `MAX_REQUEST_BYTES` の見直しが別途必要）。
 pub const MAX_VALIDATION_INPUT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// `validation_inputs` を含むリクエストの結果 JSON（`validation_predictions`
+/// を含む）の読み込み上限（バイト）。`validation_inputs` を持たない
+/// リクエストの結果には [`MAX_RESULT_BYTES`]（1 MiB）を使い続ける。
+/// `supervisor.py::_MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION`。
+///
+/// 導出（証拠種別: 推定。計算式のみで実測ではない）: 入力側は
+/// [`MAX_REQUEST_BYTES`]（1 MiB）に収まるため、最小のレコード
+/// `{"id":"a","input":""}`（21 バイト）で件数は最大 49,932 件。予測 1 件は
+/// `id`（合計は入力側の 1 MiB 以内）＋ `status`・キー名・区切りの定型
+/// （約 45 バイト）＋ `predicted_label`（最大 256 バイト。JSON エスケープ
+/// で最大 6 倍になりうるが、バイト数が最大の非 ASCII でも 3 倍程度）。
+/// 最悪でも 49,932 × (45 + 256 × 3) ≒ 41 MB ＋ id 1 MiB 程度となり、
+/// 64 MiB に収まる（`scores` は含めない）。64 MiB は
+/// [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] と同じ値で、新しい桁を増やさない。
+pub const MAX_RESULT_BYTES_WITH_VALIDATION: usize = 64 * 1024 * 1024;
 /// 学習ワーカーの標準エラー出力（stderr）の保持上限（バイト）。REQ-39
 /// 「資源の上限」（#178）。`_worker` は supervisor の stderr を継承する
 /// （`supervisor.py::_spawn_worker_and_finalize`）ため、Rust 側 stderr
