@@ -40,6 +40,8 @@
 //!   ハッシュ比較・データ契約層（`fandhe-edge-data`）の凍結記録との接続
 //!   （REQ-27 正常系・REQ-17・TASK-27.1-2・issue #70）。[`invariance`] のモデル
 //!   パッケージ側と対になる評価データ側の実装
+//! - [`final_test_once`][]: 凍結した最終 test への 1 回限り適用の強制
+//!   （REQ-27 境界値・TASK-27.3・issue #72。PoC-10・PoC-25 のロックファイル方式）
 //! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
 //!   必要評価件数の事前計算（Connor 式を起点に、実際に使う両側正確検定の
 //!   検出力で引き上げる。REQ-25 異常系・TASK-25.2・issue #66・
@@ -116,7 +118,9 @@
 //! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2・issue #71。
 //!   PoC-9 `ArgumentRecordingPredictor` 相当）: 実装済み（[`input_only`]）。
 //!   CLI `evaluate` 工程への配線（issue #140）は未実装
-//! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3）: 未実装
+//! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3・issue #72）:
+//!   実装済み（[`final_test_once`]。代表構成ロック＋重みロック）。CLI `evaluate`
+//!   工程への配線（issue #140）・終了コードへの写像（TASK-33.3）は未実装
 //! - パッケージ全体を 1 つにまとめた合成ダイジェスト・配布パッケージの
 //!   マニフェスト形式（REQ-30・TASK-30.x）: 未実装。[`invariance`] は
 //!   構成要素ごとのダイジェストの集合までを提供し、配布パッケージ形式の
@@ -158,6 +162,7 @@ pub mod abstention;
 pub mod baseline;
 pub mod calibration;
 pub mod eval_data_invariance;
+pub mod final_test_once;
 pub mod holm;
 pub mod input_only;
 pub mod invariance;
