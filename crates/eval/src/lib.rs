@@ -100,7 +100,9 @@
 //!   工程への配線（issue #140）は未実装
 //! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:
 //!   判定ロジックは実装済み（TASK-26.3-1・issue #104・[`reproducibility`]）。
-//!   CPU 決定性テスト・GPU 未確認の限界の詳しい記述は未実装（issue #105）。
+//!   CPU 決定性テストは実装済み（TASK-26.3-2・issue #105・
+//!   `tests/reproducibility_determinism.rs`）。GPU（事前登録条件）での確認は
+//!   人間担当の未実施事項（#103）。
 //!   CLI `evaluate` への配線・3 seed 再学習ジョブ（REQ-34）との接続・
 //!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
 //! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
