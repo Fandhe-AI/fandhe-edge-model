@@ -268,6 +268,24 @@ pub fn read_open_file_bounded(
     label: &Path,
     limit: u64,
 ) -> Result<Vec<u8>, FsError> {
+    // 読み込み前に fd のサイズを確認する（REQ-39）。通常ファイル以外は FIFO 等で
+    // 読み込みが停止しないよう拒否する。
+    let metadata = file.metadata().map_err(|source| FsError::Read {
+        path: label.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(FsError::NotRegularFile {
+            path: label.to_path_buf(),
+        });
+    }
+    if metadata.len() > limit {
+        return Err(FsError::TooLarge {
+            path: label.to_path_buf(),
+            size: metadata.len(),
+            limit,
+        });
+    }
     let mut buf = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut buf)

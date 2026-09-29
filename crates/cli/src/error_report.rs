@@ -38,6 +38,7 @@ use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
+use fandhe_edge_guard::format::FormatRejection;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
@@ -169,6 +170,17 @@ impl ToErrorReport for PathRejection {
             self.exit_code(),
             format!("path rejected: {}", self.reason_code()),
         )
+    }
+}
+
+/// 形式・拡張子・サイズの拒否。理由コードだけの固定語彙で、パス・拡張子・内容を含めない（REQ-39）。
+impl ToErrorReport for FormatRejection {
+    fn to_error_report(&self) -> ErrorReport {
+        let code = self.exit_code();
+        if code == ExitCode::LimitExceeded {
+            return ErrorReport::new(code, "model file exceeds size limit");
+        }
+        ErrorReport::new(code, format!("format rejected: {}", self.reason_code()))
     }
 }
 

@@ -25,11 +25,15 @@
 //! Linux・macOS 以外では [`PathRejection::UnsupportedPlatform`]（`open_member` 側）で拒否する。
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::PathBuf;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::path::EscapeKind;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::path::{ConfinedDir, open_dir_confined};
-use crate::path::{ConfinedPath, EscapeKind, PathRejection, safe_join};
+use crate::path::{ConfinedPath, PathRejection, safe_join};
 
 /// workspace 配下へ閉じ込め済みのパッケージディレクトリ。[`confine_package`] だけが生成する。
 ///
@@ -38,6 +42,7 @@ use crate::path::{ConfinedPath, EscapeKind, PathRejection, safe_join};
 #[derive(Debug)]
 pub struct ConfinedPackage {
     /// 正準化した workspace（メンバーの実パスの包含確認に使う）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     workspace: PathBuf,
     /// 正準化したパッケージディレクトリ。
     dir: ConfinedPath,
@@ -63,6 +68,7 @@ pub fn confine_package(workspace: &Path, package: &Path) -> Result<ConfinedPacka
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let handle = open_dir_confined(&dir)?;
     Ok(ConfinedPackage {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         workspace: canon_workspace,
         dir,
         #[cfg(any(target_os = "linux", target_os = "macos"))]

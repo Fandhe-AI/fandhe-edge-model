@@ -12,24 +12,25 @@
 //! 1. `--package` を workspace（カレントディレクトリ）配下へ閉じ込め、ディレクトリであることを確認
 //! 2. パッケージ配下の `artifact.json` を、開いた fd から上限付きで読む
 //! 3. `onnx_file` を取り出し、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
-//!    開いた fd のサイズがランタイムの読み込み上限（`MAX_MODEL_FILE_BYTES`）以下であることを確認
-//!    （超過は `limit_exceeded`=20。REQ-39 資源の上限）
+//!    拡張子（`.onnx`）を確認し、保持した fd を上限（`MAX_MODEL_FILE_BYTES`）付きで読み切って
+//!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
+//!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
 //!
-//! ONNX の形式検査・サイズ上限の正式値の確定・sha256 照合は本モジュールの範囲外（TASK-39.2-4・
-//! TASK-39.5・TASK-39.6）。`--input-file`・`--out` の閉じ込めも範囲外。
+//! サイズ上限の正式値の確定・sha256 照合は本モジュールの範囲外（TASK-39.5・TASK-39.6）。`--input-file`・`--out` の閉じ込めも範囲外。
 //!
 //! # 後続（#136）への申し送り
 //!
-//! 返す [`GuardedInferInputs::onnx`] は検証つきで開いた [`File`]。推論への接続では、この
-//! `File` からバイト列を読んでランタイムへ渡すこと。パスから開き直すと検証後の差し替え
+//! 返す [`GuardedInferInputs::onnx`] は検証つきで開いて形式検査を通した [`CheckedFile`]。推論への接続では、この
+//! バイト列（`as_bytes`・`Read`）をランタイムへ渡すこと。パスから開き直すと検証後の差し替え
 //! （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。
 
-use std::fs::File;
 use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::{ArtifactOnnxRef, MAX_ARTIFACT_META_BYTES};
-use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_open_file_bounded;
+use fandhe_edge_guard::format::{CheckedFile, FormatAllowlist, FormatRejection, check_open_file};
+use fandhe_edge_guard::model_file::MODEL_FILE_EXTENSION;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::ConfinedPath;
 use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
@@ -45,8 +46,8 @@ const ARTIFACT_META_FILE: &str = "artifact.json";
 pub struct GuardedInferInputs {
     /// workspace 配下へ閉じ込め済みのパッケージ。
     pub package: ConfinedPackage,
-    /// 検証つきで開いた ONNX ファイル。読むときはこの `File` だけを使う。
-    pub onnx: File,
+    /// 検証つきで開き、形式検査を通した ONNX のバイト列。読むときはこれだけを使う。
+    pub onnx: CheckedFile,
     /// `onnx` の実パス（表示・診断用。開き直さない）。
     pub onnx_path: ConfinedPath,
 }
@@ -76,17 +77,25 @@ pub fn guard_infer_paths(
     let (onnx, onnx_path) = package
         .open_member(Path::new(onnx_ref.onnx_file()))
         .map_err(|e| e.to_error_report())?;
-    // 開いた fd のメタデータでサイズを確認する（パスから再取得しない。読み込み前の上限確認。REQ-39）。
-    let onnx_len = onnx
-        .metadata()
-        .map_err(|_| ErrorReport::new(ExitCode::RuntimeError, "cannot read model metadata"))?
-        .len();
-    if onnx_len > MAX_MODEL_FILE_BYTES {
-        return Err(ErrorReport::new(
-            ExitCode::LimitExceeded,
-            "model file exceeds size limit",
-        ));
+    // 実体パスの拡張子を確認してから、保持した fd を上限付きで読み切り形式を検査する
+    // （パスから開き直さない。読み込み前の上限確認は check_open_file 内。REQ-39）。
+    if onnx_path
+        .as_path()
+        .extension()
+        .is_none_or(|e| e != MODEL_FILE_EXTENSION)
+    {
+        return Err(FormatRejection::ExtensionNotAllowed {
+            expected: MODEL_FILE_EXTENSION,
+        }
+        .to_error_report());
     }
+    let onnx = check_open_file(
+        onnx,
+        onnx_path.as_path(),
+        &FormatAllowlist::onnx_only(),
+        MAX_MODEL_FILE_BYTES,
+    )
+    .map_err(|e| e.to_error_report())?;
     Ok(GuardedInferInputs {
         package,
         onnx,

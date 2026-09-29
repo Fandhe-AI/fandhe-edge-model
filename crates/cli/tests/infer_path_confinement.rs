@@ -10,6 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// 最小の ONNX 形（形式検査を通る）。
+const MIN_ONNX: [u8; 9] = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
+
 const ESCAPES: &str =
     "{\"code\":\"invalid_input\",\"message\":\"path rejected: path_escapes_root\"}\n";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -52,7 +55,7 @@ impl Sandbox {
         let dir = self.workspace().join(name);
         fs::create_dir_all(&dir).expect("mkdir pkg");
         fs::write(dir.join("artifact.json"), artifact_json).expect("write");
-        fs::write(dir.join("model.onnx"), b"onnx").expect("write");
+        fs::write(dir.join("model.onnx"), MIN_ONNX).expect("write");
         dir
     }
     /// `fandhe-edge infer --package <package> --text a` を workspace で起動する。
@@ -212,6 +215,20 @@ mod unix_only {
         assert_eq!(
             stdout,
             "{\"code\":\"invalid_input\",\"message\":\"path rejected: not_directory\"}\n"
+        );
+    }
+
+    /// REQ-39（形式の許可制）: pickle 偽装（拡張子は .onnx だが中身は pickle）は invalid_input（64）。
+    #[test]
+    fn req39_pickle_disguised_onnx_is_rejected() {
+        let sb = Sandbox::new("pickle");
+        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        fs::write(dir.join("model.onnx"), b"\x80\x04\x95\x00\x00\x00.").expect("write");
+        let (code, stdout) = sb.infer(Path::new("pkg"));
+        assert_eq!(code, Some(64));
+        assert_eq!(
+            stdout,
+            "{\"code\":\"invalid_input\",\"message\":\"format rejected: format_not_allowed\"}\n"
         );
     }
 
