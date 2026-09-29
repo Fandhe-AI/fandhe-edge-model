@@ -20,7 +20,7 @@
 //!   判断が要るため。`.claude/rules/dependency-policy.md`）
 
 use crate::mcnemar::McNemarError;
-use crate::metrics::{EvalError, MAX_LABELS};
+use crate::metrics::{EvalError, MAX_LABEL_BYTES, MAX_LABELS, MAX_LABELS_TOTAL_BYTES};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -130,6 +130,23 @@ pub(crate) fn validate_label_order<'a>(
             n_labels: label_order.len(),
             limit: MAX_LABELS,
         });
+    }
+
+    // ID のバイト長と合計を、索引の構築・複製の前に上限検証する（REQ-39）。
+    let mut total_bytes: usize = 0;
+    for (pos, &label) in label_order.iter().enumerate() {
+        if label.len() > MAX_LABEL_BYTES {
+            return Err(EvalError::LabelTooLong {
+                index: pos,
+                limit: MAX_LABEL_BYTES,
+            });
+        }
+        total_bytes = total_bytes.saturating_add(label.len());
+        if total_bytes > MAX_LABELS_TOTAL_BYTES {
+            return Err(EvalError::LabelsTotalTooLarge {
+                limit: MAX_LABELS_TOTAL_BYTES,
+            });
+        }
     }
 
     let mut index: BTreeMap<&'a str, usize> = BTreeMap::new();

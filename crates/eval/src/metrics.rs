@@ -113,6 +113,20 @@ pub enum EvalError {
         /// 上限（[`MAX_LABELS`]）。
         limit: usize,
     },
+    /// ラベル ID 1 件のバイト長が上限（[`MAX_LABEL_BYTES`]）を超える。
+    ///
+    /// ラベル ID を `String` へ複製する前に拒否する（REQ-39 資源の上限）。
+    LabelTooLong {
+        /// 宣言順での位置（0 始まり。ラベル本文は含めない）。
+        index: usize,
+        /// 上限（[`MAX_LABEL_BYTES`]）。
+        limit: usize,
+    },
+    /// ラベル ID 全体の合計バイト数が上限（[`MAX_LABELS_TOTAL_BYTES`]）を超える。
+    LabelsTotalTooLarge {
+        /// 上限（[`MAX_LABELS_TOTAL_BYTES`]）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -132,6 +146,12 @@ impl fmt::Display for EvalError {
             }
             EvalError::TooManyLabels { n_labels, limit } => {
                 write!(f, "too many labels: {n_labels} exceeds limit {limit}")
+            }
+            EvalError::LabelTooLong { index, limit } => {
+                write!(f, "label id at index {index} exceeds {limit} bytes")
+            }
+            EvalError::LabelsTotalTooLarge { limit } => {
+                write!(f, "label ids exceed total limit of {limit} bytes")
             }
         }
     }
@@ -285,6 +305,17 @@ pub struct ConfusionMatrix {
 /// 十分な余裕を持ちつつ、単一の判定でプロセスを終了させうる規模の
 /// アロケーションを防ぐ。
 pub const MAX_LABELS: usize = 4096;
+
+/// ラベル ID 1 件あたりの最大 UTF-8 バイト数（学習ワーカー側
+/// `fandhe-edge-train` の `MAX_LABEL_BYTES` と同値。REQ-39）。
+/// 評価器は学習層より下位のため参照できず、値の一致は train 側の結合テスト
+/// （`crates/train/tests/train_contract_fixture.rs`）で機械照合する。
+/// ラベル ID を複製・保持する前に検証する。
+pub const MAX_LABEL_BYTES: usize = 256;
+
+/// ラベル ID 全体の合計バイト数の上限（[`MAX_LABELS`] × [`MAX_LABEL_BYTES`]。
+/// 1 MiB。REQ-39）。
+pub const MAX_LABELS_TOTAL_BYTES: usize = MAX_LABELS * MAX_LABEL_BYTES;
 
 impl ConfusionMatrix {
     /// 混同行列を確保する。`n_labels` が [`MAX_LABELS`] を超える場合、
