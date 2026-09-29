@@ -288,6 +288,15 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# Mac 実機で人間が実行する実機前提の確認（`ci` には含めない。REQ-32・TASK-32.3・#115）
+.PHONY: check-runtime-linkage
+check-runtime-linkage: ## 推論ランタイムの動的リンク確認（Mac 実機前提・人間が実行。REQ-32・#115）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	sh scripts/check-runtime-linkage.sh
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-runtime-linkage をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
