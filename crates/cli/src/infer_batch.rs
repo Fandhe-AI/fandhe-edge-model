@@ -19,7 +19,8 @@
 //! - 成功（exit 0）: レコードごとに `JudgmentResult` の 1 行を入力順に出す（形は `--text` と同一）
 //! - 失敗: 全件の解析・検証・推論・`JudgmentResult` 構築の検証を書き込み前に終えるため、結果行は
 //!   1 行も出さず、`ErrorReport`（`{"code","message"}`）を 1 行だけ出す。失敗が複数あれば
-//!   入力順で最初のものを採る（決定的）
+//!   入力順で最初のものを採る（決定的。優先規則は `first_failure` に集約。入力側の失敗行より前の
+//!   レコードだけを推論し、その推論失敗が入力側の失敗より先ならそちらを採る）
 //! - `JudgmentResult` は検証の段階では作って即捨て、書き込みの段階で 1 件ずつ作り直して
 //!   書く。結果行を全件保持しないため、選択肢 ID が結果ごとに複製されて大きくなるメモリ消費
 //!   （選択肢 ID の合計長 × 件数）が入力に比例して膨らまない。保持するのは
@@ -49,8 +50,10 @@
 //! [`BatchLimits::for_cli_process`] を使い、切り離したスレッドはプロセス終了で回収する。
 //!
 //! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
-//! 出力段階は行の間で `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は書き込み失敗と同じ
-//! `io::Error`（出力が壊れるため `ErrorReport` は追記しない）。1 回の `write` 自体が読み手の
+//! 出力段階は各行の書き込みと flush の完了後（最後の行を含む）に
+//! `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は成功にせず `limit_exceeded`（出力が壊れる
+//! ため `ErrorReport` は追記しない）。1 行目の書き込み前に超過済みなら、何も書かず `io::Error`。
+//! ウォッチドッグの起動に失敗したら、上限なしで書かず `io::Error`（exit 70）で終える。1 回の `write` 自体が読み手の
 //! 停止でブロックする場合は `Write` では中断できないため、CLI 経路（`for_cli_process`）では
 //! ウォッチドッグが期限でプロセスを exit 70 で終了する。
 //!
@@ -150,13 +153,38 @@ fn read_batch_records_with_limit<R: Read>(
     byte_limit: usize,
     deadline: Option<Instant>,
 ) -> Result<Vec<InferInput>, ErrorReport> {
+    let (records, failure) = read_batch_records_partial(reader, io, byte_limit, deadline);
+    failure.map_or(Ok(records), Err)
+}
+
+/// 読み取りの失敗があっても、失敗した行より前の検証済みレコードを返す版（REQ-33・TASK-33.4）。
+///
+/// 戻り値の失敗は「入力順で最初の入力側の失敗」で、レコード数（= 失敗行の位置）と組で
+/// [`first_failure`] へ渡し、先行行の推論エラーとの優先を決める。有効 0 件も失敗（`invalid_input`）。
+fn read_batch_records_partial<R: Read>(
+    reader: R,
+    io: &IoSchema,
+    byte_limit: usize,
+    deadline: Option<Instant>,
+) -> (Vec<InferInput>, Option<ErrorReport>) {
+    let mut records = Vec::new();
+    let failure = read_records_into(reader, io, byte_limit, deadline, &mut records).err();
+    (records, failure)
+}
+
+fn read_records_into<R: Read>(
+    reader: R,
+    io: &IoSchema,
+    byte_limit: usize,
+    deadline: Option<Instant>,
+    records: &mut Vec<InferInput>,
+) -> Result<(), ErrorReport> {
     // 入力全体は上限 + 1 バイトで打ち切る（無制限の読み取りの防止。REQ-39）。
     let cap = u64::try_from(byte_limit)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let mut reader = BufReader::new(reader.take(cap));
     let mut consumed: usize = 0;
-    let mut records = Vec::new();
     // 1 行ずつ、行長の上限 + 1 バイトまでしかバッファへ確保しない。巨大な単一行・空白行のみの
     // 入力でも、拒否前にファイル全体をメモリへ保持しない（REQ-39）。
     loop {
@@ -189,7 +217,23 @@ fn read_batch_records_with_limit<R: Read>(
     if records.is_empty() {
         return Err(report(ExitCode::InvalidInput));
     }
-    Ok(records)
+    Ok(())
+}
+
+/// 入力側の失敗（読み取り・検証。失敗行の直前までのレコードは推論済み）と先行行の推論側の
+/// 失敗のうち、入力順で最初のものを採る（REQ-33・TASK-33.4）。
+///
+/// 推論側の失敗は失敗行より前の行で起きたものだけが渡されるため、あれば常にそれが先。
+/// バッチ全体の終了コードの優先規則はここに集約する。
+fn first_failure<T>(
+    prefix_outcome: Result<T, ErrorReport>,
+    input_failure: Option<ErrorReport>,
+) -> Result<T, ErrorReport> {
+    match (prefix_outcome, input_failure) {
+        (Err(inference_failure), _) => Err(inference_failure),
+        (Ok(_), Some(input_failure)) => Err(input_failure),
+        (Ok(value), None) => Ok(value),
+    }
 }
 
 /// 1 行（改行を含む）を最大 `MAX_INFER_INPUT_BYTES + 2` バイトまで読む。
@@ -297,20 +341,36 @@ struct OutputWatchdog {
 
 impl OutputWatchdog {
     /// `enabled` なら `duration` 後にプロセスを終了するウォッチドッグを起動する。
-    fn arm(enabled: bool, duration: Duration) -> Option<Self> {
+    ///
+    /// # Errors
+    /// スレッドを起動できなければ `Err`。上限なしで続行せず、呼び出し側は fail-closed で
+    /// 終える（REQ-39）。
+    fn arm(enabled: bool, duration: Duration) -> io::Result<Option<Self>> {
+        Self::arm_with(enabled, duration, |task| {
+            thread::Builder::new()
+                .name("infer-batch-watchdog".to_string())
+                .spawn(task)
+                .map(|_| ())
+        })
+    }
+
+    /// 起動手段を差し替えられる版（起動失敗の回帰テスト用）。
+    fn arm_with(
+        enabled: bool,
+        duration: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<Option<Self>> {
         if !enabled {
-            return None;
+            return Ok(None);
         }
         let (tx, rx) = mpsc::channel::<()>();
-        let spawned = thread::Builder::new()
-            .name("infer-batch-watchdog".to_string())
-            .spawn(move || {
-                // 送信側の drop（解除）は Disconnected で返る。Timeout のときだけ終了する。
-                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(duration) {
-                    std::process::exit(i32::from(ExitCode::RuntimeError.code()));
-                }
-            });
-        spawned.ok().map(|_| Self { _disarm: tx })
+        spawn(Box::new(move || {
+            // 送信側の drop（解除）は Disconnected で返る。Timeout のときだけ終了する。
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(duration) {
+                std::process::exit(i32::from(ExitCode::RuntimeError.code()));
+            }
+        }))?;
+        Ok(Some(Self { _disarm: tx }))
     }
 }
 
@@ -366,8 +426,21 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     deadline: Option<Instant>,
     output_byte_limit: usize,
 ) -> Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport> {
-    let records = read_batch_records_until(reader, io, deadline)?;
-    let predictions = predict_batch(pipeline, options, &records, deadline, output_byte_limit)?;
+    let (records, input_failure) =
+        read_batch_records_partial(reader, io, MAX_INFER_BATCH_TOTAL_BYTES, deadline);
+    // 入力エラーが後続行にあっても、先行行の推論エラーが入力順で先なら、それを採る。
+    // 失敗行より前のレコードだけを推論する（失敗行以降は推論しない）。
+    let predictions = if records.is_empty() {
+        Vec::new()
+    } else {
+        first_failure(
+            predict_batch(pipeline, options, &records, deadline, output_byte_limit),
+            input_failure.clone(),
+        )?
+    };
+    if let Some(failure) = input_failure {
+        return Err(failure);
+    }
     // 出力の途中で打ち切ると出力が壊れるため、書き始める前にだけ期限を確認する。
     if deadline_passed(deadline) {
         return Err(report(ExitCode::LimitExceeded));
@@ -469,7 +542,8 @@ where
         }
     };
     // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
-    let _watchdog = OutputWatchdog::arm(limits.terminate_process_on_stall, limits.output_duration);
+    // 起動に失敗したら上限なしで書かず、何も書かずに Err（exit 70）で終える。
+    let _watchdog = OutputWatchdog::arm(limits.terminate_process_on_stall, limits.output_duration)?;
     match outcome {
         Ok((records, predictions)) => {
             let output_deadline = Instant::now().checked_add(limits.output_duration);
@@ -485,6 +559,11 @@ where
                 let result = judgment_from_prediction(options, record.id(), prediction)
                     .map_err(|error| io::Error::other(error.message))?;
                 write_ok_judgment(out, &result)?;
+                // 最後の行を含め、書き込みと flush の完了後に期限を確認する。超過なら成功にせず
+                // `limit_exceeded`（出力は壊れているため ErrorReport は追記しない）。
+                if deadline_passed(output_deadline) {
+                    return Ok(ExitCode::LimitExceeded);
+                }
             }
             Ok(ExitCode::Ok)
         }
@@ -615,10 +694,40 @@ mod tests {
     /// REQ-39: 期限内に解除（drop）したウォッチドッグはプロセスを終了しない。
     #[test]
     fn req39_watchdog_disarmed_before_deadline_does_not_exit() {
-        let guard = OutputWatchdog::arm(true, Duration::from_millis(50));
+        let guard = OutputWatchdog::arm(true, Duration::from_millis(50)).unwrap();
         assert!(guard.is_some());
         drop(guard);
         std::thread::sleep(Duration::from_millis(150));
-        assert!(OutputWatchdog::arm(false, Duration::from_millis(1)).is_none());
+        assert!(
+            OutputWatchdog::arm(false, Duration::from_millis(1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// REQ-39: ウォッチドッグの起動に失敗したら、上限なしで続行せず `Err`（fail-closed）。
+    #[test]
+    fn req39_watchdog_spawn_failure_is_error_not_unbounded() {
+        let result = OutputWatchdog::arm_with(true, Duration::from_secs(1), |_task| {
+            Err(io::Error::other("spawn failed"))
+        });
+        assert!(result.is_err());
+    }
+
+    /// REQ-33: 入力順で最初の失敗を採る。先行行の推論失敗は後続行の入力失敗より優先し、
+    /// 推論失敗が無ければ入力失敗を返す。
+    #[test]
+    fn req33_first_failure_prefers_earlier_inference_failure() {
+        let inference = Err::<(), _>(report(ExitCode::RuntimeError));
+        let input = Some(report(ExitCode::InvalidInput));
+        assert_eq!(
+            first_failure(inference, input.clone()).unwrap_err().code,
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            first_failure(Ok(()), input).unwrap_err().code,
+            ExitCode::InvalidInput
+        );
+        assert!(first_failure(Ok(()), None).is_ok());
     }
 }

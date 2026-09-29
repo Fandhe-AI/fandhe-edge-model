@@ -470,3 +470,55 @@ fn req39_batch_output_deadline_stops_writing() {
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     assert!(out.is_empty());
 }
+
+/// REQ-33・REQ-21: 先行行の推論失敗（runtime_error）は、後続行の入力失敗（invalid_input）より
+/// 入力順で先なので、そちらを採る。
+#[test]
+fn req33_batch_earlier_inference_failure_wins_over_later_input_error() {
+    let (code, text) =
+        run(b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"f\"}\nnot json\n");
+    assert_single_error(code, &text, ExitCode::RuntimeError, "runtime_error");
+}
+
+/// REQ-33: 入力失敗が先の行にあれば、後続行の推論失敗があってもその入力失敗を採る。
+#[test]
+fn req33_batch_earlier_input_error_wins_over_later_inference_failure() {
+    let (code, text) =
+        run(b"{\"id\":\"r1\",\"input\":\"a\"}\nnot json\n{\"id\":\"r3\",\"input\":\"f\"}\n");
+    assert_single_error(code, &text, ExitCode::InvalidInput, "invalid_input");
+}
+
+/// 書き込みのたびに一定時間止まる出力先（出力期限の回帰テスト用）。
+struct SlowWriter(Vec<u8>);
+
+impl Write for SlowWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(150));
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REQ-39: 最後の行の書き込みで出力期限を超えたら、成功にせず `limit_exceeded`。
+#[test]
+fn req39_batch_last_row_exceeding_output_deadline_is_limit_exceeded() {
+    let definition = definition();
+    let (pipeline, _) = pipeline();
+    let mut out = SlowWriter(Vec::new());
+    let code = emit_infer_batch_with_limits(
+        &mut out,
+        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+        definition.io(),
+        definition.options(),
+        pipeline,
+        BatchLimits {
+            output_duration: Duration::from_millis(50),
+            ..BatchLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(code, ExitCode::LimitExceeded);
+}
