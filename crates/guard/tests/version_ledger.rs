@@ -2,10 +2,11 @@
 //! 証拠種別: テストハーネス。合成ファイル・一時ディレクトリ）。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::FsError;
+use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_guard::version_ledger::{
     ArtifactKind, CreatedAt, LedgerError, VersionId, VersionLedger,
 };
@@ -44,6 +45,7 @@ fn at() -> CreatedAt {
 }
 
 /// REQ-39: ファイルから記録したハッシュが具体値と一致する。
+#[cfg(unix)]
 #[test]
 fn req39_record_file_hash_and_time() {
     let sb = Sandbox::new("ok");
@@ -52,7 +54,14 @@ fn req39_record_file_hash_and_time() {
     fs::write(sb.0.join("empty"), b"").unwrap();
     let mut l = VersionLedger::new();
     let e = l
-        .record_file(ArtifactKind::Model, id("v1"), &p, 1024, at())
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0,
+            Path::new("model.onnx"),
+            1024,
+            at(),
+        )
         .unwrap();
     assert_eq!(e.sha256().to_hex(), V1_HEX);
     assert_eq!(e.created_at().to_rfc3339_utc(), "2026-09-21T14:13:20Z");
@@ -60,7 +69,8 @@ fn req39_record_file_hash_and_time() {
         .record_file(
             ArtifactKind::Data,
             id("d1"),
-            &sb.0.join("empty"),
+            &sb.0,
+            Path::new("empty"),
             1024,
             at(),
         )
@@ -70,6 +80,7 @@ fn req39_record_file_hash_and_time() {
 }
 
 /// REQ-39: サイズ超過・非通常ファイル・不存在は台帳を変えずに拒否される。
+#[cfg(unix)]
 #[test]
 fn req39_record_file_failures_leave_ledger_empty() {
     let sb = Sandbox::new("fail");
@@ -78,17 +89,31 @@ fn req39_record_file_failures_leave_ledger_empty() {
     let mut l = VersionLedger::new();
 
     let err = l
-        .record_file(ArtifactKind::Model, id("v1"), &big, 4, at())
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0,
+            Path::new("big"),
+            4,
+            at(),
+        )
         .unwrap_err();
     assert!(matches!(err, LedgerError::Io(FsError::TooLarge { .. })));
     assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
 
     let err = l
-        .record_file(ArtifactKind::Model, id("v1"), &sb.0, 1024, at())
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0,
+            Path::new("."),
+            1024,
+            at(),
+        )
         .unwrap_err();
     assert!(matches!(
         err,
-        LedgerError::Io(FsError::NotRegularFile { .. })
+        LedgerError::Path(PathRejection::NotRegularFile { .. })
     ));
     assert_eq!(err.exit_code(), ExitCode::InvalidInput);
 
@@ -96,7 +121,8 @@ fn req39_record_file_failures_leave_ledger_empty() {
         .record_file(
             ArtifactKind::Model,
             id("v1"),
-            &sb.0.join("nope"),
+            &sb.0,
+            Path::new("nope"),
             1024,
             at(),
         )
@@ -106,23 +132,62 @@ fn req39_record_file_failures_leave_ledger_empty() {
 }
 
 /// REQ-39: 重複は、ファイルを読む前に拒否される。
+#[cfg(unix)]
 #[test]
 fn req39_duplicate_checked_before_reading_file() {
     let sb = Sandbox::new("dup");
     let p = sb.0.join("model.onnx");
     fs::write(&p, b"model-v1").unwrap();
     let mut l = VersionLedger::new();
-    l.record_file(ArtifactKind::Model, id("v1"), &p, 1024, at())
-        .unwrap();
+    l.record_file(
+        ArtifactKind::Model,
+        id("v1"),
+        &sb.0,
+        Path::new("model.onnx"),
+        1024,
+        at(),
+    )
+    .unwrap();
     let err = l
         .record_file(
             ArtifactKind::Model,
             id("v1"),
-            &sb.0.join("nope"),
+            &sb.0,
+            Path::new("nope"),
             1024,
             at(),
         )
         .unwrap_err();
     assert!(matches!(err, LedgerError::DuplicateVersion { .. }));
     assert_eq!(l.len(), 1);
+}
+
+/// REQ-39: ルート外参照（`../`・絶対パス・symlink）は台帳を変えずに拒否される（open_confined 経由）。
+#[cfg(unix)]
+#[test]
+fn req39_record_file_rejects_escapes_from_root() {
+    let sb = Sandbox::new("escape");
+    let root = sb.0.join("root");
+    let outside = sb.0.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret"), b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link_dir")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret"), root.join("link_file")).unwrap();
+
+    let mut l = VersionLedger::new();
+    let abs = outside.join("secret");
+    for cand in [
+        Path::new("../outside/secret"),
+        abs.as_path(),
+        Path::new("link_dir/secret"),
+        Path::new("link_file"),
+    ] {
+        let err = l
+            .record_file(ArtifactKind::Model, id("v1"), &root, cand, 1024, at())
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::Path(_)), "{cand:?}: {err}");
+        assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+    }
+    assert!(l.is_empty());
 }

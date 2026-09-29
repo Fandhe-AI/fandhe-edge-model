@@ -10,16 +10,19 @@
 //!   ダイジェストの読み取りだけで書けるよう API を揃えている
 //! - 台帳はメモリ上のみで、永続化（JSON への保存・読み戻し）は未実装。ガード層への
 //!   `serde` 系の配置が dependency-policy で未承認のため（永続化時は台帳ファイルの改ざん検証も課題）
-//! - [`VersionLedger::record_file`] は渡されたパスをそのまま開く。ルート外参照の拒否は
-//!   呼び出し側が [`crate::path`] を通す責務（CLI への組み込みは TASK-39.4-2・#159）
+//! - [`VersionLedger::record_file`] は `(root, candidate)` を受け取り、[`crate::path::open_confined`]
+//!   で閉じ込め検証と open を一体で行う。返されたハンドルだけからサイズ上限付きでハッシュを
+//!   計算し、パスを開き直さない（`../`・絶対パス・symlink によるルート外参照と、検証後の差し替え
+//!   〔TOCTOU〕を拒否する。REQ-39）。CLI への組み込みは TASK-39.4-2・#159
 //! - ファイルサイズ上限の値は TASK-39.5 が決め、本モジュールは渡された値を強制する
 //! - 追記のみ。同じ `(種別, 版 ID)` の再記録は拒否し、記録済みハッシュの差し替えを防ぐ（完全性）
 //!
 //! 時刻は共通コア・データ契約の型を流用せず本モジュールの [`CreatedAt`] で持つ
 //! （ガード層は共通コアのみに依存する方針のため。REQ-32）。
 
+use crate::path::{PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::fs::{FsError, sha256_file_bounded};
+use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::path::Path;
@@ -244,19 +247,22 @@ impl VersionLedger {
         self.entries.last().ok_or(LedgerError::Internal)
     }
 
-    /// ファイルの sha256 をサイズ上限付きのストリームで計算して記録する。
-    /// 重複・容量を先に検査し、ハッシュ計算に失敗したときは台帳を変更しない。
-    /// パスの閉じ込めは呼び出し側の責務（モジュール doc 参照）。
+    /// `root` 配下の `candidate` を [`open_confined`] で開き、そのハンドルから sha256 を
+    /// サイズ上限付きのストリームで計算して記録する（パスは開き直さない）。
+    /// 重複・容量を先に検査し、閉じ込め違反・ハッシュ計算の失敗時は台帳を変更しない。
     pub fn record_file(
         &mut self,
         kind: ArtifactKind,
         id: VersionId,
-        path: &Path,
+        root: &Path,
+        candidate: &Path,
         max_bytes: u64,
         created_at: CreatedAt,
     ) -> Result<&VersionEntry, LedgerError> {
         self.check_room(kind, &id)?;
-        let digest = sha256_file_bounded(path, max_bytes).map_err(LedgerError::Io)?;
+        let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
+        let digest = sha256_open_file_bounded(file, confined.as_path(), max_bytes)
+            .map_err(LedgerError::Io)?;
         self.record(kind, id, digest, created_at)
     }
 
@@ -318,6 +324,8 @@ pub enum LedgerError {
     Internal,
     /// ファイルの読み込み・ハッシュ計算の失敗。
     Io(FsError),
+    /// 経路の閉じ込め違反・open の拒否（[`PathRejection`]）。
+    Path(PathRejection),
 }
 
 impl LedgerError {
@@ -338,6 +346,7 @@ impl LedgerError {
                 ExitCode::InvalidInput
             }
             LedgerError::Io(_) => ExitCode::RuntimeError,
+            LedgerError::Path(p) => p.exit_code(),
         }
     }
 }
@@ -373,6 +382,7 @@ impl fmt::Display for LedgerError {
             LedgerError::ClockUnavailable => f.write_str("system clock is unavailable"),
             LedgerError::Internal => f.write_str("internal ledger inconsistency"),
             LedgerError::Io(e) => write!(f, "{e}"),
+            LedgerError::Path(p) => write!(f, "{p}"),
         }
     }
 }
