@@ -38,12 +38,25 @@ fn script_path() -> PathBuf {
 }
 
 fn run_script(args: &[&str]) -> Out {
-    run_script_env(args, &[])
+    run_script_in(None, args)
+}
+
+/// カレントディレクトリを指定して起動する（`infer` の経路ガードは cwd を workspace とする。#159）。
+fn run_script_in(cwd: Option<&std::path::Path>, args: &[&str]) -> Out {
+    run_script_in_env(cwd, args, &[])
 }
 
 /// `run_script` に環境変数を追加で渡す版（実行記録の検証用。TASK-36.1-2）。
 fn run_script_env(args: &[&str], envs: &[(&str, &str)]) -> Out {
-    let mut child = Command::new("sh")
+    run_script_in_env(None, args, envs)
+}
+
+fn run_script_in_env(cwd: Option<&std::path::Path>, args: &[&str], envs: &[(&str, &str)]) -> Out {
+    let mut cmd = Command::new("sh");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         // 独立したプロセスグループで起動し、タイムアウト時に子孫も終了できるようにする
         .process_group(0)
         .arg(script_path())
@@ -167,15 +180,30 @@ fn req36_no_args_still_reports_exit_code() {
 }
 
 /// スクリプトが非ゼロの終了コードを握りつぶさないこと。
+/// 経路ガード（#159）を通る有効なパッケージを置いた一時 workspace で実行し、スタブの 70 を確認する。
 /// #136 で工程が接続されたらこの期待を置き換える。
 #[test]
 fn req36_infer_nonzero_exit_is_propagated_via_sh() {
-    let o = run_script(&["--package", "p", "--text", "a"]);
+    let ws = std::env::temp_dir().join(format!("fandhe-noninteractive-{}-ws", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(ws.join("p")).expect("mkdir");
+    std::fs::write(ws.join("p/artifact.json"), r#"{"onnx_file":"model.onnx"}"#).expect("write");
+    // 最小の ONNX 形（形式検査を通る）。
+    std::fs::write(
+        ws.join("p/model.onnx"),
+        [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78],
+    )
+    .expect("write");
+    let o = run_script_in(Some(&ws), &["--package", "p", "--text", "a"]);
+    let _ = std::fs::remove_dir_all(&ws);
     assert_eq!(o.code, Some(70));
-    let expected = expected_stdout(&ErrorReport::new(
-        ExitCode::RuntimeError,
-        "stage not implemented yet (TASK-33.1-2)",
-    ));
+    // Linux・macOS 以外の unix ではガードが fail-closed で 70（unsupported_platform）を返す。
+    let message = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        "stage not implemented yet (TASK-33.1-2)"
+    } else {
+        "path rejected: unsupported_platform"
+    };
+    let expected = expected_stdout(&ErrorReport::new(ExitCode::RuntimeError, message));
     assert_eq!(o.stdout, expected);
     assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
 }

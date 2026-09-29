@@ -48,6 +48,15 @@ impl ScoringBackend for TickBackend {
         self.clock.set(self.clock.get() + self.base + self.step * k);
         Ok(vec![0.75, 0.25])
     }
+
+    fn scores_limited(
+        &self,
+        ids: &TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, BackendError> {
+        // このテストは時間上限を使わないため、計算は scores と同一にする。
+        self.scores(ids)
+    }
 }
 
 fn report(base: u64, step: u64, iters: usize) -> LatencyReport {
