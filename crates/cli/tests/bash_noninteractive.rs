@@ -171,3 +171,50 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
     assert_eq!(o.stdout, expected);
     assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
 }
+
+/// 偽の実行ファイル（sh スクリプト）を一時ディレクトリへ作り、スクリプト経由で実行する。
+fn run_with_fake_bin(name: &str, body: &str) -> Out {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "fandhe-noninteractive-{}-{name}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let bin = dir.join("fake-bin");
+    std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = Command::new("sh")
+        .arg(script_path())
+        .arg("--help")
+        .env("FANDHE_EDGE_BIN", &bin)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    std::fs::remove_dir_all(&dir).ok();
+    Out {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// シグナル終了など契約外の終了値は runtime_error(70) の JSON 1 つへ写ること（REQ-21）。
+#[test]
+fn req21_signal_termination_maps_to_runtime_error_70() {
+    let o = run_with_fake_bin("signal", "kill -9 $$");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge terminated abnormally\"}\n"
+    );
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+}
+
+/// 結果 JSON を出した後に 127 を返しても stdout は 1 JSON のままであること（REQ-33）。
+#[test]
+fn req33_output_then_127_keeps_single_json_and_exit_70() {
+    let o = run_with_fake_bin("out127", "echo '{\"code\":\"ok\"}'\nexit 127");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(o.stdout, "{\"code\":\"ok\"}\n");
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+}

@@ -12,8 +12,8 @@
 #   - stdout は CLI の出力を無加工で中継する（1 呼び出し 1 JSON。REQ-33）
 #   - stderr は CLI の stderr に続けて診断 `exit_code=<N>` を 1 行だけ出す
 #     （引数値・入力テキストは出さない）
-#   - 終了コードは CLI のものをそのまま返す。バイナリが無ければ
-#     runtime_error の JSON を stdout に出して 70
+#   - 終了コードは CLI のもの（7 種）をそのまま返す。契約外の値・バイナリ不在は
+#     runtime_error(70) へ写し、JSON が無ければ補う（stdout は常に 1 JSON）
 #
 # バイナリ: 環境変数 FANDHE_EDGE_BIN、無ければ
 #   ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge
@@ -44,16 +44,30 @@ if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
     launch_failed
 fi
 
+# stdout は一時ファイルへ退避し、終了値の確定後に 1 JSON だけを出す
+# （実行後に 126/127 を返す実行ファイルが JSON を出していても二重出力しない。REQ-33）
+out=$(mktemp) || launch_failed
+trap 'rm -f "$out"' EXIT
+
 # ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
-if "$bin" infer ${1+"$@"} </dev/null; then
+if "$bin" infer ${1+"$@"} </dev/null >"$out"; then
     rc=0
 else
     rc=$?
 fi
-# CLI の終了コードは 7 種（0/10/11/12/20/64/70）に固定のため、126（実行不能）・
-# 127（見つからない。壊れた shebang 等）は起動失敗とみなして runtime_error にする
-if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
-    launch_failed
-fi
+
+# CLI の終了コードは 7 種（0/10/11/12/20/64/70）に固定のため、それ以外
+# （126・127・シグナル終了の 128+N 等の契約外）は runtime_error(70) へ写す（REQ-21）。
+# CLI が JSON を出さなかった場合のみ、こちらで runtime_error の JSON を補う
+case "$rc" in
+    0 | 10 | 11 | 12 | 20 | 64 | 70) ;;
+    *)
+        if [ ! -s "$out" ]; then
+            printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge terminated abnormally"}' >"$out"
+        fi
+        rc=70
+        ;;
+esac
+cat "$out"
 echo "exit_code=$rc" >&2
 exit "$rc"
