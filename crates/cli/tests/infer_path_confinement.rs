@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// 最小の ONNX 形（形式検査を通る）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MIN_ONNX: [u8; 9] = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
 
 const ESCAPES: &str =
