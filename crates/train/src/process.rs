@@ -966,11 +966,18 @@ pub fn run_train_cancellable(
     let mut pre_exited: Option<ExitStatus> = None;
     let mut stdout_wait = None;
     if let Some(rx) = stdout_rx.as_ref() {
-        let mut cancel_seen = false;
+        // キャンセルは各刻みで確認する。`StillRunning`（kill 送出失敗で停止を
+        // 確認できない）の場合も待ちを一括せず、次の刻みで kill を再試行する
+        // （codex/review 指摘 P1。REQ-34・REQ-39）。壁時計の上限は緩めない。
         let first = loop {
-            if cancel.is_cancelled() {
-                cancel_seen = true;
-                break Err(mpsc::RecvTimeoutError::Timeout);
+            if pre_exited.is_none() && cancel.is_cancelled() {
+                match cancel_child(&mut child, started)? {
+                    CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
+                    // キャンセルが間に合わず子は既に終了していた（kill しない）。
+                    // 通常経路へ合流し、stdout を締め切りまで待つ。
+                    CancelStep::AlreadyExited(status) => pre_exited = Some(status),
+                    CancelStep::StillRunning => {}
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(remaining.min(POLL_INTERVAL)) {
@@ -979,23 +986,6 @@ pub fn run_train_cancellable(
             }
         };
         stdout_wait = Some(first);
-        if cancel_seen {
-            match cancel_child(&mut child, started)? {
-                CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
-                CancelStep::AlreadyExited(status) => {
-                    // キャンセルが間に合わず子は既に終了していた（kill しない）。
-                    // 通常経路へ合流するため、stdout を改めて締め切りまで待つ。
-                    pre_exited = Some(status);
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    stdout_wait = Some(rx.recv_timeout(remaining));
-                }
-                CancelStep::StillRunning => {
-                    // 停止を確認できていない。監視を続け、壁時計の上限まで待つ。
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    stdout_wait = Some(rx.recv_timeout(remaining));
-                }
-            }
-        }
     }
     // `stdout_wait` が `None` になるのは `stdout_pipe` を取得できなかった
     // 場合だが、本関数は常に `stdout(Stdio::piped())` を指定するため
