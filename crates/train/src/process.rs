@@ -640,17 +640,22 @@ enum CancelStep {
 /// 「完了検知・タイムアウト時の回収順序」と同じ不変条件）。子孫は lifeline
 /// に委ねる。
 #[cfg(unix)]
-fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, TrainProcessError> {
+fn cancel_child(
+    child: &mut Child,
+    started: Instant,
+    wall_deadline: Instant,
+) -> Result<CancelStep, TrainProcessError> {
     use std::os::unix::process::ExitStatusExt;
-    // `Interrupted` が続いても期限（`KILL_WAIT_TIMEOUT`）で抜ける
-    // （codex/review 指摘 P1。REQ-39「資源の上限」）。
-    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
+    // キャンセル処理全体の待機を `min(KILL_WAIT_TIMEOUT, 壁時計の残り)` で
+    // 抑える。`Interrupted` が続いてもこの期限で抜ける（codex/review 指摘
+    // P0・P1。REQ-39「資源の上限」）。
+    let deadline = bounded_deadline(Instant::now(), wall_deadline);
     match try_wait_interrupt_bounded(|| child.try_wait(), deadline) {
         Ok(Some(status)) => return Ok(CancelStep::AlreadyExited(status)),
         Ok(None) => {}
         Err(e) => {
             let _ = child.kill();
-            let _ = wait_after_kill(child);
+            let _ = wait_after_kill_until(child, deadline);
             return Err(TrainProcessError::Wait { kind: e.kind() });
         }
     }
@@ -665,7 +670,7 @@ fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, Train
             _ => Ok(CancelStep::StillRunning),
         };
     }
-    let status = wait_after_kill(child)?;
+    let status = wait_after_kill_until(child, deadline)?;
     // `try_wait()` が `None` を返した直後に子が自然終了すると、未回収（ゾンビ）
     // の子への `kill()` は成功しうる。回収した状態が `SIGKILL` 終了でなければ
     // 自然終了なので、`Cancelled` とせず通常の結果分類へ戻す（成功した学習を
@@ -775,7 +780,23 @@ fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Op
 /// 持たない。issue #178 PR #233 レビュー。モジュール doc 参照）。
 #[cfg(unix)]
 fn wait_after_kill(child: &mut Child) -> Result<ExitStatus, TrainProcessError> {
-    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
+    wait_after_kill_until(child, Instant::now() + KILL_WAIT_TIMEOUT)
+}
+
+/// キャンセル待機の期限。`now + KILL_WAIT_TIMEOUT` と壁時計の期限の早い方
+/// （壁時計の上限を超えて待たない。REQ-39）。
+#[cfg(unix)]
+fn bounded_deadline(now: Instant, wall_deadline: Instant) -> Instant {
+    (now + KILL_WAIT_TIMEOUT).min(wall_deadline)
+}
+
+/// [`wait_after_kill`] の期限指定版。`deadline` までに回収できなければ
+/// [`TrainProcessError::KillWaitTimedOut`]（既存規約どおり回収を主張しない）。
+#[cfg(unix)]
+fn wait_after_kill_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<ExitStatus, TrainProcessError> {
     match poll_wait_bounded(child, deadline) {
         Ok(Some(status)) => Ok(status),
         Ok(None) => Err(TrainProcessError::KillWaitTimedOut),
@@ -1019,7 +1040,7 @@ pub fn run_train_cancellable(
             // 壁時計の期限後に観測したキャンセルは採用しない（期限超過を
             // `Cancelled` で隠さない。codex/review 指摘 P1。REQ-39）。
             if pre_exited.is_none() && cancel_applies(Instant::now(), deadline, cancel) {
-                match cancel_child(&mut child, started)? {
+                match cancel_child(&mut child, started, deadline)? {
                     CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
                     // キャンセルが間に合わず子は既に終了していた（kill しない）。
                     // 通常経路へ合流し、stdout を締め切りまで待つ。
@@ -1061,7 +1082,7 @@ pub fn run_train_cancellable(
         // キャンセルより壁時計超過（`WallTimeout`）を優先し、超過を
         // `Cancelled` で隠さない（codex/review 指摘 P1。REQ-39）。
         if cancel_applies(Instant::now(), wait_deadline, cancel) {
-            match cancel_child(&mut child, started)? {
+            match cancel_child(&mut child, started, wait_deadline)? {
                 CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
                 CancelStep::AlreadyExited(status) => {
                     pre_exited = Some(status);
@@ -1308,6 +1329,42 @@ mod tests {
         assert!(cancel_applies(now, now + Duration::from_secs(1), &token));
         assert!(!cancel_applies(now, now, &token));
         assert!(!cancel_applies(now + Duration::from_secs(1), now, &token));
+    }
+
+    /// REQ-39: キャンセル待機の期限は壁時計の残りで抑える。
+    #[cfg(unix)]
+    #[test]
+    fn bounded_deadline_is_min_of_kill_wait_and_wall_remaining() {
+        let now = Instant::now();
+        let short = now + Duration::from_millis(100);
+        assert_eq!(bounded_deadline(now, short), short);
+        let long = now + KILL_WAIT_TIMEOUT + Duration::from_secs(60);
+        assert_eq!(bounded_deadline(now, long), now + KILL_WAIT_TIMEOUT);
+        assert_eq!(bounded_deadline(now, now), now);
+    }
+
+    /// REQ-34・REQ-39: 壁時計の残りが短いとき、SIGKILL を受けない子に対する
+    /// キャンセルの回収待ちが `KILL_WAIT_TIMEOUT` ではなく残り時間内で終わる。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_wait_is_bounded_by_wall_remaining() {
+        // SIGKILL は無視できないため、子が終了しない状況は作れない。代わりに
+        // 期限切れの壁時計でも、生きている子の kill 後の回収が
+        // 5 秒より十分早く（即時に）終わることと、結果が有限であることを確かめる。
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let r = cancel_child(&mut child, started, started + Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        match r {
+            Ok(CancelStep::Cancelled(run)) => assert_eq!(run.signal(), Some(SIGKILL)),
+            Err(TrainProcessError::KillWaitTimedOut) => {}
+            _ => panic!("unexpected cancel step"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
