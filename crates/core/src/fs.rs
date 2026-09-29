@@ -197,7 +197,35 @@ pub fn open_regular_file_for_read(path: &Path) -> Result<File, FsError> {
 /// `fandhe_edge_eval::invariance` の両方がこの関数を使う
 /// （issue #214 codex/review 指摘: 防御ロジックの複製を解消する）。
 pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, FsError> {
-    let (mut file, metadata) = open_regular_file_with_metadata(path)?;
+    let (file, metadata) = open_regular_file_with_metadata(path)?;
+    read_bounded_from_file(file, &metadata, path, limit)
+}
+
+/// 既に開いた通常ファイルのハンドルを `limit` バイトまでの上限付きで読み切る（REQ-39）。
+///
+/// [`read_bounded`] と同じ上限検査を、パスを開き直さずに行う。閉じ込め検証済みのハンドル
+/// （`fandhe_edge_guard::path::open_confined` の戻り値）をそのまま渡すための入口。
+/// `path` はエラー表示専用で、開き直しには使わない。ハンドルが通常ファイルでなければ
+/// [`FsError::NotRegularFile`]（FIFO 等で読み込みが停止しないようにするため）。
+pub fn read_bounded_open_file(file: File, path: &Path, limit: u64) -> Result<Vec<u8>, FsError> {
+    let metadata = file.metadata().map_err(|source| FsError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(FsError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    read_bounded_from_file(file, &metadata, path, limit)
+}
+
+fn read_bounded_from_file(
+    mut file: File,
+    metadata: &Metadata,
+    path: &Path,
+    limit: u64,
+) -> Result<Vec<u8>, FsError> {
     let reported_size = metadata.len();
     if reported_size > limit {
         return Err(FsError::TooLarge {
