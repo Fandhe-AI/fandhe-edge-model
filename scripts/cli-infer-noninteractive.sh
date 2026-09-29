@@ -51,11 +51,20 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 70
 fi
 
-# バッチ（infer --input-file）は 1 行 1 JSON を認める（REQ-33）。引数から判別する
+# バッチ（infer --input-file）は 1 行 1 JSON を認める（REQ-33）。CLI（args.rs の INFER_OPTS）と
+# 同じくオプションと値を対応づけて走査し、他オプションの値として現れた `--input-file` は
+# バッチ指定とみなさない（infer のオプションはすべて値を取る）
 batch=0
+skip=0
 for a in ${1+"$@"}; do
+    if [ "$skip" -eq 1 ]; then
+        skip=0
+        continue
+    fi
     case "$a" in
-        --input-file | --input-file=*) batch=1 ;;
+        --input-file) batch=1; skip=1 ;;
+        --input-file=*) batch=1 ;;
+        --package | --text | --id | --out) skip=1 ;;
     esac
 done
 
@@ -207,8 +216,15 @@ esac
 # stdout の検証（awk の再帰下降パーサー。RFC 8259 の構文を検査し、既存ツールのみで完結させる）。
 # 単一モードは 1 行 1 オブジェクトのみ、バッチは各行がオブジェクト。終了値: 0=正常・
 # 1=JSON 不正・2=`code` と終了コードの不一致（REQ-21・REQ-33）。
-# 対応表は fixtures/exitcode/exit_codes.json と同一（bash_noninteractive.rs が照合する）
+# 対応表は fixtures/exitcode/exit_codes.json と同一（bash_noninteractive.rs が照合する）。
+# エスケープを含む top-level のキー・`code` の値は復号せず不一致として拒否する
+# （CLI は escape した `code` を出さない。REQ-21）
 check_output() {
+    # 1 行 1 JSON の契約のため、終端が改行でない出力（末尾の改行欠落）は不正とする（REQ-33）。
+    # $(...) は末尾の改行を落とすため、最終バイトが改行のときだけ空になる
+    if [ -n "$(tail -c 1 "$out")" ]; then
+        return 1
+    fi
     LC_ALL=C awk -v batch="$batch" -v rc="$rc" '
     function isdig(c) { return c != "" && index("0123456789", c) > 0 }
     function skipws(   c) {
@@ -219,12 +235,13 @@ check_output() {
         }
     }
     function pstring(   c, k, h, start) {
-        pos++; start = pos
+        pos++; start = pos; hasesc = 0
         while (pos <= n) {
             c = substr(s, pos, 1)
             if (c == "\"") { strval = substr(s, start, pos - start); pos++; return 1 }
             if (c < " ") return 0
             if (c == "\\") {
+                hasesc = 1
                 pos++; c = substr(s, pos, 1)
                 if (c != "" && index("\"\\/bfnrt", c) > 0) { pos++; continue }
                 if (c == "u") {
@@ -276,7 +293,7 @@ check_output() {
         if (c == "n") return pliteral("null")
         return pnumber()
     }
-    function pobject(depth,   key, first, c) {
+    function pobject(depth,   key, first, c, keyesc) {
         pos++; skipws()
         if (substr(s, pos, 1) == "}") { pos++; return 1 }
         while (1) {
@@ -284,13 +301,15 @@ check_output() {
             if (substr(s, pos, 1) != "\"") return 0
             if (!pstring()) return 0
             key = strval
+            keyesc = hasesc
             skipws()
             if (substr(s, pos, 1) != ":") return 0
             pos++; skipws()
             first = substr(s, pos, 1)
             if (!pvalue(depth + 1)) return 0
+            if (depth == 0 && keyesc) { codebad = 1; hascode = 1 }
             if (depth == 0 && key == "code") {
-                if (hascode || first != "\"") codebad = 1
+                if (hascode || first != "\"" || hasesc) codebad = 1
                 else code = strval
                 hascode = 1
             }

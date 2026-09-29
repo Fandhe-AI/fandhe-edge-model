@@ -545,3 +545,50 @@ fn req39_descendant_output_after_parent_exit_hits_output_limit() {
         "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge output exceeded size limit\"}\n"
     );
 }
+
+/// 他オプションの値として現れた `--input-file` はバッチ指定とみなさず、複数行は拒否する。
+/// 値として消費された `--out` 等の後に本物の `--input-file` があればバッチ（REQ-33）。
+#[test]
+fn req33_input_file_as_option_value_is_not_batch() {
+    let body = "echo '{\"code\":\"ok\"}'\necho '{\"code\":\"ok\"}'\nexit 0";
+    for args in [
+        vec!["--text", "--input-file"],
+        vec!["--package", "--input-file", "--text", "a"],
+        vec!["--text=--input-file"],
+    ] {
+        let o = run_with_fake_bin_args("valbatch", body, &args, &[]);
+        assert_eq!(o.code, Some(70), "{args:?}");
+        assert_eq!(o.stdout, INVALID_OUTPUT, "{args:?}");
+    }
+    let o = run_with_fake_bin_args(
+        "realbatch",
+        body,
+        &["--package", "p", "--out", "o", "--input-file", "f"],
+        &[],
+    );
+    assert_eq!(o.code, Some(0));
+}
+
+/// エスケープを含む top-level のキー・`code` は復号せず拒否する（REQ-21）。
+#[test]
+fn req21_escaped_code_or_key_is_rejected() {
+    let cases = [
+        ("esc_value", r#"{"code":"\u006fk"}"#),
+        ("esc_key", r#"{"co\u0064e":"runtime_error"}"#),
+    ];
+    for (name, json) in cases {
+        let o = run_with_fake_bin(name, &format!("printf '%s\\n' '{json}'\nexit 0"));
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+    }
+}
+
+/// 末尾に改行の無い出力は 1 行 1 JSON の契約に反するため置き換える（REQ-33）。
+#[test]
+fn req33_missing_trailing_newline_is_rejected() {
+    for args in [vec!["--help"], vec!["--input-file", "f"]] {
+        let o = run_with_fake_bin_args("nonl", "printf '{\"code\":\"ok\"}'\nexit 0", &args, &[]);
+        assert_eq!(o.code, Some(70), "{args:?}");
+        assert_eq!(o.stdout, INVALID_OUTPUT, "{args:?}");
+    }
+}
