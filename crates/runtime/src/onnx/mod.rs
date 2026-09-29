@@ -253,6 +253,19 @@ impl ScoringBackend for OnnxBackend {
             Inner::C3(m) => m.scores(ids),
         }
     }
+
+    fn scores_limited(
+        &self,
+        ids: &TokenIds,
+        limit: std::time::Duration,
+    ) -> Result<Vec<f64>, BackendError> {
+        let ids = ids.as_slice();
+        check_token_ids(ids)?;
+        match &self.inner {
+            Inner::C1(m) => m.scores_limited(ids, limit),
+            Inner::C3(m) => m.scores_limited(ids, limit),
+        }
+    }
 }
 
 /// 前処理（`max_bytes` の範囲検証つき）と ONNX バックエンドを束ねた推論パイプラインを組み立てる。

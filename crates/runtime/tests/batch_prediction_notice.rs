@@ -33,6 +33,15 @@ impl ScoringBackend for MockBackend {
         let t = a + b + c;
         Ok(vec![a / t, b / t, c / t])
     }
+
+    fn scores_limited(
+        &self,
+        ids: &TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, BackendError> {
+        // このテストは時間上限を使わないため、計算は scores と同一にする。
+        self.scores(ids)
+    }
 }
 
 fn pipeline() -> InferencePipeline<MockPre, MockBackend> {

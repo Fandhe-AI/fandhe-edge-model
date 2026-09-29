@@ -20,6 +20,9 @@
 //! - [`capacity`][]: 容量計測コア（REQ-30・TASK-30.1-1・#122）。実装済み。上限照合
 //!   （TASK-30.2）・配布パッケージ形式は後続 TASK。エラーの終了コード・公開メッセージへの
 //!   写像（TASK-30.1-2・#123）を持ち、JSON 直列化は CLI 側
+//! - [`export_exclusion`][]: 書き出し不能・予測ずれの構成を配布候補から外し理由を記録する
+//!   （REQ-32 異常系・TASK-32.2・#114）。既知制約は PoC-14 実測の表、実行時検出はテストハーネス。
+//!   `tract-onnx`・`ort` は未承認のため実行しない。JSON 直列化は CLI 側、`package` への配線は TASK-33.x
 //! - [`latency`][]: 推論のみの待ち時間の反復計測ハーネス（REQ-31・TASK-31.1-1・#127）。
 //!   実モデルでの計測は #113 後
 //! - [`latency_report`][]: p95 の厳密な整数算出と、250ms を参考値として明記したレポート
@@ -47,6 +50,7 @@
 //! 工程の接続（#136）後に追加する。
 
 pub mod capacity;
+pub mod export_exclusion;
 pub mod latency;
 pub mod latency_limit;
 pub mod latency_report;

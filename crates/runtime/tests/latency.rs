@@ -29,6 +29,14 @@ struct TickBackend {
     fail_at: Option<u64>,
 }
 impl ScoringBackend for TickBackend {
+    /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+    fn scores_limited(
+        &self,
+        ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+        self.scores(ids)
+    }
     fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         let k = self.calls.get();
         self.calls.set(k + 1);
@@ -159,6 +167,14 @@ fn non_monotonic_clock_is_rejected() {
     // 推論のたびに時計を巻き戻す。
     struct Rewind(Rc<Cell<u64>>);
     impl ScoringBackend for Rewind {
+        /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+        fn scores_limited(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+            _limit: std::time::Duration,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            self.scores(ids)
+        }
         fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
             self.0.set(self.0.get().saturating_sub(10));
             Ok(vec![1.0])
