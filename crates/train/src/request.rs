@@ -13,7 +13,9 @@
 //! # 経路の閉じ込めについて
 //!
 //! `root`・`train_path`・`out_dir` はここでは**文字列としての構文検査のみ**を
-//! 行う（空・NUL・絶対/相対の取り違え・`..` 構成要素・`.` のみの拒否）。
+//! 行う（空・NUL・絶対/相対の取り違え・`..` 構成要素の拒否は 3 フィールド共通。
+//! `.` のみの拒否は相対パスの `train_path`・`out_dir` のみで、`root` は `.`・
+//! 末尾 `/`・連続 `/` を受理する。`root` の `..` 拒否は #256）。
 //! ファイルシステムへの実際の閉じ込め（存在確認・dir_fd による symlink 対策）
 //! は行わない。これは学習ワーカー自身が多層防御として `guard.py::confine` で
 //! 検証する設計（`contract.py` のモジュール docstring 参照）であり、Rust 側
@@ -363,9 +365,14 @@ fn is_default_rss_bytes(value: &u64) -> bool {
 }
 
 /// `root`（絶対パス）の構文検査。`guard.py::resolve_root` の文字列レベルの
-/// 規則（存在確認・open は行わない）。
+/// 規則（存在確認・open は行わない）。空・NUL・非絶対パスに加え、`..` 構成要素
+/// を拒否する（REQ-39・#256）。`.`・末尾 `/`・連続 `/`・`..b` のように `..` を
+/// 名前の一部に含むだけの要素は受理する（`guard.py::resolve_root` と同じ規則）。
 fn check_root_syntax(value: &str) -> Result<(), TrainRequestError> {
     if value.is_empty() || value.contains('\0') || !value.starts_with('/') {
+        return Err(TrainRequestError::InvalidPath { field: "root" });
+    }
+    if value.split('/').any(|part| part == "..") {
         return Err(TrainRequestError::InvalidPath { field: "root" });
     }
     Ok(())
@@ -906,11 +913,33 @@ mod tests {
     /// `root` の構文検査: 絶対パスでない・空・NUL を拒否する。
     #[test]
     fn req39_rejects_malformed_root() {
-        for bad in ["", "relative/root", "with\0nul"] {
+        for bad in [
+            "",
+            "relative/root",
+            "with\0nul",
+            "/..",
+            "/a/..",
+            "/a/../b",
+            "/a/../",
+        ] {
             let mut params = valid_params();
             params.root = bad.to_string();
             let err = TrainRequest::new(params).unwrap_err();
             assert_eq!(err.reason_code(), "invalid_path", "case: {bad:?}");
+        }
+    }
+
+    /// REQ-39・#256: `root` の `.`・末尾 `/`・連続 `/`・`..` を名前の一部に含む
+    /// だけの要素は受理し、入力文字列のまま保つ（正規化しない）。
+    #[test]
+    fn req39_accepts_root_with_dot_trailing_slash_and_dotdot_like_names() {
+        for ok in [
+            "/", "/a/.", "/a/./b", "/a/", "/a//b", "//a", "/a/..b", "/a/b..", "/a/.../b",
+        ] {
+            let mut params = valid_params();
+            params.root = ok.to_string();
+            let req = TrainRequest::new(params).expect(ok);
+            assert_eq!(req.root(), ok);
         }
     }
 

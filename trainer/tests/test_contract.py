@@ -100,6 +100,58 @@ def test_load_request_accepts_valid_request(tmp_path: Path) -> None:
         req.close_resources()
 
 
+_TRAIN_LINES = '{"input": "x", "label": "a"}\n{"input": "y", "label": "b"}\n'
+
+
+def test_load_request_rejects_root_with_parent_component(tmp_path: Path) -> None:
+    """REQ-39・#256: 実在するパスでも `root` の `..` 構成要素は `invalid_path`／
+    exit 64 で拒否する（修正前は realpath で解決されて受理されていた）。
+    """
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "train.jsonl").write_text(_TRAIN_LINES, encoding="utf-8")
+    for bad in (
+        f"{tmp_path}/sub/..",
+        f"{tmp_path}/sub/../",
+        f"{tmp_path}/../{tmp_path.name}",
+    ):
+        req_dict = {**_base_request(tmp_path), "root": bad}
+        p = _write(tmp_path / "req.json", req_dict)
+        with pytest.raises(WorkerError) as exc_info:
+            contract.load_request(p)
+        assert exc_info.value.code == "invalid_path", bad
+        assert int(exc_info.value.exit_code) == 64, bad
+
+
+def test_load_request_accepts_root_dot_and_trailing_slash(tmp_path: Path) -> None:
+    """REQ-39・#256: `.`・末尾 `/`・連続 `/` を含む `root` は受理する。"""
+    (tmp_path / "train.jsonl").write_text(_TRAIN_LINES, encoding="utf-8")
+    for ok in (f"{tmp_path}/.", f"{tmp_path}/", f"{tmp_path}//", f"{tmp_path}/./"):
+        req_dict = {**_base_request(tmp_path), "root": ok}
+        p = _write(tmp_path / "req.json", req_dict)
+        req = contract.load_request(p)
+        try:
+            assert req.root.root_real == Path(os.path.realpath(tmp_path)), ok
+        finally:
+            req.close_resources()
+
+
+def test_load_request_accepts_root_with_dotdot_like_names(tmp_path: Path) -> None:
+    """REQ-39・#256: `..b`・`b..`・`...` のように `..` を名前の一部に含む
+    だけの要素は構成要素 `..` ではないため受理する。
+    """
+    for name in ("..b", "b..", "..."):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "train.jsonl").write_text(_TRAIN_LINES, encoding="utf-8")
+        req_dict = {**_base_request(tmp_path), "root": str(d)}
+        p = _write(tmp_path / "req.json", req_dict)
+        req = contract.load_request(p)
+        try:
+            assert req.root.root_real == Path(os.path.realpath(d)), name
+        finally:
+            req.close_resources()
+
+
 def test_load_request_accepts_nested_relative_path(tmp_path: Path) -> None:
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "train.jsonl").write_text(

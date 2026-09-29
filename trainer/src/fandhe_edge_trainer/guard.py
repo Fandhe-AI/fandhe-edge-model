@@ -109,6 +109,10 @@ def resolve_root(root_raw: object) -> RootHandle:
 
     存在しない・ディレクトリでない場合は拒否する。呼び出し側は使い終わったら
     必ず `close()` する（`TrainRequest.close_resources()` 参照）。
+
+    `..` 構成要素は拒否する。`.`・末尾 `/`・連続 `/`・`..b` のような名前の一部に
+    `..` を含むだけの要素は受理する（Rust `check_root_syntax` と同じ規則。
+    REQ-39・#256）。判定は realpath の前に文字列上で行う。
     """
     _assert_dir_fd_support()
     if not isinstance(root_raw, str) or not root_raw:
@@ -117,6 +121,8 @@ def resolve_root(root_raw: object) -> RootHandle:
         raise _invalid_path("root must not contain NUL")
     if not os.path.isabs(root_raw):
         raise _invalid_path("root must be an absolute path")
+    if ".." in root_raw.split("/"):
+        raise _invalid_path("root must not contain '..' components")
     real = Path(os.path.realpath(root_raw))
     try:
         fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY)
