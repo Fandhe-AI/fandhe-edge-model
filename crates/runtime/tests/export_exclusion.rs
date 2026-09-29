@@ -389,3 +389,25 @@ fn req39_parity_time_limit_checked_after_last_inference() {
     assert_eq!(e.code(), "limit_exceeded");
     assert_eq!(calls, 2);
 }
+
+/// REQ-39: 残り時間が極小なら、推論中の打ち切りで停止する（推論後の検査に頼らない）。
+#[test]
+fn req39_parity_deadline_enforced_during_inference() {
+    let f = fixture(ModelKind::C1);
+    let bytes = fs::read(&f.path).expect("read model");
+    let pipeline = from_bytes(&bytes, ModelKind::C1, f.max_bytes).expect("pipeline");
+    let labels = vec![0usize; f.inputs.len()];
+    let cases = parity_cases(&f, &labels);
+    let one = cases.get(..1).expect("at least one case");
+    let limit = Duration::from_secs(1);
+    // 推論前の確認では残り 1ns。推論の打ち切り上限に渡り、推論自体が TimeLimitExceeded で止まる
+    let mut calls = 0u32;
+    let e = check_prediction_parity_with_clock(&pipeline, one, limit, || {
+        calls += 1;
+        limit - Duration::from_nanos(1)
+    })
+    .expect_err("deadline during inference");
+    assert!(matches!(e, ScreeningError::ParityTimeExceeded));
+    // 推論後の検査に到達せず、推論前の 1 回だけで止まる
+    assert_eq!(calls, 1);
+}

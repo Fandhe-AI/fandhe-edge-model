@@ -35,7 +35,7 @@
 
 use crate::onnx::{ModelKind, OnnxBackend, OnnxLoadError, load_pipeline};
 use crate::pipeline::{
-    InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES,
+    BackendError, InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES,
 };
 use crate::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_core::hash::Sha256Digest;
@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 pub const MAX_EXPORT_CANDIDATES: usize = 64;
 /// 1 候補あたりの照合ケース数の上限（バッチ推論の上限と同値。REQ-39）。
 pub const MAX_PARITY_CASES: usize = MAX_INFER_BATCH_LEN;
-/// 1 候補の予測照合全体の時間上限（REQ-39。暫定値。ケースごとの推論の合計に対する上限で、
-/// 各ケース推論の前に経過時間を確認する。1 件の推論自体は入力長の上限で有界）。
+/// 1 候補の予測照合全体の時間上限（REQ-39。暫定値。ケースごとの推論の合計に対する上限。
+/// 各推論には残り時間を打ち切り上限として渡すため、1 件の推論中にも期限を強制する）。
 pub const MAX_PARITY_DURATION: Duration = Duration::from_secs(60);
 
 /// 書き出し先の推論ランタイム。
@@ -452,14 +452,20 @@ where
     validate_parity_cases(cases)?;
     let mut mismatched = 0usize;
     for case in cases {
-        // 各推論の前に照合全体の期限を確認し、超過なら停止する（fail-closed。REQ-39）
-        if elapsed() >= max_duration {
+        // 各推論の前に照合全体の残り時間を確認し、尽きていれば停止する（fail-closed。REQ-39）
+        let now = elapsed();
+        if now >= max_duration {
             return Err(ScreeningError::ParityTimeExceeded);
         }
-        let pred = pipeline
-            .infer_one(case.input)
-            .map_err(ScreeningError::Infer)?;
-        // 推論中に期限を超えた場合（最後のケースを含む）も結果を確定させず停止する
+        // 残り時間を推論の打ち切り上限として渡し、1 件の推論中にも期限を強制する（REQ-39）
+        let pred = match pipeline.infer_one_within(case.input, max_duration.saturating_sub(now)) {
+            Ok(p) => p,
+            Err(InferError::Backend(BackendError::TimeLimitExceeded)) => {
+                return Err(ScreeningError::ParityTimeExceeded);
+            }
+            Err(e) => return Err(ScreeningError::Infer(e)),
+        };
+        // 打ち切り検査の粒度を超えて期限を過ぎた場合も結果を確定させず停止する
         if elapsed() >= max_duration {
             return Err(ScreeningError::ParityTimeExceeded);
         }

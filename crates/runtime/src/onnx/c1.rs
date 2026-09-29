@@ -193,6 +193,16 @@ impl C1Model {
         self.scores_within(ids, MAX_INFER_DURATION)
     }
 
+    /// 呼び出し側の残り時間（`limit`）と 1 件の上限 `MAX_INFER_DURATION` の小さい方で打ち切るスコア計算
+    /// （照合全体の期限を推論中にも強制するため。REQ-39）。
+    pub(super) fn scores_limited(
+        &self,
+        ids: &[i64],
+        limit: Duration,
+    ) -> Result<Vec<f64>, BackendError> {
+        self.scores_within(ids, limit.min(MAX_INFER_DURATION))
+    }
+
     /// 計算時間の上限付きのスコア計算。n-gram の走査・重み行の加算の反復境界で経過時間を検査し、
     /// 超過したら [`BackendError::TimeLimitExceeded`] で打ち切る（REQ-39）。
     fn scores_within(&self, ids: &[i64], limit: Duration) -> Result<Vec<f64>, BackendError> {

@@ -86,6 +86,17 @@ pub trait Preprocessor {
 pub trait ScoringBackend {
     /// 1 系列のスコア列（選択肢の宣言順）を返す。
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError>;
+
+    /// 計算時間を `limit` 以内に打ち切る版（超過は [`BackendError::TimeLimitExceeded`]。REQ-39）。
+    /// 既定実装は打ち切りを持たない `scores` と同じ。時間上限を強制できるバックエンドは上書きする。
+    fn scores_limited(
+        &self,
+        ids: &TokenIds,
+        limit: std::time::Duration,
+    ) -> Result<Vec<f64>, BackendError> {
+        let _ = limit;
+        self.scores(ids)
+    }
 }
 
 /// 前処理の失敗（本文を保持しない）。
@@ -261,7 +272,16 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
 
     /// 単体推論。`run_single` を呼ぶだけ。
     pub fn infer_one(&self, input: &str) -> Result<Prediction, InferError> {
-        self.run_single(input)
+        self.run_single(input, None)
+    }
+
+    /// 単体推論。スコア計算を `limit` 以内に打ち切る（超過は `Backend(TimeLimitExceeded)`。REQ-39）。
+    pub fn infer_one_within(
+        &self,
+        input: &str,
+        limit: std::time::Duration,
+    ) -> Result<Prediction, InferError> {
+        self.run_single(input, Some(limit))
     }
 
     /// バッチ推論。件数・総入力バイト数を処理前に検査し、1 件ずつ `run_single` を呼ぶだけ。
@@ -286,7 +306,7 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
         let mut results = Vec::with_capacity(inputs.len());
         let mut retained_scores = 0usize;
         for input in inputs {
-            let result = self.run_single(input);
+            let result = self.run_single(input, None);
             if let Ok(p) = &result {
                 retained_scores = retained_scores.saturating_add(p.scores.len());
                 if retained_scores > MAX_INFER_BATCH_TOTAL_SCORES {
@@ -302,11 +322,15 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
 
     /// `run_single` と同義の関数（評価器の推論関数へ渡す用。#118）。
     pub fn as_predict_fn(&self) -> impl Fn(&str) -> Result<Prediction, InferError> + '_ {
-        move |input| self.run_single(input)
+        move |input| self.run_single(input, None)
     }
 
     /// 単体・バッチ共通の唯一の経路。
-    fn run_single(&self, input: &str) -> Result<Prediction, InferError> {
+    fn run_single(
+        &self,
+        input: &str,
+        limit: Option<std::time::Duration>,
+    ) -> Result<Prediction, InferError> {
         if input.len() > MAX_INFER_INPUT_BYTES {
             return Err(InferError::InputTooLarge {
                 len: input.len(),
@@ -323,7 +347,11 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
                 limit: MAX_INFER_TOKEN_IDS,
             });
         }
-        let scores = self.backend.scores(&ids).map_err(InferError::Backend)?;
+        let scores = match limit {
+            Some(l) => self.backend.scores_limited(&ids, l),
+            None => self.backend.scores(&ids),
+        }
+        .map_err(InferError::Backend)?;
         if scores.len() > MAX_INFER_SCORES {
             return Err(InferError::TooManyScores {
                 len: scores.len(),
