@@ -253,6 +253,16 @@ pub fn verify_input_only<F>(
             actual,
         });
     }
+    // 照合対象の `item.input` も、ハッシュ計算の前に 1 件あたりの上限を検証する（REQ-39）。
+    // 記録器側の引数が小さくても、items 側の巨大 input で上限を迂回させない。
+    if items
+        .iter()
+        .any(|item| item.input.len() > MAX_INFER_INPUT_BYTES)
+    {
+        return Err(InputIsolationViolation::InputTooLarge {
+            limit: MAX_INFER_INPUT_BYTES,
+        });
+    }
     let indices: Vec<usize> = items
         .iter()
         .zip(recorder.records.iter())
@@ -423,6 +433,22 @@ mod tests {
         );
         assert_eq!(
             verify_input_only(&[], &r),
+            Err(InputIsolationViolation::InputTooLarge {
+                limit: MAX_INFER_INPUT_BYTES
+            })
+        );
+    }
+
+    /// REQ-39: 照合対象 items 側の巨大 input も、記録器の引数が小さくてもハッシュ前に拒否する。
+    #[test]
+    fn req39_oversized_item_input_rejected_in_verify() {
+        let mut r = ArgumentRecorder::new(|_: &str| 0u8);
+        assert_eq!(r.call("a"), Ok(0));
+        let big = "a".repeat(MAX_INFER_INPUT_BYTES + 1);
+        let tags: Vec<String> = vec![];
+        let it = items(&[big.as_str()], &tags);
+        assert_eq!(
+            verify_input_only(&it, &r),
             Err(InputIsolationViolation::InputTooLarge {
                 limit: MAX_INFER_INPUT_BYTES
             })
