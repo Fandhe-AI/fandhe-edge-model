@@ -15,8 +15,8 @@
 //!
 //! - 前処理: #112（TASK-32.1 配下）のバイト前処理（NFKC 正規化＋バイトエンコード）は
 //!   [`crate::preprocess::ByteEncodingPreprocessor`] が [`Preprocessor`] を実装する（REQ-32）
-//! - スコア計算: #113 の ONNX 推論が [`ScoringBackend`] を実装する想定。ONNX Runtime の
-//!   セッション API が `&mut` を要求する場合の内部可変性の扱いは #113 で判断する
+//! - スコア計算: [`crate::onnx::OnnxBackend`]（#113。自作の ONNX 推論）が [`ScoringBackend`] を
+//!   実装する。`&self` の純粋計算で内部可変性を持たない
 //! - 実装は呼び出し間で結果に影響する状態を持たないこと（REQ-28）。trait は `&self` だが
 //!   内部可変性は型で塞げないため契約として明記する
 //!
@@ -26,6 +26,7 @@
 //! 機械可読な `code()` 文字列のみ返す。エラー・`Debug` は入力本文やトークン値を保持しない
 //! （security.md）。
 
+use crate::prediction_provenance::ReferenceBatchPredictions;
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::judgment::{MAX_OPTIONS, SCORE_SUM_TOLERANCE};
 use std::fmt;
@@ -79,7 +80,7 @@ pub trait Preprocessor {
     fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError>;
 }
 
-/// スコア計算の継ぎ目（#113 の ONNX 推論が実装する想定）。
+/// スコア計算の継ぎ目（[`crate::onnx::OnnxBackend`] が実装する。#113）。
 ///
 /// 引数は 1 系列のみで、系列間パディングを型の上で表現できない。実装は呼び出し間で
 /// 結果に影響する状態を持たないこと（REQ-28）。
@@ -111,6 +112,12 @@ impl PreprocessError {
 pub enum BackendError {
     /// スコア計算を実行できない。
     Failed,
+    /// トークン列が空、または系列長がモデルの上限を超える（ONNX バックエンド。REQ-39）。
+    InvalidSequenceLength,
+    /// トークン値が語彙の範囲（`0..257`）外（ONNX バックエンド。REQ-39）。
+    InvalidTokenId,
+    /// 1 件の計算時間が上限を超えたため打ち切った（ONNX バックエンド。REQ-39）。
+    TimeLimitExceeded,
 }
 
 impl BackendError {
@@ -118,6 +125,9 @@ impl BackendError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Failed => "backend_failed",
+            Self::InvalidSequenceLength => "invalid_sequence_length",
+            Self::InvalidTokenId => "invalid_token_id",
+            Self::TimeLimitExceeded => "time_limit_exceeded",
         }
     }
 }
@@ -289,6 +299,16 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// 参考測定（判定に使わない目的）でバッチ API を使うときの入口（REQ-28 境界値・TASK-28.3・#120）。
+    /// [`Self::infer_batch`] をそのまま呼び、戻り値に「バッチ予測である」注記を結び付けるだけで、
+    /// 予測は変えない。判定経路は `infer_one` / `as_predict_fn` を使い、フラグは不要（TASK-28.1）。
+    pub fn infer_batch_for_reference(
+        &self,
+        inputs: &[&str],
+    ) -> Result<ReferenceBatchPredictions, BatchError> {
+        self.infer_batch(inputs).map(ReferenceBatchPredictions::new)
     }
 
     /// `run_single` と同義の関数（評価器の推論関数へ渡す用。#118）。

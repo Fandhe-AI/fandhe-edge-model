@@ -131,6 +131,7 @@ dependencies = [
  "fandhe-edge-core",
  "fandhe-edge-data",
  "fandhe-edge-eval",
+ "fandhe-edge-guard",
  "serde",
  "serde_json",
 ]
