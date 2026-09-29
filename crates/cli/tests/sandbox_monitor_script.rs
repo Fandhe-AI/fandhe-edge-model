@@ -350,7 +350,7 @@ fn req38_report_never_contains_raw_log_strings() {
         T3,
     );
     assert_eq!(o.code, Some(12), "{}", o.stdout);
-    has(&o, "\"network_deny_events\": 2");
+    has(&o, "\"network_deny_events\": 1");
     let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
     for needle in [
         "secret-host",
@@ -421,13 +421,41 @@ fn req38_unattributed_network_denial_is_pending() {
     has(&o, "\"unattributed_network_deny_events\": 1");
 }
 
-/// 形式に合わないが deny と network を含む行は fail-closed で pending(12)。
+/// 拒否行（`deny` を含む）なのに形式を読み取れない行は、`network` を含むか否かにかかわらず
+/// 判定不能(70)にする（「0 件」側へ倒さない。fail-closed）。
 #[test]
-fn req38_unrecognized_network_deny_line_is_not_ok() {
+fn req38_unrecognized_deny_line_is_undeterminable() {
+    for name in ["unrecognized.ndjson", "unrecognized_no_network.ndjson"] {
+        let e = Env::new();
+        let o = e.run(name, &e.base_args(), &[]);
+        assert_eq!(o.code, Some(70), "{name}: {}", o.stdout);
+        has(&o, "\"network_verdict\": \"undeterminable\"");
+        has(&o, "log stream contains a deny line in an unknown format");
+        assert!(!o.stdout.contains("unknown-layout"), "{}", o.stdout);
+    }
+}
+
+/// 拒否行ではない行（`denied` 等）は無視して件数に残し、判定を 70 にしない（判別子は語境界の
+/// `deny`）。空行・壊れた JSON は従来どおり 70。
+#[test]
+fn req38_non_deny_line_is_ignored_and_counted() {
     let e = Env::new();
-    let o = e.run("unrecognized.ndjson", &e.base_args(), &[]);
-    assert_eq!(o.code, Some(12), "{}", o.stdout);
-    has(&o, "\"unrecognized_deny_events\": 1");
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let stream = e.dir.join("ignored.ndjson");
+    fs::write(
+        &stream,
+        format!("{header}\n{{\"eventMessage\":\"something was denied here\"}}\n"),
+    )
+    .expect("write");
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"ignored_non_deny_events\": 1");
+    has(&o, "\"deny_events\": 0");
+    let blank = e.dir.join("blank.ndjson");
+    fs::write(&blank, format!("{header}\n\n")).expect("write");
+    let o2 = run_report(&e.dir, &blank, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o2.code, Some(70), "{}", o2.stdout);
 }
 
 /// JSON として読めない行があれば判定不能（70）。読めない行に拒否が隠れる可能性を排除する。

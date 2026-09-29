@@ -106,7 +106,15 @@ EVENT_RE = re.compile(
     r"^(?:(\d+) duplicate reports? for )?Sandbox: (.+)\((\d+)\) deny\((\d+)\) (\S+)(?: (.*))?$",
     re.DOTALL,
 )
+# 「拒否行」の判別子（唯一の定義）。語境界の `deny` で、`deny(1)`・`deny` は拒否行、`denied` 等は
+# 拒否行ではない。拒否行は EVENT_RE で操作を読み取れなければ判定不能になる
+DENY_LINE_RE = re.compile(r"\bdeny\b")
 UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def is_deny_line(msg: str) -> bool:
+    """`eventMessage` が拒否行か（判別子は DENY_LINE_RE の 1 か所）。"""
+    return DENY_LINE_RE.search(msg) is not None
 
 
 class Undeterminable(Exception):
@@ -208,7 +216,7 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
         "network_deny_events": 0,
         "tool_network_deny_events": 0,
         "unattributed_network_deny_events": 0,
-        "unrecognized_deny_events": 0,
+        "ignored_non_deny_events": 0,
     }
     records: list[dict] = []
     truncated = False
@@ -227,28 +235,17 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
 
     for msg in events_raw:
         counts["parsed_events"] += 1
-        if "deny" not in msg:
+        if not is_deny_line(msg):
+            # 拒否行ではない（述語の部分文字列 `deny` に `denied` 等が当たっただけ）。
+            # 無視してよい行はここだけで扱い、件数を `ignored_non_deny_events` に残す
+            counts["ignored_non_deny_events"] += 1
             continue
         counts["deny_events"] += 1
         m = EVENT_RE.match(msg)
         if m is None:
-            counts["unrecognized_deny_events"] += 1
-            if "network" in msg:
-                # 形式外でも network を含む拒否は fail-closed で帰属不明の通信拒否とする
-                counts["network_deny_events"] += 1
-                counts["unattributed_network_deny_events"] += 1
-                keep(
-                    {
-                        "process": None,
-                        "pid": None,
-                        "operation": None,
-                        "target_digest": target_digest(salt, msg),
-                        "occurrences": 1,
-                        "attribution": "unattributed",
-                        "recognized": False,
-                    }
-                )
-            continue
+            # 拒否行なのに操作を読み取れない（ログ形式の変化等）。`network` を含むか否かで分けず、
+            # 「0 件」側へ倒さないため判定不能にする（fail-closed。REQ-38）。本文は例外へ含めない
+            raise Undeterminable("log stream contains a deny line in an unknown format")
         dup, proc, pid, deny_n, op, target = m.groups()
         dup_n = int(dup) if dup is not None else 0
         counts["duplicate_reports"] += dup_n
@@ -352,7 +349,7 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
         "network_deny_events": 0,
         "tool_network_deny_events": 0,
         "unattributed_network_deny_events": 0,
-        "unrecognized_deny_events": 0,
+        "ignored_non_deny_events": 0,
     }
     counts = dict(counts_zero)
     records: list[dict] = []
