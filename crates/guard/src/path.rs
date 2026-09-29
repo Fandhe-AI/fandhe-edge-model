@@ -339,9 +339,16 @@ fn open_confined_impl(
     candidate: &Path,
 ) -> Result<(File, ConfinedPath), PathRejection> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let root_handle =
-        File::open(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
+    // ルートが FIFO 等のブロックする特殊ファイルでも open で停止しないよう `O_NONBLOCK` で開き、
+    // ディレクトリか否かは開いた fd の metadata で確認する（REQ-39。値は Linux 全アーキテクチャ共通）。
+    const O_NONBLOCK: i32 = 0o4000;
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(root)
+        .map_err(|source| PathRejection::RootUnresolvable { source })?;
     let root_meta = root_handle
         .metadata()
         .map_err(|source| PathRejection::RootUnresolvable { source })?;
@@ -382,8 +389,10 @@ fn open_confined_impl(
 
 /// macOS: ルートを 1 度だけ正準化して固定し、open 後に固定ルートで再検証して dev / inode を比較する。
 ///
-/// std だけでは fd の実パスを取れないため、再解決と比較の間の差し替えは検出できない
-/// 残余リスクがある（`F_GETPATH` / `openat` は `libc` 依存の承認後の課題）。
+/// 開いた fd と再解決先の dev / inode が一致する場合のみ通すため、通過するのは「ルート配下に
+/// 実在するファイルと同一 inode」に限られる（差し替え中に外部ファイルを開いても、同一 inode
+/// でない限り拒否される）。std だけでは fd の実パスを取れないため、再解決と比較の間の差し替えは
+/// 検出できない残余リスクがある（`F_GETPATH` / `openat` は `libc` 依存の承認後の課題）。
 #[cfg(target_os = "macos")]
 fn open_confined_impl(
     root: &Path,

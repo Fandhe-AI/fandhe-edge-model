@@ -257,3 +257,25 @@ fn req39_open_confined_rejects_non_regular_files_without_hanging() {
         }
     }
 }
+
+/// ルートが FIFO でも `open_confined` は停止せず `RootNotDirectory` を返す（REQ-39）。
+#[cfg(target_os = "linux")]
+#[test]
+fn req39_open_confined_root_fifo_does_not_hang() {
+    let sb = Sandbox::new("root_fifo");
+    let fifo = sb.base.join("rootfifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = open_confined(&fifo, Path::new("x")).map(|_| ());
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Err(PathRejection::RootNotDirectory)) => {}
+        other => panic!("expected RootNotDirectory without hanging, got {other:?}"),
+    }
+}
