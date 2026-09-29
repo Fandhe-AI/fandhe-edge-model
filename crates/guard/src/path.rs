@@ -457,6 +457,18 @@ fn ensure_real_path_under(
     canon_root: &Path,
     candidate: &Path,
 ) -> Result<PathBuf, PathRejection> {
+    // unlink 済み（`st_nlink == 0`）なら、開いた後に対象が差し替え・削除されている。fd 由来のパスは
+    // 実在しない名前（Linux の `(deleted)` 付き等）になるため、文字列に頼らず nlink で拒否する。
+    let stat = rustix::fs::fstat(fd).map_err(|e| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source: errno_to_io(e),
+    })?;
+    if stat.st_nlink == 0 {
+        return Err(PathRejection::Escapes {
+            candidate: candidate.to_path_buf(),
+            kind: EscapeKind::Symlink,
+        });
+    }
     let real = fd_real_path(fd).map_err(|source| PathRejection::Unresolvable {
         candidate: candidate.to_path_buf(),
         source,
@@ -529,12 +541,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 返す実パスは検証時の解決結果ではなく開いた fd 由来である。開いた後に同名の別ファイルへ
-    /// 差し替えると、fd は元の（削除済みの）対象を指し続け、fd 由来のパスにそれが反映される
-    /// （Linux の `/proc/self/fd` の `(deleted)` 表記で固定する。REQ-39・TASK-39.4-1）。
-    #[cfg(target_os = "linux")]
+    /// 開いた後に同名の別ファイルへ差し替えられ、fd が unlink 済みの対象になった場合は、実在しない
+    /// パスを ConfinedPath として返さず拒否する（`st_nlink == 0`。文字列照合に頼らない。
+    /// REQ-39・TASK-39.4-1）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn req39_confined_path_comes_from_opened_fd_not_from_validation() {
+    fn req39_replaced_after_open_is_rejected_not_returned_as_deleted_path() {
         use rustix::fs::{Mode, OFlags, openat};
         let base = std::env::temp_dir().join(format!("fandhe-guard-fdpath-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -556,12 +568,13 @@ mod tests {
         )
         .expect("open file");
         std::fs::rename(base.join("ws/g.txt"), base.join("ws/f.txt")).expect("swap");
-        let real =
-            ensure_real_path_under(&fd, &canon_root, Path::new("f.txt")).expect("under root");
-        assert_eq!(
-            real.to_string_lossy(),
-            format!("{} (deleted)", canon_root.join("f.txt").display())
-        );
+        match ensure_real_path_under(&fd, &canon_root, Path::new("f.txt")) {
+            Err(PathRejection::Escapes {
+                kind: EscapeKind::Symlink,
+                ..
+            }) => {}
+            other => panic!("expected Escapes for unlinked fd, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
