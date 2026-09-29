@@ -11,6 +11,12 @@
 //! 区間は推論 1 回の呼び出しのみ。CLI 起動・モデルロード・入力ファイル読み込みは区間外で、
 //! パイプライン構築（ロード）は呼び出し側が本関数の前に済ませる（REQ-31 の対象範囲）。
 //!
+//! # 資源上限（REQ-39）
+//!
+//! 総入力バイト数は推論前に検査する。計測全体の期限は各反復の開始前、推論 1 回の上限は
+//! 呼び出しの復帰後に検査し、超過は計測失敗として返す。同期呼び出し中の推論を強制中断は
+//! できない（協調的な検出。完全に停止する推論の中断は呼び出し側の子プロセス制御の責務）。
+//!
 //! # 範囲外（実装済みを装わない）
 //!
 //! - p95 算出・レポート・参考値の明記: #128（TASK-31.1-2）。上限照合と `limit_exceeded`:
@@ -20,7 +26,8 @@
 //!   証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ
 
 use crate::pipeline::{
-    InferError, InferencePipeline, MAX_INFER_BATCH_LEN, Prediction, Preprocessor, ScoringBackend,
+    InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES, Prediction,
+    Preprocessor, ScoringBackend,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -33,6 +40,13 @@ pub const DEFAULT_LATENCY_ITERS: usize = 1000;
 pub const MAX_LATENCY_WARMUP: usize = 1_000_000;
 /// 計測回数の上限（REQ-39 の暫定資源上限。`Vec<u64>` で約 8 MiB）。
 pub const MAX_LATENCY_ITERS: usize = 1_000_000;
+
+/// 計測全体（warmup と計測の合計）の時間上限の既定値（ns。10 分。REQ-39 の暫定値）。
+pub const DEFAULT_LATENCY_TOTAL_TIMEOUT_NS: u64 = 600_000_000_000;
+/// 推論 1 回あたりの時間上限の既定値（ns。10 秒。REQ-39 の暫定値）。
+pub const DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS: u64 = 10_000_000_000;
+/// 各時間上限として指定できる最大値（ns。1 時間。REQ-39 の暫定値）。
+pub const MAX_LATENCY_TIMEOUT_NS: u64 = 3_600_000_000_000;
 
 /// 単調時計の継ぎ目。テストでは偽の時計を注入して計測値を決定的にする。
 pub trait Clock {
@@ -97,6 +111,36 @@ pub enum LatencyError {
         /// 上限。
         limit: usize,
     },
+    /// 計測用の入力の総バイト数が [`MAX_INFER_BATCH_TOTAL_BYTES`] を超える（推論前に検査。REQ-39）。
+    TotalInputTooLarge {
+        /// 総入力バイト数（飽和加算）。
+        total: usize,
+        /// 上限。
+        limit: usize,
+    },
+    /// 時間上限が 0、または [`MAX_LATENCY_TIMEOUT_NS`] を超える（REQ-39）。
+    InvalidTimeout {
+        /// 指定値（ns）。
+        timeout_ns: u64,
+    },
+    /// 計測全体の時間上限を超えた（各反復の境界で検査する。REQ-39）。
+    DeadlineExceeded {
+        /// 超過した段階。
+        phase: LatencyPhase,
+        /// 段階内の 0 始まりの反復番号（次に実行するはずだった反復）。
+        iteration: usize,
+        /// 上限（ns）。
+        limit_ns: u64,
+    },
+    /// 推論 1 回が時間上限を超えた（呼び出しが戻った後に検出する。REQ-39）。
+    InferenceTimeout {
+        /// 超過した段階。
+        phase: LatencyPhase,
+        /// 段階内の 0 始まりの反復番号。
+        iteration: usize,
+        /// 上限（ns）。
+        limit_ns: u64,
+    },
     /// 推論が失敗した（fail-closed。失敗経路の時間を計測値に混ぜない）。
     Inference {
         /// 失敗した段階。
@@ -131,6 +175,10 @@ impl LatencyError {
             Self::ZeroIterations => "zero_iterations",
             Self::TooManyIterations { .. } => "too_many_iterations",
             Self::TooManyWarmup { .. } => "too_many_warmup",
+            Self::TotalInputTooLarge { .. } => "total_input_too_large",
+            Self::InvalidTimeout { .. } => "invalid_timeout",
+            Self::DeadlineExceeded { .. } => "deadline_exceeded",
+            Self::InferenceTimeout { .. } => "inference_timeout",
             Self::Inference { .. } => "inference_failed",
             Self::NonMonotonicClock { .. } => "non_monotonic_clock",
         }
@@ -142,6 +190,8 @@ impl LatencyError {
 pub struct LatencyConfig {
     warmup: usize,
     iters: usize,
+    total_timeout_ns: u64,
+    per_infer_timeout_ns: u64,
 }
 
 impl LatencyConfig {
@@ -162,7 +212,41 @@ impl LatencyConfig {
                 limit: MAX_LATENCY_WARMUP,
             });
         }
-        Ok(Self { warmup, iters })
+        Ok(Self {
+            warmup,
+            iters,
+            total_timeout_ns: DEFAULT_LATENCY_TOTAL_TIMEOUT_NS,
+            per_infer_timeout_ns: DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS,
+        })
+    }
+
+    /// 計測全体・推論 1 回の時間上限（ns）を差し替える。各値は 1 以上 [`MAX_LATENCY_TIMEOUT_NS`] 以下。
+    ///
+    /// 上限の検出は協調的で、同期呼び出し中の推論を中断はできない。反復の境界（全体）と
+    /// 呼び出しの復帰後（1 回）に検査し、超過したら計測を失敗として返す（REQ-39）。
+    pub fn with_timeouts(
+        mut self,
+        total_timeout_ns: u64,
+        per_infer_timeout_ns: u64,
+    ) -> Result<Self, LatencyError> {
+        for t in [total_timeout_ns, per_infer_timeout_ns] {
+            if t == 0 || t > MAX_LATENCY_TIMEOUT_NS {
+                return Err(LatencyError::InvalidTimeout { timeout_ns: t });
+            }
+        }
+        self.total_timeout_ns = total_timeout_ns;
+        self.per_infer_timeout_ns = per_infer_timeout_ns;
+        Ok(self)
+    }
+
+    /// 計測全体の時間上限（ns）。
+    pub fn total_timeout_ns(&self) -> u64 {
+        self.total_timeout_ns
+    }
+
+    /// 推論 1 回の時間上限（ns）。
+    pub fn per_infer_timeout_ns(&self) -> u64 {
+        self.per_infer_timeout_ns
     }
 
     /// warmup 回数。
@@ -181,6 +265,8 @@ impl Default for LatencyConfig {
         Self {
             warmup: DEFAULT_LATENCY_WARMUP,
             iters: DEFAULT_LATENCY_ITERS,
+            total_timeout_ns: DEFAULT_LATENCY_TOTAL_TIMEOUT_NS,
+            per_infer_timeout_ns: DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS,
         }
     }
 }
@@ -256,8 +342,36 @@ where
         });
     }
 
+    let total = inputs
+        .iter()
+        .fold(0usize, |acc, x| acc.saturating_add(x.len()));
+    if total > MAX_INFER_BATCH_TOTAL_BYTES {
+        return Err(LatencyError::TotalInputTooLarge {
+            total,
+            limit: MAX_INFER_BATCH_TOTAL_BYTES,
+        });
+    }
+
+    let start = clock.now_ns();
+    // 各反復の開始前に計測全体の期限を検査する。
+    let check_deadline = |phase: LatencyPhase, iteration: usize| {
+        if clock.now_ns().saturating_sub(start) > config.total_timeout_ns {
+            Err(LatencyError::DeadlineExceeded {
+                phase,
+                iteration,
+                limit_ns: config.total_timeout_ns,
+            })
+        } else {
+            Ok(())
+        }
+    };
+
     for (iteration, input) in inputs.iter().cycle().take(config.warmup).enumerate() {
-        match predict(black_box(input)) {
+        check_deadline(LatencyPhase::Warmup, iteration)?;
+        let t0 = clock.now_ns();
+        let result = predict(black_box(input));
+        let t1 = clock.now_ns();
+        match result {
             Ok(p) => {
                 black_box(p);
             }
@@ -269,10 +383,18 @@ where
                 });
             }
         }
+        if t1.saturating_sub(t0) > config.per_infer_timeout_ns {
+            return Err(LatencyError::InferenceTimeout {
+                phase: LatencyPhase::Warmup,
+                iteration,
+                limit_ns: config.per_infer_timeout_ns,
+            });
+        }
     }
 
     let mut samples_ns = Vec::with_capacity(config.iters);
     for (iteration, input) in inputs.iter().cycle().take(config.iters).enumerate() {
+        check_deadline(LatencyPhase::Measure, iteration)?;
         let t0 = clock.now_ns();
         let result = black_box(predict(black_box(input)));
         let t1 = clock.now_ns();
@@ -286,6 +408,13 @@ where
         let elapsed = t1
             .checked_sub(t0)
             .ok_or(LatencyError::NonMonotonicClock { iteration })?;
+        if elapsed > config.per_infer_timeout_ns {
+            return Err(LatencyError::InferenceTimeout {
+                phase: LatencyPhase::Measure,
+                iteration,
+                limit_ns: config.per_infer_timeout_ns,
+            });
+        }
         samples_ns.push(elapsed);
     }
 
@@ -356,6 +485,30 @@ mod tests {
                 "too_many_warmup",
             ),
             (
+                LatencyError::TotalInputTooLarge { total: 2, limit: 1 },
+                "total_input_too_large",
+            ),
+            (
+                LatencyError::InvalidTimeout { timeout_ns: 0 },
+                "invalid_timeout",
+            ),
+            (
+                LatencyError::DeadlineExceeded {
+                    phase: LatencyPhase::Measure,
+                    iteration: 0,
+                    limit_ns: 1,
+                },
+                "deadline_exceeded",
+            ),
+            (
+                LatencyError::InferenceTimeout {
+                    phase: LatencyPhase::Measure,
+                    iteration: 0,
+                    limit_ns: 1,
+                },
+                "inference_timeout",
+            ),
+            (
                 LatencyError::Inference {
                     phase: LatencyPhase::Measure,
                     iteration: 0,
@@ -371,6 +524,171 @@ mod tests {
         for (e, code) in cases {
             assert_eq!(e.code(), code);
         }
+    }
+
+    use std::cell::Cell;
+
+    /// 呼ばれるたびに `step` ns 進む偽の時計。
+    struct StepClock {
+        now: Cell<u64>,
+        step: u64,
+    }
+
+    impl Clock for StepClock {
+        fn now_ns(&self) -> u64 {
+            let v = self.now.get();
+            self.now.set(v + self.step);
+            v
+        }
+    }
+
+    struct StubPre;
+    impl Preprocessor for StubPre {
+        fn preprocess(
+            &self,
+            _input: &str,
+        ) -> Result<crate::pipeline::TokenIds, crate::pipeline::PreprocessError> {
+            Ok(crate::pipeline::TokenIds::new(vec![1]))
+        }
+    }
+
+    struct StubBackend;
+    impl ScoringBackend for StubBackend {
+        fn scores(
+            &self,
+            _ids: &crate::pipeline::TokenIds,
+        ) -> Result<Vec<f64>, crate::pipeline::BackendError> {
+            Ok(vec![0.75, 0.25])
+        }
+    }
+
+    fn ok_prediction() -> Result<Prediction, InferError> {
+        InferencePipeline::new(StubPre, StubBackend).infer_one("x")
+    }
+
+    #[test]
+    fn req39_total_input_bytes_checked_before_inference() {
+        let big = "a".repeat(1024 * 1024);
+        let inputs: Vec<&str> = (0..65).map(|_| big.as_str()).collect();
+        let mut called = false;
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 1,
+        };
+        let r = measure_with(
+            |_| {
+                called = true;
+                ok_prediction()
+            },
+            &inputs,
+            &LatencyConfig::default(),
+            &clock,
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            LatencyError::TotalInputTooLarge {
+                total: 65 * 1024 * 1024,
+                limit: MAX_INFER_BATCH_TOTAL_BYTES
+            }
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn req39_timeouts_validated() {
+        let c = LatencyConfig::default();
+        assert_eq!(
+            c.with_timeouts(0, 1),
+            Err(LatencyError::InvalidTimeout { timeout_ns: 0 })
+        );
+        assert_eq!(
+            c.with_timeouts(1, MAX_LATENCY_TIMEOUT_NS + 1),
+            Err(LatencyError::InvalidTimeout {
+                timeout_ns: MAX_LATENCY_TIMEOUT_NS + 1
+            })
+        );
+        assert!(c.with_timeouts(MAX_LATENCY_TIMEOUT_NS, 1).is_ok());
+    }
+
+    #[test]
+    fn req39_total_deadline_aborts_measurement() {
+        // now_ns 1 回ごとに 10 ns 進む。各反復は 2 回呼ぶので 1 反復 20 ns。全体上限 50 ns。
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 10,
+        };
+        let cfg = LatencyConfig::new(0, 1000)
+            .unwrap()
+            .with_timeouts(50, 1_000)
+            .unwrap();
+        let err = measure_with(|_| ok_prediction(), &["x"], &cfg, &clock).unwrap_err();
+        assert!(matches!(
+            err,
+            LatencyError::DeadlineExceeded {
+                phase: LatencyPhase::Measure,
+                limit_ns: 50,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn req39_per_inference_timeout_in_measure_and_warmup() {
+        // 反復ごとに 10 ns かかる（t0 と t1 の差）。1 回上限 5 ns を超える。
+        let cfg_measure = LatencyConfig::new(0, 3)
+            .unwrap()
+            .with_timeouts(1_000_000, 5)
+            .unwrap();
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 10,
+        };
+        assert_eq!(
+            measure_with(|_| ok_prediction(), &["x"], &cfg_measure, &clock).unwrap_err(),
+            LatencyError::InferenceTimeout {
+                phase: LatencyPhase::Measure,
+                iteration: 0,
+                limit_ns: 5
+            }
+        );
+        let cfg_warm = LatencyConfig::new(3, 1)
+            .unwrap()
+            .with_timeouts(1_000_000, 5)
+            .unwrap();
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 10,
+        };
+        assert_eq!(
+            measure_with(|_| ok_prediction(), &["x"], &cfg_warm, &clock).unwrap_err(),
+            LatencyError::InferenceTimeout {
+                phase: LatencyPhase::Warmup,
+                iteration: 0,
+                limit_ns: 5
+            }
+        );
+    }
+
+    #[test]
+    fn req39_warmup_deadline_exceeded() {
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 100,
+        };
+        let cfg = LatencyConfig::new(1000, 1)
+            .unwrap()
+            .with_timeouts(50, 1_000_000)
+            .unwrap();
+        // 最初の check_deadline で start から 100 ns 経過し 50 ns 上限を超える。
+        let err = measure_with(|_| ok_prediction(), &["x"], &cfg, &clock).unwrap_err();
+        assert_eq!(
+            err,
+            LatencyError::DeadlineExceeded {
+                phase: LatencyPhase::Warmup,
+                iteration: 0,
+                limit_ns: 50
+            }
+        );
     }
 
     #[test]
