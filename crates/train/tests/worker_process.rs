@@ -1096,7 +1096,10 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     let poll_deadline = std::time::Instant::now() + Duration::from_millis(450);
     let mut orphan_spawned = false;
     while std::time::Instant::now() < poll_deadline {
-        if orphan_pid_path.exists() {
+        // 孫の起動（pid）に加え、heartbeat が書かれたことまで待つ。
+        if orphan_pid_path.exists()
+            && std::fs::metadata(case_dir.join("orphan-heartbeat.txt")).is_ok_and(|m| m.len() >= 1)
+        {
             orphan_spawned = true;
             break;
         }
@@ -1116,41 +1119,58 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
         "grandchild (orphan.pid) must appear before the wall timeout fires",
     )?;
 
-    let orphan_pid_text = std::fs::read_to_string(&orphan_pid_path)
-        .map_err(|e| format!("read orphan.pid: {e} (grandchild may not have started in time)"))?;
-    let orphan_pid: u32 = orphan_pid_text
+    expect_orphan_stopped(case_dir)
+}
+
+/// 孫（orphan）プロセスが停止したことを、事前条件つきで検証する共通手順
+/// （REQ-39。`timeout_hang_kills_orphan`・`cancel_kills_lifeline_orphan` 共用）。
+///
+/// 1. 事前条件: `orphan.pid` があり、heartbeat が 1 回以上書かれている
+///    （孫が起動していないのに「止まった」と誤判定しない）。
+/// 2. 孫の pid が `kill -0` で見えなくなるまで、上限つき（10 秒）でポーリング
+///    する。
+/// 3. 消滅を確認した後の heartbeat 長を基準に、一定時間増えないことを確認する
+///    （kill 時点で書き込み途中だった heartbeat が遅れて反映されても、許容差を
+///    広げずに判定できる）。
+#[cfg(unix)]
+fn expect_orphan_stopped(case_dir: &Path) -> Result<(), String> {
+    let pid_text = std::fs::read_to_string(case_dir.join("orphan.pid"))
+        .map_err(|e| format!("read orphan.pid: {e} (grandchild did not start)"))?;
+    let pid: u32 = pid_text
         .trim()
         .parse()
-        .map_err(|e| format!("parse orphan.pid {orphan_pid_text:?}: {e}"))?;
-
-    // 孫プロセスが生きていれば heartbeat が伸び続けるはずなので、少し待って
-    // `orphan-heartbeat.txt` が伸びていないことを確認する（`run_train` の
-    // 戻り値だけでなく、実際に孫プロセスが止まったことを外部から観測する）。
+        .map_err(|e| format!("parse orphan.pid {pid_text:?}: {e}"))?;
     let heartbeat = case_dir.join("orphan-heartbeat.txt");
-    let len_after_return = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(500));
-    let len_after_wait = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
-    expect_eq(
-        len_after_wait,
-        len_after_return,
-        "orphan heartbeat must not grow after run_train returns (grandchild must be killed too)",
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    expect_true(
+        len(&heartbeat) >= 1,
+        "precondition: orphan heartbeat must have been written at least once",
     )?;
 
-    // `kill -0 <pid>` は送信対象が存在すれば 0、存在しなければ非 0 で
-    // 終了する（`/bin/kill` は本テストが検証対象とする `run_train` 側の
-    // 実装が使う同じバイナリ。テスト側の検証にも同じ絶対パスの外部
-    // コマンドを再利用する）。
-    let status = std::process::Command::new("/bin/kill")
-        .args(["-0", &orphan_pid.to_string()])
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to run /bin/kill -0: {e}"))?;
-    expect_true(
-        !status.success(),
-        "orphan process must no longer exist after run_train returns",
+    let alive = || -> Result<bool, String> {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| format!("failed to run /bin/kill -0: {e}"))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive()? {
+        if std::time::Instant::now() >= deadline {
+            return Err("orphan process must disappear (kill -0 kept succeeding)".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let baseline = len(&heartbeat);
+    std::thread::sleep(Duration::from_millis(400));
+    expect_eq(
+        len(&heartbeat),
+        baseline,
+        "orphan heartbeat must not grow after the orphan process is gone",
     )
 }
 
@@ -1158,14 +1178,16 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
 /// ではなく子の進行で決定的にする）。
 #[cfg(unix)]
 fn wait_for_file(path: &Path, max: Duration) -> bool {
+    // 作成直後で中身が空の瞬間を「現れた」と誤判定しないよう、1 バイト以上を待つ。
+    let ready = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() >= 1);
     let deadline = std::time::Instant::now() + max;
     while std::time::Instant::now() < deadline {
-        if path.exists() {
+        if ready(path) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    path.exists()
+    ready(path)
 }
 
 /// `TrainJob::run` を別スレッドで走らせ、`ready` が現れたらキャンセルして
@@ -1175,7 +1197,7 @@ fn wait_for_file(path: &Path, max: Duration) -> bool {
 fn run_and_cancel_when(
     case_dir: &Path,
     mode: &str,
-    ready: &Path,
+    ready: &[&Path],
 ) -> Result<(CancelOutcome, TrainRunEnd, JobState, Duration), String> {
     let launcher = make_launcher(case_dir, mode);
     let request = make_request(Some(30));
@@ -1186,11 +1208,13 @@ fn run_and_cancel_when(
     let handle = job.handle();
     let dir = case_dir.to_path_buf();
     let worker = std::thread::spawn(move || job.run(&launcher, &request, &dir, &limits));
-    if !wait_for_file(ready, Duration::from_secs(10)) {
-        // 進行しないまま残さないよう、待ちきれなくても止める。
-        handle.cancel();
-        let _ = worker.join();
-        return Err(format!("{} did not appear in time", ready.display()));
+    for path in ready {
+        if !wait_for_file(path, Duration::from_secs(10)) {
+            // 進行しないまま残さないよう、待ちきれなくても止める。
+            handle.cancel();
+            let _ = worker.join();
+            return Err(format!("{} did not appear in time", path.display()));
+        }
     }
     let started = std::time::Instant::now();
     let outcome = handle.cancel();
@@ -1206,7 +1230,7 @@ fn run_and_cancel_when(
 #[cfg(unix)]
 fn case_cancel_hang(case_dir: &Path) -> Result<(), String> {
     let heartbeat = case_dir.join("heartbeat.txt");
-    let (outcome, end, state, elapsed) = run_and_cancel_when(case_dir, "hang", &heartbeat)?;
+    let (outcome, end, state, elapsed) = run_and_cancel_when(case_dir, "hang", &[&heartbeat])?;
     expect_eq(outcome, CancelOutcome::Requested, "cancel outcome")?;
     let TrainRunEnd::Cancelled(run) = end else {
         return Err("expected Cancelled".to_string());
@@ -1229,19 +1253,16 @@ fn case_cancel_hang(case_dir: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn case_cancel_kills_lifeline_orphan(case_dir: &Path) -> Result<(), String> {
     let pid_path = case_dir.join("orphan.pid");
-    let (_, end, state, _) = run_and_cancel_when(case_dir, "hang_with_lifeline_orphan", &pid_path)?;
+    // 孫の起動（pid）と heartbeat の書き込みを両方確認してからキャンセルする。
+    let hb = case_dir.join("orphan-heartbeat.txt");
+    let (_, end, state, _) =
+        run_and_cancel_when(case_dir, "hang_with_lifeline_orphan", &[&pid_path, &hb])?;
     expect_true(
         matches!(end, TrainRunEnd::Cancelled(_)),
         "expected Cancelled",
     )?;
     expect_eq(state, JobState::Cancelled, "job state")?;
-    let hb = case_dir.join("orphan-heartbeat.txt");
-    // 孫の停止（lifeline の EOF 検知）を待ってから、伸びが止まることを見る。
-    std::thread::sleep(Duration::from_millis(500));
-    let before = std::fs::metadata(&hb).map(|m| m.len()).unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(500));
-    let after = std::fs::metadata(&hb).map(|m| m.len()).unwrap_or(0);
-    expect_eq(after, before, "orphan heartbeat must not grow after cancel")
+    expect_orphan_stopped(case_dir)
 }
 
 /// REQ-34: 起動前のキャンセルは子を起動せず、`request.json` も残さない。
