@@ -55,6 +55,14 @@ fn window_scores(ids: &[i64]) -> Vec<f64> {
 /// 模擬バックエンド（ONNX 推論の代用。#113 で置換）。
 struct MockBackend;
 impl ScoringBackend for MockBackend {
+    /// テスト用スタブ: 計算は即時で打ち切り対象の反復を持たないため、`scores` と同じ結果を返す。
+    fn scores_limited(
+        &self,
+        ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        _limit: std::time::Duration,
+    ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+        self.scores(ids)
+    }
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         Ok(window_scores(ids.as_slice()))
     }

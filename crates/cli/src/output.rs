@@ -45,6 +45,12 @@
 //! [`package_capacity_json`]・[`write_package_capacity`] は容量計測（`fandhe-edge-runtime`）の
 //! 内訳を `package` 工程（TASK-33.1。未配線）の JSON へ出す部品。`status`・`judgment` は
 //! TASK-33.x・TASK-30.2 の責務で、ここでは出さない。
+//!
+//! # 除外記録（TASK-32.2・#114）
+//!
+//! [`export_exclusions_json`] は配布候補から外した構成と理由（`fandhe-edge-runtime` の
+//! `export_exclusion`）を `package`・`select` 工程（TASK-33.x。未配線）の JSON へ出す部品。
+//! 入出力契約は変えず、`package` 出力への埋め込みは配線 TASK の責務。
 
 use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
@@ -52,6 +58,7 @@ use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
 use fandhe_edge_core::stage_report::{EvaluateReport, PackageReport};
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
+use fandhe_edge_runtime::export_exclusion::{ExclusionReason, ExclusionRecord};
 use std::io::{self, Write};
 
 /// [`JudgmentResult`] を JSON 1 行＋改行として `out` へ書き、
@@ -249,6 +256,58 @@ pub fn write_package_capacity<W: Write>(
 #[must_use]
 pub fn capacity_error_report(err: &CapacityError) -> ErrorReport {
     ErrorReport::new(err.exit_code(), err.public_message())
+}
+
+/// JSON 文字列リテラルの中身としてエスケープする（引用符・バックスラッシュ・制御文字）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 配布候補の除外記録（REQ-32・TASK-32.2・#114）を `{"excluded":[...]}` へ直列化する
+/// （JSON 文字列。改行なし）。
+///
+/// 後続の `package`・`select` 工程（TASK-33.x。未配線）が出力へ埋め込む部品。値は ASCII の
+/// snake_case 固定リテラルと整数だけの想定だが、`load_code` は公開フィールドで任意の文字列を持てる
+/// ため、文字列値はすべて [`json_escape`] を通す（不正な JSON を作らない）。
+/// `detail`・`source`・`load_code`・`mismatched`・`total` は該当する場合だけ出し、キー順は固定。
+/// 入力本文・パスは記録に含まれない。
+#[must_use]
+pub fn export_exclusions_json(records: &[ExclusionRecord]) -> String {
+    let items = records
+        .iter()
+        .map(|r| {
+            let mut s = format!(
+                "{{\"kind\":\"{}\",\"runtime\":\"{}\",\"format\":\"{}\",\"code\":\"{}\"",
+                r.config.kind.as_str(),
+                r.config.runtime.as_str(),
+                r.config.format.as_str(),
+                r.code()
+            );
+            if let Some(d) = r.detail_code() {
+                s.push_str(&format!(",\"detail\":\"{}\"", json_escape(d)));
+            }
+            if let ExclusionReason::PredictionMismatch { mismatched, total } = &r.reason {
+                s.push_str(&format!(",\"mismatched\":{mismatched},\"total\":{total}"));
+            }
+            s.push_str(&format!(",\"evidence\":\"{}\"", r.evidence.as_str()));
+            if let Some(src) = r.source() {
+                s.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
+            }
+            s.push('}');
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"excluded\":[{items}]}}")
 }
 
 #[cfg(test)]
@@ -746,5 +805,79 @@ mod tests {
             capacity_error_report(&CapacityError::Overflow).code.code(),
             20
         );
+    }
+
+    fn export_cfg(
+        kind: fandhe_edge_runtime::onnx::ModelKind,
+        runtime: fandhe_edge_runtime::export_exclusion::InferenceRuntime,
+        format: fandhe_edge_runtime::export_exclusion::NumericFormat,
+    ) -> fandhe_edge_runtime::export_exclusion::ExportConfig {
+        fandhe_edge_runtime::export_exclusion::ExportConfig {
+            kind,
+            runtime,
+            format,
+        }
+    }
+
+    /// REQ-32: 除外記録の JSON は完全一致で固定する（空・既知制約・予測ずれ・読み込み拒否）。
+    #[test]
+    fn req32_export_exclusions_json_exact() {
+        use fandhe_edge_runtime::export_exclusion::{
+            EvidenceKind, InferenceRuntime as Rt, KNOWN_INFEASIBLE, NumericFormat as Nf,
+        };
+        use fandhe_edge_runtime::onnx::ModelKind;
+        assert_eq!(export_exclusions_json(&[]), "{\"excluded\":[]}");
+        let known = ExclusionRecord {
+            config: export_cfg(ModelKind::C3, Rt::Tract, Nf::Int8Dynamic),
+            reason: ExclusionReason::ExportInfeasible(&KNOWN_INFEASIBLE[0]),
+            evidence: EvidenceKind::Measured,
+        };
+        let mismatch = ExclusionRecord {
+            config: export_cfg(ModelKind::C1, Rt::Own, Nf::F32),
+            reason: ExclusionReason::PredictionMismatch {
+                mismatched: 1,
+                total: 120,
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        let rejected = ExclusionRecord {
+            config: export_cfg(ModelKind::C3, Rt::Own, Nf::F32),
+            reason: ExclusionReason::RuntimeRejectedModel {
+                load_code: "unsupported_graph",
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        assert_eq!(
+            export_exclusions_json(&[known, mismatch, rejected]),
+            concat!(
+                "{\"excluded\":[",
+                "{\"kind\":\"c3\",\"runtime\":\"tract\",\"format\":\"int8_dynamic\",",
+                "\"code\":\"export_infeasible\",\"detail\":\"type_unification_failed\",",
+                "\"evidence\":\"measured\",\"source\":\"PoC-14\"},",
+                "{\"kind\":\"c1\",\"runtime\":\"own\",\"format\":\"f32\",",
+                "\"code\":\"prediction_mismatch\",\"mismatched\":1,\"total\":120,",
+                "\"evidence\":\"test_harness\"},",
+                "{\"kind\":\"c3\",\"runtime\":\"own\",\"format\":\"f32\",",
+                "\"code\":\"runtime_rejected_model\",\"detail\":\"unsupported_graph\",",
+                "\"evidence\":\"test_harness\"}]}"
+            )
+        );
+    }
+
+    /// REQ-32: `load_code` に引用符・改行があっても JSON がエスケープされる。
+    #[test]
+    fn req32_export_exclusions_json_escapes_load_code() {
+        use fandhe_edge_runtime::export_exclusion::{
+            EvidenceKind, InferenceRuntime as Rt, NumericFormat as Nf,
+        };
+        use fandhe_edge_runtime::onnx::ModelKind;
+        let rec = ExclusionRecord {
+            config: export_cfg(ModelKind::C3, Rt::Own, Nf::F32),
+            reason: ExclusionReason::RuntimeRejectedModel {
+                load_code: "a\"b\\c\nd",
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        assert!(export_exclusions_json(&[rec]).contains("\"detail\":\"a\\\"b\\\\c\\u000ad\""),);
     }
 }

@@ -58,6 +58,10 @@ impl ScoringBackend for Backend {
             _ => Ok(vec![0.5, 0.25, 0.25]),
         }
     }
+    fn scores_limited(&self, ids: &TokenIds, _limit: Duration) -> Result<Vec<f64>, BackendError> {
+        // テスト用スタブ: 時間上限は対象外のため委譲する。
+        self.scores(ids)
+    }
 }
 
 type Seen = Arc<Mutex<Vec<String>>>;
@@ -249,6 +253,14 @@ fn req21_label_index_out_of_options_is_runtime_error() {
         fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
             Ok(vec![0.0, 0.0, 0.0, 1.0])
         }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
+        }
     }
     let definition = definition();
     let pre = Pre(Arc::new(Mutex::new(Vec::new())));
@@ -391,6 +403,14 @@ fn req39_batch_stalled_inference_returns_limit_exceeded_at_deadline() {
         fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
             std::thread::sleep(Duration::from_secs(30));
             Ok(vec![0.5, 0.25, 0.25])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
         }
     }
     let definition = definition();
