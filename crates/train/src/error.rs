@@ -451,6 +451,11 @@ pub enum TrainProcessError {
     /// として残り続ける可能性があり、確実な後始末を主張しない。fail-closed。
     /// REQ-39「資源の上限」）。
     KillWaitTimedOut,
+    /// `try_wait()` などの待機エラー後、壁時計の期限まで `kill()` と回収を
+    /// 再試行しても、直接の子プロセス（pid）を回収できたと確認できなかった。
+    /// 子が OS 上に残っている可能性を呼び出し側へ明示する（データ本文を含めず
+    /// pid のみ持つ。codex/review 指摘 P0。REQ-39「資源の上限」）。
+    ChildNotReaped { pid: u32 },
     /// 子プロセスがシグナルで終了し、終了コードを取得できなかった
     /// （unix。`ExitStatus::code()` が `None` を返す場合）。
     TerminatedBySignal,
@@ -533,6 +538,12 @@ impl std::fmt::Display for TrainProcessError {
                     "worker process did not exit within the bounded wait after SIGKILL"
                 )
             }
+            TrainProcessError::ChildNotReaped { pid } => {
+                write!(
+                    f,
+                    "worker process (pid {pid}) could not be confirmed reaped"
+                )
+            }
             TrainProcessError::TerminatedBySignal => {
                 write!(f, "worker process was terminated by a signal")
             }
@@ -599,6 +610,7 @@ impl TrainProcessError {
             | TrainProcessError::Spawn { .. }
             | TrainProcessError::Wait { .. }
             | TrainProcessError::KillWaitTimedOut
+            | TrainProcessError::ChildNotReaped { .. }
             | TrainProcessError::TerminatedBySignal
             | TrainProcessError::UnknownExitCode(_)
             | TrainProcessError::StdoutIncomplete
