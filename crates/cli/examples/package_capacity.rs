@@ -161,10 +161,34 @@ mod tests {
     use super::*;
 
     fn root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fandhe_cap_ex_{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub").join("m.json"), b"{}").unwrap();
-        dir.canonicalize().unwrap()
+        // 予測可能なパスを再利用・上書きしない。一意なディレクトリを create_dir で排他作成し、
+        // ファイルは create_new で作る（衝突時は名前を変えて再試行）。
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("fandhe_cap_ex_{}_{nanos}_{n}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    std::fs::create_dir(dir.join("sub")).unwrap();
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(dir.join("sub").join("m.json"))
+                        .unwrap();
+                    f.write_all(b"{}").unwrap();
+                    return dir.canonicalize().unwrap();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
+        }
+        panic!("could not create a unique temp dir");
     }
 
     /// REQ-39: ルート配下の相対パスは受理され、絶対パス・`..` は InvalidInput になる。

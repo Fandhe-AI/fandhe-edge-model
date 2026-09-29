@@ -344,7 +344,11 @@ pub fn measure_package(files: &[PackageFile]) -> Result<CapacityBreakdown, Capac
 /// 検証（経路の閉じ込め等）とファイル取得の間でパスを再解決させないための入口（TOCTOU 対策。
 /// REQ-39）。サイズと重複判定の鍵は渡されたハンドルの `fstat` 相当から得る。ハンドルが通常
 /// ファイルであることの保証は呼び出し側（`open_regular_file_for_read` 等）が負う。
-/// `label` はエラー表示用のパスで、再度開くことはしない。
+/// `label` はエラー表示用のパスで、再度開くことも再解決することもしない。
+///
+/// 制約（REQ-39）: 同一ファイルの重複検出（[`CapacityError::DuplicatePath`]）は Unix
+/// （デバイス・inode）のみ。Unix 以外ではハンドルの同一性を標準ライブラリだけでは取得できない
+/// ため重複判定を行わず、そのまま合算する（M10 時点で対象外。呼び出し側が重複を避けること）。
 pub fn measure_opened_files(
     files: &[(PackageComponent, PathBuf, std::fs::File)],
 ) -> Result<CapacityBreakdown, CapacityError> {
@@ -363,11 +367,20 @@ pub fn measure_opened_files(
                 path: label.clone(),
             }));
         }
-        let id = file_id(label, &meta).map_err(read_err)?;
-        if !seen.insert(id) {
-            return Err(CapacityError::DuplicatePath {
-                path: label.clone(),
-            });
+        // 重複判定の鍵はハンドル由来の (dev, ino) のみ。Unix 以外では std だけでハンドルの
+        // 同一性を取れず、`label` の再解決（canonicalize）は契約違反になるため判定しない。
+        #[cfg(unix)]
+        {
+            let id = file_id(label, &meta).map_err(read_err)?;
+            if !seen.insert(id) {
+                return Err(CapacityError::DuplicatePath {
+                    path: label.clone(),
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&mut seen, read_err);
         }
         sizes.push((*component, meta.len()));
     }
@@ -450,7 +463,11 @@ mod tests {
             (Weights, path.clone(), open()),
             (Metadata, path.clone(), open()),
         ]);
+        #[cfg(unix)]
         assert!(matches!(dup, Err(CapacityError::DuplicatePath { .. })));
+        // Unix 以外は重複判定を行わず合算する（API 契約。doc 参照）
+        #[cfg(not(unix))]
+        assert_eq!(dup.unwrap().total_bytes(), 8);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir_path);
     }
