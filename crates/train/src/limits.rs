@@ -75,8 +75,8 @@ pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 ///
 /// `SearchInput` は公開 API で、データ契約層（`crates/data`）を経由しない
 /// 呼び出し元が直接値を渡せるため、`validate_input`（`crate::search`）が
-/// [`crate::search::ValidationScorer::predict_validation`] を呼び出す前に
-/// 合計バイト数を検証する。1 件あたりの上限は
+/// 学習を始める前に（採点は学習ジョブの中で行うため。[`crate::search`]
+/// モジュール doc 参照）合計バイト数を検証する。1 件あたりの上限は
 /// `fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES`（推論入力 1 件の
 /// 上限。train・infer で共有）をそのまま使うため train 側に重複定義しない
 /// が、合計バイト数の上限は train・data のいずれにも既存の定数が無いため

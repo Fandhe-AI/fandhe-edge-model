@@ -396,7 +396,7 @@ pub enum CandidateSearchResult {
 /// 候補 1 件の探索記録（時刻・打ち切り分類・探索結果の組）。
 ///
 /// `Debug` は手書きする（下記）。`validation_outcomes`（[`Outcome`] の列。
-/// `Outcome::Label` は scorer が返す予測ラベル文字列を保持する）を
+/// `Outcome::Label` は学習ジョブが返す予測ラベル文字列を保持する）を
 /// `derive(Debug)` のまま `{:?}` で出力すると、`#[serde(skip)]` で JSON へは
 /// 出していないにもかかわらず、デバッグ出力（ログ等）から予測ラベルの
 /// 内容がそのまま漏れてしまう（security.md「秘密情報の混入防止」。P0
@@ -523,8 +523,8 @@ pub enum SearchError<E> {
     ValidationRecordIdCountMismatch { expected: usize, actual: usize },
     /// `validation_record_ids` に空文字列の要素が含まれる。
     InvalidValidationRecordId { index: usize },
-    /// `validation_record_ids` に重複した要素が含まれる（scorer からの
-    /// 戻り値を順序で一意に対応づけられなくなるため拒否する）。
+    /// `validation_record_ids` に重複した要素が含まれる（学習ジョブの
+    /// 予測列を順序・`id` で一意に対応づけられなくなるため拒否する）。
     DuplicateValidationRecordId { index: usize },
     /// `validation_record_ids` の 1 件が
     /// [`fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES`] を超える
@@ -1039,7 +1039,7 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<Vec<ValidationInput>, Se
     }
 
     // `validation_record_ids` が凍結済み validation split の記録と一致する
-    // ことを、採点（scorer）を呼び出す前に確認する（P0 指摘対応・REQ-17・
+    // ことを、学習を始める前に確認する（P0 指摘対応・REQ-17・
     // REQ-27「評価の独立性」。issue #84 PR #238 レビュー）。`SearchInput`
     // は公開 API で、呼び出し元が凍結済み分割と無関係な・または凍結した
     // 最終 test 分割の record_ids を validation として渡す経路を塞げない
