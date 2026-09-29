@@ -279,3 +279,90 @@ fn req39_open_confined_root_fifo_does_not_hang() {
         other => panic!("expected RootNotDirectory without hanging, got {other:?}"),
     }
 }
+
+/// 中間の成分が外部への symlink のとき、開く前に拒否される（REQ-39・TASK-39.4-1）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req39_open_confined_rejects_intermediate_symlink_to_outside() {
+    let sb = Sandbox::new("open_mid_link");
+    symlink(&sb.outside(), &sb.pkg().join("mid"));
+    assert_escapes(
+        open_confined(&sb.workspace(), Path::new("pkg/mid/secret_marker.txt")),
+        EscapeKind::Symlink,
+    );
+}
+
+/// 最後の成分が外部ファイルへの symlink のとき拒否される（REQ-39・TASK-39.4-1）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req39_open_confined_rejects_final_symlink_to_outside() {
+    let sb = Sandbox::new("open_last_link");
+    symlink(
+        &sb.outside().join("secret_marker.txt"),
+        &sb.pkg().join("leak.txt"),
+    );
+    assert_escapes(
+        open_confined(&sb.workspace(), Path::new("pkg/leak.txt")),
+        EscapeKind::Symlink,
+    );
+}
+
+/// ルート内向きの symlink は正準化されて開ける（REQ-39。safe_join の既存挙動の維持）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req39_open_confined_follows_inner_symlink_via_canonical_components() {
+    let sb = Sandbox::new("open_inner_link");
+    symlink(&sb.pkg(), &sb.workspace().join("alias"));
+    let (mut f, _) =
+        open_confined(&sb.workspace(), Path::new("alias/model.onnx")).expect("inner symlink");
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf).expect("read");
+    assert_eq!(buf, b"onnx");
+}
+
+/// 検証後・open 前に親ディレクトリが外部への symlink へ差し替えられても、外部ファイルは開かれない
+/// （REQ-39・TASK-39.4-1・#158。競合を確率的に発生させる差し替えスレッドを併走させる。
+/// 開けた場合は内容が必ずルート内のファイルのものであること、開けない場合は Escapes であることを
+/// 確認する）。証拠種別: テストハーネス（Linux）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req39_open_confined_never_returns_outside_file_under_swap_race() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let sb = Sandbox::new("open_swap");
+    fs::write(sb.pkg().join("model.onnx"), b"inside").expect("write inside");
+    fs::write(sb.outside().join("model.onnx"), b"outside").expect("write outside");
+    let stage = sb.workspace().join("stage");
+    fs::create_dir_all(&stage).expect("mkdir stage");
+    fs::write(stage.join("model.onnx"), b"inside").expect("write stage");
+    let swap = sb.workspace().join("swap");
+    let outside = sb.outside();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    let (swap2, stage2) = (swap.clone(), stage.clone());
+    let flipper = std::thread::spawn(move || {
+        let tmp = swap2.with_extension("tmp");
+        let mut to_outside = true;
+        while !stop2.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&tmp);
+            let target = if to_outside { &outside } else { &stage2 };
+            std::os::unix::fs::symlink(target, &tmp).expect("symlink");
+            let _ = fs::rename(&tmp, &swap2);
+            to_outside = !to_outside;
+        }
+    });
+    for _ in 0..3000 {
+        match open_confined(&sb.workspace(), Path::new("swap/model.onnx")) {
+            Ok((mut f, _)) => {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut buf).expect("read");
+                assert_eq!(buf, b"inside", "outside file must never be returned");
+            }
+            Err(PathRejection::Escapes { .. } | PathRejection::Unresolvable { .. }) => {}
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().expect("join");
+}

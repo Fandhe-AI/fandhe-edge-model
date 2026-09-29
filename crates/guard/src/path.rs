@@ -25,21 +25,18 @@
 //! `link/../..` のように symlink の後ろへ `..` を置く形は、字句判定側で拒否しうる。安全側の
 //! 偽陽性として許容する。
 //!
-//! # 残る TOCTOU（[`open_confined`]）
+//! # TOCTOU への対処（[`open_confined`]）
 //!
-//! `openat`・`O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存（`libc` 等）が
-//! 必要で未承認のため使わない。代わりに、通常ファイル検証つき（`O_NONBLOCK`・FIFO / デバイスの
-//! 拒否。`fandhe_edge_core::fs`）で開いた後、開いた fd 自身の実体を検査する。
+//! パスを繰り返し解決して同一性を推定する方式は使わない。ルートのディレクトリ fd を最初に
+//! 開いて保持し、そこを起点に各成分を `openat`（中間は `O_DIRECTORY | O_NOFOLLOW`、最後は
+//! `O_NOFOLLOW`）で開く。検証後に親ディレクトリや対象が symlink へ差し替えられても
+//! `O_NOFOLLOW` により開けず、外部ファイルは通らない。`openat` は `rustix`
+//! （2026-09-29 オーナー承認。`unsafe` 不要）を使う。開いた fd は `fstat` で通常ファイルか
+//! 確認する（`O_NONBLOCK` で FIFO・デバイスの open が停止しない）。macOS では加えて
+//! `F_GETPATH` による fd の実パスがルート配下であることを確認する。
 //!
-//! - Linux: ルートのディレクトリハンドルを最初に開いて保持し、ルートの実パスはそのハンドル
-//!   （`/proc/self/fd/<fd>`）から得る。open もハンドル起点（`/proc/self/fd/<root fd>/<相対>`）で
-//!   行い、開いた fd の実パスがルート配下であることを確認する。fd に対する検査のため、
-//!   検証後の差し替えでは外部ファイルを通せない
-//! - macOS: std だけで fd の実パスを取れないため、ルートは 1 度だけ正準化して固定し、open 後に
-//!   固定ルートで再検証して dev / inode の一致を確認する。再解決と比較の間の差し替えは検出
-//!   できない残余リスクがあり、`F_GETPATH` / `openat`（`libc` 依存の承認）は依存承認後の課題とする
-//! - その他の OS（Windows・他の unix 等）: 非ブロッキング open と実体確認を保証できないため
-//!   [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed。M10 時点で対象外）
+//! - Linux・macOS 以外（Windows・他の unix 等）は [`PathRejection::UnsupportedPlatform`] で
+//!   拒否する（fail-closed。M10 時点で対象外）
 //!
 //! 拒否結果は [`PathRejection::exit_code`] と [`PathRejection::reason_code`] で、REQ-21 の
 //! 終了コード（`invalid_input`=64 等）と機械可読な理由コードへ写せる。
@@ -292,9 +289,9 @@ fn resolve_under(
 ///
 /// [`safe_join`] 単体では検証から open までの間に親ディレクトリを symlink へ差し替えられる
 /// （TOCTOU）。本関数は (1) ルートを 1 度だけ確定して保持、(2) そのルートに対し検証、
-/// (3) 通常ファイル検証つき（FIFO・デバイスを `O_NONBLOCK` と種別確認で拒否）で open、
-/// (4) 開いた fd の実体を検査する。検査方法と OS ごとの残余リスクはモジュールドキュメントの
-/// 「残る TOCTOU」を参照。呼び出し側は返した [`File`] だけを読み、パスを再度 open しないこと。
+/// (3) ルートの fd を起点に `openat`（`O_NOFOLLOW`）で成分ごとに開き、(4) 開いた fd を `fstat` して
+/// 通常ファイルか確認する。詳細はモジュールドキュメントの「TOCTOU への対処」を参照。
+/// 呼び出し側は返した [`File`] だけを読み、パスを再度 open しないこと。
 ///
 /// Linux・macOS 以外では [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed。
 /// 非ブロッキング open と fd の実体検査を保証できる OS に限るため。他の unix を含む）。
@@ -310,114 +307,137 @@ pub fn open_confined(root: &Path, candidate: &Path) -> Result<(File, ConfinedPat
     }
 }
 
+/// rustix の errno を `io::Error` へ写す（`std` feature を使わず生の errno 値で変換する）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn open_regular(path: &Path, candidate: &Path) -> Result<File, PathRejection> {
-    fandhe_edge_core::fs::open_regular_file_for_read(path).map_err(|e| match e {
-        fandhe_edge_core::fs::FsError::NotRegularFile { .. } => PathRejection::NotRegularFile {
-            candidate: candidate.to_path_buf(),
+fn errno_to_io(e: rustix::io::Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw_os_error())
+}
+
+/// ディレクトリ fd を起点に成分ごとに開いて閉じ込めを強制する（Linux・macOS）。
+///
+/// 1. ルートを 1 度だけ `O_DIRECTORY` で開いて fd を保持する。以降のパス解決はこの fd が起点で、
+///    ルートのパス名を差し替えても参照先は変わらない（`O_NONBLOCK` は FIFO 等での停止を避ける
+///    ためで、`O_DIRECTORY` により FIFO は `ENOTDIR` で拒否される）
+/// 2. ルートの実パスを fd から得る（Linux: `/proc/self/fd`・macOS: `F_GETPATH`）
+/// 3. [`safe_join`] 相当の検証（字句判定・正準化・包含判定。拒否種別の判別を含む）で、ルートからの
+///    相対の `Normal` 成分列を得る。正準化済みのため成分に symlink は含まれない
+/// 4. 各成分を `openat` で開く。中間は `O_DIRECTORY | O_NOFOLLOW`、最後は `O_NOFOLLOW`。検証後に
+///    成分が symlink へ差し替えられていれば `ELOOP` / `ENOTDIR` となり、外部へは出られない
+///    （パスの再解決を行わない。TASK-39.4-1・#158 の再照合競合の指摘への対処）
+/// 5. 開いた fd を `fstat` して通常ファイルであることを確認する。macOS ではさらに fd の実パスが
+///    ルートの実パス配下であることを確認する（多層防御）
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_confined_impl(
+    root: &Path,
+    candidate: &Path,
+) -> Result<(File, ConfinedPath), PathRejection> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+    use rustix::io::Errno;
+
+    let escapes = || PathRejection::Escapes {
+        candidate: candidate.to_path_buf(),
+        kind: EscapeKind::Symlink,
+    };
+    let unresolvable = |e: Errno| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source: errno_to_io(e),
+    };
+
+    let root_fd = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::NOTDIR => PathRejection::RootNotDirectory,
+        other => PathRejection::RootUnresolvable {
+            source: errno_to_io(other),
         },
-        fandhe_edge_core::fs::FsError::Read { source, .. } => PathRejection::Unresolvable {
+    })?;
+    let canon_root =
+        fd_real_path(&root_fd).map_err(|source| PathRejection::RootUnresolvable { source })?;
+
+    let first = resolve_under(&canon_root, root, candidate)?;
+    let relative = first
+        .as_path()
+        .strip_prefix(&canon_root)
+        .map_err(|_| escapes())?;
+    let mut names = Vec::new();
+    for c in relative.components() {
+        match c {
+            Component::Normal(n) => names.push(n),
+            // 正準化済みなら現れない。現れたら fail-closed。
+            _ => return Err(escapes()),
+        }
+    }
+    let Some((last, parents)) = names.split_last() else {
+        // ルート自身はファイルではない。
+        return Err(PathRejection::NotRegularFile {
+            candidate: candidate.to_path_buf(),
+        });
+    };
+
+    let mut dir = root_fd;
+    for name in parents {
+        dir = openat(
+            &dir,
+            *name,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            // 検証後に symlink 等へ差し替えられた（symlink は Linux で ENOTDIR・macOS で ELOOP）。
+            Errno::LOOP | Errno::NOTDIR => escapes(),
+            other => unresolvable(other),
+        })?;
+    }
+    let fd = openat(
+        &dir,
+        *last,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP => escapes(),
+        other => unresolvable(other),
+    })?;
+
+    let stat = fstat(&fd).map_err(unresolvable)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(PathRejection::NotRegularFile {
+            candidate: candidate.to_path_buf(),
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let real = fd_real_path(&fd).map_err(|source| PathRejection::Unresolvable {
             candidate: candidate.to_path_buf(),
             source,
-        },
-        // FsError は non_exhaustive。未知の失敗は fail-closed で入力不正として扱う。
-        _ => PathRejection::Unresolvable {
-            candidate: candidate.to_path_buf(),
-            source: io::Error::from(io::ErrorKind::InvalidInput),
-        },
-    })
+        })?;
+        if !real.starts_with(&canon_root) {
+            return Err(escapes());
+        }
+    }
+    Ok((File::from(fd), first))
 }
 
-/// Linux: ルートのディレクトリハンドルを先に開いて保持し、以降はハンドルを起点にする。
-///
-/// ルートの実パスは保持した fd（`/proc/self/fd/<fd>`）から得るため、検証後にルートの
-/// パス名を symlink へ差し替えても参照先は変わらない。open も `/proc/self/fd/<root fd>/<相対>`
-/// でハンドル起点にし、最後に開いた fd 自身の実パスがルート配下であることを確認する。
+/// fd 自身の実パスを得る（Linux: `/proc/self/fd/<fd>` の `read_link`）。
 #[cfg(target_os = "linux")]
-fn open_confined_impl(
-    root: &Path,
-    candidate: &Path,
-) -> Result<(File, ConfinedPath), PathRejection> {
+fn fd_real_path(fd: &rustix::fd::OwnedFd) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // ルートが FIFO 等のブロックする特殊ファイルでも open で停止しないよう `O_NONBLOCK` で開き、
-    // ディレクトリか否かは開いた fd の metadata で確認する（REQ-39。値は Linux 全アーキテクチャ共通）。
-    const O_NONBLOCK: i32 = 0o4000;
-    let root_handle = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(root)
-        .map_err(|source| PathRejection::RootUnresolvable { source })?;
-    let root_meta = root_handle
-        .metadata()
-        .map_err(|source| PathRejection::RootUnresolvable { source })?;
-    if !root_meta.is_dir() {
-        return Err(PathRejection::RootNotDirectory);
-    }
-    let root_link = PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd()));
-    let canon_root = std::fs::read_link(&root_link)
-        .map_err(|source| PathRejection::RootUnresolvable { source })?;
-
-    let first = resolve_under(&canon_root, root, candidate)?;
-    let relative =
-        first
-            .as_path()
-            .strip_prefix(&canon_root)
-            .map_err(|_| PathRejection::Escapes {
-                candidate: candidate.to_path_buf(),
-                kind: EscapeKind::Symlink,
-            })?;
-    let file = open_regular(&root_link.join(relative), candidate)?;
-
-    let fd_link = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    let real = std::fs::read_link(&fd_link).map_err(|source| PathRejection::Unresolvable {
-        candidate: candidate.to_path_buf(),
-        source,
-    })?;
-    // ルートは保持したハンドルから再取得する（パス名の再解決を挟まない）。
-    let canon_root_now = std::fs::read_link(&root_link)
-        .map_err(|source| PathRejection::RootUnresolvable { source })?;
-    if !real.starts_with(&canon_root_now) {
-        return Err(PathRejection::Escapes {
-            candidate: candidate.to_path_buf(),
-            kind: EscapeKind::Symlink,
-        });
-    }
-    Ok((file, ConfinedPath(real)))
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
 
-/// macOS: ルートを 1 度だけ正準化して固定し、open 後に固定ルートで再検証して dev / inode を比較する。
-///
-/// 開いた fd と再解決先の dev / inode が一致する場合のみ通すため、通過するのは「ルート配下に
-/// 実在するファイルと同一 inode」に限られる（差し替え中に外部ファイルを開いても、同一 inode
-/// でない限り拒否される）。std だけでは fd の実パスを取れないため、再解決と比較の間の差し替えは
-/// 検出できない残余リスクがある（`F_GETPATH` / `openat` は `libc` 依存の承認後の課題）。
+/// fd 自身の実パスを得る（macOS: `F_GETPATH`）。
 #[cfg(target_os = "macos")]
-fn open_confined_impl(
-    root: &Path,
-    candidate: &Path,
-) -> Result<(File, ConfinedPath), PathRejection> {
-    use std::os::unix::fs::MetadataExt;
-
-    let canon_root =
-        std::fs::canonicalize(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
-    let first = resolve_under(&canon_root, root, candidate)?;
-    let file = open_regular(first.as_path(), candidate)?;
-    let unresolvable = |source| PathRejection::Unresolvable {
-        candidate: candidate.to_path_buf(),
-        source,
-    };
-    let second = resolve_under(&canon_root, root, candidate)?;
-    let opened = file.metadata().map_err(unresolvable)?;
-    let resolved = std::fs::metadata(second.as_path()).map_err(unresolvable)?;
-    if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
-        return Err(PathRejection::Escapes {
-            candidate: candidate.to_path_buf(),
-            kind: EscapeKind::Symlink,
-        });
-    }
-    Ok((file, second))
+fn fd_real_path(fd: &rustix::fd::OwnedFd) -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = rustix::fs::getpath(fd).map_err(errno_to_io)?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(c.as_bytes())))
 }
 
 #[cfg(test)]
