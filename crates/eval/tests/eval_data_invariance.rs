@@ -174,9 +174,18 @@ fn req17_req27_stale_frozen_record_stops_before_evaluation() {
     }
 
     // data 層の evaluate_gate も同じ改変後バイト列に対して HashMismatch を返す。
-    let state = EvalDataState::Frozen(record);
+    let expected = freeze_eval_data(tampered).expect("凍結は失敗しないはず");
+    let state = EvalDataState::Frozen(record.clone());
     let gate_result = evaluate_gate(&state, tampered);
-    assert_eq!(gate_result, Err(FreezeError::HashMismatch));
+    assert_eq!(
+        gate_result,
+        Err(FreezeError::HashMismatch {
+            expected_sha256: record.sha256(),
+            expected_byte_len: record.byte_len(),
+            actual_sha256: expected.sha256(),
+            actual_byte_len: expected.byte_len(),
+        })
+    );
 }
 
 #[test]
@@ -214,9 +223,18 @@ fn req17_req27_tampering_by_evaluation_step_is_detected() {
         other => panic!("ChangedDuringEvaluation を期待したが {other:?} だった"),
     }
 
-    let state = EvalDataState::Frozen(record);
+    let actual = freeze_eval_data(&tampered_bytes).expect("凍結は失敗しないはず");
+    let state = EvalDataState::Frozen(record.clone());
     let gate_result = evaluate_gate(&state, &tampered_bytes);
-    assert_eq!(gate_result, Err(FreezeError::HashMismatch));
+    assert_eq!(
+        gate_result,
+        Err(FreezeError::HashMismatch {
+            expected_sha256: record.sha256(),
+            expected_byte_len: record.byte_len(),
+            actual_sha256: actual.sha256(),
+            actual_byte_len: actual.byte_len(),
+        })
+    );
 }
 
 #[test]

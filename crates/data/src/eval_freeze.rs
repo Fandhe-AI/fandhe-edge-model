@@ -31,10 +31,14 @@
 //!   単独では信用せず、渡された実データバイト列（`actual_bytes`）が非空
 //!   なら状態と実データの不整合として [`FreezeError::NotProvidedButDataPresent`]
 //!   で拒否する（PR #209 レビュー指摘）
-//! - **凍結記録の“来歴”（過去に記録した台帳との突き合わせ・版管理）は
-//!   実装しない**（REQ-17・TASK-17.3・issue #49 の対象）。[`EvalDataState`]
-//!   は `#[non_exhaustive]` にしてあり、#49 が台帳との突き合わせ結果を表す
-//!   variant を追加できる
+//! - **ハッシュ不一致時の停止分岐（報告内容・終了コード）は本モジュールが
+//!   持つ**（REQ-17・TASK-17.3・issue #49）。不一致は状態ではなく判定結果
+//!   なので [`EvalDataState`] へ variant は足さず、[`evaluate_gate`] が
+//!   `Err(`[`FreezeError::HashMismatch`]`{..})` で返す。記録側・実データ側の
+//!   sha256 とバイト長を報告内容に含め、[`FreezeError::exit_code`] が非ゼロの
+//!   終了コードへ写す。過去の記録台帳との突き合わせ・版管理は spec の
+//!   TASK-17.3 の範囲外で本モジュールは扱わない（凍結記録とファイルの
+//!   対応づけは CLI のプロジェクト台帳〔TASK-33.x〕の責務）
 //! - **読み取り専用配置・書き込み拒否は本モジュールの対象外**（[`crate::frozen_placement`]
 //!   が担う。REQ-39・TASK-17.2-2・issue #48）
 //! - **CLI の出力 JSON 全体の形（`step`・`reason` 等のキー構成）は決めない**。
@@ -249,9 +253,23 @@ pub enum FreezeError {
     /// fail-closed の中核（`.claude/rules/evaluation-contract.md`
     /// 「データの分割と凍結」: 「ハッシュが記録と一致しなければ処理を
     /// 停止する」）。呼び出し側（将来の CLI `evaluate` 工程）はこの
-    /// variant を受け取ったら評価を進めず、非ゼロ終了で停止すること
-    /// （具体的な終了コードへの対応付けは TASK-33.3 に委ねる）。
-    HashMismatch,
+    /// variant を受け取ったら評価を進めず、下記の内容を報告して
+    /// 非ゼロ終了で停止すること（REQ-17 異常系・TASK-17.3・issue #49。
+    /// 終了コードは [`FreezeError::exit_code`]）。
+    ///
+    /// `expected_*` は [`EvalDataState::Frozen`] に渡された（凍結時の）記録の
+    /// 値、`actual_*` は `actual_bytes` から再計算した値。ハッシュ値とバイト長
+    /// だけを持ち、評価データ本文・パスは含めない（`.claude/rules/security.md`）。
+    HashMismatch {
+        /// 凍結記録に残っている sha256。
+        expected_sha256: Sha256Digest,
+        /// 凍結記録に残っているバイト長。
+        expected_byte_len: u64,
+        /// 実データから再計算した sha256。
+        actual_sha256: Sha256Digest,
+        /// 実データのバイト長。
+        actual_byte_len: u64,
+    },
     /// [`evaluate_gate`] で、状態が [`EvalDataState::NotProvided`]
     /// （評価データなし）なのに、渡された `actual_bytes` が非空だった
     /// （状態フラグと実データの不整合。PR #209 レビュー指摘）。
@@ -272,10 +290,17 @@ impl fmt::Display for FreezeError {
             FreezeError::LengthOverflow => {
                 write!(f, "eval data byte length does not fit in u64")
             }
-            FreezeError::HashMismatch => {
+            FreezeError::HashMismatch {
+                expected_sha256,
+                expected_byte_len,
+                actual_sha256,
+                actual_byte_len,
+            } => {
                 write!(
                     f,
-                    "recomputed eval data hash does not match the frozen record"
+                    "eval data hash mismatch: frozen record sha256={expected_sha256} \
+                     byte_len={expected_byte_len}, actual sha256={actual_sha256} \
+                     byte_len={actual_byte_len}"
                 )
             }
             FreezeError::NotProvidedButDataPresent => {
@@ -284,6 +309,30 @@ impl fmt::Display for FreezeError {
                     "eval data state is not_provided but actual_bytes is non-empty"
                 )
             }
+        }
+    }
+}
+
+impl FreezeError {
+    /// 停止時の終了コード（REQ-17・REQ-21・TASK-17.3）。どの variant も
+    /// [`ExitCode::Ok`] へは写らない（停止を exit 0 に落とさない）。
+    ///
+    /// #47 では写像を TASK-33.3 に委ねていたが、`fandhe-edge-train` の
+    /// ハッシュ不一致（`SearchError::ValidationSplitHashMismatch` 等 →
+    /// `InvalidInput`）の先例に揃えて写像だけ前倒しする。CLI 出力 JSON の形は
+    /// 引き続き TASK-33.3 の対象。
+    ///
+    /// - `HashMismatch`・`NotProvidedButDataPresent`: 凍結後に外部入力
+    ///   （評価データ）が変わった、または状態と実データが矛盾 → `InvalidInput`
+    /// - `LengthOverflow`: バイト長が `u64` に収まらない資源上限超過 →
+    ///   `LimitExceeded`（64bit 環境では実質到達しない）
+    #[must_use]
+    pub const fn exit_code(self) -> ExitCode {
+        match self {
+            FreezeError::HashMismatch { .. } | FreezeError::NotProvidedButDataPresent => {
+                ExitCode::InvalidInput
+            }
+            FreezeError::LengthOverflow => ExitCode::LimitExceeded,
         }
     }
 }
@@ -324,8 +373,9 @@ pub fn freeze_eval_data(bytes: &[u8]) -> Result<FreezeRecord, FreezeError> {
 
 /// 評価データの有無・凍結状態（REQ-17）。
 ///
-/// `#[non_exhaustive]` にしてあり、TASK-17.3（issue #49）がハッシュ不一致を
-/// 表す `Mismatched` 等の variant を追加できる余地を残す。
+/// `#[non_exhaustive]` にしてある。ハッシュ不一致は状態ではなく判定結果の
+/// ため variant は持たず、[`evaluate_gate`] が
+/// `Err(`[`FreezeError::HashMismatch`]`{..})` で返す（TASK-17.3・issue #49）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EvalDataState {
@@ -369,10 +419,9 @@ pub enum EvaluateGate {
 /// fail-closed に拒否する（PR #209 レビュー指摘）。評価データが実際に
 /// 渡されなかった場合、呼び出し側は空スライスを渡すこと。
 ///
-/// `#[non_exhaustive]` な [`EvalDataState`] に対する `match` は、将来 #49 が
-/// variant を追加した際にこの関数がコンパイルエラーで検出できるよう、
-/// ワイルドカードアーム無しで網羅する（本 issue の範囲では `NotProvided`・
-/// `Frozen` の 2 種のみ存在するため到達可能）。
+/// `#[non_exhaustive]` な [`EvalDataState`] に対する `match` は、将来
+/// variant が追加された際にこの関数がコンパイルエラーで検出できるよう、
+/// ワイルドカードアーム無しで網羅する。
 pub fn evaluate_gate(
     state: &EvalDataState,
     actual_bytes: &[u8],
@@ -390,7 +439,12 @@ pub fn evaluate_gate(
             if &recomputed == record {
                 Ok(EvaluateGate::Proceed(record.clone()))
             } else {
-                Err(FreezeError::HashMismatch)
+                Err(FreezeError::HashMismatch {
+                    expected_sha256: record.sha256(),
+                    expected_byte_len: record.byte_len(),
+                    actual_sha256: recomputed.sha256(),
+                    actual_byte_len: recomputed.byte_len(),
+                })
             }
         }
     }
@@ -452,7 +506,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// REQ-17: 1 バイトだけ変えると sha256 が変わる（不一致検知の前提。#49）。
+    /// REQ-17: 1 バイトだけ変えると sha256 が変わる（不一致検知〔TASK-17.3・#49〕の前提）。
     #[test]
     fn req17_freeze_differs_on_single_byte_change() {
         let original = freeze_eval_data(b"farewell").expect("失敗しないはず");
@@ -526,10 +580,16 @@ mod tests {
     #[test]
     fn req17_evaluate_gate_rejects_hash_mismatch() {
         let stale_record = freeze_eval_data(b"original eval data").expect("失敗しないはず");
-        let state = EvalDataState::Frozen(stale_record);
+        let tampered = freeze_eval_data(b"tampered eval data").expect("失敗しないはず");
+        let state = EvalDataState::Frozen(stale_record.clone());
         assert_eq!(
             evaluate_gate(&state, b"tampered eval data"),
-            Err(FreezeError::HashMismatch)
+            Err(FreezeError::HashMismatch {
+                expected_sha256: stale_record.sha256(),
+                expected_byte_len: stale_record.byte_len(),
+                actual_sha256: tampered.sha256(),
+                actual_byte_len: tampered.byte_len(),
+            })
         );
     }
 
@@ -547,8 +607,66 @@ mod tests {
         let state = EvalDataState::Frozen(forged);
         assert_eq!(
             evaluate_gate(&state, b"eval data"),
-            Err(FreezeError::HashMismatch)
+            Err(FreezeError::HashMismatch {
+                expected_sha256: genuine.sha256(),
+                expected_byte_len: genuine.byte_len() + 1,
+                actual_sha256: genuine.sha256(),
+                actual_byte_len: genuine.byte_len(),
+            })
         );
+    }
+
+    /// REQ-17・REQ-21: 各 `FreezeError` の終了コードは固定で、いずれも
+    /// `Ok`（exit 0）にならない（停止を成功扱いにしない）。
+    #[test]
+    fn req17_req21_freeze_error_exit_codes_are_fixed() {
+        let digest = Sha256Digest::of_bytes(b"x");
+        let mismatch = FreezeError::HashMismatch {
+            expected_sha256: digest,
+            expected_byte_len: 1,
+            actual_sha256: digest,
+            actual_byte_len: 2,
+        };
+        assert_eq!(mismatch.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(
+            FreezeError::NotProvidedButDataPresent.exit_code(),
+            ExitCode::InvalidInput
+        );
+        assert_eq!(
+            FreezeError::LengthOverflow.exit_code(),
+            ExitCode::LimitExceeded
+        );
+        for e in [
+            mismatch,
+            FreezeError::NotProvidedButDataPresent,
+            FreezeError::LengthOverflow,
+        ] {
+            assert_ne!(e.exit_code(), ExitCode::Ok);
+        }
+    }
+
+    /// REQ-17: `Display` は expected/actual のハッシュ・バイト長を含み、
+    /// 評価データ本文を含まない。
+    #[test]
+    fn req17_hash_mismatch_display_reports_hashes_without_data() {
+        let secret = b"SECRET-EVAL-BODY-original";
+        let changed = b"SECRET-EVAL-BODY-changed!!";
+        let record = freeze_eval_data(secret).expect("失敗しないはず");
+        let actual = freeze_eval_data(changed).expect("失敗しないはず");
+        let err = evaluate_gate(&EvalDataState::Frozen(record.clone()), changed)
+            .expect_err("不一致のはず");
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "eval data hash mismatch: frozen record sha256={} byte_len={}, actual sha256={} byte_len={}",
+                record.sha256().to_hex(),
+                record.byte_len(),
+                actual.sha256().to_hex(),
+                actual.byte_len()
+            )
+        );
+        assert!(!text.contains("SECRET"));
     }
 
     /// REQ-17・REQ-39: 上限内の妥当な JSON は `FreezeRecord::parse` で成功する。
