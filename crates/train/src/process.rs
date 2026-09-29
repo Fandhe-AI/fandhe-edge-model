@@ -1867,6 +1867,9 @@ mod tests {
         /// この時刻以後の `try_wait()` は、パイプを閉じていれば正常終了
         /// （`exit(0)`）を返す（協調キャンセルで自ら終了する子を模す）。
         exit_after_close_at: Option<Instant>,
+        /// `kill()` が 1 回以上呼ばれた後の `try_wait()` は `SIGKILL` 終了を返す
+        /// （時刻に依存せず、協調しない子を決定的に模す）。
+        reap_on_kill: bool,
     }
 
     #[cfg(unix)]
@@ -1900,7 +1903,9 @@ mod tests {
             {
                 use std::os::unix::process::ExitStatusExt;
                 Ok(Some(ExitStatus::from_raw(0)))
-            } else if self.reap_at.is_some_and(|t| Instant::now() >= t) {
+            } else if (self.reap_on_kill && self.kills > 0)
+                || self.reap_at.is_some_and(|t| Instant::now() >= t)
+            {
                 use std::os::unix::process::ExitStatusExt;
                 Ok(Some(ExitStatus::from_raw(SIGKILL)))
             } else {
@@ -2269,11 +2274,11 @@ mod tests {
         let started = Instant::now();
         let mut c = FakeChild {
             has_cancel_channel: true,
-            reap_at: Some(started + Duration::from_millis(150)),
+            reap_on_kill: true,
             ..FakeChild::default()
         };
-        // reap_at は kill の有無と無関係に SIGKILL 終了を返すため、猶予（100ms）を
-        // 過ぎた後の回収は kill 送出後に観測される。
+        // kill 送出後にのみ SIGKILL 終了を返す。時刻依存にすると、macOS 等で
+        // 猶予内の poll が遅延したとき協調終了と誤判定され不安定になる。
         let mut signalled = false;
         let step = cancel_child(
             &mut c,

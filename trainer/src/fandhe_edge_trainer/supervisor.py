@@ -768,6 +768,21 @@ def _monitor_worker_and_finalize(
         cancel_event=cancel_event,
     )
 
+    if killed_reason == "cancelled":
+        # 協調キャンセル: worker は `monitor_child` が `killpg` → 回収済み。
+        # 破棄される標準出力の drain は待たず、先に保持中の fd で予約を解放する
+        # （drain の最大 15 秒待ちが Rust 側の猶予予算 15 秒を超え SIGKILL され、
+        # 空の予約が残るのを防ぐ。REQ-34）。確定へは進まない。
+        try:
+            return _report_cancelled(reservation)
+        finally:
+            # 解放後の後始末のみ（結果は使わない）。reader は daemon スレッドで、
+            # パイプを閉じて読み出しを解除するため待ちは短く抑える。
+            if proc.stdout is not None:
+                with contextlib.suppress(OSError):
+                    proc.stdout.close()
+            reader_thread.join(timeout=1)
+
     reader_thread.join(timeout=10)
     if reader_thread.is_alive() and proc.stdout is not None:
         # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に
@@ -778,11 +793,6 @@ def _monitor_worker_and_finalize(
     if proc.stdout is not None:
         with contextlib.suppress(OSError):
             proc.stdout.close()
-
-    if killed_reason == "cancelled":
-        # 協調キャンセル: worker は `monitor_child` が `killpg` → 回収済み。
-        # 保持中の fd で予約を解放し、確定へ進まない（REQ-34）。
-        return _report_cancelled(reservation)
 
     if killed_reason is not None:
         contract.cleanup_reservation(reservation)
