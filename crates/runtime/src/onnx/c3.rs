@@ -306,9 +306,9 @@ impl C3Model {
             return Err(BackendError::InvalidSequenceLength);
         }
         let e = self.emb;
-        // 埋め込み [T, E]（行優先）と、詰め物位置へ加える値 [T]
+        // 埋め込み [T, E]（行優先）と、実トークン位置か否かの印 [T]
         let mut x = Vec::with_capacity(t_len.saturating_mul(e));
-        let mut neg = Vec::with_capacity(t_len);
+        let mut is_real = Vec::with_capacity(t_len);
         for &id in ids {
             let id = usize::try_from(id).map_err(|_| BackendError::InvalidTokenId)?;
             let start = id.checked_mul(e).ok_or(BackendError::InvalidTokenId)?;
@@ -317,8 +317,7 @@ impl C3Model {
                 .get(start..start + e)
                 .ok_or(BackendError::InvalidTokenId)?;
             x.extend_from_slice(row);
-            let mask = if id > 0 { 1.0f32 } else { 0.0 };
-            neg.push((1.0 - mask) * self.neg_big);
+            is_real.push(id > 0);
         }
 
         let mut pooled: Vec<f32> = Vec::new();
@@ -327,7 +326,7 @@ impl C3Model {
             for f in 0..br.filters {
                 let bias = *br.bias.get(f).ok_or(BackendError::Failed)?;
                 let mut best = f32::NEG_INFINITY;
-                for (t, &n) in neg.iter().enumerate() {
+                for (t, &real) in is_real.iter().enumerate() {
                     if started.elapsed() >= limit {
                         return Err(BackendError::TimeLimitExceeded);
                     }
@@ -352,10 +351,19 @@ impl C3Model {
                             acc += wv * xv;
                         }
                     }
-                    let relu = (acc + bias).max(0.0);
-                    best = best.max(relu + n);
+                    // 詰め物位置は最大値の候補から明示的に除外する。加算によるマスクでは
+                    // 有限でも巨大な重み・バイアスで詰め物位置が選ばれうる（REQ-28）
+                    if real {
+                        let relu = (acc + bias).max(0.0);
+                        best = best.max(relu);
+                    }
                 }
-                pooled.push(best);
+                // 実トークンが 1 つも無い系列のみ、書き出し器のマスク値へ倒す（候補なしの -inf を出さない）
+                pooled.push(if best == f32::NEG_INFINITY {
+                    self.neg_big
+                } else {
+                    best
+                });
             }
         }
 
