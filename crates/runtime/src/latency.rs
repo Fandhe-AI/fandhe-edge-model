@@ -152,7 +152,9 @@ pub enum LatencyError {
     },
     /// 時計が逆行した。
     NonMonotonicClock {
-        /// 計測の 0 始まりの反復番号。
+        /// 逆行を検出した段階。
+        phase: LatencyPhase,
+        /// 段階内の 0 始まりの反復番号。
         iteration: usize,
     },
 }
@@ -383,7 +385,12 @@ where
                 });
             }
         }
-        if t1.saturating_sub(t0) > config.per_infer_timeout_ns {
+        // warmup でも時計の逆行を 0 ns 扱いにせず、計測段階と同様に失敗させる（REQ-39）。
+        let warmup_elapsed = t1.checked_sub(t0).ok_or(LatencyError::NonMonotonicClock {
+            phase: LatencyPhase::Warmup,
+            iteration,
+        })?;
+        if warmup_elapsed > config.per_infer_timeout_ns {
             return Err(LatencyError::InferenceTimeout {
                 phase: LatencyPhase::Warmup,
                 iteration,
@@ -405,9 +412,10 @@ where
                 code: e.code(),
             });
         }
-        let elapsed = t1
-            .checked_sub(t0)
-            .ok_or(LatencyError::NonMonotonicClock { iteration })?;
+        let elapsed = t1.checked_sub(t0).ok_or(LatencyError::NonMonotonicClock {
+            phase: LatencyPhase::Measure,
+            iteration,
+        })?;
         if elapsed > config.per_infer_timeout_ns {
             return Err(LatencyError::InferenceTimeout {
                 phase: LatencyPhase::Measure,
@@ -417,6 +425,9 @@ where
         }
         samples_ns.push(elapsed);
     }
+
+    // 最後の推論が全体期限を超えて終わった場合も成功として返さない（fail-closed。REQ-39）。
+    check_deadline(LatencyPhase::Measure, config.iters)?;
 
     Ok(LatencySamples {
         warmup: config.warmup,
@@ -517,7 +528,10 @@ mod tests {
                 "inference_failed",
             ),
             (
-                LatencyError::NonMonotonicClock { iteration: 0 },
+                LatencyError::NonMonotonicClock {
+                    phase: LatencyPhase::Measure,
+                    iteration: 0,
+                },
                 "non_monotonic_clock",
             ),
         ];
@@ -665,6 +679,56 @@ mod tests {
                 phase: LatencyPhase::Warmup,
                 iteration: 0,
                 limit_ns: 5
+            }
+        );
+    }
+
+    #[test]
+    fn req39_total_deadline_checked_after_last_iteration() {
+        // 1 反復 = t0,t1 の 2 回 + 開始前検査 1 回 + start 1 回。iters=1 で最後の検査のみが超過する。
+        let clock = StepClock {
+            now: Cell::new(0),
+            step: 10,
+        };
+        // start=0, check(10), t0=20, t1=30, 最終 check=40 → 40 > 35。開始前検査 10 は超えない。
+        let cfg = LatencyConfig::new(0, 1)
+            .unwrap()
+            .with_timeouts(35, 1_000)
+            .unwrap();
+        let err = measure_with(|_| ok_prediction(), &["x"], &cfg, &clock).unwrap_err();
+        assert_eq!(
+            err,
+            LatencyError::DeadlineExceeded {
+                phase: LatencyPhase::Measure,
+                iteration: 1,
+                limit_ns: 35
+            }
+        );
+    }
+
+    #[test]
+    fn req39_warmup_clock_regression_is_error() {
+        struct BackClock(Cell<u64>);
+        impl Clock for BackClock {
+            fn now_ns(&self) -> u64 {
+                let v = self.0.get();
+                self.0.set(v.saturating_sub(1));
+                v
+            }
+        }
+        let cfg = LatencyConfig::new(1, 1).unwrap();
+        let err = measure_with(
+            |_| ok_prediction(),
+            &["x"],
+            &cfg,
+            &BackClock(Cell::new(1_000)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LatencyError::NonMonotonicClock {
+                phase: LatencyPhase::Warmup,
+                iteration: 0
             }
         );
     }

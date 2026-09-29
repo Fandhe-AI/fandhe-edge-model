@@ -168,7 +168,13 @@ fn non_monotonic_clock_is_rejected() {
     let p = InferencePipeline::new(Pre(Rc::default()), Rewind(cell.clone()));
     let cfg = LatencyConfig::new(0, 3).unwrap();
     let e = measure_latency(&p, &["a"], &cfg, &FakeClock(cell)).unwrap_err();
-    assert_eq!(e, LatencyError::NonMonotonicClock { iteration: 0 });
+    assert_eq!(
+        e,
+        LatencyError::NonMonotonicClock {
+            phase: LatencyPhase::Measure,
+            iteration: 0
+        }
+    );
 }
 
 #[test]
