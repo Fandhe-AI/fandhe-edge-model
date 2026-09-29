@@ -40,7 +40,7 @@
 #
 # 実行記録（REQ-36・TASK-36.1-2・#150。opt-in）:
 #   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
-#   その直下へ `run-record.XXXXXX`（mktemp。O_EXCL・0600。既存ファイルは上書きしない）を作り、
+#   その直下へ `run-record.<pid>.<乱数>`（noclobber の O_EXCL 作成・0600。既存エントリは symlink を含め上書きしない）を作り、
 #   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
 #   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
 #   実行ファイルのパスは入れない）・started_at（CLI 起動前の UTC 秒精度）・exit_code（呼び出し元へ
@@ -52,8 +52,8 @@
 #   記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値
 #   （UTF-8 として不正なら `<invalid utf-8>`）だけ、--text・--id の値・未知のトークン・位置引数は
 #   `<redacted>` に伏せる。入力ファイルの中身は読まず、環境変数は記録しない。
-#   記録先は起動前に物理パス（`cd -P` + `pwd -P`。途中の symlink を解決）へ正規化し、保存の前後で
-#   記録先の物理パスと作成したファイルの親が一致すること・記録が通常ファイルであることを確認する
+#   記録先は起動前に物理パス（`cd -P` + `pwd -P`。途中の symlink を解決）へ正規化し、作成と書き込みは 1 回の open でパスを再解決せず、保存後に
+#   記録先の物理パスが不変であること・記録が通常ファイルであることを確認する
 #   （不一致は fail-closed。検査から作成までの完全な排他はシェルでは保証できない限界で、
 #   差し替えに気づいたら記録を削除して 70 にする）。ハッシュは sha256sum / shasum -a 256 のいずれか
 #   （無ければ fail-closed）。記録を要求されたのに保存できなければ runtime_error(70)。
@@ -639,19 +639,29 @@ if [ -n "$rec_dir" ]; then
         rec_dir_unchanged || rec_ok=0
     fi
     if [ "$rec_ok" -eq 1 ]; then
-        rec_file=$(mktemp "$rec_real/run-record.XXXXXX") || rec_ok=0
+        # 作成と書き込みを 1 回の open（noclobber の O_EXCL|O_CREAT）で行い、パスを再解決しない。
+        # 検査後に symlink へ差し替えられても既存エントリがあれば open が失敗するため、
+        # 任意ファイルの切り詰め（TOCTOU）は起きない。名前の衝突は有限回だけ乱数を変えて再試行する
+        rec_try=0
+        while [ "$rec_try" -lt 10 ]; do
+            rec_try=$((rec_try + 1))
+            rec_cand="$rec_real/run-record.$$.$RANDOM$RANDOM"
+            if (
+                set -C
+                umask 077
+                printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
+                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >"$rec_cand"
+            ); then
+                rec_file=$rec_cand
+                break
+            fi
+        done
+        [ -n "$rec_file" ] || rec_ok=0
     fi
     if [ "$rec_ok" -eq 1 ]; then
-        # 作成したファイルの親が正規化済みの記録先であり、通常ファイルであること（書き込み前に確認）
-        rec_parent=$(CDPATH='' cd -P -- "$(dirname -- "$rec_file")" 2>/dev/null && pwd -P) || rec_parent=
-        if [ "$rec_parent" != "$rec_real" ] || [ -L "$rec_file" ] || [ ! -f "$rec_file" ]; then
-            rec_ok=0
-        fi
-    fi
-    if [ "$rec_ok" -eq 1 ]; then
-        printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
-            "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >"$rec_file" || rec_ok=0
+        # 書き込み後も記録先の物理パスが変わっていないこと・通常ファイルであることを確認する
         rec_dir_unchanged || rec_ok=0
+        if [ -L "$rec_file" ] || [ ! -f "$rec_file" ]; then rec_ok=0; fi
     fi
     if [ "$rec_ok" -ne 1 ]; then
         if [ -n "$rec_file" ]; then rm -f "$rec_file"; fi
