@@ -114,10 +114,10 @@ def test_monitor_child_fails_closed_when_status_race_with_exit(
     proc = _spawn("import time; time.sleep(0.3)")
     real_status = supervisor._current_child_status
 
-    def _none_after_zombie(pid: int) -> tuple[int, bool] | None:
+    def _none_after_zombie(pid: int, **_kw: object) -> tuple[int, bool] | None:
         deadline = time_mod.monotonic() + 5.0
         while time_mod.monotonic() < deadline:
-            status = real_status(pid)
+            status = real_status(pid, **_kw)
             if status is not None and status[1]:  # is_zombie
                 break
             time_mod.sleep(0.01)
@@ -161,7 +161,7 @@ def test_monitor_child_treats_late_zombie_detection_as_timeout(
     （`_terminate_and_reap` 内の `proc.wait(timeout=10)` は正常に動く）。
     """
     proc = _spawn("import time; time.sleep(60)")
-    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: (1024 * 1024, True))
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid, **_kw: (1024 * 1024, True))
 
     calls = {"n": 0}
 
@@ -228,8 +228,8 @@ def test_run_supervised_train_does_not_finalize_artifact_on_late_zombie_detectio
     real_status = supervisor._current_child_status
     late = {"is_late": False}
 
-    def _status_and_flag_first_zombie(pid: int) -> tuple[int, bool] | None:
-        status = real_status(pid)
+    def _status_and_flag_first_zombie(pid: int, **_kw: object) -> tuple[int, bool] | None:
+        status = real_status(pid, **_kw)
         if status is not None and status[1]:  # is_zombie
             late["is_late"] = True
         return status
@@ -478,7 +478,7 @@ def test_monitor_child_kills_grandchild_when_status_always_unknown(
         f"open({str(grandchild_pid_path)!r}, 'w').write(str(p.pid))\n"
     )
     proc = _spawn(code)
-    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: None)
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid, **_kw: None)
     try:
         startup_deadline = time_mod.monotonic() + 5.0
         while time_mod.monotonic() < startup_deadline and not (
@@ -1148,7 +1148,7 @@ def test_req34_monitor_child_prefers_cancelled_over_normal_exit_on_zombie(
     proc = _spawn("pass")
     event = threading.Event()
     event.set()
-    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: (1024, True))
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid, **_kw: (1024, True))
     try:
         reason = supervisor.monitor_child(
             proc,
@@ -1169,7 +1169,7 @@ def test_req34_monitor_child_prefers_cancelled_when_ps_fails(
     proc = _spawn("hang")
     event = threading.Event()
     event.set()
-    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: None)
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid, **_kw: None)
     try:
         reason = supervisor.monitor_child(
             proc,
@@ -1287,3 +1287,83 @@ def test_req34_drain_stdout_closes_pipe_itself_and_cancel_does_not_hang() -> Non
     assert result["data"] == b""
     assert proc.stdout is not None
     assert proc.stdout.closed
+
+
+def test_req34_slow_status_check_does_not_consume_cooperative_cancel_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34・REQ-39・#145 回帰: 状態確認（`ps`）が遅くても、協調キャンセルは
+    その完了を待たず猶予内に完了する。以前は `monitor_child` がキャンセルを
+    確認する前に最大 5 秒ブロックする `ps` を呼び、`_terminate_and_reap` の
+    猶予を食い潰していた。`ps` を「30 秒眠る」スクリプトに差し替えて遅延を
+    注入する（証拠種別: テストハーネス）。"""
+    slow_ps = tmp_path / "slow_ps.sh"
+    slow_ps.write_text("#!/bin/sh\nexec sleep 30\n")
+    slow_ps.chmod(0o755)
+    monkeypatch.setattr(supervisor, "_PS_BIN", str(slow_ps))
+    proc = _spawn("import time; time.sleep(60)")
+    event = threading.Event()
+    threading.Timer(0.3, event.set).start()
+    try:
+        t0 = time_mod.monotonic()
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            cancel_event=event,
+        )
+        elapsed = time_mod.monotonic() - t0
+        assert reason == "cancelled"
+        assert elapsed < 2.0  # `ps` の 5 秒上限を待たない
+        assert proc.poll() is not None
+    finally:
+        _reap(proc)
+
+
+def test_req34_cancel_is_checked_before_blocking_status_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34: 既にキャンセル済みなら、状態確認を 1 回も呼ばずに止める。"""
+    proc = _spawn("import time; time.sleep(60)")
+    calls = {"n": 0}
+
+    def _status(pid: int, **_kw: object) -> tuple[int, bool]:
+        calls["n"] += 1
+        return 1024, False
+
+    monkeypatch.setattr(supervisor, "_current_child_status", _status)
+    event = threading.Event()
+    event.set()
+    try:
+        reason = supervisor.monitor_child(
+            proc, time_limit_seconds=60.0, rss_limit_bytes=1 << 40, cancel_event=event
+        )
+        assert reason == "cancelled"
+        assert calls["n"] == 0
+    finally:
+        _reap(proc)
+
+
+def test_req39_status_timeout_is_bounded_by_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: 状態確認へ渡す待ち時間は固定の 5 秒ではなく、締め切りの残り時間
+    以下に切り詰められる（時計を差し替えて決定的に確認）。"""
+    proc = _spawn("import time; time.sleep(60)")
+    seen: list[float] = []
+    now = {"t": 100.0}
+
+    def _status(pid: int, *, timeout: float, **_kw: object) -> None:
+        seen.append(timeout)
+        return None
+
+    monkeypatch.setattr(supervisor, "_current_child_status", _status)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: now["t"])
+    try:
+        # 締め切りは 100 + 1.0 + 0.5。開始時刻が 100 のため残りは 1.5 秒。
+        supervisor.monitor_child(
+            proc, time_limit_seconds=1.0, grace_seconds=0.5, rss_limit_bytes=1 << 40
+        )
+        assert seen == [1.5]
+    finally:
+        _reap(proc)
