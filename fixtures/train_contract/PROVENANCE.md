@@ -24,6 +24,14 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   と、validation 入力の上限 4 件（`max_validation_input_bytes`・
   `max_validation_id_bytes`・`max_validation_input_total_bytes`・
   `max_result_bytes_with_validation`。issue #84 PR #238）の値を並べたもの。
+- `default_candidates.json`: `kind` を省略したときの既定候補の集合（REQ-19・
+  TASK-19.2 の 2026-09-24 追記。issue #77）。手作成。spec の REQ-19 が既定候補を
+  「C1・C3」と複数形で書いていることに基づく暫定値で、どれを既定とするかの
+  オーナー承認は未了。要素の順序は validation 正解率が同率のときの優先順
+  （宣言順）を兼ねる。`crates/train/src/kind_resolution.rs`（`include_str!` で
+  埋め込み、`kind_defaults.json` で解決できることを検査）と
+  `trainer/tests/test_default_candidates_fixture.py`（選択口
+  `kinds/__init__.py::_registry` への登録を照合）が使う。
 - `kind_defaults.json`: `kind` ごとの config 既定値（REQ-18・REQ-19・
   REQ-19b・REQ-21・REQ-39。codex review PR #220 P1「成果物の追加 config 値を
   検証せず成功扱いにしている」対応）。選択口（`trainer/src/
