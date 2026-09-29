@@ -268,6 +268,38 @@ fn build_params(
     Ok(params)
 }
 
+/// `out_dir` の最後の構成要素へ `-{kind}` を付けた出力先を返す。
+///
+/// 末尾の `/`・`.` を正規化してから最後の構成要素へ接尾辞を付け、親ディレクトリは
+/// 元の `out_dir` と同じに保つ（`out/`・`out/.` を単純連結すると `out/-c1`・`out/.-c1`
+/// になり、未作成の `out` が親になって学習ワーカーが `invalid_path` を返すため）。
+/// 最後の構成要素が無い（`..`・`/` 等）場合は `InvalidParams` として拒否する。
+/// `out_dir` は POSIX 形式の文字列なので、結果は `/` 区切りで組み立てる。
+fn suffixed_out_dir(out_dir: &str, kind: &str) -> Result<String, KindResolutionError> {
+    let invalid =
+        || KindResolutionError::InvalidParams(TrainRequestError::InvalidPath { field: "out_dir" });
+    // OS の `Path` は Windows で区切りが変わるため使わず、`/` 区切りの文字列として扱う。
+    let mut parts: Vec<&str> = out_dir
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let name = parts.pop().ok_or_else(invalid)?;
+    if name == ".." {
+        return Err(invalid());
+    }
+    let leaf = format!("{name}-{kind}");
+    let mut result = String::new();
+    if out_dir.starts_with('/') {
+        result.push('/');
+    }
+    for p in parts.iter().filter(|p| !p.is_empty()) {
+        result.push_str(p);
+        result.push('/');
+    }
+    result.push_str(&leaf);
+    Ok(result)
+}
+
 /// `kind` の有無から探索候補を組み立てる。
 ///
 /// - `Some`: 1 候補（`candidate_id = kind`。`out_dir` は加工しない）。
@@ -309,7 +341,7 @@ pub fn resolve_kind_candidates(
         None => {
             let mut candidates = Vec::new();
             for (kind, version) in default_candidates()? {
-                let out_dir = format!("{}-{}", common.out_dir, kind);
+                let out_dir = suffixed_out_dir(&common.out_dir, kind)?;
                 let params = build_params(&common, kind.clone(), *version, Map::new(), out_dir)?;
                 candidates.push(SearchCandidate {
                     candidate_id: kind.clone(),
@@ -410,6 +442,27 @@ mod tests {
                 .all(|d| std::path::Path::new(d).parent() == base_parent)
         );
         assert!(r.candidates().iter().all(|c| c.params.config.is_empty()));
+    }
+
+    /// REQ-19: 末尾の `/`・`.` を持つ out_dir でも親ディレクトリが維持される。
+    #[test]
+    fn req19_default_out_dir_keeps_parent_for_trailing_forms() {
+        for (input, expected) in [
+            ("out", "out-c1"),
+            ("out/", "out-c1"),
+            ("out/.", "out-c1"),
+            ("a/out", "a/out-c1"),
+            ("a/out/", "a/out-c1"),
+            ("a/out/.", "a/out-c1"),
+        ] {
+            assert_eq!(
+                suffixed_out_dir(input, "c1").expect("ok"),
+                expected,
+                "{input}"
+            );
+        }
+        assert!(suffixed_out_dir("..", "c1").is_err());
+        assert!(suffixed_out_dir("a/..", "c1").is_err());
     }
 
     /// REQ-19: 解決記録の JSON 形。
