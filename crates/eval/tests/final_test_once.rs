@@ -321,12 +321,12 @@ fn req27_frozen_hash_mismatch_does_not_consume_application() {
         Err(EvalDataInvarianceError::FrozenRecordMismatch { .. })
     ));
     // 事前登録ファイル 1 つだけ。ロックは作られていない。
-    assert_eq!(dir.count(), 1);
+    assert_eq!(dir.count(), 2);
     assert_eq!(hits.get(), 0);
 
     fs::write(&path, DATA).unwrap();
     assert!(attempt().is_ok());
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
     assert_eq!(hits.get(), 1);
 }
 
@@ -368,7 +368,7 @@ fn req27_cannot_bypass_lock_with_different_digest() {
     ));
     assert_eq!(hits.get(), 0);
     // 登録 1 + 適用 2（代表構成・重み）。
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
 }
 
 #[test]
@@ -409,8 +409,8 @@ fn req27_same_weights_under_renamed_config_is_rejected() {
     let tuned_model = Model::new(b"w1", Some(b"t2"));
     let tuned = run(&ledger, DATA, "c1:tuned", &tuned_model, &calls);
     assert!(is_already(&tuned, AppliedBy::ModelWeights));
-    // 登録 1 + 代表 1 + 重み 1 + 別 ID の代表構成ロック 2（fail-closed で残る）。
-    assert_eq!(dir.count(), 5);
+    // 登録・封印 2 + 代表 1 + 重み 1 + 別 ID の代表構成ロック 2（fail-closed で残る）。
+    assert_eq!(dir.count(), 6);
     assert_eq!(calls.get(), 1);
 }
 
@@ -423,13 +423,13 @@ fn req27_unregistered_config_is_rejected_without_lock() {
     register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
     let r = run(&ledger, DATA, "c9:other", &Model::new(b"w9", None), &calls);
     assert!(
         matches!(acquire_err(&r), Some(AcquireError::UnregisteredConfig)),
         "{r:?}"
     );
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
     assert_eq!(calls.get(), 1);
 }
 
@@ -460,7 +460,7 @@ fn req27_registration_is_frozen_once() {
         ledger.register_configs(&freeze_eval_data(b"x").unwrap().sha256(), &[]),
         Err(AcquireError::RegistryInvalid { .. })
     ));
-    assert_eq!(dir.count(), 1);
+    assert_eq!(dir.count(), 2);
 }
 
 #[test]
@@ -533,7 +533,7 @@ fn req27_missing_weights_file_does_not_create_lock() {
     let calls = Cell::new(0u32);
     let r = run(&ledger, DATA, "c1:seed0", &m, &calls);
     assert!(r.is_err());
-    assert_eq!(dir.count(), 1);
+    assert_eq!(dir.count(), 2);
     assert_eq!(calls.get(), 0);
 }
 
@@ -560,11 +560,11 @@ fn req27_poc10_methods_by_seeds_each_once() {
         let m = Model::new(format!("weights-{cid}").as_bytes(), None);
         assert!(run(&ledger, DATA, cid, &m, &calls).is_ok());
     }
-    assert_eq!(dir.count(), 19);
+    assert_eq!(dir.count(), 20);
     let again = Model::new(b"weights-c3:seed1", None);
     let r = run(&ledger, DATA, "c3:seed1", &again, &calls);
     assert!(is_already(&r, AppliedBy::RepresentativeConfig));
-    assert_eq!(dir.count(), 19);
+    assert_eq!(dir.count(), 20);
     assert_eq!(calls.get(), 9);
 }
 
@@ -668,7 +668,7 @@ fn req27_registered_id_with_different_weights_is_rejected() {
     register(&ledger, DATA, &[("c1:seed0", b"w1"), ("c2:seed0", b"w2")]);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
     // 初回の結果を見てから、未使用 ID に登録外の重みを当てる。
     let r = run(
         &ledger,
@@ -681,7 +681,7 @@ fn req27_registered_id_with_different_weights_is_rejected() {
         matches!(acquire_err(&r), Some(AcquireError::WeightsNotRegistered)),
         "{r:?}"
     );
-    assert_eq!(dir.count(), 3);
+    assert_eq!(dir.count(), 4);
     assert_eq!(calls.get(), 1);
 }
 
@@ -914,4 +914,196 @@ fn req27_decode_failure_consumes_application() {
         ))
     ));
     assert_eq!(calls.get(), 0);
+}
+
+// ---- 事前登録の改変検出（REQ-27・TASK-27.3・issue #72。codex P0 指摘の回帰）----
+
+#[cfg(unix)]
+fn ledger_file(dir: &TempDir, prefix: &str) -> PathBuf {
+    let mut hits: Vec<PathBuf> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "expected exactly one {prefix}* file");
+    hits.remove(0)
+}
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+/// 権限を 0600 へ戻して内容を差し替える（改変者が行う操作）。
+#[cfg(unix)]
+fn overwrite_writable(p: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(p, bytes).unwrap();
+}
+
+#[cfg(unix)]
+fn tampered_reason(r: &Outcome) -> Option<&'static str> {
+    match acquire_err(r) {
+        Some(AcquireError::RegistryTampered { reason }) => Some(reason),
+        _ => None,
+    }
+}
+
+/// 初回適用を済ませた台帳（登録は `a` のみ。重みは `wa`）。
+#[cfg(unix)]
+fn applied_ledger(label: &str) -> (TempDir, FinalTestLedger, Cell<u32>) {
+    let dir = TempDir::new(label);
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls).is_ok());
+    (dir, ledger, calls)
+}
+
+#[cfg(unix)]
+#[test]
+fn req27_registry_and_seal_are_created_read_only_0400() {
+    let dir = TempDir::new("ro-modes");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    assert_eq!(mode_of(&ledger_file(&dir, "registry-")), 0o400);
+    assert_eq!(mode_of(&ledger_file(&dir, "seal-")), 0o400);
+    let seal = fs::read_to_string(ledger_file(&dir, "seal-")).unwrap();
+    assert!(seal.starts_with("fandhe-edge-final-test-registry-seal v1\nregistry_sha256="));
+    assert_eq!(seal.trim_end().rsplit('=').next().unwrap().len(), 64);
+}
+
+/// 初回適用の後に権限を戻して登録へ未使用 ID を足しても、封印との不一致で拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_registry_edited_after_first_application_is_rejected() {
+    let (dir, ledger, calls) = applied_ledger("tamper-edit");
+    let reg_path = ledger_file(&dir, "registry-");
+    let mut body = fs::read_to_string(&reg_path).unwrap();
+    body.push_str(&format!(
+        "c9 {} - - -\n",
+        Sha256Digest::of_bytes(b"wc9").to_hex()
+    ));
+    overwrite_writable(&reg_path, body.as_bytes());
+    let before = dir.count();
+    let r = run(&ledger, DATA, "c9", &Model::new(b"wc9", None), &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry content does not match its seal")
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(dir.count(), before);
+}
+
+/// 登録ファイルを丸ごと別の（それ自体は有効な）内容へ差し替えた場合も拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_registry_replaced_with_other_content_is_rejected() {
+    let (dir, ledger, calls) = applied_ledger("tamper-replace");
+    let other_dir = TempDir::new("tamper-replace-other");
+    let other = FinalTestLedger::open(other_dir.path()).unwrap();
+    register(&other, DATA, &[("z", b"wz")]);
+    let other_body = fs::read(ledger_file(&other_dir, "registry-")).unwrap();
+    overwrite_writable(&ledger_file(&dir, "registry-"), &other_body);
+    let r = run(&ledger, DATA, "z", &Model::new(b"wz", None), &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry content does not match its seal")
+    );
+    assert_eq!(calls.get(), 1);
+}
+
+/// 封印を書き換えた（登録は無傷）場合も、封印の欠落・不正・不一致として拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_seal_tampered_or_removed_is_rejected() {
+    let (dir, ledger, calls) = applied_ledger("tamper-seal");
+    let seal = ledger_file(&dir, "seal-");
+    let m = Model::new(b"wa", None);
+
+    overwrite_writable(&seal, b"garbage");
+    let r = run(&ledger, DATA, "a", &m, &calls);
+    assert_eq!(tampered_reason(&r), Some("registry seal is malformed"));
+
+    let bogus = format!(
+        "fandhe-edge-final-test-registry-seal v1\nregistry_sha256={}\n",
+        Sha256Digest::of_bytes(b"x").to_hex()
+    );
+    overwrite_writable(&seal, bogus.as_bytes());
+    let r = run(&ledger, DATA, "a", &m, &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry content does not match its seal")
+    );
+
+    fs::remove_file(&seal).unwrap();
+    let r = run(&ledger, DATA, "a", &m, &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry seal is missing or unreadable")
+    );
+    assert_eq!(calls.get(), 1);
+}
+
+/// 登録と封印の両方を（別台帳で作った正規の組へ）差し替えても、適用済みロックが
+/// 記録した登録ダイジェストとの食い違いで拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_registry_and_seal_both_replaced_is_caught_by_lock_record() {
+    let (dir, ledger, calls) = applied_ledger("tamper-both");
+    let forged_dir = TempDir::new("tamper-both-forged");
+    let forged = FinalTestLedger::open(forged_dir.path()).unwrap();
+    register(&forged, DATA, &[("a", b"wa"), ("c9", b"wc9")]);
+    overwrite_writable(
+        &ledger_file(&dir, "registry-"),
+        &fs::read(ledger_file(&forged_dir, "registry-")).unwrap(),
+    );
+    overwrite_writable(
+        &ledger_file(&dir, "seal-"),
+        &fs::read(ledger_file(&forged_dir, "seal-")).unwrap(),
+    );
+    // 偽造した組は権限が 0600 のまま（読み取り専用でもない）ため、まず権限で弾かれる。
+    let r = run(&ledger, DATA, "c9", &Model::new(b"wc9", None), &calls);
+    assert_eq!(tampered_reason(&r), Some("registry or seal is writable"));
+    // 権限まで 0400 へ整えても、適用済みロックの記録との不一致で弾かれる。
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for p in [ledger_file(&dir, "registry-"), ledger_file(&dir, "seal-")] {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+    }
+    let before = dir.count();
+    let r = run(&ledger, DATA, "c9", &Model::new(b"wc9", None), &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry does not match the digest recorded at application")
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(dir.count(), before);
+}
+
+/// 内容を変えずに書き込み権だけを戻された場合も、読み取り専用でないとして拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_registry_made_writable_is_rejected_even_if_unchanged() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new("writable");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let reg_path = ledger_file(&dir, "registry-");
+    fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let calls = Cell::new(0u32);
+    let r = run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls);
+    assert_eq!(tampered_reason(&r), Some("registry or seal is writable"));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(dir.count(), 2);
+    // 権限を 0400 へ戻せば（内容が無傷なので）適用できる。
+    fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls).is_ok());
 }

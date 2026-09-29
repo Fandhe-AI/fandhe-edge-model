@@ -33,6 +33,17 @@
 //!   追加できない。PoC-10 の `APPLIED.json` 事前登録に相当）。登録後は集合を変更できない
 //!   （`create_new`）。
 //!
+//! - **事前登録の改変検出**: 登録ファイルは `create_new` の後に読み取り専用（Unix では
+//!   0400）へ落とし、登録本文の sha256（共通コアの [`Sha256Digest`]。正準化は
+//!   `registry_body` の 1 箇所）を別の封印ファイルへ 1 回だけ書いて同じく読み取り専用にする。
+//!   [`apply_once`] は適用前に、(1) 本文と封印の一致、(2) 登録・封印がともに読み取り専用、
+//!   (3) 登録済み ID のうち適用済みのロックが記録した登録ダイジェストとの一致、を確認し、
+//!   違反なら [`AcquireError::RegistryTampered`] で拒否する（ロックは作らない。fail-closed）。
+//!   (3) により、権限を戻して登録と封印の両方を差し替えても、適用済みの構成が 1 つでも
+//!   あれば検出できる。限界: 台帳ディレクトリを自由に書ける主体が、適用前に登録と封印を
+//!   まとめて差し替える、または適用済みロックまで含めて全て作り直す場合は、台帳内の
+//!   記録だけでは検出できない（台帳ディレクトリの保護は REQ-39 のガード層の責務）。
+//!   非 Unix でも `Permissions::readonly` で同じ検査をする。
 //! - **推論への入力**: 照合済みの評価データ本体は評価器側の `decode` で `input` と
 //!   正解に分け、`predict` へは `input` の列だけを渡す（REQ-27）。正解・評価データ
 //!   本体は予測側から見えず、正解は [`AppliedOnce::golds`] として評価器側へ返す。
@@ -101,7 +112,14 @@ pub const MAX_CONFIG_ID_BYTES: usize = 128;
 const CONFIG_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/config/v1\0";
 const WEIGHTS_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/weights/v1\0";
 const REGISTRY_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry/v1\0";
+const REGISTRY_SEAL_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-seal/v1\0";
+const REGISTRY_CONTENT_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-content/v1\0";
+const SEAL_HEADER: &str = "fandhe-edge-final-test-registry-seal v1\n";
 const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
+
+/// 封印ファイル・適用ロック記録の最大バイト数（読み込み前のサイズ上限。REQ-39）。
+const MAX_SEAL_BYTES: u64 = 256;
+const MAX_LOCK_RECORD_BYTES: u64 = 1024;
 
 /// 事前登録できる代表構成 ID の最大件数（確保・検証の上限。REQ-39）。
 pub const MAX_REGISTERED_CONFIGS: usize = 1024;
@@ -253,6 +271,30 @@ fn registry_name(eval_data_sha256: &Sha256Digest) -> String {
     format!("registry-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
 }
 
+/// 事前登録の封印ファイル名（登録本文の sha256 を 1 回だけ書き込む別ファイル）。
+fn seal_name(eval_data_sha256: &Sha256Digest) -> String {
+    let mut buf = Vec::with_capacity(REGISTRY_SEAL_DOMAIN.len() + 32);
+    buf.extend_from_slice(REGISTRY_SEAL_DOMAIN);
+    buf.extend_from_slice(eval_data_sha256.as_bytes());
+    format!("seal-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+}
+
+/// 事前登録の正準化本文（[`registry_body`]）のドメイン分離付き sha256。
+/// 正準化は [`registry_body`] の 1 箇所に集約し、ハッシュは共通コアの
+/// [`Sha256Digest`] で計算する（新しい正準化規則は持たない）。
+fn registry_digest(body: &[u8]) -> Sha256Digest {
+    let mut buf = Vec::with_capacity(REGISTRY_CONTENT_DOMAIN.len() + body.len());
+    buf.extend_from_slice(REGISTRY_CONTENT_DOMAIN);
+    buf.extend_from_slice(body);
+    Sha256Digest::of_bytes(&buf)
+}
+
+fn is_read_only(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file() && m.permissions().readonly())
+        .unwrap_or(false)
+}
+
 /// 最終 test 適用の識別キー（評価データ × 代表構成 × 重み）。
 ///
 /// 非公開型。評価データのダイジェストは [`apply_once`] が凍結記録と照合した値だけが
@@ -291,16 +333,17 @@ impl FinalTestKey {
         format!("weights-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
     }
 
-    fn record(&self, kind: &str) -> String {
+    fn record(&self, kind: &str, registry_sha256: &Sha256Digest) -> String {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         format!(
-            "fandhe-edge-final-test-application v1\nlock={kind}\neval_data_sha256={}\nrepresentative_config_id={}\nweights_sha256={}\napplied_unix_secs={secs}\n",
+            "fandhe-edge-final-test-application v1\nlock={kind}\neval_data_sha256={}\nrepresentative_config_id={}\nweights_sha256={}\nregistry_sha256={}\napplied_unix_secs={secs}\n",
             self.eval_data_sha256.to_hex(),
             self.config_id.as_str(),
             self.weights_sha256.to_hex(),
+            registry_sha256.to_hex(),
         )
     }
 }
@@ -360,6 +403,13 @@ pub enum AcquireError {
     /// 事前登録の内容が不正（空・件数超過・形式違反）。
     RegistryInvalid {
         /// 違反の種別（ID の実値は載せない）。
+        reason: &'static str,
+    },
+    /// 事前登録が改変された、または改変を検出できない状態にある（封印ファイルの欠落・
+    /// 内容不一致、登録・封印が読み取り専用でない、適用済みロックの記録との不一致）。
+    /// ロックは作られず、適用は拒否される（fail-closed。REQ-27）。
+    RegistryTampered {
+        /// 違反の種別（登録内容の実値は載せない）。
         reason: &'static str,
     },
     /// 台帳ディレクトリが存在しない・ディレクトリでない・symlink。
@@ -432,6 +482,9 @@ impl fmt::Display for AcquireError {
             }
             AcquireError::RegistryInvalid { reason } => {
                 write!(f, "invalid registration: {reason}")
+            }
+            AcquireError::RegistryTampered { reason } => {
+                write!(f, "registration integrity check failed: {reason}")
             }
             AcquireError::LedgerDirInvalid { path } => {
                 write!(f, "ledger path is not a real directory: {}", path.display())
@@ -544,6 +597,18 @@ impl FinalTestLedger {
             })
     }
 
+    /// 書き込み権を外す（登録・封印を通常のファイル操作で書き換えられなくする。
+    /// 権限を戻せる主体には効かないため、改変の検出は封印・ロック記録との照合が担う）。
+    fn make_read_only(path: &Path) -> Result<(), AcquireError> {
+        let io = |source| AcquireError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mut perms = fs::metadata(path).map_err(io)?.permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(path, perms).map_err(io)
+    }
+
     /// 台帳ディレクトリのエントリを永続化する。失敗を握りつぶさない（予測後の
     /// クラッシュでロックのエントリが失われると再適用できてしまうため）。
     #[cfg(unix)]
@@ -566,10 +631,16 @@ impl FinalTestLedger {
     }
 
     /// 評価データの事前登録を読む。無ければ [`AcquireError::NotRegistered`]。
+    ///
+    /// 読み込んだ本文は、登録時に別ファイル（封印）へ 1 回だけ書いた sha256 と一致し、
+    /// 登録・封印がともに読み取り専用のままで、かつ適用済みのロックが記録した登録
+    /// ダイジェストとも一致する場合にだけ返す。いずれかに違反したら
+    /// [`AcquireError::RegistryTampered`]（REQ-27。適用後に登録へ未使用 ID を足して
+    /// 適用対象を選び直す迂回を拒否する）。
     fn load_registry(
         &self,
         eval_data_sha256: &Sha256Digest,
-    ) -> Result<Vec<RegisteredConfig>, AcquireError> {
+    ) -> Result<(Vec<RegisteredConfig>, Sha256Digest), AcquireError> {
         let path = self.dir.join(registry_name(eval_data_sha256));
         // 通常ファイル判定・`O_NONBLOCK` 付きオープン・サイズ上限付き読み込みは共通コアに
         // 集約されている。FIFO 等では open 前に拒否され、無期限に待たない（REQ-39）。
@@ -590,21 +661,82 @@ impl FinalTestLedger {
                 });
             }
         };
+        let actual = registry_digest(&bytes);
+        let seal_path = self.dir.join(seal_name(eval_data_sha256));
+        let seal_bytes = match fandhe_edge_core::fs::read_bounded(&seal_path, MAX_SEAL_BYTES) {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(AcquireError::RegistryTampered {
+                    reason: "registry seal is missing or unreadable",
+                });
+            }
+        };
+        let sealed = String::from_utf8(seal_bytes)
+            .ok()
+            .and_then(|t| {
+                t.strip_prefix(SEAL_HEADER)
+                    .and_then(|r| r.strip_prefix("registry_sha256="))
+                    .and_then(|r| r.strip_suffix('\n'))
+                    .and_then(|r| r.parse::<Sha256Digest>().ok())
+            })
+            .ok_or(AcquireError::RegistryTampered {
+                reason: "registry seal is malformed",
+            })?;
+        if sealed != actual {
+            return Err(AcquireError::RegistryTampered {
+                reason: "registry content does not match its seal",
+            });
+        }
+        if !is_read_only(&path) || !is_read_only(&seal_path) {
+            return Err(AcquireError::RegistryTampered {
+                reason: "registry or seal is writable",
+            });
+        }
         let body = String::from_utf8(bytes).map_err(|_| AcquireError::RegistryInvalid {
             reason: "registry is not valid utf-8",
         })?;
-        parse_registry(&body)
+        let entries = parse_registry(&body)?;
+        // 適用済みのロックは、適用時点の登録ダイジェストを記録している。登録と封印の
+        // 両方を差し替えても、既存ロックの記録と食い違えば検出できる。
+        let want = format!("registry_sha256={}\n", sealed.to_hex());
+        for entry in &entries {
+            let lock = self.dir.join(config_lock_name(eval_data_sha256, &entry.id));
+            match fandhe_edge_core::fs::read_bounded(&lock, MAX_LOCK_RECORD_BYTES) {
+                Ok(b) => {
+                    // 空のロックは、代表構成ロックを作った後に重みロックの衝突で
+                    // 記録を書かず失敗した消費済みの残骸。記録が無いので照合しない。
+                    let text = String::from_utf8(b).unwrap_or_default();
+                    if !text.is_empty() && !text.contains(&format!("\n{want}")) {
+                        return Err(AcquireError::RegistryTampered {
+                            reason: "registry does not match the digest recorded at application",
+                        });
+                    }
+                }
+                Err(FsError::Read { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(AcquireError::RegistryTampered {
+                        reason: "application lock is unreadable",
+                    });
+                }
+            }
+        }
+        Ok((entries, sealed))
     }
 
     /// 適用権を取得する（代表構成ロック → 重みロックの順）。
-    fn acquire(&self, key: &FinalTestKey) -> Result<ApplicationTicket, AcquireError> {
+    fn acquire(
+        &self,
+        key: &FinalTestKey,
+        registry_sha256: &Sha256Digest,
+    ) -> Result<ApplicationTicket, AcquireError> {
         let (cfg_file, cfg_path) =
             self.create_lock(&key.config_lock_name(), AppliedBy::RepresentativeConfig)?;
         // 以降、失敗してもロールバックしない（適用を試みた事実として消費扱い）。
         let (w_file, w_path) =
             self.create_lock(&key.weights_lock_name(), AppliedBy::ModelWeights)?;
-        Self::write_record(cfg_file, &cfg_path, &key.record("config"))?;
-        Self::write_record(w_file, &w_path, &key.record("weights"))?;
+        Self::write_record(cfg_file, &cfg_path, &key.record("config", registry_sha256))?;
+        Self::write_record(w_file, &w_path, &key.record("weights", registry_sha256))?;
         self.sync_dir()?;
         Ok(ApplicationTicket {
             config_lock: cfg_path,
@@ -758,7 +890,27 @@ impl FinalTestLedger {
             }
             Err(e) => return Err(e),
         };
-        Self::write_record(file, &path, &registry_body(&sorted))?;
+        let body = registry_body(&sorted);
+        Self::write_record(file, &path, &body)?;
+        Self::make_read_only(&path)?;
+        // 登録本文の sha256 を別ファイルへ 1 回だけ封印する。登録ファイルだけを
+        // 書き換えても、封印との不一致で適用が拒否される。
+        let (seal_file, seal_path) = match self.create_lock(
+            &seal_name(eval_data_sha256),
+            AppliedBy::RepresentativeConfig,
+        ) {
+            Ok(v) => v,
+            Err(AcquireError::AlreadyApplied { lock_path, .. }) => {
+                return Err(AcquireError::AlreadyRegistered { path: lock_path });
+            }
+            Err(e) => return Err(e),
+        };
+        let seal = format!(
+            "{SEAL_HEADER}registry_sha256={}\n",
+            registry_digest(body.as_bytes()).to_hex()
+        );
+        Self::write_record(seal_file, &seal_path, &seal)?;
+        Self::make_read_only(&seal_path)?;
         self.sync_dir()
     }
 }
@@ -788,7 +940,7 @@ pub fn apply_once<T, E>(
     evaluate_with_eval_data_invariance(frozen, |bytes| {
         // ここに来た時点で bytes の sha256 == frozen.sha256（照合済み）。
         evaluate_with_invariance(model, |paths| {
-            let registered = ledger
+            let (registered, registry_sha256) = ledger
                 .load_registry(&frozen.sha256)
                 .map_err(ApplyOnceError::Acquire)?;
             let Some(entry) = registered.iter().find(|e| e.id == config_id) else {
@@ -816,7 +968,9 @@ pub fn apply_once<T, E>(
             // 適用権は評価データ本文を `decode` へ渡す前に消費する。本文を見てから
             // `Err` で抜けて何度でも呼び直す迂回を塞ぐ（REQ-27）。
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
-            let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
+            let ticket = ledger
+                .acquire(&key, &registry_sha256)
+                .map_err(ApplyOnceError::Acquire)?;
             let records = decode(bytes).map_err(|DecodeFailed| ApplyOnceError::Decode)?;
             let (inputs, golds): (Vec<String>, Vec<String>) =
                 records.into_iter().map(|r| (r.input, r.gold)).unzip();
