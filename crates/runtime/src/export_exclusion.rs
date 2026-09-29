@@ -34,7 +34,9 @@
 //!   `#[non_exhaustive]` で、後からバリアントを足せる
 
 use crate::onnx::{ModelKind, OnnxBackend, OnnxLoadError, load_pipeline};
-use crate::pipeline::{InferError, InferencePipeline, MAX_INFER_BATCH_LEN};
+use crate::pipeline::{
+    InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES,
+};
 use crate::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
@@ -312,6 +314,8 @@ pub enum ScreeningError {
     TooManyCandidates,
     /// 照合ケース数が [`MAX_PARITY_CASES`] を超えた。
     TooManyCases,
+    /// 照合ケースの総入力バイト数が [`MAX_INFER_BATCH_TOTAL_BYTES`] を超えた（推論前に検査。REQ-39）。
+    TotalInputTooLarge,
     /// 参照ラベルがクラス数の範囲外。
     ReferenceOutOfRange,
     /// 同じ構成が重複して渡された。
@@ -324,7 +328,9 @@ impl ScreeningError {
         match self {
             Self::Load(e) => e.code(),
             Self::Infer(e) => e.code(),
-            Self::TooManyCandidates | Self::TooManyCases => "limit_exceeded",
+            Self::TooManyCandidates | Self::TooManyCases | Self::TotalInputTooLarge => {
+                "limit_exceeded"
+            }
             Self::ReferenceOutOfRange => "reference_out_of_range",
             Self::DuplicateCandidate => "duplicate_candidate",
         }
@@ -389,6 +395,16 @@ pub fn check_prediction_parity(
 ) -> Result<ParityReport, ScreeningError> {
     if cases.len() > MAX_PARITY_CASES {
         return Err(ScreeningError::TooManyCases);
+    }
+    // 総入力バイト数を推論前に checked 演算で集計する（`infer_batch` の総量上限の迂回を防ぐ。REQ-39）
+    let mut total_bytes = 0usize;
+    for case in cases {
+        total_bytes = total_bytes
+            .checked_add(case.input.len())
+            .ok_or(ScreeningError::TotalInputTooLarge)?;
+        if total_bytes > MAX_INFER_BATCH_TOTAL_BYTES {
+            return Err(ScreeningError::TotalInputTooLarge);
+        }
     }
     let mut mismatched = 0usize;
     for case in cases {
@@ -490,7 +506,8 @@ where
 }
 
 /// パスと sha256 からモデルを読んで判定する薄い関数（内部で [`load_pipeline`]。サイズ上限と
-/// sha256 照合を通る）。パスの閉じ込めは呼び出し側（ガード層）の責務。
+/// sha256 照合を通る。検証は除外判定より先に行い、既知制約で除外する構成でもモデルの欠落・破損・
+/// 不一致は [`ScreeningError::Load`] になる）。パスの閉じ込めは呼び出し側（ガード層）の責務。
 ///
 /// # Errors
 /// [`screen_candidate`] と同じ。
@@ -501,11 +518,17 @@ pub fn screen_candidate_from_path(
     expected_sha256: &Sha256Digest,
     cases: &[ParityCase<'_>],
 ) -> Result<CandidateDecision, ScreeningError> {
-    screen_candidate(
-        config,
-        |kind| load_pipeline(kind, max_bytes, path, expected_sha256),
-        cases,
-    )
+    // 除外判定（既知制約・未対応ランタイム・ケース 0 件）より先にファイルの存在・サイズ・sha256 を
+    // 検証する。欠落・破損・改ざんは除外に化けさせず全体停止にする（REQ-39 fail-closed）。
+    // 形式不成立（`Exclude` 分類）だけは除外判定へ回すため、結果を保持して渡す。
+    let loaded = load_pipeline(config.kind, max_bytes, path, expected_sha256);
+    let loaded = match loaded {
+        Err(e) if classify_load_error(&e) == LoadErrorClass::Propagate => {
+            return Err(ScreeningError::Load(e));
+        }
+        other => other,
+    };
+    screen_candidate(config, |_| loaded, cases)
 }
 
 /// 複数構成を入力順に判定する。候補数上限・重複検査・順序保持をここに集約する。

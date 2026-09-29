@@ -258,11 +258,26 @@ pub fn capacity_error_report(err: &CapacityError) -> ErrorReport {
     ErrorReport::new(err.exit_code(), err.public_message())
 }
 
+/// JSON 文字列リテラルの中身としてエスケープする（引用符・バックスラッシュ・制御文字）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 配布候補の除外記録（REQ-32・TASK-32.2・#114）を `{"excluded":[...]}` へ直列化する
 /// （JSON 文字列。改行なし）。
 ///
 /// 後続の `package`・`select` 工程（TASK-33.x。未配線）が出力へ埋め込む部品。値は ASCII の
-/// snake_case 固定リテラルと整数だけで、エスケープは要らない（前提は runtime 側のテストで固定）。
+/// snake_case 固定リテラルと整数だけの想定だが、`load_code` は公開フィールドで任意の文字列を持てる
+/// ため、文字列値はすべて [`json_escape`] を通す（不正な JSON を作らない）。
 /// `detail`・`source`・`load_code`・`mismatched`・`total` は該当する場合だけ出し、キー順は固定。
 /// 入力本文・パスは記録に含まれない。
 #[must_use]
@@ -278,14 +293,14 @@ pub fn export_exclusions_json(records: &[ExclusionRecord]) -> String {
                 r.code()
             );
             if let Some(d) = r.detail_code() {
-                s.push_str(&format!(",\"detail\":\"{d}\""));
+                s.push_str(&format!(",\"detail\":\"{}\"", json_escape(d)));
             }
             if let ExclusionReason::PredictionMismatch { mismatched, total } = &r.reason {
                 s.push_str(&format!(",\"mismatched\":{mismatched},\"total\":{total}"));
             }
             s.push_str(&format!(",\"evidence\":\"{}\"", r.evidence.as_str()));
             if let Some(src) = r.source() {
-                s.push_str(&format!(",\"source\":\"{src}\""));
+                s.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
             }
             s.push('}');
             s
@@ -847,5 +862,22 @@ mod tests {
                 "\"evidence\":\"test_harness\"}]}"
             )
         );
+    }
+
+    /// REQ-32: `load_code` に引用符・改行があっても JSON がエスケープされる。
+    #[test]
+    fn req32_export_exclusions_json_escapes_load_code() {
+        use fandhe_edge_runtime::export_exclusion::{
+            EvidenceKind, InferenceRuntime as Rt, NumericFormat as Nf,
+        };
+        use fandhe_edge_runtime::onnx::ModelKind;
+        let rec = ExclusionRecord {
+            config: export_cfg(ModelKind::C3, Rt::Own, Nf::F32),
+            reason: ExclusionReason::RuntimeRejectedModel {
+                load_code: "a\"b\\c\nd",
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        assert!(export_exclusions_json(&[rec]).contains("\"detail\":\"a\\\"b\\\\c\\u000ad\""),);
     }
 }

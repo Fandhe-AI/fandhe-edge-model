@@ -267,3 +267,57 @@ fn req32_screen_candidates_order_limits_duplicates() {
         screen_candidate_from_path(own, f.max_bytes, &f.path, &f.sha, &bad).expect_err("range");
     assert!(matches!(err, ScreeningError::ReferenceOutOfRange));
 }
+
+/// REQ-39: 既知制約・未対応ランタイム・ケース 0 件でも、sha256 不一致・ファイル欠落は
+/// 除外にならず全体停止（fail-closed）になる。
+#[test]
+fn req39_from_path_verifies_model_before_exclusion() {
+    let f = fixture(ModelKind::C1);
+    let wrong: Sha256Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+        .parse()
+        .expect("digest");
+    let missing = f.path.with_file_name("does_not_exist.onnx");
+    let tract_int8 = ExportConfig {
+        kind: ModelKind::C3,
+        runtime: InferenceRuntime::Tract,
+        format: NumericFormat::Int8Dynamic,
+    };
+    let not_available = ExportConfig {
+        kind: ModelKind::C1,
+        runtime: InferenceRuntime::OnnxRuntime,
+        format: NumericFormat::F16,
+    };
+    let cases = parity_cases(&f, &f.labels);
+    for config in [tract_int8, not_available, own_f32(ModelKind::C1)] {
+        for case_set in [&cases[..], &[][..]] {
+            let e = screen_candidate_from_path(config, f.max_bytes, &f.path, &wrong, case_set)
+                .expect_err("sha mismatch must stop");
+            assert_eq!(e.code(), "integrity_mismatch");
+            let e = screen_candidate_from_path(config, f.max_bytes, &missing, &f.sha, case_set)
+                .expect_err("missing file must stop");
+            assert!(matches!(e, ScreeningError::Load(_)));
+        }
+    }
+    // 正しいファイルなら既知制約の除外は従来どおり成立する
+    let d = screen_candidate_from_path(tract_int8, f.max_bytes, &f.path, &f.sha, &[])
+        .expect("decision");
+    assert!(matches!(d, CandidateDecision::Excluded(_)));
+}
+
+/// REQ-39: 照合ケースの総入力バイト数が上限（64 MiB）を超えれば推論前に `limit_exceeded`。
+#[test]
+fn req39_parity_total_input_bytes_limited() {
+    let f = fixture(ModelKind::C1);
+    let big = "a".repeat(1024 * 1024);
+    let cases: Vec<ParityCase<'_>> = (0..65)
+        .map(|_| ParityCase {
+            input: &big,
+            reference_label: 0,
+        })
+        .collect();
+    let e =
+        screen_candidate_from_path(own_f32(ModelKind::C1), f.max_bytes, &f.path, &f.sha, &cases)
+            .expect_err("total bytes limit");
+    assert!(matches!(e, ScreeningError::TotalInputTooLarge));
+    assert_eq!(e.code(), "limit_exceeded");
+}
