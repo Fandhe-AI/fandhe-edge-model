@@ -121,6 +121,20 @@ const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
 const MAX_SEAL_BYTES: u64 = 256;
 const MAX_LOCK_RECORD_BYTES: u64 = 1024;
 
+/// 台帳内で照合する適用ロックの最大件数（列挙の上限。REQ-39）。
+const MAX_LOCK_SCAN_ENTRIES: usize = 65_536;
+
+/// 適用ロックのファイル名（`config-` または `weights-` + 小文字 hex 64 桁 + `.lock`）か。
+fn is_lock_file_name(name: &str) -> bool {
+    ["config-", "weights-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(".lock"))
+            .is_some_and(|h| {
+                h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    })
+}
+
 /// 事前登録できる代表構成 ID の最大件数（確保・検証の上限。REQ-39）。
 pub const MAX_REGISTERED_CONFIGS: usize = 1024;
 
@@ -509,7 +523,6 @@ impl fmt::Display for AcquireError {
 impl std::error::Error for AcquireError {}
 
 /// [`apply_once`] のエラー。予測クロージャ自身のエラー型 `E` を包む。
-#[derive(Debug)]
 #[non_exhaustive]
 pub enum ApplyOnceError<E> {
     /// ロック取得に失敗（予測は呼ばれていない）。
@@ -519,20 +532,33 @@ pub enum ApplyOnceError<E> {
     /// （分解側が返す文字列に評価データの本文が混ざる経路を型で塞ぐ。REQ-39）。
     Decode,
     /// 予測クロージャが失敗した。ロックは残るため再試行は拒否される。
+    ///
+    /// `E` は呼び出し側の値としてそのまま返すが、本型の `Display`・`Debug` には
+    /// 中身を出さない（`E` が入力本文を抱えていても公開エラー・ログへ流さない。REQ-39）。
     Prediction(E),
 }
 
-impl<E: fmt::Display> fmt::Display for ApplyOnceError<E> {
+impl<E> fmt::Debug for ApplyOnceError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ApplyOnceError::Acquire(e) => write!(f, "{e}"),
-            ApplyOnceError::Decode => write!(f, "failed to decode eval data"),
-            ApplyOnceError::Prediction(e) => write!(f, "prediction failed: {e}"),
+            ApplyOnceError::Acquire(e) => f.debug_tuple("Acquire").field(e).finish(),
+            ApplyOnceError::Decode => f.write_str("Decode"),
+            ApplyOnceError::Prediction(_) => f.write_str("Prediction(..)"),
         }
     }
 }
 
-impl<E: fmt::Debug + fmt::Display> std::error::Error for ApplyOnceError<E> {}
+impl<E> fmt::Display for ApplyOnceError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApplyOnceError::Acquire(e) => write!(f, "{e}"),
+            ApplyOnceError::Decode => write!(f, "failed to decode eval data"),
+            ApplyOnceError::Prediction(_) => write!(f, "prediction failed"),
+        }
+    }
+}
+
+impl<E> std::error::Error for ApplyOnceError<E> {}
 
 /// 適用権（消費される値）。取得できた呼び出し側だけが予測を当ててよい。
 #[derive(Debug)]
@@ -697,31 +723,65 @@ impl FinalTestLedger {
         })?;
         let entries = parse_registry(&body)?;
         // 適用済みのロックは、適用時点の登録ダイジェストを記録している。登録と封印の
-        // 両方を差し替えても、既存ロックの記録と食い違えば検出できる。
-        let want = format!("registry_sha256={}\n", sealed.to_hex());
-        for entry in &entries {
-            let lock = self.dir.join(config_lock_name(eval_data_sha256, &entry.id));
-            match fandhe_edge_core::fs::read_bounded(&lock, MAX_LOCK_RECORD_BYTES) {
-                Ok(b) => {
-                    // 空のロックは、代表構成ロックを作った後に重みロックの衝突で
-                    // 記録を書かず失敗した消費済みの残骸。記録が無いので照合しない。
-                    let text = String::from_utf8(b).unwrap_or_default();
-                    if !text.is_empty() && !text.contains(&format!("\n{want}")) {
-                        return Err(AcquireError::RegistryTampered {
-                            reason: "registry does not match the digest recorded at application",
-                        });
-                    }
-                }
-                Err(FsError::Read { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    return Err(AcquireError::RegistryTampered {
-                        reason: "application lock is unreadable",
-                    });
-                }
+        // 両方を差し替えても、既存ロックの記録と食い違えば検出できる。現在の登録に含まれる
+        // ID に限らず、この評価データの既存ロックをすべて列挙して照合する（登録から
+        // 適用済み ID を除いた集合への差し替えを検出するため）。
+        self.check_existing_locks(eval_data_sha256, &sealed)?;
+        Ok((entries, sealed))
+    }
+
+    /// 台帳内の適用ロック（`config-<hex>.lock`・`weights-<hex>.lock`）をすべて列挙し、
+    /// この評価データのロックが記録した登録ダイジェストが `sealed` と一致することを確認する。
+    ///
+    /// 列挙はファイル名の許可パターンに限り、件数（[`MAX_LOCK_SCAN_ENTRIES`]）と
+    /// 1 件のサイズ（[`MAX_LOCK_RECORD_BYTES`]）に上限を置く。読めない・壊れた・通常
+    /// ファイルでないロックは fail-closed で拒否する。空のロックは、代表構成ロック作成後に
+    /// 重みロックの衝突で記録を書かず失敗した消費済みの残骸で、記録が無いので照合しない。
+    fn check_existing_locks(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+        sealed: &Sha256Digest,
+    ) -> Result<(), AcquireError> {
+        let tampered = |reason| AcquireError::RegistryTampered { reason };
+        let entries = fs::read_dir(&self.dir).map_err(|_| tampered("ledger is unreadable"))?;
+        let want_eval = eval_data_sha256.to_hex();
+        let want_registry = sealed.to_hex();
+        let mut scanned = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|_| tampered("ledger is unreadable"))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_lock_file_name(name) {
+                continue;
+            }
+            scanned += 1;
+            if scanned > MAX_LOCK_SCAN_ENTRIES {
+                return Err(tampered("too many application locks"));
+            }
+            let bytes = fandhe_edge_core::fs::read_bounded(&entry.path(), MAX_LOCK_RECORD_BYTES)
+                .map_err(|_| tampered("application lock is unreadable"))?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let text =
+                String::from_utf8(bytes).map_err(|_| tampered("application lock is malformed"))?;
+            let field = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+            };
+            let Some(eval) = field("eval_data_sha256") else {
+                return Err(tampered("application lock is malformed"));
+            };
+            if eval != want_eval {
+                continue;
+            }
+            if field("registry_sha256") != Some(want_registry.as_str()) {
+                return Err(tampered(
+                    "registry does not match the digest recorded at application",
+                ));
             }
         }
-        Ok((entries, sealed))
+        Ok(())
     }
 
     /// 適用権を取得する（代表構成ロック → 重みロックの順）。

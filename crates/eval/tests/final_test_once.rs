@@ -1107,3 +1107,74 @@ fn req27_registry_made_writable_is_rejected_even_if_unchanged() {
     fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o400)).unwrap();
     assert!(run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls).is_ok());
 }
+
+/// 登録と封印を、適用済み ID を含まない互いに素な ID 集合の正規の組へ差し替えても、
+/// 台帳内の既存ロックをすべて照合するため拒否される（Bugbot・codex 指摘の回帰）。
+#[cfg(unix)]
+#[test]
+fn req27_registry_replaced_with_disjoint_id_set_is_rejected() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (dir, ledger, calls) = applied_ledger("tamper-disjoint");
+    let forged_dir = TempDir::new("tamper-disjoint-forged");
+    let forged = FinalTestLedger::open(forged_dir.path()).unwrap();
+    register(&forged, DATA, &[("x", b"wx")]);
+    for prefix in ["registry-", "seal-"] {
+        let dst = ledger_file(&dir, prefix);
+        overwrite_writable(&dst, &fs::read(ledger_file(&forged_dir, prefix)).unwrap());
+        fs::set_permissions(&dst, fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    let before = dir.count();
+    let r = run(&ledger, DATA, "x", &Model::new(b"wx", None), &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("registry does not match the digest recorded at application")
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(dir.count(), before);
+}
+
+/// 壊れた適用ロック（評価データの記録が読めない）は fail-closed で拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_malformed_application_lock_is_rejected() {
+    let (dir, ledger, calls) = applied_ledger("tamper-lock");
+    let lock = ledger_file(&dir, "config-");
+    overwrite_writable(&lock, b"garbage\n");
+    let r = run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls);
+    assert_eq!(tampered_reason(&r), Some("application lock is malformed"));
+    assert_eq!(calls.get(), 1);
+}
+
+/// 予測エラーが入力本文を抱えていても、公開エラーの Display・Debug には出ない。
+#[test]
+fn req39_prediction_error_body_does_not_leak_into_display_or_debug() {
+    let dir = TempDir::new("pred-leak");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let data_dir = TempDir::new("pred-leak-data");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let record = freeze_eval_data(DATA).unwrap();
+    let frozen = FrozenEvalData {
+        path: &path,
+        sha256: record.sha256(),
+        byte_len: record.byte_len(),
+    };
+    let r = apply_once(
+        &ledger,
+        &frozen,
+        id("a"),
+        &Model::new(b"wa", None).paths(),
+        dec,
+        |_t, inputs, _p| Err::<(), _>(format!("SECRET-BODY {}", inputs[0])),
+    );
+    let e = r.unwrap_err();
+    let display = e.to_string();
+    let debug = format!("{e:?}");
+    assert_eq!(
+        display,
+        "evaluation failed: evaluation failed: prediction failed"
+    );
+    assert!(!debug.contains("SECRET-BODY"), "{debug}");
+    assert!(debug.contains("Prediction(..)"), "{debug}");
+}
