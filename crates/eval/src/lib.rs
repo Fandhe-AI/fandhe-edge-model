@@ -119,7 +119,7 @@
 //!   PoC-9 `ArgumentRecordingPredictor` 相当）: 実装済み（[`input_only`]）。
 //!   CLI `evaluate` 工程への配線（issue #140）は未実装
 //! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3・issue #72）:
-//!   実装済み（[`final_test_once`]。代表構成ロック＋重みロック）。CLI `evaluate`
+//!   実装済み（[`final_test_once`]。事前登録集合・代表構成ロック・重みロック）。CLI `evaluate`
 //!   工程への配線（issue #140）・終了コードへの写像（TASK-33.3）は未実装
 //! - パッケージ全体を 1 つにまとめた合成ダイジェスト・配布パッケージの
 //!   マニフェスト形式（REQ-30・TASK-30.x）: 未実装。[`invariance`] は

@@ -12,24 +12,38 @@
 //! CLI の `evaluate` 工程（issue #140 で配線予定・未配線）が、データ契約層の
 //! 凍結記録から組み立てた [`FrozenEvalData`] を渡して [`apply_once`] を呼ぶ想定。
 //!
-//! # 唯一の公開経路（ロックと凍結記録の結び付け）
+//! # 唯一の公開経路（ロック・凍結記録・実モデルの結び付け）
 //!
 //! ロックのキー（`FinalTestKey`）は非公開型で、コンストラクタも非公開。
-//! 公開の入口は [`apply_once`] だけで、内部で
-//! [`evaluate_with_eval_data_invariance`] を呼び、**実データから計算した sha256 が
-//! 凍結記録と一致した後にのみ**、その照合済みダイジェストからキーを作る。
-//! 呼び出し側が任意のダイジェストでキーを作って別ロックを取得し、2 回目の
-//! 予測を通すことはできない（レビュー指摘 P0 への対応）。
+//! 公開の入口は [`apply_once`] だけで、次の 3 つを内部で結び付ける。
+//!
+//! - **評価データ**: [`evaluate_with_eval_data_invariance`] で実データの sha256 が
+//!   凍結記録と一致した後にのみ、その照合済みダイジェストからキーを作る。
+//! - **モデル**: 呼び出し側が申告するダイジェストは受け取らない。[`ModelPackagePaths`]
+//!   を受け取り、[`evaluate_with_invariance`] の内側で重みファイルを自らハッシュして
+//!   キーを作り、`predict` へは**同じ [`ModelPackagePaths`]** を渡す。予測に使う
+//!   モデルとロックキーが同一のパスから導出され、評価前後のモデル不変性検証
+//!   （REQ-27）と一体で動く。
+//! - **事前登録**: 候補・seed の代表構成 ID 集合は、評価前に
+//!   [`FinalTestLedger::register_configs`] で評価データごとに 1 回だけ台帳へ凍結する。
+//!   [`apply_once`] は登録済み集合に含まれない ID を拒否する（別 ID・別重みでの
+//!   再適用を、登録されていない候補として拒否する。PoC-10 の `APPLIED.json`
+//!   事前登録に相当）。登録後は集合を変更できない（`create_new`）。
 //!
 //! # 順序の不変条件
 //!
 //! 1. 凍結記録との照合（`evaluate_with_eval_data_invariance`）が通ってから
-//! 2. ロックを取得し、永続化（ファイル・ディレクトリの `sync_all`）まで確認し
-//! 3. 予測を当てる
+//! 2. モデルの評価前スナップショットを取り、事前登録の照合（ロックは作らない）
+//! 3. ロックを取得し、永続化（ファイルの `sync_all`、Unix ではディレクトリも）まで確認し
+//! 4. 予測を当て、評価後にモデル・評価データの不変性を検証する
 //!
-//! 永続化の確認に失敗したら予測は呼ばずエラーを返す（fail-closed）。ディレクトリの
-//! fsync ができない環境（非 Unix 等）では永続性を保証できないため、
-//! [`AcquireError::DurabilityUnsupported`] で拒否する（サポート外を成功扱いにしない）。
+//! 事前登録・ID・重みの読み込みに失敗した場合はロックを作らず、適用を消費しない。
+//! 永続化の確認に失敗したら予測は呼ばずエラーを返す（fail-closed）。
+//!
+//! 台帳ディレクトリの fsync は Unix のみ行う。Windows 等ではディレクトリハンドルの
+//! `sync_all` が使えないため、ロックファイル自体の `sync_all` までで成功扱いとする
+//! （ディレクトリエントリの永続化は OS 任せ。この限界は既知で、ロックのクラッシュ
+//! 耐性は Unix より弱い）。
 //!
 //! 凍結ハッシュ不一致では `eval` クロージャが呼ばれないためロックは作られず、
 //! 1 回の適用を消費しない。ロック取得後に予測が失敗しても、ロックは残す
@@ -50,6 +64,8 @@
 //! # 範囲外（実装済みを装わない）
 //!
 //! - CLI `evaluate` への配線（issue #140）・終了コードへの写像（TASK-33.3）は未実装。
+//! - 事前登録集合の内容（どの候補・seed を登録するか）の決定は呼び出し側（選定工程）の
+//!   責務。本モジュールは登録の凍結と照合のみを行う。
 //! - 台帳ディレクトリの配置・ルート配下への閉じ込めはガード層（REQ-39）と呼び出し側の
 //!   責務。本モジュールは symlink でない実ディレクトリであることのみ検査する。
 //! - 既存予測の再採点（予測を当てない操作）はロック不要のため対象外。
@@ -59,11 +75,15 @@
 use crate::eval_data_invariance::{
     EvalDataInvarianceError, FrozenEvalData, evaluate_with_eval_data_invariance,
 };
-use crate::invariance::{ModelComponent, ModelPackageSnapshot};
+use crate::invariance::{
+    EvaluationInvarianceError, MAX_MODEL_COMPONENT_BYTES, ModelPackagePaths,
+    evaluate_with_invariance,
+};
+use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 /// 代表構成 ID の最大バイト数（確保・検証の上限。REQ-39）。
@@ -71,6 +91,16 @@ pub const MAX_CONFIG_ID_BYTES: usize = 128;
 
 const CONFIG_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/config/v1\0";
 const WEIGHTS_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/weights/v1\0";
+const REGISTRY_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry/v1\0";
+const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
+
+/// 事前登録できる代表構成 ID の最大件数（確保・検証の上限。REQ-39）。
+pub const MAX_REGISTERED_CONFIGS: usize = 1024;
+
+/// 事前登録ファイルの最大バイト数（読み込み前のサイズ上限。REQ-39）。
+/// 128 バイトの ID を最大件数並べても収まる値。
+const MAX_REGISTRY_BYTES: u64 =
+    (MAX_CONFIG_ID_BYTES as u64 + 1) * MAX_REGISTERED_CONFIGS as u64 + REGISTRY_HEADER.len() as u64;
 
 /// 検証済みの代表構成 ID（1〜128 バイトの ASCII `[A-Za-z0-9._:-]`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +133,25 @@ impl RepresentativeConfigId {
     }
 }
 
+/// 評価データ × 代表構成のロックファイル名（ハッシュ由来の固定長 hex のみ）。
+fn config_lock_name(eval_data_sha256: &Sha256Digest, config_id: &RepresentativeConfigId) -> String {
+    let id = config_id.as_str().as_bytes();
+    let mut buf = Vec::with_capacity(CONFIG_LOCK_DOMAIN.len() + 32 + 8 + id.len());
+    buf.extend_from_slice(CONFIG_LOCK_DOMAIN);
+    buf.extend_from_slice(eval_data_sha256.as_bytes());
+    buf.extend_from_slice(&(id.len() as u64).to_be_bytes());
+    buf.extend_from_slice(id);
+    format!("config-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+}
+
+/// 評価データごとの事前登録ファイル名。
+fn registry_name(eval_data_sha256: &Sha256Digest) -> String {
+    let mut buf = Vec::with_capacity(REGISTRY_DOMAIN.len() + 32);
+    buf.extend_from_slice(REGISTRY_DOMAIN);
+    buf.extend_from_slice(eval_data_sha256.as_bytes());
+    format!("registry-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+}
+
 /// 最終 test 適用の識別キー（評価データ × 代表構成 × 重み）。
 ///
 /// 非公開型。評価データのダイジェストは [`apply_once`] が凍結記録と照合した値だけが
@@ -115,31 +164,22 @@ struct FinalTestKey {
 }
 
 impl FinalTestKey {
-    /// 凍結記録との照合を通過した評価データの sha256・代表構成 ID・モデル
-    /// スナップショットから作る。重みのダイジェストが取れなければ fail-closed。
+    /// 凍結記録との照合を通過した評価データの sha256・代表構成 ID・予測に使う
+    /// 重みファイルから [`apply_once`] が自ら計算したダイジェストから作る。
     fn from_verified(
         frozen_eval_sha256: Sha256Digest,
         config_id: RepresentativeConfigId,
-        model: &ModelPackageSnapshot,
-    ) -> Result<Self, AcquireError> {
-        let weights_sha256 = *model
-            .digest(ModelComponent::Weights)
-            .ok_or(AcquireError::MissingWeightsDigest)?;
-        Ok(FinalTestKey {
+        weights_sha256: Sha256Digest,
+    ) -> Self {
+        FinalTestKey {
             eval_data_sha256: frozen_eval_sha256,
             config_id,
             weights_sha256,
-        })
+        }
     }
 
     fn config_lock_name(&self) -> String {
-        let id = self.config_id.as_str().as_bytes();
-        let mut buf = Vec::with_capacity(CONFIG_LOCK_DOMAIN.len() + 32 + 8 + id.len());
-        buf.extend_from_slice(CONFIG_LOCK_DOMAIN);
-        buf.extend_from_slice(self.eval_data_sha256.as_bytes());
-        buf.extend_from_slice(&(id.len() as u64).to_be_bytes());
-        buf.extend_from_slice(id);
-        format!("config-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+        config_lock_name(&self.eval_data_sha256, &self.config_id)
     }
 
     fn weights_lock_name(&self) -> String {
@@ -190,8 +230,28 @@ pub enum AcquireError {
         /// 違反の種別。
         reason: &'static str,
     },
-    /// モデルスナップショットに重みのダイジェストが無い。
-    MissingWeightsDigest,
+    /// 予測に使う重みファイルのダイジェストを計算できなかった（読み込み失敗・
+    /// サイズ上限超過・通常ファイルでない）。ロックは作られない。
+    WeightsDigest {
+        /// 原因。
+        source: FsError,
+    },
+    /// この評価データに代表構成 ID の事前登録が無い。[`FinalTestLedger::register_configs`]
+    /// を評価前に呼ぶ必要がある。ロックは作られない。
+    NotRegistered,
+    /// 代表構成 ID が事前登録集合に含まれない。ロックは作られない。
+    UnregisteredConfig,
+    /// この評価データの事前登録は既にある（登録の変更・上書きは拒否する）、または
+    /// 登録しようとした ID の適用が既に行われている。
+    AlreadyRegistered {
+        /// 既存の登録ファイルまたは既存ロックのパス。
+        path: PathBuf,
+    },
+    /// 事前登録の内容が不正（空・件数超過・形式違反）。
+    RegistryInvalid {
+        /// 違反の種別（ID の実値は載せない）。
+        reason: &'static str,
+    },
     /// 台帳ディレクトリが存在しない・ディレクトリでない・symlink。
     LedgerDirInvalid {
         /// 台帳ディレクトリのパス。
@@ -205,9 +265,6 @@ pub enum AcquireError {
         /// 原因。
         source: std::io::Error,
     },
-    /// 台帳ディレクトリの fsync ができない環境（非 Unix）で、ロックの永続性を
-    /// 保証できない。予測は呼ばれない。
-    DurabilityUnsupported,
     /// ロックの作成に失敗した。
     Io {
         /// 対象パス。
@@ -240,8 +297,25 @@ impl fmt::Display for AcquireError {
             AcquireError::InvalidConfigId { reason } => {
                 write!(f, "invalid representative config id: {reason}")
             }
-            AcquireError::MissingWeightsDigest => {
-                write!(f, "model snapshot has no weights digest")
+            AcquireError::WeightsDigest { source } => {
+                write!(f, "failed to compute weights digest: {source}")
+            }
+            AcquireError::NotRegistered => write!(
+                f,
+                "no representative config registration for this eval data"
+            ),
+            AcquireError::UnregisteredConfig => {
+                write!(f, "representative config id is not registered")
+            }
+            AcquireError::AlreadyRegistered { path } => {
+                write!(
+                    f,
+                    "registration conflicts with existing state: {}",
+                    path.display()
+                )
+            }
+            AcquireError::RegistryInvalid { reason } => {
+                write!(f, "invalid registration: {reason}")
             }
             AcquireError::LedgerDirInvalid { path } => {
                 write!(f, "ledger path is not a real directory: {}", path.display())
@@ -250,10 +324,6 @@ impl fmt::Display for AcquireError {
                 f,
                 "failed to persist lock (application consumed) {}: {source}",
                 path.display()
-            ),
-            AcquireError::DurabilityUnsupported => write!(
-                f,
-                "cannot guarantee lock durability on this platform (directory fsync unsupported)"
             ),
             AcquireError::Io { path, source } => {
                 write!(f, "failed to create lock {}: {source}", path.display())
@@ -365,10 +435,42 @@ impl FinalTestLedger {
             })
     }
 
-    /// 非 Unix ではディレクトリの fsync 手段が無く、永続性を保証できないため拒否する。
+    /// 非 Unix（Windows 等）ではディレクトリハンドルの `sync_all` が使えない。
+    /// ロックファイル自体は `write_record` で `sync_all` 済みのため成功扱いとする
+    /// （ディレクトリエントリの永続化は OS 任せ。モジュール docs の限界を参照）。
     #[cfg(not(unix))]
     fn sync_dir(&self) -> Result<(), AcquireError> {
-        Err(AcquireError::DurabilityUnsupported)
+        let _ = &self.dir;
+        Ok(())
+    }
+
+    /// 評価データの事前登録を読む。無ければ [`AcquireError::NotRegistered`]。
+    fn load_registry(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+    ) -> Result<Vec<RepresentativeConfigId>, AcquireError> {
+        let path = self.dir.join(registry_name(eval_data_sha256));
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AcquireError::NotRegistered);
+            }
+            Err(source) => return Err(AcquireError::Io { path, source }),
+        };
+        let mut body = String::new();
+        // 読み込み前にサイズ上限を課す（`take` で上限 + 1 まで）。
+        file.take(MAX_REGISTRY_BYTES + 1)
+            .read_to_string(&mut body)
+            .map_err(|source| AcquireError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if body.len() as u64 > MAX_REGISTRY_BYTES {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "registry file too large",
+            });
+        }
+        parse_registry(&body)
     }
 
     /// 適用権を取得する（代表構成ロック → 重みロックの順）。
@@ -387,25 +489,127 @@ impl FinalTestLedger {
     }
 }
 
-/// 凍結記録との照合 → ロック取得・永続化 → 予測の順で、`predict` を高々 1 回呼ぶ。
+/// [`apply_once`] の戻り値。外側が評価データ、内側がモデルの不変性検証。
+pub type ApplyOnceResult<T, E> =
+    Result<T, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
+
+/// 事前登録集合の正準化本文（ソート・重複除去済みの ID を 1 行ずつ）。
+fn registry_body(ids: &[RepresentativeConfigId]) -> String {
+    let mut out = String::from(REGISTRY_HEADER);
+    for id in ids {
+        out.push_str(id.as_str());
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_registry(body: &str) -> Result<Vec<RepresentativeConfigId>, AcquireError> {
+    let rest = body
+        .strip_prefix(REGISTRY_HEADER)
+        .ok_or(AcquireError::RegistryInvalid {
+            reason: "bad registry header",
+        })?;
+    let mut ids = Vec::new();
+    for line in rest.lines() {
+        if ids.len() >= MAX_REGISTERED_CONFIGS {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "too many registered configs",
+            });
+        }
+        ids.push(RepresentativeConfigId::parse(line)?);
+    }
+    if ids.is_empty() {
+        return Err(AcquireError::RegistryInvalid {
+            reason: "empty registry",
+        });
+    }
+    Ok(ids)
+}
+
+impl FinalTestLedger {
+    /// 評価データ（凍結記録の sha256）に対し、最終 test に適用してよい代表構成 ID の
+    /// 集合を評価前に 1 回だけ凍結する（REQ-27。PoC-10 の事前登録）。
+    ///
+    /// - 集合はソート・重複除去して `create_new` で保存し、以後変更できない
+    ///   （同じ評価データへの再登録は [`AcquireError::AlreadyRegistered`]）。
+    /// - 登録しようとする ID のいずれかが既に適用済み（代表構成ロックが存在）の場合も
+    ///   拒否する（適用後の事後登録で履歴を正当化させない）。
+    /// - 空集合・[`MAX_REGISTERED_CONFIGS`] 超過は [`AcquireError::RegistryInvalid`]。
+    pub fn register_configs(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+        ids: &[RepresentativeConfigId],
+    ) -> Result<(), AcquireError> {
+        let mut sorted: Vec<RepresentativeConfigId> = ids.to_vec();
+        sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        sorted.dedup();
+        if sorted.is_empty() {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "empty registry",
+            });
+        }
+        if sorted.len() > MAX_REGISTERED_CONFIGS {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "too many registered configs",
+            });
+        }
+        for id in &sorted {
+            let path = self.dir.join(config_lock_name(eval_data_sha256, id));
+            if fs::symlink_metadata(&path).is_ok() {
+                return Err(AcquireError::AlreadyRegistered { path });
+            }
+        }
+        let (file, path) = match self.create_lock(
+            &registry_name(eval_data_sha256),
+            AppliedBy::RepresentativeConfig,
+        ) {
+            Ok(v) => v,
+            Err(AcquireError::AlreadyApplied { lock_path, .. }) => {
+                return Err(AcquireError::AlreadyRegistered { path: lock_path });
+            }
+            Err(e) => return Err(e),
+        };
+        Self::write_record(file, &path, &registry_body(&sorted))?;
+        self.sync_dir()
+    }
+}
+
+/// 凍結記録との照合 → 事前登録の照合 → ロック取得・永続化 → 予測の順で、
+/// `predict` を高々 1 回呼ぶ。唯一の公開経路。
 ///
-/// 唯一の公開経路。`frozen` の sha256・バイト長と実データが一致した場合のみ、
-/// その照合済み sha256 でロックのキーを作る。`predict` には適用権と、照合済みの
-/// 評価データ本体を渡す（評価データ本体は評価器側の経路。推論関数へ渡す情報の
-/// 絞り込みは TASK-27.2 の責務）。
+/// - `frozen` の sha256・バイト長と実データが一致した場合のみ、その照合済み sha256 で
+///   ロックのキーを作る。
+/// - `model` の重みファイルは本関数が自らハッシュしてキーにし、`predict` へは同じ
+///   `model` を渡す。評価前後のモデル不変性も本関数が検証する（REQ-27）。
+/// - `config_id` は [`FinalTestLedger::register_configs`] で事前登録済みの ID に限る。
+/// - `predict` には適用権・照合済み評価データ本体・`model` を渡す（推論関数へ渡す
+///   情報の絞り込みは TASK-27.2 の責務）。`predict` は渡された `model` のパスから
+///   モデルを読むこと。ロックは `model` の重みに対して消費される。
 pub fn apply_once<T, E>(
     ledger: &FinalTestLedger,
     frozen: &FrozenEvalData<'_>,
     config_id: RepresentativeConfigId,
-    model: &ModelPackageSnapshot,
-    predict: impl FnOnce(ApplicationTicket, &[u8]) -> Result<T, E>,
-) -> Result<T, EvalDataInvarianceError<ApplyOnceError<E>>> {
+    model: &ModelPackagePaths<'_>,
+    predict: impl FnOnce(ApplicationTicket, &[u8], &ModelPackagePaths<'_>) -> Result<T, E>,
+) -> ApplyOnceResult<T, E> {
     evaluate_with_eval_data_invariance(frozen, |bytes| {
         // ここに来た時点で bytes の sha256 == frozen.sha256（照合済み）。
-        let key = FinalTestKey::from_verified(frozen.sha256, config_id, model)
-            .map_err(ApplyOnceError::Acquire)?;
-        let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
-        predict(ticket, bytes).map_err(ApplyOnceError::Prediction)
+        evaluate_with_invariance(model, |paths| {
+            let registered = ledger
+                .load_registry(&frozen.sha256)
+                .map_err(ApplyOnceError::Acquire)?;
+            if !registered.contains(&config_id) {
+                return Err(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig));
+            }
+            let weights_sha256 =
+                fandhe_edge_core::fs::sha256_file_bounded(paths.weights, MAX_MODEL_COMPONENT_BYTES)
+                    .map_err(|source| {
+                        ApplyOnceError::Acquire(AcquireError::WeightsDigest { source })
+                    })?;
+            let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
+            let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
+            predict(ticket, bytes, paths).map_err(ApplyOnceError::Prediction)
+        })
     })
 }
 
