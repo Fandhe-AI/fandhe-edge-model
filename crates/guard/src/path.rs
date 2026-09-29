@@ -24,14 +24,17 @@
 //!
 //! # 残る TOCTOU
 //!
-//! 正準化してから開くまでの間に symlink を差し替えられる余地が残る。`openat`・`O_NOFOLLOW` で
-//! 閉じるには新規依存（`libc` 等）が必要で未承認のため、本 TASK では扱わない。呼び出し側は
-//! 返した正準パスを即座に開くこと。
+//! [`safe_join`] 単体では、正準化してから開くまでの間に symlink を差し替えられる余地が残る。
+//! 読み込む側は [`open_confined`] を使う。open 後に開いたファイルの実体（dev / inode）が
+//! ルート配下で再解決した実体と一致することを確認し、差し替えで外部ファイルを開いた場合は
+//! 拒否する。`openat`・`O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存
+//! （`libc` 等）が必要で未承認のため使わない。
 //!
 //! 拒否結果は [`PathRejection::exit_code`] と [`PathRejection::reason_code`] で、REQ-21 の
 //! 終了コード（`invalid_input`=64 等）と機械可読な理由コードへ写せる。
 
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -232,15 +235,72 @@ pub fn safe_join(root: &Path, candidate: &Path) -> Result<ConfinedPath, PathReje
     if resolved.starts_with(&canon_root) {
         Ok(ConfinedPath(resolved))
     } else {
+        // 絶対パスでも、字句的にルート配下（与えられたルートまたは正準化後のルートの下）から
+        // symlink で外へ出る場合は Symlink とする。字句的にも外なら Absolute。
+        let lexically_under_root =
+            candidate.starts_with(&canon_root) || candidate.starts_with(root);
         Err(PathRejection::Escapes {
             candidate: candidate.to_path_buf(),
-            kind: if absolute {
+            kind: if absolute && !lexically_under_root {
                 EscapeKind::Absolute
             } else {
                 EscapeKind::Symlink
             },
         })
     }
+}
+
+/// 検証と open を一体で行い、開いたファイルがルート配下の実体であることを確認して返す。
+///
+/// [`safe_join`] 単体では検証から open までの間に親ディレクトリを symlink へ差し替えられる
+/// （TOCTOU）。本関数は (1) [`safe_join`] で検証、(2) そのパスを open、(3) 開いた
+/// ファイルハンドルの実体（unix では dev / inode）が、open 後に再解決・再検証した
+/// ルート配下のパスの実体と一致することを確認する。差し替えで外部ファイルを開いた場合は
+/// 実体が一致せず拒否する（fail-closed）。呼び出し側は返した [`File`] だけを読み、
+/// パスを再度 open しないこと。
+///
+/// `openat` / `O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存（`libc` 等）が
+/// 必要で未承認のため使わない（依存追加はユーザー承認事項）。
+pub fn open_confined(root: &Path, candidate: &Path) -> Result<(File, ConfinedPath), PathRejection> {
+    let first = safe_join(root, candidate)?;
+    let file = File::open(first.as_path()).map_err(|source| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source,
+    })?;
+    // open 後にもう一度解決し直す。差し替えが起きていればここで外れるか、実体が食い違う。
+    let second = safe_join(root, candidate)?;
+    let escaped = || PathRejection::Escapes {
+        candidate: candidate.to_path_buf(),
+        kind: EscapeKind::Symlink,
+    };
+    let opened_meta = file
+        .metadata()
+        .map_err(|source| PathRejection::Unresolvable {
+            candidate: candidate.to_path_buf(),
+            source,
+        })?;
+    let resolved_meta =
+        std::fs::metadata(second.as_path()).map_err(|source| PathRejection::Unresolvable {
+            candidate: candidate.to_path_buf(),
+            source,
+        })?;
+    if !same_object(&opened_meta, &resolved_meta) {
+        return Err(escaped());
+    }
+    Ok((file, second))
+}
+
+#[cfg(unix)]
+fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+// unix 以外は実体同一性を std だけでは取れないため、長さと更新時刻の一致で代用する
+// （検証環境は Mac のみ。REQ-39。Windows 対応時に見直す）。
+#[cfg(not(unix))]
+fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
 #[cfg(test)]
@@ -296,6 +356,21 @@ mod tests {
         }
         assert_eq!(EscapeKind::Symlink.name(), "symlink");
         assert_eq!(EscapeKind::Absolute.name(), "absolute");
+    }
+
+    /// 別実体のファイルは同一実体と判定されない（open 後の実体照合の根拠。REQ-39）。
+    #[test]
+    fn same_object_distinguishes_files() {
+        let dir = std::env::temp_dir().join(format!("guard_same_object_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"x").expect("write");
+        std::fs::write(&b, b"x").expect("write");
+        let ma = std::fs::metadata(&a).expect("meta");
+        let mb = std::fs::metadata(&b).expect("meta");
+        assert!(same_object(&ma, &ma));
+        assert!(!same_object(&ma, &mb));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

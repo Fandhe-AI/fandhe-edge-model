@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_guard::path::{EscapeKind, PathRejection, safe_join};
+use fandhe_edge_guard::path::{EscapeKind, PathRejection, open_confined, safe_join};
 
 /// 一時ディレクトリ（Drop で削除）。外部 crate を使わない。
 struct Sandbox {
@@ -192,4 +192,43 @@ fn req39_unresolvable_and_invalid_roots_are_rejected() {
     let e = safe_join(&sb.workspace(), Path::new("")).unwrap_err();
     assert_eq!(e.reason_code(), "empty_path");
     assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+}
+
+/// 字句的にルート配下の絶対パスが symlink で外へ出る場合は Absolute でなく Symlink（REQ-39）。
+#[cfg(unix)]
+#[test]
+fn req39_absolute_under_root_via_symlink_is_symlink_kind() {
+    let sb = Sandbox::new("abs_link");
+    symlink(&sb.outside(), &sb.workspace().join("link_dir"));
+    let candidate = sb.workspace().join("link_dir").join("secret_marker.txt");
+    assert_escapes(safe_join(&sb.workspace(), &candidate), EscapeKind::Symlink);
+}
+
+/// 検証と open を一体で行う経路（TOCTOU 対策。REQ-39）。ルート配下のファイルは開ける。
+#[test]
+fn req39_open_confined_opens_inside_file() {
+    let sb = Sandbox::new("open_ok");
+    let (mut f, got) =
+        open_confined(&sb.workspace(), Path::new("pkg/model.onnx")).expect("open inside");
+    let expected = fs::canonicalize(sb.pkg().join("model.onnx")).expect("canon");
+    assert_eq!(got.as_path(), expected.as_path());
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf).expect("read");
+    assert_eq!(buf, fs::read(sb.pkg().join("model.onnx")).expect("read"));
+}
+
+/// 外部を指す入力は open せず拒否する（REQ-39）。
+#[cfg(unix)]
+#[test]
+fn req39_open_confined_rejects_outside() {
+    let sb = Sandbox::new("open_out");
+    symlink(&sb.outside(), &sb.workspace().join("link_dir"));
+    assert_escapes(
+        open_confined(&sb.workspace(), Path::new("link_dir/secret_marker.txt")),
+        EscapeKind::Symlink,
+    );
+    assert_escapes(
+        open_confined(&sb.workspace(), Path::new("../outside/secret_marker.txt")),
+        EscapeKind::ParentTraversal,
+    );
 }
