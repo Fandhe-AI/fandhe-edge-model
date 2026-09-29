@@ -1,6 +1,9 @@
 //! 版管理台帳の結合テスト（REQ-39・PoC-20 ケース 7・TASK-39.3-1・#167。
 //! 証拠種別: テストハーネス。合成ファイル・一時ディレクトリ）。
 
+// 閉じ込め検証（open_confined）が Unix 前提のため、Windows ではこのテスト全体を対象外とする。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,7 +48,6 @@ fn at() -> CreatedAt {
 }
 
 /// REQ-39: ファイルから記録したハッシュが具体値と一致する。
-#[cfg(unix)]
 #[test]
 fn req39_record_file_hash_and_time() {
     let sb = Sandbox::new("ok");
@@ -80,7 +82,6 @@ fn req39_record_file_hash_and_time() {
 }
 
 /// REQ-39: サイズ超過・非通常ファイル・不存在は台帳を変えずに拒否される。
-#[cfg(unix)]
 #[test]
 fn req39_record_file_failures_leave_ledger_empty() {
     let sb = Sandbox::new("fail");
@@ -132,7 +133,6 @@ fn req39_record_file_failures_leave_ledger_empty() {
 }
 
 /// REQ-39: 重複は、ファイルを読む前に拒否される。
-#[cfg(unix)]
 #[test]
 fn req39_duplicate_checked_before_reading_file() {
     let sb = Sandbox::new("dup");
@@ -163,7 +163,6 @@ fn req39_duplicate_checked_before_reading_file() {
 }
 
 /// REQ-39: ルート外参照（`../`・絶対パス・symlink）は台帳を変えずに拒否される（open_confined 経由）。
-#[cfg(unix)]
 #[test]
 fn req39_record_file_rejects_escapes_from_root() {
     let sb = Sandbox::new("escape");
