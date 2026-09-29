@@ -439,8 +439,10 @@ fn open_confined_impl(
             candidate: candidate.to_path_buf(),
         });
     }
-    ensure_real_path_under(&fd, &canon_root, candidate)?;
-    Ok((File::from(fd), first))
+    // 返すパスは、検証時の `first` ではなく開いた fd 自身の実パス（openat までの間に通常ファイルが
+    // 別のファイルへ差し替えられても、File と ConfinedPath が別の対象を指さない）。
+    let real = ensure_real_path_under(&fd, &canon_root, candidate)?;
+    Ok((File::from(fd), ConfinedPath(real)))
 }
 
 /// 開いた fd の実パスが、最初に確定したルートの実パス配下であることを確認する（fail-closed）。
@@ -454,13 +456,13 @@ fn ensure_real_path_under(
     fd: &rustix::fd::OwnedFd,
     canon_root: &Path,
     candidate: &Path,
-) -> Result<(), PathRejection> {
+) -> Result<PathBuf, PathRejection> {
     let real = fd_real_path(fd).map_err(|source| PathRejection::Unresolvable {
         candidate: candidate.to_path_buf(),
         source,
     })?;
     if real.starts_with(canon_root) {
-        Ok(())
+        Ok(real)
     } else {
         Err(PathRejection::Escapes {
             candidate: candidate.to_path_buf(),
@@ -514,7 +516,8 @@ mod tests {
         )
         .expect("open file");
         let cand = Path::new("f.txt");
-        assert!(ensure_real_path_under(&fd, &canon_root, cand).is_ok());
+        let real = ensure_real_path_under(&fd, &canon_root, cand).expect("under root");
+        assert_eq!(real, canon_root.join("f.txt"));
         std::fs::rename(base.join("ws"), base.join("elsewhere/ws")).expect("move root away");
         match ensure_real_path_under(&fd, &canon_root, cand) {
             Err(PathRejection::Escapes {
@@ -523,6 +526,42 @@ mod tests {
             }) => {}
             other => panic!("expected Escapes, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 返す実パスは検証時の解決結果ではなく開いた fd 由来である。開いた後に同名の別ファイルへ
+    /// 差し替えると、fd は元の（削除済みの）対象を指し続け、fd 由来のパスにそれが反映される
+    /// （Linux の `/proc/self/fd` の `(deleted)` 表記で固定する。REQ-39・TASK-39.4-1）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn req39_confined_path_comes_from_opened_fd_not_from_validation() {
+        use rustix::fs::{Mode, OFlags, openat};
+        let base = std::env::temp_dir().join(format!("fandhe-guard-fdpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir ws");
+        std::fs::write(base.join("ws/f.txt"), b"old").expect("write old");
+        std::fs::write(base.join("ws/g.txt"), b"new").expect("write new");
+        let canon_root = std::fs::canonicalize(base.join("ws")).expect("canon");
+        let root_fd = rustix::fs::open(
+            &canon_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open root");
+        let fd = openat(
+            &root_fd,
+            "f.txt",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open file");
+        std::fs::rename(base.join("ws/g.txt"), base.join("ws/f.txt")).expect("swap");
+        let real =
+            ensure_real_path_under(&fd, &canon_root, Path::new("f.txt")).expect("under root");
+        assert_eq!(
+            real.to_string_lossy(),
+            format!("{} (deleted)", canon_root.join("f.txt").display())
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
