@@ -129,13 +129,31 @@ impl ReferenceBatchPredictions {
 
 /// [`ReferenceBatchPredictions::into_annotated_results`] の戻り値。
 /// 取り出した結果に、バッチ API を使った出どころと注記が常に付く。
+///
+/// フィールドは非公開。呼び出し側が `results` だけを取り出したり、出どころ・注記を
+/// 書き換えたりできないよう、生成は本モジュール内（`into_annotated_results`）に限り、
+/// 読み出しはアクセサ経由にする（REQ-28・TASK-28.3）。
 pub struct AnnotatedBatchResults {
+    results: BatchResult,
+    provenance: PredictionProvenance,
+    notice: &'static str,
+}
+
+impl AnnotatedBatchResults {
     /// 要素ごとの結果。
-    pub results: BatchResult,
+    pub fn results(&self) -> &[Result<Prediction, InferError>] {
+        &self.results
+    }
+
     /// 常に参考測定・バッチ。
-    pub provenance: PredictionProvenance,
+    pub fn provenance(&self) -> PredictionProvenance {
+        self.provenance
+    }
+
     /// 記録へ付ける注記（常に [`BATCH_PREDICTION_NOTICE`]）。
-    pub notice: &'static str,
+    pub fn notice(&self) -> &'static str {
+        self.notice
+    }
 }
 
 /// スコア・ラベル・入力本文を出さず、件数と用途のみ出す（security.md）。
@@ -190,15 +208,15 @@ mod tests {
     fn req28_into_annotated_results_keeps_provenance() {
         let batch: BatchResult = vec![Err(InferError::InputTooLarge { len: 2, limit: 1 })];
         let out = ReferenceBatchPredictions::new(batch).into_annotated_results();
-        assert_eq!(out.results.len(), 1);
-        assert_eq!(out.notice, BATCH_PREDICTION_NOTICE);
+        assert_eq!(out.results().len(), 1);
+        assert_eq!(out.notice(), BATCH_PREDICTION_NOTICE);
         assert_eq!(
-            out.provenance,
+            out.provenance(),
             PredictionProvenance::Reference {
                 mode: PredictionMode::Batch
             }
         );
-        assert!(out.provenance.is_batch_prediction());
+        assert!(out.provenance().is_batch_prediction());
     }
 
     #[test]
