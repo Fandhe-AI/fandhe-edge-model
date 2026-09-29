@@ -50,6 +50,16 @@
 //! （[`result::SuccessOutcome::validation_predictions`]）として返す。
 //! [`search`] はその予測列を validation gold と突き合わせる。
 //!
+//! # キャンセル操作（TASK-34.1-1・issue #144）
+//!
+//! [`process::run_train_cancellable`] と [`job`]（状態遷移・
+//! [`job::JobHandle::cancel`]）が、学習ジョブへのキャンセル（直接の子への
+//! `SIGKILL`）と状態遷移（実行中 → キャンセル中 → キャンセル済み）を担う
+//! （REQ-34）。後続・未実装: `SIGTERM` による graceful cancel（依存追加か
+//! `unsafe` が要りユーザー承認事項）・キャンセルの終了コード写像
+//! （TASK-33.x）・探索途中のキャンセル伝播・キャンセル後に残る予約済み
+//! `out_dir` の扱い（#145）・`job.json` 永続化とクラッシュ検出（#146）。
+//!
 //! # スコープ外（#178 以降も対象外）
 //!
 //! - `kind` ごとの `config` 検証（`config` は「JSON オブジェクトであること」
@@ -80,6 +90,7 @@
 //!   への写像（TASK-33.x）
 
 pub mod error;
+pub mod job;
 mod kind_defaults;
 pub mod limits;
 pub mod process;

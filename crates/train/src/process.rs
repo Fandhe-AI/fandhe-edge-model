@@ -60,6 +60,24 @@
 //! 同根）。[`run_train`] はこの観測を [`WaitOutcome::LateExit`] として
 //! 区別し、`Child::kill()` を呼ばずに `WallTimeout` として扱う。
 //!
+//! # キャンセル（REQ-34・TASK-34.1-1・#144）
+//!
+//! [`run_train_cancellable`] は [`CancelToken`] が立つと、直接の子
+//! （supervisor）へ `Child::kill()`（`SIGKILL`）を送って回収し
+//! [`TrainRunEnd::Cancelled`] を返す。送るシグナルは std だけで送れる
+//! `SIGKILL` に限る（`SIGTERM` による graceful cancel は `libc`／`unsafe`
+//! が要り、ユーザー承認事項）。kill は未回収の直接の子にだけ送り、
+//! `try_wait()` で既に終了していたら kill せず通常経路へ合流する。
+//! キャンセルと壁時計締め切りが同時に成立したらキャンセルを優先する。
+//! kill の送出失敗・回収の確認失敗（上限超過を含む）は `Cancelled` とせず
+//! エラーで返し、ジョブは `Failed` になる（生存した子を残したまま終端の
+//! キャンセル完了にしない。REQ-39）。
+//!
+//! 未実装（実装済みを装わない）: supervisor は `SIGKILL` されると後始末を
+//! しないため、予約済み `out_dir`・tmp の残置と、finalize 完了後に kill
+//! した場合の整合は #145（TASK-34.1-2）で扱う。キャンセルの終了コード写像
+//! は TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
+//!
 //! # windows（対象外・fail-closed）
 //!
 //! windows で同等の恒久対応を行うにはジョブオブジェクト
@@ -507,6 +525,137 @@ impl TrainRun {
     }
 }
 
+/// 学習ジョブのキャンセル要求を運ぶ共有フラグ（REQ-34・TASK-34.1-1・#144）。
+///
+/// [`crate::job::JobHandle::cancel`] が立て、[`run_train_cancellable`] が
+/// 待ちの刻みごとに確認する。クローン間で同じフラグを共有し、`Send + Sync`
+/// なのでスレッドをまたいで使える。一度立てたら戻せない。
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// 立っていないトークンを作る。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// キャンセルを要求する（冪等）。
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// キャンセルが要求されたか。
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`run_train_cancellable`] の終わり方。キャンセルはエラーではない
+/// 終わり方として表す。
+///
+/// キャンセルを REQ-21 の 7 種の終了コードのどれへ写すかは CLI の入出力契約
+/// の設計事項で、TASK-33.x での承認事項（本 issue では決めない。そのため
+/// [`TrainProcessError`] にはバリアントを足していない）。
+#[derive(Debug)]
+pub enum TrainRunEnd {
+    /// 子が最後まで走り、結果を得た。
+    Completed(TrainRun),
+    /// キャンセルで止めた。成果物は持たない（成功として扱わない）。
+    Cancelled(CancelledRun),
+}
+
+/// キャンセルで止めた実行の診断情報。ワーカーの出力は保持しない
+/// （データ由来の文字列を持たない。`.claude/rules/security.md`）。
+///
+/// 予約済み `out_dir`・tmp の残置と、finalize 完了後に kill した場合の
+/// 整合は #145（TASK-34.1-2）で扱う。本型は公開場所に何も残らないことを
+/// 主張しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledRun {
+    elapsed: Duration,
+    child_spawned: bool,
+    child_reaped: bool,
+    signal: Option<i32>,
+}
+
+impl CancelledRun {
+    /// 開始からキャンセル完了までの経過時間。
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// 子プロセスを起動したか（起動前にキャンセルされたら `false`）。
+    #[must_use]
+    pub fn child_spawned(&self) -> bool {
+        self.child_spawned
+    }
+
+    /// 直接の子を回収（wait）できたか。回収を確認できない場合は
+    /// `Cancelled` ではなくエラーで返すため、`Cancelled` では常に `true`。
+    #[must_use]
+    pub fn child_reaped(&self) -> bool {
+        self.child_reaped
+    }
+
+    /// 子を止めたシグナル番号（`SIGKILL` なら `Some(9)`）。
+    #[must_use]
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+}
+
+/// [`cancel_child`] の結果。
+#[cfg(unix)]
+enum CancelStep {
+    /// 確認した時点で子は既に終了していた（回収済み。kill していない）。
+    AlreadyExited(ExitStatus),
+    /// `SIGKILL` を送って止めた。
+    Cancelled(CancelledRun),
+}
+
+/// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収のときに
+/// 限り `Child::kill()`（`SIGKILL`）を送って回収する。既に回収済みの子へ
+/// kill を送らない（pid 再利用で無関係なプロセスを止めない。モジュール doc
+/// 「完了検知・タイムアウト時の回収順序」と同じ不変条件）。子孫は lifeline
+/// に委ねる。
+#[cfg(unix)]
+fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, TrainProcessError> {
+    use std::os::unix::process::ExitStatusExt;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(CancelStep::AlreadyExited(status)),
+            Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = wait_after_kill(child);
+                return Err(TrainProcessError::Wait { kind: e.kind() });
+            }
+        }
+    }
+    // 停止・回収を確認できない場合は成功したキャンセルとして返さない
+    // （codex/review 指摘 P0。生存した子を残したまま終端の `Cancelled` へ
+    // 遷移させない。REQ-39「資源の上限」）。`kill()` の失敗も回収の失敗も
+    // エラーとして呼び出し元へ返し、ジョブは `Failed` になる。
+    if let Err(e) = child.kill() {
+        // kill 送出に失敗しても、直前に既に終了していた可能性を再確認する。
+        return match child.try_wait() {
+            Ok(Some(status)) => Ok(CancelStep::AlreadyExited(status)),
+            _ => Err(TrainProcessError::Wait { kind: e.kind() }),
+        };
+    }
+    let status = wait_after_kill(child)?;
+    Ok(CancelStep::Cancelled(CancelledRun {
+        elapsed: started.elapsed(),
+        child_spawned: true,
+        child_reaped: true,
+        signal: status.signal(),
+    }))
+}
+
 /// `SIGKILL` 送出後、直接の子プロセスの終了待ちあたりの上限（REQ-39
 /// 「資源の上限」）。`SIGKILL` は通常即座に効くため、この上限に達するのは
 /// 割り込み不可能な OS 側の待ち（D state）等の極めて稀なケースに限られる
@@ -622,6 +771,19 @@ pub fn run_train(
     Err(TrainProcessError::UnsupportedPlatform)
 }
 
+/// unix 以外では [`run_train`] と同じく即座に
+/// [`TrainProcessError::UnsupportedPlatform`] を返す（fail-closed）。
+#[cfg(not(unix))]
+pub fn run_train_cancellable(
+    _launcher: &WorkerLauncher,
+    _request: &TrainRequest,
+    _job_dir: &Path,
+    _limits: &RunLimits,
+    _cancel: &CancelToken,
+) -> Result<TrainRunEnd, TrainProcessError> {
+    Err(TrainProcessError::UnsupportedPlatform)
+}
+
 /// [`run_train`] を [`CandidateRunner`]（[`crate::search::run_search`] が候補を
 /// 実行する接合点）として使うアダプター（REQ-18・REQ-34・REQ-39。issue #84
 /// PR #238・選択肢 2）。
@@ -722,12 +884,13 @@ fn observed_within_deadline(observed_at: Instant, deadline: Instant) -> bool {
 /// 関与しない**（学習ワーカー側の lifeline に委ねる設計。モジュール doc
 /// 参照）。unix 限定（windows 版は上記の `#[cfg(not(unix))]` 版を参照）。
 #[cfg(unix)]
-pub fn run_train(
+pub fn run_train_cancellable(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
     job_dir: &Path,
     limits: &RunLimits,
-) -> Result<TrainRun, TrainProcessError> {
+    cancel: &CancelToken,
+) -> Result<TrainRunEnd, TrainProcessError> {
     // `request` と `limits` は呼び出し元が別々の引数として渡すため、型では
     // 対応関係を強制できない。検証なしに `limits.wall_timeout()` を採用すると、
     // 短い `time_limit_seconds` の `request` に、別の（長い）リクエストから
@@ -739,6 +902,16 @@ pub fn run_train(
     // 不変条件を、`request` との対応についても同様に守る）。
     if limits.wall_timeout() > RunLimits::for_request(request).wall_timeout() {
         return Err(TrainProcessError::InvalidRunLimits);
+    }
+    // 起動前にキャンセル済みなら、子プロセスも `request.json` も作らずに
+    // 返す（`Queued` のまま取り消されたジョブ。REQ-34・#144）。
+    if cancel.is_cancelled() {
+        return Ok(TrainRunEnd::Cancelled(CancelledRun {
+            elapsed: Duration::ZERO,
+            child_spawned: false,
+            child_reaped: true,
+            signal: None,
+        }));
     }
     let guard = write_request_file(job_dir, request)?;
     let started = Instant::now();
@@ -774,11 +947,38 @@ pub fn run_train(
     let deadline = started + limits.wall_timeout();
 
     // 標準出力の読み取りスレッドが完了する（EOF・上限超過・エラーの
-    // いずれか）のを、残りの壁時計予算だけ待つ。
-    let stdout_wait = stdout_rx.map(|rx| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        rx.recv_timeout(remaining)
-    });
+    // いずれか）のを、残りの壁時計予算だけ待つ。hang 中でもキャンセルに
+    // 反応できるよう、待ちを [`POLL_INTERVAL`] 刻みに分割し、各刻みで
+    // トークンを確認する（壁時計の上限そのものは緩めない）。
+    let mut pre_exited: Option<ExitStatus> = None;
+    let mut stdout_wait = None;
+    if let Some(rx) = stdout_rx.as_ref() {
+        let mut cancel_seen = false;
+        let first = loop {
+            if cancel.is_cancelled() {
+                cancel_seen = true;
+                break Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining.min(POLL_INTERVAL)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                other => break other,
+            }
+        };
+        stdout_wait = Some(first);
+        if cancel_seen {
+            match cancel_child(&mut child, started)? {
+                CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
+                CancelStep::AlreadyExited(status) => {
+                    // キャンセルが間に合わず子は既に終了していた（kill しない）。
+                    // 通常経路へ合流するため、stdout を改めて締め切りまで待つ。
+                    pre_exited = Some(status);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    stdout_wait = Some(rx.recv_timeout(remaining));
+                }
+            }
+        }
+    }
     // `stdout_wait` が `None` になるのは `stdout_pipe` を取得できなかった
     // 場合だが、本関数は常に `stdout(Stdio::piped())` を指定するため
     // 到達しない防御的分岐。到達したとしても後続の `match` が
@@ -795,6 +995,23 @@ pub fn run_train(
     // モジュール doc「完了検知・タイムアウト時の回収順序」参照）。
     let wait_deadline = deadline;
     let outcome = loop {
+        if let Some(status) = pre_exited.take() {
+            if observed_within_deadline(Instant::now(), wait_deadline) {
+                break WaitOutcome::Exited(status);
+            }
+            break WaitOutcome::LateExit;
+        }
+        // キャンセルは締め切り判定より先に確認する（利用者の明示操作を
+        // 優先する。両方が同時に成立した場合は `Cancelled`）。
+        if cancel.is_cancelled() {
+            match cancel_child(&mut child, started)? {
+                CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
+                CancelStep::AlreadyExited(status) => {
+                    pre_exited = Some(status);
+                    continue;
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 if observed_within_deadline(Instant::now(), wait_deadline) {
@@ -926,13 +1143,34 @@ pub fn run_train(
     let process_exit = classify_process_exit_status(status)?;
     let outcome = classify_exit(process_exit, &stdout_drain.kept, request)?;
 
-    Ok(TrainRun {
+    Ok(TrainRunEnd::Completed(TrainRun {
         outcome,
         exit_code: process_exit,
         elapsed,
         worker_stderr,
         stderr_truncated,
-    })
+    }))
+}
+
+/// [`run_train_cancellable`] を、キャンセルされない前提で呼ぶ従来の入口
+/// （挙動は #178 から変えない）。
+///
+/// 立てられることのないトークンを渡すため `Cancelled` には到達しない。
+/// それでもライブラリで panic しない方針（`.claude/rules/coding-rust.md`）
+/// により、到達時は `Wait { kind: Interrupted }` を返して安全側に倒す。
+#[cfg(unix)]
+pub fn run_train(
+    launcher: &WorkerLauncher,
+    request: &TrainRequest,
+    job_dir: &Path,
+    limits: &RunLimits,
+) -> Result<TrainRun, TrainProcessError> {
+    match run_train_cancellable(launcher, request, job_dir, limits, &CancelToken::new())? {
+        TrainRunEnd::Completed(run) => Ok(run),
+        TrainRunEnd::Cancelled(_) => Err(TrainProcessError::Wait {
+            kind: std::io::ErrorKind::Interrupted,
+        }),
+    }
 }
 
 #[cfg(test)]

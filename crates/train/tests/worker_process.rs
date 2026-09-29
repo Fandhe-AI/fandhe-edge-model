@@ -27,7 +27,11 @@ use std::time::Duration;
 
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
+use fandhe_edge_train::job::{CancelOutcome, JobState, TrainJob};
+#[cfg(unix)]
 use fandhe_edge_train::process::ENV_ALLOWLIST;
+#[cfg(unix)]
+use fandhe_edge_train::process::TrainRunEnd;
 #[cfg(unix)]
 use fandhe_edge_train::process::WorkerCandidateRunner;
 use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
@@ -447,6 +451,20 @@ fn run_test_suite() -> ProcessExitCode {
     ];
     #[cfg(unix)]
     cases.push(("timeout_hang_kills_orphan", case_timeout_hang_kills_orphan));
+    #[cfg(unix)]
+    cases.push(("cancel_hang", case_cancel_hang));
+    #[cfg(unix)]
+    cases.push((
+        "cancel_kills_lifeline_orphan",
+        case_cancel_kills_lifeline_orphan,
+    ));
+    #[cfg(unix)]
+    cases.push(("cancel_before_start", case_cancel_before_start));
+    #[cfg(unix)]
+    cases.push((
+        "cancel_after_exit_is_not_cancelled",
+        case_cancel_after_exit_is_not_cancelled,
+    ));
     #[cfg(not(unix))]
     let cases: Vec<(&'static str, CaseFn)> =
         vec![("unsupported_platform", case_unsupported_platform)];
@@ -1134,6 +1152,141 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
         !status.success(),
         "orphan process must no longer exist after run_train returns",
     )
+}
+
+/// `path` が現れるまで最大 `max` 待つ（キャンセルのタイミングを sleep
+/// ではなく子の進行で決定的にする）。
+#[cfg(unix)]
+fn wait_for_file(path: &Path, max: Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    path.exists()
+}
+
+/// `TrainJob::run` を別スレッドで走らせ、`ready` が現れたらキャンセルして
+/// 結果を返す共通手順。壁時計は 20 秒に設定し、キャンセル起因の停止と
+/// 壁時計起因の停止を区別できるようにする。
+#[cfg(unix)]
+fn run_and_cancel_when(
+    case_dir: &Path,
+    mode: &str,
+    ready: &Path,
+) -> Result<(CancelOutcome, TrainRunEnd, JobState, Duration), String> {
+    let launcher = make_launcher(case_dir, mode);
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request)
+        .with_wall_timeout(Duration::from_secs(20))
+        .map_err(|e| format!("with_wall_timeout: {e}"))?;
+    let job = TrainJob::new();
+    let handle = job.handle();
+    let dir = case_dir.to_path_buf();
+    let worker = std::thread::spawn(move || job.run(&launcher, &request, &dir, &limits));
+    if !wait_for_file(ready, Duration::from_secs(10)) {
+        // 進行しないまま残さないよう、待ちきれなくても止める。
+        handle.cancel();
+        let _ = worker.join();
+        return Err(format!("{} did not appear in time", ready.display()));
+    }
+    let started = std::time::Instant::now();
+    let outcome = handle.cancel();
+    let end = worker
+        .join()
+        .map_err(|_| "job thread panicked".to_string())?
+        .map_err(|e| format!("run returned error: {e}"))?;
+    Ok((outcome, end, handle.state(), started.elapsed()))
+}
+
+/// REQ-34・TASK-34.1-1: キャンセル要求で hang 中の学習プロセスが止まり、
+/// ジョブ状態が `Cancelled` になる。
+#[cfg(unix)]
+fn case_cancel_hang(case_dir: &Path) -> Result<(), String> {
+    let heartbeat = case_dir.join("heartbeat.txt");
+    let (outcome, end, state, elapsed) = run_and_cancel_when(case_dir, "hang", &heartbeat)?;
+    expect_eq(outcome, CancelOutcome::Requested, "cancel outcome")?;
+    let TrainRunEnd::Cancelled(run) = end else {
+        return Err("expected Cancelled".to_string());
+    };
+    expect_eq(run.child_spawned(), true, "child_spawned")?;
+    expect_eq(run.child_reaped(), true, "child_reaped")?;
+    expect_eq(run.signal(), Some(9), "signal")?;
+    expect_eq(state, JobState::Cancelled, "job state")?;
+    expect_true(
+        elapsed < Duration::from_secs(5),
+        "must stop well before the 20s wall timeout",
+    )?;
+    let before = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(300));
+    let after = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    expect_eq(after, before, "heartbeat must not grow after cancel")
+}
+
+/// REQ-34・REQ-39: キャンセル後、lifeline で孫プロセスも止まる。
+#[cfg(unix)]
+fn case_cancel_kills_lifeline_orphan(case_dir: &Path) -> Result<(), String> {
+    let pid_path = case_dir.join("orphan.pid");
+    let (_, end, state, _) = run_and_cancel_when(case_dir, "hang_with_lifeline_orphan", &pid_path)?;
+    expect_true(
+        matches!(end, TrainRunEnd::Cancelled(_)),
+        "expected Cancelled",
+    )?;
+    expect_eq(state, JobState::Cancelled, "job state")?;
+    let hb = case_dir.join("orphan-heartbeat.txt");
+    // 孫の停止（lifeline の EOF 検知）を待ってから、伸びが止まることを見る。
+    std::thread::sleep(Duration::from_millis(500));
+    let before = std::fs::metadata(&hb).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = std::fs::metadata(&hb).map(|m| m.len()).unwrap_or(0);
+    expect_eq(after, before, "orphan heartbeat must not grow after cancel")
+}
+
+/// REQ-34: 起動前のキャンセルは子を起動せず、`request.json` も残さない。
+#[cfg(unix)]
+fn case_cancel_before_start(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "hang");
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+    let job = TrainJob::new();
+    let handle = job.handle();
+    expect_eq(handle.cancel(), CancelOutcome::Requested, "cancel outcome")?;
+    let end = job
+        .run(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("run returned error: {e}"))?;
+    let TrainRunEnd::Cancelled(run) = end else {
+        return Err("expected Cancelled".to_string());
+    };
+    expect_eq(run.child_spawned(), false, "child_spawned")?;
+    expect_eq(run.signal(), None, "signal")?;
+    expect_eq(handle.state(), JobState::Cancelled, "job state")?;
+    expect_true(!case_dir.join("heartbeat.txt").exists(), "no heartbeat")?;
+    expect_true(!case_dir.join("request.json").exists(), "no request.json")
+}
+
+/// REQ-34: 終了後の `cancel()` は何もせず、状態は `Succeeded` のまま。
+#[cfg(unix)]
+fn case_cancel_after_exit_is_not_cancelled(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok");
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+    let job = TrainJob::new();
+    let handle = job.handle();
+    let end = job
+        .run(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("run returned error: {e}"))?;
+    let TrainRunEnd::Completed(run) = end else {
+        return Err("expected Completed".to_string());
+    };
+    expect_eq(run.exit_code(), ExitCode::Ok, "exit_code")?;
+    expect_eq(
+        handle.cancel(),
+        CancelOutcome::AlreadyFinished,
+        "cancel outcome",
+    )?;
+    expect_eq(handle.state(), JobState::Succeeded, "job state")
 }
 
 /// `record` モード: argv・request.json の内容・環境変数名の許可リスト
