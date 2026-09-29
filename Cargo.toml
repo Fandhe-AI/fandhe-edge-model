@@ -5,7 +5,7 @@
 # 深い階層（`crates/foo/bar`）には crate を置かない。
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/data", "crates/eval", "crates/train"]
+members = ["crates/core", "crates/cli", "crates/data", "crates/eval", "crates/train", "crates/runtime"]
 
 [workspace.package]
 edition = "2024"
@@ -24,6 +24,7 @@ fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
 fandhe-edge-eval = { path = "crates/eval" }
 fandhe-edge-train = { path = "crates/train" }
+fandhe-edge-runtime = { path = "crates/runtime" }
 # serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の
 # 「配置する層」は共通コア（TASK-15.3〜15.5）に加え、データ契約層（crates/data。
