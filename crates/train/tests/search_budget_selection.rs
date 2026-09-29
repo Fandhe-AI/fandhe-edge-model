@@ -1,4 +1,5 @@
-//! REQ-18・REQ-27・REQ-39（TASK-18.1-2・issue #84）: 探索予算全体の管理・
+//! REQ-18・REQ-27・REQ-39（TASK-18.1-2・issue #84。`task18_2_` で始まるテストは
+//! TASK-18.2・issue #85 の予算到達の記録・非合格扱い）: 探索予算全体の管理・
 //! 複数候補の比較・選定の記録の受け入れ条件を確認する結合テスト
 //! （証拠種別: テストハーネス）。
 //!
@@ -25,8 +26,8 @@ use fandhe_edge_eval::metrics::Outcome;
 use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{
-    CandidateSearchResult, NotStartedReason, SearchBudget, SearchCandidate, SearchError,
-    SearchInput, SelectionDecision, run_search,
+    BudgetReachedScope, CandidateSearchResult, NotStartedReason, SearchBudget, SearchCandidate,
+    SearchError, SearchInput, SelectionDecision, run_search,
 };
 use fandhe_edge_train::time_allotment::{CandidateRunner, Clock, PerCandidatePolicy};
 
@@ -1877,4 +1878,282 @@ fn task18_1_2_split_record_without_content_hash_is_rejected() {
     .unwrap_err();
     assert_eq!(err, SearchError::ValidationContentHashMismatch);
     assert_eq!(runner.calls, 0);
+}
+
+/// 予算到達の記録と選定の照合（TASK-18.2・issue #85・REQ-18 異常系。証拠種別:
+/// テストハーネス）。選ばれた候補が `Evaluated` かつ予算到達でないことを確かめる。
+fn assert_selected_is_evaluated_and_not_budget_reached(
+    record: &fandhe_edge_train::search::SearchRecord,
+) {
+    let id = selected_id(record);
+    let entry = record
+        .candidates
+        .iter()
+        .find(|e| e.candidate_id == id)
+        .expect("selected candidate is recorded");
+    assert!(matches!(
+        entry.result,
+        CandidateSearchResult::Evaluated { .. }
+    ));
+    assert_eq!(entry.budget_reached(), None);
+}
+
+/// (TASK-18.2・REQ-18 異常系) 全体予算が学習ジョブで尽きた場合、その候補と
+/// 残りの候補が全体予算の予算到達として記録され、選定されない。
+#[test]
+fn task18_2_search_budget_exhaustion_is_recorded_as_budget_reached_and_not_selected() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, vec![ok(3_600_000, outcomes_with_correct(10))]);
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let input = input_for(
+        &gold,
+        &split,
+        candidates(&["c3-a", "c3-b"]),
+        SearchBudget::default(),
+        fixed_policy(3600),
+    );
+    let record = run_search(&mut runner, &clock, input).expect("search succeeds");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringSkippedBudgetExhausted
+    );
+    assert_eq!(
+        record.candidates[1].result,
+        CandidateSearchResult::NotStarted {
+            reason: NotStartedReason::BudgetExhausted
+        }
+    );
+    for entry in &record.candidates {
+        assert_eq!(
+            entry.budget_reached(),
+            Some(BudgetReachedScope::SearchBudget)
+        );
+        assert_eq!(entry.validation_outcomes(), None);
+    }
+    assert!(record.budget_reached);
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
+/// (TASK-18.2) 評価器の後で予算を越えた候補は正解率を参考値として残すが、
+/// 全体予算の予算到達で選定されない。`monotonic()` の 6 回目は T16 と同じ。
+#[test]
+fn task18_2_scoring_exceeded_budget_keeps_reference_accuracy_but_is_not_selected() {
+    let clock = FakeClock::new(0).with_advance_at_monotonic_call(6, 4_000_000);
+    let mut runner = FakeRunner::new(&clock, vec![ok(10, outcomes_with_correct(9))]);
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(&mut runner, &clock, default_input(&gold, &split, &["c3-a"]))
+        .expect("search succeeds");
+    match &record.candidates[0].result {
+        CandidateSearchResult::ScoringExceededBudget {
+            validation_accuracy,
+        } => assert_eq!(validation_accuracy.correct, 9),
+        other => panic!("expected ScoringExceededBudget, got {other:?}"),
+    }
+    assert_eq!(
+        record.candidates[0].budget_reached(),
+        Some(BudgetReachedScope::SearchBudget)
+    );
+    assert!(record.budget_reached);
+    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+}
+
+/// (TASK-18.2) 壁時計の強制終了は持ち時間の予算到達。次の候補は選定できる。
+#[test]
+fn task18_2_candidate_wall_timeout_is_budget_reached_and_next_candidate_selected() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::WallTimeout {
+                advance_ms: 1_800_000,
+            },
+            ok(10, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::TrainingTimedOut
+    );
+    assert_eq!(
+        record.candidates[0].budget_reached(),
+        Some(BudgetReachedScope::CandidateTimeLimit)
+    );
+    assert_eq!(record.candidates[1].budget_reached(), None);
+    assert_eq!(selected_id(&record), "c3-b");
+    assert!(record.budget_reached);
+    assert_selected_is_evaluated_and_not_budget_reached(&record);
+}
+
+/// (TASK-18.2) ワーカーの `limit_exceeded` で経過時間が持ち時間以上なら
+/// 持ち時間の予算到達。
+#[test]
+fn task18_2_worker_limit_exceeded_after_time_limit_is_candidate_time_limit() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::WorkerError {
+                code: "limit_exceeded",
+                advance_ms: 1_800_000,
+            },
+            ok(10, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::TrainingTimedOut
+    );
+    assert_eq!(
+        record.candidates[0].budget_reached(),
+        Some(BudgetReachedScope::CandidateTimeLimit)
+    );
+    assert!(record.budget_reached);
+    assert_selected_is_evaluated_and_not_budget_reached(&record);
+}
+
+/// (TASK-18.2) 持ち時間を超えて成功した候補は、最高正解率でも合格にしない。
+#[test]
+fn task18_2_training_over_own_time_limit_is_budget_reached_even_with_best_accuracy() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            ok(2_000_000, outcomes_with_correct(10)),
+            ok(10, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    assert_eq!(
+        record.candidates[0].budget_reached(),
+        Some(BudgetReachedScope::CandidateTimeLimit)
+    );
+    assert_eq!(selected_id(&record), "c3-b");
+    assert!(record.budget_reached);
+    assert_selected_is_evaluated_and_not_budget_reached(&record);
+}
+
+/// (TASK-18.2) 予算内で全候補が完了すれば予算到達なし。
+#[test]
+fn task18_2_normal_run_has_no_budget_reached() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            ok(10, outcomes_with_correct(7)),
+            ok(10, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    assert!(
+        record
+            .candidates
+            .iter()
+            .all(|e| e.budget_reached().is_none())
+    );
+    assert!(!record.budget_reached);
+    assert_selected_is_evaluated_and_not_budget_reached(&record);
+}
+
+/// (TASK-18.2) 持ち時間未満の資源上限・その他のワーカー失敗は不合格であって
+/// 予算到達ではない（混同しない）。
+#[test]
+fn task18_2_training_failure_is_not_budget_reached() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::WorkerError {
+                code: "limit_exceeded",
+                advance_ms: 10,
+            },
+            RunnerBehavior::WorkerError {
+                code: "runtime_error",
+                advance_ms: 10,
+            },
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    for entry in &record.candidates {
+        assert_eq!(entry.result, CandidateSearchResult::TrainingNotCompleted);
+        assert_eq!(entry.budget_reached(), None);
+    }
+    assert!(!record.budget_reached);
+}
+
+/// (TASK-18.2) JSON に予算到達のフィールドが出て、`validation_outcomes` は出ない。
+#[test]
+fn task18_2_record_json_exposes_budget_reached_fields() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            ok(2_000_000, outcomes_with_correct(10)),
+            ok(10, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("search succeeds");
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(json["budget_reached"], serde_json::json!(true));
+    assert_eq!(
+        json["candidates"][0]["budget_reached"],
+        serde_json::json!("candidate_time_limit")
+    );
+    assert_eq!(
+        json["candidates"][0]["result"],
+        "training_exceeded_time_limit"
+    );
+    assert_eq!(
+        json["candidates"][1]["budget_reached"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["candidates"][1]["result"], "evaluated");
+    for c in json["candidates"].as_array().expect("array") {
+        assert!(c.get("validation_outcomes").is_none());
+    }
 }
