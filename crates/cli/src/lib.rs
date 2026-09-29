@@ -24,6 +24,9 @@
 //! TASK-33.4（#141）で、`infer --input-file` の一括推論と 1 行 1 JSON 出力（REQ-33 の唯一の
 //! 例外）を [`infer_batch`] に追加した。それ以外のコマンドの出力は 1 呼び出し 1 JSON のまま
 //! （[`infer_batch::output_mode`] で型として固定）。`main.rs` への配線は #136 の範囲。
+//!
+//! TASK-33.3（#140）で、評価データ未定義の `evaluate` を `status:"skipped"`・exit 0 で終える
+//! `stage_output::evaluate_start`・`emit_evaluate_skipped` を追加した。バイナリへの結線は #136。
 
 pub mod args;
 pub mod error_report;

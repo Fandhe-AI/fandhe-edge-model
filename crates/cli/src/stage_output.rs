@@ -14,12 +14,23 @@
 //! - exit ≠ 0（`Fail`・`Undeterminable`・`LimitExceeded`）: 新しい形は作らず、確定済みの
 //!   `{"code","message"}`（`error_report::default_message` の固定語彙）へ流す
 //!
+//! # evaluate の skipped（REQ-17・REQ-33・TASK-33.3・#140）
+//!
+//! [`evaluate_start`] が評価データの状態を data 層の `evaluate_gate` へ通し、評価データ未定義なら
+//! [`EvaluateStart::Skipped`]（[`emit_evaluate_skipped`] で `status:"skipped"`・exit 0）、
+//! 凍結記録と一致すれば [`EvaluateStart::Proceed`]、不一致・矛盾は `ErrorReport`（exit ≠ 0。
+//! skipped へ落とさない）へ振り分ける。skip 判定は CLI で再実装しない。
+//! `Proceed` の後段（評価器呼び出し・結果 JSON）は未実装（評価器の結線 TASK・#136）で、
+//! 成功 JSON は出さない。#136 で `evaluate` を結線する際は、PoC-16 と同様に「候補が学習済みか」
+//! 等の確認より前に本関数の skip 判定を行うこと。
+//!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136）。
 
-use crate::error_report::{default_message, emit_error_report};
-use crate::output::write_package_report;
+use crate::error_report::{ToErrorReport, default_message, emit_error_report};
+use crate::output::{write_evaluate_report, write_package_report};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::stage_report::PackageReport;
+use fandhe_edge_core::stage_report::{EvaluateReport, PackageReport};
+use fandhe_edge_data::eval_freeze::{EvalDataState, EvaluateGate, FreezeRecord, evaluate_gate};
 use fandhe_edge_runtime::package_outcome::{PackageOutcome, PackageVerdict};
 use std::io::{self, Write};
 
@@ -79,9 +90,98 @@ pub fn emit_package_outcome<W: Write>(
     }
 }
 
+/// `evaluate` 工程の開始判定の結果（REQ-17・TASK-33.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluateStart {
+    /// 評価データ未定義。[`emit_evaluate_skipped`] で skipped（exit 0）を出す。
+    Skipped(EvaluateReport),
+    /// 凍結記録と実データが一致した。評価器へ進む（後段は未実装。成功 JSON は出さない）。
+    Proceed(FreezeRecord),
+}
+
+/// 評価データの状態と実データから `evaluate` を進めるか skipped にするかを決める。
+///
+/// 必ず data 層の `evaluate_gate` を経由する。データが渡されているのに skipped へ落とす経路、
+/// 凍結記録との不一致を通す経路は作らない（fail-closed。REQ-17・REQ-27）。
+///
+/// # Errors
+/// `FreezeError` を `ErrorReport`（`invalid_input`・`limit_exceeded` 等。exit ≠ 0）へ写して返す。
+pub fn evaluate_start(
+    state: &EvalDataState,
+    actual_bytes: &[u8],
+) -> Result<EvaluateStart, ErrorReport> {
+    match evaluate_gate(state, actual_bytes) {
+        Ok(EvaluateGate::Skip) => Ok(EvaluateStart::Skipped(EvaluateReport::skipped())),
+        Ok(EvaluateGate::Proceed(record)) => Ok(EvaluateStart::Proceed(record)),
+        Err(error) => Err(error.to_error_report()),
+    }
+}
+
+/// skipped の `evaluate` 結果を stdout へ JSON 1 行で書き、[`ExitCode::Ok`] を返す。
+///
+/// # Errors
+/// 書き込み・flush・直列化の失敗を `io::Error` で返す（`output` の契約）。
+pub fn emit_evaluate_skipped<W: Write>(
+    out: &mut W,
+    report: &EvaluateReport,
+) -> io::Result<ExitCode> {
+    write_evaluate_report(out, report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SKIPPED_LINE: &str = "{\"step\":\"evaluate\",\"status\":\"skipped\",\"reason\":\"evaluation_data_not_defined\"}\n";
+
+    /// REQ-17・REQ-33: 評価データなし（空）は skipped・exit 0。
+    #[test]
+    fn req17_req33_not_provided_empty_bytes_is_skipped() {
+        let start = evaluate_start(&EvalDataState::NotProvided, b"").expect("start");
+        let EvaluateStart::Skipped(report) = start else {
+            panic!("expected Skipped");
+        };
+        assert_eq!(report, EvaluateReport::skipped());
+        let mut buf = Vec::new();
+        let code = emit_evaluate_skipped(&mut buf, &report).expect("emit");
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(String::from_utf8(buf).expect("utf8"), SKIPPED_LINE);
+    }
+
+    /// REQ-17: NotProvided なのに実データがあれば invalid_input で停止する。
+    #[test]
+    fn req17_not_provided_with_data_fails_closed() {
+        let err = evaluate_start(&EvalDataState::NotProvided, b"x").expect_err("must fail");
+        assert_eq!(err.code, ExitCode::InvalidInput);
+    }
+
+    /// REQ-17・REQ-27: 凍結記録とのハッシュ不一致は invalid_input で停止する。
+    #[test]
+    fn req17_frozen_hash_mismatch_fails_closed() {
+        let record = fandhe_edge_data::eval_freeze::freeze_eval_data(b"a").expect("freeze");
+        let err = evaluate_start(&EvalDataState::Frozen(record), b"b").expect_err("must fail");
+        assert_eq!(err.code, ExitCode::InvalidInput);
+    }
+
+    /// REQ-17: 一致時は Proceed（skipped を出さない）。
+    #[test]
+    fn req17_frozen_matching_bytes_proceeds() {
+        let record = fandhe_edge_data::eval_freeze::freeze_eval_data(b"a").expect("freeze");
+        let start = evaluate_start(&EvalDataState::Frozen(record.clone()), b"a").expect("start");
+        assert_eq!(start, EvaluateStart::Proceed(record));
+    }
+
+    /// REQ-21: data 層の EvalStatus::Skipped の終了コードと出力関数の戻り値が一致する。
+    #[test]
+    fn req21_skipped_exit_code_matches_eval_status() {
+        let mut buf = Vec::new();
+        let code = emit_evaluate_skipped(&mut buf, &EvaluateReport::skipped()).expect("emit");
+        assert_eq!(
+            code,
+            fandhe_edge_data::eval_freeze::EvalStatus::Skipped.exit_code()
+        );
+        assert_eq!(code, ExitCode::Ok);
+    }
     use fandhe_edge_runtime::package_outcome::{
         LimitBreach, PackageQualityJudgment, resolve_package_outcome,
     };

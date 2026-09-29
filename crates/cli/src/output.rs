@@ -23,6 +23,11 @@
 //! [`write_package_report`] は `package` 工程の exit 0 の結果 JSON を書く。呼び出し元は
 //! `stage_output::emit_package_outcome`（配線は TASK-33.1-2・#136）。
 //!
+//! # evaluate の skipped（TASK-33.3・#140）
+//!
+//! [`write_evaluate_report`] は評価データ未定義の `evaluate` の exit 0 の JSON を書く。呼び出し元は
+//! `stage_output::emit_evaluate_skipped`（配線は TASK-33.1-2・#136）。
+//!
 //! # 異常系（TASK-21.2）
 //!
 //! [`write_error_report`] は [`ErrorReport`] を JSON 1 行として書き出す。
@@ -45,7 +50,7 @@ use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
-use fandhe_edge_core::stage_report::PackageReport;
+use fandhe_edge_core::stage_report::{EvaluateReport, PackageReport};
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use std::io::{self, Write};
 
@@ -124,6 +129,29 @@ pub fn write_error_report<W: Write>(out: &mut W, report: &ErrorReport) -> io::Re
 /// # Errors
 /// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
 pub fn write_package_report<W: Write>(out: &mut W, report: &PackageReport) -> io::Result<ExitCode> {
+    let mut line = report
+        .to_json_line()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(ExitCode::Ok)
+}
+
+/// [`EvaluateReport`]（`evaluate` 工程の評価データ未定義 skipped。exit 0）を JSON 1 行＋改行として
+/// `out` へ書き、[`ExitCode::Ok`] を返す（REQ-17・REQ-33・TASK-33.3・#140）。
+///
+/// [`write_package_report`] と同じ保証を持つ（直列化失敗時は何も書かず `Err`、`write_all` は
+/// 高々 1 回、部分書き込み失敗時にリトライ・追記・flush をしない）。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_evaluate_report<W: Write>(
+    out: &mut W,
+    report: &EvaluateReport,
+) -> io::Result<ExitCode> {
     let mut line = report
         .to_json_line()
         .map_err(|error| io::Error::other(error.to_string()))?;
