@@ -430,6 +430,11 @@ def monitor_child(
         status = _current_child_status(proc.pid)
         if status is None:
             _terminate_and_reap(proc)
+            # キャンセル済みなら監視失敗より優先する。`monitor_failed` の経路は
+            # stdout の drain 待ちを含み Rust 側の猶予を超えうるため、高速な
+            # キャンセル経路で予約を解放させる（REQ-34・#145）。
+            if _is_cancelled(cancel_event):
+                return "cancelled"
             return "monitor_failed"
         rss, is_zombie = status
         if is_zombie:
@@ -579,6 +584,15 @@ def run_supervised_train(
     request.train_path.close()
     request.root.close()
 
+    # 予約前のキャンセル確認: 予約も worker 起動もせず、所定のキャンセル応答を返す
+    # （起動処理が Rust 側の猶予を超えて SIGKILL され予約が残るのを防ぐ。REQ-34・#145）。
+    if _is_cancelled(cancel_event):
+        request.out_dir.close()
+        _emit(
+            {"status": "error", "code": "runtime_error", "message": "training cancelled by caller"}
+        )
+        return ExitCode.RUNTIME_ERROR
+
     try:
         reservation = contract.prepare_out_dir(request.out_dir)
     except WorkerError as e:
@@ -587,6 +601,9 @@ def run_supervised_train(
         return e.exit_code
 
     try:
+        # 予約後・worker 起動前のキャンセル確認（保持中の fd で予約を解放して応答する）。
+        if _is_cancelled(cancel_event):
+            return _report_cancelled(reservation)
         return _spawn_worker_and_finalize(
             raw_request,
             reservation,

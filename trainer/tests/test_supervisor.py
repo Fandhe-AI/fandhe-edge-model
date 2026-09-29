@@ -1159,3 +1159,65 @@ def test_req34_monitor_child_prefers_cancelled_over_normal_exit_on_zombie(
         assert reason == "cancelled"
     finally:
         _reap(proc)
+
+
+def test_req34_monitor_child_prefers_cancelled_when_ps_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34: キャンセル済みで `ps` が失敗しても `monitor_failed` にせず
+    `"cancelled"` を返す（stdout drain を待たない高速経路へ流す）。"""
+    proc = _spawn("hang")
+    event = threading.Event()
+    event.set()
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: None)
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            cancel_event=event,
+        )
+        assert reason == "cancelled"
+    finally:
+        _reap(proc)
+
+
+def test_req34_cancel_before_reservation_does_not_reserve_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: 予約前にキャンセル済みなら out_dir を予約せず worker も起動せず、
+    所定のキャンセル応答を返す。"""
+    request_path, out_dir, ctl_dir = _coop_setup(tmp_path, monkeypatch, "hang")
+    event = threading.Event()
+    event.set()
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.RUNTIME_ERROR
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["message"] == "training cancelled by caller"
+    assert not out_dir.exists()
+    assert _tmp_leftovers(tmp_path) == []
+    assert not (ctl_dir / "ready").exists()
+
+
+def test_req34_cancel_after_reservation_before_spawn_releases_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: 予約直後（worker 起動前）にキャンセルされたら、保持中の fd で予約を
+    解放して所定のキャンセル応答を返し、worker は起動しない。"""
+    request_path, out_dir, ctl_dir = _coop_setup(tmp_path, monkeypatch, "hang")
+    event = threading.Event()
+    real_prepare = contract.prepare_out_dir
+
+    def _prepare_then_cancel(entry):
+        reservation = real_prepare(entry)
+        event.set()
+        return reservation
+
+    monkeypatch.setattr(contract, "prepare_out_dir", _prepare_then_cancel)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.RUNTIME_ERROR
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["message"] == "training cancelled by caller"
+    assert not out_dir.exists()
+    assert _tmp_leftovers(tmp_path) == []
+    assert not (ctl_dir / "ready").exists()

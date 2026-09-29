@@ -1679,6 +1679,10 @@ fn conclude_run(
         Ok(run) if is_cancel_ack(&run) => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
             started.elapsed(),
         ))),
+        // supervisor が予約の解放を確認できなかった旨の報告は、通常の失敗として
+        // 隠さず `Unconfirmed` 経路で残置を観測する（公開済み・判定不能なら
+        // `CancelOutcomeUnconfirmed`。REQ-34・#145）。
+        Ok(run) if is_cleanup_incomplete(&run) => unconfirmed(),
         // supervisor が返したキャンセル応答以外のエラー結果（`invalid_request` 等の
         // 入力エラーを含む）は隠さず、そのまま呼び出し元へ返す（キャンセル要求後に
         // 検証が先に失敗した場合の入力エラーを保持する。codex/review 指摘 P1）。
@@ -1706,6 +1710,23 @@ fn is_cancel_ack(run: &TrainRun) -> bool {
 /// `supervisor.py::_report_cancelled` が出す固定メッセージ（両側で一致させる）。
 #[cfg(unix)]
 const CANCEL_ACK_MESSAGE: &str = "training cancelled by caller";
+
+/// `supervisor.py::_report_cancelled` が予約の解放を確認できなかったときに出す
+/// 固定メッセージ（両側で一致させる）。
+#[cfg(unix)]
+const CANCEL_CLEANUP_INCOMPLETE_MESSAGE: &str = "training cancelled but cleanup incomplete";
+
+/// supervisor が「キャンセルしたが予約の解放を確認できなかった」と報告したか。
+#[cfg(unix)]
+fn is_cleanup_incomplete(run: &TrainRun) -> bool {
+    run.exit_code == ExitCode::RuntimeError
+        && matches!(
+            &run.outcome,
+            TrainOutcome::Error(f)
+                if f.failure_code() == crate::result::FailureCode::RuntimeError
+                    && f.message() == CANCEL_CLEANUP_INCOMPLETE_MESSAGE
+        )
+}
 
 /// 子（supervisor）の終了・回収後に、標準出力・標準エラー出力・終了コードを
 /// 検証して [`TrainRun`] を得る（[`run_train_cancellable`] の後半。協調キャンセルの
@@ -2573,6 +2594,32 @@ mod tests {
                 assert_eq!(run.exit_code, ExitCode::RuntimeError);
             }
             _ => panic!("expected Completed(Error)"),
+        }
+    }
+
+    /// REQ-34・#145: supervisor が予約の解放を確認できなかった旨（固定メッセージ）を
+    /// 報告した場合は、通常の失敗（`Completed`）にせず `Unconfirmed` 経路に入る。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_treats_cleanup_incomplete_as_unconfirmed() {
+        let request = test_request(None);
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_CLEANUP_INCOMPLETE_MESSAGE}"}}"#
+        );
+        let outcome =
+            classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+        let run = TrainRun {
+            outcome,
+            exit_code: ExitCode::RuntimeError,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        assert!(is_cleanup_incomplete(&run));
+        match conclude_run(Ok(run), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => assert_eq!(run.stop(), CancelStop::Unconfirmed),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed { .. }) => {}
+            _ => panic!("expected Unconfirmed handling, not Completed"),
         }
     }
 
