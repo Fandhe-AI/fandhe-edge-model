@@ -270,16 +270,17 @@ fn req39_oversized_request_is_rejected_before_parsing() {
     assert!(matches!(err, TrainRequestError::TooLarge { .. }));
 }
 
-/// REQ-39(e): `config` が巨大で `to_json_vec` がサイズ超過を検出する
-/// （組み立て段階での再検査）。
-#[test]
-fn req39_to_json_vec_rejects_oversized_config() {
+/// `MAX_REQUEST_BYTES` を基準に、直列化後の長さが `delta` だけずれる `config`
+/// を作る（`{"k":"` 6 バイト＋本文＋`"}` 2 バイト）。
+fn config_with_serialized_len(len: usize) -> serde_json::Map<String, Value> {
     let mut config = serde_json::Map::new();
-    config.insert(
-        "huge".to_string(),
-        Value::String("a".repeat(limits::MAX_REQUEST_BYTES)),
-    );
-    let params = TrainRequestParams {
+    config.insert("k".to_string(), Value::String("a".repeat(len - 8)));
+    assert_eq!(serde_json::to_vec(&config).expect("serialize").len(), len);
+    config
+}
+
+fn params_with_config(config: serde_json::Map<String, Value>) -> TrainRequestParams {
+    TrainRequestParams {
         kind: "c3".to_string(),
         kind_version: 1,
         config,
@@ -292,9 +293,37 @@ fn req39_to_json_vec_rejects_oversized_config() {
         out_dir: "out".to_string(),
         time_limit_seconds: None,
         rss_limit_bytes: None,
-    };
-    let req = TrainRequest::new(params).expect("oversized config is not rejected by new()");
+    }
+}
+
+/// REQ-39・issue #255: 直列化後 `MAX_REQUEST_BYTES + 1` の `config` は
+/// `new()` が `limit_exceeded`（20）で拒否する。
+#[test]
+fn req39_new_rejects_oversized_config() {
+    let config = config_with_serialized_len(limits::MAX_REQUEST_BYTES + 1);
+    let err = TrainRequest::new(params_with_config(config)).unwrap_err();
+    assert_eq!(
+        err,
+        fandhe_edge_train::error::TrainRequestError::ConfigTooLarge {
+            limit: limits::MAX_REQUEST_BYTES
+        }
+    );
+    assert_eq!(err.reason_code(), "limit_exceeded");
+    assert_eq!(err.exit_code().code(), 20);
+}
+
+/// REQ-39(e): 直列化後ちょうど `MAX_REQUEST_BYTES` の `config` は `new()` が
+/// 受理するが、リクエスト全体では上限を超えるため `to_json_vec` が拒否する。
+#[test]
+fn req39_to_json_vec_rejects_request_exceeding_limit_with_at_limit_config() {
+    let config = config_with_serialized_len(limits::MAX_REQUEST_BYTES);
+    let req = TrainRequest::new(params_with_config(config))
+        .expect("config exactly at the limit is accepted by new()");
     let err = req.to_json_vec().unwrap_err();
+    assert!(matches!(
+        err,
+        fandhe_edge_train::error::TrainRequestError::TooLarge { .. }
+    ));
     assert_eq!(err.reason_code(), "limit_exceeded");
     assert_eq!(err.exit_code().code(), 20);
 }

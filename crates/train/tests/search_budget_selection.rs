@@ -1178,6 +1178,37 @@ fn task18_1_2_validation_inputs_exceeding_request_size_are_rejected_before_train
     assert_eq!(runner.calls, 0);
 }
 
+/// (issue #255・REQ-39) 候補の `config` が直列化後 `MAX_REQUEST_BYTES` を超える場合、
+/// 子プロセスを起動する前に `ConfigTooLarge`（`limit_exceeded`・20）で拒否される。
+#[test]
+fn issue255_oversized_candidate_config_is_rejected_before_training() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let mut input = default_input(&gold, &split, &["c3-a"]);
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "k".to_string(),
+        serde_json::Value::String("a".repeat(fandhe_edge_train::limits::MAX_REQUEST_BYTES - 7)),
+    );
+    input.candidates[0].params.config = config;
+    let err = run_search(&mut runner, &clock, input).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SearchError::InvalidRequest {
+                index: 0,
+                source: fandhe_edge_train::error::TrainRequestError::ConfigTooLarge { .. }
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(err.reason_code(), "limit_exceeded");
+    assert_eq!(err.exit_code().code(), 20);
+    assert_eq!(runner.calls, 0);
+}
+
 /// (T7・P1・REQ-27) 予測列の件数が gold と異なる場合、その候補は `scoring_failed`
 /// （候補単位の失敗）として記録され、探索は継続して後続候補を実行・選定する
 /// （それまでの候補の記録を失わない）。
