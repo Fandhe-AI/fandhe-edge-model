@@ -26,6 +26,7 @@
 //! 機械可読な `code()` 文字列のみ返す。エラー・`Debug` は入力本文やトークン値を保持しない
 //! （security.md）。
 
+use crate::prediction_provenance::ReferenceBatchPredictions;
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::judgment::{MAX_OPTIONS, SCORE_SUM_TOLERANCE};
 use std::fmt;
@@ -298,6 +299,16 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// 参考測定（判定に使わない目的）でバッチ API を使うときの入口（REQ-28 境界値・TASK-28.3・#120）。
+    /// [`Self::infer_batch`] をそのまま呼び、戻り値に「バッチ予測である」注記を結び付けるだけで、
+    /// 予測は変えない。判定経路は `infer_one` / `as_predict_fn` を使い、フラグは不要（TASK-28.1）。
+    pub fn infer_batch_for_reference(
+        &self,
+        inputs: &[&str],
+    ) -> Result<ReferenceBatchPredictions, BatchError> {
+        self.infer_batch(inputs).map(ReferenceBatchPredictions::new)
     }
 
     /// `run_single` と同義の関数（評価器の推論関数へ渡す用。#118）。
