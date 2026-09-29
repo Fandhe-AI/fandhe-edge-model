@@ -427,7 +427,7 @@ pub enum TrainProcessError {
     ///
     /// `child_reaped` は、締め切り超過を検出して `Child::kill()` を送った
     /// 後、直接の子（supervisor）の終了を
-    /// [`crate::process::wait_after_kill`] で回収できたかを示す
+    /// [`crate::process::ensure_reaped`] で回収できたかを示す
     /// （`LateExit` 経路では既に reap 済みのため常に `true`）。`false` は
     /// 回収自体
     /// （`KillWaitTimedOut`／`Wait`）が失敗したことを意味するが、その場合

@@ -48,7 +48,7 @@
 //! 終了状態をそのまま使う。
 //!
 //! 期限内に終了しなかった、または `try_wait()` 自体が失敗した場合は
-//! `Child::kill()` で直接の子を `SIGKILL` してから [`wait_after_kill`] で
+//! `Child::kill()` で直接の子を `SIGKILL` してから [`wait_after_kill_until`] で
 //! 回収し、[`TrainProcessError::WallTimeout`]（`LimitExceeded`＝20）として
 //! 分類する（この分類は変えない）。直接の子は Rust 自身の未回収の子である
 //! ため、`wait()` するまで pid が OS に返却されない（＝再利用されない）。
@@ -793,6 +793,15 @@ fn ensure_reaped<C: ChildControl>(
     }
 }
 
+/// 壁時計超過後の回収。期限は既に過ぎているため、`ensure_reaped` の最後の
+/// kill と `final_grace` 以内の有界な回収待ちに当たる。回収できたかを返し、
+/// できなくても呼び出し側は `WallTimeout { child_reaped: false }` を返す
+/// （超過を `runtime_error` に化けさせない。REQ-21・REQ-39）。
+#[cfg(unix)]
+fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration) -> bool {
+    ensure_reaped(child, Instant::now(), final_grace).is_ok()
+}
+
 /// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
@@ -801,7 +810,7 @@ const SIGKILL: i32 = 9;
 /// 「資源の上限」）。`SIGKILL` は通常即座に効くため、この上限に達するのは
 /// 割り込み不可能な OS 側の待ち（D state）等の極めて稀なケースに限られる
 /// （Cursor Bugbot 指摘 Medium「Timeout wait can block forever」。issue
-/// #178 PR #233 レビュー。[`wait_after_kill`] 参照）。
+/// #178 PR #233 レビュー。[`wait_after_kill_until`] 参照）。
 #[cfg(unix)]
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -810,7 +819,7 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `try_wait()` 自体が `ErrorKind::Interrupted`（`EINTR`。シグナル配送等で
 /// 発生しうる retryable なエラー）を返した場合は打ち切らず再試行する
 /// （[`drain_capped`] の `EINTR` 扱いと同じ理由。Cursor Bugbot 指摘 Medium
-/// 「Pipe reads fail on interrupt」と同種の欠陥が [`wait_after_kill`] にも
+/// 「Pipe reads fail on interrupt」と同種の欠陥が [`wait_after_kill_until`] にも
 /// あった：修正前は `EINTR` を他の `try_wait()` エラーと同列に扱い、
 /// `SIGKILL` 送出後で実際にはまだ生きているだけのプロセスを、回収に失敗した
 /// ものとして即座にエラー化していた。issue #178 PR #233 レビュー）。
@@ -857,11 +866,6 @@ fn poll_wait_bounded(child: &mut Child, deadline: Instant) -> std::io::Result<Op
 /// プロセスの掃除は学習ワーカー側の lifeline に委ねる設計へ移行したため、
 /// `descendants_confirmed_clean` のような子孫掃除の確認フィールドはもはや
 /// 持たない。issue #178 PR #233 レビュー。モジュール doc 参照）。
-#[cfg(unix)]
-fn wait_after_kill(child: &mut Child) -> Result<ExitStatus, TrainProcessError> {
-    wait_after_kill_until(child, Instant::now() + KILL_WAIT_TIMEOUT)
-}
-
 /// キャンセル待機の期限。`now + KILL_WAIT_TIMEOUT` と壁時計の期限の早い方
 /// （壁時計の上限を超えて待たない。REQ-39）。
 #[cfg(unix)]
@@ -869,7 +873,7 @@ fn bounded_deadline(now: Instant, wall_deadline: Instant) -> Instant {
     (now + KILL_WAIT_TIMEOUT).min(wall_deadline)
 }
 
-/// [`wait_after_kill`] の期限指定版。`deadline` までに回収できなければ
+/// [`wait_after_kill_until`] の期限指定版。`deadline` までに回収できなければ
 /// [`TrainProcessError::KillWaitTimedOut`]（既存規約どおり回収を主張しない）。
 #[cfg(unix)]
 fn wait_after_kill_until(
@@ -1229,8 +1233,7 @@ pub fn run_train_cancellable(
             // 必ず `wait()` で回収する（ゾンビを残さない）。子孫プロセス
             // （`_worker` を含む）の掃除は学習ワーカー側の lifeline に
             // 委ねる（モジュール doc 参照）。
-            let _ = child.kill();
-            let child_reaped = wait_after_kill(&mut child).is_ok();
+            let child_reaped = reap_after_wall_timeout(&mut child, KILL_WAIT_TIMEOUT);
             (None, true, child_reaped)
         }
     };
@@ -1525,6 +1528,30 @@ mod tests {
         ));
         assert!(c.kills >= 2);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// REQ-21・REQ-39: 壁時計超過後の回収は kill 失敗を再試行して回収でき、
+    /// 回収できなければ `false`（呼び出し側は `WallTimeout` を維持する）。
+    #[cfg(unix)]
+    #[test]
+    fn reap_after_wall_timeout_reports_reaped_flag() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut ok = FakeChild {
+            kill_results: vec![Err(io_err())],
+            wait_results: vec![Err(io_err()), Ok(Some(ExitStatus::from_raw(9)))],
+            kills: 0,
+        };
+        assert!(reap_after_wall_timeout(&mut ok, Duration::from_millis(500)));
+        assert!(ok.kills >= 2);
+        let mut never = FakeChild {
+            kill_results: vec![],
+            wait_results: vec![],
+            kills: 0,
+        };
+        assert!(!reap_after_wall_timeout(
+            &mut never,
+            Duration::from_millis(100)
+        ));
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
