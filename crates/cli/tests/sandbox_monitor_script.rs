@@ -292,6 +292,100 @@ fn req38_duplicate_report_is_merged_into_network_events() {
     has(&o, "\"unattributed_network_deny_events\": 4");
 }
 
+/// 元の行と重複要約行が両方ある場合、同一イベントとして 1+3 回（4 回。5 回ではない）に数える。
+#[test]
+fn req38_duplicate_summary_with_original_line_is_not_double_counted() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("duplicate_with_original.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"deny_events\": 2");
+    has(&o, "\"duplicate_reports\": 3");
+    has(&o, "\"network_deny_events\": 4");
+    has(&o, "\"unattributed_network_deny_events\": 4");
+    let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
+    assert_eq!(report.matches("\"attribution\"").count(), 1, "{report}");
+    assert!(report.contains("\"occurrences\": 4"), "{report}");
+}
+
+/// 別イベント（PID・対象が異なる）の要約行は元の行を消費しない（過小計上の防止）。
+#[test]
+fn req38_duplicate_summary_of_different_event_is_counted_separately() {
+    let e = Env::new();
+    let stream = e.dir.join("mixed.ndjson");
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let body = "{\"eventMessage\":\"Sandbox: zz(9) deny(1) network-outbound 10.0.0.1:1\"}\n\
+                {\"eventMessage\":\"2 duplicate reports for Sandbox: zz(9) deny(1) network-outbound 10.0.0.2:1\"}\n";
+    fs::write(&stream, format!("{header}\n{body}")).expect("write");
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 4");
+}
+
+/// 拒否ログの生文字列（通信先・許可リスト外のプロセス名・形式外の行の本文）は、レポートにも
+/// stdout にも出さない（P0。件数・固定語彙・ダイジェストだけ）。
+#[test]
+fn req38_report_never_contains_raw_log_strings() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("leak_probe.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 2");
+    let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
+    for needle in [
+        "secret-host",
+        "example.invalid",
+        "8443",
+        "PrivateAppName",
+        "unformatted-secret-body",
+        "secretuser",
+        "/Users/",
+    ] {
+        assert!(!report.contains(needle), "report leaked {needle}");
+        assert!(!o.stdout.contains(needle), "stdout leaked {needle}");
+    }
+    assert!(report.contains("\"target_digest\""));
+}
+
+/// 監視スクリプト経由でも、`network_report.json` と `monitor.meta.json` に生文字列は残らない
+/// （生ログ `log_stream.ndjson` は 0600 の入力そのもので、対象外）。
+#[test]
+fn req38_monitor_outputs_do_not_contain_raw_log_strings() {
+    let e = Env::new();
+    let o = e.run("leak_probe.ndjson", &e.base_args(), &[]);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    for name in ["network_report.json", "monitor.meta.json"] {
+        let body = fs::read_to_string(e.out().join(name)).expect("read");
+        for needle in [
+            "secret-host",
+            "PrivateAppName",
+            "unformatted-secret-body",
+            "secretuser",
+        ] {
+            assert!(!body.contains(needle), "{name} leaked {needle}");
+        }
+    }
+    for needle in [
+        "secret-host",
+        "PrivateAppName",
+        "unformatted-secret-body",
+        "secretuser",
+    ] {
+        assert!(!o.stdout.contains(needle), "stdout leaked {needle}");
+    }
+}
+
 /// `--candidates` は log stream を開始する前に 1〜16 を検証し、範囲外は 64（CLI も起動しない）。
 #[test]
 fn req33_candidates_range_is_validated_before_monitoring() {
@@ -537,7 +631,9 @@ fn req38_report_regex_boundaries() {
     has(&o, "\"duplicate_reports\": 1");
     has(&o, "\"evidence_hint\": \"requires_human_review\"");
     let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
-    assert!(report.contains("\"process\": \"Foo(bar)\""));
+    // 許可リスト外のプロセス名は生文字列でなく固定語彙 `other` で記録する
+    assert!(report.contains("\"process\": \"other\""));
+    assert!(!report.contains("Foo(bar)"));
     assert!(report.contains("\"pid\": 321"));
 }
 

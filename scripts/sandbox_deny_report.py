@@ -27,9 +27,15 @@ judged_fail にしないため）。`run.meta.json` の任意キー `process_pid
 （現状の `sandbox-run.sh` は PID を記録しないため、通信拒否があれば常に 12 になる。
 PID 記録は将来仕様。REQ-38・TASK-38.2 で扱う）。
 
-件数の意味: `network_deny_events` 等の通信拒否件数は、元の 1 行 + `N duplicate reports for`
-の重複分 N を合算した**拒否の発生回数**。`duplicate_reports` は重複分だけの合計（内訳）。
+件数の意味: `network_deny_events` 等の通信拒否件数は**拒否の発生回数**。元の 1 行は 1 回、
+`N duplicate reports for` の要約行は、同一イベント（`event_key`）の元の行が先にあれば N 回、
+無ければ 1+N 回。`duplicate_reports` は重複分だけの合計（内訳）。
 `deny_events`・`parsed_events` はイベント行数。
+
+生文字列の非保存（P0）: 拒否ログの対象（通信先・パス）・許可リスト外のプロセス名・形式外の行の
+本文は、レポート・stdout・例外メッセージのどこにも書かない。レポートに載せるのは件数・固定語彙
+（許可リストで正規化したプロセス名 `other`・`network*` の操作トークン）・PID・実行ごとの salt
+付きダイジェスト（`target_digest`。salt は保存しない）に限る。
 
 資源: ログは 1 行ずつ読み（一括読み込みしない）、保持するレコードは MAX_RECORDS 件まで
 （超過分は件数だけ数え、レポートの `network_denials_truncated` を true にする。REQ-39）。
@@ -46,6 +52,7 @@ PID 記録は将来仕様。REQ-38・TASK-38.2 で扱う）。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -60,7 +67,11 @@ MAX_META_BYTES = 1024 * 1024
 # レポートに保持する通信拒否レコードの上限（超過分は件数のみ。REQ-39）
 MAX_RECORDS = 1000
 MAX_PIDS = 4096
-MAX_TARGET_BYTES = 256
+# 重複報告の突き合わせ用に保持する未照合の元イベントの上限（メモリ上限。REQ-39）。
+# 超過時は照合できないものとして 1+N に数える（過小に数えない側へ倒す）
+MAX_PENDING_EVENTS = 100_000
+DIGEST_HEX_LEN = 12
+OPERATION_RE = re.compile(r"^network[a-z0-9*-]{0,40}$")
 HEADER_PREFIX = "Filtering the log data"
 VALID_EXIT_CODES = {0, 10, 11, 12, 20, 64, 70}
 CODE_NAMES = {
@@ -140,19 +151,41 @@ def load_run_meta(path: str) -> dict:
     return meta
 
 
-def truncate_target(text: str) -> str:
-    """対象文字列を 256 バイトで切り詰める（他アプリのパスを長く転記しない）。"""
-    raw = text.encode("utf-8", errors="replace")
-    if len(raw) <= MAX_TARGET_BYTES:
-        return text
-    return raw[:MAX_TARGET_BYTES].decode("utf-8", errors="ignore")
+def target_digest(salt: bytes, text: str) -> str:
+    """対象文字列（通信先・パス・ログ本文）の実行ごとの salt 付きダイジェスト先頭 12 桁。
+
+    生文字列はレポートへ書かない（P0）。salt は実行ごとの乱数で**どこにも保存しない**ため、
+    低エントロピーな値（ホスト名・IP）を辞書照合で復元できず、同一レポート内の同一対象の
+    識別にだけ使える。
+    """
+    h = hashlib.sha256(salt + text.encode("utf-8", errors="replace")).hexdigest()
+    return h[:DIGEST_HEX_LEN]
+
+
+def event_key(proc: str, pid: str, deny_n: str, op: str, target: str | None) -> bytes:
+    """同一拒否イベントの識別規則（唯一の定義）。
+
+    `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> <対象>` の全要素が一致する元の行と
+    `N duplicate reports for` の要約行を同一イベントとみなす（要約行は元の行より後に出る。
+    要約行にはイベント ID・時刻が無く、元の行と時刻も異なるため）。キーはメモリ上だけで使い、
+    ダイジェスト化して保持する（対象文字列を保持しない）。
+    """
+    raw = "\x00".join((proc, pid, deny_n, op, target or ""))
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).digest()
 
 
 def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset()) -> dict:
     """`eventMessage` を 1 件ずつ分類して件数とレコード（上限あり）を返す。
 
     `tool_pids` に含まれる PID かつ許可リストのプロセス名だけを tool とし、それ以外は
-    帰属不明にする（名前だけでは断定しない）。通信拒否の件数は重複報告分を合算する。
+    帰属不明にする（名前だけでは断定しない）。
+
+    発生回数: 元の行は 1 回。`N duplicate reports for` の要約行は、同じ `event_key` の元の行が
+    先に数えられていれば N 回だけ加算し（元の 1 回を二重に数えない）、元の行が無ければ
+    元の 1 回を含めて 1+N 回とする。
+
+    レポートに載せるのは件数・固定語彙・salt 付きダイジェストだけで、ログ上の生文字列
+    （プロセス名の許可リスト外・対象・形式外の行）は保存しない。
     """
     counts = {
         "parsed_events": 0,
@@ -165,13 +198,18 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
     }
     records: list[dict] = []
     truncated = False
+    salt = os.urandom(16)
+    # event_key -> 要約行にまだ照合されていない元の行のレコード位置（保持できなければ -1）
+    pending: dict[bytes, list[int]] = {}
+    pending_total = 0
 
-    def keep(rec: dict) -> None:
+    def keep(rec: dict) -> int | None:
         nonlocal truncated
         if len(records) < MAX_RECORDS:
             records.append(rec)
-        else:
-            truncated = True
+            return len(records) - 1
+        truncated = True
+        return None
 
     for msg in events_raw:
         counts["parsed_events"] += 1
@@ -190,34 +228,50 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
                         "process": None,
                         "pid": None,
                         "operation": None,
-                        "target": truncate_target(msg),
+                        "target_digest": target_digest(salt, msg),
+                        "occurrences": 1,
                         "attribution": "unattributed",
                         "recognized": False,
                     }
                 )
             continue
-        dup, proc, pid, _n, op, target = m.groups()
+        dup, proc, pid, deny_n, op, target = m.groups()
         dup_n = int(dup) if dup is not None else 0
         counts["duplicate_reports"] += dup_n
         if not op.startswith("network"):
             continue
-        occurrences = 1 + dup_n
+        key = event_key(proc, pid, deny_n, op, target)
+        claimed = False
+        if dup is not None:
+            waiting = pending.get(key)
+            if waiting:
+                idx = waiting.pop()
+                pending_total -= 1
+                claimed = True
+                if 0 <= idx < len(records):
+                    records[idx]["occurrences"] += dup_n
+        occurrences = dup_n if claimed else 1 + dup_n
         counts["network_deny_events"] += occurrences
         tool = proc in TOOL_PROCESSES and int(pid) in tool_pids
         counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += (
             occurrences
         )
-        keep(
+        if claimed:
+            continue
+        idx = keep(
             {
-                "process": proc,
+                "process": proc if proc in TOOL_PROCESSES else "other",
                 "pid": int(pid),
-                "operation": op,
-                "target": truncate_target(target or ""),
+                "operation": op if OPERATION_RE.match(op) else "network-other",
+                "target_digest": target_digest(salt, target or ""),
                 "occurrences": occurrences,
                 "attribution": "tool" if tool else "unattributed",
                 "recognized": True,
             }
         )
+        if dup is None and pending_total < MAX_PENDING_EVENTS:
+            pending.setdefault(key, []).append(-1 if idx is None else idx)
+            pending_total += 1
     return {"counts": counts, "records": records, "truncated": truncated}
 
 
@@ -373,12 +427,18 @@ def main(argv: list[str]) -> int:
     p.add_argument("--stream-overflow", action="store_true")
     p.add_argument("--stream-died", action="store_true")
     p.add_argument("--report-out", required=True)
+    # argparse 既定のエラーは不正な値を stderr へ複写するため、固定の出力に置き換える
+    p.error = lambda _message: (_ for _ in ()).throw(SystemExit(2))  # type: ignore[method-assign]
     try:
         args = p.parse_args(argv)
     except SystemExit:
         print(json.dumps({"code": "invalid_input", "message": "invalid arguments"}))
         return 64
-    rc, summary, report = build(args)
+    try:
+        rc, summary, report = build(args)
+    except Exception:  # 想定外の例外でも本文を含む traceback を出さない
+        print(json.dumps({"code": "runtime_error", "message": "unexpected report failure"}))
+        return 70
     try:
         with open(args.report_out, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False)

@@ -1,0 +1,3 @@
+Filtering the log data using "process == \"kernel\" AND eventMessage CONTAINS \"deny\""
+{"eventMessage": "Sandbox: PrivateAppName(901) deny(1) network-outbound secret-host.example.invalid:8443", "processImagePath": "/kernel", "timestamp": "2026-09-29 10:00:00.000000+0900", "messageType": "Default"}
+{"eventMessage": "deny network unformatted-secret-body /Users/secretuser/x", "processImagePath": "/kernel", "timestamp": "2026-09-29 10:00:00.000000+0900", "messageType": "Default"}

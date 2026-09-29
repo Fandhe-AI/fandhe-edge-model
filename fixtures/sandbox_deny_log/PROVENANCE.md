@@ -13,3 +13,7 @@
 - ファイル一覧: `clean`（通信拒否なし）・`tool_python`・`tool_duplicate`（本ツール起因）・
   `unattributed`（帰属不明）・`unrecognized`（形式外の deny 行）・`garbage`（JSON でない行）・
   `no_header`（ヘッダなし）・`edge_cases`（括弧を含むプロセス名・単数形の重複報告・`network*`）
+- `duplicate_with_original`: 元の行と `3 duplicate reports for` の要約行が両方ある（発生回数は 4。
+  二重計上の回帰）。`leak_probe`: 許可リスト外のプロセス名・通信先・形式外の行に、レポートへ
+  出してはならない目印の文字列（`secret-host.example.invalid`・`PrivateAppName`・
+  `unformatted-secret-body`・`/Users/secretuser`）を含む（生文字列非保存の回帰。すべて架空の値）

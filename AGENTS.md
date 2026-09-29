@@ -59,7 +59,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 実機確認は `scripts/sandbox-monitor.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> [--candidates N] [--smoke]` を macOS 実機で**人が手動実行**する（前提は `sandbox-run.sh` と同じ）。`log stream` を実行の前に開始し後に止め（`log show` では Sandbox の拒否ログが取れない。PoC-16）、`scripts/sandbox_deny_report.py`（標準ライブラリのみ）が操作トークン（`network*` で始まる操作）で通信拒否を機械判定する。部分文字列 `network` では判定しない（PoC-16 の誤検出の回避）
 - 帰属と件数: プロセス名だけでは本ツール起因と断定せず、`run.meta.json` の `process_pids` に PID が含まれる場合のみ tool とする（現状の `sandbox-run.sh` は PID を記録しないため、通信拒否があれば `pending`(12) になる）。通信拒否の件数は重複報告分を合算した発生回数で、レポートのレコードは 1000 件で切り詰める（`network_denials_truncated`）。ログは 1 行ずつ読む
 - 判定と終了コード: 本ツール起因（PID 照合済み）の通信拒否あり `judged_fail`(10)・帰属不明の通信拒否あり `pending`(12)・監視の無効や読めない行や時刻の不整合 `runtime_error`(70。`network_verdict:"undeterminable"`)・拒否 0 件は run の終了コードを伝搬（合格は run も 0 のときのみ）
-- 出力先: `<out-dir>/network_report.json`（件数・通信拒否のレコード）・`log_stream.ndjson`（生ログ。0600）・`monitor.meta.json`・`run/run.meta.json`。生ログには他アプリのイベントが含まれるため、PR・Issue へは転記せず `network_report.json` の件数を記録する
+- 出力先: `<out-dir>/network_report.json`（件数・通信拒否のレコード。通信先・パス等の生文字列は書かず、固定語彙と salt 付きダイジェストだけ）・`log_stream.ndjson`（生ログ。0600）・`monitor.meta.json`・`run/run.meta.json`。生ログには他アプリのイベントが含まれるため、PR・Issue へは転記せず `network_report.json` の件数を記録する
 - `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
 - 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
 
