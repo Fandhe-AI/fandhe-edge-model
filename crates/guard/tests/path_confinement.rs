@@ -320,8 +320,10 @@ fn req39_open_confined_follows_inner_symlink_via_canonical_components() {
     assert_eq!(buf, b"onnx");
 }
 
-/// 検証後・open 前に親ディレクトリが外部への symlink へ差し替えられても、外部ファイルは開かれない
-/// （REQ-39・TASK-39.4-1・#158。競合を確率的に発生させる差し替えスレッドを併走させる。
+/// 併走する差し替えスレッドで、`open_confined` が外部ファイルを返さないことを確率的に確認する
+/// （REQ-39・TASK-39.4-1・#158）。symlink `swap` は正準化で解決されるため、検証と openat の間の
+/// 親ディレクトリ差し替えそのものは決定的に再現できない。それは `path.rs` の単体テスト
+/// `req39_parent_swapped_between_validation_and_openat_is_rejected`（テスト用フック）が担う。
 /// 開けた場合は内容が必ずルート内のファイルのものであること、開けない場合は Escapes であることを
 /// 確認する）。証拠種別: テストハーネス（Linux）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]

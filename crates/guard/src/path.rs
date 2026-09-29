@@ -99,15 +99,34 @@ pub enum PathRejection {
     UnsupportedPlatform,
 }
 
-/// 権限・資源・中断など環境起因の失敗だけを実行時エラー（70）とし、それ以外は
-/// 利用者が渡したパスの不正（存在しない・ファイル配下を辿る・symlink ループ・
+/// 環境・資源起因の errno（Linux / macOS の値。生の値で判定し、追加の依存を持たない）。
+///
+/// EPERM・EACCES（権限）・EIO・ENOMEM・ENFILE・EMFILE・ENOSPC・EINTR・EAGAIN・ETIMEDOUT・EDQUOT。
+/// 番号が OS で異なるもの（EAGAIN・ETIMEDOUT・EDQUOT）は `cfg!(target_os = "macos")` で切り替える。
+fn is_environmental_errno(code: i32) -> bool {
+    let mac = cfg!(target_os = "macos");
+    let eagain = if mac { 35 } else { 11 };
+    let etimedout = if mac { 60 } else { 110 };
+    let edquot = if mac { 69 } else { 122 };
+    matches!(code, 1 | 4 | 5 | 12 | 13 | 23 | 24 | 28)
+        || [eagain, etimedout, edquot].contains(&code)
+}
+
+/// 権限・資源（fd・メモリ・ディスク枯渇）・中断など環境起因の失敗だけを実行時エラー（70）とし、
+/// それ以外は利用者が渡したパスの不正（存在しない・ファイル配下を辿る・symlink ループ・
 /// 名前の長すぎ等。`NotFound`・`NotADirectory`・`FilesystemLoop`・`InvalidFilename`・
 /// `InvalidInput` ほか）として入力不正（64）に写す（REQ-21）。
 fn io_exit_code(source: &io::Error) -> ExitCode {
+    if source.raw_os_error().is_some_and(is_environmental_errno) {
+        return ExitCode::RuntimeError;
+    }
     match source.kind() {
         io::ErrorKind::PermissionDenied
         | io::ErrorKind::OutOfMemory
         | io::ErrorKind::TimedOut
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::StorageFull
+        | io::ErrorKind::QuotaExceeded
         | io::ErrorKind::Interrupted => ExitCode::RuntimeError,
         _ => ExitCode::InvalidInput,
     }
@@ -334,6 +353,29 @@ pub fn open_confined(root: &Path, candidate: &Path) -> Result<(File, ConfinedPat
     }
 }
 
+/// 検証後・openat 前の差し替えを決定的に再現するテスト用フック（`cfg(test)` のみ）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_VALIDATION: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// 次の `open_confined`（同一スレッド）の検証後に一度だけ実行するフックを登録する。
+    pub(super) fn set_after_validation(hook: Hook) {
+        AFTER_VALIDATION.with(|h| *h.borrow_mut() = Some(hook));
+    }
+
+    pub(super) fn run_after_validation() {
+        if let Some(hook) = AFTER_VALIDATION.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+}
+
 /// rustix の errno を `io::Error` へ写す（`std` feature を使わず生の errno 値で変換する）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn errno_to_io(e: rustix::io::Errno) -> io::Error {
@@ -403,6 +445,10 @@ fn open_confined_impl(
             candidate: candidate.to_path_buf(),
         });
     };
+
+    // テスト時だけ、検証（正準化）の後・openat の前に差し替えを挟む（公開 API には現れない）。
+    #[cfg(test)]
+    test_hooks::run_after_validation();
 
     let mut dir = root_fd;
     for name in parents {
@@ -578,6 +624,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 正準化後に残る親ディレクトリ（`stage`）を、検証と openat の間に外部への symlink へ差し替えても
+    /// 外部ファイルは開かれず、Escapes で拒否される（決定的な再現。REQ-39・TASK-39.4-1・#158。
+    /// 証拠種別: テストハーネス。Linux・macOS）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn req39_parent_swapped_between_validation_and_openat_is_rejected() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("stage")).expect("mkdir stage");
+        std::fs::create_dir_all(base.join("outside")).expect("mkdir outside");
+        std::fs::write(ws.join("stage/model.onnx"), b"inside").expect("write inside");
+        std::fs::write(base.join("outside/model.onnx"), b"outside").expect("write outside");
+        let (stage, moved, outside) = (
+            ws.join("stage"),
+            ws.join("stage_real"),
+            base.join("outside"),
+        );
+        test_hooks::set_after_validation(Box::new(move || {
+            std::fs::rename(&stage, &moved).expect("move stage");
+            std::os::unix::fs::symlink(&outside, &stage).expect("symlink stage");
+        }));
+        match open_confined(&ws, Path::new("stage/model.onnx")) {
+            Err(PathRejection::Escapes {
+                kind: EscapeKind::Symlink,
+                ..
+            }) => {}
+            other => panic!("expected Escapes(Symlink), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn dotted_absolute_escape_is_classified_absolute() {
         let base = std::env::temp_dir().join(format!("fandhe-guard-dots-{}", std::process::id()));
@@ -639,6 +717,45 @@ mod tests {
     }
     fn libc_enametoolong() -> i32 {
         if cfg!(target_os = "macos") { 63 } else { 36 }
+    }
+
+    /// errno 別の終了コード写像を表で固定する（REQ-21・REQ-39）。fd 枯渇（EMFILE・ENFILE）などの
+    /// 環境起因は 70、利用者が渡したパスの不正は 64。
+    #[test]
+    fn req21_errno_to_exit_code_table() {
+        let mac = cfg!(target_os = "macos");
+        let table: [(&str, i32, ExitCode); 15] = [
+            ("EPERM", 1, ExitCode::RuntimeError),
+            ("EINTR", 4, ExitCode::RuntimeError),
+            ("EIO", 5, ExitCode::RuntimeError),
+            ("ENOMEM", 12, ExitCode::RuntimeError),
+            ("EACCES", 13, ExitCode::RuntimeError),
+            ("ENFILE", 23, ExitCode::RuntimeError),
+            ("EMFILE", 24, ExitCode::RuntimeError),
+            ("ENOSPC", 28, ExitCode::RuntimeError),
+            ("EAGAIN", if mac { 35 } else { 11 }, ExitCode::RuntimeError),
+            (
+                "ETIMEDOUT",
+                if mac { 60 } else { 110 },
+                ExitCode::RuntimeError,
+            ),
+            ("EDQUOT", if mac { 69 } else { 122 }, ExitCode::RuntimeError),
+            ("ENOENT", 2, ExitCode::InvalidInput),
+            ("ENOTDIR", libc_enotdir(), ExitCode::InvalidInput),
+            ("ELOOP", libc_eloop(), ExitCode::InvalidInput),
+            ("ENAMETOOLONG", libc_enametoolong(), ExitCode::InvalidInput),
+        ];
+        for (name, code, expected) in table {
+            let r = PathRejection::Unresolvable {
+                candidate: PathBuf::from("x"),
+                source: io::Error::from_raw_os_error(code),
+            };
+            assert_eq!(r.exit_code(), expected, "{name} ({code})");
+            let root = PathRejection::RootUnresolvable {
+                source: io::Error::from_raw_os_error(code),
+            };
+            assert_eq!(root.exit_code(), expected, "root {name} ({code})");
+        }
     }
 
     #[test]
