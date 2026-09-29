@@ -10,11 +10,12 @@
 //! - **診断専用**: 結果は合否判定に使わない（TASK-29.1・REQ-29「精度の目安は検討中」）。
 //! - **数え方の規則と正規化を一体で受け取る**: ユニーク数の数え方は [`InputKey`] で
 //!   指定する。[`InputKey::ByteExact`] は `input` のバイト一致、[`InputKey::Normalized`]
-//!   は規則 ID と正規化関数の組で、本モジュールが各 `input` へ関数を適用してから数える。
-//!   結果の `input_key_rule` は実際に使った [`InputKey`] から導出するため、未正規化の
-//!   入力に正規化済みの規則 ID を付けて報告することはできない（issue #107 codex/review
-//!   指摘）。層の境界のため data 層へは依存せず、正規化関数（データ契約層の
-//!   `NfkcWhitespaceNormalizer` 等）は呼び出し側が渡す。
+//!   は [`InputNormalizer`]（規則 ID と処理を 1 実装に束ねた trait）で、本モジュールが
+//!   各 `input` へ適用してから数える。結果の `input_key_rule` は実際に使った実装から
+//!   導出するため、規則 ID と処理を別々に指定して食い違わせることはできない（issue #107
+//!   codex/review 指摘）。層の境界のため data 層へは依存せず、実装は呼び出し側が渡す。
+//! - **資源の上限**: 行数（[`MAX_EVAL_RECORDS`]）に加え、1 行の入力長・入力の総バイト数・
+//!   保持するユニークキーの総バイト数を、正規化・保持の前後で検証する（REQ-39）。
 //! - **本文を保持しない**: 結果・エラーは件数とラベル ID のみを持ち、入力本文を
 //!   複製・転記しない（`.claude/rules/security.md`）。
 //! - 引数は共有参照のみで書き換えない（REQ-27 の評価前後ハッシュ不変と両立）。
@@ -72,32 +73,49 @@ pub struct BasicStats {
 /// [`InputKey::ByteExact`] の規則 ID。
 pub const BYTE_EXACT_RULE: &str = "byte_exact";
 
-/// ユニーク入力数の数え方（規則 ID と、その規則を実際に適用する処理を一体にした型）。
-#[derive(Clone, Copy)]
-pub enum InputKey {
-    /// `input` のバイト一致で数える（正規化しない）。
-    ByteExact,
-    /// 各 `input` へ `normalize` を適用した結果で数える。`rule` は結果へ記録される。
-    Normalized {
-        /// 規則 ID（例: `nfkc_whitespace`。英語）。
-        rule: &'static str,
-        /// 正規化関数（決定的であること）。
-        normalize: fn(&str) -> String,
-    },
+/// 1 行の `input`（正規化前・正規化後とも）の最大バイト数（REQ-39 資源の上限）。
+///
+/// 値はデータ契約層の重複・リーク検査（`fandhe_edge_data::leak::MAX_LEAK_CHECK_INPUT_BYTES`）
+/// と同じ暫定値。層の境界のため data 層へは依存せず本層で持つ。
+pub const MAX_STATS_INPUT_BYTES: usize = 4096;
+
+/// 走査する `input` の総バイト数と、ユニーク入力として保持するキーの総バイト数の上限
+/// （REQ-39。走査・保持の前に検証する。`MAX_EVAL_RECORDS` は行数のみの上限のため別に必要）。
+pub const MAX_STATS_TOTAL_INPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// 正規化規則（規則 ID と、その規則を適用する処理を 1 つの実装に束ねる）。
+///
+/// 規則 ID と処理を呼び出し側が別々に渡せないようにするための trait。実装（データ契約層の
+/// `NfkcWhitespaceNormalizer` に対する薄いアダプター等）が両方を所有する。処理は決定的で
+/// あること。
+pub trait InputNormalizer {
+    /// 規則 ID（英語。結果の `input_key_rule` へ記録される）。
+    fn rule_id(&self) -> &'static str;
+    /// `input` を正規化する。
+    fn normalize(&self, input: &str) -> String;
 }
 
-impl InputKey {
+/// ユニーク入力数の数え方。
+#[derive(Clone, Copy)]
+pub enum InputKey<'n> {
+    /// `input` のバイト一致で数える（正規化しない）。
+    ByteExact,
+    /// 各 `input` へ正規化を適用した結果で数える。規則 ID は正規化実装自身から導出する。
+    Normalized(&'n dyn InputNormalizer),
+}
+
+impl InputKey<'_> {
     fn rule(&self) -> &'static str {
         match self {
             InputKey::ByteExact => BYTE_EXACT_RULE,
-            InputKey::Normalized { rule, .. } => rule,
+            InputKey::Normalized(n) => n.rule_id(),
         }
     }
 
     fn key<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match self {
             InputKey::ByteExact => Cow::Borrowed(input),
-            InputKey::Normalized { normalize, .. } => Cow::Owned(normalize(input)),
+            InputKey::Normalized(n) => Cow::Owned(n.normalize(input)),
         }
     }
 }
@@ -114,6 +132,19 @@ pub enum DiagnosticsError {
     TooManyRows {
         /// 渡された行数。
         n_rows: usize,
+        /// 上限。
+        limit: usize,
+    },
+    /// `input` が [`MAX_STATS_INPUT_BYTES`] を超える（正規化前後のいずれか。REQ-39）。
+    InputTooLong {
+        /// 行位置。
+        index: usize,
+        /// 上限。
+        limit: usize,
+    },
+    /// `input` の総バイト数、または保持するユニーク入力キーの総バイト数が
+    /// [`MAX_STATS_TOTAL_INPUT_BYTES`] を超える（REQ-39）。
+    TotalInputTooLarge {
         /// 上限。
         limit: usize,
     },
@@ -136,6 +167,15 @@ impl fmt::Display for DiagnosticsError {
             DiagnosticsError::EmptyRows => write!(f, "rows must not be empty"),
             DiagnosticsError::TooManyRows { n_rows, limit } => {
                 write!(f, "too many rows: {n_rows} (limit: {limit})")
+            }
+            DiagnosticsError::InputTooLong { index, limit } => {
+                write!(
+                    f,
+                    "input too long at row index {index} (limit: {limit} bytes)"
+                )
+            }
+            DiagnosticsError::TotalInputTooLarge { limit } => {
+                write!(f, "total input size exceeds limit ({limit} bytes)")
             }
             DiagnosticsError::UnknownLabel { index } => {
                 write!(f, "unknown label at row index {index}")
@@ -162,7 +202,7 @@ fn internal(detail: &str) -> DiagnosticsError {
 pub fn basic_stats(
     labels: &[&str],
     rows: &[StatsRow<'_>],
-    input_key: InputKey,
+    input_key: InputKey<'_>,
 ) -> Result<BasicStats, DiagnosticsError> {
     if rows.len() > MAX_EVAL_RECORDS {
         return Err(DiagnosticsError::TooManyRows {
@@ -175,8 +215,26 @@ pub fn basic_stats(
         return Err(DiagnosticsError::EmptyRows);
     }
 
+    // 正規化・保持の前に、生の入力長と総バイト数を検証する（REQ-39）。
+    let mut raw_total: usize = 0;
+    for (i, row) in rows.iter().enumerate() {
+        if row.input.len() > MAX_STATS_INPUT_BYTES {
+            return Err(DiagnosticsError::InputTooLong {
+                index: i,
+                limit: MAX_STATS_INPUT_BYTES,
+            });
+        }
+        raw_total = raw_total
+            .checked_add(row.input.len())
+            .filter(|&t| t <= MAX_STATS_TOTAL_INPUT_BYTES)
+            .ok_or(DiagnosticsError::TotalInputTooLarge {
+                limit: MAX_STATS_TOTAL_INPUT_BYTES,
+            })?;
+    }
+
     let mut counts: Vec<u64> = vec![0; labels.len()];
     let mut inputs: BTreeSet<Cow<'_, str>> = BTreeSet::new();
+    let mut retained_bytes: usize = 0;
     for (i, row) in rows.iter().enumerate() {
         let &pos = index
             .get(row.label)
@@ -187,7 +245,22 @@ pub fn basic_stats(
         *slot = slot
             .checked_add(1)
             .ok_or_else(|| internal("count overflow while tallying labels"))?;
-        inputs.insert(input_key.key(row.input));
+        let key = input_key.key(row.input);
+        if key.len() > MAX_STATS_INPUT_BYTES {
+            return Err(DiagnosticsError::InputTooLong {
+                index: i,
+                limit: MAX_STATS_INPUT_BYTES,
+            });
+        }
+        let key_len = key.len();
+        if inputs.insert(key) {
+            retained_bytes = retained_bytes
+                .checked_add(key_len)
+                .filter(|&t| t <= MAX_STATS_TOTAL_INPUT_BYTES)
+                .ok_or(DiagnosticsError::TotalInputTooLarge {
+                    limit: MAX_STATS_TOTAL_INPUT_BYTES,
+                })?;
+        }
     }
 
     let min_label_count = *counts
@@ -258,11 +331,16 @@ mod tests {
         ];
         let exact = basic_stats(&["A"], &rows, InputKey::ByteExact).unwrap();
         assert_eq!(exact.unique_inputs, 2);
-        let key = InputKey::Normalized {
-            rule: "nfkc_whitespace",
-            normalize: squash,
-        };
-        let s = basic_stats(&["A"], &rows, key).unwrap();
+        struct Squash;
+        impl InputNormalizer for Squash {
+            fn rule_id(&self) -> &'static str {
+                "nfkc_whitespace"
+            }
+            fn normalize(&self, input: &str) -> String {
+                squash(input)
+            }
+        }
+        let s = basic_stats(&["A"], &rows, InputKey::Normalized(&Squash)).unwrap();
         assert_eq!(s.unique_inputs, 1);
         assert_eq!(s.input_key_rule, "nfkc_whitespace");
     }
