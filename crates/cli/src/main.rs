@@ -1,25 +1,37 @@
-//! 操作アダプター層の CLI（`fandhe-edge` バイナリ）。
+//! `fandhe-edge` バイナリの入口（薄い配線のみ。REQ-33・TASK-33.1-1）。
 //!
-//! 最終的には `register → inspect → train → evaluate → select → package → infer`
-//! の 7 工程（REQ-33）を TASK-33.1 で実装し、stdout の JSON 出力・stderr・
-//! 終了コードの入出力契約を TASK-33.2 で確定させる。TUI・MCP / Codex 連携
-//! （REQ-35〜37）もここで確定する契約を再利用する想定で、CLI 以外の口に
-//! 別の契約を作らない。
+//! `args_os()`（非 UTF-8 でも panic しない）を [`fandhe_edge_cli::args::parse`]
+//! に渡し、結果で分岐する。ロジックはすべて lib 側に置く。
 //!
-//! 現状は TASK-15.2 の crate 雛形であり、どの引数を渡しても工程は一切実行
-//! しない（実装済みを装わない）。crate 構成は PoC-16
-//! （`core-cli-vertical-slice`）の lib/bin 分離を踏襲しつつ、共通コアと
-//! アダプターを別 crate に分けている（`.claude/rules/coding-rust.md`「アダ
-//! プターは薄く保ち、業務ロジックは下位層に置く」）。業務ロジックは
-//! `fandhe-edge-core` 側に置き、本 crate には持ち込まない。
+//! - help: 「1 呼び出し 1 JSON」契約（REQ-33）を守るため、確定済みの
+//!   `ErrorReport` の形（`{"code":"ok","message":"<help テキスト>"}`）を
+//!   stdout に JSON 1 行で出し exit 0。help 用の新スキーマ・フィールドは
+//!   作らない（stderr は使わない）。
+//! - 引数エラー: TASK-21.2 で確定済みの `ErrorReport` を stdout に JSON 1 行、
+//!   exit 64（フィールドは増やさない）。
+//! - 解析に成功したコマンド: 下位層への接続は TASK-33.1-2（#136）の範囲の
+//!   ため、完走を装わず `runtime_error`（exit 70）で未実装を返す。
 
-use fandhe_edge_core::exitcode::ExitCode;
+use fandhe_edge_cli::args::{self, Invocation};
+use fandhe_edge_cli::output::write_error_report;
+use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 
 fn main() -> std::process::ExitCode {
-    // 引数は読まない（工程を一切実行しないため std::env::args を使わない）。
-    // stdout は空のまま終える。CLI の出力契約（1 呼び出しにつき JSON 1 つ。
-    // TASK-33.2）をここで先取りしないためで、stdout に何か出すこと自体が
-    // 契約の先取りになる。
-    eprintln!("fandhe-edge: not implemented yet (TASK-33.1)");
-    ExitCode::RuntimeError.into()
+    let report = match args::parse(std::env::args_os().skip(1)) {
+        Ok(Invocation::Help(topic)) => ErrorReport::new(ExitCode::Ok, args::render_help(topic)),
+        Ok(Invocation::Run(_)) => {
+            // TASK-33.1-2（#136）で各工程を下位層へ接続して置き換える。
+            eprintln!("fandhe-edge: stage execution is not implemented yet (TASK-33.1-2)");
+            ErrorReport::new(
+                ExitCode::RuntimeError,
+                "stage not implemented yet (TASK-33.1-2)",
+            )
+        }
+        Err(e) => args::args_error_report(&e),
+    };
+    // 書き込み失敗時は追記・リトライせず runtime_error とする（output.rs の方針）。
+    match write_error_report(&mut std::io::stdout().lock(), &report) {
+        Ok(code) => code.into(),
+        Err(_) => ExitCode::RuntimeError.into(),
+    }
 }
