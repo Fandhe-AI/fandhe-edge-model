@@ -8,7 +8,10 @@ kind ごとの予測処理を 1 箇所で振り分け、kind の追加時に変�
 
 - `c1`・`c3`: 学習時の順伝播（`TfidfLogReg.__call__`・`ByteCNN.__call__`）の
   argmax（`kinds/c1.py::predict_labels`・`kinds/c3.py::predict_labels`）
-- `autoregressive`: 既存の `predict_records`（対応づけ (b)）から `scores` を除く
+- `autoregressive`: 既存の `predict_records`（対応づけ (b)）から `scores` を除く。
+  対応づけに失敗したレコードは `status:"error"`（判定不能を含む。REQ-19b・
+  TASK-19b.2）とし、全件を消費した後に理由別の件数だけを stderr へ 1 行報告する
+  （id・入力本文は出さない。c1・c3 は分類器の argmax で対応づけ失敗が起きない）
 
 **推論関数へ渡すのは `(id, input)` だけ**（REQ-27。正解ラベル・分割情報を
 受け取らない）。予測時間もジョブ全体の `resource_budget`（学習の壁時計上限）の
@@ -17,6 +20,7 @@ kind ごとの予測処理を 1 箇所で振り分け、kind の追加時に変�
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
 from typing import Any
 
@@ -54,12 +58,17 @@ def predict_validation(
     """
     require_validation_prediction_support(kind)
     if kind == "autoregressive":
-        from .kinds.autoregressive import predict_records
+        from .kinds.autoregressive import ChoiceMappingTally, predict_records
 
-        return [
+        tally = ChoiceMappingTally()
+        records = [
             {key: record[key] for key in PREDICTION_FIELDS}
-            for record in predict_records(trained, rows, resource_budget=resource_budget)
+            for record in predict_records(
+                trained, rows, resource_budget=resource_budget, tally=tally
+            )
         ]
+        print(tally.to_log_line(), file=sys.stderr)
+        return records
     if kind == "c1":
         from .kinds.c1 import predict_labels as predict_c1
 
