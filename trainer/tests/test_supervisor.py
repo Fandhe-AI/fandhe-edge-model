@@ -930,6 +930,10 @@ if mode == "hang":
     with open(os.path.join(ctl, "ready"), "w") as f:
         f.write("1")
     time.sleep(120)
+elif mode == "fwd":
+    print(json.dumps({"status": "error", "code": "runtime_error",
+                      "message": "training cancelled by caller"}))
+    sys.exit(70)
 else:
     onnx = b"onnx-bytes"
     put("model.onnx", onnx)
@@ -1486,3 +1490,30 @@ def test_req39_deadline_expiry_with_unknown_status_is_time_not_monitor_failure(
         assert reason == "time"
     finally:
         _reap(proc)
+
+
+def test_req34_forwarded_worker_error_is_not_a_cancel_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34・#145 回帰: worker が予約済みのキャンセル応答文言を含むエラーを返しても、
+    supervisor はそのまま転送せず別文言に置き換える（Rust 側が supervisor 自身の
+    応答と取り違えない）。終了コード 70・`runtime_error` は変えない。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "fwd")
+    code = supervisor.run_supervised_train(request_path)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert code == ExitCode.RUNTIME_ERROR
+    assert payload == {
+        "status": "error",
+        "code": "runtime_error",
+        "message": "worker reported an error",
+    }
+    assert not out_dir.exists()
+
+
+def test_req34_forward_worker_error_keeps_other_messages() -> None:
+    """予約文言以外のエラーはそのまま転送する。"""
+    p = {"status": "error", "code": "invalid_request", "message": "bad field"}
+    assert supervisor._forward_worker_error(p) == p
+    for m in ("training cancelled by caller", "training cancelled but cleanup incomplete"):
+        q = {"status": "error", "code": "runtime_error", "message": m}
+        assert supervisor._forward_worker_error(q)["message"] == "worker reported an error"

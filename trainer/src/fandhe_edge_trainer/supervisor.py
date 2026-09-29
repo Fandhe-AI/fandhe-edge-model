@@ -232,6 +232,25 @@ _LAUNCH_SCRIPT = Path(__file__).resolve().parent.parent.parent / "launch.py"
 _VALID_EXIT_CODES = {int(code) for code in ExitCode}
 
 
+#: 協調キャンセルの応答文（`crates/train/src/process.rs` の `CANCEL_ACK_MESSAGE`・
+#: `CANCEL_CLEANUP_INCOMPLETE_MESSAGE` と両側で一致させる。REQ-34・#145）。
+_CANCEL_ACK_MESSAGE = "training cancelled by caller"
+_CANCEL_CLEANUP_INCOMPLETE_MESSAGE = "training cancelled but cleanup incomplete"
+_RESERVED_MESSAGES = frozenset({_CANCEL_ACK_MESSAGE, _CANCEL_CLEANUP_INCOMPLETE_MESSAGE})
+
+
+def _forward_worker_error(payload: dict[str, Any]) -> dict[str, Any]:
+    """worker が返したエラー JSON を転送用に整える。
+
+    キャンセル応答の予約文言と一致する `message` は、supervisor 自身の応答と
+    取り違えられないよう固定の別文言へ置き換える（フィールドの追加・意味の変更は
+    しない。JSON 契約は不変）。REQ-34・#145。
+    """
+    if payload.get("message") in _RESERVED_MESSAGES:
+        return {**payload, "message": "worker reported an error"}
+    return payload
+
+
 def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
@@ -644,9 +663,7 @@ def _report_cancelled(reservation: contract.OutDirReservation) -> ExitCode:
     # 解放を確認できない場合は所定の協調キャンセル応答（Rust 側 `is_cancel_ack`）を
     # 出さない。別メッセージにより呼び出し側は Unconfirmed（残置あり）として扱う
     # （REQ-34「協調キャンセルでは公開場所に何も残らない」・#145）。
-    message = (
-        "training cancelled by caller" if released else "training cancelled but cleanup incomplete"
-    )
+    message = _CANCEL_ACK_MESSAGE if released else _CANCEL_CLEANUP_INCOMPLETE_MESSAGE
     _emit({"status": "error", "code": "runtime_error", "message": message})
     return ExitCode.RUNTIME_ERROR
 
@@ -753,9 +770,7 @@ def run_supervised_train(
     # （起動処理が Rust 側の猶予を超えて SIGKILL され予約が残るのを防ぐ。REQ-34・#145）。
     if _is_cancelled(cancel_event):
         request.out_dir.close()
-        _emit(
-            {"status": "error", "code": "runtime_error", "message": "training cancelled by caller"}
-        )
+        _emit({"status": "error", "code": "runtime_error", "message": _CANCEL_ACK_MESSAGE})
         return ExitCode.RUNTIME_ERROR
 
     try:
@@ -1044,7 +1059,7 @@ def _monitor_worker_and_finalize(
         # ワーカー自身が 7 種のいずれかのエラーで終了した（例: invalid_config）。
         # 出力は確定させず、予約を解放してからそのままエラーを伝える。
         contract.cleanup_reservation(reservation)
-        _emit(payload)
+        _emit(_forward_worker_error(payload))
         return ExitCode(returncode)
 
     # P0: 確定（rename）の直前に、保持し続けている tmp_fd（名前を再解決しない）

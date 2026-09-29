@@ -1676,9 +1676,20 @@ fn conclude_run(
         Ok(run) if !cancel_signalled || matches!(run.outcome, TrainOutcome::Ok(_)) => {
             Ok(TrainRunEnd::Completed(run))
         }
-        Ok(run) if is_cancel_ack(&run) => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
-            started.elapsed(),
-        ))),
+        // 応答の文面だけでは supervisor 自身の応答と、worker が転送したエラー JSON を
+        // 区別できない（JSON 契約は変えない）。そのため文面が一致しても、公開場所に
+        // 何も残っていない（`Absent`）ことを観測できたときだけ `Cooperative` とする。
+        // 残置があれば通常の `Unconfirmed` 経路（公開済み・判定不能ならエラー）へ回す
+        // （fail-closed。REQ-34・#145）。
+        Ok(run) if is_cancel_ack(&run) => {
+            if inspect_out_dir_residue(request) == OutDirResidue::Absent {
+                Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
+                    started.elapsed(),
+                )))
+            } else {
+                unconfirmed()
+            }
+        }
         // supervisor が予約の解放を確認できなかった旨の報告は、通常の失敗として
         // 隠さず `Unconfirmed` 経路で残置を観測する（公開済み・判定不能なら
         // `CancelOutcomeUnconfirmed`。REQ-34・#145）。
@@ -2595,6 +2606,70 @@ mod tests {
             }
             _ => panic!("expected Completed(Error)"),
         }
+    }
+
+    /// REQ-34・#145 回帰: 文面がキャンセル応答と一致する転送された worker エラーでも、
+    /// 予約が残っていれば `Cooperative` としない（空の予約が残る場合は `Unconfirmed`、
+    /// 中身がある場合は `CancelOutcomeUnconfirmed`）。残置が無ければ従来どおり
+    /// `Cooperative`（本物の応答）。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_does_not_trust_ack_lookalike_when_reservation_remains() {
+        let root = std::env::temp_dir().join(format!("fandhe-ack-fwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+        );
+        let make_run = || {
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            }
+        };
+        // 残置なし: 本物の応答として Cooperative。
+        assert!(matches!(
+            conclude_run(Ok(make_run()), true, Instant::now(), &request),
+            Ok(TrainRunEnd::Cancelled(run)) if run.stop() == CancelStop::Cooperative
+        ));
+        // 空の予約が残る: Cooperative ではなく Unconfirmed（残置を報告）。
+        std::fs::create_dir(root.join("out")).expect("create out");
+        match conclude_run(Ok(make_run()), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Unconfirmed);
+                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::EmptyReservation));
+            }
+            _ => panic!("expected Cancelled(Unconfirmed)"),
+        }
+        // 中身が残る: 公開済みの可能性があるため Cancelled としない。
+        std::fs::write(root.join("out").join("model.onnx"), b"x").expect("write");
+        assert!(matches!(
+            conclude_run(Ok(make_run()), true, Instant::now(), &request),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::NonEmpty
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// REQ-34・#145: supervisor が予約の解放を確認できなかった旨（固定メッセージ）を
