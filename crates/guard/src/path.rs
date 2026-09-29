@@ -83,17 +83,23 @@ pub enum PathRejection {
     },
 }
 
-/// `NotFound`・`InvalidInput`（NUL 等の不正なパス）は入力不正、それ以外は実行時エラー。
+/// 権限・資源・中断など環境起因の失敗だけを実行時エラー（70）とし、それ以外は
+/// 利用者が渡したパスの不正（存在しない・ファイル配下を辿る・symlink ループ・
+/// 名前の長すぎ等。`NotFound`・`NotADirectory`・`FilesystemLoop`・`InvalidFilename`・
+/// `InvalidInput` ほか）として入力不正（64）に写す（REQ-21）。
 fn io_exit_code(source: &io::Error) -> ExitCode {
     match source.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => ExitCode::InvalidInput,
-        _ => ExitCode::RuntimeError,
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::OutOfMemory
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::Interrupted => ExitCode::RuntimeError,
+        _ => ExitCode::InvalidInput,
     }
 }
 
 impl PathRejection {
     /// 終了コード（REQ-21）。閉じ込め違反・空パス・存在しない対象は `InvalidInput`、
-    /// 権限等の想定外の I/O 失敗は `RuntimeError`。
+    /// 権限・資源等の環境起因の I/O 失敗のみ `RuntimeError`（他の I/O 失敗は入力不正）。
     pub fn exit_code(&self) -> ExitCode {
         match self {
             PathRejection::EmptyPath
@@ -250,6 +256,17 @@ mod tests {
         assert!(lexically_escapes(Path::new("a/../../b")));
     }
 
+    // libc 依存を増やさないため Linux / macOS の errno 値を直接持つ。
+    fn libc_enotdir() -> i32 {
+        20
+    }
+    fn libc_eloop() -> i32 {
+        if cfg!(target_os = "macos") { 62 } else { 40 }
+    }
+    fn libc_enametoolong() -> i32 {
+        if cfg!(target_os = "macos") { 63 } else { 36 }
+    }
+
     #[test]
     fn reason_and_exit_codes_are_concrete() {
         let esc = PathRejection::Escapes {
@@ -269,6 +286,14 @@ mod tests {
         };
         assert_eq!(denied.exit_code(), ExitCode::RuntimeError);
         assert_eq!(denied.reason_code(), "path_unresolvable");
+        // 利用者入力起因の I/O エラー（ENOTDIR・ELOOP・ENAMETOOLONG 相当）は 64。
+        for code in [libc_enotdir(), libc_eloop(), libc_enametoolong()] {
+            let r = PathRejection::Unresolvable {
+                candidate: PathBuf::from("x"),
+                source: io::Error::from_raw_os_error(code),
+            };
+            assert_eq!(r.exit_code(), ExitCode::InvalidInput, "os error {code}");
+        }
         assert_eq!(EscapeKind::Symlink.name(), "symlink");
         assert_eq!(EscapeKind::Absolute.name(), "absolute");
     }
