@@ -37,6 +37,11 @@ fandhe-edge-data.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+# workspace 内の path 依存のみ（外部 crate の追加ではない）。ガード層の既定 kind 集合と
+# 共有 fixture のキー集合の同期照合に使う（REQ-39・#155）。guard は train に依存しない。
+fandhe-edge-guard.workspace = true
+
 [lints]
 workspace = true
 

@@ -11,10 +11,11 @@
 //!   （TASK-39.2-2・#154）。実装済み
 //! - [`path`]: 経路の閉じ込め（`safe_join` 相当・検証と open を一体化した `open_confined`。TASK-39.4-1・#158）。実装済み。
 //!   CLI 引数への組み込みは TASK-39.4-2（#159）で未着手
-//! - 未着手（後続 TASK）: `kind` の許可リスト
-//!   （TASK-39.2-3・#155）・CLI への統合（TASK-39.2-4・#156）・資源の上限（TASK-39.5）・
-//!   完全性と版（TASK-39.6）
+//! - [`kind`]: `kind` 値の許可リスト判定（TASK-39.2-3・#155）。実装済み。CLI への統合は #156 で未着手
+//! - 未着手（後続 TASK）: CLI への統合（TASK-39.2-4・#156）・資源の上限（TASK-39.5）・
+//!   完全性と版（`kind_version` の許可リストを含む。TASK-39.6）
 
 pub mod format;
+pub mod kind;
 pub mod model_file;
 pub mod path;
