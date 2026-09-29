@@ -81,11 +81,32 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    不一致・欠落は予約を解放して確定させない）、一致すれば
    `contract.finalize_out_dir` で確定させたうえで、そのまま出力する。
 
-Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパーバイザー」の役割を
-担う計画であり、本モジュールは Rust 側が無い・本ワーカーが単独プロセスとして
-起動される場合の防御として存在する。本モジュール自身が SIGKILL 等で道連れに
-終了した場合の後始末は、本モジュールの責務ではなく Rust 側ジョブ管理
-（TASK-34.x）に委ねる。
+**協調キャンセルと責務分担（REQ-34・TASK-34.1-2・issue #145）**: Rust 側
+ジョブ管理（`crates/train/src/process.rs`）は `train --cancel-on-stdin-eof` で
+本プロセスを `stdin` パイプ付きで起動し、キャンセル時にその書き込み端を閉じる
+（EOF）。本プロセスは EOF を `cli.py::_start_cancel_watch` の daemon スレッドで
+検知して `cancel_event` を立て、`monitor_child` が `_terminate_and_reap`
+（`killpg` → 回収）で worker を止めたうえで、保持中の fd だけで予約を解放する
+（`cleanup_reservation`。名前は再解決しない）。
+
+- 予約・確定・解放（`out_dir` の所有権）: 本モジュールのみ
+- キャンセル要求の伝達（stdin を閉じる）・猶予の管理・猶予超過時の `SIGKILL`:
+  Rust 側 `process.rs`
+- `Completed`／`Cancelled` の最終判定: Rust 側 `process.rs`（本プロセスの
+  終了状態と結果 JSON に従う）
+- **公開されている ⇔ 本プロセスが exit 0 と ok JSON を返した**: 確定
+  （`finalize_out_dir`）の直前までキャンセルを確認し、確定した後に届いた
+  キャンセルは無視して成功を報告する。これで「公開済みなのに `Cancelled`」
+  「未公開なのに成功」が起きない
+- Rust 側の猶予内に本プロセスが終了しなければ Rust が `SIGKILL` する
+  （フォールバック）。この場合だけ、後始末が走らず空の予約済み `out_dir`・
+  tmp が残りうる（安全側の残置。Rust は削除せず読み取り専用で検査して報告
+  するだけで、やり直し時の案内・掃除は TASK-34.3）
+- 協調キャンセル時の終了コード（exit 70・`runtime_error`）は暫定で、Rust 側は
+  依存しない。キャンセルの写像は TASK-33.x で決める
+
+`--cancel-on-stdin-eof` が無い単独起動では標準入力を監視しない
+（`cancel_event` は `None`）。
 
 **lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕からの全面移行）**:
@@ -351,6 +372,7 @@ def monitor_child(
     rss_limit_bytes: int,
     poll_interval: float = _POLL_INTERVAL_SECONDS,
     grace_seconds: float = _TIME_LIMIT_GRACE_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> str | None:
     """`proc` を監視する。正常終了したら `None` を返す。
 
@@ -396,6 +418,11 @@ def monitor_child(
     `_monitor_worker_and_finalize` はこれを他の強制終了理由と同様に
     予約解放のみ〔確定しない〕の経路へ流す。REQ-39）。`killpg` → 回収
     （`_terminate_and_reap`）の順序はこの分岐でも変わらず守る。
+
+    **協調キャンセル**（REQ-34・TASK-34.1-2・#145）: `cancel_event` が立って
+    いたら `_terminate_and_reap` で worker を止めて `"cancelled"` を返す
+    （回収経路を増やさない）。ゾンビを検知した時点でキャンセル済みなら
+    `"cancelled"` を優先し、既に終了した worker の成果物を確定しに行かない。
     """
     cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
@@ -422,14 +449,42 @@ def monitor_child(
                 _terminate_and_reap(proc)
                 return "time"
             _terminate_and_reap(proc)
+            if _is_cancelled(cancel_event):
+                return "cancelled"
             return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         if time.monotonic() > deadline:
             _terminate_and_reap(proc)
             return "time"
+        if _is_cancelled(cancel_event):
+            _terminate_and_reap(proc)
+            return "cancelled"
         if rss > rss_limit_bytes:
             _terminate_and_reap(proc)
             return "rss"
         time.sleep(poll_interval)
+
+
+def _is_cancelled(cancel_event: threading.Event | None) -> bool:
+    """協調キャンセルが要求されたか（`None` は常に `False`）。"""
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _report_cancelled(reservation: contract.OutDirReservation) -> ExitCode:
+    """キャンセルされたジョブの予約を解放し、エラー JSON を出力する。
+
+    メッセージは固定の英語文字列（データ本文・パスを含めない）。`code` は既存の
+    語彙（`runtime_error`）だけを使い、終了コードの 70 は暫定値で Rust 側は
+    これに依存しない（キャンセルの写像は TASK-33.x。REQ-21・REQ-34）。
+    """
+    contract.cleanup_reservation(reservation)
+    _emit(
+        {
+            "status": "error",
+            "code": "runtime_error",
+            "message": "training cancelled by caller",
+        }
+    )
+    return ExitCode.RUNTIME_ERROR
 
 
 def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDOUT_BYTES) -> None:
@@ -493,9 +548,15 @@ def _parse_worker_stdout(raw: bytes) -> dict[str, Any] | None:
     return payload
 
 
-def run_supervised_train(request_path: Path) -> ExitCode:
+def run_supervised_train(
+    request_path: Path, *, cancel_event: threading.Event | None = None
+) -> ExitCode:
     """`train` サブコマンドの本体。`out_dir` を予約したうえで `_worker` を
     子プロセスとして起動・監視し、結果に応じて確定または解放する。
+
+    `cancel_event` は協調キャンセル（モジュール docstring 参照）で、
+    `cli.py::_start_cancel_watch` が標準入力の EOF で立てる。`None` なら
+    キャンセルを受け付けない。
     """
     try:
         # リクエストファイルはここで 1 回だけ読む。パース前の生バイト列
@@ -532,6 +593,7 @@ def run_supervised_train(request_path: Path) -> ExitCode:
             time_limit_seconds=float(time_limit_seconds),
             rss_limit_bytes=rss_limit_bytes,
             stdout_cap=stdout_cap,
+            cancel_event=cancel_event,
         )
     finally:
         reservation.entry.close()  # request.out_dir と同一オブジェクト
@@ -570,6 +632,7 @@ def _spawn_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
     stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> ExitCode:
     # lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
     # 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕は PID
@@ -669,6 +732,7 @@ def _spawn_worker_and_finalize(
             time_limit_seconds=time_limit_seconds,
             rss_limit_bytes=rss_limit_bytes,
             stdout_cap=stdout_cap,
+            cancel_event=cancel_event,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -682,6 +746,7 @@ def _monitor_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
     stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> ExitCode:
     """`_spawn_worker_and_finalize` が起動した `proc`（`_worker`）を監視し、
     結果に応じて `out_dir` の予約を確定または解放する（分離した理由:
@@ -697,7 +762,10 @@ def _monitor_worker_and_finalize(
     reader_thread.start()
 
     killed_reason = monitor_child(
-        proc, time_limit_seconds=time_limit_seconds, rss_limit_bytes=rss_limit_bytes
+        proc,
+        time_limit_seconds=time_limit_seconds,
+        rss_limit_bytes=rss_limit_bytes,
+        cancel_event=cancel_event,
     )
 
     reader_thread.join(timeout=10)
@@ -710,6 +778,11 @@ def _monitor_worker_and_finalize(
     if proc.stdout is not None:
         with contextlib.suppress(OSError):
             proc.stdout.close()
+
+    if killed_reason == "cancelled":
+        # 協調キャンセル: worker は `monitor_child` が `killpg` → 回収済み。
+        # 保持中の fd で予約を解放し、確定へ進まない（REQ-34）。
+        return _report_cancelled(reservation)
 
     if killed_reason is not None:
         contract.cleanup_reservation(reservation)
@@ -789,12 +862,20 @@ def _monitor_worker_and_finalize(
     # に対して model.onnx の SHA-256 が artifact.json の記録と一致するかを
     # 確認する（AGENTS.md ガード層「完全性と版」・REQ-39。artifact.py の
     # モジュール docstring 参照）。不一致・欠落は出力を確定させない。
+    if _is_cancelled(cancel_event):
+        return _report_cancelled(reservation)
+
     try:
         artifact_mod.verify_output(reservation.tmp_fd)
     except WorkerError as e:
         contract.cleanup_reservation(reservation)
         _emit({"status": "error", "code": e.code, "message": e.message})
         return e.exit_code
+
+    # 確定の直前の最後のキャンセル確認。`finalize_out_dir`（rename）が成功した
+    # 後はキャンセルを見ず、公開と成功報告を一致させる（モジュール docstring）。
+    if _is_cancelled(cancel_event):
+        return _report_cancelled(reservation)
 
     try:
         contract.finalize_out_dir(reservation)

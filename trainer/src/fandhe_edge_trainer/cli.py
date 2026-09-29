@@ -2,7 +2,8 @@
 
 Rust 側 CLI（`docs/spec/03-poc/core-cli-vertical-slice/core/src/subprocess.rs`
 `run_logged` 相当。本実装では TASK-34.x のジョブ管理から呼ばれる）が子プロセスとして
-`<venv の python> -I trainer/launch.py train --request <path>` を起動する契約
+`<venv の python> -I trainer/launch.py train --request <path> [--cancel-on-stdin-eof]`
+を起動する契約
 （Issue #12。`trainer/launch.py` のモジュール docstring 参照。`trainer/` は
 `package = false` のため `python -m fandhe_edge_trainer ...` は呼び出し元が
 `PYTHONPATH` を自前で設定しない限り解決できない。`-m fandhe_edge_trainer` 形式は
@@ -177,6 +178,59 @@ def _start_lifeline_thread(lifeline_fd: int) -> None:
     ).start()
 
 
+def _cancel_watch_loop(event: threading.Event) -> None:
+    """キャンセル用チャネル（標準入力のパイプ）の監視ループ本体
+    （`_start_cancel_watch` から切り出したもの）。
+
+    標準入力を 1 バイト block read し、EOF・何らかのバイトの到着・`OSError` の
+    いずれでも `event` を立てて終わる（fail-closed: チャネルの状態を確認
+    できなくなった場合もキャンセルとして扱い、途中成果物を確定させない）。
+    内容は解釈しない（データを読み込まない。REQ-39）。
+    """
+    try:
+        os.read(0, 1)
+    except OSError:
+        pass
+    finally:
+        event.set()
+
+
+def _start_cancel_watch() -> threading.Event:
+    """`train --cancel-on-stdin-eof` のキャンセル監視を開始し、キャンセルを
+    表す `threading.Event` を返す（REQ-34・TASK-34.1-2・issue #145）。
+
+    Rust 側ジョブ管理（`crates/train/src/process.rs`）は supervisor を
+    `stdin` パイプ付きで起動して書き込み端を握り続け、キャンセル時にそれを
+    閉じる。supervisor は EOF を受けて自ら worker を止め、保持中の fd で
+    予約を解放する（`supervisor.py` モジュール docstring「協調キャンセル」節）。
+    Rust の親プロセスが落ちた場合もカーネルが書き込み端を閉じるため、同じ
+    経路で後始末される（lifeline の逆方向）。
+
+    **標準入力がパイプであることを `out_dir` の予約より前に検査する**
+    （`/dev/null` や通常ファイルだと即座に EOF となり、起動直後に自己
+    キャンセルしてしまう。`_start_lifeline_thread` の fd 検証と同じ fail-closed）。
+    満たさなければ `WorkerError`（`invalid_request`・exit 64）を送出し、
+    子プロセスも予約も作らない。
+    """
+    try:
+        st = os.fstat(0)
+    except OSError as e:
+        raise WorkerError(
+            "invalid_request",
+            f"cancel channel (stdin) not stat-able: {type(e).__name__}",
+            ExitCode.INVALID_INPUT,
+        ) from e
+    if not stat.S_ISFIFO(st.st_mode):
+        raise WorkerError(
+            "invalid_request", "cancel channel (stdin) must be a pipe", ExitCode.INVALID_INPUT
+        )
+    event = threading.Event()
+    threading.Thread(
+        target=_cancel_watch_loop, args=(event,), name="cancel-watch", daemon=True
+    ).start()
+    return event
+
+
 def _read_request_from_stdin() -> bytes:
     """標準入力からリクエストの生バイト列を読む（P1。`_worker` 専用）。
 
@@ -333,6 +387,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     p_train = sub.add_parser("train", add_help=False, exit_on_error=False)
     p_train.add_argument("--request", required=True)
+    # opt-in の協調キャンセル（REQ-34・TASK-34.1-2・#145。`_start_cancel_watch`
+    # 参照）。無い場合は標準入力を見ず、単独起動の挙動は変えない。
+    p_train.add_argument("--cancel-on-stdin-eof", action="store_true")
     # `_worker`: 公開契約ではない内部サブコマンド（P0-2 のモジュール docstring参照）。
     # `train`（supervisor.py）が子プロセスとして起動する実体。`--out-fd` は
     # スーパーバイザーが `pass_fds` で引き継いだ、出力用一時ディレクトリの fd 番号
@@ -352,7 +409,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         if args.command == "train":
-            exit_code = supervisor_mod.run_supervised_train(Path(args.request))
+            cancel_event = _start_cancel_watch() if args.cancel_on_stdin_eof else None
+            exit_code = supervisor_mod.run_supervised_train(
+                Path(args.request), cancel_event=cancel_event
+            )
         elif args.command == "_worker":
             _start_lifeline_thread(args.lifeline_fd)
             exit_code = run_worker_train(args.out_fd)

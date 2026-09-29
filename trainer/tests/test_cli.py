@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -572,3 +573,124 @@ def test_req27_cli_rejects_gold_label_in_validation_inputs(tmp_path: Path) -> No
     payload = json.loads(result.stdout.strip())
     assert payload["code"] == "invalid_request"
     assert not (tmp_path / "out").exists()
+
+
+# --------------------------------------------------------------------------
+# 協調キャンセル `--cancel-on-stdin-eof`（REQ-34・TASK-34.1-2・issue #145）
+# --------------------------------------------------------------------------
+
+
+def _write_cancel_request(tmp_path: Path, config: dict) -> Path:
+    _write_train_data(tmp_path / "train.jsonl")
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": config,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    return request_path
+
+
+def test_req34_cancel_flag_rejects_non_pipe_stdin_before_reserving_out_dir(
+    tmp_path: Path,
+) -> None:
+    """REQ-34・REQ-39: フラグ付きで標準入力がパイプでなければ（通常ファイルは
+    即 EOF になり自己キャンセルしてしまう）、`out_dir` を予約せず
+    `invalid_request`（exit 64）で拒否する。"""
+    request_path = _write_cancel_request(tmp_path, TINY_CONFIG)
+    stdin_file = tmp_path / "stdin.txt"
+    stdin_file.write_text("", encoding="utf-8")
+    with stdin_file.open("rb") as stdin:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                _LAUNCH_SCRIPT,
+                "train",
+                "--request",
+                str(request_path),
+                "--cancel-on-stdin-eof",
+            ],
+            stdin=stdin,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    payload = _assert_single_json_error(result)
+    assert payload["message"] == "cancel channel (stdin) must be a pipe"
+    assert not (tmp_path / "out").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+def test_req34_train_without_cancel_flag_passes_no_cancel_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34: フラグが無ければ標準入力を見ず、`cancel_event` は `None`
+    （単独起動の挙動は変えない）。"""
+    seen: dict[str, object] = {}
+
+    def _fake_run(request_path: Path, *, cancel_event: object = "unset") -> int:
+        seen["cancel_event"] = cancel_event
+        return 0
+
+    monkeypatch.setattr(supervisor, "run_supervised_train", _fake_run)
+    assert cli.main(["train", "--request", str(tmp_path / "request.json")]) == 0
+    assert seen["cancel_event"] is None
+
+
+def test_req34_cancel_on_stdin_eof_leaves_nothing_published(tmp_path: Path) -> None:
+    """REQ-34・TASK-34.1-2: 実 `_worker`（c3・CPU）の学習中に標準入力（キャンセル用
+    パイプ）を閉じると、supervisor は worker を止めて予約を解放し、`out_dir`・
+    作業用一時ディレクトリのいずれも残らない。学習は完走しない長さ（epochs を
+    大きく取る）にして、確定前にキャンセルが届くことを保証する。"""
+    request_path = _write_cancel_request(tmp_path, dict(TINY_CONFIG, epochs=1_000_000))
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            _LAUNCH_SCRIPT,
+            "train",
+            "--request",
+            str(request_path),
+            "--cancel-on-stdin-eof",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        out_dir = tmp_path / "out"
+        deadline = time.monotonic() + 30
+        while not out_dir.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert out_dir.is_dir(), "out_dir was not reserved in time"
+        assert proc.stdin is not None
+        proc.stdin.close()
+        assert proc.stdout is not None
+        stdout = proc.stdout.read()
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert proc.returncode == 70
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {
+        "status": "error",
+        "code": "runtime_error",
+        "message": "training cancelled by caller",
+    }
+    assert not out_dir.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]

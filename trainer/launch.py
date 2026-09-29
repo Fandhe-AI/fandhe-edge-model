@@ -12,6 +12,11 @@
 
     <venv の python> -I trainer/launch.py <サブコマンド> [引数...]
 
+`train` は `--request <path>` に加え、opt-in の `--cancel-on-stdin-eof` を取る
+（REQ-34・TASK-34.1-2・#145）。付けると標準入力をキャンセル用パイプとして
+監視し、EOF で worker を止めて予約を解放する（`supervisor.py` の協調キャンセル）。
+標準入力がパイプでなければ起動前に `invalid_request` で拒否する。
+
 `-I`（隔離モード）は必須である。`-I` は `PYTHONPATH`・`PYTHONHOME` 等の
 `PYTHON*` 環境変数とユーザーサイトパッケージ（`site-packages` の外側の
 `~/.local` 等）を無視させ、呼び出し元の環境変数に無関係なモジュール探索パスが

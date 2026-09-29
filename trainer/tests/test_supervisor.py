@@ -902,3 +902,234 @@ def test_spawn_worker_and_finalize_cleans_up_reservation_when_pipe_creation_fail
         assert payload["code"] == "runtime_error"
     finally:
         entry.close()
+
+
+# --------------------------------------------------------------------------
+# 協調キャンセル（REQ-34・TASK-34.1-2・issue #145）。偽の `_worker`（MLX 不要・
+# CPU のみ。証拠種別: テストハーネス〔模擬プロセス〕）で、キャンセル後に公開場所
+# （`out_dir`）へ途中成果物が残らないこと、確定後のキャンセルは成功報告のまま
+# であること（公開 ⇔ 成功報告）を具体値で確認する。
+# --------------------------------------------------------------------------
+
+#: 偽の `_worker`。`--out-fd` の dir へ書きかけの `model.onnx` を置き、`hang` なら
+#: pid と ready を書いて眠り続ける。`ok` なら整合した成果物を書いて exit 0 する。
+_FAKE_COOP_WORKER = """
+import hashlib, json, os, sys, time
+argv = sys.argv
+out_fd = int(argv[argv.index("--out-fd") + 1])
+mode = argv[argv.index("--mode") + 1]
+ctl = argv[argv.index("--ctl") + 1]
+def put(name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=out_fd)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+if mode == "hang":
+    put("model.onnx", b"partial")
+    with open(os.path.join(ctl, "pid"), "w") as f:
+        f.write(str(os.getpid()))
+    with open(os.path.join(ctl, "ready"), "w") as f:
+        f.write("1")
+    time.sleep(120)
+else:
+    onnx = b"onnx-bytes"
+    put("model.onnx", onnx)
+    put("artifact.json", json.dumps({"onnx_sha256": hashlib.sha256(onnx).hexdigest()}).encode())
+    print(json.dumps({"status": "ok", "artifact_dir": "x", "artifact": {}}))
+"""
+
+
+def _coop_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> tuple[Path, Path, Path]:
+    """偽 `_worker` を差し込み、(request_path, out_dir, ctl_dir) を返す。"""
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    ctl_dir = tmp_path / "ctl"
+    ctl_dir.mkdir()
+    script = ctl_dir / "fake_worker.py"
+    script.write_text(_FAKE_COOP_WORKER, encoding="utf-8")
+
+    def _argv(out_fd: int, lifeline_fd: int) -> list[str]:
+        return [
+            sys.executable,
+            str(script),
+            "--out-fd",
+            str(out_fd),
+            "--lifeline-fd",
+            str(lifeline_fd),
+            "--mode",
+            mode,
+            "--ctl",
+            str(ctl_dir),
+        ]
+
+    monkeypatch.setattr(supervisor, "worker_argv", _argv)
+    return request_path, tmp_path / "out", ctl_dir
+
+
+def _tmp_leftovers(tmp_path: Path) -> list[str]:
+    return [p.name for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
+def test_req34_cancel_mid_run_leaves_nothing_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34・TASK-34.1-2: 学習中にキャンセルすると、公開場所（`out_dir`）も
+    作業用一時ディレクトリも残らない（PoC-19 の `out_dir_exists == False`・
+    `out_dir_listing == []` に相当）。worker は止まり、出力 JSON は
+    `runtime_error`（cancelled）。"""
+    request_path, out_dir, ctl_dir = _coop_setup(tmp_path, monkeypatch, "hang")
+    event = threading.Event()
+    result: dict[str, ExitCode] = {}
+    runner = threading.Thread(
+        target=lambda: result.update(
+            code=supervisor.run_supervised_train(request_path, cancel_event=event)
+        )
+    )
+    runner.start()
+    deadline = time_mod.monotonic() + 30
+    while not (ctl_dir / "ready").exists() and time_mod.monotonic() < deadline:
+        time_mod.sleep(0.02)
+    assert (ctl_dir / "ready").exists()
+    # 予約済み `out_dir` と、書きかけの成果物を含む一時ディレクトリがある状態。
+    assert out_dir.is_dir()
+    assert len(_tmp_leftovers(tmp_path)) == 1
+    event.set()
+    runner.join(timeout=30)
+    assert not runner.is_alive()
+
+    assert result["code"] == ExitCode.RUNTIME_ERROR
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload == {
+        "status": "error",
+        "code": "runtime_error",
+        "message": "training cancelled by caller",
+    }
+    assert not out_dir.exists()
+    assert _tmp_leftovers(tmp_path) == []
+    pid = int((ctl_dir / "pid").read_text())
+    stop_deadline = time_mod.monotonic() + 5
+    while _process_alive(pid) and time_mod.monotonic() < stop_deadline:
+        time_mod.sleep(0.05)
+    assert not _process_alive(pid)
+
+
+def test_req34_cancel_after_worker_output_before_verify_does_not_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: worker が成果物を書き終えて終了した後でも、検証・確定の前に届いた
+    キャンセルは確定へ進まず、`out_dir` は公開されない。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "ok")
+    event = threading.Event()
+    real_parse = supervisor._parse_worker_stdout
+
+    def _parse_then_cancel(raw: bytes):
+        payload = real_parse(raw)
+        event.set()
+        return payload
+
+    monkeypatch.setattr(supervisor, "_parse_worker_stdout", _parse_then_cancel)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.RUNTIME_ERROR
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["message"] == "training cancelled by caller"
+    assert not out_dir.exists()
+    assert _tmp_leftovers(tmp_path) == []
+
+
+def test_req34_cancel_right_before_finalize_does_not_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: 整合検証（`verify_output`）の直後・確定の直前に届いたキャンセルも
+    確定させない（最後のキャンセル確認）。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "ok")
+    event = threading.Event()
+    real_verify = supervisor.artifact_mod.verify_output
+
+    def _verify_then_cancel(dir_fd: int) -> None:
+        real_verify(dir_fd)
+        event.set()
+
+    monkeypatch.setattr(supervisor.artifact_mod, "verify_output", _verify_then_cancel)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.RUNTIME_ERROR
+    capsys.readouterr()
+    assert not out_dir.exists()
+    assert _tmp_leftovers(tmp_path) == []
+
+
+def test_req34_cancel_after_finalize_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: 確定（rename）が済んだ後に届いたキャンセルは無視し、成功を
+    報告する（公開されている ⇔ 成功報告）。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "ok")
+    event = threading.Event()
+    real_finalize = contract.finalize_out_dir
+
+    def _finalize_then_cancel(reservation: contract.OutDirReservation) -> None:
+        real_finalize(reservation)
+        event.set()
+
+    monkeypatch.setattr(contract, "finalize_out_dir", _finalize_then_cancel)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.OK
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "ok"
+    assert sorted(os.listdir(out_dir)) == ["artifact.json", "model.onnx"]
+    assert _tmp_leftovers(tmp_path) == []
+
+
+def test_req34_monitor_child_returns_cancelled_and_reaps() -> None:
+    """REQ-34: `cancel_event` が立つと `monitor_child` は子を止めて回収し、
+    `"cancelled"` を返す。"""
+    proc = _spawn("import time; time.sleep(60)")
+    event = threading.Event()
+    event.set()
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            cancel_event=event,
+        )
+        assert reason == "cancelled"
+        assert proc.returncode is not None
+    finally:
+        _reap(proc)
+
+
+def test_req34_monitor_child_prefers_cancelled_over_normal_exit_on_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34: 既に終了した（ゾンビ）worker を検知した時点でキャンセル済みなら、
+    通常終了（`None`）ではなく `"cancelled"` を返し、成果物を確定させない。"""
+    proc = _spawn("pass")
+    event = threading.Event()
+    event.set()
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: (1024, True))
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            cancel_event=event,
+        )
+        assert reason == "cancelled"
+    finally:
+        _reap(proc)

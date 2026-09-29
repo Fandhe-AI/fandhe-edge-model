@@ -34,6 +34,8 @@ use fandhe_edge_train::process::ENV_ALLOWLIST;
 use fandhe_edge_train::process::TrainRunEnd;
 #[cfg(unix)]
 use fandhe_edge_train::process::WorkerCandidateRunner;
+#[cfg(unix)]
+use fandhe_edge_train::process::{CancelStop, OutDirResidue};
 use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
 #[cfg(unix)]
 use fandhe_edge_train::request::ValidationInput;
@@ -60,13 +62,20 @@ fn ok_json(artifact_dir: &str) -> String {
 fn main() -> ProcessExitCode {
     let args: Vec<String> = std::env::args().collect();
     // `run_train` が組み立てる固定 argv:
-    // [program, "-I", launch_script, "train", "--request", request_path]
+    // [program, "-I", launch_script, "train", "--request", request_path,
+    //  "--cancel-on-stdin-eof"]
     let is_worker_invocation = args.get(1).map(String::as_str) == Some("-I")
         && args.get(3).map(String::as_str) == Some("train")
         && args.get(4).map(String::as_str) == Some("--request");
     if is_worker_invocation {
         let launch_script = args.get(2).expect("launch_script arg present");
         let request_path = args.get(5).expect("request path arg present");
+        // 協調キャンセルの opt-in フラグ（REQ-34・#145）。付け忘れは
+        // テストで検出できるよう、7 種のどれでもない終了コード 3 で落とす。
+        if args.get(6).map(String::as_str) != Some("--cancel-on-stdin-eof") {
+            eprintln!("fake worker: missing --cancel-on-stdin-eof");
+            std::process::exit(3);
+        }
         // `run_fake_worker` の戻り値型は `!`（内部で必ず
         // `std::process::exit` する）ため、ここには戻ってこない。
         run_fake_worker(launch_script, request_path);
@@ -158,6 +167,56 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        "hang_with_empty_out" => {
+            // 空の予約済み `out/`（cwd = job_dir = request の root）を作ってから
+            // hang する。stdin は読まない（協調しない supervisor を模す。
+            // `SIGKILL` フォールバック後に空の予約が残る状況。REQ-34・#145）。
+            std::fs::create_dir("out").expect("create out");
+            loop {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("heartbeat.txt")
+                {
+                    let _ = f.write_all(b".");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        "coop_cancel_cleanup" => {
+            // 協調する supervisor を模す: 空の予約 `out/` と書きかけの一時
+            // ディレクトリを作って ready を書き、stdin が EOF になったら両方を
+            // 削除してエラー JSON（`runtime_error`・exit 70）で終了する
+            // （REQ-34・#145。実 supervisor の `cleanup_reservation` 相当）。
+            std::fs::create_dir("out").expect("create out");
+            std::fs::create_dir(".out.tmp-0000").expect("create tmp");
+            std::fs::write(".out.tmp-0000/model.onnx", b"partial").expect("write partial");
+            std::fs::write("heartbeat.txt", b".").expect("write ready");
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            let _ = std::fs::remove_dir_all(".out.tmp-0000");
+            let _ = std::fs::remove_dir_all("out");
+            print!(r#"{{"status":"error","code":"runtime_error","message":"m"}}"#);
+            std::process::exit(70);
+        }
+        "coop_cancel_after_publish" => {
+            // 確定（公開）済みの supervisor を模す: `out/` に成果物がある状態で
+            // ready を書き、stdin が EOF になっても成功 JSON を出して exit 0 する
+            // （確定後に届いたキャンセルは無視して成功を報告する。REQ-34・#145）。
+            std::fs::create_dir("out").expect("create out");
+            std::fs::write("out/artifact.json", b"{}").expect("write artifact.json");
+            std::fs::write("out/model.onnx", b"onnx").expect("write model.onnx");
+            std::fs::write("heartbeat.txt", b".").expect("write ready");
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            let artifact_dir = std::env::current_dir()
+                .expect("cwd")
+                .join("out")
+                .to_string_lossy()
+                .to_string();
+            print!("{}", ok_json(&artifact_dir));
+            std::process::exit(0);
+        }
         "hang_with_lifeline_orphan" => {
             // issue #178 PR #233 レビュー: Rust 側は直接の子（supervisor 役
             // ＝このプロセス）だけを把握・終了させればよく、孫プロセス
@@ -191,6 +250,8 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                     .arg("train")
                     .arg("--request")
                     .arg(request_path)
+                    // 偽ワーカーとして起動されるための固定 argv（親と同じ形）。
+                    .arg("--cancel-on-stdin-eof")
                     // 孫を自分自身のプロセスグループのリーダーにする
                     // （実際の `_worker` が `start_new_session=True` で
                     // 別セッションのリーダーになるのと同じ理由: lifeline の
@@ -282,6 +343,7 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 .arg("train")
                 .arg("--request")
                 .arg(request_path)
+                .arg("--cancel-on-stdin-eof")
                 // 標準入力・標準出力は明示的に `null` にする。指定しなければ
                 // 孫は標準出力（fd 1）の複製も継承してしまい、`run_train` の
                 // stdout 側の待ち（`stdout_wait`）が先にタイムアウトして
@@ -459,6 +521,21 @@ fn run_test_suite() -> ProcessExitCode {
         case_cancel_kills_lifeline_orphan,
     ));
     #[cfg(unix)]
+    cases.push((
+        "cancel_cooperative_leaves_nothing_published",
+        case_cancel_cooperative_leaves_nothing_published,
+    ));
+    #[cfg(unix)]
+    cases.push((
+        "cancel_after_publish_is_completed",
+        case_cancel_after_publish_is_completed,
+    ));
+    #[cfg(unix)]
+    cases.push((
+        "cancel_forced_kill_reports_empty_reservation",
+        case_cancel_forced_kill_reports_empty_reservation,
+    ));
+    #[cfg(unix)]
     cases.push(("cancel_before_start", case_cancel_before_start));
     #[cfg(unix)]
     cases.push((
@@ -560,6 +637,42 @@ fn make_request(time_limit_seconds: Option<u32>) -> TrainRequest {
         rss_limit_bytes: None,
     })
     .expect("valid request params")
+}
+
+/// `root` を指定した学習リクエスト（`out_dir` は `out`）。`out_dir` の残置を
+/// 実ファイルシステムで確認するケース用（`root` = ケースの一時ディレクトリ）。
+#[cfg(unix)]
+fn make_request_in(root: &Path, time_limit_seconds: Option<u32>) -> TrainRequest {
+    TrainRequest::new(TrainRequestParams {
+        kind: "c3".to_string(),
+        kind_version: 1,
+        config: serde_json::Map::new(),
+        label_order: vec!["a".to_string(), "b".to_string()],
+        max_bytes: 512,
+        seed: 0,
+        device: Device::Cpu,
+        root: root.to_string_lossy().to_string(),
+        train_path: "train.jsonl".to_string(),
+        out_dir: "out".to_string(),
+        time_limit_seconds,
+        rss_limit_bytes: None,
+    })
+    .expect("valid request params")
+}
+
+/// `dir` 直下の `.out.tmp-` で始まるエントリ名の一覧（ソート済み）。
+#[cfg(unix)]
+fn tmp_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(".out.tmp-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 fn expect_eq<T: PartialEq + std::fmt::Debug>(
@@ -1194,20 +1307,45 @@ fn wait_for_file(path: &Path, max: Duration) -> bool {
     ready(path)
 }
 
+/// [`run_and_cancel_when`] の結果。
+#[cfg(unix)]
+type CancelRunResult = (CancelOutcome, TrainRunEnd, JobState, Duration);
+
 /// `TrainJob::run` を別スレッドで走らせ、`ready` が現れたらキャンセルして
 /// 結果を返す共通手順。壁時計は 20 秒に設定し、キャンセル起因の停止と
-/// 壁時計起因の停止を区別できるようにする。
+/// 壁時計起因の停止を区別できるようにする。協調の猶予は 1 秒へ締め（
+/// `SIGKILL` フォールバックの確認を速くする）、協調する supervisor を模す
+/// ケースは 1 秒以内に終了するため影響しない。`request` の `root` は
+/// `FIXTURE_ROOT`（実在しない）。
 #[cfg(unix)]
 fn run_and_cancel_when(
     case_dir: &Path,
     mode: &str,
     ready: &[&Path],
-) -> Result<(CancelOutcome, TrainRunEnd, JobState, Duration), String> {
+) -> Result<CancelRunResult, String> {
+    run_and_cancel_with_request(
+        case_dir,
+        mode,
+        ready,
+        make_request(Some(30)),
+        Duration::from_secs(1),
+    )
+}
+
+/// [`run_and_cancel_when`] の、リクエストと協調の猶予を指定できる版。
+#[cfg(unix)]
+fn run_and_cancel_with_request(
+    case_dir: &Path,
+    mode: &str,
+    ready: &[&Path],
+    request: TrainRequest,
+    grace: Duration,
+) -> Result<CancelRunResult, String> {
     let launcher = make_launcher(case_dir, mode);
-    let request = make_request(Some(30));
     let limits = RunLimits::for_request(&request)
         .with_wall_timeout(Duration::from_secs(20))
-        .map_err(|e| format!("with_wall_timeout: {e}"))?;
+        .and_then(|l| l.with_cooperative_grace(grace))
+        .map_err(|e| format!("limits: {e}"))?;
     let job = TrainJob::new();
     let handle = job.handle();
     let dir = case_dir.to_path_buf();
@@ -1242,10 +1380,18 @@ fn case_cancel_hang(case_dir: &Path) -> Result<(), String> {
     expect_eq(run.child_spawned(), true, "child_spawned")?;
     expect_eq(run.child_reaped(), true, "child_reaped")?;
     expect_eq(run.signal(), Some(9), "signal")?;
+    // 協調しない supervisor は猶予（1 秒）内に終了せず `SIGKILL` へ
+    // フォールバックする。`out_dir`（実在しない root 配下）は存在しない。
+    expect_eq(run.stop(), CancelStop::ForcedKill, "stop")?;
+    expect_eq(
+        run.out_dir_residue(),
+        Some(OutDirResidue::Absent),
+        "out_dir_residue",
+    )?;
     expect_eq(state, JobState::Cancelled, "job state")?;
     expect_true(
-        elapsed < Duration::from_secs(5),
-        "must stop well before the 20s wall timeout",
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(8),
+        "grace (1s) must elapse before SIGKILL, and stop well before the 20s wall timeout",
     )?;
     let before = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
     std::thread::sleep(Duration::from_millis(300));
@@ -1269,6 +1415,126 @@ fn case_cancel_kills_lifeline_orphan(case_dir: &Path) -> Result<(), String> {
     expect_orphan_stopped(case_dir)
 }
 
+/// REQ-34・TASK-34.1-2: 協調する supervisor は stdin の EOF を受けて自ら後始末する。
+/// キャンセル後、公開場所（`out`）も一時ディレクトリも存在しない（PoC-19 の
+/// `out_dir_exists == False`・`out_dir_listing == []` に相当）。猶予は既定
+/// （15 秒）のままだが、supervisor はすぐ終了するため待たない。
+#[cfg(unix)]
+fn case_cancel_cooperative_leaves_nothing_published(case_dir: &Path) -> Result<(), String> {
+    let heartbeat = case_dir.join("heartbeat.txt");
+    let request = make_request_in(case_dir, Some(30));
+    let launcher = make_launcher(case_dir, "coop_cancel_cleanup");
+    let limits = RunLimits::for_request(&request)
+        .with_wall_timeout(Duration::from_secs(60))
+        .map_err(|e| format!("limits: {e}"))?;
+    let job = TrainJob::new();
+    let handle = job.handle();
+    let dir = case_dir.to_path_buf();
+    let worker = std::thread::spawn(move || job.run(&launcher, &request, &dir, &limits));
+    if !wait_for_file(&heartbeat, Duration::from_secs(10)) {
+        handle.cancel();
+        let _ = worker.join();
+        return Err("ready did not appear in time".to_string());
+    }
+    // 予約済み `out/` と一時ディレクトリがある状態からキャンセルする。
+    expect_true(case_dir.join("out").is_dir(), "out reserved before cancel")?;
+    expect_eq(
+        tmp_entries(case_dir),
+        vec![".out.tmp-0000".to_string()],
+        "tmp before cancel",
+    )?;
+    let started = std::time::Instant::now();
+    expect_eq(handle.cancel(), CancelOutcome::Requested, "cancel outcome")?;
+    let end = worker
+        .join()
+        .map_err(|_| "job thread panicked".to_string())?
+        .map_err(|e| format!("run returned error: {e}"))?;
+    let TrainRunEnd::Cancelled(run) = end else {
+        return Err("expected Cancelled".to_string());
+    };
+    expect_eq(run.stop(), CancelStop::Cooperative, "stop")?;
+    expect_eq(run.signal(), None, "signal")?;
+    expect_eq(run.out_dir_residue(), None, "out_dir_residue")?;
+    expect_eq(run.child_reaped(), true, "child_reaped")?;
+    expect_eq(handle.state(), JobState::Cancelled, "job state")?;
+    expect_true(!case_dir.join("out").exists(), "out must not exist")?;
+    expect_eq(
+        tmp_entries(case_dir),
+        Vec::<String>::new(),
+        "tmp after cancel",
+    )?;
+    expect_true(
+        started.elapsed() < Duration::from_secs(5),
+        "cooperative cancel must not wait for the grace",
+    )
+}
+
+/// REQ-34・TASK-34.1-2: 確定（公開）済みの supervisor は、その後に届いたキャンセルを
+/// 無視して成功を報告する。公開されている ⇔ 成功報告（`Cancelling` → `Succeeded`）。
+#[cfg(unix)]
+fn case_cancel_after_publish_is_completed(case_dir: &Path) -> Result<(), String> {
+    let heartbeat = case_dir.join("heartbeat.txt");
+    let request = make_request_in(case_dir, Some(30));
+    let (outcome, end, state, _) = run_and_cancel_with_request(
+        case_dir,
+        "coop_cancel_after_publish",
+        &[&heartbeat],
+        request,
+        Duration::from_secs(1),
+    )?;
+    expect_eq(outcome, CancelOutcome::Requested, "cancel outcome")?;
+    let TrainRunEnd::Completed(run) = end else {
+        return Err("expected Completed".to_string());
+    };
+    expect_true(
+        matches!(
+            run.outcome(),
+            fandhe_edge_train::result::TrainOutcome::Ok(_)
+        ),
+        "outcome must be Ok",
+    )?;
+    expect_eq(state, JobState::Succeeded, "job state")?;
+    let mut listing: Vec<String> = std::fs::read_dir(case_dir.join("out"))
+        .map_err(|e| format!("read out: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    listing.sort();
+    expect_eq(
+        listing,
+        vec!["artifact.json".to_string(), "model.onnx".to_string()],
+        "published listing",
+    )
+}
+
+/// REQ-34・TASK-34.1-2: 協調しない supervisor は `SIGKILL` へフォールバックし、
+/// 後始末が走らないため残った空の予約を読み取り専用で報告する（削除はしない）。
+#[cfg(unix)]
+fn case_cancel_forced_kill_reports_empty_reservation(case_dir: &Path) -> Result<(), String> {
+    let heartbeat = case_dir.join("heartbeat.txt");
+    let request = make_request_in(case_dir, Some(30));
+    let (_, end, state, _) = run_and_cancel_with_request(
+        case_dir,
+        "hang_with_empty_out",
+        &[&heartbeat],
+        request,
+        Duration::from_secs(1),
+    )?;
+    let TrainRunEnd::Cancelled(run) = end else {
+        return Err("expected Cancelled".to_string());
+    };
+    expect_eq(run.stop(), CancelStop::ForcedKill, "stop")?;
+    expect_eq(run.signal(), Some(9), "signal")?;
+    expect_eq(
+        run.out_dir_residue(),
+        Some(OutDirResidue::EmptyReservation),
+        "out_dir_residue",
+    )?;
+    expect_eq(state, JobState::Cancelled, "job state")?;
+    // 観測しただけで削除していない。
+    expect_true(case_dir.join("out").is_dir(), "out must be left as is")
+}
+
 /// REQ-34: 起動前のキャンセルは子を起動せず、`request.json` も残さない。
 #[cfg(unix)]
 fn case_cancel_before_start(case_dir: &Path) -> Result<(), String> {
@@ -1286,6 +1552,8 @@ fn case_cancel_before_start(case_dir: &Path) -> Result<(), String> {
     };
     expect_eq(run.child_spawned(), false, "child_spawned")?;
     expect_eq(run.signal(), None, "signal")?;
+    expect_eq(run.stop(), CancelStop::BeforeStart, "stop")?;
+    expect_eq(run.out_dir_residue(), None, "out_dir_residue")?;
     expect_eq(handle.state(), JobState::Cancelled, "job state")?;
     expect_true(!case_dir.join("heartbeat.txt").exists(), "no heartbeat")?;
     expect_true(!case_dir.join("request.json").exists(), "no request.json")
@@ -1346,6 +1614,7 @@ fn case_record(case_dir: &Path) -> Result<(), String> {
         "train".to_string(),
         "--request".to_string(),
         expected_request_path.to_string_lossy().to_string(),
+        "--cancel-on-stdin-eof".to_string(),
     ];
     expect_eq(argv.clone(), expected_argv, "argv")?;
 
