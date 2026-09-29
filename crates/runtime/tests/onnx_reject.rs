@@ -203,6 +203,13 @@ fn req39_c3_graph_template_violations_rejected() {
     // 未知の op
     let unknown_op = set_op_type(&good, 0, "Gathez");
     assert_eq!(code(&unknown_op, ModelKind::C3), "unsupported_graph");
+    // 詰め物を除外できない負値（-0.001）のマスク値は、負数でも書き出し器の固定値（-1e9）と
+    // 異なるため拒否する（REQ-28）
+    let weak_mask = edit_initializer(&good, "neg_big_f32", |t| {
+        let i = t.iter().position(|(n, _)| *n == 9).expect("raw");
+        t[i].1 = Val::Len((-0.001f32).to_le_bytes().to_vec());
+    });
+    assert_eq!(code(&weak_mask, ModelKind::C3), "unsupported_graph");
 }
 
 /// REQ-39: テンソルの形式違反（長さ不一致・FLOAT/INT64 以外・外部参照・raw_data 以外の値）は

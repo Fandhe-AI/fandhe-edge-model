@@ -115,6 +115,8 @@ pub enum BackendError {
     InvalidSequenceLength,
     /// トークン値が語彙の範囲（`0..257`）外（ONNX バックエンド。REQ-39）。
     InvalidTokenId,
+    /// 1 件の計算時間が上限を超えたため打ち切った（ONNX バックエンド。REQ-39）。
+    TimeLimitExceeded,
 }
 
 impl BackendError {
@@ -124,6 +126,7 @@ impl BackendError {
             Self::Failed => "backend_failed",
             Self::InvalidSequenceLength => "invalid_sequence_length",
             Self::InvalidTokenId => "invalid_token_id",
+            Self::TimeLimitExceeded => "time_limit_exceeded",
         }
     }
 }

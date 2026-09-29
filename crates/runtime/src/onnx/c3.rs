@@ -22,6 +22,8 @@
 //! 幅の個数・`k`・埋め込み次元・フィルタ数は学習ワーカーの上限
 //! （`limits.py::MAX_C3_*`）と同値の定数で制限し、重みの総量はモデルファイルの大きさで有界。
 
+use std::time::{Duration, Instant};
+
 use super::proto::{GraphProto, NodeProto};
 use super::{
     Inits, MAX_MAX_BYTES, N_TOKENS, OnnxLoadError, attr_f32_is, attr_int_is, attr_ints_are,
@@ -37,6 +39,14 @@ const MAX_KERNEL: usize = 31;
 const MAX_EMB: usize = 1024;
 /// 1 枝のフィルタ数の上限（`limits.py::MAX_C3_FILTERS`）。
 const MAX_FILTERS: usize = 1024;
+/// 詰め物位置へ加える負値。書き出し器（`kinds/c3.py::_MASK_NEG_VALUE`）の固定値と一致するものだけを
+/// 受理する。任意の負数（例: -0.001）を許すと、詰め物位置が実トークン位置より大きくなり
+/// プーリングへ混入する（REQ-28）。
+const MASK_NEG_VALUE: f32 = -1e9;
+/// 1 系列の計算時間の上限（REQ-39。`latency::DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS` と同値）。
+/// 受理したモデルは最大 4096 トークン × 1024 次元 × 31 カーネル × フィルタ数の走査になりうるため、
+/// モデルファイルの大きさの上限だけでは時間を抑えられない。
+const MAX_INFER_DURATION: Duration = Duration::from_secs(10);
 /// 幅に依存しない前段のノード数と、後段（`Concat`・`Gemm`・`Softmax`）のノード数。
 const PREFIX_NODES: usize = 7;
 const SUFFIX_NODES: usize = 3;
@@ -232,7 +242,7 @@ impl C3Model {
         }
         scalar_is(inits.f32_scalar("one_f32")?, 1.0)?;
         let neg_big = inits.f32_scalar("neg_big_f32")?;
-        if neg_big >= 0.0 {
+        if neg_big.to_bits() != MASK_NEG_VALUE.to_bits() {
             return Err(bad());
         }
         match inits.i64("unsqueeze_axes_1")? {
@@ -284,6 +294,13 @@ impl C3Model {
 
     /// 1 系列のスコア（確率。選択肢の宣言順）。`ids` は空でなく、各値が `0..257`（呼び出し側で検査済み）。
     pub(super) fn scores(&self, ids: &[i64]) -> Result<Vec<f64>, BackendError> {
+        self.scores_within(ids, MAX_INFER_DURATION)
+    }
+
+    /// 計算時間の上限付きのスコア計算。各位置（フィルタ 1 本 × 1 位置の走査）の境界で経過時間を
+    /// 検査し、超過したら [`BackendError::TimeLimitExceeded`] で打ち切る（REQ-39）。
+    fn scores_within(&self, ids: &[i64], limit: Duration) -> Result<Vec<f64>, BackendError> {
+        let started = Instant::now();
         let t_len = ids.len();
         if t_len == 0 || t_len > MAX_MAX_BYTES {
             return Err(BackendError::InvalidSequenceLength);
@@ -311,6 +328,9 @@ impl C3Model {
                 let bias = *br.bias.get(f).ok_or(BackendError::Failed)?;
                 let mut best = f32::NEG_INFINITY;
                 for (t, &n) in neg.iter().enumerate() {
+                    if started.elapsed() >= limit {
+                        return Err(BackendError::TimeLimitExceeded);
+                    }
                     let mut acc = 0.0f32;
                     for ch in 0..e {
                         let base = f
@@ -355,5 +375,28 @@ impl C3Model {
             *acc += b;
         }
         softmax_f64(&logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onnx::{ModelKind, OnnxBackend};
+
+    /// REQ-39: 時間上限 0 では最初の位置で打ち切られる（超過時に打ち切れる経路）。
+    #[test]
+    fn req39_c3_scores_abort_when_time_limit_exceeded() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/onnx_parity/c3.onnx");
+        let bytes = std::fs::read(path).expect("fixture read");
+        let backend = OnnxBackend::from_bytes(&bytes, ModelKind::C3).expect("load");
+        let crate::onnx::Inner::C3(m) = &backend.inner else {
+            panic!("c3 expected");
+        };
+        assert_eq!(
+            m.scores_within(&[1, 2, 3], Duration::ZERO).err(),
+            Some(BackendError::TimeLimitExceeded)
+        );
+        assert!(m.scores_within(&[1, 2, 3], MAX_INFER_DURATION).is_ok());
     }
 }
