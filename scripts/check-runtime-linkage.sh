@@ -51,10 +51,45 @@ direct_deps() {
 }
 
 # Darwin: 直接リンクだけでは「依存ライブラリがさらに Python・MLX へ依存する」経路を見逃すため、
-# 絶対パスで実在する依存を再帰的に辿る（REQ-32。上限 MAX_LIBS 件で打ち切り fail-closed）。
-# @rpath・@loader_path 等の未解決参照は辿れないが、名前は PATTERN で判定する。
+# 依存を再帰的に辿る（REQ-32。上限 MAX_LIBS 件で打ち切り fail-closed）。
+# @rpath・@loader_path・@executable_path は LC_RPATH（辿っている実行ファイル自身と検査対象の
+# 最上位バイナリの両方）を展開して解決する。解決できない @ 参照・存在しない絶対パスは、
+# 参照先の検査ができないため失敗させる（fail-closed。見逃したまま「リンクなし」と報告しない）。
 # /usr/lib・/System 配下は OS 提供（dyld shared cache 内）のため再帰しない。
 # Linux の ldd は推移的依存を含めて出力するため再帰不要。
+# バイナリの LC_RPATH を 1 行 1 件で出す。
+rpaths_of() {
+  otool -l "$1" | sed -n '/cmd LC_RPATH/,/^Load command/{s/^ *path //;s/ (offset [0-9]*)$//;t p;b;:p;p;}'
+}
+
+# 依存名 $2（辿っている実行ファイル $1、最上位バイナリ $3）を実ファイルのパスへ解決して stdout へ出す。
+# 解決できなければ何も出さず非 0 を返す。
+resolve_dep() {
+  cur_dir=$(dirname "$1")
+  top_dir=$(dirname "$3")
+  case $2 in
+    /*) [ -f "$2" ] && printf '%s\n' "$2"; return ;;
+    @loader_path/*) c="$cur_dir/${2#@loader_path/}"; [ -f "$c" ] && printf '%s\n' "$c"; return ;;
+    @executable_path/*) c="$top_dir/${2#@executable_path/}"; [ -f "$c" ] && printf '%s\n' "$c"; return ;;
+    @rpath/*)
+      rel=${2#@rpath/}
+      for owner in "$1" "$3"; do
+        rpaths_of "$owner" >"$TMP.rp" || return 1
+        while IFS= read -r rp; do
+          [ -n "$rp" ] || continue
+          case $rp in
+            @loader_path*) rp="$(dirname "$owner")${rp#@loader_path}" ;;
+            @executable_path*) rp="$top_dir${rp#@executable_path}" ;;
+          esac
+          if [ -f "$rp/$rel" ]; then printf '%s\n' "$rp/$rel"; rm -f "$TMP.rp"; return 0; fi
+        done <"$TMP.rp"
+      done
+      rm -f "$TMP.rp"
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 MAX_LIBS=500
 collect_libs() {
   : >"$2"
@@ -71,9 +106,13 @@ collect_libs() {
       printf '%s\n' "$dep" >>"$2"
       case $dep in
         /usr/lib/*|/System/*) continue ;;
-        /*) [ -f "$dep" ] || continue ;;
-        *) continue ;;
       esac
+      real=$(resolve_dep "$cur" "$dep" "$1") || {
+        echo "error: cannot resolve dependency '$dep' of $cur" >&2
+        rm -f "$q" "$q.d" "$q.seen" "$q.n"
+        return 1
+      }
+      dep=$real
       if grep -qxF "$dep" "$q.seen"; then continue; fi
       printf '%s\n' "$dep" >>"$q.seen"
       printf '%s\n' "$dep" >>"$q"
