@@ -954,6 +954,13 @@ pub fn run_train_cancellable(
         }
     }
 
+    // 最初の確認から `write_request_file`・環境構築を経る間にキャンセルが
+    // 要求された場合も、子プロセスを起動しない。`guard` は return で drop され
+    // `request.json` が削除される（REQ-34・#144。codex/review 指摘 P1）。
+    // 本確認以降の要求は、起動後の監視ループが子の kill として処理する。
+    if cancel.is_cancelled() {
+        return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
+    }
     let mut child = command
         .spawn()
         .map_err(|e| TrainProcessError::Spawn { kind: e.kind() })?;
