@@ -642,16 +642,16 @@ enum CancelStep {
 #[cfg(unix)]
 fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, TrainProcessError> {
     use std::os::unix::process::ExitStatusExt;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(CancelStep::AlreadyExited(status)),
-            Ok(None) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                let _ = child.kill();
-                let _ = wait_after_kill(child);
-                return Err(TrainProcessError::Wait { kind: e.kind() });
-            }
+    // `Interrupted` が続いても期限（`KILL_WAIT_TIMEOUT`）で抜ける
+    // （codex/review 指摘 P1。REQ-39「資源の上限」）。
+    let deadline = Instant::now() + KILL_WAIT_TIMEOUT;
+    match try_wait_interrupt_bounded(|| child.try_wait(), deadline) {
+        Ok(Some(status)) => return Ok(CancelStep::AlreadyExited(status)),
+        Ok(None) => {}
+        Err(e) => {
+            let _ = child.kill();
+            let _ = wait_after_kill(child);
+            return Err(TrainProcessError::Wait { kind: e.kind() });
         }
     }
     // 停止・回収を確認できない場合は成功したキャンセルとして返さず、生存中の
@@ -679,6 +679,26 @@ fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, Train
         child_reaped: true,
         signal: status.signal(),
     }))
+}
+
+/// `try_wait` を 1 回確認する。`Interrupted`（`EINTR`）は再試行するが、毎回
+/// `deadline` を確認し、到達したら `Interrupted` のエラーで返す（無限ループ
+/// 防止。REQ-39）。`Ok(None)` は「まだ生きている」。
+#[cfg(unix)]
+fn try_wait_interrupt_bounded(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+    deadline: Instant,
+) -> std::io::Result<Option<ExitStatus>> {
+    loop {
+        match try_wait() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 /// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
@@ -1225,6 +1245,45 @@ mod tests {
     use super::*;
     use crate::limits::MAX_TRAIN_WALL_SECONDS;
     use crate::request::{Device, TrainRequestParams};
+
+    /// REQ-34・REQ-39: `try_wait()` が `Interrupted` を返し続けても、期限で
+    /// 抜けて `Interrupted` のエラーを返す（無限ループしない）。
+    #[cfg(unix)]
+    #[test]
+    fn try_wait_interrupt_bounded_gives_up_at_deadline() {
+        let started = Instant::now();
+        let mut calls = 0u64;
+        let r = try_wait_interrupt_bounded(
+            || {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            },
+            Instant::now() + Duration::from_millis(50),
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(calls >= 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REQ-34: 期限前の `Interrupted` は再試行し、その後の結果を返す。
+    #[cfg(unix)]
+    #[test]
+    fn try_wait_interrupt_bounded_retries_before_deadline() {
+        let mut calls = 0;
+        let r = try_wait_interrupt_bounded(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(None)
+                }
+            },
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(r, Ok(None)));
+        assert_eq!(calls, 3);
+    }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
         TrainRequest::new(TrainRequestParams {
