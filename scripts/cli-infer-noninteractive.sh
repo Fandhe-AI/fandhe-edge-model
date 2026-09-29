@@ -143,10 +143,11 @@ rec_add() {
 # 不正な JSON を作らないよう固定値へ置き換える（stderr・stdout の検査と同じ方針）
 rec_add_path() {
     if [ -n "$rec_dir" ]; then
+        # $2 は `--package=` のような等号形式の接頭辞（空なら値のみ）。UTF-8 の検査は値だけに行う
         if printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
-            rec_add "$1"
+            rec_add "${2:-}$1"
         else
-            rec_add "<invalid utf-8>"
+            rec_add "${2:-}<invalid utf-8>"
         fi
     fi
 }
@@ -171,11 +172,11 @@ for a in ${1+"$@"}; do
     fi
     case "$a" in
         --input-file) batch=1; skip=1; redact_next=1; rec_add "$a" ;;
-        --input-file=*) batch=1; rec_add "--input-file=<redacted>" ;;
+        --input-file=*) batch=1; rec_add_path "${a#--input-file=}" "--input-file=" ;;
         --out) out_requested=1; skip=1; redact_next=1; rec_add "$a" ;;
-        --out=*) out_requested=1; rec_add "--out=<redacted>" ;;
+        --out=*) out_requested=1; rec_add_path "${a#--out=}" "--out=" ;;
         --package) skip=1; redact_next=1; rec_add "$a" ;;
-        --package=*) rec_add "--package=<redacted>" ;;
+        --package=*) rec_add_path "${a#--package=}" "--package=" ;;
         --text | --id) skip=1; redact_next=0; rec_add "$a" ;;
         --text=*) rec_add "--text=<redacted>" ;;
         --id=*) rec_add "--id=<redacted>" ;;
@@ -668,13 +669,22 @@ if [ -n "$rec_dir" ]; then
         while [ "$rec_try" -lt 10 ]; do
             rec_try=$((rec_try + 1))
             rec_cand="$rec_real/run-record.$$.$RANDOM$RANDOM"
-            if (
+            # 子シェルの終了値: 0=保存成功・2=作成失敗（既存エントリとの衝突等。自分のファイルではない）・
+            # 3=作成後の書き込み失敗（容量不足・quota 超過等。自分が作った不完全なファイルが残る）
+            rec_rc=0
+            (
                 set -C
                 umask 077
+                exec 4>"$rec_cand" || exit 2
                 printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
-                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >"$rec_cand"
-            ); then
+                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >&4 || exit 3
+            ) || rec_rc=$?
+            if [ "$rec_rc" -eq 0 ]; then
                 rec_file=$rec_cand
+                break
+            elif [ "$rec_rc" -eq 3 ]; then
+                # 不完全な記録を残さない（完全に書けたファイルだけを記録とする）。再試行しない
+                rm -f "$rec_cand"
                 break
             fi
         done

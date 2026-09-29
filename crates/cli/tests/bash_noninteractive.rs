@@ -1138,14 +1138,42 @@ fn req36_run_record_redacts_unknown_tokens_and_positionals() {
             "SECRET-BODY-pos",
             "--bogus",
             "SECRET-VAL",
-            "--package=SECRET-PKG",
+            "--bogus=SECRET-EQ",
         ],
         &[("FANDHE_EDGE_RECORD_DIR", d)],
     );
     assert_eq!(o.code, Some(64));
     let rec = only_record(&dir);
     assert!(
-        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"<redacted>\",\"<redacted>\",\"<redacted>\",\"--package=<redacted>\"],"),
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"<redacted>\",\"<redacted>\",\"<redacted>\",\"<redacted>\"],"),
+        "{rec}"
+    );
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 等号形式（`--package=PATH`・`--input-file=PATH`）も空白区切りと同じくパス値を記録し、
+/// `--text=`・`--id=` の値は伏せる（REQ-36・TASK-36.1-2）。
+#[test]
+fn req36_run_record_equals_form_records_path_values() {
+    let dir = record_dir("equals");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"code\":\"invalid_input\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "record-equals",
+        body,
+        &[
+            "--package=pkg/a",
+            "--input-file=in/b.jsonl",
+            "--text=SECRET-TEXT",
+            "--id=SECRET-ID",
+        ],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--package=pkg/a\",\"--input-file=in/b.jsonl\",\"--text=<redacted>\",\"--id=<redacted>\"],"),
         "{rec}"
     );
     assert!(!rec.contains("SECRET"), "{rec}");
