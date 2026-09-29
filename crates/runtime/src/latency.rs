@@ -19,8 +19,9 @@
 //!
 //! # 範囲外（実装済みを装わない）
 //!
-//! - p95 算出・レポート・参考値の明記: #128（TASK-31.1-2）。上限照合と `limit_exceeded`:
-//!   TASK-31.2・#129。上限ちょうどの境界判定: #130。JSON 出力・CLI 接続: TASK-33.x
+//! - p95 算出・レポート・参考値の明記は [`crate::latency_report`]（#128・TASK-31.1-2）で実装済み。
+//!   上限照合と `limit_exceeded`: TASK-31.2・#129。上限ちょうどの境界判定: #130。
+//!   JSON 出力・CLI 接続: TASK-33.x
 //! - 実前処理（#112）・ONNX 推論（#113）が未実装のため、実モデルでの計測は #113 完了後
 //! - 実機（静かな Mac）での実計測と実測値の記録は人間の作業。本モジュールのテストの
 //!   証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ
@@ -273,7 +274,7 @@ impl Default for LatencyConfig {
     }
 }
 
-/// 計測結果。個々の計測値（ns）を反復順に保持する。p95・合否は持たない（#128・#129）。
+/// 計測結果。個々の計測値（ns）を反復順に保持する。p95 は [`crate::latency_report`]、合否は持たない（#129）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct LatencySamples {
     warmup: usize,
@@ -295,6 +296,16 @@ impl LatencySamples {
     /// 1 回ごとの所要時間（ns）。反復順。
     pub fn samples_ns(&self) -> &[u64] {
         &self.samples_ns
+    }
+}
+
+/// 他モジュールの単体テスト用に計測値から直接 [`LatencySamples`] を作る（warmup 0）。
+#[cfg(test)]
+pub(crate) fn test_samples(v: &[u64]) -> LatencySamples {
+    LatencySamples {
+        warmup: 0,
+        iters: v.len(),
+        samples_ns: v.to_vec(),
     }
 }
 

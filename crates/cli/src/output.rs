@@ -18,6 +18,11 @@
 //! （`.claude/rules/coding-rust.md`「操作アダプターは薄く保ち、業務ロジッ
 //! クは下位層に置く」）。
 //!
+//! # package の正常系（TASK-33.2-2）
+//!
+//! [`write_package_report`] は `package` 工程の exit 0 の結果 JSON を書く。呼び出し元は
+//! `stage_output::emit_package_outcome`（配線は TASK-33.1-2・#136）。
+//!
 //! # 異常系（TASK-21.2）
 //!
 //! [`write_error_report`] は [`ErrorReport`] を JSON 1 行として書き出す。
@@ -41,6 +46,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
+use fandhe_edge_core::stage_report::PackageReport;
 use std::io::{self, Write};
 
 /// [`JudgmentResult`] を JSON 1 行＋改行として `out` へ書き、
@@ -107,6 +113,26 @@ pub fn write_error_report<W: Write>(out: &mut W, report: &ErrorReport) -> io::Re
     out.flush()?;
 
     Ok(report.code)
+}
+
+/// [`PackageReport`]（`package` 工程の exit 0 の結果）を JSON 1 行＋改行として
+/// `out` へ書き、[`ExitCode::Ok`] を返す（TASK-33.2-2）。
+///
+/// [`write_error_report`] と同じ保証を持つ: 直列化に失敗したら何も書かず `Err`、
+/// `write_all` は高々 1 回で、部分書き込み失敗時にリトライ・追記・flush をしない。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_package_report<W: Write>(out: &mut W, report: &PackageReport) -> io::Result<ExitCode> {
+    let mut line = report
+        .to_json_line()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(ExitCode::Ok)
 }
 
 /// [`InferInputError`] を [`ErrorReport`] へ変換する薄い関数。
@@ -412,6 +438,30 @@ mod tests {
         let mut writer = FailingWriter;
         let outcome = write_error_report(&mut writer, &report);
         assert!(outcome.is_err());
+    }
+
+    /// TASK-33.2-2: package の結果は JSON 1 行＋改行で書かれ exit 0 を返し、
+    /// 書き込み失敗は `Err` で伝わる（リトライ・追記なし）。
+    #[test]
+    fn req33_write_package_report_writes_line_and_propagates_failure() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let code = write_package_report(&mut buffer, &PackageReport::pass()).unwrap();
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(
+            String::from_utf8(buffer).unwrap(),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
+        );
+
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_package_report(&mut FailingWriter, &PackageReport::pass()).is_err());
     }
 
     /// TASK-21.2: 部分書き込み後に失敗する `Write` を渡した場合でも、本
