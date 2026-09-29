@@ -85,9 +85,11 @@
 //! キャンセルは無視して成功を報告する。Rust 側は stdin を閉じた後も supervisor の
 //! 終了状態と結果 JSON に従って分類する: 成功 JSON なら [`TrainRunEnd::Completed`]
 //! （確定済み。`Cancelling` → `Completed`）、それ以外（エラー JSON・終了状態の
-//! 不整合を含む。壁時計超過を除く）は [`TrainRunEnd::Cancelled`]（
-//! [`CancelStop::Cooperative`]。**キャンセル送出後に別の失敗が重なった場合も
-//! `Cancelled` と報告する。どちらの場合も成果物は確定していない**）。
+//! 不整合を含む。壁時計超過を除く）は [`TrainRunEnd::Cancelled`]。所定のキャンセル
+//! 応答（exit 70・`runtime_error`・固定メッセージ）を確認できたときだけ
+//! [`CancelStop::Cooperative`]、確認できなければ [`CancelStop::Unconfirmed`] とし、
+//! [`CancelledRun::out_dir_residue`] で残置を報告する（クラッシュを協調完了として
+//! 隠さない。どちらの場合も成果物は確定していない）。
 //!
 //! ## 責務分担
 //!
@@ -644,6 +646,12 @@ pub enum CancelStop {
     /// 協調の猶予内に終了せず `SIGKILL` で止めた。supervisor の後始末は走って
     /// いないため、[`CancelledRun::out_dir_residue`] の状態が残りうる。
     ForcedKill,
+    /// キャンセル送出後に supervisor が終了したが、所定のキャンセル応答
+    /// （exit 70・`runtime_error`・固定メッセージ）を確認できなかった（クラッシュ・
+    /// 外部からの終了・出力の不整合。`supervisor.py` が予約を解放した証拠が無い）。
+    /// 成果物は確定していないが、[`CancelledRun::out_dir_residue`] に読み取り専用の
+    /// 観測結果を持つ（異常を隠さない。削除はしない。REQ-34・#145）。
+    Unconfirmed,
 }
 
 /// `SIGKILL` フォールバック後の `out_dir` の読み取り専用の観測結果
@@ -739,11 +747,25 @@ impl CancelledRun {
         self.stop
     }
 
-    /// `SIGKILL` フォールバック後の `out_dir` の観測結果。[`CancelStop::ForcedKill`]
-    /// 以外では `None`（supervisor が解放済み、または起動前で、何も残らない）。
+    /// `SIGKILL` フォールバック後・応答未確認（[`CancelStop::Unconfirmed`]）の
+    /// `out_dir` の観測結果。それ以外では `None`（supervisor が解放済み、または起動前で、何も残らない）。
     #[must_use]
     pub fn out_dir_residue(&self) -> Option<OutDirResidue> {
         self.out_dir_residue
+    }
+
+    /// 所定のキャンセル応答を確認できないまま supervisor が終了した場合の結果
+    /// （REQ-34・#145）。残置の観測結果を必ず付ける。
+    #[cfg(unix)]
+    fn unconfirmed(elapsed: Duration, residue: OutDirResidue) -> Self {
+        Self {
+            elapsed,
+            child_spawned: true,
+            child_reaped: true,
+            signal: None,
+            stop: CancelStop::Unconfirmed,
+            out_dir_residue: Some(residue),
+        }
     }
 
     /// `ForcedKill` の実行に、`out_dir` の観測結果を付ける。
@@ -786,7 +808,7 @@ enum CancelStep {
     AlreadyExited(ExitStatus),
     /// キャンセル用パイプを閉じた後、`kill` を送らずに猶予内で自ら終了した
     /// （回収済み。協調キャンセル。REQ-34・#145）。呼び出し元は通常の結果分類へ
-    /// 合流し、成功 JSON なら `Completed`、それ以外なら `Cancelled(Cooperative)`。
+    /// 合流し、成功 JSON なら `Completed`、キャンセル応答なら `Cancelled(Cooperative)`、それ以外は `Cancelled(Unconfirmed)`。
     ExitedAfterSignal(ExitStatus),
     /// 協調の猶予内に終了せず `SIGKILL` を送って止めた。
     Cancelled(CancelledRun),
@@ -1573,7 +1595,7 @@ pub fn run_train_cancellable(
         limits,
         request,
     });
-    conclude_run(finished, cancel_signalled, started)
+    conclude_run(finished, cancel_signalled, started, request)
 }
 
 /// `SIGKILL` フォールバックの `Cancelled` に `out_dir` の読み取り専用の観測結果を
@@ -1600,30 +1622,57 @@ struct FinishInput<'a> {
 /// REQ-34・#145）。
 ///
 /// パイプを閉じていない（`cancel_signalled == false`）なら従来どおり。閉じた後は、
-/// supervisor の報告に従う: 成功 JSON は確定済みなので `Completed`、それ以外は
-/// `Cancelled(Cooperative)`（エラー JSON・終了状態の不整合を含む。どちらの場合も
-/// 成果物は確定していない）。壁時計超過（`WallTimeout`）はキャンセルより優先し、
+/// supervisor の報告に従う: 成功 JSON は確定済みなので `Completed`、所定の
+/// キャンセル応答（[`is_cancel_ack`]）は `Cancelled(Cooperative)`、それ以外
+/// （クラッシュ・別のエラー JSON・終了状態の不整合）は `Cancelled(Unconfirmed)` で
+/// 残置を観測して報告する（成果物は確定していないが、予約解放の証拠が無い）。壁時計超過（`WallTimeout`）はキャンセルより優先し、
 /// 従来どおりエラーで返す。
 #[cfg(unix)]
 fn conclude_run(
     finished: Result<TrainRun, TrainProcessError>,
     cancel_signalled: bool,
     started: Instant,
+    request: &TrainRequest,
 ) -> Result<TrainRunEnd, TrainProcessError> {
+    // 所定のキャンセル応答でない終了は `Unconfirmed` とし、残置を観測して報告する
+    // （supervisor のクラッシュ等を協調キャンセル完了として扱わない）。
+    let unconfirmed = || {
+        Ok(TrainRunEnd::Cancelled(CancelledRun::unconfirmed(
+            started.elapsed(),
+            inspect_out_dir_residue(request),
+        )))
+    };
     match finished {
         Ok(run) if !cancel_signalled || matches!(run.outcome, TrainOutcome::Ok(_)) => {
             Ok(TrainRunEnd::Completed(run))
         }
-        Ok(_) => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
+        Ok(run) if is_cancel_ack(&run) => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
             started.elapsed(),
         ))),
+        Ok(_) => unconfirmed(),
         Err(e @ TrainProcessError::WallTimeout { .. }) => Err(e),
-        Err(_) if cancel_signalled => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
-            started.elapsed(),
-        ))),
+        Err(_) if cancel_signalled => unconfirmed(),
         Err(e) => Err(e),
     }
 }
+
+/// `supervisor.py::_report_cancelled` の所定のキャンセル応答（exit 70・
+/// `runtime_error`・固定メッセージ）か。これだけが「supervisor が予約を解放して
+/// 終了した」証拠になる（REQ-34・#145）。
+#[cfg(unix)]
+fn is_cancel_ack(run: &TrainRun) -> bool {
+    run.exit_code == ExitCode::RuntimeError
+        && matches!(
+            &run.outcome,
+            TrainOutcome::Error(f)
+                if f.failure_code() == crate::result::FailureCode::RuntimeError
+                    && f.message() == CANCEL_ACK_MESSAGE
+        )
+}
+
+/// `supervisor.py::_report_cancelled` が出す固定メッセージ（両側で一致させる）。
+#[cfg(unix)]
+const CANCEL_ACK_MESSAGE: &str = "training cancelled by caller";
 
 /// 子（supervisor）の終了・回収後に、標準出力・標準エラー出力・終了コードを
 /// 検証して [`TrainRun`] を得る（[`run_train_cancellable`] の後半。協調キャンセルの
@@ -2423,26 +2472,74 @@ mod tests {
             limit_ms: 1,
             child_reaped: true,
         };
+        let request = test_request(None);
         // 送出前は従来どおり（エラーはエラー）。
         assert!(matches!(
-            conclude_run(Err(TrainProcessError::StdoutIncomplete), false, started),
+            conclude_run(
+                Err(TrainProcessError::StdoutIncomplete),
+                false,
+                started,
+                &request
+            ),
             Err(TrainProcessError::StdoutIncomplete)
         ));
-        // 送出後の別の失敗は `Cancelled`（成果物は確定していない）。
-        match conclude_run(Err(TrainProcessError::StdoutIncomplete), true, started) {
+        // 送出後の別の失敗（クラッシュ等）は `Unconfirmed`（残置を観測して報告する）。
+        match conclude_run(
+            Err(TrainProcessError::StdoutIncomplete),
+            true,
+            started,
+            &request,
+        ) {
             Ok(TrainRunEnd::Cancelled(run)) => {
-                assert_eq!(run.stop(), CancelStop::Cooperative);
+                assert_eq!(run.stop(), CancelStop::Unconfirmed);
                 assert_eq!(run.signal(), None);
-                assert_eq!(run.out_dir_residue(), None);
+                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::Absent));
                 assert!(run.child_spawned() && run.child_reaped());
             }
-            _ => panic!("expected Cancelled"),
+            _ => panic!("expected Cancelled(Unconfirmed)"),
         }
         // 壁時計超過は送出後でもキャンセルより優先する。
         assert!(matches!(
-            conclude_run(Err(wall()), true, started),
+            conclude_run(Err(wall()), true, started, &request),
             Err(TrainProcessError::WallTimeout { .. })
         ));
+    }
+
+    /// REQ-34・#145: 所定のキャンセル応答（exit 70・`runtime_error`・固定メッセージ）
+    /// だけが `Cooperative`。別のエラー JSON（exit 70 でもメッセージ違い）は
+    /// `Unconfirmed` で、残置を観測して報告する。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_requires_cancel_ack_for_cooperative() {
+        let started = Instant::now();
+        let request = test_request(None);
+        let run_of = |message: &str| {
+            let json =
+                format!(r#"{{"status":"error","code":"runtime_error","message":"{message}"}}"#);
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            }
+        };
+        match conclude_run(Ok(run_of(CANCEL_ACK_MESSAGE)), true, started, &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Cooperative);
+                assert_eq!(run.out_dir_residue(), None);
+            }
+            _ => panic!("expected Cancelled(Cooperative)"),
+        }
+        match conclude_run(Ok(run_of("worker crashed")), true, started, &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Unconfirmed);
+                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::Absent));
+            }
+            _ => panic!("expected Cancelled(Unconfirmed)"),
+        }
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
