@@ -476,14 +476,14 @@ def _report_cancelled(reservation: contract.OutDirReservation) -> ExitCode:
     語彙（`runtime_error`）だけを使い、終了コードの 70 は暫定値で Rust 側は
     これに依存しない（キャンセルの写像は TASK-33.x。REQ-21・REQ-34）。
     """
-    contract.cleanup_reservation(reservation)
-    _emit(
-        {
-            "status": "error",
-            "code": "runtime_error",
-            "message": "training cancelled by caller",
-        }
+    released = contract.cleanup_reservation(reservation)
+    # 解放を確認できない場合は所定の協調キャンセル応答（Rust 側 `is_cancel_ack`）を
+    # 出さない。別メッセージにより呼び出し側は Unconfirmed（残置あり）として扱う
+    # （REQ-34「協調キャンセルでは公開場所に何も残らない」・#145）。
+    message = (
+        "training cancelled by caller" if released else "training cancelled but cleanup incomplete"
     )
+    _emit({"status": "error", "code": "runtime_error", "message": message})
     return ExitCode.RUNTIME_ERROR
 
 

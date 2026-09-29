@@ -1052,6 +1052,32 @@ def test_req34_cancel_after_worker_output_before_verify_does_not_publish(
     assert _tmp_leftovers(tmp_path) == []
 
 
+def test_req34_cancel_with_incomplete_cleanup_does_not_report_cooperative_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34: 予約の解放を確認できない（rmdir 失敗）場合は所定の協調キャンセル
+    応答を出さず、呼び出し側が残置ありとして扱える別メッセージを返す。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "ok")
+    event = threading.Event()
+    real_parse = supervisor._parse_worker_stdout
+
+    def _parse_then_cancel(raw: bytes):
+        payload = real_parse(raw)
+        event.set()
+        return payload
+
+    def _rmdir_fails(*args: object, **kwargs: object) -> None:
+        raise PermissionError("simulated rmdir failure")
+
+    monkeypatch.setattr(supervisor, "_parse_worker_stdout", _parse_then_cancel)
+    monkeypatch.setattr(contract.os, "rmdir", _rmdir_fails)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.RUNTIME_ERROR
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["message"] == "training cancelled but cleanup incomplete"
+    assert out_dir.exists()
+
+
 def test_req34_cancel_right_before_finalize_does_not_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

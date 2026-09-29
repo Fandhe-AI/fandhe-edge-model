@@ -196,7 +196,9 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
             let _ = std::fs::remove_dir_all(".out.tmp-0000");
             let _ = std::fs::remove_dir_all("out");
-            print!(r#"{{"status":"error","code":"runtime_error","message":"m"}}"#);
+            print!(
+                r#"{{"status":"error","code":"runtime_error","message":"training cancelled by caller"}}"#
+            );
             std::process::exit(70);
         }
         "coop_cancel_after_publish" => {
