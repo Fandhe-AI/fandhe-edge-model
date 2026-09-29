@@ -198,6 +198,31 @@ impl Drop for TempDir {
     }
 }
 
+/// 排他的に新規作成した一意な一時ディレクトリを作る。既存パスは削除も再利用もしない
+/// （`create_dir` は既存なら失敗するため、他者のディレクトリを破壊しない）。
+fn create_unique_dir() -> (PathBuf, TempDir) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..100u32 {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-env-isolation-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let guard = TempDir(dir.clone());
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod dir");
+                return (dir, guard);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("mkdir failed: {e}"),
+        }
+    }
+    panic!("could not create a unique temp dir");
+}
+
 fn write_trap(dir: &Path, name: &str, marker: &Path) {
     let file = dir.join(name);
     let body = format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display());
@@ -209,11 +234,7 @@ fn write_trap(dir: &Path, name: &str, marker: &Path) {
 /// （「たまたま PATH に無かった」ことではなく「起動していない」ことを示す）。
 #[test]
 fn req32_inference_does_not_invoke_python_from_path() {
-    let dir = std::env::temp_dir().join(format!("fandhe-env-isolation-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).expect("mkdir");
-    let _guard = TempDir(dir.clone());
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod dir");
+    let (dir, _guard) = create_unique_dir();
     let marker = dir.join("trap-invoked.marker");
     for name in ["python", "python3", "uv"] {
         write_trap(&dir, name, &marker);

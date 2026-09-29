@@ -42,7 +42,14 @@ esac
 command -v "$TOOL" >/dev/null 2>&1 || { echo "error: $TOOL not found" >&2; exit 1; }
 
 list_libs() {
-  if [ "$TOOL" = otool ]; then otool -L "$1"; else ldd "$1"; fi
+  # otool -L は先頭行に検査対象パス自体を出すため除き、ライブラリ行だけを判定対象にする
+  # （作業ディレクトリ名に python・mlx が含まれても誤一致させない）
+  if [ "$TOOL" = otool ]; then
+    out=$(otool -L "$1") || return 1
+    printf '%s\n' "$out" | sed 1d
+  else
+    ldd "$1"
+  fi
 }
 
 for bin in "$CLI_BIN" "$TEST_BIN"; do
