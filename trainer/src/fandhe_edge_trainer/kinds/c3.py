@@ -424,6 +424,8 @@ def predict_labels(
             "prediction requires a resource budget",
             ExitCode.RUNTIME_ERROR,
         )
+    # 学習後は eval のはずだが、dropout を持つため予測前に明示的に固定する（冪等）。
+    trained.model.eval()
     chunk_size = max(1, min(int(trained.config["batch_size"]), MAX_C3_BATCH_SIZE))
     records: list[dict[str, Any]] = []
     for start in range(0, len(rows), chunk_size):
