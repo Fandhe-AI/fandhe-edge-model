@@ -100,6 +100,10 @@ impl Env {
                  echo '{{\"code\":\"ok\",\"status\":\"skipped\"}}'\n\
                  exit 0\n\
                  fi\n\
+                 if [ -n \"${{FAKE_STAGE_OUT_SET:-}}\" ]; then\n\
+                 printf '%s' \"$FAKE_STAGE_OUT\"\n\
+                 exit 0\n\
+                 fi\n\
                  echo '{{\"code\":\"ok\"}}'\n\
                  exit 0\n",
                 cli_log.display()
@@ -569,4 +573,67 @@ fn req38_real_binary_reports_runtime_error_at_register() {
     assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
     assert!(o.stdout.contains("\"failed_step\":\"register\""));
     assert_eq!(e.launch_calls().len(), 1);
+}
+
+/// --out-dir が --project-dir と同一・配下・祖先だと 64 で拒否し、CLI を起動せず
+/// 未作成の project-dir を作らない（REQ-33・REQ-38）。
+#[test]
+fn req33_out_dir_overlapping_project_dir_is_rejected() {
+    let e = Env::new();
+    let project = e.project().display().to_string();
+    let cases = [
+        (project.clone(), project.clone()),
+        (project.clone(), format!("{project}/out")),
+        (format!("{project}/nested"), e.dir.display().to_string()),
+        (project.clone(), format!("{project}/sub/../../project")),
+    ];
+    for (proj, out) in cases {
+        let o = e.run(
+            &s(&[
+                "--definition",
+                &e.definition().display().to_string(),
+                "--project-dir",
+                &proj,
+                "--out-dir",
+                &out,
+            ]),
+            &[],
+        );
+        assert_eq!(
+            o.code,
+            Some(64),
+            "proj={proj} out={out} stdout={}",
+            o.stdout
+        );
+        assert!(!e.project().exists(), "proj={proj} out={out}");
+        assert!(e.cli_calls().is_empty());
+    }
+}
+
+/// 終了コード 0 でも stdout が空・不正 JSON・複数 JSON・code 不整合なら 70 で停止する
+/// （REQ-21・REQ-33）。
+#[test]
+fn req33_zero_exit_with_invalid_stage_output_stops_with_70() {
+    let bad = [
+        "",
+        "not json",
+        "{\"code\":\"ok\"}\n{\"code\":\"ok\"}",
+        "[]",
+        "{\"code\":\"judged_fail\"}",
+        "{}",
+    ];
+    for out in bad {
+        let e = Env::new();
+        let o = e.run(
+            &e.base_args(),
+            &[("FAKE_STAGE_OUT", out), ("FAKE_STAGE_OUT_SET", "1")],
+        );
+        assert_eq!(o.code, Some(70), "out={out:?} stdout={}", o.stdout);
+        assert!(
+            o.stdout.contains("\"failed_step\":\"register\""),
+            "{}",
+            o.stdout
+        );
+        assert_eq!(e.cli_calls().len(), 1, "out={out:?}");
+    }
 }

@@ -43,9 +43,12 @@
 #     と工程ごとのバイト数を #163 へ引き渡す）。工程の stdout・stderr の本文は永続化しない
 #     （推論結果・エラーに学習・評価データの本文が含まれうるため。security.md）。
 #     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
-#   - evaluate の skipped 判定は stdout を JSON として解析し、トップレベルの status だけを
-#     見る（python3 の json で構造検証）。解析できない・JSON オブジェクトでない場合は
-#     判定不能として runtime_error(70)（fail-closed。REQ-17・REQ-21）
+#   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。単一の JSON オブジェクトで
+#     トップレベルの code が "ok" でなければ、空出力・不正 JSON・code 不整合を含めて
+#     runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。evaluate はさらに
+#     トップレベルの status だけを見て skipped を判定する（REQ-17）
+#   - --out-dir は --project-dir と同一・包含関係にないこと（両パスを物理パスへ正規化して比較。
+#     違反は invalid_input(64)。mkdir が未作成の project-dir を先に作る契約違反を防ぐ）
 #
 # 前提条件（通信を伴う準備は sandbox の外で先に済ませる。REQ-38。本スクリプトは
 # cargo build・uv sync を実行しない）: ビルド済みバイナリ
@@ -149,6 +152,39 @@ if [ -e "$out_dir" ] || [ -L "$out_dir" ]; then
     fi
     [ -z "$(ls -A -- "$out_dir")" ] || fail 64 invalid_input "output directory is not empty"
 fi
+
+# パスを物理パスへ正規化する（未作成の末尾は字句的に連結。macOS に realpath -m が無いため）。
+# 未作成部分に `..` を含む・祖先がディレクトリでない場合は 1 を返す。結果は canon_out へ入れる
+canon_out=
+canon_path() {
+    _p=$1
+    case "$_p" in /*) ;; *) _p="$PWD/$_p" ;; esac
+    _rest=
+    while [ ! -e "$_p" ] && [ ! -L "$_p" ]; do
+        _base=${_p##*/}
+        _p=${_p%/*}
+        [ -n "$_p" ] || _p=/
+        case "$_base" in
+            '' | .) ;;
+            ..) return 1 ;;
+            *) _rest="/$_base$_rest" ;;
+        esac
+    done
+    [ -d "$_p" ] || return 1
+    _phys=$(cd -P -- "$_p" && pwd -P) || return 1
+    canon_out="${_phys%/}$_rest"
+}
+canon_project=
+canon_path "$project_dir" || fail 64 invalid_input "cannot resolve project directory"
+canon_project=$canon_out
+canon_path "$out_dir" || fail 64 invalid_input "cannot resolve output directory"
+# --out-dir の作成が未作成の --project-dir を先に作ってしまわないよう、同一・包含を拒否する
+case "$canon_out/" in
+    "$canon_project/"*) fail 64 invalid_input "output directory must be separate from project directory" ;;
+esac
+case "$canon_project/" in
+    "$canon_out/"*) fail 64 invalid_input "output directory must be separate from project directory" ;;
+esac
 
 # ---- 前提（launcher・バイナリ）。CLI を起動する前に fail-closed で確認する ----
 override=false
@@ -333,9 +369,10 @@ do_step() {
     run_step "$prefix" "$@"
     t1=$(utc_now)
     status=null
-    if [ "$name" = "evaluate" ] && [ "$step_rc" -eq 0 ]; then
-        # stdout を JSON として解析し、トップレベルの status だけを見る。
-        # 出力は skipped / other / invalid のいずれかの固定語
+    if [ "$step_rc" -eq 0 ]; then
+        # 終了コード 0 でも出力を信用しない。stdout が単一の JSON オブジェクトで、
+        # トップレベルの code が "ok"（終了コード 0 と整合）であることを検証する。
+        # 出力は skipped / ok / invalid のいずれかの固定語（evaluate は status も見る）
         verdict=$(python3 -c '
 import json, sys
 try:
@@ -343,14 +380,16 @@ try:
 except Exception:
     print("invalid")
     sys.exit(0)
-if not isinstance(v, dict):
+if not isinstance(v, dict) or v.get("code") != "ok":
     print("invalid")
+elif sys.argv[1] == "evaluate" and v.get("status") == "skipped":
+    print("skipped")
 else:
-    print("skipped" if v.get("status") == "skipped" else "other")
-' <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
+    print("ok")
+' "$name" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;
-            other) status='"ok"' ;;
+            ok) [ "$name" != "evaluate" ] || status='"ok"' ;;
             *) step_rc=70 ;;
         esac
     fi
