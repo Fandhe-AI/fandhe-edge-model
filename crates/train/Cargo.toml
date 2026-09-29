@@ -25,3 +25,14 @@ fandhe-edge-eval.workspace = true
 
 [lints]
 workspace = true
+
+# `tests/worker_process.rs` は MLX 不要の偽ワーカー（`main()` が argv を見て
+# 偽ワーカーとテストランナーのどちらとして振る舞うか分岐する）を同じテスト
+# バイナリに同居させる（issue #178 実装計画 3.8）。libtest（既定の
+# harness）付きで再実行すると `running 1 test` 等が stdout に出て、
+# 学習ワーカーの「JSON 1 行」契約を偽ワーカーが再現できなくなるため
+# `harness = false` にする。
+[[test]]
+name = "worker_process"
+path = "tests/worker_process.rs"
+harness = false

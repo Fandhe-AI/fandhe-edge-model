@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ import pytest
 
 from conftest import LABEL_ORDER, TINY_CONFIG
 from fandhe_edge_trainer import contract, guard, supervisor
+from fandhe_edge_trainer.exitcode import ExitCode
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
@@ -90,22 +92,38 @@ def test_monitor_child_returns_none_on_normal_completion() -> None:
     assert proc.wait(timeout=5) == 0
 
 
-def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
+def test_monitor_child_fails_closed_when_status_race_with_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`wait` のタイムアウト直後に子が正常終了し `ps` が PID を見つけられない
-    競合でも、監視失敗（monitor_failed）ではなく通常の終了として扱う。
+    """issue #178 PR #233 レビュー再々指摘 P0: `_current_child_status` が
+    `None` を返す場合（`wait` のタイムアウト直後に子が正常終了し `ps` が
+    PID を見つけられない競合を含む）は、正常終了かどうかを安全に区別する
+    手段が無いため、常に `monitor_failed` として fail-closed に扱う
+    （以前は `proc.poll()` で確認して通常終了として扱っていたが、これは
+    `killpg` を経由しない回収経路になっていたため廃止した）。
 
-    `_current_child_rss_bytes` が「子の終了を待ってから None を返す」ように
-    差し替え、競合を決定的に再現する。
+    `_current_child_status` が「子がゾンビになるまで（＝回収せずに）待って
+    から None を返す」ように差し替え、競合を決定的に再現する。**回収
+    （`proc.wait()`）はしない**: `_terminate_and_reap` が呼ぶ `killpg` は
+    「対象がまだ回収されていない（実行中またはゾンビ）」ことを前提に
+    安全とされているため、このモック自身が先に回収してしまうと
+    `_terminate_and_reap` が既に無効な pid へ `killpg` する形になり、
+    検証したい不変条件と矛盾する（本物の `_current_child_status` を使って
+    ゾンビになるのを待つだけで、回収は一切行わない）。
     """
     proc = _spawn("import time; time.sleep(0.3)")
+    real_status = supervisor._current_child_status
 
-    def _ps_after_exit(pid: int) -> None:
-        proc.wait(timeout=5)
+    def _none_after_zombie(pid: int) -> tuple[int, bool] | None:
+        deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < deadline:
+            status = real_status(pid)
+            if status is not None and status[1]:  # is_zombie
+                break
+            time_mod.sleep(0.01)
         return None
 
-    monkeypatch.setattr(supervisor, "_current_child_rss_bytes", _ps_after_exit)
+    monkeypatch.setattr(supervisor, "_current_child_status", _none_after_zombie)
     try:
         reason = supervisor.monitor_child(
             proc,
@@ -114,10 +132,129 @@ def test_monitor_child_treats_exit_between_wait_and_ps_as_normal(
             poll_interval=0.05,
             grace_seconds=0.0,
         )
-        assert reason is None
-        assert proc.returncode == 0
+        assert reason == "monitor_failed"
     finally:
         _reap(proc)
+
+
+def test_monitor_child_treats_late_zombie_detection_as_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #178 PR #233 レビュー再々々指摘 P1: `ps` でゾンビ（終了済み）と
+    分かっても、それだけで「締め切り内に終了した」ことにはならない。`ps`
+    のポーリング間隔・`_current_child_status` 自体の所要時間により、実際
+    には壁時計の締め切りを過ぎてから初めてゾンビだと気づく場合がある。
+    この場合、`_classify_self_exit`（正常終了・`RLIMIT_CPU` 自己終了の
+    判定）を呼ばずに `"time"` として扱わなければならない（呼び出し元
+    `_monitor_worker_and_finalize` はこれを他の強制終了理由と同様に
+    予約解放のみ〔確定しない〕の経路へ流す。REQ-39。成果物が確定される
+    経路は `killed_reason is None` のときだけであり、`"time"` はその経路
+    に入らない）。
+
+    `time.monotonic` を差し替え、「deadline 計算時は締め切り内」→
+    「ゾンビ検知直後のチェック時は締め切りを大きく超えている」という
+    競合を決定的に再現する（`_current_child_status` 自体は実プロセスの
+    生死を問わず常にゾンビを報告するよう差し替え、`ps` のタイミングに
+    左右されないようにする）。`subprocess` 内部のタイムアウト計算は
+    モジュール読み込み時に `from time import monotonic as _time` で
+    束縛された別参照を使うため、本差し替えの影響を受けない
+    （`_terminate_and_reap` 内の `proc.wait(timeout=10)` は正常に動く）。
+    """
+    proc = _spawn("import time; time.sleep(60)")
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: (1024 * 1024, True))
+
+    calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        calls["n"] += 1
+        # 1 回目: `deadline = time.monotonic() + time_limit_seconds` の計算
+        # （締め切りは 1.0 秒後になる）。2 回目以降: ゾンビ検知直後の
+        # 締め切りチェックで、締め切りを大きく超えていることにする。
+        return 0.0 if calls["n"] == 1 else 1000.0
+
+    monkeypatch.setattr(supervisor.time, "monotonic", _fake_monotonic)
+
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=1.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason == "time"
+    finally:
+        _reap(proc)
+
+
+def test_run_supervised_train_does_not_finalize_artifact_on_late_zombie_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue #178 PR #233 レビュー再々々指摘 P1 への end-to-end 回帰:
+    実際の `_worker`（`c3`・`TINY_CONFIG`）を締め切り内に正常終了させつつ、
+    `monitor_child` がそのゾンビ状態に気づくタイミングだけを締め切り超過後
+    にずらし、成果物（`out_dir`）が確定されず `limit_exceeded`（exit 20）に
+    なることを確認する（`test_monitor_child_treats_late_zombie_detection_as_
+    timeout` の単体テストに対し、`_monitor_worker_and_finalize` の予約解放
+    経路まで含めた確認）。
+
+    `_current_child_status` を実装をそのまま呼びつつ、初めてゾンビを観測
+    した瞬間にフラグを立てるラッパーへ差し替える。`time.monotonic` は
+    フラグが立つまでは実時間をそのまま返し、フラグが立った後は実時間へ
+    大きなオフセットを足して返す。これにより、学習自体は通常どおり
+    （既定の大きな `time_limit_seconds`〔`MAX_TRAIN_WALL_SECONDS`〕の下で）
+    正常に完了しつつ、`monitor_child` 側だけが「ゾンビ検知の直後には
+    締め切りを大きく超えていた」状況を観測する。
+    """
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    real_status = supervisor._current_child_status
+    late = {"is_late": False}
+
+    def _status_and_flag_first_zombie(pid: int) -> tuple[int, bool] | None:
+        status = real_status(pid)
+        if status is not None and status[1]:  # is_zombie
+            late["is_late"] = True
+        return status
+
+    monkeypatch.setattr(supervisor, "_current_child_status", _status_and_flag_first_zombie)
+
+    real_monotonic = time_mod.monotonic
+
+    def _fake_monotonic() -> float:
+        return real_monotonic() + (10_000.0 if late["is_late"] else 0.0)
+
+    monkeypatch.setattr(supervisor.time, "monotonic", _fake_monotonic)
+
+    exit_code = supervisor.run_supervised_train(request_path)
+    assert int(exit_code) == int(ExitCode.LIMIT_EXCEEDED)
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "error"
+    assert payload["code"] == "limit_exceeded"
+    assert "time" in payload["message"]
+
+    # 成果物は確定されておらず、予約（out_dir・作業用一時ディレクトリ）も
+    # 残置されていない。
+    assert not out_dir.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
 def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,6 +313,318 @@ def test_monitor_child_maps_rlimit_cpu_self_kill_to_limit_exceeded() -> None:
         assert proc.poll() is not None
     finally:
         _reap(proc)
+
+
+# --------------------------------------------------------------------------
+# `_terminate_worker`: `_worker` のプロセスグループ全体を終了させること
+# （REQ-39。issue #178 PR #233 レビュー）
+# --------------------------------------------------------------------------
+
+
+def test_terminate_worker_kills_grandchild_too(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー: 内部タイムアウト時に `_worker` 役
+    （`monitor_child` に渡す `proc`）だけでなく、その子（孫プロセス）も
+    一括して終了すること（`_worker` を `start_new_session=True` で別
+    グループへ切り離し、`os.killpg` でグループごと終了させる）。
+    """
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、自分の子（孫プロセス）を「同じグループに
+    # 残したまま」（`start_new_session` を指定しない＝デフォルトで継承）
+    # 起動する。孫は heartbeat ファイルへ書き続ける。
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        "time.sleep(60)\n"
+    )
+    proc = _spawn(code)
+    try:
+        # `monitor_child` 自身の壁時計（`time_limit_seconds=0.2`）が起動する
+        # 前に、孫プロセスが実際に起動済み（heartbeat が書かれ始めている）
+        # ことを確認しておく。冷えた CI ランナーでは `python -c` の起動に
+        # 100〜300ms かかることがあり、確認せずに `monitor_child` を呼ぶと
+        # 「孫がまだ起動していないうちにタイムアウトが発火し、heartbeat が
+        # 一度も作られない」という無関係な理由でテストが flaky になる。
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not heartbeat.exists():
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started before invoking monitor_child"
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=0.2,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason == "time"
+
+        size_after_kill = heartbeat.stat().st_size
+        time_mod.sleep(0.3)
+        assert heartbeat.stat().st_size == size_after_kill, (
+            "grandchild must not still be writing after monitor_child returns"
+        )
+    finally:
+        _reap(proc)
+
+
+def _process_alive(pid: int) -> bool:
+    """`os.kill(pid, 0)` でシグナルを送らずに対象の生存を確認する。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 権限の理由で確認できない場合は「存在する」とみなす（fail-closed）。
+        return True
+    return True
+
+
+def test_monitor_child_kills_grandchild_after_worker_exits_normally(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー再指摘 P0「worker が先に終了すると、
+    子孫プロセスが残る」への回帰テスト: `_worker` 役が孫プロセスを起動した
+    直後に自分自身はすぐ正常終了しても（孫を明示的に `wait()` しない）、
+    `monitor_child` が戻った後には孫プロセスも消えていること。
+
+    孫は supervisor（本テストプロセス）の子ではなく `_worker` 役の子である
+    ため、本テストプロセスからは回収されずゾンビ判定の問題は起きない
+    （`os.kill(pid, 0)` でそのまま生存確認できる）。ゾンビの残骸が一瞬
+    見えることがあるため、少し待ってからもう一度確認する。
+    """
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、孫プロセスを起動した直後（`wait()` せず）に
+    # 自分自身はすぐ正常終了する。孫は同じプロセスグループに残ったままに
+    # なる（`start_new_session` を指定しないため）。
+    code = (
+        "import subprocess, sys\n"
+        f"p = subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(p.pid))\n"
+    )
+    proc = _spawn(code)
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            heartbeat.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started"
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason is None
+        assert proc.returncode == 0
+
+        deadline = time_mod.monotonic() + 5.0
+        alive = _process_alive(grandchild_pid)
+        while alive and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+            alive = _process_alive(grandchild_pid)
+        assert not alive, "grandchild must be terminated after monitor_child returns"
+    finally:
+        _reap(proc)
+
+
+def test_monitor_child_kills_grandchild_when_status_always_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #178 PR #233 レビュー再々指摘 P0 への回帰テスト: `_current_child_status`
+    が常に `None`（`ps` の恒常的な失敗を模す）を返す場合でも、`monitor_child` は
+    `proc.poll()` で正常終了を装って回収するのではなく、必ず `killpg` してから
+    `monitor_failed` を返し、`_worker` 役が残した孫プロセスも終了させること。
+    """
+    heartbeat = tmp_path / "grandchild-heartbeat.txt"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import time\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "while True:\n"
+        "    with open(heartbeat, 'a') as f:\n"
+        "        f.write('.')\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    # `_worker` 役（`proc`）は、孫プロセスを起動した直後に自分自身はすぐ
+    # 正常終了する（孫は同じプロセスグループに残ったままになる）。
+    code = (
+        "import subprocess, sys\n"
+        f"p = subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(p.pid))\n"
+    )
+    proc = _spawn(code)
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: None)
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            heartbeat.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert heartbeat.exists(), "grandchild must have started"
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        # `ps` が常に失敗する以上、正常終了として扱ってはならない
+        # （`proc.poll()` を代替の確認手段に使っていた旧実装は、これを
+        # 「正常終了」として誤って返していた）。
+        assert reason == "monitor_failed"
+
+        deadline = time_mod.monotonic() + 5.0
+        alive = _process_alive(grandchild_pid)
+        while alive and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+            alive = _process_alive(grandchild_pid)
+        assert not alive, "grandchild must be terminated even when status is unknown"
+    finally:
+        _reap(proc)
+
+
+# --------------------------------------------------------------------------
+# lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理から
+# worker 自身が親の死を検知する方式への全面移行）
+# --------------------------------------------------------------------------
+
+
+def test_lifeline_write_end_not_passed_to_worker() -> None:
+    """REQ-39・issue #178 PR #233 レビュー: lifeline パイプの書き込み端は
+    `_worker` へ渡さない（`_spawn_worker_and_finalize` の `pass_fds` には
+    読み取り端だけを含める）こと。`_worker` 役の子プロセスが書き込み端の
+    fd 番号へ書き込もうとすると `OSError`（対象の fd が存在しない）に
+    なることで確認する。書き込み端が漏れていると、`_worker` 自身がその
+    複製を保持し続けるため、supervisor が終了してもカーネルが書き込み端を
+    閉じられず、lifeline の EOF が届かなくなる。
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        code = (
+            "import os\n"
+            "try:\n"
+            f"    os.write({write_fd}, b'x')\n"
+            "except OSError:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        )
+        result = subprocess.run(  # noqa: S603 - テスト専用。引数は固定・shell 不使用
+            [sys.executable, "-c", code],
+            pass_fds=(read_fd,),
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, "worker role must not have access to the lifeline write end"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_lifeline_worker_and_grandchild_die_when_supervisor_is_killed(tmp_path: Path) -> None:
+    """REQ-39・issue #178 PR #233 レビュー: supervisor 役を `SIGKILL` すると、
+    lifeline により worker 役・孫プロセスが有界時間内に消滅すること。
+
+    supervisor がどのような形で終了しても（正常終了・内部タイムアウトに
+    よる `killpg`・外側からの `SIGKILL` を含む）、カーネルが lifeline の
+    書き込み端を自動的に閉じるため、worker 側の EOF 検知は必ず働く、という
+    設計の核心を検証する（`cli.py::_start_lifeline_thread` を実プロセスへ
+    組み込んで確認する。証拠種別: テストハーネス）。
+    """
+    worker_pid_path = tmp_path / "worker.pid"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+
+    worker_script = tmp_path / "worker_role.py"
+    worker_script.write_text(
+        "import os, subprocess, sys, time\n"
+        f"sys.path.insert(0, {_SRC_DIR!r})\n"
+        "from fandhe_edge_trainer import cli\n"
+        "lifeline_fd = int(sys.argv[1])\n"
+        "cli._start_lifeline_thread(lifeline_fd)\n"
+        f"open({str(worker_pid_path)!r}, 'w').write(str(os.getpid()))\n"
+        "grandchild = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time\\nwhile True: time.sleep(0.05)']\n"
+        ")\n"
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(grandchild.pid))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    supervisor_script = tmp_path / "supervisor_role.py"
+    supervisor_script.write_text(
+        "import os, subprocess, sys, time\n"
+        "r, w = os.pipe()\n"
+        f"subprocess.Popen(\n"
+        f"    [sys.executable, {str(worker_script)!r}, str(r)],\n"
+        "    pass_fds=(r,),\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "os.close(r)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    supervisor_proc = subprocess.Popen(  # noqa: S603 - テスト専用。引数は固定・shell 不使用
+        [sys.executable, str(supervisor_script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        startup_deadline = time_mod.monotonic() + 5.0
+        while time_mod.monotonic() < startup_deadline and not (
+            worker_pid_path.exists() and grandchild_pid_path.exists()
+        ):
+            time_mod.sleep(0.01)
+        assert worker_pid_path.exists(), "worker role must have started"
+        assert grandchild_pid_path.exists(), "grandchild must have started"
+
+        worker_pid = int(worker_pid_path.read_text().strip())
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        supervisor_proc.kill()  # SIGKILL
+        supervisor_proc.wait(timeout=5)
+
+        for role, pid in (("worker", worker_pid), ("grandchild", grandchild_pid)):
+            death_deadline = time_mod.monotonic() + 5.0
+            while time_mod.monotonic() < death_deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time_mod.sleep(0.02)
+            else:
+                pytest.fail(
+                    f"{role} (pid {pid}) did not die within the bound after supervisor SIGKILL"
+                )
+    finally:
+        if supervisor_proc.poll() is None:
+            supervisor_proc.kill()
+            supervisor_proc.wait(timeout=5)
 
 
 def test_parse_worker_stdout_accepts_single_json_object() -> None:
@@ -269,16 +718,17 @@ def test_supervisor_module_does_not_import_mlx() -> None:
 def test_worker_argv_uses_isolated_mode_and_launch_script() -> None:
     """`supervisor.worker_argv`（Issue #12）が組み立てる argv が、`sys.executable`・
     `-I`（隔離モード）・実在する `trainer/launch.py` の絶対パス・
-    `["_worker", "--out-fd", "<n>"]` から成ることを具体値で確認する。
+    `["_worker", "--out-fd", "<n>", "--lifeline-fd", "<n>"]` から成ることを
+    具体値で確認する（`--lifeline-fd`: issue #178 PR #233 レビュー）。
     """
-    argv = supervisor.worker_argv(7)
+    argv = supervisor.worker_argv(7, 8)
     assert argv[0] == sys.executable
     assert argv[1] == "-I"
     launch_script = Path(argv[2])
     assert launch_script.is_absolute()
     assert launch_script.name == "launch.py"
     assert launch_script.is_file()
-    assert argv[3:] == ["_worker", "--out-fd", "7"]
+    assert argv[3:] == ["_worker", "--out-fd", "7", "--lifeline-fd", "8"]
 
 
 def test_run_supervised_train_rejects_invalid_request_without_spawning_worker(
@@ -410,5 +860,45 @@ def test_spawn_worker_and_finalize_cleans_up_reservation_when_tempfile_creation_
         # （cleanup_reservation が例外経路でも呼ばれたことの確認）。
         assert not (tmp_path / "out").exists()
         assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+    finally:
+        entry.close()
+
+
+def test_spawn_worker_and_finalize_cleans_up_reservation_when_pipe_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue #178 PR #233 レビュー再々指摘 P1: lifeline パイプ作成
+    （`os.pipe()`）が（fd 数の上限超過等で）`OSError` を送出した場合でも、
+    既に確保済みの予約（`out_dir`・作業用一時ディレクトリ）が残置されず
+    解放されること。`os.pipe` を差し替えて決定的に再現する
+    （証拠種別: テストハーネス）。
+    """
+    root_handle = guard.resolve_root(str(tmp_path))
+    entry = guard.confine(root_handle, "out", "out_dir")
+    root_handle.close()
+    reservation = contract.prepare_out_dir(entry)
+
+    def _boom() -> tuple[int, int]:
+        raise OSError("simulated EMFILE while creating the lifeline pipe")
+
+    monkeypatch.setattr(supervisor.os, "pipe", _boom)
+
+    try:
+        exit_code = supervisor._spawn_worker_and_finalize(
+            b'{"schema_version": 1}',
+            reservation,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+        )
+        assert exit_code == ExitCode.RUNTIME_ERROR
+
+        # 予約済み out_dir・作業用一時ディレクトリのいずれも残っていない
+        # （cleanup_reservation が呼ばれたことの確認）。
+        assert not (tmp_path / "out").exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["status"] == "error"
+        assert payload["code"] == "runtime_error"
     finally:
         entry.close()
