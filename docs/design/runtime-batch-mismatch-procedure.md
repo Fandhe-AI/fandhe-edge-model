@@ -10,7 +10,9 @@ spec の内容は要約であり、詳細は spec の REQ-28・PoC-16（`03-poc/
 適用する場面は次のとおり。
 
 - `crates/runtime/tests/full_match.rs`（単体・バッチ・評価器の 3 経路の予測ラベル全件一致。TASK-28.1-2・#118）が不一致を 1 件以上検出した
-- 実前処理・ONNX 実装後（#112・#113）に同じハーネスを再実行して不一致が出た
+- 実前処理・ONNX 経路の全件一致テスト `crates/runtime/tests/onnx_parity.rs`（`req32_c1_labels_match_mlx`・`req32_c3_labels_match_mlx`。TASK-32.1-2・#113）が、単体推論と `infer_batch`・`as_predict_fn` の不一致（`batch differs from single` 等）または MLX との予測ラベル不一致を検出した
+
+注意: `full_match.rs` は固定の `MockPre`・`MockBackend` を使う模擬ハーネスで、実前処理・実 ONNX 推論を通らない。したがって、実モデルでのバッチ依存の不具合が直ったかの確認には使えない。`full_match.rs` は 3 経路の比較器そのものの検証（陰性対照を含む）に位置づけ、実モデルの REQ-28 一致確認は `onnx_parity.rs` で行う。
 
 ## 2. 不変条件（緩めない）
 
@@ -25,7 +27,7 @@ spec の内容は要約であり、詳細は spec の REQ-28・PoC-16（`03-poc/
 
 ## 3. 検出
 
-1. `label_mismatches`（`full_match.rs`）が返す不一致 index の一覧を取る。その件数が「修正前の不一致件数」になる。
+1. 検出したテスト（模擬ハーネスなら `full_match.rs` の `label_mismatches`、実モデルなら `onnx_parity.rs` の失敗出力）が示す不一致のケース名・index の一覧と件数を取る。その件数が「修正前の不一致件数」になる。証拠種別は前者が模擬、後者がテストハーネス（合成データ・実 ONNX）である。
 2. その時点のモデル（重み・語彙）と評価データのハッシュ、コミット SHA、依存の版、実行環境を控える。
 
 ## 4. 切り分け（PoC-16 と同じ 3 段の順）
@@ -45,7 +47,7 @@ spec の内容は要約であり、詳細は spec の REQ-28・PoC-16（`03-poc/
 ## 6. 修正と再実行
 
 - 修正の例: 推論経路を 1 系列経路にそろえる（`crates/runtime/src/pipeline.rs`・#117）、評価器の予測をバッチ 1 にする薄いラッパーを使う。
-- 修正後に同じハーネスで 3 経路の全件一致を再実行する。合格は不一致 0 件のときだけ。
+- 修正後に、検出したテストと同じテストを再実行する。実モデルのバッチ依存は `onnx_parity.rs`（実前処理・実 ONNX。単体・`infer_batch`・`as_predict_fn` の全件一致と MLX とのラベル一致）で確認し、`full_match.rs`（模擬）の再実行だけで実モデルの修正確認としない。実モデルの経路を新たに `full_match.rs` 相当の 650 件ハーネスへ接続する場合は、実前処理・実 ONNX を差し込んだ別テストとして追加する。合格は不一致 0 件のときだけ。
 - 修正後の再実行も validation データか合成データで行い、凍結した評価データには当てない（2 節）。
 - 判定に使わない参考測定でバッチ予測を使う場合の明記ルールは TASK-28.3（#120）で扱う。
 
@@ -88,6 +90,7 @@ spec の内容は要約であり、詳細は spec の REQ-28・PoC-16（`03-poc/
 ## 10. 関連
 
 - `crates/runtime/src/pipeline.rs`（#117）
-- `crates/runtime/tests/full_match.rs`（#118。陰性対照テスト `req28_negative_control_padded_batch_detected_by_same_comparator` を含む）
+- `crates/runtime/tests/full_match.rs`（#118。模擬の前処理・バックエンドによる比較器の検証。陰性対照テスト `req28_negative_control_padded_batch_detected_by_same_comparator` を含む）
+- `crates/runtime/tests/onnx_parity.rs`（#113。実前処理・実 ONNX での単体・バッチ・評価器用関数の全件一致と MLX とのラベル一致）
 - TASK-28.3（#120）
 - [evaluation-contract](../../.claude/rules/evaluation-contract.md)
