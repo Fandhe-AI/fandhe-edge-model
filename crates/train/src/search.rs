@@ -803,10 +803,10 @@ fn normalized_path_components(value: &str) -> Vec<&str> {
 /// [`canonicalized_out_dir_key`] が、存在する接頭辞を `canonicalize` した後で
 /// （実体に対して正しい順序で）行う。
 ///
-/// `out_dir` は `..` を含まない相対パスであることを [`TrainRequest::new`] が
-/// 強制するが、`root` は絶対パスであること（`check_root_syntax`）しか強制して
-/// おらず `..` 構成要素を含みうる。呼び出し元（[`validate_input`]）は本関数を
-/// 呼ぶ前に必ず [`TrainRequest::new`] を通す。
+/// `root`・`out_dir` とも `..` 構成要素は [`TrainRequest::new`] が拒否済み
+/// （`root` は #256）。本関数と [`canonicalized_out_dir_key`] の `..` 処理は
+/// 多層防御として残す。呼び出し元（[`validate_input`]）は本関数を呼ぶ前に
+/// 必ず [`TrainRequest::new`] を通す。
 fn joined_components<'a>(root: &'a str, out_dir: &'a str) -> Vec<&'a str> {
     normalized_path_components(root)
         .into_iter()
@@ -2268,12 +2268,11 @@ mod tests {
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
     }
 
-    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
-    /// 〔Cursor〕）: 存在しない構成要素の後ろに `..` があるパスは、文字列の上で
-    /// 畳んでも実体と合う保証が無いため、重複判定に進まず `OutDirCanonicalizeFailed`
-    /// で拒否する。
+    /// REQ-39・#256: `..` 構成要素を含む `root` は [`TrainRequest::new`] が先に
+    /// 拒否するため、重複判定へ進まず `InvalidRequest`（`root` の `invalid_path`）
+    /// になる。
     #[test]
-    fn task18_1_2_validate_input_rejects_dotdot_after_nonexistent_component() {
+    fn req39_validate_input_rejects_dotdot_in_root() {
         let label_order = ["positive", "negative"];
         let gold = ["positive"];
         let candidates = vec![
@@ -2288,16 +2287,33 @@ mod tests {
         ];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
-        assert_eq!(err, SearchError::OutDirCanonicalizeFailed { index: 1 });
+        assert_eq!(
+            err,
+            SearchError::InvalidRequest {
+                index: 1,
+                source: TrainRequestError::InvalidPath { field: "root" },
+            }
+        );
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
+    /// 〔Cursor〕）: 存在しない構成要素の後ろに `..` があるパスは
+    /// `canonicalized_out_dir_key` が `InvalidInput` で拒否する。`TrainRequest` が
+    /// `..` を拒否する（#256）ため、多層防御として helper を直接検証する。
+    #[test]
+    fn task18_1_2_canonicalized_key_rejects_dotdot_after_nonexistent_component() {
+        let err = canonicalized_out_dir_key("/nonexistent-fandhe-root/x/..", "out/a").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
     /// 〔Cursor〕）: 存在する構成要素の `..` は `canonicalize` が実体に対して
-    /// 解決するため、通常のディレクトリを経由した `root="/t/real/sub/.."` は
-    /// `root="/t/real"` と同じ出力先として重複判定される。
+    /// 解決するため、`root="/t/real/sub/.."` のキーは `root="/t/real"` と一致する。
+    /// `TrainRequest` が `..` を拒否する（#256）ため、多層防御として
+    /// `canonicalized_out_dir_key` を直接検証する。
     #[cfg(unix)]
     #[test]
-    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_existing_dotdot_in_root() {
+    fn task18_1_2_canonicalized_key_resolves_existing_dotdot() {
         let base = std::env::temp_dir().join(format!(
             "fandhe-edge-train-test-dotdot-{}-existing",
             std::process::id()
@@ -2305,35 +2321,22 @@ mod tests {
         let sub = base.join("real").join("sub");
         std::fs::create_dir_all(&sub).expect("create dirs");
         let real = base.join("real");
-        let via_dotdot = format!("{}/sub/..", real.to_str().expect("utf-8 path"));
-
-        let label_order = ["positive", "negative"];
-        let gold = ["positive"];
-        let candidates = vec![
-            SearchCandidate {
-                candidate_id: "c3-a".to_string(),
-                params: valid_params(real.to_str().expect("utf-8 path"), "out/a"),
-            },
-            SearchCandidate {
-                candidate_id: "c3-b".to_string(),
-                params: valid_params(&via_dotdot, "out/a"),
-            },
-        ];
-        let input = base_input(&label_order, &gold, candidates);
-        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        let real_str = real.to_str().expect("utf-8 path");
+        let via_dotdot = format!("{real_str}/sub/..");
+        let plain = canonicalized_out_dir_key(real_str, "out/a");
+        let dotdot = canonicalized_out_dir_key(&via_dotdot, "out/a");
         let _ = std::fs::remove_dir_all(&base);
-        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+        assert_eq!(plain.expect("plain"), dotdot.expect("dotdot"));
     }
 
     /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
-    /// 〔Cursor〕の回帰テスト。`cfg(unix)`）: symlink と `..` を組み合わせても
-    /// 同じ実ディレクトリを指す 2 候補は `DuplicateOutDir` になる。
-    /// `link2 -> real/sub` のとき `root="/t/link2/.."` の実体は `/t/real`
-    /// （symlink を先に解決してから `..` を適用する）で、`..` を文字列の上で
-    /// 先に畳むと `/t` になり、`root="/t/real"` の候補との重複を見逃していた。
+    /// 〔Cursor〕の回帰テスト。`cfg(unix)`）: `link2 -> real/sub` のとき
+    /// `root="/t/link2/.."` の実体は `/t/real`（symlink を先に解決してから `..`
+    /// を適用する）。`..` を文字列の上で先に畳むと `/t` になる。`TrainRequest` が
+    /// `..` を拒否する（#256）ため、多層防御として helper を直接検証する。
     #[cfg(unix)]
     #[test]
-    fn task18_1_2_validate_input_rejects_duplicate_out_dir_via_symlink_and_dotdot() {
+    fn task18_1_2_canonicalized_key_resolves_symlink_then_dotdot() {
         let base = std::env::temp_dir().join(format!(
             "fandhe-edge-train-test-symlink-dotdot-{}",
             std::process::id()
@@ -2343,46 +2346,22 @@ mod tests {
         std::fs::create_dir_all(&sub).expect("create dirs");
         let link2 = base.join("link2");
         std::os::unix::fs::symlink(&sub, &link2).expect("create symlink");
-        let via_symlink_dotdot = format!("{}/..", link2.to_str().expect("utf-8 path"));
-
-        let label_order = ["positive", "negative"];
-        let gold = ["positive"];
-        let candidates = vec![
-            SearchCandidate {
-                candidate_id: "c3-a".to_string(),
-                params: valid_params(real.to_str().expect("utf-8 path"), "out/a"),
-            },
-            SearchCandidate {
-                candidate_id: "c3-b".to_string(),
-                params: valid_params(&via_symlink_dotdot, "out/a"),
-            },
-        ];
-        let input = base_input(&label_order, &gold, candidates);
-        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        let real_str = real.to_str().expect("utf-8 path");
+        let via = format!("{}/..", link2.to_str().expect("utf-8 path"));
+        let plain = canonicalized_out_dir_key(real_str, "out/a");
+        let dotdot = canonicalized_out_dir_key(&via, "out/a");
         let _ = std::fs::remove_dir_all(&base);
-        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+        assert_eq!(plain.expect("plain"), dotdot.expect("dotdot"));
     }
 
-    /// REQ-18・TASK-18.1-2・REQ-39: `root` の `..` がルートより上へ遡ろうと
-    /// してもスタックが空のまま無視され（クランプ）、`root="/.."` は
-    /// `root="/"` と同じ出力先として扱われる（codex review PR #238 P1 指摘の対応中に判明した回帰テスト）。
+    /// REQ-18・TASK-18.1-2・REQ-39: ルートより上へ遡る `..` はクランプされ、
+    /// `root="/.."` のキーは `root="/"` と一致する。`TrainRequest` が `..` を
+    /// 拒否する（#256）ため、多層防御として helper を直接検証する。
     #[test]
-    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_dotdot_clamped_at_root() {
-        let label_order = ["positive", "negative"];
-        let gold = ["positive"];
-        let candidates = vec![
-            SearchCandidate {
-                candidate_id: "c3-a".to_string(),
-                params: valid_params("/", "a"),
-            },
-            SearchCandidate {
-                candidate_id: "c3-b".to_string(),
-                params: valid_params("/..", "a"),
-            },
-        ];
-        let input = base_input(&label_order, &gold, candidates);
-        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
-        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    fn task18_1_2_canonicalized_key_clamps_dotdot_at_root() {
+        let plain = canonicalized_out_dir_key("/", "a").expect("plain");
+        let dotdot = canonicalized_out_dir_key("/..", "a").expect("dotdot");
+        assert_eq!(plain, dotdot);
     }
 
     /// REQ-18・TASK-18.1-2: 兄弟ディレクトリ（互いの祖先・子孫にならない

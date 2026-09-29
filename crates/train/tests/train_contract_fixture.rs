@@ -258,6 +258,35 @@ fn req39_reject_cases_match_expected_code_and_exit() {
     }
 }
 
+/// REQ-39・#256: `request_root_accept_cases.json` の各 suffix を `root` の
+/// プレースホルダーへ連結したリクエストが受理され、`root` が入力のまま保たれる。
+#[test]
+fn req39_root_accept_cases_are_accepted() {
+    let fixture = load_fixture_value("request_root_accept_cases.json");
+    let base = load_fixture_value("request_reject_cases.json")["base"].clone();
+    let placeholder = base["root"]
+        .as_str()
+        .expect("root must be a string")
+        .to_string();
+    let suffixes = fixture["suffixes"]
+        .as_array()
+        .expect("suffixes must be an array");
+    assert!(
+        !suffixes.is_empty(),
+        "accept cases fixture must not be empty"
+    );
+    for suffix in suffixes {
+        let suffix = suffix.as_str().expect("suffix must be a string");
+        let root = format!("{placeholder}{suffix}");
+        let mut applied = base.clone();
+        applied["root"] = Value::String(root.clone());
+        let bytes = serde_json::to_vec(&applied).expect("serialize request");
+        let req = TrainRequest::from_json_slice(&bytes)
+            .unwrap_or_else(|e| panic!("root {root:?} must be accepted: {e:?}"));
+        assert_eq!(req.root(), root);
+    }
+}
+
 /// REQ-39(e): `MAX_REQUEST_BYTES` を超えるリクエストは解析前に拒否され、
 /// `limit_exceeded`／exit 20 になる（fixture には巨大な文字列を置かず、
 /// テスト内で生成する）。

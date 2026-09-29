@@ -13,6 +13,7 @@ REQ-34・REQ-39・issue #177）。
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -241,6 +242,24 @@ def test_req39_reject_cases_match_expected_code_and_exit(
     err = exc_info.value
     assert err.code == case["expected_code"], f"case={case['name']}"
     assert int(err.exit_code) == case["expected_exit"], f"case={case['name']}"
+
+
+_ROOT_ACCEPT_CASES = _load_json_fixture("request_root_accept_cases.json")
+
+
+@pytest.mark.parametrize("suffix", _ROOT_ACCEPT_CASES["suffixes"])
+def test_req39_root_accept_cases_are_accepted(suffix: str, tmp_path: Path) -> None:
+    """REQ-39・#256: `request_root_accept_cases.json` の suffix を `root`
+    （`tmp_path`）へ連結したリクエストが受理され、`root_real` が
+    `realpath(tmp_path)` に解決されること（Rust 側と同じ fixture を共有）。
+    """
+    resolved = dict(_REJECT_CASES["base"])
+    resolved["root"] = str(tmp_path) + suffix
+    req = contract.validate_request(resolved)
+    try:
+        assert req.root.root_real == Path(os.path.realpath(tmp_path))
+    finally:
+        req.close_resources()
 
 
 def test_req39_oversized_request_is_limit_exceeded() -> None:

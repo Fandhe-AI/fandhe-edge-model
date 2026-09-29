@@ -545,8 +545,9 @@ fn is_syntactically_valid_created_utc(value: &str) -> bool {
 /// 本モジュール doc 参照）。
 ///
 /// `guard.py::resolve_root` は `root` に `os.path.realpath` を適用してから
-/// `artifact_dir` を組み立てるため、`root` が `..`・`.`・連続スラッシュを
-/// 含む正当な絶対パスの場合、正規化しない文字列比較では正常な結果まで
+/// `artifact_dir` を組み立てるため、`root` が `.`・連続スラッシュを
+/// 含む正当な絶対パスの場合（`..` は #256 以降 `TrainRequest` が拒否するが、
+/// 本関数の `..` 処理は多層防御として残す）、正規化しない文字列比較では正常な結果まで
 /// `runtime_error` にしてしまっていた（REQ-39・P1。codex review・cursor[bot]
 /// 重複指摘。PR #220）。
 ///
@@ -579,9 +580,9 @@ fn normalize_absolute_path(path: &str) -> String {
 /// 側は `..` を含まない構文検査済みの構成要素のみなので、`out_dir` 自体を
 /// realpath する必要はない。`guard.py::confine` と同じ非対称性）。
 /// `root`／`out_dir` はいずれも [`TrainRequest`] が構文検査済み（空・NUL・
-/// 絶対/相対の取り違えを含まない）だが、`root` 自体には `..`・連続スラッシュ
-/// の禁止までは課していない（[`TrainRequest`] のモジュール doc「経路の閉じ
-/// 込めについて」参照）ため、結合後に [`normalize_absolute_path`] でも
+/// 絶対/相対の取り違えを含まず、`..` 構成要素も拒否済み。#256）だが、`root` の
+/// `.`・連続スラッシュは残りうる（[`TrainRequest`] のモジュール doc「経路の
+/// 閉じ込めについて」参照）ため、結合後に [`normalize_absolute_path`] でも
 /// 正規化する。
 fn expected_artifact_dir(request: &TrainRequest) -> String {
     let mut joined = canonicalize_root_best_effort(request.root());
@@ -1471,12 +1472,11 @@ mod tests {
     }
 
     /// REQ-39・P1（codex review・cursor[bot] 重複指摘。PR #220）: `root` が
-    /// `..`・`.`・連続スラッシュを含む正当な絶対パスでも、正規化後に一致する
+    /// `.`・連続スラッシュ・末尾スラッシュを含む正当な絶対パスでも、正規化後に一致する
     /// `artifact_dir` は拒否しない。
     #[test]
     fn req39_accepts_artifact_dir_when_root_needs_normalization() {
-        let request =
-            test_request_with_root("/fandhe-edge-fixture-root/../fandhe-edge-fixture-root/./sub//");
+        let request = test_request_with_root("/fandhe-edge-fixture-root/./sub//");
         let json = VALID_OK_JSON.replace(
             "/fandhe-edge-fixture-root/out",
             "/fandhe-edge-fixture-root/sub/out",
