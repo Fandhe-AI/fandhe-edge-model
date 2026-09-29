@@ -10,7 +10,8 @@ use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::freeze_eval_data;
 use fandhe_edge_eval::eval_data_invariance::{EvalDataInvarianceError, FrozenEvalData};
 use fandhe_edge_eval::final_test_once::{
-    AcquireError, AppliedBy, ApplyOnceError, FinalTestLedger, RepresentativeConfigId, apply_once,
+    AcquireError, AppliedBy, ApplyOnceError, FinalTestLedger, RegisteredConfig,
+    RepresentativeConfigId, apply_once,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
 use std::cell::Cell;
@@ -96,11 +97,15 @@ fn id(raw: &str) -> RepresentativeConfigId {
     RepresentativeConfigId::parse(raw).unwrap()
 }
 
-/// 評価データの事前登録（評価前の凍結）。
-fn register(ledger: &FinalTestLedger, data: &[u8], ids: &[&str]) {
-    let ids: Vec<_> = ids.iter().map(|i| id(i)).collect();
+fn reg(id_str: &str, weights: &[u8]) -> RegisteredConfig {
+    RegisteredConfig::new(id(id_str), Sha256Digest::of_bytes(weights))
+}
+
+/// 評価データの事前登録（評価前の凍結）。ID ごとに当てる重みの内容も結び付ける。
+fn register(ledger: &FinalTestLedger, data: &[u8], entries: &[(&str, &[u8])]) {
+    let entries: Vec<_> = entries.iter().map(|(i, w)| reg(i, w)).collect();
     ledger
-        .register_configs(&freeze_eval_data(data).unwrap().sha256(), &ids)
+        .register_configs(&freeze_eval_data(data).unwrap().sha256(), &entries)
         .unwrap();
 }
 
@@ -151,7 +156,7 @@ fn is_already(r: &Outcome, want: AppliedBy) -> bool {
 fn req27_second_application_same_config_is_rejected() {
     let dir = TempDir::new("second");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let m = Model::new(b"w1", None);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &m, &calls).is_ok());
@@ -166,7 +171,7 @@ fn req27_rejection_persists_across_ledger_instances() {
     let calls = Cell::new(0u32);
     let m = Model::new(b"w1", None);
     let l1 = FinalTestLedger::open(dir.path()).unwrap();
-    register(&l1, DATA, &["c1:seed0"]);
+    register(&l1, DATA, &[("c1:seed0", b"w1")]);
     assert!(run(&l1, DATA, "c1:seed0", &m, &calls).is_ok());
     let l2 = FinalTestLedger::open(dir.path()).unwrap();
     let r = run(&l2, DATA, "c1:seed0", &m, &calls);
@@ -178,7 +183,7 @@ fn req27_rejection_persists_across_ledger_instances() {
 fn req27_concurrent_apply_exactly_one_wins() {
     let dir = TempDir::new("concurrent");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let data_dir = TempDir::new("concurrent-data");
     let path = data_dir.path().join("eval.bin");
     fs::write(&path, DATA).unwrap();
@@ -218,7 +223,7 @@ fn req27_concurrent_apply_exactly_one_wins() {
 fn req27_prediction_error_still_consumes_application() {
     let dir = TempDir::new("prederr");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let data_dir = TempDir::new("prederr-data");
     let path = data_dir.path().join("eval.bin");
     fs::write(&path, DATA).unwrap();
@@ -266,7 +271,7 @@ fn req27_invalid_config_id_creates_no_lock() {
 fn req27_frozen_hash_mismatch_does_not_consume_application() {
     let dir = TempDir::new("frozen");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let record = freeze_eval_data(DATA).unwrap();
 
     let data_dir = TempDir::new("frozen-data");
@@ -313,7 +318,7 @@ fn req27_frozen_hash_mismatch_does_not_consume_application() {
 fn req27_cannot_bypass_lock_with_different_digest() {
     let dir = TempDir::new("bypass");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let m = Model::new(b"w1", None);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &m, &calls).is_ok());
@@ -351,8 +356,8 @@ fn req27_cannot_bypass_lock_with_different_digest() {
 fn req27_different_config_or_dataset_is_allowed() {
     let dir = TempDir::new("different");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0", "c2:seed0"]);
-    register(&ledger, b"other", &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1"), ("c2:seed0", b"w2")]);
+    register(&ledger, b"other", &[("c1:seed0", b"w1")]);
     let calls = Cell::new(0u32);
     let w1 = Model::new(b"w1", None);
     let w2 = Model::new(b"w2", None);
@@ -366,7 +371,15 @@ fn req27_different_config_or_dataset_is_allowed() {
 fn req27_same_weights_under_renamed_config_is_rejected() {
     let dir = TempDir::new("renamed");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0", "c1:renamed", "c1:tuned"]);
+    register(
+        &ledger,
+        DATA,
+        &[
+            ("c1:seed0", b"w1"),
+            ("c1:renamed", b"w1"),
+            ("c1:tuned", b"w1"),
+        ],
+    );
     let calls = Cell::new(0u32);
     let m = Model::new(b"w1", None);
     assert!(run(&ledger, DATA, "c1:seed0", &m, &calls).is_ok());
@@ -387,7 +400,7 @@ fn req27_same_weights_under_renamed_config_is_rejected() {
 fn req27_unregistered_config_is_rejected_without_lock() {
     let dir = TempDir::new("unregistered");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
     assert_eq!(dir.count(), 3);
@@ -417,10 +430,10 @@ fn req27_registration_is_frozen_once() {
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
     let digest = freeze_eval_data(DATA).unwrap().sha256();
     ledger
-        .register_configs(&digest, &[id("b"), id("a"), id("a")])
+        .register_configs(&digest, &[reg("b", b"1"), reg("a", b"1"), reg("a", b"1")])
         .unwrap();
     assert!(matches!(
-        ledger.register_configs(&digest, &[id("c")]),
+        ledger.register_configs(&digest, &[reg("c", b"1")]),
         Err(AcquireError::AlreadyRegistered { .. })
     ));
     assert!(matches!(
@@ -434,7 +447,7 @@ fn req27_registration_is_frozen_once() {
 fn req27_registration_after_application_is_rejected() {
     let dir = TempDir::new("latereg");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let calls = Cell::new(0u32);
     assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
     // 適用済みの代表構成ロックだけを別の台帳へ持ち込んでも、事後登録は拒否される。
@@ -448,7 +461,7 @@ fn req27_registration_after_application_is_rejected() {
     }
     let ledger2 = FinalTestLedger::open(dir2.path()).unwrap();
     assert!(matches!(
-        ledger2.register_configs(&digest, &[id("c1:seed0")]),
+        ledger2.register_configs(&digest, &[reg("c1:seed0", b"w1")]),
         Err(AcquireError::AlreadyRegistered { .. })
     ));
 }
@@ -459,7 +472,7 @@ fn req27_registration_after_application_is_rejected() {
 fn req27_model_mutation_during_prediction_is_rejected() {
     let dir = TempDir::new("mutation");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let data_dir = TempDir::new("mutation-data");
     let path = data_dir.path().join("eval.bin");
     fs::write(&path, DATA).unwrap();
@@ -487,7 +500,7 @@ fn req27_model_mutation_during_prediction_is_rejected() {
 fn req27_missing_weights_file_does_not_create_lock() {
     let dir = TempDir::new("noweights");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let m = Model::new(b"w1", None);
     fs::remove_file(&m.weights).unwrap();
     let calls = Cell::new(0u32);
@@ -505,8 +518,16 @@ fn req27_poc10_methods_by_seeds_each_once() {
         .iter()
         .flat_map(|m| (0..3).map(move |s| format!("{m}:seed{s}")))
         .collect();
-    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    register(&ledger, DATA, &id_refs);
+    let weights: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|cid| format!("weights-{cid}").into_bytes())
+        .collect();
+    let entries: Vec<(&str, &[u8])> = ids
+        .iter()
+        .zip(&weights)
+        .map(|(cid, w)| (cid.as_str(), w.as_slice()))
+        .collect();
+    register(&ledger, DATA, &entries);
     let calls = Cell::new(0u32);
     for cid in &ids {
         let m = Model::new(format!("weights-{cid}").as_bytes(), None);
@@ -556,7 +577,7 @@ fn req27_ledger_dir_removed_does_not_call_prediction() {
     let ledger_dir = dir.path().join("ledger");
     fs::create_dir(&ledger_dir).unwrap();
     let ledger = FinalTestLedger::open(&ledger_dir).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     fs::remove_dir_all(&ledger_dir).unwrap();
     let calls = Cell::new(0u32);
     let r = run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls);
@@ -571,7 +592,7 @@ fn req27_ledger_dir_removed_does_not_call_prediction() {
 fn req27_record_contains_digests_and_id_only() {
     let dir = TempDir::new("record");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(&ledger, DATA, &["c1:seed0"]);
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
     let data_dir = TempDir::new("record-data");
     let path = data_dir.path().join("eval.bin");
     fs::write(&path, DATA).unwrap();
@@ -604,4 +625,91 @@ fn req27_record_contains_digests_and_id_only() {
         let mode = fs::metadata(&lock_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+/// P0 回帰（レビュー指摘）: 登録済みだが未使用の ID に、登録と異なる重みを当てて
+/// 最終 test を再適用することはできない。ロックも作られず予測も呼ばれない。
+#[test]
+fn req27_registered_id_with_different_weights_is_rejected() {
+    let dir = TempDir::new("otherweights");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("c1:seed0", b"w1"), ("c2:seed0", b"w2")]);
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
+    assert_eq!(dir.count(), 3);
+    // 初回の結果を見てから、未使用 ID に登録外の重みを当てる。
+    let r = run(
+        &ledger,
+        DATA,
+        "c2:seed0",
+        &Model::new(b"w-tuned", None),
+        &calls,
+    );
+    assert!(
+        matches!(acquire_err(&r), Some(AcquireError::WeightsNotRegistered)),
+        "{r:?}"
+    );
+    assert_eq!(dir.count(), 3);
+    assert_eq!(calls.get(), 1);
+}
+
+/// 同じ ID に異なる重みを登録することはできない。
+#[test]
+fn req27_registration_rejects_conflicting_weights_for_same_id() {
+    let dir = TempDir::new("conflictreg");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    let r = ledger.register_configs(&digest, &[reg("a", b"1"), reg("a", b"2")]);
+    assert!(
+        matches!(r, Err(AcquireError::RegistryInvalid { .. })),
+        "{r:?}"
+    );
+    assert_eq!(dir.count(), 0);
+}
+
+/// P0 回帰（REQ-39）: 登録件数の上限超過は、複製・ソートの前に拒否される。
+#[test]
+fn req39_registration_over_limit_is_rejected() {
+    let dir = TempDir::new("overlimit");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    let entries: Vec<_> = (0..=fandhe_edge_eval::final_test_once::MAX_REGISTERED_CONFIGS)
+        .map(|i| reg(&format!("c{i}"), b"w"))
+        .collect();
+    let r = ledger.register_configs(&digest, &entries);
+    assert!(
+        matches!(r, Err(AcquireError::RegistryInvalid { .. })),
+        "{r:?}"
+    );
+    assert_eq!(dir.count(), 0);
+}
+
+/// P0 回帰（REQ-39）: 事前登録ファイルが FIFO に差し替えられていても、開く前に
+/// 通常ファイルでないと判定して拒否し、無期限に待たない。
+#[cfg(unix)]
+#[test]
+fn req39_registry_fifo_is_rejected_without_blocking() {
+    let dir = TempDir::new("fifo");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let mut reg_path = None;
+    for entry in fs::read_dir(dir.path()).unwrap() {
+        let e = entry.unwrap();
+        if e.file_name().to_string_lossy().starts_with("registry-") {
+            reg_path = Some(e.path());
+        }
+    }
+    let reg_path = reg_path.unwrap();
+    fs::remove_file(&reg_path).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&reg_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let calls = Cell::new(0u32);
+    let r = run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls);
+    assert!(
+        matches!(acquire_err(&r), Some(AcquireError::RegistryInvalid { .. })),
+        "{r:?}"
+    );
+    assert_eq!(calls.get(), 0);
 }

@@ -24,11 +24,13 @@
 //!   キーを作り、`predict` へは**同じ [`ModelPackagePaths`]** を渡す。予測に使う
 //!   モデルとロックキーが同一のパスから導出され、評価前後のモデル不変性検証
 //!   （REQ-27）と一体で動く。
-//! - **事前登録**: 候補・seed の代表構成 ID 集合は、評価前に
-//!   [`FinalTestLedger::register_configs`] で評価データごとに 1 回だけ台帳へ凍結する。
-//!   [`apply_once`] は登録済み集合に含まれない ID を拒否する（別 ID・別重みでの
-//!   再適用を、登録されていない候補として拒否する。PoC-10 の `APPLIED.json`
-//!   事前登録に相当）。登録後は集合を変更できない（`create_new`）。
+//! - **事前登録**: 候補・seed の代表構成 ID と、その構成で当てる重みの sha256 の組
+//!   ([`RegisteredConfig`]) を、評価前に [`FinalTestLedger::register_configs`] で
+//!   評価データごとに 1 回だけ台帳へ凍結する。[`apply_once`] は登録済み集合に含まれない
+//!   ID、および登録した重みと異なる重みでの適用を拒否する（未使用 ID に別重みを当てて
+//!   再適用する迂回を拒否する。適用対象は評価前に確定し、初回適用後に新たな候補を
+//!   追加できない。PoC-10 の `APPLIED.json` 事前登録に相当）。登録後は集合を変更できない
+//!   （`create_new`）。
 //!
 //! # 順序の不変条件
 //!
@@ -83,7 +85,7 @@ use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// 代表構成 ID の最大バイト数（確保・検証の上限。REQ-39）。
@@ -98,9 +100,10 @@ const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
 pub const MAX_REGISTERED_CONFIGS: usize = 1024;
 
 /// 事前登録ファイルの最大バイト数（読み込み前のサイズ上限。REQ-39）。
-/// 128 バイトの ID を最大件数並べても収まる値。
-const MAX_REGISTRY_BYTES: u64 =
-    (MAX_CONFIG_ID_BYTES as u64 + 1) * MAX_REGISTERED_CONFIGS as u64 + REGISTRY_HEADER.len() as u64;
+/// 128 バイトの ID と重み sha256（hex 64 桁）の行を最大件数並べても収まる値。
+const MAX_REGISTRY_BYTES: u64 = (MAX_CONFIG_ID_BYTES as u64 + 1 + 64 + 1)
+    * MAX_REGISTERED_CONFIGS as u64
+    + REGISTRY_HEADER.len() as u64;
 
 /// 検証済みの代表構成 ID（1〜128 バイトの ASCII `[A-Za-z0-9._:-]`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +133,24 @@ impl RepresentativeConfigId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// 事前登録する 1 件（代表構成 ID と、その構成で最終 test に当てる重みの sha256）。
+///
+/// 重みのダイジェストを評価前に ID へ結び付けて凍結することで、登録済みだが未使用の
+/// ID に別の重みを当てて最終 test を再適用する迂回を拒否する（REQ-27）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredConfig {
+    id: RepresentativeConfigId,
+    weights_sha256: Sha256Digest,
+}
+
+impl RegisteredConfig {
+    /// 代表構成 ID と、評価前に確定した重みファイルの sha256 から作る。
+    #[must_use]
+    pub fn new(id: RepresentativeConfigId, weights_sha256: Sha256Digest) -> Self {
+        RegisteredConfig { id, weights_sha256 }
     }
 }
 
@@ -241,6 +262,9 @@ pub enum AcquireError {
     NotRegistered,
     /// 代表構成 ID が事前登録集合に含まれない。ロックは作られない。
     UnregisteredConfig,
+    /// 予測に使う重みが、事前登録でその ID に結び付けた重みと一致しない。
+    /// ロックは作られない。
+    WeightsNotRegistered,
     /// この評価データの事前登録は既にある（登録の変更・上書きは拒否する）、または
     /// 登録しようとした ID の適用が既に行われている。
     AlreadyRegistered {
@@ -306,6 +330,9 @@ impl fmt::Display for AcquireError {
             ),
             AcquireError::UnregisteredConfig => {
                 write!(f, "representative config id is not registered")
+            }
+            AcquireError::WeightsNotRegistered => {
+                write!(f, "model weights do not match the registered weights")
             }
             AcquireError::AlreadyRegistered { path } => {
                 write!(
@@ -448,28 +475,30 @@ impl FinalTestLedger {
     fn load_registry(
         &self,
         eval_data_sha256: &Sha256Digest,
-    ) -> Result<Vec<RepresentativeConfigId>, AcquireError> {
+    ) -> Result<Vec<RegisteredConfig>, AcquireError> {
         let path = self.dir.join(registry_name(eval_data_sha256));
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // 通常ファイル判定・`O_NONBLOCK` 付きオープン・サイズ上限付き読み込みは共通コアに
+        // 集約されている。FIFO 等では open 前に拒否され、無期限に待たない（REQ-39）。
+        let bytes = match fandhe_edge_core::fs::read_bounded(&path, MAX_REGISTRY_BYTES) {
+            Ok(b) => b,
+            Err(FsError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Err(AcquireError::NotRegistered);
             }
-            Err(source) => return Err(AcquireError::Io { path, source }),
+            Err(FsError::Read { source, .. }) => return Err(AcquireError::Io { path, source }),
+            Err(FsError::TooLarge { .. }) => {
+                return Err(AcquireError::RegistryInvalid {
+                    reason: "registry file too large",
+                });
+            }
+            Err(_) => {
+                return Err(AcquireError::RegistryInvalid {
+                    reason: "registry is not a regular file",
+                });
+            }
         };
-        let mut body = String::new();
-        // 読み込み前にサイズ上限を課す（`take` で上限 + 1 まで）。
-        file.take(MAX_REGISTRY_BYTES + 1)
-            .read_to_string(&mut body)
-            .map_err(|source| AcquireError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        if body.len() as u64 > MAX_REGISTRY_BYTES {
-            return Err(AcquireError::RegistryInvalid {
-                reason: "registry file too large",
-            });
-        }
+        let body = String::from_utf8(bytes).map_err(|_| AcquireError::RegistryInvalid {
+            reason: "registry is not valid utf-8",
+        })?;
         parse_registry(&body)
     }
 
@@ -493,37 +522,50 @@ impl FinalTestLedger {
 pub type ApplyOnceResult<T, E> =
     Result<T, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
 
-/// 事前登録集合の正準化本文（ソート・重複除去済みの ID を 1 行ずつ）。
-fn registry_body(ids: &[RepresentativeConfigId]) -> String {
+/// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み sha256 hex>` を 1 行ずつ）。
+fn registry_body(entries: &[RegisteredConfig]) -> String {
     let mut out = String::from(REGISTRY_HEADER);
-    for id in ids {
-        out.push_str(id.as_str());
+    for e in entries {
+        out.push_str(e.id.as_str());
+        out.push(' ');
+        out.push_str(&e.weights_sha256.to_hex());
         out.push('\n');
     }
     out
 }
 
-fn parse_registry(body: &str) -> Result<Vec<RepresentativeConfigId>, AcquireError> {
+fn parse_registry(body: &str) -> Result<Vec<RegisteredConfig>, AcquireError> {
     let rest = body
         .strip_prefix(REGISTRY_HEADER)
         .ok_or(AcquireError::RegistryInvalid {
             reason: "bad registry header",
         })?;
-    let mut ids = Vec::new();
+    let mut entries = Vec::new();
     for line in rest.lines() {
-        if ids.len() >= MAX_REGISTERED_CONFIGS {
+        if entries.len() >= MAX_REGISTERED_CONFIGS {
             return Err(AcquireError::RegistryInvalid {
                 reason: "too many registered configs",
             });
         }
-        ids.push(RepresentativeConfigId::parse(line)?);
+        let (id, hex) = line.split_once(' ').ok_or(AcquireError::RegistryInvalid {
+            reason: "malformed registry line",
+        })?;
+        let weights_sha256 =
+            hex.parse::<Sha256Digest>()
+                .map_err(|_| AcquireError::RegistryInvalid {
+                    reason: "malformed registry digest",
+                })?;
+        entries.push(RegisteredConfig {
+            id: RepresentativeConfigId::parse(id)?,
+            weights_sha256,
+        });
     }
-    if ids.is_empty() {
+    if entries.is_empty() {
         return Err(AcquireError::RegistryInvalid {
             reason: "empty registry",
         });
     }
-    Ok(ids)
+    Ok(entries)
 }
 
 impl FinalTestLedger {
@@ -534,27 +576,39 @@ impl FinalTestLedger {
     ///   （同じ評価データへの再登録は [`AcquireError::AlreadyRegistered`]）。
     /// - 登録しようとする ID のいずれかが既に適用済み（代表構成ロックが存在）の場合も
     ///   拒否する（適用後の事後登録で履歴を正当化させない）。
+    /// - 各 ID には重みの sha256 を結び付けて凍結する。同じ ID に異なる重みを登録する
+    ///   ことはできない（完全に同一の重複は除去する）。
     /// - 空集合・[`MAX_REGISTERED_CONFIGS`] 超過は [`AcquireError::RegistryInvalid`]。
+    ///   件数は複製・ソートの前に検査する（REQ-39）。
     pub fn register_configs(
         &self,
         eval_data_sha256: &Sha256Digest,
-        ids: &[RepresentativeConfigId],
+        entries: &[RegisteredConfig],
     ) -> Result<(), AcquireError> {
-        let mut sorted: Vec<RepresentativeConfigId> = ids.to_vec();
-        sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        if entries.len() > MAX_REGISTERED_CONFIGS {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "too many registered configs",
+            });
+        }
+        let mut sorted: Vec<RegisteredConfig> = entries.to_vec();
+        sorted.sort_by(|a, b| {
+            a.id.as_str()
+                .cmp(b.id.as_str())
+                .then_with(|| a.weights_sha256.as_bytes().cmp(b.weights_sha256.as_bytes()))
+        });
         sorted.dedup();
         if sorted.is_empty() {
             return Err(AcquireError::RegistryInvalid {
                 reason: "empty registry",
             });
         }
-        if sorted.len() > MAX_REGISTERED_CONFIGS {
+        if sorted.windows(2).any(|w| w[0].id == w[1].id) {
             return Err(AcquireError::RegistryInvalid {
-                reason: "too many registered configs",
+                reason: "same config id with different weights",
             });
         }
-        for id in &sorted {
-            let path = self.dir.join(config_lock_name(eval_data_sha256, id));
+        for entry in &sorted {
+            let path = self.dir.join(config_lock_name(eval_data_sha256, &entry.id));
             if fs::symlink_metadata(&path).is_ok() {
                 return Err(AcquireError::AlreadyRegistered { path });
             }
@@ -598,14 +652,17 @@ pub fn apply_once<T, E>(
             let registered = ledger
                 .load_registry(&frozen.sha256)
                 .map_err(ApplyOnceError::Acquire)?;
-            if !registered.contains(&config_id) {
+            let Some(entry) = registered.iter().find(|e| e.id == config_id) else {
                 return Err(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig));
-            }
+            };
             let weights_sha256 =
                 fandhe_edge_core::fs::sha256_file_bounded(paths.weights, MAX_MODEL_COMPONENT_BYTES)
                     .map_err(|source| {
                         ApplyOnceError::Acquire(AcquireError::WeightsDigest { source })
                     })?;
+            if weights_sha256 != entry.weights_sha256 {
+                return Err(ApplyOnceError::Acquire(AcquireError::WeightsNotRegistered));
+            }
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
             let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
             predict(ticket, bytes, paths).map_err(ApplyOnceError::Prediction)
