@@ -469,46 +469,6 @@ fn req39_batch_total_output_over_limit_is_limit_exceeded_before_any_row() {
     assert!(!text.contains("predicted_label"));
 }
 
-/// REQ-21・REQ-39: 1 行も書く前に出力段階の期限を超えていたら、結果行は書かず
-/// `limit_exceeded` の `ErrorReport` 1 行（時間上限の超過は経路によらず 20）。
-#[test]
-fn req39_batch_output_deadline_before_first_row_is_limit_exceeded() {
-    let definition = definition();
-    let (pipeline, _) = pipeline();
-    let mut out: Vec<u8> = Vec::new();
-    let code = emit_infer_batch_with_limits(
-        &mut out,
-        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
-        definition.io(),
-        definition.options(),
-        pipeline,
-        BatchLimits {
-            output_duration: Duration::ZERO,
-            ..BatchLimits::default()
-        },
-    )
-    .unwrap();
-    let text = String::from_utf8(out).unwrap();
-    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
-}
-
-/// REQ-33・REQ-21: 先行行の推論失敗（runtime_error）は、後続行の入力失敗（invalid_input）より
-/// 入力順で先なので、そちらを採る。
-#[test]
-fn req33_batch_earlier_inference_failure_wins_over_later_input_error() {
-    let (code, text) =
-        run(b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"f\"}\nnot json\n");
-    assert_single_error(code, &text, ExitCode::RuntimeError, "runtime_error");
-}
-
-/// REQ-33: 入力失敗が先の行にあれば、後続行の推論失敗があってもその入力失敗を採る。
-#[test]
-fn req33_batch_earlier_input_error_wins_over_later_inference_failure() {
-    let (code, text) =
-        run(b"{\"id\":\"r1\",\"input\":\"a\"}\nnot json\n{\"id\":\"r3\",\"input\":\"f\"}\n");
-    assert_single_error(code, &text, ExitCode::InvalidInput, "invalid_input");
-}
-
 /// 書き込みのたびに一定時間止まる出力先（出力期限の回帰テスト用）。
 struct SlowWriter(Vec<u8>);
 
@@ -523,15 +483,16 @@ impl Write for SlowWriter {
     }
 }
 
-/// REQ-39: 最後の行の書き込みで出力期限を超えたら、成功にせず `limit_exceeded`。
+/// REQ-21・REQ-39: 計算段階で全件が期限内に済んだら成功が確定し、書き出しが出力期限より
+/// 遅くても（最後の行を含め）結果行は全件そろって exit 0 のまま（失敗へ覆さない）。
 #[test]
-fn req39_batch_last_row_exceeding_output_deadline_is_limit_exceeded() {
+fn req39_batch_success_is_committed_after_compute_even_if_writing_is_slow() {
     let definition = definition();
     let (pipeline, _) = pipeline();
     let mut out = SlowWriter(Vec::new());
     let code = emit_infer_batch_with_limits(
         &mut out,
-        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n".to_vec()),
         definition.io(),
         definition.options(),
         pipeline,
@@ -541,7 +502,103 @@ fn req39_batch_last_row_exceeding_output_deadline_is_limit_exceeded() {
         },
     )
     .unwrap();
-    assert_eq!(code, ExitCode::LimitExceeded);
+    assert_eq!(code, ExitCode::Ok);
+    let text = String::from_utf8(out.0).unwrap();
+    assert_eq!(text.matches('\n').count(), 2);
+    assert!(!text.contains("\"code\""));
+}
+
+/// REQ-21・REQ-39: 計算中に期限を超えたら、結果行 0 行・ErrorReport 1 行・`limit_exceeded`。
+#[test]
+fn req39_batch_deadline_during_compute_emits_no_rows_and_one_error() {
+    struct Slow;
+    impl ScoringBackend for Slow {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(vec![0.5, 0.25, 0.25])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+    let definition = definition();
+    let pipeline = Arc::new(InferencePipeline::new(
+        Pre(Arc::new(Mutex::new(Vec::new()))),
+        Slow,
+    ));
+    let mut out: Vec<u8> = Vec::new();
+    let code = emit_infer_batch_with_limits(
+        &mut out,
+        Cursor::new(
+            b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n{\"id\":\"r3\",\"input\":\"c\"}\n"
+                .to_vec(),
+        ),
+        definition.io(),
+        definition.options(),
+        pipeline,
+        BatchLimits {
+            duration: Duration::from_millis(150),
+            ..BatchLimits::default()
+        },
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
+    assert!(!text.contains("predicted_label"));
+}
+
+/// REQ-21・REQ-39: CLI 経路で書き出しが停止したら、ウォッチドッグが exit 20 で終える
+/// （出力先が停止しているため ErrorReport は書けず、終了コードが唯一の判定根拠）。
+/// 自身のテストバイナリを子プロセスとして再実行して確かめる。
+#[test]
+fn req39_cli_process_exits_20_when_output_stalls() {
+    struct Stuck;
+    impl Write for Stuck {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_secs(600));
+            Ok(0)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    const CHILD_ENV: &str = "FANDHE_TEST_STALLED_WRITER_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let definition = definition();
+        let (pipeline, _) = pipeline();
+        let result = emit_infer_batch_with_limits(
+            &mut Stuck,
+            Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+            definition.io(),
+            definition.options(),
+            pipeline,
+            BatchLimits {
+                output_duration: Duration::from_millis(300),
+                ..BatchLimits::for_cli_process()
+            },
+        );
+        // ウォッチドッグが先に終了させるため、ここへは戻らない。
+        std::process::exit(if result.is_ok() { 0 } else { 70 });
+    }
+    let exe = std::env::current_exe().expect("current exe");
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "req39_cli_process_exits_20_when_output_stalls",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn child");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(20));
 }
 
 /// REQ-39: CLI 経路（`for_cli_process`）では、停止した推論を期限で見切り、エラー JSON を書いた

@@ -50,13 +50,15 @@
 //! [`BatchLimits::for_cli_process`] を使い、切り離したスレッドはプロセス終了で回収する。
 //!
 //! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
-//! 出力段階は各行の書き込みと flush の完了後（最後の行を含む）に
-//! `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は成功にせず `limit_exceeded`（出力が壊れる
-//! ため `ErrorReport` は追記しない）。1 行目の書き込み前に超過済みなら `ErrorReport`（`limit_exceeded`）を 1 行書く。時間上限の
-//! 超過は経路によらず `limit_exceeded`（REQ-21・REQ-39）。
-//! ウォッチドッグの起動に失敗したら、上限なしで書かず `io::Error`（exit 70）で終える。1 回の `write` 自体が読み手の
-//! 停止でブロックする場合は `Write` では中断できないため、CLI 経路（`for_cli_process`）では
-//! ウォッチドッグが期限でプロセスを exit 70 で終了する。
+//!
+//! 時間上限の確定点は計算段階（読み取り・推論・出力量の検証）の 1 つだけで、期限内に全件の
+//! 計算が済んだ時点で結果は成功として確定する。計算中の超過は結果行なしの `ErrorReport`
+//! （`limit_exceeded`・exit 20）。書き出しと flush の完了後に期限を理由に失敗へ変えない。
+//! 書き出しの段階は、CLI 経路（`for_cli_process`）のウォッチドッグだけが扱う: 出力先が停止して
+//! `MAX_INFER_BATCH_OUTPUT_DURATION` を超えたらプロセスを exit 20（`limit_exceeded`）で終える。
+//! 既知の制限: 出力先が停止しているため `ErrorReport` は書けず、途中までの行が残りうる。この
+//! 場合は終了コードが唯一の判定根拠になる（書き込みをブロックしたまま待たないため）。
+//! ウォッチドッグの起動に失敗したら、上限なしで書かず `io::Error`（exit 70）で終える。
 //!
 //! # 長寿命プロセスから呼ぶ場合の制約（REQ-39）
 //!
@@ -296,7 +298,7 @@ pub fn judgment_from_prediction(
 /// 出力量（と、その書き込みに要する時間）を有界にする。
 pub const MAX_INFER_BATCH_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
-/// 出力段階（結果行の書き込み）の時間上限（暫定。REQ-39）。行と行の間で確認する。
+/// 出力段階（結果行の書き込み）の時間上限（暫定。REQ-39）。CLI 経路のウォッチドッグが強制する。
 pub const MAX_INFER_BATCH_OUTPUT_DURATION: Duration = Duration::from_secs(60);
 
 /// [`emit_infer_batch_with_limits`] の資源上限。既定は本モジュールの定数（REQ-39）。
@@ -319,7 +321,7 @@ impl BatchLimits {
     /// CLI の 1 呼び出し 1 プロセス向けの上限（既定値 + プロセス終了による回収）。
     ///
     /// 出力段階が `output_duration` を超えて書き込みでブロックしたら、ウォッチドッグが
-    /// exit 70（`runtime_error`。出力が壊れた書き込み失敗と同じ写像）でプロセスを終える。
+    /// exit 20（`limit_exceeded`。時間上限の超過。ErrorReport は書けない）でプロセスを終える。
     /// 期限超過で計算スレッドを切り離した場合は、`limit_exceeded` の `ErrorReport` を書いた
     /// 直後に exit 20 でプロセスを終え、スレッド・reader・pipeline を確実に回収する。
     #[must_use]
@@ -378,7 +380,9 @@ impl OutputWatchdog {
         spawn(Box::new(move || {
             // 送信側の drop（解除）は Disconnected で返る。Timeout のときだけ終了する。
             if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(duration) {
-                std::process::exit(i32::from(ExitCode::RuntimeError.code()));
+                // 時間上限の超過は経路によらず limit_exceeded（REQ-21・REQ-39）。出力先が停止して
+                // いるため ErrorReport は書けず、終了コードが唯一の判定根拠になる。
+                std::process::exit(i32::from(ExitCode::LimitExceeded.code()));
             }
         }))?;
         Ok(Some(Self { _disarm: tx }))
@@ -486,15 +490,16 @@ where
 /// `recv_timeout` する。改行が来ない低速な `Read` や、期限を確認できない 1 件の推論の途中でも、
 /// 期限超過で `limit_exceeded` を返せる（スレッドは強制終了できないため、超過時は切り離して
 /// 残す。呼び出し側は結果を書いたらプロセスを終了する前提で、CLI は 1 呼び出し 1 プロセス）。
-/// 書き込みは総量（`limits.output_bytes`）を事前に検査済みで、行の間で `limits.output_duration`
-/// を確認する。1 回の `write` 自体が読み手の停止でブロックする場合、`Write` は中断できない。
+/// 書き込みは総量（`limits.output_bytes`）を事前に検査済み。計算段階で確定した成功は、書き出し後に
+/// 期限を理由に覆さない。読み手の停止で `write` がブロックする場合、`Write` は中断できない。
 /// `limits.terminate_process_on_stall`（[`BatchLimits::for_cli_process`]）が真なら、ウォッチドッグが
 /// 期限でプロセスを終了して回収する。偽（既定）の間は中断できず、期限切れで切り離した計算
 /// スレッドも残るため、同一プロセスからの繰り返し呼び出しでは資源が蓄積しうる。本番の CLI 経路は
 /// 必ず `for_cli_process` を使う（REQ-39）。
 ///
 /// # Errors
-/// 書き込み・flush の失敗（および 1 行ごとの再構築失敗）を `io::Error` で返す。部分書き込み後は出力が壊れているため、追加の書き込み（残りの行・`ErrorReport`）は
+/// 書き込み・flush の失敗（および 1 行ごとの再構築失敗）を `io::Error` で返す。部分書き込み後は
+/// 出力が壊れているため、追加の書き込み（残りの行・`ErrorReport`）は
 /// せず即座に打ち切る（`output` の契約）。呼び出し側は `Err` を exit 70 に写し、何も書かない。
 pub fn emit_infer_batch_with_limits<W, R, P, B>(
     out: &mut W,
@@ -556,22 +561,15 @@ where
     let _watchdog = OutputWatchdog::arm(limits.terminate_process_on_stall, limits.output_duration)?;
     match outcome {
         Ok((records, predictions)) => {
-            let output_deadline = Instant::now().checked_add(limits.output_duration);
+            // 計算段階で期限内に全件が済んだ時点で結果は成功として確定している。書き出しと
+            // flush の完了後に期限を理由に失敗へ変えない（確定点は 1 つ）。書き出しの停止は
+            // ウォッチドッグ（CLI 経路）だけが扱う。
             for (record, prediction) in records.iter().zip(&predictions) {
-                // 1 行も書く前に超過していれば、出力は壊れていないため ErrorReport を 1 行返す。
-                if deadline_passed(output_deadline) {
-                    return emit_error_report(out, &report(ExitCode::LimitExceeded));
-                }
                 // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
                 // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
                 let result = judgment_from_prediction(options, record.id(), prediction)
                     .map_err(|error| io::Error::other(error.message))?;
                 write_ok_judgment(out, &result)?;
-                // 最後の行を含め、書き込みと flush の完了後に期限を確認する。超過なら成功にせず
-                // `limit_exceeded`（出力は壊れているため ErrorReport は追記しない）。
-                if deadline_passed(output_deadline) {
-                    return Ok(ExitCode::LimitExceeded);
-                }
             }
             Ok(ExitCode::Ok)
         }
