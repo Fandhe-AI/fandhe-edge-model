@@ -13,7 +13,9 @@
 //!   pickle 等の中身は解釈・展開・実行しない
 //! - ONNX の判定は ModelProto と `graph`（GraphProto）の top-level 構造の「形の検査」であり、
 //!   意味の検証ではない（空の graph・output の無い graph は拒否）。node / initializer の中身は検査しない。
-//!   最終的な解析の成否は読み込み時の ONNX Runtime に委ねる。`external_data` の拒否は対象外
+//!   最終的な解析の成否は読み込み時の ONNX Runtime に委ねる。
+//!   一方、テンソルの外部データ参照（`external_data`・`data_location`）は graph・サブグラフ・functions・
+//!   training_info 内の TensorProto をすべて降りて検出し、1 件でもあれば拒否する（参照先は追わない）
 //! - 経路の閉じ込め（TASK-39.4）は本モジュールの責務外。サイズ上限の値の決定（TASK-39.5）も
 //!   呼び出し側（CLI の統合は TASK-39.2-4・#156）が行い、本モジュールは渡された上限を強制する
 //! - 拡張子と内容の照合による偽装拒否シナリオは TASK-39.2-2（#154）で上に重ねる
@@ -360,6 +362,146 @@ fn detect_signature(prefix: &[u8]) -> Option<FileFormat> {
     None
 }
 
+/// テンソルの外部データ参照の検査で許すサブグラフの入れ子の深さ（超えたら拒否）。
+const MAX_TENSOR_SCAN_DEPTH: usize = 32;
+
+/// テンソルの外部データ参照の検査で走査するフィールド数の上限（超えたら拒否。REQ-39）。
+const MAX_TENSOR_SCAN_FIELDS: usize = 1 << 22;
+
+/// 外部データ参照の検査の走査状態。
+struct ExternalScan {
+    remaining_fields: usize,
+}
+
+/// 1 フィールド分の値。
+enum WireValue<'a> {
+    Varint(u64),
+    Len(&'a [u8]),
+    Fixed,
+}
+
+impl ExternalScan {
+    /// `buf` の全フィールドを走査して `f(field, value)` を呼ぶ。形が壊れている・上限超過は `Err`。
+    fn each_field<'a>(
+        &mut self,
+        buf: &'a [u8],
+        mut f: impl FnMut(&mut Self, u64, WireValue<'a>) -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            self.remaining_fields = self.remaining_fields.checked_sub(1).ok_or(())?;
+            let rest = buf.get(pos..).ok_or(())?;
+            let (tag, n) = read_varint(rest).map_err(|_| ())?;
+            pos = pos.checked_add(n).ok_or(())?;
+            let rest = buf.get(pos..).ok_or(())?;
+            let value = match tag & 7 {
+                0 => {
+                    let (v, n) = read_varint(rest).map_err(|_| ())?;
+                    pos = pos.checked_add(n).ok_or(())?;
+                    WireValue::Varint(v)
+                }
+                1 | 5 => {
+                    let n = if tag & 7 == 1 { 8 } else { 4 };
+                    pos = pos.checked_add(n).ok_or(())?;
+                    if pos > buf.len() {
+                        return Err(());
+                    }
+                    WireValue::Fixed
+                }
+                2 => {
+                    let (len, n) = read_varint(rest).map_err(|_| ())?;
+                    let start = pos.checked_add(n).ok_or(())?;
+                    let end = start
+                        .checked_add(usize::try_from(len).map_err(|_| ())?)
+                        .ok_or(())?;
+                    let body = buf.get(start..end).ok_or(())?;
+                    pos = end;
+                    WireValue::Len(body)
+                }
+                _ => return Err(()),
+            };
+            f(self, tag >> 3, value)?;
+        }
+        Ok(())
+    }
+
+    /// ModelProto: graph(7)・training_info(20)・functions(25) 内のテンソルを検査する。
+    fn model(&mut self, buf: &[u8]) -> Result<(), ()> {
+        self.each_field(buf, |me, field, v| match (field, v) {
+            (7, WireValue::Len(b)) => me.graph(b, 1),
+            (20, WireValue::Len(b)) => me.each_field(b, |me, f, v| match (f, v) {
+                (1 | 2, WireValue::Len(g)) => me.graph(g, 1),
+                _ => Ok(()),
+            }),
+            (25, WireValue::Len(b)) => me.each_field(b, |me, f, v| match (f, v) {
+                (7, WireValue::Len(n)) => me.node(n, 1),
+                (11, WireValue::Len(a)) => me.attribute(a, 1),
+                _ => Ok(()),
+            }),
+            _ => Ok(()),
+        })
+    }
+
+    /// GraphProto: node(1)・initializer(5)・sparse_initializer(15)。
+    fn graph(&mut self, buf: &[u8], depth: usize) -> Result<(), ()> {
+        if depth > MAX_TENSOR_SCAN_DEPTH {
+            return Err(());
+        }
+        self.each_field(buf, |me, field, v| match (field, v) {
+            (1, WireValue::Len(b)) => me.node(b, depth),
+            (5, WireValue::Len(b)) => me.tensor(b),
+            (15, WireValue::Len(b)) => me.sparse(b),
+            _ => Ok(()),
+        })
+    }
+
+    /// NodeProto: attribute(5)。
+    fn node(&mut self, buf: &[u8], depth: usize) -> Result<(), ()> {
+        self.each_field(buf, |me, field, v| match (field, v) {
+            (5, WireValue::Len(b)) => me.attribute(b, depth),
+            _ => Ok(()),
+        })
+    }
+
+    /// AttributeProto: t(5)・tensors(10)・sparse_tensor(22)・sparse_tensors(23)・g(6)・graphs(11)。
+    fn attribute(&mut self, buf: &[u8], depth: usize) -> Result<(), ()> {
+        self.each_field(buf, |me, field, v| match (field, v) {
+            (5 | 10, WireValue::Len(b)) => me.tensor(b),
+            (22 | 23, WireValue::Len(b)) => me.sparse(b),
+            (6 | 11, WireValue::Len(b)) => me.graph(b, depth.saturating_add(1)),
+            _ => Ok(()),
+        })
+    }
+
+    /// SparseTensorProto: values(1)・indices(2)。
+    fn sparse(&mut self, buf: &[u8]) -> Result<(), ()> {
+        self.each_field(buf, |me, field, v| match (field, v) {
+            (1 | 2, WireValue::Len(b)) => me.tensor(b),
+            _ => Ok(()),
+        })
+    }
+
+    /// TensorProto: external_data(13) が 1 件でもある、または data_location(14) が DEFAULT(0) 以外なら拒否。
+    fn tensor(&mut self, buf: &[u8]) -> Result<(), ()> {
+        self.each_field(buf, |_, field, v| match (field, v) {
+            (13, _) => Err(()),
+            (14, WireValue::Varint(0)) => Ok(()),
+            (14, _) => Err(()),
+            _ => Ok(()),
+        })
+    }
+}
+
+/// ModelProto 内のすべての TensorProto を降りて、外部データ（外部ファイル）への参照が無いことを確認する。
+/// 参照先を追って検査することはせず、参照があれば拒否する（経路の閉じ込め・サイズ上限の迂回を防ぐ。REQ-39）。
+fn has_no_external_data(bytes: &[u8]) -> bool {
+    ExternalScan {
+        remaining_fields: MAX_TENSOR_SCAN_FIELDS,
+    }
+    .model(bytes)
+    .is_ok()
+}
+
 /// バイト列全体からファイル形式を判定する純関数（非公開。公開すると検査を経ない判定値が出回る）。
 /// 判定順は固定シグネチャ → ONNX 構造検査 → `Unknown`。`bytes` はファイル全体でなければならず、
 /// 全バイトを走査して「ちょうど末尾で終わる」ことを確認する。長さ超過・途中切れ・走査回数の上限で
@@ -374,7 +516,7 @@ fn detect_format(bytes: &[u8]) -> FileFormat {
         total_len,
     };
     match scan_onnx_model(&mut src, total_len) {
-        Ok(OnnxScan::Onnx) => FileFormat::Onnx,
+        Ok(OnnxScan::Onnx) if has_no_external_data(bytes) => FileFormat::Onnx,
         _ => FileFormat::Unknown,
     }
 }
@@ -641,6 +783,131 @@ mod tests {
         let err = open_checked_file(&pkl, &al, 1 << 20).unwrap_err();
         assert_eq!(err.exit_code(), ExitCode::InvalidInput);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// protobuf の LEN フィールドを組み立てる試験用ヘルパー（tag・長さとも varint で書く）。
+    fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
+        fn varint(v: &mut Vec<u8>, mut n: usize) {
+            while n >= 0x80 {
+                v.push((n & 0x7f) as u8 | 0x80);
+                n >>= 7;
+            }
+            v.push(n as u8);
+        }
+        let mut v = Vec::new();
+        varint(&mut v, (usize::from(field) << 3) | 2);
+        varint(&mut v, payload.len());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// 有効な output だけを持つ graph 本体に `extra` を足した ONNX を作る。
+    fn model_with_graph_extra(extra: &[u8]) -> Vec<u8> {
+        let mut g = ld(12, &[0x0a, 0x01, 0x78]);
+        g.extend_from_slice(extra);
+        let mut m = vec![0x08, 0x07];
+        m.extend(ld(7, &g));
+        m
+    }
+
+    fn tensor_with_external() -> Vec<u8> {
+        ld(13, &[0x0a, 0x01, 0x6b]) // external_data(key)
+    }
+
+    /// REQ-39・TASK-39.2-1: 外部データを参照するテンソルは、どこに現れても ONNX と認めない。
+    #[test]
+    fn req39_external_data_is_rejected_everywhere() {
+        let ext = tensor_with_external();
+        let loc = vec![0x70, 0x01]; // data_location = EXTERNAL
+        let clean_tensor = vec![0x40, 0x01]; // data_type=1（外部参照なし）
+        // 通常モデル（外部参照の無い initializer）は通る。
+        assert_eq!(
+            d(&model_with_graph_extra(&ld(5, &clean_tensor))),
+            FileFormat::Onnx
+        );
+        // data_location=DEFAULT(0) は通る。
+        assert_eq!(
+            d(&model_with_graph_extra(&ld(5, &[0x70, 0x00]))),
+            FileFormat::Onnx
+        );
+        // initializer の external_data・data_location=EXTERNAL
+        assert_eq!(
+            d(&model_with_graph_extra(&ld(5, &ext))),
+            FileFormat::Unknown
+        );
+        assert_eq!(
+            d(&model_with_graph_extra(&ld(5, &loc))),
+            FileFormat::Unknown
+        );
+        // sparse_initializer の values・indices
+        for f in [1u8, 2] {
+            let sp = ld(f, &ext);
+            assert_eq!(
+                d(&model_with_graph_extra(&ld(15, &sp))),
+                FileFormat::Unknown
+            );
+        }
+        // node の attribute の t・tensors・sparse_tensor・sparse_tensors
+        for (af, wrap_sparse) in [(5u8, false), (10, false), (22, true), (23, true)] {
+            let inner = if wrap_sparse {
+                ld(1, &ext)
+            } else {
+                ext.clone()
+            };
+            let node = ld(5, &ld(af, &inner));
+            assert_eq!(
+                d(&model_with_graph_extra(&ld(1, &node))),
+                FileFormat::Unknown
+            );
+        }
+        // サブグラフ（属性 g・graphs）内の外部参照
+        let sub = ld(5, &ext);
+        for af in [6u8, 11] {
+            let node = ld(5, &ld(af, &sub));
+            assert_eq!(
+                d(&model_with_graph_extra(&ld(1, &node))),
+                FileFormat::Unknown
+            );
+        }
+        // functions 内のノードの属性・attribute_proto、training_info の graph
+        let node = ld(5, &ld(5, &ext));
+        let mut m = model_with_graph_extra(&[]);
+        m.extend(ld(25, &ld(7, &node)));
+        assert_eq!(d(&m), FileFormat::Unknown);
+        let mut m = model_with_graph_extra(&[]);
+        m.extend(ld(25, &ld(11, &ld(5, &ext))));
+        assert_eq!(d(&m), FileFormat::Unknown);
+        let mut m = model_with_graph_extra(&[]);
+        m.extend(ld(20, &ld(2, &ld(5, &ext))));
+        assert_eq!(d(&m), FileFormat::Unknown);
+        // 外部参照の無い functions は通る。
+        let mut m = model_with_graph_extra(&[]);
+        m.extend(ld(25, &ld(7, &ld(5, &ld(5, &clean_tensor)))));
+        assert_eq!(d(&m), FileFormat::Onnx);
+    }
+
+    /// REQ-39・TASK-39.2-1: サブグラフの入れ子が深さの上限を超えたら拒否し、上限以内なら通る。
+    #[test]
+    fn req39_subgraph_depth_limit() {
+        fn nested(levels: usize) -> Vec<u8> {
+            // graph の node の attribute g に graph を `levels` 段入れる（長さ varint を 2 バイトで書く）。
+            let mut inner: Vec<u8> = Vec::new();
+            for _ in 0..levels {
+                let attr = ld(6, &inner);
+                let node = ld(5, &attr);
+                inner = ld(1, &node);
+            }
+            inner
+        }
+        let build = |levels: usize| {
+            let mut g = ld(12, &[0x0a, 0x01, 0x78]);
+            g.extend(nested(levels));
+            let mut m = vec![0x08, 0x07];
+            m.extend(ld(7, &g));
+            m
+        };
+        assert_eq!(d(&build(10)), FileFormat::Onnx);
+        assert_eq!(d(&build(40)), FileFormat::Unknown);
     }
 
     /// REQ-39・TASK-39.2-1: ModelProto の field 26（configuration。LEN）を持つ ONNX を通し、
