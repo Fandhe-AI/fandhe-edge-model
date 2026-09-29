@@ -34,8 +34,8 @@ fn req17_freeze_eval_data_matches_independently_computed_sha256() {
     assert_eq!(record.byte_len(), 113);
 }
 
-/// REQ-17: 1 バイトだけ変えた入力は異なる sha256 になる（#49 の不一致検知の
-/// 前提となる性質）。バイト長は変わらない。
+/// REQ-17: 1 バイトだけ変えた入力は異なる sha256 になる（不一致検知〔TASK-17.3・
+/// `tests/eval_hash_mismatch.rs`〕の前提となる性質）。バイト長は変わらない。
 #[test]
 fn req17_freeze_eval_data_differs_on_single_byte_change() {
     let original = freeze_eval_data(SAMPLE).expect("凍結は失敗しないはず");
@@ -132,7 +132,12 @@ fn req17_evaluate_gate_fails_closed_on_hash_mismatch() {
     let state = EvalDataState::Frozen(record);
     assert_eq!(
         evaluate_gate(&state, SAMPLE_ONE_BYTE_CHANGED),
-        Err(FreezeError::HashMismatch)
+        Err(FreezeError::HashMismatch {
+            expected_sha256: SAMPLE_SHA256.parse().expect("64hex"),
+            expected_byte_len: 113,
+            actual_sha256: SAMPLE_ONE_BYTE_CHANGED_SHA256.parse().expect("64hex"),
+            actual_byte_len: 113,
+        })
     );
 }
 

@@ -60,8 +60,9 @@
 //!   したハッシュとの一致確認」「評価データなしの境界動作」までを実装済み。
 //!   読み取り専用配置・直接書き込みの拒否確認（[`frozen_placement`]・
 //!   REQ-39・TASK-17.2-2・issue #48）も実装済み。凍結後のハッシュ不一致検知
-//!   で処理を止める分岐（過去の記録台帳との突き合わせ・版管理。REQ-17・
-//!   TASK-17.3・issue #49）は未実装。CLI `evaluate` 工程
+//!   で処理を止める分岐（不一致の報告内容・終了コード写像・不一致検知テスト。
+//!   [`eval_freeze::FreezeError::HashMismatch`]。REQ-17・TASK-17.3・issue
+//!   #49）も実装済み。CLI `evaluate` 工程
 //!   への配線・学習・パッケージ化・推論を通した完走確認（TASK-33.3・
 //!   issue #140）も未実装。（[`inspect::inspect_records`] が返す
 //!   [`inspect::ValidRecord`] は [`split::Groupable`] を実装しないため、
