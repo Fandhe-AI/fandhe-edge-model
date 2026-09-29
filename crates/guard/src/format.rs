@@ -18,7 +18,7 @@
 //!   training_info 内の TensorProto をすべて降りて検出し、1 件でもあれば拒否する（参照先は追わない）
 //! - 経路の閉じ込め（TASK-39.4）は本モジュールの責務外。サイズ上限の値の決定（TASK-39.5）も
 //!   呼び出し側（CLI の統合は TASK-39.2-4・#156）が行い、本モジュールは渡された上限を強制する
-//! - 拡張子と内容の照合による偽装拒否シナリオは TASK-39.2-2（#154）で上に重ねる
+//! - 拡張子と内容の照合による偽装拒否は `model_file` モジュール（TASK-39.2-2・#154）で上に重ねた
 //!
 //! pickle プロトコル 0/1（テキスト opcode 始まり）は誤検出が多いため固定シグネチャでは
 //! 判定せず、ONNX の構造検査にも通らないので `Unknown` として拒否される。
@@ -573,6 +573,9 @@ pub enum FormatRejection {
         detected: FileFormat,
         allowed: Vec<FileFormat>,
     },
+    /// モデルファイルの拡張子が許可されていない（TASK-39.2-2・#154）。
+    /// `expected` は常に定数で、利用者由来の拡張子は保持しない。
+    ExtensionNotAllowed { expected: &'static str },
     /// ファイルを開けない・通常ファイルでない・読み込めない。
     Io(FsError),
 }
@@ -583,6 +586,7 @@ impl FormatRejection {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             FormatRejection::NotAllowed { .. } => ExitCode::InvalidInput,
+            FormatRejection::ExtensionNotAllowed { .. } => ExitCode::InvalidInput,
             FormatRejection::Io(FsError::NotRegularFile { .. }) => ExitCode::InvalidInput,
             FormatRejection::Io(FsError::TooLarge { .. }) => ExitCode::LimitExceeded,
             FormatRejection::Io(FsError::Read { source, .. })
@@ -598,6 +602,7 @@ impl FormatRejection {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             FormatRejection::NotAllowed { .. } => "format_not_allowed",
+            FormatRejection::ExtensionNotAllowed { .. } => "extension_not_allowed",
             FormatRejection::Io(_) => "file_unreadable",
         }
     }
@@ -614,6 +619,9 @@ impl fmt::Display for FormatRejection {
                     detected.name(),
                     names.join(", ")
                 )
+            }
+            FormatRejection::ExtensionNotAllowed { expected } => {
+                write!(f, "file extension is not allowed (expected: .{expected})")
             }
             FormatRejection::Io(_) => write!(f, "file could not be opened as a regular file"),
         }
@@ -1045,6 +1053,18 @@ mod tests {
                 _ => panic!("unexpected variant"),
             }
         }
+    }
+
+    /// REQ-39・TASK-39.2-2: 拡張子拒否の契約（64・理由コード・固定メッセージ）。
+    #[test]
+    fn req39_extension_not_allowed_contract() {
+        let err = FormatRejection::ExtensionNotAllowed { expected: "onnx" };
+        assert_eq!(err.exit_code().code(), 64);
+        assert_eq!(err.reason_code(), "extension_not_allowed");
+        assert_eq!(
+            err.to_string(),
+            "file extension is not allowed (expected: .onnx)"
+        );
     }
 
     /// REQ-39・TASK-39.2-1: 許可リストの中身で結果が変わり、Unknown は入れられない。
