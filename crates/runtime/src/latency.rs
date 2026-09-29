@@ -355,9 +355,24 @@ where
     }
 
     let start = clock.now_ns();
-    // 各反復の開始前に計測全体の期限を検査する。
+    // 直前に観測した時刻。反復間・検査間をまたいで単調性を検査するために保持する（REQ-39）。
+    let last = std::cell::Cell::new(start);
+    // 時計を読み、直前の観測より戻っていれば NonMonotonicClock で失敗させる。
+    let read_clock = |phase: LatencyPhase, iteration: usize| {
+        let now = clock.now_ns();
+        if now < last.get() {
+            return Err(LatencyError::NonMonotonicClock { phase, iteration });
+        }
+        last.set(now);
+        Ok(now)
+    };
+    // 各反復の開始前に計測全体の期限を検査する。開始時刻との差も checked_sub で検査する。
     let check_deadline = |phase: LatencyPhase, iteration: usize| {
-        if clock.now_ns().saturating_sub(start) > config.total_timeout_ns {
+        let now = read_clock(phase, iteration)?;
+        let since_start = now
+            .checked_sub(start)
+            .ok_or(LatencyError::NonMonotonicClock { phase, iteration })?;
+        if since_start > config.total_timeout_ns {
             Err(LatencyError::DeadlineExceeded {
                 phase,
                 iteration,
@@ -370,9 +385,9 @@ where
 
     for (iteration, input) in inputs.iter().cycle().take(config.warmup).enumerate() {
         check_deadline(LatencyPhase::Warmup, iteration)?;
-        let t0 = clock.now_ns();
+        let t0 = read_clock(LatencyPhase::Warmup, iteration)?;
         let result = predict(black_box(input));
-        let t1 = clock.now_ns();
+        let t1 = read_clock(LatencyPhase::Warmup, iteration)?;
         match result {
             Ok(p) => {
                 black_box(p);
@@ -402,9 +417,9 @@ where
     let mut samples_ns = Vec::with_capacity(config.iters);
     for (iteration, input) in inputs.iter().cycle().take(config.iters).enumerate() {
         check_deadline(LatencyPhase::Measure, iteration)?;
-        let t0 = clock.now_ns();
+        let t0 = read_clock(LatencyPhase::Measure, iteration)?;
         let result = black_box(predict(black_box(input)));
-        let t1 = clock.now_ns();
+        let t1 = read_clock(LatencyPhase::Measure, iteration)?;
         if let Err(e) = result {
             return Err(LatencyError::Inference {
                 phase: LatencyPhase::Measure,
@@ -729,6 +744,30 @@ mod tests {
             LatencyError::NonMonotonicClock {
                 phase: LatencyPhase::Warmup,
                 iteration: 0
+            }
+        );
+    }
+
+    #[test]
+    fn req39_clock_regression_between_iterations_is_error() {
+        struct SeqClock(Cell<usize>);
+        impl Clock for SeqClock {
+            fn now_ns(&self) -> u64 {
+                let seq = [100u64, 110, 120, 130, 50, 60, 70];
+                let i = self.0.get();
+                self.0.set(i + 1);
+                seq.get(i).copied().unwrap_or(1_000)
+            }
+        }
+        // start=100, 検査 110, t0=120, t1=130, 次反復の検査 50（反復間で逆行）。
+        let cfg = LatencyConfig::new(0, 2).unwrap();
+        let err =
+            measure_with(|_| ok_prediction(), &["x"], &cfg, &SeqClock(Cell::new(0))).unwrap_err();
+        assert_eq!(
+            err,
+            LatencyError::NonMonotonicClock {
+                phase: LatencyPhase::Measure,
+                iteration: 1
             }
         );
     }
