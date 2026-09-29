@@ -706,6 +706,9 @@ fn cancel_child<C: ChildControl>(
     // キャンセル処理全体の待機を `min(KILL_WAIT_TIMEOUT, 壁時計の残り)` で
     // 抑える（REQ-39「資源の上限」）。
     let deadline = bounded_deadline(Instant::now(), wall_deadline);
+    // kill 成功の記録。全経路・全再試行で持ち回る単調な状態（`ensure_reaped` へ
+    // `&mut` で渡し、戻り値で上書きしない）。
+    let mut kill_delivered = false;
     match try_wait_interrupt_bounded(|| child.try_wait(), deadline) {
         Ok(Some(status)) => {
             let reaped = Some(Reaped {
@@ -717,7 +720,7 @@ fn cancel_child<C: ChildControl>(
         }
         Ok(None) => {}
         Err(_) => {
-            let reaped = ensure_reaped(child, wall_deadline, final_grace);
+            let reaped = ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered);
             return classify_cancel_outcome(reaped, wall_deadline, started);
         }
     }
@@ -737,13 +740,14 @@ fn cancel_child<C: ChildControl>(
             _ => CancelStep::StillRunning,
         };
     }
+    kill_delivered = true;
     let reaped = match wait_after_kill_until(child, deadline) {
         Some(status) => Some(Reaped {
             status,
             at: Instant::now(),
-            kill_delivered: true,
+            kill_delivered,
         }),
-        None => ensure_reaped(child, wall_deadline, final_grace),
+        None => ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered),
     };
     classify_cancel_outcome(reaped, wall_deadline, started)
 }
@@ -815,15 +819,18 @@ fn ensure_reaped<C: ChildControl>(
     child: &mut C,
     retry_until: Instant,
     final_grace: Duration,
+    kill_delivered: &mut bool,
 ) -> Option<Reaped> {
-    let mut kill_delivered = false;
+    // `kill_delivered` は単調（一度 true になったら戻さない）。再試行の kill が
+    // 「既に終了」で失敗しても、それ以前に成功した kill の記録を消さない
+    // （codex/review 指摘 P1・Cursor Bugbot 指摘。REQ-34）。
     loop {
-        kill_delivered |= child.kill().is_ok();
+        *kill_delivered |= child.kill().is_ok();
         if let Ok(Some(status)) = child.try_wait() {
             return Some(Reaped {
                 status,
                 at: Instant::now(),
-                kill_delivered,
+                kill_delivered: *kill_delivered,
             });
         }
         if Instant::now() >= retry_until {
@@ -831,14 +838,14 @@ fn ensure_reaped<C: ChildControl>(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    kill_delivered |= child.kill().is_ok();
+    *kill_delivered |= child.kill().is_ok();
     let grace_deadline = Instant::now() + final_grace;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Some(Reaped {
                 status,
                 at: Instant::now(),
-                kill_delivered,
+                kill_delivered: *kill_delivered,
             });
         }
         if Instant::now() >= grace_deadline {
@@ -854,7 +861,7 @@ fn ensure_reaped<C: ChildControl>(
 /// （超過を `runtime_error` に化けさせない。REQ-21・REQ-39）。
 #[cfg(unix)]
 fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration) -> bool {
-    ensure_reaped(child, Instant::now(), final_grace).is_some()
+    ensure_reaped(child, Instant::now(), final_grace, &mut false).is_some()
 }
 
 /// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
@@ -1264,7 +1271,8 @@ pub fn run_train_cancellable(
                 // 回収を確認できるまで `Child` を手放さず、壁時計の期限まで
                 // kill と回収を再試行する。確認できなければ
                 // `WallTimeout { child_reaped: false }`（codex/review 指摘 P0。REQ-39）。
-                return match ensure_reaped(&mut child, wait_deadline, KILL_WAIT_TIMEOUT) {
+                return match ensure_reaped(&mut child, wait_deadline, KILL_WAIT_TIMEOUT, &mut false)
+                {
                     // 回収を観測したのが期限以後なら壁時計超過（キャンセルと
                     // 同じ規則。[`classify_cancel_outcome`]）。
                     Some(r) if r.at >= wait_deadline => Err(wall_timeout_error(limits, true)),
@@ -1570,6 +1578,7 @@ mod tests {
             &mut c,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(50),
+            &mut false,
         );
         assert_eq!(r.and_then(|r| r.status.signal()), Some(9));
         assert!(c.kills >= 3);
@@ -1591,6 +1600,7 @@ mod tests {
             &mut c,
             Instant::now() + Duration::from_millis(100),
             Duration::from_millis(100),
+            &mut false,
         );
         assert!(r.is_none());
         assert!(c.kills >= 2);
@@ -1754,6 +1764,28 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(matches!(step, CancelStep::AlreadyExited(_)));
+    }
+
+    /// REQ-34: 1 回目の kill が成功し、回収が一時エラーになり、再試行の kill が
+    /// 「既に終了」で失敗して `SIGKILL` 終了として回収された場合も、送信済みの
+    /// kill を記録しているので `Cancelled`。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_keeps_earlier_kill_record_across_retries() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            kill_results: vec![Ok(()), Err(io_err()), Err(io_err())],
+            wait_results: vec![Ok(None), Err(io_err())],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(30),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(step, CancelStep::Cancelled(_)));
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {

@@ -1073,8 +1073,12 @@ fn case_timeout_hang(case_dir: &Path) -> Result<(), String> {
 fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "hang_with_lifeline_orphan");
     let request = make_request(Some(1));
+    // 孫の起動待ちの上限（CI の起動遅延を見込んだ十分な値）。ワーカーの壁時計は
+    // 起動待ちが尽きる前に切れないよう、これに余裕を足して決める（起動待ちは
+    // 孫の起動を待つ部分だけ。停止確認の基準は `expect_orphan_stopped` で別）。
+    const ORPHAN_STARTUP_WAIT: Duration = Duration::from_secs(5);
     let limits = RunLimits::for_request(&request)
-        .with_wall_timeout(Duration::from_millis(500))
+        .with_wall_timeout(ORPHAN_STARTUP_WAIT + Duration::from_secs(1))
         .expect("tighten wall timeout");
 
     // 孫プロセスが実際に起動したことを確認してから検証したいため、
@@ -1093,7 +1097,7 @@ fn case_timeout_hang_kills_orphan(case_dir: &Path) -> Result<(), String> {
         std::thread::spawn(move || run_train(&launcher, &request, &case_dir, &limits))
     };
 
-    let poll_deadline = std::time::Instant::now() + Duration::from_millis(450);
+    let poll_deadline = std::time::Instant::now() + ORPHAN_STARTUP_WAIT;
     let mut orphan_spawned = false;
     while std::time::Instant::now() < poll_deadline {
         // 孫の起動（pid）に加え、heartbeat が書かれたことまで待つ。
