@@ -8,15 +8,20 @@ publish.workspace = true
 description = "Artifact and inference SDK layer (shared inference path, package capacity measurement) for fandhe-edge-model."
 
 [dependencies]
-# workspace 内の path 依存のみ（外部 crate は追加しない。REQ-32: 学習側・評価器に依存しない）。
+# 学習側・評価器・データ契約層には依存しない（REQ-32）。外部 crate は `unicode-normalization`
+# のみ（バイト前処理の NFKC 正規化。TASK-32.1-1・#112。学習側依存ではない。配置層の
+# 出典は Issue #112 コメント 2026-09-29 の承認記録。版はルート Cargo.toml で完全固定）。
 # 用途は入力サイズ上限 `MAX_INFER_INPUT_BYTES` の参照と、容量計測での通常ファイル
 # 検証つきオープン（`fandhe_edge_core::fs::open_regular_file_for_read`。REQ-39）。
 fandhe-edge-core.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 # テスト専用。評価器経路（`run_inference_input_only`）との全件一致照合用（REQ-28・#118）。
 # workspace 内の path 依存のみで、本体の依存（推論は学習・評価器に依存しない）には影響しない。
 fandhe-edge-eval.workspace = true
+# 共有ゴールデンベクタ fixture（JSON）の読み込み専用（#112）。推論経路には入らない。
+serde_json.workspace = true
 
 [lints]
 workspace = true
