@@ -207,13 +207,33 @@ if [ "$out_requested" -eq 1 ]; then
 fi
 
 # 記録ディレクトリは CLI の起動前に検証する（fail-closed。メッセージは固定でパスを含めない）
+# ディレクトリの識別子（デバイス番号:inode）。GNU stat と BSD stat の両方に対応する
+dir_identity() {
+    stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' -- "$1" 2>/dev/null
+}
+# 末尾の / と /. を取り除いた最終要素で symlink を判定する（"link/"・"link/." だと
+# -L が偽になり symlink を素通りするため）
+rec_trim=$rec_dir
+while :; do
+    case "$rec_trim" in
+        ?*/) rec_trim=${rec_trim%/} ;;
+        ?*/.) rec_trim=${rec_trim%/.} ;;
+        *) break ;;
+    esac
+done
 rec_real=
-if [ -n "$rec_dir" ] && { [ ! -d "$rec_dir" ] || [ -L "$rec_dir" ]; }; then
+rec_id=
+if [ -n "$rec_dir" ] && { [ ! -d "$rec_dir" ] || [ -L "$rec_trim" ]; }; then
     rec_real=-
 elif [ -n "$rec_dir" ]; then
     # 途中の symlink を含む全経路を物理パスへ正規化し、以降の保存はこの値だけを使う
     rec_real=$(CDPATH='' cd -P -- "$rec_dir" 2>/dev/null && pwd -P) || rec_real=-
     [ -n "$rec_real" ] || rec_real=-
+    if [ "$rec_real" != "-" ]; then
+        # 起動前のディレクトリ識別子を控える（保存時に同一ディレクトリか照合する）
+        rec_id=$(dir_identity "$rec_real") || rec_id=
+        [ -n "$rec_id" ] || rec_real=-
+    fi
 fi
 if [ "$rec_real" = "-" ]; then
     printf '%s\n' '{"code":"invalid_input","message":"FANDHE_EDGE_RECORD_DIR must be an existing directory"}'
@@ -631,9 +651,11 @@ if [ -n "$rec_dir" ]; then
         out_bytes=$(wc -c <"$out" | tr -d ' ') || rec_ok=0
         err_bytes=$(wc -c <"$err" | tr -d ' ') || rec_ok=0
     fi
-    # 記録先が起動前に正規化した物理パスのままか（検査後の symlink 差し替えの検出）
+    # 記録先が起動前の物理パスかつ同一ディレクトリ（デバイス:inode）のままか
+    # （検査後の symlink 差し替え・同名の別ディレクトリへの入れ替えの検出）
     rec_dir_unchanged() {
-        [ "$(CDPATH='' cd -P -- "$rec_real" 2>/dev/null && pwd -P)" = "$rec_real" ]
+        [ "$(CDPATH='' cd -P -- "$rec_real" 2>/dev/null && pwd -P)" = "$rec_real" ] &&
+            [ "$(dir_identity "$rec_real")" = "$rec_id" ]
     }
     if [ "$rec_ok" -eq 1 ]; then
         rec_dir_unchanged || rec_ok=0

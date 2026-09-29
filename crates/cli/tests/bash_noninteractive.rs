@@ -1333,7 +1333,18 @@ fn req36_run_record_dir_not_directory_is_rejected_without_launching_cli() {
         "echo x >'{}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
         marker.display()
     );
-    for p in [&file, &missing, &link] {
+    // 末尾の / や /. を付けた symlink も拒否する（-L の素通り対策）
+    let link_slash = PathBuf::from(format!("{}/", link.display()));
+    let link_dot = PathBuf::from(format!("{}/.", link.display()));
+    let link_slashes = PathBuf::from(format!("{}//", link.display()));
+    for p in [
+        &file,
+        &missing,
+        &link,
+        &link_slash,
+        &link_dot,
+        &link_slashes,
+    ] {
         let o = run_with_fake_bin_args(
             "baddir",
             &body,
@@ -1416,6 +1427,35 @@ fn req36_run_record_resolves_parent_symlink_and_detects_swap() {
         record_files(&evil).is_empty(),
         "record must not land in swapped dir"
     );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 実行中に記録先が同じパスの別ディレクトリへ入れ替えられたら、パス文字列が同じでも
+/// 記録を残さず 70 にする（ディレクトリ識別子の照合。REQ-39）。
+#[test]
+fn req36_run_record_detects_same_path_directory_replacement() {
+    let base = record_dir("replaced");
+    let dir = base.join("rec");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let moved = base.join("moved");
+    let body = format!(
+        "mv '{d}' '{m}'\nmkdir '{d}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        d = dir.display(),
+        m = moved.display()
+    );
+    let o = run_with_fake_bin_args(
+        "record-replaced",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(record_files(&dir).is_empty());
+    assert!(record_files(&moved).is_empty());
     std::fs::remove_dir_all(&base).ok();
 }
 
