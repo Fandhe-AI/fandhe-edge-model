@@ -10,8 +10,8 @@ use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::freeze_eval_data;
 use fandhe_edge_eval::eval_data_invariance::{EvalDataInvarianceError, FrozenEvalData};
 use fandhe_edge_eval::final_test_once::{
-    AcquireError, AppliedBy, AppliedOnce, ApplyOnceError, FinalTestLedger, LabeledInput,
-    RegisteredConfig, RepresentativeConfigId, apply_once,
+    AcquireError, AppliedBy, AppliedOnce, ApplyOnceError, DecodeFailed, FinalTestLedger,
+    LabeledInput, RegisteredConfig, RepresentativeConfigId, apply_once,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
 use std::cell::Cell;
@@ -96,8 +96,8 @@ type Outcome = Result<
 >;
 
 /// 評価データを 1 行 1 件として分解する: `input` は行そのもの、正解は `gold-<行>`。
-fn dec(bytes: &[u8]) -> Result<Vec<LabeledInput>, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "not utf-8".to_string())?;
+fn dec(bytes: &[u8]) -> Result<Vec<LabeledInput>, DecodeFailed> {
+    let text = std::str::from_utf8(bytes).map_err(|_| DecodeFailed)?;
     Ok(text
         .lines()
         .map(|l| LabeledInput {
@@ -863,9 +863,10 @@ fn req27_predict_receives_inputs_only_and_golds_stay_with_evaluator() {
     assert!(r.output.iter().all(|i| !i.contains("gold-")));
 }
 
-/// REQ-27: 分解に失敗しても適用は消費されず、予測は呼ばれない。
+/// REQ-27・REQ-39: 分解に失敗しても適用は消費され（本文を見てからの呼び直しを拒否）、
+/// 予測は呼ばれず、エラー文言に理由（本文）を含まない。
 #[test]
-fn req27_decode_failure_does_not_consume_application() {
+fn req27_decode_failure_consumes_application() {
     let dir = TempDir::new("ledger");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
     register(&ledger, DATA, &[("c1:seed0", b"w1")]);
@@ -885,7 +886,7 @@ fn req27_decode_failure_does_not_consume_application() {
         &frozen,
         id("c1:seed0"),
         &m.paths(),
-        |_b| Err("bad format".to_string()),
+        |_b| Err(DecodeFailed),
         |_t, _i, _p| {
             calls.set(calls.get() + 1);
             Ok::<_, String>(())
@@ -894,12 +895,23 @@ fn req27_decode_failure_does_not_consume_application() {
     assert!(matches!(
         r,
         Err(EvalDataInvarianceError::Evaluation(
-            EvaluationInvarianceError::Evaluation(ApplyOnceError::Decode { .. })
+            EvaluationInvarianceError::Evaluation(ApplyOnceError::Decode)
         ))
     ));
     assert_eq!(calls.get(), 0);
-    // ロックが残っていないので、正しい分解での適用は 1 回成功する。
-    let ok = run(&ledger, DATA, "c1:seed0", &m, &calls);
-    assert!(ok.is_ok());
-    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        format!("{}", ApplyOnceError::<String>::Decode),
+        "failed to decode eval data"
+    );
+    // ロックは消費済みなので、正しい分解での再適用も拒否される。
+    let again = run(&ledger, DATA, "c1:seed0", &m, &calls);
+    assert!(matches!(
+        again,
+        Err(EvalDataInvarianceError::Evaluation(
+            EvaluationInvarianceError::Evaluation(ApplyOnceError::Acquire(
+                AcquireError::AlreadyApplied { .. }
+            ))
+        ))
+    ));
+    assert_eq!(calls.get(), 0);
 }

@@ -44,6 +44,8 @@
 //! 3. ロックを取得し、永続化（ファイルの `sync_all`、Unix ではディレクトリも）まで確認し
 //! 4. 予測を当て、評価後にモデル・評価データの不変性を検証する
 //!
+//! 評価データ本文は 3 のロック取得後にのみ `decode` へ渡す（本文を見てから `Err` で
+//! 抜けて呼び直す迂回を塞ぐ）。分解失敗も適用を消費する。
 //! 事前登録・ID・重みの読み込みに失敗した場合はロックを作らず、適用を消費しない。
 //! 永続化の確認に失敗したら予測は呼ばずエラーを返す（fail-closed）。
 //!
@@ -459,12 +461,10 @@ impl std::error::Error for AcquireError {}
 pub enum ApplyOnceError<E> {
     /// ロック取得に失敗（予測は呼ばれていない）。
     Acquire(AcquireError),
-    /// 評価データの分解に失敗した（予測は呼ばれておらず、ロックも作られていない）。
-    /// `reason` に評価データの本文は含めない（英語の固定文言。REQ-39）。
-    Decode {
-        /// 失敗理由（本文を含まない）。
-        reason: String,
-    },
+    /// 評価データの分解に失敗した（予測は呼ばれていない）。ロックは取得済みで
+    /// 適用は消費されており、再試行は拒否される（REQ-27）。理由は持たない
+    /// （分解側が返す文字列に評価データの本文が混ざる経路を型で塞ぐ。REQ-39）。
+    Decode,
     /// 予測クロージャが失敗した。ロックは残るため再試行は拒否される。
     Prediction(E),
 }
@@ -473,9 +473,7 @@ impl<E: fmt::Display> fmt::Display for ApplyOnceError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApplyOnceError::Acquire(e) => write!(f, "{e}"),
-            ApplyOnceError::Decode { reason } => {
-                write!(f, "failed to decode eval data: {reason}")
-            }
+            ApplyOnceError::Decode => write!(f, "failed to decode eval data"),
             ApplyOnceError::Prediction(e) => write!(f, "prediction failed: {e}"),
         }
     }
@@ -613,6 +611,13 @@ impl FinalTestLedger {
         })
     }
 }
+
+/// 評価データの分解失敗を表す理由なしの標識（REQ-27・REQ-39）。
+///
+/// 分解側のエラー文字列に評価データの本文（問題の行・値）が混ざって公開エラーや
+/// ログへ流れないよう、理由を運べない型にしている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeFailed;
 
 /// 評価データ 1 件を評価器側で `input` と正解に分けた所有値（REQ-27）。
 ///
@@ -767,7 +772,7 @@ impl FinalTestLedger {
 ///   `model` を渡す。評価前後のモデル不変性も本関数が検証する（REQ-27）。
 /// - `config_id` は [`FinalTestLedger::register_configs`] で事前登録済みの ID に限る。
 /// - `decode` は照合済みの評価データ本体を [`LabeledInput`] の列へ分ける（評価器側の責務）。
-///   失敗時はロックを作らず、適用を消費しない。
+///   ロック取得後に呼ばれ、失敗しても適用は消費済み（理由は運ばない。[`DecodeFailed`]）。
 /// - `predict` には適用権・各レコードの `input` のみ・`model` を渡す。正解ラベルと評価データ
 ///   本体は渡さない（REQ-27「推論関数には `input` だけを渡す」）。`predict` は渡された
 ///   `model` のパスからモデルを読むこと。ロックは `model` の重みに対して消費される。
@@ -777,7 +782,7 @@ pub fn apply_once<T, E>(
     frozen: &FrozenEvalData<'_>,
     config_id: RepresentativeConfigId,
     model: &ModelPackagePaths<'_>,
-    decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, String>,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, DecodeFailed>,
     predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
 ) -> ApplyOnceResult<T, E> {
     evaluate_with_eval_data_invariance(frozen, |bytes| {
@@ -808,13 +813,14 @@ pub fn apply_once<T, E>(
                     ));
                 }
             }
-            // 分解はロック取得前に行い、失敗しても適用を消費しない。
-            let records = decode(bytes).map_err(|reason| ApplyOnceError::Decode { reason })?;
+            // 適用権は評価データ本文を `decode` へ渡す前に消費する。本文を見てから
+            // `Err` で抜けて何度でも呼び直す迂回を塞ぐ（REQ-27）。
+            let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
+            let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
+            let records = decode(bytes).map_err(|DecodeFailed| ApplyOnceError::Decode)?;
             let (inputs, golds): (Vec<String>, Vec<String>) =
                 records.into_iter().map(|r| (r.input, r.gold)).unzip();
             let input_refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-            let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
-            let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;
             let output = predict(ticket, &input_refs, paths).map_err(ApplyOnceError::Prediction)?;
             Ok(AppliedOnce { output, golds })
         })
