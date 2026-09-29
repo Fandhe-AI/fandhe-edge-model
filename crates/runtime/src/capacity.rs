@@ -359,9 +359,8 @@ pub fn measure_opened_files(
         };
         let meta = file.metadata().map_err(read_err)?;
         if !meta.is_file() {
-            return Err(CapacityError::File(FsError::Read {
+            return Err(CapacityError::File(FsError::NotRegularFile {
                 path: label.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
             }));
         }
         let id = file_id(label, &meta).map_err(read_err)?;
@@ -415,6 +414,13 @@ mod tests {
         let open = || std::fs::File::open(&path).unwrap();
         let one = measure_opened_files(&[(Weights, path.clone(), open())]).unwrap();
         assert_eq!(one.total_bytes(), 4);
+        // ディレクトリのハンドルは NotRegularFile（"not a regular file"）で拒否される
+        let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let not_regular = measure_opened_files(&[(Weights, path.clone(), dir)]);
+        assert!(matches!(
+            not_regular,
+            Err(CapacityError::File(FsError::NotRegularFile { .. }))
+        ));
         let dup = measure_opened_files(&[
             (Weights, path.clone(), open()),
             (Metadata, path.clone(), open()),

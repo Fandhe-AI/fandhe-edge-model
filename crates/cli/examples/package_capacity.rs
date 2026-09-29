@@ -8,14 +8,16 @@
 //! 位置づけ: 配布物・推論経路には入らず、`package` 工程の正式な CLI 契約でもない。
 //! argv は untrusted のため、パスはカレントディレクトリ（計測対象ルート）配下の相対パスに限り、
 //! 絶対パス・`..`・親経由の symlink によるルート外参照を拒否する（REQ-39）。非 UTF-8 の引数は
-//! InvalidInput として返す。末尾の symlink・FIFO・重複は計測コア側で拒否される。構成要素の分類は配布パッケージ形式
+//! InvalidInput として返す。引数は 16 件までで、開く前に件数を検証する。経路違反以外のファイル系の失敗
+//! （不在・権限・ディレクトリ・FIFO・末尾 symlink）は `capacity_error_report` の公開メッセージへ写し、
+//! 重複は計測コアが拒否する。構成要素の分類は配布パッケージ形式
 //! （TASK-28・32）が確定するまでの暫定で、C1 は `model.onnx` を `weights`、`artifact.json` を
 //! `metadata` として渡す（語彙は ONNX 内に保持されるため `vocab_or_feature_transform` は 0 件）。
 
 use fandhe_edge_cli::output::{capacity_error_report, write_error_report, write_package_capacity};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::fs::open_regular_file_for_read;
-use fandhe_edge_runtime::capacity::{PackageComponent, measure_opened_files};
+use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
+use fandhe_edge_runtime::capacity::{CapacityError, PackageComponent, measure_opened_files};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
@@ -35,6 +37,14 @@ fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport
             "path must be a relative path inside the working directory",
         )
     };
+    // 経路の閉じ込めを満たした後のファイル系の失敗は、REQ-21 の公開メッセージへ写す
+    // （不在・権限・FIFO・ディレクトリ・symlink を「経路違反」に丸めない）
+    let read_failure = |path: &Path, source: std::io::Error| {
+        capacity_error_report(&CapacityError::File(FsError::Read {
+            path: path.to_path_buf(),
+            source,
+        }))
+    };
     if raw.is_absolute()
         || !raw
             .components()
@@ -45,26 +55,33 @@ fn open_confined(root: &Path, raw: &Path) -> Result<(PathBuf, File), ErrorReport
     let joined = root.join(raw);
     let name = joined.file_name().ok_or_else(denied)?;
     let parent = joined.parent().ok_or_else(denied)?;
-    let parent = parent.canonicalize().map_err(|_| denied())?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| read_failure(&joined, e))?;
     if !parent.starts_with(root) {
         return Err(denied());
     }
     let path = parent.join(name);
     // 末尾が symlink の場合は開く前に拒否する（開いた後の再確認でも検出される）
-    let link_meta = std::fs::symlink_metadata(&path).map_err(|_| denied())?;
+    let link_meta = std::fs::symlink_metadata(&path).map_err(|e| read_failure(&path, e))?;
     if link_meta.file_type().is_symlink() {
-        return Err(denied());
+        return Err(capacity_error_report(&CapacityError::SymlinkRejected {
+            path: path.clone(),
+        }));
     }
-    let file = open_regular_file_for_read(&path).map_err(|_| denied())?;
-    // 開いた後に同じパスを再解決し、ルート配下・同一パス・同一ファイルであることを確認する
-    let resolved = path.canonicalize().map_err(|_| denied())?;
+    let file = open_regular_file_for_read(&path)
+        .map_err(|e| capacity_error_report(&CapacityError::File(e)))?;
+    // 開いた後に同じパスを再解決し、ルート配下・同一パス・同一ファイルであることを確認する。
+    // 差し替えの兆候は経路違反ではなく symlink 差し替え（計測コアと同じ扱い）として拒否する
+    let replaced = || capacity_error_report(&CapacityError::SymlinkRejected { path: path.clone() });
+    let resolved = path.canonicalize().map_err(|_| replaced())?;
     if resolved != path || !resolved.starts_with(root) {
-        return Err(denied());
+        return Err(replaced());
     }
-    let opened = file.metadata().map_err(|_| denied())?;
-    let current = std::fs::metadata(&resolved).map_err(|_| denied())?;
+    let opened = file.metadata().map_err(|e| read_failure(&path, e))?;
+    let current = std::fs::metadata(&resolved).map_err(|_| replaced())?;
     if !same_file(&opened, &current) {
-        return Err(denied());
+        return Err(replaced());
     }
     Ok((path, file))
 }
@@ -82,6 +99,9 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     a.file_type() == b.file_type() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
+/// 受け付ける引数の上限。構成要素の種類数（5）に余裕を持たせた値で、重複指定は計測コアが拒否する。
+const MAX_ARGS: usize = 16;
+
 fn parse(
     args: &[OsString],
     root: &Path,
@@ -92,7 +112,15 @@ fn parse(
             "invalid argument, expected <component>=<path>",
         )
     };
-    let mut files = Vec::new();
+    // 開いたハンドルを保持するため、開く前に件数を検証して FD・メモリの枯渇を防ぐ（REQ-39）。
+    // 構成要素は重複不可なので、正当な指定は構成要素の種類数を超えない
+    if args.len() > MAX_ARGS {
+        return Err(ErrorReport::new(
+            ExitCode::InvalidInput,
+            "too many arguments",
+        ));
+    }
+    let mut files = Vec::with_capacity(args.len());
     for arg in args {
         // 非 UTF-8 の引数は panic させず InvalidInput に写す
         let arg = arg.to_str().ok_or_else(invalid)?;
@@ -164,6 +192,39 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink("/etc", &link).unwrap();
         assert!(open_confined(&root, Path::new("escape/passwd")).is_err());
+    }
+
+    /// REQ-39: 引数件数の上限を超えたら、ファイルを開く前に InvalidInput で拒否する。
+    #[test]
+    fn req39_too_many_arguments_rejected_before_open() {
+        let root = root();
+        let args: Vec<OsString> = (0..=MAX_ARGS)
+            .map(|_| OsString::from("metadata=sub/m.json"))
+            .collect();
+        let err = parse(&args, &root).unwrap_err();
+        assert_eq!(err.message, "too many arguments");
+    }
+
+    /// REQ-21: 経路内の不在ファイル・ディレクトリ・末尾 symlink は経路違反ではなく
+    /// 容量計測の公開メッセージになる。
+    #[test]
+    fn req21_file_errors_are_not_path_confinement() {
+        let root = root();
+        let missing = open_confined(&root, Path::new("sub/none.json")).unwrap_err();
+        assert_eq!(missing.message, "package file is not readable");
+        let dir = open_confined(&root, Path::new("sub")).unwrap_err();
+        assert_eq!(dir.message, "package file is not a regular file");
+        #[cfg(unix)]
+        {
+            let l = root.join("sub").join("tail_link2");
+            let _ = std::fs::remove_file(&l);
+            std::os::unix::fs::symlink(root.join("sub").join("m.json"), &l).unwrap();
+            let e = open_confined(&root, Path::new("sub/tail_link2")).unwrap_err();
+            assert_eq!(
+                e.message,
+                "package file is a symlink or was replaced during measurement"
+            );
+        }
     }
 
     /// REQ-21: 非 UTF-8 の引数は panic せず InvalidInput の ErrorReport になる。
