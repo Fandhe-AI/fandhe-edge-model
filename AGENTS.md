@@ -29,6 +29,7 @@ make test        # cargo test --workspace（既定 feature）
 make deny        # cargo deny --locked check advisories bans licenses sources
 make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest（uv run --locked）
 make test-trainer-integration  # 実 trainer（MLX CPU）を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
+make check-runtime-linkage  # 推論ランタイムの動的リンク確認（Mac 実機前提。make ci には含まれない。#115）
 make ci          # lint-docs + check-workspace-manifest + 上記 6 つを一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
@@ -45,6 +46,12 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 分離したテストに理由（必要な環境）と REQ-n が記され、実機での実行結果が **証拠の種別（テストハーネス / 模擬 / 推定 / 実機）付きで** PR に記録されているか確認する
 - 既定のテスト集合で動くはずのテストを、CI 通過のために実機前提テストへ移す差分は P0
 - 実機での測定・判定が「人間」担当のタスクを、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する
+
+### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
+
+- `crates/runtime/tests/env_isolation.rs` は、環境変数を空にした子プロセスで C1・C3 の fixture 推論が exit 0 になることを確かめ、既定の `make test` で実行される（unix 限定。rust-ci の Linux・macOS runner で実行。証拠種別: テストハーネス）。実機前提へ移す差分は P0
+- CLI `fandhe-edge infer` の `env -i` 確認は、工程の接続（#136）完了後に追加する（現時点は推論ランタイム層のみ）
+- `make check-runtime-linkage`（`scripts/check-runtime-linkage.sh`）は Mac 実機で人間が実行し、`otool -L` で Python・MLX への動的リンクが無いことと `env -i` 実行の結果を「実機」として PR に記録する。Linux の `ldd` の結果は補助で、Mac 実機の証拠にはならない。未実施の間は「未実施」と書く
 
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
