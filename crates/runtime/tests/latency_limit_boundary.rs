@@ -1,9 +1,10 @@
 //! 待ち時間上限ちょうどの境界判定の結合テスト（REQ-31・REQ-21・TASK-31.3・#130）。
 //!
-//! 計測経路（`InferencePipeline` → `measure_latency` → `summarize_latency` → `p95_ns()`）から
-//! `LimitBreach::latency_if_exceeded` → `resolve_package_outcome` までを公開 API だけで通し、
+//! 計測経路（`InferencePipeline` → `measure_latency` → `summarize_latency`）から
+//! `LatencyLimit` → `check_latency_limit` → `LatencyLimitCheck::breach()` → `resolve_package_outcome`
+//! までを公開 API だけで通し、
 //! p95 が利用者の上限と等しいときは合格、超えたときだけ `limit_exceeded`（20）になることを固定する。
-//! 境界規則は `LimitBreach::latency_if_exceeded` の 1 箇所に集約されており、本テストは再実装せず
+//! 境界規則は `LimitBreach::latency_if_exceeded`（`check_latency_limit` 経由）の 1 箇所に集約されており、本テストは再実装せず
 //! 結果を照合する。
 //!
 //! 証拠種別: テストハーネス（偽の時計・模擬バックエンド）。実機計測ではなく PoC 実測もない。
@@ -11,6 +12,7 @@
 
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_runtime::latency::*;
+use fandhe_edge_runtime::latency_limit::*;
 use fandhe_edge_runtime::latency_report::*;
 use fandhe_edge_runtime::package_outcome::*;
 use fandhe_edge_runtime::pipeline::*;
@@ -64,8 +66,12 @@ fn report(base: u64, step: u64, iters: usize) -> LatencyReport {
     summarize_latency(&s).unwrap()
 }
 
+/// 実経路（`LatencyLimit::from_ns` → `check_latency_limit` → `LatencyLimitCheck::breach()`）で照合する。
+/// 返した Vec をそのまま `resolve_package_outcome` へ渡す。
 fn breaches(r: &LatencyReport, limit_ns: u64) -> Vec<LimitBreach> {
-    LimitBreach::latency_if_exceeded(r.p95_ns(), limit_ns)
+    let limit = LatencyLimit::from_ns(limit_ns).unwrap();
+    check_latency_limit(r, Some(limit))
+        .breach()
         .into_iter()
         .collect()
 }
@@ -82,6 +88,13 @@ fn req31_p95_exactly_equal_to_user_limit_is_not_limit_exceeded() {
     let r = report(195, 0, 100);
     assert_eq!(r.p95_ns(), 195);
     assert_eq!(r.p95().frac_hundredths(), 0);
+    assert_eq!(
+        check_latency_limit(&r, Some(LatencyLimit::from_ns(195).unwrap())),
+        LatencyLimitCheck::Within {
+            p95_ns: 195,
+            limit_ns: 195
+        }
+    );
     let b = breaches(&r, 195);
     assert!(b.is_empty());
     // 上限ちょうどは品質判定へ委ねる（0・10・12・0）。
@@ -95,6 +108,10 @@ fn req31_p95_exactly_equal_to_user_limit_is_not_limit_exceeded() {
 #[test]
 fn req31_p95_one_ns_over_user_limit_is_limit_exceeded() {
     let r = report(195, 0, 100);
+    assert!(matches!(
+        check_latency_limit(&r, Some(LatencyLimit::from_ns(194).unwrap())),
+        LatencyLimitCheck::Exceeded(_)
+    ));
     let b = breaches(&r, 194);
     assert_eq!(
         b,
