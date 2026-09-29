@@ -9,7 +9,7 @@
 //! fixture との一致を機械照合する）。
 //!
 //! 例外: [`MAX_WORKER_STDERR_BYTES`]・[`SUPERVISOR_SHUTDOWN_GRACE_SECONDS`]
-//! （issue #178）は Rust 側（子プロセスの起動・監視）固有の値で、
+//! （issue #178）・[`COOPERATIVE_CANCEL_GRACE_SECONDS`]（issue #145）は Rust 側（子プロセスの起動・監視）固有の値で、
 //! 学習ワーカー側に対応する単一真実源を持たない（各定数の doc に根拠を
 //! 記す）。
 //!
@@ -173,3 +173,19 @@ pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 /// 「3600 秒を超えない」からは猶予分だけ外れる（issue #178 実装計画・
 /// オーナー確認事項 1。孤児プロセスを残さないことを優先する設計判断）。
 pub const SUPERVISOR_SHUTDOWN_GRACE_SECONDS: u32 = 60;
+
+/// 協調キャンセルで、supervisor が自ら後始末して終了するのを待つ猶予（秒）。
+/// REQ-34・REQ-39（TASK-34.1-2・#145）。
+///
+/// キャンセル時、Rust 側は supervisor の `stdin`（キャンセル用パイプ）を閉じ、
+/// supervisor が worker の停止（`killpg` → 回収。`wait` の上限 10 秒）と予約の
+/// 解放・結果 JSON の出力を終えて自ら終了するのを、この猶予まで待つ。上限は
+/// `supervisor.py::_terminate_and_reap` の `wait(timeout=10)` に、予約解放と JSON
+/// 出力の時間を加えた値を上回る 15 秒とする。猶予を超えたら従来どおり `SIGKILL`
+/// にフォールバックする（無限待ちを作らない）。壁時計の期限は常にこの猶予より
+/// 優先し、`SIGKILL` 経路の回収待ち（5 秒）が壁時計の内側に収まるよう、待ちを
+/// 壁時計の期限から遡って切り詰める（`crates/train/src/process.rs`）。
+///
+/// Rust 側固有の値で、学習ワーカー側に対応する定数は無い（共有 fixture の対象外）。
+/// 暫定値で、実機での測定に基づく見直しは別途。
+pub const COOPERATIVE_CANCEL_GRACE_SECONDS: u32 = 15;
