@@ -79,7 +79,7 @@ pub const BYTE_EXACT_RULE: &str = "byte_exact";
 /// と同じ暫定値。層の境界のため data 層へは依存せず本層で持つ。
 pub const MAX_STATS_INPUT_BYTES: usize = 4096;
 
-/// 走査する `input` の総バイト数と、ユニーク入力として保持するキーの総バイト数の上限
+/// 走査する `input` の総バイト数と、正規化後キーの総バイト数（重複で保持されない分を含む）の上限
 /// （REQ-39。走査・保持の前に検証する。`MAX_EVAL_RECORDS` は行数のみの上限のため別に必要）。
 pub const MAX_STATS_TOTAL_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -312,7 +312,7 @@ pub fn basic_stats(
 
     let mut counts: Vec<u64> = vec![0; labels.len()];
     let mut inputs: BTreeSet<Cow<'_, str>> = BTreeSet::new();
-    let mut retained_bytes: usize = 0;
+    let mut normalized_total: usize = 0;
     for (i, row) in rows.iter().enumerate() {
         let &pos = index
             .get(row.label)
@@ -330,15 +330,15 @@ pub fn basic_stats(
                 index: i,
                 limit: MAX_STATS_INPUT_BYTES,
             })?;
-        let key_len = key.len();
-        if inputs.insert(key) {
-            retained_bytes = retained_bytes
-                .checked_add(key_len)
-                .filter(|&t| t <= MAX_STATS_TOTAL_INPUT_BYTES)
-                .ok_or(DiagnosticsError::TotalInputTooLarge {
-                    limit: MAX_STATS_TOTAL_INPUT_BYTES,
-                })?;
-        }
+        // 重複で保持されないキーも含め、正規化後のキー長を重複判定の前に累積する。
+        // 保持分だけを数えると、同一キーへ展開される大量の行で総処理量が上限を超える（REQ-39）。
+        normalized_total = normalized_total
+            .checked_add(key.len())
+            .filter(|&t| t <= MAX_STATS_TOTAL_INPUT_BYTES)
+            .ok_or(DiagnosticsError::TotalInputTooLarge {
+                limit: MAX_STATS_TOTAL_INPUT_BYTES,
+            })?;
+        inputs.insert(key);
     }
 
     let min_label_count = *counts
@@ -478,6 +478,43 @@ mod tests {
             }
         );
         assert_eq!(calls.get(), MAX_STATS_INPUT_BYTES / 8);
+    }
+
+    /// REQ-39: 同一キーへ展開される行が多数あっても、正規化後キーの総バイト数
+    /// （重複で保持されない分を含む）が上限を超えた時点で拒否される。
+    #[test]
+    fn duplicate_expanded_keys_count_toward_total_limit() {
+        use std::cell::Cell;
+        struct Expand<'c>(&'c Cell<usize>);
+        impl InputNormalizer for Expand<'_> {
+            fn rule_id(&self) -> &'static str {
+                "expand_dup"
+            }
+            fn normalize(
+                &self,
+                _input: &str,
+                out: &mut BoundedString,
+            ) -> Result<(), OutputLimitExceeded> {
+                self.0.set(self.0.get() + 1);
+                out.push_str(&"x".repeat(MAX_STATS_INPUT_BYTES))
+            }
+        }
+        let calls = Cell::new(0);
+        let n = MAX_STATS_TOTAL_INPUT_BYTES / MAX_STATS_INPUT_BYTES + 1;
+        let rows: Vec<StatsRow<'_>> = (0..n)
+            .map(|_| StatsRow {
+                input: "a",
+                label: "A",
+            })
+            .collect();
+        let err = basic_stats(&["A"], &rows, InputKey::Normalized(&Expand(&calls))).unwrap_err();
+        assert_eq!(
+            err,
+            DiagnosticsError::TotalInputTooLarge {
+                limit: MAX_STATS_TOTAL_INPUT_BYTES
+            }
+        );
+        assert_eq!(calls.get(), n);
     }
 
     /// REQ-39: BoundedString は上限ちょうどまで受け付け、超過する追記は反映しない。
