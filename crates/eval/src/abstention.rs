@@ -34,9 +34,34 @@
 //! `EvalRecord` はそれらへの参照として構築する（行数分の確保は
 //! `EvalRecord` の `Vec` 2 本のみ）。
 //!
-//! # 対象外
+//! # 「対象外」ラベルによる扱い（REQ-22 異常系・TASK-22.2・issue #97）
 //!
-//! - 「対象外」ラベルによる処理（TASK-22.2）
+//! 学習データで「対象外」ラベルが定義されている場合、対象外は**しきい値（τ）
+//! ではなくそのラベルで**扱う（PoC-12: しきい値による保留だけでは「対象外」を
+//! 返せず、明示的な対象外ラベルが要る）。呼び出し側が対象外ラベルの ID を
+//! [`OutOfScopeLabel`] として渡したとき、判定の優先順位は次のとおり。
+//!
+//! 1. argmax（同値は宣言順の先頭。[`crate::calibration`] と同じ規則）が対象外
+//!    ラベルなら、確信度と τ を比べずに [`AbstentionDecision::OutOfScope`]
+//! 2. それ以外は従来どおり `confidence >= τ` で採用、`<` で保留
+//!    （argmax が通常ラベルなら、対象外ラベルの確率が高くても二次しきい値は
+//!    設けない）
+//!
+//! 対象外の行は保留にならず採用側の扱いとなるため、`adopted_error` の分母
+//! （全件 − 保留件数）に含まれる。評価器（[`crate::metrics::Outcome`]）へは
+//! `Outcome::Label(対象外 ID)` として渡すので、gold が対象外なら正解になる
+//! （`Outcome` に variant を足さず、評価契約・TASK-24.x へ波及させない）。
+//! 対象外ラベルを指定しない（`None`）場合は TASK-22.1 の挙動と完全に同じ。
+//! 指定 ID がラベル集合に無い場合は fail-closed でエラーにする。
+//!
+//! # 対象外（本モジュールが扱わないこと）
+//!
+//! - 定義ファイルで対象外ラベルを指定する方法（REQ-15 のスキーマ変更で、設計と
+//!   承認が要る）。評価器は `fandhe-edge-core::definition` に依存せず、ID を
+//!   呼び出し側から受け取る
+//! - core の判定型 `out_of_scope` 状態の追加・CLI への配線・終了コード 11 への
+//!   写像（issue #140・TASK-33.x）
+//! - 対象外 argmax の行を coverage の分母・分子にどう数えるか（TASK-22.3）
 //! - coverage の記録・表示（TASK-22.3）
 //! - REQ-22 正常系の 95% ブートストラップ信頼区間（PoC-12 は `n_boot=2000`・
 //!   `seed=12` の対応のあるブートストラップを使うが、本 issue の受入は
@@ -81,6 +106,17 @@ pub enum AbstentionDecision {
         /// 校正後の top1 確率（確信度）。
         confidence: f64,
     },
+    /// 対象外（argmax が対象外ラベル。確信度と τ の比較より優先。
+    /// REQ-22 異常系・TASK-22.2）。
+    OutOfScope {
+        /// argmax（= 対象外ラベル）の宣言順添字。
+        label_index: usize,
+        /// 判定時点で解決した対象外ラベル ID（[`AbstentionDecision::Adopt::label`]
+        /// と同じく、判定結果自体に持たせて取り違えを防ぐ）。
+        label: String,
+        /// 校正後の top1 確率（確信度。τ 判定には使っていない）。
+        confidence: f64,
+    },
 }
 
 impl AbstentionDecision {
@@ -89,6 +125,7 @@ impl AbstentionDecision {
         match self {
             AbstentionDecision::Adopt { confidence, .. } => *confidence,
             AbstentionDecision::Abstain { confidence } => *confidence,
+            AbstentionDecision::OutOfScope { confidence, .. } => *confidence,
         }
     }
 
@@ -103,6 +140,61 @@ impl AbstentionDecision {
         match self {
             AbstentionDecision::Adopt { label, .. } => Outcome::Label(label.clone()),
             AbstentionDecision::Abstain { .. } => Outcome::Abstain,
+            // 対象外は保留ではなく「対象外ラベルを予測した」として採点する
+            // （モジュール冒頭。gold が対象外なら正解）。
+            AbstentionDecision::OutOfScope { label, .. } => Outcome::Label(label.clone()),
+        }
+    }
+}
+
+/// 「対象外」ラベルの指定（REQ-22 異常系・TASK-22.2・issue #97）。
+///
+/// 校正時の `calibration.labels()` に対して ID を宣言順添字へ解決して保持し、
+/// 判定時に同じ `calibration` のラベル集合と一致することを再検証する
+/// （別の校正結果との取り違えを fail-closed で拒否。REQ-17・REQ-27）。
+/// フィールドは非公開で、構築は [`OutOfScopeLabel::new`] に集約する。
+/// CLI の `evaluate` 工程（issue #140）が、定義ファイル側の指定に基づいて
+/// 構築して渡す想定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutOfScopeLabel {
+    index: usize,
+    id: String,
+}
+
+impl OutOfScopeLabel {
+    /// `id` を `calibration.labels()` の宣言順添字へ解決する。ラベル集合に
+    /// 無ければ [`CalibrationError::UnknownOutOfScopeLabel`]。
+    pub fn new(calibration: &Calibration, id: &str) -> Result<Self, CalibrationError> {
+        let index = calibration
+            .labels()
+            .iter()
+            .position(|label| label == id)
+            .ok_or_else(|| CalibrationError::UnknownOutOfScopeLabel { id: id.to_string() })?;
+        Ok(Self {
+            index,
+            id: id.to_string(),
+        })
+    }
+
+    /// 対象外ラベルの ID。
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 対象外ラベルの宣言順添字。
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// 判定に使う `calibration` の同じ位置のラベルが同じ ID であることを確認する。
+    fn verify(&self, calibration: &Calibration) -> Result<(), CalibrationError> {
+        match calibration.labels().get(self.index) {
+            Some(found) if *found == self.id => Ok(()),
+            other => Err(CalibrationError::OutOfScopeLabelMismatch {
+                index: self.index,
+                expected: self.id.clone(),
+                found: other.cloned(),
+            }),
         }
     }
 }
@@ -114,6 +206,7 @@ impl AbstentionDecision {
 enum RawDecision {
     Adopt { label_index: usize, confidence: f64 },
     Abstain { confidence: f64 },
+    OutOfScope { label_index: usize, confidence: f64 },
 }
 
 /// `records` 内での位置付きで保留判定する内部経路。[`decide_abstention`]
@@ -124,10 +217,20 @@ enum RawDecision {
 fn decide_abstention_at(
     index: usize,
     calibration: &Calibration,
+    out_of_scope: Option<&OutOfScopeLabel>,
     logits: &[f64],
 ) -> Result<RawDecision, CalibrationError> {
     let (d, argmax_index) = calibration::preprocess_logits(index, logits, calibration.n_labels())?;
     let confidence = calibration::top1_probability(calibration.chosen_beta(), &d);
+    // 対象外ラベルはしきい値より優先する（REQ-22 異常系・TASK-22.2）。
+    if let Some(oos) = out_of_scope
+        && argmax_index == oos.index
+    {
+        return Ok(RawDecision::OutOfScope {
+            label_index: argmax_index,
+            confidence,
+        });
+    }
     if confidence >= calibration.threshold() {
         Ok(RawDecision::Adopt {
             label_index: argmax_index,
@@ -167,6 +270,24 @@ fn resolve_decision(
             })
         }
         RawDecision::Abstain { confidence } => Ok(AbstentionDecision::Abstain { confidence }),
+        RawDecision::OutOfScope {
+            label_index,
+            confidence,
+        } => {
+            let label = calibration.labels().get(label_index).ok_or_else(|| {
+                CalibrationError::Internal {
+                    detail: format!(
+                        "out-of-scope label index {label_index} out of range while resolving decision ({} labels)",
+                        calibration.n_labels()
+                    ),
+                }
+            })?;
+            Ok(AbstentionDecision::OutOfScope {
+                label_index,
+                label: label.clone(),
+                confidence,
+            })
+        }
     }
 }
 
@@ -192,7 +313,26 @@ pub fn decide_abstention(
     calibration: &Calibration,
     logits: &[f64],
 ) -> Result<AbstentionDecision, CalibrationError> {
-    let raw = decide_abstention_at(0, calibration, logits)?;
+    decide_abstention_with_out_of_scope(calibration, None, logits)
+}
+
+/// [`decide_abstention`] に「対象外」ラベルの指定を加えた版（REQ-22 異常系・
+/// TASK-22.2・issue #97）。
+///
+/// `out_of_scope` が `Some` で argmax がそのラベルなら、確信度と τ を比べず
+/// [`AbstentionDecision::OutOfScope`] を返す。`None` なら [`decide_abstention`]
+/// と同じ。`Some` の指定が `calibration` のラベル集合と食い違えば
+/// [`CalibrationError::OutOfScopeLabelMismatch`]。**gold は受け取らない**
+/// （REQ-27）。
+pub fn decide_abstention_with_out_of_scope(
+    calibration: &Calibration,
+    out_of_scope: Option<&OutOfScopeLabel>,
+    logits: &[f64],
+) -> Result<AbstentionDecision, CalibrationError> {
+    if let Some(oos) = out_of_scope {
+        oos.verify(calibration)?;
+    }
+    let raw = decide_abstention_at(0, calibration, out_of_scope, logits)?;
     resolve_decision(calibration, raw)
 }
 
@@ -207,6 +347,7 @@ pub struct AbstentionComparison {
     with_abstention: metrics::SingleSelectMetrics,
     unconditional_error: Ratio,
     adopted_error: Option<Ratio>,
+    out_of_scope: u64,
 }
 
 impl AbstentionComparison {
@@ -229,6 +370,14 @@ impl AbstentionComparison {
     /// `None`（評価契約: 分母 0 の指標は `null`。0 や 1 で埋めない）。
     pub fn adopted_error(&self) -> Option<Ratio> {
         self.adopted_error
+    }
+
+    /// argmax が対象外ラベルだったため「対象外」と判定した件数（REQ-22 異常系・
+    /// TASK-22.2。REQ-21 の 4 状態の区別を件数で示す）。対象外ラベルを指定
+    /// しなかった場合は常に 0。保留件数は
+    /// `with_abstention().outcome_counts.abstain` で、本件数とは重ならない。
+    pub fn out_of_scope(&self) -> u64 {
+        self.out_of_scope
     }
 }
 
@@ -258,6 +407,24 @@ pub fn compare_abstention(
     calibration: &Calibration,
     records: &[calibration::CalibrationRecord],
 ) -> Result<AbstentionComparison, CalibrationError> {
+    compare_abstention_with_out_of_scope(labels, calibration, None, records)
+}
+
+/// [`compare_abstention`] に「対象外」ラベルの指定を加えた版（REQ-22 異常系・
+/// TASK-22.2・issue #97）。
+///
+/// `out_of_scope` が `Some` のとき、argmax が対象外ラベルの行は τ に関係なく
+/// 「対象外」（保留込み側では `Outcome::Label(対象外 ID)`。保留にならない）と
+/// し、その件数を [`AbstentionComparison::out_of_scope`] に記録する。保留なし
+/// 側は従来どおり全行 argmax を採用する。`None` なら [`compare_abstention`] と
+/// 同じ結果になる。指定がラベル集合と食い違えば
+/// [`CalibrationError::OutOfScopeLabelMismatch`]。
+pub fn compare_abstention_with_out_of_scope(
+    labels: &[&str],
+    calibration: &Calibration,
+    out_of_scope: Option<&OutOfScopeLabel>,
+    records: &[calibration::CalibrationRecord],
+) -> Result<AbstentionComparison, CalibrationError> {
     let label_index =
         metrics::build_label_index(labels).map_err(CalibrationError::InvalidLabels)?;
     let n_labels = labels.len();
@@ -281,6 +448,9 @@ pub fn compare_abstention(
                 given: given_label.to_string(),
             });
         }
+    }
+    if let Some(oos) = out_of_scope {
+        oos.verify(calibration)?;
     }
     // ラベルは `label_index`（`build_label_index` の戻り値）で検証済みだが、
     // gold の照合自体は `evaluate_single_select` に委譲する（評価ロジックの
@@ -322,11 +492,21 @@ pub fn compare_abstention(
 
     let mut without_records: Vec<EvalRecord> = Vec::with_capacity(records.len());
     let mut with_records: Vec<EvalRecord> = Vec::with_capacity(records.len());
+    let mut out_of_scope_count: u64 = 0;
 
     for (index, record) in records.iter().enumerate() {
-        let decision = decide_abstention_at(index, calibration, record.logits)?;
+        let decision = decide_abstention_at(index, calibration, out_of_scope, record.logits)?;
         let label_index = match decision {
             RawDecision::Adopt { label_index, .. } => label_index,
+            // 対象外は argmax の添字を保持しているので再計算しない。
+            RawDecision::OutOfScope { label_index, .. } => {
+                out_of_scope_count = out_of_scope_count.checked_add(1).ok_or_else(|| {
+                    CalibrationError::Internal {
+                        detail: "out-of-scope count overflow".to_string(),
+                    }
+                })?;
+                label_index
+            }
             RawDecision::Abstain { .. } => {
                 // 保留の行でも「保留なし」側は argmax を採用するため、
                 // argmax の添字は判定結果に含まれない。`decide_abstention_at`
@@ -351,7 +531,7 @@ pub fn compare_abstention(
             outcome: label_outcome,
         });
         let with_outcome = match decision {
-            RawDecision::Adopt { .. } => label_outcome,
+            RawDecision::Adopt { .. } | RawDecision::OutOfScope { .. } => label_outcome,
             RawDecision::Abstain { .. } => &abstain_outcome,
         };
         with_records.push(EvalRecord {
@@ -387,6 +567,7 @@ pub fn compare_abstention(
         with_abstention,
         unconditional_error,
         adopted_error,
+        out_of_scope: out_of_scope_count,
     })
 }
 
@@ -1026,7 +1207,7 @@ mod tests {
             AbstentionDecision::Adopt { confidence, .. } => {
                 assert!(approx_eq(confidence, threshold));
             }
-            AbstentionDecision::Abstain { .. } => panic!("must adopt at exact threshold"),
+            _ => panic!("must adopt at exact threshold"),
         }
     }
 
@@ -1062,7 +1243,8 @@ mod tests {
             AbstentionDecision::Abstain { confidence } => {
                 assert!(confidence < calibration.threshold());
             }
-            AbstentionDecision::Adopt { confidence, .. } => {
+            AbstentionDecision::Adopt { confidence, .. }
+            | AbstentionDecision::OutOfScope { confidence, .. } => {
                 panic!(
                     "confidence {confidence} below threshold {} must abstain, not adopt",
                     calibration.threshold()
@@ -1158,13 +1340,13 @@ mod tests {
             AbstentionDecision::Adopt {
                 label_index, label, ..
             } => (*label_index, label.clone()),
-            AbstentionDecision::Abstain { .. } => panic!("calibration_a must adopt"),
+            _ => panic!("calibration_a must adopt"),
         };
         let (label_index_b, label_b) = match &decision_b {
             AbstentionDecision::Adopt {
                 label_index, label, ..
             } => (*label_index, label.clone()),
-            AbstentionDecision::Abstain { .. } => panic!("calibration_b must adopt"),
+            _ => panic!("calibration_b must adopt"),
         };
 
         // argmax の添字は両方とも 0（同じロジット）だが、校正時に解決された
