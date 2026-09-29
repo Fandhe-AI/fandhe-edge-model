@@ -718,40 +718,33 @@ fn req39_wrapper_sigterm_does_not_leave_child_group() {
     assert!(!survived, "child group survived wrapper SIGTERM");
 }
 
-/// 子が SIGPIPE を無視して大量に書いても、stdout・stderr は書き込み時点で上限 +1 バイトで
-/// 打ち切られ（ディスク上の大きさが 65537・1048577 バイト）、終了コードは 70 になること。
-/// 測定はラッパーの終了後にテスト側で行う（子が自分で測ると監視の TERM と競合するため）。
-/// 作業ディレクトリはテスト専用の FANDHE_EDGE_WORK_DIR で観測する（REQ-39・REQ-21）。
+/// 書き込み時点で上限が効いていること（ラッパーの内部を覗かず、偽バイナリ側で証明する）。
+/// 偽バイナリは 64 KiB のチャンクを合計 64 MiB まで stdout（stderr 版も）へ書き、成功のたびに
+/// テストが所有するディレクトリの計数ファイルへチャンク数を記録する。`head -c` がパイプを
+/// 閉じると SIGPIPE で止まるため、累計は「上限 + パイプバッファ分の余裕（1 MiB）」以下で
+/// 総量には達しない。計数はラッパーの終了後に読む（監視との競合を避ける。REQ-39・REQ-21）。
 #[test]
 fn req39_output_caps_are_enforced_at_write_time() {
+    const CHUNK: u64 = 65_536;
+    const TOTAL_CHUNKS: u64 = 1024; // 64 MiB
+    const SLACK: u64 = 1_048_576;
     let cases = [
-        (
-            "errcap",
-            "1>&2",
-            "err.raw",
-            65_537_u64,
-            "stderr exceeded size limit",
-        ),
-        (
-            "outcap",
-            "",
-            "out.raw",
-            1_048_577_u64,
-            "output exceeded size limit",
-        ),
+        ("errcap", "1>&2", 65_536_u64, "stderr exceeded size limit"),
+        ("outcap", "", 1_048_576_u64, "output exceeded size limit"),
     ];
-    for (name, redirect, raw, expected_size, message) in cases {
+    for (name, redirect, limit, message) in cases {
         let dir = std::env::temp_dir().join(format!("fandhe-cap-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let body = format!("trap '' PIPE\nhead -c 3000000 /dev/zero {redirect} || true\nexit 0");
-        let dir_s = dir.display().to_string();
-        let o = run_with_fake_bin_args(
-            name,
-            &body,
-            &["--help"],
-            &[("FANDHE_EDGE_WORK_DIR", &dir_s)],
+        let counter = dir.join("chunks");
+        let body = format!(
+            "i=0\nwhile [ $i -lt {TOTAL_CHUNKS} ]; do\n  head -c {CHUNK} /dev/zero {redirect} || exit 0\n  i=$((i+1))\n  echo $i >'{}'\ndone\nexit 0",
+            counter.display()
         );
-        let size = std::fs::metadata(dir.join(raw)).map(|m| m.len());
+        let o = run_with_fake_bin(name, &body);
+        let chunks: u64 = std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(u64::MAX);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(o.code, Some(70), "{name}");
         assert_eq!(
@@ -759,41 +752,15 @@ fn req39_output_caps_are_enforced_at_write_time() {
             format!("{{\"code\":\"runtime_error\",\"message\":\"fandhe-edge {message}\"}}\n"),
             "{name}"
         );
-        assert_eq!(size.ok(), Some(expected_size), "{name}");
+        assert!(o.stdout.len() as u64 <= limit, "{name}");
+        let written = chunks.saturating_mul(CHUNK);
+        assert!(
+            written <= limit + SLACK,
+            "{name}: fake child wrote {written} bytes before stopping"
+        );
+        assert!(
+            written < TOTAL_CHUNKS * CHUNK,
+            "{name}: child was never stopped"
+        );
     }
-}
-
-/// FANDHE_EDGE_WORK_DIR が存在しない・symlink の場合は runtime_error(70) で拒否し、
-/// 未指定時の既定経路（mktemp）は変わらないこと。
-#[test]
-fn req39_work_dir_override_is_validated() {
-    let missing = "/nonexistent/fandhe-work";
-    let o = run_with_fake_bin_args(
-        "wdmissing",
-        "exit 0",
-        &["--help"],
-        &[("FANDHE_EDGE_WORK_DIR", missing)],
-    );
-    assert_eq!(o.code, Some(70));
-    assert_eq!(
-        o.stdout,
-        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge binary not found or not executable\"}\n"
-    );
-    let base = std::env::temp_dir().join(format!("fandhe-wdlink-{}", std::process::id()));
-    std::fs::create_dir_all(&base).expect("mkdir");
-    let target = base.join("t");
-    std::fs::create_dir_all(&target).expect("mkdir");
-    let link = base.join("l");
-    std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    let link_s = link.display().to_string();
-    let o = run_with_fake_bin_args(
-        "wdlink",
-        "exit 0",
-        &["--help"],
-        &[("FANDHE_EDGE_WORK_DIR", &link_s)],
-    );
-    let touched = std::fs::read_dir(&target).map(|d| d.count()).unwrap_or(99);
-    std::fs::remove_dir_all(&base).ok();
-    assert_eq!(o.code, Some(70));
-    assert_eq!(touched, 0);
 }
