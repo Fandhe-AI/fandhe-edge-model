@@ -16,7 +16,10 @@
 #     stderr 容量（64 KiB）に上限を置き、超過時は子（子孫プロセスを含む）を終了して
 #     runtime_error(70) の JSON を返す（REQ-39）。子は独立したプロセスグループで起動し、
 #     直接の子が終了しても、グループの子孫が全員いなくなるまで同じ上限の下で監視する
-#     （setsid で自らグループを抜ける子孫は対象外。bash が無い環境は fail-closed で 70）
+#     （setsid で自らグループを抜ける子孫は対象外。bash が無い環境は fail-closed で 70）。
+#     プロセス一覧（ps）の取得に失敗したら生存不明として fail-closed（グループを KILL して 70）。
+#     本スクリプトの突然死（SIGKILL）には独立した監視役が最大 1 秒後に子のグループを KILL する
+#     （監視役も同時に殺された場合と、グループが空になった後の pgid 再利用は防げない限界）
 #   - 許可された終了コードでも、stdout が JSON の構文（RFC 8259）として正しい
 #     オブジェクト 1 つ（1 行）でなければ runtime_error(70) の JSON へ置き換える
 #     （複数 JSON・途中切れ・末尾カンマ等を中継しない。REQ-33）。ただし引数に
@@ -101,7 +104,23 @@ err=$work/err
 rcf=$work/rc
 : >"$out"
 : >"$err"
-trap 'rm -rf "$work"' EXIT
+child=
+wd=
+reaped=0
+# 終了時の後始末。未回収の子のグループ（と後述の監視役）が残っていれば KILL する
+# （wait 後は pgid が再利用されうるため送らない）。TERM/INT/HUP でも EXIT へ流す
+# （呼び出し元が本スクリプトを止めてもグループを残さない。REQ-39）
+cleanup() {
+    if [ "$reaped" -eq 0 ] && [ -n "$child" ]; then
+        kill -s KILL -- "-$child" 2>/dev/null || true
+    fi
+    if [ -n "$wd" ]; then
+        kill -s KILL -- "-$wd" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 70' TERM INT HUP
 
 # 期限と出力上限（REQ-39 資源の上限。無期限待ち・無制限のディスク書き込みを作らない）。
 # 期限は FANDHE_EDGE_TIMEOUT_SECS（先頭 0 なしの 1〜999 の整数秒。不正値と先頭 0
@@ -138,9 +157,22 @@ set -m
 ) </dev/null >/dev/null 3>&- &
 child=$!
 
-# グループに生存プロセス（ゾンビ以外）が残っているか
+# 監視役（独立したプロセスグループ）: 本スクリプトが SIGKILL 等で突然死しても、
+# 生存を確認できなくなった時点で子のグループを KILL する（最大 1 秒の遅れ）。
+# 正常終了・捕捉できるシグナルでは cleanup が監視役のグループごと止める
+wrapper_pid=$$
+(
+    while kill -0 "$wrapper_pid" 2>/dev/null; do sleep 1; done
+    kill -s KILL -- "-$child" 2>/dev/null || true
+) </dev/null >/dev/null 2>&1 3>&- &
+wd=$!
+
+# グループに生存プロセス（ゾンビ以外）が残っているか。
+# 戻り値: 0=残っている・1=いない・2=プロセス一覧の取得失敗（生存不明。fail-closed に扱う）
 group_alive() {
-    ps -A -o pgid= -o stat= 2>/dev/null | awk -v g="$child" '
+    _ps=$(ps -A -o pgid= -o stat= 2>/dev/null) || return 2
+    [ -n "$_ps" ] || return 2
+    printf '%s\n' "$_ps" | awk -v g="$child" '
         $1 == g && $2 !~ /^Z/ { found = 1 }
         END { exit found ? 0 : 1 }'
 }
@@ -149,8 +181,15 @@ group_alive() {
 ticks=0
 limit_kind=
 while :; do
-    if [ -e "$rcf" ] && ! group_alive; then
-        break
+    if [ -e "$rcf" ]; then
+        alive=0
+        group_alive || alive=$?
+        if [ "$alive" -eq 1 ]; then
+            break
+        elif [ "$alive" -eq 2 ]; then
+            limit_kind=monitor_error
+            break
+        fi
     fi
     if [ "$ticks" -ge "$max_ticks" ]; then
         limit_kind=timeout
@@ -177,6 +216,7 @@ if [ -n "$limit_kind" ]; then
     kill -s KILL -- "-$child" 2>/dev/null || true
 fi
 wait "$child" || true
+reaped=1
 
 rc=70
 if [ -z "$limit_kind" ] && [ -r "$rcf" ]; then
@@ -206,6 +246,11 @@ case "$limit_kind" in
         : >"$err"
         rc=70
         ;;
+    monitor_error)
+        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge process monitoring failed"}' >"$out"
+        : >"$err"
+        rc=70
+        ;;
     stderr_limit)
         printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge stderr exceeded size limit"}' >"$out"
         : >"$err"
@@ -220,6 +265,12 @@ esac
 # エスケープを含む top-level のキー・`code` の値は復号せず不一致として拒否する
 # （CLI は escape した `code` を出さない。REQ-21）
 check_output() {
+    # RFC 8259 は JSON テキストを UTF-8 と定める。不正なバイト列（awk は LC_ALL=C で
+    # バイトのまま扱うため検出できない）は iconv で検査し、iconv が無い環境も fail-closed で
+    # 不正とみなす（REQ-33）
+    if ! iconv -f UTF-8 -t UTF-8 <"$out" >/dev/null 2>&1; then
+        return 1
+    fi
     # 1 行 1 JSON の契約のため、終端が改行でない出力（末尾の改行欠落）は不正とする（REQ-33）。
     # $(...) は末尾の改行を落とすため、最終バイトが改行のときだけ空になる
     if [ -n "$(tail -c 1 "$out")" ]; then

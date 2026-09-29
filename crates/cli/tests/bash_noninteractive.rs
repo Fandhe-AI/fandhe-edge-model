@@ -592,3 +592,128 @@ fn req33_missing_trailing_newline_is_rejected() {
         assert_eq!(o.stdout, INVALID_OUTPUT, "{args:?}");
     }
 }
+
+/// ps の取得に失敗したら子孫の終了とみなさず fail-closed（グループを終了して 70）。
+/// 生きている子孫は残さない（REQ-39）。
+#[test]
+fn req39_ps_failure_is_fail_closed_and_kills_group() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fandhe-fakeps-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let ps = dir.join("ps");
+    std::fs::write(&ps, "#!/bin/sh\nexit 1\n").expect("write");
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let marker = std::env::temp_dir().join(format!("fandhe-psfail-{}", std::process::id()));
+    let body = format!(
+        "echo '{{\"code\":\"ok\"}}'\n(sleep 3; echo alive >'{}') &\nexit 0",
+        marker.display()
+    );
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = run_with_fake_bin_args("psfail", &body, &["--help"], &[("PATH", &path)]);
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge process monitoring failed\"}\n"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let survived = marker.exists();
+    std::fs::remove_file(&marker).ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!survived, "descendant survived ps failure");
+}
+
+/// 出力に不正な UTF-8 が含まれる場合は中継せず 70 に置き換え、正当な多バイト文字は通す
+/// （REQ-33）。
+#[test]
+fn req33_invalid_utf8_output_is_rejected() {
+    let o = run_with_fake_bin(
+        "badutf8",
+        "printf '{\"code\":\"ok\",\"m\":\"\\377\"}\\n'\nexit 0",
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(o.stdout, INVALID_OUTPUT);
+    let ok = run_with_fake_bin(
+        "goodutf8",
+        "printf '{\"code\":\"ok\",\"m\":\"\\303\\251\"}\\n'\nexit 0",
+    );
+    assert_eq!(ok.code, Some(0));
+    assert_eq!(ok.stdout, "{\"code\":\"ok\",\"m\":\"\u{e9}\"}\n");
+}
+
+/// ラッパーが SIGKILL で突然死しても、監視役が子のプロセスグループを終了すること（REQ-39）。
+#[test]
+fn req39_wrapper_sigkill_does_not_leave_child_group() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fandhe-wdeath-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let marker = dir.join("alive");
+    let bin = dir.join("fake-bin");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\n(sleep 4; echo alive >'{}') &\nexec sleep 60\n",
+            marker.display()
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut wrapper = Command::new("sh")
+        .arg(script_path())
+        .arg("--help")
+        .env("FANDHE_EDGE_BIN", &bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(800));
+    wrapper.kill().expect("kill wrapper");
+    wrapper.wait().ok();
+    std::thread::sleep(Duration::from_secs(6));
+    let survived = marker.exists();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!survived, "child group survived wrapper SIGKILL");
+}
+
+/// ラッパーが SIGTERM で止められても trap で子のグループを終了すること（REQ-39）。
+#[test]
+fn req39_wrapper_sigterm_does_not_leave_child_group() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fandhe-wterm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let marker = dir.join("alive");
+    let bin = dir.join("fake-bin");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\n(sleep 3; echo alive >'{}') &\nexec sleep 60\n",
+            marker.display()
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let wrapper = Command::new("sh")
+        .arg(script_path())
+        .arg("--help")
+        .env("FANDHE_EDGE_BIN", &bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(800));
+    Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .ok();
+    std::thread::sleep(Duration::from_secs(5));
+    let survived = marker.exists();
+    std::fs::remove_dir_all(&dir).ok();
+    let mut wrapper = wrapper;
+    wrapper.wait().ok();
+    assert!(!survived, "child group survived wrapper SIGTERM");
+}
