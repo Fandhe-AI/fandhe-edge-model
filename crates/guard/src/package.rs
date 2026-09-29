@@ -10,10 +10,10 @@
 //!    ディレクトリ）配下でなければならない（[`confine_package`]）
 //! 2. パッケージ内のメンバー（`artifact.json`・`onnx_file`）はパッケージ配下でなければ
 //!    ならず、加えて開いた fd の実パスが workspace 配下であることを再確認する
-//!    （[`ConfinedPackage::open_member`]）。[`crate::path::open_confined`] はルートを
-//!    パスから開き直すため、`confine_package` の後にパッケージディレクトリ（またはその
-//!    途中の成分）が外を指す symlink へ差し替えられる競合を、ガード単体では防げない。
-//!    workspace の再確認でこの窓を塞ぐ
+//!    （[`ConfinedPackage::open_member`]）。`confine_package` は検証したパッケージの
+//!    ディレクトリ fd を `O_NOFOLLOW` で開いて保持し（実パスが検証結果と一致しなければ拒否）、
+//!    メンバーはその fd を起点に開く。検証後にパッケージのパスが別ディレクトリ（symlink 等）へ
+//!    差し替えられても、検証済みのパッケージ以外は読めない
 //!
 //! # 呼び出し元の義務
 //!
@@ -27,15 +27,23 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use crate::path::{ConfinedPath, EscapeKind, PathRejection, open_confined, safe_join};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::path::{ConfinedDir, open_dir_confined};
+use crate::path::{ConfinedPath, EscapeKind, PathRejection, safe_join};
 
 /// workspace 配下へ閉じ込め済みのパッケージディレクトリ。[`confine_package`] だけが生成する。
-#[derive(Debug, Clone)]
+///
+/// Linux・macOS では検証時に開いたディレクトリ fd を保持し、メンバーはこの fd を起点に開く
+/// （パッケージのパスを開き直さない。検証後の差し替えでも元のパッケージの外は読めない）。
+#[derive(Debug)]
 pub struct ConfinedPackage {
     /// 正準化した workspace（メンバーの実パスの包含確認に使う）。
     workspace: PathBuf,
     /// 正準化したパッケージディレクトリ。
     dir: ConfinedPath,
+    /// 検証時に開いて保持するパッケージのディレクトリ fd。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    handle: ConfinedDir,
 }
 
 /// `package`（利用者由来の `--package`）を `workspace` 配下へ閉じ込め、ディレクトリであることを確認する。
@@ -52,9 +60,13 @@ pub fn confine_package(workspace: &Path, package: &Path) -> Result<ConfinedPacka
             candidate: package.to_path_buf(),
         });
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let handle = open_dir_confined(&dir)?;
     Ok(ConfinedPackage {
         workspace: canon_workspace,
         dir,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        handle,
     })
 }
 
@@ -67,17 +79,57 @@ impl ConfinedPackage {
     /// パッケージ内のメンバーを、パッケージ配下かつ workspace 配下であることを確認して開く。
     ///
     /// # Errors
-    /// [`open_confined`] の拒否に加え、開いた実体が workspace の外なら
+    /// [`crate::path::open_confined`] と同じ拒否に加え、開いた実体が workspace の外なら
     /// [`PathRejection::Escapes`]（[`EscapeKind::Symlink`]）。
     pub fn open_member(&self, member: &Path) -> Result<(File, ConfinedPath), PathRejection> {
-        let (file, real) = open_confined(self.dir.as_path(), member)?;
-        // 成分単位の包含判定（文字列の前方一致は使わない）。
-        if !real.as_path().starts_with(&self.workspace) {
-            return Err(PathRejection::Escapes {
-                candidate: member.to_path_buf(),
-                kind: EscapeKind::Symlink,
-            });
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
         }
-        Ok((file, real))
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let (file, real) = self.handle.open_member(member)?;
+            // 成分単位の包含判定（文字列の前方一致は使わない）。
+            if !real.as_path().starts_with(&self.workspace) {
+                return Err(PathRejection::Escapes {
+                    candidate: member.to_path_buf(),
+                    kind: EscapeKind::Symlink,
+                });
+            }
+            Ok((file, real))
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+
+    /// REQ-39: 検証後にパッケージのパスが workspace 内の別ディレクトリ（symlink）へ差し替えられても、
+    /// 保持した fd 経由で元のパッケージのメンバーを読む（差し替え先は読まない）。
+    #[test]
+    fn req39_package_swap_after_confine_keeps_original() {
+        let base =
+            std::env::temp_dir().join(format!("fandhe-guard-pkgswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg")).expect("mkdir");
+        std::fs::create_dir_all(base.join("other")).expect("mkdir");
+        std::fs::write(base.join("pkg/artifact.json"), b"original").expect("write");
+        std::fs::write(base.join("other/artifact.json"), b"swapped").expect("write");
+
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        std::fs::rename(base.join("pkg"), base.join("pkg_moved")).expect("rename");
+        symlink(base.join("other"), base.join("pkg")).expect("symlink");
+
+        let (mut f, _) = pkg
+            .open_member(Path::new("artifact.json"))
+            .expect("open by fd");
+        let mut s = String::new();
+        f.read_to_string(&mut s).expect("read");
+        assert_eq!(s, "original");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

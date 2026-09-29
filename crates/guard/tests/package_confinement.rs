@@ -99,7 +99,8 @@ fn req39_member_escaping_package_is_rejected() {
 }
 
 /// REQ-39: confine 後にパッケージディレクトリを外を指す symlink へ差し替えても、
-/// open_member が workspace の再確認で拒否する（TOCTOU）。
+/// 保持した fd 起点の open_member は差し替え先を読まず拒否する（TOCTOU）。削除済みのディレクトリ
+/// fd は実パスが解決できないため fail-closed（拒否の種別は OS 依存のため問わない）。
 #[test]
 fn req39_package_dir_swapped_to_outside_symlink_is_rejected() {
     let sb = Sandbox::new("swap");
@@ -107,6 +108,5 @@ fn req39_package_dir_swapped_to_outside_symlink_is_rejected() {
     let pkg = confine_package(&sb.workspace(), Path::new("pkg")).expect("confine");
     fs::remove_dir_all(sb.workspace().join("pkg")).expect("rm pkg");
     symlink(sb.outside().join("fake_pkg"), sb.workspace().join("pkg")).expect("swap");
-    let r = pkg.open_member(Path::new("model.onnx"));
-    assert_eq!(reason(r), ("path_escapes_root", ExitCode::InvalidInput));
+    assert!(pkg.open_member(Path::new("model.onnx")).is_err());
 }

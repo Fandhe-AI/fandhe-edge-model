@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 
 const ESCAPES: &str =
     "{\"code\":\"invalid_input\",\"message\":\"path rejected: path_escapes_root\"}\n";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const STUB: &str =
     "{\"code\":\"runtime_error\",\"message\":\"stage not implemented yet (TASK-33.1-2)\"}\n";
 
@@ -46,6 +47,7 @@ impl Sandbox {
         self.base.join("outside")
     }
     /// workspace 内にパッケージ `name` を作る。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn make_pkg(&self, name: &str, artifact_json: &str) -> PathBuf {
         let dir = self.workspace().join(name);
         fs::create_dir_all(&dir).expect("mkdir pkg");
@@ -224,6 +226,25 @@ mod unix_only {
         assert_eq!(
             stdout,
             "{\"code\":\"limit_exceeded\",\"message\":\"artifact metadata exceeds size limit\"}\n"
+        );
+    }
+
+    /// REQ-39（資源の上限）: 上限を超える ONNX ファイルは読み込み前に limit_exceeded（20）。
+    /// sparse ファイル（`set_len`）で実データを書かずに 44 MiB 超を作る。
+    #[test]
+    fn req39_oversized_onnx_is_limit_exceeded() {
+        let sb = Sandbox::new("bigonnx");
+        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("model.onnx"))
+            .expect("open");
+        f.set_len(44 * 1024 * 1024 + 1).expect("set_len");
+        let (code, stdout) = sb.infer(Path::new("pkg"));
+        assert_eq!(code, Some(20));
+        assert_eq!(
+            stdout,
+            "{\"code\":\"limit_exceeded\",\"message\":\"model file exceeds size limit\"}\n"
         );
     }
 }

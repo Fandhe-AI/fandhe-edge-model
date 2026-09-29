@@ -409,17 +409,8 @@ fn open_confined_impl(
     root: &Path,
     candidate: &Path,
 ) -> Result<(File, ConfinedPath), PathRejection> {
-    use rustix::fs::{Mode, OFlags, fstat, openat};
+    use rustix::fs::{Mode, OFlags};
     use rustix::io::Errno;
-
-    let escapes = || PathRejection::Escapes {
-        candidate: candidate.to_path_buf(),
-        kind: EscapeKind::Symlink,
-    };
-    let unresolvable = |e: Errno| PathRejection::Unresolvable {
-        candidate: candidate.to_path_buf(),
-        source: errno_to_io(e),
-    };
 
     let root_fd = rustix::fs::open(
         root,
@@ -432,8 +423,32 @@ fn open_confined_impl(
             source: errno_to_io(other),
         },
     })?;
+    open_confined_from_fd(&root_fd, root, candidate)
+}
+
+/// 保持済みのルートディレクトリ fd を起点に、[`open_confined_impl`] の手順 2〜5 を行う。
+///
+/// `given_root` は拒否種別の判別にだけ使う。ルートの実パスは fd から得る（パス名を再解決しない）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_confined_from_fd(
+    root_fd: &rustix::fd::OwnedFd,
+    given_root: &Path,
+    candidate: &Path,
+) -> Result<(File, ConfinedPath), PathRejection> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+    use rustix::io::Errno;
+
+    let escapes = || PathRejection::Escapes {
+        candidate: candidate.to_path_buf(),
+        kind: EscapeKind::Symlink,
+    };
+    let unresolvable = |e: Errno| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source: errno_to_io(e),
+    };
+    let root = given_root;
     let canon_root =
-        fd_real_path(&root_fd).map_err(|source| PathRejection::RootUnresolvable { source })?;
+        fd_real_path(root_fd).map_err(|source| PathRejection::RootUnresolvable { source })?;
 
     let first = resolve_under(&canon_root, root, candidate)?;
     let relative = first
@@ -459,10 +474,11 @@ fn open_confined_impl(
     #[cfg(test)]
     test_hooks::run_after_validation();
 
-    let mut dir = root_fd;
+    let mut owned: Option<rustix::fd::OwnedFd> = None;
     for name in parents {
-        dir = openat(
-            &dir,
+        let cur = owned.as_ref().unwrap_or(root_fd);
+        let next = openat(
+            cur,
             *name,
             OFlags::RDONLY
                 | OFlags::DIRECTORY
@@ -476,9 +492,11 @@ fn open_confined_impl(
             Errno::LOOP | Errno::NOTDIR => escapes(),
             other => unresolvable(other),
         })?;
+        owned = Some(next);
     }
+    let dir = owned.as_ref().unwrap_or(root_fd);
     let fd = openat(
-        &dir,
+        dir,
         *last,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
@@ -498,6 +516,74 @@ fn open_confined_impl(
     // 別のファイルへ差し替えられても、File と ConfinedPath が別の対象を指さない）。
     let real = ensure_real_path_under(&fd, &canon_root, candidate)?;
     Ok((File::from(fd), ConfinedPath(real)))
+}
+
+/// 検証時に開いたまま保持するディレクトリ fd（Linux・macOS）。
+///
+/// パッケージのように「検証後に同じディレクトリ配下のメンバーを複数回開く」用途で、ディレクトリを
+/// パスから開き直さない（差し替え競合を塞ぐ）。[`open_dir_confined`] だけが生成する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct ConfinedDir {
+    fd: rustix::fd::OwnedFd,
+    real: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ConfinedDir {
+    /// 開いた時点の実パス（表示・診断用）。
+    pub fn as_path(&self) -> &Path {
+        &self.real
+    }
+
+    /// 保持している fd を起点に `candidate`（本ディレクトリ配下の相対パス）を開く。
+    ///
+    /// [`open_confined`] と同じ検査・拒否を、ディレクトリのパスを再解決せずに行う。
+    ///
+    /// # Errors
+    /// [`open_confined`] と同じ。
+    pub fn open_member(&self, candidate: &Path) -> Result<(File, ConfinedPath), PathRejection> {
+        open_confined_from_fd(&self.fd, &self.real, candidate)
+    }
+}
+
+/// `dir`（[`safe_join`] 済みの正準パス）を `O_NOFOLLOW` で開いて fd を保持する。
+///
+/// 開いた fd の実パスが `dir` と一致することを確認する。検証後・open 前に別ディレクトリへ
+/// 差し替えられていれば [`PathRejection::Escapes`]（[`EscapeKind::Symlink`]）で拒否する。
+///
+/// # Errors
+/// 開けない・実パスを得られない・実パスが `dir` と異なる場合。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn open_dir_confined(dir: &ConfinedPath) -> Result<ConfinedDir, PathRejection> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+
+    let fd = rustix::fs::open(
+        dir.as_path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::NOTDIR => PathRejection::NotDirectory {
+            candidate: dir.as_path().to_path_buf(),
+        },
+        Errno::LOOP => PathRejection::Escapes {
+            candidate: dir.as_path().to_path_buf(),
+            kind: EscapeKind::Symlink,
+        },
+        other => PathRejection::RootUnresolvable {
+            source: errno_to_io(other),
+        },
+    })?;
+    let real = fd_real_path(&fd).map_err(|source| PathRejection::RootUnresolvable { source })?;
+    if real != dir.as_path() {
+        return Err(PathRejection::Escapes {
+            candidate: dir.as_path().to_path_buf(),
+            kind: EscapeKind::Symlink,
+        });
+    }
+    Ok(ConfinedDir { fd, real })
 }
 
 /// 開いた fd の実パスが、最初に確定したルートの実パス配下であることを確認する（fail-closed）。
