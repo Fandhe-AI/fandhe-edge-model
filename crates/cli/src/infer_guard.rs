@@ -3,7 +3,7 @@
 //!
 //! # 呼び出し文脈
 //!
-//! `main.rs` が `infer` の引数解析に成功した直後に [`guard_infer_paths`] を呼ぶ。拒否は
+//! `main.rs` が `infer` の引数解析に成功した直後に [`check_infer_path_and_format`] を呼ぶ。拒否は
 //! [`ErrorReport`]（`invalid_input`=64 等。message は `path rejected: <reason_code>` の固定語彙で、
 //! パス・`onnx_file` の値・`artifact.json` の本文を含めない）として呼び出し側が JSON 1 行で出力する。
 //!
@@ -16,11 +16,21 @@
 //!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
 //!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
 //!
-//! サイズ上限の正式値の確定・sha256 照合は本モジュールの範囲外（TASK-39.5・TASK-39.6）。`--input-file`・`--out` の閉じ込めも範囲外。
+//! # 未検証の項目（「検証済み」ではない）
+//!
+//! 本モジュールが行うのは経路の閉じ込めと形式の許可制のみ。次は**まだ検査していない**ため、
+//! 戻り値を「完全性・版まで検証済み」と扱ってはならない。
+//!
+//! - 完全性（モデルの sha256 照合・ハッシュ一致の検証）: #168（TASK-39.3-2。親 #166）
+//! - 版（`kind_version` の許可リスト検証）: #174（TASK-39.6-1。親 #173）
+//! - 読み込み前のサイズ上限の正式値: #172（TASK-39.5-3）
+//!
+//! パッケージ形式に `kind_version`・sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。
+//! `--input-file`・`--out` の閉じ込めも範囲外。
 //!
 //! # 後続（#136）への申し送り
 //!
-//! 返す [`GuardedInferInputs::onnx`] は検証つきで開いて形式検査を通した [`CheckedFile`]。推論への接続では、この
+//! 返す [`PathFormatCheckedInputs::onnx`] は閉じ込めつきで開いて形式検査のみを通した [`CheckedFile`]。推論への接続では、この
 //! バイト列（`as_bytes`・`Read`）をランタイムへ渡すこと。パスから開き直すと検証後の差し替え
 //! （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。
 
@@ -41,28 +51,32 @@ use crate::error_report::ToErrorReport;
 /// パッケージ内のメタデータのファイル名（パッケージ形式の確定は TASK-28/32）。
 const ARTIFACT_META_FILE: &str = "artifact.json";
 
-/// 経路ガードを通過した `infer` の入力。
+/// 経路の閉じ込めと形式の許可制のみを通過した `infer` の入力。
+///
+/// **完全性（sha256）と版（`kind_version`）は未検証**（#168・#174。モジュール doc 参照）。
+/// 改変されたモデルや非対応の版のパッケージでも、経路と形式が正しければ返る。
 #[derive(Debug)]
-pub struct GuardedInferInputs {
+pub struct PathFormatCheckedInputs {
     /// workspace 配下へ閉じ込め済みのパッケージ。
     pub package: ConfinedPackage,
-    /// 検証つきで開き、形式検査を通した ONNX のバイト列。読むときはこれだけを使う。
+    /// 閉じ込めつきで開き、形式検査のみを通した ONNX のバイト列（sha256 未照合）。読むときはこれだけを使う。
     pub onnx: CheckedFile,
     /// `onnx` の実パス（表示・診断用。開き直さない）。
     pub onnx_path: ConfinedPath,
 }
 
-/// `args.package` と `artifact.json` の `onnx_file` を経路検証し、ONNX ファイルを開く。
+/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式のみ検査する。
+/// sha256・`kind_version` は検査しない（#168・#174）。
 ///
 /// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
 ///
 /// # Errors
 /// 経路の拒否は `invalid_input`（64）、`artifact.json` の上限超過は `limit_exceeded`（20）、
 /// 不正な内容は `invalid_input`、I/O 起因・非対応 OS は `runtime_error`（70）。
-pub fn guard_infer_paths(
+pub fn check_infer_path_and_format(
     workspace: &Path,
     args: &InferArgs,
-) -> Result<GuardedInferInputs, ErrorReport> {
+) -> Result<PathFormatCheckedInputs, ErrorReport> {
     let package = confine_package(workspace, &args.package).map_err(|e| e.to_error_report())?;
     let (meta_file, _) = package
         .open_member(Path::new(ARTIFACT_META_FILE))
@@ -96,7 +110,7 @@ pub fn guard_infer_paths(
         MAX_MODEL_FILE_BYTES,
     )
     .map_err(|e| e.to_error_report())?;
-    Ok(GuardedInferInputs {
+    Ok(PathFormatCheckedInputs {
         package,
         onnx,
         onnx_path,
