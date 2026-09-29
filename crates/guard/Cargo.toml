@@ -8,9 +8,14 @@ publish.workspace = true
 description = "Guard layer (input validation before processing) for fandhe-edge-model."
 
 [dependencies]
-# workspace 内の path 依存のみ（外部 crate は追加しない。REQ-39・TASK-39.2-1・#153）。
+# 共通部分は workspace 内の path 依存のみ（REQ-39・TASK-39.2-1・#153）。外部 crate は下の rustix のみ。
 # 通常ファイル検証つきオープン（`fandhe_edge_core::fs`）と終了コード（`ExitCode`）を使う。
 fandhe-edge-core.workspace = true
+
+# ディレクトリ fd 起点の openat（O_NOFOLLOW）による経路の閉じ込め（REQ-39・TASK-39.4-1。
+# 2026-09-29 オーナー承認）。open_confined を実装する Linux・macOS に限る（他 OS は fail-closed）。
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true
