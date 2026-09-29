@@ -28,8 +28,12 @@ use std::time::Duration;
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
 use fandhe_edge_train::process::ENV_ALLOWLIST;
-use fandhe_edge_train::process::{RunLimits, WorkerCandidateRunner, WorkerLauncher, run_train};
-use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams, ValidationInput};
+#[cfg(unix)]
+use fandhe_edge_train::process::WorkerCandidateRunner;
+use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
+#[cfg(unix)]
+use fandhe_edge_train::request::ValidationInput;
+use fandhe_edge_train::request::{Device, TrainRequest, TrainRequestParams};
 
 /// [`TrainRequest`] の `root`（実在しない絶対パス。`root` の symlink 解決は
 /// ベストエフォートで、存在しない場合は文字列のまま扱われる。
@@ -734,6 +738,7 @@ fn case_wall_timeout_when_grandchild_holds_stderr_open(case_dir: &Path) -> Resul
     )
 }
 
+#[cfg(unix)]
 fn make_request_with_validation(n: usize) -> TrainRequest {
     make_request(Some(30))
         .with_validation_inputs(
