@@ -53,6 +53,12 @@ sha2 = "=0.11.0"
 # 準拠で版がずれていた。PR #188 Codex レビュー P1 指摘・オーナー承認記録は
 # PR #225）。
 unicode-normalization = "=0.1.22"
+# rustix は 2026-09-29 オーナー承認済み（.claude/rules/dependency-policy.md「承認済みの
+# 依存」表。ガード層 crates/guard の経路の閉じ込め〔TASK-39.4-1・#158・REQ-39〕で、ルートの
+# ディレクトリ fd を起点に `openat`（O_NOFOLLOW）で成分ごとに開くために使う。std には
+# openat 相当が無く、unsafe の FFI を避けるための選択。
+# `std` feature は rustix::fd を std::os::fd と同一の型にして File へ変換するために必要。承認記録は PR #282）。
+rustix = { version = "=1.1.5", default-features = false, features = ["fs", "alloc", "std"] }
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で
