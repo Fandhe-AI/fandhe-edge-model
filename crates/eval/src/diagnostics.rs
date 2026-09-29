@@ -20,16 +20,22 @@
 //!   複製・転記しない（`.claude/rules/security.md`）。
 //! - 引数は共有参照のみで書き換えない（REQ-27 の評価前後ハッシュ不変と両立）。
 //!
-//! 未実装: 混同しやすいラベルの組・レポート統合（TASK-29.1-2・#108）、診断限界の
-//! 明記（TASK-29.2・#109）、データ量水準別報告（TASK-29.3・#110）、group 数、
-//! JSON 直列化（CLI 層）。
+//! 混同しやすいラベルの組とレポート統合（TASK-29.1-2・issue #108）: 評価器の混同行列
+//! （[`SingleSelectMetrics::confusion`]）を再利用して非対角セルの上位を有向
+//! `(gold, predicted, count)` で抽出する [`confusable_pairs`] と、基礎統計と統合する
+//! [`diagnostic_report`] を持つ。定義は PoC-11 の `confusable_pairs_decision.json`
+//! （validation 誤り上位を `(gold, pred, count)` の有向で記録）に対応する（定義の出典であり
+//! 期待値の出典ではない）。混同行列は再計算しない（評価ロジックの再実装をしない）。
+//!
+//! 未実装: 診断限界の明記（TASK-29.2・#109）、データ量水準別報告（TASK-29.3・#110）、
+//! group 数、JSON 直列化（CLI 層。`evaluate` 配線は #140）。
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::baseline::validate_label_order;
-use crate::metrics::EvalError;
+use crate::metrics::{ConfusionColumn, EvalError, MAX_LABELS, SingleSelectMetrics};
 use crate::significance::MAX_EVAL_RECORDS;
 
 /// 集計対象の 1 行（入力とラベル ID。いずれも借用）。
@@ -223,6 +229,34 @@ pub enum DiagnosticsError {
         /// 行位置。
         index: usize,
     },
+    /// `top_k` が 0、または [`MAX_CONFUSABLE_PAIRS`] を超える（REQ-39。黙って丸めない）。
+    InvalidTopK {
+        /// 渡された値。
+        top_k: usize,
+        /// 上限。
+        limit: usize,
+    },
+    /// `per_label` の件数と混同行列のラベル数が一致しない（不整合な評価結果）。
+    LabelCountMismatch {
+        /// `per_label` の件数。
+        per_label: usize,
+        /// 混同行列のラベル数。
+        confusion: usize,
+    },
+    /// 基礎統計のラベル並びが評価結果のラベル並び（宣言順）と一致しない（位置のみ）。
+    LabelOrderMismatch {
+        /// 不一致のデータ側。
+        side: DatasetSide,
+        /// 最初に食い違ったラベル位置（長さ不一致の場合は短い側の長さ）。
+        index: usize,
+    },
+    /// 評価データの行数と評価結果の評価件数が一致しない。
+    EvalRowCountMismatch {
+        /// 評価データ側の基礎統計の行数。
+        eval_rows: u64,
+        /// 評価結果の `n_total`。
+        metrics_total: u64,
+    },
     /// 桁あふれ・添字不整合（理論上到達しない）。
     Internal {
         /// 詳細（英語）。
@@ -253,6 +287,29 @@ impl fmt::Display for DiagnosticsError {
             DiagnosticsError::UnknownLabel { index } => {
                 write!(f, "unknown label at row index {index}")
             }
+            DiagnosticsError::InvalidTopK { top_k, limit } => {
+                write!(f, "invalid top_k: {top_k} (must be 1..={limit})")
+            }
+            DiagnosticsError::LabelCountMismatch {
+                per_label,
+                confusion,
+            } => write!(
+                f,
+                "label count mismatch: per_label {per_label}, confusion {confusion}"
+            ),
+            DiagnosticsError::LabelOrderMismatch { side, index } => {
+                write!(
+                    f,
+                    "label order mismatch on {side} data at label index {index}"
+                )
+            }
+            DiagnosticsError::EvalRowCountMismatch {
+                eval_rows,
+                metrics_total,
+            } => write!(
+                f,
+                "eval row count mismatch: stats {eval_rows}, metrics {metrics_total}"
+            ),
             DiagnosticsError::Internal { detail } => {
                 write!(f, "internal diagnostics error: {detail}")
             }
@@ -373,6 +430,184 @@ pub fn basic_stats(
         min_labels,
         unobserved_labels,
         input_key_rule: input_key.rule(),
+    })
+}
+
+/// [`DiagnosticsError::LabelOrderMismatch`] で不一致だったデータ側。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetSide {
+    /// 学習データ側の基礎統計。
+    Train,
+    /// 評価データ側の基礎統計。
+    Eval,
+}
+
+impl fmt::Display for DatasetSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DatasetSide::Train => write!(f, "train"),
+            DatasetSide::Eval => write!(f, "eval"),
+        }
+    }
+}
+
+/// [`confusable_pairs`] の `top_k` の上限（REQ-39。PoC-11 は 10 を使用）。
+pub const MAX_CONFUSABLE_PAIRS: usize = 1000;
+
+/// 混同しやすいラベルの組（有向。正解 `gold` を `predicted` と誤った件数）。
+///
+/// 無向の合計（gold→pred と pred→gold の和）は持たない。必要なら利用側が有向の
+/// 一覧から導出する。診断専用で合否判定には使わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfusablePair {
+    /// 正解ラベル ID。
+    pub gold: String,
+    /// 誤って予測されたラベル ID。
+    pub predicted: String,
+    /// 誤り件数（1 以上）。
+    pub count: u64,
+    /// `gold` の正解件数（`per_label` の `support` の写し。比率を上位層で出すため）。
+    pub gold_support: u64,
+}
+
+/// 混同行列から混同しやすいラベルの組の上位 `top_k` 件を抽出する（REQ-29 正常系・
+/// TASK-29.1-2）。
+///
+/// 対象はラベル→ラベルの非対角セルで件数 1 以上のもの。`Invalid` / `Abstain` / `Error`
+/// 列は除外する（`outcome_counts` が扱う）。並びは件数降順、同数は gold・predicted の
+/// 宣言順。誤りが無ければ空を返す。`top_k` は `1..=`[`MAX_CONFUSABLE_PAIRS`]。
+/// 評価結果は共有参照のみで、書き換えない。
+pub fn confusable_pairs(
+    metrics: &SingleSelectMetrics,
+    top_k: usize,
+) -> Result<Vec<ConfusablePair>, DiagnosticsError> {
+    if top_k == 0 || top_k > MAX_CONFUSABLE_PAIRS {
+        return Err(DiagnosticsError::InvalidTopK {
+            top_k,
+            limit: MAX_CONFUSABLE_PAIRS,
+        });
+    }
+    let n = metrics.confusion.n_labels();
+    if metrics.per_label.len() != n {
+        return Err(DiagnosticsError::LabelCountMismatch {
+            per_label: metrics.per_label.len(),
+            confusion: n,
+        });
+    }
+    if n > MAX_LABELS {
+        return Err(internal("label count exceeds limit"));
+    }
+    let mut cells: Vec<(u64, usize, usize)> = Vec::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let count = metrics
+                .confusion
+                .get(i, ConfusionColumn::Label(j))
+                .ok_or_else(|| internal("confusion cell out of bounds"))?;
+            if count > 0 {
+                cells.push((count, i, j));
+            }
+        }
+    }
+    cells.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    cells.truncate(top_k);
+    cells
+        .into_iter()
+        .map(|(count, i, j)| {
+            let gold = metrics
+                .per_label
+                .get(i)
+                .ok_or_else(|| internal("gold label index out of bounds"))?;
+            let pred = metrics
+                .per_label
+                .get(j)
+                .ok_or_else(|| internal("predicted label index out of bounds"))?;
+            Ok(ConfusablePair {
+                gold: gold.label.clone(),
+                predicted: pred.label.clone(),
+                count,
+                gold_support: gold.support,
+            })
+        })
+        .collect()
+}
+
+/// 診断レポート（基礎統計と混同しやすいラベルの組の統合。診断専用で合否判定には使わない）。
+///
+/// 構築は [`diagnostic_report`] に集約し、整合性検査を通らない値を外部から作らせない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticReport {
+    train: BasicStats,
+    eval: BasicStats,
+    confusable_pairs: Vec<ConfusablePair>,
+}
+
+impl DiagnosticReport {
+    /// 学習データの基礎統計。
+    pub fn train(&self) -> &BasicStats {
+        &self.train
+    }
+
+    /// 評価データの基礎統計。
+    pub fn eval(&self) -> &BasicStats {
+        &self.eval
+    }
+
+    /// 混同しやすいラベルの組（件数降順）。
+    pub fn confusable_pairs(&self) -> &[ConfusablePair] {
+        &self.confusable_pairs
+    }
+}
+
+fn check_label_order(
+    side: DatasetSide,
+    stats: &BasicStats,
+    metrics: &SingleSelectMetrics,
+) -> Result<(), DiagnosticsError> {
+    let a = &stats.label_counts;
+    let b = &metrics.per_label;
+    if let Some(index) = a.iter().zip(b.iter()).position(|(x, y)| x.label != y.label) {
+        return Err(DiagnosticsError::LabelOrderMismatch { side, index });
+    }
+    if a.len() != b.len() {
+        return Err(DiagnosticsError::LabelOrderMismatch {
+            side,
+            index: a.len().min(b.len()),
+        });
+    }
+    Ok(())
+}
+
+/// 基礎統計（学習・評価）と評価器の出力から診断レポートを組み立てる（REQ-29 正常系・
+/// TASK-29.1-2）。
+///
+/// CLI の `evaluate` 工程（配線は #140）が、評価を実行した場合にのみ呼ぶ想定。評価データが
+/// 無く `skipped` の場合は混同行列が無いため本レポートは作らない（CLI 側の分岐）。
+/// 評価データの行と評価レコードが 1 対 1 で渡される前提で、`eval.n_rows` と
+/// `metrics.n_total` の一致、両基礎統計のラベル並びと `metrics.per_label` の一致を検証する
+/// （fail-closed。エラーは位置・件数のみ）。
+pub fn diagnostic_report(
+    train: BasicStats,
+    eval: BasicStats,
+    metrics: &SingleSelectMetrics,
+    top_k: usize,
+) -> Result<DiagnosticReport, DiagnosticsError> {
+    check_label_order(DatasetSide::Train, &train, metrics)?;
+    check_label_order(DatasetSide::Eval, &eval, metrics)?;
+    if eval.n_rows != metrics.n_total {
+        return Err(DiagnosticsError::EvalRowCountMismatch {
+            eval_rows: eval.n_rows,
+            metrics_total: metrics.n_total,
+        });
+    }
+    let confusable_pairs = confusable_pairs(metrics, top_k)?;
+    Ok(DiagnosticReport {
+        train,
+        eval,
+        confusable_pairs,
     })
 }
 
