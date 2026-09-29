@@ -48,9 +48,13 @@
 //! `NotRequired` の差分詳細（[`rebuild::NotRequiredRebuild`]）を、
 //! TASK-20.3（issue #93）でハッシュ完全一致時に比較処理を一切実行しない
 //! ことの保証と専用テストを実装済み（REQ-20 の正常系・異常系・境界値）。
+//! `artifact_meta` モジュールは TASK-39.4-2（issue #159）で、パッケージのメタデータ
+//! `artifact.json` から経路参照 `onnx_file` だけを取り出す暫定リーダーを実装済み
+//! （パッケージ形式の確定は TASK-28/32）。
 //! `stage_report` モジュールは TASK-33.2-2（issue #139）で exit 0 時の工程結果
 //! JSON（現状は `package` の [`stage_report::PackageReport`]）の型と直列化を実装済み。
 
+pub mod artifact_meta;
 pub mod canonical;
 pub mod definition;
 pub mod exitcode;

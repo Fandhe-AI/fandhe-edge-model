@@ -345,6 +345,36 @@ fn sha256_from_file(
 mod tests {
     use super::*;
 
+    /// REQ-39: 開いた File の上限付き読み込み。上限ちょうどは通り、+1 は拒否、空は空 Vec。
+    #[test]
+    fn req39_read_bounded_open_file_limits() {
+        let dir = std::env::temp_dir().join(format!("fandhe-core-rofb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("f.bin");
+        std::fs::write(&path, [7u8; 4]).expect("write");
+        let f = File::open(&path).expect("open");
+        assert_eq!(
+            read_bounded_open_file(f, Path::new("x"), 4).expect("ok"),
+            vec![7u8; 4]
+        );
+        let f = File::open(&path).expect("open");
+        assert!(matches!(
+            read_bounded_open_file(f, Path::new("x"), 3),
+            Err(FsError::TooLarge {
+                size: 4,
+                limit: 3,
+                ..
+            })
+        ));
+        std::fs::write(&path, []).expect("write");
+        let f = File::open(&path).expect("open");
+        assert_eq!(
+            read_bounded_open_file(f, Path::new("x"), 3).expect("ok"),
+            Vec::<u8>::new()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// テスト用の一時ファイルを、成否に関わらず削除するガード（RAII）。
     struct TempFileGuard(PathBuf);
 
