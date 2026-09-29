@@ -7,7 +7,7 @@
 - Codex の既定 prompt は **PR の base コミットの本書** を読む。そのため本書への変更は、当該 PR のレビューには反映されず、**マージ後の次の PR から実効** になる
 - 本書は日本語で記述する。プログラムの出力文字列（エラーメッセージ・ログ・CLI 出力・JSON）や識別子・コマンドは原語（英語）のままでよい
 - `docs/spec`（`fandhe-edge-model-spec` submodule）は private であり、レビュー実行環境からは読めない前提とする。レビューでは spec 本文との一致を判定材料にせず、**REQ-n・TASK-n・M-n・PoC-n の併記があるか** という、diff だけで確認できる観点に限定する。ID が欠けた spec 由来の変更は「spec 参照規約」観点（P1）として指摘する
-- Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で `crates/core`（`fandhe-edge-core`。共通コア）・`crates/cli`（`fandhe-edge-cli`。操作アダプターの CLI）を、TASK-17.1-1（#44）で `crates/data`（`fandhe-edge-data`。データ契約）を、TASK-24.1-1（#59）で `crates/eval`（`fandhe-edge-eval`。評価器）を作成済みで、core・cli・data・eval の 4 crate が存在し、残りの層の crate は後続 TASK で追加する。本書の層区分は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う
+- Rust の crate は `crates/<name>/` の 1 階層に置く。TASK-15.2（#28）で `crates/core`（`fandhe-edge-core`。共通コア）・`crates/cli`（`fandhe-edge-cli`。操作アダプターの CLI）を、TASK-17.1-1（#44）で `crates/data`（`fandhe-edge-data`。データ契約）を、TASK-24.1-1（#59）で `crates/eval`（`fandhe-edge-eval`。評価器）を作成済みで、core・cli・data・eval の 4 crate に加え、#117 で `crates/runtime`（`fandhe-edge-runtime`。成果物・推論 SDK。単体/バッチ共通の推論経路の継ぎ目のみ）を作成済みで、残りの層の crate は後続 TASK で追加する。本書の層区分は spec の 6 層（共通コア・データ契約・学習ワーカー・評価器・成果物 / 推論 SDK・操作アダプター）に従う
 - 本書の各観点の詳細な根拠は `.claude/rules/`（`security.md`・`evaluation-contract.md`・`coding-rust.md`・`coding-python.md`・`dependency-policy.md`・`licensing.md`・`ci.md` 等）にある。本書と `.claude/rules/` が食い違う場合は、本書の優先度判定を正としつつ、食い違い自体を P2 として指摘する
 
 ## 優先度定義
