@@ -704,6 +704,9 @@ if [ -n "$rec_dir" ]; then
             # 子シェルの終了値: 0=保存成功・2 または 4=名前の衝突（別の乱数名で再試行する。作成したファイルは
             # 子シェルの中で削除済み）・それ以外=失敗（同じく削除済み）
             rec_rc=0
+            # 子シェルの stdout・stderr は捨てる。書き込みが上限超過などで途中失敗すると、printf の stdio
+            # バッファに残った記録の断片が、リダイレクトを戻した後に子シェルの stdout（=呼び出し元の
+            # stdout）へ吐かれる libc がある（macOS の CI で観測）。契約の出力は最後の cat "$out" だけにする
             (
                 set -C
                 umask 077
@@ -747,7 +750,7 @@ if [ -n "$rec_dir" ]; then
                     rm -f -- "$rec_name"
                     exit 3
                 fi
-            ) || rec_rc=$?
+            ) >/dev/null 2>&1 || rec_rc=$?
             case "$rec_rc" in 2 | 4) ;; *) break ;; esac
         done
         # 記録先が指定されたのに確定できなかった場合は、理由を問わず（一時ファイルの作成失敗・書き込み失敗・
