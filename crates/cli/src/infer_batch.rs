@@ -373,6 +373,19 @@ mod tests {
         assert_eq!(err.code, ExitCode::LimitExceeded);
     }
 
+    /// REQ-39: 総量の上限が次の JSON 行の途中に当たっても、断片を解析せず `limit_exceeded`
+    /// （`invalid_input` にしない）。
+    #[test]
+    fn req39_limit_inside_next_line_is_limit_exceeded_not_invalid_input() {
+        let first = "{\"id\":\"a\",\"input\":\"x\"}\n";
+        let input = format!("{first}{first}");
+        // 上限を 2 行目の途中（不完全な JSON になる位置）に置く。
+        let limit = first.len() + 5;
+        let err =
+            read_batch_records_with_limit(input.as_bytes(), &io_schema(), limit, None).unwrap_err();
+        assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
     /// REQ-39: 読み取り開始前に期限が過ぎていれば `limit_exceeded`（読み取りも期限の対象）。
     #[test]
     fn req39_read_deadline_is_enforced() {
