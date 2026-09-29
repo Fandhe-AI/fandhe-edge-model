@@ -17,6 +17,11 @@ path = "src/main.rs"
 
 [dependencies]
 fandhe-edge-core.workspace = true
+# 各層のエラー型を ErrorReport へ写す変換（TASK-33.2-1・#138）のための
+# workspace 内 path 依存（外部依存の追加ではない）。推論ランタイム側の crate
+# には train を入れない方針（REQ-32）は維持する。
+fandhe-edge-data.workspace = true
+fandhe-edge-train.workspace = true
 
 [lints]
 workspace = true

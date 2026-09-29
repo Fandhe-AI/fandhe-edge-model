@@ -21,4 +21,5 @@
 //! 70・stdout 空のスタブ契約のまま（`.claude/rules/coding-rust.md`「操作
 //! アダプターは薄く保つ」）。
 
+pub mod error_report;
 pub mod output;

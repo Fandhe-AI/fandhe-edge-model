@@ -57,6 +57,8 @@ name = "fandhe-edge-cli"
 version = "0.1.0"
 dependencies = [
  "fandhe-edge-core",
+ "fandhe-edge-data",
+ "fandhe-edge-train",
 ]
 
 [[package]]
