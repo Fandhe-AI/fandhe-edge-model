@@ -13,6 +13,8 @@
 //! - [`capacity`][]: 容量計測コア（REQ-30・TASK-30.1-1・#122）。実装済み。上限照合
 //!   （TASK-30.2）・配布パッケージ形式は後続 TASK。エラーの終了コード・公開メッセージへの
 //!   写像（TASK-30.1-2・#123）を持ち、JSON 直列化は CLI 側
+//! - [`latency`][]: 推論のみの待ち時間の反復計測ハーネス（REQ-31・TASK-31.1-1・#127）。
+//!   p95 と報告は #128、実モデルでの計測は #113 後
 //! - [`package_outcome`][]: 上限超過を合否判定より優先して `limit_exceeded`（20）へ写す
 //!   終了コード決定（REQ-21・TASK-21.3-1・#132）。待ち時間（p95）の上限超過
 //!   （`LimitBreach::Latency`・境界規則 `latency_if_exceeded`。REQ-31・TASK-21.3-2・#133）も
@@ -23,5 +25,6 @@
 //! 再実行は #112・#113 の実装後に行う。
 
 pub mod capacity;
+pub mod latency;
 pub mod package_outcome;
 pub mod pipeline;
