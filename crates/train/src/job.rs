@@ -390,4 +390,48 @@ mod tests {
         assert!(matches!(result, Ok(TrainRunEnd::Cancelled(_))));
         assert_eq!(handle.state(), S::Cancelled);
     }
+
+    /// REQ-34: `Start` の直後にキャンセルが届いた場合（状態 `Cancelling`）も、
+    /// OS によらず戻り値は `Cancelled`、状態も `Cancelled` で一致する
+    /// （非 unix の `run_train_cancellable` も起動前キャンセルを優先する）。
+    #[test]
+    fn req34_cancel_right_after_start_matches_state_on_every_os() {
+        use crate::request::{Device, TrainRequestParams};
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: "/fandhe-edge-fixture-root".to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(10),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request params");
+        let limits = RunLimits::for_request(&request);
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-job-after-start-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let python = dir.join("python");
+        let script = dir.join("launch.py");
+        std::fs::write(&python, b"").expect("stub python");
+        std::fs::write(&script, b"").expect("stub script");
+        let launcher = WorkerLauncher::new(python, script).expect("launcher");
+
+        let job = TrainJob::new();
+        let handle = job.handle();
+        job.apply(JobEvent::Start);
+        assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        assert_eq!(handle.state(), S::Cancelling);
+        let result = job.run(&launcher, &request, &dir, &limits);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Ok(TrainRunEnd::Cancelled(_))));
+        assert_eq!(handle.state(), S::Cancelled);
+    }
 }
