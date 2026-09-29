@@ -238,7 +238,7 @@ trap 'exit 70' TERM INT HUP
 
 # 工程グループ（pgid = $child）に属するプロセスの PID を run_pids へ集める。拒否ログ
 # （sandbox-monitor.sh・sandbox_deny_report.py）が「本ツール起因」を PID で照合するための
-# 記録で、run.meta.json の process_pids に書く（REQ-38・TASK-38.1-2）。ps の一覧取得は
+# 記録で、run.meta.json の process_pids に書く（REQ-38・TASK-38.1-2）。pgrep の取得は
 # ポーリング間隔（0.1 秒）ごとで、それより短命なプロセスは記録できない（その拒否は
 # 帰属不明として pending になる。過大に本ツール起因と断定しない側）。上限 MAX_RUN_PIDS 件。
 run_pids=
@@ -246,9 +246,12 @@ run_pid_n=0
 MAX_RUN_PIDS=4096
 sample_pids() {
     [ "$run_pid_n" -lt "$MAX_RUN_PIDS" ] || return 0
-    _new=$(ps -A -o pid= -o pgid= 2>/dev/null | awk -v g="$child" -v seen="$run_pids" '
+    # pgrep -g は工程グループの PID を 1 行 1 件で直接列挙する（ps の列幅・桁あふれに依存しない。
+    # macOS・Linux の procps 共通）。pgrep が無い・失敗・空の場合は何も記録しない
+    # （その拒否は帰属不明 pending になる。fail-closed）
+    _new=$(pgrep -g "$child" 2>/dev/null | awk -v seen="$run_pids" '
         BEGIN { n = split(seen, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 }
-        $1 ~ /^[0-9]+$/ && $2 == g && !($1 in s) { s[$1] = 1; printf "%s ", $1 }') || return 0
+        $1 ~ /^[0-9]+$/ && !($1 in s) { s[$1] = 1; printf "%s ", $1 }') || return 0
     for _p in $_new; do
         [ "$run_pid_n" -lt "$MAX_RUN_PIDS" ] || break
         run_pids="$run_pids$_p "

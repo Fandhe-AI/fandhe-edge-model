@@ -203,6 +203,12 @@ if [ ! -f "$run_script" ] || [ ! -f "$report_script" ]; then
     fail 70 runtime_error "companion script not found"
 fi
 command -v python3 >/dev/null 2>&1 || fail 70 runtime_error "python3 is required for the report"
+# 集計器の最低版は Python 3.9。macOS 標準の /usr/bin/python3（Xcode CLT）が 3.9 のことが多く、
+# 新しい版を前提にすると標準環境で集計器を起動できないため（uv・追加の依存は使わない）。
+# 集計器は 3.9 の文法（`from __future__ import annotations`）で書き、テストで文法を検査している。
+# 満たさなければ sandbox-run.sh を起動する前に判定不能(70)
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || fail 70 runtime_error "python3 3.9 or newer is required for the report"
 
 # 待機時間（先頭 0 は算術式で 8 進解釈されるため 0 単独以外の先頭 0 は不正値として既定へ戻す）
 bounded_secs() { # $1=値 $2=既定 $3=上限

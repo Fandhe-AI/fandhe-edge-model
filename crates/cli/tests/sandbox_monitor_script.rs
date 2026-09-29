@@ -986,3 +986,90 @@ fn req38_log_exiting_mid_run_is_undeterminable() {
     has(&o, "log stream ended before the monitoring window closed");
     assert_eq!(e.cli_calls().len(), 7);
 }
+
+/// 工程グループの PID は `pgrep -g` で列挙し、6〜7 桁の PID でも帰属が tool になる（`ps` の列幅に
+/// 依存しない。REQ-38）。偽の `pgrep` が 7 桁の PID を返す。実機の `pgrep` の出力ではない。
+#[test]
+fn req38_seven_digit_pids_from_pgrep_are_attributed_to_tool() {
+    let e = Env::new();
+    let bin = e.dir.join("fakebin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    write_exe(
+        &bin.join("pgrep"),
+        "#!/bin/sh\n[ \"$1\" = -g ] || exit 2\necho 1234567\necho 7654321\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = e.run("tool_bigpid.ndjson", &e.base_args(), &[("PATH", &path)]);
+    assert_eq!(o.code, Some(10), "{}", o.stdout);
+    has(&o, "\"tool_network_deny_events\": 1");
+    let meta = fs::read_to_string(e.out().join("run").join("run.meta.json")).expect("meta");
+    assert!(
+        meta.contains("\"process_pids\":[1234567,7654321]"),
+        "{meta}"
+    );
+}
+
+/// pgrep が使えない・空を返す場合は PID を記録せず、帰属不明の拒否は pending(12)（fail-closed）。
+#[test]
+fn req38_pgrep_failure_leaves_denials_unattributed() {
+    let e = Env::new();
+    let bin = e.dir.join("fakebin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    write_exe(&bin.join("pgrep"), "#!/bin/sh\nexit 1\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = e.run("tool_bigpid.ndjson", &e.base_args(), &[("PATH", &path)]);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    let meta = fs::read_to_string(e.out().join("run").join("run.meta.json")).expect("meta");
+    assert!(meta.contains("\"process_pids\":[]"), "{meta}");
+}
+
+/// python3 が 3.9 未満なら、sandbox-run.sh を起動する前に判定不能(70)（REQ-38）。偽の
+/// `python3` が版の検査（`version_info`）だけ失敗させる。
+#[test]
+fn req38_old_python3_is_undeterminable_before_run() {
+    let e = Env::new();
+    let bin = e.dir.join("fakebin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    write_exe(
+        &bin.join("python3"),
+        "#!/bin/sh\ncase \"$*\" in *version_info*) exit 1 ;; esac\nexit 0\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = e.run("clean.ndjson", &e.base_args(), &[("PATH", &path)]);
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "python3 3.9 or newer is required for the report");
+    assert!(e.cli_calls().is_empty());
+}
+
+/// 集計器は Python 3.9 の文法で構文エラーにならない（`ast.parse` の feature_version=(3, 9)。
+/// 文法のみの検査で、3.10 以降の標準ライブラリ API の使用は検出できない）。
+#[test]
+fn req38_report_script_parses_with_python39_grammar() {
+    let script = repo_root().join("scripts").join("sandbox_deny_report.py");
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import ast, sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), \
+             feature_version=(3, 9))",
+        ])
+        .arg(&script)
+        .output()
+        .expect("python3");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
