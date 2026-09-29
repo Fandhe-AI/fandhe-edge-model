@@ -210,11 +210,31 @@ fn req21_signal_termination_maps_to_runtime_error_70() {
     assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
 }
 
-/// 結果 JSON を出した後に 127 を返しても stdout は 1 JSON のままであること（REQ-33）。
+/// 出力後に契約外の 127 を返した場合、既存出力（`code":"ok"` 等）は破棄され、
+/// JSON の code と終了コードが runtime_error(70) で一致する 1 JSON になること（REQ-21・REQ-33）。
 #[test]
-fn req33_output_then_127_keeps_single_json_and_exit_70() {
+fn req21_output_then_127_is_replaced_by_runtime_error_json() {
     let o = run_with_fake_bin("out127", "echo '{\"code\":\"ok\"}'\nexit 127");
     assert_eq!(o.code, Some(70));
-    assert_eq!(o.stdout, "{\"code\":\"ok\"}\n");
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge terminated abnormally\"}\n"
+    );
     assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+}
+
+/// 許可された終了コード（70・0）でも stdout が空なら runtime_error(70) の JSON を補うこと
+/// （REQ-21・REQ-33）。
+#[test]
+fn req33_empty_stdout_with_allowed_exit_codes_gets_runtime_error_json() {
+    for (name, body) in [("empty70", "exit 70"), ("empty0", "exit 0")] {
+        let o = run_with_fake_bin(name, body);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge produced no output\"}\n",
+            "{name}"
+        );
+        assert_eq!(o.stderr.lines().last(), Some("exit_code=70"), "{name}");
+    }
 }

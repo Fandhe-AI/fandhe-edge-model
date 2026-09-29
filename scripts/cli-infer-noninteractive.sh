@@ -12,8 +12,8 @@
 #   - stdout は CLI の出力を無加工で中継する（1 呼び出し 1 JSON。REQ-33）
 #   - stderr は CLI の stderr に続けて診断 `exit_code=<N>` を 1 行だけ出す
 #     （引数値・入力テキストは出さない）
-#   - 終了コードは CLI のもの（7 種）をそのまま返す。契約外の値・バイナリ不在は
-#     runtime_error(70) へ写し、JSON が無ければ補う（stdout は常に 1 JSON）
+#   - 終了コードは CLI のもの（7 種）をそのまま返す。契約外の値・バイナリ不在・出力なしは
+#     runtime_error(70) へ写し、JSON を置き換え / 補う（stdout は常に 1 JSON）
 #
 # バイナリ: 環境変数 FANDHE_EDGE_BIN、無ければ
 #   ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge
@@ -57,14 +57,19 @@ else
 fi
 
 # CLI の終了コードは 7 種（0/10/11/12/20/64/70）に固定のため、それ以外
-# （126・127・シグナル終了の 128+N 等の契約外）は runtime_error(70) へ写す（REQ-21）。
-# CLI が JSON を出さなかった場合のみ、こちらで runtime_error の JSON を補う
+# （126・127・シグナル終了の 128+N 等の契約外）は既存の stdout の有無にかかわらず
+# runtime_error(70) の JSON へ置き換える（JSON の code と終了コードを一致させる。REQ-21）。
+# 許可された終了コードでも stdout が空なら 1 呼び出し 1 JSON（REQ-33）を満たさないため、
+# 同じく runtime_error(70) の JSON を補って 70 を返す
 case "$rc" in
-    0 | 10 | 11 | 12 | 20 | 64 | 70) ;;
-    *)
+    0 | 10 | 11 | 12 | 20 | 64 | 70)
         if [ ! -s "$out" ]; then
-            printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge terminated abnormally"}' >"$out"
+            printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced no output"}' >"$out"
+            rc=70
         fi
+        ;;
+    *)
+        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge terminated abnormally"}' >"$out"
         rc=70
         ;;
 esac
