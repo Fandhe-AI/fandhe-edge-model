@@ -22,7 +22,7 @@ fandhe-edge-model/
 ├── LICENSE-MIT / LICENSE-APACHE   # MIT OR Apache-2.0 デュアルライセンス
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
-├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・py-*（ruff・pytest）・ci・clean。`make help`）
+├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・py-*（ruff・pytest）・test-trainer-integration（実 trainer 結合テスト。#258）・ci・clean。`make help`）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── .markdownlint.jsonc / .markdownlintignore / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── skills-lock.json               # 導入スキルのロックファイル
