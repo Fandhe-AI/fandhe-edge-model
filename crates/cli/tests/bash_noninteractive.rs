@@ -717,3 +717,53 @@ fn req39_wrapper_sigterm_does_not_leave_child_group() {
     wrapper.wait().ok();
     assert!(!survived, "child group survived wrapper SIGTERM");
 }
+
+/// 子が SIGPIPE を無視して大量に書いても、stdout・stderr は書き込み時点で上限 +1 バイトで
+/// 打ち切られ（ディスク上の大きさが 65537・1048577 バイト）、終了コードは 70 になること。
+/// 監視間隔（0.1 秒）に依存しない上限であることの検証（REQ-39・REQ-21）。
+#[test]
+fn req39_output_caps_are_enforced_at_write_time() {
+    let cases = [
+        (
+            "errcap",
+            "1>&2",
+            "err",
+            65_537_u64,
+            "stderr exceeded size limit",
+        ),
+        (
+            "outcap",
+            "",
+            "out",
+            1_048_577_u64,
+            "output exceeded size limit",
+        ),
+    ];
+    for (name, redirect, file, expected_size, message) in cases {
+        let tmp = std::env::temp_dir().join(format!("fandhe-cap-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let marker = tmp.join("size.txt");
+        let body = format!(
+            "trap '' PIPE\nhead -c 3000000 /dev/zero {redirect} || true\nsleep 0.03\n\
+             find '{}' -name {file} -exec wc -c {{}} + >'{}' 2>/dev/null\nexit 0",
+            tmp.display(),
+            marker.display()
+        );
+        let tmp_s = tmp.display().to_string();
+        let o = run_with_fake_bin_args(name, &body, &["--help"], &[("TMPDIR", &tmp_s)]);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(
+            o.stdout,
+            format!("{{\"code\":\"runtime_error\",\"message\":\"fandhe-edge {message}\"}}\n"),
+            "{name}"
+        );
+        let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
+        let size: u64 = recorded
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::MAX);
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(size, expected_size, "{name}: {recorded}");
+    }
+}

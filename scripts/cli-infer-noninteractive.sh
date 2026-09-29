@@ -44,8 +44,13 @@ set -eu
 
 # プロセスグループの隔離に bash のジョブ制御（set -m）を使う。dash 等は tty が無いと
 # set -m が失敗するため、bash で再実行する（Bash ツールの前提は bash。無ければ fail-closed）
-if [ -z "${BASH_VERSION:-}" ]; then
-    if command -v bash >/dev/null 2>&1; then
+# 標準出力・標準エラーの書き込み時点の上限に process substitution を使うため、
+# POSIX モードの bash（macOS の /bin/sh 等）も通常モードの bash で再実行する。
+# 再実行は 1 回だけ（FANDHE_EDGE_REEXEC。POSIXLY_CORRECT 下での無限ループを避ける）
+if [ -z "${BASH_VERSION:-}" ] || [ -o posix ]; then
+    if [ -z "${FANDHE_EDGE_REEXEC:-}" ] && command -v bash >/dev/null 2>&1; then
+        FANDHE_EDGE_REEXEC=1
+        export FANDHE_EDGE_REEXEC
         exec bash "$0" ${1+"$@"}
     fi
     echo "fandhe-edge: bash is required" >&2
@@ -131,12 +136,11 @@ timeout_secs=${FANDHE_EDGE_TIMEOUT_SECS:-300}
 case "$timeout_secs" in
     '' | *[!0-9]* | 0* | ????*) timeout_secs=300 ;;
 esac
-max_ticks=$((timeout_secs * 10))
 max_out_bytes=1048576
 max_err_bytes=65536
-# ulimit -f は 512 バイト単位のブロック数。各ファイルへの書き込みの絶対上限
-# （超過は SIGXFSZ で終了）
-max_out_blocks=2048
+# 期限は壁時計（bash の SECONDS。整数秒）で判定する。0.1 秒ごとの反復回数で数えると
+# ps・wc の実行時間ぶん期限が伸びるため。SECONDS の切り捨てで最大 1 秒遅れる
+deadline=$((SECONDS + timeout_secs + 1))
 
 # 子は set -m で独立したプロセスグループ（pgid = 子の PID）として起動し、期限・容量の
 # 超過時はグループごと終了する（REQ-39）。直接の子が終了した後も、グループに生存プロセスが
@@ -149,9 +153,13 @@ max_out_blocks=2048
 exec 2>/dev/null
 set -m
 (
-    ulimit -f "$max_out_blocks" 2>/dev/null || true
     rc_child=0
-    "$bin" infer ${1+"$@"} </dev/null >"$out" 2>"$err" || rc_child=$?
+    # stdout・stderr は head -c で書き込み時点に上限 +1 バイトで打ち切る（REQ-39）。
+    # 超過すると子は SIGPIPE/EPIPE で止まり、+1 バイト目の存在で上限超過と判定する。
+    # head は同じプロセスグループに属し、監視・後始末の対象になる
+    "$bin" infer ${1+"$@"} </dev/null \
+        > >(head -c $((max_out_bytes + 1)) >"$out") \
+        2> >(head -c $((max_err_bytes + 1)) >"$err") || rc_child=$?
     echo "$rc_child" >"$rcf.tmp"
     mv "$rcf.tmp" "$rcf"
 ) </dev/null >/dev/null 3>&- &
@@ -178,7 +186,6 @@ group_alive() {
 }
 
 # 監視（前景ループ）: グループの全員の終了・期限超過・容量超過のいずれかで抜ける
-ticks=0
 limit_kind=
 while :; do
     if [ -e "$rcf" ]; then
@@ -191,12 +198,11 @@ while :; do
             break
         fi
     fi
-    if [ "$ticks" -ge "$max_ticks" ]; then
+    if [ "$SECONDS" -ge "$deadline" ]; then
         limit_kind=timeout
         break
     fi
     sleep 0.1
-    ticks=$((ticks + 1))
     size=$(wc -c <"$out" 2>/dev/null || echo 0)
     if [ "${size:-0}" -gt "$max_out_bytes" ]; then
         limit_kind=output_limit
@@ -226,8 +232,8 @@ if [ -z "$limit_kind" ] && [ -r "$rcf" ]; then
     esac
 fi
 if [ -z "$limit_kind" ]; then
-    # ulimit -f（SIGXFSZ）が先に子を止めた場合
-    if [ "$(wc -c <"$out")" -ge "$max_out_bytes" ]; then
+    # 書き込み時点の打ち切り（head -c）で上限を超えた場合
+    if [ "$(wc -c <"$out")" -gt "$max_out_bytes" ]; then
         limit_kind=output_limit
     elif [ "$(wc -c <"$err")" -gt "$max_err_bytes" ]; then
         limit_kind=stderr_limit
