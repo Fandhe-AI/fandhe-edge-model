@@ -52,10 +52,21 @@
 //! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
 //! 出力段階は各行の書き込みと flush の完了後（最後の行を含む）に
 //! `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は成功にせず `limit_exceeded`（出力が壊れる
-//! ため `ErrorReport` は追記しない）。1 行目の書き込み前に超過済みなら、何も書かず `io::Error`。
+//! ため `ErrorReport` は追記しない）。1 行目の書き込み前に超過済みなら `ErrorReport`（`limit_exceeded`）を 1 行書く。時間上限の
+//! 超過は経路によらず `limit_exceeded`（REQ-21・REQ-39）。
 //! ウォッチドッグの起動に失敗したら、上限なしで書かず `io::Error`（exit 70）で終える。1 回の `write` 自体が読み手の
 //! 停止でブロックする場合は `Write` では中断できないため、CLI 経路（`for_cli_process`）では
 //! ウォッチドッグが期限でプロセスを exit 70 で終了する。
+//!
+//! # 長寿命プロセスから呼ぶ場合の制約（REQ-39）
+//!
+//! Rust のスレッドは外から止められない。期限超過後は計算スレッドを join せず結果を捨てて戻り
+//! （計算スレッドは 1 呼び出しにつき 1 本で、期限超過後に次の計算を起動しない）、停止した
+//! スレッドの回収は「エラー JSON を書いて flush した直後の `process::exit`」
+//! （[`BatchLimits::for_cli_process`]）に頼る。既定の [`emit_infer_batch`] は回収しないため、
+//! 将来の MCP サーバなど長寿命のプロセスから繰り返し呼ぶと、期限超過のたびに停止したスレッドと
+//! 保持資源（reader・pipeline）が残る。そうした呼び出し元は、子プロセスで実行するなど別の
+//! 回収手段を用意すること（本 PR の対象外。配線は #136）。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
 
@@ -483,8 +494,7 @@ where
 /// 必ず `for_cli_process` を使う（REQ-39）。
 ///
 /// # Errors
-/// 書き込み・flush の失敗、および出力段階の期限超過（`ErrorKind::TimedOut`）を `io::Error` で
-/// 返す。部分書き込み後は出力が壊れているため、追加の書き込み（残りの行・`ErrorReport`）は
+/// 書き込み・flush の失敗（および 1 行ごとの再構築失敗）を `io::Error` で返す。部分書き込み後は出力が壊れているため、追加の書き込み（残りの行・`ErrorReport`）は
 /// せず即座に打ち切る（`output` の契約）。呼び出し側は `Err` を exit 70 に写し、何も書かない。
 pub fn emit_infer_batch_with_limits<W, R, P, B>(
     out: &mut W,
@@ -548,11 +558,9 @@ where
         Ok((records, predictions)) => {
             let output_deadline = Instant::now().checked_add(limits.output_duration);
             for (record, prediction) in records.iter().zip(&predictions) {
+                // 1 行も書く前に超過していれば、出力は壊れていないため ErrorReport を 1 行返す。
                 if deadline_passed(output_deadline) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "infer batch output deadline exceeded",
-                    ));
+                    return emit_error_report(out, &report(ExitCode::LimitExceeded));
                 }
                 // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
                 // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。

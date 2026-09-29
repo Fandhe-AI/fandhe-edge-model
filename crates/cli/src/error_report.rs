@@ -36,7 +36,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
-use fandhe_edge_runtime::pipeline::{BatchError, InferError};
+use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchError;
@@ -177,6 +177,8 @@ impl ToErrorReport for InferError {
             InferError::InputTooLarge { .. }
             | InferError::TooManyTokens { .. }
             | InferError::TooManyScores { .. } => ExitCode::LimitExceeded,
+            // 1 件の計算時間上限（REQ-39）は `DeadlineExceeded` と同じく `limit_exceeded`（REQ-21）。
+            InferError::Backend(BackendError::TimeLimitExceeded) => ExitCode::LimitExceeded,
             InferError::Preprocess(_) | InferError::Backend(_) | InferError::InvalidScores => {
                 ExitCode::RuntimeError
             }
@@ -254,7 +256,7 @@ mod tests {
     /// REQ-21・REQ-39: 推論・バッチの失敗は固定語彙の code/message に写り `Ok` にならない。
     #[test]
     fn req21_infer_and_batch_errors_map_to_fixed_reports() {
-        use fandhe_edge_runtime::pipeline::{BackendError, PreprocessError};
+        use fandhe_edge_runtime::pipeline::PreprocessError;
         let limit = ErrorReport::new(ExitCode::LimitExceeded, "resource limit exceeded");
         let runtime = ErrorReport::new(ExitCode::RuntimeError, "runtime error");
         let infer_cases = [
@@ -268,6 +270,10 @@ mod tests {
             ),
             (
                 InferError::TooManyScores { len: 2, limit: 1 },
+                limit.clone(),
+            ),
+            (
+                InferError::Backend(BackendError::TimeLimitExceeded),
                 limit.clone(),
             ),
             (InferError::Backend(BackendError::Failed), runtime.clone()),

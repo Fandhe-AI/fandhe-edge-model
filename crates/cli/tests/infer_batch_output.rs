@@ -469,13 +469,14 @@ fn req39_batch_total_output_over_limit_is_limit_exceeded_before_any_row() {
     assert!(!text.contains("predicted_label"));
 }
 
-/// REQ-39: 出力段階の期限を超えたら、残りの行もエラー行も書かず `io::Error`（TimedOut）。
+/// REQ-21・REQ-39: 1 行も書く前に出力段階の期限を超えていたら、結果行は書かず
+/// `limit_exceeded` の `ErrorReport` 1 行（時間上限の超過は経路によらず 20）。
 #[test]
-fn req39_batch_output_deadline_stops_writing() {
+fn req39_batch_output_deadline_before_first_row_is_limit_exceeded() {
     let definition = definition();
     let (pipeline, _) = pipeline();
     let mut out: Vec<u8> = Vec::new();
-    let err = emit_infer_batch_with_limits(
+    let code = emit_infer_batch_with_limits(
         &mut out,
         Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
         definition.io(),
@@ -486,9 +487,9 @@ fn req39_batch_output_deadline_stops_writing() {
             ..BatchLimits::default()
         },
     )
-    .unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-    assert!(out.is_empty());
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
 }
 
 /// REQ-33・REQ-21: 先行行の推論失敗（runtime_error）は、後続行の入力失敗（invalid_input）より
@@ -541,4 +542,67 @@ fn req39_batch_last_row_exceeding_output_deadline_is_limit_exceeded() {
     )
     .unwrap();
     assert_eq!(code, ExitCode::LimitExceeded);
+}
+
+/// REQ-39: CLI 経路（`for_cli_process`）では、停止した推論を期限で見切り、エラー JSON を書いた
+/// 直後にプロセスが exit 20 で終わる（停止スレッドの回収はプロセス終了に頼る）。
+/// 自身のテストバイナリを子プロセスとして再実行し、終了コード・stdout・経過時間を確かめる。
+#[test]
+fn req39_cli_process_exits_at_deadline_when_inference_stalls() {
+    struct Stalled;
+    impl ScoringBackend for Stalled {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_secs(600));
+            Ok(vec![0.5, 0.25, 0.25])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+    const CHILD_ENV: &str = "FANDHE_TEST_STALLED_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let definition = definition();
+        let pipeline = Arc::new(InferencePipeline::new(
+            Pre(Arc::new(Mutex::new(Vec::new()))),
+            Stalled,
+        ));
+        let mut out = io::stdout();
+        // 期限超過なら emit 内で exit するため、ここへは戻らない（戻れば fail-closed で 0 を返す）。
+        let result = emit_infer_batch_with_limits(
+            &mut out,
+            Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+            definition.io(),
+            definition.options(),
+            pipeline,
+            BatchLimits {
+                duration: Duration::from_millis(300),
+                ..BatchLimits::for_cli_process()
+            },
+        );
+        std::process::exit(if result.is_ok() { 0 } else { 70 });
+    }
+    let exe = std::env::current_exe().expect("current exe");
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "req39_cli_process_exits_at_deadline_when_inference_stalls",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn child");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(20));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("{\"code\":\"limit_exceeded\""),
+        "unexpected stdout: {stdout}"
+    );
 }
