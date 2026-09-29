@@ -14,6 +14,8 @@
 //!   （TASK-30.2）・配布パッケージ形式は後続 TASK
 //! - [`latency`][]: 推論のみの待ち時間の反復計測ハーネス（REQ-31・TASK-31.1-1・#127）。
 //!   p95 と報告は #128、実モデルでの計測は #113 後
+//! - [`package_outcome`][]: 上限超過を合否判定より優先して `limit_exceeded`（20）へ写す
+//!   終了コード決定（REQ-21・TASK-21.3-1・#132）。上限の照合・CLI 配線は未実装
 //!
 //! TASK-28.1-2（#118）で、650 件の入力に対する単体・バッチ・評価器経路の予測ラベル全件一致
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。実前処理・ONNX での
@@ -21,4 +23,5 @@
 
 pub mod capacity;
 pub mod latency;
+pub mod package_outcome;
 pub mod pipeline;
