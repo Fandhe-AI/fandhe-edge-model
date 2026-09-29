@@ -40,7 +40,7 @@ scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2
 | cli | CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） |
 | tui | TUI（REQ-35） | 未確定 |
 | mcp | MCP / Codex 連携（REQ-36/37） | 未確定 |
-| guard | ガード層（経路・形式・資源・版の検査。REQ-39） | 未確定 |
+| guard | ガード層（経路・形式・資源・版の検査。REQ-39） | `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定を実装済み） |
 | deps | 依存の追加・更新（`Cargo.toml`・`Cargo.lock`・`pyproject.toml`・lock ファイル） | — |
 | spec | `docs/spec` submodule 参照の更新 | — |
 | claude | `CLAUDE.md`・`.claude/`（agents・rules・settings・workflows） | — |
