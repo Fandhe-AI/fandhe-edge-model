@@ -1,6 +1,6 @@
-//! package 工程の終了コード決定（REQ-21・REQ-30・TASK-21.3-1・#132）。
+//! package 工程の終了コード決定（REQ-21・REQ-30・REQ-31・TASK-21.3-1・#132・TASK-21.3-2・#133）。
 //!
-//! 資源上限（容量。将来は待ち時間も。#133）の超過を、合否判定より優先して
+//! 資源上限（容量・待ち時間。REQ-30・REQ-31・#133）の超過を、合否判定より優先して
 //! `limit_exceeded`（終了コード 20）へ写す純粋関数を持つ。CLI の `package` 工程
 //! （TASK-33.x・#123）が、上限の照合結果と合否判定をここへ渡して終了コードを得る想定。
 //!
@@ -21,10 +21,23 @@
 //! - 利用者が設定する容量上限の定義ファイルへの取り込み（読み込みと範囲検証）は未実装
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
 //!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務
-//! - 待ち時間の上限超過（[`LimitBreach`] への追加）は #133 の責務
+//! - 待ち時間の p95 の算出（#128）・計測ハーネス（#127）・利用者が設定する待ち時間上限の
+//!   定義ファイルへの取り込み（範囲検証を含む）・CLI の `package` / `infer` への配線と
+//!   JSON 出力（TASK-33.x）は未実装。本モジュールは p95 と上限を数値（ナノ秒）で受け取る
+//!
+//! # 待ち時間（REQ-31）の境界規則
+//!
+//! p95 が上限を超える（`>`）ときだけ [`LimitBreach::Latency`] とし、上限ちょうど（`==`）は
+//! 合格とする。規則は [`LimitBreach::latency_if_exceeded`] の 1 箇所に集約し、
+//! TASK-31.2（#129）・TASK-31.3（#130）は再実装せずこれを再利用する。250ms は目安の
+//! 参考値であり、合否のしきい値としてここへ定数化しない。
+//!
+//! infer 1 回ごとの処理時間上限（REQ-39 の資源上限。core の `infer_input` 等が
+//! `LimitExceeded` へ写す）は別の仕組みで、REQ-31 の p95 照合とは別物である。
 //!
 //! 証拠の種別: テストハーネス。本番データでの `limit_exceeded` の再実演は未実施
-//! （PoC-16 で本番データ確認したのは `ok`・`judged_fail` のみ）。
+//! （PoC-16 で本番データ確認したのは `ok`・`judged_fail` のみ）。上限ちょうどを合格とする
+//! 扱いは PoC-14 で未確認で、テストハーネスでのみ確認している。
 
 use fandhe_edge_core::exitcode::ExitCode;
 
@@ -52,6 +65,27 @@ pub enum LimitBreach {
         /// 上限バイト数。
         limit_bytes: u64,
     },
+    /// 待ち時間（p95）上限の超過（REQ-31）。
+    Latency {
+        /// 計測した p95（ナノ秒）。
+        measured_p95_ns: u64,
+        /// 利用者が設定した上限（ナノ秒）。
+        limit_ns: u64,
+    },
+}
+
+impl LimitBreach {
+    /// p95 が上限を超える（`>`）ときだけ待ち時間超過を返す。上限ちょうどは超過でない
+    /// （REQ-31 の境界値・TASK-31.3）。
+    ///
+    /// 整数の比較のみで算術をしないため overflow・panic しない。上限値の範囲検証は
+    /// 上限を取り込む側の責務。
+    pub fn latency_if_exceeded(measured_p95_ns: u64, limit_ns: u64) -> Option<LimitBreach> {
+        (measured_p95_ns > limit_ns).then_some(LimitBreach::Latency {
+            measured_p95_ns,
+            limit_ns,
+        })
+    }
 }
 
 /// package 工程の判定結果の区分。
@@ -157,5 +191,81 @@ mod tests {
             (n.exit_code.code(), n.verdict),
             (0, PackageVerdict::NotDefined)
         );
+    }
+
+    const LIMIT_NS: u64 = 250_000_000;
+
+    #[test]
+    fn req31_latency_equal_to_limit_is_not_breach() {
+        assert_eq!(LimitBreach::latency_if_exceeded(LIMIT_NS, LIMIT_NS), None);
+    }
+
+    #[test]
+    fn req31_latency_one_ns_over_limit_is_breach() {
+        assert_eq!(
+            LimitBreach::latency_if_exceeded(LIMIT_NS + 1, LIMIT_NS),
+            Some(LimitBreach::Latency {
+                measured_p95_ns: 250_000_001,
+                limit_ns: 250_000_000
+            })
+        );
+    }
+
+    #[test]
+    fn req31_latency_below_limit_is_not_breach() {
+        assert_eq!(
+            LimitBreach::latency_if_exceeded(249_999_999, LIMIT_NS),
+            None
+        );
+    }
+
+    #[test]
+    fn req31_latency_u64_extremes() {
+        assert_eq!(LimitBreach::latency_if_exceeded(u64::MAX, u64::MAX), None);
+        assert!(LimitBreach::latency_if_exceeded(u64::MAX, u64::MAX - 1).is_some());
+        assert_eq!(LimitBreach::latency_if_exceeded(0, 0), None);
+    }
+
+    fn latency_over() -> Vec<LimitBreach> {
+        vec![LimitBreach::Latency {
+            measured_p95_ns: 250_000_001,
+            limit_ns: 250_000_000,
+        }]
+    }
+
+    #[test]
+    fn req21_latency_breach_beats_every_quality() {
+        for q in [
+            PackageQualityJudgment::Pass,
+            PackageQualityJudgment::Fail,
+            PackageQualityJudgment::Undeterminable,
+            PackageQualityJudgment::NotDefined,
+        ] {
+            let o = resolve_package_outcome(&latency_over(), q);
+            assert_eq!(o.exit_code.code(), 20);
+            assert_eq!(o.verdict, PackageVerdict::LimitExceeded);
+            assert_eq!(o.breaches, latency_over());
+        }
+    }
+
+    #[test]
+    fn req21_latency_equal_to_limit_keeps_quality_code() {
+        let breaches: Vec<LimitBreach> = LimitBreach::latency_if_exceeded(LIMIT_NS, LIMIT_NS)
+            .into_iter()
+            .collect();
+        let code = |q| resolve_package_outcome(&breaches, q).exit_code.code();
+        assert_eq!(code(PackageQualityJudgment::Fail), 10);
+        assert_eq!(code(PackageQualityJudgment::Pass), 0);
+        assert_eq!(code(PackageQualityJudgment::Undeterminable), 12);
+        assert_eq!(code(PackageQualityJudgment::NotDefined), 0);
+    }
+
+    #[test]
+    fn req21_capacity_and_latency_breaches_preserved_in_order() {
+        let mut b = over();
+        b.extend(latency_over());
+        let o = resolve_package_outcome(&b, PackageQualityJudgment::Pass);
+        assert_eq!(o.exit_code.code(), 20);
+        assert_eq!(o.breaches, b);
     }
 }
