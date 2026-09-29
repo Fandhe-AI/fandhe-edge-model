@@ -31,13 +31,15 @@
 //! 必要で未承認のため使わない。代わりに、通常ファイル検証つき（`O_NONBLOCK`・FIFO / デバイスの
 //! 拒否。`fandhe_edge_core::fs`）で開いた後、開いた fd 自身の実体を検査する。
 //!
-//! - Linux: `/proc/self/fd/<fd>` が指す実パスがルート配下であることを確認する。fd に対する
-//!   検査のため、検証後の差し替えでは外部ファイルを通せない
-//! - macOS: std だけで fd の実パスを取れないため、open 後にパスを再解決し dev / inode の一致を
-//!   確認する。再解決と比較の間の差し替えは検出できない残余リスクがあり、`F_GETPATH`
-//!   （`libc` 依存の承認）または `openat` 方式は依存承認後の課題とする
-//! - その他の OS（Windows 等）: 実体を確認する手段がないため [`PathRejection::UnsupportedPlatform`]
-//!   で拒否する（fail-closed。M10 時点で対象外）
+//! - Linux: ルートのディレクトリハンドルを最初に開いて保持し、ルートの実パスはそのハンドル
+//!   （`/proc/self/fd/<fd>`）から得る。open もハンドル起点（`/proc/self/fd/<root fd>/<相対>`）で
+//!   行い、開いた fd の実パスがルート配下であることを確認する。fd に対する検査のため、
+//!   検証後の差し替えでは外部ファイルを通せない
+//! - macOS: std だけで fd の実パスを取れないため、ルートは 1 度だけ正準化して固定し、open 後に
+//!   固定ルートで再検証して dev / inode の一致を確認する。再解決と比較の間の差し替えは検出
+//!   できない残余リスクがあり、`F_GETPATH` / `openat`（`libc` 依存の承認）は依存承認後の課題とする
+//! - その他の OS（Windows・他の unix 等）: 非ブロッキング open と実体確認を保証できないため
+//!   [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed。M10 時点で対象外）
 //!
 //! 拒否結果は [`PathRejection::exit_code`] と [`PathRejection::reason_code`] で、REQ-21 の
 //! 終了コード（`invalid_input`=64 等）と機械可読な理由コードへ写せる。
@@ -230,11 +232,24 @@ fn lexically_escapes(p: &Path) -> bool {
 ///
 /// ルート自身（`.`）は許可する。文字列の前方一致ではなく成分単位で包含を判定する。
 pub fn safe_join(root: &Path, candidate: &Path) -> Result<ConfinedPath, PathRejection> {
+    let canon_root =
+        std::fs::canonicalize(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
+    resolve_under(&canon_root, root, candidate)
+}
+
+/// 確定済みの正準化ルート `canon_root` に対して candidate を検証する内部関数。
+///
+/// [`open_confined`] が「最初に確定したルート」を使い回せるよう、ルートの正準化を呼び出し側へ
+/// 出している（検証と open の間にルートを再解決しない）。`given_root` は拒否種別
+/// （Absolute / Symlink）の判別にだけ使う。
+fn resolve_under(
+    canon_root: &Path,
+    given_root: &Path,
+    candidate: &Path,
+) -> Result<ConfinedPath, PathRejection> {
     if candidate.as_os_str().is_empty() {
         return Err(PathRejection::EmptyPath);
     }
-    let canon_root =
-        std::fs::canonicalize(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
     if !canon_root.is_dir() {
         return Err(PathRejection::RootNotDirectory);
     }
@@ -255,13 +270,13 @@ pub fn safe_join(root: &Path, candidate: &Path) -> Result<ConfinedPath, PathReje
         }
     })?;
 
-    if resolved.starts_with(&canon_root) {
+    if resolved.starts_with(canon_root) {
         Ok(ConfinedPath(resolved))
     } else {
         // 絶対パスでも、字句的にルート配下（与えられたルートまたは正準化後のルートの下）から
         // symlink で外へ出る場合は Symlink とする。字句的にも外なら Absolute。
         let lexically_under_root =
-            candidate.starts_with(&canon_root) || candidate.starts_with(root);
+            candidate.starts_with(canon_root) || candidate.starts_with(given_root);
         Err(PathRejection::Escapes {
             candidate: candidate.to_path_buf(),
             kind: if absolute && !lexically_under_root {
@@ -276,88 +291,124 @@ pub fn safe_join(root: &Path, candidate: &Path) -> Result<ConfinedPath, PathReje
 /// 検証と open を一体で行い、開いたファイル自身がルート配下の実体であることを確認して返す。
 ///
 /// [`safe_join`] 単体では検証から open までの間に親ディレクトリを symlink へ差し替えられる
-/// （TOCTOU）。本関数は (1) [`safe_join`] で検証、(2) 通常ファイル検証つき（FIFO・デバイスを
-/// `O_NONBLOCK` と種別確認で拒否）で open、(3) 開いた fd の実体を検査する。検査方法と
-/// OS ごとの残余リスクはモジュールドキュメントの「残る TOCTOU」を参照。呼び出し側は返した
-/// [`File`] だけを読み、パスを再度 open しないこと。
+/// （TOCTOU）。本関数は (1) ルートを 1 度だけ確定して保持、(2) そのルートに対し検証、
+/// (3) 通常ファイル検証つき（FIFO・デバイスを `O_NONBLOCK` と種別確認で拒否）で open、
+/// (4) 開いた fd の実体を検査する。検査方法と OS ごとの残余リスクはモジュールドキュメントの
+/// 「残る TOCTOU」を参照。呼び出し側は返した [`File`] だけを読み、パスを再度 open しないこと。
 ///
-/// unix 以外では [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed）。
+/// Linux・macOS 以外では [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed。
+/// 非ブロッキング open と fd の実体検査を保証できる OS に限るため。他の unix を含む）。
 pub fn open_confined(root: &Path, candidate: &Path) -> Result<(File, ConfinedPath), PathRejection> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (root, candidate);
         Err(PathRejection::UnsupportedPlatform)
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        open_confined_unix(root, candidate)
+        open_confined_impl(root, candidate)
     }
 }
 
-#[cfg(unix)]
-fn open_confined_unix(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_regular(path: &Path, candidate: &Path) -> Result<File, PathRejection> {
+    fandhe_edge_core::fs::open_regular_file_for_read(path).map_err(|e| match e {
+        fandhe_edge_core::fs::FsError::NotRegularFile { .. } => PathRejection::NotRegularFile {
+            candidate: candidate.to_path_buf(),
+        },
+        fandhe_edge_core::fs::FsError::Read { source, .. } => PathRejection::Unresolvable {
+            candidate: candidate.to_path_buf(),
+            source,
+        },
+        // FsError は non_exhaustive。未知の失敗は fail-closed で入力不正として扱う。
+        _ => PathRejection::Unresolvable {
+            candidate: candidate.to_path_buf(),
+            source: io::Error::from(io::ErrorKind::InvalidInput),
+        },
+    })
+}
+
+/// Linux: ルートのディレクトリハンドルを先に開いて保持し、以降はハンドルを起点にする。
+///
+/// ルートの実パスは保持した fd（`/proc/self/fd/<fd>`）から得るため、検証後にルートの
+/// パス名を symlink へ差し替えても参照先は変わらない。open も `/proc/self/fd/<root fd>/<相対>`
+/// でハンドル起点にし、最後に開いた fd 自身の実パスがルート配下であることを確認する。
+#[cfg(target_os = "linux")]
+fn open_confined_impl(
     root: &Path,
     candidate: &Path,
 ) -> Result<(File, ConfinedPath), PathRejection> {
-    let first = safe_join(root, candidate)?;
-    let file =
-        fandhe_edge_core::fs::open_regular_file_for_read(first.as_path()).map_err(|e| match e {
-            fandhe_edge_core::fs::FsError::NotRegularFile { .. } => PathRejection::NotRegularFile {
+    use std::os::fd::AsRawFd;
+
+    let root_handle =
+        File::open(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
+    let root_meta = root_handle
+        .metadata()
+        .map_err(|source| PathRejection::RootUnresolvable { source })?;
+    if !root_meta.is_dir() {
+        return Err(PathRejection::RootNotDirectory);
+    }
+    let root_link = PathBuf::from(format!("/proc/self/fd/{}", root_handle.as_raw_fd()));
+    let canon_root = std::fs::read_link(&root_link)
+        .map_err(|source| PathRejection::RootUnresolvable { source })?;
+
+    let first = resolve_under(&canon_root, root, candidate)?;
+    let relative =
+        first
+            .as_path()
+            .strip_prefix(&canon_root)
+            .map_err(|_| PathRejection::Escapes {
                 candidate: candidate.to_path_buf(),
-            },
-            fandhe_edge_core::fs::FsError::Read { source, .. } => PathRejection::Unresolvable {
-                candidate: candidate.to_path_buf(),
-                source,
-            },
-            // FsError は non_exhaustive。未知の失敗は fail-closed で入力不正として扱う。
-            _ => PathRejection::Unresolvable {
-                candidate: candidate.to_path_buf(),
-                source: io::Error::from(io::ErrorKind::InvalidInput),
-            },
-        })?;
-    let escaped = || PathRejection::Escapes {
+                kind: EscapeKind::Symlink,
+            })?;
+    let file = open_regular(&root_link.join(relative), candidate)?;
+
+    let fd_link = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let real = std::fs::read_link(&fd_link).map_err(|source| PathRejection::Unresolvable {
         candidate: candidate.to_path_buf(),
-        kind: EscapeKind::Symlink,
-    };
+        source,
+    })?;
+    // ルートは保持したハンドルから再取得する（パス名の再解決を挟まない）。
+    let canon_root_now = std::fs::read_link(&root_link)
+        .map_err(|source| PathRejection::RootUnresolvable { source })?;
+    if !real.starts_with(&canon_root_now) {
+        return Err(PathRejection::Escapes {
+            candidate: candidate.to_path_buf(),
+            kind: EscapeKind::Symlink,
+        });
+    }
+    Ok((file, ConfinedPath(real)))
+}
+
+/// macOS: ルートを 1 度だけ正準化して固定し、open 後に固定ルートで再検証して dev / inode を比較する。
+///
+/// std だけでは fd の実パスを取れないため、再解決と比較の間の差し替えは検出できない
+/// 残余リスクがある（`F_GETPATH` / `openat` は `libc` 依存の承認後の課題）。
+#[cfg(target_os = "macos")]
+fn open_confined_impl(
+    root: &Path,
+    candidate: &Path,
+) -> Result<(File, ConfinedPath), PathRejection> {
+    use std::os::unix::fs::MetadataExt;
+
     let canon_root =
         std::fs::canonicalize(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
-
-    // Linux: 開いた fd 自身の実パスを検査する（パスの再解決を挟まない）。
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let fd_link = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        let real = std::fs::read_link(&fd_link).map_err(|source| PathRejection::Unresolvable {
+    let first = resolve_under(&canon_root, root, candidate)?;
+    let file = open_regular(first.as_path(), candidate)?;
+    let unresolvable = |source| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source,
+    };
+    let second = resolve_under(&canon_root, root, candidate)?;
+    let opened = file.metadata().map_err(unresolvable)?;
+    let resolved = std::fs::metadata(second.as_path()).map_err(unresolvable)?;
+    if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
+        return Err(PathRejection::Escapes {
             candidate: candidate.to_path_buf(),
-            source,
-        })?;
-        if !real.starts_with(&canon_root) {
-            return Err(escaped());
-        }
-        Ok((file, ConfinedPath(real)))
+            kind: EscapeKind::Symlink,
+        });
     }
-
-    // その他の unix（macOS）: open 後に再解決し、dev / inode の一致を確認する（残余リスクあり）。
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let second = safe_join(root, candidate)?;
-        let opened = file
-            .metadata()
-            .map_err(|source| PathRejection::Unresolvable {
-                candidate: candidate.to_path_buf(),
-                source,
-            })?;
-        let resolved =
-            std::fs::metadata(second.as_path()).map_err(|source| PathRejection::Unresolvable {
-                candidate: candidate.to_path_buf(),
-                source,
-            })?;
-        if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
-            return Err(escaped());
-        }
-        Ok((file, second))
-    }
+    Ok((file, second))
 }
 
 #[cfg(test)]
