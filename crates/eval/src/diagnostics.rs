@@ -91,8 +91,57 @@ pub const MAX_STATS_TOTAL_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub trait InputNormalizer {
     /// 規則 ID（英語。結果の `input_key_rule` へ記録される）。
     fn rule_id(&self) -> &'static str;
-    /// `input` を正規化する。
-    fn normalize(&self, input: &str) -> String;
+    /// `input` を正規化し、結果を `out` へ書き込む。
+    ///
+    /// 出力は上限付きの [`BoundedString`] へ追記する。上限超過は追記の時点で
+    /// [`OutputLimitExceeded`] として検出されるため、短い入力から巨大な文字列を
+    /// 生成する規則でも、確保が上限を超える前に打ち切れる（REQ-39）。実装は
+    /// `push_str` / `push` の `Err` を `?` で呼び出し元へ返すこと。
+    fn normalize(&self, input: &str, out: &mut BoundedString) -> Result<(), OutputLimitExceeded>;
+}
+
+/// 正規化の出力が上限を超えた（[`BoundedString`] への追記時に検出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimitExceeded;
+
+/// 追記のたびに上限を検査する文字列バッファ（正規化の出力用。REQ-39）。
+///
+/// 上限を超える追記は、バッファへ反映する前に拒否する。
+#[derive(Debug)]
+pub struct BoundedString {
+    buf: String,
+    limit: usize,
+}
+
+impl BoundedString {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: String::new(),
+            limit,
+        }
+    }
+
+    /// 文字列を追記する。追記後の長さが上限を超えるなら何も追記せず `Err`。
+    pub fn push_str(&mut self, s: &str) -> Result<(), OutputLimitExceeded> {
+        self.buf
+            .len()
+            .checked_add(s.len())
+            .filter(|&n| n <= self.limit)
+            .ok_or(OutputLimitExceeded)?;
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    /// 1 文字を追記する（上限の扱いは [`BoundedString::push_str`] と同じ）。
+    pub fn push(&mut self, c: char) -> Result<(), OutputLimitExceeded> {
+        let mut tmp = [0u8; 4];
+        self.push_str(c.encode_utf8(&mut tmp))
+    }
+
+    /// 現在の内容。
+    pub fn as_str(&self) -> &str {
+        &self.buf
+    }
 }
 
 /// ユニーク入力数の数え方。
@@ -112,10 +161,15 @@ impl InputKey<'_> {
         }
     }
 
-    fn key<'a>(&self, input: &'a str) -> Cow<'a, str> {
+    /// 数え方のキーを得る。正規化の出力が [`MAX_STATS_INPUT_BYTES`] を超えたら `None`。
+    fn key<'a>(&self, input: &'a str) -> Option<Cow<'a, str>> {
         match self {
-            InputKey::ByteExact => Cow::Borrowed(input),
-            InputKey::Normalized(n) => Cow::Owned(n.normalize(input)),
+            InputKey::ByteExact => Some(Cow::Borrowed(input)),
+            InputKey::Normalized(n) => {
+                let mut out = BoundedString::new(MAX_STATS_INPUT_BYTES);
+                n.normalize(input, &mut out).ok()?;
+                Some(Cow::Owned(out.buf))
+            }
         }
     }
 }
@@ -124,8 +178,13 @@ impl InputKey<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticsError {
-    /// ラベル集合の検証エラー。
+    /// ラベル集合の検証エラー（重複は値を含めない [`DiagnosticsError::DuplicateLabel`] へ変換済み）。
     Labels(EvalError),
+    /// ラベル集合に重複がある（2 回目の出現位置のみ。ラベル値は含めない）。
+    DuplicateLabel {
+        /// 重複した側（2 回目の出現）のラベル位置。
+        index: usize,
+    },
     /// 行が 0 件（集計済みを装わない）。
     EmptyRows,
     /// 行数が [`MAX_EVAL_RECORDS`] を超える（REQ-39。走査前に拒否）。
@@ -164,6 +223,9 @@ impl fmt::Display for DiagnosticsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DiagnosticsError::Labels(err) => write!(f, "{err}"),
+            DiagnosticsError::DuplicateLabel { index } => {
+                write!(f, "duplicate label at label index {index}")
+            }
             DiagnosticsError::EmptyRows => write!(f, "rows must not be empty"),
             DiagnosticsError::TooManyRows { n_rows, limit } => {
                 write!(f, "too many rows: {n_rows} (limit: {limit})")
@@ -210,7 +272,15 @@ pub fn basic_stats(
             limit: MAX_EVAL_RECORDS,
         });
     }
-    let index = validate_label_order(labels).map_err(DiagnosticsError::Labels)?;
+    let index = validate_label_order(labels).map_err(|err| match err {
+        // 重複ラベルの値はエラーへ載せず、位置のみ返す（値を含めない契約）。
+        EvalError::DuplicateLabel { .. } => {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let dup = labels.iter().position(|l| !seen.insert(l)).unwrap_or(0);
+            DiagnosticsError::DuplicateLabel { index: dup }
+        }
+        other => DiagnosticsError::Labels(other),
+    })?;
     if rows.is_empty() {
         return Err(DiagnosticsError::EmptyRows);
     }
@@ -245,13 +315,13 @@ pub fn basic_stats(
         *slot = slot
             .checked_add(1)
             .ok_or_else(|| internal("count overflow while tallying labels"))?;
-        let key = input_key.key(row.input);
-        if key.len() > MAX_STATS_INPUT_BYTES {
-            return Err(DiagnosticsError::InputTooLong {
+        // 正規化の出力は上限付きバッファへ書かれ、超過は確保の途中で検出される（REQ-39）。
+        let key = input_key
+            .key(row.input)
+            .ok_or(DiagnosticsError::InputTooLong {
                 index: i,
                 limit: MAX_STATS_INPUT_BYTES,
-            });
-        }
+            })?;
         let key_len = key.len();
         if inputs.insert(key) {
             retained_bytes = retained_bytes
@@ -336,8 +406,12 @@ mod tests {
             fn rule_id(&self) -> &'static str {
                 "nfkc_whitespace"
             }
-            fn normalize(&self, input: &str) -> String {
-                squash(input)
+            fn normalize(
+                &self,
+                input: &str,
+                out: &mut BoundedString,
+            ) -> Result<(), OutputLimitExceeded> {
+                out.push_str(&squash(input))
             }
         }
         let s = basic_stats(&["A"], &rows, InputKey::Normalized(&Squash)).unwrap();
@@ -356,6 +430,76 @@ mod tests {
         assert_eq!(err, DiagnosticsError::UnknownLabel { index: 0 });
         let msg = err.to_string();
         assert_eq!(msg, "unknown label at row index 0");
+        assert!(!msg.contains("secret"));
+    }
+
+    /// REQ-39: 短い入力から巨大な出力を作る正規化は、上限を超える追記の時点で拒否される
+    /// （出力全体を確保し終えてから検査するのではない）。
+    #[test]
+    fn expanding_normalizer_is_stopped_at_limit() {
+        use std::cell::Cell;
+        struct Expand<'c>(&'c Cell<usize>);
+        impl InputNormalizer for Expand<'_> {
+            fn rule_id(&self) -> &'static str {
+                "expand"
+            }
+            fn normalize(
+                &self,
+                _input: &str,
+                out: &mut BoundedString,
+            ) -> Result<(), OutputLimitExceeded> {
+                // 上限の数千倍を生成しようとするが、超過した最初の追記で打ち切られる。
+                for _ in 0..(MAX_STATS_INPUT_BYTES * 1000) {
+                    out.push_str("xxxxxxxx")?;
+                    self.0.set(self.0.get() + 1);
+                }
+                Ok(())
+            }
+        }
+        let calls = Cell::new(0);
+        let rows = [StatsRow {
+            input: "a",
+            label: "A",
+        }];
+        let err = basic_stats(&["A"], &rows, InputKey::Normalized(&Expand(&calls))).unwrap_err();
+        assert_eq!(
+            err,
+            DiagnosticsError::InputTooLong {
+                index: 0,
+                limit: MAX_STATS_INPUT_BYTES
+            }
+        );
+        assert_eq!(calls.get(), MAX_STATS_INPUT_BYTES / 8);
+    }
+
+    /// REQ-39: BoundedString は上限ちょうどまで受け付け、超過する追記は反映しない。
+    #[test]
+    fn bounded_string_rejects_overflow_without_appending() {
+        let mut b = BoundedString::new(4);
+        assert_eq!(b.push_str("abc"), Ok(()));
+        assert_eq!(b.push_str("de"), Err(OutputLimitExceeded));
+        assert_eq!(b.as_str(), "abc");
+        assert_eq!(b.push('d'), Ok(()));
+        assert_eq!(b.push('e'), Err(OutputLimitExceeded));
+        assert_eq!(b.as_str(), "abcd");
+    }
+
+    /// REQ-29: 重複ラベルのエラーは位置のみでラベル値を含めない。
+    #[test]
+    fn duplicate_label_error_hides_value() {
+        let rows = [StatsRow {
+            input: "x",
+            label: "secret-label",
+        }];
+        let err = basic_stats(
+            &["secret-label", "B", "secret-label"],
+            &rows,
+            InputKey::ByteExact,
+        )
+        .unwrap_err();
+        assert_eq!(err, DiagnosticsError::DuplicateLabel { index: 2 });
+        let msg = err.to_string();
+        assert_eq!(msg, "duplicate label at label index 2");
         assert!(!msg.contains("secret"));
     }
 }

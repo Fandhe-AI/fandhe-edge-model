@@ -2,8 +2,8 @@
 //! 証拠種別: テストハーネス。手組みの合成データの具体値で検証する）。
 
 use fandhe_edge_eval::diagnostics::{
-    DiagnosticsError, InputKey, InputNormalizer, LabelCount, MAX_STATS_INPUT_BYTES,
-    MAX_STATS_TOTAL_INPUT_BYTES, StatsRow, basic_stats,
+    BoundedString, DiagnosticsError, InputKey, InputNormalizer, LabelCount, MAX_STATS_INPUT_BYTES,
+    MAX_STATS_TOTAL_INPUT_BYTES, OutputLimitExceeded, StatsRow, basic_stats,
 };
 use fandhe_edge_eval::metrics::EvalError;
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
@@ -71,8 +71,8 @@ fn unique_inputs_is_byte_equality_unless_normalizer_given() {
         fn rule_id(&self) -> &'static str {
             "test_fullwidth_ab"
         }
-        fn normalize(&self, s: &str) -> String {
-            s.replace('Ａ', "A").replace('Ｂ', "B")
+        fn normalize(&self, s: &str, out: &mut BoundedString) -> Result<(), OutputLimitExceeded> {
+            out.push_str(&s.replace('Ａ', "A").replace('Ｂ', "B"))
         }
     }
     let s = basic_stats(&["A"], &rows, InputKey::Normalized(&Fullwidth)).unwrap();
@@ -102,10 +102,10 @@ fn errors() {
         basic_stats(&[], &rows, InputKey::ByteExact).unwrap_err(),
         DiagnosticsError::Labels(EvalError::EmptyLabels)
     );
-    assert!(matches!(
+    assert_eq!(
         basic_stats(&["A", "A"], &rows, InputKey::ByteExact).unwrap_err(),
-        DiagnosticsError::Labels(_)
-    ));
+        DiagnosticsError::DuplicateLabel { index: 1 }
+    );
     let long = "x".repeat(100_000);
     assert!(matches!(
         basic_stats(&[long.as_str()], &rows, InputKey::ByteExact).unwrap_err(),
@@ -174,8 +174,11 @@ fn rejects_normalized_expansion() {
         fn rule_id(&self) -> &'static str {
             "test_expand"
         }
-        fn normalize(&self, s: &str) -> String {
-            s.repeat(MAX_STATS_INPUT_BYTES)
+        fn normalize(&self, s: &str, out: &mut BoundedString) -> Result<(), OutputLimitExceeded> {
+            for _ in 0..MAX_STATS_INPUT_BYTES {
+                out.push_str(s)?;
+            }
+            Ok(())
         }
     }
     let rows = [row("ab", "A")];
