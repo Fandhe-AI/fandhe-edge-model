@@ -48,7 +48,7 @@ fn drive(
     let it = items(f);
     let mut rec = ArgumentRecorder::new(|_: &str| 0u8);
     for i in 0..calls {
-        rec.call(&mk(i));
+        rec.call(&mk(i)).unwrap();
     }
     verify_input_only(&it, &rec)
 }
@@ -145,14 +145,15 @@ fn req27_no_false_positive_for_gold_substring_duplicates_and_empty() {
             tags: &tags,
         })
         .collect();
-    let mut seen = Vec::new();
-    let preds = run_inference_input_only(&it, |s| {
-        seen.push(s.to_string());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let preds = run_inference_input_only(&it, move |s| {
+        sink.borrow_mut().push(s.to_string());
         s.len()
     })
     .unwrap();
     assert_eq!(preds, vec![16, 4, 4, 0]);
-    assert_eq!(seen, raw);
+    assert_eq!(*seen.borrow(), raw);
 }
 
 #[test]

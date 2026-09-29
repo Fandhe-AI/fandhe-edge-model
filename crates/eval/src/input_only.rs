@@ -19,6 +19,16 @@
 //! ことである。部分一致（contains）判定は、正当な `input` が正解ラベル文字列を
 //! 含む場合に誤検出するため採用しない。
 //!
+//! # 推論関数の境界（メタデータ非捕捉）
+//!
+//! 推論関数は `F: FnMut(&str) -> P + 'static` に限る。評価レコードの `gold`・`tags`・
+//! `id` は [`EvalItem`] が借用する値なので、それらを参照で捕捉するクロージャは
+//! `'static` を満たせず、コンパイル時に拒否される（`compile_fail` doctest で固定）。
+//! 残る限界（実装済みを装わない）: 呼び出し側が所有権つきの複製（`clone`）を作って
+//! `move` で持ち込む経路は、同一プロセス内では型で防げない。その経路の遮断は、推論を
+//! レコードのメタデータを持たない別プロセス・別境界（CLI の `evaluate` 配線。issue #140）
+//! で実行することで担保する想定（REQ-27）。
+//!
 //! # 記録の扱い
 //!
 //! 記録器は生の文字列を保持せず、バイト長と sha256 のみを残す（学習・評価データ
@@ -29,7 +39,8 @@
 //! # 資源上限
 //!
 //! レコード件数は [`crate::significance::MAX_EVAL_RECORDS`] を超えると確保前に
-//! 拒否する。記録器の記録件数も同じ上限で打ち切り、超過は違反として扱う。
+//! 拒否する。記録器も同じ上限で打ち切り、上限に達した後の呼び出しは推論関数を
+//! 実行する前にエラーを返す（推論回数にも上限がある。REQ-39）。
 
 use fandhe_edge_core::hash::Sha256Digest;
 
@@ -68,7 +79,7 @@ pub struct ArgumentRecorder<F> {
     overflowed: bool,
 }
 
-impl<F> ArgumentRecorder<F> {
+impl<F: 'static> ArgumentRecorder<F> {
     /// 記録上限を [`MAX_EVAL_RECORDS`] として作る。
     #[must_use]
     pub fn new(predict: F) -> Self {
@@ -97,19 +108,26 @@ impl<F> ArgumentRecorder<F> {
     }
 
     /// 引数を記録してから推論関数を呼ぶ。
-    pub fn call<P>(&mut self, input: &str) -> P
+    ///
+    /// 記録上限に達している場合は推論関数を呼ばず、`overflowed` を立てて
+    /// [`InputIsolationViolation::RecorderOverflow`] を返す（REQ-39）。
+    ///
+    /// # Errors
+    ///
+    /// 記録上限を超える呼び出しのとき。
+    pub fn call<P>(&mut self, input: &str) -> Result<P, InputIsolationViolation>
     where
         F: FnMut(&str) -> P,
     {
-        if self.records.len() < self.limit {
-            self.records.push(ArgumentRecord {
-                byte_len: input.len(),
-                digest: Sha256Digest::of_bytes(input.as_bytes()),
-            });
-        } else {
+        if self.records.len() >= self.limit {
             self.overflowed = true;
+            return Err(InputIsolationViolation::RecorderOverflow { limit: self.limit });
         }
-        (self.predict)(input)
+        self.records.push(ArgumentRecord {
+            byte_len: input.len(),
+            digest: Sha256Digest::of_bytes(input.as_bytes()),
+        });
+        Ok((self.predict)(input))
     }
 }
 
@@ -231,6 +249,17 @@ pub fn verify_input_only<F>(
 /// 記録器越しに呼び、最後に [`verify_input_only`] で照合する。違反があれば
 /// 予測を返さない（fail-closed）。`id` との対応付けは呼び出し側が添字で行う。
 ///
+/// 推論関数は `'static` に限る。借用した `gold`・`tags`・`id` を捕捉するクロージャは
+/// コンパイルできない（モジュール doc の限界も参照）:
+///
+/// ```compile_fail
+/// use fandhe_edge_eval::input_only::{EvalItem, run_inference_input_only};
+/// let tags: Vec<String> = vec![];
+/// let items = [EvalItem { id: "a", input: "x", gold: "pos", tags: &tags }];
+/// let gold = items[0].gold;
+/// let _ = run_inference_input_only(&items, |_| gold.len());
+/// ```
+///
 /// 注意: この関数は常に `item.input` だけを渡すため、この関数経由では内部の照合は
 /// 恒真になる（実装済みを装わない）。違反検出が実効性を持つのは、呼び出し側が
 /// [`ArgumentRecorder`] を直接駆動して [`verify_input_only`] へ渡す経路であり、
@@ -245,7 +274,7 @@ pub fn run_inference_input_only<P, F>(
     predict: F,
 ) -> Result<Vec<P>, InputIsolationError>
 where
-    F: FnMut(&str) -> P,
+    F: FnMut(&str) -> P + 'static,
 {
     run_with_limit(items, predict, MAX_EVAL_RECORDS)
 }
@@ -256,7 +285,7 @@ fn run_with_limit<P, F>(
     limit: usize,
 ) -> Result<Vec<P>, InputIsolationError>
 where
-    F: FnMut(&str) -> P,
+    F: FnMut(&str) -> P + 'static,
 {
     if items.len() > limit {
         return Err(InputIsolationError::TooManyRecords {
@@ -267,7 +296,11 @@ where
     let mut recorder = ArgumentRecorder::with_limit(predict, limit);
     let mut preds = Vec::with_capacity(items.len());
     for item in items {
-        preds.push(recorder.call(item.input));
+        preds.push(
+            recorder
+                .call(item.input)
+                .map_err(InputIsolationError::Violation)?,
+        );
     }
     verify_input_only(items, &recorder).map_err(InputIsolationError::Violation)?;
     Ok(preds)
@@ -293,8 +326,8 @@ mod tests {
     #[test]
     fn req27_recorder_records_len_and_digest() {
         let mut r = ArgumentRecorder::new(|s: &str| s.len());
-        assert_eq!(r.call("abc"), 3);
-        assert_eq!(r.call(""), 0);
+        assert_eq!(r.call("abc"), Ok(3));
+        assert_eq!(r.call(""), Ok(0));
         assert_eq!(r.records()[0].byte_len, 3);
         assert_eq!(r.records()[0].digest, Sha256Digest::of_bytes(b"abc"));
         assert_eq!(r.records()[1].byte_len, 0);
@@ -305,12 +338,33 @@ mod tests {
     #[test]
     fn req27_recorder_overflow_boundary() {
         let mut r = ArgumentRecorder::with_limit(|_: &str| 0u8, 2);
-        r.call("a");
-        r.call("b");
+        r.call("a").unwrap();
+        r.call("b").unwrap();
         assert!(!r.overflowed());
-        r.call("c");
+        assert_eq!(
+            r.call("c"),
+            Err(InputIsolationViolation::RecorderOverflow { limit: 2 })
+        );
         assert!(r.overflowed());
         assert_eq!(r.records().len(), 2);
+    }
+
+    /// REQ-39: 上限到達後は推論関数を実行しない。
+    #[test]
+    fn req39_predict_not_called_after_limit() {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let c = count.clone();
+        let mut r = ArgumentRecorder::with_limit(
+            move |_: &str| {
+                c.set(c.get() + 1);
+                0u8
+            },
+            2,
+        );
+        for s in ["a", "b", "c", "d"] {
+            let _ = r.call(s);
+        }
+        assert_eq!(count.get(), 2);
     }
 
     /// REQ-27: 件数上限超過は確保前に拒否する。
