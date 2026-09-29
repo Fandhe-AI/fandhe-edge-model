@@ -41,8 +41,11 @@
 //! レコード件数は [`crate::significance::MAX_EVAL_RECORDS`] を超えると確保前に
 //! 拒否する。記録器も同じ上限で打ち切り、上限に達した後の呼び出しは推論関数を
 //! 実行する前にエラーを返す（推論回数にも上限がある。REQ-39）。
+//! 1 件あたりの `input` も [`MAX_INFER_INPUT_BYTES`]（推論入力の上限と同値）を超えると、
+//! sha256 の計算・推論関数の呼び出しの前に拒否する（REQ-39）。
 
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 
 use crate::significance::MAX_EVAL_RECORDS;
 
@@ -77,6 +80,7 @@ pub struct ArgumentRecorder<F> {
     records: Vec<ArgumentRecord>,
     limit: usize,
     overflowed: bool,
+    oversized: bool,
 }
 
 impl<F: 'static> ArgumentRecorder<F> {
@@ -92,6 +96,7 @@ impl<F: 'static> ArgumentRecorder<F> {
             records: Vec::new(),
             limit,
             overflowed: false,
+            oversized: false,
         }
     }
 
@@ -110,11 +115,13 @@ impl<F: 'static> ArgumentRecorder<F> {
     /// 引数を記録してから推論関数を呼ぶ。
     ///
     /// 記録上限に達している場合は推論関数を呼ばず、`overflowed` を立てて
-    /// [`InputIsolationViolation::RecorderOverflow`] を返す（REQ-39）。
+    /// [`InputIsolationViolation::RecorderOverflow`] を返す。`input` が
+    /// [`MAX_INFER_INPUT_BYTES`] を超える場合は、ハッシュ計算・推論の前に
+    /// [`InputIsolationViolation::InputTooLarge`] を返す（REQ-39）。
     ///
     /// # Errors
     ///
-    /// 記録上限を超える呼び出しのとき。
+    /// 記録上限を超える呼び出し、または入力が 1 件あたりの上限を超えるとき。
     pub fn call<P>(&mut self, input: &str) -> Result<P, InputIsolationViolation>
     where
         F: FnMut(&str) -> P,
@@ -122,6 +129,12 @@ impl<F: 'static> ArgumentRecorder<F> {
         if self.records.len() >= self.limit {
             self.overflowed = true;
             return Err(InputIsolationViolation::RecorderOverflow { limit: self.limit });
+        }
+        if input.len() > MAX_INFER_INPUT_BYTES {
+            self.oversized = true;
+            return Err(InputIsolationViolation::InputTooLarge {
+                limit: MAX_INFER_INPUT_BYTES,
+            });
         }
         self.records.push(ArgumentRecord {
             byte_len: input.len(),
@@ -147,6 +160,11 @@ pub enum InputIsolationViolation {
         /// 記録上限。
         limit: usize,
     },
+    /// 1 件の入力が 1 件あたりのバイト長上限を超えた（ハッシュ・推論の前に拒否）。
+    InputTooLarge {
+        /// 上限（バイト）。
+        limit: usize,
+    },
     /// 引数が対応するレコードの `input` と一致しない index の一覧（昇順）。
     ArgumentMismatch {
         /// 不一致のレコード index。
@@ -163,6 +181,9 @@ impl std::fmt::Display for InputIsolationViolation {
             ),
             Self::RecorderOverflow { limit } => {
                 write!(f, "inference calls exceeded recorder limit {limit}")
+            }
+            Self::InputTooLarge { limit } => {
+                write!(f, "inference input exceeded byte limit {limit}")
             }
             Self::ArgumentMismatch { indices } => write!(
                 f,
@@ -218,6 +239,11 @@ pub fn verify_input_only<F>(
     if recorder.overflowed {
         return Err(InputIsolationViolation::RecorderOverflow {
             limit: recorder.limit,
+        });
+    }
+    if recorder.oversized {
+        return Err(InputIsolationViolation::InputTooLarge {
+            limit: MAX_INFER_INPUT_BYTES,
         });
     }
     let actual = recorder.records.len();
@@ -365,6 +391,42 @@ mod tests {
             let _ = r.call(s);
         }
         assert_eq!(count.get(), 2);
+    }
+
+    /// REQ-39: 1 件あたりの上限超過はハッシュ・推論の前に拒否する（境界: ちょうどは可）。
+    #[test]
+    fn req39_oversized_input_rejected_before_predict() {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let c = count.clone();
+        let mut r = ArgumentRecorder::new(move |_: &str| {
+            c.set(c.get() + 1);
+            0u8
+        });
+        let ok = "a".repeat(MAX_INFER_INPUT_BYTES);
+        assert_eq!(r.call(&ok), Ok(0));
+        let big = "a".repeat(MAX_INFER_INPUT_BYTES + 1);
+        assert_eq!(
+            r.call(&big),
+            Err(InputIsolationViolation::InputTooLarge {
+                limit: MAX_INFER_INPUT_BYTES
+            })
+        );
+        assert_eq!(count.get(), 1);
+        assert_eq!(r.records().len(), 1);
+        let tags: Vec<String> = vec![];
+        let it = items(&[big.as_str()], &tags);
+        assert_eq!(
+            run_with_limit(&it, |_: &str| 0u8, 4).unwrap_err(),
+            InputIsolationError::Violation(InputIsolationViolation::InputTooLarge {
+                limit: MAX_INFER_INPUT_BYTES
+            })
+        );
+        assert_eq!(
+            verify_input_only(&[], &r),
+            Err(InputIsolationViolation::InputTooLarge {
+                limit: MAX_INFER_INPUT_BYTES
+            })
+        );
     }
 
     /// REQ-27: 件数上限超過は確保前に拒否する。
