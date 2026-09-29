@@ -920,6 +920,35 @@ mod tests {
         ));
     }
 
+    /// REQ-39・TASK-26.2: ラベル ID の長さと合計バイト数は複製前に拒否する。
+    #[test]
+    fn oversized_label_ids_are_rejected_before_copy() {
+        use crate::metrics::{EvalError, MAX_LABEL_BYTES, MAX_LABELS_TOTAL_BYTES};
+        let long = "x".repeat(MAX_LABEL_BYTES + 1);
+        assert_eq!(
+            compare_label_sets(&["A"], &[long.as_str()]),
+            Err(RegressionError::CurrentLabels(EvalError::LabelTooLong {
+                index: 0,
+                limit: MAX_LABEL_BYTES
+            }))
+        );
+        assert_eq!(
+            compare_label_sets(&["A", long.as_str()], &["A"]),
+            Err(RegressionError::PreviousLabels(EvalError::LabelTooLong {
+                index: 1,
+                limit: MAX_LABEL_BYTES
+            }))
+        );
+        // 件数・長さとも上限ちょうどなら合計も上限内（合計上限は多層防御）。
+        let n = crate::metrics::MAX_LABELS;
+        let owned: Vec<String> = (0..n)
+            .map(|i| format!("{i:0>width$}", width = MAX_LABEL_BYTES))
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(refs.len() * MAX_LABEL_BYTES, MAX_LABELS_TOTAL_BYTES);
+        assert!(compare_label_sets(&refs, &refs).is_ok());
+    }
+
     /// REQ-26・TASK-26.2: 件数は `regression_counts` と一致し、前提が付く。
     /// ラベル異常と長さ不一致が同時ならラベルのエラーが先。
     #[test]
