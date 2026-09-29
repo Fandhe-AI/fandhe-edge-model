@@ -78,6 +78,11 @@ fn read_varint(buf: &[u8]) -> Result<(u64, usize), bool> {
             return Err(true);
         };
         let shift = (i as u32).saturating_mul(7);
+        // 10 バイト目は u64 の最上位 1 ビットだけを持てる。0x00・0x01 以外は u64 に収まらない
+        // 値（または継続ビット付き）であり、切り詰めて受理せず拒否する。
+        if i == 9 && b > 0x01 {
+            return Err(false);
+        }
         value |= u64::from(b & 0x7f).checked_shl(shift).unwrap_or(0);
         if b & 0x80 == 0 {
             return Ok((value, i.saturating_add(1)));
@@ -132,9 +137,6 @@ fn looks_like_onnx_model(prefix: &[u8], total_len: u64) -> bool {
             };
             pos = next;
         } else {
-            if field == 7 {
-                seen_graph = true;
-            }
             let (len, m) = match read_varint(body) {
                 Ok(v) => v,
                 Err(truncated) => return truncated && seen_ir_version && seen_graph,
@@ -147,6 +149,10 @@ fn looks_like_onnx_model(prefix: &[u8], total_len: u64) -> bool {
             };
             if end > total_len {
                 return false;
+            }
+            // graph は長さを完全に読み、ファイル内に収まると確認できてから認める。
+            if field == 7 {
+                seen_graph = true;
             }
             match usize::try_from(end) {
                 Ok(e) if e <= prefix.len() => pos = e,
@@ -371,6 +377,26 @@ mod tests {
         let mut long = vec![0x08];
         long.extend_from_slice(&[0xff; 11]);
         assert_eq!(d(&long), FileFormat::Unknown);
+    }
+
+    /// REQ-39・TASK-39.2-1: graph の長さ varint が途中で切れた入力は ONNX と認めない。
+    #[test]
+    fn req39_truncated_graph_length_is_unknown() {
+        assert_eq!(d(&[0x08, 0x07, 0x3a, 0x80]), FileFormat::Unknown);
+        assert!(!FormatAllowlist::onnx_only().contains(d(&[0x08, 0x07, 0x3a, 0x80])));
+    }
+
+    /// REQ-39・TASK-39.2-1: 10 バイト目が 0x00・0x01 以外の varint は拒否し、0x01 は受理する。
+    #[test]
+    fn req39_varint_tenth_byte_must_be_0_or_1() {
+        let mut bad = vec![0x08, 0x07, 0x3a];
+        bad.extend_from_slice(&[0x80; 9]);
+        bad.push(0x02);
+        assert_eq!(detect_format(&bad, u64::MAX), FileFormat::Unknown);
+        let mut ok = vec![0x08, 0x07, 0x3a];
+        ok.extend_from_slice(&[0x80; 9]);
+        ok.push(0x01);
+        assert_eq!(detect_format(&ok, u64::MAX), FileFormat::Onnx);
     }
 
     /// REQ-39・TASK-39.2-1: onnx_only は ONNX だけを通し、他は InvalidInput(64) で拒否する。
