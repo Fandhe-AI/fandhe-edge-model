@@ -231,3 +231,90 @@ fn batch_len_limit_rejected_before_allocation() {
     assert_eq!(err.code(), "too_many_inputs");
     assert_eq!(*pre_calls.borrow(), 0);
 }
+/// REQ-39: 総入力バイト数が上限を超えるバッチは、処理前（前処理を 1 回も呼ばず）に拒否する。
+#[test]
+fn req39_batch_total_bytes_rejected_before_processing() {
+    let calls = Rc::new(RefCell::new(0usize));
+    let p = InferencePipeline::new(SpyPre(calls.clone()), WindowBackend);
+    let chunk = "a".repeat(MAX_INFER_INPUT_BYTES);
+    let n = MAX_INFER_BATCH_TOTAL_BYTES / MAX_INFER_INPUT_BYTES + 1;
+    let inputs: Vec<&str> = vec![chunk.as_str(); n];
+    let err = p.infer_batch(&inputs).unwrap_err();
+    assert_eq!(
+        err,
+        BatchError::TotalInputTooLarge {
+            total: n * MAX_INFER_INPUT_BYTES,
+            limit: MAX_INFER_BATCH_TOTAL_BYTES
+        }
+    );
+    assert_eq!(err.code(), "total_input_too_large");
+    assert_eq!(*calls.borrow(), 0);
+}
+
+struct HugeTokensPre;
+impl Preprocessor for HugeTokensPre {
+    fn preprocess(&self, _input: &str) -> Result<TokenIds, PreprocessError> {
+        Ok(TokenIds::new(vec![1; MAX_INFER_TOKEN_IDS + 1]))
+    }
+}
+
+/// REQ-39: トークン数が上限を超える場合、バックエンドを呼ばずに拒否する。
+#[test]
+fn req39_token_count_limit_rejected_before_backend() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let p = InferencePipeline::new(HugeTokensPre, SpyBackend(seen.clone()));
+    let err = p.infer_one("x").unwrap_err();
+    assert_eq!(
+        err,
+        InferError::TooManyTokens {
+            len: MAX_INFER_TOKEN_IDS + 1,
+            limit: MAX_INFER_TOKEN_IDS
+        }
+    );
+    assert!(seen.borrow().is_empty());
+}
+
+struct FixedBackend(Vec<f64>);
+impl ScoringBackend for FixedBackend {
+    fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// REQ-28: 確率として不正なスコア（範囲外・合計不正）は成功扱いにしない。
+#[test]
+fn req28_invalid_probability_scores_rejected() {
+    for bad in [vec![-0.5, 1.5], vec![0.9, 0.9], vec![0.2, 0.2]] {
+        let p = InferencePipeline::new(TestPreprocessor, FixedBackend(bad));
+        assert_eq!(p.infer_one("x").unwrap_err(), InferError::InvalidScores);
+    }
+}
+
+/// REQ-39: スコア数が上限を超えるバックエンド出力は拒否する。
+#[test]
+fn req39_too_many_scores_rejected() {
+    let n = MAX_INFER_SCORES + 1;
+    let p = InferencePipeline::new(TestPreprocessor, FixedBackend(vec![1.0 / n as f64; n]));
+    assert_eq!(
+        p.infer_one("x").unwrap_err(),
+        InferError::TooManyScores {
+            len: n,
+            limit: MAX_INFER_SCORES
+        }
+    );
+}
+
+/// REQ-39: 結果スコアの総数が上限を超えたら、バッチ全体を失敗とする。
+#[test]
+fn req39_batch_result_retention_limited() {
+    let k = MAX_INFER_SCORES;
+    let p = InferencePipeline::new(TestPreprocessor, FixedBackend(vec![1.0 / k as f64; k]));
+    let n = MAX_INFER_BATCH_TOTAL_SCORES / k + 1;
+    let inputs = vec![""; n];
+    assert_eq!(
+        p.infer_batch(&inputs).unwrap_err(),
+        BatchError::ResultTooLarge {
+            limit: MAX_INFER_BATCH_TOTAL_SCORES
+        }
+    );
+}
