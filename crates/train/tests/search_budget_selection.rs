@@ -773,6 +773,7 @@ fn task18_1_2_validation_split_hash_mismatch_is_rejected_before_training() {
     )
     .unwrap_err();
     assert_eq!(err, SearchError::ValidationSplitHashMismatch);
+    assert_eq!(err.exit_code().code(), 64);
     assert_eq!(runner.calls, 0);
 }
 
@@ -1068,6 +1069,9 @@ fn task18_1_2_non_utf8_validation_input_is_rejected_before_training() {
     let err = run_search(&mut runner, &clock, input).unwrap_err();
     assert_eq!(err, SearchError::ValidationInputNotUtf8 { index: 3 });
     assert_eq!(runner.calls, 0);
+    // `invalid_input`（REQ-21 の 64）へ写る。
+    assert_eq!(err.reason_code(), "invalid_input");
+    assert_eq!(err.exit_code().code(), 64);
 }
 
 /// (T6e・REQ-39・選択肢 2) 1 件あたりの上限（`MAX_INFER_INPUT_BYTES` = 1 MiB）
@@ -1098,6 +1102,8 @@ fn task18_1_2_validation_inputs_exceeding_request_size_are_rejected_before_train
         ),
         "unexpected error: {err:?}"
     );
+    assert_eq!(err.reason_code(), "limit_exceeded");
+    assert_eq!(err.exit_code().code(), 20);
     assert_eq!(runner.calls, 0);
 }
 

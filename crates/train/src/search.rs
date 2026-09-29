@@ -694,6 +694,68 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
 
 impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for SearchError<E> {}
 
+impl<E> SearchError<E> {
+    /// REQ-21 の終了コードへの対応づけ（issue #84 PR #238・選択肢 2。
+    /// UTF-8 でない validation 入力を子プロセス起動前に `invalid_input`〔64〕で
+    /// 拒否する契約を、型で実装する）。
+    ///
+    /// - 資源上限（件数・バイト数）の超過は `LimitExceeded`（20）
+    /// - それ以外の入力検証の違反（空・重複・不一致・UTF-8 でない・凍結済み
+    ///   validation split とのハッシュ不一致等）は `InvalidInput`（64）
+    /// - 学習リクエストの検証エラー・実行の失敗は、内側のエラーの対応づけに従う
+    ///   （実行器のエラー型 `E` は終了コードを持たないため `RuntimeError`）
+    /// - 時計・持ち時間配分・評価器・内部矛盾は `RuntimeError`（70）
+    #[must_use]
+    pub fn exit_code(&self) -> fandhe_edge_core::exitcode::ExitCode {
+        use fandhe_edge_core::exitcode::ExitCode;
+        match self {
+            SearchError::TooManyCandidates { .. }
+            | SearchError::TooManyValidationRecords { .. }
+            | SearchError::TooManyOutcomeCells
+            | SearchError::ValidationRecordIdTooLong { .. }
+            | SearchError::ValidationRecordIdTotalBytesExceeded { .. }
+            | SearchError::ValidationInputTooLarge { .. }
+            | SearchError::ValidationInputTotalBytesExceeded { .. } => ExitCode::LimitExceeded,
+            SearchError::EmptyCandidates
+            | SearchError::EmptyValidation
+            | SearchError::InvalidLabelOrder
+            | SearchError::UnknownValidationGold { .. }
+            | SearchError::ValidationRecordIdCountMismatch { .. }
+            | SearchError::InvalidValidationRecordId { .. }
+            | SearchError::DuplicateValidationRecordId { .. }
+            | SearchError::ValidationInputCountMismatch { .. }
+            | SearchError::ValidationSplitHashMismatch
+            | SearchError::ValidationInputNotUtf8 { .. }
+            | SearchError::InvalidCandidateId { .. }
+            | SearchError::DuplicateCandidateId { .. }
+            | SearchError::LabelOrderMismatch { .. }
+            | SearchError::DuplicateOutDir { .. } => ExitCode::InvalidInput,
+            SearchError::InvalidRequest { source, .. } => source.exit_code(),
+            SearchError::Candidate { source, .. } => match source {
+                CandidateTimeError::Request(e) => e.exit_code(),
+                _ => ExitCode::RuntimeError,
+            },
+            SearchError::OutDirCanonicalizeFailed { .. }
+            | SearchError::Allotment(_)
+            | SearchError::Clock(_)
+            | SearchError::Eval(_)
+            | SearchError::Internal { .. } => ExitCode::RuntimeError,
+        }
+    }
+
+    /// [`exit_code`](Self::exit_code) に対応する機械可読コード
+    /// （`limit_exceeded`・`invalid_input`・`runtime_error`）。
+    #[must_use]
+    pub fn reason_code(&self) -> &'static str {
+        use fandhe_edge_core::exitcode::ExitCode;
+        match self.exit_code() {
+            ExitCode::LimitExceeded => "limit_exceeded",
+            ExitCode::InvalidInput => "invalid_input",
+            _ => "runtime_error",
+        }
+    }
+}
+
 /// 候補 ID の検証（非空・[`MAX_CANDIDATE_ID_BYTES`] 以下・制御文字なし）。
 fn validate_candidate_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_CANDIDATE_ID_BYTES && !id.chars().any(|c| c.is_control())
