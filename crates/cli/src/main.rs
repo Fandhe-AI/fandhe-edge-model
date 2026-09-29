@@ -13,6 +13,7 @@
 //!   ため、完走を装わず `runtime_error`（exit 70）で未実装を返す。
 
 use fandhe_edge_cli::args::{self, Invocation};
+use fandhe_edge_cli::log::StderrLog;
 use fandhe_edge_cli::output::write_error_report;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 
@@ -21,7 +22,11 @@ fn main() -> std::process::ExitCode {
         Ok(Invocation::Help(topic)) => ErrorReport::new(ExitCode::Ok, args::render_help(topic)),
         Ok(Invocation::Run(_)) => {
             // TASK-33.1-2（#136）で各工程を下位層へ接続して置き換える。
-            eprintln!("fandhe-edge: stage execution is not implemented yet (TASK-33.1-2)");
+            // ログは stderr 専用の経路で出す（stdout の JSON と混ぜない。TASK-33.2-2）。
+            // #136 はこの分岐から各工程を呼び、package なら
+            // `stage_output::emit_package_outcome` へ結果を渡す。
+            StderrLog::new(std::io::stderr().lock())
+                .info_top("stage execution is not implemented yet (TASK-33.1-2)");
             ErrorReport::new(
                 ExitCode::RuntimeError,
                 "stage not implemented yet (TASK-33.1-2)",
