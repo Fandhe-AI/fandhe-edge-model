@@ -69,9 +69,11 @@
 //! が要り、ユーザー承認事項）。kill は未回収の直接の子にだけ送り、
 //! `try_wait()` で既に終了していたら kill せず通常経路へ合流する。
 //! キャンセルと壁時計締め切りが同時に成立したらキャンセルを優先する。
-//! kill の送出失敗・回収の確認失敗（上限超過を含む）は `Cancelled` とせず
+//! kill の送出失敗で終了も確認できない場合は `Cancelled` とせず監視を続け、
+//! 壁時計の上限で回収する。SIGKILL 後の回収確認の失敗（上限超過）は
 //! エラーで返し、ジョブは `Failed` になる（生存した子を残したまま終端の
-//! キャンセル完了にしない。REQ-39）。
+//! キャンセル完了にしない。REQ-39）。子の終了・回収後に届いたキャンセルは
+//! 結果の分類を完了して `Completed` を返す（`Cancelling` → `Completed`）。
 //!
 //! 未実装（実装済みを装わない）: supervisor は `SIGKILL` されると後始末を
 //! しないため、予約済み `out_dir`・tmp の残置と、finalize 完了後に kill
@@ -625,6 +627,11 @@ enum CancelStep {
     AlreadyExited(ExitStatus),
     /// `SIGKILL` を送って止めた。
     Cancelled(CancelledRun),
+    /// `kill()` の送出に失敗し、直後の `try_wait()` でも終了を確認できなかった
+    /// （子はまだ生きている可能性がある）。`Child` を drop しても子は止まらない
+    /// ため、呼び出し元は監視を続け、壁時計の上限で改めて回収する
+    /// （codex/review 指摘 P0。REQ-39「資源の上限」）。
+    StillRunning,
 }
 
 /// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収のときに
@@ -647,15 +654,15 @@ fn cancel_child(child: &mut Child, started: Instant) -> Result<CancelStep, Train
             }
         }
     }
-    // 停止・回収を確認できない場合は成功したキャンセルとして返さない
-    // （codex/review 指摘 P0。生存した子を残したまま終端の `Cancelled` へ
-    // 遷移させない。REQ-39「資源の上限」）。`kill()` の失敗も回収の失敗も
-    // エラーとして呼び出し元へ返し、ジョブは `Failed` になる。
-    if let Err(e) = child.kill() {
+    // 停止・回収を確認できない場合は成功したキャンセルとして返さず、生存中の
+    // 子を放置もしない（codex/review 指摘 P0。REQ-39「資源の上限」）。
+    // `kill()` の送出に失敗して終了も確認できないときは `StillRunning` を返し、
+    // 呼び出し元が監視を続けて壁時計の上限で回収する。
+    if child.kill().is_err() {
         // kill 送出に失敗しても、直前に既に終了していた可能性を再確認する。
         return match child.try_wait() {
             Ok(Some(status)) => Ok(CancelStep::AlreadyExited(status)),
-            _ => Err(TrainProcessError::Wait { kind: e.kind() }),
+            _ => Ok(CancelStep::StillRunning),
         };
     }
     let status = wait_after_kill(child)?;
@@ -982,6 +989,11 @@ pub fn run_train_cancellable(
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     stdout_wait = Some(rx.recv_timeout(remaining));
                 }
+                CancelStep::StillRunning => {
+                    // 停止を確認できていない。監視を続け、壁時計の上限まで待つ。
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    stdout_wait = Some(rx.recv_timeout(remaining));
+                }
             }
         }
     }
@@ -1014,6 +1026,15 @@ pub fn run_train_cancellable(
                 CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
                 CancelStep::AlreadyExited(status) => {
                     pre_exited = Some(status);
+                    continue;
+                }
+                CancelStep::StillRunning => {
+                    // 生存中の子の監視を続ける（次の周回で kill を再試行し、
+                    // 壁時計の上限に達すれば `TimedOut` として回収する）。
+                    if Instant::now() >= wait_deadline {
+                        break WaitOutcome::TimedOut;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
                     continue;
                 }
             }
@@ -1121,22 +1142,13 @@ pub fn run_train_cancellable(
     let stderr_wait_budget = deadline
         .saturating_duration_since(Instant::now())
         .min(READER_DRAIN_TIMEOUT);
-    // 待機中もキャンセル要求へ応答するため、短い間隔でトークンを確認する
-    // （codex/review 指摘 P1「標準エラー出力の待機中にキャンセル要求を処理
-    // できない」。REQ-34・#144）。直接の子は既に reap 済みのため、キャンセルは
-    // 送出すべきシグナルの無い `Cancelled`（`child_reaped: true`）として返す
-    // （`Cancelling` からは `Cancelled` 確定も `Completed` も有効遷移）。
+    // 直接の子は既に終了・回収済みで、キャンセルで止めるものが無い。この時点
+    // 以降にキャンセルが要求されても結果の分類を完了して `Completed` を返す
+    // （codex/review 指摘 P1・Bugbot High。正常終了したジョブを `Cancelled` と
+    // 記録しない。`Cancelling` → `Completed` は有効遷移。REQ-34・#144）。
     let stderr_wait_deadline = Instant::now() + stderr_wait_budget;
     let stderr_drain = match stderr_rx {
         Some(rx) => loop {
-            if cancel.is_cancelled() {
-                return Ok(TrainRunEnd::Cancelled(CancelledRun {
-                    elapsed: started.elapsed(),
-                    child_spawned: true,
-                    child_reaped,
-                    signal: None,
-                }));
-            }
             let slice = stderr_wait_deadline
                 .saturating_duration_since(Instant::now())
                 .min(POLL_INTERVAL);
