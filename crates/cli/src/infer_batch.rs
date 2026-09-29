@@ -408,28 +408,38 @@ pub fn predict_batch<P: Preprocessor, B: ScoringBackend>(
 ) -> Result<Vec<Prediction>, ErrorReport> {
     // 推論側へ渡すのは input のみ（id・ラベル・分割情報は渡さない）。
     let inputs: Vec<&str> = records.iter().map(InferInput::input).collect();
-    let predictions = pipeline
-        .infer_batch_until(&inputs, deadline)
-        .map_err(|error| error.to_error_report())?;
-    if predictions.len() != records.len() {
+    // バッチ全体の失敗（期限・上限）は発生位置（処理済み件数）を持つため、それより前の件の失敗と
+    // 入力順で比べる（先に起きた失敗を `?` で上書きしない。REQ-33）。
+    let partial = pipeline.infer_batch_partial_until(&inputs, deadline);
+    let predictions = partial.results;
+    if predictions.len() > records.len() {
         return Err(report(ExitCode::RuntimeError));
     }
-    let mut validated = Vec::with_capacity(records.len());
+    let mut validated = Vec::with_capacity(predictions.len());
     let mut output_bytes: usize = 0;
     for (record, prediction) in records.iter().zip(predictions) {
-        let prediction = prediction.map_err(|error| error.to_error_report())?;
-        let result = judgment_from_prediction(options, record.id(), &prediction)?;
-        let line = result
-            .to_json_line()
-            .map_err(|_| report(ExitCode::RuntimeError))?;
-        // 改行 1 バイトを加える。
-        output_bytes = output_bytes.saturating_add(line.len()).saturating_add(1);
-        if output_bytes > output_byte_limit {
-            return Err(report(ExitCode::LimitExceeded));
-        }
-        validated.push(prediction);
+        let row_outcome = prediction
+            .map_err(|error| error.to_error_report())
+            .and_then(|prediction| {
+                let result = judgment_from_prediction(options, record.id(), &prediction)?;
+                let line = result
+                    .to_json_line()
+                    .map_err(|_| report(ExitCode::RuntimeError))?;
+                // 改行 1 バイトを加える。
+                output_bytes = output_bytes.saturating_add(line.len()).saturating_add(1);
+                if output_bytes > output_byte_limit {
+                    return Err(report(ExitCode::LimitExceeded));
+                }
+                Ok(prediction)
+            });
+        validated.push(row_outcome?);
     }
-    Ok(validated)
+    // 全件の処理済みの各件が成功なら、次の位置で起きたバッチ全体の失敗を採る。
+    match partial.failure {
+        Some(error) => Err(error.to_error_report()),
+        None if validated.len() != records.len() => Err(report(ExitCode::RuntimeError)),
+        None => Ok(validated),
+    }
 }
 
 /// 読み取り・推論・出力量の検証までを行う計算段階。書き込みはしない。

@@ -6,11 +6,12 @@
 
 use fandhe_edge_cli::infer_batch::{
     BatchLimits, emit_infer_batch, emit_infer_batch_with_limits, judgment_from_prediction,
+    predict_batch,
 };
 use fandhe_edge_cli::output::write_ok_judgment;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
+use fandhe_edge_core::infer_input::{InferInput, MAX_INFER_INPUT_BYTES};
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferencePipeline, MAX_INFER_BATCH_LEN, PreprocessError, Preprocessor,
     ScoringBackend, TokenIds,
@@ -18,7 +19,7 @@ use fandhe_edge_runtime::pipeline::{
 use std::io::{self, Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFINITION_JSON: &str = r#"{
   "schema": "fandhe-edge-model-definition/v1",
@@ -661,5 +662,68 @@ fn req39_cli_process_exits_at_deadline_when_inference_stalls() {
     assert!(
         stdout.contains("{\"code\":\"limit_exceeded\""),
         "unexpected stdout: {stdout}"
+    );
+}
+
+/// `f` は推論失敗、`s` は 60 ms 止まる（期限をまたぐ）バックエンド。
+struct FailOrSlow;
+impl ScoringBackend for FailOrSlow {
+    fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+        match ids.as_slice().first().copied() {
+            Some(102) => Err(BackendError::Failed),
+            Some(115) => {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(vec![0.5, 0.25, 0.25])
+            }
+            _ => Ok(vec![0.5, 0.25, 0.25]),
+        }
+    }
+    fn scores_limited(&self, ids: &TokenIds, _limit: Duration) -> Result<Vec<f64>, BackendError> {
+        // テスト用スタブ: 時間上限は対象外のため委譲する。
+        self.scores(ids)
+    }
+}
+
+fn predict_with_deadline(inputs: &[&str], deadline_ms: u64) -> Result<usize, ExitCode> {
+    let definition = definition();
+    let pipeline = InferencePipeline::new(Pre(Arc::new(Mutex::new(Vec::new()))), FailOrSlow);
+    let records: Vec<InferInput> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let line = format!("{{\"id\":\"r{i}\",\"input\":\"{input}\"}}");
+            InferInput::parse(&line, definition.io()).expect("valid record")
+        })
+        .collect();
+    let deadline = Instant::now().checked_add(Duration::from_millis(deadline_ms));
+    predict_batch(
+        &pipeline,
+        definition.options(),
+        &records,
+        deadline,
+        usize::MAX,
+    )
+    .map(|p| p.len())
+    .map_err(|e| e.code)
+}
+
+/// REQ-33: 1 件目が推論失敗、3 件目でバッチ全体の上限（期限）超過なら、入力順で先の 1 件目の
+/// `runtime_error` を採る（後続の `limit_exceeded` に上書きしない）。
+#[test]
+fn req33_earlier_record_failure_wins_over_later_batch_limit() {
+    // r0 は失敗、r1 は 60 ms 止まり期限（30 ms）を超えて、r2 の位置で期限超過になる。
+    assert_eq!(
+        predict_with_deadline(&["f", "s", "a"], 30),
+        Err(ExitCode::RuntimeError)
+    );
+}
+
+/// REQ-33: 1 件目で期限超過、3 件目が推論失敗なら、入力順で先のバッチ全体の失敗
+/// （`limit_exceeded`）を採る。
+#[test]
+fn req33_earlier_batch_limit_wins_over_later_record_failure() {
+    assert_eq!(
+        predict_with_deadline(&["s", "a", "f"], 30),
+        Err(ExitCode::LimitExceeded)
     );
 }

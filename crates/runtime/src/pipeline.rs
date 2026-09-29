@@ -269,6 +269,27 @@ impl fmt::Debug for Prediction {
 /// バッチ推論の戻り値。要素ごとの成否を持つ。
 pub type BatchResult = Vec<Result<Prediction, InferError>>;
 
+/// バッチ推論の部分結果（REQ-33。[`InferencePipeline::infer_batch_partial_until`]）。
+///
+/// `failure` の発生位置は `results.len()` 件目で、それより前の `results` の失敗は入力順で
+/// 先に起きている。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartialBatch {
+    /// 処理済みの先頭からの各件の成否。
+    pub results: BatchResult,
+    /// バッチ全体の失敗（件数・総バイト・スコア総数・期限）。`None` なら全件を処理済み。
+    pub failure: Option<BatchError>,
+}
+
+impl PartialBatch {
+    fn failed_at_start(error: BatchError) -> Self {
+        Self {
+            results: Vec::new(),
+            failure: Some(error),
+        }
+    }
+}
+
 /// 前処理とスコア計算を束ねた推論パイプライン。呼び出し間で状態を持たない。
 pub struct InferencePipeline<P, B> {
     preprocessor: P,
@@ -310,13 +331,34 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
     /// [`Self::infer_batch`] の期限を指定できる版。`deadline` が `None` なら期限なし
     /// （`Instant` の加算がオーバーフローした場合のみ。呼び出し側は通常 `Some` を渡す）。
     /// 期限は各件の処理の前に確認し、超過なら `DeadlineExceeded` を返す。
+    ///
+    /// 処理は [`Self::infer_batch_partial_until`] と同じで、バッチ全体の失敗があれば部分結果を
+    /// 捨てて `Err` にする。
     pub fn infer_batch_until(
         &self,
         inputs: &[&str],
         deadline: Option<Instant>,
     ) -> Result<BatchResult, BatchError> {
+        let partial = self.infer_batch_partial_until(inputs, deadline);
+        match partial.failure {
+            Some(error) => Err(error),
+            None => Ok(partial.results),
+        }
+    }
+
+    /// [`Self::infer_batch_until`] の部分結果を返す版（REQ-33 の「入力順で最初の失敗」を呼び出し側が
+    /// 決めるため。REQ-28: 各件の処理は単体推論と同じ `run_single`）。
+    ///
+    /// `results` は処理済みの先頭からの各件の成否で、`failure` はバッチ全体の失敗（件数・総入力
+    /// バイト・スコア総数・期限）。失敗の発生位置は `results.len()` 件目（0 始まりの index）で、
+    /// それより前の件の失敗は入力順で先に起きたものとして比較できる。
+    pub fn infer_batch_partial_until(
+        &self,
+        inputs: &[&str],
+        deadline: Option<Instant>,
+    ) -> PartialBatch {
         if inputs.len() > MAX_INFER_BATCH_LEN {
-            return Err(BatchError::TooManyInputs {
+            return PartialBatch::failed_at_start(BatchError::TooManyInputs {
                 len: inputs.len(),
                 limit: MAX_INFER_BATCH_LEN,
             });
@@ -325,7 +367,7 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
             .iter()
             .fold(0usize, |acc, x| acc.saturating_add(x.len()));
         if total > MAX_INFER_BATCH_TOTAL_BYTES {
-            return Err(BatchError::TotalInputTooLarge {
+            return PartialBatch::failed_at_start(BatchError::TotalInputTooLarge {
                 total,
                 limit: MAX_INFER_BATCH_TOTAL_BYTES,
             });
@@ -334,24 +376,36 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
         let mut retained_scores = 0usize;
         for input in inputs {
             if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Err(BatchError::DeadlineExceeded);
+                return PartialBatch {
+                    results,
+                    failure: Some(BatchError::DeadlineExceeded),
+                };
             }
             let result = self.run_single(input, None);
-            // 最後の 1 件が期限を超えて完了した場合も成功を返さない。
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Err(BatchError::DeadlineExceeded);
-            }
             if let Ok(p) = &result {
                 retained_scores = retained_scores.saturating_add(p.scores.len());
                 if retained_scores > MAX_INFER_BATCH_TOTAL_SCORES {
-                    return Err(BatchError::ResultTooLarge {
-                        limit: MAX_INFER_BATCH_TOTAL_SCORES,
-                    });
+                    return PartialBatch {
+                        results,
+                        failure: Some(BatchError::ResultTooLarge {
+                            limit: MAX_INFER_BATCH_TOTAL_SCORES,
+                        }),
+                    };
                 }
             }
             results.push(result);
+            // 最後の 1 件が期限を超えて完了した場合も成功を返さない（この件の結果は保持する）。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return PartialBatch {
+                    results,
+                    failure: Some(BatchError::DeadlineExceeded),
+                };
+            }
         }
-        Ok(results)
+        PartialBatch {
+            results,
+            failure: None,
+        }
     }
 
     /// 参考測定（判定に使わない目的）でバッチ API を使うときの入口（REQ-28 境界値・TASK-28.3・#120）。
