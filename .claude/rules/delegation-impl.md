@@ -14,7 +14,7 @@
 | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40）。パス: `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・凍結記録・読み取り専用配置・ハッシュ不一致時の停止・分割記録のレコード内容ハッシュ・来歴の記録型と取り込み記録・データ検査との接続を実装済み） | data-builder | sonnet |
 | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34。Rust / Python）。パス: `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。Rust 側呼び出し元の 学習リクエスト・結果 JSON の型・子プロセス起動と終了コード写像〔#178〕・探索予算内の候補選定〔TASK-18.1・#83・#84〕・選定結果の有意性判定〔TASK-18.3-1・#87〕を実装済み。CLI `train` 工程への配線〔TASK-33.x〕は未着手。issue #177） | trainer-builder | sonnet |
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29）。パス: `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は未実装。TASK-24.1-1・#59） | evaluator-builder | sonnet |
-| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32）。パス: 未確定（後続 TASK で追加） | runtime-builder | sonnet |
+| 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32）。パス: `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目を実装済み・前処理と ONNX 推論は未着手。#117） | runtime-builder | sonnet |
 | 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33）。パス: `crates/cli/`（`fandhe-edge-cli`） | adapter-builder | sonnet |
 | 操作アダプター - TUI・MCP・ガード層（REQ-35/36/37/39）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
 | ルート `Cargo.toml`・`pyproject.toml`・`.github/workflows/`・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | infra-builder | sonnet |
