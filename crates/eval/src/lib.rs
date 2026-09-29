@@ -52,7 +52,8 @@
 //!   候補ごとの生の p 値を、事前登録した族サイズで補正し、判定を出し直す
 //! - [`regression`][]: 旧モデルとの比較による回帰件数（正解→不正解）・
 //!   改善件数（不正解→正解）の算出（REQ-26 正常系・TASK-26.1-1・issue #100）と
-//!   それぞれの Wilson 95% 信頼区間の付与（TASK-26.1-2・issue #101）。
+//!   それぞれの Wilson 95% 信頼区間の付与（TASK-26.1-2・issue #101）、
+//!   ラベル集合相違時の前提明記（TASK-26.2・issue #102）。
 //!   [`significance::is_correct`] と同じ正誤規則・[`mcnemar::paired_counts`]・
 //!   [`wilson`] を再利用し、評価ロジックを層内で再実装しない
 //! - [`reproducibility`][]: 3 seed 以上の Wilson 95% 信頼区間の重なり判定
@@ -97,7 +98,9 @@
 //!   統合は未実装）
 //! - 旧モデルとの回帰件数・改善件数（REQ-26）: 件数の算出（TASK-26.1-1・
 //!   issue #100）・Wilson 95% 信頼区間の付与（TASK-26.1-2・issue #101）は
-//!   実装済み（[`regression`]）。ラベル集合相違の前提明記（TASK-26.2）・
+//!   実装済み（[`regression`]）。ラベル集合相違時の前提明記（TASK-26.2・
+//!   issue #102。`regression::regression_report`）も実装済みで、`merges` による
+//!   予測の写像は未実装。
 //!   作り直し判定（TASK-20.1）との接続・CLI `evaluate`
 //!   工程への配線（issue #140）は未実装
 //! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:

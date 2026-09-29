@@ -457,3 +457,17 @@ fn req39_result_cap_cases_fixture_matches_bound_function() {
         );
     }
 }
+
+/// REQ-39: 評価器（`fandhe-edge-eval`）と学習層のラベル ID 長上限、評価器の行 ID 長上限と
+/// 共通コアの入力 ID 長上限が同値であること（契約値の集約。片方だけの更新を検出する）。
+#[test]
+fn eval_limits_match_train_and_core_limits() {
+    assert_eq!(
+        fandhe_edge_eval::metrics::MAX_LABEL_BYTES,
+        limits::MAX_LABEL_BYTES
+    );
+    assert_eq!(
+        fandhe_edge_eval::regression::MAX_RECORD_ID_BYTES,
+        fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES
+    );
+}
