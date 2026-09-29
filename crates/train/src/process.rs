@@ -2,7 +2,8 @@
 //! REQ-34・REQ-39。issue #178）。
 //!
 //! Rust 側 CLI・ジョブ管理（未配線。TASK-33.x）が、学習ワーカー
-//! （`trainer/launch.py`）を引数リストで子プロセス起動し、壁時計タイムアウト
+//! （`trainer/launch.py`。`train --request <path> --cancel-on-stdin-eof`）を
+//! 引数リストで子プロセス起動し、壁時計タイムアウト
 //! と標準出力／標準エラー出力の読み取り上限を掛けたうえで、
 //! [`crate::result::TrainOutcome::from_worker_stdout`] へ渡して結果を得る
 //! ための型・関数を提供する（[`run_train`] が公開入口）。
@@ -60,25 +61,67 @@
 //! 同根）。[`run_train`] はこの観測を [`WaitOutcome::LateExit`] として
 //! 区別し、`Child::kill()` を呼ばずに `WallTimeout` として扱う。
 //!
-//! # キャンセル（REQ-34・TASK-34.1-1・#144）
+//! # キャンセル（REQ-34・TASK-34.1-1・#144・TASK-34.1-2・#145）
 //!
-//! [`run_train_cancellable`] は [`CancelToken`] が立つと、直接の子
-//! （supervisor）へ `Child::kill()`（`SIGKILL`）を送って回収し
-//! [`TrainRunEnd::Cancelled`] を返す。送るシグナルは std だけで送れる
-//! `SIGKILL` に限る（`SIGTERM` による graceful cancel は `libc`／`unsafe`
-//! が要り、ユーザー承認事項）。kill は未回収の直接の子にだけ送り、
-//! `try_wait()` で既に終了していたら kill せず通常経路へ合流する。
-//! キャンセルと壁時計締め切りが同時に成立したらキャンセルを優先する。
-//! kill の送出失敗で終了も確認できない場合は `Cancelled` とせず監視を続け、
-//! 壁時計の上限で回収する。SIGKILL 後の回収確認の失敗（上限超過）は
-//! エラーで返し、ジョブは `Failed` になる（生存した子を残したまま終端の
-//! キャンセル完了にしない。REQ-39）。子の終了・回収後に届いたキャンセルは
-//! 結果の分類を完了して `Completed` を返す（`Cancelling` → `Completed`）。
+//! [`run_train_cancellable`] は [`CancelToken`] が立つと、まず**協調キャンセル**を
+//! 試み、猶予内に止まらなければ `SIGKILL` にフォールバックする。
 //!
-//! 未実装（実装済みを装わない）: supervisor は `SIGKILL` されると後始末を
-//! しないため、予約済み `out_dir`・tmp の残置と、finalize 完了後に kill
-//! した場合の整合は #145（TASK-34.1-2）で扱う。キャンセルの終了コード写像
-//! は TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
+//! ## 協調キャンセル（std のみ。`SIGTERM` は使わない）
+//!
+//! supervisor は `stdin(Stdio::piped())` で起動し、[`std::process::ChildStdin`]
+//! を実行中ずっと `Child` に持たせる（**途中で drop すると、それだけで
+//! キャンセルになる**）。キャンセル時は stdin を閉じる（EOF）。supervisor は
+//! EOF を受けて自ら worker を止め（`killpg` → 回収）、保持中の fd だけで
+//! `out_dir` の予約を解放して終了する（`supervisor.py` モジュール docstring
+//! 「協調キャンセル」）。猶予は [`RunLimits::cooperative_grace`]（既定
+//! [`crate::limits::COOPERATIVE_CANCEL_GRACE_SECONDS`]）で、常に壁時計の期限より
+//! 内側（`SIGKILL` 経路の回収待ち [`KILL_WAIT_TIMEOUT`] を残す）に切り詰める。
+//! 壁時計の期限が優先する規則は従来どおり。`SIGTERM` による graceful cancel は
+//! `libc`／`unsafe` が要りユーザー承認事項のため使わない。
+//!
+//! ## 整合の要（公開されている ⇔ supervisor が exit 0 と ok JSON を返した）
+//!
+//! supervisor は確定（`rename`）の直前までキャンセルを確認し、確定後に届いた
+//! キャンセルは無視して成功を報告する。Rust 側は stdin を閉じた後も supervisor の
+//! 終了状態と結果 JSON に従って分類する: 成功 JSON なら [`TrainRunEnd::Completed`]
+//! （確定済み。`Cancelling` → `Completed`）、所定のキャンセル応答（exit 70・
+//! `runtime_error`・固定メッセージ）は [`CancelStop::Cooperative`]、別のエラー JSON
+//! （`invalid_request` 等の入力エラー）はキャンセル完了と断定せずエラー結果のまま
+//! [`TrainRunEnd::Completed`] で返す。クラッシュ・終了状態の不整合は
+//! [`CancelStop::Unconfirmed`] とし、[`CancelledRun::out_dir_residue`] で残置を
+//! 報告する（クラッシュを協調完了として隠さない）。`SIGKILL` 後・応答未確認の
+//! いずれでも、`out_dir` が公開済みの可能性（`NonEmpty`）か判定不能（`Unknown`）なら
+//! `Cancelled` とせず [`TrainProcessError::CancelOutcomeUnconfirmed`] を返す
+//! （「公開されている ⇔ 成功報告」の契約。fail-closed）。
+//!
+//! ## 責務分担
+//!
+//! | 項目 | 担当 |
+//! | ---- | ---- |
+//! | `out_dir` の予約・確定・解放（fd 束縛） | `supervisor.py` のみ |
+//! | キャンセル時の worker 停止と予約の解放 | `supervisor.py`（協調経路） |
+//! | キャンセル要求の伝達・猶予の管理・猶予超過時の `SIGKILL` | 本モジュール |
+//! | `Completed`／`Cancelled` の最終判定 | 本モジュール |
+//! | `SIGKILL` フォールバック後の残置の削除 | どちらも行わない（本モジュールは読み取り専用で検査して報告するだけ） |
+//!
+//! ## `SIGKILL` フォールバック（[`CancelStop::ForcedKill`]）
+//!
+//! 猶予内に supervisor が終了しなければ、従来どおり直接の子へ `Child::kill()`
+//! （`SIGKILL`）を送って回収する。kill は未回収の直接の子にだけ送り、
+//! `try_wait()` で既に終了していたら送らず通常経路へ合流する。キャンセルと
+//! 壁時計締め切りが同時に成立したら壁時計を優先する規則（
+//! [`classify_cancel_outcome`]）。kill の送出失敗で終了も確認できない場合は
+//! `Cancelled` とせず監視を続け、壁時計の上限で回収する。回収確認の失敗は
+//! エラーで返し、ジョブは `Failed` になる（REQ-39）。子の終了・回収後に届いた
+//! キャンセルは結果の分類を完了して `Completed` を返す。
+//!
+//! この場合だけ supervisor が後始末できず、空の予約済み `out_dir`（
+//! [`OutDirResidue::EmptyReservation`]）や書きかけの一時ディレクトリ、
+//! 確定直後の窓では公開済みの成果物（[`OutDirResidue::NonEmpty`]）が残りうる。
+//! 本モジュールは [`CancelledRun::out_dir_residue`] で読み取り専用の状態だけ
+//! 報告し、削除・rename はしない。やり直し時の案内・掃除は TASK-34.3・#147、
+//! `job.json` の永続化は TASK-34.2・#146。キャンセルの終了コード写像は
+//! TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
 //!
 //! # windows（対象外・fail-closed）
 //!
@@ -112,7 +155,7 @@ use fandhe_edge_core::exitcode::ExitCode;
 use crate::error::TrainProcessError;
 #[cfg(unix)]
 use crate::limits::MAX_WORKER_STDERR_BYTES;
-use crate::limits::SUPERVISOR_SHUTDOWN_GRACE_SECONDS;
+use crate::limits::{COOPERATIVE_CANCEL_GRACE_SECONDS, SUPERVISOR_SHUTDOWN_GRACE_SECONDS};
 use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
 use crate::time_allotment::CandidateRunner;
@@ -227,6 +270,7 @@ impl WorkerLauncher {
     }
 
     /// このランチャーで起動する固定 argv（`Command::args` へそのまま渡す。
+    /// 末尾に協調キャンセルの `--cancel-on-stdin-eof` を含む。
     /// シェルを介さない。`.claude/rules/security.md`「インジェクション」）。
     /// unix 限定（[`run_train`] 参照）。
     #[cfg(unix)]
@@ -237,6 +281,9 @@ impl WorkerLauncher {
             "train".into(),
             "--request".into(),
             request_path.to_path_buf().into_os_string(),
+            // 協調キャンセルの opt-in（stdin の EOF で supervisor が自ら後始末
+            // する。REQ-34・#145。モジュール doc「キャンセル」）。
+            "--cancel-on-stdin-eof".into(),
         ]
     }
 }
@@ -261,6 +308,8 @@ impl WorkerLauncher {
 #[derive(Debug, Clone, Copy)]
 pub struct RunLimits {
     wall_timeout: Duration,
+    /// 協調キャンセルで supervisor の自己終了を待つ猶予（REQ-34・#145）。
+    cooperative_grace: Duration,
 }
 
 impl RunLimits {
@@ -271,6 +320,7 @@ impl RunLimits {
             .saturating_add(u64::from(SUPERVISOR_SHUTDOWN_GRACE_SECONDS));
         Self {
             wall_timeout: Duration::from_secs(seconds),
+            cooperative_grace: Duration::from_secs(u64::from(COOPERATIVE_CANCEL_GRACE_SECONDS)),
         }
     }
 
@@ -283,12 +333,32 @@ impl RunLimits {
         }
         Ok(Self {
             wall_timeout: timeout,
+            cooperative_grace: self.cooperative_grace,
+        })
+    }
+
+    /// 協調キャンセルの猶予を既定より **短い** 値へ上書きする（テスト用途。
+    /// `SIGKILL` フォールバックの確認を速くする）。0、または現在の猶予以上の
+    /// 場合は `Err`（上限を緩めることはできない）。
+    pub fn with_cooperative_grace(self, grace: Duration) -> Result<Self, TrainProcessError> {
+        if grace.is_zero() || grace >= self.cooperative_grace {
+            return Err(TrainProcessError::InvalidRunLimits);
+        }
+        Ok(Self {
+            wall_timeout: self.wall_timeout,
+            cooperative_grace: grace,
         })
     }
 
     #[must_use]
     pub fn wall_timeout(&self) -> Duration {
         self.wall_timeout
+    }
+
+    /// 協調キャンセルで supervisor の自己終了を待つ猶予。
+    #[must_use]
+    pub fn cooperative_grace(&self) -> Duration {
+        self.cooperative_grace
     }
 }
 
@@ -568,18 +638,57 @@ pub enum TrainRunEnd {
     Cancelled(CancelledRun),
 }
 
+/// キャンセルの止め方（[`CancelledRun::stop`]）。REQ-34・#145。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStop {
+    /// 子プロセスの起動前にキャンセルされた（何も起動していない）。
+    BeforeStart,
+    /// supervisor が stdin の EOF を受けて自ら後始末し、終了した。予約は
+    /// supervisor が fd で解放済みで、公開場所に何も残らない。
+    Cooperative,
+    /// 協調の猶予内に終了せず `SIGKILL` で止めた。supervisor の後始末は走って
+    /// いないため、[`CancelledRun::out_dir_residue`] の状態が残りうる。
+    ForcedKill,
+    /// キャンセル送出後に supervisor が終了したが、所定のキャンセル応答
+    /// （exit 70・`runtime_error`・固定メッセージ）を確認できなかった（クラッシュ・
+    /// 外部からの終了・出力の不整合。`supervisor.py` が予約を解放した証拠が無い）。
+    /// 成果物は確定していないが、[`CancelledRun::out_dir_residue`] に読み取り専用の
+    /// 観測結果を持つ（異常を隠さない。削除はしない。REQ-34・#145）。
+    Unconfirmed,
+}
+
+/// `SIGKILL` フォールバック後の `out_dir` の読み取り専用の観測結果
+/// （[`CancelledRun::out_dir_residue`]）。**削除・rename は一切しない**。
+/// やり直し時の案内・掃除は TASK-34.3・#147。REQ-34。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutDirResidue {
+    /// `out_dir` が存在しない（予約前、または解放済み）。
+    Absent,
+    /// 空のディレクトリが残っている（予約が解放されなかった。成果物は公開されて
+    /// いない証拠）。
+    EmptyReservation,
+    /// 中身のあるディレクトリがある（確定直後にキャンセルされた窓では、公開済みの
+    /// 成果物の可能性）。
+    NonEmpty,
+    /// symlink・ディレクトリ以外・読み取りエラーなど、判定できない。
+    Unknown,
+}
+
 /// キャンセルで止めた実行の診断情報。ワーカーの出力は保持しない
 /// （データ由来の文字列を持たない。`.claude/rules/security.md`）。
 ///
-/// 予約済み `out_dir`・tmp の残置と、finalize 完了後に kill した場合の
-/// 整合は #145（TASK-34.1-2）で扱う。本型は公開場所に何も残らないことを
-/// 主張しない。
+/// [`CancelStop::Cooperative`]・[`CancelStop::BeforeStart`] では公開場所に何も
+/// 残らない（supervisor が fd で解放済み、または起動前）。[`CancelStop::ForcedKill`]
+/// のときだけ supervisor の後始末が走らないため、[`Self::out_dir_residue`] に
+/// 観測結果を持つ（削除はしない。TASK-34.3・#147 が扱う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelledRun {
     elapsed: Duration,
     child_spawned: bool,
     child_reaped: bool,
     signal: Option<i32>,
+    stop: CancelStop,
+    out_dir_residue: Option<OutDirResidue>,
 }
 
 impl CancelledRun {
@@ -591,6 +700,21 @@ impl CancelledRun {
             child_spawned: false,
             child_reaped: true,
             signal: None,
+            stop: CancelStop::BeforeStart,
+            out_dir_residue: None,
+        }
+    }
+
+    /// supervisor が協調キャンセルで自ら終了した場合の結果（REQ-34・#145）。
+    #[cfg(unix)]
+    fn cooperative(elapsed: Duration) -> Self {
+        Self {
+            elapsed,
+            child_spawned: true,
+            child_reaped: true,
+            signal: None,
+            stop: CancelStop::Cooperative,
+            out_dir_residue: None,
         }
     }
 
@@ -613,10 +737,158 @@ impl CancelledRun {
         self.child_reaped
     }
 
-    /// 子を止めたシグナル番号（`SIGKILL` なら `Some(9)`）。
+    /// 子を止めたシグナル番号（`SIGKILL` なら `Some(9)`）。協調キャンセル・
+    /// 起動前キャンセルでは `None`（supervisor が自ら終了した／起動していない）。
     #[must_use]
     pub fn signal(&self) -> Option<i32> {
         self.signal
+    }
+
+    /// どの経路で止めたか。
+    #[must_use]
+    pub fn stop(&self) -> CancelStop {
+        self.stop
+    }
+
+    /// `SIGKILL` フォールバック後・応答未確認（[`CancelStop::Unconfirmed`]）の
+    /// `out_dir` の観測結果。それ以外では `None`（supervisor が解放済み、または起動前で、何も残らない）。
+    #[must_use]
+    pub fn out_dir_residue(&self) -> Option<OutDirResidue> {
+        self.out_dir_residue
+    }
+
+    /// 所定のキャンセル応答を確認できないまま supervisor が終了した場合の結果
+    /// （REQ-34・#145）。残置の観測結果を必ず付ける。
+    #[cfg(unix)]
+    fn unconfirmed(elapsed: Duration, residue: OutDirResidue) -> Self {
+        Self {
+            elapsed,
+            child_spawned: true,
+            child_reaped: true,
+            signal: None,
+            stop: CancelStop::Unconfirmed,
+            out_dir_residue: Some(residue),
+        }
+    }
+
+    /// `ForcedKill` の実行に、`out_dir` の観測結果を付ける。
+    #[cfg(unix)]
+    fn with_out_dir_residue(mut self, residue: OutDirResidue) -> Self {
+        self.out_dir_residue = Some(residue);
+        self
+    }
+}
+
+/// ディレクトリ実体の識別子（`dev`・`ino`）。名前ではなく実体で同一性を判断する
+/// ために使う（REQ-34・#145）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl DirId {
+    /// `path`（symlink は名前解決と同じく辿る）がディレクトリなら、その識別子。
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_dir().then(|| Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// 子プロセスを起動する**前**に記録する、`root` と `out_dir` の親ディレクトリの
+/// 実体（`dev`・`ino`）。supervisor の確定処理は自分が保持する親ディレクトリの
+/// fd に束縛されるが、Rust 側の残置観測は名前で再解決するため、実行中に root が
+/// 改名・差し替えされると、公開済みの実体を見ずに `Absent` と誤観測しうる。
+/// 観測時に再解決した実体がここへ記録した実体と一致する場合だけ、`Absent`・
+/// `EmptyReservation` を「未公開の証拠」として採用する（REQ-34・#145。
+/// fail-closed）。記録できなかった場合は常に不一致（`Unknown`）になる。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct OutDirAnchor {
+    root: Option<DirId>,
+    parent: Option<DirId>,
+}
+
+#[cfg(unix)]
+impl OutDirAnchor {
+    fn paths(request: &TrainRequest) -> (PathBuf, PathBuf) {
+        let root = PathBuf::from(request.root());
+        let mut parent = root.clone();
+        let components = out_dir_components(request);
+        // 最後の構成要素（予約されるディレクトリ自身）を除いたものが親。
+        for part in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(part);
+        }
+        (root, parent)
+    }
+
+    /// 起動前の実体を記録する（読み取りのみ）。
+    fn capture(request: &TrainRequest) -> Self {
+        let (root, parent) = Self::paths(request);
+        Self {
+            root: DirId::of(&root),
+            parent: DirId::of(&parent),
+        }
+    }
+
+    /// 名前を再解決した実体が、記録した実体と一致するか。
+    fn still_matches(&self, request: &TrainRequest) -> bool {
+        let (root, parent) = Self::paths(request);
+        matches!((self.root, DirId::of(&root)), (Some(a), Some(b)) if a == b)
+            && matches!((self.parent, DirId::of(&parent)), (Some(a), Some(b)) if a == b)
+    }
+}
+
+/// 検証（`request.rs`）と同じ規則で正規化した `out_dir` の構成要素。
+#[cfg(unix)]
+fn out_dir_components(request: &TrainRequest) -> Vec<&str> {
+    crate::request::relative_path_components(request.out_dir())
+}
+
+/// 正規化した `out_dir` の絶対パス（`root` 配下）。
+#[cfg(unix)]
+fn out_dir_path(request: &TrainRequest) -> PathBuf {
+    let mut path = PathBuf::from(request.root());
+    for part in out_dir_components(request) {
+        path.push(part);
+    }
+    path
+}
+
+/// `SIGKILL` フォールバック後の `out_dir` を読み取り専用で観測する
+/// （[`OutDirResidue`]）。`symlink_metadata` でディレクトリかを確かめ、`read_dir`
+/// は最初の 1 件だけ読む（件数上限 1。REQ-39）。symlink は辿らず `Unknown`。
+/// **削除・rename はしない**（REQ-34・#145）。
+///
+/// 名前の再解決だけで「未公開」を断定しない**唯一の場所**: root・親ディレクトリの
+/// 実体が起動前の記録（[`OutDirAnchor`]）と一致しなければ `Unknown` を返す。
+#[cfg(unix)]
+fn inspect_out_dir_residue(request: &TrainRequest, anchor: &OutDirAnchor) -> OutDirResidue {
+    if !anchor.still_matches(request) {
+        return OutDirResidue::Unknown;
+    }
+    let path = out_dir_path(request);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OutDirResidue::Absent,
+        Err(_) => return OutDirResidue::Unknown,
+    };
+    if !meta.is_dir() {
+        return OutDirResidue::Unknown;
+    }
+    match std::fs::read_dir(&path) {
+        Ok(mut entries) => match entries.next() {
+            None => OutDirResidue::EmptyReservation,
+            Some(Ok(_)) => OutDirResidue::NonEmpty,
+            Some(Err(_)) => OutDirResidue::Unknown,
+        },
+        Err(_) => OutDirResidue::Unknown,
     }
 }
 
@@ -625,7 +897,11 @@ impl CancelledRun {
 enum CancelStep {
     /// 確認した時点で子は既に終了していた（回収済み。kill していない）。
     AlreadyExited(ExitStatus),
-    /// `SIGKILL` を送って止めた。
+    /// キャンセル用パイプを閉じた後、`kill` を送らずに猶予内で自ら終了した
+    /// （回収済み。協調キャンセル。REQ-34・#145）。呼び出し元は通常の結果分類へ
+    /// 合流し、成功 JSON なら `Completed`、キャンセル応答なら `Cancelled(Cooperative)`、それ以外は `Cancelled(Unconfirmed)`。
+    ExitedAfterSignal(ExitStatus),
+    /// 協調の猶予内に終了せず `SIGKILL` を送って止めた。
     Cancelled(CancelledRun),
     /// `kill()` の送出に失敗し、直後の `try_wait()` でも終了を確認できなかった
     /// （子はまだ生きている可能性がある）。`Child` を drop しても子は止まらない
@@ -650,6 +926,8 @@ struct Reaped {
     /// 回収までに自分の `kill()` が成功したか。失敗した・kill 前に終了していた
     /// 場合の `SIGKILL` 終了は外部由来の可能性があり `Cancelled` にしない。
     kill_delivered: bool,
+    /// キャンセル用パイプを閉じ済みか（協調キャンセルを送出したか）。
+    cancel_signalled: bool,
 }
 
 /// キャンセル結末の分類。キャンセルと壁時計期限の優先規則を持つ**唯一**の
@@ -660,9 +938,12 @@ struct Reaped {
 /// - 回収を確認できなかった: `WallDeadline { child_reaped: false }`
 /// - 期限以後に回収した（キャンセル要求が先でも）: `WallDeadline { child_reaped: true }`
 /// - 期限前に回収し、自分の kill が成功して `SIGKILL` 終了だった: `Cancelled`
-/// - 期限前に回収したが、自然終了・外部由来の `SIGKILL`（kill 失敗・kill 前に
-///   終了）だった: `AlreadyExited`（通常の結果分類へ戻す。成功した学習を `Cancelled` と
-///   誤記録しない）
+///   （[`CancelStop::ForcedKill`]）
+/// - 期限前に回収し、上記でなく、キャンセル用パイプを閉じた後に終了した:
+///   `ExitedAfterSignal`（協調）
+/// - 期限前に回収したが、パイプを閉じる前の終了・外部由来の `SIGKILL`（kill 失敗・
+///   kill 前に終了）だった: `AlreadyExited`（通常の結果分類へ戻す。成功した学習を
+///   `Cancelled` と誤記録しない）
 ///
 /// `Cancelled` は自分の `kill()` の成功（`kill_delivered`）を条件にする。
 #[cfg(unix)]
@@ -677,35 +958,44 @@ fn classify_cancel_outcome(
             child_reaped: false,
         },
         Some(r) if r.at >= wall_deadline => CancelStep::WallDeadline { child_reaped: true },
-        Some(r) if !r.kill_delivered || r.status.signal() != Some(SIGKILL) => {
-            CancelStep::AlreadyExited(r.status)
+        Some(r) if r.kill_delivered && r.status.signal() == Some(SIGKILL) => {
+            CancelStep::Cancelled(CancelledRun {
+                elapsed: started.elapsed(),
+                child_spawned: true,
+                child_reaped: true,
+                signal: r.status.signal(),
+                stop: CancelStop::ForcedKill,
+                out_dir_residue: None,
+            })
         }
-        Some(r) => CancelStep::Cancelled(CancelledRun {
-            elapsed: started.elapsed(),
-            child_spawned: true,
-            child_reaped: true,
-            signal: r.status.signal(),
-        }),
+        Some(r) if r.cancel_signalled => CancelStep::ExitedAfterSignal(r.status),
+        Some(r) => CancelStep::AlreadyExited(r.status),
     }
 }
 
-/// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収のときに
-/// 限り kill（`SIGKILL`）を送って回収する。既に回収済みの子へ kill を送らない
-/// （pid 再利用で無関係なプロセスを止めない。モジュール doc「完了検知・
-/// タイムアウト時の回収順序」と同じ不変条件）。子孫は lifeline に委ねる。
-/// 待機エラー・回収失敗でも `Child` を手放さず壁時計の期限まで再試行し、
-/// 結末は [`classify_cancel_outcome`] で 1 か所で決める。
+/// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収なら**協調
+/// キャンセル**（キャンセル用パイプを閉じ、`min(coop_grace, 壁時計の期限から
+/// [`KILL_WAIT_TIMEOUT`] を遡った時刻)` まで supervisor の自己終了を待つ。
+/// REQ-34・#145）を試み、終了しなければ kill（`SIGKILL`）を送って回収する。
+/// 既に回収済みの子へ kill を送らない（pid 再利用で無関係なプロセスを止めない。
+/// モジュール doc「完了検知・タイムアウト時の回収順序」と同じ不変条件）。子孫は
+/// lifeline に委ねる。待機エラー・回収失敗でも `Child` を手放さず壁時計の期限まで
+/// 再試行し、結末は [`classify_cancel_outcome`] で 1 か所で決める。
 /// `final_grace` は期限後の最後の回収待ち（通常は [`KILL_WAIT_TIMEOUT`]）。
+/// `cancel_signalled` は呼び出しをまたいで持ち回る単調な状態（一度パイプを閉じたら
+/// 戻さず、再入時は協調を繰り返さず kill へ進む）。
 #[cfg(unix)]
 fn cancel_child<C: ChildControl>(
     child: &mut C,
     started: Instant,
     wall_deadline: Instant,
     final_grace: Duration,
+    coop_grace: Duration,
+    cancel_signalled: &mut bool,
 ) -> CancelStep {
     // キャンセル処理全体の待機を `min(KILL_WAIT_TIMEOUT, 壁時計の残り)` で
     // 抑える（REQ-39「資源の上限」）。
-    let deadline = bounded_deadline(Instant::now(), wall_deadline);
+    let mut deadline = bounded_deadline(Instant::now(), wall_deadline);
     // kill 成功の記録。全経路・全再試行で持ち回る単調な状態（`ensure_reaped` へ
     // `&mut` で渡し、戻り値で上書きしない）。
     let mut kill_delivered = false;
@@ -715,14 +1005,42 @@ fn cancel_child<C: ChildControl>(
                 status,
                 at: Instant::now(),
                 kill_delivered: false,
+                cancel_signalled: *cancel_signalled,
             });
             return classify_cancel_outcome(reaped, wall_deadline, started);
         }
         Ok(None) => {}
         Err(_) => {
-            let reaped = ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered);
+            let reaped =
+                ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered).map(|r| {
+                    Reaped {
+                        cancel_signalled: *cancel_signalled,
+                        ..r
+                    }
+                });
             return classify_cancel_outcome(reaped, wall_deadline, started);
         }
+    }
+    // 協調キャンセル。待ちの上限は壁時計の期限から `KILL_WAIT_TIMEOUT` を遡った
+    // 時刻で切り詰める（フォールバックの `SIGKILL` 経路の回収待ちを壁時計の内側に
+    // 残す。さもないと、協調しない supervisor では常に期限以後の回収になり
+    // `Cancelled` でなく `WallTimeout` になってしまう。壁時計優先の規則は不変）。
+    if !*cancel_signalled && child.close_cancel_channel() {
+        *cancel_signalled = true;
+        let now = Instant::now();
+        let coop_deadline =
+            (now + coop_grace).min(wall_deadline.checked_sub(KILL_WAIT_TIMEOUT).unwrap_or(now));
+        if let Ok(Some(status)) = poll_wait_bounded(child, coop_deadline) {
+            let reaped = Some(Reaped {
+                status,
+                at: Instant::now(),
+                kill_delivered: false,
+                cancel_signalled: true,
+            });
+            return classify_cancel_outcome(reaped, wall_deadline, started);
+        }
+        // 猶予内に終了しなかった（または `try_wait()` が失敗した）: `SIGKILL` へ。
+        deadline = bounded_deadline(Instant::now(), wall_deadline);
     }
     // `kill()` の送出に失敗して終了も確認できないときは `StillRunning` を返し、
     // 呼び出し元が監視を続けて壁時計の上限で回収する。
@@ -734,6 +1052,7 @@ fn cancel_child<C: ChildControl>(
                     status,
                     at: Instant::now(),
                     kill_delivered: false,
+                    cancel_signalled: *cancel_signalled,
                 });
                 classify_cancel_outcome(reaped, wall_deadline, started)
             }
@@ -746,8 +1065,14 @@ fn cancel_child<C: ChildControl>(
             status,
             at: Instant::now(),
             kill_delivered,
+            cancel_signalled: *cancel_signalled,
         }),
-        None => ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered),
+        None => {
+            ensure_reaped(child, wall_deadline, final_grace, &mut kill_delivered).map(|r| Reaped {
+                cancel_signalled: *cancel_signalled,
+                ..r
+            })
+        }
     };
     classify_cancel_outcome(reaped, wall_deadline, started)
 }
@@ -795,6 +1120,10 @@ fn cancel_applies(now: Instant, deadline: Instant, cancel: &CancelToken) -> bool
 trait ChildControl {
     fn kill(&mut self) -> std::io::Result<()>;
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+    /// キャンセル用パイプ（supervisor の stdin）を閉じる（協調キャンセルの
+    /// 要求。REQ-34・#145）。閉じられたら `true`、既に閉じ済み・無い場合は
+    /// `false`（呼び出し元は協調を諦めて `SIGKILL` へ進む）。
+    fn close_cancel_channel(&mut self) -> bool;
 }
 
 #[cfg(unix)]
@@ -804,6 +1133,10 @@ impl ChildControl for Child {
     }
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         Child::try_wait(self)
+    }
+    fn close_cancel_channel(&mut self) -> bool {
+        // `ChildStdin` を drop すると書き込み端が閉じ、supervisor は EOF を観測する。
+        self.stdin.take().is_some()
     }
 }
 
@@ -831,6 +1164,7 @@ fn ensure_reaped<C: ChildControl>(
                 status,
                 at: Instant::now(),
                 kill_delivered: *kill_delivered,
+                cancel_signalled: false,
             });
         }
         if Instant::now() >= retry_until {
@@ -846,6 +1180,7 @@ fn ensure_reaped<C: ChildControl>(
                 status,
                 at: Instant::now(),
                 kill_delivered: *kill_delivered,
+                cancel_signalled: false,
             });
         }
         if Instant::now() >= grace_deadline {
@@ -1128,7 +1463,11 @@ pub fn run_train_cancellable(
         .args(launcher.argv(&guard.path))
         .env_clear()
         .current_dir(job_dir)
-        .stdin(Stdio::null())
+        // キャンセル用パイプ（協調キャンセル。REQ-34・#145）。書き込み端
+        // （`ChildStdin`）は `Child` が実行中ずっと保持し、`cancel_child` だけが
+        // 閉じる。途中で drop すると、それだけで supervisor がキャンセル扱いに
+        // なるため、`Child::stdin` を取り出して別の場所へ動かさない。
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for key in ENV_ALLOWLIST {
@@ -1144,6 +1483,9 @@ pub fn run_train_cancellable(
     if cancel.is_cancelled() {
         return Ok(TrainRunEnd::Cancelled(CancelledRun::before_start()));
     }
+    // 残置観測の同一性確認用に、起動前の root・親ディレクトリの実体を記録する
+    // （REQ-34・#145）。
+    let anchor = OutDirAnchor::capture(request);
     let mut child = command
         .spawn()
         .map_err(|e| TrainProcessError::Spawn { kind: e.kind() })?;
@@ -1165,6 +1507,10 @@ pub fn run_train_cancellable(
     // 反応できるよう、待ちを [`POLL_INTERVAL`] 刻みに分割し、各刻みで
     // トークンを確認する（壁時計の上限そのものは緩めない）。
     let mut pre_exited: Option<ExitStatus> = None;
+    // キャンセル用パイプを閉じたか（協調キャンセルを送出したか）。閉じた後は、
+    // supervisor の終了状態と結果 JSON に従って `Completed`／`Cancelled` を決める。
+    let mut cancel_signalled = false;
+    let cooperative_grace = limits.cooperative_grace();
     let mut stdout_wait = None;
     if let Some(rx) = stdout_rx.as_ref() {
         // キャンセルは各刻みで確認する。`StillRunning`（kill 送出失敗で停止を
@@ -1174,11 +1520,23 @@ pub fn run_train_cancellable(
             // 壁時計の期限後に観測したキャンセルは採用しない（期限超過を
             // `Cancelled` で隠さない。codex/review 指摘 P1。REQ-39）。
             if pre_exited.is_none() && cancel_applies(Instant::now(), deadline, cancel) {
-                match cancel_child(&mut child, started, deadline, KILL_WAIT_TIMEOUT) {
-                    CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
-                    // キャンセルが間に合わず子は既に終了していた（kill しない）。
-                    // 通常経路へ合流し、stdout を締め切りまで待つ。
-                    CancelStep::AlreadyExited(status) => pre_exited = Some(status),
+                match cancel_child(
+                    &mut child,
+                    started,
+                    deadline,
+                    KILL_WAIT_TIMEOUT,
+                    cooperative_grace,
+                    &mut cancel_signalled,
+                ) {
+                    CancelStep::Cancelled(run) => {
+                        return forced_kill_run(run, request, &anchor).map(TrainRunEnd::Cancelled);
+                    }
+                    // キャンセルが間に合わず子は既に終了していた（kill しない）、
+                    // または協調キャンセルで自ら終了した。通常経路へ合流し、
+                    // stdout を締め切りまで待つ。
+                    CancelStep::AlreadyExited(status) | CancelStep::ExitedAfterSignal(status) => {
+                        pre_exited = Some(status);
+                    }
                     CancelStep::StillRunning => {}
                     CancelStep::WallDeadline { child_reaped } => {
                         return Err(wall_timeout_error(limits, child_reaped));
@@ -1219,9 +1577,18 @@ pub fn run_train_cancellable(
         // キャンセルより壁時計超過（`WallTimeout`）を優先し、超過を
         // `Cancelled` で隠さない（codex/review 指摘 P1。REQ-39）。
         if cancel_applies(Instant::now(), wait_deadline, cancel) {
-            match cancel_child(&mut child, started, wait_deadline, KILL_WAIT_TIMEOUT) {
-                CancelStep::Cancelled(run) => return Ok(TrainRunEnd::Cancelled(run)),
-                CancelStep::AlreadyExited(status) => {
+            match cancel_child(
+                &mut child,
+                started,
+                wait_deadline,
+                KILL_WAIT_TIMEOUT,
+                cooperative_grace,
+                &mut cancel_signalled,
+            ) {
+                CancelStep::Cancelled(run) => {
+                    return forced_kill_run(run, request, &anchor).map(TrainRunEnd::Cancelled);
+                }
+                CancelStep::AlreadyExited(status) | CancelStep::ExitedAfterSignal(status) => {
                     pre_exited = Some(status);
                     continue;
                 }
@@ -1312,6 +1679,175 @@ pub fn run_train_cancellable(
         });
     }
 
+    let finished = finish_run(FinishInput {
+        status,
+        started,
+        deadline,
+        stdout_wait,
+        stderr_rx,
+        child_reaped,
+        limits,
+        request,
+    });
+    conclude_run(finished, cancel_signalled, started, request, &anchor)
+}
+
+/// `SIGKILL` フォールバックの `Cancelled` に `out_dir` の読み取り専用の観測結果を
+/// 付ける（削除はしない。REQ-34・#145）。
+///
+/// 「公開されている ⇔ 成功報告」の契約を守るため、公開済みの可能性がある
+/// （[`OutDirResidue::NonEmpty`]）か公開状態を判定できない（[`OutDirResidue::Unknown`]）
+/// 場合は `Cancelled` と断定せず [`TrainProcessError::CancelOutcomeUnconfirmed`] で返す
+/// （成功応答を受け取る前に強制停止したため成功とも言えない。fail-closed。
+/// codex/review 指摘 P1）。
+#[cfg(unix)]
+fn forced_kill_run(
+    run: CancelledRun,
+    request: &TrainRequest,
+    anchor: &OutDirAnchor,
+) -> Result<CancelledRun, TrainProcessError> {
+    let residue = inspect_out_dir_residue(request, anchor);
+    ensure_not_published(residue)?;
+    Ok(run.with_out_dir_residue(residue))
+}
+
+/// 残置の観測結果が「未公開」（`Absent`・`EmptyReservation`）と確認できる場合だけ
+/// `Ok`。公開済みの可能性・判定不能ならキャンセル完了と断定しない。
+#[cfg(unix)]
+fn ensure_not_published(residue: OutDirResidue) -> Result<(), TrainProcessError> {
+    match residue {
+        OutDirResidue::Absent | OutDirResidue::EmptyReservation => Ok(()),
+        OutDirResidue::NonEmpty | OutDirResidue::Unknown => {
+            Err(TrainProcessError::CancelOutcomeUnconfirmed { residue })
+        }
+    }
+}
+
+/// 子の終了・回収後の結果分類（[`finish_run`]）の入力。
+#[cfg(unix)]
+struct FinishInput<'a> {
+    status: Option<ExitStatus>,
+    started: Instant,
+    deadline: Instant,
+    stdout_wait: Option<Result<DrainedOutput, mpsc::RecvTimeoutError>>,
+    stderr_rx: Option<mpsc::Receiver<DrainedOutput>>,
+    child_reaped: bool,
+    limits: &'a RunLimits,
+    request: &'a TrainRequest,
+}
+
+/// 協調キャンセル後の最終判定（`Completed`／`Cancelled` を決める唯一の場所。
+/// REQ-34・#145）。
+///
+/// パイプを閉じていない（`cancel_signalled == false`）なら従来どおり。閉じた後は、
+/// supervisor の報告に従う: 成功 JSON は確定済みなので `Completed`、所定の
+/// キャンセル応答（[`is_cancel_ack`]）は `Cancelled(Cooperative)`、別のエラー JSON
+/// （`invalid_request` 等）は `Completed`（エラー結果のまま保持。キャンセル完了と
+/// 断定しない）、クラッシュ・終了状態の不整合は `Cancelled(Unconfirmed)` で
+/// 残置を観測して報告する（予約解放の証拠が無い）。残置が公開済み・判定不能なら
+/// `Cancelled` とせず [`TrainProcessError::CancelOutcomeUnconfirmed`]。壁時計超過（`WallTimeout`）はキャンセルより優先し、
+/// 従来どおりエラーで返す。
+#[cfg(unix)]
+fn conclude_run(
+    finished: Result<TrainRun, TrainProcessError>,
+    cancel_signalled: bool,
+    started: Instant,
+    request: &TrainRequest,
+    anchor: &OutDirAnchor,
+) -> Result<TrainRunEnd, TrainProcessError> {
+    // 所定のキャンセル応答でない終了は `Unconfirmed` とし、残置を観測して報告する
+    // （supervisor のクラッシュ等を協調キャンセル完了として扱わない）。
+    let unconfirmed = || {
+        let residue = inspect_out_dir_residue(request, anchor);
+        ensure_not_published(residue)?;
+        Ok(TrainRunEnd::Cancelled(CancelledRun::unconfirmed(
+            started.elapsed(),
+            residue,
+        )))
+    };
+    match finished {
+        Ok(run) if !cancel_signalled || matches!(run.outcome, TrainOutcome::Ok(_)) => {
+            Ok(TrainRunEnd::Completed(run))
+        }
+        // 応答の文面だけでは supervisor 自身の応答と、worker が転送したエラー JSON を
+        // 区別できない（JSON 契約は変えない）。そのため文面が一致しても、公開場所に
+        // 何も残っていない（`Absent`）ことを観測できたときだけ `Cooperative` とする。
+        // 残置があれば通常の `Unconfirmed` 経路（公開済み・判定不能ならエラー）へ回す
+        // （fail-closed。REQ-34・#145）。
+        Ok(run) if is_cancel_ack(&run) => {
+            if inspect_out_dir_residue(request, anchor) == OutDirResidue::Absent {
+                Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
+                    started.elapsed(),
+                )))
+            } else {
+                unconfirmed()
+            }
+        }
+        // supervisor が予約の解放を確認できなかった旨の報告は、通常の失敗として
+        // 隠さず `Unconfirmed` 経路で残置を観測する（公開済み・判定不能なら
+        // `CancelOutcomeUnconfirmed`。REQ-34・#145）。
+        Ok(run) if is_cleanup_incomplete(&run) => unconfirmed(),
+        // supervisor が返したキャンセル応答以外のエラー結果（`invalid_request` 等の
+        // 入力エラーを含む）は隠さず、そのまま呼び出し元へ返す（キャンセル要求後に
+        // 検証が先に失敗した場合の入力エラーを保持する。codex/review 指摘 P1）。
+        Ok(run) => Ok(TrainRunEnd::Completed(run)),
+        Err(e @ TrainProcessError::WallTimeout { .. }) => Err(e),
+        Err(_) if cancel_signalled => unconfirmed(),
+        Err(e) => Err(e),
+    }
+}
+
+/// `supervisor.py::_report_cancelled` の所定のキャンセル応答（exit 70・
+/// `runtime_error`・固定メッセージ）か。これだけが「supervisor が予約を解放して
+/// 終了した」証拠になる（REQ-34・#145）。
+#[cfg(unix)]
+fn is_cancel_ack(run: &TrainRun) -> bool {
+    run.exit_code == ExitCode::RuntimeError
+        && matches!(
+            &run.outcome,
+            TrainOutcome::Error(f)
+                if f.failure_code() == crate::result::FailureCode::RuntimeError
+                    && f.message() == CANCEL_ACK_MESSAGE
+        )
+}
+
+/// `supervisor.py::_report_cancelled` が出す固定メッセージ（両側で一致させる）。
+#[cfg(unix)]
+const CANCEL_ACK_MESSAGE: &str = "training cancelled by caller";
+
+/// `supervisor.py::_report_cancelled` が予約の解放を確認できなかったときに出す
+/// 固定メッセージ（両側で一致させる）。
+#[cfg(unix)]
+const CANCEL_CLEANUP_INCOMPLETE_MESSAGE: &str = "training cancelled but cleanup incomplete";
+
+/// supervisor が「キャンセルしたが予約の解放を確認できなかった」と報告したか。
+#[cfg(unix)]
+fn is_cleanup_incomplete(run: &TrainRun) -> bool {
+    run.exit_code == ExitCode::RuntimeError
+        && matches!(
+            &run.outcome,
+            TrainOutcome::Error(f)
+                if f.failure_code() == crate::result::FailureCode::RuntimeError
+                    && f.message() == CANCEL_CLEANUP_INCOMPLETE_MESSAGE
+        )
+}
+
+/// 子（supervisor）の終了・回収後に、標準出力・標準エラー出力・終了コードを
+/// 検証して [`TrainRun`] を得る（[`run_train_cancellable`] の後半。協調キャンセルの
+/// 最終判定 [`conclude_run`] から切り離すために関数化した。挙動は #144 から不変）。
+#[cfg(unix)]
+fn finish_run(input: FinishInput<'_>) -> Result<TrainRun, TrainProcessError> {
+    let FinishInput {
+        status,
+        started,
+        deadline,
+        stdout_wait,
+        stderr_rx,
+        child_reaped,
+        limits,
+        request,
+    } = input;
+
     let status = status.expect("status must be Some when timed_out is false");
     let elapsed = started.elapsed();
 
@@ -1389,13 +1925,13 @@ pub fn run_train_cancellable(
     let process_exit = classify_process_exit_status(status)?;
     let outcome = classify_exit(process_exit, &stdout_drain.kept, request)?;
 
-    Ok(TrainRunEnd::Completed(TrainRun {
+    Ok(TrainRun {
         outcome,
         exit_code: process_exit,
         elapsed,
         worker_stderr,
         stderr_truncated,
-    }))
+    })
 }
 
 /// [`run_train_cancellable`] を、キャンセルされない前提で呼ぶ従来の入口
@@ -1503,7 +2039,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let started = Instant::now();
-        let r = cancel_child(
+        let r = cancel_plain(
             &mut child,
             started,
             started + Duration::from_millis(200),
@@ -1530,10 +2066,30 @@ mod tests {
         always_err: bool,
         /// この時刻以後の `try_wait()` は `SIGKILL` 終了を返す。
         reap_at: Option<Instant>,
+        /// キャンセル用パイプを持つか（`true` のとき最初の
+        /// `close_cancel_channel()` が `true` を返す）。
+        has_cancel_channel: bool,
+        /// `close_cancel_channel()` が成功した回数。
+        channel_closes: usize,
+        /// この時刻以後の `try_wait()` は、パイプを閉じていれば正常終了
+        /// （`exit(0)`）を返す（協調キャンセルで自ら終了する子を模す）。
+        exit_after_close_at: Option<Instant>,
+        /// `kill()` が 1 回以上呼ばれた後の `try_wait()` は `SIGKILL` 終了を返す
+        /// （時刻に依存せず、協調しない子を決定的に模す）。
+        reap_on_kill: bool,
     }
 
     #[cfg(unix)]
     impl ChildControl for FakeChild {
+        fn close_cancel_channel(&mut self) -> bool {
+            if self.has_cancel_channel {
+                self.has_cancel_channel = false;
+                self.channel_closes += 1;
+                true
+            } else {
+                false
+            }
+        }
         fn kill(&mut self) -> std::io::Result<()> {
             self.kills += 1;
             if self.kill_results.is_empty() {
@@ -1547,13 +2103,40 @@ mod tests {
                 Err(io_err())
             } else if !self.wait_results.is_empty() {
                 self.wait_results.remove(0)
-            } else if self.reap_at.is_some_and(|t| Instant::now() >= t) {
+            } else if self.channel_closes > 0
+                && self
+                    .exit_after_close_at
+                    .is_some_and(|t| Instant::now() >= t)
+            {
+                use std::os::unix::process::ExitStatusExt;
+                Ok(Some(ExitStatus::from_raw(0)))
+            } else if (self.reap_on_kill && self.kills > 0)
+                || self.reap_at.is_some_and(|t| Instant::now() >= t)
+            {
                 use std::os::unix::process::ExitStatusExt;
                 Ok(Some(ExitStatus::from_raw(SIGKILL)))
             } else {
                 Ok(None)
             }
         }
+    }
+
+    /// 協調キャンセルを使わない従来の呼び出し（パイプ無し）。
+    #[cfg(unix)]
+    fn cancel_plain<C: ChildControl>(
+        child: &mut C,
+        started: Instant,
+        wall_deadline: Instant,
+        final_grace: Duration,
+    ) -> CancelStep {
+        cancel_child(
+            child,
+            started,
+            wall_deadline,
+            final_grace,
+            Duration::ZERO,
+            &mut false,
+        )
     }
 
     #[cfg(unix)]
@@ -1573,6 +2156,7 @@ mod tests {
             kills: 0,
             always_err: false,
             reap_at: None,
+            ..FakeChild::default()
         };
         let r = ensure_reaped(
             &mut c,
@@ -1594,6 +2178,7 @@ mod tests {
             kills: 0,
             always_err: false,
             reap_at: None,
+            ..FakeChild::default()
         };
         let started = Instant::now();
         let r = ensure_reaped(
@@ -1619,6 +2204,7 @@ mod tests {
             kills: 0,
             always_err: false,
             reap_at: None,
+            ..FakeChild::default()
         };
         assert!(reap_after_wall_timeout(&mut ok, Duration::from_millis(500)));
         assert!(ok.kills >= 2);
@@ -1628,6 +2214,7 @@ mod tests {
             kills: 0,
             always_err: false,
             reap_at: None,
+            ..FakeChild::default()
         };
         assert!(!reap_after_wall_timeout(
             &mut never,
@@ -1646,7 +2233,7 @@ mod tests {
             reap_at: Some(started),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_secs(30),
@@ -1666,7 +2253,7 @@ mod tests {
             reap_at: Some(started + Duration::from_millis(250)),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_millis(100),
@@ -1688,7 +2275,7 @@ mod tests {
             always_err: true,
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_millis(100),
@@ -1714,7 +2301,7 @@ mod tests {
             reap_at: Some(started + Duration::from_millis(250)),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_millis(100),
@@ -1736,7 +2323,7 @@ mod tests {
             reap_at: Some(started),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_secs(30),
@@ -1757,7 +2344,7 @@ mod tests {
             reap_at: Some(started),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_secs(30),
@@ -1779,13 +2366,678 @@ mod tests {
             reap_at: Some(started),
             ..FakeChild::default()
         };
-        let step = cancel_child(
+        let step = cancel_plain(
             &mut c,
             started,
             started + Duration::from_secs(30),
             Duration::from_millis(100),
         );
         assert!(matches!(step, CancelStep::Cancelled(_)));
+    }
+
+    /// REQ-34・#145: `classify_cancel_outcome` の全セル
+    /// （回収なし・期限前後 × kill 成功 × パイプを閉じたか × `SIGKILL` 終了か）。
+    #[cfg(unix)]
+    #[test]
+    fn classify_cancel_outcome_table() {
+        use std::os::unix::process::ExitStatusExt;
+        #[derive(Debug, PartialEq)]
+        enum K {
+            WallReaped,
+            WallNotReaped,
+            Forced,
+            Coop,
+            Already,
+        }
+        fn kind(step: CancelStep) -> K {
+            match step {
+                CancelStep::WallDeadline { child_reaped: true } => K::WallReaped,
+                CancelStep::WallDeadline {
+                    child_reaped: false,
+                } => K::WallNotReaped,
+                CancelStep::Cancelled(run) => {
+                    assert_eq!(run.stop(), CancelStop::ForcedKill);
+                    assert_eq!(run.signal(), Some(SIGKILL));
+                    K::Forced
+                }
+                CancelStep::ExitedAfterSignal(_) => K::Coop,
+                CancelStep::AlreadyExited(_) => K::Already,
+                CancelStep::StillRunning => panic!("StillRunning is not a classification"),
+            }
+        }
+        let started = Instant::now();
+        let wall = started + Duration::from_secs(30);
+        let before = started;
+        let after = wall + Duration::from_secs(1);
+        assert_eq!(
+            kind(classify_cancel_outcome(None, wall, started)),
+            K::WallNotReaped
+        );
+        for (raw, kill_delivered, signalled, at, expected) in [
+            // 期限以後の回収は常に壁時計超過。
+            (9, true, true, after, K::WallReaped),
+            (0, false, true, after, K::WallReaped),
+            // 自分の kill が成功して SIGKILL 終了: ForcedKill（パイプの有無によらず）。
+            (9, true, true, before, K::Forced),
+            (9, true, false, before, K::Forced),
+            // パイプを閉じた後に kill を送らず終了: 協調。
+            (0, false, true, before, K::Coop),
+            // kill 成功後に SIGKILL 以外で終了（kill と自己終了の競合）: 協調。
+            (0, true, true, before, K::Coop),
+            // パイプを閉じる前の終了: 従来どおり AlreadyExited。
+            (0, false, false, before, K::Already),
+            // 外部由来の SIGKILL（kill 未送出）: パイプを閉じていなければ AlreadyExited。
+            (9, false, false, before, K::Already),
+            // kill 成功でも SIGKILL 終了でなくパイプ未送出: AlreadyExited。
+            (0, true, false, before, K::Already),
+            // 外部由来の SIGKILL でもパイプを閉じ済みなら協調側（Cancelled にしない）。
+            (9, false, true, before, K::Coop),
+        ] {
+            let reaped = Reaped {
+                status: ExitStatus::from_raw(raw),
+                at,
+                kill_delivered,
+                cancel_signalled: signalled,
+            };
+            assert_eq!(
+                kind(classify_cancel_outcome(Some(reaped), wall, started)),
+                expected,
+                "raw={raw} kill_delivered={kill_delivered} signalled={signalled}"
+            );
+        }
+    }
+
+    /// REQ-34・#145: パイプを閉じた後、猶予内に子が自ら終了したら kill を送らず
+    /// `ExitedAfterSignal`（協調キャンセル）。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_cooperative_exit_sends_no_kill() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            has_cancel_channel: true,
+            exit_after_close_at: Some(started),
+            ..FakeChild::default()
+        };
+        let mut signalled = false;
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(60),
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            &mut signalled,
+        );
+        assert!(matches!(step, CancelStep::ExitedAfterSignal(_)));
+        assert!(signalled);
+        assert_eq!(c.channel_closes, 1);
+        assert_eq!(c.kills, 0);
+    }
+
+    /// REQ-34・#145: 猶予内に終了しない（協調しない）子は `SIGKILL` へ
+    /// フォールバックし、`ForcedKill` になる（壁時計の内側に収まる場合）。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_falls_back_to_sigkill_after_grace() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            has_cancel_channel: true,
+            reap_on_kill: true,
+            ..FakeChild::default()
+        };
+        // kill 送出後にのみ SIGKILL 終了を返す。時刻依存にすると、macOS 等で
+        // 猶予内の poll が遅延したとき協調終了と誤判定され不安定になる。
+        let mut signalled = false;
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(60),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            &mut signalled,
+        );
+        match step {
+            CancelStep::Cancelled(run) => assert_eq!(run.stop(), CancelStop::ForcedKill),
+            _ => panic!("expected ForcedKill"),
+        }
+        assert!(signalled);
+        assert!(c.kills >= 1);
+    }
+
+    /// REQ-34・REQ-39・#145: 協調の待ちは壁時計の期限から `KILL_WAIT_TIMEOUT` を
+    /// 遡った時刻で切り詰める（フォールバックの回収待ちを壁時計の内側に残す）。
+    /// 壁時計の残りが `KILL_WAIT_TIMEOUT` 未満なら協調の待ちは実質ゼロ。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_cooperative_wait_is_clamped_by_wall_deadline() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            has_cancel_channel: true,
+            ..FakeChild::default()
+        };
+        let mut signalled = false;
+        // 壁時計の残り 200ms・猶予 30 秒: 猶予をそのまま待てば壁時計を超える。
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_millis(200),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            &mut signalled,
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(signalled);
+        assert!(matches!(
+            step,
+            CancelStep::StillRunning | CancelStep::WallDeadline { .. }
+        ));
+    }
+
+    /// REQ-34・#145: 一度パイプを閉じた後の再入では協調を繰り返さず kill へ進む。
+    #[cfg(unix)]
+    #[test]
+    fn cancel_child_reentry_skips_cooperative_wait() {
+        let started = Instant::now();
+        let mut c = FakeChild {
+            has_cancel_channel: true,
+            wait_results: vec![Ok(None)],
+            reap_at: Some(started),
+            ..FakeChild::default()
+        };
+        let mut signalled = true; // 前回の呼び出しで閉じ済み
+        let step = cancel_child(
+            &mut c,
+            started,
+            started + Duration::from_secs(60),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            &mut signalled,
+        );
+        assert!(matches!(step, CancelStep::Cancelled(_)));
+        assert_eq!(c.channel_closes, 0);
+    }
+
+    /// REQ-34・#145: `RunLimits::with_cooperative_grace` は締める方向だけを許す。
+    #[test]
+    fn req34_with_cooperative_grace_rejects_loosening() {
+        let request = test_request(Some(30));
+        let limits = RunLimits::for_request(&request);
+        assert_eq!(
+            limits.cooperative_grace(),
+            Duration::from_secs(u64::from(COOPERATIVE_CANCEL_GRACE_SECONDS))
+        );
+        let tight = limits
+            .with_cooperative_grace(Duration::from_secs(1))
+            .expect("tighter grace");
+        assert_eq!(tight.cooperative_grace(), Duration::from_secs(1));
+        assert!(limits.with_cooperative_grace(Duration::ZERO).is_err());
+        assert!(
+            limits
+                .with_cooperative_grace(limits.cooperative_grace())
+                .is_err()
+        );
+        assert!(
+            limits
+                .with_cooperative_grace(Duration::from_secs(16))
+                .is_err()
+        );
+    }
+
+    /// REQ-34・#145: `out_dir` の読み取り専用の観測（削除しない）。
+    #[cfg(unix)]
+    #[test]
+    fn inspect_out_dir_residue_reports_state_without_deleting() {
+        let root = std::env::temp_dir().join(format!("fandhe-residue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::Absent
+        );
+        std::fs::create_dir(root.join("out")).expect("create out");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::EmptyReservation
+        );
+        std::fs::write(root.join("out").join("model.onnx"), b"x").expect("write");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::NonEmpty
+        );
+        // 観測は何も削除しない。
+        assert!(root.join("out").join("model.onnx").exists());
+        std::fs::remove_dir_all(root.join("out")).expect("rm out");
+        std::os::unix::fs::symlink(&root, root.join("out")).expect("symlink");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &OutDirAnchor::capture(&request)),
+            OutDirResidue::Unknown
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REQ-34・#145: 協調キャンセル後の最終判定（成功 JSON は `Completed`、
+    /// それ以外は `Cancelled(Cooperative)`、壁時計超過はエラーのまま）。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_maps_outcomes_after_cancel_signal() {
+        let started = Instant::now();
+        let wall = || TrainProcessError::WallTimeout {
+            limit_ms: 1,
+            child_reaped: true,
+        };
+        let request = test_request(None);
+        // 送出前は従来どおり（エラーはエラー）。
+        assert!(matches!(
+            conclude_run_t(
+                Err(TrainProcessError::StdoutIncomplete),
+                false,
+                started,
+                &request
+            ),
+            Err(TrainProcessError::StdoutIncomplete)
+        ));
+        // 送出後の別の失敗（クラッシュ等）は `Unconfirmed`（残置を観測して報告する）。
+        match conclude_run_t(
+            Err(TrainProcessError::StdoutIncomplete),
+            true,
+            started,
+            &request,
+        ) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Unconfirmed);
+                assert_eq!(run.signal(), None);
+                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::Absent));
+                assert!(run.child_spawned() && run.child_reaped());
+            }
+            _ => panic!("expected Cancelled(Unconfirmed)"),
+        }
+        // 壁時計超過は送出後でもキャンセルより優先する。
+        assert!(matches!(
+            conclude_run_t(Err(wall()), true, started, &request),
+            Err(TrainProcessError::WallTimeout { .. })
+        ));
+    }
+
+    /// REQ-34・#145: 所定のキャンセル応答（exit 70・`runtime_error`・固定メッセージ）
+    /// だけが `Cooperative`。別のエラー JSON（exit 70 でもメッセージ違い）は
+    /// `Unconfirmed` で、残置を観測して報告する。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_requires_cancel_ack_for_cooperative() {
+        let started = Instant::now();
+        let request = test_request(None);
+        let run_of = |message: &str| {
+            let json =
+                format!(r#"{{"status":"error","code":"runtime_error","message":"{message}"}}"#);
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            }
+        };
+        match conclude_run_t(Ok(run_of(CANCEL_ACK_MESSAGE)), true, started, &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Cooperative);
+                assert_eq!(run.out_dir_residue(), None);
+            }
+            _ => panic!("expected Cancelled(Cooperative)"),
+        }
+        // 別のエラー JSON は隠さず `Completed`（エラー結果）のまま保持する。
+        match conclude_run_t(Ok(run_of("worker crashed")), true, started, &request) {
+            Ok(TrainRunEnd::Completed(run)) => {
+                assert!(matches!(run.outcome, TrainOutcome::Error(_)));
+                assert_eq!(run.exit_code, ExitCode::RuntimeError);
+            }
+            _ => panic!("expected Completed(Error)"),
+        }
+    }
+
+    /// REQ-34・#145 回帰: 文面がキャンセル応答と一致する転送された worker エラーでも、
+    /// 予約が残っていれば `Cooperative` としない（空の予約が残る場合は `Unconfirmed`、
+    /// 中身がある場合は `CancelOutcomeUnconfirmed`）。残置が無ければ従来どおり
+    /// `Cooperative`（本物の応答）。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_does_not_trust_ack_lookalike_when_reservation_remains() {
+        let root = std::env::temp_dir().join(format!("fandhe-ack-fwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+        );
+        let make_run = || {
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            }
+        };
+        // 残置なし: 本物の応答として Cooperative。
+        assert!(matches!(
+            conclude_run_t(Ok(make_run()), true, Instant::now(), &request),
+            Ok(TrainRunEnd::Cancelled(run)) if run.stop() == CancelStop::Cooperative
+        ));
+        // 空の予約が残る: Cooperative ではなく Unconfirmed（残置を報告）。
+        std::fs::create_dir(root.join("out")).expect("create out");
+        match conclude_run_t(Ok(make_run()), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => {
+                assert_eq!(run.stop(), CancelStop::Unconfirmed);
+                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::EmptyReservation));
+            }
+            _ => panic!("expected Cancelled(Unconfirmed)"),
+        }
+        // 中身が残る: 公開済みの可能性があるため Cancelled としない。
+        std::fs::write(root.join("out").join("model.onnx"), b"x").expect("write");
+        assert!(matches!(
+            conclude_run_t(Ok(make_run()), true, Instant::now(), &request),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::NonEmpty
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REQ-34・#145 回帰: 実行中に root が改名され、同じ名前に空ディレクトリが
+    /// 置き直された場合、名前の再解決では `Absent` に見えても実体が起動前の記録と
+    /// 違うため `Unknown` 扱いになり、`Cancelled` にならない（元の実体には成果物が
+    /// 公開済みでありうる）。
+    #[cfg(unix)]
+    #[test]
+    fn req34_swapped_root_is_not_observed_as_unpublished() {
+        let root = unique_root();
+        let request = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        let anchor = OutDirAnchor::capture(&request);
+        assert_eq!(
+            inspect_out_dir_residue(&request, &anchor),
+            OutDirResidue::Absent
+        );
+        // 実行中に root を改名し、同じ名前に空ディレクトリを置き直す。
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).expect("rename root");
+        std::fs::create_dir(&root).expect("recreate root");
+        std::fs::create_dir(moved.join("out")).expect("published in original");
+        std::fs::write(moved.join("out").join("model.onnx"), b"x").expect("write");
+        assert_eq!(
+            inspect_out_dir_residue(&request, &anchor),
+            OutDirResidue::Unknown
+        );
+        // SIGKILL 経路・協調キャンセル経路のどちらも Cancelled としない。
+        let run = CancelledRun::before_start();
+        assert!(matches!(
+            forced_kill_run(run, &request, &anchor),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::Unknown
+            })
+        ));
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+        );
+        let outcome =
+            classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+        let ack = TrainRun {
+            outcome,
+            exit_code: ExitCode::RuntimeError,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        assert!(matches!(
+            conclude_run(Ok(ack), true, Instant::now(), &request, &anchor),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed {
+                residue: OutDirResidue::Unknown
+            })
+        ));
+        // 起動前に root を記録できなかった場合も fail-closed。
+        let missing = TrainRequest::new(TrainRequestParams {
+            kind: "c3".to_string(),
+            kind_version: 1,
+            config: serde_json::Map::new(),
+            label_order: vec!["a".to_string(), "b".to_string()],
+            max_bytes: 512,
+            seed: 0,
+            device: Device::Cpu,
+            root: root.join("nonexistent").to_string_lossy().to_string(),
+            train_path: "train.jsonl".to_string(),
+            out_dir: "out".to_string(),
+            time_limit_seconds: Some(30),
+            rss_limit_bytes: None,
+        })
+        .expect("valid request");
+        assert_eq!(
+            inspect_out_dir_residue(&missing, &OutDirAnchor::capture(&missing)),
+            OutDirResidue::Unknown
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    /// REQ-34・#145 回帰: 末尾スラッシュ・`.` を含む `out_dir` でも、検証と同じ
+    /// 規則で正規化した親を求めるため、実体の記録が成立し（`Unknown` に固定されず）
+    /// `Absent`／`EmptyReservation` を観測でき、協調キャンセルは `Cooperative`
+    /// になる。
+    #[cfg(unix)]
+    #[test]
+    fn req34_out_dir_spellings_are_normalized_for_anchor() {
+        for (out_dir, parent) in [
+            ("out", ""),
+            ("out/", ""),
+            ("./out", ""),
+            ("a/./b", "a"),
+            ("a//b/", "a"),
+        ] {
+            let root = unique_root();
+            std::fs::create_dir_all(root.join(parent)).expect("create parent");
+            let request = TrainRequest::new(TrainRequestParams {
+                kind: "c3".to_string(),
+                kind_version: 1,
+                config: serde_json::Map::new(),
+                label_order: vec!["a".to_string(), "b".to_string()],
+                max_bytes: 512,
+                seed: 0,
+                device: Device::Cpu,
+                root: root.to_string_lossy().to_string(),
+                train_path: "train.jsonl".to_string(),
+                out_dir: out_dir.to_string(),
+                time_limit_seconds: Some(30),
+                rss_limit_bytes: None,
+            })
+            .expect("valid request");
+            let anchor = OutDirAnchor::capture(&request);
+            assert_eq!(
+                inspect_out_dir_residue(&request, &anchor),
+                OutDirResidue::Absent,
+                "{out_dir}"
+            );
+            std::fs::create_dir(out_dir_path(&request)).expect("reserve");
+            assert_eq!(
+                inspect_out_dir_residue(&request, &anchor),
+                OutDirResidue::EmptyReservation,
+                "{out_dir}"
+            );
+            let json = format!(
+                r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+            );
+            std::fs::remove_dir(out_dir_path(&request)).expect("release");
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            let ack = TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            };
+            assert!(
+                matches!(
+                    conclude_run(Ok(ack), true, Instant::now(), &request, &anchor),
+                    Ok(TrainRunEnd::Cancelled(run)) if run.stop() == CancelStop::Cooperative
+                ),
+                "{out_dir}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// REQ-34・#145: supervisor が予約の解放を確認できなかった旨（固定メッセージ）を
+    /// 報告した場合は、通常の失敗（`Completed`）にせず `Unconfirmed` 経路に入る。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_treats_cleanup_incomplete_as_unconfirmed() {
+        let request = test_request(None);
+        let json = format!(
+            r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_CLEANUP_INCOMPLETE_MESSAGE}"}}"#
+        );
+        let outcome =
+            classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+        let run = TrainRun {
+            outcome,
+            exit_code: ExitCode::RuntimeError,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        assert!(is_cleanup_incomplete(&run));
+        match conclude_run_t(Ok(run), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Cancelled(run)) => assert_eq!(run.stop(), CancelStop::Unconfirmed),
+            Err(TrainProcessError::CancelOutcomeUnconfirmed { .. }) => {}
+            _ => panic!("expected Unconfirmed handling, not Completed"),
+        }
+    }
+
+    /// REQ-34・#145: 入力エラー（`invalid_request`）がキャンセル送出後でも
+    /// 呼び出し元へ伝わる。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_preserves_invalid_request_after_cancel_signal() {
+        let request = test_request(None);
+        let json = r#"{"status":"error","code":"invalid_request","message":"bad field"}"#;
+        let outcome =
+            classify_exit(ExitCode::InvalidInput, json.as_bytes(), &request).expect("classify");
+        let run = TrainRun {
+            outcome,
+            exit_code: ExitCode::InvalidInput,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        match conclude_run_t(Ok(run), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Completed(run)) => {
+                assert_eq!(run.exit_code, ExitCode::InvalidInput);
+                assert!(matches!(run.outcome, TrainOutcome::Error(_)));
+            }
+            _ => panic!("expected Completed(Error invalid_request)"),
+        }
+    }
+
+    /// REQ-34・#145: 公開済みの可能性・判定不能な残置は `Cancelled` と断定しない。
+    #[cfg(unix)]
+    #[test]
+    fn ensure_not_published_rejects_published_or_unknown_residue() {
+        assert!(ensure_not_published(OutDirResidue::Absent).is_ok());
+        assert!(ensure_not_published(OutDirResidue::EmptyReservation).is_ok());
+        for residue in [OutDirResidue::NonEmpty, OutDirResidue::Unknown] {
+            assert!(matches!(
+                ensure_not_published(residue),
+                Err(TrainProcessError::CancelOutcomeUnconfirmed { residue: r }) if r == residue
+            ));
+        }
+    }
+
+    /// 呼び出し時点の実体を記録して [`conclude_run`] を呼ぶ（実体の差し替えを
+    /// 伴わないテスト用）。
+    #[cfg(unix)]
+    fn conclude_run_t(
+        finished: Result<TrainRun, TrainProcessError>,
+        cancel_signalled: bool,
+        started: Instant,
+        request: &TrainRequest,
+    ) -> Result<TrainRunEnd, TrainProcessError> {
+        conclude_run(
+            finished,
+            cancel_signalled,
+            started,
+            request,
+            &OutDirAnchor::capture(request),
+        )
+    }
+
+    /// テスト用リクエストの root 文字列。unix では実在する一意なディレクトリ
+    /// （残置観測が実体を記録できるようにする）。root は `/` 始まりの構文検査が
+    /// あるため、windows ではこれを使えず固定の架空 root にする（残置観測は
+    /// unix 限定）。
+    fn test_root() -> String {
+        #[cfg(unix)]
+        {
+            unique_root().to_string_lossy().to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            "/fandhe-edge-fixture-root".to_string()
+        }
+    }
+
+    #[cfg(unix)]
+    fn unique_root() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fandhe-train-root-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        root
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
@@ -1797,7 +3049,7 @@ mod tests {
             max_bytes: 512,
             seed: 0,
             device: Device::Cpu,
-            root: "/fandhe-edge-fixture-root".to_string(),
+            root: test_root(),
             train_path: "train.jsonl".to_string(),
             out_dir: "out".to_string(),
             time_limit_seconds,

@@ -81,10 +81,14 @@ Rust 側 CLI（呼び出し元）が担う設計だが、本ワーカーは単�
 消してしまう TOCTOU を生む（実際に P0-1 として指摘された）。スーパーバイザーは
 `_worker` を監視するだけで自身は強制終了されない前提のプロセスなので、
 予約に使った fd（`parent_fd`・`tmp_fd`）をジョブの最初から最後まで手放さずに
-持ち続けられる。強制終了は `_worker` だけに afflict し、スーパーバイザー自身が
-（SIGKILL 等で）道連れに終了した場合の後始末は、本モジュールの責務ではなく
-Rust 側ジョブ管理（TASK-34.x REQ-34）に委ねる。予約済み `out_dir` が空のまま
-残ることは「成果物は公開されていない」ことの証拠になる。
+持ち続けられる。強制終了は `_worker` だけに afflict する。キャンセル
+（REQ-34・TASK-34.1-2）は Rust 側が stdin を閉じて伝え、スーパーバイザーが
+保持中の fd で予約を解放する（協調キャンセル。`supervisor.py` モジュール
+docstring 参照）。スーパーバイザー自身が SIGKILL された場合（協調の猶予を
+超えたときの Rust 側のフォールバック等）は後始末が走らず、空の予約が残り
+うる。これは安全側の残置で、Rust 側は削除せず読み取り専用で検査して報告
+するだけである（やり直し時の掃除・案内は TASK-34.3）。予約済み `out_dir` が
+空のまま残ることは「成果物は公開されていない」ことの証拠になる。
 
 `_worker` は、スーパーバイザーが `pass_fds` で渡した一時ディレクトリの fd
 （`--out-fd <n>`）へ `artifact.json`・`model.onnx` を書き込むだけで、`out_dir` の
@@ -1291,41 +1295,56 @@ def finalize_out_dir(reservation: OutDirReservation) -> None:
     reservation.close_tmp_fd()  # 成功: rename 後はもう不要
 
 
-def cleanup_reservation(reservation: OutDirReservation) -> None:
+def cleanup_reservation(reservation: OutDirReservation) -> bool:
     """学習・書き出しの失敗時（ワーカーの異常終了・強制終了を含む）に、確保済みの
     一時ディレクトリと予約済み `out_dir` の両方を解放する
     （`supervisor.py::run_supervised_train` の失敗時クリーンアップから呼ぶ）。
+
+    両方を解放できたことを確認できた場合のみ `True` を返す。stat・rmdir の失敗や
+    非空・すり替わりで残置した場合は `False`（協調キャンセル完了を報告して
+    よいかの判断に使う。REQ-34・#145）。
     """
-    _release_tmp(reservation)
-    cleanup_reserved_out_dir(reservation.entry, reservation.reserved_id)
+    tmp_released = _release_tmp(reservation)
+    out_released = cleanup_reserved_out_dir(reservation.entry, reservation.reserved_id)
+    return tmp_released and out_released
 
 
-def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId) -> None:
+def cleanup_reserved_out_dir(entry: guard.ConfinedEntry, reserved_id: ReservedId) -> bool:
     """予約済みの `out_dir` を解放する。
 
     まだ自分が予約した実体（`st_dev`・`st_ino` が一致）であり、かつ空である
     場合にのみ `os.rmdir` する。他プロセスが何か書き込んでいる・別物へ
-    すり替わっている場合は何もしない（残置は Rust 側ジョブ管理〔REQ-34〕が
-    次回実行前に判断する。予約が空のまま残ることは「成果物は公開されていない」
-    ことの証拠であり、安全側の残置である）。
+    すり替わっている場合は何もしない（残置は次回実行前に判断する〔TASK-34.3〕。
+    予約が空のまま残ることは「成果物は公開されていない」ことの証拠であり、
+    安全側の残置である）。
 
     stat と rmdir の間には小さな間隙が残るが、`rmdir` は空ディレクトリしか
     削除できないため、この間隙で起こりうる最悪の事態は「空ディレクトリの
     取り違え」であり、データ（ファイル）を失うことはない。
+
+    解放できた（名前が存在しない、または自分の予約を rmdir できた）場合のみ
+    `True`。stat 失敗・すり替わり・非空・rmdir 失敗は `False`（残置）。
     """
     parent_fd = entry.parent_fd
     name = entry.name
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != reserved_id:
-        return
-    with contextlib.suppress(OSError):
+        return False
+    try:
         os.rmdir(name, dir_fd=parent_fd)  # 空でなければ ENOTEMPTY → 残置する
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
-def _release_tmp(reservation: OutDirReservation) -> None:
+def _release_tmp(reservation: OutDirReservation) -> bool:
     """作業用一時ディレクトリ（中身を含む）を解放する。`out_dir` 側には触れない。
 
     P0-2: 中身の削除は保持している `tmp_fd`（名前ではなく実体に束縛された fd）
@@ -1333,18 +1352,26 @@ def _release_tmp(reservation: OutDirReservation) -> None:
     `rmdir` の直前にだけ `tmp_name` が今も同じ実体（`tmp_id`）を指しているかを
     確認する。この stat→rmdir の間隙は残るが、`cleanup_reserved_out_dir` と
     同様に `rmdir` は空ディレクトリしか削除できないため、データを失うことはない。
+    名前が既に無い、または自分の一時ディレクトリを rmdir できた場合のみ `True`。
     """
     _cleanup_tmp_contents_via_fd(reservation.tmp_fd)
     reservation.close_tmp_fd()
     parent_fd = reservation.entry.parent_fd
     try:
         st = os.stat(reservation.tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     if (st.st_dev, st.st_ino) != reservation.tmp_id:
-        return
-    with contextlib.suppress(OSError):
+        return False
+    try:
         os.rmdir(reservation.tmp_name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _cleanup_tmp_contents_via_fd(tmp_fd: int) -> None:

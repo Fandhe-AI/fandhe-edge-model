@@ -387,20 +387,24 @@ fn check_relative_path_syntax(value: &str, field: &'static str) -> Result<(), Tr
     if value.is_empty() || value.contains('\0') || value.starts_with('/') {
         return Err(TrainRequestError::InvalidPath { field });
     }
-    let mut has_component = false;
-    for part in value.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." {
-            return Err(TrainRequestError::InvalidPath { field });
-        }
-        has_component = true;
+    if value.split('/').any(|part| part == "..") {
+        return Err(TrainRequestError::InvalidPath { field });
     }
-    if !has_component {
+    if relative_path_components(value).is_empty() {
         return Err(TrainRequestError::InvalidPath { field });
     }
     Ok(())
+}
+
+/// 相対パス文字列の正規化した構成要素（空要素・`.` を除く）。検証
+/// （[`check_relative_path_syntax`]）と、受理した値からパスを組み立てる側
+/// （`process.rs` の残置観測。`out/`・`./out`・`a/./b` の親の求め方）が
+/// **同じ規則**を使うための唯一の定義（REQ-34・REQ-39）。
+pub(crate) fn relative_path_components(value: &str) -> Vec<&str> {
+    value
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
 }
 
 /// [`TrainRequest::to_json_vec`] 専用の `Vec<u8>` ライター。書き込み総量が
