@@ -14,9 +14,20 @@
 #     （引数値・入力テキストは出さない）
 #   - 実行時間（既定 300 秒。FANDHE_EDGE_TIMEOUT_SECS）・stdout 容量（1 MiB）・
 #     stderr 容量（64 KiB）に上限を置き、超過時は子（子孫プロセスを含む）を終了して
-#     runtime_error(70) の JSON を返す（REQ-39）
-#   - 許可された終了コードでも stdout が「完結した JSON オブジェクト 1 つ（1 行）」でなければ
-#     runtime_error(70) の JSON へ置き換える（複数 JSON・途中切れを中継しない。REQ-33）
+#     runtime_error(70) の JSON を返す（REQ-39）。子は独立したプロセスグループで起動し、
+#     直接の子が終了しても、グループの子孫が全員いなくなるまで同じ上限の下で監視する
+#     （setsid で自らグループを抜ける子孫は対象外。bash が無い環境は fail-closed で 70）
+#   - 許可された終了コードでも、stdout が JSON の構文（RFC 8259）として正しい
+#     オブジェクト 1 つ（1 行）でなければ runtime_error(70) の JSON へ置き換える
+#     （複数 JSON・途中切れ・末尾カンマ等を中継しない。REQ-33）。ただし引数に
+#     `--input-file` がある呼び出し（バッチ）は 1 行 1 JSON オブジェクトを認め、
+#     全行を検証して中継する（REQ-33 の唯一の例外）
+#   - JSON の `code` と終了コードの対応（0=ok・10=judged_fail・11=out_of_scope・
+#     12=pending・20=limit_exceeded・64=invalid_input・70=runtime_error。
+#     fixtures/exitcode/exit_codes.json と同一）を検証し、不一致は runtime_error(70)
+#     へ置き換える（REQ-21）。単一 JSON で `code` が無い出力は終了コード 0 のときだけ認める。
+#     バッチでは各行の `code`（あれば）が既知の名前であることと、終了コード非 0 のとき
+#     最終行の `code` が終了コードと一致することを確認する
 #   - 終了コードは CLI のもの（7 種）をそのまま返す。契約外の値・バイナリ不在・出力なしは
 #     runtime_error(70) へ写し、JSON を置き換え / 補う（stdout は常に 1 JSON）
 #
@@ -27,6 +38,26 @@
 # ONNX 推論（#113）が未接続のため exit 70 を返す。exit 0 になるのは
 # `--help` のみ。記録の保存形式は #150（TASK-36.1-2）の担当。
 set -eu
+
+# プロセスグループの隔離に bash のジョブ制御（set -m）を使う。dash 等は tty が無いと
+# set -m が失敗するため、bash で再実行する（Bash ツールの前提は bash。無ければ fail-closed）
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" ${1+"$@"}
+    fi
+    echo "fandhe-edge: bash is required" >&2
+    printf '%s\n' '{"code":"runtime_error","message":"bash is required for process group isolation"}'
+    echo "exit_code=70" >&2
+    exit 70
+fi
+
+# バッチ（infer --input-file）は 1 行 1 JSON を認める（REQ-33）。引数から判別する
+batch=0
+for a in ${1+"$@"}; do
+    case "$a" in
+        --input-file | --input-file=*) batch=1 ;;
+    esac
+done
 
 # シェル自身の診断・ジョブ終了通知（macOS の bash が出す "Terminated: 15" 等）が
 # stderr を汚さないよう、契約の出力は fd 3（元の stderr）へだけ出し、fd 2 は後で捨てる
@@ -79,13 +110,16 @@ max_err_bytes=65536
 # （超過は SIGXFSZ で終了）
 max_out_blocks=2048
 
-# 期限超過時に子孫も終了できるよう、tree_pids で子を根とするプロセス木を辿る
-# （ジョブ制御 set -m は tty の無い非対話環境で使えないため使わない）。
+# 子は set -m で独立したプロセスグループ（pgid = 子の PID）として起動し、期限・容量の
+# 超過時はグループごと終了する（REQ-39）。直接の子が終了した後も、グループに生存プロセスが
+# 残る間は同じ期限・容量の監視を続け、残存する子孫を回収する（孤児化で上限が外れない）。
 # 終了値は rc ファイルへ書き、監視側は kill -0 でなくファイルで終了を判定する
-# （終了済みの子へ遅延 KILL を送る競合と PID 再利用を避ける）。
+# （終了済みの子へ遅延 KILL を送る競合と PID 再利用を避ける。未回収の子がグループの
+# リーダーとして残るため pgid は再利用されない）。
 # 子へ元の stderr（fd 3）を継がせない（呼び出し元のパイプを保持させない）。
 # ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
 exec 2>/dev/null
+set -m
 (
     ulimit -f "$max_out_blocks" 2>/dev/null || true
     rc_child=0
@@ -95,25 +129,20 @@ exec 2>/dev/null
 ) </dev/null >/dev/null 3>&- &
 child=$!
 
-# child を根とする子孫の PID 一覧（ps の pid / ppid から推移閉包を取る。macOS・Linux 共通）
-tree_pids() {
-    ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$child" '
-        { p[NR] = $1; q[NR] = $2; n = NR }
-        END {
-            seen[root] = 1
-            do {
-                grew = 0
-                for (i = 1; i <= n; i++)
-                    if ((q[i] in seen) && !(p[i] in seen)) { seen[p[i]] = 1; grew = 1 }
-            } while (grew)
-            for (k in seen) print k
-        }'
+# グループに生存プロセス（ゾンビ以外）が残っているか
+group_alive() {
+    ps -A -o pgid= -o stat= 2>/dev/null | awk -v g="$child" '
+        $1 == g && $2 !~ /^Z/ { found = 1 }
+        END { exit found ? 0 : 1 }'
 }
 
-# 監視（前景ループ）: 子の終了・期限超過・容量超過のいずれかで抜ける
+# 監視（前景ループ）: グループの全員の終了・期限超過・容量超過のいずれかで抜ける
 ticks=0
 limit_kind=
-while [ ! -e "$rcf" ]; do
+while :; do
+    if [ -e "$rcf" ] && ! group_alive; then
+        break
+    fi
     if [ "$ticks" -ge "$max_ticks" ]; then
         limit_kind=timeout
         break
@@ -132,13 +161,11 @@ while [ ! -e "$rcf" ]; do
     fi
 done
 
-# 上限超過時は、未回収の子（PID が再利用されない）から辿ったプロセス木を一度だけ列挙し、
-# 同じ一覧へ TERM → 1 秒後に KILL を送る（親を先に落として孫が孤児化しても取りこぼさない）
+# 上限超過時はグループ全体へ TERM → 1 秒後に KILL を送る
 if [ -n "$limit_kind" ]; then
-    victims=$(tree_pids)
-    for p in $victims; do kill -s TERM "$p" 2>/dev/null || true; done
+    kill -s TERM -- "-$child" 2>/dev/null || true
     sleep 1
-    for p in $victims; do kill -s KILL "$p" 2>/dev/null || true; done
+    kill -s KILL -- "-$child" 2>/dev/null || true
 fi
 wait "$child" || true
 
@@ -177,45 +204,163 @@ case "$limit_kind" in
         ;;
 esac
 
-# stdout が「完結した JSON オブジェクト 1 つ（1 行）」かを検査する（awk の状態機械。
-# 文字列・エスケープを追跡し、閉じ忘れ・後続の余分な JSON・複数行を不正とする）
-is_single_json_object() {
-    awk '
-        NR > 1 { bad = 1 }
-        NR == 1 {
-            n = length($0); d = 0; s = 0; e = 0; done = 0
-            for (i = 1; i <= n; i++) {
-                c = substr($0, i, 1)
-                if (done) { if (c != " " && c != "\r") bad = 1; continue }
-                if (s) {
-                    if (e) e = 0
-                    else if (c == "\\") e = 1
-                    else if (c == "\"") s = 0
-                    continue
-                }
-                if (c == "\"") { if (d == 0) { bad = 1; break }; s = 1; continue }
-                if (c == "{" || c == "[") { if (d == 0 && c != "{") { bad = 1; break }; d++; continue }
-                if (c == "}" || c == "]") { d--; if (d < 0) { bad = 1; break }; if (d == 0) done = 1; continue }
-                if (d == 0 && c != " ") { bad = 1; break }
-            }
+# stdout の検証（awk の再帰下降パーサー。RFC 8259 の構文を検査し、既存ツールのみで完結させる）。
+# 単一モードは 1 行 1 オブジェクトのみ、バッチは各行がオブジェクト。終了値: 0=正常・
+# 1=JSON 不正・2=`code` と終了コードの不一致（REQ-21・REQ-33）。
+# 対応表は fixtures/exitcode/exit_codes.json と同一（bash_noninteractive.rs が照合する）
+check_output() {
+    LC_ALL=C awk -v batch="$batch" -v rc="$rc" '
+    function isdig(c) { return c != "" && index("0123456789", c) > 0 }
+    function skipws(   c) {
+        while (pos <= n) {
+            c = substr(s, pos, 1)
+            if (c == " " || c == "\t" || c == "\r" || c == "\n") pos++
+            else break
         }
-        END { exit (bad || !done || NR != 1) ? 1 : 0 }
-    ' "$out"
+    }
+    function pstring(   c, k, h, start) {
+        pos++; start = pos
+        while (pos <= n) {
+            c = substr(s, pos, 1)
+            if (c == "\"") { strval = substr(s, start, pos - start); pos++; return 1 }
+            if (c < " ") return 0
+            if (c == "\\") {
+                pos++; c = substr(s, pos, 1)
+                if (c != "" && index("\"\\/bfnrt", c) > 0) { pos++; continue }
+                if (c == "u") {
+                    for (k = 1; k <= 4; k++) {
+                        h = substr(s, pos + k, 1)
+                        if (h == "" || index("0123456789abcdefABCDEF", h) == 0) return 0
+                    }
+                    pos += 5; continue
+                }
+                return 0
+            }
+            pos++
+        }
+        return 0
+    }
+    function pnumber(   c) {
+        if (substr(s, pos, 1) == "-") pos++
+        c = substr(s, pos, 1)
+        if (c == "0") pos++
+        else if (isdig(c)) { while (isdig(substr(s, pos, 1))) pos++ }
+        else return 0
+        if (substr(s, pos, 1) == ".") {
+            pos++
+            if (!isdig(substr(s, pos, 1))) return 0
+            while (isdig(substr(s, pos, 1))) pos++
+        }
+        c = substr(s, pos, 1)
+        if (c == "e" || c == "E") {
+            pos++; c = substr(s, pos, 1)
+            if (c == "+" || c == "-") pos++
+            if (!isdig(substr(s, pos, 1))) return 0
+            while (isdig(substr(s, pos, 1))) pos++
+        }
+        return 1
+    }
+    function pliteral(w) {
+        if (substr(s, pos, length(w)) == w) { pos += length(w); return 1 }
+        return 0
+    }
+    function pvalue(depth,   c) {
+        if (depth > 64) return 0
+        skipws()
+        c = substr(s, pos, 1)
+        if (c == "\"") return pstring()
+        if (c == "{") return pobject(depth)
+        if (c == "[") return parray(depth)
+        if (c == "t") return pliteral("true")
+        if (c == "f") return pliteral("false")
+        if (c == "n") return pliteral("null")
+        return pnumber()
+    }
+    function pobject(depth,   key, first, c) {
+        pos++; skipws()
+        if (substr(s, pos, 1) == "}") { pos++; return 1 }
+        while (1) {
+            skipws()
+            if (substr(s, pos, 1) != "\"") return 0
+            if (!pstring()) return 0
+            key = strval
+            skipws()
+            if (substr(s, pos, 1) != ":") return 0
+            pos++; skipws()
+            first = substr(s, pos, 1)
+            if (!pvalue(depth + 1)) return 0
+            if (depth == 0 && key == "code") {
+                if (hascode || first != "\"") codebad = 1
+                else code = strval
+                hascode = 1
+            }
+            skipws()
+            c = substr(s, pos, 1)
+            if (c == ",") { pos++; continue }
+            if (c == "}") { pos++; return 1 }
+            return 0
+        }
+    }
+    function parray(depth,   c) {
+        pos++; skipws()
+        if (substr(s, pos, 1) == "]") { pos++; return 1 }
+        while (1) {
+            if (!pvalue(depth + 1)) return 0
+            skipws()
+            c = substr(s, pos, 1)
+            if (c == ",") { pos++; continue }
+            if (c == "]") { pos++; return 1 }
+            return 0
+        }
+    }
+    BEGIN {
+        split("ok=0 judged_fail=10 out_of_scope=11 pending=12 limit_exceeded=20 invalid_input=64 runtime_error=70", pairs, " ")
+        for (i in pairs) { split(pairs[i], kv, "="); known[kv[1]] = 1; if (kv[2] == rc) expect = kv[1] }
+    }
+    {
+        lines++
+        if (!batch && lines > 1) syntax = 1
+        s = $0; n = length(s); pos = 1; code = ""; hascode = 0; codebad = 0
+        skipws()
+        if (substr(s, pos, 1) != "{" || !pvalue(0)) { syntax = 1; next }
+        skipws()
+        if (pos <= n) { syntax = 1; next }
+        if (batch) {
+            if (hascode && (codebad || !(code in known))) mismatch = 1
+            lastok = hascode && !codebad && code == expect
+        } else if (hascode) {
+            if (codebad || code != expect) mismatch = 1
+        } else if (rc != 0) {
+            mismatch = 1
+        }
+    }
+    END {
+        if (lines == 0 || syntax) exit 1
+        if (batch && rc != 0 && !lastok) mismatch = 1
+        exit mismatch ? 2 : 0
+    }' "$out"
 }
 
 # CLI の終了コードは 7 種（0/10/11/12/20/64/70）に固定のため、それ以外
 # （126・127・シグナル終了の 128+N 等の契約外）は既存の stdout の有無にかかわらず
 # runtime_error(70) の JSON へ置き換える（JSON の code と終了コードを一致させる。REQ-21）。
-# 許可された終了コードでも stdout が空なら補い、JSON 1 つ（1 行）でなければ
-# （複数 JSON・途中切れ）置き換えて 70 を返す（1 呼び出し 1 JSON。REQ-33）
+# 許可された終了コードでも stdout が空なら補い、JSON 構文の不正・`code` の不一致は
+# 置き換えて 70 を返す（1 呼び出し 1 JSON。REQ-21・REQ-33）
 case "$rc" in
     0 | 10 | 11 | 12 | 20 | 64 | 70)
         if [ ! -s "$out" ]; then
             printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced no output"}' >"$out"
             rc=70
-        elif ! is_single_json_object; then
-            printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced invalid output"}' >"$out"
-            rc=70
+        else
+            check_rc=0
+            check_output || check_rc=$?
+            if [ "$check_rc" -eq 1 ]; then
+                printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced invalid output"}' >"$out"
+                rc=70
+            elif [ "$check_rc" -ne 0 ]; then
+                printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge output code does not match exit code"}' >"$out"
+                rc=70
+            fi
         fi
         ;;
     *)

@@ -179,6 +179,11 @@ fn run_with_fake_bin(name: &str, body: &str) -> Out {
 
 /// `run_with_fake_bin` に環境変数（期限の上書きなど）を追加で渡す版。
 fn run_with_fake_bin_env(name: &str, body: &str, envs: &[(&str, &str)]) -> Out {
+    run_with_fake_bin_args(name, body, &["--help"], envs)
+}
+
+/// 引数も指定できる版（`--input-file` のバッチ判別の検証用）。
+fn run_with_fake_bin_args(name: &str, body: &str, args: &[&str], envs: &[(&str, &str)]) -> Out {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!(
         "fandhe-noninteractive-{}-{name}",
@@ -190,7 +195,7 @@ fn run_with_fake_bin_env(name: &str, body: &str, envs: &[(&str, &str)]) -> Out {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let out = Command::new("sh")
         .arg(script_path())
-        .arg("--help")
+        .args(args)
         .env("FANDHE_EDGE_BIN", &bin)
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
@@ -364,4 +369,179 @@ fn req39_timeout_kills_descendants() {
     let survived = marker.exists();
     std::fs::remove_file(&marker).ok();
     assert!(!survived, "descendant survived the timeout");
+}
+
+const INVALID_OUTPUT: &str =
+    "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge produced invalid output\"}\n";
+const CODE_MISMATCH: &str = "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge output code does not match exit code\"}\n";
+
+/// 括弧が釣り合っていても JSON 構文として不正な出力は中継されないこと（REQ-33）。
+#[test]
+fn req33_syntactically_invalid_json_is_replaced_even_if_braces_balance() {
+    let cases = [
+        ("trailingcomma", r#"{"code":"ok",}"#),
+        ("barekey", "{invalid}"),
+        ("leadingzero", r#"{"code":"ok","n":01}"#),
+        ("badescape", r#"{"code":"ok","m":"a\qb"}"#),
+        ("missingcolon", r#"{"code":"ok" "m":1}"#),
+        ("trailinggarbage", r#"{"code":"ok"} x"#),
+        ("badliteral", r#"{"code":"ok","v":tru}"#),
+        ("emptykey", "{\"\"}"),
+    ];
+    for (name, json) in cases {
+        let o = run_with_fake_bin(name, &format!("echo '{json}'\nexit 0"));
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, INVALID_OUTPUT, "{name}");
+        assert_eq!(o.stderr.lines().last(), Some("exit_code=70"), "{name}");
+    }
+}
+
+/// 数値・入れ子・エスケープを含む構文的に正しい JSON は中継されること（REQ-33）。
+#[test]
+fn req33_valid_nested_json_is_relayed() {
+    let json = r#"{"code":"ok","a":[1,-2.5e+3,{"b":null,"c":true}],"u":"\u00e9\n","e":{}}"#;
+    let o = run_with_fake_bin("nested", &format!("printf '%s\\n' '{json}'\nexit 0"));
+    assert_eq!(o.code, Some(0));
+    assert_eq!(o.stdout, format!("{json}\n"));
+}
+
+/// 終了コードと JSON の `code` の対応（7 種）が一致するときだけ中継し、
+/// 不一致は runtime_error(70) へ置き換えること。対応表は core の `ExitCode::ALL`
+/// （fixtures/exitcode/exit_codes.json と core のテストが照合）を正とする（REQ-21）。
+#[test]
+fn req21_exit_code_and_json_code_correspondence_is_enforced() {
+    for exit in ExitCode::ALL {
+        for other in ExitCode::ALL {
+            let json = format!("{{\"code\":\"{}\",\"message\":\"m\"}}", other.name());
+            let o = run_with_fake_bin("map", &format!("echo '{json}'\nexit {}", exit.code()));
+            if exit == other {
+                assert_eq!(o.code, Some(i32::from(exit.code())), "{exit:?}");
+                assert_eq!(o.stdout, format!("{json}\n"), "{exit:?}");
+            } else {
+                assert_eq!(o.code, Some(70), "{exit:?}/{other:?}");
+                assert_eq!(o.stdout, CODE_MISMATCH, "{exit:?}/{other:?}");
+                assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+            }
+        }
+    }
+}
+
+/// exit 0 で `code` が runtime_error・非 0 で `code` 欠落・code が文字列でない場合は不一致。
+#[test]
+fn req21_mismatch_edge_cases_map_to_runtime_error_70() {
+    let cases = [
+        ("zero_rt", "echo '{\"code\":\"runtime_error\"}'\nexit 0"),
+        ("nonzero_nocode", "echo '{\"message\":\"x\"}'\nexit 10"),
+        ("code_number", "echo '{\"code\":10}'\nexit 10"),
+        (
+            "code_dup",
+            "echo '{\"code\":\"ok\",\"code\":\"ok\"}'\nexit 0",
+        ),
+        ("unknown_name", "echo '{\"code\":\"weird\"}'\nexit 0"),
+    ];
+    for (name, body) in cases {
+        let o = run_with_fake_bin(name, body);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+    }
+}
+
+/// バッチ（`--input-file`）は 1 行 1 JSON を全行検証して中継すること（REQ-33）。
+#[test]
+fn req33_batch_input_file_relays_every_line() {
+    let body = "echo '{\"code\":\"ok\",\"label\":\"a\"}'\necho '{\"label\":\"b\"}'\nexit 0";
+    for args in [["--input-file", "x.jsonl"], ["--input-file=x.jsonl", "--x"]] {
+        let o = run_with_fake_bin_args("batch", body, &args, &[]);
+        assert_eq!(o.code, Some(0));
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"ok\",\"label\":\"a\"}\n{\"label\":\"b\"}\n"
+        );
+        assert_eq!(o.stderr, "exit_code=0\n");
+    }
+}
+
+/// バッチでも不正な行・空行・既知でない `code`・非 0 終了で最終行の不一致は置き換える。
+/// バッチでない呼び出しの複数行は引き続き拒否する（REQ-33・REQ-21）。
+#[test]
+fn req33_batch_rejects_bad_lines_and_single_mode_rejects_multiline() {
+    let args = ["--input-file", "x.jsonl"];
+    let bad = [
+        (
+            "badline",
+            "echo '{\"a\":1}'\necho '{bad}'\nexit 0",
+            INVALID_OUTPUT,
+        ),
+        (
+            "blankline",
+            "echo '{\"a\":1}'\necho\necho '{\"a\":2}'\nexit 0",
+            INVALID_OUTPUT,
+        ),
+        ("array", "echo '[1]'\nexit 0", INVALID_OUTPUT),
+        (
+            "unknown",
+            "echo '{\"code\":\"weird\"}'\nexit 0",
+            CODE_MISMATCH,
+        ),
+        (
+            "lastmismatch",
+            "echo '{\"code\":\"ok\"}'\nexit 10",
+            CODE_MISMATCH,
+        ),
+    ];
+    for (name, body, expected) in bad {
+        let o = run_with_fake_bin_args(name, body, &args, &[]);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, expected, "{name}");
+    }
+    let ok = run_with_fake_bin_args(
+        "batchfail",
+        "echo '{\"code\":\"ok\"}'\necho '{\"code\":\"judged_fail\"}'\nexit 10",
+        &args,
+        &[],
+    );
+    assert_eq!(ok.code, Some(10));
+    let single = run_with_fake_bin(
+        "single",
+        "echo '{\"code\":\"ok\"}'\necho '{\"code\":\"ok\"}'\nexit 0",
+    );
+    assert_eq!(single.code, Some(70));
+    assert_eq!(single.stdout, INVALID_OUTPUT);
+}
+
+/// 親が終了しても残ったバックグラウンドの子孫に期限が適用され、終了・回収されること
+/// （親の終了で上限が外れない。REQ-39）。
+#[test]
+fn req39_descendant_outliving_parent_is_bounded_by_timeout() {
+    let marker = std::env::temp_dir().join(format!("fandhe-orphan-{}", std::process::id()));
+    let body = format!(
+        "echo '{{\"code\":\"ok\"}}'\n(sleep 3; echo alive >'{}') &\nexit 0",
+        marker.display()
+    );
+    let started = Instant::now();
+    let o = run_with_fake_bin_env("orphan", &body, &[("FANDHE_EDGE_TIMEOUT_SECS", "1")]);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge timed out\"}\n"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let survived = marker.exists();
+    std::fs::remove_file(&marker).ok();
+    assert!(!survived, "orphaned descendant survived the timeout");
+}
+
+/// 親が終了した後に子孫が出力し続けても容量上限が適用されること（REQ-39）。
+#[test]
+fn req39_descendant_output_after_parent_exit_hits_output_limit() {
+    let o = run_with_fake_bin(
+        "orphanflood",
+        "echo '{\"code\":\"ok\"}'\n(exec yes) &\nexit 0",
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge output exceeded size limit\"}\n"
+    );
 }
