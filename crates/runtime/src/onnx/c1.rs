@@ -29,9 +29,17 @@ use super::{
 };
 use crate::pipeline::BackendError;
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 /// n-gram の最大長（学習ワーカーの `limits.py::MAX_C1_NGRAM`）。64 bit キーに収まる上限でもある。
 const MAX_NGRAM: usize = 7;
+
+/// 1 系列の計算時間の上限（REQ-39。C3 の `MAX_INFER_DURATION`・
+/// `latency::DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS` と同値）。入力長の上限だけでは、
+/// 大きな語彙表・重みを持つモデルの走査時間を抑えられない。
+const MAX_INFER_DURATION: Duration = Duration::from_secs(10);
+/// 経過時間を検査する間隔（反復回数）。`Instant::now` の呼び出しを間引くための値。
+const CHECK_INTERVAL: usize = 256;
 
 /// 書き出し器のノード列テンプレート: (op_type, 入力名, 出力名, 属性名)。
 type NodeSpec = (
@@ -182,10 +190,26 @@ impl C1Model {
 
     /// 1 系列のスコア（確率。選択肢の宣言順）。
     pub(super) fn scores(&self, ids: &[i64]) -> Result<Vec<f64>, BackendError> {
+        self.scores_within(ids, MAX_INFER_DURATION)
+    }
+
+    /// 計算時間の上限付きのスコア計算。n-gram の走査・重み行の加算の反復境界で経過時間を検査し、
+    /// 超過したら [`BackendError::TimeLimitExceeded`] で打ち切る（REQ-39）。
+    fn scores_within(&self, ids: &[i64], limit: Duration) -> Result<Vec<f64>, BackendError> {
+        let started = Instant::now();
+        let mut steps = 0usize;
+        let mut check = || -> Result<(), BackendError> {
+            if steps.is_multiple_of(CHECK_INTERVAL) && started.elapsed() >= limit {
+                return Err(BackendError::TimeLimitExceeded);
+            }
+            steps = steps.wrapping_add(1);
+            Ok(())
+        };
         // 列番号 → 出現回数。昇順の反復で密なグラフの添字順と同じ累積順にする。
         let mut tf: BTreeMap<u32, u32> = BTreeMap::new();
         for (n, table) in &self.tables {
             for window in ids.windows(*n) {
+                check()?;
                 if let Some(col) = pack_ngram(window).and_then(|key| table.get(&key)) {
                     let c = tf.entry(*col).or_insert(0);
                     *c = c.saturating_add(1);
@@ -196,6 +220,7 @@ impl C1Model {
         let mut weighted: Vec<(usize, f32)> = Vec::with_capacity(tf.len());
         let mut sumsq = 0.0f32;
         for (&col, &count) in &tf {
+            check()?;
             let col = usize::try_from(col).map_err(|_| BackendError::Failed)?;
             let idf = *self.idf.get(col).ok_or(BackendError::Failed)?;
             // count > 0 なので sublinear TF は ln(max(count, 1)) + 1
@@ -209,6 +234,7 @@ impl C1Model {
         let k = self.n_classes;
         let mut logits = vec![0.0f32; k];
         for &(col, w) in &weighted {
+            check()?;
             let x = w / denom;
             let start = col.checked_mul(k).ok_or(BackendError::Failed)?;
             let end = start.checked_add(k).ok_or(BackendError::Failed)?;
@@ -314,6 +340,26 @@ fn parse_tfidf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39: 時間上限 0 では最初の反復で打ち切られ、通常の上限では成功する。
+    #[test]
+    fn req39_c1_scores_abort_when_time_limit_exceeded() {
+        let mut table = HashMap::new();
+        table.insert(1u64, 0u32);
+        let model = C1Model {
+            tables: vec![(1, table)],
+            idf: vec![2.0],
+            weight: vec![1.0, 0.0],
+            bias: vec![0.0, 0.0],
+            eps: 1e-12,
+            n_classes: 2,
+        };
+        assert_eq!(
+            model.scores_within(&[2], Duration::ZERO).err(),
+            Some(BackendError::TimeLimitExceeded)
+        );
+        assert!(model.scores_within(&[2], MAX_INFER_DURATION).is_ok());
+    }
 
     /// REQ-32: n-gram のパックは 1..=256 のみ受理し、0・257 は拒否する。
     #[test]

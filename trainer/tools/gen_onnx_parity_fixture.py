@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import random
 import sys
@@ -241,12 +242,26 @@ def main() -> None:
     if not args.overwrite and any(t.exists() for t in targets):
         raise SystemExit("output files already exist; pass --overwrite to replace them")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp)
+    # 生成・検証はすべて出力先と同じファイルシステム上の一時領域で行い、3 ファイルとも成功して
+    # から出力先へ置き換える。途中で失敗しても既存の fixture は変更されない。
+    with tempfile.TemporaryDirectory(dir=out_dir, prefix=".gen_onnx_parity_") as tmp:
+        work = Path(tmp) / "work"
+        staging = Path(tmp) / "staging"
+        work.mkdir()
+        staging.mkdir()
         kinds = {
-            "c1": _build_kind("c1", c1_mod.C1Kind(), _mlx_probs_c1, C1_CONFIG, out_dir, work),
-            "c3": _build_kind("c3", c3_mod.C3Kind(), _mlx_probs_c3, C3_CONFIG, out_dir, work),
+            "c1": _build_kind("c1", c1_mod.C1Kind(), _mlx_probs_c1, C1_CONFIG, staging, work),
+            "c3": _build_kind("c3", c3_mod.C3Kind(), _mlx_probs_c3, C3_CONFIG, staging, work),
         }
+        _write_cases(staging, kinds)
+        for name in ("c1.onnx", "c3.onnx", "cases.json"):
+            os.replace(staging / name, out_dir / name)
+    for k, v in kinds.items():
+        sys.stdout.write(f"{k}: cases={len(v['cases'])} excluded={v['excluded_near_tie']}\n")
+
+
+def _write_cases(dest: Path, kinds: dict[str, Any]) -> None:
+    """`cases.json` を dest へ書く（出力先への置き換えは呼び出し側が全検証後に行う）。"""
     doc = {
         "_meta": {
             "description": (
@@ -264,11 +279,9 @@ def main() -> None:
         },
         "kinds": kinds,
     }
-    (out_dir / "cases.json").write_text(
+    (dest / "cases.json").write_text(
         json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    for k, v in kinds.items():
-        sys.stdout.write(f"{k}: cases={len(v['cases'])} excluded={v['excluded_near_tie']}\n")
 
 
 if __name__ == "__main__":
