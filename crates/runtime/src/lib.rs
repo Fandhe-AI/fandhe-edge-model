@@ -31,6 +31,8 @@
 //!   終了コード決定（REQ-21・TASK-21.3-1・#132）。待ち時間（p95）の上限超過
 //!   （`LimitBreach::Latency`・境界規則 `latency_if_exceeded`。REQ-31・TASK-21.3-2・#133）も
 //!   扱う。容量の照合・CLI 配線は未実装
+//! - [`prediction_provenance`][]: 参考測定でバッチ予測 API を使った記録への明記ルール
+//!   （REQ-28 境界値・TASK-28.3・#120）。CLI 出力への配線は TASK-33.x で未実装
 //!
 //! TASK-28.1-2（#118）で、650 件の入力に対する単体・バッチ・評価器経路の予測ラベル全件一致
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と
@@ -51,4 +53,5 @@ pub mod latency_report;
 pub mod onnx;
 pub mod package_outcome;
 pub mod pipeline;
+pub mod prediction_provenance;
 pub mod preprocess;
