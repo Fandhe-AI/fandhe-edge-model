@@ -37,6 +37,8 @@ fandhe-edge-guard = { path = "crates/guard" }
 # #177 で学習ワーカー層（crates/train）への配置も加わる。版・ライセンス・推移的依存は
 # 変更せず、この配置層の追加は 2026-09-28 オーナー承認済み
 # （.claude/rules/dependency-policy.md「承認済みの依存」表に反映済み）。
+# #112 で推論ランタイム層（crates/runtime）にも dev-dependency として配置する（共有ゴールデン
+# ベクタ fixture の読み込み専用。Issue #112 コメント 2026-09-29 の承認記録。版は変更なし）。
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 # sha2 は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
@@ -46,7 +48,8 @@ sha2 = "=0.11.0"
 # unicode-normalization は 2026-09-28 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。承認記録は PR #224）。データ契約層（crates/data）の矛盾検出
 # （TASK-16.2-2・#42・REQ-16）で NFKC 正規化を行い、学習ワーカー（Python `unicodedata`）
-# と同じ規則にするために使う。推論側には配置しない。
+# と同じ規則にするために使う。推論ランタイム層（crates/runtime。TASK-32.1-1・#112）にも
+# 配置する（Issue #112 コメント 2026-09-29 の承認記録。版・features は変更なし）。
 # 版は =0.1.22 に固定する（`UNICODE_VERSION == (15, 0, 0)`）。学習ワーカー
 # （Python 3.12 の `unicodedata`。UCD 15.0.0 準拠）と Unicode 版を一致させ、
 # NFKC の版差による結果の食い違いを避けるための選択（0.1.25 は Unicode 17.0

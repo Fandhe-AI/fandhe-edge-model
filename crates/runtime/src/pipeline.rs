@@ -13,8 +13,8 @@
 //!
 //! # 継ぎ目（スタブ）
 //!
-//! - 前処理: #112（TASK-32.1 配下）のバイト前処理（NFKC 正規化＋バイトエンコード）が
-//!   [`Preprocessor`] を実装して差し込む想定。本 crate は未実装（REQ-32）
+//! - 前処理: #112（TASK-32.1 配下）のバイト前処理（NFKC 正規化＋バイトエンコード）は
+//!   [`crate::preprocess::ByteEncodingPreprocessor`] が [`Preprocessor`] を実装する（REQ-32）
 //! - スコア計算: #113 の ONNX 推論が [`ScoringBackend`] を実装する想定。ONNX Runtime の
 //!   セッション API が `&mut` を要求する場合の内部可変性の扱いは #113 で判断する
 //! - 実装は呼び出し間で結果に影響する状態を持たないこと（REQ-28）。trait は `&self` だが
@@ -71,7 +71,7 @@ impl fmt::Debug for TokenIds {
     }
 }
 
-/// 前処理の継ぎ目（#112 が実装する想定。本 crate では未実装）。
+/// 前処理の継ぎ目（#112 の [`crate::preprocess::ByteEncodingPreprocessor`] が実装する）。
 ///
 /// 実装は呼び出し間で結果に影響する状態を持たないこと（REQ-28）。
 pub trait Preprocessor {
