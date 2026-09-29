@@ -103,7 +103,20 @@ fi
 
 # stdout・stderr は一時ファイルへ退避し、終了値の確定後に 1 JSON だけを出す
 # （実行後に 126/127 を返す実行ファイルが JSON を出していても二重出力しない。REQ-33）
-work=$(mktemp -d) || launch_failed
+# テスト専用: FANDHE_EDGE_WORK_DIR に既存のディレクトリ（symlink 不可）を指定すると、
+# 作業ディレクトリとして使い、終了後も削除しない。上限超過で出力を置換する直前の
+# 生の出力を out.raw・err.raw として残す（書き込み時点の上限を終了後に測るため）。
+# 未指定なら従来どおり mktemp -d で作り、終了時に削除する（既定の経路は変わらない）
+keep_work=0
+if [ -n "${FANDHE_EDGE_WORK_DIR:-}" ]; then
+    if [ ! -d "$FANDHE_EDGE_WORK_DIR" ] || [ -L "$FANDHE_EDGE_WORK_DIR" ]; then
+        launch_failed
+    fi
+    work=$FANDHE_EDGE_WORK_DIR
+    keep_work=1
+else
+    work=$(mktemp -d) || launch_failed
+fi
 out=$work/out
 err=$work/err
 rcf=$work/rc
@@ -122,7 +135,9 @@ cleanup() {
     if [ -n "$wd" ]; then
         kill -s KILL -- "-$wd" 2>/dev/null || true
     fi
-    rm -rf "$work"
+    if [ "$keep_work" -eq 0 ]; then
+        rm -rf "$work"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 70' TERM INT HUP
@@ -238,6 +253,11 @@ if [ -z "$limit_kind" ]; then
     elif [ "$(wc -c <"$err")" -gt "$max_err_bytes" ]; then
         limit_kind=stderr_limit
     fi
+fi
+
+if [ "$keep_work" -eq 1 ]; then
+    cp "$out" "$work/out.raw" 2>/dev/null || true
+    cp "$err" "$work/err.raw" 2>/dev/null || true
 fi
 
 # 上限超過は CLI の出力（途中まで）を捨て、原因を示す JSON へ置き換える

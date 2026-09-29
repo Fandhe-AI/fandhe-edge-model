@@ -720,50 +720,80 @@ fn req39_wrapper_sigterm_does_not_leave_child_group() {
 
 /// 子が SIGPIPE を無視して大量に書いても、stdout・stderr は書き込み時点で上限 +1 バイトで
 /// 打ち切られ（ディスク上の大きさが 65537・1048577 バイト）、終了コードは 70 になること。
-/// 監視間隔（0.1 秒）に依存しない上限であることの検証（REQ-39・REQ-21）。
+/// 測定はラッパーの終了後にテスト側で行う（子が自分で測ると監視の TERM と競合するため）。
+/// 作業ディレクトリはテスト専用の FANDHE_EDGE_WORK_DIR で観測する（REQ-39・REQ-21）。
 #[test]
 fn req39_output_caps_are_enforced_at_write_time() {
     let cases = [
         (
             "errcap",
             "1>&2",
-            "err",
+            "err.raw",
             65_537_u64,
             "stderr exceeded size limit",
         ),
         (
             "outcap",
             "",
-            "out",
+            "out.raw",
             1_048_577_u64,
             "output exceeded size limit",
         ),
     ];
-    for (name, redirect, file, expected_size, message) in cases {
-        let tmp = std::env::temp_dir().join(format!("fandhe-cap-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let marker = tmp.join("size.txt");
-        let body = format!(
-            "trap '' PIPE\nhead -c 3000000 /dev/zero {redirect} || true\nsleep 0.03\n\
-             find '{}' -name {file} -exec wc -c {{}} + >'{}' 2>/dev/null\nexit 0",
-            tmp.display(),
-            marker.display()
+    for (name, redirect, raw, expected_size, message) in cases {
+        let dir = std::env::temp_dir().join(format!("fandhe-cap-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let body = format!("trap '' PIPE\nhead -c 3000000 /dev/zero {redirect} || true\nexit 0");
+        let dir_s = dir.display().to_string();
+        let o = run_with_fake_bin_args(
+            name,
+            &body,
+            &["--help"],
+            &[("FANDHE_EDGE_WORK_DIR", &dir_s)],
         );
-        let tmp_s = tmp.display().to_string();
-        let o = run_with_fake_bin_args(name, &body, &["--help"], &[("TMPDIR", &tmp_s)]);
+        let size = std::fs::metadata(dir.join(raw)).map(|m| m.len());
+        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(o.code, Some(70), "{name}");
         assert_eq!(
             o.stdout,
             format!("{{\"code\":\"runtime_error\",\"message\":\"fandhe-edge {message}\"}}\n"),
             "{name}"
         );
-        let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
-        let size: u64 = recorded
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(u64::MAX);
-        std::fs::remove_dir_all(&tmp).ok();
-        assert_eq!(size, expected_size, "{name}: {recorded}");
+        assert_eq!(size.ok(), Some(expected_size), "{name}");
     }
+}
+
+/// FANDHE_EDGE_WORK_DIR が存在しない・symlink の場合は runtime_error(70) で拒否し、
+/// 未指定時の既定経路（mktemp）は変わらないこと。
+#[test]
+fn req39_work_dir_override_is_validated() {
+    let missing = "/nonexistent/fandhe-work";
+    let o = run_with_fake_bin_args(
+        "wdmissing",
+        "exit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_WORK_DIR", missing)],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge binary not found or not executable\"}\n"
+    );
+    let base = std::env::temp_dir().join(format!("fandhe-wdlink-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("mkdir");
+    let target = base.join("t");
+    std::fs::create_dir_all(&target).expect("mkdir");
+    let link = base.join("l");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let link_s = link.display().to_string();
+    let o = run_with_fake_bin_args(
+        "wdlink",
+        "exit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_WORK_DIR", &link_s)],
+    );
+    let touched = std::fs::read_dir(&target).map(|d| d.count()).unwrap_or(99);
+    std::fs::remove_dir_all(&base).ok();
+    assert_eq!(o.code, Some(70));
+    assert_eq!(touched, 0);
 }
