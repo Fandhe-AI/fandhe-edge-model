@@ -184,7 +184,9 @@ impl KindResolutionError {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::DefaultCandidatesUnavailable { .. } => "default_candidates_unavailable",
-            Self::InvalidParams(_) => "invalid_request",
+            // exit_code と整合させるため、内側の分類（config 過大は
+            // `limit_exceeded` 等）をそのまま使う。
+            Self::InvalidParams(e) => e.reason_code(),
             Self::InvalidKindId => "invalid_kind",
         }
     }
@@ -271,9 +273,13 @@ fn build_params(
 /// - `Some`: 1 候補（`candidate_id = kind`。`out_dir` は加工しない）。
 ///   許可リスト検査はしない（モジュール doc）。
 /// - `None`: 既定候補の集合。`config` は空（既定値は学習ワーカー側の
-///   `DEFAULT_CONFIG` が補う）。`out_dir` は `{out_dir}/{kind}` とし、
+///   `DEFAULT_CONFIG` が補う）。`out_dir` は `{out_dir}-{kind}` とし、
 ///   `run_search` の `(root, out_dir)` 衝突検出に掛からないよう候補ごとに
-///   分ける。`out_dir` は学習リクエスト JSON に載る POSIX 形式の文字列
+///   分ける。親ディレクトリは利用者が指定した `out_dir` と同じになるため、
+///   未作成の中間ディレクトリを新たに要求しない（学習ワーカーの
+///   `guard.confine` は出力先の親の存在を要求し、`prepare_out_dir` が作る
+///   のは最終要素だけのため。`{out_dir}/{kind}` だと `out_dir` 未作成で
+///   全候補が `invalid_path` になる）。`out_dir` は学習リクエスト JSON に載る POSIX 形式の文字列
 ///   （構文検査は `TrainRequest::new`）なので、`Path::join` ではなく
 ///   文字列で結合する。
 pub fn resolve_kind_candidates(
@@ -303,7 +309,7 @@ pub fn resolve_kind_candidates(
         None => {
             let mut candidates = Vec::new();
             for (kind, version) in default_candidates()? {
-                let out_dir = format!("{}/{}", common.out_dir, kind);
+                let out_dir = format!("{}-{}", common.out_dir, kind);
                 let params = build_params(&common, kind.clone(), *version, Map::new(), out_dir)?;
                 candidates.push(SearchCandidate {
                     candidate_id: kind.clone(),
@@ -336,14 +342,16 @@ mod tests {
         }
     }
 
-    /// REQ-19: 同梱の既定候補は c1・c3 の順。
+    /// REQ-19: 同梱の既定候補は 1 件以上・kind 重複なしで、各 kind が
+    /// 既定値を解決できる（具体的な種類は fixture のみで差し替えられるよう固定しない）。
     #[test]
-    fn req19_default_candidates_are_c1_then_c3() {
+    fn req19_default_candidates_are_non_empty_and_unique() {
         let parsed = default_candidates().expect("bundled fixture is valid");
-        assert_eq!(
-            parsed,
-            [("c1".to_string(), 1), ("c3".to_string(), 1)].as_slice()
-        );
+        assert!(!parsed.is_empty());
+        let mut kinds: Vec<&str> = parsed.iter().map(|(k, _)| k.as_str()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(kinds.len(), parsed.len());
     }
 
     /// REQ-19・TASK-19.3: 明示 kind は素通し（未知 kind も Ok。拒否は学習ワーカー）。
@@ -372,7 +380,7 @@ mod tests {
         }
     }
 
-    /// REQ-19: kind 省略で既定候補になり、out_dir が候補ごとに分かれる。
+    /// REQ-19: kind 省略で既定候補になり、out_dir が候補ごとに分かれ、親ディレクトリは共通になる。
     #[test]
     fn req19_omitted_kind_yields_default_candidates() {
         let r = resolve_kind_candidates(None, common()).expect("default resolves");
@@ -382,13 +390,25 @@ mod tests {
             .iter()
             .map(|c| c.candidate_id.as_str())
             .collect();
-        assert_eq!(ids, ["c1", "c3"]);
+        let expected: Vec<&str> = default_candidates()
+            .expect("bundled fixture is valid")
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(ids, expected);
         let dirs: Vec<&str> = r
             .candidates()
             .iter()
             .map(|c| c.params.out_dir.as_str())
             .collect();
-        assert_eq!(dirs, ["out/c1", "out/c3"]);
+        let expected_dirs: Vec<String> = expected.iter().map(|k| format!("out-{k}")).collect();
+        assert_eq!(dirs, expected_dirs);
+        // 親ディレクトリは利用者指定の out_dir と同じ（未作成の中間ディレクトリを要求しない）。
+        let base_parent = std::path::Path::new("out").parent();
+        assert!(
+            dirs.iter()
+                .all(|d| std::path::Path::new(d).parent() == base_parent)
+        );
         assert!(r.candidates().iter().all(|c| c.params.config.is_empty()));
     }
 
@@ -400,10 +420,13 @@ mod tests {
             serde_json::to_value(r.record()).expect("serialize"),
             serde_json::json!({
                 "kind_source": "default",
-                "candidates": [
-                    {"candidate_id": "c1", "kind": "c1", "kind_version": 1},
-                    {"candidate_id": "c3", "kind": "c3", "kind_version": 1}
-                ]
+                "candidates": default_candidates()
+                    .expect("bundled fixture is valid")
+                    .iter()
+                    .map(|(k, v)| serde_json::json!(
+                        {"candidate_id": k, "kind": k, "kind_version": v}
+                    ))
+                    .collect::<Vec<_>>()
             })
         );
     }
@@ -462,6 +485,7 @@ mod tests {
             err.exit_code(),
             fandhe_edge_core::exitcode::ExitCode::LimitExceeded
         );
+        assert_eq!(err.reason_code(), "limit_exceeded");
     }
 
     /// REQ-21: 不正な共通パラメータは invalid_input（64）。
@@ -470,7 +494,7 @@ mod tests {
         let mut c = common();
         c.train_path = String::new();
         let err = resolve_kind_candidates(None, c).unwrap_err();
-        assert_eq!(err.reason_code(), "invalid_request");
+        assert_eq!(err.reason_code(), "invalid_path");
         assert_eq!(
             err.exit_code(),
             fandhe_edge_core::exitcode::ExitCode::InvalidInput

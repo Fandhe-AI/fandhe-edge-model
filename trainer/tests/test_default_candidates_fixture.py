@@ -51,9 +51,11 @@ def test_req19_default_candidates_have_kind_defaults() -> None:
         assert candidate["kind"] in defaults
 
 
-def test_req19_default_candidates_concrete_values() -> None:
-    """REQ-19・TASK-19.2: 既定候補は c1・c3（この順。同率時の優先順）。"""
-    assert _default_candidates() == [
-        {"kind": "c1", "kind_version": 1},
-        {"kind": "c3", "kind_version": 1},
-    ]
+def test_req19_default_candidates_are_unique_and_non_empty() -> None:
+    """REQ-19・TASK-19.2: 既定候補は 1 件以上で kind が重複しない。
+
+    具体的な種類は固定しない（fixture の差し替えだけで既定候補を変えられる）。
+    """
+    kinds_list = [c["kind"] for c in _default_candidates()]
+    assert kinds_list
+    assert len(set(kinds_list)) == len(kinds_list)
