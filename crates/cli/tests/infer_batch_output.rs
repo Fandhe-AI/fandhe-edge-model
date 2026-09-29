@@ -6,12 +6,11 @@
 
 use fandhe_edge_cli::infer_batch::{
     BatchLimits, emit_infer_batch, emit_infer_batch_with_limits, judgment_from_prediction,
-    predict_batch,
 };
 use fandhe_edge_cli::output::write_ok_judgment;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::infer_input::{InferInput, MAX_INFER_INPUT_BYTES};
+use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferencePipeline, MAX_INFER_BATCH_LEN, PreprocessError, Preprocessor,
     ScoringBackend, TokenIds,
@@ -19,7 +18,7 @@ use fandhe_edge_runtime::pipeline::{
 use std::io::{self, Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DEFINITION_JSON: &str = r#"{
   "schema": "fandhe-edge-model-definition/v1",
@@ -514,69 +513,6 @@ fn req39_cli_process_exits_at_deadline_when_inference_stalls() {
     );
 }
 
-/// `f` は推論失敗、`s` は 500 ms 止まる（期限をまたぐ）バックエンド。
-struct FailOrSlow;
-impl ScoringBackend for FailOrSlow {
-    fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
-        match ids.as_slice().first().copied() {
-            Some(102) => Err(BackendError::Failed),
-            Some(115) => {
-                std::thread::sleep(Duration::from_millis(500));
-                Ok(vec![0.5, 0.25, 0.25])
-            }
-            _ => Ok(vec![0.5, 0.25, 0.25]),
-        }
-    }
-    fn scores_limited(&self, ids: &TokenIds, _limit: Duration) -> Result<Vec<f64>, BackendError> {
-        // テスト用スタブ: 時間上限は対象外のため委譲する。
-        self.scores(ids)
-    }
-}
-
-fn predict_with_deadline(inputs: &[&str], deadline_ms: u64) -> Result<usize, ExitCode> {
-    let definition = definition();
-    let pipeline = InferencePipeline::new(Pre(Arc::new(Mutex::new(Vec::new()))), FailOrSlow);
-    let records: Vec<InferInput> = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            let line = format!("{{\"id\":\"r{i}\",\"input\":\"{input}\"}}");
-            InferInput::parse(&line, definition.io()).expect("valid record")
-        })
-        .collect();
-    let deadline = Instant::now().checked_add(Duration::from_millis(deadline_ms));
-    predict_batch(
-        &pipeline,
-        definition.options(),
-        &records,
-        deadline,
-        usize::MAX,
-    )
-    .map(|p| p.len())
-    .map_err(|e| e.code)
-}
-
-/// REQ-33: 1 件目が推論失敗、3 件目でバッチ全体の上限（期限）超過なら、入力順で先の 1 件目の
-/// `runtime_error` を採る（後続の `limit_exceeded` に上書きしない）。
-#[test]
-fn req33_earlier_record_failure_wins_over_later_batch_limit() {
-    // r0 は失敗、r1 は 500 ms 止まり期限（250 ms）を超えて、r2 の位置で期限超過になる。
-    assert_eq!(
-        predict_with_deadline(&["f", "s", "a"], 250),
-        Err(ExitCode::RuntimeError)
-    );
-}
-
-/// REQ-33: 1 件目で期限超過、3 件目が推論失敗なら、入力順で先のバッチ全体の失敗
-/// （`limit_exceeded`）を採る。
-#[test]
-fn req33_earlier_batch_limit_wins_over_later_record_failure() {
-    assert_eq!(
-        predict_with_deadline(&["s", "a", "f"], 250),
-        Err(ExitCode::LimitExceeded)
-    );
-}
-
 /// 子プロセスとして自身のテストバイナリを `test_name` だけ再実行し、終了コードと stdout を返す。
 /// 公開経路（`emit_infer_batch_with_limits`）は停止をプロセス終了で回収するため、停止を伴う
 /// シナリオはプロセスごと隔離して確かめる（REQ-39）。
@@ -696,4 +632,53 @@ fn req39_cli_process_exits_20_with_no_rows_when_compute_exceeds_deadline() {
         "stdout: {stdout}"
     );
     assert!(!stdout.contains("predicted_label"));
+}
+
+/// REQ-33・REQ-39: 1 件目がすぐ推論失敗し、2 件目の読み取りが止まっても、入力順で最初の失敗
+/// （1 件目の `runtime_error`）が期限より前に確定して届き、exit 70 で終わる
+/// （期限切れの `limit_exceeded` にならない）。
+#[test]
+fn req33_cli_first_record_failure_wins_when_next_read_stalls() {
+    /// 1 行目を返したあと、次の読み取りで止まる。
+    struct ThenStall(Cursor<Vec<u8>>);
+    impl Read for ThenStall {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            if n == 0 {
+                std::thread::sleep(Duration::from_secs(600));
+            }
+            Ok(n)
+        }
+    }
+    const CHILD_ENV: &str = "FANDHE_TEST_FAIL_THEN_STALL_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let definition = definition();
+        let (pipeline, _) = pipeline();
+        let mut out = io::stdout();
+        let result = emit_infer_batch_with_limits(
+            &mut out,
+            ThenStall(Cursor::new(b"{\"id\":\"r1\",\"input\":\"f\"}\n".to_vec())),
+            definition.io(),
+            definition.options(),
+            pipeline,
+            BatchLimits {
+                duration: Duration::from_secs(5),
+                ..BatchLimits::default()
+            },
+        );
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 99,
+        });
+    }
+    let (code, stdout, elapsed) = run_in_child(
+        "req33_cli_first_record_failure_wins_when_next_read_stalls",
+        CHILD_ENV,
+    );
+    assert!(elapsed < Duration::from_secs(4), "elapsed: {elapsed:?}");
+    assert_eq!(code, Some(70));
+    assert!(
+        stdout.contains("{\"code\":\"runtime_error\""),
+        "stdout: {stdout}"
+    );
 }

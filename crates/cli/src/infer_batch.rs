@@ -19,8 +19,8 @@
 //! - 成功（exit 0）: レコードごとに `JudgmentResult` の 1 行を入力順に出す（形は `--text` と同一）
 //! - 失敗: 全件の解析・検証・推論・`JudgmentResult` 構築の検証を書き込み前に終えるため、結果行は
 //!   1 行も出さず、`ErrorReport`（`{"code","message"}`）を 1 行だけ出す。失敗が複数あれば
-//!   入力順で最初のものを採る（決定的。優先規則は `first_failure` に集約。入力側の失敗行より前の
-//!   レコードだけを推論し、その推論失敗が入力側の失敗より先ならそちらを採る）
+//!   入力順で最初のものを採る（決定的。優先規則は `compute_batch` の 1 つのループに集約。
+//!   1 レコードずつ読み・推論し、最初の失敗が出た時点で打ち切って即座に受け手へ送る）
 //! - `JudgmentResult` は検証の段階では作って即捨て、書き込みの段階で 1 件ずつ作り直して
 //!   書く。結果行を全件保持しないため、選択肢 ID が結果ごとに複製されて大きくなるメモリ消費
 //!   （選択肢 ID の合計長 × 件数）が入力に比例して膨らまない。保持するのは
@@ -68,6 +68,9 @@
 //! 保証するため、crate の外から呼べる [`emit_infer_batch`]・[`emit_infer_batch_with_limits`] は
 //! 常にプロセス終了で回収するモード（CLI の 1 呼び出し 1 プロセス専用）で動き、回収しない
 //! モード（`StallPolicy::Leak`）は crate 内部（`pub(crate)`）とそのユニットテストに閉じ込める。
+//! 同様に、止まりうる同期処理（`Read::read` の読み取り・推論）を直接実行する関数
+//! （逐次読み取り・`compute_batch`）は crate 内部に限り、公開するのは停止を回収する `emit_*`
+//! だけとする（公開関数から直接呼ばれると、`Read::read` が返らない場合に時間上限を守れないため）。
 //!
 //! 長く動き続けるプロセス（将来の MCP サーバ。REQ-36・REQ-37）から推論する場合は、スレッドを
 //! 強制終了できないため、本関数を直接呼ばず CLI を子プロセスとして起動して隔離する前提とする
@@ -84,7 +87,7 @@ use fandhe_edge_core::infer_input::{InferInput, MAX_INFER_INPUT_BYTES};
 use fandhe_edge_core::judgment::JudgmentResult;
 use fandhe_edge_runtime::pipeline::{
     InferencePipeline, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES,
-    Prediction, Preprocessor, ScoringBackend,
+    MAX_INFER_BATCH_TOTAL_SCORES, Prediction, Preprocessor, ScoringBackend,
 };
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{Arc, mpsc};
@@ -131,125 +134,90 @@ fn report(code: ExitCode) -> ErrorReport {
     ErrorReport::new(code, default_message(code))
 }
 
-/// `reader` から 1 行 1 JSON の推論入力を読み、検証済みレコードを入力順に返す。
+/// 1 行 1 JSON の推論入力を、1 レコードずつ上限付きで読む（同期。REQ-33・REQ-39）。
 ///
-/// 上限は [`MAX_INFER_BATCH_TOTAL_BYTES`]。
-///
-/// # Errors
-/// 上限超過は `limit_exceeded`、非 UTF-8・不正レコード・有効 0 件は `invalid_input`、
-/// 読み取り失敗は `runtime_error`。message は固定語彙でデータを含まない。
-pub fn read_batch_records<R: Read>(
-    reader: R,
-    io: &IoSchema,
-) -> Result<Vec<InferInput>, ErrorReport> {
-    read_batch_records_until(
-        reader,
-        io,
-        Instant::now().checked_add(MAX_INFER_BATCH_DURATION),
-    )
-}
-
-/// [`read_batch_records`] の期限を指定できる版。1 行読むごとに期限を確認し、超過なら
-/// `limit_exceeded`（REQ-39）。`deadline` が `None` なら期限なし。
-///
-/// # Errors
-/// [`read_batch_records`] と同じ。
-pub fn read_batch_records_until<R: Read>(
-    reader: R,
-    io: &IoSchema,
+/// 計算スレッドが 1 レコード読むごとに推論へ進めるための逐次読み取りで、入力順の最初の失敗が
+/// 確定した時点で打ち切れる。`Read::read` が返らない場合の時間上限は保証しない（呼び出し側の
+/// 計算スレッドの期限待ちとプロセス終了が強制する。モジュール doc）ため、crate 内部に限る。
+struct RecordReader<'a, R: Read> {
+    reader: BufReader<io::Take<R>>,
+    io: &'a IoSchema,
+    byte_limit: usize,
     deadline: Option<Instant>,
-) -> Result<Vec<InferInput>, ErrorReport> {
-    read_batch_records_with_limit(reader, io, MAX_INFER_BATCH_TOTAL_BYTES, deadline)
+    consumed: usize,
+    count: usize,
 }
 
-/// [`read_batch_records`] のバイト上限を指定できる版（上限の境界テスト用）。
+impl<'a, R: Read> RecordReader<'a, R> {
+    fn new(reader: R, io: &'a IoSchema, byte_limit: usize, deadline: Option<Instant>) -> Self {
+        // 入力全体は上限 + 1 バイトで打ち切る（無制限の読み取りの防止。REQ-39）。
+        let cap = u64::try_from(byte_limit)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        Self {
+            reader: BufReader::new(reader.take(cap)),
+            io,
+            byte_limit,
+            deadline,
+            consumed: 0,
+            count: 0,
+        }
+    }
+
+    /// 次の有効レコード。入力の終わりは `Ok(None)`。空行・空白のみの行は読み飛ばす。
+    ///
+    /// 1 行ずつ、行長の上限 + 1 バイトまでしかバッファへ確保しない。巨大な単一行・空白行のみの
+    /// 入力でも、拒否前にファイル全体をメモリへ保持しない（REQ-39）。
+    fn next_record(&mut self) -> Result<Option<InferInput>, ErrorReport> {
+        loop {
+            if deadline_passed(self.deadline) {
+                return Err(report(ExitCode::LimitExceeded));
+            }
+            let (line_bytes, has_newline) = read_bounded_line(&mut self.reader)?;
+            if line_bytes.is_empty() && !has_newline {
+                return Ok(None);
+            }
+            self.consumed = self.consumed.saturating_add(line_bytes.len());
+            if self.consumed > self.byte_limit {
+                return Err(report(ExitCode::LimitExceeded));
+            }
+            let line_bytes = strip_line_ending(&line_bytes);
+            if line_bytes.len() > MAX_INFER_INPUT_BYTES {
+                return Err(report(ExitCode::LimitExceeded));
+            }
+            let line =
+                std::str::from_utf8(line_bytes).map_err(|_| report(ExitCode::InvalidInput))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if self.count >= MAX_INFER_BATCH_LEN {
+                return Err(report(ExitCode::LimitExceeded));
+            }
+            let record = InferInput::parse(line, self.io)
+                .map_err(|error| infer_input_error_report(&error))?;
+            self.count += 1;
+            return Ok(Some(record));
+        }
+    }
+}
+
+/// 読み取りだけを行って検証済みレコードを返す（バイト上限・期限の境界テスト用）。
+#[cfg(test)]
 fn read_batch_records_with_limit<R: Read>(
     reader: R,
     io: &IoSchema,
     byte_limit: usize,
     deadline: Option<Instant>,
 ) -> Result<Vec<InferInput>, ErrorReport> {
-    let (records, failure) = read_batch_records_partial(reader, io, byte_limit, deadline);
-    failure.map_or(Ok(records), Err)
-}
-
-/// 読み取りの失敗があっても、失敗した行より前の検証済みレコードを返す版（REQ-33・TASK-33.4）。
-///
-/// 戻り値の失敗は「入力順で最初の入力側の失敗」で、レコード数（= 失敗行の位置）と組で
-/// [`first_failure`] へ渡し、先行行の推論エラーとの優先を決める。有効 0 件も失敗（`invalid_input`）。
-fn read_batch_records_partial<R: Read>(
-    reader: R,
-    io: &IoSchema,
-    byte_limit: usize,
-    deadline: Option<Instant>,
-) -> (Vec<InferInput>, Option<ErrorReport>) {
-    let mut records = Vec::new();
-    let failure = read_records_into(reader, io, byte_limit, deadline, &mut records).err();
-    (records, failure)
-}
-
-fn read_records_into<R: Read>(
-    reader: R,
-    io: &IoSchema,
-    byte_limit: usize,
-    deadline: Option<Instant>,
-    records: &mut Vec<InferInput>,
-) -> Result<(), ErrorReport> {
-    // 入力全体は上限 + 1 バイトで打ち切る（無制限の読み取りの防止。REQ-39）。
-    let cap = u64::try_from(byte_limit)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut reader = BufReader::new(reader.take(cap));
-    let mut consumed: usize = 0;
-    // 1 行ずつ、行長の上限 + 1 バイトまでしかバッファへ確保しない。巨大な単一行・空白行のみの
-    // 入力でも、拒否前にファイル全体をメモリへ保持しない（REQ-39）。
-    loop {
-        if deadline_passed(deadline) {
-            return Err(report(ExitCode::LimitExceeded));
-        }
-        let (line_bytes, has_newline) = read_bounded_line(&mut reader)?;
-        if line_bytes.is_empty() && !has_newline {
-            break;
-        }
-        consumed = consumed.saturating_add(line_bytes.len());
-        if consumed > byte_limit {
-            return Err(report(ExitCode::LimitExceeded));
-        }
-        let line_bytes = strip_line_ending(&line_bytes);
-        if line_bytes.len() > MAX_INFER_INPUT_BYTES {
-            return Err(report(ExitCode::LimitExceeded));
-        }
-        let line = std::str::from_utf8(line_bytes).map_err(|_| report(ExitCode::InvalidInput))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if records.len() >= MAX_INFER_BATCH_LEN {
-            return Err(report(ExitCode::LimitExceeded));
-        }
-        let record =
-            InferInput::parse(line, io).map_err(|error| infer_input_error_report(&error))?;
-        records.push(record);
+    let mut records = RecordReader::new(reader, io, byte_limit, deadline);
+    let mut out = Vec::new();
+    while let Some(record) = records.next_record()? {
+        out.push(record);
     }
-    if records.is_empty() {
+    if out.is_empty() {
         return Err(report(ExitCode::InvalidInput));
     }
-    Ok(())
-}
-
-/// 入力側の失敗（読み取り・検証。失敗行の直前までのレコードは推論済み）と先行行の推論側の
-/// 失敗のうち、入力順で最初のものを採る（REQ-33・TASK-33.4）。
-///
-/// 推論側の失敗は失敗行より前の行で起きたものだけが渡されるため、あれば常にそれが先。
-/// バッチ全体の終了コードの優先規則はここに集約する。
-fn first_failure<T>(
-    prefix_outcome: Result<T, ErrorReport>,
-    input_failure: Option<ErrorReport>,
-) -> Result<T, ErrorReport> {
-    match (prefix_outcome, input_failure) {
-        (Err(inference_failure), _) => Err(inference_failure),
-        (Ok(_), Some(input_failure)) => Err(input_failure),
-        (Ok(value), None) => Ok(value),
-    }
+    Ok(out)
 }
 
 /// 1 行（改行を含む）を最大 `MAX_INFER_INPUT_BYTES + 2` バイトまで読む。
@@ -394,60 +362,16 @@ impl OutputWatchdog {
     }
 }
 
-/// 全レコードを `infer_batch_until` で推論し、各予測が `JudgmentResult` として組み立てられる
-/// ことを検証したうえで、入力順の予測を返す（書き込みはしない）。
+/// 読み取り・推論・出力量の検証までを 1 レコードずつ入力順に行う計算段階。書き込みはしない。
+///
+/// 「入力順で最初の失敗」（読み取り・検証・推論・`JudgmentResult` 構築・出力量・バッチ全体の
+/// 上限）が出た時点でそれが確定するため、即座に打ち切って `Err` を返す（呼び出し側の受け手へ
+/// 直ちに届く。より前の位置で後から失敗が起きることはない）。判断規則はこの 1 つのループに
+/// 集約する。1 件の推論は単体推論と同じ `run_single` を通す（REQ-28）。推論側へ渡すのは
+/// `input` のみ（id・ラベル・分割情報は渡さない）。
 ///
 /// `JudgmentResult` は検証のためだけに作って捨てる。全件を保持すると選択肢 ID が結果ごとに
-/// 複製されメモリが入力に比例して膨らむため、書き込み側（[`emit_infer_batch`]）が 1 件ずつ
-/// 作り直す（REQ-39）。検証時に各行の直列化後の長さ（改行込み）を合計し、`output_byte_limit` を
-/// 超えたら `limit_exceeded` とする（書き込み前に総出力量を拒否するため。REQ-39）。
-///
-/// # Errors
-/// バッチ全体の失敗（期限超過を含む）、または入力順で最初の 1 件の失敗を `ErrorReport` で返す。
-pub fn predict_batch<P: Preprocessor, B: ScoringBackend>(
-    pipeline: &InferencePipeline<P, B>,
-    options: &[Choice],
-    records: &[InferInput],
-    deadline: Option<Instant>,
-    output_byte_limit: usize,
-) -> Result<Vec<Prediction>, ErrorReport> {
-    // 推論側へ渡すのは input のみ（id・ラベル・分割情報は渡さない）。
-    let inputs: Vec<&str> = records.iter().map(InferInput::input).collect();
-    // バッチ全体の失敗（期限・上限）は発生位置（処理済み件数）を持つため、それより前の件の失敗と
-    // 入力順で比べる（先に起きた失敗を `?` で上書きしない。REQ-33）。
-    let partial = pipeline.infer_batch_partial_until(&inputs, deadline);
-    let predictions = partial.results;
-    if predictions.len() > records.len() {
-        return Err(report(ExitCode::RuntimeError));
-    }
-    let mut validated = Vec::with_capacity(predictions.len());
-    let mut output_bytes: usize = 0;
-    for (record, prediction) in records.iter().zip(predictions) {
-        let row_outcome = prediction
-            .map_err(|error| error.to_error_report())
-            .and_then(|prediction| {
-                let result = judgment_from_prediction(options, record.id(), &prediction)?;
-                let line = result
-                    .to_json_line()
-                    .map_err(|_| report(ExitCode::RuntimeError))?;
-                // 改行 1 バイトを加える。
-                output_bytes = output_bytes.saturating_add(line.len()).saturating_add(1);
-                if output_bytes > output_byte_limit {
-                    return Err(report(ExitCode::LimitExceeded));
-                }
-                Ok(prediction)
-            });
-        validated.push(row_outcome?);
-    }
-    // 全件の処理済みの各件が成功なら、次の位置で起きたバッチ全体の失敗を採る。
-    match partial.failure {
-        Some(error) => Err(error.to_error_report()),
-        None if validated.len() != records.len() => Err(report(ExitCode::RuntimeError)),
-        None => Ok(validated),
-    }
-}
-
-/// 読み取り・推論・出力量の検証までを行う計算段階。書き込みはしない。
+/// 複製されメモリが入力に比例して膨らむため、書き込み側が 1 件ずつ作り直す（REQ-39）。
 fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     reader: R,
     io: &IoSchema,
@@ -456,20 +380,44 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     deadline: Option<Instant>,
     output_byte_limit: usize,
 ) -> Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport> {
-    let (records, input_failure) =
-        read_batch_records_partial(reader, io, MAX_INFER_BATCH_TOTAL_BYTES, deadline);
-    // 入力エラーが後続行にあっても、先行行の推論エラーが入力順で先なら、それを採る。
-    // 失敗行より前のレコードだけを推論する（失敗行以降は推論しない）。
-    let predictions = if records.is_empty() {
-        Vec::new()
-    } else {
-        first_failure(
-            predict_batch(pipeline, options, &records, deadline, output_byte_limit),
-            input_failure.clone(),
-        )?
-    };
-    if let Some(failure) = input_failure {
-        return Err(failure);
+    let mut reader = RecordReader::new(reader, io, MAX_INFER_BATCH_TOTAL_BYTES, deadline);
+    let mut records = Vec::new();
+    let mut predictions = Vec::new();
+    let mut retained_scores: usize = 0;
+    let mut output_bytes: usize = 0;
+    while let Some(record) = reader.next_record()? {
+        let partial = pipeline.infer_batch_partial_until(&[record.input()], deadline);
+        let mut results = partial.results.into_iter();
+        let prediction = match results.next() {
+            Some(result) => result.map_err(|error| error.to_error_report())?,
+            None => {
+                return Err(partial
+                    .failure
+                    .map_or_else(|| report(ExitCode::RuntimeError), |e| e.to_error_report()));
+            }
+        };
+        let result = judgment_from_prediction(options, record.id(), &prediction)?;
+        let line = result
+            .to_json_line()
+            .map_err(|_| report(ExitCode::RuntimeError))?;
+        // 改行 1 バイトを加える。
+        output_bytes = output_bytes.saturating_add(line.len()).saturating_add(1);
+        if output_bytes > output_byte_limit {
+            return Err(report(ExitCode::LimitExceeded));
+        }
+        retained_scores = retained_scores.saturating_add(prediction.scores().len());
+        if retained_scores > MAX_INFER_BATCH_TOTAL_SCORES {
+            return Err(report(ExitCode::LimitExceeded));
+        }
+        // この件が期限を超えて完了した場合の DeadlineExceeded は partial.failure に載る。
+        if let Some(failure) = partial.failure {
+            return Err(failure.to_error_report());
+        }
+        records.push(record);
+        predictions.push(prediction);
+    }
+    if records.is_empty() {
+        return Err(report(ExitCode::InvalidInput));
     }
     // 出力の途中で打ち切ると出力が壊れるため、書き始める前にだけ期限を確認する。
     if deadline_passed(deadline) {
@@ -741,8 +689,13 @@ mod tests {
     #[test]
     fn req39_read_deadline_is_enforced() {
         let line = "{\"id\":\"a\",\"input\":\"x\"}\n";
-        let err = read_batch_records_until(line.as_bytes(), &io_schema(), Some(Instant::now()))
-            .unwrap_err();
+        let err = read_batch_records_with_limit(
+            line.as_bytes(),
+            &io_schema(),
+            MAX_INFER_BATCH_TOTAL_BYTES,
+            Some(Instant::now()),
+        )
+        .unwrap_err();
         assert_eq!(err.code, ExitCode::LimitExceeded);
     }
 
@@ -769,21 +722,80 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// REQ-33: 入力順で最初の失敗を採る。先行行の推論失敗は後続行の入力失敗より優先し、
-    /// 推論失敗が無ければ入力失敗を返す。
+    const UNIT_DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,
+"judgment_type":"single_select","options":[
+{"id":"a","display_name":"A","description":"a"},
+{"id":"b","display_name":"B","description":"b"},
+{"id":"c","display_name":"C","description":"c"}],"io":{"input":"bytes"}}"#;
+
+    /// `f` は推論失敗、`s` は 500 ms 止まる（期限をまたぐ）バックエンド。
+    struct FailOrSlow;
+    impl ScoringBackend for FailOrSlow {
+        fn scores(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            match ids.as_slice().first().copied() {
+                Some(102) => Err(fandhe_edge_runtime::pipeline::BackendError::Failed),
+                Some(115) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(vec![0.5, 0.25, 0.25])
+                }
+                _ => Ok(vec![0.5, 0.25, 0.25]),
+            }
+        }
+        fn scores_limited(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            // テスト用スタブ: 時間上限は対象外のため委譲する。
+            self.scores(ids)
+        }
+    }
+
+    fn compute_with_deadline(inputs: &[&str], deadline_ms: u64) -> Result<usize, ExitCode> {
+        let definition = fandhe_edge_core::definition::Definition::parse(UNIT_DEFINITION)
+            .expect("valid definition");
+        let pipeline = InferencePipeline::new(UnitPre, FailOrSlow);
+        let text: String = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| format!("{{\"id\":\"r{i}\",\"input\":\"{input}\"}}\n"))
+            .collect();
+        let deadline = Instant::now().checked_add(Duration::from_millis(deadline_ms));
+        compute_batch(
+            std::io::Cursor::new(text.into_bytes()),
+            definition.io(),
+            definition.options(),
+            &pipeline,
+            deadline,
+            usize::MAX,
+        )
+        .map(|(records, _)| records.len())
+        .map_err(|e| e.code)
+    }
+
+    /// REQ-33: 1 件目が推論失敗なら、後続で期限を超えることになっても入力順で先の 1 件目の
+    /// `runtime_error` が確定し、以降の読み取り・推論には進まない。
     #[test]
-    fn req33_first_failure_prefers_earlier_inference_failure() {
-        let inference = Err::<(), _>(report(ExitCode::RuntimeError));
-        let input = Some(report(ExitCode::InvalidInput));
+    fn req33_earlier_record_failure_wins_over_later_deadline() {
+        // 1 件目の失敗で即座に打ち切るため、2 件目の 500 ms の停止には到達しない。
+        let started = Instant::now();
         assert_eq!(
-            first_failure(inference, input.clone()).unwrap_err().code,
-            ExitCode::RuntimeError
+            compute_with_deadline(&["f", "s", "a"], 250),
+            Err(ExitCode::RuntimeError)
         );
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    /// REQ-33: 1 件目で期限を超えたら、3 件目が推論失敗でも先の期限超過（`limit_exceeded`）を採る。
+    #[test]
+    fn req33_earlier_deadline_wins_over_later_record_failure() {
         assert_eq!(
-            first_failure(Ok(()), input).unwrap_err().code,
-            ExitCode::InvalidInput
+            compute_with_deadline(&["s", "a", "f"], 250),
+            Err(ExitCode::LimitExceeded)
         );
-        assert!(first_failure(Ok(()), None).is_ok());
     }
 
     /// 書き込みのたびに一定時間止まる出力先。
