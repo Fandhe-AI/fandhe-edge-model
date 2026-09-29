@@ -10,6 +10,7 @@
 #   1. CLI バイナリ `fandhe-edge`（`fandhe-edge-train` を含むが、Python へは子プロセスでしか
 #      到達せず動的リンクは無い見込み）
 #   2. 推論ランタイムの結合テスト実行ファイル `env_isolation`
+# Darwin では依存ライブラリを再帰的に辿る（直接リンクのみだと間接依存を見逃すため）。
 # 続けて `env -i PATH=/usr/bin:/bin` で env_isolation を実行し、実機での実行記録を採る。
 # CLI `infer` の推論そのものは工程の接続（#136）が未完のため確認対象外（help のみ smoke）。
 #
@@ -41,25 +42,64 @@ case $(uname -s) in
 esac
 command -v "$TOOL" >/dev/null 2>&1 || { echo "error: $TOOL not found" >&2; exit 1; }
 
-list_libs() {
-  # otool -L は先頭行に検査対象パス自体を出すため除き、ライブラリ行だけを判定対象にする
-  # （作業ディレクトリ名に python・mlx が含まれても誤一致させない）
-  if [ "$TOOL" = otool ]; then
-    out=$(otool -L "$1") || return 1
-    printf '%s\n' "$out" | sed 1d
-  else
-    ldd "$1"
-  fi
+# 直接依存のライブラリ名を 1 行 1 件で出す。otool -L は先頭行に検査対象パス自体を出すため除き、
+# ライブラリ行（先頭の空白と括弧内の version 情報を除いた名前）だけを判定対象にする
+# （作業ディレクトリ名に python・mlx が含まれても誤一致させない）。
+direct_deps() {
+  out=$(otool -L "$1") || return 1
+  printf '%s\n' "$out" | sed 1d | sed 's/^[[:space:]]*//; s/ (.*$//'
+}
+
+# Darwin: 直接リンクだけでは「依存ライブラリがさらに Python・MLX へ依存する」経路を見逃すため、
+# 絶対パスで実在する依存を再帰的に辿る（REQ-32。上限 MAX_LIBS 件で打ち切り fail-closed）。
+# @rpath・@loader_path 等の未解決参照は辿れないが、名前は PATTERN で判定する。
+# /usr/lib・/System 配下は OS 提供（dyld shared cache 内）のため再帰しない。
+# Linux の ldd は推移的依存を含めて出力するため再帰不要。
+MAX_LIBS=500
+collect_libs() {
+  : >"$2"
+  q=$(mktemp)
+  printf '%s\n' "$1" >"$q"
+  : >"$q.seen"
+  seen=0
+  while [ -s "$q" ]; do
+    cur=$(head -n 1 "$q")
+    sed 1d "$q" >"$q.n" && mv "$q.n" "$q"
+    direct_deps "$cur" >"$q.d" || { rm -f "$q" "$q.d" "$q.seen"; return 1; }
+    while IFS= read -r dep; do
+      [ -n "$dep" ] || continue
+      printf '%s\n' "$dep" >>"$2"
+      case $dep in
+        /usr/lib/*|/System/*) continue ;;
+        /*) [ -f "$dep" ] || continue ;;
+        *) continue ;;
+      esac
+      if grep -qxF "$dep" "$q.seen"; then continue; fi
+      printf '%s\n' "$dep" >>"$q.seen"
+      printf '%s\n' "$dep" >>"$q"
+      seen=$((seen + 1))
+      if [ "$seen" -gt "$MAX_LIBS" ]; then
+        echo "error: too many dependent libraries (> $MAX_LIBS)" >&2
+        rm -f "$q" "$q.d" "$q.seen"
+        return 1
+      fi
+    done <"$q.d"
+  done
+  rm -f "$q" "$q.d" "$q.seen" "$q.n"
 }
 
 for bin in "$CLI_BIN" "$TEST_BIN"; do
-  echo "== $TOOL: $bin =="
-  list_libs "$bin" >"$TMP" 2>&1 || { echo "error: $TOOL failed" >&2; exit 1; }
+  echo "== $TOOL (transitive on Darwin): $bin =="
+  if [ "$TOOL" = otool ]; then
+    collect_libs "$bin" "$TMP" || { echo "error: otool failed" >&2; exit 1; }
+  else
+    ldd "$bin" >"$TMP" 2>&1 || { echo "error: ldd failed" >&2; exit 1; }
+  fi
   if grep -i -E "$PATTERN" "$TMP"; then
-    echo "FAIL: dynamic link to Python/MLX found in $bin" >&2
+    echo "FAIL: dynamic link to Python/MLX found in $bin (direct or transitive)" >&2
     exit 1
   fi
-  echo "no Python/MLX dynamic link"
+  echo "no Python/MLX dynamic link (direct and transitive)"
 done
 
 echo "== env -i run: env_isolation =="
