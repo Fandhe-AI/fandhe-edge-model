@@ -40,9 +40,12 @@ pub const MAX_INFER_BATCH_LEN: usize = 100_000;
 pub const MAX_INFER_BATCH_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// 1 回のバッチ推論の処理時間（壁時計）の上限（暫定値。REQ-39）。
-/// 1 件ごとの処理の前に期限を確認し、超過したら以降を処理せずバッチ全体を失敗とする
-/// （`limit_exceeded`）。協調的な打ち切りで、1 件の呼び出しの内部で止まったバックエンドを
-/// 中断する仕組みではない（ONNX 推論の実装〔#113〕で 1 件の上限を別途検討する）。
+/// 1 件ごとの処理の前後（最後の 1 件の後も含む）に期限を確認し、超過したら以降を処理せず
+/// バッチ全体を失敗とする（`limit_exceeded`）。CLI は入力の読み取り開始時点から期限を数え、
+/// 読み取り・推論・出力の全体へ同じ期限を適用する。協調的な打ち切りで、1 件の呼び出しの
+/// 内部で止まったバックエンドを中断する仕組みではない（ONNX 推論の実装〔#113〕で 1 件の
+/// 上限〔session の中断〕を別途扱う。未対応の間は、期限超過した 1 件の結果を成功として返さない
+/// ことだけを保証する）。
 pub const MAX_INFER_BATCH_DURATION: Duration = Duration::from_secs(600);
 
 /// 前処理後のトークン数の上限（暫定値。REQ-39）。NFKC 正規化による膨張を見込み、
@@ -304,6 +307,10 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
                 return Err(BatchError::DeadlineExceeded);
             }
             let result = self.run_single(input);
+            // 最後の 1 件が期限を超えて完了した場合も成功を返さない。
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(BatchError::DeadlineExceeded);
+            }
             if let Ok(p) = &result {
                 retained_scores = retained_scores.saturating_add(p.scores.len());
                 if retained_scores > MAX_INFER_BATCH_TOTAL_SCORES {
@@ -465,5 +472,22 @@ mod tests {
         let ok = pipeline.infer_batch_until(&["a", "b"], future).unwrap();
         assert_eq!(ok.len(), 2);
         assert_eq!(pipeline.infer_batch(&["a"]).unwrap().len(), 1);
+    }
+
+    struct SlowBackend;
+    impl ScoringBackend for SlowBackend {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(vec![0.25, 0.75])
+        }
+    }
+
+    /// REQ-39: 最後の 1 件が期限を超えて完了した場合も成功を返さない。
+    #[test]
+    fn req39_batch_deadline_covers_last_item() {
+        let pipeline = InferencePipeline::new(StubPre, SlowBackend);
+        let deadline = Instant::now().checked_add(Duration::from_millis(10));
+        let err = pipeline.infer_batch_until(&["a"], deadline).unwrap_err();
+        assert_eq!(err, BatchError::DeadlineExceeded);
     }
 }
