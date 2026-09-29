@@ -61,12 +61,27 @@
 //! で解消し、同率だった候補 ID の一覧（[`SelectionDecision::Selected::tied_candidate_ids`]）
 //! を記録に残す。
 //!
+//! # 予算到達の扱い（TASK-18.2・issue #85・REQ-18 異常系）
+//!
+//! 「予算到達」は探索全体の予算（[`BudgetReachedScope::SearchBudget`]）と
+//! 候補ごとの持ち時間（[`BudgetReachedScope::CandidateTimeLimit`]）の両方を
+//! 含む（2026-09-27 オーナー判断）。該当するかは
+//! [`CandidateSearchResult::budget_reached`] だけから求め（単一真実源）、
+//! 候補ごとの JSON に `budget_reached`、探索記録の最上位に
+//! [`SearchRecord::budget_reached`] を出す（PoC-17 の `budget_reached`・
+//! PoC-10 の `status = "budget_reached"` の規約に対応）。予算到達の候補は
+//! 合格（選定）とも不合格（`TrainingNotCompleted`・`ScoringFailed`）とも別の
+//! 状態で、選定の後に [`run_search`] が「選ばれた候補が `Evaluated` かつ
+//! 予算到達でない」ことを fail-closed で照合する。
+//!
+//! 持ち時間の判定は成功した候補では厳密な `>`（ちょうど一致は含めない。
+//! `TrainingExceededTimeLimit` doc 参照）で、spec の「達した」との差は
+//! オーナー判断待ち。
+//!
 //! # スコープ外（他 Issue が対象）
 //!
 //! - McNemar・Holm による有意性判定と、その選定記録への埋め込み（TASK-18.3-1・
 //!   issue #87）
-//! - 「予算到達」を合格扱いにしない判定・記録上のラベル付け（TASK-18.2・
-//!   issue #85）
 //! - 推論ランタイム（REQ-28 系）を使った採点（本モジュールの採点は学習ワーカー
 //!   内の学習直後の予測。ONNX 書き出しモデルとの一致は各 kind のテストで確認する）
 //! - 記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コードへの
@@ -292,6 +307,18 @@ pub enum NotStartedReason {
     BudgetExhausted,
 }
 
+/// 「予算到達」の範囲（REQ-18 異常系・TASK-18.2・issue #85。2026-09-27
+/// オーナー判断で両方を含める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BudgetReachedScope {
+    /// 探索全体の予算に達した。
+    SearchBudget,
+    /// 候補ごとの持ち時間に達した。
+    CandidateTimeLimit,
+}
+
 /// 候補 1 件の探索結果の分類。
 ///
 /// `validation_outcomes`（[`Outcome`] の列）は JSON へ出さない
@@ -397,6 +424,25 @@ pub enum CandidateSearchResult {
     },
 }
 
+impl CandidateSearchResult {
+    /// 予算到達にあたる場合にその範囲を返す（TASK-18.2・REQ-18 異常系）。
+    /// 予算到達は合格・選定扱いにせず、不合格（`TrainingNotCompleted`・
+    /// `ScoringFailed`）とも区別する。バリアントを足すときに分類を強制する
+    /// ため `_` アームを置かない。
+    #[must_use]
+    pub fn budget_reached(&self) -> Option<BudgetReachedScope> {
+        match self {
+            Self::NotStarted { .. }
+            | Self::ScoringSkippedBudgetExhausted
+            | Self::ScoringExceededBudget { .. } => Some(BudgetReachedScope::SearchBudget),
+            Self::TrainingExceededTimeLimit | Self::TrainingTimedOut => {
+                Some(BudgetReachedScope::CandidateTimeLimit)
+            }
+            Self::Evaluated { .. } | Self::TrainingNotCompleted | Self::ScoringFailed => None,
+        }
+    }
+}
+
 /// 候補 1 件の探索記録（時刻・打ち切り分類・探索結果の組）。
 ///
 /// `Debug` は手書きする（下記）。`validation_outcomes`（[`Outcome`] の列。
@@ -405,7 +451,7 @@ pub enum CandidateSearchResult {
 /// 出していないにもかかわらず、デバッグ出力（ログ等）から予測ラベルの
 /// 内容がそのまま漏れてしまう（security.md「秘密情報の混入防止」。P0
 /// 指摘対応。issue #84 PR #238 レビュー）。
-#[derive(Clone, PartialEq, serde::Serialize)]
+#[derive(Clone, PartialEq)]
 pub struct CandidateSearchEntry {
     /// 候補 ID。
     pub candidate_id: String,
@@ -417,13 +463,37 @@ pub struct CandidateSearchEntry {
     /// 分類の記録（候補が実行された場合のみ `Some`）。
     pub time: Option<CandidateTimeRecord>,
     /// 探索結果の分類。
-    #[serde(flatten)]
     pub result: CandidateSearchResult,
     /// validation 推論結果（評価済み候補のみ）。JSON には出さない
     /// （モジュール doc「評価契約との関係」・[`CandidateSearchResult`] doc
     /// 参照）。
-    #[serde(skip)]
     validation_outcomes: Option<Vec<Outcome>>,
+}
+
+/// [`CandidateSearchEntry`] の JSON 表現（手書き `Serialize` の影の構造体）。
+/// `budget_reached` は `result` から毎回求め、`pub` の `result` と食い違う
+/// 値を保存しない。`validation_outcomes` は出さない。
+#[derive(serde::Serialize)]
+struct CandidateSearchEntryJson<'a> {
+    candidate_id: &'a str,
+    elapsed_at_start_ms: Option<u64>,
+    time: &'a Option<CandidateTimeRecord>,
+    #[serde(flatten)]
+    result: &'a CandidateSearchResult,
+    budget_reached: Option<BudgetReachedScope>,
+}
+
+impl serde::Serialize for CandidateSearchEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CandidateSearchEntryJson {
+            candidate_id: &self.candidate_id,
+            elapsed_at_start_ms: self.elapsed_at_start_ms,
+            time: &self.time,
+            result: &self.result,
+            budget_reached: self.result.budget_reached(),
+        }
+        .serialize(serializer)
+    }
 }
 
 /// [`CandidateSearchEntry`] の手書き `Debug` が使う補助型。
@@ -456,6 +526,12 @@ impl std::fmt::Debug for CandidateSearchEntry {
 }
 
 impl CandidateSearchEntry {
+    /// 予算到達の範囲（[`CandidateSearchResult::budget_reached`]）。
+    #[must_use]
+    pub fn budget_reached(&self) -> Option<BudgetReachedScope> {
+        self.result.budget_reached()
+    }
+
     /// validation 推論結果（評価済み候補のみ `Some`）。issue #87
     /// （TASK-18.3-1）が McNemar 検定に使うための読み取り専用アクセサ。
     #[must_use]
@@ -502,6 +578,12 @@ pub struct SearchRecord {
     pub candidates: Vec<CandidateSearchEntry>,
     /// 選定結果。
     pub selection: SelectionDecision,
+    /// いずれかの候補が予算到達（全体予算・持ち時間の両方。2026-09-27
+    /// オーナー判断）、または探索全体の経過時間が予算に達した（TASK-18.2・
+    /// REQ-18 異常系。PoC-17 の `budget_reached` に対応）。`true` でも
+    /// 予算到達でない完了候補からの選定はありうる（PoC-17 状況 5
+    /// 「完了した候補だけで選定」と同じ規約）。
+    pub budget_reached: bool,
 }
 
 /// [`run_search`]・事前検証（[`validate_input`]）のエラー。
@@ -1661,6 +1743,11 @@ where
         detail: format!("{e:?}"),
     })?;
 
+    ensure_selected_not_budget_reached(&selection, &entries)
+        .map_err(|detail| SearchError::Internal { detail })?;
+    let budget_reached =
+        entries.iter().any(|e| e.budget_reached().is_some()) || total_elapsed_ms >= budget_ms;
+
     let validation_records =
         u64::try_from(input.validation_gold.len()).map_err(|_| SearchError::Internal {
             detail: "validation record count does not fit in u64".to_string(),
@@ -1674,7 +1761,29 @@ where
         validation_records,
         candidates: entries,
         selection,
+        budget_reached,
     })
+}
+
+/// 選ばれた候補が `Evaluated` かつ予算到達でないことを照合する（TASK-18.2・
+/// REQ-18 異常系の fail-closed ガード）。通常経路では到達しない防御的分岐。
+/// `Err` の文言は固定で、データ本文を含めない。
+fn ensure_selected_not_budget_reached(
+    selection: &SelectionDecision,
+    entries: &[CandidateSearchEntry],
+) -> Result<(), String> {
+    let SelectionDecision::Selected { candidate_id, .. } = selection else {
+        return Ok(());
+    };
+    match entries.iter().find(|e| e.candidate_id == *candidate_id) {
+        Some(e)
+            if matches!(e.result, CandidateSearchResult::Evaluated { .. })
+                && e.budget_reached().is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err("selected candidate is not an evaluated, non-budget-reached record".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -2653,5 +2762,109 @@ mod tests {
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
         assert_eq!(err, SearchError::InvalidCandidateId { index: 0 });
+    }
+
+    /// (TASK-18.2・REQ-18 異常系) 5 つのバリアントが期待する範囲に写る。
+    #[test]
+    fn task18_2_budget_reached_maps_each_variant_to_scope() {
+        let acc = ValidationAccuracy {
+            correct: 1,
+            total: 2,
+            value: 0.5,
+        };
+        let cases = [
+            (
+                CandidateSearchResult::NotStarted {
+                    reason: NotStartedReason::BudgetExhausted,
+                },
+                Some(BudgetReachedScope::SearchBudget),
+            ),
+            (
+                CandidateSearchResult::ScoringSkippedBudgetExhausted,
+                Some(BudgetReachedScope::SearchBudget),
+            ),
+            (
+                CandidateSearchResult::ScoringExceededBudget {
+                    validation_accuracy: acc,
+                },
+                Some(BudgetReachedScope::SearchBudget),
+            ),
+            (
+                CandidateSearchResult::TrainingExceededTimeLimit,
+                Some(BudgetReachedScope::CandidateTimeLimit),
+            ),
+            (
+                CandidateSearchResult::TrainingTimedOut,
+                Some(BudgetReachedScope::CandidateTimeLimit),
+            ),
+            (
+                CandidateSearchResult::Evaluated {
+                    validation_accuracy: acc,
+                },
+                None,
+            ),
+            (CandidateSearchResult::TrainingNotCompleted, None),
+            (CandidateSearchResult::ScoringFailed, None),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result.budget_reached(), expected, "{result:?}");
+        }
+    }
+
+    /// (TASK-18.2) 範囲は snake_case で直列化される。
+    #[test]
+    fn task18_2_budget_reached_scope_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&BudgetReachedScope::SearchBudget).expect("ser"),
+            "\"search_budget\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BudgetReachedScope::CandidateTimeLimit).expect("ser"),
+            "\"candidate_time_limit\""
+        );
+    }
+
+    /// (TASK-18.2・REQ-18 異常系) 予算到達の記録を指す `Selected` は拒否される。
+    #[test]
+    fn task18_2_guard_rejects_budget_reached_selection() {
+        let acc = ValidationAccuracy {
+            correct: 1,
+            total: 2,
+            value: 0.5,
+        };
+        let entry = |id: &str, result| CandidateSearchEntry {
+            candidate_id: id.to_string(),
+            elapsed_at_start_ms: Some(0),
+            time: None,
+            result,
+            validation_outcomes: None,
+        };
+        let selected = |id: &str| SelectionDecision::Selected {
+            candidate_id: id.to_string(),
+            validation_accuracy: acc,
+            rule: "r".to_string(),
+            tied_candidate_ids: vec![id.to_string()],
+        };
+        let entries = vec![
+            entry(
+                "a",
+                CandidateSearchResult::ScoringExceededBudget {
+                    validation_accuracy: acc,
+                },
+            ),
+            entry(
+                "b",
+                CandidateSearchResult::Evaluated {
+                    validation_accuracy: acc,
+                },
+            ),
+        ];
+        assert!(ensure_selected_not_budget_reached(&selected("a"), &entries).is_err());
+        assert!(ensure_selected_not_budget_reached(&selected("missing"), &entries).is_err());
+        assert!(ensure_selected_not_budget_reached(&selected("b"), &entries).is_ok());
+        assert!(
+            ensure_selected_not_budget_reached(&SelectionDecision::NoEligibleCandidate, &entries)
+                .is_ok()
+        );
     }
 }
