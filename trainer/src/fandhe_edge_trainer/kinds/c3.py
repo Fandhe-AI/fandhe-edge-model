@@ -37,6 +37,7 @@ PoC-10（`docs/spec/03-poc/scratch-classifier/scripts/train_mlx.py`。
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -63,6 +64,7 @@ from ..limits import (
     MAX_C3_WIDTHS,
     MIN_C3_WIDTHS,
 )
+from ..prediction import ok_prediction_record
 
 KIND = "c3"
 KIND_VERSION = 1
@@ -222,7 +224,17 @@ def _batchify(id_lists: list[list[int]]) -> tuple[mx.array, mx.array]:
 def _encode_examples(
     examples: list[TrainExample], max_bytes: int, resource_budget: budget_mod.ResourceBudget
 ) -> np.ndarray:
-    """学習データ全体を、あらかじめ確保した numpy int32 配列へ行ごとにエンコードする。
+    """学習データ全体を `_encode_texts` でエンコードする（入力本文だけを渡す。
+    ラベルは使わない）。
+    """
+    return _encode_texts([ex.input for ex in examples], max_bytes, resource_budget)
+
+
+def _encode_texts(
+    texts: Sequence[str], max_bytes: int, resource_budget: budget_mod.ResourceBudget
+) -> np.ndarray:
+    """入力本文の列を、あらかじめ確保した numpy int32 配列へ行ごとにエンコードする
+    （学習データ・学習直後の validation 予測〔`predict_labels`〕で共有する）。
 
     P0-1: Python のリストのリスト（`[[encode_bytes(...)], ...]`）として全件を
     保持すると、呼び出し前の `budget_mod.check_total_tokens` による見積もり
@@ -236,11 +248,11 @@ def _encode_examples(
     `(len(examples), 実際の最大長)`）。詰め物 id=0 の行（`encode_bytes("")`）を
     含め、既存の `_batchify` と同じ「id 0 = 詰め物」の規約に従う。
     """
-    n = len(examples)
+    n = len(texts)
     arr = np.zeros((n, max_bytes), dtype=np.int32)
     max_len = 1
-    for i, ex in enumerate(examples):
-        row = encode_bytes(ex.input, max_bytes)
+    for i, text in enumerate(texts):
+        row = encode_bytes(text, max_bytes)
         length = len(row)
         arr[i, :length] = row
         if length > max_len:
@@ -385,6 +397,45 @@ class C3Kind:
         if trained.resource_budget is not None:
             trained.resource_budget.check()
         _export_c3_onnx(trained, out)
+
+
+def predict_labels(
+    trained: C3TrainedModel,
+    rows: Sequence[tuple[str, str]],
+    resource_budget: budget_mod.ResourceBudget | None = None,
+) -> list[dict[str, Any]]:
+    """学習直後の validation 予測（REQ-18・REQ-27。`predict.py` から呼ばれる）。
+
+    `rows` は `(id, input)` の列で、**正解ラベルは受け取らない**。学習時と同じ
+    エンコード（`_encode_texts`）・マスク（`ids > 0`）・順伝播
+    （`ByteCNN.__call__`）を通し、argmax のラベルを返す（同点は `label_order` の
+    先頭側。numpy の `argmax` は最初の最大値を返す）。戻り値は入力と同じ順序・
+    件数の `{id, status:"ok", predicted_label}`。
+
+    チャンクは学習と同じ `batch_size`（学習開始前に資源検査済みの大きさ）。
+    チャンクごとに `resource_budget` を検査する（REQ-39。省略時は学習で使った
+    インスタンス）。詰め物位置はマスクされるため、チャンクの分け方で結果は変わらない
+    （REQ-28。`tests/test_c3_batch_parity.py`）。
+    """
+    budget = resource_budget if resource_budget is not None else trained.resource_budget
+    if budget is None:
+        raise WorkerError(
+            "runtime_error",
+            "prediction requires a resource budget",
+            ExitCode.RUNTIME_ERROR,
+        )
+    chunk_size = max(1, min(int(trained.config["batch_size"]), MAX_C3_BATCH_SIZE))
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(rows), chunk_size):
+        budget.check()
+        chunk = rows[start : start + chunk_size]
+        ids_arr = _encode_texts([text for _rid, text in chunk], trained.max_bytes, budget)
+        logits = trained.model(mx.array(ids_arr), mx.array((ids_arr > 0).astype(np.float32)))
+        chosen = np.argmax(np.array(logits, dtype=np.float32), axis=1)
+        budget.check()
+        for (rid, _text), label_index in zip(chunk, chosen, strict=True):
+            records.append(ok_prediction_record(rid, trained.label_order[int(label_index)]))
+    return records
 
 
 def _f32(arr: np.ndarray, name: str) -> TensorProto:
