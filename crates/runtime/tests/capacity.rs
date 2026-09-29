@@ -108,6 +108,21 @@ fn req30_alias_spelling_of_same_file_is_duplicate() {
     assert!(matches!(r, Err(CapacityError::DuplicatePath { .. })));
 }
 
+/// ハードリンクの別名も開いたハンドルの同一性で検出し、二重計上しない（REQ-30・REQ-39）。
+#[cfg(unix)]
+#[test]
+fn req30_hardlink_alias_is_duplicate() {
+    let d = TempDir::new("hardlink");
+    let p = write(d.path(), "a", 3);
+    let alias = d.path().join("b");
+    std::fs::hard_link(&p, &alias).unwrap();
+    let r = measure_package(&[
+        pf(PackageComponent::Weights, p),
+        pf(PackageComponent::Metadata, alias),
+    ]);
+    assert!(matches!(r, Err(CapacityError::DuplicatePath { .. })));
+}
+
 #[cfg(unix)]
 #[test]
 fn req30_symlink_is_rejected() {
