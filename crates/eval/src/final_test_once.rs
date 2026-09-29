@@ -24,10 +24,11 @@
 //!   キーを作り、`predict` へは**同じ [`ModelPackagePaths`]** を渡す。予測に使う
 //!   モデルとロックキーが同一のパスから導出され、評価前後のモデル不変性検証
 //!   （REQ-27）と一体で動く。
-//! - **事前登録**: 候補・seed の代表構成 ID と、その構成で当てる重みの sha256 の組
+//! - **事前登録**: 候補・seed の代表構成 ID と、その構成で当てるモデルパッケージ全構成要素
+//!   （重み・語彙・校正・しきい値。無い要素は「無い」）の sha256 の組
 //!   ([`RegisteredConfig`]) を、評価前に [`FinalTestLedger::register_configs`] で
 //!   評価データごとに 1 回だけ台帳へ凍結する。[`apply_once`] は登録済み集合に含まれない
-//!   ID、および登録した重みと異なる重みでの適用を拒否する（未使用 ID に別重みを当てて
+//!   ID、および登録したダイジェストと異なる構成要素での適用を拒否する（未使用 ID に別重みを当てて
 //!   再適用する迂回を拒否する。適用対象は評価前に確定し、初回適用後に新たな候補を
 //!   追加できない。PoC-10 の `APPLIED.json` 事前登録に相当）。登録後は集合を変更できない
 //!   （`create_new`）。
@@ -100,8 +101,8 @@ const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
 pub const MAX_REGISTERED_CONFIGS: usize = 1024;
 
 /// 事前登録ファイルの最大バイト数（読み込み前のサイズ上限。REQ-39）。
-/// 128 バイトの ID と重み sha256（hex 64 桁）の行を最大件数並べても収まる値。
-const MAX_REGISTRY_BYTES: u64 = (MAX_CONFIG_ID_BYTES as u64 + 1 + 64 + 1)
+/// 128 バイトの ID と sha256（hex 64 桁）4 個の行を最大件数並べても収まる値。
+const MAX_REGISTRY_BYTES: u64 = (MAX_CONFIG_ID_BYTES as u64 + 4 * (1 + 64) + 1)
     * MAX_REGISTERED_CONFIGS as u64
     + REGISTRY_HEADER.len() as u64;
 
@@ -138,20 +139,93 @@ impl RepresentativeConfigId {
 
 /// 事前登録する 1 件（代表構成 ID と、その構成で最終 test に当てる重みの sha256）。
 ///
-/// 重みのダイジェストを評価前に ID へ結び付けて凍結することで、登録済みだが未使用の
+/// 重み・語彙・校正・しきい値のダイジェストを評価前に ID へ結び付けて凍結することで、登録済みだが未使用の
 /// ID に別の重みを当てて最終 test を再適用する迂回を拒否する（REQ-27）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredConfig {
     id: RepresentativeConfigId,
     weights_sha256: Sha256Digest,
+    vocab_sha256: Option<Sha256Digest>,
+    calibration_sha256: Option<Sha256Digest>,
+    thresholds_sha256: Option<Sha256Digest>,
 }
 
 impl RegisteredConfig {
     /// 代表構成 ID と、評価前に確定した重みファイルの sha256 から作る。
     #[must_use]
     pub fn new(id: RepresentativeConfigId, weights_sha256: Sha256Digest) -> Self {
-        RegisteredConfig { id, weights_sha256 }
+        RegisteredConfig {
+            id,
+            weights_sha256,
+            vocab_sha256: None,
+            calibration_sha256: None,
+            thresholds_sha256: None,
+        }
     }
+
+    /// 語彙ファイルの sha256 も結び付ける（呼ばなければ「語彙なし」を登録する）。
+    #[must_use]
+    pub fn with_vocab(mut self, sha256: Sha256Digest) -> Self {
+        self.vocab_sha256 = Some(sha256);
+        self
+    }
+
+    /// 校正パラメータファイルの sha256 も結び付ける。
+    #[must_use]
+    pub fn with_calibration(mut self, sha256: Sha256Digest) -> Self {
+        self.calibration_sha256 = Some(sha256);
+        self
+    }
+
+    /// しきい値ファイルの sha256 も結び付ける。
+    #[must_use]
+    pub fn with_thresholds(mut self, sha256: Sha256Digest) -> Self {
+        self.thresholds_sha256 = Some(sha256);
+        self
+    }
+
+    /// モデルパッケージの全構成要素（重み・語彙・校正・しきい値）を自らハッシュして
+    /// 登録項目を作る。存在しない構成要素（`None`）は「無い」ことを登録する。
+    ///
+    /// # Errors
+    ///
+    /// いずれかのファイルのダイジェストを計算できない場合（[`AcquireError::WeightsDigest`]）。
+    pub fn from_package(
+        id: RepresentativeConfigId,
+        package: &ModelPackagePaths<'_>,
+    ) -> Result<Self, AcquireError> {
+        Ok(RegisteredConfig {
+            id,
+            weights_sha256: digest_component(package.weights)?,
+            vocab_sha256: digest_optional(package.vocab)?,
+            calibration_sha256: digest_optional(package.calibration)?,
+            thresholds_sha256: digest_optional(package.thresholds)?,
+        })
+    }
+}
+
+fn digest_component(path: &Path) -> Result<Sha256Digest, AcquireError> {
+    fandhe_edge_core::fs::sha256_file_bounded(path, MAX_MODEL_COMPONENT_BYTES)
+        .map_err(|source| AcquireError::WeightsDigest { source })
+}
+
+fn digest_optional(path: Option<&Path>) -> Result<Option<Sha256Digest>, AcquireError> {
+    path.map(digest_component).transpose()
+}
+
+fn opt_hex(d: &Option<Sha256Digest>) -> String {
+    d.as_ref().map_or_else(|| "-".to_string(), |d| d.to_hex())
+}
+
+fn parse_opt_digest(raw: &str) -> Result<Option<Sha256Digest>, AcquireError> {
+    if raw == "-" {
+        return Ok(None);
+    }
+    raw.parse::<Sha256Digest>()
+        .map(Some)
+        .map_err(|_| AcquireError::RegistryInvalid {
+            reason: "malformed registry digest",
+        })
 }
 
 /// 評価データ × 代表構成のロックファイル名（ハッシュ由来の固定長 hex のみ）。
@@ -265,6 +339,12 @@ pub enum AcquireError {
     /// 予測に使う重みが、事前登録でその ID に結び付けた重みと一致しない。
     /// ロックは作られない。
     WeightsNotRegistered,
+    /// 予測に使う語彙・校正・しきい値のいずれかが、事前登録でその ID に結び付けた
+    /// ダイジェスト（または「無い」）と一致しない。ロックは作られない。
+    ComponentNotRegistered {
+        /// 不一致の構成要素名（`vocab` / `calibration` / `thresholds`）。
+        component: &'static str,
+    },
     /// この評価データの事前登録は既にある（登録の変更・上書きは拒否する）、または
     /// 登録しようとした ID の適用が既に行われている。
     AlreadyRegistered {
@@ -333,6 +413,9 @@ impl fmt::Display for AcquireError {
             }
             AcquireError::WeightsNotRegistered => {
                 write!(f, "model weights do not match the registered weights")
+            }
+            AcquireError::ComponentNotRegistered { component } => {
+                write!(f, "model {component} does not match the registered digest")
             }
             AcquireError::AlreadyRegistered { path } => {
                 write!(
@@ -522,13 +605,20 @@ impl FinalTestLedger {
 pub type ApplyOnceResult<T, E> =
     Result<T, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
 
-/// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み sha256 hex>` を 1 行ずつ）。
+/// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を 1 行ずつ）。
 fn registry_body(entries: &[RegisteredConfig]) -> String {
     let mut out = String::from(REGISTRY_HEADER);
     for e in entries {
         out.push_str(e.id.as_str());
-        out.push(' ');
-        out.push_str(&e.weights_sha256.to_hex());
+        for d in [
+            Some(e.weights_sha256),
+            e.vocab_sha256,
+            e.calibration_sha256,
+            e.thresholds_sha256,
+        ] {
+            out.push(' ');
+            out.push_str(&opt_hex(&d));
+        }
         out.push('\n');
     }
     out
@@ -547,17 +637,23 @@ fn parse_registry(body: &str) -> Result<Vec<RegisteredConfig>, AcquireError> {
                 reason: "too many registered configs",
             });
         }
-        let (id, hex) = line.split_once(' ').ok_or(AcquireError::RegistryInvalid {
-            reason: "malformed registry line",
-        })?;
-        let weights_sha256 =
-            hex.parse::<Sha256Digest>()
-                .map_err(|_| AcquireError::RegistryInvalid {
-                    reason: "malformed registry digest",
-                })?;
+        let fields: Vec<&str> = line.split(' ').collect();
+        let [id, w, v, c, t] = fields[..] else {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "malformed registry line",
+            });
+        };
+        let Some(weights_sha256) = parse_opt_digest(w)? else {
+            return Err(AcquireError::RegistryInvalid {
+                reason: "malformed registry digest",
+            });
+        };
         entries.push(RegisteredConfig {
             id: RepresentativeConfigId::parse(id)?,
             weights_sha256,
+            vocab_sha256: parse_opt_digest(v)?,
+            calibration_sha256: parse_opt_digest(c)?,
+            thresholds_sha256: parse_opt_digest(t)?,
         });
     }
     if entries.is_empty() {
@@ -592,9 +688,9 @@ impl FinalTestLedger {
         }
         let mut sorted: Vec<RegisteredConfig> = entries.to_vec();
         sorted.sort_by(|a, b| {
-            a.id.as_str()
-                .cmp(b.id.as_str())
-                .then_with(|| a.weights_sha256.as_bytes().cmp(b.weights_sha256.as_bytes()))
+            a.id.as_str().cmp(b.id.as_str()).then_with(|| {
+                registry_body(std::slice::from_ref(a)).cmp(&registry_body(std::slice::from_ref(b)))
+            })
         });
         sorted.dedup();
         if sorted.is_empty() {
@@ -656,12 +752,23 @@ pub fn apply_once<T, E>(
                 return Err(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig));
             };
             let weights_sha256 =
-                fandhe_edge_core::fs::sha256_file_bounded(paths.weights, MAX_MODEL_COMPONENT_BYTES)
-                    .map_err(|source| {
-                        ApplyOnceError::Acquire(AcquireError::WeightsDigest { source })
-                    })?;
+                digest_component(paths.weights).map_err(ApplyOnceError::Acquire)?;
             if weights_sha256 != entry.weights_sha256 {
                 return Err(ApplyOnceError::Acquire(AcquireError::WeightsNotRegistered));
+            }
+            // 語彙・校正・しきい値も登録時のダイジェスト（または「無い」）と照合する。
+            // 重みだけ一致させて未使用構成の他要素を調整する迂回を拒否する（REQ-27）。
+            for (component, path, registered) in [
+                ("vocab", paths.vocab, &entry.vocab_sha256),
+                ("calibration", paths.calibration, &entry.calibration_sha256),
+                ("thresholds", paths.thresholds, &entry.thresholds_sha256),
+            ] {
+                let actual = digest_optional(path).map_err(ApplyOnceError::Acquire)?;
+                if &actual != registered {
+                    return Err(ApplyOnceError::Acquire(
+                        AcquireError::ComponentNotRegistered { component },
+                    ));
+                }
             }
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
             let ticket = ledger.acquire(&key).map_err(ApplyOnceError::Acquire)?;

@@ -371,15 +371,16 @@ fn req27_different_config_or_dataset_is_allowed() {
 fn req27_same_weights_under_renamed_config_is_rejected() {
     let dir = TempDir::new("renamed");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
-    register(
-        &ledger,
-        DATA,
-        &[
-            ("c1:seed0", b"w1"),
-            ("c1:renamed", b"w1"),
-            ("c1:tuned", b"w1"),
-        ],
-    );
+    ledger
+        .register_configs(
+            &freeze_eval_data(DATA).unwrap().sha256(),
+            &[
+                reg("c1:seed0", b"w1"),
+                reg("c1:renamed", b"w1"),
+                reg("c1:tuned", b"w1").with_thresholds(Sha256Digest::of_bytes(b"t2")),
+            ],
+        )
+        .unwrap();
     let calls = Cell::new(0u32);
     let m = Model::new(b"w1", None);
     assert!(run(&ledger, DATA, "c1:seed0", &m, &calls).is_ok());
@@ -712,4 +713,90 @@ fn req39_registry_fifo_is_rejected_without_blocking() {
         "{r:?}"
     );
     assert_eq!(calls.get(), 0);
+}
+
+/// P0 回帰（レビュー指摘）: 重みが登録と一致しても、しきい値が登録と異なる（または
+/// 登録に無いのに付いている・登録にあるのに無い）場合は拒否され、ロックも作られず
+/// 予測も呼ばれない。未使用構成 B のしきい値を A の結果を見てから調整する迂回の拒否。
+#[test]
+fn req27_registered_id_with_different_thresholds_is_rejected() {
+    let dir = TempDir::new("otherthresholds");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    ledger
+        .register_configs(
+            &freeze_eval_data(DATA).unwrap().sha256(),
+            &[
+                reg("a", b"wa"),
+                reg("b", b"wb").with_thresholds(Sha256Digest::of_bytes(b"t-registered")),
+                reg("c", b"wc"),
+            ],
+        )
+        .unwrap();
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls).is_ok());
+    let locks = dir.count();
+    // B: 重みは登録どおり、しきい値だけ調整済み。
+    let tuned = run(
+        &ledger,
+        DATA,
+        "b",
+        &Model::new(b"wb", Some(b"t-tuned")),
+        &calls,
+    );
+    assert!(
+        matches!(
+            acquire_err(&tuned),
+            Some(AcquireError::ComponentNotRegistered {
+                component: "thresholds"
+            })
+        ),
+        "{tuned:?}"
+    );
+    // B: 登録にあるしきい値が無い。
+    let missing = run(&ledger, DATA, "b", &Model::new(b"wb", None), &calls);
+    assert!(matches!(
+        acquire_err(&missing),
+        Some(AcquireError::ComponentNotRegistered {
+            component: "thresholds"
+        })
+    ));
+    // C: 登録に無いしきい値が付いている。
+    let extra = run(&ledger, DATA, "c", &Model::new(b"wc", Some(b"t")), &calls);
+    assert!(matches!(
+        acquire_err(&extra),
+        Some(AcquireError::ComponentNotRegistered {
+            component: "thresholds"
+        })
+    ));
+    assert_eq!(dir.count(), locks);
+    assert_eq!(calls.get(), 1);
+    // 登録どおりなら適用できる。
+    assert!(
+        run(
+            &ledger,
+            DATA,
+            "b",
+            &Model::new(b"wb", Some(b"t-registered")),
+            &calls
+        )
+        .is_ok()
+    );
+}
+
+/// `from_package` は実ファイルから全構成要素のダイジェストを作り、登録どおりに通る。
+#[test]
+fn req27_from_package_binds_all_components() {
+    let dir = TempDir::new("frompackage");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let model = Model::new(b"w1", Some(b"t1"));
+    let entry = RegisteredConfig::from_package(id("a"), &model.paths()).unwrap();
+    assert_eq!(
+        entry,
+        reg("a", b"w1").with_thresholds(Sha256Digest::of_bytes(b"t1"))
+    );
+    ledger
+        .register_configs(&freeze_eval_data(DATA).unwrap().sha256(), &[entry])
+        .unwrap();
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "a", &model, &calls).is_ok());
 }
