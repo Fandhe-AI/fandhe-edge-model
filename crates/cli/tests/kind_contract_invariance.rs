@@ -355,7 +355,14 @@ fn req19_infer_output_schema_is_kind_invariant() {
             .expect("label index within options");
         assert_eq!(predicted, label, "{kind}");
         // 種類ごとの経路が想定どおりのスコアを出すこと（経路が種類で分岐している確認）。
-        assert_eq!(prediction.scores(), scores.as_slice(), "{kind}");
+        // 浮動小数は == で比較せず、許容差 1e-9 を要素ごとの差で判定する。
+        assert_eq!(prediction.scores().len(), scores.len(), "{kind}");
+        for (actual, expected) in prediction.scores().iter().zip(scores.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1e-9,
+                "{kind}: {actual} vs {expected}"
+            );
+        }
 
         let result = JudgmentResult::new(options, "input-001", predicted, prediction.scores())
             .expect("valid judgment result");
