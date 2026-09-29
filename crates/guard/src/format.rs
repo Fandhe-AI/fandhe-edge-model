@@ -169,10 +169,7 @@ enum OnnxScan {
     /// ONNX ではない（不正な構造・実ファイル末尾での切断を含む）。
     NotOnnx,
     /// 判定用 prefix の打ち切り・走査回数の上限に達し、続きは未検査。
-    Exhausted {
-        seen_ir_version: bool,
-        seen_graph: bool,
-    },
+    Exhausted,
 }
 
 /// トップレベルのフィールド数の上限（`metadata_props` 等の繰り返しを考慮した余裕値）。
@@ -194,10 +191,7 @@ fn scan_onnx_model<S: ByteSource>(src: &mut S, total_len: u64) -> io::Result<Onn
                 OnnxScan::NotOnnx
             });
         }
-        let exhausted = OnnxScan::Exhausted {
-            seen_ir_version,
-            seen_graph,
-        };
+        let exhausted = OnnxScan::Exhausted;
         let mut buf = [0u8; 10];
         let n = src.read_at(pos, &mut buf)?;
         if pos == 0 && buf.first() != Some(&0x08) {
@@ -250,10 +244,7 @@ fn scan_onnx_model<S: ByteSource>(src: &mut S, total_len: u64) -> io::Result<Onn
             pos = end;
         }
     }
-    Ok(OnnxScan::Exhausted {
-        seen_ir_version,
-        seen_graph,
-    })
+    Ok(OnnxScan::Exhausted)
 }
 
 /// 固定シグネチャ形式の判定。該当しなければ `None`。
@@ -279,8 +270,8 @@ fn detect_signature(prefix: &[u8]) -> Option<FileFormat> {
 /// `total_len` はメタデータ上のファイルサイズ。判定順は固定シグネチャ → ONNX 構造検査 → `Unknown`。
 ///
 /// `prefix` がファイル全体（`prefix.len() >= total_len`）なら、途中で切れた protobuf は拒否する。
-/// `prefix` がファイルの一部だけの場合に限り、prefix の終端で打ち切られた続きは未検査として扱い、
-/// それまでに `ir_version` と `graph` を確認できていれば ONNX とする。
+/// `prefix` がファイルの一部だけの場合、prefix の終端で打ち切られた続きは未検査のため
+/// ONNX とは認めず `Unknown` を返す（未検査を合格扱いにしない。REQ-39）。
 /// ファイルに対する判定は [`check_file_format`] が LEN を飛ばして末尾まで走査する。
 pub fn detect_format(prefix: &[u8], total_len: u64) -> FileFormat {
     if let Some(f) = detect_signature(prefix) {
@@ -289,10 +280,7 @@ pub fn detect_format(prefix: &[u8], total_len: u64) -> FileFormat {
     let mut src = SliceSource { prefix, total_len };
     match scan_onnx_model(&mut src, total_len) {
         Ok(OnnxScan::Onnx) => FileFormat::Onnx,
-        Ok(OnnxScan::Exhausted {
-            seen_ir_version: true,
-            seen_graph: true,
-        }) => FileFormat::Onnx,
+        // 未検査の続きが残る場合は許可しない（fail-closed。REQ-39）。
         _ => FileFormat::Unknown,
     }
 }
@@ -459,13 +447,17 @@ mod tests {
         assert_eq!(d(&b), FileFormat::Onnx);
     }
 
-    /// REQ-39・TASK-39.2-1: prefix がファイルの一部で、graph が prefix を超える巨大 LEN のときは
-    /// 未検査の続きとして合格する。実サイズより大きい LEN は拒否。
+    /// REQ-39・TASK-39.2-1: prefix がファイルの一部のとき、後続が未検査なら ONNX と認めない
+    /// （prefix だけ ONNX 風で total_len が大きい偽装を許可リストに通さない）。実サイズより大きい LEN も拒否。
     #[test]
-    fn req39_onnx_large_graph_beyond_prefix() {
+    fn req39_partial_prefix_is_never_onnx() {
         let prefix = [0x08, 0x07, 0x3a, 0x80, 0x80, 0x80, 0x04];
-        assert_eq!(detect_format(&prefix, 1 << 30), FileFormat::Onnx);
+        assert_eq!(detect_format(&prefix, 1 << 30), FileFormat::Unknown);
         assert_eq!(detect_format(&prefix, 100), FileFormat::Unknown);
+        assert_eq!(
+            detect_format(&[0x08, 0x07, 0x3a, 0x00], 1 << 30),
+            FileFormat::Unknown
+        );
     }
 
     /// REQ-39・TASK-39.2-1: 実ファイル末尾で切れた protobuf は、graph の後でも拒否する。
@@ -527,14 +519,17 @@ mod tests {
     /// REQ-39・TASK-39.2-1: 10 バイト目が 0x00・0x01 以外の varint は拒否し、0x01 は受理する。
     #[test]
     fn req39_varint_tenth_byte_must_be_0_or_1() {
-        let mut bad = vec![0x08, 0x07, 0x3a];
+        // model_version（field 5・varint）の 10 バイト varint を経由して graph まで完全に走査する。
+        let mut bad = vec![0x08, 0x07, 0x28];
         bad.extend_from_slice(&[0x80; 9]);
         bad.push(0x02);
-        assert_eq!(detect_format(&bad, u64::MAX), FileFormat::Unknown);
-        let mut ok = vec![0x08, 0x07, 0x3a];
+        bad.extend_from_slice(&[0x3a, 0x00]);
+        assert_eq!(d(&bad), FileFormat::Unknown);
+        let mut ok = vec![0x08, 0x07, 0x28];
         ok.extend_from_slice(&[0x80; 9]);
         ok.push(0x01);
-        assert_eq!(detect_format(&ok, u64::MAX), FileFormat::Onnx);
+        ok.extend_from_slice(&[0x3a, 0x00]);
+        assert_eq!(d(&ok), FileFormat::Onnx);
     }
 
     /// REQ-39・TASK-39.2-1: onnx_only は ONNX だけを通し、他は InvalidInput(64) で拒否する。
