@@ -124,7 +124,6 @@
 //! - 基礎統計（REQ-29・TASK-29.1-1・issue #107。[`diagnostics`]）: 実装済み
 //!   （診断専用。合否判定に使わない）。混同しやすいラベルの組とレポート統合
 //!   （TASK-29.1-2・issue #108）・診断限界の明記（TASK-29.2・issue #109）・データ量水準別の効果報告（TASK-29.3・issue #110）も実装済み。
-//!   データ量水準別報告（#110）は未実装
 //! - abstain_rate・error_rate 等の診断レポート系（REQ-29）: 未実装
 //!   （TASK-29.x。評価データ適用時の coverage は [`coverage`] に実装済み）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
