@@ -9,7 +9,7 @@ description = "Guard layer (input validation before processing) for fandhe-edge-
 
 [dependencies]
 # 共通部分は workspace 内の path 依存のみ（REQ-39・TASK-39.2-1・#153）。外部 crate は下の rustix のみ。
-# 現状は終了コード（`ExitCode`）のみ使う。通常ファイル検証つきオープン（`fandhe_edge_core::fs`）は後続 TASK（形式・資源の検査）で使う予定。
+# 通常ファイル検証つきオープン（`fandhe_edge_core::fs`）と終了コード（`ExitCode`）を使う。
 fandhe-edge-core.workspace = true
 
 # ディレクトリ fd 起点の openat（O_NOFOLLOW）による経路の閉じ込め（REQ-39・TASK-39.4-1。
