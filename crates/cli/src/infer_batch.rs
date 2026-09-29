@@ -30,10 +30,12 @@
 //!
 //! # 資源上限（REQ-39・暫定）
 //!
-//! 入力全体のバイト数は読み込み中に `MAX_INFER_BATCH_TOTAL_BYTES + 1` で打ち切る。各レコードの
-//! `input` の復号後バイト長はその JSON 行以下なので、ファイルが上限内なら総入力バイトも上限内
-//! （JSON のオーバーヘッド分だけ保守側）。件数は `MAX_INFER_BATCH_LEN`、1 行は
-//! `MAX_INFER_INPUT_BYTES` を、いずれもアロケーション前に検査する。
+//! 入力は 1 行ずつ上限付きで読む（`read_until` を 1 行 `MAX_INFER_INPUT_BYTES + 2` バイトで
+//! 打ち切る）ため、バッファは高々 1 行分で、入力全体をメモリへ載せない。入力全体のバイト数は
+//! `MAX_INFER_BATCH_TOTAL_BYTES + 1` で読み取りを打ち切る。各レコードの `input` の復号後バイト長は
+//! その JSON 行以下なので、ファイルが上限内なら総入力バイトも上限内（JSON のオーバーヘッド分だけ
+//! 保守側）。件数は `MAX_INFER_BATCH_LEN`、1 行は `MAX_INFER_INPUT_BYTES` を、レコードを保持する
+//! 前に検査する。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
 
@@ -42,13 +44,13 @@ use crate::error_report::{ToErrorReport, default_message, emit_error_report};
 use crate::output::{infer_input_error_report, judgment_error_report, write_ok_judgment};
 use fandhe_edge_core::definition::{Choice, IoSchema};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::infer_input::InferInput;
+use fandhe_edge_core::infer_input::{InferInput, MAX_INFER_INPUT_BYTES};
 use fandhe_edge_core::judgment::JudgmentResult;
 use fandhe_edge_runtime::pipeline::{
     InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES, Prediction, Preprocessor,
     ScoringBackend,
 };
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 
 /// stdout の出力形（REQ-33）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,22 +108,29 @@ fn read_batch_records_with_limit<R: Read>(
     io: &IoSchema,
     byte_limit: usize,
 ) -> Result<Vec<InferInput>, ErrorReport> {
-    // 上限 + 1 バイトまでしか読まない（無制限アロケーションの防止。REQ-39）。
+    // 入力全体は上限 + 1 バイトで打ち切る（無制限の読み取りの防止。REQ-39）。
     let cap = u64::try_from(byte_limit)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    let mut bytes = Vec::new();
-    reader
-        .take(cap)
-        .read_to_end(&mut bytes)
-        .map_err(|_| report(ExitCode::RuntimeError))?;
-    if bytes.len() > byte_limit {
-        return Err(report(ExitCode::LimitExceeded));
-    }
-    let text = String::from_utf8(bytes).map_err(|_| report(ExitCode::InvalidInput))?;
-
+    let mut reader = BufReader::new(reader.take(cap));
+    let mut consumed: usize = 0;
     let mut records = Vec::new();
-    for line in text.lines() {
+    // 1 行ずつ、行長の上限 + 1 バイトまでしかバッファへ確保しない。巨大な単一行・空白行のみの
+    // 入力でも、拒否前にファイル全体をメモリへ保持しない（REQ-39）。
+    loop {
+        let (line_bytes, has_newline) = read_bounded_line(&mut reader)?;
+        if line_bytes.is_empty() && !has_newline {
+            break;
+        }
+        consumed = consumed.saturating_add(line_bytes.len());
+        if consumed > byte_limit {
+            return Err(report(ExitCode::LimitExceeded));
+        }
+        let line_bytes = strip_line_ending(&line_bytes);
+        if line_bytes.len() > MAX_INFER_INPUT_BYTES {
+            return Err(report(ExitCode::LimitExceeded));
+        }
+        let line = std::str::from_utf8(line_bytes).map_err(|_| report(ExitCode::InvalidInput))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -136,6 +145,31 @@ fn read_batch_records_with_limit<R: Read>(
         return Err(report(ExitCode::InvalidInput));
     }
     Ok(records)
+}
+
+/// 1 行（改行を含む）を最大 `MAX_INFER_INPUT_BYTES + 2` バイトまで読む。
+///
+/// 戻り値の bool は改行で終わったか。上限までに改行が無ければ超過行として、そこで打ち切った
+/// 断片を返す（呼び出し側が長さで `limit_exceeded` にする。残りは読まない）。
+fn read_bounded_line<R: BufRead>(reader: &mut R) -> Result<(Vec<u8>, bool), ErrorReport> {
+    // 改行（CRLF なら 2 バイト）を含めて 1 行の上限 + 2 バイト。
+    let line_cap = u64::try_from(MAX_INFER_INPUT_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
+    let mut buf = Vec::new();
+    reader
+        .by_ref()
+        .take(line_cap)
+        .read_until(b'\n', &mut buf)
+        .map_err(|_| report(ExitCode::RuntimeError))?;
+    let has_newline = buf.last() == Some(&b'\n');
+    Ok((buf, has_newline))
+}
+
+/// 行末の `\n` / `\r\n` を除く（`str::lines` と同じ扱い）。
+fn strip_line_ending(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// 予測（選択肢 index とスコア）を `JudgmentResult` へ写す。`--text` 経路と共有する想定。

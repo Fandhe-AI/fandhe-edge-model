@@ -156,7 +156,7 @@ fn req39_batch_input_over_byte_cap_is_limit_exceeded() {
     struct Endless(Rc<RefCell<usize>>);
     impl Read for Endless {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            buf.fill(b' ');
+            buf.fill(b'\n');
             *self.0.borrow_mut() += buf.len();
             Ok(buf.len())
         }
@@ -177,6 +177,36 @@ fn req39_batch_input_over_byte_cap_is_limit_exceeded() {
     assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
     let limit = fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_TOTAL_BYTES;
     assert_eq!(*read.borrow(), limit + 1);
+}
+
+/// REQ-39: 改行の無い無限入力は 1 行の上限付近で読み取りを止め `limit_exceeded`
+/// （入力全体をメモリへ読み込んでから検証しない）。
+#[test]
+fn req39_batch_endless_single_line_stops_reading_near_line_cap() {
+    struct Endless(Rc<RefCell<usize>>);
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(b' ');
+            *self.0.borrow_mut() += buf.len();
+            Ok(buf.len())
+        }
+    }
+    let read = Rc::new(RefCell::new(0usize));
+    let definition = definition();
+    let (pipeline, _) = pipeline();
+    let mut out: Vec<u8> = Vec::new();
+    let code = emit_infer_batch(
+        &mut out,
+        Endless(Rc::clone(&read)),
+        definition.io(),
+        definition.options(),
+        &pipeline,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
+    // 1 行の上限 + 2 バイトと BufReader の 1 回分（8 KiB）を超えて読まない。
+    assert!(*read.borrow() <= MAX_INFER_INPUT_BYTES + 2 + 8192);
 }
 
 /// REQ-39: 件数が上限 + 1 なら `limit_exceeded`。
