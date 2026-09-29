@@ -25,12 +25,28 @@ use std::io::{self, Write};
 
 /// [`PackageOutcome`] を正常系の [`PackageReport`]、または異常系の [`ErrorReport`] へ写す。
 ///
-/// `Ok` を返すのは `outcome.exit_code == ExitCode::Ok` のときに限る。`verdict` は
+/// `Ok` を返すのは `verdict` が Pass / NotDefined かつ `exit_code == ExitCode::Ok` のときに限る。
+/// 両者が不整合なら `runtime_error` の `Err` を返す。`verdict` は
 /// ワイルドカード無しで網羅し、区分が増えたらコンパイルエラーで気付けるようにする。
 ///
 /// # Errors
 /// exit ≠ 0 の区分は `Err(ErrorReport)`（エラー処理ではなく出力形の振り分け）。
 pub fn package_outcome_report(outcome: &PackageOutcome) -> Result<PackageReport, ErrorReport> {
+    // exit_code と verdict は別フィールドで不整合を構築できるため、verdict から期待される
+    // 終了コードと一致しない場合は fail-closed で runtime_error へ倒す（上限超過などを
+    // exit 0 へ変えない。REQ-21）。
+    let expected = match outcome.verdict {
+        PackageVerdict::Pass | PackageVerdict::NotDefined => ExitCode::Ok,
+        PackageVerdict::Fail => ExitCode::JudgedFail,
+        PackageVerdict::Undeterminable => ExitCode::Pending,
+        PackageVerdict::LimitExceeded => ExitCode::LimitExceeded,
+    };
+    if outcome.exit_code != expected {
+        return Err(ErrorReport::new(
+            ExitCode::RuntimeError,
+            default_message(ExitCode::RuntimeError),
+        ));
+    }
     match outcome.verdict {
         PackageVerdict::Pass => Ok(PackageReport::pass()),
         PackageVerdict::NotDefined => Ok(PackageReport::acceptance_not_defined()),
@@ -138,5 +154,24 @@ mod tests {
                 o.exit_code == ExitCode::Ok
             );
         }
+    }
+
+    /// REQ-21: exit_code と verdict の不整合（上限超過を Pass で exit 0 にする等）は
+    /// runtime_error へ倒れ、正常系 JSON を出さない。
+    #[test]
+    fn req21_inconsistent_outcome_fails_closed() {
+        let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
+        o.exit_code = ExitCode::LimitExceeded;
+        let mut buf = Vec::new();
+        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        assert_eq!(code, ExitCode::RuntimeError);
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n"
+        );
+
+        let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
+        o.exit_code = ExitCode::Ok;
+        assert!(package_outcome_report(&o).is_err());
     }
 }
