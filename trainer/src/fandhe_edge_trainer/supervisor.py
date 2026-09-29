@@ -81,11 +81,32 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    不一致・欠落は予約を解放して確定させない）、一致すれば
    `contract.finalize_out_dir` で確定させたうえで、そのまま出力する。
 
-Rust 側ジョブ管理（REQ-34）が最終的にはこの「外側のスーパーバイザー」の役割を
-担う計画であり、本モジュールは Rust 側が無い・本ワーカーが単独プロセスとして
-起動される場合の防御として存在する。本モジュール自身が SIGKILL 等で道連れに
-終了した場合の後始末は、本モジュールの責務ではなく Rust 側ジョブ管理
-（TASK-34.x）に委ねる。
+**協調キャンセルと責務分担（REQ-34・TASK-34.1-2・issue #145）**: Rust 側
+ジョブ管理（`crates/train/src/process.rs`）は `train --cancel-on-stdin-eof` で
+本プロセスを `stdin` パイプ付きで起動し、キャンセル時にその書き込み端を閉じる
+（EOF）。本プロセスは EOF を `cli.py::_start_cancel_watch` の daemon スレッドで
+検知して `cancel_event` を立て、`monitor_child` が `_terminate_and_reap`
+（`killpg` → 回収）で worker を止めたうえで、保持中の fd だけで予約を解放する
+（`cleanup_reservation`。名前は再解決しない）。
+
+- 予約・確定・解放（`out_dir` の所有権）: 本モジュールのみ
+- キャンセル要求の伝達（stdin を閉じる）・猶予の管理・猶予超過時の `SIGKILL`:
+  Rust 側 `process.rs`
+- `Completed`／`Cancelled` の最終判定: Rust 側 `process.rs`（本プロセスの
+  終了状態と結果 JSON に従う）
+- **公開されている ⇔ 本プロセスが exit 0 と ok JSON を返した**: 確定
+  （`finalize_out_dir`）の直前までキャンセルを確認し、確定した後に届いた
+  キャンセルは無視して成功を報告する。これで「公開済みなのに `Cancelled`」
+  「未公開なのに成功」が起きない
+- Rust 側の猶予内に本プロセスが終了しなければ Rust が `SIGKILL` する
+  （フォールバック）。この場合だけ、後始末が走らず空の予約済み `out_dir`・
+  tmp が残りうる（安全側の残置。Rust は削除せず読み取り専用で検査して報告
+  するだけで、やり直し時の案内・掃除は TASK-34.3）
+- 協調キャンセル時の終了コード（exit 70・`runtime_error`）は暫定で、Rust 側は
+  依存しない。キャンセルの写像は TASK-33.x で決める
+
+`--cancel-on-stdin-eof` が無い単独起動では標準入力を監視しない
+（`cancel_event` は `None`）。
 
 **lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕からの全面移行）**:
@@ -160,6 +181,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +198,18 @@ _POLL_INTERVAL_SECONDS = 0.1
 #: 協調的なチェック（バッチの境目等）が自ら気づいて終了する猶予を与える。
 #: それでも終わらない場合（単一の長い同期呼び出しの最中等）はここで強制終了する。
 _TIME_LIMIT_GRACE_SECONDS = 5.0
+
+#: `ps` 1 回の呼び出しの上限（秒）。実際の待ちは締め切りの残り時間でさらに
+#: 切り詰める（`_bounded_timeout`）。
+_PS_TIMEOUT_SECONDS = 5.0
+
+#: `killpg` 後の回収（`Popen.wait`）の上限（秒）。`crates/train` の
+#: `COOPERATIVE_CANCEL_GRACE_SECONDS`（15 秒）は本値に予約解放と JSON 出力の
+#: 時間を加えた値を上回る前提で決めている。
+_REAP_WAIT_SECONDS = 10.0
+
+#: 標準出力 reader の合流待ちの上限（秒）。キャンセル要求が来たら打ち切る。
+_READER_JOIN_SECONDS = 10.0
 
 #: 子プロセスの標準出力の上限（bytes）。
 _MAX_WORKER_STDOUT_BYTES = MAX_RESULT_BYTES
@@ -198,11 +232,130 @@ _LAUNCH_SCRIPT = Path(__file__).resolve().parent.parent.parent / "launch.py"
 _VALID_EXIT_CODES = {int(code) for code in ExitCode}
 
 
+#: 協調キャンセルの応答文（`crates/train/src/process.rs` の `CANCEL_ACK_MESSAGE`・
+#: `CANCEL_CLEANUP_INCOMPLETE_MESSAGE` と両側で一致させる。REQ-34・#145）。
+_CANCEL_ACK_MESSAGE = "training cancelled by caller"
+_CANCEL_CLEANUP_INCOMPLETE_MESSAGE = "training cancelled but cleanup incomplete"
+_RESERVED_MESSAGES = frozenset({_CANCEL_ACK_MESSAGE, _CANCEL_CLEANUP_INCOMPLETE_MESSAGE})
+
+
+def _forward_worker_error(payload: dict[str, Any]) -> dict[str, Any]:
+    """worker が返したエラー JSON を転送用に整える。
+
+    キャンセル応答の予約文言と一致する `message` は、supervisor 自身の応答と
+    取り違えられないよう固定の別文言へ置き換える（フィールドの追加・意味の変更は
+    しない。JSON 契約は不変）。REQ-34・#145。
+    """
+    if payload.get("message") in _RESERVED_MESSAGES:
+        return {**payload, "message": "worker reported an error"}
+    return payload
+
+
 def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def _current_child_status(pid: int) -> tuple[int, bool] | None:
+def _remaining(deadline: float) -> float:
+    """締め切り（`time.monotonic` 基準）までの残り秒数（負にならない）。
+
+    本モジュールの待機はすべて、1 つの締め切りから残り時間を求めてここを
+    通す（個々の固定タイムアウトが残り時間を超えないようにする規則を 1 か所に
+    集約する。`crates/train/src/process.rs` の `bounded_deadline`・
+    `classify_cancel_outcome` と同じ方針。REQ-34・REQ-39）。
+    """
+    return max(0.0, deadline - time.monotonic())
+
+
+def _bounded_timeout(cap: float, deadline: float) -> float:
+    """固定の上限 `cap` と締め切りまでの残り時間の小さい方（秒）。"""
+    return min(cap, _remaining(deadline))
+
+
+def _wait_cancel(cancel_event: threading.Event | None, timeout: float) -> bool:
+    """最大 `timeout` 秒待ち、その間にキャンセルが要求されたかを返す。
+
+    キャンセルが来たら即座に戻る（`time.sleep` のように猶予を食わない）。
+    `cancel_event` が `None` なら単に `timeout` 秒眠り `False` を返す。
+    """
+    if cancel_event is None:
+        time.sleep(timeout)
+        return False
+    return cancel_event.wait(timeout)
+
+
+def _run_ps(pid: int, timeout: float, cancel_event: threading.Event | None) -> str | None:
+    """`ps -o rss=,stat= -p <pid>` を実行して標準出力を返す。**例外を外へ出さない**。
+
+    起動・待機・kill・回収・パイプの後始末をこの関数に閉じ込める。返り値は
+    標準出力（成功）か `None`（不明）のどちらかで、起動失敗・タイムアウト・
+    キャンセルによる中断・kill と終了の競合（`ProcessLookupError`）・
+    `communicate` の `OSError`／`ValueError`（閉じたパイプ）・非ゼロ終了は
+    すべて `None` に写す。終了時は必ず `ps` を回収しパイプを閉じる。呼び出し側
+    （`monitor_child`）は `None` を既存の fail-closed 方針で扱い、予約の解放
+    経路へ進む（REQ-34・REQ-39）。
+    """
+    try:
+        ps = subprocess.Popen(  # noqa: S603 - 引数は固定リスト。shell 不使用。絶対パスの /bin/ps のみを呼ぶ
+            [_PS_BIN, "-o", "rss=,stat=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, ValueError):
+        return None
+    result: str | None = None
+    try:
+        # `timeout`（締め切りの残りで切り詰め済み）まで、キャンセルを短い刻みで
+        # 確認しながら待つ。キャンセルが来たら即座に戻り、協調キャンセルの猶予を
+        # 状態確認で使い切らない（REQ-34）。
+        stop_at = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                out, _ = ps.communicate(timeout=min(0.05, _remaining(stop_at)))
+            except subprocess.TimeoutExpired:
+                if _is_cancelled(cancel_event) or _remaining(stop_at) <= 0.0:
+                    return None
+                continue
+            if ps.returncode == 0:
+                result = out
+            return result
+    except (OSError, ValueError):
+        return None
+    finally:
+        # 成功・失敗・例外のいずれでも、`ps` を止めて回収し、パイプを閉じる。
+        with contextlib.suppress(OSError):
+            if ps.poll() is None:
+                ps.kill()
+        with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+            ps.communicate(timeout=1)
+        with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+            ps.wait(timeout=1)
+        for pipe in (ps.stdout, ps.stdin, ps.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    pipe.close()
+
+
+def _stop_reason(deadline: float, cancel_event: threading.Event | None) -> str | None:
+    """監視を打ち切るべき理由（`"time"`／`"cancelled"`／`None`）を 1 つの規則で決める。
+
+    壁時計の締め切りをキャンセルより優先する（`crates/train` の
+    `classify_cancel_outcome` と同じ優先関係。REQ-34・REQ-39）。締め切りの判定は
+    `_remaining` と同じ時計を使う。
+    """
+    if _remaining(deadline) <= 0.0:
+        return "time"
+    if _is_cancelled(cancel_event):
+        return "cancelled"
+    return None
+
+
+def _current_child_status(
+    pid: int,
+    *,
+    timeout: float = _PS_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, bool] | None:
     """`ps -o rss=,stat= -p <pid>` で RSS（バイト単位に変換済み）とゾンビ
     状態かどうかを 1 回の呼び出しでまとめて取得する。取得できなければ
     `None`。
@@ -221,19 +374,10 @@ def _current_child_status(pid: int) -> tuple[int, bool] | None:
     監視が使う `ps` 呼び出しへ相乗りすることで、新しい依存・子プロセス
     起動を増やさずに実現する）。
     """
-    try:
-        result = subprocess.run(  # noqa: S603 - 引数は固定リスト。shell 不使用。絶対パスの /bin/ps のみを呼ぶ
-            [_PS_BIN, "-o", "rss=,stat=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    stdout_text = _run_ps(pid, timeout, cancel_event)
+    if stdout_text is None:
         return None
-    if result.returncode != 0:
-        return None
-    text = result.stdout.strip()
+    text = stdout_text.strip()
     if not text:
         return None
     parts = text.split(None, 1)
@@ -324,7 +468,7 @@ def _classify_self_exit(
     return None
 
 
-def _terminate_and_reap(proc: subprocess.Popen) -> None:
+def _terminate_and_reap(proc: subprocess.Popen) -> bool:
     """`_terminate_worker`（`killpg`）を呼んでから `Popen.wait()` で回収
     する、**`proc` を回収する唯一の経路**（issue #178 PR #233 レビュー
     再々指摘 P0「`_current_child_status()` が `None` を返す場合に
@@ -340,8 +484,26 @@ def _terminate_and_reap(proc: subprocess.Popen) -> None:
     `killpg` は ESRCH 相当（`ProcessLookupError`）になるだけで無害である。
     """
     _terminate_worker(proc)
+    # 回収待ちは kill 時点から数える専用の締め切り（`_REAP_WAIT_SECONDS`）で
+    # 上限を持つ。キャンセル経路ではこの前に状態確認等のブロックが入らない
+    # （`monitor_child` はキャンセルを先に確認する）ため、猶予の総量は
+    # 「キャンセル検知の刻み + 本待ち」に収まる。
+    reap_deadline = time.monotonic() + _REAP_WAIT_SECONDS
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=10)
+        proc.wait(timeout=_remaining(reap_deadline))
+    # 回収できたか（`returncode` が確定したか）を戻り値で伝える。回収できない
+    # worker は生きている可能性があるため、呼び出し側は成功側（キャンセル完了・
+    # 通常の資源超過報告・予約の解放）へ倒してはならない（REQ-39。`"reap_failed"`）。
+    return proc.returncode is not None
+
+
+def _stop_and_report(proc: subprocess.Popen, reason: str) -> str:
+    """worker を止めて回収し、`reason` を返す。回収できなければ `"reap_failed"`。
+
+    `monitor_child` の停止経路はすべてここを通す（`wait`・`kill` の失敗を
+    成功側へ握りつぶさない規則の 1 か所。REQ-34・REQ-39）。
+    """
+    return reason if _terminate_and_reap(proc) else "reap_failed"
 
 
 def monitor_child(
@@ -351,6 +513,7 @@ def monitor_child(
     rss_limit_bytes: int,
     poll_interval: float = _POLL_INTERVAL_SECONDS,
     grace_seconds: float = _TIME_LIMIT_GRACE_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> str | None:
     """`proc` を監視する。正常終了したら `None` を返す。
 
@@ -396,40 +559,125 @@ def monitor_child(
     `_monitor_worker_and_finalize` はこれを他の強制終了理由と同様に
     予約解放のみ〔確定しない〕の経路へ流す。REQ-39）。`killpg` → 回収
     （`_terminate_and_reap`）の順序はこの分岐でも変わらず守る。
+
+    **協調キャンセル**（REQ-34・TASK-34.1-2・#145）: `cancel_event` が立って
+    いたら `_terminate_and_reap` で worker を止めて `"cancelled"` を返す
+    （回収経路を増やさない）。ゾンビを検知した時点でキャンセル済みなら
+    `"cancelled"` を優先し、既に終了した worker の成果物を確定しに行かない。
     """
     cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
     while True:
-        status = _current_child_status(proc.pid)
+        # ブロックする呼び出し（`ps`・待機）の前に、非ブロッキングの確認を
+        # 先に済ませる（規則は `_stop_reason` の 1 か所）。
+        reason = _stop_reason(deadline, cancel_event)
+        if reason is not None:
+            return _stop_and_report(proc, reason)
+        # `ps` の待ちは締め切りの残りとキャンセル要求で打ち切る。
+        status = _current_child_status(
+            proc.pid,
+            timeout=_bounded_timeout(_PS_TIMEOUT_SECONDS, deadline),
+            cancel_event=cancel_event,
+        )
         if status is None:
-            _terminate_and_reap(proc)
-            return "monitor_failed"
+            reaped = _terminate_and_reap(proc)
+            # 状態が不明になった理由が締め切り切れ・キャンセルなら、監視失敗
+            # ではなくそちらで報告する。`monitor_failed` は本当に `ps` が使えない
+            # 場合だけ（stdout の drain 待ちを含み Rust 側の猶予を超えうるため、
+            # キャンセルは高速な経路で予約を解放させる。REQ-34・#145）。
+            reason = _stop_reason(deadline, cancel_event) or "monitor_failed"
+            return reason if reaped else "reap_failed"
         rss, is_zombie = status
         if is_zombie:
             # issue #178 PR #233 レビュー再々々指摘 P1: ゾンビ（終了済み）を
             # 検知しても、それだけで「締め切り内に正常終了した」とは限らない。
-            # `ps` のポーリング間隔・`_current_child_status` の呼び出し自体の
-            # 所要時間により、実際には締め切りを過ぎてから初めてゾンビだと
-            # 気づく場合がある。この場合、終了理由（自発的な正常終了・
-            # `RLIMIT_CPU` による自己終了のいずれであっても）を受理して
-            # 成果物を確定させてはならず、壁時計超過（`"time"`）として
-            # fail-closed に扱う（呼び出し元 `_monitor_worker_and_finalize`
-            # は `killed_reason is not None` の経路で予約を解放するだけで
-            # 確定しない。REQ-39）。締め切り内であれば、従来どおり
-            # `_classify_self_exit` で通常終了か `RLIMIT_CPU` 自己終了かを
-            # 判定する。
-            if time.monotonic() > deadline:
-                _terminate_and_reap(proc)
-                return "time"
-            _terminate_and_reap(proc)
+            # `ps` の呼び出し自体の所要時間により、締め切りを過ぎてから初めて
+            # ゾンビだと気づく場合がある。この場合は成果物を確定させず壁時計
+            # 超過（`"time"`）として fail-closed に扱う（REQ-39）。締め切り内なら
+            # `_classify_self_exit` で通常終了か `RLIMIT_CPU` 自己終了かを判定する。
+            if not _terminate_and_reap(proc):
+                return "reap_failed"
+            reason = _stop_reason(deadline, cancel_event)
+            if reason is not None:
+                return reason
             return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
-        if time.monotonic() > deadline:
-            _terminate_and_reap(proc)
-            return "time"
+        reason = _stop_reason(deadline, cancel_event)
+        if reason is not None:
+            return _stop_and_report(proc, reason)
         if rss > rss_limit_bytes:
-            _terminate_and_reap(proc)
-            return "rss"
-        time.sleep(poll_interval)
+            return _stop_and_report(proc, "rss")
+        # 次の確認まで眠る。キャンセルが来たら即座に起きる。
+        _wait_cancel(cancel_event, _bounded_timeout(poll_interval, deadline))
+
+
+class CancelSignal(threading.Event):
+    """確定処理と排他できる協調キャンセルのイベント（REQ-34・#145）。
+
+    `set()` は `commit_lock` を取る。確定側は `_commit_section` で同じロックを
+    保持したままキャンセル確認と `finalize_out_dir` を行うため、EOF の到着が
+    確認後〜rename 前に挟まっても、どちらが先に成立したかで結果が決まる。
+    `cli.py::_start_cancel_watch` が生成する。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_lock = threading.Lock()
+
+    def set(self) -> None:
+        with self.commit_lock:
+            super().set()
+
+
+@contextlib.contextmanager
+def _commit_section(cancel_event: threading.Event | None) -> Iterator[bool]:
+    """キャンセル確認と確定を同期区間にまとめ、区間開始時点のキャンセル有無を渡す。
+
+    `CancelSignal` 以外（`None`・素の `Event`）ではロックを取らず単に確認する。
+    """
+    lock = getattr(cancel_event, "commit_lock", None)
+    if lock is None:
+        yield _is_cancelled(cancel_event)
+        return
+    with lock:
+        yield _is_cancelled(cancel_event)
+
+
+def _is_cancelled(cancel_event: threading.Event | None) -> bool:
+    """協調キャンセルが要求されたか（`None` は常に `False`）。"""
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _join_unless_cancelled(
+    thread: threading.Thread, timeout: float, cancel_event: threading.Event | None
+) -> bool:
+    """`thread` を最大 `timeout` 秒待つ。待つ間にキャンセルが来たら `False`。
+
+    合流待ち（子孫が書き込み端を保持すると最大 `timeout` 秒かかる）が協調
+    キャンセルの猶予を使い切らないよう、短い刻みでキャンセルを確認する
+    （REQ-34）。`True` はキャンセルされずに待ちを終えたこと（タイムアウトを含む）。
+    """
+    deadline = time.monotonic() + timeout
+    while thread.is_alive() and _remaining(deadline) > 0.0:
+        if _is_cancelled(cancel_event):
+            return False
+        thread.join(timeout=_bounded_timeout(0.05, deadline))
+    return not _is_cancelled(cancel_event)
+
+
+def _report_cancelled(reservation: contract.OutDirReservation) -> ExitCode:
+    """キャンセルされたジョブの予約を解放し、エラー JSON を出力する。
+
+    メッセージは固定の英語文字列（データ本文・パスを含めない）。`code` は既存の
+    語彙（`runtime_error`）だけを使い、終了コードの 70 は暫定値で Rust 側は
+    これに依存しない（キャンセルの写像は TASK-33.x。REQ-21・REQ-34）。
+    """
+    released = contract.cleanup_reservation(reservation)
+    # 解放を確認できない場合は所定の協調キャンセル応答（Rust 側 `is_cancel_ack`）を
+    # 出さない。別メッセージにより呼び出し側は Unconfirmed（残置あり）として扱う
+    # （REQ-34「協調キャンセルでは公開場所に何も残らない」・#145）。
+    message = _CANCEL_ACK_MESSAGE if released else _CANCEL_CLEANUP_INCOMPLETE_MESSAGE
+    _emit({"status": "error", "code": "runtime_error", "message": message})
+    return ExitCode.RUNTIME_ERROR
 
 
 def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDOUT_BYTES) -> None:
@@ -466,8 +714,14 @@ def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDO
                         kept += remaining
                     oversized = True
     except (OSError, ValueError):
-        # 親側でパイプを閉じた等。読めた分だけを使う。
+        # 読み出しエラー。読めた分だけを使う。
         pass
+    finally:
+        # パイプは reader 自身が閉じる。別スレッドから `close()` を呼ぶと、
+        # バッファ付きストリームの読み取りロック待ちで停止しうる（子孫が書き込み端を
+        # 保持している場合。#145 PR #286 レビュー）ため、他スレッドは閉じない。
+        with contextlib.suppress(OSError, ValueError):
+            pipe.close()
     result["data"] = b"".join(chunks)
     result["oversized"] = oversized
 
@@ -493,9 +747,15 @@ def _parse_worker_stdout(raw: bytes) -> dict[str, Any] | None:
     return payload
 
 
-def run_supervised_train(request_path: Path) -> ExitCode:
+def run_supervised_train(
+    request_path: Path, *, cancel_event: threading.Event | None = None
+) -> ExitCode:
     """`train` サブコマンドの本体。`out_dir` を予約したうえで `_worker` を
     子プロセスとして起動・監視し、結果に応じて確定または解放する。
+
+    `cancel_event` は協調キャンセル（モジュール docstring 参照）で、
+    `cli.py::_start_cancel_watch` が標準入力の EOF で立てる。`None` なら
+    キャンセルを受け付けない。
     """
     try:
         # リクエストファイルはここで 1 回だけ読む。パース前の生バイト列
@@ -518,6 +778,13 @@ def run_supervised_train(request_path: Path) -> ExitCode:
     request.train_path.close()
     request.root.close()
 
+    # 予約前のキャンセル確認: 予約も worker 起動もせず、所定のキャンセル応答を返す
+    # （起動処理が Rust 側の猶予を超えて SIGKILL され予約が残るのを防ぐ。REQ-34・#145）。
+    if _is_cancelled(cancel_event):
+        request.out_dir.close()
+        _emit({"status": "error", "code": "runtime_error", "message": _CANCEL_ACK_MESSAGE})
+        return ExitCode.RUNTIME_ERROR
+
     try:
         reservation = contract.prepare_out_dir(request.out_dir)
     except WorkerError as e:
@@ -526,12 +793,16 @@ def run_supervised_train(request_path: Path) -> ExitCode:
         return e.exit_code
 
     try:
+        # 予約後・worker 起動前のキャンセル確認（保持中の fd で予約を解放して応答する）。
+        if _is_cancelled(cancel_event):
+            return _report_cancelled(reservation)
         return _spawn_worker_and_finalize(
             raw_request,
             reservation,
             time_limit_seconds=float(time_limit_seconds),
             rss_limit_bytes=rss_limit_bytes,
             stdout_cap=stdout_cap,
+            cancel_event=cancel_event,
         )
     finally:
         reservation.entry.close()  # request.out_dir と同一オブジェクト
@@ -570,6 +841,7 @@ def _spawn_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
     stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> ExitCode:
     # lifeline（issue #178 PR #233 レビュー: Rust 側でのプロセスグループ管理
     # 〔`process_group(0)`・`/bin/kill` 呼び出し・`kill -0` 確認〕は PID
@@ -669,6 +941,7 @@ def _spawn_worker_and_finalize(
             time_limit_seconds=time_limit_seconds,
             rss_limit_bytes=rss_limit_bytes,
             stdout_cap=stdout_cap,
+            cancel_event=cancel_event,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -682,6 +955,7 @@ def _monitor_worker_and_finalize(
     time_limit_seconds: float,
     rss_limit_bytes: int,
     stdout_cap: int = _MAX_WORKER_STDOUT_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> ExitCode:
     """`_spawn_worker_and_finalize` が起動した `proc`（`_worker`）を監視し、
     結果に応じて `out_dir` の予約を確定または解放する（分離した理由:
@@ -697,19 +971,47 @@ def _monitor_worker_and_finalize(
     reader_thread.start()
 
     killed_reason = monitor_child(
-        proc, time_limit_seconds=time_limit_seconds, rss_limit_bytes=rss_limit_bytes
+        proc,
+        time_limit_seconds=time_limit_seconds,
+        rss_limit_bytes=rss_limit_bytes,
+        cancel_event=cancel_event,
     )
 
-    reader_thread.join(timeout=10)
-    if reader_thread.is_alive() and proc.stdout is not None:
-        # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に
-        # 終わるはずだが、万一残っていたら pipe を閉じて読み出しを解除する。
-        with contextlib.suppress(OSError):
-            proc.stdout.close()
-        reader_thread.join(timeout=5)
-    if proc.stdout is not None:
-        with contextlib.suppress(OSError):
-            proc.stdout.close()
+    if killed_reason == "reap_failed":
+        # worker を回収できず、生きて書き込み続けている可能性がある。予約を解放
+        # せず（公開場所を触らない）、協調キャンセル完了の応答も出さない。キャンセル
+        # 要求中は「解放を確認できない」応答にして Rust 側を Unconfirmed へ倒す
+        # （REQ-34・REQ-39）。
+        message = (
+            _CANCEL_CLEANUP_INCOMPLETE_MESSAGE
+            if _is_cancelled(cancel_event)
+            else "worker could not be reaped"
+        )
+        _emit({"status": "error", "code": "runtime_error", "message": message})
+        return ExitCode.RUNTIME_ERROR
+
+    if killed_reason == "cancelled":
+        # 協調キャンセル: worker は `monitor_child` が `killpg` → 回収済み。
+        # 破棄される標準出力の drain は待たず、先に保持中の fd で予約を解放する
+        # （drain の最大 15 秒待ちが Rust 側の猶予予算 15 秒を超え SIGKILL され、
+        # 空の予約が残るのを防ぐ。REQ-34）。確定へは進まない。
+        try:
+            return _report_cancelled(reservation)
+        finally:
+            # 解放後は他スレッドから `proc.stdout` を閉じない（reader が自身で
+            # 閉じる。読み取り中の close は停止しうる）。reader は daemon で、
+            # 待ちは短く抑える。
+            reader_thread.join(timeout=1)
+
+    # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に終わる。
+    # 子孫が書き込み端を保持して残った場合も、他スレッドから閉じずに待ちを
+    # 打ち切る。その際 `stdout_result` は未設定のまま JSON 検証で fail-closed になる。
+    # 資源上限で止めた場合（`killed_reason` あり）は壁時計・資源超過の結果を
+    # キャンセルより優先する（`classify_cancel_outcome` と同じ優先関係）。
+    join_cancel = cancel_event if killed_reason is None else None
+    if not _join_unless_cancelled(reader_thread, _READER_JOIN_SECONDS, join_cancel):
+        # 待っている間にキャンセルが届いた。確定前なので公開せず解放する。
+        return _report_cancelled(reservation)
 
     if killed_reason is not None:
         contract.cleanup_reservation(reservation)
@@ -782,13 +1084,16 @@ def _monitor_worker_and_finalize(
         # ワーカー自身が 7 種のいずれかのエラーで終了した（例: invalid_config）。
         # 出力は確定させず、予約を解放してからそのままエラーを伝える。
         contract.cleanup_reservation(reservation)
-        _emit(payload)
+        _emit(_forward_worker_error(payload))
         return ExitCode(returncode)
 
     # P0: 確定（rename）の直前に、保持し続けている tmp_fd（名前を再解決しない）
     # に対して model.onnx の SHA-256 が artifact.json の記録と一致するかを
     # 確認する（AGENTS.md ガード層「完全性と版」・REQ-39。artifact.py の
     # モジュール docstring 参照）。不一致・欠落は出力を確定させない。
+    if _is_cancelled(cancel_event):
+        return _report_cancelled(reservation)
+
     try:
         artifact_mod.verify_output(reservation.tmp_fd)
     except WorkerError as e:
@@ -796,11 +1101,18 @@ def _monitor_worker_and_finalize(
         _emit({"status": "error", "code": e.code, "message": e.message})
         return e.exit_code
 
-    try:
-        contract.finalize_out_dir(reservation)
-    except WorkerError as e:
-        _emit({"status": "error", "code": e.code, "message": e.message})
-        return e.exit_code
+    # キャンセル確認と確定（rename）を同じ同期区間で行う。`CancelSignal.set()` も
+    # 同じロックを取るため、確認後〜rename 前に届いた要求は rename の完了まで
+    # 待たされ、「キャンセルが先か確定が先か」で結果が一意に決まる。確定後に
+    # 届いたキャンセルは無視して成功を報告する（モジュール docstring）。
+    with _commit_section(cancel_event) as cancelled:
+        if cancelled:
+            return _report_cancelled(reservation)
+        try:
+            contract.finalize_out_dir(reservation)
+        except WorkerError as e:
+            _emit({"status": "error", "code": e.code, "message": e.message})
+            return e.exit_code
 
     _emit(payload)
     return ExitCode.OK
