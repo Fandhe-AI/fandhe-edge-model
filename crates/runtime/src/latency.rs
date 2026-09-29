@@ -20,7 +20,7 @@
 //! # 範囲外（実装済みを装わない）
 //!
 //! - p95 算出・レポート・参考値の明記は [`crate::latency_report`]（#128・TASK-31.1-2）で実装済み。
-//!   上限照合と `limit_exceeded`: TASK-31.2・#129。上限ちょうどの境界判定: #130。
+//!   上限照合と `limit_exceeded`: [`crate::latency_limit`]（TASK-31.2・#129）で実装済み。上限ちょうどの境界判定: #130。
 //!   JSON 出力・CLI 接続: TASK-33.x
 //! - 実前処理（#112）・ONNX 推論（#113）が未実装のため、実モデルでの計測は #113 完了後
 //! - 実機（静かな Mac）での実計測と実測値の記録は人間の作業。本モジュールのテストの
@@ -274,7 +274,7 @@ impl Default for LatencyConfig {
     }
 }
 
-/// 計測結果。個々の計測値（ns）を反復順に保持する。p95 は [`crate::latency_report`]、合否は持たない（#129）。
+/// 計測結果。個々の計測値（ns）を反復順に保持する。p95 は [`crate::latency_report`]、合否は持たない（上限照合は [`crate::latency_limit`]）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct LatencySamples {
     warmup: usize,

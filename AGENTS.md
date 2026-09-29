@@ -47,6 +47,13 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 既定のテスト集合で動くはずのテストを、CI 通過のために実機前提テストへ移す差分は P0
 - 実機での測定・判定が「人間」担当のタスクを、計測スクリプト準備を超えて Agent が単独で完了扱いにしていないか確認する
 
+#### sandbox 下の完走確認（REQ-38・TASK-38.1-1・#162）
+
+- 実機確認は `scripts/sandbox-run.sh` を macOS 実機（Apple Silicon・`/usr/bin/sandbox-exec`）で**人が手動実行**する。sandbox の外で先に `cargo build` と `make py-sync` を済ませ、定義ファイルとデータを用意する。例: `scripts/sandbox-run.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke`
+- 既定の `make test` に含まれる `crates/cli/tests/sandbox_run_script.rs` は偽の launcher を使うテストハーネスで、実際の通信遮断は行わない。実機の証拠にはならない（証拠種別: テストハーネス）
+- 実バイナリは TASK-33.1-2（#136）の完了まで `register` で `runtime_error`(70) になる。完走を装っていないことの確認に留まる
+- 拒否ログの監視と 0 件判定は TASK-38.1-2（#163）、陽性対照は TASK-38.2 の担当
+
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 
 - `crates/runtime/tests/env_isolation.rs` は、環境変数を空にした子プロセスで C1・C3 の fixture 推論が exit 0 になることを確かめ、既定の `make test` で実行される（unix 限定。rust-ci の Linux・macOS runner で実行。証拠種別: テストハーネス）。実機前提へ移す差分は P0
