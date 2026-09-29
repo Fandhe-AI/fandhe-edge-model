@@ -42,8 +42,28 @@ impl TempDir {
     fn path(&self) -> &Path {
         &self.0
     }
+    /// 台帳内のファイル数（評価データごとのサブディレクトリを 1 階層たどって数える）。
     fn count(&self) -> usize {
-        fs::read_dir(&self.0).unwrap().count()
+        fs::read_dir(&self.0)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    fs::read_dir(&p).unwrap().count()
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    /// 台帳直下のエントリ（評価データごとのサブディレクトリ）の一覧。
+    fn scope_dirs(&self) -> Vec<PathBuf> {
+        fs::read_dir(&self.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect()
     }
 }
 
@@ -473,10 +493,14 @@ fn req27_registration_after_application_is_rejected() {
     // 適用済みの代表構成ロックだけを別の台帳へ持ち込んでも、事後登録は拒否される。
     let dir2 = TempDir::new("latereg2");
     let digest = freeze_eval_data(DATA).unwrap().sha256();
-    for entry in fs::read_dir(dir.path()).unwrap() {
-        let e = entry.unwrap();
-        if e.file_name().to_string_lossy().starts_with("config-") {
-            fs::copy(e.path(), dir2.path().join(e.file_name())).unwrap();
+    for scope in dir.scope_dirs() {
+        let scope2 = dir2.path().join(scope.file_name().unwrap());
+        fs::create_dir(&scope2).unwrap();
+        for entry in fs::read_dir(&scope).unwrap() {
+            let e = entry.unwrap();
+            if e.file_name().to_string_lossy().starts_with("config-") {
+                fs::copy(e.path(), scope2.join(e.file_name())).unwrap();
+            }
         }
     }
     let ledger2 = FinalTestLedger::open(dir2.path()).unwrap();
@@ -724,14 +748,7 @@ fn req39_registry_fifo_is_rejected_without_blocking() {
     let dir = TempDir::new("fifo");
     let ledger = FinalTestLedger::open(dir.path()).unwrap();
     register(&ledger, DATA, &[("c1:seed0", b"w1")]);
-    let mut reg_path = None;
-    for entry in fs::read_dir(dir.path()).unwrap() {
-        let e = entry.unwrap();
-        if e.file_name().to_string_lossy().starts_with("registry-") {
-            reg_path = Some(e.path());
-        }
-    }
-    let reg_path = reg_path.unwrap();
+    let reg_path = ledger_file(&dir, "registry-");
     fs::remove_file(&reg_path).unwrap();
     let status = std::process::Command::new("mkfifo")
         .arg(&reg_path)
@@ -920,8 +937,10 @@ fn req27_decode_failure_consumes_application() {
 
 #[cfg(unix)]
 fn ledger_file(dir: &TempDir, prefix: &str) -> PathBuf {
-    let mut hits: Vec<PathBuf> = fs::read_dir(dir.path())
-        .unwrap()
+    let mut hits: Vec<PathBuf> = dir
+        .scope_dirs()
+        .into_iter()
+        .flat_map(|d| fs::read_dir(d).unwrap())
         .map(|e| e.unwrap().path())
         .filter(|p| {
             p.file_name()
@@ -1191,23 +1210,55 @@ fn req27_foreign_eval_data_locks_do_not_affect_application() {
     let calls = Cell::new(0u32);
     assert!(run(&ledger, OTHER, "o", &Model::new(b"wo", None), &calls).is_ok());
     // 別の評価データのロックを壊し、さらに同じ許可パターンの名前の無関係なファイルを大量に置く。
-    let foreign = fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("config-")
-        })
-        .unwrap();
+    let foreign = ledger_file(&dir, "config-");
     overwrite_writable(&foreign, b"garbage\n");
+    let foreign_dir = foreign.parent().unwrap().to_path_buf();
     for i in 0..2000u32 {
         let h = Sha256Digest::of_bytes(&i.to_be_bytes()).to_hex();
-        fs::write(dir.path().join(format!("config-{h}-{h}.lock")), b"x").unwrap();
+        fs::write(foreign_dir.join(format!("config-{h}.lock")), b"x").unwrap();
     }
     register(&ledger, DATA, &[("a", b"wa")]);
     let r = run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls);
     assert!(r.is_ok());
     assert_eq!(calls.get(), 2);
+}
+
+/// 評価データのサブディレクトリが symlink の場合は、登録も適用も拒否される。
+#[cfg(unix)]
+#[test]
+fn req27_scope_dir_symlink_is_rejected() {
+    let dir = TempDir::new("scope-symlink");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let scope = dir.scope_dirs().remove(0);
+    let moved = TempDir::new("scope-symlink-moved");
+    let target = moved.path().join("real");
+    fs::rename(&scope, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &scope).unwrap();
+    let calls = Cell::new(0u32);
+    let r = run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls);
+    assert_eq!(
+        tampered_reason(&r),
+        Some("scope directory is not a real directory")
+    );
+    assert_eq!(calls.get(), 0);
+    // 再登録も、symlink のままでは拒否される。
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    assert!(matches!(
+        ledger.register_configs(&digest, &[reg("b", b"wb")]),
+        Err(AcquireError::LedgerDirInvalid { .. })
+    ));
+}
+
+/// 評価データのサブディレクトリは 0700 で作られる。
+#[cfg(unix)]
+#[test]
+fn req27_scope_dir_is_created_0700() {
+    let dir = TempDir::new("scope-mode");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let scopes = dir.scope_dirs();
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(mode_of(&scopes[0]), 0o700);
+    assert_eq!(scopes[0].file_name().unwrap().len(), 64);
 }
