@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -243,7 +244,7 @@ def main() -> None:
         raise SystemExit("output files already exist; pass --overwrite to replace them")
 
     # 生成・検証はすべて出力先と同じファイルシステム上の一時領域で行い、3 ファイルとも成功して
-    # から出力先へ置き換える。途中で失敗しても既存の fixture は変更されない。
+    # から出力先へ置き換える。置き換え中の失敗は旧ファイルへ戻す（_install_all）。
     with tempfile.TemporaryDirectory(dir=out_dir, prefix=".gen_onnx_parity_") as tmp:
         work = Path(tmp) / "work"
         staging = Path(tmp) / "staging"
@@ -254,10 +255,37 @@ def main() -> None:
             "c3": _build_kind("c3", c3_mod.C3Kind(), _mlx_probs_c3, C3_CONFIG, staging, work),
         }
         _write_cases(staging, kinds)
-        for name in ("c1.onnx", "c3.onnx", "cases.json"):
-            os.replace(staging / name, out_dir / name)
+        _install_all(staging, out_dir, Path(tmp) / "backup")
     for k, v in kinds.items():
         sys.stdout.write(f"{k}: cases={len(v['cases'])} excluded={v['excluded_near_tie']}\n")
+
+
+def _install_all(staging: Path, out_dir: Path, backup: Path) -> None:
+    """staging の 3 ファイルを out_dir へ置き換える。途中で失敗したら旧ファイルへ戻す。
+
+    `os.replace` は 1 ファイルずつ原子的だが 3 ファイル全体では原子的でないため、置き換え前に
+    既存ファイルを backup へ退避し、失敗時は退避分を戻して
+    新規に置いた分を消す（新旧の混在を残さない）。
+    """
+    names = ("c1.onnx", "c3.onnx", "cases.json")
+    backup.mkdir()
+    saved: list[str] = []
+    placed: list[str] = []
+    try:
+        for name in names:
+            if (out_dir / name).exists():
+                shutil.copy2(out_dir / name, backup / name)
+                saved.append(name)
+        for name in names:
+            os.replace(staging / name, out_dir / name)
+            placed.append(name)
+    except BaseException:
+        for name in placed:
+            if name in saved:
+                os.replace(backup / name, out_dir / name)
+            else:
+                (out_dir / name).unlink(missing_ok=True)
+        raise
 
 
 def _write_cases(dest: Path, kinds: dict[str, Any]) -> None:

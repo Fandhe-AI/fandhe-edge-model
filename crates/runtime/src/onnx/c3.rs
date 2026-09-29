@@ -297,8 +297,8 @@ impl C3Model {
         self.scores_within(ids, MAX_INFER_DURATION)
     }
 
-    /// 計算時間の上限付きのスコア計算。各位置（フィルタ 1 本 × 1 位置の走査）の境界で経過時間を
-    /// 検査し、超過したら [`BackendError::TimeLimitExceeded`] で打ち切る（REQ-39）。
+    /// 計算時間の上限付きのスコア計算。各位置（フィルタ 1 本 × 1 位置の走査）・出力層の各反復・softmax の前で
+    /// 経過時間を検査し、超過したら [`BackendError::TimeLimitExceeded`] で打ち切る（REQ-39）。
     fn scores_within(&self, ids: &[i64], limit: Duration) -> Result<Vec<f64>, BackendError> {
         let started = Instant::now();
         let t_len = ids.len();
@@ -362,6 +362,10 @@ impl C3Model {
         let k = self.n_classes;
         let mut logits = vec![0.0f32; k];
         for (i, &p) in pooled.iter().enumerate() {
+            // 出力層の反復でも期限を検査する（許可された最大構成では pooled × out_w も大きい）
+            if started.elapsed() >= limit {
+                return Err(BackendError::TimeLimitExceeded);
+            }
             let start = i.checked_mul(k).ok_or(BackendError::Failed)?;
             let row = self
                 .out_w
@@ -373,6 +377,10 @@ impl C3Model {
         }
         for (acc, b) in logits.iter_mut().zip(&self.out_b) {
             *acc += b;
+        }
+        // softmax の前にも検査し、期限超過の結果を返さない
+        if started.elapsed() >= limit {
+            return Err(BackendError::TimeLimitExceeded);
         }
         softmax_f64(&logits)
     }
