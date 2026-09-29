@@ -181,6 +181,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -469,6 +470,38 @@ def monitor_child(
         time.sleep(poll_interval)
 
 
+class CancelSignal(threading.Event):
+    """確定処理と排他できる協調キャンセルのイベント（REQ-34・#145）。
+
+    `set()` は `commit_lock` を取る。確定側は `_commit_section` で同じロックを
+    保持したままキャンセル確認と `finalize_out_dir` を行うため、EOF の到着が
+    確認後〜rename 前に挟まっても、どちらが先に成立したかで結果が決まる。
+    `cli.py::_start_cancel_watch` が生成する。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_lock = threading.Lock()
+
+    def set(self) -> None:
+        with self.commit_lock:
+            super().set()
+
+
+@contextlib.contextmanager
+def _commit_section(cancel_event: threading.Event | None) -> Iterator[bool]:
+    """キャンセル確認と確定を同期区間にまとめ、区間開始時点のキャンセル有無を渡す。
+
+    `CancelSignal` 以外（`None`・素の `Event`）ではロックを取らず単に確認する。
+    """
+    lock = getattr(cancel_event, "commit_lock", None)
+    if lock is None:
+        yield _is_cancelled(cancel_event)
+        return
+    with lock:
+        yield _is_cancelled(cancel_event)
+
+
 def _is_cancelled(cancel_event: threading.Event | None) -> bool:
     """協調キャンセルが要求されたか（`None` は常に `False`）。"""
     return cancel_event is not None and cancel_event.is_set()
@@ -526,8 +559,14 @@ def _drain_stdout(pipe: Any, result: dict[str, Any], cap: int = _MAX_WORKER_STDO
                         kept += remaining
                     oversized = True
     except (OSError, ValueError):
-        # 親側でパイプを閉じた等。読めた分だけを使う。
+        # 読み出しエラー。読めた分だけを使う。
         pass
+    finally:
+        # パイプは reader 自身が閉じる。別スレッドから `close()` を呼ぶと、
+        # バッファ付きストリームの読み取りロック待ちで停止しうる（子孫が書き込み端を
+        # 保持している場合。#145 PR #286 レビュー）ため、他スレッドは閉じない。
+        with contextlib.suppress(OSError, ValueError):
+            pipe.close()
     result["data"] = b"".join(chunks)
     result["oversized"] = oversized
 
@@ -793,23 +832,15 @@ def _monitor_worker_and_finalize(
         try:
             return _report_cancelled(reservation)
         finally:
-            # 解放後の後始末のみ（結果は使わない）。reader は daemon スレッドで、
-            # パイプを閉じて読み出しを解除するため待ちは短く抑える。
-            if proc.stdout is not None:
-                with contextlib.suppress(OSError):
-                    proc.stdout.close()
+            # 解放後は他スレッドから `proc.stdout` を閉じない（reader が自身で
+            # 閉じる。読み取り中の close は停止しうる）。reader は daemon で、
+            # 待ちは短く抑える。
             reader_thread.join(timeout=1)
 
+    # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に終わる。
+    # 子孫が書き込み端を保持して残った場合も、他スレッドから閉じずに待ちを
+    # 打ち切る。その際 `stdout_result` は未設定のまま JSON 検証で fail-closed になる。
     reader_thread.join(timeout=10)
-    if reader_thread.is_alive() and proc.stdout is not None:
-        # 通常は proc の終了（パイプの書き手が閉じる）で reader は自然に
-        # 終わるはずだが、万一残っていたら pipe を閉じて読み出しを解除する。
-        with contextlib.suppress(OSError):
-            proc.stdout.close()
-        reader_thread.join(timeout=5)
-    if proc.stdout is not None:
-        with contextlib.suppress(OSError):
-            proc.stdout.close()
 
     if killed_reason is not None:
         contract.cleanup_reservation(reservation)
@@ -899,16 +930,18 @@ def _monitor_worker_and_finalize(
         _emit({"status": "error", "code": e.code, "message": e.message})
         return e.exit_code
 
-    # 確定の直前の最後のキャンセル確認。`finalize_out_dir`（rename）が成功した
-    # 後はキャンセルを見ず、公開と成功報告を一致させる（モジュール docstring）。
-    if _is_cancelled(cancel_event):
-        return _report_cancelled(reservation)
-
-    try:
-        contract.finalize_out_dir(reservation)
-    except WorkerError as e:
-        _emit({"status": "error", "code": e.code, "message": e.message})
-        return e.exit_code
+    # キャンセル確認と確定（rename）を同じ同期区間で行う。`CancelSignal.set()` も
+    # 同じロックを取るため、確認後〜rename 前に届いた要求は rename の完了まで
+    # 待たされ、「キャンセルが先か確定が先か」で結果が一意に決まる。確定後に
+    # 届いたキャンセルは無視して成功を報告する（モジュール docstring）。
+    with _commit_section(cancel_event) as cancelled:
+        if cancelled:
+            return _report_cancelled(reservation)
+        try:
+            contract.finalize_out_dir(reservation)
+        except WorkerError as e:
+            _emit({"status": "error", "code": e.code, "message": e.message})
+            return e.exit_code
 
     _emit(payload)
     return ExitCode.OK

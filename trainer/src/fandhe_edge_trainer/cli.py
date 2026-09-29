@@ -224,7 +224,7 @@ def _start_cancel_watch() -> threading.Event:
         raise WorkerError(
             "invalid_request", "cancel channel (stdin) must be a pipe", ExitCode.INVALID_INPUT
         )
-    event = threading.Event()
+    event = supervisor_mod.CancelSignal()
     threading.Thread(
         target=_cancel_watch_loop, args=(event,), name="cancel-watch", daemon=True
     ).start()

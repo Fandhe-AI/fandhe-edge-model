@@ -1221,3 +1221,69 @@ def test_req34_cancel_after_reservation_before_spawn_releases_reservation(
     assert not out_dir.exists()
     assert _tmp_leftovers(tmp_path) == []
     assert not (ctl_dir / "ready").exists()
+
+
+def test_req34_cancel_arriving_during_finalize_is_serialized_with_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34（#145 PR #286 レビュー P1）: キャンセル確認〜rename の間に届いた
+    要求は rename の完了まで待たされ、確定が先に成立して成功を報告する
+    （公開されている ⇔ 成功報告。キャンセル済みなのに公開して成功、を作らない）。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "ok")
+    event = supervisor.CancelSignal()
+    real_finalize = contract.finalize_out_dir
+    setter_started = threading.Event()
+    setter_done = threading.Event()
+
+    def _set_from_other_thread() -> None:
+        setter_started.set()
+        event.set()
+        setter_done.set()
+
+    def _finalize_with_racing_cancel(reservation: contract.OutDirReservation) -> None:
+        # 確認済みの区間内で別スレッドが cancel を要求する。ロックにより
+        # finalize の完了まで set() は完了しない。
+        threading.Thread(target=_set_from_other_thread, daemon=True).start()
+        assert setter_started.wait(timeout=5)
+        time_mod.sleep(0.2)
+        assert not setter_done.is_set()
+        assert not event.is_set()
+        real_finalize(reservation)
+
+    monkeypatch.setattr(contract, "finalize_out_dir", _finalize_with_racing_cancel)
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    assert code == ExitCode.OK
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "ok"
+    assert sorted(os.listdir(out_dir)) == ["artifact.json", "model.onnx"]
+    assert setter_done.wait(timeout=5)
+    assert event.is_set()
+
+
+def test_req34_drain_stdout_closes_pipe_itself_and_cancel_does_not_hang() -> None:
+    """REQ-34（#145 PR #286 レビュー P1）: reader が自身でパイプを閉じる。
+    子孫が書き込み端を保持していても、他スレッドから `close()` を呼ばない
+    ため協調キャンセル後の終了が停止しない。"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+    )
+    result: dict = {}
+    reader = threading.Thread(
+        target=supervisor._drain_stdout, args=(proc.stdout, result), daemon=True
+    )
+    reader.start()
+    try:
+        started = time_mod.monotonic()
+        # 読み取り中に join だけ（close はしない）。所定時間で必ず戻る。
+        reader.join(timeout=0.5)
+        assert reader.is_alive()
+        assert time_mod.monotonic() - started < 3
+    finally:
+        proc.kill()
+        proc.wait()
+        reader.join(timeout=5)
+    assert not reader.is_alive()
+    assert result["data"] == b""
+    assert proc.stdout is not None
+    assert proc.stdout.closed
