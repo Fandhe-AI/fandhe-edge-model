@@ -1,14 +1,12 @@
 //! 公開 API 経由の結合テスト（REQ-39・TASK-39.2-1・#153）。
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_guard::format::{
-    AllowedFormat, FileFormat, FormatAllowlist, FormatRejection, open_checked_file,
-};
+use fandhe_edge_guard::format::{FileFormat, FormatAllowlist, FormatRejection, open_checked_file};
 use std::path::{Path, PathBuf};
 
 /// 検査結果の形式だけを取り出す試験用ヘルパー（公開 API は検査済みハンドルのみ返す）。
-fn check_file_format(path: &Path, al: &FormatAllowlist) -> Result<AllowedFormat, FormatRejection> {
-    open_checked_file(path, al, 1 << 20).map(|c| c.into_parts().1)
+fn check_file_format(path: &Path, al: &FormatAllowlist) -> Result<FileFormat, FormatRejection> {
+    open_checked_file(path, al, 1 << 20).map(|c| c.format())
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -30,8 +28,7 @@ fn req39_check_file_format_by_content() {
     .unwrap();
     std::fs::write(&fake, [0x80, 0x04, 0x95, 0x00]).unwrap();
     let al = FormatAllowlist::onnx_only();
-    let ok: AllowedFormat = check_file_format(&onnx, &al).unwrap();
-    assert_eq!(ok.format(), FileFormat::Onnx);
+    assert_eq!(check_file_format(&onnx, &al).unwrap(), FileFormat::Onnx);
     match check_file_format(&fake, &al).unwrap_err() {
         FormatRejection::NotAllowed { detected, .. } => assert_eq!(detected, FileFormat::Pickle),
         other => panic!("unexpected: {other}"),
@@ -64,7 +61,7 @@ fn req39_onnx_graph_beyond_prefix_is_allowed() {
     b.extend_from_slice(&[0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]);
     std::fs::write(&path, &b).unwrap();
     let ok = check_file_format(&path, &FormatAllowlist::onnx_only()).unwrap();
-    assert_eq!(ok.format(), FileFormat::Onnx);
+    assert_eq!(ok, FileFormat::Onnx);
     // graph が無いまま大きな doc_string だけなら拒否する。
     b.truncate(b.len() - 4);
     std::fs::write(&path, &b).unwrap();
@@ -101,7 +98,7 @@ fn req39_open_checked_file_keeps_inspected_handle() {
     let body = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
     std::fs::write(&path, body).unwrap();
     let mut checked = open_checked_file(&path, &FormatAllowlist::onnx_only(), 1 << 20).unwrap();
-    assert_eq!(checked.format().format(), FileFormat::Onnx);
+    assert_eq!(checked.format(), FileFormat::Onnx);
     // 検査後に別の書き込みハンドルで同じファイルの中身を pickle へ上書きする。
     {
         use std::io::Write as _;

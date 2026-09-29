@@ -1,8 +1,8 @@
 //! 許可リストによるファイル形式判定基盤（REQ-39「形式・種別の検査」・TASK-39.2-1・#153）。
 //!
 //! 読み込もうとするファイルの形式を、拡張子ではなく先頭バイトの構造から判定し、
-//! 許可リストに含まれる形式だけを通す。許可済みの型 [`AllowedFormat`] は
-//! [`open_checked_file`] が実ファイルの内容を検査したときだけ得られ、形式の値から直接は作れない。
+//! 許可リストに含まれる形式だけを通す。許可済みの証明は
+//! [`open_checked_file`] が実ファイルの内容を検査して返す [`CheckedFile`] だけが持ち、バイト列と形式を切り離せない。
 //! 検査したバイト列はメモリに保持して [`CheckedFile`] で渡し、検査後の書き換えを防ぐ。許可リスト方式のため、判定できない
 //! 内容（[`FileFormat::Unknown`]）は常に拒否する（fail-closed）。
 //!
@@ -358,21 +358,21 @@ fn detect_signature(prefix: &[u8]) -> Option<FileFormat> {
     None
 }
 
-/// 先頭バイトからファイル形式を判定する純関数。`prefix` はファイル先頭の有限長、
-/// `total_len` はメタデータ上のファイルサイズ。判定順は固定シグネチャ → ONNX 構造検査 → `Unknown`。
-///
-/// `prefix` がファイル全体（`prefix.len() >= total_len`）なら、途中で切れた protobuf は拒否する。
-/// `prefix` がファイルの一部だけの場合、prefix の終端で打ち切られた続きは未検査のため
-/// ONNX とは認めず `Unknown` を返す（未検査を合格扱いにしない。REQ-39）。
-/// ファイルに対する判定は [`check_file_format`] が LEN を飛ばして末尾まで走査する。
-pub fn detect_format(prefix: &[u8], total_len: u64) -> FileFormat {
-    if let Some(f) = detect_signature(prefix) {
+/// バイト列全体からファイル形式を判定する純関数（非公開。公開すると検査を経ない判定値が出回る）。
+/// 判定順は固定シグネチャ → ONNX 構造検査 → `Unknown`。`bytes` はファイル全体でなければならず、
+/// 全バイトを走査して「ちょうど末尾で終わる」ことを確認する。長さ超過・途中切れ・走査回数の上限で
+/// 確認しきれない場合は `Unknown`（fail-closed。REQ-39）。
+fn detect_format(bytes: &[u8]) -> FileFormat {
+    if let Some(f) = detect_signature(bytes) {
         return f;
     }
-    let mut src = SliceSource { prefix, total_len };
+    let total_len = bytes.len() as u64;
+    let mut src = SliceSource {
+        prefix: bytes,
+        total_len,
+    };
     match scan_onnx_model(&mut src, total_len) {
         Ok(OnnxScan::Onnx) => FileFormat::Onnx,
-        // 未検査の続きが残る場合は許可しない（fail-closed。REQ-39）。
         _ => FileFormat::Unknown,
     }
 }
@@ -406,29 +406,17 @@ impl FormatAllowlist {
 
     /// 判定済みの形式を許可リストと照合する。
     ///
-    /// 非公開: 公開すると任意の [`FileFormat`] から [`AllowedFormat`] を得られ、検査を迂回できる。
-    /// 許可済みの型は [`open_checked_file`] が実ファイルの内容を検査したときだけ得られる（REQ-39）。
-    fn check(&self, detected: FileFormat) -> Result<AllowedFormat, FormatRejection> {
+    /// 非公開: 公開すると検査を経ない形式で許可済みを装える。
+    /// 許可済みの証明は [`open_checked_file`] が返す [`CheckedFile`] だけが持つ（REQ-39）。
+    fn check(&self, detected: FileFormat) -> Result<FileFormat, FormatRejection> {
         if self.contains(detected) {
-            Ok(AllowedFormat(detected))
+            Ok(detected)
         } else {
             Err(FormatRejection::NotAllowed {
                 detected,
                 allowed: self.formats.iter().copied().collect(),
             })
         }
-    }
-}
-
-/// 許可リストの検査を通った形式。外部から直接は作れず、`Copy`・`Clone` でもない
-/// （検査済みのハンドルから切り離して持ち回さない。TOCTOU 対策。REQ-39）。
-#[derive(Debug, PartialEq, Eq)]
-pub struct AllowedFormat(FileFormat);
-
-impl AllowedFormat {
-    /// 通った形式。
-    pub const fn format(&self) -> FileFormat {
-        self.0
     }
 }
 
@@ -499,23 +487,19 @@ impl std::error::Error for FormatRejection {}
 #[derive(Debug)]
 pub struct CheckedFile {
     cursor: io::Cursor<Vec<u8>>,
-    format: AllowedFormat,
+    format: FileFormat,
 }
 
 impl CheckedFile {
-    /// 検査を通った形式（バイト列への借用。`CheckedFile` を手放さずに参照する）。
-    pub const fn format(&self) -> &AllowedFormat {
-        &self.format
+    /// 検査を通った形式。形式の証明は `CheckedFile` の中にだけあり、バイト列と切り離して取り出せない
+    /// （`FileFormat` は判定結果のラベルで、許可済みの証明ではない）。
+    pub const fn format(&self) -> FileFormat {
+        self.format
     }
 
     /// 検査したバイト列全体。
     pub fn as_bytes(&self) -> &[u8] {
         self.cursor.get_ref()
-    }
-
-    /// 検査したバイト列と形式を一緒に取り出す。
-    pub fn into_parts(self) -> (Vec<u8>, AllowedFormat) {
-        (self.cursor.into_inner(), self.format)
     }
 }
 
@@ -543,8 +527,7 @@ pub fn open_checked_file(
     max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
     let bytes = read_bounded(path, max_bytes).map_err(FormatRejection::Io)?;
-    let total_len = bytes.len() as u64;
-    let detected = detect_format(&bytes, total_len);
+    let detected = detect_format(&bytes);
     let format = allowlist.check(detected)?;
     Ok(CheckedFile {
         cursor: io::Cursor::new(bytes),
@@ -557,7 +540,7 @@ mod tests {
     use super::*;
 
     fn d(b: &[u8]) -> FileFormat {
-        detect_format(b, b.len() as u64)
+        detect_format(b)
     }
 
     /// REQ-39・TASK-39.2-1: 最小の ONNX 形と実物に近い先頭を Onnx と判定する。
@@ -652,24 +635,22 @@ mod tests {
         std::fs::write(&pkl, [0x80, 0x04, 0x95]).unwrap();
         let al = FormatAllowlist::onnx_only();
         let ok = open_checked_file(&onnx, &al, 1 << 20).unwrap();
-        assert_eq!(ok.format().format(), FileFormat::Onnx);
+        assert_eq!(ok.format(), FileFormat::Onnx);
         let err = open_checked_file(&pkl, &al, 1 << 20).unwrap_err();
         assert_eq!(err.exit_code(), ExitCode::InvalidInput);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// REQ-39・TASK-39.2-1: prefix がファイルの一部のとき、後続が未検査なら ONNX と認めない
-    /// （prefix だけ ONNX 風で total_len が大きい偽装を許可リストに通さない）。実サイズより大きい LEN も拒否。
+    /// REQ-39・TASK-39.2-1: graph の後ろに未検査の末尾（長さ付きフィールドの中身が無い・LEN が
+    /// 実サイズ超過）を持つバイト列は ONNX と認めない（全バイトが検査できたものだけを通す）。
     #[test]
-    fn req39_partial_prefix_is_never_onnx() {
-        let prefix = [0x08, 0x07, 0x3a, 0x80, 0x80, 0x80, 0x04];
-        assert_eq!(detect_format(&prefix, 1 << 30), FileFormat::Unknown);
-        assert_eq!(detect_format(&prefix, 100), FileFormat::Unknown);
+    fn req39_unverified_tail_is_never_onnx() {
+        let mut b = vec![0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
+        assert_eq!(d(&b), FileFormat::Onnx);
+        b.extend_from_slice(&[0x32, 0x64]); // doc_string LEN 100 だが中身が無い
+        assert_eq!(d(&b), FileFormat::Unknown);
         assert_eq!(
-            detect_format(
-                &[0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78],
-                1 << 30
-            ),
+            d(&[0x08, 0x07, 0x3a, 0x80, 0x80, 0x80, 0x04]),
             FileFormat::Unknown
         );
     }
@@ -738,11 +719,6 @@ mod tests {
     #[test]
     fn req39_truncated_graph_length_is_unknown() {
         assert_eq!(d(&[0x08, 0x07, 0x3a, 0x80]), FileFormat::Unknown);
-        // prefix がファイルの一部でも graph の長さが確定していなければ認めない。
-        assert_eq!(
-            detect_format(&[0x08, 0x07, 0x3a, 0x80], 1 << 30),
-            FileFormat::Unknown
-        );
         assert!(!FormatAllowlist::onnx_only().contains(d(&[0x08, 0x07, 0x3a, 0x80])));
     }
 
@@ -767,7 +743,7 @@ mod tests {
     fn req39_onnx_only_allowlist() {
         let al = FormatAllowlist::onnx_only();
         let ok = al.check(FileFormat::Onnx).unwrap();
-        assert_eq!(ok.format(), FileFormat::Onnx);
+        assert_eq!(ok, FileFormat::Onnx);
         for f in [
             FileFormat::Pickle,
             FileFormat::Npy,
