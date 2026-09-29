@@ -28,11 +28,18 @@
 //! 各エラー型の実装に委ねる（`InferInputError`／`JudgmentError` は
 //! `Display`、`DefinitionError` はパス・利用者指定値を含まない
 //! `public_message`。PR #217 レビュー指摘・P0）。
+//!
+//! # 容量内訳（TASK-30.1-2・#123）
+//!
+//! [`package_capacity_json`]・[`write_package_capacity`] は容量計測（`fandhe-edge-runtime`）の
+//! 内訳を `package` 工程（TASK-33.1。未配線）の JSON へ出す部品。`status`・`judgment` は
+//! TASK-33.x・TASK-30.2 の責務で、ここでは出さない。
 
 use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
+use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use std::io::{self, Write};
 
 /// [`JudgmentResult`] を JSON 1 行＋改行として `out` へ書き、
@@ -130,6 +137,62 @@ pub fn judgment_error_report(err: &JudgmentError) -> ErrorReport {
 /// security.md「秘密情報の混入防止（P0）」）。
 #[must_use]
 pub fn definition_error_report(err: &DefinitionError) -> ErrorReport {
+    ErrorReport::new(err.exit_code(), err.public_message())
+}
+
+/// 容量内訳（REQ-30・TASK-30.1-2・#123）を `package` 出力へ埋め込む `capacity` オブジェクト
+/// （JSON 文字列。改行なし）へ直列化する。
+///
+/// 後続の `package` 工程（TASK-33.1。未配線）が出力へ埋め込む部品。`status`・`judgment`・
+/// 上限照合（TASK-30.2・#124）はここでは扱わない。手組みで足りるのは、キーが
+/// `PackageComponent::as_str()` の ASCII snake_case と固定リテラルだけ、値が整数だけで、
+/// エスケープが要らないため（前提はテストで固定）。構成要素は宣言順に 5 件とも常に出す。
+#[must_use]
+pub fn package_capacity_json(breakdown: &CapacityBreakdown) -> String {
+    let components = breakdown
+        .entries()
+        .into_iter()
+        .map(|(component, entry)| {
+            format!(
+                "\"{}\":{{\"bytes\":{},\"file_count\":{}}}",
+                component.as_str(),
+                entry.bytes,
+                entry.file_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"total_bytes\":{},\"components\":{{{}}}}}",
+        breakdown.total_bytes(),
+        components
+    )
+}
+
+/// `{"capacity":{...}}` を JSON 1 行＋改行として `out` へ書き、[`ExitCode::Ok`] を返す。
+///
+/// [`write_ok_judgment`] と同じ保証を持つ: 行全体を先に組み立て、`write_all` は 1 回の
+/// 呼び出しにつき高々 1 回、失敗時にリトライ・追記・flush をしない。
+///
+/// # Errors
+/// `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_package_capacity<W: Write>(
+    out: &mut W,
+    breakdown: &CapacityBreakdown,
+) -> io::Result<ExitCode> {
+    let mut line = format!("{{\"capacity\":{}}}", package_capacity_json(breakdown));
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(ExitCode::Ok)
+}
+
+/// [`CapacityError`] を [`ErrorReport`] へ変換する薄い関数。`message` はパス・io エラー本文を
+/// 含まない [`CapacityError::public_message`] を使う（security.md P0）。
+#[must_use]
+pub fn capacity_error_report(err: &CapacityError) -> ErrorReport {
     ErrorReport::new(err.exit_code(), err.public_message())
 }
 
@@ -468,5 +531,141 @@ mod tests {
             assert!(!line.contains(secret_schema));
             assert!(!line.contains(secret_id));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // TASK-30.1-2: 容量内訳の JSON 出力（REQ-30・#123）
+    // ------------------------------------------------------------------
+
+    use fandhe_edge_runtime::capacity::PackageComponent;
+
+    const EXPECTED_CAPACITY: &str = concat!(
+        "{\"capacity\":{\"total_bytes\":1549,\"components\":{",
+        "\"weights\":{\"bytes\":1000,\"file_count\":1},",
+        "\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},",
+        "\"label_table\":{\"bytes\":37,\"file_count\":1},",
+        "\"calibration\":{\"bytes\":0,\"file_count\":0},",
+        "\"metadata\":{\"bytes\":512,\"file_count\":1}}}}\n"
+    );
+
+    fn sample_breakdown() -> CapacityBreakdown {
+        CapacityBreakdown::from_sizes([
+            (PackageComponent::Weights, 1000),
+            (PackageComponent::LabelTable, 37),
+            (PackageComponent::Metadata, 512),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn req30_write_package_capacity_exact_output() {
+        let mut buf = Vec::new();
+        let code = write_package_capacity(&mut buf, &sample_breakdown()).unwrap();
+        assert_eq!(code.code(), 0);
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, EXPECTED_CAPACITY);
+        assert_eq!(text.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn req30_zero_byte_file_vs_absent_and_summed() {
+        let b = CapacityBreakdown::from_sizes([
+            (PackageComponent::Weights, 300),
+            (PackageComponent::Weights, 200),
+            (PackageComponent::Calibration, 0),
+        ])
+        .unwrap();
+        let json = package_capacity_json(&b);
+        assert!(
+            json.contains("\"weights\":{\"bytes\":500,\"file_count\":2}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"calibration\":{\"bytes\":0,\"file_count\":1}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"metadata\":{\"bytes\":0,\"file_count\":0}"),
+            "{json}"
+        );
+        assert!(json.starts_with("{\"total_bytes\":500,"), "{json}");
+    }
+
+    #[test]
+    fn req30_component_names_need_no_json_escaping() {
+        for c in PackageComponent::all() {
+            assert!(
+                c.as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{}",
+                c.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn req30_write_package_capacity_propagates_write_failure() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_package_capacity(&mut Failing, &sample_breakdown()).is_err());
+    }
+
+    #[test]
+    fn req30_write_package_capacity_stops_after_partial_write_failure() {
+        struct PartialThenFailing {
+            written: Vec<u8>,
+            write_calls: usize,
+            flush_calls: usize,
+        }
+        impl Write for PartialThenFailing {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.write_calls += 1;
+                if self.write_calls == 1 {
+                    let n = buf.len().min(4);
+                    self.written
+                        .extend_from_slice(buf.get(..n).unwrap_or_default());
+                    Ok(n)
+                } else {
+                    Err(io::Error::other("simulated partial write failure"))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flush_calls += 1;
+                Ok(())
+            }
+        }
+        let mut w = PartialThenFailing {
+            written: Vec::new(),
+            write_calls: 0,
+            flush_calls: 0,
+        };
+        assert!(write_package_capacity(&mut w, &sample_breakdown()).is_err());
+        assert_eq!(w.write_calls, 2);
+        assert_eq!(w.flush_calls, 0);
+        assert_eq!(w.written.len(), 4);
+    }
+
+    #[test]
+    fn req30_capacity_error_report_maps_code_and_message_without_leak() {
+        let err = CapacityError::DuplicatePath {
+            path: std::path::PathBuf::from("/home/alice/secret-marker.onnx"),
+        };
+        let report = capacity_error_report(&err);
+        assert_eq!(report.code.code(), 64);
+        assert_eq!(report.message, "package file is listed more than once");
+        let line = report.to_json_line().unwrap();
+        assert!(!line.contains("secret-marker"), "{line}");
+        assert_eq!(
+            capacity_error_report(&CapacityError::Overflow).code.code(),
+            70
+        );
     }
 }

@@ -17,6 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 fandhe-edge-core.workspace = true
+# workspace 内の path 依存のみ（外部 crate の追加ではない）。用途は容量内訳の型と
+# `CapacityError` の終了コード写像（REQ-30・#123）。runtime は学習側に依存しない（REQ-32）。
+fandhe-edge-runtime.workspace = true
 
 [lints]
 workspace = true
