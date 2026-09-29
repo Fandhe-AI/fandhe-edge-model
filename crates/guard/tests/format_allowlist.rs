@@ -2,10 +2,14 @@
 
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_guard::format::{
-    AllowedFormat, FileFormat, FormatAllowlist, FormatRejection, check_file_format,
-    open_checked_file,
+    AllowedFormat, FileFormat, FormatAllowlist, FormatRejection, open_checked_file,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// 検査結果の形式だけを取り出す試験用ヘルパー（公開 API は検査済みハンドルのみ返す）。
+fn check_file_format(path: &Path, al: &FormatAllowlist) -> Result<AllowedFormat, FormatRejection> {
+    open_checked_file(path, al).map(|c| c.format())
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("fandhe-guard-{}-{name}", std::process::id()));
@@ -19,7 +23,7 @@ fn req39_check_file_format_by_content() {
     let dir = temp_dir("content");
     let onnx = dir.join("m.onnx");
     let fake = dir.join("fake.onnx");
-    std::fs::write(&onnx, [0x08, 0x07, 0x3a, 0x00]).unwrap();
+    std::fs::write(&onnx, [0x08, 0x07, 0x3a, 0x02, 0x62, 0x00]).unwrap();
     std::fs::write(&fake, [0x80, 0x04, 0x95, 0x00]).unwrap();
     let al = FormatAllowlist::onnx_only();
     let ok: AllowedFormat = check_file_format(&onnx, &al).unwrap();
@@ -50,15 +54,15 @@ fn req39_check_file_format_io_rejections() {
 fn req39_onnx_graph_beyond_prefix_is_allowed() {
     let dir = temp_dir("bigdoc");
     let path = dir.join("big.onnx");
-    // ir_version=7, doc_string(field 6, LEN 100000 バイト), graph(field 7, 空)。
+    // ir_version=7, doc_string(field 6, LEN 100000 バイト), graph(field 7, output だけ)。
     let mut b = vec![0x08, 0x07, 0x32, 0xa0, 0x8d, 0x06];
     b.extend(std::iter::repeat_n(b'x', 100_000));
-    b.extend_from_slice(&[0x3a, 0x00]);
+    b.extend_from_slice(&[0x3a, 0x02, 0x62, 0x00]);
     std::fs::write(&path, &b).unwrap();
     let ok = check_file_format(&path, &FormatAllowlist::onnx_only()).unwrap();
     assert_eq!(ok.format(), FileFormat::Onnx);
     // graph が無いまま大きな doc_string だけなら拒否する。
-    b.truncate(b.len() - 2);
+    b.truncate(b.len() - 4);
     std::fs::write(&path, &b).unwrap();
     assert!(check_file_format(&path, &FormatAllowlist::onnx_only()).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -69,7 +73,7 @@ fn req39_onnx_graph_beyond_prefix_is_allowed() {
 fn req39_onnx_truncated_after_graph_is_rejected() {
     let dir = temp_dir("trunc");
     let path = dir.join("t.onnx");
-    std::fs::write(&path, [0x08, 0x07, 0x3a, 0x00, 0x12, 0x80]).unwrap();
+    std::fs::write(&path, [0x08, 0x07, 0x3a, 0x02, 0x62, 0x00, 0x12, 0x80]).unwrap();
     match check_file_format(&path, &FormatAllowlist::onnx_only()).unwrap_err() {
         FormatRejection::NotAllowed { detected, .. } => assert_eq!(detected, FileFormat::Unknown),
         other => panic!("unexpected: {other}"),
@@ -84,7 +88,7 @@ fn req39_open_checked_file_keeps_inspected_handle() {
     use std::io::Read as _;
     let dir = temp_dir("handle");
     let path = dir.join("m.onnx");
-    let body = [0x08, 0x07, 0x3a, 0x00];
+    let body = [0x08, 0x07, 0x3a, 0x02, 0x62, 0x00];
     std::fs::write(&path, body).unwrap();
     let checked = open_checked_file(&path, &FormatAllowlist::onnx_only()).unwrap();
     assert_eq!(checked.format().format(), FileFormat::Onnx);
