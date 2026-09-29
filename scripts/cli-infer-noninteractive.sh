@@ -38,9 +38,36 @@
 # バイナリ: 環境変数 FANDHE_EDGE_BIN、無ければ
 #   ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge
 #
+# 実行記録（REQ-36・TASK-36.1-2・#150。opt-in）:
+#   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
+#   その直下へ一時名 `.run-record.<pid>.<乱数>.tmp`（noclobber の O_EXCL 作成・0600）で作り、書き込みと検証が済んだときだけ
+#   `run-record.<pid>.<乱数>` へ確定する（ハードリンク `ln` で上書きせず原子的に。衝突したら別の乱数で最大 10 回再試行し、
+#   それでも確定できなければ 70）（失敗時は一時名・最終名とも残さない。作成・rename・削除は
+#   記録先を cd -P で開いたカレントディレクトリへの相対名で行い、記録先の移動・差し替えに影響されない）。
+#   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
+#   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
+#   実行ファイルのパスは入れない）・started_at（CLI 起動前の UTC 秒精度）・exit_code（呼び出し元へ
+#   返す値）・stdout・stderr（それぞれ `{"bytes":<バイト数>,"sha256":"<hex>"}`。
+#   stdout は呼び出し元が受け取る正規化後の全体、stderr は中継する CLI の stderr で、診断行
+#   exit_code=<N> は含めない）。
+#   データ本文の混入防止（security.md）: 利用者由来の値（stdout に含まれる id・入力由来の文字列、
+#   CLI の stderr）は本文を保存せず、件数（バイト数）とハッシュだけを残す。command は許可リスト方式で、
+#   記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値
+#   （UTF-8 として不正なら `<invalid utf-8>`）だけ、--text・--id の値・未知のトークン・位置引数は
+#   `<redacted>` に伏せる。入力ファイルの中身は読まず、環境変数は記録しない。
+#   command の記録には資源上限がある（引数 64 件・command 部 4096 バイト・1 値 512 文字）。1 値が長いときはその値を
+#   `<truncated>` に置き換え、件数か総量が超えたら以降を記録せず末尾に `<truncated>` を 1 つ付ける（推論の結果は変えない）。
+#   記録先は起動前に物理パス（`cd -P` + `pwd -P`。途中の symlink を解決）へ正規化し、作成と書き込みは 1 回の open でパスを再解決せず、保存後に
+#   記録先の物理パスが不変であること・記録が通常ファイルであることを確認する
+#   （不一致は fail-closed。検査から作成までの完全な排他はシェルでは保証できない限界で、
+#   差し替えに気づいたら記録を削除して 70 にする）。ハッシュは sha256sum / shasum -a 256 のいずれか
+#   （無ければ fail-closed）。記録を要求されたのに保存できなければ runtime_error(70)。
+#   CLI 起動前の拒否（--out・不正な記録ディレクトリ・バイナリ不在）は記録しない。
+#   証拠種別: テストハーネス（fake bin・help 経路。実クライアントでの記録ではない）。
+#
 # 現状の制約: infer の実推論は TASK-33.1-2（#136）・前処理（#112）・
 # ONNX 推論（#113）が未接続のため exit 70 を返す。exit 0 になるのは
-# `--help` のみ。記録の保存形式は #150（TASK-36.1-2）の担当。
+# `--help` のみ。
 set -eu
 
 # プロセスグループの隔離に bash のジョブ制御（set -m）を使う。dash 等は tty が無いと
@@ -60,23 +87,130 @@ if [ -z "${BASH_VERSION:-}" ] || [ -o posix ]; then
     exit 70
 fi
 
+# 実行記録（TASK-36.1-2）用の JSON 文字列エスケープ。stdin をバイト単位（LC_ALL=C）で読み、
+# `"`・`\`・制御文字（0x01〜0x1F）をエスケープして引用符なしで出す。引数 $1 は入力が改行で
+# 終わるか（1/0）。0x7F 以上は素通し（UTF-8 の正当性は呼び出し側が保証する）。
+# 置換は index/substr で組み立て、gsub の置換文字列の `\` 解釈差（awk 実装差）を避ける
+json_escape() {
+    LC_ALL=C awk -v trail="$1" '
+    function rep(l, c, r,   o, p) {
+        o = ""
+        while ((p = index(l, c)) > 0) { o = o substr(l, 1, p - 1) r; l = substr(l, p + length(c)) }
+        return o l
+    }
+    BEGIN {
+        for (i = 1; i <= 31; i++) if (i != 10) { ch[i] = sprintf("%c", i); es[i] = sprintf("\\u%04x", i) }
+    }
+    {
+        l = rep($0, "\\", "\\\\")
+        l = rep(l, "\"", "\\\"")
+        for (i = 1; i <= 31; i++) if (i != 10 && index(l, ch[i]) > 0) l = rep(l, ch[i], es[i])
+        if (NR > 1) printf "\\n"
+        printf "%s", l
+    }
+    END { if (NR > 0 && trail == 1) printf "\\n" }'
+}
+
+# ファイルの sha256（16 進 64 桁）を出す。ツールが無い・出力が不正なら非 0（fail-closed）
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        _h=$(sha256sum <"$1") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        _h=$(shasum -a 256 <"$1") || return 1
+    else
+        return 1
+    fi
+    _h=${_h%% *}
+    case "$_h" in
+        *[!0-9a-f]* | '') return 1 ;;
+    esac
+    [ "${#_h}" -eq 64 ] || return 1
+    printf '%s' "$_h"
+}
+
+# 引数 1 つを記録の command 配列へ追加する（記録を要求されたときだけ）。呼び出し側は
+# 固定のオプション名か伏せ字だけを渡す（許可リスト方式。入力本文を記録に残さない。security.md）
+rec_dir=${FANDHE_EDGE_RECORD_DIR:-}
+rec_cmd='"fandhe-edge","infer"'
+# command 記録の資源上限（REQ-39）: 引数 64 件・記録の command 部 4096 バイト・1 値 512 文字。
+# 1 値が長すぎるときはその値を `<truncated>` に置き換え、件数か総量が上限を超えたら
+# 以降の引数を記録せず末尾に固定の印 `<truncated>` を 1 度だけ付ける（記録の切り詰め。
+# 推論本体の終了コード・出力には影響しない）
+rec_n=0
+rec_bytes=0
+rec_trunc=0
+rec_add() {
+    if [ -n "$rec_dir" ] && [ "$rec_trunc" -eq 0 ]; then
+        _piece=
+        _plen=0
+        if [ "$rec_n" -lt 64 ]; then
+            if [ "${#1}" -gt 512 ]; then
+                _piece=',"<truncated>"'
+            else
+                # awk は行区切りの末尾改行を取り除くため、値が改行で終わるかを判定して json_escape へ
+                # 渡す（末尾改行を含むパスが記録で別の値にならないようにする）
+                _trail=0
+                case "$1" in
+                    *$'\n') _trail=1 ;;
+                esac
+                _piece=",\"$(printf '%s' "$1" | json_escape "$_trail")\""
+            fi
+            _plen=$(printf '%s' "$_piece" | wc -c | tr -d ' ')
+        fi
+        if [ -z "$_piece" ] || [ $((rec_bytes + _plen)) -gt 4096 ]; then
+            rec_trunc=1
+            rec_cmd="$rec_cmd"',"<truncated>"'
+        else
+            rec_n=$((rec_n + 1))
+            rec_bytes=$((rec_bytes + _plen))
+            rec_cmd="$rec_cmd$_piece"
+        fi
+    fi
+}
+
+# パス値（--package・--input-file・--out の値）を記録へ追加する。UTF-8 として不正なら
+# 不正な JSON を作らないよう固定値へ置き換える（stderr・stdout の検査と同じ方針）
+rec_add_path() {
+    if [ -n "$rec_dir" ]; then
+        # $2 は `--package=` のような等号形式の接頭辞（空なら値のみ）。UTF-8 の検査は値だけに行う
+        if printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            rec_add "${2:-}$1"
+        else
+            rec_add "${2:-}<invalid utf-8>"
+        fi
+    fi
+}
+
 # バッチ（infer --input-file）は 1 行 1 JSON を認める（REQ-33）。CLI（args.rs の INFER_OPTS）と
 # 同じくオプションと値を対応づけて走査し、他オプションの値として現れた `--input-file` は
 # バッチ指定とみなさない（infer のオプションはすべて値を取る）
 batch=0
 skip=0
 out_requested=0
+redact_next=0
 for a in ${1+"$@"}; do
     if [ "$skip" -eq 1 ]; then
         skip=0
+        # 記録は許可リスト方式（TASK-36.1-2）。パス値（--package・--input-file・--out）以外の
+        # 値（--text・--id の入力本文・利用者の id、未知オプションの値）は伏せる
+        case "$redact_next" in
+            1) redact_next=0; rec_add_path "$a" ;;
+            *) rec_add "<redacted>" ;;
+        esac
         continue
     fi
     case "$a" in
-        --input-file) batch=1; skip=1 ;;
-        --input-file=*) batch=1 ;;
-        --out) out_requested=1; skip=1 ;;
-        --out=*) out_requested=1 ;;
-        --package | --text | --id) skip=1 ;;
+        --input-file) batch=1; skip=1; redact_next=1; rec_add "$a" ;;
+        --input-file=*) batch=1; rec_add_path "${a#--input-file=}" "--input-file=" ;;
+        --out) out_requested=1; skip=1; redact_next=1; rec_add "$a" ;;
+        --out=*) out_requested=1; rec_add_path "${a#--out=}" "--out=" ;;
+        --package) skip=1; redact_next=1; rec_add "$a" ;;
+        --package=*) rec_add_path "${a#--package=}" "--package=" ;;
+        --text | --id) skip=1; redact_next=0; rec_add "$a" ;;
+        --text=*) rec_add "--text=<redacted>" ;;
+        --id=*) rec_add "--id=<redacted>" ;;
+        --help | -h) rec_add "$a" ;;
+        *) rec_add "<redacted>" ;;
     esac
 done
 
@@ -98,6 +232,41 @@ fi
 if [ "$out_requested" -eq 1 ]; then
     echo "fandhe-edge: --out is not supported by this wrapper" >&3
     printf '%s\n' '{"code":"invalid_input","message":"--out is not supported by the non-interactive wrapper"}'
+    echo "exit_code=64" >&3
+    exit 64
+fi
+
+# 記録ディレクトリは CLI の起動前に検証する（fail-closed。メッセージは固定でパスを含めない）
+# ディレクトリの識別子（デバイス番号:inode）。GNU stat と BSD stat の両方に対応する
+dir_identity() {
+    stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' -- "$1" 2>/dev/null
+}
+# 末尾の / と /. を取り除いた最終要素で symlink を判定する（"link/"・"link/." だと
+# -L が偽になり symlink を素通りするため）
+rec_trim=$rec_dir
+while :; do
+    case "$rec_trim" in
+        ?*/) rec_trim=${rec_trim%/} ;;
+        ?*/.) rec_trim=${rec_trim%/.} ;;
+        *) break ;;
+    esac
+done
+rec_real=
+rec_id=
+if [ -n "$rec_dir" ] && { [ ! -d "$rec_dir" ] || [ -L "$rec_trim" ]; }; then
+    rec_real=-
+elif [ -n "$rec_dir" ]; then
+    # 途中の symlink を含む全経路を物理パスへ正規化し、以降の保存はこの値だけを使う
+    rec_real=$(CDPATH='' cd -P -- "$rec_dir" 2>/dev/null && pwd -P) || rec_real=-
+    [ -n "$rec_real" ] || rec_real=-
+    if [ "$rec_real" != "-" ]; then
+        # 起動前のディレクトリ識別子を控える（保存時に同一ディレクトリか照合する）
+        rec_id=$(dir_identity "$rec_real") || rec_id=
+        [ -n "$rec_id" ] || rec_real=-
+    fi
+fi
+if [ "$rec_real" = "-" ]; then
+    printf '%s\n' '{"code":"invalid_input","message":"FANDHE_EDGE_RECORD_DIR must be an existing directory"}'
     echo "exit_code=64" >&3
     exit 64
 fi
@@ -166,6 +335,11 @@ deadline=$((SECONDS + timeout_secs + 1))
 # 子へ元の stderr（fd 3）を継がせない（呼び出し元のパイプを保持させない）。
 # ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
 exec 2>/dev/null
+# 記録の started_at は CLI 起動前の UTC 秒精度（取得失敗は記録時に fail-closed）
+started_at=
+if [ -n "$rec_dir" ]; then
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ) || started_at=
+fi
 set -m
 (
     rc_child=0
@@ -487,6 +661,106 @@ case "$rc" in
         replace_with_error "fandhe-edge terminated abnormally"
         ;;
 esac
+# 実行記録の保存（opt-in。TASK-36.1-2）。正規化と置き換えが済んだ最終結果を記録する。
+# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）
+if [ -n "$rec_dir" ]; then
+    rec_ok=1
+    case "$started_at" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) rec_ok=0 ;;
+    esac
+    # stdout・stderr は本文を残さずバイト数と sha256 だけを記録する（利用者由来の値の混入防止）
+    out_hash=
+    err_hash=
+    out_bytes=
+    err_bytes=
+    if [ "$rec_ok" -eq 1 ]; then
+        out_hash=$(sha256_file "$out") || rec_ok=0
+        err_hash=$(sha256_file "$err") || rec_ok=0
+        out_bytes=$(wc -c <"$out" | tr -d ' ') || rec_ok=0
+        err_bytes=$(wc -c <"$err" | tr -d ' ') || rec_ok=0
+    fi
+    # 記録先が起動前の物理パスかつ同一ディレクトリ（デバイス:inode）のままか
+    # （検査後の symlink 差し替え・同名の別ディレクトリへの入れ替えの検出）
+    rec_dir_unchanged() {
+        [ "$(CDPATH='' cd -P -- "$rec_real" 2>/dev/null && pwd -P)" = "$rec_real" ] &&
+            [ "$(dir_identity "$rec_real")" = "$rec_id" ]
+    }
+    if [ "$rec_ok" -eq 1 ]; then
+        rec_dir_unchanged || rec_ok=0
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        # 記録は一時名で作り、書き込みと検証が済んだときだけ rename で確定する（原子的。
+        # 途中の失敗で最終名の不完全な記録を残さない）。作成・rename・削除はすべて子シェルの
+        # カレントディレクトリ（起動前に控えた inode を cd -P で開いたもの）に対する相対名で行い、
+        # 記録先のパスが移動・差し替えられても、作ったファイルを元のディレクトリから確実に消せる
+        # （パスの再解決に依存しない）。名前の衝突は有限回だけ乱数を変えて再試行する
+        rec_try=0
+        rec_rc=3
+        while [ "$rec_try" -lt 10 ]; do
+            rec_try=$((rec_try + 1))
+            rec_name="run-record.$$.$RANDOM$RANDOM"
+            rec_tmp=".$rec_name.tmp"
+            # 子シェルの終了値: 0=保存成功・2 または 4=名前の衝突（別の乱数名で再試行する。作成したファイルは
+            # 子シェルの中で削除済み）・それ以外=失敗（同じく削除済み）
+            rec_rc=0
+            # 子シェルの stdout・stderr は捨てる。書き込みが上限超過などで途中失敗すると、printf の stdio
+            # バッファに残った記録の断片が、リダイレクトを戻した後に子シェルの stdout（=呼び出し元の
+            # stdout）へ吐かれる libc がある（macOS の CI で観測）。契約の出力は最後の cat "$out" だけにする
+            (
+                set -C
+                umask 077
+                # 書き込みが上限超過（RLIMIT_FSIZE）でも SIGXFSZ で落とさず、通常の書き込み失敗として扱う
+                trap '' XFSZ
+                CDPATH='' cd -P -- "$rec_real" 2>/dev/null || exit 3
+                [ "$(dir_identity .)" = "$rec_id" ] || exit 3
+                exec 4>"$rec_tmp" || exit 2
+                if ! printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
+                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >&4; then
+                    rm -f -- "$rec_tmp"
+                    exit 3
+                fi
+                exec 4>&-
+                if [ -L "$rec_tmp" ] || [ ! -f "$rec_tmp" ] || ! rec_dir_unchanged; then
+                    rm -f -- "$rec_tmp"
+                    exit 3
+                fi
+                # 確定先の名前が既にあれば（ディレクトリ・symlink を含め）衝突として別の名前で再試行する
+                if [ -e "$rec_name" ] || [ -L "$rec_name" ]; then
+                    rm -f -- "$rec_tmp"
+                    exit 4
+                fi
+                # 上書きしない原子的な確定: ハードリンクは確定先が既にあれば失敗する（-n は GNU・BSD の
+                # どちらの ln にもある no-dereference で、確定先が symlink でも辿らない）。ただし確定先が
+                # 検査後にディレクトリへ差し替わると ln はその中へリンクを作るため、ln の後に
+                # 「確定先そのものが一時ファイルと同じ実体の通常ファイル」であることを検証し、
+                # 満たさなければディレクトリの中にできたリンクを消して衝突として扱う
+                ln -n -- "$rec_tmp" "$rec_name" 2>/dev/null || :
+                if [ ! -L "$rec_name" ] && [ -f "$rec_name" ] && [ "$rec_name" -ef "$rec_tmp" ]; then
+                    rm -f -- "$rec_tmp"
+                else
+                    if [ -d "$rec_name" ] && [ -f "$rec_name/$rec_tmp" ] && [ "$rec_name/$rec_tmp" -ef "$rec_tmp" ]; then
+                        rm -f -- "$rec_name/$rec_tmp"
+                    fi
+                    rm -f -- "$rec_tmp"
+                    exit 4
+                fi
+                # 確定後も記録先が起動前のままで、記録が通常ファイルであること
+                if [ -L "$rec_name" ] || [ ! -f "$rec_name" ] || ! rec_dir_unchanged; then
+                    rm -f -- "$rec_name"
+                    exit 3
+                fi
+            ) >/dev/null 2>&1 || rec_rc=$?
+            case "$rec_rc" in 2 | 4) ;; *) break ;; esac
+        done
+        # 記録先が指定されたのに確定できなかった場合は、理由を問わず（一時ファイルの作成失敗・書き込み失敗・
+        # 名前の衝突の上限到達・ln の失敗など）ここ 1 か所で 70 にする
+        [ "$rec_rc" -eq 0 ] || rec_ok=0
+    fi
+    if [ "$rec_ok" -ne 1 ]; then
+        replace_with_error "failed to save run record"
+    fi
+fi
 cat "$out"
 # CLI の stderr（上限 64 KiB 以内）を中継してから診断行を出す
 cat "$err" >&3

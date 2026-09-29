@@ -5,6 +5,8 @@
 //! Claude Code Bash ツールではない）。`infer` の実推論経路は TASK-33.1-2
 //! （#136）・#112・#113 が未接続のため、現時点の exit 0 経路は help のみ。
 //! 実推論の exit 0 ケースはそれらの完了後にここへ追加する。
+//! 末尾の `req36_run_record_*` は実行記録（opt-in の `FANDHE_EDGE_RECORD_DIR`。
+//! TASK-36.1-2・#150）の保存形式を具体値で照合する。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
 #![cfg(unix)]
@@ -41,6 +43,15 @@ fn run_script(args: &[&str]) -> Out {
 
 /// カレントディレクトリを指定して起動する（`infer` の経路ガードは cwd を workspace とする。#159）。
 fn run_script_in(cwd: Option<&std::path::Path>, args: &[&str]) -> Out {
+    run_script_in_env(cwd, args, &[])
+}
+
+/// `run_script` に環境変数を追加で渡す版（実行記録の検証用。TASK-36.1-2）。
+fn run_script_env(args: &[&str], envs: &[(&str, &str)]) -> Out {
+    run_script_in_env(None, args, envs)
+}
+
+fn run_script_in_env(cwd: Option<&std::path::Path>, args: &[&str], envs: &[(&str, &str)]) -> Out {
     let mut cmd = Command::new("sh");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -51,6 +62,7 @@ fn run_script_in(cwd: Option<&std::path::Path>, args: &[&str]) -> Out {
         .arg(script_path())
         .args(args)
         .env("FANDHE_EDGE_BIN", env!("CARGO_BIN_EXE_fandhe-edge"))
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -968,4 +980,937 @@ fn req21_replaced_results_never_relay_raw_cli_stderr() {
     );
     assert_eq!(o.code, Some(10));
     assert_eq!(o.stderr, "secret-diagnostic\nexit_code=10\n");
+}
+// ---- 実行記録（REQ-36・TASK-36.1-2・#150）----
+// 証拠種別はテストハーネス（fake bin・help 経路）。cli は serde_json に依存しないため、
+// JSON は解析せず期待文字列との完全一致で照合する。
+
+const RECORD_SCHEMA: &str = "fandhe-edge.run-record/1";
+
+/// テスト名と PID で一意な記録ディレクトリを作る。
+fn record_dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("fandhe-record-{}-{name}", std::process::id()));
+    std::fs::remove_dir_all(&d).ok();
+    std::fs::create_dir_all(&d).expect("mkdir record dir");
+    d
+}
+
+/// 記録ディレクトリ直下のファイルを (名前, 内容) で返す。
+fn record_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| {
+            let e = e.expect("entry");
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                String::from_utf8_lossy(&std::fs::read(e.path()).expect("read")).into_owned(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// バイト列の sha256（16 進 64 桁）。スクリプトと同じ外部ツール（sha256sum / shasum）で求める。
+fn sha256_hex(data: &[u8]) -> String {
+    use std::io::Write;
+    for (tool, extra) in [("sha256sum", None), ("shasum", Some("256"))] {
+        let mut cmd = Command::new(tool);
+        if let Some(n) = extra {
+            cmd.args(["-a", n]);
+        }
+        let Ok(mut child) = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(data)
+            .expect("write");
+        let out = child.wait_with_output().expect("wait");
+        let text = String::from_utf8(out.stdout).expect("utf8");
+        return text.split(' ').next().expect("hash").to_string();
+    }
+    panic!("no sha256 tool");
+}
+
+/// 記録の stdout / stderr 要約（本文を含まず、バイト数と sha256 だけ）の期待文字列。
+fn summary_json(data: &[u8]) -> String {
+    format!(
+        "{{\"bytes\":{},\"sha256\":\"{}\"}}",
+        data.len(),
+        sha256_hex(data)
+    )
+}
+
+/// UTC の暦日時（YYYY-MM-DDTHH:MM:SSZ）を epoch 秒へ（days_from_civil）。
+fn epoch_of(ts: &str) -> i64 {
+    let b = ts.as_bytes();
+    assert_eq!(ts.len(), 20, "{ts}");
+    assert!(b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':');
+    assert_eq!(b[19], b'Z');
+    let n = |r: std::ops::Range<usize>| -> i64 { ts[r].parse().expect("digits") };
+    let (y, m, d) = (n(0..4), n(5..7), n(8..10));
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + n(11..13) * 3600 + n(14..16) * 60 + n(17..19)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64
+}
+
+/// 記録ファイルを 1 つだけ取り出す。
+fn only_record(dir: &std::path::Path) -> String {
+    let files = record_files(dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].0.starts_with("run-record."), "{}", files[0].0);
+    files[0].1.clone()
+}
+
+/// started_at を切り出す（`"started_at":"` の直後 20 文字）。
+fn started_at_of(rec: &str) -> String {
+    let key = "\"started_at\":\"";
+    let i = rec.find(key).expect("started_at") + key.len();
+    rec[i..i + 20].to_string()
+}
+
+/// 受け入れ条件: 5 項目（command・started_at・exit_code・stdout・stderr）が具体値で残る。
+#[test]
+fn req36_run_record_contains_five_fields_with_exact_values() {
+    let dir = record_dir("five");
+    let before = now_secs();
+    let o = run_script_env(
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    let after = now_secs();
+    assert_eq!(o.code, Some(0));
+    let help = expected_stdout(&ErrorReport::new(
+        ExitCode::Ok,
+        args::render_help(Some(Subcommand::Infer)),
+    ));
+    assert_eq!(o.stdout, help);
+    // 記録しても契約の出力（stderr）は変わらない
+    assert_eq!(o.stderr, "exit_code=0\n");
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let t = epoch_of(&started);
+    assert!(
+        t >= before - 1 && t <= after + 1,
+        "{started} {before} {after}"
+    );
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":0,\"stdout\":{},\"stderr\":{}}}\n",
+        summary_json(help.as_bytes()),
+        summary_json(b"")
+    );
+    assert_eq!(rec, expected);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--text`・`--id` の値（空白区切りと `=` 形式の両方）は記録に残らない。
+#[test]
+fn req36_run_record_redacts_text_and_id_values() {
+    let body = "echo '{\"code\":\"ok\"}'\nexit 0";
+    let cases: [(&[&str], &str); 2] = [
+        (
+            &[
+                "--package",
+                "p",
+                "--text",
+                "SECRET-BODY-xyz",
+                "--id",
+                "SECRET-ID-abc",
+            ],
+            "[\"fandhe-edge\",\"infer\",\"--package\",\"p\",\"--text\",\"<redacted>\",\"--id\",\"<redacted>\"]",
+        ),
+        (
+            &["--text=SECRET2", "--id=SECRET3"],
+            "[\"fandhe-edge\",\"infer\",\"--text=<redacted>\",\"--id=<redacted>\"]",
+        ),
+    ];
+    for (i, (args, expected_cmd)) in cases.iter().enumerate() {
+        let dir = record_dir(&format!("redact{i}"));
+        let d = dir.to_str().unwrap();
+        let o = run_with_fake_bin_args("redact", body, args, &[("FANDHE_EDGE_RECORD_DIR", d)]);
+        assert_eq!(o.code, Some(0));
+        let rec = only_record(&dir);
+        assert!(
+            rec.contains(&format!("\"command\":{expected_cmd},")),
+            "{rec}"
+        );
+        assert!(!rec.contains("SECRET"), "{rec}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 未知のオプション・位置引数は（CLI が拒否する場合でも）本文を記録に残さず伏せ字にする。
+#[test]
+fn req36_run_record_redacts_unknown_tokens_and_positionals() {
+    let dir = record_dir("unknown");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"code\":\"invalid_input\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "record-unknown",
+        body,
+        &[
+            "SECRET-BODY-pos",
+            "--bogus",
+            "SECRET-VAL",
+            "--bogus=SECRET-EQ",
+        ],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"<redacted>\",\"<redacted>\",\"<redacted>\",\"<redacted>\"],"),
+        "{rec}"
+    );
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 等号形式（`--package=PATH`・`--input-file=PATH`）も空白区切りと同じくパス値を記録し、
+/// `--text=`・`--id=` の値は伏せる（REQ-36・TASK-36.1-2）。
+#[test]
+fn req36_run_record_equals_form_records_path_values() {
+    let dir = record_dir("equals");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"code\":\"invalid_input\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "record-equals",
+        body,
+        &[
+            "--package=pkg/a",
+            "--input-file=in/b.jsonl",
+            "--text=SECRET-TEXT",
+            "--id=SECRET-ID",
+        ],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--package=pkg/a\",\"--input-file=in/b.jsonl\",\"--text=<redacted>\",\"--id=<redacted>\"],"),
+        "{rec}"
+    );
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// パス値が UTF-8 として不正なら固定値へ置き換わり、記録は妥当な JSON のままになる。
+#[test]
+fn req36_run_record_invalid_utf8_path_arg_is_replaced() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = record_dir("badpath");
+    let bindir = record_dir("badpath-bin");
+    let bin = bindir.join("fake-bin");
+    std::fs::write(&bin, "#!/bin/sh\necho '{\"code\":\"ok\"}'\nexit 0\n").expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let bad = std::ffi::OsStr::from_bytes(b"p\xff\xfe");
+    let out = Command::new("sh")
+        .arg(script_path())
+        .arg("--package")
+        .arg(bad)
+        .env("FANDHE_EDGE_BIN", &bin)
+        .env("FANDHE_EDGE_RECORD_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"<invalid utf-8>\"],"),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bindir).ok();
+}
+
+/// パス値の末尾改行（と途中の改行）は記録の command で `\n` として保持される（REQ-36・TASK-36.1-2）。
+#[test]
+fn req36_run_record_path_arg_keeps_trailing_newline() {
+    let cases: [(&str, &str); 3] = [
+        ("p\n", "p\\n"),
+        ("p\n\n", "p\\n\\n"),
+        ("a\nb\n", "a\\nb\\n"),
+    ];
+    for (i, (value, escaped)) in cases.iter().enumerate() {
+        let dir = record_dir(&format!("trailnl{i}"));
+        let d = dir.to_str().unwrap();
+        let body = "echo '{\"code\":\"ok\"}'\nexit 0";
+        let o = run_with_fake_bin_args(
+            "trailnl",
+            body,
+            &["--package", value],
+            &[("FANDHE_EDGE_RECORD_DIR", d)],
+        );
+        assert_eq!(o.code, Some(0));
+        let rec = only_record(&dir);
+        assert!(
+            rec.contains(&format!(
+                "\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"{escaped}\"],"
+            )),
+            "{rec}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 非ゼロ終了が残り、stdout・stderr は本文でなくバイト数と sha256 だけが残る。
+#[test]
+fn req36_run_record_captures_nonzero_exit_and_stderr() {
+    let dir = record_dir("nonzero");
+    let d = dir.to_str().unwrap();
+    let body = "printf 'warn: \"q\"\\tx\\n' 1>&2\necho '{\"code\":\"invalid_input\",\"message\":\"m\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "nonzero",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":64,\"stdout\":{{\"bytes\":39,\"sha256\":\"811012849462321a2c240f5762e37bb0388f93aa9ad8e00ceb4bac1e5442e14f\"}},\"stderr\":{{\"bytes\":12,\"sha256\":\"2fc168109588af3b2a1c21a9ffaeacbe058c79716df3ce55292016d13c40d66f\"}}}}\n"
+    );
+    assert_eq!(rec, expected);
+    // 本文（引用符付きのメッセージ・stderr の文言）は記録に残らない
+    assert!(!rec.contains("warn"), "{rec}");
+    assert!(!rec.contains("invalid_input"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 置き換え後（呼び出し元が受け取る値）が記録される。
+#[test]
+fn req36_run_record_stores_normalized_output_after_replacement() {
+    let dir = record_dir("normalized");
+    let d = dir.to_str().unwrap();
+    let o = run_with_fake_bin_args(
+        "normalized",
+        "echo '{bad}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(70));
+    let rec = only_record(&dir);
+    assert!(rec.contains("\"exit_code\":70,"), "{rec}");
+    assert!(
+        rec.contains(&format!(
+            "\"stdout\":{},",
+            summary_json(o.stdout.as_bytes())
+        )),
+        "{rec}"
+    );
+    assert!(
+        rec.contains(&format!("\"stderr\":{}}}", summary_json(b""))),
+        "{rec}"
+    );
+    assert!(!rec.contains("runtime_error"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// バッチの複数行 stdout は全体で 1 つの要約（バイト数と sha256）になる。
+#[test]
+fn req36_run_record_batch_multiline_stdout_is_one_string() {
+    let dir = record_dir("batch");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"a\":1}'\necho '{\"b\":2}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "record-batch",
+        body,
+        &["--input-file", "f"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--input-file\",\"f\"]"),
+        "{rec}"
+    );
+    assert!(
+        rec.contains(&format!(
+            "\"stdout\":{},",
+            summary_json(b"{\"a\":1}\n{\"b\":2}\n")
+        )),
+        "{rec}"
+    );
+    assert!(!rec.contains("\\\"a\\\""), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// UTF-8 として不正・NUL を含む stderr でも、要約（バイト数・sha256）で妥当な記録になる。
+#[test]
+fn req36_run_record_invalid_utf8_stderr_is_replaced() {
+    let dir = record_dir("badstderr");
+    let d = dir.to_str().unwrap();
+    let body = "printf '\\377\\000' 1>&2\necho '{\"code\":\"ok\"}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "badstderr",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    let rec = only_record(&dir);
+    // 不正な UTF-8・NUL を含む生バイト列もそのままハッシュされ、記録は妥当な JSON のまま
+    assert!(
+        rec.contains(&format!("\"stderr\":{}}}", summary_json(b"\xff\x00"))),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 記録ディレクトリが通常ファイル・不在・symlink なら CLI を起動せず 64 で拒否する。
+#[test]
+fn req36_run_record_dir_not_directory_is_rejected_without_launching_cli() {
+    let base = record_dir("baddir");
+    let marker = base.join("launched");
+    let file = base.join("plain-file");
+    std::fs::write(&file, "x").expect("write");
+    let link = base.join("link");
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).expect("mkdir");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let missing = base.join("missing");
+    let body = format!(
+        "echo x >'{}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        marker.display()
+    );
+    // 末尾の / や /. を付けた symlink も拒否する（-L の素通り対策）
+    let link_slash = PathBuf::from(format!("{}/", link.display()));
+    let link_dot = PathBuf::from(format!("{}/.", link.display()));
+    let link_slashes = PathBuf::from(format!("{}//", link.display()));
+    for p in [
+        &file,
+        &missing,
+        &link,
+        &link_slash,
+        &link_dot,
+        &link_slashes,
+    ] {
+        let o = run_with_fake_bin_args(
+            "baddir",
+            &body,
+            &["--help"],
+            &[("FANDHE_EDGE_RECORD_DIR", p.to_str().unwrap())],
+        );
+        assert_eq!(o.code, Some(64), "{p:?}");
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"invalid_input\",\"message\":\"FANDHE_EDGE_RECORD_DIR must be an existing directory\"}\n"
+        );
+        assert!(!o.stdout.contains(p.to_str().unwrap()));
+        assert_eq!(o.stderr, "exit_code=64\n");
+        assert!(!marker.exists(), "CLI must not be launched");
+    }
+    assert!(record_files(&real).is_empty());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CLI の stdout・stderr に含まれる利用者由来の値は記録に残らない（security.md）。
+#[test]
+fn req36_run_record_does_not_store_user_derived_output() {
+    let dir = record_dir("userderived");
+    let d = dir.to_str().unwrap();
+    let body =
+        "echo 'SECRET-ERR-line' 1>&2\necho '{\"code\":\"ok\",\"id\":\"SECRET-ID-abc\"}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "record-userderived",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    assert!(o.stdout.contains("SECRET-ID-abc"));
+    let rec = only_record(&dir);
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 親ディレクトリが symlink でも、正規化した物理パスの直下にだけ記録し、
+/// 検査後に記録先が差し替えられたら記録を残さず 70 にする（fail-closed）。
+#[test]
+fn req36_run_record_resolves_parent_symlink_and_detects_swap() {
+    let base = record_dir("parentlink");
+    let real = base.join("real");
+    let sub = real.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    // 親が symlink の経路でも、実体（real/sub）へ記録される
+    let via = link.join("sub");
+    let o = run_with_fake_bin_args(
+        "record-parentlink",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", via.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(0));
+    assert_eq!(record_files(&sub).len(), 1);
+    // 実行中に記録先（正規化済みの物理パス）が別ディレクトリへの symlink に差し替えられる
+    let evil = base.join("evil");
+    std::fs::create_dir_all(&evil).expect("mkdir");
+    let body = format!(
+        "rm -rf '{s}'\nln -s '{e}' '{s}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        s = sub.display(),
+        e = evil.display()
+    );
+    let o = run_with_fake_bin_args(
+        "record-parentlink-swap",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", via.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(
+        record_files(&evil).is_empty(),
+        "record must not land in swapped dir"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 実行中に記録先が同じパスの別ディレクトリへ入れ替えられたら、パス文字列が同じでも
+/// 記録を残さず 70 にする（ディレクトリ識別子の照合。REQ-39）。
+#[test]
+fn req36_run_record_detects_same_path_directory_replacement() {
+    let base = record_dir("replaced");
+    let dir = base.join("rec");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let moved = base.join("moved");
+    let body = format!(
+        "mv '{d}' '{m}'\nmkdir '{d}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        d = dir.display(),
+        m = moved.display()
+    );
+    let o = run_with_fake_bin_args(
+        "record-replaced",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(record_files(&dir).is_empty());
+    assert!(record_files(&moved).is_empty());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 保存に失敗したら記録済みを装わず runtime_error(70) にする（fail-closed）。
+#[test]
+fn req36_run_record_write_failure_is_fail_closed_70() {
+    let dir = record_dir("writefail");
+    let d = dir.to_str().unwrap();
+    let body = format!("rmdir '{d}'\necho '{{\"code\":\"ok\"}}'\nexit 0");
+    let o = run_with_fake_bin_args(
+        "writefail",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert_eq!(o.stderr, "exit_code=70\n");
+    assert!(!dir.exists());
+}
+
+/// 引数の件数が上限（64 件）を超えたら、記録の command を切り詰めて固定の印
+/// `<truncated>` を 1 度だけ付ける。推論本体の終了コード・出力は変えない
+/// （REQ-39・TASK-36.1-2。資源上限）。
+#[test]
+fn req39_run_record_command_is_truncated_at_arg_count_limit() {
+    let dir = record_dir("argcount");
+    let d = dir.to_str().unwrap();
+    let args: Vec<String> = (0..200).map(|i| format!("SECRET-{i}")).collect();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let o = run_with_fake_bin_args(
+        "record-argcount",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &refs,
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    assert_eq!(o.stdout, "{\"code\":\"invalid_input\"}\n");
+    let rec = only_record(&dir);
+    let redacted = "\"<redacted>\",".repeat(64);
+    let want = format!("\"command\":[\"fandhe-edge\",\"infer\",{redacted}\"<truncated>\"],");
+    // 記録する引数は 64 件まで。印は末尾に 1 つだけ
+    assert!(rec.contains(&want), "{rec}");
+    assert_eq!(rec.matches("<truncated>").count(), 1, "{rec}");
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 総バイト数（4096）を超えるパス値の列、および 1 値が長すぎる値は切り詰める。
+#[test]
+fn req39_run_record_command_is_truncated_at_byte_limit() {
+    let dir = record_dir("argbytes");
+    let d = dir.to_str().unwrap();
+    // 400 文字のパス値 × 12 個（各 --package。記録される総量は 4096 バイトを超える）
+    let long = "p".repeat(400);
+    let mut args: Vec<&str> = Vec::new();
+    for _ in 0..12 {
+        args.push("--package");
+        args.push(&long);
+    }
+    let o = run_with_fake_bin_args(
+        "record-argbytes",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &args,
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert_eq!(rec.matches("<truncated>").count(), 1, "{rec}");
+    let start = rec.find("\"command\":[").expect("command");
+    let end = rec[start..].find("],\"started_at\"").expect("end") + start;
+    assert!(
+        end - start <= 4096 + 64,
+        "command part too large: {}",
+        end - start
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    // 1 値が 512 文字を超えたらその値だけ `<truncated>` に置き換える
+    let dir = record_dir("argbytes-one");
+    let d = dir.to_str().unwrap();
+    let huge = "q".repeat(5000);
+    let o = run_with_fake_bin_args(
+        "record-argbytes-one",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &["--package", &huge, "--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains(
+            "\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"<truncated>\",\"--help\"],"
+        ),
+        "{rec}"
+    );
+    assert!(!rec.contains("qqqq"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 記録ファイルの作成後に記録先ディレクトリが別の場所へ移動されても、作成済みの
+/// ファイルを元のディレクトリから確実に消し、70 を返す（一時名・最終名のどちらも残さない。
+/// パスの再解決に依存しない）。PATH 上の `stat` シムが、記録先に何か作られた後の最初の
+/// 呼び出しで移動を起こす（検査後の移動の模擬。証拠種別: テストハーネス）。
+#[test]
+fn req39_run_record_moved_dir_leaves_no_record_after_failure() {
+    let base = record_dir("moved-after");
+    let dir = base.join("rec");
+    let moved = base.join("moved");
+    let shim = base.join("shim");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::create_dir_all(&shim).expect("mkdir");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real_stat = Command::new("sh")
+            .args(["-c", "command -v stat"])
+            .output()
+            .expect("command -v stat");
+        let real_stat = String::from_utf8_lossy(&real_stat.stdout)
+            .trim()
+            .to_string();
+        assert!(!real_stat.is_empty());
+        let stat = shim.join("stat");
+        std::fs::write(
+            &stat,
+            format!(
+                "#!/bin/sh\nif [ -d '{d}' ] && [ -n \"$(ls -A '{d}')\" ]; then /bin/mv '{d}' '{m}'; fi\nexec '{r}' \"$@\"\n",
+                d = dir.display(),
+                m = moved.display(),
+                r = real_stat
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = run_with_fake_bin_args(
+        "record-moved-after",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[
+            ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+            ("PATH", &path),
+        ],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(moved.is_dir(), "shim must have moved the directory");
+    let left: Vec<String> = std::fs::read_dir(&moved)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "leftover in moved dir: {left:?}");
+    assert!(!dir.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 確定先の名前に既存ファイルがあっても上書きせず、別の名前で再試行して記録する。
+/// 衝突が上限回数続いたら 70 の固定文エラーにし、一時名も残さない
+/// （REQ-39・TASK-36.1-2）。PATH 上の `ln` シムが、確定先へ既存ファイルを先に作って衝突を起こす。
+#[test]
+fn req39_run_record_never_overwrites_existing_final_name() {
+    use std::os::unix::fs::PermissionsExt;
+    for (label, always) in [("collide-once", false), ("collide-always", true)] {
+        let base = record_dir(label);
+        let dir = base.join("rec");
+        let shim = base.join("shim");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        let real_ln = Command::new("sh")
+            .args(["-c", "command -v ln"])
+            .output()
+            .expect("command -v ln");
+        let real_ln = String::from_utf8_lossy(&real_ln.stdout).trim().to_string();
+        assert!(!real_ln.is_empty());
+        let marker = base.join("collided");
+        let ln = shim.join("ln");
+        std::fs::write(
+            &ln,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nif [ '{a}' = 1 ] || [ ! -e '{m}' ]; then\n  echo PRE-EXISTING > \"$last\"; : > '{m}'\nfi\nexec '{r}' \"$@\"\n",
+                a = i32::from(always),
+                m = marker.display(),
+                r = real_ln
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&ln, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let o = run_with_fake_bin_args(
+            label,
+            "echo '{\"code\":\"ok\"}'\nexit 0",
+            &["--help"],
+            &[
+                ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+                ("PATH", &path),
+            ],
+        );
+        // 1 回の衝突は再試行で成功し、上限到達は 70 の固定文エラーに統一される
+        if always {
+            assert_eq!(o.code, Some(70), "{label}");
+            assert_eq!(o.stdout, SAVE_FAILED_JSON, "{label}");
+        } else {
+            assert_eq!(o.code, Some(0), "{label}");
+            assert_eq!(o.stdout, "{\"code\":\"ok\"}\n", "{label}");
+        }
+        let files = record_files(&dir);
+        let pre: Vec<_> = files.iter().filter(|f| f.1 == "PRE-EXISTING\n").collect();
+        let recs: Vec<_> = files
+            .iter()
+            .filter(|f| f.1.starts_with("{\"schema\""))
+            .collect();
+        assert!(!pre.is_empty(), "{label}: {files:?}");
+        assert_eq!(
+            pre.len() + recs.len(),
+            files.len(),
+            "{label}: leftover {files:?}"
+        );
+        if always {
+            // 10 回すべて衝突: 既存 10 件が無傷で残り、記録は作られない
+            assert_eq!(pre.len(), 10, "{files:?}");
+            assert!(recs.is_empty(), "{files:?}");
+        } else {
+            assert_eq!(pre.len(), 1, "{files:?}");
+            assert_eq!(recs.len(), 1, "{files:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+const SAVE_FAILED_JSON: &str =
+    "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n";
+
+/// 一時ファイルを作れない場合も、成功として返さず 70 の固定文エラーにする
+/// （REQ-39・TASK-36.1-2）。記録先を読み取り専用にして作成を失敗させる。
+#[test]
+fn req39_run_record_temp_create_failure_is_70() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = record_dir("tmpfail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    if std::fs::write(dir.join("probe"), b"x").is_ok() {
+        // 書き込み権限を無視できる実行者（root 等）ではこの失敗を作れない
+        std::fs::remove_file(dir.join("probe")).ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        eprintln!("note: cannot make directory read-only for this user; test not exercised");
+        return;
+    }
+    let o = run_with_fake_bin_args(
+        "tmpfail",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(o.stdout, SAVE_FAILED_JSON);
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 書き込みに失敗（ファイルサイズ上限超過）しても 70 の固定文エラーになり、一時ファイルを残さない。
+/// `ulimit -f` で記録のサイズを超える上限をかけて実行する（証拠種別: テストハーネス）。
+#[test]
+fn req39_run_record_write_failure_is_70_without_leftover() {
+    let dir = record_dir("writefail-limit");
+    let bin_dir = record_dir("writefail-limit-bin");
+    let bin = bin_dir.join("fake-bin");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&bin, "#!/bin/sh\necho '{\"code\":\"ok\"}'\nexit 0\n").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    // 引数 64 件で記録が 1024 バイトを超える（ulimit -f 1 は 512 または 1024 バイト）
+    let mut args: Vec<String> = vec!["--help".to_string()];
+    args.extend((0..63).map(|i| format!("tok{i}")));
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -f 1; exec sh \"$0\" \"$@\"")
+        .arg(script_path())
+        .args(&args)
+        .env("FANDHE_EDGE_BIN", &bin)
+        .env("FANDHE_EDGE_RECORD_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(70));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), SAVE_FAILED_JSON);
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bin_dir).ok();
+}
+
+/// 確定先の名前がディレクトリ・ディレクトリを指す symlink になっても、その中へ記録を作らない
+/// （ln はディレクトリの中へリンクを作るため、確定後の同一実体検証で弾き別の名前で再試行する）。
+/// PATH 上の `ln` シムが、ln の直前に確定先をディレクトリ・symlink へ差し替える。
+#[test]
+fn req39_run_record_destination_directory_is_never_linked_into() {
+    use std::os::unix::fs::PermissionsExt;
+    for (label, symlink) in [("dest-dir", false), ("dest-symlink", true)] {
+        let base = record_dir(label);
+        let dir = base.join("rec");
+        let shim = base.join("shim");
+        let target = base.join("target");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let real_ln = Command::new("sh")
+            .args(["-c", "command -v ln"])
+            .output()
+            .expect("command -v ln");
+        let real_ln = String::from_utf8_lossy(&real_ln.stdout).trim().to_string();
+        let marker = base.join("swapped");
+        let make = if symlink {
+            format!("/bin/ln -s '{}' \"$last\"", target.display())
+        } else {
+            "mkdir \"$last\"".to_string()
+        };
+        let ln = shim.join("ln");
+        std::fs::write(
+            &ln,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nif [ ! -e '{m}' ]; then\n  {make}; : > '{m}'\nfi\nexec '{r}' \"$@\"\n",
+                m = marker.display(),
+                r = real_ln
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&ln, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let o = run_with_fake_bin_args(
+            label,
+            "echo '{\"code\":\"ok\"}'\nexit 0",
+            &["--help"],
+            &[
+                ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+                ("PATH", &path),
+            ],
+        );
+        assert_eq!(o.code, Some(0), "{label}");
+        let n_target = std::fs::read_dir(&target).expect("read_dir").count();
+        assert_eq!(n_target, 0, "{label}: link created through symlink");
+        // 差し替えられたディレクトリ（または symlink）の中には何も作られず、別の名前の記録が 1 件できる
+        let mut regular = 0;
+        for e in std::fs::read_dir(&dir).expect("read_dir") {
+            let e = e.expect("entry");
+            let ft = e.file_type().expect("type");
+            if ft.is_dir() {
+                assert_eq!(
+                    std::fs::read_dir(e.path()).expect("read_dir").count(),
+                    0,
+                    "{label}"
+                );
+            } else if ft.is_file() {
+                regular += 1;
+            }
+        }
+        assert_eq!(regular, 1, "{label}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+/// 未設定・空文字では何も作らず出力も変えない（既定の経路の回帰）。
+#[test]
+fn req36_no_record_dir_creates_nothing() {
+    let dir = record_dir("unset");
+    let o = run_with_fake_bin_args(
+        "unset",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", "")],
+    );
+    assert_eq!(o.code, Some(0));
+    assert_eq!(o.stdout, "{\"code\":\"ok\"}\n");
+    assert_eq!(o.stderr, "exit_code=0\n");
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
 }
