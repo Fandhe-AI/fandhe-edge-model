@@ -113,8 +113,9 @@
 //!   台帳との突き合わせ・来歴の記録（TASK-17.3 の停止分岐本体・issue #49）と
 //!   CLI `evaluate` 工程への配線（issue #140）・終了コードへの写像
 //!   （TASK-33.3）は未実装
-//! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2。PoC-9
-//!   `ArgumentRecordingPredictor` 相当）: 未実装
+//! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2・issue #71。
+//!   PoC-9 `ArgumentRecordingPredictor` 相当）: 実装済み（[`input_only`]）。
+//!   CLI `evaluate` 工程への配線（issue #140）は未実装
 //! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3）: 未実装
 //! - パッケージ全体を 1 つにまとめた合成ダイジェスト・配布パッケージの
 //!   マニフェスト形式（REQ-30・TASK-30.x）: 未実装。[`invariance`] は
@@ -158,6 +159,7 @@ pub mod baseline;
 pub mod calibration;
 pub mod eval_data_invariance;
 pub mod holm;
+pub mod input_only;
 pub mod invariance;
 pub mod mcnemar;
 pub mod metrics;
