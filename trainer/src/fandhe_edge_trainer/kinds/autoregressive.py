@@ -117,8 +117,18 @@ coding-python.md）。対応づけ不能（`Unmapped`）は `status:"error"` と
 
 生成出力（トークン列）がどの選択肢 ID にも一致しない場合を「判定不能」
 （`UnmappedReason.NO_CHOICE_MATCH`）と呼び、非有限スコア（`INVALID_SCORE`）と
-型で区別する（REQ-19b 異常系）。生成出力から ID への解決は
-`resolve_generated_output` の 1 箇所に集約する。JSON の境界は既存契約の語彙
+型で区別する（REQ-19b 異常系）。トークン列から ID への解決は
+`resolve_generated_output` の 1 箇所に集約する。
+
+**実装範囲の限定（スタブの明示）**: 現在の推論経路は対応づけ (b)、つまり各選択肢の
+対数尤度を採点して argmax を取る方式で、モデルが自由生成したトークン列は存在
+しない。そのため `map_scores_to_choice` が `resolve_generated_output` へ渡すのは
+「選ばれた選択肢自身のトークン列」であり、通常は必ず一致する。本 Issue で実装済み
+なのは (1) 判定不能を型で区別する `Unmapped(NO_CHOICE_MATCH)`・(2) 解決の
+1 箇所への集約・(3) `_encode_choices` の契約崩れ等に備える防御的な契約検査
+（fail-closed）・(4) 件数の別枠集計に限る。**実際の生成出力の不一致を検出する
+経路（自由生成した出力の判定）は未実装**で、自由生成の経路を追加する将来の拡張
+（REQ-19b）で `resolve_generated_output` へ生成トークン列を渡す。JSON の境界は既存契約の語彙
 （`ok`・`abstain`・`error`）のまま `status:"error"` とする（`abstain` は保留として
 分母から外れ fail-open になるため使わない）。判定不能の件数は
 `ChoiceMappingTally` で別枠に数え、学習ジョブの validation 予測の経路で stderr へ
@@ -660,8 +670,10 @@ def resolve_generated_output(
     一致すれば ID（`str`）、どの ID にも一致しなければ判定不能
     `Unmapped(UnmappedReason.NO_CHOICE_MATCH)` を返す。例外は送出しない（PAD・SEP・
     EOS・範囲外・不正な UTF-8 はすべて「一致なし」。`resolve_choice_id` の挙動）。
-    `map_scores_to_choice` から呼ばれる。将来、自由生成の経路（REQ-19b の拡張）を
-    足すときもこの関数を通す。
+    `map_scores_to_choice` から呼ばれるが、現状渡されるのは選択肢自身のトークン列
+    のみで、生成出力の判定としては使われていない（スタブ。防御的な契約検査に限る）。
+    自由生成の経路（REQ-19b の拡張。未実装）を足すときは、生成トークン列をこの関数へ
+    渡す。
     """
     resolved = resolve_choice_id(choice_tokens, label_order)
     if resolved is None:
@@ -725,7 +737,9 @@ def map_scores_to_choice(
     `choice_ids_by_label[label_order[idx]]` は `label_order[idx]` 自身の
     トークン列なので理論上必ず一致するが、`_encode_choices` の呼び出し
     契約が崩れた場合に `ok` を偽装しないよう、fail-closed に
-    `Unmapped(UnmappedReason.NO_CHOICE_MATCH)`（判定不能）へ倒す経路を残す。
+    `Unmapped(UnmappedReason.NO_CHOICE_MATCH)`（判定不能）へ倒す防御的な契約検査を
+    残す。これはモデルの生成出力の不一致を検出するものではない（生成出力の判定は
+    未実装。REQ-19b の拡張）。
 
     `len(loglik_row)` と `len(label_order)` の不一致は、呼び出し側が学習・
     書き出し時と異なる選択肢集合を渡した実装バグであり、データの問題では

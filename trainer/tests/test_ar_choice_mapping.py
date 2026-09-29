@@ -839,7 +839,7 @@ def test_ar_choice_mapping_module_still_exports_score_choices_mlx() -> None:
     assert callable(_score_choices_mlx)
 
 
-# --- #81（TASK-19b.2）: 生成出力の判定不能 -----------------------------------
+# --- #81（TASK-19b.2）: 判定不能の型と防御的な契約検査（自由生成した出力の判定は未実装）---
 
 
 def _tokens(text: str) -> list[int]:
