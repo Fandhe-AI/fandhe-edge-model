@@ -1178,3 +1178,36 @@ fn req39_prediction_error_body_does_not_leak_into_display_or_debug() {
     assert!(!debug.contains("SECRET-BODY"), "{debug}");
     assert!(debug.contains("Prediction(..)"), "{debug}");
 }
+
+/// 別の評価データのロックが大量にある・壊れている・登録ダイジェストが違っていても、
+/// 対象の評価データは適用できる（codex P1 指摘の回帰）。
+#[cfg(unix)]
+#[test]
+fn req27_foreign_eval_data_locks_do_not_affect_application() {
+    const OTHER: &[u8] = b"C\nD\n";
+    let dir = TempDir::new("foreign");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    register(&ledger, OTHER, &[("o", b"wo")]);
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, OTHER, "o", &Model::new(b"wo", None), &calls).is_ok());
+    // 別の評価データのロックを壊し、さらに同じ許可パターンの名前の無関係なファイルを大量に置く。
+    let foreign = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("config-")
+        })
+        .unwrap();
+    overwrite_writable(&foreign, b"garbage\n");
+    for i in 0..2000u32 {
+        let h = Sha256Digest::of_bytes(&i.to_be_bytes()).to_hex();
+        fs::write(dir.path().join(format!("config-{h}-{h}.lock")), b"x").unwrap();
+    }
+    register(&ledger, DATA, &[("a", b"wa")]);
+    let r = run(&ledger, DATA, "a", &Model::new(b"wa", None), &calls);
+    assert!(r.is_ok());
+    assert_eq!(calls.get(), 2);
+}

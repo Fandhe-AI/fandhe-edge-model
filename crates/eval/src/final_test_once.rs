@@ -121,13 +121,28 @@ const REGISTRY_HEADER: &str = "fandhe-edge-final-test-registry v1\n";
 const MAX_SEAL_BYTES: u64 = 256;
 const MAX_LOCK_RECORD_BYTES: u64 = 1024;
 
-/// 台帳内で照合する適用ロックの最大件数（列挙の上限。REQ-39）。
+/// 1 つの評価データについて照合する適用ロックの最大件数（列挙の上限。REQ-39）。
+/// 他の評価データのロックは数えない（ファイル名の評価データ由来の接頭辞で選別する）。
 const MAX_LOCK_SCAN_ENTRIES: usize = 65_536;
 
-/// 適用ロックのファイル名（`config-` または `weights-` + 小文字 hex 64 桁 + `.lock`）か。
-fn is_lock_file_name(name: &str) -> bool {
+const EVAL_SCOPE_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/eval-scope/v1\0";
+
+/// 評価データごとの適用ロックのファイル名接頭辞用スコープ（sha256 の hex 64 桁）。
+/// ロック名に含めることで、ある評価データの走査を他の評価データのロックから切り離す。
+fn eval_scope(eval_data_sha256: &Sha256Digest) -> String {
+    let mut buf = Vec::with_capacity(EVAL_SCOPE_DOMAIN.len() + 32);
+    buf.extend_from_slice(EVAL_SCOPE_DOMAIN);
+    buf.extend_from_slice(eval_data_sha256.as_bytes());
+    Sha256Digest::of_bytes(&buf).to_hex()
+}
+
+/// `name` が、スコープ `scope` の適用ロックのファイル名
+/// （`config-` または `weights-` + `scope` + `-` + 小文字 hex 64 桁 + `.lock`）か。
+fn is_scoped_lock_file_name(name: &str, scope: &str) -> bool {
     ["config-", "weights-"].iter().any(|prefix| {
         name.strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix(scope))
+            .and_then(|r| r.strip_prefix('-'))
             .and_then(|r| r.strip_suffix(".lock"))
             .is_some_and(|h| {
                 h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -274,7 +289,11 @@ fn config_lock_name(eval_data_sha256: &Sha256Digest, config_id: &RepresentativeC
     buf.extend_from_slice(eval_data_sha256.as_bytes());
     buf.extend_from_slice(&(id.len() as u64).to_be_bytes());
     buf.extend_from_slice(id);
-    format!("config-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+    format!(
+        "config-{}-{}.lock",
+        eval_scope(eval_data_sha256),
+        Sha256Digest::of_bytes(&buf).to_hex()
+    )
 }
 
 /// 評価データごとの事前登録ファイル名。
@@ -344,7 +363,11 @@ impl FinalTestKey {
         buf.extend_from_slice(WEIGHTS_LOCK_DOMAIN);
         buf.extend_from_slice(self.eval_data_sha256.as_bytes());
         buf.extend_from_slice(self.weights_sha256.as_bytes());
-        format!("weights-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+        format!(
+            "weights-{}-{}.lock",
+            eval_scope(&self.eval_data_sha256),
+            Sha256Digest::of_bytes(&buf).to_hex()
+        )
     }
 
     fn record(&self, kind: &str, registry_sha256: &Sha256Digest) -> String {
@@ -726,14 +749,16 @@ impl FinalTestLedger {
         // 両方を差し替えても、既存ロックの記録と食い違えば検出できる。現在の登録に含まれる
         // ID に限らず、この評価データの既存ロックをすべて列挙して照合する（登録から
         // 適用済み ID を除いた集合への差し替えを検出するため）。
-        self.check_existing_locks(eval_data_sha256, &sealed)?;
+        self.check_existing_locks(eval_data_sha256, &sealed, MAX_LOCK_SCAN_ENTRIES)?;
         Ok((entries, sealed))
     }
 
-    /// 台帳内の適用ロック（`config-<hex>.lock`・`weights-<hex>.lock`）をすべて列挙し、
-    /// この評価データのロックが記録した登録ダイジェストが `sealed` と一致することを確認する。
+    /// この評価データの適用ロック（`config-<scope>-<hex>.lock`・`weights-<scope>-<hex>.lock`）を
+    /// すべて列挙し、記録された登録ダイジェストが `sealed` と一致することを確認する。
     ///
-    /// 列挙はファイル名の許可パターンに限り、件数（[`MAX_LOCK_SCAN_ENTRIES`]）と
+    /// 他の評価データのロックは、名前の `scope` で選別して読まず・数えない（無関係な
+    /// ロックの件数や破損が、この評価データの適用可否に影響しない）。
+    /// 列挙はファイル名の許可パターンに限り、件数（`limit`。通常は [`MAX_LOCK_SCAN_ENTRIES`]）と
     /// 1 件のサイズ（[`MAX_LOCK_RECORD_BYTES`]）に上限を置く。読めない・壊れた・通常
     /// ファイルでないロックは fail-closed で拒否する。空のロックは、代表構成ロック作成後に
     /// 重みロックの衝突で記録を書かず失敗した消費済みの残骸で、記録が無いので照合しない。
@@ -741,21 +766,23 @@ impl FinalTestLedger {
         &self,
         eval_data_sha256: &Sha256Digest,
         sealed: &Sha256Digest,
+        limit: usize,
     ) -> Result<(), AcquireError> {
         let tampered = |reason| AcquireError::RegistryTampered { reason };
         let entries = fs::read_dir(&self.dir).map_err(|_| tampered("ledger is unreadable"))?;
         let want_eval = eval_data_sha256.to_hex();
         let want_registry = sealed.to_hex();
+        let scope = eval_scope(eval_data_sha256);
         let mut scanned = 0usize;
         for entry in entries {
             let entry = entry.map_err(|_| tampered("ledger is unreadable"))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !is_lock_file_name(name) {
+            if !is_scoped_lock_file_name(name, &scope) {
                 continue;
             }
             scanned += 1;
-            if scanned > MAX_LOCK_SCAN_ENTRIES {
+            if scanned > limit {
                 return Err(tampered("too many application locks"));
             }
             let bytes = fandhe_edge_core::fs::read_bounded(&entry.path(), MAX_LOCK_RECORD_BYTES)
@@ -773,7 +800,7 @@ impl FinalTestLedger {
                 return Err(tampered("application lock is malformed"));
             };
             if eval != want_eval {
-                continue;
+                return Err(tampered("application lock is malformed"));
             }
             if field("registry_sha256") != Some(want_registry.as_str()) {
                 return Err(tampered(
@@ -1060,8 +1087,10 @@ mod tests {
         let a = key.config_lock_name();
         assert_eq!(a, key.config_lock_name());
         assert!(a.starts_with("config-") && a.ends_with(".lock"));
-        assert_eq!(a.len(), "config-".len() + 64 + ".lock".len());
-        assert_ne!(a[7..], key.weights_lock_name()[8..]);
+        let w = key.weights_lock_name();
+        assert!(w.starts_with("weights-") && w.ends_with(".lock"));
+        assert_ne!(a["config-".len()..], w["weights-".len()..]);
+        assert_eq!(a.len(), "config-".len() + 64 + 1 + 64 + ".lock".len());
     }
 
     #[test]
@@ -1074,5 +1103,45 @@ mod tests {
             ));
         }
         assert!(RepresentativeConfigId::parse(&"a".repeat(129)).is_err());
+    }
+
+    /// 上限は対象の評価データのロックだけに掛かり、他の評価データのロックは数えない
+    /// （codex P1 指摘の回帰。REQ-27・REQ-39）。
+    #[test]
+    fn req39_scan_limit_counts_only_this_eval_data_locks() {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-edge-eval-scan-limit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let ledger = FinalTestLedger::open(&dir).unwrap();
+        let (mine, other) = (d(1), d(2));
+        let sealed = d(9);
+        let write = |eval: &Sha256Digest, i: u8, body: String| {
+            let id = RepresentativeConfigId::parse(&format!("c{i}")).unwrap();
+            fs::write(dir.join(config_lock_name(eval, &id)), body).unwrap();
+        };
+        let rec = |eval: &Sha256Digest| {
+            format!(
+                "eval_data_sha256={}\nregistry_sha256={}\n",
+                eval.to_hex(),
+                sealed.to_hex()
+            )
+        };
+        for i in 0..5 {
+            write(&other, i, "garbage".to_string());
+        }
+        write(&mine, 0, rec(&mine));
+        write(&mine, 1, rec(&mine));
+        assert!(ledger.check_existing_locks(&mine, &sealed, 2).is_ok());
+        assert!(matches!(
+            ledger.check_existing_locks(&mine, &sealed, 1),
+            Err(AcquireError::RegistryTampered {
+                reason: "too many application locks"
+            })
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
