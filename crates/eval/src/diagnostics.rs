@@ -35,6 +35,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::baseline::validate_label_order;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use crate::metrics::{ConfusionColumn, EvalError, MAX_LABELS, SingleSelectMetrics};
 use crate::significance::MAX_EVAL_RECORDS;
 
@@ -257,6 +260,11 @@ pub enum DiagnosticsError {
         /// 評価結果の `n_total`。
         metrics_total: u64,
     },
+    /// 評価データ側のラベル別件数が評価結果の `support` と一致しない（位置のみ）。
+    EvalLabelSupportMismatch {
+        /// 最初に食い違ったラベル位置。
+        index: usize,
+    },
     /// 桁あふれ・添字不整合（理論上到達しない）。
     Internal {
         /// 詳細（英語）。
@@ -309,6 +317,10 @@ impl fmt::Display for DiagnosticsError {
             } => write!(
                 f,
                 "eval row count mismatch: stats {eval_rows}, metrics {metrics_total}"
+            ),
+            DiagnosticsError::EvalLabelSupportMismatch { index } => write!(
+                f,
+                "eval label count mismatch with metrics support at label index {index}"
             ),
             DiagnosticsError::Internal { detail } => {
                 write!(f, "internal diagnostics error: {detail}")
@@ -470,6 +482,9 @@ pub struct ConfusablePair {
     pub gold_support: u64,
 }
 
+/// 混同しやすい組の順位キー（件数、gold 位置、predicted 位置。大きいほど上位）。
+type PairKey = (u64, Reverse<usize>, Reverse<usize>);
+
 /// 混同行列から混同しやすいラベルの組の上位 `top_k` 件を抽出する（REQ-29 正常系・
 /// TASK-29.1-2）。
 ///
@@ -497,7 +512,10 @@ pub fn confusable_pairs(
     if n > MAX_LABELS {
         return Err(internal("label count exceeds limit"));
     }
-    let mut cells: Vec<(u64, usize, usize)> = Vec::new();
+    // 走査中に上位 top_k 件だけを保持する（REQ-39）。確保量は top_k（<= MAX_CONFUSABLE_PAIRS）で
+    // 抑え、ラベル数の二乗に比例させない。key の大きい順が「より混同している」順
+    // （件数降順、同数は gold・predicted の宣言順の若い方が上位）で、ヒープの先頭は保持中の最下位。
+    let mut heap: BinaryHeap<Reverse<PairKey>> = BinaryHeap::with_capacity(top_k.saturating_add(1));
     for i in 0..n {
         for j in 0..n {
             if i == j {
@@ -507,13 +525,21 @@ pub fn confusable_pairs(
                 .confusion
                 .get(i, ConfusionColumn::Label(j))
                 .ok_or_else(|| internal("confusion cell out of bounds"))?;
-            if count > 0 {
-                cells.push((count, i, j));
+            if count == 0 {
+                continue;
+            }
+            heap.push(Reverse((count, Reverse(i), Reverse(j))));
+            if heap.len() > top_k {
+                heap.pop();
             }
         }
     }
-    cells.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    cells.truncate(top_k);
+    // 昇順（Reverse 上）= key 降順 = 上位から。
+    let cells: Vec<(u64, usize, usize)> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse((count, Reverse(i), Reverse(j)))| (count, i, j))
+        .collect();
     cells
         .into_iter()
         .map(|(count, i, j)| {
@@ -587,7 +613,8 @@ fn check_label_order(
 /// CLI の `evaluate` 工程（配線は #140）が、評価を実行した場合にのみ呼ぶ想定。評価データが
 /// 無く `skipped` の場合は混同行列が無いため本レポートは作らない（CLI 側の分岐）。
 /// 評価データの行と評価レコードが 1 対 1 で渡される前提で、`eval.n_rows` と
-/// `metrics.n_total` の一致、両基礎統計のラベル並びと `metrics.per_label` の一致を検証する
+/// `metrics.n_total` の一致、両基礎統計のラベル並びと `metrics.per_label` の一致、評価側のラベル別件数と
+/// `per_label[*].support` の一致を検証する
 /// （fail-closed。エラーは位置・件数のみ）。
 pub fn diagnostic_report(
     train: BasicStats,
@@ -602,6 +629,14 @@ pub fn diagnostic_report(
             eval_rows: eval.n_rows,
             metrics_total: metrics.n_total,
         });
+    }
+    if let Some(index) = eval
+        .label_counts
+        .iter()
+        .zip(metrics.per_label.iter())
+        .position(|(x, y)| x.count != y.support)
+    {
+        return Err(DiagnosticsError::EvalLabelSupportMismatch { index });
     }
     let confusable_pairs = confusable_pairs(metrics, top_k)?;
     Ok(DiagnosticReport {

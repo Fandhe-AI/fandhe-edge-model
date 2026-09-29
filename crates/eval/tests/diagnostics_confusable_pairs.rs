@@ -229,6 +229,55 @@ fn report_rejects_eval_row_count_mismatch() {
     );
 }
 
+/// 総行数が同じでもラベル別件数が評価結果の support と異なれば拒否する。
+#[test]
+fn report_rejects_label_support_mismatch() {
+    let m = metrics_of(&sample_pairs());
+    // 総数 10 だが A=4, B=3, C=3（評価結果は A=5, B=2, C=3）。
+    let mut rows: Vec<(String, &str)> = Vec::new();
+    for (i, l) in ["A", "A", "A", "A", "B", "B", "B", "C", "C", "C"]
+        .iter()
+        .enumerate()
+    {
+        rows.push((format!("e{i}"), l));
+    }
+    let refs: Vec<(&str, &str)> = rows.iter().map(|(k, l)| (k.as_str(), *l)).collect();
+    let eval = stats_of(&LABELS, &refs);
+    assert_eq!(
+        diagnostic_report(train_stats(), eval, &m, 5).unwrap_err(),
+        DiagnosticsError::EvalLabelSupportMismatch { index: 0 }
+    );
+}
+
+/// 全非対角セルが正でも top_k 件だけが件数降順・宣言順で返る（有界ヒープ）。
+#[test]
+fn bounded_selection_keeps_ordering_with_ties() {
+    let labels = ["A", "B", "C", "D"];
+    let mut pairs: Vec<(&str, Outcome)> = Vec::new();
+    for g in labels {
+        for p in labels {
+            if g != p {
+                pairs.push((g, lab(p)));
+            }
+        }
+    }
+    pairs.push(("D", lab("A")));
+    let records: Vec<EvalRecord<'_>> = pairs
+        .iter()
+        .map(|(g, o)| EvalRecord {
+            gold: g,
+            outcome: o,
+        })
+        .collect();
+    let m = evaluate_single_select(&labels, &records).unwrap();
+    let got = confusable_pairs(&m, 3).unwrap();
+    let seq: Vec<(&str, &str, u64)> = got
+        .iter()
+        .map(|p| (p.gold.as_str(), p.predicted.as_str(), p.count))
+        .collect();
+    assert_eq!(seq, vec![("D", "A", 2), ("A", "B", 1), ("A", "C", 1)]);
+}
+
 /// エラーメッセージにラベル値を含めない。
 #[test]
 fn error_messages_hide_label_values() {
