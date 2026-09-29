@@ -5,6 +5,8 @@
 //! Claude Code Bash ツールではない）。`infer` の実推論経路は TASK-33.1-2
 //! （#136）・#112・#113 が未接続のため、現時点の exit 0 経路は help のみ。
 //! 実推論の exit 0 ケースはそれらの完了後にここへ追加する。
+//! 末尾の `req36_run_record_*` は実行記録（opt-in の `FANDHE_EDGE_RECORD_DIR`。
+//! TASK-36.1-2・#150）の保存形式を具体値で照合する。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
 #![cfg(unix)]
@@ -36,12 +38,18 @@ fn script_path() -> PathBuf {
 }
 
 fn run_script(args: &[&str]) -> Out {
+    run_script_env(args, &[])
+}
+
+/// `run_script` に環境変数を追加で渡す版（実行記録の検証用。TASK-36.1-2）。
+fn run_script_env(args: &[&str], envs: &[(&str, &str)]) -> Out {
     let mut child = Command::new("sh")
         // 独立したプロセスグループで起動し、タイムアウト時に子孫も終了できるようにする
         .process_group(0)
         .arg(script_path())
         .args(args)
         .env("FANDHE_EDGE_BIN", env!("CARGO_BIN_EXE_fandhe-edge"))
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -938,4 +946,326 @@ fn req21_replaced_results_never_relay_raw_cli_stderr() {
     );
     assert_eq!(o.code, Some(10));
     assert_eq!(o.stderr, "secret-diagnostic\nexit_code=10\n");
+}
+// ---- 実行記録（REQ-36・TASK-36.1-2・#150）----
+// 証拠種別はテストハーネス（fake bin・help 経路）。cli は serde_json に依存しないため、
+// JSON は解析せず期待文字列との完全一致で照合する。
+
+const RECORD_SCHEMA: &str = "fandhe-edge.run-record/1";
+
+/// テスト名と PID で一意な記録ディレクトリを作る。
+fn record_dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("fandhe-record-{}-{name}", std::process::id()));
+    std::fs::remove_dir_all(&d).ok();
+    std::fs::create_dir_all(&d).expect("mkdir record dir");
+    d
+}
+
+/// 記録ディレクトリ直下のファイルを (名前, 内容) で返す。
+fn record_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| {
+            let e = e.expect("entry");
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                String::from_utf8_lossy(&std::fs::read(e.path()).expect("read")).into_owned(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// 期待値側の JSON 文字列エスケープ（`"`・`\`・制御文字）。
+fn json_str(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// UTC の暦日時（YYYY-MM-DDTHH:MM:SSZ）を epoch 秒へ（days_from_civil）。
+fn epoch_of(ts: &str) -> i64 {
+    let b = ts.as_bytes();
+    assert_eq!(ts.len(), 20, "{ts}");
+    assert!(b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':');
+    assert_eq!(b[19], b'Z');
+    let n = |r: std::ops::Range<usize>| -> i64 { ts[r].parse().expect("digits") };
+    let (y, m, d) = (n(0..4), n(5..7), n(8..10));
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + n(11..13) * 3600 + n(14..16) * 60 + n(17..19)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64
+}
+
+/// 記録ファイルを 1 つだけ取り出す。
+fn only_record(dir: &std::path::Path) -> String {
+    let files = record_files(dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].0.starts_with("run-record."), "{}", files[0].0);
+    files[0].1.clone()
+}
+
+/// started_at を切り出す（`"started_at":"` の直後 20 文字）。
+fn started_at_of(rec: &str) -> String {
+    let key = "\"started_at\":\"";
+    let i = rec.find(key).expect("started_at") + key.len();
+    rec[i..i + 20].to_string()
+}
+
+/// 受け入れ条件: 5 項目（command・started_at・exit_code・stdout・stderr）が具体値で残る。
+#[test]
+fn req36_run_record_contains_five_fields_with_exact_values() {
+    let dir = record_dir("five");
+    let before = now_secs();
+    let o = run_script_env(
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    let after = now_secs();
+    assert_eq!(o.code, Some(0));
+    let help = expected_stdout(&ErrorReport::new(
+        ExitCode::Ok,
+        args::render_help(Some(Subcommand::Infer)),
+    ));
+    assert_eq!(o.stdout, help);
+    // 記録しても契約の出力（stderr）は変わらない
+    assert_eq!(o.stderr, "exit_code=0\n");
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let t = epoch_of(&started);
+    assert!(
+        t >= before - 1 && t <= after + 1,
+        "{started} {before} {after}"
+    );
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":0,\"stdout\":\"{}\",\"stderr\":\"\",\"stderr_replaced\":false}}\n",
+        json_str(&help)
+    );
+    assert_eq!(rec, expected);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--text`・`--id` の値（空白区切りと `=` 形式の両方）は記録に残らない。
+#[test]
+fn req36_run_record_redacts_text_and_id_values() {
+    let body = "echo '{\"code\":\"ok\"}'\nexit 0";
+    let cases: [(&[&str], &str); 2] = [
+        (
+            &[
+                "--package",
+                "p",
+                "--text",
+                "SECRET-BODY-xyz",
+                "--id",
+                "SECRET-ID-abc",
+            ],
+            "[\"fandhe-edge\",\"infer\",\"--package\",\"p\",\"--text\",\"<redacted>\",\"--id\",\"<redacted>\"]",
+        ),
+        (
+            &["--text=SECRET2", "--id=SECRET3"],
+            "[\"fandhe-edge\",\"infer\",\"--text=<redacted>\",\"--id=<redacted>\"]",
+        ),
+    ];
+    for (i, (args, expected_cmd)) in cases.iter().enumerate() {
+        let dir = record_dir(&format!("redact{i}"));
+        let d = dir.to_str().unwrap();
+        let o = run_with_fake_bin_args("redact", body, args, &[("FANDHE_EDGE_RECORD_DIR", d)]);
+        assert_eq!(o.code, Some(0));
+        let rec = only_record(&dir);
+        assert!(
+            rec.contains(&format!("\"command\":{expected_cmd},")),
+            "{rec}"
+        );
+        assert!(!rec.contains("SECRET"), "{rec}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// 非ゼロ終了・stderr の引用符とタブがエスケープされて残る。
+#[test]
+fn req36_run_record_captures_nonzero_exit_and_stderr() {
+    let dir = record_dir("nonzero");
+    let d = dir.to_str().unwrap();
+    let body = "printf 'warn: \"q\"\\tx\\n' 1>&2\necho '{\"code\":\"invalid_input\",\"message\":\"m\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "nonzero",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":64,\"stdout\":\"{{\\\"code\\\":\\\"invalid_input\\\",\\\"message\\\":\\\"m\\\"}}\\n\",\"stderr\":\"warn: \\\"q\\\"\\u0009x\\n\",\"stderr_replaced\":false}}\n"
+    );
+    assert_eq!(rec, expected);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 置き換え後（呼び出し元が受け取る値）が記録される。
+#[test]
+fn req36_run_record_stores_normalized_output_after_replacement() {
+    let dir = record_dir("normalized");
+    let d = dir.to_str().unwrap();
+    let o = run_with_fake_bin_args(
+        "normalized",
+        "echo '{bad}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(70));
+    let rec = only_record(&dir);
+    assert!(rec.contains("\"exit_code\":70,"), "{rec}");
+    assert!(
+        rec.contains(&format!("\"stdout\":\"{}\"", json_str(&o.stdout))),
+        "{rec}"
+    );
+    assert!(
+        rec.contains("\"stderr\":\"\",\"stderr_replaced\":false}"),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// バッチの複数行 stdout は 1 つの文字列に収まる。
+#[test]
+fn req36_run_record_batch_multiline_stdout_is_one_string() {
+    let dir = record_dir("batch");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"a\":1}'\necho '{\"b\":2}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "batch",
+        body,
+        &["--input-file", "f"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--input-file\",\"f\"]"),
+        "{rec}"
+    );
+    assert!(
+        rec.contains("\"stdout\":\"{\\\"a\\\":1}\\n{\\\"b\\\":2}\\n\","),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// UTF-8 として不正・NUL を含む stderr は固定文字列に置き換わる。
+#[test]
+fn req36_run_record_invalid_utf8_stderr_is_replaced() {
+    let dir = record_dir("badstderr");
+    let d = dir.to_str().unwrap();
+    let body = "printf '\\377\\000' 1>&2\necho '{\"code\":\"ok\"}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "badstderr",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains(
+            "\"stderr\":\"<stderr not representable as UTF-8 text>\",\"stderr_replaced\":true}"
+        ),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 記録ディレクトリが通常ファイル・不在・symlink なら CLI を起動せず 64 で拒否する。
+#[test]
+fn req36_run_record_dir_not_directory_is_rejected_without_launching_cli() {
+    let base = record_dir("baddir");
+    let marker = base.join("launched");
+    let file = base.join("plain-file");
+    std::fs::write(&file, "x").expect("write");
+    let link = base.join("link");
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).expect("mkdir");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let missing = base.join("missing");
+    let body = format!(
+        "echo x >'{}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        marker.display()
+    );
+    for p in [&file, &missing, &link] {
+        let o = run_with_fake_bin_args(
+            "baddir",
+            &body,
+            &["--help"],
+            &[("FANDHE_EDGE_RECORD_DIR", p.to_str().unwrap())],
+        );
+        assert_eq!(o.code, Some(64), "{p:?}");
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"invalid_input\",\"message\":\"FANDHE_EDGE_RECORD_DIR must be an existing directory\"}\n"
+        );
+        assert!(!o.stdout.contains(p.to_str().unwrap()));
+        assert_eq!(o.stderr, "exit_code=64\n");
+        assert!(!marker.exists(), "CLI must not be launched");
+    }
+    assert!(record_files(&real).is_empty());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 保存に失敗したら記録済みを装わず runtime_error(70) にする（fail-closed）。
+#[test]
+fn req36_run_record_write_failure_is_fail_closed_70() {
+    let dir = record_dir("writefail");
+    let d = dir.to_str().unwrap();
+    let body = format!("rmdir '{d}'\necho '{{\"code\":\"ok\"}}'\nexit 0");
+    let o = run_with_fake_bin_args(
+        "writefail",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert_eq!(o.stderr, "exit_code=70\n");
+    assert!(!dir.exists());
+}
+
+/// 未設定・空文字では何も作らず出力も変えない（既定の経路の回帰）。
+#[test]
+fn req36_no_record_dir_creates_nothing() {
+    let dir = record_dir("unset");
+    let o = run_with_fake_bin_args(
+        "unset",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", "")],
+    );
+    assert_eq!(o.code, Some(0));
+    assert_eq!(o.stdout, "{\"code\":\"ok\"}\n");
+    assert_eq!(o.stderr, "exit_code=0\n");
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
 }

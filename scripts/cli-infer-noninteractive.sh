@@ -38,9 +38,25 @@
 # バイナリ: 環境変数 FANDHE_EDGE_BIN、無ければ
 #   ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge
 #
+# 実行記録（REQ-36・TASK-36.1-2・#150。opt-in）:
+#   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
+#   その直下へ `run-record.XXXXXX`（mktemp。O_EXCL・0600。既存ファイルは上書きしない）を作り、
+#   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
+#   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
+#   実行ファイルのパスは入れない）・started_at（CLI 起動前の UTC 秒精度）・exit_code（呼び出し元へ
+#   返す値）・stdout（呼び出し元が受け取る正規化後の全体。バッチの複数行も 1 文字列）・
+#   stderr（中継する CLI の stderr。診断行 exit_code=<N> は含めない）・stderr_replaced
+#   （UTF-8 として不正または NUL を含む stderr を固定文字列へ置き換えたとき true）。
+#   データ本文の混入防止（security.md）: `--text` と `--id` の値は `<redacted>` に伏せる
+#   （id は利用者入力で個人情報を含みうるため。infer 成功時の stdout に含まれる id は CLI の契約出力を
+#   そのまま記録するもので、呼び出し元が既に受け取っている）。入力ファイルの中身は読まず、環境変数は
+#   記録しない。記録を要求されたのに保存できなければ runtime_error(70)（fail-closed）。CLI 起動前の
+#   拒否（--out・不正な記録ディレクトリ・バイナリ不在）は記録しない。
+#   証拠種別: テストハーネス（fake bin・help 経路。実クライアントでの記録ではない）。
+#
 # 現状の制約: infer の実推論は TASK-33.1-2（#136）・前処理（#112）・
 # ONNX 推論（#113）が未接続のため exit 70 を返す。exit 0 になるのは
-# `--help` のみ。記録の保存形式は #150（TASK-36.1-2）の担当。
+# `--help` のみ。
 set -eu
 
 # プロセスグループの隔離に bash のジョブ制御（set -m）を使う。dash 等は tty が無いと
@@ -60,23 +76,75 @@ if [ -z "${BASH_VERSION:-}" ] || [ -o posix ]; then
     exit 70
 fi
 
+# 実行記録（TASK-36.1-2）用の JSON 文字列エスケープ。stdin をバイト単位（LC_ALL=C）で読み、
+# `"`・`\`・制御文字（0x01〜0x1F）をエスケープして引用符なしで出す。引数 $1 は入力が改行で
+# 終わるか（1/0）。0x7F 以上は素通し（UTF-8 の正当性は呼び出し側が保証する）。
+# 置換は index/substr で組み立て、gsub の置換文字列の `\` 解釈差（awk 実装差）を避ける
+json_escape() {
+    LC_ALL=C awk -v trail="$1" '
+    function rep(l, c, r,   o, p) {
+        o = ""
+        while ((p = index(l, c)) > 0) { o = o substr(l, 1, p - 1) r; l = substr(l, p + length(c)) }
+        return o l
+    }
+    BEGIN {
+        for (i = 1; i <= 31; i++) if (i != 10) { ch[i] = sprintf("%c", i); es[i] = sprintf("\\u%04x", i) }
+    }
+    {
+        l = rep($0, "\\", "\\\\")
+        l = rep(l, "\"", "\\\"")
+        for (i = 1; i <= 31; i++) if (i != 10 && index(l, ch[i]) > 0) l = rep(l, ch[i], es[i])
+        if (NR > 1) printf "\\n"
+        printf "%s", l
+    }
+    END { if (NR > 0 && trail == 1) printf "\\n" }'
+}
+
+# ファイル全体を JSON 文字列の本体へ（末尾の改行の有無を保つ）。出力は改行を含まない
+json_escape_file() {
+    _t=0
+    if [ -s "$1" ] && [ -z "$(tail -c 1 "$1")" ]; then _t=1; fi
+    json_escape "$_t" <"$1"
+}
+
+# 引数 1 つを記録の command 配列へ追加する（記録を要求されたときだけ）
+rec_dir=${FANDHE_EDGE_RECORD_DIR:-}
+rec_cmd='"fandhe-edge","infer"'
+rec_add() {
+    if [ -n "$rec_dir" ]; then
+        rec_cmd="$rec_cmd,\"$(printf '%s' "$1" | json_escape 0)\""
+    fi
+}
+
 # バッチ（infer --input-file）は 1 行 1 JSON を認める（REQ-33）。CLI（args.rs の INFER_OPTS）と
 # 同じくオプションと値を対応づけて走査し、他オプションの値として現れた `--input-file` は
 # バッチ指定とみなさない（infer のオプションはすべて値を取る）
 batch=0
 skip=0
 out_requested=0
+redact_next=0
 for a in ${1+"$@"}; do
     if [ "$skip" -eq 1 ]; then
         skip=0
+        # 記録では --text・--id の値（入力本文・利用者の id）を伏せる（TASK-36.1-2）
+        if [ "$redact_next" -eq 1 ]; then
+            redact_next=0
+            rec_add "<redacted>"
+        else
+            rec_add "$a"
+        fi
         continue
     fi
     case "$a" in
-        --input-file) batch=1; skip=1 ;;
-        --input-file=*) batch=1 ;;
-        --out) out_requested=1; skip=1 ;;
-        --out=*) out_requested=1 ;;
-        --package | --text | --id) skip=1 ;;
+        --input-file) batch=1; skip=1; rec_add "$a" ;;
+        --input-file=*) batch=1; rec_add "$a" ;;
+        --out) out_requested=1; skip=1; rec_add "$a" ;;
+        --out=*) out_requested=1; rec_add "$a" ;;
+        --text | --id) skip=1; redact_next=1; rec_add "$a" ;;
+        --text=*) rec_add "--text=<redacted>" ;;
+        --id=*) rec_add "--id=<redacted>" ;;
+        --package) skip=1; rec_add "$a" ;;
+        *) rec_add "$a" ;;
     esac
 done
 
@@ -98,6 +166,13 @@ fi
 if [ "$out_requested" -eq 1 ]; then
     echo "fandhe-edge: --out is not supported by this wrapper" >&3
     printf '%s\n' '{"code":"invalid_input","message":"--out is not supported by the non-interactive wrapper"}'
+    echo "exit_code=64" >&3
+    exit 64
+fi
+
+# 記録ディレクトリは CLI の起動前に検証する（fail-closed。メッセージは固定でパスを含めない）
+if [ -n "$rec_dir" ] && { [ ! -d "$rec_dir" ] || [ -L "$rec_dir" ]; }; then
+    printf '%s\n' '{"code":"invalid_input","message":"FANDHE_EDGE_RECORD_DIR must be an existing directory"}'
     echo "exit_code=64" >&3
     exit 64
 fi
@@ -166,6 +241,11 @@ deadline=$((SECONDS + timeout_secs + 1))
 # 子へ元の stderr（fd 3）を継がせない（呼び出し元のパイプを保持させない）。
 # ${1+"$@"}: 引数なしでも Bash 3.2 の set -u で abort しない
 exec 2>/dev/null
+# 記録の started_at は CLI 起動前の UTC 秒精度（取得失敗は記録時に fail-closed）
+started_at=
+if [ -n "$rec_dir" ]; then
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ) || started_at=
+fi
 set -m
 (
     rc_child=0
@@ -487,6 +567,43 @@ case "$rc" in
         replace_with_error "fandhe-edge terminated abnormally"
         ;;
 esac
+# 実行記録の保存（opt-in。TASK-36.1-2）。正規化と置き換えが済んだ最終結果を記録する。
+# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）
+if [ -n "$rec_dir" ]; then
+    rec_ok=1
+    rec_file=
+    case "$started_at" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) rec_ok=0 ;;
+    esac
+    # stderr が UTF-8 として不正・NUL を含む場合は元のバイト列を残さず固定文字列にする
+    err_replaced=false
+    err_json=
+    if [ "$rec_ok" -eq 1 ]; then
+        nul_free=$(tr -d '\000' <"$err" | wc -c) || nul_free=-1
+        raw_size=$(wc -c <"$err") || raw_size=-2
+        if [ "$nul_free" -ne "$raw_size" ] || ! iconv -f UTF-8 -t UTF-8 <"$err" >/dev/null 2>&1; then
+            err_replaced=true
+            err_json='<stderr not representable as UTF-8 text>'
+        else
+            err_json=$(json_escape_file "$err") || rec_ok=0
+        fi
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        out_json=$(json_escape_file "$out") || rec_ok=0
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        rec_file=$(mktemp "$rec_dir/run-record.XXXXXX") || rec_ok=0
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":"%s","stderr":"%s","stderr_replaced":%s}\n' \
+            "$rec_cmd" "$started_at" "$rc" "$out_json" "$err_json" "$err_replaced" >"$rec_file" || rec_ok=0
+    fi
+    if [ "$rec_ok" -ne 1 ]; then
+        if [ -n "$rec_file" ]; then rm -f "$rec_file"; fi
+        replace_with_error "failed to save run record"
+    fi
+fi
 cat "$out"
 # CLI の stderr（上限 64 KiB 以内）を中継してから診断行を出す
 cat "$err" >&3
