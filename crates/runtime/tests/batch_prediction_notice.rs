@@ -79,9 +79,13 @@ fn req28_reference_batch_predictions_equal_infer_batch() {
     let plain = pl.infer_batch(&refs).expect("within limits");
     let wrapped = pl.infer_batch_for_reference(&refs).expect("within limits");
     assert_eq!(plain.len(), 41);
-    assert_eq!(wrapped.results().len(), 41);
-    for (i, (a, b)) in plain.iter().zip(wrapped.results()).enumerate() {
-        let (a, b) = (pred(a, i), pred(b, i));
+    let wrapped = wrapped.into_annotated_results();
+    assert_eq!(wrapped.len(), 41);
+    for (i, (a, b)) in plain.iter().zip(wrapped.iter()).enumerate() {
+        // 各要素は結果と注記を一体で持つ。
+        assert_eq!(b.notice(), BATCH_PREDICTION_NOTICE, "notice missing at {i}");
+        assert!(b.is_batch_prediction());
+        let (a, b) = (pred(a, i), pred(b.result(), i));
         assert_eq!(a.label_index(), b.label_index(), "label differs at {i}");
         assert_eq!(a.scores().len(), b.scores().len());
         for (p, q) in a.scores().iter().zip(b.scores()) {

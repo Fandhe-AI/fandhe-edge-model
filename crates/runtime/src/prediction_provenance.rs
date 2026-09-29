@@ -12,7 +12,10 @@
 //! - 明記が必要な組み合わせの規則は [`PredictionProvenance::batch_prediction_notice`] の 1 箇所に集約する
 //! - [`PredictionProvenance::Judgment`] は mode を持たない。判定経路にバッチのフラグを付けること
 //!   自体を型で表現できない（判定経路にフラグは不要）
-//! - [`ReferenceBatchPredictions`] は結果と注記を分離できない形で束ねる
+//! - [`ReferenceBatchPredictions`] は結果と注記を分離できない形で束ねる。結果は要素ごとに注記と一体の
+//!   [`AnnotatedPrediction`] としてのみ読め、結果だけを返す公開アクセサは持たない
+//! - 注記なしの `InferencePipeline::infer_batch` は判定経路と共通の入口（TASK-28.1）で、
+//!   参考測定の記録を作る側は `infer_batch_for_reference` を使う（記録生成の入口はこちらに一本化）
 //!
 //! # 呼び出し元と範囲外
 //!
@@ -97,9 +100,14 @@ impl ReferenceBatchPredictions {
         Self { results }
     }
 
-    /// 要素ごとの結果。
-    pub fn results(&self) -> &[Result<Prediction, InferError>] {
-        &self.results
+    /// 件数（結果本体は出さない。結果は [`Self::into_annotated_results`] 経由でのみ読める）。
+    pub fn len(&self) -> usize {
+        self.results.len()
+    }
+
+    /// 件数が 0 か。
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
     }
 
     /// 結果を出どころ・注記つきで取り出す。結果だけを注記なしで取り出す API は提供しない
@@ -140,9 +148,24 @@ pub struct AnnotatedBatchResults {
 }
 
 impl AnnotatedBatchResults {
-    /// 要素ごとの結果。
-    pub fn results(&self) -> &[Result<Prediction, InferError>] {
-        &self.results
+    /// 件数。
+    pub fn len(&self) -> usize {
+        self.results.len()
+    }
+
+    /// 件数が 0 か。
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+
+    /// 要素ごとの記録。各要素が結果・出どころ・注記を一体で持つ。
+    /// 結果だけを返す公開アクセサは持たない（REQ-28・TASK-28.3）。
+    pub fn iter(&self) -> impl Iterator<Item = AnnotatedPrediction<'_>> + '_ {
+        self.results.iter().map(|result| AnnotatedPrediction {
+            result,
+            provenance: self.provenance,
+            notice: self.notice,
+        })
     }
 
     /// 常に参考測定・バッチ。
@@ -153,6 +176,37 @@ impl AnnotatedBatchResults {
     /// 記録へ付ける注記（常に [`BATCH_PREDICTION_NOTICE`]）。
     pub fn notice(&self) -> &'static str {
         self.notice
+    }
+}
+
+/// 1 件分の記録。結果・出どころ・注記を一体にした借用で、本モジュール外からは作れない。
+/// 結果を読む [`Self::result`] と同じ値から、必ず注記も取り出せる（REQ-28・TASK-28.3）。
+#[derive(Clone, Copy)]
+pub struct AnnotatedPrediction<'a> {
+    result: &'a Result<Prediction, InferError>,
+    provenance: PredictionProvenance,
+    notice: &'static str,
+}
+
+impl<'a> AnnotatedPrediction<'a> {
+    /// この要素の予測結果。
+    pub fn result(&self) -> &'a Result<Prediction, InferError> {
+        self.result
+    }
+
+    /// 常に参考測定・バッチ。
+    pub fn provenance(&self) -> PredictionProvenance {
+        self.provenance
+    }
+
+    /// 記録へ付ける注記（常に [`BATCH_PREDICTION_NOTICE`]）。
+    pub fn notice(&self) -> &'static str {
+        self.notice
+    }
+
+    /// `batch_prediction` フラグの値（常に true）。
+    pub fn is_batch_prediction(&self) -> bool {
+        self.provenance.is_batch_prediction()
     }
 }
 
@@ -208,7 +262,11 @@ mod tests {
     fn req28_into_annotated_results_keeps_provenance() {
         let batch: BatchResult = vec![Err(InferError::InputTooLarge { len: 2, limit: 1 })];
         let out = ReferenceBatchPredictions::new(batch).into_annotated_results();
-        assert_eq!(out.results().len(), 1);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out.iter()
+                .all(|r| r.notice() == BATCH_PREDICTION_NOTICE && r.is_batch_prediction())
+        );
         assert_eq!(out.notice(), BATCH_PREDICTION_NOTICE);
         assert_eq!(
             out.provenance(),
