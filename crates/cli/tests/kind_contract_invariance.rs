@@ -254,23 +254,51 @@ fn req19_unsupported_kind_uses_same_error_shape() {
     assert!(!line.contains(unknown));
 }
 
-/// 推論側は種類を知らない設計（REQ-19 の入出力統一）を表す、状態を持たない前処理。
-struct ByteLenPreprocessor;
+/// 種類ごとに異なるトークン列を作る前処理のスタブ。
+///
+/// 本物の種類別 ONNX 推論経路は未実装（`crates/runtime` は前処理・ONNX 推論が
+/// 未着手）のため、本テストは「種類が違えば前処理と backend の経路の中身が違う」
+/// 状況をスタブで作り、その差が CLI の出力契約へ漏れないことだけを確認する。
+struct KindPreprocessor {
+    kind: &'static str,
+}
 
-impl Preprocessor for ByteLenPreprocessor {
+impl Preprocessor for KindPreprocessor {
     fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
-        Ok(TokenIds::new(input.bytes().map(i64::from).collect()))
+        let mut ids: Vec<i64> = input.bytes().map(i64::from).collect();
+        match self.kind {
+            // 固定長 16 へ 0 埋めする（C3 の畳み込み入力を模す）。
+            "c3" => ids.resize(16, 0),
+            // 逆順にする（自己回帰 decoder の系列処理を模す）。
+            "autoregressive" => ids.reverse(),
+            _ => {}
+        }
+        Ok(TokenIds::new(ids))
     }
 }
 
-/// 種類ごとに異なる確率を返すスタブ（種類が違っても出力の骨格が同じことの確認用）。
+/// トークン列の形から種類ごとに異なる確率を返すスタブ。
+///
+/// 前処理が自分の種類の形（c1 は先頭 `s`・長さ 12、c3 は長さ 16 の 0 埋め、
+/// autoregressive は先頭 `t` の逆順）を作っていなければ `BackendError::Failed` を
+/// 返す。種類ごとの前処理と backend の組が噛み合わないと本テストが失敗する。
 struct KindStubBackend {
-    scores: [f64; 3],
+    kind: &'static str,
 }
 
 impl ScoringBackend for KindStubBackend {
-    fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
-        Ok(self.scores.to_vec())
+    fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+        let slice = ids.as_slice();
+        match self.kind {
+            "c1" if slice.len() == 12 && slice.first() == Some(&i64::from(b's')) => {
+                Ok(vec![0.75, 0.125, 0.125])
+            }
+            "c3" if slice.len() == 16 && slice.last() == Some(&0) => Ok(vec![0.125, 0.75, 0.125]),
+            "autoregressive" if slice.len() == 12 && slice.first() == Some(&i64::from(b't')) => {
+                Ok(vec![0.25, 0.25, 0.5])
+            }
+            _ => Err(BackendError::Failed),
+        }
     }
 }
 
@@ -287,7 +315,8 @@ const DEFINITION_JSON: &str = r#"{
   "io": {"input": "bytes"}
 }"#;
 
-/// REQ-19・REQ-21・REQ-33・TASK-19.4: 種類ごとに違うスコアでも、`infer` の
+/// REQ-19・REQ-21・REQ-33・TASK-19.4: 種類ごとに前処理・backend の経路が異なり
+/// （スタブ。本物の種類別 ONNX 推論は未実装）スコアも違っても、`infer` の
 /// stdout は同じ骨格（キー順 `id`→`status`→`predicted_label`→`scores`、`scores` は
 /// 選択肢の宣言順）の 1 行で、exit 0、種類名を含まないこと。
 #[test]
@@ -316,7 +345,7 @@ fn req19_infer_output_schema_is_kind_invariant() {
         ),
     ];
     for (kind, scores, label, score_body) in cases {
-        let pipeline = InferencePipeline::new(ByteLenPreprocessor, KindStubBackend { scores });
+        let pipeline = InferencePipeline::new(KindPreprocessor { kind }, KindStubBackend { kind });
         let prediction = pipeline
             .infer_one("sample input")
             .expect("inference succeeds");
@@ -325,6 +354,8 @@ fn req19_infer_output_schema_is_kind_invariant() {
             .map(|choice| choice.id.as_str())
             .expect("label index within options");
         assert_eq!(predicted, label, "{kind}");
+        // 種類ごとの経路が想定どおりのスコアを出すこと（経路が種類で分岐している確認）。
+        assert_eq!(prediction.scores(), scores.as_slice(), "{kind}");
 
         let result = JudgmentResult::new(options, "input-001", predicted, prediction.scores())
             .expect("valid judgment result");
