@@ -32,8 +32,9 @@
 //! `O_NOFOLLOW`）で開く。検証後に親ディレクトリや対象が symlink へ差し替えられても
 //! `O_NOFOLLOW` により開けず、外部ファイルは通らない。`openat` は `rustix`
 //! （2026-09-29 オーナー承認。`unsafe` 不要）を使う。開いた fd は `fstat` で通常ファイルか
-//! 確認する（`O_NONBLOCK` で FIFO・デバイスの open が停止しない）。macOS では加えて
-//! `F_GETPATH` による fd の実パスがルート配下であることを確認する。
+//! 確認する（`O_NONBLOCK` で FIFO・デバイスの open が停止しない）。加えて fd の実パス
+//! （Linux: `/proc/self/fd`・macOS: `F_GETPATH`）が最初に確定したルートの実パス配下であることを
+//! 確認する（検証後にルート自体が外へ移動されても拒否する。実パスを得られなければ拒否）。
 //!
 //! - Linux・macOS 以外（Windows・他の unix 等）は [`PathRejection::UnsupportedPlatform`] で
 //!   拒否する（fail-closed。M10 時点で対象外）
@@ -206,6 +207,24 @@ fn is_absolute_like(p: &Path) -> bool {
         .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
 }
 
+/// `.` と `..` をファイルシステムに触れず字句的に畳む（`..` が戻れない先頭ではそのまま保持する）。
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // ルート直下の `..` はルートに留まる（POSIX）。相対パスの先頭では保持する。
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// 相対パスの `..` がルートより上へ戻るか（ファイルシステムに触れない字句判定）。
 fn lexically_escapes(p: &Path) -> bool {
     let mut depth: usize = 0;
@@ -272,8 +291,11 @@ fn resolve_under(
     } else {
         // 絶対パスでも、字句的にルート配下（与えられたルートまたは正準化後のルートの下）から
         // symlink で外へ出る場合は Symlink とする。字句的にも外なら Absolute。
+        // `Path::starts_with` は `..` を畳まないため、字句正規化してから判定する
+        // （`/root/../etc` をルート配下と誤認して Symlink にしない）。
+        let normalized = lexical_normalize(candidate);
         let lexically_under_root =
-            candidate.starts_with(canon_root) || candidate.starts_with(given_root);
+            normalized.starts_with(canon_root) || normalized.starts_with(given_root);
         Err(PathRejection::Escapes {
             candidate: candidate.to_path_buf(),
             kind: if absolute && !lexically_under_root {
@@ -324,8 +346,8 @@ fn errno_to_io(e: rustix::io::Errno) -> io::Error {
 /// 4. 各成分を `openat` で開く。中間は `O_DIRECTORY | O_NOFOLLOW`、最後は `O_NOFOLLOW`。検証後に
 ///    成分が symlink へ差し替えられていれば `ELOOP` / `ENOTDIR` となり、外部へは出られない
 ///    （パスの再解決を行わない。TASK-39.4-1・#158 の再照合競合の指摘への対処）
-/// 5. 開いた fd を `fstat` して通常ファイルであることを確認する。macOS ではさらに fd の実パスが
-///    ルートの実パス配下であることを確認する（多層防御）
+/// 5. 開いた fd を `fstat` して通常ファイルであることを確認し、fd の実パスが最初に確定したルートの
+///    実パス配下であることも確認する（ルート自体の移動対策。両 OS）
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_confined_impl(
     root: &Path,
@@ -412,17 +434,34 @@ fn open_confined_impl(
             candidate: candidate.to_path_buf(),
         });
     }
-    #[cfg(target_os = "macos")]
-    {
-        let real = fd_real_path(&fd).map_err(|source| PathRejection::Unresolvable {
-            candidate: candidate.to_path_buf(),
-            source,
-        })?;
-        if !real.starts_with(&canon_root) {
-            return Err(escapes());
-        }
-    }
+    ensure_real_path_under(&fd, &canon_root, candidate)?;
     Ok((File::from(fd), first))
+}
+
+/// 開いた fd の実パスが、最初に確定したルートの実パス配下であることを確認する（fail-closed）。
+///
+/// 検証後にルートのディレクトリ自体がルート外へ移動された場合、fd 起点の `openat` は移動後の
+/// ディレクトリ内のファイルを開けてしまう。fd の実パスを最初に確定した `canon_root` と比較して
+/// 拒否する。実パスを得られない場合（Linux で `/proc` が使えない等）も拒否する。
+/// Linux は `/proc/self/fd`、macOS は `F_GETPATH` を使う（REQ-39・TASK-39.4-1）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_real_path_under(
+    fd: &rustix::fd::OwnedFd,
+    canon_root: &Path,
+    candidate: &Path,
+) -> Result<(), PathRejection> {
+    let real = fd_real_path(fd).map_err(|source| PathRejection::Unresolvable {
+        candidate: candidate.to_path_buf(),
+        source,
+    })?;
+    if real.starts_with(canon_root) {
+        Ok(())
+    } else {
+        Err(PathRejection::Escapes {
+            candidate: candidate.to_path_buf(),
+            kind: EscapeKind::Symlink,
+        })
+    }
 }
 
 /// fd 自身の実パスを得る（Linux: `/proc/self/fd/<fd>` の `read_link`）。
@@ -443,6 +482,70 @@ fn fd_real_path(fd: &rustix::fd::OwnedFd) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 検証後にルートのディレクトリがルート外へ移動された場合、開いた fd の実パスが
+    /// 最初のルート配下でなくなり拒否される（REQ-39・TASK-39.4-1。Linux・macOS）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn req39_real_path_check_rejects_root_moved_away() {
+        use rustix::fs::{Mode, OFlags, openat};
+        let base = std::env::temp_dir().join(format!("fandhe-guard-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir ws");
+        std::fs::create_dir_all(base.join("elsewhere")).expect("mkdir elsewhere");
+        std::fs::write(base.join("ws/f.txt"), b"x").expect("write");
+        let canon_root = std::fs::canonicalize(base.join("ws")).expect("canon");
+        let root_fd = rustix::fs::open(
+            &canon_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open root");
+        let fd = openat(
+            &root_fd,
+            "f.txt",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open file");
+        let cand = Path::new("f.txt");
+        assert!(ensure_real_path_under(&fd, &canon_root, cand).is_ok());
+        std::fs::rename(base.join("ws"), base.join("elsewhere/ws")).expect("move root away");
+        match ensure_real_path_under(&fd, &canon_root, cand) {
+            Err(PathRejection::Escapes {
+                kind: EscapeKind::Symlink,
+                ..
+            }) => {}
+            other => panic!("expected Escapes, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dotted_absolute_escape_is_classified_absolute() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-dots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir ws");
+        std::fs::write(base.join("secret.txt"), b"s").expect("write");
+        let ws = base.join("ws");
+        // 絶対パスが `..` でルートの外へ出る: 字句的にも外なので Absolute。
+        let cand = ws.join("../secret.txt");
+        match safe_join(&ws, &cand) {
+            Err(PathRejection::Escapes { kind, .. }) => assert_eq!(kind, EscapeKind::Absolute),
+            other => panic!("expected Escapes(Absolute), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lexical_normalize_cases() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(lexical_normalize(Path::new("/a/../..")), PathBuf::from("/"));
+        assert_eq!(lexical_normalize(Path::new("../x")), PathBuf::from("../x"));
+    }
 
     #[test]
     fn lexical_normalization_cases() {
