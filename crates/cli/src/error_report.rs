@@ -39,7 +39,7 @@ use fandhe_edge_data::eval_freeze::FreezeError;
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchError;
-use std::io::Write;
+use std::io::{self, Write};
 
 /// 終了コードごとの固定の英語 message（データを含まない）。
 ///
@@ -69,17 +69,25 @@ pub trait ToErrorReport {
 
 /// `report` を JSON 1 行で `out` へ書き、終了コードを返す。
 ///
-/// `report.code` は書き換えず返す（`Ok` を含む）。書き込みに失敗した場合は
-/// 追記・リトライをせず [`ExitCode::RuntimeError`] を返す（1 呼び出し 1 JSON
-/// を壊さない。`write_error_report` の保証に依存）。
-#[must_use]
-pub fn emit_error_report<W: Write>(out: &mut W, report: &ErrorReport) -> ExitCode {
-    write_error_report(out, report).unwrap_or(ExitCode::RuntimeError)
+/// `report.code` は書き換えず返す（`Ok` を含む）。
+///
+/// # Errors
+/// 書き込み・flush の失敗は `io::Error` として呼び出し側へ伝える。
+/// `ExitCode::RuntimeError` へ丸めない（正常に出力できた `runtime_error`
+/// の報告と区別するため）。部分書き込み後は出力が壊れているため、呼び出し
+/// 側は後続の出力を打ち切ること（`write_error_report` の契約）。
+pub fn emit_error_report<W: Write>(out: &mut W, report: &ErrorReport) -> io::Result<ExitCode> {
+    write_error_report(out, report)
 }
 
 /// 層のエラーを変換して [`emit_error_report`] で書く薄いヘルパー。
-#[must_use]
-pub fn emit_error<W: Write, E: ToErrorReport + ?Sized>(out: &mut W, err: &E) -> ExitCode {
+///
+/// # Errors
+/// [`emit_error_report`] と同じ（書き込み失敗を `io::Error` で伝える）。
+pub fn emit_error<W: Write, E: ToErrorReport + ?Sized>(
+    out: &mut W,
+    err: &E,
+) -> io::Result<ExitCode> {
     emit_error_report(out, &err.to_error_report())
 }
 
@@ -181,9 +189,9 @@ mod tests {
         }
     }
 
-    /// REQ-21・REQ-33: 書き込み失敗時は `RuntimeError`（追記しない）。
+    /// REQ-21・REQ-33: 書き込み失敗は `Err` で伝播し、`RuntimeError` へ丸めない。
     #[test]
-    fn req21_emit_returns_runtime_error_when_write_fails() {
+    fn req21_emit_propagates_io_error_when_write_fails() {
         struct FailingWriter;
         impl Write for FailingWriter {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
@@ -194,10 +202,8 @@ mod tests {
             }
         }
         let report = ErrorReport::new(ExitCode::InvalidInput, "invalid input");
-        assert_eq!(
-            emit_error_report(&mut FailingWriter, &report),
-            ExitCode::RuntimeError
-        );
+        let error = emit_error_report(&mut FailingWriter, &report).unwrap_err();
+        assert_eq!(error.to_string(), "simulated");
     }
 
     /// REQ-21: 成功時は `report.code` をそのまま返す（`Ok` も素通し）。
@@ -206,7 +212,7 @@ mod tests {
         for code in ExitCode::ALL {
             let mut buffer: Vec<u8> = Vec::new();
             let report = ErrorReport::new(code, default_message(code));
-            assert_eq!(emit_error_report(&mut buffer, &report), code);
+            assert_eq!(emit_error_report(&mut buffer, &report).unwrap(), code);
             assert_eq!(buffer.iter().filter(|b| **b == b'\n').count(), 1);
         }
     }

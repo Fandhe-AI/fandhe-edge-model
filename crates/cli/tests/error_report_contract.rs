@@ -21,7 +21,7 @@ const MARKER: &str = "sk-test-dummy-secret-marker";
 /// 出力が 1 行の JSON で、期待どおりの `code`・戻り値になっていること。
 fn assert_emitted(report: &ErrorReport, name: &str, numeric: u8) -> String {
     let mut buffer: Vec<u8> = Vec::new();
-    let code = emit_error_report(&mut buffer, report);
+    let code = emit_error_report(&mut buffer, report).unwrap();
     assert_eq!(code, report.code);
     assert_eq!(code.code(), numeric);
     assert_eq!(
@@ -81,7 +81,7 @@ fn check<E: ToErrorReport>(err: &E, name: &str, numeric: u8) -> ErrorReport {
     );
     assert_emitted(&report, name, numeric);
     let mut buffer: Vec<u8> = Vec::new();
-    assert_eq!(emit_error(&mut buffer, err), report.code);
+    assert_eq!(emit_error(&mut buffer, err).unwrap(), report.code);
     report
 }
 
@@ -190,7 +190,7 @@ fn req21_error_json_does_not_leak_data_or_credentials() {
         let line = err.to_error_report().to_json_line().unwrap();
         assert!(!line.contains(MARKER), "leaked: {line}");
         let mut buffer: Vec<u8> = Vec::new();
-        let _ = emit_error(&mut buffer, err);
+        emit_error(&mut buffer, err).unwrap();
         assert!(!String::from_utf8(buffer).unwrap().contains(MARKER));
     }
 
