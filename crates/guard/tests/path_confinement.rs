@@ -7,7 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_guard::path::{EscapeKind, PathRejection, open_confined, safe_join};
+#[cfg(unix)]
+use fandhe_edge_guard::path::open_confined;
+use fandhe_edge_guard::path::{EscapeKind, PathRejection, safe_join};
 
 /// 一時ディレクトリ（Drop で削除）。外部 crate を使わない。
 struct Sandbox {
@@ -205,6 +207,7 @@ fn req39_absolute_under_root_via_symlink_is_symlink_kind() {
 }
 
 /// 検証と open を一体で行う経路（TOCTOU 対策。REQ-39）。ルート配下のファイルは開ける。
+#[cfg(unix)]
 #[test]
 fn req39_open_confined_opens_inside_file() {
     let sb = Sandbox::new("open_ok");
@@ -231,4 +234,26 @@ fn req39_open_confined_rejects_outside() {
         open_confined(&sb.workspace(), Path::new("../outside/secret_marker.txt")),
         EscapeKind::ParentTraversal,
     );
+}
+
+/// ディレクトリ・FIFO は通常ファイルではないため open せず拒否し、FIFO でも停止しない（REQ-39）。
+#[cfg(unix)]
+#[test]
+fn req39_open_confined_rejects_non_regular_files_without_hanging() {
+    let sb = Sandbox::new("open_nonreg");
+    let fifo = sb.workspace().join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    for name in ["pipe", "pkg"] {
+        match open_confined(&sb.workspace(), Path::new(name)) {
+            Err(e @ PathRejection::NotRegularFile { .. }) => {
+                assert_eq!(e.reason_code(), "not_regular_file");
+                assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+            }
+            other => panic!("expected NotRegularFile for {name}, got {other:?}"),
+        }
+    }
 }

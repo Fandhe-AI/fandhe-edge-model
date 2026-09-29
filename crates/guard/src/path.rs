@@ -8,8 +8,11 @@
 //!
 //! - CLI の `infer --package` や、パッケージ内の `onnx_file` を開く前に、後続の TASK-39.4-2
 //!   （#159）が本モジュールを呼ぶ（CLI 引数への組み込みと `invalid_input` の E2E は #159 の責務）
-//! - 検査の順序は「経路 → サイズ → 形式」。返した [`ConfinedPath`] を
-//!   `fandhe_edge_core::fs` の読み込み関数で開き、サイズ上限（TASK-39.5）・形式の検査へ渡す
+//! - 検査の順序は「経路 → サイズ → 形式」。ファイルを読む場合は [`open_confined`] が返す
+//!   [`File`] を使い、サイズ上限（TASK-39.5）・形式の検査へ渡す。[`ConfinedPath`] を
+//!   `fandhe_edge_core::fs` 等でパスから開き直してはならない（検証後に親ディレクトリを
+//!   symlink へ差し替えられる TOCTOU が残る）。[`safe_join`] 単体はパスの検証のみで、
+//!   開く処理の安全性は保証しない
 //!
 //! # 判定（fail-closed）
 //!
@@ -22,13 +25,19 @@
 //! `link/../..` のように symlink の後ろへ `..` を置く形は、字句判定側で拒否しうる。安全側の
 //! 偽陽性として許容する。
 //!
-//! # 残る TOCTOU
+//! # 残る TOCTOU（[`open_confined`]）
 //!
-//! [`safe_join`] 単体では、正準化してから開くまでの間に symlink を差し替えられる余地が残る。
-//! 読み込む側は [`open_confined`] を使う。open 後に開いたファイルの実体（dev / inode）が
-//! ルート配下で再解決した実体と一致することを確認し、差し替えで外部ファイルを開いた場合は
-//! 拒否する。`openat`・`O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存
-//! （`libc` 等）が必要で未承認のため使わない。
+//! `openat`・`O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存（`libc` 等）が
+//! 必要で未承認のため使わない。代わりに、通常ファイル検証つき（`O_NONBLOCK`・FIFO / デバイスの
+//! 拒否。`fandhe_edge_core::fs`）で開いた後、開いた fd 自身の実体を検査する。
+//!
+//! - Linux: `/proc/self/fd/<fd>` が指す実パスがルート配下であることを確認する。fd に対する
+//!   検査のため、検証後の差し替えでは外部ファイルを通せない
+//! - macOS: std だけで fd の実パスを取れないため、open 後にパスを再解決し dev / inode の一致を
+//!   確認する。再解決と比較の間の差し替えは検出できない残余リスクがあり、`F_GETPATH`
+//!   （`libc` 依存の承認）または `openat` 方式は依存承認後の課題とする
+//! - その他の OS（Windows 等）: 実体を確認する手段がないため [`PathRejection::UnsupportedPlatform`]
+//!   で拒否する（fail-closed。M10 時点で対象外）
 //!
 //! 拒否結果は [`PathRejection::exit_code`] と [`PathRejection::reason_code`] で、REQ-21 の
 //! 終了コード（`invalid_input`=64 等）と機械可読な理由コードへ写せる。
@@ -84,6 +93,10 @@ pub enum PathRejection {
         candidate: PathBuf,
         source: io::Error,
     },
+    /// 通常ファイルではない（FIFO・デバイス・ディレクトリ等。読み込みの無期限停止を避ける）。
+    NotRegularFile { candidate: PathBuf },
+    /// 開いたファイルの実体を検証できない OS のため拒否する（fail-closed）。
+    UnsupportedPlatform,
 }
 
 /// 権限・資源・中断など環境起因の失敗だけを実行時エラー（70）とし、それ以外は
@@ -107,7 +120,9 @@ impl PathRejection {
         match self {
             PathRejection::EmptyPath
             | PathRejection::RootNotDirectory
+            | PathRejection::NotRegularFile { .. }
             | PathRejection::Escapes { .. } => ExitCode::InvalidInput,
+            PathRejection::UnsupportedPlatform => ExitCode::RuntimeError,
             PathRejection::RootUnresolvable { source }
             | PathRejection::Unresolvable { source, .. } => io_exit_code(source),
         }
@@ -121,6 +136,8 @@ impl PathRejection {
             PathRejection::RootNotDirectory => "root_not_directory",
             PathRejection::Escapes { .. } => "path_escapes_root",
             PathRejection::Unresolvable { .. } => "path_unresolvable",
+            PathRejection::NotRegularFile { .. } => "not_regular_file",
+            PathRejection::UnsupportedPlatform => "unsupported_platform",
         }
     }
 }
@@ -145,6 +162,12 @@ impl fmt::Display for PathRejection {
                     "path cannot be resolved: {}: {source}",
                     candidate.display()
                 )
+            }
+            PathRejection::NotRegularFile { candidate } => {
+                write!(f, "path is not a regular file: {}", candidate.display())
+            }
+            PathRejection::UnsupportedPlatform => {
+                write!(f, "confined open is not supported on this platform")
             }
         }
     }
@@ -250,57 +273,91 @@ pub fn safe_join(root: &Path, candidate: &Path) -> Result<ConfinedPath, PathReje
     }
 }
 
-/// 検証と open を一体で行い、開いたファイルがルート配下の実体であることを確認して返す。
+/// 検証と open を一体で行い、開いたファイル自身がルート配下の実体であることを確認して返す。
 ///
 /// [`safe_join`] 単体では検証から open までの間に親ディレクトリを symlink へ差し替えられる
-/// （TOCTOU）。本関数は (1) [`safe_join`] で検証、(2) そのパスを open、(3) 開いた
-/// ファイルハンドルの実体（unix では dev / inode）が、open 後に再解決・再検証した
-/// ルート配下のパスの実体と一致することを確認する。差し替えで外部ファイルを開いた場合は
-/// 実体が一致せず拒否する（fail-closed）。呼び出し側は返した [`File`] だけを読み、
-/// パスを再度 open しないこと。
+/// （TOCTOU）。本関数は (1) [`safe_join`] で検証、(2) 通常ファイル検証つき（FIFO・デバイスを
+/// `O_NONBLOCK` と種別確認で拒否）で open、(3) 開いた fd の実体を検査する。検査方法と
+/// OS ごとの残余リスクはモジュールドキュメントの「残る TOCTOU」を参照。呼び出し側は返した
+/// [`File`] だけを読み、パスを再度 open しないこと。
 ///
-/// `openat` / `O_NOFOLLOW` によるディレクトリハンドル相対 open は新規依存（`libc` 等）が
-/// 必要で未承認のため使わない（依存追加はユーザー承認事項）。
+/// unix 以外では [`PathRejection::UnsupportedPlatform`] で拒否する（fail-closed）。
 pub fn open_confined(root: &Path, candidate: &Path) -> Result<(File, ConfinedPath), PathRejection> {
+    #[cfg(not(unix))]
+    {
+        let _ = (root, candidate);
+        Err(PathRejection::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        open_confined_unix(root, candidate)
+    }
+}
+
+#[cfg(unix)]
+fn open_confined_unix(
+    root: &Path,
+    candidate: &Path,
+) -> Result<(File, ConfinedPath), PathRejection> {
     let first = safe_join(root, candidate)?;
-    let file = File::open(first.as_path()).map_err(|source| PathRejection::Unresolvable {
-        candidate: candidate.to_path_buf(),
-        source,
-    })?;
-    // open 後にもう一度解決し直す。差し替えが起きていればここで外れるか、実体が食い違う。
-    let second = safe_join(root, candidate)?;
+    let file =
+        fandhe_edge_core::fs::open_regular_file_for_read(first.as_path()).map_err(|e| match e {
+            fandhe_edge_core::fs::FsError::NotRegularFile { .. } => PathRejection::NotRegularFile {
+                candidate: candidate.to_path_buf(),
+            },
+            fandhe_edge_core::fs::FsError::Read { source, .. } => PathRejection::Unresolvable {
+                candidate: candidate.to_path_buf(),
+                source,
+            },
+            // FsError は non_exhaustive。未知の失敗は fail-closed で入力不正として扱う。
+            _ => PathRejection::Unresolvable {
+                candidate: candidate.to_path_buf(),
+                source: io::Error::from(io::ErrorKind::InvalidInput),
+            },
+        })?;
     let escaped = || PathRejection::Escapes {
         candidate: candidate.to_path_buf(),
         kind: EscapeKind::Symlink,
     };
-    let opened_meta = file
-        .metadata()
-        .map_err(|source| PathRejection::Unresolvable {
+    let canon_root =
+        std::fs::canonicalize(root).map_err(|source| PathRejection::RootUnresolvable { source })?;
+
+    // Linux: 開いた fd 自身の実パスを検査する（パスの再解決を挟まない）。
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd_link = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let real = std::fs::read_link(&fd_link).map_err(|source| PathRejection::Unresolvable {
             candidate: candidate.to_path_buf(),
             source,
         })?;
-    let resolved_meta =
-        std::fs::metadata(second.as_path()).map_err(|source| PathRejection::Unresolvable {
-            candidate: candidate.to_path_buf(),
-            source,
-        })?;
-    if !same_object(&opened_meta, &resolved_meta) {
-        return Err(escaped());
+        if !real.starts_with(&canon_root) {
+            return Err(escaped());
+        }
+        Ok((file, ConfinedPath(real)))
     }
-    Ok((file, second))
-}
 
-#[cfg(unix)]
-fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-// unix 以外は実体同一性を std だけでは取れないため、長さと更新時刻の一致で代用する
-// （検証環境は Mac のみ。REQ-39。Windows 対応時に見直す）。
-#[cfg(not(unix))]
-fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    // その他の unix（macOS）: open 後に再解決し、dev / inode の一致を確認する（残余リスクあり）。
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let second = safe_join(root, candidate)?;
+        let opened = file
+            .metadata()
+            .map_err(|source| PathRejection::Unresolvable {
+                candidate: candidate.to_path_buf(),
+                source,
+            })?;
+        let resolved =
+            std::fs::metadata(second.as_path()).map_err(|source| PathRejection::Unresolvable {
+                candidate: candidate.to_path_buf(),
+                source,
+            })?;
+        if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
+            return Err(escaped());
+        }
+        Ok((file, second))
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +397,19 @@ mod tests {
             PathRejection::RootNotDirectory.reason_code(),
             "root_not_directory"
         );
+        let nrf = PathRejection::NotRegularFile {
+            candidate: PathBuf::from("x"),
+        };
+        assert_eq!(nrf.reason_code(), "not_regular_file");
+        assert_eq!(nrf.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(
+            PathRejection::UnsupportedPlatform.reason_code(),
+            "unsupported_platform"
+        );
+        assert_eq!(
+            PathRejection::UnsupportedPlatform.exit_code(),
+            ExitCode::RuntimeError
+        );
         let denied = PathRejection::Unresolvable {
             candidate: PathBuf::from("x"),
             source: io::Error::from(io::ErrorKind::PermissionDenied),
@@ -356,21 +426,6 @@ mod tests {
         }
         assert_eq!(EscapeKind::Symlink.name(), "symlink");
         assert_eq!(EscapeKind::Absolute.name(), "absolute");
-    }
-
-    /// 別実体のファイルは同一実体と判定されない（open 後の実体照合の根拠。REQ-39）。
-    #[test]
-    fn same_object_distinguishes_files() {
-        let dir = std::env::temp_dir().join(format!("guard_same_object_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let (a, b) = (dir.join("a"), dir.join("b"));
-        std::fs::write(&a, b"x").expect("write");
-        std::fs::write(&b, b"x").expect("write");
-        let ma = std::fs::metadata(&a).expect("meta");
-        let mb = std::fs::metadata(&b).expect("meta");
-        assert!(same_object(&ma, &ma));
-        assert!(!same_object(&ma, &mb));
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
