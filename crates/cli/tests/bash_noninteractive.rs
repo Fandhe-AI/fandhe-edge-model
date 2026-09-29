@@ -1101,6 +1101,63 @@ fn req36_run_record_redacts_text_and_id_values() {
     }
 }
 
+/// 未知のオプション・位置引数は（CLI が拒否する場合でも）本文を記録に残さず伏せ字にする。
+#[test]
+fn req36_run_record_redacts_unknown_tokens_and_positionals() {
+    let dir = record_dir("unknown");
+    let d = dir.to_str().unwrap();
+    let body = "echo '{\"code\":\"invalid_input\"}'\nexit 64";
+    let o = run_with_fake_bin_args(
+        "unknown",
+        body,
+        &[
+            "SECRET-BODY-pos",
+            "--bogus",
+            "SECRET-VAL",
+            "--package=SECRET-PKG",
+        ],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"<redacted>\",\"<redacted>\",\"<redacted>\",\"--package=<redacted>\"],"),
+        "{rec}"
+    );
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// パス値が UTF-8 として不正なら固定値へ置き換わり、記録は妥当な JSON のままになる。
+#[test]
+fn req36_run_record_invalid_utf8_path_arg_is_replaced() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = record_dir("badpath");
+    let bindir = record_dir("badpath-bin");
+    let bin = bindir.join("fake-bin");
+    std::fs::write(&bin, "#!/bin/sh\necho '{\"code\":\"ok\"}'\nexit 0\n").expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let bad = std::ffi::OsStr::from_bytes(b"p\xff\xfe");
+    let out = Command::new("sh")
+        .arg(script_path())
+        .arg("--package")
+        .arg(bad)
+        .env("FANDHE_EDGE_BIN", &bin)
+        .env("FANDHE_EDGE_RECORD_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains("\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"<invalid utf-8>\"],"),
+        "{rec}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bindir).ok();
+}
+
 /// 非ゼロ終了・stderr の引用符とタブがエスケープされて残る。
 #[test]
 fn req36_run_record_captures_nonzero_exit_and_stderr() {

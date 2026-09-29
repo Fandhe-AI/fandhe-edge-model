@@ -47,7 +47,8 @@
 #   返す値）・stdout（呼び出し元が受け取る正規化後の全体。バッチの複数行も 1 文字列）・
 #   stderr（中継する CLI の stderr。診断行 exit_code=<N> は含めない）・stderr_replaced
 #   （UTF-8 として不正または NUL を含む stderr を固定文字列へ置き換えたとき true）。
-#   データ本文の混入防止（security.md）: `--text` と `--id` の値は `<redacted>` に伏せる
+#   データ本文の混入防止（security.md）: command は許可リスト方式。記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値（UTF-8 として不正なら `<invalid utf-8>`）だけで、
+#   --text・--id の値・未知のトークン・位置引数は `<redacted>` に伏せる
 #   （id は利用者入力で個人情報を含みうるため。infer 成功時の stdout に含まれる id は CLI の契約出力を
 #   そのまま記録するもので、呼び出し元が既に受け取っている）。入力ファイルの中身は読まず、環境変数は
 #   記録しない。記録を要求されたのに保存できなければ runtime_error(70)（fail-closed）。CLI 起動前の
@@ -107,12 +108,25 @@ json_escape_file() {
     json_escape "$_t" <"$1"
 }
 
-# 引数 1 つを記録の command 配列へ追加する（記録を要求されたときだけ）
+# 引数 1 つを記録の command 配列へ追加する（記録を要求されたときだけ）。呼び出し側は
+# 固定のオプション名か伏せ字だけを渡す（許可リスト方式。入力本文を記録に残さない。security.md）
 rec_dir=${FANDHE_EDGE_RECORD_DIR:-}
 rec_cmd='"fandhe-edge","infer"'
 rec_add() {
     if [ -n "$rec_dir" ]; then
         rec_cmd="$rec_cmd,\"$(printf '%s' "$1" | json_escape 0)\""
+    fi
+}
+
+# パス値（--package・--input-file・--out の値）を記録へ追加する。UTF-8 として不正なら
+# 不正な JSON を作らないよう固定値へ置き換える（stderr・stdout の検査と同じ方針）
+rec_add_path() {
+    if [ -n "$rec_dir" ]; then
+        if printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            rec_add "$1"
+        else
+            rec_add "<invalid utf-8>"
+        fi
     fi
 }
 
@@ -126,25 +140,26 @@ redact_next=0
 for a in ${1+"$@"}; do
     if [ "$skip" -eq 1 ]; then
         skip=0
-        # 記録では --text・--id の値（入力本文・利用者の id）を伏せる（TASK-36.1-2）
-        if [ "$redact_next" -eq 1 ]; then
-            redact_next=0
-            rec_add "<redacted>"
-        else
-            rec_add "$a"
-        fi
+        # 記録は許可リスト方式（TASK-36.1-2）。パス値（--package・--input-file・--out）以外の
+        # 値（--text・--id の入力本文・利用者の id、未知オプションの値）は伏せる
+        case "$redact_next" in
+            1) redact_next=0; rec_add_path "$a" ;;
+            *) rec_add "<redacted>" ;;
+        esac
         continue
     fi
     case "$a" in
-        --input-file) batch=1; skip=1; rec_add "$a" ;;
-        --input-file=*) batch=1; rec_add "$a" ;;
-        --out) out_requested=1; skip=1; rec_add "$a" ;;
-        --out=*) out_requested=1; rec_add "$a" ;;
-        --text | --id) skip=1; redact_next=1; rec_add "$a" ;;
+        --input-file) batch=1; skip=1; redact_next=1; rec_add "$a" ;;
+        --input-file=*) batch=1; rec_add "--input-file=<redacted>" ;;
+        --out) out_requested=1; skip=1; redact_next=1; rec_add "$a" ;;
+        --out=*) out_requested=1; rec_add "--out=<redacted>" ;;
+        --package) skip=1; redact_next=1; rec_add "$a" ;;
+        --package=*) rec_add "--package=<redacted>" ;;
+        --text | --id) skip=1; redact_next=0; rec_add "$a" ;;
         --text=*) rec_add "--text=<redacted>" ;;
         --id=*) rec_add "--id=<redacted>" ;;
-        --package) skip=1; rec_add "$a" ;;
-        *) rec_add "$a" ;;
+        --help | -h) rec_add "$a" ;;
+        *) rec_add "<redacted>" ;;
     esac
 done
 
