@@ -84,12 +84,15 @@
 //! supervisor は確定（`rename`）の直前までキャンセルを確認し、確定後に届いた
 //! キャンセルは無視して成功を報告する。Rust 側は stdin を閉じた後も supervisor の
 //! 終了状態と結果 JSON に従って分類する: 成功 JSON なら [`TrainRunEnd::Completed`]
-//! （確定済み。`Cancelling` → `Completed`）、それ以外（エラー JSON・終了状態の
-//! 不整合を含む。壁時計超過を除く）は [`TrainRunEnd::Cancelled`]。所定のキャンセル
-//! 応答（exit 70・`runtime_error`・固定メッセージ）を確認できたときだけ
-//! [`CancelStop::Cooperative`]、確認できなければ [`CancelStop::Unconfirmed`] とし、
-//! [`CancelledRun::out_dir_residue`] で残置を報告する（クラッシュを協調完了として
-//! 隠さない。どちらの場合も成果物は確定していない）。
+//! （確定済み。`Cancelling` → `Completed`）、所定のキャンセル応答（exit 70・
+//! `runtime_error`・固定メッセージ）は [`CancelStop::Cooperative`]、別のエラー JSON
+//! （`invalid_request` 等の入力エラー）はキャンセル完了と断定せずエラー結果のまま
+//! [`TrainRunEnd::Completed`] で返す。クラッシュ・終了状態の不整合は
+//! [`CancelStop::Unconfirmed`] とし、[`CancelledRun::out_dir_residue`] で残置を
+//! 報告する（クラッシュを協調完了として隠さない）。`SIGKILL` 後・応答未確認の
+//! いずれでも、`out_dir` が公開済みの可能性（`NonEmpty`）か判定不能（`Unknown`）なら
+//! `Cancelled` とせず [`TrainProcessError::CancelOutcomeUnconfirmed`] を返す
+//! （「公開されている ⇔ 成功報告」の契約。fail-closed）。
 //!
 //! ## 責務分担
 //!
@@ -1435,7 +1438,7 @@ pub fn run_train_cancellable(
                     &mut cancel_signalled,
                 ) {
                     CancelStep::Cancelled(run) => {
-                        return Ok(TrainRunEnd::Cancelled(forced_kill_run(run, request)));
+                        return forced_kill_run(run, request).map(TrainRunEnd::Cancelled);
                     }
                     // キャンセルが間に合わず子は既に終了していた（kill しない）、
                     // または協調キャンセルで自ら終了した。通常経路へ合流し、
@@ -1492,7 +1495,7 @@ pub fn run_train_cancellable(
                 &mut cancel_signalled,
             ) {
                 CancelStep::Cancelled(run) => {
-                    return Ok(TrainRunEnd::Cancelled(forced_kill_run(run, request)));
+                    return forced_kill_run(run, request).map(TrainRunEnd::Cancelled);
                 }
                 CancelStep::AlreadyExited(status) | CancelStep::ExitedAfterSignal(status) => {
                     pre_exited = Some(status);
@@ -1600,9 +1603,32 @@ pub fn run_train_cancellable(
 
 /// `SIGKILL` フォールバックの `Cancelled` に `out_dir` の読み取り専用の観測結果を
 /// 付ける（削除はしない。REQ-34・#145）。
+///
+/// 「公開されている ⇔ 成功報告」の契約を守るため、公開済みの可能性がある
+/// （[`OutDirResidue::NonEmpty`]）か公開状態を判定できない（[`OutDirResidue::Unknown`]）
+/// 場合は `Cancelled` と断定せず [`TrainProcessError::CancelOutcomeUnconfirmed`] で返す
+/// （成功応答を受け取る前に強制停止したため成功とも言えない。fail-closed。
+/// codex/review 指摘 P1）。
 #[cfg(unix)]
-fn forced_kill_run(run: CancelledRun, request: &TrainRequest) -> CancelledRun {
-    run.with_out_dir_residue(inspect_out_dir_residue(request))
+fn forced_kill_run(
+    run: CancelledRun,
+    request: &TrainRequest,
+) -> Result<CancelledRun, TrainProcessError> {
+    let residue = inspect_out_dir_residue(request);
+    ensure_not_published(residue)?;
+    Ok(run.with_out_dir_residue(residue))
+}
+
+/// 残置の観測結果が「未公開」（`Absent`・`EmptyReservation`）と確認できる場合だけ
+/// `Ok`。公開済みの可能性・判定不能ならキャンセル完了と断定しない。
+#[cfg(unix)]
+fn ensure_not_published(residue: OutDirResidue) -> Result<(), TrainProcessError> {
+    match residue {
+        OutDirResidue::Absent | OutDirResidue::EmptyReservation => Ok(()),
+        OutDirResidue::NonEmpty | OutDirResidue::Unknown => {
+            Err(TrainProcessError::CancelOutcomeUnconfirmed { residue })
+        }
+    }
 }
 
 /// 子の終了・回収後の結果分類（[`finish_run`]）の入力。
@@ -1623,9 +1649,11 @@ struct FinishInput<'a> {
 ///
 /// パイプを閉じていない（`cancel_signalled == false`）なら従来どおり。閉じた後は、
 /// supervisor の報告に従う: 成功 JSON は確定済みなので `Completed`、所定の
-/// キャンセル応答（[`is_cancel_ack`]）は `Cancelled(Cooperative)`、それ以外
-/// （クラッシュ・別のエラー JSON・終了状態の不整合）は `Cancelled(Unconfirmed)` で
-/// 残置を観測して報告する（成果物は確定していないが、予約解放の証拠が無い）。壁時計超過（`WallTimeout`）はキャンセルより優先し、
+/// キャンセル応答（[`is_cancel_ack`]）は `Cancelled(Cooperative)`、別のエラー JSON
+/// （`invalid_request` 等）は `Completed`（エラー結果のまま保持。キャンセル完了と
+/// 断定しない）、クラッシュ・終了状態の不整合は `Cancelled(Unconfirmed)` で
+/// 残置を観測して報告する（予約解放の証拠が無い）。残置が公開済み・判定不能なら
+/// `Cancelled` とせず [`TrainProcessError::CancelOutcomeUnconfirmed`]。壁時計超過（`WallTimeout`）はキャンセルより優先し、
 /// 従来どおりエラーで返す。
 #[cfg(unix)]
 fn conclude_run(
@@ -1637,9 +1665,11 @@ fn conclude_run(
     // 所定のキャンセル応答でない終了は `Unconfirmed` とし、残置を観測して報告する
     // （supervisor のクラッシュ等を協調キャンセル完了として扱わない）。
     let unconfirmed = || {
+        let residue = inspect_out_dir_residue(request);
+        ensure_not_published(residue)?;
         Ok(TrainRunEnd::Cancelled(CancelledRun::unconfirmed(
             started.elapsed(),
-            inspect_out_dir_residue(request),
+            residue,
         )))
     };
     match finished {
@@ -1649,7 +1679,10 @@ fn conclude_run(
         Ok(run) if is_cancel_ack(&run) => Ok(TrainRunEnd::Cancelled(CancelledRun::cooperative(
             started.elapsed(),
         ))),
-        Ok(_) => unconfirmed(),
+        // supervisor が返したキャンセル応答以外のエラー結果（`invalid_request` 等の
+        // 入力エラーを含む）は隠さず、そのまま呼び出し元へ返す（キャンセル要求後に
+        // 検証が先に失敗した場合の入力エラーを保持する。codex/review 指摘 P1）。
+        Ok(run) => Ok(TrainRunEnd::Completed(run)),
         Err(e @ TrainProcessError::WallTimeout { .. }) => Err(e),
         Err(_) if cancel_signalled => unconfirmed(),
         Err(e) => Err(e),
@@ -2533,12 +2566,52 @@ mod tests {
             }
             _ => panic!("expected Cancelled(Cooperative)"),
         }
+        // 別のエラー JSON は隠さず `Completed`（エラー結果）のまま保持する。
         match conclude_run(Ok(run_of("worker crashed")), true, started, &request) {
-            Ok(TrainRunEnd::Cancelled(run)) => {
-                assert_eq!(run.stop(), CancelStop::Unconfirmed);
-                assert_eq!(run.out_dir_residue(), Some(OutDirResidue::Absent));
+            Ok(TrainRunEnd::Completed(run)) => {
+                assert!(matches!(run.outcome, TrainOutcome::Error(_)));
+                assert_eq!(run.exit_code, ExitCode::RuntimeError);
             }
-            _ => panic!("expected Cancelled(Unconfirmed)"),
+            _ => panic!("expected Completed(Error)"),
+        }
+    }
+
+    /// REQ-34・#145: 入力エラー（`invalid_request`）がキャンセル送出後でも
+    /// 呼び出し元へ伝わる。
+    #[cfg(unix)]
+    #[test]
+    fn conclude_run_preserves_invalid_request_after_cancel_signal() {
+        let request = test_request(None);
+        let json = r#"{"status":"error","code":"invalid_request","message":"bad field"}"#;
+        let outcome =
+            classify_exit(ExitCode::InvalidInput, json.as_bytes(), &request).expect("classify");
+        let run = TrainRun {
+            outcome,
+            exit_code: ExitCode::InvalidInput,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        match conclude_run(Ok(run), true, Instant::now(), &request) {
+            Ok(TrainRunEnd::Completed(run)) => {
+                assert_eq!(run.exit_code, ExitCode::InvalidInput);
+                assert!(matches!(run.outcome, TrainOutcome::Error(_)));
+            }
+            _ => panic!("expected Completed(Error invalid_request)"),
+        }
+    }
+
+    /// REQ-34・#145: 公開済みの可能性・判定不能な残置は `Cancelled` と断定しない。
+    #[cfg(unix)]
+    #[test]
+    fn ensure_not_published_rejects_published_or_unknown_residue() {
+        assert!(ensure_not_published(OutDirResidue::Absent).is_ok());
+        assert!(ensure_not_published(OutDirResidue::EmptyReservation).is_ok());
+        for residue in [OutDirResidue::NonEmpty, OutDirResidue::Unknown] {
+            assert!(matches!(
+                ensure_not_published(residue),
+                Err(TrainProcessError::CancelOutcomeUnconfirmed { residue: r }) if r == residue
+            ));
         }
     }
 

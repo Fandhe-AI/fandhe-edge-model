@@ -9,6 +9,8 @@
 
 use fandhe_edge_core::exitcode::ExitCode;
 
+use crate::process::OutDirResidue;
+
 /// 学習リクエストの組み立て（[`crate::request::TrainRequest::new`]・
 /// [`crate::request::TrainRequest::from_json_slice`]）で発生するエラー。
 ///
@@ -498,6 +500,11 @@ pub enum TrainProcessError {
     /// [`crate::process::run_train`]（`cfg(not(unix))` 版）は子プロセスを
     /// 一切起動せず即座に本バリアントを返す（fail-closed）。
     UnsupportedPlatform,
+    /// キャンセル後に `SIGKILL` で止めた（または所定のキャンセル応答を確認できなかった）
+    /// 際、`out_dir` が公開済みの可能性がある（`NonEmpty`）か判定できない
+    /// （`Unknown`）ため、キャンセル完了と断定できない（「公開されている ⇔ 成功報告」
+    /// の契約。成功応答も受け取っていない。REQ-34・#145。fail-closed）。
+    CancelOutcomeUnconfirmed { residue: OutDirResidue },
 }
 
 impl std::fmt::Display for TrainProcessError {
@@ -560,6 +567,12 @@ impl std::fmt::Display for TrainProcessError {
                     "worker process exit code {process:?} does not match result-derived exit code {expected:?}"
                 )
             }
+            TrainProcessError::CancelOutcomeUnconfirmed { residue } => {
+                write!(
+                    f,
+                    "cancellation outcome is unconfirmed: out_dir may be published ({residue:?})"
+                )
+            }
             TrainProcessError::UnsupportedPlatform => {
                 write!(
                     f,
@@ -604,6 +617,7 @@ impl TrainProcessError {
             | TrainProcessError::StdoutIncomplete
             | TrainProcessError::StderrIncomplete
             | TrainProcessError::ExitCodeMismatch { .. }
+            | TrainProcessError::CancelOutcomeUnconfirmed { .. }
             | TrainProcessError::UnsupportedPlatform => ExitCode::RuntimeError,
             TrainProcessError::WallTimeout { .. } => ExitCode::LimitExceeded,
             TrainProcessError::Request(inner) => inner.exit_code(),
