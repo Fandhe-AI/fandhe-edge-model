@@ -6,7 +6,9 @@
 //!
 //! # 責務境界
 //!
-//! - 判定は先頭 [`FORMAT_PREFIX_BYTES`] だけを読む。pickle 等の中身は解釈・展開・実行しない
+//! - 固定シグネチャの判定は先頭 [`FORMAT_PREFIX_BYTES`] だけを読む。ONNX は top-level の tag と長さだけを
+//!   seek しながら読み、LEN の中身は読まない（読み取り量はフィールド数に比例する小さな値）。
+//!   pickle 等の中身は解釈・展開・実行しない
 //! - ONNX の判定は protobuf の top-level 構造の「形の検査」であり、意味の検証ではない。
 //!   最終的な解析の成否は読み込み時の ONNX Runtime に委ねる。`external_data` の拒否は対象外
 //! - 経路の閉じ込め（TASK-39.4）・サイズ上限（TASK-39.5）は本モジュールの責務外。
@@ -20,11 +22,11 @@ use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::Read as _;
+use std::fs::File;
+use std::io::{self, Read as _, Seek, SeekFrom};
 use std::path::Path;
 
-/// 判定に読む先頭バイト数の上限（64 KiB）。固定シグネチャと ONNX の top-level 数フィールドを
-/// 見るのに十分で、ファイル全体（最大 1GB 級）は読まない。
+/// 固定シグネチャの判定に読む先頭バイト数の上限（64 KiB）。ファイル全体（最大 1GB 級）は読まない。
 pub const FORMAT_PREFIX_BYTES: usize = 64 * 1024;
 
 /// 判定できるファイル形式。
@@ -69,122 +71,230 @@ fn model_field_wire_type(field: u64) -> Option<u64> {
     }
 }
 
-/// varint を読み `(値, 消費バイト数)` を返す。10 バイト以内に終わらなければ `Err(false)`、
-/// prefix の終端で途切れたら `Err(true)`。
-fn read_varint(buf: &[u8]) -> Result<(u64, usize), bool> {
+/// varint の読み取り失敗の種類。
+enum VarintError {
+    /// 10 バイト以内に終わらない・10 バイト目が 0x00/0x01 以外（u64 に収まらない）。
+    Invalid,
+    /// 入力が途中で尽きた（入力元が `limited` なら判定用 prefix の打ち切り、そうでなければ実ファイル末尾）。
+    Short,
+}
+
+/// varint を読み `(値, 消費バイト数)` を返す。
+fn read_varint(buf: &[u8]) -> Result<(u64, usize), VarintError> {
     let mut value: u64 = 0;
     for i in 0..10usize {
         let Some(&b) = buf.get(i) else {
-            return Err(true);
+            return Err(VarintError::Short);
         };
         let shift = (i as u32).saturating_mul(7);
         // 10 バイト目は u64 の最上位 1 ビットだけを持てる。0x00・0x01 以外は u64 に収まらない
         // 値（または継続ビット付き）であり、切り詰めて受理せず拒否する。
         if i == 9 && b > 0x01 {
-            return Err(false);
+            return Err(VarintError::Invalid);
         }
         value |= u64::from(b & 0x7f).checked_shl(shift).unwrap_or(0);
         if b & 0x80 == 0 {
             return Ok((value, i.saturating_add(1)));
         }
     }
-    Err(false)
+    Err(VarintError::Invalid)
 }
 
-/// prefix 上で ModelProto の top-level フィールドを走査し、ONNX の形かを判定する。
-/// 先頭が `ir_version`（tag 0x08・値 1..=0xFFFF）で、全フィールドが既知の
-/// (field, wire type) であり、LEN が `total_len` を超えず、`graph`（field 7）が現れれば真。
-/// prefix の終端で途切れた場合は、それまでに条件を満たしていれば真とする。
-fn looks_like_onnx_model(prefix: &[u8], total_len: u64) -> bool {
-    if prefix.first() != Some(&0x08) {
-        return false;
+/// ONNX 走査が任意オフセットの少量のバイトを読むための入力元。
+trait ByteSource {
+    /// `offset` から最大 `buf.len()` バイトを読み、読めた長さを返す。実ファイル末尾で短くなる。
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+    /// 短い読み取りが判定用 prefix の人為的な打ち切りに由来しうるなら真
+    /// （実ファイル末尾での切断と区別する）。
+    fn limited(&self) -> bool;
+}
+
+/// 先頭 prefix だけを持つ入力元（純関数 [`detect_format`] 用）。
+struct SliceSource<'a> {
+    prefix: &'a [u8],
+    total_len: u64,
+}
+
+impl ByteSource for SliceSource<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let Ok(start) = usize::try_from(offset) else {
+            return Ok(0);
+        };
+        let Some(rest) = self.prefix.get(start..) else {
+            return Ok(0);
+        };
+        let n = rest.len().min(buf.len());
+        if let (Some(dst), Some(src)) = (buf.get_mut(..n), rest.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        Ok(n)
     }
-    let mut pos: usize = 0;
+
+    fn limited(&self) -> bool {
+        u64::try_from(self.prefix.len()).is_ok_and(|l| l < self.total_len)
+    }
+}
+
+/// ファイルを seek しながら読む入力元。LEN フィールドの中身は読まずに飛ばすため、
+/// 読み取り量はフィールド数に比例する小さな値に収まる（ファイル全体は読まない）。
+struct FileSource<'a>(&'a mut File);
+
+impl ByteSource for FileSource<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.seek(SeekFrom::Start(offset))?;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let Some(dst) = buf.get_mut(filled..) else {
+                break;
+            };
+            match self.0.read(dst) {
+                Ok(0) => break,
+                Ok(n) => filled = filled.saturating_add(n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
+
+    fn limited(&self) -> bool {
+        false
+    }
+}
+
+/// ONNX 走査の結果。
+enum OnnxScan {
+    /// ModelProto の形を最後まで確認できた。
+    Onnx,
+    /// ONNX ではない（不正な構造・実ファイル末尾での切断を含む）。
+    NotOnnx,
+    /// 判定用 prefix の打ち切り・走査回数の上限に達し、続きは未検査。
+    Exhausted {
+        seen_ir_version: bool,
+        seen_graph: bool,
+    },
+}
+
+/// トップレベルのフィールド数の上限（`metadata_props` 等の繰り返しを考慮した余裕値）。
+/// 超えたら未検査として扱う（無限走査を作らない。REQ-39）。
+const MAX_TOP_LEVEL_FIELDS: usize = 65_536;
+
+/// ModelProto の top-level フィールドを、LEN の中身を飛ばしながら末尾まで走査し、ONNX の形かを判定する。
+/// 先頭が `ir_version`（tag 0x08・値 1..=0xFFFF）で、全フィールドが既知の (field, wire type) であり、
+/// LEN が `total_len` を超えず、`graph`（field 7）が現れ、ちょうど `total_len` で終われば ONNX。
+fn scan_onnx_model<S: ByteSource>(src: &mut S, total_len: u64) -> io::Result<OnnxScan> {
+    let mut pos: u64 = 0;
     let mut seen_graph = false;
     let mut seen_ir_version = false;
-    while pos < prefix.len() {
-        let Some(rest) = prefix.get(pos..) else {
-            break;
+    for _ in 0..MAX_TOP_LEVEL_FIELDS {
+        if pos == total_len {
+            return Ok(if seen_ir_version && seen_graph {
+                OnnxScan::Onnx
+            } else {
+                OnnxScan::NotOnnx
+            });
+        }
+        let exhausted = OnnxScan::Exhausted {
+            seen_ir_version,
+            seen_graph,
         };
-        let (tag, n) = match read_varint(rest) {
+        let mut buf = [0u8; 10];
+        let n = src.read_at(pos, &mut buf)?;
+        if pos == 0 && buf.first() != Some(&0x08) {
+            return Ok(OnnxScan::NotOnnx);
+        }
+        let Some(head) = buf.get(..n) else {
+            return Ok(OnnxScan::NotOnnx);
+        };
+        let (tag, tag_len) = match read_varint(head) {
             Ok(v) => v,
-            Err(truncated) => return truncated && seen_ir_version && seen_graph,
+            Err(VarintError::Short) if src.limited() => return Ok(exhausted),
+            Err(_) => return Ok(OnnxScan::NotOnnx),
         };
         let field = tag >> 3;
         let wire = tag & 7;
         if model_field_wire_type(field) != Some(wire) {
-            return false;
+            return Ok(OnnxScan::NotOnnx);
         }
-        let Some(body_pos) = pos.checked_add(n) else {
-            return false;
+        let body_pos = pos.saturating_add(tag_len as u64);
+        let mut vbuf = [0u8; 10];
+        let vn = src.read_at(body_pos, &mut vbuf)?;
+        let Some(vhead) = vbuf.get(..vn) else {
+            return Ok(OnnxScan::NotOnnx);
         };
-        let Some(body) = prefix.get(body_pos..) else {
-            return false;
+        let (v, m) = match read_varint(vhead) {
+            Ok(v) => v,
+            Err(VarintError::Short) if src.limited() => return Ok(exhausted),
+            Err(_) => return Ok(OnnxScan::NotOnnx),
         };
+        let after = body_pos.saturating_add(m as u64);
         if wire == 0 {
-            let (v, m) = match read_varint(body) {
-                Ok(v) => v,
-                Err(truncated) => return truncated && seen_ir_version && seen_graph,
-            };
             if field == 1 {
                 if v == 0 || v > 0xFFFF {
-                    return false;
+                    return Ok(OnnxScan::NotOnnx);
                 }
                 seen_ir_version = true;
             }
-            let Some(next) = body_pos.checked_add(m) else {
-                return false;
-            };
-            pos = next;
+            pos = after;
         } else {
-            let (len, m) = match read_varint(body) {
-                Ok(v) => v,
-                Err(truncated) => return truncated && seen_ir_version && seen_graph,
-            };
-            let Some(start) = body_pos.checked_add(m) else {
-                return false;
-            };
-            let Some(end) = u64::try_from(start).ok().and_then(|s| s.checked_add(len)) else {
-                return false;
+            let Some(end) = after.checked_add(v) else {
+                return Ok(OnnxScan::NotOnnx);
             };
             if end > total_len {
-                return false;
+                return Ok(OnnxScan::NotOnnx);
             }
             // graph は長さを完全に読み、ファイル内に収まると確認できてから認める。
             if field == 7 {
                 seen_graph = true;
             }
-            match usize::try_from(end) {
-                Ok(e) if e <= prefix.len() => pos = e,
-                // LEN が prefix を超える場合は中身を読まず、ここまでの検査で判定する。
-                _ => return seen_ir_version && seen_graph,
-            }
+            pos = end;
         }
     }
-    seen_ir_version && seen_graph
+    Ok(OnnxScan::Exhausted {
+        seen_ir_version,
+        seen_graph,
+    })
+}
+
+/// 固定シグネチャ形式の判定。該当しなければ `None`。
+fn detect_signature(prefix: &[u8]) -> Option<FileFormat> {
+    if let [0x80, ver, ..] = prefix
+        && (2..=5).contains(ver)
+    {
+        return Some(FileFormat::Pickle);
+    }
+    if prefix.starts_with(b"\x93NUMPY") {
+        return Some(FileFormat::Npy);
+    }
+    if prefix.starts_with(b"PK\x03\x04") || prefix.starts_with(b"PK\x05\x06") {
+        return Some(FileFormat::Zip);
+    }
+    if prefix.starts_with(b"GGUF") {
+        return Some(FileFormat::Gguf);
+    }
+    None
 }
 
 /// 先頭バイトからファイル形式を判定する純関数。`prefix` はファイル先頭の有限長、
 /// `total_len` はメタデータ上のファイルサイズ。判定順は固定シグネチャ → ONNX 構造検査 → `Unknown`。
+///
+/// `prefix` がファイル全体（`prefix.len() >= total_len`）なら、途中で切れた protobuf は拒否する。
+/// `prefix` がファイルの一部だけの場合に限り、prefix の終端で打ち切られた続きは未検査として扱い、
+/// それまでに `ir_version` と `graph` を確認できていれば ONNX とする。
+/// ファイルに対する判定は [`check_file_format`] が LEN を飛ばして末尾まで走査する。
 pub fn detect_format(prefix: &[u8], total_len: u64) -> FileFormat {
-    if let [0x80, ver, ..] = prefix
-        && (2..=5).contains(ver)
-    {
-        return FileFormat::Pickle;
+    if let Some(f) = detect_signature(prefix) {
+        return f;
     }
-    if prefix.starts_with(b"\x93NUMPY") {
-        return FileFormat::Npy;
+    let mut src = SliceSource { prefix, total_len };
+    match scan_onnx_model(&mut src, total_len) {
+        Ok(OnnxScan::Onnx) => FileFormat::Onnx,
+        Ok(OnnxScan::Exhausted {
+            seen_ir_version: true,
+            seen_graph: true,
+        }) => FileFormat::Onnx,
+        _ => FileFormat::Unknown,
     }
-    if prefix.starts_with(b"PK\x03\x04") || prefix.starts_with(b"PK\x05\x06") {
-        return FileFormat::Zip;
-    }
-    if prefix.starts_with(b"GGUF") {
-        return FileFormat::Gguf;
-    }
-    if looks_like_onnx_model(prefix, total_len) {
-        return FileFormat::Onnx;
-    }
-    FileFormat::Unknown
 }
 
 /// 許可する形式の集合。[`FileFormat::Unknown`] は入れられない（fail-closed）。
@@ -310,12 +420,23 @@ pub fn check_file_format(
             source,
         })
     };
+    let mut file = file;
     let total_len = file.metadata().map_err(read_err)?.len();
     let mut prefix = Vec::new();
-    file.take(FORMAT_PREFIX_BYTES as u64)
+    (&mut file)
+        .take(FORMAT_PREFIX_BYTES as u64)
         .read_to_end(&mut prefix)
         .map_err(read_err)?;
-    allowlist.check(detect_format(&prefix, total_len))
+    let detected = match detect_signature(&prefix) {
+        Some(f) => f,
+        // 先頭 prefix に graph が無い大きな ModelProto も判定できるよう、LEN を飛ばして末尾まで走査する。
+        // 走査回数の上限で打ち切られた場合は未検査のままなので Unknown（fail-closed）。
+        None => match scan_onnx_model(&mut FileSource(&mut file), total_len).map_err(read_err)? {
+            OnnxScan::Onnx => FileFormat::Onnx,
+            _ => FileFormat::Unknown,
+        },
+    };
+    allowlist.check(detected)
 }
 
 #[cfg(test)]
@@ -338,13 +459,25 @@ mod tests {
         assert_eq!(d(&b), FileFormat::Onnx);
     }
 
-    /// REQ-39・TASK-39.2-1: graph が prefix を超える巨大 LEN でも中身を読まず合格する。
+    /// REQ-39・TASK-39.2-1: prefix がファイルの一部で、graph が prefix を超える巨大 LEN のときは
+    /// 未検査の続きとして合格する。実サイズより大きい LEN は拒否。
     #[test]
     fn req39_onnx_large_graph_beyond_prefix() {
         let prefix = [0x08, 0x07, 0x3a, 0x80, 0x80, 0x80, 0x04];
         assert_eq!(detect_format(&prefix, 1 << 30), FileFormat::Onnx);
-        // 実サイズより大きい LEN は拒否。
         assert_eq!(detect_format(&prefix, 100), FileFormat::Unknown);
+    }
+
+    /// REQ-39・TASK-39.2-1: 実ファイル末尾で切れた protobuf は、graph の後でも拒否する。
+    #[test]
+    fn req39_truncated_at_real_eof_after_graph_is_unknown() {
+        assert_eq!(
+            d(&[0x08, 0x07, 0x3a, 0x00, 0x12, 0x80]),
+            FileFormat::Unknown
+        ); // 値の varint が途中
+        assert_eq!(d(&[0x08, 0x07, 0x3a, 0x00, 0x92]), FileFormat::Unknown); // tag が途中
+        assert_eq!(d(&[0x08, 0x07, 0x3a, 0x00, 0x12]), FileFormat::Unknown); // 長さが無い
+        assert_eq!(d(&[0x08, 0x07, 0x3a, 0x00, 0x08]), FileFormat::Unknown); // 値が無い
     }
 
     /// REQ-39・TASK-39.2-1: 固定シグネチャ形式。
@@ -383,6 +516,11 @@ mod tests {
     #[test]
     fn req39_truncated_graph_length_is_unknown() {
         assert_eq!(d(&[0x08, 0x07, 0x3a, 0x80]), FileFormat::Unknown);
+        // prefix がファイルの一部でも graph の長さが確定していなければ認めない。
+        assert_eq!(
+            detect_format(&[0x08, 0x07, 0x3a, 0x80], 1 << 30),
+            FileFormat::Unknown
+        );
         assert!(!FormatAllowlist::onnx_only().contains(d(&[0x08, 0x07, 0x3a, 0x80])));
     }
 
