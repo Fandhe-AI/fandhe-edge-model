@@ -34,8 +34,16 @@
 //! ラベル ID だけが異なる場合は本タスクでは注記しない（後続の検討事項。REQ-26 の
 //! `regression` モジュールの `ComparisonPremise` を参照）。
 //!
-//! 未実装: データ量水準別報告（TASK-29.3・#110）、group 数、JSON 直列化
-//! （CLI 層。`evaluate` 配線は #140）。
+//! データ量水準別の効果報告（REQ-29 境界値・TASK-29.3・issue #110）: 学習データの行数を
+//! 3 水準（100 件未満 / 100 件以上 3,000 件未満 / 3,000 件以降）へ分け、PoC-11 の学習曲線
+//! （行数系列）で見た傾向を [`DataVolumeReport`] として [`DiagnosticReport::data_volume`] に
+//! 載せる。100 は中間水準、3,000 は頭打ち水準に入る（「未満」は境界を含まず、「以降」は含む）。
+//! 傾向は「効果が大きい」「頭打ち」の 2 種類のみ。100 件未満は PoC-11 の最小測定点（100）
+//! より下で測定値ではなく、REQ-29 の境界値の記述に沿って「効果が大きい」と報告する。
+//! 傾向の目安であり保証ではなく、合否判定には使わない（精度の目安は REQ-29 で検討中）。
+//! 数えるのは学習データの行数のみで、複製行の割引（`unique_inputs`）は行わない。
+//!
+//! 未実装: group 数、JSON 直列化（CLI 層。`evaluate` 配線は #140）。
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -585,12 +593,125 @@ pub struct DiagnosticReport {
     eval: BasicStats,
     confusable_pairs: Vec<ConfusablePair>,
     limitations: Vec<DiagnosticLimitation>,
+    data_volume: DataVolumeReport,
+}
+
+/// 少量水準の上限（この値未満が [`DataVolumeLevel::Below100`]。REQ-29 境界値・TASK-29.3）。
+pub const DATA_VOLUME_SMALL_UPPER: u64 = 100;
+
+/// 頭打ち水準の下限（この値以降が [`DataVolumeLevel::From3000`]。REQ-29 境界値・TASK-29.3）。
+pub const DATA_VOLUME_PLATEAU_LOWER: u64 = 3000;
+
+/// 学習データ量の水準（REQ-29 境界値・TASK-29.3・issue #110）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DataVolumeLevel {
+    /// 100 件未満（PoC-11 の最小測定点より下。測定値ではない）。
+    Below100,
+    /// 100 件以上 3,000 件未満。
+    From100To3000,
+    /// 3,000 件以降。
+    From3000,
+}
+
+impl DataVolumeLevel {
+    /// 機械可読な ID（CLI の JSON 出力用。英語・固定）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DataVolumeLevel::Below100 => "below_100",
+            DataVolumeLevel::From100To3000 => "from_100_to_3000",
+            DataVolumeLevel::From3000 => "from_3000",
+        }
+    }
+}
+
+/// 行数を増やしたときの効果の傾向（PoC-11 の学習曲線で見た傾向。保証ではない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RowCountEffect {
+    /// 行数の効果が大きい。
+    Large,
+    /// 頭打ち。
+    Plateau,
+}
+
+impl RowCountEffect {
+    /// 機械可読な ID（英語・固定）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RowCountEffect::Large => "large",
+            RowCountEffect::Plateau => "plateau",
+        }
+    }
+}
+
+/// データ量水準別の効果報告（診断専用。合否判定には使わない）。
+///
+/// 構築は [`data_volume_report`] に集約する。[`diagnostic_report`] が学習データの行数から
+/// 作り [`DiagnosticReport::data_volume`] で返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataVolumeReport {
+    train_rows: u64,
+    level: DataVolumeLevel,
+    effect: RowCountEffect,
+}
+
+impl DataVolumeReport {
+    /// 分類に使った学習データの行数。
+    pub fn train_rows(&self) -> u64 {
+        self.train_rows
+    }
+
+    /// データ量水準。
+    pub fn level(&self) -> DataVolumeLevel {
+        self.level
+    }
+
+    /// 行数の効果の傾向。
+    pub fn effect(&self) -> RowCountEffect {
+        self.effect
+    }
+
+    /// 水準ごとの固定英文（ラベル値・入力本文を含めない）。
+    pub fn note(&self) -> &'static str {
+        match self.level {
+            DataVolumeLevel::Below100 => {
+                "training row count is below 100; row count had a large effect on accuracy in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+            }
+            DataVolumeLevel::From100To3000 => {
+                "training row count is from 100 to below 3000; row count had a large effect on accuracy in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+            }
+            DataVolumeLevel::From3000 => {
+                "training row count is 3000 or more; accuracy plateaued in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+            }
+        }
+    }
+}
+
+/// 学習データの行数からデータ量水準と効果の傾向を分類する（REQ-29 境界値・TASK-29.3）。
+///
+/// 整数比較のみの純関数で失敗しない（0 も [`DataVolumeLevel::Below100`] に入る）。
+/// [`diagnostic_report`] から呼ばれる。
+pub fn data_volume_report(train_rows: u64) -> DataVolumeReport {
+    let (level, effect) = if train_rows < DATA_VOLUME_SMALL_UPPER {
+        (DataVolumeLevel::Below100, RowCountEffect::Large)
+    } else if train_rows < DATA_VOLUME_PLATEAU_LOWER {
+        (DataVolumeLevel::From100To3000, RowCountEffect::Large)
+    } else {
+        (DataVolumeLevel::From3000, RowCountEffect::Plateau)
+    };
+    DataVolumeReport {
+        train_rows,
+        level,
+        effect,
+    }
 }
 
 /// 診断レポートの読み方の限界（REQ-29 異常系・TASK-29.2・issue #109）。
 ///
-/// PoC-11「限界と所見」5 項に対応する。`#[non_exhaustive]` のため、ラベル集合の相違や
-/// データ量水準（TASK-29.3）などの限界を後から追加しても破壊的変更にならない。
+/// PoC-11「限界と所見」5 項に対応する。`#[non_exhaustive]` のため、ラベル集合の相違などの
+/// 限界を後から追加しても破壊的変更にならない。データ量水準は常に分類できるため限界注記では
+/// なく [`DiagnosticReport::data_volume`] で扱う（TASK-29.3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticLimitation {
@@ -641,6 +762,11 @@ impl DiagnosticReport {
     /// 診断の限界の注記（付与が無ければ空）。
     pub fn limitations(&self) -> &[DiagnosticLimitation] {
         &self.limitations
+    }
+
+    /// データ量水準別の効果報告（学習データの行数で分類。TASK-29.3）。
+    pub fn data_volume(&self) -> &DataVolumeReport {
+        &self.data_volume
     }
 }
 
@@ -724,17 +850,75 @@ pub fn diagnostic_report(
         return Err(DiagnosticsError::EvalLabelSupportMismatch { index });
     }
     let confusable_pairs = confusable_pairs(metrics, top_k)?;
+    let data_volume = data_volume_report(train.n_rows);
     Ok(DiagnosticReport {
         train,
         eval,
         confusable_pairs,
         limitations: Vec::new(),
+        data_volume,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-29 境界値・TASK-29.3: 水準の境界（100 は中間、3000 は頭打ち）。
+    #[test]
+    fn data_volume_boundaries() {
+        let cases: [(u64, DataVolumeLevel, RowCountEffect); 9] = [
+            (1, DataVolumeLevel::Below100, RowCountEffect::Large),
+            (99, DataVolumeLevel::Below100, RowCountEffect::Large),
+            (100, DataVolumeLevel::From100To3000, RowCountEffect::Large),
+            (101, DataVolumeLevel::From100To3000, RowCountEffect::Large),
+            (2999, DataVolumeLevel::From100To3000, RowCountEffect::Large),
+            (3000, DataVolumeLevel::From3000, RowCountEffect::Plateau),
+            (3001, DataVolumeLevel::From3000, RowCountEffect::Plateau),
+            (7000, DataVolumeLevel::From3000, RowCountEffect::Plateau),
+            (
+                MAX_EVAL_RECORDS as u64,
+                DataVolumeLevel::From3000,
+                RowCountEffect::Plateau,
+            ),
+        ];
+        for (n, level, effect) in cases {
+            let r = data_volume_report(n);
+            assert_eq!(r.train_rows(), n);
+            assert_eq!(r.level(), level, "n={n}");
+            assert_eq!(r.effect(), effect, "n={n}");
+        }
+    }
+
+    /// REQ-29・TASK-29.3: 0 でも panic せず少量水準に入る。
+    #[test]
+    fn data_volume_zero_rows_is_below_100() {
+        let r = data_volume_report(0);
+        assert_eq!(r.level(), DataVolumeLevel::Below100);
+        assert_eq!(r.effect(), RowCountEffect::Large);
+    }
+
+    /// REQ-29・TASK-29.3: ID と固定英文の具体値。
+    #[test]
+    fn data_volume_ids_and_notes() {
+        assert_eq!(DataVolumeLevel::Below100.as_str(), "below_100");
+        assert_eq!(DataVolumeLevel::From100To3000.as_str(), "from_100_to_3000");
+        assert_eq!(DataVolumeLevel::From3000.as_str(), "from_3000");
+        assert_eq!(RowCountEffect::Large.as_str(), "large");
+        assert_eq!(RowCountEffect::Plateau.as_str(), "plateau");
+        assert_eq!(
+            data_volume_report(50).note(),
+            "training row count is below 100; row count had a large effect on accuracy in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+        );
+        assert_eq!(
+            data_volume_report(100).note(),
+            "training row count is from 100 to below 3000; row count had a large effect on accuracy in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+        );
+        assert_eq!(
+            data_volume_report(3000).note(),
+            "training row count is 3000 or more; accuracy plateaued in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)"
+        );
+    }
 
     /// REQ-29・TASK-29.1-1: 1 行・1 ラベルの境界。
     #[test]
