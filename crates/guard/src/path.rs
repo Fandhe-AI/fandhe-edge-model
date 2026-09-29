@@ -214,8 +214,13 @@ fn lexical_normalize(p: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                // ルート直下の `..` はルートに留まる（POSIX）。相対パスの先頭では保持する。
-                if !out.pop() && !out.has_root() {
+                // 末尾が通常の成分のときだけ打ち消す。ルート直下の `..` はルートに留まり（POSIX）、
+                // 相対パスの先頭や `..` の直後では `..` を保持する（連続する `..` を潰さない）。
+                let ends_with_normal =
+                    matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if ends_with_normal {
+                    out.pop();
+                } else if !out.has_root() {
                     out.push("..");
                 }
             }
@@ -545,6 +550,23 @@ mod tests {
         );
         assert_eq!(lexical_normalize(Path::new("/a/../..")), PathBuf::from("/"));
         assert_eq!(lexical_normalize(Path::new("../x")), PathBuf::from("../x"));
+        assert_eq!(
+            lexical_normalize(Path::new("../..")),
+            PathBuf::from("../..")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("../../x")),
+            PathBuf::from("../../x")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/../../x")),
+            PathBuf::from("/x")
+        );
+        assert_eq!(lexical_normalize(Path::new("a/..")), PathBuf::new());
     }
 
     #[test]
