@@ -491,6 +491,28 @@ fn req33_existing_dirs_are_rejected_with_64() {
     assert!(e.cli_calls().is_empty());
 }
 
+/// 書き込み不能な既存の空 --out-dir は、CLI を起動する前に runtime_error（70）の JSON で返す（REQ-21・REQ-33）。
+#[test]
+fn req33_unwritable_out_dir_returns_runtime_error_json() {
+    let e = Env::new();
+    fs::create_dir_all(e.out()).expect("mkdir");
+    fs::set_permissions(e.out(), fs::Permissions::from_mode(0o555)).expect("chmod");
+    // root など権限を無視する実行環境では前提が成り立たないため、その場合だけ検証を省く
+    let writable = fs::write(e.out().join("probe"), "x").is_ok();
+    if writable {
+        fs::remove_file(e.out().join("probe")).ok();
+    } else {
+        let o = e.run(&e.base_args(), &[]);
+        assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
+        assert_eq!(
+            o.stdout,
+            "{\"code\":\"runtime_error\",\"message\":\"cannot write run record\"}\n"
+        );
+        assert!(e.cli_calls().is_empty());
+    }
+    fs::set_permissions(e.out(), fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
 /// 必須の欠落・未知のオプション・不正な --candidates は 64。
 #[test]
 fn req33_invalid_args_are_rejected_with_64() {

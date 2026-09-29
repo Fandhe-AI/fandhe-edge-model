@@ -214,6 +214,8 @@ esac
 [ "$step_timeout" -le 86400 ] || step_timeout=3600
 
 mkdir -p -- "$out_dir" || fail 70 runtime_error "cannot create output directory"
+# 書き込み不能な既存の空ディレクトリを工程実行の前に検出する（set -e で JSON なしに終了させない。REQ-21・REQ-33）
+{ : >"$out_dir/run.meta.json"; } 2>/dev/null || fail 70 runtime_error "cannot write run record"
 
 work=$(mktemp -d) || fail 70 runtime_error "cannot create temporary directory"
 child=
@@ -451,9 +453,12 @@ launcher_label=$DEFAULT_LAUNCHER
 [ "$override" = false ] || launcher_label=override
 [ "$override" = false ] || hint=test_harness
 
-printf '{"started_utc":"%s","ended_utc":"%s","exit_code":%s,"failed_step":%s,"sandbox_exec":"%s","sandbox_profile":"%s","sandbox_exec_override":%s,"evidence_hint":"%s","steps":[%s]}\n' \
+if ! printf '{"started_utc":"%s","ended_utc":"%s","exit_code":%s,"failed_step":%s,"sandbox_exec":"%s","sandbox_profile":"%s","sandbox_exec_override":%s,"evidence_hint":"%s","steps":[%s]}\n' \
     "$started" "$ended" "$final_rc" "$failed_step" "$launcher_label" "$PROFILE" "$override" "$hint" "$steps_meta" \
-    >"$out_dir/run.meta.json"
+    >"$out_dir/run.meta.json" 2>/dev/null; then
+    # 記録の書き込み失敗も契約どおりの JSON（runtime_error・exit 70）で返す
+    fail 70 runtime_error "cannot write run record"
+fi
 
 printf '{"code":"%s","message":"%s","failed_step":%s,"steps":[%s],"sandbox_profile":"%s","sandbox_exec_override":%s,"run_meta":"run.meta.json"}\n' \
     "$top_code" "$msg" "$failed_step" "$steps_json" "$PROFILE" "$override"
