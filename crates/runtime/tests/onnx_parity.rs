@@ -116,16 +116,36 @@ fn check_kind(kind: ModelKind) {
     let inputs: Vec<&str> = cases.iter().map(|c| c.input.as_str()).collect();
     let batch = pipeline.infer_batch(&inputs).expect("infer_batch");
     let predict = pipeline.as_predict_fn();
+    // 最初の不一致で止めず全件を集計する（修正前後の不一致件数を記録できるようにする。
+    // docs/design/runtime-batch-mismatch-procedure.md）。記録するのはケース名と件数のみ。
+    let mut batch_mismatched: Vec<String> = Vec::new();
+    let mut fn_mismatched: Vec<String> = Vec::new();
     for ((c, single), b) in cases.iter().zip(&singles).zip(&batch) {
         let b = b.as_ref().expect("batch item");
-        assert_eq!(b, single, "{}: batch differs from single", c.name);
+        if b != single {
+            batch_mismatched.push(c.name.clone());
+        }
         let via_fn = predict(&c.input).expect("predict fn");
-        assert_eq!(
-            &via_fn, single,
-            "{}: predict fn differs from single",
-            c.name
-        );
+        if &via_fn != single {
+            fn_mismatched.push(c.name.clone());
+        }
     }
+    assert!(
+        batch_mismatched.is_empty(),
+        "{}: batch differs from single: {} of {} cases: {:?}",
+        kind.as_str(),
+        batch_mismatched.len(),
+        cases.len(),
+        batch_mismatched
+    );
+    assert!(
+        fn_mismatched.is_empty(),
+        "{}: predict fn differs from single: {} of {} cases: {:?}",
+        kind.as_str(),
+        fn_mismatched.len(),
+        cases.len(),
+        fn_mismatched
+    );
 }
 
 /// REQ-32 正常系: C1 の書き出し ONNX を推論ランタイムで読み、MLX 内推論と予測ラベルが全件一致する。
