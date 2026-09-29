@@ -12,7 +12,8 @@ mod proto_builder;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_runtime::export_exclusion::{
     CandidateDecision, EvidenceKind, ExclusionReason, ExportConfig, InferenceRuntime,
-    MAX_EXPORT_CANDIDATES, NumericFormat, ParityCase, ScreeningError, screen_candidate,
+    MAX_EXPORT_CANDIDATES, MAX_PARITY_CASES, NumericFormat, ParityCase, ScreeningError,
+    check_prediction_parity_with_clock, check_prediction_parity_within, screen_candidate,
     screen_candidate_from_path, screen_candidates,
 };
 use fandhe_edge_runtime::onnx::{ModelKind, OnnxBackend, OnnxLoadError};
@@ -21,6 +22,7 @@ use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -320,4 +322,70 @@ fn req39_parity_total_input_bytes_limited() {
             .expect_err("total bytes limit");
     assert!(matches!(e, ScreeningError::TotalInputTooLarge));
     assert_eq!(e.code(), "limit_exceeded");
+}
+
+/// REQ-39: ケース数の上限検査は早期除外（既知制約・未対応ランタイム・ケース 0 件）より先に行い、
+/// 構成によらず `limit_exceeded` になる。
+#[test]
+fn req39_case_limit_checked_before_early_exclusion() {
+    let cases: Vec<ParityCase<'_>> = (0..=MAX_PARITY_CASES)
+        .map(|_| ParityCase {
+            input: "a",
+            reference_label: 0,
+        })
+        .collect();
+    for config in [
+        ExportConfig {
+            kind: ModelKind::C3,
+            runtime: InferenceRuntime::Tract,
+            format: NumericFormat::Int8Dynamic,
+        },
+        ExportConfig {
+            kind: ModelKind::C1,
+            runtime: InferenceRuntime::OnnxRuntime,
+            format: NumericFormat::F16,
+        },
+        own_f32(ModelKind::C1),
+    ] {
+        let e = screen_candidate(config, never_load, &cases).expect_err("case limit");
+        assert!(matches!(e, ScreeningError::TooManyCases));
+        assert_eq!(e.code(), "limit_exceeded");
+    }
+}
+
+/// REQ-39: 照合全体の時間上限を超えたら停止する（上限 0 で最初の推論前に停止）。
+#[test]
+fn req39_parity_time_limit_stops() {
+    let f = fixture(ModelKind::C1);
+    let bytes = fs::read(&f.path).expect("read model");
+    let pipeline = from_bytes(&bytes, ModelKind::C1, f.max_bytes).expect("pipeline");
+    let labels = vec![0usize; f.inputs.len()];
+    let cases = parity_cases(&f, &labels);
+    assert!(!cases.is_empty());
+    let e =
+        check_prediction_parity_within(&pipeline, &cases, Duration::ZERO).expect_err("time limit");
+    assert!(matches!(e, ScreeningError::ParityTimeExceeded));
+    assert_eq!(e.code(), "limit_exceeded");
+}
+
+/// REQ-39: 最後の推論中に期限を超えた場合も結果を確定させず停止する（推論前は期限内、推論後に超過する時計で決定的に検証）。
+#[test]
+fn req39_parity_time_limit_checked_after_last_inference() {
+    let f = fixture(ModelKind::C1);
+    let bytes = fs::read(&f.path).expect("read model");
+    let pipeline = from_bytes(&bytes, ModelKind::C1, f.max_bytes).expect("pipeline");
+    let labels = vec![0usize; f.inputs.len()];
+    let cases = parity_cases(&f, &labels);
+    let one = cases.get(..1).expect("at least one case");
+    let limit = Duration::from_secs(1);
+    // 1 回目の確認（推論前）は期限内、2 回目（推論後）で超過する
+    let mut calls = 0u32;
+    let e = check_prediction_parity_with_clock(&pipeline, one, limit, || {
+        calls += 1;
+        if calls == 1 { Duration::ZERO } else { limit }
+    })
+    .expect_err("time limit after inference");
+    assert!(matches!(e, ScreeningError::ParityTimeExceeded));
+    assert_eq!(e.code(), "limit_exceeded");
+    assert_eq!(calls, 2);
 }

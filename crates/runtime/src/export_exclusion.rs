@@ -41,11 +41,15 @@ use crate::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// 1 回の [`screen_candidates`] が受け付ける候補数の上限（現実の組み合わせは 2 × 3 × 3 = 18）。
 pub const MAX_EXPORT_CANDIDATES: usize = 64;
 /// 1 候補あたりの照合ケース数の上限（バッチ推論の上限と同値。REQ-39）。
 pub const MAX_PARITY_CASES: usize = MAX_INFER_BATCH_LEN;
+/// 1 候補の予測照合全体の時間上限（REQ-39。暫定値。ケースごとの推論の合計に対する上限で、
+/// 各ケース推論の前に経過時間を確認する。1 件の推論自体は入力長の上限で有界）。
+pub const MAX_PARITY_DURATION: Duration = Duration::from_secs(60);
 
 /// 書き出し先の推論ランタイム。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +320,8 @@ pub enum ScreeningError {
     TooManyCases,
     /// 照合ケースの総入力バイト数が [`MAX_INFER_BATCH_TOTAL_BYTES`] を超えた（推論前に検査。REQ-39）。
     TotalInputTooLarge,
+    /// 照合全体の時間が [`MAX_PARITY_DURATION`] を超えた（REQ-39。処理を停止する）。
+    ParityTimeExceeded,
     /// 参照ラベルがクラス数の範囲外。
     ReferenceOutOfRange,
     /// 同じ構成が重複して渡された。
@@ -328,9 +334,10 @@ impl ScreeningError {
         match self {
             Self::Load(e) => e.code(),
             Self::Infer(e) => e.code(),
-            Self::TooManyCandidates | Self::TooManyCases | Self::TotalInputTooLarge => {
-                "limit_exceeded"
-            }
+            Self::TooManyCandidates
+            | Self::TooManyCases
+            | Self::TotalInputTooLarge
+            | Self::ParityTimeExceeded => "limit_exceeded",
             Self::ReferenceOutOfRange => "reference_out_of_range",
             Self::DuplicateCandidate => "duplicate_candidate",
         }
@@ -385,18 +392,12 @@ pub struct ParityReport {
     pub mismatched: usize,
 }
 
-/// 予測ラベルを参照と照合する。クラス数は予測のスコア列の長さから取る。
-///
-/// # Errors
-/// 参照ラベルがクラス数以上（`ReferenceOutOfRange`）、推論失敗（`Infer`）、ケース数超過。
-pub fn check_prediction_parity(
-    pipeline: &InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>,
-    cases: &[ParityCase<'_>],
-) -> Result<ParityReport, ScreeningError> {
+/// 照合ケースの件数と総入力バイト数を推論前に検査する（REQ-39）。除外判定より先に呼び、
+/// 構成によって上限エラーと除外記録に分かれないようにする。`infer_batch` の総量上限の迂回も防ぐ。
+fn validate_parity_cases(cases: &[ParityCase<'_>]) -> Result<(), ScreeningError> {
     if cases.len() > MAX_PARITY_CASES {
         return Err(ScreeningError::TooManyCases);
     }
-    // 総入力バイト数を推論前に checked 演算で集計する（`infer_batch` の総量上限の迂回を防ぐ。REQ-39）
     let mut total_bytes = 0usize;
     for case in cases {
         total_bytes = total_bytes
@@ -406,11 +407,62 @@ pub fn check_prediction_parity(
             return Err(ScreeningError::TotalInputTooLarge);
         }
     }
+    Ok(())
+}
+
+/// 予測ラベルを参照と照合する。クラス数は予測のスコア列の長さから取る。
+/// 照合全体の時間上限は [`MAX_PARITY_DURATION`]。
+///
+/// # Errors
+/// 参照ラベルがクラス数以上（`ReferenceOutOfRange`）、推論失敗（`Infer`）、ケース数・総量・時間の超過。
+pub fn check_prediction_parity(
+    pipeline: &InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>,
+    cases: &[ParityCase<'_>],
+) -> Result<ParityReport, ScreeningError> {
+    check_prediction_parity_within(pipeline, cases, MAX_PARITY_DURATION)
+}
+
+/// [`check_prediction_parity`] の時間上限を引数で受ける版（テストで上限を小さくするため）。
+///
+/// # Errors
+/// [`check_prediction_parity`] と同じ。
+pub fn check_prediction_parity_within(
+    pipeline: &InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>,
+    cases: &[ParityCase<'_>],
+    max_duration: Duration,
+) -> Result<ParityReport, ScreeningError> {
+    let started = Instant::now();
+    check_prediction_parity_with_clock(pipeline, cases, max_duration, || started.elapsed())
+}
+
+/// 経過時間の取得を `elapsed` で差し替えられる版（最後の推論中に期限を超える境界を決定的にテストするため）。
+/// 各推論の前後で経過時間を確認し、超過なら結果を確定せず停止する（fail-closed。REQ-39）。
+///
+/// # Errors
+/// [`check_prediction_parity`] と同じ。
+pub fn check_prediction_parity_with_clock<C>(
+    pipeline: &InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>,
+    cases: &[ParityCase<'_>],
+    max_duration: Duration,
+    mut elapsed: C,
+) -> Result<ParityReport, ScreeningError>
+where
+    C: FnMut() -> Duration,
+{
+    validate_parity_cases(cases)?;
     let mut mismatched = 0usize;
     for case in cases {
+        // 各推論の前に照合全体の期限を確認し、超過なら停止する（fail-closed。REQ-39）
+        if elapsed() >= max_duration {
+            return Err(ScreeningError::ParityTimeExceeded);
+        }
         let pred = pipeline
             .infer_one(case.input)
             .map_err(ScreeningError::Infer)?;
+        // 推論中に期限を超えた場合（最後のケースを含む）も結果を確定させず停止する
+        if elapsed() >= max_duration {
+            return Err(ScreeningError::ParityTimeExceeded);
+        }
         if case.reference_label >= pred.scores().len() {
             return Err(ScreeningError::ReferenceOutOfRange);
         }
@@ -436,7 +488,7 @@ fn excluded(
     })
 }
 
-/// 1 構成を判定する。`load` は遅延実行され、既知制約・未対応ランタイム・ケース 0 件では呼ばれない。
+/// 1 構成を判定する。ケースの件数・総量は除外判定より先に検査する。`load` は遅延実行され、既知制約・未対応ランタイム・ケース 0 件では呼ばれない。
 ///
 /// # Errors
 /// [`ScreeningError`]（除外ではなく処理全体を止める失敗）。
@@ -451,6 +503,8 @@ where
     )
         -> Result<InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>, OnnxLoadError>,
 {
+    // 早期除外より先にケースの件数・総量を検査する（構成によって結果が変わらないように。REQ-39）
+    validate_parity_cases(cases)?;
     if let Some(known) = known_infeasibility(&config) {
         return Ok(excluded(
             config,
@@ -467,9 +521,6 @@ where
             ExclusionReason::RuntimeNotAvailable,
             EvidenceKind::TestHarness,
         ));
-    }
-    if cases.len() > MAX_PARITY_CASES {
-        return Err(ScreeningError::TooManyCases);
     }
     if cases.is_empty() {
         return Ok(excluded(
@@ -521,6 +572,7 @@ pub fn screen_candidate_from_path(
     // 除外判定（既知制約・未対応ランタイム・ケース 0 件）より先にファイルの存在・サイズ・sha256 を
     // 検証する。欠落・破損・改ざんは除外に化けさせず全体停止にする（REQ-39 fail-closed）。
     // 形式不成立（`Exclude` 分類）だけは除外判定へ回すため、結果を保持して渡す。
+    validate_parity_cases(cases)?;
     let loaded = load_pipeline(config.kind, max_bytes, path, expected_sha256);
     let loaded = match loaded {
         Err(e) if classify_load_error(&e) == LoadErrorClass::Propagate => {
