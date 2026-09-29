@@ -31,11 +31,14 @@
 use crate::output::{
     definition_error_report, infer_input_error_report, judgment_error_report, write_error_report,
 };
+use fandhe_edge_core::artifact_meta::ArtifactMetaError;
 use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
+use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchError;
@@ -158,6 +161,38 @@ impl ToErrorReport for TrainProcessError {
     }
 }
 
+/// 経路の閉じ込めの拒否（REQ-39・TASK-39.4-2・#159）。`Display` は candidate の
+/// パスを含みうるため使わず、`reason_code` の固定語彙だけを出す。
+impl ToErrorReport for PathRejection {
+    fn to_error_report(&self) -> ErrorReport {
+        ErrorReport::new(
+            self.exit_code(),
+            format!("path rejected: {}", self.reason_code()),
+        )
+    }
+}
+
+/// `artifact.json` の解釈エラー。入力値を含めない固定文へ写す（REQ-39）。
+impl ToErrorReport for ArtifactMetaError {
+    fn to_error_report(&self) -> ErrorReport {
+        ErrorReport::new(ExitCode::InvalidInput, "artifact metadata is invalid")
+    }
+}
+
+/// 開いたファイルの上限付き読み込みの失敗。サイズ超過は `limit_exceeded`（REQ-39）、
+/// それ以外は実行時エラー。`Display` はパスを含むため使わない。
+impl ToErrorReport for FsError {
+    fn to_error_report(&self) -> ErrorReport {
+        match self {
+            FsError::TooLarge { .. } => ErrorReport::new(
+                ExitCode::LimitExceeded,
+                "artifact metadata exceeds size limit",
+            ),
+            _ => ErrorReport::new(ExitCode::RuntimeError, "cannot read artifact metadata"),
+        }
+    }
+}
+
 /// `SearchError` の `Display` は汎用の `E`・`Internal { detail }` を含みう
 /// るため使わず、終了コードごとの固定文にする。
 impl<E> ToErrorReport for SearchError<E> {
@@ -215,5 +250,48 @@ mod tests {
             assert_eq!(emit_error_report(&mut buffer, &report).unwrap(), code);
             assert_eq!(buffer.iter().filter(|b| **b == b'\n').count(), 1);
         }
+    }
+    /// REQ-39・REQ-21: 経路の拒否は invalid_input と固定 message で、候補パスを含まない。
+    #[test]
+    fn req39_path_rejection_maps_to_invalid_input_without_path() {
+        use fandhe_edge_guard::path::{EscapeKind, PathRejection};
+        let r = PathRejection::Escapes {
+            candidate: std::path::PathBuf::from("../secret/outside"),
+            kind: EscapeKind::ParentTraversal,
+        }
+        .to_error_report();
+        assert_eq!(r.code, ExitCode::InvalidInput);
+        assert_eq!(r.message, "path rejected: path_escapes_root");
+        let r = PathRejection::NotDirectory {
+            candidate: std::path::PathBuf::from("x"),
+        }
+        .to_error_report();
+        assert_eq!(r.message, "path rejected: not_directory");
+        assert_eq!(
+            PathRejection::UnsupportedPlatform.to_error_report().code,
+            ExitCode::RuntimeError
+        );
+    }
+
+    /// REQ-39: artifact.json の不正・サイズ超過・I/O 失敗の写像。
+    #[test]
+    fn req39_artifact_meta_and_fs_errors_map_to_fixed_reports() {
+        let r = ArtifactMetaError::Malformed.to_error_report();
+        assert_eq!(r.code, ExitCode::InvalidInput);
+        assert_eq!(r.message, "artifact metadata is invalid");
+        let r = FsError::TooLarge {
+            path: std::path::PathBuf::from("/secret/dir"),
+            size: 2,
+            limit: 1,
+        }
+        .to_error_report();
+        assert_eq!(r.code, ExitCode::LimitExceeded);
+        assert_eq!(r.message, "artifact metadata exceeds size limit");
+        let r = FsError::NotRegularFile {
+            path: std::path::PathBuf::from("/secret/dir"),
+        }
+        .to_error_report();
+        assert_eq!(r.code, ExitCode::RuntimeError);
+        assert!(!r.message.contains("secret"));
     }
 }

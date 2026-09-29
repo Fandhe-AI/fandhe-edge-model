@@ -6,8 +6,9 @@
 //!
 //! # 呼び出し文脈
 //!
-//! - CLI の `infer --package` や、パッケージ内の `onnx_file` を開く前に、後続の TASK-39.4-2
-//!   （#159）が本モジュールを呼ぶ（CLI 引数への組み込みと `invalid_input` の E2E は #159 の責務）
+//! - CLI の `infer --package` や、パッケージ内の `onnx_file` を開く前に、TASK-39.4-2
+//!   （#159）が [`crate::package`] 経由で本モジュールを呼ぶ（CLI 側の組み込みは
+//!   `fandhe_edge_cli::infer_guard`）
 //! - 検査の順序は「経路 → サイズ → 形式」。ファイルを読む場合は [`open_confined`] が返す
 //!   [`File`] を使い、サイズ上限（TASK-39.5）・形式の検査へ渡す。[`ConfinedPath`] を
 //!   `fandhe_edge_core::fs` 等でパスから開き直してはならない（検証後に親ディレクトリを
@@ -97,6 +98,9 @@ pub enum PathRejection {
     NotRegularFile { candidate: PathBuf },
     /// 開いたファイルの実体を検証できない OS のため拒否する（fail-closed）。
     UnsupportedPlatform,
+    /// ディレクトリであるべき対象（パッケージディレクトリ）がディレクトリでない
+    /// （`package::confine_package`。TASK-39.4-2・#159）。
+    NotDirectory { candidate: PathBuf },
 }
 
 /// 環境・資源起因の errno（Linux / macOS の値。生の値で判定し、追加の依存を持たない）。
@@ -140,6 +144,7 @@ impl PathRejection {
             PathRejection::EmptyPath
             | PathRejection::RootNotDirectory
             | PathRejection::NotRegularFile { .. }
+            | PathRejection::NotDirectory { .. }
             | PathRejection::Escapes { .. } => ExitCode::InvalidInput,
             PathRejection::UnsupportedPlatform => ExitCode::RuntimeError,
             PathRejection::RootUnresolvable { source }
@@ -157,6 +162,7 @@ impl PathRejection {
             PathRejection::Unresolvable { .. } => "path_unresolvable",
             PathRejection::NotRegularFile { .. } => "not_regular_file",
             PathRejection::UnsupportedPlatform => "unsupported_platform",
+            PathRejection::NotDirectory { .. } => "not_directory",
         }
     }
 }
@@ -187,6 +193,9 @@ impl fmt::Display for PathRejection {
             }
             PathRejection::UnsupportedPlatform => {
                 write!(f, "confined open is not supported on this platform")
+            }
+            PathRejection::NotDirectory { candidate } => {
+                write!(f, "path is not a directory: {}", candidate.display())
             }
         }
     }

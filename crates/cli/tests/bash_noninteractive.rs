@@ -36,7 +36,16 @@ fn script_path() -> PathBuf {
 }
 
 fn run_script(args: &[&str]) -> Out {
-    let mut child = Command::new("sh")
+    run_script_in(None, args)
+}
+
+/// カレントディレクトリを指定して起動する（`infer` の経路ガードは cwd を workspace とする。#159）。
+fn run_script_in(cwd: Option<&std::path::Path>, args: &[&str]) -> Out {
+    let mut cmd = Command::new("sh");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         // 独立したプロセスグループで起動し、タイムアウト時に子孫も終了できるようにする
         .process_group(0)
         .arg(script_path())
@@ -159,10 +168,18 @@ fn req36_no_args_still_reports_exit_code() {
 }
 
 /// スクリプトが非ゼロの終了コードを握りつぶさないこと。
+/// 経路ガード（#159）を通る有効なパッケージを置いた一時 workspace で実行し、スタブの 70 を確認する。
 /// #136 で工程が接続されたらこの期待を置き換える。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn req36_infer_nonzero_exit_is_propagated_via_sh() {
-    let o = run_script(&["--package", "p", "--text", "a"]);
+    let ws = std::env::temp_dir().join(format!("fandhe-noninteractive-{}-ws", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(ws.join("p")).expect("mkdir");
+    std::fs::write(ws.join("p/artifact.json"), r#"{"onnx_file":"model.onnx"}"#).expect("write");
+    std::fs::write(ws.join("p/model.onnx"), b"onnx").expect("write");
+    let o = run_script_in(Some(&ws), &["--package", "p", "--text", "a"]);
+    let _ = std::fs::remove_dir_all(&ws);
     assert_eq!(o.code, Some(70));
     let expected = expected_stdout(&ErrorReport::new(
         ExitCode::RuntimeError,
