@@ -23,7 +23,7 @@
 //!
 //! 250ms は目安であり合否条件ではない（TASK-31.1）。本モジュールは上限照合を呼ばず、
 //! 合否フィールド・終了コードを持たない。利用者設定の上限との照合と `limit_exceeded` への
-//! 結線は TASK-31.2（#129）、上限ちょうどの境界判定は #130。JSON 直列化・CLI 配線は
+//! 結線は [`crate::latency_limit::check_latency_limit`]（TASK-31.2・#129）、上限ちょうどの境界判定は #130。JSON 直列化・CLI 配線は
 //! TASK-33.x（serde 系の配置はオーナー承認事項）。実機（静かな Mac）での実計測は人間の作業で、
 //! 本モジュールのテストの証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ。
 
@@ -132,7 +132,7 @@ impl fmt::Display for LatencyReportError {
 
 impl std::error::Error for LatencyReportError {}
 
-/// p95 と参考値を持つレポート。合否・終了コードは持たない（#129 が別途結線する）。
+/// p95 と参考値を持つレポート。合否・終了コードは持たない（上限照合は [`crate::latency_limit::check_latency_limit`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatencyReport {
     iters: usize,
@@ -154,7 +154,7 @@ impl LatencyReport {
         self.warmup
     }
 
-    /// 切り上げ済みの p95（ns）。#129 が `latency_if_exceeded` へ渡す値。
+    /// 切り上げ済みの p95（ns）。`check_latency_limit`（#129）が `latency_if_exceeded` へ渡す値。
     pub fn p95_ns(&self) -> u64 {
         self.p95.ceil_ns()
     }

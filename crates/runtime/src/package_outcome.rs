@@ -18,6 +18,8 @@
 //! - 超過の生成元となる上限との照合（`total_bytes > limit_bytes`。上限ちょうどは超過でない）は
 //!   TASK-30.2（#124）の責務で、本モジュールは [`LimitBreach`] を入力として受け取る。
 //!   #124 のマージ後に `measure_package` からの結線確認を行う
+//! - 待ち時間上限の検証済み型 `LatencyLimit` と照合 `check_latency_limit` は #129 で追加済み
+//!   （`latency_limit` モジュール）。定義ファイルへの取り込みは未実装
 //! - 利用者が設定する容量上限の定義ファイルへの取り込み（読み込みと範囲検証）は未実装
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
 //!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務

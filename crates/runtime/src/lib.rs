@@ -23,7 +23,10 @@
 //! - [`latency`][]: 推論のみの待ち時間の反復計測ハーネス（REQ-31・TASK-31.1-1・#127）。
 //!   実モデルでの計測は #113 後
 //! - [`latency_report`][]: p95 の厳密な整数算出と、250ms を参考値として明記したレポート
-//!   （REQ-31・TASK-31.1-2・#128）。合否・上限照合は持たない（#129）
+//!   （REQ-31・TASK-31.1-2・#128）。合否・上限照合は持たない（上限照合は `latency_limit`）
+//! - [`latency_limit`][]: 利用者設定の待ち時間上限の検証済み型と p95 との照合（REQ-31・REQ-21・
+//!   TASK-31.2・#129）。超過は `LimitBreach::Latency` として `package_outcome` へ渡す。
+//!   定義ファイル・CLI からの上限取り込み、CLI 配線は未実装
 //! - [`package_outcome`][]: 上限超過を合否判定より優先して `limit_exceeded`（20）へ写す
 //!   終了コード決定（REQ-21・TASK-21.3-1・#132）。待ち時間（p95）の上限超過
 //!   （`LimitBreach::Latency`・境界規則 `latency_if_exceeded`。REQ-31・TASK-21.3-2・#133）も
@@ -42,6 +45,7 @@
 
 pub mod capacity;
 pub mod latency;
+pub mod latency_limit;
 pub mod latency_report;
 pub mod onnx;
 pub mod package_outcome;
