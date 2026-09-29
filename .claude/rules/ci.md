@@ -7,6 +7,7 @@ make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make test        # cargo test --workspace
 make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest
+make test-trainer-integration  # 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 make ci          # 上記 + lint-docs + check-workspace-manifest + deny を一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
@@ -19,7 +20,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 - `.github/workflows/ci.yml`: lint-docs（Fandhe-AI/actions）・rust-ci（fmt / clippy / test / deny を 3 OS matrix）・rust-ci-default-features・集約ジョブ `ci-complete`。稼働中（`workflow_dispatch`・`pull_request`・main への `push` で発火）。集約ジョブ `ci-complete` に加え、各ジョブの check も個別に必須チェックへ登録している（下の ruleset の項）
 - `.github/workflows/release.yml`: crates.io 公開。**発火条件は無効化中**（公開 crate 名と公開方針の確定後に有効化）
-- `.github/workflows/python-ci.yml`: 稼働中。学習ワーカーの `make py-ci` を macos-14（arm64。MLX の wheel と出力先の拡張 ACL 検査が macOS 前提）で実行する（`ci-complete` への統合は検討中）
+- `.github/workflows/python-ci.yml`: 稼働中。学習ワーカーの `make py-ci` を macos-14（arm64。MLX の wheel と出力先の拡張 ACL 検査が macOS 前提）で実行する。あわせて Rust から実 trainer を起動する結合テスト `make test-trainer-integration`（`crates/train/tests/real_trainer.rs`。`#[ignore]` で既定の `make test` から分離し、uv venv・MLX が無い `rust-ci` では `ignored` になる。issue #258）も実行する（`ci-complete` への統合は検討中）
 - `.github/workflows/ai-review.yml`・`update-external.yml`: 稼働中（ai-review は Actions 変数 `CODEX_HOME_DIR` 設定までスキップ。`update-external.yml` が生成する日次同期 PR〔`chore/skills-update-*`・`chore/submodule-update-*` ブランチ〕も `skip-branch-prefixes` でスキップし、指摘は取り込み元の上流リポジトリで扱う）
 - ruleset `main-protection` の必須チェック（29 件）: `codex / preflight`・`codex / review`・`codex / post_feedback`・`python-ci`・`ci-complete`・`lint-docs / *`（5 件）・`rust-ci (<os>) / *`（3 OS × 5 件）・`rust-ci-default-features (<os>)`（3 件）（GitHub Actions に束縛）と `Cursor Bugbot`（Cursor App に束縛）。PR HEAD に報告される check をすべて必須にしているのは、implement-issue-tree の自動マージのゲート（required に含まれない check が 1 件でもあればマージを辞退する）を通すため（2026-09-27 オーナー判断）。`lint-docs / *`・`rust-ci (<os>) / *` は Fandhe-AI/actions（`@latest`）の reusable workflow 側のジョブ名に由来するため、上流でジョブ名が変わると旧名の必須チェックが報告されずマージがブロックされる。その場合は ruleset を新しい check 名へ更新する。implement-issue-tree の自動マージ（`autoMerge: true`）は PR HEAD に報告される全チェックの必須化を前提とするため、チェックを追加・改名する workflow 変更では、マージ前に ruleset を新しいチェック名へ更新する
 
