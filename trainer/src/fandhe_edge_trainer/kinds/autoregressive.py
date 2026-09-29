@@ -90,7 +90,7 @@ LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention は�
 
 #79 の範囲はモデル・学習・ONNX 書き出し・選択口への登録までで、Python 側で
 1 件ずつの予測レコードを組み立てて評価器へ渡す処理は #80（TASK-19b.1-2）が
-担う。判定不能を別の status として区別する扱い（#81・TASK-19b.2）は含まない。
+担う。生成出力が選択肢 ID に対応づけられない場合の判定不能の扱いは #81（TASK-19b.2）が担う（後述）。
 `_score_choices_mlx`（対応づけ (b) の MLX 実装。一致試験・訓練後の簡易正解率
 確認に使う）は #80 がそのまま再利用する。
 
@@ -110,8 +110,21 @@ LayerNorm・GELU（厳密形。`math.erf` 相当）・multi-head attention は�
 最終段として担う。PoC-24 の `reason_code`（対応づけ不能の理由を JSON に含め
 る設計）は意図的に落とす（`crates/core::JudgmentStatus` が現状 `Ok` のみの
 ため、Rust 側スキーマに無いフィールドを Python 側で増やさない。
-coding-python.md）。対応づけ不能（`Unmapped`）は現状 `status:"error"` として
+coding-python.md）。対応づけ不能（`Unmapped`）は `status:"error"` として
 評価の分母に含まれる。
+
+## #81（TASK-19b.2）: 生成出力の判定不能の扱い
+
+生成出力（トークン列）がどの選択肢 ID にも一致しない場合を「判定不能」
+（`UnmappedReason.NO_CHOICE_MATCH`）と呼び、非有限スコア（`INVALID_SCORE`）と
+型で区別する（REQ-19b 異常系）。生成出力から ID への解決は
+`resolve_generated_output` の 1 箇所に集約する。JSON の境界は既存契約の語彙
+（`ok`・`abstain`・`error`）のまま `status:"error"` とする（`abstain` は保留として
+分母から外れ fail-open になるため使わない）。判定不能の件数は
+`ChoiceMappingTally` で別枠に数え、学習ジョブの validation 予測の経路で stderr へ
+件数だけ報告する（`predict.py`）。独立した status 値の追加は入出力契約・評価契約の
+変更のため、オーナー承認事項として本 Issue では実装しない。PoC-24 では失敗の実例が
+なく（REQ-19b「未検証」）、テストハーネスと合成データで確認する。
 """
 
 from __future__ import annotations
@@ -120,6 +133,7 @@ import json
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import IO, Any
 
 import mlx.core as mx
@@ -552,19 +566,34 @@ class Mapped:
     probs: tuple[float, ...]
 
 
-@dataclass(frozen=True)
-class Unmapped:
-    """対応づけ (b) が選択肢 ID を解決できなかったことを表す（#80）。
+class UnmappedReason(Enum):
+    """対応づけ (b) が失敗した理由（#81。内部値で JSON には出さない）。
 
-    `reason` はテストと将来の #81（TASK-19b.2。判定不能を別の status として
-    区別する扱い）のために保持するだけの内部値で、JSON の予測レコードには
-    出さない（`build_prediction_record` 参照。理由は
-    `"invalid_score"`〔`choice_posteriors` が非有限と判定〕・
-    `"no_exact_match"`〔`resolve_choice_id` が argmax の選択肢と一致する ID
-    を解決できない防御的経路。対応づけ (b) では理論上起こらない〕の 2 つ）。
+    「判定不能」は `NO_CHOICE_MATCH` だけを指す（`crates/eval` の件数不足による
+    `BaselineVerdict::Undeterminable`〔REQ-25〕とは別概念）。
     """
 
-    reason: str
+    #: 判定不能: 生成出力がどの選択肢 ID にも一致しない（REQ-19b 異常系・TASK-19b.2）。
+    NO_CHOICE_MATCH = "no_choice_match"
+    #: 対数尤度・事後確率が非有限（数値異常。PoC-24 preregistration 3 節の推論エラー相当）。
+    INVALID_SCORE = "invalid_score"
+
+
+@dataclass(frozen=True)
+class Unmapped:
+    """対応づけ (b) が選択肢 ID を解決できなかったことを表す（#80・#81）。
+
+    `reason` は内部値（`UnmappedReason`）で、JSON の予測レコードには出さない
+    （`build_prediction_record` 参照。どちらの理由でも `status:"error"`）。
+    件数は `ChoiceMappingTally` が理由別に数える。壊れた値を作れないよう、
+    `UnmappedReason` 以外は `TypeError`（内部の実装バグの fail-closed 検出）。
+    """
+
+    reason: UnmappedReason
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, UnmappedReason):
+            raise TypeError("Unmapped.reason must be an UnmappedReason")
 
 
 #: 対応づけ (b) の結果を表す型（`map_scores_to_choice` の戻り値）。
@@ -581,7 +610,7 @@ def choice_posteriors(loglik_row: np.ndarray) -> np.ndarray | None:
     `x - max` を引いてから `exp` を取り合計で割る、数値的に安定化した
     softmax を計算する。入力が 1 次元・長さ 1 以上・全要素が有限であること
     を事前に検証し、満たさなければ `None` を返す（呼び出し側で
-    `Unmapped("invalid_score")` にする。fail-closed）。出力も有限であること
+    `Unmapped(UnmappedReason.INVALID_SCORE)` にする。fail-closed）。出力も有限であること
     を再確認し、満たさなければ同様に `None` を返す（`ok` を装わない）。
     """
     if loglik_row.ndim != 1 or loglik_row.shape[0] < 1:
@@ -623,6 +652,55 @@ def resolve_choice_id(choice_tokens: Sequence[int], label_order: Sequence[str]) 
     return None
 
 
+def resolve_generated_output(
+    choice_tokens: Sequence[int], label_order: Sequence[str]
+) -> str | Unmapped:
+    """生成出力（トークン列）を選択肢 ID へ解決する唯一の入口（#81・TASK-19b.2）。
+
+    一致すれば ID（`str`）、どの ID にも一致しなければ判定不能
+    `Unmapped(UnmappedReason.NO_CHOICE_MATCH)` を返す。例外は送出しない（PAD・SEP・
+    EOS・範囲外・不正な UTF-8 はすべて「一致なし」。`resolve_choice_id` の挙動）。
+    `map_scores_to_choice` から呼ばれる。将来、自由生成の経路（REQ-19b の拡張）を
+    足すときもこの関数を通す。
+    """
+    resolved = resolve_choice_id(choice_tokens, label_order)
+    if resolved is None:
+        return Unmapped(UnmappedReason.NO_CHOICE_MATCH)
+    return resolved
+
+
+@dataclass
+class ChoiceMappingTally:
+    """対応づけの結果件数を別枠で数える（#81。件数のみ。id・本文は持たない）。
+
+    学習ジョブの validation 予測（`predict.py`）が stderr へ報告する。正解率などの
+    評価ロジックは持たない（評価器は TASK-24.1 に一本化）。
+    """
+
+    mapped: int = 0
+    no_choice_match: int = 0
+    invalid_score: int = 0
+
+    def record(self, mapping: ChoiceMapping) -> None:
+        """1 件の対応づけ結果を数える。未知の型は `TypeError`。"""
+        if isinstance(mapping, Mapped):
+            self.mapped += 1
+        elif isinstance(mapping, Unmapped):
+            if mapping.reason is UnmappedReason.NO_CHOICE_MATCH:
+                self.no_choice_match += 1
+            else:
+                self.invalid_score += 1
+        else:
+            raise TypeError("unexpected choice mapping type")
+
+    def to_log_line(self) -> str:
+        """stderr 用の英語 1 行（件数のみ）。"""
+        return (
+            f"autoregressive choice mapping: mapped={self.mapped}"
+            f" no_choice_match={self.no_choice_match} invalid_score={self.invalid_score}"
+        )
+
+
 def map_scores_to_choice(
     loglik_row: np.ndarray,
     label_order: Sequence[str],
@@ -633,7 +711,7 @@ def map_scores_to_choice(
     （`Unmapped`）へ変換する。
 
     手順: (1) `choice_posteriors` で事後確率を求める。非有限・不正な形なら
-    `Unmapped("invalid_score")` を返す。(2) 出力する `scores`（softmax 後の
+    `Unmapped(UnmappedReason.INVALID_SCORE)` を返す。(2) 出力する `scores`（softmax 後の
     事後確率）に対して `argmax`（タイブレークは `label_order` の宣言順で
     先頭。`np.argmax` は同点のとき最初の添字を返すため追加の分岐は要らない）
     で最大の選択肢を選ぶ。生の対数尤度ではなく事後確率で argmax を取るのは、
@@ -642,12 +720,12 @@ def map_scores_to_choice(
     指摘。`crates/core/src/judgment.rs::JudgmentResult::new` は同点を宣言順
     で判定し `predicted_choice_id` と最大スコアの一致を要求する）。(3) その
     選択肢の
-    トークン列を `resolve_choice_id` で実際に ID へ解決し、選んだ添字の
+    トークン列を `resolve_generated_output` で実際に ID へ解決し、選んだ添字の
     `label_order[idx]` と一致することを確認する。対応づけ (b) では
     `choice_ids_by_label[label_order[idx]]` は `label_order[idx]` 自身の
     トークン列なので理論上必ず一致するが、`_encode_choices` の呼び出し
     契約が崩れた場合に `ok` を偽装しないよう、fail-closed に
-    `Unmapped("no_exact_match")` へ倒す経路を残す。
+    `Unmapped(UnmappedReason.NO_CHOICE_MATCH)`（判定不能）へ倒す経路を残す。
 
     `len(loglik_row)` と `len(label_order)` の不一致は、呼び出し側が学習・
     書き出し時と異なる選択肢集合を渡した実装バグであり、データの問題では
@@ -665,7 +743,7 @@ def map_scores_to_choice(
 
     probs = choice_posteriors(np.asarray(loglik_row))
     if probs is None:
-        return Unmapped("invalid_score")
+        return Unmapped(UnmappedReason.INVALID_SCORE)
 
     # argmax は出力する scores（softmax 後の事後確率）に対して行う。
     # 生の対数尤度で argmax を決めると、僅差の対数尤度が softmax 後の
@@ -676,9 +754,11 @@ def map_scores_to_choice(
     # 添字を返すため、宣言順のタイブレークは追加の分岐なしに満たされる。
     idx = int(np.argmax(probs))
     label = label_order[idx]
-    resolved = resolve_choice_id(choice_ids_by_label[label], label_order)
+    resolved = resolve_generated_output(choice_ids_by_label[label], label_order)
+    if isinstance(resolved, Unmapped):
+        return resolved
     if resolved != label:
-        return Unmapped("no_exact_match")
+        return Unmapped(UnmappedReason.NO_CHOICE_MATCH)
     return Mapped(choice_id=resolved, index=idx, probs=tuple(float(p) for p in probs))
 
 
@@ -699,11 +779,13 @@ def build_prediction_record(
     （PoC-24 にあった `reason_code` は意図的に落とす。
     coding-python.md「Python 側で独自のフィールドを増やさない」）。
 
-    `Unmapped` は現状 `status:"error"` として評価の分母に含まれる。#81・
-    TASK-19b.2 で「判定不能」を別の status として区別する場合は、Rust 側
-    （`crates/data::eval_input` の status 許可集合・
-    `crates/core::JudgmentStatus`）へ先に値を追加しなければ
-    `unknown_status` として拒否される。
+    `Unmapped` は理由（判定不能・非有限スコア）によらず `status:"error"` とし、
+    評価の分母に含める（#81・TASK-19b.2）。既存契約の語彙で分母に残るのは
+    `error` だけで、`abstain` は保留として分母から外れ判定不能が紛れる
+    （fail-open）ため使わない。独立した status 値の追加は Rust 側
+    （`crates/data::eval_input`・`crates/core::JudgmentStatus`）と評価契約の変更に
+    なるため、オーナー承認事項として本 Issue では行わない。理由別の件数は
+    `ChoiceMappingTally` が数える。
 
     `id` には入力本文を入れない契約（security.md）は呼び出し側
     （`predict_records`）が守る前提で、ここでは型・非空・バイト長のみを
@@ -896,6 +978,7 @@ def predict_records(
     *,
     chunk_size: int | None = None,
     resource_budget: budget_mod.ResourceBudget | None = None,
+    tally: ChoiceMappingTally | None = None,
 ) -> Iterator[dict[str, Any]]:
     """学習ワーカー内で対応づけ (b) を確認するための推論経路（#80。PoC-24
     `predict` 相当）。`rows` は `(id, input)` の列。
@@ -1018,7 +1101,9 @@ def predict_records(
     # 上限内〔数百万件のオーダー〕でもコピー自体が検査前に RSS を消費する。
     # Codex レビュー指摘 P0・PR #234）。`rows` をそのまま渡し、チャンクへの
     # スライスは `_predict_records_stream` 側でチャンクぶんだけ行う。
-    return _predict_records_stream(trained, rows, chunk_size, choice_id_list, resource_budget)
+    return _predict_records_stream(
+        trained, rows, chunk_size, choice_id_list, resource_budget, tally
+    )
 
 
 def _predict_records_stream(
@@ -1027,6 +1112,7 @@ def _predict_records_stream(
     chunk_size: int,
     choice_id_list: list[list[int]],
     resource_budget: budget_mod.ResourceBudget,
+    tally: ChoiceMappingTally | None = None,
 ) -> Iterator[dict[str, Any]]:
     """`predict_records` のチャンクごとの逐次出力本体（件数上限検査済みの
     `rows` を受け取る）。全件を `list` へ蓄積せず 1 件ずつ `yield` する。
@@ -1054,6 +1140,8 @@ def _predict_records_stream(
         resource_budget.check()
         for (row_id, _text), row in zip(chunk, scores, strict=True):
             mapping = map_scores_to_choice(row, trained.label_order, trained.choice_ids_by_label)
+            if tally is not None:
+                tally.record(mapping)
             yield build_prediction_record(row_id, mapping, trained.label_order)
 
 

@@ -36,8 +36,10 @@ from fandhe_edge_trainer.kinds.autoregressive import (
     MAX_PREDICTION_ID_BYTES,
     VOCAB_SIZE,
     AutoregressiveKind,
+    ChoiceMappingTally,
     Mapped,
     Unmapped,
+    UnmappedReason,
     _default_predict_resource_budget,
     _encode_choices,
     _max_safe_predict_chunk_size,
@@ -46,6 +48,7 @@ from fandhe_edge_trainer.kinds.autoregressive import (
     predict_records,
     prediction_record_to_json_line,
     resolve_choice_id,
+    resolve_generated_output,
 )
 from fandhe_edge_trainer.limits import (
     MAX_AR_EXPORT_ATTENTION_ELEMENTS,
@@ -195,7 +198,7 @@ def test_req19b_map_scores_argmax_uses_softmax_probs_not_raw_loglik() -> None:
     ],
 )
 def test_req19b_map_scores_non_finite_is_unmapped(loglik: list[float]) -> None:
-    """`NaN`・`+inf`・`-inf` を含む行は `Unmapped("invalid_score")` になり、
+    """`NaN`・`+inf`・`-inf` を含む行は `Unmapped(UnmappedReason.INVALID_SCORE)` になり、
     `status:"error"` のレコードになること（`ok` を偽装しない。fail-closed）。
     """
     label_order = ["cat_a", "cat_b"]
@@ -204,7 +207,8 @@ def test_req19b_map_scores_non_finite_is_unmapped(loglik: list[float]) -> None:
     mapping = map_scores_to_choice(np.array(loglik), label_order, choice_ids_by_label)
 
     assert isinstance(mapping, Unmapped)
-    assert mapping.reason == "invalid_score"
+    assert mapping.reason is UnmappedReason.INVALID_SCORE
+    assert mapping.reason is not UnmappedReason.NO_CHOICE_MATCH
     record = build_prediction_record("row-0", mapping, label_order)
     assert record == {"id": "row-0", "status": "error", "predicted_label": None}
 
@@ -242,11 +246,12 @@ def test_req21_prediction_record_schema() -> None:
     assert list(record["scores"].keys()) == label_order
     assert record["scores"] == {"cat_a": 0.2, "cat_b": 0.5, "cat_c": 0.3}
 
-    error_record = build_prediction_record("row-2", Unmapped("no_exact_match"), label_order)
-    assert error_record == {"id": "row-2", "status": "error", "predicted_label": None}
-    assert "scores" not in error_record
-    assert "reason" not in error_record
-    assert "reason_code" not in error_record
+    for reason in (UnmappedReason.NO_CHOICE_MATCH, UnmappedReason.INVALID_SCORE):
+        error_record = build_prediction_record("row-2", Unmapped(reason), label_order)
+        assert error_record == {"id": "row-2", "status": "error", "predicted_label": None}
+        assert "scores" not in error_record
+        assert "reason" not in error_record
+        assert "reason_code" not in error_record
 
 
 def test_req21_scores_sum_within_shared_tolerance() -> None:
@@ -832,3 +837,97 @@ def test_ar_choice_mapping_module_still_exports_score_choices_mlx() -> None:
     from fandhe_edge_trainer.kinds.autoregressive import _score_choices_mlx
 
     assert callable(_score_choices_mlx)
+
+
+# --- #81（TASK-19b.2）: 生成出力の判定不能 -----------------------------------
+
+
+def _tokens(text: str) -> list[int]:
+    return [b + 1 for b in text.encode("utf-8")]
+
+
+def test_req19b_resolve_generated_output_no_match_is_undecidable() -> None:
+    """どの選択肢 ID にも一致しない生成出力は判定不能になり、例外を出さない。"""
+    label_order = ["cat_a", "cat_b"]
+    for text in ("cat_c", "cat", "cat_a ", "", "CAT_A"):
+        assert resolve_generated_output(_tokens(text), label_order) == Unmapped(
+            UnmappedReason.NO_CHOICE_MATCH
+        )
+
+
+def test_req19b_resolve_generated_output_invalid_tokens_is_undecidable() -> None:
+    """PAD・SEP・EOS・範囲外・不正な UTF-8 も判定不能になる。"""
+    label_order = ["cat_a", "cat_b"]
+    invalid = [
+        [0],
+        [257],
+        [258],
+        [-1],
+        [300],
+        [*_tokens("cat_a"), 0],
+        [0xFF + 1],
+    ]
+    for tokens in invalid:
+        assert resolve_generated_output(tokens, label_order) == Unmapped(
+            UnmappedReason.NO_CHOICE_MATCH
+        )
+
+
+def test_req19b_resolve_generated_output_exact_match() -> None:
+    """完全一致する生成出力は選択肢 ID（str）へ解決される。"""
+    assert resolve_generated_output(_tokens("cat_b"), ["cat_a", "cat_b"]) == "cat_b"
+
+
+def test_req19b_map_scores_no_choice_match_when_tokens_mismatch() -> None:
+    """契約崩れ（選択肢のトークン列がどの ID とも一致しない）は判定不能になる。"""
+    label_order = ["cat_a", "cat_b"]
+    broken = {"cat_a": _tokens("zzz"), "cat_b": _tokens("cat_b")}
+    mapping = map_scores_to_choice(np.array([-0.1, -3.0]), label_order, broken)
+    assert mapping == Unmapped(UnmappedReason.NO_CHOICE_MATCH)
+
+
+def test_req19b_unmapped_rejects_non_enum_reason() -> None:
+    """`UnmappedReason` 以外の reason は `TypeError`。"""
+    with pytest.raises(TypeError):
+        Unmapped("no_exact_match")  # type: ignore[arg-type]
+
+
+def test_req19b_choice_mapping_tally_counts() -> None:
+    """理由別に件数を数え、ログ行は件数だけを含む。"""
+    tally = ChoiceMappingTally()
+    mapped = Mapped(choice_id="cat_a", index=0, probs=(0.6, 0.4))
+    tally.record(mapped)
+    tally.record(mapped)
+    tally.record(Unmapped(UnmappedReason.NO_CHOICE_MATCH))
+    tally.record(Unmapped(UnmappedReason.INVALID_SCORE))
+    assert (tally.mapped, tally.no_choice_match, tally.invalid_score) == (2, 1, 1)
+    assert tally.to_log_line() == (
+        "autoregressive choice mapping: mapped=2 no_choice_match=1 invalid_score=1"
+    )
+
+
+def test_req19b_predict_records_reports_no_choice_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """判定不能は `status:"error"` になり、tally の no_choice_match に数えられる。
+    tally なしの呼び出しは挙動が変わらない。
+    """
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(AutoregressiveKind(), make_examples(), req)
+    rows = [(f"r{i}", f"text {i}") for i in range(3)]
+    baseline = list(predict_records(trained, rows, resource_budget=trained.resource_budget))
+    assert all(r["status"] == "ok" for r in baseline)
+
+    import fandhe_edge_trainer.kinds.autoregressive as ar
+
+    monkeypatch.setattr(
+        ar, "resolve_generated_output", lambda *_a: Unmapped(UnmappedReason.NO_CHOICE_MATCH)
+    )
+    tally = ChoiceMappingTally()
+    records = list(
+        predict_records(trained, rows, resource_budget=trained.resource_budget, tally=tally)
+    )
+    assert records == [
+        {"id": f"r{i}", "status": "error", "predicted_label": None} for i in range(3)
+    ]
+    assert (tally.mapped, tally.no_choice_match, tally.invalid_score) == (0, 3, 0)

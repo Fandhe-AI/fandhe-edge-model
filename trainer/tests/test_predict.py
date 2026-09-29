@@ -132,3 +132,29 @@ def test_req18_unsupported_kind_is_rejected_as_invalid_request() -> None:
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
     for supported in ("c1", "c3", "autoregressive"):
         predict.require_validation_prediction_support(supported)
+
+
+def test_req19b_predict_validation_logs_undecidable_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-19b・TASK-19b.2: 判定不能は `status:"error"` で返り、stderr には
+    件数の 1 行だけが出る（id・入力本文は出さない）。
+    """
+    import fandhe_edge_trainer.kinds.autoregressive as ar
+
+    req = make_request(tmp_path, kind="autoregressive", config=TINY_AR_CONFIG)
+    trained = train_kind(AutoregressiveKind(), make_examples(), req)
+    monkeypatch.setattr(
+        ar,
+        "resolve_generated_output",
+        lambda *_a: ar.Unmapped(ar.UnmappedReason.NO_CHOICE_MATCH),
+    )
+    rows = [("marker-id-1", "secret-body-1"), ("marker-id-2", "secret-body-2")]
+    capsys.readouterr()
+    records = predict.predict_validation("autoregressive", trained, rows, trained.resource_budget)
+    assert records == [
+        {"id": "marker-id-1", "status": "error", "predicted_label": None},
+        {"id": "marker-id-2", "status": "error", "predicted_label": None},
+    ]
+    err = capsys.readouterr().err
+    assert err == "autoregressive choice mapping: mapped=0 no_choice_match=2 invalid_score=0\n"
