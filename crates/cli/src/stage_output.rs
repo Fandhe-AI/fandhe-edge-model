@@ -25,8 +25,8 @@ use std::io::{self, Write};
 
 /// [`PackageOutcome`] を正常系の [`PackageReport`]、または異常系の [`ErrorReport`] へ写す。
 ///
-/// `Ok` を返すのは `verdict` が Pass / NotDefined かつ `exit_code == ExitCode::Ok` のときに限る。
-/// 両者が不整合なら `runtime_error` の `Err` を返す。`verdict` は
+/// `Ok` を返すのは `verdict` が Pass / NotDefined・`exit_code == ExitCode::Ok`・`breaches` が
+/// 空のときに限る。3 フィールドが不整合なら `runtime_error` の `Err` を返す。`verdict` は
 /// ワイルドカード無しで網羅し、区分が増えたらコンパイルエラーで気付けるようにする。
 ///
 /// # Errors
@@ -41,7 +41,12 @@ pub fn package_outcome_report(outcome: &PackageOutcome) -> Result<PackageReport,
         PackageVerdict::Undeterminable => ExitCode::Pending,
         PackageVerdict::LimitExceeded => ExitCode::LimitExceeded,
     };
-    if outcome.exit_code != expected {
+    // 上限超過（breaches 非空）は合否より優先する（REQ-30・REQ-31・REQ-39）。breaches が
+    // あるのに verdict / exit_code が LimitExceeded でなければ不整合として拒否する。
+    let breach_inconsistent = !outcome.breaches.is_empty()
+        && (outcome.verdict != PackageVerdict::LimitExceeded
+            || outcome.exit_code != ExitCode::LimitExceeded);
+    if breach_inconsistent || outcome.exit_code != expected {
         return Err(ErrorReport::new(
             ExitCode::RuntimeError,
             default_message(ExitCode::RuntimeError),
@@ -173,5 +178,38 @@ mod tests {
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         o.exit_code = ExitCode::Ok;
         assert!(package_outcome_report(&o).is_err());
+    }
+
+    /// REQ-21・REQ-30・REQ-31・REQ-39: breaches が非空なのに Pass / Ok の組を渡しても
+    /// 成功 JSON を出さず runtime_error へ倒れる。
+    #[test]
+    fn req21_breaches_with_pass_ok_fails_closed() {
+        let breach = LimitBreach::Capacity {
+            measured_bytes: 2,
+            limit_bytes: 1,
+        };
+        let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
+        o.breaches = vec![breach];
+        let mut buf = Vec::new();
+        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        assert_eq!(code, ExitCode::RuntimeError);
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n"
+        );
+
+        // verdict だけ LimitExceeded で exit_code が Ok の組も拒否する。
+        o.verdict = PackageVerdict::LimitExceeded;
+        assert!(package_outcome_report(&o).is_err());
+
+        // breaches 非空で verdict Fail・exit_code JudgedFail の組も runtime_error にする。
+        let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
+        o.breaches = vec![LimitBreach::Latency {
+            measured_p95_ns: 2,
+            limit_ns: 1,
+        }];
+        let mut buf = Vec::new();
+        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        assert_eq!(code, ExitCode::RuntimeError);
     }
 }
