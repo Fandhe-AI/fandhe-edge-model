@@ -83,7 +83,6 @@
 //!   supervisor.py` モジュール docstring「lifeline」節参照。native
 //!   `kill(2)` の直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe`
 //!   新規導入のいずれもユーザー承認事項のため対象外）
-//! - 「予算到達」を合格扱いしない判定（TASK-18.2・issue #85）
 //! - McNemar・Holm による有意性判定の選定記録への統合（TASK-18.3-1・issue #87）
 //! - 探索記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コード
 //!   への写像（TASK-33.x）
