@@ -2,34 +2,31 @@
 //!
 //! 読み込もうとするファイルの形式を、拡張子ではなく先頭バイトの構造から判定し、
 //! 許可リストに含まれる形式だけを通す。許可済みの型 [`AllowedFormat`] は
-//! [`open_checked_file`] が実ファイルの内容を検査したときだけ得られ、形式の値から直接は作れない。許可リスト方式のため、判定できない
+//! [`open_checked_file`] が実ファイルの内容を検査したときだけ得られ、形式の値から直接は作れない。
+//! 検査したバイト列はメモリに保持して [`CheckedFile`] で渡し、検査後の書き換えを防ぐ。許可リスト方式のため、判定できない
 //! 内容（[`FileFormat::Unknown`]）は常に拒否する（fail-closed）。
 //!
 //! # 責務境界
 //!
-//! - 固定シグネチャの判定は先頭 [`FORMAT_PREFIX_BYTES`] だけを読む。ONNX は top-level の tag と長さだけを
-//!   seek しながら読み、LEN の中身は読まない（読み取り量はフィールド数に比例する小さな値）。
+//! - ファイルは呼び出し側が指定する上限（`max_bytes`）以内でメモリへ読み切り、そのバイト列で判定する。
+//!   ONNX は top-level の tag と長さだけをたどり、LEN の中身は解釈しない。
 //!   pickle 等の中身は解釈・展開・実行しない
 //! - ONNX の判定は ModelProto と `graph`（GraphProto）の top-level 構造の「形の検査」であり、
 //!   意味の検証ではない（空の graph・output の無い graph は拒否）。node / initializer の中身は検査しない。
 //!   最終的な解析の成否は読み込み時の ONNX Runtime に委ねる。`external_data` の拒否は対象外
-//! - 経路の閉じ込め（TASK-39.4）・サイズ上限（TASK-39.5）は本モジュールの責務外。
-//!   呼び出し側（CLI の統合は TASK-39.2-4・#156）が経路 → サイズ → 形式の順で先に適用する
+//! - 経路の閉じ込め（TASK-39.4）は本モジュールの責務外。サイズ上限の値の決定（TASK-39.5）も
+//!   呼び出し側（CLI の統合は TASK-39.2-4・#156）が行い、本モジュールは渡された上限を強制する
 //! - 拡張子と内容の照合による偽装拒否シナリオは TASK-39.2-2（#154）で上に重ねる
 //!
 //! pickle プロトコル 0/1（テキスト opcode 始まり）は誤検出が多いため固定シグネチャでは
 //! 判定せず、ONNX の構造検査にも通らないので `Unknown` として拒否される。
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::fs::{FsError, open_regular_file_for_read};
+use fandhe_edge_core::fs::{FsError, read_bounded};
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read as _, Seek, SeekFrom};
+use std::io::{self, SeekFrom};
 use std::path::Path;
-
-/// 固定シグネチャの判定に読む先頭バイト数の上限（64 KiB）。ファイル全体（最大 1GB 級）は読まない。
-pub const FORMAT_PREFIX_BYTES: usize = 64 * 1024;
 
 /// 判定できるファイル形式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -134,33 +131,6 @@ impl ByteSource for SliceSource<'_> {
 
     fn limited(&self) -> bool {
         u64::try_from(self.prefix.len()).is_ok_and(|l| l < self.total_len)
-    }
-}
-
-/// ファイルを seek しながら読む入力元。LEN フィールドの中身は読まずに飛ばすため、
-/// 読み取り量はフィールド数に比例する小さな値に収まる（ファイル全体は読まない）。
-struct FileSource<'a>(&'a mut File);
-
-impl ByteSource for FileSource<'_> {
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.seek(SeekFrom::Start(offset))?;
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let Some(dst) = buf.get_mut(filled..) else {
-                break;
-            };
-            match self.0.read(dst) {
-                Ok(0) => break,
-                Ok(n) => filled = filled.saturating_add(n),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(filled)
-    }
-
-    fn limited(&self) -> bool {
-        false
     }
 }
 
@@ -520,81 +490,66 @@ impl fmt::Display for FormatRejection {
 
 impl std::error::Error for FormatRejection {}
 
-/// 形式検査を通したファイルハンドル。検査に使った `File` をそのまま後続の読み込みへ渡すための型。
+/// 形式検査を通したバイト列。検査に使ったバイト列そのものをメモリに保持して渡すための型。
 ///
-/// パスを開き直すと検査後に pickle 等へ差し替えられる（TOCTOU）ため、検査と読み込みは
-/// 同一のハンドルで行う（REQ-39「形式の許可制」）。ハンドルの位置は先頭に戻してある。
+/// ファイルはハンドルを保持しても別の書き込みハンドルから上書きできる（検査後の内容差し替え）。
+/// そのため検査対象を不変のメモリ上のバッファに読み切り、利用側にはこのバッファだけを渡す。
+/// 利用側はパスを開き直さず、[`CheckedFile::as_bytes`]・[`std::io::Read`]・[`std::io::Seek`]
+/// 経由で読む（REQ-39「形式の許可制」）。
 #[derive(Debug)]
 pub struct CheckedFile {
-    file: File,
+    cursor: io::Cursor<Vec<u8>>,
     format: AllowedFormat,
 }
 
 impl CheckedFile {
-    /// 検査を通った形式（ハンドルへの借用。`CheckedFile` を手放さずに参照する）。
+    /// 検査を通った形式（バイト列への借用。`CheckedFile` を手放さずに参照する）。
     pub const fn format(&self) -> &AllowedFormat {
         &self.format
     }
 
-    /// 検査済みのハンドルと形式を一緒に取り出す（位置は先頭）。形式はハンドルの読み込みにだけ
-    /// 使い、パスを開き直さないこと。
-    pub fn into_parts(self) -> (File, AllowedFormat) {
-        (self.file, self.format)
+    /// 検査したバイト列全体。
+    pub fn as_bytes(&self) -> &[u8] {
+        self.cursor.get_ref()
     }
 
-    /// 検査済みのハンドルを取り出す（位置は先頭）。以降の読み込みはこのハンドルで行うこと。
-    /// 形式だけを返してパスを開き直させる公開 API は設けない（検査後の差し替え = TOCTOU の防止）。
-    pub fn into_file(self) -> File {
-        self.file
+    /// 検査したバイト列と形式を一緒に取り出す。
+    pub fn into_parts(self) -> (Vec<u8>, AllowedFormat) {
+        (self.cursor.into_inner(), self.format)
     }
 }
 
 impl io::Read for CheckedFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
+        self.cursor.read(buf)
     }
 }
 
 impl io::Seek for CheckedFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.file.seek(pos)
+        self.cursor.seek(pos)
     }
 }
 
-/// ファイルを開き、同じハンドルの内容から形式を判定して許可リストと照合する。
+/// ファイルを `max_bytes` を上限にメモリへ読み切り、そのバイト列から形式を判定して許可リストと照合する。
 ///
-/// 通った場合は検査済みの [`CheckedFile`] を返す。後続の読み込み（ONNX Runtime への
-/// 受け渡し等）は返されたハンドルで行い、パスを開き直さない（TOCTOU 対策。REQ-39）。
-/// 経路の検証・サイズ上限を通したパスを渡すこと（責務外。モジュール doc 参照）。
+/// 通った場合は検査したバイト列を保持する [`CheckedFile`] を返す。後続の読み込みは返された
+/// バイト列で行い、パスを開き直さない（検査後の書き換え・差し替えへの対策。REQ-39）。
+/// 上限超過は `FsError::TooLarge`（終了コード `LimitExceeded`）。経路の検証は責務外
+/// （モジュール doc 参照）。
 pub fn open_checked_file(
     path: &Path,
     allowlist: &FormatAllowlist,
+    max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
-    let mut file = open_regular_file_for_read(path).map_err(FormatRejection::Io)?;
-    let read_err = |source| {
-        FormatRejection::Io(FsError::Read {
-            path: path.to_path_buf(),
-            source,
-        })
-    };
-    let total_len = file.metadata().map_err(read_err)?.len();
-    let mut prefix = Vec::new();
-    (&mut file)
-        .take(FORMAT_PREFIX_BYTES as u64)
-        .read_to_end(&mut prefix)
-        .map_err(read_err)?;
-    let detected = match detect_signature(&prefix) {
-        Some(f) => f,
-        // 先頭 prefix に graph が無い大きな ModelProto も判定できるよう、LEN を飛ばして末尾まで走査する。
-        // 走査回数の上限で打ち切られた場合は未検査のままなので Unknown（fail-closed）。
-        None => match scan_onnx_model(&mut FileSource(&mut file), total_len).map_err(read_err)? {
-            OnnxScan::Onnx => FileFormat::Onnx,
-            _ => FileFormat::Unknown,
-        },
-    };
+    let bytes = read_bounded(path, max_bytes).map_err(FormatRejection::Io)?;
+    let total_len = bytes.len() as u64;
+    let detected = detect_format(&bytes, total_len);
     let format = allowlist.check(detected)?;
-    file.seek(SeekFrom::Start(0)).map_err(read_err)?;
-    Ok(CheckedFile { file, format })
+    Ok(CheckedFile {
+        cursor: io::Cursor::new(bytes),
+        format,
+    })
 }
 
 #[cfg(test)]
@@ -696,9 +651,9 @@ mod tests {
         let pkl = dir.join("m.onnx.pkl");
         std::fs::write(&pkl, [0x80, 0x04, 0x95]).unwrap();
         let al = FormatAllowlist::onnx_only();
-        let ok = open_checked_file(&onnx, &al).unwrap();
+        let ok = open_checked_file(&onnx, &al, 1 << 20).unwrap();
         assert_eq!(ok.format().format(), FileFormat::Onnx);
-        let err = open_checked_file(&pkl, &al).unwrap_err();
+        let err = open_checked_file(&pkl, &al, 1 << 20).unwrap_err();
         assert_eq!(err.exit_code(), ExitCode::InvalidInput);
         std::fs::remove_dir_all(&dir).unwrap();
     }

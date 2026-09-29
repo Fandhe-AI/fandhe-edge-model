@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// 検査結果の形式だけを取り出す試験用ヘルパー（公開 API は検査済みハンドルのみ返す）。
 fn check_file_format(path: &Path, al: &FormatAllowlist) -> Result<AllowedFormat, FormatRejection> {
-    open_checked_file(path, al).map(|c| c.into_parts().1)
+    open_checked_file(path, al, 1 << 20).map(|c| c.into_parts().1)
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -100,14 +100,34 @@ fn req39_open_checked_file_keeps_inspected_handle() {
     let path = dir.join("m.onnx");
     let body = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
     std::fs::write(&path, body).unwrap();
-    let checked = open_checked_file(&path, &FormatAllowlist::onnx_only()).unwrap();
+    let mut checked = open_checked_file(&path, &FormatAllowlist::onnx_only(), 1 << 20).unwrap();
     assert_eq!(checked.format().format(), FileFormat::Onnx);
-    // 検査後にパスを pickle へ差し替える。
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&path, [0x80, 0x04, 0x95, 0x00]).unwrap();
+    // 検査後に別の書き込みハンドルで同じファイルの中身を pickle へ上書きする。
+    {
+        use std::io::Write as _;
+        let mut w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        w.write_all(&[0x80, 0x04, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .unwrap();
+    }
+    assert_eq!(std::fs::read(&path).unwrap()[0], 0x80);
     let mut read = Vec::new();
-    let mut checked = checked;
     checked.read_to_end(&mut read).unwrap();
     assert_eq!(read, body);
+    assert_eq!(checked.as_bytes(), body);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// REQ-39・TASK-39.2-1: 上限を超えるファイルは読み込まず LimitExceeded(20) で拒否する。
+#[test]
+fn req39_open_checked_file_rejects_over_limit() {
+    let dir = temp_dir("limit");
+    let path = dir.join("m.onnx");
+    std::fs::write(
+        &path,
+        [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78],
+    )
+    .unwrap();
+    let err = open_checked_file(&path, &FormatAllowlist::onnx_only(), 8).unwrap_err();
+    assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
     std::fs::remove_dir_all(&dir).unwrap();
 }
