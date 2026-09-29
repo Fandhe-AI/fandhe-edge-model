@@ -12,5 +12,10 @@ description = "Inference SDK layer (single/batch shared inference path) for fand
 # 用途は入力サイズ上限 `MAX_INFER_INPUT_BYTES` の参照に限る。
 fandhe-edge-core.workspace = true
 
+[dev-dependencies]
+# テスト専用。評価器経路（`run_inference_input_only`）との全件一致照合用（REQ-28・#118）。
+# workspace 内の path 依存のみで、本体の依存（推論は学習・評価器に依存しない）には影響しない。
+fandhe-edge-eval.workspace = true
+
 [lints]
 workspace = true
