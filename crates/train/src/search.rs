@@ -24,7 +24,9 @@
 //!
 //! - 予測時間は学習と同じ持ち時間・壁時計の締め切りに含まれる。締め切り超過は
 //!   実行器が強制終了する（[`crate::time_allotment::CandidateRunner::is_wall_timeout`]）
-//!   ため、本モジュールはスレッドも `recv_timeout` も持たない
+//!   ため、本モジュールはスレッドも `recv_timeout` も持たない。1 候補の時間切れは
+//!   その候補だけの記録（[`CandidateSearchResult::TrainingTimedOut`]）で、探索
+//!   予算が残っていれば次の候補へ進む（予算切れのときだけ残りを未着手にする）
 //! - 予測経路を持たない `kind` は学習ワーカーが学習前に拒否する
 //!   （`invalid_request`。候補は [`CandidateSearchResult::TrainingNotCompleted`]）
 //!
@@ -383,8 +385,10 @@ pub enum CandidateSearchResult {
     ///    場合を含む。RSS 等の他の資源上限は、経過時間が持ち時間に達して
     ///    いなければこちらではなく [`TrainingNotCompleted`](Self::TrainingNotCompleted)）
     ///
-    /// 正解率は算出していない。既存の探索予算超過と同じ扱いで、以降の候補を
-    /// 未着手として記録し探索を終える。選定対象外。
+    /// 正解率は算出していない。選定対象外。**候補単位の時間切れであり、探索全体の
+    /// 予算切れではない**: 探索予算が残っていれば次の候補へ進み、予算を使い
+    /// 切ったときだけ、残りの候補が [`NotStarted`](Self::NotStarted)
+    /// （`BudgetExhausted`）になる（P1 指摘対応。issue #84 PR #238 レビュー）。
     TrainingTimedOut,
     /// 探索予算全体が尽きたため実行しなかった。
     NotStarted {
@@ -559,6 +563,15 @@ pub enum SearchError<E> {
     /// PR #238 レビュー。凍結した最終 test 分割を validation として渡した
     /// 場合もこの経路で拒否される。学習を始める前に fail-closed で停止する）。
     ValidationSplitHashMismatch,
+    /// `validation_record_ids`・`validation_inputs`・`validation_gold`（正解
+    /// ラベル）から再計算した**中身のハッシュ**が、
+    /// [`SearchInput::validation_split_record`] の `validation` split の中身の
+    /// ハッシュ（[`fandhe_edge_data::split_record::SplitDigest::content_sha256`]）と
+    /// 一致しない、または記録が中身のハッシュを持たない（REQ-17・REQ-27・P0
+    /// 指摘対応。issue #84 PR #238 レビュー）。ID を変えずに `input` だけ、または
+    /// 正解ラベルだけを差し替えた入力もここで拒否する。学習を始める前に
+    /// fail-closed で停止する。
+    ValidationContentHashMismatch,
     /// `validation_inputs[index]` が UTF-8 として読めない（REQ-27・REQ-39。
     /// 学習リクエスト JSON の文字列に載せられないため、子プロセスを起動する
     /// 前に `invalid_input` として拒否する。issue #84 PR #238・選択肢 2）。
@@ -663,6 +676,10 @@ impl<E: std::fmt::Display> std::fmt::Display for SearchError<E> {
             SearchError::ValidationInputNotUtf8 { index } => {
                 write!(f, "validation input at index {index} is not valid utf-8")
             }
+            SearchError::ValidationContentHashMismatch => write!(
+                f,
+                "validation contents (ids, inputs, gold labels) do not match the frozen validation split record"
+            ),
             SearchError::InvalidCandidateId { index } => {
                 write!(f, "invalid candidate id at index {index}")
             }
@@ -725,6 +742,7 @@ impl<E> SearchError<E> {
             | SearchError::DuplicateValidationRecordId { .. }
             | SearchError::ValidationInputCountMismatch { .. }
             | SearchError::ValidationSplitHashMismatch
+            | SearchError::ValidationContentHashMismatch
             | SearchError::ValidationInputNotUtf8 { .. }
             | SearchError::InvalidCandidateId { .. }
             | SearchError::DuplicateCandidateId { .. }
@@ -768,10 +786,8 @@ fn validate_candidate_id(id: &str) -> bool {
 /// 「`/` 区切りの構成要素のうち空要素・`.` 単体は無視する」規則で比較用の
 /// 表現を作る。これにより `out/a`・`out/./a`・`out//a`・`out/a/` は同一の
 /// 出力先として重複検出される。本関数は分割・除去のみを行い、`..` 構成要素
-/// はそのまま残す。`..` の字句上の解決（親ディレクトリへの遡上）は
-/// [`normalized_joined_components`] が呼び出し元として行う（`root` 側に
-/// `..` が含まれうるため、単に「`TrainRequest::new` が拒否する」とは言え
-/// ない。同関数の doc 参照）。
+/// はそのまま残す（`..` の解決は、symlink を実体へ解決した後で
+/// [`canonicalized_out_dir_key`] が行う。[`joined_components`] 参照）。
 fn normalized_path_components(value: &str) -> Vec<&str> {
     value
         .split('/')
@@ -779,42 +795,23 @@ fn normalized_path_components(value: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `root` と `out_dir` を結合した後の出力先を、構成要素の列へ正規化する
-/// （codex review PR #238 P1 指摘: `root` と `out_dir` を別々に正規化して
-/// 組として比較すると、`root="/a", out_dir="out/x"` と
-/// `root="/a/out", out_dir="x"` が同じ `/a/out/x` を指していても
-/// 別物として扱われてしまう）。
+/// `root` と `out_dir` を結合した出力先の構成要素列を返す。空要素・`.` だけを
+/// 取り除き、**`..` は畳まずそのまま残す**（P1 指摘対応。issue #84 PR #238
+/// レビュー〔Cursor〕: `..` を文字列の上で先に畳むと、途中の構成要素が symlink
+/// のとき実体と合わなくなる。例: `link2 -> real/sub` のとき、`/t/link2/..` の
+/// 実体は `/t/real` だが、字句上で畳むと `/t` になる）。`..` の解決は
+/// [`canonicalized_out_dir_key`] が、存在する接頭辞を `canonicalize` した後で
+/// （実体に対して正しい順序で）行う。
 ///
-/// `out_dir` は `..` を含まない相対パスであることを [`TrainRequest::new`]
-/// が強制するが、`root` は絶対パスであること（`check_root_syntax`）しか
-/// 強制しておらず `..` 構成要素を含みうる（`root="/root/x/..", out_dir=
-/// "out/a"` は `root="/root", out_dir="out/a"` と同じ `/root/out/a` を
-/// 指す）。そのため単純な連結では不十分で、結合後の構成要素列に対して
-/// スタックによる字句上の `..` 解決（一つ前の構成要素を取り除く。スタック
-/// が空のまま `..` に出会った場合は無視してそれ以上遡らない）を行う。
-/// これは文字列としての字句解決のみであり、途中の構成要素が symlink で
-/// ある場合の実体解決（`canonicalize`）は行わない。symlink の解決は
-/// 呼び出し元（[`canonicalized_out_dir_key`]）の責務とする（P1 指摘対応・
-/// issue #84 PR #238 レビュー: 字句上の正規化だけでは、symlink を経由して
-/// 同じ実ディレクトリを指す 2 候補を重複として検出できなかった）。
-///
-/// 呼び出し元（[`validate_input`]）は本関数を呼ぶ前に必ず
-/// [`TrainRequest::new`] を通す。`out_dir` が空・`..` を含む等の不正な値の
-/// まま本関数へ渡すと、正規化後の構成要素列が空や root 側へ食い込んだ値に
-/// なり得て、無関係な候補との間に偽陽性の重複判定を招くため。
-fn normalized_joined_components<'a>(root: &'a str, out_dir: &'a str) -> Vec<&'a str> {
-    let mut resolved: Vec<&'a str> = Vec::new();
-    for part in normalized_path_components(root)
+/// `out_dir` は `..` を含まない相対パスであることを [`TrainRequest::new`] が
+/// 強制するが、`root` は絶対パスであること（`check_root_syntax`）しか強制して
+/// おらず `..` 構成要素を含みうる。呼び出し元（[`validate_input`]）は本関数を
+/// 呼ぶ前に必ず [`TrainRequest::new`] を通す。
+fn joined_components<'a>(root: &'a str, out_dir: &'a str) -> Vec<&'a str> {
+    normalized_path_components(root)
         .into_iter()
         .chain(normalized_path_components(out_dir))
-    {
-        if part == ".." {
-            resolved.pop();
-        } else {
-            resolved.push(part);
-        }
-    }
-    resolved
+        .collect()
 }
 
 /// 2 つの正規化済み出力先が同一か、一方が他方の祖先（親ディレクトリ）に
@@ -835,8 +832,8 @@ fn out_dirs_conflict<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// 構成要素列へ正規化する（P1 指摘対応・REQ-39。issue #84 PR #238
 /// レビュー）。
 ///
-/// [`normalized_joined_components`] による字句上の正規化（`.`・`..`・
-/// 空要素の解決）だけでは、symlink を経由して同じ実ディレクトリを指す
+/// [`joined_components`] による字句上の正規化（`.`・空要素の除去）だけでは、
+/// symlink を経由して同じ実ディレクトリを指す
 /// 2 つの候補（例: `root="/tmp/link", out_dir="x"` と
 /// `root="/tmp/real", out_dir="x"`。`/tmp/link` が `/tmp/real` への
 /// symlink）を見分けられない。本関数は結合後のパスのうち、存在する
@@ -845,7 +842,9 @@ fn out_dirs_conflict<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// symlink 越しの重複も検出できるようにする。祖先を遡る過程は「存在しない」
 /// （`NotFound`）ことが確定している間だけ続け、`root` は絶対パスのため
 /// 最終的に必ず `/`（ファイルシステムのルート。通常必ず存在する）で終端
-/// する。`NotFound` 以外の理由（権限不足等）での失敗は、より浅い祖先へ
+/// する。`..` は畳まずに接頭辞ごと `canonicalize` へ渡し（実体に対して正しい
+/// 順序で解決される）、存在しない残りの要素に `..` があれば拒否する
+/// （[`joined_components`]・関数内コメント参照）。`NotFound` 以外の理由（権限不足等）での失敗は、より浅い祖先へ
 /// 読み替えずに即座に拒否する（P1 指摘対応・issue #84 PR #238 レビュー。
 /// 関数 doc「# Errors」参照）。
 ///
@@ -861,16 +860,28 @@ fn out_dirs_conflict<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// 読み取り可能なため、`/` 自体の `canonicalize` が失敗する経路は理論上
 /// 到達しない防御的分岐とする。
 fn canonicalized_out_dir_key(root: &str, out_dir: &str) -> std::io::Result<Vec<String>> {
-    let components = normalized_joined_components(root, out_dir);
+    let components = joined_components(root, out_dir);
     for existing_len in (0..=components.len()).rev() {
         let mut candidate = PathBuf::from("/");
-        for part in &components[..existing_len] {
+        for part in components.iter().take(existing_len) {
             candidate.push(part);
         }
         match std::fs::canonicalize(&candidate) {
             Ok(canonical) => {
+                // 存在する接頭辞（`..` を含んでも `canonicalize` が実体に対して
+                // 正しい順序で解決する）の後ろは、まだ存在しない要素。そこに
+                // `..` があると、文字列の上で畳んでも実体と合う保証が無い
+                // （存在しない要素を経由した `..` の行き先は、後から作られる
+                // ものによって変わる）ため、拒否する（P1 指摘対応）。
+                let rest: Vec<&str> = components.iter().skip(existing_len).copied().collect();
+                if rest.contains(&"..") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "parent directory reference after the deepest existing ancestor",
+                    ));
+                }
                 let mut resolved = canonical;
-                for part in &components[existing_len..] {
+                for part in rest {
                     resolved.push(part);
                 }
                 return Ok(path_components_to_strings(&resolved));
@@ -1134,6 +1145,36 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<Vec<ValidationInput>, Se
         return Err(SearchError::ValidationSplitHashMismatch);
     }
 
+    // 中身（`id`・`input`・正解ラベル）のハッシュも、凍結記録の validation split と
+    // 照合する（P0 指摘対応・REQ-17・REQ-27。issue #84 PR #238 レビュー）。ID
+    // ハッシュだけでは、ID を変えずに `input` や正解ラベルだけを差し替えた
+    // 入力を検出できない。計算は分割を作る側（`split_and_record`）と同じ
+    // `fandhe_edge_data::split_record::content_sha256_hex` の 1 関数で、ここでも
+    // 新しい規則は作らない。中身のハッシュを持たない古い記録（`None`）は、
+    // 中身を保証できないため拒否する（fail-closed）。
+    let content_records: Vec<fandhe_edge_data::split_record::ContentRecord<'_>> = input
+        .validation_record_ids
+        .iter()
+        .zip(input.validation_inputs.iter())
+        .zip(input.validation_gold.iter())
+        .map(
+            |((&id, &input_bytes), &gold)| fandhe_edge_data::split_record::ContentRecord {
+                id,
+                input: input_bytes,
+                label: gold,
+            },
+        )
+        .collect();
+    let recomputed_content_hash =
+        fandhe_edge_data::split_record::content_sha256_hex(&content_records)
+            // 理論上到達しない防御的分岐（ID ハッシュの計算と同じ理由）。
+            .map_err(|_| SearchError::Internal {
+                detail: "failed to canonicalize validation contents for hashing".to_string(),
+            })?;
+    if expected_digest.content_sha256() != Some(recomputed_content_hash.as_str()) {
+        return Err(SearchError::ValidationContentHashMismatch);
+    }
+
     // 候補 ID の検証・重複検出、`label_order` 一致、`(root, out_dir)` 重複、
     // リクエストとしての妥当性。
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
@@ -1278,10 +1319,10 @@ pub fn select_best(
 /// `entries` へ記録する（P1 指摘対応・REQ-18「候補ごとの選定記録」）。
 ///
 /// [`run_search`] が探索予算全体を使い切ったと判断した時点（[`Allotment::Exhausted`]、
-/// 学習ジョブ〔学習＋予測〕が終わった時点で予算を使い切っていた場合、
-/// 候補が持ち時間を使い切って打ち切られた場合
-/// 〔[`CandidateSearchResult::TrainingTimedOut`]〕。issue #84 PR #238
-/// レビュー）で、宣言順にまだ控えていた候補を `iter` から取り出し尽くす。
+/// 学習ジョブ〔学習＋予測〕が終わった時点、または評価器の呼び出し後に予算を
+/// 使い切っていた場合。候補 1 件の時間切れ
+/// 〔[`CandidateSearchResult::TrainingTimedOut`]〕は予算切れではないため含めない。
+/// issue #84 PR #238 レビュー）で、宣言順にまだ控えていた候補を `iter` から取り出し尽くす。
 /// これらの候補には「順番が回ってきた」時点の経過時間が存在しないため
 /// `elapsed_at_start_ms: None`・`time: None` とする
 /// （[`CandidateSearchEntry::elapsed_at_start_ms`] doc 参照）。
@@ -1351,7 +1392,7 @@ fn outcomes_from_predictions(
 /// [`SearchError`] を返す。候補単位の失敗（学習が完了しなかった・持ち時間を
 /// 使い切った・予測列の件数または `id` 列が一致しなかった
 /// 〔REQ-27。issue #84 PR #238 レビュー〕）は探索全体を中断せず、その候補を
-/// 該当する分類で記録する（持ち時間切れは以降の候補を未着手にして終える）。
+/// 該当する分類で記録する（持ち時間切れも候補単位の記録で、探索予算が残っていれば次の候補へ進む）。
 pub fn run_search<R, C>(
     runner: &mut R,
     clock: &C,
@@ -1437,9 +1478,13 @@ where
             Ok(run) => run,
             Err(CandidateTimeError::Runner(error)) if R::is_wall_timeout(&error) => {
                 // 実行器が壁時計の締め切りで子プロセスを強制終了した。探索全体の
-                // 失敗ではなく候補単位の時間切れとして記録し、既存の探索予算
-                // 超過と同じ扱い（以降の候補を未着手にして終える）にする
-                // （REQ-39。実行器の記録〔`CandidateTimeRecord`〕は作られない）。
+                // 失敗ではなく候補単位の時間切れとして記録する（REQ-39。実行器の
+                // 記録〔`CandidateTimeRecord`〕は作られない）。候補ごとの時間切れと
+                // 探索全体の予算切れは分けて扱い（P1 指摘対応。issue #84 PR #238
+                // レビュー）、探索予算が残っていれば次の候補へ進む。予算を使い切って
+                // いれば、次の周回の `allot` が `Exhausted` を返し、残りの候補を
+                // `BudgetExhausted` にする。採点用スレッドはもう無いため、
+                // 1 候補の時間切れで探索を止める必要はない。
                 entries.push(CandidateSearchEntry {
                     candidate_id: candidate.candidate_id,
                     elapsed_at_start_ms: Some(elapsed_ms),
@@ -1447,8 +1492,7 @@ where
                     result: CandidateSearchResult::TrainingTimedOut,
                     validation_outcomes: None,
                 });
-                drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                break;
+                continue;
             }
             Err(source) => return Err(SearchError::Candidate { index, source }),
         };
@@ -1565,7 +1609,7 @@ where
                 // 学習ワーカー自身が `limit_exceeded` を報告し、Rust 側で測った
                 // 経過時間が持ち時間に達していた場合は、実行器が強制終了した
                 // 場合（上の `is_wall_timeout`）と同じ候補単位の時間切れとして
-                // 扱う（学習後・予測の最初の資源検査で持ち時間超過が検出された
+                // 扱い、探索予算が残っていれば次の候補へ進む（学習後・予測の最初の資源検査で持ち時間超過が検出された
                 // 場合など。REQ-39。issue #84 PR #238・選択肢 2）。RSS 等の他の
                 // 資源上限による `limit_exceeded` は、経過時間が持ち時間に達して
                 // いなければここに入らず、通常の学習失敗として次候補へ進む。
@@ -1586,10 +1630,6 @@ where
                     },
                     validation_outcomes: None,
                 });
-                if timed_out {
-                    drain_remaining_as_not_started(&mut entries, &mut candidates_iter);
-                    break;
-                }
             }
         }
     }
@@ -2228,13 +2268,12 @@ mod tests {
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
     }
 
-    /// REQ-18・TASK-18.1-2・REQ-39: `root` に `..` 構成要素が含まれていても
-    /// 結合後の出力先を字句上で解決してから重複判定する
-    /// （`root="/root/x/.."` は `root="/root"` と同じ。`check_root_syntax`
-    /// は `..` を拒否しないため、`out_dir` 側だけでなく `root` 側の `..` も
-    /// 考慮する必要がある。codex review PR #238 P1 指摘の対応中に判明した回帰テスト）。
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
+    /// 〔Cursor〕）: 存在しない構成要素の後ろに `..` があるパスは、文字列の上で
+    /// 畳んでも実体と合う保証が無いため、重複判定に進まず `OutDirCanonicalizeFailed`
+    /// で拒否する。
     #[test]
-    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_dotdot_in_root() {
+    fn task18_1_2_validate_input_rejects_dotdot_after_nonexistent_component() {
         let label_order = ["positive", "negative"];
         let gold = ["positive"];
         let candidates = vec![
@@ -2249,6 +2288,78 @@ mod tests {
         ];
         let input = base_input(&label_order, &gold, candidates);
         let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        assert_eq!(err, SearchError::OutDirCanonicalizeFailed { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
+    /// 〔Cursor〕）: 存在する構成要素の `..` は `canonicalize` が実体に対して
+    /// 解決するため、通常のディレクトリを経由した `root="/t/real/sub/.."` は
+    /// `root="/t/real"` と同じ出力先として重複判定される。
+    #[cfg(unix)]
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_with_existing_dotdot_in_root() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-dotdot-{}-existing",
+            std::process::id()
+        ));
+        let sub = base.join("real").join("sub");
+        std::fs::create_dir_all(&sub).expect("create dirs");
+        let real = base.join("real");
+        let via_dotdot = format!("{}/sub/..", real.to_str().expect("utf-8 path"));
+
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params(real.to_str().expect("utf-8 path"), "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params(&via_dotdot, "out/a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
+    }
+
+    /// REQ-18・TASK-18.1-2・REQ-39（P1 指摘対応。issue #84 PR #238 レビュー
+    /// 〔Cursor〕の回帰テスト。`cfg(unix)`）: symlink と `..` を組み合わせても
+    /// 同じ実ディレクトリを指す 2 候補は `DuplicateOutDir` になる。
+    /// `link2 -> real/sub` のとき `root="/t/link2/.."` の実体は `/t/real`
+    /// （symlink を先に解決してから `..` を適用する）で、`..` を文字列の上で
+    /// 先に畳むと `/t` になり、`root="/t/real"` の候補との重複を見逃していた。
+    #[cfg(unix)]
+    #[test]
+    fn task18_1_2_validate_input_rejects_duplicate_out_dir_via_symlink_and_dotdot() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-edge-train-test-symlink-dotdot-{}",
+            std::process::id()
+        ));
+        let real = base.join("real");
+        let sub = real.join("sub");
+        std::fs::create_dir_all(&sub).expect("create dirs");
+        let link2 = base.join("link2");
+        std::os::unix::fs::symlink(&sub, &link2).expect("create symlink");
+        let via_symlink_dotdot = format!("{}/..", link2.to_str().expect("utf-8 path"));
+
+        let label_order = ["positive", "negative"];
+        let gold = ["positive"];
+        let candidates = vec![
+            SearchCandidate {
+                candidate_id: "c3-a".to_string(),
+                params: valid_params(real.to_str().expect("utf-8 path"), "out/a"),
+            },
+            SearchCandidate {
+                candidate_id: "c3-b".to_string(),
+                params: valid_params(&via_symlink_dotdot, "out/a"),
+            },
+        ];
+        let input = base_input(&label_order, &gold, candidates);
+        let err = validate_input::<std::convert::Infallible>(&input).unwrap_err();
+        let _ = std::fs::remove_dir_all(&base);
         assert_eq!(err, SearchError::DuplicateOutDir { index: 1 });
     }
 

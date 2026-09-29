@@ -58,6 +58,7 @@ struct SplitGroupable {
     id: String,
     group_id: String,
     label: String,
+    input: Vec<u8>,
 }
 
 impl Groupable for SplitGroupable {
@@ -71,7 +72,7 @@ impl Groupable for SplitGroupable {
         &self.label
     }
     fn input(&self) -> &[u8] {
-        &[]
+        &self.input
     }
 }
 
@@ -83,13 +84,27 @@ impl Groupable for SplitGroupable {
 /// が validation split に入る。各レコードを別 group にして group 単位分割の
 /// 影響を受けないようにする。
 fn validation_split_record_fixture() -> SplitRecord {
-    let records: Vec<SplitGroupable> = VALIDATION_RECORD_IDS
+    split_record_for(
+        &VALIDATION_RECORD_IDS,
+        &VALIDATION_INPUTS,
+        &validation_gold(),
+    )
+}
+
+/// `ids`・`inputs`・`labels`（正解ラベル）を validation split として持つ凍結記録
+/// （中身のハッシュを含む）を組み立てる。ID・input・ラベルの一部だけを差し替えた
+/// 記録を作って、中身のハッシュの照合を確認するのにも使う。
+fn split_record_for(ids: &[&str], inputs: &[&[u8]], labels: &[&str]) -> SplitRecord {
+    let records: Vec<SplitGroupable> = ids
         .iter()
+        .zip(inputs.iter())
+        .zip(labels.iter())
         .enumerate()
-        .map(|(i, &id)| SplitGroupable {
+        .map(|(i, ((&id, &input), &label))| SplitGroupable {
             id: id.to_string(),
             group_id: format!("g{i}"),
-            label: "positive".to_string(),
+            label: label.to_string(),
+            input: input.to_vec(),
         })
         .collect();
     let ratios = SplitRatios {
@@ -173,6 +188,7 @@ fn mismatched_split_record_fixture() -> SplitRecord {
             id: format!("x{i}"),
             group_id: format!("g{i}"),
             label: "positive".to_string(),
+            input: Vec::new(),
         })
         .collect();
     let ratios = SplitRatios {
@@ -780,18 +796,68 @@ fn task18_1_2_validation_split_hash_mismatch_is_rejected_before_training() {
     assert_eq!(runner.calls, 0);
 }
 
-/// (T5c・P0・REQ-39・issue #84 PR #238・選択肢 2) 実行器が壁時計の締め切りで
-/// 子プロセスを強制終了した場合（`CandidateRunner::is_wall_timeout`）、探索全体の
-/// 失敗（`SearchError`）ではなく、その候補を `training_timed_out` として記録し、
-/// 以降の候補を未着手にして探索を終える（既存の探索予算超過と同じ扱い）。
+/// (T5c・P0/P1・REQ-39・issue #84 PR #238) 実行器が壁時計の締め切りで子プロセスを
+/// 強制終了した場合（`CandidateRunner::is_wall_timeout`）、探索全体の失敗
+/// （`SearchError`）ではなく、その候補を `training_timed_out` として記録する。
+/// **候補単位の時間切れと探索全体の予算切れは別**: 探索予算 3600 秒・2 候補
+/// （各 1800 秒）で、1 つ目が 1800 秒で時間切れになっても、残り 1800 秒で
+/// 2 つ目が実行・評価され選定される（P1 指摘の回帰テスト）。
 #[test]
-fn task18_1_2_wall_timeout_is_recorded_as_candidate_timeout_and_drains_remaining() {
+fn task18_1_2_candidate_timeout_does_not_stop_remaining_candidates_while_budget_remains() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::WallTimeout {
+                advance_ms: 1_800_000,
+            },
+            ok(1_000, outcomes_with_correct(9)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        input_for(
+            &gold,
+            &split,
+            candidates(&["c3-a", "c3-b"]),
+            SearchBudget::new(3600).expect("non-zero"),
+            PerCandidatePolicy::EvenSplit,
+        ),
+    )
+    .expect("search succeeds even though a candidate timed out");
+    assert_eq!(runner.calls, 2, "c3-b は予算が残っているため実行される");
+    assert_eq!(record.candidates.len(), 2);
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::TrainingTimedOut
+    );
+    assert_eq!(record.candidates[0].time, None);
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    assert!(matches!(
+        record.candidates[1].result,
+        CandidateSearchResult::Evaluated { .. }
+    ));
+    // c3-b の持ち時間は、時間切れで消費した 1800 秒を除いた残り予算で決まる。
+    assert_eq!(runner.received[1].time_limit_seconds, 1800);
+    assert_eq!(selected_id(&record), "c3-b");
+}
+
+/// (T5c2・P1・REQ-39) 時間切れで探索予算全体を使い切った場合だけ、残りの候補は
+/// `not_started/budget_exhausted` になる（候補単位の時間切れではなく予算切れが
+/// 理由）。
+#[test]
+fn task18_1_2_candidate_timeout_that_exhausts_budget_marks_remaining_not_started() {
     let clock = FakeClock::new(0);
     let mut runner = FakeRunner::new(
         &clock,
         vec![
             ok(100, outcomes_with_correct(9)),
-            RunnerBehavior::WallTimeout { advance_ms: 1_000 },
+            RunnerBehavior::WallTimeout {
+                advance_ms: 4_000_000,
+            },
         ],
     );
     let gold = validation_gold();
@@ -802,8 +868,7 @@ fn task18_1_2_wall_timeout_is_recorded_as_candidate_timeout_and_drains_remaining
         default_input(&gold, &split, &["c3-a", "c3-b", "c3-c"]),
     )
     .expect("search succeeds even though a candidate timed out");
-    assert_eq!(runner.calls, 2, "c3-c は時間切れ後に実行されない");
-    assert_eq!(record.candidates.len(), 3);
+    assert_eq!(runner.calls, 2, "c3-c は予算切れ後に実行されない");
     assert!(matches!(
         record.candidates[0].result,
         CandidateSearchResult::Evaluated { .. }
@@ -812,10 +877,7 @@ fn task18_1_2_wall_timeout_is_recorded_as_candidate_timeout_and_drains_remaining
         record.candidates[1].result,
         CandidateSearchResult::TrainingTimedOut
     );
-    assert_eq!(record.candidates[1].time, None);
-    assert_eq!(record.candidates[1].validation_outcomes(), None);
     assert_eq!(record.candidates[2].candidate_id, "c3-c");
-    assert_eq!(record.candidates[2].elapsed_at_start_ms, None);
     assert_eq!(
         record.candidates[2].result,
         CandidateSearchResult::NotStarted {
@@ -826,20 +888,23 @@ fn task18_1_2_wall_timeout_is_recorded_as_candidate_timeout_and_drains_remaining
     assert_eq!(selected_id(&record), "c3-a");
 }
 
-/// (T5d・P0・REQ-39・選択肢 2) 学習ワーカー自身が `limit_exceeded` を報告し、
+/// (T5d・P0/P1・REQ-39・選択肢 2) 学習ワーカー自身が `limit_exceeded` を報告し、
 /// Rust 側で測った経過時間が持ち時間に達していた場合（学習後・予測の最初の
 /// 資源検査で持ち時間超過が検出された場合など）は、実行器の強制終了と同じ
-/// `training_timed_out` として扱い、残り候補を未着手にする。`Fixed(10)` の
-/// 持ち時間 10 秒に対し経過 12 秒。
+/// `training_timed_out` として扱うが、探索予算が残っていれば次の候補へ進む
+/// （`Fixed(10)` の持ち時間 10 秒に対し経過 12 秒）。
 #[test]
-fn task18_1_2_worker_limit_exceeded_after_time_limit_is_candidate_timeout() {
+fn task18_1_2_worker_limit_exceeded_after_time_limit_is_candidate_timeout_and_search_continues() {
     let clock = FakeClock::new(0);
     let mut runner = FakeRunner::new(
         &clock,
-        vec![RunnerBehavior::WorkerError {
-            code: "limit_exceeded",
-            advance_ms: 12_000,
-        }],
+        vec![
+            RunnerBehavior::WorkerError {
+                code: "limit_exceeded",
+                advance_ms: 12_000,
+            },
+            ok(100, outcomes_with_correct(8)),
+        ],
     );
     let gold = validation_gold();
     let split = validation_split_record_fixture();
@@ -855,19 +920,17 @@ fn task18_1_2_worker_limit_exceeded_after_time_limit_is_candidate_timeout() {
         ),
     )
     .expect("search succeeds");
-    assert_eq!(runner.calls, 1);
+    assert_eq!(runner.calls, 2);
     assert_eq!(
         record.candidates[0].result,
         CandidateSearchResult::TrainingTimedOut
     );
     assert!(record.candidates[0].time.is_some());
-    assert_eq!(
+    assert!(matches!(
         record.candidates[1].result,
-        CandidateSearchResult::NotStarted {
-            reason: NotStartedReason::BudgetExhausted
-        }
-    );
-    assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
+        CandidateSearchResult::Evaluated { .. }
+    ));
+    assert_eq!(selected_id(&record), "c3-b");
 }
 
 /// (T5e・REQ-39・選択肢 2) `limit_exceeded` でも経過時間が持ち時間に達して
@@ -1091,7 +1154,12 @@ fn task18_1_2_validation_inputs_exceeding_request_size_are_rejected_before_train
     validation_inputs[0] = max_each.as_slice();
 
     let gold = validation_gold();
-    let split = validation_split_record_fixture();
+    // 凍結記録も同じ（巨大な）入力で作り、中身のハッシュは一致させる。
+    let split = split_record_for(
+        &VALIDATION_RECORD_IDS,
+        &validation_inputs,
+        &validation_gold(),
+    );
     let mut input = default_input(&gold, &split, &["c3-a"]);
     input.validation_inputs = &validation_inputs;
     let err = run_search(&mut runner, &clock, input).unwrap_err();
@@ -1297,13 +1365,17 @@ fn task18_1_2_record_serializes_expected_json_shape() {
 }
 
 /// (T9b・選択肢 2) 時間切れの候補の記録は `training_timed_out`（`time` は
-/// 実行器の強制終了のため `null`）、以降は `not_started` として直列化される。
+/// 実行器の強制終了のため `null`）として直列化され、探索予算が残っていれば次の
+/// 候補が実行される。
 #[test]
 fn task18_1_2_timed_out_candidate_serializes_as_training_timed_out() {
     let clock = FakeClock::new(0);
     let mut runner = FakeRunner::new(
         &clock,
-        vec![RunnerBehavior::WallTimeout { advance_ms: 1_000 }],
+        vec![
+            RunnerBehavior::WallTimeout { advance_ms: 1_000 },
+            ok(10, outcomes_with_correct(9)),
+        ],
     );
     let gold = validation_gold();
     let split = validation_split_record_fixture();
@@ -1321,12 +1393,9 @@ fn task18_1_2_timed_out_candidate_serializes_as_training_timed_out() {
     assert_eq!(json["candidates"][0]["time"], serde_json::Value::Null);
     assert_eq!(
         json["candidates"][1]["result"],
-        serde_json::json!("not_started")
+        serde_json::json!("evaluated")
     );
-    assert_eq!(
-        json["selection"]["decision"],
-        serde_json::json!("no_eligible_candidate")
-    );
+    assert_eq!(json["selection"]["candidate_id"], serde_json::json!("c3-b"));
 }
 
 /// (T10・REQ-27) 評価済み候補の validation 出力アクセサが使え、失敗した候補では
@@ -1665,4 +1734,71 @@ fn task18_1_2_training_exactly_at_own_time_limit_is_not_excluded_but_one_ms_over
             assert_eq!(record.selection, SelectionDecision::NoEligibleCandidate);
         }
     }
+}
+
+/// (P0・REQ-17・REQ-27・issue #84 PR #238 レビュー) ID を変えずに `input` だけを
+/// 差し替えた入力は、ID ハッシュは一致しても中身のハッシュが一致せず、学習を始める
+/// 前に `ValidationContentHashMismatch` で拒否される。
+#[test]
+fn task18_1_2_swapped_input_with_same_ids_is_rejected_before_training() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let gold = validation_gold();
+    // 凍結記録は元の入力、実際に渡す入力は 1 件だけ差し替える。
+    let split = validation_split_record_fixture();
+    let mut swapped: Vec<&[u8]> = VALIDATION_INPUTS.to_vec();
+    swapped[4] = b"tampered input";
+    let mut input = default_input(&gold, &split, &["c3-a"]);
+    input.validation_inputs = &swapped;
+    let err = run_search(&mut runner, &clock, input).unwrap_err();
+    assert_eq!(err, SearchError::ValidationContentHashMismatch);
+    assert_eq!(err.exit_code().code(), 64);
+    assert_eq!(runner.calls, 0);
+}
+
+/// (P0・REQ-17・REQ-27) ID を変えずに正解ラベルだけを差し替えた場合も拒否される
+/// （凍結記録の validation は `negative` のラベルを含み、渡された gold は全件
+/// `positive`）。
+#[test]
+fn task18_1_2_swapped_gold_with_same_ids_is_rejected_before_training() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let mut frozen_labels = validation_gold();
+    frozen_labels[7] = "negative";
+    let split = split_record_for(&VALIDATION_RECORD_IDS, &VALIDATION_INPUTS, &frozen_labels);
+    let gold = validation_gold();
+    let err = run_search(&mut runner, &clock, default_input(&gold, &split, &["c3-a"])).unwrap_err();
+    assert_eq!(err, SearchError::ValidationContentHashMismatch);
+    assert_eq!(runner.calls, 0);
+}
+
+/// (P0・REQ-17・REQ-27) 中身のハッシュを持たない古い分割記録は、中身の同一性を
+/// 保証できないため拒否される（fail-closed）。ID ハッシュは一致していても止まる。
+#[test]
+fn task18_1_2_split_record_without_content_hash_is_rejected() {
+    let clock = FakeClock::new(0);
+    let mut runner = FakeRunner::new(&clock, Vec::new());
+    let mut value: serde_json::Value = serde_json::from_str(
+        &validation_split_record_fixture()
+            .to_json()
+            .expect("to_json"),
+    )
+    .expect("json");
+    for split in ["train", "validation", "test"] {
+        value["splits"][split]
+            .as_object_mut()
+            .expect("object")
+            .remove("content_sha256");
+    }
+    let legacy = SplitRecord::from_json_str(&value.to_string()).expect("legacy record loads");
+    assert_eq!(legacy.digest(Split::Validation).content_sha256(), None);
+    let gold = validation_gold();
+    let err = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &legacy, &["c3-a"]),
+    )
+    .unwrap_err();
+    assert_eq!(err, SearchError::ValidationContentHashMismatch);
+    assert_eq!(runner.calls, 0);
 }

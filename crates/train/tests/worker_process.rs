@@ -821,6 +821,8 @@ fn case_validation_result_above_validation_cap_is_rejected(case_dir: &Path) -> R
 struct SplitItem {
     id: String,
     group_id: String,
+    label: String,
+    input: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -832,22 +834,31 @@ impl fandhe_edge_data::split::Groupable for SplitItem {
         &self.group_id
     }
     fn label(&self) -> &str {
-        "a"
+        &self.label
     }
     fn input(&self) -> &[u8] {
-        &[]
+        &self.input
     }
 }
 
-/// `record_ids` を validation split として持つ凍結記録を作る（比率 validation: 1.0）。
+/// `record_ids`・`inputs`・`gold` を validation split として持つ凍結記録を作る
+/// （比率 validation: 1.0。中身のハッシュを含む）。
 #[cfg(unix)]
-fn frozen_validation_split(record_ids: &[&str]) -> fandhe_edge_data::split_record::SplitRecord {
+fn frozen_validation_split(
+    record_ids: &[&str],
+    inputs: &[&[u8]],
+    gold: &[&str],
+) -> fandhe_edge_data::split_record::SplitRecord {
     let items: Vec<SplitItem> = record_ids
         .iter()
+        .zip(inputs.iter())
+        .zip(gold.iter())
         .enumerate()
-        .map(|(i, id)| SplitItem {
+        .map(|(i, ((id, input), label))| SplitItem {
             id: (*id).to_string(),
             group_id: format!("g{i}"),
+            label: (*label).to_string(),
+            input: input.to_vec(),
         })
         .collect();
     let ratios = fandhe_edge_data::split::SplitRatios {
@@ -900,7 +911,7 @@ fn case_search_scores_inside_the_training_job(case_dir: &Path) -> Result<(), Str
     let inputs: [&[u8]; 4] = [b"input 0", b"input 1", b"input 2", b"input 3"];
     // 偽ワーカーは a,b,a,b と予測する。gold は 3/4 が一致する並び。
     let gold = ["a", "b", "a", "a"];
-    let split = frozen_validation_split(&record_ids);
+    let split = frozen_validation_split(&record_ids, &inputs, &gold);
     let input = SearchInput {
         label_order: &["a", "b"],
         validation_gold: &gold,
@@ -947,7 +958,7 @@ fn case_search_records_wall_timeout_as_candidate_timeout(case_dir: &Path) -> Res
     let record_ids = ["r0", "r1"];
     let inputs: [&[u8]; 2] = [b"input 0", b"input 1"];
     let gold = ["a", "b"];
-    let split = frozen_validation_split(&record_ids);
+    let split = frozen_validation_split(&record_ids, &inputs, &gold);
     let input = SearchInput {
         label_order: &["a", "b"],
         validation_gold: &gold,
@@ -971,11 +982,11 @@ fn case_search_records_wall_timeout_as_candidate_timeout(case_dir: &Path) -> Res
         CandidateSearchResult::TrainingTimedOut,
         "first candidate",
     )?;
+    // 候補単位の時間切れは探索全体を止めない: 予算が残っているため 2 件目も
+    // 実行され（`hang` のため同じく時間切れ）、どちらも `training_timed_out`。
     expect_eq(
         record.candidates[1].result.clone(),
-        CandidateSearchResult::NotStarted {
-            reason: fandhe_edge_train::search::NotStartedReason::BudgetExhausted,
-        },
+        CandidateSearchResult::TrainingTimedOut,
         "second candidate",
     )?;
     expect_eq(
