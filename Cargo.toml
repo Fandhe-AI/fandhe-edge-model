@@ -24,6 +24,7 @@ fandhe-edge-core = { path = "crates/core" }
 fandhe-edge-data = { path = "crates/data" }
 fandhe-edge-eval = { path = "crates/eval" }
 fandhe-edge-train = { path = "crates/train" }
+# 推論 SDK 層（REQ-28・#117）。外部依存なし（workspace 内 path 依存のみ）。
 fandhe-edge-runtime = { path = "crates/runtime" }
 # serde・serde_json は 2026-09-27 オーナー承認済み（.claude/rules/dependency-policy.md
 # 「承認済みの依存」表。定義ファイル・JSON 入出力の型への読み込みに使う）。serde_json の

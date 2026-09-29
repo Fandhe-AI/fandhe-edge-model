@@ -5,13 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Artifact and inference SDK layer for fandhe-edge-model (currently: package capacity measurement core)."
+description = "Artifact and inference SDK layer (shared inference path, package capacity measurement) for fandhe-edge-model."
 
 [dependencies]
-# workspace 内の path 依存のみ（外部 crate は追加しない）。用途は容量計測での
-# 通常ファイル検証つきオープン（`fandhe_edge_core::fs::open_regular_file_for_read`。
-# REQ-39）に限る。推論ランタイムは学習側（train・Python・MLX）と評価器（eval）に
-# 依存しない（REQ-32。dependency-policy.md）。
+# workspace 内の path 依存のみ（外部 crate は追加しない。REQ-32: 学習側・評価器に依存しない）。
+# 用途は入力サイズ上限 `MAX_INFER_INPUT_BYTES` の参照と、容量計測での通常ファイル
+# 検証つきオープン（`fandhe_edge_core::fs::open_regular_file_for_read`。REQ-39）。
 fandhe-edge-core.workspace = true
 
 [lints]
