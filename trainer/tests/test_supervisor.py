@@ -20,6 +20,7 @@ import pytest
 
 from conftest import LABEL_ORDER, TINY_CONFIG
 from fandhe_edge_trainer import contract, guard, supervisor
+from fandhe_edge_trainer.exitcode import ExitCode
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
@@ -739,5 +740,45 @@ def test_spawn_worker_and_finalize_cleans_up_reservation_when_tempfile_creation_
         # （cleanup_reservation が例外経路でも呼ばれたことの確認）。
         assert not (tmp_path / "out").exists()
         assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+    finally:
+        entry.close()
+
+
+def test_spawn_worker_and_finalize_cleans_up_reservation_when_pipe_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue #178 PR #233 レビュー再々指摘 P1: lifeline パイプ作成
+    （`os.pipe()`）が（fd 数の上限超過等で）`OSError` を送出した場合でも、
+    既に確保済みの予約（`out_dir`・作業用一時ディレクトリ）が残置されず
+    解放されること。`os.pipe` を差し替えて決定的に再現する
+    （証拠種別: テストハーネス）。
+    """
+    root_handle = guard.resolve_root(str(tmp_path))
+    entry = guard.confine(root_handle, "out", "out_dir")
+    root_handle.close()
+    reservation = contract.prepare_out_dir(entry)
+
+    def _boom() -> tuple[int, int]:
+        raise OSError("simulated EMFILE while creating the lifeline pipe")
+
+    monkeypatch.setattr(supervisor.os, "pipe", _boom)
+
+    try:
+        exit_code = supervisor._spawn_worker_and_finalize(
+            b'{"schema_version": 1}',
+            reservation,
+            time_limit_seconds=30.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+        )
+        assert exit_code == ExitCode.RUNTIME_ERROR
+
+        # 予約済み out_dir・作業用一時ディレクトリのいずれも残っていない
+        # （cleanup_reservation が呼ばれたことの確認）。
+        assert not (tmp_path / "out").exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["status"] == "error"
+        assert payload["code"] == "runtime_error"
     finally:
         entry.close()

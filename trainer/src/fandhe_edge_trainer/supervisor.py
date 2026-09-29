@@ -549,7 +549,25 @@ def _spawn_worker_and_finalize(
     # 自分自身のプロセスグループ（`start_new_session=True` で起動している
     # ため pgid は worker 自身の pid）へ `SIGKILL` を送り、worker 自身と
     # その孫プロセスをまとめて終了させる。
-    lifeline_read_fd, lifeline_write_fd = os.pipe()
+    # `os.pipe()` はファイルディスクリプタ数の上限超過等で `OSError` を
+    # 送出しうる（issue #178 PR #233 レビュー再々指摘 P1）。この時点で
+    # 既に `out_dir` の予約（`reservation`）は確保済みのため、ここで
+    # 送出された場合も他の起動失敗（`Popen` 失敗）と同様に
+    # `cleanup_reservation` で解放してから `runtime_error` を返す
+    # （fail-closed。予約だけが残置される事態を防ぐ。REQ-39）。
+    try:
+        lifeline_read_fd, lifeline_write_fd = os.pipe()
+    except OSError as e:
+        contract.cleanup_reservation(reservation)
+        _emit(
+            {
+                "status": "error",
+                "code": "runtime_error",
+                "message": f"failed to create lifeline pipe: {type(e).__name__}",
+            }
+        )
+        return ExitCode.RUNTIME_ERROR
+
     try:
         argv = worker_argv(reservation.tmp_fd, lifeline_read_fd)
         # P1: 検証済みのリクエスト（raw_request）を、作成直後に unlink 済みの

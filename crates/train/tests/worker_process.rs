@@ -252,6 +252,59 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        "ok_with_orphan_stderr" => {
+            // issue #178 PR #233 レビュー再々指摘 P1「stderr の回収待ちが
+            // 残りの壁時計予算を無視して最大 `READER_DRAIN_TIMEOUT`（5 秒）
+            // 待ってしまい、締め切りを過ぎた後に `StderrIncomplete`
+            // （runtime_error=70）を誤って返す」の回帰。孫プロセスに
+            // stderr（fd 2）の複製を継承させたまま（`Command` は明示的に
+            // `.stderr(...)` を指定しない限り親の fd をそのまま継承する）
+            // このプロセス（supervisor 役）自身は正常終了する。孫が
+            // stderr を握り続ける間、`run_train` 側の stderr 読み取り
+            // スレッドは EOF に達せずブロックし続ける。
+            let exe = std::env::current_exe().expect("resolve current_exe for stderr holder");
+            let launch_script = std::env::current_dir()
+                .expect("cwd")
+                .join("stderr-holder-launch.py");
+            std::fs::write(&launch_script, "stderr_holder").expect("write stderr-holder launch.py");
+            let mut command = std::process::Command::new(&exe);
+            command
+                .arg("-I")
+                .arg(&launch_script)
+                .arg("train")
+                .arg("--request")
+                .arg(request_path)
+                // 標準入力・標準出力は明示的に `null` にする。指定しなければ
+                // 孫は標準出力（fd 1）の複製も継承してしまい、`run_train` の
+                // stdout 側の待ち（`stdout_wait`）が先にタイムアウトして
+                // `WallTimeout` を返してしまう（本テストが検証したい
+                // stderr 側の待ちに到達する前に、別の経路で同じ結果が
+                // 出てしまい、本回帰テストが何も検証しないことになる）。
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null());
+            // stderr だけは明示的に指定しない（親の fd をそのまま継承。
+            // これが run_train が読み取っているパイプの書き込み端であり、
+            // 孫がこれを握り続けることで stderr 側だけを EOF させない）。
+            let grandchild = command.spawn().expect("spawn stderr holder grandchild");
+            // `wait()` せずに drop すると `clippy::zombie_processes` に抵触する
+            // ため、別スレッドへ切り出して回収する（孫は `stderr_holder`
+            // モードの sleep 後に自発的に終了する）。
+            std::thread::spawn(move || {
+                let mut grandchild = grandchild;
+                let _ = grandchild.wait();
+            });
+            print!("{}", ok_json(&format!("{FIXTURE_ROOT}/out")));
+            std::process::exit(0);
+        }
+        "stderr_holder" => {
+            // `ok_with_orphan_stderr` が起動する孫プロセス。親から継承した
+            // stderr の複製を保持したまま、外側の壁時計タイムアウトより
+            // 十分長く眠ってから終了する（標準出力には何も書かない。
+            // `run_train` は直接の子＝`ok_with_orphan_stderr` 役の標準出力
+            // だけを見るため孫の標準出力は無関係）。
+            std::thread::sleep(Duration::from_secs(2));
+            std::process::exit(0);
+        }
         "record" => {
             // argv・受け取った request.json の内容・環境変数名の一覧を
             // cwd（= job_dir）の `record.json` へ書く（issue #178 実装計画
@@ -316,6 +369,10 @@ fn run_test_suite() -> ProcessExitCode {
         ("big_stdout", case_big_stdout),
         ("big_stderr", case_big_stderr),
         ("timeout_hang", case_timeout_hang),
+        (
+            "wall_timeout_when_grandchild_holds_stderr_open",
+            case_wall_timeout_when_grandchild_holds_stderr_open,
+        ),
         ("record_argv_and_request", case_record),
         ("invalid_job_dir", case_invalid_job_dir),
         ("existing_request_file_rejected", case_existing_request_file),
@@ -573,6 +630,40 @@ fn case_big_stderr(case_dir: &Path) -> Result<(), String> {
         "worker_stderr length",
     )?;
     expect_true(run.stderr_truncated(), "stderr_truncated")
+}
+
+/// issue #178 PR #233 レビュー再々指摘 P1: 直接の子（supervisor 役）は
+/// 締め切り内に正常終了し標準出力も読み切れるが、孫プロセスが標準エラー
+/// 出力（fd 2）の複製を握ったまま締め切りを超えて生き続ける場合、
+/// `StderrIncomplete`（runtime_error=70）ではなく `WallTimeout`
+/// （limit_exceeded=20）として分類されること。孫が stderr の複製を
+/// `READER_DRAIN_TIMEOUT`（5 秒）より十分長く（かつテストが速く終わる
+/// 程度に短く）握り続けるようにし、壁時計の残り予算だけで打ち切られる
+/// ことを確認する（`wall_timeout` は他のケースと同じ 500ms とし、冷えた
+/// CI ランナーでの起動遅延が偽陰性〔旧経路のまま偶然 `WallTimeout` に
+/// ならず素通りする〕を招かないようにする）。孫は stderr を 2 秒間
+/// 握り続けるため、経過時間が 1.5 秒未満であることも合わせて確認し、
+/// 「新しい stderr 側のガードで打ち切られた」ことと「孫の終了を待って
+/// 約 2 秒後に戻った」ことを区別できるようにする。
+#[cfg(unix)]
+fn case_wall_timeout_when_grandchild_holds_stderr_open(case_dir: &Path) -> Result<(), String> {
+    let launcher = make_launcher(case_dir, "ok_with_orphan_stderr");
+    let request = make_request(Some(1));
+    let limits = RunLimits::for_request(&request)
+        .with_wall_timeout(Duration::from_millis(500))
+        .expect("tighten wall timeout");
+    let started = std::time::Instant::now();
+    let err = match run_train(&launcher, &request, case_dir, &limits) {
+        Err(e) => e,
+        Ok(_) => return Err("expected WallTimeout error".to_string()),
+    };
+    expect_eq(err.exit_code(), ExitCode::LimitExceeded, "exit_code")?;
+    expect_eq(err.reason_code(), "limit_exceeded", "reason_code")?;
+    expect_true(
+        started.elapsed() < Duration::from_millis(1500),
+        "must return around the wall timeout, not after waiting ~2s for the \
+         grandchild holding stderr open to exit on its own",
+    )
 }
 
 /// 受け入れ条件 2: タイムアウトで子プロセスを確実に終了させ、

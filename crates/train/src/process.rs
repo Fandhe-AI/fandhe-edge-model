@@ -826,9 +826,37 @@ pub fn run_train(
 
     // supervisor は既に正常終了しているため、標準エラー出力は速やかに
     // EOF へ達するはずである。念のため短い上限（[`READER_DRAIN_TIMEOUT`]）を
-    // 掛ける（issue #178 実装計画 3.5）。
+    // 掛ける（issue #178 実装計画 3.5）。ただし壁時計の残り予算を無視して
+    // 独自に最大 `READER_DRAIN_TIMEOUT`（5 秒）待ってしまうと、子孫が
+    // stderr を開いたままの場合に締め切りを超過してから `StderrIncomplete`
+    // （runtime_error=70）を返してしまい、本来返すべき上限超過
+    // （`WallTimeout`・limit_exceeded=20）を誤分類する（issue #178 PR #233
+    // レビュー再々指摘 P1）。待つ時間は「残りの壁時計予算」と
+    // `READER_DRAIN_TIMEOUT` の短い方にし、締め切りを過ぎてもなお読み
+    // 切れなかった場合は `WallTimeout` として分類する。締め切り前に
+    // `READER_DRAIN_TIMEOUT` だけが尽きた場合は、従来どおり
+    // `StderrIncomplete` とする。
+    let stderr_wait_budget = deadline
+        .saturating_duration_since(Instant::now())
+        .min(READER_DRAIN_TIMEOUT);
     let stderr_drain = match stderr_rx {
-        Some(rx) => rx.recv_timeout(READER_DRAIN_TIMEOUT).ok(),
+        Some(rx) => match rx.recv_timeout(stderr_wait_budget) {
+            Ok(drained) => Some(drained),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    // 直接の子（supervisor）は既に reap 済み（`timed_out`
+                    // が `false` でここへ到達した以上、`outcome` は
+                    // `WaitOutcome::Exited` であり `child_reaped == true`）。
+                    return Err(TrainProcessError::WallTimeout {
+                        limit_ms: u64::try_from(limits.wall_timeout().as_millis())
+                            .unwrap_or(u64::MAX),
+                        child_reaped,
+                    });
+                }
+                None
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        },
         None => None,
     };
     let Some(stderr_drain) = stderr_drain.filter(|d| !d.read_error) else {
