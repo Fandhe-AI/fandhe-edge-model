@@ -169,6 +169,57 @@ fn validate_validation_inputs(inputs: &[ValidationInput]) -> Result<(), TrainReq
     Ok(())
 }
 
+/// 予測 1 件の JSON の固定部分の最大バイト数: `{"id":` 6・引用符 2・`,"status":` 10・
+/// 最長の status `"abstain"` 9・`,"predicted_label":` 19・引用符 2・`}` 1・区切りの `,` 1。
+const VALIDATION_PREDICTION_FIXED_BYTES: usize = 50;
+
+/// `validation_predictions` を含む結果のうち、予測 1 件ぶん以外（キー・括弧）に
+/// 加える余裕（`,"validation_predictions":[` と `]` は 28 バイト）。
+const VALIDATION_PREDICTIONS_ARRAY_SLACK_BYTES: usize = 64;
+
+/// JSON 文字列（引用符を除く）のエスケープ後の最大バイト長。制御文字は
+/// `\uXXXX` の 6 バイトとする最悪値（実際は `\n` 等の 2 バイトになるものも
+/// ある）、`"`・`\` は 2 バイト、それ以外は UTF-8 のバイト長（Rust の
+/// `serde_json` も Python の `json.dumps(ensure_ascii=False)` も非 ASCII を
+/// エスケープしない）。実際の文字列から求める（`trainer/.../contract.py::
+/// _json_escaped_len_bound` と同じ規則。共有 fixture `result_cap_cases.json` で照合）。
+fn json_escaped_len_bound(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+/// `validation_inputs` 付きリクエストの結果 JSON の最大バイト数（読み取り上限）を
+/// 正確に計算する（P1 指摘対応。issue #84 PR #238 レビュー）。
+///
+/// `MAX_RESULT_BYTES`（従来の上限。artifact 等）＋ 配列の余裕 ＋
+/// Σ（予測 1 件の固定部分 ＋ その `id` のエスケープ後の最大長 ＋ ラベル集合のうち
+/// エスケープ後に最長のラベルの長さ）。最長ラベルを全件に当てるのは、どのラベルが
+/// 返るか事前に分からない最悪値のため。加算は飽和し、上限超過の判定には十分。
+#[must_use]
+pub fn validation_result_bytes_bound<'a>(
+    label_order: &[String],
+    ids: impl IntoIterator<Item = &'a str>,
+) -> usize {
+    let longest_label = label_order
+        .iter()
+        .map(|label| json_escaped_len_bound(label))
+        .max()
+        .unwrap_or(0);
+    let mut total = MAX_RESULT_BYTES.saturating_add(VALIDATION_PREDICTIONS_ARRAY_SLACK_BYTES);
+    for id in ids {
+        total = total
+            .saturating_add(VALIDATION_PREDICTION_FIXED_BYTES)
+            .saturating_add(json_escaped_len_bound(id))
+            .saturating_add(longest_label);
+    }
+    total
+}
+
 /// 未検証の学習リクエストの構成要素（呼び出し元が組み立てる入力）。
 ///
 /// [`TrainRequest::new`] へ渡す前段の値で、フィールドはすべて公開だが
@@ -216,6 +267,8 @@ pub struct TrainRequest {
     rss_limit_bytes: u64,
     /// 学習ジョブ内での採点用 validation 入力（任意。gold は持たない）。
     validation_inputs: Option<Vec<ValidationInput>>,
+    /// このリクエストの結果 JSON の読み取り上限（[`TrainRequest::max_result_bytes`]）。
+    max_result_bytes: usize,
 }
 
 /// [`ValidationInput`] の JSON 読み込み用中間表現（未知フィールドを拒否する）。
@@ -431,6 +484,7 @@ impl TrainRequest {
             time_limit_seconds,
             rss_limit_bytes,
             validation_inputs: None,
+            max_result_bytes: MAX_RESULT_BYTES,
         })
     }
 
@@ -444,6 +498,18 @@ impl TrainRequest {
         inputs: Vec<ValidationInput>,
     ) -> Result<Self, TrainRequestError> {
         validate_validation_inputs(&inputs)?;
+        // 結果の上限をリクエストごとに正確に計算し、固定の上限
+        // （`MAX_RESULT_BYTES_WITH_VALIDATION`）を超えるなら、学習を始める前に
+        // 拒否する（正常な結果が上限で弾かれる状況を作らない。P1 指摘対応。
+        // issue #84 PR #238 レビュー）。
+        let bound = validation_result_bytes_bound(
+            self.label_order.as_slice(),
+            inputs.iter().map(ValidationInput::id),
+        );
+        if bound > MAX_RESULT_BYTES_WITH_VALIDATION {
+            return Err(TrainRequestError::ValidationResultTooLarge);
+        }
+        self.max_result_bytes = bound;
         self.validation_inputs = Some(inputs);
         Ok(self)
     }
@@ -606,15 +672,13 @@ impl TrainRequest {
     }
 
     /// このリクエストに対する結果 JSON（ワーカーの標準出力）の読み込み上限
-    /// （バイト）。`validation_inputs` を持つ場合だけ、予測列を含むぶん緩い
-    /// [`MAX_RESULT_BYTES_WITH_VALIDATION`]、それ以外は [`MAX_RESULT_BYTES`]。
+    /// （バイト）。`validation_inputs` を持たなければ [`MAX_RESULT_BYTES`]。
+    /// 持つ場合は、そのリクエストの許可するラベル・id から正確に計算した値
+    /// （[`validation_result_bytes_bound`]。常に [`MAX_RESULT_BYTES_WITH_VALIDATION`]
+    /// 以下。超える場合は [`TrainRequest::with_validation_inputs`] が拒否する）。
     #[must_use]
     pub fn max_result_bytes(&self) -> usize {
-        if self.validation_inputs.is_some() {
-            MAX_RESULT_BYTES_WITH_VALIDATION
-        } else {
-            MAX_RESULT_BYTES
-        }
+        self.max_result_bytes
     }
 }
 
@@ -957,7 +1021,8 @@ mod tests {
         let request = plain
             .with_validation_inputs(vec![vi("r1", "alpha"), vi("r2", "beta")])
             .expect("valid validation inputs");
-        assert_eq!(request.max_result_bytes(), MAX_RESULT_BYTES_WITH_VALIDATION);
+        // 1 MiB + 配列の余裕 64 + 2 件 × (固定 50 + id 2 + 最長ラベル 1) = 1_048_746。
+        assert_eq!(request.max_result_bytes(), 1_048_746);
         let bytes = request.to_json_vec().expect("serialize");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(
@@ -1072,5 +1137,58 @@ mod tests {
         );
         assert!(!debug.contains("MARKER"), "{debug}");
         assert!(debug.contains("input_len"));
+    }
+
+    /// P1（issue #84 PR #238 レビュー）: 制御文字だけでできた最長ラベル（256 文字 =
+    /// エスケープで 1536 バイト）と多数の短い入力の組み合わせでは、結果の最大長が
+    /// 固定の天井（64 MiB）を超えるため、学習を始める前に `limit_exceeded` で拒否
+    /// される。同じラベルでも件数が少なければ受理され、その上限（`max_result_bytes`）
+    /// は天井以下で、想定される最悪の結果（全件が最長ラベル）を収容できる。
+    #[test]
+    fn req39_result_cap_rejects_control_char_label_with_many_inputs_but_fits_when_accepted() {
+        let control_label = "\u{1}".repeat(256);
+        let params = |labels: Vec<String>| TrainRequestParams {
+            label_order: labels,
+            ..valid_params()
+        };
+        let inputs = |n: usize| -> Vec<ValidationInput> {
+            (0..n)
+                .map(|i| ValidationInput::new(format!("a{i}"), String::new()))
+                .collect()
+        };
+        let labels = vec![control_label.clone(), "b".to_string()];
+
+        // 多数（1 件 = 固定 50 + id + 1536 で、42,100 件で 64 MiB 超）。
+        let too_many = TrainRequest::new(params(labels.clone()))
+            .expect("valid")
+            .with_validation_inputs(inputs(43_000))
+            .unwrap_err();
+        assert_eq!(too_many, TrainRequestError::ValidationResultTooLarge);
+        assert_eq!(too_many.reason_code(), "limit_exceeded");
+        assert_eq!(too_many.exit_code().code(), 20);
+
+        // 少数なら受理され、上限は天井以下で、全件が最長ラベルの結果を収容できる。
+        let accepted = TrainRequest::new(params(labels))
+            .expect("valid")
+            .with_validation_inputs(inputs(1_000))
+            .expect("fits under the ceiling");
+        assert!(accepted.max_result_bytes() <= MAX_RESULT_BYTES_WITH_VALIDATION);
+        // 実際に出力されうる最悪の結果（全件が最長ラベル・最長の status）を組み立てる。
+        let worst_case_total = MAX_RESULT_BYTES
+            + 28
+            + (0..1_000)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":"a{i}","status":"abstain","predicted_label":"{}"}},"#,
+                        "\\u0001".repeat(256)
+                    )
+                    .len()
+                })
+                .sum::<usize>();
+        assert!(
+            accepted.max_result_bytes() >= worst_case_total,
+            "the bound {} must cover the worst-case result {worst_case_total}",
+            accepted.max_result_bytes()
+        );
     }
 }

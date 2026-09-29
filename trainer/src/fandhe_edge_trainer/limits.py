@@ -54,11 +54,16 @@ MAX_VALIDATION_INPUT_BYTES = 1_048_576
 MAX_VALIDATION_ID_BYTES = 1024
 MAX_VALIDATION_INPUT_TOTAL_BYTES = 64 * 1024 * 1024
 
+#: 学習結果 JSON（ワーカーの標準出力）の上限（bytes）。現行値: 1 MiB
+#: （`crates/train/src/limits.rs::MAX_RESULT_BYTES`。根拠: 仮置き）。
+MAX_RESULT_BYTES = 1 * 1024 * 1024
+
 #: `validation_inputs` を持つリクエストの結果 JSON（`validation_predictions`
-#: を含む）の標準出力上限（bytes）。持たないリクエストは
-#: `supervisor.py::_MAX_WORKER_STDOUT_BYTES`（1 MiB）のまま。値の導出は
-#: `crates/train/src/limits.rs::MAX_RESULT_BYTES_WITH_VALIDATION` の doc を参照
-#: （最悪でも約 41 MB＋id 分で 64 MiB に収まる。証拠種別: 推定）。
+#: を含む）の標準出力上限の**天井**（bytes）。実際の上限はリクエストごとに
+#: `contract.py::validation_result_bytes_bound`（許可するラベル・id から正確に
+#: 計算。Rust 側 `validation_result_bytes_bound` と同じ式。共有 fixture
+#: `result_cap_cases.json` で照合）で決め、この天井を超えるリクエストは
+#: `validate_request` が `limit_exceeded` で拒否する（issue #84 PR #238 レビュー）。
 MAX_RESULT_BYTES_WITH_VALIDATION = 64 * 1024 * 1024
 
 #: 現行値: 64 MiB（累積読み取りバイト数で判定する）。根拠: 仮置き（実運用データ

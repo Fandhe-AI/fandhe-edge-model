@@ -64,6 +64,13 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `validation_inputs[].id` と同順・同件数。手作成。`result_ok.json` と
   同様に `request_full.json` 由来の `artifact` を持ち、Rust 側は
   `request_with_validation.json` から組み立てたリクエストに対して読む。
+- `result_cap_cases.json`: リクエストごとの結果上限（`validation_inputs` 付きの
+  結果 JSON の最大バイト数。Rust `validation_result_bytes_bound`・Python
+  `contract.validation_result_bytes_bound`。issue #84 PR #238 レビュー）の計算例。
+  `MAX_RESULT_BYTES`（1048576）＋ 余裕 64 ＋ Σ（固定 50 ＋ JSON エスケープ後の id 長 ＋
+  エスケープ後に最長のラベル長）を、実装とは独立に手計算した期待値（制御文字は 6、
+  `"`・`\` は 2、その他は UTF-8 のバイト長）。制御文字だけのラベル・引用符・
+  バックスラッシュ・多バイト文字・多数の短い id を含む。両言語のテストが再現する。
 - `request_reject_cases.json`: `base`（`request_full.json` と同じ内容）に
   1 フィールドずつ `patch` または `raw_text`（JSON 外の数値トークンを含む
   生テキスト）を適用した異常系一覧。各ケースの `expected_code`／

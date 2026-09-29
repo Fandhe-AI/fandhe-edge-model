@@ -314,8 +314,8 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             // `id` から `validation_predictions` を組み立てて返す（実際の
             // 学習ワーカーが学習直後に行う予測の代役）。`artifact_dir` は
             // リクエストの `root`／`out_dir` から作る（候補ごとに `out_dir` が
-            // 異なるため）。`ok_validation_big` は予測ラベルを 250 文字にして
-            // 結果を既定上限（1 MiB）より大きくする。`ok_validation_over_cap` は
+            // 異なるため）。`ok_validation_big` は長い id（リクエストが運ぶ）を返すため
+            // 結果が既定上限（1 MiB）より大きくなる。`ok_validation_over_cap` は
             // さらに 70 MiB の空白を続けて validation 付きの上限（64 MiB）も超える。
             let request_json: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(request_path).unwrap_or_else(|e| panic!("read request: {e}")),
@@ -329,18 +329,14 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
             let inputs = request_json["validation_inputs"]
                 .as_array()
                 .expect("validation_inputs must be present");
-            let big_label = "l".repeat(250);
             let predictions: Vec<serde_json::Value> = inputs
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
                     // 各要素は `id`・`input` の 2 キーだけ（正解ラベルを持たない。REQ-27）。
                     assert_eq!(item.as_object().expect("object").len(), 2);
-                    let label = if mode == "ok_validation" {
-                        if i % 2 == 0 { "a" } else { "b" }
-                    } else {
-                        big_label.as_str()
-                    };
+                    // 許可済みのラベル（`["a","b"]`）だけを返す。
+                    let label = if i % 2 == 0 { "a" } else { "b" };
                     serde_json::json!({
                         "id": item["id"],
                         "status": "ok",
@@ -779,17 +775,29 @@ fn case_validation_predictions_are_returned(case_dir: &Path) -> Result<(), Strin
 }
 
 /// 予測列を含む結果は、`validation_inputs` 付きのときだけ既定の上限
-/// （`MAX_RESULT_BYTES` = 1 MiB）を超えても受理される
-/// （`MAX_RESULT_BYTES_WITH_VALIDATION`）。5000 件 × 250 文字のラベルで約 1.4 MB。
+/// （`MAX_RESULT_BYTES` = 1 MiB）を超えても受理される（リクエストごとに計算した
+/// 上限。`TrainRequest::max_result_bytes`）。1000 件 × 1000 バイトの id で、
+/// 結果は約 1.05 MB（許可済みのラベルだけを返す正常な結果）。
 #[cfg(unix)]
 fn case_validation_result_above_default_cap_is_accepted(case_dir: &Path) -> Result<(), String> {
-    const N: usize = 5000;
+    const N: usize = 1000;
+    const ID_LEN: usize = 1000;
     expect_true(
-        N * 250 > fandhe_edge_train::limits::MAX_RESULT_BYTES,
+        N * (ID_LEN + 50) > fandhe_edge_train::limits::MAX_RESULT_BYTES,
         "the test result must exceed the default cap",
     )?;
     let launcher = make_launcher(case_dir, "ok_validation_big");
-    let request = make_request_with_validation(N);
+    let request = make_request(Some(30))
+        .with_validation_inputs(
+            (0..N)
+                .map(|i| ValidationInput::new(format!("{i:0>ID_LEN$}"), String::new()))
+                .collect(),
+        )
+        .expect("valid validation inputs");
+    expect_true(
+        request.max_result_bytes() > fandhe_edge_train::limits::MAX_RESULT_BYTES,
+        "the per-request cap must exceed the default cap",
+    )?;
     let limits = RunLimits::for_request(&request);
     let run = run_train(&launcher, &request, case_dir, &limits)
         .map_err(|e| format!("run_train failed: {e}"))?;
@@ -803,8 +811,8 @@ fn case_validation_result_above_default_cap_is_accepted(case_dir: &Path) -> Resu
     )
 }
 
-/// validation 付きの上限（`MAX_RESULT_BYTES_WITH_VALIDATION` = 64 MiB）を超える
-/// 標準出力は `TooLarge` として拒否される（`RuntimeError`）。
+/// リクエストごとに計算した上限（`TrainRequest::max_result_bytes`）を超える
+/// 標準出力（70 MiB の空白を続ける）は `TooLarge` として拒否される（`RuntimeError`）。
 #[cfg(unix)]
 fn case_validation_result_above_validation_cap_is_rejected(case_dir: &Path) -> Result<(), String> {
     let launcher = make_launcher(case_dir, "ok_validation_over_cap");

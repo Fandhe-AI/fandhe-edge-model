@@ -167,7 +167,7 @@ from . import artifact as artifact_mod
 from . import contract
 from .errors import WorkerError
 from .exitcode import ExitCode
-from .limits import MAX_RESULT_BYTES_WITH_VALIDATION
+from .limits import MAX_RESULT_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION
 
 #: 監視ループのポーリング間隔（秒）。
 _POLL_INTERVAL_SECONDS = 0.1
@@ -178,7 +178,7 @@ _POLL_INTERVAL_SECONDS = 0.1
 _TIME_LIMIT_GRACE_SECONDS = 5.0
 
 #: 子プロセスの標準出力の上限（bytes）。
-_MAX_WORKER_STDOUT_BYTES = 1 * 1024 * 1024
+_MAX_WORKER_STDOUT_BYTES = MAX_RESULT_BYTES
 
 #: `validation_inputs` を持つリクエストの子プロセス標準出力の上限（bytes）。
 #: 値は `limits.py::MAX_RESULT_BYTES_WITH_VALIDATION`（Rust 側の
@@ -510,13 +510,9 @@ def run_supervised_train(request_path: Path) -> ExitCode:
 
     time_limit_seconds = request.time_limit_seconds
     rss_limit_bytes = request.rss_limit_bytes
-    # `validation_inputs` を持つリクエストだけ、予測列を含む結果 JSON のぶん
-    # 標準出力の保持上限を緩める（Rust 側 `TrainRequest::max_result_bytes` と同じ）。
-    stdout_cap = (
-        _MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION
-        if request.validation_inputs is not None
-        else _MAX_WORKER_STDOUT_BYTES
-    )
+    # 標準出力の保持上限は、リクエストごとに計算した値（Rust 側
+    # `TrainRequest::max_result_bytes` と同じ式。`validation_inputs` が無ければ 1 MiB）。
+    stdout_cap = request.max_result_bytes
     # train_path・root の fd はスーパーバイザーには不要（_worker が独立に
     # 検証・open し直す）。out_dir の fd だけは、直後の予約のために保持する。
     request.train_path.close()

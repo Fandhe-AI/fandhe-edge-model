@@ -90,6 +90,11 @@ pub enum TrainRequestError {
     ValidationInputsTotalBytesExceeded,
     /// `validation_inputs[index].id` が先行する要素と重複する。
     ValidationInputDuplicateId { index: usize },
+    /// `validation_inputs` の結果 JSON の最大長（許可するラベル・id から計算。
+    /// [`crate::request::validation_result_bytes_bound`]）が
+    /// [`crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION`] を超える。学習を始める
+    /// 前に `limit_exceeded` で拒否する。
+    ValidationResultTooLarge,
 }
 
 impl std::fmt::Display for TrainRequestError {
@@ -191,6 +196,11 @@ impl std::fmt::Display for TrainRequestError {
             TrainRequestError::ValidationInputDuplicateId { index } => {
                 write!(f, "validation_inputs[{index}].id is a duplicate")
             }
+            TrainRequestError::ValidationResultTooLarge => write!(
+                f,
+                "the result for validation_inputs could exceed {} bytes",
+                crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION
+            ),
         }
     }
 }
@@ -203,7 +213,9 @@ impl TrainRequestError {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             TrainRequestError::InvalidPath { .. } => "invalid_path",
-            TrainRequestError::TooLarge { .. } => "limit_exceeded",
+            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
+                "limit_exceeded"
+            }
             TrainRequestError::NotUtf8
             | TrainRequestError::NotJson { .. }
             | TrainRequestError::NotObject
@@ -236,7 +248,9 @@ impl TrainRequestError {
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
-            TrainRequestError::TooLarge { .. } => ExitCode::LimitExceeded,
+            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
+                ExitCode::LimitExceeded
+            }
             _ => ExitCode::InvalidInput,
         }
     }

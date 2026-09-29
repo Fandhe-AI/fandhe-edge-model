@@ -446,9 +446,9 @@ impl SuccessOutcome {
     }
 
     /// 学習ジョブ内で採点した validation の予測列。リクエストが
-    /// `validation_inputs` を持っていた場合だけ `Some`（件数は入力件数以下。
-    /// 件数・`id` の順序が入力と一致するかは呼び出し元〔`crate::search`〕が
-    /// 照合する）。
+    /// `validation_inputs` を持っていた場合だけ `Some`（件数・`id` の順序が入力と
+    /// 一致するかは呼び出し元〔`crate::search`〕が照合する。入力より多くても
+    /// ここでは拒否しない）。
     #[must_use]
     pub fn validation_predictions(&self) -> Option<&[ValidationPrediction]> {
         self.validation_predictions.as_deref()
@@ -618,21 +618,19 @@ fn canonicalize_root_best_effort(root: &str) -> String {
     }
 }
 
-/// `validation_predictions` の検証（REQ-27・REQ-39）。件数は入力件数
-/// （`max_count`）以下、`id` は非空・[`MAX_INPUT_ID_BYTES`] 以下、`status:"ok"`
+/// `validation_predictions` の検証（REQ-27・REQ-39）。`id` は非空・[`MAX_INPUT_ID_BYTES`] 以下、`status:"ok"`
 /// は `predicted_label` が文字列、`abstain`／`error` は `null` でなければならない。
 /// `id` の順序・件数の一致は検査しない（呼び出し元の `crate::search` が
-/// 既存の record_id 照合で候補単位に処理する）。
+/// 既存の record_id 照合で候補単位に処理する）。件数が入力より多い場合も
+/// ここでは拒否しない（Cursor 指摘対応。issue #84 PR #238 レビュー: 結果全体の
+/// 拒否は探索全体の失敗になる。件数は結果のバイト長上限〔リクエストごとに
+/// 正確に計算〕で有界）。
 fn parse_validation_predictions(
     items: Vec<RawValidationPrediction>,
-    max_count: usize,
 ) -> Result<Vec<ValidationPrediction>, TrainResultError> {
     let malformed = || TrainResultError::MalformedArtifact {
         field: "validation_predictions",
     };
-    if items.len() > max_count {
-        return Err(malformed());
-    }
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         if item.id.is_empty() || item.id.len() > MAX_INPUT_ID_BYTES {
@@ -656,7 +654,7 @@ impl TrainOutcome {
     /// 学習ワーカーの標準出力（信頼しない外部入力）から結果を解析する。
     ///
     /// `supervisor.py`（子プロセスが自分で終了した場合の検査）と同じ規則:
-    /// (1) バイト長を [`TrainRequest::max_result_bytes`]（既定 [`crate::limits::MAX_RESULT_BYTES`]。`validation_inputs` 付きは [`crate::limits::MAX_RESULT_BYTES_WITH_VALIDATION`]）と照合 → (2) UTF-8 として読める →
+    /// (1) バイト長を [`TrainRequest::max_result_bytes`]（既定 [`crate::limits::MAX_RESULT_BYTES`]。`validation_inputs` 付きはラベル・id から計算した値）と照合 → (2) UTF-8 として読める →
     /// (3) 空行を除いてちょうど 1 行 → (4) JSON として解析可能 →
     /// (5) `status`／各フィールドの組み合わせが妥当 → (6) `status:"ok"` の
     /// 場合に限り、`artifact_dir` が `request` の `root`／`out_dir` 配下に
@@ -727,9 +725,7 @@ impl TrainOutcome {
                 let validation_predictions =
                     match (request.validation_inputs(), raw.validation_predictions) {
                         (None, None) => None,
-                        (Some(inputs), Some(Some(items))) => {
-                            Some(parse_validation_predictions(items, inputs.len())?)
-                        }
+                        (Some(_), Some(Some(items))) => Some(parse_validation_predictions(items)?),
                         _ => return Err(TrainResultError::MalformedOutcome),
                     };
                 // 経路の閉じ込め（REQ-39・P0）: 空文字・絶対パスの取り違え・
@@ -1733,7 +1729,6 @@ mod tests {
             field: "validation_predictions",
         };
         let cases = [
-            r#"[{"id":"r0","status":"ok","predicted_label":"a"},{"id":"r1","status":"ok","predicted_label":"a"}]"#,
             r#"[{"id":"","status":"ok","predicted_label":"a"}]"#,
             r#"[{"id":"r0","status":"ok","predicted_label":null}]"#,
             r#"[{"id":"r0","status":"error","predicted_label":"a"}]"#,
@@ -1788,5 +1783,23 @@ mod tests {
             ),
             Err(TrainResultError::TooLarge { .. })
         ));
+    }
+
+    /// (Cursor 指摘対応・issue #84 PR #238 レビュー) 予測列が入力より多くても、
+    /// 結果の解析では拒否しない（結果全体の拒否は探索全体の失敗になるため）。
+    /// 件数の不一致は呼び出し元（`crate::search`）が候補単位の `ScoringFailed`
+    /// にする。
+    #[test]
+    fn req27_extra_prediction_rows_are_parsed_and_left_to_the_caller() {
+        let json = ok_json_with_predictions(
+            r#"[{"id":"r0","status":"ok","predicted_label":"a"},{"id":"r1","status":"ok","predicted_label":"a"}]"#,
+        );
+        let outcome =
+            TrainOutcome::from_worker_stdout(json.as_bytes(), &request_with_validation(1))
+                .expect("extra rows are not a malformed result");
+        let TrainOutcome::Ok(success) = outcome else {
+            panic!("expected Ok");
+        };
+        assert_eq!(success.validation_predictions().map(<[_]>::len), Some(2));
     }
 }

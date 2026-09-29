@@ -63,6 +63,7 @@ _REQUEST_FULL = _load_json_fixture("request_full.json")
 _REQUEST_MINIMAL = _load_json_fixture("request_minimal.json")
 _REQUEST_WITH_VALIDATION = _load_json_fixture("request_with_validation.json")
 _RESULT_OK_WITH_VALIDATION = _load_json_fixture("result_ok_with_validation.json")
+_RESULT_CAP_CASES = _load_json_fixture("result_cap_cases.json")
 _REJECT_CASES = _load_json_fixture("request_reject_cases.json")
 _RESULT_OK = _load_json_fixture("result_ok.json")
 _RESULT_ERROR = _load_json_fixture("result_error.json")
@@ -321,3 +322,72 @@ def test_req21_missing_request_file_matches_result_error_fixture(
     captured = capsys.readouterr()
     printed = json.loads(captured.out.strip())
     assert printed == _RESULT_ERROR
+
+
+@pytest.mark.parametrize("case", _RESULT_CAP_CASES["cases"], ids=lambda c: c["name"])
+def test_req39_result_cap_cases_match_bound_function(case: dict[str, Any]) -> None:
+    """P1（issue #84 PR #238 レビュー）: リクエストごとの結果上限の計算が、独立に
+    計算した共有 fixture `result_cap_cases.json` と一致する（Rust 側
+    `validation_result_bytes_bound` と同じ fixture で照合する）。
+    """
+    actual = contract.validation_result_bytes_bound(case["label_order"], case["ids"])
+    assert actual == case["expected_max_result_bytes"], case["name"]
+
+
+def test_req39_request_with_validation_fixture_has_computed_result_cap(tmp_path: Path) -> None:
+    """`request_with_validation.json` の結果上限は、1 MiB ＋ 余裕 64 ＋ 3 件 ×
+    (固定 50 ＋ id 7 ＋ 最長ラベル 8) = 1_048_835。supervisor の標準出力上限はこれを使う。
+    """
+    req = contract.validate_request(_resolve_root(_REQUEST_WITH_VALIDATION, tmp_path))
+    try:
+        assert req.max_result_bytes == 1_048_835
+    finally:
+        req.close_resources()
+    plain = contract.validate_request(_resolve_root(_REQUEST_FULL, tmp_path))
+    try:
+        assert plain.max_result_bytes == limits.MAX_RESULT_BYTES
+    finally:
+        plain.close_resources()
+
+
+def test_req39_control_char_label_with_many_inputs_is_rejected_before_training(
+    tmp_path: Path,
+) -> None:
+    """P1: 制御文字だけの最長ラベル（エスケープで 1536 バイト）と多数の短い入力の
+    組み合わせは、結果の最大長が天井を超えるため `limit_exceeded`／exit 20 で拒否される。
+    件数が少なければ受理され、上限は天井以下で全件が最長ラベルの結果を収容できる。
+    """
+    labels = ["\u0001" * 256, "b"]
+
+    def request_with(n: int) -> dict:
+        resolved = _resolve_root(_REQUEST_FULL, tmp_path)
+        resolved["label_order"] = labels
+        resolved["validation_inputs"] = [{"id": f"a{i}", "input": ""} for i in range(n)]
+        return resolved
+
+    with pytest.raises(WorkerError) as exc_info:
+        contract.validate_request(request_with(43_000))
+    assert exc_info.value.code == "limit_exceeded"
+    assert int(exc_info.value.exit_code) == 20
+
+    accepted = contract.validate_request(request_with(1_000))
+    try:
+        assert accepted.max_result_bytes <= limits.MAX_RESULT_BYTES_WITH_VALIDATION
+        worst_case = (
+            limits.MAX_RESULT_BYTES
+            + 28
+            + sum(
+                len(
+                    json.dumps(
+                        {"id": f"a{i}", "status": "abstain", "predicted_label": labels[0]},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                + 1
+                for i in range(1_000)
+            )
+        )
+        assert accepted.max_result_bytes >= worst_case
+    finally:
+        accepted.close_resources()

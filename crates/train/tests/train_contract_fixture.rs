@@ -395,10 +395,8 @@ fn req27_validation_request_and_result_round_trip_fixtures() {
     let ids: Vec<&str> = inputs.iter().map(|v| v.id()).collect();
     assert_eq!(ids, ["val-001", "val-002", "val-003"]);
     assert_eq!(inputs[0].input(), "great product, works well");
-    assert_eq!(
-        request.max_result_bytes(),
-        limits::MAX_RESULT_BYTES_WITH_VALIDATION
-    );
+    // 1 MiB + 余裕 64 + 3 件 × (固定 50 + id 7 + 最長ラベル "positive" 8) = 1_048_835。
+    assert_eq!(request.max_result_bytes(), 1_048_835);
     let expected_request = load_fixture_value("request_with_validation.json");
     let actual_request: Value =
         serde_json::from_slice(&request.to_json_vec().expect("serialize")).expect("valid json");
@@ -424,4 +422,38 @@ fn req27_validation_request_and_result_round_trip_fixtures() {
     let plain = TrainRequest::from_json_slice(&load_fixture_bytes("request_full.json"))
         .expect("request_full.json must parse");
     assert!(TrainOutcome::from_worker_stdout(ok_line.as_bytes(), &plain).is_err());
+}
+
+/// P1（issue #84 PR #238 レビュー）: リクエストごとの結果上限の計算
+/// （`validation_result_bytes_bound`）が、独立に計算した共有 fixture
+/// `result_cap_cases.json` と一致する（Python 側と同じ fixture で照合する）。
+#[test]
+fn req39_result_cap_cases_fixture_matches_bound_function() {
+    let fixture = load_fixture_value("result_cap_cases.json");
+    let cases = fixture["cases"].as_array().expect("cases must be an array");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let labels: Vec<String> = case["label_order"]
+            .as_array()
+            .expect("label_order")
+            .iter()
+            .map(|v| v.as_str().expect("label").to_string())
+            .collect();
+        let ids: Vec<String> = case["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_str().expect("id").to_string())
+            .collect();
+        let actual = fandhe_edge_train::request::validation_result_bytes_bound(
+            &labels,
+            ids.iter().map(String::as_str),
+        );
+        assert_eq!(
+            Some(actual as u64),
+            case["expected_max_result_bytes"].as_u64(),
+            "case: {name}"
+        );
+    }
 }

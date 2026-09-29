@@ -117,19 +117,20 @@ pub const ALLOWED_SELECTOR_VERSIONS: [&str; 1] = ["0.1"];
 pub const MAX_VALIDATION_INPUT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// `validation_inputs` を含むリクエストの結果 JSON（`validation_predictions`
-/// を含む）の読み込み上限（バイト）。`validation_inputs` を持たない
-/// リクエストの結果には [`MAX_RESULT_BYTES`]（1 MiB）を使い続ける。
-/// `supervisor.py::_MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION`。
+/// を含む）の読み取り上限の**天井**（バイト）。実際の上限はリクエストごとに
+/// [`crate::request::validation_result_bytes_bound`] で正確に計算する
+/// （`TrainRequest::max_result_bytes`。許可するラベル・id から求める）。計算値が
+/// この天井を超えるリクエストは、学習を始める前に `limit_exceeded` で拒否する
+/// （P1 指摘対応。issue #84 PR #238 レビュー: 以前の固定の見積もりは、エスケープで
+/// 大きくなる許可済みのラベルの結果を収容できなかった）。したがって、受理された
+/// リクエストの正常な結果が上限で弾かれることはない。
+/// `validation_inputs` を持たないリクエストの結果には [`MAX_RESULT_BYTES`]（1 MiB）
+/// を使い続ける。Python 側の対応は `limits.py::MAX_RESULT_BYTES_WITH_VALIDATION`。
 ///
-/// 導出（証拠種別: 推定。計算式のみで実測ではない）: 入力側は
-/// [`MAX_REQUEST_BYTES`]（1 MiB）に収まるため、最小のレコード
-/// `{"id":"a","input":""}`（21 バイト）で件数は最大 49,932 件。予測 1 件は
-/// `id`（合計は入力側の 1 MiB 以内）＋ `status`・キー名・区切りの定型
-/// （約 45 バイト）＋ `predicted_label`（最大 256 バイト。JSON エスケープ
-/// で最大 6 倍になりうるが、バイト数が最大の非 ASCII でも 3 倍程度）。
-/// 最悪でも 49,932 × (45 + 256 × 3) ≒ 41 MB ＋ id 1 MiB 程度となり、
-/// 64 MiB に収まる（`scores` は含めない）。64 MiB は
-/// [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] と同じ値で、新しい桁を増やさない。
+/// 値 64 MiB は [`MAX_VALIDATION_INPUT_TOTAL_BYTES`] と同じで、新しい桁を増やさない
+/// （根拠: 仮置き。実用上の validation 件数・ラベル長は、この天井の内側に収まる
+/// ことをテストで確認している。ただし制御文字だけの最長ラベルと多数の短い入力の
+/// 組み合わせは拒否されうる）。
 pub const MAX_RESULT_BYTES_WITH_VALIDATION: usize = 64 * 1024 * 1024;
 /// 学習ワーカーの標準エラー出力（stderr）の保持上限（バイト）。REQ-39
 /// 「資源の上限」（#178）。`_worker` は supervisor の stderr を継承する

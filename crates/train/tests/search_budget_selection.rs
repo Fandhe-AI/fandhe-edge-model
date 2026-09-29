@@ -1229,6 +1229,51 @@ fn task18_1_2_prediction_length_mismatch_is_recorded_and_search_continues() {
     );
 }
 
+/// (T7b・Cursor 指摘対応・REQ-27。issue #84 PR #238 レビュー) 予測列が入力より
+/// **多い**場合も、少ない場合（T7）・`id` が合わない場合（T8b・T8c）と同じく候補単位の
+/// `scoring_failed` になり、他の候補の記録が残って探索が続く（以前は結果の解析が
+/// 結果全体を拒否し、探索全体が `SearchError` で止まっていた）。
+#[test]
+fn task18_1_2_extra_prediction_rows_fail_only_that_candidate_and_search_continues() {
+    let clock = FakeClock::new(0);
+    let mut ids: Vec<String> = VALIDATION_RECORD_IDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    ids.push("extra-row".to_string());
+    let mut outcomes = outcomes_with_correct(10);
+    outcomes.push(Outcome::Label("positive".to_string()));
+    let mut runner = FakeRunner::new(
+        &clock,
+        vec![
+            RunnerBehavior::Ok {
+                advance_ms: 10,
+                prediction: Prediction::WithIds { ids, outcomes },
+            },
+            ok(10, outcomes_with_correct(7)),
+        ],
+    );
+    let gold = validation_gold();
+    let split = validation_split_record_fixture();
+    let record = run_search(
+        &mut runner,
+        &clock,
+        default_input(&gold, &split, &["c3-a", "c3-b"]),
+    )
+    .expect("extra rows must not abort the whole search");
+    assert_eq!(runner.calls, 2, "c3-b は c3-a の後も実行される");
+    assert_eq!(
+        record.candidates[0].result,
+        CandidateSearchResult::ScoringFailed
+    );
+    assert_eq!(record.candidates[0].validation_outcomes(), None);
+    assert!(matches!(
+        record.candidates[1].result,
+        CandidateSearchResult::Evaluated { .. }
+    ));
+    assert_eq!(selected_id(&record), "c3-b");
+}
+
 /// (T8b・P0・REQ-27・評価の独立性) 予測列が件数は一致するが `id` の順序が異なる
 /// 場合、`run_search` は `validation_gold` と誤って突き合わせて正解率を算出せず、
 /// `scoring_failed` として選定対象から除外する。探索全体は中断しない。
