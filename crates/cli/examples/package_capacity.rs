@@ -136,7 +136,9 @@ fn parse(
 }
 
 fn main() -> std::process::ExitCode {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // 収集前に件数を打ち切る（REQ-39）。上限 +1 件だけ取れば超過を parse が検出できるため、
+    // untrusted な引数の件数に比例したメモリ確保をしない
+    let args: Vec<OsString> = std::env::args_os().skip(1).take(MAX_ARGS + 1).collect();
     let mut out = std::io::stdout().lock();
     let result = std::env::current_dir()
         .and_then(|d| d.canonicalize())
