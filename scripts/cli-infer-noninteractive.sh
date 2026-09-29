@@ -129,7 +129,13 @@ rec_dir=${FANDHE_EDGE_RECORD_DIR:-}
 rec_cmd='"fandhe-edge","infer"'
 rec_add() {
     if [ -n "$rec_dir" ]; then
-        rec_cmd="$rec_cmd,\"$(printf '%s' "$1" | json_escape 0)\""
+        # awk は行区切りの末尾改行を取り除くため、値が改行で終わるかを判定して json_escape へ
+        # 渡す（末尾改行を含むパスが記録で別の値にならないようにする）
+        _trail=0
+        case "$1" in
+            *$'\n') _trail=1 ;;
+        esac
+        rec_cmd="$rec_cmd,\"$(printf '%s' "$1" | json_escape "$_trail")\""
     fi
 }
 

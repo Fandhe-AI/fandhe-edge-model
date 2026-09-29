@@ -1182,6 +1182,36 @@ fn req36_run_record_invalid_utf8_path_arg_is_replaced() {
     std::fs::remove_dir_all(&bindir).ok();
 }
 
+/// パス値の末尾改行（と途中の改行）は記録の command で `\n` として保持される（REQ-36・TASK-36.1-2）。
+#[test]
+fn req36_run_record_path_arg_keeps_trailing_newline() {
+    let cases: [(&str, &str); 3] = [
+        ("p\n", "p\\n"),
+        ("p\n\n", "p\\n\\n"),
+        ("a\nb\n", "a\\nb\\n"),
+    ];
+    for (i, (value, escaped)) in cases.iter().enumerate() {
+        let dir = record_dir(&format!("trailnl{i}"));
+        let d = dir.to_str().unwrap();
+        let body = "echo '{\"code\":\"ok\"}'\nexit 0";
+        let o = run_with_fake_bin_args(
+            "trailnl",
+            body,
+            &["--package", value],
+            &[("FANDHE_EDGE_RECORD_DIR", d)],
+        );
+        assert_eq!(o.code, Some(0));
+        let rec = only_record(&dir);
+        assert!(
+            rec.contains(&format!(
+                "\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"{escaped}\"],"
+            )),
+            "{rec}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// 非ゼロ終了が残り、stdout・stderr は本文でなくバイト数と sha256 だけが残る。
 #[test]
 fn req36_run_record_captures_nonzero_exit_and_stderr() {
