@@ -16,8 +16,9 @@
 //! - [`baseline`][]: 下限基準（majority）の予測生成（REQ-25・TASK-25.1-2・
 //!   issue #65）
 //! - [`calibration`][]: 温度スケーリング（T）と保留しきい値（τ）の校正計算
-//!   （REQ-22 正常系・TASK-22.1-1・issue #95。PoC-12 移植。coverage の記録と
-//!   表示は TASK-22.3 が担当し未実装）
+//!   （REQ-22 正常系・TASK-22.1-1・issue #95。PoC-12 移植）
+//! - [`coverage`][]: 評価データ適用時の coverage の記録と表示（REQ-22 境界値・
+//!   TASK-22.3・issue #98。80% は参考値で合否条件にしない）
 //! - [`abstention`][]: 確信度（校正後の top1 確率）としきい値 τ の比較による
 //!   保留判定と、保留込み／保留なしの誤り率の比較（REQ-22 正常系・
 //!   TASK-22.1-2・issue #96。[`calibration`] の T・τ を再利用し、判定結果を
@@ -76,8 +77,8 @@
 //!   誤り率の比較も実装済み（TASK-22.1-2・issue #96・[`abstention`]）。
 //!   「対象外」ラベルによる扱いも実装済み（TASK-22.2・issue #97。
 //!   [`abstention::OutOfScopeLabel`]。定義ファイル側での指定方法・CLI 配線・
-//!   終了コード 11 への写像は未実装）。coverage の記録と表示（TASK-22.3）は
-//!   未実装
+//!   終了コード 11 への写像は未実装）。coverage の記録と表示も実装済み
+//!   （TASK-22.3・issue #98・[`coverage`]）
 //! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
 //!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
 //!   （REQ-24 異常系・TASK-24.2・issue #61）。`None` を JSON の `null` へ
@@ -120,8 +121,8 @@
 //! - 基礎統計（REQ-29・TASK-29.1-1・issue #107。[`diagnostics`]）: 実装済み
 //!   （診断専用。合否判定に使わない）。混同しやすいラベルの組とレポート統合
 //!   （#108）・診断限界の明記（#109）・データ量水準別報告（#110）は未実装
-//! - coverage・abstain_rate・error_rate 等のレポート系（REQ-29）: 未実装
-//!   （TASK-29.x）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
+//! - abstain_rate・error_rate 等の診断レポート系（REQ-29）: 未実装
+//!   （TASK-29.x。評価データ適用時の coverage は [`coverage`] に実装済み）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
 //! - 評価データのハッシュの前後比較・凍結記録との接続（REQ-17・REQ-27）:
 //!   実装済み（TASK-27.1-2・issue #70。[`eval_data_invariance`]）。ただし
@@ -174,6 +175,7 @@
 pub mod abstention;
 pub mod baseline;
 pub mod calibration;
+pub mod coverage;
 pub mod diagnostics;
 pub mod eval_data_invariance;
 pub mod final_test_once;

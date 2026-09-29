@@ -1,0 +1,16 @@
+[package]
+name = "fandhe-edge-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Inference SDK layer (single/batch shared inference path) for fandhe-edge-model."
+
+[dependencies]
+# workspace 内の path 依存のみ（外部 crate は追加しない。REQ-32: 学習側に依存しない）。
+# 用途は入力サイズ上限 `MAX_INFER_INPUT_BYTES` の参照に限る。
+fandhe-edge-core.workspace = true
+
+[lints]
+workspace = true

@@ -54,6 +54,11 @@
 //! 対象外ラベルを指定しない（`None`）場合は TASK-22.1 の挙動と完全に同じ。
 //! 指定 ID がラベル集合に無い場合は fail-closed でエラーにする。
 //!
+//! # coverage の記録（TASK-22.3）
+//!
+//! 評価データ適用時の coverage は [`AbstentionComparison::coverage`] に記録する
+//! （実装と定義は [`crate::coverage`]。対象外 argmax の行は答えた側に数える）。
+//!
 //! # 対象外（本モジュールが扱わないこと）
 //!
 //! - 定義ファイルで対象外ラベルを指定する方法（REQ-15 のスキーマ変更で、設計と
@@ -61,8 +66,6 @@
 //!   呼び出し側から受け取る
 //! - core の判定型 `out_of_scope` 状態の追加・CLI への配線・終了コード 11 への
 //!   写像（issue #140・TASK-33.x）
-//! - 対象外 argmax の行を coverage の分母・分子にどう数えるか（TASK-22.3）
-//! - coverage の記録・表示（TASK-22.3）
 //! - REQ-22 正常系の 95% ブートストラップ信頼区間（PoC-12 は `n_boot=2000`・
 //!   `seed=12` の対応のあるブートストラップを使うが、本 issue の受入は
 //!   具体値での比較のみ。実装には乱数と依存の判断が要る）
@@ -74,6 +77,7 @@
 //!   配線（issue #140）
 
 use crate::calibration::{self, Calibration, CalibrationError};
+use crate::coverage::CoverageReport;
 use crate::metrics::{self, EvalRecord, Outcome, Ratio};
 use crate::significance;
 
@@ -348,6 +352,7 @@ pub struct AbstentionComparison {
     unconditional_error: Ratio,
     adopted_error: Option<Ratio>,
     out_of_scope: u64,
+    coverage: CoverageReport,
 }
 
 impl AbstentionComparison {
@@ -378,6 +383,12 @@ impl AbstentionComparison {
     /// `with_abstention().outcome_counts.abstain` で、本件数とは重ならない。
     pub fn out_of_scope(&self) -> u64 {
         self.out_of_scope
+    }
+
+    /// 評価データ適用時の coverage の記録（REQ-22 境界値・TASK-22.3）。
+    /// 参考値であり、値は本比較の成否に影響しない（[`crate::coverage`]）。
+    pub fn coverage(&self) -> &CoverageReport {
+        &self.coverage
     }
 }
 
@@ -562,12 +573,23 @@ pub fn compare_abstention_with_out_of_scope(
         None => None,
     };
 
+    let total = u64::try_from(records.len()).map_err(|_| CalibrationError::Internal {
+        detail: "record count conversion failed".to_string(),
+    })?;
+    let coverage = crate::coverage::record_coverage(
+        total,
+        with_abstention.outcome_counts.abstain,
+        out_of_scope_count,
+        calibration.validation_coverage(),
+    )?;
+
     Ok(AbstentionComparison {
         without_abstention,
         with_abstention,
         unconditional_error,
         adopted_error,
         out_of_scope: out_of_scope_count,
+        coverage,
     })
 }
 
@@ -923,6 +945,21 @@ mod tests {
             assert_eq!(
                 covered, config.validation_covered,
                 "{}: decide_abstention covered count on validation rows",
+                config.name
+            );
+            // 対象外ラベル未指定なら、validation に適用した coverage の記録は
+            // 校正時の validation coverage と一致する（PoC-12 の定義。TASK-22.3）。
+            let applied = compare_abstention(&LABELS, &calibration, &validation_records).unwrap();
+            assert_eq!(
+                applied.coverage().coverage().numerator(),
+                calibration.validation_coverage().numerator(),
+                "{}: recorded coverage numerator",
+                config.name
+            );
+            assert_eq!(
+                applied.coverage().coverage().denominator(),
+                calibration.validation_coverage().denominator(),
+                "{}: recorded coverage denominator",
                 config.name
             );
         }
