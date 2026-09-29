@@ -108,6 +108,10 @@ impl Env {
                  [ \"${{FAKE_LOG_MODE:-}}\" != flood_err ] || head -c 300000 /dev/zero >&2\n\
                  cat \"$FAKE_STREAM_FIXTURE\"\n\
                  [ \"${{FAKE_LOG_MODE:-}}\" = early ] && exit 0\n\
+                 if [ \"${{FAKE_LOG_MODE:-}}\" = die_mid_run ]; then\n\
+                 until [ -s \"$FAKE_CLI_LOG\" ]; do sleep 0.05; done\n\
+                 exit 0\n\
+                 fi\n\
                  if [ \"${{FAKE_LOG_MODE:-}}\" = late_line ]; then\n\
                  trap 'printf \"%s\\n\" \"{LATE_LINE}\"; exit 0' TERM\n\
                  sleep 300 &\n\
@@ -960,4 +964,25 @@ fn req38_denial_written_after_stop_signal_is_counted() {
     assert_eq!(o.code, Some(12), "{}", o.stdout);
     has(&o, "\"network_deny_events\": 1");
     has(&o, "\"unattributed_network_deny_events\": 1");
+}
+
+/// ヘッダを出して起動確認を通った後、実行中に log が exit 0 で終了した場合は、監視が抜けた
+/// 時間帯があるため 0 件と判定せず 70 にする（REQ-38。終了済みの子を `kill -0` で生存と誤認しない）。
+#[test]
+fn req38_log_exiting_mid_run_is_undeterminable() {
+    let e = Env::new();
+    let cli_log = e.cli_log.display().to_string();
+    let o = e.run(
+        "clean.ndjson",
+        &e.base_args(),
+        &[
+            ("FAKE_LOG_MODE", "die_mid_run"),
+            ("FAKE_CLI_LOG", &cli_log),
+            ("FANDHE_EDGE_LOG_STREAM_TAIL_SECS", "1"),
+        ],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "\"network_verdict\": \"undeterminable\"");
+    has(&o, "log stream ended before the monitoring window closed");
+    assert_eq!(e.cli_calls().len(), 7);
 }

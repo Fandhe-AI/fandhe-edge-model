@@ -225,6 +225,15 @@ stream_file="$out_dir/log_stream.ndjson"
 report_file="$out_dir/network_report.json"
 meta_file="$out_dir/monitor.meta.json"
 
+# 監視プロセス（log）が動いているか。`kill -0` は終了済みで未回収（ゾンビ）の子にも成功しうる
+# ため使わず、ps の状態で判定する（空・Z で始まる状態は終了済み。ps が失敗した場合も動いて
+# いないとみなす＝fail-closed。Linux・macOS 共通）
+log_alive() {
+    _st=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ') || return 1
+    case "$_st" in '' | Z*) return 1 ;; esac
+    return 0
+}
+
 utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 logpid=
@@ -278,11 +287,11 @@ sleep "$warmup"
 gate_ok=0
 i=0
 while [ "$i" -le 50 ]; do
-    kill -0 "$logpid" 2>/dev/null || break
+    log_alive "$logpid" || break
     if [ "$(head -c 22 -- "$stream_file" 2>/dev/null)" = "Filtering the log data" ]; then
         # ヘッダ出力直後の即終了を拾うため、短い猶予の後にもう一度生存を確認する
         sleep 0.3
-        kill -0 "$logpid" 2>/dev/null && gate_ok=1
+        log_alive "$logpid" && gate_ok=1
         break
     fi
     sleep 0.1
@@ -300,27 +309,32 @@ run_rc=0
 
 sleep "$tail_secs"
 
-# ---- 監視の停止 ----
-# 停止手順（ここだけに置く）: TERM → 終了を上限付きで待つ → 残っていれば KILL → wait で回収 →
-# 終了を確認できたら集計へ進む。log は生ログへ直接書くため、log（と同じグループの子）が
-# 終了していれば書き込みは完了している。終了を確認できなければ stream_ok=0 にして判定不能(70)
-# とし、「0 件」とは判定しない（停止後に遅れて出た拒否行を取りこぼさない）。
+# ---- 監視の停止（監視の健全性の規則はここだけに置く） ----
+# 手順: 停止操作を送る前に log が既に終了していないか確認 → TERM → 終了を上限付きで待つ →
+# 残っていれば KILL → wait で回収して終了状態を必ず取得 → 判定。log は生ログへ直接書くため、
+# 終了していれば書き込みは完了している。次のどれかなら stream_ok=0 にして判定不能(70)とし、
+# 「0 件」とは判定しない（監視が抜けた時間帯の拒否を見逃さない。REQ-38・fail-closed）:
+#   - こちらの停止操作より前に log が終了していた（実行中の異常終了。ゾンビ含む）
+#   - wait の終了状態が、正常終了（0）・こちらの TERM（143）・KILL（137）のいずれでもない
+#     （自然終了の 0 は停止操作の前の終了として上で弾く。SIGPIPE・SIGXFSZ・異常終了など）
 stream_ok=1
-kill -0 "$logpid" 2>/dev/null || stream_ok=0
+log_alive "$logpid" || stream_ok=0
 stopped=$(utc_now)
 if [ "$stream_ok" -eq 1 ]; then
     kill -s TERM -- "-$logpid" 2>/dev/null || true
     i=0
-    while [ "$i" -lt 50 ] && kill -0 "$logpid" 2>/dev/null; do
+    while [ "$i" -lt 50 ] && log_alive "$logpid"; do
         sleep 0.1
         i=$((i + 1))
     done
 fi
 kill -s KILL -- "-$logpid" 2>/dev/null || true
-wait "$logpid" 2>/dev/null || true
-if kill -0 "$logpid" 2>/dev/null; then
-    stream_ok=0
+log_rc=0
+wait "$logpid" 2>/dev/null || log_rc=$?
+if [ "$stream_ok" -eq 1 ]; then
+    case "$log_rc" in 0 | 137 | 143) ;; *) stream_ok=0 ;; esac
 fi
+log_alive "$logpid" && stream_ok=0
 logpid=
 kill -s KILL -- "-$wd" 2>/dev/null || true
 wait "$wd" 2>/dev/null || true
