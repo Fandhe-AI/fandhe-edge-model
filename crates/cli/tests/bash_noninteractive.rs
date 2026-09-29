@@ -1657,6 +1657,78 @@ fn req39_run_record_moved_dir_leaves_no_record_after_failure() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// 確定先の名前に既存ファイルがあっても上書きせず、別の名前で再試行して記録する。
+/// 衝突が上限回数続いたら記録を捨て、推論の結果・終了コードを変えず一時名も残さない
+/// （REQ-39・TASK-36.1-2）。PATH 上の `ln` シムが、確定先へ既存ファイルを先に作って衝突を起こす。
+#[test]
+fn req39_run_record_never_overwrites_existing_final_name() {
+    use std::os::unix::fs::PermissionsExt;
+    for (label, always) in [("collide-once", false), ("collide-always", true)] {
+        let base = record_dir(label);
+        let dir = base.join("rec");
+        let shim = base.join("shim");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        let real_ln = Command::new("sh")
+            .args(["-c", "command -v ln"])
+            .output()
+            .expect("command -v ln");
+        let real_ln = String::from_utf8_lossy(&real_ln.stdout).trim().to_string();
+        assert!(!real_ln.is_empty());
+        let marker = base.join("collided");
+        let ln = shim.join("ln");
+        std::fs::write(
+            &ln,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nif [ '{a}' = 1 ] || [ ! -e '{m}' ]; then\n  echo PRE-EXISTING > \"$last\"; : > '{m}'\nfi\nexec '{r}' \"$@\"\n",
+                a = i32::from(always),
+                m = marker.display(),
+                r = real_ln
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&ln, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let o = run_with_fake_bin_args(
+            label,
+            "echo '{\"code\":\"ok\"}'\nexit 0",
+            &["--help"],
+            &[
+                ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+                ("PATH", &path),
+            ],
+        );
+        // 推論の結果と終了コードは変わらない
+        assert_eq!(o.code, Some(0), "{label}");
+        assert_eq!(o.stdout, "{\"code\":\"ok\"}\n", "{label}");
+        let files = record_files(&dir);
+        let pre: Vec<_> = files.iter().filter(|f| f.1 == "PRE-EXISTING\n").collect();
+        let recs: Vec<_> = files
+            .iter()
+            .filter(|f| f.1.starts_with("{\"schema\""))
+            .collect();
+        assert!(!pre.is_empty(), "{label}: {files:?}");
+        assert_eq!(
+            pre.len() + recs.len(),
+            files.len(),
+            "{label}: leftover {files:?}"
+        );
+        if always {
+            // 10 回すべて衝突: 既存 10 件が無傷で残り、記録は捨てられる
+            assert_eq!(pre.len(), 10, "{files:?}");
+            assert!(recs.is_empty(), "{files:?}");
+        } else {
+            assert_eq!(pre.len(), 1, "{files:?}");
+            assert_eq!(recs.len(), 1, "{files:?}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
 /// 未設定・空文字では何も作らず出力も変えない（既定の経路の回帰）。
 #[test]
 fn req36_no_record_dir_creates_nothing() {

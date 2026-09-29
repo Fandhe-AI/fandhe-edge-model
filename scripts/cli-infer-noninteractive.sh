@@ -41,7 +41,8 @@
 # 実行記録（REQ-36・TASK-36.1-2・#150。opt-in）:
 #   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
 #   その直下へ一時名 `.run-record.<pid>.<乱数>.tmp`（noclobber の O_EXCL 作成・0600）で作り、書き込みと検証が済んだときだけ
-#   `run-record.<pid>.<乱数>` へ rename で確定する（失敗時は一時名・最終名とも残さない。作成・rename・削除は
+#   `run-record.<pid>.<乱数>` へ確定する（ハードリンク `ln` で上書きせず原子的に。衝突したら別の乱数で最大 10 回再試行し、
+#   それでも確定できなければ記録を捨てて結果は変えない）（失敗時は一時名・最終名とも残さない。作成・rename・削除は
 #   記録先を cd -P で開いたカレントディレクトリへの相対名で行い、記録先の移動・差し替えに影響されない）。
 #   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
 #   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
@@ -661,7 +662,8 @@ case "$rc" in
         ;;
 esac
 # 実行記録の保存（opt-in。TASK-36.1-2）。正規化と置き換えが済んだ最終結果を記録する。
-# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）
+# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）。ただし確定先の名前の
+# 衝突が上限回数続いた場合だけは記録を捨て、推論の結果・終了コードを変えない
 if [ -n "$rec_dir" ]; then
     rec_ok=1
     case "$started_at" in
@@ -715,20 +717,32 @@ if [ -n "$rec_dir" ]; then
                     exit 3
                 fi
                 exec 4>&-
-                if [ -L "$rec_tmp" ] || [ ! -f "$rec_tmp" ] || ! rec_dir_unchanged ||
-                    [ -e "$rec_name" ] || [ -L "$rec_name" ] || ! mv -f -- "$rec_tmp" "$rec_name"; then
+                if [ -L "$rec_tmp" ] || [ ! -f "$rec_tmp" ] || ! rec_dir_unchanged; then
                     rm -f -- "$rec_tmp"
                     exit 3
                 fi
+                # 上書きしない原子的な確定: ハードリンクは確定先が既にあれば（symlink を含め）失敗する。
+                # 成功したら一時名を消す。確定先の衝突は exit 4（別の名前で再試行）、それ以外は exit 3
+                if ! ln -- "$rec_tmp" "$rec_name" 2>/dev/null; then
+                    rm -f -- "$rec_tmp"
+                    if [ -e "$rec_name" ] || [ -L "$rec_name" ]; then exit 4; fi
+                    exit 3
+                fi
+                rm -f -- "$rec_tmp"
                 # 確定後も記録先が起動前のままで、記録が通常ファイルであること
                 if [ -L "$rec_name" ] || [ ! -f "$rec_name" ] || ! rec_dir_unchanged; then
                     rm -f -- "$rec_name"
                     exit 3
                 fi
             ) || rec_rc=$?
-            [ "$rec_rc" -eq 2 ] || break
+            case "$rec_rc" in 2 | 4) ;; *) break ;; esac
         done
-        [ "$rec_rc" -eq 0 ] || rec_ok=0
+        case "$rec_rc" in
+            0) ;;
+            # 名前の衝突が上限回数続いた場合は記録を捨てる（一時名は削除済み。推論の結果・終了コードは変えない）
+            2 | 4) ;;
+            *) rec_ok=0 ;;
+        esac
     fi
     if [ "$rec_ok" -ne 1 ]; then
         replace_with_error "failed to save run record"
