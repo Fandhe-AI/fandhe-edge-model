@@ -635,9 +635,9 @@ enum CancelStep {
     StillRunning,
     /// kill 後の回収待ちが壁時計の期限に達して打ち切られた（または期限後に
     /// 回収を試みた）。`WallTimeout { child_reaped }` として返す。回収の成否は
-    /// `child_reaped` で示す。`ChildNotReaped`（70）は壁時計の期限と関係なく
-    /// 回収できない場合（`try_wait()` エラー）に限る（Cursor Bugbot 指摘
-    /// Medium。REQ-21・REQ-39）。
+    /// `child_reaped` で示す。回収失敗は経路を問わず
+    /// `WallTimeout`（limit_exceeded）へ写し、runtime_error にしない
+    /// （Cursor Bugbot 指摘 Medium。REQ-21・REQ-39）。
     WallDeadline { child_reaped: bool },
 }
 
@@ -670,8 +670,12 @@ fn cancel_child(
         Err(e) => {
             // 待機エラー後も回収を確認できるまで `Child` を手放さない
             // （codex/review 指摘 P0。REQ-39）。
-            ensure_reaped(child, wall_deadline, KILL_WAIT_TIMEOUT)?;
-            return Err(TrainProcessError::Wait { kind: e.kind() });
+            return match ensure_reaped(child, wall_deadline, KILL_WAIT_TIMEOUT) {
+                Some(_) => Err(TrainProcessError::Wait { kind: e.kind() }),
+                None => Ok(CancelStep::WallDeadline {
+                    child_reaped: false,
+                }),
+            };
         }
     }
     // 停止・回収を確認できない場合は成功したキャンセルとして返さず、生存中の
@@ -744,13 +748,12 @@ fn cancel_applies(now: Instant, deadline: Instant, cancel: &CancelToken) -> bool
     now < deadline && cancel.is_cancelled()
 }
 
-/// 子プロセスの操作（`Child` の kill・非ブロッキング待ち・pid）。エラー注入
+/// 子プロセスの操作（`Child` の kill・非ブロッキング待ち）。エラー注入
 /// テストのための差し替え点で、実運用は [`Child`] の実装のみ。
 #[cfg(unix)]
 trait ChildControl {
     fn kill(&mut self) -> std::io::Result<()>;
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
-    fn pid(&self) -> u32;
 }
 
 #[cfg(unix)]
@@ -761,26 +764,25 @@ impl ChildControl for Child {
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         Child::try_wait(self)
     }
-    fn pid(&self) -> u32 {
-        self.id()
-    }
 }
 
 /// 待機エラー後に、子が回収されたと確認できるまで `Child` を手放さない。
 /// `retry_until`（壁時計の期限）まで `kill()` と `try_wait()` を毎周回
 /// 再試行し、期限後は最後の `kill()` と `final_grace` 以内の有界な回収待ちを
-/// する。それでも回収を確認できなければ pid つきの
-/// [`TrainProcessError::ChildNotReaped`] を返す（REQ-39）。
+/// する。回収を確認できなければ `None`。`None` になるのは常に壁時計の期限を
+/// 過ぎた後なので、呼び出し側は経路を問わず
+/// `WallTimeout { child_reaped: false }`（limit_exceeded）で返す
+/// （回収失敗を runtime_error に化けさせない。REQ-21・REQ-39）。
 #[cfg(unix)]
 fn ensure_reaped<C: ChildControl>(
     child: &mut C,
     retry_until: Instant,
     final_grace: Duration,
-) -> Result<ExitStatus, TrainProcessError> {
+) -> Option<ExitStatus> {
     loop {
         let _ = child.kill();
         if let Ok(Some(status)) = child.try_wait() {
-            return Ok(status);
+            return Some(status);
         }
         if Instant::now() >= retry_until {
             break;
@@ -791,10 +793,10 @@ fn ensure_reaped<C: ChildControl>(
     let grace_deadline = Instant::now() + final_grace;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return Ok(status);
+            return Some(status);
         }
         if Instant::now() >= grace_deadline {
-            return Err(TrainProcessError::ChildNotReaped { pid: child.pid() });
+            return None;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -806,7 +808,7 @@ fn ensure_reaped<C: ChildControl>(
 /// （超過を `runtime_error` に化けさせない。REQ-21・REQ-39）。
 #[cfg(unix)]
 fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration) -> bool {
-    ensure_reaped(child, Instant::now(), final_grace).is_ok()
+    ensure_reaped(child, Instant::now(), final_grace).is_some()
 }
 
 /// キャンセルの kill 後に回収待ちが失敗したときの後始末。壁時計の期限に
@@ -814,7 +816,7 @@ fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration
 /// `CancelStep::WallDeadline { child_reaped }` を返す。期限前なら壁時計の
 /// 期限まで [`ensure_reaped`] で再試行し、回収できれば `Ok(status)`、期限に
 /// なっても回収できなければ `WallDeadline { child_reaped: false }` を返す。
-/// いずれも `WallTimeout`（limit_exceeded）へ写り、`ChildNotReaped`（70）へは
+/// いずれも `WallTimeout`（limit_exceeded）へ写り、runtime_error へは
 /// 化けない（REQ-21・REQ-39）。
 #[cfg(unix)]
 fn reap_failed_cancel_wait<C: ChildControl>(
@@ -827,7 +829,7 @@ fn reap_failed_cancel_wait<C: ChildControl>(
             child_reaped: reap_after_wall_timeout(child, final_grace),
         });
     }
-    ensure_reaped(child, wall_deadline, final_grace).map_err(|_| CancelStep::WallDeadline {
+    ensure_reaped(child, wall_deadline, final_grace).ok_or(CancelStep::WallDeadline {
         child_reaped: false,
     })
 }
@@ -1248,10 +1250,12 @@ pub fn run_train_cancellable(
                 // （Cursor Bugbot 指摘「Child leaked on wait error」）。
                 // エラーを返す前に必ず回収を試みる。
                 // 回収を確認できるまで `Child` を手放さず、壁時計の期限まで
-                // kill と回収を再試行する。確認できなければ pid つきの
-                // `ChildNotReaped` を返す（codex/review 指摘 P0。REQ-39）。
-                ensure_reaped(&mut child, wait_deadline, KILL_WAIT_TIMEOUT)?;
-                return Err(TrainProcessError::Wait { kind: e.kind() });
+                // kill と回収を再試行する。確認できなければ
+                // `WallTimeout { child_reaped: false }`（codex/review 指摘 P0。REQ-39）。
+                return match ensure_reaped(&mut child, wait_deadline, KILL_WAIT_TIMEOUT) {
+                    Some(_) => Err(TrainProcessError::Wait { kind: e.kind() }),
+                    None => Err(wall_timeout_error(limits, false)),
+                };
             }
         }
     };
@@ -1494,6 +1498,7 @@ mod tests {
         kill_results: Vec<std::io::Result<()>>,
         wait_results: Vec<std::io::Result<Option<ExitStatus>>>,
         kills: usize,
+        always_err: bool,
     }
 
     #[cfg(unix)]
@@ -1507,14 +1512,13 @@ mod tests {
             }
         }
         fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-            if self.wait_results.is_empty() {
+            if self.always_err {
+                Err(io_err())
+            } else if self.wait_results.is_empty() {
                 Ok(None)
             } else {
                 self.wait_results.remove(0)
             }
-        }
-        fn pid(&self) -> u32 {
-            4242
         }
     }
 
@@ -1533,24 +1537,26 @@ mod tests {
             kill_results: vec![Err(io_err()), Err(io_err())],
             wait_results: vec![Err(io_err()), Ok(None), Ok(Some(ExitStatus::from_raw(9)))],
             kills: 0,
+            always_err: false,
         };
         let r = ensure_reaped(
             &mut c,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(50),
         );
-        assert_eq!(r.unwrap().signal(), Some(9));
+        assert_eq!(r.and_then(|s| s.signal()), Some(9));
         assert!(c.kills >= 3);
     }
 
-    /// REQ-39: 回収を確認できない場合は pid つきの `ChildNotReaped` を返す。
+    /// REQ-39: 回収を確認できない場合は `None`（呼び出し側が `WallTimeout` にする）。
     #[cfg(unix)]
     #[test]
-    fn ensure_reaped_reports_pid_when_never_reaped() {
+    fn ensure_reaped_returns_none_when_never_reaped() {
         let mut c = FakeChild {
             kill_results: vec![],
             wait_results: vec![],
             kills: 0,
+            always_err: false,
         };
         let started = Instant::now();
         let r = ensure_reaped(
@@ -1558,10 +1564,7 @@ mod tests {
             Instant::now() + Duration::from_millis(100),
             Duration::from_millis(100),
         );
-        assert!(matches!(
-            r,
-            Err(TrainProcessError::ChildNotReaped { pid: 4242 })
-        ));
+        assert!(r.is_none());
         assert!(c.kills >= 2);
         assert!(started.elapsed() < Duration::from_secs(3));
     }
@@ -1576,6 +1579,7 @@ mod tests {
             kill_results: vec![Err(io_err())],
             wait_results: vec![Err(io_err()), Ok(Some(ExitStatus::from_raw(9)))],
             kills: 0,
+            always_err: false,
         };
         assert!(reap_after_wall_timeout(&mut ok, Duration::from_millis(500)));
         assert!(ok.kills >= 2);
@@ -1583,6 +1587,7 @@ mod tests {
             kill_results: vec![],
             wait_results: vec![],
             kills: 0,
+            always_err: false,
         };
         assert!(!reap_after_wall_timeout(
             &mut never,
@@ -1603,11 +1608,13 @@ mod tests {
             kill_results: vec![Err(io_err())],
             wait_results: vec![Ok(Some(ExitStatus::from_raw(9)))],
             kills: 0,
+            always_err: false,
         };
         let never = || FakeChild {
             kill_results: vec![],
             wait_results: vec![],
             kills: 0,
+            always_err: false,
         };
         assert!(matches!(
             reap_failed_cancel_wait(&mut reaped(), past, grace),
@@ -1632,6 +1639,28 @@ mod tests {
                 child_reaped: false
             })
         ));
+    }
+
+    /// REQ-21・REQ-39: `try_wait()` のエラーが続いたまま期限に達しても、
+    /// 回収できなければ `WallDeadline { child_reaped: false }`
+    /// （`WallTimeout`。runtime_error にしない）。
+    #[cfg(unix)]
+    #[test]
+    fn persistent_try_wait_errors_end_as_wall_timeout_not_reaped() {
+        let mut c = FakeChild {
+            kill_results: vec![],
+            wait_results: vec![],
+            kills: 0,
+            always_err: true,
+        };
+        let soon = Instant::now() + Duration::from_millis(100);
+        assert!(matches!(
+            reap_failed_cancel_wait(&mut c, soon, Duration::from_millis(100)),
+            Err(CancelStep::WallDeadline {
+                child_reaped: false
+            })
+        ));
+        assert!(c.kills >= 2);
     }
 
     fn test_request(time_limit_seconds: Option<u32>) -> TrainRequest {
