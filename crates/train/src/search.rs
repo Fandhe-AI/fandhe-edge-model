@@ -98,7 +98,7 @@ use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
 use crate::error::TrainRequestError;
 use crate::limits::{MAX_LABEL_BYTES, MAX_LABELS, MAX_VALIDATION_INPUT_TOTAL_BYTES};
-use crate::request::{TrainRequest, TrainRequestParams, ValidationInput};
+use crate::request::{TrainRequest, TrainRequestParams, ValidationInput, check_config_size};
 use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
 use crate::time_allotment::{
     Allotment, CandidateRunner, CandidateTimeError, CandidateTimeRecord, CandidateTimeStatus,
@@ -1214,6 +1214,10 @@ fn validate_input<E>(input: &SearchInput<'_>) -> Result<Vec<ValidationInput>, Se
         // 大きさ（実効上限は `MAX_REQUEST_BYTES`）は候補の `config` 等との
         // 合計で決まるため、実際に JSON へ直列化して確認する（学習を始めてから
         // 大きさ超過に気づくことを避ける。fail-closed）。
+        // 巨大な `config` は複製の前に拒否する（REQ-39・issue #255）。下の
+        // `to_json_vec` は `config` と validation 入力の合計の検査として残す。
+        check_config_size(&candidate.params.config)
+            .map_err(|source| SearchError::InvalidRequest { index, source })?;
         let candidate_request = TrainRequest::new(candidate.params.clone())
             .and_then(|request| request.with_validation_inputs(validation_request_inputs.clone()))
             .map_err(|source| SearchError::InvalidRequest { index, source })?;

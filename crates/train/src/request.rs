@@ -405,7 +405,7 @@ fn check_relative_path_syntax(value: &str, field: &'static str) -> Result<(), Tr
 
 /// [`TrainRequest::to_json_vec`] 専用の `Vec<u8>` ライター。書き込み総量が
 /// `limit` を超えた時点で `Err` を返し、以降の書き込み（`serde_json` の
-/// 直列化）を打ち切る。`config` に外部由来の巨大な値が入っていても、
+/// 直列化）を打ち切る。`validation_inputs` 等との合計が大きくなっても、
 /// [`MAX_REQUEST_BYTES`] を大幅に超えるメモリを先に確保しないための資源上限
 /// （REQ-39「資源の上限」・P1。codex review PR #220）。
 struct LimitedVecWriter {
@@ -449,12 +449,77 @@ impl std::io::Write for LimitedVecWriter {
     }
 }
 
+/// [`check_config_size`] 専用の書き込み量カウンタ。バッファを持たず、
+/// 書き込み総量が `limit` を超えた時点で `Err` を返して直列化を打ち切る
+/// （測るための追加確保は O(1)。REQ-39・issue #255）。
+struct CountingLimitWriter {
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for CountingLimitWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let total = self.written.saturating_add(data.len());
+        if total > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("config serialization exceeds limit"));
+        }
+        self.written = total;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `config` を直列化した長さが [`MAX_REQUEST_BYTES`] 以下であることを検査する
+/// （ちょうどの値は受理）。[`TrainRequest::new`] と探索の事前検証
+/// （`crate::search`。候補の `config` を複製する前）から呼ばれ、外部由来の
+/// 巨大な `config` を検証済みの型として保持・複製させない（REQ-39「資源の
+/// 上限」・REQ-18・issue #255）。
+///
+/// 上限に新しい定数を作らず [`MAX_REQUEST_BYTES`] を再利用するのは、学習
+/// ワーカー（`contract.py`）の契約を変えないため（`config` がこれを超えれば
+/// リクエスト全体の上限も必ず超える）。`from_json_slice` 経路はこの検査を
+/// 通らず、生バイト長（[`MAX_REQUEST_BYTES`] 以下）で上限を担保する（解析後の
+/// 再直列化で長くなる入力〔指数表記の数値等〕を拒否しないため）。
+pub(crate) fn check_config_size(
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), TrainRequestError> {
+    let mut writer = CountingLimitWriter {
+        written: 0,
+        limit: MAX_REQUEST_BYTES,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut writer, config) {
+        Ok(()) => Ok(()),
+        Err(_) if writer.exceeded => Err(TrainRequestError::ConfigTooLarge {
+            limit: MAX_REQUEST_BYTES,
+        }),
+        Err(_) => Err(TrainRequestError::SerializeFailed),
+    }
+}
+
 impl TrainRequest {
     /// [`TrainRequestParams`] を検証し、[`TrainRequest`] を組み立てる。
     ///
     /// `contract.py::validate_request` と同じ検証内容（経路の閉じ込め自体を
-    /// 除く。本モジュールの doc 参照）を、fail-closed に適用する。
+    /// 除く。本モジュールの doc 参照）を、fail-closed に適用する。`config` は
+    /// 直列化後の大きさを [`check_config_size`] で検査する（issue #255）。
     pub fn new(params: TrainRequestParams) -> Result<Self, TrainRequestError> {
+        check_config_size(&params.config)?;
+        Self::new_with_bounded_config(params)
+    }
+
+    /// `config` の大きさ検査を除く [`TrainRequest::new`] の本体。呼び出し元が
+    /// `config` の大きさを別の手段で上限内に抑えている場合（`from_json_slice`
+    /// は生バイト長を先に [`MAX_REQUEST_BYTES`] 以下へ制限済みで、`config` は
+    /// その一部）に限って使う。解析後の再直列化の長さ（指数表記の数値等で
+    /// 伸びうる）で、上限内の入力を Rust 側だけが拒否しないようにする
+    /// （入出力契約を変えない。codex review PR #260）。
+    fn new_with_bounded_config(params: TrainRequestParams) -> Result<Self, TrainRequestError> {
         if params.kind.is_empty() {
             return Err(TrainRequestError::EmptyKind);
         }
@@ -569,7 +634,7 @@ impl TrainRequest {
             time_limit_seconds: raw.time_limit_seconds,
             rss_limit_bytes: raw.rss_limit_bytes,
         };
-        let request = Self::new(params)?;
+        let request = Self::new_with_bounded_config(params)?;
         match raw.validation_inputs {
             None => Ok(request),
             Some(items) => request.with_validation_inputs(
@@ -582,9 +647,9 @@ impl TrainRequest {
     }
 
     /// 検証済みの [`TrainRequest`] を、`contract.py` と同じスキーマの JSON
-    /// バイト列へ直列化する。`config` は [`TrainRequest::new`] の時点では
-    /// サイズを検査しない（任意の JSON を保持しうる。本モジュールの doc
-    /// 参照）ため、ここで検査する。[`LimitedVecWriter`] へ書き込みながら
+    /// バイト列へ直列化する。[`TrainRequest::new`] は `config` 単体の大きさだけを
+    /// 検査する（issue #255）ため、`config`・`validation_inputs` 等を合わせた
+    /// リクエスト全体の大きさはここで検査する。[`LimitedVecWriter`] へ書き込みながら
     /// [`MAX_REQUEST_BYTES`] 超過を検出した時点で直列化を打ち切ることで、
     /// 外部由来の巨大な `config` を渡された場合でも上限を超える確保を
     /// 先に行わない（REQ-39 ガード層「資源の上限」・P1。codex review
@@ -732,6 +797,71 @@ mod tests {
             time_limit_seconds: None,
             rss_limit_bytes: None,
         }
+    }
+
+    fn config_with_serialized_len(len: usize) -> serde_json::Map<String, serde_json::Value> {
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "k".to_string(),
+            serde_json::Value::String("a".repeat(len - 8)),
+        );
+        assert_eq!(serde_json::to_vec(&config).expect("serialize").len(), len);
+        config
+    }
+
+    /// REQ-39・issue #255: 直列化後ちょうど `MAX_REQUEST_BYTES` の `config` は受理する。
+    #[test]
+    fn req39_config_exactly_at_limit_is_accepted_by_new() {
+        let mut params = valid_params();
+        params.config = config_with_serialized_len(MAX_REQUEST_BYTES);
+        assert!(TrainRequest::new(params).is_ok());
+    }
+
+    /// REQ-39・issue #255: 1 バイト超過の `config` は `limit_exceeded`（20）で拒否する。
+    #[test]
+    fn req39_config_one_byte_over_limit_is_rejected_by_new() {
+        let mut params = valid_params();
+        params.config = config_with_serialized_len(MAX_REQUEST_BYTES + 1);
+        let err = TrainRequest::new(params).unwrap_err();
+        assert_eq!(
+            err,
+            TrainRequestError::ConfigTooLarge {
+                limit: MAX_REQUEST_BYTES
+            }
+        );
+        assert_eq!(err.reason_code(), "limit_exceeded");
+        assert_eq!(err.exit_code().code(), 20);
+    }
+
+    /// REQ-39・security.md: `ConfigTooLarge` のエラー文言に `config` の内容を含めない。
+    #[test]
+    fn req39_config_too_large_error_does_not_leak_config_content() {
+        let mut params = valid_params();
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "SECRET-KEY-DUMMY".to_string(),
+            serde_json::Value::String("SECRET-DUMMY".repeat(MAX_REQUEST_BYTES / 12 + 1)),
+        );
+        params.config = config;
+        let err = TrainRequest::new(params).unwrap_err();
+        assert!(matches!(err, TrainRequestError::ConfigTooLarge { .. }));
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("SECRET"));
+    }
+
+    /// REQ-39・codex review PR #260: 生バイト長が上限以下なら、再直列化で `config` が
+    /// 上限を超える入力（指数表記の数値を多数含む）も `from_json_slice` は受理する。
+    #[test]
+    fn req39_from_json_slice_accepts_input_whose_config_grows_on_reserialize() {
+        let nums = vec!["1e15"; 150_000].join(",");
+        let json = format!(
+            r#"{{"schema_version":1,"kind":"c3","kind_version":1,"config":{{"a":[{nums}]}},"label_order":["a","b"],"max_bytes":512,"seed":1,"device":"cpu","root":"/tmp/fandhe-edge-train-test","train_path":"t.jsonl","out_dir":"o"}}"#
+        );
+        assert!(json.len() <= MAX_REQUEST_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let config = value["config"].as_object().expect("object");
+        assert!(serde_json::to_vec(config).expect("serialize").len() > MAX_REQUEST_BYTES);
+        assert!(TrainRequest::from_json_slice(json.as_bytes()).is_ok());
     }
 
     /// REQ-39: 既定値解決（`time_limit_seconds`／`rss_limit_bytes` 省略時）が
