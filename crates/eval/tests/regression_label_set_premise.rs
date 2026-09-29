@@ -9,7 +9,9 @@
 //! 本テストによる新しい実測ではない（`docs/spec` は読まない）。正誤列は乱数を
 //! 使わず決定的に組み立てる。
 
-use fandhe_edge_eval::regression::{ComparisonPremise, regression_counts, regression_report};
+use fandhe_edge_eval::regression::{
+    ComparisonPremise, RegressionError, ReportRecord, regression_counts, regression_report,
+};
 
 /// PoC-19 の 9 ラベル（旧モデル）。
 const M9: [&str; 9] = [
@@ -71,6 +73,23 @@ fn build(both: usize, c2i: usize, i2c: usize, wrong: usize) -> (Vec<bool>, Vec<b
     (prev, cur)
 }
 
+/// 正誤列に対応する連番の行 ID。
+fn ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("r{i}")).collect()
+}
+
+/// 正誤列を行 ID で対応づけた入力行にする。
+fn rows<'a>(ids: &'a [String], prev: &[bool], cur: &[bool]) -> Vec<ReportRecord<'a>> {
+    ids.iter()
+        .zip(prev.iter().zip(cur.iter()))
+        .map(|(id, (p, c))| ReportRecord {
+            id,
+            previous_correct: *p,
+            current_correct: *c,
+        })
+        .collect()
+}
+
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
 }
@@ -80,7 +99,10 @@ fn strings(items: &[&str]) -> Vec<String> {
 #[test]
 fn p3_merge_reports_label_set_differs() {
     let (prev, cur) = build(170, 44, 45, 391);
-    let report = regression_report(&M9, &M8_MERGE, &prev, &cur).unwrap();
+    let report = {
+        let ids = ids(prev.len());
+        regression_report(&M9, &M8_MERGE, &rows(&ids, &prev, &cur)).unwrap()
+    };
     assert_eq!(report.counts().n(), 650);
     assert_eq!(report.counts().correct_to_incorrect(), 44);
     assert_eq!(report.counts().incorrect_to_correct(), 45);
@@ -99,7 +121,10 @@ fn p3_merge_reports_label_set_differs() {
 #[test]
 fn p1_addition_reports_added_label() {
     let (prev, cur) = build(100, 58, 22, 351);
-    let report = regression_report(&M8_RM, &M9, &prev, &cur).unwrap();
+    let report = {
+        let ids = ids(prev.len());
+        regression_report(&M8_RM, &M9, &rows(&ids, &prev, &cur)).unwrap()
+    };
     assert_eq!(report.counts().n(), 531);
     assert_eq!(
         report.premise(),
@@ -114,7 +139,10 @@ fn p1_addition_reports_added_label() {
 #[test]
 fn p2_removal_reports_removed_label() {
     let (prev, cur) = build(100, 22, 58, 351);
-    let report = regression_report(&M9, &M8_RM, &prev, &cur).unwrap();
+    let report = {
+        let ids = ids(prev.len());
+        regression_report(&M9, &M8_RM, &rows(&ids, &prev, &cur)).unwrap()
+    };
     assert_eq!(report.counts().correct_to_incorrect(), 22);
     assert_eq!(report.counts().incorrect_to_correct(), 58);
     assert_eq!(
@@ -131,7 +159,10 @@ fn p2_removal_reports_removed_label() {
 #[test]
 fn same_label_set_keeps_counts_identical() {
     let (prev, cur) = build(2, 2, 1, 2);
-    let report = regression_report(&M9, &M9, &prev, &cur).unwrap();
+    let report = {
+        let ids = ids(prev.len());
+        regression_report(&M9, &M9, &rows(&ids, &prev, &cur)).unwrap()
+    };
     assert_eq!(report.counts(), &regression_counts(&prev, &cur).unwrap());
     assert_eq!(report.counts().both_correct(), 2);
     assert_eq!(report.counts().correct_to_incorrect(), 2);
@@ -139,4 +170,21 @@ fn same_label_set_keeps_counts_identical() {
     assert_eq!(report.counts().both_wrong(), 2);
     assert_eq!(report.premise(), &ComparisonPremise::SameLabelSet);
     assert_eq!(report.premise().note(), None);
+}
+
+/// REQ-26・TASK-26.2: 行 ID が空・重複なら拒否する（旧・新の対応を検証できない
+/// 入力で件数を確定させない）。
+#[test]
+fn rejects_empty_and_duplicate_record_ids() {
+    let row = |id| ReportRecord {
+        id,
+        previous_correct: true,
+        current_correct: false,
+    };
+    let err = regression_report(&M9, &M9, &[row("a"), row("")]).unwrap_err();
+    assert_eq!(err, RegressionError::EmptyRecordId { index: 1 });
+    let err = regression_report(&M9, &M9, &[row("a"), row("b"), row("a")]).unwrap_err();
+    assert_eq!(err, RegressionError::DuplicateRecordId { index: 2 });
+    let err = regression_report(&M9, &M9, &[]).unwrap_err();
+    assert_eq!(err, RegressionError::EmptyRecords);
 }
