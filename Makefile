@@ -42,6 +42,10 @@ HAS_MEMBERS := $(wildcard crates/*/Cargo.toml)
 # 別ディレクトリに切り出している。未追加の間 py-* 系ターゲットはスキップする
 PY_DIR := trainer
 HAS_PY := $(wildcard trainer/pyproject.toml)
+# Windows（GitHub Actions の windows runner では OS 環境変数が Windows_NT）判定。
+# 実 trainer 結合テスト（real_trainer.rs は #![cfg(unix)]）は Windows でテストが
+# 0 件になるため、test-trainer-integration を Windows では実行対象から外す（#258）
+IS_WINDOWS := $(filter Windows_NT,$(OS))
 
 # lint ツールの固定バージョン。CI（Fandhe-AI/actions の lint-docs reusable workflow）の
 # 既定値に合わせる（CI 側が正。乖離したらこちらを追従させる）。
@@ -371,6 +375,12 @@ py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲー�
 # 一時ファイルへ出力してから表示する。--exact のテスト名がずれると 0 件実行で
 # 成功してしまうため、出力の「1 passed」も検査して fail-closed にする
 # （テスト名を変えたらここも更新する）。
+# real_trainer.rs は unix 限定（`#![cfg(unix)]`）のため、Windows では skip を表示して
+# 成功扱いにする（Windows は MLX の実機検証対象外。`.claude/rules/coding-rust.md`）。
+ifneq ($(IS_WINDOWS),)
+test-trainer-integration: ## 実 trainer を Rust から起動する結合テスト（Windows では対象外。issue #258）
+	@echo "skip: real_trainer は unix 限定のため Windows では test-trainer-integration をスキップ"
+else
 test-trainer-integration: py-sync ## 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
 	@$(require_uv)
@@ -389,6 +399,7 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
 	rm -f "$$out"; exit $$overall
 else
 	@echo "skip: Cargo.toml / メンバー crate / trainer/pyproject.toml のいずれかが無いため test-trainer-integration をスキップ"
+endif
 endif
 
 .PHONY: ci
