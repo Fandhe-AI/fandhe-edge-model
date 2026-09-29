@@ -22,6 +22,9 @@ fandhe-edge-core.workspace = true
 # には train を入れない方針（REQ-32）は維持する。
 fandhe-edge-data.workspace = true
 fandhe-edge-train.workspace = true
+# package の合否結果（PackageOutcome）を stdout JSON へ写す（TASK-33.2-2・#139）ための
+# workspace 内 path 依存。runtime は core にしか依存せず、学習側依存は入らない（REQ-32）。
+fandhe-edge-runtime.workspace = true
 
 [lints]
 workspace = true

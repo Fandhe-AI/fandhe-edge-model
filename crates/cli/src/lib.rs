@@ -12,7 +12,14 @@
 //! パーサ・help 生成（TASK-33.1-1）。各工程の下位層への接続と完走は
 //! TASK-33.1-2（#136）、入出力契約全体の統合は TASK-33.2 の対象で、
 //! `main.rs` は解析成功後も工程を実行せず `runtime_error` を返す。
+//!
+//! TASK-33.2-2（#139）で、`package` の結果を stdout の JSON 1 つへ写す
+//! [`stage_output`] と、stderr へテキストログを出す [`log`] を追加した。
+//! stdout（結果 JSON）と stderr（ログ）は別の書き込み先として扱う。`package` の
+//! 実処理への接続は #136 の範囲で、現状はテストハーネスでのみ確認している。
 
 pub mod args;
 pub mod error_report;
+pub mod log;
 pub mod output;
+pub mod stage_output;
