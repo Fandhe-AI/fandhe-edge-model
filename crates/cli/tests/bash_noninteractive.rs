@@ -1514,6 +1514,149 @@ fn req36_run_record_write_failure_is_fail_closed_70() {
     assert!(!dir.exists());
 }
 
+/// 引数の件数が上限（64 件）を超えたら、記録の command を切り詰めて固定の印
+/// `<truncated>` を 1 度だけ付ける。推論本体の終了コード・出力は変えない
+/// （REQ-39・TASK-36.1-2。資源上限）。
+#[test]
+fn req39_run_record_command_is_truncated_at_arg_count_limit() {
+    let dir = record_dir("argcount");
+    let d = dir.to_str().unwrap();
+    let args: Vec<String> = (0..200).map(|i| format!("SECRET-{i}")).collect();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let o = run_with_fake_bin_args(
+        "record-argcount",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &refs,
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    assert_eq!(o.stdout, "{\"code\":\"invalid_input\"}\n");
+    let rec = only_record(&dir);
+    let redacted = "\"<redacted>\",".repeat(64);
+    let want = format!("\"command\":[\"fandhe-edge\",\"infer\",{redacted}\"<truncated>\"],");
+    // 記録する引数は 64 件まで。印は末尾に 1 つだけ
+    assert!(rec.contains(&want), "{rec}");
+    assert_eq!(rec.matches("<truncated>").count(), 1, "{rec}");
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 総バイト数（4096）を超えるパス値の列、および 1 値が長すぎる値は切り詰める。
+#[test]
+fn req39_run_record_command_is_truncated_at_byte_limit() {
+    let dir = record_dir("argbytes");
+    let d = dir.to_str().unwrap();
+    // 400 文字のパス値 × 12 個（各 --package。記録される総量は 4096 バイトを超える）
+    let long = "p".repeat(400);
+    let mut args: Vec<&str> = Vec::new();
+    for _ in 0..12 {
+        args.push("--package");
+        args.push(&long);
+    }
+    let o = run_with_fake_bin_args(
+        "record-argbytes",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &args,
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert_eq!(rec.matches("<truncated>").count(), 1, "{rec}");
+    let start = rec.find("\"command\":[").expect("command");
+    let end = rec[start..].find("],\"started_at\"").expect("end") + start;
+    assert!(
+        end - start <= 4096 + 64,
+        "command part too large: {}",
+        end - start
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    // 1 値が 512 文字を超えたらその値だけ `<truncated>` に置き換える
+    let dir = record_dir("argbytes-one");
+    let d = dir.to_str().unwrap();
+    let huge = "q".repeat(5000);
+    let o = run_with_fake_bin_args(
+        "record-argbytes-one",
+        "echo '{\"code\":\"invalid_input\"}'\nexit 64",
+        &["--package", &huge, "--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(64));
+    let rec = only_record(&dir);
+    assert!(
+        rec.contains(
+            "\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"<truncated>\",\"--help\"],"
+        ),
+        "{rec}"
+    );
+    assert!(!rec.contains("qqqq"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 記録ファイルの作成後に記録先ディレクトリが別の場所へ移動されても、作成済みの
+/// ファイルを元のディレクトリから確実に消し、70 を返す（一時名・最終名のどちらも残さない。
+/// パスの再解決に依存しない）。PATH 上の `stat` シムが、記録先に何か作られた後の最初の
+/// 呼び出しで移動を起こす（検査後の移動の模擬。証拠種別: テストハーネス）。
+#[test]
+fn req39_run_record_moved_dir_leaves_no_record_after_failure() {
+    let base = record_dir("moved-after");
+    let dir = base.join("rec");
+    let moved = base.join("moved");
+    let shim = base.join("shim");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::create_dir_all(&shim).expect("mkdir");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real_stat = Command::new("sh")
+            .args(["-c", "command -v stat"])
+            .output()
+            .expect("command -v stat");
+        let real_stat = String::from_utf8_lossy(&real_stat.stdout)
+            .trim()
+            .to_string();
+        assert!(!real_stat.is_empty());
+        let stat = shim.join("stat");
+        std::fs::write(
+            &stat,
+            format!(
+                "#!/bin/sh\nif [ -d '{d}' ] && [ -n \"$(ls -A '{d}')\" ]; then /bin/mv '{d}' '{m}'; fi\nexec '{r}' \"$@\"\n",
+                d = dir.display(),
+                m = moved.display(),
+                r = real_stat
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = run_with_fake_bin_args(
+        "record-moved-after",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[
+            ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+            ("PATH", &path),
+        ],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(moved.is_dir(), "shim must have moved the directory");
+    let left: Vec<String> = std::fs::read_dir(&moved)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "leftover in moved dir: {left:?}");
+    assert!(!dir.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// 未設定・空文字では何も作らず出力も変えない（既定の経路の回帰）。
 #[test]
 fn req36_no_record_dir_creates_nothing() {

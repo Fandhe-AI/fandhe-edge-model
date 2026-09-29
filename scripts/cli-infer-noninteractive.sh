@@ -40,7 +40,9 @@
 #
 # 実行記録（REQ-36・TASK-36.1-2・#150。opt-in）:
 #   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
-#   その直下へ `run-record.<pid>.<乱数>`（noclobber の O_EXCL 作成・0600。既存エントリは symlink を含め上書きしない）を作り、
+#   その直下へ一時名 `.run-record.<pid>.<乱数>.tmp`（noclobber の O_EXCL 作成・0600）で作り、書き込みと検証が済んだときだけ
+#   `run-record.<pid>.<乱数>` へ rename で確定する（失敗時は一時名・最終名とも残さない。作成・rename・削除は
+#   記録先を cd -P で開いたカレントディレクトリへの相対名で行い、記録先の移動・差し替えに影響されない）。
 #   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
 #   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
 #   実行ファイルのパスは入れない）・started_at（CLI 起動前の UTC 秒精度）・exit_code（呼び出し元へ
@@ -52,6 +54,8 @@
 #   記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値
 #   （UTF-8 として不正なら `<invalid utf-8>`）だけ、--text・--id の値・未知のトークン・位置引数は
 #   `<redacted>` に伏せる。入力ファイルの中身は読まず、環境変数は記録しない。
+#   command の記録には資源上限がある（引数 64 件・command 部 4096 バイト・1 値 512 文字）。1 値が長いときはその値を
+#   `<truncated>` に置き換え、件数か総量が超えたら以降を記録せず末尾に `<truncated>` を 1 つ付ける（推論の結果は変えない）。
 #   記録先は起動前に物理パス（`cd -P` + `pwd -P`。途中の symlink を解決）へ正規化し、作成と書き込みは 1 回の open でパスを再解決せず、保存後に
 #   記録先の物理パスが不変であること・記録が通常ファイルであることを確認する
 #   （不一致は fail-closed。検査から作成までの完全な排他はシェルでは保証できない限界で、
@@ -127,15 +131,39 @@ sha256_file() {
 # 固定のオプション名か伏せ字だけを渡す（許可リスト方式。入力本文を記録に残さない。security.md）
 rec_dir=${FANDHE_EDGE_RECORD_DIR:-}
 rec_cmd='"fandhe-edge","infer"'
+# command 記録の資源上限（REQ-39）: 引数 64 件・記録の command 部 4096 バイト・1 値 512 文字。
+# 1 値が長すぎるときはその値を `<truncated>` に置き換え、件数か総量が上限を超えたら
+# 以降の引数を記録せず末尾に固定の印 `<truncated>` を 1 度だけ付ける（記録の切り詰め。
+# 推論本体の終了コード・出力には影響しない）
+rec_n=0
+rec_bytes=0
+rec_trunc=0
 rec_add() {
-    if [ -n "$rec_dir" ]; then
-        # awk は行区切りの末尾改行を取り除くため、値が改行で終わるかを判定して json_escape へ
-        # 渡す（末尾改行を含むパスが記録で別の値にならないようにする）
-        _trail=0
-        case "$1" in
-            *$'\n') _trail=1 ;;
-        esac
-        rec_cmd="$rec_cmd,\"$(printf '%s' "$1" | json_escape "$_trail")\""
+    if [ -n "$rec_dir" ] && [ "$rec_trunc" -eq 0 ]; then
+        _piece=
+        _plen=0
+        if [ "$rec_n" -lt 64 ]; then
+            if [ "${#1}" -gt 512 ]; then
+                _piece=',"<truncated>"'
+            else
+                # awk は行区切りの末尾改行を取り除くため、値が改行で終わるかを判定して json_escape へ
+                # 渡す（末尾改行を含むパスが記録で別の値にならないようにする）
+                _trail=0
+                case "$1" in
+                    *$'\n') _trail=1 ;;
+                esac
+                _piece=",\"$(printf '%s' "$1" | json_escape "$_trail")\""
+            fi
+            _plen=$(printf '%s' "$_piece" | wc -c | tr -d ' ')
+        fi
+        if [ -z "$_piece" ] || [ $((rec_bytes + _plen)) -gt 4096 ]; then
+            rec_trunc=1
+            rec_cmd="$rec_cmd"',"<truncated>"'
+        else
+            rec_n=$((rec_n + 1))
+            rec_bytes=$((rec_bytes + _plen))
+            rec_cmd="$rec_cmd$_piece"
+        fi
     fi
 }
 
@@ -636,7 +664,6 @@ esac
 # 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）
 if [ -n "$rec_dir" ]; then
     rec_ok=1
-    rec_file=
     case "$started_at" in
         [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
         *) rec_ok=0 ;;
@@ -662,41 +689,48 @@ if [ -n "$rec_dir" ]; then
         rec_dir_unchanged || rec_ok=0
     fi
     if [ "$rec_ok" -eq 1 ]; then
-        # 作成と書き込みを 1 回の open（noclobber の O_EXCL|O_CREAT）で行い、パスを再解決しない。
-        # 検査後に symlink へ差し替えられても既存エントリがあれば open が失敗するため、
-        # 任意ファイルの切り詰め（TOCTOU）は起きない。名前の衝突は有限回だけ乱数を変えて再試行する
+        # 記録は一時名で作り、書き込みと検証が済んだときだけ rename で確定する（原子的。
+        # 途中の失敗で最終名の不完全な記録を残さない）。作成・rename・削除はすべて子シェルの
+        # カレントディレクトリ（起動前に控えた inode を cd -P で開いたもの）に対する相対名で行い、
+        # 記録先のパスが移動・差し替えられても、作ったファイルを元のディレクトリから確実に消せる
+        # （パスの再解決に依存しない）。名前の衝突は有限回だけ乱数を変えて再試行する
         rec_try=0
+        rec_rc=3
         while [ "$rec_try" -lt 10 ]; do
             rec_try=$((rec_try + 1))
-            rec_cand="$rec_real/run-record.$$.$RANDOM$RANDOM"
-            # 子シェルの終了値: 0=保存成功・2=作成失敗（既存エントリとの衝突等。自分のファイルではない）・
-            # 3=作成後の書き込み失敗（容量不足・quota 超過等。自分が作った不完全なファイルが残る）
+            rec_name="run-record.$$.$RANDOM$RANDOM"
+            rec_tmp=".$rec_name.tmp"
+            # 子シェルの終了値: 0=保存成功・2=一時名の作成失敗（既存エントリとの衝突等。自分のファイルではない）・
+            # 3=それ以外の失敗（作成したファイルは子シェルの中で削除済み）
             rec_rc=0
             (
                 set -C
                 umask 077
-                exec 4>"$rec_cand" || exit 2
-                printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
-                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >&4 || exit 3
+                CDPATH='' cd -P -- "$rec_real" 2>/dev/null || exit 3
+                [ "$(dir_identity .)" = "$rec_id" ] || exit 3
+                exec 4>"$rec_tmp" || exit 2
+                if ! printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
+                    "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >&4; then
+                    rm -f -- "$rec_tmp"
+                    exit 3
+                fi
+                exec 4>&-
+                if [ -L "$rec_tmp" ] || [ ! -f "$rec_tmp" ] || ! rec_dir_unchanged ||
+                    [ -e "$rec_name" ] || [ -L "$rec_name" ] || ! mv -f -- "$rec_tmp" "$rec_name"; then
+                    rm -f -- "$rec_tmp"
+                    exit 3
+                fi
+                # 確定後も記録先が起動前のままで、記録が通常ファイルであること
+                if [ -L "$rec_name" ] || [ ! -f "$rec_name" ] || ! rec_dir_unchanged; then
+                    rm -f -- "$rec_name"
+                    exit 3
+                fi
             ) || rec_rc=$?
-            if [ "$rec_rc" -eq 0 ]; then
-                rec_file=$rec_cand
-                break
-            elif [ "$rec_rc" -eq 3 ]; then
-                # 不完全な記録を残さない（完全に書けたファイルだけを記録とする）。再試行しない
-                rm -f "$rec_cand"
-                break
-            fi
+            [ "$rec_rc" -eq 2 ] || break
         done
-        [ -n "$rec_file" ] || rec_ok=0
-    fi
-    if [ "$rec_ok" -eq 1 ]; then
-        # 書き込み後も記録先の物理パスが変わっていないこと・通常ファイルであることを確認する
-        rec_dir_unchanged || rec_ok=0
-        if [ -L "$rec_file" ] || [ ! -f "$rec_file" ]; then rec_ok=0; fi
+        [ "$rec_rc" -eq 0 ] || rec_ok=0
     fi
     if [ "$rec_ok" -ne 1 ]; then
-        if [ -n "$rec_file" ]; then rm -f "$rec_file"; fi
         replace_with_error "failed to save run record"
     fi
 fi
