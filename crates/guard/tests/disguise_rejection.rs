@@ -6,7 +6,7 @@
 //! 将来の回帰（外部プロセスでの解析導入等）を検出する番兵である。
 
 use fandhe_edge_guard::format::{FileFormat, FormatRejection};
-use fandhe_edge_guard::model_file::open_onnx_model_file;
+use fandhe_edge_guard::model_file::{ModelFileRejection, open_onnx_model_file};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,12 +52,12 @@ fn assert_no_leak(dir: &Path, msg: &str) {
 }
 
 fn assert_not_allowed(dir: &Path, name: &str, bytes: &[u8], expected: FileFormat) {
-    let p = write(dir, name, bytes);
-    let err = open_onnx_model_file(&p, 1 << 20).unwrap_err();
+    write(dir, name, bytes);
+    let err = open_onnx_model_file(dir, Path::new(name), 1 << 20).unwrap_err();
     assert_eq!(err.exit_code().code(), 64);
     assert_eq!(err.reason_code(), "format_not_allowed");
     match &err {
-        FormatRejection::NotAllowed { detected, allowed } => {
+        ModelFileRejection::Format(FormatRejection::NotAllowed { detected, allowed }) => {
             assert_eq!(*detected, expected, "{name}");
             assert_eq!(allowed, &vec![FileFormat::Onnx]);
         }
@@ -100,9 +100,12 @@ fn req39_pickle_as_pt_or_npy_is_rejected_by_extension() {
     let dir = temp_dir("b");
     let marker = dir.join("MARKER");
     for name in ["model.pt", "model.npy"] {
-        let p = write(&dir, name, &marker_pickle(2, &marker));
-        let err = open_onnx_model_file(&p, 1 << 20).unwrap_err();
-        assert!(matches!(err, FormatRejection::ExtensionNotAllowed { .. }));
+        write(&dir, name, &marker_pickle(2, &marker));
+        let err = open_onnx_model_file(&dir, Path::new(name), 1 << 20).unwrap_err();
+        assert!(matches!(
+            err,
+            ModelFileRejection::Format(FormatRejection::ExtensionNotAllowed { .. })
+        ));
         assert_eq!(err.exit_code().code(), 64);
         assert_eq!(err.reason_code(), "extension_not_allowed");
         assert_no_leak(&dir, &err.to_string());
@@ -143,14 +146,16 @@ fn req39_non_onnx_content_is_rejected() {
 #[test]
 fn req39_valid_onnx_passes_and_checks_are_independent() {
     let dir = temp_dir("ok");
-    let p = write(&dir, "model.onnx", &MIN_ONNX);
-    let f = open_onnx_model_file(&p, 1 << 20).unwrap();
+    write(&dir, "model.onnx", &MIN_ONNX);
+    let f = open_onnx_model_file(&dir, Path::new("model.onnx"), 1 << 20).unwrap();
     assert_eq!(f.format(), FileFormat::Onnx);
     assert_eq!(f.as_bytes(), &MIN_ONNX);
-    let q = write(&dir, "model.pt", &MIN_ONNX);
+    write(&dir, "model.pt", &MIN_ONNX);
     assert!(matches!(
-        open_onnx_model_file(&q, 1 << 20),
-        Err(FormatRejection::ExtensionNotAllowed { .. })
+        open_onnx_model_file(&dir, Path::new("model.pt"), 1 << 20),
+        Err(ModelFileRejection::Format(
+            FormatRejection::ExtensionNotAllowed { .. }
+        ))
     ));
     fs::remove_dir_all(&dir).unwrap();
 }

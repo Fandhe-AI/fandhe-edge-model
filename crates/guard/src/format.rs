@@ -24,7 +24,7 @@
 //! 判定せず、ONNX の構造検査にも通らないので `Unknown` として拒否される。
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_core::fs::{FsError, read_bounded};
+use fandhe_edge_core::fs::{FsError, read_bounded, read_bounded_open_file};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, SeekFrom};
@@ -679,6 +679,28 @@ pub fn open_checked_file(
     max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
     let bytes = read_bounded(path, max_bytes).map_err(FormatRejection::Io)?;
+    check_bytes(bytes, allowlist)
+}
+
+/// 既に開いたファイルハンドルを検査する（パスを開き直さない）。
+///
+/// [`crate::path::open_confined`] が返した閉じ込め検証済みのハンドルをそのまま渡す入口で、
+/// 検証と検査の間にパスが差し替えられてもルート外を読まない（REQ-39・PoC-20）。
+/// `path` はエラー表示専用。上限・形式の扱いは [`open_checked_file`] と同じ。
+pub fn check_open_file(
+    file: std::fs::File,
+    path: &Path,
+    allowlist: &FormatAllowlist,
+    max_bytes: u64,
+) -> Result<CheckedFile, FormatRejection> {
+    let bytes = read_bounded_open_file(file, path, max_bytes).map_err(FormatRejection::Io)?;
+    check_bytes(bytes, allowlist)
+}
+
+fn check_bytes(
+    bytes: Vec<u8>,
+    allowlist: &FormatAllowlist,
+) -> Result<CheckedFile, FormatRejection> {
     let detected = detect_format(&bytes);
     let format = allowlist.check(detected)?;
     Ok(CheckedFile {
