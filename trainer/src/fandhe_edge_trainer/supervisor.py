@@ -378,6 +378,18 @@ def monitor_child(
     一時的な失敗であっても、区別する安全な手段が無いため 1 回の失敗で
     打ち切る〔既存の「監視できないこと自体を fail-closed に扱う」方針を
     踏襲し、リトライで猶予を与えない〕）。
+
+    **ゾンビ検知は「締め切り内に終了した」ことを意味しない**（issue #178
+    PR #233 レビュー再々々指摘 P1）: `ps` のポーリング間隔・
+    `_current_child_status` 自体の所要時間により、実際には壁時計の
+    締め切りを過ぎてから初めてゾンビ状態に気づく場合がある。この場合、
+    終了理由（自発的な正常終了・`RLIMIT_CPU` 自己終了のいずれであっても）
+    を受理して成果物を確定させてはならないため、`_classify_self_exit` を
+    呼ぶ前に必ず `time.monotonic()` と `deadline` を比較し、締め切りを
+    過ぎていれば通常終了として扱わず `"time"` を返す（呼び出し元
+    `_monitor_worker_and_finalize` はこれを他の強制終了理由と同様に
+    予約解放のみ〔確定しない〕の経路へ流す。REQ-39）。`killpg` → 回収
+    （`_terminate_and_reap`）の順序はこの分岐でも変わらず守る。
     """
     cpu_baseline = resource.getrusage(resource.RUSAGE_CHILDREN)
     deadline = time.monotonic() + time_limit_seconds + grace_seconds
@@ -388,6 +400,21 @@ def monitor_child(
             return "monitor_failed"
         rss, is_zombie = status
         if is_zombie:
+            # issue #178 PR #233 レビュー再々々指摘 P1: ゾンビ（終了済み）を
+            # 検知しても、それだけで「締め切り内に正常終了した」とは限らない。
+            # `ps` のポーリング間隔・`_current_child_status` の呼び出し自体の
+            # 所要時間により、実際には締め切りを過ぎてから初めてゾンビだと
+            # 気づく場合がある。この場合、終了理由（自発的な正常終了・
+            # `RLIMIT_CPU` による自己終了のいずれであっても）を受理して
+            # 成果物を確定させてはならず、壁時計超過（`"time"`）として
+            # fail-closed に扱う（呼び出し元 `_monitor_worker_and_finalize`
+            # は `killed_reason is not None` の経路で予約を解放するだけで
+            # 確定しない。REQ-39）。締め切り内であれば、従来どおり
+            # `_classify_self_exit` で通常終了か `RLIMIT_CPU` 自己終了かを
+            # 判定する。
+            if time.monotonic() > deadline:
+                _terminate_and_reap(proc)
+                return "time"
             _terminate_and_reap(proc)
             return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         if time.monotonic() > deadline:

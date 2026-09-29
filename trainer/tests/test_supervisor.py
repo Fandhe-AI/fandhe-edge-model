@@ -137,6 +137,126 @@ def test_monitor_child_fails_closed_when_status_race_with_exit(
         _reap(proc)
 
 
+def test_monitor_child_treats_late_zombie_detection_as_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #178 PR #233 レビュー再々々指摘 P1: `ps` でゾンビ（終了済み）と
+    分かっても、それだけで「締め切り内に終了した」ことにはならない。`ps`
+    のポーリング間隔・`_current_child_status` 自体の所要時間により、実際
+    には壁時計の締め切りを過ぎてから初めてゾンビだと気づく場合がある。
+    この場合、`_classify_self_exit`（正常終了・`RLIMIT_CPU` 自己終了の
+    判定）を呼ばずに `"time"` として扱わなければならない（呼び出し元
+    `_monitor_worker_and_finalize` はこれを他の強制終了理由と同様に
+    予約解放のみ〔確定しない〕の経路へ流す。REQ-39。成果物が確定される
+    経路は `killed_reason is None` のときだけであり、`"time"` はその経路
+    に入らない）。
+
+    `time.monotonic` を差し替え、「deadline 計算時は締め切り内」→
+    「ゾンビ検知直後のチェック時は締め切りを大きく超えている」という
+    競合を決定的に再現する（`_current_child_status` 自体は実プロセスの
+    生死を問わず常にゾンビを報告するよう差し替え、`ps` のタイミングに
+    左右されないようにする）。`subprocess` 内部のタイムアウト計算は
+    モジュール読み込み時に `from time import monotonic as _time` で
+    束縛された別参照を使うため、本差し替えの影響を受けない
+    （`_terminate_and_reap` 内の `proc.wait(timeout=10)` は正常に動く）。
+    """
+    proc = _spawn("import time; time.sleep(60)")
+    monkeypatch.setattr(supervisor, "_current_child_status", lambda pid: (1024 * 1024, True))
+
+    calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        calls["n"] += 1
+        # 1 回目: `deadline = time.monotonic() + time_limit_seconds` の計算
+        # （締め切りは 1.0 秒後になる）。2 回目以降: ゾンビ検知直後の
+        # 締め切りチェックで、締め切りを大きく超えていることにする。
+        return 0.0 if calls["n"] == 1 else 1000.0
+
+    monkeypatch.setattr(supervisor.time, "monotonic", _fake_monotonic)
+
+    try:
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=1.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        assert reason == "time"
+    finally:
+        _reap(proc)
+
+
+def test_run_supervised_train_does_not_finalize_artifact_on_late_zombie_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue #178 PR #233 レビュー再々々指摘 P1 への end-to-end 回帰:
+    実際の `_worker`（`c3`・`TINY_CONFIG`）を締め切り内に正常終了させつつ、
+    `monitor_child` がそのゾンビ状態に気づくタイミングだけを締め切り超過後
+    にずらし、成果物（`out_dir`）が確定されず `limit_exceeded`（exit 20）に
+    なることを確認する（`test_monitor_child_treats_late_zombie_detection_as_
+    timeout` の単体テストに対し、`_monitor_worker_and_finalize` の予約解放
+    経路まで含めた確認）。
+
+    `_current_child_status` を実装をそのまま呼びつつ、初めてゾンビを観測
+    した瞬間にフラグを立てるラッパーへ差し替える。`time.monotonic` は
+    フラグが立つまでは実時間をそのまま返し、フラグが立った後は実時間へ
+    大きなオフセットを足して返す。これにより、学習自体は通常どおり
+    （既定の大きな `time_limit_seconds`〔`MAX_TRAIN_WALL_SECONDS`〕の下で）
+    正常に完了しつつ、`monitor_child` 側だけが「ゾンビ検知の直後には
+    締め切りを大きく超えていた」状況を観測する。
+    """
+    train_path = tmp_path / "train.jsonl"
+    _write_train_data(train_path)
+    out_dir = tmp_path / "out"
+    request = {
+        "schema_version": 1,
+        "kind": "c3",
+        "kind_version": 1,
+        "config": TINY_CONFIG,
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    real_status = supervisor._current_child_status
+    late = {"is_late": False}
+
+    def _status_and_flag_first_zombie(pid: int) -> tuple[int, bool] | None:
+        status = real_status(pid)
+        if status is not None and status[1]:  # is_zombie
+            late["is_late"] = True
+        return status
+
+    monkeypatch.setattr(supervisor, "_current_child_status", _status_and_flag_first_zombie)
+
+    real_monotonic = time_mod.monotonic
+
+    def _fake_monotonic() -> float:
+        return real_monotonic() + (10_000.0 if late["is_late"] else 0.0)
+
+    monkeypatch.setattr(supervisor.time, "monotonic", _fake_monotonic)
+
+    exit_code = supervisor.run_supervised_train(request_path)
+    assert int(exit_code) == int(ExitCode.LIMIT_EXCEEDED)
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "error"
+    assert payload["code"] == "limit_exceeded"
+    assert "time" in payload["message"]
+
+    # 成果物は確定されておらず、予約（out_dir・作業用一時ディレクトリ）も
+    # 残置されていない。
+    assert not out_dir.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
+
+
 def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     """`ps` が使えない（監視できない）場合、野放しにせず子プロセスごと終了させる。"""
     monkeypatch.setattr(supervisor, "_PS_BIN", "/nonexistent/ps")
