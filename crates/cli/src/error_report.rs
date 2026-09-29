@@ -193,7 +193,8 @@ impl ToErrorReport for BatchError {
         let code = match self {
             BatchError::TooManyInputs { .. }
             | BatchError::TotalInputTooLarge { .. }
-            | BatchError::ResultTooLarge { .. } => ExitCode::LimitExceeded,
+            | BatchError::ResultTooLarge { .. }
+            | BatchError::DeadlineExceeded => ExitCode::LimitExceeded,
             _ => ExitCode::RuntimeError,
         };
         ErrorReport::new(code, default_message(code))
@@ -280,6 +281,7 @@ mod tests {
             BatchError::TooManyInputs { len: 2, limit: 1 },
             BatchError::TotalInputTooLarge { total: 2, limit: 1 },
             BatchError::ResultTooLarge { limit: 1 },
+            BatchError::DeadlineExceeded,
         ];
         for error in batch_cases {
             assert_eq!(error.to_error_report(), limit);

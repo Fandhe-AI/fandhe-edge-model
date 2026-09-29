@@ -29,6 +29,7 @@
 use fandhe_edge_core::infer_input::MAX_INFER_INPUT_BYTES;
 use fandhe_edge_core::judgment::{MAX_OPTIONS, SCORE_SUM_TOLERANCE};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// 1 回のバッチ推論で受け付ける件数の上限（暫定値。REQ-39 の資源上限が正式に決まるまで暫定）。
 /// `Vec` の確保前に検査する。
@@ -37,6 +38,12 @@ pub const MAX_INFER_BATCH_LEN: usize = 100_000;
 /// 1 回のバッチ推論の総入力バイト数の上限（暫定値。REQ-39）。
 /// 件数上限だけでは 100,000 件 × 1 MiB で約 100 GB になるため、処理前に総量を検査する。
 pub const MAX_INFER_BATCH_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// 1 回のバッチ推論の処理時間（壁時計）の上限（暫定値。REQ-39）。
+/// 1 件ごとの処理の前に期限を確認し、超過したら以降を処理せずバッチ全体を失敗とする
+/// （`limit_exceeded`）。協調的な打ち切りで、1 件の呼び出しの内部で止まったバックエンドを
+/// 中断する仕組みではない（ONNX 推論の実装〔#113〕で 1 件の上限を別途検討する）。
+pub const MAX_INFER_BATCH_DURATION: Duration = Duration::from_secs(600);
 
 /// 前処理後のトークン数の上限（暫定値。REQ-39）。NFKC 正規化による膨張を見込み、
 /// 入力上限 [`MAX_INFER_INPUT_BYTES`] の 4 倍とする。バックエンド呼び出し前に検査する。
@@ -193,6 +200,8 @@ pub enum BatchError {
         /// 上限。
         limit: usize,
     },
+    /// 処理時間が期限を超えた（REQ-39）。部分結果は返さず、バッチ全体を失敗とする。
+    DeadlineExceeded,
 }
 
 impl BatchError {
@@ -202,6 +211,7 @@ impl BatchError {
             Self::TooManyInputs { .. } => "too_many_inputs",
             Self::TotalInputTooLarge { .. } => "total_input_too_large",
             Self::ResultTooLarge { .. } => "result_too_large",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 }
@@ -258,7 +268,20 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
     /// バッチ推論。件数・総入力バイト数を処理前に検査し、1 件ずつ `run_single` を呼ぶだけ。
     /// 結果スコアの総数が上限を超えたら、以降を処理せずバッチ全体を失敗とする。
     /// 1 件の失敗は他要素へ波及しない。
+    /// 処理時間は [`MAX_INFER_BATCH_DURATION`] で打ち切る（REQ-39）。
     pub fn infer_batch(&self, inputs: &[&str]) -> Result<BatchResult, BatchError> {
+        let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
+        self.infer_batch_until(inputs, deadline)
+    }
+
+    /// [`Self::infer_batch`] の期限を指定できる版。`deadline` が `None` なら期限なし
+    /// （`Instant` の加算がオーバーフローした場合のみ。呼び出し側は通常 `Some` を渡す）。
+    /// 期限は各件の処理の前に確認し、超過なら `DeadlineExceeded` を返す。
+    pub fn infer_batch_until(
+        &self,
+        inputs: &[&str],
+        deadline: Option<Instant>,
+    ) -> Result<BatchResult, BatchError> {
         if inputs.len() > MAX_INFER_BATCH_LEN {
             return Err(BatchError::TooManyInputs {
                 len: inputs.len(),
@@ -277,6 +300,9 @@ impl<P: Preprocessor, B: ScoringBackend> InferencePipeline<P, B> {
         let mut results = Vec::with_capacity(inputs.len());
         let mut retained_scores = 0usize;
         for input in inputs {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(BatchError::DeadlineExceeded);
+            }
             let result = self.run_single(input);
             if let Ok(p) = &result {
                 retained_scores = retained_scores.saturating_add(p.scores.len());
@@ -409,5 +435,35 @@ mod tests {
             format!("{:?}", TokenIds::new(vec![7, 8])),
             "TokenIds(len=2)"
         );
+    }
+
+    struct StubPre;
+    impl Preprocessor for StubPre {
+        fn preprocess(&self, _input: &str) -> Result<TokenIds, PreprocessError> {
+            Ok(TokenIds::new(vec![1]))
+        }
+    }
+
+    struct StubBackend;
+    impl ScoringBackend for StubBackend {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            Ok(vec![0.25, 0.75])
+        }
+    }
+
+    /// REQ-39: 期限が過ぎていれば 1 件も処理せず `DeadlineExceeded`、期限内なら全件成功。
+    #[test]
+    fn req39_batch_deadline_is_enforced() {
+        let pipeline = InferencePipeline::new(StubPre, StubBackend);
+        let past = Instant::now();
+        let err = pipeline
+            .infer_batch_until(&["a", "b"], Some(past))
+            .unwrap_err();
+        assert_eq!(err, BatchError::DeadlineExceeded);
+        assert_eq!(err.code(), "deadline_exceeded");
+        let future = Instant::now().checked_add(Duration::from_secs(60));
+        let ok = pipeline.infer_batch_until(&["a", "b"], future).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert_eq!(pipeline.infer_batch(&["a"]).unwrap().len(), 1);
     }
 }
