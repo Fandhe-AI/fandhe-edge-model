@@ -61,10 +61,13 @@ pub struct BasicStats {
     pub unique_labels: u64,
     /// 宣言順のラベル別件数（0 件のラベルも含む）。
     pub label_counts: Vec<LabelCount>,
-    /// ラベル別件数の最小値。
-    pub min_label_count: u64,
-    /// 最小件数に並ぶラベル（宣言順）。
+    /// 観測されたラベル（件数 1 以上）の最小件数。観測ラベルが無ければ `None`（0 で埋めない。
+    /// データ契約層 `fandhe_edge_data::report` の `min_label_count` と同じ意味）。
+    pub min_label_count: Option<u64>,
+    /// 観測されたラベルのうち最小件数に並ぶもの（宣言順。未出現ラベルは含めない）。
     pub min_labels: Vec<String>,
+    /// 宣言済みだが 1 件も出現しなかったラベル（宣言順）。
+    pub unobserved_labels: Vec<String>,
     /// ユニーク数の数え方の規則 ID（実際に使った [`InputKey`] から導出。
     /// [`InputKey::ByteExact`] なら [`BYTE_EXACT_RULE`]）。
     pub input_key_rule: &'static str,
@@ -341,19 +344,20 @@ pub fn basic_stats(
         inputs.insert(key);
     }
 
-    let min_label_count = *counts
-        .iter()
-        .min()
-        .ok_or_else(|| internal("empty counts table"))?;
+    // 最小件数は観測ラベル（件数 > 0）だけで求める。未出現ラベルは別項目へ分ける。
+    let min_label_count = counts.iter().copied().filter(|&c| c > 0).min();
     let unique_labels = counts.iter().filter(|&&c| c > 0).count();
     let mut label_counts = Vec::with_capacity(labels.len());
     let mut min_labels = Vec::new();
+    let mut unobserved_labels = Vec::new();
     for (&label, &count) in labels.iter().zip(counts.iter()) {
         label_counts.push(LabelCount {
             label: label.to_string(),
             count,
         });
-        if count == min_label_count {
+        if count == 0 {
+            unobserved_labels.push(label.to_string());
+        } else if Some(count) == min_label_count {
             min_labels.push(label.to_string());
         }
     }
@@ -367,6 +371,7 @@ pub fn basic_stats(
         label_counts,
         min_label_count,
         min_labels,
+        unobserved_labels,
         input_key_rule: input_key.rule(),
     })
 }
@@ -386,7 +391,8 @@ mod tests {
         assert_eq!(s.n_rows, 1);
         assert_eq!(s.unique_inputs, 1);
         assert_eq!(s.unique_labels, 1);
-        assert_eq!(s.min_label_count, 1);
+        assert_eq!(s.min_label_count, Some(1));
+        assert!(s.unobserved_labels.is_empty());
         assert_eq!(s.min_labels, vec!["A".to_string()]);
         assert_eq!(s.input_key_rule, "byte_exact");
     }

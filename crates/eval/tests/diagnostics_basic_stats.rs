@@ -44,15 +44,18 @@ fn known_synthetic_dataset() {
         s.label_counts,
         vec![lc("A", 4), lc("B", 3), lc("C", 3), lc("D", 0)]
     );
-    assert_eq!(s.min_label_count, 0);
-    assert_eq!(s.min_labels, vec!["D".to_string()]);
+    // 未出現ラベル D は最小件数の計算に含めない（codex P1。data 層 report の定義と一致）。
+    assert_eq!(s.min_label_count, Some(3));
+    assert_eq!(s.min_labels, vec!["B".to_string(), "C".to_string()]);
+    assert_eq!(s.unobserved_labels, vec!["D".to_string()]);
     assert_eq!(s.input_key_rule, "byte_exact");
 }
 
 #[test]
 fn tied_minimum_lists_all_in_declaration_order() {
     let s = basic_stats(&["A", "B", "C"], &synthetic(), InputKey::ByteExact).unwrap();
-    assert_eq!(s.min_label_count, 3);
+    assert_eq!(s.min_label_count, Some(3));
+    assert!(s.unobserved_labels.is_empty());
     assert_eq!(s.min_labels, vec!["B".to_string(), "C".to_string()]);
     assert_eq!(s.input_key_rule, "byte_exact");
 }
@@ -188,5 +191,14 @@ fn rejects_normalized_expansion() {
             index: 0,
             limit: MAX_STATS_INPUT_BYTES
         }
+    );
+}
+
+/// REQ-29・TASK-29.1-1: 行が 0 件は拒否され、最小件数を 0 で埋めた統計は作られない。
+#[test]
+fn no_rows_is_rejected_not_zero_filled() {
+    assert_eq!(
+        basic_stats(&["A", "B"], &[], InputKey::ByteExact).unwrap_err(),
+        DiagnosticsError::EmptyRows
     );
 }
