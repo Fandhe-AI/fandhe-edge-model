@@ -20,6 +20,9 @@
 //! [`stage_output`] と、stderr へテキストログを出す [`log`] を追加した。
 //! stdout（結果 JSON）と stderr（ログ）は別の書き込み先として扱う。`package` の
 //! 実処理への接続は #136 の範囲で、現状はテストハーネスでのみ確認している。
+//!
+//! TASK-33.3（#140）で、評価データ未定義の `evaluate` を `status:"skipped"`・exit 0 で終える
+//! `stage_output::evaluate_start`・`emit_evaluate_skipped` を追加した。バイナリへの結線は #136。
 
 pub mod args;
 pub mod error_report;
