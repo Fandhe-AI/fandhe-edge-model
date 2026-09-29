@@ -28,7 +28,7 @@
 #     FANDHE_EDGE_LOG_STREAM_WARMUP_SECS（0〜60）・FANDHE_EDGE_LOG_STREAM_TAIL_SECS（0〜600）で
 #     上書きでき（不正値は既定へ戻す）、既定と異なる値のときは evidence_hint を test_harness にする
 #   - 出力先: <out-dir>/run/（sandbox-run.sh の出力。run.meta.json）・log_stream.ndjson（生ログ。
-#     0600）・log_stream.stderr.log・network_report.json（集計レポート）・monitor.meta.json
+#     0600）・network_report.json（集計レポート）・monitor.meta.json
 #   - 生ログには他アプリのイベントが含まれるため PR・Issue へ転記しない（件数は
 #     network_report.json を記録する）。工程の stdout・stderr・--infer-text・パスは保存しない
 #   - stdout は集計 JSON を 1 行だけ出す（REQ-33。固定の文字列と件数のみ。利用者の値は出さない）。
@@ -67,8 +67,6 @@ DEFAULT_LOG_CMD=/usr/bin/log
 PREDICATE='process == "kernel" AND eventMessage CONTAINS "deny"'
 # 生ログの容量上限（sandbox_deny_report.py の MAX_STREAM_BYTES と揃える）
 MAX_STREAM_BYTES=268435456
-# `log` の stderr の容量上限（超過は判定不能。REQ-39）
-MAX_STREAM_ERR_BYTES=65536
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 # 固定メッセージの JSON を 1 行出して終了する。$1=終了コード $2=code 名 $3=固定メッセージ
@@ -224,7 +222,6 @@ probe="$out_dir/.write-probe.$$"
 rm -f -- "$probe"
 
 stream_file="$out_dir/log_stream.ndjson"
-stream_err="$out_dir/log_stream.stderr.log"
 report_file="$out_dir/network_report.json"
 meta_file="$out_dir/monitor.meta.json"
 
@@ -248,12 +245,14 @@ trap 'exit 70' TERM INT HUP
 monitor_started=$(utc_now)
 set -m
 (
-    # stdout・stderr とも head -c で書き込み時点に上限 +1 バイトで打ち切る（REQ-39。
-    # sandbox-run.sh・cli-infer-noninteractive.sh と同じ方式）。head も同じグループ。
-    # 上限に達すると head が終了して log は書き込み失敗で止まり、超過は下の検査で判定不能になる
+    # 書き込み時点の容量上限は RLIMIT_FSIZE（ulimit -f。bash では 1024 バイト単位）で掛ける。
+    # log がファイルへ直接書くため、停止時に「パイプ上の head の未書き出し分が失われる」ことがなく、
+    # プロセス終了＝書き込み完了になる。上限 +1 ブロックまで書けるので、超過は下の
+    # 大きさの検査（MAX_STREAM_BYTES 超え）で判定不能になる（REQ-39）。
+    # stderr は内容を使わないため保存せず /dev/null へ捨てる（容量の問題が生じない）
+    ulimit -f $((MAX_STREAM_BYTES / 1024 + 1)) || exit 70
     exec "$log_cmd" stream --style ndjson --predicate "$PREDICATE" </dev/null \
-        > >(head -c $((MAX_STREAM_BYTES + 1)) >"$stream_file") \
-        2> >(head -c $((MAX_STREAM_ERR_BYTES + 1)) >"$stream_err")
+        >"$stream_file" 2>/dev/null
 ) </dev/null >/dev/null 2>&1 &
 logpid=$!
 # 監視役（独立グループ）: 本スクリプトが突然死しても log を KILL し、容量超過でも KILL する
@@ -261,8 +260,7 @@ wrapper_pid=$$
 (
     while kill -0 "$wrapper_pid" 2>/dev/null; do
         _sz=$(wc -c <"$stream_file" 2>/dev/null || echo 0)
-        _esz=$(wc -c <"$stream_err" 2>/dev/null || echo 0)
-        if [ "${_sz:-0}" -gt "$MAX_STREAM_BYTES" ] || [ "${_esz:-0}" -gt "$MAX_STREAM_ERR_BYTES" ]; then
+        if [ "${_sz:-0}" -gt "$MAX_STREAM_BYTES" ]; then
             kill -s KILL -- "-$logpid" 2>/dev/null || true
         fi
         sleep 1
@@ -303,6 +301,10 @@ run_rc=0
 sleep "$tail_secs"
 
 # ---- 監視の停止 ----
+# 停止手順（ここだけに置く）: TERM → 終了を上限付きで待つ → 残っていれば KILL → wait で回収 →
+# 終了を確認できたら集計へ進む。log は生ログへ直接書くため、log（と同じグループの子）が
+# 終了していれば書き込みは完了している。終了を確認できなければ stream_ok=0 にして判定不能(70)
+# とし、「0 件」とは判定しない（停止後に遅れて出た拒否行を取りこぼさない）。
 stream_ok=1
 kill -0 "$logpid" 2>/dev/null || stream_ok=0
 stopped=$(utc_now)
@@ -316,6 +318,9 @@ if [ "$stream_ok" -eq 1 ]; then
 fi
 kill -s KILL -- "-$logpid" 2>/dev/null || true
 wait "$logpid" 2>/dev/null || true
+if kill -0 "$logpid" 2>/dev/null; then
+    stream_ok=0
+fi
 logpid=
 kill -s KILL -- "-$wd" 2>/dev/null || true
 wait "$wd" 2>/dev/null || true
@@ -328,9 +333,7 @@ set -- --stream "$stream_file" --run-meta "$out_dir/run/run.meta.json" \
     --warmup-secs "$warmup" --tail-secs "$tail_secs" --report-out "$report_file"
 [ "$log_override" = false ] || set -- "$@" --log-override
 [ "$stream_ok" -eq 1 ] || set -- "$@" --stream-died
-esize=$(wc -c <"$stream_err" 2>/dev/null || echo 0)
-{ [ "${size:-0}" -le "$MAX_STREAM_BYTES" ] && [ "${esize:-0}" -le "$MAX_STREAM_ERR_BYTES" ]; } \
-    || set -- "$@" --stream-overflow
+[ "${size:-0}" -le "$MAX_STREAM_BYTES" ] || set -- "$@" --stream-overflow
 # run の実際の終了コードを渡し、集計器が run.meta.json の exit_code と照合する（不一致は判定不能）
 set -- "$@" --run-exit-code "$run_rc"
 rep_rc=0

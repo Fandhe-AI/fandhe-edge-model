@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(60);
 const PROFILE: &str = "(version 1)(allow default)(deny network*)";
 const PREDICATE: &str = "process == \"kernel\" AND eventMessage CONTAINS \"deny\"";
+/// SIGTERM を受けた後に fake の log が書く 1 行（停止後に遅れて届く拒否行の模擬）
+const LATE_LINE: &str =
+    "{\\\"eventMessage\\\": \\\"Sandbox: LateApp(888) deny(1) network-outbound 192.0.2.7:443\\\"}";
 const INFER_MARKER: &str = "MARKER_TEXT_9f3a";
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -105,6 +108,11 @@ impl Env {
                  [ \"${{FAKE_LOG_MODE:-}}\" != flood_err ] || head -c 300000 /dev/zero >&2\n\
                  cat \"$FAKE_STREAM_FIXTURE\"\n\
                  [ \"${{FAKE_LOG_MODE:-}}\" = early ] && exit 0\n\
+                 if [ \"${{FAKE_LOG_MODE:-}}\" = late_line ]; then\n\
+                 trap 'printf \"%s\\n\" \"{LATE_LINE}\"; exit 0' TERM\n\
+                 sleep 300 &\n\
+                 wait\n\
+                 fi\n\
                  exec sleep 300\n"
             ),
         );
@@ -810,20 +818,39 @@ fn req38_attribution_uses_raw_name_before_masking() {
     assert!(!report.contains("PrivateAppName"));
 }
 
-/// `log` の stderr が上限（64 KiB）を超えて書かれても、書き込み時点で打ち切られ、
-/// 監視は判定不能(70)になる（無制限の追記を許さない。REQ-39）。
+/// `log` の stderr は保存しない（内容を使わず、容量の問題を生じさせない）。大量に書かれても
+/// 出力先にファイルは作られず、判定は通常どおり（REQ-39）。
 #[test]
-fn req39_log_stderr_is_capped_at_write_time() {
+fn req39_log_stderr_is_not_stored() {
     let e = Env::new();
     let o = e.run(
         "clean.ndjson",
         &e.base_args(),
         &[("FAKE_LOG_MODE", "flood_err")],
     );
-    assert_eq!(o.code, Some(70), "{}", o.stdout);
-    let size = fs::metadata(e.out().join("log_stream.stderr.log"))
-        .expect("stat")
-        .len();
-    assert!(size <= 65_537, "stderr file grew to {size}");
-    assert!(size > 0);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    for entry in walk(&e.out()) {
+        let len = fs::metadata(&entry).expect("stat").len();
+        assert!(len < 100_000, "{} is {len} bytes", entry.display());
+        assert!(
+            !entry.to_string_lossy().contains("stderr"),
+            "{}",
+            entry.display()
+        );
+    }
+}
+
+/// 停止（SIGTERM）の後に遅れて書かれた拒否行も集計に含める。停止手順が log の終了を確認する前に
+/// 集計へ進むと、この 1 件を取りこぼして「0 件」と誤判定する（REQ-38）。
+#[test]
+fn req38_denial_written_after_stop_signal_is_counted() {
+    let e = Env::new();
+    let o = e.run(
+        "clean.ndjson",
+        &e.base_args(),
+        &[("FAKE_LOG_MODE", "late_line")],
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 1");
+    has(&o, "\"unattributed_network_deny_events\": 1");
 }
