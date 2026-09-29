@@ -66,6 +66,9 @@
 //!   （[`wilson`] が返す型）を直接受け取る内部関数は seed・評価データの
 //!   由来を検証できないため crate 内部限定（issue #104 レビュー指摘・
 //!   PR #243）
+//! - [`diagnostics`][]: 診断レポートの基礎統計（行数・ユニーク入力数・ラベル別件数・
+//!   最少件数。REQ-29 正常系・TASK-29.1-1・issue #107。PoC-11 `stat_of` 相当）。
+//!   診断専用で合否判定に使わない
 //!
 //! # 現状（実装済みを装わない）
 //!
@@ -115,6 +118,9 @@
 //!   人間担当の未実施事項（#103）。
 //!   CLI `evaluate` への配線・3 seed 再学習ジョブ（REQ-34）との接続・
 //!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
+//! - 基礎統計（REQ-29・TASK-29.1-1・issue #107。[`diagnostics`]）: 実装済み
+//!   （診断専用。合否判定に使わない）。混同しやすいラベルの組とレポート統合
+//!   （#108）・診断限界の明記（#109）・データ量水準別報告（#110）は未実装
 //! - abstain_rate・error_rate 等の診断レポート系（REQ-29）: 未実装
 //!   （TASK-29.x。評価データ適用時の coverage は [`coverage`] に実装済み）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
 //!   材料にして上位層が算出する
@@ -170,6 +176,7 @@ pub mod abstention;
 pub mod baseline;
 pub mod calibration;
 pub mod coverage;
+pub mod diagnostics;
 pub mod eval_data_invariance;
 pub mod final_test_once;
 pub mod holm;
