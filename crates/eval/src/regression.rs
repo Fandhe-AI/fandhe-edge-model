@@ -116,7 +116,9 @@ pub enum RegressionError {
     /// 行 ID 1 件のバイト長が上限（[`MAX_RECORD_ID_BYTES`]）を超える
     /// （[`regression_report`]。REQ-39 資源の上限。重複判定のハッシュ計算より前に拒否する）。
     RecordIdTooLong {
-        /// `records` 内での位置（0 始まり）。
+        /// どちら側の結果か。
+        side: RecordSide,
+        /// その側の結果内での位置（0 始まり）。
         index: usize,
         /// 上限（[`MAX_RECORD_ID_BYTES`]）。
         limit: usize,
@@ -135,13 +137,25 @@ pub enum RegressionError {
     },
     /// 行 ID が空文字列（[`regression_report`]。REQ-26・TASK-26.2）。
     EmptyRecordId {
-        /// `records` 内での位置（0 始まり）。
+        /// どちら側の結果か。
+        side: RecordSide,
+        /// その側の結果内での位置（0 始まり）。
         index: usize,
     },
     /// 行 ID が先行する行と重複している（旧・新の対応が一意でない。
     /// [`regression_report`]。REQ-26・TASK-26.2）。
     DuplicateRecordId {
+        /// どちら側の結果か。
+        side: RecordSide,
         /// 重複した行の位置（0 始まり。ID 本文は含めない）。
+        index: usize,
+    },
+    /// 片側の行 ID が相手側に存在しない（旧・新の行が 1 対 1 に対応しない。
+    /// [`regression_report`]。REQ-26・TASK-26.2）。
+    MissingRecordId {
+        /// ID が見つからなかった側（相手側にあって、この側に無い）。
+        side: RecordSide,
+        /// 相手側の結果内での、対応する行の位置（0 始まり。ID 本文は含めない）。
         index: usize,
     },
     /// 件数の合計が `u64` の範囲を超える（[`mcnemar::paired_counts`] から）。
@@ -197,14 +211,25 @@ impl fmt::Display for RegressionError {
             RegressionError::UnknownGoldLabel { index } => {
                 write!(f, "unknown gold label at record index {index}")
             }
-            RegressionError::EmptyRecordId { index } => {
-                write!(f, "empty record id at record index {index}")
+            RegressionError::EmptyRecordId { side, index } => {
+                write!(f, "empty record id at {} index {index}", side.as_str())
             }
-            RegressionError::RecordIdTooLong { index, limit } => {
-                write!(f, "record id at record index {index} exceeds {limit} bytes")
+            RegressionError::RecordIdTooLong { side, index, limit } => {
+                write!(
+                    f,
+                    "record id at {} index {index} exceeds {limit} bytes",
+                    side.as_str()
+                )
             }
-            RegressionError::DuplicateRecordId { index } => {
-                write!(f, "duplicate record id at record index {index}")
+            RegressionError::DuplicateRecordId { side, index } => {
+                write!(f, "duplicate record id at {} index {index}", side.as_str())
+            }
+            RegressionError::MissingRecordId { side, index } => {
+                write!(
+                    f,
+                    "record id at counterpart index {index} is missing from {} results",
+                    side.as_str()
+                )
             }
             RegressionError::CountOverflow => write!(f, "count overflow while computing counts"),
             RegressionError::Internal { detail } => {
@@ -215,6 +240,27 @@ impl fmt::Display for RegressionError {
 }
 
 impl std::error::Error for RegressionError {}
+
+/// 旧・新どちら側の結果かを表す（[`regression_report`] の ID 検証エラー用。
+/// REQ-26・TASK-26.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordSide {
+    /// 旧モデルの結果。
+    Previous,
+    /// 新モデルの結果。
+    Current,
+}
+
+impl RecordSide {
+    /// エラーメッセージ用の固定文字列。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecordSide::Previous => "previous",
+            RecordSide::Current => "current",
+        }
+    }
+}
 
 /// 旧モデル・新モデルを 1 行に対応させた入力。
 ///
@@ -529,86 +575,119 @@ pub fn compare_label_sets(
 /// [`regression_report`] が重複判定のハッシュ計算より前に検証する。
 pub const MAX_RECORD_ID_BYTES: usize = fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES;
 
-/// [`regression_report`] の入力 1 行（旧・新の正誤を record ID で 1 行に対応
-/// させる。REQ-26・TASK-26.2）。
+/// [`regression_report`] の入力 1 行（片側のモデルの、record ID 付きの正誤。
+/// REQ-26・TASK-26.2）。
 ///
-/// 旧・新の正誤列を別々のスライスで受けると、異なるレコードや順序を同じ
-/// 件数で渡しても回帰・改善件数が確定してしまう。行の対応を型で保持し、
-/// 呼び出し側に共通の record ID による対応づけを必須にする。
+/// 旧・新それぞれの結果に record ID を持たせ、[`regression_report`] が ID で
+/// 照合してから正誤を組み合わせる。旧・新の正誤列を別々に（あるいは 1 つの
+/// 共通 ID の下に）渡すと、異なる行や順序を同じ件数で渡しても回帰・改善件数が
+/// 確定してしまうため、各正誤値がその ID の行から得られたことを ID 照合で保証する。
 #[derive(Debug, Clone, Copy)]
-pub struct ReportRecord<'a> {
-    /// 旧・新に共通の record ID（空不可・全行で一意）。
+pub struct IdentifiedCorrectness<'a> {
+    /// record ID（空不可・その側の中で一意）。
     pub id: &'a str,
-    /// 旧モデルがこの行を正解したか（旧モデル自身のラベル空間で判定済み）。
-    pub previous_correct: bool,
-    /// 新モデルがこの行を正解したか（新モデル自身のラベル空間で判定済み）。
-    pub current_correct: bool,
+    /// そのモデルがこの行を正解したか（そのモデル自身のラベル空間で判定済み）。
+    pub correct: bool,
 }
 
-/// 各モデル自身のラベル空間で判定済みの対応行と両側のラベル集合から、前提付きの
-/// [`RegressionReport`] を作る（REQ-26 異常系・TASK-26.2）。
+/// 片側の行 ID を検証する（空・長さ上限・重複。REQ-39・REQ-26）。
 ///
-/// ラベル集合を先に検証し（[`compare_label_sets`]）、続けて行 ID
-/// （空・重複を拒否）を検証して [`regression_counts`] に委ねる（評価ロジックを
-/// 再実装しない）。ラベル集合が異なる場合もエラーにせず、レポートの
-/// [`ComparisonPremise`] に明記する。
-///
-/// # エラー
-///
-/// - [`compare_label_sets`] のエラー（ラベルのエラーが先）
-/// - 行が空 → [`RegressionError::EmptyRecords`]、上限超過 →
-///   [`RegressionError::TooManyRecords`]（確保の前。REQ-39）
-/// - 行 ID が [`MAX_RECORD_ID_BYTES`] 超 → [`RegressionError::RecordIdTooLong`]
-///   （重複判定のハッシュ計算より前に全行を走査して拒否する。REQ-39）
-/// - 空の行 ID → [`RegressionError::EmptyRecordId`]、重複 →
-///   [`RegressionError::DuplicateRecordId`]
-/// - [`regression_counts`] のエラー
-pub fn regression_report(
-    previous_labels: &[&str],
-    current_labels: &[&str],
-    records: &[ReportRecord<'_>],
-) -> Result<RegressionReport, RegressionError> {
-    let premise = compare_label_sets(previous_labels, current_labels)?;
-
-    if records.is_empty() {
-        return Err(RegressionError::EmptyRecords);
-    }
-    if records.len() > MAX_EVAL_RECORDS {
-        return Err(RegressionError::TooManyRecords {
-            n_records: records.len(),
-            limit: MAX_EVAL_RECORDS,
-        });
-    }
-
-    // 重複判定（ハッシュ計算）の前に、全行の ID 長を検証する（REQ-39）。
-    for (i, record) in records.iter().enumerate() {
-        if record.id.len() > MAX_RECORD_ID_BYTES {
+/// 長さ上限は重複判定のハッシュ計算より前に全行を走査して拒否する。
+fn validate_side_ids(
+    side: RecordSide,
+    rows: &[IdentifiedCorrectness<'_>],
+) -> Result<(), RegressionError> {
+    for (i, row) in rows.iter().enumerate() {
+        if row.id.len() > MAX_RECORD_ID_BYTES {
             return Err(RegressionError::RecordIdTooLong {
+                side,
                 index: i,
                 limit: MAX_RECORD_ID_BYTES,
             });
         }
     }
-
     let mut seen: std::collections::HashSet<&str> =
-        std::collections::HashSet::with_capacity(records.len());
-    let mut previous_correct = Vec::with_capacity(records.len());
-    let mut current_correct = Vec::with_capacity(records.len());
-    for (i, record) in records.iter().enumerate() {
-        if record.id.is_empty() {
-            return Err(RegressionError::EmptyRecordId { index: i });
+        std::collections::HashSet::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        if row.id.is_empty() {
+            return Err(RegressionError::EmptyRecordId { side, index: i });
         }
-        if !seen.insert(record.id) {
-            return Err(RegressionError::DuplicateRecordId { index: i });
+        if !seen.insert(row.id) {
+            return Err(RegressionError::DuplicateRecordId { side, index: i });
         }
-        previous_correct.push(record.previous_correct);
-        current_correct.push(record.current_correct);
+    }
+    Ok(())
+}
+
+/// 各モデル自身のラベル空間で判定済みの、record ID 付き正誤と両側のラベル集合から、
+/// 前提付きの [`RegressionReport`] を作る（REQ-26 異常系・TASK-26.2）。
+///
+/// ラベル集合を先に検証し（[`compare_label_sets`]）、続けて旧・新それぞれの
+/// 行 ID（空・長さ・重複）を検証し、ID で 1 対 1 に照合して欠落を拒否した後に
+/// 旧の並びで正誤を組み合わせ、[`regression_counts`] に委ねる（評価ロジックを
+/// 再実装しない）。旧・新の並び順が異なっていても ID で対応づける。ラベル集合が
+/// 異なる場合もエラーにせず、レポートの [`ComparisonPremise`] に明記する。
+///
+/// # エラー
+///
+/// - [`compare_label_sets`] のエラー（ラベルのエラーが先）
+/// - どちらかの側が空 → [`RegressionError::EmptyRecords`]、上限超過 →
+///   [`RegressionError::TooManyRecords`]（確保の前。REQ-39）
+/// - 行 ID が [`MAX_RECORD_ID_BYTES`] 超 → [`RegressionError::RecordIdTooLong`]
+/// - 空の行 ID → [`RegressionError::EmptyRecordId`]、側内の重複 →
+///   [`RegressionError::DuplicateRecordId`]
+/// - 旧・新の件数が異なる → [`RegressionError::LengthMismatch`]、ID の集合が
+///   一致しない → [`RegressionError::MissingRecordId`]
+/// - [`regression_counts`] のエラー
+pub fn regression_report(
+    previous_labels: &[&str],
+    current_labels: &[&str],
+    previous: &[IdentifiedCorrectness<'_>],
+    current: &[IdentifiedCorrectness<'_>],
+) -> Result<RegressionReport, RegressionError> {
+    let premise = compare_label_sets(previous_labels, current_labels)?;
+
+    if previous.is_empty() || current.is_empty() {
+        return Err(RegressionError::EmptyRecords);
+    }
+    for len in [previous.len(), current.len()] {
+        if len > MAX_EVAL_RECORDS {
+            return Err(RegressionError::TooManyRecords {
+                n_records: len,
+                limit: MAX_EVAL_RECORDS,
+            });
+        }
+    }
+
+    validate_side_ids(RecordSide::Previous, previous)?;
+    validate_side_ids(RecordSide::Current, current)?;
+
+    if previous.len() != current.len() {
+        return Err(RegressionError::LengthMismatch {
+            previous: previous.len(),
+            current: current.len(),
+        });
+    }
+
+    // 各側は一意・同数なので、旧の全 ID が新に存在すれば ID 集合は一致する。
+    let current_by_id: std::collections::HashMap<&str, bool> =
+        current.iter().map(|r| (r.id, r.correct)).collect();
+    let mut previous_correct = Vec::with_capacity(previous.len());
+    let mut current_correct = Vec::with_capacity(previous.len());
+    for (i, row) in previous.iter().enumerate() {
+        let Some(cur) = current_by_id.get(row.id) else {
+            return Err(RegressionError::MissingRecordId {
+                side: RecordSide::Current,
+                index: i,
+            });
+        };
+        previous_correct.push(row.correct);
+        current_correct.push(*cur);
     }
 
     let counts = regression_counts(&previous_correct, &current_correct)?;
     Ok(RegressionReport { counts, premise })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,6 +1120,13 @@ mod tests {
         assert!(compare_label_sets(&refs, &refs).is_ok());
     }
 
+    fn side<'a>(ids: &[&'a str], correct: &[bool]) -> Vec<IdentifiedCorrectness<'a>> {
+        ids.iter()
+            .zip(correct.iter())
+            .map(|(id, c)| IdentifiedCorrectness { id, correct: *c })
+            .collect()
+    }
+
     /// REQ-26・TASK-26.2: 件数は `regression_counts` と一致し、前提が付く。
     /// ラベル異常と行 ID 異常が同時ならラベルのエラーが先。
     #[test]
@@ -1048,31 +1134,75 @@ mod tests {
         let prev = [true, true, false, false];
         let cur = [true, false, true, false];
         let ids = ["a", "b", "c", "d"];
-        let rows: Vec<ReportRecord<'_>> = ids
-            .iter()
-            .zip(prev.iter().zip(cur.iter()))
-            .map(|(id, (p, c))| ReportRecord {
-                id,
-                previous_correct: *p,
-                current_correct: *c,
-            })
-            .collect();
-        let report = regression_report(&["A", "B"], &["A", "C"], &rows).unwrap();
+        let p = side(&ids, &prev);
+        let c = side(&ids, &cur);
+        let report = regression_report(&["A", "B"], &["A", "C"], &p, &c).unwrap();
         assert_eq!(report.counts(), &regression_counts(&prev, &cur).unwrap());
         assert_eq!(report.counts().correct_to_incorrect(), 1);
         assert_eq!(report.counts().incorrect_to_correct(), 1);
         assert_eq!(report.premise().as_str(), "label_set_differs");
 
-        let mut dup = rows.clone();
-        dup[3].id = "a";
+        let dup = side(&["a", "b", "c", "a"], &prev);
         assert_eq!(
-            regression_report(&["A"], &["A"], &dup).unwrap_err(),
-            RegressionError::DuplicateRecordId { index: 3 }
+            regression_report(&["A"], &["A"], &dup, &c).unwrap_err(),
+            RegressionError::DuplicateRecordId {
+                side: RecordSide::Previous,
+                index: 3
+            }
+        );
+        assert_eq!(
+            regression_report(&["A"], &["A"], &p, &dup).unwrap_err(),
+            RegressionError::DuplicateRecordId {
+                side: RecordSide::Current,
+                index: 3
+            }
         );
         assert!(matches!(
-            regression_report(&[], &["A"], &dup),
+            regression_report(&[], &["A"], &dup, &c),
             Err(RegressionError::PreviousLabels(_))
         ));
+    }
+
+    /// REQ-26・TASK-26.2: 旧・新の並び順が異なっても ID で照合し、正誤は同じ ID の行同士で
+    /// 組み合わされる。ID 集合が一致しない（同数でも）場合は拒否する。
+    #[test]
+    fn report_matches_by_id_and_rejects_missing() {
+        // 旧: a=正解, b=不正解。新は逆順: b=正解, a=不正解。
+        let p = side(&["a", "b"], &[true, false]);
+        let c = side(&["b", "a"], &[true, false]);
+        let r = regression_report(&["A"], &["A"], &p, &c).unwrap();
+        assert_eq!(r.counts().correct_to_incorrect(), 1);
+        assert_eq!(r.counts().incorrect_to_correct(), 1);
+        assert_eq!(r.counts().both_correct(), 0);
+        // 同じ並びで渡した場合（a: 正解→正解, b: 不正解→不正解）とは結果が異なる。
+        let c_pos = side(&["a", "b"], &[true, false]);
+        let r2 = regression_report(&["A"], &["A"], &p, &c_pos).unwrap();
+        assert_eq!(r2.counts().correct_to_incorrect(), 0);
+        assert_eq!(r2.counts().both_correct(), 1);
+
+        // 同数だが ID が食い違う。
+        let c_bad = side(&["a", "z"], &[true, false]);
+        assert_eq!(
+            regression_report(&["A"], &["A"], &p, &c_bad).unwrap_err(),
+            RegressionError::MissingRecordId {
+                side: RecordSide::Current,
+                index: 1
+            }
+        );
+        // 件数が異なる。
+        let c_short = side(&["a"], &[true]);
+        assert_eq!(
+            regression_report(&["A"], &["A"], &p, &c_short).unwrap_err(),
+            RegressionError::LengthMismatch {
+                previous: 2,
+                current: 1
+            }
+        );
+        // どちらかが空。
+        assert_eq!(
+            regression_report(&["A"], &["A"], &p, &[]).unwrap_err(),
+            RegressionError::EmptyRecords
+        );
     }
 
     /// REQ-39・TASK-26.2: 上限超過の行 ID は、後方に空 ID・重複があっても先に拒否される。
@@ -1080,36 +1210,24 @@ mod tests {
     fn report_rejects_oversized_record_id_before_hashing() {
         let long = "x".repeat(MAX_RECORD_ID_BYTES + 1);
         let ok = "y".repeat(MAX_RECORD_ID_BYTES);
-        let rows = [
-            ReportRecord {
-                id: &ok,
-                previous_correct: true,
-                current_correct: true,
-            },
-            ReportRecord {
-                id: "",
-                previous_correct: true,
-                current_correct: true,
-            },
-            ReportRecord {
-                id: &long,
-                previous_correct: true,
-                current_correct: true,
-            },
-        ];
+        let ids = [ok.as_str(), "", long.as_str()];
+        let rows = side(&ids, &[true, true, true]);
         assert_eq!(
-            regression_report(&["A"], &["A"], &rows).unwrap_err(),
+            regression_report(&["A"], &["A"], &rows, &rows).unwrap_err(),
             RegressionError::RecordIdTooLong {
+                side: RecordSide::Previous,
                 index: 2,
                 limit: MAX_RECORD_ID_BYTES
             }
         );
         assert_eq!(
-            regression_report(&["A"], &["A"], &rows[..2]).unwrap_err(),
-            RegressionError::EmptyRecordId { index: 1 }
+            regression_report(&["A"], &["A"], &rows[..2], &rows[..2]).unwrap_err(),
+            RegressionError::EmptyRecordId {
+                side: RecordSide::Previous,
+                index: 1
+            }
         );
     }
-
     /// REQ-26・TASK-26.2: Display は英語の固定文で、データ本文を含まない。
     #[test]
     fn side_error_display_is_english() {

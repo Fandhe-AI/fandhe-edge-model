@@ -10,7 +10,8 @@
 //! 使わず決定的に組み立てる。
 
 use fandhe_edge_eval::regression::{
-    ComparisonPremise, RegressionError, ReportRecord, regression_counts, regression_report,
+    ComparisonPremise, IdentifiedCorrectness, RecordSide, RegressionError, regression_counts,
+    regression_report,
 };
 
 /// PoC-19 の 9 ラベル（旧モデル）。
@@ -78,15 +79,11 @@ fn ids(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("r{i}")).collect()
 }
 
-/// 正誤列を行 ID で対応づけた入力行にする。
-fn rows<'a>(ids: &'a [String], prev: &[bool], cur: &[bool]) -> Vec<ReportRecord<'a>> {
+/// 正誤列を行 ID 付きの片側結果にする。
+fn side<'a>(ids: &'a [String], correct: &[bool]) -> Vec<IdentifiedCorrectness<'a>> {
     ids.iter()
-        .zip(prev.iter().zip(cur.iter()))
-        .map(|(id, (p, c))| ReportRecord {
-            id,
-            previous_correct: *p,
-            current_correct: *c,
-        })
+        .zip(correct.iter())
+        .map(|(id, c)| IdentifiedCorrectness { id, correct: *c })
         .collect()
 }
 
@@ -101,7 +98,7 @@ fn p3_merge_reports_label_set_differs() {
     let (prev, cur) = build(170, 44, 45, 391);
     let report = {
         let ids = ids(prev.len());
-        regression_report(&M9, &M8_MERGE, &rows(&ids, &prev, &cur)).unwrap()
+        regression_report(&M9, &M8_MERGE, &side(&ids, &prev), &side(&ids, &cur)).unwrap()
     };
     assert_eq!(report.counts().n(), 650);
     assert_eq!(report.counts().correct_to_incorrect(), 44);
@@ -123,7 +120,7 @@ fn p1_addition_reports_added_label() {
     let (prev, cur) = build(100, 58, 22, 351);
     let report = {
         let ids = ids(prev.len());
-        regression_report(&M8_RM, &M9, &rows(&ids, &prev, &cur)).unwrap()
+        regression_report(&M8_RM, &M9, &side(&ids, &prev), &side(&ids, &cur)).unwrap()
     };
     assert_eq!(report.counts().n(), 531);
     assert_eq!(
@@ -141,7 +138,7 @@ fn p2_removal_reports_removed_label() {
     let (prev, cur) = build(100, 22, 58, 351);
     let report = {
         let ids = ids(prev.len());
-        regression_report(&M9, &M8_RM, &rows(&ids, &prev, &cur)).unwrap()
+        regression_report(&M9, &M8_RM, &side(&ids, &prev), &side(&ids, &cur)).unwrap()
     };
     assert_eq!(report.counts().correct_to_incorrect(), 22);
     assert_eq!(report.counts().incorrect_to_correct(), 58);
@@ -161,7 +158,7 @@ fn same_label_set_keeps_counts_identical() {
     let (prev, cur) = build(2, 2, 1, 2);
     let report = {
         let ids = ids(prev.len());
-        regression_report(&M9, &M9, &rows(&ids, &prev, &cur)).unwrap()
+        regression_report(&M9, &M9, &side(&ids, &prev), &side(&ids, &cur)).unwrap()
     };
     assert_eq!(report.counts(), &regression_counts(&prev, &cur).unwrap());
     assert_eq!(report.counts().both_correct(), 2);
@@ -172,19 +169,42 @@ fn same_label_set_keeps_counts_identical() {
     assert_eq!(report.premise().note(), None);
 }
 
-/// REQ-26・TASK-26.2: 行 ID が空・重複なら拒否する（旧・新の対応を検証できない
+/// REQ-26・TASK-26.2: 行 ID が空・重複・欠落なら拒否する（旧・新の対応を検証できない
 /// 入力で件数を確定させない）。
 #[test]
-fn rejects_empty_and_duplicate_record_ids() {
-    let row = |id| ReportRecord {
-        id,
-        previous_correct: true,
-        current_correct: false,
-    };
-    let err = regression_report(&M9, &M9, &[row("a"), row("")]).unwrap_err();
-    assert_eq!(err, RegressionError::EmptyRecordId { index: 1 });
-    let err = regression_report(&M9, &M9, &[row("a"), row("b"), row("a")]).unwrap_err();
-    assert_eq!(err, RegressionError::DuplicateRecordId { index: 2 });
-    let err = regression_report(&M9, &M9, &[]).unwrap_err();
+fn rejects_empty_duplicate_and_missing_record_ids() {
+    let row = |id| IdentifiedCorrectness { id, correct: true };
+    let err = regression_report(&M9, &M9, &[row("a"), row("")], &[row("a"), row("b")]).unwrap_err();
+    assert_eq!(
+        err,
+        RegressionError::EmptyRecordId {
+            side: RecordSide::Previous,
+            index: 1
+        }
+    );
+    let err = regression_report(
+        &M9,
+        &M9,
+        &[row("a"), row("b"), row("c")],
+        &[row("a"), row("b"), row("a")],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        RegressionError::DuplicateRecordId {
+            side: RecordSide::Current,
+            index: 2
+        }
+    );
+    let err =
+        regression_report(&M9, &M9, &[row("a"), row("b")], &[row("a"), row("c")]).unwrap_err();
+    assert_eq!(
+        err,
+        RegressionError::MissingRecordId {
+            side: RecordSide::Current,
+            index: 1
+        }
+    );
+    let err = regression_report(&M9, &M9, &[], &[]).unwrap_err();
     assert_eq!(err, RegressionError::EmptyRecords);
 }
