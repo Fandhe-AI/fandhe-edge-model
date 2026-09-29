@@ -44,15 +44,20 @@
 #   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
 #   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
 #   実行ファイルのパスは入れない）・started_at（CLI 起動前の UTC 秒精度）・exit_code（呼び出し元へ
-#   返す値）・stdout（呼び出し元が受け取る正規化後の全体。バッチの複数行も 1 文字列）・
-#   stderr（中継する CLI の stderr。診断行 exit_code=<N> は含めない）・stderr_replaced
-#   （UTF-8 として不正または NUL を含む stderr を固定文字列へ置き換えたとき true）。
-#   データ本文の混入防止（security.md）: command は許可リスト方式。記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値（UTF-8 として不正なら `<invalid utf-8>`）だけで、
-#   --text・--id の値・未知のトークン・位置引数は `<redacted>` に伏せる
-#   （id は利用者入力で個人情報を含みうるため。infer 成功時の stdout に含まれる id は CLI の契約出力を
-#   そのまま記録するもので、呼び出し元が既に受け取っている）。入力ファイルの中身は読まず、環境変数は
-#   記録しない。記録を要求されたのに保存できなければ runtime_error(70)（fail-closed）。CLI 起動前の
-#   拒否（--out・不正な記録ディレクトリ・バイナリ不在）は記録しない。
+#   返す値）・stdout・stderr（それぞれ `{"bytes":<バイト数>,"sha256":"<hex>"}`。
+#   stdout は呼び出し元が受け取る正規化後の全体、stderr は中継する CLI の stderr で、診断行
+#   exit_code=<N> は含めない）。
+#   データ本文の混入防止（security.md）: 利用者由来の値（stdout に含まれる id・入力由来の文字列、
+#   CLI の stderr）は本文を保存せず、件数（バイト数）とハッシュだけを残す。command は許可リスト方式で、
+#   記録するのは既知オプション名（--package・--input-file・--out・--text・--id・--help）とパス値
+#   （UTF-8 として不正なら `<invalid utf-8>`）だけ、--text・--id の値・未知のトークン・位置引数は
+#   `<redacted>` に伏せる。入力ファイルの中身は読まず、環境変数は記録しない。
+#   記録先は起動前に物理パス（`cd -P` + `pwd -P`。途中の symlink を解決）へ正規化し、保存の前後で
+#   記録先の物理パスと作成したファイルの親が一致すること・記録が通常ファイルであることを確認する
+#   （不一致は fail-closed。検査から作成までの完全な排他はシェルでは保証できない限界で、
+#   差し替えに気づいたら記録を削除して 70 にする）。ハッシュは sha256sum / shasum -a 256 のいずれか
+#   （無ければ fail-closed）。記録を要求されたのに保存できなければ runtime_error(70)。
+#   CLI 起動前の拒否（--out・不正な記録ディレクトリ・バイナリ不在）は記録しない。
 #   証拠種別: テストハーネス（fake bin・help 経路。実クライアントでの記録ではない）。
 #
 # 現状の制約: infer の実推論は TASK-33.1-2（#136）・前処理（#112）・
@@ -101,11 +106,21 @@ json_escape() {
     END { if (NR > 0 && trail == 1) printf "\\n" }'
 }
 
-# ファイル全体を JSON 文字列の本体へ（末尾の改行の有無を保つ）。出力は改行を含まない
-json_escape_file() {
-    _t=0
-    if [ -s "$1" ] && [ -z "$(tail -c 1 "$1")" ]; then _t=1; fi
-    json_escape "$_t" <"$1"
+# ファイルの sha256（16 進 64 桁）を出す。ツールが無い・出力が不正なら非 0（fail-closed）
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        _h=$(sha256sum <"$1") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        _h=$(shasum -a 256 <"$1") || return 1
+    else
+        return 1
+    fi
+    _h=${_h%% *}
+    case "$_h" in
+        *[!0-9a-f]* | '') return 1 ;;
+    esac
+    [ "${#_h}" -eq 64 ] || return 1
+    printf '%s' "$_h"
 }
 
 # 引数 1 つを記録の command 配列へ追加する（記録を要求されたときだけ）。呼び出し側は
@@ -186,7 +201,15 @@ if [ "$out_requested" -eq 1 ]; then
 fi
 
 # 記録ディレクトリは CLI の起動前に検証する（fail-closed。メッセージは固定でパスを含めない）
+rec_real=
 if [ -n "$rec_dir" ] && { [ ! -d "$rec_dir" ] || [ -L "$rec_dir" ]; }; then
+    rec_real=-
+elif [ -n "$rec_dir" ]; then
+    # 途中の symlink を含む全経路を物理パスへ正規化し、以降の保存はこの値だけを使う
+    rec_real=$(CDPATH='' cd -P -- "$rec_dir" 2>/dev/null && pwd -P) || rec_real=-
+    [ -n "$rec_real" ] || rec_real=-
+fi
+if [ "$rec_real" = "-" ]; then
     printf '%s\n' '{"code":"invalid_input","message":"FANDHE_EDGE_RECORD_DIR must be an existing directory"}'
     echo "exit_code=64" >&3
     exit 64
@@ -591,28 +614,38 @@ if [ -n "$rec_dir" ]; then
         [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
         *) rec_ok=0 ;;
     esac
-    # stderr が UTF-8 として不正・NUL を含む場合は元のバイト列を残さず固定文字列にする
-    err_replaced=false
-    err_json=
+    # stdout・stderr は本文を残さずバイト数と sha256 だけを記録する（利用者由来の値の混入防止）
+    out_hash=
+    err_hash=
+    out_bytes=
+    err_bytes=
     if [ "$rec_ok" -eq 1 ]; then
-        nul_free=$(tr -d '\000' <"$err" | wc -c) || nul_free=-1
-        raw_size=$(wc -c <"$err") || raw_size=-2
-        if [ "$nul_free" -ne "$raw_size" ] || ! iconv -f UTF-8 -t UTF-8 <"$err" >/dev/null 2>&1; then
-            err_replaced=true
-            err_json='<stderr not representable as UTF-8 text>'
-        else
-            err_json=$(json_escape_file "$err") || rec_ok=0
+        out_hash=$(sha256_file "$out") || rec_ok=0
+        err_hash=$(sha256_file "$err") || rec_ok=0
+        out_bytes=$(wc -c <"$out" | tr -d ' ') || rec_ok=0
+        err_bytes=$(wc -c <"$err" | tr -d ' ') || rec_ok=0
+    fi
+    # 記録先が起動前に正規化した物理パスのままか（検査後の symlink 差し替えの検出）
+    rec_dir_unchanged() {
+        [ "$(CDPATH='' cd -P -- "$rec_real" 2>/dev/null && pwd -P)" = "$rec_real" ]
+    }
+    if [ "$rec_ok" -eq 1 ]; then
+        rec_dir_unchanged || rec_ok=0
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        rec_file=$(mktemp "$rec_real/run-record.XXXXXX") || rec_ok=0
+    fi
+    if [ "$rec_ok" -eq 1 ]; then
+        # 作成したファイルの親が正規化済みの記録先であり、通常ファイルであること（書き込み前に確認）
+        rec_parent=$(CDPATH='' cd -P -- "$(dirname -- "$rec_file")" 2>/dev/null && pwd -P) || rec_parent=
+        if [ "$rec_parent" != "$rec_real" ] || [ -L "$rec_file" ] || [ ! -f "$rec_file" ]; then
+            rec_ok=0
         fi
     fi
     if [ "$rec_ok" -eq 1 ]; then
-        out_json=$(json_escape_file "$out") || rec_ok=0
-    fi
-    if [ "$rec_ok" -eq 1 ]; then
-        rec_file=$(mktemp "$rec_dir/run-record.XXXXXX") || rec_ok=0
-    fi
-    if [ "$rec_ok" -eq 1 ]; then
-        printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":"%s","stderr":"%s","stderr_replaced":%s}\n' \
-            "$rec_cmd" "$started_at" "$rc" "$out_json" "$err_json" "$err_replaced" >"$rec_file" || rec_ok=0
+        printf '{"schema":"fandhe-edge.run-record/1","command":[%s],"started_at":"%s","exit_code":%s,"stdout":{"bytes":%s,"sha256":"%s"},"stderr":{"bytes":%s,"sha256":"%s"}}\n' \
+            "$rec_cmd" "$started_at" "$rc" "$out_bytes" "$out_hash" "$err_bytes" "$err_hash" >"$rec_file" || rec_ok=0
+        rec_dir_unchanged || rec_ok=0
     fi
     if [ "$rec_ok" -ne 1 ]; then
         if [ -n "$rec_file" ]; then rm -f "$rec_file"; fi

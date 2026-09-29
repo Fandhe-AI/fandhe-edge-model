@@ -977,19 +977,42 @@ fn record_files(dir: &std::path::Path) -> Vec<(String, String)> {
     v
 }
 
-/// 期待値側の JSON 文字列エスケープ（`"`・`\`・制御文字）。
-fn json_str(s: &str) -> String {
-    let mut o = String::new();
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
+/// バイト列の sha256（16 進 64 桁）。スクリプトと同じ外部ツール（sha256sum / shasum）で求める。
+fn sha256_hex(data: &[u8]) -> String {
+    use std::io::Write;
+    for (tool, extra) in [("sha256sum", None), ("shasum", Some("256"))] {
+        let mut cmd = Command::new(tool);
+        if let Some(n) = extra {
+            cmd.args(["-a", n]);
         }
+        let Ok(mut child) = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(data)
+            .expect("write");
+        let out = child.wait_with_output().expect("wait");
+        let text = String::from_utf8(out.stdout).expect("utf8");
+        return text.split(' ').next().expect("hash").to_string();
     }
-    o
+    panic!("no sha256 tool");
+}
+
+/// 記録の stdout / stderr 要約（本文を含まず、バイト数と sha256 だけ）の期待文字列。
+fn summary_json(data: &[u8]) -> String {
+    format!(
+        "{{\"bytes\":{},\"sha256\":\"{}\"}}",
+        data.len(),
+        sha256_hex(data)
+    )
 }
 
 /// UTC の暦日時（YYYY-MM-DDTHH:MM:SSZ）を epoch 秒へ（days_from_civil）。
@@ -1058,8 +1081,9 @@ fn req36_run_record_contains_five_fields_with_exact_values() {
         "{started} {before} {after}"
     );
     let expected = format!(
-        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":0,\"stdout\":\"{}\",\"stderr\":\"\",\"stderr_replaced\":false}}\n",
-        json_str(&help)
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":0,\"stdout\":{},\"stderr\":{}}}\n",
+        summary_json(help.as_bytes()),
+        summary_json(b"")
     );
     assert_eq!(rec, expected);
     std::fs::remove_dir_all(&dir).ok();
@@ -1108,7 +1132,7 @@ fn req36_run_record_redacts_unknown_tokens_and_positionals() {
     let d = dir.to_str().unwrap();
     let body = "echo '{\"code\":\"invalid_input\"}'\nexit 64";
     let o = run_with_fake_bin_args(
-        "unknown",
+        "record-unknown",
         body,
         &[
             "SECRET-BODY-pos",
@@ -1158,7 +1182,7 @@ fn req36_run_record_invalid_utf8_path_arg_is_replaced() {
     std::fs::remove_dir_all(&bindir).ok();
 }
 
-/// 非ゼロ終了・stderr の引用符とタブがエスケープされて残る。
+/// 非ゼロ終了が残り、stdout・stderr は本文でなくバイト数と sha256 だけが残る。
 #[test]
 fn req36_run_record_captures_nonzero_exit_and_stderr() {
     let dir = record_dir("nonzero");
@@ -1174,9 +1198,12 @@ fn req36_run_record_captures_nonzero_exit_and_stderr() {
     let rec = only_record(&dir);
     let started = started_at_of(&rec);
     let expected = format!(
-        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":64,\"stdout\":\"{{\\\"code\\\":\\\"invalid_input\\\",\\\"message\\\":\\\"m\\\"}}\\n\",\"stderr\":\"warn: \\\"q\\\"\\u0009x\\n\",\"stderr_replaced\":false}}\n"
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--help\"],\"started_at\":\"{started}\",\"exit_code\":64,\"stdout\":{{\"bytes\":39,\"sha256\":\"811012849462321a2c240f5762e37bb0388f93aa9ad8e00ceb4bac1e5442e14f\"}},\"stderr\":{{\"bytes\":12,\"sha256\":\"2fc168109588af3b2a1c21a9ffaeacbe058c79716df3ce55292016d13c40d66f\"}}}}\n"
     );
     assert_eq!(rec, expected);
+    // 本文（引用符付きのメッセージ・stderr の文言）は記録に残らない
+    assert!(!rec.contains("warn"), "{rec}");
+    assert!(!rec.contains("invalid_input"), "{rec}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1195,24 +1222,28 @@ fn req36_run_record_stores_normalized_output_after_replacement() {
     let rec = only_record(&dir);
     assert!(rec.contains("\"exit_code\":70,"), "{rec}");
     assert!(
-        rec.contains(&format!("\"stdout\":\"{}\"", json_str(&o.stdout))),
+        rec.contains(&format!(
+            "\"stdout\":{},",
+            summary_json(o.stdout.as_bytes())
+        )),
         "{rec}"
     );
     assert!(
-        rec.contains("\"stderr\":\"\",\"stderr_replaced\":false}"),
+        rec.contains(&format!("\"stderr\":{}}}", summary_json(b""))),
         "{rec}"
     );
+    assert!(!rec.contains("runtime_error"), "{rec}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// バッチの複数行 stdout は 1 つの文字列に収まる。
+/// バッチの複数行 stdout は全体で 1 つの要約（バイト数と sha256）になる。
 #[test]
 fn req36_run_record_batch_multiline_stdout_is_one_string() {
     let dir = record_dir("batch");
     let d = dir.to_str().unwrap();
     let body = "echo '{\"a\":1}'\necho '{\"b\":2}'\nexit 0";
     let o = run_with_fake_bin_args(
-        "batch",
+        "record-batch",
         body,
         &["--input-file", "f"],
         &[("FANDHE_EDGE_RECORD_DIR", d)],
@@ -1224,13 +1255,17 @@ fn req36_run_record_batch_multiline_stdout_is_one_string() {
         "{rec}"
     );
     assert!(
-        rec.contains("\"stdout\":\"{\\\"a\\\":1}\\n{\\\"b\\\":2}\\n\","),
+        rec.contains(&format!(
+            "\"stdout\":{},",
+            summary_json(b"{\"a\":1}\n{\"b\":2}\n")
+        )),
         "{rec}"
     );
+    assert!(!rec.contains("\\\"a\\\""), "{rec}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// UTF-8 として不正・NUL を含む stderr は固定文字列に置き換わる。
+/// UTF-8 として不正・NUL を含む stderr でも、要約（バイト数・sha256）で妥当な記録になる。
 #[test]
 fn req36_run_record_invalid_utf8_stderr_is_replaced() {
     let dir = record_dir("badstderr");
@@ -1244,10 +1279,9 @@ fn req36_run_record_invalid_utf8_stderr_is_replaced() {
     );
     assert_eq!(o.code, Some(0));
     let rec = only_record(&dir);
+    // 不正な UTF-8・NUL を含む生バイト列もそのままハッシュされ、記録は妥当な JSON のまま
     assert!(
-        rec.contains(
-            "\"stderr\":\"<stderr not representable as UTF-8 text>\",\"stderr_replaced\":true}"
-        ),
+        rec.contains(&format!("\"stderr\":{}}}", summary_json(b"\xff\x00"))),
         "{rec}"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -1286,6 +1320,72 @@ fn req36_run_record_dir_not_directory_is_rejected_without_launching_cli() {
         assert!(!marker.exists(), "CLI must not be launched");
     }
     assert!(record_files(&real).is_empty());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CLI の stdout・stderr に含まれる利用者由来の値は記録に残らない（security.md）。
+#[test]
+fn req36_run_record_does_not_store_user_derived_output() {
+    let dir = record_dir("userderived");
+    let d = dir.to_str().unwrap();
+    let body =
+        "echo 'SECRET-ERR-line' 1>&2\necho '{\"code\":\"ok\",\"id\":\"SECRET-ID-abc\"}'\nexit 0";
+    let o = run_with_fake_bin_args(
+        "record-userderived",
+        body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", d)],
+    );
+    assert_eq!(o.code, Some(0));
+    assert!(o.stdout.contains("SECRET-ID-abc"));
+    let rec = only_record(&dir);
+    assert!(!rec.contains("SECRET"), "{rec}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 親ディレクトリが symlink でも、正規化した物理パスの直下にだけ記録し、
+/// 検査後に記録先が差し替えられたら記録を残さず 70 にする（fail-closed）。
+#[test]
+fn req36_run_record_resolves_parent_symlink_and_detects_swap() {
+    let base = record_dir("parentlink");
+    let real = base.join("real");
+    let sub = real.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    // 親が symlink の経路でも、実体（real/sub）へ記録される
+    let via = link.join("sub");
+    let o = run_with_fake_bin_args(
+        "record-parentlink",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", via.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(0));
+    assert_eq!(record_files(&sub).len(), 1);
+    // 実行中に記録先（正規化済みの物理パス）が別ディレクトリへの symlink に差し替えられる
+    let evil = base.join("evil");
+    std::fs::create_dir_all(&evil).expect("mkdir");
+    let body = format!(
+        "rm -rf '{s}'\nln -s '{e}' '{s}'\necho '{{\"code\":\"ok\"}}'\nexit 0",
+        s = sub.display(),
+        e = evil.display()
+    );
+    let o = run_with_fake_bin_args(
+        "record-parentlink-swap",
+        &body,
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", via.to_str().unwrap())],
+    );
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n"
+    );
+    assert!(
+        record_files(&evil).is_empty(),
+        "record must not land in swapped dir"
+    );
     std::fs::remove_dir_all(&base).ok();
 }
 
