@@ -174,6 +174,11 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
 
 /// 偽の実行ファイル（sh スクリプト）を一時ディレクトリへ作り、スクリプト経由で実行する。
 fn run_with_fake_bin(name: &str, body: &str) -> Out {
+    run_with_fake_bin_env(name, body, &[])
+}
+
+/// `run_with_fake_bin` に環境変数（期限の上書きなど）を追加で渡す版。
+fn run_with_fake_bin_env(name: &str, body: &str, envs: &[(&str, &str)]) -> Out {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!(
         "fandhe-noninteractive-{}-{name}",
@@ -187,6 +192,7 @@ fn run_with_fake_bin(name: &str, body: &str) -> Out {
         .arg(script_path())
         .arg("--help")
         .env("FANDHE_EDGE_BIN", &bin)
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .output()
         .expect("run");
@@ -237,4 +243,35 @@ fn req33_empty_stdout_with_allowed_exit_codes_gets_runtime_error_json() {
         );
         assert_eq!(o.stderr.lines().last(), Some("exit_code=70"), "{name}");
     }
+}
+
+/// 期限を超えた子は終了され、runtime_error(70) の JSON 1 つが返ること（REQ-39・REQ-21）。
+#[test]
+fn req39_timeout_kills_child_and_returns_runtime_error_70() {
+    let started = Instant::now();
+    let o = run_with_fake_bin_env(
+        "timeout",
+        "exec sleep 60",
+        &[("FANDHE_EDGE_TIMEOUT_SECS", "1")],
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge timed out\"}\n"
+    );
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+}
+
+/// stdout が容量上限（1 MiB）を超えた子は終了され、途中までの出力は破棄されて
+/// runtime_error(70) の JSON 1 つが返ること（REQ-39・REQ-21）。
+#[test]
+fn req39_output_over_limit_returns_runtime_error_70() {
+    let o = run_with_fake_bin("bigout", "exec yes");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge output exceeded size limit\"}\n"
+    );
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
 }
