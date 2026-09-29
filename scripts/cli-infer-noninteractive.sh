@@ -42,7 +42,7 @@
 #   環境変数 FANDHE_EDGE_RECORD_DIR（存在する実ディレクトリ。symlink は不可）を設定したときだけ、
 #   その直下へ一時名 `.run-record.<pid>.<乱数>.tmp`（noclobber の O_EXCL 作成・0600）で作り、書き込みと検証が済んだときだけ
 #   `run-record.<pid>.<乱数>` へ確定する（ハードリンク `ln` で上書きせず原子的に。衝突したら別の乱数で最大 10 回再試行し、
-#   それでも確定できなければ記録を捨てて結果は変えない）（失敗時は一時名・最終名とも残さない。作成・rename・削除は
+#   それでも確定できなければ 70）（失敗時は一時名・最終名とも残さない。作成・rename・削除は
 #   記録先を cd -P で開いたカレントディレクトリへの相対名で行い、記録先の移動・差し替えに影響されない）。
 #   JSON オブジェクト 1 つを 1 行（末尾 LF・UTF-8）で保存する。未設定なら出力も副作用も一切変えない。
 #   キーはこの順: schema（`fandhe-edge.run-record/1`）・command（`["fandhe-edge","infer",<引数…>]`。
@@ -662,8 +662,7 @@ case "$rc" in
         ;;
 esac
 # 実行記録の保存（opt-in。TASK-36.1-2）。正規化と置き換えが済んだ最終結果を記録する。
-# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）。ただし確定先の名前の
-# 衝突が上限回数続いた場合だけは記録を捨て、推論の結果・終了コードを変えない
+# 保存できなければ記録済みを装わず runtime_error(70) にする（再試行しない）
 if [ -n "$rec_dir" ]; then
     rec_ok=1
     case "$started_at" in
@@ -702,12 +701,14 @@ if [ -n "$rec_dir" ]; then
             rec_try=$((rec_try + 1))
             rec_name="run-record.$$.$RANDOM$RANDOM"
             rec_tmp=".$rec_name.tmp"
-            # 子シェルの終了値: 0=保存成功・2=一時名の作成失敗（既存エントリとの衝突等。自分のファイルではない）・
-            # 3=それ以外の失敗（作成したファイルは子シェルの中で削除済み）
+            # 子シェルの終了値: 0=保存成功・2 または 4=名前の衝突（別の乱数名で再試行する。作成したファイルは
+            # 子シェルの中で削除済み）・それ以外=失敗（同じく削除済み）
             rec_rc=0
             (
                 set -C
                 umask 077
+                # 書き込みが上限超過（RLIMIT_FSIZE）でも SIGXFSZ で落とさず、通常の書き込み失敗として扱う
+                trap '' XFSZ
                 CDPATH='' cd -P -- "$rec_real" 2>/dev/null || exit 3
                 [ "$(dir_identity .)" = "$rec_id" ] || exit 3
                 exec 4>"$rec_tmp" || exit 2
@@ -721,14 +722,26 @@ if [ -n "$rec_dir" ]; then
                     rm -f -- "$rec_tmp"
                     exit 3
                 fi
-                # 上書きしない原子的な確定: ハードリンクは確定先が既にあれば（symlink を含め）失敗する。
-                # 成功したら一時名を消す。確定先の衝突は exit 4（別の名前で再試行）、それ以外は exit 3
-                if ! ln -- "$rec_tmp" "$rec_name" 2>/dev/null; then
+                # 確定先の名前が既にあれば（ディレクトリ・symlink を含め）衝突として別の名前で再試行する
+                if [ -e "$rec_name" ] || [ -L "$rec_name" ]; then
                     rm -f -- "$rec_tmp"
-                    if [ -e "$rec_name" ] || [ -L "$rec_name" ]; then exit 4; fi
-                    exit 3
+                    exit 4
                 fi
-                rm -f -- "$rec_tmp"
+                # 上書きしない原子的な確定: ハードリンクは確定先が既にあれば失敗する（-n は GNU・BSD の
+                # どちらの ln にもある no-dereference で、確定先が symlink でも辿らない）。ただし確定先が
+                # 検査後にディレクトリへ差し替わると ln はその中へリンクを作るため、ln の後に
+                # 「確定先そのものが一時ファイルと同じ実体の通常ファイル」であることを検証し、
+                # 満たさなければディレクトリの中にできたリンクを消して衝突として扱う
+                ln -n -- "$rec_tmp" "$rec_name" 2>/dev/null || :
+                if [ ! -L "$rec_name" ] && [ -f "$rec_name" ] && [ "$rec_name" -ef "$rec_tmp" ]; then
+                    rm -f -- "$rec_tmp"
+                else
+                    if [ -d "$rec_name" ] && [ -f "$rec_name/$rec_tmp" ] && [ "$rec_name/$rec_tmp" -ef "$rec_tmp" ]; then
+                        rm -f -- "$rec_name/$rec_tmp"
+                    fi
+                    rm -f -- "$rec_tmp"
+                    exit 4
+                fi
                 # 確定後も記録先が起動前のままで、記録が通常ファイルであること
                 if [ -L "$rec_name" ] || [ ! -f "$rec_name" ] || ! rec_dir_unchanged; then
                     rm -f -- "$rec_name"
@@ -737,12 +750,9 @@ if [ -n "$rec_dir" ]; then
             ) || rec_rc=$?
             case "$rec_rc" in 2 | 4) ;; *) break ;; esac
         done
-        case "$rec_rc" in
-            0) ;;
-            # 名前の衝突が上限回数続いた場合は記録を捨てる（一時名は削除済み。推論の結果・終了コードは変えない）
-            2 | 4) ;;
-            *) rec_ok=0 ;;
-        esac
+        # 記録先が指定されたのに確定できなかった場合は、理由を問わず（一時ファイルの作成失敗・書き込み失敗・
+        # 名前の衝突の上限到達・ln の失敗など）ここ 1 か所で 70 にする
+        [ "$rec_rc" -eq 0 ] || rec_ok=0
     fi
     if [ "$rec_ok" -ne 1 ]; then
         replace_with_error "failed to save run record"

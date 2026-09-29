@@ -1658,7 +1658,7 @@ fn req39_run_record_moved_dir_leaves_no_record_after_failure() {
 }
 
 /// 確定先の名前に既存ファイルがあっても上書きせず、別の名前で再試行して記録する。
-/// 衝突が上限回数続いたら記録を捨て、推論の結果・終了コードを変えず一時名も残さない
+/// 衝突が上限回数続いたら 70 の固定文エラーにし、一時名も残さない
 /// （REQ-39・TASK-36.1-2）。PATH 上の `ln` シムが、確定先へ既存ファイルを先に作って衝突を起こす。
 #[test]
 fn req39_run_record_never_overwrites_existing_final_name() {
@@ -1702,9 +1702,14 @@ fn req39_run_record_never_overwrites_existing_final_name() {
                 ("PATH", &path),
             ],
         );
-        // 推論の結果と終了コードは変わらない
-        assert_eq!(o.code, Some(0), "{label}");
-        assert_eq!(o.stdout, "{\"code\":\"ok\"}\n", "{label}");
+        // 1 回の衝突は再試行で成功し、上限到達は 70 の固定文エラーに統一される
+        if always {
+            assert_eq!(o.code, Some(70), "{label}");
+            assert_eq!(o.stdout, SAVE_FAILED_JSON, "{label}");
+        } else {
+            assert_eq!(o.code, Some(0), "{label}");
+            assert_eq!(o.stdout, "{\"code\":\"ok\"}\n", "{label}");
+        }
         let files = record_files(&dir);
         let pre: Vec<_> = files.iter().filter(|f| f.1 == "PRE-EXISTING\n").collect();
         let recs: Vec<_> = files
@@ -1718,13 +1723,149 @@ fn req39_run_record_never_overwrites_existing_final_name() {
             "{label}: leftover {files:?}"
         );
         if always {
-            // 10 回すべて衝突: 既存 10 件が無傷で残り、記録は捨てられる
+            // 10 回すべて衝突: 既存 10 件が無傷で残り、記録は作られない
             assert_eq!(pre.len(), 10, "{files:?}");
             assert!(recs.is_empty(), "{files:?}");
         } else {
             assert_eq!(pre.len(), 1, "{files:?}");
             assert_eq!(recs.len(), 1, "{files:?}");
         }
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+const SAVE_FAILED_JSON: &str =
+    "{\"code\":\"runtime_error\",\"message\":\"failed to save run record\"}\n";
+
+/// 一時ファイルを作れない場合も、成功として返さず 70 の固定文エラーにする
+/// （REQ-39・TASK-36.1-2）。記録先を読み取り専用にして作成を失敗させる。
+#[test]
+fn req39_run_record_temp_create_failure_is_70() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = record_dir("tmpfail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    if std::fs::write(dir.join("probe"), b"x").is_ok() {
+        // 書き込み権限を無視できる実行者（root 等）ではこの失敗を作れない
+        std::fs::remove_file(dir.join("probe")).ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        eprintln!("note: cannot make directory read-only for this user; test not exercised");
+        return;
+    }
+    let o = run_with_fake_bin_args(
+        "tmpfail",
+        "echo '{\"code\":\"ok\"}'\nexit 0",
+        &["--help"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(o.code, Some(70));
+    assert_eq!(o.stdout, SAVE_FAILED_JSON);
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 書き込みに失敗（ファイルサイズ上限超過）しても 70 の固定文エラーになり、一時ファイルを残さない。
+/// `ulimit -f` で記録のサイズを超える上限をかけて実行する（証拠種別: テストハーネス）。
+#[test]
+fn req39_run_record_write_failure_is_70_without_leftover() {
+    let dir = record_dir("writefail-limit");
+    let bin_dir = record_dir("writefail-limit-bin");
+    let bin = bin_dir.join("fake-bin");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&bin, "#!/bin/sh\necho '{\"code\":\"ok\"}'\nexit 0\n").expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    // 引数 64 件で記録が 1024 バイトを超える（ulimit -f 1 は 512 または 1024 バイト）
+    let mut args: Vec<String> = vec!["--help".to_string()];
+    args.extend((0..63).map(|i| format!("tok{i}")));
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -f 1; exec sh \"$0\" \"$@\"")
+        .arg(script_path())
+        .args(&args)
+        .env("FANDHE_EDGE_BIN", &bin)
+        .env("FANDHE_EDGE_RECORD_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(70));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), SAVE_FAILED_JSON);
+    assert!(record_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bin_dir).ok();
+}
+
+/// 確定先の名前がディレクトリ・ディレクトリを指す symlink になっても、その中へ記録を作らない
+/// （ln はディレクトリの中へリンクを作るため、確定後の同一実体検証で弾き別の名前で再試行する）。
+/// PATH 上の `ln` シムが、ln の直前に確定先をディレクトリ・symlink へ差し替える。
+#[test]
+fn req39_run_record_destination_directory_is_never_linked_into() {
+    use std::os::unix::fs::PermissionsExt;
+    for (label, symlink) in [("dest-dir", false), ("dest-symlink", true)] {
+        let base = record_dir(label);
+        let dir = base.join("rec");
+        let shim = base.join("shim");
+        let target = base.join("target");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        std::fs::create_dir_all(&target).expect("mkdir");
+        let real_ln = Command::new("sh")
+            .args(["-c", "command -v ln"])
+            .output()
+            .expect("command -v ln");
+        let real_ln = String::from_utf8_lossy(&real_ln.stdout).trim().to_string();
+        let marker = base.join("swapped");
+        let make = if symlink {
+            format!("/bin/ln -s '{}' \"$last\"", target.display())
+        } else {
+            "mkdir \"$last\"".to_string()
+        };
+        let ln = shim.join("ln");
+        std::fs::write(
+            &ln,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nif [ ! -e '{m}' ]; then\n  {make}; : > '{m}'\nfi\nexec '{r}' \"$@\"\n",
+                m = marker.display(),
+                r = real_ln
+            ),
+        )
+        .expect("write shim");
+        std::fs::set_permissions(&ln, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let o = run_with_fake_bin_args(
+            label,
+            "echo '{\"code\":\"ok\"}'\nexit 0",
+            &["--help"],
+            &[
+                ("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap()),
+                ("PATH", &path),
+            ],
+        );
+        assert_eq!(o.code, Some(0), "{label}");
+        let n_target = std::fs::read_dir(&target).expect("read_dir").count();
+        assert_eq!(n_target, 0, "{label}: link created through symlink");
+        // 差し替えられたディレクトリ（または symlink）の中には何も作られず、別の名前の記録が 1 件できる
+        let mut regular = 0;
+        for e in std::fs::read_dir(&dir).expect("read_dir") {
+            let e = e.expect("entry");
+            let ft = e.file_type().expect("type");
+            if ft.is_dir() {
+                assert_eq!(
+                    std::fs::read_dir(e.path()).expect("read_dir").count(),
+                    0,
+                    "{label}"
+                );
+            } else if ft.is_file() {
+                regular += 1;
+            }
+        }
+        assert_eq!(regular, 1, "{label}");
         std::fs::remove_dir_all(&base).ok();
     }
 }
