@@ -73,9 +73,12 @@ MAX_META_BYTES = 1024 * 1024
 # レポートに保持する通信拒否レコードの上限（超過分は件数のみ。REQ-39）
 MAX_RECORDS = 1000
 MAX_PIDS = 4096
-# 重複報告の突き合わせ用に保持する未照合の元イベントの上限（メモリ上限。REQ-39）。
-# 超過時は照合できないものとして 1+N に数える（過小に数えない側へ倒す）
+# 重複報告の突き合わせ用に保持する未照合の元イベントの件数・キー数の上限（メモリ上限。REQ-39）。
+# どちらも超過したら判定不能（照合できないまま黙って過小・過大に数えない）。上限の判定は
+# `_check_pending_limits` の 1 か所。保持量は 1 キーあたりダイジェスト 32 バイト＋リストで、
+# 上限の 100000 でも数十 MB に収まる
 MAX_PENDING_EVENTS = 100_000
+MAX_PENDING_KEYS = 100_000
 DIGEST_HEX_LEN = 12
 OPERATION_RE = re.compile(r"^network[a-z0-9*-]{0,40}$")
 HEADER_PREFIX = "Filtering the log data"
@@ -188,6 +191,12 @@ def event_key(proc: str, pid: str, deny_n: str, op: str, target: str | None) -> 
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).digest()
 
 
+def _check_pending_limits(events: int, keys: int) -> None:
+    """未照合イベントの件数・キー数の上限を検査する（超過は判定不能。REQ-39）。"""
+    if events > MAX_PENDING_EVENTS or keys > MAX_PENDING_KEYS:
+        raise Undeterminable("log stream exceeds the pending event limit")
+
+
 def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset()) -> dict:
     """`eventMessage` を 1 件ずつ分類して件数とレコード（上限あり）を返す。
 
@@ -249,6 +258,9 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
             if waiting:
                 idx = waiting.pop()
                 pending_total -= 1
+                if not waiting:
+                    # 空になったキーは残さない（キー数が上限を素通りして増え続けるのを防ぐ）
+                    del pending[key]
                 claimed = True
                 if 0 <= idx < len(records):
                     records[idx]["occurrences"] += dup_n
@@ -271,9 +283,10 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
                 "recognized": True,
             }
         )
-        if dup is None and pending_total < MAX_PENDING_EVENTS:
+        if dup is None:
             pending.setdefault(key, []).append(-1 if idx is None else idx)
             pending_total += 1
+            _check_pending_limits(pending_total, len(pending))
     return {"counts": counts, "records": records, "truncated": truncated}
 
 

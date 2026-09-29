@@ -1073,3 +1073,41 @@ fn req38_report_script_parses_with_python39_grammar() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn write_flood(path: &Path, pairs: bool, n: usize) {
+    use std::io::Write;
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let mut f = std::io::BufWriter::new(fs::File::create(path).expect("create"));
+    writeln!(f, "{header}").expect("write");
+    for i in 0..n {
+        let ev = format!("Sandbox: zz(9) deny(1) network-outbound h{i}");
+        writeln!(f, "{{\"eventMessage\":\"{ev}\"}}").expect("write");
+        if pairs {
+            writeln!(f, "{{\"eventMessage\":\"2 duplicate reports for {ev}\"}}").expect("write");
+        }
+    }
+}
+
+/// 異なるイベントと重複報告の組が大量に続いても、照合済みのキーが残らないため上限（10 万キー）に
+/// 達せず完走し、発生回数は 1+2 回ずつで数えられる（REQ-39）。
+#[test]
+fn req39_matched_duplicate_pairs_do_not_accumulate_pending_keys() {
+    let e = Env::new();
+    let stream = e.dir.join("pairs.ndjson");
+    write_flood(&stream, true, 100_500);
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 301500");
+}
+
+/// 未照合の元イベントが上限（10 万キー）を超えたら判定不能(70)にする（REQ-39）。
+#[test]
+fn req39_pending_key_limit_is_undeterminable() {
+    let e = Env::new();
+    let stream = e.dir.join("unmatched.ndjson");
+    write_flood(&stream, false, 100_500);
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "log stream exceeds the pending event limit");
+}
