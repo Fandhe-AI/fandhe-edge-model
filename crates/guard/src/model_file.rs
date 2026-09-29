@@ -150,6 +150,7 @@ mod tests {
 
     /// REQ-39・TASK-39.2-2: ルート配下の ONNX は通り、pickle 偽装は拒否される。
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn req39_open_confined_onnx_and_disguise() {
         let root = tmp("ok");
         std::fs::write(root.join("m.onnx"), ONNX).unwrap();
@@ -182,11 +183,32 @@ mod tests {
 
     /// REQ-39: 上限超過は `LimitExceeded`。
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn req39_size_limit() {
         let root = tmp("big");
         std::fs::write(root.join("m.onnx"), ONNX).unwrap();
         let err = open_onnx_model_file(&root, Path::new("m.onnx"), 4).unwrap_err();
         assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// REQ-39・TASK-39.4-1: 経路検証コアが対応しない OS（Windows 等）では fail-closed で拒否される
+    /// （`UnsupportedPlatform`・終了コード 70）。拡張子が適格でも内容検査へ進まない。
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn req39_unsupported_platform_fails_closed() {
+        let root = tmp("unsupported");
+        std::fs::write(root.join("m.onnx"), ONNX).unwrap();
+        let err = open_onnx_model_file(&root, Path::new("m.onnx"), 1024).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModelFileRejection::Path(PathRejection::UnsupportedPlatform)
+            ),
+            "{err}"
+        );
+        assert_eq!(err.reason_code(), "unsupported_platform");
+        assert_eq!(err.exit_code(), ExitCode::RuntimeError);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

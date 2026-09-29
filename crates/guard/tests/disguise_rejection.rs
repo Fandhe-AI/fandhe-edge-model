@@ -5,6 +5,13 @@
 //! テスト内で生成する。Rust のガード層は pickle を逆シリアル化しないため、マーカー不在の確認は
 //! 将来の回帰（外部プロセスでの解析導入等）を検出する番兵である。
 
+// 経路検証コア（`open_confined`）は Linux・macOS のみ対応し、他 OS では常に `UnsupportedPlatform` を返す
+// （REQ-39・TASK-39.4-1）。内容検査へ到達するテストは対応 OS に限定し、共有ヘルパーの未使用警告は許容する。
+#![cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(dead_code, unused_imports)
+)]
+
 use fandhe_edge_guard::format::{FileFormat, FormatRejection};
 use fandhe_edge_guard::model_file::{ModelFileRejection, open_onnx_model_file};
 use std::fs;
@@ -72,6 +79,7 @@ fn file_count(dir: &Path) -> usize {
 
 /// PoC-20 case_a: `.onnx` として置いた pickle（プロトコル 2/4/5・テキスト）を拒否し、マーカーは 0 件。
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn req39_pickle_disguised_as_onnx_is_rejected() {
     let dir = temp_dir("a");
     let marker = dir.join("MARKER");
@@ -117,6 +125,7 @@ fn req39_pickle_as_pt_or_npy_is_rejected_by_extension() {
 
 /// 実形式（zip・npy・gguf）の偽装と PoC-20 case_d（非 ONNX）・空ファイルの拒否。
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn req39_non_onnx_content_is_rejected() {
     let dir = temp_dir("d");
     let marker = dir.join("MARKER");
@@ -144,6 +153,7 @@ fn req39_non_onnx_content_is_rejected() {
 
 /// 陽性対照と、拡張子検査・内容検査が独立に効くこと。
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn req39_valid_onnx_passes_and_checks_are_independent() {
     let dir = temp_dir("ok");
     write(&dir, "model.onnx", &MIN_ONNX);
@@ -157,5 +167,25 @@ fn req39_valid_onnx_passes_and_checks_are_independent() {
             FormatRejection::ExtensionNotAllowed { .. }
         ))
     ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 経路検証未対応 OS（Windows 等）では、拡張子が適格でも内容検査へ進まず fail-closed で拒否する
+/// （`UnsupportedPlatform`・終了コード 70。REQ-39・TASK-39.4-1）。
+#[test]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn req39_unsupported_platform_fails_closed_for_pickle_disguise() {
+    use fandhe_edge_guard::path::PathRejection;
+    let dir = temp_dir("unsupported");
+    let marker = dir.join("MARKER");
+    write(&dir, "model.onnx", &marker_pickle(2, &marker));
+    let err = open_onnx_model_file(&dir, Path::new("model.onnx"), 1 << 20).unwrap_err();
+    assert!(matches!(
+        err,
+        ModelFileRejection::Path(PathRejection::UnsupportedPlatform)
+    ));
+    assert_eq!(err.exit_code().code(), 70);
+    assert_eq!(err.reason_code(), "unsupported_platform");
+    assert!(!marker.exists());
     fs::remove_dir_all(&dir).unwrap();
 }
