@@ -819,8 +819,12 @@ struct OutDirAnchor {
 impl OutDirAnchor {
     fn paths(request: &TrainRequest) -> (PathBuf, PathBuf) {
         let root = PathBuf::from(request.root());
-        let out = root.join(request.out_dir());
-        let parent = out.parent().map_or_else(|| root.clone(), Path::to_path_buf);
+        let mut parent = root.clone();
+        let components = out_dir_components(request);
+        // 最後の構成要素（予約されるディレクトリ自身）を除いたものが親。
+        for part in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(part);
+        }
         (root, parent)
     }
 
@@ -841,6 +845,22 @@ impl OutDirAnchor {
     }
 }
 
+/// 検証（`request.rs`）と同じ規則で正規化した `out_dir` の構成要素。
+#[cfg(unix)]
+fn out_dir_components(request: &TrainRequest) -> Vec<&str> {
+    crate::request::relative_path_components(request.out_dir())
+}
+
+/// 正規化した `out_dir` の絶対パス（`root` 配下）。
+#[cfg(unix)]
+fn out_dir_path(request: &TrainRequest) -> PathBuf {
+    let mut path = PathBuf::from(request.root());
+    for part in out_dir_components(request) {
+        path.push(part);
+    }
+    path
+}
+
 /// `SIGKILL` フォールバック後の `out_dir` を読み取り専用で観測する
 /// （[`OutDirResidue`]）。`symlink_metadata` でディレクトリかを確かめ、`read_dir`
 /// は最初の 1 件だけ読む（件数上限 1。REQ-39）。symlink は辿らず `Unknown`。
@@ -853,7 +873,7 @@ fn inspect_out_dir_residue(request: &TrainRequest, anchor: &OutDirAnchor) -> Out
     if !anchor.still_matches(request) {
         return OutDirResidue::Unknown;
     }
-    let path = Path::new(request.root()).join(request.out_dir());
+    let path = out_dir_path(request);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OutDirResidue::Absent,
@@ -2842,6 +2862,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&moved);
     }
 
+    /// REQ-34・#145 回帰: 末尾スラッシュ・`.` を含む `out_dir` でも、検証と同じ
+    /// 規則で正規化した親を求めるため、実体の記録が成立し（`Unknown` に固定されず）
+    /// `Absent`／`EmptyReservation` を観測でき、協調キャンセルは `Cooperative`
+    /// になる。
+    #[cfg(unix)]
+    #[test]
+    fn req34_out_dir_spellings_are_normalized_for_anchor() {
+        for (out_dir, parent) in [
+            ("out", ""),
+            ("out/", ""),
+            ("./out", ""),
+            ("a/./b", "a"),
+            ("a//b/", "a"),
+        ] {
+            let root = unique_root();
+            std::fs::create_dir_all(root.join(parent)).expect("create parent");
+            let request = TrainRequest::new(TrainRequestParams {
+                kind: "c3".to_string(),
+                kind_version: 1,
+                config: serde_json::Map::new(),
+                label_order: vec!["a".to_string(), "b".to_string()],
+                max_bytes: 512,
+                seed: 0,
+                device: Device::Cpu,
+                root: root.to_string_lossy().to_string(),
+                train_path: "train.jsonl".to_string(),
+                out_dir: out_dir.to_string(),
+                time_limit_seconds: Some(30),
+                rss_limit_bytes: None,
+            })
+            .expect("valid request");
+            let anchor = OutDirAnchor::capture(&request);
+            assert_eq!(
+                inspect_out_dir_residue(&request, &anchor),
+                OutDirResidue::Absent,
+                "{out_dir}"
+            );
+            std::fs::create_dir(out_dir_path(&request)).expect("reserve");
+            assert_eq!(
+                inspect_out_dir_residue(&request, &anchor),
+                OutDirResidue::EmptyReservation,
+                "{out_dir}"
+            );
+            let json = format!(
+                r#"{{"status":"error","code":"runtime_error","message":"{CANCEL_ACK_MESSAGE}"}}"#
+            );
+            std::fs::remove_dir(out_dir_path(&request)).expect("release");
+            let outcome =
+                classify_exit(ExitCode::RuntimeError, json.as_bytes(), &request).expect("classify");
+            let ack = TrainRun {
+                outcome,
+                exit_code: ExitCode::RuntimeError,
+                elapsed: Duration::ZERO,
+                worker_stderr: Vec::new(),
+                stderr_truncated: false,
+            };
+            assert!(
+                matches!(
+                    conclude_run(Ok(ack), true, Instant::now(), &request, &anchor),
+                    Ok(TrainRunEnd::Cancelled(run)) if run.stop() == CancelStop::Cooperative
+                ),
+                "{out_dir}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
     /// REQ-34・#145: supervisor が予約の解放を確認できなかった旨（固定メッセージ）を
     /// 報告した場合は、通常の失敗（`Completed`）にせず `Unconfirmed` 経路に入る。
     #[cfg(unix)]
@@ -2925,7 +3012,22 @@ mod tests {
         )
     }
 
-    /// 実在する一意な root（残置観測が実体を記録できるようにする）。
+    /// テスト用リクエストの root 文字列。unix では実在する一意なディレクトリ
+    /// （残置観測が実体を記録できるようにする）。root は `/` 始まりの構文検査が
+    /// あるため、windows ではこれを使えず固定の架空 root にする（残置観測は
+    /// unix 限定）。
+    fn test_root() -> String {
+        #[cfg(unix)]
+        {
+            unique_root().to_string_lossy().to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            "/fandhe-edge-fixture-root".to_string()
+        }
+    }
+
+    #[cfg(unix)]
     fn unique_root() -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
@@ -2947,7 +3049,7 @@ mod tests {
             max_bytes: 512,
             seed: 0,
             device: Device::Cpu,
-            root: unique_root().to_string_lossy().to_string(),
+            root: test_root(),
             train_path: "train.jsonl".to_string(),
             out_dir: "out".to_string(),
             time_limit_seconds,

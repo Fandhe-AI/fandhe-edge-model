@@ -468,7 +468,7 @@ def _classify_self_exit(
     return None
 
 
-def _terminate_and_reap(proc: subprocess.Popen) -> None:
+def _terminate_and_reap(proc: subprocess.Popen) -> bool:
     """`_terminate_worker`（`killpg`）を呼んでから `Popen.wait()` で回収
     する、**`proc` を回収する唯一の経路**（issue #178 PR #233 レビュー
     再々指摘 P0「`_current_child_status()` が `None` を返す場合に
@@ -491,6 +491,19 @@ def _terminate_and_reap(proc: subprocess.Popen) -> None:
     reap_deadline = time.monotonic() + _REAP_WAIT_SECONDS
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=_remaining(reap_deadline))
+    # 回収できたか（`returncode` が確定したか）を戻り値で伝える。回収できない
+    # worker は生きている可能性があるため、呼び出し側は成功側（キャンセル完了・
+    # 通常の資源超過報告・予約の解放）へ倒してはならない（REQ-39。`"reap_failed"`）。
+    return proc.returncode is not None
+
+
+def _stop_and_report(proc: subprocess.Popen, reason: str) -> str:
+    """worker を止めて回収し、`reason` を返す。回収できなければ `"reap_failed"`。
+
+    `monitor_child` の停止経路はすべてここを通す（`wait`・`kill` の失敗を
+    成功側へ握りつぶさない規則の 1 か所。REQ-34・REQ-39）。
+    """
+    return reason if _terminate_and_reap(proc) else "reap_failed"
 
 
 def monitor_child(
@@ -559,8 +572,7 @@ def monitor_child(
         # 先に済ませる（規則は `_stop_reason` の 1 か所）。
         reason = _stop_reason(deadline, cancel_event)
         if reason is not None:
-            _terminate_and_reap(proc)
-            return reason
+            return _stop_and_report(proc, reason)
         # `ps` の待ちは締め切りの残りとキャンセル要求で打ち切る。
         status = _current_child_status(
             proc.pid,
@@ -568,12 +580,13 @@ def monitor_child(
             cancel_event=cancel_event,
         )
         if status is None:
-            _terminate_and_reap(proc)
+            reaped = _terminate_and_reap(proc)
             # 状態が不明になった理由が締め切り切れ・キャンセルなら、監視失敗
             # ではなくそちらで報告する。`monitor_failed` は本当に `ps` が使えない
             # 場合だけ（stdout の drain 待ちを含み Rust 側の猶予を超えうるため、
             # キャンセルは高速な経路で予約を解放させる。REQ-34・#145）。
-            return _stop_reason(deadline, cancel_event) or "monitor_failed"
+            reason = _stop_reason(deadline, cancel_event) or "monitor_failed"
+            return reason if reaped else "reap_failed"
         rss, is_zombie = status
         if is_zombie:
             # issue #178 PR #233 レビュー再々々指摘 P1: ゾンビ（終了済み）を
@@ -582,18 +595,17 @@ def monitor_child(
             # ゾンビだと気づく場合がある。この場合は成果物を確定させず壁時計
             # 超過（`"time"`）として fail-closed に扱う（REQ-39）。締め切り内なら
             # `_classify_self_exit` で通常終了か `RLIMIT_CPU` 自己終了かを判定する。
-            _terminate_and_reap(proc)
+            if not _terminate_and_reap(proc):
+                return "reap_failed"
             reason = _stop_reason(deadline, cancel_event)
             if reason is not None:
                 return reason
             return _classify_self_exit(proc, cpu_baseline, time_limit_seconds)
         reason = _stop_reason(deadline, cancel_event)
         if reason is not None:
-            _terminate_and_reap(proc)
-            return reason
+            return _stop_and_report(proc, reason)
         if rss > rss_limit_bytes:
-            _terminate_and_reap(proc)
-            return "rss"
+            return _stop_and_report(proc, "rss")
         # 次の確認まで眠る。キャンセルが来たら即座に起きる。
         _wait_cancel(cancel_event, _bounded_timeout(poll_interval, deadline))
 
@@ -964,6 +976,19 @@ def _monitor_worker_and_finalize(
         rss_limit_bytes=rss_limit_bytes,
         cancel_event=cancel_event,
     )
+
+    if killed_reason == "reap_failed":
+        # worker を回収できず、生きて書き込み続けている可能性がある。予約を解放
+        # せず（公開場所を触らない）、協調キャンセル完了の応答も出さない。キャンセル
+        # 要求中は「解放を確認できない」応答にして Rust 側を Unconfirmed へ倒す
+        # （REQ-34・REQ-39）。
+        message = (
+            _CANCEL_CLEANUP_INCOMPLETE_MESSAGE
+            if _is_cancelled(cancel_event)
+            else "worker could not be reaped"
+        )
+        _emit({"status": "error", "code": "runtime_error", "message": message})
+        return ExitCode.RUNTIME_ERROR
 
     if killed_reason == "cancelled":
         # 協調キャンセル: worker は `monitor_child` が `killpg` → 回収済み。

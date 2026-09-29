@@ -1517,3 +1517,60 @@ def test_req34_forward_worker_error_keeps_other_messages() -> None:
     for m in ("training cancelled by caller", "training cancelled but cleanup incomplete"):
         q = {"status": "error", "code": "runtime_error", "message": m}
         assert supervisor._forward_worker_error(q)["message"] == "worker reported an error"
+
+
+def test_req39_unreaped_worker_is_reap_failed_not_cancelled() -> None:
+    """REQ-39・REQ-34 回帰（P0）: `wait` がタイムアウトして回収を確認できない
+    worker は `"cancelled"` にせず `"reap_failed"` を返す。"""
+    real_popen = subprocess.Popen
+
+    class _StuckPopen(real_popen):  # type: ignore[misc, valid-type]
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            raise subprocess.TimeoutExpired("worker", timeout or 0)
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+    proc = _StuckPopen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    event = threading.Event()
+    event.set()
+    try:
+        reason = supervisor.monitor_child(
+            proc, time_limit_seconds=60.0, rss_limit_bytes=1 << 40, cancel_event=event
+        )
+        assert reason == "reap_failed"
+    finally:
+        proc.kill()
+        real_popen.wait(proc, timeout=5)
+
+
+def test_req39_reap_failure_keeps_reservation_and_reports_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-34・REQ-39 回帰（P0）: 回収できなかった場合、予約を解放せず、協調
+    キャンセル完了の応答（`training cancelled by caller`）も出さない。キャンセル
+    要求中は「解放を確認できない」応答にして Rust 側を Unconfirmed へ倒す。"""
+    request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "hang")
+    real_reap = supervisor._terminate_and_reap
+
+    def _reap_but_report_failure(proc: subprocess.Popen) -> bool:
+        real_reap(proc)  # テストで worker を残さないため実際には止める
+        return False
+
+    monkeypatch.setattr(supervisor, "_terminate_and_reap", _reap_but_report_failure)
+    event = supervisor.CancelSignal()
+    threading.Timer(1.0, event.set).start()
+    code = supervisor.run_supervised_train(request_path, cancel_event=event)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert code == ExitCode.RUNTIME_ERROR
+    assert payload == {
+        "status": "error",
+        "code": "runtime_error",
+        "message": "training cancelled but cleanup incomplete",
+    }
+    assert out_dir.exists()  # 予約は解放されない
