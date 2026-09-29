@@ -113,6 +113,14 @@ pub enum RegressionError {
         /// 上限（[`MAX_EVAL_RECORDS`]）。
         limit: usize,
     },
+    /// 行 ID 1 件のバイト長が上限（[`MAX_RECORD_ID_BYTES`]）を超える
+    /// （[`regression_report`]。REQ-39 資源の上限。重複判定のハッシュ計算より前に拒否する）。
+    RecordIdTooLong {
+        /// `records` 内での位置（0 始まり）。
+        index: usize,
+        /// 上限（[`MAX_RECORD_ID_BYTES`]）。
+        limit: usize,
+    },
     /// `previous`・`current` の正誤列の長さが一致しない。
     LengthMismatch {
         /// 旧モデル側の長さ。
@@ -191,6 +199,9 @@ impl fmt::Display for RegressionError {
             }
             RegressionError::EmptyRecordId { index } => {
                 write!(f, "empty record id at record index {index}")
+            }
+            RegressionError::RecordIdTooLong { index, limit } => {
+                write!(f, "record id at record index {index} exceeds {limit} bytes")
             }
             RegressionError::DuplicateRecordId { index } => {
                 write!(f, "duplicate record id at record index {index}")
@@ -512,6 +523,11 @@ pub fn compare_label_sets(
     }
 }
 
+/// 行 ID 1 件あたりの最大 UTF-8 バイト数（`fandhe_edge_core` の
+/// `MAX_INPUT_ID_BYTES` と同値。REQ-39 資源の上限）。
+/// [`regression_report`] が重複判定のハッシュ計算より前に検証する。
+pub const MAX_RECORD_ID_BYTES: usize = 1024;
+
 /// [`regression_report`] の入力 1 行（旧・新の正誤を record ID で 1 行に対応
 /// させる。REQ-26・TASK-26.2）。
 ///
@@ -541,6 +557,8 @@ pub struct ReportRecord<'a> {
 /// - [`compare_label_sets`] のエラー（ラベルのエラーが先）
 /// - 行が空 → [`RegressionError::EmptyRecords`]、上限超過 →
 ///   [`RegressionError::TooManyRecords`]（確保の前。REQ-39）
+/// - 行 ID が [`MAX_RECORD_ID_BYTES`] 超 → [`RegressionError::RecordIdTooLong`]
+///   （重複判定のハッシュ計算より前に全行を走査して拒否する。REQ-39）
 /// - 空の行 ID → [`RegressionError::EmptyRecordId`]、重複 →
 ///   [`RegressionError::DuplicateRecordId`]
 /// - [`regression_counts`] のエラー
@@ -559,6 +577,16 @@ pub fn regression_report(
             n_records: records.len(),
             limit: MAX_EVAL_RECORDS,
         });
+    }
+
+    // 重複判定（ハッシュ計算）の前に、全行の ID 長を検証する（REQ-39）。
+    for (i, record) in records.iter().enumerate() {
+        if record.id.len() > MAX_RECORD_ID_BYTES {
+            return Err(RegressionError::RecordIdTooLong {
+                index: i,
+                limit: MAX_RECORD_ID_BYTES,
+            });
+        }
     }
 
     let mut seen: std::collections::HashSet<&str> =
@@ -1044,6 +1072,41 @@ mod tests {
             regression_report(&[], &["A"], &dup),
             Err(RegressionError::PreviousLabels(_))
         ));
+    }
+
+    /// REQ-39・TASK-26.2: 上限超過の行 ID は、後方に空 ID・重複があっても先に拒否される。
+    #[test]
+    fn report_rejects_oversized_record_id_before_hashing() {
+        let long = "x".repeat(MAX_RECORD_ID_BYTES + 1);
+        let ok = "y".repeat(MAX_RECORD_ID_BYTES);
+        let rows = [
+            ReportRecord {
+                id: &ok,
+                previous_correct: true,
+                current_correct: true,
+            },
+            ReportRecord {
+                id: "",
+                previous_correct: true,
+                current_correct: true,
+            },
+            ReportRecord {
+                id: &long,
+                previous_correct: true,
+                current_correct: true,
+            },
+        ];
+        assert_eq!(
+            regression_report(&["A"], &["A"], &rows).unwrap_err(),
+            RegressionError::RecordIdTooLong {
+                index: 2,
+                limit: MAX_RECORD_ID_BYTES
+            }
+        );
+        assert_eq!(
+            regression_report(&["A"], &["A"], &rows[..2]).unwrap_err(),
+            RegressionError::EmptyRecordId { index: 1 }
+        );
     }
 
     /// REQ-26・TASK-26.2: Display は英語の固定文で、データ本文を含まない。
