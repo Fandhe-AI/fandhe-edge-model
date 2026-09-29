@@ -50,7 +50,15 @@
 //! （[`result::SuccessOutcome::validation_predictions`]）として返す。
 //! [`search`] はその予測列を validation gold と突き合わせる。
 //!
+//! [`kind_resolution`] は利用者が `kind` を省略したとき、既定候補（C1・C3。
+//! オーナー承認前の暫定値）を探索候補の集合へ解決する（REQ-19・TASK-19.2・
+//! issue #77）。学習ワーカーには常に解決済みの `kind` を渡す。
+//!
 //! # スコープ外（#178 以降も対象外）
+//!
+//! - 解決記録（[`kind_resolution::KindResolutionRecord`]）の CLI 出力への反映
+//!   （TASK-33.1-2・#136 / TASK-33.2-2・#139）と、定義ファイルへの任意項目
+//!   `kind` の追加（スキーマ・正準化ハッシュの変更。ユーザー承認事項）
 //!
 //! - `kind` ごとの `config` 検証（`config` は「JSON オブジェクトであること」
 //!   だけを検査する。`kinds/c1.py`・`c3.py` の `_validate_config` は再実装
@@ -82,6 +90,8 @@
 
 pub mod error;
 mod kind_defaults;
+// kind 省略時の既定候補の解決（REQ-19・TASK-19.2・#77）。
+pub mod kind_resolution;
 pub mod limits;
 pub mod process;
 pub mod request;
