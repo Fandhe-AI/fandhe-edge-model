@@ -612,6 +612,31 @@ fn run_report(dir: &Path, stream: &Path, meta: Option<&str>, start: &str, stop: 
     run_report_with_actual(dir, stream, meta, start, stop, &actual)
 }
 
+fn run_report_extra(dir: &Path, stream: &Path, meta: Option<&str>, extra: &[&str]) -> Out {
+    let meta_path = dir.join("run.meta.json");
+    let _ = fs::remove_file(&meta_path);
+    if let Some(m) = meta {
+        fs::write(&meta_path, m).expect("meta");
+    }
+    let mut cmd = Command::new("python3");
+    cmd.process_group(0)
+        .args(["-I"])
+        .arg(repo_root().join("scripts").join("sandbox_deny_report.py"))
+        .arg("--stream")
+        .arg(stream)
+        .arg("--run-meta")
+        .arg(&meta_path)
+        .args(["--monitor-started-utc", T0, "--monitor-stopped-utc", T3])
+        .args(["--run-exit-code", "0"])
+        .args(extra)
+        .arg("--report-out")
+        .arg(dir.join("report.json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    spawn_and_collect(cmd)
+}
+
 fn run_report_with_actual(
     dir: &Path,
     stream: &Path,
@@ -818,32 +843,86 @@ fn req38_report_run_exit_code_mismatch_is_undeterminable() {
     assert_eq!(ok.code, Some(0), "{}", ok.stdout);
 }
 
-/// 本ツール起因の判定はマスキング前の生のプロセス名と PID で行い、出力は `attribution` と
-/// 固定語彙だけ。許可リスト内の名前・PID 一致なら judged_fail(10)、生の名前は出力しない語彙
-/// （`other`）へ丸めた後でも判定は変わらない。
+/// 帰属の第一の根拠は PID（`process_pids`）で、プロセス名は根拠にしない。`python3.11`・
+/// `python3.13` など版が違っても、PID が採取済みなら本ツール起因になる。`process` ラベルは
+/// `python3` と任意の `.N` だけを名前のまま出し、`python3-evil` や未知の名前は `other` にする。
 #[test]
-fn req38_attribution_uses_raw_name_before_masking() {
+fn req38_attribution_is_pid_first_and_label_is_normalized() {
     let e = Env::new();
     let stream = e.dir.join("attr.ndjson");
     let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
     let header = header.lines().next().expect("header").to_string();
-    let body = "{\"eventMessage\":\"Sandbox: fandhe-edge(4242) deny(1) network-outbound 10.0.0.9:1\"}\n\
-                {\"eventMessage\":\"Sandbox: PrivateAppName(4243) deny(1) network-outbound 10.0.0.9:1\"}\n";
+    let mut body = String::new();
+    for (name, pid) in [
+        ("python3.11", 4201),
+        ("python3.13", 4202),
+        ("python3-evil", 4203),
+        ("PrivateAppName", 4204),
+        ("python3.13", 9999),
+    ] {
+        body.push_str(&format!(
+            "{{\"eventMessage\":\"Sandbox: {name}({pid}) deny(1) network-outbound 10.0.0.9:1\"}}\n"
+        ));
+    }
     fs::write(&stream, format!("{header}\n{body}")).expect("write");
     let o = run_report(
         &e.dir,
         &stream,
-        Some(&meta_with_pids(0, T1, T2, "[4242, 4243]")),
+        Some(&meta_with_pids(0, T1, T2, "[4201, 4202, 4203, 4204]")),
         T0,
         T3,
     );
-    // 許可リスト外の名前は PID が一致しても本ツール起因とみなさない
     assert_eq!(o.code, Some(10), "{}", o.stdout);
-    has(&o, "\"tool_network_deny_events\": 1");
+    has(&o, "\"tool_network_deny_events\": 4");
+    // PID が採取されていなければ名前が python3.13 でも帰属不明
     has(&o, "\"unattributed_network_deny_events\": 1");
     let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
-    assert!(report.contains("\"attribution\": \"tool\""), "{report}");
-    assert!(!report.contains("PrivateAppName"));
+    assert!(report.contains("\"process\": \"python3.11\""), "{report}");
+    assert!(report.contains("\"process\": \"python3.13\""), "{report}");
+    assert_eq!(
+        report.matches("\"process\": \"other\"").count(),
+        2,
+        "{report}"
+    );
+    assert!(!report.contains("PrivateAppName") && !report.contains("python3-evil"));
+}
+
+/// 最終終了コードの優先順を全組み合わせで固定する（`decide()` の表）。run の終了コード
+/// {0, 10, 20, 64, 70} × 拒否 {なし, 本ツール起因, 帰属不明}。run が 70 なら拒否があっても 70、
+/// 拒否件数はレポートに残る。それ以外は 本ツール起因 10 > 帰属不明 12 > run の終了コード。
+/// 監視の異常（stream 停止）は run が 0 でも 70。
+#[test]
+fn req38_final_exit_code_priority_table() {
+    let e = Env::new();
+    let none = fixture("clean.ndjson");
+    let tool = fixture("tool_python.ndjson");
+    let unattr = fixture("unattributed.ndjson");
+    for run in [0, 10, 20, 64, 70] {
+        for (label, stream, pids, tool_n, unattr_n, base) in [
+            ("none", &none, "[1]", 0, 0, run),
+            ("tool", &tool, "[5001]", 1, 0, 10),
+            ("unattributed", &unattr, "[1]", 0, 1, 12),
+        ] {
+            let o = run_report(
+                &e.dir,
+                stream,
+                Some(&meta_with_pids(run, T1, T2, pids)),
+                T0,
+                T3,
+            );
+            let expected = if run == 70 { 70 } else { base };
+            assert_eq!(o.code, Some(expected), "run={run} {label}: {}", o.stdout);
+            has(&o, &format!("\"tool_network_deny_events\": {tool_n}"));
+            has(
+                &o,
+                &format!("\"unattributed_network_deny_events\": {unattr_n}"),
+            );
+        }
+    }
+    // 監視の異常は run の終了コードにかかわらず 70
+    let o = run_report_extra(&e.dir, &none, Some(&meta(0, T1, T2)), &["--stream-died"]);
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "\"network_verdict\": \"undeterminable\"");
 }
 
 /// `log` の stderr は保存しない（内容を使わず、容量の問題を生じさせない）。大量に書かれても

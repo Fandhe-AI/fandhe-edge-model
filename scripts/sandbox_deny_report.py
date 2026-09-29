@@ -20,13 +20,16 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
 出力: stdout に JSON 1 行（REQ-33。固定の文字列と件数だけ。利用者の値は出さない）、
 `--report-out` に詳細レポート。終了コードは 7 種（0・10・11・12・20・64・70。REQ-21）。
 
-帰属（本ツール起因か）の根拠: 拒否行 `Sandbox: <プロセス名>(<pid>) deny(...)` の**マスキング前の
-生のプロセス名**が許可リスト（TOOL_PROCESSES）にあり、かつその PID が `run.meta.json` の
-`process_pids`（`sandbox-run.sh` が工程のプロセスグループから 0.1 秒間隔で採取した PID）に
-含まれる場合だけ tool とする。名前だけでは断定しない（無関係な python3・sh の拒否で誤って
-judged_fail にしないため）。PID が採取できなかった短命プロセスの拒否は帰属不明（unattributed）で
-pending(12)（過大に本ツール起因と断定しない側）。判定はマスキングの前に行い、出力へ出すのは
-判定結果（`attribution`）と固定語彙だけで、生のプロセス名は出さない。
+帰属（本ツール起因か）の根拠: 第一の根拠は PID。拒否行 `Sandbox: <プロセス名>(<pid>) deny(...)` の
+PID が `run.meta.json` の `process_pids`（`sandbox-run.sh` が工程のプロセスグループから
+0.1 秒間隔で採取した PID。sandbox の内側で本ツールが起動したプロセスの集合）に含まれれば tool。
+プロセス名は根拠にしない（Python の版・実行ファイル名は環境で変わり、固定の許可リストでは
+取りこぼす）。名前は出力する固定語彙（`process` ラベル）への正規化にだけ使い、
+`TOOL_NAME_RE`（`python3` と任意の `.N`・sh 等）に合えばその名前、他は `other` とする。
+PID が採取できなかった短命プロセスの拒否は帰属不明（unattributed）で pending(12)
+（過大に本ツール起因と断定しない側）。既知の限界: 採取後に PID が再利用され同じ窓内で無関係な
+プロセスが同じ PID を得た場合は tool と誤帰属しうる（窓は 1 回の実行に限る）。
+出力へ出すのは判定結果（`attribution`）と固定語彙だけで、生のプロセス名は出さない。
 実ログの形式: 上の形式は PoC-16 で観測した macOS の `log stream` の出力に基づく。本リポの
 fixture は合成データで、実機の出力そのものではない（証拠種別: テストハーネス）。
 
@@ -43,7 +46,7 @@ fixture は合成データで、実機の出力そのものではない（証拠
 資源: ログは 1 行ずつ読み（一括読み込みしない）、保持するレコードは MAX_RECORDS 件まで
 （超過分は件数だけ数え、レポートの `network_denials_truncated` を true にする。REQ-39）。
 
-判定（優先順 70 > 10 > 12 > run の終了コード > 0）:
+判定（優先順は `decide()` が唯一の定義。判定不能 70 > run の 70 > 10 > 12 > run のその他 > 0）:
   - 監視が無効・読めない行・時刻の不整合 -> undeterminable(70)（fail-closed）
   - 本ツール起因（PID 照合済み）の通信拒否あり -> judged_fail(10)
   - 帰属不明の通信拒否あり -> pending(12。人が確認する)
@@ -86,20 +89,9 @@ CODE_NAMES = {
     64: "invalid_input",
     70: "runtime_error",
 }
-# sandbox の内側で動きうるプロセス名（本ツール起因とみなす固定の許可リスト）。
-# sandbox の外で起動される head 等は含めない
-TOOL_PROCESSES = frozenset(
-    {
-        "sandbox-exec",
-        "fandhe-edge",
-        "python",
-        "python3",
-        "python3.12",
-        "Python",
-        "sh",
-        "bash",
-    }
-)
+# 出力する `process` ラベルの固定語彙への正規化（帰属の根拠ではない）。`python3` と任意の `.N`
+# （`python3.11`・`python3.13` 等）を受け付け、`python3-evil` のような別名は `other` にする
+TOOL_NAME_RE = re.compile(r"^(?:sandbox-exec|fandhe-edge|python(?:3(?:\.\d+)?)?|Python|sh|bash)$")
 # `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> [対象]`。プロセス名は括弧を含みうるため
 # `(<数字>) deny(` を右側から照合する（貪欲な `.+` の後ろ向き探索。行長は事前に制限済み）
 EVENT_RE = re.compile(
@@ -199,8 +191,7 @@ def event_key(proc: str, pid: str, deny_n: str, op: str, target: str | None) -> 
 def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset()) -> dict:
     """`eventMessage` を 1 件ずつ分類して件数とレコード（上限あり）を返す。
 
-    `tool_pids` に含まれる PID かつ許可リストのプロセス名だけを tool とし、それ以外は
-    帰属不明にする（名前だけでは断定しない）。
+    `tool_pids` に含まれる PID だけを tool とし、それ以外は帰属不明にする（名前は根拠にしない）。
 
     発生回数: 元の行は 1 回。`N duplicate reports for` の要約行は、同じ `event_key` の元の行が
     先に数えられていれば N 回だけ加算し（元の 1 回を二重に数えない）、元の行が無ければ
@@ -263,7 +254,7 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
                     records[idx]["occurrences"] += dup_n
         occurrences = dup_n if claimed else 1 + dup_n
         counts["network_deny_events"] += occurrences
-        tool = proc in TOOL_PROCESSES and int(pid) in tool_pids
+        tool = int(pid) in tool_pids
         counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += (
             occurrences
         )
@@ -271,7 +262,7 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
             continue
         idx = keep(
             {
-                "process": proc if proc in TOOL_PROCESSES else "other",
+                "process": proc if TOOL_NAME_RE.match(proc) else "other",
                 "pid": int(pid),
                 "operation": op if OPERATION_RE.match(op) else "network-other",
                 "target_digest": target_digest(salt, target or ""),
@@ -339,6 +330,35 @@ def iter_stream(path: str, stats: dict) -> Iterator[str]:
         raise Undeterminable("log stream output is empty")
 
 
+def decide(run_exit: int, tool_n: int, unattributed_n: int) -> tuple[str, int, str]:
+    """最終の (network_verdict, 終了コード, message) を決める（優先順の唯一の定義）。
+
+    判定不能（監視の異常・読めない行・時刻の不整合）は呼び出し元が 70 で先に打ち切る。ここでは
+    優先順 run が 70 > 本ツール起因の拒否 10 > 帰属不明の拒否 12 > run のその他の終了コード。
+    run が 70（実行失敗）なら拒否の有無にかかわらず 70 を返す（完走していない実行を、拒否件数の
+    判定で 10・12 に上書きしない）。拒否件数と network_verdict は 70 でも常にレポートへ残す。
+    """
+    if tool_n > 0:
+        verdict = "tool_network_denials_found"
+        text = "network denials attributed to the tool were found"
+        rc = 10
+    elif unattributed_n > 0:
+        verdict = "unattributed_network_denials"
+        text = "network denials from unattributed processes need human review"
+        rc = 12
+    else:
+        verdict = "zero_network_denials"
+        text = (
+            "no network denials were observed"
+            if run_exit == 0
+            else "no network denials were observed but the run did not complete"
+        )
+        rc = run_exit
+    if run_exit == 70:
+        return verdict, 70, "the sandboxed run failed with runtime_error; " + text
+    return verdict, rc, text
+
+
 def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
     """判定して (終了コード, stdout 用, レポート用) を返す。"""
     counts_zero = {
@@ -384,19 +404,9 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
             and meta["ended_utc"] <= args.monitor_stopped_utc
         ):
             raise Undeterminable("run is not covered by the monitoring window")
-        if counts["tool_network_deny_events"] > 0:
-            verdict, rc = "tool_network_denials_found", 10
-            msg_text = "network denials attributed to the tool were found"
-        elif counts["unattributed_network_deny_events"] > 0:
-            verdict, rc = "unattributed_network_denials", 12
-            msg_text = "network denials from unattributed processes need human review"
-        else:
-            verdict, rc = "zero_network_denials", run_exit
-            msg_text = (
-                "no network denials were observed"
-                if run_exit == 0
-                else "no network denials were observed but the run did not complete"
-            )
+        verdict, rc, msg_text = decide(
+            run_exit, counts["tool_network_deny_events"], counts["unattributed_network_deny_events"]
+        )
     except Undeterminable as e:
         verdict, rc = "undeterminable", 70
         msg_text = str(e)
