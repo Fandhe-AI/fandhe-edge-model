@@ -118,6 +118,13 @@ fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
             1,
             "args: {args:?}"
         );
-        one_json_line(&o, "runtime_error");
+        // infer は経路ガード（REQ-39・#159）が未存在の package を先に拒否する。それ以外は
+        // 工程未接続の runtime_error（#136 で置き換える）。
+        let expected = if args[0] == "infer" {
+            "invalid_input"
+        } else {
+            "runtime_error"
+        };
+        one_json_line(&o, expected);
     }
 }
