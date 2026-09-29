@@ -4,7 +4,9 @@
 //! 証拠種別: テストハーネス（模擬の前処理・バックエンド。バイナリでの完走は #136、実前処理は
 //! #112、ONNX は #113）。
 
-use fandhe_edge_cli::infer_batch::{emit_infer_batch, judgment_from_prediction};
+use fandhe_edge_cli::infer_batch::{
+    BatchLimits, emit_infer_batch, emit_infer_batch_with_limits, judgment_from_prediction,
+};
 use fandhe_edge_cli::output::write_ok_judgment;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::ExitCode;
@@ -13,9 +15,10 @@ use fandhe_edge_runtime::pipeline::{
     BackendError, InferencePipeline, MAX_INFER_BATCH_LEN, PreprocessError, Preprocessor,
     ScoringBackend, TokenIds,
 };
-use std::cell::RefCell;
-use std::io::{self, Read, Write};
-use std::rc::Rc;
+use std::io::{self, Cursor, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const DEFINITION_JSON: &str = r#"{
   "schema": "fandhe-edge-model-definition/v1",
@@ -35,10 +38,10 @@ fn definition() -> Definition {
 }
 
 /// 入力の文字列で固定スコアを決める模擬。前処理は入力をそのまま保持する。
-struct Pre(Rc<RefCell<Vec<String>>>);
+struct Pre(Arc<Mutex<Vec<String>>>);
 impl Preprocessor for Pre {
     fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
-        self.0.borrow_mut().push(input.to_string());
+        self.0.lock().unwrap().push(input.to_string());
         Ok(TokenIds::new(input.bytes().map(i64::from).collect()))
     }
 }
@@ -57,9 +60,14 @@ impl ScoringBackend for Backend {
     }
 }
 
-fn pipeline() -> (InferencePipeline<Pre, Backend>, Rc<RefCell<Vec<String>>>) {
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    (InferencePipeline::new(Pre(Rc::clone(&seen)), Backend), seen)
+type Seen = Arc<Mutex<Vec<String>>>;
+
+fn pipeline() -> (Arc<InferencePipeline<Pre, Backend>>, Seen) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (
+        Arc::new(InferencePipeline::new(Pre(Arc::clone(&seen)), Backend)),
+        seen,
+    )
 }
 
 fn run(input: &[u8]) -> (ExitCode, String) {
@@ -68,10 +76,10 @@ fn run(input: &[u8]) -> (ExitCode, String) {
     let mut out: Vec<u8> = Vec::new();
     let code = emit_infer_batch(
         &mut out,
-        input,
+        Cursor::new(input.to_vec()),
         definition.io(),
         definition.options(),
-        &pipeline,
+        pipeline,
     )
     .expect("write must succeed");
     (code, String::from_utf8(out).expect("utf-8 output"))
@@ -153,60 +161,60 @@ fn req39_batch_oversized_record_is_limit_exceeded() {
 /// REQ-39: 入力全体が上限超過なら上限 + 1 バイトで読み取りを止め `limit_exceeded`。
 #[test]
 fn req39_batch_input_over_byte_cap_is_limit_exceeded() {
-    struct Endless(Rc<RefCell<usize>>);
+    struct Endless(Arc<AtomicUsize>);
     impl Read for Endless {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             buf.fill(b'\n');
-            *self.0.borrow_mut() += buf.len();
+            self.0.fetch_add(buf.len(), Ordering::SeqCst);
             Ok(buf.len())
         }
     }
-    let read = Rc::new(RefCell::new(0usize));
+    let read = Arc::new(AtomicUsize::new(0));
     let definition = definition();
     let (pipeline, _) = pipeline();
     let mut out: Vec<u8> = Vec::new();
     let code = emit_infer_batch(
         &mut out,
-        Endless(Rc::clone(&read)),
+        Endless(Arc::clone(&read)),
         definition.io(),
         definition.options(),
-        &pipeline,
+        pipeline,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
     let limit = fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_TOTAL_BYTES;
-    assert_eq!(*read.borrow(), limit + 1);
+    assert_eq!(read.load(Ordering::SeqCst), limit + 1);
 }
 
 /// REQ-39: 改行の無い無限入力は 1 行の上限付近で読み取りを止め `limit_exceeded`
 /// （入力全体をメモリへ読み込んでから検証しない）。
 #[test]
 fn req39_batch_endless_single_line_stops_reading_near_line_cap() {
-    struct Endless(Rc<RefCell<usize>>);
+    struct Endless(Arc<AtomicUsize>);
     impl Read for Endless {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             buf.fill(b' ');
-            *self.0.borrow_mut() += buf.len();
+            self.0.fetch_add(buf.len(), Ordering::SeqCst);
             Ok(buf.len())
         }
     }
-    let read = Rc::new(RefCell::new(0usize));
+    let read = Arc::new(AtomicUsize::new(0));
     let definition = definition();
     let (pipeline, _) = pipeline();
     let mut out: Vec<u8> = Vec::new();
     let code = emit_infer_batch(
         &mut out,
-        Endless(Rc::clone(&read)),
+        Endless(Arc::clone(&read)),
         definition.io(),
         definition.options(),
-        &pipeline,
+        pipeline,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
     // 1 行の上限 + 2 バイトと BufReader の 1 回分（8 KiB）を超えて読まない。
-    assert!(*read.borrow() <= MAX_INFER_INPUT_BYTES + 2 + 8192);
+    assert!(read.load(Ordering::SeqCst) <= MAX_INFER_INPUT_BYTES + 2 + 8192);
 }
 
 /// REQ-39: 件数が上限 + 1 なら `limit_exceeded`。
@@ -243,7 +251,7 @@ fn req21_label_index_out_of_options_is_runtime_error() {
         }
     }
     let definition = definition();
-    let (pre, _) = (Pre(Rc::new(RefCell::new(Vec::new()))), ());
+    let pre = Pre(Arc::new(Mutex::new(Vec::new())));
     let pipeline = InferencePipeline::new(pre, Wide);
     let prediction = pipeline.infer_one("x").unwrap();
     let error = judgment_from_prediction(definition.options(), "id", &prediction).unwrap_err();
@@ -289,10 +297,10 @@ fn req21_batch_stops_after_write_failure() {
     let input = b"{\"id\":\"1\",\"input\":\"a\"}\n{\"id\":\"2\",\"input\":\"a\"}\n{\"id\":\"3\",\"input\":\"a\"}\n";
     let result = emit_infer_batch(
         &mut out,
-        &input[..],
+        Cursor::new(input.to_vec()),
         definition.io(),
         definition.options(),
-        &pipeline,
+        pipeline,
     );
     assert!(result.is_err());
     assert_eq!(out.calls, 2, "no write after the failing one");
@@ -329,11 +337,136 @@ fn req27_batch_passes_only_input_to_pipeline() {
     let mut out: Vec<u8> = Vec::new();
     emit_infer_batch(
         &mut out,
-        &b"{\"id\":\"secret-id-1\",\"input\":\"alpha\"}\n{\"id\":\"secret-id-2\",\"input\":\"beta\"}\n"[..],
+        Cursor::new(
+            b"{\"id\":\"secret-id-1\",\"input\":\"alpha\"}\n{\"id\":\"secret-id-2\",\"input\":\"beta\"}\n".to_vec(),
+        ),
         definition.io(),
         definition.options(),
-        &pipeline,
+        pipeline,
     )
     .unwrap();
-    assert_eq!(*seen.borrow(), ["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+/// REQ-39: 改行が来ないまま停止する `Read` でも、期限で `limit_exceeded` を返して戻る
+/// （読み取りが期限後も戻らないことはない）。
+#[test]
+fn req39_batch_stalled_reader_returns_limit_exceeded_at_deadline() {
+    struct Stalled;
+    impl Read for Stalled {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(0)
+        }
+    }
+    let definition = definition();
+    let (pipeline, _) = pipeline();
+    let mut out: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
+    let code = emit_infer_batch_with_limits(
+        &mut out,
+        Stalled,
+        definition.io(),
+        definition.options(),
+        pipeline,
+        BatchLimits {
+            duration: Duration::from_millis(200),
+            ..BatchLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let text = String::from_utf8(out).unwrap();
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
+}
+
+/// REQ-39: 期限を確認できない 1 件の推論が停止しても、期限で `limit_exceeded` を返して戻る。
+#[test]
+fn req39_batch_stalled_inference_returns_limit_exceeded_at_deadline() {
+    struct Stalled;
+    impl ScoringBackend for Stalled {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(vec![0.5, 0.25, 0.25])
+        }
+    }
+    let definition = definition();
+    let pipeline = Arc::new(InferencePipeline::new(
+        Pre(Arc::new(Mutex::new(Vec::new()))),
+        Stalled,
+    ));
+    let mut out: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
+    let code = emit_infer_batch_with_limits(
+        &mut out,
+        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+        definition.io(),
+        definition.options(),
+        pipeline,
+        BatchLimits {
+            duration: Duration::from_millis(200),
+            ..BatchLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let text = String::from_utf8(out).unwrap();
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
+}
+
+/// REQ-39: 総出力バイト数が上限を超えるなら、結果行を 1 行も出さず `limit_exceeded`。
+/// 上限ちょうどは受理する。
+#[test]
+fn req39_batch_total_output_over_limit_is_limit_exceeded_before_any_row() {
+    let definition = definition();
+    let input = b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"a\"}\n";
+    let (_, full) = run(input);
+    let run_with = |output_bytes: usize| {
+        let (pipeline, _) = pipeline();
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_infer_batch_with_limits(
+            &mut out,
+            Cursor::new(input.to_vec()),
+            definition.io(),
+            definition.options(),
+            pipeline,
+            BatchLimits {
+                output_bytes,
+                ..BatchLimits::default()
+            },
+        )
+        .unwrap();
+        (code, String::from_utf8(out).unwrap())
+    };
+    let (code, text) = run_with(full.len());
+    assert_eq!(code, ExitCode::Ok);
+    assert_eq!(text, full);
+    let (code, text) = run_with(full.len() - 1);
+    assert_single_error(code, &text, ExitCode::LimitExceeded, "limit_exceeded");
+    assert!(!text.contains("predicted_label"));
+}
+
+/// REQ-39: 出力段階の期限を超えたら、残りの行もエラー行も書かず `io::Error`（TimedOut）。
+#[test]
+fn req39_batch_output_deadline_stops_writing() {
+    let definition = definition();
+    let (pipeline, _) = pipeline();
+    let mut out: Vec<u8> = Vec::new();
+    let err = emit_infer_batch_with_limits(
+        &mut out,
+        Cursor::new(b"{\"id\":\"r1\",\"input\":\"a\"}\n".to_vec()),
+        definition.io(),
+        definition.options(),
+        pipeline,
+        BatchLimits {
+            output_duration: Duration::ZERO,
+            ..BatchLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(out.is_empty());
 }

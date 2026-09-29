@@ -42,10 +42,15 @@
 //! 前に検査する。
 //!
 //! 処理時間は、入力の読み取り開始から出力開始までを 1 つの期限（`MAX_INFER_BATCH_DURATION`）で
-//! 数える。読み取りは 1 行ごと、推論は 1 件ごとの前後で期限を確認し、超過は `limit_exceeded`
-//! とする。協調的な打ち切りで、ブロックした `Read` や 1 件の推論の内部は中断できない
-//! （バックエンド側の上限は #113）。出力は推論済みの結果を書くだけで、書き込み途中の打ち切りは
-//! 出力を壊すため期限の対象にしない（開始前に確認する）。
+//! 数える。読み取り・推論・出力量の検証は専用スレッドで行い、呼び出し側が期限で待つため、
+//! 改行が来ない低速な `Read` や 1 件の推論の内部でブロックしても、超過は `limit_exceeded`
+//! で返る（スレッドは強制終了できず切り離して残る。CLI は 1 呼び出し 1 プロセスで、結果を
+//! 書いたら終了する前提）。協調的な確認（1 行ごと・1 件ごと）も併用する。
+//!
+//! 総出力量は書き込み前に全行の長さを合計して `MAX_INFER_BATCH_OUTPUT_BYTES` で拒否する。
+//! 出力段階は行の間で `MAX_INFER_BATCH_OUTPUT_DURATION` を確認し、超過は書き込み失敗と同じ
+//! `io::Error`（出力が壊れるため `ErrorReport` は追記しない）。1 回の `write` 自体が読み手の
+//! 停止でブロックする場合は中断できないが、量は上限内に有界。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
 
@@ -61,7 +66,9 @@ use fandhe_edge_runtime::pipeline::{
     Prediction, Preprocessor, ScoringBackend,
 };
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::time::Instant;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// stdout の出力形（REQ-33）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,12 +232,44 @@ pub fn judgment_from_prediction(
         .map_err(|error| judgment_error_report(&error))
 }
 
+/// バッチ全体の総出力バイト数の上限（暫定。REQ-39）。
+///
+/// 入力は最大 [`MAX_INFER_BATCH_LEN`] 件で、選択肢 ID は 1 件あたり最大 64 KiB になりうるため、
+/// 出力は入力より桁違いに大きくなりえる。全行の長さを書き込み前に合計してこの値で拒否し、
+/// 出力量（と、その書き込みに要する時間）を有界にする。
+pub const MAX_INFER_BATCH_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+
+/// 出力段階（結果行の書き込み）の時間上限（暫定。REQ-39）。行と行の間で確認する。
+pub const MAX_INFER_BATCH_OUTPUT_DURATION: Duration = Duration::from_secs(60);
+
+/// [`emit_infer_batch_with_limits`] の資源上限。既定は本モジュールの定数（REQ-39）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    /// 読み取り開始から出力開始までの時間上限。
+    pub duration: Duration,
+    /// 総出力バイト数の上限。
+    pub output_bytes: usize,
+    /// 出力段階の時間上限。
+    pub output_duration: Duration,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            duration: MAX_INFER_BATCH_DURATION,
+            output_bytes: MAX_INFER_BATCH_OUTPUT_BYTES,
+            output_duration: MAX_INFER_BATCH_OUTPUT_DURATION,
+        }
+    }
+}
+
 /// 全レコードを `infer_batch_until` で推論し、各予測が `JudgmentResult` として組み立てられる
 /// ことを検証したうえで、入力順の予測を返す（書き込みはしない）。
 ///
 /// `JudgmentResult` は検証のためだけに作って捨てる。全件を保持すると選択肢 ID が結果ごとに
 /// 複製されメモリが入力に比例して膨らむため、書き込み側（[`emit_infer_batch`]）が 1 件ずつ
-/// 作り直す（REQ-39）。
+/// 作り直す（REQ-39）。検証時に各行の直列化後の長さ（改行込み）を合計し、`output_byte_limit` を
+/// 超えたら `limit_exceeded` とする（書き込み前に総出力量を拒否するため。REQ-39）。
 ///
 /// # Errors
 /// バッチ全体の失敗（期限超過を含む）、または入力順で最初の 1 件の失敗を `ErrorReport` で返す。
@@ -239,6 +278,7 @@ pub fn predict_batch<P: Preprocessor, B: ScoringBackend>(
     options: &[Choice],
     records: &[InferInput],
     deadline: Option<Instant>,
+    output_byte_limit: usize,
 ) -> Result<Vec<Prediction>, ErrorReport> {
     // 推論側へ渡すのは input のみ（id・ラベル・分割情報は渡さない）。
     let inputs: Vec<&str> = records.iter().map(InferInput::input).collect();
@@ -249,40 +289,137 @@ pub fn predict_batch<P: Preprocessor, B: ScoringBackend>(
         return Err(report(ExitCode::RuntimeError));
     }
     let mut validated = Vec::with_capacity(records.len());
+    let mut output_bytes: usize = 0;
     for (record, prediction) in records.iter().zip(predictions) {
         let prediction = prediction.map_err(|error| error.to_error_report())?;
-        judgment_from_prediction(options, record.id(), &prediction)?;
+        let result = judgment_from_prediction(options, record.id(), &prediction)?;
+        let line = result
+            .to_json_line()
+            .map_err(|_| report(ExitCode::RuntimeError))?;
+        // 改行 1 バイトを加える。
+        output_bytes = output_bytes.saturating_add(line.len()).saturating_add(1);
+        if output_bytes > output_byte_limit {
+            return Err(report(ExitCode::LimitExceeded));
+        }
         validated.push(prediction);
     }
     Ok(validated)
 }
 
-/// 入力を読み・推論し、成功なら結果を 1 行 1 JSON で、失敗なら `ErrorReport` を 1 行で書く。
-///
-/// # Errors
-/// 書き込み・flush の失敗を `io::Error` で返す。部分書き込み後は出力が壊れているため、
-/// 追加の書き込み（残りの行・`ErrorReport`）はせず即座に打ち切る（`output` の契約）。
-/// 呼び出し側は `Err` を exit 70 に写し、何も書かない。
-pub fn emit_infer_batch<W: Write, R: Read, P: Preprocessor, B: ScoringBackend>(
-    out: &mut W,
+/// 読み取り・推論・出力量の検証までを行う計算段階。書き込みはしない。
+fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     reader: R,
     io: &IoSchema,
     options: &[Choice],
     pipeline: &InferencePipeline<P, B>,
-) -> io::Result<ExitCode> {
+    deadline: Option<Instant>,
+    output_byte_limit: usize,
+) -> Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport> {
+    let records = read_batch_records_until(reader, io, deadline)?;
+    let predictions = predict_batch(pipeline, options, &records, deadline, output_byte_limit)?;
+    // 出力の途中で打ち切ると出力が壊れるため、書き始める前にだけ期限を確認する。
+    if deadline_passed(deadline) {
+        return Err(report(ExitCode::LimitExceeded));
+    }
+    Ok((records, predictions))
+}
+
+/// 入力を読み・推論し、成功なら結果を 1 行 1 JSON で、失敗なら `ErrorReport` を 1 行で書く。
+/// 資源上限は [`BatchLimits::default`]。
+///
+/// # Errors
+/// [`emit_infer_batch_with_limits`] と同じ。
+pub fn emit_infer_batch<W, R, P, B>(
+    out: &mut W,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_batch_with_limits(out, reader, io, options, pipeline, BatchLimits::default())
+}
+
+/// [`emit_infer_batch`] の資源上限を指定できる版（REQ-39）。
+///
+/// 読み取り・推論・出力量の検証は専用スレッドで行い、呼び出し側は `limits.duration` で
+/// `recv_timeout` する。改行が来ない低速な `Read` や、期限を確認できない 1 件の推論の途中でも、
+/// 期限超過で `limit_exceeded` を返せる（スレッドは強制終了できないため、超過時は切り離して
+/// 残す。呼び出し側は結果を書いたらプロセスを終了する前提で、CLI は 1 呼び出し 1 プロセス）。
+/// 書き込みは総量（`limits.output_bytes`）を事前に検査済みで、行の間で `limits.output_duration`
+/// を確認する。ただし 1 回の `write` 自体が読み手の停止でブロックする場合は中断できない
+/// （OS のパイプ背圧。出力量が有界なので待つのは最大でも上限内の量）。
+///
+/// # Errors
+/// 書き込み・flush の失敗、および出力段階の期限超過（`ErrorKind::TimedOut`）を `io::Error` で
+/// 返す。部分書き込み後は出力が壊れているため、追加の書き込み（残りの行・`ErrorReport`）は
+/// せず即座に打ち切る（`output` の契約）。呼び出し側は `Err` を exit 70 に写し、何も書かない。
+pub fn emit_infer_batch_with_limits<W, R, P, B>(
+    out: &mut W,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+    limits: BatchLimits,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
     // 読み取り開始から出力開始までを 1 つの期限で数える（REQ-39）。
-    let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
-    let outcome = read_batch_records_until(reader, io, deadline).and_then(|records| {
-        let predictions = predict_batch(pipeline, options, &records, deadline)?;
-        // 出力の途中で打ち切ると出力が壊れるため、書き始める前にだけ期限を確認する。
-        if deadline_passed(deadline) {
-            return Err(report(ExitCode::LimitExceeded));
+    let start = Instant::now();
+    let deadline = start.checked_add(limits.duration);
+    let (tx, rx) = mpsc::channel();
+    let worker_io = io.clone();
+    let worker_options = options.to_vec();
+    let worker_pipeline = Arc::clone(&pipeline);
+    let output_bytes = limits.output_bytes;
+    let spawned = thread::Builder::new()
+        .name("infer-batch".to_string())
+        .spawn(move || {
+            let outcome = compute_batch(
+                reader,
+                &worker_io,
+                &worker_options,
+                &worker_pipeline,
+                deadline,
+                output_bytes,
+            );
+            // 受信側が期限で去っていれば送信は失敗する。捨てる。
+            let _ = tx.send(outcome);
+        });
+    let outcome = match spawned {
+        Err(_) => Err(report(ExitCode::RuntimeError)),
+        Ok(_) => {
+            let received = match deadline {
+                Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            match received {
+                Ok(outcome) => outcome,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(report(ExitCode::LimitExceeded)),
+                // 計算スレッドの panic。
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(report(ExitCode::RuntimeError)),
+            }
         }
-        Ok((records, predictions))
-    });
+    };
     match outcome {
         Ok((records, predictions)) => {
+            let output_deadline = Instant::now().checked_add(limits.output_duration);
             for (record, prediction) in records.iter().zip(&predictions) {
+                if deadline_passed(output_deadline) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "infer batch output deadline exceeded",
+                    ));
+                }
                 // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
                 // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
                 let result = judgment_from_prediction(options, record.id(), prediction)
