@@ -4,8 +4,8 @@
 //! **決める計算**だけを担当する（TASK-22.1-1・issue #95・親 #94）。保留状態
 //! （`Outcome::Abstain`）への接続と保留込み／保留なしの誤り率の比較は
 //! [`crate::abstention`]（TASK-22.1-2・issue #96）、「対象外」ラベルによる
-//! 扱い（TASK-22.2・issue #97）も同モジュールが担当し、coverage の記録と表示は
-//! TASK-22.3 が担当する。いずれも本モジュールの対象外。
+//! 扱い（TASK-22.2・issue #97）も同モジュールが担当し、coverage の記録と表示
+//! （TASK-22.3）は [`crate::coverage`] が担当する。いずれも本モジュールの対象外。
 //!
 //! 移植元は PoC-12 の `03-poc/abstention-calibration/scripts/calibrate.py`
 //! （事前登録の 3〜4 節）。本実装は次の点で PoC-12 から変更している。
@@ -83,7 +83,7 @@ pub const NLL_CLIP_EPSILON: f64 = 1e-12;
 /// `numpy.quantile(q=0.20, method="lower")` に一致させる規則で決まり、
 /// 常に coverage ≥ 80% を満たすが、`n` が 5 の倍数のとき、その条件を満たす
 /// 最大の τ より 1 段低い値になりうる（PoC-12 の規則をそのまま踏襲する）。
-const TARGET_COVERAGE_DENOMINATOR: usize = 5;
+pub(crate) const TARGET_COVERAGE_DENOMINATOR: usize = 5;
 /// 二分法の反復回数の上限（決定的な停止条件。無限ループを作らない。REQ-39）。
 const MAX_BISECTION_ITERATIONS: u32 = 200;
 
