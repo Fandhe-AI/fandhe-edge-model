@@ -455,6 +455,11 @@ pub enum TrainProcessError {
     /// 再試行しても、直接の子プロセス（pid）を回収できたと確認できなかった。
     /// 子が OS 上に残っている可能性を呼び出し側へ明示する（データ本文を含めず
     /// pid のみ持つ。codex/review 指摘 P0。REQ-39「資源の上限」）。
+    ///
+    /// 使い分け: 壁時計の期限に達して打ち切った回収失敗（タイムアウト経路・
+    /// キャンセルの kill 後の回収待ち）は `WallTimeout { child_reaped: false }`
+    /// （limit_exceeded）で返し、本バリアント（runtime_error）は壁時計の期限と
+    /// 関係なく `try_wait()` が失敗した経路に限る（REQ-21）。
     ChildNotReaped { pid: u32 },
     /// 子プロセスがシグナルで終了し、終了コードを取得できなかった
     /// （unix。`ExitStatus::code()` が `None` を返す場合）。

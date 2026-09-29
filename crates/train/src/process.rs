@@ -633,6 +633,12 @@ enum CancelStep {
     /// （codex/review 指摘 P0。REQ-39「資源の上限」）。壁時計の期限で kill 後の
     /// 回収待ちを打ち切った場合も同じ扱いで、`WallTimeout` として回収する。
     StillRunning,
+    /// kill 後の回収待ちが壁時計の期限に達して打ち切られた（または期限後に
+    /// 回収を試みた）。`WallTimeout { child_reaped }` として返す。回収の成否は
+    /// `child_reaped` で示す。`ChildNotReaped`（70）は壁時計の期限と関係なく
+    /// 回収できない場合（`try_wait()` エラー）に限る（Cursor Bugbot 指摘
+    /// Medium。REQ-21・REQ-39）。
+    WallDeadline { child_reaped: bool },
 }
 
 /// キャンセル分岐。まず `try_wait()` で未回収か確かめ、未回収のときに
@@ -681,18 +687,10 @@ fn cancel_child(
     }
     let status = match wait_after_kill_until(child, deadline) {
         Ok(status) => status,
-        // 壁時計の期限で待ちを打ち切った場合は実行時エラーにせず、
-        // `StillRunning` として呼び出し元へ返す。呼び出し元は期限超過を
-        // `TimedOut`（`WallTimeout`）として回収する（Cursor Bugbot 指摘 Medium。
-        // 期限前に受理したキャンセルの回収が期限に間に合わなかっただけで、
-        // 実行時エラー扱いにしない。REQ-39）。
-        Err(TrainProcessError::KillWaitTimedOut) if Instant::now() >= wall_deadline => {
-            return Ok(CancelStep::StillRunning);
-        }
-        // それ以外（`try_wait()` のエラー・`KILL_WAIT_TIMEOUT` 超過）でも
-        // `Child` を手放さず、壁時計の期限まで kill と回収を再試行する。
-        // 確認できなければ pid つきの `ChildNotReaped`（codex/review 指摘 P0）。
-        Err(_) => ensure_reaped(child, wall_deadline, KILL_WAIT_TIMEOUT)?,
+        Err(_) => match reap_failed_cancel_wait(child, wall_deadline, KILL_WAIT_TIMEOUT) {
+            Ok(status) => status,
+            Err(step) => return Ok(step),
+        },
     };
     // `try_wait()` が `None` を返した直後に子が自然終了すると、未回収（ゾンビ）
     // の子への `kill()` は成功しうる。回収した状態が `SIGKILL` 終了でなければ
@@ -726,6 +724,15 @@ fn try_wait_interrupt_bounded(
             }
             other => return other,
         }
+    }
+}
+
+/// 壁時計超過のエラー（`limit_exceeded`）を作る。
+#[cfg(unix)]
+fn wall_timeout_error(limits: &RunLimits, child_reaped: bool) -> TrainProcessError {
+    TrainProcessError::WallTimeout {
+        limit_ms: u64::try_from(limits.wall_timeout().as_millis()).unwrap_or(u64::MAX),
+        child_reaped,
     }
 }
 
@@ -800,6 +807,29 @@ fn ensure_reaped<C: ChildControl>(
 #[cfg(unix)]
 fn reap_after_wall_timeout<C: ChildControl>(child: &mut C, final_grace: Duration) -> bool {
     ensure_reaped(child, Instant::now(), final_grace).is_ok()
+}
+
+/// キャンセルの kill 後に回収待ちが失敗したときの後始末。壁時計の期限に
+/// 達している場合は [`reap_after_wall_timeout`] で回収を試みて
+/// `CancelStep::WallDeadline { child_reaped }` を返す。期限前なら壁時計の
+/// 期限まで [`ensure_reaped`] で再試行し、回収できれば `Ok(status)`、期限に
+/// なっても回収できなければ `WallDeadline { child_reaped: false }` を返す。
+/// いずれも `WallTimeout`（limit_exceeded）へ写り、`ChildNotReaped`（70）へは
+/// 化けない（REQ-21・REQ-39）。
+#[cfg(unix)]
+fn reap_failed_cancel_wait<C: ChildControl>(
+    child: &mut C,
+    wall_deadline: Instant,
+    final_grace: Duration,
+) -> Result<ExitStatus, CancelStep> {
+    if Instant::now() >= wall_deadline {
+        return Err(CancelStep::WallDeadline {
+            child_reaped: reap_after_wall_timeout(child, final_grace),
+        });
+    }
+    ensure_reaped(child, wall_deadline, final_grace).map_err(|_| CancelStep::WallDeadline {
+        child_reaped: false,
+    })
 }
 
 /// `SIGKILL` のシグナル番号（`Child::kill()` が送る値。unix で共通）。
@@ -1129,6 +1159,9 @@ pub fn run_train_cancellable(
                     // 通常経路へ合流し、stdout を締め切りまで待つ。
                     CancelStep::AlreadyExited(status) => pre_exited = Some(status),
                     CancelStep::StillRunning => {}
+                    CancelStep::WallDeadline { child_reaped } => {
+                        return Err(wall_timeout_error(limits, child_reaped));
+                    }
                 }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1170,6 +1203,9 @@ pub fn run_train_cancellable(
                 CancelStep::AlreadyExited(status) => {
                     pre_exited = Some(status);
                     continue;
+                }
+                CancelStep::WallDeadline { child_reaped } => {
+                    return Err(wall_timeout_error(limits, child_reaped));
                 }
                 CancelStep::StillRunning => {
                     // 生存中の子の監視を続ける（次の周回で kill を再試行し、
@@ -1446,7 +1482,7 @@ mod tests {
             Ok(CancelStep::Cancelled(run)) => assert_eq!(run.signal(), Some(SIGKILL)),
             // 壁時計の期限で打ち切った場合は実行時エラーではなく `StillRunning`
             // （呼び出し元が `WallTimeout` として回収する）。
-            Ok(CancelStep::StillRunning) => {}
+            Ok(CancelStep::StillRunning | CancelStep::WallDeadline { .. }) => {}
             _ => panic!("unexpected cancel step"),
         }
         let _ = child.kill();
@@ -1551,6 +1587,50 @@ mod tests {
         assert!(!reap_after_wall_timeout(
             &mut never,
             Duration::from_millis(100)
+        ));
+    }
+
+    /// REQ-21・REQ-39: キャンセルの kill 後の回収失敗は、期限到達なら
+    /// `WallDeadline`（`WallTimeout` へ写る。回収の成否は `child_reaped`）、
+    /// 期限前に回収できれば `Ok`。
+    #[cfg(unix)]
+    #[test]
+    fn reap_failed_cancel_wait_maps_to_wall_deadline() {
+        use std::os::unix::process::ExitStatusExt;
+        let past = Instant::now();
+        let grace = Duration::from_millis(100);
+        let reaped = || FakeChild {
+            kill_results: vec![Err(io_err())],
+            wait_results: vec![Ok(Some(ExitStatus::from_raw(9)))],
+            kills: 0,
+        };
+        let never = || FakeChild {
+            kill_results: vec![],
+            wait_results: vec![],
+            kills: 0,
+        };
+        assert!(matches!(
+            reap_failed_cancel_wait(&mut reaped(), past, grace),
+            Err(CancelStep::WallDeadline { child_reaped: true })
+        ));
+        assert!(matches!(
+            reap_failed_cancel_wait(&mut never(), past, grace),
+            Err(CancelStep::WallDeadline {
+                child_reaped: false
+            })
+        ));
+        let soon = Instant::now() + Duration::from_millis(100);
+        assert_eq!(
+            reap_failed_cancel_wait(&mut reaped(), soon, grace)
+                .ok()
+                .and_then(|s| s.signal()),
+            Some(9)
+        );
+        assert!(matches!(
+            reap_failed_cancel_wait(&mut never(), soon, grace),
+            Err(CancelStep::WallDeadline {
+                child_reaped: false
+            })
         ));
     }
 
