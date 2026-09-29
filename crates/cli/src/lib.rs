@@ -8,7 +8,10 @@
 //! # 現状（TASK-21.1-2・TASK-21.2・TASK-33.1-1）
 //!
 //! [`output`] は `JudgmentResult` / `ErrorReport` を JSON 1 行として書き出す
-//! （TASK-21.1-2・TASK-21.2）。[`args`] は 7 工程サブコマンドの引数定義と
+//! （TASK-21.1-2・TASK-21.2）。あわせて容量内訳を `package` 出力用 JSON にする
+//! `output::package_capacity_json`・`write_package_capacity` と
+//! `capacity_error_report`（TASK-30.1-2・#123。`package` 工程への配線は
+//! TASK-33.1-2）も実装済み。[`args`] は 7 工程サブコマンドの引数定義と
 //! パーサ・help 生成（TASK-33.1-1）。各工程の下位層への接続と完走は
 //! TASK-33.1-2（#136）、入出力契約全体の統合は TASK-33.2 の対象で、
 //! `main.rs` は解析成功後も工程を実行せず `runtime_error` を返す。
