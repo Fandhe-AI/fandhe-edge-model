@@ -36,6 +36,10 @@
 //!
 //! 不一致を検出した場合の原因特定・記録の手順は `docs/design/runtime-batch-mismatch-procedure.md`
 //! （REQ-28 異常系・TASK-28.2・#119）に従う。
+//!
+//! TASK-32.3（#115）で、環境変数を空にした（`env -i` 相当）子プロセスでの推論成功テスト
+//! （`tests/env_isolation.rs`。証拠種別: テストハーネス）を追加した。CLI `infer` 経由の確認は
+//! 工程の接続（#136）後に追加する。
 
 pub mod capacity;
 pub mod latency;
