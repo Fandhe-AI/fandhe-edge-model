@@ -856,3 +856,86 @@ fn req39_output_caps_are_enforced_at_write_time() {
         );
     }
 }
+
+/// 非 ASCII の `\uXXXX`・サロゲートペア・16 進の大文字小文字は正当な JSON として扱い、
+/// `code` 以外は素通し、`code` に関わる場合は復号後の値で照合する（REQ-21・REQ-33）。
+#[test]
+fn req33_unicode_escapes_are_valid_and_compared_after_decoding() {
+    let cases = [
+        ("uni_key", r#"{"code":"ok","é€":1}"#, 0, 0, true),
+        ("uni_value", r#"{"code":"ok","m":"é€😀"}"#, 0, 0, true),
+        ("pair_upper", r#"{"code":"ok","😀":"😀"}"#, 0, 0, true),
+        ("pair_mixed", r#"{"code":"ok","😀":1}"#, 0, 0, true),
+        ("code_nonascii_value", r#"{"code":"ék"}"#, 0, 70, false),
+        ("code_pair_value", r#"{"code":"😀"}"#, 0, 70, false),
+        (
+            "code_nonascii_key",
+            r#"{"céde":"runtime_error"}"#,
+            0,
+            0,
+            true,
+        ),
+    ];
+    for (name, json, exit, expected, relayed) in cases {
+        let o = run_with_fake_bin(name, &format!("printf '%s\n' '{json}'\nexit {exit}"));
+        assert_eq!(o.code, Some(expected), "{name}");
+        if relayed {
+            assert_eq!(o.stdout, format!("{json}\n"), "{name}");
+        } else {
+            assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+        }
+    }
+}
+
+/// 単独の high / low サロゲートは、キー・値・入れ子のどこにあっても fail-closed（70）にする
+/// （REQ-33）。
+#[test]
+fn req33_lone_surrogates_are_rejected() {
+    let cases = [
+        ("lone_high_value", r#"{"code":"ok","m":"\ud83d"}"#),
+        ("lone_high_then_char", r#"{"code":"ok","m":"\ud83dx"}"#),
+        ("high_then_high", r#"{"code":"ok","m":"\ud83d\ud83d"}"#),
+        ("high_then_nonsurrogate", r#"{"code":"ok","m":"\ud83dA"}"#),
+        ("lone_low_value", r#"{"code":"ok","m":"\ude00"}"#),
+        ("low_then_high", r#"{"code":"ok","m":"\ude00\ud83d"}"#),
+        ("lone_high_key", r#"{"code":"ok","\ud83d":1}"#),
+        ("lone_low_key", r#"{"code":"ok","\uDE00":1}"#),
+        ("lone_nested", r#"{"code":"ok","a":[{"b":"\uDC00"}]}"#),
+        ("lone_in_code", r#"{"code":"\ud83d"}"#),
+    ];
+    for (name, json) in cases {
+        let o = run_with_fake_bin(name, &format!("printf '%s\n' '{json}'\nexit 0"));
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, INVALID_OUTPUT, "{name}");
+    }
+}
+
+/// ラッパーが 70 へ置き換える経路では、CLI の生の stderr を中継せず、診断行だけを出す。
+/// 置き換えない経路（契約どおりの出力）は CLI の stderr を中継する（REQ-21・REQ-33・REQ-39）。
+#[test]
+fn req21_replaced_results_never_relay_raw_cli_stderr() {
+    let noise = "echo 'secret-diagnostic' 1>&2\n";
+    let replaced = [
+        ("r_invalid", "echo '{bad}'\nexit 0", None),
+        ("r_mismatch", "echo '{\"code\":\"ok\"}'\nexit 10", None),
+        ("r_empty", "exit 0", None),
+        ("r_abnormal", "echo '{\"code\":\"ok\"}'\nexit 127", None),
+        ("r_stderr_limit", "exec yes 1>&2", None),
+        ("r_output_limit", "exec yes", None),
+        ("r_timeout", "exec sleep 60", Some("1")),
+    ];
+    for (name, body, timeout) in replaced {
+        let envs: Vec<(&str, &str)> = timeout
+            .map(|s| vec![("FANDHE_EDGE_TIMEOUT_SECS", s)])
+            .unwrap_or_default();
+        let o = run_with_fake_bin_env(name, &format!("{noise}{body}"), &envs);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stderr, "exit_code=70\n", "{name}");
+    }
+    let o = run_with_fake_bin(
+        "r_passthrough",
+        &format!("{noise}echo '{{\"code\":\"judged_fail\"}}'\nexit 10"),
+    );
+    assert_eq!(o.code, Some(10));
+    assert_eq!(o.stderr, "secret-diagnostic\nexit_code=10\n");
+}

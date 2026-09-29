@@ -11,7 +11,8 @@
 #   - stdin は /dev/null に閉じ、入力待ちを作らない（非対話の要点）
 #   - stdout は CLI の出力を中継する（1 呼び出し 1 JSON。REQ-33）
 #   - stderr は CLI の stderr に続けて診断 `exit_code=<N>` を 1 行だけ出す
-#     （引数値・入力テキストは出さない）
+#     （引数値・入力テキストは出さない）。ラッパーが 70 へ置き換えた結果では CLI の stderr を
+#     中継せず、診断行だけを出す（置き換えは replace_with_error に集約）
 #   - 実行時間（既定 300 秒。FANDHE_EDGE_TIMEOUT_SECS）・stdout 容量（1 MiB）・
 #     stderr 容量（64 KiB）に上限を置き、超過時は子（子孫プロセスを含む）を終了して
 #     runtime_error(70) の JSON を返す（REQ-39）。子は独立したプロセスグループで起動し、
@@ -254,28 +255,21 @@ if [ -z "$limit_kind" ]; then
     fi
 fi
 
-# 上限超過は CLI の出力（途中まで）を捨て、原因を示す JSON へ置き換える
+# ラッパーが CLI の結果を 70 へ置き換える経路（上限超過・期限・監視失敗・出力なし・不正な
+# JSON・code の不一致・異常終了）は、すべてこの関数を通す。CLI の出力（stdout・stderr の
+# どちらも途中まで・信頼できない内容）は捨て、固定文の runtime_error(70) の JSON だけを返す。
+# 置き換えない経路（CLI の契約どおりの出力）だけが CLI の stderr を中継する（REQ-21・REQ-33・REQ-39）
+replace_with_error() {
+    printf '%s\n' "{\"code\":\"runtime_error\",\"message\":\"$1\"}" >"$out"
+    : >"$err"
+    rc=70
+}
+
 case "$limit_kind" in
-    timeout)
-        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge timed out"}' >"$out"
-        : >"$err"
-        rc=70
-        ;;
-    output_limit)
-        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge output exceeded size limit"}' >"$out"
-        : >"$err"
-        rc=70
-        ;;
-    monitor_error)
-        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge process monitoring failed"}' >"$out"
-        : >"$err"
-        rc=70
-        ;;
-    stderr_limit)
-        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge stderr exceeded size limit"}' >"$out"
-        : >"$err"
-        rc=70
-        ;;
+    timeout) replace_with_error "fandhe-edge timed out" ;;
+    output_limit) replace_with_error "fandhe-edge output exceeded size limit" ;;
+    monitor_error) replace_with_error "fandhe-edge process monitoring failed" ;;
+    stderr_limit) replace_with_error "fandhe-edge stderr exceeded size limit" ;;
 esac
 
 # stdout の検証（awk の再帰下降パーサー。RFC 8259 の構文を検査し、既存ツールのみで完結させる）。
@@ -306,7 +300,7 @@ check_output() {
             else break
         }
     }
-    function pstring(   c, k, h, start) {
+    function pstring(   c, k, h, start, v) {
         pos++; start = pos; hasesc = 0
         while (pos <= n) {
             c = substr(s, pos, 1)
@@ -320,6 +314,20 @@ check_output() {
                     for (k = 1; k <= 4; k++) {
                         h = substr(s, pos + k, 1)
                         if (h == "" || index("0123456789abcdefABCDEF", h) == 0) return 0
+                    }
+                    # 単独のサロゲート（high の後に low が続かない・low 単独）は UTF-8 へ復号できず、
+                    # 厳格な JSON パーサーも拒否するため不正とする（fail-closed。REQ-33）
+                    v = hexval(substr(s, pos + 1, 4))
+                    if (v >= 56320 && v <= 57343) return 0
+                    if (v >= 55296 && v <= 56319) {
+                        if (substr(s, pos + 5, 2) != "\\u") return 0
+                        for (k = 7; k <= 10; k++) {
+                            h = substr(s, pos + k, 1)
+                            if (h == "" || index("0123456789abcdefABCDEF", h) == 0) return 0
+                        }
+                        v = hexval(substr(s, pos + 7, 4))
+                        if (v < 56320 || v > 57343) return 0
+                        pos += 6
                     }
                     pos += 5; continue
                 }
@@ -464,23 +472,19 @@ check_output() {
 case "$rc" in
     0 | 10 | 11 | 12 | 20 | 64 | 70)
         if [ ! -s "$out" ]; then
-            printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced no output"}' >"$out"
-            rc=70
+            replace_with_error "fandhe-edge produced no output"
         else
             check_rc=0
             check_output || check_rc=$?
             if [ "$check_rc" -eq 1 ]; then
-                printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge produced invalid output"}' >"$out"
-                rc=70
+                replace_with_error "fandhe-edge produced invalid output"
             elif [ "$check_rc" -ne 0 ]; then
-                printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge output code does not match exit code"}' >"$out"
-                rc=70
+                replace_with_error "fandhe-edge output code does not match exit code"
             fi
         fi
         ;;
     *)
-        printf '%s\n' '{"code":"runtime_error","message":"fandhe-edge terminated abnormally"}' >"$out"
-        rc=70
+        replace_with_error "fandhe-edge terminated abnormally"
         ;;
 esac
 cat "$out"
