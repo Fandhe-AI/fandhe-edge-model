@@ -89,6 +89,15 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `raw.get(field, DEFAULT)` は値が `null` なら `DEFAULT` を使わず
   `isinstance(None, int)` で弾く。Rust 側は `crates/train/src/request.rs`
   の `deserialize_present` で同じ区別を行う）。
+  `root_parent_*`（#256。REQ-39）: `root` の `..` 構成要素を `invalid_path`／64 で
+  拒否する。`root_parent_only`・`_trailing`・`_trailing_slash` は realpath すると
+  `/` に解決されて修正前の Python が受理していたため、修正の効果を判別できる。
+  `root_parent_component_middle` は解決先が存在せず修正前も Python が拒否して
+  いたので、Rust と Python の判定一致の照合だけに使う。
+- `request_root_accept_cases.json`（#256。REQ-39）: `root` の受理側の共有ケース。
+  `suffixes` を `request_full.json` の `root`（プレースホルダー。pytest では
+  `str(tmp_path)`）の後ろへ連結したリクエストを、Rust・Python の両方が受理する
+  （`.`・末尾 `/`・連続 `/`。証拠種別: テストハーネス）。
 - `result_ok.json`: 成功時の結果 JSON。`onnx_sha256` はダミーバイト列
   `b"dummy-onnx-bytes-for-fixture"` の SHA-256（形式が妥当な値であること
   だけを確認するためのダミーで、実際の `model.onnx` とは対応しない）。

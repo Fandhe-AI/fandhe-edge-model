@@ -1425,6 +1425,38 @@
       },
       "expected_code": "invalid_request",
       "expected_exit": 64
+    },
+    {
+      "name": "root_parent_only",
+      "patch": {
+        "root": "/.."
+      },
+      "expected_code": "invalid_path",
+      "expected_exit": 64
+    },
+    {
+      "name": "root_parent_component_trailing",
+      "patch": {
+        "root": "/fandhe-edge-fixture-root/.."
+      },
+      "expected_code": "invalid_path",
+      "expected_exit": 64
+    },
+    {
+      "name": "root_parent_component_trailing_slash",
+      "patch": {
+        "root": "/fandhe-edge-fixture-root/../"
+      },
+      "expected_code": "invalid_path",
+      "expected_exit": 64
+    },
+    {
+      "name": "root_parent_component_middle",
+      "patch": {
+        "root": "/fandhe-edge-fixture-root/../fandhe-edge-fixture-root"
+      },
+      "expected_code": "invalid_path",
+      "expected_exit": 64
     }
   ]
 }

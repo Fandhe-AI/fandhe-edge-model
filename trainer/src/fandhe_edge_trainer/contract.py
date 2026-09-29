@@ -23,7 +23,8 @@ schema_version 1 の形（`__main__.py` の `train` サブコマンドが `--req
 }
 ```
 
-`root` は呼び出し元が許可する作業ルート（絶対パス）。`train_path`・`out_dir` は
+`root` は呼び出し元が許可する作業ルート（絶対パス。`..` 構成要素は拒否、
+`.`・末尾 `/`・連続 `/` は受理。REQ-39・#256）。`train_path`・`out_dir` は
 `root` からの**相対パス**でなければならない（絶対パス・`..` 構成要素・空文字列は
 拒否する）。`TrainRequest.train_path`・`TrainRequest.out_dir` は
 `guard.ConfinedEntry`（root 配下へ dir_fd で閉じ込め済みの「親ディレクトリ fd +

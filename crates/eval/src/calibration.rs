@@ -3,9 +3,9 @@
 //! REQ-22（保留・確率の校正）のうち、`validation` 分割から T と τ を
 //! **決める計算**だけを担当する（TASK-22.1-1・issue #95・親 #94）。保留状態
 //! （`Outcome::Abstain`）への接続と保留込み／保留なしの誤り率の比較は
-//! [`crate::abstention`]（TASK-22.1-2・issue #96）、「対象外」ラベルは
-//! TASK-22.2、coverage の記録と表示は TASK-22.3 が担当し、いずれも本モジュール
-//! の対象外。
+//! [`crate::abstention`]（TASK-22.1-2・issue #96）、「対象外」ラベルによる
+//! 扱い（TASK-22.2・issue #97）も同モジュールが担当し、coverage の記録と表示は
+//! TASK-22.3 が担当する。いずれも本モジュールの対象外。
 //!
 //! 移植元は PoC-12 の `03-poc/abstention-calibration/scripts/calibrate.py`
 //! （事前登録の 3〜4 節）。本実装は次の点で PoC-12 から変更している。
@@ -59,7 +59,9 @@
 //!
 //! # 対象外
 //!
-//! - 「対象外」ラベルによる処理（TASK-22.2）
+//! - 「対象外」ラベルによる処理は [`crate::abstention`] に実装済み
+//!   （TASK-22.2・issue #97）。本モジュールの T・τ の選び方は対象外ラベルの
+//!   有無で変えない
 //! - T・τ の永続化・配布パッケージへの格納（REQ-30）・CLI への配線（issue #140）
 
 use std::fmt;
@@ -221,6 +223,24 @@ pub enum CalibrationError {
         /// 渡されたその位置のラベル ID。
         given: String,
     },
+    /// 対象外ラベルとして指定された ID が、`calibration` のラベル集合に無い
+    /// （REQ-22 異常系・TASK-22.2・issue #97。設定誤りを隠さず、黙って
+    /// しきい値のみの判定へ戻さない fail-closed）。
+    UnknownOutOfScopeLabel {
+        /// 指定された対象外ラベル ID。
+        id: String,
+    },
+    /// 対象外ラベルの指定（[`crate::abstention::OutOfScopeLabel`]）が、判定に
+    /// 使う `calibration` のラベル集合と食い違う（別の校正結果との取り違え。
+    /// REQ-17・REQ-27・TASK-22.2）。
+    OutOfScopeLabelMismatch {
+        /// 指定時に解決した宣言順添字。
+        index: usize,
+        /// 指定された対象外ラベル ID。
+        expected: String,
+        /// 判定に使う `calibration` のその位置のラベル ID（範囲外なら `None`）。
+        found: Option<String>,
+    },
     /// [`crate::abstention::compare_abstention`] が内部で呼ぶ
     /// [`crate::metrics::evaluate_single_select`] が返したエラー（評価ロジックを
     /// 本モジュール・`abstention` モジュールで再実装せず、評価器の唯一の実装
@@ -295,6 +315,24 @@ impl fmt::Display for CalibrationError {
                 f,
                 "label mismatch at index {index}: calibrated with \"{calibrated}\", got \"{given}\""
             ),
+            CalibrationError::UnknownOutOfScopeLabel { id } => write!(
+                f,
+                "out-of-scope label \"{id}\" is not in the calibrated label set"
+            ),
+            CalibrationError::OutOfScopeLabelMismatch {
+                index,
+                expected,
+                found,
+            } => match found {
+                Some(found) => write!(
+                    f,
+                    "out-of-scope label mismatch at index {index}: expected \"{expected}\", calibration has \"{found}\""
+                ),
+                None => write!(
+                    f,
+                    "out-of-scope label mismatch at index {index}: expected \"{expected}\", calibration has no such index"
+                ),
+            },
             CalibrationError::Evaluation(err) => {
                 write!(f, "evaluation failed: {err}")
             }

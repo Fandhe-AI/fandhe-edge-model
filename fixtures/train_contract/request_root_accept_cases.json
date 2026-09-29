@@ -1,0 +1,12 @@
+{
+  "_meta": {
+    "description": "Shared accept cases for the train request root syntax (REQ-39/#256). Each suffix is appended to the root placeholder /fandhe-edge-fixture-root (pytest appends it to str(tmp_path)) and the resulting request must be accepted by both crates/train (Rust) and trainer (Python). Names that merely contain '..' (e.g. ..b) need a real directory in Python and are covered by each language's unit tests instead."
+  },
+  "suffixes": [
+    "/",
+    "/.",
+    "/./",
+    "//",
+    "/.//"
+  ]
+}

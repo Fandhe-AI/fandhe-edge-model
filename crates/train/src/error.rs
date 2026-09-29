@@ -25,6 +25,10 @@ pub enum TrainRequestError {
     /// リクエストの生バイト列が [`crate::limits::MAX_REQUEST_BYTES`] を超える
     /// （解析前・直列化後のいずれの検査でも到達しうる）。
     TooLarge { size: usize, limit: usize },
+    /// `config` を直列化した長さが [`crate::limits::MAX_REQUEST_BYTES`] を超える。
+    /// `TrainRequest::new` と探索の事前検証（`crate::search`）で、保持・複製の前に
+    /// 検出する（REQ-39・issue #255）。`config` の内容は含めない。
+    ConfigTooLarge { limit: usize },
     /// UTF-8 として読めない。
     NotUtf8,
     /// JSON として解析できない（構文エラー・重複キー・未知フィールド・型
@@ -102,6 +106,9 @@ impl std::fmt::Display for TrainRequestError {
         match self {
             TrainRequestError::TooLarge { size, limit } => {
                 write!(f, "train request exceeds {limit} bytes limit (got {size})")
+            }
+            TrainRequestError::ConfigTooLarge { limit } => {
+                write!(f, "train request config exceeds {limit} bytes limit")
             }
             TrainRequestError::NotUtf8 => write!(f, "train request is not valid utf-8"),
             TrainRequestError::NotJson {
@@ -213,9 +220,9 @@ impl TrainRequestError {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             TrainRequestError::InvalidPath { .. } => "invalid_path",
-            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
-                "limit_exceeded"
-            }
+            TrainRequestError::TooLarge { .. }
+            | TrainRequestError::ConfigTooLarge { .. }
+            | TrainRequestError::ValidationResultTooLarge => "limit_exceeded",
             TrainRequestError::NotUtf8
             | TrainRequestError::NotJson { .. }
             | TrainRequestError::NotObject
@@ -243,14 +250,14 @@ impl TrainRequestError {
         }
     }
 
-    /// REQ-21 の終了コードへの対応づけ。`TooLarge` のみ `LimitExceeded`（20）、
+    /// REQ-21 の終了コードへの対応づけ。`TooLarge`・`ConfigTooLarge`・`ValidationResultTooLarge` のみ `LimitExceeded`（20）、
     /// それ以外はすべて `InvalidInput`（64）。
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self {
-            TrainRequestError::TooLarge { .. } | TrainRequestError::ValidationResultTooLarge => {
-                ExitCode::LimitExceeded
-            }
+            TrainRequestError::TooLarge { .. }
+            | TrainRequestError::ConfigTooLarge { .. }
+            | TrainRequestError::ValidationResultTooLarge => ExitCode::LimitExceeded,
             _ => ExitCode::InvalidInput,
         }
     }

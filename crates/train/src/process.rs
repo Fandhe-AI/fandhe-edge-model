@@ -309,10 +309,9 @@ fn write_request_file(
         return Err(TrainProcessError::InvalidJobDir);
     }
     let path = job_dir.join("request.json");
-    // `TrainRequest::new` は `config` の値そのもののサイズを検査しない
-    // （`config` は任意の JSON を保持しうる。`request.rs` のモジュール
-    // doc 参照）ため、巨大な `config` を持つリクエストでは
-    // `to_json_vec` が直列化上限超過（`TrainRequestError::TooLarge`）を
+    // `TrainRequest::new` は `config` 単体の大きさを検査済みだが、リクエスト
+    // 全体（`config`＋`validation_inputs` 等）の大きさは `to_json_vec` が
+    // 初めて判定するため、`to_json_vec` が直列化上限超過（`TrainRequestError::TooLarge`）を
     // 返しうる（防御的な分岐ではなく到達しうる経路）。`TrainRequestError`
     // の終了コード（`TooLarge` は `LimitExceeded`）をそのまま尊重するため
     // `TrainProcessError::Request` へ委譲する（`?` は
@@ -1024,10 +1023,12 @@ mod tests {
         use crate::limits::MAX_REQUEST_BYTES;
         use crate::request::TrainRequestParams;
 
+        // 直列化後ちょうど `MAX_REQUEST_BYTES` の `config`（`{"k":"` 6 バイト＋
+        // 本文＋`"}` 2 バイト）。`new` は受理し、リクエスト全体では超過する。
         let mut huge_config = serde_json::Map::new();
         huge_config.insert(
-            "huge".to_string(),
-            serde_json::Value::String("x".repeat(MAX_REQUEST_BYTES * 2)),
+            "k".to_string(),
+            serde_json::Value::String("x".repeat(MAX_REQUEST_BYTES - 8)),
         );
         let request = TrainRequest::new(TrainRequestParams {
             kind: "c3".to_string(),
@@ -1043,7 +1044,7 @@ mod tests {
             time_limit_seconds: None,
             rss_limit_bytes: None,
         })
-        .expect("config size is not checked at construction time");
+        .expect("config exactly at the limit is accepted by new()");
 
         let job_dir = std::env::temp_dir().join(format!(
             "fandhe-edge-train-test-huge-config-{}",
