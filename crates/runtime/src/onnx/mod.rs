@@ -280,9 +280,10 @@ pub fn load_pipeline(
 /// トークン値の語彙サイズ（バイト値 0..=255 に 1 を足した 1..=256 と詰め物 0）。
 const N_TOKENS: usize = 257;
 
-/// 入力トークンが空、または `0..N_TOKENS` の範囲外なら拒否する（C1・C3 共通。fail-closed）。
+/// 入力トークンが空・[`MAX_MAX_BYTES`] 超過、または `0..N_TOKENS` の範囲外なら拒否する（C1・C3 共通。fail-closed）。
 fn check_token_ids(ids: &[i64]) -> Result<(), BackendError> {
-    if ids.is_empty() {
+    // 系列長の上限は C1・C3 共通の入口で検証する（REQ-39。C1 の n-gram 走査・集計量は長さに比例する）
+    if ids.is_empty() || ids.len() > MAX_MAX_BYTES {
         return Err(BackendError::InvalidSequenceLength);
     }
     let in_range = |&id: &i64| usize::try_from(id).is_ok_and(|v| v < N_TOKENS);

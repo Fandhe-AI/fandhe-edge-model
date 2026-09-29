@@ -271,7 +271,7 @@ fn req39_max_bytes_range_and_limits_fixture() {
     assert_eq!(limits["max_max_bytes"].as_u64(), Some(MAX_MAX_BYTES as u64));
 }
 
-/// REQ-39: 語彙範囲外のトークン・空の系列はバックエンドが拒否する（panic しない）。
+/// REQ-39: 語彙範囲外のトークン・空の系列・上限超過の系列はバックエンドが拒否する（panic しない）。
 #[test]
 fn req39_backend_rejects_invalid_token_sequences() {
     use fandhe_edge_runtime::pipeline::{ScoringBackend, TokenIds};
@@ -290,9 +290,13 @@ fn req39_backend_rejects_invalid_token_sequences() {
             assert_eq!(err.code(), want, "{name} {label}");
         }
     }
-    // C3 は系列長の上限（MAX_MAX_BYTES）も検査する
-    let c3 = OnnxBackend::from_bytes(&model_bytes("c3.onnx"), ModelKind::C3).expect("load");
-    let long = TokenIds::new(vec![1; MAX_MAX_BYTES + 1]);
-    let err = c3.scores(&long).expect_err("must reject");
-    assert_eq!(err.code(), "invalid_sequence_length");
+    // C1・C3 とも共通の入口で系列長の上限（MAX_MAX_BYTES）を検査する（境界値は受理）
+    for (kind, name) in [(ModelKind::C1, "c1.onnx"), (ModelKind::C3, "c3.onnx")] {
+        let backend = OnnxBackend::from_bytes(&model_bytes(name), kind).expect("load");
+        let long = TokenIds::new(vec![1; MAX_MAX_BYTES + 1]);
+        let err = backend.scores(&long).expect_err("must reject");
+        assert_eq!(err.code(), "invalid_sequence_length", "{name} long");
+        let at_limit = TokenIds::new(vec![1; MAX_MAX_BYTES]);
+        assert!(backend.scores(&at_limit).is_ok(), "{name} at limit");
+    }
 }
