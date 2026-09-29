@@ -36,6 +36,10 @@
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と
 //! 実モデルでの待ち時間計測は未実施（#113 の実装で可能になった。`tests/onnx_parity.rs` は fixture の
 //! 全件で単体・バッチ・評価器用関数の一致まで確認する）。
+//!
+//! TASK-32.3（#115）で、環境変数を空にした（`env -i` 相当）子プロセスでの推論成功テスト
+//! （`tests/env_isolation.rs`。証拠種別: テストハーネス）を追加した。CLI `infer` 経由の確認は
+//! 工程の接続（#136）後に追加する。
 
 pub mod capacity;
 pub mod export_exclusion;
