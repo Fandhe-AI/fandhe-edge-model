@@ -42,7 +42,7 @@
 //!
 //! # 書き手と読み手の順序（不変条件）
 //!
-//! - 書き手: `begin` は `job.lock` の作成・取得→`job.json`（`running`）の書き込みの順。
+//! - 書き手: `begin` は lock 済みの `job.lock` の公開→`job.json`（`running`）の書き込みの順。
 //!   `finish` は終端記録の書き込みを**終えてから** lock を解放する。
 //! - 読み手: 非終端の記録を読んだら `job.lock` の取得を試み、取得できたら lock を
 //!   保持したまま `job.json` を読み直す（読んでから lock を取るまでの間に正常終了
@@ -50,6 +50,12 @@
 //!   保持中に限って `failed`＋`OwnerLost` を書き戻す。`job.lock` が無い場合は生存中の
 //!   可能性を否定できないため crash と断定しない（[`JobRecordError::LockMissing`]。
 //!   fail-closed）。
+//! - `begin` の `job.lock` は lock 済みの一時ファイルの `hard_link` で公開する（公開の
+//!   瞬間から所有者が lock 保持中）。公開後〜`job.json` 確定前に所有プロセスが落ちて
+//!   `job.lock` だけが残った場合、状態確認は `job.json` 無しでも lock を取れれば
+//!   `failed`＋`OwnerLost` の記録を新規に書いて回復する（取れなければ初期化中の
+//!   `running`）。公開前に落ちた場合は `job.lock.init.*` が残りうるが状態確認には
+//!   影響しない（掃除は TASK-34.3・#147）。
 //! - `finish` を呼ばずに drop（panic 等）された場合も lock は解放されるため、状態確認が
 //!   `OwnerLost` を検出する（意図した挙動）。
 //! - 読み手同士は `job.check.lock`（blocking の advisory lock）で直列化する。同時に
@@ -70,6 +76,7 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fandhe_edge_core::exitcode::ExitCode;
@@ -88,6 +95,11 @@ pub const JOB_LOCK_FILE: &str = "job.lock";
 /// 原子的置き換えの一時ファイル名。
 /// 状態確認（読み手）同士を直列化する lock ファイル名。所有者の生存確認用 `job.lock` とは別。
 pub const JOB_CHECK_LOCK_FILE: &str = "job.check.lock";
+/// `begin` の lock 済み一時ファイル名の重複回避用（同一プロセス内の並行 `begin`）。
+static INIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// 他者保持の `job.lock` を生存と断定する前の再試行回数と間隔（[`try_lock_settled`]）。
+const LOCK_SETTLE_RETRIES: u32 = 10;
+const LOCK_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const JOB_RECORD_TMP_FILE: &str = "job.json.tmp";
 /// 記録の `schema_version`。
 pub const JOB_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -418,22 +430,45 @@ impl JobRecorder {
         if regular_file_exists(&record_path)? || regular_file_exists(&lock_path)? {
             return Err(JobRecordError::AlreadyExists);
         }
-        let lock = create_new_private(&lock_path).map_err(|e| {
+        // `job.lock` は「既に lock 済み」の状態でだけ公開する。先に `job.lock` を作ってから
+        // lock すると、作成〜取得の隙間に状態確認が lock を取り、初期化中の所有者を
+        // 落ちたと誤検出する。lock 済みの一時ファイルを `hard_link`（既存なら失敗する
+        // 排他的な公開）で `job.lock` にする。一時ファイルは公開後に消す（公開前に
+        // 落ちた場合の残置物は `job.lock` ではないため状態確認には影響しない）。
+        let init_path = job_dir.join(format!(
+            "{JOB_LOCK_FILE}.init.{}.{}",
+            std::process::id(),
+            INIT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let lock = create_new_private(&init_path).map_err(|e| io_err(&e))?;
+        let discard_init = || {
+            let _ = std::fs::remove_file(&init_path);
+        };
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                discard_init();
+                return Err(JobRecordError::LockUnavailable);
+            }
+            Err(TryLockError::Error(e)) => {
+                discard_init();
+                return Err(io_err(&e));
+            }
+        }
+        let published = std::fs::hard_link(&init_path, &lock_path);
+        discard_init();
+        published.map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 JobRecordError::AlreadyExists
             } else {
                 io_err(&e)
             }
         })?;
+        // ここから `job.lock` は自分のもの。以降の失敗では取り除く。
         let rollback = |e: JobRecordError| {
             let _ = std::fs::remove_file(&lock_path);
             e
         };
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(rollback(JobRecordError::LockUnavailable)),
-            Err(TryLockError::Error(e)) => return Err(rollback(io_err(&e))),
-        }
         let record = JobRecord {
             schema_version: JOB_RECORD_SCHEMA_VERSION,
             state: JobState::Running,
@@ -499,13 +534,31 @@ fn report_of(record: &JobRecord, record_updated: bool) -> JobStatusReport {
 /// 書き戻し失敗。
 pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport, JobRecordError> {
     check_job_dir(job_dir)?;
-    let record = read_record(job_dir)?;
-    if record.state.is_terminal() {
-        return Ok(report_of(&record, false));
-    }
+    let record_path = job_dir.join(JOB_RECORD_FILE);
     let lock_path = job_dir.join(JOB_LOCK_FILE);
-    if !regular_file_exists(&lock_path)? {
-        return Err(JobRecordError::LockMissing);
+    // `job.json` が無く `job.lock` だけがある場合は、`begin` が `job.lock` の公開後・
+    // `job.json`（`running`）の確定前に所有プロセスが落ちた残置物か、初期化中の
+    // 所有者かのどちらか。lock の保持有無で区別する（下の直列化区間で判定）。
+    let record_exists = regular_file_exists(&record_path)?;
+    let lock_exists = regular_file_exists(&lock_path)?;
+    let first = if record_exists {
+        let record = read_record(job_dir)?;
+        if record.state.is_terminal() {
+            return Ok(report_of(&record, false));
+        }
+        Some(record)
+    } else {
+        None
+    };
+    if !lock_exists {
+        return match first {
+            // 非終端の記録なのに lock が無い。生存中の可能性を否定できない。
+            Some(_) => Err(JobRecordError::LockMissing),
+            // 何も始まっていない（従来どおり記録欠落）。
+            None => Err(JobRecordError::Io {
+                kind: std::io::ErrorKind::NotFound,
+            }),
+        };
     }
     // 読み手同士を直列化する。書き戻し中の別の読み手による `job.lock` の保持を
     // 「所有者が生存中」と誤認しないため、`job.lock` の取得試行と書き戻しをこの
@@ -521,27 +574,36 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
     }
     let check_lock = check_options.open(&check_path).map_err(|e| io_err(&e))?;
     check_lock.lock().map_err(|e| io_err(&e))?;
-    let record = read_record(job_dir)?;
-    if record.state.is_terminal() {
-        return Ok(report_of(&record, false));
+    let current = read_current(job_dir)?;
+    if let Some(record) = current.as_ref().filter(|r| r.state.is_terminal()) {
+        return Ok(report_of(record, false));
     }
     let lock = File::open(&lock_path).map_err(|e| io_err(&e))?;
-    match lock.try_lock() {
-        // 読み手は直列化済みなので、取れないのは所有プロセスが生存中のため。
-        Err(TryLockError::WouldBlock) => Ok(report_of(&record, false)),
-        Err(TryLockError::Error(e)) => Err(io_err(&e)),
-        Ok(()) => {
+    match try_lock_settled(&lock)? {
+        // 読み手は直列化済みなので、取れないのは所有プロセスが生存中のため
+        // （記録がまだ無い場合は初期化中。`running` として返す）。
+        false => Ok(match current {
+            Some(record) => report_of(&record, false),
+            None => report_of(&initializing_record(&lock_path, now_unix), false),
+        }),
+        true => {
             // lock を保持したまま読み直す。最初の読み込み後に正常終了していれば
             // その終端記録を返し、crash と誤報しない。
-            let current = read_record(job_dir)?;
-            if current.state.is_terminal() {
-                return Ok(report_of(&current, false));
+            let current = read_current(job_dir)?;
+            if let Some(record) = current.as_ref().filter(|r| r.state.is_terminal()) {
+                return Ok(report_of(record, false));
             }
+            let started_at_unix = match current {
+                Some(record) => record.started_at_unix,
+                // `job.json` の確定前に落ちた場合の開始時刻は、公開済みの `job.lock`
+                // の更新時刻で近似する（無ければ検出時刻）。
+                None => initializing_record(&lock_path, now_unix).started_at_unix,
+            };
             let crashed = JobRecord {
                 schema_version: JOB_RECORD_SCHEMA_VERSION,
                 state: JobState::Failed,
-                started_at_unix: current.started_at_unix,
-                finished_at_unix: Some(now_unix),
+                started_at_unix,
+                finished_at_unix: Some(now_unix.max(started_at_unix)),
                 failure: Some(JobFailure::Crashed {
                     cause: CrashCause::OwnerLost,
                     signal: None,
@@ -552,6 +614,53 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
             Ok(report_of(&crashed, true))
         }
     }
+}
+
+/// `job.json` があれば読む。無ければ `None`（`begin` の初期化途中）。
+fn read_current(job_dir: &Path) -> Result<Option<JobRecord>, JobRecordError> {
+    if regular_file_exists(&job_dir.join(JOB_RECORD_FILE))? {
+        read_record(job_dir).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// `job.json` 確定前の初期化中（または初期化途中で落ちた）ジョブの暫定記録。
+/// 開始時刻は `job.lock` の更新時刻（`now_unix` を上限）。取れなければ `now_unix`。
+fn initializing_record(lock_path: &Path, now_unix: u64) -> JobRecord {
+    let started_at_unix = std::fs::metadata(lock_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(now_unix, |d| d.as_secs().min(now_unix));
+    JobRecord {
+        schema_version: JOB_RECORD_SCHEMA_VERSION,
+        state: JobState::Running,
+        started_at_unix,
+        finished_at_unix: None,
+        failure: None,
+    }
+}
+
+/// `lock` の取得を試み、取れたら `true`、他者が保持していれば `false`。
+///
+/// 他者の保持が「所有者の生存」ではなく、同一マシンで並行する `fork`〜`exec` 間の
+/// 子プロセスが継承した fd による一過性のもの（`O_CLOEXEC` は `exec` で閉じるため
+/// 短時間だけ保持が見える）である場合を除くため、短時間だけ再試行してから
+/// 生存と判断する（`running` の確認は上限 [`LOCK_SETTLE_RETRIES`] × 間隔だけ遅れる）。
+fn try_lock_settled(lock: &File) -> Result<bool, JobRecordError> {
+    for attempt in 0..=LOCK_SETTLE_RETRIES {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::Error(e)) => return Err(io_err(&e)),
+            Err(TryLockError::WouldBlock) => {
+                if attempt < LOCK_SETTLE_RETRIES {
+                    std::thread::sleep(LOCK_SETTLE_INTERVAL);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -803,6 +912,56 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&recorder2);
+    }
+
+    /// REQ-34: `begin` が `job.json` の確定前に落ちて `job.lock` だけが残った場合、状態確認が
+    /// `failed`＋`owner_lost` へ回復し（冪等）、記録欠落で失敗し続けない。
+    #[test]
+    fn req34_lock_without_record_is_recovered_as_owner_lost() {
+        let dir = tmp_dir("lock-only");
+        std::fs::write(dir.join(JOB_LOCK_FILE), b"").expect("leftover lock");
+        let first = read_job_status(&dir, 50).expect("first");
+        assert_eq!(first.state, JobState::Failed);
+        assert!(first.crash_detected);
+        assert!(first.record_updated);
+        let second = read_job_status(&dir, 99).expect("second");
+        assert_eq!(second.failure, first.failure);
+        assert!(!second.record_updated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: `job.json` が無くても `job.lock` を所有者が保持中なら初期化中の `running`
+    /// として返し、crash と誤報・記録の書き込みをしない。
+    #[test]
+    fn req34_lock_held_without_record_is_initializing() {
+        let dir = tmp_dir("lock-held");
+        let lock = File::create(dir.join(JOB_LOCK_FILE)).expect("lock");
+        lock.try_lock().expect("hold");
+        let report = read_job_status(&dir, 5).expect("status");
+        assert_eq!(report.state, JobState::Running);
+        assert!(!report.crash_detected);
+        assert!(!report.record_updated);
+        assert!(!dir.join(JOB_RECORD_FILE).exists());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: 状態確認による回復後の `begin` は既存記録として拒否する（`job_dir` は再利用しない）。
+    #[test]
+    fn req34_begin_after_recovery_is_rejected_without_leftovers() {
+        let dir = tmp_dir("after-recovery");
+        std::fs::write(dir.join(JOB_LOCK_FILE), b"").expect("leftover lock");
+        read_job_status(&dir, 1).expect("recover");
+        assert_eq!(
+            JobRecorder::begin(&dir, 2).map(|_| ()),
+            Err(JobRecordError::AlreadyExists)
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".init.")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REQ-34: 同じ `job_dir` の再利用は拒否する。
