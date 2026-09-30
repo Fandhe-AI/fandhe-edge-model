@@ -218,6 +218,12 @@ impl std::error::Error for PathRejection {
 pub struct ConfinedPath(PathBuf);
 
 impl ConfinedPath {
+    /// 保持 fd の実パス確認を済ませたパスから作る（同一 crate 内の fd 起点の開き直し専用）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn from_verified(path: PathBuf) -> Self {
+        Self(path)
+    }
+
     /// 正準化済みのパスを借用する。
     pub fn as_path(&self) -> &Path {
         &self.0
@@ -673,6 +679,142 @@ impl ConfinedDir {
             source: errno_to_io(e),
         })
     }
+}
+
+/// 再帰削除の最大深さ（異常に深い木・循環でスタックを使い切らない。REQ-39）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_REMOVE_DEPTH: usize = 64;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ConfinedDir {
+    /// `rel`（本ディレクトリ配下）のディレクトリを `O_NOFOLLOW` で開き、fd を保持する新しい
+    /// [`ConfinedDir`] を返す（作成直後のディレクトリの同一性を fd で握るために使う）。
+    ///
+    /// # Errors
+    /// 経路の拒否・ディレクトリでない・実パスが本ディレクトリ配下でない場合。
+    pub fn open_dir_member(&self, rel: &Path) -> Result<ConfinedDir, PathRejection> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use rustix::io::Errno;
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        let fd = openat(
+            dir,
+            name.as_os_str(),
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            Errno::LOOP | Errno::NOTDIR => PathRejection::Escapes {
+                candidate: rel.to_path_buf(),
+                kind: EscapeKind::Symlink,
+            },
+            other => PathRejection::Unresolvable {
+                candidate: rel.to_path_buf(),
+                source: errno_to_io(other),
+            },
+        })?;
+        let real = ensure_real_path_under(&fd, &self.real, rel)?;
+        Ok(ConfinedDir { fd, real })
+    }
+
+    /// 本ディレクトリの中身を、保持した fd を起点に再帰的に削除する（本ディレクトリ自身は残す）。
+    ///
+    /// パスを再解決しないため、保持後に名前が別のディレクトリへ差し替えられても、削除されるのは
+    /// 保持している実体の中身だけ（失敗時の後始末が他所を消さない。REQ-39）。symlink は追従せず
+    /// リンク自身を消す。深さは [`MAX_REMOVE_DEPTH`] で打ち切る。
+    ///
+    /// # Errors
+    /// 列挙・削除の失敗、深さ超過。
+    pub fn clear_contents(&self) -> Result<(), PathRejection> {
+        clear_dir_fd(&self.fd, 0).map_err(|source| PathRejection::Unresolvable {
+            candidate: PathBuf::new(),
+            source,
+        })
+    }
+
+    /// `rel` が指すディレクトリが `other` と同一の実体（デバイス・inode が一致）か。
+    ///
+    /// # Errors
+    /// 経路の拒否・メタデータ取得失敗。
+    pub fn is_same_dir_member(
+        &self,
+        rel: &Path,
+        other: &ConfinedDir,
+    ) -> Result<bool, PathRejection> {
+        let opened = self.open_dir_member(rel)?;
+        let unresolvable = |e: rustix::io::Errno| PathRejection::Unresolvable {
+            candidate: rel.to_path_buf(),
+            source: errno_to_io(e),
+        };
+        let a = rustix::fs::fstat(&opened.fd).map_err(unresolvable)?;
+        let b = rustix::fs::fstat(&other.fd).map_err(unresolvable)?;
+        Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+    }
+
+    /// `rel` の空ディレクトリを削除する（空でなければ失敗する。`unlinkat(AT_REMOVEDIR)`）。
+    ///
+    /// # Errors
+    /// 経路の拒否・削除失敗（空でない場合を含む）。
+    pub fn remove_empty_dir_member(&self, rel: &Path) -> Result<(), PathRejection> {
+        use rustix::fs::{AtFlags, unlinkat};
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        unlinkat(dir, name.as_os_str(), AtFlags::REMOVEDIR).map_err(|e| {
+            PathRejection::Unresolvable {
+                candidate: rel.to_path_buf(),
+                source: errno_to_io(e),
+            }
+        })
+    }
+}
+
+/// `dir` の直下を再帰的に削除する（`clear_contents` の実体。fd 起点・`O_NOFOLLOW`）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_dir_fd(dir: &rustix::fd::OwnedFd, depth: usize) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, statat, unlinkat};
+    use std::os::unix::ffi::OsStrExt;
+
+    if depth >= MAX_REMOVE_DEPTH {
+        return Err(io::Error::other("directory tree is too deep"));
+    }
+    // 削除中の列挙を避けるため、先に名前を集める。
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    let iter = Dir::read_from(dir).map_err(errno_to_io)?;
+    for entry in iter {
+        let entry = entry.map_err(errno_to_io)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(std::ffi::OsStr::from_bytes(bytes).to_os_string());
+    }
+    for name in names {
+        let stat = statat(dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(errno_to_io)?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let child = openat(
+                dir,
+                name.as_os_str(),
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(errno_to_io)?;
+            clear_dir_fd(&child, depth + 1)?;
+            unlinkat(dir, name.as_os_str(), AtFlags::REMOVEDIR).map_err(errno_to_io)?;
+        } else {
+            unlinkat(dir, name.as_os_str(), AtFlags::empty()).map_err(errno_to_io)?;
+        }
+    }
+    Ok(())
 }
 
 /// `dir`（[`safe_join`] 済みの正準パス）を `O_NOFOLLOW` で開いて fd を保持する。

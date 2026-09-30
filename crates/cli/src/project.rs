@@ -120,6 +120,16 @@ pub fn fs_report(error: &FsError) -> ErrorReport {
 #[derive(Debug)]
 pub struct Project {
     package: ConfinedPackage,
+    /// [`Project::create`] が作った場合の、親（保持 fd）と末尾の名前。失敗時の後始末
+    /// （[`Project::remove_created`]）が、作ったディレクトリと同一の実体だけを消すために使う。
+    created_in: Option<(ConfinedPackage, std::ffi::OsString)>,
+}
+
+/// [`Project::create_dir_tracked`] が作ったディレクトリ（fd を保持し、後始末の同一性確認に使う）。
+#[derive(Debug)]
+pub struct CreatedDir {
+    rel: PathBuf,
+    handle: ConfinedPackage,
 }
 
 impl Project {
@@ -129,7 +139,10 @@ impl Project {
     /// 経路の拒否（存在しない・cwd 外・ディレクトリでない）は `invalid_input`（64）等。
     pub fn open(cwd: &Path, project_dir: &Path) -> Result<Self, ErrorReport> {
         let package = confine_package(cwd, project_dir).map_err(|e| e.to_error_report())?;
-        Ok(Self { package })
+        Ok(Self {
+            package,
+            created_in: None,
+        })
     }
 
     /// `register` 用に、未作成の `--project-dir` を cwd 配下の既存の親の下へ新規作成して開く。
@@ -149,8 +162,27 @@ impl Project {
         parent.create_dir_member(Path::new(leaf)).map_err(|e| {
             write_rejection(&e, "directory already exists", "cannot create directory")
         })?;
-        let target = parent.dir().join(leaf);
-        Self::open(cwd, &target)
+        // 作った直後に fd を保持して開く（パスを開き直さない。後始末で同一性を確認するため）。
+        let package = parent
+            .open_subdir(Path::new(leaf))
+            .map_err(|e| e.to_error_report())?;
+        Ok(Self {
+            package,
+            created_in: Some((parent, leaf.to_os_string())),
+        })
+    }
+
+    /// [`Project::create`] が作ったプロジェクトを片付ける（失敗時の後始末。best effort）。
+    ///
+    /// 中身は保持した fd 起点で消し（パスを再解決しない）、ディレクトリ自身は親の下の名前が作成時と
+    /// 同一の実体のときだけ削除する。差し替えられていれば他所のディレクトリには触れない（REQ-39）。
+    /// [`Project::create`] で作っていないプロジェクトには何もしない。
+    pub fn remove_created(&self) {
+        let Some((parent, leaf)) = &self.created_in else {
+            return;
+        };
+        let _ = self.package.clear_contents();
+        let _ = parent.remove_empty_dir_member_if_same(Path::new(leaf), &self.package);
     }
 
     /// 正準化済みのプロジェクトディレクトリ（学習ワーカーへ渡す `root` の組み立て用。
@@ -264,6 +296,33 @@ impl Project {
             write_rejection(&e, "directory already exists", "cannot create directory")
         })?;
         Ok(self.path(rel))
+    }
+
+    /// [`Project::create_dir`] と同じくディレクトリを新規作成し、fd を保持したハンドルも返す
+    /// （失敗時に [`Project::remove_created_dir`] で同一の実体だけを片付けるため）。
+    ///
+    /// # Errors
+    /// [`Project::create_dir`] と同じ。
+    pub fn create_dir_tracked(&self, rel: impl AsRef<Path>) -> Result<CreatedDir, ErrorReport> {
+        let rel = rel.as_ref();
+        self.create_dir(rel)?;
+        let handle = self
+            .package
+            .open_subdir(rel)
+            .map_err(|e| e.to_error_report())?;
+        Ok(CreatedDir {
+            rel: rel.to_path_buf(),
+            handle,
+        })
+    }
+
+    /// [`Project::create_dir_tracked`] が作ったディレクトリを片付ける（best effort）。
+    /// 中身は保持 fd 起点で消し、名前が作成時と同一の実体のときだけディレクトリ自身を消す。
+    pub fn remove_created_dir(&self, created: &CreatedDir) {
+        let _ = created.handle.clear_contents();
+        let _ = self
+            .package
+            .remove_empty_dir_member_if_same(&created.rel, &created.handle);
     }
 
     /// 登録済みの定義を読む。

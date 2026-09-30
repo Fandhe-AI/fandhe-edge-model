@@ -159,6 +159,76 @@ impl ConfinedPackage {
     }
 }
 
+impl ConfinedPackage {
+    /// `member`（本パッケージ配下のディレクトリ）を fd 起点で開き、その fd を保持する新しい
+    /// [`ConfinedPackage`] を返す（作成直後のディレクトリの同一性を fd で握る。REQ-39）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_dir_member`] と同じ。
+    pub fn open_subdir(&self, member: &Path) -> Result<ConfinedPackage, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let handle = self.handle.open_dir_member(member)?;
+            if !handle.as_path().starts_with(&self.workspace) {
+                return Err(PathRejection::Escapes {
+                    candidate: member.to_path_buf(),
+                    kind: EscapeKind::Symlink,
+                });
+            }
+            Ok(ConfinedPackage {
+                workspace: self.workspace.clone(),
+                dir: ConfinedPath::from_verified(handle.as_path().to_path_buf()),
+                handle,
+            })
+        }
+    }
+
+    /// 本パッケージの中身を、保持した fd 起点で再帰的に削除する（本ディレクトリは残す）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::clear_contents`] と同じ。
+    pub fn clear_contents(&self) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.clear_contents()
+        }
+    }
+
+    /// `member` が `created`（本工程が作って fd を保持しているディレクトリ）と同一の実体で、
+    /// かつ空のときだけ削除する。差し替えられていれば何も消さず `Ok(false)`。
+    ///
+    /// # Errors
+    /// 経路の拒否・削除失敗。
+    pub fn remove_empty_dir_member_if_same(
+        &self,
+        member: &Path,
+        created: &ConfinedPackage,
+    ) -> Result<bool, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (member, created);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if !self.handle.is_same_dir_member(member, &created.handle)? {
+                return Ok(false);
+            }
+            self.handle.remove_empty_dir_member(member)?;
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
@@ -274,6 +344,67 @@ mod tests {
         pkg.remove_file_member(Path::new("new.txt"))
             .expect("remove");
         assert!(!base.join("pkg/new.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 保持 fd 起点の後始末は、名前が別ディレクトリへ差し替えられても差し替え先を消さない。
+    #[test]
+    fn req39_remove_created_dir_leaves_swapped_directory_untouched() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rmswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir");
+        let ws = confine_package(&base, Path::new("ws")).expect("confine");
+        ws.create_dir_member(Path::new("made")).expect("mkdirat");
+        ws.create_new_member(Path::new("made/a.txt")).expect("file");
+        let created = ws.open_subdir(Path::new("made")).expect("open subdir");
+
+        // 作成後に、同名を別の実ディレクトリ（中身あり）へ差し替える。
+        std::fs::rename(base.join("ws/made"), base.join("ws/made_orig")).expect("rename");
+        std::fs::create_dir(base.join("ws/made")).expect("mkdir swapped");
+        std::fs::write(base.join("ws/made/victim.txt"), b"keep").expect("write");
+
+        created.clear_contents().expect("clear via fd");
+        let removed = ws
+            .remove_empty_dir_member_if_same(Path::new("made"), &created)
+            .expect("compare");
+        assert!(!removed);
+        assert_eq!(
+            std::fs::read(base.join("ws/made/victim.txt")).expect("victim"),
+            b"keep"
+        );
+        // 保持していた実体（移動後の made_orig）の中身は消えている。
+        assert!(!base.join("ws/made_orig/a.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 差し替えが無ければ、中身（入れ子・symlink を含む）ごと作成したディレクトリを消す。
+    /// symlink は追従せず、リンク先は消さない。
+    #[test]
+    fn req39_remove_created_dir_removes_tree_without_following_symlink() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rmtree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir");
+        std::fs::create_dir_all(base.join("outside")).expect("mkdir");
+        std::fs::write(base.join("outside/keep.txt"), b"keep").expect("write");
+        let ws = confine_package(&base, Path::new("ws")).expect("confine");
+        ws.create_dir_member(Path::new("made")).expect("mkdirat");
+        ws.create_dir_member(Path::new("made/sub"))
+            .expect("mkdirat");
+        ws.create_new_member(Path::new("made/sub/a.txt"))
+            .expect("file");
+        symlink(base.join("outside"), base.join("ws/made/link")).expect("symlink");
+        let created = ws.open_subdir(Path::new("made")).expect("open subdir");
+
+        created.clear_contents().expect("clear");
+        let removed = ws
+            .remove_empty_dir_member_if_same(Path::new("made"), &created)
+            .expect("remove");
+        assert!(removed);
+        assert!(!base.join("ws/made").exists());
+        assert_eq!(
+            std::fs::read(base.join("outside/keep.txt")).expect("keep"),
+            b"keep"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

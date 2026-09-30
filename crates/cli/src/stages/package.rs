@@ -108,7 +108,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
     }
-    let package_dir = project.create_dir(PACKAGE_DIR)?;
+    let package_dir = project.create_dir_tracked(PACKAGE_DIR)?;
     // 組み立て・容量計測のどこかで失敗したら、本工程が作った `package/` を片付ける。
     // 半端なパッケージが残ると再実行が「既存」で恒久的に拒否され、`infer --package` に
     // 誤った成果物として渡される恐れがあるため（best effort。容量の上限超過は成功扱いで残す）。
@@ -121,7 +121,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
-            let _ = std::fs::remove_dir_all(&package_dir);
+            project.remove_created_dir(&package_dir);
             return Err(report);
         }
     };

@@ -118,8 +118,8 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
     let project = Project::create(cwd, &args.project_dir)?;
     let placed = place_project(&project, &def_bytes, &train_bytes, evaluation.as_ref());
     if let Err(report) = placed {
-        // 本工程が作ったディレクトリだけを片付ける（best effort）。
-        let _ = std::fs::remove_dir_all(project.dir());
+        // 本工程が作ったディレクトリだけを、保持した fd 起点で片付ける（best effort。REQ-39）。
+        project.remove_created();
         return Err(report);
     }
     Ok(RegisterReport::new(

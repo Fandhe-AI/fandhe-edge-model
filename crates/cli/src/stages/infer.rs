@@ -137,6 +137,12 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     if !checked.onnx_path.as_path().ends_with(meta.onnx_file()) {
         return Err(invalid("artifact metadata does not match the model file"));
     }
+    // 再読込したメタデータの `kind` が、ガードが検査した `kind` と一致することを確認する
+    // （2 回の読み込みの間に `artifact.json` を差し替えられても、検査した `kind` と別の `kind` で
+    // バックエンドを組み立てない。REQ-39）。
+    if meta.kind() != checked.kind.as_str() {
+        return Err(invalid("artifact metadata does not match the model file"));
+    }
     let onnx = checked.onnx.as_bytes();
     if meta.onnx_sha256() != Sha256Digest::of_bytes(onnx).to_hex() {
         return Err(invalid("package model does not match its recorded hash"));
