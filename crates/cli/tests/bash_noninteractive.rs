@@ -8,6 +8,8 @@
 //! 予測ラベルの具体値で照合し、実推論経路の実行記録（`req36_run_record_real_infer_*`）も確認する。
 //! 末尾の `req36_run_record_*` は実行記録（opt-in の `FANDHE_EDGE_RECORD_DIR`。
 //! TASK-36.1-2・#150）の保存形式を具体値で照合する。
+//! 末尾の `req36_*_via_sh`（TASK-36.2・#151）は異常系（存在しないパッケージ・不正な入力）の
+//! 終了コード 64・stdout の JSON・stderr（ラッパーの診断行のみ）・実行記録を具体値で照合する。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
 #![cfg(unix)]
@@ -2093,4 +2095,180 @@ fn req36_no_record_dir_creates_nothing() {
     assert_eq!(o.stderr, "exit_code=0\n");
     assert!(record_files(&dir).is_empty());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- TASK-36.2・#151 異常系の終了コード対応確認（証拠種別: テストハーネス） ----
+
+/// 異常系の出力を照合する。CLI 本体は `infer` のエラー経路で stderr へ何も書かないため
+/// （PoC-16 の実クライアント記録と同じ）、stderr 全体はラッパーの診断行だけになる。
+/// 期待値はリテラルで渡し、利用者の値（パス・入力本文）が出力へ漏れていないことも確認する。
+fn assert_invalid_input(o: &Out, message: &str, leaks: &[&str], label: &str) {
+    assert_eq!(o.code, Some(64), "{label}: {}", o.stdout);
+    assert_eq!(
+        o.stdout,
+        format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n"),
+        "{label}"
+    );
+    assert_eq!(o.stderr, "exit_code=64\n", "{label}");
+    for l in leaks {
+        assert!(
+            !o.stdout.contains(l) && !o.stderr.contains(l),
+            "{label}: {l}"
+        );
+    }
+}
+
+/// 空の一時 workspace（cwd にする）を作る。呼び出し側が削除する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn empty_ws(name: &str) -> PathBuf {
+    let ws = std::env::temp_dir().join(format!("fandhe-abn-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    ws
+}
+
+/// 存在しないパッケージ（`--text`）は 64・`path_unresolvable`（REQ-36・REQ-21・REQ-39・TASK-36.2・#151）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_missing_package_text_returns_invalid_input_64_via_sh() {
+    let ws = empty_ws("miss-text");
+    let o = run_script_in(Some(&ws), &["--package", "missing_pkg", "--text", "a"]);
+    let _ = std::fs::remove_dir_all(&ws);
+    let ws_str = ws.to_string_lossy().into_owned();
+    assert_invalid_input(
+        &o,
+        "path rejected: path_unresolvable",
+        &["missing_pkg", &ws_str],
+        "text",
+    );
+}
+
+/// 存在しないパッケージは `--input-file`（バッチ）でも入力源の分岐より前に 64 で拒否される
+/// （REQ-36・REQ-21・TASK-36.2・#151）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_missing_package_input_file_returns_invalid_input_64_via_sh() {
+    let ws = empty_ws("miss-batch");
+    std::fs::write(ws.join("in.jsonl"), "{\"id\":\"r1\",\"input\":\"x\"}\n").expect("write");
+    let o = run_script_in(
+        Some(&ws),
+        &["--package", "missing_pkg", "--input-file", "in.jsonl"],
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+    let ws_str = ws.to_string_lossy().into_owned();
+    assert_invalid_input(
+        &o,
+        "path rejected: path_unresolvable",
+        &["missing_pkg", &ws_str],
+        "batch",
+    );
+}
+
+/// パッケージはあるが `--input-file` が存在しない場合も 64（REQ-36・REQ-21・TASK-36.2・#151）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_missing_input_file_returns_invalid_input_64_via_sh() {
+    let ws = make_real_package("missing-in");
+    let o = run_script_in(Some(&ws), &["--package", "p", "--input-file", "nope.jsonl"]);
+    let _ = std::fs::remove_dir_all(&ws);
+    let ws_str = ws.to_string_lossy().into_owned();
+    assert_invalid_input(
+        &o,
+        "path rejected: path_unresolvable",
+        &["nope.jsonl", &ws_str],
+        "input-file",
+    );
+}
+
+/// 不正な引数は 64（REQ-36・REQ-21・REQ-33・TASK-36.2・#151）。ガードの手前で止まるため OS を問わない。
+#[test]
+fn req36_invalid_arguments_return_invalid_input_64_via_sh() {
+    let cases: [(&[&str], &str); 5] = [
+        (
+            &["--package", "p", "--bogus"],
+            "unknown option for subcommand infer",
+        ),
+        (
+            &["--package", "p", "--text", "a", "--input-file", "x"],
+            "options --text and --input-file cannot be used together",
+        ),
+        (
+            &["--package", "p"],
+            "one of --text or --input-file is required",
+        ),
+        (&["--text", "a"], "required option --package is missing"),
+        (
+            &["--package", "", "--text", "a"],
+            "option --package requires a non-empty value",
+        ),
+    ];
+    for (args, message) in cases {
+        let o = run_script(args);
+        assert_invalid_input(&o, message, &[], &format!("{args:?}"));
+    }
+}
+
+/// 不正なバッチ入力の内容は 64（REQ-36・REQ-21・REQ-39・TASK-36.2・#151）。不正行の本文は出力へ出ない。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_invalid_batch_input_returns_invalid_input_64_via_sh() {
+    let ws = make_real_package("badbatch");
+    let cases: [(&str, &[u8], &str); 4] = [
+        (
+            "truncated-json",
+            b"{\"id\":\"r1\",\"input\":\"LEAKMARK",
+            "infer input is not valid JSON",
+        ),
+        ("blank-only", b"\n  \n", "invalid input"),
+        ("non-utf8", b"\xff\n", "invalid input"),
+        (
+            "unknown-field",
+            b"{\"id\":\"r1\",\"input\":\"LEAKMARK\",\"extra\":1}\n",
+            "infer input contains an unknown field",
+        ),
+    ];
+    let mut outs = Vec::new();
+    for (name, body, _) in cases {
+        let file = format!("{name}.jsonl");
+        std::fs::write(ws.join(&file), body).expect("write");
+        outs.push(run_script_in(
+            Some(&ws),
+            &["--package", "p", "--input-file", &file],
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&ws);
+    for (o, (name, _, message)) in outs.iter().zip(cases) {
+        assert_invalid_input(o, message, &["LEAKMARK"], name);
+    }
+}
+
+/// 異常系の実行記録（REQ-36・TASK-36.2・#151・TASK-36.1-2）。記録しても契約の出力は変わらず、
+/// `--text` の値は `<redacted>`、stdout・stderr はバイト数と sha256 だけで残る。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_run_record_missing_package_exit_64_with_exact_values() {
+    let ws = empty_ws("rec-miss");
+    let dir = record_dir("abn-missing");
+    let o = run_script_in_env(
+        Some(&ws),
+        &["--package", "missing_pkg", "--text", "secret-body"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    assert_invalid_input(
+        &o,
+        "path rejected: path_unresolvable",
+        &["secret-body"],
+        "record",
+    );
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"missing_pkg\",\"--text\",\"<redacted>\"],\"started_at\":\"{started}\",\"exit_code\":64,\"stdout\":{},\"stderr\":{}}}\n",
+        summary_json(o.stdout.as_bytes()),
+        summary_json(b"")
+    );
+    assert_eq!(rec, expected);
+    assert!(!rec.contains("secret-body"));
+    std::fs::remove_dir_all(&dir).ok();
+    let _ = std::fs::remove_dir_all(&ws);
 }
