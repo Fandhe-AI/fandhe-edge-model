@@ -5,32 +5,32 @@
 //!
 //! # 責務境界
 //!
-//! - 前版へのロールバックと、復元した成果物のハッシュ再計算・台帳記録との一致検証は
-//!   実装済み（TASK-39.3-2・#168。[`VersionLedger::rollback_to`]・[`VersionLedger::rollback_to_previous`]）。
+//! - 前版へのロールバック対象の検証（成果物のハッシュ再計算・台帳記録との一致検証）は
+//!   実装済み（TASK-39.3-2・#168。[`VersionLedger::verify_rollback_to`]・[`VersionLedger::verify_rollback_to_previous`]）。
+//!   検証機能であり、復元操作そのもの（配置先への書き込み・現在版の切り替え）ではない。
 //!   PoC-20 ケース 7 は台帳から記録を引くだけでファイルからは再計算していないため、本実装は
-//!   対象版の成果物を閉じ込め検証付きで開き直して sha256 を再計算し、一致したときだけ
-//!   [`RestoredVersion`] を返す（不一致は [`LedgerError::HashMismatch`] で fail-closed）。
+//!   対象版の成果物を閉じ込め検証付きで開いて上限付きでメモリへ読み込み、そのバイト列から
+//!   sha256 を再計算して、一致したときだけ検証に使ったバイト列ごと [`VerifiedVersion`] を返す（不一致は [`LedgerError::HashMismatch`] で fail-closed）。
 //!   配置先への物理コピー・現在版ポインタ・CLI 配線は未実装（台帳は追記のみで可変状態を持たない）
 //! - 台帳はメモリ上のみで、永続化（JSON への保存・読み戻し）は未実装。ガード層への
 //!   `serde` 系の配置が dependency-policy で未承認のため（永続化時は台帳ファイルの改ざん検証も課題）
 //! - [`VersionLedger::record_file`] は `(root, candidate)` を受け取り、[`crate::path::open_confined`]
 //!   で閉じ込め検証と open を一体で行う。返されたハンドルだけからサイズ上限付きでハッシュを
 //!   計算し、パスを開き直さない（`../`・絶対パス・symlink によるルート外参照と、検証後の差し替え
-//!   〔TOCTOU〕を拒否する。REQ-39）。CLI への組み込みは TASK-39.4-2・#159
+//!   〔TOCTOU〕を拒否する。同一 inode の in-place 改変は防げないため、利用側が使う内容は
+//!   検証に使ったバイト列に固定する。REQ-39）。CLI への組み込みは TASK-39.4-2・#159
 //! - ファイルサイズ上限の値は TASK-39.5 が決め、本モジュールは渡された値を強制する
 //! - 追記のみ。同じ `(種別, 版 ID)` の再記録は拒否し、記録済みハッシュの差し替えを防ぐ（完全性）
 //!
 //! 時刻は共通コア・データ契約の型を流用せず本モジュールの [`CreatedAt`] で持つ
 //! （ガード層は共通コアのみに依存する方針のため。REQ-32）。
 
-use crate::path::ConfinedPath;
-use crate::path::{PathRejection, open_confined};
+use crate::path::{ConfinedPath, PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
-use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::Read as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -266,7 +266,7 @@ impl VersionLedger {
         created_at: CreatedAt,
     ) -> Result<&VersionEntry, LedgerError> {
         self.check_room(kind, &id)?;
-        let (digest, _file, _confined) = hash_confined(root, candidate, max_bytes)?;
+        let digest = hash_confined(root, candidate, max_bytes)?;
         self.record(kind, id, digest, created_at)
     }
 
@@ -296,16 +296,16 @@ impl VersionLedger {
 
     /// 指定した版へ戻す。対象版を先に引き（未記録ならファイルを読まず拒否）、`root` 配下の
     /// `candidate` を [`open_confined`] で開いて sha256 を再計算し、台帳の記録と一致したときだけ
-    /// 検証済みの [`RestoredVersion`] を返す。不一致は [`LedgerError::HashMismatch`]。
+    /// 検証済みの [`VerifiedVersion`] を返す。不一致は [`LedgerError::HashMismatch`]。
     /// 台帳は変更しない（REQ-39・TASK-39.3-2・#168）。
-    pub fn rollback_to(
+    pub fn verify_rollback_to(
         &self,
         kind: ArtifactKind,
         target: &VersionId,
         root: &Path,
         candidate: &Path,
         max_bytes: u64,
-    ) -> Result<RestoredVersion, LedgerError> {
+    ) -> Result<VerifiedVersion, LedgerError> {
         let entry = self
             .get(kind, target)
             .ok_or_else(|| LedgerError::VersionNotFound {
@@ -315,28 +315,30 @@ impl VersionLedger {
         Self::verify_restore(entry, root, candidate, max_bytes)
     }
 
-    /// `current` の前版へ戻す。前版の解決後は [`VersionLedger::rollback_to`] と同じ検証を行う。
-    pub fn rollback_to_previous(
+    /// `current` の前版へ戻す。前版の解決後は [`VersionLedger::verify_rollback_to`] と同じ検証を行う。
+    pub fn verify_rollback_to_previous(
         &self,
         kind: ArtifactKind,
         current: &VersionId,
         root: &Path,
         candidate: &Path,
         max_bytes: u64,
-    ) -> Result<RestoredVersion, LedgerError> {
+    ) -> Result<VerifiedVersion, LedgerError> {
         let entry = self.previous_version(kind, current)?;
         Self::verify_restore(entry, root, candidate, max_bytes)
     }
 
-    /// 成果物のハッシュを再計算して `entry` の記録と照合する。返すハンドルは先頭へ戻した
-    /// 検証済みのもので、呼び出し側がパスを開き直す必要はない（TOCTOU 対策）。
+    /// 成果物を上限付きでメモリへ読み込み、そのバイト列から sha256 を再計算して `entry` の記録と
+    /// 照合する。返すのは検証に使ったバイト列そのもの（ファイルハンドルは返さない）ため、
+    /// 検証後にファイルが書き換えられても利用側は検証済みの内容だけを得る。
     fn verify_restore(
         entry: &VersionEntry,
         root: &Path,
         candidate: &Path,
         max_bytes: u64,
-    ) -> Result<RestoredVersion, LedgerError> {
-        let (actual, mut file, confined) = hash_confined(root, candidate, max_bytes)?;
+    ) -> Result<VerifiedVersion, LedgerError> {
+        let (bytes, confined) = read_confined(root, candidate, max_bytes)?;
+        let actual = Sha256Digest::of_bytes(&bytes);
         if actual != entry.sha256 {
             return Err(LedgerError::HashMismatch {
                 kind: entry.kind,
@@ -345,13 +347,11 @@ impl VersionLedger {
                 actual,
             });
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;
-        Ok(RestoredVersion {
+        Ok(VerifiedVersion {
             entry: entry.clone(),
             recomputed: actual,
             path: confined,
-            file,
+            bytes,
         })
     }
 
@@ -381,21 +381,54 @@ impl VersionLedger {
     }
 }
 
-/// `root` 配下の `candidate` を閉じ込め検証付きで開き、上限付きでハッシュを計算する。
-/// ハッシュ計算に渡すのは `try_clone` した 1 本で、元のハンドルは呼び出し側へ返す
-/// （パスを開き直さない。dup のためオフセットは共有され、返す側で先頭へ戻す必要がある）。
+/// `root` 配下の `candidate` を閉じ込め検証付きで開き、同じハンドルから上限付きでハッシュを
+/// 計算する（パスを開き直さない。ハンドルは返さない）。
+/// 防げるのはパスの差し替え（TOCTOU）のみで、同一 inode の in-place 改変は対象外。
 fn hash_confined(
     root: &Path,
     candidate: &Path,
     max_bytes: u64,
-) -> Result<(Sha256Digest, File, ConfinedPath), LedgerError> {
+) -> Result<Sha256Digest, LedgerError> {
     let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
-    let for_hash = file
-        .try_clone()
+    sha256_open_file_bounded(file, confined.as_path(), max_bytes).map_err(LedgerError::Io)
+}
+
+/// `root` 配下の `candidate` を閉じ込め検証付きで開き、上限付きでバイト列を読み込む。
+/// サイズは読み込み前にメタデータで、読み込み中は `take(max_bytes + 1)` で確認する。
+/// 呼び出し側はこのバイト列からハッシュを計算することで、検証対象と利用対象を一致させる。
+fn read_confined(
+    root: &Path,
+    candidate: &Path,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, ConfinedPath), LedgerError> {
+    let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
+    let path = confined.as_path().to_path_buf();
+    let metadata = file
+        .metadata()
         .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;
-    let digest = sha256_open_file_bounded(for_hash, confined.as_path(), max_bytes)
-        .map_err(LedgerError::Io)?;
-    Ok((digest, file, confined))
+    if !metadata.file_type().is_file() {
+        return Err(LedgerError::Io(FsError::NotRegularFile { path }));
+    }
+    if metadata.len() > max_bytes {
+        return Err(LedgerError::Io(FsError::TooLarge {
+            path,
+            size: metadata.len(),
+            limit: max_bytes,
+        }));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > max_bytes {
+        return Err(LedgerError::Io(FsError::TooLarge {
+            path,
+            size: read,
+            limit: max_bytes,
+        }));
+    }
+    Ok((bytes, confined))
 }
 
 fn read_error(path: &ConfinedPath, source: std::io::Error) -> FsError {
@@ -405,20 +438,22 @@ fn read_error(path: &ConfinedPath, source: std::io::Error) -> FsError {
     }
 }
 
-/// ロールバックで復元・検証済みの成果物（REQ-39・TASK-39.3-2・#168）。
+/// ロールバック対象として検証済みの成果物（REQ-39・TASK-39.3-2・#168）。
 ///
-/// 再計算した sha256 が台帳の記録と一致した場合にだけ作られる。ファイルハンドルは検証に使った
-/// ものを先頭へ戻して保持しており、利用側はこれを読めばパスの差し替え（TOCTOU）を受けない。
+/// 再計算した sha256 が台帳の記録と一致した場合にだけ作られる。保持するのは検証に使った
+/// バイト列そのもので、利用側は [`VerifiedVersion::bytes`] を使えば検証後のファイル書き換え
+/// （パス差し替え・in-place 改変の双方）を受けない。配置先への書き込みや現在版の切り替えは
+/// 行わない（未実装）。
 #[derive(Debug)]
-pub struct RestoredVersion {
+pub struct VerifiedVersion {
     entry: VersionEntry,
     recomputed: Sha256Digest,
     path: ConfinedPath,
-    file: File,
+    bytes: Vec<u8>,
 }
 
-impl RestoredVersion {
-    /// 復元した版の台帳記録。
+impl VerifiedVersion {
+    /// 検証した版の台帳記録。
     pub fn entry(&self) -> &VersionEntry {
         &self.entry
     }
@@ -426,13 +461,17 @@ impl RestoredVersion {
     pub fn recomputed_sha256(&self) -> &Sha256Digest {
         &self.recomputed
     }
-    /// 閉じ込め検証済みのパス。
+    /// 閉じ込め検証済みのパス（読み込み元。以後の内容は保証しない）。
     pub fn path(&self) -> &ConfinedPath {
         &self.path
     }
-    /// 検証済みで先頭へ戻したファイルハンドルを取り出す。
-    pub fn into_file(self) -> File {
-        self.file
+    /// 検証に使ったバイト列（sha256 が台帳の記録と一致済み）。
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// 検証済みバイト列を取り出す。
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 

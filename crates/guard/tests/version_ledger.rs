@@ -6,7 +6,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::exitcode::ExitCode;
@@ -212,7 +211,7 @@ fn ledger_v1_v2(sb: &Sandbox) -> VersionLedger {
 
 /// REQ-39・TASK-39.3-2: 前版へ戻すと、復元した成果物のハッシュが元の版のハッシュと一致する。
 #[test]
-fn req39_rollback_to_previous_restores_v1_hash() {
+fn req39_verify_rollback_to_previous_restores_v1_hash() {
     let sb = Sandbox::new("rb-prev");
     let l = ledger_v1_v2(&sb);
     assert_eq!(
@@ -223,7 +222,7 @@ fn req39_rollback_to_previous_restores_v1_hash() {
         TRUNCATED_HEX
     );
     let r = l
-        .rollback_to_previous(
+        .verify_rollback_to_previous(
             ArtifactKind::Model,
             &id("v2"),
             &sb.0,
@@ -234,19 +233,20 @@ fn req39_rollback_to_previous_restores_v1_hash() {
     assert_eq!(r.recomputed_sha256().to_hex(), V1_HEX);
     assert_eq!(r.entry().sha256().to_hex(), V1_HEX);
     assert_eq!(r.entry().id().as_str(), "v1");
-    let mut body = Vec::new();
-    r.into_file().read_to_end(&mut body).unwrap();
-    assert_eq!(body, b"model-v1");
+    assert_eq!(r.bytes(), b"model-v1");
+    // 検証後にファイルを書き換えても、保持したバイト列は検証済みの内容のまま。
+    fs::write(sb.0.join("v1/model.onnx"), b"tampered").unwrap();
+    assert_eq!(r.into_bytes(), b"model-v1");
     assert_eq!(l.len(), 2);
 }
 
 /// REQ-39・TASK-39.3-2: 版を明示したロールバックでも一致する。
 #[test]
-fn req39_rollback_to_explicit_version() {
+fn req39_verify_rollback_to_explicit_version() {
     let sb = Sandbox::new("rb-explicit");
     let l = ledger_v1_v2(&sb);
     let r = l
-        .rollback_to(
+        .verify_rollback_to(
             ArtifactKind::Model,
             &id("v1"),
             &sb.0,
@@ -264,7 +264,7 @@ fn req39_rollback_detects_tampered_artifact() {
     let l = ledger_v1_v2(&sb);
     fs::write(sb.0.join("v1/model.onnx"), b"tampered").unwrap();
     let err = l
-        .rollback_to_previous(
+        .verify_rollback_to_previous(
             ArtifactKind::Model,
             &id("v2"),
             &sb.0,
@@ -309,14 +309,14 @@ fn req39_rollback_without_previous_or_unknown() {
     .unwrap();
     let missing = Path::new("does-not-exist");
     let err = l
-        .rollback_to_previous(ArtifactKind::Model, &id("v1"), &sb.0, missing, 1024)
+        .verify_rollback_to_previous(ArtifactKind::Model, &id("v1"), &sb.0, missing, 1024)
         .unwrap_err();
     assert!(
         matches!(err, LedgerError::NoPreviousVersion { .. }),
         "{err}"
     );
     let err = l
-        .rollback_to(ArtifactKind::Model, &id("v9"), &sb.0, missing, 1024)
+        .verify_rollback_to(ArtifactKind::Model, &id("v9"), &sb.0, missing, 1024)
         .unwrap_err();
     assert!(matches!(err, LedgerError::VersionNotFound { .. }), "{err}");
     assert_eq!(err.exit_code(), ExitCode::InvalidInput);
@@ -352,13 +352,13 @@ fn req39_rollback_rejects_escapes_and_oversize() {
         Path::new("link_file"),
     ] {
         let err = l
-            .rollback_to(ArtifactKind::Model, &id("v1"), &root, cand, 1024)
+            .verify_rollback_to(ArtifactKind::Model, &id("v1"), &root, cand, 1024)
             .unwrap_err();
         assert!(matches!(err, LedgerError::Path(_)), "{cand:?}: {err}");
         assert_eq!(err.exit_code(), ExitCode::InvalidInput);
     }
     let err = l
-        .rollback_to(ArtifactKind::Model, &id("v1"), &root, Path::new("m"), 4)
+        .verify_rollback_to(ArtifactKind::Model, &id("v1"), &root, Path::new("m"), 4)
         .unwrap_err();
     assert!(matches!(err, LedgerError::Io(FsError::TooLarge { .. })));
     assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
