@@ -5,9 +5,12 @@
 //!
 //! # 責務境界
 //!
-//! - 前版へのロールバックと、復元後に再計算したハッシュと台帳記録との一致検証は
-//!   TASK-39.3-2（#168）の範囲。#168 が `(種別, 版 ID)` での取得・記録順の列挙・
-//!   ダイジェストの読み取りだけで書けるよう API を揃えている
+//! - 前版へのロールバックと、復元した成果物のハッシュ再計算・台帳記録との一致検証は
+//!   実装済み（TASK-39.3-2・#168。[`VersionLedger::rollback_to`]・[`VersionLedger::rollback_to_previous`]）。
+//!   PoC-20 ケース 7 は台帳から記録を引くだけでファイルからは再計算していないため、本実装は
+//!   対象版の成果物を閉じ込め検証付きで開き直して sha256 を再計算し、一致したときだけ
+//!   [`RestoredVersion`] を返す（不一致は [`LedgerError::HashMismatch`] で fail-closed）。
+//!   配置先への物理コピー・現在版ポインタ・CLI 配線は未実装（台帳は追記のみで可変状態を持たない）
 //! - 台帳はメモリ上のみで、永続化（JSON への保存・読み戻し）は未実装。ガード層への
 //!   `serde` 系の配置が dependency-policy で未承認のため（永続化時は台帳ファイルの改ざん検証も課題）
 //! - [`VersionLedger::record_file`] は `(root, candidate)` を受け取り、[`crate::path::open_confined`]
@@ -20,11 +23,14 @@
 //! 時刻は共通コア・データ契約の型を流用せず本モジュールの [`CreatedAt`] で持つ
 //! （ガード層は共通コアのみに依存する方針のため。REQ-32）。
 
+use crate::path::ConfinedPath;
 use crate::path::{PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -260,10 +266,93 @@ impl VersionLedger {
         created_at: CreatedAt,
     ) -> Result<&VersionEntry, LedgerError> {
         self.check_room(kind, &id)?;
-        let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
-        let digest = sha256_open_file_bounded(file, confined.as_path(), max_bytes)
-            .map_err(LedgerError::Io)?;
+        let (digest, _file, _confined) = hash_confined(root, candidate, max_bytes)?;
         self.record(kind, id, digest, created_at)
+    }
+
+    /// 同じ種別の中で、記録順に `current` の直前の版を返す（他の種別の版は跨がない）。
+    /// `current` が未記録なら [`LedgerError::VersionNotFound`]、先頭の版なら
+    /// [`LedgerError::NoPreviousVersion`]。
+    pub fn previous_version(
+        &self,
+        kind: ArtifactKind,
+        current: &VersionId,
+    ) -> Result<&VersionEntry, LedgerError> {
+        let mut prev: Option<&VersionEntry> = None;
+        for e in self.versions_of(kind) {
+            if &e.id == current {
+                return prev.ok_or_else(|| LedgerError::NoPreviousVersion {
+                    kind,
+                    id: current.clone(),
+                });
+            }
+            prev = Some(e);
+        }
+        Err(LedgerError::VersionNotFound {
+            kind,
+            id: current.clone(),
+        })
+    }
+
+    /// 指定した版へ戻す。対象版を先に引き（未記録ならファイルを読まず拒否）、`root` 配下の
+    /// `candidate` を [`open_confined`] で開いて sha256 を再計算し、台帳の記録と一致したときだけ
+    /// 検証済みの [`RestoredVersion`] を返す。不一致は [`LedgerError::HashMismatch`]。
+    /// 台帳は変更しない（REQ-39・TASK-39.3-2・#168）。
+    pub fn rollback_to(
+        &self,
+        kind: ArtifactKind,
+        target: &VersionId,
+        root: &Path,
+        candidate: &Path,
+        max_bytes: u64,
+    ) -> Result<RestoredVersion, LedgerError> {
+        let entry = self
+            .get(kind, target)
+            .ok_or_else(|| LedgerError::VersionNotFound {
+                kind,
+                id: target.clone(),
+            })?;
+        Self::verify_restore(entry, root, candidate, max_bytes)
+    }
+
+    /// `current` の前版へ戻す。前版の解決後は [`VersionLedger::rollback_to`] と同じ検証を行う。
+    pub fn rollback_to_previous(
+        &self,
+        kind: ArtifactKind,
+        current: &VersionId,
+        root: &Path,
+        candidate: &Path,
+        max_bytes: u64,
+    ) -> Result<RestoredVersion, LedgerError> {
+        let entry = self.previous_version(kind, current)?;
+        Self::verify_restore(entry, root, candidate, max_bytes)
+    }
+
+    /// 成果物のハッシュを再計算して `entry` の記録と照合する。返すハンドルは先頭へ戻した
+    /// 検証済みのもので、呼び出し側がパスを開き直す必要はない（TOCTOU 対策）。
+    fn verify_restore(
+        entry: &VersionEntry,
+        root: &Path,
+        candidate: &Path,
+        max_bytes: u64,
+    ) -> Result<RestoredVersion, LedgerError> {
+        let (actual, mut file, confined) = hash_confined(root, candidate, max_bytes)?;
+        if actual != entry.sha256 {
+            return Err(LedgerError::HashMismatch {
+                kind: entry.kind,
+                id: entry.id.clone(),
+                expected: entry.sha256,
+                actual,
+            });
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;
+        Ok(RestoredVersion {
+            entry: entry.clone(),
+            recomputed: actual,
+            path: confined,
+            file,
+        })
     }
 
     /// `(種別, 版 ID)` で 1 件を引く。
@@ -289,6 +378,61 @@ impl VersionLedger {
     /// 台帳が空か。
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// `root` 配下の `candidate` を閉じ込め検証付きで開き、上限付きでハッシュを計算する。
+/// ハッシュ計算に渡すのは `try_clone` した 1 本で、元のハンドルは呼び出し側へ返す
+/// （パスを開き直さない。dup のためオフセットは共有され、返す側で先頭へ戻す必要がある）。
+fn hash_confined(
+    root: &Path,
+    candidate: &Path,
+    max_bytes: u64,
+) -> Result<(Sha256Digest, File, ConfinedPath), LedgerError> {
+    let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
+    let for_hash = file
+        .try_clone()
+        .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;
+    let digest = sha256_open_file_bounded(for_hash, confined.as_path(), max_bytes)
+        .map_err(LedgerError::Io)?;
+    Ok((digest, file, confined))
+}
+
+fn read_error(path: &ConfinedPath, source: std::io::Error) -> FsError {
+    FsError::Read {
+        path: path.as_path().to_path_buf(),
+        source,
+    }
+}
+
+/// ロールバックで復元・検証済みの成果物（REQ-39・TASK-39.3-2・#168）。
+///
+/// 再計算した sha256 が台帳の記録と一致した場合にだけ作られる。ファイルハンドルは検証に使った
+/// ものを先頭へ戻して保持しており、利用側はこれを読めばパスの差し替え（TOCTOU）を受けない。
+#[derive(Debug)]
+pub struct RestoredVersion {
+    entry: VersionEntry,
+    recomputed: Sha256Digest,
+    path: ConfinedPath,
+    file: File,
+}
+
+impl RestoredVersion {
+    /// 復元した版の台帳記録。
+    pub fn entry(&self) -> &VersionEntry {
+        &self.entry
+    }
+    /// 成果物から再計算した sha256（台帳の記録と一致済み）。
+    pub fn recomputed_sha256(&self) -> &Sha256Digest {
+        &self.recomputed
+    }
+    /// 閉じ込め検証済みのパス。
+    pub fn path(&self) -> &ConfinedPath {
+        &self.path
+    }
+    /// 検証済みで先頭へ戻したファイルハンドルを取り出す。
+    pub fn into_file(self) -> File {
+        self.file
     }
 }
 
@@ -326,6 +470,31 @@ pub enum LedgerError {
     Io(FsError),
     /// 経路の閉じ込め違反・open の拒否（[`PathRejection`]）。
     Path(PathRejection),
+    /// 復元した成果物の sha256 が台帳の記録と一致しない（TASK-39.3-2・#168）。
+    HashMismatch {
+        /// 対象種別。
+        kind: ArtifactKind,
+        /// 対象の版 ID。
+        id: VersionId,
+        /// 台帳に記録されたハッシュ。
+        expected: Sha256Digest,
+        /// 成果物から再計算したハッシュ。
+        actual: Sha256Digest,
+    },
+    /// 指定した版が台帳に無い。
+    VersionNotFound {
+        /// 対象種別。
+        kind: ArtifactKind,
+        /// 指定された版 ID。
+        id: VersionId,
+    },
+    /// 指定した版が先頭で、戻り先の前版が無い。
+    NoPreviousVersion {
+        /// 対象種別。
+        kind: ArtifactKind,
+        /// 指定された版 ID。
+        id: VersionId,
+    },
 }
 
 impl LedgerError {
@@ -335,7 +504,10 @@ impl LedgerError {
         match self {
             LedgerError::InvalidVersionId { .. }
             | LedgerError::DuplicateVersion { .. }
-            | LedgerError::CreatedAtOutOfRange { .. } => ExitCode::InvalidInput,
+            | LedgerError::CreatedAtOutOfRange { .. }
+            | LedgerError::HashMismatch { .. }
+            | LedgerError::VersionNotFound { .. }
+            | LedgerError::NoPreviousVersion { .. } => ExitCode::InvalidInput,
             LedgerError::CapacityExceeded { .. } => ExitCode::LimitExceeded,
             LedgerError::ClockUnavailable | LedgerError::Internal => ExitCode::RuntimeError,
             LedgerError::Io(FsError::NotRegularFile { .. }) => ExitCode::InvalidInput,
@@ -383,6 +555,28 @@ impl fmt::Display for LedgerError {
             LedgerError::Internal => f.write_str("internal ledger inconsistency"),
             LedgerError::Io(e) => write!(f, "{e}"),
             LedgerError::Path(p) => write!(f, "{p}"),
+            LedgerError::HashMismatch {
+                kind,
+                id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "version {id} of kind {} hash mismatch: recorded sha256={}, actual sha256={}",
+                kind.name(),
+                expected.to_hex(),
+                actual.to_hex()
+            ),
+            LedgerError::VersionNotFound { kind, id } => {
+                write!(f, "version {id} of kind {} is not recorded", kind.name())
+            }
+            LedgerError::NoPreviousVersion { kind, id } => {
+                write!(
+                    f,
+                    "version {id} of kind {} has no previous version",
+                    kind.name()
+                )
+            }
         }
     }
 }
@@ -534,5 +728,67 @@ mod tests {
         ));
         assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
         assert_eq!(l.len(), 10_000);
+    }
+
+    /// REQ-39・TASK-39.3-2: 前版は同じ種別の中で記録順に直前の版で、他の種別を跨がない。
+    #[test]
+    fn req39_previous_version_stays_within_kind() {
+        let mut l = VersionLedger::new();
+        let d = Sha256Digest::of_bytes(b"x");
+        for (k, v) in [
+            (ArtifactKind::Model, "v1"),
+            (ArtifactKind::Data, "v1"),
+            (ArtifactKind::Model, "v2"),
+        ] {
+            l.record(k, id(v), d, at(1)).unwrap();
+        }
+        let prev = l.previous_version(ArtifactKind::Model, &id("v2")).unwrap();
+        assert_eq!(prev.kind(), ArtifactKind::Model);
+        assert_eq!(prev.id().as_str(), "v1");
+    }
+
+    /// REQ-39・TASK-39.3-2: 先頭の版・未記録の版は拒否される。
+    #[test]
+    fn req39_previous_version_errors() {
+        let mut l = VersionLedger::new();
+        let d = Sha256Digest::of_bytes(b"x");
+        l.record(ArtifactKind::Model, id("v1"), d, at(1)).unwrap();
+        let err = l
+            .previous_version(ArtifactKind::Model, &id("v1"))
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::NoPreviousVersion { .. }));
+        assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "version v1 of kind model has no previous version"
+        );
+        let err = l
+            .previous_version(ArtifactKind::Model, &id("v9"))
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::VersionNotFound { .. }));
+        assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(err.to_string(), "version v9 of kind model is not recorded");
+        let err = l
+            .previous_version(ArtifactKind::Data, &id("v1"))
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::VersionNotFound { .. }));
+    }
+
+    /// REQ-39・TASK-39.3-2: ハッシュ不一致の Display は 16 進値のみを出す。
+    #[test]
+    fn req39_hash_mismatch_display_and_exit_code() {
+        let err = LedgerError::HashMismatch {
+            kind: ArtifactKind::Model,
+            id: id("v1"),
+            expected: Sha256Digest::of_bytes(b"model-v1"),
+            actual: Sha256Digest::of_bytes(b"tampered"),
+        };
+        assert_eq!(err.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "version v1 of kind model hash mismatch: recorded sha256={V1_HEX}, actual sha256=d121be3103007b41edf96f8262925f8c7d61894afe9a041843b631f69445bc57"
+            )
+        );
     }
 }
