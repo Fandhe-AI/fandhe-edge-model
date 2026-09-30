@@ -99,14 +99,18 @@ impl Env {
                  exit 0\n\
                  fi\n\
                  if [ \"$stage\" = evaluate ] && [ -n \"${{FAKE_EVAL_SKIPPED:-}}\" ]; then\n\
-                 echo '{{\"code\":\"ok\",\"status\":\"skipped\"}}'\n\
+                 echo '{{\"step\":\"evaluate\",\"status\":\"skipped\"}}'\n\
                  exit 0\n\
                  fi\n\
                  if [ -n \"${{FAKE_STAGE_OUT_SET:-}}\" ]; then\n\
                  printf '%s' \"$FAKE_STAGE_OUT\"\n\
                  exit 0\n\
                  fi\n\
-                 echo '{{\"code\":\"ok\"}}'\n\
+                 if [ \"$stage\" = infer ]; then\n\
+                 echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
+                 exit 0\n\
+                 fi\n\
+                 printf '{{\"step\":\"%s\",\"status\":\"ok\"}}\\n' \"$stage\"\n\
                  exit 0\n",
                 cli_log.display()
             ),
@@ -417,7 +421,7 @@ fn req17_evaluate_skipped_detection_is_structural() {
         &e.base_args(),
         &[(
             "FAKE_EVAL_OUT",
-            "{ \"code\" : \"ok\", \"status\" : \"skipped\" }",
+            "{ \"step\" : \"evaluate\", \"status\" : \"skipped\" }",
         )],
     );
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
@@ -428,7 +432,7 @@ fn req17_evaluate_skipped_detection_is_structural() {
         &e.base_args(),
         &[(
             "FAKE_EVAL_OUT",
-            "{\"code\":\"ok\",\"note\":\"\\\"status\\\":\\\"skipped\\\"\",\"inner\":{\"status\":\"skipped\"}}",
+            "{\"step\":\"evaluate\",\"status\":\"ok\",\"note\":\"\\\"status\\\":\\\"skipped\\\"\",\"inner\":{\"status\":\"skipped\"}}",
         )],
     );
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
@@ -651,10 +655,10 @@ fn req38_real_binary_completes_register_and_inspect_then_stops_at_train() {
     assert_eq!(e.launch_calls().len(), 3);
 }
 
-/// exit 0 の工程結果 JSON が `code` を持たなくても（`step`・`status` 等の契約）受理する。
-/// `code` があるなら "ok" が必要（REQ-33。TASK-33.1-2・#136）。
+/// exit 0 の工程結果 JSON は `code` を持たなくてよいが、`step` が工程名と一致し `status` が "ok"
+/// でなければ 70（REQ-33。TASK-33.1-2・#136）。
 #[test]
-fn req33_zero_exit_stage_json_without_code_is_accepted() {
+fn req33_zero_exit_stage_json_must_match_stage_contract() {
     let e = Env::new();
     let o = e.run(
         &e.base_args(),
@@ -663,7 +667,8 @@ fn req33_zero_exit_stage_json_without_code_is_accepted() {
             ("FAKE_STAGE_OUT_SET", "1"),
         ],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    // 工程名と一致しない step は契約外（REQ-33。register の出力が register でない）
+    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
 }
 
 /// --out-dir が --project-dir と同一・配下・祖先だと 64 で拒否し、CLI を起動せず
@@ -712,6 +717,12 @@ fn req33_zero_exit_with_invalid_stage_output_stops_with_70() {
         "[]",
         "{\"code\":\"judged_fail\"}",
         "{}",
+        // code の無い任意の JSON・工程名の不一致・契約外の status・infer 形の出力は契約外
+        "{\"foo\":1}",
+        "{\"step\":\"inspect\",\"status\":\"ok\"}",
+        "{\"step\":\"register\",\"status\":\"failed\"}",
+        "{\"step\":\"register\",\"status\":\"skipped\"}",
+        "{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}",
     ];
     for out in bad {
         let e = Env::new();

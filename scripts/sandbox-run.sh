@@ -44,8 +44,9 @@
 #     （推論結果・エラーに学習・評価データの本文が含まれうるため。security.md）。
 #     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
 #   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。空でない単一の JSON オブジェクトで
-#     ないか、トップレベルに code があるのに "ok" でなければ、空出力・不正 JSON・code 不整合を含めて
-#     runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。exit 0 の工程結果 JSON
+#     ないか、トップレベルに code があるのに "ok" でなければ、工程ごとの契約（step が工程名と一致し
+#     status が "ok"。evaluate のみ "skipped" も可。infer は step を持たず status:"ok"・id・predicted_label）
+#     に合わなければ、空出力・不正 JSON・code 不整合を含めて runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。exit 0 の工程結果 JSON
 #     （register・inspect・train・evaluate・select・package と infer の判定）は code を持たず
 #     step・status 等のフィールドを持つ契約のため、code の欠如は許容する（cli-infer-noninteractive.sh
 #     と同じ規則。TASK-33.1-2・#136）。evaluate はさらに
@@ -414,12 +415,23 @@ try:
 except Exception:
     print("invalid")
     sys.exit(0)
+name = sys.argv[1]
 if not isinstance(v, dict) or not v or ("code" in v and v.get("code") != "ok"):
     print("invalid")
-elif sys.argv[1] == "evaluate" and v.get("status") == "skipped":
+elif name == "infer":
+    # infer の判定 JSON は step を持たず、status:"ok" と id・predicted_label を持つ
+    if v.get("status") == "ok" and "step" not in v and isinstance(v.get("id"), str) and isinstance(v.get("predicted_label"), str):
+        print("ok")
+    else:
+        print("invalid")
+elif v.get("step") != name:
+    print("invalid")
+elif name == "evaluate" and v.get("status") == "skipped":
     print("skipped")
-else:
+elif v.get("status") == "ok":
     print("ok")
+else:
+    print("invalid")
 ' "$name" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;

@@ -17,8 +17,9 @@
 //!
 //! # 未検証の項目（「検証済み」ではない）
 //!
-//! 外部台帳による sha256 完全性（#168）・`kind_version` の許可リスト（#174）は未検証。ここで
-//! 行う sha256 照合は、パッケージ自身が記す値との一致だけを確認する。
+//! 外部台帳による sha256 完全性（#168）・版管理台帳による前版への復帰（#174）は未検証。ここで
+//! 行う sha256 照合は、パッケージ自身が記す値との一致だけを確認する。`kind_version` は
+//! 許可リスト（[`ALLOWED_KIND_VERSIONS`]）で検証し、未許可の版は `invalid_input` で拒否する（REQ-39）。
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -44,6 +45,20 @@ use crate::project::{DEFINITION_FILE, fs_report, invalid, parse_definition, runt
 
 /// パッケージ内のメタデータのファイル名。
 const ARTIFACT_META_FILE: &str = "artifact.json";
+
+/// 推論を許可する `kind_version` の許可リスト（REQ-39。`kind` ごとに列挙する）。
+///
+/// 学習ワーカーの登録簿（`trainer` の `resolve_kind`）と同じ版だけを許可し、未知の版のパッケージを
+/// 推論へ進めない。版管理台帳による前版への復帰（#174・TASK-39.6）は未実装。
+const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] =
+    &[(ModelKind::C1, &[1]), (ModelKind::C3, &[1])];
+
+/// `kind_version` が許可リストにあるか。
+fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
+    ALLOWED_KIND_VERSIONS
+        .iter()
+        .any(|(k, versions)| *k == kind && versions.contains(&version))
+}
 
 /// `--id` を省略した `--text` の入力 ID。
 const DEFAULT_TEXT_ID: &str = "input";
@@ -156,6 +171,9 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         .filter(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(n))
         .ok_or_else(|| invalid("package max_bytes is out of range"))?;
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
+    if !kind_version_allowed(kind, meta.kind_version()) {
+        return Err(invalid("unsupported kind_version"));
+    }
     let backend =
         OnnxBackend::from_bytes(onnx, kind).map_err(|_| invalid("model file cannot be loaded"))?;
     if backend.n_classes() != definition.options().len() {

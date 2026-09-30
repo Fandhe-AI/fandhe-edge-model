@@ -11,7 +11,7 @@
 //! # 評価契約
 //!
 //! 評価データは取り込み時に凍結記録（sha256・バイト長。[`freeze_eval_data`]）を作り、
-//! プロジェクトへ読み取り専用配置する（[`place_read_only`]。REQ-17・REQ-39）。以後の
+//! プロジェクトへ読み取り専用配置する（[`Project::write_new_read_only`]。保持 fd 起点の書き込みと fchmod。REQ-17・REQ-39）。以後の
 //! `inspect`・`evaluate` は記録とのハッシュ一致を確認し、不一致なら停止する（fail-closed）。
 //!
 //! 取り込みの途中で失敗した場合、本工程が作った `--project-dir` は削除する（半端な状態の
@@ -22,18 +22,17 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::definition::MAX_DEFINITION_FILE_BYTES;
-use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::stage_report::RegisterReport;
 use fandhe_edge_data::eval_freeze::{FreezeRecord, freeze_eval_data};
-use fandhe_edge_data::frozen_placement::place_read_only;
 use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 
 use crate::args::RegisterArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
     DATA_DIR, DEFINITION_FILE, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project,
-    TRAIN_DATA_FILE, fail, fs_report, invalid, parse_definition, runtime,
+    TRAIN_DATA_FILE, fs_report, invalid, parse_definition, runtime,
 };
 
 /// 「対象が存在しない」を表す拒否か（`NotFound` のみ。権限拒否・I/O 失敗は含めない）。
@@ -107,9 +106,9 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
     let eval_path = src_dir.join(EVALUATION_DATA_FILE);
     let evaluation = match std::fs::symlink_metadata(&eval_path) {
         Ok(_) => {
-            let (bytes, real) = read_confined(cwd, &eval_path, MAX_PROJECT_FILE_BYTES)?;
+            let (bytes, _) = read_confined(cwd, &eval_path, MAX_PROJECT_FILE_BYTES)?;
             let record = freeze_eval_data(&bytes).map_err(|e| e.to_error_report())?;
-            Some((real, record))
+            Some((bytes, record))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(_) => return Err(runtime("cannot inspect evaluation data file")),
@@ -134,25 +133,16 @@ fn place_project(
     project: &Project,
     def_bytes: &[u8],
     train_bytes: &[u8],
-    evaluation: Option<&(PathBuf, FreezeRecord)>,
+    evaluation: Option<&(Vec<u8>, FreezeRecord)>,
 ) -> Result<(), ErrorReport> {
     project.write_new(DEFINITION_FILE, def_bytes)?;
-    let data_dir = project.create_dir(DATA_DIR)?;
+    project.create_dir(DATA_DIR)?;
     project.write_new(Path::new(DATA_DIR).join(TRAIN_DATA_FILE), train_bytes)?;
-    if let Some((src, record)) = evaluation {
-        place_read_only(
-            src,
-            &data_dir,
-            EVALUATION_DATA_FILE,
-            record,
-            MAX_PROJECT_FILE_BYTES,
-        )
-        .map_err(|_| {
-            fail(
-                ExitCode::RuntimeError,
-                "cannot place evaluation data read-only",
-            )
-        })?;
+    if let Some((eval_bytes, record)) = evaluation {
+        // 評価データも他のプロジェクトファイルと同じく保持 fd 起点で書き（閉じ込め外へ書かない。
+        // TOCTOU 対策。REQ-39）、開いた fd への fchmod で読み取り専用にする（REQ-17）。
+        // 内容は `freeze_eval_data` で記録を作ったのと同じバイト列。
+        project.write_new_read_only(Path::new(DATA_DIR).join(EVALUATION_DATA_FILE), eval_bytes)?;
         let json = record
             .to_json()
             .map_err(|_| runtime("cannot serialize freeze record"))?;
