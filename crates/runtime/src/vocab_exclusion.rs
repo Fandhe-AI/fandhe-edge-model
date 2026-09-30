@@ -6,8 +6,9 @@
 //! 46,365,993 バイト。証拠種別: 実機）が容量の目安 40MB を超える場合に、「超過」として記録し、
 //! 既定候補（自動選定の対象）から外す。CLI の `select`・既定候補の解決（TASK-19.2）・`package`
 //! 工程（TASK-33.x）が、候補ごとに [`crate::capacity::measure_package`] で得た内訳を
-//! [`screen_vocab_candidates`] へ渡す想定だが、それらへの配線は未接続（現行の既定候補 c1・c3 は
-//! 語彙を ONNX グラフ内に持ち、語彙成分は 0 件のため除外は起きない）。JSON 直列化は CLI 側。
+//! [`screen_vocab_candidates`] へ渡す。CLI の `select` 工程が接続済み（現行の既定候補 c1・c3 は
+//! 語彙を ONNX グラフ内に持ち語彙ファイルが無いため、実際に除外が起きるのは語彙ファイルを持つ
+//! 構成が加わったとき）。`package` 工程・既定候補の解決への接続は未着手。JSON 直列化は CLI 側。
 //!
 //! # 判定規則
 //!
@@ -36,10 +37,12 @@
 //! せず呼び出し側が処理全体を止める（fail-closed。REQ-39）。
 
 use crate::capacity::{CapacityBreakdown, PackageComponent};
+use crate::capacity_limit::REFERENCE_CAPACITY_BYTES;
 use std::fmt;
 
 /// 容量の目安（バイト。10 進の 40MB。PoC-13 の `fits_40mb`・REQ-30）。
-pub const VOCAB_GUIDELINE_BYTES: u64 = 40_000_000;
+/// 値は [`REFERENCE_CAPACITY_BYTES`] に集約済みで、ここでは別名として参照するだけ。
+pub const VOCAB_GUIDELINE_BYTES: u64 = REFERENCE_CAPACITY_BYTES;
 /// 1 回の選別で受け付ける候補数の上限（REQ-39）。
 pub const MAX_VOCAB_SCREENING_CANDIDATES: usize = 64;
 /// 根拠の出典。

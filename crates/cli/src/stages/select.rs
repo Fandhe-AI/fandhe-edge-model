@@ -28,15 +28,21 @@ use std::path::Path;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
+use fandhe_edge_runtime::capacity::{
+    MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
+};
+use fandhe_edge_runtime::vocab_exclusion::screen_vocab_candidates;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
-use fandhe_edge_train::stage_files::{SelectionRecord, validation_accuracy};
+use fandhe_edge_train::stage_files::{ExcludedCandidate, SelectionRecord, validation_accuracy};
 
 use crate::args::SelectArgs;
-use crate::error_report::default_message;
+use crate::error_report::{ToErrorReport, default_message};
 use crate::project::{Project, SELECTION_FILE, fail, invalid, runtime};
 
-use super::train::{load_trained, request_matches_candidate, resolve_candidates, verified_split};
+use super::train::{
+    candidate_rel, load_trained, request_matches_candidate, resolve_candidates, verified_split,
+};
 
 /// `select` を実行する。
 ///
@@ -87,6 +93,7 @@ pub fn compute_selection(
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
 
     let mut evaluated = Vec::new();
+    let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
     let candidate_count = resolve_candidates(project, definition, 0, seed)?.len();
@@ -111,6 +118,12 @@ pub fn compute_selection(
         // 候補 N として採点しない。記録の差し替え対策。REQ-27）。
         if !request_matches_candidate(&request, &candidate.params, &records, &split) {
             return Err(invalid("train request does not match the candidate"));
+        }
+        // 語彙ファイルを持つ構成が容量の目安を超える場合は、選定対象から外して記録する
+        // （REQ-30・TASK-30.3・#125。失敗時は除外せず処理全体を止める）。
+        if let Some(entry) = vocab_exclusion_of(project, index, candidate, success)? {
+            excluded.push(entry);
+            continue;
         }
         let inputs = request
             .validation_inputs()
@@ -157,5 +170,49 @@ pub fn compute_selection(
         rule,
         validation_correct: accuracy.correct,
         validation_total: accuracy.total,
+        excluded_candidates: excluded,
+    }))
+}
+
+/// 学習済みの候補の成果物（ONNX・`artifact.json`）の容量を計測し、語彙超過構成なら除外記録を返す
+/// （REQ-30・TASK-30.3・#125）。判定は runtime の [`screen_vocab_candidates`] に集約し、ここでは
+/// 再実装しない。現行の既定候補（c1・c3）は語彙を ONNX グラフ内に持ち語彙ファイルが無いため、
+/// `has_vocab_file` は `false`（語彙ファイルを持つ構成が加わったら成果物の構成から判定する）。
+/// 計測の失敗は除外にせずエラーで返す（fail-closed。REQ-39）。
+fn vocab_exclusion_of(
+    project: &Project,
+    index: usize,
+    candidate: &fandhe_edge_train::search::SearchCandidate,
+    success: &fandhe_edge_train::result::SuccessOutcome,
+) -> Result<Option<ExcludedCandidate>, ErrorReport> {
+    let candidate_dir = project.open_subdir(candidate_rel(index))?;
+    let artifact_rel = Path::new(success.artifact_dir())
+        .strip_prefix(candidate_dir.dir())
+        .map_err(|_| invalid("artifact directory is outside the candidate directory"))?
+        .to_path_buf();
+    let onnx_file = success.artifact().onnx_file();
+    let mut files = Vec::new();
+    for (component, name) in [
+        (PackageComponent::Weights, onnx_file),
+        (PackageComponent::Metadata, "artifact.json"),
+    ] {
+        if Path::new(name).components().count() != 1 {
+            return Err(invalid("onnx file name is invalid"));
+        }
+        let (file, real) = candidate_dir
+            .open_member(&artifact_rel.join(name))
+            .map_err(|e| e.to_error_report())?;
+        files.push((component, real.into_path_buf(), file));
+    }
+    let breakdown = measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
+        .map_err(|e| crate::output::capacity_error_report(&e))?;
+    let screening = screen_vocab_candidates(&[(index, breakdown, false)])
+        .map_err(|_| runtime("cannot screen candidate capacity"))?;
+    Ok(screening.excluded().first().map(|r| ExcludedCandidate {
+        candidate_index: index,
+        candidate_id: candidate.candidate_id.clone(),
+        reason: r.code().unwrap_or_default().to_string(),
+        total_bytes: r.total_bytes,
+        guideline_bytes: fandhe_edge_runtime::vocab_exclusion::VOCAB_GUIDELINE_BYTES,
     }))
 }
