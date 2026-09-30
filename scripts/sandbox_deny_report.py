@@ -7,8 +7,8 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
 `file-read*` を誤検出するため。
 
 呼び出し元: `scripts/sandbox-monitor.sh`（監視の終了後に起動する）。人が既存の生ログを
-再集計する場合や、TASK-38.2 の陽性対照からも単体で実行できる。製品（CLI・推論経路・配布物）には
-入らない検証用スクリプトで、標準ライブラリだけを使う（依存の追加なし）。
+再集計する場合にも単体で実行できる（その場合は陽性対照の記録が無いため 0 を返さない。下記）。
+製品（CLI・推論経路・配布物）には入らない検証用スクリプトで、標準ライブラリだけを使う（依存の追加なし）。
 `python3 -I` で起動する想定。
 
 入力（すべて引数で明示。環境変数は読まない）:
@@ -16,6 +16,7 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
   --run-meta          `sandbox-run.sh` が書く run.meta.json
   --monitor-started-utc / --monitor-stopped-utc  監視の開始・停止時刻（UTC）
   --warmup-secs / --tail-secs / --log-override / --stream-overflow / --stream-died  監視の条件の記録
+  --positive-control-meta  陽性対照（sandbox 下の curl）の記録 positive_control.meta.json（任意）
 
 出力: stdout に JSON 1 行（REQ-33。固定の文字列と件数だけ。利用者の値は出さない）、
 `--report-out` に詳細レポート。終了コードは 7 種（0・10・11・12・20・64・70。REQ-21）。
@@ -51,8 +52,19 @@ fixture は合成データで、実機の出力そのものではない（証拠
   - 本ツール起因（PID 照合済み）の通信拒否あり -> judged_fail(10)
   - 帰属不明の通信拒否あり -> pending(12。人が確認する)
   - 全プロセスで通信拒否 0 件 -> zero_network_denials。run の終了コードを伝搬する
-陽性対照（検出手段が機能することの確認）は TASK-38.2 の担当で、本スクリプトは実行しない
-（出力に `positive_control:"not_run"` を明示する）。
+
+陽性対照（REQ-38・TASK-38.2・#164。検出手段が機能することの確認）: 監視窓の中で
+`sandbox-monitor.sh` が sandbox 下の curl に意図的な通信をさせる。その PID
+（`--positive-control-meta` の `pid`）の `network*` 拒否は
+`positive_control_network_deny_events` として数え、tool・unattributed の件数と判定からは外す
+（外さないと正常な実行がすべて pending になる）。
+`positive_control` の値: `detected`（1 件以上）・`not_detected`（0 件。検出手段が機能していない
+ため判定不能 70）・`not_evaluated`（記録はあるが判定前に打ち切られた）・`not_run`（記録なし）。
+次のいずれも判定不能 70: curl の終了コードが 0（遮断が効いていない）・陽性対照の PID が
+`process_pids` に含まれる（PID 再利用で帰属が曖昧）・時刻の順序違反
+（監視開始 <= 対照開始 <= 対照終了 <= run 開始 <= run 終了 <= 監視停止）。
+陽性対照なし（`not_run`）の「0 件」は「監視が壊れていて何も拾えていない」場合と区別できず証拠に
+ならないため、終了コード 0 を返さず pending(12) にする。
 """
 
 from __future__ import annotations
@@ -197,10 +209,37 @@ def _check_pending_limits(events: int, keys: int) -> None:
         raise Undeterminable("log stream exceeds the pending event limit")
 
 
-def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset()) -> dict:
+def load_positive_control_meta(path: str) -> dict:
+    """positive_control.meta.json を検証する。契約外の値は判定不能（load_run_meta と同じ流儀）。"""
+    try:
+        meta = json.loads(read_bounded(path, MAX_META_BYTES).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise Undeterminable("positive control record is not valid json") from e
+    if not isinstance(meta, dict):
+        raise Undeterminable("positive control record is not an object")
+    pid = meta.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise Undeterminable("positive control record pid is invalid")
+    rc = meta.get("exit_code")
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        raise Undeterminable("positive control record exit_code is invalid")
+    for key in ("started_utc", "ended_utc"):
+        v = meta.get(key)
+        if not isinstance(v, str) or not UTC_RE.match(v):
+            raise Undeterminable("positive control record timestamp is invalid")
+    return meta
+
+
+def classify(
+    events_raw: Iterable[str],
+    tool_pids: frozenset[int] = frozenset(),
+    control_pid: int | None = None,
+) -> dict:
     """`eventMessage` を 1 件ずつ分類して件数とレコード（上限あり）を返す。
 
     `tool_pids` に含まれる PID だけを tool とし、それ以外は帰属不明にする（名前は根拠にしない）。
+    `control_pid` の拒否は陽性対照（`positive_control`）として別に数え、tool・unattributed・
+    `network_deny_events` には含めない。
 
     発生回数: 元の行は 1 回。`N duplicate reports for` の要約行は、同じ `event_key` の元の行が
     先に数えられていれば N 回だけ加算し（元の 1 回を二重に数えない）、元の行が無ければ
@@ -216,6 +255,7 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
         "network_deny_events": 0,
         "tool_network_deny_events": 0,
         "unattributed_network_deny_events": 0,
+        "positive_control_network_deny_events": 0,
         "ignored_non_deny_events": 0,
     }
     records: list[dict] = []
@@ -265,11 +305,15 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
                 if 0 <= idx < len(records):
                     records[idx]["occurrences"] += dup_n
         occurrences = dup_n if claimed else 1 + dup_n
-        counts["network_deny_events"] += occurrences
+        control = control_pid is not None and int(pid) == control_pid
         tool = int(pid) in tool_pids
-        counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += (
-            occurrences
-        )
+        if control:
+            counts["positive_control_network_deny_events"] += occurrences
+        else:
+            counts["network_deny_events"] += occurrences
+            counts["tool_network_deny_events" if tool else "unattributed_network_deny_events"] += (
+                occurrences
+            )
         if claimed:
             continue
         idx = keep(
@@ -279,7 +323,9 @@ def classify(events_raw: Iterable[str], tool_pids: frozenset[int] = frozenset())
                 "operation": op if OPERATION_RE.match(op) else "network-other",
                 "target_digest": target_digest(salt, target or ""),
                 "occurrences": occurrences,
-                "attribution": "tool" if tool else "unattributed",
+                "attribution": (
+                    "positive_control" if control else "tool" if tool else "unattributed"
+                ),
                 "recognized": True,
             }
         )
@@ -343,10 +389,14 @@ def iter_stream(path: str, stats: dict) -> Iterator[str]:
         raise Undeterminable("log stream output is empty")
 
 
-def decide(run_exit: int, tool_n: int, unattributed_n: int) -> tuple[str, int, str]:
+def decide(
+    run_exit: int, tool_n: int, unattributed_n: int, control_ran: bool = False
+) -> tuple[str, int, str]:
     """最終の (network_verdict, 終了コード, message) を決める（優先順の唯一の定義）。
 
-    判定不能（監視の異常・読めない行・時刻の不整合）は呼び出し元が 70 で先に打ち切る。ここでは
+    判定不能（監視の異常・読めない行・時刻の不整合・陽性対照の不検出）は呼び出し元が 70 で先に
+    打ち切る。`control_ran` は陽性対照が実行され検出済みであること。未実行の「0 件」は証拠に
+    ならないため、run が完走（0）していても 0 を返さず pending(12) にする。ここでは
     優先順 run が 70 > 本ツール起因の拒否 10 > 帰属不明の拒否 12 > run のその他の終了コード。
     run が 70（実行失敗）なら拒否の有無にかかわらず 70 を返す（完走していない実行を、拒否件数の
     判定で 10・12 に上書きしない）。拒否件数と network_verdict は 70 でも常にレポートへ残す。
@@ -361,12 +411,15 @@ def decide(run_exit: int, tool_n: int, unattributed_n: int) -> tuple[str, int, s
         rc = 12
     else:
         verdict = "zero_network_denials"
-        text = (
-            "no network denials were observed"
-            if run_exit == 0
-            else "no network denials were observed but the run did not complete"
-        )
-        rc = run_exit
+        if run_exit != 0:
+            text = "no network denials were observed but the run did not complete"
+            rc = run_exit
+        elif not control_ran:
+            text = "no network denials were observed but the positive control was not run"
+            rc = 12
+        else:
+            text = "no network denials were observed"
+            rc = 0
     if run_exit == 70:
         return verdict, 70, "the sandboxed run failed with runtime_error; " + text
     return verdict, rc, text
@@ -382,6 +435,7 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
         "network_deny_events": 0,
         "tool_network_deny_events": 0,
         "unattributed_network_deny_events": 0,
+        "positive_control_network_deny_events": 0,
         "ignored_non_deny_events": 0,
     }
     counts = dict(counts_zero)
@@ -389,6 +443,8 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
     truncated = False
     run_exit: int | None = None
     hint = "requires_human_review"
+    control_meta = None
+    positive_control = "not_run" if args.positive_control_meta is None else "not_evaluated"
     try:
         meta = load_run_meta(args.run_meta)
         run_exit = reconcile_run_exit(meta["exit_code"], args.run_exit_code)
@@ -400,10 +456,18 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
             raise Undeterminable("log stream output exceeded capacity")
         if args.stream_died:
             raise Undeterminable("log stream ended before the monitoring window closed")
+        tool_pids = frozenset(int(x) for x in meta.get("process_pids", []))
+        if args.positive_control_meta is not None:
+            control_meta = load_positive_control_meta(args.positive_control_meta)
+            if control_meta["exit_code"] == 0:
+                raise Undeterminable("positive control command succeeded; the block is not active")
+            if control_meta["pid"] in tool_pids:
+                raise Undeterminable("positive control pid overlaps with the run processes")
         stats = {"lines": 0}
         result = classify(
             iter_stream(args.stream, stats),
-            frozenset(int(x) for x in meta.get("process_pids", [])),
+            tool_pids,
+            control_meta["pid"] if control_meta else None,
         )
         counts.update(result["counts"])
         counts["stream_lines"] = stats["lines"]
@@ -417,8 +481,23 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
             and meta["ended_utc"] <= args.monitor_stopped_utc
         ):
             raise Undeterminable("run is not covered by the monitoring window")
+        if control_meta is not None:
+            if not (
+                args.monitor_started_utc
+                <= control_meta["started_utc"]
+                <= control_meta["ended_utc"]
+                <= meta["started_utc"]
+            ):
+                raise Undeterminable("positive control is not ordered inside the monitoring window")
+            if counts["positive_control_network_deny_events"] == 0:
+                positive_control = "not_detected"
+                raise Undeterminable("positive control denial was not observed")
+            positive_control = "detected"
         verdict, rc, msg_text = decide(
-            run_exit, counts["tool_network_deny_events"], counts["unattributed_network_deny_events"]
+            run_exit,
+            counts["tool_network_deny_events"],
+            counts["unattributed_network_deny_events"],
+            positive_control == "detected",
         )
     except Undeterminable as e:
         verdict, rc = "undeterminable", 70
@@ -430,7 +509,8 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
         "run_exit_code": run_exit,
         "run_code": CODE_NAMES.get(run_exit) if run_exit is not None else None,
         "counts": counts,
-        "positive_control": "not_run",
+        "positive_control": positive_control,
+        "positive_control_exit_code": control_meta["exit_code"] if control_meta else None,
         "evidence_hint": hint,
         "log_stream_override": bool(args.log_override),
         "report": "network_report.json",
@@ -460,6 +540,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--log-override", action="store_true")
     p.add_argument("--stream-overflow", action="store_true")
     p.add_argument("--stream-died", action="store_true")
+    p.add_argument("--positive-control-meta", default=None)
     p.add_argument("--run-exit-code", type=int, required=True)
     p.add_argument("--report-out", required=True)
     # argparse 既定のエラーは不正な値を stderr へ複写するため、固定の出力に置き換える
