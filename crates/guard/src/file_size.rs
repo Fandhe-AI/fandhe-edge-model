@@ -13,8 +13,9 @@
 //! - 天井 [`MAX_READ_FILE_BYTES`] は [`effective_read_limit`] で `format`・`version_ledger` の
 //!   読み込み口にも適用され、呼び出し側は 1 GiB を超える上限を渡せない
 //! - 確認後にファイルが伸びても頭打ちになるよう、[`SizeCheckedFile`] は生の `File` を返さず、
-//!   実効上限 + 1 バイトで打ち切る `Take<File>`（[`SizeCheckedFile::into_parts`]）または
-//!   上限内読み込み（[`SizeCheckedFile::read_to_end_bounded`]）だけを公開する
+//!   上限内読み込み（[`SizeCheckedFile::read_to_end_bounded`]・
+//!   [`SizeCheckedFile::read_to_end_bounded_with_path`]）だけを公開する。実効上限 + 1 バイトで
+//!   打ち切り、超過は `Result` のエラーで返すため、切り詰めた内容を正常入力として渡せない
 //! - 拒否メッセージにパス・ファイル内容を含めない（size・limit の数値のみ）
 //!
 //! CLI の `infer --input-file` への配線と `ToErrorReport` 写像は #136 の範囲。
@@ -185,16 +186,18 @@ impl SizeCheckedFile {
         self.limit
     }
 
-    /// 実効上限 + 1 バイトで打ち切る読み手・検証済み経路・確認済みサイズに分解する。
-    ///
-    /// 読み手が上限 + 1 バイト返したら、確認後に伸びたことを意味するので呼び出し側は拒否すること。
-    pub fn into_parts(self) -> (std::io::Take<File>, ConfinedPath, u64) {
-        let cap = self.limit.saturating_add(1);
-        (self.file.take(cap), self.path, self.size)
-    }
-
     /// 実効上限を超えない範囲で全体を読む。超えたら `TooLarge`（`size` は観測できた下限値）。
     pub fn read_to_end_bounded(self) -> Result<Vec<u8>, SizeCheckedReadRejection> {
+        self.read_to_end_bounded_with_path().map(|(buf, _)| buf)
+    }
+
+    /// [`Self::read_to_end_bounded`] と同じ読み込みで、検証済み経路も併せて返す。
+    ///
+    /// 実効上限 + 1 バイトで打ち切り、上限を超えたら `Err`（確認後に伸びたファイルの切り詰めを
+    /// 正常入力として返さない。REQ-39）。
+    pub fn read_to_end_bounded_with_path(
+        self,
+    ) -> Result<(Vec<u8>, ConfinedPath), SizeCheckedReadRejection> {
         let limit = self.limit;
         let mut buf = Vec::new();
         self.file
@@ -207,7 +210,7 @@ impl SizeCheckedFile {
                 FileSizeRejection::TooLarge { size: read, limit },
             ));
         }
-        Ok(buf)
+        Ok((buf, self.path))
     }
 }
 
@@ -290,6 +293,8 @@ mod tests {
     }
 
     /// REQ-39・TASK-39.5-3: 確認後に伸びたファイルは上限 + 1 で打ち切られ拒否される。
+    /// 経路の閉じ込め（rustix）は Linux・macOS 限定のため、その他の OS は別テストで期待値を固定する。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn req39_read_is_bounded_after_growth() {
         let root = std::env::temp_dir().join(format!("fe-guard-fsz-grow-{}", std::process::id()));
@@ -306,16 +311,29 @@ mod tests {
             })) => {}
             other => panic!("unexpected {other:?}"),
         }
-        // into_parts の読み手も上限 + 1 で打ち切られる
+        // 経路付きの読み込みも同じく超過を Err で返す
         std::fs::write(&p, [0u8; 8]).unwrap();
         let checked = open_confined_size_checked(&root, Path::new("g.bin"), 10).unwrap();
         std::fs::write(&p, [0u8; 100]).unwrap();
-        let (mut r, _, size) = checked.into_parts();
-        assert_eq!(size, 8);
-        let mut v = Vec::new();
-        r.read_to_end(&mut v).unwrap();
-        assert_eq!(v.len(), 11);
+        match checked.read_to_end_bounded_with_path() {
+            Err(SizeCheckedReadRejection::Size(FileSizeRejection::TooLarge {
+                size: 11,
+                limit: 10,
+            })) => {}
+            other => panic!("unexpected {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REQ-39・TASK-39.5-3: 閉じ込め未対応 OS では open が `UnsupportedPlatform` で拒否される（fail-closed）。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn req39_open_is_unsupported_on_other_platforms() {
+        let root = std::env::temp_dir();
+        match open_confined_size_checked(&root, Path::new("g.bin"), 10) {
+            Err(SizeCheckedOpenRejection::Path(PathRejection::UnsupportedPlatform)) => {}
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// REQ-39・TASK-39.5-3: 天井の丸め。
