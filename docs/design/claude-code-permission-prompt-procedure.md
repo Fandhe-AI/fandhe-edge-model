@@ -12,7 +12,7 @@ spec の内容は要約であり、詳細は spec の REQ-36・TASK-36.3 を参�
 ## 2. 前提
 
 - 検証環境は Mac（Apple Silicon）。Claude Code がインストール済みで、版を第 6 節の記録に書けること。
-- Claude Code を起動するディレクトリ（cwd）は本リポジトリのルート、またはその配下の作業用ディレクトリ。`--package` は **cwd 配下の相対パス**で渡す（`infer` は cwd を workspace として経路を閉じ込める。TASK-39.4-2・#159）。
+- Claude Code を起動するディレクトリ（cwd）は本リポジトリのルートに限る。準備手順の `fixtures/onnx_parity/c1.onnx` と実行例の `scripts/cli-infer-noninteractive.sh` はリポジトリルートからの相対パスであり、配下の作業用ディレクトリを cwd にするとファイルが見つからない。`--package` は **cwd 配下の相対パス**で渡す（`infer` は cwd を workspace として経路を閉じ込める。TASK-39.4-2・#159）。
 - 確認は通信を発生させない（REQ-38）。ONNX はリポジトリ同梱の fixture を使い、外部から取得しない。
 
 ## 3. 準備（権限モードを切り替える前に、人がターミナルで実行）
