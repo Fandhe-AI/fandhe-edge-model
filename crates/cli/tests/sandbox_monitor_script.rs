@@ -6,8 +6,9 @@
 //! `log stream` も使っていない**。macOS 実機での sandbox 下の完走確認と拒否ログの記録は人の
 //! 担当で、本テストはその証拠にならない（手順は `AGENTS.md`「実機前提テスト」）。ここで検証するのは
 //! 監視の制御（開始・停止・fail-closed）と集計器の判定規則・出力契約。
-//! 陽性対照（検出手段が機能することの確認）は TASK-38.2 の担当で、ここでは行わない
-//! （出力の `positive_control` が `not_run` であることだけを固定する）。
+//! 陽性対照（TASK-38.2・#164。検出手段が機能することの確認）は偽の curl と、PoC-16 実測の形
+//! （`Sandbox: curl(<pid>) deny(1) network-outbound /private/var/run/mDNSResponder`）を模した
+//! 偽の log の行で検査する。実機の curl・実際の遮断は使っていない（証拠種別: テストハーネス）。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
 #![cfg(unix)]
@@ -41,6 +42,7 @@ struct Out {
 struct Env {
     dir: PathBuf,
     launcher: PathBuf,
+    curl: PathBuf,
     cli: PathBuf,
     log: PathBuf,
     cli_log: PathBuf,
@@ -73,6 +75,7 @@ impl Env {
         fs::create_dir_all(&dir).expect("mkdir");
         let launcher = dir.join("fake-sandbox-exec");
         let cli = dir.join("fake-cli");
+        let curl = dir.join("fake-curl");
         let log = dir.join("fake-log");
         let cli_log = dir.join("cli.log");
         write_exe(
@@ -84,6 +87,17 @@ impl Env {
                  shift 2\n\
                  FAKE_SANDBOXED=1 exec \"$@\"\n"
             ),
+        );
+        // 偽の curl: 受け取る引数が監視スクリプトの定数の並びと完全一致しなければ 99。
+        // 自分の PID を記録し（偽の log が拒否行を出す根拠）、FAKE_CURL_RC（既定 6。PoC-16 の
+        // 実測値）で終わる
+        write_exe(
+            &curl,
+            "#!/bin/sh\n\
+             [ \"${FAKE_SANDBOXED:-}\" = 1 ] || exit 99\n\
+             [ \"$*\" = \"-q --noproxy * --silent --output /dev/null --max-time 3 --connect-timeout 2 https://example.com\" ] || exit 99\n\
+             echo $$ > \"$FAKE_PC_PID_FILE\"\n\
+             exit \"${FAKE_CURL_RC:-6}\"\n",
         );
         write_exe(
             &cli,
@@ -116,6 +130,11 @@ impl Env {
                  [ \"${{FAKE_LOG_MODE:-}}\" != flood_err ] || head -c 300000 /dev/zero >&2\n\
                  cat \"$FAKE_STREAM_FIXTURE\"\n\
                  [ \"${{FAKE_LOG_MODE:-}}\" = early ] && exit 0\n\
+                 if [ \"${{FAKE_LOG_MODE:-}}\" != pc_missing ]; then\n\
+                 n=0\n\
+                 while [ ! -s \"$FAKE_PC_PID_FILE\" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n\
+                 [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\",\"timestamp\":\"%s\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\" \"$(date '+%Y-%m-%d %H:%M:%S.000000%z')\"\n\
+                 fi\n\
                  if [ \"${{FAKE_LOG_MODE:-}}\" = die_mid_run ]; then\n\
                  until [ -s \"$FAKE_CLI_LOG\" ]; do sleep 0.05; done\n\
                  exit 0\n\
@@ -131,6 +150,7 @@ impl Env {
         Env {
             dir,
             launcher,
+            curl,
             cli,
             log,
             cli_log,
@@ -175,6 +195,8 @@ impl Env {
             .env_remove("FANDHE_EDGE_LOG_CMD")
             .env("FANDHE_EDGE_SANDBOX_EXEC", &self.launcher)
             .env("FANDHE_EDGE_BIN", &self.cli)
+            .env("FANDHE_EDGE_CURL_CMD", &self.curl)
+            .env("FAKE_PC_PID_FILE", self.dir.join("pc.pid"))
             .env("FANDHE_EDGE_LOG_STREAM_WARMUP_SECS", "0")
             .env("FANDHE_EDGE_LOG_STREAM_TAIL_SECS", "0")
             .env("FAKE_STREAM_FIXTURE", fixture(fixture_name))
@@ -268,9 +290,9 @@ fn req38_clean_stream_reports_zero_network_denials() {
     single_line(&o);
     has(&o, "\"network_verdict\": \"zero_network_denials\"");
     has(&o, "\"run_exit_code\": 0");
-    has(&o, "\"stream_lines\": 5");
-    has(&o, "\"parsed_events\": 4");
-    has(&o, "\"deny_events\": 4");
+    has(&o, "\"stream_lines\": 6");
+    has(&o, "\"parsed_events\": 5");
+    has(&o, "\"deny_events\": 5");
     has(&o, "\"duplicate_reports\": 2");
     has(&o, "\"network_deny_events\": 0");
     has(&o, "\"tool_network_deny_events\": 0");
@@ -461,7 +483,7 @@ fn req38_non_deny_line_is_ignored_and_counted() {
     )
     .expect("write");
     let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
-    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
     has(&o, "\"ignored_non_deny_events\": 1");
     has(&o, "\"deny_events\": 0");
     let blank = e.dir.join("blank.ndjson");
@@ -528,14 +550,14 @@ fn req38_run_failure_propagates_with_zero_denials() {
     assert_eq!(e.cli_calls(), vec!["register".to_string()]);
 }
 
-/// 上書きは test_harness として記録し、陽性対照は未実施と明示する。
+/// 上書きは test_harness として記録し、陽性対照は検出済みと明示する。
 #[test]
 fn req38_overrides_are_recorded_as_test_harness() {
     let e = Env::new();
     let o = e.run("clean.ndjson", &e.base_args(), &[]);
     has(&o, "\"evidence_hint\": \"test_harness\"");
     has(&o, "\"log_stream_override\": true");
-    has(&o, "\"positive_control\": \"not_run\"");
+    has(&o, "\"positive_control\": \"detected\"");
     assert!(!o.stdout.contains("実機"));
 }
 
@@ -765,7 +787,7 @@ fn req38_report_time_window_must_cover_run() {
     let early_stop = run_report(&e.dir, &clean, Some(&meta(0, T1, T3)), T0, T2);
     assert_eq!(early_stop.code, Some(70), "{}", early_stop.stdout);
     let ok = run_report(&e.dir, &clean, Some(&meta(0, T1, T2)), T0, T3);
-    assert_eq!(ok.code, Some(0), "{}", ok.stdout);
+    assert_eq!(ok.code, Some(12), "{}", ok.stdout);
 }
 
 /// PID が `process_pids` に無ければ、名前が許可リストでも帰属不明（pending）。
@@ -852,7 +874,7 @@ fn req38_report_run_exit_code_mismatch_is_undeterminable() {
         T3,
         "0",
     );
-    assert_eq!(ok.code, Some(0), "{}", ok.stdout);
+    assert_eq!(ok.code, Some(12), "{}", ok.stdout);
 }
 
 /// 帰属の第一の根拠は PID（`process_pids`）で、プロセス名は根拠にしない。`python3.11`・
@@ -911,7 +933,7 @@ fn req38_final_exit_code_priority_table() {
     let unattr = fixture("unattributed.ndjson");
     for run in [0, 10, 20, 64, 70] {
         for (label, stream, pids, tool_n, unattr_n, base) in [
-            ("none", &none, "[1]", 0, 0, run),
+            ("none", &none, "[1]", 0, 0, if run == 0 { 12 } else { run }),
             ("tool", &tool, "[5001]", 1, 0, 10),
             ("unattributed", &unattr, "[1]", 0, 1, 12),
         ] {
@@ -1118,4 +1140,425 @@ fn req39_pending_key_limit_is_undeterminable() {
     let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
     assert_eq!(o.code, Some(70), "{}", o.stdout);
     has(&o, "log stream exceeds the pending event limit");
+}
+// ---- 陽性対照（REQ-38・TASK-38.2・#164。証拠種別: テストハーネス） ----
+
+const MDNS_DENY: &str =
+    "Sandbox: curl(4242) deny(1) network-outbound /private/var/run/mDNSResponder";
+const LOOPBACK_DENY: &str = "Sandbox: curl(4242) deny(1) network-outbound 127.0.0.1:9";
+
+/// ヘッダ行 + 指定した `eventMessage` の行からなる合成ストリームを書く。
+fn write_stream(dir: &Path, messages: &[&str]) -> PathBuf {
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let path = dir.join("pc_stream.ndjson");
+    let mut body = format!("{header}\n");
+    for m in messages {
+        body.push_str(&format!(
+            "{{\"eventMessage\":\"{m}\",\"timestamp\":\"2026-01-01 09:00:00.500000+0900\"}}\n"
+        ));
+    }
+    fs::write(&path, body).expect("write");
+    path
+}
+
+fn control_meta(pid: &str, rc: &str, started: &str, ended: &str) -> String {
+    format!(
+        "{{\"pid\":{pid},\"exit_code\":{rc},\"started_utc\":\"{started}\",\"ended_utc\":\"{ended}\",\
+         \"curl_override\":true,\"sandbox_exec_override\":true}}"
+    )
+}
+
+fn control_meta_flags(curl: &str, launcher: &str) -> String {
+    format!(
+        "{{\"pid\":4242,\"exit_code\":6,\"started_utc\":\"{T0}\",\"ended_utc\":\"{T0}\",\
+         \"curl_override\":{curl},\"sandbox_exec_override\":{launcher}}}"
+    )
+}
+
+/// 陽性対照の記録つきで集計器を直接実行する（実行の記録は T1〜T2、監視窓は T0〜T3）。
+fn run_report_control(dir: &Path, stream: &Path, run_meta: &str, control: &str) -> Out {
+    let control_path = dir.join("positive_control.meta.json");
+    fs::write(&control_path, control).expect("control meta");
+    run_report_extra(
+        dir,
+        stream,
+        Some(run_meta),
+        &[
+            "--positive-control-meta",
+            control_path.to_str().expect("utf8"),
+        ],
+    )
+}
+
+/// 陽性対照の拒否が監視で記録されなければ、本実行（sandbox-run.sh）を起動せず 70 で止める
+/// （REQ-38・TASK-38.2。陽性対照を本実行のゲートにする。検出手段が機能しない状態で
+/// 「0 件」を装わない）。
+#[test]
+fn req38_positive_control_not_detected_stops_before_run() {
+    let e = Env::new();
+    let o = e.run(
+        "clean.ndjson",
+        &e.base_args(),
+        &[("FAKE_LOG_MODE", "pc_missing")],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "positive control denial was not observed");
+    has(&o, "sandbox run was not started");
+    assert!(e.cli_calls().is_empty());
+}
+
+/// curl の終了コードが 0（通信が成功した＝遮断が効いていない）なら、本実行を起動せず 70
+/// （REQ-38・TASK-38.2。ゲート）。
+#[test]
+fn req38_positive_control_curl_success_stops_before_run() {
+    let e = Env::new();
+    let o = e.run("clean.ndjson", &e.base_args(), &[("FAKE_CURL_RC", "0")]);
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "positive control command succeeded");
+    has(&o, "sandbox run was not started");
+    assert!(e.cli_calls().is_empty());
+}
+
+/// PoC-16 実測の形の拒否行が陽性対照として検出され、tool・unattributed の件数に混ざらない。
+#[test]
+fn req38_positive_control_detected_with_poc16_deny_line() {
+    let e = Env::new();
+    let o = e.run("clean.ndjson", &e.base_args(), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"positive_control\": \"detected\"");
+    has(&o, "\"positive_control_network_deny_events\": 1");
+    has(&o, "\"tool_network_deny_events\": 0");
+    has(&o, "\"unattributed_network_deny_events\": 0");
+    has(&o, "\"network_deny_events\": 0");
+    has(&o, "\"positive_control_exit_code\": 6");
+    // 陽性対照の対象文字列は生のまま残さない（P0）
+    let report = fs::read_to_string(e.out().join("network_report.json")).expect("report");
+    assert!(!report.contains("mDNSResponder"), "{report}");
+    assert!(
+        report.contains("\"attribution\": \"positive_control\""),
+        "{report}"
+    );
+}
+
+/// 陽性対照は sandbox-run.sh より前に、同じ launcher・プロファイルで実行される。
+#[test]
+fn req38_positive_control_runs_before_sandbox_run() {
+    let e = Env::new();
+    let o = e.run("clean.ndjson", &e.base_args(), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    assert_eq!(e.cli_calls().len(), 7);
+    // 偽の launcher はプロファイルが違えば 99 を返し、偽の curl は launcher 経由でなければ 99 を
+    // 返す。PID が記録されていれば、定数のプロファイルと引数で実行された
+    assert!(e.dir.join("pc.pid").is_file());
+    let pc = fs::read_to_string(e.out().join("positive_control.meta.json")).expect("pc meta");
+    let run = fs::read_to_string(e.out().join("run").join("run.meta.json")).expect("run meta");
+    let field = |s: &str, key: &str| -> String {
+        s.split(&format!("\"{key}\":\""))
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let control_ended = field(&pc, "ended_utc");
+    let run_started = field(&run, "started_utc");
+    assert!(
+        !control_ended.is_empty() && !run_started.is_empty(),
+        "{pc} {run}"
+    );
+    assert!(
+        control_ended <= run_started,
+        "{control_ended} > {run_started}"
+    );
+    let mode = fs::metadata(e.out().join("positive_control.meta.json"))
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+/// curl が無い・実行できないときは sandbox-run.sh を起動せず 70（fail-closed）。
+#[test]
+fn req38_missing_curl_does_not_start_run() {
+    let e = Env::new();
+    let o = e.run(
+        "clean.ndjson",
+        &e.base_args(),
+        &[("FANDHE_EDGE_CURL_CMD", "/nonexistent/fake-curl")],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "curl not found or not executable");
+    assert!(e.cli_calls().is_empty());
+}
+
+/// 集計器: 陽性対照の PID の拒否は、PoC-16 の mDNSResponder の形・ループバックの形のどちらでも
+/// `positive_control` に分類される。
+#[test]
+fn req38_report_classifies_control_pid_denials_as_positive_control() {
+    let e = Env::new();
+    for deny in [MDNS_DENY, LOOPBACK_DENY] {
+        let stream = write_stream(&e.dir, &[deny]);
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta_with_pids(0, T1, T2, "[5001]"),
+            &control_meta("4242", "6", T0, T0),
+        );
+        assert_eq!(o.code, Some(0), "{}", o.stdout);
+        has(&o, "\"positive_control\": \"detected\"");
+        has(&o, "\"positive_control_network_deny_events\": 1");
+        has(&o, "\"unattributed_network_deny_events\": 0");
+    }
+    // 陽性対照の PID 以外の拒否は従来どおり帰属不明で pending
+    let stream = write_stream(
+        &e.dir,
+        &[
+            MDNS_DENY,
+            "Sandbox: zz(9) deny(1) network-outbound 10.0.0.1:1",
+        ],
+    );
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"positive_control_network_deny_events\": 1");
+    has(&o, "\"unattributed_network_deny_events\": 1");
+}
+
+/// 陽性対照の PID が `process_pids` に含まれる（PID 再利用で帰属が曖昧）なら判定不能 70。
+#[test]
+fn req38_report_control_pid_overlapping_run_pids_is_undeterminable() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[4242]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "positive control pid overlaps with the run processes");
+}
+
+/// 時刻の順序（監視開始 <= 対照開始 <= 対照終了 <= run 開始）が崩れていたら判定不能 70。
+#[test]
+fn req38_report_control_time_order_violation_is_undeterminable() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for (cs, ce) in [(T1, T0), (T2, T2), (T0, T2)] {
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta(0, T1, T2),
+            &control_meta("4242", "6", cs, ce),
+        );
+        assert_eq!(o.code, Some(70), "{cs} {ce}: {}", o.stdout);
+        has(
+            &o,
+            "positive control is not ordered inside the monitoring window",
+        );
+    }
+}
+
+/// 陽性対照の記録の型・値が契約外なら判定不能 70。
+#[test]
+fn req38_report_invalid_control_meta_is_undeterminable() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for bad in [
+        control_meta("\"4242\"", "6", T0, T0),
+        control_meta("0", "6", T0, T0),
+        control_meta("true", "6", T0, T0),
+        control_meta("4242", "\"6\"", T0, T0),
+        control_meta("4242", "6", "yesterday", T0),
+        "[]".to_string(),
+        "not json".to_string(),
+    ] {
+        let o = run_report_control(&e.dir, &stream, &meta(0, T1, T2), &bad);
+        assert_eq!(o.code, Some(70), "{bad}: {}", o.stdout);
+        has(&o, "\"network_verdict\": \"undeterminable\"");
+        has(&o, "\"positive_control\": \"not_evaluated\"");
+    }
+}
+
+/// 陽性対照の記録が無い単体の再集計では、0 件でも終了コード 0 を返さず pending(12)。
+#[test]
+fn req38_report_without_positive_control_never_returns_ok() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("clean.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"positive_control\": \"not_run\"");
+    has(
+        &o,
+        "no network denials were observed but the positive control was not run",
+    );
+}
+
+/// curl・launcher のどちらかを差し替えた陽性対照は、本物の launcher・log でも test_harness（REQ-38）。
+/// 差し替えなし（false / false）のときだけ requires_human_review。
+#[test]
+fn req38_control_override_flags_set_test_harness_hint() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for (curl, launcher, hint) in [
+        ("true", "false", "test_harness"),
+        ("false", "true", "test_harness"),
+        ("true", "true", "test_harness"),
+        ("false", "false", "requires_human_review"),
+    ] {
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta_with_pids(0, T1, T2, "[5001]"),
+            &control_meta_flags(curl, launcher),
+        );
+        assert_eq!(o.code, Some(0), "{curl}/{launcher}: {}", o.stdout);
+        has(&o, &format!("\"evidence_hint\": \"{hint}\""));
+    }
+}
+
+/// 上書きフラグが bool でない・欠落している記録は判定不能 70。
+#[test]
+fn req38_control_override_flags_must_be_bool() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for bad in [
+        control_meta_flags("\"true\"", "false"),
+        control_meta_flags("false", "1"),
+        format!("{{\"pid\":4242,\"exit_code\":6,\"started_utc\":\"{T0}\",\"ended_utc\":\"{T0}\"}}"),
+    ] {
+        let o = run_report_control(&e.dir, &stream, &meta(0, T1, T2), &bad);
+        assert_eq!(o.code, Some(70), "{bad}: {}", o.stdout);
+        has(&o, "\"positive_control\": \"not_evaluated\"");
+    }
+}
+/// 陽性対照と同じ PID でも、イベント時刻が対照の実行区間の外なら陽性対照にしない
+/// （PID 再利用で別プロセスの拒否が tool・unattributed から消えない。REQ-38・TASK-38.2・#164）。
+#[test]
+fn req38_report_control_pid_outside_control_window_is_not_positive_control() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let line = |ts: &str| format!("{{\"eventMessage\":\"{MDNS_DENY}\",\"timestamp\":\"{ts}\"}}\n");
+    // 対照の区間は T0（= 2026-01-01 09:00:00+0900）。区間内 1 件と、5 分後の同じ PID 1 件
+    let body = format!(
+        "{header}\n{}{}",
+        line("2026-01-01 09:00:00.500000+0900"),
+        line("2026-01-01 09:05:00.000000+0900"),
+    );
+    let stream = e.dir.join("pc_ts_stream.ndjson");
+    fs::write(&stream, body).expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"positive_control\": \"detected\"");
+    has(&o, "\"positive_control_network_deny_events\": 1");
+    has(&o, "\"unattributed_network_deny_events\": 1");
+}
+
+/// 陽性対照の記録があり、同じ PID の拒否行に timestamp が無ければ判定不能 70
+/// （PID 再利用を時刻で区別できないため。REQ-38・TASK-38.2・#164）。
+#[test]
+fn req38_report_control_pid_line_without_timestamp_is_undeterminable() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let stream = e.dir.join("pc_no_ts_stream.ndjson");
+    fs::write(
+        &stream,
+        format!("{header}\n{{\"eventMessage\":\"{MDNS_DENY}\"}}\n"),
+    )
+    .expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "positive control candidate deny line has no timestamp");
+}
+
+/// 照合済みの要約行は、自身の時刻が区間外でも元イベントの帰属（陽性対照）で数える。
+#[test]
+fn req38_report_duplicate_summary_inherits_original_attribution() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let line =
+        |msg: &str, ts: &str| format!("{{\"eventMessage\":\"{msg}\",\"timestamp\":\"{ts}\"}}\n");
+    let dup = format!("2 duplicate reports for {MDNS_DENY}");
+    let body = format!(
+        "{header}\n{}{}",
+        line(MDNS_DENY, "2026-01-01 09:00:00.500000+0900"),
+        line(&dup, "2026-01-01 09:05:00.000000+0900"),
+    );
+    let stream = e.dir.join("pc_dup_stream.ndjson");
+    fs::write(&stream, body).expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"positive_control_network_deny_events\": 3");
+    has(&o, "\"unattributed_network_deny_events\": 0");
+}
+
+/// timestamp が文字列でない・形式外のイベントは判定不能 70（fail-closed）。
+#[test]
+fn req38_report_invalid_event_timestamp_is_undeterminable() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    for ts in ["\"yesterday\"", "12345"] {
+        let body = format!("{header}\n{{\"eventMessage\":\"{MDNS_DENY}\",\"timestamp\":{ts}}}\n");
+        let stream = e.dir.join("pc_bad_ts.ndjson");
+        fs::write(&stream, body).expect("write");
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta_with_pids(0, T1, T2, "[5001]"),
+            &control_meta("4242", "6", T0, T0),
+        );
+        assert_eq!(o.code, Some(70), "{ts}: {}", o.stdout);
+        has(&o, "log stream event timestamp is invalid");
+    }
+}
+
+/// curl・launcher の上書きは、stream-overflow で早期に打ち切られる経路でも
+/// `evidence_hint` を test_harness にする（契約: curl override はすべて test_harness）。
+#[test]
+fn req38_control_override_hint_survives_early_abort() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    let control_path = e.dir.join("positive_control.meta.json");
+    fs::write(&control_path, control_meta_flags("true", "false")).expect("control meta");
+    let o = run_report_extra(
+        &e.dir,
+        &stream,
+        Some(&meta_with_pids(0, T1, T2, "[5001]")),
+        &[
+            "--positive-control-meta",
+            control_path.to_str().expect("utf8"),
+            "--stream-overflow",
+        ],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "\"evidence_hint\": \"test_harness\"");
 }

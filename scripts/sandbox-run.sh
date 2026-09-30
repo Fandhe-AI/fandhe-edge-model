@@ -21,7 +21,8 @@
 #   - 各工程を `<launcher> -p '(version 1)(allow default)(deny network*)' <bin> <工程> ...`
 #     で起動する。遮断プロファイルは定数で、弱める経路（オプション・環境変数）を設けない。
 #     train が起動する学習ワーカー（Python）の子プロセスも sandbox を継承する前提で、
-#     根拠は PoC-16 の実測（子プロセスを含めて拒否 0 件・陽性対照で検出を確認）
+#     根拠は PoC-16 の実測（子プロセスを含めて拒否 0 件・陽性対照で検出を確認）。陽性対照は
+#     sandbox-monitor.sh が監視窓の中で実行する（TASK-38.2・#164。本スクリプトは実行しない）
 #   - launcher は絶対パス /usr/bin/sandbox-exec（PATH で探さない）。テスト専用の上書きは
 #     環境変数 FANDHE_EDGE_SANDBOX_EXEC で、上書き時は stdout と run.meta.json に
 #     sandbox_exec_override:true・evidence_hint:"test_harness" を記録する

@@ -14,6 +14,12 @@ pub const INFER_TIME_LIMIT: Duration = Duration::from_secs(10);
 /// [`INFER_TIME_LIMIT`] の ns 表現（`INFER_TIME_LIMIT` から導出。別の値を持たない）。
 pub const INFER_TIME_LIMIT_NS: u64 = INFER_TIME_LIMIT.as_secs() * 1_000_000_000;
 
+/// 推論プロセスの RSS（常駐メモリ）の暫定上限（2 GiB。REQ-39・PoC-20 の `INFER_MAX_RSS_BYTES`・C-16）。
+///
+/// 推論経路向けの値で、学習ワーカーには適用しない。ガード層が RSS ポーリングで強制する（模擬。
+/// 確実な上限機構への置き換えは別課題。TASK-39.5-2・#171）。
+pub const INFER_RSS_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// 呼び出し側が指定できる時間上限の最大値（暫定 1 時間。REQ-39）。
 pub const MAX_TIME_LIMIT: Duration = Duration::from_secs(3600);
 /// [`MAX_TIME_LIMIT`] の ns 表現（`MAX_TIME_LIMIT` から導出）。
@@ -45,6 +51,7 @@ mod tests {
     fn req39_limits_have_expected_values() {
         assert_eq!(INFER_TIME_LIMIT, Duration::from_secs(10));
         assert_eq!(INFER_TIME_LIMIT_NS, 10_000_000_000);
+        assert_eq!(INFER_RSS_LIMIT_BYTES, 2_147_483_648);
         assert_eq!(MAX_TIME_LIMIT, Duration::from_secs(3600));
         assert_eq!(MAX_TIME_LIMIT_NS, 3_600_000_000_000);
         assert_eq!(MAX_OUTPUT_BYTES, 268_435_456);

@@ -19,3 +19,4 @@
   （生文字列非保存の回帰。すべて架空の値）
 - `unrecognized_no_network`: `network` を含まない形式外の拒否行（判定不能になることの回帰。合成データ）
 - `tool_bigpid`: 7 桁の PID を持つ本ツール起因の拒否行（偽の `pgrep` が同じ PID を返すテストで使う。合成データ）
+- 陽性対照の拒否行（PoC-16 実測の形 `Sandbox: curl(<pid>) deny(1) network-outbound /private/var/run/mDNSResponder` を模した合成データ。TASK-38.2・#164）は、テストが偽の `log` から出す行と `crates/cli/tests/sandbox_monitor_script.rs` 内の合成ストリームで持ち、ファイルとしては追加していない

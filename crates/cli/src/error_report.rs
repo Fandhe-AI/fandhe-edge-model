@@ -197,6 +197,7 @@ impl ToErrorReport for ResourceLimitExceeded {
         let code = self.exit_code();
         match self.kind() {
             ResourceKind::Time => ErrorReport::new(code, "inference time limit exceeded"),
+            ResourceKind::Memory => ErrorReport::new(code, "inference memory limit exceeded"),
             _ => ErrorReport::new(code, default_message(code)),
         }
     }
@@ -589,6 +590,31 @@ mod tests {
         let report = rec.to_error_report();
         assert_eq!(report.code, ExitCode::LimitExceeded);
         assert_eq!(report.message, "inference time limit exceeded");
+        let mem = ResourceLimitExceeded::memory(
+            INFER_TIME_LIMIT,
+            2_147_483_648,
+            2_190_000_000,
+            Duration::from_secs(1),
+            true,
+        );
+        assert_eq!(
+            mem.to_error_report(),
+            ErrorReport::new(ExitCode::LimitExceeded, "inference memory limit exceeded")
+        );
+        assert_eq!(
+            GuardRunError::MemoryProbe.to_error_report(),
+            ErrorReport::new(
+                ExitCode::RuntimeError,
+                "guarded run failed: memory_probe_failed"
+            )
+        );
+        assert_eq!(
+            GuardRunError::MemoryLimitUnsupported.to_error_report(),
+            ErrorReport::new(
+                ExitCode::RuntimeError,
+                "guarded run failed: memory_limit_unsupported"
+            )
+        );
         assert_eq!(
             GuardRunError::InvalidProgram.to_error_report(),
             ErrorReport::new(

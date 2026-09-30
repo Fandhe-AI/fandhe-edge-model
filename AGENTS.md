@@ -60,7 +60,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 実機確認は `scripts/sandbox-run.sh` を macOS 実機（Apple Silicon・`/usr/bin/sandbox-exec`）で**人が手動実行**する。sandbox の外で先に `cargo build` と `make py-sync` を済ませ、定義ファイルとデータを用意する。例: `scripts/sandbox-run.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke`
 - 既定の `make test` に含まれる `crates/cli/tests/sandbox_run_script.rs` は偽の launcher を使うテストハーネスで、実際の通信遮断は行わない。実機の証拠にはならない（証拠種別: テストハーネス）
 - 実バイナリの 7 工程は TASK-33.1-2（#136）で接続済み。データは定義ファイルと同じディレクトリの固定名 `train.jsonl`（必須）・`evaluation.jsonl`（任意）から `register` が取り込み、学習ワーカーは環境変数 `FANDHE_EDGE_TRAINER_DIR`（絶対パス。未設定なら開発ツリーの `trainer/`）で指す。`--definition`・`--project-dir` は実行時のカレントディレクトリ配下に置く（経路の閉じ込め。REQ-39）。評価データがあるときの `evaluate` は評価器へ接続済み（#314）で、凍結した評価データへ候補ごとに 1 回だけ適用して正解率・Macro-F1 を返し、`candidates/<N>/evaluation_record.json`（評価完了の記録）を残す。最初の `evaluate` がその時点の学習済み候補をすべて最終 test の台帳（`final_test_ledger/`）へ事前登録するため、**最初の `evaluate` の前に全候補を `train` しておくこと**（後から学習した候補と `train --smoke` の候補は評価できず `invalid_input`）。適用権を取った後の失敗では再評価できない。評価データがあるプロジェクトの `package` は、選定候補の評価完了記録とモデル・`artifact.json`・評価データ・定義のハッシュが一致しなければ公開を拒否する（記録の完全性の外部検証は #168 で未実装）。結果 JSON と記録の形式は提案でオーナー未承認、Wilson 区間・McNemar / Holm・診断は未結線。`package` は p95・合否基準が未接続で `judgment:null`。実機での完走記録は人の担当
-- 陽性対照（sandbox 下で curl を実行して拒否の検出を確かめる）は TASK-38.2 の担当
+- 陽性対照（sandbox 下で curl を実行して拒否の検出を確かめる）は `sandbox-monitor.sh` が実行する（下の「陽性対照」節。TASK-38.2・#164）
 
 #### 拒否ログの監視・集計（REQ-38・TASK-38.1-2・#163）
 
@@ -69,7 +69,21 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 判定と終了コード: 本ツール起因（PID 照合済み）の通信拒否あり `judged_fail`(10)・帰属不明の通信拒否あり `pending`(12)・監視の無効や読めない行・形式外の拒否行（`deny` を含み操作を読み取れない行）・時刻の不整合 `runtime_error`(70。`network_verdict:"undeterminable"`)・拒否 0 件は run の終了コードを伝搬（合格は run も 0 のときのみ）
 - 出力先: `<out-dir>/network_report.json`（件数・通信拒否のレコード。通信先・パス等の生文字列は書かず、固定語彙と salt 付きダイジェストだけ）・`log_stream.ndjson`（生ログ。0600）・`monitor.meta.json`・`run/run.meta.json`。生ログには他アプリのイベントが含まれるため、PR・Issue へは転記せず `network_report.json` の件数を記録する
 - `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
-- 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
+- 陽性対照なし（`positive_control:"not_run"`。`sandbox_deny_report.py` を記録なしで単体実行した場合）の「0 件」は証拠にならず、終了コード 0 を返さず `pending`(12) にする。監視スクリプト経由では陽性対照が常に実行される（下の「陽性対照」節）
+
+#### 通信監視の陽性対照（REQ-38・TASK-38.2・#164）
+
+- 陽性対照は `scripts/sandbox-monitor.sh` に組み込み済みで、外す経路（オプション・環境変数）はない。監視の開始とゲートの確認の後、`sandbox-run.sh` の前に、同じ sandbox プロファイルの下で `/usr/bin/curl -q --noproxy '*' --silent --output /dev/null --max-time 3 --connect-timeout 2 https://example.com`（PoC-16 と同じ対象）を実行し、その PID の `network*` 拒否が `log stream` に出ることを集計器が確かめる。curl・launcher・対象・プロファイルは定数で、テスト専用の上書きは `FANDHE_EDGE_CURL_CMD`・`FANDHE_EDGE_SANDBOX_EXEC` のみ（`test_harness` 扱い）。curl が無い・10 秒以内に終わらない場合は `sandbox-run.sh` を起動せず `runtime_error`(70)
+- `positive_control` の値と判定: `detected`（陽性対照の拒否を 1 件以上検出。`positive_control_network_deny_events` に計上し、tool・unattributed には混ぜない）・`not_detected`（0 件。判定不能 `runtime_error`(70)）・`not_evaluated`（記録はあるが判定前に打ち切られた）・`not_run`（記録なし。集計器の単体実行のみ。0 件でも `pending`(12)）。curl の終了コードが 0・陽性対照の PID が `process_pids` と重複・時刻の順序違反（監視開始 <= 対照開始 <= 対照終了 <= run 開始 <= run 終了 <= 監視停止）も 70。記録は `<out-dir>/positive_control.meta.json`（0600。対象 URL は書かない）
+- 実機での実行は**人の担当**: macOS 実機で `scripts/sandbox-monitor.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke` を実行し、`network_report.json` の `positive_control:"detected"`・`positive_control_network_deny_events`・`positive_control_exit_code`（PoC-16 の実測では curl の終了コード 6）と `evidence_hint` を証拠種別（実機）付きで記録する。Agent は実機の陽性対照を実行しない
+- 残るリスク・判断事項: 対象 URL が example.com のため、sandbox が効いていない故障時に限り 1 回リクエストが出る（検出のための故障ケース）。ループバック（`http://127.0.0.1:9/`）や `.invalid` ドメインへの変更は、実機で拒否行が記録されることを確かめてから判断する（PoC-16 では未測定）
+- `crates/cli/tests/sandbox_monitor_script.rs` は偽の curl・偽の `log` の陽性対照行（PoC-16 実測の形を模した合成データ）を使うテストハーネスで、実機の証拠にならない
+
+#### sandbox 監視チェーンの統合確認（REQ-38・TASK-38.1・#161）
+
+- 手順と PR への記録項目は [docs/design/sandbox-offline-check-procedure.md](docs/design/sandbox-offline-check-procedure.md)。実機での完走確認と拒否ログの記録は**人が実行**する
+- `crates/cli/tests/sandbox_pipeline_real_trainer.rs` は実 CLI と実 trainer（CPU・合成データ `fixtures/sandbox_run/`）で `sandbox-monitor.sh` → `sandbox-run.sh` を通すテストハーネス（`#[ignore]`。`make test-trainer-integration` で実行。`python-ci` と `make ci` で実際に走る）。launcher・`log` は偽物で、実機の証拠にならない。既定集合から移したテストではない
+- 評価データなしの `evaluate`（`skipped`）経路のみ。評価本体の配線前で、評価の完走は未達。陽性対照は `sandbox-monitor.sh` に組み込み済み（TASK-38.2・#164。実機での実行は人の担当）
 
 #### Claude Code の許可操作（確認画面）の確認（REQ-36・TASK-36.3・#160）
 
@@ -85,7 +99,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
 - `crates/train/tests/real_trainer.rs` は実 `trainer/`（MLX・C1/C3・ONNX 書き出し）を Rust の `run_train` から起動して学習ジョブを完走させる（REQ-18/19/34/39。証拠種別: テストハーネス・合成データ・CPU）。`make py-sync` 済みの `trainer/.venv` と MLX CPU が必要で、`rust-ci` の 3 OS runner には無いため `#[ignore]` で既定の `make test` から分離している
-- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 2 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
+- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 3 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
 - `rust-ci` では `ignored` と報告され、Windows は `#![cfg(unix)]` で対象外（`run_train` が `UnsupportedPlatform`）
 
 ### 学習ワーカーの起動契約（Issue #12）
