@@ -57,6 +57,7 @@
 pub mod artifact_meta;
 pub mod canonical;
 pub mod definition;
+pub mod evaluation_record;
 pub mod exitcode;
 pub mod fs;
 pub mod hash;

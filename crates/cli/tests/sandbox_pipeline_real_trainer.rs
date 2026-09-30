@@ -16,7 +16,8 @@
 //! 合成データ・CPU のみ。macOS 実機の sandbox 下での完走確認と拒否ログの記録は人の担当で、
 //! 本テストはその証拠にならない（手順は `docs/design/sandbox-offline-check-procedure.md`）。
 //! 陽性対照（TASK-38.2・#164）は偽の curl と偽の `log` の拒否行で通し、`detected` を確かめる。
-//! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価本体の配線は未実装。評価の完走は未達）。
+//! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価データありの `evaluate` は評価器へ接続済み・#314 だが、
+//! 本テストでは通していない。評価の完走は未確認）。
 //!
 //! # 既定のテスト集合から分離する理由（`.claude/rules/ci.md`）
 //!
@@ -192,10 +193,11 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
     let meta = fs::read_to_string(dir.join("out/run/run.meta.json")).expect("run.meta.json");
     assert!(meta.contains("\"sandbox_exec_override\":true"), "{meta}");
     assert!(!meta.contains("\"process_pids\":[]"), "{meta}");
-    // 7 工程がこの順に並び、evaluate だけが skipped（評価データなし。評価済みを装わない）
+    // 7 工程がこの順（select → evaluate。選定してから評価する。REQ-27）に並び、evaluate だけが
+    // skipped（評価データなし。評価済みを装わない）
     let mut pos = 0;
     for step in [
-        "register", "inspect", "train", "evaluate", "select", "package", "infer",
+        "register", "inspect", "train", "select", "evaluate", "package", "infer",
     ] {
         let needle = format!("\"step\":\"{step}\"");
         let found = meta[pos..]

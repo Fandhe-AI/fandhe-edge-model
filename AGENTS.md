@@ -49,7 +49,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 #### 容量の実機計測（REQ-30・TASK-30.1・#121）
 
-- Mac（Apple Silicon）で人が実行する。前提は、実データで学習した C1・C3 のプロジェクトを、評価データ（`evaluation.jsonl`）なしで `register → inspect → train → evaluate → select → package` まで完走させたもの（GPU を使う学習は人が実行する）。現行の `package` は評価データがあるプロジェクトを評価完了記録が未実装（#314）のため常に拒否するので、評価データありのプロジェクトでは計測対象の `package/` を作れない。評価済みパッケージの計測は #314 の対応後の手順とする（評価データなしのときの `evaluate` は `status:"skipped"`・exit 0）。Agent は単独で実行しない
+- Mac（Apple Silicon）で人が実行する。前提は、実データで学習した C1・C3 のプロジェクトを、評価データ（`evaluation.jsonl`）なしで `register → inspect → train → select → evaluate → package` まで完走させたもの（GPU を使う学習は人が実行する）。評価データがあるプロジェクトの `package` は、選定候補の評価完了記録（`select` の後の `evaluate`。#314）が無ければ（`--smoke` の候補・`--allow-smoke` でも）拒否する。評価データありの計測は、実データで `select → evaluate → package` を通したプロジェクトが対象になる（評価データなしのときの `evaluate` は `status:"skipped"`・exit 0）。Agent は単独で実行しない
 - 実行: 先にリポジトリで `cargo build -p fandhe-edge-cli --example package_capacity` を実行する。その後、プロジェクトの `package/` 配下で `<repo>/target/debug/examples/package_capacity weights=<onnx> label_table=definition.json metadata=artifact.json` を実行する（`package/` はリポジトリ外のため cargo は workspace を見つけられず、ビルド済みバイナリを直接呼ぶ。経路はカレントディレクトリ配下に閉じ込められる。REQ-39）
 - 記録: `total_bytes` と 5 要素の内訳・kind（C1 / C3）と `onnx_sha256`・機種とメモリ・実行日・証拠種別「実機」を Issue #121 のコメントか PR に残す
 - 40MB（REQ-30 の目安）は実機計測の参考値。一方、現行の `package` は `crates/cli/src/stages/package.rs` の `CAPACITY_LIMIT_BYTES = 40_000_000`（暫定の固定値）で容量を照合し、超過すると `limit_exceeded`(20) を返す公開上限として働く。計測結果の評価では両者を区別する。C1 の 2.57MB は語彙を ONNX 外に持つ旧方式の値で、比較の参考にとどめる
@@ -59,7 +59,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 - 実機確認は `scripts/sandbox-run.sh` を macOS 実機（Apple Silicon・`/usr/bin/sandbox-exec`）で**人が手動実行**する。sandbox の外で先に `cargo build` と `make py-sync` を済ませ、定義ファイルとデータを用意する。例: `scripts/sandbox-run.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke`
 - 既定の `make test` に含まれる `crates/cli/tests/sandbox_run_script.rs` は偽の launcher を使うテストハーネスで、実際の通信遮断は行わない。実機の証拠にはならない（証拠種別: テストハーネス）
-- 実バイナリの 7 工程は TASK-33.1-2（#136）で接続済み。データは定義ファイルと同じディレクトリの固定名 `train.jsonl`（必須）・`evaluation.jsonl`（任意）から `register` が取り込み、学習ワーカーは環境変数 `FANDHE_EDGE_TRAINER_DIR`（絶対パス。未設定なら開発ツリーの `trainer/`）で指す。`--definition`・`--project-dir` は実行時のカレントディレクトリ配下に置く（経路の閉じ込め。REQ-39）。評価データがあるときの `evaluate` は評価本体が未実装のため `runtime_error`(70) で止まる（評価済みを装わない）。`package` は p95・合否基準が未接続で `judgment:null`。実機での完走記録は人の担当
+- 実バイナリの 7 工程は TASK-33.1-2（#136）で接続済み。データは定義ファイルと同じディレクトリの固定名 `train.jsonl`（必須）・`evaluation.jsonl`（任意）から `register` が取り込み、学習ワーカーは環境変数 `FANDHE_EDGE_TRAINER_DIR`（絶対パス。未設定なら開発ツリーの `trainer/`）で指す。`--definition`・`--project-dir` は実行時のカレントディレクトリ配下に置く（経路の閉じ込め。REQ-39）。評価データがあるときの `evaluate` は評価器へ接続済み（#314）で、凍結した評価データへ候補ごとに 1 回だけ適用して正解率・Macro-F1 を返し、`candidates/<N>/evaluation_record.json`（評価完了の記録）を残す。最初の `evaluate` がその時点の学習済み候補をすべて最終 test の台帳（`final_test_ledger/`）へ事前登録するため、**最初の `evaluate` の前に全候補を `train` しておくこと**（後から学習した候補と `train --smoke` の候補は評価できず `invalid_input`）。適用権を取った後の失敗では再評価できない。評価データがあるプロジェクトの `package` は、選定候補の評価完了記録とモデル・`artifact.json`・評価データ・定義のハッシュが一致しなければ公開を拒否する（記録の完全性の外部検証は #168 で未実装）。結果 JSON と記録の形式は 2026-09-30 オーナー承認済み、Wilson 区間・McNemar / Holm・診断は未結線。`package` は p95・合否基準が未接続で `judgment:null`。実機での完走記録は人の担当
 - 陽性対照（sandbox 下で curl を実行して拒否の検出を確かめる）は `sandbox-monitor.sh` が実行する（下の「陽性対照」節。TASK-38.2・#164）
 
 #### 拒否ログの監視・集計（REQ-38・TASK-38.1-2・#163）

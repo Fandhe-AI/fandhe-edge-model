@@ -34,7 +34,7 @@ use crate::project::{
     DATA_DIR, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project, SPLIT_FILE, fail,
     inspect_bytes, invalid, runtime,
 };
-use crate::stage_output::evaluate_start;
+use crate::stage_output::{EvaluateStart, evaluate_start};
 
 /// 分割・漏洩検査の対象になる 1 行（`ValidRecord` の借用）。
 ///
@@ -102,6 +102,17 @@ pub(crate) fn split_rows(records: &[ValidRecord]) -> Result<Vec<Row<'_>>, ErrorR
 /// # Errors
 /// 記録の読み込み失敗・ハッシュ不一致（`invalid_input`）。
 pub(crate) fn load_evaluation_bytes(project: &Project) -> Result<Option<Vec<u8>>, ErrorReport> {
+    Ok(load_frozen_evaluation(project)?.map(|(_, bytes)| bytes))
+}
+
+/// [`load_evaluation_bytes`] と同じ照合を行い、一致した凍結記録（sha256・バイト長）も返す
+/// （`evaluate` が評価器へ渡す期待値と、評価完了記録の内容に使う。REQ-17・REQ-27・#314）。
+///
+/// # Errors
+/// [`load_evaluation_bytes`] と同じ。
+pub(crate) fn load_frozen_evaluation(
+    project: &Project,
+) -> Result<Option<(FreezeRecord, Vec<u8>)>, ErrorReport> {
     let data_rel = Path::new(DATA_DIR).join(EVALUATION_DATA_FILE);
     let Some(record_bytes) = project.read_optional(FREEZE_FILE, 1024)? else {
         // 記録が無いのに評価データがあれば、`evaluate_start` と同じく fail-closed で拒否する。
@@ -119,8 +130,10 @@ pub(crate) fn load_evaluation_bytes(project: &Project) -> Result<Option<Vec<u8>>
         std::str::from_utf8(&record_bytes).map_err(|_| invalid("freeze record is invalid"))?;
     let record = FreezeRecord::parse(text).map_err(|_| invalid("freeze record is invalid"))?;
     let bytes = project.read(&data_rel, MAX_PROJECT_FILE_BYTES)?;
-    evaluate_start(&EvalDataState::Frozen(record), &bytes)?;
-    Ok(Some(bytes))
+    match evaluate_start(&EvalDataState::Frozen(record), &bytes)? {
+        EvaluateStart::Proceed(record) => Ok(Some((record, bytes))),
+        EvaluateStart::Skipped(_) => Err(runtime("unexpected evaluation state")),
+    }
 }
 
 /// 評価データが凍結記録どおりであることを確認する（`train`・`select`・`package` が副作用の前に呼ぶ。

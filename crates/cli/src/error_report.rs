@@ -38,6 +38,9 @@ use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
+use fandhe_edge_eval::eval_data_invariance::EvalDataInvarianceError;
+use fandhe_edge_eval::final_test_once::{AcquireError, ApplyOnceError};
+use fandhe_edge_eval::invariance::EvaluationInvarianceError;
 use fandhe_edge_guard::format::FormatRejection;
 use fandhe_edge_guard::kind::KindRejection;
 use fandhe_edge_guard::kind_version::KindVersionRejection;
@@ -297,10 +300,214 @@ impl ToErrorReport for BatchError {
     }
 }
 
+/// `evaluate` の推論クロージャ（[`fandhe_edge_eval::final_test_once::apply_once`] の `predict`）が
+/// 返す失敗。本文・パスを運ばない固定の区分のみ（REQ-27・REQ-39。#314）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalPredictFailure {
+    /// 1 件の推論が時間上限（`INFER_TIME_LIMIT`）を超えた。
+    TimeLimit,
+    /// 推論に使うモデルが、評価前に検証した実体と一致しない。
+    ModelChanged,
+    /// バックエンドの組み立てなど、その他の失敗。
+    Failed,
+}
+
+/// [`fandhe_edge_eval::final_test_once::apply_once`] の失敗の全体（評価データ側・モデル側・
+/// ロック取得・推論の入れ子）。
+pub type ApplyOnceFailure =
+    EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<EvalPredictFailure>>>;
+
+/// 最終 test の台帳操作（事前登録・ロック取得）の失敗を [`ErrorReport`] にする。
+///
+/// message は固定語彙で、`AcquireError` が持つパス・代表構成 ID の実値は出さない（security.md）。
+/// `AcquireError` は `non_exhaustive` のため、将来の variant は `runtime_error` へ倒す。
+#[must_use]
+pub fn acquire_error_report(error: &AcquireError) -> ErrorReport {
+    match error {
+        AcquireError::AlreadyApplied { .. } => ErrorReport::new(
+            ExitCode::InvalidInput,
+            "candidate has already been evaluated on the frozen data",
+        ),
+        AcquireError::NotRegistered
+        | AcquireError::UnregisteredConfig
+        | AcquireError::WeightsNotRegistered
+        | AcquireError::ComponentNotRegistered { .. } => ErrorReport::new(
+            ExitCode::InvalidInput,
+            "candidate is not registered for evaluation",
+        ),
+        AcquireError::RegistryTampered { .. }
+        | AcquireError::RegistryInvalid { .. }
+        | AcquireError::LedgerDirInvalid { .. }
+        | AcquireError::AlreadyRegistered { .. } => {
+            ErrorReport::new(ExitCode::InvalidInput, "final test ledger is invalid")
+        }
+        AcquireError::InvalidConfigId { .. } => {
+            ErrorReport::new(ExitCode::InvalidInput, "evaluation config id is invalid")
+        }
+        AcquireError::SelectionChanged => ErrorReport::new(
+            ExitCode::InvalidInput,
+            "selection differs from the one fixed at the first evaluation",
+        ),
+        AcquireError::SelectionNotPinned => {
+            ErrorReport::new(ExitCode::InvalidInput, "evaluation has not been completed")
+        }
+        AcquireError::WeightsDigest {
+            source: FsError::TooLarge { .. },
+        } => ErrorReport::new(
+            ExitCode::LimitExceeded,
+            default_message(ExitCode::LimitExceeded),
+        ),
+        _ => ErrorReport::new(ExitCode::RuntimeError, "cannot evaluate candidate"),
+    }
+}
+
+/// `apply_once` の失敗を [`ErrorReport`] にする（REQ-27・REQ-39・#314）。
+///
+/// 凍結記録との不一致・評価中の評価データ / モデルの変化・適用済み・未登録・台帳の不整合は
+/// `invalid_input`、サイズ・時間の上限超過は `limit_exceeded`、その他の I/O 失敗は
+/// `runtime_error`。message は固定語彙で、評価データの本文・パス・ハッシュの実値を含めない。
+/// 各エラー型は `non_exhaustive` のため、将来の variant は `runtime_error` へ倒す（fail-closed）。
+#[must_use]
+pub fn apply_once_error_report(error: &ApplyOnceFailure) -> ErrorReport {
+    let invalid = |m: &str| ErrorReport::new(ExitCode::InvalidInput, m);
+    let limit = || {
+        ErrorReport::new(
+            ExitCode::LimitExceeded,
+            default_message(ExitCode::LimitExceeded),
+        )
+    };
+    let failed = || ErrorReport::new(ExitCode::RuntimeError, "cannot evaluate candidate");
+    match error {
+        EvalDataInvarianceError::FrozenRecordMismatch { .. } => {
+            invalid("evaluation data does not match the freeze record")
+        }
+        EvalDataInvarianceError::ChangedDuringEvaluation { .. } => {
+            invalid("evaluation data changed during evaluation")
+        }
+        EvalDataInvarianceError::TooLarge { .. } => limit(),
+        EvalDataInvarianceError::NotRegularFile { .. } => invalid("evaluation data is invalid"),
+        EvalDataInvarianceError::Evaluation(inner) => match inner {
+            EvaluationInvarianceError::Changed(_) => invalid("model changed during evaluation"),
+            EvaluationInvarianceError::TooLarge { .. } => limit(),
+            EvaluationInvarianceError::NotRegularFile { .. } => invalid("model file is invalid"),
+            EvaluationInvarianceError::Evaluation(apply) => match apply {
+                ApplyOnceError::Acquire(acquire) => acquire_error_report(acquire),
+                ApplyOnceError::Decode => invalid("evaluation data is invalid"),
+                ApplyOnceError::Prediction(EvalPredictFailure::TimeLimit) => limit(),
+                ApplyOnceError::Prediction(EvalPredictFailure::ModelChanged) => {
+                    invalid("model changed during evaluation")
+                }
+                ApplyOnceError::Prediction(EvalPredictFailure::Failed) => failed(),
+                _ => failed(),
+            },
+            _ => failed(),
+        },
+        _ => failed(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_edge_core::hash::Sha256Digest;
+    use fandhe_edge_eval::final_test_once::AppliedBy;
     use fandhe_edge_guard::kind::KindAllowlist;
+
+    fn nest(inner: ApplyOnceError<EvalPredictFailure>) -> ApplyOnceFailure {
+        EvalDataInvarianceError::Evaluation(EvaluationInvarianceError::Evaluation(inner))
+    }
+
+    /// REQ-27・REQ-39・REQ-21: `apply_once` の各失敗の終了コードと固定 message が完全一致し、
+    /// パス・ハッシュの実値を含まない。
+    #[test]
+    fn req27_apply_once_failures_map_to_fixed_reports() {
+        let digest = Sha256Digest::of_bytes(b"x");
+        let path = std::path::PathBuf::from("/secret/path");
+        let cases: Vec<(ApplyOnceFailure, ExitCode, &str)> = vec![
+            (
+                EvalDataInvarianceError::FrozenRecordMismatch {
+                    expected_sha256: digest,
+                    actual_sha256: digest,
+                    expected_byte_len: 1,
+                    actual_byte_len: 2,
+                },
+                ExitCode::InvalidInput,
+                "evaluation data does not match the freeze record",
+            ),
+            (
+                EvalDataInvarianceError::ChangedDuringEvaluation {
+                    before: digest,
+                    after: digest,
+                },
+                ExitCode::InvalidInput,
+                "evaluation data changed during evaluation",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::AlreadyApplied {
+                    by: AppliedBy::RepresentativeConfig,
+                    lock_path: path.clone(),
+                })),
+                ExitCode::InvalidInput,
+                "candidate has already been evaluated on the frozen data",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig)),
+                ExitCode::InvalidInput,
+                "candidate is not registered for evaluation",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::WeightsNotRegistered)),
+                ExitCode::InvalidInput,
+                "candidate is not registered for evaluation",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::LedgerDirInvalid {
+                    path: path.clone(),
+                })),
+                ExitCode::InvalidInput,
+                "final test ledger is invalid",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::RegistryTampered {
+                    reason: "x",
+                })),
+                ExitCode::InvalidInput,
+                "final test ledger is invalid",
+            ),
+            (
+                nest(ApplyOnceError::Acquire(AcquireError::Io {
+                    path,
+                    source: std::io::Error::other("boom"),
+                })),
+                ExitCode::RuntimeError,
+                "cannot evaluate candidate",
+            ),
+            (
+                nest(ApplyOnceError::Decode),
+                ExitCode::InvalidInput,
+                "evaluation data is invalid",
+            ),
+            (
+                nest(ApplyOnceError::Prediction(EvalPredictFailure::TimeLimit)),
+                ExitCode::LimitExceeded,
+                "resource limit exceeded",
+            ),
+            (
+                nest(ApplyOnceError::Prediction(EvalPredictFailure::ModelChanged)),
+                ExitCode::InvalidInput,
+                "model changed during evaluation",
+            ),
+            (
+                nest(ApplyOnceError::Prediction(EvalPredictFailure::Failed)),
+                ExitCode::RuntimeError,
+                "cannot evaluate candidate",
+            ),
+        ];
+        for (error, code, message) in cases {
+            let report = apply_once_error_report(&error);
+            assert_eq!((report.code, report.message.as_str()), (code, message));
+        }
+    }
 
     /// REQ-39・REQ-21: `kind` の拒否は invalid_input・固定語彙（入力値を含めない）。
     #[test]
