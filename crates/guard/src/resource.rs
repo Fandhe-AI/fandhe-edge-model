@@ -1,10 +1,15 @@
-//! 資源の上限のうち実行時間（推論 1 件あたり暫定 10 秒）をプロセス境界で強制する（REQ-39・TASK-39.5-1・#170）。
+//! 資源の上限のうち実行時間（推論 1 件あたり暫定 10 秒）とメモリ（RSS。暫定 2 GiB・模擬）を
+//! プロセス境界で強制する（REQ-39・TASK-39.5-1・#170・TASK-39.5-2・#171）。
 //!
 //! REQ-39 異常系は、推論 1 件の実行時間が暫定上限（10 秒。推論経路向けで、学習ワーカーの
 //! 上限とは別）を超えたらプロセスを強制終了し、資源上限の超過として区別できる形で記録する
 //! ことを求める。PoC-20 ケース 3 の実測は `subprocess.run(timeout=...)` による外側からの
 //! 強制終了だった。`fandhe-edge-runtime` の期限（`infer_one_within` 等）はプロセス内の協調的な
 //! もので止まった 1 件を中断できないため、強制的な上限は本モジュールが子プロセスの境界で担う。
+//!
+//! メモリ（RSS）は PoC-20 ケース 3 と同じく、子の RSS を 50 ms 間隔でポーリングし、上限を厳密に
+//! 超えたら kill して回収する方式（模擬）。`setrlimit` 等の確実な上限機構ではない。証拠の種別は
+//! テストハーネス（実プロセス・実割り当て）で、実 CLI の推論が 2 GiB を超える実測ではない。
 //!
 //! # 使われ方
 //!
@@ -22,7 +27,13 @@
 //! - kill は直前の `try_wait` が未終了を返した直接の子にだけ送る（回収済み pid への誤送出を防ぐ）。
 //!   期限後に完了を観測した場合は kill せず時間超過として扱う（fail-closed。成功扱いにしない）
 //! - kill 後の回収待ち・読み取りスレッドの待ちは有界。回収を確認できなければエラー
-//! - 記録・エラーに入力本文・子の出力・パスを含めない（固定語彙のみ）
+//! - 記録・エラーに入力本文・子の出力・パス・pid を含めない（固定語彙と数値のみ）
+//! - RSS の計測は「直前の `try_wait` が未終了を返した直接の子」にだけ行う。未回収の間は pid が
+//!   再利用されないため、別プロセスの RSS を測る・誤って kill することがない
+//! - RSS の計測失敗は成功扱いにせず、子を kill・回収して `MemoryProbe`（70）を返す（fail-closed。
+//!   PoC-20 は計測失敗を無視していた）。計測手段の無い OS でメモリ上限が指定されたら起動前に
+//!   `MemoryLimitUnsupported`（70）を返す。時間とメモリが同時に該当した場合は時間を優先する
+//! - 計測の待ち（macOS の `ps`）・読み取り（`/proc`・`ps` の出力）は有界
 //!
 //! # 制限
 //!
@@ -32,7 +43,10 @@
 //! - Linux・macOS 以外の OS は読み取りスレッドで代替し、期限超過時は子孫がパイプを離すまで
 //!   スレッドが残りうる
 //! - 実装は全 OS でビルドされるが、検証環境は Mac のみ（Windows は実機検証の対象外）
-//! - メモリ（RSS）上限は #171、ファイルサイズ上限は #172 の範囲。[`ResourceKind`] へ追加する
+//! - メモリ上限は模擬（RSS ポーリング）で、ポーリングの間（約 50 ms と計測の遅延）は上限を超えうる
+//!   （オーバーシュート）。子孫の RSS は監視しない。macOS の RSS は圧縮メモリを含まない指標。
+//!   cgroup・コンテナのメモリ制限などの確実な上限機構への置き換えは別課題（TASK-39.5 の備考）
+//! - ファイルサイズ上限は [`crate::file_size`]（#172）の範囲
 
 use fandhe_edge_core::exitcode::ExitCode;
 use std::ffi::OsString;
@@ -43,6 +57,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// 推論プロセスの RSS の暫定上限（2 GiB。REQ-39）。値の出所は共通コアの `limits`。
+pub use fandhe_edge_core::limits::INFER_RSS_LIMIT_BYTES;
 /// 推論 1 件の実行時間の暫定上限（REQ-39）。値の出所は共通コアの `limits`（runtime・cli と共有）。
 pub use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 /// 指定できる時間上限の最大値（暫定 1 時間。REQ-39）。値の出所は共通コアの `limits`。
@@ -56,6 +72,8 @@ pub const MAX_OUTPUT_CAP: usize = fandhe_edge_core::limits::MAX_OUTPUT_BYTES;
 
 /// 監視のポーリング間隔（busy-spin を避ける）。
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// RSS の計測間隔（PoC-20 の 0.05 秒。`POLL_INTERVAL` とは別に `Clock` で管理する）。
+const MEMORY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// kill 後に回収を待つ上限。
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 終了後に読み取りスレッドを待つ上限（孫がパイプを保持すると EOF が来ないため）。
@@ -68,6 +86,8 @@ pub enum ResourceConfigError {
     TimeLimitOutOfRange,
     /// 読み取り上限が 0 または [`MAX_OUTPUT_CAP`] 超。
     OutputCapOutOfRange,
+    /// メモリ上限が 0 または [`INFER_RSS_LIMIT_BYTES`] 超。
+    MemoryLimitOutOfRange,
 }
 
 impl ResourceConfigError {
@@ -77,6 +97,7 @@ impl ResourceConfigError {
         match self {
             Self::TimeLimitOutOfRange => "time_limit_out_of_range",
             Self::OutputCapOutOfRange => "output_cap_out_of_range",
+            Self::MemoryLimitOutOfRange => "memory_limit_out_of_range",
         }
     }
 
@@ -124,12 +145,45 @@ impl TimeLimit {
     }
 }
 
-/// 超過した資源の種類。#171 で `Memory` を追加する。
+/// 検証済みのメモリ（RSS）上限（1 バイト以上 [`INFER_RSS_LIMIT_BYTES`] 以下。REQ-39）。
+///
+/// 暫定上限より緩い値は渡せない（`file_size` の上限と同じ方針）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimit(u64);
+
+impl MemoryLimit {
+    /// 上限を検証して作る。
+    ///
+    /// # Errors
+    /// 0 または [`INFER_RSS_LIMIT_BYTES`] 超は [`ResourceConfigError::MemoryLimitOutOfRange`]。
+    pub fn new(bytes: u64) -> Result<Self, ResourceConfigError> {
+        if bytes == 0 || bytes > INFER_RSS_LIMIT_BYTES {
+            return Err(ResourceConfigError::MemoryLimitOutOfRange);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// 推論プロセスの暫定上限（[`INFER_RSS_LIMIT_BYTES`]）。
+    #[must_use]
+    pub const fn infer_default() -> Self {
+        Self(INFER_RSS_LIMIT_BYTES)
+    }
+
+    /// 上限値（バイト）。
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// 超過した資源の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResourceKind {
     /// 実行時間（壁時計）。
     Time,
+    /// メモリ（RSS。ポーリングによる模擬。TASK-39.5-2・#171）。
+    Memory,
 }
 
 /// 資源上限の超過の記録。正常終了・ほかのエラーと区別できる（REQ-39）。
@@ -141,6 +195,8 @@ pub struct ResourceLimitExceeded {
     limit: Duration,
     elapsed: Duration,
     child_reaped: bool,
+    /// メモリ超過のときだけ `Some((適用した上限, 観測した RSS))`（バイト）。
+    memory: Option<(u64, u64)>,
 }
 
 impl ResourceLimitExceeded {
@@ -152,6 +208,43 @@ impl ResourceLimitExceeded {
             limit,
             elapsed,
             child_reaped,
+            memory: None,
+        }
+    }
+
+    /// メモリ超過の記録を作る（`time_limit` は同時に適用していた時間上限）。
+    #[must_use]
+    pub const fn memory(
+        time_limit: Duration,
+        memory_limit_bytes: u64,
+        observed_rss_bytes: u64,
+        elapsed: Duration,
+        child_reaped: bool,
+    ) -> Self {
+        Self {
+            kind: ResourceKind::Memory,
+            limit: time_limit,
+            elapsed,
+            child_reaped,
+            memory: Some((memory_limit_bytes, observed_rss_bytes)),
+        }
+    }
+
+    /// 適用したメモリ上限（バイト）。メモリ超過のときだけ `Some`。
+    #[must_use]
+    pub const fn memory_limit_bytes(&self) -> Option<u64> {
+        match self.memory {
+            Some((limit, _)) => Some(limit),
+            None => None,
+        }
+    }
+
+    /// 超過を検出した時の RSS（バイト）。メモリ超過のときだけ `Some`。
+    #[must_use]
+    pub const fn observed_rss_bytes(&self) -> Option<u64> {
+        match self.memory {
+            Some((_, observed)) => Some(observed),
+            None => None,
         }
     }
 
@@ -161,7 +254,7 @@ impl ResourceLimitExceeded {
         self.kind
     }
 
-    /// 適用した上限。
+    /// 適用した時間上限（メモリ超過の記録でも、同時に適用していた時間上限）。
     #[must_use]
     pub const fn limit(&self) -> Duration {
         self.limit
@@ -184,6 +277,7 @@ impl ResourceLimitExceeded {
     pub const fn code(&self) -> &'static str {
         match self.kind {
             ResourceKind::Time => "time_limit_exceeded",
+            ResourceKind::Memory => "memory_limit_exceeded",
         }
     }
 
@@ -253,7 +347,7 @@ pub enum GuardedRunOutcome {
         /// 経過時間。
         elapsed: Duration,
     },
-    /// 時間上限を超えた（kill・回収済み、または期限後の完了を観測）。
+    /// 時間上限またはメモリ上限を超えた（kill・回収済み、または期限後の完了を観測）。
     LimitExceeded(ResourceLimitExceeded),
 }
 
@@ -275,6 +369,10 @@ pub enum GuardRunError {
     ReapTimeout,
     /// 子の出力の読み取りに失敗した（欠けた出力を正常終了として返さない）。
     ReadOutput,
+    /// RSS の計測に失敗した（子は kill・回収済み。計測できないまま成功扱いにしない）。
+    MemoryProbe,
+    /// RSS の計測手段が無い OS でメモリ上限が指定された（起動前に拒否する）。
+    MemoryLimitUnsupported,
 }
 
 impl GuardRunError {
@@ -289,6 +387,8 @@ impl GuardRunError {
             Self::KillFailed => "kill_failed",
             Self::ReapTimeout => "reap_timeout",
             Self::ReadOutput => "read_output_failed",
+            Self::MemoryProbe => "memory_probe_failed",
+            Self::MemoryLimitUnsupported => "memory_limit_unsupported",
         }
     }
 
@@ -297,9 +397,13 @@ impl GuardRunError {
     pub const fn exit_code(self) -> ExitCode {
         match self {
             Self::InvalidProgram | Self::InvalidConfig => ExitCode::InvalidInput,
-            Self::Spawn | Self::Wait | Self::KillFailed | Self::ReapTimeout | Self::ReadOutput => {
-                ExitCode::RuntimeError
-            }
+            Self::Spawn
+            | Self::Wait
+            | Self::KillFailed
+            | Self::ReapTimeout
+            | Self::ReadOutput
+            | Self::MemoryProbe
+            | Self::MemoryLimitUnsupported => ExitCode::RuntimeError,
         }
     }
 }
@@ -376,10 +480,11 @@ pub struct RunConfig {
     time_limit: TimeLimit,
     stdout_cap: usize,
     stderr_cap: usize,
+    memory_limit: Option<MemoryLimit>,
 }
 
 impl RunConfig {
-    /// 設定を検証して作る。
+    /// 設定を検証して作る。メモリ上限は `None`（[`RunConfig::with_memory_limit`] で付ける）。
     ///
     /// # Errors
     /// cap が 0 または [`MAX_OUTPUT_CAP`] 超なら [`ResourceConfigError::OutputCapOutOfRange`]。
@@ -397,13 +502,31 @@ impl RunConfig {
             time_limit,
             stdout_cap,
             stderr_cap,
+            memory_limit: None,
         })
+    }
+
+    /// メモリ（RSS）上限を付ける。計測手段の無い OS では [`run_with_limits`] が
+    /// [`GuardRunError::MemoryLimitUnsupported`] を返す（fail-closed）。
+    #[must_use]
+    pub const fn with_memory_limit(mut self, limit: MemoryLimit) -> Self {
+        self.memory_limit = Some(limit);
+        self
     }
 
     /// 時間上限。
     #[must_use]
     pub const fn time_limit(&self) -> Duration {
         self.time_limit.get()
+    }
+
+    /// メモリ上限（バイト）。無効なら `None`。
+    #[must_use]
+    pub const fn memory_limit(&self) -> Option<u64> {
+        match self.memory_limit {
+            Some(l) => Some(l.get()),
+            None => None,
+        }
     }
 }
 
@@ -413,6 +536,7 @@ impl Default for RunConfig {
             time_limit: TimeLimit::infer_default(),
             stdout_cap: DEFAULT_STDOUT_CAP,
             stderr_cap: DEFAULT_STDERR_CAP,
+            memory_limit: Some(MemoryLimit::infer_default()),
         }
     }
 }
@@ -428,6 +552,8 @@ const ENV_ALLOWLIST: &[&str] = &[];
 /// 監視ロジックの対象（実プロセスと偽物を差し替える継ぎ目）。
 pub(crate) trait ChildControl {
     type Status;
+    /// OS のプロセス ID（RSS 計測用。未回収の間だけ有効）。
+    fn id(&self) -> u32;
     fn try_wait(&mut self) -> io::Result<Option<Self::Status>>;
     fn kill(&mut self) -> io::Result<()>;
 }
@@ -451,6 +577,9 @@ impl Clock for SystemClock {
 
 impl ChildControl for std::process::Child {
     type Status = ExitStatus;
+    fn id(&self) -> u32 {
+        std::process::Child::id(self)
+    }
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         std::process::Child::try_wait(self)
     }
@@ -462,8 +591,137 @@ impl ChildControl for std::process::Child {
 /// 監視の結果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MonitorEnd<S> {
-    Exited { status: S, elapsed: Duration },
-    TimedOut { elapsed: Duration, reaped: bool },
+    Exited {
+        status: S,
+        elapsed: Duration,
+    },
+    TimedOut {
+        elapsed: Duration,
+        reaped: bool,
+    },
+    MemoryExceeded {
+        elapsed: Duration,
+        observed_rss_bytes: u64,
+        reaped: bool,
+    },
+}
+
+/// RSS 計測の失敗（理由は持たない。パス・pid を記録に出さないため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeError;
+
+/// 子プロセスの RSS 計測の継ぎ目（実計測と偽物を差し替える）。
+///
+/// 呼び出し側（`monitor`）は「直前の `try_wait` が未終了を返した直接の子」にだけ呼ぶ。
+pub(crate) trait RssProbe {
+    /// `Ok(Some(n))` は RSS（バイト）、`Ok(None)` はプロセス不在（次周回の `try_wait` に委ねる）。
+    fn rss_bytes(&mut self, pid: u32) -> Result<Option<u64>, ProbeError>;
+}
+
+/// `/proc/<pid>/status` の `VmRSS:` 行（kB）をバイトにする。行が無ければ `Ok(None)`（zombie 等）。
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn parse_proc_status_vmrss(text: &str) -> Result<Option<u64>, ProbeError> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let (Some(num), Some("kB"), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(ProbeError);
+        };
+        let kb: u64 = num.parse().map_err(|_| ProbeError)?;
+        return kb.checked_mul(1024).map(Some).ok_or(ProbeError);
+    }
+    Ok(None)
+}
+
+/// `ps -o rss=` の出力（KiB）をバイトにする。空なら `Ok(None)`（プロセス不在）。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn parse_ps_rss(text: &str) -> Result<Option<u64>, ProbeError> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ProbeError);
+    }
+    let kb: u64 = t.parse().map_err(|_| ProbeError)?;
+    kb.checked_mul(1024).map(Some).ok_or(ProbeError)
+}
+
+/// 実プロセスの RSS 計測。Linux は `/proc`、macOS は `/bin/ps`（PoC-20 と同じ）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SystemRssProbe;
+
+#[cfg(target_os = "linux")]
+impl RssProbe for SystemRssProbe {
+    fn rss_bytes(&mut self, pid: u32) -> Result<Option<u64>, ProbeError> {
+        use std::io::Read;
+        /// `/proc` のファイルは size 0 を報告するため fstat で検査できない。読み取り量で上限を課す。
+        const STATUS_READ_CAP: u64 = 16 * 1024;
+        let path = PathBuf::from("/proc").join(pid.to_string()).join("status");
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ProbeError),
+        };
+        let mut bytes = Vec::new();
+        match file.take(STATUS_READ_CAP).read_to_end(&mut bytes) {
+            Ok(_) => {}
+            // 読み取り中にプロセスが消えた（ESRCH）。
+            Err(e) if e.raw_os_error() == Some(3) => return Ok(None),
+            Err(_) => return Err(ProbeError),
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| ProbeError)?;
+        parse_proc_status_vmrss(text)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl RssProbe for SystemRssProbe {
+    fn rss_bytes(&mut self, pid: u32) -> Result<Option<u64>, ProbeError> {
+        use std::io::Read;
+        /// `ps` の待ちの上限。
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+        /// `ps` の出力の読み取り上限（数字 1 つと改行だけのため十分）。
+        const PS_READ_CAP: u64 = 64;
+        let mut child = Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p"])
+            .arg(pid.to_string())
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ProbeError)?;
+        let give_up = Instant::now() + PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProbeError);
+                }
+            }
+            if Instant::now() >= give_up {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let mut bytes = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            out.take(PS_READ_CAP)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ProbeError)?;
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| ProbeError)?;
+        parse_ps_rss(text)
+    }
 }
 
 /// kill を送り、有界の間だけ回収を待つ。
@@ -502,11 +760,8 @@ fn kill_and_reap<C: ChildControl, K: Clock>(child: &mut C, clock: &K) -> Result<
     }
 }
 
-/// 期限まで子を監視し、超過したら kill して回収する。
-///
-/// `start` は子の起動前に取った時刻で、起動に要した時間も上限に含める（REQ-39）。
-/// `pump` は毎周回で呼ばれ、パイプを読み進めて進捗があれば true を返す（進捗があれば
-/// sleep を省き、子の書き込み詰まりを避ける）。
+/// 期限まで子を監視し、超過したら kill して回収する（メモリ監視なし。時間上限の単体テスト用）。
+#[cfg(test)]
 pub(crate) fn monitor<C: ChildControl, K: Clock>(
     child: &mut C,
     clock: &K,
@@ -514,9 +769,27 @@ pub(crate) fn monitor<C: ChildControl, K: Clock>(
     limit: Duration,
     pump: &mut dyn FnMut() -> bool,
 ) -> Result<MonitorEnd<C::Status>, GuardRunError> {
+    monitor_with_memory(child, clock, start, limit, pump, None)
+}
+
+/// 期限まで子を監視し、時間またはメモリ（RSS）が超過したら kill して回収する。
+///
+/// `start` は子の起動前に取った時刻で、起動に要した時間も上限に含める（REQ-39）。
+/// `pump` は毎周回で呼ばれ、パイプを読み進めて進捗があれば true を返す（進捗があれば
+/// sleep を省き、子の書き込み詰まりを避ける）。`memory` が `Some` なら、未終了と確認した
+/// 周回で `MEMORY_POLL_INTERVAL` ごとに RSS を計測し、上限を厳密に超えたら kill する。
+pub(crate) fn monitor_with_memory<C: ChildControl, K: Clock>(
+    child: &mut C,
+    clock: &K,
+    start: Instant,
+    limit: Duration,
+    pump: &mut dyn FnMut() -> bool,
+    mut memory: Option<(&mut dyn RssProbe, MemoryLimit)>,
+) -> Result<MonitorEnd<C::Status>, GuardRunError> {
     let deadline = start
         .checked_add(limit)
         .ok_or(GuardRunError::InvalidConfig)?;
+    let mut last_probe: Option<Instant> = None;
     loop {
         let progressed = pump();
         match child.try_wait() {
@@ -540,6 +813,29 @@ pub(crate) fn monitor<C: ChildControl, K: Clock>(
                         elapsed: clock.now().saturating_duration_since(start),
                         reaped: true,
                     });
+                }
+                if let Some((probe, mem_limit)) = memory.as_mut() {
+                    let due = last_probe
+                        .is_none_or(|t| now.saturating_duration_since(t) >= MEMORY_POLL_INTERVAL);
+                    if due {
+                        last_probe = Some(now);
+                        // 直前の try_wait が未終了を返した直接の子だけに計測する（pid 再利用の防止）。
+                        match probe.rss_bytes(child.id()) {
+                            Ok(Some(rss)) if rss > mem_limit.get() => {
+                                kill_and_reap(child, clock)?;
+                                return Ok(MonitorEnd::MemoryExceeded {
+                                    elapsed: clock.now().saturating_duration_since(start),
+                                    observed_rss_bytes: rss,
+                                    reaped: true,
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(ProbeError) => {
+                                kill_and_reap(child, clock)?;
+                                return Err(GuardRunError::MemoryProbe);
+                            }
+                        }
+                    }
                 }
                 if !progressed {
                     clock.sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
@@ -814,15 +1110,20 @@ fn abort_with<C: ChildControl, K: Clock>(
     Err(GuardRunError::Spawn)
 }
 
-/// 子を起動し、時間上限を強制して実行する。
+/// 子を起動し、時間上限とメモリ（RSS）上限を強制して実行する。
 ///
 /// # Errors
-/// 起動・待機・kill・回収の失敗は [`GuardRunError`]。時間超過はエラーではなく
-/// [`GuardedRunOutcome::LimitExceeded`]。
+/// 起動・待機・kill・回収・RSS 計測の失敗は [`GuardRunError`]。計測手段の無い OS でメモリ上限が
+/// 有効なら、起動前に [`GuardRunError::MemoryLimitUnsupported`]。時間超過・メモリ超過は
+/// エラーではなく [`GuardedRunOutcome::LimitExceeded`]。
 pub fn run_with_limits(
     cmd: &GuardedCommand,
     config: &RunConfig,
 ) -> Result<GuardedRunOutcome, GuardRunError> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if config.memory_limit.is_some() {
+        return Err(GuardRunError::MemoryLimitUnsupported);
+    }
     let mut command = Command::new(&cmd.program);
     command
         .args(&cmd.args)
@@ -863,12 +1164,11 @@ pub fn run_with_limits(
                 return None;
             }
             Some(kill_and_reap(child, &SystemClock).map(|()| {
-                GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
-                    kind: ResourceKind::Time,
+                GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded::time(
                     limit,
-                    elapsed: now.saturating_duration_since(start),
-                    child_reaped: true,
-                })
+                    now.saturating_duration_since(start),
+                    true,
+                ))
             }))
         };
     if let Some(r) = expired(&mut child) {
@@ -898,7 +1198,15 @@ pub fn run_with_limits(
         let b = stderr.as_mut().is_some_and(Reader::pump);
         a || b
     };
-    match monitor(&mut child, &SystemClock, start, limit, &mut pump)? {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut probe = SystemRssProbe;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let memory = config
+        .memory_limit
+        .map(|l| (&mut probe as &mut dyn RssProbe, l));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let memory: Option<(&mut dyn RssProbe, MemoryLimit)> = None;
+    match monitor_with_memory(&mut child, &SystemClock, start, limit, &mut pump, memory)? {
         MonitorEnd::Exited { status, elapsed } => {
             // 終了後の出力待機も実行時間の上限に含める。両 reader で 1 つの期限を共有し、
             // 上限直前に終了した子の出力待ちで上限を超えたら時間超過として扱う（REQ-39）。
@@ -913,12 +1221,9 @@ pub fn run_with_limits(
             let (stdout_done, stderr_done) = (out.done, err.done);
             let now = Instant::now();
             if now > deadline || (!(stdout_done && stderr_done) && now >= deadline) {
-                return Ok(GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
-                    kind: ResourceKind::Time,
-                    limit,
-                    elapsed: now.saturating_duration_since(start),
-                    child_reaped: true,
-                }));
+                return Ok(GuardedRunOutcome::LimitExceeded(
+                    ResourceLimitExceeded::time(limit, now.saturating_duration_since(start), true),
+                ));
             }
             // 判定の順序（REQ-39）: 1) 期限到達は時間超過を優先する。2) 期限前でも、読み取りエラー、
             // または子孫がパイプを保持して EOF に達しなかった（done が false）場合は出力が欠けている
@@ -940,12 +1245,28 @@ pub fn run_with_limits(
         MonitorEnd::TimedOut { elapsed, reaped } => {
             // reader は破棄する。Linux・macOS はスレッドを持たず fd を閉じるだけで何も残らない。
             // 出力は記録に含めない。
-            Ok(GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
-                kind: ResourceKind::Time,
-                limit,
-                elapsed,
-                child_reaped: reaped,
-            }))
+            Ok(GuardedRunOutcome::LimitExceeded(
+                ResourceLimitExceeded::time(limit, elapsed, reaped),
+            ))
+        }
+        MonitorEnd::MemoryExceeded {
+            elapsed,
+            observed_rss_bytes,
+            reaped,
+        } => {
+            // 出力は記録に含めない。MemoryExceeded は memory_limit が Some の経路でのみ返る。
+            let mem_limit = config
+                .memory_limit
+                .map_or(INFER_RSS_LIMIT_BYTES, MemoryLimit::get);
+            Ok(GuardedRunOutcome::LimitExceeded(
+                ResourceLimitExceeded::memory(
+                    limit,
+                    mem_limit,
+                    observed_rss_bytes,
+                    elapsed,
+                    reaped,
+                ),
+            ))
         }
     }
 }
@@ -990,6 +1311,9 @@ mod tests {
 
     impl ChildControl for FakeChild<'_> {
         type Status = i32;
+        fn id(&self) -> u32 {
+            1
+        }
         fn try_wait(&mut self) -> io::Result<Option<i32>> {
             self.clock.sleep(self.step);
             self.script.borrow_mut().pop_front().unwrap_or(Ok(None))
@@ -1268,13 +1592,240 @@ mod tests {
     /// REQ-39・REQ-21: 超過の記録は `time_limit_exceeded`・終了コード 20。
     #[test]
     fn req39_limit_exceeded_record_is_time_and_20() {
-        let rec = ResourceLimitExceeded {
-            kind: ResourceKind::Time,
-            limit: INFER_TIME_LIMIT,
-            elapsed: Duration::from_secs(10),
-            child_reaped: true,
-        };
+        let rec = ResourceLimitExceeded::time(INFER_TIME_LIMIT, Duration::from_secs(10), true);
         assert_eq!(rec.code(), "time_limit_exceeded");
         assert_eq!(rec.exit_code().code(), 20);
+    }
+
+    /// RSS 計測の偽物。呼び出しごとに script の先頭を返し、尽きたら最後の値を返し続ける。
+    struct FakeProbe {
+        script: VecDeque<Result<Option<u64>, ProbeError>>,
+        calls: u32,
+    }
+
+    impl FakeProbe {
+        fn new(script: Vec<Result<Option<u64>, ProbeError>>) -> Self {
+            Self {
+                script: script.into(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl RssProbe for FakeProbe {
+        fn rss_bytes(&mut self, _pid: u32) -> Result<Option<u64>, ProbeError> {
+            self.calls += 1;
+            if self.script.len() > 1 {
+                self.script.pop_front().unwrap_or(Ok(None))
+            } else {
+                self.script.front().copied().unwrap_or(Ok(None))
+            }
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn run_mem(
+        clock: &FakeClock,
+        child: &mut FakeChild<'_>,
+        probe: &mut FakeProbe,
+        limit: Duration,
+    ) -> Result<MonitorEnd<i32>, GuardRunError> {
+        monitor_with_memory(
+            child,
+            clock,
+            clock.now(),
+            limit,
+            &mut || false,
+            Some((probe, MemoryLimit::infer_default())),
+        )
+    }
+
+    /// REQ-39・TASK-39.5-2: 上限 + 1 バイトで kill が 1 回、観測 RSS が記録される。
+    #[test]
+    fn req39_rss_over_limit_kills_once_and_records_memory() {
+        let clock = FakeClock::new();
+        let mut script: Vec<io::Result<Option<i32>>> = (0..10).map(|_| Ok(None)).collect();
+        script.push(Ok(Some(9)));
+        let mut child = fake(&clock, script, 0);
+        let mut probe = FakeProbe::new(vec![Ok(Some(GIB)), Ok(Some(2 * GIB + 1))]);
+        let end = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap();
+        assert!(matches!(
+            end,
+            MonitorEnd::MemoryExceeded {
+                observed_rss_bytes: 2_147_483_649,
+                reaped: true,
+                ..
+            }
+        ));
+        assert_eq!(child.kill_calls.get(), 1);
+    }
+
+    /// REQ-39: 上限ちょうどは超過ではない（厳密な「超」。PoC-20）。
+    #[test]
+    fn req39_rss_equal_to_limit_is_not_exceeded() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None), Ok(None), Ok(Some(0))], 60);
+        let mut probe = FakeProbe::new(vec![Ok(Some(2 * GIB))]);
+        let end = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap();
+        assert!(matches!(end, MonitorEnd::Exited { status: 0, .. }));
+        assert_eq!(child.kill_calls.get(), 0);
+        assert!(probe.calls >= 1);
+    }
+
+    /// REQ-39: プロセス不在（`Ok(None)`）は継続し、次周回の終了観測に委ねる。
+    #[test]
+    fn req39_rss_probe_none_continues() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None), Ok(None), Ok(Some(3))], 60);
+        let mut probe = FakeProbe::new(vec![Ok(None)]);
+        let end = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap();
+        assert!(matches!(end, MonitorEnd::Exited { status: 3, .. }));
+    }
+
+    /// REQ-39: 計測失敗は fail-closed（kill・回収のうえ `MemoryProbe`=70）。
+    #[test]
+    fn req39_rss_probe_error_kills_and_reports_memory_probe() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None), Ok(Some(9))], 1);
+        let mut probe = FakeProbe::new(vec![Err(ProbeError)]);
+        let err = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap_err();
+        assert_eq!(err, GuardRunError::MemoryProbe);
+        assert_eq!(err.exit_code().code(), 70);
+        assert_eq!(err.code(), "memory_probe_failed");
+        assert_eq!(child.kill_calls.get(), 1);
+    }
+
+    /// REQ-39: 計測間隔は 50 ms（経過時間 / 50 ms + 1 回以下）。
+    #[test]
+    fn req39_rss_poll_interval_is_50ms() {
+        let clock = FakeClock::new();
+        // 約 1 秒（10 ms 刻み 100 周）経過してから終了する。
+        let mut script: Vec<io::Result<Option<i32>>> = (0..99).map(|_| Ok(None)).collect();
+        script.push(Ok(Some(0)));
+        let mut child = fake(&clock, script, 0);
+        let mut probe = FakeProbe::new(vec![Ok(Some(GIB))]);
+        let end = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap();
+        assert!(matches!(end, MonitorEnd::Exited { .. }));
+        assert!(probe.calls >= 2, "calls {}", probe.calls);
+        assert!(probe.calls <= 1000 / 50 + 1, "calls {}", probe.calls);
+    }
+
+    /// REQ-39: 期限到達と同時に RSS が超過しても時間超過を優先する。
+    #[test]
+    fn req39_time_limit_takes_precedence_over_memory() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None), Ok(Some(9))], 20_000);
+        let mut probe = FakeProbe::new(vec![Ok(Some(3 * GIB))]);
+        let end = run_mem(&clock, &mut child, &mut probe, INFER_TIME_LIMIT).unwrap();
+        assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
+        assert_eq!(probe.calls, 0);
+    }
+
+    /// REQ-39: メモリ上限は 0 と暫定上限超を拒否し（64）、ちょうどは受理する。
+    #[test]
+    fn req39_memory_limit_bounds() {
+        assert_eq!(
+            MemoryLimit::new(0),
+            Err(ResourceConfigError::MemoryLimitOutOfRange)
+        );
+        assert_eq!(
+            MemoryLimit::new(INFER_RSS_LIMIT_BYTES + 1),
+            Err(ResourceConfigError::MemoryLimitOutOfRange)
+        );
+        assert_eq!(
+            MemoryLimit::new(INFER_RSS_LIMIT_BYTES).unwrap().get(),
+            2_147_483_648
+        );
+        assert_eq!(MemoryLimit::new(1).unwrap().get(), 1);
+        assert_eq!(
+            ResourceConfigError::MemoryLimitOutOfRange.code(),
+            "memory_limit_out_of_range"
+        );
+        assert_eq!(
+            ResourceConfigError::MemoryLimitOutOfRange
+                .exit_code()
+                .code(),
+            64
+        );
+    }
+
+    /// REQ-39: 既定設定は 2 GiB のメモリ上限を持ち、`RunConfig::new` は持たない。
+    #[test]
+    fn req39_default_config_has_2gib_memory_limit() {
+        assert_eq!(RunConfig::default().memory_limit(), Some(2_147_483_648));
+        let t = TimeLimit::infer_default();
+        assert_eq!(RunConfig::new(t, 1, 1).unwrap().memory_limit(), None);
+        let with = RunConfig::new(t, 1, 1)
+            .unwrap()
+            .with_memory_limit(MemoryLimit::new(64).unwrap());
+        assert_eq!(with.memory_limit(), Some(64));
+    }
+
+    /// REQ-39: `/proc/<pid>/status` の VmRSS 行（kB）をバイトにする。
+    #[test]
+    fn req39_parse_proc_status_vmrss() {
+        assert_eq!(
+            parse_proc_status_vmrss("Name:\tx\nVmRSS:\t  2048 kB\nThreads:\t1\n"),
+            Ok(Some(2_097_152))
+        );
+        assert_eq!(parse_proc_status_vmrss("Name:\tx\nState:\tZ\n"), Ok(None));
+        assert_eq!(parse_proc_status_vmrss("VmRSS:\tabc kB\n"), Err(ProbeError));
+        assert_eq!(parse_proc_status_vmrss("VmRSS:\t10 MB\n"), Err(ProbeError));
+        assert_eq!(parse_proc_status_vmrss("VmRSS:\t10\n"), Err(ProbeError));
+        // u64 * 1024 がオーバーフローする値。
+        assert_eq!(
+            parse_proc_status_vmrss("VmRSS:\t18446744073709551615 kB\n"),
+            Err(ProbeError)
+        );
+    }
+
+    /// REQ-39: `ps -o rss=` の出力（KiB）をバイトにする。
+    #[test]
+    fn req39_parse_ps_rss() {
+        assert_eq!(parse_ps_rss("  2048\n"), Ok(Some(2_097_152)));
+        assert_eq!(parse_ps_rss(""), Ok(None));
+        assert_eq!(parse_ps_rss("\n"), Ok(None));
+        assert_eq!(parse_ps_rss("abc"), Err(ProbeError));
+        assert_eq!(parse_ps_rss("12 34"), Err(ProbeError));
+        assert_eq!(parse_ps_rss("18446744073709551615"), Err(ProbeError));
+    }
+
+    /// REQ-39・REQ-21: メモリ超過の記録は `memory_limit_exceeded`・終了コード 20で、数値を保持する。
+    #[test]
+    fn req39_memory_record_is_memory_and_20() {
+        let rec = ResourceLimitExceeded::memory(
+            INFER_TIME_LIMIT,
+            INFER_RSS_LIMIT_BYTES,
+            2_190_000_000,
+            Duration::from_secs(1),
+            true,
+        );
+        assert_eq!(rec.kind(), ResourceKind::Memory);
+        assert_eq!(rec.code(), "memory_limit_exceeded");
+        assert_eq!(rec.exit_code().code(), 20);
+        assert_eq!(rec.memory_limit_bytes(), Some(2_147_483_648));
+        assert_eq!(rec.observed_rss_bytes(), Some(2_190_000_000));
+        assert_eq!(rec.limit(), INFER_TIME_LIMIT);
+        let time = ResourceLimitExceeded::time(INFER_TIME_LIMIT, Duration::from_secs(10), true);
+        assert_eq!(time.memory_limit_bytes(), None);
+        assert_eq!(time.observed_rss_bytes(), None);
+    }
+
+    /// REQ-39: 新しい runner の失敗コードは 70 の固定語彙。
+    #[test]
+    fn req39_memory_run_errors_are_runtime_error() {
+        assert_eq!(
+            GuardRunError::MemoryProbe.exit_code(),
+            ExitCode::RuntimeError
+        );
+        assert_eq!(
+            GuardRunError::MemoryLimitUnsupported.code(),
+            "memory_limit_unsupported"
+        );
+        assert_eq!(
+            GuardRunError::MemoryLimitUnsupported.exit_code(),
+            ExitCode::RuntimeError
+        );
     }
 }

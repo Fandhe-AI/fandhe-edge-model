@@ -5,8 +5,8 @@
 //! （実プロセス・実時計・合成 sleeper）。実 CLI の推論が 10 秒を超える実測ではない。
 
 use fandhe_edge_guard::resource::{
-    GuardedCommand, GuardedRunOutcome, INFER_TIME_LIMIT, ResourceKind, RunConfig, TimeLimit,
-    run_with_limits,
+    DEFAULT_STDERR_CAP, DEFAULT_STDOUT_CAP, GuardedCommand, GuardedRunOutcome, INFER_TIME_LIMIT,
+    ResourceKind, RunConfig, TimeLimit, run_with_limits,
 };
 use std::time::Duration;
 
@@ -77,7 +77,14 @@ fn req39_infer_time_limit_is_10_seconds() {
 /// REQ-39・PoC-20 ケース 3: 10 秒を超える子は kill され、時間超過として記録される。
 #[test]
 fn req39_child_exceeding_10s_is_killed_and_recorded_as_time_limit() {
-    let outcome = run_with_limits(&child("sleep60"), &RunConfig::default()).unwrap();
+    // 時間上限だけを検証する（既定設定はメモリ上限も持ち、計測手段の無い OS では fail-closed になる）。
+    let cfg = RunConfig::new(
+        TimeLimit::infer_default(),
+        DEFAULT_STDOUT_CAP,
+        DEFAULT_STDERR_CAP,
+    )
+    .unwrap();
+    let outcome = run_with_limits(&child("sleep60"), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
         panic!("expected LimitExceeded");
     };
