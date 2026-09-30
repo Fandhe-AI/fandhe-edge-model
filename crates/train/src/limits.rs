@@ -189,3 +189,9 @@ pub const SUPERVISOR_SHUTDOWN_GRACE_SECONDS: u32 = 60;
 /// Rust 側固有の値で、学習ワーカー側に対応する定数は無い（共有 fixture の対象外）。
 /// 暫定値で、実機での測定に基づく見直しは別途。
 pub const COOPERATIVE_CANCEL_GRACE_SECONDS: u32 = 15;
+
+/// ジョブ記録（`job.json`）の読み込み上限（バイト。REQ-34・REQ-39・TASK-34.2）。
+/// 記録は状態・時刻・失敗内訳だけの数百バイトの JSON（データ本文を含まない）で、
+/// 想定の 100 倍以上の余裕を持たせつつ、状態確認が巨大ファイルを読まないための上限。
+/// Rust 側固有の値で、学習ワーカー側に対応する単一真実源を持たない。
+pub const MAX_JOB_RECORD_BYTES: usize = 64 * 1024;

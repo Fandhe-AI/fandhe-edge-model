@@ -238,15 +238,28 @@ _CANCEL_ACK_MESSAGE = "training cancelled by caller"
 _CANCEL_CLEANUP_INCOMPLETE_MESSAGE = "training cancelled but cleanup incomplete"
 _RESERVED_MESSAGES = frozenset({_CANCEL_ACK_MESSAGE, _CANCEL_CLEANUP_INCOMPLETE_MESSAGE})
 
+#: worker がシグナルで終了し `_classify_self_exit` が `None`（資源上限による
+#: 自己終了ではない）だったときの固定文言の接頭辞。Rust 側
+#: （`crates/train/src/job_record.rs`）はこの接頭辞の直後に整数だけが続く完全一致を
+#: 「クラッシュ」と分類する。共有 fixture
+#: （`fixtures/train_contract/worker_crash_message.json`）で両側を照合する。
+#: REQ-34・TASK-34.2・#146。
+_WORKER_SIGNAL_MESSAGE_PREFIX = "worker terminated by signal "
+
 
 def _forward_worker_error(payload: dict[str, Any]) -> dict[str, Any]:
     """worker が返したエラー JSON を転送用に整える。
 
-    キャンセル応答の予約文言と一致する `message` は、supervisor 自身の応答と
+    キャンセル応答の予約文言と一致する `message`、および supervisor 自身の
+    「シグナル終了」文言の接頭辞で始まる `message` は、supervisor 自身の応答と
     取り違えられないよう固定の別文言へ置き換える（フィールドの追加・意味の変更は
-    しない。JSON 契約は不変）。REQ-34・#145。
+    しない。JSON 契約は不変）。後者は worker が偽装して Rust 側にクラッシュと
+    誤分類させるのを防ぐ。REQ-34・#145・TASK-34.2・#146。
     """
-    if payload.get("message") in _RESERVED_MESSAGES:
+    message = payload.get("message")
+    if message in _RESERVED_MESSAGES or (
+        isinstance(message, str) and message.startswith(_WORKER_SIGNAL_MESSAGE_PREFIX)
+    ):
         return {**payload, "message": "worker reported an error"}
     return payload
 
@@ -454,6 +467,12 @@ def _classify_self_exit(
     外部からの kill でも起こりうるため、CPU 消費量で区別する）。
     いずれにも該当しなければ `None`（呼び出し元が通常の終了処理・
     シグナル終了の判定を続ける）。
+
+    ジョブのクラッシュ検出（REQ-34・TASK-34.2・#146）との関係: `"cpu"` は設計上の
+    資源上限による停止（`limit_exceeded`）でありクラッシュではない。`None` のまま
+    シグナルで終了した worker（CPU 消費がソフト上限未満の `SIGKILL`・`SIGSEGV`・
+    OOM killer 等の外部要因）は `worker terminated by signal N` の `runtime_error`
+    として報告され、Rust 側（`crates/train/src/job_record.rs`）が「クラッシュ」と分類する。
     """
     returncode = proc.returncode
     if returncode is None or returncode >= 0:
@@ -1041,7 +1060,7 @@ def _monitor_worker_and_finalize(
             {
                 "status": "error",
                 "code": "runtime_error",
-                "message": f"worker terminated by signal {-returncode}",
+                "message": f"{_WORKER_SIGNAL_MESSAGE_PREFIX}{-returncode}",
             }
         )
         return ExitCode.RUNTIME_ERROR
