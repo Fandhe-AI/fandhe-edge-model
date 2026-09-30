@@ -49,10 +49,10 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 #### 容量の実機計測（REQ-30・TASK-30.1・#121）
 
-- Mac（Apple Silicon）で人が実行する。前提は `register → inspect → train → evaluate → select → package` を完走させた、実データで学習した C1・C3 のプロジェクト（GPU を使う学習は人が実行する）。Agent は単独で実行しない
+- Mac（Apple Silicon）で人が実行する。前提は、実データで学習した C1・C3 のプロジェクトを、評価データ（`evaluation.jsonl`）なしで `register → inspect → train → evaluate → select → package` まで完走させたもの（GPU を使う学習は人が実行する）。現行の `package` は評価データがあるプロジェクトを評価完了記録が未実装（#314）のため常に拒否するので、評価データありのプロジェクトでは計測対象の `package/` を作れない。評価済みパッケージの計測は #314 の対応後の手順とする（評価データなしのときの `evaluate` は `status:"skipped"`・exit 0）。Agent は単独で実行しない
 - 実行: 先にリポジトリで `cargo build -p fandhe-edge-cli --example package_capacity` を実行する。その後、プロジェクトの `package/` 配下で `<repo>/target/debug/examples/package_capacity weights=<onnx> label_table=definition.json metadata=artifact.json` を実行する（`package/` はリポジトリ外のため cargo は workspace を見つけられず、ビルド済みバイナリを直接呼ぶ。経路はカレントディレクトリ配下に閉じ込められる。REQ-39）
 - 記録: `total_bytes` と 5 要素の内訳・kind（C1 / C3）と `onnx_sha256`・機種とメモリ・実行日・証拠種別「実機」を Issue #121 のコメントか PR に残す
-- 40MB は目安で合否条件ではない。C1 の 2.57MB は語彙を ONNX 外に持つ旧方式の値で、比較の参考にとどめる
+- 40MB（REQ-30 の目安）は実機計測の参考値。一方、現行の `package` は `crates/cli/src/stages/package.rs` の `CAPACITY_LIMIT_BYTES = 40_000_000`（暫定の固定値）で容量を照合し、超過すると `limit_exceeded`(20) を返す公開上限として働く。計測結果の評価では両者を区別する。C1 の 2.57MB は語彙を ONNX 外に持つ旧方式の値で、比較の参考にとどめる
 - `crates/runtime/tests/capacity_generated_packages.rs` は `fixtures/onnx_parity/` の生成物で内訳を照合するテストハーネスで、既定の `make test` で実行される（実機の証拠にはならない）
 
 #### sandbox 下の完走確認（REQ-38・TASK-38.1-1・#162）
