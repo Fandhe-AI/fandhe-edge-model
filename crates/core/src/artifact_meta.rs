@@ -17,6 +17,14 @@
 //! 移行手順は、既存の `artifact.json` に `"kind": "<c1|c3|autoregressive>"` を追加すること
 //! （学習ワーカーが出力する `artifact.json` は常に `kind` を持つ）。
 //!
+//! # 移行（破壊的変更。#174）
+//!
+//! `kind_version` も**必須**（`u32` の範囲の整数。欠落・文字列・負数・小数・範囲外は拒否）。
+//! 省略を許すと版の許可リスト検査の迂回路になるため。値の内容（許可リスト外か）は本モジュールでは
+//! 判定せず、ガード層の `KindVersionAllowlist` に一本化する。`kind_version` を持たない既存の
+//! `artifact.json` は `infer` で `invalid_input`（64）になる。移行手順は `"kind_version": 1` を
+//! 追加すること（学習ワーカーが出力する `artifact.json` は常に `kind_version` を持つ）。
+//!
 //! # 信頼境界
 //!
 //! 入力は信頼できないデータ。値の妥当性（ルート配下か）は本モジュールでは判定せず、
@@ -54,6 +62,7 @@ impl std::error::Error for ArtifactMetaError {}
 struct Raw {
     onnx_file: String,
     kind: String,
+    kind_version: u32,
 }
 
 /// `artifact.json` から取り出した ONNX ファイルへの参照（未検証の相対パス文字列）。
@@ -61,6 +70,7 @@ struct Raw {
 pub struct ArtifactOnnxRef {
     onnx_file: String,
     kind: String,
+    kind_version: u32,
 }
 
 impl ArtifactOnnxRef {
@@ -83,6 +93,7 @@ impl ArtifactOnnxRef {
         Ok(Self {
             onnx_file: raw.onnx_file,
             kind: raw.kind,
+            kind_version: raw.kind_version,
         })
     }
 
@@ -96,6 +107,12 @@ impl ArtifactOnnxRef {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+
+    /// 未検証の `kind_version`。ガード層の `KindVersionAllowlist` 検査の入力にのみ使い、
+    /// 検査を通す前に下流（ランタイム・出力）へ渡さない。
+    pub fn kind_version(&self) -> u32 {
+        self.kind_version
+    }
 }
 
 #[cfg(test)]
@@ -105,8 +122,10 @@ mod tests {
     /// REQ-39: 正常系。未知フィールドは無視する。
     #[test]
     fn req39_parse_extracts_onnx_file_and_ignores_unknown() {
-        let r =
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"model.onnx","kind":"c3","n":1}"#).expect("ok");
+        let r = ArtifactOnnxRef::parse(
+            br#"{"onnx_file":"model.onnx","kind":"c3","kind_version":1,"n":1}"#,
+        )
+        .expect("ok");
         assert_eq!(r.onnx_file(), "model.onnx");
         assert_eq!(r.kind(), "c3");
     }
@@ -116,12 +135,12 @@ mod tests {
     fn req39_parse_rejects_malformed() {
         for b in [
             &br#"{}"#[..],
-            br#"{"onnx_file":1,"kind":"c3"}"#,
-            br#"{"onnx_file":null,"kind":"c3"}"#,
+            br#"{"onnx_file":1,"kind":"c3","kind_version":1}"#,
+            br#"{"onnx_file":null,"kind":"c3","kind_version":1}"#,
             br#"{"onnx_file":"model.onnx"}"#,
-            br#"{"onnx_file":"model.onnx","kind":1}"#,
-            br#"{"onnx_file":"model.onnx","kind":null}"#,
-            br#"{"onnx_file":"model.onnx","kind":[]}"#,
+            br#"{"onnx_file":"model.onnx","kind":1,"kind_version":1}"#,
+            br#"{"onnx_file":"model.onnx","kind":null,"kind_version":1}"#,
+            br#"{"onnx_file":"model.onnx","kind":[],"kind_version":1}"#,
             b"not json",
             br#"["onnx_file"]"#,
             b"",
@@ -134,11 +153,11 @@ mod tests {
     #[test]
     fn req39_parse_rejects_empty_and_nul() {
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"","kind":"c3"}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"","kind":"c3","kind_version":1}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b","kind":"c3"}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b","kind":"c3","kind_version":1}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
     }
@@ -147,17 +166,46 @@ mod tests {
     #[test]
     fn req39_parse_does_not_judge_kind_content() {
         for k in ["", "c3; rm -rf ~", "PT"] {
-            let json = format!(r#"{{"onnx_file":"model.onnx","kind":"{k}"}}"#);
+            let json = format!(r#"{{"onnx_file":"model.onnx","kind":"{k}","kind_version":1}}"#);
             let r = ArtifactOnnxRef::parse(json.as_bytes()).expect("ok");
             assert_eq!(r.kind(), k);
         }
     }
 
+    /// REQ-39・TASK-39.6-1: `kind_version` は必須の `u32`。値の内容（99 など）は判定せず読める。
+    #[test]
+    fn req39_parse_reads_kind_version_without_judging() {
+        for (lit, v) in [("1", 1u32), ("99", 99), ("0", 0), ("4294967295", u32::MAX)] {
+            let json = format!(r#"{{"onnx_file":"m.onnx","kind":"c3","kind_version":{lit}}}"#);
+            let r = ArtifactOnnxRef::parse(json.as_bytes()).expect("ok");
+            assert_eq!(r.kind_version(), v);
+        }
+    }
+
+    /// REQ-39・TASK-39.6-1: `kind_version` の欠落・型違い・範囲外は Malformed（fail-closed）。
+    #[test]
+    fn req39_parse_rejects_missing_or_invalid_kind_version() {
+        for lit in [r#""1""#, "-1", "1.5", "null", "[]", "true", "4294967296"] {
+            let json = format!(r#"{{"onnx_file":"m.onnx","kind":"c3","kind_version":{lit}}}"#);
+            assert_eq!(
+                ArtifactOnnxRef::parse(json.as_bytes()),
+                Err(ArtifactMetaError::Malformed),
+                "{lit}"
+            );
+        }
+        assert_eq!(
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"m.onnx","kind":"c3"}"#),
+            Err(ArtifactMetaError::Malformed)
+        );
+    }
+
     /// REQ-39: エラー文言に入力値を含めない。
     #[test]
     fn req39_error_display_has_no_input_value() {
-        let e = ArtifactOnnxRef::parse(br#"{"onnx_file":1,"kind":"c3","secret":"../../etc"}"#)
-            .unwrap_err();
+        let e = ArtifactOnnxRef::parse(
+            br#"{"onnx_file":1,"kind":"c3","kind_version":1,"secret":"../../etc"}"#,
+        )
+        .unwrap_err();
         assert!(!e.to_string().contains("etc"));
     }
 }

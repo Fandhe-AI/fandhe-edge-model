@@ -24,6 +24,7 @@ mod unix_only {
         "{\"code\":\"invalid_input\",\"message\":\"kind rejected: unsupported_kind\"}\n";
     const MALFORMED_KIND: &str =
         "{\"code\":\"invalid_input\",\"message\":\"kind rejected: malformed_kind\"}\n";
+    const UNSUPPORTED_KIND_VERSION: &str = "{\"code\":\"invalid_input\",\"message\":\"kind_version rejected: unsupported_kind_version\"}\n";
     const META_INVALID: &str =
         "{\"code\":\"invalid_input\",\"message\":\"artifact metadata is invalid\"}\n";
 
@@ -82,7 +83,11 @@ mod unix_only {
     }
 
     fn meta(kind_json: &str, onnx: &str) -> String {
-        format!(r#"{{"onnx_file":"{onnx}","kind":{kind_json}}}"#)
+        meta_v(kind_json, "1", onnx)
+    }
+
+    fn meta_v(kind_json: &str, version_json: &str, onnx: &str) -> String {
+        format!(r#"{{"onnx_file":"{onnx}","kind":{kind_json},"kind_version":{version_json}}}"#)
     }
 
     /// 「unpickle されたらマーカーに空ファイルを作る」だけの無害な pickle 形。
@@ -173,7 +178,7 @@ mod unix_only {
     fn req39_missing_or_non_string_kind_is_rejected() {
         let sb = Sandbox::new("kind-missing");
         let metas = [
-            r#"{"onnx_file":"model.onnx"}"#.to_string(),
+            r#"{"onnx_file":"model.onnx","kind_version":1}"#.to_string(),
             meta("1", "model.onnx"),
             meta("null", "model.onnx"),
             meta("[]", "model.onnx"),
@@ -200,6 +205,59 @@ mod unix_only {
         for k in ["\"c1\"", "\"c3\"", "\"autoregressive\""] {
             sb.setup(&meta(k, "model.onnx"), "model.onnx", &MIN_ONNX);
             sb.assert_infer(70, STUB);
+        }
+    }
+
+    /// REQ-39・PoC-20 ケース 7（テストハーネス）: 許可リスト外の `kind_version` は推論前に拒否され、
+    /// 出力に版番号・パス・CANARY を含めない。
+    #[test]
+    fn req39_kind_version_99_is_rejected_before_inference() {
+        let sb = Sandbox::new("kv-99");
+        for (k, v) in [
+            ("\"c3\"", "99"),
+            ("\"c1\"", "99"),
+            ("\"autoregressive\"", "99"),
+            ("\"c3\"", "0"),
+            ("\"c3\"", "2"),
+            ("\"c3\"", "4294967295"),
+        ] {
+            sb.setup(&meta_v(k, v, "model.onnx"), "model.onnx", &MIN_ONNX);
+            sb.assert_infer(64, UNSUPPORTED_KIND_VERSION);
+        }
+    }
+
+    /// REQ-39: 版の検査はモデルのバイト列を開くより先に効く（モデルが pickle でも版の拒否が返る）。
+    #[test]
+    fn req39_kind_version_is_checked_before_model_bytes() {
+        let sb = Sandbox::new("kv-order");
+        let p = marker_pickle(4, &sb.marker());
+        sb.setup(&meta_v("\"c3\"", "99", "model.onnx"), "model.onnx", &p);
+        sb.assert_infer(64, UNSUPPORTED_KIND_VERSION);
+    }
+
+    /// REQ-39: `kind` の検査が `kind_version` より先に効く。
+    #[test]
+    fn req39_kind_is_checked_before_kind_version() {
+        let sb = Sandbox::new("kv-kind-first");
+        sb.setup(
+            &meta_v("\"pt\"", "99", "model.onnx"),
+            "model.onnx",
+            &MIN_ONNX,
+        );
+        sb.assert_infer(64, UNSUPPORTED_KIND);
+    }
+
+    /// REQ-39: `kind_version` の欠落・型違い・範囲外は必須違反として `artifact metadata is invalid`。
+    #[test]
+    fn req39_missing_or_non_integer_kind_version_is_rejected() {
+        let sb = Sandbox::new("kv-invalid");
+        let mut metas = vec![r#"{"onnx_file":"model.onnx","kind":"c3"}"#.to_string()];
+        for v in ["\"1\"", "-1", "1.5", "null", "4294967296"] {
+            metas.push(meta_v("\"c3\"", v, "model.onnx"));
+        }
+        for m in metas {
+            sb.setup(&m, "model.onnx", &MIN_ONNX);
+            sb.assert_infer(64, META_INVALID);
         }
     }
 }

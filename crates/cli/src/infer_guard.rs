@@ -1,5 +1,5 @@
 //! `infer` の `--package` と `onnx_file` を経路の閉じ込めへ通す統合（REQ-39・PoC-20 ケース 1・
-//! TASK-39.4-2・#159・`kind` の許可リスト検査は TASK-39.2-4・#156）。
+//! TASK-39.4-2・#159・`kind` の許可リスト検査は TASK-39.2-4・#156・`kind_version` は TASK-39.6-1・#174）。
 //!
 //! # 呼び出し文脈
 //!
@@ -11,10 +11,12 @@
 //!
 //! 1. `--package` を workspace（カレントディレクトリ）配下へ閉じ込め、ディレクトリであることを確認
 //! 2. パッケージ配下の `artifact.json` を、開いた fd から上限付きで読む
-//! 3. `onnx_file` と `kind` を取り出す（欠落・型違いは `artifact metadata is invalid`・64）
+//! 3. `onnx_file`・`kind`・`kind_version` を取り出す（欠落・型違いは `artifact metadata is invalid`・64）
 //! 4. `kind` を許可リスト（`KindAllowlist::supported()`）で検査する。拒否は
 //!    `kind rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う（fail-closed）
-//! 5. `onnx_file` を、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
+//! 5. `kind_version` を `kind` ごとの許可リスト（`KindVersionAllowlist::supported()`）で検査する。
+//!    拒否は `kind_version rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う
+//! 6. `onnx_file` を、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
 //!    拡張子（`.onnx`）を確認し、保持した fd を上限（`MAX_MODEL_FILE_BYTES`）付きで読み切って
 //!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
 //!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
@@ -25,10 +27,9 @@
 //! 戻り値を「完全性・版まで検証済み」と扱ってはならない。
 //!
 //! - 完全性（モデルの sha256 照合・ハッシュ一致の検証）: #168（TASK-39.3-2。親 #166）
-//! - 版（`kind_version` の許可リスト検証）: #174（TASK-39.6-1。親 #173）
 //! - 読み込み前のサイズ上限の正式値: #172（TASK-39.5-3）
 //!
-//! パッケージ形式に `kind_version`・sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。
+//! パッケージ形式のうち sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。`kind_version` の許可リスト検査は TASK-39.6-1（#174）で実装済み。
 //! `--input-file`・`--out` の閉じ込めも範囲外。
 //!
 //! # 後続（#136）への申し送り
@@ -50,6 +51,7 @@ use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_guard::format::{CheckedFile, FormatAllowlist, FormatRejection, check_open_file};
 use fandhe_edge_guard::kind::{CheckedKind, KindAllowlist};
+use fandhe_edge_guard::kind_version::{CheckedKindVersion, KindVersionAllowlist};
 use fandhe_edge_guard::model_file::MODEL_FILE_EXTENSION;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::ConfinedPath;
@@ -63,12 +65,14 @@ const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 経路の閉じ込めと形式の許可制のみを通過した `infer` の入力。
 ///
-/// **完全性（sha256）と版（`kind_version`）は未検証**（#168・#174。モジュール doc 参照）。
-/// 改変されたモデルや非対応の版のパッケージでも、経路と形式が正しければ返る。
+/// **完全性（sha256）は未検証**（#168。モジュール doc 参照）。改変されたモデルでも、経路・形式・版が
+/// 正しければ返る。`kind_version` は許可リスト検査済み。
 #[derive(Debug)]
 pub struct PathFormatCheckedInputs {
     /// 許可リストで検査済みの `kind`（`&'static str`。入力の文字列は流れない）。
     pub kind: CheckedKind,
+    /// 許可リストで検査済みの `kind_version`（`kind` との組で合格した証明。TASK-39.6-1・#174）。
+    pub kind_version: CheckedKindVersion,
     /// workspace 配下へ閉じ込め済みのパッケージ。
     pub package: ConfinedPackage,
     /// 閉じ込めつきで開き、形式検査のみを通した ONNX のバイト列（sha256 未照合）。読むときはこれだけを使う。
@@ -78,7 +82,7 @@ pub struct PathFormatCheckedInputs {
 }
 
 /// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式のみ検査する。
-/// sha256・`kind_version` は検査しない（#168・#174）。
+/// sha256 は検査しない（#168）。`kind_version` は許可リストで検査する（#174）。
 ///
 /// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
 ///
@@ -104,6 +108,10 @@ pub fn check_infer_path_and_format(
     let kind = KindAllowlist::supported()
         .check(onnx_ref.kind())
         .map_err(|e| e.to_error_report())?;
+    // 版の検査も同様にモデルのバイト列を開く前に行う（REQ-39・PoC-20 ケース 7・TASK-39.6-1）。
+    let kind_version = KindVersionAllowlist::supported()
+        .check(kind, onnx_ref.kind_version())
+        .map_err(|e| e.to_error_report())?;
     let (onnx, onnx_path) = package
         .open_member(Path::new(onnx_ref.onnx_file()))
         .map_err(|e| e.to_error_report())?;
@@ -128,6 +136,7 @@ pub fn check_infer_path_and_format(
     .map_err(|e| e.to_error_report())?;
     Ok(PathFormatCheckedInputs {
         kind,
+        kind_version,
         package,
         onnx,
         onnx_path,

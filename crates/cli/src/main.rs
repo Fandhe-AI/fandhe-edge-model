@@ -11,7 +11,7 @@
 //!   exit 64（フィールドは増やさない）。
 //! - `infer`: 解析成功後、`--package` と `artifact.json` の `onnx_file`・`kind` を経路ガード・許可リスト
 //!   （`infer_guard`。REQ-39・#159・#156）へ通し、拒否は `invalid_input`（64）等の JSON 1 行で
-//!   終える。経路・形式の検査（sha256・kind_version は未検証。#168・#174）を通過した後の推論本体は #136 で未接続のため、下のスタブ（70）へ進む。
+//!   終える。経路・形式の検査（sha256 は未検証。#168）を通過した後の推論本体は #136 で未接続のため、下のスタブ（70）へ進む。
 //! - 解析に成功したコマンド: 下位層への接続は TASK-33.1-2（#136）の範囲の
 //!   ため、完走を装わず `runtime_error`（exit 70）で未実装を返す。
 
@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
     let report = match args::parse(std::env::args_os().skip(1)) {
         Ok(Invocation::Help(topic)) => ErrorReport::new(ExitCode::Ok, args::render_help(topic)),
         Ok(Invocation::Run(Command::Infer(infer_args))) => {
-            // 経路の閉じ込めと形式検査を通過するまで何も読まない（REQ-39）。sha256・kind_version は未検証（#168・#174）。workspace はカレントディレクトリ。
+            // 経路の閉じ込めと形式検査を通過するまで何も読まない（REQ-39）。sha256 は未検証（#168）。workspace はカレントディレクトリ。
             match std::env::current_dir() {
                 Err(_) => {
                     ErrorReport::new(ExitCode::RuntimeError, "cannot resolve working directory")
