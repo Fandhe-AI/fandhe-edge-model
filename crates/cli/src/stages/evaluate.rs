@@ -29,6 +29,12 @@
 //! （成果物の検証・バックエンドの試し組み立て・評価データの事前検査・台帳の用意と事前登録・
 //! 記録ファイルの不在確認）はすべて `apply_once` の前に済ませる。
 //!
+//! # 推論失敗の扱い
+//!
+//! 1 件でも推論または判定への変換に失敗したら、評価全体を失敗（`runtime_error` / `limit_exceeded`）
+//! とし、完了記録を書かない（成功 JSON・配布許可を作らない。REQ-27）。適用権は消費済みのため、
+//! その候補は再評価できない（fail-closed）。
+//!
 //! # 評価完了の記録
 //!
 //! 成功時は `candidates/<N>/evaluation_record.json`（[`EvaluationRecord`]）を新規に書く。`package` は
@@ -458,20 +464,19 @@ fn apply_to_frozen_data(
                 if deadline.is_some_and(|d| Instant::now() > d) {
                     return Err(EvalPredictFailure::TimeLimit);
                 }
-                outcomes.push(match pipeline.infer_one_within(input, INFER_TIME_LIMIT) {
-                    Ok(prediction) => {
-                        match judgment_from_prediction(options, PLACEHOLDER_ID, &prediction) {
-                            Ok(judgment) => {
-                                Outcome::Label(judgment.predicted_choice_id().to_string())
-                            }
-                            Err(_) => Outcome::Error,
-                        }
-                    }
+                // 推論・判定への変換の失敗は 1 件ごとの `Outcome::Error` にせず、評価全体の失敗として
+                // 伝える。`Ok` で返すと、全件が失敗しても完了記録と配布許可が作られてしまう（REQ-27）。
+                // 失敗時は評価器が成功を記録しないため、`package` は配布を許さない。
+                let prediction = match pipeline.infer_one_within(input, INFER_TIME_LIMIT) {
+                    Ok(prediction) => prediction,
                     Err(InferError::Backend(BackendError::TimeLimitExceeded)) => {
                         return Err(EvalPredictFailure::TimeLimit);
                     }
-                    Err(_) => Outcome::Error,
-                });
+                    Err(_) => return Err(EvalPredictFailure::Failed),
+                };
+                let judgment = judgment_from_prediction(options, PLACEHOLDER_ID, &prediction)
+                    .map_err(|_| EvalPredictFailure::Failed)?;
+                outcomes.push(Outcome::Label(judgment.predicted_choice_id().to_string()));
             }
             Ok(outcomes)
         },
