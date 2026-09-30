@@ -71,6 +71,12 @@ make doctor      # 環境診断のみ（何も導入しない）
 - `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
 - 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
 
+#### sandbox 監視チェーンの統合確認（REQ-38・TASK-38.1・#161）
+
+- 手順と PR への記録項目は [docs/design/sandbox-offline-check-procedure.md](docs/design/sandbox-offline-check-procedure.md)。実機での完走確認と拒否ログの記録は**人が実行**する
+- `crates/cli/tests/sandbox_pipeline_real_trainer.rs` は実 CLI と実 trainer（CPU・合成データ `fixtures/sandbox_run/`）で `sandbox-monitor.sh` → `sandbox-run.sh` を通すテストハーネス（`#[ignore]`。`make test-trainer-integration` で実行。`python-ci` と `make ci` で実際に走る）。launcher・`log` は偽物で、実機の証拠にならない。既定集合から移したテストではない
+- 評価データなしの `evaluate`（`skipped`）経路のみ。評価本体の配線前で、評価の完走は未達。陽性対照は TASK-38.2（#164）
+
 #### Claude Code の許可操作（確認画面）の確認（REQ-36・TASK-36.3・#160）
 
 - 確認は [docs/design/claude-code-permission-prompt-procedure.md](docs/design/claude-code-permission-prompt-procedure.md) の手順で、確認画面が出る権限モードの Claude Code を使い**人が手動実行**する。Agent は手順と記録テンプレートの準備までで、実機の結果を Agent が確定させない。受け入れ条件は人の実測記録（証拠種別: 実機）が貼られて初めて満たされ、M9 もそれまで完了扱いにしない
@@ -85,7 +91,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
 - `crates/train/tests/real_trainer.rs` は実 `trainer/`（MLX・C1/C3・ONNX 書き出し）を Rust の `run_train` から起動して学習ジョブを完走させる（REQ-18/19/34/39。証拠種別: テストハーネス・合成データ・CPU）。`make py-sync` 済みの `trainer/.venv` と MLX CPU が必要で、`rust-ci` の 3 OS runner には無いため `#[ignore]` で既定の `make test` から分離している
-- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 2 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
+- 実行コマンドは `make test-trainer-integration`（`--ignored --exact` で 3 件のテストを個別に起動し、各起動の出力で `1 passed` を検査する）。`python-ci`（macos-14 arm64）とローカルの `make ci` で実際に実行される。GPU・実機測定を伴わないため上の実機前提テストとは別扱いで、CI で実行されない分離は P0
 - `rust-ci` では `ignored` と報告され、Windows は `#![cfg(unix)]` で対象外（`run_train` が `UnsupportedPlatform`）
 
 ### 学習ワーカーの起動契約（Issue #12）
