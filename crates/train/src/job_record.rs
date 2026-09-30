@@ -12,8 +12,8 @@
 //!
 //! `job_dir` に 2 つを置く（`process.rs` の `request.json` と同じディレクトリ）。
 //!
-//! - `job.json`: 記録本体（[`JobRecord`]）。`tmp` への書き込み→`sync_all`→`rename` で
-//!   原子的に置き換える。データ本文・パス・ワーカーの stderr は含めない。
+//! - `job.json`: 記録本体（[`JobRecord`]）。`tmp` への書き込み→`sync_all`→`rename`→親ディレクトリの
+//!   `sync_all` で原子的に置き換える。データ本文・パス・ワーカーの stderr は含めない。
 //! - `job.lock`: 生存確認用の advisory lock（std の `File::try_lock`。unix では
 //!   `flock`）。ジョブを所有するプロセスがジョブの生存期間中ずっと保持し、カーネルが
 //!   プロセスの終了時（`SIGKILL`・panic を含む）に必ず解放する。`job.json` は
@@ -56,6 +56,9 @@
 //!   `failed`＋`OwnerLost` の記録を新規に書いて回復する（取れなければ初期化中の
 //!   `running`）。公開前に落ちた場合は `job.lock.init.*` が残りうるが状態確認には
 //!   影響しない（掃除は TASK-34.3・#147）。
+//! - 所有者と同一プロセスから状態確認を呼んでも、プロセス内レジストリ（dev, ino）で
+//!   所有者の生存を判定し `job.lock` の取得を試みない（fcntl 系の lock 実装では同一
+//!   プロセス内の取得が成功し、close で所有者の lock が失われるため）。
 //! - `finish` を呼ばずに drop（panic 等）された場合も lock は解放されるため、状態確認が
 //!   `OwnerLost` を検出する（意図した挙動）。
 //! - 読み手同士は `job.check.lock`（blocking の advisory lock）で直列化する。同時に
@@ -73,9 +76,11 @@
 //!   （REQ-34）ため記録に `resumable` は持たない。
 //! - 記録のスキーマ（`schema_version: 1`）は暫定の内部形式で、spec に明記が無い。
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,6 +102,61 @@ pub const JOB_LOCK_FILE: &str = "job.lock";
 pub const JOB_CHECK_LOCK_FILE: &str = "job.check.lock";
 /// `begin` の lock 済み一時ファイル名の重複回避用（同一プロセス内の並行 `begin`）。
 static INIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// このプロセス内で所有者（[`JobRecorder`]）が保持中の `job.lock` の識別子（dev, ino）。
+///
+/// 状態確認が所有者と同一プロセスで呼ばれた場合に、advisory lock の実装差（fcntl 系は
+/// プロセス単位で、同一プロセス内の取得が成功し、close で所有者の lock まで失われる）に
+/// 依らず「所有者は生存中」と判定するための補助（REQ-34。別プロセスからの確認は lock で判定）。
+static HELD_LOCKS: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
+
+/// `file` の (dev, ino)。unix 以外では `None`（レジストリを使わない）。
+fn file_identity(file: &File) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        file.metadata().ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// [`HELD_LOCKS`] への登録。drop で解除する。
+#[derive(Debug)]
+struct InProcessHold(Option<(u64, u64)>);
+
+impl InProcessHold {
+    fn register(file: &File) -> Self {
+        let id = file_identity(file);
+        if let Some(id) = id {
+            let mut guard = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get_or_insert_with(HashSet::new).insert(id);
+        }
+        Self(id)
+    }
+}
+
+impl Drop for InProcessHold {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            let mut guard = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(set) = guard.as_mut() {
+                set.remove(&id);
+            }
+        }
+    }
+}
+
+/// `file` が同一プロセス内の所有者に保持されているか。
+fn held_in_process(file: &File) -> bool {
+    file_identity(file).is_some_and(|id| {
+        let guard = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().is_some_and(|set| set.contains(&id))
+    })
+}
+
 /// 他者保持の `job.lock` を生存と断定する前の再試行回数と間隔（[`try_lock_settled`]）。
 const LOCK_SETTLE_RETRIES: u32 = 10;
 const LOCK_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -360,12 +420,29 @@ fn write_record_atomic(job_dir: &Path, record: &JobRecord) -> Result<(), JobReco
         let mut file = create_new_private(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, job_dir.join(JOB_RECORD_FILE))
+        std::fs::rename(&tmp, job_dir.join(JOB_RECORD_FILE))?;
+        // rename の永続化のため親ディレクトリも sync する。電源断で rename が失われ、
+        // 正常終了したジョブを後から `OwnerLost` と誤記録するのを防ぐ（REQ-34）。
+        sync_dir(job_dir)
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_err(&e)
     })
+}
+
+/// ディレクトリのエントリ変更（rename）を永続化する。unix 以外ではディレクトリの
+/// open が使えないため何もしない。
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// `job.json` を上限つきで読み、厳格に parse・検証する。
@@ -413,6 +490,8 @@ fn read_record(job_dir: &Path) -> Result<JobRecord, JobRecordError> {
 pub struct JobRecorder {
     // 保持し続けることが目的のフィールド（drop でカーネルが lock を解放する）。
     _lock: File,
+    // 同一プロセス内の状態確認に所有者の生存を示す（drop で解除）。
+    _hold: InProcessHold,
     job_dir: PathBuf,
     started_at_unix: u64,
 }
@@ -455,6 +534,7 @@ impl JobRecorder {
                 return Err(io_err(&e));
             }
         }
+        let hold = InProcessHold::register(&lock);
         let published = std::fs::hard_link(&init_path, &lock_path);
         discard_init();
         published.map_err(|e| {
@@ -479,6 +559,7 @@ impl JobRecorder {
         write_record_atomic(job_dir, &record).map_err(rollback)?;
         Ok(Self {
             _lock: lock,
+            _hold: hold,
             job_dir: job_dir.to_path_buf(),
             started_at_unix: now_unix,
         })
@@ -579,7 +660,15 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
         return Ok(report_of(record, false));
     }
     let lock = File::open(&lock_path).map_err(|e| io_err(&e))?;
-    match try_lock_settled(&lock)? {
+    // 同一プロセスの所有者が保持中なら、lock の取得を試みず（fcntl 系の実装では取得が
+    // 成功して close 時に所有者の lock を奪うため）生存中として扱う。
+    let alive_in_process = held_in_process(&lock);
+    let acquired = if alive_in_process {
+        false
+    } else {
+        try_lock_settled(&lock)?
+    };
+    match acquired {
         // 読み手は直列化済みなので、取れないのは所有プロセスが生存中のため
         // （記録がまだ無い場合は初期化中。`running` として返す）。
         false => Ok(match current {
@@ -810,6 +899,27 @@ mod tests {
             }
         );
         drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: 所有者と同一プロセスでの状態確認を繰り返しても crash と誤記録せず、
+    /// 所有者の lock も奪われないため、その後の `finish` の終端記録が正しく読める。
+    #[test]
+    fn req34_in_process_status_checks_do_not_steal_owner_lock() {
+        let dir = tmp_dir("inproc");
+        let recorder = JobRecorder::begin(&dir, 10).expect("begin");
+        for _ in 0..3 {
+            let report = read_job_status(&dir, 20).expect("status");
+            assert_eq!(report.state, JobState::Running);
+            assert!(!report.crash_detected);
+            assert!(!report.record_updated);
+        }
+        recorder
+            .finish(JobState::Succeeded, None, 30)
+            .expect("finish");
+        let report = read_job_status(&dir, 40).expect("status");
+        assert_eq!(report.state, JobState::Succeeded);
+        assert!(!report.crash_detected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
