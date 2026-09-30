@@ -1002,6 +1002,71 @@ mod suite {
         env.ok(&["package", "--project-dir", "proj"]);
     }
 
+    /// 候補 0 の成果物へ `vocab.json` を置き、`recorded` が `Some` なら `artifact.json` にその sha256 を記録する。
+    fn place_vocab(env: &Env, bytes: &[u8], recorded: Option<&[u8]>) {
+        std::fs::write(env.project_file("candidates/0/model-c1/vocab.json"), bytes).expect("vocab");
+        if let Some(hashed) = recorded {
+            let meta = env.project_file("candidates/0/model-c1/artifact.json");
+            let text = std::fs::read_to_string(&meta).expect("artifact.json");
+            let hex = Sha256Digest::of_bytes(hashed).to_hex();
+            let patched = text.replacen('{', &format!("{{\"vocab_sha256\":\"{hex}\","), 1);
+            std::fs::write(&meta, patched).expect("patch artifact.json");
+        }
+    }
+
+    /// 配布容量の目安（40MB）を超える、許可形式の語彙ファイル（約 45MB）。
+    fn oversized_vocab() -> Vec<u8> {
+        let mut out = String::from("{");
+        for i in 0..3_000_000u32 {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"t{i}\":{i}"));
+        }
+        out.push('}');
+        out.into_bytes()
+    }
+
+    /// REQ-39・REQ-30: 語彙ファイルがあるのに記録ハッシュが無い・記録と不一致の候補は、選定時にも
+    /// `invalid_input`（64）で止まり、選定記録を作らない（容量判定より前に完全性を確認する）。
+    pub fn select_rejects_vocab_file_without_matching_recorded_hash() {
+        let env = inspected("selvocabhash");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        place_vocab(&env, br#"{"a":0}"#, None);
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+        // 記録ハッシュが別内容のもの。
+        place_vocab(&env, br#"{"a":0}"#, Some(br#"{"b":1}"#));
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: 容量超過で除外される候補にも整合性の確認が先に適用される。改ざんのない
+    /// 超過候補は除外（全件除外で `pending`）になるが、validation 予測を改ざんした超過候補は
+    /// 「除外」として扱わず `runtime_error`（70）で止まる。
+    pub fn select_validates_candidate_before_capacity_exclusion() {
+        let env = inspected("selexclorder");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert!(out.contains("excluded"), "{out}");
+
+        let result = env.project_file("candidates/0/result.json");
+        let text = std::fs::read_to_string(&result).expect("result.json");
+        let marker = "\"validation_predictions\":[{\"id\":\"";
+        assert!(text.contains(marker), "{text}");
+        std::fs::write(
+            &result,
+            text.replacen(marker, &format!("{marker}tampered-"), 1),
+        )
+        .expect("tamper");
+        let (code, stdout) = env.run(&["select", "--project-dir", "proj"]);
+        assert_eq!(code, 70, "{stdout}");
+        assert!(stdout.contains("cannot score"), "{stdout}");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1196,6 +1261,14 @@ fn main() -> std::process::ExitCode {
         (
             "select_and_package_reject_request_fields_beyond_kind_and_seed",
             suite::select_and_package_reject_request_fields_beyond_kind_and_seed,
+        ),
+        (
+            "select_rejects_vocab_file_without_matching_recorded_hash",
+            suite::select_rejects_vocab_file_without_matching_recorded_hash,
+        ),
+        (
+            "select_validates_candidate_before_capacity_exclusion",
+            suite::select_validates_candidate_before_capacity_exclusion,
         ),
         (
             "infer_out_option_is_not_faked",

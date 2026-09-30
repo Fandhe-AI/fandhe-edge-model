@@ -172,19 +172,95 @@ fn is_hex64(s: &str) -> bool {
 /// 語彙ファイル（`vocab.json`）の最大エントリ数（REQ-39。巨大な語彙でのアロケーション上限）。
 pub const MAX_VOCAB_ENTRIES: usize = 4_194_304;
 
-/// 語彙ファイルが許可された形式（トークン文字列から非負整数 ID への JSON オブジェクト）かを検証する
-/// （REQ-39 形式の許可制・REQ-30・TASK-30.3・#125）。
+/// 語彙ファイルのトークン文字列の最大バイト長（REQ-39。要素 1 件あたりのアロケーション上限）。
+pub const MAX_VOCAB_TOKEN_BYTES: usize = 4096;
+
+/// 語彙ファイルの走査を上限つきで行う訪問者（REQ-39・TASK-30.3・#125）。
 ///
-/// # Errors
-/// JSON として不正・オブジェクトでない・値が非負整数でない・空・エントリ過多の場合は
-/// [`ArtifactMetaError::InvalidVocab`]。
-pub fn validate_vocab_bytes(bytes: &[u8]) -> Result<(), ArtifactMetaError> {
-    let map: std::collections::BTreeMap<String, u32> =
-        serde_json::from_slice(bytes).map_err(|_| ArtifactMetaError::InvalidVocab)?;
-    if map.is_empty() || map.len() > MAX_VOCAB_ENTRIES {
+/// 全件を map へ確保せず、要素ごとに件数・トークン長を確認して、上限を超えた時点で打ち切る。
+/// `seen` は走査した要素数で、打ち切りが上限の直後で起きること（それ以上読み進めないこと）を
+/// テストで確認するために公開しない内部関数から観測する。
+struct VocabScan<'a> {
+    max_entries: usize,
+    max_token_bytes: usize,
+    seen: &'a std::cell::Cell<usize>,
+}
+
+/// トークン文字列を確保せず、長さの上限だけを確認するキー。
+struct BoundedToken(usize);
+
+impl<'de> serde::Deserialize<'de> for BoundedToken {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BoundedToken;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a token string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<BoundedToken, E> {
+                Ok(BoundedToken(v.len()))
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for VocabScan<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a token to id map")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some((token, _id)) = map.next_entry::<BoundedToken, u32>()? {
+            let n = self.seen.get().saturating_add(1);
+            self.seen.set(n);
+            if n > self.max_entries || token.0 > self.max_token_bytes {
+                return Err(serde::de::Error::custom("vocab entry limit exceeded"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn scan_vocab(
+    bytes: &[u8],
+    max_entries: usize,
+    max_token_bytes: usize,
+    seen: &std::cell::Cell<usize>,
+) -> Result<(), ArtifactMetaError> {
+    use serde::Deserializer as _;
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    de.deserialize_map(VocabScan {
+        max_entries,
+        max_token_bytes,
+        seen,
+    })
+    .map_err(|_| ArtifactMetaError::InvalidVocab)?;
+    de.end().map_err(|_| ArtifactMetaError::InvalidVocab)?;
+    if seen.get() == 0 {
         return Err(ArtifactMetaError::InvalidVocab);
     }
     Ok(())
+}
+
+/// 語彙ファイルが許可された形式（トークン文字列から非負整数 ID への JSON オブジェクト）かを検証する
+/// （REQ-39 形式の許可制・REQ-30・TASK-30.3・#125）。
+///
+/// 全件を確保せず読み込み中に件数（[`MAX_VOCAB_ENTRIES`]）とトークン長
+/// （[`MAX_VOCAB_TOKEN_BYTES`]）を確認し、上限を超えた時点で打ち切る（REQ-39 の資源上限）。
+///
+/// # Errors
+/// JSON として不正・オブジェクトでない・値が非負整数でない・空・エントリ過多・トークン過長の場合は
+/// [`ArtifactMetaError::InvalidVocab`]。
+pub fn validate_vocab_bytes(bytes: &[u8]) -> Result<(), ArtifactMetaError> {
+    scan_vocab(
+        bytes,
+        MAX_VOCAB_ENTRIES,
+        MAX_VOCAB_TOKEN_BYTES,
+        &std::cell::Cell::new(0),
+    )
 }
 
 impl ArtifactMeta {
@@ -423,6 +499,32 @@ mod tests {
                 Err(ArtifactMetaError::InvalidVocab)
             );
         }
+    }
+
+    /// REQ-39: 件数上限を超えた時点で走査を打ち切る（上限 +1 件目で止まり、後続を読まない）。
+    #[test]
+    fn req39_vocab_scan_aborts_at_entry_limit_without_reading_rest() {
+        let seen = std::cell::Cell::new(0);
+        let json = br#"{"a":0,"b":1,"c":2,"d":3,"e":4}"#;
+        assert_eq!(
+            scan_vocab(json, 2, MAX_VOCAB_TOKEN_BYTES, &seen),
+            Err(ArtifactMetaError::InvalidVocab)
+        );
+        assert_eq!(seen.get(), 3);
+        let seen = std::cell::Cell::new(0);
+        assert_eq!(scan_vocab(br#"{"a":0,"b":1}"#, 2, 8, &seen), Ok(()));
+        assert_eq!(seen.get(), 2);
+    }
+
+    /// REQ-39: トークン長の上限を超える要素は拒否する。
+    #[test]
+    fn req39_vocab_scan_rejects_overlong_token() {
+        let seen = std::cell::Cell::new(0);
+        assert_eq!(
+            scan_vocab(br#"{"abcd":0}"#, 10, 3, &seen),
+            Err(ArtifactMetaError::InvalidVocab)
+        );
+        assert_eq!(scan_vocab(br#"{"abc":0}"#, 10, 3, &seen), Ok(()));
     }
 
     /// REQ-39: 欠落・型違い・不正値は fail-closed。

@@ -26,8 +26,10 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::stage_report::SelectReport;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::capacity::{
@@ -40,8 +42,9 @@ use fandhe_edge_train::stage_files::{ExcludedCandidate, SelectionRecord, validat
 
 use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
-use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, invalid, runtime};
+use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, fs_report, invalid, runtime};
 
+use super::package::verify_vocab_member;
 use super::train::{
     candidate_rel, load_trained, request_matches_candidate, resolve_candidates, verified_split,
 };
@@ -156,12 +159,6 @@ pub fn compute_selection_with_exclusions(
         if !request_matches_candidate(&request, &candidate.params, &records, &split) {
             return Err(invalid("train request does not match the candidate"));
         }
-        // 語彙ファイルを持つ構成が容量の目安を超える場合は、選定対象から外して記録する
-        // （REQ-30・TASK-30.3・#125。失敗時は除外せず処理全体を止める）。
-        if let Some(entry) = vocab_exclusion_of(project, index, candidate, success)? {
-            excluded.push(entry);
-            continue;
-        }
         let inputs = request
             .validation_inputs()
             .ok_or_else(|| runtime("train result has no validation inputs"))?;
@@ -178,6 +175,14 @@ pub fn compute_selection_with_exclusions(
             .ok_or_else(|| runtime("validation record is missing"))?;
         let accuracy = validation_accuracy(&labels, &ids, &gold_labels, predictions)
             .map_err(|_| runtime("cannot score validation predictions"))?;
+        // 整合性の確認（上の validation 入力・予測・正解率）を通した候補にだけ、語彙ファイルの
+        // 検証と容量による除外を適用する（改ざん候補を「容量超過で除外」として正常扱いしない。
+        // 語彙ファイルは記録ハッシュ・形式も照合する。REQ-30・REQ-39・TASK-30.3・#125。
+        // 失敗時は除外せず処理全体を止める）。
+        if let Some(entry) = vocab_exclusion_of(project, index, candidate, success)? {
+            excluded.push(entry);
+            continue;
+        }
         evaluated.push((index, candidate.candidate_id.as_str(), accuracy));
     }
 
@@ -234,6 +239,13 @@ fn vocab_exclusion_of(
         .to_path_buf();
     let onnx_file = success.artifact().onnx_file();
     let mut files = Vec::new();
+    let meta_bytes = {
+        let (file, real) = candidate_dir
+            .open_member(&artifact_rel.join("artifact.json"))
+            .map_err(|e| e.to_error_report())?;
+        read_bounded_open_file(file, real.as_path(), MAX_ARTIFACT_META_BYTES)
+            .map_err(|e| fs_report(&e))?
+    };
     for (component, name) in [
         (PackageComponent::Weights, onnx_file),
         (PackageComponent::Metadata, "artifact.json"),
@@ -247,20 +259,32 @@ fn vocab_exclusion_of(
         files.push((component, real.into_path_buf(), file));
     }
     // 語彙ファイル: 無い（NotFound）ときだけ `has_vocab_file = false`。それ以外の失敗は止める。
-    let has_vocab_file = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
-        Ok((file, real)) => {
-            files.push((
-                PackageComponent::VocabOrFeatureTransform,
-                real.into_path_buf(),
-                file,
-            ));
-            true
-        }
+    // あれば `artifact.json` 記載の sha256・許可形式と照合し（`package`・`infer` と同じ
+    // `verify_vocab_member`）、不一致・形式不正は `invalid_input` で止める（REQ-39）。
+    let vocab_rel = artifact_rel.join(VOCAB_FILE_NAME);
+    let vocab_bytes = match candidate_dir.open_member(&vocab_rel) {
+        Ok((file, real)) => Some(
+            read_bounded_open_file(file, real.as_path(), MAX_FILE_BYTES)
+                .map_err(|e| fs_report(&e))?,
+        ),
         Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
-            false
+            None
         }
         Err(e) => return Err(e.to_error_report()),
     };
+    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
+    verify_vocab_member(&meta, vocab_bytes.as_deref())?;
+    let has_vocab_file = vocab_bytes.is_some();
+    if has_vocab_file {
+        let (file, real) = candidate_dir
+            .open_member(&vocab_rel)
+            .map_err(|e| e.to_error_report())?;
+        files.push((
+            PackageComponent::VocabOrFeatureTransform,
+            real.into_path_buf(),
+            file,
+        ));
+    }
     // 選択肢表（`package` は `definition.json` を LabelTable として合計に含める）。
     let (file, path) = project.open_file(DEFINITION_FILE)?;
     files.push((PackageComponent::LabelTable, path, file));
