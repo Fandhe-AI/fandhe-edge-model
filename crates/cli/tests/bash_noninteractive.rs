@@ -189,7 +189,7 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
     std::fs::create_dir_all(ws.join("p")).expect("mkdir");
     std::fs::write(
         ws.join("p/artifact.json"),
-        r#"{"onnx_file":"model.onnx","kind":"c3"}"#,
+        r#"{"onnx_file":"model.onnx","kind":"c3","kind_version":1}"#,
     )
     .expect("write");
     // 最小の ONNX 形（形式検査を通る）。

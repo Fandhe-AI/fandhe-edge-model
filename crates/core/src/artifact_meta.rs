@@ -17,6 +17,14 @@
 //! 移行手順は、既存の `artifact.json` に `"kind": "<c1|c3|autoregressive>"` を追加すること
 //! （学習ワーカーが出力する `artifact.json` は常に `kind` を持つ）。
 //!
+//! # 後方互換（#174）
+//!
+//! `kind_version` は後方互換のため**省略可**。省略時は版管理導入前のパッケージとみなして
+//! [`LEGACY_KIND_VERSION`]（1）を返す。`kind_version` を持つ場合は `u32` の範囲の整数のみを受理し、
+//! 文字列・負数・小数・`null`・範囲外は拒否する（省略と不正値は区別する）。値の内容（許可リスト外か）は
+//! 本モジュールでは判定せず、省略時の 1 も含めてガード層の `KindVersionAllowlist` で検査する
+//! （許可リストに 1 が無くなれば、旧形式のパッケージも拒否される）。
+//!
 //! # 信頼境界
 //!
 //! 入力は信頼できないデータ。値の妥当性（ルート配下か）は本モジュールでは判定せず、
@@ -28,6 +36,9 @@ use std::fmt;
 
 /// `artifact.json` の最大バイト数（暫定値。上限の正式値は TASK-39.5 で確定する。REQ-39）。
 pub const MAX_ARTIFACT_META_BYTES: u64 = 1024 * 1024;
+
+/// `kind_version` を持たない従来の `artifact.json` に当てはめる版（版管理導入前は全て 1 相当。REQ-39・#174）。
+pub const LEGACY_KIND_VERSION: u32 = 1;
 
 /// メタデータの解釈エラー。入力値を保持しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +65,12 @@ impl std::error::Error for ArtifactMetaError {}
 struct Raw {
     onnx_file: String,
     kind: String,
+    #[serde(default = "legacy_kind_version")]
+    kind_version: u32,
+}
+
+fn legacy_kind_version() -> u32 {
+    LEGACY_KIND_VERSION
 }
 
 /// `artifact.json` から取り出した ONNX ファイルへの参照（未検証の相対パス文字列）。
@@ -61,6 +78,7 @@ struct Raw {
 pub struct ArtifactOnnxRef {
     onnx_file: String,
     kind: String,
+    kind_version: u32,
 }
 
 impl ArtifactOnnxRef {
@@ -83,6 +101,7 @@ impl ArtifactOnnxRef {
         Ok(Self {
             onnx_file: raw.onnx_file,
             kind: raw.kind,
+            kind_version: raw.kind_version,
         })
     }
 
@@ -95,6 +114,12 @@ impl ArtifactOnnxRef {
     /// 検査を通す前に下流（ランタイム・出力）へ渡さない。
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// 未検証の `kind_version`（省略時は [`LEGACY_KIND_VERSION`]）。ガード層の `KindVersionAllowlist` 検査の入力にのみ使い、
+    /// 検査を通す前に下流（ランタイム・出力）へ渡さない。
+    pub fn kind_version(&self) -> u32 {
+        self.kind_version
     }
 }
 
@@ -223,8 +248,10 @@ mod tests {
     /// REQ-39: 正常系。未知フィールドは無視する。
     #[test]
     fn req39_parse_extracts_onnx_file_and_ignores_unknown() {
-        let r =
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"model.onnx","kind":"c3","n":1}"#).expect("ok");
+        let r = ArtifactOnnxRef::parse(
+            br#"{"onnx_file":"model.onnx","kind":"c3","kind_version":1,"n":1}"#,
+        )
+        .expect("ok");
         assert_eq!(r.onnx_file(), "model.onnx");
         assert_eq!(r.kind(), "c3");
     }
@@ -234,12 +261,12 @@ mod tests {
     fn req39_parse_rejects_malformed() {
         for b in [
             &br#"{}"#[..],
-            br#"{"onnx_file":1,"kind":"c3"}"#,
-            br#"{"onnx_file":null,"kind":"c3"}"#,
+            br#"{"onnx_file":1,"kind":"c3","kind_version":1}"#,
+            br#"{"onnx_file":null,"kind":"c3","kind_version":1}"#,
             br#"{"onnx_file":"model.onnx"}"#,
-            br#"{"onnx_file":"model.onnx","kind":1}"#,
-            br#"{"onnx_file":"model.onnx","kind":null}"#,
-            br#"{"onnx_file":"model.onnx","kind":[]}"#,
+            br#"{"onnx_file":"model.onnx","kind":1,"kind_version":1}"#,
+            br#"{"onnx_file":"model.onnx","kind":null,"kind_version":1}"#,
+            br#"{"onnx_file":"model.onnx","kind":[],"kind_version":1}"#,
             b"not json",
             br#"["onnx_file"]"#,
             b"",
@@ -252,11 +279,11 @@ mod tests {
     #[test]
     fn req39_parse_rejects_empty_and_nul() {
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"","kind":"c3"}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"","kind":"c3","kind_version":1}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b","kind":"c3"}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b","kind":"c3","kind_version":1}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
     }
@@ -265,17 +292,50 @@ mod tests {
     #[test]
     fn req39_parse_does_not_judge_kind_content() {
         for k in ["", "c3; rm -rf ~", "PT"] {
-            let json = format!(r#"{{"onnx_file":"model.onnx","kind":"{k}"}}"#);
+            let json = format!(r#"{{"onnx_file":"model.onnx","kind":"{k}","kind_version":1}}"#);
             let r = ArtifactOnnxRef::parse(json.as_bytes()).expect("ok");
             assert_eq!(r.kind(), k);
         }
     }
 
+    /// REQ-39・TASK-39.6-1: `kind_version` は必須の `u32`。値の内容（99 など）は判定せず読める。
+    #[test]
+    fn req39_parse_reads_kind_version_without_judging() {
+        for (lit, v) in [("1", 1u32), ("99", 99), ("0", 0), ("4294967295", u32::MAX)] {
+            let json = format!(r#"{{"onnx_file":"m.onnx","kind":"c3","kind_version":{lit}}}"#);
+            let r = ArtifactOnnxRef::parse(json.as_bytes()).expect("ok");
+            assert_eq!(r.kind_version(), v);
+        }
+    }
+
+    /// REQ-39・TASK-39.6-1: `kind_version` の型違い・範囲外は Malformed（fail-closed）。
+    #[test]
+    fn req39_parse_rejects_missing_or_invalid_kind_version() {
+        for lit in [r#""1""#, "-1", "1.5", "null", "[]", "true", "4294967296"] {
+            let json = format!(r#"{{"onnx_file":"m.onnx","kind":"c3","kind_version":{lit}}}"#);
+            assert_eq!(
+                ArtifactOnnxRef::parse(json.as_bytes()),
+                Err(ArtifactMetaError::Malformed),
+                "{lit}"
+            );
+        }
+    }
+
+    /// REQ-39・#174: `kind_version` を持たない従来の artifact.json は版 1 として読める（後方互換）。
+    #[test]
+    fn req39_parse_defaults_missing_kind_version_to_legacy() {
+        let r = ArtifactOnnxRef::parse(br#"{"onnx_file":"m.onnx","kind":"c3"}"#).expect("ok");
+        assert_eq!(r.kind_version(), LEGACY_KIND_VERSION);
+        assert_eq!(r.kind_version(), 1);
+    }
+
     /// REQ-39: エラー文言に入力値を含めない。
     #[test]
     fn req39_error_display_has_no_input_value() {
-        let e = ArtifactOnnxRef::parse(br#"{"onnx_file":1,"kind":"c3","secret":"../../etc"}"#)
-            .unwrap_err();
+        let e = ArtifactOnnxRef::parse(
+            br#"{"onnx_file":1,"kind":"c3","kind_version":1,"secret":"../../etc"}"#,
+        )
+        .unwrap_err();
         assert!(!e.to_string().contains("etc"));
     }
 

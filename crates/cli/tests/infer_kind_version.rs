@@ -61,7 +61,7 @@ fn req39_unlisted_kind_version_is_rejected() {
         assert_eq!(code, Some(64), "version={version} stdout: {stdout}");
         assert_eq!(
             stdout,
-            "{\"code\":\"invalid_input\",\"message\":\"unsupported kind_version\"}\n"
+            "{\"code\":\"invalid_input\",\"message\":\"kind_version rejected: unsupported_kind_version\"}\n"
         );
     }
 }

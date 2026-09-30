@@ -25,6 +25,7 @@
 //! 時刻は共通コア・データ契約の型を流用せず本モジュールの [`CreatedAt`] で持つ
 //! （ガード層は共通コアのみに依存する方針のため。REQ-32）。
 
+use crate::file_size::effective_read_limit;
 use crate::path::{ConfinedPath, PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
@@ -398,7 +399,8 @@ fn hash_confined(
     max_bytes: u64,
 ) -> Result<Sha256Digest, LedgerError> {
     let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
-    sha256_open_file_bounded(file, confined.as_path(), max_bytes).map_err(LedgerError::Io)
+    sha256_open_file_bounded(file, confined.as_path(), effective_read_limit(max_bytes))
+        .map_err(LedgerError::Io)
 }
 
 /// `root` 配下の `candidate` を閉じ込め検証付きで開き、上限付きでバイト列を読み込む。
