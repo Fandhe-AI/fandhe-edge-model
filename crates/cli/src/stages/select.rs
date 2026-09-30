@@ -28,7 +28,6 @@ use std::path::Path;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
-use fandhe_edge_data::split::Split;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::stage_files::{SelectionRecord, validation_accuracy};
@@ -82,15 +81,9 @@ pub fn compute_selection(
         .iter()
         .map(|r| (r.id.as_str(), r.label_id.as_str()))
         .collect();
-    // 分割記録をデータから再現して照合し、選定に使う validation 集合を記録側から決める。
-    // 保存済みの `request.json` の validation を信用すると、記録の改変で任意の部分集合の
-    // 正解率により候補を選べてしまう（REQ-27）。
+    // 分割記録をデータから再現して照合する。保存済みの `request.json` の validation を信用すると、
+    // 記録の改変で任意の部分集合の正解率により候補を選べてしまう（REQ-27）。
     let (split, seed) = verified_split(project, &records)?;
-    let expected_validation: BTreeMap<&str, &str> = records
-        .iter()
-        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
-        .map(|r| (r.id.as_str(), r.input.as_str()))
-        .collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
 
     let mut evaluated = Vec::new();
@@ -116,7 +109,7 @@ pub fn compute_selection(
         };
         // 保存済みのリクエストが既定候補 N の種類・構成と一致すること（別の種類の学習結果を
         // 候補 N として採点しない。記録の差し替え対策。REQ-27）。
-        if !request_matches_candidate(&request, &candidate.params) {
+        if !request_matches_candidate(&request, &candidate.params, &records, &split) {
             return Err(invalid("train request does not match the candidate"));
         }
         let inputs = request
@@ -125,14 +118,8 @@ pub fn compute_selection(
         let predictions = success
             .validation_predictions()
             .ok_or_else(|| runtime("train result has no validation predictions"))?;
-        // request の validation は、分割記録の validation 全体と id・input が完全に一致すること。
-        let matches_split = inputs.len() == expected_validation.len()
-            && inputs
-                .iter()
-                .all(|v| expected_validation.get(v.id()) == Some(&v.input()));
-        if !matches_split {
-            return Err(invalid("train request does not match the split record"));
-        }
+        // request の validation 入力は、分割記録の validation 全体と一致済み（上の照合が期待する
+        // リクエストを丸ごと組み立てて比べる。記録の改変による部分集合での選定を防ぐ。REQ-27）。
         let ids: Vec<&str> = inputs.iter().map(|v| v.id()).collect();
         let gold_labels = ids
             .iter()

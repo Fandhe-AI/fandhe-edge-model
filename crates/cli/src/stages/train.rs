@@ -152,14 +152,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
         .filter(|r| split.by_record.get(&r.id) == Some(&Split::Train));
     let train_jsonl = trainer_jsonl(train_rows.map(|r| (r.input.as_str(), r.label_id.as_str())))
         .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
-    let validation: Vec<ValidationInput> = records
-        .iter()
-        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
-        .map(|r| ValidationInput::new(r.id.clone(), r.input.clone()))
-        .collect();
-    let request = TrainRequest::new(candidate.params)
-        .and_then(|r| r.with_validation_inputs(validation))
-        .map_err(|e| e.to_error_report())?;
+    let request = build_train_request(candidate.params, &records, &split)?;
     let request_json = request.to_json_vec().map_err(|e| e.to_error_report())?;
     let launcher = worker_launcher()?;
 
@@ -289,32 +282,64 @@ pub fn load_trained(
     Ok(Some((request, outcome)))
 }
 
-/// 保存済みの学習リクエストが、既定候補 `params` から作られたものと同じ種類・構成かを返す
-/// （`select`・`package` が、別の種類の学習結果を候補 N として扱わないための照合。REQ-27・REQ-39）。
+/// 候補の学習リクエストを組み立てる（`train` が学習ワーカーへ渡すものと、`select`・`package` が
+/// 期待値として組み立てるものの、唯一の作り方。REQ-27・REQ-39）。
 ///
-/// 比べるのは `kind`・`kind_version`・`label_order`・`max_bytes`・`seed`・`root`・`out_dir` と、
-/// `epochs` を除く `config`。`epochs` は `train --smoke` が 1 へ上書きする唯一の項目のため除く。
+/// `params`（[`resolve_candidates`] の結果）に、分割記録の validation 入力（`id` と `input` のみ。
+/// 正解ラベルは渡さない）を付ける。`train_path`・`device`・制限値・`root`・`out_dir` などは
+/// すべて `params` から決まる。
 ///
-/// `params` は `train` と同じ [`resolve_candidates`]（候補番号 N から `root`・`out_dir` を組み立てる
-/// 唯一の関数）で作ったものでなければならない。`root`・`out_dir` を比べるのは、保存済みの
-/// リクエストと結果の差し替えで `artifact_dir` が候補ディレクトリの外を指すのを防ぐため
-/// （`load_trained` は保存済みリクエストを基準に `artifact_dir` を検証するため。REQ-39）。`root` は
-/// 絶対パスで記録されるので、プロジェクトのディレクトリを移動すると一致せず拒否される
-/// （fail-closed として許容する）。制限値（時間・メモリ）は比べない。
+/// # Errors
+/// リクエストの検証失敗（`TrainRequestError` の写像）。
+pub fn build_train_request(
+    params: TrainRequestParams,
+    records: &[ValidRecord],
+    split: &SplitResult,
+) -> Result<TrainRequest, ErrorReport> {
+    let validation: Vec<ValidationInput> = records
+        .iter()
+        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
+        .map(|r| ValidationInput::new(r.id.clone(), r.input.clone()))
+        .collect();
+    TrainRequest::new(params)
+        .and_then(|r| r.with_validation_inputs(validation))
+        .map_err(|e| e.to_error_report())
+}
+
+/// 保存済みの学習リクエストが、期待する学習リクエストと（`epochs` を除いて）完全に一致するかを返す
+/// （`select`・`package` が、別の構成・別の場所の学習結果を候補 N として扱わないための照合。
+/// REQ-27・REQ-39）。
+///
+/// 期待値は、`train` と同じ [`build_train_request`] に、`train` と同じ [`resolve_candidates`] で作った
+/// 候補 N の `params` と、プロジェクトのデータ・`split.json`（`records`・`split`）を渡して丸ごと
+/// 組み立て、保存済みのリクエストと構造全体で比べる。項目を列挙しないので、`TrainRequest` に項目が
+/// 増えても自動で照合対象になる（`train_path`・`device`・時間と RSS の制限・validation 入力・
+/// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
+/// 移動すると一致せず拒否される（fail-closed として許容する）。
+///
+/// **例外は `epochs` の 1 か所だけ**: `train --smoke` が 1 へ上書きする唯一の項目のため、期待値の
+/// `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
+/// [`request_is_smoke_trained`] で判定する）。実行時の環境でしか決まらない値（学習ワーカーの実行
+/// ファイルのパス等）はリクエストに含まれないため、除外した項目は他にない。
 #[must_use]
-pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestParams) -> bool {
-    request.kind() == params.kind
-        && request.kind_version() == params.kind_version
-        && request.label_order().as_slice() == params.label_order.as_slice()
-        && request.max_bytes() == params.max_bytes
-        && request.seed() == params.seed
-        && request.root() == params.root
-        && request.out_dir() == params.out_dir
-        && request
-            .config()
-            .iter()
-            .filter(|(k, _)| k.as_str() != "epochs")
-            .eq(params.config.iter().filter(|(k, _)| k.as_str() != "epochs"))
+pub fn request_matches_candidate(
+    request: &TrainRequest,
+    params: &TrainRequestParams,
+    records: &[ValidRecord],
+    split: &SplitResult,
+) -> bool {
+    let mut expected_params = params.clone();
+    match request.config().get("epochs") {
+        Some(epochs) => {
+            expected_params
+                .config
+                .insert("epochs".to_string(), epochs.clone());
+        }
+        None => {
+            expected_params.config.remove("epochs");
+        }
+    }
+    build_train_request(expected_params, records, split).is_ok_and(|expected| &expected == request)
 }
 
 /// 保存済みの学習リクエストが `train --smoke`（`epochs` を 1 へ上書きした短縮学習）のものか

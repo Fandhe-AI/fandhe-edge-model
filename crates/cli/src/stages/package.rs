@@ -60,8 +60,8 @@ use crate::project::{
 use super::infer::load_backend;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, load_trained, read_split_record, request_is_smoke_trained,
-    request_matches_candidate, resolve_candidates,
+    candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
+    resolve_candidates, verified_split,
 };
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
@@ -97,9 +97,10 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if compute_selection(&project, &definition)?.as_ref() != Some(&selection) {
         return Err(invalid("selection record does not match the candidate"));
     }
-    // 期待する seed は固定値ではなく `split.json` の記録値（`compute_selection` が分割を検証済み）。
-    let seed = u32::try_from(read_split_record(&project)?.seed())
-        .map_err(|_| invalid("split record is invalid"))?;
+    // 期待する seed・validation 入力は固定値ではなく `split.json` の記録とデータから求める
+    // （`compute_selection` が分割を検証済みだが、期待値の組み立てのため同じ検証をもう一度通す）。
+    let records = project.load_records(&definition)?;
+    let (split, seed) = verified_split(&project, &records)?;
     let candidates = resolve_candidates(&project, &definition, selection.candidate_index, seed)?;
     let candidate = candidates
         .get(selection.candidate_index)
@@ -107,7 +108,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         .ok_or_else(|| invalid("selection record does not match the candidate"))?;
     let (request, outcome) = load_trained(&project, selection.candidate_index)?
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
-    if !request_matches_candidate(&request, &candidate.params) {
+    if !request_matches_candidate(&request, &candidate.params, &records, &split) {
         return Err(invalid("selection record does not match the candidate"));
     }
     // 短縮学習（`train --smoke`）の結果は、検証専用の `--allow-smoke` を明示しない限り配布しない

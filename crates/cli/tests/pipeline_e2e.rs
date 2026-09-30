@@ -428,6 +428,55 @@ mod suite {
         assert!(env.project_file("package/artifact.json").is_file());
     }
 
+    /// REQ-27・REQ-39: 保存済みの `request.json` の `device`・時間制限・`train_path`（結果 `result.json` とは
+    /// 整合したまま）を書き換えると、`select` も `package` も、期待するリクエストを丸ごと組み立てた比較で
+    /// `invalid_input`（64）・固定 message で止まり、選定記録・`package/` を作らない。`epochs` だけが違う
+    /// smoke の結果はこの照合を通る（別テストで確認済み）。
+    pub fn select_and_package_reject_request_fields_beyond_kind_and_seed() {
+        let env = inspected("reqfields");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let request = env.project_file("candidates/0/request.json");
+        let original = std::fs::read_to_string(&request).expect("request.json");
+        let tampers = [
+            ("device", "\"device\":\"cpu\"", "\"device\":\"gpu\""),
+            // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加える。
+            ("time limit", "{", "{\"time_limit_seconds\":1,"),
+            (
+                "train_path",
+                "\"train_path\":\"train_input.jsonl\"",
+                "\"train_path\":\"other_input.jsonl\"",
+            ),
+        ];
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n";
+        for (label, from, to) in &tampers {
+            assert!(original.contains(from), "{label}: {original}");
+            std::fs::write(&request, original.replacen(from, to, 1)).expect("tamper");
+            assert_eq!(
+                env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+                mismatch,
+                "select {label}"
+            );
+            assert!(
+                !env.project_file("selection_record.json").exists(),
+                "{label}"
+            );
+        }
+        std::fs::write(&request, &original).expect("restore");
+        env.ok(&["select", "--project-dir", "proj"]);
+        for (label, from, to) in &tampers {
+            std::fs::write(&request, original.replacen(from, to, 1)).expect("tamper");
+            assert_eq!(
+                env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+                mismatch,
+                "package {label}"
+            );
+            assert!(!env.project_file("package").exists(), "{label}");
+            assert!(!env.project_file("package.staging").exists(), "{label}");
+        }
+        std::fs::write(&request, original).expect("restore");
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
     /// REQ-17: 凍結記録が欠落（評価データだけ残る）していても、後続工程は停止する（fail-closed）。
     pub fn later_stages_stop_when_freeze_record_is_missing() {
         let env = eval_env_until("nofrz", &[]);
@@ -1143,6 +1192,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_smoke_trained_candidate_unless_allowed",
             suite::package_rejects_smoke_trained_candidate_unless_allowed,
+        ),
+        (
+            "select_and_package_reject_request_fields_beyond_kind_and_seed",
+            suite::select_and_package_reject_request_fields_beyond_kind_and_seed,
         ),
         (
             "infer_out_option_is_not_faked",
