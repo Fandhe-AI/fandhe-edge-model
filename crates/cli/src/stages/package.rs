@@ -23,9 +23,13 @@
 //! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
 //! 公開する。途中の失敗・容量の上限超過ではステージングを片付け、`package/` を作らない
 //! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
-//! 置き換えも削除もしない）。容量内訳の JSON は超過時も返す。
+//! 置き換えも削除もしない）。容量は計測して上限照合（`limit_exceeded` の判定）に使う。
 //!
 //! # 未接続（実装済みを装わない）
+//!
+//! 容量内訳の stdout 出力は未接続。現状の出力は `PackageOutcome` 由来の JSON（成功時。`judgment`・`acceptance_defined` のみ）または
+//! `{"code","message"}`（超過時）で、内訳は載らない。内訳の JSON 部品は
+//! `output::package_capacity_json`（#123）にあり、接続は入出力契約（REQ-33）の変更を伴うため別途扱う。
 //!
 //! p95 の計測（REQ-31・`LimitBreach::Latency`）と合否基準は未接続。定義ファイルに合否基準の欄が
 //! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
