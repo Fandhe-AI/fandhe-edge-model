@@ -40,7 +40,7 @@ scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2
 | cli | CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） |
 | tui | TUI（REQ-35） | 未確定 |
 | mcp | MCP / Codex 連携（REQ-36/37） | 未確定 |
-| guard | ガード層（経路・形式・資源・版の検査。REQ-39） | `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕・`infer` の `--package`・`onnx_file` への統合〔TASK-39.4-2・#159〕・`kind` の `infer` への統合〔TASK-39.2-4・#156〕・`kind_version` の許可リスト〔TASK-39.6-1・#174〕を実装済み） |
+| guard | ガード層（経路・形式・資源・版の検査。REQ-39） | `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕・`infer` の `--package`・`onnx_file` への統合〔TASK-39.4-2・#159〕・`kind` の `infer` への統合〔TASK-39.2-4・#156〕・`kind_version` の許可リスト〔TASK-39.6-1・#174〕・実行時間上限〔暫定 10 秒。TASK-39.5-1・#170〕を実装済み） |
 | deps | 依存の追加・更新（`Cargo.toml`・`Cargo.lock`・`pyproject.toml`・lock ファイル） | — |
 | spec | `docs/spec` submodule 参照の更新 | — |
 | claude | `CLAUDE.md`・`.claude/`（agents・rules・settings・workflows） | — |

@@ -44,10 +44,10 @@ const MAX_FILTERS: usize = 1024;
 /// 受理する。任意の負数（例: -0.001）を許すと、詰め物位置が実トークン位置より大きくなり
 /// プーリングへ混入する（REQ-28）。
 const MASK_NEG_VALUE: f32 = -1e9;
-/// 1 系列の計算時間の上限（REQ-39。`latency::DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS` と同値）。
+/// 1 系列の計算時間の上限（REQ-39。値の出所は共通コアの `limits::INFER_TIME_LIMIT`）。
 /// 受理したモデルは最大 4096 トークン × 1024 次元 × 31 カーネル × フィルタ数の走査になりうるため、
 /// モデルファイルの大きさの上限だけでは時間を抑えられない。
-const MAX_INFER_DURATION: Duration = Duration::from_secs(10);
+const MAX_INFER_DURATION: Duration = fandhe_edge_core::limits::INFER_TIME_LIMIT;
 /// 幅に依存しない前段のノード数と、後段（`Concat`・`Gemm`・`Softmax`）のノード数。
 const PREFIX_NODES: usize = 7;
 const SUFFIX_NODES: usize = 3;
