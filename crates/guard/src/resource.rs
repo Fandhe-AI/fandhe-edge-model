@@ -43,16 +43,16 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 推論 1 件の実行時間の暫定上限（REQ-39。PoC-20 の C-16・`guard.py` の `INFER_TIMEOUT_SEC`）。
-pub const INFER_TIME_LIMIT: Duration = Duration::from_secs(10);
-/// 指定できる時間上限の最大値（1 時間。runtime の `MAX_LATENCY_TIMEOUT_NS` と同値）。
-pub const MAX_TIME_LIMIT: Duration = Duration::from_secs(3600);
+/// 推論 1 件の実行時間の暫定上限（REQ-39）。値の出所は共通コアの `limits`（runtime・cli と共有）。
+pub use fandhe_edge_core::limits::INFER_TIME_LIMIT;
+/// 指定できる時間上限の最大値（暫定 1 時間。REQ-39）。値の出所は共通コアの `limits`。
+pub use fandhe_edge_core::limits::MAX_TIME_LIMIT;
 /// stdout の既定の読み取り上限（推論 1 件の JSON は小さい）。
 pub const DEFAULT_STDOUT_CAP: usize = 1024 * 1024;
 /// stderr の既定の読み取り上限。
 pub const DEFAULT_STDERR_CAP: usize = 64 * 1024;
-/// 読み取り上限の最大値（CLI の `MAX_INFER_BATCH_OUTPUT_BYTES` と同値）。
-pub const MAX_OUTPUT_CAP: usize = 256 * 1024 * 1024;
+/// 読み取り上限の最大値（暫定 256 MiB。REQ-39）。値の出所は共通コアの `limits`（cli と共有）。
+pub const MAX_OUTPUT_CAP: usize = fandhe_edge_core::limits::MAX_OUTPUT_BYTES;
 
 /// 監視のポーリング間隔（busy-spin を避ける）。
 const POLL_INTERVAL: Duration = Duration::from_millis(10);

@@ -30,6 +30,7 @@ use crate::pipeline::{
     InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES, Prediction,
     Preprocessor, ScoringBackend,
 };
+use fandhe_edge_core::limits;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -44,10 +45,10 @@ pub const MAX_LATENCY_ITERS: usize = 1_000_000;
 
 /// 計測全体（warmup と計測の合計）の時間上限の既定値（ns。10 分。REQ-39 の暫定値）。
 pub const DEFAULT_LATENCY_TOTAL_TIMEOUT_NS: u64 = 600_000_000_000;
-/// 推論 1 回あたりの時間上限の既定値（ns。10 秒。REQ-39 の暫定値）。
-pub const DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS: u64 = 10_000_000_000;
-/// 各時間上限として指定できる最大値（ns。1 時間。REQ-39 の暫定値）。
-pub const MAX_LATENCY_TIMEOUT_NS: u64 = 3_600_000_000_000;
+/// 推論 1 回あたりの時間上限の既定値（ns。10 秒。REQ-39 の暫定値）。値の出所は共通コアの `limits`。
+pub const DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS: u64 = limits::INFER_TIME_LIMIT_NS;
+/// 各時間上限として指定できる最大値（ns。1 時間。REQ-39 の暫定値）。値の出所は共通コアの `limits`。
+pub const MAX_LATENCY_TIMEOUT_NS: u64 = limits::MAX_TIME_LIMIT_NS;
 
 /// 単調時計の継ぎ目。テストでは偽の時計を注入して計測値を決定的にする。
 pub trait Clock {
