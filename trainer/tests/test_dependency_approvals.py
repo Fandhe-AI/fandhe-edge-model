@@ -492,3 +492,98 @@ def test_req38_python_extras_normalization_is_tolerated(repo: Path, capsys: Capt
     code, payload = run(repo, capsys)
     assert code == 0, payload
     assert mod.norm_extras("B_x, a.y,A-Y") == ["a-y", "b-x"]
+
+
+@pytest.mark.parametrize(
+    ("anchor", "old", "new"),
+    [
+        ("tool.uv", "package = false", 'package = false\ndev-dependencies = ["requests==2.0.0"]'),
+        ("group", '"pytest==9.1.1"]', '"pytest==9.1.1", "requests==2.0.0"]'),
+        (
+            "group-marker",
+            '"pytest==9.1.1"]',
+            '"pytest==9.1.1", "requests==2.0.0; os_name == \'x\'"]',
+        ),
+    ],
+)
+def test_req38_python_dev_dependency_sections_are_checked(
+    repo: Path, capsys: Capture, anchor: str, old: str, new: str
+) -> None:
+    """`[tool.uv].dev-dependencies`・`[dependency-groups]` の未承認依存も exit 10（REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", old, new)
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_dependency", "requests") in kinds(payload)
+
+
+def test_req38_python_optional_dependencies_are_checked(repo: Path, capsys: Capture) -> None:
+    """`[project.optional-dependencies]` の未承認依存も exit 10（REQ-38）。"""
+    edit(
+        repo,
+        "trainer/pyproject.toml",
+        "[dependency-groups]",
+        '[project.optional-dependencies]\nx = ["requests==2.0.0"]\n\n[dependency-groups]',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_dependency", "requests") in kinds(payload)
+
+
+def test_req38_python_include_group_is_understood(repo: Path, capsys: Capture) -> None:
+    """`include-group` は実在する参照先なら通り、未知の参照先・未知の形式は exit 64（REQ-38）。"""
+    edit(
+        repo,
+        "trainer/pyproject.toml",
+        "[tool.uv]",
+        "[dependency-groups.all]\nx = 1\n\n[tool.uv]",
+    )
+    assert run(repo, capsys)[0] == 64
+    edit(repo, "trainer/pyproject.toml", "[dependency-groups.all]\nx = 1\n", "")
+    edit(
+        repo,
+        "trainer/pyproject.toml",
+        'dev = ["ruff==0.16.9", "pytest==9.1.1"]',
+        'dev = ["ruff==0.16.9", "pytest==9.1.1", {include-group = "nope"}]',
+    )
+    assert run(repo, capsys)[0] == 64
+    edit(repo, "trainer/pyproject.toml", '"nope"', '"dev"')
+    assert run(repo, capsys)[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("package = false", 'package = false\noverride-dependencies = ["numpy==9.9.9"]'),
+        ("package = false", 'package = false\nindex = [{ url = "https://example.invalid" }]'),
+        ('dependencies = ["mlx', 'dynamic = ["dependencies"]\ndependencies = ["mlx'),
+    ],
+)
+def test_req38_python_unverifiable_sections_are_invalid_input(
+    repo: Path, capsys: Capture, old: str, new: str
+) -> None:
+    """未知の `[tool.uv]` キー・動的依存は黙って読み飛ばさず exit 64（fail-closed。REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", old, new)
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize("table", ["dev-dependencies", "build-dependencies"])
+def test_req38_member_dev_and_build_dependencies_are_checked(
+    repo: Path, capsys: Capture, table: str
+) -> None:
+    """dev / build の依存表と target 別の dev 表も直接指定を拒否する（REQ-38）。"""
+    append(repo, "crates/core/Cargo.toml", f'\n[{table}]\nbar = "=1.0.0"\n')
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("member_dependency_not_workspace", "bar") in kinds(payload)
+
+
+def test_req38_member_target_dev_dependencies_are_checked(repo: Path, capsys: Capture) -> None:
+    """[target.*.dev-dependencies] の直接指定も拒否する（REQ-38）。"""
+    append(
+        repo,
+        "crates/core/Cargo.toml",
+        "\n[target.'cfg(unix)'.dev-dependencies]\nbar = \"=1.0.0\"\n",
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("member_dependency_not_workspace", "bar") in kinds(payload)

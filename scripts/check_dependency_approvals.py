@@ -76,7 +76,10 @@ CARGO_PIN_RE = re.compile(r"^=([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0
 PY_REQ_RE = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
     r"(?:\[([A-Za-z0-9,._ -]+)\])?"
-    r"==([0-9]+\.[0-9]+\.[0-9]+)$"
+    r"==([0-9]+\.[0-9]+\.[0-9]+)"
+    # PEP 508 の環境マーカー（`; sys_platform == 'linux'` 等）。名前・版・extras の照合には
+    # 影響させないが、構文として受理する（マーカーだけで承認照合を迂回させない）。
+    r"(?:\s*;\s*[^;\s][^;]*)?$"
 )
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 CARGO_DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
@@ -419,20 +422,64 @@ def check_cargo(
             v.append(Violation("missing_in_lock", "cargo", key[0], key[1], "Cargo.lock"))
 
 
+# `[tool.uv]` で読み飛ばしてよいキー（依存・ソース・索引を変えないもの）。それ以外の未知のキー
+# （sources・index・override-dependencies 等）は依存の解決を変えうるため fail-closed にする。
+UV_SAFE_KEYS = {"required-version", "package", "environments", "default-groups"}
+PROJECT_DEP_KEYS = {"dependencies", "optional-dependencies"}
+
+
+def _str_list(value: Any, what: str) -> list[Any]:
+    """依存宣言のリストであることを検証する（形式不正は入力不正として 64）。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise InputError(f"pyproject {what} must be a list")
+    return list(value)
+
+
 def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
-    """pyproject の全依存宣言（dependencies・optional・dependency-groups）を平坦化する。"""
+    """pyproject の全依存宣言を平坦化する（REQ-38・#165）。
+
+    対象は `[project].dependencies`・`[project.optional-dependencies]`・PEP 735 の
+    `[dependency-groups]`（`include-group` は参照先の実在だけ確認）・`[tool.uv].dev-dependencies`。
+    未知の `[tool.uv]` キー・`dynamic` の依存・解釈できない形式は InputError（fail-closed）。
+    """
     reqs: list[Any] = []
     project = pyproject.get("project", {})
-    if isinstance(project, dict):
-        reqs.extend(project.get("dependencies", []) or [])
-        opt = project.get("optional-dependencies", {}) or {}
-        if isinstance(opt, dict):
-            for items in opt.values():
-                reqs.extend(items or [])
+    if not isinstance(project, dict):
+        raise InputError("pyproject [project] must be a table")
+    dynamic = project.get("dynamic", []) or []
+    if not isinstance(dynamic, list) or PROJECT_DEP_KEYS & set(dynamic):
+        raise InputError("pyproject dynamic dependencies cannot be verified")
+    reqs.extend(_str_list(project.get("dependencies"), "project.dependencies"))
+    opt = project.get("optional-dependencies", {}) or {}
+    if not isinstance(opt, dict):
+        raise InputError("pyproject optional-dependencies must be a table")
+    for name, items in opt.items():
+        reqs.extend(_str_list(items, f"optional-dependencies.{name}"))
     groups = pyproject.get("dependency-groups", {}) or {}
-    if isinstance(groups, dict):
-        for items in groups.values():
-            reqs.extend(items or [])
+    if not isinstance(groups, dict):
+        raise InputError("pyproject dependency-groups must be a table")
+    group_names = {norm_py(g) for g in groups}
+    for gname, items in groups.items():
+        for item in _str_list(items, f"dependency-groups.{gname}"):
+            if isinstance(item, dict):
+                target = item.get("include-group")
+                if set(item) != {"include-group"} or not isinstance(target, str):
+                    raise InputError("pyproject dependency-groups entry is not understood")
+                if norm_py(target) not in group_names:
+                    raise InputError("pyproject include-group references an unknown group")
+            else:
+                reqs.append(item)
+    tool = pyproject.get("tool", {}) or {}
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    if uv is not None:
+        if not isinstance(uv, dict):
+            raise InputError("pyproject [tool.uv] must be a table")
+        for key in uv:
+            if key != "dev-dependencies" and key not in UV_SAFE_KEYS:
+                raise InputError("pyproject [tool.uv] has an unverifiable key")
+        reqs.extend(_str_list(uv.get("dev-dependencies"), "tool.uv.dev-dependencies"))
     return reqs
 
 
