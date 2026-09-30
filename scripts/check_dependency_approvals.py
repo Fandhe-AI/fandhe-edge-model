@@ -27,7 +27,9 @@ REQ-38・TASK-38.3・#165。依存の追加・更新・削除は通信を伴う�
   機械で担保）。`Cargo.lock` の registry パッケージは台帳（direct ∪ locked）に (name, version) が
   あること。source の無いパッケージはワークスペースメンバー名に限る（内部 crate の追加は台帳不要）。
 - Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみで、extras は台帳 `extras`
-  （PEP 685 正規化）と一致すること（`extras_mismatch`）。`uv.lock` の registry パッケージも
+  （PEP 685 正規化）と一致すること（`extras_mismatch`）。配置層は manifest のディレクトリ名
+  （trainer 層）が台帳 layers に含まれること。dev（groups・dev-dependencies）は `trainer(dev)`、
+  build-system は `trainer(build)` でも可（`unapproved_layer`）。`uv.lock` の registry パッケージも
   台帳に (name, version) があること。
 - ルート manifest 自身の `[dependencies]` 等もメンバーと同じ規則（`workspace = true` のみ）で
   検査する。
@@ -437,26 +439,28 @@ def _str_list(value: Any, what: str) -> list[Any]:
     return list(value)
 
 
-def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
+def _py_requirements(pyproject: dict[str, Any]) -> list[tuple[Any, str]]:
     """pyproject の全依存宣言を平坦化する（REQ-38・#165）。
 
     対象は `[project].dependencies`・`[project.optional-dependencies]`・PEP 735 の
     `[dependency-groups]`（`include-group` は参照先の実在だけ確認）・`[tool.uv].dev-dependencies`。
+    各要求は (要求, 区分) で返す。区分は本番（dependencies・optional）か dev（groups・
+    tool.uv.dev-dependencies）で、台帳の layers との照合に使う。
     未知の `[tool.uv]` キー・`dynamic` の依存・解釈できない形式は InputError（fail-closed）。
     """
-    reqs: list[Any] = []
+    reqs: list[tuple[Any, str]] = []
     project = pyproject.get("project", {})
     if not isinstance(project, dict):
         raise InputError("pyproject [project] must be a table")
     dynamic = project.get("dynamic", []) or []
     if not isinstance(dynamic, list) or PROJECT_DEP_KEYS & set(dynamic):
         raise InputError("pyproject dynamic dependencies cannot be verified")
-    reqs.extend(_str_list(project.get("dependencies"), "project.dependencies"))
+    reqs.extend((r, "prod") for r in _str_list(project.get("dependencies"), "project.dependencies"))
     opt = project.get("optional-dependencies", {}) or {}
     if not isinstance(opt, dict):
         raise InputError("pyproject optional-dependencies must be a table")
     for name, items in opt.items():
-        reqs.extend(_str_list(items, f"optional-dependencies.{name}"))
+        reqs.extend((r, "prod") for r in _str_list(items, f"optional-dependencies.{name}"))
     groups = pyproject.get("dependency-groups", {}) or {}
     if not isinstance(groups, dict):
         raise InputError("pyproject dependency-groups must be a table")
@@ -470,7 +474,7 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
                 if norm_py(target) not in group_names:
                     raise InputError("pyproject include-group references an unknown group")
             else:
-                reqs.append(item)
+                reqs.append((item, "dev"))
     tool = pyproject.get("tool", {}) or {}
     uv = tool.get("uv") if isinstance(tool, dict) else None
     if uv is not None:
@@ -479,7 +483,9 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
         for key in uv:
             if key != "dev-dependencies" and key not in UV_SAFE_KEYS:
                 raise InputError("pyproject [tool.uv] has an unverifiable key")
-        reqs.extend(_str_list(uv.get("dev-dependencies"), "tool.uv.dev-dependencies"))
+        reqs.extend(
+            (r, "dev") for r in _str_list(uv.get("dev-dependencies"), "tool.uv.dev-dependencies")
+        )
     return reqs
 
 
@@ -504,31 +510,31 @@ def check_pypi(
         raise InputError("pyproject.toml has no project name")
     own = norm_py(project["name"])
 
+    # 配置先の層は manifest のあるディレクトリ名（`trainer/pyproject.toml` なら trainer 層）。
+    layer = rel_py.split("/", 1)[0]
     manifest_direct: set[tuple[str, str]] = set()
-    for req in _py_requirements(pyproject):
-        m = PY_REQ_RE.match(req) if isinstance(req, str) else None
-        if m is None:
-            v.append(Violation("pin_violation", "pypi", str(req)[:80], "", rel_py))
-            continue
-        key = (norm_py(m.group(1)), m.group(3))
-        manifest_direct.add(key)
-        if key not in ledger["direct"]:
-            v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
-        elif norm_extras(m.group(2)) != ledger["direct"][key]["extras"]:
-            v.append(Violation("extras_mismatch", "pypi", key[0], key[1], rel_py))
-    # ビルド時依存は uv.lock に載らないため、固定と承認記録だけを照合する
+    # ビルド時依存（build）は uv.lock に載らないため、固定と承認記録だけを照合する
     build_direct: set[tuple[str, str]] = set()
-    for req in _py_build_requirements(pyproject):
+    declared = _py_requirements(pyproject) + [
+        (r, "build") for r in _py_build_requirements(pyproject)
+    ]
+    for req, cat in declared:
         m = PY_REQ_RE.match(req) if isinstance(req, str) else None
         if m is None:
             v.append(Violation("pin_violation", "pypi", str(req)[:80], "", rel_py))
             continue
         key = (norm_py(m.group(1)), m.group(3))
-        build_direct.add(key)
-        if key not in ledger["direct"]:
+        (build_direct if cat == "build" else manifest_direct).add(key)
+        entry = ledger["direct"].get(key)
+        if entry is None:
             v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
-        elif norm_extras(m.group(2)) != ledger["direct"][key]["extras"]:
+            continue
+        if norm_extras(m.group(2)) != entry["extras"]:
             v.append(Violation("extras_mismatch", "pypi", key[0], key[1], rel_py))
+        # 区分ごとの配置層（Cargo 側と同じ表現）。dev は `<層>(dev)`・build は `<層>(build)` でも可
+        allowed = set(entry["layers"])
+        if layer not in allowed and not (cat != "prod" and f"{layer}({cat})" in allowed):
+            v.append(Violation("unapproved_layer", "pypi", key[0], key[1], rel_py))
     for key in ledger["direct"]:
         if key not in manifest_direct and key not in build_direct:
             v.append(Violation("stale_record", "pypi", key[0], key[1], LEDGER_NAME))

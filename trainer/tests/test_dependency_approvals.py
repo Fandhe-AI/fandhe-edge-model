@@ -587,3 +587,46 @@ def test_req38_member_target_dev_dependencies_are_checked(repo: Path, capsys: Ca
     code, payload = run(repo, capsys)
     assert code == 10
     assert ("member_dependency_not_workspace", "bar") in kinds(payload)
+
+
+def test_req38_python_layer_not_in_ledger_fails(repo: Path, capsys: Capture) -> None:
+    """台帳 layers に trainer が無い依存は、名前・版・extras が一致しても exit 10（REQ-38）。"""
+    mutate_ledger(repo, lambda g: g["pypi"]["direct"][1].update(layers=["core"]))
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_layer", "numpy") in kinds(payload)
+
+
+def test_req38_python_dev_layer_only_covers_dev_usage(repo: Path, capsys: Capture) -> None:
+    """`trainer(dev)` は dev 区分の利用だけを許す。本番依存 numpy への利用は exit 10（REQ-38）。"""
+
+    def to_dev(g: dict[str, Any]) -> None:
+        for e in g["pypi"]["direct"]:
+            if e["name"] in ("ruff", "numpy"):
+                e["layers"] = ["trainer(dev)"]
+
+    mutate_ledger(repo, to_dev)
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert kinds(payload) == {("unapproved_layer", "numpy")}
+
+
+def test_req38_python_build_requires_needs_build_layer(repo: Path, capsys: Capture) -> None:
+    """build-system の利用は `trainer(dev)` では許されず、`trainer(build)` なら通る（REQ-38）。"""
+    append(repo, "trainer/pyproject.toml", '\n[build-system]\nrequires = ["ruff==0.16.9"]\n')
+    mutate_ledger(
+        repo,
+        lambda g: next(e for e in g["pypi"]["direct"] if e["name"] == "ruff").update(
+            layers=["trainer(dev)"]
+        ),
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_layer", "ruff") in kinds(payload)
+    mutate_ledger(
+        repo,
+        lambda g: next(e for e in g["pypi"]["direct"] if e["name"] == "ruff").update(
+            layers=["trainer(dev)", "trainer(build)"]
+        ),
+    )
+    assert run(repo, capsys)[0] == 0
