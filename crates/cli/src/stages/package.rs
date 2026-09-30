@@ -37,7 +37,6 @@ use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::kind::KindAllowlist;
-use fandhe_edge_guard::package::confine_package;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
@@ -105,11 +104,10 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));
     };
-    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から、ガード層の閉じ込め（保持 fd 起点・
-    // symlink 非追従）で読む。`artifact_dir` は文字列の前方一致でなく、閉じ込め済みの候補
-    // ディレクトリからの相対パスとして求める（リクエスト・結果の差し替えで候補の外を読まない。REQ-39）。
-    let candidate_dir = confine_package(project.dir(), &candidate_rel(selection.candidate_index))
-        .map_err(|e| e.to_error_report())?;
+    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から読む。候補ディレクトリは `Project` の
+    // 保持 fd からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得る（パスの正規化・開き直しをしない）。
+    // `artifact_dir` は文字列の前方一致でなく、閉じ込め済みの候補ディレクトリからの相対パスとして求める（リクエスト・結果の差し替えで候補の外を読まない。REQ-39）。
+    let candidate_dir = project.open_subdir(candidate_rel(selection.candidate_index))?;
     let artifact_rel = Path::new(success.artifact_dir())
         .strip_prefix(candidate_dir.dir())
         .map_err(|_| invalid("artifact directory is outside the candidate directory"))?

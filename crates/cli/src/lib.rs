@@ -35,6 +35,7 @@
 
 pub mod args;
 pub mod error_report;
+pub mod frozen_dir;
 pub mod infer_batch;
 pub mod infer_guard;
 pub mod log;

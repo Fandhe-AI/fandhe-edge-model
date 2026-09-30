@@ -319,6 +319,18 @@ impl Project {
         })
     }
 
+    /// プロジェクト内のディレクトリ `rel` を、保持 fd 起点の相対オープン（`O_NOFOLLOW`・
+    /// `O_DIRECTORY`）で開き、新しい閉じ込めルートとして返す（パスの正規化・再解決をしない。
+    /// 検証後の差し替えでも別のディレクトリを開かない。REQ-39）。
+    ///
+    /// # Errors
+    /// 存在しない・ディレクトリでない・symlink・プロジェクトの外を指す場合は `invalid_input` 等。
+    pub fn open_subdir(&self, rel: impl AsRef<Path>) -> Result<ConfinedPackage, ErrorReport> {
+        self.package
+            .open_subdir(rel.as_ref())
+            .map_err(|e| e.to_error_report())
+    }
+
     /// [`Project::create_dir_tracked`] が作ったディレクトリを片付ける（best effort）。
     /// 中身は保持 fd 起点で消し（symlink は追従せず、プロジェクトの外へは出ない）、名前が作成時と
     /// 同一の実体のときだけディレクトリ自身を消す。差し替えられていれば他所には触れない。

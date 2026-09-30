@@ -11,7 +11,7 @@
 //! # 評価契約
 //!
 //! 評価データは取り込み時に凍結記録（sha256・バイト長。[`freeze_eval_data`]）を作り、
-//! プロジェクトへ読み取り専用配置する（data 層の [`place_read_only`]。書き込みプローブで拒否を
+//! プロジェクトへ読み取り専用配置する（data 層の [`place_read_only_bytes`]。書き込みプローブで拒否を
 //! 確認できない環境〔root・ACL 等〕では配置しない。凍結確認の単一の出所。REQ-17・REQ-39）。以後の
 //! `inspect`・`evaluate` は記録とのハッシュ一致を確認し、不一致なら停止する（fail-closed）。
 //!
@@ -27,11 +27,12 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::stage_report::RegisterReport;
 use fandhe_edge_data::eval_freeze::{FreezeRecord, freeze_eval_data};
-use fandhe_edge_data::frozen_placement::{PlacementError, place_read_only};
+use fandhe_edge_data::frozen_placement::{PlacementError, place_read_only_bytes};
 use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 
 use crate::args::RegisterArgs;
 use crate::error_report::ToErrorReport;
+use crate::frozen_dir::HeldPlacementDir;
 use crate::project::{
     DATA_DIR, DEFINITION_FILE, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project,
     TRAIN_DATA_FILE, fail, fs_report, invalid, parse_definition, runtime,
@@ -110,7 +111,7 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         Ok(_) => {
             let (bytes, _) = read_confined(cwd, &eval_path, MAX_PROJECT_FILE_BYTES)?;
             let record = freeze_eval_data(&bytes).map_err(|e| e.to_error_report())?;
-            Some((bytes, record, eval_path.clone()))
+            Some((bytes, record))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(_) => return Err(runtime("cannot inspect evaluation data file")),
@@ -135,18 +136,20 @@ fn place_project(
     project: &Project,
     def_bytes: &[u8],
     train_bytes: &[u8],
-    evaluation: Option<&(Vec<u8>, FreezeRecord, PathBuf)>,
+    evaluation: Option<&(Vec<u8>, FreezeRecord)>,
 ) -> Result<(), ErrorReport> {
     project.write_new(DEFINITION_FILE, def_bytes)?;
     project.create_dir(DATA_DIR)?;
     project.write_new(Path::new(DATA_DIR).join(TRAIN_DATA_FILE), train_bytes)?;
-    if let Some((_, record, src)) = evaluation {
-        // 凍結記録との照合・0400 化・書き込み拒否のプローブ・原子的な公開は data 層の
-        // `place_read_only` に一本化する（モード 0400 だけで凍結済みとみなさない。REQ-17・REQ-39）。
-        // `data/` は `create_dir` が 0700 で作った本工程の管理ディレクトリ。
-        place_read_only(
-            src,
-            &project.path(DATA_DIR),
+    if let Some((eval_bytes, record)) = evaluation {
+        // 凍結記録との照合・0400 化・書き込み拒否のプローブ・原子的な公開の手順は data 層の
+        // `place_read_only_bytes` に一本化する（モード 0400 だけで凍結済みとみなさない。REQ-17・REQ-39）。
+        // コピー元は `read_confined` で検証・読み込み済みのバイト列（パスを開き直さない）、配置先は
+        // `data/` を保持 fd から開いたハンドル（パスを再解決しない）。`data/` は 0700 の管理ディレクトリ。
+        let data_dir = HeldPlacementDir::new(project.open_subdir(DATA_DIR)?);
+        place_read_only_bytes(
+            eval_bytes,
+            &data_dir,
             EVALUATION_DATA_FILE,
             record,
             MAX_PROJECT_FILE_BYTES,
