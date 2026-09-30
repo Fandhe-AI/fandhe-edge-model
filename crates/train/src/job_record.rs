@@ -52,8 +52,10 @@
 //!   fail-closed）。
 //! - `finish` を呼ばずに drop（panic 等）された場合も lock は解放されるため、状態確認が
 //!   `OwnerLost` を検出する（意図した挙動）。
-//! - 複数の読み手が同時に検出した場合、書き戻し中の読み手を除く読み手は lock を取れず
-//!   記録どおり（`running`）を返しうる。次回以降の呼び出しは終端記録を返すだけ（冪等）。
+//! - 読み手同士は `job.check.lock`（blocking の advisory lock）で直列化する。同時に
+//!   検出した読み手は先の書き戻しを待ち、取得後に記録を読み直して終端記録を返す
+//!   （書き戻し中の `job.lock` 保持を所有者の生存と誤認して `running` と誤報しない）。
+//!   次回以降の呼び出しは終端記録を返すだけ（冪等）。
 //!
 //! # 責務境界・未実装（実装済みを装わない）
 //!
@@ -84,6 +86,8 @@ pub const JOB_RECORD_FILE: &str = "job.json";
 /// 生存確認用 lock のファイル名。
 pub const JOB_LOCK_FILE: &str = "job.lock";
 /// 原子的置き換えの一時ファイル名。
+/// 状態確認（読み手）同士を直列化する lock ファイル名。所有者の生存確認用 `job.lock` とは別。
+pub const JOB_CHECK_LOCK_FILE: &str = "job.check.lock";
 const JOB_RECORD_TMP_FILE: &str = "job.json.tmp";
 /// 記録の `schema_version`。
 pub const JOB_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -503,9 +507,27 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
     if !regular_file_exists(&lock_path)? {
         return Err(JobRecordError::LockMissing);
     }
+    // 読み手同士を直列化する。書き戻し中の別の読み手による `job.lock` の保持を
+    // 「所有者が生存中」と誤認しないため、`job.lock` の取得試行と書き戻しをこの
+    // lock の保持中に行い、待たされた読み手は取得後に記録を読み直す。
+    let check_path = job_dir.join(JOB_CHECK_LOCK_FILE);
+    regular_file_exists(&check_path)?;
+    let mut check_options = OpenOptions::new();
+    check_options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        check_options.mode(0o600);
+    }
+    let check_lock = check_options.open(&check_path).map_err(|e| io_err(&e))?;
+    check_lock.lock().map_err(|e| io_err(&e))?;
+    let record = read_record(job_dir)?;
+    if record.state.is_terminal() {
+        return Ok(report_of(&record, false));
+    }
     let lock = File::open(&lock_path).map_err(|e| io_err(&e))?;
     match lock.try_lock() {
-        // 所有プロセスが生存中。記録どおり返す。
+        // 読み手は直列化済みなので、取れないのは所有プロセスが生存中のため。
         Err(TryLockError::WouldBlock) => Ok(report_of(&record, false)),
         Err(TryLockError::Error(e)) => Err(io_err(&e)),
         Ok(()) => {
@@ -714,6 +736,33 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: 所有者の消滅後に複数の読み手が同時に状態確認しても、全員が
+    /// `failed`＋crash を返し（`running` と誤報しない）、書き戻しは 1 回だけ。
+    #[test]
+    fn req34_concurrent_readers_all_see_crash() {
+        for round in 0..20 {
+            let dir = tmp_dir(&format!("concurrent-{round}"));
+            drop(JobRecorder::begin(&dir, 10).expect("begin"));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let d = dir.clone();
+                    std::thread::spawn(move || read_job_status(&d, 20).expect("status"))
+                })
+                .collect();
+            let reports: Vec<JobStatusReport> = handles
+                .into_iter()
+                .map(|h| h.join().expect("join"))
+                .collect();
+            assert!(
+                reports
+                    .iter()
+                    .all(|r| r.state == JobState::Failed && r.crash_detected)
+            );
+            assert_eq!(reports.iter().filter(|r| r.record_updated).count(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// REQ-34: 正常終了は succeeded・crash なし。
