@@ -401,3 +401,30 @@ fn req39_rollback_caps_max_bytes_at_fixed_limit() {
     }
     assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
 }
+
+/// REQ-39: 記録にもロールバック検証と同じ固定上限を適用し、超過する成果物は記録できない
+/// （記録できたが検証できない版を作らない。スパースファイルでサイズだけを超過させる）。
+#[test]
+fn req39_record_file_caps_at_rollback_limit() {
+    let sb = Sandbox::new("record-cap");
+    let f = fs::File::create(sb.0.join("huge")).unwrap();
+    f.set_len(ROLLBACK_MAX_ARTIFACT_BYTES + 1).unwrap();
+    drop(f);
+    let mut l = VersionLedger::new();
+    let err = l
+        .record_file(
+            ArtifactKind::Model,
+            id("v1"),
+            &sb.0,
+            Path::new("huge"),
+            u64::MAX,
+            at(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::Io(FsError::TooLarge { limit, .. }) if limit == ROLLBACK_MAX_ARTIFACT_BYTES
+    ));
+    assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
+    assert!(l.is_empty());
+}

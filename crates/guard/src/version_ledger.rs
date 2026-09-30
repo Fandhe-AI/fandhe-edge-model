@@ -44,9 +44,10 @@ pub const CREATED_AT_MAX_UNIX_SECONDS: u64 = 253_402_300_799;
 /// 実運用の値は TASK-39.5 の資源上限で見直す）。
 pub const LEDGER_MAX_ENTRIES: usize = 10_000;
 
-/// ロールバック検証（[`VersionLedger::verify_rollback_to`] 等）が成果物をメモリへ保持する上限バイト数。
-/// 呼び出し側の `max_bytes` がこれを超えても、実効上限はこの値に切り詰める（大きな値の指定で
-/// メモリを使い切らせない。REQ-39。証拠種別: 仮置き。実運用の値は TASK-39.5 の資源上限で見直す）。
+/// 版管理の成果物サイズの上限バイト数。ロールバック検証（[`VersionLedger::verify_rollback_to`] 等）が
+/// メモリへ保持する上限であり、記録（[`VersionLedger::record_file`]）にも同じ値を適用して、
+/// 記録できた版は必ずロールバック検証できるようにする。呼び出し側の `max_bytes` がこれを超えても、
+/// 実効上限はこの値に切り詰める（大きな値の指定でメモリを使い切らせない。REQ-39。証拠種別: 仮置き。実運用の値は TASK-39.5 の資源上限で見直す）。
 pub const ROLLBACK_MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 版管理の対象種別（REQ-39）。
@@ -271,6 +272,8 @@ impl VersionLedger {
         created_at: CreatedAt,
     ) -> Result<&VersionEntry, LedgerError> {
         self.check_room(kind, &id)?;
+        // 記録可能なサイズをロールバック検証の上限と揃える（記録できたが検証できない版を作らない）。
+        let max_bytes = max_bytes.min(ROLLBACK_MAX_ARTIFACT_BYTES);
         let digest = hash_confined(root, candidate, max_bytes)?;
         self.record(kind, id, digest, created_at)
     }
