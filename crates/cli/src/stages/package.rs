@@ -47,6 +47,9 @@ use fandhe_edge_guard::kind::KindAllowlist;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
+use fandhe_edge_runtime::capacity_limit::{
+    CapacityLimit, CapacityLimitCheck, check_capacity_limit,
+};
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind};
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
@@ -72,7 +75,7 @@ use super::train::{
 const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 容量の上限（バイト。REQ-30 の目安 40MB。暫定の固定値）。
-/// 利用者設定の取り込み（定義ファイル・CLI 引数。`CapacityLimit` 経由）は入出力契約の変更を伴い未実装（承認事項）。
+/// `run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。利用者設定の取り込み（定義ファイル・CLI 引数）は入出力契約の変更を伴い未実装（承認事項）。
 const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 
 /// `package` を実行する。
@@ -192,12 +195,17 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
             return Err(report);
         }
     };
-    let breaches = finalize_staging(
-        &project,
-        &staging,
-        breakdown.total_bytes(),
-        CAPACITY_LIMIT_BYTES,
-    )?;
+    // 暫定固定値を検証済み型へ変換し、runtime の照合（`check_capacity_limit`）の結果を渡す。
+    // 変換失敗（0）は `invalid_input`。ステージングは片付けてから返す。
+    let limit = match CapacityLimit::from_bytes(CAPACITY_LIMIT_BYTES) {
+        Ok(limit) => limit,
+        Err(e) => {
+            let _ = project.remove_created_dir(&staging);
+            return Err(invalid(&e.to_string()));
+        }
+    };
+    let check = check_capacity_limit(&breakdown, Some(limit));
+    let breaches = finalize_staging(&project, &staging, &check)?;
     Ok(resolve_package_outcome(
         &breaches,
         PackageQualityJudgment::NotDefined,
@@ -212,12 +220,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 fn finalize_staging(
     project: &Project,
     staging: &CreatedDir,
-    measured_bytes: u64,
-    limit_bytes: u64,
+    check: &CapacityLimitCheck,
 ) -> Result<Vec<LimitBreach>, ErrorReport> {
-    // 境界規則（`>` で超過・`==` は超過でない）は runtime の 1 箇所に集約している
-    // （`capacity_limit` モジュール。TASK-30.2・#124）。ここでは再実装しない。
-    if let Some(breach) = LimitBreach::capacity_if_exceeded(measured_bytes, limit_bytes) {
+    // 境界規則（`>` で超過・`==` は超過でない）は runtime の `check_capacity_limit`
+    // （`capacity_limit` モジュール。TASK-30.2・#124）に集約している。ここでは再実装しない。
+    if let Some(breach) = check.breach() {
         let _ = project.remove_created_dir(staging);
         return Ok(vec![breach]);
     }
@@ -308,6 +315,17 @@ fn is_single_component(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 測定値と上限から `check_capacity_limit` 相当の照合結果を作る（境界規則は runtime 側の 1 箇所）。
+    fn check_of(measured_bytes: u64, limit_bytes: u64) -> CapacityLimitCheck {
+        match LimitBreach::capacity_if_exceeded(measured_bytes, limit_bytes) {
+            Some(b) => CapacityLimitCheck::Exceeded(b),
+            None => CapacityLimitCheck::Within {
+                total_bytes: measured_bytes,
+                limit_bytes,
+            },
+        }
+    }
+
     /// 一時 cwd の下に `proj/` を新規作成し、ステージングにファイルを 1 つ置いて返す。
     fn setup(case: &str) -> (std::path::PathBuf, Project, CreatedDir) {
         let cwd =
@@ -328,7 +346,7 @@ mod tests {
     #[test]
     fn req30_over_limit_leaves_no_package_and_no_staging() {
         let (cwd, project, staging) = setup("over");
-        let breaches = finalize_staging(&project, &staging, 41, 40).expect("finalize");
+        let breaches = finalize_staging(&project, &staging, &check_of(41, 40)).expect("finalize");
         assert_eq!(
             breaches,
             vec![LimitBreach::Capacity {
@@ -345,7 +363,7 @@ mod tests {
     #[test]
     fn req30_within_limit_publishes_package() {
         let (cwd, project, staging) = setup("within");
-        let breaches = finalize_staging(&project, &staging, 40, 40).expect("finalize");
+        let breaches = finalize_staging(&project, &staging, &check_of(40, 40)).expect("finalize");
         assert_eq!(breaches, Vec::new());
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let bytes = project
@@ -364,7 +382,7 @@ mod tests {
         project
             .write_new(Path::new(PACKAGE_DIR).join("artifact.json"), b"old")
             .expect("old file");
-        let breaches = finalize_staging(&project, &staging, 41, 40).expect("finalize");
+        let breaches = finalize_staging(&project, &staging, &check_of(41, 40)).expect("finalize");
         assert_eq!(breaches.len(), 1);
         let bytes = project
             .read(Path::new(PACKAGE_DIR).join("artifact.json"), 16)
@@ -380,7 +398,8 @@ mod tests {
     fn req39_publish_does_not_replace_existing_package() {
         let (cwd, project, staging) = setup("noreplace");
         project.create_dir(PACKAGE_DIR).expect("empty package");
-        let err = finalize_staging(&project, &staging, 1, 40).expect_err("must not replace");
+        let err =
+            finalize_staging(&project, &staging, &check_of(1, 40)).expect_err("must not replace");
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
