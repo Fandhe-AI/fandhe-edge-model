@@ -42,6 +42,7 @@ use fandhe_edge_guard::format::FormatRejection;
 use fandhe_edge_guard::kind::KindRejection;
 use fandhe_edge_guard::kind_version::KindVersionRejection;
 use fandhe_edge_guard::path::PathRejection;
+use fandhe_edge_guard::resource::{GuardRunError, ResourceKind, ResourceLimitExceeded};
 use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::result::TrainOutcome;
@@ -184,6 +185,27 @@ impl ToErrorReport for FormatRejection {
             return ErrorReport::new(code, "model file exceeds size limit");
         }
         ErrorReport::new(code, format!("format rejected: {}", self.reason_code()))
+    }
+}
+
+/// 資源上限の超過の記録（REQ-39・TASK-39.5-1・#170）。固定語彙のみで、入力・子の出力・パスを含めない。
+impl ToErrorReport for ResourceLimitExceeded {
+    fn to_error_report(&self) -> ErrorReport {
+        let code = self.exit_code();
+        match self.kind() {
+            ResourceKind::Time => ErrorReport::new(code, "inference time limit exceeded"),
+            _ => ErrorReport::new(code, default_message(code)),
+        }
+    }
+}
+
+/// 時間上限 runner 自体の失敗。理由コードだけの固定語彙で、パス・本文を含めない（REQ-39）。
+impl ToErrorReport for GuardRunError {
+    fn to_error_report(&self) -> ErrorReport {
+        ErrorReport::new(
+            self.exit_code(),
+            format!("guarded run failed: {}", self.code()),
+        )
     }
 }
 
@@ -356,6 +378,32 @@ mod tests {
             assert_eq!(emit_error_report(&mut buffer, &report).unwrap(), code);
             assert_eq!(buffer.iter().filter(|b| **b == b'\n').count(), 1);
         }
+    }
+
+    /// REQ-39・TASK-39.5-1: 時間超過は `limit_exceeded`(20)・固定文に写り、runner の失敗は 64/70 に写る。
+    #[test]
+    fn req39_resource_limit_records_map_to_fixed_reports() {
+        use fandhe_edge_guard::resource::INFER_TIME_LIMIT;
+        use std::time::Duration;
+        let rec = ResourceLimitExceeded::time(INFER_TIME_LIMIT, Duration::from_secs(10), true);
+        let report = rec.to_error_report();
+        assert_eq!(report.code, ExitCode::LimitExceeded);
+        assert_eq!(report.message, "inference time limit exceeded");
+        assert_eq!(
+            GuardRunError::InvalidProgram.to_error_report(),
+            ErrorReport::new(
+                ExitCode::InvalidInput,
+                "guarded run failed: invalid_program"
+            )
+        );
+        assert_eq!(
+            GuardRunError::KillFailed.to_error_report(),
+            ErrorReport::new(ExitCode::RuntimeError, "guarded run failed: kill_failed")
+        );
+        assert_eq!(
+            GuardRunError::ReapTimeout.to_error_report(),
+            ErrorReport::new(ExitCode::RuntimeError, "guarded run failed: reap_timeout")
+        );
     }
 
     /// REQ-21・REQ-39: 推論・バッチの失敗は固定語彙の code/message に写り `Ok` にならない。

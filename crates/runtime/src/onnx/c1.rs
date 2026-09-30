@@ -34,10 +34,9 @@ use std::time::{Duration, Instant};
 /// n-gram の最大長（学習ワーカーの `limits.py::MAX_C1_NGRAM`）。64 bit キーに収まる上限でもある。
 const MAX_NGRAM: usize = 7;
 
-/// 1 系列の計算時間の上限（REQ-39。C3 の `MAX_INFER_DURATION`・
-/// `latency::DEFAULT_LATENCY_PER_INFER_TIMEOUT_NS` と同値）。入力長の上限だけでは、
+/// 1 系列の計算時間の上限（REQ-39。値の出所は共通コアの `limits::INFER_TIME_LIMIT`）。入力長の上限だけでは、
 /// 大きな語彙表・重みを持つモデルの走査時間を抑えられない。
-const MAX_INFER_DURATION: Duration = Duration::from_secs(10);
+const MAX_INFER_DURATION: Duration = fandhe_edge_core::limits::INFER_TIME_LIMIT;
 /// 経過時間を検査する間隔（反復回数）。`Instant::now` の呼び出しを間引くための値。
 const CHECK_INTERVAL: usize = 256;
 

@@ -267,7 +267,7 @@ pub fn judgment_from_prediction(
 /// 入力は最大 [`MAX_INFER_BATCH_LEN`] 件で、選択肢 ID は 1 件あたり最大 64 KiB になりうるため、
 /// 出力は入力より桁違いに大きくなりえる。全行の長さを書き込み前に合計してこの値で拒否し、
 /// 出力量（と、その書き込みに要する時間）を有界にする。
-pub const MAX_INFER_BATCH_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_INFER_BATCH_OUTPUT_BYTES: usize = fandhe_edge_core::limits::MAX_OUTPUT_BYTES;
 
 /// 出力段階（結果行の書き込み）の時間上限（暫定。REQ-39）。CLI 経路のウォッチドッグが強制する。
 pub const MAX_INFER_BATCH_OUTPUT_DURATION: Duration = Duration::from_secs(60);

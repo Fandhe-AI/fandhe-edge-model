@@ -62,5 +62,6 @@ pub mod fs;
 pub mod hash;
 pub mod infer_input;
 pub mod judgment;
+pub mod limits;
 pub mod rebuild;
 pub mod stage_report;
