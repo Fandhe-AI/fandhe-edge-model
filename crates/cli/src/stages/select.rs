@@ -45,7 +45,7 @@ use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, invalid, ru
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
 };
-use super::infer::kind_version_allowed;
+use super::infer::load_backend;
 use super::train::{load_trained, request_matches_candidate, resolve_candidates, verified_split};
 
 /// `select` を実行する。
@@ -260,11 +260,18 @@ fn vocab_exclusion_of(
         request.kind_version(),
         request.max_bytes(),
     )?;
-    check_bytes(onnx_bytes, &FormatAllowlist::onnx_only()).map_err(|e| e.to_error_report())?;
+    // `package`・`infer` と共有する `load_backend` で、ONNX として読み込めること・出力クラス数が
+    // 定義の選択肢数と一致すること・`kind_version` の許可も確認する（容量超過の候補も同じ。
+    // 失敗は除外にせず、`package` と同じ終了コードで止める。REQ-30・REQ-39）。
+    let checked =
+        check_bytes(onnx_bytes, &FormatAllowlist::onnx_only()).map_err(|e| e.to_error_report())?;
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    if !kind_version_allowed(kind, meta.kind_version()) {
-        return Err(invalid("unsupported kind_version"));
-    }
+    load_backend(
+        checked.as_bytes(),
+        kind,
+        meta.kind_version(),
+        definition.options().len(),
+    )?;
     // 語彙の保持 fd 1 本を検証（ローダー内）と容量計測（fstat）の両方で使い、開き直さない。
     // 容量を超える語彙も同じ形式検証を通し済みで、不正なら除外にせず `invalid_input` で止まる。
     let has_vocab_file = handles.vocab.is_some();

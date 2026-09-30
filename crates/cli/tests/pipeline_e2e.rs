@@ -1605,6 +1605,55 @@ mod suite {
         assert!(!env.project_file("selection_record.json").exists());
     }
 
+    /// REQ-30・REQ-39: 容量超過の候補にも `package` と同じ `load_backend` の確認が先に適用される。
+    /// 形式は ONNX でハッシュも一致するが読み込めないモデルと、出力クラス数が定義の選択肢数と
+    /// 食い違うモデル（2 択の定義に 3 クラスの fixture）は、除外にならず `invalid_input`（64）で止まる。
+    pub fn select_loads_onnx_before_capacity_exclusion() {
+        let env = inspected("selloadexcl");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let onnx = env.project_file("candidates/0/model-c1/model.onnx");
+        let original = std::fs::read(&onnx).expect("onnx");
+        // ONNX の最小の形（形式判定は通る）だが、モデルとしては読み込めない。
+        let broken = vec![0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
+        std::fs::write(&onnx, &broken).expect("broken");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let old = Sha256Digest::of_bytes(&original).to_hex();
+        let new = Sha256Digest::of_bytes(&broken).to_hex();
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"model file cannot be loaded\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+
+        // 2 択の定義（fixture は 3 クラス）。
+        let env = Env::new("selclasses", false);
+        let two = definition_text().replace(
+            r#",{"id":"gamma","display_name":"gamma","description":"dummy"}"#,
+            "",
+        );
+        std::fs::write(env.work.join("def").join("definition.json"), two).expect("definition");
+        let data: String = train_jsonl()
+            .lines()
+            .filter(|l| !l.contains("gamma"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"model output size does not match definition\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1871,6 +1920,10 @@ fn main() -> std::process::ExitCode {
         (
             "vocab_in_artifact_dir_passes_select_package_and_infer",
             suite::vocab_in_artifact_dir_passes_select_package_and_infer,
+        ),
+        (
+            "select_loads_onnx_before_capacity_exclusion",
+            suite::select_loads_onnx_before_capacity_exclusion,
         ),
         (
             "infer_out_option_is_not_faked",
