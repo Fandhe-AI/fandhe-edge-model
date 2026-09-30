@@ -37,7 +37,7 @@ use super::train::{load_trained, resolve_candidates};
 /// 予測と入力の不一致・採点失敗は `runtime_error`（70）。
 pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
-    if project.exists(SELECTION_FILE) {
+    if project.exists(SELECTION_FILE)? {
         return Err(crate::project::invalid("selection record already exists"));
     }
     let definition = project.load_definition()?;

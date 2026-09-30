@@ -18,6 +18,7 @@
 //! プロジェクトを残さない。既存の `--project-dir` は最初に拒否するため、削除対象は
 //! 本工程が作ったものに限る）。
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::definition::MAX_DEFINITION_FILE_BYTES;
@@ -26,7 +27,7 @@ use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::stage_report::RegisterReport;
 use fandhe_edge_data::eval_freeze::{FreezeRecord, freeze_eval_data};
 use fandhe_edge_data::frozen_placement::place_read_only;
-use fandhe_edge_guard::path::open_confined;
+use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 
 use crate::args::RegisterArgs;
 use crate::error_report::ToErrorReport;
@@ -35,11 +36,50 @@ use crate::project::{
     TRAIN_DATA_FILE, fail, fs_report, invalid, parse_definition, runtime,
 };
 
-/// cwd 配下へ閉じ込めて開き、上限付きで読む（実体パスも返す）。
+/// 「対象が存在しない」を表す拒否か（`NotFound` のみ。権限拒否・I/O 失敗は含めない）。
+fn is_not_found(e: &PathRejection) -> bool {
+    matches!(e, PathRejection::Unresolvable { source, .. } if source.kind() == ErrorKind::NotFound)
+}
+
+/// cwd 配下へ閉じ込めて開き、上限付きで読む（実体パスも返す）。存在しなければ `None`。
+///
+/// `None` は `NotFound` のときだけ。権限拒否・I/O 失敗・閉じ込め違反は失敗として返す
+/// （失敗を「無い」と読み替えない。評価データの取り込み漏れを防ぐ。REQ-17）。
+fn read_confined_optional(
+    cwd: &Path,
+    path: &Path,
+    limit: u64,
+) -> Result<Option<(Vec<u8>, PathBuf)>, ErrorReport> {
+    match open_confined(cwd, path) {
+        Ok((file, real)) => {
+            let bytes =
+                read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))?;
+            Ok(Some((bytes, real.into_path_buf())))
+        }
+        Err(e) if is_not_found(&e) => Ok(None),
+        // 閉じ込めつきの open が使えない OS では、存在しない・cwd 外のパスの拒否だけを
+        // 他 OS と同じ結果にそろえ、それ以外は未対応として拒否する（fail-closed）。
+        Err(PathRejection::UnsupportedPlatform) => {
+            let root = std::fs::canonicalize(cwd).map_err(|_| runtime("cannot resolve cwd"))?;
+            match safe_join(&root, path) {
+                Err(e) if is_not_found(&e) => Ok(None),
+                Err(e) => Err(e.to_error_report()),
+                Ok(_) => Err(PathRejection::UnsupportedPlatform.to_error_report()),
+            }
+        }
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// [`read_confined_optional`] で、存在しないことも `invalid_input`（経路の拒否）として返す。
 fn read_confined(cwd: &Path, path: &Path, limit: u64) -> Result<(Vec<u8>, PathBuf), ErrorReport> {
-    let (file, real) = open_confined(cwd, path).map_err(|e| e.to_error_report())?;
-    let bytes = read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))?;
-    Ok((bytes, real.into_path_buf()))
+    read_confined_optional(cwd, path, limit)?.ok_or_else(|| {
+        PathRejection::Unresolvable {
+            candidate: path.to_path_buf(),
+            source: std::io::Error::from(ErrorKind::NotFound),
+        }
+        .to_error_report()
+    })
 }
 
 /// `register` を実行する。
@@ -57,24 +97,22 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         return Err(invalid("definition path is invalid"));
     };
 
+    // 学習データが無い場合は利用者の入力不備（`invalid_input`）。権限拒否・容量超過・I/O 失敗は
+    // それぞれの終了コードのまま返す。
     let (train_bytes, _) =
-        read_confined(cwd, &src_dir.join(TRAIN_DATA_FILE), MAX_PROJECT_FILE_BYTES).map_err(
-            |e| {
-                // 学習データが無い場合は利用者の入力不備として扱う。
-                if e.code == ExitCode::RuntimeError {
-                    invalid("training data file is missing")
-                } else {
-                    e
-                }
-            },
-        )?;
+        read_confined_optional(cwd, &src_dir.join(TRAIN_DATA_FILE), MAX_PROJECT_FILE_BYTES)?
+            .ok_or_else(|| invalid("training data file is missing"))?;
+    // 評価データは任意。`NotFound` のときだけ「提供なし」とし、それ以外の失敗は停止する
+    // （失敗を「無い」と読み替えると凍結記録が作られず、evaluate が skipped・exit 0 になる。REQ-17）。
     let eval_path = src_dir.join(EVALUATION_DATA_FILE);
-    let evaluation = if std::fs::symlink_metadata(&eval_path).is_ok() {
-        let (bytes, real) = read_confined(cwd, &eval_path, MAX_PROJECT_FILE_BYTES)?;
-        let record = freeze_eval_data(&bytes).map_err(|e| e.to_error_report())?;
-        Some((real, record))
-    } else {
-        None
+    let evaluation = match std::fs::symlink_metadata(&eval_path) {
+        Ok(_) => {
+            let (bytes, real) = read_confined(cwd, &eval_path, MAX_PROJECT_FILE_BYTES)?;
+            let record = freeze_eval_data(&bytes).map_err(|e| e.to_error_report())?;
+            Some((real, record))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(_) => return Err(runtime("cannot inspect evaluation data file")),
     };
 
     let project = Project::create(cwd, &args.project_dir)?;

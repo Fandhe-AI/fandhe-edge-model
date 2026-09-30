@@ -29,16 +29,16 @@
 //!
 //! # 閉じ込め（REQ-39）
 //!
-//! プロジェクト内の読み取りはガード層の [`ConfinedPackage`]（ディレクトリ fd 起点の `openat`＋
-//! `O_NOFOLLOW`）を通す。書き込みは正準化済みのプロジェクトパス配下へ `create_new`（既存ファイルの
-//! 上書き・symlink の追従をしない）で行う。プロジェクトの作成は cwd 配下へ閉じ込めた親の下だけで、
-//! 既存の `--project-dir` は拒否する。ディレクトリは所有者のみ（0700）で作る
+//! プロジェクト内の読み取り・書き込みはガード層の [`ConfinedPackage`]（ディレクトリ fd 起点の
+//! `openat`＋`O_NOFOLLOW`。書き込みは `O_EXCL`・`mkdirat`）を通す（既存の上書き・symlink の追従・
+//! 検証後の親の差し替えによる外部への書き込みをしない）。プロジェクトの作成は cwd 配下へ閉じ込めた
+//! 親の下だけで、既存の `--project-dir` は拒否する。ディレクトリは所有者のみ（0700）で作る
 //! （学習ワーカーが出力先の親の権限を検査するため）。
 //!
 //! エラーの message は固定の英語語彙で、パス・データ本文・利用者の値を含めない（`security.md`）。
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
@@ -46,7 +46,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_data::inspect::{ValidRecord, inspect_records};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
-use fandhe_edge_guard::path::safe_join;
+use fandhe_edge_guard::path::PathRejection;
 
 use crate::error_report::ToErrorReport;
 
@@ -144,9 +144,12 @@ impl Project {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let parent = safe_join(cwd, parent).map_err(|e| e.to_error_report())?;
-        let target = parent.as_path().join(leaf);
-        make_dir(&target)?;
+        // 親も保持した fd 起点で開き、`mkdirat` で作る（検証後の親の差し替えで cwd 外へ作らない。REQ-39）。
+        let parent = confine_package(cwd, parent).map_err(|e| e.to_error_report())?;
+        parent.create_dir_member(Path::new(leaf)).map_err(|e| {
+            write_rejection(&e, "directory already exists", "cannot create directory")
+        })?;
+        let target = parent.dir().join(leaf);
         Self::open(cwd, &target)
     }
 
@@ -164,9 +167,18 @@ impl Project {
     }
 
     /// 相対パスの対象が存在するか（symlink は追従しない）。
-    #[must_use]
-    pub fn exists(&self, rel: impl AsRef<Path>) -> bool {
-        std::fs::symlink_metadata(self.path(rel)).is_ok()
+    ///
+    /// `NotFound` だけを「無い」とし、権限拒否・I/O 失敗は `runtime_error` にする（失敗を
+    /// 「無い」と読み替えて後続工程が既存の記録を無視しない。fail-closed）。
+    ///
+    /// # Errors
+    /// `NotFound` 以外のメタデータ取得失敗は `runtime_error`（70）。
+    pub fn exists(&self, rel: impl AsRef<Path>) -> Result<bool, ErrorReport> {
+        match std::fs::symlink_metadata(self.path(rel)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(runtime("cannot inspect project file")),
+        }
     }
 
     /// 閉じ込めつきで開いて上限付きで読む（パスを開き直さない）。
@@ -202,19 +214,44 @@ impl Project {
         rel: impl AsRef<Path>,
         limit: u64,
     ) -> Result<Option<Vec<u8>>, ErrorReport> {
-        if self.exists(rel.as_ref()) {
-            self.read(rel, limit).map(Some)
-        } else {
-            Ok(None)
-        }
+        // 開いた結果で「無い」を判定する（`NotFound` のみ `None`。権限拒否・I/O 失敗は
+        // 「無い」と読み替えず失敗として返す。評価データが「無い」扱いで evaluate が
+        // skipped になるのを防ぐ。REQ-17）。
+        let (file, real) = match self.package.open_member(rel.as_ref()) {
+            Ok(opened) => opened,
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.to_error_report()),
+        };
+        read_bounded_open_file(file, real.as_path(), limit)
+            .map(Some)
+            .map_err(|e| fs_report(&e))
     }
 
     /// 新規ファイルを書く（既存なら拒否。symlink は追従しない）。親ディレクトリは既存であること。
     ///
+    /// 親は保持したディレクトリ fd 起点で成分ごとに `O_NOFOLLOW` で辿り、`O_EXCL` で作る
+    /// （`Project::open` 後に親が symlink へ差し替えられても外へ書かない。REQ-39）。書き込みに
+    /// 失敗したら作りかけのファイルを消す（再実行が「既存」で恒久的に拒否されないように）。
+    ///
     /// # Errors
     /// 既存は `invalid_input`、書き込み失敗は `runtime_error`。
     pub fn write_new(&self, rel: impl AsRef<Path>, bytes: &[u8]) -> Result<(), ErrorReport> {
-        write_new_file(&self.path(rel), bytes)
+        let rel = rel.as_ref();
+        let mut file = self
+            .package
+            .create_new_member(rel)
+            .map_err(|e| write_rejection(&e, "file already exists", "cannot write project file"))?;
+        if file.write_all(bytes).and_then(|()| file.flush()).is_err() {
+            drop(file);
+            // best effort（消せなくても元の失敗を返す）。
+            let _ = self.package.remove_file_member(rel);
+            return Err(runtime("cannot write project file"));
+        }
+        Ok(())
     }
 
     /// ディレクトリを所有者のみ（0700）で新規作成する（既存なら拒否）。
@@ -222,9 +259,11 @@ impl Project {
     /// # Errors
     /// 既存は `invalid_input`、作成失敗は `runtime_error`。
     pub fn create_dir(&self, rel: impl AsRef<Path>) -> Result<PathBuf, ErrorReport> {
-        let path = self.path(rel);
-        make_dir(&path)?;
-        Ok(path)
+        let rel = rel.as_ref();
+        self.package.create_dir_member(rel).map_err(|e| {
+            write_rejection(&e, "directory already exists", "cannot create directory")
+        })?;
+        Ok(self.path(rel))
     }
 
     /// 登録済みの定義を読む。
@@ -279,46 +318,18 @@ pub fn inspect_bytes(
     Ok(outcome.valid_records)
 }
 
-#[cfg(unix)]
-fn make_dir(path: &Path) -> Result<(), ErrorReport> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(invalid("directory already exists"))
-        }
-        Err(_) => Err(runtime("cannot create directory")),
-    }
-}
-
-#[cfg(not(unix))]
-fn make_dir(path: &Path) -> Result<(), ErrorReport> {
-    match std::fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(invalid("directory already exists"))
-        }
-        Err(_) => Err(runtime("cannot create directory")),
-    }
-}
-
-/// 新規ファイルを `create_new`（`O_EXCL`。既存・symlink は拒否）で書く。
+/// 書き込み系の閉じ込め拒否を [`ErrorReport`] にする（message は固定語彙）。
 ///
-/// # Errors
-/// 既存は `invalid_input`、書き込み失敗は `runtime_error`。
-pub fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), ErrorReport> {
-    let mut file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(invalid("file already exists"));
+/// 既存は `invalid_input`、経路の拒否・未対応 OS は下位層の写像、それ以外（権限・容量等）は
+/// `runtime_error`。
+fn write_rejection(e: &PathRejection, exists_message: &str, other_message: &str) -> ErrorReport {
+    match e {
+        PathRejection::Unresolvable { source, .. } if source.kind() == ErrorKind::AlreadyExists => {
+            invalid(exists_message)
         }
-        Err(_) => return Err(runtime("cannot write project file")),
-    };
-    file.write_all(bytes)
-        .and_then(|()| file.flush())
-        .map_err(|_| runtime("cannot write project file"))
+        PathRejection::Escapes { .. }
+        | PathRejection::EmptyPath
+        | PathRejection::UnsupportedPlatform => e.to_error_report(),
+        _ => runtime(other_message),
+    }
 }

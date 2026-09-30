@@ -165,7 +165,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let launcher = worker_launcher()?;
 
     let rel = candidate_rel(args.candidate);
-    if !project.exists(CANDIDATES_DIR) {
+    if !project.exists(CANDIDATES_DIR)? {
         project.create_dir(CANDIDATES_DIR)?;
     }
     project.create_dir(&rel)?;

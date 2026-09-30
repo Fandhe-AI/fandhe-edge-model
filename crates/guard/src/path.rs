@@ -547,6 +547,128 @@ impl ConfinedDir {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ConfinedDir {
+    /// `rel`（本ディレクトリ配下の相対パス）の親までを、保持した fd を起点に成分ごとに
+    /// `openat`（`O_DIRECTORY | O_NOFOLLOW`）で辿り、親ディレクトリ fd（`None` は本ディレクトリ自身）
+    /// と末尾の名前を返す。パスを開き直さないため、検証後に親が symlink へ差し替えられても
+    /// 外へは出られない（REQ-39。書き込み系の閉じ込め）。
+    fn open_parent_of(
+        &self,
+        rel: &Path,
+    ) -> Result<(Option<rustix::fd::OwnedFd>, std::ffi::OsString), PathRejection> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use rustix::io::Errno;
+
+        let escapes = || PathRejection::Escapes {
+            candidate: rel.to_path_buf(),
+            kind: EscapeKind::Symlink,
+        };
+        let mut names = Vec::new();
+        for c in rel.components() {
+            match c {
+                Component::Normal(n) => names.push(n),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(PathRejection::Escapes {
+                        candidate: rel.to_path_buf(),
+                        kind: EscapeKind::ParentTraversal,
+                    });
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(PathRejection::Escapes {
+                        candidate: rel.to_path_buf(),
+                        kind: EscapeKind::Absolute,
+                    });
+                }
+            }
+        }
+        let Some((last, parents)) = names.split_last() else {
+            return Err(PathRejection::EmptyPath);
+        };
+        let mut owned: Option<rustix::fd::OwnedFd> = None;
+        for name in parents {
+            let cur = owned.as_ref().unwrap_or(&self.fd);
+            let next = openat(
+                cur,
+                *name,
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| match e {
+                Errno::LOOP | Errno::NOTDIR => escapes(),
+                other => PathRejection::Unresolvable {
+                    candidate: rel.to_path_buf(),
+                    source: errno_to_io(other),
+                },
+            })?;
+            owned = Some(next);
+        }
+        Ok((owned, (*last).to_os_string()))
+    }
+
+    /// `rel` に新規の通常ファイルを `O_CREAT | O_EXCL | O_NOFOLLOW` で作って書き込み用に返す。
+    ///
+    /// 親は保持した fd 起点で辿る（[`ConfinedDir::open_member`] と同じ閉じ込め）。既存（symlink を
+    /// 含む）の名前は `AlreadyExists` の [`PathRejection::Unresolvable`] で拒否する。
+    ///
+    /// # Errors
+    /// 経路の拒否・既存・作成失敗。
+    pub fn create_new_member(&self, rel: &Path) -> Result<File, PathRejection> {
+        use rustix::fs::{Mode, OFlags, openat};
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        let fd = openat(
+            dir,
+            name.as_os_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(|e| PathRejection::Unresolvable {
+            candidate: rel.to_path_buf(),
+            source: errno_to_io(e),
+        })?;
+        Ok(File::from(fd))
+    }
+
+    /// `rel` にディレクトリを所有者のみ（0700）で新規作成する（既存なら `AlreadyExists`）。
+    ///
+    /// # Errors
+    /// 経路の拒否・既存・作成失敗。
+    pub fn create_dir_member(&self, rel: &Path) -> Result<(), PathRejection> {
+        use rustix::fs::{Mode, mkdirat};
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        mkdirat(dir, name.as_os_str(), Mode::from_raw_mode(0o700)).map_err(|e| {
+            PathRejection::Unresolvable {
+                candidate: rel.to_path_buf(),
+                source: errno_to_io(e),
+            }
+        })
+    }
+
+    /// `rel` の通常ファイル（またはリンク自身）を削除する（書き込み失敗後の片付け用。ディレクトリは消さない）。
+    ///
+    /// # Errors
+    /// 経路の拒否・削除失敗。
+    pub fn remove_file_member(&self, rel: &Path) -> Result<(), PathRejection> {
+        use rustix::fs::{AtFlags, unlinkat};
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        unlinkat(dir, name.as_os_str(), AtFlags::empty()).map_err(|e| PathRejection::Unresolvable {
+            candidate: rel.to_path_buf(),
+            source: errno_to_io(e),
+        })
+    }
+}
+
 /// `dir`（[`safe_join`] 済みの正準パス）を `O_NOFOLLOW` で開いて fd を保持する。
 ///
 /// 開いた fd の実パスが `dir` と一致することを確認する。検証後・open 前に別ディレクトリへ

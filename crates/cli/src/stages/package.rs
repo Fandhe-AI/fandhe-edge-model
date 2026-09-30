@@ -86,7 +86,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         return Err(invalid("artifact metadata does not match the model file"));
     }
 
-    if project.exists(PACKAGE_DIR) {
+    if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
     }
     let package_dir = project.create_dir(PACKAGE_DIR)?;
