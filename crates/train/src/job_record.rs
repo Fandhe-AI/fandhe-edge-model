@@ -56,6 +56,13 @@
 //!   `failed`＋`OwnerLost` の記録を新規に書いて回復する（取れなければ初期化中の
 //!   `running`）。公開前に落ちた場合は `job.lock.init.*` が残りうるが状態確認には
 //!   影響しない（掃除は TASK-34.3・#147）。
+//! - `job.lock` の fd は `O_CLOEXEC`（std の `File` の既定）で開くため、学習ワーカー等の
+//!   子プロセスへ `exec` 後は継承されない。所有者の消滅後に子プロセスが lock を保持し
+//!   続けて crash を見逃すことはない（`fork`〜`exec` 間の一過性の保持だけは
+//!   [`try_lock_settled`] の再試行で吸収する。テスト
+//!   `req34_owner_lost_is_detected_while_spawned_child_survives` で固定）。
+//! - `begin` が `job.json` の書き込み（rename 後の `sync_dir` を含む）に失敗した場合は、
+//!   `job.json` と `job.lock` の両方を取り除き、`job_dir` を再利用できる状態に戻す。
 //! - 所有者と同一プロセスから状態確認を呼んでも、プロセス内レジストリ（dev, ino）で
 //!   所有者の生存を判定し `job.lock` の取得を試みない（fcntl 系の lock 実装では同一
 //!   プロセス内の取得が成功し、close で所有者の lock が失われるため）。
@@ -545,7 +552,11 @@ impl JobRecorder {
             }
         })?;
         // ここから `job.lock` は自分のもの。以降の失敗では取り除く。
+        // `job.json` は rename 後の `sync_dir` の失敗でも公開済みになりうる。非終端の
+        // 記録だけが残ると `LockMissing`・`AlreadyExists` で `job_dir` を回復も再利用も
+        // できないため、lock 保持中に記録も取り除いてから lock を外す。
         let rollback = |e: JobRecordError| {
+            let _ = std::fs::remove_file(&record_path);
             let _ = std::fs::remove_file(&lock_path);
             e
         };
@@ -982,6 +993,67 @@ mod tests {
             assert_eq!(reports.iter().filter(|r| r.record_updated).count(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// REQ-34: 所有者の lock は子プロセスへ継承されない（`O_CLOEXEC`）。所有者が
+    /// `finish` せず消えたとき、`exec` 済みの子プロセスが生き残っていても crash を検出する。
+    #[cfg(unix)]
+    #[test]
+    fn req34_owner_lost_is_detected_while_spawned_child_survives() {
+        let dir = tmp_dir("child-survives");
+        let recorder = JobRecorder::begin(&dir, 10).expect("begin");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        drop(recorder);
+        let report = read_job_status(&dir, 20);
+        let _ = child.kill();
+        let _ = child.wait();
+        let report = report.expect("status");
+        assert_eq!(report.state, JobState::Failed);
+        assert!(report.crash_detected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: `job.json` が無い（初期化途中）状態でも、`exec` 済みの子プロセスが
+    /// 生き残っていて所有者の lock が継承されていなければ crash として回復できる。
+    #[cfg(unix)]
+    #[test]
+    fn req34_lock_only_owner_lost_is_recovered_while_child_survives() {
+        let dir = tmp_dir("lock-only-child");
+        let lock_path = dir.join(JOB_LOCK_FILE);
+        std::fs::write(&lock_path, b"").expect("lock file");
+        let lock = File::open(&lock_path).expect("open");
+        lock.try_lock().expect("hold");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        drop(lock);
+        let report = read_job_status(&dir, 20);
+        let _ = child.kill();
+        let _ = child.wait();
+        let report = report.expect("status");
+        assert_eq!(report.state, JobState::Failed);
+        assert!(report.crash_detected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-34: `begin` の `job.json` 書き込みが失敗しても `job.json`・`job.lock` を残さず、
+    /// `job_dir` を再利用できる（rename 後の `sync_dir` 失敗の後始末と同じ経路）。
+    #[test]
+    fn req34_begin_failure_leaves_dir_reusable() {
+        let dir = tmp_dir("begin-fail");
+        // tmp の位置をディレクトリで塞ぎ、書き込みを失敗させる。
+        std::fs::create_dir(dir.join(JOB_RECORD_TMP_FILE)).expect("block tmp");
+        assert!(JobRecorder::begin(&dir, 10).is_err());
+        assert!(!dir.join(JOB_LOCK_FILE).exists());
+        assert!(!dir.join(JOB_RECORD_FILE).exists());
+        std::fs::remove_dir(dir.join(JOB_RECORD_TMP_FILE)).expect("unblock");
+        let recorder = JobRecorder::begin(&dir, 11).expect("reuse");
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REQ-34: 正常終了は succeeded・crash なし。
