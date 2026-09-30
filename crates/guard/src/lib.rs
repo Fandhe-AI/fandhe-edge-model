@@ -16,7 +16,9 @@
 //! - [`kind`]: `kind` 値の許可リスト判定（TASK-39.2-3・#155）。実装済み。CLI への統合は #156 で未着手
 //! - [`version_ledger`]: 版管理台帳（版 ID・sha256・作成時刻の記録と取得。TASK-39.3-1・#167）。実装済み（メモリ上のみ）。
 //!   ロールバックと復元後のハッシュ一致検証は TASK-39.3-2（#168）、永続化は未着手
-//! - 未着手（後続 TASK）: CLI への統合（TASK-39.2-4・#156）・資源の上限（TASK-39.5）・
+//! - [`resource`]: 実行時間の上限（推論 1 件あたり暫定 10 秒）を子プロセス境界で強制し、超過を記録する
+//!   （TASK-39.5-1・#170）。実装済み。RSS 上限は #171、ファイルサイズ上限は #172、CLI 等への配線は #136
+//! - 未着手（後続 TASK）: CLI への統合（TASK-39.2-4・#156）・メモリ / ファイルサイズの上限（#171・#172）・
 //!   完全性と版（`kind_version` の許可リストを含む。TASK-39.6）
 
 pub mod format;
@@ -24,4 +26,5 @@ pub mod kind;
 pub mod model_file;
 pub mod package;
 pub mod path;
+pub mod resource;
 pub mod version_ledger;
