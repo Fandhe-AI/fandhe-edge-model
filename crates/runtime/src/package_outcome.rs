@@ -15,12 +15,13 @@
 //!
 //! # 範囲外（実装済みを装わない）
 //!
-//! - 超過の生成元となる上限との照合（`total_bytes > limit_bytes`。上限ちょうどは超過でない）は
-//!   TASK-30.2（#124）の責務で、本モジュールは [`LimitBreach`] を入力として受け取る。
-//!   #124 のマージ後に `measure_package` からの結線確認を行う
+//! - 容量の上限との照合（`total_bytes > limit_bytes`。上限ちょうどは超過でない）の境界規則は
+//!   [`LimitBreach::capacity_if_exceeded`] の 1 箇所に集約し、検証済み上限型との照合は
+//!   `capacity_limit` モジュール（TASK-30.2・#124）が担う。本モジュールは [`LimitBreach`] を
+//!   入力として受け取る
 //! - 待ち時間上限の検証済み型 `LatencyLimit` と照合 `check_latency_limit` は #129 で追加済み
 //!   （`latency_limit` モジュール）。定義ファイルへの取り込みは未実装
-//! - 利用者が設定する容量上限の定義ファイルへの取り込み（読み込みと範囲検証）は未実装
+//! - 利用者が設定する容量上限の定義ファイル・CLI 引数への取り込みは未実装（入出力契約の変更を伴う）
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
 //!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務
 //! - 待ち時間の p95 は `latency_report::LatencyReport::p95_ns()`（切り上げ済み。#128）から得る。
@@ -78,6 +79,18 @@ pub enum LimitBreach {
 }
 
 impl LimitBreach {
+    /// 非圧縮合計バイト数が上限を超える（`>`）ときだけ容量超過を返す。上限ちょうどは超過でない
+    /// （REQ-30・TASK-30.2・#124）。
+    ///
+    /// 整数の比較のみで算術をしないため overflow・panic しない。上限値の検証は
+    /// `capacity_limit::CapacityLimit` の責務。境界規則の唯一の実装で、他所で `>` 比較を書かない。
+    pub fn capacity_if_exceeded(measured_bytes: u64, limit_bytes: u64) -> Option<LimitBreach> {
+        (measured_bytes > limit_bytes).then_some(LimitBreach::Capacity {
+            measured_bytes,
+            limit_bytes,
+        })
+    }
+
     /// p95 が上限を超える（`>`）ときだけ待ち時間超過を返す。上限ちょうどは超過でない
     /// （REQ-31 の境界値・TASK-31.3）。計測経路を通した境界確認は
     /// `tests/latency_limit_boundary.rs`（#130。証拠種別はテストハーネス）。
@@ -195,6 +208,40 @@ mod tests {
             (n.exit_code.code(), n.verdict),
             (0, PackageVerdict::NotDefined)
         );
+    }
+
+    #[test]
+    fn req30_capacity_equal_to_limit_is_not_breach() {
+        assert_eq!(
+            LimitBreach::capacity_if_exceeded(40_000_000, 40_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn req30_capacity_one_byte_over_limit_is_breach() {
+        assert_eq!(
+            LimitBreach::capacity_if_exceeded(40_000_001, 40_000_000),
+            Some(LimitBreach::Capacity {
+                measured_bytes: 40_000_001,
+                limit_bytes: 40_000_000
+            })
+        );
+    }
+
+    #[test]
+    fn req30_capacity_below_limit_is_not_breach() {
+        assert_eq!(
+            LimitBreach::capacity_if_exceeded(39_999_999, 40_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn req30_capacity_u64_extremes() {
+        assert_eq!(LimitBreach::capacity_if_exceeded(u64::MAX, u64::MAX), None);
+        assert!(LimitBreach::capacity_if_exceeded(u64::MAX, u64::MAX - 1).is_some());
+        assert_eq!(LimitBreach::capacity_if_exceeded(0, 0), None);
     }
 
     const LIMIT_NS: u64 = 250_000_000;

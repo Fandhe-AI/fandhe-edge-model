@@ -71,6 +71,11 @@ make doctor      # 環境診断のみ（何も導入しない）
 - `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
 - 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
 
+#### Claude Code の許可操作（確認画面）の確認（REQ-36・TASK-36.3・#160）
+
+- 確認は [docs/design/claude-code-permission-prompt-procedure.md](docs/design/claude-code-permission-prompt-procedure.md) の手順で、確認画面が出る権限モードの Claude Code を使い**人が手動実行**する。Agent は手順と記録テンプレートの準備までで、実機の結果を Agent が確定させない。受け入れ条件は人の実測記録（証拠種別: 実機）が貼られて初めて満たされ、M9 もそれまで完了扱いにしない
+- Agent が一時ディレクトリで行う予行は確認画面を通さないテストハーネスで、実機の証拠にならない。`crates/cli/tests/bash_noninteractive.rs` の `req36_infer_real_package_exit_zero_via_sh` も同様（証拠種別: テストハーネス）
+
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 
 - `crates/runtime/tests/env_isolation.rs` は、環境変数を空にした子プロセスで C1・C3 の fixture 推論が exit 0 になることを確かめ、既定の `make test` で実行される（unix 限定。rust-ci の Linux・macOS runner で実行。証拠種別: テストハーネス）。実機前提へ移す差分は P0
