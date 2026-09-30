@@ -920,8 +920,10 @@ pub fn run_with_limits(
                     child_reaped: true,
                 }));
             }
-            // 読み取りエラーで欠けた出力を Exited として返さない。
-            if out.failed || err.failed {
+            // 判定の順序（REQ-39）: 1) 期限到達は時間超過を優先する。2) 期限前でも、読み取りエラー、
+            // または子孫がパイプを保持して EOF に達しなかった（done が false）場合は出力が欠けている
+            // ため、正常終了とせず `ReadOutput` を返す。3) それ以外だけを `Exited` とする。
+            if out.failed || err.failed || !(stdout_done && stderr_done) {
                 return Err(GuardRunError::ReadOutput);
             }
             Ok(GuardedRunOutcome::Exited {

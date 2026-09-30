@@ -22,6 +22,14 @@ fn child_entry() {
         "sleep60" => std::thread::sleep(Duration::from_secs(60)),
         "sleep5" => std::thread::sleep(Duration::from_secs(5)),
         "ok" => println!("child-ok"),
+        "grandchild" => {
+            // 自身は即終了し、stdout を継承した孫を残す。孫は 5 秒で自走終了する（後始末）。
+            let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+                .env(MODE_ENV, "sleep5")
+                .spawn();
+            println!("child-exit");
+        }
         "exit70" => std::process::exit(70),
         "flood" => {
             let line = "x".repeat(1024);
@@ -160,4 +168,12 @@ fn req39_continuous_output_does_not_bypass_time_limit() {
     assert_eq!(rec.kind(), ResourceKind::Time);
     assert!(rec.child_reaped());
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// REQ-39: 子が期限内に終了しても孫が stdout を保持して EOF が来ない場合、欠けた出力を
+/// 正常終了として返さず `ReadOutput` にする（期限 30 秒より十分短い約 1 秒で判定される）。
+#[test]
+fn req39_grandchild_holding_pipe_is_read_output_error() {
+    let err = run_with_limits(&child("grandchild"), &config(Duration::from_secs(30))).unwrap_err();
+    assert_eq!(err, fandhe_edge_guard::resource::GuardRunError::ReadOutput);
 }
