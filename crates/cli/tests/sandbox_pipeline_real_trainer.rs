@@ -193,10 +193,11 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
     let meta = fs::read_to_string(dir.join("out/run/run.meta.json")).expect("run.meta.json");
     assert!(meta.contains("\"sandbox_exec_override\":true"), "{meta}");
     assert!(!meta.contains("\"process_pids\":[]"), "{meta}");
-    // 7 工程がこの順に並び、evaluate だけが skipped（評価データなし。評価済みを装わない）
+    // 7 工程がこの順（select → evaluate。選定してから評価する。REQ-27）に並び、evaluate だけが
+    // skipped（評価データなし。評価済みを装わない）
     let mut pos = 0;
     for step in [
-        "register", "inspect", "train", "evaluate", "select", "package", "infer",
+        "register", "inspect", "train", "select", "evaluate", "package", "infer",
     ] {
         let needle = format!("\"step\":\"{step}\"");
         let found = meta[pos..]
