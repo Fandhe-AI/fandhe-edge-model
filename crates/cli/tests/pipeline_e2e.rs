@@ -510,6 +510,27 @@ mod suite {
         );
     }
 
+    /// REQ-17: group が 1 件だけで validation 分割が空になるデータは、`inspect` が `invalid_input`（64）で
+    /// 拒否し、分割記録（split.json）を保存しない（後続の train が必ず失敗する状態を ok にしない）。
+    pub fn inspect_rejects_empty_validation_split_without_split_record() {
+        let env = Env::new("emptyval", false);
+        let mut data = String::new();
+        for i in 0..6 {
+            data.push_str(&format!(
+                "{{\"id\":\"r{i}\",\"input\":\"alpha sample {i}\",\"output\":{{\"intent\":\"alpha\"}},\"group_id\":\"only\"}}\n"
+            ));
+        }
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        let out = env.run(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(out.0, 64, "{}", out.1);
+        assert_eq!(
+            out.1,
+            "{\"code\":\"invalid_input\",\"message\":\"validation split is empty\"}\n"
+        );
+        assert!(!env.project_file("split.json").exists());
+    }
+
     /// REQ-39: データに異常（重複 id 等）があると inspect が停止し、分割記録を残さない。
     pub fn inspect_rejects_invalid_records() {
         let env = Env::new("badrecords", false);
@@ -857,6 +878,10 @@ fn main() -> std::process::ExitCode {
         (
             "register_rejects_existing_and_escaping_paths",
             suite::register_rejects_existing_and_escaping_paths,
+        ),
+        (
+            "inspect_rejects_empty_validation_split_without_split_record",
+            suite::inspect_rejects_empty_validation_split_without_split_record,
         ),
         (
             "inspect_rejects_invalid_records",

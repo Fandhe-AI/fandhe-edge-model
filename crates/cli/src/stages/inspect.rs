@@ -157,6 +157,17 @@ pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorRe
     let recorded = split_and_record(&train_rows, SPLIT_SEED, &SplitRatios::default())
         .map_err(|_| invalid("cannot split records"))?;
     let by_record = &recorded.result().by_record;
+    // 分割が空のまま `status:"ok"` で記録すると、後続の `train` が必ず失敗する。書き込みの前に拒否する
+    // （分割規則・seed は変えない。REQ-17）。group の件数が少ないと（目安として数件未満）起こるため、
+    // 利用者には group の件数を増やしてもらう（message は固定語彙でデータ本文・件数を含めない）。
+    for (split, message) in [
+        (Split::Train, "train split is empty"),
+        (Split::Validation, "validation split is empty"),
+    ] {
+        if !by_record.values().any(|s| *s == split) {
+            return Err(invalid(message));
+        }
+    }
     let pick = |split: Split| -> Vec<Row<'_>> {
         train_rows
             .iter()
