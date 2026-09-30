@@ -50,7 +50,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 #### 容量の実機計測（REQ-30・TASK-30.1・#121）
 
 - Mac（Apple Silicon）で人が実行する。前提は `register → inspect → train → evaluate → select → package` を完走させた、実データで学習した C1・C3 のプロジェクト（GPU を使う学習は人が実行する）。Agent は単独で実行しない
-- 実行: プロジェクトの `package/` 配下で `cargo run -p fandhe-edge-cli --example package_capacity -- weights=<onnx> label_table=definition.json metadata=artifact.json`（経路はカレントディレクトリ配下に閉じ込められる。REQ-39）
+- 実行: 先にリポジトリで `cargo build -p fandhe-edge-cli --example package_capacity` を実行する。その後、プロジェクトの `package/` 配下で `<repo>/target/debug/examples/package_capacity weights=<onnx> label_table=definition.json metadata=artifact.json` を実行する（`package/` はリポジトリ外のため cargo は workspace を見つけられず、ビルド済みバイナリを直接呼ぶ。経路はカレントディレクトリ配下に閉じ込められる。REQ-39）
 - 記録: `total_bytes` と 5 要素の内訳・kind（C1 / C3）と `onnx_sha256`・機種とメモリ・実行日・証拠種別「実機」を Issue #121 のコメントか PR に残す
 - 40MB は目安で合否条件ではない。C1 の 2.57MB は語彙を ONNX 外に持つ旧方式の値で、比較の参考にとどめる
 - `crates/runtime/tests/capacity_generated_packages.rs` は `fixtures/onnx_parity/` の生成物で内訳を照合するテストハーネスで、既定の `make test` で実行される（実機の証拠にはならない）
