@@ -657,6 +657,46 @@ mod suite {
         env.ok(&["package", "--project-dir", "proj"]);
     }
 
+    /// REQ-39: ハッシュは `artifact.json` と一致するが ONNX ではないファイル（pickle 先頭バイトの偽装・
+    /// ONNX 以外の中身）は、`infer` と同じ `invalid_input`（64）で公開前に止まり、`package/` を作らない。
+    pub fn package_rejects_non_onnx_model_with_matching_hash() {
+        let env = inspected("pkgnononnx");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let dir = env.project_file("candidates/0/model-c1");
+        let onnx = dir.join("model.onnx");
+        let meta = dir.join("artifact.json");
+        let meta_original = std::fs::read_to_string(&meta).expect("artifact.json");
+        let onnx_original = std::fs::read(&onnx).expect("onnx");
+        let old_hash = Sha256Digest::of_bytes(&onnx_original).to_hex();
+        for (label, bytes, expected) in [
+            (
+                "not onnx at all",
+                b"this is not an onnx model".to_vec(),
+                "{\"code\":\"invalid_input\",\"message\":\"format rejected: format_not_allowed\"}\n",
+            ),
+            (
+                "pickle disguise",
+                b"\x80\x04\x95 pickle".to_vec(),
+                "{\"code\":\"invalid_input\",\"message\":\"format rejected: format_not_allowed\"}\n",
+            ),
+        ] {
+            let new_hash = Sha256Digest::of_bytes(&bytes).to_hex();
+            std::fs::write(&onnx, &bytes).expect("replace onnx");
+            std::fs::write(&meta, meta_original.replace(&old_hash, &new_hash)).expect("meta");
+            assert_eq!(
+                env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+                expected,
+                "{label}"
+            );
+            assert!(!env.project_file("package").exists(), "{label}");
+            assert!(!env.project_file("package.staging").exists(), "{label}");
+        }
+        std::fs::write(&onnx, onnx_original).expect("restore onnx");
+        std::fs::write(&meta, meta_original).expect("restore meta");
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
     /// REQ-39: `artifact.json` の `kind_version` が選定候補の学習リクエストと食い違うと、公開前に
     /// `invalid_input`（64）で止まり `package/` を作らない。
     pub fn package_rejects_artifact_kind_version_mismatch() {
@@ -861,6 +901,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_selection_record_rewritten_to_other_candidate",
             suite::package_rejects_selection_record_rewritten_to_other_candidate,
+        ),
+        (
+            "package_rejects_non_onnx_model_with_matching_hash",
+            suite::package_rejects_non_onnx_model_with_matching_hash,
         ),
         (
             "package_rejects_artifact_kind_version_mismatch",

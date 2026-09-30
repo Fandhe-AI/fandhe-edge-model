@@ -13,6 +13,8 @@
 //! 3. `artifact.json` の `onnx_sha256` とコピーした ONNX の sha256 の一致、および `kind`・
 //!    `label_order`・`max_bytes` の定義・選定候補との一致を確認する
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
+//!    あわせて、公開前に `infer` と同じ検証（ガード層の形式許可リスト・ONNX の読み込み。
+//!    [`super::infer::load_backend`]）を通す
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
 //! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
@@ -32,11 +34,12 @@ use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::kind::KindAllowlist;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES};
+use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind};
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
@@ -50,6 +53,7 @@ use crate::project::{
     invalid, parse_definition, runtime,
 };
 
+use super::infer::load_backend;
 use super::select::compute_selection;
 use super::train::{load_trained, request_matches_candidate, resolve_candidates};
 
@@ -121,6 +125,18 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         request.kind(),
         request.kind_version(),
         request.max_bytes(),
+    )?;
+    // 公開前に、`infer` が同じパッケージを読むときと同じ検証を通す（ハッシュが一致しても ONNX として
+    // 読めないファイルを公開しない）。形式の許可リスト（ガード層）→ `kind_version` の許可リスト・
+    // ONNX の読み込み・出力サイズの一致（`infer` の `load_backend` と共通。REQ-39）。
+    check_bytes(onnx_bytes.clone(), &FormatAllowlist::onnx_only())
+        .map_err(|e| e.to_error_report())?;
+    let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
+    load_backend(
+        &onnx_bytes,
+        kind,
+        meta.kind_version(),
+        definition.options().len(),
     )?;
 
     if project.exists(PACKAGE_DIR)? {

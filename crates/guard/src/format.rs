@@ -700,7 +700,10 @@ pub fn check_open_file(
     check_bytes(bytes, allowlist)
 }
 
-fn check_bytes(
+/// 読み込み済みのバイト列を許可リストで検査する（`check_open_file` の検査部分。
+/// 既にバイト列を保持している呼び出し元〔`package` の公開前検証〕が、`infer` と同じ判定を通すための入口）。
+/// 上限の確認は呼び出し側が読み込み時に済ませていること（REQ-39）。
+pub fn check_bytes(
     bytes: Vec<u8>,
     allowlist: &FormatAllowlist,
 ) -> Result<CheckedFile, FormatRejection> {

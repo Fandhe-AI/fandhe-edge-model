@@ -113,6 +113,28 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
     }
 }
 
+/// `kind_version` の許可リスト検査・ONNX の読み込み・出力サイズと選択肢数の一致を確認して
+/// バックエンドを組み立てる（`infer` の `prepare` と、`package` の公開前検証が共有する。REQ-39）。
+///
+/// # Errors
+/// 未許可の版・読み込めない ONNX・出力サイズの不一致は `invalid_input`（64）。
+pub(crate) fn load_backend(
+    onnx: &[u8],
+    kind: ModelKind,
+    kind_version: u32,
+    n_options: usize,
+) -> Result<OnnxBackend, ErrorReport> {
+    if !kind_version_allowed(kind, kind_version) {
+        return Err(invalid("unsupported kind_version"));
+    }
+    let backend =
+        OnnxBackend::from_bytes(onnx, kind).map_err(|_| invalid("model file cannot be loaded"))?;
+    if backend.n_classes() != n_options {
+        return Err(invalid("model output size does not match definition"));
+    }
+    Ok(backend)
+}
+
 /// 経路・形式・自己整合性を検査し、推論パイプラインを組み立てる。
 fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     let checked = check_infer_path_and_format(cwd, args)?;
@@ -159,14 +181,7 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         .filter(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(n))
         .ok_or_else(|| invalid("package max_bytes is out of range"))?;
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    if !kind_version_allowed(kind, meta.kind_version()) {
-        return Err(invalid("unsupported kind_version"));
-    }
-    let backend =
-        OnnxBackend::from_bytes(onnx, kind).map_err(|_| invalid("model file cannot be loaded"))?;
-    if backend.n_classes() != definition.options().len() {
-        return Err(invalid("model output size does not match definition"));
-    }
+    let backend = load_backend(onnx, kind, meta.kind_version(), definition.options().len())?;
     Ok(Prepared {
         definition,
         pipeline: InferencePipeline::new(ByteEncodingPreprocessor::new(max_bytes), backend),
