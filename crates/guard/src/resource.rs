@@ -273,6 +273,8 @@ pub enum GuardRunError {
     KillFailed,
     /// kill 後の回収を確認できなかった。
     ReapTimeout,
+    /// 子の出力の読み取りに失敗した（欠けた出力を正常終了として返さない）。
+    ReadOutput,
 }
 
 impl GuardRunError {
@@ -286,6 +288,7 @@ impl GuardRunError {
             Self::Wait => "wait_failed",
             Self::KillFailed => "kill_failed",
             Self::ReapTimeout => "reap_timeout",
+            Self::ReadOutput => "read_output_failed",
         }
     }
 
@@ -294,7 +297,7 @@ impl GuardRunError {
     pub const fn exit_code(self) -> ExitCode {
         match self {
             Self::InvalidProgram | Self::InvalidConfig => ExitCode::InvalidInput,
-            Self::Spawn | Self::Wait | Self::KillFailed | Self::ReapTimeout => {
+            Self::Spawn | Self::Wait | Self::KillFailed | Self::ReapTimeout | Self::ReadOutput => {
                 ExitCode::RuntimeError
             }
         }
@@ -575,6 +578,7 @@ mod reader {
         cap: usize,
         truncated: bool,
         eof: bool,
+        failed: bool,
     }
 
     fn errno_io(e: rustix::io::Errno) -> io::Error {
@@ -592,6 +596,7 @@ mod reader {
                 cap,
                 truncated: false,
                 eof: false,
+                failed: false,
             })
         }
 
@@ -613,7 +618,9 @@ mod reader {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => {
+                        // 読み取り失敗は正常な EOF と区別して保持する（欠けた出力を成功扱いにしない）。
                         self.eof = true;
+                        self.failed = true;
                         break;
                     }
                 };
@@ -630,8 +637,8 @@ mod reader {
             progressed
         }
 
-        /// `deadline` まで EOF を待ち、(出力, 切り詰め, EOF 到達) を返す。
-        pub fn finish(mut self, deadline: Instant) -> (Vec<u8>, bool, bool) {
+        /// `deadline` まで EOF を待ち、出力・切り詰め・EOF 到達・読み取り失敗を返す。
+        pub fn finish(mut self, deadline: Instant) -> super::Finished {
             loop {
                 self.pump();
                 let now = Instant::now();
@@ -642,9 +649,26 @@ mod reader {
                     Duration::from_millis(5).min(deadline.saturating_duration_since(now)),
                 );
             }
-            (self.buf, self.truncated || !self.eof, self.eof)
+            super::Finished {
+                buf: self.buf,
+                truncated: self.truncated || !self.eof,
+                done: self.eof,
+                failed: self.failed,
+            }
         }
     }
+    /// REQ-39: 読み取りエラーは正常な EOF と区別され、`failed` として保持される。
+    #[cfg(test)]
+    #[test]
+    fn req39_read_error_is_reported_as_failed_not_eof() {
+        // ディレクトリ fd への read は EISDIR で失敗する。
+        let dir = File::open("/").unwrap();
+        let reader = Reader::new(OwnedFd::from(dir), 1024).unwrap();
+        let fin = reader.finish(Instant::now() + Duration::from_secs(1));
+        assert!(fin.failed);
+        assert!(fin.buf.is_empty());
+    }
+
     /// REQ-39: 書き手が出力し続けても 1 回の `pump` は上限量で返る（監視ループへ制御を戻す）。
     #[cfg(test)]
     #[test]
@@ -692,7 +716,8 @@ mod reader {
     pub trait Source: Read + Send + 'static {}
     impl<T: Read + Send + 'static> Source for T {}
 
-    type Captured = Arc<Mutex<(Vec<u8>, bool)>>;
+    /// (出力, 切り詰め, 読み取り失敗)。
+    type Captured = Arc<Mutex<(Vec<u8>, bool, bool)>>;
 
     pub struct Reader {
         captured: Captured,
@@ -701,7 +726,7 @@ mod reader {
 
     impl Reader {
         pub fn new<R: Source>(mut src: R, cap: usize) -> io::Result<Self> {
-            let captured: Captured = Arc::new(Mutex::new((Vec::new(), false)));
+            let captured: Captured = Arc::new(Mutex::new((Vec::new(), false, false)));
             let shared = Arc::clone(&captured);
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
@@ -711,7 +736,11 @@ mod reader {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(_) => {
+                            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.2 = true;
+                            break;
+                        }
                     };
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                     let take = cap.saturating_sub(guard.0.len()).min(n);
@@ -731,16 +760,41 @@ mod reader {
             false
         }
 
-        pub fn finish(self, deadline: Instant) -> (Vec<u8>, bool, bool) {
+        pub fn finish(self, deadline: Instant) -> super::Finished {
             let wait = deadline.saturating_duration_since(Instant::now());
             let finished = self.done.recv_timeout(wait).is_ok();
             let guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
-            (guard.0.clone(), guard.1 || !finished, finished)
+            super::Finished {
+                buf: guard.0.clone(),
+                truncated: guard.1 || !finished,
+                done: finished,
+                failed: guard.2,
+            }
         }
     }
 }
 
 use reader::Reader;
+
+/// reader の終了結果。`failed` は読み取りエラー（正常な EOF ではない）。
+pub(crate) struct Finished {
+    pub buf: Vec<u8>,
+    pub truncated: bool,
+    pub done: bool,
+    pub failed: bool,
+}
+
+impl Finished {
+    /// reader が無い（パイプ未取得）場合の空の結果。
+    fn empty() -> Self {
+        Self {
+            buf: Vec::new(),
+            truncated: false,
+            done: true,
+            failed: false,
+        }
+    }
+}
 
 /// reader を作れなかった場合に、起動済みの子を止めて回収を試みてからエラーを返す。
 ///
@@ -780,12 +834,43 @@ pub fn run_with_limits(
     // 起動に要する時間も上限に含めるため、spawn の前から測る（REQ-39）。
     let start = Instant::now();
     let mut child = command.spawn().map_err(|_| GuardRunError::Spawn)?;
+    let limit = config.time_limit.get();
+    let spawn_deadline = start.checked_add(limit).ok_or(GuardRunError::InvalidConfig);
+    let spawn_deadline = match spawn_deadline {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = kill_and_reap(&mut child, &SystemClock);
+            return Err(e);
+        }
+    };
     let mut stdout = None;
     let mut stderr = None;
+    // 起動後の reader 準備にも期限を適用する。超過したら子を止めて回収し時間超過として返す（REQ-39）。
+    let expired =
+        |child: &mut std::process::Child| -> Option<Result<GuardedRunOutcome, GuardRunError>> {
+            let now = Instant::now();
+            if now < spawn_deadline {
+                return None;
+            }
+            Some(kill_and_reap(child, &SystemClock).map(|()| {
+                GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
+                    kind: ResourceKind::Time,
+                    limit,
+                    elapsed: now.saturating_duration_since(start),
+                    child_reaped: true,
+                })
+            }))
+        };
+    if let Some(r) = expired(&mut child) {
+        return r;
+    }
     if let Some(pipe) = child.stdout.take() {
         stdout = Reader::new(pipe, config.stdout_cap).ok();
         if stdout.is_none() {
             return abort_child(&mut child);
+        }
+        if let Some(r) = expired(&mut child) {
+            return r;
         }
     }
     if let Some(pipe) = child.stderr.take() {
@@ -793,9 +878,11 @@ pub fn run_with_limits(
         if stderr.is_none() {
             return abort_child(&mut child);
         }
+        if let Some(r) = expired(&mut child) {
+            return r;
+        }
     }
 
-    let limit = config.time_limit.get();
     let mut pump = || {
         let a = stdout.as_mut().is_some_and(Reader::pump);
         let b = stderr.as_mut().is_some_and(Reader::pump);
@@ -811,10 +898,9 @@ pub fn run_with_limits(
             let reader_deadline = Instant::now()
                 .checked_add(READER_WAIT_TIMEOUT)
                 .map_or(deadline, |d| d.min(deadline));
-            let (stdout, stdout_truncated, stdout_done) =
-                stdout.map_or_else(|| (Vec::new(), false, true), |r| r.finish(reader_deadline));
-            let (stderr, stderr_truncated, stderr_done) =
-                stderr.map_or_else(|| (Vec::new(), false, true), |r| r.finish(reader_deadline));
+            let out = stdout.map_or_else(Finished::empty, |r| r.finish(reader_deadline));
+            let err = stderr.map_or_else(Finished::empty, |r| r.finish(reader_deadline));
+            let (stdout_done, stderr_done) = (out.done, err.done);
             let now = Instant::now();
             if now > deadline || (!(stdout_done && stderr_done) && now >= deadline) {
                 return Ok(GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
@@ -824,13 +910,17 @@ pub fn run_with_limits(
                     child_reaped: true,
                 }));
             }
+            // 読み取りエラーで欠けた出力を Exited として返さない。
+            if out.failed || err.failed {
+                return Err(GuardRunError::ReadOutput);
+            }
             Ok(GuardedRunOutcome::Exited {
                 status,
                 output: ChildOutput {
-                    stdout,
-                    stdout_truncated,
-                    stderr,
-                    stderr_truncated,
+                    stdout: out.buf,
+                    stdout_truncated: out.truncated,
+                    stderr: err.buf,
+                    stderr_truncated: err.truncated,
                 },
                 elapsed,
             })
