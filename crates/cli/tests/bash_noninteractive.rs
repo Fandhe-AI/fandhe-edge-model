@@ -4,7 +4,8 @@
 //! stdout の JSON を具体値で照合する。証拠種別はテストハーネス（実機の
 //! Claude Code Bash ツールではない）。`infer` の実推論（TASK-33.1-2・#136 で接続）の
 //! exit 0 経路は `req36_infer_real_package_exit_zero_via_sh`（共有 fixture の ONNX を置いた
-//! 合成パッケージ）で確認する。
+//! 合成パッケージ）で確認する。TASK-36.1（#148）で、実推論の単体（3 ラベル）・バッチ（`--input-file`）を
+//! 予測ラベルの具体値で照合し、実推論経路の実行記録（`req36_run_record_real_infer_*`）も確認する。
 //! 末尾の `req36_run_record_*` は実行記録（opt-in の `FANDHE_EDGE_RECORD_DIR`。
 //! TASK-36.1-2・#150）の保存形式を具体値で照合する。
 //! Windows では `sh` を前提にできないため unix に限定する。
@@ -113,7 +114,7 @@ fn expected_stdout(report: &ErrorReport) -> String {
     String::from_utf8(buf).expect("utf8")
 }
 
-/// 現時点で `infer` が exit 0 になる唯一の経路（help）。
+/// help 経路の exit 0 を具体値で照合する（実推論の exit 0 は `req36_infer_real_package_exit_zero_via_sh`）。
 #[test]
 fn req36_infer_help_via_sh_exits_0_with_exact_json() {
     let o = run_script(&["--help"]);
@@ -222,14 +223,16 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
     assert_eq!(o.stderr.lines().last(), Some(exit_line));
 }
 
-/// 実パッケージ（共有 fixture の C1 の ONNX・選択肢 alpha/beta/gamma）で、スクリプト経由の
-/// `infer --text` が exit 0 と判定 JSON 1 行を返すこと（REQ-36・REQ-33・#136。
-/// 証拠種別: テストハーネス。ONNX の出所は `fixtures/onnx_parity/PROVENANCE.md`）。
+/// 共有 fixture の C1 の ONNX（選択肢 alpha/beta/gamma）を置いた合成パッケージを一時ディレクトリへ作り、
+/// その workspace（cwd にする親ディレクトリ）を返す。パッケージは `<ws>/p`。
+/// `max_bytes`・`label_order` は `fixtures/onnx_parity/cases.json` の `kinds.c1` と一致させている
+/// （出所は `fixtures/onnx_parity/PROVENANCE.md`）。呼び出し側がテスト終了時に削除する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn req36_infer_real_package_exit_zero_via_sh() {
-    let ws =
-        std::env::temp_dir().join(format!("fandhe-noninteractive-{}-real", std::process::id()));
+fn make_real_package(name: &str) -> PathBuf {
+    let ws = std::env::temp_dir().join(format!(
+        "fandhe-noninteractive-{}-{name}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(ws.join("p")).expect("mkdir");
     let onnx = std::fs::read(
@@ -250,16 +253,87 @@ fn req36_infer_real_package_exit_zero_via_sh() {
         r#"{"schema":"fandhe-edge-model-definition/v1","name":"sh_real","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"a","description":"d"},{"id":"beta","display_name":"b","description":"d"},{"id":"gamma","display_name":"g","description":"d"}],"io":{"input":"bytes"}}"#,
     )
     .expect("write definition");
-    let o = run_script_in(Some(&ws), &["--package", "p", "--text", "hello world"]);
+    ws
+}
+
+/// 余裕（top2_margin）の大きい C1 のケース（入力, 期待ラベル）。`cases.json` の `kinds.c1` の
+/// `synthetic_118`（margin 0.888）・`synthetic_004`（0.869）・`synthetic_119`（0.680）を逐語で使う。
+/// 不一致は期待値を緩めず原因を調査する（`cases.json` の `_meta` の方針）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REAL_CASES: [(&str, &str); 3] = [
+    ("beta", "beta"),
+    ("ghost grain", "gamma"),
+    ("apple amberapple amberapple amber", "alpha"),
+];
+
+/// 判定 JSON 1 行の前置（id・status・predicted_label と scores の先頭キー）の期待文字列。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn real_prefix(id: &str, label: &str) -> String {
+    format!(
+        "{{\"id\":\"{id}\",\"status\":\"ok\",\"predicted_label\":\"{label}\",\"scores\":{{\"alpha\":"
+    )
+}
+
+/// `scores` のキーが label_order（alpha → beta → gamma）の順に並ぶこと。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_scores_in_label_order(line: &str) {
+    let pos: Vec<usize> = ["\"alpha\":", "\"beta\":", "\"gamma\":"]
+        .iter()
+        .map(|k| line.rfind(k).unwrap_or_else(|| panic!("{k} in {line}")))
+        .collect();
+    assert!(pos[0] < pos[1] && pos[1] < pos[2], "{line}");
+}
+
+/// 実パッケージ（共有 fixture の C1 の ONNX・選択肢 alpha/beta/gamma）で、スクリプト経由の
+/// `infer --text` が exit 0 と判定 JSON 1 行を具体値（予測ラベル）で返すこと
+/// （REQ-36・REQ-33・TASK-36.1・#148・#136。証拠種別: テストハーネス）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_infer_real_package_exit_zero_via_sh() {
+    let ws = make_real_package("real");
+    for (input, label) in REAL_CASES {
+        let o = run_script_in(Some(&ws), &["--package", "p", "--text", input]);
+        assert_eq!(o.code, Some(0), "stdout: {}", o.stdout);
+        assert!(o.stdout.ends_with("}\n"), "stdout: {}", o.stdout);
+        assert_eq!(o.stdout.lines().count(), 1);
+        assert!(
+            o.stdout.starts_with(&real_prefix("input", label)),
+            "input={input:?} stdout: {}",
+            o.stdout
+        );
+        assert_scores_in_label_order(&o.stdout);
+        assert_eq!(o.stderr.lines().last(), Some("exit_code=0"));
+    }
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// 実パッケージのバッチ（`--input-file`。REQ-33 の唯一の例外の 1 行 1 JSON）が入力順に exit 0 で返り、
+/// 単体推論（`req36_infer_real_package_exit_zero_via_sh`）と同じラベルになること（REQ-28・REQ-36・#148）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_infer_real_package_batch_via_sh() {
+    let ws = make_real_package("batch");
+    let mut lines = String::new();
+    for (i, (input, _)) in REAL_CASES.iter().enumerate() {
+        lines.push_str(&format!(
+            "{{\"id\":\"r{}\",\"input\":\"{input}\"}}\n",
+            i + 1
+        ));
+    }
+    std::fs::write(ws.join("in.jsonl"), lines).expect("write input");
+    let o = run_script_in(Some(&ws), &["--package", "p", "--input-file", "in.jsonl"]);
     let _ = std::fs::remove_dir_all(&ws);
     assert_eq!(o.code, Some(0), "stdout: {}", o.stdout);
-    assert!(
-        o.stdout
-            .starts_with("{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\""),
-        "stdout: {}",
-        o.stdout
-    );
-    assert_eq!(o.stdout.lines().count(), 1);
+    assert!(o.stdout.ends_with("}\n"), "stdout: {}", o.stdout);
+    let out: Vec<&str> = o.stdout.lines().collect();
+    assert_eq!(out.len(), 3, "stdout: {}", o.stdout);
+    for (i, ((_, label), line)) in REAL_CASES.iter().zip(&out).enumerate() {
+        assert!(
+            line.starts_with(&real_prefix(&format!("r{}", i + 1), label)),
+            "{line}"
+        );
+        assert_scores_in_label_order(line);
+    }
     assert_eq!(o.stderr.lines().last(), Some("exit_code=0"));
 }
 
@@ -1037,7 +1111,7 @@ fn req21_replaced_results_never_relay_raw_cli_stderr() {
     assert_eq!(o.stderr, "secret-diagnostic\nexit_code=10\n");
 }
 // ---- 実行記録（REQ-36・TASK-36.1-2・#150）----
-// 証拠種別はテストハーネス（fake bin・help 経路）。cli は serde_json に依存しないため、
+// 証拠種別はテストハーネス（fake bin・help 経路・実パッケージの実推論経路）。cli は serde_json に依存しないため、
 // JSON は解析せず期待文字列との完全一致で照合する。
 
 const RECORD_SCHEMA: &str = "fandhe-edge.run-record/1";
@@ -1176,6 +1250,47 @@ fn req36_run_record_contains_five_fields_with_exact_values() {
     );
     assert_eq!(rec, expected);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 実推論経路（実パッケージ・exit 0）でも実行記録が残り、入力本文と判定結果が平文で残らないこと
+/// （REQ-36・TASK-36.1-2・#150・#148。security.md のデータ本文の転記禁止）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_run_record_real_infer_exit_zero_with_exact_values() {
+    let ws = make_real_package("recreal");
+    let dir = record_dir("real-infer");
+    let before = now_secs();
+    let o = run_script_in_env(
+        Some(&ws),
+        &["--package", "p", "--text", "beta"],
+        &[("FANDHE_EDGE_RECORD_DIR", dir.to_str().unwrap())],
+    );
+    let after = now_secs();
+    assert_eq!(o.code, Some(0), "stdout: {}", o.stdout);
+    assert!(
+        o.stdout.starts_with(&real_prefix("input", "beta")),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=0"));
+    let cli_stderr = o.stderr.strip_suffix("exit_code=0\n").expect("diag line");
+    let rec = only_record(&dir);
+    let started = started_at_of(&rec);
+    let t = epoch_of(&started);
+    assert!(
+        t >= before - 1 && t <= after + 1,
+        "{started} {before} {after}"
+    );
+    let expected = format!(
+        "{{\"schema\":\"{RECORD_SCHEMA}\",\"command\":[\"fandhe-edge\",\"infer\",\"--package\",\"p\",\"--text\",\"<redacted>\"],\"started_at\":\"{started}\",\"exit_code\":0,\"stdout\":{},\"stderr\":{}}}\n",
+        summary_json(o.stdout.as_bytes()),
+        summary_json(cli_stderr.as_bytes())
+    );
+    assert_eq!(rec, expected);
+    assert!(!rec.contains("predicted_label"));
+    assert!(!rec.contains("\"beta\""));
+    std::fs::remove_dir_all(&dir).ok();
+    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// `--text`・`--id` の値（空白区切りと `=` 形式の両方）は記録に残らない。
