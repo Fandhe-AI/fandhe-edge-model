@@ -60,6 +60,11 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 /// `package` 工程と同じ分類（ONNX→重み・定義→選択肢表・artifact→メタデータ）で計測する。
+///
+/// 3 OS 共通で成立する: 入口は `measure_package`（パスから開く版）で、同一ファイルの重複判定に
+/// Unix は (dev, inode)、Unix 以外は `canonicalize` した実パスを使うため、複数ファイルでも
+/// `IdentityUnavailable` にならない。`IdentityUnavailable` を返すのはハンドルを受け取る
+/// `measure_opened_files`（Unix 以外で 2 件以上）だけで、本テストは経由しない（REQ-30・REQ-39）。
 fn measure(tag: &str, onnx_name: &str) -> (CapacityBreakdown, u64) {
     let d = TempDir::new(tag);
     let onnx = d.path().join("model.onnx");
