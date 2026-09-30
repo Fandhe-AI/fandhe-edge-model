@@ -40,8 +40,18 @@
 #   - 資源上限（REQ-39）: 生ログの容量上限（超過で log を KILL して判定不能）・停止の期限
 #     （TERM の後 5 秒で KILL）・独立プロセスグループと監視役（本スクリプトが突然死しても
 #     log を KILL する）
-#   - 陽性対照（curl を sandbox 下で実行して拒否の検出を確かめる）は TASK-38.2 の担当で
-#     本スクリプトは実行しない。出力の positive_control は常に "not_run"
+#   - 陽性対照（REQ-38・TASK-38.2・#164）: 監視の開始とゲートの確認の後、sandbox-run.sh の前に、
+#     同じ sandbox プロファイルの下で curl に意図的な通信（PoC-16 と同じ https://example.com）を
+#     させ、同じ監視窓の中で拒否が検出されることを集計器が確かめる。省略する経路（オプション・
+#     環境変数）は設けない（人が忘れる PoC-16 の逸脱 1 を構造的に防ぐ）。curl は絶対パス
+#     /usr/bin/curl で、テスト専用の上書きは FANDHE_EDGE_CURL_CMD（上書き時は集計器が
+#     evidence_hint を test_harness にする）。起動できない・期限（10 秒）を超えた・curl が成功した・
+#     拒否行が 5 秒以内に記録されない場合は sandbox-run.sh を起動せず runtime_error(70)
+#     （本実行のゲート）。最終判定でも検出されなければ「0 件」とは判定せず判定不能(70)。
+#     記録は <out-dir>/positive_control.meta.json（0600。PID・時刻・終了コード・
+#     上書きの有無のみで、対象 URL は書かない）。
+#     残るリスク: sandbox が効いていない故障時に限り example.com へ 1 回リクエストが出る
+#     （それを検出するのが陽性対照の役割。実行は人が macOS 実機で行う）
 #
 # 前提条件: sandbox-run.sh と同じ（cargo build・uv sync は sandbox の外で先に済ませる。
 # 本スクリプトは通信せず、それらを実行しない）。
@@ -64,6 +74,13 @@ unset FANDHE_EDGE_REEXEC
 umask 077
 
 DEFAULT_LOG_CMD=/usr/bin/log
+# 陽性対照の launcher・curl・プロファイル・対象（すべて定数。対象・プロファイルを上書きする
+# 経路は作らない）。PROFILE は sandbox-run.sh と同じ値の複製（共通化は別課題）
+DEFAULT_SANDBOX_EXEC=/usr/bin/sandbox-exec
+DEFAULT_CURL_CMD=/usr/bin/curl
+PROFILE='(version 1)(allow default)(deny network*)'
+CONTROL_URL=https://example.com
+CONTROL_DEADLINE_SECS=10
 PREDICATE='process == "kernel" AND eventMessage CONTAINS "deny"'
 # 生ログの容量上限（sandbox_deny_report.py の MAX_STREAM_BYTES と揃える）
 MAX_STREAM_BYTES=268435456
@@ -197,6 +214,25 @@ fi
 if [ ! -f "$log_cmd" ] || [ ! -x "$log_cmd" ]; then
     fail 70 runtime_error "log command not found or not executable"
 fi
+# 陽性対照の launcher と curl（監視を始める前に実行可能な通常ファイルであることを確認する）
+launcher=$DEFAULT_SANDBOX_EXEC
+launcher_override=false
+if [ -n "${FANDHE_EDGE_SANDBOX_EXEC:-}" ]; then
+    launcher=$FANDHE_EDGE_SANDBOX_EXEC
+    launcher_override=true
+fi
+curl_cmd=$DEFAULT_CURL_CMD
+curl_override=false
+if [ -n "${FANDHE_EDGE_CURL_CMD:-}" ]; then
+    curl_cmd=$FANDHE_EDGE_CURL_CMD
+    curl_override=true
+fi
+if [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
+    fail 70 runtime_error "sandbox launcher not found or not executable"
+fi
+if [ ! -f "$curl_cmd" ] || [ ! -x "$curl_cmd" ]; then
+    fail 70 runtime_error "curl not found or not executable for the positive control"
+fi
 run_script="$here/sandbox-run.sh"
 report_script="$here/sandbox_deny_report.py"
 if [ ! -f "$run_script" ] || [ ! -f "$report_script" ]; then
@@ -230,6 +266,7 @@ rm -f -- "$probe"
 stream_file="$out_dir/log_stream.ndjson"
 report_file="$out_dir/network_report.json"
 meta_file="$out_dir/monitor.meta.json"
+control_meta_file="$out_dir/positive_control.meta.json"
 
 # 監視プロセス（log）が動いているか。`kill -0` は終了済みで未回収（ゾンビ）の子にも成功しうる
 # ため使わず、ps の状態で判定する（空・Z で始まる状態は終了済み。ps が失敗した場合も動いて
@@ -244,6 +281,7 @@ utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 logpid=
 wd=
+control_pid=
 # 終了時の後始末。log と監視役が残っていれば KILL する
 cleanup() {
     if [ -n "$logpid" ]; then
@@ -251,6 +289,11 @@ cleanup() {
     fi
     if [ -n "$wd" ]; then
         kill -s KILL -- "-$wd" 2>/dev/null || true
+    fi
+    # 陽性対照の curl（独立プロセスグループ）も残さない。待機中の TERM/INT/HUP で monitor より
+    # 長く生き残り、sandbox が無効なら対照 URL へ接続しうるため（REQ-38・REQ-39）
+    if [ -n "$control_pid" ]; then
+        kill -s KILL -- "-$control_pid" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -305,6 +348,62 @@ while [ "$i" -le 50 ]; do
 done
 [ "$gate_ok" -eq 1 ] || fail 70 runtime_error "log stream is not active; sandbox run was not started"
 
+# ---- 陽性対照（sandbox-run.sh の前・同じ監視窓の中） ----
+# 同じプロファイルの下で curl に通信を試みさせ、その PID の拒否が監視で検出できることを
+# 集計器が確かめる。sandbox-exec は対象を exec するため `$!` がそのまま curl の PID になる。
+# 独立プロセスグループで起動し、期限（CONTROL_DEADLINE_SECS）を過ぎたら TERM → KILL →
+# wait で必ず回収して 70 にする（REQ-39）。引数は固定で、利用者の値を連結しない。
+control_started=$(utc_now)
+set -m
+"$launcher" -p "$PROFILE" "$curl_cmd" -q --noproxy '*' --silent --output /dev/null \
+    --max-time 3 --connect-timeout 2 "$CONTROL_URL" </dev/null >/dev/null 2>&1 &
+control_pid=$!
+set +m
+i=0
+while [ "$i" -lt $((CONTROL_DEADLINE_SECS * 10)) ] && log_alive "$control_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+done
+control_timeout=0
+if log_alive "$control_pid"; then
+    control_timeout=1
+    kill -s TERM -- "-$control_pid" 2>/dev/null || true
+    sleep 0.2
+    kill -s KILL -- "-$control_pid" 2>/dev/null || true
+fi
+control_rc=0
+wait "$control_pid" 2>/dev/null || control_rc=$?
+control_pid_recorded=$control_pid
+control_pid=
+control_ended=$(utc_now)
+[ "$control_timeout" -eq 0 ] \
+    || fail 70 runtime_error "positive control did not finish in time; sandbox run was not started"
+if ! printf '{"pid":%s,"exit_code":%s,"started_utc":"%s","ended_utc":"%s","curl_override":%s,"sandbox_exec_override":%s}\n' \
+    "$control_pid_recorded" "$control_rc" "$control_started" "$control_ended" "$curl_override" "$launcher_override" \
+    >"$control_meta_file" 2>/dev/null; then
+    fail 70 runtime_error "cannot write positive control record"
+fi
+
+# 陽性対照をゲートにする（REQ-38）: curl が成功した（遮断が効いていない）、または監視が
+# 陽性対照の拒否行を記録できていない場合は、本実行へ進まず 70 で止める。そのまま 7 工程を
+# 実行すると、異常が実行後の集計まで判明しない。拒否行の書き込みは遅れうるため最大 5 秒待つ。
+# PID と時刻区間の厳密な照合は集計器が行う（ここは「何か記録されたか」の事前確認）
+[ "$control_rc" -ne 0 ] \
+    || fail 70 runtime_error "positive control command succeeded; sandbox run was not started"
+control_seen=0
+i=0
+while [ "$i" -le 50 ]; do
+    if grep -Eq "\\($control_pid_recorded\\) deny\\([0-9]+\\) network" -- "$stream_file" 2>/dev/null; then
+        control_seen=1
+        break
+    fi
+    log_alive "$logpid" || break
+    sleep 0.1
+    i=$((i + 1))
+done
+[ "$control_seen" -eq 1 ] \
+    || fail 70 runtime_error "positive control denial was not observed; sandbox run was not started"
+
 # ---- 実行 ----
 set -- --definition "$definition" --project-dir "$project_dir" --out-dir "$out_dir/run"
 [ "$has_candidates" -eq 0 ] || set -- "$@" --candidates "$candidates"
@@ -352,6 +451,7 @@ set -- --stream "$stream_file" --run-meta "$out_dir/run/run.meta.json" \
     --monitor-started-utc "$monitor_started" --monitor-stopped-utc "$stopped" \
     --warmup-secs "$warmup" --tail-secs "$tail_secs" --report-out "$report_file"
 [ "$log_override" = false ] || set -- "$@" --log-override
+set -- "$@" --positive-control-meta "$control_meta_file"
 [ "$stream_ok" -eq 1 ] || set -- "$@" --stream-died
 [ "${size:-0}" -le "$MAX_STREAM_BYTES" ] || set -- "$@" --stream-overflow
 # run の実際の終了コードを渡し、集計器が run.meta.json の exit_code と照合する（不一致は判定不能）
@@ -362,7 +462,7 @@ rep_out=$(python3 -I "$report_script" "$@" </dev/null 2>/dev/null) || rep_rc=$?
 case "$rep_rc" in 0 | 10 | 11 | 12 | 20 | 64 | 70) ;; *) rep_rc=70 ;; esac
 if [ -z "$rep_out" ]; then
     rep_rc=70
-    rep_out='{"code":"runtime_error","message":"report generator failed","network_verdict":"undeterminable","positive_control":"not_run"}'
+    rep_out='{"code":"runtime_error","message":"report generator failed","network_verdict":"undeterminable","positive_control":"not_evaluated"}'
 fi
 
 # 述語は PREDICATE から JSON エスケープして埋め込む（定数のため `"` の置換のみで足りる）
