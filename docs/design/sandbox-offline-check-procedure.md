@@ -20,7 +20,7 @@ Agent が確定させない（`evidence_hint` は `requires_human_review` か `t
 | `crates/cli/tests/sandbox_pipeline_real_trainer.rs`（`#[ignore]`。`make test-trainer-integration`） | 実 CLI＋実 trainer（CPU・合成データ）で両スクリプトの全チェーンを通し、7 工程の完走と 0 件判定の接続を検証 |
 
 注意: 評価データなしの `evaluate`（`status:"skipped"`）経路のみを通している。評価データありの `evaluate` は
-評価本体の CLI 配線が未実装で `runtime_error`(70) で停止するため、**評価の完走は未達**で、配線後に再確認が必要。
+評価器へ接続済み（#314）だが、この結合テストは評価データなしの経路だけで、**評価データありの完走は未確認**（実機での再確認が必要）。
 陽性対照の実機での実行（TASK-38.2・#164。スクリプトへは組み込み済み）が未実施のため、0 件を「検出手段が機能した上での 0 件」と書かない。
 
 ## 3. 実機での手順（人が実行）

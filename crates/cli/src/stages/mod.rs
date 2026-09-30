@@ -11,9 +11,10 @@
 //! # 完走の範囲（実装済みを装わない）
 //!
 //! - `register`・`inspect`・`train`・`select`・`package`・`infer` は下位層へ接続済み
-//! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。**評価データありの評価本体
-//!   （凍結データでの推論・指標算出・評価完了の結果型）は評価器の結線 TASK で未実装**で、
-//!   `runtime_error`（70）を返す（評価済みを装わない。[`evaluate`] 参照）
+//! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
+//!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
+//!   `package` はその記録を確認する。Wilson 区間・McNemar / Holm・診断（REQ-29）は未結線
+//!   （[`evaluate`] 参照）
 //! - `package` は容量（REQ-30）のみ計測し、p95（REQ-31）と合否基準は未接続で
 //!   `judgment:null`・`acceptance_defined:false`（`pass` を出さない）
 //! - `infer --out` は未実装（`runtime_error`）
@@ -28,7 +29,7 @@ use std::path::Path;
 
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{
-    EvaluateReport, InspectStageReport, RegisterReport, SelectReport, TrainReport,
+    InspectStageReport, RegisterReport, SelectReport, TrainReport,
 };
 use fandhe_edge_runtime::package_outcome::PackageOutcome;
 
@@ -37,9 +38,11 @@ use crate::error_report::emit_error_report;
 use crate::output::write_stage_line;
 use crate::stage_output::{emit_evaluate_skipped, emit_package_outcome};
 
+pub mod candidate_artifact;
 pub mod evaluate;
 pub mod infer;
 pub mod inspect;
+mod ledger;
 pub mod package;
 pub mod register;
 pub mod select;
@@ -50,7 +53,7 @@ enum Done {
     Register(RegisterReport),
     Inspect(InspectStageReport),
     Train(TrainReport),
-    Evaluate(EvaluateReport),
+    Evaluate(evaluate::EvaluateOutcome),
     Select(SelectReport),
     Package(PackageOutcome),
 }
@@ -77,7 +80,10 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
         Ok(Done::Inspect(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::Train(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::Select(r)) => write_stage_line(out, r.to_json_line()),
-        Ok(Done::Evaluate(r)) => emit_evaluate_skipped(out, &r),
+        Ok(Done::Evaluate(evaluate::EvaluateOutcome::Skipped(r))) => emit_evaluate_skipped(out, &r),
+        Ok(Done::Evaluate(evaluate::EvaluateOutcome::Completed(r))) => {
+            write_stage_line(out, r.to_json_line())
+        }
         Ok(Done::Package(outcome)) => emit_package_outcome(out, &outcome),
         Err(report) => emit_error_report(out, &report),
     }

@@ -183,7 +183,10 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    super::package::verify_vocab_file(&meta, vocab_file.as_ref().map(|(f, p)| (f, p.as_path())))?;
+    super::candidate_artifact::verify_vocab_file(
+        &meta,
+        vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
+    )?;
     let option_ids = definition.options().iter().map(|c| c.id.as_str());
     if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
         return Err(invalid("package label order does not match definition"));

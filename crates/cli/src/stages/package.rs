@@ -4,9 +4,13 @@
 //! # 手順
 //!
 //! 0. 開始時（ステージングを作る前）に評価データの凍結ハッシュを確認する（不一致・凍結記録の欠落は
-//!    `invalid_input` で停止。REQ-17）。評価データがあるプロジェクトは、評価の完了記録が無い限り
-//!    `invalid_input`（`evaluation has not been completed`）で拒否する。完了記録は未実装のため当面は
-//!    常に拒否する（#314 で evaluate を評価器へ接続し、完了記録を本工程が確認する。REQ-24〜27）
+//!    `invalid_input` で停止。REQ-17）。評価データがあるプロジェクトは、選定候補の評価完了記録
+//!    （`candidates/<N>/evaluation_record.json`。`evaluate` が書く。#314）が無い限り
+//!    `invalid_input`（`evaluation has not been completed`）で拒否し、記録の ONNX・`artifact.json`・
+//!    評価データ・定義のハッシュが今の実体と一致しなければ
+//!    `evaluation record does not match the package` で拒否し、最終 test の台帳に適用完了が
+//!    記録されていなければ `evaluation has not been completed` で拒否する（成果物を読んだ後・ステージングを
+//!    作る前に確認する。[`verify_evaluation_record`]。REQ-27）
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
 //!    学習リクエストの `kind` の一致も確認する
@@ -17,7 +21,8 @@
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //!    あわせて、公開前に `infer` と同じ検証（ガード層の形式許可リスト・ONNX の読み込み。
 //!    [`super::infer::load_backend`]）を通す
-//!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）
+//!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）。
+//!    `--allow-smoke` の検証専用パッケージは最終 test を適用できないため、評価完了の確認を行わない
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
 //! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
@@ -36,26 +41,24 @@
 //! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
 
 use std::fs::File;
-use std::io::{ErrorKind, Seek, SeekFrom};
-use std::path::{Component, Path};
+use std::io::{Seek, SeekFrom};
+use std::path::Path;
 
-use fandhe_edge_core::artifact_meta::{
-    ArtifactMeta, ArtifactMetaError, MAX_ARTIFACT_META_BYTES, VocabStreamError, verify_vocab_stream,
-};
+use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
+use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_data::eval_freeze::FreezeRecord;
+use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
-use fandhe_edge_guard::kind::KindAllowlist;
-use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
 use fandhe_edge_runtime::capacity_limit::{
     CapacityLimit, CapacityLimitCheck, check_capacity_limit,
 };
-use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind};
+use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
@@ -64,21 +67,24 @@ use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
 use crate::args::PackageArgs;
-use crate::error_report::ToErrorReport;
+use crate::error_report::{ToErrorReport, acquire_error_report};
 use crate::project::{
-    CreatedDir, DEFINITION_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE,
-    fs_report, invalid, parse_definition, runtime,
+    CreatedDir, DEFINITION_FILE, EVALUATION_RECORD_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project,
+    SELECTION_FILE, inspect_bytes, invalid, parse_definition, runtime,
+};
+
+use super::candidate_artifact::{
+    ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
+    verify_vocab_file,
 };
 
 use super::infer::load_backend;
+use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
     resolve_candidates, verified_split,
 };
-
-/// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
-const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 容量の上限（バイト。REQ-30 の目安 40MB。暫定の固定値）。
 /// `run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。利用者設定の取り込み（定義ファイル・CLI 引数）は入出力契約の変更を伴い未実装（承認事項）。
@@ -91,13 +97,10 @@ const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 /// I/O 失敗は `runtime_error`（70）。容量の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
 pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
-    // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認し（REQ-17）、
-    // 評価データがあるプロジェクトは評価の完了記録が無い限り公開を拒否する（fail-closed。REQ-27）。
-    // TODO(#314・REQ-24〜27): evaluate 工程を評価器へ接続して評価の完了記録を残し、ここでその記録を
-    // 確認する。完了記録の形式がまだ無いため、当面は評価データがあれば常に拒否する（実装済みを装わない）。
-    if super::inspect::load_evaluation_bytes(&project)?.is_some() {
-        return Err(invalid("evaluation has not been completed"));
-    }
+    // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    // 評価データがあるプロジェクトは、選定候補の評価完了記録を確認できるまで公開しない
+    // （下の [`verify_evaluation_record`]。fail-closed。REQ-27）。
+    let frozen = super::inspect::load_frozen_evaluation(&project)?;
     let selection_bytes = project.read(SELECTION_FILE, 64 * 1024)?;
     let selection = SelectionRecord::from_json_slice(&selection_bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
@@ -126,50 +129,26 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         return Err(invalid("selection record does not match the candidate"));
     }
     // 短縮学習（`train --smoke`）の結果は、検証専用の `--allow-smoke` を明示しない限り配布しない
-    // （`select` は smoke の結果も選定できるため、ここが配布の関門。REQ-27）。
+    // （`select` は smoke の結果も選定できるため、ここが配布の関門。REQ-27）。`--allow-smoke` が
+    // 緩めるのはこの確認だけで、評価完了の確認（下の [`verify_evaluation_record`]）は緩めない。
     if request_is_smoke_trained(&request, &candidate.params) && !args.allow_smoke {
         return Err(invalid("smoke-trained candidate cannot be packaged"));
     }
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));
     };
-    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から読む。候補ディレクトリは `Project` の
-    // 保持 fd からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得る（パスの正規化・開き直しをしない）。
-    // `artifact_dir` は文字列の前方一致でなく、閉じ込め済みの候補ディレクトリからの相対パスとして求める（リクエスト・結果の差し替えで候補の外を読まない。REQ-39）。
-    let candidate_dir = project.open_subdir(candidate_rel(selection.candidate_index))?;
-    let artifact_rel = Path::new(success.artifact_dir())
-        .strip_prefix(candidate_dir.dir())
-        .map_err(|_| invalid("artifact directory is outside the candidate directory"))?
-        .to_path_buf();
-    let onnx_file = success.artifact().onnx_file();
-    if !is_single_component(onnx_file) {
-        return Err(invalid("onnx file name is invalid"));
-    }
-    let read_member = |name: &str, limit: u64| -> Result<Vec<u8>, ErrorReport> {
-        let (file, real) = candidate_dir
-            .open_member(&artifact_rel.join(name))
-            .map_err(|e| e.to_error_report())?;
-        read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))
-    };
-    let meta_bytes = read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
-    let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
-    // 語彙ファイル（あれば）も配布物に含め、`select` の容量判定と構成を揃える（REQ-30・#125）。
-    // 無い（NotFound）ときだけ省略し、それ以外の失敗は止める。
-    // 保持 fd は検証（ストリーミング 1 パス）とステージングへの複写の両方で使い、開き直さない。
-    let vocab_file = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
-        Ok((file, real)) => Some((file, real.into_path_buf())),
-        Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
-            None
-        }
-        Err(e) => return Err(e.to_error_report()),
-    };
-    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
-    if meta.onnx_file() != onnx_file
-        || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
-    {
-        return Err(invalid("artifact metadata does not match the model file"));
-    }
-    verify_vocab_file(&meta, vocab_file.as_ref().map(|(f, p)| (f, p.as_path())))?;
+    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から閉じ込めつきで読む
+    // （`evaluate` と共有する [`load_candidate_artifact`]。語彙ファイルの保持 fd 1 本によるストリーミング
+    // 検証もここで行い、以降の複写・計測は同じ fd を使う。REQ-30・REQ-39）。
+    let CandidateArtifact {
+        meta_bytes,
+        meta,
+        onnx_bytes,
+        onnx_file,
+        handles,
+    } = load_candidate_artifact(&project, selection.candidate_index, success)?;
+    let onnx_file = onnx_file.as_str();
+    let vocab_file = handles.vocab;
     check_meta_consistency(
         &meta,
         &definition,
@@ -189,6 +168,22 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         meta.kind_version(),
         definition.options().len(),
     )?;
+
+    // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
+    // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
+    // smoke 学習の候補かどうか・`--allow-smoke` の有無に関係なく確認する（smoke の候補は
+    // `evaluate` が拒否するため、評価データがあるプロジェクトでは公開できない。fail-closed。REQ-27）。
+    if let Some((freeze, eval_bytes)) = frozen.as_ref() {
+        verify_evaluation_record(
+            &project,
+            (&selection, &Sha256Digest::of_bytes(&selection_bytes)),
+            (freeze, eval_bytes),
+            &definition,
+            &meta_bytes,
+            &onnx_bytes,
+            &format!("{}:seed{}", candidate.candidate_id, seed),
+        )?;
+    }
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -229,6 +224,81 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &breaches,
         PackageQualityJudgment::NotDefined,
     ))
+}
+
+/// 選定候補の評価完了記録を読み、公開する成果物・評価データ・定義と一致することを確認する
+/// （REQ-27・#314）。
+///
+/// 記録が無ければ `evaluation has not been completed`、解析できなければ
+/// `evaluation record is invalid`、いずれかの値が一致しなければ
+/// `evaluation record does not match the package`（いずれも `invalid_input`）。
+///
+/// 記録の `config_id`（期待する代表構成 ID）・`total`（凍結した評価データの件数）・`correct <= total`
+/// も照合する（他の構成の記録・件数や正解数の改変を公開に使わせない）。
+///
+/// 記録ファイルに加えて、最終 test の台帳（`final_test_ledger/`。適用ロックと封印つき事前登録）が
+/// その代表構成・重みの適用完了を記録していることを照合する（台帳に完了が無ければ
+/// `evaluation has not been completed`。記録の偽造だけでは公開できない）。
+///
+/// **台帳ファイル自体もプロジェクトへ書き込める主体なら丸ごと作り直せる**ため、本確認は外部台帳による
+/// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
+fn verify_evaluation_record(
+    project: &Project,
+    (selection, selection_sha256): (&SelectionRecord, &Sha256Digest),
+    (freeze, eval_bytes): (&FreezeRecord, &[u8]),
+    definition: &Definition,
+    meta_bytes: &[u8],
+    onnx_bytes: &[u8],
+    config_id: &str,
+) -> Result<(), ErrorReport> {
+    let rel = candidate_rel(selection.candidate_index).join(EVALUATION_RECORD_FILE);
+    let Some(bytes) = project.read_optional(&rel, MAX_EVALUATION_RECORD_BYTES)? else {
+        return Err(invalid("evaluation has not been completed"));
+    };
+    let record = EvaluationRecord::from_json_slice(&bytes)
+        .map_err(|_| invalid("evaluation record is invalid"))?;
+    let definition_sha256 = definition
+        .canonical_hash()
+        .map_err(|_| runtime("cannot hash definition"))?
+        .to_hex();
+    // 評価件数は凍結した評価データ（照合済みのバイト列）から数え直し、記録の `total` と照合する。
+    let expected_total = inspect_bytes(eval_bytes, definition)
+        .map_err(|_| invalid("evaluation data is invalid"))?
+        .len();
+    let matches = record.candidate_index == selection.candidate_index
+        && record.config_id == config_id
+        && record.correct <= record.total
+        && usize::try_from(record.total).is_ok_and(|t| t == expected_total)
+        && record.candidate_id == selection.candidate_id
+        && record.evaluation_sha256 == freeze.sha256().to_hex()
+        && record.evaluation_bytes == freeze.byte_len()
+        && record.onnx_sha256 == Sha256Digest::of_bytes(onnx_bytes).to_hex()
+        && record.artifact_meta_sha256 == Sha256Digest::of_bytes(meta_bytes).to_hex()
+        && record.definition_sha256 == definition_sha256;
+    if !matches {
+        return Err(invalid("evaluation record does not match the package"));
+    }
+    // 記録ファイルだけでは偽造できてしまうため、最終 test の台帳（ロックと封印つき事前登録）が
+    // この評価データ × 代表構成 × 重みの適用完了を記録していることを必ず照合する（REQ-27）。
+    let config_id =
+        RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
+    let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
+    let Some(held) = HeldLedger::open(project, false)? else {
+        return Err(invalid("evaluation has not been completed"));
+    };
+    let applied = held
+        .ledger()
+        .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
+        .map_err(|e| acquire_error_report(&e))?;
+    if !applied {
+        return Err(invalid("evaluation has not been completed"));
+    }
+    // 最初の適用の前に台帳へ固定した選定が、現在の選定（候補 ID と選定記録のダイジェスト）と
+    // 一致することを確認する（選定を書き換えた別候補を配布しない。REQ-27）。
+    held.ledger()
+        .verify_selection_pin(&freeze.sha256(), &config_id, selection_sha256)
+        .map_err(|e| acquire_error_report(&e))?;
+    Ok(())
 }
 
 /// 計測した容量が上限内ならステージングを `package/` へ原子的に公開し、超過なら公開せず片付ける
@@ -297,104 +367,6 @@ fn assemble_and_measure(
     measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))
 }
-
-/// `artifact.json` の `kind`・`label_order`・`max_bytes` を、選定候補の学習リクエストと定義に照合する
-/// （`infer` が読み込み時に行う検査と同じ観点。食い違うパッケージを作らない。REQ-32・REQ-39）。
-fn check_meta_consistency(
-    meta: &ArtifactMeta,
-    definition: &Definition,
-    trained_kind: &str,
-    trained_kind_version: u32,
-    trained_max_bytes: u32,
-) -> Result<(), ErrorReport> {
-    KindAllowlist::supported()
-        .check(meta.kind())
-        .map_err(|e| e.to_error_report())?;
-    if meta.kind() != trained_kind {
-        return Err(invalid(
-            "artifact kind does not match the selected candidate",
-        ));
-    }
-    if meta.kind_version() != trained_kind_version {
-        return Err(invalid(
-            "artifact kind_version does not match the selected candidate",
-        ));
-    }
-    let option_ids = definition.options().iter().map(|c| c.id.as_str());
-    if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
-        return Err(invalid("package label order does not match definition"));
-    }
-    if meta.max_bytes() != trained_max_bytes {
-        return Err(invalid(
-            "artifact max_bytes does not match the selected candidate",
-        ));
-    }
-    let in_range = usize::try_from(meta.max_bytes())
-        .is_ok_and(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(&n));
-    if !in_range {
-        return Err(invalid("package max_bytes is out of range"));
-    }
-    Ok(())
-}
-
-/// 語彙ファイルの形式（許可制）と `artifact.json` 記載の sha256 との一致を、開いた保持 fd からの
-/// ストリーミング 1 パスで検証する（`select`・`package`・`infer` が共有。REQ-30・REQ-39）。
-///
-/// 全体をメモリへ読まず、読みながら sha256 と形式（件数・トークン長の上限つき）を確認する
-/// （[`verify_vocab_stream`]）。保持 fd はオフセット 0 から読むこと（呼び出し側で開き直さない）。
-/// 語彙ファイルがあるのに sha256 の記録が無い・不一致・形式不正・サイズ超過、または記録があるのに
-/// ファイルが無い場合は `invalid_input`（fail-closed）、読み込み失敗は `runtime_error`。語彙ファイルも
-/// 記録も無ければ `Ok(None)`。あれば fstat のサイズを返す。
-pub(crate) fn verify_vocab_file(
-    meta: &ArtifactMeta,
-    vocab: Option<(&File, &Path)>,
-) -> Result<Option<u64>, ErrorReport> {
-    match (vocab, meta.vocab_sha256()) {
-        (None, None) => Ok(None),
-        (None, Some(_)) => Err(invalid("vocab file is missing but its hash is recorded")),
-        (Some(_), None) => Err(invalid("vocab file has no recorded hash")),
-        (Some((file, path)), Some(recorded)) => {
-            let read_err = |source| {
-                fs_report(&FsError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                })
-            };
-            let metadata = file.metadata().map_err(read_err)?;
-            if !metadata.is_file() {
-                return Err(fs_report(&FsError::NotRegularFile {
-                    path: path.to_path_buf(),
-                }));
-            }
-            let size = metadata.len();
-            if size > MAX_FILE_BYTES {
-                return Err(fs_report(&FsError::TooLarge {
-                    path: path.to_path_buf(),
-                    size,
-                    limit: MAX_FILE_BYTES,
-                }));
-            }
-            let digest = verify_vocab_stream(file, MAX_FILE_BYTES).map_err(|e| match e {
-                VocabStreamError::Format => ArtifactMetaError::InvalidVocab.to_error_report(),
-                VocabStreamError::Read => runtime("cannot read vocab file"),
-            })?;
-            if digest.to_hex() != recorded {
-                return Err(invalid("vocab file does not match its recorded hash"));
-            }
-            Ok(Some(size))
-        }
-    }
-}
-
-/// 単一の通常の名前（区切り・`..`・絶対パスを含まない）か。
-fn is_single_component(name: &str) -> bool {
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
