@@ -26,7 +26,8 @@ REQ-38・TASK-38.3・#165。依存の追加・更新・削除は通信を伴う�
   台帳の `cargo.direct` に記録があること。メンバー crate は `workspace = true` のみ（依存の集約を
   機械で担保）。`Cargo.lock` の registry パッケージは台帳（direct ∪ locked）に (name, version) が
   あること。source の無いパッケージはワークスペースメンバー名に限る（内部 crate の追加は台帳不要）。
-- Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみ。`uv.lock` の registry パッケージも
+- Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみで、extras は台帳 `extras`
+  （PEP 685 正規化）と一致すること（`extras_mismatch`）。`uv.lock` の registry パッケージも
   台帳に (name, version) があること。
 - ルート manifest 自身の `[dependencies]` 等もメンバーと同じ規則（`workspace = true` のみ）で
   検査する。
@@ -83,6 +84,8 @@ CARGO_DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 DIRECT_FIELDS = {"name", "version", "approved_on", "approved_by", "record", "purpose", "layers"}
 # cargo の直接依存は、承認した機能構成（features・default-features）も台帳に持つ。
 CARGO_DIRECT_FIELDS = DIRECT_FIELDS | {"features", "default_features"}
+# pypi の直接依存は、承認した extras（`mlx[cpu]` の `cpu` 等）も台帳に持つ（REQ-38）。
+PYPI_DIRECT_FIELDS = DIRECT_FIELDS | {"extras"}
 LOCKED_FIELDS = {"name", "version", "basis"}
 
 
@@ -142,6 +145,14 @@ def norm_py(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def norm_extras(raw: str | None) -> list[str]:
+    """extras を PEP 685 で正規化（小文字化・`-_.` を `-`・空白除去）し、重複除去して整列する。"""
+    if not raw:
+        return []
+    items = {re.sub(r"[-_.]+", "-", x.strip()).lower() for x in raw.split(",")}
+    return sorted(x for x in items if x)
+
+
 def _nonempty_str(value: Any, what: str) -> str:
     """空でない文字列であることを検証する。"""
     if not isinstance(value, str) or not value.strip():
@@ -165,7 +176,7 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
         if not isinstance(section, dict) or set(section) != {"direct", "locked"}:
             raise InputError(f"ledger {eco} section is invalid")
         out[eco] = {}
-        direct_fields = CARGO_DIRECT_FIELDS if eco == "cargo" else DIRECT_FIELDS
+        direct_fields = CARGO_DIRECT_FIELDS if eco == "cargo" else PYPI_DIRECT_FIELDS
         for kind, fields in (("direct", direct_fields), ("locked", LOCKED_FIELDS)):
             entries = section[kind]
             if not isinstance(entries, list):
@@ -199,6 +210,14 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
                             raise InputError("ledger features must be a list of strings")
                         if not isinstance(entry["default_features"], bool):
                             raise InputError("ledger default_features must be a boolean")
+                    else:
+                        extras = entry["extras"]
+                        if (
+                            not isinstance(extras, list)
+                            or not all(isinstance(x, str) and x for x in extras)
+                            or extras != norm_extras(",".join(extras))
+                        ):
+                            raise InputError("ledger extras must be a sorted normalized list")
                 else:
                     basis = _nonempty_str(entry["basis"], "basis")
                     # 承認記録が未確認と明記された basis を承認済みとして通さない（fail-closed）
@@ -448,6 +467,8 @@ def check_pypi(
         manifest_direct.add(key)
         if key not in ledger["direct"]:
             v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
+        elif norm_extras(m.group(2)) != ledger["direct"][key]["extras"]:
+            v.append(Violation("extras_mismatch", "pypi", key[0], key[1], rel_py))
     # ビルド時依存は uv.lock に載らないため、固定と承認記録だけを照合する
     build_direct: set[tuple[str, str]] = set()
     for req in _py_build_requirements(pyproject):
@@ -459,6 +480,8 @@ def check_pypi(
         build_direct.add(key)
         if key not in ledger["direct"]:
             v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
+        elif norm_extras(m.group(2)) != ledger["direct"][key]["extras"]:
+            v.append(Violation("extras_mismatch", "pypi", key[0], key[1], rel_py))
     for key in ledger["direct"]:
         if key not in manifest_direct and key not in build_direct:
             v.append(Violation("stale_record", "pypi", key[0], key[1], LEDGER_NAME))

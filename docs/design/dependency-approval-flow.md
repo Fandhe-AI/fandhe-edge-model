@@ -18,7 +18,7 @@ REQ-38・TASK-38.3（#165）。依存の追加・更新・削除は通信を伴�
 
 - Rust: ルート `[workspace.dependencies]` は `=x.y.z` の完全固定で、`cargo.direct` に記録があること。path 依存は実在するメンバーのパスと package 名に一致すること。メンバー crate とルート manifest 自身の `[dependencies]` 等は `workspace = true` のみ。manifest の直接依存が lock に同じ版で現れること（`missing_in_lock`）。`Cargo.lock` の crates.io パッケージは台帳（direct と locked）に (name, version) があること。git・別レジストリは拒否する。内部 crate（lock に source が無い）の追加は台帳の更新が要らない
 - Rust の配置層と機能: メンバー crate（`crates/<層>`）の依存は、台帳 `cargo.direct[].layers` にその層が含まれること（dev-dependencies のみの利用は `<層>(dev)` でも可。記録の無い層での利用は `unapproved_layer`）。ルートの `features`・`default-features` は台帳の `features`・`default_features` と一致すること（`feature_mismatch`）。メンバー側の features・default-features・optional による上書きは拒否する
-- Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみで、`pypi.direct` に記録があること。 `[build-system].requires` も同じ規則で固定と記録を照合する（uv.lock には現れないため lock 照合は対象外）`uv.lock` の PyPI パッケージは台帳に (name, version) があること
+- Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみで、extras は台帳 `pypi.direct[].extras`（PEP 685 正規化）と一致すること（`extras_mismatch`）。`pypi.direct` に記録があること。 `[build-system].requires` も同じ規則で固定と記録を照合する（uv.lock には現れないため lock 照合は対象外）`uv.lock` の PyPI パッケージは台帳に (name, version) があること
 - 台帳にだけ残った記録（削除・版の変更の取りこぼし）も失敗とする
 
 ## 手順

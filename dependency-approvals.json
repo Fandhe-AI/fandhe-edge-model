@@ -214,6 +214,9 @@
         "purpose": "学習（MLX）。`cpu` extra で mlx-cpu を開発環境に導入",
         "layers": [
           "trainer"
+        ],
+        "extras": [
+          "cpu"
         ]
       },
       {
@@ -225,7 +228,8 @@
         "purpose": "学習・書き出しの数値計算",
         "layers": [
           "trainer"
-        ]
+        ],
+        "extras": []
       },
       {
         "name": "onnx",
@@ -236,7 +240,8 @@
         "purpose": "ONNX 書き出し",
         "layers": [
           "trainer"
-        ]
+        ],
+        "extras": []
       },
       {
         "name": "ruff",
@@ -247,7 +252,8 @@
         "purpose": "整形・lint（dev）",
         "layers": [
           "trainer"
-        ]
+        ],
+        "extras": []
       },
       {
         "name": "pytest",
@@ -258,7 +264,8 @@
         "purpose": "テスト（dev）",
         "layers": [
           "trainer"
-        ]
+        ],
+        "extras": []
       }
     ],
     "locked": [

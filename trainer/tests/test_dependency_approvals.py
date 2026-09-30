@@ -242,6 +242,8 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], object]] = {
     "blank-approver": lambda g: g["cargo"]["direct"][0].update(approved_by=" "),
     "extra-field": lambda g: g["cargo"]["direct"][0].update(extra="x"),
     "duplicate": lambda g: g["cargo"]["direct"].append(dict(g["cargo"]["direct"][0])),
+    "pypi-missing-extras": lambda g: g["pypi"]["direct"][0].pop("extras"),
+    "pypi-unnormalized-extras": lambda g: g["pypi"]["direct"][0].update(extras=["CPU"]),
     "missing-basis": lambda g: g["cargo"]["locked"][0].pop("basis"),
     "missing-section": lambda g: g.pop("pypi"),
     "unconfirmed-basis": lambda g: g["cargo"]["locked"][0].update(
@@ -455,3 +457,38 @@ def test_req38_build_system_requires_is_checked(repo: Path, capsys: Capture) -> 
     found = kinds(payload)
     assert ("unapproved_dependency", "hatchling") in found
     assert any(k == "pin_violation" for k, _ in found)
+
+
+def test_req38_python_extras_removed_fails(repo: Path, capsys: Capture) -> None:
+    """承認済みの extras を外す（`mlx[cpu]` -> `mlx`）と exit 10（REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", '"mlx[cpu]==0.32.2"', '"mlx==0.32.2"')
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("extras_mismatch", "mlx") in kinds(payload)
+
+
+def test_req38_python_extras_added_fails(repo: Path, capsys: Capture) -> None:
+    """extras の無い承認済み依存へ extras を足す（`numpy` -> `numpy[x]`）と exit 10（REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", '"numpy==2.5.3"', '"numpy[extra]==2.5.3"')
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("extras_mismatch", "numpy") in kinds(payload)
+
+
+def test_req38_python_extras_changed_fails(repo: Path, capsys: Capture) -> None:
+    """extras を別のものへ変える・追加すると exit 10（REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", "mlx[cpu]==0.32.2", "mlx[cuda]==0.32.2")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("extras_mismatch", "mlx") in kinds(payload)
+    edit(repo, "trainer/pyproject.toml", "mlx[cuda]==0.32.2", "mlx[cpu,cuda]==0.32.2")
+    code, payload = run(repo, capsys)
+    assert ("extras_mismatch", "mlx") in kinds(payload)
+
+
+def test_req38_python_extras_normalization_is_tolerated(repo: Path, capsys: Capture) -> None:
+    """extras の大文字小文字・空白・順序・区切りの差は同一として通る（PEP 685）。"""
+    edit(repo, "trainer/pyproject.toml", "mlx[cpu]==0.32.2", "mlx[ CPU ]==0.32.2")
+    code, payload = run(repo, capsys)
+    assert code == 0, payload
+    assert mod.norm_extras("B_x, a.y,A-Y") == ["a-y", "b-x"]
