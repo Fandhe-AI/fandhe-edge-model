@@ -129,7 +129,7 @@ impl Env {
                  if [ \"${{FAKE_LOG_MODE:-}}\" != pc_missing ]; then\n\
                  n=0\n\
                  while [ ! -s \"$FAKE_PC_PID_FILE\" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n\
-                 [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\"\n\
+                 [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\",\"timestamp\":\"%s\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\" \"$(date '+%Y-%m-%d %H:%M:%S.000000%z')\"\n\
                  fi\n\
                  if [ \"${{FAKE_LOG_MODE:-}}\" = die_mid_run ]; then\n\
                  until [ -s \"$FAKE_CLI_LOG\" ]; do sleep 0.05; done\n\
@@ -1150,7 +1150,9 @@ fn write_stream(dir: &Path, messages: &[&str]) -> PathBuf {
     let path = dir.join("pc_stream.ndjson");
     let mut body = format!("{header}\n");
     for m in messages {
-        body.push_str(&format!("{{\"eventMessage\":\"{m}\"}}\n"));
+        body.push_str(&format!(
+            "{{\"eventMessage\":\"{m}\",\"timestamp\":\"2026-01-01 09:00:00.500000+0900\"}}\n"
+        ));
     }
     fs::write(&path, body).expect("write");
     path
@@ -1458,6 +1460,56 @@ fn req38_report_control_pid_outside_control_window_is_not_positive_control() {
     has(&o, "\"positive_control\": \"detected\"");
     has(&o, "\"positive_control_network_deny_events\": 1");
     has(&o, "\"unattributed_network_deny_events\": 1");
+}
+
+/// 陽性対照の記録があり、同じ PID の拒否行に timestamp が無ければ判定不能 70
+/// （PID 再利用を時刻で区別できないため。REQ-38・TASK-38.2・#164）。
+#[test]
+fn req38_report_control_pid_line_without_timestamp_is_undeterminable() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let stream = e.dir.join("pc_no_ts_stream.ndjson");
+    fs::write(
+        &stream,
+        format!("{header}\n{{\"eventMessage\":\"{MDNS_DENY}\"}}\n"),
+    )
+    .expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "positive control candidate deny line has no timestamp");
+}
+
+/// 照合済みの要約行は、自身の時刻が区間外でも元イベントの帰属（陽性対照）で数える。
+#[test]
+fn req38_report_duplicate_summary_inherits_original_attribution() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let line =
+        |msg: &str, ts: &str| format!("{{\"eventMessage\":\"{msg}\",\"timestamp\":\"{ts}\"}}\n");
+    let dup = format!("2 duplicate reports for {MDNS_DENY}");
+    let body = format!(
+        "{header}\n{}{}",
+        line(MDNS_DENY, "2026-01-01 09:00:00.500000+0900"),
+        line(&dup, "2026-01-01 09:05:00.000000+0900"),
+    );
+    let stream = e.dir.join("pc_dup_stream.ndjson");
+    fs::write(&stream, body).expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"positive_control_network_deny_events\": 3");
+    has(&o, "\"unattributed_network_deny_events\": 0");
 }
 
 /// timestamp が文字列でない・形式外のイベントは判定不能 70（fail-closed）。

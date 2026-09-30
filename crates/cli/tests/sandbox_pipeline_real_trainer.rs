@@ -139,7 +139,7 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
              cat \"{}\"\n\
              n=0\n\
              while [ ! -s \"$FAKE_PC_PID_FILE\" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n\
-             [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\"\n\
+             [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\",\"timestamp\":\"%s\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\" \"$(date '+%Y-%m-%d %H:%M:%S.000000%z')\"\n\
              exec sleep 1200\n",
             clean.display()
         ),

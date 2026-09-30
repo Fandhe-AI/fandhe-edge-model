@@ -275,8 +275,8 @@ def classify(
     `control_pid` の拒否は陽性対照（`positive_control`）として別に数え、tool・unattributed・
     `network_deny_events` には含めない。ただし `control_window`（epoch 秒の下限・上限）が
     あるとき、イベントの時刻が区間外なら同じ PID でも陽性対照にしない（PID 再利用で別プロセスの
-    拒否が陽性対照へ紛れ、tool・unattributed の件数から消えるのを防ぐ）。時刻が無いイベントは
-    区間内として扱う（実ログには必ず timestamp があり、合成ストリームだけが該当する）。
+    拒否が陽性対照へ紛れ、tool・unattributed の件数から消えるのを防ぐ）。`control_window` があり時刻が無い
+    同 PID の拒否行は判定不能（fail-closed）。照合済みの要約行は元イベントの帰属を引き継ぐ。
 
     発生回数: 元の行は 1 回。`N duplicate reports for` の要約行は、同じ `event_key` の元の行が
     先に数えられていれば N 回だけ加算し（元の 1 回を二重に数えない）、元の行が無ければ
@@ -299,7 +299,7 @@ def classify(
     truncated = False
     salt = os.urandom(16)
     # event_key -> 要約行にまだ照合されていない元の行のレコード位置（保持できなければ -1）
-    pending: dict[bytes, list[int]] = {}
+    pending: dict[bytes, list[tuple[int, bool]]] = {}
     pending_total = 0
 
     def keep(rec: dict) -> int | None:
@@ -330,10 +330,11 @@ def classify(
             continue
         key = event_key(proc, pid, deny_n, op, target)
         claimed = False
+        claimed_control: bool | None = None
         if dup is not None:
             waiting = pending.get(key)
             if waiting:
-                idx = waiting.pop()
+                idx, claimed_control = waiting.pop()
                 pending_total -= 1
                 if not waiting:
                     # 空になったキーは残さない（キー数が上限を素通りして増え続けるのを防ぐ）
@@ -343,7 +344,14 @@ def classify(
                     records[idx]["occurrences"] += dup_n
         occurrences = dup_n if claimed else 1 + dup_n
         control = control_pid is not None and int(pid) == control_pid
-        if control and control_window is not None and ts is not None:
+        if claimed_control is not None:
+            # 照合済みの要約行は元イベントの帰属を引き継ぐ（要約行は元の行より後に出るため、
+            # 自身の時刻で再判定すると区間外になり帰属不明へ誤って倒れる）
+            control = claimed_control
+        elif control and control_window is not None:
+            if ts is None:
+                # 時刻が無い拒否行は PID 再利用を区別できない。陽性対照として認めず判定不能にする
+                raise Undeterminable("positive control candidate deny line has no timestamp")
             control = control_window[0] <= ts <= control_window[1]
         tool = int(pid) in tool_pids
         if control:
@@ -369,7 +377,7 @@ def classify(
             }
         )
         if dup is None:
-            pending.setdefault(key, []).append(-1 if idx is None else idx)
+            pending.setdefault(key, []).append((-1 if idx is None else idx, control))
             pending_total += 1
             _check_pending_limits(pending_total, len(pending))
     return {"counts": counts, "records": records, "truncated": truncated}
