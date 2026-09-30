@@ -759,9 +759,9 @@ impl ConfinedDir {
     /// 本ディレクトリ配下の `from` を、同じく配下の `to` へ名前替えする（ステージングの原子的な公開用。
     /// 両者の親は保持 fd 起点で辿る。REQ-39）。
     ///
-    /// Linux では `RENAME_NOREPLACE` で、`to` が既に存在すれば（空ディレクトリでも）置き換えず
-    /// `AlreadyExists` で失敗する。それ以外の OS は通常の `renameat`（呼び出し側が事前に不在を
-    /// 確認すること。空ディレクトリだけは置き換わりうる）。
+    /// Linux では `RENAME_NOREPLACE`、macOS では `RENAME_EXCL`（rustix の `RenameFlags::NOREPLACE`）で、
+    /// `to` が既に存在すれば（空ディレクトリでも）置き換えず `AlreadyExists` で失敗する。それ以外の OS は
+    /// 通常の `renameat`（呼び出し側が事前に不在を確認すること。空ディレクトリだけは置き換わりうる）。
     ///
     /// # Errors
     /// 経路の拒否・名前替えの失敗（`to` が既存の場合を含む）。
@@ -770,7 +770,7 @@ impl ConfinedDir {
         let (to_parent, to_name) = self.open_parent_of(to)?;
         let from_dir = from_parent.as_ref().unwrap_or(&self.fd);
         let to_dir = to_parent.as_ref().unwrap_or(&self.fd);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let result = rustix::fs::renameat_with(
             from_dir,
             from_name.as_os_str(),

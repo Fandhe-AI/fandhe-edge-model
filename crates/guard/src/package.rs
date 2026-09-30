@@ -439,7 +439,6 @@ mod tests {
         assert_eq!(std::fs::read(base.join("pkg/done/a")).expect("read"), b"x");
         assert!(!base.join("pkg/stage").exists());
 
-        #[cfg(target_os = "linux")]
         {
             std::fs::create_dir_all(base.join("pkg/stage2")).expect("mkdir");
             let err = pkg

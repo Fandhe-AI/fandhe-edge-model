@@ -312,7 +312,7 @@ mod tests {
     }
 
     /// REQ-39: 公開先が既にあれば（空でも）置き換えず、ステージングを片付けて `invalid_input`。
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn req39_publish_does_not_replace_existing_package() {
         let (cwd, project, staging) = setup("noreplace");
