@@ -6,6 +6,7 @@
 - **推論は学習に依存しない**: 推論ランタイム・配布パッケージに学習側の依存（Python・MLX・学習用 crate）を持ち込まない。Python・MLX が PATH に無い `env -i` 環境でも推論が成功すること（REQ-32）
 - **完全固定**: Rust は `Cargo.toml` で `=x.y.z` の完全固定（`^`・`~`・範囲指定は禁止）。workspace 共通依存は `[workspace.dependencies]` に集約する。Python は `pyproject.toml` で `==x.y.z` 固定し、lock ファイルをコミットする
 - **ユーザー承認制**: 依存の追加・更新・削除は必ずユーザーの明示承認を経てから行う
+- **承認記録の台帳と機械照合**: 承認記録は `dependency-approvals.json` に残し、`make check-dependency-approvals`（`make ci`・lefthook pre-commit・python-ci の pytest）が manifest・lock と照合して、記録の無い依存変更を fail-closed で止める（REQ-38・TASK-38.3・#165。手順とチェックリストは [dependency-approval-flow](../../docs/design/dependency-approval-flow.md)）
 - **通信はユーザー承認後**: 依存・モデル重み・データセットの取得など通信を伴う操作は、明示承認を経てから実行する。推論・学習・評価の実行時に本ツール起因の通信を発生させない（REQ-38）
 
 ## 承認を求める際に提示する情報
@@ -32,7 +33,7 @@
 
 - `serde`（derive）: `serde_core`・`serde_derive`・`proc-macro2`・`quote`・`syn`（3.0 系）・`unicode-ident`（`(MIT OR Apache-2.0) AND Unicode-3.0`）。`syn` 3.0 系は PoC-16 の lock でも同じ
 - `serde_json`: `itoa`・`memchr`（Unlicense OR MIT）・`zmij`（MIT 単独。`ryu` の後継）
-- `sha2`: `cfg-if`・`cpufeatures`（Apple Silicon では `libc`）・`digest`・`block-buffer`・`crypto-common`・`hybrid-array`・`typenum`
+- `sha2`: `cfg-if`・`cpufeatures`（Apple Silicon では `libc`）・`digest`・`block-buffer`・`const-oid`（`digest` の依存。Cargo.lock で確認）・`crypto-common`・`hybrid-array`・`typenum`
 - いずれも `deny.toml` の許可ライセンスに収まり、C/C++ のネイティブビルド・プリビルドバイナリの自動ダウンロードは確認されなかった
 - メンテナンス状況: 最終リリースは `serde` 2026-07-18・`serde_json` 2026-07-20・`sha2` 2026-03-25（いずれも yank なし）
 - 配布サイズ・推論レイテンシへの影響: 共通コアの定義ファイル読み込みとハッシュ計算に限られ、推論の 1 件あたりの経路には入らない見込み（推定。導入 PR で実測値があれば記録する）
@@ -46,4 +47,4 @@
 
 ## subagent への適用
 
-- builder Agent は依存の追加・更新を行わない。必要と判断した場合は「承認事項」として main へ報告し、main がユーザーに確認する
+- builder Agent は依存の追加・更新を行わず、`dependency-approvals.json` も独断で編集しない（承認の記録は承認後に main が反映する）。必要と判断した場合は「承認事項」として main へ報告し、main がユーザーに確認する

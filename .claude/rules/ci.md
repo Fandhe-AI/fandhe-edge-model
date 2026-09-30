@@ -8,6 +8,7 @@ make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make test        # cargo test --workspace
 make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest
 make test-trainer-integration  # 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
+make check-dependency-approvals  # 依存の承認台帳と manifest・lock の照合（REQ-38・TASK-38.3・#165。pytest 経由で python-ci も実行）
 make ci          # 上記 + lint-docs + check-workspace-manifest + deny を一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
