@@ -1,11 +1,12 @@
 //! `infer --input-file` の一括推論と 1 行 1 JSON 出力（REQ-33 の例外。TASK-33.4・#141）の
 //! 結合テスト。
 //!
-//! 証拠種別: テストハーネス（模擬の前処理・バックエンド。バイナリでの完走は #136、実前処理は
+//! 証拠種別: テストハーネス（模擬の前処理・バックエンド。バイナリでの完走は `pipeline_e2e.rs`（#136）、実前処理は
 //! #112、ONNX は #113）。
 
 use fandhe_edge_cli::infer_batch::{
-    BatchLimits, emit_infer_batch, emit_infer_batch_with_limits, judgment_from_prediction,
+    BatchLimits, emit_infer_batch, emit_infer_batch_with_limits, emit_infer_single,
+    emit_infer_single_with_limits, judgment_from_prediction,
 };
 use fandhe_edge_cli::output::write_ok_judgment;
 use fandhe_edge_core::definition::Definition;
@@ -681,4 +682,85 @@ fn req33_cli_first_record_failure_wins_when_next_read_stalls() {
         stdout.contains("{\"code\":\"runtime_error\""),
         "stdout: {stdout}"
     );
+}
+
+/// REQ-39: 単件推論（`--text`）の正常系は 1 行の JSON で exit 0（既定の上限内）。
+#[test]
+fn req39_single_infer_within_limit_writes_one_judgment() {
+    let definition = definition();
+    let (pipeline, _) = pipeline();
+    let mut out: Vec<u8> = Vec::new();
+    let code = emit_infer_single(
+        &mut out,
+        definition.io(),
+        definition.options(),
+        pipeline,
+        "s1",
+        "b",
+    )
+    .expect("write");
+    assert_eq!(code, ExitCode::Ok);
+    let text = String::from_utf8(out).expect("utf8");
+    assert_eq!(text.matches('\n').count(), 1);
+    assert!(text.contains("\"id\":\"s1\""), "{text}");
+    assert!(text.contains("\"predicted_label\":\"b\""), "{text}");
+}
+
+/// REQ-21・REQ-39: 単件推論が止まって返らないとき、CLI 経路は期限で見切り、`limit_exceeded` の
+/// ErrorReport を 1 行書いて exit 20 で終える（バッチと同じ見張り）。自身のテストバイナリを
+/// 子プロセスとして再実行して確かめる。
+#[test]
+fn req39_cli_single_infer_exits_20_when_inference_stalls() {
+    struct Stalled;
+    impl ScoringBackend for Stalled {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            std::thread::sleep(Duration::from_secs(600));
+            Ok(vec![0.5, 0.25, 0.25])
+        }
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            // 協調的な期限を無視して止まる模擬（ハードな上限は CLI のプロセス境界が担う）。
+            self.scores(ids)
+        }
+    }
+    const CHILD_ENV: &str = "FANDHE_TEST_SINGLE_STALLED_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let definition = definition();
+        let pipeline = Arc::new(InferencePipeline::new(
+            Pre(Arc::new(Mutex::new(Vec::new()))),
+            Stalled,
+        ));
+        let mut out = io::stdout();
+        let result = emit_infer_single_with_limits(
+            &mut out,
+            definition.io(),
+            definition.options(),
+            pipeline,
+            "s1",
+            "a",
+            BatchLimits {
+                duration: Duration::from_millis(200),
+                ..BatchLimits::default()
+            },
+        );
+        std::process::exit(match result {
+            Ok(code) => i32::from(code.code()),
+            Err(_) => 70,
+        });
+    }
+    let (code, stdout, elapsed) = run_in_child(
+        "req39_cli_single_infer_exits_20_when_inference_stalls",
+        CHILD_ENV,
+    );
+    assert!(elapsed < Duration::from_secs(30));
+    assert_eq!(code, Some(20));
+    // ハーネスの出力行と同じ行に出るため、行頭一致でなく具体的な 1 行の JSON を含むことを確認する。
+    assert!(
+        stdout.contains("{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("predicted_label"));
 }

@@ -176,6 +176,7 @@ use fandhe_edge_core::fs::{FsError, read_bounded};
 use std::fmt;
 #[cfg(unix)]
 use std::fs::OpenOptions;
+use std::io;
 #[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -428,12 +429,6 @@ fn check_dest_dir(dest_dir: &Path) -> Result<(), PlacementError> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn dev_ino(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt as _;
-    (meta.dev(), meta.ino())
-}
-
 /// `dest_dir` の mode に group・other 向けの権限ビットが無いことを確認する
 /// （unix 限定。モジュール doc「`dest_dir` の機密性」）。
 ///
@@ -456,155 +451,306 @@ fn check_dest_dir_mode(dest_dir: &Path) -> Result<(), PlacementError> {
     Ok(())
 }
 
-/// `dest_dir` の所有者が呼び出しプロセスの実効ユーザーであることを確認する
-/// （unix 限定。モジュール doc「`dest_dir` の機密性」）。
+/// 配置先ディレクトリの操作の抽象（[`place_read_only_bytes`] が使う。REQ-39・REQ-17）。
 ///
-/// `my_uid_proxy_dir` には、本関数の呼び出し元が直前に自分自身で新規作成
-/// した作業ディレクトリのパスを渡す。新規作成した実体の所有者は必ず
-/// 呼び出しプロセスの実効ユーザーになるため、`getuid(2)`（`unsafe` な
-/// FFI・`libc` 依存が要る）を呼ばずに「自分の uid」を得られる
-/// （`.claude/rules/coding-rust.md`「unsafe は原則禁止」・
-/// `.claude/rules/dependency-policy.md`）。
+/// 凍結配置の手順（照合 → ステージングへ書き込み → 0400 化 → 書き込み拒否のプローブ → 既存を置き換えない
+/// 公開 → 片付け）は [`place_read_only_bytes`] の 1 か所に置き、ファイル操作だけをこの trait で差し替える。
+/// パス版は [`StdPlacementDir`]（std のパス操作。[`place_read_only`] が使う）、CLI は保持した
+/// ディレクトリ fd 起点の実装（検証後のパス差し替えで外へ出ない）を渡す。data 層は guard・rustix に
+/// 依存しないため、fd 起点の実装は呼び出し側（CLI）が書く。
 ///
-/// 所有者が別ユーザーであっても、そのユーザーが root（`CAP_CHOWN` 等）で
-/// なければ通常は起こり得ない状況だが、テスト環境・共有ホスティング等で
-/// 所有者を偽装された `dest_dir` を渡された場合に備えて確認する。この
-/// 分岐（uid 不一致）は非 root なら他ユーザーの所有物を作れないため、
-/// 単体テストでは決定的に再現できない（本関数自身のコード上の正しさは
-/// 型・ロジックで担保する）。
-#[cfg(unix)]
-fn check_dest_dir_owner(dest_dir: &Path, my_uid_proxy_dir: &Path) -> Result<(), PlacementError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let dest_uid = std::fs::symlink_metadata(dest_dir)
-        .map_err(|source| PlacementError::Io {
-            path: dest_dir.to_path_buf(),
-            source,
-        })?
-        .uid();
-    let my_uid = std::fs::symlink_metadata(my_uid_proxy_dir)
-        .map_err(|source| PlacementError::Io {
-            path: dest_dir.to_path_buf(),
-            source,
-        })?
-        .uid();
-    if dest_uid != my_uid {
-        return Err(PlacementError::InsecureDestDir {
-            path: dest_dir.to_path_buf(),
-        });
-    }
-    Ok(())
+/// 名前引数 `rel` は配置先直下からの相対（`<staging>/frozen` のように 1 段の入れ子のみ）で、
+/// 実装は配置先の外へ出さないこと。すべてシンボリックリンクを辿らない操作にする。
+pub trait PlacementDir {
+    /// 配置先ディレクトリ自身の `(mode & 0o7777, 所有者 uid)`。
+    fn dir_mode_and_uid(&self) -> io::Result<(u32, u32)>;
+    /// 配置先直下の非公開ディレクトリを 0700 で新規作成する（既存なら `AlreadyExists`）。
+    fn create_private_dir(&self, name: &str) -> io::Result<()>;
+    /// 配置先直下のディレクトリ `name` の所有者 uid（辿らない）。
+    fn entry_uid(&self, name: &str) -> io::Result<u32>;
+    /// `rel` に新規ファイルを排他的に作る（既存なら `AlreadyExists`）。
+    fn create_new_file(&self, rel: &str) -> io::Result<std::fs::File>;
+    /// `rel` を追記モードで開けるかを試す。開ければ `Ok`（書き込みを拒否できていない）。
+    fn probe_append(&self, rel: &str) -> io::Result<()>;
+    /// `rel` を配置先直下の `name` として、**既存を置き換えずに**公開する（既存なら `AlreadyExists`）。
+    fn publish_no_replace(&self, rel: &str, name: &str) -> io::Result<()>;
+    /// 配置先直下の `name`（辿らない）の `(dev, ino, mode & 0o7777)`。
+    fn stat_entry(&self, name: &str) -> io::Result<(u64, u64, u32)>;
+    /// 配置先直下のディレクトリ `name` を中身ごと片付ける。
+    fn remove_dir_tree(&self, name: &str) -> io::Result<()>;
 }
 
-/// [`place_read_only`] が使う非公開の作業領域（unix 限定）。
+/// `dest_dir` の中に非公開の作業ディレクトリを新規作成する（unix 限定）。
 ///
-/// `dir` は `dest_dir` の中に `mkdir(0700)` で新規作成したディレクトリで、
-/// 他のどの利用者からも到達できない（実行ビットが無いため、ディレクトリ
-/// 名を知っていてもトラバースできない）。`file_path` はその中に
-/// `create_new`（`O_EXCL`）で作る新規ファイルで、公開（`hard_link`）する
-/// までこのディレクトリの外へ一切現れない。
+/// 作業ディレクトリは `PlacementDir::create_private_dir`（0700）で作る。名前は衝突時に付け直す。
 #[cfg(unix)]
-struct StagingArea {
-    dir: PathBuf,
-    file_path: PathBuf,
-}
-
-#[cfg(unix)]
-impl Drop for StagingArea {
-    fn drop(&mut self) {
-        // エラー経路で早期リターンした場合の後始末（ベストエフォート）。
-        // 成功経路では `place_read_only` が先に明示的な削除を試み、
-        // その成否を `ReadOnlyPlacement::cleanup_failed` へ記録してから
-        // この Drop に到達する（既に片付いていれば、ここでの
-        // `remove_dir_all` は対象が無く何もしない）。このディレクトリは
-        // 作成された瞬間から 0700 で他者から到達できない内輪の作業領域
-        // であり、削除に失敗して残ったとしても外部（`dest_dir` の外・
-        // `dest_path`）へは一切影響しない。
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// `dest_dir` の中に `mkdir(0700)` で非公開の作業ディレクトリを新規作成する
-/// （unix 限定）。
-///
-/// `DirBuilderExt::mode` は `mkdir(2)` 呼び出し自体に渡すモードのため、
-/// 「作成した瞬間から 0700」であることが保証される。
-#[cfg(unix)]
-fn create_staging_area(dest_dir: &Path) -> Result<StagingArea, PlacementError> {
-    use std::os::unix::fs::DirBuilderExt as _;
-
+fn create_staging_dir<D: PlacementDir + ?Sized>(dest: &D) -> Result<String, PlacementError> {
     let pid = std::process::id();
     for attempt in 0..1000u32 {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = dest_dir.join(format!(
-            ".fandhe-edge-frozen-staging-{pid}-{attempt}-{nanos}"
-        ));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&dir) {
-            Ok(()) => {
-                let file_path = dir.join("frozen");
-                return Ok(StagingArea { dir, file_path });
-            }
+        let name = format!(".fandhe-edge-frozen-staging-{pid}-{attempt}-{nanos}");
+        match dest.create_private_dir(&name) {
+            Ok(()) => return Ok(name),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
             Err(source) => {
-                return Err(PlacementError::Io { path: dir, source });
+                return Err(PlacementError::Io {
+                    path: PathBuf::from(name),
+                    source,
+                });
             }
         }
     }
     Err(PlacementError::Io {
-        path: dest_dir.to_path_buf(),
-        source: std::io::Error::other("failed to create a unique staging directory"),
+        path: PathBuf::new(),
+        source: io::Error::other("failed to create a unique staging directory"),
     })
 }
 
-/// 公開（`hard_link`）直後の検証を行う（unix 限定。REQ-17・REQ-39・
-/// TASK-17.2-2。issue #227 P1 指摘）。
-///
-/// `dest_path` に現れた実体が `expected_dev_ino`（検証・chmod 済みの
-/// ステージング inode）と一致すれば `(mode, dev_ino)` を返す。**公開後の
-/// 経路では `dest_path` を一切削除しない**（issue #227 codex[bot] P1
-/// 指摘: `symlink_metadata` が失敗した時点で `dest_path` が本当に自分が
-/// 公開した inode かは確認できておらず、`remove_file` で撤去すると
-/// 無関係な別ファイルを削除してしまう競合がありうる）。失敗経路は次の
-/// いずれかへ必ず着地させ、呼び出し側が [`PlacementError::AlreadyExists`]
-/// と誤認して単純に再試行する事態を避ける（モジュール doc「設計」手順 6）:
-///
-/// - `(dev, ino)` が一致する場合のみ、それが自分の公開した実体だと確認
-///   できたことになるので、その実体には触れず `Ok` を返す
-/// - `(dev, ino)` が一致しない場合: 他者が既に `dest_path` を差し替えた
-///   と判断し、そのファイルには触れず [`PlacementError::DestReplacedAfterPublish`]
-///   を返す
-/// - 突き合わせ自体（`symlink_metadata`）が失敗した場合: `dest_path` が
-///   自分の公開した実体かどうかをこの時点で確認できないため、削除を
-///   試みず [`PlacementError::PublishedButUnverified`]（配置の成否・
-///   `dest_path` に何が残っているかが不明であることを表す）を返す
+/// 作業ディレクトリのエラー経路の後始末（ベストエフォート）。成功経路では明示的に片付け、
+/// 成否を [`ReadOnlyPlacement::cleanup_failed`] へ記録する。
 #[cfg(unix)]
-fn verify_and_finalize_publish(
-    dest_path: &Path,
-    expected_dev_ino: (u64, u64),
-) -> Result<(u32, (u64, u64)), PlacementError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let dest_meta = std::fs::symlink_metadata(dest_path).map_err(|_source| {
-        PlacementError::PublishedButUnverified {
-            path: dest_path.to_path_buf(),
-        }
-    })?;
-    let dest_dev_ino = dev_ino(&dest_meta);
-    if dest_dev_ino != expected_dev_ino {
-        return Err(PlacementError::DestReplacedAfterPublish {
-            path: dest_path.to_path_buf(),
-        });
-    }
-    let mode = dest_meta.permissions().mode() & 0o7777;
-    Ok((mode, dest_dev_ino))
+struct StagingGuard<'a, D: PlacementDir + ?Sized> {
+    dest: &'a D,
+    name: String,
 }
 
-/// 評価データ本体を読み取り専用配置にする（REQ-39・REQ-17・TASK-17.2-2）。
+#[cfg(unix)]
+impl<D: PlacementDir + ?Sized> Drop for StagingGuard<'_, D> {
+    fn drop(&mut self) {
+        let _ = self.dest.remove_dir_tree(&self.name);
+    }
+}
+
+/// 検証済みのバイト列を、`dest` の直下へ読み取り専用で配置する（REQ-39・REQ-17・TASK-17.2-2）。
+///
+/// 手順（モジュール doc「設計」）の実体はここに 1 つだけ置く。`bytes` を [`freeze_eval_data`] で
+/// 再計算して `record` と照合（不一致は [`PlacementError::HashMismatch`]。以降の操作を一切しない）→
+/// `dest` の mode・所有者の確認 → 非公開ステージングへ書き込み・`sync`・0400 化 → 書き込み拒否の
+/// プローブ（拒否を確認できなければ [`PlacementError::WriteNotRejected`]。何も公開しない）→
+/// 既存を置き換えない公開 → 公開後の `(dev, ino)` の突き合わせ → ステージングの片付け。
+/// 検証したバイト列そのものを書き出すため、検証と書き出しの間に内容が変わる窓は無い。
+///
+/// パスを一切扱わないので、呼び出し側が保持 fd 起点の [`PlacementDir`] を渡せば、検証後の
+/// パス差し替えでプロジェクトの外を読み書きしない。返す [`ReadOnlyPlacement::path`] は `file_name`
+/// （配置先からの相対）。非 unix では常に [`PlacementError::UnsupportedPlatform`]。
+pub fn place_read_only_bytes<D: PlacementDir + ?Sized>(
+    bytes: &[u8],
+    dest: &D,
+    file_name: &str,
+    record: &FreezeRecord,
+    max_bytes: u64,
+) -> Result<ReadOnlyPlacement, PlacementError> {
+    validate_file_name(file_name)?;
+    if record.byte_len() > max_bytes {
+        return Err(PlacementError::TooLarge {
+            size: record.byte_len(),
+            limit: max_bytes,
+        });
+    }
+    let actual_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_len > max_bytes {
+        return Err(PlacementError::TooLarge {
+            size: actual_len,
+            limit: max_bytes,
+        });
+    }
+    // `usize` から `u64` への変換失敗は実質到達しないが、外部入力の経路では `unwrap` を使わない。
+    let recomputed = freeze_eval_data(bytes).map_err(|_| PlacementError::Io {
+        path: PathBuf::from(file_name),
+        source: io::Error::other("eval data byte length does not fit in u64"),
+    })?;
+    if &recomputed != record {
+        return Err(PlacementError::HashMismatch);
+    }
+    let dest_path = PathBuf::from(file_name);
+
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let io_err = |source: io::Error| PlacementError::Io {
+            path: dest_path.clone(),
+            source,
+        };
+        // 1 段目: 配置先の mode に group・other 向けの権限ビットが無いこと。
+        let (dir_mode, dir_uid) = dest.dir_mode_and_uid().map_err(io_err)?;
+        if dir_mode & 0o077 != 0 {
+            return Err(PlacementError::InsecureDestDir {
+                path: dest_path.clone(),
+            });
+        }
+
+        let staging_name = create_staging_dir(dest)?;
+        let _staging = StagingGuard {
+            dest,
+            name: staging_name.clone(),
+        };
+        // 2 段目: 今作った作業ディレクトリの所有者（＝自分の uid）と配置先の所有者を突き合わせる
+        // （`getuid` の unsafe FFI・依存を使わない。モジュール doc「`dest_dir` の機密性」）。
+        let my_uid = dest.entry_uid(&staging_name).map_err(io_err)?;
+        if dir_uid != my_uid {
+            return Err(PlacementError::InsecureDestDir {
+                path: dest_path.clone(),
+            });
+        }
+
+        let staged_rel = format!("{staging_name}/frozen");
+        let mut staging_file = dest.create_new_file(&staged_rel).map_err(io_err)?;
+        staging_file
+            .write_all(bytes)
+            .and_then(|()| staging_file.sync_all())
+            .map_err(io_err)?;
+        // 権限変更するのはこの新規 inode だけ。`0o444` ではなく `0o400`（所有者のみ。issue #227）。
+        const READ_ONLY_MODE: u32 = 0o400;
+        staging_file
+            .set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE))
+            .map_err(io_err)?;
+        let staging_meta = staging_file.metadata().map_err(io_err)?;
+        let staged_mode = staging_meta.permissions().mode() & 0o7777;
+        if staged_mode != READ_ONLY_MODE {
+            return Err(io_err(io::Error::other(format!(
+                "permissions did not converge to {READ_ONLY_MODE:o} (got {staged_mode:o})"
+            ))));
+        }
+        let staged_dev_ino = (staging_meta.dev(), staging_meta.ino());
+
+        // 公開前の書き込み拒否プローブ（書き込みモードで開いたままのハンドルではなく、開き直して
+        // 実際にファイルシステムが拒否することを確認する。非公開ディレクトリ内なので競合しない）。
+        match dest.probe_append(&staged_rel) {
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
+            Ok(()) => {
+                return Err(PlacementError::WriteNotRejected { path: dest_path });
+            }
+            Err(source) => {
+                return Err(PlacementError::Io {
+                    path: dest_path,
+                    source,
+                });
+            }
+        }
+
+        // 公開。既存を置き換えない（原子的に失敗する）。
+        match dest.publish_no_replace(&staged_rel, file_name) {
+            Ok(()) => {}
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+                return Err(PlacementError::AlreadyExists { path: dest_path });
+            }
+            Err(source) => {
+                return Err(PlacementError::Io {
+                    path: dest_path,
+                    source,
+                });
+            }
+        }
+
+        // 公開直後の検証。失敗経路は必ず「これは他者のものだ」か「確認できない」へ着地させ、公開後は
+        // `dest_path` を削除しない（issue #227 codex[bot] P1 指摘。モジュール doc「設計」手順 6）。
+        let (mode, (dev, ino)) = verify_and_finalize_publish(dest, file_name, staged_dev_ino)?;
+
+        // 作業領域の後始末。公開は完了しているので、失敗しても配置は有効（`cleanup_failed` に記録）。
+        let cleanup_failed = dest.remove_dir_tree(&staging_name).is_err();
+        Ok(ReadOnlyPlacement {
+            path: dest_path,
+            mode,
+            dev_ino: (dev, ino),
+            cleanup_failed,
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = dest;
+        Err(PlacementError::UnsupportedPlatform { path: dest_path })
+    }
+}
+
+/// 公開直後の検証を行う（unix 限定。REQ-17・REQ-39・TASK-17.2-2。issue #227 P1 指摘）。
+///
+/// `file_name` に現れた実体が `expected_dev_ino`（検証・chmod 済みのステージング inode）と一致すれば
+/// `(mode, dev_ino)` を返す。**公開後の経路では `file_name` を一切削除しない**（`stat` が失敗した
+/// 時点で本当に自分が公開した inode かは確認できず、撤去すると無関係な別ファイルを消す競合が
+/// ありうる）。失敗経路は次のいずれかへ必ず着地させ、呼び出し側が [`PlacementError::AlreadyExists`]
+/// と誤認して単純に再試行する事態を避ける（モジュール doc「設計」手順 6）:
+///
+/// - `(dev, ino)` が一致しない: 他者が差し替えたと判断し、触れず
+///   [`PlacementError::DestReplacedAfterPublish`]
+/// - 突き合わせ自体（`stat_entry`）が失敗: 撤去を試みず [`PlacementError::PublishedButUnverified`]
+#[cfg(unix)]
+fn verify_and_finalize_publish<D: PlacementDir + ?Sized>(
+    dest: &D,
+    file_name: &str,
+    expected_dev_ino: (u64, u64),
+) -> Result<(u32, (u64, u64)), PlacementError> {
+    let path = PathBuf::from(file_name);
+    let (dev, ino, mode) = dest
+        .stat_entry(file_name)
+        .map_err(|_| PlacementError::PublishedButUnverified { path: path.clone() })?;
+    if (dev, ino) != expected_dev_ino {
+        return Err(PlacementError::DestReplacedAfterPublish { path });
+    }
+    Ok((mode, (dev, ino)))
+}
+
+/// パス（`dest_dir`）を std のパス操作で扱う [`PlacementDir`]（パス版 [`place_read_only`] 用）。
+///
+/// 検証後にパスが差し替えられる問題（TOCTOU）を避けたい呼び出し元は使わず、保持 fd 起点の
+/// 実装を渡すこと（CLI の `register` がそうする）。
+#[cfg(unix)]
+struct StdPlacementDir<'a> {
+    dir: &'a Path,
+}
+
+#[cfg(unix)]
+impl PlacementDir for StdPlacementDir<'_> {
+    fn dir_mode_and_uid(&self) -> io::Result<(u32, u32)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(self.dir)?;
+        Ok((meta.mode() & 0o7777, meta.uid()))
+    }
+    fn create_private_dir(&self, name: &str) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(self.dir.join(name))
+    }
+    fn entry_uid(&self, name: &str) -> io::Result<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(std::fs::symlink_metadata(self.dir.join(name))?.uid())
+    }
+    fn create_new_file(&self, rel: &str) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.dir.join(rel))
+    }
+    fn probe_append(&self, rel: &str) -> io::Result<()> {
+        OpenOptions::new()
+            .append(true)
+            .open(self.dir.join(rel))
+            .map(|_| ())
+    }
+    fn publish_no_replace(&self, rel: &str, name: &str) -> io::Result<()> {
+        // `hard_link` は宛先が既に存在する場合に原子的に失敗する（`rename` は使わない）。
+        std::fs::hard_link(self.dir.join(rel), self.dir.join(name))
+    }
+    fn stat_entry(&self, name: &str) -> io::Result<(u64, u64, u32)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(self.dir.join(name))?;
+        Ok((meta.dev(), meta.ino(), meta.mode() & 0o7777))
+    }
+    fn remove_dir_tree(&self, name: &str) -> io::Result<()> {
+        std::fs::remove_dir_all(self.dir.join(name))
+    }
+}
+
+/// 評価データ本体を読み取り専用配置にする（REQ-39・REQ-17・TASK-17.2-2）。パス版。
 ///
 /// モジュール doc「設計」を参照。`src` は読み込むだけで、権限変更・
 /// `rename`・`unlink` のいずれも行わない。`record` は `src` の内容から
@@ -612,6 +758,10 @@ fn verify_and_finalize_publish(
 /// 本関数はそれを信用せず `src` から読み直した実データと突き合わせる。
 /// `max_bytes` は呼び出し側の方針として受け取る上限で、本モジュールは
 /// 既定値を持たない（モジュール doc「責務の境界」）。
+///
+/// 手順の実体は [`place_read_only_bytes`]（`src` の読み込みと `dest_dir` の事前検査の後、std の
+/// パス操作の [`PlacementDir`] を渡す薄いアダプター）。パスを開き直すため、検証後の差し替えを
+/// 避けたい呼び出し元は [`place_read_only_bytes`] を保持 fd 起点の実装で使うこと。
 ///
 /// 非 unix では常に [`PlacementError::UnsupportedPlatform`] を返す
 /// （モジュール doc「責務の境界」）。
@@ -634,173 +784,53 @@ pub fn place_read_only(
     check_dest_dir(dest_dir)?;
     #[cfg(unix)]
     {
-        // `dest_dir` の mode（group・other 向けの権限ビットが無いこと）を
-        // 先に検査する。所有者の突き合わせ（[`check_dest_dir_owner`]）は
-        // 作業ディレクトリを新規作成した後でなければ「自分の uid」の
-        // 代わりが用意できないため、ここでは行わない（モジュール doc
-        // 「`dest_dir` の機密性」）。
+        // mode の検査は `src` を読む前に済ませる（安価な検査を先に）。
         check_dest_dir_mode(dest_dir)?;
     }
 
-    // `src` は読み込むだけ。上限は `max_bytes`（呼び出し側の方針）で、
-    // `read_bounded` はメタデータ由来のサイズと実際に読んだバイト数の
-    // 両方をこの上限と照合する（TOCTOU 対策。`fandhe_edge_core::fs` doc
-    // 参照）。
+    // `src` は読み込むだけ。上限は `max_bytes`（呼び出し側の方針）で、`read_bounded` は
+    // メタデータ由来のサイズと実際に読んだバイト数の両方を照合する（TOCTOU 対策）。
     let bytes = read_bounded(src, max_bytes)?;
-
-    // `usize` から `u64` への変換失敗（64bit 環境では `max_bytes: u64` に
-    // 収まっている時点で実質到達しない）は、外部入力の経路でも
-    // `unwrap`/`expect` を使わない規約（`.claude/rules/coding-rust.md`）に
-    // 従い `Io` として扱う。
-    let recomputed = freeze_eval_data(&bytes).map_err(|_| PlacementError::Io {
-        path: src.to_path_buf(),
-        source: std::io::Error::other("eval data byte length does not fit in u64"),
-    })?;
-    if &recomputed != record {
-        return Err(PlacementError::HashMismatch);
-    }
-
     let dest_path = dest_dir.join(file_name);
 
     #[cfg(unix)]
     {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let staging = create_staging_area(dest_dir)?;
-
-        // `staging.dir` は本関数が今まさに新規作成したディレクトリなので、
-        // その所有者は呼び出しプロセスの実効ユーザーそのもの。これを
-        // 「自分の uid」の代わりに使い、`dest_dir` の所有者と突き合わせる
-        // （`getuid(2)` 相当の `unsafe` な FFI を使わない。モジュール doc
-        // 「`dest_dir` の機密性」）。
-        check_dest_dir_owner(dest_dir, &staging.dir)?;
-
-        let mut staging_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staging.file_path)
-            .map_err(|source| PlacementError::Io {
-                path: dest_path.clone(),
-                source,
-            })?;
-
-        staging_file
-            .write_all(&bytes)
-            .and_then(|()| staging_file.sync_all())
-            .map_err(|source| PlacementError::Io {
-                path: dest_path.clone(),
-                source,
-            })?;
-
-        // ここまでで書き込んだのは、他のどのパスからも到達できない新規
-        // inode（`staging.file_path`）のみ。ここから先で権限変更するのは
-        // この inode 一つだけであり、`src` を含む既存の inode には一切
-        // 触れない（モジュール doc「設計」）。`0o444`（誰でも読み取り可）
-        // ではなく `0o400`（所有者のみ読み取り可）にする（issue #227
-        // codex[bot] P0 指摘: 評価データの機密性。モジュール doc
-        // 「`dest_dir` の機密性」）。
-        const READ_ONLY_MODE: u32 = 0o400;
-        staging_file
-            .set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE))
-            .map_err(|source| PlacementError::Io {
-                path: dest_path.clone(),
-                source,
-            })?;
-
-        let staging_meta = staging_file
-            .metadata()
-            .map_err(|source| PlacementError::Io {
-                path: dest_path.clone(),
-                source,
-            })?;
-        let staged_mode = staging_meta.permissions().mode() & 0o7777;
-        if staged_mode != READ_ONLY_MODE {
-            return Err(PlacementError::Io {
-                path: dest_path.clone(),
-                source: std::io::Error::other(format!(
-                    "permissions did not converge to {READ_ONLY_MODE:o} (got {staged_mode:o})"
-                )),
-            });
-        }
-        // 公開後に「本当にこの inode が公開されたか」を突き合わせるための
-        // 基準値（issue #227 codex[bot] 指摘: `rename`/`hard_link` の後に
-        // 対象の同一性を確認しないまま成功を返さないこと）。
-        let staged_dev_ino = dev_ino(&staging_meta);
-
-        // 公開前の書き込み拒否プローブ。`staging_file` は書き込みモードで
-        // 開いたままのハンドルであり、unix の権限判定は `open` 時点で
-        // 確定するため、このハンドルへ書き込めるかどうかを試しても
-        // `chmod` 後の実効権限を検査したことにならない。フレッシュに
-        // 開き直すことで、実際にファイルシステムが拒否することを確認
-        // する。このパスは `dest_dir` 配下の非公開ディレクトリ（0700）の
-        // 中にしか存在しないため、この再オープンは他プロセスと競合しない
-        // （TOCTOU の窓が無い）。
-        match OpenOptions::new().append(true).open(&staging.file_path) {
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {}
-            Ok(_opened) => {
-                return Err(PlacementError::WriteNotRejected { path: dest_path });
-            }
-            Err(source) => {
-                return Err(PlacementError::Io {
-                    path: dest_path,
-                    source,
-                });
-            }
-        }
-
-        // 公開。`hard_link` は宛先が既に存在する場合に原子的に失敗する
-        // ため、既存のファイルを上書きしない。`rename` は使わない
-        // （利用者の `path` を `rename` で置き換える設計は本モジュールが
-        // 廃止した旧方式であり、この関数は `dest_path` 以外のどのパスにも
-        // 一切書き込まない）。
-        match std::fs::hard_link(&staging.file_path, &dest_path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-                return Err(PlacementError::AlreadyExists { path: dest_path });
-            }
-            Err(source) => {
-                return Err(PlacementError::Io {
-                    path: dest_path,
-                    source,
-                });
-            }
-        }
-
-        // 公開直後の検証。`hard_link` の戻り値だけを信用して「成功した
-        // のだから同一のはず」と即座に `Ok` を返さない（issue #227
-        // codex[bot] 指摘）。失敗経路は [`verify_and_finalize_publish`]
-        // の doc・モジュール doc「設計」手順 6 のとおり、必ず「何も
-        // 残っていない」か「これは他者のものだ」のどちらかへ着地させる。
-        let (mode, dev_ino_value) = verify_and_finalize_publish(&dest_path, staged_dev_ino)?;
-
-        // 作業領域の後始末。公開は既に完了しているため、失敗しても配置
-        // 自体は有効。失敗を無視せず `cleanup_failed` に記録する
-        // （旧実装が復元処理の失敗を `let _ = ...` で握り潰していた
-        // ことへの反省。ただしここでの「後始末」は他者に見えない内輪の
-        // 作業ディレクトリの削除であり、失敗しても公開済みの `dest_path`
-        // 以外へ副作用は及ばない）。
-        let cleanup_failed = std::fs::remove_file(&staging.file_path).is_err()
-            | std::fs::remove_dir(&staging.dir).is_err();
-
-        Ok(ReadOnlyPlacement {
-            path: dest_path,
-            mode,
-            dev_ino: dev_ino_value,
-            cleanup_failed,
-        })
+        let mut placement = place_read_only_bytes(
+            &bytes,
+            &StdPlacementDir { dir: dest_dir },
+            file_name,
+            record,
+            max_bytes,
+        )
+        .map_err(|e| with_dest_path(e, &dest_path))?;
+        placement.path = dest_path;
+        Ok(placement)
     }
 
     #[cfg(not(unix))]
     {
-        // 非 unix（Windows）では読み取り専用配置そのものを拒否する
-        // （[`PlacementError::UnsupportedPlatform`]。モジュール doc
-        // 「責務の境界」参照）。M10 時点で対象外の Windows 向けに未検証の
-        // 実装を「実装済みを装う」形で残さず、fail-closed に拒否する。
         let _ = &bytes;
         Err(PlacementError::UnsupportedPlatform { path: dest_path })
+    }
+}
+
+/// [`place_read_only_bytes`] が返したエラーの相対パスを、パス版の絶対パスに置き換える
+/// （パス版の既存の表示・挙動を保つ）。
+#[cfg(unix)]
+fn with_dest_path(error: PlacementError, dest_path: &Path) -> PlacementError {
+    let path = dest_path.to_path_buf();
+    match error {
+        PlacementError::InsecureDestDir { .. } => PlacementError::InsecureDestDir { path },
+        PlacementError::AlreadyExists { .. } => PlacementError::AlreadyExists { path },
+        PlacementError::WriteNotRejected { .. } => PlacementError::WriteNotRejected { path },
+        PlacementError::DestReplacedAfterPublish { .. } => {
+            PlacementError::DestReplacedAfterPublish { path }
+        }
+        PlacementError::PublishedButUnverified { .. } => {
+            PlacementError::PublishedButUnverified { path }
+        }
+        PlacementError::Io { source, .. } => PlacementError::Io { path, source },
+        other => other,
     }
 }
 
@@ -1223,9 +1253,13 @@ mod tests {
         // `dest_path` には「他者が置いた」ことにする別ファイルを用意する。
         std::fs::write(&dest_path, b"someone else's file").expect("dest を作成できるはず");
 
-        match verify_and_finalize_publish(&dest_path, staged_dev_ino) {
+        match verify_and_finalize_publish(
+            &StdPlacementDir { dir: &dest_dir.0 },
+            "frozen.jsonl",
+            staged_dev_ino,
+        ) {
             Err(PlacementError::DestReplacedAfterPublish { path }) => {
-                assert_eq!(path, dest_path);
+                assert_eq!(path, PathBuf::from("frozen.jsonl"));
             }
             other => panic!("DestReplacedAfterPublish を期待したが {other:?} だった"),
         }
@@ -1268,13 +1302,19 @@ mod tests {
         // 決定的に再現する。
         std::fs::set_permissions(&dest_dir.0, std::fs::Permissions::from_mode(0o600))
             .expect("dest_dir の権限を一時的に変更できるはず");
-        let result = verify_and_finalize_publish(&dest_path, staged_dev_ino);
+        let result = verify_and_finalize_publish(
+            &StdPlacementDir { dir: &dest_dir.0 },
+            "frozen.jsonl",
+            staged_dev_ino,
+        );
         // 後始末（`TempDirGuard::drop` が中身を削除できるように）実行ビットを戻す。
         std::fs::set_permissions(&dest_dir.0, std::fs::Permissions::from_mode(0o700))
             .expect("dest_dir の権限を元に戻せるはず");
 
         match result {
-            Err(PlacementError::PublishedButUnverified { path }) => assert_eq!(path, dest_path),
+            Err(PlacementError::PublishedButUnverified { path }) => {
+                assert_eq!(path, PathBuf::from("frozen.jsonl"));
+            }
             other => panic!("PublishedButUnverified を期待したが {other:?} だった"),
         }
 
@@ -1336,5 +1376,148 @@ mod tests {
         let hash_text = PlacementError::HashMismatch.to_string();
         assert!(hash_text.is_ascii());
         assert!(!hash_text.contains("tampered"));
+    }
+
+    /// 書き込み拒否のプローブを常に「書けた」と答える [`PlacementDir`]（root・ACL で拒否できない環境の模擬）。
+    #[cfg(unix)]
+    struct AlwaysWritable<'a>(StdPlacementDir<'a>);
+
+    #[cfg(unix)]
+    impl PlacementDir for AlwaysWritable<'_> {
+        fn dir_mode_and_uid(&self) -> io::Result<(u32, u32)> {
+            self.0.dir_mode_and_uid()
+        }
+        fn create_private_dir(&self, name: &str) -> io::Result<()> {
+            self.0.create_private_dir(name)
+        }
+        fn entry_uid(&self, name: &str) -> io::Result<u32> {
+            self.0.entry_uid(name)
+        }
+        fn create_new_file(&self, rel: &str) -> io::Result<std::fs::File> {
+            self.0.create_new_file(rel)
+        }
+        fn probe_append(&self, _rel: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn publish_no_replace(&self, rel: &str, name: &str) -> io::Result<()> {
+            self.0.publish_no_replace(rel, name)
+        }
+        fn stat_entry(&self, name: &str) -> io::Result<(u64, u64, u32)> {
+            self.0.stat_entry(name)
+        }
+        fn remove_dir_tree(&self, name: &str) -> io::Result<()> {
+            self.0.remove_dir_tree(name)
+        }
+    }
+
+    #[cfg(unix)]
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// REQ-17・REQ-39: バイト列版は、照合が一致すれば 0400 で公開し、作業領域を残さない（相対パスを返す）。
+    #[cfg(unix)]
+    #[test]
+    fn req17_place_read_only_bytes_publishes_read_only_and_cleans_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if running_as_root(&std::env::temp_dir()) {
+            return; // root は書き込みを拒否できず fail-closed になる（別テストで確認）。
+        }
+        let dest_dir = make_temp_dir("bytes-ok");
+        let bytes = b"{\"id\":\"a\"}\n";
+        let record = freeze_eval_data(bytes).expect("record");
+        let placement = place_read_only_bytes(
+            bytes,
+            &StdPlacementDir { dir: &dest_dir.0 },
+            "frozen.jsonl",
+            &record,
+            1024,
+        )
+        .expect("placed");
+        assert_eq!(placement.path(), Path::new("frozen.jsonl"));
+        assert_eq!(placement.mode(), 0o400);
+        assert!(!placement.cleanup_failed());
+        assert_eq!(names_in(&dest_dir.0), ["frozen.jsonl"]);
+        let file = dest_dir.0.join("frozen.jsonl");
+        assert_eq!(std::fs::read(&file).expect("read"), bytes);
+        assert_eq!(
+            std::fs::metadata(&file).expect("meta").permissions().mode() & 0o7777,
+            0o400
+        );
+    }
+
+    /// REQ-17・REQ-39: 記録と一致しないバイト列は `HashMismatch` で拒否し、配置先に何も作らない。
+    #[cfg(unix)]
+    #[test]
+    fn req17_place_read_only_bytes_rejects_hash_mismatch_without_touching_dest() {
+        let dest_dir = make_temp_dir("bytes-mismatch");
+        let record = freeze_eval_data(b"original").expect("record");
+        let result = place_read_only_bytes(
+            b"tampered",
+            &StdPlacementDir { dir: &dest_dir.0 },
+            "frozen.jsonl",
+            &record,
+            1024,
+        );
+        assert!(
+            matches!(result, Err(PlacementError::HashMismatch)),
+            "{result:?}"
+        );
+        assert_eq!(names_in(&dest_dir.0), Vec::<String>::new());
+    }
+
+    /// REQ-39: 公開先に既にファイルがあれば置き換えず `AlreadyExists`。既存の内容は不変で、作業領域も残さない。
+    #[cfg(unix)]
+    #[test]
+    fn req39_place_read_only_bytes_does_not_replace_existing_file() {
+        if running_as_root(&std::env::temp_dir()) {
+            return;
+        }
+        let dest_dir = make_temp_dir("bytes-exists");
+        std::fs::write(dest_dir.0.join("frozen.jsonl"), b"old").expect("existing");
+        let record = freeze_eval_data(b"new").expect("record");
+        let result = place_read_only_bytes(
+            b"new",
+            &StdPlacementDir { dir: &dest_dir.0 },
+            "frozen.jsonl",
+            &record,
+            1024,
+        );
+        assert!(
+            matches!(result, Err(PlacementError::AlreadyExists { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.0.join("frozen.jsonl")).expect("read"),
+            b"old"
+        );
+        assert_eq!(names_in(&dest_dir.0), ["frozen.jsonl"]);
+    }
+
+    /// REQ-39: 書き込み拒否を確認できない（プローブが「書けた」）場合は `WriteNotRejected` で
+    /// fail-closed にし、何も公開せず作業領域も残さない。
+    #[cfg(unix)]
+    #[test]
+    fn req39_place_read_only_bytes_fails_closed_when_probe_is_not_rejected() {
+        let dest_dir = make_temp_dir("bytes-probe");
+        let record = freeze_eval_data(b"data").expect("record");
+        let result = place_read_only_bytes(
+            b"data",
+            &AlwaysWritable(StdPlacementDir { dir: &dest_dir.0 }),
+            "frozen.jsonl",
+            &record,
+            1024,
+        );
+        assert!(
+            matches!(result, Err(PlacementError::WriteNotRejected { .. })),
+            "{result:?}"
+        );
+        assert_eq!(names_in(&dest_dir.0), Vec::<String>::new());
     }
 }

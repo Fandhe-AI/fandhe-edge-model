@@ -14,8 +14,10 @@ mod unix_only {
 
     const MIN_ONNX: [u8; 9] = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
     const CANARY: &str = "CANARY_SECRET";
-    const STUB: &str =
-        "{\"code\":\"runtime_error\",\"message\":\"stage not implemented yet (TASK-33.1-2)\"}\n";
+    /// ガード通過後は #136 で推論本体（`stages::infer`）へ進む。このフィクスチャのメタデータは
+    /// `onnx_file`・`kind` のみで完全なパッケージ形式ではないため、次の層が拒否する。
+    const AFTER_GUARD_META_INVALID: &str =
+        "{\"code\":\"invalid_input\",\"message\":\"artifact metadata is invalid\"}\n";
     const FORMAT_NOT_ALLOWED: &str =
         "{\"code\":\"invalid_input\",\"message\":\"format rejected: format_not_allowed\"}\n";
     const EXTENSION_NOT_ALLOWED: &str =
@@ -198,13 +200,13 @@ mod unix_only {
         sb.assert_infer(64, UNSUPPORTED_KIND);
     }
 
-    /// 正常対照: 許可された `kind` と ONNX はガードを通過し、スタブ（70）へ到達する。
+    /// 正常対照: 許可された `kind` と ONNX はガードを通過し、次の層（メタデータ検証）で拒否される。
     #[test]
-    fn req39_allowed_kinds_reach_stub() {
+    fn req39_allowed_kinds_pass_guard_and_reach_next_layer() {
         let sb = Sandbox::new("kind-ok");
         for k in ["\"c1\"", "\"c3\"", "\"autoregressive\""] {
             sb.setup(&meta(k, "model.onnx"), "model.onnx", &MIN_ONNX);
-            sb.assert_infer(70, STUB);
+            sb.assert_infer(64, AFTER_GUARD_META_INVALID);
         }
     }
 

@@ -74,9 +74,9 @@
 //!
 //! 長く動き続けるプロセス（将来の MCP サーバ。REQ-36・REQ-37）から推論する場合は、スレッドを
 //! 強制終了できないため、本関数を直接呼ばず CLI を子プロセスとして起動して隔離する前提とする
-//! （配線は #136）。
+//! （配線は #136 で `stages::infer` に実装済み）。
 //!
-//! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
+//! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`、実バックエンドは #112/#113）。
 
 use crate::args::{Command, InferSource};
 use crate::error_report::{ToErrorReport, default_message, emit_error_report};
@@ -577,9 +577,9 @@ where
 /// ウォッチドッグの起動に失敗している（`watchdog` が `Err`）場合は、停止した出力先への書き込みを
 /// 中断できないため ErrorReport を書かず、終了コードだけで返す（無期限に待たない。REQ-39）。
 /// 書き込みの間はウォッチドッグを保持し、停止を終了へ倒す。
-fn finish_abandoned<W: Write>(
+fn finish_abandoned<W: Write, T>(
     out: &mut W,
-    outcome: &Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport>,
+    outcome: &Result<T, ErrorReport>,
     watchdog: io::Result<Option<OutputWatchdog>>,
 ) -> i32 {
     if let Ok(_guard) = watchdog {
@@ -592,6 +592,178 @@ fn finish_abandoned<W: Write>(
         let _ = out.flush();
     }
     i32::from(ExitCode::LimitExceeded.code())
+}
+
+/// 単件推論の協調的な期限（runtime）に足す、CLI 側のハード上限までの猶予（暫定）。協調的な期限が
+/// 先に効けば通常の `limit_exceeded`、止まって返らないときだけ CLI の見張りが効く（REQ-39）。
+pub const SINGLE_HARD_LIMIT_GRACE: Duration = Duration::from_millis(500);
+
+/// 単件推論の既定の上限。`duration` は `core::limits::INFER_TIME_LIMIT`（推論 1 件の上限。REQ-39）。
+#[must_use]
+pub fn default_single_limits() -> BatchLimits {
+    BatchLimits {
+        duration: fandhe_edge_core::limits::INFER_TIME_LIMIT,
+        ..BatchLimits::default()
+    }
+}
+
+/// 計算スレッドで `work` を実行し、`duration` 以内に返らなければ切り離す（バッチと共通の見張り。
+/// REQ-39）。
+///
+/// 期限超過時、`policy` がプロセス終了で回収するなら [`OutputWatchdog`] を起動して
+/// [`finish_abandoned`] が `limit_exceeded` の JSON を書き、`process::exit(20)` する（戻らない）。
+/// 回収しない方式（テスト専用）では `Err(limit_exceeded)` を返す。スレッドを起動できない・
+/// panic は `runtime_error`。
+pub(crate) fn run_with_stall_guard<W, T>(
+    out: &mut W,
+    duration: Duration,
+    output_duration: Duration,
+    policy: StallPolicy,
+    work: impl FnOnce() -> Result<T, ErrorReport> + Send + 'static,
+) -> Result<T, ErrorReport>
+where
+    W: Write,
+    T: Send + 'static,
+{
+    let deadline = Instant::now().checked_add(duration);
+    let (tx, rx) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("infer-single".to_string())
+        .spawn(move || {
+            let _ = tx.send(work());
+        });
+    if spawned.is_err() {
+        return Err(report(ExitCode::RuntimeError));
+    }
+    let received = match deadline {
+        Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+        None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+    };
+    match received {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let outcome: Result<T, ErrorReport> = Err(report(ExitCode::LimitExceeded));
+            if policy.terminates() {
+                let watchdog = OutputWatchdog::arm(true, output_duration);
+                std::process::exit(finish_abandoned(out, &outcome, watchdog));
+            }
+            outcome
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(report(ExitCode::RuntimeError)),
+    }
+}
+
+/// `--text` の単件推論を実行して 1 行の JSON を書く（既定の上限。REQ-39・REQ-33）。
+///
+/// # Errors
+/// 出力先への書き込み失敗（exit 70 に写す）。
+pub fn emit_infer_single<W, P, B>(
+    out: &mut W,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+    id: &str,
+    text: &str,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_single_with_limits(
+        out,
+        io,
+        options,
+        pipeline,
+        id,
+        text,
+        default_single_limits(),
+    )
+}
+
+/// [`emit_infer_single`] の上限を指定できる版。停止の回収は常にプロセス終了（CLI の 1 呼び出し
+/// 1 プロセス専用。[`emit_infer_batch_with_limits`] と同じ）。
+///
+/// runtime へは `limits.duration` を協調的な期限として渡し（`infer_one_within`）、止まって返らない
+/// ときだけ `duration + SINGLE_HARD_LIMIT_GRACE` で見切って `limit_exceeded`・exit 20 で終える。
+///
+/// # Errors
+/// 出力先への書き込み失敗。
+pub fn emit_infer_single_with_limits<W, P, B>(
+    out: &mut W,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+    id: &str,
+    text: &str,
+    limits: BatchLimits,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_single_inner(
+        out,
+        pipeline,
+        SingleCall {
+            io,
+            options,
+            id,
+            text,
+        },
+        limits,
+        StallPolicy::TerminateProcess,
+    )
+}
+
+/// 単件推論 1 回分の入力（[`emit_infer_single_inner`] の引数をまとめたもの）。
+pub(crate) struct SingleCall<'a> {
+    pub(crate) io: &'a IoSchema,
+    pub(crate) options: &'a [Choice],
+    pub(crate) id: &'a str,
+    pub(crate) text: &'a str,
+}
+
+/// [`emit_infer_single_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
+pub(crate) fn emit_infer_single_inner<W, P, B>(
+    out: &mut W,
+    pipeline: Arc<InferencePipeline<P, B>>,
+    call: SingleCall<'_>,
+    limits: BatchLimits,
+    policy: StallPolicy,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    let SingleCall {
+        io,
+        options,
+        id,
+        text,
+    } = call;
+    let input = match InferInput::from_text(id, text, io) {
+        Ok(input) => input,
+        Err(e) => return emit_error_report(out, &infer_input_error_report(&e)),
+    };
+    let cooperative = limits.duration;
+    let hard = cooperative.saturating_add(SINGLE_HARD_LIMIT_GRACE);
+    let worker_options = options.to_vec();
+    let outcome = run_with_stall_guard(out, hard, limits.output_duration, policy, move || {
+        // 推論側へ渡すのは `input` のみ（REQ-27）。
+        let prediction = pipeline
+            .infer_one_within(input.input(), cooperative)
+            .map_err(|e| e.to_error_report())?;
+        judgment_from_prediction(&worker_options, input.id(), &prediction)
+    });
+    // 書き込みの停止も期限でプロセス終了へ倒す（バッチと同じ見張り）。
+    let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
+    match outcome {
+        Ok(result) => write_ok_judgment(out, &result),
+        Err(error) => emit_error_report(out, &error),
+    }
 }
 
 #[cfg(test)]
@@ -621,7 +793,10 @@ mod tests {
                 definition: p(),
                 project_dir: p(),
             }),
-            Command::Inspect(InspectArgs { project_dir: p() }),
+            Command::Inspect(InspectArgs {
+                project_dir: p(),
+                seed: 42,
+            }),
             Command::Train(TrainArgs {
                 project_dir: p(),
                 candidate: 0,
@@ -632,7 +807,10 @@ mod tests {
                 candidate: 0,
             }),
             Command::Select(SelectArgs { project_dir: p() }),
-            Command::Package(PackageArgs { project_dir: p() }),
+            Command::Package(PackageArgs {
+                project_dir: p(),
+                allow_smoke: false,
+            }),
             infer(InferSource::Text {
                 text: "t".to_string(),
                 id: None,
@@ -880,11 +1058,41 @@ mod tests {
         assert!(!text.contains("\"code\""));
     }
 
+    /// REQ-39: 回収しない方式（テスト専用）では、返らない処理を期限で見切って `limit_exceeded`（20）を
+    /// 返し、期限内に返る処理の結果はそのまま返す。
+    #[test]
+    fn req39_stall_guard_reports_limit_exceeded_without_exit_under_leak_policy() {
+        let mut out: Vec<u8> = Vec::new();
+        let stalled: Result<u8, ErrorReport> = run_with_stall_guard(
+            &mut out,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            StallPolicy::Leak,
+            || {
+                thread::sleep(Duration::from_secs(5));
+                Ok(1)
+            },
+        );
+        assert_eq!(
+            stalled.expect_err("must time out"),
+            report(ExitCode::LimitExceeded)
+        );
+        let fast = run_with_stall_guard(
+            &mut out,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            StallPolicy::Leak,
+            || Ok(7_u8),
+        );
+        assert_eq!(fast.expect("in time"), 7);
+        assert!(out.is_empty());
+    }
+
     /// REQ-39: 切り離しの後は、ウォッチドッグの起動に失敗しても終了コードは 20 で、停止しうる
     /// 書き込みはしない。起動できていれば ErrorReport を 1 行書いて 20。
     #[test]
     fn req39_finish_abandoned_always_yields_limit_exceeded_exit_code() {
-        let outcome = Err(report(ExitCode::LimitExceeded));
+        let outcome: Result<(), ErrorReport> = Err(report(ExitCode::LimitExceeded));
         let mut out: Vec<u8> = Vec::new();
         let code = finish_abandoned(&mut out, &outcome, Err(io::Error::other("spawn failed")));
         assert_eq!(code, 20);

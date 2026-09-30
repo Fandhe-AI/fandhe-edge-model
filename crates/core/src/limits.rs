@@ -23,6 +23,19 @@ pub const MAX_TIME_LIMIT_NS: u64 = MAX_TIME_LIMIT.as_secs() * 1_000_000_000;
 /// （暫定 256 MiB。REQ-39）。
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
+/// プロジェクトへ取り込む学習・評価データ 1 ファイルの読み込み上限（64 MiB。暫定。REQ-39）。
+/// CLI の各工程の読み込み（`MAX_PROJECT_FILE_BYTES`）の出所で、下の学習用 JSONL の上限もここから導出する。
+pub const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 学習ワーカーへ渡す trainer 形式 JSONL の生成量の上限（暫定。REQ-39）。
+///
+/// 入力データの読み込み上限 [`MAX_PROJECT_FILE_BYTES`] の 4 倍。`{"input","label"}` の行への変換は、
+/// JSON のキー・ラベルの付与と、入力文字列のエスケープ（制御文字・非 ASCII が `\uXXXX` で最大 6 倍に
+/// 膨らむ）により入力より大きくなりうるため、入力上限そのものでは正常な入力まで拒否しうる。一方で
+/// 無制限に生成すると資源を使い切るので、上限を超えた時点で生成をやめる。4 倍は暫定値で、確定値は
+/// 実機測定後に spec 側で決まる。
+pub const TRAINER_JSONL_MAX_BYTES: u64 = 4 * MAX_PROJECT_FILE_BYTES;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,6 +48,8 @@ mod tests {
         assert_eq!(MAX_TIME_LIMIT, Duration::from_secs(3600));
         assert_eq!(MAX_TIME_LIMIT_NS, 3_600_000_000_000);
         assert_eq!(MAX_OUTPUT_BYTES, 268_435_456);
+        assert_eq!(MAX_PROJECT_FILE_BYTES, 67_108_864);
+        assert_eq!(TRAINER_JSONL_MAX_BYTES, 268_435_456);
         assert_eq!(u128::from(INFER_TIME_LIMIT_NS), INFER_TIME_LIMIT.as_nanos());
         assert_eq!(u128::from(MAX_TIME_LIMIT_NS), MAX_TIME_LIMIT.as_nanos());
     }

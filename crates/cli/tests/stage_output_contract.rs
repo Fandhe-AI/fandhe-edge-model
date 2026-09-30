@@ -1,6 +1,6 @@
 //! 正常系 stdout JSON と stderr ログの分離の結合テスト（REQ-33・TASK-33.2-2・#139）。
 //!
-//! 証拠種別: テストハーネス（`package` の実処理への接続とバイナリでの完走は #136）。
+//! 証拠種別: テストハーネス（`package` の実処理への接続は #136 で `stages::package` に実装済み。バイナリでの完走は `pipeline_e2e.rs`）。
 //! 期待値の `judgment:"pass"`・`status:"ok"` は PoC-16 vertical_a の package 工程の
 //! 実測に基づく（`docs/spec` は読まない）。
 

@@ -92,7 +92,11 @@ impl Env {
                  [ \"${{FAKE_SANDBOXED:-}}\" = 1 ] || exit 99\n\
                  echo \"$1\" >> \"{}\"\n\
                  if [ \"${{FAKE_FAIL_STAGE:-}}\" = \"$1\" ]; then exit \"${{FAKE_FAIL_RC:-70}}\"; fi\n\
-                 echo '{{\"code\":\"ok\"}}'\n\
+                 if [ \"$1\" = infer ]; then\n\
+                 echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
+                 exit 0\n\
+                 fi\n\
+                 printf '{{\"step\":\"%s\",\"status\":\"ok\"}}\\n' \"$1\"\n\
                  exit 0\n",
                 cli_log.display()
             ),

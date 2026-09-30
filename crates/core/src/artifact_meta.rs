@@ -123,6 +123,124 @@ impl ArtifactOnnxRef {
     }
 }
 
+/// 推論に必要な `artifact.json` の項目（`kind`・`kind_version`・`max_bytes`・`label_order`・
+/// `onnx_file`・`onnx_sha256`。TASK-33.1-2・#136）。
+///
+/// 推論経路（`infer`）が学習側の `fandhe-edge-train` に依存しないよう（REQ-32）、学習ワーカーの
+/// 成果物記録型を使わず、必要項目だけをここで読む。未知フィールドは無視する。入力は信頼できない
+/// データとして、型・範囲を fail-closed で検証する。値の経路検証（`onnx_file` がルート配下か）は
+/// 呼び出し側がガード層で行う。`onnx_sha256` の照合（パッケージの自己整合性）は呼び出し側が
+/// 開いたバイト列に対して行う。外部台帳による完全性検証（#168）・`kind_version` の許可リスト
+/// 検証（#174）の代替ではない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactMeta {
+    onnx_file: String,
+    kind: String,
+    kind_version: u32,
+    max_bytes: u32,
+    label_order: Vec<String>,
+    onnx_sha256: String,
+}
+
+/// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
+const MAX_META_LABELS: usize = 1024;
+/// `kind` の最大バイト数。
+const MAX_META_KIND_BYTES: usize = 64;
+
+#[derive(Deserialize)]
+struct RawMeta {
+    onnx_file: String,
+    kind: String,
+    kind_version: u32,
+    max_bytes: u32,
+    label_order: Vec<String>,
+    onnx_sha256: String,
+}
+
+impl ArtifactMeta {
+    /// `artifact.json` のバイト列を検証つきで読む。
+    ///
+    /// # Errors
+    /// 不正な JSON・欠落・型違い・`onnx_file` の空・NUL・`kind` の空・過長・`max_bytes` が 0・
+    /// `label_order` が空・過多・重複・空要素・`onnx_sha256` が小文字 16 進 64 桁でない場合。
+    pub fn parse(bytes: &[u8]) -> Result<Self, ArtifactMetaError> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|_| ArtifactMetaError::Malformed)?;
+        if !value.is_object() {
+            return Err(ArtifactMetaError::Malformed);
+        }
+        let raw: RawMeta =
+            serde_json::from_value(value).map_err(|_| ArtifactMetaError::Malformed)?;
+        if raw.onnx_file.is_empty() || raw.onnx_file.contains('\0') {
+            return Err(ArtifactMetaError::InvalidOnnxFile);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let labels_ok = !raw.label_order.is_empty()
+            && raw.label_order.len() <= MAX_META_LABELS
+            && raw
+                .label_order
+                .iter()
+                .all(|l| !l.is_empty() && seen.insert(l.as_str()));
+        let sha_ok = raw.onnx_sha256.len() == 64
+            && raw
+                .onnx_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if raw.kind.is_empty()
+            || raw.kind.len() > MAX_META_KIND_BYTES
+            || raw.max_bytes == 0
+            || !labels_ok
+            || !sha_ok
+        {
+            return Err(ArtifactMetaError::Malformed);
+        }
+        Ok(Self {
+            onnx_file: raw.onnx_file,
+            kind: raw.kind,
+            kind_version: raw.kind_version,
+            max_bytes: raw.max_bytes,
+            label_order: raw.label_order,
+            onnx_sha256: raw.onnx_sha256,
+        })
+    }
+
+    /// 未検証の `onnx_file` 文字列（経路検証の入力にのみ使う）。
+    #[must_use]
+    pub fn onnx_file(&self) -> &str {
+        &self.onnx_file
+    }
+
+    /// 種類 ID（`c1`・`c3` 等）。
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// 種類の版（許可リスト検証は #174 で未実装）。
+    #[must_use]
+    pub const fn kind_version(&self) -> u32 {
+        self.kind_version
+    }
+
+    /// 前処理の最大バイト長（範囲検証は推論ランタイム側）。
+    #[must_use]
+    pub const fn max_bytes(&self) -> u32 {
+        self.max_bytes
+    }
+
+    /// 出力ラベルの並び（定義の選択肢の宣言順と一致する必要がある）。
+    #[must_use]
+    pub fn label_order(&self) -> &[String] {
+        &self.label_order
+    }
+
+    /// 記載された ONNX の sha256（小文字 16 進 64 桁）。
+    #[must_use]
+    pub fn onnx_sha256(&self) -> &str {
+        &self.onnx_sha256
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +337,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(!e.to_string().contains("etc"));
+    }
+
+    fn full_meta(extra: &str) -> String {
+        format!(
+            r#"{{"onnx_file":"model.onnx","kind":"c1","kind_version":1,"max_bytes":48,"label_order":["a","b"],"onnx_sha256":"{}"{extra}}}"#,
+            "0".repeat(64)
+        )
+    }
+
+    /// REQ-39: 拡張メタの正常系。未知フィールドは無視する。
+    #[test]
+    fn req39_meta_parse_reads_fields() {
+        let m = ArtifactMeta::parse(full_meta(r#","n":1"#).as_bytes()).expect("ok");
+        assert_eq!(m.onnx_file(), "model.onnx");
+        assert_eq!(m.kind(), "c1");
+        assert_eq!(m.kind_version(), 1);
+        assert_eq!(m.max_bytes(), 48);
+        assert_eq!(m.label_order(), ["a".to_string(), "b".to_string()]);
+        assert_eq!(m.onnx_sha256(), "0".repeat(64));
+    }
+
+    /// REQ-39: 欠落・型違い・不正値は fail-closed。
+    #[test]
+    fn req39_meta_parse_rejects_invalid() {
+        let sha = "0".repeat(64);
+        let bad: Vec<String> = vec![
+            "{}".to_string(),
+            "[]".to_string(),
+            "not json".to_string(),
+            format!(
+                r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":0,"label_order":["a"],"onnx_sha256":"{sha}"}}"#
+            ),
+            format!(
+                r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":4,"label_order":[],"onnx_sha256":"{sha}"}}"#
+            ),
+            format!(
+                r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":4,"label_order":["a","a"],"onnx_sha256":"{sha}"}}"#
+            ),
+            format!(
+                r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":4,"label_order":["a"],"onnx_sha256":"{}"}}"#,
+                "A".repeat(64)
+            ),
+            format!(
+                r#"{{"onnx_file":"m.onnx","kind":"","kind_version":1,"max_bytes":4,"label_order":["a"],"onnx_sha256":"{sha}"}}"#
+            ),
+        ];
+        for b in &bad {
+            assert_eq!(
+                ArtifactMeta::parse(b.as_bytes()),
+                Err(ArtifactMetaError::Malformed),
+                "{b}"
+            );
+        }
+        let empty_file = full_meta("").replace("model.onnx", "");
+        assert_eq!(
+            ArtifactMeta::parse(empty_file.as_bytes()),
+            Err(ArtifactMetaError::InvalidOnnxFile)
+        );
     }
 }

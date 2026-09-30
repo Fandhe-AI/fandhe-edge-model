@@ -127,4 +127,6 @@ pub mod search;
 // 選定結果への McNemar・Holm 有意性判定の付与（評価器
 // `fandhe-edge-eval` を呼ぶ。REQ-18・REQ-25・TASK-18.3-1・#87）。
 pub mod selection_significance;
+// CLI `train`・`select`・`package` 工程が置くファイルの読み書き補助（REQ-18・TASK-33.1-2・#136）。
+pub mod stage_files;
 pub mod time_allotment;

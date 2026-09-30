@@ -1,7 +1,7 @@
 //! 評価データ未定義の `evaluate` が skipped・exit 0 で終わることの結合テスト
 //! （REQ-17・REQ-33・TASK-33.3・#140）。
 //!
-//! 証拠種別: テストハーネス（バイナリでの完走は #136）。期待値の `status:"skipped"`・exit 0 は
+//! 証拠種別: テストハーネス（バイナリでの完走は `pipeline_e2e.rs`。#136）。期待値の `status:"skipped"`・exit 0 は
 //! PoC-16 縦断 2（評価データなしの evaluate）の実測に基づく（`docs/spec` は読まない）。
 //! `reason` は英語の固定語彙へ置き換えている（日本語出力規約）。
 

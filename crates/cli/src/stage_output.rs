@@ -20,11 +20,11 @@
 //! [`EvaluateStart::Skipped`]（[`emit_evaluate_skipped`] で `status:"skipped"`・exit 0）、
 //! 凍結記録と一致すれば [`EvaluateStart::Proceed`]、不一致・矛盾は `ErrorReport`（exit ≠ 0。
 //! skipped へ落とさない）へ振り分ける。skip 判定は CLI で再実装しない。
-//! `Proceed` の後段（評価器呼び出し・結果 JSON）は未実装（評価器の結線 TASK・#136）で、
-//! 成功 JSON は出さない。#136 で `evaluate` を結線する際は、PoC-16 と同様に「候補が学習済みか」
-//! 等の確認より前に本関数の skip 判定を行うこと。
+//! `Proceed` の後段（評価器呼び出し・結果 JSON）は未実装（評価器の結線 TASK）で、成功 JSON は
+//! 出さない。`stages::evaluate`（#136）は PoC-16 と同様に、候補が学習済みか等の確認より前に本関数の
+//! skip 判定を行い、`Proceed` の後は評価済みを装わず `runtime_error` を返す。
 //!
-//! 証拠種別: テストハーネス（バイナリでの完走は #136）。
+//! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`。#136）。
 
 use crate::error_report::{ToErrorReport, default_message, emit_error_report};
 use crate::output::{write_evaluate_report, write_package_report};

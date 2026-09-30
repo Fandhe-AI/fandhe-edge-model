@@ -12,7 +12,8 @@
 #   2. 推論ランタイムの結合テスト実行ファイル `env_isolation`
 # Darwin では依存ライブラリを再帰的に辿る（直接リンクのみだと間接依存を見逃すため）。
 # 続けて `env -i PATH=/usr/bin:/bin` で env_isolation を実行し、実機での実行記録を採る。
-# CLI `infer` の推論そのものは工程の接続（#136）が未完のため確認対象外（help のみ smoke）。
+# CLI `infer` は工程の接続（#136）済みだが、推論そのものの `env -i` 実行 smoke は本スクリプトに
+# 未追加（別課題。現状は help のみ smoke）。
 #
 # eval は使わない。ネットワークには接続しない（REQ-38）。
 
@@ -151,7 +152,7 @@ for t in \
   echo "ok: $t"
 done
 
-echo "== smoke: env -i fandhe-edge infer --help (not inference; #136 pending) =="
+echo "== smoke: env -i fandhe-edge infer --help (help only; inference smoke is a separate task) =="
 env -i PATH=/usr/bin:/bin "$CLI_BIN" infer --help >/dev/null 2>&1 || { echo "FAIL: infer --help" >&2; exit 1; }
 
 echo "OK: tool=$TOOL evidence=$EVIDENCE targets=fandhe-edge,env_isolation"

@@ -6,8 +6,9 @@
 //! macOS 実機での sandbox 下の完走確認と拒否ログの記録は人の担当で、本テストは
 //! その証拠にならない（実機の手順は `AGENTS.md`「実機前提テスト」）。ここで検証するのは
 //! スクリプトの制御（sandbox 経由の起動・工程の順序・停止・記録・資源上限・終了コード）。
-//! 実バイナリは #136（TASK-33.1-2）が未完了のため `register` で 70 になるのが現状の
-//! 正しい結果で、#136 の完了後は最後のテストの期待値を更新する。
+//! 実バイナリは #136（TASK-33.1-2）で 7 工程を接続済み。ここでは実バイナリで register・inspect
+//! が完走し、学習ワーカーが無い環境では train で止まること（完走を装わない）を確認する
+//! （7 工程の完走は `pipeline_e2e.rs`）。
 //! 拒否ログの監視と 0 件判定は #163（TASK-38.1-2）の担当。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
@@ -81,6 +82,7 @@ impl Env {
                  prev=$a\n\
                  done\n\
                  echo \"$stage $cand\" >> \"{}\"\n\
+                 echo \"$*\" >> \"{}.args\"\n\
                  [ -z \"${{FAKE_SLEEP_SECS:-}}\" ] || sleep \"$FAKE_SLEEP_SECS\"\n\
                  if [ \"${{FAKE_HANG_STAGE:-}}\" = \"$stage\" ]; then\n\
                  case \"${{FAKE_HANG_KIND:-sleep}}\" in\n\
@@ -98,15 +100,20 @@ impl Env {
                  exit 0\n\
                  fi\n\
                  if [ \"$stage\" = evaluate ] && [ -n \"${{FAKE_EVAL_SKIPPED:-}}\" ]; then\n\
-                 echo '{{\"code\":\"ok\",\"status\":\"skipped\"}}'\n\
+                 echo '{{\"step\":\"evaluate\",\"status\":\"skipped\"}}'\n\
                  exit 0\n\
                  fi\n\
                  if [ -n \"${{FAKE_STAGE_OUT_SET:-}}\" ]; then\n\
                  printf '%s' \"$FAKE_STAGE_OUT\"\n\
                  exit 0\n\
                  fi\n\
-                 echo '{{\"code\":\"ok\"}}'\n\
+                 if [ \"$stage\" = infer ]; then\n\
+                 echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
+                 exit 0\n\
+                 fi\n\
+                 printf '{{\"step\":\"%s\",\"status\":\"ok\"}}\\n' \"$stage\"\n\
                  exit 0\n",
+                cli_log.display(),
                 cli_log.display()
             ),
         );
@@ -154,6 +161,13 @@ impl Env {
         Self::lines(&self.cli_log)
     }
 
+    /// 偽の CLI が受け取った引数全体（1 呼び出し 1 行）。
+    fn cli_args(&self) -> Vec<String> {
+        let mut path = self.cli_log.clone().into_os_string();
+        path.push(".args");
+        Self::lines(Path::new(&path))
+    }
+
     fn launch_calls(&self) -> Vec<String> {
         Self::lines(&self.launch_log)
     }
@@ -168,6 +182,19 @@ impl Env {
         envs: &[(&str, &str)],
         launcher: Option<&Path>,
         cli: Option<&Path>,
+    ) -> Out {
+        self.run_in(args, envs, launcher, cli, None)
+    }
+
+    /// `run_with` に加えてスクリプトの cwd を指定できる版（実バイナリは経路の閉じ込めのため
+    /// 定義ファイルを含むディレクトリを cwd にする必要がある。REQ-39）。
+    fn run_in(
+        &self,
+        args: &[String],
+        envs: &[(&str, &str)],
+        launcher: Option<&Path>,
+        cli: Option<&Path>,
+        cwd: Option<&Path>,
     ) -> Out {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -184,6 +211,9 @@ impl Env {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         if let Some(l) = launcher {
             cmd.env("FANDHE_EDGE_SANDBOX_EXEC", l);
         }
@@ -302,6 +332,37 @@ fn req38_candidates_param_runs_each_candidate() {
     );
 }
 
+/// REQ-27: `--smoke` のときだけ package に検証専用の `--allow-smoke` を渡す（短縮学習の候補を
+/// package するため）。`--smoke` なしでは渡さない（配布用の経路で smoke を許さない）。
+#[test]
+fn req27_allow_smoke_is_passed_to_package_only_with_smoke() {
+    let package_args = |e: &Env| -> String {
+        e.cli_args()
+            .into_iter()
+            .find(|l| l.starts_with("package "))
+            .expect("package call")
+    };
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--smoke".to_string());
+    let o = e.run(&args, &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        package_args(&e).ends_with(" --allow-smoke"),
+        "{}",
+        package_args(&e)
+    );
+
+    let e = Env::new();
+    let o = e.run(&e.base_args(), &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        !package_args(&e).contains("--allow-smoke"),
+        "{}",
+        package_args(&e)
+    );
+}
+
 /// launcher へ渡す遮断プロファイルが PoC-14/16 と完全一致する（弱める経路がない）。
 #[test]
 fn req38_profile_argv_is_exact() {
@@ -400,7 +461,7 @@ fn req17_evaluate_skipped_detection_is_structural() {
         &e.base_args(),
         &[(
             "FAKE_EVAL_OUT",
-            "{ \"code\" : \"ok\", \"status\" : \"skipped\" }",
+            "{ \"step\" : \"evaluate\", \"status\" : \"skipped\" }",
         )],
     );
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
@@ -411,7 +472,7 @@ fn req17_evaluate_skipped_detection_is_structural() {
         &e.base_args(),
         &[(
             "FAKE_EVAL_OUT",
-            "{\"code\":\"ok\",\"note\":\"\\\"status\\\":\\\"skipped\\\"\",\"inner\":{\"status\":\"skipped\"}}",
+            "{\"step\":\"evaluate\",\"status\":\"ok\",\"note\":\"\\\"status\\\":\\\"skipped\\\"\",\"inner\":{\"status\":\"skipped\"}}",
         )],
     );
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
@@ -586,16 +647,68 @@ fn req38_infer_text_is_not_written_to_logs() {
     assert!(hits.is_empty(), "{hits:?}");
 }
 
-/// 実バイナリは #136 未完了のため register で 70。完走を装わないことの確認。
-/// #136 の完了後はこの期待値を更新する。
+/// 実バイナリ（#136 で接続済み）で register・inspect が完走し（code の無い exit 0 の工程結果 JSON を
+/// スクリプトが受理する）、学習ワーカーが無い環境（存在しない `FANDHE_EDGE_TRAINER_DIR`）では
+/// train で止まる。完走を装わない確認（REQ-33・REQ-38。証拠種別: テストハーネス）。
 #[test]
-fn req38_real_binary_reports_runtime_error_at_register() {
+fn req38_real_binary_completes_register_and_inspect_then_stops_at_train() {
     let e = Env::new();
+    fs::write(
+        e.definition(),
+        r#"{"schema":"fandhe-edge-model-definition/v1","name":"sandbox_real","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#,
+    )
+    .expect("definition");
+    let mut rows = String::new();
+    for i in 0..20 {
+        for l in ["a", "b"] {
+            rows.push_str(&format!(
+                "{{\"id\":\"{l}{i}\",\"input\":\"{l} text {i}\",\"output\":{{\"intent\":\"{l}\"}},\"group_id\":\"g{l}{i}\"}}\n"
+            ));
+        }
+    }
+    fs::write(e.dir.join("train.jsonl"), rows).expect("train data");
     let real = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-edge"));
-    let o = e.run_with(&e.base_args(), &[], Some(&e.launcher), Some(&real));
+    let missing_trainer = e.dir.join("no-such-trainer");
+    let o = e.run_in(
+        &e.base_args(),
+        &[(
+            "FANDHE_EDGE_TRAINER_DIR",
+            &missing_trainer.display().to_string(),
+        )],
+        Some(&e.launcher),
+        Some(&real),
+        Some(&e.dir),
+    );
+    assert_ne!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        o.stdout.contains("\"failed_step\":\"train\""),
+        "stdout={}",
+        o.stdout
+    );
+    assert_eq!(step_names(&o.stdout), ["register", "inspect", "train"]);
+    assert!(
+        o.stdout
+            .contains("\"step\":\"register\",\"candidate\":null,\"exit_code\":0"),
+        "stdout={}",
+        o.stdout
+    );
+    assert_eq!(e.launch_calls().len(), 3);
+}
+
+/// exit 0 の工程結果 JSON は `code` を持たなくてよいが、`step` が工程名と一致し `status` が "ok"
+/// でなければ 70（REQ-33。TASK-33.1-2・#136）。
+#[test]
+fn req33_zero_exit_stage_json_must_match_stage_contract() {
+    let e = Env::new();
+    let o = e.run(
+        &e.base_args(),
+        &[
+            ("FAKE_STAGE_OUT", "{\"step\":\"x\",\"status\":\"ok\"}\n"),
+            ("FAKE_STAGE_OUT_SET", "1"),
+        ],
+    );
+    // 工程名と一致しない step は契約外（REQ-33。register の出力が register でない）
     assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
-    assert!(o.stdout.contains("\"failed_step\":\"register\""));
-    assert_eq!(e.launch_calls().len(), 1);
 }
 
 /// --out-dir が --project-dir と同一・配下・祖先だと 64 で拒否し、CLI を起動せず
@@ -644,6 +757,12 @@ fn req33_zero_exit_with_invalid_stage_output_stops_with_70() {
         "[]",
         "{\"code\":\"judged_fail\"}",
         "{}",
+        // code の無い任意の JSON・工程名の不一致・契約外の status・infer 形の出力は契約外
+        "{\"foo\":1}",
+        "{\"step\":\"inspect\",\"status\":\"ok\"}",
+        "{\"step\":\"register\",\"status\":\"failed\"}",
+        "{\"step\":\"register\",\"status\":\"skipped\"}",
+        "{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}",
     ];
     for out in bad {
         let e = Env::new();

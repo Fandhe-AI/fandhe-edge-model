@@ -43,9 +43,13 @@
 #     と工程ごとのバイト数を sandbox-monitor.sh へ引き渡す）。工程の stdout・stderr の本文は永続化しない
 #     （推論結果・エラーに学習・評価データの本文が含まれうるため。security.md）。
 #     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
-#   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。単一の JSON オブジェクトで
-#     トップレベルの code が "ok" でなければ、空出力・不正 JSON・code 不整合を含めて
-#     runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。evaluate はさらに
+#   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。空でない単一の JSON オブジェクトで
+#     ないか、トップレベルに code があるのに "ok" でなければ、工程ごとの契約（step が工程名と一致し
+#     status が "ok"。evaluate のみ "skipped" も可。infer は step を持たず status:"ok"・id・predicted_label）
+#     に合わなければ、空出力・不正 JSON・code 不整合を含めて runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。exit 0 の工程結果 JSON
+#     （register・inspect・train・evaluate・select・package と infer の判定）は code を持たず
+#     step・status 等のフィールドを持つ契約のため、code の欠如は許容する（cli-infer-noninteractive.sh
+#     と同じ規則。TASK-33.1-2・#136）。evaluate はさらに
 #     トップレベルの status だけを見て skipped を判定する（REQ-17）
 #   - --out-dir は --project-dir と同一・包含関係にないこと（両パスを物理パスへ正規化して比較。
 #     違反は invalid_input(64)。mkdir が未作成の project-dir を先に作る契約違反を防ぐ）
@@ -55,9 +59,12 @@
 # （環境変数 FANDHE_EDGE_BIN、無ければ ${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge）、
 # 同期済みの trainer/.venv、定義ファイルと学習・評価データ。
 #
-# 現状の制約: 各工程の下位層への接続（TASK-33.1-2・#136）が未完了のため、実バイナリは
-# register で runtime_error(70) を返して停止する。これが現時点の正しい結果で、
-# 完走を装わない。package の出力先は暫定で <project-dir>/package とする（#136 で確定）。
+# 工程の接続（TASK-33.1-2・#136）: 実バイナリは 7 工程を下位層へ接続済み。データは定義ファイルと
+# 同じディレクトリの固定名 train.jsonl（必須）・evaluation.jsonl（任意）から register が取り込む。
+# 学習ワーカーは環境変数 FANDHE_EDGE_TRAINER_DIR（絶対パス）で指す（未設定なら開発ツリーの trainer/）。
+# 経路の閉じ込め（REQ-39）により、--definition・--project-dir は実行時のカレントディレクトリ配下に
+# 置くこと。package の出力先は <project-dir>/package で確定。評価データがあるときの evaluate は
+# 評価本体が未実装のため runtime_error(70) で停止する（評価済みを装わない）。
 set -eu
 
 # 期限監視のプロセスグループ隔離（set -m）と process substitution のため通常モードの
@@ -399,7 +406,7 @@ do_step() {
     status=null
     if [ "$step_rc" -eq 0 ]; then
         # 終了コード 0 でも出力を信用しない。stdout が単一の JSON オブジェクトで、
-        # トップレベルの code が "ok"（終了コード 0 と整合）であることを検証する。
+        # トップレベルに code があるなら "ok"（終了コード 0 と整合）であることを検証する。
         # 出力は skipped / ok / invalid のいずれかの固定語（evaluate は status も見る）
         verdict=$(python3 -c '
 import json, sys
@@ -408,12 +415,23 @@ try:
 except Exception:
     print("invalid")
     sys.exit(0)
-if not isinstance(v, dict) or v.get("code") != "ok":
+name = sys.argv[1]
+if not isinstance(v, dict) or not v or ("code" in v and v.get("code") != "ok"):
     print("invalid")
-elif sys.argv[1] == "evaluate" and v.get("status") == "skipped":
+elif name == "infer":
+    # infer の判定 JSON は step を持たず、status:"ok" と id・predicted_label を持つ
+    if v.get("status") == "ok" and "step" not in v and isinstance(v.get("id"), str) and isinstance(v.get("predicted_label"), str):
+        print("ok")
+    else:
+        print("invalid")
+elif v.get("step") != name:
+    print("invalid")
+elif name == "evaluate" and v.get("status") == "skipped":
     print("skipped")
-else:
+elif v.get("status") == "ok":
     print("ok")
+else:
+    print("invalid")
 ' "$name" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;
@@ -460,7 +478,13 @@ run_all() {
         i=$((i + 1))
     done
     do_step select - select --project-dir "$project_dir" || return 0
-    do_step package - package --project-dir "$project_dir" || return 0
+    # `--smoke` で短縮学習した候補は、検証専用の `--allow-smoke` を渡さないと package できない
+    # （配布用ではない。REQ-27）。
+    if [ "$smoke" -eq 1 ]; then
+        do_step package - package --project-dir "$project_dir" --allow-smoke || return 0
+    else
+        do_step package - package --project-dir "$project_dir" || return 0
+    fi
     do_step infer - infer --package "$project_dir/package" --text "$infer_text" || return 0
 }
 run_all

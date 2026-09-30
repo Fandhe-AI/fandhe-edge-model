@@ -3,23 +3,20 @@
 //!
 //! 学習するモデルの種類（`c1`・`c3`・`autoregressive`）は選択口（REQ-19）で
 //! 差し替えられる。種類固有の情報や形が CLI の出力契約へ漏れていないことを、
-//! `fandhe-edge-cli` の lib が公開する出力・変換関数（#136 が各工程の結線で
+//! `fandhe-edge-cli` の lib が公開する出力・変換関数（#136 の各工程の結線が
 //! 使うのと同じ部品）へ種類ごとの入力を流して固定する。
 //!
 //! # 証拠の種別
 //!
-//! テストハーネス（lib 経由）。バイナリ（`fandhe-edge`）での完走は #136 の
-//! 範囲で、現状の `main.rs` はどの種類でも `runtime_error`（exit 70）を返す
-//! ため、本ファイルはバイナリを起動しない。#136 の結線後にバイナリレベルへ
-//! 広げる想定。期待値の出典は PoC-16（`core-cli-vertical-slice`）の終了コード表・
+//! テストハーネス（lib 経由）。バイナリ（`fandhe-edge`）での完走は #136 で接続済みの
+//! `pipeline_e2e.rs`（偽ワーカー・c1/c3）が確認する。本ファイルはバイナリを起動しない。期待値の出典は PoC-16（`core-cli-vertical-slice`）の終了コード表・
 //! `{"code","message"}`・推論出力のキー構成で、値はリテラルで埋め込む
 //! （`docs/spec` は読まない）。
 //!
 //! # 未確定の範囲
 //!
-//! `train` の exit 0 の stdout JSON 型は未定義（#136・TASK-33.x で決まる）。
-//! 成功経路で確かめるのは「exit 0 になり異常系 JSON へ流れないこと」までで、
-//! 型が決まったら具体値のアサーションを加える。
+//! `train` の exit 0 の stdout JSON 型（`TrainReport`。#136）の具体値は `pipeline_e2e.rs` で
+//! 照合する。本ファイルが成功経路で確かめるのは「exit 0 になり異常系 JSON へ流れないこと」まで。
 
 use fandhe_edge_cli::error_report::{emit_error, emit_error_report, train_outcome_error_report};
 use fandhe_edge_cli::output::write_ok_judgment;
@@ -185,7 +182,7 @@ fn req19_train_failure_output_is_kind_invariant() {
 
 /// REQ-19・REQ-21: 成功結果は種類によらず exit 0 で、異常系 JSON へ流れず、
 /// 成果物の kind が依頼の kind と一致すること（`autoregressive` の既定 config の
-/// 照合が成立することも兼ねる）。exit 0 の stdout JSON 型は未定義（#136）。
+/// 照合が成立することも兼ねる）。exit 0 の stdout JSON 型は `TrainReport`（#136。`pipeline_e2e.rs` で照合）。
 #[test]
 fn req19_train_success_is_exit_ok_for_every_kind() {
     for kind in KINDS {

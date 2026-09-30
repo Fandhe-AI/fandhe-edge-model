@@ -1,7 +1,7 @@
 //! CLI バイナリの引数解析の結合テスト（REQ-33・TASK-33.1-1）。
 //!
-//! 工程の実行は TASK-33.1-2（#136）で接続するため、解析に成功したコマンドは
-//! 現状 `runtime_error`（70）を返す。#136 でこの期待を置き換える。
+//! 工程の実行は TASK-33.1-2（#136）で接続済み。ここでは存在しないパスを渡した解析成功コマンドが
+//! `invalid_input`（64）の JSON 1 行で終わることだけを確認する（7 工程の完走は `pipeline_e2e.rs`）。
 
 use fandhe_edge_cli::args::{Subcommand, options};
 use std::process::{Command, Output};
@@ -71,7 +71,7 @@ fn req33_conflicting_infer_source_is_invalid_input() {
 }
 
 #[test]
-fn req33_parsed_command_reports_not_implemented() {
+fn req33_parsed_command_with_missing_input_is_invalid_input() {
     let o = run(&[
         "register",
         "--definition",
@@ -79,8 +79,8 @@ fn req33_parsed_command_reports_not_implemented() {
         "--project-dir",
         "proj",
     ]);
-    assert_eq!(o.status.code(), Some(70));
-    one_json_line(&o, "runtime_error");
+    assert_eq!(o.status.code(), Some(64));
+    one_json_line(&o, "invalid_input");
 }
 
 #[cfg(unix)]
@@ -96,9 +96,8 @@ fn req33_non_utf8_argument_does_not_panic() {
     one_json_line(&o, "invalid_input");
 }
 
-/// REQ-33: 解析に成功した 7 サブコマンドはいずれも stdout へちょうど 1 行の JSON だけを出す
-/// （1 行 1 JSON の例外は `infer --input-file` の実行が接続される #136 以降で、成功時のみ
-/// `infer_batch` が担う。それ以外の出力形を変えていないことの回帰確認。TASK-33.4）。
+/// REQ-33: 解析に成功した 7 サブコマンドはいずれも（入力が無ければ）stdout へちょうど 1 行の
+/// JSON だけを出す（1 行 1 JSON の例外は成功時の `infer --input-file` のみ。TASK-33.4）。
 #[test]
 fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
     let cases: [&[&str]; 8] = [
@@ -118,13 +117,8 @@ fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
             1,
             "args: {args:?}"
         );
-        // infer は経路ガード（REQ-39・#159）が未存在の package を先に拒否する。それ以外は
-        // 工程未接続の runtime_error（#136 で置き換える）。
-        let expected = if args[0] == "infer" {
-            "invalid_input"
-        } else {
-            "runtime_error"
-        };
-        one_json_line(&o, expected);
+        // どの工程も、存在しないパスは経路の閉じ込め（REQ-39）が invalid_input で拒否する。
+        assert_eq!(o.status.code(), Some(64), "args: {args:?}");
+        one_json_line(&o, "invalid_input");
     }
 }

@@ -108,6 +108,176 @@ impl ConfinedPackage {
     }
 }
 
+impl ConfinedPackage {
+    /// 新規ファイルを作って書き込み用に返す（既存・symlink は拒否）。親は保持 fd 起点で辿る
+    /// （検証後の親の差し替えでも外へ書かない。REQ-39）。Linux・macOS 以外は拒否（fail-closed）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::create_new_member`] と同じ。
+    pub fn create_new_member(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.create_new_member(member)
+        }
+    }
+
+    /// ディレクトリを所有者のみ（0700）で新規作成する（既存なら拒否）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::create_dir_member`] と同じ。
+    pub fn create_dir_member(&self, member: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.create_dir_member(member)
+        }
+    }
+
+    /// 書き込み失敗後の片付け用にファイルを削除する。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::remove_file_member`] と同じ。
+    pub fn remove_file_member(&self, member: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.remove_file_member(member)
+        }
+    }
+}
+
+impl ConfinedPackage {
+    /// 保持しているディレクトリ fd 自身のメタデータ（mode・所有者。パスを再解決しない）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::metadata`] と同じ。Linux・macOS 以外は `Unsupported`。
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.metadata()
+        }
+    }
+
+    /// `member` を追記モードで開く（読み取り専用配置の書き込み拒否プローブ用。作成しない）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_member_append`] と同じ。
+    pub fn open_member_append(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.open_member_append(member)
+        }
+    }
+}
+
+impl ConfinedPackage {
+    /// `member`（本パッケージ配下のディレクトリ）を fd 起点で開き、その fd を保持する新しい
+    /// [`ConfinedPackage`] を返す（作成直後のディレクトリの同一性を fd で握る。REQ-39）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_dir_member`] と同じ。
+    pub fn open_subdir(&self, member: &Path) -> Result<ConfinedPackage, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let handle = self.handle.open_dir_member(member)?;
+            if !handle.as_path().starts_with(&self.workspace) {
+                return Err(PathRejection::Escapes {
+                    candidate: member.to_path_buf(),
+                    kind: EscapeKind::Symlink,
+                });
+            }
+            Ok(ConfinedPackage {
+                workspace: self.workspace.clone(),
+                dir: ConfinedPath::from_verified(handle.as_path().to_path_buf()),
+                handle,
+            })
+        }
+    }
+
+    /// 本パッケージ配下の `from` を `to` へ名前替えする（ステージングの原子的な公開。REQ-39）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::rename_member`] と同じ。
+    pub fn rename_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (from, to);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.rename_member(from, to)
+        }
+    }
+
+    /// 本パッケージの中身を、保持した fd 起点で再帰的に削除する（本ディレクトリは残す）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::clear_contents`] と同じ。
+    pub fn clear_contents(&self) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.clear_contents()
+        }
+    }
+
+    /// `member` が `created`（本工程が作って fd を保持しているディレクトリ）と同一の実体で、
+    /// かつ空のときだけ削除する。差し替えられていれば何も消さず `Ok(false)`。
+    ///
+    /// # Errors
+    /// 経路の拒否・削除失敗。
+    pub fn remove_empty_dir_member_if_same(
+        &self,
+        member: &Path,
+        created: &ConfinedPackage,
+    ) -> Result<bool, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (member, created);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if !self.handle.is_same_dir_member(member, &created.handle)? {
+                return Ok(false);
+            }
+            self.handle.remove_empty_dir_member(member)?;
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
@@ -136,6 +306,218 @@ mod tests {
         let mut s = String::new();
         f.read_to_string(&mut s).expect("read");
         assert_eq!(s, "original");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: `confine_package` の後に子ディレクトリが外部へ向く symlink へ差し替えられても、
+    /// `create_new_member` / `create_dir_member` は外へ書かず拒否する。
+    #[test]
+    fn req39_create_member_rejects_parent_swapped_to_symlink() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-wswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg/data")).expect("mkdir");
+        std::fs::create_dir_all(base.join("outside")).expect("mkdir");
+
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        std::fs::remove_dir(base.join("pkg/data")).expect("rmdir");
+        symlink(base.join("outside"), base.join("pkg/data")).expect("symlink");
+
+        let file = pkg.create_new_member(Path::new("data/x.json"));
+        assert!(
+            matches!(file, Err(PathRejection::Escapes { .. })),
+            "{file:?}"
+        );
+        let dir = pkg.create_dir_member(Path::new("data/sub"));
+        assert!(matches!(dir, Err(PathRejection::Escapes { .. })), "{dir:?}");
+        assert!(!base.join("outside/x.json").exists());
+        assert!(!base.join("outside/sub").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: `confine_package` の後にパッケージのディレクトリ自体が移動されたら、書き込み系
+    /// （`create_new_member`・`create_dir_member`・`remove_file_member`）は移動後の場所へ書かず拒否する。
+    #[test]
+    fn req39_write_rejects_package_dir_moved_after_confine() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-wmoved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg/data")).expect("mkdir");
+        std::fs::write(base.join("pkg/old.txt"), b"x").expect("write");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        std::fs::create_dir_all(base.join("elsewhere")).expect("mkdir");
+        std::fs::rename(base.join("pkg"), base.join("elsewhere/pkg")).expect("move");
+
+        for rel in ["new.txt", "data/new.txt"] {
+            let r = pkg.create_new_member(Path::new(rel));
+            assert!(matches!(r, Err(PathRejection::Escapes { .. })), "{r:?}");
+        }
+        let d = pkg.create_dir_member(Path::new("sub"));
+        assert!(matches!(d, Err(PathRejection::Escapes { .. })), "{d:?}");
+        let rm = pkg.remove_file_member(Path::new("old.txt"));
+        assert!(matches!(rm, Err(PathRejection::Escapes { .. })), "{rm:?}");
+        assert!(!base.join("elsewhere/pkg/new.txt").exists());
+        assert!(!base.join("elsewhere/pkg/data/new.txt").exists());
+        assert!(!base.join("elsewhere/pkg/sub").exists());
+        assert!(base.join("elsewhere/pkg/old.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 既存の名前（symlink を含む）は上書きせず `AlreadyExists` で拒否し、`..` は拒否する。
+    /// 書き込み後の `remove_file_member` でファイルが消える。
+    #[test]
+    fn req39_create_member_exclusive_and_confined_names() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-wexcl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg")).expect("mkdir");
+        std::fs::write(base.join("target.txt"), b"keep").expect("write");
+        symlink(base.join("target.txt"), base.join("pkg/link")).expect("symlink");
+
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        let e = pkg
+            .create_new_member(Path::new("link"))
+            .expect_err("exists");
+        assert!(
+            matches!(&e, PathRejection::Unresolvable { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "{e:?}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("target.txt")).expect("read"),
+            b"keep"
+        );
+        assert!(matches!(
+            pkg.create_new_member(Path::new("../evil")),
+            Err(PathRejection::Escapes { .. })
+        ));
+        pkg.create_new_member(Path::new("new.txt")).expect("create");
+        assert!(base.join("pkg/new.txt").exists());
+        pkg.remove_file_member(Path::new("new.txt"))
+            .expect("remove");
+        assert!(!base.join("pkg/new.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 保持 fd 起点の後始末は、名前が別ディレクトリへ差し替えられても差し替え先を消さない。
+    #[test]
+    fn req39_remove_created_dir_leaves_swapped_directory_untouched() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rmswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir");
+        let ws = confine_package(&base, Path::new("ws")).expect("confine");
+        ws.create_dir_member(Path::new("made")).expect("mkdirat");
+        ws.create_new_member(Path::new("made/a.txt")).expect("file");
+        let created = ws.open_subdir(Path::new("made")).expect("open subdir");
+
+        // 作成後に、同名を別の実ディレクトリ（中身あり）へ差し替える。
+        std::fs::rename(base.join("ws/made"), base.join("ws/made_orig")).expect("rename");
+        std::fs::create_dir(base.join("ws/made")).expect("mkdir swapped");
+        std::fs::write(base.join("ws/made/victim.txt"), b"keep").expect("write");
+
+        created.clear_contents().expect("clear via fd");
+        let removed = ws
+            .remove_empty_dir_member_if_same(Path::new("made"), &created)
+            .expect("compare");
+        assert!(!removed);
+        assert_eq!(
+            std::fs::read(base.join("ws/made/victim.txt")).expect("victim"),
+            b"keep"
+        );
+        // 保持していた実体（移動後の made_orig）の中身は消えている。
+        assert!(!base.join("ws/made_orig/a.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 差し替えが無ければ、中身（入れ子・symlink を含む）ごと作成したディレクトリを消す。
+    /// symlink は追従せず、リンク先は消さない。
+    #[test]
+    fn req39_remove_created_dir_removes_tree_without_following_symlink() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rmtree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir");
+        std::fs::create_dir_all(base.join("outside")).expect("mkdir");
+        std::fs::write(base.join("outside/keep.txt"), b"keep").expect("write");
+        let ws = confine_package(&base, Path::new("ws")).expect("confine");
+        ws.create_dir_member(Path::new("made")).expect("mkdirat");
+        ws.create_dir_member(Path::new("made/sub"))
+            .expect("mkdirat");
+        ws.create_new_member(Path::new("made/sub/a.txt"))
+            .expect("file");
+        symlink(base.join("outside"), base.join("ws/made/link")).expect("symlink");
+        let created = ws.open_subdir(Path::new("made")).expect("open subdir");
+
+        created.clear_contents().expect("clear");
+        let removed = ws
+            .remove_empty_dir_member_if_same(Path::new("made"), &created)
+            .expect("remove");
+        assert!(removed);
+        assert!(!base.join("ws/made").exists());
+        assert_eq!(
+            std::fs::read(base.join("outside/keep.txt")).expect("keep"),
+            b"keep"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: `rename_member` は保持 fd 起点でディレクトリを名前替えし、公開先が既にあれば
+    /// （Linux では空でも）置き換えない。`..` を含む宛先は拒否する。
+    #[test]
+    fn req39_rename_member_publishes_without_replacing() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg/stage")).expect("mkdir");
+        std::fs::write(base.join("pkg/stage/a"), b"x").expect("write");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+
+        pkg.rename_member(Path::new("stage"), Path::new("done"))
+            .expect("rename");
+        assert_eq!(std::fs::read(base.join("pkg/done/a")).expect("read"), b"x");
+        assert!(!base.join("pkg/stage").exists());
+
+        {
+            std::fs::create_dir_all(base.join("pkg/stage2")).expect("mkdir");
+            let err = pkg
+                .rename_member(Path::new("stage2"), Path::new("done"))
+                .expect_err("must not replace");
+            assert!(matches!(
+                err,
+                PathRejection::Unresolvable { ref source, .. }
+                    if source.kind() == std::io::ErrorKind::AlreadyExists
+            ));
+        }
+        assert!(
+            pkg.rename_member(Path::new("done"), Path::new("../escaped"))
+                .is_err()
+        );
+        assert!(!base.join("escaped").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 追記プローブは、書き込める通常ファイルなら開け、0400 にすると `PermissionDenied`
+    /// （root 以外）になり、symlink は辿らず拒否する。`metadata` は保持 fd 自身のもの。
+    #[test]
+    fn req39_open_member_append_probe_and_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!("fandhe-guard-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg")).expect("mkdir");
+        std::fs::write(base.join("pkg/f"), b"x").expect("write");
+        symlink(base.join("pkg/f"), base.join("pkg/link")).expect("symlink");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        assert!(pkg.open_member_append(Path::new("f")).is_ok());
+        assert!(pkg.open_member_append(Path::new("link")).is_err());
+        assert!(pkg.open_member_append(Path::new("../f")).is_err());
+        assert!(pkg.metadata().expect("metadata").is_dir());
+        std::fs::set_permissions(base.join("pkg/f"), std::fs::Permissions::from_mode(0o400))
+            .expect("chmod");
+        let denied = pkg.open_member_append(Path::new("f"));
+        let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+        if !is_root {
+            assert!(matches!(
+                denied,
+                Err(PathRejection::Unresolvable { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }

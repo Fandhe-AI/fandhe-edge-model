@@ -194,6 +194,15 @@ impl From<FsError> for LoadFreezeRecordError {
 }
 
 impl FreezeRecord {
+    /// 凍結記録を JSON 文字列（[`FreezeRecord::parse`] で読み戻せる形）へ直列化する
+    /// （CLI の `register` が `eval_freeze.json` へ保存する。TASK-33.1-2・#136）。
+    ///
+    /// # Errors
+    /// 直列化に失敗した場合（実務上は起こらない）。
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
     /// 凍結記録の JSON 文字列を、パース前にバイト数を検証してから読み込む
     /// （REQ-39・REQ-17）。
     ///
