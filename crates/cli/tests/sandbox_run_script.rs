@@ -312,7 +312,8 @@ fn req38_all_stages_complete_under_fake_sandbox() {
     );
 }
 
-/// `--candidates 2` で train が候補 0・1 の順に実行され、select の後に選定候補だけが evaluate される（REQ-27）。
+/// `--candidates 2 --smoke` で train が候補 0・1 の順に実行され、select の後は evaluate を起動せず
+/// skipped と記録して package へ進む（smoke 候補は評価できない。REQ-27）。
 #[test]
 fn req38_candidates_param_runs_each_candidate() {
     let e = Env::new();
@@ -328,10 +329,16 @@ fn req38_candidates_param_runs_each_candidate() {
             "train 0",
             "train 1",
             "select -",
-            "evaluate 0",
             "package -",
             "infer -"
         ]
+    );
+    // smoke 候補は評価できないため evaluate は起動せず、集計には skipped として残す（REQ-17・REQ-27）。
+    assert!(
+        o.stdout
+            .contains("{\"step\":\"evaluate\",\"candidate\":0,\"exit_code\":0,\"code\":\"ok\",\"status\":\"skipped\"}"),
+        "{}",
+        o.stdout
     );
 }
 

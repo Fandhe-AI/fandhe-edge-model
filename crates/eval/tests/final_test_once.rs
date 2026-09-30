@@ -1262,3 +1262,49 @@ fn req27_scope_dir_is_created_0700() {
     assert_eq!(mode_of(&scopes[0]), 0o700);
     assert_eq!(scopes[0].file_name().unwrap().len(), 64);
 }
+
+/// REQ-27: `is_applied` は、登録だけでは偽・適用後は真・別の重みや別の構成では偽になる。
+#[test]
+fn req27_is_applied_reflects_ledger_state() {
+    let dir = TempDir::new("is-applied");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    let w = Sha256Digest::of_bytes(b"w1");
+    // 未登録。
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+    register(&ledger, DATA, &[("c1:seed0", b"w1"), ("c2:seed0", b"w2")]);
+    // 登録のみ（未適用）。
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
+    assert!(ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+    // 別の構成・別の重みは適用済みではない。
+    let w2 = Sha256Digest::of_bytes(b"w2");
+    assert!(!ledger.is_applied(&digest, &id("c2:seed0"), &w2).unwrap());
+    let other = Sha256Digest::of_bytes(b"x");
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &other).unwrap());
+}
+
+/// REQ-27: ロックの記録が食い違う（改変された）場合は `RegistryTampered`（fail-closed）。
+#[test]
+fn req27_is_applied_rejects_tampered_lock_record() {
+    let dir = TempDir::new("is-applied-tamper");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
+    let scope = dir.scope_dirs().remove(0);
+    for entry in fs::read_dir(&scope).unwrap() {
+        let p = entry.unwrap().path();
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        if name.starts_with("config-") && name.ends_with(".lock") {
+            fs::write(&p, "garbage\n").unwrap();
+        }
+    }
+    let r = ledger.is_applied(&digest, &id("c1:seed0"), &Sha256Digest::of_bytes(b"w1"));
+    assert!(
+        matches!(r, Err(AcquireError::RegistryTampered { .. })),
+        "{r:?}"
+    );
+}

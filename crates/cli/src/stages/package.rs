@@ -8,7 +8,8 @@
 //!    （`candidates/<N>/evaluation_record.json`。`evaluate` が書く。#314）が無い限り
 //!    `invalid_input`（`evaluation has not been completed`）で拒否し、記録の ONNX・`artifact.json`・
 //!    評価データ・定義のハッシュが今の実体と一致しなければ
-//!    `evaluation record does not match the package` で拒否する（成果物を読んだ後・ステージングを
+//!    `evaluation record does not match the package` で拒否し、最終 test の台帳に適用完了が
+//!    記録されていなければ `evaluation has not been completed` で拒否する（成果物を読んだ後・ステージングを
 //!    作る前に確認する。[`verify_evaluation_record`]。REQ-27）
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
@@ -20,7 +21,8 @@
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //!    あわせて、公開前に `infer` と同じ検証（ガード層の形式許可リスト・ONNX の読み込み。
 //!    [`super::infer::load_backend`]）を通す
-//!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）
+//!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）。
+//!    `--allow-smoke` の検証専用パッケージは最終 test を適用できないため、評価完了の確認を行わない
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
 //! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
@@ -45,6 +47,7 @@ use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECOR
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::FreezeRecord;
+use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
@@ -57,7 +60,7 @@ use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
 use crate::args::PackageArgs;
-use crate::error_report::ToErrorReport;
+use crate::error_report::{ToErrorReport, acquire_error_report};
 use crate::project::{
     CreatedDir, DEFINITION_FILE, EVALUATION_RECORD_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project,
     SELECTION_FILE, invalid, parse_definition, runtime,
@@ -68,6 +71,7 @@ use super::candidate_artifact::{
 };
 
 use super::infer::load_backend;
+use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
@@ -155,7 +159,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 
     // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
     // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
-    if let Some((freeze, _)) = &frozen {
+    // `--allow-smoke` の検証専用パッケージ（短縮学習の候補）は最終 test を適用できない
+    // （`evaluate` が拒否する）ため評価完了の確認を行わない。配布用ではなく、明示した場合のみ
+    // ここへ来る（上で `--allow-smoke` なしの smoke 候補は拒否済み。REQ-27）。
+    let smoke_validation_only = request_is_smoke_trained(&request, &candidate.params);
+    if let Some((freeze, _)) = frozen.as_ref().filter(|_| !smoke_validation_only) {
         verify_evaluation_record(
             &project,
             &selection,
@@ -163,6 +171,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
             &definition,
             &meta_bytes,
             &onnx_bytes,
+            &format!("{}:seed{}", candidate.candidate_id, seed),
         )?;
     }
 
@@ -207,7 +216,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 /// `evaluation record is invalid`、いずれかの値が一致しなければ
 /// `evaluation record does not match the package`（いずれも `invalid_input`）。
 ///
-/// **記録ファイル自体はプロジェクトへ書き込める主体なら作り直せる**ため、本確認は外部台帳による
+/// 記録ファイルに加えて、最終 test の台帳（`final_test_ledger/`。適用ロックと封印つき事前登録）が
+/// その代表構成・重みの適用完了を記録していることを照合する（台帳に完了が無ければ
+/// `evaluation has not been completed`。記録の偽造だけでは公開できない）。
+///
+/// **台帳ファイル自体もプロジェクトへ書き込める主体なら丸ごと作り直せる**ため、本確認は外部台帳による
 /// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
 fn verify_evaluation_record(
     project: &Project,
@@ -216,6 +229,7 @@ fn verify_evaluation_record(
     definition: &Definition,
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
+    config_id: &str,
 ) -> Result<(), ErrorReport> {
     let rel = candidate_rel(selection.candidate_index).join(EVALUATION_RECORD_FILE);
     let Some(bytes) = project.read_optional(&rel, MAX_EVALUATION_RECORD_BYTES)? else {
@@ -236,6 +250,21 @@ fn verify_evaluation_record(
         && record.definition_sha256 == definition_sha256;
     if !matches {
         return Err(invalid("evaluation record does not match the package"));
+    }
+    // 記録ファイルだけでは偽造できてしまうため、最終 test の台帳（ロックと封印つき事前登録）が
+    // この評価データ × 代表構成 × 重みの適用完了を記録していることを必ず照合する（REQ-27）。
+    let config_id =
+        RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
+    let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
+    let applied = match HeldLedger::open(project, false)? {
+        Some(held) => held
+            .ledger()?
+            .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
+            .map_err(|e| acquire_error_report(&e))?,
+        None => false,
+    };
+    if !applied {
+        return Err(invalid("evaluation has not been completed"));
     }
     Ok(())
 }

@@ -42,6 +42,7 @@ pub mod candidate_artifact;
 pub mod evaluate;
 pub mod infer;
 pub mod inspect;
+mod ledger;
 pub mod package;
 pub mod register;
 pub mod select;

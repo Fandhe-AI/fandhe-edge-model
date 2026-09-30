@@ -468,6 +468,16 @@ else:
 
 started=$(utc_now)
 
+# smoke 時に実行しない evaluate を、skipped の工程として記録する（工程は起動しない。exit 0）
+record_skipped_evaluate() {
+    step_no=$((step_no + 1))
+    t_skip=$(utc_now)
+    entry=$(printf '{"step":"evaluate","candidate":%s,"exit_code":0,"code":"ok","status":"skipped"}' "$1")
+    steps_json="${steps_json:+$steps_json,}$entry"
+    meta_entry=$(printf '{"step":"evaluate","candidate":%s,"exit_code":0,"code":"ok","status":"skipped","started_utc":"%s","ended_utc":"%s","stdout_bytes":0,"stderr_bytes":0}' "$1" "$t_skip" "$t_skip")
+    steps_meta="${steps_meta:+$steps_meta,}$meta_entry"
+}
+
 # 7 工程を順に実行する（選定を評価より先に行う。REQ-27）。途中の失敗で停止する（以降の工程は起動しない。fail-closed）
 run_all() {
     do_step register - register --definition "$definition" --project-dir "$project_dir" || return 0
@@ -485,9 +495,16 @@ run_all() {
     # 選定された候補だけを evaluate する（evaluate は選定記録のない候補を拒否する。REQ-27）
     selected_candidate=
     do_step select - select --project-dir "$project_dir" || return 0
-    do_step evaluate "$selected_candidate" evaluate --project-dir "$project_dir" --candidate "$selected_candidate" || return 0
+    if [ "$smoke" -eq 1 ]; then
+        # `--smoke` の短縮学習候補は最終 test を適用できない（evaluate が拒否する。検証専用モデルが
+        # 本番候補の構成ロックを使い切らないため）。評価は実行せず、評価未実施を skipped として
+        # 記録する（評価済みを装わない。REQ-17・REQ-27）。
+        record_skipped_evaluate "$selected_candidate"
+    else
+        do_step evaluate "$selected_candidate" evaluate --project-dir "$project_dir" --candidate "$selected_candidate" || return 0
+    fi
     # `--smoke` で短縮学習した候補は、検証専用の `--allow-smoke` を渡さないと package できない
-    # （配布用ではない。REQ-27）。
+    # （配布用ではない。REQ-27。package は smoke 候補の評価完了の確認を行わない）。
     if [ "$smoke" -eq 1 ]; then
         do_step package - package --project-dir "$project_dir" --allow-smoke || return 0
     else

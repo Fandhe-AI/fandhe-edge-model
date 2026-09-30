@@ -32,12 +32,14 @@
 //! # 評価完了の記録
 //!
 //! 成功時は `candidates/<N>/evaluation_record.json`（[`EvaluationRecord`]）を新規に書く。`package` は
-//! 記録とモデル・`artifact.json`・評価データ・定義のハッシュの一致を確認してから公開する。
+//! 記録とモデル・`artifact.json`・評価データ・定義のハッシュの一致と、最終 test の台帳での適用完了を確認してから公開する。
 //! 記録ファイル自体はプロジェクトに書き込める主体なら作り直せる（外部台帳は #168・TASK-39.3-2。
 //! 本工程は検証済みとしない）。評価器のパスベース API は `O_NOFOLLOW` の成分走査をしないため、
 //! 閉じ込めつきで読み検証したバイト列（評価データ・重み）を私用の一時ディレクトリ（0700）へ複製し、
 //! そのパスだけを評価器へ渡す（プロジェクト内のパスを渡さない。REQ-39）。最終 test の台帳
-//! ディレクトリは評価器のパスベース API で開くため、差し替え対策は未了（#168 の範囲）。
+//! ディレクトリは保持 fd 起点で開き、使う直前ごとに保持 fd とパスの実体（dev・ino）の一致を確認する
+//! （[`super::ledger::HeldLedger`]）。評価器の台帳 API がパスを受け取るため、確認と台帳操作の間の
+//! 差し替えは原理的に残る（fd 相対の台帳 API は #168 の範囲）。
 //!
 //! # 選定との順序（REQ-27）
 //!
@@ -83,8 +85,7 @@ use crate::error_report::{
 };
 use crate::infer_batch::judgment_from_prediction;
 use crate::project::{
-    EVALUATION_RECORD_FILE, FINAL_TEST_LEDGER_DIR, Project, SELECTION_FILE, fail, inspect_bytes,
-    invalid, runtime,
+    EVALUATION_RECORD_FILE, Project, SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -93,6 +94,7 @@ use super::candidate_artifact::{
 };
 use super::infer::load_backend;
 use super::inspect::load_frozen_evaluation;
+use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
@@ -200,14 +202,19 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .to_hex();
     let onnx_digest = Sha256Digest::of_bytes(&target.artifact.onnx_bytes);
 
-    let ledger = open_ledger(&project)?;
-    match ledger.register_configs(&freeze.sha256(), &entries) {
+    // 台帳は保持 fd 起点で開き、使う直前ごとに同一性を確認する（REQ-39。[`HeldLedger`]）。
+    let held_ledger = HeldLedger::open(&project, true)?
+        .ok_or_else(|| runtime("cannot open final test ledger"))?;
+    match held_ledger
+        .ledger()?
+        .register_configs(&freeze.sha256(), &entries)
+    {
         Ok(()) | Err(AcquireError::AlreadyRegistered { .. }) => {}
         Err(e) => return Err(acquire_error_report(&e)),
     }
 
     let applied = apply_to_frozen_data(
-        &ledger,
+        held_ledger.ledger()?,
         &freeze,
         &definition,
         &eval_bytes,
@@ -348,21 +355,6 @@ fn check_candidate_artifact(
         request.kind_version(),
         request.max_bytes(),
     )
-}
-
-/// 最終 test の台帳ディレクトリを（無ければ 0700 で作って）開く。
-fn open_ledger(project: &Project) -> Result<FinalTestLedger, ErrorReport> {
-    if !project.exists(FINAL_TEST_LEDGER_DIR)? {
-        // 最初の `evaluate` が同時に走ると後発の作成は「既存」で失敗する。作成に失敗しても
-        // 既にディレクトリがあれば（先行プロセスが作った）開き直す。
-        if let Err(e) = project.create_dir(FINAL_TEST_LEDGER_DIR)
-            && !project.exists(FINAL_TEST_LEDGER_DIR)?
-        {
-            return Err(e);
-        }
-    }
-    FinalTestLedger::open(&project.path(FINAL_TEST_LEDGER_DIR))
-        .map_err(|e| acquire_error_report(&e))
 }
 
 /// 評価データの分解の失敗（本文・行番号を含まない）。
@@ -511,6 +503,7 @@ impl StagedFiles {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             let dir = base.join(name);
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

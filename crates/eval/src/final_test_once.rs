@@ -870,6 +870,78 @@ impl FinalTestLedger {
             config_lock: cfg_path,
         })
     }
+
+    /// 代表構成 `config_id`・重み `weights_sha256` の最終 test 適用が、この台帳で完了しているかを返す
+    /// （REQ-27。`package` が評価完了の根拠にする読み取り専用の照会）。
+    ///
+    /// 事前登録（封印・読み取り専用・既存ロックの登録ダイジェスト）を [`apply_once`] と同じ検査で
+    /// 読み、登録された重みが `weights_sha256` と一致し、代表構成ロックと重みロックの両方が
+    /// 評価データ・代表構成 ID・重み・登録ダイジェストを正しく記録しているときだけ `Ok(true)`。
+    /// 未登録・ロックが無い（または記録が空の消費済み残骸）場合は `Ok(false)`。
+    /// 記録が壊れている・食い違う場合は [`AcquireError::RegistryTampered`]（fail-closed）。
+    ///
+    /// 台帳のファイルへ書き込める主体による丸ごとの偽造は防げない（外部台帳は #168・TASK-39.3-2）。
+    ///
+    /// # Errors
+    /// 台帳の読み取り失敗・改変の検出（[`AcquireError`]）。
+    pub fn is_applied(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+        config_id: &RepresentativeConfigId,
+        weights_sha256: &Sha256Digest,
+    ) -> Result<bool, AcquireError> {
+        let (registered, sealed) = match self.load_registry(eval_data_sha256) {
+            Ok(v) => v,
+            Err(AcquireError::NotRegistered) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let Some(entry) = registered.iter().find(|e| &e.id == config_id) else {
+            return Ok(false);
+        };
+        if &entry.weights_sha256 != weights_sha256 {
+            return Ok(false);
+        }
+        let key = FinalTestKey {
+            eval_data_sha256: *eval_data_sha256,
+            config_id: config_id.clone(),
+            weights_sha256: *weights_sha256,
+        };
+        let sdir = self.scope_dir(eval_data_sha256);
+        let tampered = |reason| AcquireError::RegistryTampered { reason };
+        for (name, kind) in [
+            (key.config_lock_name(), "config"),
+            (key.weights_lock_name(), "weights"),
+        ] {
+            let bytes =
+                match fandhe_edge_core::fs::read_bounded(&sdir.join(name), MAX_LOCK_RECORD_BYTES) {
+                    Ok(b) => b,
+                    Err(FsError::Read { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(_) => return Err(tampered("application lock is unreadable")),
+                };
+            if bytes.is_empty() {
+                return Ok(false);
+            }
+            let text =
+                String::from_utf8(bytes).map_err(|_| tampered("application lock is malformed"))?;
+            let field = |k: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('=')))
+            };
+            let matches = field("lock") == Some(kind)
+                && field("eval_data_sha256") == Some(eval_data_sha256.to_hex().as_str())
+                && field("representative_config_id") == Some(config_id.as_str())
+                && field("weights_sha256") == Some(weights_sha256.to_hex().as_str())
+                && field("registry_sha256") == Some(sealed.to_hex().as_str());
+            if !matches {
+                return Err(tampered("application lock does not match the application"));
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// 評価データの分解失敗を表す理由なしの標識（REQ-27・REQ-39）。

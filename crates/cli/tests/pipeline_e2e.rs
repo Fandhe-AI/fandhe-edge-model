@@ -1256,6 +1256,21 @@ mod suite {
         assert!(!env.project_file("package.staging").exists());
     }
 
+    /// REQ-27: 評価完了記録が実体と一致していても、最終 test の台帳に適用完了が無ければ（台帳を消した・
+    /// 記録だけを用意した）`package` は拒否し、`package/` を作らない（記録の偽造では公開できない）。
+    pub fn package_rejects_record_without_ledger_completion() {
+        let env = eval_trained("pkgnoledger");
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        std::fs::remove_dir_all(env.project_file("final_test_ledger")).expect("remove ledger");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation has not been completed\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
     /// REQ-27: 評価完了記録のハッシュ・候補の値が実体と食い違う、または未知キーを含む場合、
     /// `package` は拒否し `package/` を作らない。元に戻せば成功する。
     pub fn package_rejects_tampered_evaluation_record() {
@@ -1421,6 +1436,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_when_selected_candidate_not_evaluated",
             suite::package_rejects_when_selected_candidate_not_evaluated,
+        ),
+        (
+            "package_rejects_record_without_ledger_completion",
+            suite::package_rejects_record_without_ledger_completion,
         ),
         (
             "package_rejects_tampered_evaluation_record",
