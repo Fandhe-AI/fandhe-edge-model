@@ -65,8 +65,9 @@
 //! 成功として扱う。責務分担は [`process`] のモジュール doc）。後続・未実装:
 //! `SIGTERM` による graceful cancel（依存追加か `unsafe` が要りユーザー承認事項）・
 //! キャンセルの終了コード写像（TASK-33.x）・探索途中のキャンセル伝播・
-//! `SIGKILL` フォールバック後に残る予約の掃除とやり直しの案内（#147）・
-//! `job.json` 永続化とクラッシュ検出（#146）。
+//! `job.json` 永続化とクラッシュ検出（#146）。やり直しの案内は [`restart`]
+//! （再開は提供せず、`SIGKILL` フォールバック後に残る予約は自動で掃除せず案内する。
+//! TASK-34.3・#147）。
 //!
 //! # スコープ外（#178 以降も対象外）
 //!
@@ -109,6 +110,8 @@ pub mod kind_resolution;
 pub mod limits;
 pub mod process;
 pub mod request;
+// 中断ジョブへの再開非提供・やり直し案内（REQ-34・TASK-34.3・#147）。
+pub mod restart;
 pub mod result;
 pub mod search;
 // 選定結果への McNemar・Holm 有意性判定の付与（評価器
