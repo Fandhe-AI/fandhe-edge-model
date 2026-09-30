@@ -9,12 +9,12 @@
 //! # 責務境界
 //!
 //! - 検査するのは `kind` だけ。`kind_version` の許可リストは TASK-39.6（#174）で扱う
-//! - JSON 上で `kind` が欠落している・文字列でない場合は呼び出し側（CLI 統合 TASK-39.2-4・#156）の
+//! - JSON 上で `kind` が欠落している・文字列でない場合は呼び出し側（CLI の `infer` 統合 TASK-39.2-4・#156。欠落は必須違反として拒否）の
 //!   解析エラーとして扱い、本 API は `&str` を受け取る
 //! - 既定の許可集合は学習ワーカーの選択口（TASK-19.1 の `_registry`）と同じ。ずれは
 //!   `crates/train/tests/guard_kind_allowlist_sync.rs` が共有 fixture 経由で機械的に検出する
 //! - 拒否メッセージには入力値を埋め込まない（ログインジェクション・データ転記の防止）
-//! - 拒否は既存の終了コード `invalid_input`（64）に写す（REQ-21）。CLI への接続は #156
+//! - 拒否は既存の終了コード `invalid_input`（64）に写す（REQ-21）。CLI への接続は #156 で `infer` の `artifact.json` へ統合済み
 
 use fandhe_edge_core::exitcode::ExitCode;
 use std::collections::BTreeSet;
