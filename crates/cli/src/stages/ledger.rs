@@ -80,3 +80,124 @@ impl HeldLedger {
         Err(runtime("unsupported platform"))
     }
 }
+
+/// 台帳・評価記録の差し替え検出の回帰テスト（REQ-39・REQ-27・#314）。
+///
+/// 検証するのは「検証後にディレクトリを symlink へ差し替えても、プロジェクト外を読み書きしない」
+/// ことの検出であり、評価器の台帳 API（パスベース）内部の競合窓そのものではない（#168）。
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use fandhe_edge_core::exitcode::ExitCode;
+
+    use super::*;
+    use crate::project::{CANDIDATES_DIR, EVALUATION_RECORD_FILE};
+
+    /// テスト用の作業ディレクトリ（cwd 役）。Drop で片付ける。
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "fandhe-edge-ledger-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch");
+            let real = std::fs::canonicalize(&dir).expect("canonicalize scratch");
+            Self(real)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// REQ-39: 台帳ディレクトリを外部への symlink へ差し替えると、台帳の使用前確認が
+    /// `invalid_input`（64）で拒否し、外部ディレクトリには何も作られない。
+    #[test]
+    fn req39_swapped_ledger_dir_symlink_is_rejected() {
+        let scratch = Scratch::new();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside dir");
+        let project = Project::create(scratch.path(), Path::new("proj")).expect("create project");
+        let held = HeldLedger::open(&project, true)
+            .expect("open ledger")
+            .expect("ledger is created");
+        assert!(held.ledger().is_ok());
+
+        let ledger_path = scratch.path().join("proj").join(FINAL_TEST_LEDGER_DIR);
+        std::fs::remove_dir_all(&ledger_path).expect("remove ledger");
+        std::os::unix::fs::symlink(&outside, &ledger_path).expect("symlink swap");
+
+        let Err(err) = held.ledger() else {
+            panic!("swap must be detected");
+        };
+        assert_eq!(err.code, ExitCode::InvalidInput);
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("read outside").count(),
+            0
+        );
+    }
+
+    /// REQ-39: 台帳ディレクトリが最初から外部への symlink なら、開く段階で拒否する。
+    #[test]
+    fn req39_ledger_dir_that_is_a_symlink_is_rejected_on_open() {
+        let scratch = Scratch::new();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside dir");
+        let project = Project::create(scratch.path(), Path::new("proj")).expect("create project");
+        std::os::unix::fs::symlink(
+            &outside,
+            scratch.path().join("proj").join(FINAL_TEST_LEDGER_DIR),
+        )
+        .expect("symlink");
+
+        let Err(err) = HeldLedger::open(&project, true) else {
+            panic!("symlinked ledger dir must be rejected");
+        };
+        assert_ne!(err.code, ExitCode::Ok);
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("read outside").count(),
+            0
+        );
+    }
+
+    /// REQ-39・REQ-27: 評価完了記録の書き込み先（`candidates/<N>`）を外部への symlink へ差し替えても、
+    /// fd 起点の作成が拒否し、外部ディレクトリへ `evaluation_record.json` を書かない。
+    #[test]
+    fn req39_swapped_candidate_dir_symlink_rejects_record_write() {
+        let scratch = Scratch::new();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside dir");
+        let project = Project::create(scratch.path(), Path::new("proj")).expect("create project");
+        project.create_dir(CANDIDATES_DIR).expect("candidates dir");
+        project
+            .create_dir(format!("{CANDIDATES_DIR}/0"))
+            .expect("candidate dir");
+
+        let cand = scratch.path().join("proj").join(CANDIDATES_DIR).join("0");
+        std::fs::remove_dir_all(&cand).expect("remove candidate");
+        std::os::unix::fs::symlink(&outside, &cand).expect("symlink swap");
+
+        let rel = format!("{CANDIDATES_DIR}/0/{EVALUATION_RECORD_FILE}");
+        let err = project
+            .write_new(&rel, b"{}")
+            .expect_err("write through symlink must be rejected");
+        assert_ne!(err.code, ExitCode::Ok);
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("read outside").count(),
+            0
+        );
+    }
+}
