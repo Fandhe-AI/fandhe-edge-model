@@ -16,7 +16,9 @@
 //!
 //! - シェルを経由せず、program は絶対パス必須（PATH 探索をしない）。stdin は null
 //! - 環境変数は `env_clear` のうえ許可リスト（REQ-38）と呼び出し側が明示した値だけを渡す
-//! - stdout・stderr は上限つきで読み、超過分は読み捨てて drain する（子のパイプ詰まり防止）
+//! - stdout・stderr は上限つきで読み、超過分は読み捨てて drain する（子のパイプ詰まり防止）。
+//!   Linux・macOS はパイプを非ブロッキングにして監視ループ内で読み、スレッドを残さない
+//! - 時間は子の起動前から測る（起動に要した時間も上限に含む）
 //! - kill は直前の `try_wait` が未終了を返した直接の子にだけ送る（回収済み pid への誤送出を防ぐ）。
 //!   期限後に完了を観測した場合は kill せず時間超過として扱う（fail-closed。成功扱いにしない）
 //! - kill 後の回収待ち・読み取りスレッドの待ちは有界。回収を確認できなければエラー
@@ -27,17 +29,17 @@
 //! - 対象は直接の子だけで、子孫プロセスは kill しない。`fandhe-edge infer` は子プロセスを
 //!   起動しない（REQ-32）ため受け入れる。子孫の管理にはプロセスグループ（`unsafe`・新規依存）が
 //!   要り、ユーザー承認事項のため行わない
-//! - 実装は std のみで全 OS でビルドされるが、検証環境は Mac のみ（Windows は実機検証の対象外）
+//! - Linux・macOS 以外の OS は読み取りスレッドで代替し、期限超過時は子孫がパイプを離すまで
+//!   スレッドが残りうる
+//! - 実装は全 OS でビルドされるが、検証環境は Mac のみ（Windows は実機検証の対象外）
 //! - メモリ（RSS）上限は #171、ファイルサイズ上限は #172 の範囲。[`ResourceKind`] へ追加する
 
 use fandhe_edge_core::exitcode::ExitCode;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -463,7 +465,17 @@ pub(crate) enum MonitorEnd<S> {
 
 /// kill を送り、有界の間だけ回収を待つ。
 fn kill_and_reap<C: ChildControl, K: Clock>(child: &mut C, clock: &K) -> Result<(), GuardRunError> {
-    child.kill().map_err(|_| GuardRunError::KillFailed)?;
+    if child.kill().is_err() {
+        // 直前に子が終了した競合では kill が失敗する。回収済みなら時間超過として扱う
+        // （`limit_exceeded`=20 と `runtime_error`=70 を取り違えない。REQ-39・REQ-21）。
+        return loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                _ => break Err(GuardRunError::KillFailed),
+            }
+        };
+    }
     let give_up = clock
         .now()
         .checked_add(KILL_WAIT_TIMEOUT)
@@ -483,16 +495,22 @@ fn kill_and_reap<C: ChildControl, K: Clock>(child: &mut C, clock: &K) -> Result<
 }
 
 /// 期限まで子を監視し、超過したら kill して回収する。
+///
+/// `start` は子の起動前に取った時刻で、起動に要した時間も上限に含める（REQ-39）。
+/// `pump` は毎周回で呼ばれ、パイプを読み進めて進捗があれば true を返す（進捗があれば
+/// sleep を省き、子の書き込み詰まりを避ける）。
 pub(crate) fn monitor<C: ChildControl, K: Clock>(
     child: &mut C,
     clock: &K,
+    start: Instant,
     limit: Duration,
+    pump: &mut dyn FnMut() -> bool,
 ) -> Result<MonitorEnd<C::Status>, GuardRunError> {
-    let start = clock.now();
     let deadline = start
         .checked_add(limit)
         .ok_or(GuardRunError::InvalidConfig)?;
     loop {
+        let progressed = pump();
         match child.try_wait() {
             Ok(Some(status)) => {
                 let now = clock.now();
@@ -515,7 +533,9 @@ pub(crate) fn monitor<C: ChildControl, K: Clock>(
                         reaped: true,
                     });
                 }
-                clock.sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                if !progressed {
+                    clock.sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => {
@@ -526,48 +546,157 @@ pub(crate) fn monitor<C: ChildControl, K: Clock>(
     }
 }
 
-/// 上限つきで読む reader の共有状態（バッファと切り詰めフラグ）。
-type Captured = Arc<Mutex<(Vec<u8>, bool)>>;
+/// 上限つきで読む reader。Linux・macOS ではパイプを非ブロッキングにして監視ループの中で
+/// 読む（スレッドを持たないため、子孫がパイプを保持していても期限超過時に何も残らない）。
+/// 他 OS は読み取りスレッドで代替する（期限超過時は子孫がパイプを離すまでスレッドが残りうる）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod reader {
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::OwnedFd;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-struct Reader {
-    captured: Captured,
-    done: mpsc::Receiver<()>,
-}
+    /// 非ブロッキング化できる読み取り元。
+    pub trait Source: Into<OwnedFd> {}
+    impl<T: Into<OwnedFd>> Source for T {}
 
-fn spawn_reader<R: Read + Send + 'static>(mut src: R, cap: usize) -> Reader {
-    let captured: Captured = Arc::new(Mutex::new((Vec::new(), false)));
-    let shared = Arc::clone(&captured);
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut scratch = [0u8; 8192];
-        loop {
-            let n = match src.read(&mut scratch) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let room = cap.saturating_sub(guard.0.len());
-            let take = room.min(n);
-            if let Some(chunk) = scratch.get(..take) {
-                guard.0.extend_from_slice(chunk);
-            }
-            if take < n {
-                // 超過分は読み捨てて drain を続ける。
-                guard.1 = true;
-            }
+    pub struct Reader {
+        file: File,
+        buf: Vec<u8>,
+        cap: usize,
+        truncated: bool,
+        eof: bool,
+    }
+
+    fn errno_io(e: rustix::io::Errno) -> io::Error {
+        io::Error::from_raw_os_error(e.raw_os_error())
+    }
+
+    impl Reader {
+        pub fn new<R: Source>(src: R, cap: usize) -> io::Result<Self> {
+            let fd: OwnedFd = src.into();
+            let flags = rustix::fs::fcntl_getfl(&fd).map_err(errno_io)?;
+            rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK).map_err(errno_io)?;
+            Ok(Self {
+                file: File::from(fd),
+                buf: Vec::new(),
+                cap,
+                truncated: false,
+                eof: false,
+            })
         }
-        let _ = tx.send(());
-    });
-    Reader { captured, done: rx }
+
+        /// 読める分だけ読む。進捗（1 バイト以上）があれば true。超過分は読み捨てて drain する。
+        pub fn pump(&mut self) -> bool {
+            let mut progressed = false;
+            let mut scratch = [0u8; 8192];
+            while !self.eof {
+                let n = match self.file.read(&mut scratch) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        self.eof = true;
+                        break;
+                    }
+                };
+                progressed = true;
+                let take = self.cap.saturating_sub(self.buf.len()).min(n);
+                if let Some(chunk) = scratch.get(..take) {
+                    self.buf.extend_from_slice(chunk);
+                }
+                if take < n {
+                    self.truncated = true;
+                }
+            }
+            progressed
+        }
+
+        /// 有界の間だけ EOF を待ち、それまでの分を返す。EOF が来なければ切り詰め扱い。
+        pub fn finish(mut self, wait: Duration) -> (Vec<u8>, bool) {
+            let give_up = Instant::now().checked_add(wait);
+            loop {
+                self.pump();
+                if self.eof || give_up.is_none_or(|g| Instant::now() >= g) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            (self.buf, self.truncated || !self.eof)
+        }
+    }
 }
 
-/// reader の結果を有界で回収する。EOF が来なければそれまでの分を切り詰め扱いで返す。
-fn collect(reader: &Reader, wait: Duration) -> (Vec<u8>, bool) {
-    let finished = reader.done.recv_timeout(wait).is_ok();
-    let guard = reader.captured.lock().unwrap_or_else(|e| e.into_inner());
-    (guard.0.clone(), guard.1 || !finished)
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod reader {
+    use std::io::{self, Read};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    pub trait Source: Read + Send + 'static {}
+    impl<T: Read + Send + 'static> Source for T {}
+
+    type Captured = Arc<Mutex<(Vec<u8>, bool)>>;
+
+    pub struct Reader {
+        captured: Captured,
+        done: mpsc::Receiver<()>,
+    }
+
+    impl Reader {
+        pub fn new<R: Source>(mut src: R, cap: usize) -> io::Result<Self> {
+            let captured: Captured = Arc::new(Mutex::new((Vec::new(), false)));
+            let shared = Arc::clone(&captured);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut scratch = [0u8; 8192];
+                loop {
+                    let n = match src.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let take = cap.saturating_sub(guard.0.len()).min(n);
+                    if let Some(chunk) = scratch.get(..take) {
+                        guard.0.extend_from_slice(chunk);
+                    }
+                    if take < n {
+                        guard.1 = true;
+                    }
+                }
+                let _ = tx.send(());
+            });
+            Ok(Self { captured, done: rx })
+        }
+
+        pub fn pump(&mut self) -> bool {
+            false
+        }
+
+        pub fn finish(self, wait: Duration) -> (Vec<u8>, bool) {
+            let finished = self.done.recv_timeout(wait).is_ok();
+            let guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.0.clone(), guard.1 || !finished)
+        }
+    }
+}
+
+use reader::Reader;
+
+/// reader を作れなかった場合に、起動済みの子を止めて回収してからエラーを返す。
+fn abort_child(child: &mut std::process::Child) -> Result<GuardedRunOutcome, GuardRunError> {
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(GuardRunError::Spawn)
 }
 
 /// 子を起動し、時間上限を強制して実行する。
@@ -597,25 +726,36 @@ pub fn run_with_limits(
     if let Some(dir) = &cmd.current_dir {
         command.current_dir(dir);
     }
+    // 起動に要する時間も上限に含めるため、spawn の前から測る（REQ-39）。
+    let start = Instant::now();
     let mut child = command.spawn().map_err(|_| GuardRunError::Spawn)?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|s| spawn_reader(s, config.stdout_cap));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|s| spawn_reader(s, config.stderr_cap));
+    let mut stdout = None;
+    let mut stderr = None;
+    if let Some(pipe) = child.stdout.take() {
+        stdout = Reader::new(pipe, config.stdout_cap).ok();
+        if stdout.is_none() {
+            return abort_child(&mut child);
+        }
+    }
+    if let Some(pipe) = child.stderr.take() {
+        stderr = Reader::new(pipe, config.stderr_cap).ok();
+        if stderr.is_none() {
+            return abort_child(&mut child);
+        }
+    }
 
     let limit = config.time_limit.get();
-    match monitor(&mut child, &SystemClock, limit)? {
+    let mut pump = || {
+        let a = stdout.as_mut().is_some_and(Reader::pump);
+        let b = stderr.as_mut().is_some_and(Reader::pump);
+        a || b
+    };
+    match monitor(&mut child, &SystemClock, start, limit, &mut pump)? {
         MonitorEnd::Exited { status, elapsed } => {
-            let (stdout, stdout_truncated) = stdout
-                .as_ref()
-                .map_or((Vec::new(), false), |r| collect(r, READER_WAIT_TIMEOUT));
-            let (stderr, stderr_truncated) = stderr
-                .as_ref()
-                .map_or((Vec::new(), false), |r| collect(r, READER_WAIT_TIMEOUT));
+            let (stdout, stdout_truncated) =
+                stdout.map_or((Vec::new(), false), |r| r.finish(READER_WAIT_TIMEOUT));
+            let (stderr, stderr_truncated) =
+                stderr.map_or((Vec::new(), false), |r| r.finish(READER_WAIT_TIMEOUT));
             Ok(GuardedRunOutcome::Exited {
                 status,
                 output: ChildOutput {
@@ -628,7 +768,8 @@ pub fn run_with_limits(
             })
         }
         MonitorEnd::TimedOut { elapsed, reaped } => {
-            // reader は破棄する（子の終了で EOF となり自然に終わる）。出力は記録に含めない。
+            // reader は破棄する。Linux・macOS はスレッドを持たず fd を閉じるだけで何も残らない。
+            // 出力は記録に含めない。
             Ok(GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
                 kind: ResourceKind::Time,
                 limit,
@@ -712,7 +853,14 @@ mod tests {
     fn req39_late_exit_is_time_limit_without_kill() {
         let clock = FakeClock::new();
         let mut child = fake(&clock, vec![Ok(Some(0))], 11_000);
-        let end = monitor(&mut child, &clock, INFER_TIME_LIMIT).unwrap();
+        let end = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap();
         assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
         assert_eq!(child.kill_calls.get(), 0);
     }
@@ -722,7 +870,14 @@ mod tests {
     fn req39_exit_within_limit_is_exited() {
         let clock = FakeClock::new();
         let mut child = fake(&clock, vec![Ok(None), Ok(Some(7))], 10);
-        let end = monitor(&mut child, &clock, INFER_TIME_LIMIT).unwrap();
+        let end = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap();
         assert!(matches!(end, MonitorEnd::Exited { status: 7, .. }));
     }
 
@@ -738,7 +893,14 @@ mod tests {
             ],
             1,
         );
-        let end = monitor(&mut child, &clock, INFER_TIME_LIMIT).unwrap();
+        let end = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap();
         assert!(matches!(end, MonitorEnd::Exited { status: 0, .. }));
     }
 
@@ -750,7 +912,14 @@ mod tests {
         let mut script: Vec<io::Result<Option<i32>>> = (0..31).map(|_| Ok(None)).collect();
         script.push(Ok(Some(9)));
         let mut child = fake(&clock, script, 0);
-        let end = monitor(&mut child, &clock, Duration::from_millis(300)).unwrap();
+        let end = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            Duration::from_millis(300),
+            &mut || false,
+        )
+        .unwrap();
         assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
         assert_eq!(child.kill_calls.get(), 1);
     }
@@ -761,9 +930,49 @@ mod tests {
         let clock = FakeClock::new();
         let mut child = fake(&clock, vec![], 20_000);
         child.kill_ok = false;
-        let err = monitor(&mut child, &clock, INFER_TIME_LIMIT).unwrap_err();
+        let err = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap_err();
         assert_eq!(err, GuardRunError::KillFailed);
         assert_eq!(err.exit_code(), ExitCode::RuntimeError);
+    }
+
+    /// REQ-39・REQ-21: kill が競合で失敗しても、直後に回収済みなら時間超過（70 にしない）。
+    #[test]
+    fn req39_kill_race_with_exit_is_time_limit() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None), Ok(Some(0))], 20_000);
+        child.kill_ok = false;
+        let end = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap();
+        assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
+        assert_eq!(child.kill_calls.get(), 1);
+    }
+
+    /// REQ-39: 起動前から測った開始時刻を渡すと、起動に要した時間も上限に含まれる。
+    #[test]
+    fn req39_spawn_time_counts_toward_limit() {
+        let clock = FakeClock::new();
+        let start = clock.now();
+        clock.sleep(Duration::from_secs(9)); // 起動に 9 秒かかった想定
+        let mut child = fake(&clock, vec![], 0);
+        let end = monitor(&mut child, &clock, start, INFER_TIME_LIMIT, &mut || false);
+        // 残り 1 秒で kill を送るが、回収できない fake なので ReapTimeout になる。
+        assert_eq!(end.unwrap_err(), GuardRunError::ReapTimeout);
+        assert_eq!(child.kill_calls.get(), 1);
+        // 起動後から 10 秒待たず、開始から約 10 秒（+ 回収待ち 2 秒）で見切る。
+        assert!(clock.now().duration_since(start) < Duration::from_millis(12_500));
     }
 
     /// REQ-39: kill 後に回収できなければ ReapTimeout。
@@ -771,7 +980,14 @@ mod tests {
     fn req39_unreapable_child_is_reap_timeout() {
         let clock = FakeClock::new();
         let mut child = fake(&clock, vec![], 0);
-        let err = monitor(&mut child, &clock, Duration::from_millis(50)).unwrap_err();
+        let err = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            Duration::from_millis(50),
+            &mut || false,
+        )
+        .unwrap_err();
         assert_eq!(err, GuardRunError::ReapTimeout);
     }
 
@@ -787,7 +1003,14 @@ mod tests {
             ],
             1,
         );
-        let err = monitor(&mut child, &clock, INFER_TIME_LIMIT).unwrap_err();
+        let err = monitor(
+            &mut child,
+            &clock,
+            clock.now(),
+            INFER_TIME_LIMIT,
+            &mut || false,
+        )
+        .unwrap_err();
         assert_eq!(err, GuardRunError::Wait);
         assert_eq!(child.kill_calls.get(), 1);
     }
