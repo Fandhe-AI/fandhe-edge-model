@@ -478,7 +478,13 @@ run_all() {
         i=$((i + 1))
     done
     do_step select - select --project-dir "$project_dir" || return 0
-    do_step package - package --project-dir "$project_dir" || return 0
+    # `--smoke` で短縮学習した候補は、検証専用の `--allow-smoke` を渡さないと package できない
+    # （配布用ではない。REQ-27）。
+    if [ "$smoke" -eq 1 ]; then
+        do_step package - package --project-dir "$project_dir" --allow-smoke || return 0
+    else
+        do_step package - package --project-dir "$project_dir" || return 0
+    fi
     do_step infer - infer --package "$project_dir/package" --text "$infer_text" || return 0
 }
 run_all

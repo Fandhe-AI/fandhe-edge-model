@@ -82,6 +82,7 @@ impl Env {
                  prev=$a\n\
                  done\n\
                  echo \"$stage $cand\" >> \"{}\"\n\
+                 echo \"$*\" >> \"{}.args\"\n\
                  [ -z \"${{FAKE_SLEEP_SECS:-}}\" ] || sleep \"$FAKE_SLEEP_SECS\"\n\
                  if [ \"${{FAKE_HANG_STAGE:-}}\" = \"$stage\" ]; then\n\
                  case \"${{FAKE_HANG_KIND:-sleep}}\" in\n\
@@ -112,6 +113,7 @@ impl Env {
                  fi\n\
                  printf '{{\"step\":\"%s\",\"status\":\"ok\"}}\\n' \"$stage\"\n\
                  exit 0\n",
+                cli_log.display(),
                 cli_log.display()
             ),
         );
@@ -157,6 +159,13 @@ impl Env {
 
     fn cli_calls(&self) -> Vec<String> {
         Self::lines(&self.cli_log)
+    }
+
+    /// 偽の CLI が受け取った引数全体（1 呼び出し 1 行）。
+    fn cli_args(&self) -> Vec<String> {
+        let mut path = self.cli_log.clone().into_os_string();
+        path.push(".args");
+        Self::lines(Path::new(&path))
     }
 
     fn launch_calls(&self) -> Vec<String> {
@@ -320,6 +329,37 @@ fn req38_candidates_param_runs_each_candidate() {
             "package -",
             "infer -"
         ]
+    );
+}
+
+/// REQ-27: `--smoke` のときだけ package に検証専用の `--allow-smoke` を渡す（短縮学習の候補を
+/// package するため）。`--smoke` なしでは渡さない（配布用の経路で smoke を許さない）。
+#[test]
+fn req27_allow_smoke_is_passed_to_package_only_with_smoke() {
+    let package_args = |e: &Env| -> String {
+        e.cli_args()
+            .into_iter()
+            .find(|l| l.starts_with("package "))
+            .expect("package call")
+    };
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--smoke".to_string());
+    let o = e.run(&args, &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        package_args(&e).ends_with(" --allow-smoke"),
+        "{}",
+        package_args(&e)
+    );
+
+    let e = Env::new();
+    let o = e.run(&e.base_args(), &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        !package_args(&e).contains("--allow-smoke"),
+        "{}",
+        package_args(&e)
     );
 }
 
