@@ -458,6 +458,72 @@ mod suite {
         );
     }
 
+    /// REQ-27: `select` は保存済みの学習リクエストの validation が分割記録の validation 全体と
+    /// 一致しなければ、候補を選ばず拒否する（記録の改変による部分集合での選定を防ぐ）。
+    pub fn select_rejects_request_validation_not_matching_split() {
+        let env = inspected("selsplit");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let request = env.project_file("candidates/0/request.json");
+        let original = std::fs::read_to_string(&request).expect("request.json");
+        let start = original
+            .find("\"validation_inputs\":[")
+            .expect("validation_inputs")
+            + "\"validation_inputs\":[".len();
+        let end = start + original[start..].find("},").expect("first element") + 2;
+        let mut tampered = original.clone();
+        tampered.replace_range(start..end, "");
+        std::fs::write(&request, tampered).expect("tamper request");
+        let out = env.run(&["select", "--project-dir", "proj"]);
+        assert_eq!(out.0, 64, "{}", out.1);
+        assert!(!env.project_file("selection_record.json").exists());
+        std::fs::write(&request, original).expect("restore");
+        env.ok(&["select", "--project-dir", "proj"]);
+    }
+
+    /// REQ-27・REQ-32・REQ-39: `package` は選定記録の候補 ID、`artifact.json` の `label_order`・`kind`
+    /// が選定候補・定義と食い違うと、`package/` を残さず拒否する。
+    pub fn package_rejects_mismatched_selection_and_metadata() {
+        let env = inspected("pkgmismatch");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let record = env.project_file("selection_record.json");
+        let original = std::fs::read_to_string(&record).expect("selection record");
+        std::fs::write(
+            &record,
+            original.replace("\"candidate_id\":\"", "\"candidate_id\":\"other-"),
+        )
+        .expect("tamper record");
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record does not match the candidate\"}\n"
+        );
+        std::fs::write(&record, &original).expect("restore record");
+
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let meta_original = std::fs::read_to_string(&meta).expect("artifact.json");
+        std::fs::write(
+            &meta,
+            meta_original.replace(
+                "\"label_order\":[\"alpha\",\"beta\",\"gamma\"]",
+                "\"label_order\":[\"beta\",\"alpha\",\"gamma\"]",
+            ),
+        )
+        .expect("tamper labels");
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package label order does not match definition\"}\n"
+        );
+        std::fs::write(
+            &meta,
+            meta_original.replace("\"kind\":\"c1\"", "\"kind\":\"c3\""),
+        )
+        .expect("tamper kind");
+        env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&meta, &meta_original).expect("restore meta");
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -558,6 +624,14 @@ fn main() -> std::process::ExitCode {
         (
             "infer_rejects_tampered_package",
             suite::infer_rejects_tampered_package,
+        ),
+        (
+            "select_rejects_request_validation_not_matching_split",
+            suite::select_rejects_request_validation_not_matching_split,
+        ),
+        (
+            "package_rejects_mismatched_selection_and_metadata",
+            suite::package_rejects_mismatched_selection_and_metadata,
         ),
         (
             "infer_out_option_is_not_faked",

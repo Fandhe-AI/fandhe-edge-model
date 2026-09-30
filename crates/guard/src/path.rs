@@ -608,6 +608,12 @@ impl ConfinedDir {
             })?;
             owned = Some(next);
         }
+        // 書き込み側でも読み取り側（`ensure_real_path_under`）と同じく、親ディレクトリ fd の実パスが
+        // 本ディレクトリの実パス配下であることを確認する。保持 fd 起点の `openat` は、検証後に本
+        // ディレクトリ自体が移動された・bind mount された場合に移動後の場所へ書けてしまうため
+        // （REQ-39。fail-closed。実パスを得られない場合も拒否する）。
+        let parent_fd = owned.as_ref().unwrap_or(&self.fd);
+        ensure_real_path_under(parent_fd, &self.real, rel)?;
         Ok((owned, (*last).to_os_string()))
     }
 

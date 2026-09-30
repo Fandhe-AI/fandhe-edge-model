@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::TrainReport;
-use fandhe_edge_data::split::Split;
+use fandhe_edge_data::inspect::ValidRecord;
+use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
@@ -124,16 +125,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
-    let rows = split_rows(&records)?;
-
-    let split_bytes = project.read(SPLIT_FILE, crate::project::MAX_PROJECT_FILE_BYTES)?;
-    let split_text =
-        std::str::from_utf8(&split_bytes).map_err(|_| invalid("split record is invalid"))?;
-    let split_record =
-        SplitRecord::from_json_str(split_text).map_err(|_| invalid("split record is invalid"))?;
-    let split = split_record
-        .verify_against(&rows)
-        .map_err(|_| invalid("split record does not match the data"))?;
+    let split = verified_split(&project, &records)?;
 
     let mut candidates = resolve_candidates(&project, &definition, args.candidate)?;
     if args.candidate >= candidates.len() {
@@ -193,6 +185,26 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
         outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
     project.write_new(rel.join(RESULT_FILE), &result_json)?;
     Ok(TrainReport::new(args.candidate, candidate.candidate_id))
+}
+
+/// `split.json`（`inspect` の記録）を読み、取り込んだデータから分割を再現して照合する
+/// （不一致は `invalid_input`。REQ-17・REQ-27）。`train`・`select` が同じ検証を通す。
+///
+/// # Errors
+/// 記録が読めない・不正・データと一致しない場合は `invalid_input`（64）等。
+pub fn verified_split(
+    project: &Project,
+    records: &[ValidRecord],
+) -> Result<SplitResult, ErrorReport> {
+    let rows = split_rows(records)?;
+    let split_bytes = project.read(SPLIT_FILE, crate::project::MAX_PROJECT_FILE_BYTES)?;
+    let split_text =
+        std::str::from_utf8(&split_bytes).map_err(|_| invalid("split record is invalid"))?;
+    let split_record =
+        SplitRecord::from_json_str(split_text).map_err(|_| invalid("split record is invalid"))?;
+    split_record
+        .verify_against(&rows)
+        .map_err(|_| invalid("split record does not match the data"))
 }
 
 /// 学習済みの候補 `index` の学習リクエストと結果を読み戻す（学習済みでなければ `None`）。

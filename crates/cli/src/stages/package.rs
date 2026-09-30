@@ -4,10 +4,12 @@
 //! # 手順
 //!
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
-//!    を再検証つきで読み戻す（[`super::train::load_trained`]）
+//!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
+//!    学習リクエストの `kind` の一致も確認する
 //! 2. 選定候補の学習ワーカー出力（`artifact.json`・ONNX ファイル）と登録済みの `definition.json`
 //!    （選択肢表）を `package/` へ新規コピーする（既存の `package/` は拒否。上書きしない）
-//! 3. `artifact.json` の `onnx_sha256` とコピーした ONNX の sha256 の一致を確認する
+//! 3. `artifact.json` の `onnx_sha256` とコピーした ONNX の sha256 の一致、および `kind`・
+//!    `label_order`・`max_bytes` の定義・選定候補との一致を確認する
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
@@ -23,13 +25,14 @@
 use std::path::{Component, Path};
 
 use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
-use fandhe_edge_core::definition::MAX_DEFINITION_FILE_BYTES;
+use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_guard::kind::KindAllowlist;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
+use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES};
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
@@ -38,9 +41,11 @@ use fandhe_edge_train::stage_files::SelectionRecord;
 
 use crate::args::PackageArgs;
 use crate::error_report::ToErrorReport;
-use crate::project::{DEFINITION_FILE, PACKAGE_DIR, Project, SELECTION_FILE, invalid, runtime};
+use crate::project::{
+    DEFINITION_FILE, PACKAGE_DIR, Project, SELECTION_FILE, invalid, parse_definition, runtime,
+};
 
-use super::train::load_trained;
+use super::train::{load_trained, resolve_candidates};
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
 const ARTIFACT_META_FILE: &str = "artifact.json";
@@ -58,8 +63,22 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let selection_bytes = project.read(SELECTION_FILE, 64 * 1024)?;
     let selection = SelectionRecord::from_json_slice(&selection_bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
-    let (_, outcome) = load_trained(&project, selection.candidate_index)?
+    let definition_bytes = project.read(DEFINITION_FILE, MAX_DEFINITION_FILE_BYTES)?;
+    let definition = parse_definition(&definition_bytes)?;
+    // 選定記録の `candidate_index` だけで学習結果を読まず、その添字の既定候補の ID・kind が
+    // 記録と一致することを確認する（別の候補を配布しない。REQ-27・REQ-39）。
+    let candidates = resolve_candidates(&project, &definition, selection.candidate_index)?;
+    let candidate = candidates
+        .get(selection.candidate_index)
+        .filter(|c| c.candidate_id == selection.candidate_id)
+        .ok_or_else(|| invalid("selection record does not match the candidate"))?;
+    let (request, outcome) = load_trained(&project, selection.candidate_index)?
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
+    if request.kind() != candidate.params.kind
+        || request.kind_version() != candidate.params.kind_version
+    {
+        return Err(invalid("selection record does not match the candidate"));
+    }
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));
     };
@@ -78,13 +97,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         MAX_ARTIFACT_META_BYTES,
     )?;
     let onnx_bytes = project.read(artifact_rel.join(onnx_file), MAX_MODEL_FILE_BYTES)?;
-    let definition_bytes = project.read(DEFINITION_FILE, MAX_DEFINITION_FILE_BYTES)?;
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
     if meta.onnx_file() != onnx_file
         || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
+    check_meta_consistency(&meta, &definition, request.kind(), request.max_bytes())?;
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -145,6 +164,39 @@ fn assemble_and_measure(
     }
     measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))
+}
+
+/// `artifact.json` の `kind`・`label_order`・`max_bytes` を、選定候補の学習リクエストと定義に照合する
+/// （`infer` が読み込み時に行う検査と同じ観点。食い違うパッケージを作らない。REQ-32・REQ-39）。
+fn check_meta_consistency(
+    meta: &ArtifactMeta,
+    definition: &Definition,
+    trained_kind: &str,
+    trained_max_bytes: u32,
+) -> Result<(), ErrorReport> {
+    KindAllowlist::supported()
+        .check(meta.kind())
+        .map_err(|e| e.to_error_report())?;
+    if meta.kind() != trained_kind {
+        return Err(invalid(
+            "artifact kind does not match the selected candidate",
+        ));
+    }
+    let option_ids = definition.options().iter().map(|c| c.id.as_str());
+    if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
+        return Err(invalid("package label order does not match definition"));
+    }
+    if meta.max_bytes() != trained_max_bytes {
+        return Err(invalid(
+            "artifact max_bytes does not match the selected candidate",
+        ));
+    }
+    let in_range = usize::try_from(meta.max_bytes())
+        .is_ok_and(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(&n));
+    if !in_range {
+        return Err(invalid("package max_bytes is out of range"));
+    }
+    Ok(())
 }
 
 /// 単一の通常の名前（区切り・`..`・絶対パスを含まない）か。

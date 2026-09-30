@@ -215,6 +215,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// REQ-39: `confine_package` の後にパッケージのディレクトリ自体が移動されたら、書き込み系
+    /// （`create_new_member`・`create_dir_member`・`remove_file_member`）は移動後の場所へ書かず拒否する。
+    #[test]
+    fn req39_write_rejects_package_dir_moved_after_confine() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-wmoved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg/data")).expect("mkdir");
+        std::fs::write(base.join("pkg/old.txt"), b"x").expect("write");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        std::fs::create_dir_all(base.join("elsewhere")).expect("mkdir");
+        std::fs::rename(base.join("pkg"), base.join("elsewhere/pkg")).expect("move");
+
+        for rel in ["new.txt", "data/new.txt"] {
+            let r = pkg.create_new_member(Path::new(rel));
+            assert!(matches!(r, Err(PathRejection::Escapes { .. })), "{r:?}");
+        }
+        let d = pkg.create_dir_member(Path::new("sub"));
+        assert!(matches!(d, Err(PathRejection::Escapes { .. })), "{d:?}");
+        let rm = pkg.remove_file_member(Path::new("old.txt"));
+        assert!(matches!(rm, Err(PathRejection::Escapes { .. })), "{rm:?}");
+        assert!(!base.join("elsewhere/pkg/new.txt").exists());
+        assert!(!base.join("elsewhere/pkg/data/new.txt").exists());
+        assert!(!base.join("elsewhere/pkg/sub").exists());
+        assert!(base.join("elsewhere/pkg/old.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// REQ-39: 既存の名前（symlink を含む）は上書きせず `AlreadyExists` で拒否し、`..` は拒否する。
     /// 書き込み後の `remove_file_member` でファイルが消える。
     #[test]

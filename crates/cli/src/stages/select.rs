@@ -9,6 +9,10 @@
 //! 最高正解率の候補を [`select_best`]（同率は宣言順で先。乱数なし）で選び、`selection_record.json`
 //! へ記録する。学習済みの候補が 1 件も無ければ `pending`（12）。
 //!
+//! 採点の前に `split.json` をデータから再現して照合し（[`super::train::verified_split`]）、各候補の
+//! 保存済み `request.json` の validation（id・input）が分割記録の validation 全体と一致することを
+//! 確認する（不一致は `invalid_input`。記録の改変による部分集合での選定を防ぐ。REQ-27）。
+//!
 //! # 未接続
 //!
 //! McNemar・Holm による選定結果の有意性判定（[`fandhe_edge_train::selection_significance`]）は
@@ -20,15 +24,16 @@ use std::path::Path;
 
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
+use fandhe_edge_data::split::Split;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::stage_files::{SelectionRecord, validation_accuracy};
 
 use crate::args::SelectArgs;
 use crate::error_report::default_message;
-use crate::project::{Project, SELECTION_FILE, fail, runtime};
+use crate::project::{Project, SELECTION_FILE, fail, invalid, runtime};
 
-use super::train::{load_trained, resolve_candidates};
+use super::train::{load_trained, resolve_candidates, verified_split};
 
 /// `select` を実行する。
 ///
@@ -45,6 +50,15 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     let gold: BTreeMap<&str, &str> = records
         .iter()
         .map(|r| (r.id.as_str(), r.label_id.as_str()))
+        .collect();
+    // 分割記録をデータから再現して照合し、選定に使う validation 集合を記録側から決める。
+    // 保存済みの `request.json` の validation を信用すると、記録の改変で任意の部分集合の
+    // 正解率により候補を選べてしまう（REQ-27）。
+    let split = verified_split(&project, &records)?;
+    let expected_validation: BTreeMap<&str, &str> = records
+        .iter()
+        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
+        .map(|r| (r.id.as_str(), r.input.as_str()))
         .collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let candidates = resolve_candidates(&project, &definition, 0)?;
@@ -63,6 +77,14 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         let predictions = success
             .validation_predictions()
             .ok_or_else(|| runtime("train result has no validation predictions"))?;
+        // request の validation は、分割記録の validation 全体と id・input が完全に一致すること。
+        let matches_split = inputs.len() == expected_validation.len()
+            && inputs
+                .iter()
+                .all(|v| expected_validation.get(v.id()) == Some(&v.input()));
+        if !matches_split {
+            return Err(invalid("train request does not match the split record"));
+        }
         let ids: Vec<&str> = inputs.iter().map(|v| v.id()).collect();
         let gold_labels = ids
             .iter()
