@@ -5,8 +5,8 @@
 //! （実プロセス・実時計・合成 sleeper）。実 CLI の推論が 10 秒を超える実測ではない。
 
 use fandhe_edge_guard::resource::{
-    GuardedCommand, GuardedRunOutcome, INFER_TIME_LIMIT, ResourceKind, RunConfig, TimeLimit,
-    run_with_limits,
+    DEFAULT_STDERR_CAP, DEFAULT_STDOUT_CAP, GuardedCommand, GuardedRunOutcome, INFER_TIME_LIMIT,
+    ResourceKind, RunConfig, TimeLimit, run_with_limits,
 };
 use std::time::Duration;
 
@@ -64,7 +64,9 @@ fn child(mode: &str) -> GuardedCommand {
 }
 
 fn config(limit: Duration) -> RunConfig {
-    RunConfig::new(TimeLimit::new(limit).unwrap(), 1024 * 1024, 64 * 1024).unwrap()
+    RunConfig::new(TimeLimit::new(limit).unwrap(), 1024 * 1024, 64 * 1024)
+        .unwrap()
+        .without_memory_limit()
 }
 
 /// REQ-39: 暫定値は 10 秒で、既定設定にも反映される。
@@ -77,7 +79,15 @@ fn req39_infer_time_limit_is_10_seconds() {
 /// REQ-39・PoC-20 ケース 3: 10 秒を超える子は kill され、時間超過として記録される。
 #[test]
 fn req39_child_exceeding_10s_is_killed_and_recorded_as_time_limit() {
-    let outcome = run_with_limits(&child("sleep60"), &RunConfig::default()).unwrap();
+    // 時間上限だけを検証する（既定設定はメモリ上限も持ち、計測手段の無い OS では fail-closed になる）。
+    let cfg = RunConfig::new(
+        TimeLimit::infer_default(),
+        DEFAULT_STDOUT_CAP,
+        DEFAULT_STDERR_CAP,
+    )
+    .unwrap()
+    .without_memory_limit();
+    let outcome = run_with_limits(&child("sleep60"), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
         panic!("expected LimitExceeded");
     };
@@ -127,7 +137,9 @@ fn req39_nonzero_exit_is_not_limit_exceeded() {
 /// REQ-39: 読み取り上限を超える出力は切り詰めフラグ付きで上限長に収まる。
 #[test]
 fn req39_stdout_is_capped_and_flagged() {
-    let cfg = RunConfig::new(TimeLimit::new(Duration::from_secs(30)).unwrap(), 100, 100).unwrap();
+    let cfg = RunConfig::new(TimeLimit::new(Duration::from_secs(30)).unwrap(), 100, 100)
+        .unwrap()
+        .without_memory_limit();
     let outcome = run_with_limits(&child("flood"), &cfg).unwrap();
     let GuardedRunOutcome::Exited { output, .. } = outcome else {
         panic!("expected Exited");
@@ -159,7 +171,8 @@ fn req39_continuous_output_does_not_bypass_time_limit() {
         1024 * 1024,
         64 * 1024,
     )
-    .unwrap();
+    .unwrap()
+    .without_memory_limit();
     let started = std::time::Instant::now();
     let outcome = run_with_limits(&child("spew"), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
