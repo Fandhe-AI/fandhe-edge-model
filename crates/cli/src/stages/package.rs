@@ -11,6 +11,9 @@
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
+//! 2〜4 の途中で失敗した場合は、本工程が作った `package/` を削除する（再実行できなくなる半端な
+//! パッケージを残さない）。容量の上限超過は成功扱いで `package/` を残す。
+//!
 //! # 未接続（実装済みを装わない）
 //!
 //! p95 の計測（REQ-31・`LimitBreach::Latency`）と合否基準は未接続。定義ファイルに合否基準の欄が
@@ -86,24 +89,23 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if project.exists(PACKAGE_DIR) {
         return Err(invalid("package directory already exists"));
     }
-    project.create_dir(PACKAGE_DIR)?;
-    let pkg = Path::new(PACKAGE_DIR);
-    project.write_new(pkg.join(ARTIFACT_META_FILE), &meta_bytes)?;
-    project.write_new(pkg.join(onnx_file), &onnx_bytes)?;
-    project.write_new(pkg.join(DEFINITION_FILE), &definition_bytes)?;
-
-    // 容量の計測は、書き出したパッケージのファイルを閉じ込めつきで開いたハンドルで行う（REQ-30）。
-    let mut files = Vec::new();
-    for (component, name) in [
-        (PackageComponent::Weights, onnx_file),
-        (PackageComponent::LabelTable, DEFINITION_FILE),
-        (PackageComponent::Metadata, ARTIFACT_META_FILE),
-    ] {
-        let (file, path) = project.open_file(pkg.join(name))?;
-        files.push((component, path, file));
-    }
-    let breakdown = measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
-        .map_err(|e| crate::output::capacity_error_report(&e))?;
+    let package_dir = project.create_dir(PACKAGE_DIR)?;
+    // 組み立て・容量計測のどこかで失敗したら、本工程が作った `package/` を片付ける。
+    // 半端なパッケージが残ると再実行が「既存」で恒久的に拒否され、`infer --package` に
+    // 誤った成果物として渡される恐れがあるため（best effort。容量の上限超過は成功扱いで残す）。
+    let breakdown = match assemble_and_measure(
+        &project,
+        onnx_file,
+        &meta_bytes,
+        &onnx_bytes,
+        &definition_bytes,
+    ) {
+        Ok(breakdown) => breakdown,
+        Err(report) => {
+            let _ = std::fs::remove_dir_all(&package_dir);
+            return Err(report);
+        }
+    };
     let mut breaches = Vec::new();
     if breakdown.total_bytes() > CAPACITY_LIMIT_BYTES {
         breaches.push(LimitBreach::Capacity {
@@ -115,6 +117,34 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &breaches,
         PackageQualityJudgment::NotDefined,
     ))
+}
+
+/// `package/` へ 3 ファイルを新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+///
+/// 呼び出し元（[`run`]）は `package/` を作成済みで、失敗時の後始末は呼び出し元が行う。
+fn assemble_and_measure(
+    project: &Project,
+    onnx_file: &str,
+    meta_bytes: &[u8],
+    onnx_bytes: &[u8],
+    definition_bytes: &[u8],
+) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
+    let pkg = Path::new(PACKAGE_DIR);
+    project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
+    project.write_new(pkg.join(onnx_file), onnx_bytes)?;
+    project.write_new(pkg.join(DEFINITION_FILE), definition_bytes)?;
+
+    let mut files = Vec::new();
+    for (component, name) in [
+        (PackageComponent::Weights, onnx_file),
+        (PackageComponent::LabelTable, DEFINITION_FILE),
+        (PackageComponent::Metadata, ARTIFACT_META_FILE),
+    ] {
+        let (file, path) = project.open_file(pkg.join(name))?;
+        files.push((component, path, file));
+    }
+    measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
+        .map_err(|e| crate::output::capacity_error_report(&e))
 }
 
 /// 単一の通常の名前（区切り・`..`・絶対パスを含まない）か。
