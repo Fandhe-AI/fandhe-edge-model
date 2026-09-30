@@ -43,6 +43,10 @@ use std::fmt;
 /// 容量の目安（バイト。10 進の 40MB。PoC-13 の `fits_40mb`・REQ-30）。
 /// 値は [`REFERENCE_CAPACITY_BYTES`] に集約済みで、ここでは別名として参照するだけ。
 pub const VOCAB_GUIDELINE_BYTES: u64 = REFERENCE_CAPACITY_BYTES;
+/// 語彙ファイルを持つ成果物が成果物ディレクトリに置くファイル名（ある場合のみ）。
+/// `select` 工程はこのファイルの有無で `has_vocab_file` を決め、存在すれば容量計測の対象
+/// （[`PackageComponent::VocabOrFeatureTransform`]）に含める（REQ-30・TASK-30.3・#125）。
+pub const VOCAB_FILE_NAME: &str = "vocab.json";
 /// 1 回の選別で受け付ける候補数の上限（REQ-39）。
 pub const MAX_VOCAB_SCREENING_CANDIDATES: usize = 64;
 /// 根拠の出典。

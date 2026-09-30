@@ -23,22 +23,24 @@
 //! （REQ-27。validation のみで選ぶ）。
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
+use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::vocab_exclusion::screen_vocab_candidates;
+use fandhe_edge_runtime::vocab_exclusion::{VOCAB_FILE_NAME, screen_vocab_candidates};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::stage_files::{ExcludedCandidate, SelectionRecord, validation_accuracy};
 
 use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
-use crate::project::{Project, SELECTION_FILE, fail, invalid, runtime};
+use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, invalid, runtime};
 
 use super::train::{
     candidate_rel, load_trained, request_matches_candidate, resolve_candidates, verified_split,
@@ -174,11 +176,13 @@ pub fn compute_selection(
     }))
 }
 
-/// 学習済みの候補の成果物（ONNX・`artifact.json`）の容量を計測し、語彙超過構成なら除外記録を返す
-/// （REQ-30・TASK-30.3・#125）。判定は runtime の [`screen_vocab_candidates`] に集約し、ここでは
-/// 再実装しない。現行の既定候補（c1・c3）は語彙を ONNX グラフ内に持ち語彙ファイルが無いため、
-/// `has_vocab_file` は `false`（語彙ファイルを持つ構成が加わったら成果物の構成から判定する）。
-/// 計測の失敗は除外にせずエラーで返す（fail-closed。REQ-39）。
+/// 学習済みの候補のパッケージ相当の容量（ONNX・語彙ファイル〔あれば〕・選択肢表
+/// `definition.json`・`artifact.json`）を計測し、語彙超過構成なら除外記録を返す
+/// （REQ-30・TASK-30.3・#125）。構成要素は `package` 工程の組み立て（`assemble_and_measure`）と
+/// 揃え、選定時に 40MB 以下でも配布時に超過する候補を見逃さない。語彙ファイルの有無は成果物
+/// ディレクトリの [`VOCAB_FILE_NAME`] で判定する（現行の既定候補 c1・c3 は語彙を ONNX グラフ内に
+/// 持ち、このファイルを作らない）。判定は runtime の [`screen_vocab_candidates`] に集約し再実装
+/// しない。計測の失敗は除外にせずエラーで返す（fail-closed。REQ-39）。
 fn vocab_exclusion_of(
     project: &Project,
     index: usize,
@@ -204,9 +208,27 @@ fn vocab_exclusion_of(
             .map_err(|e| e.to_error_report())?;
         files.push((component, real.into_path_buf(), file));
     }
+    // 語彙ファイル: 無い（NotFound）ときだけ `has_vocab_file = false`。それ以外の失敗は止める。
+    let has_vocab_file = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
+        Ok((file, real)) => {
+            files.push((
+                PackageComponent::VocabOrFeatureTransform,
+                real.into_path_buf(),
+                file,
+            ));
+            true
+        }
+        Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            false
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
+    // 選択肢表（`package` は `definition.json` を LabelTable として合計に含める）。
+    let (file, path) = project.open_file(DEFINITION_FILE)?;
+    files.push((PackageComponent::LabelTable, path, file));
     let breakdown = measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))?;
-    let screening = screen_vocab_candidates(&[(index, breakdown, false)])
+    let screening = screen_vocab_candidates(&[(index, breakdown, has_vocab_file)])
         .map_err(|_| runtime("cannot screen candidate capacity"))?;
     Ok(screening.excluded().first().map(|r| ExcludedCandidate {
         candidate_index: index,
