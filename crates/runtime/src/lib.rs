@@ -36,7 +36,10 @@
 //! - [`package_outcome`][]: 上限超過を合否判定より優先して `limit_exceeded`（20）へ写す
 //!   終了コード決定（REQ-21・TASK-21.3-1・#132）。待ち時間（p95）の上限超過
 //!   （`LimitBreach::Latency`・境界規則 `latency_if_exceeded`。REQ-31・TASK-21.3-2・#133）も
-//!   扱う。容量の照合・CLI 配線は未実装
+//!   扱う。容量の照合は `capacity_limit` 経由で CLI `package` に結線済み（上限は暫定固定 40MB。
+//!   `crates/cli/src/stages/package.rs`）。待ち時間（p95）の CLI 配線と利用者設定上限の取り込みは未実装。
+//!   容量・待ち時間の合流点確認は `tests/limit_exceeded_boundary.rs`（TASK-21.3・#131。
+//!   証拠種別はテストハーネスで、本番データでの再実演は未実施）
 //! - [`prediction_provenance`][]: 参考測定でバッチ予測 API を使った記録への明記ルール
 //!   （REQ-28 境界値・TASK-28.3・#120）。CLI 出力への配線は TASK-33.x で未実装
 //!
