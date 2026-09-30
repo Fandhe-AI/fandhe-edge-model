@@ -21,7 +21,7 @@
 //! TASK で main が判断する入出力契約の変更）。加えて `evaluate` 工程の評価データ
 //! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
 //! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
-//! 後者の JSON スキーマは提案でありオーナー未承認。Wilson 区間・McNemar / Holm・診断（REQ-29）は
+//! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
 //! 出力に含めない（未結線）。
 //!
 //! 合否判定は exit 0 になる `pass` のみを表す。`fail`・`limit_exceeded`・判定不能は
@@ -108,7 +108,7 @@ impl EvaluateReport {
 /// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
-/// この JSON スキーマは提案であり、オーナーの承認は得ていない（入出力契約への加算的な追加）。
+/// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvaluateCompletedReport {
     step: Stage,

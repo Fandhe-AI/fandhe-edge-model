@@ -59,7 +59,7 @@
 //! # 未接続（実装済みを装わない）
 //!
 //! Wilson 区間・McNemar / Holm・診断レポート（REQ-29）・校正と棄権（REQ-22）は結線していない。
-//! 結果 JSON は正解率と Macro-F1 のみ（スキーマは提案でありオーナー未承認）。
+//! 結果 JSON は正解率と Macro-F1 のみ（スキーマは 2026-09-30 オーナー承認済み）。
 
 use std::path::Path;
 use std::time::Instant;
