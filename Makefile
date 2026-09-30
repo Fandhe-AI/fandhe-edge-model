@@ -380,7 +380,8 @@ py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲー�
 # `make test` から分離してあり、ここで --ignored 付きで実行する（python-ci.yml と
 # `make ci` の両方で実行するため、CI を通すための skip ではない）。
 # libtest のテスト名フィルタは 1 回の起動につき 1 つしか渡せないため、テストごとに
-# 個別に起動する。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
+# 個別に起動する（「パッケージ:テストバイナリ:テスト名」の組で回す。sandbox_pipeline_real_trainer は
+# sandbox 監視チェーンの完走確認。REQ-38・TASK-38.1・#161）。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
 # 一時ファイルへ出力してから表示する。--exact のテスト名がずれると 0 件実行で
 # 成功してしまうため、出力の「1 passed」も検査して fail-closed にする
 # （テスト名を変えたらここも更新する）。
@@ -394,15 +395,18 @@ test-trainer-integration: py-sync ## 実 trainer を Rust から起動する結�
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
 	@$(require_uv)
 	@out="$$(mktemp)"; overall=0; \
-	for t in req18_real_trainer_c1_job_completes_with_typed_outcome \
-		req18_real_trainer_c3_job_completes_with_validation_predictions; do \
-		cargo test -p fandhe-edge-train --test real_trainer -- --ignored --exact "$$t" >"$$out" 2>&1; \
+	for spec in \
+		fandhe-edge-train:real_trainer:req18_real_trainer_c1_job_completes_with_typed_outcome \
+		fandhe-edge-train:real_trainer:req18_real_trainer_c3_job_completes_with_validation_predictions \
+		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_completes_under_monitor_with_zero_tool_denials; do \
+		pkg="$${spec%%:*}"; rest="$${spec#*:}"; bin="$${rest%%:*}"; t="$${rest#*:}"; \
+		cargo test -p "$$pkg" --test "$$bin" -- --ignored --exact "$$t" >"$$out" 2>&1; \
 		status=$$?; \
 		cat "$$out"; \
 		if [ "$$status" -ne 0 ]; then \
-			echo "error: real_trainer の $$t が失敗しました（終了コード $$status）" >&2; overall=1; \
+			echo "error: $$bin の $$t が失敗しました（終了コード $$status）" >&2; overall=1; \
 		elif ! grep -q "test result: ok. 1 passed" "$$out"; then \
-			echo "error: real_trainer の $$t が実行・成功していません（テスト名の不一致の可能性）" >&2; overall=1; \
+			echo "error: $$bin の $$t が実行・成功していません（テスト名の不一致の可能性）" >&2; overall=1; \
 		fi; \
 	done; \
 	rm -f "$$out"; exit $$overall
