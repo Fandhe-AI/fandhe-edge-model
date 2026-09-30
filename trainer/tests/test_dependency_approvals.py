@@ -759,3 +759,36 @@ def test_req38_trailing_newline_pin_is_rejected() -> None:
     """末尾の改行付きの要求・固定版は完全一致でないため受理しない（REQ-38）。"""
     assert mod.PY_REQ_RE.fullmatch("numpy==2.5.3\n") is None
     assert mod.CARGO_PIN_RE.fullmatch("=1.0.0\n") is None
+
+
+@pytest.mark.parametrize("pin", ["=1.2.3-alpha", "=1.2.3+meta", "=1.2.3-rc.1+b", "=1.2", "1.2.3"])
+def test_req38_cargo_pin_only_accepts_plain_x_y_z(pin: str) -> None:
+    """Cargo の固定は `=x.y.z` のみ。pre-release・build metadata などは拒否する（REQ-38）。"""
+    assert mod.CARGO_PIN_RE.fullmatch(pin) is None
+    assert mod.CARGO_PIN_RE.fullmatch("=1.2.3") is not None
+
+
+@pytest.mark.parametrize("pin", ["=1.0.151-alpha", "=1.0.151+meta"])
+def test_req38_cargo_prerelease_pin_in_manifest_fails(
+    repo: Path, capsys: Capture, pin: str
+) -> None:
+    """manifest の `=x.y.z-pre` / `=x.y.z+meta` は pin_violation で exit 10（REQ-38）。"""
+    edit(repo, "Cargo.toml", 'serde_json = "=1.0.151"', f'serde_json = "{pin}"')
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("pin_violation", "serde_json") in kinds(payload)
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        "numpy==2.5.3rc1",
+        "numpy==2.5.3.post1",
+        "numpy==2.5.3.dev0",
+        "numpy==2.5.3+local",
+        "numpy==2.5.*",
+    ],
+)
+def test_req38_python_pre_post_dev_local_and_wildcard_pins_are_rejected(req: str) -> None:
+    """Python の固定は `==x.y.z` のみ（pre・post・dev・local・ワイルドカードは拒否。REQ-38）。"""
+    assert mod.PY_REQ_RE.fullmatch(req) is None

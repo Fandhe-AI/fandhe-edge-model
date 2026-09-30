@@ -74,7 +74,8 @@ EXIT_JUDGED_FAIL = 10
 EXIT_INVALID_INPUT = 64
 EXIT_RUNTIME_ERROR = 70
 
-CARGO_PIN_RE = re.compile(r"^=([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$")
+# `=x.y.z` のみ受理する（dependency-policy の完全固定。pre-release・build metadata は不可）。
+CARGO_PIN_RE = re.compile(r"=([0-9]+\.[0-9]+\.[0-9]+)")
 _EXTRA = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 PY_REQ_RE = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
