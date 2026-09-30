@@ -8,8 +8,8 @@
 //!
 //! # 範囲外（後続 TASK の責務）
 //!
-//! - 上限との照合（TASK-30.2・#124）。`limit_exceeded` への終了コード決定は
-//!   [`crate::package_outcome`]（#132）。40MB は目安であり、本モジュールは
+//! - 上限との照合は [`crate::capacity_limit`]（TASK-30.2・#124）。`limit_exceeded` への
+//!   終了コード決定は [`crate::package_outcome`]（#132）。40MB は目安であり、本モジュールは
 //!   合否の真偽値を持たない。語彙ファイル超過構成の目安との比較・除外記録は
 //!   [`crate::vocab_exclusion`]（TASK-30.3・#125）
 //! - JSON 直列化・CLI 工程への配線（CLI 側。#123・TASK-33.1）
@@ -139,7 +139,7 @@ impl CapacityError {
     /// 7 種の終了コードへの写像（REQ-21・REQ-30・#123）。分類はここ 1 か所に集約する。
     ///
     /// - 資源超過 `LimitExceeded`（20）: 1 ファイルの上限超過（`FsError::TooLarge`）・合計の
-    ///   あふれ（`Overflow`）。利用者が設定した合計容量の上限（TASK-30.2・#124）ではない
+    ///   あふれ（`Overflow`）。利用者が設定した合計容量の上限（[`crate::capacity_limit`]。TASK-30.2・#124）ではない
     /// - 実行時エラー `RuntimeError`（70）: 計測中の I/O 障害（権限・EIO 等。`NotFound`・
     ///   `InvalidInput` 以外の `io::ErrorKind` はすべて環境起因として扱う fail-closed）と、
     ///   プラットフォームの機能不足（`IdentityUnavailable`）。入力を直しても解消しない

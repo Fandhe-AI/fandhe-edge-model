@@ -17,9 +17,12 @@
 //!   `ort`・`tract-onnx` は未承認のため使わない（承認事項）。`artifact.json` の読み込み・CLI 配線は
 //!   後続（TASK-33.x）。`autoregressive` は未対応（REQ-19b の後続 TASK）。共有 fixture
 //!   `fixtures/onnx_parity/` との全件一致は `tests/onnx_parity.rs`（証拠種別: テストハーネス）
-//! - [`capacity`][]: 容量計測コア（REQ-30・TASK-30.1-1・#122）。実装済み。上限照合
-//!   （TASK-30.2）・配布パッケージ形式は後続 TASK。エラーの終了コード・公開メッセージへの
+//! - [`capacity`][]: 容量計測コア（REQ-30・TASK-30.1-1・#122）。実装済み。配布パッケージ形式は
+//!   後続 TASK（上限照合は `capacity_limit`）。エラーの終了コード・公開メッセージへの
 //!   写像（TASK-30.1-2・#123）を持ち、JSON 直列化は CLI 側
+//! - [`capacity_limit`][]: 利用者設定の容量上限の検証済み型と合計容量との照合（REQ-30・REQ-21・
+//!   TASK-30.2・#124）。超過は `LimitBreach::Capacity` として `package_outcome` へ渡す。
+//!   定義ファイル・CLI からの上限取り込みは未実装
 //! - [`export_exclusion`][]: 書き出し不能・予測ずれの構成を配布候補から外し理由を記録する
 //!   （REQ-32 異常系・TASK-32.2・#114）。既知制約は PoC-14 実測の表、実行時検出はテストハーネス。
 //!   `tract-onnx`・`ort` は未承認のため実行しない。JSON 直列化は CLI 側、`package` への配線は TASK-33.x
@@ -53,6 +56,7 @@
 //! 工程の接続（#136）後に追加する。
 
 pub mod capacity;
+pub mod capacity_limit;
 pub mod export_exclusion;
 pub mod latency;
 pub mod latency_limit;
