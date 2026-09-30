@@ -278,9 +278,14 @@ def test_req38_symlink_and_oversize_rejected(repo: Path, capsys: Capture) -> Non
     assert run(repo, capsys)[0] == 64
 
 
-def test_req38_missing_root_argument_is_invalid_input() -> None:
-    """引数不足は invalid_input(64)。"""
+def test_req38_missing_root_argument_is_invalid_input(capsys: Capture) -> None:
+    """引数不足は stdout に invalid_input の JSON 1 つを出し、stderr は空で exit 64。"""
     assert mod.main([]) == 64
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert (payload["status"], payload["code"]) == ("invalid_input", 64)
+    assert captured.out.count("\n") == 1
+    assert captured.err == ""
 
 
 def test_req38_unexpected_exception_maps_to_70(

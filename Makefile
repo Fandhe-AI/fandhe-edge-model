@@ -426,7 +426,8 @@ ifneq ($(HAS_PY),)
 	@$(require_uv)
 	uv run --no-project --offline --directory $(PY_DIR) python -I ../scripts/check_dependency_approvals.py --root ..
 else
-	@echo "skip: trainer/pyproject.toml 未追加のため check-dependency-approvals をスキップ"
+	@echo "error: trainer/pyproject.toml が無く check-dependency-approvals の照合対象が欠けている（fail-closed）" >&2
+	@exit 1
 endif
 
 .PHONY: ci

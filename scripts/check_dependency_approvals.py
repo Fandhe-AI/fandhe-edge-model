@@ -54,7 +54,7 @@ import sys
 import tomllib
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 # 各入力ファイルの読み込み上限。現行の最大は Cargo.lock・uv.lock の数十 KB 程度。
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -526,16 +526,37 @@ def run(root: Path) -> tuple[int, dict[str, Any]]:
     }
 
 
+class _ArgumentError(Exception):
+    """コマンドライン引数の不正（argparse の usage 出力・SystemExit を避けるための例外）。"""
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    """引数エラーで stderr へ usage を出さず `_ArgumentError` を送出する parser。"""
+
+    def error(self, message: str) -> NoReturn:
+        raise _ArgumentError(message)
+
+
 def main(argv: list[str]) -> int:
     """エントリポイント。例外は最後に runtime_error(70) へ写す（REQ-21）。"""
     try:
-        parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        parser = _JsonArgumentParser(description=__doc__.splitlines()[0])
         parser.add_argument("--root", required=True, type=Path, help="repository root")
         try:
             args = parser.parse_args(argv)
-        except SystemExit as exc:
-            code = exc.code if isinstance(exc.code, int) else EXIT_INVALID_INPUT
-            return EXIT_OK if code == 0 else EXIT_INVALID_INPUT
+        except _ArgumentError as exc:
+            # 引数不正も「stdout に JSON 1 つ」の契約に揃え、invalid_input(64) で返す
+            payload = {
+                "status": "invalid_input",
+                "code": EXIT_INVALID_INPUT,
+                "message": f"invalid arguments: {exc}",
+                "violation_count": 0,
+                "violations": [],
+            }
+            sys.stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+            return EXIT_INVALID_INPUT
+        except SystemExit as exc:  # --help（終了コード 0）のみ。usage は argparse が出力済み
+            return EXIT_OK if exc.code in (0, None) else EXIT_INVALID_INPUT
         code, payload = run(args.root)
     except Exception:  # 予期しない例外も JSON 1 つと終了コード 70 に揃える
         code, payload = (
