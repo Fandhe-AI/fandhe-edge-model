@@ -12,7 +12,9 @@
 //! - 検査順序は 経路 → サイズ → 形式。通常ファイル以外（FIFO・デバイス等）も拒否する
 //! - 天井 [`MAX_READ_FILE_BYTES`] は [`effective_read_limit`] で `format`・`version_ledger` の
 //!   読み込み口にも適用され、呼び出し側は 1 GiB を超える上限を渡せない
-//! - 確認後にファイルが伸びても、読み込み側（`core::fs` の `take(limit + 1)`）で頭打ちになる
+//! - 確認後にファイルが伸びても頭打ちになるよう、[`SizeCheckedFile`] は生の `File` を返さず、
+//!   実効上限 + 1 バイトで打ち切る `Take<File>`（[`SizeCheckedFile::into_parts`]）または
+//!   上限内読み込み（[`SizeCheckedFile::read_to_end_bounded`]）だけを公開する
 //! - 拒否メッセージにパス・ファイル内容を含めない（size・limit の数値のみ）
 //!
 //! CLI の `infer --input-file` への配線と `ToErrorReport` 写像は #136 の範囲。
@@ -21,6 +23,7 @@ use crate::path::{ConfinedPath, PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// 読み込むファイルサイズの暫定上限（1 GiB。PoC-20 の `MAX_INPUT_FILE_BYTES` 相当。REQ-39）。
@@ -161,11 +164,14 @@ impl std::error::Error for SizeCheckedOpenRejection {
 }
 
 /// 閉じ込め検証とサイズ確認を通ったハンドル。パスから開き直さず、このハンドルを読むこと。
+///
+/// 生の `File` は公開せず、読み込みには常に実効上限が掛かる（確認後に伸びたファイルへの対策。REQ-39）。
 #[derive(Debug)]
 pub struct SizeCheckedFile {
     file: File,
     path: ConfinedPath,
     size: u64,
+    limit: u64,
 }
 
 impl SizeCheckedFile {
@@ -174,11 +180,67 @@ impl SizeCheckedFile {
         self.size
     }
 
-    /// ハンドル・検証済み経路・確認済みサイズに分解する。
-    pub fn into_parts(self) -> (File, ConfinedPath, u64) {
-        (self.file, self.path, self.size)
+    /// 適用した実効上限（バイト）。
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// 実効上限 + 1 バイトで打ち切る読み手・検証済み経路・確認済みサイズに分解する。
+    ///
+    /// 読み手が上限 + 1 バイト返したら、確認後に伸びたことを意味するので呼び出し側は拒否すること。
+    pub fn into_parts(self) -> (std::io::Take<File>, ConfinedPath, u64) {
+        let cap = self.limit.saturating_add(1);
+        (self.file.take(cap), self.path, self.size)
+    }
+
+    /// 実効上限を超えない範囲で全体を読む。超えたら `TooLarge`（`size` は観測できた下限値）。
+    pub fn read_to_end_bounded(self) -> Result<Vec<u8>, SizeCheckedReadRejection> {
+        let limit = self.limit;
+        let mut buf = Vec::new();
+        self.file
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(SizeCheckedReadRejection::Io)?;
+        let read = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        if read > limit {
+            return Err(SizeCheckedReadRejection::Size(
+                FileSizeRejection::TooLarge { size: read, limit },
+            ));
+        }
+        Ok(buf)
     }
 }
+
+/// [`SizeCheckedFile::read_to_end_bounded`] の拒否理由。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SizeCheckedReadRejection {
+    /// 読み込み中に上限を超えた。
+    Size(FileSizeRejection),
+    /// 読み込み I/O の失敗。
+    Io(std::io::Error),
+}
+
+impl SizeCheckedReadRejection {
+    /// 終了コード（REQ-21）。
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            SizeCheckedReadRejection::Size(e) => e.exit_code(),
+            SizeCheckedReadRejection::Io(_) => ExitCode::RuntimeError,
+        }
+    }
+}
+
+impl fmt::Display for SizeCheckedReadRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SizeCheckedReadRejection::Size(e) => e.fmt(f),
+            SizeCheckedReadRejection::Io(_) => write!(f, "file read failed"),
+        }
+    }
+}
+
+impl std::error::Error for SizeCheckedReadRejection {}
 
 /// `root` 配下の `candidate` を [`open_confined`] で開き、読み込み前にサイズを確認する
 /// （`infer --input-file` 等の利用者入力ファイル向け入口。TASK-39.5-3・#172）。
@@ -188,8 +250,14 @@ pub fn open_confined_size_checked(
     limit: u64,
 ) -> Result<SizeCheckedFile, SizeCheckedOpenRejection> {
     let (file, path) = open_confined(root, candidate).map_err(SizeCheckedOpenRejection::Path)?;
+    let limit = effective_read_limit(limit);
     let size = check_file_size_within(&file, limit).map_err(SizeCheckedOpenRejection::Size)?;
-    Ok(SizeCheckedFile { file, path, size })
+    Ok(SizeCheckedFile {
+        file,
+        path,
+        size,
+        limit,
+    })
 }
 
 #[cfg(test)]
@@ -219,6 +287,35 @@ mod tests {
         assert_eq!(check_file_size_within(&f0, 0).unwrap(), 0);
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(p0);
+    }
+
+    /// REQ-39・TASK-39.5-3: 確認後に伸びたファイルは上限 + 1 で打ち切られ拒否される。
+    #[test]
+    fn req39_read_is_bounded_after_growth() {
+        let root = std::env::temp_dir().join(format!("fe-guard-fsz-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("g.bin");
+        std::fs::write(&p, [0u8; 8]).unwrap();
+        let checked = open_confined_size_checked(&root, Path::new("g.bin"), 10).unwrap();
+        assert_eq!(checked.limit(), 10);
+        std::fs::write(&p, [0u8; 100]).unwrap();
+        match checked.read_to_end_bounded() {
+            Err(SizeCheckedReadRejection::Size(FileSizeRejection::TooLarge {
+                size: 11,
+                limit: 10,
+            })) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        // into_parts の読み手も上限 + 1 で打ち切られる
+        std::fs::write(&p, [0u8; 8]).unwrap();
+        let checked = open_confined_size_checked(&root, Path::new("g.bin"), 10).unwrap();
+        std::fs::write(&p, [0u8; 100]).unwrap();
+        let (mut r, _, size) = checked.into_parts();
+        assert_eq!(size, 8);
+        let mut v = Vec::new();
+        r.read_to_end(&mut v).unwrap();
+        assert_eq!(v.len(), 11);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// REQ-39・TASK-39.5-3: 天井の丸め。
