@@ -16,7 +16,7 @@
 | 評価器（指標・McNemar / Holm・回帰・診断。REQ-21〜27/29）。パス: `crates/eval/`（`fandhe-edge-eval`。正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は未実装。TASK-24.1-1・#59） | evaluator-builder | sonnet |
 | 成果物・推論 SDK（配布パッケージ・学習非依存の推論ランタイム。REQ-28/30〜32）。パス: `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目〔#117〕・容量計測コア〔TASK-30.1-1・#122〕・容量内訳の JSON 出力接続〔エラー写像は runtime、直列化は cli の output。TASK-30.1-2・#123〕を実装済み。バイト前処理〔TASK-32.1-1・#112〕・C1・C3 の ONNX を読む自作推論バックエンド〔TASK-32.1-2・#113〕を実装済み。書き出し不能構成の除外・理由記録〔TASK-32.2・#114〕も実装済み。autoregressive の ONNX 推論は未着手） | runtime-builder | sonnet |
 | 操作アダプター - CLI（7 工程・JSON 入出力契約。REQ-33）。パス: `crates/cli/`（`fandhe-edge-cli`） | adapter-builder | sonnet |
-| 操作アダプター - ガード層（REQ-39）。パス: `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕・`infer` の `--package`・`onnx_file` への統合〔TASK-39.4-2・#159〕・`kind` の `infer` への統合〔TASK-39.2-4・#156〕を実装済み。TASK-39.2-1・#153）／TUI・MCP（REQ-35/36/37）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
+| 操作アダプター - ガード層（REQ-39）。パス: `crates/guard/`（`fandhe-edge-guard`。許可リストによる形式判定・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕・`infer` の `--package`・`onnx_file` への統合〔TASK-39.4-2・#159〕・`kind` の `infer` への統合〔TASK-39.2-4・#156〕・`kind_version` の許可リスト〔TASK-39.6-1・#174〕を実装済み。TASK-39.2-1・#153）／TUI・MCP（REQ-35/36/37）。パス: 未確定（後続 TASK で追加） | adapter-builder | sonnet |
 | ルート `Cargo.toml`・`pyproject.toml`・`.github/workflows/`・`deny.toml`・`Makefile`・`lefthook.yml`・lint 設定・`scripts/` | infra-builder | sonnet |
 | テスト実行・失敗解析（`make test` / `make lint`） | test-runner | sonnet |
 | コードレビュー | reviewer | sonnet |

@@ -1,0 +1,8 @@
+{
+  "_meta": {
+    "description": "Allowed kind_version values per kind (REQ-39, TASK-39.6-1). Single source of truth is trainer/src/fandhe_edge_trainer/kinds/__init__.py::_registry. Cross-checked by trainer/tests/test_kind_versions_fixture.py and crates/train/tests/guard_kind_version_allowlist_sync.rs (against KindVersionAllowlist::supported())."
+  },
+  "c1": [1],
+  "c3": [1],
+  "autoregressive": [1]
+}

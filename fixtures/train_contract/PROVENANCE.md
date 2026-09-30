@@ -218,6 +218,15 @@ print(json.dumps(
 `["l0", "l1", ..., "l1024"]`（`f"l{i}" for i in range(1025)`）として生成した。
 生成スクリプトは残していない（値は fixture へ直接書き込み済み）。
 
+## `kind_versions.json`
+
+`kind` ごとの許可 `kind_version`（REQ-39・TASK-39.6-1・#174）。正本は
+`trainer/src/fandhe_edge_trainer/kinds/__init__.py::_registry` で、手作業で
+`{"c1": [1], "c3": [1], "autoregressive": [1]}` を書いた。
+`trainer/tests/test_kind_versions_fixture.py` が `_registry` との一致を、
+`crates/train/tests/guard_kind_version_allowlist_sync.rs` が
+`KindVersionAllowlist::supported()` との一致を照合する。
+
 ## `worker_crash_message.json`
 
 手書き。`trainer/src/fandhe_edge_trainer/supervisor.py` の固定文言

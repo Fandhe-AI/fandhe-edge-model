@@ -40,6 +40,7 @@ use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
 use fandhe_edge_guard::format::FormatRejection;
 use fandhe_edge_guard::kind::KindRejection;
+use fandhe_edge_guard::kind_version::KindVersionRejection;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
@@ -197,6 +198,17 @@ impl ToErrorReport for KindRejection {
     }
 }
 
+/// `kind_version` の許可リスト拒否（REQ-39・TASK-39.6-1・#174）。`reason_code` の固定語彙だけを使い、
+/// 入力値（版番号）を含めない。
+impl ToErrorReport for KindVersionRejection {
+    fn to_error_report(&self) -> ErrorReport {
+        ErrorReport::new(
+            self.exit_code(),
+            format!("kind_version rejected: {}", self.reason_code()),
+        )
+    }
+}
+
 /// `artifact.json` の解釈エラー。入力値を含めない固定文へ写す（REQ-39）。
 impl ToErrorReport for ArtifactMetaError {
     fn to_error_report(&self) -> ErrorReport {
@@ -283,6 +295,21 @@ mod tests {
             assert_eq!(report.code, ExitCode::InvalidInput);
             assert_eq!(report.message, message);
         }
+    }
+
+    /// REQ-39・REQ-21・TASK-39.6-1: `kind_version` の拒否は invalid_input・固定語彙（版番号を含めない）。
+    #[test]
+    fn req39_kind_version_rejection_maps_to_invalid_input_fixed_message() {
+        let kind = KindAllowlist::supported().check("c3").expect("allowed");
+        let rejection = fandhe_edge_guard::kind_version::KindVersionAllowlist::supported()
+            .check(kind, 99)
+            .expect_err("must be rejected");
+        let report = rejection.to_error_report();
+        assert_eq!(report.code, ExitCode::InvalidInput);
+        assert_eq!(
+            report.message,
+            "kind_version rejected: unsupported_kind_version"
+        );
     }
 
     /// REQ-21: 7 種の固定 message の具体値。

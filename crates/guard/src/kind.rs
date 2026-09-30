@@ -8,7 +8,7 @@
 //!
 //! # 責務境界
 //!
-//! - 検査するのは `kind` だけ。`kind_version` の許可リストは TASK-39.6（#174）で扱う
+//! - 検査するのは `kind` だけ。`kind_version` の許可リストは [`crate::kind_version`]（TASK-39.6-1・#174）で扱う
 //! - JSON 上で `kind` が欠落している・文字列でない場合は呼び出し側（CLI の `infer` 統合 TASK-39.2-4・#156。欠落は必須違反として拒否）の
 //!   解析エラーとして扱い、本 API は `&str` を受け取る
 //! - 既定の許可集合は学習ワーカーの選択口（TASK-19.1 の `_registry`）と同じ。ずれは
@@ -112,7 +112,7 @@ impl fmt::Display for KindRejection {
 impl std::error::Error for KindRejection {}
 
 /// 構文検査の 1 箇所実装。長さ → 空 → 文字の順に判定する。
-fn validate_kind_syntax(kind: &str) -> Result<(), KindRejection> {
+pub(crate) fn validate_kind_syntax(kind: &str) -> Result<(), KindRejection> {
     if kind.len() > MAX_KIND_LEN {
         return Err(KindRejection::TooLong {
             len: kind.len(),
