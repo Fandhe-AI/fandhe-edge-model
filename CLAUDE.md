@@ -22,7 +22,7 @@ fandhe-edge-model/
 ├── LICENSE-MIT / LICENSE-APACHE   # MIT OR Apache-2.0 デュアルライセンス
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig                  # インデント・改行・文字コード規約
-├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・py-*（ruff・pytest）・test-trainer-integration（実 trainer 結合テスト。#258）・ci・clean。`make help`）
+├── Makefile                       # 開発タスク集約（setup・doctor・lint-docs・fmt・clippy・test・deny・py-*（ruff・pytest）・test-trainer-integration（実 trainer 結合テスト。#258）・check-dependency-approvals（依存の承認台帳の照合。#165）・ci・clean。`make help`）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── .markdownlint.jsonc / .markdownlintignore / .yamllint / .editorconfig-checker.json  # lint-docs 設定
 ├── skills-lock.json               # 導入スキルのロックファイル
@@ -30,6 +30,7 @@ fandhe-edge-model/
 ├── lefthook.yml                    # git hooks 定義（`make hooks` で導入。未導入の間は動作しない）
 ├── Cargo.toml                      # workspace 定義（resolver 3・edition 2024・license `MIT OR Apache-2.0`）
 ├── Cargo.lock                      # 依存ロック
+├── dependency-approvals.json       # 依存の承認台帳（`scripts/check_dependency_approvals.py` が manifest・lock と照合。REQ-38・TASK-38.3・#165）
 ├── crates/                         # 層に対応する crate 群（残りの層は後続 TASK で追加）
 │   ├── core/                       # `fandhe-edge-core`（lib。共通コア。作り直し判定〔`rebuild`。REQ-20・TASK-20.1〜20.3〕を含む。REQ-15）
 │   ├── cli/                        # `fandhe-edge-cli`（lib＋bin `fandhe-edge`。操作アダプター - CLI。REQ-33）
@@ -40,9 +41,9 @@ fandhe-edge-model/
 │   └── train/                      # `fandhe-edge-train`（lib。学習ワーカー層 - 学習リクエスト・結果 JSON の型・子プロセス起動と終了コード写像〔#178〕・探索予算内の候補選定〔TASK-18.1・#83・#84〕・選定結果の有意性判定〔TASK-18.3-1・#87〕・中断ジョブへの再開非提供とやり直し案内〔TASK-34.3・#147〕・ジョブ記録の永続化とクラッシュ検出〔TASK-34.2・#146〕・kind 省略時の既定候補の解決〔TASK-19.2・#77〕を実装済み。CLI `train` 工程への配線〔TASK-33.x〕は未着手。REQ-18/19/34/39。issue #177）
 ├── trainer/                       # 学習ワーカー（Python。uv プロジェクト: pyproject.toml・uv.lock・.python-version）。選択口（TASK-19.1/19.3）と既定候補 C1（バイト n-gram TF-IDF＋ロジスティック回帰。TF-IDF は ONNX グラフ内で計算）・C3（バイト CNN）・autoregressive（バイト単位の小型自己回帰 decoder。対応づけ (b) を ONNX グラフ内で計算。REQ-19b・TASK-19b.1-1・#79）と対応づけ (b) の選択肢 ID 対応づけ・判定不能扱い（TASK-19b.1-2・#234、TASK-19b.2・#250）を実装済み（MLX 学習・ONNX 書き出し）。lifeline による子孫プロセスの終了（`supervisor.py`）・学習直後の validation 予測（`predict.py`）・資源上限（`budget.py`）も実装済み。選定は Rust 側 `crates/train`、作り直し判定（TASK-20.x）は `crates/core` の `rebuild` で実装済みで、CLI `train` 工程への配線（TASK-33.x）は未着手
 ├── fixtures/                       # 層をまたいで共有するテストデータ（`docs/spec` を参照しない）。`preprocess/byte_encoding_vectors.json`（バイトエンコードのゴールデンベクタ。将来 Rust 推論ランタイムからも参照する契約。Chore #10）・`exitcode/exit_codes.json`（終了コード 7 種の共有 fixture。Rust と学習ワーカーの一致照合。#179）・`train_contract/`（学習リクエスト・結果 JSON・既定候補 `default_candidates.json` の共有 fixture。`crates/train`・`trainer` の一致照合。issue #177）・`score_tolerance/score_sum_tolerance.json`（`SCORE_SUM_TOLERANCE` の共有 fixture。`crates/core`・`crates/data` が独立に持つ同名定数の一致照合。PR #202）・`sandbox_run/`（sandbox 監視チェーンの完走確認用の合成定義・学習データ。REQ-38・TASK-38.1・#161）・`onnx_parity/`（C1・C3 の ONNX と MLX 内推論の予測ラベル。`trainer/tools/gen_onnx_parity_fixture.py` が生成し、`crates/runtime` の全件一致テストが読む。REQ-32・#113）
-├── scripts/                       # `cli-infer-noninteractive.sh`（Bash 経由の非対話実行確認スクリプト。REQ-36・TASK-36.1-1・#149。opt-in の環境変数 `FANDHE_EDGE_RECORD_DIR` で実行記録 JSON を保存する。TASK-36.1-2・#150）・`sandbox-run.sh`（sandbox 下で 7 工程を順に実行するスクリプト。実機確認は人の担当。REQ-38・TASK-38.1-1・#162）・`sandbox-monitor.sh`（`log stream` の拒否ログ監視で包み通信拒否 0 件を自動判定するスクリプト。集計は標準ライブラリのみの `sandbox_deny_report.py`。実機確認は人の担当。REQ-38・TASK-38.1-2・#163）
+├── scripts/                       # `cli-infer-noninteractive.sh`（Bash 経由の非対話実行確認スクリプト。REQ-36・TASK-36.1-1・#149。opt-in の環境変数 `FANDHE_EDGE_RECORD_DIR` で実行記録 JSON を保存する。TASK-36.1-2・#150）・`sandbox-run.sh`（sandbox 下で 7 工程を順に実行するスクリプト。実機確認は人の担当。REQ-38・TASK-38.1-1・#162）・`check_dependency_approvals.py`（依存の承認台帳と manifest・lock の照合。標準ライブラリのみ。REQ-38・TASK-38.3・#165）・`sandbox-monitor.sh`（`log stream` の拒否ログ監視で包み通信拒否 0 件を自動判定するスクリプト。集計は標準ライブラリのみの `sandbox_deny_report.py`。実機確認は人の担当。REQ-38・TASK-38.1-2・#163）
 ├── docs/
-│   ├── design/                    # 設計・運用手順（`sandbox-offline-check-procedure.md`: sandbox 下の完走確認の実機手順と記録項目。REQ-38・TASK-38.1・#161、`runtime-batch-mismatch-procedure.md`: 推論の不一致発見時の原因特定・記録手順。REQ-28・TASK-28.2・#119、`claude-code-permission-prompt-procedure.md`: Claude Code の許可操作〔確認画面〕発生時の動作確認手順。人が実機で実行。REQ-36・TASK-36.3・#160）
+│   ├── design/                    # 設計・運用手順（`dependency-approval-flow.md`: 依存追加時の明示承認フローとチェックリスト。REQ-38・TASK-38.3・#165、`sandbox-offline-check-procedure.md`: sandbox 下の完走確認の実機手順と記録項目。REQ-38・TASK-38.1・#161、`runtime-batch-mismatch-procedure.md`: 推論の不一致発見時の原因特定・記録手順。REQ-28・TASK-28.2・#119、`claude-code-permission-prompt-procedure.md`: Claude Code の許可操作〔確認画面〕発生時の動作確認手順。人が実機で実行。REQ-36・TASK-36.3・#160）
 │   └── spec/                      # fandhe-edge-model-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・ci・python-ci・update-external（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
