@@ -227,6 +227,9 @@ def load_positive_control_meta(path: str) -> dict:
         v = meta.get(key)
         if not isinstance(v, str) or not UTC_RE.match(v):
             raise Undeterminable("positive control record timestamp is invalid")
+    for key in ("curl_override", "sandbox_exec_override"):
+        if not isinstance(meta.get(key), bool):
+            raise Undeterminable("positive control record override flag is invalid")
     return meta
 
 
@@ -463,6 +466,9 @@ def build(args: argparse.Namespace) -> tuple[int, dict, dict]:
                 raise Undeterminable("positive control command succeeded; the block is not active")
             if control_meta["pid"] in tool_pids:
                 raise Undeterminable("positive control pid overlaps with the run processes")
+            # curl・launcher を差し替えた陽性対照は本物の証拠にならない（REQ-38）
+            if control_meta["curl_override"] or control_meta["sandbox_exec_override"]:
+                hint = "test_harness"
         stats = {"lines": 0}
         result = classify(
             iter_stream(args.stream, stats),

@@ -1163,6 +1163,13 @@ fn control_meta(pid: &str, rc: &str, started: &str, ended: &str) -> String {
     )
 }
 
+fn control_meta_flags(curl: &str, launcher: &str) -> String {
+    format!(
+        "{{\"pid\":4242,\"exit_code\":6,\"started_utc\":\"{T0}\",\"ended_utc\":\"{T0}\",\
+         \"curl_override\":{curl},\"sandbox_exec_override\":{launcher}}}"
+    )
+}
+
 /// 陽性対照の記録つきで集計器を直接実行する（実行の記録は T1〜T2、監視窓は T0〜T3）。
 fn run_report_control(dir: &Path, stream: &Path, run_meta: &str, control: &str) -> Out {
     let control_path = dir.join("positive_control.meta.json");
@@ -1385,4 +1392,43 @@ fn req38_report_without_positive_control_never_returns_ok() {
         &o,
         "no network denials were observed but the positive control was not run",
     );
+}
+
+/// curl・launcher のどちらかを差し替えた陽性対照は、本物の launcher・log でも test_harness（REQ-38）。
+/// 差し替えなし（false / false）のときだけ requires_human_review。
+#[test]
+fn req38_control_override_flags_set_test_harness_hint() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for (curl, launcher, hint) in [
+        ("true", "false", "test_harness"),
+        ("false", "true", "test_harness"),
+        ("true", "true", "test_harness"),
+        ("false", "false", "requires_human_review"),
+    ] {
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta_with_pids(0, T1, T2, "[5001]"),
+            &control_meta_flags(curl, launcher),
+        );
+        assert_eq!(o.code, Some(0), "{curl}/{launcher}: {}", o.stdout);
+        has(&o, &format!("\"evidence_hint\": \"{hint}\""));
+    }
+}
+
+/// 上書きフラグが bool でない・欠落している記録は判定不能 70。
+#[test]
+fn req38_control_override_flags_must_be_bool() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    for bad in [
+        control_meta_flags("\"true\"", "false"),
+        control_meta_flags("false", "1"),
+        format!("{{\"pid\":4242,\"exit_code\":6,\"started_utc\":\"{T0}\",\"ended_utc\":\"{T0}\"}}"),
+    ] {
+        let o = run_report_control(&e.dir, &stream, &meta(0, T1, T2), &bad);
+        assert_eq!(o.code, Some(70), "{bad}: {}", o.stdout);
+        has(&o, "\"positive_control\": \"not_evaluated\"");
+    }
 }
