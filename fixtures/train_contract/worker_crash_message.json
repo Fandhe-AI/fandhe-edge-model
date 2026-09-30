@@ -1,0 +1,16 @@
+{
+  "prefix": "worker terminated by signal ",
+  "crash_messages": [
+    { "message": "worker terminated by signal 9", "signal": 9 },
+    { "message": "worker terminated by signal 11", "signal": 11 }
+  ],
+  "non_crash_messages": [
+    "worker terminated by signal x",
+    "worker terminated by signal 9 extra",
+    "worker terminated by signal ",
+    "worker terminated by signal +9",
+    "worker terminated by signal 9 ",
+    "worker exceeded the cpu limit and was terminated",
+    "resource monitoring failed (ps unavailable); worker terminated"
+  ]
+}

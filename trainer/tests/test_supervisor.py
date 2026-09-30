@@ -1519,6 +1519,50 @@ def test_req34_forward_worker_error_keeps_other_messages() -> None:
         assert supervisor._forward_worker_error(q)["message"] == "worker reported an error"
 
 
+def test_req34_external_sigkill_below_cpu_limit_is_not_a_cpu_self_exit() -> None:
+    """REQ-34・TASK-34.2・#146: CPU 消費がソフト上限未満の外部 `SIGKILL` は資源上限
+    （`"cpu"`）ではなく `None`（= クラッシュ側。呼び出し元が `worker terminated by
+    signal 9` を返し、Rust 側がクラッシュと分類する）。証拠種別: テストハーネス。"""
+    proc = _spawn("import time; time.sleep(60)")
+    try:
+        killer = threading.Timer(0.3, proc.kill)
+        killer.start()
+        reason = supervisor.monitor_child(
+            proc,
+            time_limit_seconds=60.0,
+            rss_limit_bytes=64 * 1024 * 1024 * 1024,
+            poll_interval=0.05,
+            grace_seconds=0.0,
+        )
+        killer.join()
+        assert reason is None
+        assert proc.returncode == -9
+    finally:
+        _reap(proc)
+
+
+def _crash_fixture() -> dict:
+    root = Path(__file__).resolve().parents[2]
+    path = root / "fixtures" / "train_contract" / "worker_crash_message.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_req34_worker_signal_prefix_matches_shared_fixture() -> None:
+    """REQ-34・TASK-34.2・#146: シグナル終了文言の接頭辞は Rust 側と共有 fixture で一致する。"""
+    fx = _crash_fixture()
+    assert supervisor._WORKER_SIGNAL_MESSAGE_PREFIX == fx["prefix"]
+    assert supervisor._WORKER_SIGNAL_MESSAGE_PREFIX == "worker terminated by signal "
+    for case in fx["crash_messages"]:
+        assert case["message"] == f"{fx['prefix']}{case['signal']}"
+
+
+def test_req34_forward_worker_error_neutralizes_forged_crash_message() -> None:
+    """REQ-34・#146: worker が返した「シグナル終了」文言は偽装として置き換える。"""
+    for case in _crash_fixture()["crash_messages"]:
+        q = {"status": "error", "code": "runtime_error", "message": case["message"]}
+        assert supervisor._forward_worker_error(q)["message"] == "worker reported an error"
+
+
 def test_req39_unreaped_worker_is_reap_failed_not_cancelled() -> None:
     """REQ-39・REQ-34 回帰（P0）: `wait` がタイムアウトして回収を確認できない
     worker は `"cancelled"` にせず `"reap_failed"` を返す。"""
