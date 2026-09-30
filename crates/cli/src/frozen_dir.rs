@@ -6,6 +6,10 @@
 //! `data/` を開いた fd（[`crate::project::Project::open_subdir`]）を起点に、ガード層の `openat`
 //! （`O_NOFOLLOW`）系の操作だけで配置する。パスの正規化・再解決をしないので、検証後にパスが
 //! symlink へ差し替えられてもプロジェクトの外を読み書きしない。手順そのものはここに複製しない。
+//!
+//! Linux・macOS 限定（ガード層の fd 操作の target 依存と同じ。`lib.rs` で cfg により局所化する）。
+//! それ以外の OS では本モジュールを持たず、`register` は評価データの配置を従来どおり
+//! `runtime_error` で拒否する（fail-closed。Windows は M10 時点で対象外）。
 
 use std::fs::File;
 use std::io;
@@ -39,7 +43,6 @@ fn to_io(rejection: &PathRejection) -> io::Error {
     }
 }
 
-#[cfg(unix)]
 impl PlacementDir for HeldPlacementDir {
     fn dir_mode_and_uid(&self) -> io::Result<(u32, u32)> {
         use std::os::unix::fs::MetadataExt as _;
@@ -104,37 +107,7 @@ impl PlacementDir for HeldPlacementDir {
     }
 }
 
-/// 非 unix では配置しない（data 層の `place_read_only_bytes` が `UnsupportedPlatform` を返す。
-/// この実装のメソッドは呼ばれない）。
-#[cfg(not(unix))]
-impl PlacementDir for HeldPlacementDir {
-    fn dir_mode_and_uid(&self) -> io::Result<(u32, u32)> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn create_private_dir(&self, _name: &str) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn entry_uid(&self, _name: &str) -> io::Result<u32> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn create_new_file(&self, _rel: &str) -> io::Result<File> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn probe_append(&self, _rel: &str) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn publish_no_replace(&self, _rel: &str, _name: &str) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn stat_entry(&self, _name: &str) -> io::Result<(u64, u64, u32)> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    fn remove_dir_tree(&self, _name: &str) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use fandhe_edge_data::eval_freeze::freeze_eval_data;

@@ -23,19 +23,17 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::definition::MAX_DEFINITION_FILE_BYTES;
-use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::stage_report::RegisterReport;
 use fandhe_edge_data::eval_freeze::{FreezeRecord, freeze_eval_data};
-use fandhe_edge_data::frozen_placement::{PlacementError, place_read_only_bytes};
 use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 
 use crate::args::RegisterArgs;
 use crate::error_report::ToErrorReport;
-use crate::frozen_dir::HeldPlacementDir;
 use crate::project::{
     DATA_DIR, DEFINITION_FILE, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project,
-    TRAIN_DATA_FILE, fail, fs_report, invalid, parse_definition, runtime,
+    TRAIN_DATA_FILE, fs_report, invalid, parse_definition, runtime,
 };
 
 /// 「対象が存在しない」を表す拒否か（`NotFound` のみ。権限拒否・I/O 失敗は含めない）。
@@ -142,19 +140,7 @@ fn place_project(
     project.create_dir(DATA_DIR)?;
     project.write_new(Path::new(DATA_DIR).join(TRAIN_DATA_FILE), train_bytes)?;
     if let Some((eval_bytes, record)) = evaluation {
-        // 凍結記録との照合・0400 化・書き込み拒否のプローブ・原子的な公開の手順は data 層の
-        // `place_read_only_bytes` に一本化する（モード 0400 だけで凍結済みとみなさない。REQ-17・REQ-39）。
-        // コピー元は `read_confined` で検証・読み込み済みのバイト列（パスを開き直さない）、配置先は
-        // `data/` を保持 fd から開いたハンドル（パスを再解決しない）。`data/` は 0700 の管理ディレクトリ。
-        let data_dir = HeldPlacementDir::new(project.open_subdir(DATA_DIR)?);
-        place_read_only_bytes(
-            eval_bytes,
-            &data_dir,
-            EVALUATION_DATA_FILE,
-            record,
-            MAX_PROJECT_FILE_BYTES,
-        )
-        .map_err(|e| placement_report(&e))?;
+        place_evaluation(project, eval_bytes, record)?;
         let json = record
             .to_json()
             .map_err(|_| runtime("cannot serialize freeze record"))?;
@@ -163,19 +149,53 @@ fn place_project(
     Ok(())
 }
 
-/// 読み取り専用配置の失敗を [`ErrorReport`] にする（message は固定語彙。パスを含めない）。
+/// 評価データを `data/` へ読み取り専用で配置する（Linux・macOS）。
 ///
-/// 入力起因（記録との不一致・既存・不正な名前）は `invalid_input`、サイズ超過は `limit_exceeded`、
-/// 書き込み拒否を確認できない環境（root・ACL 等）や I/O 失敗は `runtime_error`（fail-closed）。
-fn placement_report(e: &PlacementError) -> ErrorReport {
-    match e {
+/// 凍結記録との照合・0400 化・書き込み拒否のプローブ・原子的な公開の手順は data 層の
+/// `place_read_only_bytes` に一本化する（モード 0400 だけで凍結済みとみなさない。REQ-17・REQ-39）。
+/// コピー元は `read_confined` で検証・読み込み済みのバイト列（パスを開き直さない）、配置先は
+/// `data/` を保持 fd から開いたハンドル（パスを再解決しない）。`data/` は 0700 の管理ディレクトリ。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn place_evaluation(
+    project: &Project,
+    eval_bytes: &[u8],
+    record: &FreezeRecord,
+) -> Result<(), ErrorReport> {
+    use crate::frozen_dir::HeldPlacementDir;
+    use fandhe_edge_core::exitcode::ExitCode;
+    use fandhe_edge_data::frozen_placement::{PlacementError, place_read_only_bytes};
+
+    let data_dir = HeldPlacementDir::new(project.open_subdir(DATA_DIR)?);
+    place_read_only_bytes(
+        eval_bytes,
+        &data_dir,
+        EVALUATION_DATA_FILE,
+        record,
+        MAX_PROJECT_FILE_BYTES,
+    )
+    .map(|_| ())
+    .map_err(|e| match &e {
+        // 入力起因（記録との不一致・既存）は `invalid_input`、サイズ超過は `limit_exceeded`、
+        // 書き込み拒否を確認できない環境（root・ACL 等）や I/O 失敗は `runtime_error`（fail-closed）。
+        // message は固定語彙でパスを含めない。
         PlacementError::HashMismatch => invalid("evaluation data does not match freeze record"),
         PlacementError::AlreadyExists { .. } => invalid("file already exists"),
-        PlacementError::TooLarge { .. } => fail(
+        PlacementError::TooLarge { .. } => crate::project::fail(
             ExitCode::LimitExceeded,
             "evaluation data exceeds size limit",
         ),
         PlacementError::Fs(fs) => fs_report(fs),
         _ => runtime("cannot place evaluation data read-only"),
-    }
+    })
+}
+
+/// 保持 fd 起点の配置は Linux・macOS のみ。それ以外の OS では配置せず拒否する（fail-closed。
+/// Windows は M10 時点で対象外。従来の `UnsupportedPlatform` と同じく `runtime_error`）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn place_evaluation(
+    _project: &Project,
+    _eval_bytes: &[u8],
+    _record: &FreezeRecord,
+) -> Result<(), ErrorReport> {
+    Err(runtime("cannot place evaluation data read-only"))
 }
