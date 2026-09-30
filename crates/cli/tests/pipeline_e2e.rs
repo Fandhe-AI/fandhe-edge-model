@@ -555,6 +555,28 @@ mod suite {
         assert!(env.project_file("candidates/0/result.json").is_file());
     }
 
+    /// REQ-17: `inspect --seed 7` は分割記録の seed を 7 にし、`train` の学習リクエストの seed も 7 になる
+    /// （分割と学習で seed がずれない）。範囲外（u32 超）の `--seed` は引数エラーの `invalid_input`。
+    pub fn inspect_seed_is_recorded_and_used_by_train() {
+        let env = registered("seed7", false);
+        env.fails(
+            &["inspect", "--project-dir", "proj", "--seed", "4294967296"],
+            64,
+            "invalid_input",
+        );
+        assert!(!env.project_file("split.json").exists());
+        env.ok(&["inspect", "--project-dir", "proj", "--seed", "7"]);
+        let split = std::fs::read_to_string(env.project_file("split.json")).expect("split.json");
+        assert!(split.contains("\"seed\":7"), "{split}");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let request = std::fs::read_to_string(env.project_file("candidates/0/request.json"))
+            .expect("request");
+        assert!(request.contains("\"seed\":7"), "{request}");
+        // select・package も記録値（7）と照合して通る。
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
     /// REQ-39: データに異常（重複 id 等）があると inspect が停止し、分割記録を残さない。
     pub fn inspect_rejects_invalid_records() {
         let env = Env::new("badrecords", false);
@@ -916,6 +938,10 @@ fn main() -> std::process::ExitCode {
         (
             "train_failure_cleans_candidate_dir_and_allows_retry",
             suite::train_failure_cleans_candidate_dir_and_allows_retry,
+        ),
+        (
+            "inspect_seed_is_recorded_and_used_by_train",
+            suite::inspect_seed_is_recorded_and_used_by_train,
         ),
         (
             "inspect_rejects_invalid_records",

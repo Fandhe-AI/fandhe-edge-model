@@ -25,6 +25,7 @@
 //! - [`ArgsError`] の `Display` は固定の英語文で、利用者が渡したトークンや値を
 //!   含めない（表に載る既知のオプション名・サブコマンド名のみ）。
 
+use crate::project::DEFAULT_SEED;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use std::ffi::OsString;
 use std::fmt;
@@ -116,6 +117,15 @@ const REGISTER_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
 ];
 const PROJECT_OPTS: &[OptSpec] = &[opt("--project-dir", "DIR", true, "Project directory")];
+const INSPECT_OPTS: &[OptSpec] = &[
+    opt("--project-dir", "DIR", true, "Project directory"),
+    opt(
+        "--seed",
+        "N",
+        false,
+        "Project seed for the split and training (u32, default 42)",
+    ),
+];
 const TRAIN_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
     opt("--candidate", "N", true, "Candidate number"),
@@ -157,7 +167,8 @@ const INFER_OPTS: &[OptSpec] = &[
 pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
     match sub {
         Subcommand::Register => REGISTER_OPTS,
-        Subcommand::Inspect | Subcommand::Select | Subcommand::Package => PROJECT_OPTS,
+        Subcommand::Inspect => INSPECT_OPTS,
+        Subcommand::Select | Subcommand::Package => PROJECT_OPTS,
         Subcommand::Train => TRAIN_OPTS,
         Subcommand::Evaluate => EVALUATE_OPTS,
         Subcommand::Infer => INFER_OPTS,
@@ -174,6 +185,9 @@ pub struct RegisterArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectArgs {
     pub project_dir: PathBuf,
+    /// プロジェクトの seed（分割と学習で共通。`split.json` に記録され、`train` はその値を使う。
+    /// 既定は [`DEFAULT_SEED`]。REQ-17）。
+    pub seed: u32,
 }
 /// `train` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +273,8 @@ pub enum ArgsError {
         option: &'static str,
     },
     InvalidCandidate,
+    /// `--seed` が `u32` の範囲の非負整数でない。
+    InvalidSeed,
     ConflictingInferSource,
     MissingInferSource,
     /// `--id` は `--text` とだけ、`--out` は `--input-file` とだけ併用できる。
@@ -304,6 +320,9 @@ impl fmt::Display for ArgsError {
             }
             ArgsError::InvalidCandidate => {
                 f.write_str("option --candidate must be a non-negative integer")
+            }
+            ArgsError::InvalidSeed => {
+                f.write_str("option --seed must be an integer in the range 0 to 4294967295")
             }
             ArgsError::ConflictingInferSource => {
                 f.write_str("options --text and --input-file cannot be used together")
@@ -473,6 +492,16 @@ impl Values {
             .map(|v| v.into_string().map_err(|_| ArgsError::NonUtf8Argument))
             .transpose()
     }
+    fn seed(&mut self) -> Result<u32, ArgsError> {
+        match self.take("--seed") {
+            None => Ok(DEFAULT_SEED),
+            Some(v) => v
+                .into_string()
+                .map_err(|_| ArgsError::NonUtf8Argument)?
+                .parse::<u32>()
+                .map_err(|_| ArgsError::InvalidSeed),
+        }
+    }
     fn candidate(&mut self) -> Result<usize, ArgsError> {
         let v = self
             .take("--candidate")
@@ -494,6 +523,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         }),
         Subcommand::Inspect => Command::Inspect(InspectArgs {
             project_dir: v.path("--project-dir")?,
+            seed: v.seed()?,
         }),
         Subcommand::Train => Command::Train(TrainArgs {
             project_dir: v.path("--project-dir")?,
@@ -602,7 +632,8 @@ mod tests {
         assert_eq!(
             run(&["inspect", "--project-dir", "proj"]),
             Command::Inspect(InspectArgs {
-                project_dir: d.clone()
+                project_dir: d.clone(),
+                seed: 42
             })
         );
         assert_eq!(
@@ -615,6 +646,37 @@ mod tests {
             run(&["package", "--project-dir", "proj"]),
             Command::Package(PackageArgs { project_dir: d })
         );
+    }
+
+    /// REQ-17: `inspect --seed` は u32 の範囲で受理し、省略時は 42。範囲外・非数値は `InvalidSeed`。
+    #[test]
+    fn req17_inspect_seed_parses_with_default_and_range() {
+        let seeded = |v: &str| p(&["inspect", "--project-dir", "proj", "--seed", v]);
+        assert_eq!(
+            run(&["inspect", "--project-dir", "proj", "--seed", "7"]),
+            Command::Inspect(InspectArgs {
+                project_dir: PathBuf::from("proj"),
+                seed: 7
+            })
+        );
+        assert_eq!(
+            run(&["inspect", "--project-dir", "proj"]),
+            Command::Inspect(InspectArgs {
+                project_dir: PathBuf::from("proj"),
+                seed: 42
+            })
+        );
+        assert_eq!(
+            run(&["inspect", "--project-dir", "proj", "--seed=4294967295"]),
+            Command::Inspect(InspectArgs {
+                project_dir: PathBuf::from("proj"),
+                seed: u32::MAX
+            })
+        );
+        assert_eq!(seeded("4294967296"), Err(ArgsError::InvalidSeed));
+        assert_eq!(seeded("-1"), Err(ArgsError::InvalidSeed));
+        assert_eq!(seeded("abc"), Err(ArgsError::InvalidSeed));
+        assert_eq!(ArgsError::InvalidSeed.exit_code(), ExitCode::InvalidInput);
     }
 
     #[test]
@@ -841,7 +903,8 @@ mod tests {
         assert_eq!(
             r,
             Ok(Invocation::Run(Command::Inspect(InspectArgs {
-                project_dir: PathBuf::from(bad.clone())
+                project_dir: PathBuf::from(bad.clone()),
+                seed: 42
             })))
         );
         // `--key=value` 形式でも同じく損失なく受理する。
@@ -854,7 +917,8 @@ mod tests {
         assert_eq!(
             r,
             Ok(Invocation::Run(Command::Inspect(InspectArgs {
-                project_dir: PathBuf::from(bad.clone())
+                project_dir: PathBuf::from(bad.clone()),
+                seed: 42
             })))
         );
         assert_eq!(parse([bad]), Err(ArgsError::NonUtf8Argument));

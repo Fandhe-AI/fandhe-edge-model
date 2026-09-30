@@ -83,10 +83,9 @@ pub const JOB_DIR: &str = "job";
 /// 候補ディレクトリ内の学習ワーカーの出力先（種類ごとに `-<kind>` が付く。REQ-19）。
 pub const MODEL_DIR: &str = "model";
 
-/// 分割の seed（暫定の固定値。定義ファイルに欄が無いため。オーナー確認事項）。
-pub const SPLIT_SEED: u64 = 42;
-/// 学習の seed（暫定の固定値）。
-pub const TRAIN_SEED: u32 = 42;
+/// プロジェクトの seed の既定値（`inspect --seed` の省略時。暫定の固定値）。分割と学習で共通で、
+/// `inspect` が `split.json` に記録し、`train`・`select`・`package` はその記録値を使う（REQ-17）。
+pub const DEFAULT_SEED: u32 = 42;
 /// 前処理の最大バイト長（暫定の固定値。`fixtures/train_contract/request_minimal.json` と同じ）。
 pub const DEFAULT_MAX_BYTES: u32 = 512;
 

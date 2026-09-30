@@ -793,7 +793,10 @@ mod tests {
                 definition: p(),
                 project_dir: p(),
             }),
-            Command::Inspect(InspectArgs { project_dir: p() }),
+            Command::Inspect(InspectArgs {
+                project_dir: p(),
+                seed: 42,
+            }),
             Command::Train(TrainArgs {
                 project_dir: p(),
                 candidate: 0,

@@ -46,7 +46,7 @@ use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANDIDATES_DIR, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE, RESULT_FILE,
-    SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED, fail, invalid, runtime,
+    SPLIT_FILE, TRAIN_INPUT_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -88,6 +88,7 @@ pub fn resolve_candidates(
     project: &Project,
     definition: &Definition,
     index: usize,
+    seed: u32,
 ) -> Result<Vec<SearchCandidate>, ErrorReport> {
     let label_order = label_order_from_definition(definition)
         .map_err(|e| e.to_error_report())?
@@ -102,7 +103,7 @@ pub fn resolve_candidates(
         CommonTrainParams {
             label_order,
             max_bytes: DEFAULT_MAX_BYTES,
-            seed: TRAIN_SEED,
+            seed,
             device: Device::Cpu,
             root,
             train_path: TRAIN_INPUT_FILE.to_string(),
@@ -131,9 +132,9 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     super::inspect::ensure_evaluation_frozen(&project)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
-    let split = verified_split(&project, &records)?;
+    let (split, seed) = verified_split(&project, &records)?;
 
-    let mut candidates = resolve_candidates(&project, &definition, args.candidate)?;
+    let mut candidates = resolve_candidates(&project, &definition, args.candidate, seed)?;
     if args.candidate >= candidates.len() {
         return Err(invalid("candidate index is out of range"));
     }
@@ -230,21 +231,33 @@ fn train_in_candidate_dir(
 /// `split.json`（`inspect` の記録）を読み、取り込んだデータから分割を再現して照合する
 /// （不一致は `invalid_input`。REQ-17・REQ-27）。`train`・`select` が同じ検証を通す。
 ///
+/// 戻り値の seed は記録された値（`train` が学習リクエストの seed に使う）。
+///
 /// # Errors
 /// 記録が読めない・不正・データと一致しない場合は `invalid_input`（64）等。
 pub fn verified_split(
     project: &Project,
     records: &[ValidRecord],
-) -> Result<SplitResult, ErrorReport> {
+) -> Result<(SplitResult, u32), ErrorReport> {
     let rows = split_rows(records)?;
+    let split_record = read_split_record(project)?;
+    let seed =
+        u32::try_from(split_record.seed()).map_err(|_| invalid("split record is invalid"))?;
+    let result = split_record
+        .verify_against(&rows)
+        .map_err(|_| invalid("split record does not match the data"))?;
+    Ok((result, seed))
+}
+
+/// `split.json` を読んで解析する（検証はしない。`package` が記録済みの seed を取り出すのにも使う）。
+///
+/// # Errors
+/// 記録が読めない・不正な場合は `invalid_input`（64）等。
+pub fn read_split_record(project: &Project) -> Result<SplitRecord, ErrorReport> {
     let split_bytes = project.read(SPLIT_FILE, crate::project::MAX_PROJECT_FILE_BYTES)?;
     let split_text =
         std::str::from_utf8(&split_bytes).map_err(|_| invalid("split record is invalid"))?;
-    let split_record =
-        SplitRecord::from_json_str(split_text).map_err(|_| invalid("split record is invalid"))?;
-    split_record
-        .verify_against(&rows)
-        .map_err(|_| invalid("split record does not match the data"))
+    SplitRecord::from_json_str(split_text).map_err(|_| invalid("split record is invalid"))
 }
 
 /// 学習済みの候補 `index` の学習リクエストと結果を読み戻す（学習済みでなければ `None`）。

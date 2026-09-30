@@ -31,8 +31,8 @@ use fandhe_edge_data::split_record::split_and_record;
 
 use crate::args::InspectArgs;
 use crate::project::{
-    DATA_DIR, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project, SPLIT_FILE,
-    SPLIT_SEED, fail, inspect_bytes, invalid, runtime,
+    DATA_DIR, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project, SPLIT_FILE, fail,
+    inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::evaluate_start;
 
@@ -154,7 +154,7 @@ pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorRe
         None => None,
     };
 
-    let recorded = split_and_record(&train_rows, SPLIT_SEED, &SplitRatios::default())
+    let recorded = split_and_record(&train_rows, u64::from(args.seed), &SplitRatios::default())
         .map_err(|_| invalid("cannot split records"))?;
     let by_record = &recorded.result().by_record;
     // 分割が空のまま `status:"ok"` で記録すると、後続の `train` が必ず失敗する。書き込みの前に拒否する

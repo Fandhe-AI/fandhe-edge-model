@@ -85,14 +85,14 @@ pub fn compute_selection(
     // 分割記録をデータから再現して照合し、選定に使う validation 集合を記録側から決める。
     // 保存済みの `request.json` の validation を信用すると、記録の改変で任意の部分集合の
     // 正解率により候補を選べてしまう（REQ-27）。
-    let split = verified_split(project, &records)?;
+    let (split, seed) = verified_split(project, &records)?;
     let expected_validation: BTreeMap<&str, &str> = records
         .iter()
         .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
         .map(|r| (r.id.as_str(), r.input.as_str()))
         .collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
-    let candidates = resolve_candidates(project, definition, 0)?;
+    let candidates = resolve_candidates(project, definition, 0, seed)?;
 
     let mut evaluated = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {

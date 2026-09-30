@@ -55,7 +55,9 @@ use crate::project::{
 
 use super::infer::load_backend;
 use super::select::compute_selection;
-use super::train::{load_trained, request_matches_candidate, resolve_candidates};
+use super::train::{
+    load_trained, read_split_record, request_matches_candidate, resolve_candidates,
+};
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
 const ARTIFACT_META_FILE: &str = "artifact.json";
@@ -85,7 +87,10 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if compute_selection(&project, &definition)?.as_ref() != Some(&selection) {
         return Err(invalid("selection record does not match the candidate"));
     }
-    let candidates = resolve_candidates(&project, &definition, selection.candidate_index)?;
+    // 期待する seed は固定値ではなく `split.json` の記録値（`compute_selection` が分割を検証済み）。
+    let seed = u32::try_from(read_split_record(&project)?.seed())
+        .map_err(|_| invalid("split record is invalid"))?;
+    let candidates = resolve_candidates(&project, &definition, selection.candidate_index, seed)?;
     let candidate = candidates
         .get(selection.candidate_index)
         .filter(|c| c.candidate_id == selection.candidate_id)
