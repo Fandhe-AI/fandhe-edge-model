@@ -18,7 +18,8 @@
 //! ├── candidates/<N>/            train が候補ごとに作る（request.json・train_input.jsonl・
 //! │                              job/・result.json と、学習ワーカーの出力先）
 //! ├── selection_record.json      select の記録
-//! └── package/                   package が作る配布パッケージ
+//! ├── package.staging/           package の組み立て・容量計測用（公開後・失敗時は残らない）
+//! └── package/                   package が作る配布パッケージ（容量が上限内のときだけ公開）
 //! ```
 //!
 //! # 入力元の規約（暫定・オーナー確認事項）
@@ -68,6 +69,9 @@ pub const CANDIDATES_DIR: &str = "candidates";
 pub const SELECTION_FILE: &str = "selection_record.json";
 /// 配布パッケージのディレクトリ名（`sandbox-run.sh` の出力先と同じ）。
 pub const PACKAGE_DIR: &str = "package";
+/// `package` 工程の組み立て・容量計測用のステージング。上限内のときだけ [`PACKAGE_DIR`] へ
+/// 原子的に名前替えして公開する（推論可能な場所に超過したパッケージを残さない。REQ-30・REQ-39）。
+pub const PACKAGE_STAGING_DIR: &str = "package.staging";
 /// 候補ディレクトリ内の学習リクエスト（`select` が結果の再検証に使う）。
 pub const REQUEST_FILE: &str = "request.json";
 /// 候補ディレクトリ内の学習結果。
@@ -286,58 +290,6 @@ impl Project {
         Ok(())
     }
 
-    /// 新規ファイルを書き、所有者のみ読み取り可（0400）の読み取り専用にする（評価データの配置用。
-    /// REQ-17・REQ-39）。
-    ///
-    /// [`Project::write_new`] と同じく親は保持 fd 起点で辿り（`O_EXCL`・`O_NOFOLLOW`）、権限の変更も
-    /// 開いた fd に対する `fchmod` で行う（パスから開き直さないため、`Project::open` 後の
-    /// ディレクトリ差し替えで閉じ込め外へ書けない）。いずれかの段階で失敗したら作りかけの
-    /// ファイルを消す。
-    ///
-    /// # Errors
-    /// 既存は `invalid_input`、書き込み・権限変更の失敗は `runtime_error`。
-    #[cfg(unix)]
-    pub fn write_new_read_only(
-        &self,
-        rel: impl AsRef<Path>,
-        bytes: &[u8],
-    ) -> Result<(), ErrorReport> {
-        use std::os::unix::fs::PermissionsExt;
-
-        const READ_ONLY_MODE: u32 = 0o400;
-        let rel = rel.as_ref();
-        let mut file = self
-            .package
-            .create_new_member(rel)
-            .map_err(|e| write_rejection(&e, "file already exists", "cannot write project file"))?;
-        let finished = file
-            .write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(READ_ONLY_MODE)))
-            .and_then(|()| file.metadata())
-            .is_ok_and(|m| m.permissions().mode() & 0o7777 == READ_ONLY_MODE);
-        if !finished {
-            drop(file);
-            // best effort（消せなくても元の失敗を返す）。
-            let _ = self.package.remove_file_member(rel);
-            return Err(runtime("cannot place evaluation data read-only"));
-        }
-        Ok(())
-    }
-
-    /// 非 unix では読み取り専用配置を提供しない（fail-closed）。
-    ///
-    /// # Errors
-    /// 常に `runtime_error`。
-    #[cfg(not(unix))]
-    pub fn write_new_read_only(
-        &self,
-        _rel: impl AsRef<Path>,
-        _bytes: &[u8],
-    ) -> Result<(), ErrorReport> {
-        Err(runtime("cannot place evaluation data read-only"))
-    }
-
     /// ディレクトリを所有者のみ（0700）で新規作成する（既存なら拒否）。
     ///
     /// # Errors
@@ -375,6 +327,23 @@ impl Project {
         let _ = self
             .package
             .remove_empty_dir_member_if_same(&created.rel, &created.handle);
+    }
+
+    /// プロジェクト内のディレクトリ `from` を、存在しない `to` へ原子的に名前替えする
+    /// （ステージングの公開用。保持 fd 起点。Linux は `RENAME_NOREPLACE`）。
+    ///
+    /// # Errors
+    /// `to` が既存は `invalid_input`、それ以外の失敗は `runtime_error`。
+    pub fn publish_dir(
+        &self,
+        from: impl AsRef<Path>,
+        to: impl AsRef<Path>,
+    ) -> Result<(), ErrorReport> {
+        self.package
+            .rename_member(from.as_ref(), to.as_ref())
+            .map_err(|e| {
+                write_rejection(&e, "directory already exists", "cannot publish directory")
+            })
     }
 
     /// 登録済みの定義を読む。

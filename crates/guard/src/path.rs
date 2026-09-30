@@ -756,6 +756,37 @@ impl ConfinedDir {
         Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
     }
 
+    /// 本ディレクトリ配下の `from` を、同じく配下の `to` へ名前替えする（ステージングの原子的な公開用。
+    /// 両者の親は保持 fd 起点で辿る。REQ-39）。
+    ///
+    /// Linux では `RENAME_NOREPLACE` で、`to` が既に存在すれば（空ディレクトリでも）置き換えず
+    /// `AlreadyExists` で失敗する。それ以外の OS は通常の `renameat`（呼び出し側が事前に不在を
+    /// 確認すること。空ディレクトリだけは置き換わりうる）。
+    ///
+    /// # Errors
+    /// 経路の拒否・名前替えの失敗（`to` が既存の場合を含む）。
+    pub fn rename_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        let (from_parent, from_name) = self.open_parent_of(from)?;
+        let (to_parent, to_name) = self.open_parent_of(to)?;
+        let from_dir = from_parent.as_ref().unwrap_or(&self.fd);
+        let to_dir = to_parent.as_ref().unwrap_or(&self.fd);
+        #[cfg(target_os = "linux")]
+        let result = rustix::fs::renameat_with(
+            from_dir,
+            from_name.as_os_str(),
+            to_dir,
+            to_name.as_os_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let result =
+            rustix::fs::renameat(from_dir, from_name.as_os_str(), to_dir, to_name.as_os_str());
+        result.map_err(|e| PathRejection::Unresolvable {
+            candidate: to.to_path_buf(),
+            source: errno_to_io(e),
+        })
+    }
+
     /// `rel` の空ディレクトリを削除する（空でなければ失敗する。`unlinkat(AT_REMOVEDIR)`）。
     ///
     /// # Errors

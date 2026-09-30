@@ -3,18 +3,22 @@
 //!
 //! # 手順
 //!
+//! 0. 開始時（ステージングを作る前）に評価データの凍結ハッシュを確認する（不一致・凍結記録の欠落は
+//!    `invalid_input` で停止。[`super::inspect::ensure_evaluation_frozen`]。REQ-17）
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
 //!    学習リクエストの `kind` の一致も確認する
 //! 2. 選定候補の学習ワーカー出力（`artifact.json`・ONNX ファイル）と登録済みの `definition.json`
-//!    （選択肢表）を `package/` へ新規コピーする（既存の `package/` は拒否。上書きしない）
+//!    （選択肢表）をステージングへ新規コピーする（既存の `package/` は拒否。上書きしない）
 //! 3. `artifact.json` の `onnx_sha256` とコピーした ONNX の sha256 の一致、および `kind`・
 //!    `label_order`・`max_bytes` の定義・選定候補との一致を確認する
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
-//! 2〜4 の途中で失敗した場合は、本工程が作った `package/` を削除する（再実行できなくなる半端な
-//! パッケージを残さない）。容量の上限超過は成功扱いで `package/` を残す。
+//! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
+//! 公開する。途中の失敗・容量の上限超過ではステージングを片付け、`package/` を作らない
+//! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
+//! 置き換えも削除もしない）。容量内訳の JSON は超過時も返す。
 //!
 //! # 未接続（実装済みを装わない）
 //!
@@ -42,7 +46,8 @@ use fandhe_edge_train::stage_files::SelectionRecord;
 use crate::args::PackageArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
-    DEFINITION_FILE, PACKAGE_DIR, Project, SELECTION_FILE, invalid, parse_definition, runtime,
+    CreatedDir, DEFINITION_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE,
+    invalid, parse_definition, runtime,
 };
 
 use super::train::{load_trained, resolve_candidates};
@@ -60,6 +65,8 @@ const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 /// I/O 失敗は `runtime_error`（70）。容量の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
 pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
+    // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    super::inspect::ensure_evaluation_frozen(&project)?;
     let selection_bytes = project.read(SELECTION_FILE, 64 * 1024)?;
     let selection = SelectionRecord::from_json_slice(&selection_bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
@@ -108,10 +115,12 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
     }
-    let package_dir = project.create_dir_tracked(PACKAGE_DIR)?;
-    // 組み立て・容量計測のどこかで失敗したら、本工程が作った `package/` を片付ける。
-    // 半端なパッケージが残ると再実行が「既存」で恒久的に拒否され、`infer --package` に
-    // 誤った成果物として渡される恐れがあるため（best effort。容量の上限超過は成功扱いで残す）。
+    // 組み立て・容量計測はステージングで行い、上限内のときだけ `package/` へ原子的に公開する
+    // （容量超過のパッケージを `infer --package` で使える場所に残さない。既存の `package/` は
+    // 事前に拒否済みで、置き換えも削除もしない。REQ-30・REQ-39）。
+    let staging = project.create_dir_tracked(PACKAGE_STAGING_DIR)?;
+    // 組み立て・容量計測のどこかで失敗したら、本工程が作ったステージングを片付ける（best effort）。
+    // 半端なステージングが残ると再実行が「既存」で拒否されるため。
     let breakdown = match assemble_and_measure(
         &project,
         onnx_file,
@@ -121,26 +130,50 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
-            project.remove_created_dir(&package_dir);
+            project.remove_created_dir(&staging);
             return Err(report);
         }
     };
-    let mut breaches = Vec::new();
-    if breakdown.total_bytes() > CAPACITY_LIMIT_BYTES {
-        breaches.push(LimitBreach::Capacity {
-            measured_bytes: breakdown.total_bytes(),
-            limit_bytes: CAPACITY_LIMIT_BYTES,
-        });
-    }
+    let breaches = finalize_staging(
+        &project,
+        &staging,
+        breakdown.total_bytes(),
+        CAPACITY_LIMIT_BYTES,
+    )?;
     Ok(resolve_package_outcome(
         &breaches,
         PackageQualityJudgment::NotDefined,
     ))
 }
 
-/// `package/` へ 3 ファイルを新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+/// 計測した容量が上限内ならステージングを `package/` へ原子的に公開し、超過なら公開せず片付ける
+/// （REQ-30・REQ-39）。公開に失敗した場合もステージングを片付けてエラーを返す。
 ///
-/// 呼び出し元（[`run`]）は `package/` を作成済みで、失敗時の後始末は呼び出し元が行う。
+/// 上限を超えた場合は [`LimitBreach::Capacity`] を返し、`package/` は作らない。既存の `package/` は
+/// 触らない（呼び出し元が事前に不在を確認済み。公開は `RENAME_NOREPLACE` 相当で置き換えない）。
+fn finalize_staging(
+    project: &Project,
+    staging: &CreatedDir,
+    measured_bytes: u64,
+    limit_bytes: u64,
+) -> Result<Vec<LimitBreach>, ErrorReport> {
+    if measured_bytes > limit_bytes {
+        project.remove_created_dir(staging);
+        return Ok(vec![LimitBreach::Capacity {
+            measured_bytes,
+            limit_bytes,
+        }]);
+    }
+    if let Err(report) = project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR) {
+        project.remove_created_dir(staging);
+        return Err(report);
+    }
+    Ok(Vec::new())
+}
+
+/// ステージングへ 3 ファイルを新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+///
+/// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
     project: &Project,
     onnx_file: &str,
@@ -148,7 +181,7 @@ fn assemble_and_measure(
     onnx_bytes: &[u8],
     definition_bytes: &[u8],
 ) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
-    let pkg = Path::new(PACKAGE_DIR);
+    let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
     project.write_new(pkg.join(onnx_file), onnx_bytes)?;
     project.write_new(pkg.join(DEFINITION_FILE), definition_bytes)?;
@@ -206,4 +239,87 @@ fn is_single_component(name: &str) -> bool {
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 一時 cwd の下に `proj/` を新規作成し、ステージングにファイルを 1 つ置いて返す。
+    fn setup(case: &str) -> (std::path::PathBuf, Project, CreatedDir) {
+        let cwd =
+            std::env::temp_dir().join(format!("package-staging-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let project = Project::create(&cwd, Path::new("proj")).expect("project");
+        let staging = project
+            .create_dir_tracked(PACKAGE_STAGING_DIR)
+            .expect("staging");
+        project
+            .write_new(Path::new(PACKAGE_STAGING_DIR).join("artifact.json"), b"new")
+            .expect("write");
+        (cwd, project, staging)
+    }
+
+    /// REQ-30・REQ-39: 上限超過では `package/` を作らず、ステージングも残さない。
+    #[test]
+    fn req30_over_limit_leaves_no_package_and_no_staging() {
+        let (cwd, project, staging) = setup("over");
+        let breaches = finalize_staging(&project, &staging, 41, 40).expect("finalize");
+        assert_eq!(
+            breaches,
+            vec![LimitBreach::Capacity {
+                measured_bytes: 41,
+                limit_bytes: 40
+            }]
+        );
+        assert!(!project.exists(PACKAGE_DIR).expect("exists"));
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-30・REQ-39: 上限ちょうど（超過でない）なら `package/` として公開され、ステージングは消える。
+    #[test]
+    fn req30_within_limit_publishes_package() {
+        let (cwd, project, staging) = setup("within");
+        let breaches = finalize_staging(&project, &staging, 40, 40).expect("finalize");
+        assert_eq!(breaches, Vec::new());
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let bytes = project
+            .read(Path::new(PACKAGE_DIR).join("artifact.json"), 16)
+            .expect("read published");
+        assert_eq!(bytes, b"new");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-30・REQ-39: 超過時に以前公開済みの `package/` があっても消さず・置き換えない。
+    #[test]
+    fn req30_over_limit_keeps_previously_published_package() {
+        let (cwd, project, staging) = setup("keep");
+        // 以前の公開物（ステージングの名前替えより前に存在した状態を模擬）。
+        project.create_dir(PACKAGE_DIR).expect("old package");
+        project
+            .write_new(Path::new(PACKAGE_DIR).join("artifact.json"), b"old")
+            .expect("old file");
+        let breaches = finalize_staging(&project, &staging, 41, 40).expect("finalize");
+        assert_eq!(breaches.len(), 1);
+        let bytes = project
+            .read(Path::new(PACKAGE_DIR).join("artifact.json"), 16)
+            .expect("read old");
+        assert_eq!(bytes, b"old");
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39: 公開先が既にあれば（空でも）置き換えず、ステージングを片付けて `invalid_input`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn req39_publish_does_not_replace_existing_package() {
+        let (cwd, project, staging) = setup("noreplace");
+        project.create_dir(PACKAGE_DIR).expect("empty package");
+        let err = finalize_staging(&project, &staging, 1, 40).expect_err("must not replace");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 }

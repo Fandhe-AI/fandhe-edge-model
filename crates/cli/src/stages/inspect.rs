@@ -123,6 +123,20 @@ pub(crate) fn load_evaluation_bytes(project: &Project) -> Result<Option<Vec<u8>>
     Ok(Some(bytes))
 }
 
+/// 評価データが凍結記録どおりであることを確認する（`train`・`select`・`package` が副作用の前に呼ぶ。
+/// REQ-17・REQ-27）。
+///
+/// 評価データが無い（`evaluate` が `skipped` になる）プロジェクトは何もせず通す。ある場合は
+/// [`load_evaluation_bytes`]（`inspect`・`evaluate` と同じ照合の単一の出所）で、凍結記録の欠落・破損・
+/// ハッシュ不一致を `invalid_input`（64）で停止する（fail-closed。学習・選定・書き出しで評価データを
+/// 差し替えたまま進めない）。
+///
+/// # Errors
+/// [`load_evaluation_bytes`] と同じ。
+pub(crate) fn ensure_evaluation_frozen(project: &Project) -> Result<(), ErrorReport> {
+    load_evaluation_bytes(project).map(|_| ())
+}
+
 /// `inspect` を実行する。
 ///
 /// # Errors

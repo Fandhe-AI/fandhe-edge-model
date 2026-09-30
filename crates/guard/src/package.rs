@@ -188,6 +188,22 @@ impl ConfinedPackage {
         }
     }
 
+    /// 本パッケージ配下の `from` を `to` へ名前替えする（ステージングの原子的な公開。REQ-39）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::rename_member`] と同じ。
+    pub fn rename_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (from, to);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.rename_member(from, to)
+        }
+    }
+
     /// 本パッケージの中身を、保持した fd 起点で再帰的に削除する（本ディレクトリは残す）。
     ///
     /// # Errors
@@ -405,6 +421,41 @@ mod tests {
             std::fs::read(base.join("outside/keep.txt")).expect("keep"),
             b"keep"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: `rename_member` は保持 fd 起点でディレクトリを名前替えし、公開先が既にあれば
+    /// （Linux では空でも）置き換えない。`..` を含む宛先は拒否する。
+    #[test]
+    fn req39_rename_member_publishes_without_replacing() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg/stage")).expect("mkdir");
+        std::fs::write(base.join("pkg/stage/a"), b"x").expect("write");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+
+        pkg.rename_member(Path::new("stage"), Path::new("done"))
+            .expect("rename");
+        assert_eq!(std::fs::read(base.join("pkg/done/a")).expect("read"), b"x");
+        assert!(!base.join("pkg/stage").exists());
+
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::create_dir_all(base.join("pkg/stage2")).expect("mkdir");
+            let err = pkg
+                .rename_member(Path::new("stage2"), Path::new("done"))
+                .expect_err("must not replace");
+            assert!(matches!(
+                err,
+                PathRejection::Unresolvable { ref source, .. }
+                    if source.kind() == std::io::ErrorKind::AlreadyExists
+            ));
+        }
+        assert!(
+            pkg.rename_member(Path::new("done"), Path::new("../escaped"))
+                .is_err()
+        );
+        assert!(!base.join("escaped").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
