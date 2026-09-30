@@ -49,7 +49,17 @@ impl TempDir {
             .map(|e| {
                 let p = e.unwrap().path();
                 if p.is_dir() {
-                    fs::read_dir(&p).unwrap().count()
+                    // 評価成功の完了記録（`done-*`）は適用ロックとは別の状態なので数えない。
+                    fs::read_dir(&p)
+                        .unwrap()
+                        .filter(|e| {
+                            !e.as_ref()
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("done-")
+                        })
+                        .count()
                 } else {
                     1
                 }
@@ -1299,6 +1309,79 @@ fn req27_is_applied_rejects_tampered_lock_record() {
         let p = entry.unwrap().path();
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
         if name.starts_with("config-") && name.ends_with(".lock") {
+            fs::write(&p, "garbage\n").unwrap();
+        }
+    }
+    let r = ledger.is_applied(&digest, &id("c1:seed0"), &Sha256Digest::of_bytes(b"w1"));
+    assert!(
+        matches!(r, Err(AcquireError::RegistryTampered { .. })),
+        "{r:?}"
+    );
+}
+/// REQ-27: 予測が失敗した適用は適用権を消費する（再適用は拒否）が、評価の成功ではないため
+/// `is_applied` は偽のまま（適用権の消費と評価の成功は別の状態）。
+#[test]
+fn req27_is_applied_is_false_after_failed_prediction() {
+    let dir = TempDir::new("is-applied-failed");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let model = Model::new(b"w1", None);
+    let data_dir = TempDir::new("data-failed");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let record = freeze_eval_data(DATA).unwrap();
+    let frozen = FrozenEvalData {
+        path: &path,
+        sha256: record.sha256(),
+        byte_len: record.byte_len(),
+    };
+    let failed: Outcome = apply_once(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &model.paths(),
+        dec,
+        |_t, _inputs, _paths| Err::<(), _>("boom".to_string()),
+    );
+    assert!(matches!(
+        failed,
+        Err(EvalDataInvarianceError::Evaluation(
+            EvaluationInvarianceError::Evaluation(ApplyOnceError::Prediction(_))
+        ))
+    ));
+    let w = Sha256Digest::of_bytes(b"w1");
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+    // 適用権は消費済みで、やり直しは拒否される。
+    let calls = Cell::new(0u32);
+    let retry = run(&ledger, DATA, "c1:seed0", &model, &calls);
+    assert!(acquire_err(&retry).is_some(), "{retry:?}");
+    assert_eq!(calls.get(), 0);
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+}
+
+/// REQ-27: 完了記録が食い違う（改変された）場合は `RegistryTampered`（fail-closed）。
+#[test]
+fn req27_is_applied_rejects_tampered_completion_record() {
+    let dir = TempDir::new("is-applied-done-tamper");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let calls = Cell::new(0u32);
+    assert!(run(&ledger, DATA, "c1:seed0", &Model::new(b"w1", None), &calls).is_ok());
+    let scope = dir.scope_dirs().remove(0);
+    for entry in fs::read_dir(&scope).unwrap() {
+        let p = entry.unwrap().path();
+        if p.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("done-")
+        {
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&p, perms).unwrap();
             fs::write(&p, "garbage\n").unwrap();
         }
     }

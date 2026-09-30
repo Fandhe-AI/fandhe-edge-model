@@ -1303,6 +1303,31 @@ mod suite {
         let tampered = original.replacen("\"candidate_id\":\"c3\"", "\"candidate_id\":\"c1\"", 1);
         std::fs::write(&record_path, tampered).expect("tamper");
         assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch);
+        // 構成 ID・評価件数・正解数の改変（他のハッシュが合っていても公開できない。REQ-27）。
+        let config_marker = "\"config_id\":\"";
+        let at = original.find(config_marker).expect("config_id") + config_marker.len();
+        let mut other_config = original.clone();
+        other_config.insert(at, 'x');
+        std::fs::write(&record_path, other_config).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            mismatch,
+            "config_id"
+        );
+        for key in ["total", "correct"] {
+            let marker = format!("\"{key}\":");
+            let at = original.find(&marker).expect("key") + marker.len();
+            let end = at
+                + original[at..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .expect("number end");
+            let mut bumped = original.clone();
+            // 評価件数・正解数を桁違いの値へ（`correct` は `total` を超え、`total` は評価件数と食い違う）。
+            bumped.replace_range(at..end, "99999");
+            std::fs::write(&record_path, bumped).expect("tamper");
+            assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch, "{key}");
+        }
+        assert!(!env.project_file("package").exists());
         let unknown = original.trim_end().trim_end_matches('}').to_string() + ",\"extra\":1}\n";
         std::fs::write(&record_path, unknown).expect("tamper");
         assert_eq!(

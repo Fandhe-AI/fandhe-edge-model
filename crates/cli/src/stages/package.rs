@@ -63,7 +63,7 @@ use crate::args::PackageArgs;
 use crate::error_report::{ToErrorReport, acquire_error_report};
 use crate::project::{
     CreatedDir, DEFINITION_FILE, EVALUATION_RECORD_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project,
-    SELECTION_FILE, invalid, parse_definition, runtime,
+    SELECTION_FILE, inspect_bytes, invalid, parse_definition, runtime,
 };
 
 use super::candidate_artifact::{
@@ -163,11 +163,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     // （`evaluate` が拒否する）ため評価完了の確認を行わない。配布用ではなく、明示した場合のみ
     // ここへ来る（上で `--allow-smoke` なしの smoke 候補は拒否済み。REQ-27）。
     let smoke_validation_only = request_is_smoke_trained(&request, &candidate.params);
-    if let Some((freeze, _)) = frozen.as_ref().filter(|_| !smoke_validation_only) {
+    if let Some((freeze, eval_bytes)) = frozen.as_ref().filter(|_| !smoke_validation_only) {
         verify_evaluation_record(
             &project,
             &selection,
-            freeze,
+            (freeze, eval_bytes),
             &definition,
             &meta_bytes,
             &onnx_bytes,
@@ -216,6 +216,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 /// `evaluation record is invalid`、いずれかの値が一致しなければ
 /// `evaluation record does not match the package`（いずれも `invalid_input`）。
 ///
+/// 記録の `config_id`（期待する代表構成 ID）・`total`（凍結した評価データの件数）・`correct <= total`
+/// も照合する（他の構成の記録・件数や正解数の改変を公開に使わせない）。
+///
 /// 記録ファイルに加えて、最終 test の台帳（`final_test_ledger/`。適用ロックと封印つき事前登録）が
 /// その代表構成・重みの適用完了を記録していることを照合する（台帳に完了が無ければ
 /// `evaluation has not been completed`。記録の偽造だけでは公開できない）。
@@ -225,7 +228,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 fn verify_evaluation_record(
     project: &Project,
     selection: &SelectionRecord,
-    freeze: &FreezeRecord,
+    (freeze, eval_bytes): (&FreezeRecord, &[u8]),
     definition: &Definition,
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
@@ -241,7 +244,14 @@ fn verify_evaluation_record(
         .canonical_hash()
         .map_err(|_| runtime("cannot hash definition"))?
         .to_hex();
+    // 評価件数は凍結した評価データ（照合済みのバイト列）から数え直し、記録の `total` と照合する。
+    let expected_total = inspect_bytes(eval_bytes, definition)
+        .map_err(|_| invalid("evaluation data is invalid"))?
+        .len();
     let matches = record.candidate_index == selection.candidate_index
+        && record.config_id == config_id
+        && record.correct <= record.total
+        && usize::try_from(record.total).is_ok_and(|t| t == expected_total)
         && record.candidate_id == selection.candidate_id
         && record.evaluation_sha256 == freeze.sha256().to_hex()
         && record.evaluation_bytes == freeze.byte_len()

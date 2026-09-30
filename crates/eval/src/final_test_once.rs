@@ -74,6 +74,12 @@
 //! 1 回の適用を消費しない。ロック取得後に予測が失敗しても、ロックは残す
 //! （fail-closed。やり直しは拒否する）。
 //!
+//! # 適用権の消費と評価の成功は別の状態（REQ-27）
+//!
+//! 予測と評価後の不変性検証まで成功した場合だけ、適用ロックとは別ファイル `done-<hex>.lock`（完了記録。
+//! 読み取り専用）を書く。失敗した適用はロックのみが残り、[`FinalTestLedger::is_applied`] は偽を返す
+//! （`package` が評価完了の根拠にするのは完了記録）。
+//!
 //! # ロックの種類
 //!
 //! - 代表構成ロック `config-<hex>.lock`: 評価データ × 代表構成 ID。
@@ -116,6 +122,7 @@ pub const MAX_CONFIG_ID_BYTES: usize = 128;
 
 const CONFIG_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/config/v1\0";
 const WEIGHTS_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/weights/v1\0";
+const COMPLETION_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/completion/v1\0";
 const REGISTRY_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry/v1\0";
 const REGISTRY_SEAL_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-seal/v1\0";
 const REGISTRY_CONTENT_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-content/v1\0";
@@ -364,6 +371,18 @@ impl FinalTestKey {
         buf.extend_from_slice(self.eval_data_sha256.as_bytes());
         buf.extend_from_slice(self.weights_sha256.as_bytes());
         format!("weights-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+    }
+
+    /// 評価成功（予測・評価後の不変性検証まで完了）の記録ファイル名。適用権の消費（ロック）とは
+    /// 別の状態で、[`FinalTestLedger::is_applied`] はこのファイルがある場合だけ完了とみなす。
+    fn completion_name(&self) -> String {
+        let mut buf = Vec::with_capacity(COMPLETION_DOMAIN.len() + 96);
+        buf.extend_from_slice(COMPLETION_DOMAIN);
+        buf.extend_from_slice(self.eval_data_sha256.as_bytes());
+        buf.extend_from_slice(self.weights_sha256.as_bytes());
+        buf.extend_from_slice(&(self.config_id.as_str().len() as u64).to_be_bytes());
+        buf.extend_from_slice(self.config_id.as_str().as_bytes());
+        format!("done-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
     }
 
     fn record(&self, kind: &str, registry_sha256: &Sha256Digest) -> String {
@@ -871,6 +890,35 @@ impl FinalTestLedger {
         })
     }
 
+    /// 評価の成功（予測と評価後の不変性検証まで完了）を、適用ロックとは別ファイルへ記録する
+    /// （`create_new`・読み取り専用。REQ-27）。[`apply_once`] だけが成功後に呼ぶ。
+    fn record_completion(
+        &self,
+        key: &FinalTestKey,
+        registry_sha256: &Sha256Digest,
+    ) -> Result<(), AcquireError> {
+        let sdir = self.scope_dir(&key.eval_data_sha256);
+        let (file, path) = Self::create_lock(
+            &sdir,
+            &key.completion_name(),
+            AppliedBy::RepresentativeConfig,
+        )?;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let body = format!(
+            "fandhe-edge-final-test-completion v1\nlock=completed\neval_data_sha256={}\nrepresentative_config_id={}\nweights_sha256={}\nregistry_sha256={}\ncompleted_unix_secs={secs}\n",
+            key.eval_data_sha256.to_hex(),
+            key.config_id.as_str(),
+            key.weights_sha256.to_hex(),
+            registry_sha256.to_hex(),
+        );
+        Self::write_record(file, &path, &body)?;
+        Self::make_read_only(&path)?;
+        Self::sync_dir(&sdir)
+    }
+
     /// 代表構成 `config_id`・重み `weights_sha256` の最終 test 適用が、この台帳で完了しているかを返す
     /// （REQ-27。`package` が評価完了の根拠にする読み取り専用の照会）。
     ///
@@ -939,6 +987,35 @@ impl FinalTestLedger {
             if !matches {
                 return Err(tampered("application lock does not match the application"));
             }
+        }
+        // 適用権の消費（ロック）と評価の成功は別の状態。成功記録が無ければ、予測の失敗などで
+        // 消費だけが済んだ適用であり、完了とはみなさない（REQ-27）。
+        let bytes = match fandhe_edge_core::fs::read_bounded(
+            &sdir.join(key.completion_name()),
+            MAX_LOCK_RECORD_BYTES,
+        ) {
+            Ok(b) => b,
+            Err(FsError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(_) => return Err(tampered("completion record is unreadable")),
+        };
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|_| tampered("completion record is malformed"))?;
+        let field = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('=')))
+        };
+        let matches = field("lock") == Some("completed")
+            && field("eval_data_sha256") == Some(eval_data_sha256.to_hex().as_str())
+            && field("representative_config_id") == Some(config_id.as_str())
+            && field("weights_sha256") == Some(weights_sha256.to_hex().as_str())
+            && field("registry_sha256") == Some(sealed.to_hex().as_str());
+        if !matches {
+            return Err(tampered("completion record does not match the application"));
         }
         Ok(true)
     }
@@ -1140,7 +1217,9 @@ pub fn apply_once<T, E>(
     decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, DecodeFailed>,
     predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
 ) -> ApplyOnceResult<T, E> {
-    evaluate_with_eval_data_invariance(frozen, |bytes| {
+    // 評価が最後まで成功したときに記録する完了記録の材料（適用権の消費とは別の状態。REQ-27）。
+    let mut pending_completion: Option<(FinalTestKey, Sha256Digest)> = None;
+    let result = evaluate_with_eval_data_invariance(frozen, |bytes| {
         // ここに来た時点で bytes の sha256 == frozen.sha256（照合済み）。
         evaluate_with_invariance(model, |paths| {
             let (registered, registry_sha256) = ledger
@@ -1171,6 +1250,7 @@ pub fn apply_once<T, E>(
             // 適用権は評価データ本文を `decode` へ渡す前に消費する。本文を見てから
             // `Err` で抜けて何度でも呼び直す迂回を塞ぐ（REQ-27）。
             let key = FinalTestKey::from_verified(frozen.sha256, config_id, weights_sha256);
+            let completion_key = key.clone();
             let ticket = ledger
                 .acquire(&key, &registry_sha256)
                 .map_err(ApplyOnceError::Acquire)?;
@@ -1179,9 +1259,23 @@ pub fn apply_once<T, E>(
                 records.into_iter().map(|r| (r.input, r.gold)).unzip();
             let input_refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
             let output = predict(ticket, &input_refs, paths).map_err(ApplyOnceError::Prediction)?;
+            pending_completion = Some((completion_key, registry_sha256));
             Ok(AppliedOnce { output, golds })
         })
-    })
+    });
+    // 予測・評価後のモデル / 評価データの不変性検証まで成功した場合だけ完了を記録する。
+    // 失敗した適用はロックのみが残り、`is_applied` は false を返す。
+    let applied = result?;
+    if let Some((key, registry_sha256)) = pending_completion {
+        ledger
+            .record_completion(&key, &registry_sha256)
+            .map_err(|e| {
+                EvalDataInvarianceError::Evaluation(EvaluationInvarianceError::Evaluation(
+                    ApplyOnceError::Acquire(e),
+                ))
+            })?;
+    }
+    Ok(applied)
 }
 
 #[cfg(test)]
