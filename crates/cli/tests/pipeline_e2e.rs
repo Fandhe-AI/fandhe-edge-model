@@ -1654,6 +1654,71 @@ mod suite {
         assert!(!env.project_file("selection_record.json").exists());
     }
 
+    /// REQ-30・TASK-30.3: 全候補が容量超過で除外された `select` は `pending`（12）で、内部記録
+    /// `selection_exclusions.json` に除外結果（`selection_record.json` の `excluded_candidates` と同じ
+    /// 要素の形）を残す（選定記録は作らない）。再実行では置き換わり、選定が成功すると削除される。
+    pub fn select_all_excluded_writes_exclusions_record_and_success_removes_it() {
+        let env = inspected("selexclrec");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let record = env.project_file("selection_exclusions.json");
+        let expected = |stdout: &str| {
+            let total: u64 = stdout
+                .split("vocab_package_over_guideline (")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .expect("total bytes in message");
+            format!(
+                "{{\"excluded_candidates\":[{{\"candidate_index\":0,\"candidate_id\":\"c1\",\"reason\":\"vocab_package_over_guideline\",\"total_bytes\":{total},\"guideline_bytes\":40000000}}]}}\n"
+            )
+        };
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record"),
+            expected(&out)
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+        // 再実行でも（既存があっても）同じ内容で置き換わり、一時ファイルは残らない。
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record"),
+            expected(&out)
+        );
+        assert!(!env.project_file("selection_exclusions.json.tmp").exists());
+        // 小さな正しい語彙へ差し替えると選定に成功し、古い除外結果は消える。
+        let small = br#"{"a":0}"#;
+        std::fs::write(env.project_file("candidates/0/model-c1/vocab.json"), small).expect("vocab");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let (old, new) = (
+            Sha256Digest::of_bytes(&vocab).to_hex(),
+            Sha256Digest::of_bytes(small).to_hex(),
+        );
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        env.ok(&["select", "--project-dir", "proj"]);
+        assert!(!record.exists());
+        assert!(env.project_file("selection_record.json").is_file());
+        // 選定記録が残っていれば、次の select は除外の計算に入らず拒否される（挙動は変えない）。
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record already exists\"}\n"
+        );
+    }
+
+    /// REQ-39: 語彙ファイルの形式不正は、原因が分かる `vocab file is invalid`（64）で報告する。
+    pub fn select_reports_invalid_vocab_with_dedicated_message() {
+        let env = inspected("selbadvocab");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let bad = br#"{"a":0} x"#;
+        place_vocab(&env, bad, Some(bad));
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"vocab file is invalid\"}\n"
+        );
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1924,6 +1989,14 @@ fn main() -> std::process::ExitCode {
         (
             "select_loads_onnx_before_capacity_exclusion",
             suite::select_loads_onnx_before_capacity_exclusion,
+        ),
+        (
+            "select_all_excluded_writes_exclusions_record_and_success_removes_it",
+            suite::select_all_excluded_writes_exclusions_record_and_success_removes_it,
+        ),
+        (
+            "select_reports_invalid_vocab_with_dedicated_message",
+            suite::select_reports_invalid_vocab_with_dedicated_message,
         ),
         (
             "infer_out_option_is_not_faked",

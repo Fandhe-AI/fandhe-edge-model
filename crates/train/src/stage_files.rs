@@ -181,6 +181,30 @@ pub struct ExcludedCandidate {
     pub guideline_bytes: u64,
 }
 
+/// 全候補が容量の目安超過で除外され、選定記録を作れなかった `select` の除外結果
+/// （`selection_exclusions.json`。REQ-30・TASK-30.3・#125）。
+///
+/// 要素は [`SelectionRecord::excluded_candidates`] と同じ形。プロジェクト内部の記録で、CLI の
+/// stdout JSON と `selection_record.json` の形は変えない（`package`・`evaluate`・`infer` は読まない）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionExclusions {
+    /// 除外した候補。
+    pub excluded_candidates: Vec<ExcludedCandidate>,
+}
+
+impl SelectionExclusions {
+    /// JSON 1 行（末尾改行つき）へ直列化する。
+    ///
+    /// # Errors
+    /// 直列化に失敗した場合。
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, StageFileError> {
+        let mut bytes = serde_json::to_vec(self).map_err(|_| StageFileError::Serialize)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
 impl SelectionRecord {
     /// JSON 1 行（末尾改行つき）へ直列化する。
     ///

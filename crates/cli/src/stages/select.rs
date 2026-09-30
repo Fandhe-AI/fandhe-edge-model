@@ -36,11 +36,15 @@ use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::vocab_exclusion::{VOCAB_GUIDELINE_BYTES, screen_vocab_candidates};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
-use fandhe_edge_train::stage_files::{ExcludedCandidate, SelectionRecord, validation_accuracy};
+use fandhe_edge_train::stage_files::{
+    ExcludedCandidate, SelectionExclusions, SelectionRecord, validation_accuracy,
+};
 
 use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
-use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, invalid, runtime};
+use crate::project::{
+    DEFINITION_FILE, Project, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail, invalid, runtime,
+};
 
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
@@ -63,16 +67,26 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     let definition = project.load_definition()?;
     let (record, excluded) = compute_selection_with_exclusions(&project, &definition)?;
     let Some(record) = record else {
-        // 全候補が容量の目安超過で除外された場合は、除外理由を失わないようメッセージに残す
-        // （記録は作らない。REQ-30・TASK-30.3・#125）。
+        // 全候補が容量の目安超過で除外された場合は、除外理由をメッセージに残し、内部記録
+        // `selection_exclusions.json` にも保存する（`selection_record.json` は作らない。他工程は
+        // 読まない。REQ-30・TASK-30.3・#125）。
         if excluded.is_empty() {
             return Err(fail(ExitCode::Pending, default_message(ExitCode::Pending)));
         }
+        let json = SelectionExclusions {
+            excluded_candidates: excluded.clone(),
+        }
+        .to_json_vec()
+        .map_err(|_| runtime("cannot serialize selection exclusions"))?;
+        project.replace_file(SELECTION_EXCLUSIONS_FILE, &json)?;
         return Err(fail(ExitCode::Pending, &all_excluded_message(&excluded)));
     };
     let json = record
         .to_json_vec()
         .map_err(|_| runtime("cannot serialize selection record"))?;
+    // 選定できたので、以前の全件除外で残った内部記録は消す（古い除外結果を残さない。削除に失敗したら
+    // 選定記録を書かずに止める。fail-closed）。
+    project.remove_file_if_exists(SELECTION_EXCLUSIONS_FILE)?;
     project.write_new(SELECTION_FILE, &json)?;
     Ok(SelectReport::new(
         record.candidate_index,

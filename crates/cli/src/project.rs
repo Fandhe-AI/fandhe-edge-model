@@ -74,6 +74,8 @@ pub const FINAL_TEST_LEDGER_DIR: &str = "final_test_ledger";
 pub const EVALUATION_RECORD_FILE: &str = "evaluation_record.json";
 /// 選定記録のファイル名。
 pub const SELECTION_FILE: &str = "selection_record.json";
+/// 全候補が容量超過で除外された `select` の除外結果（内部記録。他工程は読まない。#125）。
+pub const SELECTION_EXCLUSIONS_FILE: &str = "selection_exclusions.json";
 /// 配布パッケージのディレクトリ名（`sandbox-run.sh` の出力先と同じ）。
 pub const PACKAGE_DIR: &str = "package";
 /// `package` 工程の組み立て・容量計測用のステージング。上限内のときだけ [`PACKAGE_DIR`] へ
@@ -294,6 +296,48 @@ impl Project {
             return Err(runtime("cannot write project file"));
         }
         Ok(())
+    }
+
+    /// `rel` の通常ファイルを保持 fd 起点で削除する。無ければ何もしない（削除に失敗したら
+    /// `runtime_error`。古い記録を残さないための fail-closed）。
+    ///
+    /// # Errors
+    /// 削除失敗（存在しない場合を除く）は `runtime_error`。
+    pub fn remove_file_if_exists(&self, rel: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        match self.package.remove_file_member(rel.as_ref()) {
+            Ok(()) => Ok(()),
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(runtime("cannot remove project file")),
+        }
+    }
+
+    /// `rel` を新しい内容で置き換える（既存があってもよい）。同じディレクトリの一時名へ新規に書いて
+    /// から、既存を消して保持 fd 起点の名前替えで置くため、`rel` が書きかけの状態で見えることはない
+    /// （失敗時は一時ファイルを片付ける。名前替えは既存を置き換えない `NOREPLACE` のため、
+    /// 消去と名前替えの間に落ちると `rel` は無い状態になる）。
+    ///
+    /// # Errors
+    /// 書き込み・名前替えの失敗は `runtime_error`。
+    pub fn replace_file(&self, rel: impl AsRef<Path>, bytes: &[u8]) -> Result<(), ErrorReport> {
+        let rel = rel.as_ref();
+        let mut tmp_name = rel.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        self.remove_file_if_exists(&tmp)?;
+        self.write_new(&tmp, bytes)?;
+        let published = self.remove_file_if_exists(rel).and_then(|()| {
+            self.package
+                .rename_member(&tmp, rel)
+                .map_err(|_| runtime("cannot write project file"))
+        });
+        if published.is_err() {
+            let _ = self.package.remove_file_member(&tmp);
+        }
+        published
     }
 
     /// [`Project::write_new`] のストリーミング版。`reader` から最大 `limit` バイトを固定長バッファで
