@@ -59,8 +59,14 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         return Err(crate::project::invalid("selection record already exists"));
     }
     let definition = project.load_definition()?;
-    let Some(record) = compute_selection(&project, &definition)? else {
-        return Err(fail(ExitCode::Pending, default_message(ExitCode::Pending)));
+    let (record, excluded) = compute_selection_with_exclusions(&project, &definition)?;
+    let Some(record) = record else {
+        // 全候補が容量の目安超過で除外された場合は、除外理由を失わないようメッセージに残す
+        // （記録は作らない。REQ-30・TASK-30.3・#125）。
+        if excluded.is_empty() {
+            return Err(fail(ExitCode::Pending, default_message(ExitCode::Pending)));
+        }
+        return Err(fail(ExitCode::Pending, &all_excluded_message(&excluded)));
     };
     let json = record
         .to_json_vec()
@@ -84,6 +90,35 @@ pub fn compute_selection(
     project: &Project,
     definition: &Definition,
 ) -> Result<Option<SelectionRecord>, ErrorReport> {
+    compute_selection_with_exclusions(project, definition).map(|(record, _)| record)
+}
+
+/// 全候補が容量の目安超過で除外されたときの `pending` メッセージ（英語。除外理由を残す）。
+fn all_excluded_message(excluded: &[ExcludedCandidate]) -> String {
+    let detail: Vec<String> = excluded
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{} {} ({} > {} bytes)",
+                e.candidate_index, e.candidate_id, e.reason, e.total_bytes, e.guideline_bytes
+            )
+        })
+        .collect();
+    format!(
+        "no eligible candidate: all trained candidates were excluded ({})",
+        detail.join(", ")
+    )
+}
+
+/// [`compute_selection`] と同じ選定に加え、容量の目安超過で除外した候補も返す
+/// （選定候補が無いときも除外理由を呼び出し元へ渡すため。REQ-30・TASK-30.3・#125）。
+///
+/// # Errors
+/// [`compute_selection`] と同じ。
+pub fn compute_selection_with_exclusions(
+    project: &Project,
+    definition: &Definition,
+) -> Result<(Option<SelectionRecord>, Vec<ExcludedCandidate>), ErrorReport> {
     let records = project.load_records(definition)?;
     let gold: BTreeMap<&str, &str> = records
         .iter()
@@ -161,19 +196,22 @@ pub fn compute_selection(
         ..
     } = decision
     else {
-        return Ok(None);
+        return Ok((None, excluded));
     };
     let Some((index, _, _)) = evaluated.iter().find(|(_, id, _)| *id == candidate_id) else {
         return Err(runtime("selected candidate is not evaluated"));
     };
-    Ok(Some(SelectionRecord {
-        candidate_index: *index,
-        candidate_id,
-        rule,
-        validation_correct: accuracy.correct,
-        validation_total: accuracy.total,
-        excluded_candidates: excluded,
-    }))
+    Ok((
+        Some(SelectionRecord {
+            candidate_index: *index,
+            candidate_id,
+            rule,
+            validation_correct: accuracy.correct,
+            validation_total: accuracy.total,
+            excluded_candidates: excluded.clone(),
+        }),
+        excluded,
+    ))
 }
 
 /// 学習済みの候補のパッケージ相当の容量（ONNX・語彙ファイル〔あれば〕・選択肢表
@@ -237,4 +275,26 @@ fn vocab_exclusion_of(
         total_bytes: r.total_bytes,
         guideline_bytes: fandhe_edge_runtime::vocab_exclusion::VOCAB_GUIDELINE_BYTES,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REQ-30・TASK-30.3: 全候補が除外されたときの `pending` メッセージに除外理由が残る。
+    #[test]
+    fn req30_all_excluded_message_keeps_reason_and_sizes() {
+        let excluded = vec![ExcludedCandidate {
+            candidate_index: 1,
+            candidate_id: "c9".to_string(),
+            reason: "vocab_package_over_guideline".to_string(),
+            total_bytes: 41_000_000,
+            guideline_bytes: 40_000_000,
+        }];
+        assert_eq!(
+            all_excluded_message(&excluded),
+            "no eligible candidate: all trained candidates were excluded \
+             (1:c9 vocab_package_over_guideline (41000000 > 40000000 bytes))"
+        );
+    }
 }

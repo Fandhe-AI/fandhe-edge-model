@@ -35,6 +35,7 @@
 //! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
 //! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
 
+use std::io::ErrorKind;
 use std::path::{Component, Path};
 
 use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
@@ -44,6 +45,7 @@ use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::kind::KindAllowlist;
+use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
@@ -54,6 +56,7 @@ use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYT
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
+use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
@@ -147,6 +150,18 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     };
     let meta_bytes = read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
     let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
+    // 語彙ファイル（あれば）も配布物に含め、`select` の容量判定と構成を揃える（REQ-30・#125）。
+    // 無い（NotFound）ときだけ省略し、それ以外の失敗は止める。
+    let vocab_bytes = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
+        Ok((file, real)) => Some(
+            read_bounded_open_file(file, real.as_path(), MAX_FILE_BYTES)
+                .map_err(|e| fs_report(&e))?,
+        ),
+        Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            None
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
     if meta.onnx_file() != onnx_file
         || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
@@ -188,6 +203,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &meta_bytes,
         &onnx_bytes,
         &definition_bytes,
+        vocab_bytes.as_deref(),
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
@@ -235,7 +251,7 @@ fn finalize_staging(
     Ok(Vec::new())
 }
 
-/// ステージングへ 3 ファイルを新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+/// ステージングへ 3 ファイル（語彙ファイルがあれば 4）を新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
 ///
 /// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
@@ -244,18 +260,24 @@ fn assemble_and_measure(
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
     definition_bytes: &[u8],
+    vocab_bytes: Option<&[u8]>,
 ) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
     let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
     project.write_new(pkg.join(onnx_file), onnx_bytes)?;
     project.write_new(pkg.join(DEFINITION_FILE), definition_bytes)?;
-
-    let mut files = Vec::new();
-    for (component, name) in [
+    let mut members = vec![
         (PackageComponent::Weights, onnx_file),
         (PackageComponent::LabelTable, DEFINITION_FILE),
         (PackageComponent::Metadata, ARTIFACT_META_FILE),
-    ] {
+    ];
+    if let Some(bytes) = vocab_bytes {
+        project.write_new(pkg.join(VOCAB_FILE_NAME), bytes)?;
+        members.push((PackageComponent::VocabOrFeatureTransform, VOCAB_FILE_NAME));
+    }
+
+    let mut files = Vec::new();
+    for (component, name) in members {
         let (file, path) = project.open_file(pkg.join(name))?;
         files.push((component, path, file));
     }
