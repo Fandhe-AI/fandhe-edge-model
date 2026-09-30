@@ -275,8 +275,9 @@ def classify(
     `control_pid` の拒否は陽性対照（`positive_control`）として別に数え、tool・unattributed・
     `network_deny_events` には含めない。ただし `control_window`（epoch 秒の下限・上限）が
     あるとき、イベントの時刻が区間外なら同じ PID でも陽性対照にしない（PID 再利用で別プロセスの
-    拒否が陽性対照へ紛れ、tool・unattributed の件数から消えるのを防ぐ）。`control_window` があり時刻が無い
-    同 PID の拒否行は判定不能（fail-closed）。照合済みの要約行は元イベントの帰属を引き継ぐ。
+    拒否が陽性対照へ紛れ、tool・unattributed の件数から消えるのを防ぐ）。`control_window` が
+    あり時刻が無い同 PID の拒否行は判定不能（fail-closed）。
+    照合済みの要約行は元イベントの帰属を引き継ぐ。
 
     発生回数: 元の行は 1 回。`N duplicate reports for` の要約行は、同じ `event_key` の元の行が
     先に数えられていれば N 回だけ加算し（元の 1 回を二重に数えない）、元の行が無ければ

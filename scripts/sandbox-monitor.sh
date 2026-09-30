@@ -45,9 +45,10 @@
 #     させ、同じ監視窓の中で拒否が検出されることを集計器が確かめる。省略する経路（オプション・
 #     環境変数）は設けない（人が忘れる PoC-16 の逸脱 1 を構造的に防ぐ）。curl は絶対パス
 #     /usr/bin/curl で、テスト専用の上書きは FANDHE_EDGE_CURL_CMD（上書き時は集計器が
-#     evidence_hint を test_harness にする）。起動できない・期限（10 秒）を超えた場合は
-#     sandbox-run.sh を起動せず runtime_error(70)。検出されなければ「0 件」とは判定せず
-#     判定不能(70)。記録は <out-dir>/positive_control.meta.json（0600。PID・時刻・終了コード・
+#     evidence_hint を test_harness にする）。起動できない・期限（10 秒）を超えた・curl が成功した・
+#     拒否行が 5 秒以内に記録されない場合は sandbox-run.sh を起動せず runtime_error(70)
+#     （本実行のゲート）。最終判定でも検出されなければ「0 件」とは判定せず判定不能(70)。
+#     記録は <out-dir>/positive_control.meta.json（0600。PID・時刻・終了コード・
 #     上書きの有無のみで、対象 URL は書かない）。
 #     残るリスク: sandbox が効いていない故障時に限り example.com へ 1 回リクエストが出る
 #     （それを検出するのが陽性対照の役割。実行は人が macOS 実機で行う）
@@ -382,6 +383,26 @@ if ! printf '{"pid":%s,"exit_code":%s,"started_utc":"%s","ended_utc":"%s","curl_
     >"$control_meta_file" 2>/dev/null; then
     fail 70 runtime_error "cannot write positive control record"
 fi
+
+# 陽性対照をゲートにする（REQ-38）: curl が成功した（遮断が効いていない）、または監視が
+# 陽性対照の拒否行を記録できていない場合は、本実行へ進まず 70 で止める。そのまま 7 工程を
+# 実行すると、異常が実行後の集計まで判明しない。拒否行の書き込みは遅れうるため最大 5 秒待つ。
+# PID と時刻区間の厳密な照合は集計器が行う（ここは「何か記録されたか」の事前確認）
+[ "$control_rc" -ne 0 ] \
+    || fail 70 runtime_error "positive control command succeeded; sandbox run was not started"
+control_seen=0
+i=0
+while [ "$i" -le 50 ]; do
+    if grep -Eq "\\($control_pid_recorded\\) deny\\([0-9]+\\) network" -- "$stream_file" 2>/dev/null; then
+        control_seen=1
+        break
+    fi
+    log_alive "$logpid" || break
+    sleep 0.1
+    i=$((i + 1))
+done
+[ "$control_seen" -eq 1 ] \
+    || fail 70 runtime_error "positive control denial was not observed; sandbox run was not started"
 
 # ---- 実行 ----
 set -- --definition "$definition" --project-dir "$project_dir" --out-dir "$out_dir/run"

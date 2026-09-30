@@ -1187,9 +1187,11 @@ fn run_report_control(dir: &Path, stream: &Path, run_meta: &str, control: &str) 
     )
 }
 
-/// 拒否が検出されなければ「0 件」とは判定せず判定不能 70（検出手段が機能しない）。
+/// 陽性対照の拒否が監視で記録されなければ、本実行（sandbox-run.sh）を起動せず 70 で止める
+/// （REQ-38・TASK-38.2。陽性対照を本実行のゲートにする。検出手段が機能しない状態で
+/// 「0 件」を装わない）。
 #[test]
-fn req38_positive_control_not_detected_is_undeterminable() {
+fn req38_positive_control_not_detected_stops_before_run() {
     let e = Env::new();
     let o = e.run(
         "clean.ndjson",
@@ -1197,19 +1199,21 @@ fn req38_positive_control_not_detected_is_undeterminable() {
         &[("FAKE_LOG_MODE", "pc_missing")],
     );
     assert_eq!(o.code, Some(70), "{}", o.stdout);
-    has(&o, "\"network_verdict\": \"undeterminable\"");
-    has(&o, "\"positive_control\": \"not_detected\"");
     has(&o, "positive control denial was not observed");
+    has(&o, "sandbox run was not started");
+    assert!(e.cli_calls().is_empty());
 }
 
-/// curl の終了コードが 0（通信が成功した＝遮断が効いていない）なら判定不能 70。
+/// curl の終了コードが 0（通信が成功した＝遮断が効いていない）なら、本実行を起動せず 70
+/// （REQ-38・TASK-38.2。ゲート）。
 #[test]
-fn req38_positive_control_curl_success_is_undeterminable() {
+fn req38_positive_control_curl_success_stops_before_run() {
     let e = Env::new();
     let o = e.run("clean.ndjson", &e.base_args(), &[("FAKE_CURL_RC", "0")]);
     assert_eq!(o.code, Some(70), "{}", o.stdout);
-    has(&o, "\"network_verdict\": \"undeterminable\"");
     has(&o, "positive control command succeeded");
+    has(&o, "sandbox run was not started");
+    assert!(e.cli_calls().is_empty());
 }
 
 /// PoC-16 実測の形の拒否行が陽性対照として検出され、tool・unattributed の件数に混ざらない。
