@@ -344,6 +344,13 @@ pub fn acquire_error_report(error: &AcquireError) -> ErrorReport {
         AcquireError::InvalidConfigId { .. } => {
             ErrorReport::new(ExitCode::InvalidInput, "evaluation config id is invalid")
         }
+        AcquireError::SelectionChanged => ErrorReport::new(
+            ExitCode::InvalidInput,
+            "selection differs from the one fixed at the first evaluation",
+        ),
+        AcquireError::SelectionNotPinned => {
+            ErrorReport::new(ExitCode::InvalidInput, "evaluation has not been completed")
+        }
         AcquireError::WeightsDigest {
             source: FsError::TooLarge { .. },
         } => ErrorReport::new(

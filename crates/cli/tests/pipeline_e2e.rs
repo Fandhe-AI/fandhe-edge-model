@@ -1339,6 +1339,116 @@ mod suite {
         env.ok(&PACKAGE);
     }
 
+    /// REQ-27: 評価データがあるプロジェクトでは、smoke 学習の候補は `--allow-smoke` を付けても
+    /// `package` できない（`--allow-smoke` が緩めるのは smoke 候補の拒否だけ。評価完了の確認は緩めない）。
+    pub fn package_rejects_smoke_candidate_with_allow_smoke_when_evaluation_data_exists() {
+        let env = eval_env_until("smokeevalpkg", &[]);
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--smoke",
+        ]);
+        env.ok(&SELECT);
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"smoke-trained candidate cannot be packaged\"}\n"
+        );
+        assert_eq!(
+            env.fails(
+                &["package", "--project-dir", "proj", "--allow-smoke"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation has not been completed\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// 候補 `index` の `result.json` の validation 予測を、すべて正解ラベル（id の先頭語）へ書き換える。
+    /// `validation_predictions` の各要素は `{"id":"<label>-<n>","status":"ok","predicted_label":"<x>"}`。
+    fn set_validation_predictions(env: &Env, index: usize, correct: bool) {
+        let path = env.project_file(&format!("candidates/{index}/result.json"));
+        let text = std::fs::read_to_string(&path).expect("result.json");
+        let mut out = String::new();
+        let mut rest = text.as_str();
+        let key = "\"predicted_label\":\"";
+        let mut rewritten = 0;
+        while let Some(at) = rest.find(key) {
+            let (head, tail) = rest.split_at(at + key.len());
+            let id_start = head.rfind("\"id\":\"").expect("id before label") + 6;
+            let id = &head[id_start..];
+            let gold = id.split('-').next().expect("label prefix").to_string();
+            let end = tail.find('"').expect("label end");
+            let label = if correct { gold } else { "zzz".to_string() };
+            out.push_str(head);
+            out.push_str(&label);
+            rest = &tail[end..];
+            rewritten += 1;
+        }
+        out.push_str(rest);
+        assert!(rewritten > 0, "no validation predictions rewritten");
+        std::fs::write(&path, out).expect("write result.json");
+    }
+
+    /// REQ-27: 最初の `evaluate` で固定した選定と異なる選定（A を評価した後に validation 結果と選定記録を
+    /// 書き換えて B を選ぶ）では、B の `evaluate` は台帳が拒否し最終 test へ適用させない。`package` も拒否する。
+    pub fn evaluate_and_package_reject_selection_switched_after_first_evaluation() {
+        let env = eval_trained("selswitch");
+        // 既定の偽ワーカーでは candidate 1（c3）が選ばれる。A = candidate 1 を評価する。
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        // validation 結果を書き換えて candidate 0（c1）が選ばれるようにし、選定記録も作り直す。
+        set_validation_predictions(&env, 0, true);
+        set_validation_predictions(&env, 1, false);
+        std::fs::remove_file(env.project_file("selection_record.json")).expect("remove selection");
+        assert_eq!(
+            env.ok(&SELECT),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}\n"
+        );
+        assert_eq!(
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection differs from the one fixed at the first evaluation\"}\n"
+        );
+        assert!(
+            !env.project_file("candidates/0/evaluation_record.json")
+                .exists()
+        );
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input")
+                .matches('\n')
+                .count(),
+            1
+        );
+        assert!(!env.project_file("package").exists());
+    }
+
+    /// REQ-27: 選定記録の内容（ダイジェスト）が最初の `evaluate` の時点から変わると（同じ候補でも）、
+    /// 再評価は台帳が選定の不一致として拒否し、`package` も固定した選定と一致しないため拒否する。
+    /// 元に戻せば `package` は成功する。
+    pub fn evaluate_and_package_reject_selection_digest_changed_after_first_evaluation() {
+        let env = eval_trained("seldigest");
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        let selection_path = env.project_file("selection_record.json");
+        let original = std::fs::read(&selection_path).expect("selection record");
+        // 意味は同じ（同じ候補・同じ値）だが、バイト列（ダイジェスト）が異なる記録。
+        let mut altered = original.clone();
+        altered.insert(0, b' ');
+        std::fs::write(&selection_path, &altered).expect("alter selection");
+        let differs = "{\"code\":\"invalid_input\",\"message\":\"selection differs from the one fixed at the first evaluation\"}\n";
+        assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), differs);
+        assert!(!env.project_file("package").exists());
+        // 記録を消しても、台帳が固定した選定との不一致で拒否する（適用ロックより前の判定）。
+        std::fs::remove_file(env.project_file("candidates/1/evaluation_record.json"))
+            .expect("remove record");
+        assert_eq!(env.fails(&EVALUATE_1, 64, "invalid_input"), differs);
+        std::fs::write(&selection_path, &original).expect("restore selection");
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1465,6 +1575,18 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_record_without_ledger_completion",
             suite::package_rejects_record_without_ledger_completion,
+        ),
+        (
+            "package_rejects_smoke_candidate_with_allow_smoke_when_evaluation_data_exists",
+            suite::package_rejects_smoke_candidate_with_allow_smoke_when_evaluation_data_exists,
+        ),
+        (
+            "evaluate_and_package_reject_selection_switched_after_first_evaluation",
+            suite::evaluate_and_package_reject_selection_switched_after_first_evaluation,
+        ),
+        (
+            "evaluate_and_package_reject_selection_digest_changed_after_first_evaluation",
+            suite::evaluate_and_package_reject_selection_digest_changed_after_first_evaluation,
         ),
         (
             "package_rejects_tampered_evaluation_record",

@@ -275,3 +275,37 @@ fn req27_sync_failure_through_trait_is_fail_closed() {
     assert_eq!(calls.get(), 0);
     assert!(!fx.is_applied(&ledger));
 }
+
+/// REQ-27: 選定（代表構成 ID と選定記録のダイジェスト）は最初の適用の前に 1 回だけ固定でき、
+/// 同じ選定なら冪等、異なる ID・ダイジェストは `SelectionChanged`、未固定の照合は `SelectionNotPinned`。
+/// 固定は `LedgerDir` 越しに作られ、ロックは作られない。
+#[test]
+fn req27_selection_pin_is_fixed_once_and_rejects_changes() {
+    let fx = Fixture::new("selpin");
+    let mock = RecordingDir::new(&fx.ledger_root);
+    let ledger = FinalTestLedger::with_dir(mock.clone());
+    let eval = freeze_eval_data(DATA).unwrap().sha256();
+    let a = RepresentativeConfigId::parse("c1:seed0").unwrap();
+    let b = RepresentativeConfigId::parse("c3:seed0").unwrap();
+    let (sel_a, sel_b) = (Sha256Digest::of_bytes(b"a"), Sha256Digest::of_bytes(b"b"));
+
+    assert!(matches!(
+        ledger.verify_selection_pin(&eval, &a, &sel_a),
+        Err(AcquireError::SelectionNotPinned)
+    ));
+    ledger.pin_selection(&eval, &a, &sel_a).unwrap();
+    ledger.pin_selection(&eval, &a, &sel_a).unwrap();
+    ledger.verify_selection_pin(&eval, &a, &sel_a).unwrap();
+    for (id, sel) in [(&b, &sel_a), (&a, &sel_b), (&b, &sel_b)] {
+        assert!(matches!(
+            ledger.pin_selection(&eval, id, sel),
+            Err(AcquireError::SelectionChanged)
+        ));
+        assert!(matches!(
+            ledger.verify_selection_pin(&eval, id, sel),
+            Err(AcquireError::SelectionChanged)
+        ));
+    }
+    let ops: Vec<&str> = mock.log.lock().unwrap().iter().map(|(o, _)| *o).collect();
+    assert!(ops.contains(&"create_new_file") && ops.contains(&"make_read_only"));
+}

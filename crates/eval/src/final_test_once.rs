@@ -128,6 +128,7 @@ const CONFIG_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/config/v1\0";
 const WEIGHTS_LOCK_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/weights/v1\0";
 const COMPLETION_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/completion/v1\0";
 const REGISTRY_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry/v1\0";
+const SELECTION_PIN_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/selection-pin/v1\0";
 const REGISTRY_SEAL_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-seal/v1\0";
 const REGISTRY_CONTENT_DOMAIN: &[u8] = b"fandhe-edge/final-test-lock/registry-content/v1\0";
 const SEAL_HEADER: &str = "fandhe-edge-final-test-registry-seal v1\n";
@@ -315,6 +316,14 @@ fn registry_name(eval_data_sha256: &Sha256Digest) -> String {
     format!("registry-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
 }
 
+/// 選定の固定ファイル名（評価データごとに 1 つ。最初の適用の前に固定した選定を残す）。
+fn selection_pin_name(eval_data_sha256: &Sha256Digest) -> String {
+    let mut buf = Vec::with_capacity(SELECTION_PIN_DOMAIN.len() + 32);
+    buf.extend_from_slice(SELECTION_PIN_DOMAIN);
+    buf.extend_from_slice(eval_data_sha256.as_bytes());
+    format!("selection-{}.lock", Sha256Digest::of_bytes(&buf).to_hex())
+}
+
 /// 事前登録の封印ファイル名（登録本文の sha256 を 1 回だけ書き込む別ファイル）。
 fn seal_name(eval_data_sha256: &Sha256Digest) -> String {
     let mut buf = Vec::with_capacity(REGISTRY_SEAL_DOMAIN.len() + 32);
@@ -462,6 +471,12 @@ pub enum AcquireError {
         /// 違反の種別（登録内容の実値は載せない）。
         reason: &'static str,
     },
+    /// 最初の適用より前に固定した選定（候補 ID と選定記録のダイジェスト）が無い。
+    /// 適用は選定の固定後にしか行えない（REQ-27）。
+    SelectionNotPinned,
+    /// 固定済みの選定と異なる選定が渡された（最終 test の結果を見て選定を選び直す迂回の拒否。
+    /// REQ-27）。ロックは作られない。
+    SelectionChanged,
     /// 台帳ディレクトリが存在しない・ディレクトリでない・symlink。
     LedgerDirInvalid {
         /// 台帳ディレクトリのパス。
@@ -535,6 +550,15 @@ impl fmt::Display for AcquireError {
             }
             AcquireError::RegistryTampered { reason } => {
                 write!(f, "registration integrity check failed: {reason}")
+            }
+            AcquireError::SelectionNotPinned => {
+                write!(f, "selection was not fixed before the first application")
+            }
+            AcquireError::SelectionChanged => {
+                write!(
+                    f,
+                    "selection differs from the one fixed at the first application"
+                )
             }
             AcquireError::LedgerDirInvalid { path } => {
                 write!(f, "ledger path is not a real directory: {}", path.display())
@@ -930,6 +954,74 @@ impl FinalTestLedger {
         self.sync_dir(&sdir)
     }
 
+    /// 選定（代表構成 ID と、validation 結果を含む選定記録のダイジェスト）を評価データごとに 1 回だけ
+    /// 固定する。最初の適用より前に呼ぶ（REQ-27）。
+    ///
+    /// 既に固定済みなら、同じ選定のときだけ `Ok`（冪等）で、異なれば [`AcquireError::SelectionChanged`]。
+    /// 「A を評価した後に validation 結果と選定記録を書き換えて B を選び、B も最終 test へ適用する」
+    /// 迂回を、固定した選定との照合で拒否するための内部状態（`create_new`・読み取り専用。
+    /// 事前登録と同じく台帳の書き込み主体による丸ごとの作り直しは検出できない。#168）。
+    /// 作成途中で中断した空の固定ファイルは、次回以降「固定済みと不一致」として拒否する（fail-closed）。
+    ///
+    /// # Errors
+    /// 固定済みの選定との不一致・台帳の書き込み失敗（[`AcquireError`]）。
+    pub fn pin_selection(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+        config_id: &RepresentativeConfigId,
+        selection_sha256: &Sha256Digest,
+    ) -> Result<(), AcquireError> {
+        let sdir = self.ensure_scope_dir(eval_data_sha256)?;
+        let rel = member(&sdir, &selection_pin_name(eval_data_sha256));
+        match self.create_lock(&rel, AppliedBy::RepresentativeConfig) {
+            Ok((file, path)) => {
+                let body = selection_pin_body(eval_data_sha256, config_id, selection_sha256);
+                Self::write_record(file, &path, &body)?;
+                self.make_read_only(&rel)?;
+                self.sync_dir(&sdir)
+            }
+            Err(AcquireError::AlreadyApplied { .. }) => {
+                self.verify_selection_pin(eval_data_sha256, config_id, selection_sha256)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 固定済みの選定が `config_id`・`selection_sha256` と一致することを確認する（`package` が
+    /// 評価完了・現在の選定との一致を照合するために使う。REQ-27）。
+    ///
+    /// # Errors
+    /// 固定が無い（[`AcquireError::SelectionNotPinned`]）・不一致や壊れた固定
+    /// （[`AcquireError::SelectionChanged`]）・読み取り失敗。
+    pub fn verify_selection_pin(
+        &self,
+        eval_data_sha256: &Sha256Digest,
+        config_id: &RepresentativeConfigId,
+        selection_sha256: &Sha256Digest,
+    ) -> Result<(), AcquireError> {
+        let sdir = self.scope_dir(eval_data_sha256);
+        let rel = member(&sdir, &selection_pin_name(eval_data_sha256));
+        let bytes = match self.dir.read_bounded(&rel, MAX_LOCK_RECORD_BYTES) {
+            Ok(b) => b,
+            Err(FsError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AcquireError::SelectionNotPinned);
+            }
+            Err(FsError::Read { source, .. }) => {
+                return Err(AcquireError::Io {
+                    path: self.dir.display_path(&rel),
+                    source,
+                });
+            }
+            Err(_) => return Err(AcquireError::SelectionChanged),
+        };
+        let want = selection_pin_body(eval_data_sha256, config_id, selection_sha256);
+        if bytes == want.as_bytes() && self.dir.is_read_only_file(&rel) {
+            Ok(())
+        } else {
+            Err(AcquireError::SelectionChanged)
+        }
+    }
+
     /// 代表構成 `config_id`・重み `weights_sha256` の最終 test 適用が、この台帳で完了しているかを返す
     /// （REQ-27。`package` が評価完了の根拠にする読み取り専用の照会）。
     ///
@@ -1071,6 +1163,20 @@ pub type ApplyOnceThenResult<T, E, R> = Result<
     (AppliedOnce<T>, R),
     EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>,
 >;
+
+/// 選定の固定ファイルの本文（正準化は 1 箇所。ダイジェストと検証済み ID のみで本文は含まない）。
+fn selection_pin_body(
+    eval_data_sha256: &Sha256Digest,
+    config_id: &RepresentativeConfigId,
+    selection_sha256: &Sha256Digest,
+) -> String {
+    format!(
+        "fandhe-edge-final-test-selection-pin v1\neval_data_sha256={}\nrepresentative_config_id={}\nselection_sha256={}\n",
+        eval_data_sha256.to_hex(),
+        config_id.as_str(),
+        selection_sha256.to_hex(),
+    )
+}
 
 /// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を 1 行ずつ）。
 fn registry_body(entries: &[RegisteredConfig]) -> String {

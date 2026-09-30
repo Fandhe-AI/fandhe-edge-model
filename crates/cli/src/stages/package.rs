@@ -124,7 +124,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         return Err(invalid("selection record does not match the candidate"));
     }
     // 短縮学習（`train --smoke`）の結果は、検証専用の `--allow-smoke` を明示しない限り配布しない
-    // （`select` は smoke の結果も選定できるため、ここが配布の関門。REQ-27）。
+    // （`select` は smoke の結果も選定できるため、ここが配布の関門。REQ-27）。`--allow-smoke` が
+    // 緩めるのはこの確認だけで、評価完了の確認（下の [`verify_evaluation_record`]）は緩めない。
     if request_is_smoke_trained(&request, &candidate.params) && !args.allow_smoke {
         return Err(invalid("smoke-trained candidate cannot be packaged"));
     }
@@ -163,14 +164,12 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 
     // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
     // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
-    // `--allow-smoke` の検証専用パッケージ（短縮学習の候補）は最終 test を適用できない
-    // （`evaluate` が拒否する）ため評価完了の確認を行わない。配布用ではなく、明示した場合のみ
-    // ここへ来る（上で `--allow-smoke` なしの smoke 候補は拒否済み。REQ-27）。
-    let smoke_validation_only = request_is_smoke_trained(&request, &candidate.params);
-    if let Some((freeze, eval_bytes)) = frozen.as_ref().filter(|_| !smoke_validation_only) {
+    // smoke 学習の候補かどうか・`--allow-smoke` の有無に関係なく確認する（smoke の候補は
+    // `evaluate` が拒否するため、評価データがあるプロジェクトでは公開できない。fail-closed。REQ-27）。
+    if let Some((freeze, eval_bytes)) = frozen.as_ref() {
         verify_evaluation_record(
             &project,
-            &selection,
+            (&selection, &Sha256Digest::of_bytes(&selection_bytes)),
             (freeze, eval_bytes),
             &definition,
             &meta_bytes,
@@ -236,7 +235,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
 /// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
 fn verify_evaluation_record(
     project: &Project,
-    selection: &SelectionRecord,
+    (selection, selection_sha256): (&SelectionRecord, &Sha256Digest),
     (freeze, eval_bytes): (&FreezeRecord, &[u8]),
     definition: &Definition,
     meta_bytes: &[u8],
@@ -275,16 +274,21 @@ fn verify_evaluation_record(
     let config_id =
         RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
     let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
-    let applied = match HeldLedger::open(project, false)? {
-        Some(held) => held
-            .ledger()
-            .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
-            .map_err(|e| acquire_error_report(&e))?,
-        None => false,
+    let Some(held) = HeldLedger::open(project, false)? else {
+        return Err(invalid("evaluation has not been completed"));
     };
+    let applied = held
+        .ledger()
+        .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
+        .map_err(|e| acquire_error_report(&e))?;
     if !applied {
         return Err(invalid("evaluation has not been completed"));
     }
+    // 最初の適用の前に台帳へ固定した選定が、現在の選定（候補 ID と選定記録のダイジェスト）と
+    // 一致することを確認する（選定を書き換えた別候補を配布しない。REQ-27）。
+    held.ledger()
+        .verify_selection_pin(&freeze.sha256(), &config_id, selection_sha256)
+        .map_err(|e| acquire_error_report(&e))?;
     Ok(())
 }
 

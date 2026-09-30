@@ -149,7 +149,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     let definition = project.load_definition()?;
     // 最終 test の結果を見て候補を選び直せないよう、validation による選定（`select`）を先に確定させ、
     // 選定された候補だけを評価可能にする（REQ-27）。
-    ensure_selected(&project, &definition, args.candidate)?;
+    let selection_sha256 = ensure_selected(&project, &definition, args.candidate)?;
     let records = project.load_records(&definition)?;
     let (split, seed) = verified_split(&project, &records)?;
 
@@ -223,6 +223,13 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         Ok(()) | Err(AcquireError::AlreadyRegistered { .. }) => {}
         Err(e) => return Err(acquire_error_report(&e)),
     }
+    // 最初の適用の前に、選定（候補 ID と、validation 結果を含む選定記録のダイジェスト）を台帳へ
+    // 固定する。以後は同じ選定のときだけ評価でき、A を評価した後に validation 結果と選定記録を
+    // 書き換えて B を選んでも、B は最終 test に適用できない（REQ-27）。
+    held_ledger
+        .ledger()
+        .pin_selection(&freeze.sha256(), &target.config_id, &selection_sha256)
+        .map_err(|e| acquire_error_report(&e))?;
 
     // 指標の算出・評価記録の書き込みは、台帳へ完了を記録する前（`finish`）に済ませる。失敗しても
     // 台帳は完了状態にならず、記録の無い完了（台帳だけが完了）を作らない（REQ-27）。
@@ -263,13 +270,15 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
 /// `select` の記録があり、保存済みの結果から再計算した選定と一致し、対象候補が選定された候補で
 /// あることを確認する（`package` と同じ再検証。選定ロジックを複製しない。REQ-27）。
 ///
+/// 成功時は選定記録のバイト列の sha256 を返す（台帳へ固定する選定のダイジェスト）。
+///
 /// # Errors
 /// 選定記録が無い・不正・再計算と不一致・対象候補が選定された候補でない場合は `invalid_input`。
 fn ensure_selected(
     project: &Project,
     definition: &Definition,
     candidate: usize,
-) -> Result<(), ErrorReport> {
+) -> Result<Sha256Digest, ErrorReport> {
     let Some(bytes) = project.read_optional(SELECTION_FILE, 64 * 1024)? else {
         return Err(invalid("candidate selection has not been recorded"));
     };
@@ -281,7 +290,8 @@ fn ensure_selected(
     if selection.candidate_index != candidate {
         return Err(invalid("candidate is not the selected candidate"));
     }
-    Ok(())
+    // 選定記録には選定の入力になった validation 結果（正解数・件数）が含まれる。
+    Ok(Sha256Digest::of_bytes(&bytes))
 }
 
 /// 候補 `index` の学習結果を検証して、評価に使える形にする（評価できない候補は `None`）。
