@@ -12,7 +12,7 @@
 //!   [`CheckedKind`] がなければ [`KindVersionAllowlist::check`] を呼べない
 //! - 検査するのは版の許可リストだけ。sha256 による完全性検証は `version_ledger`（TASK-39.3）、
 //!   破損パッケージの確認は TASK-39.6-2（#175）の範囲
-//! - `artifact.json` 上で `kind_version` が欠落・非整数・範囲外のときは、呼び出し側（core の
+//! - `artifact.json` 上で `kind_version` が非整数・範囲外のときは（欠落は版 1 として扱う）、呼び出し側（core の
 //!   `ArtifactOnnxRef::parse`）の解析エラーとして拒否する。本 API は `u32` を受け取る
 //! - 既定の許可集合は学習ワーカーの選択口と同じ。ずれは
 //!   `crates/train/tests/guard_kind_version_allowlist_sync.rs` が共有 fixture 経由で検出する

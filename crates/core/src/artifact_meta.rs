@@ -17,13 +17,13 @@
 //! 移行手順は、既存の `artifact.json` に `"kind": "<c1|c3|autoregressive>"` を追加すること
 //! （学習ワーカーが出力する `artifact.json` は常に `kind` を持つ）。
 //!
-//! # 移行（破壊的変更。#174）
+//! # 後方互換（#174）
 //!
-//! `kind_version` も**必須**（`u32` の範囲の整数。欠落・文字列・負数・小数・範囲外は拒否）。
-//! 省略を許すと版の許可リスト検査の迂回路になるため。値の内容（許可リスト外か）は本モジュールでは
-//! 判定せず、ガード層の `KindVersionAllowlist` に一本化する。`kind_version` を持たない既存の
-//! `artifact.json` は `infer` で `invalid_input`（64）になる。移行手順は `"kind_version": 1` を
-//! 追加すること（学習ワーカーが出力する `artifact.json` は常に `kind_version` を持つ）。
+//! `kind_version` は後方互換のため**省略可**。省略時は版管理導入前のパッケージとみなして
+//! [`LEGACY_KIND_VERSION`]（1）を返す。`kind_version` を持つ場合は `u32` の範囲の整数のみを受理し、
+//! 文字列・負数・小数・`null`・範囲外は拒否する（省略と不正値は区別する）。値の内容（許可リスト外か）は
+//! 本モジュールでは判定せず、省略時の 1 も含めてガード層の `KindVersionAllowlist` で検査する
+//! （許可リストに 1 が無くなれば、旧形式のパッケージも拒否される）。
 //!
 //! # 信頼境界
 //!
@@ -36,6 +36,9 @@ use std::fmt;
 
 /// `artifact.json` の最大バイト数（暫定値。上限の正式値は TASK-39.5 で確定する。REQ-39）。
 pub const MAX_ARTIFACT_META_BYTES: u64 = 1024 * 1024;
+
+/// `kind_version` を持たない従来の `artifact.json` に当てはめる版（版管理導入前は全て 1 相当。REQ-39・#174）。
+pub const LEGACY_KIND_VERSION: u32 = 1;
 
 /// メタデータの解釈エラー。入力値を保持しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +65,12 @@ impl std::error::Error for ArtifactMetaError {}
 struct Raw {
     onnx_file: String,
     kind: String,
+    #[serde(default = "legacy_kind_version")]
     kind_version: u32,
+}
+
+fn legacy_kind_version() -> u32 {
+    LEGACY_KIND_VERSION
 }
 
 /// `artifact.json` から取り出した ONNX ファイルへの参照（未検証の相対パス文字列）。
@@ -108,7 +116,7 @@ impl ArtifactOnnxRef {
         &self.kind
     }
 
-    /// 未検証の `kind_version`。ガード層の `KindVersionAllowlist` 検査の入力にのみ使い、
+    /// 未検証の `kind_version`（省略時は [`LEGACY_KIND_VERSION`]）。ガード層の `KindVersionAllowlist` 検査の入力にのみ使い、
     /// 検査を通す前に下流（ランタイム・出力）へ渡さない。
     pub fn kind_version(&self) -> u32 {
         self.kind_version
@@ -182,7 +190,7 @@ mod tests {
         }
     }
 
-    /// REQ-39・TASK-39.6-1: `kind_version` の欠落・型違い・範囲外は Malformed（fail-closed）。
+    /// REQ-39・TASK-39.6-1: `kind_version` の型違い・範囲外は Malformed（fail-closed）。
     #[test]
     fn req39_parse_rejects_missing_or_invalid_kind_version() {
         for lit in [r#""1""#, "-1", "1.5", "null", "[]", "true", "4294967296"] {
@@ -193,10 +201,14 @@ mod tests {
                 "{lit}"
             );
         }
-        assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"m.onnx","kind":"c3"}"#),
-            Err(ArtifactMetaError::Malformed)
-        );
+    }
+
+    /// REQ-39・#174: `kind_version` を持たない従来の artifact.json は版 1 として読める（後方互換）。
+    #[test]
+    fn req39_parse_defaults_missing_kind_version_to_legacy() {
+        let r = ArtifactOnnxRef::parse(br#"{"onnx_file":"m.onnx","kind":"c3"}"#).expect("ok");
+        assert_eq!(r.kind_version(), LEGACY_KIND_VERSION);
+        assert_eq!(r.kind_version(), 1);
     }
 
     /// REQ-39: エラー文言に入力値を含めない。

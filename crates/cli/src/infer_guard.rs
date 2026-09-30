@@ -11,7 +11,7 @@
 //!
 //! 1. `--package` を workspace（カレントディレクトリ）配下へ閉じ込め、ディレクトリであることを確認
 //! 2. パッケージ配下の `artifact.json` を、開いた fd から上限付きで読む
-//! 3. `onnx_file`・`kind`・`kind_version` を取り出す（欠落・型違いは `artifact metadata is invalid`・64）
+//! 3. `onnx_file`・`kind`・`kind_version` を取り出す（`onnx_file`・`kind` の欠落・型違い、`kind_version` の型違いは `artifact metadata is invalid`・64。`kind_version` の欠落は版 1 として扱う）
 //! 4. `kind` を許可リスト（`KindAllowlist::supported()`）で検査する。拒否は
 //!    `kind rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う（fail-closed）
 //! 5. `kind_version` を `kind` ごとの許可リスト（`KindVersionAllowlist::supported()`）で検査する。

@@ -247,11 +247,11 @@ mod unix_only {
         sb.assert_infer(64, UNSUPPORTED_KIND);
     }
 
-    /// REQ-39: `kind_version` の欠落・型違い・範囲外は必須違反として `artifact metadata is invalid`。
+    /// REQ-39: `kind_version` の型違い・範囲外は `artifact metadata is invalid`（欠落は後方互換で許可）。
     #[test]
     fn req39_missing_or_non_integer_kind_version_is_rejected() {
         let sb = Sandbox::new("kv-invalid");
-        let mut metas = vec![r#"{"onnx_file":"model.onnx","kind":"c3"}"#.to_string()];
+        let mut metas = Vec::new();
         for v in ["\"1\"", "-1", "1.5", "null", "4294967296"] {
             metas.push(meta_v("\"c3\"", v, "model.onnx"));
         }
