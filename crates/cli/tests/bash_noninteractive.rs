@@ -229,10 +229,7 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
 /// （出所は `fixtures/onnx_parity/PROVENANCE.md`）。呼び出し側がテスト終了時に削除する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn make_real_package(name: &str) -> PathBuf {
-    let ws = std::env::temp_dir().join(format!(
-        "fandhe-noninteractive-{}-{name}",
-        std::process::id()
-    ));
+    let ws = std::env::temp_dir().join(format!("fandhe-realpkg-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(ws.join("p")).expect("mkdir");
     let onnx = std::fs::read(
