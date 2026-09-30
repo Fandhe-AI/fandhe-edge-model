@@ -374,3 +374,79 @@ def test_req38_python_full_pin_is_accepted() -> None:
     """`==x.y.z` と extras 付きは受理する。"""
     assert mod.PY_REQ_RE.match("numpy==2.5.3") is not None
     assert mod.PY_REQ_RE.match("mlx[cpu]==0.32.2") is not None
+
+
+def test_req38_unapproved_layer_for_existing_dependency_fails(repo: Path, capsys: Capture) -> None:
+    """台帳の layers に無い層（crates/eval）で承認済み依存を使うと exit 10（REQ-38・#165）。"""
+    edit(repo, "crates/eval/Cargo.toml", "[lints]", "serde.workspace = true\n\n[lints]")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_layer", "serde") in kinds(payload)
+
+
+def test_req38_dev_only_layer_needs_dev_record(repo: Path, capsys: Capture) -> None:
+    """境界値: 通常依存への昇格は `<層>(dev)` 記録だけでは通らない（runtime）。"""
+    edit(
+        repo,
+        "crates/runtime/Cargo.toml",
+        "[dev-dependencies]",
+        "serde_json.workspace = true\n\n[dev-dependencies]",
+    )
+    # 重複キーを避けるため dev 側の既存記述を除去する
+    text = (repo / "crates/runtime/Cargo.toml").read_text(encoding="utf-8")
+    head, _, tail = text.partition("[dev-dependencies]")
+    tail = tail.replace("serde_json.workspace = true\n", "", 1)
+    (repo / "crates/runtime/Cargo.toml").write_text(
+        head + "[dev-dependencies]" + tail, encoding="utf-8"
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unapproved_layer", "serde_json") in kinds(payload)
+
+
+def test_req38_workspace_feature_change_fails(repo: Path, capsys: Capture) -> None:
+    """同じ版のまま features を増やすと、台帳の features と不一致で exit 10。"""
+    edit(
+        repo,
+        "Cargo.toml",
+        'serde_json = "=1.0.151"',
+        'serde_json = { version = "=1.0.151", features = ["preserve_order"] }',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("feature_mismatch", "serde_json") in kinds(payload)
+
+
+def test_req38_default_features_change_fails(repo: Path, capsys: Capture) -> None:
+    """default-features の有効化（rustix は台帳で false）も exit 10。"""
+    edit(repo, "Cargo.toml", "default-features = false, ", "")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("feature_mismatch", "rustix") in kinds(payload)
+
+
+def test_req38_member_feature_override_fails(repo: Path, capsys: Capture) -> None:
+    """メンバー側の features 上書きは exit 10。"""
+    edit(
+        repo,
+        "crates/core/Cargo.toml",
+        "sha2.workspace = true",
+        'sha2 = { workspace = true, features = ["oid"] }',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("member_dependency_not_workspace", "sha2") in kinds(payload)
+
+
+def test_req38_build_system_requires_is_checked(repo: Path, capsys: Capture) -> None:
+    """build-system.requires の未承認・未固定の依存も exit 10。"""
+    append(
+        repo,
+        "trainer/pyproject.toml",
+        '\n[build-system]\nrequires = ["hatchling==1.0.0", "setuptools>=1"]\n',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    found = kinds(payload)
+    assert ("unapproved_dependency", "hatchling") in found
+    assert any(k == "pin_violation" for k, _ in found)

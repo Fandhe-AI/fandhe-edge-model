@@ -13,7 +13,11 @@
           "core",
           "data",
           "train"
-        ]
+        ],
+        "features": [
+          "derive"
+        ],
+        "default_features": true
       },
       {
         "name": "serde_json",
@@ -27,7 +31,9 @@
           "data",
           "train",
           "runtime(dev)"
-        ]
+        ],
+        "features": [],
+        "default_features": true
       },
       {
         "name": "sha2",
@@ -38,7 +44,9 @@
         "purpose": "正準化ハッシュ（sha256）の計算",
         "layers": [
           "core"
-        ]
+        ],
+        "features": [],
+        "default_features": true
       },
       {
         "name": "unicode-normalization",
@@ -50,7 +58,9 @@
         "layers": [
           "data",
           "runtime"
-        ]
+        ],
+        "features": [],
+        "default_features": true
       },
       {
         "name": "rustix",
@@ -61,7 +71,13 @@
         "purpose": "openat（O_NOFOLLOW）による経路の閉じ込め",
         "layers": [
           "guard"
-        ]
+        ],
+        "features": [
+          "alloc",
+          "fs",
+          "std"
+        ],
+        "default_features": false
       }
     ],
     "locked": [

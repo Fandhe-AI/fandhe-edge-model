@@ -31,6 +31,12 @@ REQ-38・TASK-38.3・#165。依存の追加・更新・削除は通信を伴う�
 - ルート manifest 自身の `[dependencies]` 等もメンバーと同じ規則（`workspace = true` のみ）で
   検査する。
   ワークスペース依存の `path` は、実在するメンバーのパスで、依存名がその package 名と一致すること。
+- 配置層・機能: メンバー crate の依存は、台帳 `direct[].layers` に crate の層（`crates/<層>`。
+  dev-dependencies のみなら `<層>(dev)` も可）が含まれること。ルートの features・
+  default-features は台帳の `features`・`default_features` と一致すること。メンバー側の
+  features・default-features・optional による上書きは拒否する。
+- Python: `[build-system].requires` も固定と台帳記録を照合する（uv.lock には現れないので
+  lock 照合は対象外）。
 - 逆方向: manifest の直接依存が lock に同じ版で現れること（`missing_in_lock`）。
 - 台帳の余分な記録（manifest・lock に無い記録）も失敗（削除にも承認記録の更新が要る）。
 
@@ -75,6 +81,8 @@ DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 CARGO_DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 
 DIRECT_FIELDS = {"name", "version", "approved_on", "approved_by", "record", "purpose", "layers"}
+# cargo の直接依存は、承認した機能構成（features・default-features）も台帳に持つ。
+CARGO_DIRECT_FIELDS = DIRECT_FIELDS | {"features", "default_features"}
 LOCKED_FIELDS = {"name", "version", "basis"}
 
 
@@ -157,7 +165,8 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
         if not isinstance(section, dict) or set(section) != {"direct", "locked"}:
             raise InputError(f"ledger {eco} section is invalid")
         out[eco] = {}
-        for kind, fields in (("direct", DIRECT_FIELDS), ("locked", LOCKED_FIELDS)):
+        direct_fields = CARGO_DIRECT_FIELDS if eco == "cargo" else DIRECT_FIELDS
+        for kind, fields in (("direct", direct_fields), ("locked", LOCKED_FIELDS)):
             entries = section[kind]
             if not isinstance(entries, list):
                 raise InputError(f"ledger {eco}.{kind} must be a list")
@@ -182,6 +191,14 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
                         raise InputError("ledger layers must be a non-empty list")
                     for layer in layers:
                         _nonempty_str(layer, "layers")
+                    if eco == "cargo":
+                        feats = entry["features"]
+                        if not isinstance(feats, list) or not all(
+                            isinstance(f, str) and f for f in feats
+                        ):
+                            raise InputError("ledger features must be a list of strings")
+                        if not isinstance(entry["default_features"], bool):
+                            raise InputError("ledger default_features must be a boolean")
                 else:
                     basis = _nonempty_str(entry["basis"], "basis")
                     # 承認記録が未確認と明記された basis を承認済みとして通さない（fail-closed）
@@ -235,28 +252,60 @@ def _cargo_workspace_dep(
     return m.group(1)
 
 
-def _member_deps(rel: str, manifest: dict[str, Any], v: list[Violation]) -> None:
-    """crate の全依存表が `workspace = true` だけであることを検査する。
+def _cargo_feature_config(spec: Any) -> tuple[list[str], bool]:
+    """registry 依存の (ソート済み features, default-features) を返す（既定は [] と True）。"""
+    if not isinstance(spec, dict):
+        return [], True
+    feats = spec.get("features", [])
+    names = sorted({f for f in feats if isinstance(f, str)}) if isinstance(feats, list) else []
+    default = spec.get("default-features", spec.get("default_features", True))
+    return names, default is not False
+
+
+def _member_deps(
+    rel: str,
+    manifest: dict[str, Any],
+    v: list[Violation],
+    layer: str,
+    usages: list[tuple[str, str, str, bool]],
+) -> None:
+    """crate の全依存表が `workspace = true` だけであることを検査し、利用先を集める。
 
     メンバー crate に加え、ルート manifest 自身の `[dependencies]` 等にも適用する。
+    機能（features・default-features・optional）のメンバー側での上書きも拒否する（機能構成は
+    ルートの宣言と台帳でだけ決める）。利用先は (依存名, manifest, 層, dev のみか) で `usages` へ
+    追記し、台帳の layers との照合は呼び出し側が行う（REQ-38・#165）。
     """
-    tables: list[dict[str, Any]] = []
+    tables: list[tuple[str, dict[str, Any]]] = []
     for t in CARGO_DEP_TABLES:
         if isinstance(manifest.get(t), dict):
-            tables.append(manifest[t])
+            tables.append((t, manifest[t]))
     targets = manifest.get("target")
     if isinstance(targets, dict):
         for cfg in targets.values():
             if isinstance(cfg, dict):
                 for t in CARGO_DEP_TABLES:
                     if isinstance(cfg.get(t), dict):
-                        tables.append(cfg[t])
-    for table in tables:
+                        tables.append((t, cfg[t]))
+    forbidden = (
+        "version",
+        "git",
+        "path",
+        "registry",
+        "package",
+        "features",
+        "default-features",
+        "default_features",
+        "optional",
+    )
+    for table_name, table in tables:
         for dep, spec in table.items():
             if not (isinstance(spec, dict) and spec.get("workspace") is True):
                 v.append(Violation("member_dependency_not_workspace", "cargo", dep, "", rel))
-            elif any(k in spec for k in ("version", "git", "path", "registry", "package")):
+            elif any(k in spec for k in forbidden):
                 v.append(Violation("member_dependency_not_workspace", "cargo", dep, "", rel))
+            else:
+                usages.append((dep, rel, layer, table_name == "dev-dependencies"))
 
 
 def check_cargo(
@@ -273,7 +322,8 @@ def check_cargo(
     members = ws.get("members", [])
     if not isinstance(members, list):
         raise InputError("workspace members must be a list")
-    _member_deps("Cargo.toml", top, v)
+    usages: list[tuple[str, str, str, bool]] = []
+    _member_deps("Cargo.toml", top, v, "root", usages)
     member_names: set[str] = set()
     member_paths: dict[str, str] = {}
     for m in members:
@@ -286,9 +336,10 @@ def check_cargo(
             raise InputError(f"{rel} has no package name")
         member_names.add(pkg["name"])
         member_paths[Path(m).as_posix().rstrip("/")] = pkg["name"]
-        _member_deps(rel, manifest, v)
+        _member_deps(rel, manifest, v, Path(m).name, usages)
 
     manifest_direct: set[tuple[str, str]] = set()
+    ext_versions: dict[str, str] = {}
     wdeps = ws.get("dependencies", {})
     if not isinstance(wdeps, dict):
         raise InputError("workspace.dependencies must be a table")
@@ -297,8 +348,24 @@ def check_cargo(
         if ver is None:
             continue
         manifest_direct.add((name, ver))
-        if (name, ver) not in ledger["direct"]:
+        ext_versions[name] = ver
+        entry = ledger["direct"].get((name, ver))
+        if entry is None:
             v.append(Violation("unapproved_dependency", "cargo", name, ver, "Cargo.toml"))
+        elif _cargo_feature_config(spec) != (
+            sorted(set(entry["features"])),
+            entry["default_features"],
+        ):
+            # 同じ版のまま機能を有効化・無効化しても承認記録の更新を要求する
+            v.append(Violation("feature_mismatch", "cargo", name, ver, "Cargo.toml"))
+    for dep, rel, layer, dev_only in usages:
+        ver = ext_versions.get(dep)
+        entry = ledger["direct"].get((dep, ver)) if ver is not None else None
+        if entry is None:
+            continue  # 内部 crate、または台帳未記録（unapproved_dependency で別途報告済み）
+        allowed = set(entry["layers"])
+        if layer not in allowed and not (dev_only and f"{layer}(dev)" in allowed):
+            v.append(Violation("unapproved_layer", "cargo", dep, ver or "", rel))
     for key in ledger["direct"]:
         if key not in manifest_direct:
             v.append(Violation("stale_record", "cargo", key[0], key[1], LEDGER_NAME))
@@ -350,6 +417,16 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
     return reqs
 
 
+def _py_build_requirements(pyproject: dict[str, Any]) -> list[Any]:
+    """`[build-system].requires`（ビルド時依存）を返す。uv.lock には現れない。"""
+    bs = pyproject.get("build-system", {})
+    if isinstance(bs, dict):
+        req = bs.get("requires", []) or []
+        if isinstance(req, list):
+            return list(req)
+    return []
+
+
 def check_pypi(
     root: Path, ledger: dict[str, dict[tuple[str, str], dict[str, Any]]], v: list[Violation]
 ) -> None:
@@ -371,8 +448,19 @@ def check_pypi(
         manifest_direct.add(key)
         if key not in ledger["direct"]:
             v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
+    # ビルド時依存は uv.lock に載らないため、固定と承認記録だけを照合する
+    build_direct: set[tuple[str, str]] = set()
+    for req in _py_build_requirements(pyproject):
+        m = PY_REQ_RE.match(req) if isinstance(req, str) else None
+        if m is None:
+            v.append(Violation("pin_violation", "pypi", str(req)[:80], "", rel_py))
+            continue
+        key = (norm_py(m.group(1)), m.group(3))
+        build_direct.add(key)
+        if key not in ledger["direct"]:
+            v.append(Violation("unapproved_dependency", "pypi", key[0], key[1], rel_py))
     for key in ledger["direct"]:
-        if key not in manifest_direct:
+        if key not in manifest_direct and key not in build_direct:
             v.append(Violation("stale_record", "pypi", key[0], key[1], LEDGER_NAME))
 
     lock = load_toml(root, rel_lock)
