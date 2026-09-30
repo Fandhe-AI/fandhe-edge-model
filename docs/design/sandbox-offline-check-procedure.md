@@ -30,10 +30,12 @@ Agent が確定させない（`evidence_hint` は `requires_human_review` か `t
    `--definition`・`--project-dir` はカレントディレクトリ配下に置く。
 3. オーバーライド用の環境変数（`FANDHE_EDGE_SANDBOX_EXEC`・`FANDHE_EDGE_LOG_CMD`・`FANDHE_EDGE_BIN` 以外の
    `FANDHE_EDGE_LOG_STREAM_*`）は設定しない。設定すると `evidence_hint` が `test_harness` になる。
-4. 実行例（`<out>` は空または未作成、`<project>` は未作成）:
+4. 実行例（手順 2 の作業ディレクトリへ移動してから、スクリプトはリポジトリの絶対パスで呼ぶ。
+   `<REPO>` はリポジトリのルート、`<out>` は空または未作成、`<project>` は未作成）:
 
    ```bash
-   scripts/sandbox-monitor.sh --definition definition.json --project-dir project \
+   cd <作業ディレクトリ>
+   <REPO>/scripts/sandbox-monitor.sh --definition definition.json --project-dir project \
      --out-dir out --candidates 1 --smoke
    ```
 

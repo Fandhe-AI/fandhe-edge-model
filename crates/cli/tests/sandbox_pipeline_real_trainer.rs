@@ -127,13 +127,16 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
             "#!/bin/sh\n[ \"$1\" = \"-p\" ] || exit 99\n[ \"$2\" = \"{PROFILE}\" ] || exit 99\nshift 2\nexec \"$@\"\n"
         ),
     );
+    // 偽 log は stop（SIGTERM）まで生存させる必要がある。寿命が TIMEOUT（900 秒）より短いと、
+    // 実 trainer が長引いた場合に監視が「stop 前に log が死んだ」無効な窓として
+    // runtime_error を返すため、TIMEOUT を超える 1200 秒とする。
     let log = dir.join("fake-log");
     write_exe(
         &log,
         &format!(
             "#!/bin/sh\n[ $# -eq 5 ] && [ \"$1\" = stream ] && [ \"$2\" = --style ] && [ \"$3\" = ndjson ] \
              && [ \"$4\" = --predicate ] && [ \"$5\" = '{PREDICATE}' ] || exit 99\n\
-             cat \"{}\"\nexec sleep 300\n",
+             cat \"{}\"\nexec sleep 1200\n",
             clean.display()
         ),
     );
