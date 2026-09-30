@@ -44,6 +44,11 @@ pub const CREATED_AT_MAX_UNIX_SECONDS: u64 = 253_402_300_799;
 /// 実運用の値は TASK-39.5 の資源上限で見直す）。
 pub const LEDGER_MAX_ENTRIES: usize = 10_000;
 
+/// ロールバック検証（[`VersionLedger::verify_rollback_to`] 等）が成果物をメモリへ保持する上限バイト数。
+/// 呼び出し側の `max_bytes` がこれを超えても、実効上限はこの値に切り詰める（大きな値の指定で
+/// メモリを使い切らせない。REQ-39。証拠種別: 仮置き。実運用の値は TASK-39.5 の資源上限で見直す）。
+pub const ROLLBACK_MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 版管理の対象種別（REQ-39）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -401,6 +406,8 @@ fn read_confined(
     candidate: &Path,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, ConfinedPath), LedgerError> {
+    // 呼び出し側の指定にかかわらず固定上限で切り詰める（メモリ保持の上限。読み込み前に拒否）。
+    let max_bytes = max_bytes.min(ROLLBACK_MAX_ARTIFACT_BYTES);
     let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
     let path = confined.as_path().to_path_buf();
     let metadata = file
@@ -416,7 +423,8 @@ fn read_confined(
             limit: max_bytes,
         }));
     }
-    let mut bytes = Vec::new();
+    // メタデータのサイズ（上限以下を確認済み）で事前確保し、再確保による一時的な倍増を避ける。
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| LedgerError::Io(read_error(&confined, source)))?;

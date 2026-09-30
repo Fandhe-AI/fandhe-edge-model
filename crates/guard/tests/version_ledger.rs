@@ -12,7 +12,7 @@ use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::FsError;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_guard::version_ledger::{
-    ArtifactKind, CreatedAt, LedgerError, VersionId, VersionLedger,
+    ArtifactKind, CreatedAt, LedgerError, ROLLBACK_MAX_ARTIFACT_BYTES, VersionId, VersionLedger,
 };
 
 const V1_HEX: &str = "1a1f4502024df8a68d12e64bb2364ad6308d04ed0a7d5e8300a676ec70867140";
@@ -361,5 +361,43 @@ fn req39_rollback_rejects_escapes_and_oversize() {
         .verify_rollback_to(ArtifactKind::Model, &id("v1"), &root, Path::new("m"), 4)
         .unwrap_err();
     assert!(matches!(err, LedgerError::Io(FsError::TooLarge { .. })));
+    assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
+}
+
+/// REQ-39・TASK-39.3-2: 呼び出し側が巨大な `max_bytes` を渡しても、固定上限を超える成果物は
+/// 読み込み前に `limit_exceeded` で拒否される（メモリ保持の上限）。
+#[test]
+fn req39_rollback_caps_max_bytes_at_fixed_limit() {
+    let sb = Sandbox::new("rb-cap");
+    fs::write(sb.0.join("m"), b"model-v1").unwrap();
+    let mut l = VersionLedger::new();
+    l.record_file(
+        ArtifactKind::Model,
+        id("v1"),
+        &sb.0,
+        Path::new("m"),
+        1024,
+        at(),
+    )
+    .unwrap();
+    // スパースファイルで固定上限 + 1 バイトの成果物を作る（実ディスクはほぼ消費しない）。
+    let big = fs::File::create(sb.0.join("big")).unwrap();
+    big.set_len(ROLLBACK_MAX_ARTIFACT_BYTES + 1).unwrap();
+    let err = l
+        .verify_rollback_to(
+            ArtifactKind::Model,
+            &id("v1"),
+            &sb.0,
+            Path::new("big"),
+            u64::MAX,
+        )
+        .unwrap_err();
+    match &err {
+        LedgerError::Io(FsError::TooLarge { size, limit, .. }) => {
+            assert_eq!(*size, ROLLBACK_MAX_ARTIFACT_BYTES + 1);
+            assert_eq!(*limit, ROLLBACK_MAX_ARTIFACT_BYTES);
+        }
+        other => panic!("unexpected: {other}"),
+    }
     assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
 }
