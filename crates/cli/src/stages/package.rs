@@ -72,6 +72,7 @@ use super::train::{
 const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 容量の上限（バイト。REQ-30 の目安 40MB。暫定の固定値）。
+/// 利用者設定の取り込み（定義ファイル・CLI 引数。`CapacityLimit` 経由）は入出力契約の変更を伴い未実装（承認事項）。
 const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 
 /// `package` を実行する。
@@ -214,12 +215,11 @@ fn finalize_staging(
     measured_bytes: u64,
     limit_bytes: u64,
 ) -> Result<Vec<LimitBreach>, ErrorReport> {
-    if measured_bytes > limit_bytes {
+    // 境界規則（`>` で超過・`==` は超過でない）は runtime の 1 箇所に集約している
+    // （`capacity_limit` モジュール。TASK-30.2・#124）。ここでは再実装しない。
+    if let Some(breach) = LimitBreach::capacity_if_exceeded(measured_bytes, limit_bytes) {
         let _ = project.remove_created_dir(staging);
-        return Ok(vec![LimitBreach::Capacity {
-            measured_bytes,
-            limit_bytes,
-        }]);
+        return Ok(vec![breach]);
     }
     if let Err(report) = project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR) {
         let _ = project.remove_created_dir(staging);
