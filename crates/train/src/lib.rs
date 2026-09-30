@@ -65,9 +65,17 @@
 //! 成功として扱う。責務分担は [`process`] のモジュール doc）。後続・未実装:
 //! `SIGTERM` による graceful cancel（依存追加か `unsafe` が要りユーザー承認事項）・
 //! キャンセルの終了コード写像（TASK-33.x）・探索途中のキャンセル伝播・
-//! `job.json` 永続化とクラッシュ検出（#146）。やり直しの案内は [`restart`]
-//! （再開は提供せず、`SIGKILL` フォールバック後に残る予約は自動で掃除せず案内する。
-//! TASK-34.3・#147）。
+//! `SIGKILL` フォールバック後に残る予約はやり直しの案内（[`restart`]。再開は提供せず
+//! 自動では掃除しない。TASK-34.3・#147）。
+//!
+//! # ジョブ記録とクラッシュ検出（TASK-34.2・issue #146）
+//!
+//! [`job_record`] が `job.json`（記録）と `job.lock`（生存確認用 advisory lock）を
+//! 永続化し、[`job::TrainJob::run_recorded`] が実行の前後で記録する。学習中のプロセス
+//! （worker・supervisor・ジョブの所有者）が異常終了しても、[`job_record::read_job_status`]
+//! （状態確認の中核）がクラッシュとして検出する。`supervisor.py::_classify_self_exit` の
+//! 資源上限（`limit_exceeded`）とクラッシュの区別は [`job_record`] のモジュール doc。
+//! 後続・未実装: CLI への状態確認の露出（TASK-33.x の承認事項）。
 //!
 //! # スコープ外（#178 以降も対象外）
 //!
@@ -104,6 +112,8 @@
 
 pub mod error;
 pub mod job;
+// ジョブ記録の永続化とクラッシュ検出（REQ-34・TASK-34.2・#146）。
+pub mod job_record;
 mod kind_defaults;
 // kind 省略時の既定候補の解決（REQ-19・TASK-19.2・#77）。
 pub mod kind_resolution;

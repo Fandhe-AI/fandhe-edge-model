@@ -27,7 +27,11 @@ use std::time::Duration;
 
 use fandhe_edge_core::exitcode::ExitCode;
 #[cfg(unix)]
-use fandhe_edge_train::job::{CancelOutcome, JobState, TrainJob};
+use fandhe_edge_train::job::{CancelOutcome, JobState, RecordedRun, TrainJob};
+#[cfg(unix)]
+use fandhe_edge_train::job_record::{
+    CrashCause, JobFailure, JobRecorder, JobStatusReport, read_job_status, unix_now,
+};
 #[cfg(unix)]
 use fandhe_edge_train::process::ENV_ALLOWLIST;
 #[cfg(unix)]
@@ -67,6 +71,12 @@ fn main() -> ProcessExitCode {
     let is_worker_invocation = args.get(1).map(String::as_str) == Some("-I")
         && args.get(3).map(String::as_str) == Some("train")
         && args.get(4).map(String::as_str) == Some("--request");
+    // ジョブ所有プロセス役（REQ-34・TASK-34.2・#146。PoC-19 の「所有プロセスを
+    // SIGKILL」の再現）。学習ワーカーの argv（`-I` で始まる）とは衝突しない。
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("--job-owner-holder") {
+        run_job_owner_holder(args.get(2).expect("job_dir arg present"));
+    }
     if is_worker_invocation {
         let launch_script = args.get(2).expect("launch_script arg present");
         let request_path = args.get(5).expect("request path arg present");
@@ -135,6 +145,23 @@ fn run_fake_worker(launch_script: &str, request_path: &str) -> ! {
         }
         "abort" => {
             std::process::abort();
+        }
+        "worker_signal_crash" => {
+            // supervisor が「worker が資源上限以外でシグナル終了した」と報告する
+            // 固定文言（`supervisor.py::_WORKER_SIGNAL_MESSAGE_PREFIX`）を再現する
+            // （REQ-34・TASK-34.2・#146）。
+            print!(
+                r#"{{"status":"error","code":"runtime_error","message":"worker terminated by signal 9"}}"#
+            );
+            std::process::exit(70);
+        }
+        "cpu_limit_exit" => {
+            // `_classify_self_exit` が `"cpu"` と判定した資源上限による停止の報告
+            // （crash ではない。REQ-34・REQ-39・#146）。
+            print!(
+                r#"{{"status":"error","code":"limit_exceeded","message":"worker exceeded the cpu limit and was terminated"}}"#
+            );
+            std::process::exit(20);
         }
         "big_stdout" => {
             // `MAX_RESULT_BYTES`（1 MiB）を超える標準出力。
@@ -465,6 +492,21 @@ struct CaseResult {
 /// ケース名と実行関数の組。`clippy::type_complexity` を避けるための型別名。
 type CaseFn = fn(&Path) -> Result<(), String>;
 
+/// ジョブ所有プロセス役。`JobRecorder::begin` の後に `ready` を 1 行出し、上限時間まで
+/// 待つ（親が `SIGKILL` するまで `finish` しない）。
+#[cfg(unix)]
+fn run_job_owner_holder(job_dir: &str) -> ! {
+    let Ok(_recorder) = JobRecorder::begin(Path::new(job_dir), unix_now()) else {
+        eprintln!("holder: begin failed");
+        std::process::exit(2);
+    };
+    println!("ready");
+    let _ = std::io::stdout().flush();
+    // 親が kill し損ねても残り続けないよう上限を設ける。
+    std::thread::sleep(Duration::from_secs(60));
+    std::process::exit(0);
+}
+
 fn run_test_suite() -> ProcessExitCode {
     // `run_train` は unix 限定（issue #178 PR #233 レビュー再指摘 P0
     // 「Windows で正常終了後の孤児ワーカーを停止できない」への対応として
@@ -543,6 +585,28 @@ fn run_test_suite() -> ProcessExitCode {
     cases.push((
         "cancel_after_exit_is_not_cancelled",
         case_cancel_after_exit_is_not_cancelled,
+    ));
+    #[cfg(unix)]
+    cases.push(("job_record_success", case_job_record_success));
+    #[cfg(unix)]
+    cases.push((
+        "job_record_supervisor_signal_is_crash",
+        case_job_record_supervisor_signal_is_crash,
+    ));
+    #[cfg(unix)]
+    cases.push((
+        "job_record_worker_signal_is_crash",
+        case_job_record_worker_signal_is_crash,
+    ));
+    #[cfg(unix)]
+    cases.push((
+        "job_record_cpu_limit_is_not_crash",
+        case_job_record_cpu_limit_is_not_crash,
+    ));
+    #[cfg(unix)]
+    cases.push((
+        "job_record_owner_killed_is_detected",
+        case_job_record_owner_killed_is_detected,
     ));
     #[cfg(not(unix))]
     let cases: Vec<(&'static str, CaseFn)> =
@@ -1707,4 +1771,164 @@ fn case_unsupported_platform(case_dir: &Path) -> Result<(), String> {
         }
         Ok(_) => Err("expected UnsupportedPlatform error".to_string()),
     }
+}
+// ============================================================
+// ジョブ記録とクラッシュ検出（REQ-34・TASK-34.2・issue #146。
+// 証拠種別: テストハーネス。GPU を使う実学習ジョブでの検証は人の担当）
+// ============================================================
+
+/// `run_recorded` を実行し、終了後の `job.json` を状態確認で読み直す。
+#[cfg(unix)]
+fn run_recorded_and_status(
+    case_dir: &Path,
+    mode: &str,
+) -> Result<(RecordedRun, JobStatusReport), String> {
+    let launcher = make_launcher(case_dir, mode);
+    let request = make_request(Some(30));
+    let limits = RunLimits::for_request(&request);
+    let recorded = TrainJob::new()
+        .run_recorded(&launcher, &request, case_dir, &limits)
+        .map_err(|e| format!("begin failed: {e}"))?;
+    expect_true(recorded.record.is_ok(), "record written")?;
+    let status =
+        read_job_status(case_dir, unix_now()).map_err(|e| format!("status failed: {e}"))?;
+    Ok((recorded, status))
+}
+
+/// REQ-34: 正常終了は `succeeded`・crash なし。
+#[cfg(unix)]
+fn case_job_record_success(case_dir: &Path) -> Result<(), String> {
+    let (_, status) = run_recorded_and_status(case_dir, "ok")?;
+    expect_eq(
+        status,
+        JobStatusReport {
+            state: JobState::Succeeded,
+            crash_detected: false,
+            failure: None,
+            record_updated: false,
+        },
+        "status",
+    )
+}
+
+/// REQ-34・TASK-34.2: supervisor（直接の子）が `abort` で落ちると `failed`＋
+/// `supervisor_signal` のクラッシュ。
+#[cfg(unix)]
+fn case_job_record_supervisor_signal_is_crash(case_dir: &Path) -> Result<(), String> {
+    let (_, status) = run_recorded_and_status(case_dir, "abort")?;
+    expect_eq(
+        (status.state, status.crash_detected),
+        (JobState::Failed, true),
+        "state/crash",
+    )?;
+    match status.failure {
+        Some(JobFailure::Crashed {
+            cause: CrashCause::SupervisorSignal,
+            signal: None,
+            ..
+        }) => Ok(()),
+        other => Err(format!("unexpected failure: {other:?}")),
+    }
+}
+
+/// REQ-34・TASK-34.2: supervisor が worker のシグナル終了を報告すると `failed`＋
+/// `worker_signal`（signal 9）のクラッシュ。
+#[cfg(unix)]
+fn case_job_record_worker_signal_is_crash(case_dir: &Path) -> Result<(), String> {
+    let (_, status) = run_recorded_and_status(case_dir, "worker_signal_crash")?;
+    expect_eq(
+        (status.state, status.crash_detected),
+        (JobState::Failed, true),
+        "state/crash",
+    )?;
+    match status.failure {
+        Some(JobFailure::Crashed {
+            cause: CrashCause::WorkerSignal,
+            signal: Some(9),
+            ..
+        }) => Ok(()),
+        other => Err(format!("unexpected failure: {other:?}")),
+    }
+}
+
+/// REQ-34・REQ-39: CPU 上限による自己終了は crash ではなく `limit_exceeded`。
+#[cfg(unix)]
+fn case_job_record_cpu_limit_is_not_crash(case_dir: &Path) -> Result<(), String> {
+    let (_, status) = run_recorded_and_status(case_dir, "cpu_limit_exit")?;
+    expect_eq(
+        status,
+        JobStatusReport {
+            state: JobState::Failed,
+            crash_detected: false,
+            failure: Some(JobFailure::Error {
+                code: ExitCode::LimitExceeded,
+            }),
+            record_updated: false,
+        },
+        "status",
+    )
+}
+
+/// REQ-34・PoC-19 相当: ジョブを所有するプロセスを `SIGKILL` すると、状態確認が
+/// `running` → `failed`＋`owner_lost` のクラッシュを検出する（2 回目は冪等）。
+#[cfg(unix)]
+fn case_job_record_owner_killed_is_detected(case_dir: &Path) -> Result<(), String> {
+    use std::io::BufRead as _;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut holder = std::process::Command::new(exe)
+        .arg("--job-owner-holder")
+        .arg(case_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn holder: {e}"))?;
+    let stdout = holder.stdout.take().ok_or("holder stdout missing")?;
+    let result = (|| -> Result<(), String> {
+        // holder 側が 60 秒で自壊するため、`ready` の待機は無限にならない。
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .map_err(|e| format!("read ready: {e}"))?;
+        expect_eq(line.trim(), "ready", "holder ready line")?;
+        let running = read_job_status(case_dir, unix_now()).map_err(|e| format!("status: {e}"))?;
+        expect_eq(
+            running,
+            JobStatusReport {
+                state: JobState::Running,
+                crash_detected: false,
+                failure: None,
+                record_updated: false,
+            },
+            "status while owner alive",
+        )?;
+        holder.kill().map_err(|e| format!("kill holder: {e}"))?;
+        holder.wait().map_err(|e| format!("wait holder: {e}"))?;
+        let first = read_job_status(case_dir, unix_now()).map_err(|e| format!("status: {e}"))?;
+        expect_eq(
+            (first.state, first.crash_detected, first.record_updated),
+            (JobState::Failed, true, true),
+            "first status after kill",
+        )?;
+        match &first.failure {
+            Some(JobFailure::Crashed {
+                cause: CrashCause::OwnerLost,
+                signal: None,
+                ..
+            }) => {}
+            other => return Err(format!("unexpected failure: {other:?}")),
+        }
+        let second = read_job_status(case_dir, unix_now()).map_err(|e| format!("status: {e}"))?;
+        expect_eq(
+            second,
+            JobStatusReport {
+                record_updated: false,
+                ..first
+            },
+            "second status is idempotent",
+        )
+    })();
+    // 失敗時にも holder を残さない。
+    let _ = holder.kill();
+    let _ = holder.wait();
+    result
 }
