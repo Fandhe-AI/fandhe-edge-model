@@ -1067,6 +1067,55 @@ mod suite {
         assert!(!env.project_file("selection_record.json").exists());
     }
 
+    /// REQ-30・REQ-39: 容量の目安を超える語彙は、記録ハッシュ（ストリーミング照合）が一致すれば
+    /// JSON としてパースせずに除外する（形式が壊れていても除外。メモリへ全体を読まない）。
+    /// ハッシュが不一致なら除外にせず `invalid_input`（64）で止まる。
+    pub fn select_excludes_oversized_vocab_without_parsing_but_checks_hash() {
+        let env = inspected("selbigvocab");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let garbage = vec![b'x'; 45_000_000];
+        place_vocab(&env, &garbage, Some(&garbage));
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert!(out.contains("vocab_package_over_guideline"), "{out}");
+        assert!(!env.project_file("selection_record.json").exists());
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let recorded = Sha256Digest::of_bytes(&garbage).to_hex();
+        let other = Sha256Digest::of_bytes(b"other").to_hex();
+        assert!(text.contains(&recorded), "{text}");
+        std::fs::write(&meta, text.replace(&recorded, &other)).expect("patch");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+    }
+
+    /// REQ-30・REQ-39: 容量超過の候補にも ONNX の完全性確認が先に適用される。ONNX を改ざんした
+    /// 超過候補（記録 sha256 と不一致・非 ONNX で記録ハッシュを合わせた場合）は「除外」にならず
+    /// `invalid_input`（64）で止まる。
+    pub fn select_verifies_onnx_before_capacity_exclusion() {
+        let env = inspected("selonnxexcl");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let onnx = env.project_file("candidates/0/model-c1/model.onnx");
+        let original = std::fs::read(&onnx).expect("onnx");
+        // 1 バイト追記（記録 sha256 と不一致）。
+        let mut tampered = original.clone();
+        tampered.push(0);
+        std::fs::write(&onnx, &tampered).expect("tamper");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+        // 非 ONNX の内容へ差し替え、artifact.json の記録ハッシュも合わせる（形式の許可リストで拒否）。
+        let junk = b"not an onnx model at all".to_vec();
+        std::fs::write(&onnx, &junk).expect("junk");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let old = Sha256Digest::of_bytes(&original).to_hex();
+        let new = Sha256Digest::of_bytes(&junk).to_hex();
+        assert!(text.contains(&old), "{text}");
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1269,6 +1318,14 @@ fn main() -> std::process::ExitCode {
         (
             "select_validates_candidate_before_capacity_exclusion",
             suite::select_validates_candidate_before_capacity_exclusion,
+        ),
+        (
+            "select_excludes_oversized_vocab_without_parsing_but_checks_hash",
+            suite::select_excludes_oversized_vocab_without_parsing_but_checks_hash,
+        ),
+        (
+            "select_verifies_onnx_before_capacity_exclusion",
+            suite::select_verifies_onnx_before_capacity_exclusion,
         ),
         (
             "infer_out_option_is_not_faked",

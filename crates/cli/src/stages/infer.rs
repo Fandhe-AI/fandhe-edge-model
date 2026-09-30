@@ -55,7 +55,7 @@ const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] =
     &[(ModelKind::C1, &[1]), (ModelKind::C3, &[1])];
 
 /// `kind_version` が許可リストにあるか。
-fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
+pub(crate) fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
     ALLOWED_KIND_VERSIONS
         .iter()
         .any(|(k, versions)| *k == kind && versions.contains(&version))

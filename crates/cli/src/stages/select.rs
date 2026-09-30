@@ -26,16 +26,23 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
+use fandhe_edge_core::artifact_meta::{
+    ArtifactMeta, MAX_ARTIFACT_META_BYTES, validate_vocab_bytes,
+};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::fs::read_bounded_open_file;
+use fandhe_edge_core::fs::{read_bounded_open_file, sha256_open_file_bounded};
 use fandhe_edge_core::stage_report::SelectReport;
+use fandhe_edge_guard::format::{FormatAllowlist, check_open_file};
+use fandhe_edge_guard::kind::KindAllowlist;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::vocab_exclusion::{VOCAB_FILE_NAME, screen_vocab_candidates};
+use fandhe_edge_runtime::onnx::{MAX_MODEL_FILE_BYTES, ModelKind};
+use fandhe_edge_runtime::vocab_exclusion::{
+    VOCAB_FILE_NAME, VOCAB_GUIDELINE_BYTES, screen_vocab_candidates,
+};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::stage_files::{ExcludedCandidate, SelectionRecord, validation_accuracy};
@@ -44,7 +51,7 @@ use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
 use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, fs_report, invalid, runtime};
 
-use super::package::verify_vocab_member;
+use super::infer::kind_version_allowed;
 use super::train::{
     candidate_rel, load_trained, request_matches_candidate, resolve_candidates, verified_split,
 };
@@ -179,7 +186,7 @@ pub fn compute_selection_with_exclusions(
         // 検証と容量による除外を適用する（改ざん候補を「容量超過で除外」として正常扱いしない。
         // 語彙ファイルは記録ハッシュ・形式も照合する。REQ-30・REQ-39・TASK-30.3・#125。
         // 失敗時は除外せず処理全体を止める）。
-        if let Some(entry) = vocab_exclusion_of(project, index, candidate, success)? {
+        if let Some(entry) = vocab_exclusion_of(project, index, candidate, success, &request)? {
             excluded.push(entry);
             continue;
         }
@@ -219,18 +226,27 @@ pub fn compute_selection_with_exclusions(
     ))
 }
 
-/// 学習済みの候補のパッケージ相当の容量（ONNX・語彙ファイル〔あれば〕・選択肢表
-/// `definition.json`・`artifact.json`）を計測し、語彙超過構成なら除外記録を返す
-/// （REQ-30・TASK-30.3・#125）。構成要素は `package` 工程の組み立て（`assemble_and_measure`）と
-/// 揃え、選定時に 40MB 以下でも配布時に超過する候補を見逃さない。語彙ファイルの有無は成果物
-/// ディレクトリの [`VOCAB_FILE_NAME`] で判定する（現行の既定候補 c1・c3 は語彙を ONNX グラフ内に
+/// 学習済みの候補の成果物を検証したうえで、パッケージ相当の容量（ONNX・語彙ファイル〔あれば〕・
+/// 選択肢表 `definition.json`・`artifact.json`）を計測し、語彙超過構成なら除外記録を返す
+/// （REQ-30・REQ-39・TASK-30.3・#125）。
+///
+/// 検証は除外判定より前に、除外されない候補と同じ内容を行う。
+/// - ONNX: `artifact.json` 記載の sha256 とのストリーミング照合・形式の許可リスト・`kind`・
+///   `kind_version` の許可リストと学習リクエストとの一致（`package` の公開前検証と同じ観点）。
+/// - 語彙ファイル: 記録 sha256 とのストリーミング照合（固定長バッファ。全体をメモリへ読まない）。
+///   JSON 形式の検証は、保持 fd の fstat サイズが容量の目安以下のときだけ行う。超える語彙は
+///   ハッシュ一致を確認したうえでパースせずに除外へ回す（メモリ使用量が語彙サイズに比例しない）。
+///
+/// 構成要素は `package` 工程の組み立て（`assemble_and_measure`）と揃える。語彙ファイルの有無は
+/// 成果物ディレクトリの [`VOCAB_FILE_NAME`] で判定する（現行の既定候補 c1・c3 は語彙を ONNX グラフ内に
 /// 持ち、このファイルを作らない）。判定は runtime の [`screen_vocab_candidates`] に集約し再実装
-/// しない。計測の失敗は除外にせずエラーで返す（fail-closed。REQ-39）。
+/// しない。検証・計測の失敗は除外にせずエラーで返す（fail-closed。REQ-39）。
 fn vocab_exclusion_of(
     project: &Project,
     index: usize,
     candidate: &fandhe_edge_train::search::SearchCandidate,
     success: &fandhe_edge_train::result::SuccessOutcome,
+    request: &fandhe_edge_train::request::TrainRequest,
 ) -> Result<Option<ExcludedCandidate>, ErrorReport> {
     let candidate_dir = project.open_subdir(candidate_rel(index))?;
     let artifact_rel = Path::new(success.artifact_dir())
@@ -238,47 +254,102 @@ fn vocab_exclusion_of(
         .map_err(|_| invalid("artifact directory is outside the candidate directory"))?
         .to_path_buf();
     let onnx_file = success.artifact().onnx_file();
-    let mut files = Vec::new();
-    let meta_bytes = {
-        let (file, real) = candidate_dir
-            .open_member(&artifact_rel.join("artifact.json"))
-            .map_err(|e| e.to_error_report())?;
-        read_bounded_open_file(file, real.as_path(), MAX_ARTIFACT_META_BYTES)
-            .map_err(|e| fs_report(&e))?
-    };
-    for (component, name) in [
-        (PackageComponent::Weights, onnx_file),
-        (PackageComponent::Metadata, "artifact.json"),
-    ] {
-        if Path::new(name).components().count() != 1 {
-            return Err(invalid("onnx file name is invalid"));
-        }
-        let (file, real) = candidate_dir
-            .open_member(&artifact_rel.join(name))
-            .map_err(|e| e.to_error_report())?;
-        files.push((component, real.into_path_buf(), file));
+    if Path::new(onnx_file).components().count() != 1 {
+        return Err(invalid("onnx file name is invalid"));
     }
+    let open = |name: &str| {
+        candidate_dir
+            .open_member(&artifact_rel.join(name))
+            .map_err(|e| e.to_error_report())
+    };
+    let (meta_file, meta_real) = open("artifact.json")?;
+    let meta_bytes =
+        read_bounded_open_file(meta_file, meta_real.as_path(), MAX_ARTIFACT_META_BYTES)
+            .map_err(|e| fs_report(&e))?;
+    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
+
+    // ONNX の完全性: 記録 sha256（ストリーミング）・形式・kind・kind_version。
+    if meta.onnx_file() != onnx_file {
+        return Err(invalid("artifact metadata does not match the model file"));
+    }
+    let (onnx_hash_file, onnx_real) = open(onnx_file)?;
+    let onnx_hash =
+        sha256_open_file_bounded(onnx_hash_file, onnx_real.as_path(), MAX_MODEL_FILE_BYTES)
+            .map_err(|e| fs_report(&e))?;
+    if meta.onnx_sha256() != onnx_hash.to_hex() {
+        return Err(invalid("artifact metadata does not match the model file"));
+    }
+    let (onnx_file_handle, onnx_real) = open(onnx_file)?;
+    check_open_file(
+        onnx_file_handle,
+        onnx_real.as_path(),
+        &FormatAllowlist::onnx_only(),
+        MAX_MODEL_FILE_BYTES,
+    )
+    .map_err(|e| e.to_error_report())?;
+    KindAllowlist::supported()
+        .check(meta.kind())
+        .map_err(|e| e.to_error_report())?;
+    if meta.kind() != request.kind() {
+        return Err(invalid(
+            "artifact kind does not match the selected candidate",
+        ));
+    }
+    if meta.kind_version() != request.kind_version() {
+        return Err(invalid(
+            "artifact kind_version does not match the selected candidate",
+        ));
+    }
+    let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
+    if !kind_version_allowed(kind, meta.kind_version()) {
+        return Err(invalid("unsupported kind_version"));
+    }
+
     // 語彙ファイル: 無い（NotFound）ときだけ `has_vocab_file = false`。それ以外の失敗は止める。
-    // あれば `artifact.json` 記載の sha256・許可形式と照合し（`package`・`infer` と同じ
-    // `verify_vocab_member`）、不一致・形式不正は `invalid_input` で止める（REQ-39）。
     let vocab_rel = artifact_rel.join(VOCAB_FILE_NAME);
-    let vocab_bytes = match candidate_dir.open_member(&vocab_rel) {
-        Ok((file, real)) => Some(
-            read_bounded_open_file(file, real.as_path(), MAX_FILE_BYTES)
-                .map_err(|e| fs_report(&e))?,
-        ),
+    let vocab_open = match candidate_dir.open_member(&vocab_rel) {
+        Ok(opened) => Some(opened),
         Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
             None
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
-    verify_vocab_member(&meta, vocab_bytes.as_deref())?;
-    let has_vocab_file = vocab_bytes.is_some();
+    let has_vocab_file = vocab_open.is_some();
+    match (&vocab_open, meta.vocab_sha256()) {
+        (None, None) => {}
+        (None, Some(_)) => return Err(invalid("vocab file is missing but its hash is recorded")),
+        (Some(_), None) => return Err(invalid("vocab file has no recorded hash")),
+        (Some((file, real)), Some(recorded)) => {
+            let vocab_size = file
+                .metadata()
+                .map_err(|_| runtime("cannot inspect vocab file"))?
+                .len();
+            let hash_handle = file
+                .try_clone()
+                .map_err(|_| runtime("cannot inspect vocab file"))?;
+            let digest = sha256_open_file_bounded(hash_handle, real.as_path(), MAX_FILE_BYTES)
+                .map_err(|e| fs_report(&e))?;
+            if digest.to_hex() != recorded {
+                return Err(invalid("vocab file does not match its recorded hash"));
+            }
+            // 形式検証（メモリへ読む）は容量の目安以下のときだけ。超過分は除外されるためパースしない。
+            if vocab_size <= VOCAB_GUIDELINE_BYTES {
+                let (vfile, vreal) = open(VOCAB_FILE_NAME)?;
+                let bytes = read_bounded_open_file(vfile, vreal.as_path(), VOCAB_GUIDELINE_BYTES)
+                    .map_err(|e| fs_report(&e))?;
+                validate_vocab_bytes(&bytes).map_err(|e| e.to_error_report())?;
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    files.push((PackageComponent::Weights, onnx_real.into_path_buf(), {
+        open(onnx_file)?.0
+    }));
+    let (file, real) = open("artifact.json")?;
+    files.push((PackageComponent::Metadata, real.into_path_buf(), file));
     if has_vocab_file {
-        let (file, real) = candidate_dir
-            .open_member(&vocab_rel)
-            .map_err(|e| e.to_error_report())?;
+        let (file, real) = open(VOCAB_FILE_NAME)?;
         files.push((
             PackageComponent::VocabOrFeatureTransform,
             real.into_path_buf(),
@@ -297,7 +368,7 @@ fn vocab_exclusion_of(
         candidate_id: candidate.candidate_id.clone(),
         reason: r.code().unwrap_or_default().to_string(),
         total_bytes: r.total_bytes,
-        guideline_bytes: fandhe_edge_runtime::vocab_exclusion::VOCAB_GUIDELINE_BYTES,
+        guideline_bytes: VOCAB_GUIDELINE_BYTES,
     }))
 }
 
