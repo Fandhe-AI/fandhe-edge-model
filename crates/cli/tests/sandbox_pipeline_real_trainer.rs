@@ -189,6 +189,19 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         pos += found + needle.len();
     }
     assert_eq!(meta.matches("\"step\":").count(), 7, "{meta}");
+    // 工程ごとの entry（平坦な JSON object）を切り出し、evaluate だけが skipped で
+    // 他の工程は skipped でないことを工程名ごとに確認する（REQ-17。別工程の skipped を見逃さない）
+    let entries: Vec<&str> = meta
+        .split("{\"step\":\"")
+        .skip(1)
+        .map(|chunk| chunk.split('}').next().unwrap_or(chunk))
+        .collect();
+    assert_eq!(entries.len(), 7, "{meta}");
+    for entry in entries {
+        let name = entry.split('"').next().unwrap_or("");
+        let skipped = entry.contains("\"status\":\"skipped\"");
+        assert_eq!(skipped, name == "evaluate", "step {name}: {entry}");
+    }
     assert_eq!(meta.matches("\"status\":\"skipped\"").count(), 1, "{meta}");
     // 全体（1）と 7 工程（7）の exit_code がすべて 0
     assert_eq!(meta.matches("\"exit_code\":0").count(), 8, "{meta}");
