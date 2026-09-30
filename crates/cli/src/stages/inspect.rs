@@ -137,6 +137,28 @@ pub(crate) fn ensure_evaluation_frozen(project: &Project) -> Result<(), ErrorRep
     load_evaluation_bytes(project).map(|_| ())
 }
 
+/// train・validation・test のいずれかが 0 件の分割を拒否する（`invalid_input`。固定 message
+/// `train split is empty`・`validation split is empty`・`test split is empty`）。
+///
+/// 空のまま `status:"ok"` で記録すると、後続の `train`（train・validation）や凍結 test での評価
+/// （test）が必ず成り立たない。`split.json` などの書き込みより前に呼ぶ（分割規則・seed は変えない。
+/// REQ-17・REQ-27）。group の件数が少ないと（目安として数件未満）起こるため、利用者には group の件数を
+/// 増やしてもらう（message は固定語彙でデータ本文・件数を含めない）。
+fn ensure_splits_non_empty(
+    by_record: &std::collections::BTreeMap<String, Split>,
+) -> Result<(), ErrorReport> {
+    for (split, message) in [
+        (Split::Train, "train split is empty"),
+        (Split::Validation, "validation split is empty"),
+        (Split::Test, "test split is empty"),
+    ] {
+        if !by_record.values().any(|s| *s == split) {
+            return Err(invalid(message));
+        }
+    }
+    Ok(())
+}
+
 /// `inspect` を実行する。
 ///
 /// # Errors
@@ -157,17 +179,7 @@ pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorRe
     let recorded = split_and_record(&train_rows, u64::from(args.seed), &SplitRatios::default())
         .map_err(|_| invalid("cannot split records"))?;
     let by_record = &recorded.result().by_record;
-    // 分割が空のまま `status:"ok"` で記録すると、後続の `train` が必ず失敗する。書き込みの前に拒否する
-    // （分割規則・seed は変えない。REQ-17）。group の件数が少ないと（目安として数件未満）起こるため、
-    // 利用者には group の件数を増やしてもらう（message は固定語彙でデータ本文・件数を含めない）。
-    for (split, message) in [
-        (Split::Train, "train split is empty"),
-        (Split::Validation, "validation split is empty"),
-    ] {
-        if !by_record.values().any(|s| *s == split) {
-            return Err(invalid(message));
-        }
-    }
+    ensure_splits_non_empty(by_record)?;
     let pick = |split: Split| -> Vec<Row<'_>> {
         train_rows
             .iter()
@@ -210,4 +222,40 @@ pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorRe
             test: test.len(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(splits: &[Split]) -> std::collections::BTreeMap<String, Split> {
+        splits
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("r{i}"), *s))
+            .collect()
+    }
+
+    /// REQ-17・REQ-27: 3 分割がすべて非空なら通り、空の分割ごとに固定 message の `invalid_input`。
+    #[test]
+    fn req17_empty_split_is_rejected_with_fixed_message() {
+        let all = [Split::Train, Split::Validation, Split::Test];
+        assert!(ensure_splits_non_empty(&map(&all)).is_ok());
+        for (missing, message) in [
+            (Split::Train, "train split is empty"),
+            (Split::Validation, "validation split is empty"),
+            (Split::Test, "test split is empty"),
+        ] {
+            let rest: Vec<Split> = all.iter().copied().filter(|s| *s != missing).collect();
+            let err = ensure_splits_non_empty(&map(&rest)).expect_err("must reject");
+            assert_eq!(err.code, ExitCode::InvalidInput);
+            assert_eq!(err.message, message);
+        }
+        assert_eq!(
+            ensure_splits_non_empty(&map(&[]))
+                .expect_err("empty")
+                .message,
+            "train split is empty"
+        );
+    }
 }
