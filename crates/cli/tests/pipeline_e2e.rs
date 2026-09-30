@@ -271,9 +271,8 @@ mod suite {
         assert_eq!(single.trim_end(), lines[0]);
     }
 
-    /// REQ-17・REQ-33: 評価データがあると凍結・読み取り専用配置され、`evaluate` は本体が未実装のため
-    /// `runtime_error`（評価済みを装わない）。
-    pub fn evaluation_data_is_frozen_and_evaluate_is_not_faked() {
+    /// REQ-17: 評価データがあると `register` が凍結記録を作り、評価データを読み取り専用（0400）で配置する。
+    pub fn evaluation_data_is_frozen_and_read_only() {
         let env = registered("eval", true);
         assert!(env.project_file("eval_freeze.json").is_file());
         let eval_file = env.project_file("data/evaluation.jsonl");
@@ -288,15 +287,6 @@ mod suite {
             "evaluation data must be read-only: {mode:o}"
         );
         env.ok(&["inspect", "--project-dir", "proj"]);
-        let out = env.fails(
-            &["evaluate", "--project-dir", "proj", "--candidate", "0"],
-            70,
-            "runtime_error",
-        );
-        assert_eq!(
-            out,
-            "{\"code\":\"runtime_error\",\"message\":\"evaluation on frozen data is not implemented yet\"}\n"
-        );
     }
 
     /// REQ-17: 凍結記録と評価データが食い違うと `evaluate` は停止する（fail-closed）。
@@ -1002,6 +992,287 @@ mod suite {
         env.ok(&["package", "--project-dir", "proj"]);
     }
 
+    /// 評価データありで `register → inspect → train 0 → train 1` まで進める（評価はまだ）。
+    fn eval_trained(case: &str) -> Env {
+        eval_env_until(
+            case,
+            &[
+                &["train", "--project-dir", "proj", "--candidate", "0"],
+                &["train", "--project-dir", "proj", "--candidate", "1"],
+            ],
+        )
+    }
+
+    const EVALUATE_0: [&str; 5] = ["evaluate", "--project-dir", "proj", "--candidate", "0"];
+    const EVALUATE_1: [&str; 5] = ["evaluate", "--project-dir", "proj", "--candidate", "1"];
+    const PACKAGE: [&str; 3] = ["package", "--project-dir", "proj"];
+
+    /// `"key":<number>` の数値（次の `,` または `}` まで）を取り出す。
+    fn number_field(json: &str, key: &str) -> f64 {
+        let marker = format!("\"{key}\":");
+        let rest = json.split(&marker).nth(1).expect("key exists");
+        let end = rest.find([',', '}']).expect("value end");
+        rest[..end].parse().expect("number")
+    }
+
+    fn file_sha256(env: &Env, rel: &str) -> String {
+        Sha256Digest::of_bytes(&std::fs::read(env.project_file(rel)).expect("read")).to_hex()
+    }
+
+    /// REQ-33・REQ-24・REQ-27: 評価データありで 7 工程がすべて非対話で exit 0 まで完走し、
+    /// `evaluate` は JSON 1 つ（正解率・Macro-F1）と評価完了の記録を残す。
+    pub fn full_pipeline_completes_with_evaluation_data() {
+        let env = eval_trained("fullevl");
+        for (index, kind) in [(0, "c1"), (1, "c3")] {
+            let candidate = index.to_string();
+            let out = env.ok(&[
+                "evaluate",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                &candidate,
+            ]);
+            let prefix = format!(
+                "{{\"step\":\"evaluate\",\"status\":\"ok\",\"candidate\":{index},\"kind\":\"{kind}\",\"n_total\":12,\"correct\":"
+            );
+            assert!(out.starts_with(&prefix), "{out}");
+            let correct = number_field(&out, "correct");
+            assert!((0.0..=12.0).contains(&correct), "{out}");
+            assert!(
+                (number_field(&out, "accuracy") - correct / 12.0).abs() < 1e-9,
+                "{out}"
+            );
+            assert!(out.contains("\"macro_f1\":"), "{out}");
+            assert!(
+                env.project_file(&format!("candidates/{index}/evaluation_record.json"))
+                    .is_file()
+            );
+        }
+        assert_eq!(
+            env.ok(&["select", "--project-dir", "proj"]),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+        );
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        );
+        let text = env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--text",
+            "alpha sample 1",
+        ]);
+        assert!(
+            text.starts_with("{\"id\":\"input\",\"status\":\"ok\""),
+            "{text}"
+        );
+        std::fs::write(
+            env.work.join("batch.jsonl"),
+            "{\"id\":\"a\",\"input\":\"alpha sample 1\"}\n",
+        )
+        .expect("batch");
+        let (code, batch) = env.run(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "batch.jsonl",
+        ]);
+        assert_eq!(code, 0, "{batch}");
+    }
+
+    /// REQ-27: `evaluate` の前後で、モデル（ONNX・`artifact.json`）と評価データの sha256 が一致し、
+    /// 評価完了記録の値が実ファイルのハッシュと一致する。
+    pub fn evaluate_keeps_model_and_evaluation_hashes() {
+        let env = eval_trained("evalhashes");
+        let files = [
+            "candidates/0/model-c1/model.onnx",
+            "candidates/0/model-c1/artifact.json",
+            "data/evaluation.jsonl",
+        ];
+        let before: Vec<String> = files.iter().map(|f| file_sha256(&env, f)).collect();
+        env.ok(&EVALUATE_0);
+        let after: Vec<String> = files.iter().map(|f| file_sha256(&env, f)).collect();
+        assert_eq!(before, after);
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/0/evaluation_record.json"))
+                .expect("record");
+        for (key, hash) in [
+            ("onnx_sha256", &before[0]),
+            ("artifact_meta_sha256", &before[1]),
+            ("evaluation_sha256", &before[2]),
+        ] {
+            assert!(
+                record.contains(&format!("\"{key}\":\"{hash}\"")),
+                "{key}: {record}"
+            );
+        }
+        assert!(record.contains("\"config_id\":\"c1:seed42\""), "{record}");
+    }
+
+    /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した
+    /// 予測と正解の一致件数に等しい（評価経路と推論経路の全件一致）。
+    pub fn evaluate_correct_matches_infer_on_package() {
+        let env = eval_trained("evalinfer");
+        env.ok(&EVALUATE_0);
+        let out = env.ok(&EVALUATE_1);
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&PACKAGE);
+        let mut batch = String::new();
+        let mut golds = Vec::new();
+        for i in 0..4 {
+            for l in LABELS {
+                batch.push_str(&format!(
+                    "{{\"id\":\"e-{l}-{i}\",\"input\":\"{l} evaluation {i}\"}}\n"
+                ));
+                golds.push(l);
+            }
+        }
+        std::fs::write(env.work.join("batch.jsonl"), batch).expect("batch");
+        let (code, lines) = env.run(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "batch.jsonl",
+        ]);
+        assert_eq!(code, 0, "{lines}");
+        assert_eq!(lines.lines().count(), 12, "{lines}");
+        let matched = lines
+            .lines()
+            .zip(&golds)
+            .filter(|(line, gold)| line.contains(&format!("\"predicted_label\":\"{gold}\"")))
+            .count();
+        assert_eq!(
+            number_field(&out, "correct").to_bits(),
+            (matched as f64).to_bits(),
+            "{out} matched={matched}"
+        );
+    }
+
+    /// REQ-27: 同じ候補への 2 回目の `evaluate` は固定 message の `invalid_input` で、記録は変わらない。
+    /// 記録を消しても、台帳の適用ロックが再適用を拒否する。
+    pub fn evaluate_twice_is_rejected() {
+        let env = eval_trained("evaltwice");
+        env.ok(&EVALUATE_0);
+        let record_path = env.project_file("candidates/0/evaluation_record.json");
+        let original = std::fs::read(&record_path).expect("record");
+        let expected = "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n";
+        assert_eq!(env.fails(&EVALUATE_0, 64, "invalid_input"), expected);
+        assert_eq!(std::fs::read(&record_path).expect("record"), original);
+        // 記録ファイルを消しても、台帳のロックが 2 回目の適用を拒否する（記録の削除で回避できない）。
+        std::fs::remove_file(&record_path).expect("remove record");
+        assert_eq!(env.fails(&EVALUATE_0, 64, "invalid_input"), expected);
+        assert!(!record_path.exists());
+    }
+
+    /// REQ-27: 最初の `evaluate` の後に学習した候補は、台帳へ事前登録されていないため評価できない。
+    pub fn evaluate_rejects_candidate_trained_after_registration() {
+        let env = eval_env_until(
+            "evalafter",
+            &[&["train", "--project-dir", "proj", "--candidate", "0"]],
+        );
+        env.ok(&EVALUATE_0);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        assert_eq!(
+            env.fails(&EVALUATE_1, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate is not registered for evaluation\"}\n"
+        );
+        assert!(
+            !env.project_file("candidates/1/evaluation_record.json")
+                .exists()
+        );
+    }
+
+    /// REQ-27: 未学習の候補と `train --smoke` の候補は評価できず、台帳にロックを作らない。
+    pub fn evaluate_rejects_untrained_and_smoke_trained_candidates() {
+        let env = eval_env_until("evalsmoke", &[]);
+        assert_eq!(
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate is not trained\"}\n"
+        );
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--smoke",
+        ]);
+        assert_eq!(
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"smoke-trained candidate cannot be evaluated\"}\n"
+        );
+        assert!(!env.project_file("final_test_ledger").exists());
+        assert!(
+            !env.project_file("candidates/0/evaluation_record.json")
+                .exists()
+        );
+    }
+
+    /// REQ-27: 選定候補が評価済みでなければ、他の候補が評価済みでも `package` は拒否し、
+    /// `package/`・ステージングを作らない。
+    pub fn package_rejects_when_selected_candidate_not_evaluated() {
+        let env = eval_trained("pkgselnoeval");
+        env.ok(&EVALUATE_0);
+        // select は validation だけで選ぶため candidate 1（c3）を選ぶ（評価済みは candidate 0 のみ）。
+        assert_eq!(
+            env.ok(&["select", "--project-dir", "proj"]),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+        );
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation has not been completed\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-27: 評価完了記録のハッシュ・候補の値が実体と食い違う、または未知キーを含む場合、
+    /// `package` は拒否し `package/` を作らない。元に戻せば成功する。
+    pub fn package_rejects_tampered_evaluation_record() {
+        let env = eval_trained("pkgtamper");
+        env.ok(&EVALUATE_0);
+        env.ok(&EVALUATE_1);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let record_path = env.project_file("candidates/1/evaluation_record.json");
+        let original = std::fs::read_to_string(&record_path).expect("record");
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n";
+        for key in [
+            "onnx_sha256",
+            "evaluation_sha256",
+            "definition_sha256",
+            "artifact_meta_sha256",
+        ] {
+            let marker = format!("\"{key}\":\"");
+            let at = original.find(&marker).expect("key") + marker.len();
+            let mut tampered = original.clone();
+            let flipped = if original.as_bytes().get(at) == Some(&b'0') {
+                "1"
+            } else {
+                "0"
+            };
+            tampered.replace_range(at..=at, flipped);
+            std::fs::write(&record_path, tampered).expect("tamper");
+            assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch, "{key}");
+            assert!(!env.project_file("package").exists(), "{key}");
+            assert!(!env.project_file("package.staging").exists(), "{key}");
+        }
+        let tampered = original.replacen("\"candidate_id\":\"c3\"", "\"candidate_id\":\"c1\"", 1);
+        std::fs::write(&record_path, tampered).expect("tamper");
+        assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch);
+        let unknown = original.trim_end().trim_end_matches('}').to_string() + ",\"extra\":1}\n";
+        std::fs::write(&record_path, unknown).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record is invalid\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&record_path, original).expect("restore");
+        env.ok(&PACKAGE);
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1090,8 +1361,40 @@ fn main() -> std::process::ExitCode {
             suite::full_pipeline_completes_without_evaluation_data,
         ),
         (
-            "evaluation_data_is_frozen_and_evaluate_is_not_faked",
-            suite::evaluation_data_is_frozen_and_evaluate_is_not_faked,
+            "evaluation_data_is_frozen_and_read_only",
+            suite::evaluation_data_is_frozen_and_read_only,
+        ),
+        (
+            "full_pipeline_completes_with_evaluation_data",
+            suite::full_pipeline_completes_with_evaluation_data,
+        ),
+        (
+            "evaluate_keeps_model_and_evaluation_hashes",
+            suite::evaluate_keeps_model_and_evaluation_hashes,
+        ),
+        (
+            "evaluate_correct_matches_infer_on_package",
+            suite::evaluate_correct_matches_infer_on_package,
+        ),
+        (
+            "evaluate_twice_is_rejected",
+            suite::evaluate_twice_is_rejected,
+        ),
+        (
+            "evaluate_rejects_candidate_trained_after_registration",
+            suite::evaluate_rejects_candidate_trained_after_registration,
+        ),
+        (
+            "evaluate_rejects_untrained_and_smoke_trained_candidates",
+            suite::evaluate_rejects_untrained_and_smoke_trained_candidates,
+        ),
+        (
+            "package_rejects_when_selected_candidate_not_evaluated",
+            suite::package_rejects_when_selected_candidate_not_evaluated,
+        ),
+        (
+            "package_rejects_tampered_evaluation_record",
+            suite::package_rejects_tampered_evaluation_record,
         ),
         (
             "evaluate_stops_on_frozen_hash_mismatch",

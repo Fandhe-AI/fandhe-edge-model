@@ -4,9 +4,12 @@
 //! # 手順
 //!
 //! 0. 開始時（ステージングを作る前）に評価データの凍結ハッシュを確認する（不一致・凍結記録の欠落は
-//!    `invalid_input` で停止。REQ-17）。評価データがあるプロジェクトは、評価の完了記録が無い限り
-//!    `invalid_input`（`evaluation has not been completed`）で拒否する。完了記録は未実装のため当面は
-//!    常に拒否する（#314 で evaluate を評価器へ接続し、完了記録を本工程が確認する。REQ-24〜27）
+//!    `invalid_input` で停止。REQ-17）。評価データがあるプロジェクトは、選定候補の評価完了記録
+//!    （`candidates/<N>/evaluation_record.json`。`evaluate` が書く。#314）が無い限り
+//!    `invalid_input`（`evaluation has not been completed`）で拒否し、記録の ONNX・`artifact.json`・
+//!    評価データ・定義のハッシュが今の実体と一致しなければ
+//!    `evaluation record does not match the package` で拒否する（成果物を読んだ後・ステージングを
+//!    作る前に確認する。[`verify_evaluation_record`]。REQ-27）
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
 //!    学習リクエストの `kind` の一致も確認する
@@ -31,19 +34,18 @@
 //! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
 //! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
 
-use std::path::{Component, Path};
+use std::path::Path;
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
+use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_data::eval_freeze::FreezeRecord;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
-use fandhe_edge_guard::kind::KindAllowlist;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES, ModelKind};
+use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
@@ -53,8 +55,12 @@ use fandhe_edge_train::stage_files::SelectionRecord;
 use crate::args::PackageArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
-    CreatedDir, DEFINITION_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE,
-    fs_report, invalid, parse_definition,
+    CreatedDir, DEFINITION_FILE, EVALUATION_RECORD_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project,
+    SELECTION_FILE, invalid, parse_definition, runtime,
+};
+
+use super::candidate_artifact::{
+    ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
 };
 
 use super::infer::load_backend;
@@ -63,9 +69,6 @@ use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
     resolve_candidates, verified_split,
 };
-
-/// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
-const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 容量の上限（バイト。REQ-30 の目安 40MB。暫定の固定値）。
 const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
@@ -77,13 +80,10 @@ const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 /// I/O 失敗は `runtime_error`（70）。容量の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
 pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
-    // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認し（REQ-17）、
-    // 評価データがあるプロジェクトは評価の完了記録が無い限り公開を拒否する（fail-closed。REQ-27）。
-    // TODO(#314・REQ-24〜27): evaluate 工程を評価器へ接続して評価の完了記録を残し、ここでその記録を
-    // 確認する。完了記録の形式がまだ無いため、当面は評価データがあれば常に拒否する（実装済みを装わない）。
-    if super::inspect::load_evaluation_bytes(&project)?.is_some() {
-        return Err(invalid("evaluation has not been completed"));
-    }
+    // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    // 評価データがあるプロジェクトは、選定候補の評価完了記録を確認できるまで公開しない
+    // （下の [`verify_evaluation_record`]。fail-closed。REQ-27）。
+    let frozen = super::inspect::load_frozen_evaluation(&project)?;
     let selection_bytes = project.read(SELECTION_FILE, 64 * 1024)?;
     let selection = SelectionRecord::from_json_slice(&selection_bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
@@ -119,32 +119,16 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));
     };
-    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から読む。候補ディレクトリは `Project` の
-    // 保持 fd からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得る（パスの正規化・開き直しをしない）。
-    // `artifact_dir` は文字列の前方一致でなく、閉じ込め済みの候補ディレクトリからの相対パスとして求める（リクエスト・結果の差し替えで候補の外を読まない。REQ-39）。
-    let candidate_dir = project.open_subdir(candidate_rel(selection.candidate_index))?;
-    let artifact_rel = Path::new(success.artifact_dir())
-        .strip_prefix(candidate_dir.dir())
-        .map_err(|_| invalid("artifact directory is outside the candidate directory"))?
-        .to_path_buf();
-    let onnx_file = success.artifact().onnx_file();
-    if !is_single_component(onnx_file) {
-        return Err(invalid("onnx file name is invalid"));
-    }
-    let read_member = |name: &str, limit: u64| -> Result<Vec<u8>, ErrorReport> {
-        let (file, real) = candidate_dir
-            .open_member(&artifact_rel.join(name))
-            .map_err(|e| e.to_error_report())?;
-        read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))
-    };
-    let meta_bytes = read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
-    let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
-    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
-    if meta.onnx_file() != onnx_file
-        || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
-    {
-        return Err(invalid("artifact metadata does not match the model file"));
-    }
+    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から閉じ込めつきで読む
+    // （`evaluate` と共有する [`load_candidate_artifact`]。REQ-39）。
+    let CandidateArtifact {
+        meta_bytes,
+        meta,
+        onnx_bytes,
+        onnx_file,
+        ..
+    } = load_candidate_artifact(&project, selection.candidate_index, success)?;
+    let onnx_file = onnx_file.as_str();
     check_meta_consistency(
         &meta,
         &definition,
@@ -164,6 +148,19 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         meta.kind_version(),
         definition.options().len(),
     )?;
+
+    // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
+    // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
+    if let Some((freeze, _)) = &frozen {
+        verify_evaluation_record(
+            &project,
+            &selection,
+            freeze,
+            &definition,
+            &meta_bytes,
+            &onnx_bytes,
+        )?;
+    }
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -197,6 +194,46 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &breaches,
         PackageQualityJudgment::NotDefined,
     ))
+}
+
+/// 選定候補の評価完了記録を読み、公開する成果物・評価データ・定義と一致することを確認する
+/// （REQ-27・#314）。
+///
+/// 記録が無ければ `evaluation has not been completed`、解析できなければ
+/// `evaluation record is invalid`、いずれかの値が一致しなければ
+/// `evaluation record does not match the package`（いずれも `invalid_input`）。
+///
+/// **記録ファイル自体はプロジェクトへ書き込める主体なら作り直せる**ため、本確認は外部台帳による
+/// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
+fn verify_evaluation_record(
+    project: &Project,
+    selection: &SelectionRecord,
+    freeze: &FreezeRecord,
+    definition: &Definition,
+    meta_bytes: &[u8],
+    onnx_bytes: &[u8],
+) -> Result<(), ErrorReport> {
+    let rel = candidate_rel(selection.candidate_index).join(EVALUATION_RECORD_FILE);
+    let Some(bytes) = project.read_optional(&rel, MAX_EVALUATION_RECORD_BYTES)? else {
+        return Err(invalid("evaluation has not been completed"));
+    };
+    let record = EvaluationRecord::from_json_slice(&bytes)
+        .map_err(|_| invalid("evaluation record is invalid"))?;
+    let definition_sha256 = definition
+        .canonical_hash()
+        .map_err(|_| runtime("cannot hash definition"))?
+        .to_hex();
+    let matches = record.candidate_index == selection.candidate_index
+        && record.candidate_id == selection.candidate_id
+        && record.evaluation_sha256 == freeze.sha256().to_hex()
+        && record.evaluation_bytes == freeze.byte_len()
+        && record.onnx_sha256 == Sha256Digest::of_bytes(onnx_bytes).to_hex()
+        && record.artifact_meta_sha256 == Sha256Digest::of_bytes(meta_bytes).to_hex()
+        && record.definition_sha256 == definition_sha256;
+    if !matches {
+        return Err(invalid("evaluation record does not match the package"));
+    }
+    Ok(())
 }
 
 /// 計測した容量が上限内ならステージングを `package/` へ原子的に公開し、超過なら公開せず片付ける
@@ -251,55 +288,6 @@ fn assemble_and_measure(
     measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))
 }
-
-/// `artifact.json` の `kind`・`label_order`・`max_bytes` を、選定候補の学習リクエストと定義に照合する
-/// （`infer` が読み込み時に行う検査と同じ観点。食い違うパッケージを作らない。REQ-32・REQ-39）。
-fn check_meta_consistency(
-    meta: &ArtifactMeta,
-    definition: &Definition,
-    trained_kind: &str,
-    trained_kind_version: u32,
-    trained_max_bytes: u32,
-) -> Result<(), ErrorReport> {
-    KindAllowlist::supported()
-        .check(meta.kind())
-        .map_err(|e| e.to_error_report())?;
-    if meta.kind() != trained_kind {
-        return Err(invalid(
-            "artifact kind does not match the selected candidate",
-        ));
-    }
-    if meta.kind_version() != trained_kind_version {
-        return Err(invalid(
-            "artifact kind_version does not match the selected candidate",
-        ));
-    }
-    let option_ids = definition.options().iter().map(|c| c.id.as_str());
-    if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
-        return Err(invalid("package label order does not match definition"));
-    }
-    if meta.max_bytes() != trained_max_bytes {
-        return Err(invalid(
-            "artifact max_bytes does not match the selected candidate",
-        ));
-    }
-    let in_range = usize::try_from(meta.max_bytes())
-        .is_ok_and(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(&n));
-    if !in_range {
-        return Err(invalid("package max_bytes is out of range"));
-    }
-    Ok(())
-}
-
-/// 単一の通常の名前（区切り・`..`・絶対パスを含まない）か。
-fn is_single_component(name: &str) -> bool {
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -16,7 +16,9 @@
 //! ├── eval_freeze.json           evaluation.jsonl がある場合のみ（凍結記録）
 //! ├── split.json                 inspect が作る分割記録（seed・規則・各分割のハッシュ）
 //! ├── candidates/<N>/            train が候補ごとに作る（request.json・train_input.jsonl・
-//! │                              job/・result.json と、学習ワーカーの出力先）
+//! │                              job/・result.json と、学習ワーカーの出力先）。evaluate が
+//! │                              evaluation_record.json（評価完了の記録）を足す
+//! ├── final_test_ledger/         最初の evaluate が作る最終 test の台帳（評価器が管理。0700）
 //! ├── selection_record.json      select の記録
 //! ├── package.staging/           package の組み立て・容量計測用（公開後・失敗時は残らない）
 //! └── package/                   package が作る配布パッケージ（容量が上限内のときだけ公開）
@@ -65,6 +67,11 @@ pub const FREEZE_FILE: &str = "eval_freeze.json";
 pub const SPLIT_FILE: &str = "split.json";
 /// 候補ディレクトリの親。
 pub const CANDIDATES_DIR: &str = "candidates";
+/// 最終 test の台帳（評価器の `FinalTestLedger`）のディレクトリ名。最初の `evaluate` が作り、
+/// 学習済みの候補をまとめて事前登録する（REQ-27。#314）。
+pub const FINAL_TEST_LEDGER_DIR: &str = "final_test_ledger";
+/// 候補ディレクトリ内の評価完了記録のファイル名（`evaluate` が新規に書き、`package` が確認する。#314）。
+pub const EVALUATION_RECORD_FILE: &str = "evaluation_record.json";
 /// 選定記録のファイル名。
 pub const SELECTION_FILE: &str = "selection_record.json";
 /// 配布パッケージのディレクトリ名（`sandbox-run.sh` の出力先と同じ）。
