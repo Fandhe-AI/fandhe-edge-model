@@ -48,6 +48,8 @@ pub enum ArtifactMetaError {
     Malformed,
     /// `onnx_file` が空文字列、または NUL を含む。
     InvalidOnnxFile,
+    /// 語彙ファイルが許可された形式でない。
+    InvalidVocab,
 }
 
 impl fmt::Display for ArtifactMetaError {
@@ -55,6 +57,7 @@ impl fmt::Display for ArtifactMetaError {
         match self {
             ArtifactMetaError::Malformed => write!(f, "artifact metadata is malformed"),
             ArtifactMetaError::InvalidOnnxFile => write!(f, "onnx_file value is invalid"),
+            ArtifactMetaError::InvalidVocab => write!(f, "vocab file format is invalid"),
         }
     }
 }
@@ -140,6 +143,7 @@ pub struct ArtifactMeta {
     max_bytes: u32,
     label_order: Vec<String>,
     onnx_sha256: String,
+    vocab_sha256: Option<String>,
 }
 
 /// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
@@ -155,6 +159,32 @@ struct RawMeta {
     max_bytes: u32,
     label_order: Vec<String>,
     onnx_sha256: String,
+    #[serde(default)]
+    vocab_sha256: Option<String>,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 語彙ファイル（`vocab.json`）の最大エントリ数（REQ-39。巨大な語彙でのアロケーション上限）。
+pub const MAX_VOCAB_ENTRIES: usize = 4_194_304;
+
+/// 語彙ファイルが許可された形式（トークン文字列から非負整数 ID への JSON オブジェクト）かを検証する
+/// （REQ-39 形式の許可制・REQ-30・TASK-30.3・#125）。
+///
+/// # Errors
+/// JSON として不正・オブジェクトでない・値が非負整数でない・空・エントリ過多の場合は
+/// [`ArtifactMetaError::InvalidVocab`]。
+pub fn validate_vocab_bytes(bytes: &[u8]) -> Result<(), ArtifactMetaError> {
+    let map: std::collections::BTreeMap<String, u32> =
+        serde_json::from_slice(bytes).map_err(|_| ArtifactMetaError::InvalidVocab)?;
+    if map.is_empty() || map.len() > MAX_VOCAB_ENTRIES {
+        return Err(ArtifactMetaError::InvalidVocab);
+    }
+    Ok(())
 }
 
 impl ArtifactMeta {
@@ -181,11 +211,7 @@ impl ArtifactMeta {
                 .label_order
                 .iter()
                 .all(|l| !l.is_empty() && seen.insert(l.as_str()));
-        let sha_ok = raw.onnx_sha256.len() == 64
-            && raw
-                .onnx_sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let sha_ok = is_hex64(&raw.onnx_sha256) && raw.vocab_sha256.as_deref().is_none_or(is_hex64);
         if raw.kind.is_empty()
             || raw.kind.len() > MAX_META_KIND_BYTES
             || raw.max_bytes == 0
@@ -201,6 +227,7 @@ impl ArtifactMeta {
             max_bytes: raw.max_bytes,
             label_order: raw.label_order,
             onnx_sha256: raw.onnx_sha256,
+            vocab_sha256: raw.vocab_sha256,
         })
     }
 
@@ -238,6 +265,13 @@ impl ArtifactMeta {
     #[must_use]
     pub fn onnx_sha256(&self) -> &str {
         &self.onnx_sha256
+    }
+
+    /// 記載された語彙ファイルの sha256（小文字 16 進 64 桁）。語彙ファイルを持たない成果物では `None`。
+    /// 語彙ファイルがある場合は記録が必須で、呼び出し側（`package`・`infer`）が照合する（REQ-39）。
+    #[must_use]
+    pub fn vocab_sha256(&self) -> Option<&str> {
+        self.vocab_sha256.as_deref()
     }
 }
 
@@ -356,6 +390,39 @@ mod tests {
         assert_eq!(m.max_bytes(), 48);
         assert_eq!(m.label_order(), ["a".to_string(), "b".to_string()]);
         assert_eq!(m.onnx_sha256(), "0".repeat(64));
+        assert_eq!(m.vocab_sha256(), None);
+    }
+
+    /// REQ-39: 語彙ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
+    #[test]
+    fn req39_meta_vocab_sha256_is_optional_and_validated() {
+        let ok = format!(r#","vocab_sha256":"{}""#, "a".repeat(64));
+        let m = ArtifactMeta::parse(full_meta(&ok).as_bytes()).expect("ok");
+        assert_eq!(m.vocab_sha256(), Some("a".repeat(64).as_str()));
+        assert_eq!(
+            ArtifactMeta::parse(full_meta(r#","vocab_sha256":"zz""#).as_bytes()),
+            Err(ArtifactMetaError::Malformed)
+        );
+    }
+
+    /// REQ-39: 語彙ファイルは「トークン -> 非負整数 ID」の JSON オブジェクトだけを許可する。
+    #[test]
+    fn req39_validate_vocab_bytes_allows_only_token_id_map() {
+        assert_eq!(validate_vocab_bytes(br#"{"a":0,"b":1}"#), Ok(()));
+        for bad in [
+            &b"{}"[..],
+            b"[]",
+            b"not json",
+            br#"{"a":-1}"#,
+            br#"{"a":"x"}"#,
+            br#"{"a":1.5}"#,
+            b"\x80\x81",
+        ] {
+            assert_eq!(
+                validate_vocab_bytes(bad),
+                Err(ArtifactMetaError::InvalidVocab)
+            );
+        }
     }
 
     /// REQ-39: 欠落・型違い・不正値は fail-closed。

@@ -38,7 +38,9 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path};
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
+use fandhe_edge_core::artifact_meta::{
+    ArtifactMeta, MAX_ARTIFACT_META_BYTES, validate_vocab_bytes,
+};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
@@ -168,6 +170,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
+    verify_vocab_member(&meta, vocab_bytes.as_deref())?;
     check_meta_consistency(
         &meta,
         &definition,
@@ -324,6 +327,28 @@ fn check_meta_consistency(
     Ok(())
 }
 
+/// 語彙ファイルの形式（許可制）と `artifact.json` 記載の sha256 との一致を検証する
+/// （`package` の公開前と `infer` の読み込み時で共有。REQ-39 形式の許可制・完全性）。
+///
+/// 語彙ファイルがあるのに sha256 の記録が無い・不一致・形式不正、または記録があるのにファイルが無い
+/// 場合は `invalid_input`（fail-closed）。語彙ファイルも記録も無ければ何もしない。
+pub(crate) fn verify_vocab_member(
+    meta: &ArtifactMeta,
+    vocab_bytes: Option<&[u8]>,
+) -> Result<(), ErrorReport> {
+    match (vocab_bytes, meta.vocab_sha256()) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(invalid("vocab file is missing but its hash is recorded")),
+        (Some(_), None) => Err(invalid("vocab file has no recorded hash")),
+        (Some(bytes), Some(recorded)) => {
+            if Sha256Digest::of_bytes(bytes).to_hex() != recorded {
+                return Err(invalid("vocab file does not match its recorded hash"));
+            }
+            validate_vocab_bytes(bytes).map_err(|e| e.to_error_report())
+        }
+    }
+}
+
 /// 単一の通常の名前（区切り・`..`・絶対パスを含まない）か。
 fn is_single_component(name: &str) -> bool {
     let mut components = Path::new(name).components();
@@ -425,5 +450,34 @@ mod tests {
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn meta_with_vocab(vocab_sha: Option<&str>) -> ArtifactMeta {
+        let extra = vocab_sha
+            .map(|h| format!(r#","vocab_sha256":"{h}""#))
+            .unwrap_or_default();
+        let json = format!(
+            r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":48,"label_order":["a"],"onnx_sha256":"{}"{extra}}}"#,
+            "0".repeat(64)
+        );
+        ArtifactMeta::parse(json.as_bytes()).expect("meta")
+    }
+
+    /// REQ-39: 語彙ファイルは記録ハッシュとの一致と許可形式の両方を満たすときだけ通す。
+    #[test]
+    fn req39_verify_vocab_member_checks_hash_and_format() {
+        let good = br#"{"a":0}"#;
+        let good_hex = Sha256Digest::of_bytes(good).to_hex();
+        assert!(verify_vocab_member(&meta_with_vocab(None), None).is_ok());
+        assert!(verify_vocab_member(&meta_with_vocab(Some(&good_hex)), Some(good)).is_ok());
+        // 記録なし・ファイルなし・ハッシュ不一致は拒否。
+        assert!(verify_vocab_member(&meta_with_vocab(None), Some(good)).is_err());
+        assert!(verify_vocab_member(&meta_with_vocab(Some(&good_hex)), None).is_err());
+        assert!(verify_vocab_member(&meta_with_vocab(Some(&"1".repeat(64))), Some(good)).is_err());
+        // ハッシュが一致しても形式が許可外なら拒否。
+        let bad = b"not json";
+        let bad_hex = Sha256Digest::of_bytes(bad).to_hex();
+        let err = verify_vocab_member(&meta_with_vocab(Some(&bad_hex)), Some(bad)).unwrap_err();
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
     }
 }
