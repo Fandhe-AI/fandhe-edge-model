@@ -254,7 +254,7 @@ fn scan_vocab_reader<R: std::io::Read>(
 ) -> Result<(), VocabStreamError> {
     use serde::Deserializer as _;
     let classify = |e: serde_json::Error| {
-        if e.is_io() {
+        if e.is_io() && e.io_error_kind() != Some(std::io::ErrorKind::InvalidData) {
             VocabStreamError::Read
         } else {
             VocabStreamError::Format
@@ -303,6 +303,85 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
     }
 }
 
+/// 1 つの文字列リテラルの生バイト数の上限。`\uXXXX`（6 バイト）は最小でも 1 バイトに展開される
+/// ため、デコード後 [`MAX_VOCAB_TOKEN_BYTES`] の正しいトークンを誤って拒否しない値にする。
+const MAX_VOCAB_RAW_STRING_BYTES: usize = MAX_VOCAB_TOKEN_BYTES * 6;
+
+/// 数値リテラルの生バイト数の上限（`u32` は 10 桁。符号・小数点・指数の余裕を見た値）。
+const MAX_VOCAB_RAW_NUMBER_BYTES: usize = 32;
+
+/// serde_json へ渡す前に JSON の字句の長さを制限する `Read` アダプタ（REQ-39）。
+///
+/// serde_json は文字列キー全体を scratch バッファへ読んでから訪問者を呼ぶため、訪問者側のトークン長
+/// 確認だけでは、極端に長いキーの確保を防げない。通過するバイトを走査し、文字列リテラルの内外・
+/// エスケープ（`\` の直後の 1 文字）を状態として追跡して、生バイト数が上限を超えたら
+/// `InvalidData` で読み込みを打ち切る（超過した塊は serde_json へ渡さない）。
+struct LexGuardReader<R> {
+    inner: R,
+    in_string: bool,
+    escaped: bool,
+    string_len: usize,
+    number_len: usize,
+}
+
+impl<R> LexGuardReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            in_string: false,
+            escaped: false,
+            string_len: 0,
+            number_len: 0,
+        }
+    }
+
+    fn scan(&mut self, byte: u8) -> Result<(), ()> {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'"' {
+                // 閉じ引用符は文字列の生バイト数に含めない。
+                self.in_string = false;
+                return Ok(());
+            } else if byte == b'\\' {
+                self.escaped = true;
+            }
+            self.string_len += 1;
+            if self.string_len > MAX_VOCAB_RAW_STRING_BYTES {
+                return Err(());
+            }
+        } else if byte == b'"' {
+            self.in_string = true;
+            self.string_len = 0;
+            self.number_len = 0;
+        } else if byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E') {
+            self.number_len += 1;
+            if self.number_len > MAX_VOCAB_RAW_NUMBER_BYTES {
+                return Err(());
+            }
+        } else {
+            self.number_len = 0;
+        }
+        Ok(())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for LexGuardReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for i in 0..n {
+            let Some(&byte) = buf.get(i) else { break };
+            if self.scan(byte).is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "vocab lexical limit exceeded",
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// 語彙ファイルを 1 パスのストリームで検証し、その sha256 を返す
 /// （`select`・`package`・`infer` が共有。REQ-30・REQ-39・TASK-30.3・#125）。
 ///
@@ -325,14 +404,14 @@ pub fn verify_vocab_stream<R: std::io::Read>(
         hasher: sha2::Sha256::new(),
         total: 0,
     };
-    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, hashing);
+    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, LexGuardReader::new(hashing));
     scan_vocab_reader(
         &mut buffered,
         MAX_VOCAB_ENTRIES,
         MAX_VOCAB_TOKEN_BYTES,
         &std::cell::Cell::new(0),
     )?;
-    let done = buffered.into_inner();
+    let done = buffered.into_inner().inner;
     if done.total > max_bytes {
         return Err(VocabStreamError::Format);
     }
@@ -653,6 +732,97 @@ mod tests {
         );
         assert_eq!(
             verify_vocab_stream(&good[..], good.len() as u64 - 1),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// 読んだバイト数を数える `Read`（同じ内容を繰り返す。`limit` 到達で EOF）。
+    struct Counting<'a> {
+        head: &'a [u8],
+        pos: usize,
+        fill: u8,
+        limit: usize,
+        read: &'a std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut n = 0;
+            for slot in buf.iter_mut() {
+                if self.pos >= self.limit {
+                    break;
+                }
+                *slot = self.head.get(self.pos).copied().unwrap_or(self.fill);
+                self.pos += 1;
+                n += 1;
+            }
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// REQ-39: 極端に長いキー（1 MiB）は、字句ガードが上限＋バッファ分で打ち切り、それ以上読まない
+    /// （serde_json が scratch へ確保する前に拒否する）。
+    #[test]
+    fn req39_lex_guard_stops_overlong_key_before_allocation() {
+        let read = std::cell::Cell::new(0);
+        let reader = Counting {
+            head: b"{\"",
+            pos: 0,
+            fill: b'a',
+            limit: 1 << 20,
+            read: &read,
+        };
+        assert_eq!(
+            verify_vocab_stream(reader, u64::MAX / 2),
+            Err(VocabStreamError::Format)
+        );
+        assert!(
+            read.get() <= MAX_VOCAB_RAW_STRING_BYTES + 64 * 1024 + 2,
+            "read {} bytes",
+            read.get()
+        );
+    }
+
+    /// REQ-39: 長すぎる数値リテラルも打ち切る。
+    #[test]
+    fn req39_lex_guard_rejects_overlong_number() {
+        let json = format!("{{\"a\":{}}}", "1".repeat(64));
+        assert_eq!(
+            verify_vocab_stream(json.as_bytes(), 1 << 20),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// REQ-39: エスケープ（`\uXXXX`）で生バイト数が膨らんだ正しい 4096 バイトのトークンは通る。
+    /// 4097 バイトは訪問者が拒否する。
+    #[test]
+    fn req39_lex_guard_accepts_escaped_max_token_and_visitor_rejects_longer() {
+        let ok = format!("{{\"{}\":0}}", "\\u0061".repeat(MAX_VOCAB_TOKEN_BYTES));
+        assert_eq!(
+            verify_vocab_stream(ok.as_bytes(), 1 << 20),
+            Ok(Sha256Digest::of_bytes(ok.as_bytes()))
+        );
+        let long = format!("{{\"{}\":0}}", "\\u0061".repeat(MAX_VOCAB_TOKEN_BYTES + 1));
+        assert_eq!(
+            verify_vocab_stream(long.as_bytes(), 1 << 20),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// REQ-39: 文字列中の `\"`・`\\` で状態が崩れない（エスケープされた引用符で文字列が終わらず、
+    /// `\\` の直後の引用符では終わる）。
+    #[test]
+    fn req39_lex_guard_tracks_escaped_quotes() {
+        let json = br#"{"a\"b":0,"c\\":1,"d":2}"#;
+        assert_eq!(
+            verify_vocab_stream(&json[..], 1024),
+            Ok(Sha256Digest::of_bytes(json))
+        );
+        // 引用符が閉じないまま長く続くケース: 長いキーとして拒否される。
+        let unterminated = format!("{{\"a\\\"{}", "b".repeat(MAX_VOCAB_RAW_STRING_BYTES + 10));
+        assert_eq!(
+            verify_vocab_stream(unterminated.as_bytes(), 1 << 20),
             Err(VocabStreamError::Format)
         );
     }
