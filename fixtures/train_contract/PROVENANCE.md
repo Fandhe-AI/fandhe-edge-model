@@ -217,3 +217,11 @@ print(json.dumps(
 
 `["l0", "l1", ..., "l1024"]`（`f"l{i}" for i in range(1025)`）として生成した。
 生成スクリプトは残していない（値は fixture へ直接書き込み済み）。
+
+## `worker_crash_message.json`
+
+手書き。`trainer/src/fandhe_edge_trainer/supervisor.py` の固定文言
+（`_WORKER_SIGNAL_MESSAGE_PREFIX`・`_monitor_worker_and_finalize` が出す
+`worker terminated by signal N`・cpu 上限・監視失敗の各文言）から作成した
+（REQ-34・TASK-34.2・#146）。`crates/train/tests/worker_crash_message_fixture.rs` と
+`trainer/tests/test_supervisor.py` が接頭辞と分類を照合する。

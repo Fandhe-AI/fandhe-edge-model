@@ -23,8 +23,10 @@
 //!
 //! # 未実装（実装済みを装わない）
 //!
-//! - `job.json` への永続化・クラッシュ検出・状態確認コマンドは #146
-//!   （TASK-34.2）、やり直しの案内は #147（TASK-34.3）。
+//! - 状態確認コマンド（CLI への露出。REQ-33 の 7 工程の変更にあたり TASK-33.x の
+//!   承認事項）と、やり直しの案内は #147（TASK-34.3）。`job.json` への永続化と
+//!   クラッシュ検出は [`crate::job_record`]・[`TrainJob::run_recorded`]（TASK-34.2・
+//!   #146）で実装済み。
 //! - `SIGKILL` フォールバック（協調キャンセルの猶予超過）後に残りうる予約済み
 //!   `out_dir`・tmp の削除と、やり直し時の案内は #147（TASK-34.3）。協調キャンセル
 //!   （supervisor が自ら解放）では公開場所に何も残らず、確定済みなら
@@ -36,6 +38,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::TrainProcessError;
+use crate::job_record::{JobRecordError, JobRecorder, classify_run_end, unix_now};
 use crate::process::{
     CancelToken, CancelledRun, RunLimits, TrainRunEnd, WorkerLauncher, run_train_cancellable,
 };
@@ -43,7 +46,7 @@ use crate::request::TrainRequest;
 use crate::result::TrainOutcome;
 
 /// 学習ジョブの状態。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     /// 起動前。
@@ -161,6 +164,17 @@ impl JobHandle {
     }
 }
 
+/// [`TrainJob::run_recorded`] の結果。記録の失敗で学習結果を失わないよう、実行結果と
+/// 記録の成否を別々に持つ。
+#[derive(Debug)]
+pub struct RecordedRun {
+    /// 学習の実行結果（[`TrainJob::run`] と同じ）。
+    pub run: Result<TrainRunEnd, TrainProcessError>,
+    /// 終端記録の書き込み結果。`Err` のときも lock は解放され、状態確認は
+    /// 非終端の記録を `OwnerLost` のクラッシュとして検出しうる。
+    pub record: Result<(), JobRecordError>,
+}
+
 /// 1 回の学習実行を状態遷移つきで行うジョブ。
 #[derive(Debug)]
 pub struct TrainJob {
@@ -207,6 +221,41 @@ impl TrainJob {
     /// [`crate::process::run_train_cancellable`] のエラー（状態は `Failed`）。
     pub fn run(
         self,
+        launcher: &WorkerLauncher,
+        request: &TrainRequest,
+        job_dir: &Path,
+        limits: &RunLimits,
+    ) -> Result<TrainRunEnd, TrainProcessError> {
+        self.run_inner(launcher, request, job_dir, limits)
+    }
+
+    /// [`Self::run`] に、`job_dir` への記録の永続化（`job.json`・`job.lock`）を加えた版
+    /// （REQ-34・TASK-34.2・#146）。
+    ///
+    /// 子を起動する前に [`JobRecorder::begin`] で `running` を記録して lock を保持し、
+    /// 終了後に [`classify_run_end`] の分類で終端記録を書いてから lock を解放する。
+    /// 途中でこのプロセスが落ちた場合は、後から [`crate::job_record::read_job_status`]
+    /// が `failed`＋クラッシュとして検出する。
+    ///
+    /// # Errors
+    /// 記録を開始できなかった場合（子は起動しない）。開始後の記録の書き込み失敗は、
+    /// 学習結果（公開済みの成果物を含む）を失わないよう [`RecordedRun::record`] で返す。
+    pub fn run_recorded(
+        self,
+        launcher: &WorkerLauncher,
+        request: &TrainRequest,
+        job_dir: &Path,
+        limits: &RunLimits,
+    ) -> Result<RecordedRun, JobRecordError> {
+        let recorder = JobRecorder::begin(job_dir, unix_now())?;
+        let run = self.run_inner(launcher, request, job_dir, limits);
+        let (state, failure) = classify_run_end(&run, unix_now());
+        let record = recorder.finish(state, failure, unix_now());
+        Ok(RecordedRun { run, record })
+    }
+
+    fn run_inner(
+        &self,
         launcher: &WorkerLauncher,
         request: &TrainRequest,
         job_dir: &Path,
