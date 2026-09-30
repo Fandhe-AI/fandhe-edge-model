@@ -315,6 +315,13 @@ mod suite {
         );
     }
 
+    /// REQ-17: 凍結記録が無いまま空の評価データがあっても `inspect` は拒否する（fail-closed）。
+    pub fn inspect_rejects_empty_evaluation_data_without_freeze_record() {
+        let env = registered("evalempty", false);
+        std::fs::write(env.project_file("data/evaluation.jsonl"), "").expect("write empty");
+        env.fails(&["inspect", "--project-dir", "proj"], 64, "invalid_input");
+    }
+
     /// REQ-33: 前工程が済んでいない場合は次工程が失敗する（固定メッセージ・パスを含まない）。
     pub fn stages_require_their_predecessors() {
         let env = registered("order", false);
@@ -531,6 +538,10 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_stops_on_frozen_hash_mismatch",
             suite::evaluate_stops_on_frozen_hash_mismatch,
+        ),
+        (
+            "inspect_rejects_empty_evaluation_data_without_freeze_record",
+            suite::inspect_rejects_empty_evaluation_data_without_freeze_record,
         ),
         (
             "stages_require_their_predecessors",

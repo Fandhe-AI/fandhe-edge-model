@@ -13,7 +13,9 @@
 //!
 //! `package` 工程の [`PackageReport`] のほか、TASK-33.1-2（#136）で `register`・`inspect`・
 //! `train`・`select` の完了結果（[`RegisterReport`]・[`InspectStageReport`]・[`TrainReport`]・
-//! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。`package` 工程の [`PackageReport`] が中心で、フィールドは PoC-16 の package 工程の
+//! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。
+//!
+//! `package` 工程の [`PackageReport`] のフィールドは PoC-16 の package 工程の
 //! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に揃えた最小集合で、
 //! パス・データ本文・計測値は載せない（security.md。容量・p95 等の追加は各結線
 //! TASK で main が判断する入出力契約の変更）。加えて `evaluate` 工程の評価データ

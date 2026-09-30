@@ -108,7 +108,11 @@ pub(crate) fn load_evaluation_bytes(project: &Project) -> Result<Option<Vec<u8>>
         let bytes = project.read_optional(&data_rel, MAX_PROJECT_FILE_BYTES)?;
         return match bytes {
             None => Ok(None),
-            Some(b) => evaluate_start(&EvalDataState::NotProvided, &b).map(|_| Some(b)),
+            Some(b) => {
+                // 凍結記録が無い状態の評価データは、空ファイルを含め評価データありとして扱わない。
+                evaluate_start(&EvalDataState::NotProvided, &b)?;
+                Err(invalid("freeze record is missing"))
+            }
         };
     };
     let text =
