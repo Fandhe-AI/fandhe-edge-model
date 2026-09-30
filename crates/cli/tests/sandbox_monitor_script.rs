@@ -1432,3 +1432,73 @@ fn req38_control_override_flags_must_be_bool() {
         has(&o, "\"positive_control\": \"not_evaluated\"");
     }
 }
+/// 陽性対照と同じ PID でも、イベント時刻が対照の実行区間の外なら陽性対照にしない
+/// （PID 再利用で別プロセスの拒否が tool・unattributed から消えない。REQ-38・TASK-38.2・#164）。
+#[test]
+fn req38_report_control_pid_outside_control_window_is_not_positive_control() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    let line = |ts: &str| format!("{{\"eventMessage\":\"{MDNS_DENY}\",\"timestamp\":\"{ts}\"}}\n");
+    // 対照の区間は T0（= 2026-01-01 09:00:00+0900）。区間内 1 件と、5 分後の同じ PID 1 件
+    let body = format!(
+        "{header}\n{}{}",
+        line("2026-01-01 09:00:00.500000+0900"),
+        line("2026-01-01 09:05:00.000000+0900"),
+    );
+    let stream = e.dir.join("pc_ts_stream.ndjson");
+    fs::write(&stream, body).expect("write");
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"positive_control\": \"detected\"");
+    has(&o, "\"positive_control_network_deny_events\": 1");
+    has(&o, "\"unattributed_network_deny_events\": 1");
+}
+
+/// timestamp が文字列でない・形式外のイベントは判定不能 70（fail-closed）。
+#[test]
+fn req38_report_invalid_event_timestamp_is_undeterminable() {
+    let e = Env::new();
+    let header = fs::read_to_string(fixture("clean.ndjson")).expect("fixture");
+    let header = header.lines().next().expect("header").to_string();
+    for ts in ["\"yesterday\"", "12345"] {
+        let body = format!("{header}\n{{\"eventMessage\":\"{MDNS_DENY}\",\"timestamp\":{ts}}}\n");
+        let stream = e.dir.join("pc_bad_ts.ndjson");
+        fs::write(&stream, body).expect("write");
+        let o = run_report_control(
+            &e.dir,
+            &stream,
+            &meta_with_pids(0, T1, T2, "[5001]"),
+            &control_meta("4242", "6", T0, T0),
+        );
+        assert_eq!(o.code, Some(70), "{ts}: {}", o.stdout);
+        has(&o, "log stream event timestamp is invalid");
+    }
+}
+
+/// curl・launcher の上書きは、stream-overflow で早期に打ち切られる経路でも
+/// `evidence_hint` を test_harness にする（契約: curl override はすべて test_harness）。
+#[test]
+fn req38_control_override_hint_survives_early_abort() {
+    let e = Env::new();
+    let stream = write_stream(&e.dir, &[MDNS_DENY]);
+    let control_path = e.dir.join("positive_control.meta.json");
+    fs::write(&control_path, control_meta_flags("true", "false")).expect("control meta");
+    let o = run_report_extra(
+        &e.dir,
+        &stream,
+        Some(&meta_with_pids(0, T1, T2, "[5001]")),
+        &[
+            "--positive-control-meta",
+            control_path.to_str().expect("utf8"),
+            "--stream-overflow",
+        ],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "\"evidence_hint\": \"test_harness\"");
+}

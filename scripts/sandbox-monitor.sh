@@ -280,6 +280,7 @@ utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 logpid=
 wd=
+control_pid=
 # 終了時の後始末。log と監視役が残っていれば KILL する
 cleanup() {
     if [ -n "$logpid" ]; then
@@ -287,6 +288,11 @@ cleanup() {
     fi
     if [ -n "$wd" ]; then
         kill -s KILL -- "-$wd" 2>/dev/null || true
+    fi
+    # 陽性対照の curl（独立プロセスグループ）も残さない。待機中の TERM/INT/HUP で monitor より
+    # 長く生き残り、sandbox が無効なら対照 URL へ接続しうるため（REQ-38・REQ-39）
+    if [ -n "$control_pid" ]; then
+        kill -s KILL -- "-$control_pid" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -366,11 +372,13 @@ if log_alive "$control_pid"; then
 fi
 control_rc=0
 wait "$control_pid" 2>/dev/null || control_rc=$?
+control_pid_recorded=$control_pid
+control_pid=
 control_ended=$(utc_now)
 [ "$control_timeout" -eq 0 ] \
     || fail 70 runtime_error "positive control did not finish in time; sandbox run was not started"
 if ! printf '{"pid":%s,"exit_code":%s,"started_utc":"%s","ended_utc":"%s","curl_override":%s,"sandbox_exec_override":%s}\n' \
-    "$control_pid" "$control_rc" "$control_started" "$control_ended" "$curl_override" "$launcher_override" \
+    "$control_pid_recorded" "$control_rc" "$control_started" "$control_ended" "$curl_override" "$launcher_override" \
     >"$control_meta_file" 2>/dev/null; then
     fail 70 runtime_error "cannot write positive control record"
 fi
