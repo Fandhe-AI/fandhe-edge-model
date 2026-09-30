@@ -25,6 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
 use fandhe_edge_data::split::Split;
@@ -36,7 +37,7 @@ use crate::args::SelectArgs;
 use crate::error_report::default_message;
 use crate::project::{Project, SELECTION_FILE, fail, invalid, runtime};
 
-use super::train::{load_trained, resolve_candidates, verified_split};
+use super::train::{load_trained, request_matches_candidate, resolve_candidates, verified_split};
 
 /// `select` を実行する。
 ///
@@ -51,7 +52,32 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         return Err(crate::project::invalid("selection record already exists"));
     }
     let definition = project.load_definition()?;
-    let records = project.load_records(&definition)?;
+    let Some(record) = compute_selection(&project, &definition)? else {
+        return Err(fail(ExitCode::Pending, default_message(ExitCode::Pending)));
+    };
+    let json = record
+        .to_json_vec()
+        .map_err(|_| runtime("cannot serialize selection record"))?;
+    project.write_new(SELECTION_FILE, &json)?;
+    Ok(SelectReport::new(
+        record.candidate_index,
+        record.candidate_id,
+    ))
+}
+
+/// 保存済みの候補結果と分割データから、選定結果を計算する（`select` の記録と、`package` の
+/// 記録の再検証が同じ関数を使う。選定ロジックを複製しない。REQ-27）。
+///
+/// 選定は validation のみで行い、凍結した最終 test・評価データは使わない。学習済みの候補が無ければ
+/// `None`（`select` は `pending`）。
+///
+/// # Errors
+/// 分割記録・保存済みリクエストの不整合は `invalid_input`、採点失敗は `runtime_error`。
+pub fn compute_selection(
+    project: &Project,
+    definition: &Definition,
+) -> Result<Option<SelectionRecord>, ErrorReport> {
+    let records = project.load_records(definition)?;
     let gold: BTreeMap<&str, &str> = records
         .iter()
         .map(|r| (r.id.as_str(), r.label_id.as_str()))
@@ -59,23 +85,28 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     // 分割記録をデータから再現して照合し、選定に使う validation 集合を記録側から決める。
     // 保存済みの `request.json` の validation を信用すると、記録の改変で任意の部分集合の
     // 正解率により候補を選べてしまう（REQ-27）。
-    let split = verified_split(&project, &records)?;
+    let split = verified_split(project, &records)?;
     let expected_validation: BTreeMap<&str, &str> = records
         .iter()
         .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
         .map(|r| (r.id.as_str(), r.input.as_str()))
         .collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
-    let candidates = resolve_candidates(&project, &definition, 0)?;
+    let candidates = resolve_candidates(project, definition, 0)?;
 
     let mut evaluated = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let Some((request, outcome)) = load_trained(&project, index)? else {
+        let Some((request, outcome)) = load_trained(project, index)? else {
             continue;
         };
         let TrainOutcome::Ok(success) = &outcome else {
             continue;
         };
+        // 保存済みのリクエストが既定候補 N の種類・構成と一致すること（別の種類の学習結果を
+        // 候補 N として採点しない。記録の差し替え対策。REQ-27）。
+        if !request_matches_candidate(&request, &candidate.params) {
+            return Err(invalid("train request does not match the candidate"));
+        }
         let inputs = request
             .validation_inputs()
             .ok_or_else(|| runtime("train result has no validation inputs"))?;
@@ -116,21 +147,16 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         ..
     } = decision
     else {
-        return Err(fail(ExitCode::Pending, default_message(ExitCode::Pending)));
+        return Ok(None);
     };
     let Some((index, _, _)) = evaluated.iter().find(|(_, id, _)| *id == candidate_id) else {
         return Err(runtime("selected candidate is not evaluated"));
     };
-    let record = SelectionRecord {
+    Ok(Some(SelectionRecord {
         candidate_index: *index,
-        candidate_id: candidate_id.clone(),
+        candidate_id,
         rule,
         validation_correct: accuracy.correct,
         validation_total: accuracy.total,
-    };
-    let json = record
-        .to_json_vec()
-        .map_err(|_| runtime("cannot serialize selection record"))?;
-    project.write_new(SELECTION_FILE, &json)?;
-    Ok(SelectReport::new(*index, candidate_id))
+    }))
 }

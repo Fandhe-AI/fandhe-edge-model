@@ -34,7 +34,7 @@ use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candida
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
 use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
 use fandhe_edge_train::request::{
-    Device, TrainRequest, ValidationInput, label_order_from_definition,
+    Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchCandidate;
@@ -237,4 +237,24 @@ pub fn load_trained(
     let outcome = TrainOutcome::from_worker_stdout(&result_bytes, &request)
         .map_err(|e| e.to_error_report())?;
     Ok(Some((request, outcome)))
+}
+
+/// 保存済みの学習リクエストが、既定候補 `params` から作られたものと同じ種類・構成かを返す
+/// （`select`・`package` が、別の種類の学習結果を候補 N として扱わないための照合。REQ-27・REQ-39）。
+///
+/// 比べるのは `kind`・`kind_version`・`label_order`・`max_bytes`・`seed` と、`epochs` を除く
+/// `config`。`epochs` は `train --smoke` が 1 へ上書きする唯一の項目のため除く。`root`・出力先・
+/// 制限値は実行環境ごとの値なので比べない。
+#[must_use]
+pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestParams) -> bool {
+    request.kind() == params.kind
+        && request.kind_version() == params.kind_version
+        && request.label_order().as_slice() == params.label_order.as_slice()
+        && request.max_bytes() == params.max_bytes
+        && request.seed() == params.seed
+        && request
+            .config()
+            .iter()
+            .filter(|(k, _)| k.as_str() != "epochs")
+            .eq(params.config.iter().filter(|(k, _)| k.as_str() != "epochs"))
 }

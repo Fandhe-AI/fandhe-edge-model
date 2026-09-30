@@ -50,7 +50,8 @@ use crate::project::{
     invalid, parse_definition, runtime,
 };
 
-use super::train::{load_trained, resolve_candidates};
+use super::select::compute_selection;
+use super::train::{load_trained, request_matches_candidate, resolve_candidates};
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
 const ARTIFACT_META_FILE: &str = "artifact.json";
@@ -74,6 +75,12 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let definition = parse_definition(&definition_bytes)?;
     // 選定記録の `candidate_index` だけで学習結果を読まず、その添字の既定候補の ID・kind が
     // 記録と一致することを確認する（別の候補を配布しない。REQ-27・REQ-39）。
+    // 記録された選定結果を信じず、`select` と同じ関数で保存済みの候補結果・分割データから
+    // 選定をやり直し、記録と完全一致することを確認する（記録の改変対策。validation のみを使い、
+    // 凍結 test には触れない。REQ-27）。
+    if compute_selection(&project, &definition)?.as_ref() != Some(&selection) {
+        return Err(invalid("selection record does not match the candidate"));
+    }
     let candidates = resolve_candidates(&project, &definition, selection.candidate_index)?;
     let candidate = candidates
         .get(selection.candidate_index)
@@ -81,9 +88,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         .ok_or_else(|| invalid("selection record does not match the candidate"))?;
     let (request, outcome) = load_trained(&project, selection.candidate_index)?
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
-    if request.kind() != candidate.params.kind
-        || request.kind_version() != candidate.params.kind_version
-    {
+    if !request_matches_candidate(&request, &candidate.params) {
         return Err(invalid("selection record does not match the candidate"));
     }
     let TrainOutcome::Ok(success) = &outcome else {
@@ -110,7 +115,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
-    check_meta_consistency(&meta, &definition, request.kind(), request.max_bytes())?;
+    check_meta_consistency(
+        &meta,
+        &definition,
+        request.kind(),
+        request.kind_version(),
+        request.max_bytes(),
+    )?;
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -205,6 +216,7 @@ fn check_meta_consistency(
     meta: &ArtifactMeta,
     definition: &Definition,
     trained_kind: &str,
+    trained_kind_version: u32,
     trained_max_bytes: u32,
 ) -> Result<(), ErrorReport> {
     KindAllowlist::supported()
@@ -213,6 +225,11 @@ fn check_meta_consistency(
     if meta.kind() != trained_kind {
         return Err(invalid(
             "artifact kind does not match the selected candidate",
+        ));
+    }
+    if meta.kind_version() != trained_kind_version {
+        return Err(invalid(
+            "artifact kind_version does not match the selected candidate",
         ));
     }
     let option_ids = definition.options().iter().map(|c| c.id.as_str());

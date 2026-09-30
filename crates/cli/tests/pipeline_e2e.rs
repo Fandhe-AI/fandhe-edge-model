@@ -612,6 +612,75 @@ mod suite {
         env.ok(&["select", "--project-dir", "proj"]);
     }
 
+    /// REQ-27: `select` は保存済みの学習リクエストが既定候補 N の種類・構成と一致しなければ、
+    /// 採点せず `invalid_input` で止める（別の構成の学習結果を候補 N として選ばない）。
+    pub fn select_rejects_request_not_matching_default_candidate() {
+        let env = inspected("selcand");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let request = env.project_file("candidates/0/request.json");
+        let original = std::fs::read_to_string(&request).expect("request.json");
+        assert!(original.contains("\"seed\":42"), "{original}");
+        std::fs::write(&request, original.replace("\"seed\":42", "\"seed\":43"))
+            .expect("tamper request");
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+        std::fs::write(&request, original).expect("restore");
+        env.ok(&["select", "--project-dir", "proj"]);
+    }
+
+    /// REQ-27・REQ-39: `package` は選定記録を信じず選定をやり直し、記録の候補 ID・添字を別の学習済み
+    /// 候補へ書き換えると `invalid_input`（64）で止まり、`package/` もステージングも作らない。
+    pub fn package_rejects_selection_record_rewritten_to_other_candidate() {
+        let env = inspected("pkgrewrite");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let record = env.project_file("selection_record.json");
+        let c1_record = std::fs::read_to_string(&record).expect("record of c1");
+        assert!(c1_record.contains("\"candidate_index\":0"), "{c1_record}");
+        std::fs::remove_file(&record).expect("remove record");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let c3_record = std::fs::read_to_string(&record).expect("record of c3");
+        assert!(c3_record.contains("\"candidate_index\":1"), "{c3_record}");
+        // 実際の選定は候補 1（c3）。記録を候補 0（c1、学習済み）へ書き換える。
+        std::fs::write(&record, &c1_record).expect("rewrite record");
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record does not match the candidate\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+        std::fs::write(&record, &c3_record).expect("restore record");
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
+    /// REQ-39: `artifact.json` の `kind_version` が選定候補の学習リクエストと食い違うと、公開前に
+    /// `invalid_input`（64）で止まり `package/` を作らない。
+    pub fn package_rejects_artifact_kind_version_mismatch() {
+        let env = inspected("pkgkv");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let original = std::fs::read_to_string(&meta).expect("artifact.json");
+        assert!(original.contains("\"kind_version\":1"), "{original}");
+        std::fs::write(
+            &meta,
+            original.replace("\"kind_version\":1", "\"kind_version\":2"),
+        )
+        .expect("tamper");
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"artifact kind_version does not match the selected candidate\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+        std::fs::write(&meta, original).expect("restore");
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
     /// REQ-27・REQ-32・REQ-39: `package` は選定記録の候補 ID、`artifact.json` の `label_order`・`kind`
     /// が選定候補・定義と食い違うと、`package/` を残さず拒否する。
     pub fn package_rejects_mismatched_selection_and_metadata() {
@@ -784,6 +853,18 @@ fn main() -> std::process::ExitCode {
         (
             "register_places_evaluation_data_via_write_probe",
             suite::register_places_evaluation_data_via_write_probe,
+        ),
+        (
+            "select_rejects_request_not_matching_default_candidate",
+            suite::select_rejects_request_not_matching_default_candidate,
+        ),
+        (
+            "package_rejects_selection_record_rewritten_to_other_candidate",
+            suite::package_rejects_selection_record_rewritten_to_other_candidate,
+        ),
+        (
+            "package_rejects_artifact_kind_version_mismatch",
+            suite::package_rejects_artifact_kind_version_mismatch,
         ),
         (
             "infer_out_option_is_not_faked",
