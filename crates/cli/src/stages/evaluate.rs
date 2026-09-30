@@ -9,7 +9,7 @@
 //! - 評価データあり: 凍結記録とのハッシュ一致を確認する（不一致は `invalid_input`。fail-closed）。
 //!   一致した後の**評価本体（凍結データでの推論・指標算出・評価完了の結果 JSON 型）は
 //!   未実装**で、`runtime_error`（70）を返す。評価器（`fandhe-edge-eval`）の CLI 結線は
-//!   別 TASK の範囲（REQ-24〜27）。評価が完了したと誤認させないため exit 0 にしない。
+//!   別 Issue（#314）の範囲（REQ-24〜27）。評価完了の記録も #314 で追加し、`package` がそれを確認する。評価が完了したと誤認させないため exit 0 にしない。
 
 use std::path::Path;
 
@@ -40,7 +40,8 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateReport, ErrorRepor
             )),
         };
     }
-    // TODO(評価器の結線 TASK・REQ-24〜27): 凍結した評価データを推論関数（input のみ）へ渡し、
+    // TODO(#314・REQ-24〜27): 評価器へ接続し、評価完了の記録を残す（`package` はその記録を確認する。
+    // 記録が無い間、評価データがあるプロジェクトの `package` は拒否される）。 凍結した評価データを推論関数（input のみ）へ渡し、
     // 指標を算出して評価完了の結果を返す。それまでは評価済みを装わない。
     Err(ErrorReport::new(
         ExitCode::RuntimeError,

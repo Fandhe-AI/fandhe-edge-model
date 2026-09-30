@@ -384,6 +384,25 @@ mod suite {
         assert!(!env.project_file("package.staging").exists());
     }
 
+    /// REQ-17・REQ-27: 評価データがあるプロジェクトは、評価の完了記録が無い（#314 で追加予定）ため、
+    /// register → inspect → train → select の後でも `package` は `invalid_input`（64）で拒否し、
+    /// `package/` もステージングも作らない（評価が未完了のまま配布パッケージを公開しない）。
+    pub fn package_is_rejected_when_evaluation_data_exists_but_not_completed() {
+        let env = eval_env_until(
+            "pkgnoeval",
+            &[
+                &["train", "--project-dir", "proj", "--candidate", "0"],
+                &["select", "--project-dir", "proj"],
+            ],
+        );
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation has not been completed\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
     /// REQ-17: 凍結記録が欠落（評価データだけ残る）していても、後続工程は停止する（fail-closed）。
     pub fn later_stages_stop_when_freeze_record_is_missing() {
         let env = eval_env_until("nofrz", &[]);
@@ -1083,6 +1102,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_artifact_dir_outside_candidate_dir",
             suite::package_rejects_artifact_dir_outside_candidate_dir,
+        ),
+        (
+            "package_is_rejected_when_evaluation_data_exists_but_not_completed",
+            suite::package_is_rejected_when_evaluation_data_exists_but_not_completed,
         ),
         (
             "infer_out_option_is_not_faked",

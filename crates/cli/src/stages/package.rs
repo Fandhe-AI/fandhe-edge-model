@@ -4,7 +4,9 @@
 //! # 手順
 //!
 //! 0. 開始時（ステージングを作る前）に評価データの凍結ハッシュを確認する（不一致・凍結記録の欠落は
-//!    `invalid_input` で停止。[`super::inspect::ensure_evaluation_frozen`]。REQ-17）
+//!    `invalid_input` で停止。REQ-17）。評価データがあるプロジェクトは、評価の完了記録が無い限り
+//!    `invalid_input`（`evaluation has not been completed`）で拒否する。完了記録は未実装のため当面は
+//!    常に拒否する（#314 で evaluate を評価器へ接続し、完了記録を本工程が確認する。REQ-24〜27）
 //! 1. `selection_record.json`（`select` の記録）から選定候補を読み、`request.json`・`result.json`
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
 //!    学習リクエストの `kind` の一致も確認する
@@ -73,8 +75,13 @@ const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 /// I/O 失敗は `runtime_error`（70）。容量の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
 pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
-    // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
-    super::inspect::ensure_evaluation_frozen(&project)?;
+    // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認し（REQ-17）、
+    // 評価データがあるプロジェクトは評価の完了記録が無い限り公開を拒否する（fail-closed。REQ-27）。
+    // TODO(#314・REQ-24〜27): evaluate 工程を評価器へ接続して評価の完了記録を残し、ここでその記録を
+    // 確認する。完了記録の形式がまだ無いため、当面は評価データがあれば常に拒否する（実装済みを装わない）。
+    if super::inspect::load_evaluation_bytes(&project)?.is_some() {
+        return Err(invalid("evaluation has not been completed"));
+    }
     let selection_bytes = project.read(SELECTION_FILE, 64 * 1024)?;
     let selection = SelectionRecord::from_json_slice(&selection_bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
