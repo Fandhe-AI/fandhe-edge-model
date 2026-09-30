@@ -92,6 +92,10 @@ impl Env {
                  [ \"${{FAKE_SANDBOXED:-}}\" = 1 ] || exit 99\n\
                  echo \"$1\" >> \"{}\"\n\
                  if [ \"${{FAKE_FAIL_STAGE:-}}\" = \"$1\" ]; then exit \"${{FAKE_FAIL_RC:-70}}\"; fi\n\
+                 if [ \"$1\" = select ]; then\n\
+                 echo '{{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0}}'\n\
+                 exit 0\n\
+                 fi\n\
                  if [ \"$1\" = infer ]; then\n\
                  echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
                  exit 0\n\

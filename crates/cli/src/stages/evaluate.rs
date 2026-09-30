@@ -19,7 +19,7 @@
 //! - 最終 test の台帳は `final_test_ledger/` 1 つで、**最初の `evaluate` がその時点の学習済み候補を
 //!   すべて事前登録する**（代表構成 ID は `"<candidate_id>:seed<seed>"`。暫定・オーナー確認事項）。
 //!   そのため最初の `evaluate` の後に学習した候補は `invalid_input`
-//!   （`candidate is not registered for evaluation`）になる。**全候補を学習してから評価すること**
+//!   （`candidate is not registered for evaluation`）になる。**全候補を学習し、`select` で選定してから選定候補だけを評価すること**
 //! - `train --smoke` の候補は評価できない（検証専用モデルが本番候補の構成ロックを使い切らないため）
 //!
 //! # 適用権を消費した後はやり直せない
@@ -35,8 +35,14 @@
 //! 記録とモデル・`artifact.json`・評価データ・定義のハッシュの一致を確認してから公開する。
 //! 記録ファイル自体はプロジェクトに書き込める主体なら作り直せる（外部台帳は #168・TASK-39.3-2。
 //! 本工程は検証済みとしない）。評価器のパスベース API は `O_NOFOLLOW` の成分走査をしないため、
-//! 重みは閉じ込めつきで読んだ digest と突き合わせてから使う（パスの解決先の差し替えは完全には
-//! 塞げない。REQ-39）。
+//! 閉じ込めつきで読み検証したバイト列（評価データ・重み）を私用の一時ディレクトリ（0700）へ複製し、
+//! そのパスだけを評価器へ渡す（プロジェクト内のパスを渡さない。REQ-39）。最終 test の台帳
+//! ディレクトリは評価器のパスベース API で開くため、差し替え対策は未了（#168 の範囲）。
+//!
+//! # 選定との順序（REQ-27）
+//!
+//! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
+//! `invalid_input`。最終 test の結果を見てから候補を選べない。
 //!
 //! # 未接続（実装済みを装わない）
 //!
@@ -69,6 +75,7 @@ use fandhe_edge_runtime::pipeline::{
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_train::request::TrainRequest;
 use fandhe_edge_train::result::TrainOutcome;
+use fandhe_edge_train::stage_files::SelectionRecord;
 
 use crate::args::EvaluateArgs;
 use crate::error_report::{
@@ -76,8 +83,8 @@ use crate::error_report::{
 };
 use crate::infer_batch::judgment_from_prediction;
 use crate::project::{
-    DATA_DIR, EVALUATION_DATA_FILE, EVALUATION_RECORD_FILE, FINAL_TEST_LEDGER_DIR, Project, fail,
-    inspect_bytes, invalid, runtime,
+    EVALUATION_RECORD_FILE, FINAL_TEST_LEDGER_DIR, Project, SELECTION_FILE, fail, inspect_bytes,
+    invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -86,6 +93,7 @@ use super::candidate_artifact::{
 };
 use super::infer::load_backend;
 use super::inspect::load_frozen_evaluation;
+use super::select::compute_selection;
 use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
     resolve_candidates, verified_split,
@@ -126,6 +134,9 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         };
     };
     let definition = project.load_definition()?;
+    // 最終 test の結果を見て候補を選び直せないよう、validation による選定（`select`）を先に確定させ、
+    // 選定された候補だけを評価可能にする（REQ-27）。
+    ensure_selected(&project, &definition, args.candidate)?;
     let records = project.load_records(&definition)?;
     let (split, seed) = verified_split(&project, &records)?;
 
@@ -196,10 +207,10 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     }
 
     let applied = apply_to_frozen_data(
-        &project,
         &ledger,
         &freeze,
         &definition,
+        &eval_bytes,
         &target,
         onnx_digest,
     )?;
@@ -243,6 +254,30 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     )
     .map(EvaluateOutcome::Completed)
     .ok_or_else(|| runtime("cannot build evaluation report"))
+}
+
+/// `select` の記録があり、保存済みの結果から再計算した選定と一致し、対象候補が選定された候補で
+/// あることを確認する（`package` と同じ再検証。選定ロジックを複製しない。REQ-27）。
+///
+/// # Errors
+/// 選定記録が無い・不正・再計算と不一致・対象候補が選定された候補でない場合は `invalid_input`。
+fn ensure_selected(
+    project: &Project,
+    definition: &Definition,
+    candidate: usize,
+) -> Result<(), ErrorReport> {
+    let Some(bytes) = project.read_optional(SELECTION_FILE, 64 * 1024)? else {
+        return Err(invalid("candidate selection has not been recorded"));
+    };
+    let selection = SelectionRecord::from_json_slice(&bytes)
+        .map_err(|_| invalid("selection record is invalid"))?;
+    if compute_selection(project, definition)?.as_ref() != Some(&selection) {
+        return Err(invalid("selection record does not match the candidate"));
+    }
+    if selection.candidate_index != candidate {
+        return Err(invalid("candidate is not the selected candidate"));
+    }
+    Ok(())
 }
 
 /// 候補 `index` の学習結果を検証して、評価に使える形にする（評価できない候補は `None`）。
@@ -318,7 +353,13 @@ fn check_candidate_artifact(
 /// 最終 test の台帳ディレクトリを（無ければ 0700 で作って）開く。
 fn open_ledger(project: &Project) -> Result<FinalTestLedger, ErrorReport> {
     if !project.exists(FINAL_TEST_LEDGER_DIR)? {
-        project.create_dir(FINAL_TEST_LEDGER_DIR)?;
+        // 最初の `evaluate` が同時に走ると後発の作成は「既存」で失敗する。作成に失敗しても
+        // 既にディレクトリがあれば（先行プロセスが作った）開き直す。
+        if let Err(e) = project.create_dir(FINAL_TEST_LEDGER_DIR)
+            && !project.exists(FINAL_TEST_LEDGER_DIR)?
+        {
+            return Err(e);
+        }
     }
     FinalTestLedger::open(&project.path(FINAL_TEST_LEDGER_DIR))
         .map_err(|e| acquire_error_report(&e))
@@ -371,15 +412,19 @@ fn decode_evaluation(
 
 /// 台帳で適用権を取り、凍結した評価データへ 1 回だけ推論を当てる。
 fn apply_to_frozen_data(
-    project: &Project,
     ledger: &FinalTestLedger,
     freeze: &FreezeRecord,
     definition: &Definition,
+    eval_bytes: &[u8],
     target: &PreparedCandidate,
     onnx_digest: Sha256Digest,
 ) -> Result<fandhe_edge_eval::final_test_once::AppliedOnce<Vec<Outcome>>, ErrorReport> {
-    let eval_path = project.path(Path::new(DATA_DIR).join(EVALUATION_DATA_FILE));
-    let weights_path = project.path(&target.artifact.onnx_rel);
+    // 評価器はパスから開き直すため、閉じ込めつきで読み検証済みのバイト列を、この実行だけの
+    // 私用ディレクトリ（0700・新規作成）へ複製し、そのパスを渡す。プロジェクト内のパスを渡すと、
+    // 検証後に symlink へ差し替えられてプロジェクト外を読みうる（REQ-39）。
+    let staged = StagedFiles::create()?;
+    let eval_path = staged.write("evaluation.jsonl", eval_bytes)?;
+    let weights_path = staged.write("model.onnx", &target.artifact.onnx_bytes)?;
     let frozen = FrozenEvalData {
         path: &eval_path,
         sha256: freeze.sha256(),
@@ -440,6 +485,66 @@ fn apply_to_frozen_data(
         },
     )
     .map_err(|e| apply_once_error_report(&e))
+}
+
+/// 評価器へ渡すファイルの私用置き場（OS の一時ディレクトリ配下に 0700 で新規作成し、破棄時に消す）。
+///
+/// 名前は重複しない限り新規作成のみ（既存なら作り直しを試す）で、他者が事前に用意した
+/// ディレクトリを使わない。
+struct StagedFiles {
+    dir: std::path::PathBuf,
+}
+
+impl StagedFiles {
+    fn create() -> Result<Self, ErrorReport> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir();
+        for _ in 0..16 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let name = format!(
+                "fandhe-edge-eval-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let dir = base.join(name);
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(runtime("cannot create staging directory")),
+            }
+        }
+        Err(runtime("cannot create staging directory"))
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, ErrorReport> {
+        use std::io::Write;
+        let path = self.dir.join(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
+            .open(&path)
+            .map_err(|_| runtime("cannot stage evaluation file"))?;
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .map_err(|_| runtime("cannot stage evaluation file"))?;
+        Ok(path)
+    }
+}
+
+impl Drop for StagedFiles {
+    fn drop(&mut self) {
+        // best effort（自分が作った私用ディレクトリだけを消す）。
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// 判定型の `id`（評価ではレコード ID を推論側へ渡さないため固定の占位値を使う。REQ-27）。

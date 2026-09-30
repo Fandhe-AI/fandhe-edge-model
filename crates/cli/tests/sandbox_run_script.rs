@@ -107,6 +107,10 @@ impl Env {
                  printf '%s' \"$FAKE_STAGE_OUT\"\n\
                  exit 0\n\
                  fi\n\
+                 if [ \"$stage\" = select ]; then\n\
+                 printf '{{\"step\":\"select\",\"status\":\"ok\",\"candidate\":%s}}\\n' \"${{FAKE_SELECT_CANDIDATE:-0}}\"\n\
+                 exit 0\n\
+                 fi\n\
                  if [ \"$stage\" = infer ]; then\n\
                  echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
                  exit 0\n\
@@ -281,7 +285,7 @@ fn step_names(stdout: &str) -> Vec<String> {
 }
 
 const ALL_STAGES: [&str; 7] = [
-    "register", "inspect", "train", "evaluate", "select", "package", "infer",
+    "register", "inspect", "train", "select", "evaluate", "package", "infer",
 ];
 
 /// 全工程が偽の launcher 経由で順に完走し exit 0・集計 JSON が ok になる。
@@ -300,15 +304,15 @@ fn req38_all_stages_complete_under_fake_sandbox() {
             "register -",
             "inspect -",
             "train 0",
-            "evaluate 0",
             "select -",
+            "evaluate 0",
             "package -",
             "infer -"
         ]
     );
 }
 
-/// `--candidates 2` で train・evaluate が候補 0・1 の順に 2 回ずつ実行される。
+/// `--candidates 2` で train が候補 0・1 の順に実行され、select の後に選定候補だけが evaluate される（REQ-27）。
 #[test]
 fn req38_candidates_param_runs_each_candidate() {
     let e = Env::new();
@@ -323,9 +327,8 @@ fn req38_candidates_param_runs_each_candidate() {
             "inspect -",
             "train 0",
             "train 1",
-            "evaluate 0",
-            "evaluate 1",
             "select -",
+            "evaluate 0",
             "package -",
             "infer -"
         ]

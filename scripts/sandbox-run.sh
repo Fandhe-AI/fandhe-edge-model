@@ -1,6 +1,6 @@
 #!/bin/sh
 # sandbox（通信遮断）下で `fandhe-edge` の 7 工程
-# （register → inspect → train → evaluate → select → package → infer）を順に実行し、
+# （register → inspect → train → select → evaluate（選定された候補のみ。REQ-27）→ package → infer）を順に実行し、
 # 学習・推論・評価が通信なしで完走することを確認するスクリプト
 # （REQ-38・TASK-38.1-1・#162。手法の出典は PoC-14・PoC-16 の run_vertical.sh /
 # monitored_vertical.sh）。
@@ -64,7 +64,7 @@
 # 学習ワーカーは環境変数 FANDHE_EDGE_TRAINER_DIR（絶対パス）で指す（未設定なら開発ツリーの trainer/）。
 # 経路の閉じ込め（REQ-39）により、--definition・--project-dir は実行時のカレントディレクトリ配下に
 # 置くこと。package の出力先は <project-dir>/package で確定。評価データがあるときの evaluate は
-# 評価本体が未実装のため runtime_error(70) で停止する（評価済みを装わない）。
+# 選定された候補に凍結データを 1 回だけ適用する（#314）。
 set -eu
 
 # 期限監視のプロセスグループ隔離（set -m）と process substitution のため通常モードの
@@ -429,13 +429,22 @@ elif v.get("step") != name:
 elif name == "evaluate" and v.get("status") == "skipped":
     print("skipped")
 elif v.get("status") == "ok":
-    print("ok")
+    if name == "select":
+        # select の出力の candidate（非負整数）を後段の evaluate の対象にする
+        c = v.get("candidate")
+        if isinstance(c, int) and not isinstance(c, bool) and c >= 0:
+            print("ok " + str(c))
+        else:
+            print("invalid")
+    else:
+        print("ok")
 else:
     print("invalid")
 ' "$name" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;
             ok) [ "$name" != "evaluate" ] || status='"ok"' ;;
+            "ok "*) selected_candidate=${verdict#ok } ;;
             *) step_rc=70 ;;
         esac
     fi
@@ -459,7 +468,7 @@ else:
 
 started=$(utc_now)
 
-# 7 工程を順に実行する。途中の失敗で停止する（以降の工程は起動しない。fail-closed）
+# 7 工程を順に実行する（選定を評価より先に行う。REQ-27）。途中の失敗で停止する（以降の工程は起動しない。fail-closed）
 run_all() {
     do_step register - register --definition "$definition" --project-dir "$project_dir" || return 0
     do_step inspect - inspect --project-dir "$project_dir" || return 0
@@ -472,12 +481,11 @@ run_all() {
         fi
         i=$((i + 1))
     done
-    i=0
-    while [ "$i" -lt "$candidates" ]; do
-        do_step evaluate "$i" evaluate --project-dir "$project_dir" --candidate "$i" || return 0
-        i=$((i + 1))
-    done
+    # 最終 test の結果を見て候補を選べないよう、validation による選定（select）を先に確定し、
+    # 選定された候補だけを evaluate する（evaluate は選定記録のない候補を拒否する。REQ-27）
+    selected_candidate=
     do_step select - select --project-dir "$project_dir" || return 0
+    do_step evaluate "$selected_candidate" evaluate --project-dir "$project_dir" --candidate "$selected_candidate" || return 0
     # `--smoke` で短縮学習した候補は、検証専用の `--allow-smoke` を渡さないと package できない
     # （配布用ではない。REQ-27）。
     if [ "$smoke" -eq 1 ]; then

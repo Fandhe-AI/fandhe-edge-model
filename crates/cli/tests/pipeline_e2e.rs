@@ -1006,6 +1006,7 @@ mod suite {
     const EVALUATE_0: [&str; 5] = ["evaluate", "--project-dir", "proj", "--candidate", "0"];
     const EVALUATE_1: [&str; 5] = ["evaluate", "--project-dir", "proj", "--candidate", "1"];
     const PACKAGE: [&str; 3] = ["package", "--project-dir", "proj"];
+    const SELECT: [&str; 3] = ["select", "--project-dir", "proj"];
 
     /// `"key":<number>` の数値（次の `,` または `}` まで）を取り出す。
     fn number_field(json: &str, key: &str) -> f64 {
@@ -1020,37 +1021,39 @@ mod suite {
     }
 
     /// REQ-33・REQ-24・REQ-27: 評価データありで 7 工程がすべて非対話で exit 0 まで完走し、
-    /// `evaluate` は JSON 1 つ（正解率・Macro-F1）と評価完了の記録を残す。
+    /// `evaluate` は JSON 1 つ（正解率・Macro-F1）と評価完了の記録を残す。選定（`select`）が先で、
+    /// 選定前・選定候補以外の `evaluate` は拒否される（REQ-27）。
     pub fn full_pipeline_completes_with_evaluation_data() {
         let env = eval_trained("fullevl");
-        for (index, kind) in [(0, "c1"), (1, "c3")] {
-            let candidate = index.to_string();
-            let out = env.ok(&[
-                "evaluate",
-                "--project-dir",
-                "proj",
-                "--candidate",
-                &candidate,
-            ]);
-            let prefix = format!(
-                "{{\"step\":\"evaluate\",\"status\":\"ok\",\"candidate\":{index},\"kind\":\"{kind}\",\"n_total\":12,\"correct\":"
-            );
-            assert!(out.starts_with(&prefix), "{out}");
-            let correct = number_field(&out, "correct");
-            assert!((0.0..=12.0).contains(&correct), "{out}");
-            assert!(
-                (number_field(&out, "accuracy") - correct / 12.0).abs() < 1e-9,
-                "{out}"
-            );
-            assert!(out.contains("\"macro_f1\":"), "{out}");
-            assert!(
-                env.project_file(&format!("candidates/{index}/evaluation_record.json"))
-                    .is_file()
-            );
-        }
+        // 選定前は、どの候補も最終 test に適用できない。
+        assert_eq!(
+            env.fails(&EVALUATE_1, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate selection has not been recorded\"}\n"
+        );
+        assert!(!env.project_file("final_test_ledger").exists());
         assert_eq!(
             env.ok(&["select", "--project-dir", "proj"]),
             "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+        );
+        // 選定されていない候補は評価できない（台帳にも触れない）。
+        assert_eq!(
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate is not the selected candidate\"}\n"
+        );
+        assert!(!env.project_file("final_test_ledger").exists());
+        let out = env.ok(&EVALUATE_1);
+        let prefix = "{\"step\":\"evaluate\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"n_total\":12,\"correct\":";
+        assert!(out.starts_with(prefix), "{out}");
+        let correct = number_field(&out, "correct");
+        assert!((0.0..=12.0).contains(&correct), "{out}");
+        assert!(
+            (number_field(&out, "accuracy") - correct / 12.0).abs() < 1e-9,
+            "{out}"
+        );
+        assert!(out.contains("\"macro_f1\":"), "{out}");
+        assert!(
+            env.project_file("candidates/1/evaluation_record.json")
+                .is_file()
         );
         assert_eq!(
             env.ok(&PACKAGE),
@@ -1086,17 +1089,18 @@ mod suite {
     /// 評価完了記録の値が実ファイルのハッシュと一致する。
     pub fn evaluate_keeps_model_and_evaluation_hashes() {
         let env = eval_trained("evalhashes");
+        env.ok(&SELECT);
         let files = [
-            "candidates/0/model-c1/model.onnx",
-            "candidates/0/model-c1/artifact.json",
+            "candidates/1/model-c3/model.onnx",
+            "candidates/1/model-c3/artifact.json",
             "data/evaluation.jsonl",
         ];
         let before: Vec<String> = files.iter().map(|f| file_sha256(&env, f)).collect();
-        env.ok(&EVALUATE_0);
+        env.ok(&EVALUATE_1);
         let after: Vec<String> = files.iter().map(|f| file_sha256(&env, f)).collect();
         assert_eq!(before, after);
         let record =
-            std::fs::read_to_string(env.project_file("candidates/0/evaluation_record.json"))
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
                 .expect("record");
         for (key, hash) in [
             ("onnx_sha256", &before[0]),
@@ -1108,16 +1112,15 @@ mod suite {
                 "{key}: {record}"
             );
         }
-        assert!(record.contains("\"config_id\":\"c1:seed42\""), "{record}");
+        assert!(record.contains("\"config_id\":\"c3:seed42\""), "{record}");
     }
 
     /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した
     /// 予測と正解の一致件数に等しい（評価経路と推論経路の全件一致）。
     pub fn evaluate_correct_matches_infer_on_package() {
         let env = eval_trained("evalinfer");
-        env.ok(&EVALUATE_0);
+        env.ok(&SELECT);
         let out = env.ok(&EVALUATE_1);
-        env.ok(&["select", "--project-dir", "proj"]);
         env.ok(&PACKAGE);
         let mut batch = String::new();
         let mut golds = Vec::new();
@@ -1155,42 +1158,66 @@ mod suite {
     /// 記録を消しても、台帳の適用ロックが再適用を拒否する。
     pub fn evaluate_twice_is_rejected() {
         let env = eval_trained("evaltwice");
-        env.ok(&EVALUATE_0);
-        let record_path = env.project_file("candidates/0/evaluation_record.json");
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        let record_path = env.project_file("candidates/1/evaluation_record.json");
         let original = std::fs::read(&record_path).expect("record");
         let expected = "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n";
-        assert_eq!(env.fails(&EVALUATE_0, 64, "invalid_input"), expected);
+        assert_eq!(env.fails(&EVALUATE_1, 64, "invalid_input"), expected);
         assert_eq!(std::fs::read(&record_path).expect("record"), original);
         // 記録ファイルを消しても、台帳のロックが 2 回目の適用を拒否する（記録の削除で回避できない）。
         std::fs::remove_file(&record_path).expect("remove record");
-        assert_eq!(env.fails(&EVALUATE_0, 64, "invalid_input"), expected);
+        assert_eq!(env.fails(&EVALUATE_1, 64, "invalid_input"), expected);
         assert!(!record_path.exists());
     }
 
-    /// REQ-27: 最初の `evaluate` の後に学習した候補は、台帳へ事前登録されていないため評価できない。
-    pub fn evaluate_rejects_candidate_trained_after_registration() {
+    /// REQ-27: 選定後に学習した候補が現れて選定が変わる場合、選定記録と再計算が食い違うため、
+    /// `evaluate` は拒否する（最終 test の適用前に選定を確定させる）。
+    pub fn evaluate_rejects_selection_record_out_of_date() {
         let env = eval_env_until(
             "evalafter",
             &[&["train", "--project-dir", "proj", "--candidate", "0"]],
         );
-        env.ok(&EVALUATE_0);
+        env.ok(&SELECT);
         env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
         assert_eq!(
-            env.fails(&EVALUATE_1, 64, "invalid_input"),
-            "{\"code\":\"invalid_input\",\"message\":\"candidate is not registered for evaluation\"}\n"
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record does not match the candidate\"}\n"
         );
+        assert!(!env.project_file("final_test_ledger").exists());
         assert!(
-            !env.project_file("candidates/1/evaluation_record.json")
+            !env.project_file("candidates/0/evaluation_record.json")
                 .exists()
         );
     }
 
-    /// REQ-27: 未学習の候補と `train --smoke` の候補は評価できず、台帳にロックを作らない。
+    /// REQ-27: 選定記録が別の候補へ書き換えられても、`evaluate` は再計算と不一致で拒否する。
+    pub fn evaluate_rejects_rewritten_selection_record() {
+        let env = eval_trained("evalrewrite");
+        env.ok(&SELECT);
+        let record = env.project_file("selection_record.json");
+        let original = std::fs::read_to_string(&record).expect("selection record");
+        std::fs::write(
+            &record,
+            original
+                .replacen("\"candidate_index\":1", "\"candidate_index\":0", 1)
+                .replacen("\"candidate_id\":\"c3\"", "\"candidate_id\":\"c1\"", 1),
+        )
+        .expect("tamper");
+        assert_eq!(
+            env.fails(&EVALUATE_0, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record does not match the candidate\"}\n"
+        );
+        assert!(!env.project_file("final_test_ledger").exists());
+    }
+
+    /// REQ-27: 未学習の候補は選定できず（`pending`）評価もできない。`train --smoke` の候補は選定できても
+    /// 評価できず、台帳にロックを作らない。
     pub fn evaluate_rejects_untrained_and_smoke_trained_candidates() {
         let env = eval_env_until("evalsmoke", &[]);
         assert_eq!(
             env.fails(&EVALUATE_0, 64, "invalid_input"),
-            "{\"code\":\"invalid_input\",\"message\":\"candidate is not trained\"}\n"
+            "{\"code\":\"invalid_input\",\"message\":\"candidate selection has not been recorded\"}\n"
         );
         env.ok(&[
             "train",
@@ -1200,6 +1227,7 @@ mod suite {
             "0",
             "--smoke",
         ]);
+        env.ok(&SELECT);
         assert_eq!(
             env.fails(&EVALUATE_0, 64, "invalid_input"),
             "{\"code\":\"invalid_input\",\"message\":\"smoke-trained candidate cannot be evaluated\"}\n"
@@ -1211,14 +1239,13 @@ mod suite {
         );
     }
 
-    /// REQ-27: 選定候補が評価済みでなければ、他の候補が評価済みでも `package` は拒否し、
-    /// `package/`・ステージングを作らない。
+    /// REQ-27: 選定候補が評価済みでなければ `package` は拒否し、`package/`・ステージングを作らない
+    /// （選定されていない候補は評価できないため、評価済みの別候補で代替できない）。
     pub fn package_rejects_when_selected_candidate_not_evaluated() {
         let env = eval_trained("pkgselnoeval");
-        env.ok(&EVALUATE_0);
-        // select は validation だけで選ぶため candidate 1（c3）を選ぶ（評価済みは candidate 0 のみ）。
+        // select は validation だけで選ぶため candidate 1（c3）を選ぶ。
         assert_eq!(
-            env.ok(&["select", "--project-dir", "proj"]),
+            env.ok(&SELECT),
             "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
         );
         assert_eq!(
@@ -1233,9 +1260,8 @@ mod suite {
     /// `package` は拒否し `package/` を作らない。元に戻せば成功する。
     pub fn package_rejects_tampered_evaluation_record() {
         let env = eval_trained("pkgtamper");
-        env.ok(&EVALUATE_0);
+        env.ok(&SELECT);
         env.ok(&EVALUATE_1);
-        env.ok(&["select", "--project-dir", "proj"]);
         let record_path = env.project_file("candidates/1/evaluation_record.json");
         let original = std::fs::read_to_string(&record_path).expect("record");
         let mismatch = "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n";
@@ -1381,8 +1407,12 @@ fn main() -> std::process::ExitCode {
             suite::evaluate_twice_is_rejected,
         ),
         (
-            "evaluate_rejects_candidate_trained_after_registration",
-            suite::evaluate_rejects_candidate_trained_after_registration,
+            "evaluate_rejects_selection_record_out_of_date",
+            suite::evaluate_rejects_selection_record_out_of_date,
+        ),
+        (
+            "evaluate_rejects_rewritten_selection_record",
+            suite::evaluate_rejects_rewritten_selection_record,
         ),
         (
             "evaluate_rejects_untrained_and_smoke_trained_candidates",

@@ -8,7 +8,7 @@
 //! からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得て、`artifact_dir` は文字列の前方一致でなく
 //! 候補ディレクトリからの相対パスとして求める（学習結果の差し替えで候補の外を読まない。REQ-39）。
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::Definition;
@@ -37,8 +37,6 @@ pub(crate) struct CandidateArtifact {
     pub onnx_bytes: Vec<u8>,
     /// ONNX のファイル名（単一の通常の名前であることを確認済み）。
     pub onnx_file: String,
-    /// ONNX のプロジェクト内の相対パス（`Project::path` へ渡す。評価器のパスベース API 用）。
-    pub onnx_rel: PathBuf,
 }
 
 /// 候補 `index` の成果物を閉じ込めつきで読み、メタデータと ONNX の自己整合性を確認する。
@@ -79,7 +77,6 @@ pub(crate) fn load_candidate_artifact(
         meta,
         onnx_bytes,
         onnx_file: onnx_file.to_string(),
-        onnx_rel: candidate_rel(index).join(&artifact_rel).join(onnx_file),
     })
 }
 
