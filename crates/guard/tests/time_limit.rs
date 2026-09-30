@@ -29,6 +29,18 @@ fn child_entry() {
                 println!("{line}");
             }
         }
+        "spew" => {
+            // 期限まで出力し続ける。kill されなくても 20 秒で自走終了する（テストの暴走防止）。
+            use std::io::Write;
+            let chunk = [b'x'; 8192];
+            let stop = std::time::Instant::now() + Duration::from_secs(20);
+            let mut out = std::io::stdout();
+            while std::time::Instant::now() < stop {
+                if out.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -127,5 +139,25 @@ fn req39_grandchild_holding_pipe_does_not_block_runner() {
     let started = std::time::Instant::now();
     let outcome = run_with_limits(&cmd, &config(Duration::from_millis(300))).unwrap();
     assert!(matches!(outcome, GuardedRunOutcome::LimitExceeded(_)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// REQ-39: 子が出力し続けても、監視ループが期限を判定して kill する（pump が EOF まで居座らない）。
+#[cfg(unix)]
+#[test]
+fn req39_continuous_output_does_not_bypass_time_limit() {
+    let cfg = RunConfig::new(
+        TimeLimit::new(Duration::from_millis(500)).unwrap(),
+        1024 * 1024,
+        64 * 1024,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let outcome = run_with_limits(&child("spew"), &cfg).unwrap();
+    let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
+        panic!("expected LimitExceeded");
+    };
+    assert_eq!(rec.kind(), ResourceKind::Time);
+    assert!(rec.child_reaped());
     assert!(started.elapsed() < Duration::from_secs(5));
 }

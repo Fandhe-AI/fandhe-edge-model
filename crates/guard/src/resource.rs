@@ -561,6 +561,9 @@ mod reader {
     pub trait Source: Into<OwnedFd> {}
     impl<T: Into<OwnedFd>> Source for T {}
 
+    /// `pump` 1 回あたりに読む最大バイト数。
+    const PUMP_BUDGET_BYTES: usize = 64 * 1024;
+
     pub struct Reader {
         file: File,
         buf: Vec<u8>,
@@ -588,10 +591,14 @@ mod reader {
         }
 
         /// 読める分だけ読む。進捗（1 バイト以上）があれば true。超過分は読み捨てて drain する。
+        ///
+        /// 1 回の呼び出しで読む量は `PUMP_BUDGET_BYTES` までに制限する。子が出力し続けても
+        /// 必ず監視ループへ戻り、期限判定と kill が走るようにするため（REQ-39）。
         pub fn pump(&mut self) -> bool {
             let mut progressed = false;
             let mut scratch = [0u8; 8192];
-            while !self.eof {
+            let mut budget = PUMP_BUDGET_BYTES;
+            while !self.eof && budget > 0 {
                 let n = match self.file.read(&mut scratch) {
                     Ok(0) => {
                         self.eof = true;
@@ -606,6 +613,7 @@ mod reader {
                     }
                 };
                 progressed = true;
+                budget = budget.saturating_sub(n);
                 let take = self.cap.saturating_sub(self.buf.len()).min(n);
                 if let Some(chunk) = scratch.get(..take) {
                     self.buf.extend_from_slice(chunk);
@@ -629,6 +637,44 @@ mod reader {
             }
             (self.buf, self.truncated || !self.eof)
         }
+    }
+    /// REQ-39: 書き手が出力し続けても 1 回の `pump` は上限量で返る（監視ループへ制御を戻す）。
+    #[cfg(test)]
+    #[test]
+    fn req39_pump_returns_after_bounded_read_under_continuous_output() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut writer, read_end) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let chunk = [b'x'; 8192];
+            while !stop_w.load(Ordering::Relaxed) {
+                let _ = writer.write(&chunk);
+            }
+        });
+        // 書き手がソケットバッファを満たすまで待ち、1 回で読み切れない状態にする。
+        thread::sleep(Duration::from_millis(200));
+        let mut reader = Reader::new(read_end, usize::MAX).unwrap();
+        assert!(reader.pump());
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        // 上限量に達した時点で返る（最後の 1 読み分の超過のみ許容）。
+        assert!(
+            reader.buf.len() >= PUMP_BUDGET_BYTES,
+            "read {}",
+            reader.buf.len()
+        );
+        assert!(
+            reader.buf.len() < PUMP_BUDGET_BYTES + 8192,
+            "read {}",
+            reader.buf.len()
+        );
+        assert!(!reader.eof);
     }
 }
 
