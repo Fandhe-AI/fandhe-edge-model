@@ -536,7 +536,14 @@ impl Default for RunConfig {
             time_limit: TimeLimit::infer_default(),
             stdout_cap: DEFAULT_STDOUT_CAP,
             stderr_cap: DEFAULT_STDERR_CAP,
-            memory_limit: Some(MemoryLimit::infer_default()),
+            // 計測手段のある OS（Linux・macOS）だけメモリ上限を既定で有効にする。
+            // それ以外で有効にすると `run_with_limits` が常に起動前拒否になり、
+            // 既存の既定設定が使えなくなるため、時間上限のみの既定にする。
+            memory_limit: if cfg!(any(target_os = "linux", target_os = "macos")) {
+                Some(MemoryLimit::infer_default())
+            } else {
+                None
+            },
         }
     }
 }
@@ -649,6 +656,23 @@ pub(crate) fn parse_ps_rss(text: &str) -> Result<Option<u64>, ProbeError> {
     kb.checked_mul(1024).map(Some).ok_or(ProbeError)
 }
 
+/// `ps` の終了状態と出力から RSS 計測の結果を決める。
+///
+/// 成功終了は出力を解釈する（空ならプロセス不在）。`ps -p` は該当プロセスが無いとき
+/// 空出力で終了コード 1 を返すため、その組だけを不在（`Ok(None)`）として扱う。
+/// それ以外の非 0 終了・シグナル終了は計測失敗で、不在と区別して fail-closed にする。
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn classify_ps_result(
+    exit_code: Option<i32>,
+    text: &str,
+) -> Result<Option<u64>, ProbeError> {
+    match exit_code {
+        Some(0) => parse_ps_rss(text),
+        Some(1) if text.trim().is_empty() => Ok(None),
+        _ => Err(ProbeError),
+    }
+}
+
 /// 実プロセスの RSS 計測。Linux は `/proc`、macOS は `/bin/ps`（PoC-20 と同じ）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SystemRssProbe;
@@ -695,9 +719,9 @@ impl RssProbe for SystemRssProbe {
             .spawn()
             .map_err(|_| ProbeError)?;
         let give_up = Instant::now() + PROBE_TIMEOUT;
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => {
@@ -712,7 +736,7 @@ impl RssProbe for SystemRssProbe {
                 return Err(ProbeError);
             }
             thread::sleep(Duration::from_millis(2));
-        }
+        };
         let mut bytes = Vec::new();
         if let Some(out) = child.stdout.take() {
             out.take(PS_READ_CAP)
@@ -720,7 +744,7 @@ impl RssProbe for SystemRssProbe {
                 .map_err(|_| ProbeError)?;
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| ProbeError)?;
-        parse_ps_rss(text)
+        classify_ps_result(status.code(), text)
     }
 }
 
@@ -820,7 +844,17 @@ pub(crate) fn monitor_with_memory<C: ChildControl, K: Clock>(
                     if due {
                         last_probe = Some(now);
                         // 直前の try_wait が未終了を返した直接の子だけに計測する（pid 再利用の防止）。
-                        match probe.rss_bytes(child.id()) {
+                        let probed = probe.rss_bytes(child.id());
+                        // 計測（macOS の `ps` は最大 1 秒かかる）の間に期限へ達していたら、
+                        // 計測結果によらず時間超過を優先する（REQ-39）。
+                        if clock.now() >= deadline {
+                            kill_and_reap(child, clock)?;
+                            return Ok(MonitorEnd::TimedOut {
+                                elapsed: clock.now().saturating_duration_since(start),
+                                reaped: true,
+                            });
+                        }
+                        match probed {
                             Ok(Some(rss)) if rss > mem_limit.get() => {
                                 kill_and_reap(child, clock)?;
                                 return Ok(MonitorEnd::MemoryExceeded {
@@ -1722,6 +1756,56 @@ mod tests {
         assert_eq!(probe.calls, 0);
     }
 
+    /// 計測中に時計を進める RSS 計測の偽物（`ps` の遅延を模す）。
+    struct SlowProbe<'a> {
+        clock: &'a FakeClock,
+        delay: Duration,
+        result: Result<Option<u64>, ProbeError>,
+    }
+
+    impl RssProbe for SlowProbe<'_> {
+        fn rss_bytes(&mut self, _pid: u32) -> Result<Option<u64>, ProbeError> {
+            self.clock.sleep(self.delay);
+            self.result
+        }
+    }
+
+    /// REQ-39: 計測の最中に期限へ達し、RSS も超過していても時間超過を優先する。
+    #[test]
+    fn req39_deadline_reached_during_probe_is_time_limit() {
+        for result in [Ok(Some(3 * GIB)), Err(ProbeError)] {
+            let clock = FakeClock::new();
+            let mut child = fake(&clock, vec![Ok(None), Ok(Some(9))], 0);
+            let mut probe = SlowProbe {
+                clock: &clock,
+                delay: INFER_TIME_LIMIT + Duration::from_secs(1),
+                result,
+            };
+            let end = monitor_with_memory(
+                &mut child,
+                &clock,
+                clock.now(),
+                INFER_TIME_LIMIT,
+                &mut || false,
+                Some((&mut probe, MemoryLimit::infer_default())),
+            )
+            .unwrap();
+            assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
+            assert_eq!(child.kill_calls.get(), 1);
+        }
+    }
+
+    /// REQ-39: `ps` の終了状態を見て、不在（空出力・終了コード 1）と計測失敗を区別する。
+    #[test]
+    fn req39_classify_ps_result() {
+        assert_eq!(classify_ps_result(Some(0), "  2048\n"), Ok(Some(2_097_152)));
+        assert_eq!(classify_ps_result(Some(0), ""), Ok(None));
+        assert_eq!(classify_ps_result(Some(1), ""), Ok(None));
+        assert_eq!(classify_ps_result(Some(1), "2048\n"), Err(ProbeError));
+        assert_eq!(classify_ps_result(Some(2), ""), Err(ProbeError));
+        assert_eq!(classify_ps_result(None, ""), Err(ProbeError));
+    }
+
     /// REQ-39: メモリ上限は 0 と暫定上限超を拒否し（64）、ちょうどは受理する。
     #[test]
     fn req39_memory_limit_bounds() {
@@ -1750,10 +1834,16 @@ mod tests {
         );
     }
 
-    /// REQ-39: 既定設定は 2 GiB のメモリ上限を持ち、`RunConfig::new` は持たない。
+    /// REQ-39: 既定設定は計測手段のある OS で 2 GiB のメモリ上限を持ち、それ以外では持たない
+    /// （`run_with_limits` が常に拒否する既定にしない）。`RunConfig::new` は持たない。
     #[test]
     fn req39_default_config_has_2gib_memory_limit() {
-        assert_eq!(RunConfig::default().memory_limit(), Some(2_147_483_648));
+        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            Some(2_147_483_648)
+        } else {
+            None
+        };
+        assert_eq!(RunConfig::default().memory_limit(), expected);
         let t = TimeLimit::infer_default();
         assert_eq!(RunConfig::new(t, 1, 1).unwrap().memory_limit(), None);
         let with = RunConfig::new(t, 1, 1)

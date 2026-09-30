@@ -30,21 +30,28 @@ fn child_entry() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            // 8 MiB ずつ、圧縮されにくい擬似乱数で埋めて確保する（macOS のメモリ圧縮で RSS が
-            // 縮まないようにする）。1 チャンクごとに sleep して割り当て速度を抑え、
-            // ポーリング間のオーバーシュートを有界にする。
+            // 8 MiB ずつ確保する。macOS のメモリ圧縮で RSS が縮まないよう、圧縮されにくい
+            // 擬似乱数の雛形を 1 つ作り、各チャンクへ複製する（ページ単位では非圧縮）。
+            // 雛形の生成は 1 回だけにして、debug ビルドでも確保速度が律速にならないようにする。
+            // 1 チャンクごとに sleep して割り当て速度を抑え、ポーリング間のオーバーシュートを
+            // 有界にする。
             const CHUNK: usize = 8 * 1024 * 1024;
-            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            let mut template = vec![0u8; CHUNK];
             let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-            for _ in 0..target_mib.div_ceil(8) {
-                let mut v = vec![0u8; CHUNK];
-                for b in v.chunks_mut(8) {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    let bytes = x.to_le_bytes();
-                    let n = b.len();
-                    b.copy_from_slice(&bytes[..n]);
+            for b in template.chunks_mut(8) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let bytes = x.to_le_bytes();
+                let n = b.len();
+                b.copy_from_slice(&bytes[..n]);
+            }
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            for i in 0..target_mib.div_ceil(8) {
+                let mut v = template.clone();
+                // チャンク間で内容を変える（重複排除・圧縮の余地を減らす）。
+                if let Some(first) = v.first_mut() {
+                    *first = (i % 251) as u8;
                 }
                 chunks.push(std::hint::black_box(v));
                 std::thread::sleep(Duration::from_millis(5));
@@ -81,9 +88,10 @@ fn config(limit: Duration, memory: MemoryLimit) -> RunConfig {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn req39_rss_over_2gib_is_killed_and_recorded_as_memory() {
-    // 割り当ての所要時間で時間超過に反転しないよう、時間上限は 30 秒にする。
-    let cfg = config(Duration::from_secs(30), MemoryLimit::infer_default());
-    let outcome = run_with_limits(&child("alloc", 3 * 1024), &cfg).unwrap();
+    // 割り当て・RSS 計測（macOS は `ps` 起動）の所要時間で時間超過に反転しないよう、
+    // 時間上限は 60 秒にする。割り当て量は上限を十分に超える 2.25 GiB とする。
+    let cfg = config(Duration::from_secs(60), MemoryLimit::infer_default());
+    let outcome = run_with_limits(&child("alloc", 2304), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
         panic!("expected LimitExceeded");
     };
