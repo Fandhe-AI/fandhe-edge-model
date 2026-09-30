@@ -36,7 +36,7 @@ scope は spec の 6 層に対応する。TASK-15.2（#28）で core・cli の 2
 | data | データ契約（検査・group 分割と凍結・来歴・読み取り専用配置。REQ-16/17/40） | `crates/data/`（`fandhe-edge-data`。検査・group 単位分割・凍結記録・読み取り専用配置・ハッシュ不一致時の停止・分割記録のレコード内容ハッシュ・来歴の記録型と取り込み記録・データ検査との接続を実装済み） |
 | train | 学習ワーカー（候補学習・選定・選択口・作り直し判定・ジョブ管理。REQ-18〜20/34） | `trainer/`（Python）・`crates/train/`（`fandhe-edge-train`。学習リクエスト・結果 JSON の型・子プロセス起動と終了コード写像・探索予算内の候補選定・選定結果の有意性判定・中断ジョブへの再開非提供とやり直し案内・ジョブ記録の永続化とクラッシュ検出〔TASK-34.2・#146〕を実装済み。CLI 配線は未着手。issue #177） |
 | eval | 評価器（指標・有意性・回帰・診断。REQ-21〜27/29） | `crates/eval/`（`fandhe-edge-eval`。指標・McNemar / Holm・回帰・再現性・不変性・校正と棄権などを実装済み。対象外ラベル・coverage・レポート系は未実装） |
-| runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目〔#117〕・容量計測コア〔TASK-30.1-1・#122〕・容量内訳の JSON 出力接続〔エラー写像は runtime、直列化は cli の output。TASK-30.1-2・#123〕・容量上限の照合〔TASK-30.2・#124。利用者設定の取り込みは未実装〕を実装済み。バイト前処理〔TASK-32.1-1・#112〕・C1・C3 の ONNX を読む自作推論バックエンド〔TASK-32.1-2・#113〕を実装済み。書き出し不能構成の除外・理由記録〔TASK-32.2・#114〕も実装済み。autoregressive の ONNX 推論は未着手） |
+| runtime | 成果物・推論 SDK（学習非依存の推論ランタイム。REQ-28/30〜32） | `crates/runtime/`（`fandhe-edge-runtime`。単体/バッチ共通の推論経路の継ぎ目〔#117〕・容量計測コア〔TASK-30.1-1・#122〕・容量内訳の JSON 出力接続〔エラー写像は runtime、直列化は cli の output。TASK-30.1-2・#123〕・容量上限の照合〔TASK-30.2・#124。利用者設定の取り込みは未実装〕を実装済み。バイト前処理〔TASK-32.1-1・#112〕・C1・C3 の ONNX を読む自作推論バックエンド〔TASK-32.1-2・#113〕を実装済み。書き出し不能構成の除外・理由記録〔TASK-32.2・#114〕・語彙ファイル超過構成の除外記録〔TASK-30.3・#125〕も実装済み。autoregressive の ONNX 推論は未着手） |
 | cli | CLI（7 工程・JSON 入出力契約。REQ-33） | `crates/cli/`（`fandhe-edge-cli`） |
 | tui | TUI（REQ-35） | 未確定 |
 | mcp | MCP / Codex 連携（REQ-36/37） | 未確定 |

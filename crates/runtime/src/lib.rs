@@ -42,6 +42,9 @@
 //!   証拠種別はテストハーネスで、本番データでの再実演は未実施）
 //! - [`prediction_provenance`][]: 参考測定でバッチ予測 API を使った記録への明記ルール
 //!   （REQ-28 境界値・TASK-28.3・#120）。CLI 出力への配線は TASK-33.x で未実装
+//! - [`vocab_exclusion`][]: 語彙ファイルを持つ構成が容量の目安 40MB を超える場合の既定候補からの
+//!   除外と記録（REQ-30 境界値・TASK-30.3・#125。根拠 PoC-13 実機）。終了コードは変えない。
+//!   `select`・`package` への配線は TASK-33.x で未接続
 //!
 //! TASK-28.1-2（#118）で、650 件の入力に対する単体・バッチ・評価器経路の予測ラベル全件一致
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と
@@ -66,3 +69,4 @@ pub mod package_outcome;
 pub mod pipeline;
 pub mod prediction_provenance;
 pub mod preprocess;
+pub mod vocab_exclusion;

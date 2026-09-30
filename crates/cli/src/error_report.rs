@@ -238,7 +238,12 @@ impl ToErrorReport for KindVersionRejection {
 /// `artifact.json` の解釈エラー。入力値を含めない固定文へ写す（REQ-39）。
 impl ToErrorReport for ArtifactMetaError {
     fn to_error_report(&self) -> ErrorReport {
-        ErrorReport::new(ExitCode::InvalidInput, "artifact metadata is invalid")
+        // 語彙ファイルの形式不正は、原因が分かる専用の固定文にする（終了コードは同じ 64）。
+        let message = match self {
+            ArtifactMetaError::InvalidVocab => "vocab file is invalid",
+            _ => "artifact metadata is invalid",
+        };
+        ErrorReport::new(ExitCode::InvalidInput, message)
     }
 }
 

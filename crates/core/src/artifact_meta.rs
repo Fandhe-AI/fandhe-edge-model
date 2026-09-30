@@ -31,6 +31,7 @@
 //! 呼び出し側が `fandhe-edge-guard` の経路検証を必ず通す。エラーの `Display` は入力値・
 //! 本文を含めない（`.claude/rules/security.md`）。
 
+use crate::hash::Sha256Digest;
 use serde::Deserialize;
 use std::fmt;
 
@@ -48,6 +49,8 @@ pub enum ArtifactMetaError {
     Malformed,
     /// `onnx_file` が空文字列、または NUL を含む。
     InvalidOnnxFile,
+    /// 語彙ファイルが許可された形式でない。
+    InvalidVocab,
 }
 
 impl fmt::Display for ArtifactMetaError {
@@ -55,6 +58,7 @@ impl fmt::Display for ArtifactMetaError {
         match self {
             ArtifactMetaError::Malformed => write!(f, "artifact metadata is malformed"),
             ArtifactMetaError::InvalidOnnxFile => write!(f, "onnx_file value is invalid"),
+            ArtifactMetaError::InvalidVocab => write!(f, "vocab file format is invalid"),
         }
     }
 }
@@ -140,6 +144,7 @@ pub struct ArtifactMeta {
     max_bytes: u32,
     label_order: Vec<String>,
     onnx_sha256: String,
+    vocab_sha256: Option<String>,
 }
 
 /// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
@@ -155,6 +160,280 @@ struct RawMeta {
     max_bytes: u32,
     label_order: Vec<String>,
     onnx_sha256: String,
+    #[serde(default)]
+    vocab_sha256: Option<String>,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 語彙ファイル（`vocab.json`）の最大エントリ数（REQ-39。巨大な語彙でのアロケーション上限）。
+pub const MAX_VOCAB_ENTRIES: usize = 4_194_304;
+
+/// 語彙ファイルのトークン文字列の最大バイト長（REQ-39。要素 1 件あたりのアロケーション上限）。
+pub const MAX_VOCAB_TOKEN_BYTES: usize = 4096;
+
+/// 語彙ファイルの走査を上限つきで行う訪問者（REQ-39・TASK-30.3・#125）。
+///
+/// 全件を map へ確保せず、要素ごとに件数・トークン長を確認して、上限を超えた時点で打ち切る。
+/// `seen` は走査した要素数で、打ち切りが上限の直後で起きること（それ以上読み進めないこと）を
+/// テストで確認するために公開しない内部関数から観測する。
+struct VocabScan<'a> {
+    max_entries: usize,
+    max_token_bytes: usize,
+    seen: &'a std::cell::Cell<usize>,
+}
+
+/// トークン文字列を確保せず、長さの上限だけを確認するキー。
+struct BoundedToken(usize);
+
+impl<'de> serde::Deserialize<'de> for BoundedToken {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BoundedToken;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a token string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<BoundedToken, E> {
+                Ok(BoundedToken(v.len()))
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for VocabScan<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a token to id map")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some((token, _id)) = map.next_entry::<BoundedToken, u32>()? {
+            let n = self.seen.get().saturating_add(1);
+            self.seen.set(n);
+            if n > self.max_entries || token.0 > self.max_token_bytes {
+                return Err(serde::de::Error::custom("vocab entry limit exceeded"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 語彙ファイルのストリーミング検証の失敗（REQ-39）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VocabStreamError {
+    /// 形式が許可外（JSON として不正・オブジェクトでない・値が非負整数でない・空・
+    /// エントリ過多・トークン過長・末尾に余分なデータ・サイズ上限超過）。
+    Format,
+    /// 読み込み中の I/O エラー（形式の判定はできていない）。
+    Read,
+}
+
+impl fmt::Display for VocabStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VocabStreamError::Format => write!(f, "vocab file format is invalid"),
+            VocabStreamError::Read => write!(f, "vocab file cannot be read"),
+        }
+    }
+}
+
+impl std::error::Error for VocabStreamError {}
+
+fn scan_vocab_reader<R: std::io::Read>(
+    reader: R,
+    max_entries: usize,
+    max_token_bytes: usize,
+    seen: &std::cell::Cell<usize>,
+) -> Result<(), VocabStreamError> {
+    use serde::Deserializer as _;
+    let classify = |e: serde_json::Error| {
+        if e.is_io() && e.io_error_kind() != Some(std::io::ErrorKind::InvalidData) {
+            VocabStreamError::Read
+        } else {
+            VocabStreamError::Format
+        }
+    };
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    de.deserialize_map(VocabScan {
+        max_entries,
+        max_token_bytes,
+        seen,
+    })
+    .map_err(classify)?;
+    de.end().map_err(classify)?;
+    if seen.get() == 0 {
+        return Err(VocabStreamError::Format);
+    }
+    Ok(())
+}
+
+fn scan_vocab(
+    bytes: &[u8],
+    max_entries: usize,
+    max_token_bytes: usize,
+    seen: &std::cell::Cell<usize>,
+) -> Result<(), ArtifactMetaError> {
+    scan_vocab_reader(bytes, max_entries, max_token_bytes, seen)
+        .map_err(|_| ArtifactMetaError::InvalidVocab)
+}
+
+/// `Read` を包み、読み進めたバイトの sha256 と総量を数える。
+struct HashingReader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+    total: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+        let n = self.inner.read(buf)?;
+        if let Some(read) = buf.get(..n) {
+            self.hasher.update(read);
+        }
+        self.total = self.total.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+/// 1 つの文字列リテラルの生バイト数の上限。`\uXXXX`（6 バイト）は最小でも 1 バイトに展開される
+/// ため、デコード後 [`MAX_VOCAB_TOKEN_BYTES`] の正しいトークンを誤って拒否しない値にする。
+const MAX_VOCAB_RAW_STRING_BYTES: usize = MAX_VOCAB_TOKEN_BYTES * 6;
+
+/// 数値リテラルの生バイト数の上限（`u32` は 10 桁。符号・小数点・指数の余裕を見た値）。
+const MAX_VOCAB_RAW_NUMBER_BYTES: usize = 32;
+
+/// serde_json へ渡す前に JSON の字句の長さを制限する `Read` アダプタ（REQ-39）。
+///
+/// serde_json は文字列キー全体を scratch バッファへ読んでから訪問者を呼ぶため、訪問者側のトークン長
+/// 確認だけでは、極端に長いキーの確保を防げない。通過するバイトを走査し、文字列リテラルの内外・
+/// エスケープ（`\` の直後の 1 文字）を状態として追跡して、生バイト数が上限を超えたら
+/// `InvalidData` で読み込みを打ち切る（超過した塊は serde_json へ渡さない）。
+struct LexGuardReader<R> {
+    inner: R,
+    in_string: bool,
+    escaped: bool,
+    string_len: usize,
+    number_len: usize,
+}
+
+impl<R> LexGuardReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            in_string: false,
+            escaped: false,
+            string_len: 0,
+            number_len: 0,
+        }
+    }
+
+    fn scan(&mut self, byte: u8) -> Result<(), ()> {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'"' {
+                // 閉じ引用符は文字列の生バイト数に含めない。
+                self.in_string = false;
+                return Ok(());
+            } else if byte == b'\\' {
+                self.escaped = true;
+            }
+            self.string_len += 1;
+            if self.string_len > MAX_VOCAB_RAW_STRING_BYTES {
+                return Err(());
+            }
+        } else if byte == b'"' {
+            self.in_string = true;
+            self.string_len = 0;
+            self.number_len = 0;
+        } else if byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E') {
+            self.number_len += 1;
+            if self.number_len > MAX_VOCAB_RAW_NUMBER_BYTES {
+                return Err(());
+            }
+        } else {
+            self.number_len = 0;
+        }
+        Ok(())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for LexGuardReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for i in 0..n {
+            let Some(&byte) = buf.get(i) else { break };
+            if self.scan(byte).is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "vocab lexical limit exceeded",
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// 語彙ファイルを 1 パスのストリームで検証し、その sha256 を返す
+/// （`select`・`package`・`infer` が共有。REQ-30・REQ-39・TASK-30.3・#125）。
+///
+/// 読みながら sha256 を計算し、同じストリームを上限つきの訪問者（件数 [`MAX_VOCAB_ENTRIES`]・
+/// トークン長 [`MAX_VOCAB_TOKEN_BYTES`]）で検証する。末尾の余分なデータは拒否し、読み込み総量は
+/// `max_bytes` に制限する（超えたら [`VocabStreamError::Format`]）。メモリ使用量は固定長バッファと
+/// トークン 1 件分で、ファイルサイズに比例しない。正常終了時は EOF まで読み切っているため、
+/// 返すダイジェストはファイル全体のもの。
+///
+/// # Errors
+/// 形式不正・サイズ上限超過は [`VocabStreamError::Format`]、読み込み失敗は
+/// [`VocabStreamError::Read`]。
+pub fn verify_vocab_stream<R: std::io::Read>(
+    reader: R,
+    max_bytes: u64,
+) -> Result<Sha256Digest, VocabStreamError> {
+    use sha2::Digest as _;
+    let hashing = HashingReader {
+        inner: reader.take(max_bytes.saturating_add(1)),
+        hasher: sha2::Sha256::new(),
+        total: 0,
+    };
+    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, LexGuardReader::new(hashing));
+    scan_vocab_reader(
+        &mut buffered,
+        MAX_VOCAB_ENTRIES,
+        MAX_VOCAB_TOKEN_BYTES,
+        &std::cell::Cell::new(0),
+    )?;
+    let done = buffered.into_inner().inner;
+    if done.total > max_bytes {
+        return Err(VocabStreamError::Format);
+    }
+    Ok(Sha256Digest::from_array(done.hasher.finalize().into()))
+}
+
+/// 語彙ファイルが許可された形式（トークン文字列から非負整数 ID への JSON オブジェクト）かを検証する
+/// （REQ-39 形式の許可制・REQ-30・TASK-30.3・#125）。
+///
+/// 全件を確保せず読み込み中に件数（[`MAX_VOCAB_ENTRIES`]）とトークン長
+/// （[`MAX_VOCAB_TOKEN_BYTES`]）を確認し、上限を超えた時点で打ち切る（REQ-39 の資源上限）。
+///
+/// # Errors
+/// JSON として不正・オブジェクトでない・値が非負整数でない・空・エントリ過多・トークン過長の場合は
+/// [`ArtifactMetaError::InvalidVocab`]。
+pub fn validate_vocab_bytes(bytes: &[u8]) -> Result<(), ArtifactMetaError> {
+    scan_vocab(
+        bytes,
+        MAX_VOCAB_ENTRIES,
+        MAX_VOCAB_TOKEN_BYTES,
+        &std::cell::Cell::new(0),
+    )
 }
 
 impl ArtifactMeta {
@@ -181,11 +460,7 @@ impl ArtifactMeta {
                 .label_order
                 .iter()
                 .all(|l| !l.is_empty() && seen.insert(l.as_str()));
-        let sha_ok = raw.onnx_sha256.len() == 64
-            && raw
-                .onnx_sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let sha_ok = is_hex64(&raw.onnx_sha256) && raw.vocab_sha256.as_deref().is_none_or(is_hex64);
         if raw.kind.is_empty()
             || raw.kind.len() > MAX_META_KIND_BYTES
             || raw.max_bytes == 0
@@ -201,6 +476,7 @@ impl ArtifactMeta {
             max_bytes: raw.max_bytes,
             label_order: raw.label_order,
             onnx_sha256: raw.onnx_sha256,
+            vocab_sha256: raw.vocab_sha256,
         })
     }
 
@@ -238,6 +514,13 @@ impl ArtifactMeta {
     #[must_use]
     pub fn onnx_sha256(&self) -> &str {
         &self.onnx_sha256
+    }
+
+    /// 記載された語彙ファイルの sha256（小文字 16 進 64 桁）。語彙ファイルを持たない成果物では `None`。
+    /// 語彙ファイルがある場合は記録が必須で、呼び出し側（`package`・`infer`）が照合する（REQ-39）。
+    #[must_use]
+    pub fn vocab_sha256(&self) -> Option<&str> {
+        self.vocab_sha256.as_deref()
     }
 }
 
@@ -356,6 +639,192 @@ mod tests {
         assert_eq!(m.max_bytes(), 48);
         assert_eq!(m.label_order(), ["a".to_string(), "b".to_string()]);
         assert_eq!(m.onnx_sha256(), "0".repeat(64));
+        assert_eq!(m.vocab_sha256(), None);
+    }
+
+    /// REQ-39: 語彙ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
+    #[test]
+    fn req39_meta_vocab_sha256_is_optional_and_validated() {
+        let ok = format!(r#","vocab_sha256":"{}""#, "a".repeat(64));
+        let m = ArtifactMeta::parse(full_meta(&ok).as_bytes()).expect("ok");
+        assert_eq!(m.vocab_sha256(), Some("a".repeat(64).as_str()));
+        assert_eq!(
+            ArtifactMeta::parse(full_meta(r#","vocab_sha256":"zz""#).as_bytes()),
+            Err(ArtifactMetaError::Malformed)
+        );
+    }
+
+    /// REQ-39: 語彙ファイルは「トークン -> 非負整数 ID」の JSON オブジェクトだけを許可する。
+    #[test]
+    fn req39_validate_vocab_bytes_allows_only_token_id_map() {
+        assert_eq!(validate_vocab_bytes(br#"{"a":0,"b":1}"#), Ok(()));
+        for bad in [
+            &b"{}"[..],
+            b"[]",
+            b"not json",
+            br#"{"a":-1}"#,
+            br#"{"a":"x"}"#,
+            br#"{"a":1.5}"#,
+            b"\x80\x81",
+        ] {
+            assert_eq!(
+                validate_vocab_bytes(bad),
+                Err(ArtifactMetaError::InvalidVocab)
+            );
+        }
+    }
+
+    /// REQ-39: 件数上限を超えた時点で走査を打ち切る（上限 +1 件目で止まり、後続を読まない）。
+    #[test]
+    fn req39_vocab_scan_aborts_at_entry_limit_without_reading_rest() {
+        let seen = std::cell::Cell::new(0);
+        let json = br#"{"a":0,"b":1,"c":2,"d":3,"e":4}"#;
+        assert_eq!(
+            scan_vocab(json, 2, MAX_VOCAB_TOKEN_BYTES, &seen),
+            Err(ArtifactMetaError::InvalidVocab)
+        );
+        assert_eq!(seen.get(), 3);
+        let seen = std::cell::Cell::new(0);
+        assert_eq!(scan_vocab(br#"{"a":0,"b":1}"#, 2, 8, &seen), Ok(()));
+        assert_eq!(seen.get(), 2);
+    }
+
+    /// REQ-39: トークン長の上限を超える要素は拒否する。
+    #[test]
+    fn req39_vocab_scan_rejects_overlong_token() {
+        let seen = std::cell::Cell::new(0);
+        assert_eq!(
+            scan_vocab(br#"{"abcd":0}"#, 10, 3, &seen),
+            Err(ArtifactMetaError::InvalidVocab)
+        );
+        assert_eq!(scan_vocab(br#"{"abc":0}"#, 10, 3, &seen), Ok(()));
+    }
+
+    /// REQ-39: ストリーミング検証は全体の sha256 を返し、末尾の余分なデータ・サイズ上限超過・
+    /// 形式不正を `Format` で拒否する。
+    #[test]
+    fn req39_verify_vocab_stream_returns_hash_and_rejects_trailing_data() {
+        let good = br#"{"a":0,"b":1}"#;
+        assert_eq!(
+            verify_vocab_stream(&good[..], 1024),
+            Ok(Sha256Digest::of_bytes(good))
+        );
+        let padded = b"{\"a\":0}  \n";
+        assert_eq!(
+            verify_vocab_stream(&padded[..], 1024),
+            Ok(Sha256Digest::of_bytes(padded))
+        );
+        for bad in [
+            &br#"{"a":0} x"#[..],
+            br#"{"a":0}{"b":1}"#,
+            b"not json",
+            b"{}",
+        ] {
+            assert_eq!(
+                verify_vocab_stream(bad, 1024),
+                Err(VocabStreamError::Format)
+            );
+        }
+        // 正しい JSON でも、上限を 1 バイトでも超えれば拒否する。
+        assert_eq!(
+            verify_vocab_stream(&good[..], good.len() as u64),
+            Ok(Sha256Digest::of_bytes(good))
+        );
+        assert_eq!(
+            verify_vocab_stream(&good[..], good.len() as u64 - 1),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// 読んだバイト数を数える `Read`（同じ内容を繰り返す。`limit` 到達で EOF）。
+    struct Counting<'a> {
+        head: &'a [u8],
+        pos: usize,
+        fill: u8,
+        limit: usize,
+        read: &'a std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut n = 0;
+            for slot in buf.iter_mut() {
+                if self.pos >= self.limit {
+                    break;
+                }
+                *slot = self.head.get(self.pos).copied().unwrap_or(self.fill);
+                self.pos += 1;
+                n += 1;
+            }
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// REQ-39: 極端に長いキー（1 MiB）は、字句ガードが上限＋バッファ分で打ち切り、それ以上読まない
+    /// （serde_json が scratch へ確保する前に拒否する）。
+    #[test]
+    fn req39_lex_guard_stops_overlong_key_before_allocation() {
+        let read = std::cell::Cell::new(0);
+        let reader = Counting {
+            head: b"{\"",
+            pos: 0,
+            fill: b'a',
+            limit: 1 << 20,
+            read: &read,
+        };
+        assert_eq!(
+            verify_vocab_stream(reader, u64::MAX / 2),
+            Err(VocabStreamError::Format)
+        );
+        assert!(
+            read.get() <= MAX_VOCAB_RAW_STRING_BYTES + 64 * 1024 + 2,
+            "read {} bytes",
+            read.get()
+        );
+    }
+
+    /// REQ-39: 長すぎる数値リテラルも打ち切る。
+    #[test]
+    fn req39_lex_guard_rejects_overlong_number() {
+        let json = format!("{{\"a\":{}}}", "1".repeat(64));
+        assert_eq!(
+            verify_vocab_stream(json.as_bytes(), 1 << 20),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// REQ-39: エスケープ（`\uXXXX`）で生バイト数が膨らんだ正しい 4096 バイトのトークンは通る。
+    /// 4097 バイトは訪問者が拒否する。
+    #[test]
+    fn req39_lex_guard_accepts_escaped_max_token_and_visitor_rejects_longer() {
+        let ok = format!("{{\"{}\":0}}", "\\u0061".repeat(MAX_VOCAB_TOKEN_BYTES));
+        assert_eq!(
+            verify_vocab_stream(ok.as_bytes(), 1 << 20),
+            Ok(Sha256Digest::of_bytes(ok.as_bytes()))
+        );
+        let long = format!("{{\"{}\":0}}", "\\u0061".repeat(MAX_VOCAB_TOKEN_BYTES + 1));
+        assert_eq!(
+            verify_vocab_stream(long.as_bytes(), 1 << 20),
+            Err(VocabStreamError::Format)
+        );
+    }
+
+    /// REQ-39: 文字列中の `\"`・`\\` で状態が崩れない（エスケープされた引用符で文字列が終わらず、
+    /// `\\` の直後の引用符では終わる）。
+    #[test]
+    fn req39_lex_guard_tracks_escaped_quotes() {
+        let json = br#"{"a\"b":0,"c\\":1,"d":2}"#;
+        assert_eq!(
+            verify_vocab_stream(&json[..], 1024),
+            Ok(Sha256Digest::of_bytes(json))
+        );
+        // 引用符が閉じないまま長く続くケース: 長いキーとして拒否される。
+        let unterminated = format!("{{\"a\\\"{}", "b".repeat(MAX_VOCAB_RAW_STRING_BYTES + 10));
+        assert_eq!(
+            verify_vocab_stream(unterminated.as_bytes(), 1 << 20),
+            Err(VocabStreamError::Format)
+        );
     }
 
     /// REQ-39: 欠落・型違い・不正値は fail-closed。

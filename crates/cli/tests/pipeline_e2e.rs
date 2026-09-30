@@ -1449,6 +1449,276 @@ mod suite {
         std::fs::write(&selection_path, &original).expect("restore selection");
     }
 
+    /// 候補 0 の成果物へ `vocab.json` を置き、`recorded` が `Some` なら `artifact.json` にその sha256 を記録する。
+    fn place_vocab(env: &Env, bytes: &[u8], recorded: Option<&[u8]>) {
+        std::fs::write(env.project_file("candidates/0/model-c1/vocab.json"), bytes).expect("vocab");
+        if let Some(hashed) = recorded {
+            let meta = env.project_file("candidates/0/model-c1/artifact.json");
+            let text = std::fs::read_to_string(&meta).expect("artifact.json");
+            let hex = Sha256Digest::of_bytes(hashed).to_hex();
+            let patched = text.replacen('{', &format!("{{\"vocab_sha256\":\"{hex}\","), 1);
+            std::fs::write(&meta, patched).expect("patch artifact.json");
+        }
+    }
+
+    /// 配布容量の目安（40MB）を超える、許可形式の語彙ファイル（約 45MB）。
+    fn oversized_vocab() -> Vec<u8> {
+        let mut out = String::from("{");
+        for i in 0..3_000_000u32 {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"t{i}\":{i}"));
+        }
+        out.push('}');
+        out.into_bytes()
+    }
+
+    /// REQ-39・REQ-30: 語彙ファイルがあるのに記録ハッシュが無い・記録と不一致の候補は、選定時にも
+    /// `invalid_input`（64）で止まり、選定記録を作らない（容量判定より前に完全性を確認する）。
+    pub fn select_rejects_vocab_file_without_matching_recorded_hash() {
+        let env = inspected("selvocabhash");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        place_vocab(&env, br#"{"a":0}"#, None);
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+        // 記録ハッシュが別内容のもの。
+        place_vocab(&env, br#"{"a":0}"#, Some(br#"{"b":1}"#));
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: 容量超過で除外される候補にも整合性の確認が先に適用される。改ざんのない
+    /// 超過候補は除外（全件除外で `pending`）になるが、validation 予測を改ざんした超過候補は
+    /// 「除外」として扱わず `runtime_error`（70）で止まる。
+    pub fn select_validates_candidate_before_capacity_exclusion() {
+        let env = inspected("selexclorder");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert!(out.contains("excluded"), "{out}");
+
+        let result = env.project_file("candidates/0/result.json");
+        let text = std::fs::read_to_string(&result).expect("result.json");
+        let marker = "\"validation_predictions\":[{\"id\":\"";
+        assert!(text.contains(marker), "{text}");
+        std::fs::write(
+            &result,
+            text.replacen(marker, &format!("{marker}tampered-"), 1),
+        )
+        .expect("tamper");
+        let (code, stdout) = env.run(&["select", "--project-dir", "proj"]);
+        assert_eq!(code, 70, "{stdout}");
+        assert!(stdout.contains("cannot score"), "{stdout}");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: 容量の目安を超える語彙も同じストリーミング検証を通す。ハッシュだけ合わせた
+    /// 45MB の非 JSON は除外にせず `invalid_input`（64）で止まる。形式が正しい超過は除外（`pending`）、
+    /// ハッシュ不一致・末尾に余分なデータがある場合も 64。
+    pub fn select_oversized_vocab_is_validated_not_just_excluded() {
+        let env = inspected("selbigvocab");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let garbage = vec![b'x'; 45_000_000];
+        place_vocab(&env, &garbage, Some(&garbage));
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let vocab_path = env.project_file("candidates/0/model-c1/vocab.json");
+        let replace_hash = |old: &[u8], new: &[u8]| {
+            let text = std::fs::read_to_string(&meta).expect("artifact.json");
+            let (old, new) = (
+                Sha256Digest::of_bytes(old).to_hex(),
+                Sha256Digest::of_bytes(new).to_hex(),
+            );
+            assert!(text.contains(&old), "{text}");
+            std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        };
+        // 正しい語彙（45MB 超）は除外される。
+        let valid = oversized_vocab();
+        std::fs::write(&vocab_path, &valid).expect("vocab");
+        replace_hash(&garbage, &valid);
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert!(out.contains("vocab_package_over_guideline"), "{out}");
+        // 末尾に余分なデータ。
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b" x");
+        std::fs::write(&vocab_path, &trailing).expect("vocab");
+        replace_hash(&valid, &trailing);
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        // ハッシュ不一致。
+        replace_hash(&trailing, b"other");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: `model-c1/` 配下に置いた実配置の小さな語彙は、select・package・infer の
+    /// 3 経路が同じ保持 fd 検証で通り、パッケージへ複写される。
+    pub fn vocab_in_artifact_dir_passes_select_package_and_infer() {
+        let env = inspected("vocabpipe");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = br#"{"a":0,"b":1}"#;
+        place_vocab(&env, vocab, Some(vocab));
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&["package", "--project-dir", "proj"]);
+        assert_eq!(
+            std::fs::read(env.project_file("package/vocab.json")).expect("packaged vocab"),
+            vocab
+        );
+        env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--text",
+            "alpha sample",
+        ]);
+    }
+
+    /// REQ-30・REQ-39: 容量超過の候補にも ONNX の完全性確認が先に適用される。ONNX を改ざんした
+    /// 超過候補（記録 sha256 と不一致・非 ONNX で記録ハッシュを合わせた場合）は「除外」にならず
+    /// `invalid_input`（64）で止まる。
+    pub fn select_verifies_onnx_before_capacity_exclusion() {
+        let env = inspected("selonnxexcl");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let onnx = env.project_file("candidates/0/model-c1/model.onnx");
+        let original = std::fs::read(&onnx).expect("onnx");
+        // 1 バイト追記（記録 sha256 と不一致）。
+        let mut tampered = original.clone();
+        tampered.push(0);
+        std::fs::write(&onnx, &tampered).expect("tamper");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+        // 非 ONNX の内容へ差し替え、artifact.json の記録ハッシュも合わせる（形式の許可リストで拒否）。
+        let junk = b"not an onnx model at all".to_vec();
+        std::fs::write(&onnx, &junk).expect("junk");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let old = Sha256Digest::of_bytes(&original).to_hex();
+        let new = Sha256Digest::of_bytes(&junk).to_hex();
+        assert!(text.contains(&old), "{text}");
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: 容量超過の候補にも `package` と同じ `load_backend` の確認が先に適用される。
+    /// 形式は ONNX でハッシュも一致するが読み込めないモデルと、出力クラス数が定義の選択肢数と
+    /// 食い違うモデル（2 択の定義に 3 クラスの fixture）は、除外にならず `invalid_input`（64）で止まる。
+    pub fn select_loads_onnx_before_capacity_exclusion() {
+        let env = inspected("selloadexcl");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let onnx = env.project_file("candidates/0/model-c1/model.onnx");
+        let original = std::fs::read(&onnx).expect("onnx");
+        // ONNX の最小の形（形式判定は通る）だが、モデルとしては読み込めない。
+        let broken = vec![0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
+        std::fs::write(&onnx, &broken).expect("broken");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let old = Sha256Digest::of_bytes(&original).to_hex();
+        let new = Sha256Digest::of_bytes(&broken).to_hex();
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"model file cannot be loaded\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+
+        // 2 択の定義（fixture は 3 クラス）。
+        let env = Env::new("selclasses", false);
+        let two = definition_text().replace(
+            r#",{"id":"gamma","display_name":"gamma","description":"dummy"}"#,
+            "",
+        );
+        std::fs::write(env.work.join("def").join("definition.json"), two).expect("definition");
+        let data: String = train_jsonl()
+            .lines()
+            .filter(|l| !l.contains("gamma"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"model output size does not match definition\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・TASK-30.3: 全候補が容量超過で除外された `select` は `pending`（12）で、内部記録
+    /// `selection_exclusions.json` に除外結果（`selection_record.json` の `excluded_candidates` と同じ
+    /// 要素の形）を残す（選定記録は作らない）。再実行では置き換わり、選定が成功すると削除される。
+    pub fn select_all_excluded_writes_exclusions_record_and_success_removes_it() {
+        let env = inspected("selexclrec");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = oversized_vocab();
+        place_vocab(&env, &vocab, Some(&vocab));
+        let record = env.project_file("selection_exclusions.json");
+        let expected = |stdout: &str| {
+            let total: u64 = stdout
+                .split("vocab_package_over_guideline (")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .expect("total bytes in message");
+            format!(
+                "{{\"excluded_candidates\":[{{\"candidate_index\":0,\"candidate_id\":\"c1\",\"reason\":\"vocab_package_over_guideline\",\"total_bytes\":{total},\"guideline_bytes\":40000000}}]}}\n"
+            )
+        };
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record"),
+            expected(&out)
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+        // 再実行でも（既存があっても）同じ内容で置き換わり、一時ファイルは残らない。
+        let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record"),
+            expected(&out)
+        );
+        assert!(!env.project_file("selection_exclusions.json.tmp").exists());
+        // 小さな正しい語彙へ差し替えると選定に成功し、古い除外結果は消える。
+        let small = br#"{"a":0}"#;
+        std::fs::write(env.project_file("candidates/0/model-c1/vocab.json"), small).expect("vocab");
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let (old, new) = (
+            Sha256Digest::of_bytes(&vocab).to_hex(),
+            Sha256Digest::of_bytes(small).to_hex(),
+        );
+        std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        env.ok(&["select", "--project-dir", "proj"]);
+        assert!(!record.exists());
+        assert!(env.project_file("selection_record.json").is_file());
+        // 選定記録が残っていれば、次の select は除外の計算に入らず拒否される（挙動は変えない）。
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"selection record already exists\"}\n"
+        );
+    }
+
+    /// REQ-39: 語彙ファイルの形式不正は、原因が分かる `vocab file is invalid`（64）で報告する。
+    pub fn select_reports_invalid_vocab_with_dedicated_message() {
+        let env = inspected("selbadvocab");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let bad = br#"{"a":0} x"#;
+        place_vocab(&env, bad, Some(bad));
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"vocab file is invalid\"}\n"
+        );
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
@@ -1695,6 +1965,38 @@ fn main() -> std::process::ExitCode {
         (
             "select_and_package_reject_request_fields_beyond_kind_and_seed",
             suite::select_and_package_reject_request_fields_beyond_kind_and_seed,
+        ),
+        (
+            "select_rejects_vocab_file_without_matching_recorded_hash",
+            suite::select_rejects_vocab_file_without_matching_recorded_hash,
+        ),
+        (
+            "select_validates_candidate_before_capacity_exclusion",
+            suite::select_validates_candidate_before_capacity_exclusion,
+        ),
+        (
+            "select_oversized_vocab_is_validated_not_just_excluded",
+            suite::select_oversized_vocab_is_validated_not_just_excluded,
+        ),
+        (
+            "select_verifies_onnx_before_capacity_exclusion",
+            suite::select_verifies_onnx_before_capacity_exclusion,
+        ),
+        (
+            "vocab_in_artifact_dir_passes_select_package_and_infer",
+            suite::vocab_in_artifact_dir_passes_select_package_and_infer,
+        ),
+        (
+            "select_loads_onnx_before_capacity_exclusion",
+            suite::select_loads_onnx_before_capacity_exclusion,
+        ),
+        (
+            "select_all_excluded_writes_exclusions_record_and_success_removes_it",
+            suite::select_all_excluded_writes_exclusions_record_and_success_removes_it,
+        ),
+        (
+            "select_reports_invalid_vocab_with_dedicated_message",
+            suite::select_reports_invalid_vocab_with_dedicated_message,
         ),
         (
             "infer_out_option_is_not_faked",

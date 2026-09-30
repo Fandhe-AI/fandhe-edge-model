@@ -40,8 +40,11 @@
 //! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
 //! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
 
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
+use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
@@ -59,6 +62,7 @@ use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
+use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
@@ -71,6 +75,7 @@ use crate::project::{
 
 use super::candidate_artifact::{
     ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
+    verify_vocab_file,
 };
 
 use super::infer::load_backend;
@@ -133,15 +138,17 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         return Err(invalid("selected candidate has no artifact"));
     };
     // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から閉じ込めつきで読む
-    // （`evaluate` と共有する [`load_candidate_artifact`]。REQ-39）。
+    // （`evaluate` と共有する [`load_candidate_artifact`]。語彙ファイルの保持 fd 1 本によるストリーミング
+    // 検証もここで行い、以降の複写・計測は同じ fd を使う。REQ-30・REQ-39）。
     let CandidateArtifact {
         meta_bytes,
         meta,
         onnx_bytes,
         onnx_file,
-        ..
+        handles,
     } = load_candidate_artifact(&project, selection.candidate_index, success)?;
     let onnx_file = onnx_file.as_str();
+    let vocab_file = handles.vocab;
     check_meta_consistency(
         &meta,
         &definition,
@@ -193,6 +200,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &meta_bytes,
         &onnx_bytes,
         &definition_bytes,
+        &meta,
+        vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
@@ -315,7 +324,7 @@ fn finalize_staging(
     Ok(Vec::new())
 }
 
-/// ステージングへ 3 ファイルを新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+/// ステージングへ 3 ファイル（語彙ファイルがあれば 4）を新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
 ///
 /// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
@@ -324,20 +333,36 @@ fn assemble_and_measure(
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
     definition_bytes: &[u8],
+    meta: &ArtifactMeta,
+    vocab: Option<(&File, &Path)>,
 ) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
     let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
     project.write_new(pkg.join(onnx_file), onnx_bytes)?;
     project.write_new(pkg.join(DEFINITION_FILE), definition_bytes)?;
-
-    let mut files = Vec::new();
-    for (component, name) in [
+    let mut members = vec![
         (PackageComponent::Weights, onnx_file),
         (PackageComponent::LabelTable, DEFINITION_FILE),
         (PackageComponent::Metadata, ARTIFACT_META_FILE),
-    ] {
+    ];
+    if let Some((mut file, _)) = vocab {
+        // 保持 fd を先頭へ戻し、固定長バッファで複写する（全体をメモリへ読まない）。
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| runtime("cannot read vocab file"))?;
+        project.write_new_from_reader(pkg.join(VOCAB_FILE_NAME), &mut file, MAX_FILE_BYTES)?;
+        members.push((PackageComponent::VocabOrFeatureTransform, VOCAB_FILE_NAME));
+    }
+
+    let mut files = Vec::new();
+    for (component, name) in members {
         let (file, path) = project.open_file(pkg.join(name))?;
         files.push((component, path, file));
+    }
+    // 公開するのはステージングへ複写したファイルなので、複写後の実体も記録どおりか再検証する
+    // （検証から複写までの間の差し替え対策。REQ-39）。
+    if vocab.is_some() {
+        let (file, path) = project.open_file(pkg.join(VOCAB_FILE_NAME))?;
+        verify_vocab_file(meta, Some((&file, path.as_path())))?;
     }
     measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))
@@ -434,5 +459,51 @@ mod tests {
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn meta_with_vocab(vocab_sha: Option<&str>) -> ArtifactMeta {
+        let extra = vocab_sha
+            .map(|h| format!(r#","vocab_sha256":"{h}""#))
+            .unwrap_or_default();
+        let json = format!(
+            r#"{{"onnx_file":"m.onnx","kind":"c1","kind_version":1,"max_bytes":48,"label_order":["a"],"onnx_sha256":"{}"{extra}}}"#,
+            "0".repeat(64)
+        );
+        ArtifactMeta::parse(json.as_bytes()).expect("meta")
+    }
+
+    fn temp_vocab(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!("fandhe-vocab-{tag}-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write");
+        let file = File::open(&path).expect("open");
+        (path, file)
+    }
+
+    /// REQ-39: 語彙ファイルは記録ハッシュとの一致と許可形式の両方を満たすときだけ通す
+    /// （保持 fd からのストリーミング検証。select・package・infer で共有）。
+    #[test]
+    fn req39_verify_vocab_file_checks_hash_and_format() {
+        let good = br#"{"a":0}"#;
+        let good_hex = Sha256Digest::of_bytes(good).to_hex();
+        let (p1, f1) = temp_vocab("good", good);
+        assert_eq!(verify_vocab_file(&meta_with_vocab(None), None), Ok(None));
+        assert_eq!(
+            verify_vocab_file(&meta_with_vocab(Some(&good_hex)), Some((&f1, &p1))),
+            Ok(Some(7))
+        );
+        // 記録なし・ファイルなし・ハッシュ不一致は拒否。
+        assert!(verify_vocab_file(&meta_with_vocab(None), Some((&f1, &p1))).is_err());
+        assert!(verify_vocab_file(&meta_with_vocab(Some(&good_hex)), None).is_err());
+        let wrong = meta_with_vocab(Some(&"1".repeat(64)));
+        assert!(verify_vocab_file(&wrong, Some((&f1, &p1))).is_err());
+        // ハッシュが一致しても形式が許可外・末尾に余分なデータなら拒否。
+        for (tag, bad) in [("bad", &b"not json"[..]), ("trail", br#"{"a":0} x"#)] {
+            let hex = Sha256Digest::of_bytes(bad).to_hex();
+            let (p, f) = temp_vocab(tag, bad);
+            let err = verify_vocab_file(&meta_with_vocab(Some(&hex)), Some((&f, &p))).unwrap_err();
+            assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(&p1);
     }
 }

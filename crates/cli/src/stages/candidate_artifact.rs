@@ -8,19 +8,26 @@
 //! からの相対オープン（`O_NOFOLLOW`・`O_DIRECTORY`）で得て、`artifact_dir` は文字列の前方一致でなく
 //! 候補ディレクトリからの相対パスとして求める（学習結果の差し替えで候補の外を読まない。REQ-39）。
 
-use std::path::{Component, Path};
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
+use fandhe_edge_core::artifact_meta::{
+    ArtifactMeta, ArtifactMetaError, MAX_ARTIFACT_META_BYTES, VocabStreamError, verify_vocab_stream,
+};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::fs::read_bounded_open_file;
+use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::kind::KindAllowlist;
+use fandhe_edge_guard::path::PathRejection;
+use fandhe_edge_runtime::capacity::MAX_FILE_BYTES;
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MAX_MODEL_FILE_BYTES, MIN_MAX_BYTES};
+use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::SuccessOutcome;
 
 use crate::error_report::ToErrorReport;
-use crate::project::{Project, fs_report, invalid};
+use crate::project::{Project, fs_report, invalid, runtime};
 
 use super::train::candidate_rel;
 
@@ -37,6 +44,20 @@ pub(crate) struct CandidateArtifact {
     pub onnx_bytes: Vec<u8>,
     /// ONNX のファイル名（単一の通常の名前であることを確認済み）。
     pub onnx_file: String,
+    /// 検証に使った保持 fd（容量計測・語彙の複写に使い回し、パスで開き直さない）。
+    pub handles: ArtifactHandles,
+}
+
+/// [`load_candidate_artifact`] が読んだ成果物の保持 fd（`(fd, 閉じ込め検証済みの実パス)`）。
+///
+/// fd のオフセットは読み込み後の位置にあるため、内容を読み直す側は先頭へ戻す。
+pub(crate) struct ArtifactHandles {
+    /// `artifact.json`。
+    pub meta: (File, PathBuf),
+    /// ONNX ファイル。
+    pub onnx: (File, PathBuf),
+    /// 語彙ファイル（`vocab.json`。あるときだけ。検証済み）。
+    pub vocab: Option<(File, PathBuf)>,
 }
 
 /// 候補 `index` の成果物を閉じ込めつきで読み、メタデータと ONNX の自己整合性を確認する。
@@ -58,25 +79,46 @@ pub(crate) fn load_candidate_artifact(
     if !is_single_component(onnx_file) {
         return Err(invalid("onnx file name is invalid"));
     }
-    let read_member = |name: &str, limit: u64| -> Result<Vec<u8>, ErrorReport> {
-        let (file, real) = candidate_dir
-            .open_member(&artifact_rel.join(name))
-            .map_err(|e| e.to_error_report())?;
-        read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))
+    // 各メンバーは 1 回だけ開き、読み込み用に複製した fd で読む（元の fd は容量計測用に保持する）。
+    let open_member = |name: &str| candidate_dir.open_member(&artifact_rel.join(name));
+    let read_member = |name: &str, limit: u64| -> Result<(Vec<u8>, File, PathBuf), ErrorReport> {
+        let (file, real) = open_member(name).map_err(|e| e.to_error_report())?;
+        let reader = file
+            .try_clone()
+            .map_err(|_| runtime("cannot read candidate artifact"))?;
+        let bytes =
+            read_bounded_open_file(reader, real.as_path(), limit).map_err(|e| fs_report(&e))?;
+        Ok((bytes, file, real.into_path_buf()))
     };
-    let meta_bytes = read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
-    let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
+    let (meta_bytes, meta_file, meta_path) =
+        read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
+    let (onnx_bytes, onnx_handle, onnx_path) = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
     if meta.onnx_file() != onnx_file
         || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
+    // 語彙ファイル（あれば）: 無い（NotFound）ときだけ省略し、それ以外の失敗は止める。保持 fd 1 本を
+    // ストリーミング 1 パスで検証し、以降の計測・複写にも同じ fd を使う（REQ-30・REQ-39・#125）。
+    let vocab = match open_member(VOCAB_FILE_NAME) {
+        Ok((file, real)) => Some((file, real.into_path_buf())),
+        Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            None
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
+    verify_vocab_file(&meta, vocab.as_ref().map(|(f, p)| (f, p.as_path())))?;
     Ok(CandidateArtifact {
         meta_bytes,
         meta,
         onnx_bytes,
         onnx_file: onnx_file.to_string(),
+        handles: ArtifactHandles {
+            meta: (meta_file, meta_path),
+            onnx: (onnx_handle, onnx_path),
+            vocab,
+        },
     })
 }
 
@@ -126,4 +168,53 @@ pub(crate) fn is_single_component(name: &str) -> bool {
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     )
+}
+
+/// 語彙ファイルの形式（許可制）と `artifact.json` 記載の sha256 との一致を、開いた保持 fd からの
+/// ストリーミング 1 パスで検証する（`select`・`package`・`evaluate`・`infer` が共有。REQ-30・REQ-39）。
+///
+/// 全体をメモリへ読まず、読みながら sha256 と形式（件数・トークン長の上限つき）を確認する
+/// （[`verify_vocab_stream`]）。保持 fd はオフセット 0 から読むこと（呼び出し側で開き直さない）。
+/// 語彙ファイルがあるのに sha256 の記録が無い・不一致・形式不正・サイズ超過、または記録があるのに
+/// ファイルが無い場合は `invalid_input`（fail-closed）、読み込み失敗は `runtime_error`。語彙ファイルも
+/// 記録も無ければ `Ok(None)`。あれば fstat のサイズを返す。
+pub(crate) fn verify_vocab_file(
+    meta: &ArtifactMeta,
+    vocab: Option<(&File, &Path)>,
+) -> Result<Option<u64>, ErrorReport> {
+    match (vocab, meta.vocab_sha256()) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(invalid("vocab file is missing but its hash is recorded")),
+        (Some(_), None) => Err(invalid("vocab file has no recorded hash")),
+        (Some((file, path)), Some(recorded)) => {
+            let read_err = |source| {
+                fs_report(&FsError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            };
+            let metadata = file.metadata().map_err(read_err)?;
+            if !metadata.is_file() {
+                return Err(fs_report(&FsError::NotRegularFile {
+                    path: path.to_path_buf(),
+                }));
+            }
+            let size = metadata.len();
+            if size > MAX_FILE_BYTES {
+                return Err(fs_report(&FsError::TooLarge {
+                    path: path.to_path_buf(),
+                    size,
+                    limit: MAX_FILE_BYTES,
+                }));
+            }
+            let digest = verify_vocab_stream(file, MAX_FILE_BYTES).map_err(|e| match e {
+                VocabStreamError::Format => ArtifactMetaError::InvalidVocab.to_error_report(),
+                VocabStreamError::Read => runtime("cannot read vocab file"),
+            })?;
+            if digest.to_hex() != recorded {
+                return Err(invalid("vocab file does not match its recorded hash"));
+            }
+            Ok(Some(size))
+        }
+    }
 }

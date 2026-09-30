@@ -158,6 +158,51 @@ pub struct SelectionRecord {
     pub validation_correct: u64,
     /// validation の件数。
     pub validation_total: u64,
+    /// 語彙ファイル超過構成として選定対象から除外した候補（REQ-30・TASK-30.3・#125）。
+    /// 除外が無いときはキーごと省略する（従来の記録と互換）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_candidates: Vec<ExcludedCandidate>,
+}
+
+/// 語彙ファイルを持つ構成が容量の目安（40MB）を超えたため選定対象から外した候補の記録
+/// （REQ-30・TASK-30.3・#125）。数値と固定コードのみを持ち、パス・入力本文を含めない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedCandidate {
+    /// 除外した候補の添字。
+    pub candidate_index: usize,
+    /// 除外した候補 ID。
+    pub candidate_id: String,
+    /// 機械可読な除外理由（`vocab_package_over_guideline`）。
+    pub reason: String,
+    /// パッケージ合計バイト数。
+    pub total_bytes: u64,
+    /// 目安（バイト）。
+    pub guideline_bytes: u64,
+}
+
+/// 全候補が容量の目安超過で除外され、選定記録を作れなかった `select` の除外結果
+/// （`selection_exclusions.json`。REQ-30・TASK-30.3・#125）。
+///
+/// 要素は [`SelectionRecord::excluded_candidates`] と同じ形。プロジェクト内部の記録で、CLI の
+/// stdout JSON と `selection_record.json` の形は変えない（`package`・`evaluate`・`infer` は読まない）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionExclusions {
+    /// 除外した候補。
+    pub excluded_candidates: Vec<ExcludedCandidate>,
+}
+
+impl SelectionExclusions {
+    /// JSON 1 行（末尾改行つき）へ直列化する。
+    ///
+    /// # Errors
+    /// 直列化に失敗した場合。
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, StageFileError> {
+        let mut bytes = serde_json::to_vec(self).map_err(|_| StageFileError::Serialize)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
 }
 
 impl SelectionRecord {
@@ -234,12 +279,37 @@ mod tests {
             rule: "validation_accuracy_desc_then_candidate_order".to_string(),
             validation_correct: 3,
             validation_total: 4,
+            excluded_candidates: Vec::new(),
         };
         let bytes = r.to_json_vec().expect("json");
+        // 除外が無い記録は従来どおり `excluded_candidates` キーを出さない。
+        assert!(!String::from_utf8_lossy(&bytes).contains("excluded_candidates"));
         assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
         assert_eq!(
             SelectionRecord::from_json_slice(br#"{"candidate_index":0,"extra":1}"#),
             Err(StageFileError::Malformed)
         );
+    }
+
+    /// REQ-30・TASK-30.3: 語彙超過の除外記録は往復でき、理由コードと数値を保つ。
+    #[test]
+    fn req30_selection_record_with_exclusion_round_trips() {
+        let r = SelectionRecord {
+            candidate_index: 0,
+            candidate_id: "c1".to_string(),
+            rule: "r".to_string(),
+            validation_correct: 1,
+            validation_total: 2,
+            excluded_candidates: vec![ExcludedCandidate {
+                candidate_index: 1,
+                candidate_id: "qwen".to_string(),
+                reason: "vocab_package_over_guideline".to_string(),
+                total_bytes: 46_365_993,
+                guideline_bytes: 40_000_000,
+            }],
+        };
+        let bytes = r.to_json_vec().expect("json");
+        assert!(String::from_utf8_lossy(&bytes).contains("\"total_bytes\":46365993"));
+        assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
     }
 }
