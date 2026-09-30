@@ -321,12 +321,19 @@ impl Project {
     }
 
     /// [`Project::create_dir_tracked`] が作ったディレクトリを片付ける（best effort）。
-    /// 中身は保持 fd 起点で消し、名前が作成時と同一の実体のときだけディレクトリ自身を消す。
-    pub fn remove_created_dir(&self, created: &CreatedDir) {
-        let _ = created.handle.clear_contents();
-        let _ = self
-            .package
-            .remove_empty_dir_member_if_same(&created.rel, &created.handle);
+    /// 中身は保持 fd 起点で消し（symlink は追従せず、プロジェクトの外へは出ない）、名前が作成時と
+    /// 同一の実体のときだけディレクトリ自身を消す。差し替えられていれば他所には触れない。
+    ///
+    /// 戻り値は、ディレクトリを完全に片付けられたか（`false` は残骸が残りうる）。
+    #[must_use]
+    pub fn remove_created_dir(&self, created: &CreatedDir) -> bool {
+        let cleared = created.handle.clear_contents().is_ok();
+        let removed = matches!(
+            self.package
+                .remove_empty_dir_member_if_same(&created.rel, &created.handle),
+            Ok(true)
+        );
+        cleared && removed
     }
 
     /// プロジェクト内のディレクトリ `from` を、存在しない `to` へ原子的に名前替えする

@@ -15,7 +15,8 @@
 //! （[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
 //!
 //! 学習ワーカーへ渡す validation は `id` と `input` のみ（正解ラベルは渡さない。REQ-27）。
-//! 失敗した候補の `candidates/<N>/` は残る（チェックポイントからの再開は提供しない。REQ-34）。
+//! 作成後に失敗した場合は、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける
+//! （同じ `--candidate` を再試行できる。チェックポイントからの再開は提供しない。REQ-34）。
 //!
 //! # 学習ワーカーの発見（暫定）
 //!
@@ -165,16 +166,51 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     if !project.exists(CANDIDATES_DIR)? {
         project.create_dir(CANDIDATES_DIR)?;
     }
-    project.create_dir(&rel)?;
-    let job_dir = project.create_dir(rel.join(JOB_DIR))?;
-    project.write_new(rel.join(TRAIN_INPUT_FILE), &train_jsonl)?;
-    project.write_new(rel.join(REQUEST_FILE), &request_json)?;
-
-    let run = run_train(
+    // 以降の失敗では、今回作った候補ディレクトリだけを片付けてから返す（同じ `--candidate` を
+    // 再試行できるようにする。名前替えの公開方式は使わない: 結果の `artifact_dir` は絶対パスで
+    // 記録されるため、移動すると記録と実体がずれる。REQ-34: 再開は提供せず、やり直しは新規）。
+    let created = project.create_dir_tracked(&rel)?;
+    let trained = train_in_candidate_dir(
+        &project,
+        &rel,
         &launcher,
         &request,
+        &train_jsonl,
+        &request_json,
+    );
+    match trained {
+        Ok(()) => Ok(TrainReport::new(args.candidate, candidate.candidate_id)),
+        Err(mut report) => {
+            if !project.remove_created_dir(&created) {
+                // 元のエラーの終了コードは変えず、残骸があることだけ固定文言で付記する。
+                report
+                    .message
+                    .push_str("; candidate directory could not be cleaned up");
+            }
+            Err(report)
+        }
+    }
+}
+
+/// 作成済みの候補ディレクトリへ学習入力を置き、学習ワーカーを実行して結果を保存する。
+/// 失敗時の後始末は呼び出し元（[`run`]）が行う。
+fn train_in_candidate_dir(
+    project: &Project,
+    rel: &Path,
+    launcher: &WorkerLauncher,
+    request: &TrainRequest,
+    train_jsonl: &[u8],
+    request_json: &[u8],
+) -> Result<(), ErrorReport> {
+    let job_dir = project.create_dir(rel.join(JOB_DIR))?;
+    project.write_new(rel.join(TRAIN_INPUT_FILE), train_jsonl)?;
+    project.write_new(rel.join(REQUEST_FILE), request_json)?;
+
+    let run = run_train(
+        launcher,
+        request,
         &job_dir,
-        &RunLimits::for_request(&request),
+        &RunLimits::for_request(request),
     )
     .map_err(|e| e.to_error_report())?;
     if let Some(report) = train_outcome_error_report(run.outcome()) {
@@ -188,8 +224,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     };
     let result_json =
         outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
-    project.write_new(rel.join(RESULT_FILE), &result_json)?;
-    Ok(TrainReport::new(args.candidate, candidate.candidate_id))
+    project.write_new(rel.join(RESULT_FILE), &result_json)
 }
 
 /// `split.json`（`inspect` の記録）を読み、取り込んだデータから分割を再現して照合する

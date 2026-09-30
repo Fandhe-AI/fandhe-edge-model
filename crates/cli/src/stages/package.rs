@@ -157,7 +157,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
-            project.remove_created_dir(&staging);
+            let _ = project.remove_created_dir(&staging);
             return Err(report);
         }
     };
@@ -185,14 +185,14 @@ fn finalize_staging(
     limit_bytes: u64,
 ) -> Result<Vec<LimitBreach>, ErrorReport> {
     if measured_bytes > limit_bytes {
-        project.remove_created_dir(staging);
+        let _ = project.remove_created_dir(staging);
         return Ok(vec![LimitBreach::Capacity {
             measured_bytes,
             limit_bytes,
         }]);
     }
     if let Err(report) = project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR) {
-        project.remove_created_dir(staging);
+        let _ = project.remove_created_dir(staging);
         return Err(report);
     }
     Ok(Vec::new())

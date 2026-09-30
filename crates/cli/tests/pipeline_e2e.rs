@@ -531,6 +531,30 @@ mod suite {
         assert!(!env.project_file("split.json").exists());
     }
 
+    /// REQ-34: 学習ワーカーが失敗（異常終了・残骸あり）すると `candidates/<N>/` は片付けられ、
+    /// 同じ `--candidate N` を成功するワーカーで再実行すると成功する（再開ではなく新規のやり直し）。
+    pub fn train_failure_cleans_candidate_dir_and_allows_retry() {
+        let env = inspected("trainretry");
+        let marker = env.project_file("fail_worker");
+        std::fs::write(&marker, "").expect("marker");
+        let (code, stdout) = env.run(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        assert_eq!(code, 70, "{stdout}");
+        assert_eq!(
+            stdout,
+            "{\"code\":\"runtime_error\",\"message\":\"worker process exited with unknown exit code 1\"}\n"
+        );
+        assert!(!env.project_file("candidates/0").exists());
+        // 別の候補の領域には触れない（親の `candidates/` は残る）。
+        assert!(env.project_file("candidates").is_dir());
+
+        std::fs::remove_file(&marker).expect("remove marker");
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}\n"
+        );
+        assert!(env.project_file("candidates/0/result.json").is_file());
+    }
+
     /// REQ-39: データに異常（重複 id 等）があると inspect が停止し、分割記録を残さない。
     pub fn inspect_rejects_invalid_records() {
         let env = Env::new("badrecords", false);
@@ -792,6 +816,12 @@ mod suite {
         let request = TrainRequest::from_json_slice(&bytes).expect("valid request");
         let out_dir = format!("{}/{}", request.root(), request.out_dir());
         std::fs::create_dir(&out_dir).expect("create out dir");
+        // 失敗の模擬: プロジェクト直下に目印があれば、出力の残骸を残して異常終了する
+        // （`root` は `<project>/candidates/<N>`）。
+        if Path::new(request.root()).join("../../fail_worker").exists() {
+            std::fs::write(format!("{out_dir}/partial.bin"), b"debris").expect("debris");
+            std::process::exit(1);
+        }
         let onnx_src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/onnx_parity")
             .join(format!("{}.onnx", request.kind()));
@@ -882,6 +912,10 @@ fn main() -> std::process::ExitCode {
         (
             "inspect_rejects_empty_validation_split_without_split_record",
             suite::inspect_rejects_empty_validation_split_without_split_record,
+        ),
+        (
+            "train_failure_cleans_candidate_dir_and_allows_retry",
+            suite::train_failure_cleans_candidate_dir_and_allows_retry,
         ),
         (
             "inspect_rejects_invalid_records",
