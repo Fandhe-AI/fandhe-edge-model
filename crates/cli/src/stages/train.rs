@@ -282,17 +282,25 @@ pub fn load_trained(
     };
     let request_bytes = project.read(rel.join(REQUEST_FILE), MAX_REQUEST_BYTES as u64)?;
     let request = TrainRequest::from_json_slice(&request_bytes).map_err(|e| e.to_error_report())?;
+    // 保存済みの結果の再検証失敗（`artifact_dir` が期待する場所と違う等）は、ワーカーの実行時エラー
+    // ではなくプロジェクト内の記録の不整合・改ざんなので `invalid_input`（固定語彙。REQ-39）。
     let outcome = TrainOutcome::from_worker_stdout(&result_bytes, &request)
-        .map_err(|e| e.to_error_report())?;
+        .map_err(|_| invalid("stored train result is invalid"))?;
     Ok(Some((request, outcome)))
 }
 
 /// 保存済みの学習リクエストが、既定候補 `params` から作られたものと同じ種類・構成かを返す
 /// （`select`・`package` が、別の種類の学習結果を候補 N として扱わないための照合。REQ-27・REQ-39）。
 ///
-/// 比べるのは `kind`・`kind_version`・`label_order`・`max_bytes`・`seed` と、`epochs` を除く
-/// `config`。`epochs` は `train --smoke` が 1 へ上書きする唯一の項目のため除く。`root`・出力先・
-/// 制限値は実行環境ごとの値なので比べない。
+/// 比べるのは `kind`・`kind_version`・`label_order`・`max_bytes`・`seed`・`root`・`out_dir` と、
+/// `epochs` を除く `config`。`epochs` は `train --smoke` が 1 へ上書きする唯一の項目のため除く。
+///
+/// `params` は `train` と同じ [`resolve_candidates`]（候補番号 N から `root`・`out_dir` を組み立てる
+/// 唯一の関数）で作ったものでなければならない。`root`・`out_dir` を比べるのは、保存済みの
+/// リクエストと結果の差し替えで `artifact_dir` が候補ディレクトリの外を指すのを防ぐため
+/// （`load_trained` は保存済みリクエストを基準に `artifact_dir` を検証するため。REQ-39）。`root` は
+/// 絶対パスで記録されるので、プロジェクトのディレクトリを移動すると一致せず拒否される
+/// （fail-closed として許容する）。制限値（時間・メモリ）は比べない。
 #[must_use]
 pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestParams) -> bool {
     request.kind() == params.kind
@@ -300,6 +308,8 @@ pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestPa
         && request.label_order().as_slice() == params.label_order.as_slice()
         && request.max_bytes() == params.max_bytes
         && request.seed() == params.seed
+        && request.root() == params.root
+        && request.out_dir() == params.out_dir
         && request
             .config()
             .iter()

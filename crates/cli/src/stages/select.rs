@@ -92,9 +92,21 @@ pub fn compute_selection(
         .map(|r| (r.id.as_str(), r.input.as_str()))
         .collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
-    let candidates = resolve_candidates(project, definition, 0, seed)?;
 
     let mut evaluated = Vec::new();
+    // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
+    // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
+    let candidate_count = resolve_candidates(project, definition, 0, seed)?.len();
+    let candidates = (0..candidate_count)
+        .map(|i| {
+            let mut all = resolve_candidates(project, definition, i, seed)?;
+            if i < all.len() {
+                Ok(all.swap_remove(i))
+            } else {
+                Err(runtime("candidate is not available"))
+            }
+        })
+        .collect::<Result<Vec<_>, ErrorReport>>()?;
     for (index, candidate) in candidates.iter().enumerate() {
         let Some((request, outcome)) = load_trained(project, index)? else {
             continue;

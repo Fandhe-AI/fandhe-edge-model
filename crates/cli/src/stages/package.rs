@@ -33,9 +33,11 @@ use std::path::{Component, Path};
 use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
+use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::kind::KindAllowlist;
+use fandhe_edge_guard::package::confine_package;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
@@ -50,13 +52,13 @@ use crate::args::PackageArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
     CreatedDir, DEFINITION_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE,
-    invalid, parse_definition, runtime,
+    fs_report, invalid, parse_definition,
 };
 
 use super::infer::load_backend;
 use super::select::compute_selection;
 use super::train::{
-    load_trained, read_split_record, request_matches_candidate, resolve_candidates,
+    candidate_rel, load_trained, read_split_record, request_matches_candidate, resolve_candidates,
 };
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
@@ -103,21 +105,27 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));
     };
-    // `artifact_dir` は再検証済みの絶対パス（候補の root 配下）。プロジェクト内の相対パスへ戻す。
+    // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から、ガード層の閉じ込め（保持 fd 起点・
+    // symlink 非追従）で読む。`artifact_dir` は文字列の前方一致でなく、閉じ込め済みの候補
+    // ディレクトリからの相対パスとして求める（リクエスト・結果の差し替えで候補の外を読まない。REQ-39）。
+    let candidate_dir = confine_package(project.dir(), &candidate_rel(selection.candidate_index))
+        .map_err(|e| e.to_error_report())?;
     let artifact_rel = Path::new(success.artifact_dir())
-        .strip_prefix(project.dir())
-        .map_err(|_| runtime("artifact directory is outside the project"))?
+        .strip_prefix(candidate_dir.dir())
+        .map_err(|_| invalid("artifact directory is outside the candidate directory"))?
         .to_path_buf();
     let onnx_file = success.artifact().onnx_file();
     if !is_single_component(onnx_file) {
         return Err(invalid("onnx file name is invalid"));
     }
-
-    let meta_bytes = project.read(
-        artifact_rel.join(ARTIFACT_META_FILE),
-        MAX_ARTIFACT_META_BYTES,
-    )?;
-    let onnx_bytes = project.read(artifact_rel.join(onnx_file), MAX_MODEL_FILE_BYTES)?;
+    let read_member = |name: &str, limit: u64| -> Result<Vec<u8>, ErrorReport> {
+        let (file, real) = candidate_dir
+            .open_member(&artifact_rel.join(name))
+            .map_err(|e| e.to_error_report())?;
+        read_bounded_open_file(file, real.as_path(), limit).map_err(|e| fs_report(&e))
+    };
+    let meta_bytes = read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
+    let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
     if meta.onnx_file() != onnx_file
         || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()

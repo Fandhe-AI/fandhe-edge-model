@@ -764,6 +764,83 @@ mod suite {
         env.ok(&["package", "--project-dir", "proj"]);
     }
 
+    /// 候補 0 の成果物をプロジェクト内の別の場所（`other/`）へ移した状態を作る。
+    /// `request.json` の `root` と `result.json` の `artifact_dir` を、移動先に合わせて書き換える。
+    fn relocate_candidate_zero_artifacts(env: &Env) {
+        std::fs::create_dir_all(env.project_file("other")).expect("other");
+        std::fs::rename(
+            env.project_file("candidates/0/model-c1"),
+            env.project_file("other/model-c1"),
+        )
+        .expect("move artifacts");
+        let project = env.project_file("");
+        let project = project.to_str().expect("utf8").trim_end_matches('/');
+        let old_root = format!("{project}/candidates/0");
+        let new_root = format!("{project}/other");
+        for file in ["request.json", "result.json"] {
+            let path = env.project_file(&format!("candidates/0/{file}"));
+            let text = std::fs::read_to_string(&path).expect(file);
+            assert!(text.contains(&old_root), "{file}: {text}");
+            std::fs::write(&path, text.replace(&old_root, &new_root)).expect("rewrite");
+        }
+    }
+
+    /// REQ-39: 候補 0 の `request.json` の `root` と `result.json` の `artifact_dir` を、プロジェクト内の
+    /// 別の場所へ揃えて書き換えても（リクエストと結果の整合は保たれる）、`select` は候補 0 の期待する
+    /// `root` と一致しないため `invalid_input`（64）で止まり、選定記録を作らない。
+    pub fn select_rejects_request_root_outside_candidate_dir() {
+        let env = inspected("selroot");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        relocate_candidate_zero_artifacts(&env);
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-39: 同じ差し替えを選定の後に行うと、`package` も `invalid_input`（64）で止まり、
+    /// `package/` もステージングも作らない。
+    pub fn package_rejects_request_root_outside_candidate_dir() {
+        let env = inspected("pkgroot");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        relocate_candidate_zero_artifacts(&env);
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-39: `request.json` はそのままで、成果物のディレクトリ `candidates/0/model-c1` を
+    /// プロジェクト内の別の場所（`other/`）への symlink にして `artifact_dir` が候補の外を指す場合、
+    /// 保存済みの結果の再検証（期待する `artifact_dir` と不一致）で `invalid_input`（64）として止まり、
+    /// `package/` を作らない。
+    pub fn package_rejects_artifact_dir_outside_candidate_dir() {
+        let env = inspected("pkgoutside");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        std::fs::create_dir_all(env.project_file("other")).expect("other");
+        let link = env.project_file("candidates/0/model-c1");
+        std::fs::rename(&link, env.project_file("other/model-c1")).expect("move");
+        std::os::unix::fs::symlink("../../other/model-c1", &link).expect("symlink");
+        let result = env.project_file("candidates/0/result.json");
+        let text = std::fs::read_to_string(&result).expect("result.json");
+        std::fs::write(
+            &result,
+            text.replace("/candidates/0/model-c1", "/other/model-c1"),
+        )
+        .expect("rewrite result");
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"stored train result is invalid\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
     /// REQ-39: `artifact.json` の `kind_version` が選定候補の学習リクエストと食い違うと、公開前に
     /// `invalid_input`（64）で止まり `package/` を作らない。
     pub fn package_rejects_artifact_kind_version_mismatch() {
@@ -994,6 +1071,18 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_artifact_kind_version_mismatch",
             suite::package_rejects_artifact_kind_version_mismatch,
+        ),
+        (
+            "select_rejects_request_root_outside_candidate_dir",
+            suite::select_rejects_request_root_outside_candidate_dir,
+        ),
+        (
+            "package_rejects_request_root_outside_candidate_dir",
+            suite::package_rejects_request_root_outside_candidate_dir,
+        ),
+        (
+            "package_rejects_artifact_dir_outside_candidate_dir",
+            suite::package_rejects_artifact_dir_outside_candidate_dir,
         ),
         (
             "infer_out_option_is_not_faked",
