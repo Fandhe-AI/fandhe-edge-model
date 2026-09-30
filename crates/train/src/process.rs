@@ -121,7 +121,7 @@
 //! 本モジュールは [`CancelledRun::out_dir_residue`] で読み取り専用の状態だけ
 //! 報告し、削除・rename はしない。やり直しの案内は [`crate::restart`]
 //! （TASK-34.3・#147。自動掃除はせず案内する）、
-//! `job.json` の永続化は TASK-34.2・#146。キャンセルの終了コード写像は
+//! `job.json` の永続化とクラッシュ検出は [`crate::job_record`]（TASK-34.2・#146。実装済み）。キャンセルの終了コード写像は
 //! TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
 //!
 //! # windows（対象外・fail-closed）
@@ -569,6 +569,19 @@ impl std::fmt::Debug for RedactedOutcome<'_> {
 }
 
 impl TrainRun {
+    /// 単体テスト専用の組み立て（`job_record` の分類テストが、子プロセスを起動せずに
+    /// 結果を作るため）。製品コードからは使えない。
+    #[cfg(test)]
+    pub(crate) fn for_test(outcome: TrainOutcome, exit_code: ExitCode) -> Self {
+        Self {
+            outcome,
+            exit_code,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
     /// テスト用: ワーカーのエラー結果で終わった実行（`restart` のテストが使う）。
     #[cfg(test)]
     pub(crate) fn for_test_error() -> Self {
