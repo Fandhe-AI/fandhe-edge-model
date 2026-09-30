@@ -277,7 +277,7 @@ fn verify_evaluation_record(
     let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
     let applied = match HeldLedger::open(project, false)? {
         Some(held) => held
-            .ledger()?
+            .ledger()
             .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
             .map_err(|e| acquire_error_report(&e))?,
         None => false,

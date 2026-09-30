@@ -16,7 +16,8 @@
 //! 合成データ・CPU のみ。macOS 実機の sandbox 下での完走確認と拒否ログの記録は人の担当で、
 //! 本テストはその証拠にならない（手順は `docs/design/sandbox-offline-check-procedure.md`）。
 //! 陽性対照（TASK-38.2・#164）は偽の curl と偽の `log` の拒否行で通し、`detected` を確かめる。
-//! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価本体の配線は未実装。評価の完走は未達）。
+//! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価データありの `evaluate` は評価器へ接続済み・#314 だが、
+//! 本テストでは通していない。評価の完走は未確認）。
 //!
 //! # 既定のテスト集合から分離する理由（`.claude/rules/ci.md`）
 //!

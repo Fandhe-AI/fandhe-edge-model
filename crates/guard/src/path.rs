@@ -790,6 +790,40 @@ impl ConfinedDir {
         Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
     }
 
+    /// 本ディレクトリ直下のエントリ名を、保持した fd を起点に列挙する（`.`・`..` は除く）。
+    ///
+    /// 最大 `limit + 1` 件で列挙を打ち切る（呼び出し側は件数が `limit` を超えたかを判定できる。
+    /// 走査量の上限。REQ-39）。パスを再解決しない。
+    ///
+    /// # Errors
+    /// 列挙の失敗。
+    pub fn list_entry_names(&self, limit: usize) -> io::Result<Vec<std::ffi::OsString>> {
+        use rustix::fs::Dir;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut names = Vec::new();
+        for entry in Dir::read_from(&self.fd).map_err(errno_to_io)? {
+            let entry = entry.map_err(errno_to_io)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(std::ffi::OsStr::from_bytes(bytes).to_os_string());
+            if names.len() > limit {
+                break;
+            }
+        }
+        Ok(names)
+    }
+
+    /// 保持しているディレクトリ fd を `fsync` する（ディレクトリエントリの永続化。パスを再解決しない）。
+    ///
+    /// # Errors
+    /// fd の複製・`fsync` の失敗。
+    pub fn sync_all(&self) -> io::Result<()> {
+        File::from(self.fd.try_clone()?).sync_all()
+    }
+
     /// 本ディレクトリ配下の `from` を、同じく配下の `to` へ名前替えする（ステージングの原子的な公開用。
     /// 両者の親は保持 fd 起点で辿る。REQ-39）。
     ///

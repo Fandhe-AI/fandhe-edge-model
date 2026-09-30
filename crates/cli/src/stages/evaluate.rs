@@ -40,12 +40,13 @@
 //! 成功時は `candidates/<N>/evaluation_record.json`（[`EvaluationRecord`]）を新規に書く。`package` は
 //! 記録とモデル・`artifact.json`・評価データ・定義のハッシュの一致と、最終 test の台帳での適用完了を確認してから公開する。
 //! 記録ファイル自体はプロジェクトに書き込める主体なら作り直せる（外部台帳は #168・TASK-39.3-2。
-//! 本工程は検証済みとしない）。評価器のパスベース API は `O_NOFOLLOW` の成分走査をしないため、
-//! 閉じ込めつきで読み検証したバイト列（評価データ・重み）を私用の一時ディレクトリ（0700）へ複製し、
-//! そのパスだけを評価器へ渡す（プロジェクト内のパスを渡さない。REQ-39）。最終 test の台帳
-//! ディレクトリは保持 fd 起点で開き、使う直前ごとに保持 fd とパスの実体（dev・ino）の一致を確認する
-//! （[`super::ledger::HeldLedger`]）。評価器の台帳 API がパスを受け取るため、確認と台帳操作の間の
-//! 差し替えは原理的に残る（fd 相対の台帳 API は #168 の範囲）。
+//! 本工程は検証済みとしない）。評価器のモデル・評価データ入力はパスを受け取り
+//! `O_NOFOLLOW` の成分走査をしないため、閉じ込めつきで読み検証したバイト列（評価データ・重み）を
+//! 私用の一時ディレクトリ（0700）へ複製し、そのパスだけを評価器へ渡す（プロジェクト内のパスを
+//! 渡さない。REQ-39）。最終 test の台帳は、保持 fd 起点で開いた台帳ディレクトリを
+//! `LedgerDir` の fd 実装（[`crate::held_ledger_dir::HeldLedgerDir`]。[`super::ledger::HeldLedger`]）
+//! 越しに評価器へ渡し、台帳の読み書き・一覧・永続化はすべて保持 fd 起点の `openat` で行う
+//! （パスへ戻る経路なし。検証後の差し替えでプロジェクト外を読み書きしない。#168）。
 //!
 //! 指標の算出・結果の検証・記録ファイルの書き込みは、台帳へ完了を記録する前
 //! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
@@ -212,11 +213,11 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .to_hex();
     let onnx_digest = Sha256Digest::of_bytes(&target.artifact.onnx_bytes);
 
-    // 台帳は保持 fd 起点で開き、使う直前ごとに同一性を確認する（REQ-39。[`HeldLedger`]）。
+    // 台帳は保持 fd 起点で開き、以降の操作もすべて fd 相対で行う（REQ-39。[`HeldLedger`]）。
     let held_ledger = HeldLedger::open(&project, true)?
         .ok_or_else(|| runtime("cannot open final test ledger"))?;
     match held_ledger
-        .ledger()?
+        .ledger()
         .register_configs(&freeze.sha256(), &entries)
     {
         Ok(()) | Err(AcquireError::AlreadyRegistered { .. }) => {}
@@ -244,7 +245,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         })
     };
     let (_applied, report) = match apply_to_frozen_data(
-        held_ledger.ledger()?,
+        held_ledger.ledger(),
         &freeze,
         &definition,
         &eval_bytes,

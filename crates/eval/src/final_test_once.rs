@@ -98,7 +98,9 @@
 //! - 事前登録集合の内容（どの候補・seed を登録するか）の決定は呼び出し側（選定工程）の
 //!   責務。本モジュールは登録の凍結と照合のみを行う。
 //! - 台帳ディレクトリの配置・ルート配下への閉じ込めはガード層（REQ-39）と呼び出し側の
-//!   責務。本モジュールは symlink でない実ディレクトリであることのみ検査する。
+//!   責務。台帳のファイル操作は [`crate::ledger_dir::LedgerDir`] 越しで、パス版
+//!   ([`FinalTestLedger::open`]。symlink でない実ディレクトリであることのみ検査) と、呼び出し側が
+//!   渡す保持 fd 起点の実装（[`FinalTestLedger::with_dir`]。CLI）を同じ台帳ロジックで使う。
 //! - 既存予測の再採点（予測を当てない操作）はロック不要のため対象外。
 //! - seed は独自フィールドにせず、呼び出し側が事前登録（PoC-10: 代表構成を seed ごとに
 //!   1 回）に従って構成 ID へ畳み込む（例 `c1:seed0`）。
@@ -110,12 +112,14 @@ use crate::invariance::{
     EvaluationInvarianceError, MAX_MODEL_COMPONENT_BYTES, ModelPackagePaths,
     evaluate_with_invariance,
 };
+use crate::ledger_dir::{EntryKind, LedgerDir, StdLedgerDir};
 use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// 代表構成 ID の最大バイト数（確保・検証の上限。REQ-39）。
 pub const MAX_CONFIG_ID_BYTES: usize = 128;
@@ -327,12 +331,6 @@ fn registry_digest(body: &[u8]) -> Sha256Digest {
     buf.extend_from_slice(REGISTRY_CONTENT_DOMAIN);
     buf.extend_from_slice(body);
     Sha256Digest::of_bytes(&buf)
-}
-
-fn is_read_only(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_file() && m.permissions().readonly())
-        .unwrap_or(false)
 }
 
 /// 最終 test 適用の識別キー（評価データ × 代表構成 × 重み）。
@@ -613,34 +611,48 @@ impl ApplicationTicket {
 }
 
 /// 呼び出し側が用意した台帳ディレクトリを包む。
-#[derive(Debug, Clone)]
+///
+/// ファイル操作はすべて [`LedgerDir`] 越しに行う（[`FinalTestLedger::open`] はパス版の
+/// [`StdLedgerDir`]、CLI は保持 fd 起点の実装を [`FinalTestLedger::with_dir`] で渡す。REQ-39）。
+#[derive(Clone)]
 pub struct FinalTestLedger {
-    dir: PathBuf,
+    dir: Arc<dyn LedgerDir>,
+}
+
+impl fmt::Debug for FinalTestLedger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalTestLedger").finish_non_exhaustive()
+    }
+}
+
+/// 台帳直下の相対名 `<scope>/<name>`。
+fn member(scope: &str, name: &str) -> String {
+    format!("{scope}/{name}")
 }
 
 impl FinalTestLedger {
     /// symlink でない実ディレクトリであることを検証して開く（作成はしない）。
+    ///
+    /// std のパス操作の実装（[`StdLedgerDir`]）を使う薄いラッパ。検証後のパス差し替えに強い
+    /// 呼び出しが必要なら、保持 fd 起点の実装を [`FinalTestLedger::with_dir`] へ渡す（REQ-39）。
     pub fn open(dir: &Path) -> Result<Self, AcquireError> {
         match fs::symlink_metadata(dir) {
-            Ok(meta) if meta.is_dir() => Ok(FinalTestLedger {
-                dir: dir.to_path_buf(),
-            }),
+            Ok(meta) if meta.is_dir() => Ok(Self::with_dir(StdLedgerDir::new(dir.to_path_buf()))),
             _ => Err(AcquireError::LedgerDirInvalid {
                 path: dir.to_path_buf(),
             }),
         }
     }
 
-    fn create_lock(dir: &Path, name: &str, by: AppliedBy) -> Result<(File, PathBuf), AcquireError> {
-        let path = dir.join(name);
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-        match opts.open(&path) {
+    /// 呼び出し側が用意した [`LedgerDir`] 実装で台帳を開く（実体の検証は実装側の責務）。
+    #[must_use]
+    pub fn with_dir(dir: impl LedgerDir + 'static) -> Self {
+        FinalTestLedger { dir: Arc::new(dir) }
+    }
+
+    fn create_lock(&self, rel: &str, by: AppliedBy) -> Result<(File, PathBuf), AcquireError> {
+        let path = self.dir.display_path(rel);
+        match self.dir.create_new_file(rel) {
             Ok(file) => Ok((file, path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(AcquireError::AlreadyApplied {
@@ -663,61 +675,50 @@ impl FinalTestLedger {
 
     /// 書き込み権を外す（登録・封印を通常のファイル操作で書き換えられなくする。
     /// 権限を戻せる主体には効かないため、改変の検出は封印・ロック記録との照合が担う）。
-    fn make_read_only(path: &Path) -> Result<(), AcquireError> {
-        let io = |source| AcquireError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let mut perms = fs::metadata(path).map_err(io)?.permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(path, perms).map_err(io)
-    }
-
-    /// 台帳ディレクトリのエントリを永続化する。失敗を握りつぶさない（予測後の
-    /// クラッシュでロックのエントリが失われると再適用できてしまうため）。
-    #[cfg(unix)]
-    fn sync_dir(dir: &Path) -> Result<(), AcquireError> {
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|source| AcquireError::DurabilityFailed {
-                path: dir.to_path_buf(),
+    fn make_read_only(&self, rel: &str) -> Result<(), AcquireError> {
+        self.dir
+            .make_read_only(rel)
+            .map_err(|source| AcquireError::Io {
+                path: self.dir.display_path(rel),
                 source,
             })
     }
 
-    /// 非 Unix（Windows 等）ではディレクトリハンドルの `sync_all` が使えない。
-    /// ロックファイル自体は `write_record` で `sync_all` 済みのため成功扱いとする
-    /// （ディレクトリエントリの永続化は OS 任せ。モジュール docs の限界を参照）。
-    #[cfg(not(unix))]
-    fn sync_dir(dir: &Path) -> Result<(), AcquireError> {
-        let _ = dir;
-        Ok(())
+    /// 台帳（`rel` が `""`）またはそのサブディレクトリのエントリを永続化する。失敗を握りつぶさない
+    /// （予測後のクラッシュでロックのエントリが失われると再適用できてしまうため）。
+    fn sync_dir(&self, rel: &str) -> Result<(), AcquireError> {
+        self.dir
+            .sync_dir(rel)
+            .map_err(|source| AcquireError::DurabilityFailed {
+                path: self.dir.display_path(rel),
+                source,
+            })
     }
 
-    /// 評価データごとのサブディレクトリのパス（名前はコードが生成した hex のみ）。
-    fn scope_dir(&self, eval_data_sha256: &Sha256Digest) -> PathBuf {
-        self.dir.join(eval_scope(eval_data_sha256))
+    /// 評価データごとのサブディレクトリの相対名（名前はコードが生成した hex のみ）。
+    fn scope_dir(&self, eval_data_sha256: &Sha256Digest) -> String {
+        eval_scope(eval_data_sha256)
     }
 
-    /// 評価データのサブディレクトリを `create_dir`（Unix では 0700）で作る。既存なら
-    /// symlink でない実ディレクトリであることを検証する（`symlink_metadata`）。
-    fn ensure_scope_dir(&self, eval_data_sha256: &Sha256Digest) -> Result<PathBuf, AcquireError> {
-        let path = self.scope_dir(eval_data_sha256);
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        match builder.create(&path) {
-            Ok(()) => Self::sync_dir(&self.dir)?,
+    /// 評価データのサブディレクトリを作る（Unix では 0700）。既存なら symlink でない実ディレクトリで
+    /// あることを検証する（辿らない検査）。
+    fn ensure_scope_dir(&self, eval_data_sha256: &Sha256Digest) -> Result<String, AcquireError> {
+        let scope = self.scope_dir(eval_data_sha256);
+        match self.dir.create_dir(&scope) {
+            Ok(()) => self.sync_dir("")?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(AcquireError::Io { path, source }),
+            Err(source) => {
+                return Err(AcquireError::Io {
+                    path: self.dir.display_path(&scope),
+                    source,
+                });
+            }
         }
-        match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => Ok(path),
-            _ => Err(AcquireError::LedgerDirInvalid { path }),
+        match self.dir.entry_kind(&scope) {
+            Ok(EntryKind::Dir) => Ok(scope),
+            _ => Err(AcquireError::LedgerDirInvalid {
+                path: self.dir.display_path(&scope),
+            }),
         }
     }
 
@@ -733,8 +734,8 @@ impl FinalTestLedger {
         eval_data_sha256: &Sha256Digest,
     ) -> Result<(Vec<RegisteredConfig>, Sha256Digest), AcquireError> {
         let sdir = self.scope_dir(eval_data_sha256);
-        match fs::symlink_metadata(&sdir) {
-            Ok(m) if m.is_dir() => {}
+        match self.dir.entry_kind(&sdir) {
+            Ok(EntryKind::Dir) => {}
             Ok(_) => {
                 return Err(AcquireError::RegistryTampered {
                     reason: "scope directory is not a real directory",
@@ -743,17 +744,27 @@ impl FinalTestLedger {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(AcquireError::NotRegistered);
             }
-            Err(source) => return Err(AcquireError::Io { path: sdir, source }),
+            Err(source) => {
+                return Err(AcquireError::Io {
+                    path: self.dir.display_path(&sdir),
+                    source,
+                });
+            }
         }
-        let path = sdir.join(registry_name(eval_data_sha256));
+        let path = member(&sdir, &registry_name(eval_data_sha256));
         // 通常ファイル判定・`O_NONBLOCK` 付きオープン・サイズ上限付き読み込みは共通コアに
         // 集約されている。FIFO 等では open 前に拒否され、無期限に待たない（REQ-39）。
-        let bytes = match fandhe_edge_core::fs::read_bounded(&path, MAX_REGISTRY_BYTES) {
+        let bytes = match self.dir.read_bounded(&path, MAX_REGISTRY_BYTES) {
             Ok(b) => b,
             Err(FsError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Err(AcquireError::NotRegistered);
             }
-            Err(FsError::Read { source, .. }) => return Err(AcquireError::Io { path, source }),
+            Err(FsError::Read { source, .. }) => {
+                return Err(AcquireError::Io {
+                    path: self.dir.display_path(&path),
+                    source,
+                });
+            }
             Err(FsError::TooLarge { .. }) => {
                 return Err(AcquireError::RegistryInvalid {
                     reason: "registry file too large",
@@ -766,8 +777,8 @@ impl FinalTestLedger {
             }
         };
         let actual = registry_digest(&bytes);
-        let seal_path = sdir.join(seal_name(eval_data_sha256));
-        let seal_bytes = match fandhe_edge_core::fs::read_bounded(&seal_path, MAX_SEAL_BYTES) {
+        let seal_path = member(&sdir, &seal_name(eval_data_sha256));
+        let seal_bytes = match self.dir.read_bounded(&seal_path, MAX_SEAL_BYTES) {
             Ok(b) => b,
             Err(_) => {
                 return Err(AcquireError::RegistryTampered {
@@ -791,7 +802,7 @@ impl FinalTestLedger {
                 reason: "registry content does not match its seal",
             });
         }
-        if !is_read_only(&path) || !is_read_only(&seal_path) {
+        if !self.dir.is_read_only_file(&path) || !self.dir.is_read_only_file(&seal_path) {
             return Err(AcquireError::RegistryTampered {
                 reason: "registry or seal is writable",
             });
@@ -804,7 +815,7 @@ impl FinalTestLedger {
         // 両方を差し替えても、既存ロックの記録と食い違えば検出できる。現在の登録に含まれる
         // ID に限らず、この評価データの既存ロックをすべて列挙して照合する（登録から
         // 適用済み ID を除いた集合への差し替えを検出するため）。
-        Self::check_existing_locks(&sdir, eval_data_sha256, &sealed, MAX_LOCK_SCAN_ENTRIES)?;
+        self.check_existing_locks(&sdir, eval_data_sha256, &sealed, MAX_LOCK_SCAN_ENTRIES)?;
         Ok((entries, sealed))
     }
 
@@ -819,29 +830,31 @@ impl FinalTestLedger {
     /// ファイルでないロックは fail-closed で拒否する。空のロックは、代表構成ロック作成後に
     /// 重みロックの衝突で記録を書かず失敗した消費済みの残骸で、記録が無いので照合しない。
     fn check_existing_locks(
-        sdir: &Path,
+        &self,
+        sdir: &str,
         eval_data_sha256: &Sha256Digest,
         sealed: &Sha256Digest,
         limit: usize,
     ) -> Result<(), AcquireError> {
         let tampered = |reason| AcquireError::RegistryTampered { reason };
-        let entries = fs::read_dir(sdir).map_err(|_| tampered("ledger is unreadable"))?;
+        let entries = self
+            .dir
+            .list_names(sdir, limit)
+            .map_err(|_| tampered("ledger is unreadable"))?;
+        // 走査量の上限は列挙の時点で `limit + 1` 件に頭打ちされる（許可パターン外を含む。REQ-39）。
+        if entries.len() > limit {
+            return Err(tampered("too many ledger entries"));
+        }
         let want_eval = eval_data_sha256.to_hex();
         let want_registry = sealed.to_hex();
-        let mut scanned = 0usize;
-        for entry in entries {
-            let entry = entry.map_err(|_| tampered("ledger is unreadable"))?;
-            let name = entry.file_name();
-            // 許可パターンに合わないエントリも数える（走査量の上限。REQ-39）。
-            scanned += 1;
-            if scanned > limit {
-                return Err(tampered("too many ledger entries"));
-            }
-            let Some(name) = name.to_str() else { continue };
-            if !is_lock_file_name(name) {
+        for name in entries {
+            let Some(name) = name else { continue };
+            if !is_lock_file_name(&name) {
                 continue;
             }
-            let bytes = fandhe_edge_core::fs::read_bounded(&entry.path(), MAX_LOCK_RECORD_BYTES)
+            let bytes = self
+                .dir
+                .read_bounded(&member(sdir, &name), MAX_LOCK_RECORD_BYTES)
                 .map_err(|_| tampered("application lock is unreadable"))?;
             if bytes.is_empty() {
                 continue;
@@ -874,17 +887,18 @@ impl FinalTestLedger {
         registry_sha256: &Sha256Digest,
     ) -> Result<ApplicationTicket, AcquireError> {
         let sdir = self.scope_dir(&key.eval_data_sha256);
-        let (cfg_file, cfg_path) = Self::create_lock(
-            &sdir,
-            &key.config_lock_name(),
+        let (cfg_file, cfg_path) = self.create_lock(
+            &member(&sdir, &key.config_lock_name()),
             AppliedBy::RepresentativeConfig,
         )?;
         // 以降、失敗してもロールバックしない（適用を試みた事実として消費扱い）。
-        let (w_file, w_path) =
-            Self::create_lock(&sdir, &key.weights_lock_name(), AppliedBy::ModelWeights)?;
+        let (w_file, w_path) = self.create_lock(
+            &member(&sdir, &key.weights_lock_name()),
+            AppliedBy::ModelWeights,
+        )?;
         Self::write_record(cfg_file, &cfg_path, &key.record("config", registry_sha256))?;
         Self::write_record(w_file, &w_path, &key.record("weights", registry_sha256))?;
-        Self::sync_dir(&sdir)?;
+        self.sync_dir(&sdir)?;
         Ok(ApplicationTicket {
             config_lock: cfg_path,
         })
@@ -898,11 +912,8 @@ impl FinalTestLedger {
         registry_sha256: &Sha256Digest,
     ) -> Result<(), AcquireError> {
         let sdir = self.scope_dir(&key.eval_data_sha256);
-        let (file, path) = Self::create_lock(
-            &sdir,
-            &key.completion_name(),
-            AppliedBy::RepresentativeConfig,
-        )?;
+        let rel = member(&sdir, &key.completion_name());
+        let (file, path) = self.create_lock(&rel, AppliedBy::RepresentativeConfig)?;
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -915,8 +926,8 @@ impl FinalTestLedger {
             registry_sha256.to_hex(),
         );
         Self::write_record(file, &path, &body)?;
-        Self::make_read_only(&path)?;
-        Self::sync_dir(&sdir)
+        self.make_read_only(&rel)?;
+        self.sync_dir(&sdir)
     }
 
     /// 代表構成 `config_id`・重み `weights_sha256` の最終 test 適用が、この台帳で完了しているかを返す
@@ -960,16 +971,18 @@ impl FinalTestLedger {
             (key.config_lock_name(), "config"),
             (key.weights_lock_name(), "weights"),
         ] {
-            let bytes =
-                match fandhe_edge_core::fs::read_bounded(&sdir.join(name), MAX_LOCK_RECORD_BYTES) {
-                    Ok(b) => b,
-                    Err(FsError::Read { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        return Ok(false);
-                    }
-                    Err(_) => return Err(tampered("application lock is unreadable")),
-                };
+            let bytes = match self
+                .dir
+                .read_bounded(&member(&sdir, &name), MAX_LOCK_RECORD_BYTES)
+            {
+                Ok(b) => b,
+                Err(FsError::Read { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(false);
+                }
+                Err(_) => return Err(tampered("application lock is unreadable")),
+            };
             if bytes.is_empty() {
                 return Ok(false);
             }
@@ -990,8 +1003,8 @@ impl FinalTestLedger {
         }
         // 適用権の消費（ロック）と評価の成功は別の状態。成功記録が無ければ、予測の失敗などで
         // 消費だけが済んだ適用であり、完了とはみなさない（REQ-27）。
-        let bytes = match fandhe_edge_core::fs::read_bounded(
-            &sdir.join(key.completion_name()),
+        let bytes = match self.dir.read_bounded(
+            &member(&sdir, &key.completion_name()),
             MAX_LOCK_RECORD_BYTES,
         ) {
             Ok(b) => b,
@@ -1159,16 +1172,15 @@ impl FinalTestLedger {
         }
         let sdir = self.ensure_scope_dir(eval_data_sha256)?;
         for entry in &sorted {
-            let path = sdir.join(config_lock_name(eval_data_sha256, &entry.id));
-            if fs::symlink_metadata(&path).is_ok() {
-                return Err(AcquireError::AlreadyRegistered { path });
+            let rel = member(&sdir, &config_lock_name(eval_data_sha256, &entry.id));
+            if self.dir.entry_kind(&rel).is_ok() {
+                return Err(AcquireError::AlreadyRegistered {
+                    path: self.dir.display_path(&rel),
+                });
             }
         }
-        let (file, path) = match Self::create_lock(
-            &sdir,
-            &registry_name(eval_data_sha256),
-            AppliedBy::RepresentativeConfig,
-        ) {
+        let registry_rel = member(&sdir, &registry_name(eval_data_sha256));
+        let (file, path) = match self.create_lock(&registry_rel, AppliedBy::RepresentativeConfig) {
             Ok(v) => v,
             Err(AcquireError::AlreadyApplied { lock_path, .. }) => {
                 return Err(AcquireError::AlreadyRegistered { path: lock_path });
@@ -1177,27 +1189,25 @@ impl FinalTestLedger {
         };
         let body = registry_body(&sorted);
         Self::write_record(file, &path, &body)?;
-        Self::make_read_only(&path)?;
+        self.make_read_only(&registry_rel)?;
         // 登録本文の sha256 を別ファイルへ 1 回だけ封印する。登録ファイルだけを
         // 書き換えても、封印との不一致で適用が拒否される。
-        let (seal_file, seal_path) = match Self::create_lock(
-            &sdir,
-            &seal_name(eval_data_sha256),
-            AppliedBy::RepresentativeConfig,
-        ) {
-            Ok(v) => v,
-            Err(AcquireError::AlreadyApplied { lock_path, .. }) => {
-                return Err(AcquireError::AlreadyRegistered { path: lock_path });
-            }
-            Err(e) => return Err(e),
-        };
+        let seal_rel = member(&sdir, &seal_name(eval_data_sha256));
+        let (seal_file, seal_path) =
+            match self.create_lock(&seal_rel, AppliedBy::RepresentativeConfig) {
+                Ok(v) => v,
+                Err(AcquireError::AlreadyApplied { lock_path, .. }) => {
+                    return Err(AcquireError::AlreadyRegistered { path: lock_path });
+                }
+                Err(e) => return Err(e),
+            };
         let seal = format!(
             "{SEAL_HEADER}registry_sha256={}\n",
             registry_digest(body.as_bytes()).to_hex()
         );
         Self::write_record(seal_file, &seal_path, &seal)?;
-        Self::make_read_only(&seal_path)?;
-        Self::sync_dir(&sdir)
+        self.make_read_only(&seal_rel)?;
+        self.sync_dir(&sdir)
     }
 }
 
@@ -1363,15 +1373,16 @@ mod tests {
         let ledger = FinalTestLedger::open(&dir).unwrap();
         let (mine, other) = (d(1), d(2));
         let sealed = d(9);
-        let my_dir = ledger.ensure_scope_dir(&mine).unwrap();
-        let other_dir = ledger.ensure_scope_dir(&other).unwrap();
+        let my_scope = ledger.ensure_scope_dir(&mine).unwrap();
+        let other_scope = ledger.ensure_scope_dir(&other).unwrap();
+        let (my_dir, other_dir) = (dir.join(&my_scope), dir.join(&other_scope));
         for i in 0..50 {
             fs::write(other_dir.join(format!("junk-{i}")), "garbage").unwrap();
         }
         for i in 0..2 {
             fs::write(my_dir.join(format!("junk-{i}")), "x").unwrap();
         }
-        let check = |limit| FinalTestLedger::check_existing_locks(&my_dir, &mine, &sealed, limit);
+        let check = |limit| ledger.check_existing_locks(&my_scope, &mine, &sealed, limit);
         assert!(check(2).is_ok());
         assert!(matches!(
             check(1),

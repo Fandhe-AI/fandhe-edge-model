@@ -237,6 +237,37 @@ impl ConfinedPackage {
         }
     }
 
+    /// 本パッケージ直下のエントリ名を列挙する（最大 `limit + 1` 件で打ち切る。REQ-39）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::list_entry_names`] と同じ。Linux・macOS 以外は `Unsupported`。
+    pub fn list_entry_names(&self, limit: usize) -> std::io::Result<Vec<std::ffi::OsString>> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = limit;
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.list_entry_names(limit)
+        }
+    }
+
+    /// 保持しているディレクトリ fd を `fsync` する。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::sync_all`] と同じ。Linux・macOS 以外は `Unsupported`。
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.sync_all()
+        }
+    }
+
     /// 本パッケージの中身を、保持した fd 起点で再帰的に削除する（本ディレクトリは残す）。
     ///
     /// # Errors
@@ -423,6 +454,24 @@ mod tests {
         );
         // 保持していた実体（移動後の made_orig）の中身は消えている。
         assert!(!base.join("ws/made_orig/a.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 保持 fd 起点の列挙は上限 + 1 件で打ち切り、`.`・`..` を含まない。fsync も通る。
+    #[test]
+    fn req39_list_entry_names_is_bounded_and_skips_dots() {
+        let base = std::env::temp_dir().join(format!("fandhe-guard-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("mkdir");
+        let ws = confine_package(&base, Path::new("ws")).expect("confine");
+        for n in ["a", "b", "c"] {
+            ws.create_new_member(Path::new(n)).expect("file");
+        }
+        let mut all = ws.list_entry_names(10).expect("list");
+        all.sort();
+        assert_eq!(all, ["a", "b", "c"]);
+        assert_eq!(ws.list_entry_names(1).expect("bounded").len(), 2);
+        ws.sync_all().expect("fsync");
         let _ = std::fs::remove_dir_all(&base);
     }
 
