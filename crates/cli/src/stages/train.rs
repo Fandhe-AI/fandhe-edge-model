@@ -11,6 +11,9 @@
 //!    許可リストの環境のみ・壁時計タイムアウトつき。REQ-39）
 //! 4. 結果を `result.json` へ保存する（`select` が再検証つきで読み戻す）
 //!
+//! 開始時（副作用の前）に評価データの凍結ハッシュを確認し、不一致・凍結記録の欠落は `invalid_input` で停止する
+//! （[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
+//!
 //! 学習ワーカーへ渡す validation は `id` と `input` のみ（正解ラベルは渡さない。REQ-27）。
 //! 失敗した候補の `candidates/<N>/` は残る（チェックポイントからの再開は提供しない。REQ-34）。
 //!
@@ -123,6 +126,8 @@ pub fn resolve_candidates(
 /// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。
 pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
+    // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    super::inspect::ensure_evaluation_frozen(&project)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
     let split = verified_split(&project, &records)?;

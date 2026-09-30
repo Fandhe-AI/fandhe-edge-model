@@ -315,6 +315,138 @@ mod suite {
         );
     }
 
+    /// 評価データを 1 バイトだけ書き換える（読み取り専用配置を外して差し替える改ざんの模擬。
+    /// 実運用では書き込みは拒否される）。長さは変えない。
+    fn tamper_evaluation_one_byte(env: &Env) {
+        let eval_file = env.project_file("data/evaluation.jsonl");
+        let mut perm = std::fs::metadata(&eval_file).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&eval_file, perm).expect("chmod");
+        let mut bytes = std::fs::read(&eval_file).expect("read");
+        let at = bytes
+            .windows(5)
+            .position(|w| w == b"alpha")
+            .expect("alpha exists");
+        bytes[at + 4] = b'b';
+        std::fs::write(&eval_file, bytes).expect("tamper");
+    }
+
+    /// 凍結ハッシュ不一致で工程が停止したときの、`evaluate` と同じ終了コードと `code`・固定 message。
+    const FROZEN_MISMATCH_STDOUT: &str = "{\"code\":\"invalid_input\",\"message\":\"eval data hash mismatch: frozen record sha256=de442855ffe8258cc3f2d6db32e769393420740014b4ba9f0026cf94066b47ec byte_len=1184, actual sha256=e74473414f0868e0362f32368f9d860dc4dd3cead3b98005d282e859ff5c5d18 byte_len=1184\"}\n";
+
+    fn eval_env_until(case: &str, stages: &[&[&str]]) -> Env {
+        let env = registered(case, true);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        for args in stages {
+            env.ok(args);
+        }
+        env
+    }
+
+    /// REQ-17: `train` は開始時に凍結ハッシュを確認し、不一致なら学習の出力物を作らず停止する。
+    pub fn train_stops_on_frozen_hash_mismatch_without_outputs() {
+        let env = eval_env_until("trainfrz", &[]);
+        tamper_evaluation_one_byte(&env);
+        let out = env.fails(
+            &["train", "--project-dir", "proj", "--candidate", "0"],
+            64,
+            "invalid_input",
+        );
+        assert_eq!(out, FROZEN_MISMATCH_STDOUT);
+        assert!(!env.project_file("candidates").exists());
+    }
+
+    /// REQ-17: `select` は開始時に凍結ハッシュを確認し、不一致なら選定記録を作らず停止する。
+    pub fn select_stops_on_frozen_hash_mismatch_without_outputs() {
+        let env = eval_env_until(
+            "selfrz",
+            &[&["train", "--project-dir", "proj", "--candidate", "0"]],
+        );
+        tamper_evaluation_one_byte(&env);
+        let out = env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert_eq!(out, FROZEN_MISMATCH_STDOUT);
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-17: `package` は開始時に凍結ハッシュを確認し、不一致なら `package/` もステージングも作らず停止する。
+    pub fn package_stops_on_frozen_hash_mismatch_without_outputs() {
+        let env = eval_env_until(
+            "pkgfrz",
+            &[
+                &["train", "--project-dir", "proj", "--candidate", "0"],
+                &["select", "--project-dir", "proj"],
+            ],
+        );
+        tamper_evaluation_one_byte(&env);
+        let out = env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+        assert_eq!(out, FROZEN_MISMATCH_STDOUT);
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-17: 凍結記録が欠落（評価データだけ残る）していても、後続工程は停止する（fail-closed）。
+    pub fn later_stages_stop_when_freeze_record_is_missing() {
+        let env = eval_env_until("nofrz", &[]);
+        std::fs::remove_file(env.project_file("eval_freeze.json")).expect("remove record");
+        let out = env.fails(
+            &["train", "--project-dir", "proj", "--candidate", "0"],
+            64,
+            "invalid_input",
+        );
+        assert_eq!(
+            out,
+            "{\"code\":\"invalid_input\",\"message\":\"eval data state is not_provided but actual_bytes is non-empty\"}\n"
+        );
+        assert!(!env.project_file("candidates").exists());
+    }
+
+    /// REQ-17・REQ-39: 評価データの読み取り専用配置は data 層の `place_read_only` を通り、0400・
+    /// 書き込み拒否（追記オープンが `PermissionDenied`）・作業用ディレクトリの残骸なし。
+    /// root 実行では書き込みを拒否できず配置は fail-closed で失敗する（`runtime_error`・
+    /// project は残らない）ため、その場合は失敗側を確認する（本環境の実行者が root でない場合のみ
+    /// 成功側が検証される。ACL を実際に作って書き込みを通す模擬は行っていない）。
+    pub fn register_places_evaluation_data_via_write_probe() {
+        let env = Env::new("probe", true);
+        let args = ["register", "--definition", DEF, "--project-dir", "proj"];
+        let (code, stdout) = env.run(&args);
+        if running_as_root() {
+            assert_eq!(code, 70, "{stdout}");
+            assert_eq!(
+                stdout,
+                "{\"code\":\"runtime_error\",\"message\":\"cannot place evaluation data read-only\"}\n"
+            );
+            assert!(!env.project_file("").exists());
+            return;
+        }
+        assert_eq!(code, 0, "{stdout}");
+        let eval_file = env.project_file("data/evaluation.jsonl");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&eval_file).expect("meta").permissions(),
+        );
+        assert_eq!(mode & 0o7777, 0o400);
+        let append = std::fs::OpenOptions::new().append(true).open(&eval_file);
+        assert_eq!(
+            append.expect_err("write must be rejected").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(env.project_file("data"))
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["evaluation.jsonl", "train.jsonl"]);
+    }
+
+    fn running_as_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Uid:").map(str::to_string))
+            })
+            .is_some_and(|l| l.split_whitespace().nth(1) == Some("0"))
+    }
+
     /// REQ-17: 凍結記録が無いまま空の評価データがあっても `inspect` は拒否する（fail-closed）。
     pub fn inspect_rejects_empty_evaluation_data_without_freeze_record() {
         let env = registered("evalempty", false);
@@ -632,6 +764,26 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_mismatched_selection_and_metadata",
             suite::package_rejects_mismatched_selection_and_metadata,
+        ),
+        (
+            "train_stops_on_frozen_hash_mismatch_without_outputs",
+            suite::train_stops_on_frozen_hash_mismatch_without_outputs,
+        ),
+        (
+            "select_stops_on_frozen_hash_mismatch_without_outputs",
+            suite::select_stops_on_frozen_hash_mismatch_without_outputs,
+        ),
+        (
+            "package_stops_on_frozen_hash_mismatch_without_outputs",
+            suite::package_stops_on_frozen_hash_mismatch_without_outputs,
+        ),
+        (
+            "later_stages_stop_when_freeze_record_is_missing",
+            suite::later_stages_stop_when_freeze_record_is_missing,
+        ),
+        (
+            "register_places_evaluation_data_via_write_probe",
+            suite::register_places_evaluation_data_via_write_probe,
         ),
         (
             "infer_out_option_is_not_faked",

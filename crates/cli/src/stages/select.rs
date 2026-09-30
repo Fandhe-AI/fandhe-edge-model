@@ -13,6 +13,9 @@
 //! 保存済み `request.json` の validation（id・input）が分割記録の validation 全体と一致することを
 //! 確認する（不一致は `invalid_input`。記録の改変による部分集合での選定を防ぐ。REQ-27）。
 //!
+//! 開始時（記録の書き込み前）に評価データの凍結ハッシュを確認し、不一致・凍結記録の欠落は
+//! `invalid_input` で停止する（[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
+//!
 //! # 未接続
 //!
 //! McNemar・Holm による選定結果の有意性判定（[`fandhe_edge_train::selection_significance`]）は
@@ -42,6 +45,8 @@ use super::train::{load_trained, resolve_candidates, verified_split};
 /// 予測と入力の不一致・採点失敗は `runtime_error`（70）。
 pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
+    // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    super::inspect::ensure_evaluation_frozen(&project)?;
     if project.exists(SELECTION_FILE)? {
         return Err(crate::project::invalid("selection record already exists"));
     }
