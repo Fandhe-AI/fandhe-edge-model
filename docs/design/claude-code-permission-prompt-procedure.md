@@ -18,20 +18,20 @@ spec の内容は要約であり、詳細は spec の REQ-36・TASK-36.3 を参�
 ## 3. 準備（権限モードを切り替える前に、人がターミナルで実行）
 
 1. `cargo build -p fandhe-edge-cli` で `target/debug/fandhe-edge` を作る。ラッパーは環境変数 `FANDHE_EDGE_BIN`、未設定なら `${CARGO_TARGET_DIR:-<repo>/target}/debug/fandhe-edge` を使う。
-2. 合成パッケージを作る（構成は `crates/cli/tests/bash_noninteractive.rs` の `make_real_package` と同じ）。作業用ディレクトリはコミットされない場所にする（例: リポジトリルートの `tmp-task36-3/`。使用後に削除する）。
+2. 合成パッケージを作る（構成は `crates/cli/tests/bash_noninteractive.rs` の `make_real_package` と同じ）。作業用ディレクトリはコミットされない場所にする（例: リポジトリルートの `tmp-task36-3/`。`.gitignore` 対象ではないため、作業後に `git status` で未追跡ファイルが残っていないことを確かめ、使用後に削除する）。次のコードブロックは heredoc の終端 `JSON` が行頭に来るようリストの外に置いている。そのまま貼り付けてよい。
 
-   ```sh
-   W=tmp-task36-3
-   mkdir -p "$W/p" "$W/records"
-   cp fixtures/onnx_parity/c1.onnx "$W/p/model.onnx"
-   SHA=$(shasum -a 256 "$W/p/model.onnx" | cut -d' ' -f1)
-   cat > "$W/p/artifact.json" <<JSON
-   {"kind":"c1","kind_version":1,"max_bytes":48,"label_order":["alpha","beta","gamma"],"onnx_file":"model.onnx","onnx_sha256":"$SHA"}
-   JSON
-   cat > "$W/p/definition.json" <<'JSON'
-   {"schema":"fandhe-edge-model-definition/v1","name":"sh_real","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"a","description":"d"},{"id":"beta","display_name":"b","description":"d"},{"id":"gamma","display_name":"g","description":"d"}],"io":{"input":"bytes"}}
-   JSON
-   ```
+```sh
+W=tmp-task36-3
+mkdir -p "$W/p" "$W/records"
+cp fixtures/onnx_parity/c1.onnx "$W/p/model.onnx"
+SHA=$(shasum -a 256 "$W/p/model.onnx" | cut -d' ' -f1)
+cat > "$W/p/artifact.json" <<JSON
+{"kind":"c1","kind_version":1,"max_bytes":48,"label_order":["alpha","beta","gamma"],"onnx_file":"model.onnx","onnx_sha256":"$SHA"}
+JSON
+cat > "$W/p/definition.json" <<'JSON'
+{"schema":"fandhe-edge-model-definition/v1","name":"sh_real","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"a","description":"d"},{"id":"beta","display_name":"b","description":"d"},{"id":"gamma","display_name":"g","description":"d"}],"io":{"input":"bytes"}}
+JSON
+```
 
 3. 実行記録（TASK-36.1-2）の保存先 `$W/records` は実在する通常のディレクトリで、symlink は使えない。`onnx_sha256` の検査（完全性。REQ-39）は外さない。
 
@@ -87,5 +87,5 @@ stderr.bytes / stderr.sha256:
 
 ## 7. 後片付け
 
-- 作業用ディレクトリ（`tmp-task36-3/`）を削除する。コミットしない。
+- 作業用ディレクトリ（`tmp-task36-3/`）を削除する。コミットしない（`git status` で未追跡ファイルが残っていないことを確かめる）。
 - 権限モードを元に戻す。
