@@ -91,7 +91,7 @@ pub const TRAIN_SEED: u32 = 42;
 pub const DEFAULT_MAX_BYTES: u32 = 512;
 
 /// データ・記録ファイルの読み込み上限（バイト。データ検査の合計上限と同じ。REQ-39）。
-pub const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PROJECT_FILE_BYTES: u64 = fandhe_edge_core::limits::MAX_PROJECT_FILE_BYTES;
 
 /// 工程内のエラーを [`ErrorReport`] にする（message は固定語彙）。
 #[must_use]

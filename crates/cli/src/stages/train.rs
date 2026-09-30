@@ -38,14 +38,14 @@ use fandhe_edge_train::request::{
 };
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchCandidate;
-use fandhe_edge_train::stage_files::{outcome_json_vec, trainer_jsonl};
+use fandhe_edge_train::stage_files::{StageFileError, outcome_json_vec, trainer_jsonl};
 
 use super::inspect::split_rows;
 use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANDIDATES_DIR, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE, RESULT_FILE,
-    SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED, invalid, runtime,
+    SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -149,7 +149,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
         .iter()
         .filter(|r| split.by_record.get(&r.id) == Some(&Split::Train));
     let train_jsonl = trainer_jsonl(train_rows.map(|r| (r.input.as_str(), r.label_id.as_str())))
-        .map_err(|_| runtime("cannot build training data"))?;
+        .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
     let validation: Vec<ValidationInput> = records
         .iter()
         .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
@@ -257,4 +257,32 @@ pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestPa
             .iter()
             .filter(|(k, _)| k.as_str() != "epochs")
             .eq(params.config.iter().filter(|(k, _)| k.as_str() != "epochs"))
+}
+
+/// 学習用データの生成失敗を [`ErrorReport`] にする。上限超過は `limit_exceeded`（20。REQ-39）で、
+/// 学習ワーカーの起動より前に止まる。それ以外は `runtime_error`（`message` は固定語彙）。
+fn stage_file_error_report(error: StageFileError, message: &str) -> ErrorReport {
+    match error {
+        StageFileError::LimitExceeded => {
+            fail(ExitCode::LimitExceeded, "training data exceeds size limit")
+        }
+        _ => runtime(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REQ-39: 学習用データの上限超過は `limit_exceeded`（20）、それ以外の失敗は `runtime_error`（70）。
+    #[test]
+    fn req39_stage_file_limit_maps_to_limit_exceeded() {
+        let report = stage_file_error_report(StageFileError::LimitExceeded, "x");
+        assert_eq!(report.code, ExitCode::LimitExceeded);
+        assert_eq!(report.message, "training data exceeds size limit");
+        let report =
+            stage_file_error_report(StageFileError::Serialize, "cannot build training data");
+        assert_eq!(report.code, ExitCode::RuntimeError);
+        assert_eq!(report.message, "cannot build training data");
+    }
 }

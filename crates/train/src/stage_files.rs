@@ -33,6 +33,8 @@ pub enum StageFileError {
     Malformed,
     /// 予測の件数・`id` 順序が入力と一致しない、または採点に失敗した。
     Scoring,
+    /// 生成する学習用データが上限（`core::limits::TRAINER_JSONL_MAX_BYTES`）を超える（REQ-39）。
+    LimitExceeded,
 }
 
 impl std::fmt::Display for StageFileError {
@@ -41,6 +43,7 @@ impl std::fmt::Display for StageFileError {
             StageFileError::Serialize => write!(f, "failed to serialize stage file"),
             StageFileError::Malformed => write!(f, "stage file is malformed"),
             StageFileError::Scoring => write!(f, "failed to score validation predictions"),
+            StageFileError::LimitExceeded => write!(f, "stage file exceeds size limit"),
         }
     }
 }
@@ -49,9 +52,26 @@ impl std::error::Error for StageFileError {}
 
 /// `(input, label)` の列から trainer 形式（1 行 `{"input","label"}`）の JSONL を作る。
 ///
+/// 生成量は `core::limits::TRAINER_JSONL_MAX_BYTES`（暫定。REQ-39）で打ち切る。学習前に呼ばれ、
+/// 超過なら学習ワーカーを起動しない（CLI の `train` 工程が `limit_exceeded` に写す）。
+///
 /// # Errors
-/// 直列化に失敗した場合（実務上は起こらない）。
+/// 直列化に失敗した場合（実務上は起こらない）、または生成量が上限を超えた場合（`LimitExceeded`）。
 pub fn trainer_jsonl<'a, I>(rows: I) -> Result<Vec<u8>, StageFileError>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let limit = usize::try_from(fandhe_edge_core::limits::TRAINER_JSONL_MAX_BYTES)
+        .map_err(|_| StageFileError::LimitExceeded)?;
+    trainer_jsonl_with_limit(rows, limit)
+}
+
+/// [`trainer_jsonl`] の上限を指定できる版（上限ちょうどは成功、1 バイトでも超えれば
+/// `LimitExceeded`。変換後の累積バイト数〔改行を含む〕を checked 演算で数える）。
+pub(crate) fn trainer_jsonl_with_limit<'a, I>(
+    rows: I,
+    limit: usize,
+) -> Result<Vec<u8>, StageFileError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
@@ -59,6 +79,14 @@ where
     for (input, label) in rows {
         let line = serde_json::to_vec(&serde_json::json!({"input": input, "label": label}))
             .map_err(|_| StageFileError::Serialize)?;
+        let total = out
+            .len()
+            .checked_add(line.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(StageFileError::LimitExceeded)?;
+        if total > limit {
+            return Err(StageFileError::LimitExceeded);
+        }
         out.extend_from_slice(&line);
         out.push(b'\n');
     }
@@ -164,6 +192,37 @@ mod tests {
             String::from_utf8(bytes).expect("utf8"),
             "{\"input\":\"a \\\"q\\\"\",\"label\":\"x\"}\n{\"input\":\"b\",\"label\":\"y\"}\n"
         );
+    }
+
+    /// REQ-39: 生成量が上限ちょうど（改行込み 26 バイト）なら成功し、1 バイト小さい上限では
+    /// `LimitExceeded`。複数行では累積で数える。
+    #[test]
+    fn req39_trainer_jsonl_limit_is_exact_and_cumulative() {
+        let row = [("b", "y")];
+        let bytes = trainer_jsonl_with_limit(row, 26).expect("exactly at the limit");
+        assert_eq!(bytes.len(), 26);
+        assert_eq!(
+            trainer_jsonl_with_limit(row, 25),
+            Err(StageFileError::LimitExceeded)
+        );
+        assert_eq!(
+            trainer_jsonl_with_limit([("b", "y"), ("b", "y")], 52).map(|b| b.len()),
+            Ok(52)
+        );
+        assert_eq!(
+            trainer_jsonl_with_limit([("b", "y"), ("b", "y")], 51),
+            Err(StageFileError::LimitExceeded)
+        );
+    }
+
+    /// REQ-39: 既定の上限は入力読み込み上限（64 MiB）の 4 倍（268435456 バイト）。
+    #[test]
+    fn req39_trainer_jsonl_default_limit_is_four_times_input_limit() {
+        assert_eq!(
+            fandhe_edge_core::limits::TRAINER_JSONL_MAX_BYTES,
+            268_435_456
+        );
+        assert_eq!(trainer_jsonl([("b", "y")]).map(|b| b.len()), Ok(26));
     }
 
     /// REQ-18: 選定記録は往復でき、未知キーは拒否する。
