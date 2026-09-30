@@ -119,7 +119,8 @@
 //! [`OutDirResidue::EmptyReservation`]）や書きかけの一時ディレクトリ、
 //! 確定直後の窓では公開済みの成果物（[`OutDirResidue::NonEmpty`]）が残りうる。
 //! 本モジュールは [`CancelledRun::out_dir_residue`] で読み取り専用の状態だけ
-//! 報告し、削除・rename はしない。やり直し時の案内・掃除は TASK-34.3・#147、
+//! 報告し、削除・rename はしない。やり直しの案内は [`crate::restart`]
+//! （TASK-34.3・#147。自動掃除はせず案内する）、
 //! `job.json` の永続化とクラッシュ検出は [`crate::job_record`]（TASK-34.2・#146。実装済み）。キャンセルの終了コード写像は
 //! TASK-33.x の承認事項。ジョブ状態の遷移は [`crate::job`]。
 //!
@@ -581,6 +582,18 @@ impl TrainRun {
         }
     }
 
+    /// テスト用: ワーカーのエラー結果で終わった実行（`restart` のテストが使う）。
+    #[cfg(test)]
+    pub(crate) fn for_test_error() -> Self {
+        Self {
+            outcome: TrainOutcome::Error(crate::result::WorkerFailure::for_test("runtime_error")),
+            exit_code: ExitCode::RuntimeError,
+            elapsed: Duration::ZERO,
+            worker_stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
     #[must_use]
     pub fn outcome(&self) -> &TrainOutcome {
         &self.outcome
@@ -672,7 +685,7 @@ pub enum CancelStop {
 
 /// `SIGKILL` フォールバック後の `out_dir` の読み取り専用の観測結果
 /// （[`CancelledRun::out_dir_residue`]）。**削除・rename は一切しない**。
-/// やり直し時の案内・掃除は TASK-34.3・#147。REQ-34。
+/// やり直しの案内は [`crate::restart`]（自動掃除はしない。TASK-34.3・#147）。REQ-34。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutDirResidue {
     /// `out_dir` が存在しない（予約前、または解放済み）。
@@ -693,7 +706,7 @@ pub enum OutDirResidue {
 /// [`CancelStop::Cooperative`]・[`CancelStop::BeforeStart`] では公開場所に何も
 /// 残らない（supervisor が fd で解放済み、または起動前）。[`CancelStop::ForcedKill`]
 /// のときだけ supervisor の後始末が走らないため、[`Self::out_dir_residue`] に
-/// 観測結果を持つ（削除はしない。TASK-34.3・#147 が扱う）。
+/// 観測結果を持つ（削除はしない。案内は [`crate::restart`]。TASK-34.3・#147）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelledRun {
     elapsed: Duration,
@@ -728,6 +741,23 @@ impl CancelledRun {
             signal: None,
             stop: CancelStop::Cooperative,
             out_dir_residue: None,
+        }
+    }
+
+    /// テスト用の任意の組の構築（`restart` の写像の網羅テストが使う）。
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        stop: CancelStop,
+        out_dir_residue: Option<OutDirResidue>,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            elapsed,
+            child_spawned: !matches!(stop, CancelStop::BeforeStart),
+            child_reaped: true,
+            signal: None,
+            stop,
+            out_dir_residue,
         }
     }
 

@@ -24,11 +24,11 @@
 //! # 未実装（実装済みを装わない）
 //!
 //! - 状態確認コマンド（CLI への露出。REQ-33 の 7 工程の変更にあたり TASK-33.x の
-//!   承認事項）と、やり直しの案内は #147（TASK-34.3）。`job.json` への永続化と
-//!   クラッシュ検出は [`crate::job_record`]・[`TrainJob::run_recorded`]（TASK-34.2・
-//!   #146）で実装済み。
+//!   承認事項）。`job.json` への永続化とクラッシュ検出は [`crate::job_record`]・
+//!   [`TrainJob::run_recorded`]（TASK-34.2・#146）で実装済み。やり直しの案内は
+//!   [`crate::restart`]（TASK-34.3・#147）。
 //! - `SIGKILL` フォールバック（協調キャンセルの猶予超過）後に残りうる予約済み
-//!   `out_dir`・tmp の削除と、やり直し時の案内は #147（TASK-34.3）。協調キャンセル
+//!   `out_dir`・tmp は自動では削除せず、[`crate::restart`] が案内する（TASK-34.3・#147）。協調キャンセル
 //!   （supervisor が自ら解放）では公開場所に何も残らず、確定済みなら
 //!   `Cancelling` → `Succeeded`（`Completed`）になる（#145・TASK-34.1-2。
 //!   [`crate::process`] のモジュール doc「キャンセル」）。遷移表は変えない。

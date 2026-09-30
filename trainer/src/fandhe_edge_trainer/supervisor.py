@@ -101,7 +101,7 @@ test_supervisor_module_does_not_import_mlx` で検証する。
 - Rust 側の猶予内に本プロセスが終了しなければ Rust が `SIGKILL` する
   （フォールバック）。この場合だけ、後始末が走らず空の予約済み `out_dir`・
   tmp が残りうる（安全側の残置。Rust は削除せず読み取り専用で検査して報告
-  するだけで、やり直し時の案内・掃除は TASK-34.3）
+  するだけで、やり直しの案内は Rust 側 `restart` が行い、自動では掃除しない。TASK-34.3）
 - 協調キャンセル時の終了コード（exit 70・`runtime_error`）は暫定で、Rust 側は
   依存しない。キャンセルの写像は TASK-33.x で決める
 
