@@ -33,7 +33,7 @@
 
 - `serde`（derive）: `serde_core`・`serde_derive`・`proc-macro2`・`quote`・`syn`（3.0 系）・`unicode-ident`（`(MIT OR Apache-2.0) AND Unicode-3.0`）。`syn` 3.0 系は PoC-16 の lock でも同じ
 - `serde_json`: `itoa`・`memchr`（Unlicense OR MIT）・`zmij`（MIT 単独。`ryu` の後継）
-- `sha2`: `cfg-if`・`cpufeatures`（Apple Silicon では `libc`）・`digest`・`block-buffer`・`crypto-common`・`hybrid-array`・`typenum`
+- `sha2`: `cfg-if`・`cpufeatures`（Apple Silicon では `libc`）・`digest`・`block-buffer`・`const-oid`（`digest` の依存。Cargo.lock で確認）・`crypto-common`・`hybrid-array`・`typenum`
 - いずれも `deny.toml` の許可ライセンスに収まり、C/C++ のネイティブビルド・プリビルドバイナリの自動ダウンロードは確認されなかった
 - メンテナンス状況: 最終リリースは `serde` 2026-07-18・`serde_json` 2026-07-20・`sha2` 2026-03-25（いずれも yank なし）
 - 配布サイズ・推論レイテンシへの影響: 共通コアの定義ファイル読み込みとハッシュ計算に限られ、推論の 1 件あたりの経路には入らない見込み（推定。導入 PR で実測値があれば記録する）

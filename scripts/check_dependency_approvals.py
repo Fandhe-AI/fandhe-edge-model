@@ -69,7 +69,7 @@ CARGO_PIN_RE = re.compile(r"^=([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0
 PY_REQ_RE = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
     r"(?:\[([A-Za-z0-9,._ -]+)\])?"
-    r"==([0-9][0-9A-Za-z.+!-]*)$"
+    r"==([0-9]+\.[0-9]+\.[0-9]+)$"
 )
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 CARGO_DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")

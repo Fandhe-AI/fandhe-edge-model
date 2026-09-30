@@ -362,3 +362,15 @@ def test_req38_direct_dependency_missing_from_uv_lock_fails(repo: Path, capsys: 
     code, payload = run(repo, capsys)
     assert code == 10
     assert ("missing_in_lock", "numpy") in kinds(payload)
+
+
+@pytest.mark.parametrize("req", ["numpy==1", "numpy==1.0", "numpy==1.0.0.post1", "numpy==1.*"])
+def test_req38_python_short_or_loose_pin_is_rejected(req: str) -> None:
+    """Python の版は `==x.y.z`（数字 3 組）のみ完全固定として受理する。"""
+    assert mod.PY_REQ_RE.match(req) is None
+
+
+def test_req38_python_full_pin_is_accepted() -> None:
+    """`==x.y.z` と extras 付きは受理する。"""
+    assert mod.PY_REQ_RE.match("numpy==2.5.3") is not None
+    assert mod.PY_REQ_RE.match("mlx[cpu]==0.32.2") is not None
