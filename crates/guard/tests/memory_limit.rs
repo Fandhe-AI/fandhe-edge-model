@@ -85,7 +85,13 @@ fn config(limit: Duration, memory: MemoryLimit) -> RunConfig {
 }
 
 /// REQ-39・PoC-20 ケース 3: RSS が 2 GiB を超える子は kill され、メモリ超過として記録される。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+///
+/// Linux 限定。macOS の GitHub ホステッド runner（搭載メモリが小さくメモリ圧縮が働く）では、
+/// 2.25 GiB を確保しても `ps` の RSS が 2 GiB に達せず超過を観測できなかった（CI 実測。
+/// 超過検知の機構自体は同 OS で 64 MiB 上限のテストが検証している）。2 GiB 既定値の
+/// 保持は `resource` のユニットテストで全 OS 固定している。macOS 実機（十分なメモリ）での
+/// 2 GiB 実測は実機前提の確認事項で、本テストは実機の代替にしない。
+#[cfg(target_os = "linux")]
 #[test]
 fn req39_rss_over_2gib_is_killed_and_recorded_as_memory() {
     // 割り当て・RSS 計測（macOS は `ps` 起動）の所要時間で時間超過に反転しないよう、
@@ -161,4 +167,14 @@ fn req39_memory_limit_unsupported_os_fails_closed() {
     let err = run_with_limits(&child("ok", 0), &cfg).unwrap_err();
     assert_eq!(err, GuardRunError::MemoryLimitUnsupported);
     assert_eq!(err.exit_code().code(), 70);
+    // 既定設定・`RunConfig::new` も上限を保持するため、上限なしで子を起動せず同じく拒否する。
+    for cfg in [
+        RunConfig::default(),
+        RunConfig::new(TimeLimit::infer_default(), 1024, 1024).unwrap(),
+    ] {
+        assert_eq!(
+            run_with_limits(&child("ok", 0), &cfg).unwrap_err(),
+            GuardRunError::MemoryLimitUnsupported
+        );
+    }
 }

@@ -64,7 +64,9 @@ fn child(mode: &str) -> GuardedCommand {
 }
 
 fn config(limit: Duration) -> RunConfig {
-    RunConfig::new(TimeLimit::new(limit).unwrap(), 1024 * 1024, 64 * 1024).unwrap()
+    RunConfig::new(TimeLimit::new(limit).unwrap(), 1024 * 1024, 64 * 1024)
+        .unwrap()
+        .without_memory_limit()
 }
 
 /// REQ-39: 暫定値は 10 秒で、既定設定にも反映される。
@@ -83,7 +85,8 @@ fn req39_child_exceeding_10s_is_killed_and_recorded_as_time_limit() {
         DEFAULT_STDOUT_CAP,
         DEFAULT_STDERR_CAP,
     )
-    .unwrap();
+    .unwrap()
+    .without_memory_limit();
     let outcome = run_with_limits(&child("sleep60"), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {
         panic!("expected LimitExceeded");
@@ -134,7 +137,9 @@ fn req39_nonzero_exit_is_not_limit_exceeded() {
 /// REQ-39: 読み取り上限を超える出力は切り詰めフラグ付きで上限長に収まる。
 #[test]
 fn req39_stdout_is_capped_and_flagged() {
-    let cfg = RunConfig::new(TimeLimit::new(Duration::from_secs(30)).unwrap(), 100, 100).unwrap();
+    let cfg = RunConfig::new(TimeLimit::new(Duration::from_secs(30)).unwrap(), 100, 100)
+        .unwrap()
+        .without_memory_limit();
     let outcome = run_with_limits(&child("flood"), &cfg).unwrap();
     let GuardedRunOutcome::Exited { output, .. } = outcome else {
         panic!("expected Exited");
@@ -166,7 +171,8 @@ fn req39_continuous_output_does_not_bypass_time_limit() {
         1024 * 1024,
         64 * 1024,
     )
-    .unwrap();
+    .unwrap()
+    .without_memory_limit();
     let started = std::time::Instant::now();
     let outcome = run_with_limits(&child("spew"), &cfg).unwrap();
     let GuardedRunOutcome::LimitExceeded(rec) = outcome else {

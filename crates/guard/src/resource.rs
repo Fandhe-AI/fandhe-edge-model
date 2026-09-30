@@ -484,7 +484,8 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
-    /// 設定を検証して作る。メモリ上限は `None`（[`RunConfig::with_memory_limit`] で付ける）。
+    /// 設定を検証して作る。メモリ上限は既定の暫定 2 GiB を有効にする（REQ-39。上限を迂回させない）。
+    /// 上限なしは [`RunConfig::without_memory_limit`] による明示的な経路だけで得られる。
     ///
     /// # Errors
     /// cap が 0 または [`MAX_OUTPUT_CAP`] 超なら [`ResourceConfigError::OutputCapOutOfRange`]。
@@ -502,8 +503,16 @@ impl RunConfig {
             time_limit,
             stdout_cap,
             stderr_cap,
-            memory_limit: None,
+            memory_limit: Some(MemoryLimit::infer_default()),
         })
+    }
+
+    /// メモリ（RSS）上限を無効にする明示的な経路（時間上限だけの検証用途）。通常の経路では使わない。
+    /// 計測手段の無い OS でも起動前拒否を受けずに実行できるが、RSS は制限されない。
+    #[must_use]
+    pub const fn without_memory_limit(mut self) -> Self {
+        self.memory_limit = None;
+        self
     }
 
     /// メモリ（RSS）上限を付ける。計測手段の無い OS では [`run_with_limits`] が
@@ -536,14 +545,9 @@ impl Default for RunConfig {
             time_limit: TimeLimit::infer_default(),
             stdout_cap: DEFAULT_STDOUT_CAP,
             stderr_cap: DEFAULT_STDERR_CAP,
-            // 計測手段のある OS（Linux・macOS）だけメモリ上限を既定で有効にする。
-            // それ以外で有効にすると `run_with_limits` が常に起動前拒否になり、
-            // 既存の既定設定が使えなくなるため、時間上限のみの既定にする。
-            memory_limit: if cfg!(any(target_os = "linux", target_os = "macos")) {
-                Some(MemoryLimit::infer_default())
-            } else {
-                None
-            },
+            // 全 OS でメモリ上限を保持する。計測手段の無い OS では `run_with_limits` が
+            // 起動前に `MemoryLimitUnsupported` で拒否する（上限なしで子を起動しない。fail-closed）。
+            memory_limit: Some(MemoryLimit::infer_default()),
         }
     }
 }
@@ -1834,18 +1838,23 @@ mod tests {
         );
     }
 
-    /// REQ-39: 既定設定は計測手段のある OS で 2 GiB のメモリ上限を持ち、それ以外では持たない
-    /// （`run_with_limits` が常に拒否する既定にしない）。`RunConfig::new` は持たない。
+    /// REQ-39: 既定設定・`RunConfig::new` は全 OS で 2 GiB のメモリ上限を持つ。上限なしは
+    /// `without_memory_limit` の明示的な経路だけ（計測不能 OS では起動前拒否に倒れる）。
     #[test]
     fn req39_default_config_has_2gib_memory_limit() {
-        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
-            Some(2_147_483_648)
-        } else {
-            None
-        };
-        assert_eq!(RunConfig::default().memory_limit(), expected);
+        assert_eq!(RunConfig::default().memory_limit(), Some(2_147_483_648));
         let t = TimeLimit::infer_default();
-        assert_eq!(RunConfig::new(t, 1, 1).unwrap().memory_limit(), None);
+        assert_eq!(
+            RunConfig::new(t, 1, 1).unwrap().memory_limit(),
+            Some(2_147_483_648)
+        );
+        assert_eq!(
+            RunConfig::new(t, 1, 1)
+                .unwrap()
+                .without_memory_limit()
+                .memory_limit(),
+            None
+        );
         let with = RunConfig::new(t, 1, 1)
             .unwrap()
             .with_memory_limit(MemoryLimit::new(64).unwrap());
