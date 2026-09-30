@@ -16,7 +16,7 @@ REQ-38・TASK-38.3（#165）。依存の追加・更新・削除は通信を伴�
 
 ## 照合する内容
 
-- Rust: ルート `[workspace.dependencies]` は `=x.y.z` の完全固定で、`cargo.direct` に記録があること。メンバー crate は `workspace = true` のみ。`Cargo.lock` の crates.io パッケージは台帳（direct と locked）に (name, version) があること。git・別レジストリは拒否する。内部 crate（lock に source が無い）の追加は台帳の更新が要らない
+- Rust: ルート `[workspace.dependencies]` は `=x.y.z` の完全固定で、`cargo.direct` に記録があること。path 依存は実在するメンバーのパスと package 名に一致すること。メンバー crate とルート manifest 自身の `[dependencies]` 等は `workspace = true` のみ。manifest の直接依存が lock に同じ版で現れること（`missing_in_lock`）。`Cargo.lock` の crates.io パッケージは台帳（direct と locked）に (name, version) があること。git・別レジストリは拒否する。内部 crate（lock に source が無い）の追加は台帳の更新が要らない
 - Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみで、`pypi.direct` に記録があること。`uv.lock` の PyPI パッケージは台帳に (name, version) があること
 - 台帳にだけ残った記録（削除・版の変更の取りこぼし）も失敗とする
 
@@ -41,6 +41,9 @@ REQ-38・TASK-38.3（#165）。依存の追加・更新・削除は通信を伴�
 ```
 
 ## 限界
+
+- 通信なしの契約: 照合は `uv run --no-project --offline`（プロジェクトの同期・解決をしない。Python 本体が未導入ならダウンロードせず失敗）で実行する。`uv run --locked` は環境未構築時に同期（通信）しうるため使わない
+- lefthook の pre-commit は index（staged）の内容を一時ディレクトリへ書き出して照合する。作業ツリーだけを直して通すことはできない。最終の強制は CI（python-ci）。Python 側も `pyproject.toml` の直接依存が `uv.lock` に同じ版で現れることを照合する
 
 - 台帳を同じ PR で書き換えれば照合は通る。承認の実在は PR レビュー（AGENTS.md「依存の追加・更新」）で確認する
 - Makefile の lint ツール（markdownlint・yamllint・cargo-deny・uv 等）の固定版は照合の対象外

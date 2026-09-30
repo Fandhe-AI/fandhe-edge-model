@@ -300,3 +300,62 @@ def test_req38_script_has_no_network_or_process_modules() -> None:
     for banned in ("socket", "urllib", "http.client", "requests", "subprocess", "os.system"):
         assert f"import {banned}" not in src
         assert f"from {banned}" not in src
+
+
+def test_req38_root_manifest_dependency_tables_are_checked(repo: Path, capsys: Capture) -> None:
+    """ルート manifest 自身の [dependencies]・[dev-dependencies] も workspace 集約違反になる。"""
+    append(repo, "Cargo.toml", '\n[dependencies]\nrootdep = "=1.0.0"\n')
+    append(repo, "Cargo.toml", '\n[dev-dependencies]\nrootdev = { git = "https://x/y" }\n')
+    code, payload = run(repo, capsys)
+    assert code == 10
+    found = kinds(payload)
+    assert ("member_dependency_not_workspace", "rootdep") in found
+    assert ("member_dependency_not_workspace", "rootdev") in found
+
+
+def test_req38_path_dependency_must_match_member(repo: Path, capsys: Capture) -> None:
+    """path 依存が実在メンバーのパスと package 名に対応しなければ forbidden_source。"""
+    edit(
+        repo,
+        "Cargo.toml",
+        'fandhe-edge-core = { path = "crates/core" }',
+        'fandhe-edge-core = { path = "crates/nonexistent" }',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("forbidden_source", "fandhe-edge-core") in kinds(payload)
+
+
+def test_req38_path_dependency_name_mismatch_fails(repo: Path, capsys: Capture) -> None:
+    """実在するパスでも依存名が別 crate の package 名なら forbidden_source。"""
+    edit(
+        repo,
+        "Cargo.toml",
+        'fandhe-edge-core = { path = "crates/core" }',
+        'fandhe-edge-core = { path = "crates/data" }',
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("forbidden_source", "fandhe-edge-core") in kinds(payload)
+
+
+def test_req38_direct_dependency_missing_from_cargo_lock_fails(repo: Path, capsys: Capture) -> None:
+    """manifest と台帳にあるが Cargo.lock に無い直接依存は missing_in_lock で exit 10。"""
+    text = (repo / "Cargo.lock").read_text(encoding="utf-8")
+    start = text.index('[[package]]\nname = "sha2"')
+    end = text.index("[[package]]", start + 1)
+    (repo / "Cargo.lock").write_text(text[:start] + text[end:], encoding="utf-8")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("missing_in_lock", "sha2") in kinds(payload)
+
+
+def test_req38_direct_dependency_missing_from_uv_lock_fails(repo: Path, capsys: Capture) -> None:
+    """pyproject と台帳にあるが uv.lock に無い直接依存は missing_in_lock で exit 10。"""
+    text = (repo / "trainer/uv.lock").read_text(encoding="utf-8")
+    start = text.index('[[package]]\nname = "numpy"')
+    end = text.index("[[package]]", start + 1)
+    (repo / "trainer/uv.lock").write_text(text[:start] + text[end:], encoding="utf-8")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("missing_in_lock", "numpy") in kinds(payload)

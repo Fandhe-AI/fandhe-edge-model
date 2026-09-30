@@ -28,6 +28,10 @@ REQ-38・TASK-38.3・#165。依存の追加・更新・削除は通信を伴う�
   あること。source の無いパッケージはワークスペースメンバー名に限る（内部 crate の追加は台帳不要）。
 - Python: `pyproject.toml` の依存は `name[extras]==x.y.z` のみ。`uv.lock` の registry パッケージも
   台帳に (name, version) があること。
+- ルート manifest 自身の `[dependencies]` 等もメンバーと同じ規則（`workspace = true` のみ）で
+  検査する。
+  ワークスペース依存の `path` は、実在するメンバーのパスで、依存名がその package 名と一致すること。
+- 逆方向: manifest の直接依存が lock に同じ版で現れること（`missing_in_lock`）。
 - 台帳の余分な記録（manifest・lock に無い記録）も失敗（削除にも承認記録の更新が要る）。
 
 限界: 台帳を同じ PR で書き換えれば機械照合は通る。承認の実在は PR レビューで確認する
@@ -191,8 +195,14 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
     return out
 
 
-def _cargo_workspace_dep(name: str, spec: Any, v: list[Violation]) -> str | None:
-    """ルートの 1 依存を検査し、registry 依存なら固定版（`=` なし）を返す。"""
+def _cargo_workspace_dep(
+    name: str, spec: Any, v: list[Violation], member_paths: dict[str, str]
+) -> str | None:
+    """ルートの 1 依存を検査し、registry 依存なら固定版（`=` なし）を返す。
+
+    path 依存は、ワークスペースメンバーの実在するパスで、かつ依存名がそのメンバーの
+    package 名と一致するものに限る（任意の crates/ 配下を内部 crate と装えない）。
+    """
     rel = "Cargo.toml"
     if isinstance(spec, str):
         spec = {"version": spec}
@@ -206,6 +216,7 @@ def _cargo_workspace_dep(name: str, spec: Any, v: list[Violation]) -> str | None
             and path.startswith("crates/")
             and ".." not in Path(path).parts
             and not any(k in spec for k in ("git", "registry", "version", "package"))
+            and member_paths.get(Path(path).as_posix().rstrip("/")) == name
         )
         if not ok:
             v.append(Violation("forbidden_source", "cargo", name, "", rel))
@@ -222,7 +233,10 @@ def _cargo_workspace_dep(name: str, spec: Any, v: list[Violation]) -> str | None
 
 
 def _member_deps(rel: str, manifest: dict[str, Any], v: list[Violation]) -> None:
-    """メンバー crate の全依存表が `workspace = true` だけであることを検査する。"""
+    """crate の全依存表が `workspace = true` だけであることを検査する。
+
+    メンバー crate に加え、ルート manifest 自身の `[dependencies]` 等にも適用する。
+    """
     tables: list[dict[str, Any]] = []
     for t in CARGO_DEP_TABLES:
         if isinstance(manifest.get(t), dict):
@@ -256,7 +270,9 @@ def check_cargo(
     members = ws.get("members", [])
     if not isinstance(members, list):
         raise InputError("workspace members must be a list")
+    _member_deps("Cargo.toml", top, v)
     member_names: set[str] = set()
+    member_paths: dict[str, str] = {}
     for m in members:
         if not isinstance(m, str) or not m.startswith("crates/") or ".." in Path(m).parts:
             raise InputError("workspace members must be plain paths under crates/")
@@ -266,6 +282,7 @@ def check_cargo(
         if not isinstance(pkg, dict) or not isinstance(pkg.get("name"), str):
             raise InputError(f"{rel} has no package name")
         member_names.add(pkg["name"])
+        member_paths[Path(m).as_posix().rstrip("/")] = pkg["name"]
         _member_deps(rel, manifest, v)
 
     manifest_direct: set[tuple[str, str]] = set()
@@ -273,7 +290,7 @@ def check_cargo(
     if not isinstance(wdeps, dict):
         raise InputError("workspace.dependencies must be a table")
     for name, spec in wdeps.items():
-        ver = _cargo_workspace_dep(name, spec, v)
+        ver = _cargo_workspace_dep(name, spec, v, member_paths)
         if ver is None:
             continue
         manifest_direct.add((name, ver))
@@ -307,6 +324,10 @@ def check_cargo(
     for key in ledger["locked"]:
         if key not in locked_seen:
             v.append(Violation("stale_record", "cargo", key[0], key[1], LEDGER_NAME))
+    # 逆方向: manifest にある承認済みの直接依存が、lock に同じ版で現れること
+    for key in sorted(manifest_direct):
+        if key not in locked_seen:
+            v.append(Violation("missing_in_lock", "cargo", key[0], key[1], "Cargo.lock"))
 
 
 def _py_requirements(pyproject: dict[str, Any]) -> list[Any]:
@@ -375,6 +396,10 @@ def check_pypi(
     for key in ledger["locked"]:
         if key not in locked_seen:
             v.append(Violation("stale_record", "pypi", key[0], key[1], LEDGER_NAME))
+    # 逆方向: manifest にある承認済みの直接依存が、lock に同じ版で現れること
+    for key in sorted(manifest_direct):
+        if key not in locked_seen:
+            v.append(Violation("missing_in_lock", "pypi", key[0], key[1], rel_lock))
 
 
 def run(root: Path) -> tuple[int, dict[str, Any]]:

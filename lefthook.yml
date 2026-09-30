@@ -134,8 +134,16 @@ pre-commit:
         - "trainer/uv.lock"
         - "dependency-approvals.json"
       run: |
+        # 作業ツリーではなく index（staged）の内容を一時ディレクトリへ書き出して照合する。
+        # 通信を避けるため uv は --no-project --offline で起動する（Makefile と同じ）
         if [ -f trainer/pyproject.toml ] && command -v uv >/dev/null 2>&1; then
-          uv run --locked --directory trainer python -I ../scripts/check_dependency_approvals.py --root ..
+          tmp=$(mktemp -d) || exit 1
+          trap 'rm -rf "$tmp"' EXIT
+          git ls-files -z -- Cargo.toml 'crates/*/Cargo.toml' Cargo.lock \
+            trainer/pyproject.toml trainer/uv.lock dependency-approvals.json \
+            | xargs -0 git checkout-index --prefix="$tmp/" -- || exit 1
+          uv run --no-project --offline --directory trainer python -I \
+            ../scripts/check_dependency_approvals.py --root "$tmp"
         else
           echo "skip: trainer/pyproject.toml 未追加または uv 未導入"
         fi
