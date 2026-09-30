@@ -9,8 +9,8 @@
 //!   作らない（stderr は使わない）。
 //! - 引数エラー: TASK-21.2 で確定済みの `ErrorReport` を stdout に JSON 1 行、
 //!   exit 64（フィールドは増やさない）。
-//! - `infer`: 解析成功後、`--package` と `artifact.json` の `onnx_file` を経路ガード
-//!   （`infer_guard`。REQ-39・#159）へ通し、拒否は `invalid_input`（64）等の JSON 1 行で
+//! - `infer`: 解析成功後、`--package` と `artifact.json` の `onnx_file`・`kind` を経路ガード・許可リスト
+//!   （`infer_guard`。REQ-39・#159・#156）へ通し、拒否は `invalid_input`（64）等の JSON 1 行で
 //!   終える。経路・形式の検査（sha256・kind_version は未検証。#168・#174）を通過した後の推論本体は #136 で未接続のため、下のスタブ（70）へ進む。
 //! - 解析に成功したコマンド: 下位層への接続は TASK-33.1-2（#136）の範囲の
 //!   ため、完走を装わず `runtime_error`（exit 70）で未実装を返す。

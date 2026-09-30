@@ -27,6 +27,7 @@
 //!
 //! TASK-39.4-2（#159）で、`infer` の `--package` と `artifact.json` の `onnx_file` を
 //! ガード層の経路検証へ通す [`infer_guard`] を追加し、`main.rs` の `infer` 分岐へ接続した。
+//! TASK-39.2-4（#156）で、同じ経路に `artifact.json` の `kind` の許可リスト検査も接続した。
 //! 拒否は `invalid_input`（64）の JSON 1 行。経路・形式の検査のみを通過した後の推論本体は #136 で未接続（sha256・kind_version は未検証。#168・#174）。
 //!
 //! TASK-33.3（#140）で、評価データ未定義の `evaluate` を `status:"skipped"`・exit 0 で終える

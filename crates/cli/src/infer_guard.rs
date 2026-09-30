@@ -1,5 +1,5 @@
 //! `infer` の `--package` と `onnx_file` を経路の閉じ込めへ通す統合（REQ-39・PoC-20 ケース 1・
-//! TASK-39.4-2・#159）。
+//! TASK-39.4-2・#159・`kind` の許可リスト検査は TASK-39.2-4・#156）。
 //!
 //! # 呼び出し文脈
 //!
@@ -11,7 +11,10 @@
 //!
 //! 1. `--package` を workspace（カレントディレクトリ）配下へ閉じ込め、ディレクトリであることを確認
 //! 2. パッケージ配下の `artifact.json` を、開いた fd から上限付きで読む
-//! 3. `onnx_file` を取り出し、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
+//! 3. `onnx_file` と `kind` を取り出す（欠落・型違いは `artifact metadata is invalid`・64）
+//! 4. `kind` を許可リスト（`KindAllowlist::supported()`）で検査する。拒否は
+//!    `kind rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う（fail-closed）
+//! 5. `onnx_file` を、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
 //!    拡張子（`.onnx`）を確認し、保持した fd を上限（`MAX_MODEL_FILE_BYTES`）付きで読み切って
 //!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
 //!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
@@ -30,9 +33,15 @@
 //!
 //! # 後続（#136）への申し送り
 //!
-//! 返す [`PathFormatCheckedInputs::onnx`] は閉じ込めつきで開いて形式検査のみを通した [`CheckedFile`]。推論への接続では、この
-//! バイト列（`as_bytes`・`Read`）をランタイムへ渡すこと。パスから開き直すと検証後の差し替え
-//! （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。
+//! - 返す [`PathFormatCheckedInputs::kind`] は許可リスト検査済みの `kind`。ランタイムの
+//!   `ModelKind::parse` へ写すこと。ガードの許可集合（`c1`・`c3`・`autoregressive`）はランタイムの
+//!   対応（`c1`・`c3`）より広く、`autoregressive` はガードを通ってもランタイムで
+//!   `unsupported_kind` になる（別の層の検査。autoregressive の ONNX 推論は未着手）
+//! - `train`・`register` への `kind` 検査の統合は #136／TASK-33.x の範囲（現行 CLI に入口が無い）。
+//!   `train` 接続時は学習ワーカー起動前に `KindAllowlist` を通すこと
+//! - 返す [`PathFormatCheckedInputs::onnx`] は閉じ込めつきで開いて形式検査のみを通した [`CheckedFile`]。推論への接続では、この
+//!   バイト列（`as_bytes`・`Read`）をランタイムへ渡すこと。パスから開き直すと検証後の差し替え
+//!   （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。
 
 use std::path::Path;
 
@@ -40,6 +49,7 @@ use fandhe_edge_core::artifact_meta::{ArtifactOnnxRef, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_guard::format::{CheckedFile, FormatAllowlist, FormatRejection, check_open_file};
+use fandhe_edge_guard::kind::{CheckedKind, KindAllowlist};
 use fandhe_edge_guard::model_file::MODEL_FILE_EXTENSION;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::ConfinedPath;
@@ -57,6 +67,8 @@ const ARTIFACT_META_FILE: &str = "artifact.json";
 /// 改変されたモデルや非対応の版のパッケージでも、経路と形式が正しければ返る。
 #[derive(Debug)]
 pub struct PathFormatCheckedInputs {
+    /// 許可リストで検査済みの `kind`（`&'static str`。入力の文字列は流れない）。
+    pub kind: CheckedKind,
     /// workspace 配下へ閉じ込め済みのパッケージ。
     pub package: ConfinedPackage,
     /// 閉じ込めつきで開き、形式検査のみを通した ONNX のバイト列（sha256 未照合）。読むときはこれだけを使う。
@@ -88,6 +100,10 @@ pub fn check_infer_path_and_format(
     )
     .map_err(|e| e.to_error_report())?;
     let onnx_ref = ArtifactOnnxRef::parse(&bytes).map_err(|e| e.to_error_report())?;
+    // モデルのバイト列を開く前に kind を拒否する（REQ-39・PoC-20）。
+    let kind = KindAllowlist::supported()
+        .check(onnx_ref.kind())
+        .map_err(|e| e.to_error_report())?;
     let (onnx, onnx_path) = package
         .open_member(Path::new(onnx_ref.onnx_file()))
         .map_err(|e| e.to_error_report())?;
@@ -111,6 +127,7 @@ pub fn check_infer_path_and_format(
     )
     .map_err(|e| e.to_error_report())?;
     Ok(PathFormatCheckedInputs {
+        kind,
         package,
         onnx,
         onnx_path,
