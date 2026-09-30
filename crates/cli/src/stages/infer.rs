@@ -32,7 +32,6 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::path::{PathRejection, open_confined};
-use fandhe_edge_runtime::capacity::MAX_FILE_BYTES;
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
 use fandhe_edge_runtime::pipeline::InferencePipeline;
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
@@ -175,11 +174,8 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         return Err(invalid("package model does not match its recorded hash"));
     }
     // 語彙ファイル（あれば）も配布物の一部として、記録されたハッシュと形式を検証する（REQ-39）。
-    let vocab_bytes = match checked.package.open_member(Path::new(VOCAB_FILE_NAME)) {
-        Ok((file, real)) => Some(
-            read_bounded_open_file(file, real.as_path(), MAX_FILE_BYTES)
-                .map_err(|e| fs_report(&e))?,
-        ),
+    let vocab_file = match checked.package.open_member(Path::new(VOCAB_FILE_NAME)) {
+        Ok((file, real)) => Some((file, real.into_path_buf())),
         Err(PathRejection::Unresolvable { source, .. })
             if source.kind() == io::ErrorKind::NotFound =>
         {
@@ -187,7 +183,7 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    super::package::verify_vocab_member(&meta, vocab_bytes.as_deref())?;
+    super::package::verify_vocab_file(&meta, vocab_file.as_ref().map(|(f, p)| (f, p.as_path())))?;
     let option_ids = definition.options().iter().map(|c| c.id.as_str());
     if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
         return Err(invalid("package label order does not match definition"));

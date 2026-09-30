@@ -1067,24 +1067,66 @@ mod suite {
         assert!(!env.project_file("selection_record.json").exists());
     }
 
-    /// REQ-30・REQ-39: 容量の目安を超える語彙は、記録ハッシュ（ストリーミング照合）が一致すれば
-    /// JSON としてパースせずに除外する（形式が壊れていても除外。メモリへ全体を読まない）。
-    /// ハッシュが不一致なら除外にせず `invalid_input`（64）で止まる。
-    pub fn select_excludes_oversized_vocab_without_parsing_but_checks_hash() {
+    /// REQ-30・REQ-39: 容量の目安を超える語彙も同じストリーミング検証を通す。ハッシュだけ合わせた
+    /// 45MB の非 JSON は除外にせず `invalid_input`（64）で止まる。形式が正しい超過は除外（`pending`）、
+    /// ハッシュ不一致・末尾に余分なデータがある場合も 64。
+    pub fn select_oversized_vocab_is_validated_not_just_excluded() {
         let env = inspected("selbigvocab");
         env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
         let garbage = vec![b'x'; 45_000_000];
         place_vocab(&env, &garbage, Some(&garbage));
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+
+        let meta = env.project_file("candidates/0/model-c1/artifact.json");
+        let vocab_path = env.project_file("candidates/0/model-c1/vocab.json");
+        let replace_hash = |old: &[u8], new: &[u8]| {
+            let text = std::fs::read_to_string(&meta).expect("artifact.json");
+            let (old, new) = (
+                Sha256Digest::of_bytes(old).to_hex(),
+                Sha256Digest::of_bytes(new).to_hex(),
+            );
+            assert!(text.contains(&old), "{text}");
+            std::fs::write(&meta, text.replace(&old, &new)).expect("patch");
+        };
+        // 正しい語彙（45MB 超）は除外される。
+        let valid = oversized_vocab();
+        std::fs::write(&vocab_path, &valid).expect("vocab");
+        replace_hash(&garbage, &valid);
         let out = env.fails(&["select", "--project-dir", "proj"], 12, "pending");
         assert!(out.contains("vocab_package_over_guideline"), "{out}");
-        assert!(!env.project_file("selection_record.json").exists());
-        let meta = env.project_file("candidates/0/model-c1/artifact.json");
-        let text = std::fs::read_to_string(&meta).expect("artifact.json");
-        let recorded = Sha256Digest::of_bytes(&garbage).to_hex();
-        let other = Sha256Digest::of_bytes(b"other").to_hex();
-        assert!(text.contains(&recorded), "{text}");
-        std::fs::write(&meta, text.replace(&recorded, &other)).expect("patch");
+        // 末尾に余分なデータ。
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b" x");
+        std::fs::write(&vocab_path, &trailing).expect("vocab");
+        replace_hash(&valid, &trailing);
         env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        // ハッシュ不一致。
+        replace_hash(&trailing, b"other");
+        env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-30・REQ-39: `model-c1/` 配下に置いた実配置の小さな語彙は、select・package・infer の
+    /// 3 経路が同じ保持 fd 検証で通り、パッケージへ複写される。
+    pub fn vocab_in_artifact_dir_passes_select_package_and_infer() {
+        let env = inspected("vocabpipe");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let vocab = br#"{"a":0,"b":1}"#;
+        place_vocab(&env, vocab, Some(vocab));
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&["package", "--project-dir", "proj"]);
+        assert_eq!(
+            std::fs::read(env.project_file("package/vocab.json")).expect("packaged vocab"),
+            vocab
+        );
+        env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--text",
+            "alpha sample",
+        ]);
     }
 
     /// REQ-30・REQ-39: 容量超過の候補にも ONNX の完全性確認が先に適用される。ONNX を改ざんした
@@ -1320,12 +1362,16 @@ fn main() -> std::process::ExitCode {
             suite::select_validates_candidate_before_capacity_exclusion,
         ),
         (
-            "select_excludes_oversized_vocab_without_parsing_but_checks_hash",
-            suite::select_excludes_oversized_vocab_without_parsing_but_checks_hash,
+            "select_oversized_vocab_is_validated_not_just_excluded",
+            suite::select_oversized_vocab_is_validated_not_just_excluded,
         ),
         (
             "select_verifies_onnx_before_capacity_exclusion",
             suite::select_verifies_onnx_before_capacity_exclusion,
+        ),
+        (
+            "vocab_in_artifact_dir_passes_select_package_and_infer",
+            suite::vocab_in_artifact_dir_passes_select_package_and_infer,
         ),
         (
             "infer_out_option_is_not_faked",

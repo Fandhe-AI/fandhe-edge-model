@@ -35,15 +35,16 @@
 //! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
 //! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
 
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{ErrorKind, Seek, SeekFrom};
 use std::path::{Component, Path};
 
 use fandhe_edge_core::artifact_meta::{
-    ArtifactMeta, MAX_ARTIFACT_META_BYTES, validate_vocab_bytes,
+    ArtifactMeta, ArtifactMetaError, MAX_ARTIFACT_META_BYTES, VocabStreamError, verify_vocab_stream,
 };
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::fs::read_bounded_open_file;
+use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_guard::kind::KindAllowlist;
@@ -66,7 +67,7 @@ use crate::args::PackageArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
     CreatedDir, DEFINITION_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE,
-    fs_report, invalid, parse_definition,
+    fs_report, invalid, parse_definition, runtime,
 };
 
 use super::infer::load_backend;
@@ -154,11 +155,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let onnx_bytes = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
     // 語彙ファイル（あれば）も配布物に含め、`select` の容量判定と構成を揃える（REQ-30・#125）。
     // 無い（NotFound）ときだけ省略し、それ以外の失敗は止める。
-    let vocab_bytes = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
-        Ok((file, real)) => Some(
-            read_bounded_open_file(file, real.as_path(), MAX_FILE_BYTES)
-                .map_err(|e| fs_report(&e))?,
-        ),
+    // 保持 fd は検証（ストリーミング 1 パス）とステージングへの複写の両方で使い、開き直さない。
+    let vocab_file = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
+        Ok((file, real)) => Some((file, real.into_path_buf())),
         Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
             None
         }
@@ -170,7 +169,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
-    verify_vocab_member(&meta, vocab_bytes.as_deref())?;
+    verify_vocab_file(&meta, vocab_file.as_ref().map(|(f, p)| (f, p.as_path())))?;
     check_meta_consistency(
         &meta,
         &definition,
@@ -206,7 +205,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         &meta_bytes,
         &onnx_bytes,
         &definition_bytes,
-        vocab_bytes.as_deref(),
+        &meta,
+        vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
@@ -263,7 +263,8 @@ fn assemble_and_measure(
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
     definition_bytes: &[u8],
-    vocab_bytes: Option<&[u8]>,
+    meta: &ArtifactMeta,
+    vocab: Option<(&File, &Path)>,
 ) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
     let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
@@ -274,8 +275,11 @@ fn assemble_and_measure(
         (PackageComponent::LabelTable, DEFINITION_FILE),
         (PackageComponent::Metadata, ARTIFACT_META_FILE),
     ];
-    if let Some(bytes) = vocab_bytes {
-        project.write_new(pkg.join(VOCAB_FILE_NAME), bytes)?;
+    if let Some((mut file, _)) = vocab {
+        // 保持 fd を先頭へ戻し、固定長バッファで複写する（全体をメモリへ読まない）。
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| runtime("cannot read vocab file"))?;
+        project.write_new_from_reader(pkg.join(VOCAB_FILE_NAME), &mut file, MAX_FILE_BYTES)?;
         members.push((PackageComponent::VocabOrFeatureTransform, VOCAB_FILE_NAME));
     }
 
@@ -283,6 +287,12 @@ fn assemble_and_measure(
     for (component, name) in members {
         let (file, path) = project.open_file(pkg.join(name))?;
         files.push((component, path, file));
+    }
+    // 公開するのはステージングへ複写したファイルなので、複写後の実体も記録どおりか再検証する
+    // （検証から複写までの間の差し替え対策。REQ-39）。
+    if vocab.is_some() {
+        let (file, path) = project.open_file(pkg.join(VOCAB_FILE_NAME))?;
+        verify_vocab_file(meta, Some((&file, path.as_path())))?;
     }
     measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
         .map_err(|e| crate::output::capacity_error_report(&e))
@@ -327,24 +337,51 @@ fn check_meta_consistency(
     Ok(())
 }
 
-/// 語彙ファイルの形式（許可制）と `artifact.json` 記載の sha256 との一致を検証する
-/// （`package` の公開前と `infer` の読み込み時で共有。REQ-39 形式の許可制・完全性）。
+/// 語彙ファイルの形式（許可制）と `artifact.json` 記載の sha256 との一致を、開いた保持 fd からの
+/// ストリーミング 1 パスで検証する（`select`・`package`・`infer` が共有。REQ-30・REQ-39）。
 ///
-/// 語彙ファイルがあるのに sha256 の記録が無い・不一致・形式不正、または記録があるのにファイルが無い
-/// 場合は `invalid_input`（fail-closed）。語彙ファイルも記録も無ければ何もしない。
-pub(crate) fn verify_vocab_member(
+/// 全体をメモリへ読まず、読みながら sha256 と形式（件数・トークン長の上限つき）を確認する
+/// （[`verify_vocab_stream`]）。保持 fd はオフセット 0 から読むこと（呼び出し側で開き直さない）。
+/// 語彙ファイルがあるのに sha256 の記録が無い・不一致・形式不正・サイズ超過、または記録があるのに
+/// ファイルが無い場合は `invalid_input`（fail-closed）、読み込み失敗は `runtime_error`。語彙ファイルも
+/// 記録も無ければ `Ok(None)`。あれば fstat のサイズを返す。
+pub(crate) fn verify_vocab_file(
     meta: &ArtifactMeta,
-    vocab_bytes: Option<&[u8]>,
-) -> Result<(), ErrorReport> {
-    match (vocab_bytes, meta.vocab_sha256()) {
-        (None, None) => Ok(()),
+    vocab: Option<(&File, &Path)>,
+) -> Result<Option<u64>, ErrorReport> {
+    match (vocab, meta.vocab_sha256()) {
+        (None, None) => Ok(None),
         (None, Some(_)) => Err(invalid("vocab file is missing but its hash is recorded")),
         (Some(_), None) => Err(invalid("vocab file has no recorded hash")),
-        (Some(bytes), Some(recorded)) => {
-            if Sha256Digest::of_bytes(bytes).to_hex() != recorded {
+        (Some((file, path)), Some(recorded)) => {
+            let read_err = |source| {
+                fs_report(&FsError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            };
+            let metadata = file.metadata().map_err(read_err)?;
+            if !metadata.is_file() {
+                return Err(fs_report(&FsError::NotRegularFile {
+                    path: path.to_path_buf(),
+                }));
+            }
+            let size = metadata.len();
+            if size > MAX_FILE_BYTES {
+                return Err(fs_report(&FsError::TooLarge {
+                    path: path.to_path_buf(),
+                    size,
+                    limit: MAX_FILE_BYTES,
+                }));
+            }
+            let digest = verify_vocab_stream(file, MAX_FILE_BYTES).map_err(|e| match e {
+                VocabStreamError::Format => ArtifactMetaError::InvalidVocab.to_error_report(),
+                VocabStreamError::Read => runtime("cannot read vocab file"),
+            })?;
+            if digest.to_hex() != recorded {
                 return Err(invalid("vocab file does not match its recorded hash"));
             }
-            validate_vocab_bytes(bytes).map_err(|e| e.to_error_report())
+            Ok(Some(size))
         }
     }
 }
@@ -463,21 +500,38 @@ mod tests {
         ArtifactMeta::parse(json.as_bytes()).expect("meta")
     }
 
-    /// REQ-39: 語彙ファイルは記録ハッシュとの一致と許可形式の両方を満たすときだけ通す。
+    fn temp_vocab(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!("fandhe-vocab-{tag}-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write");
+        let file = File::open(&path).expect("open");
+        (path, file)
+    }
+
+    /// REQ-39: 語彙ファイルは記録ハッシュとの一致と許可形式の両方を満たすときだけ通す
+    /// （保持 fd からのストリーミング検証。select・package・infer で共有）。
     #[test]
-    fn req39_verify_vocab_member_checks_hash_and_format() {
+    fn req39_verify_vocab_file_checks_hash_and_format() {
         let good = br#"{"a":0}"#;
         let good_hex = Sha256Digest::of_bytes(good).to_hex();
-        assert!(verify_vocab_member(&meta_with_vocab(None), None).is_ok());
-        assert!(verify_vocab_member(&meta_with_vocab(Some(&good_hex)), Some(good)).is_ok());
+        let (p1, f1) = temp_vocab("good", good);
+        assert_eq!(verify_vocab_file(&meta_with_vocab(None), None), Ok(None));
+        assert_eq!(
+            verify_vocab_file(&meta_with_vocab(Some(&good_hex)), Some((&f1, &p1))),
+            Ok(Some(7))
+        );
         // 記録なし・ファイルなし・ハッシュ不一致は拒否。
-        assert!(verify_vocab_member(&meta_with_vocab(None), Some(good)).is_err());
-        assert!(verify_vocab_member(&meta_with_vocab(Some(&good_hex)), None).is_err());
-        assert!(verify_vocab_member(&meta_with_vocab(Some(&"1".repeat(64))), Some(good)).is_err());
-        // ハッシュが一致しても形式が許可外なら拒否。
-        let bad = b"not json";
-        let bad_hex = Sha256Digest::of_bytes(bad).to_hex();
-        let err = verify_vocab_member(&meta_with_vocab(Some(&bad_hex)), Some(bad)).unwrap_err();
-        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+        assert!(verify_vocab_file(&meta_with_vocab(None), Some((&f1, &p1))).is_err());
+        assert!(verify_vocab_file(&meta_with_vocab(Some(&good_hex)), None).is_err());
+        let wrong = meta_with_vocab(Some(&"1".repeat(64)));
+        assert!(verify_vocab_file(&wrong, Some((&f1, &p1))).is_err());
+        // ハッシュが一致しても形式が許可外・末尾に余分なデータなら拒否。
+        for (tag, bad) in [("bad", &b"not json"[..]), ("trail", br#"{"a":0} x"#)] {
+            let hex = Sha256Digest::of_bytes(bad).to_hex();
+            let (p, f) = temp_vocab(tag, bad);
+            let err = verify_vocab_file(&meta_with_vocab(Some(&hex)), Some((&f, &p))).unwrap_err();
+            assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(&p1);
     }
 }

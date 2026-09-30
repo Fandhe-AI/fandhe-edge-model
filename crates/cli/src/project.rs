@@ -289,6 +289,36 @@ impl Project {
         Ok(())
     }
 
+    /// [`Project::write_new`] のストリーミング版。`reader` から最大 `limit` バイトを固定長バッファで
+    /// 複写し、全体をメモリへ載せない（語彙ファイルの配布物への複写。REQ-30・REQ-39）。
+    /// `limit` を超えて続くデータがあれば拒否し、書きかけのファイルは消す。
+    ///
+    /// # Errors
+    /// 既存は `invalid_input`、上限超過は `invalid_input`、書き込み・読み込み失敗は `runtime_error`。
+    pub fn write_new_from_reader(
+        &self,
+        rel: impl AsRef<Path>,
+        reader: &mut impl std::io::Read,
+        limit: u64,
+    ) -> Result<(), ErrorReport> {
+        use std::io::Read as _;
+        let rel = rel.as_ref();
+        let mut file = self
+            .package
+            .create_new_member(rel)
+            .map_err(|e| write_rejection(&e, "file already exists", "cannot write project file"))?;
+        let copied = std::io::copy(&mut reader.take(limit.saturating_add(1)), &mut file)
+            .and_then(|n| file.flush().map(|()| n));
+        let result = match copied {
+            Ok(n) if n <= limit => return Ok(()),
+            Ok(_) => invalid("file exceeds the size limit"),
+            Err(_) => runtime("cannot write project file"),
+        };
+        drop(file);
+        let _ = self.package.remove_file_member(rel);
+        Err(result)
+    }
+
     /// ディレクトリを所有者のみ（0700）で新規作成する（既存なら拒否）。
     ///
     /// # Errors

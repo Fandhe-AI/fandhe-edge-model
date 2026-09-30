@@ -26,9 +26,7 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use fandhe_edge_core::artifact_meta::{
-    ArtifactMeta, MAX_ARTIFACT_META_BYTES, validate_vocab_bytes,
-};
+use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::{read_bounded_open_file, sha256_open_file_bounded};
@@ -52,6 +50,7 @@ use crate::error_report::{ToErrorReport, default_message};
 use crate::project::{DEFINITION_FILE, Project, SELECTION_FILE, fail, fs_report, invalid, runtime};
 
 use super::infer::kind_version_allowed;
+use super::package::verify_vocab_file;
 use super::train::{
     candidate_rel, load_trained, request_matches_candidate, resolve_candidates, verified_split,
 };
@@ -234,8 +233,9 @@ pub fn compute_selection_with_exclusions(
 /// - ONNX: `artifact.json` 記載の sha256 とのストリーミング照合・形式の許可リスト・`kind`・
 ///   `kind_version` の許可リストと学習リクエストとの一致（`package` の公開前検証と同じ観点）。
 /// - 語彙ファイル: 記録 sha256 とのストリーミング照合（固定長バッファ。全体をメモリへ読まない）。
-///   JSON 形式の検証は、保持 fd の fstat サイズが容量の目安以下のときだけ行う。超える語彙は
-///   ハッシュ一致を確認したうえでパースせずに除外へ回す（メモリ使用量が語彙サイズに比例しない）。
+///   同じストリームで JSON 形式も検証する（[`verify_vocab_file`]。`package`・`infer` と共通）。容量を
+///   超える語彙も同じ検証を通し、形式不正なら除外にせず `invalid_input`、形式が正しい超過だけを除外する。
+///   語彙は保持 fd 1 本を検証と計測で使い回し（開き直さない）、メモリ使用量はファイルサイズに比例しない。
 ///
 /// 構成要素は `package` 工程の組み立て（`assemble_and_measure`）と揃える。語彙ファイルの有無は
 /// 成果物ディレクトリの [`VOCAB_FILE_NAME`] で判定する（現行の既定候補 c1・c3 は語彙を ONNX グラフ内に
@@ -305,56 +305,30 @@ fn vocab_exclusion_of(
         return Err(invalid("unsupported kind_version"));
     }
 
-    // 語彙ファイル: 無い（NotFound）ときだけ `has_vocab_file = false`。それ以外の失敗は止める。
-    let vocab_rel = artifact_rel.join(VOCAB_FILE_NAME);
-    let vocab_open = match candidate_dir.open_member(&vocab_rel) {
-        Ok(opened) => Some(opened),
+    // 語彙ファイル: 無い（NotFound）ときだけ「無し」。それ以外の失敗は止める。
+    let vocab_open = match candidate_dir.open_member(&artifact_rel.join(VOCAB_FILE_NAME)) {
+        Ok((file, real)) => Some((file, real.into_path_buf())),
         Err(PathRejection::Unresolvable { source, .. }) if source.kind() == ErrorKind::NotFound => {
             None
         }
         Err(e) => return Err(e.to_error_report()),
     };
+    // 保持 fd 1 本を、検証（ストリーミング 1 パス）と容量計測（fstat）の両方で使い、開き直さない。
+    // 容量を超える語彙も同じ形式検証を通し、不正なら除外にせず `invalid_input` で止める
+    // （形式が正しい超過だけが除外へ進む）。
+    verify_vocab_file(&meta, vocab_open.as_ref().map(|(f, p)| (f, p.as_path())))?;
     let has_vocab_file = vocab_open.is_some();
-    match (&vocab_open, meta.vocab_sha256()) {
-        (None, None) => {}
-        (None, Some(_)) => return Err(invalid("vocab file is missing but its hash is recorded")),
-        (Some(_), None) => return Err(invalid("vocab file has no recorded hash")),
-        (Some((file, real)), Some(recorded)) => {
-            let vocab_size = file
-                .metadata()
-                .map_err(|_| runtime("cannot inspect vocab file"))?
-                .len();
-            let hash_handle = file
-                .try_clone()
-                .map_err(|_| runtime("cannot inspect vocab file"))?;
-            let digest = sha256_open_file_bounded(hash_handle, real.as_path(), MAX_FILE_BYTES)
-                .map_err(|e| fs_report(&e))?;
-            if digest.to_hex() != recorded {
-                return Err(invalid("vocab file does not match its recorded hash"));
-            }
-            // 形式検証（メモリへ読む）は容量の目安以下のときだけ。超過分は除外されるためパースしない。
-            if vocab_size <= VOCAB_GUIDELINE_BYTES {
-                let (vfile, vreal) = open(VOCAB_FILE_NAME)?;
-                let bytes = read_bounded_open_file(vfile, vreal.as_path(), VOCAB_GUIDELINE_BYTES)
-                    .map_err(|e| fs_report(&e))?;
-                validate_vocab_bytes(&bytes).map_err(|e| e.to_error_report())?;
-            }
-        }
-    }
-
     let mut files = Vec::new();
-    files.push((PackageComponent::Weights, onnx_real.into_path_buf(), {
-        open(onnx_file)?.0
-    }));
+    let (onnx_handle, _) = open(onnx_file)?;
+    files.push((
+        PackageComponent::Weights,
+        onnx_real.into_path_buf(),
+        onnx_handle,
+    ));
     let (file, real) = open("artifact.json")?;
     files.push((PackageComponent::Metadata, real.into_path_buf(), file));
-    if has_vocab_file {
-        let (file, real) = open(VOCAB_FILE_NAME)?;
-        files.push((
-            PackageComponent::VocabOrFeatureTransform,
-            real.into_path_buf(),
-            file,
-        ));
+    if let Some((file, real)) = vocab_open {
+        files.push((PackageComponent::VocabOrFeatureTransform, real, file));
     }
     // 選択肢表（`package` は `definition.json` を LabelTable として合計に含める）。
     let (file, path) = project.open_file(DEFINITION_FILE)?;
