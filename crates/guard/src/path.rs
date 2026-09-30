@@ -778,7 +778,7 @@ impl ConfinedDir {
             to_name.as_os_str(),
             rustix::fs::RenameFlags::NOREPLACE,
         );
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let result =
             rustix::fs::renameat(from_dir, from_name.as_os_str(), to_dir, to_name.as_os_str());
         result.map_err(|e| PathRejection::Unresolvable {
