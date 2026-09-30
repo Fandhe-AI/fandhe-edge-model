@@ -11,7 +11,7 @@ use fandhe_edge_data::eval_freeze::freeze_eval_data;
 use fandhe_edge_eval::eval_data_invariance::{EvalDataInvarianceError, FrozenEvalData};
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedBy, AppliedOnce, ApplyOnceError, DecodeFailed, FinalTestLedger,
-    LabeledInput, RegisteredConfig, RepresentativeConfigId, apply_once,
+    LabeledInput, RegisteredConfig, RepresentativeConfigId, apply_once, apply_once_then,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
 use std::cell::Cell;
@@ -1358,6 +1358,45 @@ fn req27_is_applied_is_false_after_failed_prediction() {
     assert!(acquire_err(&retry).is_some(), "{retry:?}");
     assert_eq!(calls.get(), 0);
     assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+}
+
+/// REQ-27: `apply_once_then` の `finish` が失敗すると完了は記録されず（`is_applied` は偽）、
+/// 適用権は消費済みのまま（台帳だけが完了状態になる不整合を作らない）。
+#[test]
+fn req27_finish_failure_leaves_completion_unrecorded() {
+    let dir = TempDir::new("finish-failed");
+    let ledger = FinalTestLedger::open(dir.path()).unwrap();
+    let digest = freeze_eval_data(DATA).unwrap().sha256();
+    register(&ledger, DATA, &[("c1:seed0", b"w1")]);
+    let model = Model::new(b"w1", None);
+    let data_dir = TempDir::new("data-finish-failed");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let record = freeze_eval_data(DATA).unwrap();
+    let frozen = FrozenEvalData {
+        path: &path,
+        sha256: record.sha256(),
+        byte_len: record.byte_len(),
+    };
+    let w = Sha256Digest::of_bytes(b"w1");
+    let failed = apply_once_then(
+        &ledger,
+        &frozen,
+        id("c1:seed0"),
+        &model.paths(),
+        dec,
+        |_t, inputs, _paths| Ok::<usize, String>(inputs.len()),
+        |_applied| Err::<(), String>("finish failed".to_string()),
+    );
+    assert!(matches!(
+        failed,
+        Err(EvalDataInvarianceError::Evaluation(
+            EvaluationInvarianceError::Evaluation(ApplyOnceError::Prediction(_))
+        ))
+    ));
+    assert!(!ledger.is_applied(&digest, &id("c1:seed0"), &w).unwrap());
+    let retry = run(&ledger, DATA, "c1:seed0", &model, &Cell::new(0));
+    assert!(acquire_err(&retry).is_some(), "{retry:?}");
 }
 
 /// REQ-27: 完了記録が食い違う（改変された）場合は `RegistryTampered`（fail-closed）。

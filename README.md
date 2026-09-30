@@ -24,6 +24,27 @@
 
 詳細な要件は spec リポの [`04-requirements.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/04-requirements.md) を唯一の正（SSOT）とします。
 
+## `evaluate` 工程の出力（REQ-24・REQ-27・REQ-33・#314）
+
+`fandhe-edge evaluate`（`--candidate <N>`）は、凍結した評価データへ選定済み候補を **1 回だけ** 適用し、JSON を 1 つ出力します。出力スキーマは提案であり、オーナーの承認は得ていません（入出力契約への加算的な追加）。
+
+評価データがあり評価が完了した場合（exit 0）:
+
+```json
+{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":100,"correct":90,"accuracy":0.9,"macro_f1":0.88}
+```
+
+| フィールド | 意味 |
+| ---------- | ---- |
+| `candidate` | 評価した候補の番号 |
+| `kind` | 候補のモデルの種類 |
+| `n_total` | 評価データの件数（分母。0 件は完了にならない） |
+| `correct` | 正解した件数 |
+| `accuracy` | 正解率（`correct / n_total`） |
+| `macro_f1` | Macro-F1（評価器で算出。分母 0 のラベルは平均から除外し、全ラベルで未定義なら `null`） |
+
+評価データが未定義のときは `{"step":"evaluate","status":"skipped",...}`（exit 0）で、評価済みを装いません。成功時は `candidates/<N>/evaluation_record.json` を書き、`package` は記録と最終 test の台帳での適用完了を確認してから公開します。値は例示です。Wilson 区間・McNemar / Holm・診断レポートは未接続です。
+
 ## 開発環境構築
 
 ```bash

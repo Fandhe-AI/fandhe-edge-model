@@ -1053,6 +1053,12 @@ pub struct AppliedOnce<T> {
 pub type ApplyOnceResult<T, E> =
     Result<AppliedOnce<T>, EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>>;
 
+/// [`apply_once_then`] の戻り値。成功値は [`AppliedOnce`] と `finish` の戻り値の組。
+pub type ApplyOnceThenResult<T, E, R> = Result<
+    (AppliedOnce<T>, R),
+    EvalDataInvarianceError<EvaluationInvarianceError<ApplyOnceError<E>>>,
+>;
+
 /// 事前登録集合の正準化本文（ID 順にソート済みの `<ID> <重み> <語彙> <校正> <しきい値>`（sha256 hex。無い要素は `-`）を 1 行ずつ）。
 fn registry_body(entries: &[RegisteredConfig]) -> String {
     let mut out = String::from(REGISTRY_HEADER);
@@ -1217,6 +1223,34 @@ pub fn apply_once<T, E>(
     decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, DecodeFailed>,
     predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
 ) -> ApplyOnceResult<T, E> {
+    apply_once_then(
+        ledger,
+        frozen,
+        config_id,
+        model,
+        decode,
+        predict,
+        |_| Ok(()),
+    )
+    .map(|(applied, ())| applied)
+}
+
+/// [`apply_once`] に、完了記録の直前に走る `finish` を加えた版（REQ-27）。
+///
+/// `finish` は予測・不変性検証がすべて成功した後、完了記録の **前** に 1 回だけ呼ばれる
+/// （指標の算出・結果の検証・評価記録の書き込みなど、成功の一部である後処理用）。
+/// `finish` が失敗すると完了は記録されず（適用権のロックのみが残り、`is_applied` は偽）、
+/// 「台帳だけが完了状態で結果が無い」不整合を作らない。失敗は [`ApplyOnceError::Prediction`] として返る。
+/// `finish` へ渡すのは予測結果と正解ラベル（評価器側の値）で、推論側には渡らない。
+pub fn apply_once_then<T, E, R>(
+    ledger: &FinalTestLedger,
+    frozen: &FrozenEvalData<'_>,
+    config_id: RepresentativeConfigId,
+    model: &ModelPackagePaths<'_>,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, DecodeFailed>,
+    predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
+    finish: impl FnOnce(&AppliedOnce<T>) -> Result<R, E>,
+) -> ApplyOnceThenResult<T, E, R> {
     // 評価が最後まで成功したときに記録する完了記録の材料（適用権の消費とは別の状態。REQ-27）。
     let mut pending_completion: Option<(FinalTestKey, Sha256Digest)> = None;
     let result = evaluate_with_eval_data_invariance(frozen, |bytes| {
@@ -1266,16 +1300,16 @@ pub fn apply_once<T, E>(
     // 予測・評価後のモデル / 評価データの不変性検証まで成功した場合だけ完了を記録する。
     // 失敗した適用はロックのみが残り、`is_applied` は false を返す。
     let applied = result?;
+    let wrap = |e: ApplyOnceError<E>| {
+        EvalDataInvarianceError::Evaluation(EvaluationInvarianceError::Evaluation(e))
+    };
+    let finished = finish(&applied).map_err(|e| wrap(ApplyOnceError::Prediction(e)))?;
     if let Some((key, registry_sha256)) = pending_completion {
         ledger
             .record_completion(&key, &registry_sha256)
-            .map_err(|e| {
-                EvalDataInvarianceError::Evaluation(EvaluationInvarianceError::Evaluation(
-                    ApplyOnceError::Acquire(e),
-                ))
-            })?;
+            .map_err(|e| wrap(ApplyOnceError::Acquire(e)))?;
     }
-    Ok(applied)
+    Ok((applied, finished))
 }
 
 #[cfg(test)]

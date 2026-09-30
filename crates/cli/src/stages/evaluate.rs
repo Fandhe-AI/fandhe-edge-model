@@ -47,6 +47,10 @@
 //! （[`super::ledger::HeldLedger`]）。評価器の台帳 API がパスを受け取るため、確認と台帳操作の間の
 //! 差し替えは原理的に残る（fd 相対の台帳 API は #168 の範囲）。
 //!
+//! 指標の算出・結果の検証・記録ファイルの書き込みは、台帳へ完了を記録する前
+//! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
+//! 台帳は完了状態にならず（適用権のロックのみが残る）、記録の無い完了を作らない（REQ-27）。
+//!
 //! # 選定との順序（REQ-27）
 //!
 //! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
@@ -70,8 +74,8 @@ use fandhe_edge_core::stage_report::{EvaluateCompletedReport, EvaluateReport};
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
-    AcquireError, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
-    RepresentativeConfigId, apply_once,
+    AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
+    RepresentativeConfigId, apply_once_then,
 };
 use fandhe_edge_eval::invariance::ModelPackagePaths;
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome};
@@ -219,54 +223,40 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         Err(e) => return Err(acquire_error_report(&e)),
     }
 
-    let applied = apply_to_frozen_data(
+    // 指標の算出・評価記録の書き込みは、台帳へ完了を記録する前（`finish`）に済ませる。失敗しても
+    // 台帳は完了状態にならず、記録の無い完了（台帳だけが完了）を作らない（REQ-27）。
+    let mut finish_error: Option<ErrorReport> = None;
+    let finish = |applied: &AppliedOnce<Vec<Outcome>>| -> Result<EvaluateCompletedReport, EvalPredictFailure> {
+        finalize_evaluation(
+            &project,
+            &definition,
+            &freeze,
+            &target,
+            args.candidate,
+            &record_rel,
+            definition_sha256,
+            onnx_digest,
+            applied,
+        )
+        .map_err(|e| {
+            finish_error = Some(e);
+            EvalPredictFailure::Failed
+        })
+    };
+    let (_applied, report) = match apply_to_frozen_data(
         held_ledger.ledger()?,
         &freeze,
         &definition,
         &eval_bytes,
         &target,
         onnx_digest,
-    )?;
-
-    // 指標は評価器で求める（CLI で評価ロジックを再実装しない）。
-    let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
-    let eval_records: Vec<EvalRecord<'_>> = applied
-        .golds
-        .iter()
-        .zip(&applied.output)
-        .map(|(gold, outcome)| EvalRecord { gold, outcome })
-        .collect();
-    let computed = metrics::evaluate_single_select(&labels, &eval_records)
-        .map_err(|_| runtime("cannot compute evaluation metrics"))?;
-    let correct = computed.accuracy.overall.numerator();
-    let total = computed.accuracy.overall.denominator();
-
-    let record = EvaluationRecord {
-        candidate_index: args.candidate,
-        candidate_id: target.candidate_id.clone(),
-        config_id: target.config_id.as_str().to_string(),
-        evaluation_sha256: freeze.sha256().to_hex(),
-        evaluation_bytes: freeze.byte_len(),
-        onnx_sha256: onnx_digest.to_hex(),
-        artifact_meta_sha256: Sha256Digest::of_bytes(&target.artifact.meta_bytes).to_hex(),
-        definition_sha256,
-        correct,
-        total,
+        finish,
+    ) {
+        Ok(v) => v,
+        Err(report) => return Err(finish_error.take().unwrap_or(report)),
     };
-    let record_json = record
-        .to_json_vec()
-        .map_err(|_| runtime("cannot serialize evaluation record"))?;
-    project.write_new(&record_rel, &record_json)?;
 
-    EvaluateCompletedReport::completed(
-        args.candidate,
-        target.kind_name,
-        correct,
-        total,
-        computed.macro_f1.value(),
-    )
-    .map(EvaluateOutcome::Completed)
-    .ok_or_else(|| runtime("cannot build evaluation report"))
+    Ok(EvaluateOutcome::Completed(report))
 }
 
 /// `select` の記録があり、保存済みの結果から再計算した選定と一致し、対象候補が選定された候補で
@@ -408,15 +398,71 @@ fn decode_evaluation(
         .collect())
 }
 
+/// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
+///
+/// 指標は評価器（`fandhe-edge-eval`）で求め、CLI では再実装しない（REQ-24）。記録の書き込みは最後に行い、
+/// それ以前の失敗では記録を残さない。
+#[allow(clippy::too_many_arguments)]
+fn finalize_evaluation(
+    project: &Project,
+    definition: &Definition,
+    freeze: &FreezeRecord,
+    target: &PreparedCandidate,
+    candidate: usize,
+    record_rel: &Path,
+    definition_sha256: String,
+    onnx_digest: Sha256Digest,
+    applied: &AppliedOnce<Vec<Outcome>>,
+) -> Result<EvaluateCompletedReport, ErrorReport> {
+    let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
+    let eval_records: Vec<EvalRecord<'_>> = applied
+        .golds
+        .iter()
+        .zip(&applied.output)
+        .map(|(gold, outcome)| EvalRecord { gold, outcome })
+        .collect();
+    let computed = metrics::evaluate_single_select(&labels, &eval_records)
+        .map_err(|_| runtime("cannot compute evaluation metrics"))?;
+    let correct = computed.accuracy.overall.numerator();
+    let total = computed.accuracy.overall.denominator();
+    let report = EvaluateCompletedReport::completed(
+        candidate,
+        target.kind_name.clone(),
+        correct,
+        total,
+        computed.macro_f1.value(),
+    )
+    .ok_or_else(|| runtime("cannot build evaluation report"))?;
+
+    let record = EvaluationRecord {
+        candidate_index: candidate,
+        candidate_id: target.candidate_id.clone(),
+        config_id: target.config_id.as_str().to_string(),
+        evaluation_sha256: freeze.sha256().to_hex(),
+        evaluation_bytes: freeze.byte_len(),
+        onnx_sha256: onnx_digest.to_hex(),
+        artifact_meta_sha256: Sha256Digest::of_bytes(&target.artifact.meta_bytes).to_hex(),
+        definition_sha256,
+        correct,
+        total,
+    };
+    let record_json = record
+        .to_json_vec()
+        .map_err(|_| runtime("cannot serialize evaluation record"))?;
+    project.write_new(record_rel, &record_json)?;
+    Ok(report)
+}
+
 /// 台帳で適用権を取り、凍結した評価データへ 1 回だけ推論を当てる。
-fn apply_to_frozen_data(
+fn apply_to_frozen_data<R>(
     ledger: &FinalTestLedger,
     freeze: &FreezeRecord,
     definition: &Definition,
     eval_bytes: &[u8],
     target: &PreparedCandidate,
     onnx_digest: Sha256Digest,
-) -> Result<fandhe_edge_eval::final_test_once::AppliedOnce<Vec<Outcome>>, ErrorReport> {
+    finish: impl FnOnce(&AppliedOnce<Vec<Outcome>>) -> Result<R, EvalPredictFailure>,
+) -> Result<(AppliedOnce<Vec<Outcome>>, R), ErrorReport> {
     // 評価器はパスから開き直すため、閉じ込めつきで読み検証済みのバイト列を、この実行だけの
     // 私用ディレクトリ（0700・新規作成）へ複製し、そのパスを渡す。プロジェクト内のパスを渡すと、
     // 検証後に symlink へ差し替えられてプロジェクト外を読みうる（REQ-39）。
@@ -435,7 +481,7 @@ fn apply_to_frozen_data(
         thresholds: None,
     };
     let options = definition.options();
-    apply_once(
+    apply_once_then(
         ledger,
         &frozen,
         target.config_id.clone(),
@@ -480,6 +526,7 @@ fn apply_to_frozen_data(
             }
             Ok(outcomes)
         },
+        finish,
     )
     .map_err(|e| apply_once_error_report(&e))
 }
