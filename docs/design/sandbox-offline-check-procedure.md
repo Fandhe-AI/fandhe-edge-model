@@ -28,8 +28,10 @@ Agent が確定させない（`evidence_hint` は `requires_human_review` か `t
 1. 前提（sandbox の外で先に済ませる。承認済みの依存取得の通信は計測対象外）: `cargo build`・`make py-sync`。
 2. 入力は `fixtures/sandbox_run/`（合成データ）を作業ディレクトリ配下へコピーして使う。経路の閉じ込め（REQ-39）により
    `--definition`・`--project-dir` はカレントディレクトリ配下に置く。
-3. オーバーライド用の環境変数（`FANDHE_EDGE_SANDBOX_EXEC`・`FANDHE_EDGE_LOG_CMD`・`FANDHE_EDGE_BIN` 以外の
-   `FANDHE_EDGE_LOG_STREAM_*`）は設定しない。設定すると `evidence_hint` が `test_harness` になる。
+3. テスト用の上書き環境変数は**すべて未設定**にする（`unset` してから実行する）。対象は
+   `FANDHE_EDGE_SANDBOX_EXEC`（sandbox を偽物へ差し替える）・`FANDHE_EDGE_LOG_CMD`（log stream を偽物へ差し替える）・
+   `FANDHE_EDGE_LOG_STREAM_*`（監視の待ち時間の調整）。`FANDHE_EDGE_BIN` は実 CLI を指す場合に限り使ってよい。
+   いずれかを設定すると実機確認（REQ-38）にならず、`evidence_hint` が `test_harness` になる。
 4. 実行例（手順 2 の作業ディレクトリへ移動してから、スクリプトはリポジトリの絶対パスで呼ぶ。
    `<REPO>` はリポジトリのルート、`<out>` は空または未作成、`<project>` は未作成）:
 
@@ -51,6 +53,9 @@ Agent が確定させない（`evidence_hint` は `requires_human_review` か `t
 ## 5. PR・Issue へ記録する項目
 
 - 証拠種別: 実機（機種・OS 版を併記）
+- 記録の前に、`out/network_report.json` の `evidence_hint` が `requires_human_review` であること、
+  `log_stream_override` が `false` であること、`out/run/run.meta.json` の `sandbox_exec_override` が `false` である
+  ことを確認する。1 つでも異なれば実機の証拠として記録せず、環境変数を見直して再実行する
 - `out/network_report.json` の `counts`・`network_verdict`・`evidence_hint`・`positive_control`
 - `out/run/run.meta.json` の工程ごとの終了コード（評価は `skipped` である旨）
 - 生ログ `log_stream.ndjson` は他アプリのイベントを含むため**転記しない**。データ本文・パスも記録しない
