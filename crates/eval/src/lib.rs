@@ -45,6 +45,7 @@
 //!   パッケージ側と対になる評価データ側の実装
 //! - [`final_test_once`][]: 凍結した最終 test への 1 回限り適用の強制
 //!   （REQ-27 境界値・TASK-27.3・issue #72。PoC-10・PoC-25 のロックファイル方式）
+//! - [`ledger_dir`]: 最終 test 台帳のディレクトリ操作の抽象（fd 起点の実装を CLI が差し込む。REQ-39）
 //! - [`sample_size`][]: McNemar 検定で下限基準との差を検出するための
 //!   必要評価件数の事前計算（Connor 式を起点に、実際に使う両側正確検定の
 //!   検出力で引き上げる。REQ-25 異常系・TASK-25.2・issue #66・
@@ -185,6 +186,7 @@ pub mod final_test_once;
 pub mod holm;
 pub mod input_only;
 pub mod invariance;
+pub mod ledger_dir;
 pub mod mcnemar;
 pub mod metrics;
 pub mod quadrant;

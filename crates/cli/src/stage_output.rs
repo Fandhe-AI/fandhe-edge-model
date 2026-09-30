@@ -20,9 +20,8 @@
 //! [`EvaluateStart::Skipped`]（[`emit_evaluate_skipped`] で `status:"skipped"`・exit 0）、
 //! 凍結記録と一致すれば [`EvaluateStart::Proceed`]、不一致・矛盾は `ErrorReport`（exit ≠ 0。
 //! skipped へ落とさない）へ振り分ける。skip 判定は CLI で再実装しない。
-//! `Proceed` の後段（評価器呼び出し・結果 JSON）は未実装（評価器の結線 TASK）で、成功 JSON は
-//! 出さない。`stages::evaluate`（#136）は PoC-16 と同様に、候補が学習済みか等の確認より前に本関数の
-//! skip 判定を行い、`Proceed` の後は評価済みを装わず `runtime_error` を返す。
+//! `Proceed` の後段（評価器の呼び出し・結果 JSON・評価完了の記録）は `stages::evaluate`
+//! （#136・#314）が担う。同工程は PoC-16 と同様に、候補が学習済みか等の確認より前に skip 判定を行う。
 //!
 //! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`。#136）。
 
@@ -95,7 +94,7 @@ pub fn emit_package_outcome<W: Write>(
 pub enum EvaluateStart {
     /// 評価データ未定義。[`emit_evaluate_skipped`] で skipped（exit 0）を出す。
     Skipped(EvaluateReport),
-    /// 凍結記録と実データが一致した。評価器へ進む（後段は未実装。成功 JSON は出さない）。
+    /// 凍結記録と実データが一致した。評価器へ進む（後段は `stages::evaluate`）。
     Proceed(FreezeRecord),
 }
 

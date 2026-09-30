@@ -37,6 +37,8 @@ pub mod args;
 pub mod error_report;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod frozen_dir;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod held_ledger_dir;
 pub mod infer_batch;
 pub mod infer_guard;
 pub mod log;

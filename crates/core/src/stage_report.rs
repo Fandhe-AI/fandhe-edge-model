@@ -19,8 +19,10 @@
 //! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に揃えた最小集合で、
 //! パス・データ本文・計測値は載せない（security.md。容量・p95 等の追加は各結線
 //! TASK で main が判断する入出力契約の変更）。加えて `evaluate` 工程の評価データ
-//! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）を持つ。
-//! 評価完了の結果型（指標を持つ）は評価器の結線 TASK で追加する（未実装）。
+//! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
+//! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
+//! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
+//! 出力に含めない（未結線）。
 //!
 //! 合否判定は exit 0 になる `pass` のみを表す。`fail`・`limit_exceeded`・判定不能は
 //! exit ≠ 0 であり `ErrorReport` 側へ流すため、本型では表現できない（壊れた値を
@@ -89,6 +91,67 @@ impl EvaluateReport {
     }
 
     /// JSON 1 行（末尾の改行なし）へ直列化する。[`PackageReport::to_json_line`] と対称。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `evaluate` 工程が評価データありで完了したときの JSON（REQ-24・REQ-27・REQ-33・#314）。
+///
+/// 凍結した評価データへの 1 回限りの適用が終わり、指標を算出できたときだけ作れる。
+/// フィールドは非公開でコンストラクタ [`Self::completed`] のみが作る（`total == 0`・
+/// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
+/// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
+/// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`）に直列化し、`macro_f1` が未定義なら
+/// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
+///
+/// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvaluateCompletedReport {
+    step: Stage,
+    status: StageStatus,
+    candidate: usize,
+    kind: String,
+    n_total: u64,
+    correct: u64,
+    accuracy: f64,
+    macro_f1: Option<f64>,
+}
+
+impl EvaluateCompletedReport {
+    /// 評価完了の結果を作る。`accuracy` は `correct / total` から求める。
+    ///
+    /// `total == 0`、`correct > total`、有限でない・`[0, 1]` の外の `macro_f1` は `None`。
+    #[must_use]
+    pub fn completed(
+        candidate: usize,
+        kind: String,
+        correct: u64,
+        total: u64,
+        macro_f1: Option<f64>,
+    ) -> Option<Self> {
+        if total == 0 || correct > total {
+            return None;
+        }
+        if macro_f1.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+            return None;
+        }
+        Some(Self {
+            step: Stage::Evaluate,
+            status: StageStatus::Ok,
+            candidate,
+            kind,
+            n_total: total,
+            correct,
+            accuracy: correct as f64 / total as f64,
+            macro_f1,
+        })
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
     ///
     /// # Errors
     /// `serde_json` 側の直列化エラーをそのまま返す。
@@ -357,6 +420,41 @@ mod tests {
                 .expect("json")
                 .contains('\n')
         );
+    }
+
+    /// REQ-33・REQ-24: 評価完了の JSON が完全一致する（キーは宣言順。`macro_f1` は数値）。
+    #[test]
+    fn req33_evaluate_completed_report_json_is_exact() {
+        let report = EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5))
+            .expect("report");
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5}"#
+        );
+    }
+
+    /// REQ-24: `macro_f1` が未定義なら `null`（0 や 1 で埋めない）。
+    #[test]
+    fn req24_evaluate_completed_report_macro_f1_null() {
+        let report =
+            EvaluateCompletedReport::completed(0, "c1".to_string(), 0, 2, None).expect("report");
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            r#"{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":2,"correct":0,"accuracy":0.0,"macro_f1":null}"#
+        );
+    }
+
+    /// REQ-33: 壊れた値（件数 0・正解数が件数超過・範囲外や非有限の macro_f1）は作れない。
+    #[test]
+    fn req33_evaluate_completed_report_rejects_broken_values() {
+        let make = |c, t, f| EvaluateCompletedReport::completed(0, "c1".to_string(), c, t, f);
+        assert_eq!(make(0, 0, None), None);
+        assert_eq!(make(5, 4, None), None);
+        assert_eq!(make(1, 2, Some(f64::NAN)), None);
+        assert_eq!(make(1, 2, Some(f64::INFINITY)), None);
+        assert_eq!(make(1, 2, Some(1.5)), None);
+        assert_eq!(make(1, 2, Some(-0.1)), None);
+        assert!(make(2, 2, Some(1.0)).is_some());
     }
 
     /// REQ-33: 工程状態は snake_case。
