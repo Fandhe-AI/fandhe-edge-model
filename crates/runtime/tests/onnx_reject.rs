@@ -3,6 +3,7 @@
 //! 証拠種別: テストハーネス。コミット済みの正常な C1・C3（`fixtures/onnx_parity/`）を
 //! `common/proto_builder.rs`（復号器とは独立に書いた protobuf 編集器）で 1 か所だけ改変し、
 //! 推論ランタイムが fail-closed で拒否する（読み込みに成功しない）ことを、エラーコードの具体値で確認する。
+//! 破損パッケージ（切り詰め・バイト反転）の拒否は TASK-39.6-2・#175・PoC-20 ケース 7。
 //! 許可リスト方式（テンプレートの完全一致）のため、未知の演算子・順序の違い・属性値の違い・
 //! 外部ファイル参照・部分グラフ属性はすべて拒否される。
 
@@ -306,4 +307,52 @@ fn req39_backend_rejects_invalid_token_sequences() {
         let at_limit = TokenIds::new(vec![1; MAX_MAX_BYTES]);
         assert!(backend.scores(&at_limit).is_ok(), "{name} at limit");
     }
+}
+
+/// TASK-39.6-2・#175・PoC-20 ケース 7: PoC の破損レシピ（A: 先頭 `len/3` に切り詰め、B: 100..200 を反転）は
+/// ガードを経由しない呼び出し元に対しても `malformed_protobuf` で拒否される（多層防御）。
+#[test]
+fn req39_poc20_corruption_recipes_rejected() {
+    for (name, kind) in [("c1.onnx", ModelKind::C1), ("c3.onnx", ModelKind::C3)] {
+        let good = model_bytes(name);
+        let truncated: Vec<u8> = good.iter().copied().take(good.len() / 3).collect();
+        let mut flipped = good.clone();
+        for b in flipped.iter_mut().skip(100).take(100) {
+            *b ^= 0xFF;
+        }
+        assert_ne!(flipped, good);
+        assert_eq!(code(&truncated, kind), "malformed_protobuf", "{name} A");
+        assert_eq!(code(&flipped, kind), "malformed_protobuf", "{name} B");
+    }
+}
+
+/// REQ-39 完全性: 重み領域（C1 の `bias` の raw_data）の 1 バイト反転は protobuf として解析は通る領域の破損で、
+/// 検出は sha256 照合が担う（`load_path` が `integrity_mismatch`）。CLI の `infer` 経路への sha256 接続は #168。
+#[test]
+fn req39_weight_byte_flip_detected_by_sha256() {
+    let good = model_bytes("c1.onnx");
+    let flipped = edit_initializer(&good, "bias", |t| {
+        for (n, v) in t.iter_mut() {
+            if *n == 9
+                && let Val::Len(raw) = v
+                && let Some(b) = raw.first_mut()
+            {
+                *b ^= 0xFF;
+            }
+        }
+    });
+    assert_eq!(flipped.len(), good.len());
+    let diff = flipped
+        .iter()
+        .zip(good.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(diff, 1);
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("weight-flip-{}.onnx", std::process::id()));
+    fs::write(&path, &flipped).expect("write");
+    let err = OnnxBackend::load_path(&path, ModelKind::C1, &Sha256Digest::of_bytes(&good))
+        .expect_err("must reject");
+    let _ = fs::remove_file(&path);
+    assert_eq!(err.code(), "integrity_mismatch");
 }
