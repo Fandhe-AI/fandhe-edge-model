@@ -15,7 +15,7 @@
 //! プロファイル文字列を検査して素通しする偽物、`log` は合成 fixture を出す偽物）。学習データは
 //! 合成データ・CPU のみ。macOS 実機の sandbox 下での完走確認と拒否ログの記録は人の担当で、
 //! 本テストはその証拠にならない（手順は `docs/design/sandbox-offline-check-procedure.md`）。
-//! 陽性対照は TASK-38.2（#164）の担当で、ここでは `positive_control:"not_run"` を固定するのみ。
+//! 陽性対照（TASK-38.2・#164）は偽の curl と偽の `log` の拒否行で通し、`detected` を確かめる。
 //! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価本体の配線は未実装。評価の完走は未達）。
 //!
 //! # 既定のテスト集合から分離する理由（`.claude/rules/ci.md`）
@@ -136,9 +136,20 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         &format!(
             "#!/bin/sh\n[ $# -eq 5 ] && [ \"$1\" = stream ] && [ \"$2\" = --style ] && [ \"$3\" = ndjson ] \
              && [ \"$4\" = --predicate ] && [ \"$5\" = '{PREDICATE}' ] || exit 99\n\
-             cat \"{}\"\nexec sleep 1200\n",
+             cat \"{}\"\n\
+             n=0\n\
+             while [ ! -s \"$FAKE_PC_PID_FILE\" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n\
+             [ -s \"$FAKE_PC_PID_FILE\" ] && printf '{{\"eventMessage\":\"Sandbox: curl(%s) deny(1) network-outbound /private/var/run/mDNSResponder\",\"timestamp\":\"%s\"}}\\n' \"$(cat \"$FAKE_PC_PID_FILE\")\" \"$(date '+%Y-%m-%d %H:%M:%S.000000%z')\"\n\
+             exec sleep 1200\n",
             clean.display()
         ),
+    );
+    // 偽 curl: 実際の通信は行わない（陽性対照に実 curl を使うと unsandboxed の偽 launcher の下で
+    // 実通信になるため）。PID を記録して PoC-16 実測と同じ終了コード 6 で終わる
+    let curl = dir.join("fake-curl");
+    write_exe(
+        &curl,
+        "#!/bin/sh\necho $$ > \"$FAKE_PC_PID_FILE\"\nexit 6\n",
     );
 
     let mut cmd = Command::new("sh");
@@ -151,6 +162,8 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         .args(["--infer-text", INFER_MARKER])
         .env("FANDHE_EDGE_SANDBOX_EXEC", &launcher)
         .env("FANDHE_EDGE_LOG_CMD", &log)
+        .env("FANDHE_EDGE_CURL_CMD", &curl)
+        .env("FAKE_PC_PID_FILE", dir.join("pc.pid"))
         .env("FANDHE_EDGE_BIN", env!("CARGO_BIN_EXE_fandhe-edge"))
         .env("FANDHE_EDGE_TRAINER_DIR", root.join("trainer"))
         .env("FANDHE_EDGE_LOG_STREAM_WARMUP_SECS", "0")
@@ -166,8 +179,10 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         "\"tool_network_deny_events\": 0".to_string(),
         "\"unattributed_network_deny_events\": 0".to_string(),
         "\"network_deny_events\": 0".to_string(),
-        format!("\"deny_events\": {expected_deny}"),
-        "\"positive_control\": \"not_run\"".to_string(),
+        // 陽性対照の拒否行（1 行）を含む
+        format!("\"deny_events\": {}", expected_deny + 1),
+        "\"positive_control\": \"detected\"".to_string(),
+        "\"positive_control_network_deny_events\": 1".to_string(),
         "\"evidence_hint\": \"test_harness\"".to_string(),
         "\"log_stream_override\": true".to_string(),
     ] {
