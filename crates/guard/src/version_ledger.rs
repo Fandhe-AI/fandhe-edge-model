@@ -20,6 +20,7 @@
 //! 時刻は共通コア・データ契約の型を流用せず本モジュールの [`CreatedAt`] で持つ
 //! （ガード層は共通コアのみに依存する方針のため。REQ-32）。
 
+use crate::file_size::effective_read_limit;
 use crate::path::{PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
@@ -261,8 +262,9 @@ impl VersionLedger {
     ) -> Result<&VersionEntry, LedgerError> {
         self.check_room(kind, &id)?;
         let (file, confined) = open_confined(root, candidate).map_err(LedgerError::Path)?;
-        let digest = sha256_open_file_bounded(file, confined.as_path(), max_bytes)
-            .map_err(LedgerError::Io)?;
+        let digest =
+            sha256_open_file_bounded(file, confined.as_path(), effective_read_limit(max_bytes))
+                .map_err(LedgerError::Io)?;
         self.record(kind, id, digest, created_at)
     }
 

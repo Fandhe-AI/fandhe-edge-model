@@ -16,13 +16,14 @@
 //!   最終的な解析の成否は読み込み時の ONNX Runtime に委ねる。
 //!   一方、テンソルの外部データ参照（`external_data`・`data_location`）は graph・サブグラフ・functions・
 //!   training_info 内の TensorProto をすべて降りて検出し、1 件でもあれば拒否する（参照先は追わない）
-//! - 経路の閉じ込め（TASK-39.4）は本モジュールの責務外。サイズ上限の値の決定（TASK-39.5）も
-//!   呼び出し側（CLI の統合は TASK-39.2-4・#156）が行い、本モジュールは渡された上限を強制する
+//! - 経路の閉じ込め（TASK-39.4）は本モジュールの責務外。サイズ上限は呼び出し側（CLI の統合は TASK-39.2-4・#156）が渡し、
+//!   ガード層の天井 `MAX_READ_FILE_BYTES`（1 GiB。TASK-39.5-3・#172）で丸めて強制する
 //! - 拡張子と内容の照合による偽装拒否は `model_file` モジュール（TASK-39.2-2・#154）で上に重ねた
 //!
 //! pickle プロトコル 0/1（テキスト opcode 始まり）は誤検出が多いため固定シグネチャでは
 //! 判定せず、ONNX の構造検査にも通らないので `Unknown` として拒否される。
 
+use crate::file_size::effective_read_limit;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, read_bounded, read_bounded_open_file};
 use std::collections::BTreeSet;
@@ -678,6 +679,7 @@ pub fn open_checked_file(
     allowlist: &FormatAllowlist,
     max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
+    let max_bytes = effective_read_limit(max_bytes);
     let bytes = read_bounded(path, max_bytes).map_err(FormatRejection::Io)?;
     check_bytes(bytes, allowlist)
 }
@@ -693,6 +695,7 @@ pub fn check_open_file(
     allowlist: &FormatAllowlist,
     max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
+    let max_bytes = effective_read_limit(max_bytes);
     let bytes = read_bounded_open_file(file, path, max_bytes).map_err(FormatRejection::Io)?;
     check_bytes(bytes, allowlist)
 }

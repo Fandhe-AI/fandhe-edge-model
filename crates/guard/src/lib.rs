@@ -16,9 +16,11 @@
 //! - [`kind`]: `kind` 値の許可リスト判定（TASK-39.2-3・#155）。実装済み。`infer` の `artifact.json` への CLI 統合は #156 で済み（`register`・`train` は #136／TASK-33.x）
 //! - [`version_ledger`]: 版管理台帳（版 ID・sha256・作成時刻の記録と取得。TASK-39.3-1・#167）。実装済み（メモリ上のみ）。
 //!   ロールバックと復元後のハッシュ一致検証は TASK-39.3-2（#168）、永続化は未着手
-//! - 未着手（後続 TASK）: `register`・`train` への CLI 統合（#136）・資源の上限（TASK-39.5）・
+//! - [`file_size`]: ファイルサイズ上限（暫定 1 GiB）の読み込み前検証（fstat。TASK-39.5-3・#172）。実装済み
+//! - 未着手（後続 TASK）: `register`・`train` への CLI 統合（#136）・資源の上限のうち時間（#170）・RSS（#171）・
 //!   完全性と版（`kind_version` の許可リストを含む。TASK-39.6）
 
+pub mod file_size;
 pub mod format;
 pub mod kind;
 pub mod model_file;
