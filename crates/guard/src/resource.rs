@@ -465,26 +465,31 @@ pub(crate) enum MonitorEnd<S> {
 
 /// kill を送り、有界の間だけ回収を待つ。
 fn kill_and_reap<C: ChildControl, K: Clock>(child: &mut C, clock: &K) -> Result<(), GuardRunError> {
-    if child.kill().is_err() {
-        // 直前に子が終了した競合では kill が失敗する。回収済みなら時間超過として扱う
-        // （`limit_exceeded`=20 と `runtime_error`=70 を取り違えない。REQ-39・REQ-21）。
-        return loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                _ => break Err(GuardRunError::KillFailed),
-            }
-        };
-    }
     let give_up = clock
         .now()
         .checked_add(KILL_WAIT_TIMEOUT)
         .ok_or(GuardRunError::InvalidConfig)?;
+    if child.kill().is_err() {
+        // 直前に子が終了した競合では kill が失敗する。回収済みなら時間超過として扱う
+        // （`limit_exceeded`=20 と `runtime_error`=70 を取り違えない。REQ-39・REQ-21）。
+        // EINTR の再試行にも期限を設け、回収できなければ `KillFailed` を返す（無限ループを作らない）。
+        return loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    if clock.now() >= give_up {
+                        break Err(GuardRunError::KillFailed);
+                    }
+                }
+                _ => break Err(GuardRunError::KillFailed),
+            }
+        };
+    }
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Err(GuardRunError::ReapTimeout),
         }
         if clock.now() >= give_up {
@@ -625,17 +630,19 @@ mod reader {
             progressed
         }
 
-        /// 有界の間だけ EOF を待ち、それまでの分を返す。EOF が来なければ切り詰め扱い。
-        pub fn finish(mut self, wait: Duration) -> (Vec<u8>, bool) {
-            let give_up = Instant::now().checked_add(wait);
+        /// `deadline` まで EOF を待ち、(出力, 切り詰め, EOF 到達) を返す。
+        pub fn finish(mut self, deadline: Instant) -> (Vec<u8>, bool, bool) {
             loop {
                 self.pump();
-                if self.eof || give_up.is_none_or(|g| Instant::now() >= g) {
+                let now = Instant::now();
+                if self.eof || now >= deadline {
                     break;
                 }
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(
+                    Duration::from_millis(5).min(deadline.saturating_duration_since(now)),
+                );
             }
-            (self.buf, self.truncated || !self.eof)
+            (self.buf, self.truncated || !self.eof, self.eof)
         }
     }
     /// REQ-39: 書き手が出力し続けても 1 回の `pump` は上限量で返る（監視ループへ制御を戻す）。
@@ -663,12 +670,8 @@ mod reader {
         assert!(reader.pump());
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
-        // 上限量に達した時点で返る（最後の 1 読み分の超過のみ許容）。
-        assert!(
-            reader.buf.len() >= PUMP_BUDGET_BYTES,
-            "read {}",
-            reader.buf.len()
-        );
+        // 上限量に達した時点で返る（最後の 1 読み分の超過のみ許容）。下限は環境（ソケット
+        // バッファ長）に依存するため検証しない。
         assert!(
             reader.buf.len() < PUMP_BUDGET_BYTES + 8192,
             "read {}",
@@ -684,7 +687,7 @@ mod reader {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::Instant;
 
     pub trait Source: Read + Send + 'static {}
     impl<T: Read + Send + 'static> Source for T {}
@@ -728,20 +731,22 @@ mod reader {
             false
         }
 
-        pub fn finish(self, wait: Duration) -> (Vec<u8>, bool) {
+        pub fn finish(self, deadline: Instant) -> (Vec<u8>, bool, bool) {
+            let wait = deadline.saturating_duration_since(Instant::now());
             let finished = self.done.recv_timeout(wait).is_ok();
             let guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
-            (guard.0.clone(), guard.1 || !finished)
+            (guard.0.clone(), guard.1 || !finished, finished)
         }
     }
 }
 
 use reader::Reader;
 
-/// reader を作れなかった場合に、起動済みの子を止めて回収してからエラーを返す。
+/// reader を作れなかった場合に、起動済みの子を止めて回収を試みてからエラーを返す。
+///
+/// 回収待ちは `KILL_WAIT_TIMEOUT` までに制限する（kill が効かない子でブロックしない。REQ-39）。
 fn abort_child(child: &mut std::process::Child) -> Result<GuardedRunOutcome, GuardRunError> {
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = kill_and_reap(child, &SystemClock);
     Err(GuardRunError::Spawn)
 }
 
@@ -798,10 +803,27 @@ pub fn run_with_limits(
     };
     match monitor(&mut child, &SystemClock, start, limit, &mut pump)? {
         MonitorEnd::Exited { status, elapsed } => {
-            let (stdout, stdout_truncated) =
-                stdout.map_or((Vec::new(), false), |r| r.finish(READER_WAIT_TIMEOUT));
-            let (stderr, stderr_truncated) =
-                stderr.map_or((Vec::new(), false), |r| r.finish(READER_WAIT_TIMEOUT));
+            // 終了後の出力待機も実行時間の上限に含める。両 reader で 1 つの期限を共有し、
+            // 上限直前に終了した子の出力待ちで上限を超えたら時間超過として扱う（REQ-39）。
+            let deadline = start
+                .checked_add(limit)
+                .ok_or(GuardRunError::InvalidConfig)?;
+            let reader_deadline = Instant::now()
+                .checked_add(READER_WAIT_TIMEOUT)
+                .map_or(deadline, |d| d.min(deadline));
+            let (stdout, stdout_truncated, stdout_done) =
+                stdout.map_or_else(|| (Vec::new(), false, true), |r| r.finish(reader_deadline));
+            let (stderr, stderr_truncated, stderr_done) =
+                stderr.map_or_else(|| (Vec::new(), false, true), |r| r.finish(reader_deadline));
+            let now = Instant::now();
+            if now > deadline || (!(stdout_done && stderr_done) && now >= deadline) {
+                return Ok(GuardedRunOutcome::LimitExceeded(ResourceLimitExceeded {
+                    kind: ResourceKind::Time,
+                    limit,
+                    elapsed: now.saturating_duration_since(start),
+                    child_reaped: true,
+                }));
+            }
             Ok(GuardedRunOutcome::Exited {
                 status,
                 output: ChildOutput {
@@ -986,6 +1008,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, GuardRunError::KillFailed);
         assert_eq!(err.exit_code(), ExitCode::RuntimeError);
+    }
+
+    /// REQ-39: kill 失敗後の try_wait が Interrupted を返し続けても、期限で打ち切って KillFailed。
+    #[test]
+    fn req39_kill_failure_with_endless_eintr_is_bounded() {
+        let clock = FakeClock::new();
+        let script = (0..10_000)
+            .map(|_| Err(io::Error::from(io::ErrorKind::Interrupted)))
+            .collect();
+        let mut child = fake(&clock, script, 100);
+        child.kill_ok = false;
+        let err = kill_and_reap(&mut child, &clock).unwrap_err();
+        assert_eq!(err, GuardRunError::KillFailed);
     }
 
     /// REQ-39・REQ-21: kill が競合で失敗しても、直後に回収済みなら時間超過（70 にしない）。
