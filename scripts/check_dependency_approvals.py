@@ -75,9 +75,10 @@ EXIT_INVALID_INPUT = 64
 EXIT_RUNTIME_ERROR = 70
 
 CARGO_PIN_RE = re.compile(r"^=([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$")
+_EXTRA = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 PY_REQ_RE = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
-    r"(?:\[([A-Za-z0-9,._ -]+)\])?"
+    r"(?:\[\s*(" + _EXTRA + r"(?:\s*,\s*" + _EXTRA + r")*)\s*\])?"
     r"==([0-9]+\.[0-9]+\.[0-9]+)"
     # PEP 508 の環境マーカー（`; sys_platform == 'linux'` 等）。名前・版・extras の照合には
     # 影響させないが、構文として受理する（マーカーだけで承認照合を迂回させない）。
@@ -239,6 +240,13 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
     return out
 
 
+def _toml_table(value: Any, what: str) -> dict[str, Any]:
+    """テーブルであることを検証する。型が違う値を空扱いで読み飛ばさない（fail-closed）。"""
+    if not isinstance(value, dict):
+        raise InputError(f"{what} must be a table")
+    return value
+
+
 def _cargo_workspace_dep(
     name: str, spec: Any, v: list[Violation], member_paths: dict[str, str]
 ) -> str | None:
@@ -269,21 +277,41 @@ def _cargo_workspace_dep(
         v.append(Violation("forbidden_source", "cargo", name, "", rel))
         return None
     version = spec.get("version")
-    m = CARGO_PIN_RE.match(version) if isinstance(version, str) else None
+    m = CARGO_PIN_RE.fullmatch(version) if isinstance(version, str) else None
     if m is None:
         v.append(Violation("pin_violation", "cargo", name, str(version or ""), rel))
         return None
     return m.group(1)
 
 
+def _lock_version(pkg: dict[str, Any], rel: str) -> str:
+    """lock のパッケージの version を返す。存在しない・文字列でない場合は入力不正（64）。"""
+    version = pkg.get("version")
+    if not isinstance(version, str) or not version:
+        raise InputError(f"{rel} package has no valid version")
+    return version
+
+
 def _cargo_feature_config(spec: Any) -> tuple[list[str], bool]:
-    """registry 依存の (ソート済み features, default-features) を返す（既定は [] と True）。"""
-    if not isinstance(spec, dict):
+    """registry 依存の (ソート済み features, default-features) を返す（REQ-38・#165）。
+
+    省略時の既定は features=[]・default-features=true（Cargo の仕様）。キーがあるのに型が
+    不正な場合（features がリストでない・文字列以外の要素・default-features が真偽値でない・
+    `default-features` と `default_features` の併記）は黙って読み替えず InputError にする。
+    """
+    if isinstance(spec, str):
         return [], True
+    if not isinstance(spec, dict):
+        raise InputError("workspace dependency spec has an unexpected type")
     feats = spec.get("features", [])
-    names = sorted({f for f in feats if isinstance(f, str)}) if isinstance(feats, list) else []
+    if not isinstance(feats, list) or not all(isinstance(f, str) for f in feats):
+        raise InputError("workspace dependency features must be a list of strings")
+    if "default-features" in spec and "default_features" in spec:
+        raise InputError("workspace dependency has both default-features spellings")
     default = spec.get("default-features", spec.get("default_features", True))
-    return names, default is not False
+    if not isinstance(default, bool):
+        raise InputError("workspace dependency default-features must be a boolean")
+    return sorted(set(feats)), default
 
 
 def _member_deps(
@@ -302,15 +330,14 @@ def _member_deps(
     """
     tables: list[tuple[str, dict[str, Any]]] = []
     for t in CARGO_DEP_TABLES:
-        if isinstance(manifest.get(t), dict):
-            tables.append((t, manifest[t]))
-    targets = manifest.get("target")
-    if isinstance(targets, dict):
-        for cfg in targets.values():
-            if isinstance(cfg, dict):
-                for t in CARGO_DEP_TABLES:
-                    if isinstance(cfg.get(t), dict):
-                        tables.append((t, cfg[t]))
+        if t in manifest:
+            tables.append((t, _toml_table(manifest[t], f"{rel} {t}")))
+    if "target" in manifest:
+        for tname, cfg in _toml_table(manifest["target"], f"{rel} target").items():
+            cfg = _toml_table(cfg, f"{rel} target.{tname}")
+            for t in CARGO_DEP_TABLES:
+                if t in cfg:
+                    tables.append((t, _toml_table(cfg[t], f"{rel} target.{tname}.{t}")))
     forbidden = (
         "version",
         "git",
@@ -343,7 +370,7 @@ def check_cargo(
     for forbidden in ("patch", "replace"):
         if forbidden in top:
             v.append(Violation("forbidden_source", "cargo", forbidden, "", "Cargo.toml"))
-    members = ws.get("members", [])
+    members = ws.get("members")
     if not isinstance(members, list):
         raise InputError("workspace members must be a list")
     usages: list[tuple[str, str, str, bool]] = []
@@ -373,10 +400,11 @@ def check_cargo(
             continue
         manifest_direct.add((name, ver))
         ext_versions[name] = ver
+        config = _cargo_feature_config(spec)  # 未承認でも型不正は先に 64 で止める
         entry = ledger["direct"].get((name, ver))
         if entry is None:
             v.append(Violation("unapproved_dependency", "cargo", name, ver, "Cargo.toml"))
-        elif _cargo_feature_config(spec) != (
+        elif config != (
             sorted(set(entry["features"])),
             entry["default_features"],
         ):
@@ -395,14 +423,14 @@ def check_cargo(
             v.append(Violation("stale_record", "cargo", key[0], key[1], LEDGER_NAME))
 
     lock = load_toml(root, "Cargo.lock")
-    packages = lock.get("package", [])
+    packages = lock.get("package")
     if not isinstance(packages, list):
         raise InputError("Cargo.lock package list is invalid")
     locked_seen: set[tuple[str, str]] = set()
     for p in packages:
         if not isinstance(p, dict) or not isinstance(p.get("name"), str):
             raise InputError("Cargo.lock has an invalid package entry")
-        name, version, source = p["name"], str(p.get("version", "")), p.get("source")
+        name, version, source = p["name"], _lock_version(p, "Cargo.lock"), p.get("source")
         if source is None:
             if name not in member_names:
                 v.append(Violation("forbidden_source", "cargo", name, version, "Cargo.lock"))
@@ -446,24 +474,20 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[tuple[Any, str]]:
     `[dependency-groups]`（`include-group` は参照先の実在だけ確認）・`[tool.uv].dev-dependencies`。
     各要求は (要求, 区分) で返す。区分は本番（dependencies・optional）か dev（groups・
     tool.uv.dev-dependencies）で、台帳の layers との照合に使う。
-    未知の `[tool.uv]` キー・`dynamic` の依存・解釈できない形式は InputError（fail-closed）。
+    型が不正なセクション・未知の `[tool.uv]` キー・`dynamic` の依存は InputError（fail-closed）。
     """
     reqs: list[tuple[Any, str]] = []
-    project = pyproject.get("project", {})
-    if not isinstance(project, dict):
-        raise InputError("pyproject [project] must be a table")
-    dynamic = project.get("dynamic", []) or []
-    if not isinstance(dynamic, list) or PROJECT_DEP_KEYS & set(dynamic):
+    project = _toml_table(pyproject.get("project", {}), "pyproject [project]")
+    dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list) or not all(isinstance(d, str) for d in dynamic):
+        raise InputError("pyproject dynamic must be a list of strings")
+    if PROJECT_DEP_KEYS & set(dynamic):
         raise InputError("pyproject dynamic dependencies cannot be verified")
     reqs.extend((r, "prod") for r in _str_list(project.get("dependencies"), "project.dependencies"))
-    opt = project.get("optional-dependencies", {}) or {}
-    if not isinstance(opt, dict):
-        raise InputError("pyproject optional-dependencies must be a table")
+    opt = _toml_table(project.get("optional-dependencies", {}), "pyproject optional-dependencies")
     for name, items in opt.items():
         reqs.extend((r, "prod") for r in _str_list(items, f"optional-dependencies.{name}"))
-    groups = pyproject.get("dependency-groups", {}) or {}
-    if not isinstance(groups, dict):
-        raise InputError("pyproject dependency-groups must be a table")
+    groups = _toml_table(pyproject.get("dependency-groups", {}), "pyproject dependency-groups")
     group_names = {norm_py(g) for g in groups}
     for gname, items in groups.items():
         for item in _str_list(items, f"dependency-groups.{gname}"):
@@ -475,11 +499,9 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[tuple[Any, str]]:
                     raise InputError("pyproject include-group references an unknown group")
             else:
                 reqs.append((item, "dev"))
-    tool = pyproject.get("tool", {}) or {}
-    uv = tool.get("uv") if isinstance(tool, dict) else None
-    if uv is not None:
-        if not isinstance(uv, dict):
-            raise InputError("pyproject [tool.uv] must be a table")
+    tool = _toml_table(pyproject.get("tool", {}), "pyproject [tool]")
+    if "uv" in tool:
+        uv = _toml_table(tool["uv"], "pyproject [tool.uv]")
         for key in uv:
             if key != "dev-dependencies" and key not in UV_SAFE_KEYS:
                 raise InputError("pyproject [tool.uv] has an unverifiable key")
@@ -490,13 +512,18 @@ def _py_requirements(pyproject: dict[str, Any]) -> list[tuple[Any, str]]:
 
 
 def _py_build_requirements(pyproject: dict[str, Any]) -> list[Any]:
-    """`[build-system].requires`（ビルド時依存）を返す。uv.lock には現れない。"""
-    bs = pyproject.get("build-system", {})
-    if isinstance(bs, dict):
-        req = bs.get("requires", []) or []
-        if isinstance(req, list):
-            return list(req)
-    return []
+    """`[build-system].requires`（ビルド時依存）を返す。uv.lock には現れない。
+
+    `[build-system]` の省略は許す（PEP 518 の既定）。あるのに表でない・`requires` が無い・
+    リストでない場合は入力不正（64）。黙って空扱いにしない（REQ-38・#165）。
+    """
+    if "build-system" not in pyproject:
+        return []
+    bs = _toml_table(pyproject["build-system"], "pyproject [build-system]")
+    req = bs.get("requires")
+    if not isinstance(req, list):
+        raise InputError("pyproject [build-system].requires must be a list")
+    return list(req)
 
 
 def check_pypi(
@@ -519,7 +546,7 @@ def check_pypi(
         (r, "build") for r in _py_build_requirements(pyproject)
     ]
     for req, cat in declared:
-        m = PY_REQ_RE.match(req) if isinstance(req, str) else None
+        m = PY_REQ_RE.fullmatch(req) if isinstance(req, str) else None
         if m is None:
             v.append(Violation("pin_violation", "pypi", str(req)[:80], "", rel_py))
             continue
@@ -540,14 +567,14 @@ def check_pypi(
             v.append(Violation("stale_record", "pypi", key[0], key[1], LEDGER_NAME))
 
     lock = load_toml(root, rel_lock)
-    packages = lock.get("package", [])
+    packages = lock.get("package")
     if not isinstance(packages, list):
         raise InputError("uv.lock package list is invalid")
     locked_seen: set[tuple[str, str]] = set()
     for p in packages:
         if not isinstance(p, dict) or not isinstance(p.get("name"), str):
             raise InputError("uv.lock has an invalid package entry")
-        name, version = norm_py(p["name"]), str(p.get("version", ""))
+        name, version = norm_py(p["name"]), _lock_version(p, "uv.lock")
         source = p.get("source")
         if not isinstance(source, dict):
             raise InputError("uv.lock package has no source")

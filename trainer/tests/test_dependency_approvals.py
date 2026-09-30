@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import sys
 from collections.abc import Callable
@@ -630,3 +631,131 @@ def test_req38_python_build_requires_needs_build_layer(repo: Path, capsys: Captu
         ),
     )
     assert run(repo, capsys)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        '{ version = "=1.0.151", features = "preserve_order" }',
+        '{ version = "=1.0.151", features = ["a", 1] }',
+        '{ version = "=1.0.151", features = 1 }',
+        '{ version = "=1.0.151", default-features = "false" }',
+        '{ version = "=1.0.151", default-features = 0 }',
+        '{ version = "=1.0.151", default-features = false, default_features = false }',
+    ],
+)
+def test_req38_cargo_malformed_feature_config_is_invalid_input(
+    repo: Path, capsys: Capture, spec: str
+) -> None:
+    """features・default-features の型不正は黙って読み替えず exit 64（REQ-38）。"""
+    edit(repo, "Cargo.toml", 'serde_json = "=1.0.151"', f"serde_json = {spec}")
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\n[build-system]\nrequires = 1\n",
+        '\n[build-system]\nrequires = ""\n',
+        '\n[build-system]\nbuild-backend = "x"\n',
+    ],
+)
+def test_req38_python_malformed_build_system_is_invalid_input(
+    repo: Path, capsys: Capture, text: str
+) -> None:
+    """`[build-system]` の `requires` が無い / リストでないと exit 64（REQ-38）。"""
+    append(repo, "trainer/pyproject.toml", text)
+    assert run(repo, capsys)[0] == 64
+
+
+def prepend(root: Path, rel: str, text: str) -> None:
+    """ファイル先頭（トップレベル）へ追記する。"""
+    p = root / rel
+    p.write_text(text + p.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_req38_python_build_system_not_a_table_is_invalid_input(
+    repo: Path, capsys: Capture
+) -> None:
+    """`build-system` が表でないと exit 64（REQ-38）。"""
+    prepend(repo, "trainer/pyproject.toml", "build-system = 1\n")
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('dependencies = ["mlx', 'dynamic = "dependencies"\ndependencies = ["mlx'),
+        ('dependencies = ["mlx', 'dynamic = [1]\ndependencies = ["mlx'),
+        ('dependencies = ["mlx', 'optional-dependencies = ""\ndependencies = ["mlx'),
+        ("[tool.uv]", "[tool]\nuv = 1\n[tool.x]"),
+    ],
+)
+def test_req38_python_wrongly_typed_sections_are_invalid_input(
+    repo: Path, capsys: Capture, old: str, new: str
+) -> None:
+    """pyproject の各セクションの型不正は空扱いにせず exit 64（REQ-38）。"""
+    p = repo / "trainer/pyproject.toml"
+    text = p.read_text(encoding="utf-8")
+    assert old in text
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize("target", ["crates/core/Cargo.toml", "Cargo.toml"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "dev-dependencies = 1\n",
+        "build-dependencies = []\n",
+        "target = 1\n",
+        "target = { x = 1 }\n",
+        "target = { x = { dependencies = 1 } }\n",
+    ],
+)
+def test_req38_cargo_wrongly_typed_dependency_tables_are_invalid_input(
+    repo: Path, capsys: Capture, target: str, text: str
+) -> None:
+    """依存表・target の型不正は読み飛ばさず exit 64（REQ-38）。"""
+    prepend(repo, target, text)
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize("lock", ["Cargo.lock", "trainer/uv.lock"])
+def test_req38_lock_without_package_list_or_version_is_invalid_input(
+    repo: Path, capsys: Capture, lock: str
+) -> None:
+    """lock に package 一覧が無い・version が無い / 文字列でないと exit 64（REQ-38）。"""
+    p = repo / lock
+    original = p.read_text(encoding="utf-8")
+    p.write_text("version = 1\n", encoding="utf-8")
+    assert run(repo, capsys)[0] == 64
+    head, sep, rest = original.partition("[[package]]\n")
+    no_version = re.sub(r"(?m)^version = .*\n", "", rest, count=1)
+    int_version = re.sub(r"(?m)^version = .*\n", "version = 1\n", rest, count=1)
+    for body in (no_version, int_version):
+        p.write_text(head + sep + body, encoding="utf-8")
+        assert run(repo, capsys)[0] == 64
+
+
+def test_req38_python_dependency_groups_not_a_table_is_invalid_input(
+    repo: Path, capsys: Capture
+) -> None:
+    """トップレベルの `dependency-groups` が表でないと exit 64（REQ-38）。"""
+    prepend(repo, "trainer/pyproject.toml", "dependency-groups = 0\n")
+    assert run(repo, capsys)[0] == 64
+
+
+@pytest.mark.parametrize("req", ['"numpy[]==2.5.3"', '"numpy[a,]==2.5.3"', '"numpy[,a]==2.5.3"'])
+def test_req38_python_malformed_extras_is_rejected(repo: Path, capsys: Capture, req: str) -> None:
+    """空の extras 要素は黙って捨てず、解釈できない要求として exit 10（REQ-38）。"""
+    edit(repo, "trainer/pyproject.toml", '"numpy==2.5.3"', req)
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert any(k == "pin_violation" for k, _ in kinds(payload))
+
+
+def test_req38_trailing_newline_pin_is_rejected() -> None:
+    """末尾の改行付きの要求・固定版は完全一致でないため受理しない（REQ-38）。"""
+    assert mod.PY_REQ_RE.fullmatch("numpy==2.5.3\n") is None
+    assert mod.CARGO_PIN_RE.fullmatch("=1.0.0\n") is None
