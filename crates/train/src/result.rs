@@ -314,6 +314,12 @@ impl WorkerFailure {
         Ok(Self { code, message })
     }
 
+    /// テスト用: 許可リストの `code` から作る（`restart` のテストが使う）。
+    #[cfg(test)]
+    pub(crate) fn for_test(code: &str) -> Self {
+        Self::parse(code.to_owned(), String::new()).expect("valid test failure")
+    }
+
     pub fn code(&self) -> &str {
         self.code.as_str()
     }
