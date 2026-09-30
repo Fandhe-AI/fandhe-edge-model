@@ -123,6 +123,23 @@ pre-commit:
           esac
         done
 
+    # 依存の承認台帳と manifest・lock の照合（REQ-38・TASK-38.3・#165）。依存ファイルまたは
+    # 台帳が staged のときだけ走らせる。承認記録のない依存変更はここで止まる
+    - name: dependency-approvals
+      glob:
+        - "Cargo.toml"
+        - "crates/*/Cargo.toml"
+        - "Cargo.lock"
+        - "trainer/pyproject.toml"
+        - "trainer/uv.lock"
+        - "dependency-approvals.json"
+      run: |
+        if [ -f trainer/pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+          uv run --locked --directory trainer python -I ../scripts/check_dependency_approvals.py --root ..
+        else
+          echo "skip: trainer/pyproject.toml 未追加または uv 未導入"
+        fi
+
 commit-msg:
   jobs:
     # Conventional Commits 形式の検証（.claude/rules/conventional-commits.md）。

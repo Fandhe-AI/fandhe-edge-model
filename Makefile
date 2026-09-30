@@ -415,8 +415,20 @@ else
 endif
 endif
 
+.PHONY: check-dependency-approvals
+# 依存の承認台帳（dependency-approvals.json）と manifest・lock を照合し、承認記録のない
+# 依存の追加・更新・削除を止める（REQ-38・TASK-38.3・#165。手順: docs/design/dependency-approval-flow.md）。
+# tomllib が要るため trainer の Python（uv 管理）で実行する。通信はしない（標準ライブラリのみ）。
+check-dependency-approvals: ## 依存の承認台帳と manifest・lock を照合する（未承認の依存変更で失敗。#165）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --locked --directory $(PY_DIR) python -I ../scripts/check_dependency_approvals.py --root ..
+else
+	@echo "skip: trainer/pyproject.toml 未追加のため check-dependency-approvals をスキップ"
+endif
+
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint test deny py-ci test-trainer-integration ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
+ci: lint-docs check-workspace-manifest check-dependency-approvals fmt-check lint test deny py-ci test-trainer-integration ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
 
 # --------------------------------------------------
 # 後片付け
