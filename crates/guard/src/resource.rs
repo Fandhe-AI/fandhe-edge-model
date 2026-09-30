@@ -799,8 +799,18 @@ impl Finished {
 /// reader を作れなかった場合に、起動済みの子を止めて回収を試みてからエラーを返す。
 ///
 /// 回収待ちは `KILL_WAIT_TIMEOUT` までに制限する（kill が効かない子でブロックしない。REQ-39）。
+/// 停止・回収に失敗した場合は元の起動失敗ではなく [`GuardRunError::KillFailed`]・
+/// [`GuardRunError::ReapTimeout`] を返し、子が残りうることを呼び出し側が判別できるようにする。
 fn abort_child(child: &mut std::process::Child) -> Result<GuardedRunOutcome, GuardRunError> {
-    let _ = kill_and_reap(child, &SystemClock);
+    abort_with(child, &SystemClock)
+}
+
+/// [`abort_child`] の本体。子の制御と時計を差し替えて単体テストできるよう分けている。
+fn abort_with<C: ChildControl, K: Clock>(
+    child: &mut C,
+    clock: &K,
+) -> Result<GuardedRunOutcome, GuardRunError> {
+    kill_and_reap(child, clock)?;
     Err(GuardRunError::Spawn)
 }
 
@@ -1079,6 +1089,35 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
+        assert_eq!(child.kill_calls.get(), 1);
+    }
+
+    /// REQ-39: reader 初期化失敗後の停止に失敗したら、Spawn ではなく KillFailed を返す。
+    #[test]
+    fn req39_abort_reports_kill_failed_not_spawn() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(None)], 10);
+        child.kill_ok = false;
+        let err = abort_with(&mut child, &clock).unwrap_err();
+        assert_eq!(err, GuardRunError::KillFailed);
+    }
+
+    /// REQ-39: reader 初期化失敗後に回収できなければ ReapTimeout を返す。
+    #[test]
+    fn req39_abort_reports_reap_timeout_not_spawn() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![], 10);
+        let err = abort_with(&mut child, &clock).unwrap_err();
+        assert_eq!(err, GuardRunError::ReapTimeout);
+    }
+
+    /// REQ-39: 回収できた場合のみ元の起動失敗（Spawn）を返す。
+    #[test]
+    fn req39_abort_returns_spawn_when_reaped() {
+        let clock = FakeClock::new();
+        let mut child = fake(&clock, vec![Ok(Some(0))], 10);
+        let err = abort_with(&mut child, &clock).unwrap_err();
+        assert_eq!(err, GuardRunError::Spawn);
         assert_eq!(child.kill_calls.get(), 1);
     }
 

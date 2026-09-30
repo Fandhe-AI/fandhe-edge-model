@@ -397,6 +397,10 @@ mod tests {
             )
         );
         assert_eq!(
+            GuardRunError::KillFailed.to_error_report(),
+            ErrorReport::new(ExitCode::RuntimeError, "guarded run failed: kill_failed")
+        );
+        assert_eq!(
             GuardRunError::ReapTimeout.to_error_report(),
             ErrorReport::new(ExitCode::RuntimeError, "guarded run failed: reap_timeout")
         );
