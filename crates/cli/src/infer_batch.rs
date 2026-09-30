@@ -74,9 +74,9 @@
 //!
 //! 長く動き続けるプロセス（将来の MCP サーバ。REQ-36・REQ-37）から推論する場合は、スレッドを
 //! 強制終了できないため、本関数を直接呼ばず CLI を子プロセスとして起動して隔離する前提とする
-//! （配線は #136）。
+//! （配線は #136 で `stages::infer` に実装済み）。
 //!
-//! 証拠種別: テストハーネス（バイナリでの完走は #136、実バックエンドは #112/#113）。
+//! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`、実バックエンドは #112/#113）。
 
 use crate::args::{Command, InferSource};
 use crate::error_report::{ToErrorReport, default_message, emit_error_report};

@@ -2,9 +2,9 @@
 //!
 //! `scripts/cli-infer-noninteractive.sh` を子プロセスで起動し、終了コードと
 //! stdout の JSON を具体値で照合する。証拠種別はテストハーネス（実機の
-//! Claude Code Bash ツールではない）。`infer` の実推論経路は TASK-33.1-2
-//! （#136）・#112・#113 が未接続のため、現時点の exit 0 経路は help のみ。
-//! 実推論の exit 0 ケースはそれらの完了後にここへ追加する。
+//! Claude Code Bash ツールではない）。`infer` の実推論（TASK-33.1-2・#136 で接続）の
+//! exit 0 経路は `req36_infer_real_package_exit_zero_via_sh`（共有 fixture の ONNX を置いた
+//! 合成パッケージ）で確認する。
 //! 末尾の `req36_run_record_*` は実行記録（opt-in の `FANDHE_EDGE_RECORD_DIR`。
 //! TASK-36.1-2・#150）の保存形式を具体値で照合する。
 //! Windows では `sh` を前提にできないため unix に限定する。
@@ -180,8 +180,8 @@ fn req36_no_args_still_reports_exit_code() {
 }
 
 /// スクリプトが非ゼロの終了コードを握りつぶさないこと。
-/// 経路ガード（#159）を通る有効なパッケージを置いた一時 workspace で実行し、スタブの 70 を確認する。
-/// #136 で工程が接続されたらこの期待を置き換える。
+/// 経路ガード（#159）を通る最小のパッケージ（メタデータの必須項目が不足）を置いた一時 workspace で
+/// 実行し、ガード通過後の検査が返す 64 が伝わることを確認する（TASK-33.1-2・#136）。
 #[test]
 fn req36_infer_nonzero_exit_is_propagated_via_sh() {
     let ws = std::env::temp_dir().join(format!("fandhe-noninteractive-{}-ws", std::process::id()));
@@ -196,16 +196,67 @@ fn req36_infer_nonzero_exit_is_propagated_via_sh() {
     .expect("write");
     let o = run_script_in(Some(&ws), &["--package", "p", "--text", "a"]);
     let _ = std::fs::remove_dir_all(&ws);
-    assert_eq!(o.code, Some(70));
     // Linux・macOS 以外の unix ではガードが fail-closed で 70（unsupported_platform）を返す。
-    let message = if cfg!(any(target_os = "linux", target_os = "macos")) {
-        "stage not implemented yet (TASK-33.1-2)"
+    let (code, exit_line, report) = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        (
+            64,
+            "exit_code=64",
+            ErrorReport::new(ExitCode::InvalidInput, "artifact metadata is invalid"),
+        )
     } else {
-        "path rejected: unsupported_platform"
+        (
+            70,
+            "exit_code=70",
+            ErrorReport::new(
+                ExitCode::RuntimeError,
+                "path rejected: unsupported_platform",
+            ),
+        )
     };
-    let expected = expected_stdout(&ErrorReport::new(ExitCode::RuntimeError, message));
-    assert_eq!(o.stdout, expected);
-    assert_eq!(o.stderr.lines().last(), Some("exit_code=70"));
+    assert_eq!(o.code, Some(code));
+    assert_eq!(o.stdout, expected_stdout(&report));
+    assert_eq!(o.stderr.lines().last(), Some(exit_line));
+}
+
+/// 実パッケージ（共有 fixture の C1 の ONNX・選択肢 alpha/beta/gamma）で、スクリプト経由の
+/// `infer --text` が exit 0 と判定 JSON 1 行を返すこと（REQ-36・REQ-33・#136。
+/// 証拠種別: テストハーネス。ONNX の出所は `fixtures/onnx_parity/PROVENANCE.md`）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn req36_infer_real_package_exit_zero_via_sh() {
+    let ws =
+        std::env::temp_dir().join(format!("fandhe-noninteractive-{}-real", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(ws.join("p")).expect("mkdir");
+    let onnx = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/onnx_parity/c1.onnx"),
+    )
+    .expect("fixture onnx");
+    let sha = fandhe_edge_core::hash::Sha256Digest::of_bytes(&onnx).to_hex();
+    std::fs::write(ws.join("p/model.onnx"), &onnx).expect("write onnx");
+    std::fs::write(
+        ws.join("p/artifact.json"),
+        format!(
+            r#"{{"kind":"c1","kind_version":1,"max_bytes":48,"label_order":["alpha","beta","gamma"],"onnx_file":"model.onnx","onnx_sha256":"{sha}"}}"#
+        ),
+    )
+    .expect("write meta");
+    std::fs::write(
+        ws.join("p/definition.json"),
+        r#"{"schema":"fandhe-edge-model-definition/v1","name":"sh_real","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"a","description":"d"},{"id":"beta","display_name":"b","description":"d"},{"id":"gamma","display_name":"g","description":"d"}],"io":{"input":"bytes"}}"#,
+    )
+    .expect("write definition");
+    let o = run_script_in(Some(&ws), &["--package", "p", "--text", "hello world"]);
+    let _ = std::fs::remove_dir_all(&ws);
+    assert_eq!(o.code, Some(0), "stdout: {}", o.stdout);
+    assert!(
+        o.stdout
+            .starts_with("{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\""),
+        "stdout: {}",
+        o.stdout
+    );
+    assert_eq!(o.stdout.lines().count(), 1);
+    assert_eq!(o.stderr.lines().last(), Some("exit_code=0"));
 }
 
 /// 偽の実行ファイル（sh スクリプト）を一時ディレクトリへ作り、スクリプト経由で実行する。

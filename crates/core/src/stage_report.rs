@@ -11,7 +11,9 @@
 //!
 //! # 現状（実装済みの範囲）
 //!
-//! `package` 工程の [`PackageReport`] のみ。フィールドは PoC-16 の package 工程の
+//! `package` 工程の [`PackageReport`] のほか、TASK-33.1-2（#136）で `register`・`inspect`・
+//! `train`・`select` の完了結果（[`RegisterReport`]・[`InspectStageReport`]・[`TrainReport`]・
+//! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。`package` 工程の [`PackageReport`] が中心で、フィールドは PoC-16 の package 工程の
 //! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に揃えた最小集合で、
 //! パス・データ本文・計測値は載せない（security.md。容量・p95 等の追加は各結線
 //! TASK で main が判断する入出力契約の変更）。加えて `evaluate` 工程の評価データ
@@ -149,6 +151,148 @@ impl PackageReport {
     }
 }
 
+/// `register` 工程が exit 0 で返す JSON（REQ-15・REQ-17・REQ-33・TASK-33.1-2・#136）。
+///
+/// パス・データ本文は載せない（security.md）。`definition_sha256` は定義の正準化ハッシュ
+/// （[`crate::definition::Definition::canonical_hash`]）、`options` は選択肢数、
+/// `evaluation_defined` は独立した評価データを取り込んだか（REQ-17）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegisterReport {
+    step: Stage,
+    status: StageStatus,
+    definition_sha256: String,
+    options: usize,
+    evaluation_defined: bool,
+}
+
+impl RegisterReport {
+    /// `register` の完了結果を作る。
+    #[must_use]
+    pub fn new(definition_sha256: String, options: usize, evaluation_defined: bool) -> Self {
+        Self {
+            step: Stage::Register,
+            status: StageStatus::Ok,
+            definition_sha256,
+            options,
+            evaluation_defined,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `inspect` の分割ごとの件数（REQ-17）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SplitCounts {
+    /// train 分割の件数。
+    pub train: usize,
+    /// validation 分割の件数。
+    pub validation: usize,
+    /// test 分割の件数（記録のみ。最終 test は 1 回限りの適用まで使わない。REQ-27）。
+    pub test: usize,
+}
+
+/// `inspect` 工程が exit 0 で返す JSON（REQ-16・REQ-17・REQ-33・TASK-33.1-2・#136）。
+///
+/// 異常・漏洩が 1 件でもあれば exit 0 にせず `invalid_input` を返すため、本型は
+/// 「検査を通過した」結果のみを表す。件数のみを載せ、行番号・本文は載せない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InspectStageReport {
+    step: Stage,
+    status: StageStatus,
+    valid_records: usize,
+    split: SplitCounts,
+}
+
+impl InspectStageReport {
+    /// `inspect` の完了結果を作る。
+    #[must_use]
+    pub fn new(valid_records: usize, split: SplitCounts) -> Self {
+        Self {
+            step: Stage::Inspect,
+            status: StageStatus::Ok,
+            valid_records,
+            split,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `train` 工程が exit 0 で返す JSON（REQ-18・REQ-33・TASK-33.1-2・#136）。
+///
+/// `candidate` は候補の添字（`--candidate`）、`kind` は候補の種類 ID（固定語彙 `c1` 等）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrainReport {
+    step: Stage,
+    status: StageStatus,
+    candidate: usize,
+    kind: String,
+}
+
+impl TrainReport {
+    /// `train` の完了結果を作る。
+    #[must_use]
+    pub fn new(candidate: usize, kind: String) -> Self {
+        Self {
+            step: Stage::Train,
+            status: StageStatus::Ok,
+            candidate,
+            kind,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `select` 工程が exit 0 で返す JSON（REQ-18・REQ-33・TASK-33.1-2・#136）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelectReport {
+    step: Stage,
+    status: StageStatus,
+    candidate: usize,
+    kind: String,
+}
+
+impl SelectReport {
+    /// `select` の完了結果を作る（選ばれた候補の添字と種類）。
+    #[must_use]
+    pub fn new(candidate: usize, kind: String) -> Self {
+        Self {
+            step: Stage::Select,
+            status: StageStatus::Ok,
+            candidate,
+            kind,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +378,53 @@ mod tests {
                 .to_json_line()
                 .expect("json")
                 .contains('\n')
+        );
+    }
+
+    /// REQ-33: register の JSON が完全一致する。
+    #[test]
+    fn req33_register_report_json_is_exact() {
+        assert_eq!(
+            RegisterReport::new("ab".repeat(32), 3, false)
+                .to_json_line()
+                .expect("json"),
+            format!(
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":false}}",
+                "ab".repeat(32)
+            )
+        );
+    }
+
+    /// REQ-33: inspect の JSON が完全一致する。
+    #[test]
+    fn req33_inspect_report_json_is_exact() {
+        let split = SplitCounts {
+            train: 8,
+            validation: 1,
+            test: 1,
+        };
+        assert_eq!(
+            InspectStageReport::new(10, split)
+                .to_json_line()
+                .expect("json"),
+            "{\"step\":\"inspect\",\"status\":\"ok\",\"valid_records\":10,\"split\":{\"train\":8,\"validation\":1,\"test\":1}}"
+        );
+    }
+
+    /// REQ-33: train・select の JSON が完全一致する。
+    #[test]
+    fn req33_train_and_select_report_json_are_exact() {
+        assert_eq!(
+            TrainReport::new(0, "c1".to_string())
+                .to_json_line()
+                .expect("json"),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}"
+        );
+        assert_eq!(
+            SelectReport::new(1, "c3".to_string())
+                .to_json_line()
+                .expect("json"),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}"
         );
     }
 }

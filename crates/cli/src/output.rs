@@ -21,12 +21,12 @@
 //! # package の正常系（TASK-33.2-2）
 //!
 //! [`write_package_report`] は `package` 工程の exit 0 の結果 JSON を書く。呼び出し元は
-//! `stage_output::emit_package_outcome`（配線は TASK-33.1-2・#136）。
+//! `stage_output::emit_package_outcome`（`stages::package` が配線。TASK-33.1-2・#136）。
 //!
 //! # evaluate の skipped（TASK-33.3・#140）
 //!
 //! [`write_evaluate_report`] は評価データ未定義の `evaluate` の exit 0 の JSON を書く。呼び出し元は
-//! `stage_output::emit_evaluate_skipped`（配線は TASK-33.1-2・#136）。
+//! `stage_output::emit_evaluate_skipped`（`stages::evaluate` が配線。TASK-33.1-2・#136）。
 //!
 //! # 異常系（TASK-21.2）
 //!
@@ -162,6 +162,28 @@ pub fn write_evaluate_report<W: Write>(
     let mut line = report
         .to_json_line()
         .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(ExitCode::Ok)
+}
+
+/// `register`・`inspect`・`train`・`select` の完了結果（JSON 1 行。直列化済みの文字列または
+/// その失敗）を改行つきで `out` へ書き、[`ExitCode::Ok`] を返す（REQ-33・TASK-33.1-2・#136）。
+///
+/// [`write_package_report`] と同じ保証を持つ（直列化失敗時は何も書かず `Err`、`write_all` は
+/// 高々 1 回、部分書き込み失敗時にリトライ・追記・flush をしない）。cli は `serde_json` に
+/// 依存しないため、直列化エラーの型は呼び出し側から `Display` として受け取る。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_stage_line<W: Write, E: std::fmt::Display>(
+    out: &mut W,
+    line: Result<String, E>,
+) -> io::Result<ExitCode> {
+    let mut line = line.map_err(|error| io::Error::other(error.to_string()))?;
     line.push('\n');
 
     out.write_all(line.as_bytes())?;

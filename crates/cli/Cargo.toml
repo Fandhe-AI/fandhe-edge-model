@@ -29,5 +29,12 @@ fandhe-edge-runtime.workspace = true
 # 容量計測 example（#123）の open_confined に使う。workspace 内 path 依存のみ（外部依存の追加ではない）。
 fandhe-edge-guard.workspace = true
 
+# 7 工程の完走確認（TASK-33.1-2・#136）。本バイナリ自身を偽の学習ワーカーとして再実行するため
+# libtest を使わない（crates/train/tests/worker_process.rs と同じ方式）。
+[[test]]
+name = "pipeline_e2e"
+path = "tests/pipeline_e2e.rs"
+harness = false
+
 [lints]
 workspace = true

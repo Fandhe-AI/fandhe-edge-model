@@ -307,6 +307,39 @@ impl InferInput {
         })
     }
 
+    /// `--text`・`--id`（JSON を経由しない入力）から検証済みの [`InferInput`] を作る
+    /// （REQ-33・TASK-33.1-2・#136）。[`InferInput::parse`] と同じ検証（サイズ上限・
+    /// `id` の空・長さ）を、JSON の解釈なしで行う。cli が `serde_json` に依存しないため、
+    /// JSON の文字列エスケープをせずに済むこの経路を core に置く。
+    ///
+    /// # Errors
+    /// 入力が [`MAX_INFER_INPUT_BYTES`] を超える・`id` が空・`id` が長すぎる場合。
+    pub fn from_text(id: &str, input: &str, io: &IoSchema) -> Result<Self, InferInputError> {
+        match io.input {
+            InputRepresentation::Bytes => {}
+        }
+        let len = input.len();
+        if len > MAX_INFER_INPUT_BYTES {
+            return Err(InferInputError::TooLarge {
+                len,
+                limit: MAX_INFER_INPUT_BYTES,
+            });
+        }
+        if id.is_empty() {
+            return Err(InferInputError::EmptyId);
+        }
+        if id.len() > MAX_INPUT_ID_BYTES {
+            return Err(InferInputError::IdTooLong {
+                len: id.len(),
+                limit: MAX_INPUT_ID_BYTES,
+            });
+        }
+        Ok(Self {
+            id: id.to_string(),
+            input: input.to_string(),
+        })
+    }
+
     /// `serde_json::Error::classify() == Data`（構文エラーではない）の失
     /// 敗を `serde_json::Value` として再走査し、型付きの `InferInputError`
     /// へ分類する（`definition.rs` の `diagnose` モジュールと同じ考え方。
@@ -410,6 +443,25 @@ mod tests {
         IoSchema {
             input: InputRepresentation::Bytes,
         }
+    }
+
+    /// REQ-33: `--text` 経路は JSON を経由せず、`parse` と同じ検証（空 id・巨大入力）を行う。
+    #[test]
+    fn req33_from_text_validates_like_parse() {
+        let ok = InferInput::from_text("a1", "he\"llo", &io_bytes()).unwrap();
+        assert_eq!((ok.id(), ok.input()), ("a1", "he\"llo"));
+        assert_eq!(
+            InferInput::from_text("", "x", &io_bytes()),
+            Err(InferInputError::EmptyId)
+        );
+        let big = "x".repeat(MAX_INFER_INPUT_BYTES + 1);
+        assert_eq!(
+            InferInput::from_text("a", &big, &io_bytes()),
+            Err(InferInputError::TooLarge {
+                len: MAX_INFER_INPUT_BYTES + 1,
+                limit: MAX_INFER_INPUT_BYTES
+            })
+        );
     }
 
     /// REQ-21: 正常系。

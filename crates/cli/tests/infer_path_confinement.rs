@@ -3,8 +3,9 @@
 //!
 //! 構成: `<tmp>/workspace/`（カレントディレクトリ）と `<tmp>/outside/`。workspace の外を指す
 //! `--package`・`onnx_file` は `invalid_input`（64）の JSON 1 行で拒否され、外のパスを
-//! 出力へ含めないこと。正常対照として、内側の有効なパッケージはガードを通過して
-//! スタブ（`runtime_error`・70。#136 で置換予定）に到達すること。
+//! 出力へ含めないこと。正常対照として、内側のパッケージはガードを通過して次の検査
+//! （TASK-33.1-2・#136 で接続した推論準備。ここでは最小のメタデータのため `artifact.json` の
+//! 必須項目の不足で `invalid_input`）に到達すること。実推論の完走は `pipeline_e2e.rs`。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,8 +18,8 @@ const MIN_ONNX: [u8; 9] = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]
 const ESCAPES: &str =
     "{\"code\":\"invalid_input\",\"message\":\"path rejected: path_escapes_root\"}\n";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const STUB: &str =
-    "{\"code\":\"runtime_error\",\"message\":\"stage not implemented yet (TASK-33.1-2)\"}\n";
+const AFTER_GUARD: &str =
+    "{\"code\":\"invalid_input\",\"message\":\"artifact metadata is invalid\"}\n";
 
 struct Sandbox {
     base: PathBuf,
@@ -108,14 +109,15 @@ mod unix_only {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    /// REQ-39（正常対照）: 内側の有効なパッケージはガードを通過してスタブ（70）に到達する。
+    /// REQ-39（正常対照）: 内側のパッケージはガード（経路・形式）を通過し、次の検査
+    /// （拡張メタデータの必須項目）で止まる。経路拒否（`path_escapes_root`）ではない。
     #[test]
-    fn req39_valid_inner_package_passes_guard_to_stub() {
+    fn req39_valid_inner_package_passes_guard_to_next_check() {
         let sb = Sandbox::new("ok");
         sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
         let (code, stdout) = sb.infer(Path::new("pkg"));
-        assert_eq!(code, Some(70));
-        assert_eq!(stdout, STUB);
+        assert_eq!(code, Some(64));
+        assert_eq!(stdout, AFTER_GUARD);
     }
 
     /// REQ-39・PoC-20 ケース 1（a）: `onnx_file` が外の秘密ファイルへ出る相対パス。

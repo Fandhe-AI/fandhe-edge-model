@@ -28,10 +28,10 @@
 //! パッケージ形式に `kind_version`・sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。
 //! `--input-file`・`--out` の閉じ込めも範囲外。
 //!
-//! # 後続（#136）への申し送り
+//! # 推論への接続（#136。`stages::infer`）
 //!
 //! 返す [`PathFormatCheckedInputs::onnx`] は閉じ込めつきで開いて形式検査のみを通した [`CheckedFile`]。推論への接続では、この
-//! バイト列（`as_bytes`・`Read`）をランタイムへ渡すこと。パスから開き直すと検証後の差し替え
+//! バイト列（`as_bytes`・`Read`）をランタイムへ渡す（`stages::infer` はそうしている）。パスから開き直すと検証後の差し替え
 //! （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。
 
 use std::path::Path;

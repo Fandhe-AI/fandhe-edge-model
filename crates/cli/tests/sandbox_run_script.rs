@@ -6,8 +6,9 @@
 //! macOS 実機での sandbox 下の完走確認と拒否ログの記録は人の担当で、本テストは
 //! その証拠にならない（実機の手順は `AGENTS.md`「実機前提テスト」）。ここで検証するのは
 //! スクリプトの制御（sandbox 経由の起動・工程の順序・停止・記録・資源上限・終了コード）。
-//! 実バイナリは #136（TASK-33.1-2）が未完了のため `register` で 70 になるのが現状の
-//! 正しい結果で、#136 の完了後は最後のテストの期待値を更新する。
+//! 実バイナリは #136（TASK-33.1-2）で 7 工程を接続済み。ここでは実バイナリで register・inspect
+//! が完走し、学習ワーカーが無い環境では train で止まること（完走を装わない）を確認する
+//! （7 工程の完走は `pipeline_e2e.rs`）。
 //! 拒否ログの監視と 0 件判定は #163（TASK-38.1-2）の担当。
 //! Windows では `sh` を前提にできないため unix に限定する。
 
@@ -169,6 +170,19 @@ impl Env {
         launcher: Option<&Path>,
         cli: Option<&Path>,
     ) -> Out {
+        self.run_in(args, envs, launcher, cli, None)
+    }
+
+    /// `run_with` に加えてスクリプトの cwd を指定できる版（実バイナリは経路の閉じ込めのため
+    /// 定義ファイルを含むディレクトリを cwd にする必要がある。REQ-39）。
+    fn run_in(
+        &self,
+        args: &[String],
+        envs: &[(&str, &str)],
+        launcher: Option<&Path>,
+        cli: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Out {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -184,6 +198,9 @@ impl Env {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         if let Some(l) = launcher {
             cmd.env("FANDHE_EDGE_SANDBOX_EXEC", l);
         }
@@ -586,16 +603,67 @@ fn req38_infer_text_is_not_written_to_logs() {
     assert!(hits.is_empty(), "{hits:?}");
 }
 
-/// 実バイナリは #136 未完了のため register で 70。完走を装わないことの確認。
-/// #136 の完了後はこの期待値を更新する。
+/// 実バイナリ（#136 で接続済み）で register・inspect が完走し（code の無い exit 0 の工程結果 JSON を
+/// スクリプトが受理する）、学習ワーカーが無い環境（存在しない `FANDHE_EDGE_TRAINER_DIR`）では
+/// train で止まる。完走を装わない確認（REQ-33・REQ-38。証拠種別: テストハーネス）。
 #[test]
-fn req38_real_binary_reports_runtime_error_at_register() {
+fn req38_real_binary_completes_register_and_inspect_then_stops_at_train() {
     let e = Env::new();
+    fs::write(
+        e.definition(),
+        r#"{"schema":"fandhe-edge-model-definition/v1","name":"sandbox_real","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#,
+    )
+    .expect("definition");
+    let mut rows = String::new();
+    for i in 0..20 {
+        for l in ["a", "b"] {
+            rows.push_str(&format!(
+                "{{\"id\":\"{l}{i}\",\"input\":\"{l} text {i}\",\"output\":{{\"intent\":\"{l}\"}},\"group_id\":\"g{l}{i}\"}}\n"
+            ));
+        }
+    }
+    fs::write(e.dir.join("train.jsonl"), rows).expect("train data");
     let real = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-edge"));
-    let o = e.run_with(&e.base_args(), &[], Some(&e.launcher), Some(&real));
-    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
-    assert!(o.stdout.contains("\"failed_step\":\"register\""));
-    assert_eq!(e.launch_calls().len(), 1);
+    let missing_trainer = e.dir.join("no-such-trainer");
+    let o = e.run_in(
+        &e.base_args(),
+        &[(
+            "FANDHE_EDGE_TRAINER_DIR",
+            &missing_trainer.display().to_string(),
+        )],
+        Some(&e.launcher),
+        Some(&real),
+        Some(&e.dir),
+    );
+    assert_ne!(o.code, Some(0), "stdout={}", o.stdout);
+    assert!(
+        o.stdout.contains("\"failed_step\":\"train\""),
+        "stdout={}",
+        o.stdout
+    );
+    assert_eq!(step_names(&o.stdout), ["register", "inspect", "train"]);
+    assert!(
+        o.stdout
+            .contains("\"step\":\"register\",\"candidate\":null,\"exit_code\":0"),
+        "stdout={}",
+        o.stdout
+    );
+    assert_eq!(e.launch_calls().len(), 3);
+}
+
+/// exit 0 の工程結果 JSON が `code` を持たなくても（`step`・`status` 等の契約）受理する。
+/// `code` があるなら "ok" が必要（REQ-33。TASK-33.1-2・#136）。
+#[test]
+fn req33_zero_exit_stage_json_without_code_is_accepted() {
+    let e = Env::new();
+    let o = e.run(
+        &e.base_args(),
+        &[
+            ("FAKE_STAGE_OUT", "{\"step\":\"x\",\"status\":\"ok\"}\n"),
+            ("FAKE_STAGE_OUT_SET", "1"),
+        ],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
 }
 
 /// --out-dir が --project-dir と同一・配下・祖先だと 64 で拒否し、CLI を起動せず
