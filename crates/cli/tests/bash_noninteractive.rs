@@ -305,7 +305,7 @@ fn req36_infer_real_package_exit_zero_via_sh() {
 }
 
 /// 実パッケージのバッチ（`--input-file`。REQ-33 の唯一の例外の 1 行 1 JSON）が入力順に exit 0 で返り、
-/// 単体推論（`req36_infer_real_package_exit_zero_via_sh`）と同じラベルになること（REQ-28・REQ-36・#148）。
+/// 単体推論（`req36_infer_real_package_exit_zero_via_sh`）と id 以外の全内容（scores を含む）が一致すること（REQ-28・REQ-36・#148）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn req36_infer_real_package_batch_via_sh() {
@@ -318,6 +318,15 @@ fn req36_infer_real_package_batch_via_sh() {
         ));
     }
     std::fs::write(ws.join("in.jsonl"), lines).expect("write input");
+    // 単体推論の結果（1 行の全文）を入力ごとに控え、バッチの同じ入力の行と全体比較する（REQ-28）。
+    let singles: Vec<String> = REAL_CASES
+        .iter()
+        .map(|(input, _)| {
+            let s = run_script_in(Some(&ws), &["--package", "p", "--text", input]);
+            assert_eq!(s.code, Some(0), "stdout: {}", s.stdout);
+            s.stdout
+        })
+        .collect();
     let o = run_script_in(Some(&ws), &["--package", "p", "--input-file", "in.jsonl"]);
     let _ = std::fs::remove_dir_all(&ws);
     assert_eq!(o.code, Some(0), "stdout: {}", o.stdout);
@@ -330,6 +339,10 @@ fn req36_infer_real_package_batch_via_sh() {
             "{line}"
         );
         assert_scores_in_label_order(line);
+        // id 以外（status・predicted_label・scores の全値）が単体推論と一字一句一致すること。
+        let single = singles[i].trim_end_matches('\n');
+        let expected = single.replacen("\"id\":\"input\"", &format!("\"id\":\"r{}\"", i + 1), 1);
+        assert_eq!(*line, expected, "single vs batch differ at {i}");
     }
     assert_eq!(o.stderr.lines().last(), Some("exit_code=0"));
 }
