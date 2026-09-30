@@ -13,7 +13,8 @@
 //!    （推論経路は学習側〔`fandhe-edge-train`・Python〕に依存しない。REQ-32）
 //!
 //! 推論関数へ渡すのは `input` のみ（REQ-27）。`--text` は 1 件・`--input-file` は 1 行 1 JSON
-//! （[`crate::infer_batch`]。REQ-33 の唯一の例外）。`--out` は未実装で `runtime_error`。
+//! （[`crate::infer_batch`]。REQ-33 の唯一の例外）。`--text` も上限つき（`INFER_TIME_LIMIT`。runtime の
+//! 協調的な期限＋バッチと共通の見張りで `limit_exceeded`・exit 20。REQ-39）。`--out` は未実装で `runtime_error`。
 //!
 //! # 未検証の項目（「検証済み」ではない）
 //!
@@ -30,7 +31,6 @@ use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
-use fandhe_edge_core::infer_input::InferInput;
 use fandhe_edge_guard::path::open_confined;
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
 use fandhe_edge_runtime::pipeline::InferencePipeline;
@@ -38,9 +38,8 @@ use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
-use crate::infer_batch::{emit_infer_batch, judgment_from_prediction};
+use crate::infer_batch::{emit_infer_batch, emit_infer_single};
 use crate::infer_guard::check_infer_path_and_format;
-use crate::output::write_ok_judgment;
 use crate::project::{DEFINITION_FILE, fs_report, invalid, parse_definition, runtime};
 
 /// パッケージ内のメタデータのファイル名。
@@ -81,12 +80,16 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
         Err(report) => return emit_error_report(out, &report),
     };
     match &args.source {
-        InferSource::Text { text, id } => {
-            match infer_text(&prepared, id.as_deref().unwrap_or(DEFAULT_TEXT_ID), text) {
-                Ok(result) => write_ok_judgment(out, &result),
-                Err(report) => emit_error_report(out, &report),
-            }
-        }
+        // 単件推論も上限つきで、止まったらバッチと同じ見張りで `limit_exceeded`・exit 20 に終える
+        // （runtime の協調的な期限＋CLI のプロセス境界。REQ-39）。
+        InferSource::Text { text, id } => emit_infer_single(
+            out,
+            &prepared.definition.io().clone(),
+            prepared.definition.options(),
+            Arc::new(prepared.pipeline),
+            id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
+            text,
+        ),
         InferSource::InputFile {
             path,
             out: out_path,
@@ -108,21 +111,6 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
             )
         }
     }
-}
-
-/// `--text` の 1 件を推論して判定結果へ写す。
-fn infer_text(
-    prepared: &Prepared,
-    id: &str,
-    text: &str,
-) -> Result<fandhe_edge_core::judgment::JudgmentResult, ErrorReport> {
-    let input = InferInput::from_text(id, text, prepared.definition.io())
-        .map_err(|e| crate::output::infer_input_error_report(&e))?;
-    let prediction = prepared
-        .pipeline
-        .infer_one(input.input())
-        .map_err(|e| e.to_error_report())?;
-    judgment_from_prediction(prepared.definition.options(), input.id(), &prediction)
 }
 
 /// 経路・形式・自己整合性を検査し、推論パイプラインを組み立てる。
