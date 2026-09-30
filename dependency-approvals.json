@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "cargo": {
+    "direct": [
+      {
+        "name": "serde",
+        "version": "1.0.229",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-27 オーナー承認。データ契約・学習ワーカー層への配置は 2026-09-28 承認）",
+        "purpose": "定義ファイル・JSON 入出力の型の直列化",
+        "layers": [
+          "core",
+          "data",
+          "train"
+        ]
+      },
+      {
+        "name": "serde_json",
+        "version": "1.0.151",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-27 オーナー承認。PR #193・Issue #112 コメント 2026-09-29 に配置層追加の記録）",
+        "purpose": "JSON の読み書き",
+        "layers": [
+          "core",
+          "data",
+          "train",
+          "runtime(dev)"
+        ]
+      },
+      {
+        "name": "sha2",
+        "version": "0.11.0",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-27 オーナー承認）",
+        "purpose": "正準化ハッシュ（sha256）の計算",
+        "layers": [
+          "core"
+        ]
+      },
+      {
+        "name": "unicode-normalization",
+        "version": "0.1.22",
+        "approved_on": "2026-09-28",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-28 オーナー承認。PR #224・#225・Issue #112 コメント 2026-09-29）",
+        "purpose": "NFKC 正規化（学習ワーカーと Unicode 15.0 で一致）",
+        "layers": [
+          "data",
+          "runtime"
+        ]
+      },
+      {
+        "name": "rustix",
+        "version": "1.1.5",
+        "approved_on": "2026-09-29",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-09-29 オーナー承認。PR #282）",
+        "purpose": "openat（O_NOFOLLOW）による経路の閉じ込め",
+        "layers": [
+          "guard"
+        ]
+      }
+    ],
+    "locked": [
+      {
+        "name": "serde_core",
+        "version": "1.0.229",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "serde_derive",
+        "version": "1.0.229",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "proc-macro2",
+        "version": "1.0.107",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "quote",
+        "version": "1.0.47",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "syn",
+        "version": "3.0.6",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "unicode-ident",
+        "version": "1.0.26",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde"
+      },
+      {
+        "name": "itoa",
+        "version": "1.0.18",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde_json"
+      },
+      {
+        "name": "memchr",
+        "version": "2.8.3",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde_json"
+      },
+      {
+        "name": "zmij",
+        "version": "1.0.23",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: serde_json"
+      },
+      {
+        "name": "cfg-if",
+        "version": "1.0.5",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "cpufeatures",
+        "version": "0.3.1",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "digest",
+        "version": "0.11.3",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "block-buffer",
+        "version": "0.12.1",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "crypto-common",
+        "version": "0.2.2",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "hybrid-array",
+        "version": "0.4.15",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "typenum",
+        "version": "1.20.1",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: sha2"
+      },
+      {
+        "name": "tinyvec",
+        "version": "1.13.3",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: unicode-normalization"
+      },
+      {
+        "name": "bitflags",
+        "version": "2.13.2",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "linux-raw-sys",
+        "version": "0.12.1",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "libc",
+        "version": "0.2.189",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "errno",
+        "version": "0.3.14",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "windows-sys",
+        "version": "0.61.2",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "windows-link",
+        "version": "0.2.1",
+        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
+      },
+      {
+        "name": "const-oid",
+        "version": "0.10.2",
+        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（digest の推移的依存）"
+      }
+    ]
+  },
+  "pypi": {
+    "direct": [
+      {
+        "name": "mlx",
+        "version": "0.32.2",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "trainer/pyproject.toml 冒頭コメントに記載の直接依存（2026-09-27 オーナー承認）",
+        "purpose": "学習（MLX）。`cpu` extra で mlx-cpu を開発環境に導入",
+        "layers": [
+          "trainer"
+        ]
+      },
+      {
+        "name": "numpy",
+        "version": "2.5.3",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "trainer/pyproject.toml 冒頭コメントに記載の直接依存（2026-09-27 オーナー承認）",
+        "purpose": "学習・書き出しの数値計算",
+        "layers": [
+          "trainer"
+        ]
+      },
+      {
+        "name": "onnx",
+        "version": "1.23.0",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "trainer/pyproject.toml 冒頭コメントに記載の直接依存（2026-09-27 オーナー承認）",
+        "purpose": "ONNX 書き出し",
+        "layers": [
+          "trainer"
+        ]
+      },
+      {
+        "name": "ruff",
+        "version": "0.16.9",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "trainer/pyproject.toml 冒頭コメントに記載の直接依存（2026-09-27 オーナー承認）",
+        "purpose": "整形・lint（dev）",
+        "layers": [
+          "trainer"
+        ]
+      },
+      {
+        "name": "pytest",
+        "version": "9.1.1",
+        "approved_on": "2026-09-27",
+        "approved_by": "owner",
+        "record": "trainer/pyproject.toml 冒頭コメントに記載の直接依存（2026-09-27 オーナー承認）",
+        "purpose": "テスト（dev）",
+        "layers": [
+          "trainer"
+        ]
+      }
+    ],
+    "locked": [
+      {
+        "name": "mlx-metal",
+        "version": "0.32.2",
+        "basis": "trainer/pyproject.toml 冒頭コメントに記載の推移的依存（親の承認に包含）。親: mlx"
+      },
+      {
+        "name": "mlx-cpu",
+        "version": "0.32.2",
+        "basis": "trainer/pyproject.toml 冒頭コメントに記載の推移的依存（親の承認に包含）。親: mlx"
+      },
+      {
+        "name": "ml-dtypes",
+        "version": "0.6.0",
+        "basis": "trainer/pyproject.toml 冒頭コメントに記載の推移的依存（親の承認に包含）。親: onnx"
+      },
+      {
+        "name": "protobuf",
+        "version": "7.36.2",
+        "basis": "trainer/pyproject.toml 冒頭コメントに記載の推移的依存（親の承認に包含）。親: onnx"
+      },
+      {
+        "name": "typing-extensions",
+        "version": "4.16.0",
+        "basis": "trainer/pyproject.toml 冒頭コメントに記載の推移的依存（親の承認に包含）。親: onnx"
+      },
+      {
+        "name": "iniconfig",
+        "version": "2.3.0",
+        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+      },
+      {
+        "name": "packaging",
+        "version": "26.3",
+        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+      },
+      {
+        "name": "pluggy",
+        "version": "1.6.0",
+        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+      },
+      {
+        "name": "pygments",
+        "version": "2.21.0",
+        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+      }
+    ]
+  }
+}
