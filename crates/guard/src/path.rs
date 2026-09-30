@@ -623,6 +623,40 @@ impl ConfinedDir {
         Ok((owned, (*last).to_os_string()))
     }
 
+    /// 保持しているディレクトリ fd 自身のメタデータ（mode・所有者・dev・ino。パスを再解決しない）。
+    ///
+    /// # Errors
+    /// fd の複製・`fstat` の失敗。
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        File::from(self.fd.try_clone()?).metadata()
+    }
+
+    /// `rel` を追記モード（`O_WRONLY | O_APPEND | O_NOFOLLOW`。作成しない）で開いて返す。
+    ///
+    /// 読み取り専用にしたファイルへの書き込みが拒否されることの確認（プローブ）用。親は保持 fd 起点で
+    /// 辿る（[`ConfinedDir::create_new_member`] と同じ閉じ込め）。開けた場合、呼び出し側は書き込まずに
+    /// 閉じること。
+    ///
+    /// # Errors
+    /// 経路の拒否・開けない場合（権限拒否は `PermissionDenied` の [`PathRejection::Unresolvable`]）。
+    pub fn open_member_append(&self, rel: &Path) -> Result<File, PathRejection> {
+        use rustix::fs::{Mode, OFlags, openat};
+
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        let fd = openat(
+            dir,
+            name.as_os_str(),
+            OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| PathRejection::Unresolvable {
+            candidate: rel.to_path_buf(),
+            source: errno_to_io(e),
+        })?;
+        Ok(File::from(fd))
+    }
+
     /// `rel` に新規の通常ファイルを `O_CREAT | O_EXCL | O_NOFOLLOW` で作って書き込み用に返す。
     ///
     /// 親は保持した fd 起点で辿る（[`ConfinedDir::open_member`] と同じ閉じ込め）。既存（symlink を

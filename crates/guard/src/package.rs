@@ -160,6 +160,39 @@ impl ConfinedPackage {
 }
 
 impl ConfinedPackage {
+    /// 保持しているディレクトリ fd 自身のメタデータ（mode・所有者。パスを再解決しない）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::metadata`] と同じ。Linux・macOS 以外は `Unsupported`。
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.metadata()
+        }
+    }
+
+    /// `member` を追記モードで開く（読み取り専用配置の書き込み拒否プローブ用。作成しない）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_member_append`] と同じ。
+    pub fn open_member_append(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.open_member_append(member)
+        }
+    }
+}
+
+impl ConfinedPackage {
     /// `member`（本パッケージ配下のディレクトリ）を fd 起点で開き、その fd を保持する新しい
     /// [`ConfinedPackage`] を返す（作成直後のディレクトリの同一性を fd で握る。REQ-39）。
     ///
@@ -455,6 +488,36 @@ mod tests {
                 .is_err()
         );
         assert!(!base.join("escaped").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REQ-39: 追記プローブは、書き込める通常ファイルなら開け、0400 にすると `PermissionDenied`
+    /// （root 以外）になり、symlink は辿らず拒否する。`metadata` は保持 fd 自身のもの。
+    #[test]
+    fn req39_open_member_append_probe_and_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!("fandhe-guard-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("pkg")).expect("mkdir");
+        std::fs::write(base.join("pkg/f"), b"x").expect("write");
+        symlink(base.join("pkg/f"), base.join("pkg/link")).expect("symlink");
+        let pkg = confine_package(&base, Path::new("pkg")).expect("confine");
+        assert!(pkg.open_member_append(Path::new("f")).is_ok());
+        assert!(pkg.open_member_append(Path::new("link")).is_err());
+        assert!(pkg.open_member_append(Path::new("../f")).is_err());
+        assert!(pkg.metadata().expect("metadata").is_dir());
+        std::fs::set_permissions(base.join("pkg/f"), std::fs::Permissions::from_mode(0o400))
+            .expect("chmod");
+        let denied = pkg.open_member_append(Path::new("f"));
+        let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+        if !is_root {
+            assert!(matches!(
+                denied,
+                Err(PathRejection::Unresolvable { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
