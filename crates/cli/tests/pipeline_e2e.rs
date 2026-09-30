@@ -403,6 +403,31 @@ mod suite {
         assert!(!env.project_file("package.staging").exists());
     }
 
+    /// REQ-27・REQ-33: `train --smoke`（epochs=1 の短縮学習）の候補は `select` できるが、`package` は
+    /// 既定で `invalid_input`（64）・固定 message で拒否し `package/` もステージングも作らない。検証専用の
+    /// `--allow-smoke` を付けたときだけ成功する。
+    pub fn package_rejects_smoke_trained_candidate_unless_allowed() {
+        let env = inspected("smokepkg");
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--smoke",
+        ]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        assert_eq!(
+            env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"smoke-trained candidate cannot be packaged\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+        let out = env.ok(&["package", "--project-dir", "proj", "--allow-smoke"]);
+        assert!(out.contains("\"status\":\"ok\""), "{out}");
+        assert!(env.project_file("package/artifact.json").is_file());
+    }
+
     /// REQ-17: 凍結記録が欠落（評価データだけ残る）していても、後続工程は停止する（fail-closed）。
     pub fn later_stages_stop_when_freeze_record_is_missing() {
         let env = eval_env_until("nofrz", &[]);
@@ -953,10 +978,18 @@ mod suite {
             .map(|l| format!("\"{l}\""))
             .collect();
         let labels = labels.join(",");
-        let config = if request.kind() == "c1" {
+        let default_config = if request.kind() == "c1" {
             C1_CONFIG
         } else {
             C3_CONFIG
+        };
+        // 結果の `config` は「既定値を要求の設定で上書きしたもの」。`train --smoke` は `epochs` を 1 にする。
+        let config = if request.config().get("epochs").is_some_and(|e| e == 1) {
+            default_config
+                .replace("\"epochs\":30", "\"epochs\":1")
+                .replace("\"epochs\":40", "\"epochs\":1")
+        } else {
+            default_config.to_string()
         };
         let (kind, version, max_bytes) =
             (request.kind(), request.kind_version(), request.max_bytes());
@@ -1106,6 +1139,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_is_rejected_when_evaluation_data_exists_but_not_completed",
             suite::package_is_rejected_when_evaluation_data_exists_but_not_completed,
+        ),
+        (
+            "package_rejects_smoke_trained_candidate_unless_allowed",
+            suite::package_rejects_smoke_trained_candidate_unless_allowed,
         ),
         (
             "infer_out_option_is_not_faked",

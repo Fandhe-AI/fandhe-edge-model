@@ -317,6 +317,15 @@ pub fn request_matches_candidate(request: &TrainRequest, params: &TrainRequestPa
             .eq(params.config.iter().filter(|(k, _)| k.as_str() != "epochs"))
 }
 
+/// 保存済みの学習リクエストが `train --smoke`（`epochs` を 1 へ上書きした短縮学習）のものか
+/// （既定候補 `params` の `epochs` と異なるか）を返す。`request_matches_candidate` が `epochs` を
+/// 比較から外す理由と同じ項目を見る判定で、smoke かどうかの判定はここに 1 つだけ置く。
+/// `select` は smoke の結果も採点・選定できるが、`package` は既定で拒否する（REQ-27）。
+#[must_use]
+pub fn request_is_smoke_trained(request: &TrainRequest, params: &TrainRequestParams) -> bool {
+    request.config().get("epochs") != params.config.get("epochs")
+}
+
 /// 学習用データの生成失敗を [`ErrorReport`] にする。上限超過は `limit_exceeded`（20。REQ-39）で、
 /// 学習ワーカーの起動より前に止まる。それ以外は `runtime_error`（`message` は固定語彙）。
 fn stage_file_error_report(error: StageFileError, message: &str) -> ErrorReport {

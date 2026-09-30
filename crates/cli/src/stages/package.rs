@@ -17,6 +17,7 @@
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
 //!    あわせて、公開前に `infer` と同じ検証（ガード層の形式許可リスト・ONNX の読み込み。
 //!    [`super::infer::load_backend`]）を通す
+//!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）
 //! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
 //!
 //! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
@@ -59,7 +60,8 @@ use crate::project::{
 use super::infer::load_backend;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, load_trained, read_split_record, request_matches_candidate, resolve_candidates,
+    candidate_rel, load_trained, read_split_record, request_is_smoke_trained,
+    request_matches_candidate, resolve_candidates,
 };
 
 /// 配布パッケージ内のメタデータのファイル名（`infer_guard` と同じ）。
@@ -107,6 +109,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
     if !request_matches_candidate(&request, &candidate.params) {
         return Err(invalid("selection record does not match the candidate"));
+    }
+    // 短縮学習（`train --smoke`）の結果は、検証専用の `--allow-smoke` を明示しない限り配布しない
+    // （`select` は smoke の結果も選定できるため、ここが配布の関門。REQ-27）。
+    if request_is_smoke_trained(&request, &candidate.params) && !args.allow_smoke {
+        return Err(invalid("smoke-trained candidate cannot be packaged"));
     }
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(invalid("selected candidate has no artifact"));

@@ -117,6 +117,15 @@ const REGISTER_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
 ];
 const PROJECT_OPTS: &[OptSpec] = &[opt("--project-dir", "DIR", true, "Project directory")];
+const PACKAGE_OPTS: &[OptSpec] = &[
+    opt("--project-dir", "DIR", true, "Project directory"),
+    OptSpec {
+        name: "--allow-smoke",
+        value: None,
+        required: false,
+        help: "Allow packaging a smoke-trained candidate (for verification only; not for distribution)",
+    },
+];
 const INSPECT_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
     opt(
@@ -168,7 +177,8 @@ pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
     match sub {
         Subcommand::Register => REGISTER_OPTS,
         Subcommand::Inspect => INSPECT_OPTS,
-        Subcommand::Select | Subcommand::Package => PROJECT_OPTS,
+        Subcommand::Select => PROJECT_OPTS,
+        Subcommand::Package => PACKAGE_OPTS,
         Subcommand::Train => TRAIN_OPTS,
         Subcommand::Evaluate => EVALUATE_OPTS,
         Subcommand::Infer => INFER_OPTS,
@@ -211,6 +221,9 @@ pub struct SelectArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageArgs {
     pub project_dir: PathBuf,
+    /// `--allow-smoke`: `train --smoke` で短縮学習した候補の package を許す（検証専用。配布用ではない。
+    /// 指定しなければ拒否する。REQ-27）。
+    pub allow_smoke: bool,
 }
 
 /// `infer` の入力源。同時指定・不整合な組み合わせを型で表現できなくする。
@@ -539,6 +552,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         }),
         Subcommand::Package => Command::Package(PackageArgs {
             project_dir: v.path("--project-dir")?,
+            allow_smoke: v.take("--allow-smoke").is_some(),
         }),
         Subcommand::Infer => {
             let package = v.path("--package")?;
@@ -644,7 +658,10 @@ mod tests {
         );
         assert_eq!(
             run(&["package", "--project-dir", "proj"]),
-            Command::Package(PackageArgs { project_dir: d })
+            Command::Package(PackageArgs {
+                project_dir: d,
+                allow_smoke: false
+            })
         );
     }
 
@@ -677,6 +694,25 @@ mod tests {
         assert_eq!(seeded("-1"), Err(ArgsError::InvalidSeed));
         assert_eq!(seeded("abc"), Err(ArgsError::InvalidSeed));
         assert_eq!(ArgsError::InvalidSeed.exit_code(), ExitCode::InvalidInput);
+    }
+
+    /// REQ-27・REQ-33: `package --allow-smoke` はフラグ（値なし）で、省略時は false。
+    #[test]
+    fn req27_package_allow_smoke_flag_parses() {
+        let d = PathBuf::from("proj");
+        assert_eq!(
+            run(&["package", "--project-dir", "proj", "--allow-smoke"]),
+            Command::Package(PackageArgs {
+                project_dir: d,
+                allow_smoke: true
+            })
+        );
+        assert_eq!(
+            err(&["package", "--project-dir", "proj", "--allow-smoke=1"]),
+            ArgsError::FlagTakesNoValue {
+                option: "--allow-smoke"
+            }
+        );
     }
 
     #[test]

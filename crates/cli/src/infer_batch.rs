@@ -807,7 +807,10 @@ mod tests {
                 candidate: 0,
             }),
             Command::Select(SelectArgs { project_dir: p() }),
-            Command::Package(PackageArgs { project_dir: p() }),
+            Command::Package(PackageArgs {
+                project_dir: p(),
+                allow_smoke: false,
+            }),
             infer(InferSource::Text {
                 text: "t".to_string(),
                 id: None,
