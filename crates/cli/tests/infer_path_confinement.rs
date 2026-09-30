@@ -114,7 +114,7 @@ mod unix_only {
     #[test]
     fn req39_valid_inner_package_passes_guard_to_next_check() {
         let sb = Sandbox::new("ok");
-        sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx","kind":"c3"}"#);
         let (code, stdout) = sb.infer(Path::new("pkg"));
         assert_eq!(code, Some(64));
         assert_eq!(stdout, AFTER_GUARD);
@@ -124,7 +124,10 @@ mod unix_only {
     #[test]
     fn req39_onnx_file_parent_traversal_is_rejected() {
         let sb = Sandbox::new("a");
-        sb.make_pkg("pkg", r#"{"onnx_file":"../../outside/secret_marker.txt"}"#);
+        sb.make_pkg(
+            "pkg",
+            r#"{"onnx_file":"../../outside/secret_marker.txt","kind":"c3"}"#,
+        );
         sb.assert_rejected_escapes(Path::new("pkg"));
     }
 
@@ -132,7 +135,10 @@ mod unix_only {
     #[test]
     fn req39_onnx_file_to_outside_model_is_rejected() {
         let sb = Sandbox::new("a2");
-        sb.make_pkg("pkg", r#"{"onnx_file":"../../outside/model.onnx"}"#);
+        sb.make_pkg(
+            "pkg",
+            r#"{"onnx_file":"../../outside/model.onnx","kind":"c3"}"#,
+        );
         sb.assert_rejected_escapes(Path::new("pkg"));
     }
 
@@ -141,7 +147,7 @@ mod unix_only {
     fn req39_onnx_file_absolute_outside_is_rejected() {
         let sb = Sandbox::new("a3");
         let abs = sb.outside().join("model.onnx");
-        let json = format!(r#"{{"onnx_file":{}}}"#, serde_escape(&abs));
+        let json = format!(r#"{{"onnx_file":{},"kind":"c3"}}"#, serde_escape(&abs));
         sb.make_pkg("pkg", &json);
         sb.assert_rejected_escapes(Path::new("pkg"));
     }
@@ -159,7 +165,7 @@ mod unix_only {
     #[test]
     fn req39_model_symlink_to_outside_is_rejected() {
         let sb = Sandbox::new("msym");
-        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx","kind":"c3"}"#);
         fs::remove_file(dir.join("model.onnx")).expect("rm");
         symlink(sb.outside().join("model.onnx"), dir.join("model.onnx")).expect("symlink");
         sb.assert_rejected_escapes(Path::new("pkg"));
@@ -225,7 +231,7 @@ mod unix_only {
     #[test]
     fn req39_pickle_disguised_onnx_is_rejected() {
         let sb = Sandbox::new("pickle");
-        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx","kind":"c3"}"#);
         fs::write(dir.join("model.onnx"), b"\x80\x04\x95\x00\x00\x00.").expect("write");
         let (code, stdout) = sb.infer(Path::new("pkg"));
         assert_eq!(code, Some(64));
@@ -254,7 +260,7 @@ mod unix_only {
     #[test]
     fn req39_oversized_onnx_is_limit_exceeded() {
         let sb = Sandbox::new("bigonnx");
-        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx"}"#);
+        let dir = sb.make_pkg("pkg", r#"{"onnx_file":"model.onnx","kind":"c3"}"#);
         let f = fs::OpenOptions::new()
             .write(true)
             .open(dir.join("model.onnx"))

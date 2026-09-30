@@ -39,6 +39,7 @@ use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::JudgmentError;
 use fandhe_edge_data::eval_freeze::FreezeError;
 use fandhe_edge_guard::format::FormatRejection;
+use fandhe_edge_guard::kind::KindRejection;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
@@ -185,6 +186,17 @@ impl ToErrorReport for FormatRejection {
     }
 }
 
+/// `kind` の許可リスト・構文検査の拒否（REQ-39・TASK-39.2-4・#156）。`reason_code` の固定語彙だけを
+/// 使い、`Display`（許可一覧・入力由来の値を含みうる）は使わない。
+impl ToErrorReport for KindRejection {
+    fn to_error_report(&self) -> ErrorReport {
+        ErrorReport::new(
+            self.exit_code(),
+            format!("kind rejected: {}", self.reason_code()),
+        )
+    }
+}
+
 /// `artifact.json` の解釈エラー。入力値を含めない固定文へ写す（REQ-39）。
 impl ToErrorReport for ArtifactMetaError {
     fn to_error_report(&self) -> ErrorReport {
@@ -253,6 +265,25 @@ impl ToErrorReport for BatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_edge_guard::kind::KindAllowlist;
+
+    /// REQ-39・REQ-21: `kind` の拒否は invalid_input・固定語彙（入力値を含めない）。
+    #[test]
+    fn req39_kind_rejection_maps_to_invalid_input_fixed_message() {
+        let allow = KindAllowlist::supported();
+        let cases = [
+            ("pt", "kind rejected: unsupported_kind"),
+            ("", "kind rejected: malformed_kind"),
+            ("c3; rm -rf ~", "kind rejected: malformed_kind"),
+            (&"a".repeat(65), "kind rejected: malformed_kind"),
+        ];
+        for (kind, message) in cases {
+            let rejection = allow.check(kind).expect_err("must be rejected");
+            let report = rejection.to_error_report();
+            assert_eq!(report.code, ExitCode::InvalidInput);
+            assert_eq!(report.message, message);
+        }
+    }
 
     /// REQ-21: 7 種の固定 message の具体値。
     #[test]

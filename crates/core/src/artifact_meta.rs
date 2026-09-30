@@ -1,12 +1,21 @@
-//! 配布パッケージのメタデータ `artifact.json` から `onnx_file` 参照だけを取り出す
-//! 暫定の最小リーダー（REQ-39・TASK-39.4-2・#159）。
+//! 配布パッケージのメタデータ `artifact.json` から `onnx_file` 参照と `kind` だけを取り出す
+//! 暫定の最小リーダー（REQ-39・TASK-39.4-2・#159・TASK-39.2-4・#156）。
 //!
 //! # 位置づけ
 //!
 //! CLI の `infer` が、ガード層で閉じ込めて開いた `artifact.json` のバイト列を渡し、
 //! ONNX ファイルの相対パス（経路検証の対象）を得るために使う。**配布パッケージ形式の
 //! 確定は TASK-28・TASK-32 の担当**であり、本モジュールはスキーマを確定したものではない。
-//! `onnx_file` 以外のフィールドは解釈せず無視する（将来のフィールド追加を妨げない）。
+//! `onnx_file` と `kind` 以外のフィールドは解釈せず無視する（将来のフィールド追加を妨げない）。
+//! `kind` は**必須**（欠落・文字列以外は拒否）。省略を許すと許可リスト検査の迂回路になるため。
+//! `kind` の内容（空・構文違反・許可リスト外）は本モジュールでは判定せず、ガード層の
+//! `KindAllowlist` に一本化する（core は guard に依存しない。判定規則の集約）。
+//!
+//! # 移行（破壊的変更。#156）
+//!
+//! `kind` を持たない既存の `artifact.json` は `infer` で `invalid_input`（64）になる。
+//! 移行手順は、既存の `artifact.json` に `"kind": "<c1|c3|autoregressive>"` を追加すること
+//! （学習ワーカーが出力する `artifact.json` は常に `kind` を持つ）。
 //!
 //! # 信頼境界
 //!
@@ -24,7 +33,7 @@ pub const MAX_ARTIFACT_META_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ArtifactMetaError {
-    /// JSON として不正、または `onnx_file` が欠落・文字列でない。
+    /// JSON として不正、または `onnx_file`・`kind` が欠落・文字列でない。
     Malformed,
     /// `onnx_file` が空文字列、または NUL を含む。
     InvalidOnnxFile,
@@ -44,12 +53,14 @@ impl std::error::Error for ArtifactMetaError {}
 #[derive(Deserialize)]
 struct Raw {
     onnx_file: String,
+    kind: String,
 }
 
 /// `artifact.json` から取り出した ONNX ファイルへの参照（未検証の相対パス文字列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactOnnxRef {
     onnx_file: String,
+    kind: String,
 }
 
 impl ArtifactOnnxRef {
@@ -71,12 +82,19 @@ impl ArtifactOnnxRef {
         }
         Ok(Self {
             onnx_file: raw.onnx_file,
+            kind: raw.kind,
         })
     }
 
     /// 未検証の `onnx_file` 文字列（経路検証の入力にのみ使う）。
     pub fn onnx_file(&self) -> &str {
         &self.onnx_file
+    }
+
+    /// 未検証の `kind` 文字列。ガード層の `KindAllowlist` 検査の入力にのみ使い、
+    /// 検査を通す前に下流（ランタイム・出力）へ渡さない。
+    pub fn kind(&self) -> &str {
+        &self.kind
     }
 }
 
@@ -206,8 +224,9 @@ mod tests {
     #[test]
     fn req39_parse_extracts_onnx_file_and_ignores_unknown() {
         let r =
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"model.onnx","kind":"x","n":1}"#).expect("ok");
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"model.onnx","kind":"c3","n":1}"#).expect("ok");
         assert_eq!(r.onnx_file(), "model.onnx");
+        assert_eq!(r.kind(), "c3");
     }
 
     /// REQ-39: 欠落・型違い・不正 JSON・配列は Malformed。
@@ -215,8 +234,12 @@ mod tests {
     fn req39_parse_rejects_malformed() {
         for b in [
             &br#"{}"#[..],
-            br#"{"onnx_file":1}"#,
-            br#"{"onnx_file":null}"#,
+            br#"{"onnx_file":1,"kind":"c3"}"#,
+            br#"{"onnx_file":null,"kind":"c3"}"#,
+            br#"{"onnx_file":"model.onnx"}"#,
+            br#"{"onnx_file":"model.onnx","kind":1}"#,
+            br#"{"onnx_file":"model.onnx","kind":null}"#,
+            br#"{"onnx_file":"model.onnx","kind":[]}"#,
             b"not json",
             br#"["onnx_file"]"#,
             b"",
@@ -229,19 +252,30 @@ mod tests {
     #[test]
     fn req39_parse_rejects_empty_and_nul() {
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":""}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"","kind":"c3"}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
         assert_eq!(
-            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b"}"#),
+            ArtifactOnnxRef::parse(br#"{"onnx_file":"a\u0000b","kind":"c3"}"#),
             Err(ArtifactMetaError::InvalidOnnxFile)
         );
+    }
+
+    /// REQ-39: `kind` の内容判定は core では行わない（空・構文違反でも Ok。ガード層の責務）。
+    #[test]
+    fn req39_parse_does_not_judge_kind_content() {
+        for k in ["", "c3; rm -rf ~", "PT"] {
+            let json = format!(r#"{{"onnx_file":"model.onnx","kind":"{k}"}}"#);
+            let r = ArtifactOnnxRef::parse(json.as_bytes()).expect("ok");
+            assert_eq!(r.kind(), k);
+        }
     }
 
     /// REQ-39: エラー文言に入力値を含めない。
     #[test]
     fn req39_error_display_has_no_input_value() {
-        let e = ArtifactOnnxRef::parse(br#"{"onnx_file":1,"secret":"../../etc"}"#).unwrap_err();
+        let e = ArtifactOnnxRef::parse(br#"{"onnx_file":1,"kind":"c3","secret":"../../etc"}"#)
+            .unwrap_err();
         assert!(!e.to_string().contains("etc"));
     }
 

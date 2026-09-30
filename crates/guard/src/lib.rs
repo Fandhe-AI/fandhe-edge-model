@@ -13,10 +13,10 @@
 //!   CLI 引数への組み込みは TASK-39.4-2（#159）で実装済み
 //! - [`package`]: パッケージ単位の閉じ込め（`--package` は workspace 配下、`onnx_file` 等の
 //!   メンバーはパッケージ配下かつ workspace 配下。TASK-39.4-2・#159）。実装済み
-//! - [`kind`]: `kind` 値の許可リスト判定（TASK-39.2-3・#155）。実装済み。CLI への統合は #156 で未着手
+//! - [`kind`]: `kind` 値の許可リスト判定（TASK-39.2-3・#155）。実装済み。`infer` の `artifact.json` への CLI 統合は #156 で済み（`register`・`train` は #136／TASK-33.x）
 //! - [`version_ledger`]: 版管理台帳（版 ID・sha256・作成時刻の記録と取得。TASK-39.3-1・#167）。実装済み（メモリ上のみ）。
 //!   ロールバックと復元後のハッシュ一致検証は TASK-39.3-2（#168）、永続化は未着手
-//! - 未着手（後続 TASK）: CLI への統合（TASK-39.2-4・#156）・資源の上限（TASK-39.5）・
+//! - 未着手（後続 TASK）: `register`・`train` への CLI 統合（#136）・資源の上限（TASK-39.5）・
 //!   完全性と版（`kind_version` の許可リストを含む。TASK-39.6）
 
 pub mod format;
