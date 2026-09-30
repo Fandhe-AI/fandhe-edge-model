@@ -183,7 +183,7 @@
       {
         "name": "const-oid",
         "version": "0.10.2",
-        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（digest の推移的依存）"
+        "basis": "dependency-policy.md「承認済みの依存」の sha2 =0.11.0（2026-09-27 承認）の推移的依存（digest 経由。Cargo.lock で確認。同節に個別列挙はないが親の承認に包含）。親: sha2"
       }
     ]
   },
@@ -274,22 +274,22 @@
       {
         "name": "iniconfig",
         "version": "2.3.0",
-        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+        "basis": "coding-python.md「ツール」に記載の 2026-09-27 ユーザー承認済み pytest==9.1.1 の推移的依存（親の承認に包含。uv.lock で確認）。親: pytest"
       },
       {
         "name": "packaging",
         "version": "26.3",
-        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+        "basis": "coding-python.md「ツール」に記載の 2026-09-27 ユーザー承認済み pytest==9.1.1 の推移的依存（親の承認に包含。uv.lock で確認）。親: pytest"
       },
       {
         "name": "pluggy",
         "version": "1.6.0",
-        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+        "basis": "coding-python.md「ツール」に記載の 2026-09-27 ユーザー承認済み pytest==9.1.1 の推移的依存（親の承認に包含。uv.lock で確認）。親: pytest"
       },
       {
         "name": "pygments",
         "version": "2.21.0",
-        "basis": "main 76239cf 時点の lock から取り込み。個別の承認記録は未確認（要オーナー確認）（pytest の推移的依存）"
+        "basis": "coding-python.md「ツール」に記載の 2026-09-27 ユーザー承認済み pytest==9.1.1 の推移的依存（親の承認に包含。uv.lock で確認）。親: pytest"
       }
     ]
   }

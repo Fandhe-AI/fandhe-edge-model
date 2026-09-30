@@ -183,7 +183,10 @@ def load_ledger(root: Path) -> dict[str, dict[str, dict[tuple[str, str], dict[st
                     for layer in layers:
                         _nonempty_str(layer, "layers")
                 else:
-                    _nonempty_str(entry["basis"], "basis")
+                    basis = _nonempty_str(entry["basis"], "basis")
+                    # 承認記録が未確認と明記された basis を承認済みとして通さない（fail-closed）
+                    if "未確認" in basis or "要オーナー確認" in basis:
+                        raise InputError("ledger basis states the approval record is unconfirmed")
                 key = (norm_py(name) if eco == "pypi" else name, version)
                 if key in table:
                     raise InputError(f"ledger has a duplicate entry in {eco}.{kind}")

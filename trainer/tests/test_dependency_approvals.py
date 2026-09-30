@@ -244,6 +244,9 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], object]] = {
     "duplicate": lambda g: g["cargo"]["direct"].append(dict(g["cargo"]["direct"][0])),
     "missing-basis": lambda g: g["cargo"]["locked"][0].pop("basis"),
     "missing-section": lambda g: g.pop("pypi"),
+    "unconfirmed-basis": lambda g: g["cargo"]["locked"][0].update(
+        basis="個別の承認記録は未確認（要オーナー確認）"
+    ),
 }
 
 
