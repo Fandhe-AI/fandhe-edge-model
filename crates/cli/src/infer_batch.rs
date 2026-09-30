@@ -705,25 +705,31 @@ where
 {
     emit_infer_single_inner(
         out,
-        io,
-        options,
         pipeline,
-        id,
-        text,
+        SingleCall {
+            io,
+            options,
+            id,
+            text,
+        },
         limits,
         StallPolicy::TerminateProcess,
     )
 }
 
+/// 単件推論 1 回分の入力（[`emit_infer_single_inner`] の引数をまとめたもの）。
+pub(crate) struct SingleCall<'a> {
+    pub(crate) io: &'a IoSchema,
+    pub(crate) options: &'a [Choice],
+    pub(crate) id: &'a str,
+    pub(crate) text: &'a str,
+}
+
 /// [`emit_infer_single_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_infer_single_inner<W, P, B>(
     out: &mut W,
-    io: &IoSchema,
-    options: &[Choice],
     pipeline: Arc<InferencePipeline<P, B>>,
-    id: &str,
-    text: &str,
+    call: SingleCall<'_>,
     limits: BatchLimits,
     policy: StallPolicy,
 ) -> io::Result<ExitCode>
@@ -732,6 +738,12 @@ where
     P: Preprocessor + Send + Sync + 'static,
     B: ScoringBackend + Send + Sync + 'static,
 {
+    let SingleCall {
+        io,
+        options,
+        id,
+        text,
+    } = call;
     let input = match InferInput::from_text(id, text, io) {
         Ok(input) => input,
         Err(e) => return emit_error_report(out, &infer_input_error_report(&e)),
