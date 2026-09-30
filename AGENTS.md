@@ -52,7 +52,16 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 実機確認は `scripts/sandbox-run.sh` を macOS 実機（Apple Silicon・`/usr/bin/sandbox-exec`）で**人が手動実行**する。sandbox の外で先に `cargo build` と `make py-sync` を済ませ、定義ファイルとデータを用意する。例: `scripts/sandbox-run.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> --candidates 1 --smoke`
 - 既定の `make test` に含まれる `crates/cli/tests/sandbox_run_script.rs` は偽の launcher を使うテストハーネスで、実際の通信遮断は行わない。実機の証拠にはならない（証拠種別: テストハーネス）
 - 実バイナリは TASK-33.1-2（#136）の完了まで `register` で `runtime_error`(70) になる。完走を装っていないことの確認に留まる
-- 拒否ログの監視と 0 件判定は TASK-38.1-2（#163）、陽性対照は TASK-38.2 の担当
+- 陽性対照（sandbox 下で curl を実行して拒否の検出を確かめる）は TASK-38.2 の担当
+
+#### 拒否ログの監視・集計（REQ-38・TASK-38.1-2・#163）
+
+- 実機確認は `scripts/sandbox-monitor.sh --definition <定義> --project-dir <未作成の dir> --out-dir <空の dir> [--candidates N] [--smoke]` を macOS 実機で**人が手動実行**する（前提は `sandbox-run.sh` と同じ）。`log stream` を実行の前に開始し後に止め（`log show` では Sandbox の拒否ログが取れない。PoC-16）、`scripts/sandbox_deny_report.py`（標準ライブラリのみ。最低版は Python 3.9。macOS 標準の `/usr/bin/python3`〔Xcode CLT〕が 3.9 のことが多いため。監視スクリプトが前提確認で版を検証し、満たさなければ判定不能(70)にする。集計器は 3.9 の文法で書き、テストで `ast.parse(feature_version=(3, 9))` により文法を検査する）が操作トークン（`network*` で始まる操作）で通信拒否を機械判定する。部分文字列 `network` では判定しない（PoC-16 の誤検出の回避）
+- 帰属と件数: 本ツール起因かは PID で判定し（`run.meta.json` の `process_pids` に PID が含まれる場合のみ tool。PID は `pgrep -g` で工程グループを列挙して採取し、ps の列幅に依存しない。名前は根拠にせず出力ラベルの正規化にだけ使う）、最終の終了コードは `decide()` の優先順（判定不能 70 > run の 70 > 10 > 12 > run のその他）で決める。拒否件数は 70 でもレポートに残す（`sandbox-run.sh` が工程グループの PID を 0.1 秒間隔で採取して記録する。採取できなかった短命プロセスの拒否は `pending`(12) になる）。集計器は run.meta.json の `exit_code` と実行スクリプトの実際の終了コードが食い違えば判定不能(70)にする。`log` の stdout は `ulimit -f`（RLIMIT_FSIZE）で書き込み時点の容量上限を掛け、stderr は保存しない。停止は TERM → 上限付き待機 → KILL → wait の順で、終了を確認できなければ判定不能(70)にする。通信拒否の件数は重複報告分を合算した発生回数で、レポートのレコードは 1000 件で切り詰める（`network_denials_truncated`）。ログは 1 行ずつ読む
+- 判定と終了コード: 本ツール起因（PID 照合済み）の通信拒否あり `judged_fail`(10)・帰属不明の通信拒否あり `pending`(12)・監視の無効や読めない行・形式外の拒否行（`deny` を含み操作を読み取れない行）・時刻の不整合 `runtime_error`(70。`network_verdict:"undeterminable"`)・拒否 0 件は run の終了コードを伝搬（合格は run も 0 のときのみ）
+- 出力先: `<out-dir>/network_report.json`（件数・通信拒否のレコード。通信先・パス等の生文字列は書かず、固定語彙と salt 付きダイジェストだけ）・`log_stream.ndjson`（生ログ。0600）・`monitor.meta.json`・`run/run.meta.json`。生ログには他アプリのイベントが含まれるため、PR・Issue へは転記せず `network_report.json` の件数を記録する
+- `crates/cli/tests/sandbox_monitor_script.rs` は偽の `log`・偽の launcher と合成 fixture（`fixtures/sandbox_deny_log/`）を使うテストハーネスで、既定の `make test` で実行される。実機の証拠にはならない（証拠種別: テストハーネス）。`evidence_hint` は `requires_human_review` か `test_harness` のみで、Agent は「実機」と確定させない
+- 陽性対照が未実施（`positive_control:"not_run"`）の間は、拒否 0 件の結果で「検出手段が機能する」とは言えない。TASK-38.2 と組み合わせて初めて 0 件の判定が有効になる
 
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 

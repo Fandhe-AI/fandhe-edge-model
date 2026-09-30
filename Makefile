@@ -336,10 +336,10 @@ else
 endif
 
 .PHONY: py-fmt
-py-fmt: ## ruff format で学習ワーカーのソースを整形する（書き換える）
+py-fmt: ## ruff format で学習ワーカー・scripts/ の Python を整形する（書き換える）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff format .
+	uv run --locked --directory $(PY_DIR) ruff format . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt をスキップ"
 endif
@@ -348,7 +348,7 @@ endif
 py-fmt-check: ## ruff format --check（整形差分の検出。書き換えない）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff format --check .
+	uv run --locked --directory $(PY_DIR) ruff format --check . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt-check をスキップ"
 endif
@@ -357,7 +357,7 @@ endif
 py-lint: ## ruff check（学習ワーカーの lint ゲート。S ルールで危険な逆シリアル化等を検出）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff check .
+	uv run --locked --directory $(PY_DIR) ruff check . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-lint をスキップ"
 endif

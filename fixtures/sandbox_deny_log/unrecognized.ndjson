@@ -1,0 +1,2 @@
+Filtering the log data using "process == \"kernel\" AND eventMessage CONTAINS \"deny\""
+{"eventMessage": "deny weird network format without pattern", "processImagePath": "/kernel", "timestamp": "2026-09-29 10:00:00.000000+0900", "messageType": "Default"}

@@ -1,0 +1,2 @@
+Filtering the log data using "process == \"kernel\" AND eventMessage CONTAINS \"deny\""
+{"eventMessage": "deny(1) unknown-layout entry without the usual prefix", "processImagePath": "/kernel", "timestamp": "2026-09-29 10:00:00.000000+0900", "messageType": "Default"}
