@@ -30,8 +30,9 @@
 //! - モデルの読み込み経路の閉じ込め（`safe_join` 相当）は呼び出し側（ガード層。REQ-39）の責務
 //! - sha256 不一致・破損・上限超過・I/O 失敗は「除外」にせず [`ScreeningError`] で全体を止める
 //!   （fail-closed。REQ-39）
-//! - 語彙ファイル超過構成の除外（TASK-30.3・#125）は別 TASK。[`ExclusionReason`] は
-//!   `#[non_exhaustive]` で、後からバリアントを足せる
+//! - 語彙ファイル超過構成の除外（TASK-30.3・#125）は [`crate::vocab_exclusion`] が持つ。
+//!   [`ExportConfig`] は [`ModelKind`]（C1・C3）を必須とし Qwen 語彙流用の構成を表せないため、
+//!   本モジュールへは相乗りしない
 
 use crate::onnx::{ModelKind, OnnxBackend, OnnxLoadError, load_pipeline};
 use crate::pipeline::{
