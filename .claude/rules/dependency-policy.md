@@ -28,6 +28,7 @@
 | `sha2` | `=0.11.0` | 正準化ハッシュ（sha256）の計算。PoC-16 の `shasum` 子プロセス起動を置き換え、OS・外部コマンドに依存させない | 共通コア（TASK-15.5・REQ-15） | MIT OR Apache-2.0 | 2026-09-27 オーナー承認 |
 | `unicode-normalization` | `=0.1.22` | 矛盾検出の入力を NFKC 正規化し、学習ワーカー（Python `unicodedata`）の共通正規化規則と一致させる | データ契約（TASK-16.2-2・#42・REQ-16）・推論ランタイム（バイト前処理の NFKC 正規化。`crates/runtime`・TASK-32.1-1・#112・REQ-32） | MIT OR Apache-2.0（crate の表記は旧式の `MIT/Apache-2.0`） | 2026-09-28 オーナー承認（当初 `=0.1.25` で承認し、Unicode 版を学習ワーカーと揃えるため同日 `=0.1.22` へ変更を承認）。推論ランタイム層への配置は Issue #112 コメント 2026-09-29 に承認記録あり |
 | `rustix`（`default-features = false`・features `fs`・`alloc`・`std`） | `=1.1.5` | ディレクトリ fd 起点の `openat`（`O_NOFOLLOW`）・`fstat`・`F_GETPATH`。std に openat 相当が無く、`unsafe` の FFI を自前で持たずに、経路の閉じ込めの検証後の差し替え（TOCTOU）を塞ぐため | ガード層（`crates/guard`。TASK-39.4-1・#158・REQ-39。Linux・macOS 限定の target 依存） | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 2026-09-29 オーナー承認（`std` feature は `rustix::fd` を `std::os::fd` と同一の型にして `File` へ変換するために追加） |
+| `libc`（既定 features） | `=0.2.189` | libproc の `proc_pidinfo` と `proc_taskinfo`・`proc_bsdshortinfo` の宣言。setuid の `/bin/ps` が `sandbox-exec` 下で起動できない（#327）ため、macOS の RSS を libproc で直接読む。宣言・構造体の配置を自前の `extern "C"` で再定義しないための選択 | ガード層（`crates/guard`。TASK-39.5-2・#171・#329・REQ-39。macOS 限定の target 依存。`unsafe` は `proc_pidinfo` 呼び出しの 1 関数に限定） | MIT OR Apache-2.0 | 2026-10-01 オーナー承認（rustix の推移的依存として lock に既存の版を直接依存へ昇格。lock の版は不変） |
 
 承認時に確認した推移的依存（2026-09-27 時点の crates.io。証拠種別: 一次情報の調査）:
 
@@ -40,6 +41,7 @@
 - `unicode-normalization`（2026-09-28 承認。証拠種別: 一次情報の調査〔crates.io・GitHub・crate のソース〕）: 推移的依存は `tinyvec`（`Zlib OR Apache-2.0 OR MIT`。`alloc` feature のみ）の 1 件。`build.rs`・C/C++ のネイティブビルド・外部ダウンロード・プリビルドバイナリなし（正規化テーブルは事前生成の静的テーブル）。0.1.22 は 2022-09-16 公開・yank なし、unicode-rs が継続保守。配布サイズへの影響は数十〜百数十 KB 程度（推定）で、推論の 1 件あたりの経路には入らない
 - 版は Unicode のバージョンで選ぶ: `unicode-normalization` 0.1.22 は `UNICODE_VERSION = (15, 0, 0)`、学習ワーカーの Python 3.12（`trainer/.python-version`）の `unicodedata.unidata_version` も 15.0.0 で、NFKC の結果が文字単位で一致する（0.1.23 は 15.1.0、0.1.24 は 16.0.0、0.1.25 は 17.0.0 のため採用しない）。両側の Unicode 版が一致することはテストで固定し、Python または本 crate の版を上げる場合は両者の Unicode 版を揃えて改めて承認を得る（2026-09-28 オーナー判断）
 - `rustix`（2026-09-29 承認。証拠種別: 一次情報の調査〔`Cargo.lock`・crate のソース〕）: `Cargo.lock` で確定した版は rustix 1.1.5。推移的依存は Linux が `bitflags` 2.13.2・`linux-raw-sys` 0.12.1（既定の linux_raw バックエンドで libc 不要）、macOS が `bitflags`・`libc`（既存の lock 版）・`errno` 0.3.14。Windows 向けの `windows-sys`・`windows-link` は `errno` の target 依存として lock に載るが、guard は Linux・macOS 限定の target 依存のため Windows ではビルドされない。`build.rs` は機能検出のみで、C/C++ のビルドもプリビルドバイナリもない。配布サイズへの影響は数十〜百数十 KB 程度（推定）で、推論の 1 件あたりの経路には入らない
+- `libc`（2026-10-01 承認。証拠種別: 一次情報の調査〔`Cargo.lock`・crate のソース・crates.io API〕）: 0.2.189 は 2026-07-21 公開・yank なし、rust-lang が保守。推移的依存は無い（`rustc-std-workspace-core` は std 自体のビルド用の optional）。`build.rs` は cfg 検出のみで、C/C++ のビルドもプリビルドバイナリもない。既に rustix 経由でリンクされているため配布サイズの増分はほぼない（推定）。推論の 1 件あたりの経路には入らない
 
 ## 事前学習済み重み・外部データ
 
