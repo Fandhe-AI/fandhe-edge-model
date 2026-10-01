@@ -1,0 +1,2 @@
+Filtering the log data using "process == \"kernel\" AND eventMessage CONTAINS \"deny\""
+{"eventMessage": "System Policy: SomeOtherApp(777) deny(1) file-read-data /synthetic/path/other-app.dat", "processImagePath": "/kernel", "timestamp": "2026-09-29 10:00:00.000000+0900", "messageType": "Default"}

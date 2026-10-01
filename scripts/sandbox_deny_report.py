@@ -21,7 +21,9 @@ REQ-38・TASK-38.1-2・#163。手法の出典は PoC-16（`log stream` を実行
 出力: stdout に JSON 1 行（REQ-33。固定の文字列と件数だけ。利用者の値は出さない）、
 `--report-out` に詳細レポート。終了コードは 7 種（0・10・11・12・20・64・70。REQ-21）。
 
-帰属（本ツール起因か）の根拠: 第一の根拠は PID。拒否行 `Sandbox: <プロセス名>(<pid>) deny(...)` の
+帰属（本ツール起因か）の根拠: 第一の根拠は PID。拒否行
+`Sandbox: <プロセス名>(<pid>) deny(...)`（同じ構造の `System Policy:` 形式も同様に扱う。
+Issue #331）の
 PID が `run.meta.json` の `process_pids`（`sandbox-run.sh` が工程のプロセスグループから
 0.1 秒間隔で採取した PID。sandbox の内側で本ツールが起動したプロセスの集合）に含まれれば tool。
 プロセス名は根拠にしない（Python の版・実行ファイル名は環境で変わり、固定の許可リストでは
@@ -110,10 +112,13 @@ CODE_NAMES = {
 # 出力する `process` ラベルの固定語彙への正規化（帰属の根拠ではない）。`python3` と任意の `.N`
 # （`python3.11`・`python3.13` 等）を受け付け、`python3-evil` のような別名は `other` にする
 TOOL_NAME_RE = re.compile(r"^(?:sandbox-exec|fandhe-edge|python(?:3(?:\.\d+)?)?|Python|sh|bash)$")
-# `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> [対象]`。プロセス名は括弧を含みうるため
+# `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> [対象]`。実機では同じ構造の
+# `System Policy: ...` 形式の拒否行も出る（Issue #331）。接頭辞は固定の 2 種に限り、任意の
+# 接頭辞は受け付けない（未知の形式は判定不能のまま。fail-closed）。プロセス名は括弧を含みうるため
 # `(<数字>) deny(` を右側から照合する（貪欲な `.+` の後ろ向き探索。行長は事前に制限済み）
 EVENT_RE = re.compile(
-    r"^(?:(\d+) duplicate reports? for )?Sandbox: (.+)\((\d+)\) deny\((\d+)\) (\S+)(?: (.*))?$",
+    r"^(?:(\d+) duplicate reports? for )?(Sandbox|System Policy): "
+    r"(.+)\((\d+)\) deny\((\d+)\) (\S+)(?: (.*))?$",
     re.DOTALL,
 )
 # 「拒否行」の判別子（唯一の定義）。語境界の `deny` で、`deny(1)`・`deny` は拒否行、`denied` 等は
@@ -201,15 +206,16 @@ def target_digest(salt: bytes, text: str) -> str:
     return h[:DIGEST_HEX_LEN]
 
 
-def event_key(proc: str, pid: str, deny_n: str, op: str, target: str | None) -> bytes:
+def event_key(prefix: str, proc: str, pid: str, deny_n: str, op: str, target: str | None) -> bytes:
     """同一拒否イベントの識別規則（唯一の定義）。
 
-    `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> <対象>` の全要素が一致する元の行と
+    `<接頭辞>: <プロセス名>(<pid>) deny(<n>) <操作> <対象>` の全要素（接頭辞 `Sandbox` /
+    `System Policy` を含む）が一致する元の行と
     `N duplicate reports for` の要約行を同一イベントとみなす（要約行は元の行より後に出る。
     要約行にはイベント ID・時刻が無く、元の行と時刻も異なるため）。キーはメモリ上だけで使い、
     ダイジェスト化して保持する（対象文字列を保持しない）。
     """
-    raw = "\x00".join((proc, pid, deny_n, op, target or ""))
+    raw = "\x00".join((prefix, proc, pid, deny_n, op, target or ""))
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).digest()
 
 
@@ -324,12 +330,12 @@ def classify(
             # 拒否行なのに操作を読み取れない（ログ形式の変化等）。`network` を含むか否かで分けず、
             # 「0 件」側へ倒さないため判定不能にする（fail-closed。REQ-38）。本文は例外へ含めない
             raise Undeterminable("log stream contains a deny line in an unknown format")
-        dup, proc, pid, deny_n, op, target = m.groups()
+        dup, prefix, proc, pid, deny_n, op, target = m.groups()
         dup_n = int(dup) if dup is not None else 0
         counts["duplicate_reports"] += dup_n
         if not op.startswith("network"):
             continue
-        key = event_key(proc, pid, deny_n, op, target)
+        key = event_key(prefix, proc, pid, deny_n, op, target)
         claimed = False
         claimed_control: bool | None = None
         if dup is not None:

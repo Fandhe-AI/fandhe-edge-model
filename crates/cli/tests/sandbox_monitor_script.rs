@@ -1562,3 +1562,123 @@ fn req38_control_override_hint_survives_early_abort() {
     assert_eq!(o.code, Some(70), "{}", o.stdout);
     has(&o, "\"evidence_hint\": \"test_harness\"");
 }
+// ---- `System Policy:` 形式の拒否行（Issue #331。合成データによるテストハーネス） ----
+
+/// 非通信操作の `System Policy:` 拒否行（他プロセスの `file-read-data`）が監視窓に入っても、
+/// 判定不能(70)にならず run の終了コード（0）を伝搬する（REQ-38・#331）。
+#[test]
+fn req38_system_policy_non_network_deny_is_ignored_not_undeterminable() {
+    let e = Env::new();
+    // 陽性対照の拒否（detected のため必要）の後ろに、fixture と同形の非通信行を置く
+    let stream = write_stream(
+        &e.dir,
+        &[
+            MDNS_DENY,
+            "System Policy: SomeOtherApp(777) deny(1) file-read-data /synthetic/path/other-app.dat",
+        ],
+    );
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta(0, T1, T2),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"deny_events\": 2");
+    has(&o, "\"network_deny_events\": 0");
+    has(&o, "\"unattributed_network_deny_events\": 0");
+}
+
+/// `System Policy:` の `network*` 拒否は `Sandbox:` と同じ規則で帰属・件数に反映される。
+/// 元の行 1 + 重複要約 2 で発生回数 3（二重計上しない）。PID 一致で judged_fail(10)、
+/// 不一致で pending(12)、陽性対照 PID なら positive_control（REQ-38・#331）。
+#[test]
+fn req38_system_policy_network_deny_is_attributed_like_sandbox() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("system_policy_network.ndjson"),
+        Some(&meta_with_pids(0, T1, T2, "[5001]")),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(10), "{}", o.stdout);
+    has(&o, "\"deny_events\": 2");
+    has(&o, "\"network_deny_events\": 3");
+    has(&o, "\"tool_network_deny_events\": 3");
+    let o = run_report(
+        &e.dir,
+        &fixture("system_policy_network.ndjson"),
+        Some(&meta_with_pids(0, T1, T2, "[1]")),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"unattributed_network_deny_events\": 3");
+    let stream = write_stream(
+        &e.dir,
+        &["System Policy: curl(4242) deny(1) network-outbound 192.0.2.9:443"],
+    );
+    let o = run_report_control(
+        &e.dir,
+        &stream,
+        &meta_with_pids(0, T1, T2, "[5001]"),
+        &control_meta("4242", "6", T0, T0),
+    );
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"positive_control_network_deny_events\": 1");
+}
+
+/// 接頭辞が違う行同士は同一イベントとして照合しない（`Sandbox:` の元の行 + `System Policy:` の
+/// 要約行は照合されず 1 + 1 + 2 回の 4 回に数える。過大側＝
+/// fail-closed 方向。REQ-38・#331）。
+#[test]
+fn req38_prefix_mismatch_duplicate_is_not_merged() {
+    let e = Env::new();
+    let stream = write_stream(
+        &e.dir,
+        &[
+            "Sandbox: zz(9) deny(1) network-outbound 10.0.0.1:1",
+            "2 duplicate reports for System Policy: zz(9) deny(1) network-outbound 10.0.0.1:1",
+        ],
+    );
+    let o = run_report(&e.dir, &stream, Some(&meta(0, T1, T2)), T0, T3);
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    has(&o, "\"network_deny_events\": 4");
+}
+
+/// `System Policy:` で始まるが構造を欠く deny 行は判定不能(70)のまま。生文字列は出さない
+/// （REQ-38・#331）。
+#[test]
+fn req38_system_policy_unrecognized_deny_line_is_undeterminable() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("system_policy_unrecognized.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(70), "{}", o.stdout);
+    has(&o, "log stream contains a deny line in an unknown format");
+    assert!(!o.stdout.contains("unknown-layout"), "{}", o.stdout);
+}
+
+/// `System Policy:` 形式でもレポート・stdout に通信先・プロセス名の生文字列を出さない（P0。#331）。
+#[test]
+fn req38_system_policy_report_never_contains_raw_log_strings() {
+    let e = Env::new();
+    let o = run_report(
+        &e.dir,
+        &fixture("system_policy_network.ndjson"),
+        Some(&meta(0, T1, T2)),
+        T0,
+        T3,
+    );
+    assert_eq!(o.code, Some(12), "{}", o.stdout);
+    let report = fs::read_to_string(e.dir.join("report.json")).expect("report");
+    for needle in ["secret-host", "example.invalid", "8443", "PrivateAppName"] {
+        assert!(!report.contains(needle), "report leaked {needle}");
+        assert!(!o.stdout.contains(needle), "stdout leaked {needle}");
+    }
+}

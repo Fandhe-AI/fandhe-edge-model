@@ -20,3 +20,4 @@
 - `unrecognized_no_network`: `network` を含まない形式外の拒否行（判定不能になることの回帰。合成データ）
 - `tool_bigpid`: 7 桁の PID を持つ本ツール起因の拒否行（偽の `pgrep` が同じ PID を返すテストで使う。合成データ）
 - 陽性対照の拒否行（PoC-16 実測の形 `Sandbox: curl(<pid>) deny(1) network-outbound /private/var/run/mDNSResponder` を模した合成データ。TASK-38.2・#164）は、テストが偽の `log` から出す行と `crates/cli/tests/sandbox_monitor_script.rs` 内の合成ストリームで持ち、ファイルとしては追加していない
+- `system_policy_non_network`・`system_policy_network`・`system_policy_unrecognized`: `System Policy: <プロセス名>(<pid>) deny(<n>) <操作> [対象]` 形式の拒否行（Issue #331 で実機に出ると観測された形を模した**合成データ**。実機の生ログの転記ではない。証拠種別: テストハーネス。TASK-38.1-2・#163）。`non_network` は非通信操作（`file-read-data`）、`network` は `network-outbound` と重複要約行（発生回数 3）、`unrecognized` は `(<pid>) deny(<n>)` の構造を欠く行（判定不能の回帰）
