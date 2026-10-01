@@ -181,15 +181,55 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         }
     }
 
+    // 5b. acceptance（省略可能。#328）。キーがあれば object で、
+    // `min_accuracy_bp` が必須の u32。`null` は未定義扱いにせず型エラーにする。
+    if let Some(acceptance_value) = root.get("acceptance") {
+        let acceptance_object = match acceptance_value.as_object() {
+            None => {
+                return Some(DefinitionError::TypeMismatch {
+                    field: FieldPath::Acceptance,
+                    expected: ExpectedType::Object,
+                    actual: json_type(acceptance_value),
+                });
+            }
+            Some(o) => o,
+        };
+        match acceptance_object.get("min_accuracy_bp") {
+            None => {
+                return Some(DefinitionError::MissingField {
+                    field: FieldPath::AcceptanceMinAccuracyBp,
+                });
+            }
+            Some(bp_value) => {
+                if bp_value.as_u64().is_none_or(|v| v > u64::from(u32::MAX)) {
+                    return Some(DefinitionError::TypeMismatch {
+                        field: FieldPath::AcceptanceMinAccuracyBp,
+                        expected: ExpectedType::UnsignedInt32,
+                        actual: json_type(bp_value),
+                    });
+                }
+            }
+        }
+        for key in acceptance_object.keys() {
+            if key != "min_accuracy_bp" {
+                return Some(DefinitionError::UnknownField {
+                    parent: FieldPath::Acceptance,
+                    name: key.clone(),
+                });
+            }
+        }
+    }
+
     // 6. トップレベルの未知キー（`serde_json::Map` は既定で `BTreeMap` の
     // ためキー順走査は決定的）。
-    const KNOWN_TOP_LEVEL_KEYS: [&str; 6] = [
+    const KNOWN_TOP_LEVEL_KEYS: [&str; 7] = [
         "schema",
         "name",
         "version",
         "judgment_type",
         "options",
         "io",
+        "acceptance",
     ];
     for key in root.keys() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {

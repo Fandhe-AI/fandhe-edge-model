@@ -25,7 +25,9 @@
 //!   （`latency_limit` モジュール）。定義ファイルへの取り込みは未実装
 //! - 利用者が設定する容量上限の定義ファイル・CLI 引数への取り込みは未実装（入出力契約の変更を伴う）
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
-//!   `Undeterminable` へ渡す変換を含む）、CLI・JSON 出力への配線は TASK-33.x の責務
+//!   `Undeterminable` へ渡す変換を含む）と JSON 出力への配線は、CLI の `package` 工程
+//!   （`crates/cli/src/stages/package.rs`。合否基準の接続は #328）で接続済み。本モジュールは
+//!   変換済みの [`PackageQualityJudgment`] を受け取り、上限超過を合否より優先する規則だけを担う
 //! - 待ち時間の p95 は `latency_report::LatencyReport::p95_ns()`（切り上げ済み。#128）から得る。
 //!   計測ハーネスは #127。利用者が設定する待ち時間上限の定義ファイルへの取り込み（範囲検証を含む）・CLI の `package` / `infer` への配線と
 //!   JSON 出力（TASK-33.x）は未実装。本モジュールは p95 と上限を数値（ナノ秒）で受け取る

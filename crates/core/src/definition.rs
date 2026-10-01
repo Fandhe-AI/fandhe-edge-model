@@ -37,8 +37,15 @@
 //! フィールド構成は PoC-19（`03-poc/model-lifecycle/definitions/catalog_*.json`）の
 //! カタログ形式に合わせる（TASK-15.5 での再利用のため）。PoC-16 の
 //! `core-cli-vertical-slice/core/src/definition.rs` は選択口（学習・選定）の
-//! 入口契約であり `data`・`selection`・`acceptance` を含むが、それらはデータ契約・
-//! 学習ワーカー層（TASK-16.x 以降）の関心事のためここには持ち込まない。
+//! 入口契約であり `data`・`selection`・`acceptance` を含むが、`data`・`selection` は
+//! データ契約・学習ワーカー層（TASK-16.x 以降）の関心事のためここには持ち込まない
+//! （`acceptance` は下記のとおり `min_accuracy_bp` だけを取り込む）。
+//!
+//! # 合否基準（#328・REQ-15・REQ-24・REQ-33）
+//! `acceptance` のうち `min_accuracy_bp`（正解率の下限。1 万分率の整数）だけを
+//! 省略可能な欄として取り込む。`package` の合否判定（judgment）が参照する基準で、
+//! 欄が無い定義は従来どおり「基準未定義」であり、正準化ハッシュも変わらない
+//! （`Definition.acceptance` は `None` のとき直列化しない）。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -104,6 +111,48 @@ pub enum InputRepresentation {
     Bytes,
 }
 
+/// `acceptance.min_accuracy_bp` の上限（1 万分率で 100%）。
+pub const MAX_MIN_ACCURACY_BP: u32 = 10_000;
+
+/// 合否基準（#328・REQ-15・REQ-24）。`package` の合否判定が評価記録の
+/// 正解率をこの下限と比べる（判定は評価器 `fandhe-edge-eval` の
+/// `acceptance::judge_min_accuracy`。CLI の `package` 工程が呼ぶ）。
+///
+/// `Deserialize` は実装しない。`serde_json::from_str::<Acceptance>` で
+/// 範囲検証（`0..=MAX_MIN_ACCURACY_BP`）を迂回させないため、検証済みの値は
+/// [`Definition::parse`] 経由でのみ作る（`RawDefinition` と同じ流儀）。
+/// 値は定義の正準化ハッシュに含まれるため、`evaluate` の後に基準を書き換える
+/// と評価記録の `definition_sha256` 照合で検出される（REQ-27）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Acceptance {
+    min_accuracy_bp: u32,
+}
+
+impl Acceptance {
+    /// 正解率の下限（1 万分率。`0..=10000` が `parse` により保証済み）。
+    #[must_use]
+    pub fn min_accuracy_bp(&self) -> u32 {
+        self.min_accuracy_bp
+    }
+}
+
+/// [`Acceptance`] の未検証の中間表現（デシリアライズ専用。`parse` 内でのみ使う）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcceptance {
+    min_accuracy_bp: u32,
+}
+
+/// `acceptance` キーがあるのに値が `null` のとき、`Option` の既定動作
+/// （`null` を `None` として黙って受理）にせず型エラーにする。基準の欠落と
+/// 区別し、ハッシュを変えないまま黙って通る経路を作らない（#328）。
+fn deserialize_present_acceptance<'de, D>(d: D) -> Result<Option<RawAcceptance>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RawAcceptance::deserialize(d).map(Some)
+}
+
 /// 入出力のデータ構造（REQ-15）。出力側は `judgment_type`／`options` で
 /// 表現済みのため、ここでは入力表現のみを持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +183,9 @@ pub struct Definition {
     judgment_type: JudgmentType,
     options: Vec<Choice>,
     io: IoSchema,
+    /// 省略可能な合否基準（#328）。`None` は基準未定義で、正準化 JSON にも現れない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance: Option<Acceptance>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -153,6 +205,8 @@ struct RawDefinition {
     judgment_type: JudgmentType,
     options: Vec<Choice>,
     io: IoSchema,
+    #[serde(default, deserialize_with = "deserialize_present_acceptance")]
+    acceptance: Option<RawAcceptance>,
 }
 
 /// 定義ファイル内のフィールドの位置を表すパス（TASK-15.3-2）。
@@ -185,6 +239,10 @@ pub enum FieldPath {
     Io,
     /// `io.input`。
     IoInput,
+    /// `acceptance`（#328）。
+    Acceptance,
+    /// `acceptance.min_accuracy_bp`（#328）。
+    AcceptanceMinAccuracyBp,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -200,6 +258,8 @@ impl std::fmt::Display for FieldPath {
             FieldPath::OptionField { index, field } => write!(f, "options[{index}].{field}"),
             FieldPath::Io => write!(f, "io"),
             FieldPath::IoInput => write!(f, "io.input"),
+            FieldPath::Acceptance => write!(f, "acceptance"),
+            FieldPath::AcceptanceMinAccuracyBp => write!(f, "acceptance.min_accuracy_bp"),
         }
     }
 }
@@ -705,6 +765,22 @@ impl Definition {
             }
         }
 
+        // 合否基準（#328）: 1 万分率の範囲外は判定が成立しないため拒否する。
+        // 型・欠落・未知キーは上の型付きデシリアライズと `diagnose` が扱う。
+        let acceptance = match raw.acceptance {
+            None => None,
+            Some(raw_acceptance) => {
+                if raw_acceptance.min_accuracy_bp > MAX_MIN_ACCURACY_BP {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::AcceptanceMinAccuracyBp,
+                    });
+                }
+                Some(Acceptance {
+                    min_accuracy_bp: raw_acceptance.min_accuracy_bp,
+                })
+            }
+        };
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -712,6 +788,7 @@ impl Definition {
             judgment_type: raw.judgment_type,
             options: raw.options,
             io: raw.io,
+            acceptance,
         })
     }
 
@@ -771,6 +848,12 @@ impl Definition {
     /// 入出力のデータ構造。
     pub fn io(&self) -> &IoSchema {
         &self.io
+    }
+
+    /// 合否基準（#328）。`None` は基準未定義（`package` は `judgment:null` を返す）。
+    #[must_use]
+    pub fn acceptance(&self) -> Option<&Acceptance> {
+        self.acceptance.as_ref()
     }
 
     /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
@@ -1571,5 +1654,135 @@ mod tests {
             assert_eq!(err.reason_code(), expected_reason);
             assert_eq!(err.exit_code(), expected_exit);
         }
+    }
+
+    /// 基準を `acceptance_json` に差し込んだ定義 JSON（#328）。
+    fn with_acceptance(acceptance_json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "acceptance": {acceptance_json}"#),
+            1,
+        )
+    }
+
+    /// REQ-15・#328: 範囲内（0・9500・10000）の基準は読めて値が一致する。
+    #[test]
+    fn req15_issue328_acceptance_min_accuracy_bp_accepts_in_range_values() {
+        for bp in [0_u32, 9500, 10_000] {
+            let def = Definition::parse(&with_acceptance(&format!(
+                r#"{{ "min_accuracy_bp": {bp} }}"#
+            )))
+            .expect("範囲内の基準は受理すべき");
+            assert_eq!(def.acceptance().map(Acceptance::min_accuracy_bp), Some(bp));
+        }
+        let def = Definition::parse(TWO_OPTIONS_JSON).expect("基準なしも受理");
+        assert_eq!(def.acceptance(), None);
+    }
+
+    /// REQ-15・#328: 範囲外は `UnsupportedValue`（64）。メッセージは固定語のみ。
+    #[test]
+    fn req15_issue328_acceptance_rejects_out_of_range_value() {
+        for bp in ["10001", "4294967295"] {
+            let err = Definition::parse(&with_acceptance(&format!(
+                r#"{{ "min_accuracy_bp": {bp} }}"#
+            )))
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                DefinitionError::UnsupportedValue {
+                    field: FieldPath::AcceptanceMinAccuracyBp
+                }
+            ));
+            assert_eq!(
+                err.public_message(),
+                "definition field acceptance.min_accuracy_bp has an unsupported value"
+            );
+            assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+        }
+    }
+
+    /// REQ-15・#328: 型違い・欠落・未知キー・null はすべて型付きエラー（64）。
+    #[test]
+    fn req15_issue328_acceptance_rejects_malformed_shapes() {
+        for bp in ["4294967296", "-1", "0.5", r#""9500""#] {
+            let err = Definition::parse(&with_acceptance(&format!(
+                r#"{{ "min_accuracy_bp": {bp} }}"#
+            )))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DefinitionError::TypeMismatch {
+                        field: FieldPath::AcceptanceMinAccuracyBp,
+                        expected: ExpectedType::UnsignedInt32,
+                        ..
+                    }
+                ),
+                "bp={bp}: {err:?}"
+            );
+        }
+        let err = Definition::parse(&with_acceptance("null")).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Acceptance,
+                expected: ExpectedType::Object,
+                actual: JsonType::Null
+            }
+        ));
+        let err = Definition::parse(&with_acceptance("1")).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::TypeMismatch {
+                field: FieldPath::Acceptance,
+                actual: JsonType::Number,
+                ..
+            }
+        ));
+        let err = Definition::parse(&with_acceptance("{}")).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::MissingField {
+                field: FieldPath::AcceptanceMinAccuracyBp
+            }
+        ));
+        assert_eq!(
+            err.public_message(),
+            "definition field acceptance.min_accuracy_bp is missing"
+        );
+        let err =
+            Definition::parse(&with_acceptance(r#"{ "min_accuracy_bp": 1, "x": 1 }"#)).unwrap_err();
+        assert!(matches!(
+            err,
+            DefinitionError::UnknownField {
+                parent: FieldPath::Acceptance,
+                ..
+            }
+        ));
+    }
+
+    /// REQ-15・#328: 基準なしの正準化 JSON に `acceptance` は現れず（ハッシュ不変）、
+    /// 基準ありはキー順で入る。
+    #[test]
+    fn req15_issue328_acceptance_canonical_json_is_omitted_or_ordered() {
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("parse");
+        assert!(
+            !without
+                .canonical_json()
+                .expect("canon")
+                .contains("acceptance")
+        );
+        let with =
+            Definition::parse(&with_acceptance(r#"{ "min_accuracy_bp": 9500 }"#)).expect("parse");
+        let json = with.canonical_json().expect("canon");
+        assert!(
+            json.contains(r#""acceptance":{"min_accuracy_bp":9500}"#),
+            "{json}"
+        );
+        assert_ne!(
+            without.canonical_hash().expect("hash"),
+            with.canonical_hash().expect("hash")
+        );
+        assert_eq!(without.identity(), with.identity());
     }
 }

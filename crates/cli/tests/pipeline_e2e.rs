@@ -1155,6 +1155,221 @@ mod suite {
         );
     }
 
+    /// 合否基準 `min_accuracy_bp` を足した定義 JSON（#328）。
+    fn acceptance_definition_text(extra: &str) -> String {
+        definition_text().replacen(
+            r#""io":{"input":"bytes"}"#,
+            &format!(r#""io":{{"input":"bytes"}},"acceptance":{extra}"#),
+            1,
+        )
+    }
+
+    fn bp_definition_text(bp: u32) -> String {
+        acceptance_definition_text(&format!(r#"{{"min_accuracy_bp":{bp}}}"#))
+    }
+
+    /// 評価データの入力（`evaluation_jsonl` と同じ順・同じ文字列）。
+    fn evaluation_inputs() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for i in 0..4 {
+            for l in LABELS {
+                out.push((format!("e-{l}-{i}"), format!("{l} evaluation {i}")));
+            }
+        }
+        out
+    }
+
+    /// 基準なしで 7 工程を回し、選定された配布パッケージが評価入力 12 件に返す予測ラベルを得る
+    /// （決定的な偽ワーカー・固定 fixture ONNX の推論。REQ-28 のとおり評価経路と一致する）。
+    fn predicted_evaluation_labels() -> Vec<String> {
+        let env = eval_trained("accpred");
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        env.ok(&PACKAGE);
+        let mut batch = String::new();
+        for (id, input) in evaluation_inputs() {
+            batch.push_str(&format!("{{\"id\":\"{id}\",\"input\":\"{input}\"}}\n"));
+        }
+        std::fs::write(env.work.join("batch.jsonl"), batch).expect("batch");
+        let (code, lines) = env.run(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "batch.jsonl",
+        ]);
+        assert_eq!(code, 0, "{lines}");
+        let labels: Vec<String> = lines
+            .lines()
+            .map(|line| {
+                line.split("\"predicted_label\":\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .expect("predicted label")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(labels.len(), 12, "{lines}");
+        labels
+    }
+
+    /// 正解ラベルを `golds`（評価入力と同じ順）にした評価データと、`definition` を持つプロジェクトを
+    /// `register → inspect → train 0・1 → select` まで進める（学習データ・入力は同じため選定は変わらない）。
+    fn acceptance_env(case: &str, definition: &str, golds: &[String]) -> Env {
+        let env = Env::new(case, false);
+        std::fs::write(env.work.join("def").join("definition.json"), definition)
+            .expect("definition");
+        let mut jsonl = String::new();
+        for ((id, input), gold) in evaluation_inputs().iter().zip(golds) {
+            jsonl.push_str(&format!(
+                r#"{{"id":"{id}","input":"{input}","output":{{"intent":"{gold}"}},"group_id":"g-{id}"}}"#
+            ));
+            jsonl.push('\n');
+        }
+        std::fs::write(env.work.join("def").join("evaluation.jsonl"), jsonl).expect("evaluation");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&SELECT);
+        env
+    }
+
+    /// 予測と異なる（別の）ラベル。
+    fn other_label(label: &str) -> String {
+        LABELS
+            .iter()
+            .find(|l| **l != label)
+            .expect("another label")
+            .to_string()
+    }
+
+    /// REQ-24・REQ-33・#328: 合否基準ありの `package` が、Wilson 95% 区間で pass（exit 0）・
+    /// fail（exit 10）・undeterminable（exit 12）の 3 値を判定項目つき JSON で返す。
+    /// n=12 の区間（手計算）: 12/12 正解は lo≈0.7575、0/12 は hi≈0.2425、6/12 は基準 50% をまたぐ。
+    /// fail・undeterminable でも公開の関門は容量だけで `package/` は公開される。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX）。
+    pub fn package_judges_acceptance_pass_fail_undeterminable() {
+        let predicted = predicted_evaluation_labels();
+
+        // c=12・基準 75%: pass（exit 0）。
+        let env = acceptance_env("accpass", &bp_definition_text(7500), &predicted);
+        env.ok(&EVALUATE_1);
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
+        );
+        assert!(env.project_file("package/artifact.json").is_file());
+
+        // c=0・基準 25%: fail（exit 10）。
+        let wrong: Vec<String> = predicted.iter().map(|p| other_label(p)).collect();
+        let env = acceptance_env("accfail", &bp_definition_text(2500), &wrong);
+        env.ok(&EVALUATE_1);
+        assert_eq!(
+            env.fails(&PACKAGE, 10, "judged_fail"),
+            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
+        );
+        assert!(env.project_file("package/artifact.json").is_file());
+        assert!(!env.project_file("package.staging").exists());
+
+        // c=6・基準 50%: 区間が基準をまたぐため undeterminable（exit 12）。
+        let half: Vec<String> = predicted
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i % 2 == 0 {
+                    p.clone()
+                } else {
+                    other_label(p)
+                }
+            })
+            .collect();
+        let env = acceptance_env("accpend", &bp_definition_text(5000), &half);
+        let evaluated = env.ok(&EVALUATE_1);
+        assert_eq!(
+            number_field(&evaluated, "correct").to_bits(),
+            6.0_f64.to_bits()
+        );
+        assert_eq!(
+            env.fails(&PACKAGE, 12, "pending"),
+            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
+        );
+        assert!(env.project_file("package/artifact.json").is_file());
+    }
+
+    /// REQ-17・REQ-24・#328: 合否基準があっても評価データが無ければ判定不能（exit 12）で、合格扱いにしない。
+    pub fn package_with_acceptance_but_no_evaluation_data_is_undeterminable() {
+        let env = Env::new("accnoeval", false);
+        std::fs::write(
+            env.work.join("def").join("definition.json"),
+            bp_definition_text(0),
+        )
+        .expect("definition");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&SELECT);
+        assert_eq!(
+            env.fails(&PACKAGE, 12, "pending"),
+            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
+        );
+    }
+
+    /// REQ-27・#328: `evaluate` の後に合否基準を書き換えると、評価記録の定義ハッシュが一致せず
+    /// `package` は `invalid_input` で止まり、`package/`・ステージングを作らない
+    /// （評価結果を見てから基準を調整できない）。
+    pub fn package_rejects_acceptance_changed_after_evaluate() {
+        let predicted = predicted_evaluation_labels();
+        let env = acceptance_env("accchange", &bp_definition_text(7500), &predicted);
+        env.ok(&EVALUATE_1);
+        let definition = env.project_file("definition.json");
+        let mut perm = std::fs::metadata(&definition).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&definition, perm).expect("chmod");
+        std::fs::write(&definition, bp_definition_text(7600)).expect("rewrite definition");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-15・#328: 範囲外の基準・未知の欄・`null` を持つ定義は `register` が `invalid_input` で拒否する。
+    pub fn register_rejects_invalid_acceptance() {
+        let cases = [
+            (
+                bp_definition_text(10_001),
+                "definition field acceptance.min_accuracy_bp has an unsupported value",
+            ),
+            (
+                acceptance_definition_text(r#"{"min_accuracy_bp":1,"x":1}"#),
+                "definition field acceptance has an unknown key",
+            ),
+            (
+                acceptance_definition_text("null"),
+                "definition field acceptance has wrong type: expected object, found null",
+            ),
+            (
+                acceptance_definition_text("{}"),
+                "definition field acceptance.min_accuracy_bp is missing",
+            ),
+        ];
+        for (i, (definition, message)) in cases.iter().enumerate() {
+            let env = Env::new(&format!("accbad{i}"), false);
+            std::fs::write(env.work.join("def").join("definition.json"), definition)
+                .expect("definition");
+            assert_eq!(
+                env.fails(
+                    &["register", "--definition", DEF, "--project-dir", "proj"],
+                    64,
+                    "invalid_input"
+                ),
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+        }
+    }
+
     /// REQ-27: 同じ候補への 2 回目の `evaluate` は固定 message の `invalid_input` で、記録は変わらない。
     /// 記録を消しても、台帳の適用ロックが再適用を拒否する。
     pub fn evaluate_twice_is_rejected() {
@@ -1822,6 +2037,22 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_correct_matches_infer_on_package",
             suite::evaluate_correct_matches_infer_on_package,
+        ),
+        (
+            "package_judges_acceptance_pass_fail_undeterminable",
+            suite::package_judges_acceptance_pass_fail_undeterminable,
+        ),
+        (
+            "package_with_acceptance_but_no_evaluation_data_is_undeterminable",
+            suite::package_with_acceptance_but_no_evaluation_data_is_undeterminable,
+        ),
+        (
+            "package_rejects_acceptance_changed_after_evaluate",
+            suite::package_rejects_acceptance_changed_after_evaluate,
+        ),
+        (
+            "register_rejects_invalid_acceptance",
+            suite::register_rejects_invalid_acceptance,
         ),
         (
             "evaluate_twice_is_rejected",

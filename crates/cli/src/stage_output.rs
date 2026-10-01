@@ -11,8 +11,12 @@
 //! # 契約
 //!
 //! - exit 0（`Pass`・`NotDefined`）: core の `PackageReport` を JSON 1 行で stdout へ
-//! - exit ≠ 0（`Fail`・`Undeterminable`・`LimitExceeded`）: 新しい形は作らず、確定済みの
-//!   `{"code","message"}`（`error_report::default_message` の固定語彙）へ流す
+//! - exit 10・12（`Fail`・`Undeterminable`）: 合否基準が定義されているときにだけ生じる結果として、
+//!   `{"code","message"}` に判定項目（`step`・`judgment`・`acceptance_defined`）を足した core の
+//!   `PackageJudgedReport` を JSON 1 行で stdout へ（REQ-21・REQ-33・#328。`message` は
+//!   `error_report::default_message` の固定語彙）
+//! - exit 20（`LimitExceeded`）・不整合の `runtime_error`: 新しい形は作らず、確定済みの
+//!   `{"code","message"}` へ流す
 //!
 //! # evaluate の skipped（REQ-17・REQ-33・TASK-33.3・#140）
 //!
@@ -26,22 +30,43 @@
 //! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`。#136）。
 
 use crate::error_report::{ToErrorReport, default_message, emit_error_report};
-use crate::output::{write_evaluate_report, write_package_report};
+use crate::output::{write_evaluate_report, write_package_judged_report, write_package_report};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::stage_report::{EvaluateReport, PackageReport};
+use fandhe_edge_core::stage_report::{EvaluateReport, PackageJudgedReport, PackageReport};
 use fandhe_edge_data::eval_freeze::{EvalDataState, EvaluateGate, FreezeRecord, evaluate_gate};
 use fandhe_edge_runtime::package_outcome::{PackageOutcome, PackageVerdict};
 use std::io::{self, Write};
 
-/// [`PackageOutcome`] を正常系の [`PackageReport`]、または異常系の [`ErrorReport`] へ写す。
+/// `package` 工程の stdout へ出す JSON の 3 分岐（#328）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageStageOutput {
+    /// exit 0（`Pass`・`NotDefined`）。
+    Report(PackageReport),
+    /// exit 10・12（`Fail`・`Undeterminable`。判定項目つき）。
+    Judged(PackageJudgedReport),
+    /// exit 20 および不整合の `runtime_error`（`{"code","message"}`）。
+    Error(ErrorReport),
+}
+
+impl PackageStageOutput {
+    /// この出力に対応する終了コード。
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            PackageStageOutput::Report(_) => ExitCode::Ok,
+            PackageStageOutput::Judged(report) => report.exit_code(),
+            PackageStageOutput::Error(report) => report.code,
+        }
+    }
+}
+
+/// [`PackageOutcome`] を [`PackageStageOutput`] の 3 分岐へ写す。
 ///
-/// `Ok` を返すのは `verdict` が Pass / NotDefined・`exit_code == ExitCode::Ok`・`breaches` が
-/// 空のときに限る。3 フィールドが不整合なら `runtime_error` の `Err` を返す。`verdict` は
+/// `Report`（exit 0）は `verdict` が Pass / NotDefined・`exit_code == ExitCode::Ok`・`breaches` が
+/// 空のときに限る。3 フィールドが不整合なら `runtime_error` の `Error` を返す。`verdict` は
 /// ワイルドカード無しで網羅し、区分が増えたらコンパイルエラーで気付けるようにする。
-///
-/// # Errors
-/// exit ≠ 0 の区分は `Err(ErrorReport)`（エラー処理ではなく出力形の振り分け）。
-pub fn package_outcome_report(outcome: &PackageOutcome) -> Result<PackageReport, ErrorReport> {
+#[must_use]
+pub fn package_outcome_report(outcome: &PackageOutcome) -> PackageStageOutput {
     // exit_code と verdict は別フィールドで不整合を構築できるため、verdict から期待される
     // 終了コードと一致しない場合は fail-closed で runtime_error へ倒す（上限超過などを
     // exit 0 へ変えない。REQ-21）。
@@ -57,20 +82,26 @@ pub fn package_outcome_report(outcome: &PackageOutcome) -> Result<PackageReport,
         && (outcome.verdict != PackageVerdict::LimitExceeded
             || outcome.exit_code != ExitCode::LimitExceeded);
     if breach_inconsistent || outcome.exit_code != expected {
-        return Err(ErrorReport::new(
+        return PackageStageOutput::Error(ErrorReport::new(
             ExitCode::RuntimeError,
             default_message(ExitCode::RuntimeError),
         ));
     }
     match outcome.verdict {
-        PackageVerdict::Pass => Ok(PackageReport::pass()),
-        PackageVerdict::NotDefined => Ok(PackageReport::acceptance_not_defined()),
-        PackageVerdict::Fail | PackageVerdict::Undeterminable | PackageVerdict::LimitExceeded => {
-            Err(ErrorReport::new(
-                outcome.exit_code,
-                default_message(outcome.exit_code),
-            ))
+        PackageVerdict::Pass => PackageStageOutput::Report(PackageReport::pass()),
+        PackageVerdict::NotDefined => {
+            PackageStageOutput::Report(PackageReport::acceptance_not_defined())
         }
+        PackageVerdict::Fail => PackageStageOutput::Judged(PackageJudgedReport::fail(
+            default_message(ExitCode::JudgedFail).to_string(),
+        )),
+        PackageVerdict::Undeterminable => PackageStageOutput::Judged(
+            PackageJudgedReport::undeterminable(default_message(ExitCode::Pending).to_string()),
+        ),
+        PackageVerdict::LimitExceeded => PackageStageOutput::Error(ErrorReport::new(
+            outcome.exit_code,
+            default_message(outcome.exit_code),
+        )),
     }
 }
 
@@ -84,8 +115,9 @@ pub fn emit_package_outcome<W: Write>(
     outcome: &PackageOutcome,
 ) -> io::Result<ExitCode> {
     match package_outcome_report(outcome) {
-        Ok(report) => write_package_report(out, &report),
-        Err(report) => emit_error_report(out, &report),
+        PackageStageOutput::Report(report) => write_package_report(out, &report),
+        PackageStageOutput::Judged(report) => write_package_judged_report(out, &report),
+        PackageStageOutput::Error(report) => emit_error_report(out, &report),
     }
 }
 
@@ -214,21 +246,21 @@ mod tests {
         );
     }
 
-    /// REQ-21: 不合格・判定不能・上限超過は確定済みの ErrorReport へ流れる。
+    /// REQ-21・REQ-33・#328: 不合格・判定不能は判定項目つき、上限超過は確定済みの ErrorReport。
     #[test]
-    fn req21_non_ok_verdicts_use_error_report() {
+    fn req21_non_ok_verdicts_use_judged_or_error_report() {
         let (code, out) = emit(&[], PackageQualityJudgment::Fail);
         assert_eq!(code, ExitCode::JudgedFail);
         assert_eq!(
             out,
-            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\"}\n"
+            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
         );
 
         let (code, out) = emit(&[], PackageQualityJudgment::Undeterminable);
         assert_eq!(code, ExitCode::Pending);
         assert_eq!(
             out,
-            "{\"code\":\"pending\",\"message\":\"result is pending\"}\n"
+            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
         );
 
         let breach = LimitBreach::Capacity {
@@ -253,10 +285,12 @@ mod tests {
             PackageQualityJudgment::NotDefined,
         ] {
             let o = resolve_package_outcome(&[], q);
+            let output = package_outcome_report(&o);
             assert_eq!(
-                package_outcome_report(&o).is_ok(),
+                matches!(output, PackageStageOutput::Report(_)),
                 o.exit_code == ExitCode::Ok
             );
+            assert_eq!(output.exit_code(), o.exit_code);
         }
     }
 
@@ -276,7 +310,10 @@ mod tests {
 
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         o.exit_code = ExitCode::Ok;
-        assert!(package_outcome_report(&o).is_err());
+        assert!(matches!(
+            package_outcome_report(&o),
+            PackageStageOutput::Error(_)
+        ));
     }
 
     /// REQ-21・REQ-30・REQ-31・REQ-39: breaches が非空なのに Pass / Ok の組を渡しても
@@ -299,7 +336,10 @@ mod tests {
 
         // verdict だけ LimitExceeded で exit_code が Ok の組も拒否する。
         o.verdict = PackageVerdict::LimitExceeded;
-        assert!(package_outcome_report(&o).is_err());
+        assert!(matches!(
+            package_outcome_report(&o),
+            PackageStageOutput::Error(_)
+        ));
 
         // breaches 非空で verdict Fail・exit_code JudgedFail の組も runtime_error にする。
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);

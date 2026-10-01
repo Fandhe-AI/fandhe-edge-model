@@ -24,9 +24,10 @@
 //! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
 //! 出力に含めない（未結線）。
 //!
-//! 合否判定は exit 0 になる `pass` のみを表す。`fail`・`limit_exceeded`・判定不能は
-//! exit ≠ 0 であり `ErrorReport` 側へ流すため、本型では表現できない（壊れた値を
-//! 表現できない型にする。coding-rust.md）。
+//! [`PackageReport`]（exit 0）は `pass` と基準未定義のみを表す。`fail`（exit 10）・判定不能
+//! （exit 12）は合否基準が定義されているときにだけ生じ、判定項目つきの
+//! [`PackageJudgedReport`] で返す（#328・REQ-21・REQ-33。exit 0 の型に `fail` を載せられない
+//! ことを型で保証する）。`limit_exceeded`（exit 20）は従来どおり `ErrorReport` 側へ流す。
 
 use serde::Serialize;
 
@@ -160,12 +161,73 @@ impl EvaluateCompletedReport {
     }
 }
 
-/// 合否判定（exit 0 になるものだけ）。
+/// 合否判定。`Pass` は exit 0（[`PackageReport`]）、`Fail`・`Undeterminable` は
+/// exit 10・12（[`PackageJudgedReport`]）でのみ使う（#328）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageJudgment {
     /// 合否基準を満たした。
     Pass,
+    /// 合否基準を満たさないと有意に言える（exit 10）。
+    Fail,
+    /// 件数不足などで判定できない。合格扱いにしない（exit 12。REQ-24）。
+    Undeterminable,
+}
+
+/// `package` 工程が合否判定の結果として exit 10・12 で返す JSON（#328・REQ-21・REQ-33）。
+///
+/// `{"code","message","step":"package","judgment","acceptance_defined":true}` の形で、
+/// `ErrorReport` の `{"code","message"}` に判定項目を足したもの。`Fail`・`Undeterminable`
+/// は合否基準が定義されているときにだけ生じるため `acceptance_defined` は常に `true`。
+/// コンストラクタは [`Self::fail`]・[`Self::undeterminable`] のみで、`code` と `judgment` の
+/// 矛盾した組み合わせを作れない。宣言順に直列化し、パス・件数・本文は載せない（security.md）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageJudgedReport {
+    code: crate::exitcode::ExitCode,
+    message: String,
+    step: Stage,
+    judgment: PackageJudgment,
+    acceptance_defined: bool,
+}
+
+impl PackageJudgedReport {
+    /// 合否基準を満たさない結果（exit 10・`judged_fail`）。
+    #[must_use]
+    pub fn fail(message: String) -> Self {
+        Self {
+            code: crate::exitcode::ExitCode::JudgedFail,
+            message,
+            step: Stage::Package,
+            judgment: PackageJudgment::Fail,
+            acceptance_defined: true,
+        }
+    }
+
+    /// 判定不能の結果（exit 12・`pending`。合格扱いにしない）。
+    #[must_use]
+    pub fn undeterminable(message: String) -> Self {
+        Self {
+            code: crate::exitcode::ExitCode::Pending,
+            message,
+            step: Stage::Package,
+            judgment: PackageJudgment::Undeterminable,
+            acceptance_defined: true,
+        }
+    }
+
+    /// この結果に対応する終了コード（10 または 12）。
+    #[must_use]
+    pub const fn exit_code(&self) -> crate::exitcode::ExitCode {
+        self.code
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
 }
 
 /// `package` 工程が exit 0 で返す JSON（フィールドは宣言順に直列化する）。
@@ -379,6 +441,24 @@ mod tests {
                 .to_json_line()
                 .expect("json"),
             r#"{"step":"package","status":"ok","judgment":null,"acceptance_defined":false}"#
+        );
+    }
+
+    /// REQ-21・REQ-33・#328: exit 10・12 の判定項目つき JSON と終了コード。
+    #[test]
+    fn req33_issue328_judged_reports_json_and_exit_code_are_exact() {
+        use crate::exitcode::ExitCode;
+        let fail = PackageJudgedReport::fail("judged as fail".to_string());
+        assert_eq!(fail.exit_code(), ExitCode::JudgedFail);
+        assert_eq!(
+            fail.to_json_line().expect("json"),
+            r#"{"code":"judged_fail","message":"judged as fail","step":"package","judgment":"fail","acceptance_defined":true}"#
+        );
+        let pending = PackageJudgedReport::undeterminable("result is pending".to_string());
+        assert_eq!(pending.exit_code(), ExitCode::Pending);
+        assert_eq!(
+            pending.to_json_line().expect("json"),
+            r#"{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true}"#
         );
     }
 

@@ -56,7 +56,7 @@ use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
-use fandhe_edge_core::stage_report::{EvaluateReport, PackageReport};
+use fandhe_edge_core::stage_report::{EvaluateReport, PackageJudgedReport, PackageReport};
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use fandhe_edge_runtime::export_exclusion::{ExclusionReason, ExclusionRecord};
 use std::io::{self, Write};
@@ -145,6 +145,29 @@ pub fn write_package_report<W: Write>(out: &mut W, report: &PackageReport) -> io
     out.flush()?;
 
     Ok(ExitCode::Ok)
+}
+
+/// [`PackageJudgedReport`]（`package` 工程の合否判定による exit 10・12 の結果）を JSON 1 行＋改行として
+/// `out` へ書き、その終了コード（10 または 12）を返す（REQ-21・REQ-33・#328）。
+///
+/// [`write_package_report`] と同じ保証を持つ（直列化失敗時は何も書かず `Err`、`write_all` は
+/// 高々 1 回、部分書き込み失敗時にリトライ・追記・flush をしない）。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_package_judged_report<W: Write>(
+    out: &mut W,
+    report: &PackageJudgedReport,
+) -> io::Result<ExitCode> {
+    let mut line = report
+        .to_json_line()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(report.exit_code())
 }
 
 /// [`EvaluateReport`]（`evaluate` 工程の評価データ未定義 skipped。exit 0）を JSON 1 行＋改行として
@@ -571,6 +594,25 @@ mod tests {
             }
         }
         assert!(write_package_report(&mut FailingWriter, &PackageReport::pass()).is_err());
+    }
+
+    /// REQ-21・REQ-33・#328: 判定項目つきの結果は JSON 1 行＋改行で書かれ、10・12 を返す。
+    #[test]
+    fn req33_issue328_write_package_judged_report_writes_line_and_returns_exit_code() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let report = PackageJudgedReport::fail("judged as fail".to_string());
+        let code = write_package_judged_report(&mut buffer, &report).unwrap();
+        assert_eq!(code, ExitCode::JudgedFail);
+        assert_eq!(
+            String::from_utf8(buffer).unwrap(),
+            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
+        );
+        let mut buffer: Vec<u8> = Vec::new();
+        let report = PackageJudgedReport::undeterminable("result is pending".to_string());
+        assert_eq!(
+            write_package_judged_report(&mut buffer, &report).unwrap(),
+            ExitCode::Pending
+        );
     }
 
     /// TASK-21.2: 部分書き込み後に失敗する `Write` を渡した場合でも、本
