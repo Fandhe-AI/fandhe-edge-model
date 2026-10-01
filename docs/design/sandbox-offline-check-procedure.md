@@ -50,6 +50,12 @@ Agent が確定させない（`evidence_hint` は `requires_human_review` か `t
 | 12 | `unattributed_network_denials` | 帰属不明の通信拒否がある（要確認） |
 | 70 | `undeterminable` など | 監視の無効・run の失敗（判定不能） |
 
+拒否行は `Sandbox: <プロセス名>(<pid>) deny(<n>) <操作> [対象]` に加え、同じ構造の
+`System Policy: ...` 形式も集計対象とする（Issue #331）。`network*` 以外の操作（他プロセスの
+`file-read-data` 等）の拒否は無視し、判定不能にしない。`network*` の拒否は接頭辞によらず
+同じ規則で帰属・件数に反映する。上記 2 種の接頭辞以外で `(<pid>) deny(<n>)` の構造を欠く
+拒否行は、従来どおり判定不能（70）とする。
+
 ## 5. PR・Issue へ記録する項目
 
 - 証拠種別: 実機（機種・OS 版を併記）
