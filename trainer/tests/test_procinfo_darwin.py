@@ -7,6 +7,7 @@ REQ-38・REQ-39・#327: setuid の `/bin/ps` が `sandbox-exec` 下で起動で�
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -166,3 +167,101 @@ def test_req38_req39_child_status_works_under_real_sandbox_exec() -> None:
     assert result.returncode == 0, result.stderr
     # `ps_ok` は情報としてだけ出力する（`ps` が使えるかは環境依存のためアサートしない）。
     assert "status_ok=True" in result.stdout.split()
+
+
+@darwin_only
+def test_req39_exiting_child_is_never_unknown_before_zombie_327() -> None:
+    """REQ-39・#327 回帰: 短命な子が終了処理中（SRUN のまま INEXIT・TASKINFO 失敗）でも、
+    ゾンビになるまで `child_status` が `None`（監視不能）を返さない。最後はゾンビとして
+    検知でき、`waitpid` で回収できる。`(0, False)`（INEXIT 経路）の観測回数は実機では
+    毎回あるが、タイミング依存のため assert せず、修正前実装での失敗確認で代える。"""
+    for _ in range(40):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while True:
+                status = procinfo_darwin.child_status(proc.pid)
+                assert status is not None, "child_status returned None while child was exiting"
+                if status[1]:
+                    break
+                assert time.monotonic() < deadline, "child did not become a zombie"
+            reaped_pid, wait_status = os.waitpid(proc.pid, 0)
+            assert reaped_pid == proc.pid
+            assert os.waitstatus_to_exitcode(wait_status) == 0
+            proc.returncode = 0
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+_FAKE_PID = 12345
+
+
+def _install_fake_libproc(
+    monkeypatch: pytest.MonkeyPatch,
+    states: list[tuple[int, int]],
+    taskinfo_rss: int | None,
+) -> None:
+    """`_load` を偽の `proc_pidinfo` に差し替える（キャッシュには触れないので汚れない）。
+
+    `states` は SHORTBSDINFO の応答（status, flags）を呼び出し順に返し、最後の値を使い回す。
+    `taskinfo_rss` が `None` なら TASKINFO は失敗（戻り値 0）、値があれば offset 8 に書く。"""
+    calls = {"state": 0}
+
+    def fake(pid: int, flavor: int, arg: int, buf: object, size: int) -> int:
+        assert pid == _FAKE_PID
+        if flavor == 13:
+            assert (arg, size) == (1, 64)
+            status, flags = states[min(calls["state"], len(states) - 1)]
+            calls["state"] += 1
+            raw = bytearray(64)
+            raw[0:4] = pid.to_bytes(4, "little")
+            raw[12:16] = status.to_bytes(4, "little")
+            raw[32:36] = flags.to_bytes(4, "little")
+            ctypes.memmove(buf, bytes(raw), 64)
+            return 64
+        assert (flavor, size) == (4, 96)
+        if taskinfo_rss is None:
+            return 0
+        raw = bytearray(96)
+        raw[8:16] = taskinfo_rss.to_bytes(8, "little")
+        ctypes.memmove(buf, bytes(raw), 96)
+        return 96
+
+    monkeypatch.setattr(procinfo_darwin.sys, "platform", "darwin")
+    monkeypatch.setattr(procinfo_darwin, "_load", lambda: fake)
+
+
+def test_req39_exiting_state_with_taskinfo_failure_is_zero_not_zombie_327(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39・#327: TASKINFO 失敗・再読で SRUN(2)＋INEXIT(0x4) は `(0, False)`。"""
+    _install_fake_libproc(monkeypatch, [(2, 0x14), (2, 0x4014)], None)
+    assert procinfo_darwin.child_status(_FAKE_PID) == (0, False)
+
+
+def test_req39_taskinfo_failure_without_inexit_is_unknown_327(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39・#327: TASKINFO 失敗・再読で SRUN かつ INEXIT なし（0x4010）は `None`。"""
+    _install_fake_libproc(monkeypatch, [(2, 0x10), (2, 0x4010)], None)
+    assert procinfo_darwin.child_status(_FAKE_PID) is None
+
+
+def test_req39_taskinfo_failure_then_zombie_is_zombie_327(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39・#327: TASKINFO 失敗・再読で SZOMB(5) は `(0, True)`。"""
+    _install_fake_libproc(monkeypatch, [(2, 0x10), (5, 0x4010)], None)
+    assert procinfo_darwin.child_status(_FAKE_PID) == (0, True)
+
+
+def test_req39_taskinfo_success_returns_rss_even_with_inexit_327(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39・#327: TASKINFO 成功時は INEXIT が立っていても RSS をそのまま返す。"""
+    _install_fake_libproc(monkeypatch, [(2, 0x4014)], 123456789)
+    assert procinfo_darwin.child_status(_FAKE_PID) == (123456789, False)
