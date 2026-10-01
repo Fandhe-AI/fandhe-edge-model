@@ -88,19 +88,15 @@ pub fn package_outcome_report(outcome: &PackageOutcome) -> PackageStageOutput {
         ));
     }
     match outcome.verdict {
-        PackageVerdict::Pass => PackageStageOutput::Report(
-            PackageReport::pass().with_acceptance_defined(outcome.acceptance_defined),
-        ),
+        PackageVerdict::Pass => PackageStageOutput::Report(PackageReport::pass()),
         PackageVerdict::NotDefined => {
             PackageStageOutput::Report(PackageReport::acceptance_not_defined())
         }
-        PackageVerdict::Fail => PackageStageOutput::Judged(
-            PackageJudgedReport::fail(default_message(ExitCode::JudgedFail).to_string())
-                .with_acceptance_defined(outcome.acceptance_defined),
-        ),
+        PackageVerdict::Fail => PackageStageOutput::Judged(PackageJudgedReport::fail(
+            default_message(ExitCode::JudgedFail).to_string(),
+        )),
         PackageVerdict::Undeterminable => PackageStageOutput::Judged(
-            PackageJudgedReport::undeterminable(default_message(ExitCode::Pending).to_string())
-                .with_acceptance_defined(outcome.acceptance_defined),
+            PackageJudgedReport::undeterminable(default_message(ExitCode::Pending).to_string()),
         ),
         PackageVerdict::LimitExceeded => PackageStageOutput::Error(ErrorReport::new(
             outcome.exit_code,
@@ -237,32 +233,6 @@ mod tests {
             out,
             "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
         );
-    }
-
-    /// REQ-33・#339: `acceptance` が無く下限基準だけで判定した結果は `acceptance_defined:false`
-    /// のまま judgment を出す（pass・fail・判定不能のいずれも）。
-    #[test]
-    fn req33_baseline_only_judgment_keeps_acceptance_defined_false() {
-        for (q, expected) in [
-            (
-                PackageQualityJudgment::Pass,
-                "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":false}\n",
-            ),
-            (
-                PackageQualityJudgment::Fail,
-                "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":false}\n",
-            ),
-            (
-                PackageQualityJudgment::Undeterminable,
-                "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":false}\n",
-            ),
-        ] {
-            let mut o = resolve_package_outcome(&[], q);
-            o.acceptance_defined = false;
-            let mut buf = Vec::new();
-            emit_package_outcome(&mut buf, &o).expect("emit");
-            assert_eq!(String::from_utf8(buf).expect("utf8"), expected);
-        }
     }
 
     /// REQ-33: 基準未設定は exit 0 で judgment が null。

@@ -1585,7 +1585,8 @@ mod suite {
     }
 
     /// REQ-25・REQ-27・#339: 下限基準比較の 3 つの判定（有意に上回る・有意差なし・判定不能）が
-    /// 評価記録に残り、`evaluate` の出力 JSON は比較なしの場合と同一。
+    /// 評価記録に残り、`evaluate` の出力 JSON は比較なしの場合と同一。`baseline_comparison` だけの定義の
+    /// `package` は `verdict` に関わらず `judgment:null`・exit 0（#344）。
     /// majority は「予測に最も少ないラベル」にして、`b`・`c` を予測から具体値で決める。
     /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX・合成データ）。
     pub fn evaluate_records_baseline_comparison_three_verdicts() {
@@ -1619,7 +1620,11 @@ mod suite {
         let plain = baseline_env("bcplain", &definition_text(), &train, &predicted);
         assert_eq!(plain.ok(&EVALUATE_1), stdout);
         assert!(!evaluation_record(&plain).contains("baseline_comparison"));
-        env.ok(&PACKAGE);
+        // 下限基準だけの定義は合否を出さない（`judgment:null`・exit 0。#344）。
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        );
 
         // 有意差なし: gold = 多数派 → b = 0、c = 多数派以外の予測の行。
         let golds: Vec<String> = vec![majority.to_string(); 12];
@@ -1641,8 +1646,11 @@ mod suite {
             )),
             "{record}"
         );
-        // 有意差なしは合格扱いにしない（`package` は judged_fail。REQ-24・REQ-25）。
-        env.fails(&PACKAGE, 10, "judged_fail");
+        // `baseline_comparison` だけの定義は verdict を合否に使わない（#344）。
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        );
 
         // 判定不能: 必要件数 168 > 12 件。gold = 予測で p 値だけなら有意でも、合格扱いにしない。
         let env = baseline_env(
@@ -1663,8 +1671,76 @@ mod suite {
             )),
             "{record}"
         );
-        // 判定不能は合格扱いにしない（`package` は pending。REQ-24）。
-        env.fails(&PACKAGE, 12, "pending");
+        // 判定不能でも `baseline_comparison` だけの定義は合否を出さない（#344）。
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        );
+    }
+
+    /// 比較欄と `acceptance` を併記した定義 JSON（#344）。
+    fn acceptance_and_baseline_definition_text(bp: u32, extra: &str) -> String {
+        bp_definition_text(bp).replacen(
+            r#""io":{"input":"bytes"}"#,
+            &format!(r#""io":{{"input":"bytes"}},"baseline_comparison":{extra}"#),
+            1,
+        )
+    }
+
+    /// REQ-24・REQ-25・REQ-33・#344: `acceptance` と `baseline_comparison` を併記しても、`package` の合否は
+    /// 正解率だけで決まる。`verdict` が有意差なし・判定不能でも、正解率が pass なら exit 0。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX・合成データ）。
+    pub fn package_judges_by_accuracy_only_when_baseline_comparison_coexists() {
+        let predicted = predicted_evaluation_labels();
+        let (majority, in_predicted) = least_predicted(&predicted);
+        let not_majority = 12 - in_predicted;
+        let train = train_jsonl_with_majority(majority);
+        let pass_json = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n";
+
+        // 有意差なし（gold = 多数派）。正解率の基準は 0 なので pass。
+        let golds: Vec<String> = vec![majority.to_string(); 12];
+        let env = baseline_env(
+            "bcnotacc",
+            &acceptance_and_baseline_definition_text(0, BASELINE_ASSUMPTION_REQUIRED_7),
+            &train,
+            &golds,
+        );
+        env.ok(&EVALUATE_1);
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains(&baseline_fragment(
+                majority,
+                12,
+                (0, not_majority),
+                7,
+                "not_significantly_better"
+            )),
+            "{record}"
+        );
+        assert_eq!(env.ok(&PACKAGE), pass_json);
+        assert!(env.project_file("package/artifact.json").exists());
+
+        // 判定不能（必要件数 168 > 12 件）。12/12 の Wilson 下限は 7500 bp 以上なので pass。
+        let env = baseline_env(
+            "bcundetacc",
+            &acceptance_and_baseline_definition_text(7500, BASELINE_ASSUMPTION_REQUIRED_168),
+            &train,
+            &predicted,
+        );
+        env.ok(&EVALUATE_1);
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains(&baseline_fragment(
+                majority,
+                in_predicted,
+                (not_majority, 0),
+                168,
+                "undeterminable"
+            )),
+            "{record}"
+        );
+        assert_eq!(env.ok(&PACKAGE), pass_json);
+        assert!(env.project_file("package/artifact.json").exists());
     }
 
     /// REQ-27・#339: majority は train 分割のラベルだけから作る。train の多数派が `gamma`、評価データの
@@ -1779,10 +1855,10 @@ mod suite {
         );
         assert!(!env.project_file("package").exists());
         std::fs::write(&record_path, &original).expect("restore");
-        // `acceptance` が無く下限基準だけの定義でも、判定は出るが `acceptance_defined` は false（#339）。
+        // 下限基準だけの定義は合否を出さない（`judgment:null`。#344）。
         assert_eq!(
             env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":false}\n"
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
         );
 
         // 欄の追加（定義には欄が無い）。
@@ -2582,6 +2658,10 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_without_baseline_comparison_keeps_record_and_output",
             suite::evaluate_without_baseline_comparison_keeps_record_and_output,
+        ),
+        (
+            "package_judges_by_accuracy_only_when_baseline_comparison_coexists",
+            suite::package_judges_by_accuracy_only_when_baseline_comparison_coexists,
         ),
         (
             "package_rejects_tampered_baseline_comparison",
