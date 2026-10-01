@@ -430,8 +430,21 @@ else
 	@exit 1
 endif
 
+.PHONY: check-unsafe-allowlist
+# `allow(unsafe_code)` の出現箇所を許可リスト（unsafe-allowlist.json）と照合し、承認記録のない
+# `unsafe` の追加を止める（REQ-39・#335。手順: docs/design/unsafe-allowlist-flow.md）。実行方法は
+# check-dependency-approvals と同じ（`--no-project --offline`。標準ライブラリのみ）。
+check-unsafe-allowlist: ## allow(unsafe_code) の出現を許可リストと照合する（未承認の追加で失敗。#335）
+ifneq ($(HAS_PY),)
+	@$(require_uv)
+	uv run --no-project --offline --directory $(PY_DIR) python -I ../scripts/check_unsafe_allowlist.py --root ..
+else
+	@echo "error: trainer/pyproject.toml が無く check-unsafe-allowlist を実行できない（fail-closed）" >&2
+	@exit 1
+endif
+
 .PHONY: ci
-ci: lint-docs check-workspace-manifest check-dependency-approvals fmt-check lint test deny py-ci test-trainer-integration ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
+ci: lint-docs check-workspace-manifest check-dependency-approvals check-unsafe-allowlist fmt-check lint test deny py-ci test-trainer-integration ## ローカルゲート（CI の ci.yml・python-ci.yml と同等のチェック）を一括実行する
 
 # --------------------------------------------------
 # 後片付け

@@ -38,6 +38,7 @@
 
 - `unsafe` は原則禁止。FFI 境界（ONNX Runtime 等）で必要な場合のみ、`// SAFETY:` コメントで理由と維持すべき不変条件を明記する
 - `unsafe` の新規追加はユーザー承認を得る（レビューで P0 として扱う）
+- `allow(unsafe_code)`・`expect(unsafe_code)`・`warn(unsafe_code)` の出現箇所（ファイル・item）は `unsafe-allowlist.json` と機械照合される（`make check-unsafe-allowlist`・`make ci`・lefthook pre-commit・python-ci の pytest 経由。REQ-39・#335。手順は [unsafe-allowlist-flow](../../docs/design/unsafe-allowlist-flow.md)）。許可リストの追加・更新・削除はオーナー承認事項で、builder Agent は独断で編集せず「承認事項」として main へ報告する。承認の記録（`approved_on`・`record`）は承認後に同じコミットで更新する
 
 ## クロスプラットフォーム
 
