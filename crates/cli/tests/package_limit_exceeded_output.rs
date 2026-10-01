@@ -44,8 +44,9 @@ fn emit(b: &[LimitBreach], q: PackageQualityJudgment) -> (ExitCode, String) {
 }
 
 const LIMIT_JSON: &str = "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n";
-const FAIL_JSON: &str = "{\"code\":\"judged_fail\",\"message\":\"judged as fail\"}\n";
-const PENDING_JSON: &str = "{\"code\":\"pending\",\"message\":\"result is pending\"}\n";
+// exit 10・12 は合否基準が定義されているときの判定項目つきの形（#328）。
+const FAIL_JSON: &str = "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n";
+const PENDING_JSON: &str = "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n";
 const PASS_JSON: &str =
     "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n";
 const NOT_DEFINED_JSON: &str =

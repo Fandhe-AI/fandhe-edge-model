@@ -30,6 +30,8 @@
 //! - [`quadrant`][]: 型と意味の正しさの分離集計（REQ-24 境界値・TASK-24.3・
 //!   issue #62。単一選択の 5 区分〔type_ok_meaning_ok / type_ok_meaning_ng /
 //!   type_ng_count / abstain / error〕のみ。multi-item は未対応）
+//! - [`acceptance`][]: 正解率の合否基準判定（Wilson 95% 区間による pass / fail /
+//!   undeterminable の 3 値。REQ-24・REQ-33・#328。CLI の `package` 工程が呼ぶ）
 //! - [`wilson`][]: Wilson 95% 信頼区間の算出（REQ-24・REQ-26・TASK-24.1-2・
 //!   issue #60。sklearn 照合 8/8 は `tests/sklearn_check.rs` を参照。
 //!   Wilson 自体は sklearn に実装が無いため sklearn 照合の対象外）
@@ -177,6 +179,7 @@
 //!   [`significance::MAX_EVAL_RECORDS`] で件数を拒否する防御層を本 crate 側
 //!   にも置く（Review 指摘。TASK-25.1-2・issue #65）
 pub mod abstention;
+pub mod acceptance;
 pub mod baseline;
 pub mod calibration;
 pub mod coverage;

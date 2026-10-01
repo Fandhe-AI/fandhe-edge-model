@@ -264,3 +264,27 @@ fn req20_task20_3_public_api_reserialized_definition_is_unchanged() {
         other => panic!("Unchanged を期待したが {other:?} だった"),
     }
 }
+
+/// REQ-20・REQ-15・#328: 合否基準だけを足す・変えるのは作り直し不要
+/// （`NotRequired`。同一性は選択肢 ID 集合＋判定型のため）。
+#[test]
+fn req20_issue328_acceptance_only_change_is_not_required() {
+    let with = |bp: u32| {
+        DEFINITION_A_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(
+                r#""io": {{ "input": "bytes" }}, "acceptance": {{ "min_accuracy_bp": {bp} }}"#
+            ),
+            1,
+        )
+    };
+    let base = Definition::parse(DEFINITION_A_JSON).expect("valid");
+    let a = Definition::parse(&with(9000)).expect("valid");
+    let b = Definition::parse(&with(9500)).expect("valid");
+    for (old, new) in [(&base, &a), (&a, &b)] {
+        match decide_rebuild(old, new).expect("失敗しないはず") {
+            RebuildDecision::NotRequired(_) => {}
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+}

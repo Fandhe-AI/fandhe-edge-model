@@ -30,15 +30,24 @@
 //! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
 //! 置き換えも削除もしない）。容量は計測して上限照合（`limit_exceeded` の判定）に使う。
 //!
+//! # 合否基準（#328・REQ-24・REQ-33）
+//!
+//! 定義ファイルの省略可能な `acceptance.min_accuracy_bp`（1 万分率）を、評価記録の
+//! `correct`/`total` と評価器の [`judge_min_accuracy`]（Wilson 95% 区間。pass / fail / undeterminable）
+//! で照合する（[`quality_from_acceptance`]）。基準が無ければ従来どおり `judgment:null`・
+//! `acceptance_defined:false`・exit 0。基準があり評価データが無ければ判定不能（exit 12）。
+//! `fail`（exit 10）・判定不能でも公開の関門は容量だけで、`package/` は公開する（合否は終了コードと
+//! JSON で伝える）。基準は定義の正準化ハッシュに含まれるため、`evaluate` の後に書き換えると
+//! 評価記録の `definition_sha256` 照合で `invalid_input` になる（REQ-27）。
+//!
 //! # 未接続（実装済みを装わない）
 //!
-//! 容量内訳の stdout 出力は未接続。現状の出力は `PackageOutcome` 由来の JSON（成功時。`judgment`・`acceptance_defined` のみ）または
-//! `{"code","message"}`（超過時）で、内訳は載らない。内訳の JSON 部品は
+//! 容量内訳の stdout 出力は未接続（#340）。現状の出力は `PackageOutcome` 由来の JSON（`judgment`・
+//! `acceptance_defined` など）または `{"code","message"}`（超過時）で、内訳は載らない。内訳の JSON 部品は
 //! `output::package_capacity_json`（#123）にあり、接続は入出力契約（REQ-33）の変更を伴うため別途扱う。
 //!
-//! p95 の計測（REQ-31・`LimitBreach::Latency`）と合否基準は未接続。定義ファイルに合否基準の欄が
-//! 無いため [`PackageQualityJudgment::NotDefined`] とし、`judgment:null`・
-//! `acceptance_defined:false`・exit 0 を返す（`pass` は出さない）。
+//! p95 の計測・上限照合（REQ-31・`LimitBreach::Latency`。#338）は未接続。評価記録の `correct` は
+//! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -50,6 +59,7 @@ use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECOR
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::FreezeRecord;
+use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
@@ -173,8 +183,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
     // smoke 学習の候補かどうか・`--allow-smoke` の有無に関係なく確認する（smoke の候補は
     // `evaluate` が拒否するため、評価データがあるプロジェクトでは公開できない。fail-closed。REQ-27）。
-    if let Some((freeze, eval_bytes)) = frozen.as_ref() {
-        verify_evaluation_record(
+    let verified_record = match frozen.as_ref() {
+        Some((freeze, eval_bytes)) => Some(verify_evaluation_record(
             &project,
             (&selection, &Sha256Digest::of_bytes(&selection_bytes)),
             (freeze, eval_bytes),
@@ -182,8 +192,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
             &meta_bytes,
             &onnx_bytes,
             &format!("{}:seed{}", candidate.candidate_id, seed),
-        )?;
-    }
+        )?),
+        None => None,
+    };
+    // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
+    let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -220,10 +233,38 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     };
     let check = check_capacity_limit(&breakdown, Some(limit));
     let breaches = finalize_staging(&project, &staging, &check)?;
-    Ok(resolve_package_outcome(
-        &breaches,
-        PackageQualityJudgment::NotDefined,
-    ))
+    // 上限超過（20）が合否より優先される規則は runtime の `resolve_package_outcome` に任せる。
+    // Fail・Undeterminable でも公開の関門は容量だけ（`finalize_staging` は合否を見ない。#328）。
+    Ok(resolve_package_outcome(&breaches, quality))
+}
+
+/// 定義の合否基準と照合済みの評価記録から、`package` の合否判定を決める（REQ-24・REQ-33・#328）。
+///
+/// - 基準が無い: [`PackageQualityJudgment::NotDefined`]（`judgment:null`・exit 0）
+/// - 基準があり評価記録が無い（評価データ無し。`--allow-smoke` を含む）: `Undeterminable`
+///   （評価していないモデルを合格扱いにしない。REQ-17・REQ-24）
+/// - 基準があり照合済みの記録がある: 評価器の [`judge_min_accuracy`]（Wilson 95% 区間）の結果
+///
+/// 記録の `correct` は最終 test の台帳に記録されておらず、プロジェクトへ書き込める主体が
+/// `correct <= total` の範囲で書き換えれば判定を変えられる。これは外部台帳による完全性検証
+/// （#168）の既知の限界で、本関数はその代替ではない。
+fn quality_from_acceptance(
+    definition: &Definition,
+    record: Option<&EvaluationRecord>,
+) -> Result<PackageQualityJudgment, ErrorReport> {
+    let Some(acceptance) = definition.acceptance() else {
+        return Ok(PackageQualityJudgment::NotDefined);
+    };
+    let Some(record) = record else {
+        return Ok(PackageQualityJudgment::Undeterminable);
+    };
+    let verdict = judge_min_accuracy(record.correct, record.total, acceptance.min_accuracy_bp())
+        .map_err(|_| runtime("cannot judge acceptance"))?;
+    Ok(match verdict {
+        AcceptanceVerdict::Pass => PackageQualityJudgment::Pass,
+        AcceptanceVerdict::Fail => PackageQualityJudgment::Fail,
+        AcceptanceVerdict::Undeterminable => PackageQualityJudgment::Undeterminable,
+    })
 }
 
 /// 選定候補の評価完了記録を読み、公開する成果物・評価データ・定義と一致することを確認する
@@ -250,7 +291,7 @@ fn verify_evaluation_record(
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
     config_id: &str,
-) -> Result<(), ErrorReport> {
+) -> Result<EvaluationRecord, ErrorReport> {
     let rel = candidate_rel(selection.candidate_index).join(EVALUATION_RECORD_FILE);
     let Some(bytes) = project.read_optional(&rel, MAX_EVALUATION_RECORD_BYTES)? else {
         return Err(invalid("evaluation has not been completed"));
@@ -298,7 +339,7 @@ fn verify_evaluation_record(
     held.ledger()
         .verify_selection_pin(&freeze.sha256(), &config_id, selection_sha256)
         .map_err(|e| acquire_error_report(&e))?;
-    Ok(())
+    Ok(record)
 }
 
 /// 計測した容量が上限内ならステージングを `package/` へ原子的に公開し、超過なら公開せず片付ける
@@ -459,6 +500,58 @@ mod tests {
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn definition_with(acceptance: Option<u32>) -> Definition {
+        let extra = acceptance
+            .map(|bp| format!(r#","acceptance":{{"min_accuracy_bp":{bp}}}"#))
+            .unwrap_or_default();
+        let json = format!(
+            r#"{{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{{"id":"a","display_name":"A","description":"a"}}],"io":{{"input":"bytes"}}{extra}}}"#
+        );
+        Definition::parse(&json).expect("definition")
+    }
+
+    fn record_with(correct: u64, total: u64) -> EvaluationRecord {
+        EvaluationRecord {
+            candidate_index: 0,
+            candidate_id: "c".to_string(),
+            config_id: "c:seed1".to_string(),
+            evaluation_sha256: "0".repeat(64),
+            evaluation_bytes: 1,
+            onnx_sha256: "0".repeat(64),
+            artifact_meta_sha256: "0".repeat(64),
+            definition_sha256: "0".repeat(64),
+            correct,
+            total,
+        }
+    }
+
+    /// REQ-24・REQ-33・#328: 基準なしは `NotDefined`、基準ありで記録なしは `Undeterminable`、
+    /// 基準ありで記録ありは評価器の判定（n=12 の Wilson 区間。手計算値）を写す。
+    #[test]
+    fn req24_issue328_quality_from_acceptance_maps_all_cases() {
+        let record = record_with(12, 12);
+        assert_eq!(
+            quality_from_acceptance(&definition_with(None), Some(&record)),
+            Ok(PackageQualityJudgment::NotDefined)
+        );
+        assert_eq!(
+            quality_from_acceptance(&definition_with(Some(7500)), None),
+            Ok(PackageQualityJudgment::Undeterminable)
+        );
+        assert_eq!(
+            quality_from_acceptance(&definition_with(Some(7500)), Some(&record)),
+            Ok(PackageQualityJudgment::Pass)
+        );
+        assert_eq!(
+            quality_from_acceptance(&definition_with(Some(2500)), Some(&record_with(0, 12))),
+            Ok(PackageQualityJudgment::Fail)
+        );
+        assert_eq!(
+            quality_from_acceptance(&definition_with(Some(5000)), Some(&record_with(6, 12))),
+            Ok(PackageQualityJudgment::Undeterminable)
+        );
     }
 
     fn meta_with_vocab(vocab_sha: Option<&str>) -> ArtifactMeta {
