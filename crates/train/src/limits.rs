@@ -164,7 +164,9 @@ pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 ///
 /// 内訳（`supervisor.py` の定数から算出。根拠を明示し、緩めずに保つ）:
 /// 内側の猶予 `_TIME_LIMIT_GRACE_SECONDS`（5 秒）＋ `ps` 呼び出しの
-/// タイムアウト（5 秒）＋ kill 後の `proc.wait()` 上限（10 秒）＋ reader
+/// タイムアウト（5 秒。macOS は libproc を直接呼んで `ps` を起動しない
+/// ためこの分は実際には生じないが、macOS 以外の経路のため見積もりは変え
+/// ない。#327）＋ kill 後の `proc.wait()` 上限（10 秒）＋ reader
 /// スレッドの join 上限（10 秒＋5 秒）＝ 35 秒に、Python プロセス起動・
 /// OS のプロセス後始末のための余裕を加えて 60 秒とする。
 ///

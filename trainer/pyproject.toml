@@ -82,7 +82,8 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.ruff.lint.per-file-ignores]
 # pytest の assert はテストの本質であり bandit S101（assert 使用）の対象外とする。
 "tests/*" = ["S101"]
-# S603（subprocess の呼び出し）は test_cli.py だけが `sys.executable` を引数リストで
-# （shell=True を使わず）呼ぶために必要で、危険な用法ではないため対象外とする
-# （他のテストファイルには subprocess 呼び出しが無いため、抑止範囲をここへ限定する）。
+# S603（subprocess の呼び出し）は test_cli.py が `sys.executable` を引数リストで
+# （shell=True を使わず）呼ぶために必要で、危険な用法ではないため対象外とする。
+# 他のテストファイルの subprocess 呼び出しは、各行の `# noqa: S603`（理由付き）で
+# 個別に抑止しており、抑止範囲をファイル単位へ広げない。
 "tests/test_cli.py" = ["S603"]
