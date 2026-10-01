@@ -49,6 +49,17 @@ pub(crate) struct PreparedBaseline {
     required: RequiredSampleSize,
 }
 
+impl PreparedBaseline {
+    /// 凍結した評価データの正解ラベル列に対し、majority を答えたときの正解数を数える（`package` 用）。
+    ///
+    /// 記録の `baseline_correct` を、記録に頼らず凍結データから計算し直した値と照合するための部品。
+    pub(crate) fn baseline_correct_on<'a>(&self, golds: impl Iterator<Item = &'a str>) -> u64 {
+        golds
+            .filter(|g| *g == self.majority_label)
+            .fold(0_u64, |n, _| n.saturating_add(1))
+    }
+}
+
 /// 定義の仮定から必要件数を求める。`evaluate` と `package` が同じ値を得るよう、計算はこの 1 関数に限る。
 ///
 /// # Errors
@@ -147,14 +158,20 @@ pub(crate) fn compare(
 
 /// 評価記録の比較欄が、計算し直した majority・必要件数・判定と矛盾しないかを確かめる（`package` 用）。
 ///
-/// 件数どうしの整合（`both_correct` が候補側と下限基準側で一致する等）も checked 演算で確認する。
-/// `b` と `c` を同じ量だけずらす改変や `verdict` だけの書き換えも、判定の再計算で検出する。
-/// 記録ファイルを丸ごと作り直せる主体は、外部台帳（#168）が無い限り防げない（限界）。
+/// 件数どうしの整合（`both_correct` が候補側と下限基準側で一致する等）も checked 演算で確認し、
+/// `baseline_correct` は凍結した評価データから数え直した `expected_baseline_correct` と一致を求める。
+///
+/// 検出できる範囲: majority・必要件数・`baseline_correct`・件数の算術的整合・`verdict`（再計算）。
+/// 検出できない範囲: `b` と `c` を同じ量だけずらし、`both_correct` を同量だけ減らす改変
+/// （例 total=100・correct=80・baseline_correct=60 で b=30,c=10 → b=31,c=11）。`both_correct` は
+/// 候補の予測ごとの正誤でしか確かめられず、`package` は評価データへ推論を再適用しない（REQ-27）ため。
+/// 完全な検証には候補の予測の封印記録が要る（外部台帳 #168 の範囲）。記録ファイルを丸ごと作り直せる
+/// 主体も同様に防げない。
 pub(crate) fn record_matches(
     prepared: &PreparedBaseline,
     rec: &BaselineComparisonRecord,
-    correct: u64,
-    total: u64,
+    (correct, total): (u64, u64),
+    expected_baseline_correct: u64,
 ) -> bool {
     let Some(both_by_candidate) = correct.checked_sub(rec.b) else {
         return false;
@@ -171,6 +188,7 @@ pub(crate) fn record_matches(
     if !counts_ok
         || rec.required_n != prepared.required.get()
         || rec.majority_label != prepared.majority_label
+        || rec.baseline_correct != expected_baseline_correct
     {
         return false;
     }
@@ -370,11 +388,39 @@ mod tests {
         }
     }
 
+    /// REQ-27・#339: majority の正解数は凍結データの正解ラベルから数え直す。
+    #[test]
+    fn req27_issue339_baseline_correct_on_counts_majority_hits() {
+        let p = prepared("a", 7);
+        assert_eq!(p.baseline_correct_on(["a", "b", "a", "a"].into_iter()), 3);
+        assert_eq!(p.baseline_correct_on(std::iter::empty()), 0);
+    }
+
+    /// REQ-27・#339: `baseline_correct` を凍結データの数え直しと食い違わせる改変は検出する。
+    /// b・c の同量ずらし（both_correct を減らす改変）は検出範囲外（関数の doc に明記）。
+    #[test]
+    fn req27_issue339_record_matches_documents_undetectable_shift() {
+        let p = prepared("a", 7);
+        assert!(!record_matches(&p, &valid_record(), (10, 12), 5));
+        // 限界の固定: total=100・correct=80・baseline_correct=60 の記録で、b=30,c=10 も
+        // b=31,c=11 も算術的整合と判定の再計算を通る（検出できない。#168 の範囲）。
+        let mk = |b: u64, c: u64| BaselineComparisonRecord {
+            majority_label: "a".to_string(),
+            baseline_correct: 60,
+            b,
+            c,
+            required_n: 7,
+            verdict: BaselineComparisonVerdict::SignificantlyBetter,
+        };
+        assert!(record_matches(&p, &mk(30, 10), (80, 100), 60));
+        assert!(record_matches(&p, &mk(31, 11), (80, 100), 60));
+    }
+
     /// REQ-27・#339: 正しい記録は通り、各欄の改変・範囲外の値は false になる。
     #[test]
     fn req27_issue339_record_matches_detects_tampering() {
         let p = prepared("a", 7);
-        assert!(record_matches(&p, &valid_record(), 10, 12));
+        assert!(record_matches(&p, &valid_record(), (10, 12), 4));
         type Mutation = fn(&mut BaselineComparisonRecord);
         let mutations: [Mutation; 9] = [
             |r| r.majority_label = "b".to_string(),
@@ -394,7 +440,7 @@ mod tests {
         for (i, mutate) in mutations.iter().enumerate() {
             let mut r = valid_record();
             mutate(&mut r);
-            assert!(!record_matches(&p, &r, 10, 12), "mutation {i}");
+            assert!(!record_matches(&p, &r, (10, 12), 4), "mutation {i}");
         }
     }
 }

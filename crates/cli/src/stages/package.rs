@@ -38,7 +38,8 @@
 //!
 //! 定義ファイルの省略可能な `acceptance.min_accuracy_bp`（1 万分率）を、評価記録の
 //! `correct`/`total` と評価器の [`judge_min_accuracy`]（Wilson 95% 区間。pass / fail / undeterminable）
-//! で照合する（[`quality_from_acceptance`]）。基準が無ければ従来どおり `judgment:null`・
+//! で照合する（[`quality_from_acceptance`]）。定義に `baseline_comparison` があるときは、評価記録の
+//! 下限基準との比較の `verdict` も合否へ結合する（`significantly_better` 以外は pass にしない。#339）。基準が無ければ従来どおり `judgment:null`・
 //! `acceptance_defined:false`・exit 0。基準があり評価データが無ければ判定不能（exit 12）。
 //! `fail`（exit 10）・判定不能でも公開の関門は容量だけで、`package/` は公開する（合否は終了コードと
 //! JSON で伝える）。基準は定義の正準化ハッシュに含まれるため、`evaluate` の後に書き換えると
@@ -67,7 +68,9 @@ use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES};
-use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
+use fandhe_edge_core::evaluation_record::{
+    BaselineComparisonVerdict, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES,
+};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::FreezeRecord;
@@ -326,6 +329,10 @@ fn check_latency_with_clock<P: Preprocessor, B: ScoringBackend, C: Clock>(
 /// - 基準があり評価記録が無い（評価データ無し。`--allow-smoke` を含む）: `Undeterminable`
 ///   （評価していないモデルを合格扱いにしない。REQ-17・REQ-24）
 /// - 基準があり照合済みの記録がある: 評価器の [`judge_min_accuracy`]（Wilson 95% 区間）の結果
+/// - 定義に `baseline_comparison` がある: 記録の `verdict` も合否へ結合する（REQ-24・REQ-25・#339。
+///   `significantly_better` のみ pass、`not_significantly_better` は fail、`undeterminable` は判定不能で
+///   合格扱いにしない）。`acceptance` が無く `baseline_comparison` だけの定義は下限基準のみで判定する。
+///   結合は fail > 判定不能 > pass の優先順
 ///
 /// 記録の `correct` は最終 test の台帳に記録されておらず、プロジェクトへ書き込める主体が
 /// `correct <= total` の範囲で書き換えれば判定を変えられる。これは外部台帳による完全性検証
@@ -334,18 +341,46 @@ fn quality_from_acceptance(
     definition: &Definition,
     record: Option<&EvaluationRecord>,
 ) -> Result<PackageQualityJudgment, ErrorReport> {
-    let Some(acceptance) = definition.acceptance() else {
+    let baseline_defined = definition.baseline_comparison().is_some();
+    if definition.acceptance().is_none() && !baseline_defined {
         return Ok(PackageQualityJudgment::NotDefined);
-    };
+    }
     let Some(record) = record else {
         return Ok(PackageQualityJudgment::Undeterminable);
     };
-    let verdict = judge_min_accuracy(record.correct, record.total, acceptance.min_accuracy_bp())
-        .map_err(|_| runtime("cannot judge acceptance"))?;
-    Ok(match verdict {
-        AcceptanceVerdict::Pass => PackageQualityJudgment::Pass,
-        AcceptanceVerdict::Fail => PackageQualityJudgment::Fail,
-        AcceptanceVerdict::Undeterminable => PackageQualityJudgment::Undeterminable,
+    let accuracy = match definition.acceptance() {
+        None => PackageQualityJudgment::Pass,
+        Some(acceptance) => {
+            match judge_min_accuracy(record.correct, record.total, acceptance.min_accuracy_bp())
+                .map_err(|_| runtime("cannot judge acceptance"))?
+            {
+                AcceptanceVerdict::Pass => PackageQualityJudgment::Pass,
+                AcceptanceVerdict::Fail => PackageQualityJudgment::Fail,
+                AcceptanceVerdict::Undeterminable => PackageQualityJudgment::Undeterminable,
+            }
+        }
+    };
+    if !baseline_defined {
+        return Ok(accuracy);
+    }
+    // 定義に下限基準の比較があるのに記録に欄が無い場合は、照合（`baseline_matches`）で既に拒否済みの
+    // 防御的分岐。判定不能として扱い、合格扱いにしない。
+    let baseline = match record.baseline_comparison.as_ref().map(|b| b.verdict) {
+        Some(BaselineComparisonVerdict::SignificantlyBetter) => PackageQualityJudgment::Pass,
+        Some(BaselineComparisonVerdict::NotSignificantlyBetter) => PackageQualityJudgment::Fail,
+        Some(BaselineComparisonVerdict::Undeterminable) | None => {
+            PackageQualityJudgment::Undeterminable
+        }
+    };
+    // 結合規則: どちらかが fail なら fail、次に判定不能が 1 つでもあれば判定不能、両方 pass のときだけ pass。
+    Ok(match (accuracy, baseline) {
+        (PackageQualityJudgment::Fail, _) | (_, PackageQualityJudgment::Fail) => {
+            PackageQualityJudgment::Fail
+        }
+        (PackageQualityJudgment::Pass, PackageQualityJudgment::Pass) => {
+            PackageQualityJudgment::Pass
+        }
+        _ => PackageQualityJudgment::Undeterminable,
     })
 }
 
@@ -353,10 +388,18 @@ fn quality_from_acceptance(
 ///
 /// 定義に欄があるのに記録に無い（欄の削除）、定義に欄が無いのに記録にある（欄の追加）は不一致。
 /// 両方にあるときは [`record_matches`] が majority・必要件数・判定を計算し直して照合する。
-fn baseline_matches(baseline: Option<&PreparedBaseline>, record: &EvaluationRecord) -> bool {
+fn baseline_matches(
+    baseline: Option<&PreparedBaseline>,
+    record: &EvaluationRecord,
+    golds: &[ValidRecord],
+) -> bool {
     match (baseline, record.baseline_comparison.as_ref()) {
         (None, None) => true,
-        (Some(prepared), Some(rec)) => record_matches(prepared, rec, record.correct, record.total),
+        (Some(prepared), Some(rec)) => {
+            // `baseline_correct` は凍結した評価データの正解ラベルから数え直した値と照合する。
+            let expected = prepared.baseline_correct_on(golds.iter().map(|r| r.label_id.as_str()));
+            record_matches(prepared, rec, (record.correct, record.total), expected)
+        }
         _ => false,
     }
 }
@@ -376,7 +419,9 @@ fn baseline_matches(baseline: Option<&PreparedBaseline>, record: &EvaluationReco
 /// `evaluation has not been completed`。記録の偽造だけでは公開できない）。
 ///
 /// 下限基準との比較欄（#339）は、定義と記録で欄の有無が一致することと、majority・必要件数・判定を
-/// train 分割と定義から計算し直した値との一致を確認する（記録の改変の検出。合否には使わない）。
+/// train 分割と定義から、`baseline_correct` を凍結した評価データから計算し直した値との一致を確認する。
+/// `b`・`c` の同量ずらしは検出できない（[`record_matches`] の doc。#168）。判定は
+/// [`quality_from_acceptance`] で合否へ反映する。
 ///
 /// **台帳ファイル自体もプロジェクトへ書き込める主体なら丸ごと作り直せる**ため、本確認は外部台帳による
 /// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
@@ -400,9 +445,9 @@ fn verify_evaluation_record(
         .map_err(|_| runtime("cannot hash definition"))?
         .to_hex();
     // 評価件数は凍結した評価データ（照合済みのバイト列）から数え直し、記録の `total` と照合する。
-    let expected_total = inspect_bytes(eval_bytes, definition)
-        .map_err(|_| invalid("evaluation data is invalid"))?
-        .len();
+    let eval_records =
+        inspect_bytes(eval_bytes, definition).map_err(|_| invalid("evaluation data is invalid"))?;
+    let expected_total = eval_records.len();
     let matches = record.candidate_index == selection.candidate_index
         && record.config_id == config_id
         && record.correct <= record.total
@@ -413,7 +458,7 @@ fn verify_evaluation_record(
         && record.onnx_sha256 == Sha256Digest::of_bytes(onnx_bytes).to_hex()
         && record.artifact_meta_sha256 == Sha256Digest::of_bytes(meta_bytes).to_hex()
         && record.definition_sha256 == definition_sha256
-        && baseline_matches(baseline.as_ref(), &record);
+        && baseline_matches(baseline.as_ref(), &record, &eval_records);
     if !matches {
         return Err(invalid("evaluation record does not match the package"));
     }
@@ -771,9 +816,18 @@ mod tests {
     }
 
     fn definition_with(acceptance: Option<u32>) -> Definition {
-        let extra = acceptance
+        definition_with_baseline(acceptance, false)
+    }
+
+    fn definition_with_baseline(acceptance: Option<u32>, baseline: bool) -> Definition {
+        let mut extra = acceptance
             .map(|bp| format!(r#","acceptance":{{"min_accuracy_bp":{bp}}}"#))
             .unwrap_or_default();
+        if baseline {
+            extra.push_str(
+                r#","baseline_comparison":{"assumed_p_b_bp":9500,"assumed_p_c_bp":0,"power_bp":8000}"#,
+            );
+        }
         let json = format!(
             r#"{{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{{"id":"a","display_name":"A","description":"a"}}],"io":{{"input":"bytes"}}{extra}}}"#
         );
@@ -820,6 +874,56 @@ mod tests {
         assert_eq!(
             quality_from_acceptance(&definition_with(Some(5000)), Some(&record_with(6, 12))),
             Ok(PackageQualityJudgment::Undeterminable)
+        );
+    }
+
+    fn with_verdict(verdict: Option<BaselineComparisonVerdict>) -> EvaluationRecord {
+        let mut r = record_with(12, 12);
+        r.baseline_comparison =
+            verdict.map(
+                |verdict| fandhe_edge_core::evaluation_record::BaselineComparisonRecord {
+                    majority_label: "a".to_string(),
+                    baseline_correct: 6,
+                    b: 6,
+                    c: 0,
+                    required_n: 7,
+                    verdict,
+                },
+            );
+        r
+    }
+
+    /// REQ-24・REQ-25・#339: 下限基準の判定を合否へ結合する。判定不能・有意差なしは正解率が pass でも
+    /// pass にならない（fail > 判定不能 > pass）。基準が下限基準だけの定義も判定する。
+    #[test]
+    fn req25_issue339_quality_combines_baseline_verdict() {
+        use BaselineComparisonVerdict as V;
+        use PackageQualityJudgment as Q;
+        let both = definition_with_baseline(Some(7500), true);
+        let only_baseline = definition_with_baseline(None, true);
+        for (def, verdict, expected) in [
+            (&both, Some(V::SignificantlyBetter), Q::Pass),
+            (&both, Some(V::NotSignificantlyBetter), Q::Fail),
+            (&both, Some(V::Undeterminable), Q::Undeterminable),
+            (&both, None, Q::Undeterminable),
+            (&only_baseline, Some(V::SignificantlyBetter), Q::Pass),
+            (&only_baseline, Some(V::NotSignificantlyBetter), Q::Fail),
+            (&only_baseline, Some(V::Undeterminable), Q::Undeterminable),
+        ] {
+            assert_eq!(
+                quality_from_acceptance(def, Some(&with_verdict(verdict))),
+                Ok(expected),
+                "{verdict:?}"
+            );
+        }
+        // 正解率が fail なら、下限基準が有意でも fail。
+        let mut low = with_verdict(Some(V::SignificantlyBetter));
+        low.correct = 0;
+        assert_eq!(quality_from_acceptance(&both, Some(&low)), Ok(Q::Fail));
+        // 評価記録が無い定義（下限基準のみ）は判定不能。
+        assert_eq!(
+            quality_from_acceptance(&only_baseline, None),
+            Ok(Q::Undeterminable)
         );
     }
 

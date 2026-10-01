@@ -1641,7 +1641,8 @@ mod suite {
             )),
             "{record}"
         );
-        env.ok(&PACKAGE);
+        // 有意差なしは合格扱いにしない（`package` は judged_fail。REQ-24・REQ-25）。
+        env.fails(&PACKAGE, 10, "judged_fail");
 
         // 判定不能: 必要件数 168 > 12 件。gold = 予測で p 値だけなら有意でも、合格扱いにしない。
         let env = baseline_env(
@@ -1662,7 +1663,8 @@ mod suite {
             )),
             "{record}"
         );
-        env.ok(&PACKAGE);
+        // 判定不能は合格扱いにしない（`package` は pending。REQ-24）。
+        env.fails(&PACKAGE, 12, "pending");
     }
 
     /// REQ-27・#339: majority は train 分割のラベルだけから作る。train の多数派が `gamma`、評価データの
