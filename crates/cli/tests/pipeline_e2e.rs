@@ -6,8 +6,9 @@
 //! テストハーネス。学習ワーカーは MLX 不要の**偽ワーカー**（本ファイル自身。下記）で、ONNX は
 //! 共有 fixture（`fixtures/onnx_parity/{c1,c3}.onnx`。生成元は同 `PROVENANCE.md`）をそのまま
 //! 配置する。学習・validation 予測の中身は実 trainer のものではない（実 trainer での完走は
-//! `pipeline_real_trainer.rs`〔`#[ignore]`・`make test-trainer-integration`〕）。学習データは
-//! 本ファイルが生成する合成データのみで、個人情報・機密を含まない。
+//! `sandbox_pipeline_real_trainer.rs`〔`#[ignore]`・`make test-trainer-integration`〕。同テストも
+//! launcher・`log` が偽物のテストハーネスで、評価データなしの `evaluate`〔`skipped`〕経路のみを
+//! 通す）。学習データは本ファイルが生成する合成データのみで、個人情報・機密を含まない。
 //!
 //! # なぜ `harness = false` の単一バイナリか
 //!
