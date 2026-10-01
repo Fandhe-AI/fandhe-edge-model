@@ -288,3 +288,27 @@ fn req20_issue328_acceptance_only_change_is_not_required() {
         }
     }
 }
+
+/// REQ-20・REQ-15・#338: `limits` だけを足す・変えるのは作り直し不要（`NotRequired`）。
+#[test]
+fn req20_issue338_limits_only_change_is_not_required() {
+    let with = |limits: &str| {
+        DEFINITION_A_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "limits": {limits}"#),
+            1,
+        )
+    };
+    let base = Definition::parse(DEFINITION_A_JSON).expect("valid");
+    let a = Definition::parse(&with(r#"{ "max_infer_p95_us": 50000 }"#)).expect("valid");
+    let b = Definition::parse(&with(
+        r#"{ "max_infer_p95_us": 60000, "max_package_bytes": 9 }"#,
+    ))
+    .expect("valid");
+    for (old, new) in [(&base, &a), (&a, &b)] {
+        match decide_rebuild(old, new).expect("失敗しないはず") {
+            RebuildDecision::NotRequired(_) => {}
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+}

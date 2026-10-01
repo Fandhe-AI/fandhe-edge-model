@@ -23,10 +23,14 @@
 //!    [`super::infer::load_backend`]）を通す
 //!    `train --smoke` の結果は `--allow-smoke`（検証専用）が無ければ拒否する（REQ-27）。
 //!    `--allow-smoke` の検証専用パッケージは最終 test を適用できないため、評価完了の確認を行わない
-//! 4. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限超過は `limit_exceeded`
+//! 4. 定義の `limits.max_infer_p95_us` があるときだけ、`train` 分割の入力（[`latency_inputs`]）で
+//!    推論待ち時間 p95 を計測し（warmup 20・iters 1000 固定）、上限と照合する（REQ-31。#338）。
+//!    ステージングを作る前に行う。計測の失敗（推論失敗・時計の逆行・タイムアウト）は `runtime_error`（70）
+//! 5. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限（`limits.max_package_bytes`。
+//!    無ければ [`DEFAULT_CAPACITY_LIMIT_BYTES`]）を超えたら `limit_exceeded`
 //!
-//! 2〜4 は `package.staging/` で行い、容量が上限内のときだけ `package/` へ原子的に名前替えして
-//! 公開する。途中の失敗・容量の上限超過ではステージングを片付け、`package/` を作らない
+//! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
+//! 公開する。途中の失敗・容量または p95 の上限超過ではステージングを片付け、`package/` を作らない
 //! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
 //! 置き換えも削除もしない）。容量は計測して上限照合（`limit_exceeded` の判定）に使う。
 //!
@@ -40,13 +44,21 @@
 //! JSON で伝える）。基準は定義の正準化ハッシュに含まれるため、`evaluate` の後に書き換えると
 //! 評価記録の `definition_sha256` 照合で `invalid_input` になる（REQ-27）。
 //!
+//! # 上限（#338・REQ-30・REQ-31・REQ-21）
+//!
+//! 定義ファイルの省略可能な `limits`（`max_infer_p95_us`・`max_package_bytes`）を照合する。合否
+//! （`acceptance`）とは別で、超過は exit 20 とし合否より優先する（`resolve_package_outcome`）。
+//! p95 の計測入力は `train` 分割の `input` だけで（validation・test と凍結した評価データは使わない。
+//! REQ-27）、件数・総バイト数の上限で先頭から切り詰める。計測回数は利用者設定にしない。
+//! 証拠種別はテストハーネス（偽の時計・固定 fixture の ONNX）で、実機での p95 計測は人の担当である。
+//!
 //! # 未接続（実装済みを装わない）
 //!
-//! 容量内訳の stdout 出力は未接続（#340）。現状の出力は `PackageOutcome` 由来の JSON（`judgment`・
-//! `acceptance_defined` など）または `{"code","message"}`（超過時）で、内訳は載らない。内訳の JSON 部品は
+//! 容量内訳・p95 値の stdout 出力は未接続（#340）。現状の出力は `PackageOutcome` 由来の JSON（`judgment`・
+//! `acceptance_defined` など）または `{"code","message"}`（超過時）で、内訳・p95 値は載らない。内訳の JSON 部品は
 //! `output::package_capacity_json`（#123）にあり、接続は入出力契約（REQ-33）の変更を伴うため別途扱う。
 //!
-//! p95 の計測・上限照合（REQ-31・`LimitBreach::Latency`。#338）は未接続。評価記録の `correct` は
+//! 評価記録の `correct` は
 //! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
 
 use std::fs::File;
@@ -54,23 +66,31 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
-use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
+use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_data::eval_freeze::FreezeRecord;
+use fandhe_edge_data::inspect::ValidRecord;
+use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::capacity_limit::{
-    CapacityLimit, CapacityLimitCheck, check_capacity_limit,
+use fandhe_edge_runtime::capacity_limit::{CapacityLimit, check_capacity_limit};
+use fandhe_edge_runtime::latency::{
+    Clock, LatencyConfig, LatencyError, MonotonicClock, measure_latency,
 };
-use fandhe_edge_runtime::onnx::ModelKind;
+use fandhe_edge_runtime::latency_limit::{LatencyLimit, check_latency_limit};
+use fandhe_edge_runtime::latency_report::summarize_latency;
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
+};
+use fandhe_edge_runtime::pipeline::{
+    InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES, Preprocessor,
+    ScoringBackend,
 };
 use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::TrainOutcome;
@@ -88,17 +108,17 @@ use super::candidate_artifact::{
     verify_vocab_file,
 };
 
-use super::infer::load_backend;
+use super::infer::build_pipeline;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
     candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
-    resolve_candidates, verified_split,
+    resolve_candidates, train_rows, verified_split,
 };
 
-/// 容量の上限（バイト。REQ-30 の目安 40MB。暫定の固定値）。
-/// `run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。利用者設定の取り込み（定義ファイル・CLI 引数）は入出力契約の変更を伴い未実装（承認事項）。
-const CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
+/// 容量の上限の既定値（バイト。REQ-30 の目安 40MB）。定義の `limits.max_package_bytes` が無いときだけ使う
+/// （未設定時の挙動は従来と同じ。#338）。`run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。
+const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 
 /// `package` を実行する。
 ///
@@ -171,13 +191,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     // ONNX の読み込み・出力サイズの一致（`infer` の `load_backend` と共通。REQ-39）。
     check_bytes(onnx_bytes.clone(), &FormatAllowlist::onnx_only())
         .map_err(|e| e.to_error_report())?;
-    let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    load_backend(
-        &onnx_bytes,
-        kind,
-        meta.kind_version(),
-        definition.options().len(),
-    )?;
+    // 組み立てたパイプラインは p95 の計測にも使う（公開するのと同じ `onnx_bytes` から作る。#338）。
+    let pipeline = build_pipeline(&onnx_bytes, &meta, definition.options().len())?;
 
     // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
     // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
@@ -201,6 +216,23 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
     }
+    // p95 の計測・照合（`limits.max_infer_p95_us` があるときだけ。REQ-31・#338）。ステージングを作る前に
+    // 行うので、計測の失敗で片付ける分岐が要らず、既存の `package/` がある場合は推論を回す前に失敗する。
+    let latency_breach = match definition.limits().and_then(Limits::max_infer_p95_us) {
+        None => None,
+        Some(us) => {
+            // 定義の検証（`1..=MAX_LIMIT_INFER_P95_US`）で到達しない防御的な変換。
+            let limit = us
+                .checked_mul(1_000)
+                .ok_or_else(|| invalid("latency limit is out of range"))
+                .and_then(|ns| {
+                    LatencyLimit::from_ns(ns).map_err(|_| invalid("latency limit is out of range"))
+                })?;
+            let inputs = latency_inputs(&records, &split);
+            check_latency_with_clock(&pipeline, &inputs, limit, &MonotonicClock::new())?
+        }
+    };
+
     // 組み立て・容量計測はステージングで行い、上限内のときだけ `package/` へ原子的に公開する
     // （容量超過のパッケージを `infer --package` で使える場所に残さない。既存の `package/` は
     // 事前に拒否済みで、置き換えも削除もしない。REQ-30・REQ-39）。
@@ -222,9 +254,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
             return Err(report);
         }
     };
-    // 暫定固定値を検証済み型へ変換し、runtime の照合（`check_capacity_limit`）の結果を渡す。
-    // 変換失敗（0）は `invalid_input`。ステージングは片付けてから返す。
-    let limit = match CapacityLimit::from_bytes(CAPACITY_LIMIT_BYTES) {
+    // 利用者設定（無ければ既定値）を検証済み型へ変換し、runtime の照合（`check_capacity_limit`）の結果を
+    // 渡す。変換失敗（0）は `invalid_input`。ステージングは片付けてから返す。
+    let capacity_limit_bytes = definition
+        .limits()
+        .and_then(Limits::max_package_bytes)
+        .unwrap_or(DEFAULT_CAPACITY_LIMIT_BYTES);
+    let limit = match CapacityLimit::from_bytes(capacity_limit_bytes) {
         Ok(limit) => limit,
         Err(e) => {
             let _ = project.remove_created_dir(&staging);
@@ -232,10 +268,51 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         }
     };
     let check = check_capacity_limit(&breakdown, Some(limit));
-    let breaches = finalize_staging(&project, &staging, &check)?;
+    // p95 が超過しても組み立てと容量計測は行い、両方の超過を載せる（値の出力は #340）。
+    let mut breaches: Vec<LimitBreach> = check.breach().into_iter().collect();
+    breaches.extend(latency_breach);
+    let breaches = finalize_staging(&project, &staging, &breaches)?;
     // 上限超過（20）が合否より優先される規則は runtime の `resolve_package_outcome` に任せる。
     // Fail・Undeterminable でも公開の関門は容量だけ（`finalize_staging` は合否を見ない。#328）。
     Ok(resolve_package_outcome(&breaches, quality))
+}
+
+/// p95 計測の入力を `train` 分割の `input` から集める（REQ-27・REQ-39。#338）。
+///
+/// validation・test 分割と凍結した評価データは使わない。件数が [`MAX_INFER_BATCH_LEN`] に達するか、
+/// 総バイト数が [`MAX_INFER_BATCH_TOTAL_BYTES`] を超える手前で先頭から切り詰める。空になったときは
+/// `measure_latency` が `LatencyError::NoInputs` を返し、`package` は `runtime_error`（70）になる。
+fn latency_inputs<'a>(records: &'a [ValidRecord], split: &'a SplitResult) -> Vec<&'a str> {
+    let mut inputs = Vec::new();
+    let mut total_bytes = 0_usize;
+    for row in train_rows(records, split) {
+        if inputs.len() >= MAX_INFER_BATCH_LEN {
+            break;
+        }
+        match total_bytes.checked_add(row.input.len()) {
+            Some(next) if next <= MAX_INFER_BATCH_TOTAL_BYTES => total_bytes = next,
+            _ => break,
+        }
+        inputs.push(row.input.as_str());
+    }
+    inputs
+}
+
+/// 既定の計測回数（warmup 20・iters 1000）で p95 を計測し、上限を超えたときだけ
+/// [`LimitBreach::Latency`] を返す（REQ-31・REQ-21。#338）。
+///
+/// 境界規則（`>` で超過・ちょうどは超過でない）は runtime の `check_latency_limit` に任せ、再実装しない。
+/// 計測・レポートの失敗は `runtime_error`（`message` は固定語彙の `LatencyError::code()` のみ）。
+fn check_latency_with_clock<P: Preprocessor, B: ScoringBackend, C: Clock>(
+    pipeline: &InferencePipeline<P, B>,
+    inputs: &[&str],
+    limit: LatencyLimit,
+    clock: &C,
+) -> Result<Option<LimitBreach>, ErrorReport> {
+    let samples = measure_latency(pipeline, inputs, &LatencyConfig::default(), clock)
+        .map_err(|e: LatencyError| runtime(&format!("latency measurement failed: {}", e.code())))?;
+    let report = summarize_latency(&samples).map_err(|_| runtime("latency measurement failed"))?;
+    Ok(check_latency_limit(&report, Some(limit)).breach())
 }
 
 /// 定義の合否基準と照合済みの評価記録から、`package` の合否判定を決める（REQ-24・REQ-33・#328）。
@@ -342,21 +419,21 @@ fn verify_evaluation_record(
     Ok(record)
 }
 
-/// 計測した容量が上限内ならステージングを `package/` へ原子的に公開し、超過なら公開せず片付ける
+/// 容量・p95 の超過（`breaches`）が無ければステージングを `package/` へ原子的に公開し、あれば公開せず片付ける
 /// （REQ-30・REQ-39）。公開に失敗した場合もステージングを片付けてエラーを返す。
 ///
-/// 上限を超えた場合は [`LimitBreach::Capacity`] を返し、`package/` は作らない。既存の `package/` は
+/// 超過があった場合はその一覧（[`LimitBreach::Capacity`]・[`LimitBreach::Latency`]）を返し、`package/` は作らない。既存の `package/` は
 /// 触らない（呼び出し元が事前に不在を確認済み。公開は `RENAME_NOREPLACE` 相当で置き換えない）。
 fn finalize_staging(
     project: &Project,
     staging: &CreatedDir,
-    check: &CapacityLimitCheck,
+    breaches: &[LimitBreach],
 ) -> Result<Vec<LimitBreach>, ErrorReport> {
-    // 境界規則（`>` で超過・`==` は超過でない）は runtime の `check_capacity_limit`
-    // （`capacity_limit` モジュール。TASK-30.2・#124）に集約している。ここでは再実装しない。
-    if let Some(breach) = check.breach() {
+    // 境界規則（`>` で超過・`==` は超過でない）は runtime の `check_capacity_limit`・`check_latency_limit`
+    // （TASK-30.2・#124、TASK-31.x・#338）が決めて `breaches` に載せる。ここでは再実装しない。
+    if !breaches.is_empty() {
         let _ = project.remove_created_dir(staging);
-        return Ok(vec![breach]);
+        return Ok(breaches.to_vec());
     }
     if let Err(report) = project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR) {
         let _ = project.remove_created_dir(staging);
@@ -411,6 +488,157 @@ fn assemble_and_measure(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::stages::train::test_support::records_and_split;
+    use fandhe_edge_data::split::Split;
+    use fandhe_edge_runtime::capacity_limit::CapacityLimitCheck;
+    use fandhe_edge_runtime::pipeline::{BackendError, PreprocessError, TokenIds};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// 呼び出しごとに共有カウンタを一定量進める偽の時計（`ScoringBackend` と共有する）。
+    struct FakeClock(Rc<Cell<u64>>);
+    impl Clock for FakeClock {
+        fn now_ns(&self) -> u64 {
+            self.0.get()
+        }
+    }
+
+    struct Pre;
+    impl Preprocessor for Pre {
+        fn preprocess(&self, _input: &str) -> Result<TokenIds, PreprocessError> {
+            Ok(TokenIds::new(vec![1]))
+        }
+    }
+
+    /// 1 回の推論ごとに時計を `step` ns 進める（全サンプルが同値で p95 == `step`）。`fail` なら推論失敗。
+    struct TickBackend {
+        clock: Rc<Cell<u64>>,
+        step: u64,
+        fail: bool,
+        back: bool,
+    }
+    impl ScoringBackend for TickBackend {
+        fn scores(&self, _ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
+            if self.fail {
+                return Err(BackendError::Failed);
+            }
+            if self.back {
+                self.clock.set(self.clock.get().saturating_sub(self.step));
+            } else {
+                self.clock.set(self.clock.get() + self.step);
+            }
+            Ok(vec![0.75, 0.25])
+        }
+
+        fn scores_limited(
+            &self,
+            ids: &TokenIds,
+            _limit: std::time::Duration,
+        ) -> Result<Vec<f64>, BackendError> {
+            self.scores(ids)
+        }
+    }
+
+    fn fake_pipeline(
+        step: u64,
+        fail: bool,
+        back: bool,
+    ) -> (InferencePipeline<Pre, TickBackend>, FakeClock) {
+        let cell = Rc::new(Cell::new(1_000_000_000_000));
+        let pipeline = InferencePipeline::new(
+            Pre,
+            TickBackend {
+                clock: cell.clone(),
+                step,
+                fail,
+                back,
+            },
+        );
+        (pipeline, FakeClock(cell))
+    }
+
+    /// REQ-31・REQ-21・#338: p95 が上限ちょうどなら超過でなく、1 ns 超えると `LimitBreach::Latency`。
+    #[test]
+    fn req31_issue338_latency_equal_is_within_and_one_ns_over_is_breach() {
+        let limit = LatencyLimit::from_ns(5_000 * 1_000).expect("limit");
+        let (pipeline, clock) = fake_pipeline(5_000_000, false, false);
+        assert_eq!(
+            check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure"),
+            None
+        );
+        let (pipeline, clock) = fake_pipeline(5_000_001, false, false);
+        assert_eq!(
+            check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure"),
+            Some(LimitBreach::Latency {
+                measured_p95_ns: 5_000_001,
+                limit_ns: 5_000_000
+            })
+        );
+    }
+
+    /// REQ-31・REQ-21・#338: 推論失敗は `runtime_error`（固定語彙の message）。
+    #[test]
+    fn req31_issue338_latency_inference_failure_is_runtime_error() {
+        let limit = LatencyLimit::from_ns(1_000).expect("limit");
+        let (pipeline, clock) = fake_pipeline(1, true, false);
+        let err = check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect_err("fail");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::RuntimeError);
+        assert_eq!(err.message, "latency measurement failed: inference_failed");
+    }
+
+    /// REQ-31・REQ-21・#338: 時計の逆行は `runtime_error`。
+    #[test]
+    fn req31_issue338_latency_non_monotonic_clock_is_runtime_error() {
+        let limit = LatencyLimit::from_ns(1_000).expect("limit");
+        let (pipeline, clock) = fake_pipeline(10, false, true);
+        let err = check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect_err("fail");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::RuntimeError);
+        assert_eq!(
+            err.message,
+            "latency measurement failed: non_monotonic_clock"
+        );
+    }
+
+    /// REQ-27・#338: 計測入力は Train の `input` だけで、Validation・Test は含まれない。
+    #[test]
+    fn req27_issue338_latency_inputs_use_train_split_only() {
+        let (records, split) = records_and_split(&[
+            ("a", Split::Train),
+            ("b", Split::Validation),
+            ("c", Split::Test),
+            ("d", Split::Train),
+        ]);
+        let inputs = latency_inputs(&records, &split);
+        assert_eq!(inputs, vec!["input-a", "input-d"]);
+        assert!(!inputs.contains(&"input-b"));
+        assert!(!inputs.contains(&"input-c"));
+    }
+
+    /// REQ-39・#338: 件数の上限を超える Train は先頭から切り詰められ、長さがちょうど上限になる。
+    #[test]
+    fn req39_issue338_latency_inputs_truncate_to_batch_len_limit() {
+        let ids: Vec<String> = (0..=MAX_INFER_BATCH_LEN).map(|i| i.to_string()).collect();
+        let rows: Vec<(&str, Split)> = ids.iter().map(|id| (id.as_str(), Split::Train)).collect();
+        let (records, split) = records_and_split(&rows);
+        let inputs = latency_inputs(&records, &split);
+        assert_eq!(inputs.len(), MAX_INFER_BATCH_LEN);
+        assert_eq!(inputs.first().copied(), Some("input-0"));
+    }
+
+    /// REQ-31・REQ-30・#338: 容量は上限内でも p95 の超過があれば公開せず、ステージングも残さない。
+    #[test]
+    fn req31_issue338_latency_breach_leaves_no_package_and_no_staging() {
+        let (cwd, project, staging) = setup("latency");
+        let breach = LimitBreach::Latency {
+            measured_p95_ns: 2,
+            limit_ns: 1,
+        };
+        let breaches = finalize_staging(&project, &staging, &[breach]).expect("finalize");
+        assert_eq!(breaches, vec![breach]);
+        assert!(!project.exists(PACKAGE_DIR).expect("exists"));
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 
     /// 測定値と上限から `check_capacity_limit` 相当の照合結果を作る（境界規則は runtime 側の 1 箇所）。
     fn check_of(measured_bytes: u64, limit_bytes: u64) -> CapacityLimitCheck {
@@ -443,7 +671,12 @@ mod tests {
     #[test]
     fn req30_over_limit_leaves_no_package_and_no_staging() {
         let (cwd, project, staging) = setup("over");
-        let breaches = finalize_staging(&project, &staging, &check_of(41, 40)).expect("finalize");
+        let breaches = finalize_staging(
+            &project,
+            &staging,
+            &check_of(41, 40).breach().into_iter().collect::<Vec<_>>(),
+        )
+        .expect("finalize");
         assert_eq!(
             breaches,
             vec![LimitBreach::Capacity {
@@ -460,7 +693,12 @@ mod tests {
     #[test]
     fn req30_within_limit_publishes_package() {
         let (cwd, project, staging) = setup("within");
-        let breaches = finalize_staging(&project, &staging, &check_of(40, 40)).expect("finalize");
+        let breaches = finalize_staging(
+            &project,
+            &staging,
+            &check_of(40, 40).breach().into_iter().collect::<Vec<_>>(),
+        )
+        .expect("finalize");
         assert_eq!(breaches, Vec::new());
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let bytes = project
@@ -479,7 +717,12 @@ mod tests {
         project
             .write_new(Path::new(PACKAGE_DIR).join("artifact.json"), b"old")
             .expect("old file");
-        let breaches = finalize_staging(&project, &staging, &check_of(41, 40)).expect("finalize");
+        let breaches = finalize_staging(
+            &project,
+            &staging,
+            &check_of(41, 40).breach().into_iter().collect::<Vec<_>>(),
+        )
+        .expect("finalize");
         assert_eq!(breaches.len(), 1);
         let bytes = project
             .read(Path::new(PACKAGE_DIR).join("artifact.json"), 16)
@@ -495,8 +738,12 @@ mod tests {
     fn req39_publish_does_not_replace_existing_package() {
         let (cwd, project, staging) = setup("noreplace");
         project.create_dir(PACKAGE_DIR).expect("empty package");
-        let err =
-            finalize_staging(&project, &staging, &check_of(1, 40)).expect_err("must not replace");
+        let err = finalize_staging(
+            &project,
+            &staging,
+            &check_of(1, 40).breach().into_iter().collect::<Vec<_>>(),
+        )
+        .expect_err("must not replace");
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);

@@ -15,10 +15,12 @@
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
 //!   `package` はその記録を確認する。Wilson 区間・McNemar / Holm・診断（REQ-29）は未結線
 //!   （[`evaluate`] 参照）
-//! - `package` は容量（REQ-30）を計測し、定義ファイルの省略可能な合否基準
+//! - `package` は容量（REQ-30）を計測して `limits.max_package_bytes`（無ければ 40,000,000）と照合し、
+//!   `limits.max_infer_p95_us` があれば `train` 分割の入力で推論待ち時間 p95 を計測して照合する
+//!   （REQ-31。超過は公開せず exit 20。#338）。定義ファイルの省略可能な合否基準
 //!   `acceptance.min_accuracy_bp` を評価記録の正解率と Wilson 95% 区間で照合して
 //!   pass（exit 0）・fail（exit 10）・undeterminable（exit 12）を返す（#328）。基準が無ければ
-//!   `judgment:null`・`acceptance_defined:false`（`pass` を出さない）。p95（REQ-31。#338）は未接続
+//!   `judgment:null`・`acceptance_defined:false`（`pass` を出さない）。容量内訳・p95 値の出力は未接続（#340）
 //! - `infer --out` は未実装（`runtime_error`）
 //!
 //! # 未検証の項目（「検証済み」ではない）

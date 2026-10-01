@@ -1335,6 +1335,140 @@ mod suite {
         assert!(!env.project_file("package.staging").exists());
     }
 
+    /// 上限 `limits` を足した定義 JSON（#338）。
+    fn limits_definition_text(extra: &str) -> String {
+        definition_text().replacen(
+            r#""io":{"input":"bytes"}"#,
+            &format!(r#""io":{{"input":"bytes"}},"limits":{extra}"#),
+            1,
+        )
+    }
+
+    /// 評価データなしで `limits` つきの定義を `register → inspect → train 0 → select` まで進める（#338）。
+    fn limits_env(case: &str, limits: &str) -> Env {
+        let env = Env::new(case, false);
+        std::fs::write(
+            env.work.join("def").join("definition.json"),
+            limits_definition_text(limits),
+        )
+        .expect("definition");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&SELECT);
+        env
+    }
+
+    const LIMIT_EXCEEDED_JSON: &str =
+        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n";
+
+    /// REQ-31・REQ-21・#338: p95 の上限が 1 µs だと超過（exit 20）で、`package/`・ステージングを作らない。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX。実機の p95 ではない）。
+    pub fn package_latency_limit_1us_is_limit_exceeded() {
+        let env = limits_env("lat1us", r#"{"max_infer_p95_us":1}"#);
+        assert_eq!(
+            env.fails(&PACKAGE, 20, "limit_exceeded"),
+            LIMIT_EXCEEDED_JSON
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-31・#338: 十分大きい p95 の上限なら合格で、出力は `limits` なしと同じ（p95 値は出さない）。
+    pub fn package_latency_limit_large_is_ok() {
+        let env = limits_env("latlarge", r#"{"max_infer_p95_us":3600000000}"#);
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        );
+        assert!(env.project_file("package/artifact.json").is_file());
+    }
+
+    /// REQ-30・REQ-21・#338: 定義の `max_package_bytes` が容量の上限になり、超えると exit 20。
+    pub fn package_capacity_limit_from_definition_is_limit_exceeded() {
+        let env = limits_env("capdef", r#"{"max_package_bytes":1}"#);
+        assert_eq!(
+            env.fails(&PACKAGE, 20, "limit_exceeded"),
+            LIMIT_EXCEEDED_JSON
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
+    /// REQ-15・#338: 範囲外・未知の欄・空・`null` を持つ `limits` は `register` が `invalid_input` で拒否する。
+    pub fn register_rejects_invalid_limits() {
+        let cases = [
+            (
+                r#"{"max_infer_p95_us":0}"#,
+                "definition field limits.max_infer_p95_us has an unsupported value",
+            ),
+            (
+                r#"{"max_infer_p95_us":3600000001}"#,
+                "definition field limits.max_infer_p95_us has an unsupported value",
+            ),
+            (
+                r#"{"max_package_bytes":0}"#,
+                "definition field limits.max_package_bytes has an unsupported value",
+            ),
+            (
+                r#"{"max_infer_p95_us":1,"x":1}"#,
+                "definition field limits has an unknown key",
+            ),
+            ("{}", "definition field limits has an unsupported value"),
+            (
+                "null",
+                "definition field limits has wrong type: expected object, found null",
+            ),
+            (
+                r#"{"max_infer_p95_us":null}"#,
+                "definition field limits.max_infer_p95_us has wrong type: expected unsigned integer (u64), found null",
+            ),
+        ];
+        for (i, (limits, message)) in cases.iter().enumerate() {
+            let env = Env::new(&format!("limbad{i}"), false);
+            std::fs::write(
+                env.work.join("def").join("definition.json"),
+                limits_definition_text(limits),
+            )
+            .expect("definition");
+            assert_eq!(
+                env.fails(
+                    &["register", "--definition", DEF, "--project-dir", "proj"],
+                    64,
+                    "invalid_input"
+                ),
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+        }
+    }
+
+    /// REQ-27・#338: `evaluate` の後に `limits` を書き換えると、評価記録の定義ハッシュが一致せず
+    /// `package` は `invalid_input` で止まり、`package/`・ステージングを作らない。
+    pub fn package_rejects_limits_changed_after_evaluate() {
+        let predicted = predicted_evaluation_labels();
+        let env = acceptance_env(
+            "limchange",
+            &limits_definition_text(r#"{"max_infer_p95_us":3600000000}"#),
+            &predicted,
+        );
+        env.ok(&EVALUATE_1);
+        let definition = env.project_file("definition.json");
+        let mut perm = std::fs::metadata(&definition).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&definition, perm).expect("chmod");
+        std::fs::write(
+            &definition,
+            limits_definition_text(r#"{"max_infer_p95_us":3500000000}"#),
+        )
+        .expect("rewrite definition");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("package.staging").exists());
+    }
+
     /// REQ-15・#328: 範囲外の基準・未知の欄・`null` を持つ定義は `register` が `invalid_input` で拒否する。
     pub fn register_rejects_invalid_acceptance() {
         let cases = [
@@ -2049,6 +2183,26 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_acceptance_changed_after_evaluate",
             suite::package_rejects_acceptance_changed_after_evaluate,
+        ),
+        (
+            "package_latency_limit_1us_is_limit_exceeded",
+            suite::package_latency_limit_1us_is_limit_exceeded,
+        ),
+        (
+            "package_latency_limit_large_is_ok",
+            suite::package_latency_limit_large_is_ok,
+        ),
+        (
+            "package_capacity_limit_from_definition_is_limit_exceeded",
+            suite::package_capacity_limit_from_definition_is_limit_exceeded,
+        ),
+        (
+            "register_rejects_invalid_limits",
+            suite::register_rejects_invalid_limits,
+        ),
+        (
+            "package_rejects_limits_changed_after_evaluate",
+            suite::package_rejects_limits_changed_after_evaluate,
         ),
         (
             "register_rejects_invalid_acceptance",

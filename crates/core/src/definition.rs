@@ -46,6 +46,14 @@
 //! 省略可能な欄として取り込む。`package` の合否判定（judgment）が参照する基準で、
 //! 欄が無い定義は従来どおり「基準未定義」であり、正準化ハッシュも変わらない
 //! （`Definition.acceptance` は `None` のとき直列化しない）。
+//!
+//! # 上限（#338・REQ-30・REQ-31・REQ-21）
+//! - `limits`（`max_infer_p95_us`・`max_package_bytes`。いずれも省略可能）は
+//!   `package` が推論待ち時間 p95 と容量を照合する上限で、`acceptance`（合否。
+//!   exit 10/12）とは別の欄である。超過は exit 20 で、合否と区別する
+//! - `None` のときは直列化しないので、`limits` の無い定義の正準化ハッシュは変わらない
+//! - 値は定義の正準化ハッシュに含まれるため、`evaluate` の後に変えると `package` が
+//!   評価記録の照合で止まる（意図した挙動。REQ-27）
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -153,6 +161,63 @@ where
     RawAcceptance::deserialize(d).map(Some)
 }
 
+/// `limits.max_infer_p95_us` の上限（µs。1 時間）。`limits::MAX_TIME_LIMIT_NS` から導出し、
+/// 2 つ目のリテラルを持たない（#338・REQ-31）。
+pub const MAX_LIMIT_INFER_P95_US: u64 = crate::limits::MAX_TIME_LIMIT_NS / 1_000;
+
+/// 利用者設定の上限（#338・REQ-30・REQ-31・REQ-21）。CLI の `package` 工程が
+/// 容量（`max_package_bytes`）と推論待ち時間 p95（`max_infer_p95_us`）の照合に使う。
+///
+/// `Deserialize` は実装しない（範囲検証の迂回を防ぐ。[`Acceptance`] と同じ流儀）。
+/// 検証済みの値は [`Definition::parse`] 経由でのみ作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Limits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_infer_p95_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_package_bytes: Option<u64>,
+}
+
+impl Limits {
+    /// 推論待ち時間 p95 の上限（µs。指定時は `1..=MAX_LIMIT_INFER_P95_US` が保証済み）。
+    #[must_use]
+    pub fn max_infer_p95_us(&self) -> Option<u64> {
+        self.max_infer_p95_us
+    }
+
+    /// 配布物容量の上限（バイト。指定時は 1 以上が保証済み）。
+    #[must_use]
+    pub fn max_package_bytes(&self) -> Option<u64> {
+        self.max_package_bytes
+    }
+}
+
+/// [`Limits`] の未検証の中間表現（デシリアライズ専用。`parse` 内でのみ使う）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLimits {
+    #[serde(default, deserialize_with = "deserialize_present_u64")]
+    max_infer_p95_us: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_present_u64")]
+    max_package_bytes: Option<u64>,
+}
+
+/// キーがあるのに値が `null` のとき `None` として黙って受理せず型エラーにする（#338）。
+fn deserialize_present_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u64::deserialize(d).map(Some)
+}
+
+/// `limits` キーがあるのに値が `null` のとき型エラーにする（#338）。
+fn deserialize_present_limits<'de, D>(d: D) -> Result<Option<RawLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RawLimits::deserialize(d).map(Some)
+}
+
 /// 入出力のデータ構造（REQ-15）。出力側は `judgment_type`／`options` で
 /// 表現済みのため、ここでは入力表現のみを持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +251,9 @@ pub struct Definition {
     /// 省略可能な合否基準（#328）。`None` は基準未定義で、正準化 JSON にも現れない。
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptance: Option<Acceptance>,
+    /// 省略可能な上限（#338）。`None` は未設定で、正準化 JSON にも現れない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limits: Option<Limits>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -207,6 +275,8 @@ struct RawDefinition {
     io: IoSchema,
     #[serde(default, deserialize_with = "deserialize_present_acceptance")]
     acceptance: Option<RawAcceptance>,
+    #[serde(default, deserialize_with = "deserialize_present_limits")]
+    limits: Option<RawLimits>,
 }
 
 /// 定義ファイル内のフィールドの位置を表すパス（TASK-15.3-2）。
@@ -243,6 +313,12 @@ pub enum FieldPath {
     Acceptance,
     /// `acceptance.min_accuracy_bp`（#328）。
     AcceptanceMinAccuracyBp,
+    /// `limits`（#338）。
+    Limits,
+    /// `limits.max_infer_p95_us`（#338）。
+    LimitsMaxInferP95Us,
+    /// `limits.max_package_bytes`（#338）。
+    LimitsMaxPackageBytes,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -260,6 +336,9 @@ impl std::fmt::Display for FieldPath {
             FieldPath::IoInput => write!(f, "io.input"),
             FieldPath::Acceptance => write!(f, "acceptance"),
             FieldPath::AcceptanceMinAccuracyBp => write!(f, "acceptance.min_accuracy_bp"),
+            FieldPath::Limits => write!(f, "limits"),
+            FieldPath::LimitsMaxInferP95Us => write!(f, "limits.max_infer_p95_us"),
+            FieldPath::LimitsMaxPackageBytes => write!(f, "limits.max_package_bytes"),
         }
     }
 }
@@ -293,6 +372,8 @@ pub enum ExpectedType {
     String,
     /// `version` フィールドの許容範囲（0 以上 `u32::MAX` 以下の整数）。
     UnsignedInt32,
+    /// `limits` の各値（0 以上 `u64::MAX` 以下の整数。#338）。
+    UnsignedInt64,
 }
 
 impl std::fmt::Display for ExpectedType {
@@ -302,6 +383,7 @@ impl std::fmt::Display for ExpectedType {
             ExpectedType::Array => write!(f, "array"),
             ExpectedType::String => write!(f, "string"),
             ExpectedType::UnsignedInt32 => write!(f, "unsigned integer (u32)"),
+            ExpectedType::UnsignedInt64 => write!(f, "unsigned integer (u64)"),
         }
     }
 }
@@ -781,6 +863,35 @@ impl Definition {
             }
         };
 
+        // 上限（#338）: 空の `{}` と範囲外は拒否する（fail-closed）。
+        let limits = match raw.limits {
+            None => None,
+            Some(raw_limits) => {
+                if raw_limits.max_infer_p95_us.is_none() && raw_limits.max_package_bytes.is_none() {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::Limits,
+                    });
+                }
+                if raw_limits
+                    .max_infer_p95_us
+                    .is_some_and(|v| v == 0 || v > MAX_LIMIT_INFER_P95_US)
+                {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::LimitsMaxInferP95Us,
+                    });
+                }
+                if raw_limits.max_package_bytes == Some(0) {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::LimitsMaxPackageBytes,
+                    });
+                }
+                Some(Limits {
+                    max_infer_p95_us: raw_limits.max_infer_p95_us,
+                    max_package_bytes: raw_limits.max_package_bytes,
+                })
+            }
+        };
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -789,6 +900,7 @@ impl Definition {
             options: raw.options,
             io: raw.io,
             acceptance,
+            limits,
         })
     }
 
@@ -854,6 +966,12 @@ impl Definition {
     #[must_use]
     pub fn acceptance(&self) -> Option<&Acceptance> {
         self.acceptance.as_ref()
+    }
+
+    /// 利用者設定の上限（#338）。`None` は未設定（容量は既定値、p95 は計測しない）。
+    #[must_use]
+    pub fn limits(&self) -> Option<&Limits> {
+        self.limits.as_ref()
     }
 
     /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
@@ -1784,5 +1902,214 @@ mod tests {
             with.canonical_hash().expect("hash")
         );
         assert_eq!(without.identity(), with.identity());
+    }
+
+    /// 上限を `limits_json` に差し込んだ定義 JSON（#338）。
+    fn with_limits(limits_json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "limits": {limits_json}"#),
+            1,
+        )
+    }
+
+    /// REQ-31・#338: 上限定数は 1 時間（µs）で、ns 定数から導出されている。
+    #[test]
+    fn req31_issue338_max_limit_infer_p95_us_is_one_hour() {
+        assert_eq!(MAX_LIMIT_INFER_P95_US, 3_600_000_000);
+        assert_eq!(
+            MAX_LIMIT_INFER_P95_US * 1000,
+            crate::limits::MAX_TIME_LIMIT_NS
+        );
+    }
+
+    /// REQ-15・#338: 範囲内の値は受理され、アクセサの値が一致する。
+    #[test]
+    fn req15_issue338_limits_accepts_in_range_values() {
+        for p95 in [1_u64, 50_000, 3_600_000_000] {
+            let def =
+                Definition::parse(&with_limits(&format!(r#"{{ "max_infer_p95_us": {p95} }}"#)))
+                    .expect("parse");
+            let l = def.limits().expect("limits");
+            assert_eq!(l.max_infer_p95_us(), Some(p95));
+            assert_eq!(l.max_package_bytes(), None);
+        }
+        for b in [1_u64, 40_000_000, u64::MAX] {
+            let def =
+                Definition::parse(&with_limits(&format!(r#"{{ "max_package_bytes": {b} }}"#)))
+                    .expect("parse");
+            let l = def.limits().expect("limits");
+            assert_eq!(l.max_infer_p95_us(), None);
+            assert_eq!(l.max_package_bytes(), Some(b));
+        }
+        let def = Definition::parse(&with_limits(
+            r#"{ "max_infer_p95_us": 7, "max_package_bytes": 9 }"#,
+        ))
+        .expect("parse");
+        assert_eq!(def.limits().and_then(Limits::max_infer_p95_us), Some(7));
+        assert_eq!(def.limits().and_then(Limits::max_package_bytes), Some(9));
+        assert_eq!(
+            Definition::parse(TWO_OPTIONS_JSON).expect("parse").limits(),
+            None
+        );
+    }
+
+    /// REQ-15・#338: 範囲外は `UnsupportedValue`（64）で、メッセージは固定語のみ。
+    #[test]
+    fn req15_issue338_limits_rejects_out_of_range_values() {
+        for (json, field, msg) in [
+            (
+                r#"{ "max_infer_p95_us": 0 }"#,
+                FieldPath::LimitsMaxInferP95Us,
+                "definition field limits.max_infer_p95_us has an unsupported value",
+            ),
+            (
+                r#"{ "max_infer_p95_us": 3600000001 }"#,
+                FieldPath::LimitsMaxInferP95Us,
+                "definition field limits.max_infer_p95_us has an unsupported value",
+            ),
+            (
+                r#"{ "max_infer_p95_us": 18446744073709551615 }"#,
+                FieldPath::LimitsMaxInferP95Us,
+                "definition field limits.max_infer_p95_us has an unsupported value",
+            ),
+            (
+                r#"{ "max_package_bytes": 0 }"#,
+                FieldPath::LimitsMaxPackageBytes,
+                "definition field limits.max_package_bytes has an unsupported value",
+            ),
+            (
+                "{}",
+                FieldPath::Limits,
+                "definition field limits has an unsupported value",
+            ),
+        ] {
+            let err = Definition::parse(&with_limits(json)).unwrap_err();
+            assert!(
+                matches!(&err, DefinitionError::UnsupportedValue { field: f } if *f == field),
+                "{json}: {err:?}"
+            );
+            assert_eq!(err.public_message(), msg);
+            assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+        }
+    }
+
+    /// REQ-15・#338: 形の不正（null・負数・小数・文字列・u64 超）は `TypeMismatch`。
+    #[test]
+    fn req15_issue338_limits_rejects_malformed_shapes() {
+        for (json, field, expected, actual) in [
+            (
+                "null",
+                FieldPath::Limits,
+                ExpectedType::Object,
+                JsonType::Null,
+            ),
+            (
+                "1",
+                FieldPath::Limits,
+                ExpectedType::Object,
+                JsonType::Number,
+            ),
+            (
+                r#"{ "max_infer_p95_us": null }"#,
+                FieldPath::LimitsMaxInferP95Us,
+                ExpectedType::UnsignedInt64,
+                JsonType::Null,
+            ),
+            (
+                r#"{ "max_infer_p95_us": -1 }"#,
+                FieldPath::LimitsMaxInferP95Us,
+                ExpectedType::UnsignedInt64,
+                JsonType::Number,
+            ),
+            (
+                r#"{ "max_package_bytes": 0.5 }"#,
+                FieldPath::LimitsMaxPackageBytes,
+                ExpectedType::UnsignedInt64,
+                JsonType::Number,
+            ),
+            (
+                r#"{ "max_package_bytes": "1" }"#,
+                FieldPath::LimitsMaxPackageBytes,
+                ExpectedType::UnsignedInt64,
+                JsonType::String,
+            ),
+            (
+                r#"{ "max_package_bytes": 18446744073709551616 }"#,
+                FieldPath::LimitsMaxPackageBytes,
+                ExpectedType::UnsignedInt64,
+                JsonType::Number,
+            ),
+        ] {
+            let err = Definition::parse(&with_limits(json)).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    DefinitionError::TypeMismatch { field: f, expected: e, actual: a }
+                        if *f == field && *e == expected && *a == actual
+                ),
+                "{json}: {err:?}"
+            );
+        }
+        let err = Definition::parse(&with_limits(r#"{ "max_infer_p95_us": null }"#)).unwrap_err();
+        assert_eq!(
+            err.public_message(),
+            "definition field limits.max_infer_p95_us has wrong type: expected unsigned integer (u64), found null"
+        );
+        let err = Definition::parse(&with_limits("null")).unwrap_err();
+        assert_eq!(
+            err.public_message(),
+            "definition field limits has wrong type: expected object, found null"
+        );
+    }
+
+    /// REQ-15・#338: 未知キーは `UnknownField`。
+    #[test]
+    fn req15_issue338_limits_rejects_unknown_key() {
+        let err =
+            Definition::parse(&with_limits(r#"{ "max_infer_p95_us": 1, "x": 1 }"#)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DefinitionError::UnknownField { parent: FieldPath::Limits, name } if name == "x"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.public_message(),
+            "definition field limits has an unknown key"
+        );
+    }
+
+    /// REQ-15・#338: `limits` 無しの正準化 JSON に `limits` は現れず、有りはキー順で入る。
+    #[test]
+    fn req15_issue338_limits_canonical_json_is_omitted_or_ordered() {
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("parse");
+        assert!(!without.canonical_json().expect("canon").contains("limits"));
+        let with =
+            Definition::parse(&with_limits(r#"{ "max_infer_p95_us": 50000 }"#)).expect("parse");
+        let json = with.canonical_json().expect("canon");
+        assert!(
+            json.contains(r#""limits":{"max_infer_p95_us":50000}"#),
+            "{json}"
+        );
+        assert_ne!(
+            without.canonical_hash().expect("hash"),
+            with.canonical_hash().expect("hash")
+        );
+        assert_eq!(without.identity(), with.identity());
+        let both = TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            r#""io": { "input": "bytes" }, "limits": { "max_package_bytes": 5, "max_infer_p95_us": 3 }, "acceptance": { "min_accuracy_bp": 1 }"#,
+            1,
+        );
+        let json = Definition::parse(&both)
+            .expect("parse")
+            .canonical_json()
+            .expect("canon");
+        assert!(
+            json.contains(r#""acceptance":{"min_accuracy_bp":1},"io":{"input":"bytes"},"judgment_type":"single_select","limits":{"max_infer_p95_us":3,"max_package_bytes":5},"name""#),
+            "{json}"
+        );
     }
 }

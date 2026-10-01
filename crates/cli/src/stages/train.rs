@@ -74,6 +74,19 @@ pub fn worker_launcher() -> Result<WorkerLauncher, ErrorReport> {
     WorkerLauncher::from_trainer_dir(&dir).map_err(|e| e.to_error_report())
 }
 
+/// 分割の `train` に割り当てられた行だけを入力順に返す（`train` 工程の学習データと、`package` の
+/// p95 計測入力が共有する。validation・test 分割と凍結した評価データは含めない。REQ-27）。
+///
+/// 判定は `Split::Train` との一致 1 箇所に限る（否定条件で書くと `Split::Test` が混入するため）。
+pub(crate) fn train_rows<'a>(
+    records: &'a [ValidRecord],
+    split: &'a SplitResult,
+) -> impl Iterator<Item = &'a ValidRecord> + 'a {
+    records
+        .iter()
+        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Train))
+}
+
 /// 候補ディレクトリのプロジェクト内の相対パス。
 #[must_use]
 pub fn candidate_rel(index: usize) -> PathBuf {
@@ -147,11 +160,10 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
             .insert("epochs".to_string(), 1.into());
     }
 
-    let train_rows = records
-        .iter()
-        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Train));
-    let train_jsonl = trainer_jsonl(train_rows.map(|r| (r.input.as_str(), r.label_id.as_str())))
-        .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
+    let train_jsonl = trainer_jsonl(
+        train_rows(&records, &split).map(|r| (r.input.as_str(), r.label_id.as_str())),
+    )
+    .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
     let request = build_train_request(candidate.params, &records, &split)?;
     let request_json = request.to_json_vec().map_err(|e| e.to_error_report())?;
     let launcher = worker_launcher()?;
@@ -362,9 +374,60 @@ fn stage_file_error_report(error: StageFileError, message: &str) -> ErrorReport 
     }
 }
 
+/// 分割つきの合成レコード（`train_rows`・`package` の p95 計測入力のテストが共有する）。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// `(id, split)` の並びから、入力が `input-<id>` のレコードと分割結果を作る。
+    pub(crate) fn records_and_split(rows: &[(&str, Split)]) -> (Vec<ValidRecord>, SplitResult) {
+        let records = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| ValidRecord {
+                line: i + 1,
+                id: (*id).to_string(),
+                input: format!("input-{id}"),
+                label_id: "yes".to_string(),
+                output_key: String::new(),
+                tags: None,
+                group_id: None,
+            })
+            .collect();
+        let by_record: BTreeMap<String, Split> = rows
+            .iter()
+            .map(|(id, split)| ((*id).to_string(), *split))
+            .collect();
+        let split = SplitResult {
+            by_record,
+            by_group: BTreeMap::new(),
+            per_label: Vec::new(),
+            rule_id: "test",
+        };
+        (records, split)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::records_and_split;
     use super::*;
+
+    /// REQ-27・#338: `train_rows` は Train の行だけを入力順に返し、Validation・Test を除く。
+    #[test]
+    fn req27_issue338_train_rows_returns_only_train_in_order() {
+        let (records, split) = records_and_split(&[
+            ("a", Split::Train),
+            ("b", Split::Validation),
+            ("c", Split::Test),
+            ("d", Split::Train),
+        ]);
+        let ids: Vec<&str> = train_rows(&records, &split)
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "d"]);
+    }
 
     /// REQ-39: 学習用データの上限超過は `limit_exceeded`（20）、それ以外の失敗は `runtime_error`（70）。
     #[test]
