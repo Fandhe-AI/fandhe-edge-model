@@ -310,3 +310,58 @@ def test_mask_preserves_layout() -> None:
     assert [len(x) for x in masked.split("\n")] == [len(x) for x in src.split("\n")]
     assert "fn f<'a>() {}" in masked
     assert "x" not in masked.split("\n")[0].split("=")[1]
+
+
+def test_cfg_attr_deny_after_other_lint_is_not_flagged(repo: Path, capsys: Capture) -> None:
+    """cfg_attr の複数 lint で unsafe_code が deny に属すなら誤検出しない（REQ-39・#335）。"""
+    src = (
+        '#[cfg_attr(feature = "x", allow(dead_code), deny(unsafe_code))]\n'
+        "fn a() {}\n"
+        "#[cfg_attr(all(), allow(dead_code), forbid(unsafe_code))]\nfn b() {}\n"
+    )
+    (repo / "crates/core/src/extra.rs").write_text(src)
+    code, payload = run(repo, capsys)
+    assert (code, payload["violation_count"]) == (0, 0)
+
+
+def test_cfg_attr_allow_with_other_lints_is_detected(repo: Path, capsys: Capture) -> None:
+    """複数 lint 指定の allow(dead_code, unsafe_code) は allow として検出する（REQ-39・#335）。"""
+    (repo / "crates/core/src/extra.rs").write_text(
+        '#[cfg_attr(feature = "x", deny(dead_code), allow(dead_code, unsafe_code))]\nfn a() {}\n'
+    )
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("unlisted_allow", "a") in kinds(payload)
+
+
+def test_const_generic_brace_in_header_is_included_in_body_hash(repo: Path) -> None:
+    """ヘッダの const generic の `{}` で本体が途切れず、本体の変更を検出する（REQ-39・#335）。"""
+    src = "#[allow(unsafe_code)]\nfn g<const N: usize = { 1 + 1 }>() {\n    let _a = 0;\n}\n"
+    target = repo / "crates/core/src/extra.rs"
+    target.write_text(src)
+    _, before = mod.print_hashes(repo)
+    target.write_text(src.replace("_a = 0", "_a = 1"))
+    _, after = mod.print_hashes(repo)
+
+    def digest(payload: dict[str, Any]) -> str:
+        found = [o for o in payload["occurrences"] if o["file"].endswith("extra.rs")]
+        return str(found[0]["body_sha256"])
+
+    assert digest(before) != digest(after)
+
+
+def test_out_of_line_mod_allow_is_rejected(repo: Path, capsys: Capture) -> None:
+    """`mod name;` への allow は別ファイルに及ぶため fail-closed で拒否する（REQ-39・#335）。"""
+    (repo / "crates/core/src/extra.rs").write_text("#[allow(unsafe_code)]\nmod inner;\n")
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert "unparsed_attribute" in {v["kind"] for v in payload["violations"]}
+
+
+def test_lefthook_unsafe_hook_covers_cargo_config() -> None:
+    """hook の unsafe-allowlist が .cargo/config* を glob と抽出に含む（REQ-39・#335）。"""
+    text = (REPO / "lefthook.yml").read_text()
+    block = text[text.index("name: unsafe-allowlist") : text.index("commit-msg:")]
+    assert block.count(".cargo/config.toml") == 2
+    assert block.count('".cargo/config"') == 1
+    assert block.count(" .cargo/config ") == 1

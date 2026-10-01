@@ -31,6 +31,11 @@ rustc / clippy の lint ではなくソースの文字列走査にしている�
   メンバー crate の `[lints]` が `workspace = true` のみでなければ `lints_override`。
   `.cargo/config*` に `unsafe_code` が現れたら `cargo_config_lint`（迂回経路の封じ込め）。
 
+out-of-line の `mod name;` に付けた許可は別ファイルの内容に及ぶため、本体ハッシュで担保できず
+`unparsed_attribute` とする（`#[allow]` は `mod name { .. }` の内側か、対象の item に直接付ける）。
+属性は `allow(..)` 等の lint 指定ごとに引数を調べ、`unsafe_code` が属するレベルだけで判定する
+（`cfg_attr(.., allow(dead_code), deny(unsafe_code))` は deny 扱い）。
+
 item の特定は rustfmt 済みのソースを前提にする（enclosing `mod` はインデントで判定。
 `make fmt-check` が前提を担保する）。
 
@@ -90,7 +95,7 @@ ENTRY_FIELDS = {
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 WORD_UNSAFE_RE = re.compile(r"\bunsafe_code\b")
-LEVEL_RE = re.compile(r"\b(allow|expect|warn|deny|forbid)\b")
+LEVEL_CALL_RE = re.compile(r"\b(allow|expect|warn|deny|forbid)\s*\(")
 RAW_STR_RE = re.compile(r"b?r(#*)\"")
 ITEM_RE = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+|unsafe\s+|async\s+|default\s+"
@@ -262,15 +267,39 @@ def enclosing_mods(lines: list[str], line_idx: int) -> list[str]:
     return list(reversed(mods))
 
 
-def _item_name(rest: str) -> str:
-    """属性の直後のテキストから対象 item の名前を得る（後続の属性は読み飛ばす）。"""
+def _unsafe_code_levels(body: str) -> set[str]:
+    """属性本文から、`unsafe_code` を引数に持つ lint 指定のレベルだけを集める。
+
+    `cfg_attr(.., allow(dead_code), deny(unsafe_code))` のように複数の lint 指定が並ぶ場合に、
+    `unsafe_code` が実際に属するレベルだけを判定する（属性全体からの語の別々の検索はしない）。
+    """
+    levels: set[str] = set()
+    for m in LEVEL_CALL_RE.finditer(body):
+        depth, j = 1, m.end()
+        while j < len(body) and depth > 0:
+            depth += {"(": 1, ")": -1}.get(body[j], 0)
+            j += 1
+        inner = body[m.end() : j - 1] if depth == 0 else body[m.end() :]
+        parts = [x.strip() for x in inner.split(",")]
+        if any(x == "unsafe_code" or x.endswith("::unsafe_code") for x in parts):
+            levels.add(m.group(1))
+    return levels
+
+
+def _skip_attrs(rest: str) -> str:
+    """属性の直後のテキストから、後続の属性を読み飛ばした先頭を返す。"""
     while True:
         rest = rest.lstrip()
         am = re.match(r"#\s*!?\s*\[", rest)
         if not am:
-            break
+            return rest
         end, _ = _match_bracket(rest, am.end())
         rest = rest[end:]
+
+
+def _item_name(rest: str) -> str:
+    """属性の直後のテキストから対象 item の名前を得る（後続の属性は読み飛ばす）。"""
+    rest = _skip_attrs(rest)
     im = ITEM_RE.match(rest)
     if im and im.group(1) == "impl":
         header = re.split(r"[{;]", rest, maxsplit=1)[0]
@@ -281,19 +310,34 @@ def _item_name(rest: str) -> str:
 
 
 def _item_end(masked: str, pos: int) -> int:
-    """属性の直後 pos から対象 item の終端位置を返す（`;` か対応する `}`。閉じなければ末尾）。"""
+    """属性の直後 pos から対象 item の終端位置を返す（`;` か対応する `}`。閉じなければ末尾）。
+
+    ヘッダ内の `()`・`[]`・ジェネリクス `<>` の中の `{` / `;`（const generic の `{N}` 等）は境界と
+    みなさない。`->` の `>` は閉じ括弧に数えず、`=`（初期化子の開始）以降は `<` を比較演算子として
+    扱う（`const X: bool = 1 < 2;`）。
+    """
     n = len(masked)
     depth = 0
+    angle = 0
+    in_init = False
     j = pos
     while j < n:
         ch = masked[j]
+        prev = masked[j - 1] if j > pos else ""
+        nxt = masked[j + 1] if j + 1 < n else ""
         if ch in "([":
             depth += 1
         elif ch in ")]":
             depth = max(depth - 1, 0)
-        elif ch == ";" and depth == 0:
+        elif depth == 0 and ch == "<" and not in_init:
+            angle += 1
+        elif depth == 0 and ch == ">" and angle > 0 and prev != "-":
+            angle -= 1
+        elif depth == 0 and angle == 0 and ch == "=" and nxt not in "=>" and prev not in "=!<>":
+            in_init = True
+        elif ch == ";" and depth == 0 and angle == 0:
             return j + 1
-        elif ch == "{" and depth == 0:
+        elif ch == "{" and depth == 0 and angle == 0:
             braces, j = 1, j + 1
             while j < n and braces > 0:
                 braces += {"{": 1, "}": -1}.get(masked[j], 0)
@@ -326,7 +370,7 @@ def scan_source(
     for start, end, inner, body in find_attributes(masked):
         if not WORD_UNSAFE_RE.search(body):
             continue
-        levels = set(LEVEL_RE.findall(body))
+        levels = _unsafe_code_levels(body)
         if not levels:
             violations.append(Violation("unparsed_attribute", rel))
             continue
@@ -337,9 +381,14 @@ def scan_source(
         name = "<inner>" if inner else _item_name(masked[end:])
         item = "::".join([*mods, name])
         # 内部属性はファイル全体、外部属性は属性から item 終端までを本体とする
-        digest = (
-            body_hash(src, 0, len(src)) if inner else body_hash(src, start, _item_end(masked, end))
-        )
+        item_end = len(src) if inner else _item_end(masked, end)
+        if not inner:
+            head = ITEM_RE.match(_skip_attrs(masked[end:]))
+            if head and head.group(1) == "mod" and masked[:item_end].rstrip().endswith(";"):
+                # `mod name;` の allow は別ファイルの内容に及ぶが本体ハッシュに含められない
+                violations.append(Violation("unparsed_attribute", rel, item))
+                continue
+        digest = body_hash(src, 0 if inner else start, item_end)
         for lv in relaxed:
             occurrences.append(((rel, item, lv), digest))
     return occurrences
