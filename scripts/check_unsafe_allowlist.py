@@ -34,6 +34,13 @@ rustc / clippy の lint ではなくソースの文字列走査にしている�
 item の特定は rustfmt 済みのソースを前提にする（enclosing `mod` はインデントで判定。
 `make fmt-check` が前提を担保する）。
 
+承認済み item の本体の変更検出: 各記録は `body_sha256`（対象 item の本文を空白正規化したものの
+sha256。複数出現は各ハッシュを昇順に改行連結して再ハッシュ）を持ち、item 内に `unsafe` ブロックを
+足すなどの本体の変更は `body_changed` で止まる（再承認と記録の更新を要求する）。新しい値は
+`--print-hashes` で得る（照合はせず、現在の出現ごとのハッシュを JSON で出す）。
+
+走査対象内の symlink ディレクトリは Cargo が辿れて走査を回避できるため `src/` を含め入力不正とする。
+
 限界（証拠種別: テストハーネス〔合成リポジトリでの陰性対照〕）: 許可リストを同じ PR で書き換えれば
 機械照合は通る（承認の実在は PR レビューで確認する。AGENTS.md）。マクロ展開で生成される `allow` は
 対象外。`unsafe` ブロック自体は `deny` のコンパイルエラーが担う。
@@ -42,6 +49,7 @@ item の特定は rustfmt 済みのソースを前提にする（enclosing `mod`
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,7 +76,18 @@ EXIT_INVALID_INPUT = 64
 EXIT_RUNTIME_ERROR = 70
 
 LEVELS = ("allow", "expect", "warn")
-ENTRY_FIELDS = {"file", "item", "level", "count", "approved_on", "approved_by", "record", "purpose"}
+ENTRY_FIELDS = {
+    "file",
+    "item",
+    "level",
+    "count",
+    "body_sha256",
+    "approved_on",
+    "approved_by",
+    "record",
+    "purpose",
+}
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 WORD_UNSAFE_RE = re.compile(r"\bunsafe_code\b")
 LEVEL_RE = re.compile(r"\b(allow|expect|warn|deny|forbid)\b")
@@ -261,11 +280,49 @@ def _item_name(rest: str) -> str:
     return "<other>"
 
 
-def scan_source(rel: str, src: str, violations: list[Violation]) -> list[tuple[str, str, str]]:
-    """1 ファイルの許可の出現を (file, item, level) の列で返す。解釈不能な形は違反に積む。"""
+def _item_end(masked: str, pos: int) -> int:
+    """属性の直後 pos から対象 item の終端位置を返す（`;` か対応する `}`。閉じなければ末尾）。"""
+    n = len(masked)
+    depth = 0
+    j = pos
+    while j < n:
+        ch = masked[j]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(depth - 1, 0)
+        elif ch == ";" and depth == 0:
+            return j + 1
+        elif ch == "{" and depth == 0:
+            braces, j = 1, j + 1
+            while j < n and braces > 0:
+                braces += {"{": 1, "}": -1}.get(masked[j], 0)
+                j += 1
+            return j
+        j += 1
+    return n
+
+
+def body_hash(src: str, start: int, end: int) -> str:
+    """item の本文（属性を含む元ソースの区間）を空白正規化して sha256 を返す。"""
+    return hashlib.sha256(" ".join(src[start:end].split()).encode("utf-8")).hexdigest()
+
+
+def combine_hashes(hashes: list[str]) -> str:
+    """同一キーの複数出現のハッシュを昇順に改行連結して再ハッシュする。"""
+    return hashlib.sha256("\n".join(sorted(hashes)).encode("utf-8")).hexdigest()
+
+
+def scan_source(
+    rel: str, src: str, violations: list[Violation]
+) -> list[tuple[tuple[str, str, str], str]]:
+    """1 ファイルの許可の出現を ((file, item, level), 本体ハッシュ) の列で返す。
+
+    解釈不能な形は違反に積む。
+    """
     masked = mask_rust(src)
     lines = masked.split("\n")
-    occurrences: list[tuple[str, str, str]] = []
+    occurrences: list[tuple[tuple[str, str, str], str]] = []
     for start, end, inner, body in find_attributes(masked):
         if not WORD_UNSAFE_RE.search(body):
             continue
@@ -279,8 +336,12 @@ def scan_source(rel: str, src: str, violations: list[Violation]) -> list[tuple[s
         mods = enclosing_mods(lines, masked.count("\n", 0, start))
         name = "<inner>" if inner else _item_name(masked[end:])
         item = "::".join([*mods, name])
+        # 内部属性はファイル全体、外部属性は属性から item 終端までを本体とする
+        digest = (
+            body_hash(src, 0, len(src)) if inner else body_hash(src, start, _item_end(masked, end))
+        )
         for lv in relaxed:
-            occurrences.append((rel, item, lv))
+            occurrences.append(((rel, item, lv), digest))
     return occurrences
 
 
@@ -291,6 +352,9 @@ def collect_rs_files(root: Path) -> list[str]:
         raise InputError("crates directory is missing")
     files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(crates, followlinks=False):
+        for d in dirnames:
+            if d != "target" and Path(dirpath, d).is_symlink():
+                raise InputError("symlinked directory under crates/ is not allowed")
         dirnames[:] = sorted(d for d in dirnames if d != "target")
         for fn in sorted(filenames):
             if fn.endswith(".rs"):
@@ -300,8 +364,11 @@ def collect_rs_files(root: Path) -> list[str]:
     return files
 
 
-def load_allowlist(root: Path) -> dict[tuple[str, str, str], int]:
-    """許可リストを検証して {(file, item, level): count} を返す。形式不正は InputError。"""
+def load_allowlist(root: Path) -> dict[tuple[str, str, str], tuple[int, str]]:
+    """許可リストを検証して {(file, item, level): (count, body_sha256)} を返す。
+
+    形式不正は InputError。
+    """
     try:
         data = json.loads(read_text(root, ALLOWLIST_NAME))
     except json.JSONDecodeError as exc:
@@ -313,11 +380,20 @@ def load_allowlist(root: Path) -> dict[tuple[str, str, str], int]:
     entries = data["entries"]
     if not isinstance(entries, list):
         raise InputError("entries must be a list")
-    result: dict[tuple[str, str, str], int] = {}
+    result: dict[tuple[str, str, str], tuple[int, str]] = {}
     for e in entries:
         if not isinstance(e, dict) or set(e) != ENTRY_FIELDS:
             raise InputError("each entry must have exactly the documented fields")
-        for k in ("file", "item", "level", "approved_on", "approved_by", "record", "purpose"):
+        for k in (
+            "file",
+            "item",
+            "level",
+            "body_sha256",
+            "approved_on",
+            "approved_by",
+            "record",
+            "purpose",
+        ):
             if not isinstance(e[k], str) or not e[k].strip():
                 raise InputError(f"entry field {k} must be a non-empty string")
         p = PurePosixPath(e["file"])
@@ -329,6 +405,8 @@ def load_allowlist(root: Path) -> dict[tuple[str, str, str], int]:
             raise InputError("entry level must be allow, expect or warn")
         if isinstance(e["count"], bool) or not isinstance(e["count"], int) or e["count"] < 1:
             raise InputError("entry count must be a positive integer")
+        if not SHA256_RE.match(e["body_sha256"]):
+            raise InputError("entry body_sha256 must be 64 lowercase hex digits")
         if not DATE_RE.match(e["approved_on"]):
             raise InputError("entry approved_on must be YYYY-MM-DD")
         try:
@@ -338,7 +416,7 @@ def load_allowlist(root: Path) -> dict[tuple[str, str, str], int]:
         key = (e["file"], e["item"], e["level"])
         if key in result:
             raise InputError("duplicate allowlist entry")
-        result[key] = e["count"]
+        result[key] = (e["count"], e["body_sha256"])
     return result
 
 
@@ -365,22 +443,57 @@ def check_lint_levels(root: Path, violations: list[Violation]) -> None:
             violations.append(Violation("cargo_config_lint", rel))
 
 
+def collect_occurrences(
+    root: Path, violations: list[Violation]
+) -> dict[tuple[str, str, str], list[str]]:
+    """全 `*.rs` を走査し {(file, item, level): [本体ハッシュ, ...]} を返す。"""
+    found: dict[tuple[str, str, str], list[str]] = {}
+    for rel in collect_rs_files(root):
+        for key, digest in scan_source(rel, read_text(root, rel), violations):
+            found.setdefault(key, []).append(digest)
+    return found
+
+
+def print_hashes(root: Path) -> tuple[int, dict[str, Any]]:
+    """現在の出現ごとに記録へ書く `body_sha256` を出力する（照合はしない。記録更新の補助）。"""
+    try:
+        found = collect_occurrences(root, [])
+    except InputError as exc:
+        return EXIT_INVALID_INPUT, {
+            "status": "invalid_input",
+            "code": EXIT_INVALID_INPUT,
+            "message": str(exc),
+        }
+    items = [
+        {
+            "file": k[0],
+            "item": k[1],
+            "level": k[2],
+            "count": len(v),
+            "body_sha256": combine_hashes(v),
+        }
+        for k, v in sorted(found.items())
+    ]
+    return EXIT_OK, {"status": "ok", "code": EXIT_OK, "occurrences": items}
+
+
 def run(root: Path) -> tuple[int, dict[str, Any]]:
     """照合を実行し、(終了コード, 出力 JSON の辞書) を返す。"""
     try:
         allowed = load_allowlist(root)
         violations: list[Violation] = []
-        counts: dict[tuple[str, str, str], int] = {}
-        for rel in collect_rs_files(root):
-            for key in scan_source(rel, read_text(root, rel), violations):
-                counts[key] = counts.get(key, 0) + 1
-        for key in sorted(counts):
+        found = collect_occurrences(root, violations)
+        for key in sorted(found):
             if key not in allowed:
                 violations.append(Violation("unlisted_allow", key[0], key[1], key[2]))
-            elif counts[key] > allowed[key]:
+            elif len(found[key]) > allowed[key][0]:
                 violations.append(Violation("count_exceeded", key[0], key[1], key[2]))
+            elif (
+                combine_hashes(found[key]) != allowed[key][1] and len(found[key]) == allowed[key][0]
+            ):
+                violations.append(Violation("body_changed", key[0], key[1], key[2]))
         for key in sorted(allowed):
-            if counts.get(key, 0) < allowed[key]:
+            if len(found.get(key, [])) < allowed[key][0]:
                 violations.append(Violation("stale_entry", key[0], key[1], key[2]))
         check_lint_levels(root, violations)
     except InputError as exc:
@@ -419,6 +532,9 @@ def main(argv: list[str]) -> int:
     try:
         parser = _JsonArgumentParser(description=__doc__.splitlines()[0])
         parser.add_argument("--root", required=True, type=Path, help="repository root")
+        parser.add_argument(
+            "--print-hashes", action="store_true", help="print body_sha256 values and exit"
+        )
         try:
             args = parser.parse_args(argv)
         except _ArgumentError as exc:
@@ -433,7 +549,7 @@ def main(argv: list[str]) -> int:
             return EXIT_INVALID_INPUT
         except SystemExit as exc:  # --help（終了コード 0）のみ
             return EXIT_OK if exc.code in (0, None) else EXIT_INVALID_INPUT
-        code, payload = run(args.root)
+        code, payload = print_hashes(args.root) if args.print_hashes else run(args.root)
     except Exception:  # 予期しない例外も JSON 1 つと終了コード 70 に揃える
         code, payload = (
             EXIT_RUNTIME_ERROR,

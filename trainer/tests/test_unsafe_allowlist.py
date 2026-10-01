@@ -226,6 +226,8 @@ def test_unparsable_attribute_fails_closed(repo: Path, capsys: Capture) -> None:
         lambda d: d["entries"][0].update(approved_on="2026/10/01"),
         lambda d: d["entries"][0].update(approved_on="2026-13-45"),
         lambda d: d["entries"][0].update(count=0),
+        lambda d: d["entries"][0].pop("body_sha256"),
+        lambda d: d["entries"][0].update(body_sha256="XYZ"),
         lambda d: d["entries"][0].update(level="deny"),
         lambda d: d["entries"][0].update(file="../x.rs"),
         lambda d: d["entries"][0].update(file="/abs/x.rs"),
@@ -253,6 +255,39 @@ def test_symlinked_source_is_rejected(repo: Path, capsys: Capture) -> None:
     (repo / "crates/core/src/link.rs").symlink_to(repo / GUARD)
     code, _ = run(repo, capsys)
     assert code == 64
+
+
+def test_symlinked_source_directory_is_rejected(repo: Path, capsys: Capture) -> None:
+    """crates/ 配下の symlink ディレクトリ（src/ 差し替え含む）は invalid_input（REQ-39・#335）。"""
+    real = repo / "crates/core/src"
+    moved = repo / "crates/core/src_real"
+    real.rename(moved)
+    real.symlink_to(moved, target_is_directory=True)
+    code, payload = run(repo, capsys)
+    assert (code, payload["status"]) == (64, "invalid_input")
+
+
+def test_unsafe_block_added_in_approved_item_is_detected(repo: Path, capsys: Capture) -> None:
+    """承認済み item の本体に unsafe を足すと件数が同じでも body_changed（REQ-39・#335）。"""
+    p = repo / GUARD
+    text = p.read_text()
+    needle = "    fn pidinfo(pid: c_int, flavor: Flavor) -> Option<Info> {\n"
+    assert needle in text
+    p.write_text(text.replace(needle, needle + "        let _x = unsafe { 0u8 };\n", 1))
+    code, payload = run(repo, capsys)
+    assert code == 10
+    assert ("body_changed", "darwin::pidinfo") in kinds(payload)
+
+
+def test_print_hashes_matches_allowlist(repo: Path, capsys: Capture) -> None:
+    """--print-hashes の出力は許可リストの body_sha256 と一致する。"""
+    code = mod.main(["--root", str(repo), "--print-hashes"])
+    payload = json.loads(capsys.readouterr().out)
+    ledger = json.loads((repo / "unsafe-allowlist.json").read_text())
+    assert code == 0
+    assert [o["body_sha256"] for o in payload["occurrences"]] == [
+        e["body_sha256"] for e in ledger["entries"]
+    ]
 
 
 def test_unexpected_exception_is_runtime_error(

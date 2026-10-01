@@ -8,7 +8,7 @@ REQ-39・#335（#329 の security-auditor 監査 P2）。ワークスペース�
 
 | 要素 | 役割 |
 | ---- | ---- |
-| `unsafe-allowlist.json`（リポジトリルート） | 許可リスト。`file`・`item`（enclosing `mod` と item 名。例 `darwin::pidinfo`）・`level`・`count`・`approved_on`・`approved_by`・`record`・`purpose` |
+| `unsafe-allowlist.json`（リポジトリルート） | 許可リスト。`file`・`item`（enclosing `mod` と item 名。例 `darwin::pidinfo`）・`level`・`count`・`body_sha256`（item 本文の空白正規化 sha256）・`approved_on`・`approved_by`・`record`・`purpose` |
 | `scripts/check_unsafe_allowlist.py` | `crates/` の全 `*.rs` を文字列走査して照合する（標準ライブラリのみ・読み取り専用・通信なし）。終了コードは 0・10（未承認・件数超過・陳腐化・lint 緩和）・64（形式不正）・70 |
 | `make check-unsafe-allowlist` | 上記の実行口。`make ci` の前提に含まれる |
 | lefthook の pre-commit `unsafe-allowlist` | Rust ソース・manifest・許可リストが staged のときに index の内容で照合する |
@@ -19,9 +19,10 @@ REQ-39・#335（#329 の security-auditor 監査 P2）。ワークスペース�
 ## 手順
 
 1. `allow(unsafe_code)` の追加が必要になったら、実装前にオーナーの承認を得る（`unsafe` の新規追加。builder Agent は承認事項として main へ報告する）
-2. 承認後、同じコミットで `unsafe-allowlist.json` に記録を追加・更新する（`approved_on`・`approved_by`・`record`〔Issue・PR 等の実在する参照〕・`purpose`）
-3. 出現を削除・移動したときは該当記録も更新する（残すと `stale_entry` で失敗する）
-4. `make check-unsafe-allowlist` を通す
+2. 承認後、同じコミットで（`python3 -I scripts/check_unsafe_allowlist.py --root . --print-hashes` で `body_sha256` を得て） `unsafe-allowlist.json` に記録を追加・更新する（`approved_on`・`approved_by`・`record`〔Issue・PR 等の実在する参照〕・`purpose`）
+3. 承認済み item の本体を変更したとき（`unsafe` ブロックの追加を含む）は `body_changed` で止まる。変更内容をレビューし、再承認のうえ `body_sha256` を更新する
+4. 出現を削除・移動したときは該当記録も更新する（残すと `stale_entry` で失敗する）
+5. `make check-unsafe-allowlist` を通す
 
 ## チェックリスト
 
@@ -31,6 +32,8 @@ REQ-39・#335（#329 の security-auditor 監査 P2）。ワークスペース�
 
 ## 限界
 
+- 走査対象（`crates/`）内の symlink ディレクトリは入力不正として拒否する
+- 本体ハッシュはコメントを含む item 本文が対象で、コメントのみの変更も再承認を要求する
 - マクロ展開で生成される `allow` は対象外
 - rustfmt 済みのソースを前提に item を判定する（`make fmt-check` が担保）
 - `unsafe` ブロック自体は `deny` のコンパイルエラーが止める
