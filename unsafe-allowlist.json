@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "file": "crates/guard/src/resource.rs",
+      "item": "darwin::pidinfo",
+      "level": "allow",
+      "count": 1,
+      "approved_on": "2026-10-01",
+      "approved_by": "owner",
+      "record": "#329 (merged in #336); .claude/rules/dependency-policy.md libc row (2026-10-01 owner approval)",
+      "purpose": "libproc proc_pidinfo FFI for macOS RSS and process state probing (REQ-39, TASK-39.5-2)"
+    }
+  ]
+}
