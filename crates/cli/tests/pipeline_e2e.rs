@@ -1779,7 +1779,11 @@ mod suite {
         );
         assert!(!env.project_file("package").exists());
         std::fs::write(&record_path, &original).expect("restore");
-        env.ok(&PACKAGE);
+        // `acceptance` が無く下限基準だけの定義でも、判定は出るが `acceptance_defined` は false（#339）。
+        assert_eq!(
+            env.ok(&PACKAGE),
+            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":false}\n"
+        );
 
         // 欄の追加（定義には欄が無い）。
         let env = baseline_env("bcadd", &definition_text(), &train, &predicted);

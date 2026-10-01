@@ -178,7 +178,8 @@ pub enum PackageJudgment {
 ///
 /// `{"code","message","step":"package","judgment","acceptance_defined":true}` の形で、
 /// `ErrorReport` の `{"code","message"}` に判定項目を足したもの。`Fail`・`Undeterminable`
-/// は合否基準が定義されているときにだけ生じるため `acceptance_defined` は常に `true`。
+/// は合否基準が定義されているときにだけ生じる。`acceptance_defined` は既定で `true` で、下限基準だけの
+/// 定義では [`Self::with_acceptance_defined`] で `false` にする。
 /// コンストラクタは [`Self::fail`]・[`Self::undeterminable`] のみで、`code` と `judgment` の
 /// 矛盾した組み合わせを作れない。宣言順に直列化し、パス・件数・本文は載せない（security.md）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -213,6 +214,13 @@ impl PackageJudgedReport {
             judgment: PackageJudgment::Undeterminable,
             acceptance_defined: true,
         }
+    }
+
+    /// `acceptance_defined` を上書きする（下限基準だけの定義での判定は `false`。REQ-33・#339）。
+    #[must_use]
+    pub const fn with_acceptance_defined(mut self, defined: bool) -> Self {
+        self.acceptance_defined = defined;
+        self
     }
 
     /// この結果に対応する終了コード（10 または 12）。
@@ -264,6 +272,14 @@ impl PackageReport {
             judgment: None,
             acceptance_defined: false,
         }
+    }
+
+    /// `acceptance_defined` を上書きする。`acceptance` は無く下限基準（`baseline_comparison`）だけで
+    /// 判定したときに `false` を指定する（`judgment` は `Some` のまま。REQ-33・#339）。
+    #[must_use]
+    pub const fn with_acceptance_defined(mut self, defined: bool) -> Self {
+        self.acceptance_defined = defined;
+        self
     }
 
     /// JSON 1 行（末尾の改行なし）へ直列化する。

@@ -41,6 +41,8 @@
 //! で照合する（[`quality_from_acceptance`]）。定義に `baseline_comparison` があるときは、評価記録の
 //! 下限基準との比較の `verdict` も合否へ結合する（`significantly_better` 以外は pass にしない。#339）。基準が無ければ従来どおり `judgment:null`・
 //! `acceptance_defined:false`・exit 0。基準があり評価データが無ければ判定不能（exit 12）。
+//! `acceptance_defined` は定義の `acceptance` の有無だけを表し、`baseline_comparison` だけの定義で
+//! 合否が出ても `false` のまま（従来の入出力契約の意味を保つ。#339）。
 //! `fail`（exit 10）・判定不能でも公開の関門は容量だけで、`package/` は公開する（合否は終了コードと
 //! JSON で伝える）。基準は定義の正準化ハッシュに含まれるため、`evaluate` の後に書き換えると
 //! 評価記録の `definition_sha256` 照合で `invalid_input` になる（REQ-27）。
@@ -282,7 +284,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     let breaches = finalize_staging(&project, &staging, &breaches)?;
     // 上限超過（20）が合否より優先される規則は runtime の `resolve_package_outcome` に任せる。
     // Fail・Undeterminable でも公開の関門は容量だけ（`finalize_staging` は合否を見ない。#328）。
-    Ok(resolve_package_outcome(&breaches, quality))
+    let mut outcome = resolve_package_outcome(&breaches, quality);
+    // `acceptance_defined` は定義の `acceptance` の有無を表す。下限基準だけの定義で合否が出ても
+    // `true` にしない（従来の入出力契約の意味を保つ。REQ-33・#339）。
+    outcome.acceptance_defined = definition.acceptance().is_some();
+    Ok(outcome)
 }
 
 /// p95 計測の入力を `train` 分割の `input` から集める（REQ-27・REQ-39。#338）。
