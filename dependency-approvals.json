@@ -78,6 +78,19 @@
           "std"
         ],
         "default_features": false
+      },
+      {
+        "name": "libc",
+        "version": "0.2.189",
+        "approved_on": "2026-10-01",
+        "approved_by": "owner",
+        "record": "dependency-policy.md「承認済みの依存」表（2026-10-01 オーナー承認。Issue #329）",
+        "purpose": "libproc proc_pidinfo による macOS の RSS 取得（setuid の /bin/ps を使わない）",
+        "layers": [
+          "guard"
+        ],
+        "features": [],
+        "default_features": true
       }
     ],
     "locked": [
@@ -174,11 +187,6 @@
       {
         "name": "linux-raw-sys",
         "version": "0.12.1",
-        "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
-      },
-      {
-        "name": "libc",
-        "version": "0.2.189",
         "basis": "dependency-policy.md「承認時に確認した推移的依存」に記載の推移的依存（親の承認に包含）。親: rustix"
       },
       {

@@ -62,6 +62,12 @@ unicode-normalization = "=0.1.22"
 # openat 相当が無く、unsafe の FFI を避けるための選択。
 # `std` feature は rustix::fd を std::os::fd と同一の型にして File へ変換するために必要。承認記録は PR #282）。
 rustix = { version = "=1.1.5", default-features = false, features = ["fs", "alloc", "std"] }
+# libc は 2026-10-01 オーナー承認済み（.claude/rules/dependency-policy.md「承認済みの依存」表。
+# ガード層 crates/guard の macOS 用 RSS プローブ〔TASK-39.5-2・#171・#329・REQ-39〕で libproc の
+# `proc_pidinfo` と `proc_taskinfo`・`proc_bsdshortinfo` の宣言を使う。setuid の /bin/ps は
+# sandbox-exec 下で起動できない〔#327〕ため。宣言・構造体の配置を自前の extern "C" で再定義しない
+# ための選択で、版は rustix 経由で既に lock にあるものと同じ）。
+libc = "=0.2.189"
 
 [workspace.lints.rust]
 # unsafe は原則禁止（.claude/rules/coding-rust.md）。FFI 境界（ONNX Runtime 等）で

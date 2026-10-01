@@ -33,18 +33,22 @@
 //! - RSS の計測失敗は成功扱いにせず、子を kill・回収して `MemoryProbe`（70）を返す（fail-closed。
 //!   PoC-20 は計測失敗を無視していた）。計測手段の無い OS でメモリ上限が指定されたら起動前に
 //!   `MemoryLimitUnsupported`（70）を返す。時間とメモリが同時に該当した場合は時間を優先する
-//! - 計測の待ち（macOS の `ps`）・読み取り（`/proc`・`ps` の出力）は有界
+//! - 計測は外部プロセスを起動しない。macOS は libproc の `proc_pidinfo`（#329）、Linux は `/proc` の
+//!   読み取りで、どちらも有界（`/proc` は読み取り量に上限）
 //!
 //! # 制限
 //!
 //! - 対象は直接の子だけで、子孫プロセスは kill しない。`fandhe-edge infer` は子プロセスを
-//!   起動しない（REQ-32）ため受け入れる。子孫の管理にはプロセスグループ（`unsafe`・新規依存）が
-//!   要り、ユーザー承認事項のため行わない
+//!   起動しない（REQ-32）ため受け入れる。子孫の管理にはプロセスグループが要り、承認事項のため
+//!   行わない。`unsafe` は macOS の RSS 取得（`proc_pidinfo` の FFI。#329・2026-10-01 オーナー承認）
+//!   にだけ置き、`libc` はそのための macOS 限定の直接依存
 //! - Linux・macOS 以外の OS は読み取りスレッドで代替し、期限超過時は子孫がパイプを離すまで
 //!   スレッドが残りうる
 //! - 実装は全 OS でビルドされるが、検証環境は Mac のみ（Windows は実機検証の対象外）
 //! - メモリ上限は模擬（RSS ポーリング）で、ポーリングの間（約 50 ms と計測の遅延）は上限を超えうる
-//!   （オーバーシュート）。子孫の RSS は監視しない。macOS の RSS は圧縮メモリを含まない指標。
+//!   （オーバーシュート）。子孫の RSS は監視しない。macOS の RSS（`pti_resident_size`）は resident のみで圧縮メモリを含まない。
+//!   macOS で子が終了処理中（`PROC_FLAG_INEXIT`）の間は RSS を観測できず、メモリ上限は評価されない
+//!   （時間上限だけが効く。#329）。
 //!   cgroup・コンテナのメモリ制限などの確実な上限機構への置き換えは別課題（TASK-39.5 の備考）
 //! - ファイルサイズ上限は [`crate::file_size`]（#172）の範囲
 
@@ -625,7 +629,14 @@ pub(crate) struct ProbeError;
 ///
 /// 呼び出し側（`monitor`）は「直前の `try_wait` が未終了を返した直接の子」にだけ呼ぶ。
 pub(crate) trait RssProbe {
-    /// `Ok(Some(n))` は RSS（バイト）、`Ok(None)` はプロセス不在（次周回の `try_wait` に委ねる）。
+    /// `Ok(Some(n))` は RSS（バイト）。`Ok(None)` は子が終了済み（未回収のゾンビ）か終了処理中
+    /// （macOS の `PROC_FLAG_INEXIT`）で RSS を観測しないことを表し、次の `try_wait` が回収を
+    /// 観測するか、deadline で止まる（Linux の `/proc` 版は `VmRSS` 行が無ければ `Ok(None)`）。
+    ///
+    /// プロセスの状態を読めない場合（ESRCH・EPERM 等）は `Err`（fail-closed）。監視対象は未回収の
+    /// 直接の子で消えないため、従来の macOS 版（`ps` が exit 1・空出力で `Ok(None)`）より厳しい
+    /// （#329）。学習ワーカーの `child_status` は INEXIT を `(0, False)` で返すが、この trait は
+    /// RSS とゾンビを区別しないため `Ok(None)` に寄せている（意図的な差。どちらも監視を続ける）。
     fn rss_bytes(&mut self, pid: u32) -> Result<Option<u64>, ProbeError>;
 }
 
@@ -646,38 +657,7 @@ pub(crate) fn parse_proc_status_vmrss(text: &str) -> Result<Option<u64>, ProbeEr
     Ok(None)
 }
 
-/// `ps -o rss=` の出力（KiB）をバイトにする。空なら `Ok(None)`（プロセス不在）。
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-pub(crate) fn parse_ps_rss(text: &str) -> Result<Option<u64>, ProbeError> {
-    let t = text.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    if !t.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ProbeError);
-    }
-    let kb: u64 = t.parse().map_err(|_| ProbeError)?;
-    kb.checked_mul(1024).map(Some).ok_or(ProbeError)
-}
-
-/// `ps` の終了状態と出力から RSS 計測の結果を決める。
-///
-/// 成功終了は出力を解釈する（空ならプロセス不在）。`ps -p` は該当プロセスが無いとき
-/// 空出力で終了コード 1 を返すため、その組だけを不在（`Ok(None)`）として扱う。
-/// それ以外の非 0 終了・シグナル終了は計測失敗で、不在と区別して fail-closed にする。
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-pub(crate) fn classify_ps_result(
-    exit_code: Option<i32>,
-    text: &str,
-) -> Result<Option<u64>, ProbeError> {
-    match exit_code {
-        Some(0) => parse_ps_rss(text),
-        Some(1) if text.trim().is_empty() => Ok(None),
-        _ => Err(ProbeError),
-    }
-}
-
-/// 実プロセスの RSS 計測。Linux は `/proc`、macOS は `/bin/ps`（PoC-20 と同じ）。
+/// 実プロセスの RSS 計測。Linux は `/proc`、macOS は libproc（`ps` は sandbox 下で使えない。#329）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SystemRssProbe;
 
@@ -705,50 +685,116 @@ impl RssProbe for SystemRssProbe {
     }
 }
 
+/// macOS の子プロセス状態取得（libproc の `proc_pidinfo`）。外部プロセスを起動しない。
+///
+/// 従来は `/bin/ps` を起動していたが、setuid root の `/bin/ps` は `sandbox-exec` 下で exec が
+/// EPERM になり、メモリ監視が常に `memory_probe_failed`（70）になる（REQ-38・REQ-39・
+/// TASK-39.5-2・#329・#327）。手順は学習ワーカーの `procinfo_darwin.child_status` と同じ。
+#[cfg(target_os = "macos")]
+mod darwin {
+    use super::ProbeError;
+    use std::ffi::{c_int, c_void};
+    use std::mem;
+
+    /// `proc_bsdshortinfo.pbsi_flags` の終了処理中ビット（xnu `PROC_FLAG_INEXIT`。libc に定義が無い）。
+    const PROC_FLAG_INEXIT: u32 = 0x4;
+
+    /// `proc_pidinfo` で読む構造体の種類。
+    #[derive(Clone, Copy)]
+    enum Flavor {
+        /// `PROC_PIDTASKINFO`（RSS）。
+        Task,
+        /// `PROC_PIDT_SHORTBSDINFO`（状態。`arg = 1` でゾンビも読む）。
+        Short,
+    }
+
+    /// `proc_pidinfo` の読み取り結果。
+    enum Info {
+        Task(libc::proc_taskinfo),
+        Short(libc::proc_bsdshortinfo),
+    }
+
+    /// `proc_pidinfo` を呼ぶ唯一の関数（本モジュールの `unsafe` はここだけ）。
+    ///
+    /// 返り値が構造体のサイズと一致しない（失敗・短い書き込み）場合は `None`。
+    #[allow(unsafe_code)]
+    fn pidinfo(pid: c_int, flavor: Flavor) -> Option<Info> {
+        match flavor {
+            Flavor::Task => {
+                // SAFETY: `proc_taskinfo` は整数フィールドだけの POD で、全ビット 0 が有効な値の
+                // ため `mem::zeroed` は有効。`buf` は本関数のスタック上で生きており、渡すポインタ
+                // は `buf` の先頭、サイズは `size_of_val(&buf)` で一致する。書き込み量は `size` 以下で、
+                // 返り値が `size` と一致しない（失敗・短い書き込み）場合は `buf` を使わない。
+                let mut buf: libc::proc_taskinfo = unsafe { mem::zeroed() };
+                let size = c_int::try_from(mem::size_of_val(&buf)).ok()?;
+                // SAFETY: 上記のとおり（ポインタとサイズは `buf` に一致）。
+                let written = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDTASKINFO,
+                        0,
+                        (&raw mut buf).cast::<c_void>(),
+                        size,
+                    )
+                };
+                (written == size).then_some(Info::Task(buf))
+            }
+            Flavor::Short => {
+                // SAFETY: `proc_bsdshortinfo` は整数と `c_char` 配列だけの POD で、全ビット 0 が
+                // 有効なため `mem::zeroed` は有効。
+                let mut buf: libc::proc_bsdshortinfo = unsafe { mem::zeroed() };
+                let size = c_int::try_from(mem::size_of_val(&buf)).ok()?;
+                // SAFETY: ポインタは `buf` の先頭、サイズは `size_of_val(&buf)` で一致し、
+                // `proc_pidinfo` は指定サイズを超えて書かない。`arg = 1` は未回収のゾンビを
+                // 読むための指定で、メモリアクセスには影響しない。
+                let written = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        libc::PROC_PIDT_SHORTBSDINFO,
+                        1,
+                        (&raw mut buf).cast::<c_void>(),
+                        size,
+                    )
+                };
+                (written == size).then_some(Info::Short(buf))
+            }
+        }
+    }
+
+    /// 状態（`pbsi_status`・`pbsi_flags`）を読む。読めない・pid 不一致は `None`。
+    fn read_state(pid: c_int) -> Option<(u32, u32)> {
+        match pidinfo(pid, Flavor::Short)? {
+            Info::Short(b) if u32::try_from(pid).ok() == Some(b.pbsi_pid) => {
+                Some((b.pbsi_status, b.pbsi_flags))
+            }
+            _ => None,
+        }
+    }
+
+    /// `pid` の RSS（バイト）。`Ok(None)` は終了済み（ゾンビ）か終了処理中。
+    pub(super) fn rss_bytes(pid: u32) -> Result<Option<u64>, ProbeError> {
+        let pid = c_int::try_from(pid).map_err(|_| ProbeError)?;
+        let (status, _) = read_state(pid).ok_or(ProbeError)?;
+        if status == libc::SZOMB {
+            return Ok(None);
+        }
+        if let Some(Info::Task(t)) = pidinfo(pid, Flavor::Task) {
+            return Ok(Some(t.pti_resident_size));
+        }
+        // TASKINFO の失敗は、終了処理中（INEXIT）か終了済みの可能性があるため状態を 1 回だけ読み直す。
+        let (status, flags) = read_state(pid).ok_or(ProbeError)?;
+        if status == libc::SZOMB || flags & PROC_FLAG_INEXIT != 0 {
+            Ok(None)
+        } else {
+            Err(ProbeError)
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl RssProbe for SystemRssProbe {
     fn rss_bytes(&mut self, pid: u32) -> Result<Option<u64>, ProbeError> {
-        use std::io::Read;
-        /// `ps` の待ちの上限。
-        const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-        /// `ps` の出力の読み取り上限（数字 1 つと改行だけのため十分）。
-        const PS_READ_CAP: u64 = 64;
-        let mut child = Command::new("/bin/ps")
-            .args(["-o", "rss=", "-p"])
-            .arg(pid.to_string())
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ProbeError)?;
-        let give_up = Instant::now() + PROBE_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ProbeError);
-                }
-            }
-            if Instant::now() >= give_up {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProbeError);
-            }
-            thread::sleep(Duration::from_millis(2));
-        };
-        let mut bytes = Vec::new();
-        if let Some(out) = child.stdout.take() {
-            out.take(PS_READ_CAP)
-                .read_to_end(&mut bytes)
-                .map_err(|_| ProbeError)?;
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|_| ProbeError)?;
-        classify_ps_result(status.code(), text)
+        darwin::rss_bytes(pid)
     }
 }
 
@@ -849,7 +895,7 @@ pub(crate) fn monitor_with_memory<C: ChildControl, K: Clock>(
                         last_probe = Some(now);
                         // 直前の try_wait が未終了を返した直接の子だけに計測する（pid 再利用の防止）。
                         let probed = probe.rss_bytes(child.id());
-                        // 計測（macOS の `ps` は最大 1 秒かかる）の間に期限へ達していたら、
+                        // 計測の間に期限へ達していたら、
                         // 計測結果によらず時間超過を優先する（REQ-39）。
                         if clock.now() >= deadline {
                             kill_and_reap(child, clock)?;
@@ -1760,7 +1806,7 @@ mod tests {
         assert_eq!(probe.calls, 0);
     }
 
-    /// 計測中に時計を進める RSS 計測の偽物（`ps` の遅延を模す）。
+    /// 計測中に時計を進める RSS 計測の偽物（計測の遅延を模す）。
     struct SlowProbe<'a> {
         clock: &'a FakeClock,
         delay: Duration,
@@ -1797,17 +1843,6 @@ mod tests {
             assert!(matches!(end, MonitorEnd::TimedOut { reaped: true, .. }));
             assert_eq!(child.kill_calls.get(), 1);
         }
-    }
-
-    /// REQ-39: `ps` の終了状態を見て、不在（空出力・終了コード 1）と計測失敗を区別する。
-    #[test]
-    fn req39_classify_ps_result() {
-        assert_eq!(classify_ps_result(Some(0), "  2048\n"), Ok(Some(2_097_152)));
-        assert_eq!(classify_ps_result(Some(0), ""), Ok(None));
-        assert_eq!(classify_ps_result(Some(1), ""), Ok(None));
-        assert_eq!(classify_ps_result(Some(1), "2048\n"), Err(ProbeError));
-        assert_eq!(classify_ps_result(Some(2), ""), Err(ProbeError));
-        assert_eq!(classify_ps_result(None, ""), Err(ProbeError));
     }
 
     /// REQ-39: メモリ上限は 0 と暫定上限超を拒否し（64）、ちょうどは受理する。
@@ -1879,17 +1914,6 @@ mod tests {
         );
     }
 
-    /// REQ-39: `ps -o rss=` の出力（KiB）をバイトにする。
-    #[test]
-    fn req39_parse_ps_rss() {
-        assert_eq!(parse_ps_rss("  2048\n"), Ok(Some(2_097_152)));
-        assert_eq!(parse_ps_rss(""), Ok(None));
-        assert_eq!(parse_ps_rss("\n"), Ok(None));
-        assert_eq!(parse_ps_rss("abc"), Err(ProbeError));
-        assert_eq!(parse_ps_rss("12 34"), Err(ProbeError));
-        assert_eq!(parse_ps_rss("18446744073709551615"), Err(ProbeError));
-    }
-
     /// REQ-39・REQ-21: メモリ超過の記録は `memory_limit_exceeded`・終了コード 20で、数値を保持する。
     #[test]
     fn req39_memory_record_is_memory_and_20() {
@@ -1926,5 +1950,80 @@ mod tests {
             GuardRunError::MemoryLimitUnsupported.exit_code(),
             ExitCode::RuntimeError
         );
+    }
+
+    /// macOS の libproc による RSS 計測の単体テスト（REQ-39・TASK-39.5-2・#329）。
+    /// 実プロセスを使うテストハーネス（`ps` を起動しない実装の確認）。
+    #[cfg(target_os = "macos")]
+    mod macos_probe {
+        use super::*;
+
+        fn spawn(program: &str, args: &[&str]) -> std::process::Child {
+            Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+
+        /// REQ-39・#329: 自プロセスの RSS は 0 より大きい値で観測できる。
+        #[test]
+        fn req39_macos_probe_reads_own_rss() {
+            let rss = SystemRssProbe.rss_bytes(std::process::id()).unwrap();
+            assert!(matches!(rss, Some(n) if n > 0), "rss {rss:?}");
+        }
+
+        /// REQ-39・#329: 生きている子の RSS は 0 より大きい値で観測できる。
+        #[test]
+        fn req39_macos_probe_reads_live_child_rss() {
+            let mut child = spawn("/bin/sleep", &["5"]);
+            let rss = SystemRssProbe.rss_bytes(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(matches!(rss.unwrap(), Some(n) if n > 0));
+        }
+
+        /// REQ-39・#329: 終了済みで未回収の子（ゾンビ）は `Ok(None)`。回収後に確認はしない。
+        ///
+        /// 終了の遷移中に一度でも `Err` を観測したら失敗にする（`Err` の時点で監視は子を kill して
+        /// `memory_probe_failed` になるため、遷移中の一過性の `Err` も許容しない。#327 の学習ワーカー側
+        /// テスト `test_req39_exiting_child_is_never_unknown_before_zombie_327` と同じ基準）。
+        #[test]
+        fn req39_macos_probe_zombie_is_none() {
+            let mut child = spawn("/usr/bin/true", &[]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut observed: Option<Result<Option<u64>, ProbeError>> = None;
+            // `try_wait` を呼ばずに（回収せずに）ゾンビになるのをポーリングで待つ。
+            while Instant::now() < deadline {
+                match SystemRssProbe.rss_bytes(child.id()) {
+                    Ok(None) => {
+                        observed = Some(Ok(None));
+                        break;
+                    }
+                    Ok(Some(_)) => thread::sleep(Duration::from_millis(5)),
+                    Err(e) => {
+                        observed = Some(Err(e));
+                        break;
+                    }
+                }
+            }
+            let _ = child.wait();
+            assert_eq!(observed, Some(Ok(None)));
+        }
+
+        /// REQ-39・#329: 存在しない pid は状態を読めず `Err`（fail-closed）。
+        /// macOS の pid は `PID_MAX`（99999）以下のため `0x7FFF_FFF0` は存在せず、`c_int` には収まる。
+        #[test]
+        fn req39_macos_probe_missing_pid_is_err() {
+            assert_eq!(SystemRssProbe.rss_bytes(0x7FFF_FFF0), Err(ProbeError));
+        }
+
+        /// REQ-39・#329: `c_int` を超える pid は呼び出す前に `Err`。
+        #[test]
+        fn req39_macos_probe_pid_over_c_int_is_err() {
+            assert_eq!(SystemRssProbe.rss_bytes(u32::MAX), Err(ProbeError));
+        }
     }
 }
