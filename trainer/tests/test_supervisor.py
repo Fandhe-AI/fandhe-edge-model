@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from conftest import LABEL_ORDER, TINY_CONFIG
-from fandhe_edge_trainer import contract, guard, supervisor
+from fandhe_edge_trainer import contract, guard, procinfo_darwin, supervisor
 from fandhe_edge_trainer.exitcode import ExitCode
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -257,9 +257,27 @@ def test_run_supervised_train_does_not_finalize_artifact_on_late_zombie_detectio
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
+def _force_ps_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """darwin でも `ps` 経路を強制する（`ps` 経路の回帰を OS によらず検証するため。#327）。"""
+    monkeypatch.setattr(supervisor, "_USE_LIBPROC", False)
+
+
+def _make_status_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """子の状態取得手段を「使えない」状態にする（OS ごとの取得手段に合わせる。#327）。
+
+    darwin は libproc（`procinfo_darwin.child_status`）を `None` にし、それ以外は
+    `ps` の絶対パスを存在しないパスへ差し替える。どちらも `monitor_child` から見ると
+    「監視不能」で、期待する結果（fail-closed）は変わらない。
+    """
+    if sys.platform == "darwin":
+        monkeypatch.setattr(procinfo_darwin, "child_status", lambda pid: None)
+    else:
+        monkeypatch.setattr(supervisor, "_PS_BIN", "/nonexistent/ps")
+
+
 def test_monitor_child_fails_closed_when_ps_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ps` が使えない（監視できない）場合、野放しにせず子プロセスごと終了させる。"""
-    monkeypatch.setattr(supervisor, "_PS_BIN", "/nonexistent/ps")
+    """状態取得手段（`ps`／macOS は libproc）が使えない場合、野放しにせず子ごと終了させる。"""
+    _make_status_unavailable(monkeypatch)
     proc = _spawn("import time; time.sleep(60)")
     try:
         reason = supervisor.monitor_child(
@@ -1301,6 +1319,7 @@ def test_req34_slow_status_check_does_not_consume_cooperative_cancel_grace(
     確認する前に最大 5 秒ブロックする `ps` を呼び、`_terminate_and_reap` の
     猶予を食い潰していた。`ps` を「30 秒眠る」スクリプトに差し替えて遅延を
     注入する（証拠種別: テストハーネス）。"""
+    _force_ps_path(monkeypatch)  # darwin でも遅延 `ps` で #145 の回帰を検証する（#327）
     slow_ps = tmp_path / "slow_ps.sh"
     slow_ps.write_text("#!/bin/sh\nexec sleep 30\n")
     slow_ps.chmod(0o755)
@@ -1319,6 +1338,61 @@ def test_req34_slow_status_check_does_not_consume_cooperative_cancel_grace(
         elapsed = time_mod.monotonic() - t0
         assert reason == "cancelled"
         assert elapsed < 2.0  # `ps` の 5 秒上限を待たない
+        assert proc.poll() is not None
+    finally:
+        _reap(proc)
+
+
+def test_req34_libproc_path_skips_call_when_already_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34・#327: libproc 経路では、呼び出し前にキャンセル済みなら `child_status` を
+    呼ばずに `None`。"""
+    calls = {"n": 0}
+
+    def _child_status(pid: int) -> tuple[int, bool]:
+        calls["n"] += 1
+        return 1024, False
+
+    monkeypatch.setattr(supervisor, "_USE_LIBPROC", True)
+    monkeypatch.setattr(procinfo_darwin, "child_status", _child_status)
+    event = threading.Event()
+    event.set()
+    assert supervisor._current_child_status(os.getpid(), timeout=5.0, cancel_event=event) is None
+    assert calls["n"] == 0
+
+
+def test_req34_cancel_during_slow_libproc_call_ends_monitoring_without_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-34・#327: libproc 呼び出し（本来は非ブロッキングの syscall）が仮に遅くても、
+    呼び出しが戻った直後にキャンセルが効き、次の呼び出しなしで監視が終わる。
+
+    設計上の限界: 同期呼び出しの最中は中断できない（スレッドも子プロセスも無いため
+    割り込む手段が無い）。そのためキャンセル後の完了は「遅い呼び出し 1 回分」を
+    超えない、という上限で検証する（実際の libproc は数十 µs で戻る）。"""
+    proc = _spawn("import time; time.sleep(60)")
+    event = threading.Event()
+    calls = {"n": 0}
+    slow_seconds = 1.5
+
+    def _slow_child_status(pid: int) -> tuple[int, bool]:
+        calls["n"] += 1
+        time_mod.sleep(slow_seconds)
+        return 1024, False
+
+    monkeypatch.setattr(supervisor, "_USE_LIBPROC", True)
+    monkeypatch.setattr(procinfo_darwin, "child_status", _slow_child_status)
+    threading.Timer(0.3, event.set).start()
+    try:
+        t0 = time_mod.monotonic()
+        reason = supervisor.monitor_child(
+            proc, time_limit_seconds=60.0, rss_limit_bytes=1 << 40, cancel_event=event
+        )
+        elapsed = time_mod.monotonic() - t0
+        assert reason == "cancelled"
+        assert calls["n"] == 1
+        assert elapsed < slow_seconds + 1.0
         assert proc.poll() is not None
     finally:
         _reap(proc)
@@ -1441,6 +1515,7 @@ def test_req34_communicate_error_still_releases_reservation(
     解放され、`monitor_failed` の `runtime_error` で終わる。"""
     request_path, out_dir, _ = _coop_setup(tmp_path, monkeypatch, "hang")
 
+    _force_ps_path(monkeypatch)  # darwin でも `ps` 経路で元の意図を検証する（#327）
     monkeypatch.setattr(supervisor.subprocess, "Popen", _wrap_popen_ps_fails())
     code = supervisor.run_supervised_train(request_path)
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])

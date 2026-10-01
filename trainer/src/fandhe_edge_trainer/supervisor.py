@@ -52,8 +52,11 @@ test_supervisor_module_does_not_import_mlx` で検証する。
    ブロックし、実際には正常に進んでいるのに `limit_exceeded` と誤判定しうる）。
 5. 0.1 秒間隔でポーリングする: 壁時計（`time.monotonic`）が
    `time_limit_seconds` ＋ 猶予（`_TIME_LIMIT_GRACE_SECONDS`）を超えたか、
-   `ps`（絶対パス `/bin/ps`）で読んだ子プロセスの RSS が `rss_limit_bytes` を
-   超えたかを見る。`ps` の実行自体に失敗したら「監視ができない」ことを
+   子プロセスの RSS が `rss_limit_bytes` を超えたかを見る。RSS・ゾンビ状態の
+   取得方式は OS ごとに異なる: macOS は libproc の `proc_pidinfo` を ctypes で呼び
+   （`procinfo_darwin.py`。setuid の `/bin/ps` は `sandbox-exec` 下で起動できない
+   ため。#327）、それ以外は `ps`（絶対パス `/bin/ps`）を使う。取得自体に失敗したら
+   （`ps` の起動失敗・libproc の読み込み失敗等）「監視ができない」ことを
    fail-closed に扱い、子プロセスを強制終了して `runtime_error` とする
    （安全側に倒す。上限を検査できないまま野放しにしない）。
 6. 超過を検出したら `_terminate_worker` で `_worker` のプロセスグループ W
@@ -157,7 +160,9 @@ Rust 側 `run_train` が `_worker`（＝ Rust から見た孫プロセス）を�
 使えない。代わりに、既存の RSS 監視が使う `ps -p <pid>` 呼び出しへ
 `stat=`（プロセス状態）を相乗りさせ、`Z`（ゾンビ）かどうかで判定する
 （ゾンビはプロセス表から消えないため `ps` に引き続き表示される。
-新しい依存・子プロセス起動は増やさない）。`_terminate_worker`
+新しい依存・子プロセス起動は増やさない。macOS は `ps` の代わりに libproc の
+SHORTBSDINFO〔`arg=1` で未回収のゾンビも見える〕の状態が `SZOMB` かで同じ判定を
+する。`procinfo_darwin.py`・#327）。`_terminate_worker`
 （`killpg`）を呼んでから初めて `Popen.wait()` で回収する
 （`_terminate_and_reap`。**`monitor_child` はこの関数だけを通じて `proc`
 を回収し、他の箇所で `poll()`／`wait()`／`communicate()` を直接呼ばない**。
@@ -186,7 +191,7 @@ from pathlib import Path
 from typing import Any
 
 from . import artifact as artifact_mod
-from . import contract
+from . import contract, procinfo_darwin
 from .errors import WorkerError
 from .exitcode import ExitCode
 from .limits import MAX_RESULT_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION
@@ -218,6 +223,10 @@ _MAX_WORKER_STDOUT_BYTES = MAX_RESULT_BYTES
 #: 値は `limits.py::MAX_RESULT_BYTES_WITH_VALIDATION`（Rust 側の
 #: `MAX_RESULT_BYTES_WITH_VALIDATION` と同じ。共有 fixture で照合）。
 _MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION = MAX_RESULT_BYTES_WITH_VALIDATION
+
+#: 子の状態取得に libproc（`procinfo_darwin`）を使うか。macOS のみ真（#327）。`ps` 経路を
+#: 強制したいテストが差し替えられるよう、`_current_child_status` から切り出している。
+_USE_LIBPROC = sys.platform == "darwin"
 
 #: `ps` の絶対パス（`shell=True` を使わず、`PATH` に依存しない）。
 _PS_BIN = "/bin/ps"
@@ -369,9 +378,9 @@ def _current_child_status(
     timeout: float = _PS_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> tuple[int, bool] | None:
-    """`ps -o rss=,stat= -p <pid>` で RSS（バイト単位に変換済み）とゾンビ
-    状態かどうかを 1 回の呼び出しでまとめて取得する。取得できなければ
-    `None`。
+    """RSS（バイト単位）とゾンビ状態かどうかを 1 回の呼び出しでまとめて取得する。
+    取得できなければ `None`。macOS は libproc（`procinfo_darwin`。#327）、それ以外は
+    `ps -o rss=,stat= -p <pid>` で取得する。以下は `ps` 経路の説明。
 
     `ps` の RSS 出力は KiB 単位（BSD/macOS・Linux とも `-o rss=` は KiB）。
     `stat` の先頭が `Z`（Linux・macOS/BSD 共通の意味）であれば、対象は
@@ -387,6 +396,14 @@ def _current_child_status(
     監視が使う `ps` 呼び出しへ相乗りすることで、新しい依存・子プロセス
     起動を増やさずに実現する）。
     """
+    if _USE_LIBPROC:
+        # macOS: setuid の `/bin/ps` は `sandbox-exec` 下で exec できないため、libproc を
+        # 直接呼ぶ（#327・REQ-38・REQ-39）。外部プロセスを起動せず呼び出しはブロック
+        # しないので、`timeout` は使わず、呼び出し前にキャンセル・締め切りを確認する
+        # （確認で打ち切った場合は `None`。理由は呼び出し側が `_stop_reason` で決める）。
+        if _is_cancelled(cancel_event) or timeout <= 0.0:
+            return None
+        return procinfo_darwin.child_status(pid)
     stdout_text = _run_ps(pid, timeout, cancel_event)
     if stdout_text is None:
         return None
