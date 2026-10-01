@@ -380,16 +380,27 @@ pub(crate) mod test_support {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// `(id, split)` の並びから、入力が `input-<id>` のレコードと分割結果を作る。
+    /// `(id, split)` の並びから、入力が `input-<id>`・ラベルが `yes` のレコードと分割結果を作る。
     pub(crate) fn records_and_split(rows: &[(&str, Split)]) -> (Vec<ValidRecord>, SplitResult) {
+        let labeled: Vec<(&str, Split, &str)> = rows
+            .iter()
+            .map(|(id, split)| (*id, *split, "yes"))
+            .collect();
+        records_and_split_labeled(&labeled)
+    }
+
+    /// `(id, split, label_id)` の並びから、入力が `input-<id>` のレコードと分割結果を作る。
+    pub(crate) fn records_and_split_labeled(
+        rows: &[(&str, Split, &str)],
+    ) -> (Vec<ValidRecord>, SplitResult) {
         let records = rows
             .iter()
             .enumerate()
-            .map(|(i, (id, _))| ValidRecord {
+            .map(|(i, (id, _, label))| ValidRecord {
                 line: i + 1,
                 id: (*id).to_string(),
                 input: format!("input-{id}"),
-                label_id: "yes".to_string(),
+                label_id: (*label).to_string(),
                 output_key: String::new(),
                 tags: None,
                 group_id: None,
@@ -397,7 +408,7 @@ pub(crate) mod test_support {
             .collect();
         let by_record: BTreeMap<String, Split> = rows
             .iter()
-            .map(|(id, split)| ((*id).to_string(), *split))
+            .map(|(id, split, _)| ((*id).to_string(), *split))
             .collect();
         let split = SplitResult {
             by_record,

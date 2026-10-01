@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 
 /// 評価完了記録の読み込み上限（バイト。読み込み前のサイズ確認に使う。REQ-39）。
 ///
-/// 候補 ID・sha256（hex 64 桁）4 個・件数のみを持つため、実際の大きさは 1 KiB に満たない。
+/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）のみを持つ。通常は 1 KiB 程度で、
+/// 比較欄の `majority_label`（最大 256 バイト）が全て JSON の `\u00XX` に膨らむ最悪でも
+/// この上限に収まる（テスト `req39_issue339_record_fits_size_limit`）。
 pub const MAX_EVALUATION_RECORD_BYTES: u64 = 4 * 1024;
 
 /// 評価完了記録の保存・読み込みの失敗（内容を含まない）。
@@ -43,6 +45,37 @@ impl std::fmt::Display for EvaluationRecordError {
 }
 
 impl std::error::Error for EvaluationRecordError {}
+
+/// 下限基準（majority）との比較の判定（#339・REQ-25）。評価器の `BaselineVerdict` の写し。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineComparisonVerdict {
+    /// 有意水準 0.05 で下限基準を上回る。
+    SignificantlyBetter,
+    /// 件数は足りているが有意差がない。
+    NotSignificantlyBetter,
+    /// 事前計算した必要件数に満たず判定できない（合格扱いにしない）。
+    Undeterminable,
+}
+
+/// 下限基準との比較の記録（#339・REQ-25）。p 値は `b`・`c` から計算し直せるため持たない。
+/// 値の整合は `package` が定義と train 分割から計算し直して照合する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineComparisonRecord {
+    /// train 分割のラベルだけから決めた多数派ラベルの選択肢 ID。
+    pub majority_label: String,
+    /// 下限基準の正解数。
+    pub baseline_correct: u64,
+    /// 候補だけが正解した件数。
+    pub b: u64,
+    /// 下限基準だけが正解した件数。
+    pub c: u64,
+    /// 定義の仮定から事前計算した必要件数。
+    pub required_n: u64,
+    /// 判定。
+    pub verdict: BaselineComparisonVerdict,
+}
 
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +101,10 @@ pub struct EvaluationRecord {
     pub correct: u64,
     /// 評価件数。
     pub total: u64,
+    /// 下限基準との比較（定義に `baseline_comparison` があるときだけ。#339）。
+    /// 欄の無い古い記録はそのまま読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_comparison: Option<BaselineComparisonRecord>,
 }
 
 impl EvaluationRecord {
@@ -106,6 +143,18 @@ mod tests {
             definition_sha256: "d".repeat(64),
             correct: 7,
             total: 12,
+            baseline_comparison: None,
+        }
+    }
+
+    fn sample_comparison() -> BaselineComparisonRecord {
+        BaselineComparisonRecord {
+            majority_label: "alpha".to_string(),
+            baseline_correct: 5,
+            b: 3,
+            c: 1,
+            required_n: 221,
+            verdict: BaselineComparisonVerdict::Undeterminable,
         }
     }
 
@@ -146,5 +195,87 @@ mod tests {
             EvaluationRecord::from_json_slice(br#"{"candidate_index":0}"#),
             Err(EvaluationRecordError::Malformed)
         );
+    }
+
+    /// REQ-25・#339: 比較欄つきの記録は往復でき、キーは宣言順で完全一致する。
+    #[test]
+    fn req25_issue339_record_with_comparison_round_trips_with_exact_json() {
+        let mut record = sample();
+        record.baseline_comparison = Some(sample_comparison());
+        let bytes = record.to_json_vec().expect("json");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.ends_with(
+            ",\"baseline_comparison\":{\"majority_label\":\"alpha\",\"baseline_correct\":5,\"b\":3,\"c\":1,\"required_n\":221,\"verdict\":\"undeterminable\"}}\n"
+        ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+
+    /// REQ-25・#339: 欄の無い古い記録は `None` で読める。
+    #[test]
+    fn req25_issue339_old_record_without_comparison_reads_as_none() {
+        let bytes = sample().to_json_vec().expect("json");
+        assert!(
+            !String::from_utf8(bytes.clone())
+                .unwrap()
+                .contains("baseline_comparison")
+        );
+        let read = EvaluationRecord::from_json_slice(&bytes).expect("read");
+        assert_eq!(read.baseline_comparison, None);
+    }
+
+    /// REQ-25・#339: 比較欄の未知キー・型違い・未知の判定語彙は `Malformed`。
+    #[test]
+    fn req25_issue339_comparison_rejects_malformed_shapes() {
+        let mut record = sample();
+        record.baseline_comparison = Some(sample_comparison());
+        let base: serde_json::Value =
+            serde_json::from_slice(&record.to_json_vec().expect("json")).expect("value");
+        for mutate in [
+            |v: &mut serde_json::Value| v["baseline_comparison"]["extra"] = serde_json::json!(1),
+            |v: &mut serde_json::Value| v["baseline_comparison"]["b"] = serde_json::json!("3"),
+            |v: &mut serde_json::Value| {
+                v["baseline_comparison"]["verdict"] = serde_json::json!("pass")
+            },
+            |v: &mut serde_json::Value| {
+                v["baseline_comparison"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("c");
+            },
+        ] {
+            let mut value = base.clone();
+            mutate(&mut value);
+            assert_eq!(
+                EvaluationRecord::from_json_slice(value.to_string().as_bytes()),
+                Err(EvaluationRecordError::Malformed)
+            );
+        }
+    }
+
+    /// REQ-39・#339: 最悪の大きさ（256 バイトの制御文字ラベル・全件数が `u64::MAX`）でも上限内。
+    #[test]
+    fn req39_issue339_record_fits_size_limit() {
+        let record = EvaluationRecord {
+            candidate_index: usize::MAX,
+            candidate_id: "c".repeat(64),
+            config_id: "c".repeat(128),
+            evaluation_sha256: "a".repeat(64),
+            evaluation_bytes: u64::MAX,
+            onnx_sha256: "b".repeat(64),
+            artifact_meta_sha256: "c".repeat(64),
+            definition_sha256: "d".repeat(64),
+            correct: u64::MAX,
+            total: u64::MAX,
+            baseline_comparison: Some(BaselineComparisonRecord {
+                majority_label: "\u{1}".repeat(256),
+                baseline_correct: u64::MAX,
+                b: u64::MAX,
+                c: u64::MAX,
+                required_n: u64::MAX,
+                verdict: BaselineComparisonVerdict::NotSignificantlyBetter,
+            }),
+        };
+        let len = record.to_json_vec().expect("json").len() as u64;
+        assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");
     }
 }

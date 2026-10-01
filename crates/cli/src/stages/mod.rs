@@ -13,7 +13,7 @@
 //! - `register`・`inspect`・`train`・`select`・`package`・`infer` は下位層へ接続済み
 //! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
-//!   `package` はその記録を確認する。Wilson 区間・McNemar / Holm・診断（REQ-29）は未結線
+//!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。Wilson 区間・診断（REQ-29）は未結線
 //!   （[`evaluate`] 参照）
 //! - `package` は容量（REQ-30）を計測して `limits.max_package_bytes`（無ければ 40,000,000）と照合し、
 //!   `limits.max_infer_p95_us` があれば `train` 分割の入力で推論待ち時間 p95 を計測して照合する
@@ -42,6 +42,7 @@ use crate::error_report::emit_error_report;
 use crate::output::write_stage_line;
 use crate::stage_output::{emit_evaluate_skipped, emit_package_outcome};
 
+mod baseline;
 pub mod candidate_artifact;
 pub mod evaluate;
 pub mod infer;

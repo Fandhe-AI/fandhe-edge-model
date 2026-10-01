@@ -257,9 +257,53 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         }
     }
 
+    // 5d. baseline_comparison（省略可能。#339）。キーがあれば object で、
+    // 3 つの既知キーは必須の u32。`null` は型エラーにする。
+    if let Some(value) = root.get("baseline_comparison") {
+        let object = match value.as_object() {
+            None => {
+                return Some(DefinitionError::TypeMismatch {
+                    field: FieldPath::BaselineComparison,
+                    expected: ExpectedType::Object,
+                    actual: json_type(value),
+                });
+            }
+            Some(o) => o,
+        };
+        for (key, field) in [
+            ("assumed_p_b_bp", FieldPath::BaselineComparisonAssumedPBBp),
+            ("assumed_p_c_bp", FieldPath::BaselineComparisonAssumedPCBp),
+            ("power_bp", FieldPath::BaselineComparisonPowerBp),
+        ] {
+            match object.get(key) {
+                None => return Some(DefinitionError::MissingField { field }),
+                Some(v) => {
+                    if v.as_u64().is_none_or(|n| n > u64::from(u32::MAX)) {
+                        return Some(DefinitionError::TypeMismatch {
+                            field,
+                            expected: ExpectedType::UnsignedInt32,
+                            actual: json_type(v),
+                        });
+                    }
+                }
+            }
+        }
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "assumed_p_b_bp" | "assumed_p_c_bp" | "power_bp"
+            ) {
+                return Some(DefinitionError::UnknownField {
+                    parent: FieldPath::BaselineComparison,
+                    name: key.clone(),
+                });
+            }
+        }
+    }
+
     // 6. トップレベルの未知キー（`serde_json::Map` は既定で `BTreeMap` の
     // ためキー順走査は決定的）。
-    const KNOWN_TOP_LEVEL_KEYS: [&str; 8] = [
+    const KNOWN_TOP_LEVEL_KEYS: [&str; 9] = [
         "schema",
         "name",
         "version",
@@ -268,6 +312,7 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         "io",
         "acceptance",
         "limits",
+        "baseline_comparison",
     ];
     for key in root.keys() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {

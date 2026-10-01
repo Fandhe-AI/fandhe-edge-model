@@ -135,6 +135,12 @@ pub struct PackageOutcome {
     pub verdict: PackageVerdict,
     /// 超過した上限（呼び出し側が渡した順）。
     pub breaches: Vec<LimitBreach>,
+    /// 定義に `acceptance`（`min_accuracy_bp`）があるか（出力の `acceptance_defined`。REQ-33・#339）。
+    ///
+    /// 合否の有無（`verdict`）とは別。下限基準（`baseline_comparison`）だけの定義でも `verdict` は
+    /// Pass / Fail になるが、`acceptance` は無いため `false`。[`resolve_package_outcome`] は
+    /// 従来どおり `quality != NotDefined` を既定にし、呼び出し側が定義に合わせて上書きする。
+    pub acceptance_defined: bool,
 }
 
 /// 上限超過と合否判定から終了コードを決める（純粋関数。panic しない）。
@@ -158,6 +164,7 @@ pub fn resolve_package_outcome(
         exit_code,
         verdict,
         breaches: breaches.to_vec(),
+        acceptance_defined: quality != PackageQualityJudgment::NotDefined,
     }
 }
 
