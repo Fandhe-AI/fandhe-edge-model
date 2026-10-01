@@ -358,6 +358,21 @@ mod tests {
         assert_eq!(hash.to_hex(), DEFINITION_A_HASH_HEX);
     }
 
+    /// REQ-15・#338: `limits` を持たない定義の正準化 JSON・ハッシュは、`limits` 欄の
+    /// 追加後も golden から変わらない（`None` は直列化しない）。
+    #[test]
+    fn req15_issue338_definition_without_limits_keeps_golden_hash() {
+        let def = definition_a();
+        assert_eq!(def.limits(), None);
+        let json = def.canonical_json().expect("正準化に失敗しないはず");
+        assert!(!json.contains("limits"));
+        assert_eq!(json, DEFINITION_A_CANONICAL);
+        assert_eq!(
+            def.canonical_hash().expect("ハッシュ計算").to_hex(),
+            DEFINITION_A_HASH_HEX
+        );
+    }
+
     #[test]
     fn req15_task15_5_sha256_known_vector() {
         assert_eq!(

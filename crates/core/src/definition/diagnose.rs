@@ -220,9 +220,46 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         }
     }
 
+    // 5c. limits（省略可能。#338）。キーがあれば object で、既知キーは u64。
+    // 欠落は報告しない（両方とも省略可能）。`null` は型エラーにする。
+    if let Some(limits_value) = root.get("limits") {
+        let limits_object = match limits_value.as_object() {
+            None => {
+                return Some(DefinitionError::TypeMismatch {
+                    field: FieldPath::Limits,
+                    expected: ExpectedType::Object,
+                    actual: json_type(limits_value),
+                });
+            }
+            Some(o) => o,
+        };
+        for (key, field) in [
+            ("max_infer_p95_us", FieldPath::LimitsMaxInferP95Us),
+            ("max_package_bytes", FieldPath::LimitsMaxPackageBytes),
+        ] {
+            if let Some(v) = limits_object.get(key)
+                && v.as_u64().is_none()
+            {
+                return Some(DefinitionError::TypeMismatch {
+                    field,
+                    expected: ExpectedType::UnsignedInt64,
+                    actual: json_type(v),
+                });
+            }
+        }
+        for key in limits_object.keys() {
+            if key != "max_infer_p95_us" && key != "max_package_bytes" {
+                return Some(DefinitionError::UnknownField {
+                    parent: FieldPath::Limits,
+                    name: key.clone(),
+                });
+            }
+        }
+    }
+
     // 6. トップレベルの未知キー（`serde_json::Map` は既定で `BTreeMap` の
     // ためキー順走査は決定的）。
-    const KNOWN_TOP_LEVEL_KEYS: [&str; 7] = [
+    const KNOWN_TOP_LEVEL_KEYS: [&str; 8] = [
         "schema",
         "name",
         "version",
@@ -230,6 +267,7 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         "options",
         "io",
         "acceptance",
+        "limits",
     ];
     for key in root.keys() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {

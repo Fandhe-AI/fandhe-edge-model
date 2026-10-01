@@ -3,7 +3,7 @@
 //! 資源上限（容量・待ち時間。REQ-30・REQ-31・#133）の超過を、合否判定より優先して
 //! `limit_exceeded`（終了コード 20）へ写す純粋関数を持つ。CLI の `package` 工程
 //! が、上限の照合結果と合否判定をここへ渡して終了コードを得る。容量は結線済み
-//! （`crates/cli/src/stages/package.rs`。TASK-30.2・#124）、待ち時間（p95）は未結線。
+//! （`crates/cli/src/stages/package.rs`。TASK-30.2・#124）、待ち時間（p95）も接続済み（#338）。
 //! 容量・待ち時間の合流点は `tests/limit_exceeded_boundary.rs`（TASK-21.3・#131）で確認する。
 //!
 //! # 優先順（PoC-16 の package 工程と同じ）
@@ -22,15 +22,17 @@
 //!   `capacity_limit` モジュール（TASK-30.2・#124）が担う。本モジュールは [`LimitBreach`] を
 //!   入力として受け取る
 //! - 待ち時間上限の検証済み型 `LatencyLimit` と照合 `check_latency_limit` は #129 で追加済み
-//!   （`latency_limit` モジュール）。定義ファイルへの取り込みは未実装
-//! - 利用者が設定する容量上限の定義ファイル・CLI 引数への取り込みは未実装（入出力契約の変更を伴う）
+//!   （`latency_limit` モジュール）。定義ファイルの `limits.max_infer_p95_us` からの取り込みは
+//!   CLI の `package` 工程で接続済み（#338）
+//! - 利用者が設定する容量上限は定義ファイルの `limits.max_package_bytes` から CLI の `package` 工程が
+//!   取り込む（#338。CLI 引数からの取り込みは未実装）
 //! - 評価器の判定から [`PackageQualityJudgment`] への変換（評価器の判定不能を
 //!   `Undeterminable` へ渡す変換を含む）と JSON 出力への配線は、CLI の `package` 工程
 //!   （`crates/cli/src/stages/package.rs`。合否基準の接続は #328）で接続済み。本モジュールは
 //!   変換済みの [`PackageQualityJudgment`] を受け取り、上限超過を合否より優先する規則だけを担う
 //! - 待ち時間の p95 は `latency_report::LatencyReport::p95_ns()`（切り上げ済み。#128）から得る。
-//!   計測ハーネスは #127。利用者が設定する待ち時間上限の定義ファイルへの取り込み（範囲検証を含む）・CLI の `package` / `infer` への配線と
-//!   JSON 出力（TASK-33.x）は未実装。本モジュールは p95 と上限を数値（ナノ秒）で受け取る
+//!   計測ハーネスは #127。利用者が設定する待ち時間上限の定義ファイルへの取り込み（範囲検証を含む）と CLI の `package` への配線は
+//!   接続済み（#338）。p95 値の JSON 出力は未実装（#340）。本モジュールは p95 と上限を数値（ナノ秒）で受け取る
 //!
 //! # 待ち時間（REQ-31）の境界規則
 //!

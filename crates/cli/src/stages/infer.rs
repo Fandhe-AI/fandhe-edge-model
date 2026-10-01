@@ -63,7 +63,7 @@ pub(crate) fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
 /// `--id` を省略した `--text` の入力 ID。
 const DEFAULT_TEXT_ID: &str = "input";
 
-type Pipeline = InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>;
+pub(crate) type Pipeline = InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>;
 
 /// 検査を通過したパッケージから組み立てた推論の準備。
 struct Prepared {
@@ -191,14 +191,34 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
         return Err(invalid("package label order does not match definition"));
     }
+    let pipeline = build_pipeline(onnx, &meta, definition.options().len())?;
+    Ok(Prepared {
+        definition,
+        pipeline,
+    })
+}
+
+/// `max_bytes` の範囲検査・`kind` の解析・[`load_backend`] を行い、前処理と束ねた推論パイプラインを
+/// 組み立てる（`infer` の `prepare` と、`package` の公開前検証・p95 計測が共有する。REQ-32・REQ-39）。
+///
+/// `package` は公開するのと同じ `onnx` のバイト列から組み立て、計測対象と配布物を一致させる。
+///
+/// # Errors
+/// `max_bytes` が範囲外・未対応の `kind`・未許可の版・読み込めない ONNX・出力サイズの不一致は
+/// `invalid_input`（64）。
+pub(crate) fn build_pipeline(
+    onnx: &[u8],
+    meta: &ArtifactMeta,
+    n_options: usize,
+) -> Result<Pipeline, ErrorReport> {
     let max_bytes = usize::try_from(meta.max_bytes())
         .ok()
         .filter(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(n))
         .ok_or_else(|| invalid("package max_bytes is out of range"))?;
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    let backend = load_backend(onnx, kind, meta.kind_version(), definition.options().len())?;
-    Ok(Prepared {
-        definition,
-        pipeline: InferencePipeline::new(ByteEncodingPreprocessor::new(max_bytes), backend),
-    })
+    let backend = load_backend(onnx, kind, meta.kind_version(), n_options)?;
+    Ok(InferencePipeline::new(
+        ByteEncodingPreprocessor::new(max_bytes),
+        backend,
+    ))
 }

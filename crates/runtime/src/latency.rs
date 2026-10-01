@@ -21,7 +21,8 @@
 //!
 //! - p95 算出・レポート・参考値の明記は [`crate::latency_report`]（#128・TASK-31.1-2）で実装済み。
 //!   上限照合と `limit_exceeded`: [`crate::latency_limit`]（TASK-31.2・#129）で実装済み。上限ちょうどの境界判定: #130。
-//!   JSON 出力・CLI 接続: TASK-33.x
+//!   CLI 接続: `package` 工程が定義の `limits.max_infer_p95_us` があるときだけ計測・照合する（#338）。
+//!   JSON 出力: #340
 //! - 実前処理（#112）・ONNX 推論（#113）が未実装のため、実モデルでの計測は #113 完了後
 //! - 実機（静かな Mac）での実計測と実測値の記録は人間の作業。本モジュールのテストの
 //!   証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ
@@ -325,7 +326,7 @@ impl std::fmt::Debug for LatencySamples {
 ///
 /// 計測対象は `pipeline.infer_one`（バッチ 1 件と同じ共通経路。REQ-28）の 1 回の呼び出しのみ。
 /// `inputs` は循環して使う。推論関数へ渡すのは入力文字列だけ（REQ-27）。
-/// 呼び出し元（想定）: CLI の bench 工程（TASK-33.x）・#128 のレポート生成。
+/// 呼び出し元: CLI の `package` 工程（`limits.max_infer_p95_us` があるとき。#338）・#128 のレポート生成。
 pub fn measure_latency<P: Preprocessor, B: ScoringBackend, C: Clock>(
     pipeline: &InferencePipeline<P, B>,
     inputs: &[&str],
