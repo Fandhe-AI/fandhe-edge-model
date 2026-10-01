@@ -43,7 +43,9 @@
 | `accuracy` | 正解率（`correct / n_total`） |
 | `macro_f1` | Macro-F1（評価器で算出。分母 0 のラベルは平均から除外し、全ラベルで未定義なら `null`） |
 
-評価データが未定義のときは `{"step":"evaluate","status":"skipped",...}`（exit 0）で、評価済みを装いません。成功時は `candidates/<N>/evaluation_record.json` を書き、`package` は記録と最終 test の台帳での適用完了を確認してから公開します。値は例示です。Wilson 区間・McNemar / Holm・診断レポートは未接続です。
+評価データが未定義のときは `{"step":"evaluate","status":"skipped",...}`（exit 0）で、評価済みを装いません。成功時は `candidates/<N>/evaluation_record.json` を書き、`package` は記録と最終 test の台帳での適用完了を確認してから公開します。値は例示です。Wilson 区間・診断レポートは未接続です。
+
+定義ファイルに省略可能な `baseline_comparison`（例 `{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":8000}`）を書いたときだけ、`evaluate` は下限基準（majority）との McNemar 比較を行い、結果（`majority_label`・`baseline_correct`・`b`・`c`・`required_n`・`verdict`）を評価記録 `evaluation_record.json` の `baseline_comparison` に残します（出力 JSON は変わりません。REQ-25・#339）。3 つの値は 1 万分率の整数で、`assumed_p_b_bp`・`assumed_p_c_bp` は 0..=10000（`p_b > p_c`・和は 10000 以下）、`power_bp` は 1..=9999、有意水準 α は 0.05 で固定です。`verdict` は `significantly_better`・`not_significantly_better`・`undeterminable`（評価件数が仮定から事前計算した必要件数に満たない）です。majority は train 分割のラベルだけから作り（validation・評価データは使わない）、最終 test の適用前に確定します。`package` は記録の比較欄を計算し直して照合し、改変・欄の有無の食い違いは `invalid_input` で止めます。有意性は `package` の合否には使いません。
 
 ## 開発環境構築
 

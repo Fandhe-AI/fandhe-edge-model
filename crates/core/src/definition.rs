@@ -54,6 +54,15 @@
 //! - `None` のときは直列化しないので、`limits` の無い定義の正準化ハッシュは変わらない
 //! - 値は定義の正準化ハッシュに含まれるため、`evaluate` の後に変えると `package` が
 //!   評価記録の照合で止まる（意図した挙動。REQ-27）
+//!
+//! # 下限基準比較の事前登録（#339・REQ-25・REQ-27）
+//! - `baseline_comparison`（`assumed_p_b_bp`・`assumed_p_c_bp`・`power_bp`。3 つとも必須の
+//!   1 万分率の整数）は、`evaluate` が下限基準（majority）との McNemar 比較で必要件数を
+//!   事前に計算するための仮定である。省略時は比較しない
+//! - 有意水準 α は 0.05 に固定し（評価器の `SIGNIFICANCE_ALPHA`）、欄には持たせない
+//! - `None` のときは直列化しないので、欄の無い定義の正準化ハッシュは変わらない。作り直し判定は
+//!   `NotRequired` である
+//! - 値は正準化ハッシュに含まれるため、評価データを見た後に仮定を変えると `package` が止める
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -218,6 +227,61 @@ where
     RawLimits::deserialize(d).map(Some)
 }
 
+/// `baseline_comparison` の 1 万分率の上限（100%）。
+pub const MAX_BASELINE_COMPARISON_BP: u32 = 10_000;
+
+/// 下限基準（majority）との McNemar 比較の事前登録（#339・REQ-25・REQ-27）。
+/// `evaluate` が必要件数を求める仮定（不一致の割合 2 つと検出力）で、評価器の
+/// `McNemarSampleSizeAssumption` の規則を整数（1 万分率）で表したもの。
+///
+/// `Deserialize` は実装しない（範囲検証の迂回を防ぐ。[`Acceptance`] と同じ流儀）。
+/// 検証済みの値は [`Definition::parse`] 経由でのみ作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BaselineComparisonAssumption {
+    assumed_p_b_bp: u32,
+    assumed_p_c_bp: u32,
+    power_bp: u32,
+}
+
+impl BaselineComparisonAssumption {
+    /// 候補だけが正解する割合の仮定（1 万分率。`0..=10000`）。
+    #[must_use]
+    pub fn assumed_p_b_bp(&self) -> u32 {
+        self.assumed_p_b_bp
+    }
+
+    /// 下限基準だけが正解する割合の仮定（1 万分率。`0..=10000`。`p_b` より小さい）。
+    #[must_use]
+    pub fn assumed_p_c_bp(&self) -> u32 {
+        self.assumed_p_c_bp
+    }
+
+    /// 目標の検出力（1 万分率。`1..=9999`）。
+    #[must_use]
+    pub fn power_bp(&self) -> u32 {
+        self.power_bp
+    }
+}
+
+/// [`BaselineComparisonAssumption`] の未検証の中間表現（デシリアライズ専用）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBaselineComparison {
+    assumed_p_b_bp: u32,
+    assumed_p_c_bp: u32,
+    power_bp: u32,
+}
+
+/// `baseline_comparison` キーがあるのに値が `null` のとき型エラーにする（#339）。
+fn deserialize_present_baseline_comparison<'de, D>(
+    d: D,
+) -> Result<Option<RawBaselineComparison>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RawBaselineComparison::deserialize(d).map(Some)
+}
+
 /// 入出力のデータ構造（REQ-15）。出力側は `judgment_type`／`options` で
 /// 表現済みのため、ここでは入力表現のみを持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +318,9 @@ pub struct Definition {
     /// 省略可能な上限（#338）。`None` は未設定で、正準化 JSON にも現れない。
     #[serde(skip_serializing_if = "Option::is_none")]
     limits: Option<Limits>,
+    /// 省略可能な下限基準比較の事前登録（#339）。`None` は比較しない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_comparison: Option<BaselineComparisonAssumption>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -277,6 +344,8 @@ struct RawDefinition {
     acceptance: Option<RawAcceptance>,
     #[serde(default, deserialize_with = "deserialize_present_limits")]
     limits: Option<RawLimits>,
+    #[serde(default, deserialize_with = "deserialize_present_baseline_comparison")]
+    baseline_comparison: Option<RawBaselineComparison>,
 }
 
 /// 定義ファイル内のフィールドの位置を表すパス（TASK-15.3-2）。
@@ -319,6 +388,14 @@ pub enum FieldPath {
     LimitsMaxInferP95Us,
     /// `limits.max_package_bytes`（#338）。
     LimitsMaxPackageBytes,
+    /// `baseline_comparison`（#339）。
+    BaselineComparison,
+    /// `baseline_comparison.assumed_p_b_bp`（#339）。
+    BaselineComparisonAssumedPBBp,
+    /// `baseline_comparison.assumed_p_c_bp`（#339）。
+    BaselineComparisonAssumedPCBp,
+    /// `baseline_comparison.power_bp`（#339）。
+    BaselineComparisonPowerBp,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -339,6 +416,14 @@ impl std::fmt::Display for FieldPath {
             FieldPath::Limits => write!(f, "limits"),
             FieldPath::LimitsMaxInferP95Us => write!(f, "limits.max_infer_p95_us"),
             FieldPath::LimitsMaxPackageBytes => write!(f, "limits.max_package_bytes"),
+            FieldPath::BaselineComparison => write!(f, "baseline_comparison"),
+            FieldPath::BaselineComparisonAssumedPBBp => {
+                write!(f, "baseline_comparison.assumed_p_b_bp")
+            }
+            FieldPath::BaselineComparisonAssumedPCBp => {
+                write!(f, "baseline_comparison.assumed_p_c_bp")
+            }
+            FieldPath::BaselineComparisonPowerBp => write!(f, "baseline_comparison.power_bp"),
         }
     }
 }
@@ -892,6 +977,43 @@ impl Definition {
             }
         };
 
+        // 下限基準比較（#339）: 評価器の `McNemarSampleSizeAssumption::new` と同じ規則を
+        // 整数で検証する（core は評価器に依存できない）。
+        let baseline_comparison = match raw.baseline_comparison {
+            None => None,
+            Some(b) => {
+                if b.assumed_p_b_bp > MAX_BASELINE_COMPARISON_BP {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::BaselineComparisonAssumedPBBp,
+                    });
+                }
+                if b.assumed_p_c_bp > MAX_BASELINE_COMPARISON_BP {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::BaselineComparisonAssumedPCBp,
+                    });
+                }
+                if b.power_bp == 0 || b.power_bp >= MAX_BASELINE_COMPARISON_BP {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::BaselineComparisonPowerBp,
+                    });
+                }
+                let sum_ok = b
+                    .assumed_p_b_bp
+                    .checked_add(b.assumed_p_c_bp)
+                    .is_some_and(|sum| sum <= MAX_BASELINE_COMPARISON_BP);
+                if b.assumed_p_b_bp <= b.assumed_p_c_bp || !sum_ok {
+                    return Err(DefinitionError::UnsupportedValue {
+                        field: FieldPath::BaselineComparison,
+                    });
+                }
+                Some(BaselineComparisonAssumption {
+                    assumed_p_b_bp: b.assumed_p_b_bp,
+                    assumed_p_c_bp: b.assumed_p_c_bp,
+                    power_bp: b.power_bp,
+                })
+            }
+        };
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -901,6 +1023,7 @@ impl Definition {
             io: raw.io,
             acceptance,
             limits,
+            baseline_comparison,
         })
     }
 
@@ -972,6 +1095,12 @@ impl Definition {
     #[must_use]
     pub fn limits(&self) -> Option<&Limits> {
         self.limits.as_ref()
+    }
+
+    /// 下限基準比較の事前登録（#339）。`None` は比較しない。
+    #[must_use]
+    pub fn baseline_comparison(&self) -> Option<&BaselineComparisonAssumption> {
+        self.baseline_comparison.as_ref()
     }
 
     /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
@@ -2111,5 +2240,192 @@ mod tests {
             json.contains(r#""acceptance":{"min_accuracy_bp":1},"io":{"input":"bytes"},"judgment_type":"single_select","limits":{"max_infer_p95_us":3,"max_package_bytes":5},"name""#),
             "{json}"
         );
+    }
+
+    /// 下限基準比較の欄を差し込んだ定義 JSON（#339）。
+    fn with_baseline(json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "baseline_comparison": {json}"#),
+            1,
+        )
+    }
+
+    fn baseline_json(p_b: u64, p_c: u64, power: u64) -> String {
+        format!(r#"{{ "assumed_p_b_bp": {p_b}, "assumed_p_c_bp": {p_c}, "power_bp": {power} }}"#)
+    }
+
+    /// REQ-25・#339: 範囲内の値（PoC-10 の事前登録値と境界）は受理され、アクセサが一致する。
+    #[test]
+    fn req15_issue339_baseline_comparison_accepts_in_range_values() {
+        for (b, c, p) in [(1500, 500, 8000), (10000, 0, 1), (5001, 4999, 9999)] {
+            let def = Definition::parse(&with_baseline(&baseline_json(b, c, p))).expect("parse");
+            let a = def.baseline_comparison().expect("baseline_comparison");
+            assert_eq!(
+                (a.assumed_p_b_bp(), a.assumed_p_c_bp(), a.power_bp()),
+                (b as u32, c as u32, p as u32)
+            );
+        }
+        assert_eq!(
+            Definition::parse(TWO_OPTIONS_JSON)
+                .expect("parse")
+                .baseline_comparison(),
+            None
+        );
+    }
+
+    /// REQ-25・#339: 和がちょうど 10000 の組は、評価器の f64 規則（`p_b + p_c <= 1.0`）でも
+    /// 超えない（core の整数規則と評価器の規則が境界でずれないことの固定）。
+    #[test]
+    fn req25_issue339_bp_sum_10000_is_not_above_one_in_f64() {
+        for k in 5001_u32..=10_000 {
+            let sum = f64::from(k) / 10_000.0 + f64::from(10_000 - k) / 10_000.0;
+            assert!(sum <= 1.0, "k={k} sum={sum}");
+        }
+    }
+
+    /// REQ-25・#339: 範囲外・順序違反・和の超過は `UnsupportedValue`（exit 64）。
+    #[test]
+    fn req15_issue339_baseline_comparison_rejects_out_of_range_values() {
+        for (b, c, p, field, msg) in [
+            (
+                10001,
+                0,
+                8000,
+                FieldPath::BaselineComparisonAssumedPBBp,
+                "definition field baseline_comparison.assumed_p_b_bp has an unsupported value",
+            ),
+            (
+                5000,
+                10001,
+                8000,
+                FieldPath::BaselineComparisonAssumedPCBp,
+                "definition field baseline_comparison.assumed_p_c_bp has an unsupported value",
+            ),
+            (
+                1500,
+                500,
+                0,
+                FieldPath::BaselineComparisonPowerBp,
+                "definition field baseline_comparison.power_bp has an unsupported value",
+            ),
+            (
+                1500,
+                500,
+                10000,
+                FieldPath::BaselineComparisonPowerBp,
+                "definition field baseline_comparison.power_bp has an unsupported value",
+            ),
+            (
+                500,
+                500,
+                8000,
+                FieldPath::BaselineComparison,
+                "definition field baseline_comparison has an unsupported value",
+            ),
+            (
+                500,
+                1500,
+                8000,
+                FieldPath::BaselineComparison,
+                "definition field baseline_comparison has an unsupported value",
+            ),
+            (
+                5001,
+                5000,
+                8000,
+                FieldPath::BaselineComparison,
+                "definition field baseline_comparison has an unsupported value",
+            ),
+        ] {
+            let err = Definition::parse(&with_baseline(&baseline_json(b, c, p))).unwrap_err();
+            assert!(
+                matches!(&err, DefinitionError::UnsupportedValue { field: f } if *f == field),
+                "{b}/{c}/{p}: {err:?}"
+            );
+            assert_eq!(err.public_message(), msg);
+            assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+        }
+    }
+
+    /// REQ-25・#339: 形の不正（null・`{}`・欠落・文字列・負数・小数）は型・欠落エラー。
+    #[test]
+    fn req15_issue339_baseline_comparison_rejects_malformed_shapes() {
+        for (json, msg) in [
+            (
+                "null",
+                "definition field baseline_comparison has wrong type: expected object, found null",
+            ),
+            (
+                "{}",
+                "definition field baseline_comparison.assumed_p_b_bp is missing",
+            ),
+            (
+                r#"{ "assumed_p_b_bp": 1500, "assumed_p_c_bp": 500 }"#,
+                "definition field baseline_comparison.power_bp is missing",
+            ),
+            (
+                r#"{ "assumed_p_b_bp": "1500", "assumed_p_c_bp": 500, "power_bp": 8000 }"#,
+                "definition field baseline_comparison.assumed_p_b_bp has wrong type: expected unsigned integer (u32), found string",
+            ),
+            (
+                r#"{ "assumed_p_b_bp": 1500, "assumed_p_c_bp": -1, "power_bp": 8000 }"#,
+                "definition field baseline_comparison.assumed_p_c_bp has wrong type: expected unsigned integer (u32), found number",
+            ),
+            (
+                r#"{ "assumed_p_b_bp": 1500, "assumed_p_c_bp": 500, "power_bp": 0.5 }"#,
+                "definition field baseline_comparison.power_bp has wrong type: expected unsigned integer (u32), found number",
+            ),
+        ] {
+            let err = Definition::parse(&with_baseline(json)).unwrap_err();
+            assert_eq!(err.public_message(), msg, "{json}");
+            assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
+        }
+    }
+
+    /// REQ-25・#339: 未知キーは `UnknownField`。
+    #[test]
+    fn req15_issue339_baseline_comparison_rejects_unknown_key() {
+        let err = Definition::parse(&with_baseline(
+            r#"{ "assumed_p_b_bp": 1500, "assumed_p_c_bp": 500, "power_bp": 8000, "alpha": 1 }"#,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DefinitionError::UnknownField { parent: FieldPath::BaselineComparison, name } if name == "alpha"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.public_message(),
+            "definition field baseline_comparison has an unknown key"
+        );
+    }
+
+    /// REQ-15・#339: 欄は無ければ正準化 JSON に現れず、あればキー辞書順に並ぶ。
+    #[test]
+    fn req15_issue339_baseline_comparison_canonical_json_is_omitted_or_ordered() {
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("parse");
+        assert!(
+            !without
+                .canonical_json()
+                .expect("canon")
+                .contains("baseline_comparison")
+        );
+        let with =
+            Definition::parse(&with_baseline(&baseline_json(1500, 500, 8000))).expect("parse");
+        let json = with.canonical_json().expect("canon");
+        assert!(
+            json.starts_with(
+                r#"{"baseline_comparison":{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":8000},"io""#
+            ),
+            "{json}"
+        );
+        assert_ne!(
+            without.canonical_hash().expect("hash"),
+            with.canonical_hash().expect("hash")
+        );
+        assert_eq!(without.identity(), with.identity());
     }
 }

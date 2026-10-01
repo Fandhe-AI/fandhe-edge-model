@@ -312,3 +312,30 @@ fn req20_issue338_limits_only_change_is_not_required() {
         }
     }
 }
+
+/// REQ-20・REQ-15・#339: `baseline_comparison` だけを足す・変えるのは作り直し不要（`NotRequired`）。
+#[test]
+fn req20_issue339_baseline_comparison_only_change_is_not_required() {
+    let with = |json: &str| {
+        DEFINITION_A_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "baseline_comparison": {json}"#),
+            1,
+        )
+    };
+    let base = Definition::parse(DEFINITION_A_JSON).expect("valid");
+    let a = Definition::parse(&with(
+        r#"{ "assumed_p_b_bp": 1500, "assumed_p_c_bp": 500, "power_bp": 8000 }"#,
+    ))
+    .expect("valid");
+    let b = Definition::parse(&with(
+        r#"{ "assumed_p_b_bp": 2000, "assumed_p_c_bp": 500, "power_bp": 9000 }"#,
+    ))
+    .expect("valid");
+    for (old, new) in [(&base, &a), (&a, &b)] {
+        match decide_rebuild(old, new).expect("失敗しないはず") {
+            RebuildDecision::NotRequired(_) => {}
+            other => panic!("NotRequired を期待したが {other:?} だった"),
+        }
+    }
+}

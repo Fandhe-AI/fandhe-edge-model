@@ -1504,6 +1504,363 @@ mod suite {
         }
     }
 
+    /// 下限基準比較 `baseline_comparison` を足した定義 JSON（#339）。
+    fn baseline_definition_text(extra: &str) -> String {
+        definition_text().replacen(
+            r#""io":{"input":"bytes"}"#,
+            &format!(r#""io":{{"input":"bytes"}},"baseline_comparison":{extra}"#),
+            1,
+        )
+    }
+
+    /// 必要件数が 7 になる仮定（`9500/0/8000`。12 件で足りる）。
+    const BASELINE_ASSUMPTION_REQUIRED_7: &str =
+        r#"{"assumed_p_b_bp":9500,"assumed_p_c_bp":0,"power_bp":8000}"#;
+    /// 必要件数が 168 になる仮定（α=0.05 の `1500/500/8000`。12 件では足りない）。
+    const BASELINE_ASSUMPTION_REQUIRED_168: &str =
+        r#"{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":8000}"#;
+
+    /// `train_jsonl` に `majority` のレコードを 20 件足した学習データ（その多数派を `majority` にする）。
+    fn train_jsonl_with_majority(majority: &str) -> String {
+        let mut out = train_jsonl();
+        for i in 0..20 {
+            out.push_str(&format!(
+                r#"{{"id":"{majority}-x{i}","input":"{majority} extra {i}","output":{{"intent":"{majority}"}},"group_id":"g-{majority}-x{i}"}}"#
+            ));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `acceptance_env` と同じ進め方で、学習データも差し替える（`register → … → select` まで）。
+    fn baseline_env(case: &str, definition: &str, train: &str, golds: &[String]) -> Env {
+        let env = Env::new(case, false);
+        std::fs::write(env.work.join("def").join("train.jsonl"), train).expect("train");
+        std::fs::write(env.work.join("def").join("definition.json"), definition)
+            .expect("definition");
+        let mut jsonl = String::new();
+        for ((id, input), gold) in evaluation_inputs().iter().zip(golds) {
+            jsonl.push_str(&format!(
+                r#"{{"id":"{id}","input":"{input}","output":{{"intent":"{gold}"}},"group_id":"g-{id}"}}"#
+            ));
+            jsonl.push('\n');
+        }
+        std::fs::write(env.work.join("def").join("evaluation.jsonl"), jsonl).expect("evaluation");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&SELECT);
+        env
+    }
+
+    /// 予測の中で最も少ないラベル（同数は宣言順で先）とその件数。
+    fn least_predicted(predicted: &[String]) -> (&'static str, usize) {
+        LABELS
+            .iter()
+            .map(|l| (*l, predicted.iter().filter(|p| p == l).count()))
+            .min_by_key(|(_, n)| *n)
+            .expect("labels")
+    }
+
+    /// 評価記録の `baseline_comparison` の期待する JSON 断片。
+    fn baseline_fragment(
+        majority: &str,
+        baseline_correct: usize,
+        (b, c): (usize, usize),
+        required_n: u64,
+        verdict: &str,
+    ) -> String {
+        format!(
+            "\"baseline_comparison\":{{\"majority_label\":\"{majority}\",\"baseline_correct\":{baseline_correct},\"b\":{b},\"c\":{c},\"required_n\":{required_n},\"verdict\":\"{verdict}\"}}"
+        )
+    }
+
+    fn evaluation_record_path(env: &Env) -> PathBuf {
+        env.project_file("candidates/1/evaluation_record.json")
+    }
+
+    fn evaluation_record(env: &Env) -> String {
+        std::fs::read_to_string(evaluation_record_path(env)).expect("record")
+    }
+
+    /// REQ-25・REQ-27・#339: 下限基準比較の 3 つの判定（有意に上回る・有意差なし・判定不能）が
+    /// 評価記録に残り、`evaluate` の出力 JSON は比較なしの場合と同一。
+    /// majority は「予測に最も少ないラベル」にして、`b`・`c` を予測から具体値で決める。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX・合成データ）。
+    pub fn evaluate_records_baseline_comparison_three_verdicts() {
+        let predicted = predicted_evaluation_labels();
+        let (majority, in_predicted) = least_predicted(&predicted);
+        let train = train_jsonl_with_majority(majority);
+        let not_majority = 12 - in_predicted;
+        assert!(not_majority >= 6, "{predicted:?}");
+
+        // 有意に上回る: gold = 予測 → b = 多数派以外の行、c = 0、基準の正解は多数派の行。
+        let env = baseline_env(
+            "bcsig",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train,
+            &predicted,
+        );
+        let stdout = env.ok(&EVALUATE_1);
+        assert!(!stdout.contains("baseline"), "{stdout}");
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains(&baseline_fragment(
+                majority,
+                in_predicted,
+                (not_majority, 0),
+                7,
+                "significantly_better"
+            )),
+            "{record}"
+        );
+        // 比較の無い定義・同じ評価データの出力と、キーも値も同一（出力は変えない）。
+        let plain = baseline_env("bcplain", &definition_text(), &train, &predicted);
+        assert_eq!(plain.ok(&EVALUATE_1), stdout);
+        assert!(!evaluation_record(&plain).contains("baseline_comparison"));
+        env.ok(&PACKAGE);
+
+        // 有意差なし: gold = 多数派 → b = 0、c = 多数派以外の予測の行。
+        let golds: Vec<String> = vec![majority.to_string(); 12];
+        let env = baseline_env(
+            "bcnot",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train,
+            &golds,
+        );
+        env.ok(&EVALUATE_1);
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains(&baseline_fragment(
+                majority,
+                12,
+                (0, not_majority),
+                7,
+                "not_significantly_better"
+            )),
+            "{record}"
+        );
+        env.ok(&PACKAGE);
+
+        // 判定不能: 必要件数 168 > 12 件。gold = 予測で p 値だけなら有意でも、合格扱いにしない。
+        let env = baseline_env(
+            "bcundet",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_168),
+            &train,
+            &predicted,
+        );
+        env.ok(&EVALUATE_1);
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains(&baseline_fragment(
+                majority,
+                in_predicted,
+                (not_majority, 0),
+                168,
+                "undeterminable"
+            )),
+            "{record}"
+        );
+        env.ok(&PACKAGE);
+    }
+
+    /// REQ-27・#339: majority は train 分割のラベルだけから作る。train の多数派が `gamma`、評価データの
+    /// 多数派が `alpha` の組で、記録の `majority_label` は `gamma`（評価データから作らない）。
+    pub fn evaluate_majority_comes_from_train_not_evaluation() {
+        let golds: Vec<String> = vec!["alpha".to_string(); 12];
+        let env = baseline_env(
+            "bcmajtrain",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train_jsonl_with_majority("gamma"),
+            &golds,
+        );
+        env.ok(&EVALUATE_1);
+        let record = evaluation_record(&env);
+        assert!(
+            record.contains("\"majority_label\":\"gamma\""),
+            "majority must come from train: {record}"
+        );
+    }
+
+    /// REQ-25・#339: `baseline_comparison` の無い定義では比較せず、評価記録にも欄が現れない
+    /// （出力 JSON は従来どおり）。
+    pub fn evaluate_without_baseline_comparison_keeps_record_and_output() {
+        let env = eval_trained("bcnone");
+        env.ok(&SELECT);
+        let stdout = env.ok(&EVALUATE_1);
+        assert!(!stdout.contains("baseline"), "{stdout}");
+        let record = evaluation_record(&env);
+        assert!(!record.contains("baseline_comparison"), "{record}");
+        assert!(record.ends_with("\"total\":12}\n"), "{record}");
+        env.ok(&PACKAGE);
+    }
+
+    /// REQ-27・#339: `package` は評価記録の比較欄の改変（`majority_label`・`b`・`c`・`verdict`・
+    /// `required_n`・`baseline_correct`・欄の削除・欄の追加）を検出して止め、`package/`・
+    /// `package.staging` を作らない。元に戻すと成功する。
+    pub fn package_rejects_tampered_baseline_comparison() {
+        let predicted = predicted_evaluation_labels();
+        let (majority, in_predicted) = least_predicted(&predicted);
+        let not_majority = 12 - in_predicted;
+        let train = train_jsonl_with_majority(majority);
+        let env = baseline_env(
+            "bctamper",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train,
+            &predicted,
+        );
+        env.ok(&EVALUATE_1);
+        let record_path = evaluation_record_path(&env);
+        let original = evaluation_record(&env);
+        let fragment = baseline_fragment(
+            majority,
+            in_predicted,
+            (not_majority, 0),
+            7,
+            "significantly_better",
+        );
+        assert!(original.contains(&fragment), "{original}");
+        let other = LABELS.iter().find(|l| **l != majority).expect("other");
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n";
+        let b_plus_one = fragment.replacen(
+            &format!("\"b\":{not_majority},"),
+            &format!("\"b\":{},", not_majority + 1),
+            1,
+        );
+        let tampered_fragments = [
+            fragment.replacen(
+                &format!("\"majority_label\":\"{majority}\""),
+                &format!("\"majority_label\":\"{other}\""),
+                1,
+            ),
+            b_plus_one.clone(),
+            fragment.replacen("\"c\":0,", "\"c\":1,", 1),
+            // b・c を同じ量だけずらす（件数は整合するが判定が食い違う）。
+            b_plus_one.replacen("\"c\":0,", "\"c\":1,", 1),
+            fragment.replacen("significantly_better", "not_significantly_better", 1),
+            fragment.replacen("\"required_n\":7", "\"required_n\":6", 1),
+            fragment.replacen(
+                &format!("\"baseline_correct\":{in_predicted},"),
+                &format!("\"baseline_correct\":{},", in_predicted + 1),
+                1,
+            ),
+        ];
+        for (i, tampered_fragment) in tampered_fragments.iter().enumerate() {
+            assert_ne!(tampered_fragment, &fragment, "mutation {i}");
+            std::fs::write(
+                &record_path,
+                original.replacen(&fragment, tampered_fragment, 1),
+            )
+            .expect("tamper");
+            assert_eq!(
+                env.fails(&PACKAGE, 64, "invalid_input"),
+                mismatch,
+                "mutation {i}"
+            );
+            assert!(!env.project_file("package").exists(), "mutation {i}");
+            assert!(
+                !env.project_file("package.staging").exists(),
+                "mutation {i}"
+            );
+        }
+        // 欄の削除（定義には欄がある）。
+        std::fs::write(
+            &record_path,
+            original.replacen(&format!(",{fragment}"), "", 1),
+        )
+        .expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            mismatch,
+            "deleted"
+        );
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&record_path, &original).expect("restore");
+        env.ok(&PACKAGE);
+
+        // 欄の追加（定義には欄が無い）。
+        let env = baseline_env("bcadd", &definition_text(), &train, &predicted);
+        env.ok(&EVALUATE_1);
+        let record_path = evaluation_record_path(&env);
+        let original = evaluation_record(&env);
+        let added =
+            original.trim_end().trim_end_matches('}').to_string() + &format!(",{fragment}}}\n");
+        std::fs::write(&record_path, added).expect("tamper");
+        assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch, "added");
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&record_path, original).expect("restore");
+        env.ok(&PACKAGE);
+    }
+
+    /// REQ-25・#339: 不正な `baseline_comparison`（範囲外・未知キー・`null`・欠落・`p_b <= p_c`・
+    /// 和が 10000 超）は `register` が固定 message の `invalid_input` で拒否する。
+    pub fn register_rejects_invalid_baseline_comparison() {
+        let cases = [
+            (
+                r#"{"assumed_p_b_bp":10001,"assumed_p_c_bp":0,"power_bp":8000}"#,
+                "definition field baseline_comparison.assumed_p_b_bp has an unsupported value",
+            ),
+            (
+                r#"{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":10000}"#,
+                "definition field baseline_comparison.power_bp has an unsupported value",
+            ),
+            (
+                r#"{"assumed_p_b_bp":500,"assumed_p_c_bp":500,"power_bp":8000}"#,
+                "definition field baseline_comparison has an unsupported value",
+            ),
+            (
+                r#"{"assumed_p_b_bp":5001,"assumed_p_c_bp":5000,"power_bp":8000}"#,
+                "definition field baseline_comparison has an unsupported value",
+            ),
+            (
+                r#"{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":8000,"alpha":5}"#,
+                "definition field baseline_comparison has an unknown key",
+            ),
+            (
+                "null",
+                "definition field baseline_comparison has wrong type: expected object, found null",
+            ),
+            (
+                "{}",
+                "definition field baseline_comparison.assumed_p_b_bp is missing",
+            ),
+        ];
+        for (i, (extra, message)) in cases.iter().enumerate() {
+            let env = Env::new(&format!("bcbad{i}"), false);
+            std::fs::write(
+                env.work.join("def").join("definition.json"),
+                baseline_definition_text(extra),
+            )
+            .expect("definition");
+            assert_eq!(
+                env.fails(
+                    &["register", "--definition", DEF, "--project-dir", "proj"],
+                    64,
+                    "invalid_input"
+                ),
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+        }
+    }
+
+    /// REQ-25・REQ-27・#339: 定義は有効でも必要件数を算出できない仮定（`2/1/9999`）では、`evaluate` は
+    /// 最終 test の適用前に `invalid_input` で止まり、評価記録も台帳も作らない（適用権を使い切らない）。
+    pub fn evaluate_sample_size_failure_does_not_consume_apply_right() {
+        let golds: Vec<String> = vec!["alpha".to_string(); 12];
+        let env = baseline_env(
+            "bcnosize",
+            &baseline_definition_text(r#"{"assumed_p_b_bp":2,"assumed_p_c_bp":1,"power_bp":9999}"#),
+            &train_jsonl(),
+            &golds,
+        );
+        assert_eq!(
+            env.fails(&EVALUATE_1, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"baseline comparison sample size cannot be computed\"}\n"
+        );
+        assert!(!evaluation_record_path(&env).exists());
+        assert!(!env.project_file("final_test_ledger").exists());
+    }
     /// REQ-27: 同じ候補への 2 回目の `evaluate` は固定 message の `invalid_input` で、記録は変わらない。
     /// 記録を消しても、台帳の適用ロックが再適用を拒否する。
     pub fn evaluate_twice_is_rejected() {
@@ -2207,6 +2564,30 @@ fn main() -> std::process::ExitCode {
         (
             "register_rejects_invalid_acceptance",
             suite::register_rejects_invalid_acceptance,
+        ),
+        (
+            "evaluate_records_baseline_comparison_three_verdicts",
+            suite::evaluate_records_baseline_comparison_three_verdicts,
+        ),
+        (
+            "evaluate_majority_comes_from_train_not_evaluation",
+            suite::evaluate_majority_comes_from_train_not_evaluation,
+        ),
+        (
+            "evaluate_without_baseline_comparison_keeps_record_and_output",
+            suite::evaluate_without_baseline_comparison_keeps_record_and_output,
+        ),
+        (
+            "package_rejects_tampered_baseline_comparison",
+            suite::package_rejects_tampered_baseline_comparison,
+        ),
+        (
+            "register_rejects_invalid_baseline_comparison",
+            suite::register_rejects_invalid_baseline_comparison,
+        ),
+        (
+            "evaluate_sample_size_failure_does_not_consume_apply_right",
+            suite::evaluate_sample_size_failure_does_not_consume_apply_right,
         ),
         (
             "evaluate_twice_is_rejected",

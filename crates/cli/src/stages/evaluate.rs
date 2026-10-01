@@ -26,8 +26,8 @@
 //!
 //! `apply_once` がロックを取った後の失敗（推論の時間超過・記録の書き込み失敗など）では、その候補は
 //! 二度と評価できない（評価器の fail-closed の契約）。そのため適用権が要らない失敗しうる処理
-//! （成果物の検証・バックエンドの試し組み立て・評価データの事前検査・台帳の用意と事前登録・
-//! 記録ファイルの不在確認）はすべて `apply_once` の前に済ませる。
+//! （成果物の検証・バックエンドの試し組み立て・評価データの事前検査・下限基準 majority と必要件数の確定・
+//! 台帳の用意と事前登録・記録ファイルの不在確認）はすべて `apply_once` の前に済ませる。
 //!
 //! # 推論失敗の扱い
 //!
@@ -59,14 +59,21 @@
 //!
 //! # 未接続（実装済みを装わない）
 //!
-//! Wilson 区間・McNemar / Holm・診断レポート（REQ-29）・校正と棄権（REQ-22）は結線していない。
+//! Wilson 区間・診断レポート（REQ-29）・校正と棄権（REQ-22）は結線していない。
 //! 結果 JSON は正解率と Macro-F1 のみ（スキーマは 2026-09-30 オーナー承認済み）。
+//!
+//! # 下限基準との比較（REQ-25・REQ-27・#339）
+//!
+//! 定義に `baseline_comparison`（事前登録した仮定）があるときだけ、majority との McNemar 比較
+//! （Holm の族の大きさは 1 で恒等）の結果を評価記録の `baseline_comparison` へ残す（出力 JSON は変えない）。
+//! majority は train 分割のラベルだけから作り、必要件数は定義の仮定から求める。どちらも適用権を取る前に
+//! 確定する（[`super::baseline::prepare_baseline`]）。欄が無い定義では比較しない。
 
 use std::path::Path;
 use std::time::Instant;
 
 use fandhe_edge_core::definition::Definition;
-use fandhe_edge_core::evaluation_record::EvaluationRecord;
+use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
@@ -100,6 +107,7 @@ use crate::project::{
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
+use super::baseline::{PreparedBaseline, compare, prepare_baseline};
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
 };
@@ -207,6 +215,9 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     )?;
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
     decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
+    // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
+    let baseline = prepare_baseline(&definition, &records, &split)?;
     let definition_sha256 = definition
         .canonical_hash()
         .map_err(|_| runtime("cannot hash definition"))?
@@ -244,6 +255,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             &record_rel,
             definition_sha256,
             onnx_digest,
+            baseline.as_ref(),
             applied,
         )
         .map_err(|e| {
@@ -423,6 +435,7 @@ fn finalize_evaluation(
     record_rel: &Path,
     definition_sha256: String,
     onnx_digest: Sha256Digest,
+    baseline: Option<&PreparedBaseline>,
     applied: &AppliedOnce<Vec<Outcome>>,
 ) -> Result<EvaluateCompletedReport, ErrorReport> {
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
@@ -436,6 +449,19 @@ fn finalize_evaluation(
         .map_err(|_| runtime("cannot compute evaluation metrics"))?;
     let correct = computed.accuracy.overall.numerator();
     let total = computed.accuracy.overall.denominator();
+    // 下限基準との比較（定義に `baseline_comparison` があるときだけ。出力 JSON には出さない。#339）。
+    let baseline_comparison = match baseline {
+        None => None,
+        Some(prepared) => {
+            let (record, candidate_correct) =
+                compare(prepared, &labels, &applied.golds, &applied.output)?;
+            // 正誤の規則を 2 重化した結果のずれは、記録する前に止める。
+            if candidate_correct != correct {
+                return Err(runtime("baseline comparison disagrees with metrics"));
+            }
+            Some(record)
+        }
+    };
     let report = EvaluateCompletedReport::completed(
         candidate,
         target.kind_name.clone(),
@@ -456,10 +482,15 @@ fn finalize_evaluation(
         definition_sha256,
         correct,
         total,
+        baseline_comparison,
     };
     let record_json = record
         .to_json_vec()
         .map_err(|_| runtime("cannot serialize evaluation record"))?;
+    // `package` は記録を `MAX_EVALUATION_RECORD_BYTES` までしか読まない。読めない記録を書かない。
+    if u64::try_from(record_json.len()).map_or(true, |n| n > MAX_EVALUATION_RECORD_BYTES) {
+        return Err(runtime("evaluation record is too large"));
+    }
     project.write_new(record_rel, &record_json)?;
     Ok(report)
 }

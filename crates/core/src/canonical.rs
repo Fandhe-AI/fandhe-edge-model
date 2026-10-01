@@ -358,6 +358,21 @@ mod tests {
         assert_eq!(hash.to_hex(), DEFINITION_A_HASH_HEX);
     }
 
+    /// REQ-15・#339: `baseline_comparison` を持たない定義の正準化 JSON・ハッシュは、欄の追加後も
+    /// golden から変わらない（`None` は直列化しない）。
+    #[test]
+    fn req15_issue339_definition_without_baseline_comparison_keeps_golden_hash() {
+        let def = definition_a();
+        assert_eq!(def.baseline_comparison(), None);
+        let json = def.canonical_json().expect("正準化に失敗しないはず");
+        assert!(!json.contains("baseline_comparison"));
+        assert_eq!(json, DEFINITION_A_CANONICAL);
+        assert_eq!(
+            def.canonical_hash().expect("ハッシュ計算").to_hex(),
+            DEFINITION_A_HASH_HEX
+        );
+    }
+
     /// REQ-15・#338: `limits` を持たない定義の正準化 JSON・ハッシュは、`limits` 欄の
     /// 追加後も golden から変わらない（`None` は直列化しない）。
     #[test]

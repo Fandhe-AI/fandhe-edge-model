@@ -103,6 +103,7 @@ use crate::project::{
     SELECTION_FILE, inspect_bytes, invalid, parse_definition, runtime,
 };
 
+use super::baseline::{PreparedBaseline, prepare_baseline, record_matches};
 use super::candidate_artifact::{
     ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
     verify_vocab_file,
@@ -203,7 +204,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
             &project,
             (&selection, &Sha256Digest::of_bytes(&selection_bytes)),
             (freeze, eval_bytes),
-            &definition,
+            (
+                &definition,
+                // majority・必要件数は train 分割と定義から計算し直す（評価データは渡さない。#339）。
+                prepare_baseline(&definition, &records, &split)?,
+            ),
             &meta_bytes,
             &onnx_bytes,
             &format!("{}:seed{}", candidate.candidate_id, seed),
@@ -344,6 +349,18 @@ fn quality_from_acceptance(
     })
 }
 
+/// 評価記録の `baseline_comparison` が定義と一致するか（#339・REQ-25）。
+///
+/// 定義に欄があるのに記録に無い（欄の削除）、定義に欄が無いのに記録にある（欄の追加）は不一致。
+/// 両方にあるときは [`record_matches`] が majority・必要件数・判定を計算し直して照合する。
+fn baseline_matches(baseline: Option<&PreparedBaseline>, record: &EvaluationRecord) -> bool {
+    match (baseline, record.baseline_comparison.as_ref()) {
+        (None, None) => true,
+        (Some(prepared), Some(rec)) => record_matches(prepared, rec, record.correct, record.total),
+        _ => false,
+    }
+}
+
 /// 選定候補の評価完了記録を読み、公開する成果物・評価データ・定義と一致することを確認する
 /// （REQ-27・#314）。
 ///
@@ -358,13 +375,16 @@ fn quality_from_acceptance(
 /// その代表構成・重みの適用完了を記録していることを照合する（台帳に完了が無ければ
 /// `evaluation has not been completed`。記録の偽造だけでは公開できない）。
 ///
+/// 下限基準との比較欄（#339）は、定義と記録で欄の有無が一致することと、majority・必要件数・判定を
+/// train 分割と定義から計算し直した値との一致を確認する（記録の改変の検出。合否には使わない）。
+///
 /// **台帳ファイル自体もプロジェクトへ書き込める主体なら丸ごと作り直せる**ため、本確認は外部台帳による
 /// 完全性の検証（#168・TASK-39.3-2）の代替ではない。
 fn verify_evaluation_record(
     project: &Project,
     (selection, selection_sha256): (&SelectionRecord, &Sha256Digest),
     (freeze, eval_bytes): (&FreezeRecord, &[u8]),
-    definition: &Definition,
+    (definition, baseline): (&Definition, Option<PreparedBaseline>),
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
     config_id: &str,
@@ -392,7 +412,8 @@ fn verify_evaluation_record(
         && record.evaluation_bytes == freeze.byte_len()
         && record.onnx_sha256 == Sha256Digest::of_bytes(onnx_bytes).to_hex()
         && record.artifact_meta_sha256 == Sha256Digest::of_bytes(meta_bytes).to_hex()
-        && record.definition_sha256 == definition_sha256;
+        && record.definition_sha256 == definition_sha256
+        && baseline_matches(baseline.as_ref(), &record);
     if !matches {
         return Err(invalid("evaluation record does not match the package"));
     }
@@ -771,6 +792,7 @@ mod tests {
             definition_sha256: "0".repeat(64),
             correct,
             total,
+            baseline_comparison: None,
         }
     }
 
