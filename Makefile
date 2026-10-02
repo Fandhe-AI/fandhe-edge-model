@@ -381,7 +381,7 @@ py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲー�
 # `make ci` の両方で実行するため、CI を通すための skip ではない）。
 # libtest のテスト名フィルタは 1 回の起動につき 1 つしか渡せないため、テストごとに
 # 個別に起動する（「パッケージ:テストバイナリ:テスト名」の組で回す。sandbox_pipeline_real_trainer は
-# sandbox 監視チェーンの完走確認。REQ-38・TASK-38.1・#161）。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
+# sandbox 監視チェーンの完走確認（評価なし・評価ありの 2 件）。REQ-38・TASK-38.1・#161）。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
 # 一時ファイルへ出力してから表示する。--exact のテスト名がずれると 0 件実行で
 # 成功してしまうため、出力の「1 passed」も検査して fail-closed にする
 # （テスト名を変えたらここも更新する）。
@@ -398,7 +398,8 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
 	for spec in \
 		fandhe-edge-train:real_trainer:req18_real_trainer_c1_job_completes_with_typed_outcome \
 		fandhe-edge-train:real_trainer:req18_real_trainer_c3_job_completes_with_validation_predictions \
-		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_completes_under_monitor_with_zero_tool_denials; do \
+		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_completes_under_monitor_with_zero_tool_denials \
+		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_with_evaluation_data_completes_under_monitor_with_zero_tool_denials; do \
 		pkg="$${spec%%:*}"; rest="$${spec#*:}"; bin="$${rest%%:*}"; t="$${rest#*:}"; \
 		cargo test -p "$$pkg" --test "$$bin" -- --ignored --exact "$$t" >"$$out" 2>&1; \
 		status=$$?; \

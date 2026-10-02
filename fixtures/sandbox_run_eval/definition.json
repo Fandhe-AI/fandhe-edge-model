@@ -1,0 +1,1 @@
+{"schema":"fandhe-edge-model-definition/v1","name":"sandbox_run_eval","version":1,"judgment_type":"single_select","options":[{"id":"alpha","display_name":"alpha","description":"dummy"},{"id":"beta","display_name":"beta","description":"dummy"},{"id":"gamma","display_name":"gamma","description":"dummy"}],"io":{"input":"bytes"}}
