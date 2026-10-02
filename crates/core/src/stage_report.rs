@@ -16,9 +16,9 @@
 //! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。
 //!
 //! `package` 工程の [`PackageReport`] のフィールドは PoC-16 の package 工程の
-//! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に揃えた最小集合で、
-//! パス・データ本文・計測値は載せない（security.md。容量・p95 等の追加は各結線
-//! TASK で main が判断する入出力契約の変更）。加えて `evaluate` 工程の評価データ
+//! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に、容量内訳と p95 の計測値
+//! （`capacity`・`infer_p95`。#340・REQ-30・REQ-31）を末尾へ足した集合で、載せるのは整数・
+//! bool・固定キーだけ（パス・データ本文は載せない。security.md）。加えて `evaluate` 工程の評価データ
 //! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
 //! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
 //! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
@@ -27,7 +27,10 @@
 //! [`PackageReport`]（exit 0）は `pass` と基準未定義のみを表す。`fail`（exit 10）・判定不能
 //! （exit 12）は合否基準が定義されているときにだけ生じ、判定項目つきの
 //! [`PackageJudgedReport`] で返す（#328・REQ-21・REQ-33。exit 0 の型に `fail` を載せられない
-//! ことを型で保証する）。`limit_exceeded`（exit 20）は従来どおり `ErrorReport` 側へ流す。
+//! ことを型で保証する）。`limit_exceeded`（exit 20）は [`PackageLimitExceededReport`]
+//! （`{"code","message","step","capacity","infer_p95"}`。どの上限を超えたかは各 `exceeded` で区別。#340）で返す。
+//! 計測値の値型（[`PackageCapacity`]・[`InferP95`]）は runtime に依存しない整数・bool の型で、
+//! 境界規則（`>`）は runtime の `LimitBreach` が唯一の実装であり、ここでは比較しない。
 
 use serde::Serialize;
 
@@ -161,6 +164,168 @@ impl EvaluateCompletedReport {
     }
 }
 
+/// 容量内訳の 1 構成要素（`bytes`・`file_count`。REQ-30・#340）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PackageComponentSize {
+    bytes: u64,
+    file_count: u32,
+}
+
+impl PackageComponentSize {
+    /// 値をそのまま保持する。
+    #[must_use]
+    pub const fn new(bytes: u64, file_count: u32) -> Self {
+        Self { bytes, file_count }
+    }
+}
+
+/// 容量内訳の 5 構成要素（REQ-30）。宣言順に直列化し、5 項目を常に出す（#123 の
+/// `package_capacity_json` と同じ並び）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PackageCapacityComponents {
+    weights: PackageComponentSize,
+    vocab_or_feature_transform: PackageComponentSize,
+    label_table: PackageComponentSize,
+    calibration: PackageComponentSize,
+    metadata: PackageComponentSize,
+}
+
+impl PackageCapacityComponents {
+    /// 5 構成要素を宣言順に受け取る。
+    #[must_use]
+    pub const fn new(
+        weights: PackageComponentSize,
+        vocab_or_feature_transform: PackageComponentSize,
+        label_table: PackageComponentSize,
+        calibration: PackageComponentSize,
+        metadata: PackageComponentSize,
+    ) -> Self {
+        Self {
+            weights,
+            vocab_or_feature_transform,
+            label_table,
+            calibration,
+            metadata,
+        }
+    }
+}
+
+/// `package` の容量の計測値と上限照合の結果（REQ-30・#340）。
+///
+/// `exceeded` は呼び出し側（cli）が runtime の照合結果から渡す。ここでは `total_bytes > limit_bytes`
+/// を計算しない（境界規則は runtime の `LimitBreach` が唯一の実装）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PackageCapacity {
+    total_bytes: u64,
+    limit_bytes: u64,
+    exceeded: bool,
+    components: PackageCapacityComponents,
+}
+
+impl PackageCapacity {
+    /// 値をそのまま保持する。
+    #[must_use]
+    pub const fn new(
+        total_bytes: u64,
+        limit_bytes: u64,
+        exceeded: bool,
+        components: PackageCapacityComponents,
+    ) -> Self {
+        Self {
+            total_bytes,
+            limit_bytes,
+            exceeded,
+            components,
+        }
+    }
+
+    /// 容量の上限を超えたか（runtime の照合結果）。
+    #[must_use]
+    pub const fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+/// 推論待ち時間 p95 の計測値と上限照合の結果（µs。REQ-31・#340）。
+///
+/// `p95_us` は ns の p95 を切り上げた値。`exceeded` は runtime の照合結果をそのまま受け取る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct InferP95 {
+    p95_us: u64,
+    limit_us: u64,
+    exceeded: bool,
+}
+
+impl InferP95 {
+    /// 値をそのまま保持する。
+    #[must_use]
+    pub const fn new(p95_us: u64, limit_us: u64, exceeded: bool) -> Self {
+        Self {
+            p95_us,
+            limit_us,
+            exceeded,
+        }
+    }
+
+    /// p95 の上限を超えたか（runtime の照合結果）。
+    #[must_use]
+    pub const fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+/// `package` の計測値の組（容量は常に、p95 は `limits.max_infer_p95_us` があるときだけ。#340）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageMetrics {
+    /// 容量内訳と上限照合。
+    pub capacity: PackageCapacity,
+    /// p95 と上限照合（上限未設定なら `None`。値を出すためだけに計測はしない）。
+    pub infer_p95: Option<InferP95>,
+}
+
+/// `package` 工程が上限超過（exit 20）で返す JSON（REQ-21・REQ-30・REQ-31・#340）。
+///
+/// `{"code":"limit_exceeded","message","step":"package","capacity","infer_p95"}`。少なくとも一方の
+/// `exceeded` が true のときにしか作れない（超過が無いのに exit 20 を出せない）。どちらの上限を
+/// 超えたかは各キーの `exceeded` で区別する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageLimitExceededReport {
+    code: crate::exitcode::ExitCode,
+    message: String,
+    step: Stage,
+    capacity: PackageCapacity,
+    infer_p95: Option<InferP95>,
+}
+
+impl PackageLimitExceededReport {
+    /// どちらの `exceeded` も false なら `None`（fail-closed）。
+    #[must_use]
+    pub fn new(message: String, metrics: PackageMetrics) -> Option<Self> {
+        let any = metrics.capacity.exceeded() || metrics.infer_p95.is_some_and(|p| p.exceeded());
+        any.then_some(Self {
+            code: crate::exitcode::ExitCode::LimitExceeded,
+            message,
+            step: Stage::Package,
+            capacity: metrics.capacity,
+            infer_p95: metrics.infer_p95,
+        })
+    }
+
+    /// 終了コード（常に `limit_exceeded`=20）。
+    #[must_use]
+    pub const fn exit_code(&self) -> crate::exitcode::ExitCode {
+        self.code
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
 /// 合否判定。`Pass` は exit 0（[`PackageReport`]）、`Fail`・`Undeterminable` は
 /// exit 10・12（[`PackageJudgedReport`]）でのみ使う（#328）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -188,30 +353,37 @@ pub struct PackageJudgedReport {
     step: Stage,
     judgment: PackageJudgment,
     acceptance_defined: bool,
+    capacity: PackageCapacity,
+    /// 上限未設定のときは `null`（スキーマを固定する。#340）。
+    infer_p95: Option<InferP95>,
 }
 
 impl PackageJudgedReport {
     /// 合否基準を満たさない結果（exit 10・`judged_fail`）。
     #[must_use]
-    pub fn fail(message: String) -> Self {
+    pub fn fail(message: String, metrics: PackageMetrics) -> Self {
         Self {
             code: crate::exitcode::ExitCode::JudgedFail,
             message,
             step: Stage::Package,
             judgment: PackageJudgment::Fail,
             acceptance_defined: true,
+            capacity: metrics.capacity,
+            infer_p95: metrics.infer_p95,
         }
     }
 
     /// 判定不能の結果（exit 12・`pending`。合格扱いにしない）。
     #[must_use]
-    pub fn undeterminable(message: String) -> Self {
+    pub fn undeterminable(message: String, metrics: PackageMetrics) -> Self {
         Self {
             code: crate::exitcode::ExitCode::Pending,
             message,
             step: Stage::Package,
             judgment: PackageJudgment::Undeterminable,
             acceptance_defined: true,
+            capacity: metrics.capacity,
+            infer_p95: metrics.infer_p95,
         }
     }
 
@@ -241,28 +413,35 @@ pub struct PackageReport {
     /// 合否基準が未設定のときは `null`（`skip_serializing_if` を付けずスキーマを固定する）。
     judgment: Option<PackageJudgment>,
     acceptance_defined: bool,
+    capacity: PackageCapacity,
+    /// 上限未設定のときは `null`（スキーマを固定する。#340）。
+    infer_p95: Option<InferP95>,
 }
 
 impl PackageReport {
     /// 合否基準を満たした結果（PoC-16 実測の `judgment:"pass"`）。
     #[must_use]
-    pub const fn pass() -> Self {
+    pub fn pass(metrics: PackageMetrics) -> Self {
         Self {
             step: Stage::Package,
             status: StageStatus::Ok,
             judgment: Some(PackageJudgment::Pass),
             acceptance_defined: true,
+            capacity: metrics.capacity,
+            infer_p95: metrics.infer_p95,
         }
     }
 
     /// 合否基準が未設定の結果（`judgment` は `null`。exit 0）。
     #[must_use]
-    pub const fn acceptance_not_defined() -> Self {
+    pub fn acceptance_not_defined(metrics: PackageMetrics) -> Self {
         Self {
             step: Stage::Package,
             status: StageStatus::Ok,
             judgment: None,
             acceptance_defined: false,
+            capacity: metrics.capacity,
+            infer_p95: metrics.infer_p95,
         }
     }
 
@@ -424,12 +603,39 @@ impl SelectReport {
 mod tests {
     use super::*;
 
+    /// 5 構成要素が宣言順（重み・語彙/特徴量変換・選択肢表・校正・メタデータ）で常に出る（REQ-30）。
+    const COMPONENTS: &str = r#""components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}"#;
+    const CAP_OK: &str = r#""capacity":{"total_bytes":125,"limit_bytes":40000000,"exceeded":false,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
+    const CAP_EXCEEDED: &str = r#"{"total_bytes":125,"limit_bytes":100,"exceeded":true,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
+
+    /// 合成の計測値。`capacity_exceeded` が true のときは上限 100・false のときは 40,000,000。
+    fn metrics(capacity_exceeded: bool, p95: Option<(u64, u64, bool)>) -> PackageMetrics {
+        let c = PackageComponentSize::new;
+        let components =
+            PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1));
+        let limit = if capacity_exceeded { 100 } else { 40_000_000 };
+        PackageMetrics {
+            capacity: PackageCapacity::new(125, limit, capacity_exceeded, components),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+        }
+    }
+
+    /// REQ-30・#340: components の JSON 断片は 5 項目をこの順で常に出す。
+    #[test]
+    fn req30_issue340_components_always_five_in_order() {
+        assert!(CAP_OK.contains(COMPONENTS));
+    }
+
     /// REQ-33: Pass の JSON が PoC-16 の名前・値と完全一致する。
     #[test]
     fn req33_pass_report_json_is_exact() {
         assert_eq!(
-            PackageReport::pass().to_json_line().expect("json"),
-            r#"{"step":"package","status":"ok","judgment":"pass","acceptance_defined":true}"#
+            PackageReport::pass(metrics(false, None))
+                .to_json_line()
+                .expect("json"),
+            format!(
+                r#"{{"step":"package","status":"ok","judgment":"pass","acceptance_defined":true,{CAP_OK},"infer_p95":null}}"#
+            )
         );
     }
 
@@ -437,10 +643,12 @@ mod tests {
     #[test]
     fn req33_not_defined_report_json_is_exact() {
         assert_eq!(
-            PackageReport::acceptance_not_defined()
+            PackageReport::acceptance_not_defined(metrics(false, Some((5000, 6000, false))))
                 .to_json_line()
                 .expect("json"),
-            r#"{"step":"package","status":"ok","judgment":null,"acceptance_defined":false}"#
+            format!(
+                r#"{{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,{CAP_OK},"infer_p95":{{"p95_us":5000,"limit_us":6000,"exceeded":false}}}}"#
+            )
         );
     }
 
@@ -448,17 +656,57 @@ mod tests {
     #[test]
     fn req33_issue328_judged_reports_json_and_exit_code_are_exact() {
         use crate::exitcode::ExitCode;
-        let fail = PackageJudgedReport::fail("judged as fail".to_string());
+        let fail = PackageJudgedReport::fail("judged as fail".to_string(), metrics(false, None));
         assert_eq!(fail.exit_code(), ExitCode::JudgedFail);
         assert_eq!(
             fail.to_json_line().expect("json"),
-            r#"{"code":"judged_fail","message":"judged as fail","step":"package","judgment":"fail","acceptance_defined":true}"#
+            format!(
+                r#"{{"code":"judged_fail","message":"judged as fail","step":"package","judgment":"fail","acceptance_defined":true,{CAP_OK},"infer_p95":null}}"#
+            )
         );
-        let pending = PackageJudgedReport::undeterminable("result is pending".to_string());
+        let pending = PackageJudgedReport::undeterminable(
+            "result is pending".to_string(),
+            metrics(false, Some((1, 2, false))),
+        );
         assert_eq!(pending.exit_code(), ExitCode::Pending);
         assert_eq!(
             pending.to_json_line().expect("json"),
-            r#"{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true}"#
+            format!(
+                r#"{{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true,{CAP_OK},"infer_p95":{{"p95_us":1,"limit_us":2,"exceeded":false}}}}"#
+            )
+        );
+    }
+
+    /// REQ-30・REQ-31・REQ-21・#340: exit 20 の JSON は超過の種類を各 `exceeded` で区別でき、
+    /// どちらも超過していなければ構築できない。
+    #[test]
+    fn req30_req31_issue340_limit_exceeded_report_json_and_constructor() {
+        use crate::exitcode::ExitCode;
+        let both = PackageLimitExceededReport::new(
+            "resource limit exceeded".to_string(),
+            metrics(true, Some((7, 6, true))),
+        )
+        .expect("exceeded");
+        assert_eq!(both.exit_code(), ExitCode::LimitExceeded);
+        assert_eq!(
+            both.to_json_line().expect("json"),
+            format!(
+                r#"{{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{CAP_EXCEEDED},"infer_p95":{{"p95_us":7,"limit_us":6,"exceeded":true}}}}"#
+            )
+        );
+        let only_p95 =
+            PackageLimitExceededReport::new("m".to_string(), metrics(false, Some((7, 6, true))))
+                .expect("p95 exceeded");
+        assert!(
+            only_p95
+                .to_json_line()
+                .expect("json")
+                .contains(r#""infer_p95":{"p95_us":7,"limit_us":6,"exceeded":true}"#)
+        );
+        assert!(PackageLimitExceededReport::new("m".to_string(), metrics(false, None)).is_none());
+        assert!(
+            PackageLimitExceededReport::new("m".to_string(), metrics(false, Some((1, 2, false))))
+                .is_none()
         );
     }
 
@@ -554,7 +802,7 @@ mod tests {
     #[test]
     fn req33_report_is_single_line() {
         assert!(
-            !PackageReport::pass()
+            !PackageReport::pass(metrics(false, None))
                 .to_json_line()
                 .expect("json")
                 .contains('\n')

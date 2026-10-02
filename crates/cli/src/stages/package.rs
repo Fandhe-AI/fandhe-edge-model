@@ -54,11 +54,12 @@
 //! REQ-27）、件数・総バイト数の上限で先頭から切り詰める。計測回数は利用者設定にしない。
 //! 証拠種別はテストハーネス（偽の時計・固定 fixture の ONNX）で、実機での p95 計測は人の担当である。
 //!
-//! # 未接続（実装済みを装わない）
+//! # 計測値の出力（#340・REQ-30・REQ-31・REQ-33）
 //!
-//! 容量内訳・p95 値の stdout 出力は未接続（#340）。現状の出力は `PackageOutcome` 由来の JSON（`judgment`・
-//! `acceptance_defined` など）または `{"code","message"}`（超過時）で、内訳・p95 値は載らない。内訳の JSON 部品は
-//! `output::package_capacity_json`（#123）にあり、接続は入出力契約（REQ-33）の変更を伴うため別途扱う。
+//! exit 0・10・12・20 の stdout JSON の末尾に `capacity`（常に。5 構成要素の内訳・合計・上限・`exceeded`）と
+//! `infer_p95`（`limits.max_infer_p95_us` があるときだけ。µs へ切り上げ。無ければ `null`）を載せる。
+//! 値は [`PackageRunResult::metrics`] で返し、`exceeded` は runtime の照合結果から写す（[`capacity_report`]・
+//! [`infer_p95_report`]。写像の不整合は公開前に `runtime_error`）。p95 は上限が無いとき計測しない。
 //!
 //! 評価記録の `correct` は
 //! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
@@ -72,6 +73,9 @@ use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::stage_report::{
+    InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
+};
 use fandhe_edge_data::eval_freeze::FreezeRecord;
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::SplitResult;
@@ -79,13 +83,15 @@ use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
-    MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
+    CapacityBreakdown, MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
-use fandhe_edge_runtime::capacity_limit::{CapacityLimit, check_capacity_limit};
+use fandhe_edge_runtime::capacity_limit::{
+    CapacityLimit, CapacityLimitCheck, check_capacity_limit,
+};
 use fandhe_edge_runtime::latency::{
     Clock, LatencyConfig, LatencyError, MonotonicClock, measure_latency,
 };
-use fandhe_edge_runtime::latency_limit::{LatencyLimit, check_latency_limit};
+use fandhe_edge_runtime::latency_limit::{LatencyLimit, LatencyLimitCheck, check_latency_limit};
 use fandhe_edge_runtime::latency_report::summarize_latency;
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
@@ -123,12 +129,24 @@ use super::train::{
 /// （未設定時の挙動は従来と同じ。#338）。`run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。
 const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 
+/// `package` の結果（終了コードの決定と、stdout へ載せる計測値。#340）。
+///
+/// `metrics` の各 `exceeded` は runtime の照合結果から写したもので、`outcome.breaches` と一致する
+/// （`stage_output::package_outcome_report` が fail-closed で再確認する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRunResult {
+    /// 終了コード・合否・上限超過の一覧。
+    pub outcome: PackageOutcome,
+    /// 容量内訳と p95（REQ-30・REQ-31）。
+    pub metrics: PackageMetrics,
+}
+
 /// `package` を実行する。
 ///
 /// # Errors
 /// 選定記録が無い・既存の `package/`・自己整合性の不一致は `invalid_input`（64）、
-/// I/O 失敗は `runtime_error`（70）。容量の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
-pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport> {
+/// I/O 失敗は `runtime_error`（70）。容量・p95 の上限超過は [`PackageOutcome`]（`limit_exceeded`）。
+pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     // 副作用（ステージングの作成など）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
     // 評価データがあるプロジェクトは、選定候補の評価完了記録を確認できるまで公開しない
@@ -225,7 +243,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
     }
     // p95 の計測・照合（`limits.max_infer_p95_us` があるときだけ。REQ-31・#338）。ステージングを作る前に
     // 行うので、計測の失敗で片付ける分岐が要らず、既存の `package/` がある場合は推論を回す前に失敗する。
-    let latency_breach = match definition.limits().and_then(Limits::max_infer_p95_us) {
+    let infer_p95 = match definition.limits().and_then(Limits::max_infer_p95_us) {
         None => None,
         Some(us) => {
             // 定義の検証（`1..=MAX_LIMIT_INFER_P95_US`）で到達しない防御的な変換。
@@ -236,7 +254,10 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
                     LatencyLimit::from_ns(ns).map_err(|_| invalid("latency limit is out of range"))
                 })?;
             let inputs = latency_inputs(&records, &split);
-            check_latency_with_clock(&pipeline, &inputs, limit, &MonotonicClock::new())?
+            let check =
+                check_latency_with_clock(&pipeline, &inputs, limit, &MonotonicClock::new())?;
+            // 写像の失敗もステージングを作る前に返す（公開後に runtime_error を返す経路を作らない）。
+            Some((infer_p95_report(&check, us)?, check.breach()))
         }
     };
 
@@ -275,13 +296,88 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageOutcome, ErrorReport
         }
     };
     let check = check_capacity_limit(&breakdown, Some(limit));
-    // p95 が超過しても組み立てと容量計測は行い、両方の超過を載せる（値の出力は #340）。
+    // 写像（fail-closed）は公開（`finalize_staging`）より前に行い、失敗したらステージングを片付ける。
+    let capacity = match capacity_report(&breakdown, &check) {
+        Ok(capacity) => capacity,
+        Err(report) => {
+            let _ = project.remove_created_dir(&staging);
+            return Err(report);
+        }
+    };
+    // p95 が超過しても組み立てと容量計測は行い、両方の超過を載せる。
     let mut breaches: Vec<LimitBreach> = check.breach().into_iter().collect();
-    breaches.extend(latency_breach);
+    breaches.extend(infer_p95.as_ref().and_then(|(_, breach)| *breach));
     let breaches = finalize_staging(&project, &staging, &breaches)?;
+    let metrics = PackageMetrics {
+        capacity,
+        infer_p95: infer_p95.map(|(p95, _)| p95),
+    };
     // 上限超過（20）が合否より優先される規則は runtime の `resolve_package_outcome` に任せる。
-    // Fail・Undeterminable でも公開の関門は容量だけ（`finalize_staging` は合否を見ない。#328）。
-    Ok(resolve_package_outcome(&breaches, quality))
+    // Fail・Undeterminable でも公開の関門は容量・p95 だけ（`finalize_staging` は合否を見ない。#328）。
+    Ok(PackageRunResult {
+        outcome: resolve_package_outcome(&breaches, quality),
+        metrics,
+    })
+}
+
+/// runtime の容量照合結果と内訳を、stdout 用の値型へ写す（REQ-30・#340）。
+///
+/// `exceeded` は照合結果（`Within`・`Exceeded`）から決め、`>` を再計算しない。照合していない
+/// （`NotConfigured`）・合計が内訳と食い違う・未知の区分は `runtime_error`（fail-closed）。
+fn capacity_report(
+    breakdown: &CapacityBreakdown,
+    check: &CapacityLimitCheck,
+) -> Result<PackageCapacity, ErrorReport> {
+    let (total_bytes, limit_bytes, exceeded) = match check {
+        CapacityLimitCheck::Within {
+            total_bytes,
+            limit_bytes,
+        } => (*total_bytes, *limit_bytes, false),
+        CapacityLimitCheck::Exceeded(LimitBreach::Capacity {
+            measured_bytes,
+            limit_bytes,
+        }) => (*measured_bytes, *limit_bytes, true),
+        _ => return Err(runtime("capacity check is inconsistent")),
+    };
+    if total_bytes != breakdown.total_bytes() {
+        return Err(runtime("capacity check is inconsistent"));
+    }
+    let size = |c: PackageComponent| {
+        let b = breakdown.component(c);
+        PackageComponentSize::new(b.bytes, b.file_count)
+    };
+    Ok(PackageCapacity::new(
+        total_bytes,
+        limit_bytes,
+        exceeded,
+        PackageCapacityComponents::new(
+            size(PackageComponent::Weights),
+            size(PackageComponent::VocabOrFeatureTransform),
+            size(PackageComponent::LabelTable),
+            size(PackageComponent::Calibration),
+            size(PackageComponent::Metadata),
+        ),
+    ))
+}
+
+/// runtime の p95 照合結果を stdout 用の値型へ写す（REQ-31・#340）。
+///
+/// `p95_us` は ns を切り上げた値（`limit_ns = limit_us * 1000` なので、`p95_ns > limit_ns` と
+/// `p95_us > limit_us` は同値で、切り上げが偽陽性を生まない）。`exceeded` は照合結果から決める。
+/// `limit_us` と照合に使った `limit_ns` が食い違う・照合していない・未知の区分は `runtime_error`。
+fn infer_p95_report(check: &LatencyLimitCheck, limit_us: u64) -> Result<InferP95, ErrorReport> {
+    let (p95_ns, limit_ns, exceeded) = match check {
+        LatencyLimitCheck::Within { p95_ns, limit_ns } => (*p95_ns, *limit_ns, false),
+        LatencyLimitCheck::Exceeded(LimitBreach::Latency {
+            measured_p95_ns,
+            limit_ns,
+        }) => (*measured_p95_ns, *limit_ns, true),
+        _ => return Err(runtime("latency check is inconsistent")),
+    };
+    if limit_us.checked_mul(1_000) != Some(limit_ns) {
+        return Err(runtime("latency check is inconsistent"));
+    }
+    Ok(InferP95::new(p95_ns.div_ceil(1_000), limit_us, exceeded))
 }
 
 /// p95 計測の入力を `train` 分割の `input` から集める（REQ-27・REQ-39。#338）。
@@ -305,8 +401,8 @@ fn latency_inputs<'a>(records: &'a [ValidRecord], split: &'a SplitResult) -> Vec
     inputs
 }
 
-/// 既定の計測回数（warmup 20・iters 1000）で p95 を計測し、上限を超えたときだけ
-/// [`LimitBreach::Latency`] を返す（REQ-31・REQ-21。#338）。
+/// 既定の計測回数（warmup 20・iters 1000）で p95 を計測し、上限との照合結果を返す
+/// （超過なら [`LimitBreach::Latency`] を含む。上限内でも p95 の値を残す。REQ-31・REQ-21。#338・#340）。
 ///
 /// 境界規則（`>` で超過・ちょうどは超過でない）は runtime の `check_latency_limit` に任せ、再実装しない。
 /// 計測・レポートの失敗は `runtime_error`（`message` は固定語彙の `LatencyError::code()` のみ）。
@@ -315,11 +411,11 @@ fn check_latency_with_clock<P: Preprocessor, B: ScoringBackend, C: Clock>(
     inputs: &[&str],
     limit: LatencyLimit,
     clock: &C,
-) -> Result<Option<LimitBreach>, ErrorReport> {
+) -> Result<LatencyLimitCheck, ErrorReport> {
     let samples = measure_latency(pipeline, inputs, &LatencyConfig::default(), clock)
         .map_err(|e: LatencyError| runtime(&format!("latency measurement failed: {}", e.code())))?;
     let report = summarize_latency(&samples).map_err(|_| runtime("latency measurement failed"))?;
-    Ok(check_latency_limit(&report, Some(limit)).breach())
+    Ok(check_latency_limit(&report, Some(limit)))
 }
 
 /// 定義の合否基準と照合済みの評価記録から、`package` の合否判定を決める（REQ-24・REQ-33・#328）。
@@ -488,7 +584,7 @@ fn assemble_and_measure(
     definition_bytes: &[u8],
     meta: &ArtifactMeta,
     vocab: Option<(&File, &Path)>,
-) -> Result<fandhe_edge_runtime::capacity::CapacityBreakdown, ErrorReport> {
+) -> Result<CapacityBreakdown, ErrorReport> {
     let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
     project.write_new(pkg.join(onnx_file), onnx_bytes)?;
@@ -525,6 +621,9 @@ mod tests {
     use super::*;
     use crate::stages::train::test_support::records_and_split;
     use fandhe_edge_core::evaluation_record::BaselineComparisonVerdict;
+    use fandhe_edge_core::stage_report::{
+        InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize,
+    };
     use fandhe_edge_data::split::Split;
     use fandhe_edge_runtime::capacity_limit::CapacityLimitCheck;
     use fandhe_edge_runtime::pipeline::{BackendError, PreprocessError, TokenIds};
@@ -593,23 +692,135 @@ mod tests {
         (pipeline, FakeClock(cell))
     }
 
-    /// REQ-31・REQ-21・#338: p95 が上限ちょうどなら超過でなく、1 ns 超えると `LimitBreach::Latency`。
+    /// REQ-31・REQ-21・#338・#340: p95 が上限ちょうどなら超過でなく、1 ns 超えると `LimitBreach::Latency`。
     #[test]
     fn req31_issue338_latency_equal_is_within_and_one_ns_over_is_breach() {
         let limit = LatencyLimit::from_ns(5_000 * 1_000).expect("limit");
         let (pipeline, clock) = fake_pipeline(5_000_000, false, false);
         assert_eq!(
             check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure"),
-            None
+            LatencyLimitCheck::Within {
+                p95_ns: 5_000_000,
+                limit_ns: 5_000_000
+            }
         );
         let (pipeline, clock) = fake_pipeline(5_000_001, false, false);
         assert_eq!(
             check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure"),
-            Some(LimitBreach::Latency {
+            LatencyLimitCheck::Exceeded(LimitBreach::Latency {
                 measured_p95_ns: 5_000_001,
                 limit_ns: 5_000_000
             })
         );
+    }
+
+    /// 上限 5000 µs で計測し、`infer_p95_report` へ通した結果を返す。
+    fn p95_for_step(step: u64) -> InferP95 {
+        let limit = LatencyLimit::from_ns(5_000 * 1_000).expect("limit");
+        let (pipeline, clock) = fake_pipeline(step, false, false);
+        let check = check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure");
+        infer_p95_report(&check, 5_000).expect("report")
+    }
+
+    /// REQ-31・#340: µs への切り上げの境界。ちょうど・1 ns 超・1000 の倍数でない上限内の 3 点。
+    #[test]
+    fn req31_issue340_p95_us_ceil_boundaries() {
+        assert_eq!(p95_for_step(5_000_000), InferP95::new(5_000, 5_000, false));
+        assert_eq!(p95_for_step(5_000_001), InferP95::new(5_001, 5_000, true));
+        // 1000 の倍数でない上限内の値は切り上げても超過にならない（偽陽性なし）。
+        assert_eq!(p95_for_step(4_999_999), InferP95::new(5_000, 5_000, false));
+        assert_eq!(p95_for_step(4_999_001), InferP95::new(5_000, 5_000, false));
+    }
+
+    /// REQ-31・#340: `div_ceil` の境界と写像の fail-closed（上限の食い違い・未設定・未知）。
+    #[test]
+    fn req31_issue340_infer_p95_report_mapping_and_fail_closed() {
+        let within = |p95_ns, limit_ns| LatencyLimitCheck::Within { p95_ns, limit_ns };
+        for (ns, us) in [(0, 0), (1, 1), (999, 1), (1000, 1), (1001, 2)] {
+            assert_eq!(
+                infer_p95_report(&within(ns, 5_000_000), 5_000).expect("ok"),
+                InferP95::new(us, 5_000, false)
+            );
+        }
+        // u64::MAX でも panic せず切り上げる（超過として写す）。
+        let over = LatencyLimitCheck::Exceeded(LimitBreach::Latency {
+            measured_p95_ns: u64::MAX,
+            limit_ns: 5_000_000,
+        });
+        assert_eq!(
+            infer_p95_report(&over, 5_000).expect("ok"),
+            InferP95::new(u64::MAX / 1_000 + 1, 5_000, true)
+        );
+        // limit_us と limit_ns の不一致・未設定・オーバーフローは runtime_error。
+        for bad in [
+            infer_p95_report(&within(1, 5_000_000), 4_999),
+            infer_p95_report(&LatencyLimitCheck::NotConfigured { p95_ns: 1 }, 5_000),
+            infer_p95_report(&within(1, 5_000_000), u64::MAX),
+        ] {
+            let e = bad.expect_err("fail closed");
+            assert_eq!(e.code, fandhe_edge_core::exitcode::ExitCode::RuntimeError);
+        }
+    }
+
+    /// REQ-30・#340: 容量の写像。上限ちょうどは `exceeded:false`、超過は true、合計不一致・未設定は runtime_error。
+    #[test]
+    fn req30_issue340_capacity_report_mapping_and_fail_closed() {
+        let breakdown = CapacityBreakdown::from_sizes([
+            (PackageComponent::Weights, 100),
+            (PackageComponent::LabelTable, 20),
+            (PackageComponent::Metadata, 5),
+        ])
+        .expect("breakdown");
+        let ok = capacity_report(&breakdown, &check_of(125, 125)).expect("within");
+        assert_eq!(ok, capacity_of(125, 125, false));
+        let over = capacity_report(&breakdown, &check_of(125, 124)).expect("exceeded");
+        assert_eq!(over, capacity_of(125, 124, true));
+        // 合計が内訳と食い違う・上限を照合していない結果は fail-closed。
+        assert!(capacity_report(&breakdown, &check_of(126, 200)).is_err());
+        assert!(
+            capacity_report(
+                &breakdown,
+                &CapacityLimitCheck::NotConfigured { total_bytes: 125 }
+            )
+            .is_err()
+        );
+    }
+
+    fn capacity_of(total: u64, limit: u64, exceeded: bool) -> PackageCapacity {
+        let c = PackageComponentSize::new;
+        PackageCapacity::new(
+            total,
+            limit,
+            exceeded,
+            PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
+        )
+    }
+
+    /// REQ-30・#123・#340: stdout 用の `components` は `package_capacity_json`（#123）と同じ文字列になる。
+    #[test]
+    fn req30_issue340_components_match_package_capacity_json() {
+        let breakdown = CapacityBreakdown::from_sizes([
+            (PackageComponent::Weights, 100),
+            (PackageComponent::LabelTable, 20),
+            (PackageComponent::Metadata, 5),
+        ])
+        .expect("breakdown");
+        let mapped = capacity_report(&breakdown, &check_of(125, 200)).expect("within");
+        let line = fandhe_edge_core::stage_report::PackageReport::pass(PackageMetrics {
+            capacity: mapped,
+            infer_p95: None,
+        })
+        .to_json_line()
+        .expect("json");
+        let legacy = crate::output::package_capacity_json(&breakdown);
+        let components = |s: &str| {
+            let start = s.find("\"components\":").expect("components");
+            let rest = &s[start..];
+            // `components` オブジェクトは入れ子 1 段の `}}` までで閉じる。
+            let end = rest.find("}}}").expect("end") + 3;
+            rest[..end].to_string()
+        };
+        assert_eq!(components(&line), components(&legacy));
     }
 
     /// REQ-31・REQ-21・#338: 推論失敗は `runtime_error`（固定語彙の message）。

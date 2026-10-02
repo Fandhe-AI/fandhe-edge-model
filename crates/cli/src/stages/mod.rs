@@ -20,7 +20,7 @@
 //!   （REQ-31。超過は公開せず exit 20。#338）。定義ファイルの省略可能な合否基準
 //!   `acceptance.min_accuracy_bp` を評価記録の正解率と Wilson 95% 区間で照合して
 //!   pass（exit 0）・fail（exit 10）・undeterminable（exit 12）を返す（#328）。基準が無ければ
-//!   `judgment:null`・`acceptance_defined:false`（`pass` を出さない）。容量内訳・p95 値の出力は未接続（#340）
+//!   `judgment:null`・`acceptance_defined:false`（`pass` を出さない）。容量内訳・p95 値は stdout の JSON 末尾へ載せる（#340）
 //! - `infer --out` は未実装（`runtime_error`）
 //!
 //! # 未検証の項目（「検証済み」ではない）
@@ -35,7 +35,6 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{
     InspectStageReport, RegisterReport, SelectReport, TrainReport,
 };
-use fandhe_edge_runtime::package_outcome::PackageOutcome;
 
 use crate::args::Command;
 use crate::error_report::emit_error_report;
@@ -60,7 +59,7 @@ enum Done {
     Train(TrainReport),
     Evaluate(evaluate::EvaluateOutcome),
     Select(SelectReport),
-    Package(PackageOutcome),
+    Package(package::PackageRunResult),
 }
 
 /// `command` を実行し、結果（または `ErrorReport`）を `out` へ書いて終了コードを返す。
@@ -89,7 +88,7 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Completed(r))) => {
             write_stage_line(out, r.to_json_line())
         }
-        Ok(Done::Package(outcome)) => emit_package_outcome(out, &outcome),
+        Ok(Done::Package(r)) => emit_package_outcome(out, &r.outcome, &r.metrics),
         Err(report) => emit_error_report(out, &report),
     }
 }
