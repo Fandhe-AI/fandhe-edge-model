@@ -365,6 +365,10 @@ pub enum GuardedRunOutcome {
 }
 
 /// runner 自体の失敗。`Ok` に丸めない。パス・本文を含まない。
+///
+/// `#[non_exhaustive]` のため、外部 crate の `match` はワイルドカード腕を必須とし、variant の追加
+/// （#346 の `ReadOutputIncomplete` など）は Rust API の破壊的変更にならない。外部契約の `code`・
+/// 終了コードは追加 variant でも既存の語彙（REQ-21）に写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GuardRunError {
