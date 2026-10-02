@@ -188,5 +188,54 @@ fn req39_continuous_output_does_not_bypass_time_limit() {
 #[test]
 fn req39_grandchild_holding_pipe_is_read_output_error() {
     let err = run_with_limits(&child("grandchild"), &config(Duration::from_secs(30))).unwrap_err();
-    assert_eq!(err, fandhe_edge_guard::resource::GuardRunError::ReadOutput);
+    // 読み取りエラー（`ReadOutput`）ではなく EOF 未到達（#346 で内訳を区別）。code・終了コードは共通。
+    assert_eq!(
+        err,
+        fandhe_edge_guard::resource::GuardRunError::ReadOutputIncomplete
+    );
+    assert_eq!(err.code(), "read_output_failed");
+    assert_eq!(err.exit_code().code(), 70);
+}
+
+/// REQ-39・#346: 別スレッドが同時に長寿命の子を起動していても、正常終了する子の stdout 書き込み端が
+/// 他の子へ継承されて EOF が来ず `ReadOutputIncomplete` になることがない。
+///
+/// 背景: macOS の std は `pipe()` のあとで CLOEXEC を設定する（`pipe2` が無い）ため、その窓に別スレッドが
+/// spawn すると、その子へ書き込み端が継承される。guard は spawn をプロセス内で直列化して塞ぐ。
+/// 証拠の種別: テストハーネス（実プロセス・実時計）。窓は極小のため、反復と並行起動で確率を上げる。
+#[test]
+fn req39_concurrent_spawns_do_not_inherit_each_others_pipes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    // 長寿命の子を起動し続ける側。1.3 秒で kill されるため、継承が起きれば reader の待機（1 秒）を超える。
+    const STRESSORS: usize = 6;
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(STRESSORS + 1));
+    let handles: Vec<_> = (0..STRESSORS)
+        .map(|_| {
+            let (stop, barrier) = (Arc::clone(&stop), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = run_with_limits(&child("sleep5"), &config(Duration::from_millis(1300)));
+                }
+            })
+        })
+        .collect();
+    barrier.wait();
+    let mut failures = Vec::new();
+    for i in 0..150 {
+        match run_with_limits(&child("ok"), &config(Duration::from_secs(30))) {
+            Ok(GuardedRunOutcome::Exited { status, output, .. }) => {
+                assert!(status.success());
+                assert!(String::from_utf8_lossy(output.stdout()).contains("child-ok"));
+            }
+            other => failures.push((i, format!("{other:?}"))),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+    assert!(failures.is_empty(), "failures: {failures:?}");
 }

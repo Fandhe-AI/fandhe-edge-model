@@ -58,6 +58,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,14 @@ const MEMORY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 終了後に読み取りスレッドを待つ上限（孫がパイプを保持すると EOF が来ないため）。
 const READER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `run_with_limits` の子の起動（パイプ生成から spawn 完了まで）をプロセス内で直列化する錠（#346・REQ-39）。
+///
+/// macOS の std は `pipe2` が無く、`pipe()` のあとに CLOEXEC を設定するため、その窓に別スレッドが
+/// spawn すると、その子へ他の子の stdout 書き込み端が継承され、EOF が来ず出力が欠ける。
+/// guard 経由の起動同士はこの錠で競合を塞ぐ。guard の外（他の crate・他スレッドの `Command`）の
+/// spawn には効かない。保持は spawn の間に限り、監視ループ・待機は含めない（長時間ブロックしない）。
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// 設定値の検証エラー（`invalid_input`=64）。値そのものは含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +382,10 @@ pub enum GuardRunError {
     ReapTimeout,
     /// 子の出力の読み取りに失敗した（欠けた出力を正常終了として返さない）。
     ReadOutput,
+    /// 子は終了したが、子孫や継承された fd がパイプを保持し、待機時間内に出力が EOF に達しなかった
+    /// （欠けた出力を正常終了として返さない。#346 で `ReadOutput` から内訳を分けた。
+    /// `code`・終了コードは `ReadOutput` と同じで、外部契約は変えない。REQ-39・REQ-21）。
+    ReadOutputIncomplete,
     /// RSS の計測に失敗した（子は kill・回収済み。計測できないまま成功扱いにしない）。
     MemoryProbe,
     /// RSS の計測手段が無い OS でメモリ上限が指定された（起動前に拒否する）。
@@ -390,7 +403,7 @@ impl GuardRunError {
             Self::Wait => "wait_failed",
             Self::KillFailed => "kill_failed",
             Self::ReapTimeout => "reap_timeout",
-            Self::ReadOutput => "read_output_failed",
+            Self::ReadOutput | Self::ReadOutputIncomplete => "read_output_failed",
             Self::MemoryProbe => "memory_probe_failed",
             Self::MemoryLimitUnsupported => "memory_limit_unsupported",
         }
@@ -406,6 +419,7 @@ impl GuardRunError {
             | Self::KillFailed
             | Self::ReapTimeout
             | Self::ReadOutput
+            | Self::ReadOutputIncomplete
             | Self::MemoryProbe
             | Self::MemoryLimitUnsupported => ExitCode::RuntimeError,
         }
@@ -1228,7 +1242,11 @@ pub fn run_with_limits(
     }
     // 起動に要する時間も上限に含めるため、spawn の前から測る（REQ-39）。
     let start = Instant::now();
-    let mut child = command.spawn().map_err(|_| GuardRunError::Spawn)?;
+    let mut child = {
+        // 錠が poisoned でも保護対象は `()` のため、panic させず取り戻して続行する。
+        let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        command.spawn().map_err(|_| GuardRunError::Spawn)?
+    };
     let limit = config.time_limit.get();
     let spawn_deadline = start.checked_add(limit).ok_or(GuardRunError::InvalidConfig);
     let spawn_deadline = match spawn_deadline {
@@ -1312,8 +1330,11 @@ pub fn run_with_limits(
             // 判定の順序（REQ-39）: 1) 期限到達は時間超過を優先する。2) 期限前でも、読み取りエラー、
             // または子孫がパイプを保持して EOF に達しなかった（done が false）場合は出力が欠けている
             // ため、正常終了とせず `ReadOutput` を返す。3) それ以外だけを `Exited` とする。
-            if out.failed || err.failed || !(stdout_done && stderr_done) {
+            if out.failed || err.failed {
                 return Err(GuardRunError::ReadOutput);
+            }
+            if !(stdout_done && stderr_done) {
+                return Err(GuardRunError::ReadOutputIncomplete);
             }
             Ok(GuardedRunOutcome::Exited {
                 status,
