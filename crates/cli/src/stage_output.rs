@@ -10,13 +10,17 @@
 //!
 //! # 契約
 //!
+//! すべての出力の末尾に計測値 `capacity`・`infer_p95`（#340・REQ-30・REQ-31）が付く（exit 64・70 を除く）。
+//!
 //! - exit 0（`Pass`・`NotDefined`）: core の `PackageReport` を JSON 1 行で stdout へ
 //! - exit 10・12（`Fail`・`Undeterminable`）: 合否基準が定義されているときにだけ生じる結果として、
 //!   `{"code","message"}` に判定項目（`step`・`judgment`・`acceptance_defined`）を足した core の
 //!   `PackageJudgedReport` を JSON 1 行で stdout へ（REQ-21・REQ-33・#328。`message` は
 //!   `error_report::default_message` の固定語彙）
-//! - exit 20（`LimitExceeded`）・不整合の `runtime_error`: 新しい形は作らず、確定済みの
-//!   `{"code","message"}` へ流す
+//! - exit 20（`LimitExceeded`）: core の `PackageLimitExceededReport`
+//!   （`{"code","message","step","capacity","infer_p95"}`。超過の種類は各 `exceeded`。#340）
+//! - 不整合の `runtime_error`: 確定済みの `{"code","message"}` へ流す。`breaches` と計測値の
+//!   `exceeded` が食い違う場合もここへ倒す（fail-closed）
 //!
 //! # evaluate の skipped（REQ-17・REQ-33・TASK-33.3・#140）
 //!
@@ -30,21 +34,28 @@
 //! 証拠種別: テストハーネス（バイナリでの完走は `tests/pipeline_e2e.rs`。#136）。
 
 use crate::error_report::{ToErrorReport, default_message, emit_error_report};
-use crate::output::{write_evaluate_report, write_package_judged_report, write_package_report};
+use crate::output::{
+    write_evaluate_report, write_package_judged_report, write_package_limit_exceeded_report,
+    write_package_report,
+};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::stage_report::{EvaluateReport, PackageJudgedReport, PackageReport};
+use fandhe_edge_core::stage_report::{
+    EvaluateReport, PackageJudgedReport, PackageLimitExceededReport, PackageMetrics, PackageReport,
+};
 use fandhe_edge_data::eval_freeze::{EvalDataState, EvaluateGate, FreezeRecord, evaluate_gate};
-use fandhe_edge_runtime::package_outcome::{PackageOutcome, PackageVerdict};
+use fandhe_edge_runtime::package_outcome::{LimitBreach, PackageOutcome, PackageVerdict};
 use std::io::{self, Write};
 
-/// `package` 工程の stdout へ出す JSON の 3 分岐（#328）。
+/// `package` 工程の stdout へ出す JSON の 4 分岐（#328・#340）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageStageOutput {
     /// exit 0（`Pass`・`NotDefined`）。
     Report(PackageReport),
     /// exit 10・12（`Fail`・`Undeterminable`。判定項目つき）。
     Judged(PackageJudgedReport),
-    /// exit 20 および不整合の `runtime_error`（`{"code","message"}`）。
+    /// exit 20（容量・p95 の上限超過。計測値つき）。
+    LimitExceeded(PackageLimitExceededReport),
+    /// 不整合の `runtime_error`（`{"code","message"}`）。
     Error(ErrorReport),
 }
 
@@ -55,18 +66,29 @@ impl PackageStageOutput {
         match self {
             PackageStageOutput::Report(_) => ExitCode::Ok,
             PackageStageOutput::Judged(report) => report.exit_code(),
+            PackageStageOutput::LimitExceeded(report) => report.exit_code(),
             PackageStageOutput::Error(report) => report.code,
         }
     }
 }
 
-/// [`PackageOutcome`] を [`PackageStageOutput`] の 3 分岐へ写す。
+/// [`PackageOutcome`] と計測値を [`PackageStageOutput`] の 4 分岐へ写す。
 ///
 /// `Report`（exit 0）は `verdict` が Pass / NotDefined・`exit_code == ExitCode::Ok`・`breaches` が
-/// 空のときに限る。3 フィールドが不整合なら `runtime_error` の `Error` を返す。`verdict` は
+/// 空のときに限る。3 フィールドが不整合、または `breaches` と計測値の `exceeded` が食い違えば
+/// `runtime_error` の `Error` を返す（超過を exit 0 へ変えない。REQ-21・#340）。`verdict` は
 /// ワイルドカード無しで網羅し、区分が増えたらコンパイルエラーで気付けるようにする。
 #[must_use]
-pub fn package_outcome_report(outcome: &PackageOutcome) -> PackageStageOutput {
+pub fn package_outcome_report(
+    outcome: &PackageOutcome,
+    metrics: &PackageMetrics,
+) -> PackageStageOutput {
+    let runtime_error = || {
+        PackageStageOutput::Error(ErrorReport::new(
+            ExitCode::RuntimeError,
+            default_message(ExitCode::RuntimeError),
+        ))
+    };
     // exit_code と verdict は別フィールドで不整合を構築できるため、verdict から期待される
     // 終了コードと一致しない場合は fail-closed で runtime_error へ倒す（上限超過などを
     // exit 0 へ変えない。REQ-21）。
@@ -82,26 +104,44 @@ pub fn package_outcome_report(outcome: &PackageOutcome) -> PackageStageOutput {
         && (outcome.verdict != PackageVerdict::LimitExceeded
             || outcome.exit_code != ExitCode::LimitExceeded);
     if breach_inconsistent || outcome.exit_code != expected {
-        return PackageStageOutput::Error(ErrorReport::new(
-            ExitCode::RuntimeError,
-            default_message(ExitCode::RuntimeError),
-        ));
+        return runtime_error();
     }
+    // 計測値の `exceeded` は breaches と一致しなければならない（LimitBreach は non_exhaustive のため
+    // `matches!` で数える）。
+    let capacity_breach = outcome
+        .breaches
+        .iter()
+        .any(|b| matches!(b, LimitBreach::Capacity { .. }));
+    let latency_breach = outcome
+        .breaches
+        .iter()
+        .any(|b| matches!(b, LimitBreach::Latency { .. }));
+    if capacity_breach != metrics.capacity.exceeded()
+        || latency_breach != metrics.infer_p95.is_some_and(|p| p.exceeded())
+    {
+        return runtime_error();
+    }
+    let metrics = *metrics;
     match outcome.verdict {
-        PackageVerdict::Pass => PackageStageOutput::Report(PackageReport::pass()),
+        PackageVerdict::Pass => PackageStageOutput::Report(PackageReport::pass(metrics)),
         PackageVerdict::NotDefined => {
-            PackageStageOutput::Report(PackageReport::acceptance_not_defined())
+            PackageStageOutput::Report(PackageReport::acceptance_not_defined(metrics))
         }
         PackageVerdict::Fail => PackageStageOutput::Judged(PackageJudgedReport::fail(
             default_message(ExitCode::JudgedFail).to_string(),
+            metrics,
         )),
-        PackageVerdict::Undeterminable => PackageStageOutput::Judged(
-            PackageJudgedReport::undeterminable(default_message(ExitCode::Pending).to_string()),
-        ),
-        PackageVerdict::LimitExceeded => PackageStageOutput::Error(ErrorReport::new(
-            outcome.exit_code,
-            default_message(outcome.exit_code),
-        )),
+        PackageVerdict::Undeterminable => {
+            PackageStageOutput::Judged(PackageJudgedReport::undeterminable(
+                default_message(ExitCode::Pending).to_string(),
+                metrics,
+            ))
+        }
+        PackageVerdict::LimitExceeded => PackageLimitExceededReport::new(
+            default_message(ExitCode::LimitExceeded).to_string(),
+            metrics,
+        )
+        .map_or_else(runtime_error, PackageStageOutput::LimitExceeded),
     }
 }
 
@@ -113,10 +153,14 @@ pub fn package_outcome_report(outcome: &PackageOutcome) -> PackageStageOutput {
 pub fn emit_package_outcome<W: Write>(
     out: &mut W,
     outcome: &PackageOutcome,
+    metrics: &PackageMetrics,
 ) -> io::Result<ExitCode> {
-    match package_outcome_report(outcome) {
+    match package_outcome_report(outcome, metrics) {
         PackageStageOutput::Report(report) => write_package_report(out, &report),
         PackageStageOutput::Judged(report) => write_package_judged_report(out, &report),
+        PackageStageOutput::LimitExceeded(report) => {
+            write_package_limit_exceeded_report(out, &report)
+        }
         PackageStageOutput::Error(report) => emit_error_report(out, &report),
     }
 }
@@ -213,69 +257,136 @@ mod tests {
         );
         assert_eq!(code, ExitCode::Ok);
     }
-    use fandhe_edge_runtime::package_outcome::{
-        LimitBreach, PackageQualityJudgment, resolve_package_outcome,
+    use fandhe_edge_core::stage_report::{
+        InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize,
     };
+    use fandhe_edge_runtime::package_outcome::{PackageQualityJudgment, resolve_package_outcome};
 
-    fn emit(breaches: &[LimitBreach], q: PackageQualityJudgment) -> (ExitCode, String) {
+    const CAP_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const CAP_OVER: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const RUNTIME_ERROR: &str = "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n";
+
+    fn metrics(capacity_exceeded: bool, p95: Option<(u64, u64, bool)>) -> PackageMetrics {
+        let c = PackageComponentSize::new;
+        let limit = if capacity_exceeded { 100 } else { 40_000_000 };
+        PackageMetrics {
+            capacity: PackageCapacity::new(
+                125,
+                limit,
+                capacity_exceeded,
+                PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
+            ),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+        }
+    }
+
+    fn cap_breach() -> LimitBreach {
+        LimitBreach::Capacity {
+            measured_bytes: 125,
+            limit_bytes: 100,
+        }
+    }
+
+    fn lat_breach() -> LimitBreach {
+        LimitBreach::Latency {
+            measured_p95_ns: 7_000,
+            limit_ns: 6_000,
+        }
+    }
+
+    fn emit(
+        breaches: &[LimitBreach],
+        q: PackageQualityJudgment,
+        m: &PackageMetrics,
+    ) -> (ExitCode, String) {
         let mut buf = Vec::new();
         let code =
-            emit_package_outcome(&mut buf, &resolve_package_outcome(breaches, q)).expect("emit");
+            emit_package_outcome(&mut buf, &resolve_package_outcome(breaches, q), m).expect("emit");
         (code, String::from_utf8(buf).expect("utf8"))
     }
 
-    /// REQ-33: Pass は exit 0 で judgment を含む JSON。
+    /// REQ-33・#340: Pass は exit 0 で judgment と計測値を含む JSON。
     #[test]
     fn req33_pass_emits_report() {
-        let (code, out) = emit(&[], PackageQualityJudgment::Pass);
+        let (code, out) = emit(&[], PackageQualityJudgment::Pass, &metrics(false, None));
         assert_eq!(code, ExitCode::Ok);
         assert_eq!(
             out,
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
+            format!(
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+            )
         );
     }
 
-    /// REQ-33: 基準未設定は exit 0 で judgment が null。
+    /// REQ-33・REQ-31・#340: 基準未設定は judgment が null で、p95 は上限があれば値が載る。
     #[test]
     fn req33_not_defined_emits_report() {
-        let (code, out) = emit(&[], PackageQualityJudgment::NotDefined);
+        let m = metrics(false, Some((5000, 6000, false)));
+        let (code, out) = emit(&[], PackageQualityJudgment::NotDefined, &m);
         assert_eq!(code, ExitCode::Ok);
         assert_eq!(
             out,
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+            format!(
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{CAP_OK},\"infer_p95\":{{\"p95_us\":5000,\"limit_us\":6000,\"exceeded\":false}}}}\n"
+            )
         );
     }
 
-    /// REQ-21・REQ-33・#328: 不合格・判定不能は判定項目つき、上限超過は確定済みの ErrorReport。
+    /// REQ-21・REQ-33・#328・#340: 不合格・判定不能は判定項目つき、上限超過は計測値つきの exit 20。
     #[test]
-    fn req21_non_ok_verdicts_use_judged_or_error_report() {
-        let (code, out) = emit(&[], PackageQualityJudgment::Fail);
+    fn req21_non_ok_verdicts_use_judged_or_limit_exceeded_report() {
+        let (code, out) = emit(&[], PackageQualityJudgment::Fail, &metrics(false, None));
         assert_eq!(code, ExitCode::JudgedFail);
         assert_eq!(
             out,
-            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
+            format!(
+                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+            )
         );
 
-        let (code, out) = emit(&[], PackageQualityJudgment::Undeterminable);
+        let (code, out) = emit(
+            &[],
+            PackageQualityJudgment::Undeterminable,
+            &metrics(false, None),
+        );
         assert_eq!(code, ExitCode::Pending);
         assert_eq!(
             out,
-            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
+            format!(
+                "{{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+            )
         );
 
-        let breach = LimitBreach::Capacity {
-            measured_bytes: 2,
-            limit_bytes: 1,
-        };
-        let (code, out) = emit(&[breach], PackageQualityJudgment::Pass);
+        // 容量だけの超過（p95 の上限なし）。
+        let (code, out) = emit(
+            &[cap_breach()],
+            PackageQualityJudgment::Pass,
+            &metrics(true, None),
+        );
         assert_eq!(code, ExitCode::LimitExceeded);
         assert_eq!(
             out,
-            "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n"
+            format!(
+                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",{CAP_OVER},\"infer_p95\":null}}\n"
+            )
+        );
+
+        // p95 だけの超過は capacity.exceeded=false・infer_p95.exceeded=true で区別できる。
+        let (code, out) = emit(
+            &[lat_breach()],
+            PackageQualityJudgment::Pass,
+            &metrics(false, Some((7, 6, true))),
+        );
+        assert_eq!(code, ExitCode::LimitExceeded);
+        assert_eq!(
+            out,
+            format!(
+                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",{CAP_OK},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true}}}}\n"
+            )
         );
     }
 
-    /// 不変条件: `Ok(_)` は exit_code が Ok のときに限る。
+    /// 不変条件: `Report(_)` は exit_code が Ok のときに限る。
     #[test]
     fn req21_report_ok_only_when_exit_code_ok() {
         for q in [
@@ -285,7 +396,7 @@ mod tests {
             PackageQualityJudgment::NotDefined,
         ] {
             let o = resolve_package_outcome(&[], q);
-            let output = package_outcome_report(&o);
+            let output = package_outcome_report(&o, &metrics(false, None));
             assert_eq!(
                 matches!(output, PackageStageOutput::Report(_)),
                 o.exit_code == ExitCode::Ok
@@ -298,20 +409,18 @@ mod tests {
     /// runtime_error へ倒れ、正常系 JSON を出さない。
     #[test]
     fn req21_inconsistent_outcome_fails_closed() {
+        let m = metrics(false, None);
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
         o.exit_code = ExitCode::LimitExceeded;
         let mut buf = Vec::new();
-        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        let code = emit_package_outcome(&mut buf, &o, &m).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
-        assert_eq!(
-            String::from_utf8(buf).expect("utf8"),
-            "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n"
-        );
+        assert_eq!(String::from_utf8(buf).expect("utf8"), RUNTIME_ERROR);
 
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         o.exit_code = ExitCode::Ok;
         assert!(matches!(
-            package_outcome_report(&o),
+            package_outcome_report(&o, &m),
             PackageStageOutput::Error(_)
         ));
     }
@@ -320,35 +429,47 @@ mod tests {
     /// 成功 JSON を出さず runtime_error へ倒れる。
     #[test]
     fn req21_breaches_with_pass_ok_fails_closed() {
-        let breach = LimitBreach::Capacity {
-            measured_bytes: 2,
-            limit_bytes: 1,
-        };
+        let m = metrics(true, None);
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
-        o.breaches = vec![breach];
+        o.breaches = vec![cap_breach()];
         let mut buf = Vec::new();
-        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        let code = emit_package_outcome(&mut buf, &o, &m).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
-        assert_eq!(
-            String::from_utf8(buf).expect("utf8"),
-            "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n"
-        );
+        assert_eq!(String::from_utf8(buf).expect("utf8"), RUNTIME_ERROR);
 
         // verdict だけ LimitExceeded で exit_code が Ok の組も拒否する。
         o.verdict = PackageVerdict::LimitExceeded;
         assert!(matches!(
-            package_outcome_report(&o),
+            package_outcome_report(&o, &m),
             PackageStageOutput::Error(_)
         ));
 
         // breaches 非空で verdict Fail・exit_code JudgedFail の組も runtime_error にする。
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
-        o.breaches = vec![LimitBreach::Latency {
-            measured_p95_ns: 2,
-            limit_ns: 1,
-        }];
+        o.breaches = vec![lat_breach()];
         let mut buf = Vec::new();
-        let code = emit_package_outcome(&mut buf, &o).expect("emit");
+        let code =
+            emit_package_outcome(&mut buf, &o, &metrics(false, Some((7, 6, true)))).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
+    }
+
+    /// REQ-21・REQ-30・REQ-31・#340: breaches と計測値の `exceeded` が食い違えば runtime_error
+    /// （超過があるのに `exceeded:false`・超過が無いのに `exceeded:true`・p95 の値が無いのに
+    /// 遅延の超過がある）。
+    #[test]
+    fn req21_issue340_metrics_exceeded_mismatch_fails_closed() {
+        let cases: [(Vec<LimitBreach>, PackageMetrics); 5] = [
+            (vec![cap_breach()], metrics(false, None)),
+            (vec![], metrics(true, None)),
+            (vec![lat_breach()], metrics(false, Some((7, 6, false)))),
+            (vec![], metrics(false, Some((7, 6, true)))),
+            (vec![lat_breach()], metrics(false, None)),
+        ];
+        for (breaches, m) in cases {
+            let q = PackageQualityJudgment::Pass;
+            let (code, out) = emit(&breaches, q, &m);
+            assert_eq!(code, ExitCode::RuntimeError, "{breaches:?}");
+            assert_eq!(out, RUNTIME_ERROR);
+        }
     }
 }

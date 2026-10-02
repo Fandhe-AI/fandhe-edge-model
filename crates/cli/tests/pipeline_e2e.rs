@@ -164,6 +164,54 @@ mod suite {
         }
     }
 
+    /// 選定候補 c3（`candidates/1`）の成果物ディレクトリ（`EVALUATE_1` の経路。#340）。
+    const C3_DIR: &str = "candidates/1/model-c3";
+    /// 選定候補 c1（`candidates/0`）の成果物ディレクトリ（`limits_env` の経路。#340）。
+    const C1_DIR: &str = "candidates/0/model-c1";
+    /// `package` の出力の先頭（`capacity`・`infer_p95` を付ける前。#340）。
+    const NULL_HEAD: &str =
+        "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false";
+    const PASS_HEAD: &str =
+        "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true";
+    const FAIL_HEAD: &str = "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true";
+    const PENDING_HEAD: &str = "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true";
+    const LIMIT_HEAD: &str =
+        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\"";
+    const DEFAULT_CAPACITY_LIMIT: u64 = 40_000_000;
+
+    /// `capacity` オブジェクトの期待値を、公開元のファイルのバイト数から組み立てる（REQ-30・#340）。
+    /// 公開した `package/` の中身は複写なので、成果物ディレクトリの ONNX・`artifact.json`・語彙ファイルと
+    /// 登録済みの `definition.json` のサイズに等しい（`package/` が作られない exit 20 でも同じ式で比べる）。
+    fn capacity_json(env: &Env, model_dir: &str, limit_bytes: u64, exceeded: bool) -> String {
+        let size = |rel: String| -> (u64, u32) {
+            match std::fs::metadata(env.project_file(&rel)) {
+                Ok(m) => (m.len(), 1),
+                Err(_) => (0, 0),
+            }
+        };
+        let weights = size(format!("{model_dir}/model.onnx"));
+        let vocab = size(format!("{model_dir}/vocab.json"));
+        let label = size("definition.json".to_string());
+        let meta = size(format!("{model_dir}/artifact.json"));
+        let total = weights.0 + vocab.0 + label.0 + meta.0;
+        let c = |(b, n): (u64, u32)| format!("{{\"bytes\":{b},\"file_count\":{n}}}");
+        format!(
+            "\"capacity\":{{\"total_bytes\":{total},\"limit_bytes\":{limit_bytes},\"exceeded\":{exceeded},\"components\":{{\"weights\":{},\"vocab_or_feature_transform\":{},\"label_table\":{},\"calibration\":{{\"bytes\":0,\"file_count\":0}},\"metadata\":{}}}}}",
+            c(weights),
+            c(vocab),
+            c(label),
+            c(meta)
+        )
+    }
+
+    /// 上限なし（容量は既定の 40,000,000・p95 は `null`）の `package` の出力行の期待値（#340）。
+    fn package_line(env: &Env, model_dir: &str, head: &str) -> String {
+        format!(
+            "{head},{},\"infer_p95\":null}}\n",
+            capacity_json(env, model_dir, DEFAULT_CAPACITY_LIMIT, false)
+        )
+    }
+
     const DEF: &str = "def/definition.json";
 
     fn registered(case: &str, with_evaluation: bool) -> Env {
@@ -215,7 +263,7 @@ mod suite {
         );
         assert_eq!(
             env.ok(&["package", "--project-dir", "proj"]),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+            package_line(&env, C3_DIR, NULL_HEAD)
         );
 
         let text = env.ok(&[
@@ -1056,10 +1104,7 @@ mod suite {
             env.project_file("candidates/1/evaluation_record.json")
                 .is_file()
         );
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
         let text = env.ok(&[
             "infer",
             "--package",
@@ -1255,10 +1300,7 @@ mod suite {
         // c=12・基準 75%: pass（exit 0）。
         let env = acceptance_env("accpass", &bp_definition_text(7500), &predicted);
         env.ok(&EVALUATE_1);
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, PASS_HEAD));
         assert!(env.project_file("package/artifact.json").is_file());
 
         // c=0・基準 25%: fail（exit 10）。
@@ -1267,7 +1309,7 @@ mod suite {
         env.ok(&EVALUATE_1);
         assert_eq!(
             env.fails(&PACKAGE, 10, "judged_fail"),
-            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
+            package_line(&env, C3_DIR, FAIL_HEAD)
         );
         assert!(env.project_file("package/artifact.json").is_file());
         assert!(!env.project_file("package.staging").exists());
@@ -1292,7 +1334,7 @@ mod suite {
         );
         assert_eq!(
             env.fails(&PACKAGE, 12, "pending"),
-            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
+            package_line(&env, C3_DIR, PENDING_HEAD)
         );
         assert!(env.project_file("package/artifact.json").is_file());
     }
@@ -1311,7 +1353,7 @@ mod suite {
         env.ok(&SELECT);
         assert_eq!(
             env.fails(&PACKAGE, 12, "pending"),
-            "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true}\n"
+            package_line(&env, C1_DIR, PENDING_HEAD)
         );
     }
 
@@ -1359,37 +1401,62 @@ mod suite {
         env
     }
 
-    const LIMIT_EXCEEDED_JSON: &str =
-        "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\"}\n";
+    /// p95 の出力の期待値の検証（実時計のため値は決まらない。#340）。`limit_us` と `exceeded` は固定、
+    /// `p95_us` は ASCII 数字だけの整数で、`exceeded` が true のときは 2 以上（上限 1 µs を超える）。
+    fn assert_p95_tail(line: &str, limit_us: u64, exceeded: bool) {
+        let prefix = "\"infer_p95\":{\"p95_us\":";
+        let suffix = format!(",\"limit_us\":{limit_us},\"exceeded\":{exceeded}}}}}\n");
+        let start = line.find(prefix).expect("infer_p95 key") + prefix.len();
+        assert!(line.ends_with(&suffix), "{line}");
+        let digits = &line[start..line.len() - suffix.len()];
+        assert!(
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+            "{line}"
+        );
+        if exceeded {
+            assert!(digits.parse::<u64>().expect("p95") >= 2, "{line}");
+        }
+    }
 
-    /// REQ-31・REQ-21・#338: p95 の上限が 1 µs だと超過（exit 20）で、`package/`・ステージングを作らない。
+    /// REQ-31・REQ-30・REQ-21・#338・#340: p95 の上限が 1 µs だと超過（exit 20）で、`package/`・ステージングを
+    /// 作らない。出力は容量内訳（上限内）と p95（`exceeded:true`）を含み、容量の超過と区別できる。
     /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX。実機の p95 ではない）。
     pub fn package_latency_limit_1us_is_limit_exceeded() {
         let env = limits_env("lat1us", r#"{"max_infer_p95_us":1}"#);
-        assert_eq!(
-            env.fails(&PACKAGE, 20, "limit_exceeded"),
-            LIMIT_EXCEEDED_JSON
+        let out = env.fails(&PACKAGE, 20, "limit_exceeded");
+        let head = format!(
+            "{LIMIT_HEAD},{},",
+            capacity_json(&env, C1_DIR, DEFAULT_CAPACITY_LIMIT, false)
         );
+        assert!(out.starts_with(&head), "{out}");
+        assert_p95_tail(&out, 1, true);
         assert!(!env.project_file("package").exists());
         assert!(!env.project_file("package.staging").exists());
     }
 
-    /// REQ-31・#338: 十分大きい p95 の上限なら合格で、出力は `limits` なしと同じ（p95 値は出さない）。
+    /// REQ-31・REQ-30・#338・#340: 十分大きい p95 の上限なら合格で、出力に p95（`exceeded:false`）が載る。
     pub fn package_latency_limit_large_is_ok() {
         let env = limits_env("latlarge", r#"{"max_infer_p95_us":3600000000}"#);
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
+        let out = env.ok(&PACKAGE);
+        let head = format!(
+            "{NULL_HEAD},{},",
+            capacity_json(&env, C1_DIR, DEFAULT_CAPACITY_LIMIT, false)
         );
+        assert!(out.starts_with(&head), "{out}");
+        assert_p95_tail(&out, 3_600_000_000, false);
         assert!(env.project_file("package/artifact.json").is_file());
     }
 
-    /// REQ-30・REQ-21・#338: 定義の `max_package_bytes` が容量の上限になり、超えると exit 20。
+    /// REQ-30・REQ-21・#338・#340: 定義の `max_package_bytes` が容量の上限になり、超えると exit 20。
+    /// 出力は `limit_bytes:1`・`exceeded:true` で、p95 の上限は未設定なので `infer_p95` は `null`。
     pub fn package_capacity_limit_from_definition_is_limit_exceeded() {
         let env = limits_env("capdef", r#"{"max_package_bytes":1}"#);
         assert_eq!(
             env.fails(&PACKAGE, 20, "limit_exceeded"),
-            LIMIT_EXCEEDED_JSON
+            format!(
+                "{LIMIT_HEAD},{},\"infer_p95\":null}}\n",
+                capacity_json(&env, C1_DIR, 1, true)
+            )
         );
         assert!(!env.project_file("package").exists());
         assert!(!env.project_file("package.staging").exists());
@@ -1621,10 +1688,7 @@ mod suite {
         assert_eq!(plain.ok(&EVALUATE_1), stdout);
         assert!(!evaluation_record(&plain).contains("baseline_comparison"));
         // 下限基準だけの定義は合否を出さない（`judgment:null`・exit 0。#344）。
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
 
         // 有意差なし: gold = 多数派 → b = 0、c = 多数派以外の予測の行。
         let golds: Vec<String> = vec![majority.to_string(); 12];
@@ -1647,10 +1711,7 @@ mod suite {
             "{record}"
         );
         // `baseline_comparison` だけの定義は verdict を合否に使わない（#344）。
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
 
         // 判定不能: 必要件数 168 > 12 件。gold = 予測で p 値だけなら有意でも、合格扱いにしない。
         let env = baseline_env(
@@ -1672,10 +1733,7 @@ mod suite {
             "{record}"
         );
         // 判定不能でも `baseline_comparison` だけの定義は合否を出さない（#344）。
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
     }
 
     /// 比較欄と `acceptance` を併記した定義 JSON（#344）。
@@ -1695,7 +1753,6 @@ mod suite {
         let (majority, in_predicted) = least_predicted(&predicted);
         let not_majority = 12 - in_predicted;
         let train = train_jsonl_with_majority(majority);
-        let pass_json = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n";
 
         // 有意差なし（gold = 多数派）。正解率の基準は 0 なので pass。
         let golds: Vec<String> = vec![majority.to_string(); 12];
@@ -1717,7 +1774,7 @@ mod suite {
             )),
             "{record}"
         );
-        assert_eq!(env.ok(&PACKAGE), pass_json);
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, PASS_HEAD));
         assert!(env.project_file("package/artifact.json").exists());
 
         // 判定不能（必要件数 168 > 12 件）。12/12 の Wilson 下限は 7500 bp 以上なので pass。
@@ -1739,7 +1796,7 @@ mod suite {
             )),
             "{record}"
         );
-        assert_eq!(env.ok(&PACKAGE), pass_json);
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, PASS_HEAD));
         assert!(env.project_file("package/artifact.json").exists());
     }
 
@@ -1856,10 +1913,7 @@ mod suite {
         assert!(!env.project_file("package").exists());
         std::fs::write(&record_path, &original).expect("restore");
         // 下限基準だけの定義は合否を出さない（`judgment:null`。#344）。
-        assert_eq!(
-            env.ok(&PACKAGE),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false}\n"
-        );
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
 
         // 欄の追加（定義には欄が無い）。
         let env = baseline_env("bcadd", &definition_text(), &train, &predicted);

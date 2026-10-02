@@ -56,7 +56,9 @@ use fandhe_edge_core::definition::DefinitionError;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::infer_input::InferInputError;
 use fandhe_edge_core::judgment::{JudgmentError, JudgmentResult};
-use fandhe_edge_core::stage_report::{EvaluateReport, PackageJudgedReport, PackageReport};
+use fandhe_edge_core::stage_report::{
+    EvaluateReport, PackageJudgedReport, PackageLimitExceededReport, PackageReport,
+};
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, CapacityError};
 use fandhe_edge_runtime::export_exclusion::{ExclusionReason, ExclusionRecord};
 use std::io::{self, Write};
@@ -170,6 +172,29 @@ pub fn write_package_judged_report<W: Write>(
     Ok(report.exit_code())
 }
 
+/// [`PackageLimitExceededReport`]（`package` の上限超過 exit 20。計測値つき）を JSON 1 行＋改行として
+/// `out` へ書き、[`ExitCode::LimitExceeded`] を返す（REQ-21・REQ-30・REQ-31・#340）。
+///
+/// [`write_package_report`] と同じ保証を持つ（直列化失敗時は何も書かず `Err`、`write_all` は
+/// 高々 1 回、部分書き込み失敗時にリトライ・追記・flush をしない）。
+///
+/// # Errors
+/// 直列化エラー、または `out` への書き込み・flush の失敗を `io::Error` として返す。
+pub fn write_package_limit_exceeded_report<W: Write>(
+    out: &mut W,
+    report: &PackageLimitExceededReport,
+) -> io::Result<ExitCode> {
+    let mut line = report
+        .to_json_line()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    line.push('\n');
+
+    out.write_all(line.as_bytes())?;
+    out.flush()?;
+
+    Ok(report.exit_code())
+}
+
 /// [`EvaluateReport`]（`evaluate` 工程の評価データ未定義 skipped。exit 0）を JSON 1 行＋改行として
 /// `out` へ書き、[`ExitCode::Ok`] を返す（REQ-17・REQ-33・TASK-33.3・#140）。
 ///
@@ -250,8 +275,9 @@ pub fn definition_error_report(err: &DefinitionError) -> ErrorReport {
 /// 容量内訳（REQ-30・TASK-30.1-2・#123）を `package` 出力へ埋め込む `capacity` オブジェクト
 /// （JSON 文字列。改行なし）へ直列化する。
 ///
-/// 後続の `package` 工程（TASK-33.1。未配線）が出力へ埋め込む部品。`status`・`judgment`・
-/// 上限照合（TASK-30.2・#124）はここでは扱わない。手組みで足りるのは、キーが
+/// `package` の stdout JSON（#340）は core の `PackageCapacity` で直列化し、`components` の形は
+/// 本関数と同じ（`stages::package` のテストで一致を固定）。本関数は example 用に残している。
+/// `status`・`judgment`・上限照合（TASK-30.2・#124）はここでは扱わない。手組みで足りるのは、キーが
 /// `PackageComponent::as_str()` の ASCII snake_case と固定リテラルだけ、値が整数だけで、
 /// エスケープが要らないため（前提はテストで固定）。構成要素は宣言順に 5 件とも常に出す。
 #[must_use]
@@ -359,6 +385,31 @@ pub fn export_exclusions_json(records: &[ExclusionRecord]) -> String {
 mod tests {
     use super::*;
     use fandhe_edge_core::definition::Choice;
+
+    const SAMPLE_CAPACITY_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const SAMPLE_CAPACITY_EXCEEDED: &str = "{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+
+    /// 合成の計測値（`stage_report` のテストと同じ値。上限は超過時 100・それ以外 40,000,000）。
+    fn sample_metrics(
+        capacity_exceeded: bool,
+        p95: Option<(u64, u64, bool)>,
+    ) -> fandhe_edge_core::stage_report::PackageMetrics {
+        use fandhe_edge_core::stage_report::{
+            InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize,
+            PackageMetrics,
+        };
+        let c = PackageComponentSize::new;
+        let limit = if capacity_exceeded { 100 } else { 40_000_000 };
+        PackageMetrics {
+            capacity: PackageCapacity::new(
+                125,
+                limit,
+                capacity_exceeded,
+                PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
+            ),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+        }
+    }
 
     fn choice(id: &str) -> Choice {
         Choice {
@@ -577,11 +628,14 @@ mod tests {
     #[test]
     fn req33_write_package_report_writes_line_and_propagates_failure() {
         let mut buffer: Vec<u8> = Vec::new();
-        let code = write_package_report(&mut buffer, &PackageReport::pass()).unwrap();
+        let report = PackageReport::pass(sample_metrics(false, None));
+        let code = write_package_report(&mut buffer, &report).unwrap();
         assert_eq!(code, ExitCode::Ok);
         assert_eq!(
             String::from_utf8(buffer).unwrap(),
-            "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true}\n"
+            format!(
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null}}\n"
+            )
         );
 
         struct FailingWriter;
@@ -593,26 +647,65 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(write_package_report(&mut FailingWriter, &PackageReport::pass()).is_err());
+        assert!(write_package_report(&mut FailingWriter, &report).is_err());
     }
 
     /// REQ-21・REQ-33・#328: 判定項目つきの結果は JSON 1 行＋改行で書かれ、10・12 を返す。
     #[test]
     fn req33_issue328_write_package_judged_report_writes_line_and_returns_exit_code() {
         let mut buffer: Vec<u8> = Vec::new();
-        let report = PackageJudgedReport::fail("judged as fail".to_string());
+        let report =
+            PackageJudgedReport::fail("judged as fail".to_string(), sample_metrics(false, None));
         let code = write_package_judged_report(&mut buffer, &report).unwrap();
         assert_eq!(code, ExitCode::JudgedFail);
         assert_eq!(
             String::from_utf8(buffer).unwrap(),
-            "{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true}\n"
+            format!(
+                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null}}\n"
+            )
         );
         let mut buffer: Vec<u8> = Vec::new();
-        let report = PackageJudgedReport::undeterminable("result is pending".to_string());
+        let report = PackageJudgedReport::undeterminable(
+            "result is pending".to_string(),
+            sample_metrics(false, None),
+        );
         assert_eq!(
             write_package_judged_report(&mut buffer, &report).unwrap(),
             ExitCode::Pending
         );
+    }
+
+    /// REQ-21・REQ-30・REQ-31・#340: 上限超過の結果は JSON 1 行＋改行で書かれ 20 を返し、
+    /// 書き込み失敗は `Err` で伝わる。
+    #[test]
+    fn req21_issue340_write_package_limit_exceeded_report_writes_line_and_returns_exit_code() {
+        let report = PackageLimitExceededReport::new(
+            "resource limit exceeded".to_string(),
+            sample_metrics(true, Some((7, 6, true))),
+        )
+        .expect("exceeded");
+        let mut buffer: Vec<u8> = Vec::new();
+        let code = write_package_limit_exceeded_report(&mut buffer, &report).unwrap();
+        assert_eq!(code, ExitCode::LimitExceeded);
+        let text = String::from_utf8(buffer).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",\"capacity\":{SAMPLE_CAPACITY_EXCEEDED},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true}}}}\n"
+            )
+        );
+        assert_eq!(text.matches('\n').count(), 1);
+
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_package_limit_exceeded_report(&mut FailingWriter, &report).is_err());
     }
 
     /// TASK-21.2: 部分書き込み後に失敗する `Write` を渡した場合でも、本
