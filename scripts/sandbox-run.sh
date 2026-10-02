@@ -507,7 +507,7 @@ run_all() {
     # `--smoke` で短縮学習した候補は、検証専用の `--allow-smoke` を渡さないと package できない
     # （配布用ではない。REQ-27）。評価データがあるプロジェクトでは、smoke 候補は evaluate できず評価完了
     # 記録が無いため `--allow-smoke` でも package は拒否される（ゲートは緩めない）。smoke ランは評価データの
-    # ない fixture（`fixtures/sandbox_run`）で使うこと。
+    # ない fixture（`fixtures/sandbox_run`）で使うこと。評価データありの経路は smoke なしで `fixtures/sandbox_run_eval` を使う。
     if [ "$smoke" -eq 1 ]; then
         do_step package - package --project-dir "$project_dir" --allow-smoke || return 0
     else

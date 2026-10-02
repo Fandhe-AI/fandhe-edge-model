@@ -6,8 +6,9 @@
 - 用途: `crates/cli/tests/sandbox_pipeline_real_trainer.rs`（テストハーネス）と、人が macOS 実機で
   `scripts/sandbox-monitor.sh` を実行するときの共通入力（REQ-38・TASK-38.1・#161。手順は
   `docs/design/sandbox-offline-check-procedure.md`）
-- `evaluation.jsonl` を置かない理由: 評価データありの `evaluate` は評価本体の CLI 配線が未実装で
-  `runtime_error`(70) で停止する（評価済みを装わない）ため、評価データなしの `status:"skipped"`
-  経路（exit 0）で 7 工程を完走させる
+- `evaluation.jsonl` を置かない理由: 評価本体は配線済み（#314）だが、`--smoke` の候補は最終 test を
+  適用できず、評価データがあると `package` が評価未完了として拒否する。本 fixture は smoke 経路
+  （評価データなしで `evaluate` が `status:"skipped"`・exit 0）専用とし、評価データありの経路は
+  `fixtures/sandbox_run_eval/` を使う
 - 経路の閉じ込め（REQ-39）により、`--definition`・`--project-dir` はカレントディレクトリ配下へ
   コピーして使う（本 fixture 自体は書き換えない）

@@ -16,8 +16,9 @@
 //! 合成データ・CPU のみ。macOS 実機の sandbox 下での完走確認と拒否ログの記録は人の担当で、
 //! 本テストはその証拠にならない（手順は `docs/design/sandbox-offline-check-procedure.md`）。
 //! 陽性対照（TASK-38.2・#164）は偽の curl と偽の `log` の拒否行で通し、`detected` を確かめる。
-//! 評価データなしの `evaluate`（`skipped`）経路だけを通す（評価データありの `evaluate` は評価器へ接続済み・#314 だが、
-//! 本テストでは通していない。評価の完走は未確認）。
+//! 2 経路を通す: 評価なし（`--smoke`・`fixtures/sandbox_run/`。`evaluate` は `skipped`）と、
+//! 評価あり（`--smoke` なし・`fixtures/sandbox_run_eval/`。凍結した評価データへ 1 回だけ適用して
+//! `evaluate` が `ok`。#314・#348）。評価ありの実機確認は未実施（人の担当）。
 //!
 //! # 既定のテスト集合から分離する理由（`.claude/rules/ci.md`）
 //!
@@ -38,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// 子プロセスの上限時間（資源上限。REQ-39）。実 trainer の smoke 学習を含む。
+/// 子プロセスの上限時間（資源上限。REQ-39）。実 trainer の学習（評価ありは smoke なしの c1・30 epochs）を含む。
 const TIMEOUT: Duration = Duration::from_secs(900);
 const PROFILE: &str = "(version 1)(allow default)(deny network*)";
 const PREDICATE: &str = "process == \"kernel\" AND eventMessage CONTAINS \"deny\"";
@@ -100,21 +101,35 @@ fn run_with_timeout(mut cmd: Command) -> (Option<i32>, String) {
     (status.code(), reader.join().expect("join"))
 }
 
-/// 実 CLI・実 trainer・両スクリプトを通して 7 工程が完走し、本ツール起因の通信拒否が 0 件になる
-/// （REQ-38 正常系のうち、実バイナリでの完走とスクリプトの判定の接続。証拠種別: テストハーネス）。
-#[test]
-#[ignore = "requires trainer/.venv (make py-sync) and MLX CPU; run via make test-trainer-integration"]
-fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
+/// 1 回のチェーン実行の結果。`_work` は Drop で作業ディレクトリを削除する。
+struct Chain {
+    code: Option<i32>,
+    stdout: String,
+    meta: String,
+    dir: PathBuf,
+    expected_deny: usize,
+    _work: Work,
+}
+
+/// `sandbox-monitor.sh` を偽 launcher・偽 `log`・偽 curl の下で実 CLI・実 trainer に対して実行する。
+/// `case` は作業ディレクトリ名の接尾辞（同一プロセス内で複数テストが並走しても衝突させない）。
+/// `fixture` の `files` を作業ディレクトリへコピーし、`smoke` のときだけ `--smoke` を渡す。
+fn run_chain(case: &str, fixture: &str, files: &[&str], smoke: bool) -> Chain {
     let root = repo_root();
-    let dir = std::env::temp_dir().join(format!("fandhe-sandbox-real-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("fandhe-sandbox-real-{case}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("mkdir");
     let dir = dir.canonicalize().expect("canonicalize");
-    let _work = Work(dir.clone());
+    let work = Work(dir.clone());
 
     // fixture は原本を変更しないようコピーして使う
-    for name in ["definition.json", "train.jsonl"] {
-        fs::copy(root.join("fixtures/sandbox_run").join(name), dir.join(name)).expect("copy");
+    for name in files {
+        fs::copy(
+            root.join("fixtures").join(fixture).join(name),
+            dir.join(name),
+        )
+        .expect("copy");
     }
     let clean = root.join("fixtures/sandbox_deny_log/clean.ndjson");
     let clean_text = fs::read_to_string(&clean).expect("clean fixture");
@@ -159,8 +174,11 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         .args(["--definition", "definition.json"])
         .args(["--project-dir", "project"])
         .args(["--out-dir", "out"])
-        .args(["--candidates", "1", "--smoke"])
-        .args(["--infer-text", INFER_MARKER])
+        .args(["--candidates", "1"]);
+    if smoke {
+        cmd.arg("--smoke");
+    }
+    cmd.args(["--infer-text", INFER_MARKER])
         .env("FANDHE_EDGE_SANDBOX_EXEC", &launcher)
         .env("FANDHE_EDGE_LOG_CMD", &log)
         .env("FANDHE_EDGE_CURL_CMD", &curl)
@@ -170,8 +188,30 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         .env("FANDHE_EDGE_LOG_STREAM_WARMUP_SECS", "0")
         .env("FANDHE_EDGE_LOG_STREAM_TAIL_SECS", "0");
     let (code, stdout) = run_with_timeout(cmd);
+    let meta = fs::read_to_string(dir.join("out/run/run.meta.json")).unwrap_or_default();
+    Chain {
+        code,
+        stdout,
+        meta,
+        dir,
+        expected_deny,
+        _work: work,
+    }
+}
 
-    assert_eq!(code, Some(0), "{stdout}");
+/// 両経路に共通の確認（完走・0 件判定・陽性対照・7 工程の順序・漏えい検査）。
+/// `evaluate_status` は evaluate 工程の期待 status（評価データなしは `skipped`、ありは `ok`）。
+/// evaluate 以外の工程は status が null（`skipped` を別工程に見逃さない。REQ-17）。
+fn assert_chain_completed(chain: &Chain, evaluate_status: &str) {
+    let Chain {
+        code,
+        stdout,
+        meta,
+        dir,
+        expected_deny,
+        ..
+    } = chain;
+    assert_eq!(*code, Some(0), "{stdout}");
     assert_eq!(stdout.trim_end().lines().count(), 1, "{stdout}");
     for frag in [
         "\"code\": \"ok\"".to_string(),
@@ -190,11 +230,9 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         assert!(stdout.contains(&frag), "missing {frag} in: {stdout}");
     }
 
-    let meta = fs::read_to_string(dir.join("out/run/run.meta.json")).expect("run.meta.json");
     assert!(meta.contains("\"sandbox_exec_override\":true"), "{meta}");
     assert!(!meta.contains("\"process_pids\":[]"), "{meta}");
-    // 7 工程がこの順（select → evaluate。選定してから評価する。REQ-27）に並び、evaluate だけが
-    // skipped（評価データなし。評価済みを装わない）
+    // 7 工程がこの順（select → evaluate。選定してから評価する。REQ-27）に並ぶ
     let mut pos = 0;
     for step in [
         "register", "inspect", "train", "select", "evaluate", "package", "infer",
@@ -206,26 +244,35 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         pos += found + needle.len();
     }
     assert_eq!(meta.matches("\"step\":").count(), 7, "{meta}");
-    // 工程ごとの entry（平坦な JSON object）を切り出し、evaluate だけが skipped で
-    // 他の工程は skipped でないことを工程名ごとに確認する（REQ-17。別工程の skipped を見逃さない）
+    // 工程ごとの entry（平坦な JSON object）を切り出し、evaluate だけが status 値を持つことを確認する
     let entries: Vec<&str> = meta
         .split("{\"step\":\"")
         .skip(1)
         .map(|chunk| chunk.split('}').next().unwrap_or(chunk))
         .collect();
     assert_eq!(entries.len(), 7, "{meta}");
+    let expected_status = format!("\"status\":\"{evaluate_status}\"");
     for entry in entries {
         let name = entry.split('"').next().unwrap_or("");
-        let skipped = entry.contains("\"status\":\"skipped\"");
-        assert_eq!(skipped, name == "evaluate", "step {name}: {entry}");
+        assert_eq!(
+            entry.contains(&expected_status),
+            name == "evaluate",
+            "step {name}: {entry}"
+        );
+        assert_eq!(
+            entry.contains("\"status\":null"),
+            name != "evaluate",
+            "step {name}: {entry}"
+        );
     }
-    assert_eq!(meta.matches("\"status\":\"skipped\"").count(), 1, "{meta}");
+    assert_eq!(meta.matches(&expected_status).count(), 1, "{meta}");
+    assert_eq!(meta.matches("\"status\":null").count(), 6, "{meta}");
     // 全体（1）と 7 工程（7）の exit_code がすべて 0
     assert_eq!(meta.matches("\"exit_code\":0").count(), 8, "{meta}");
 
     // 利用者の値・一時パスが出力物へ漏れない（生文字列非保存）
     let tmp = dir.display().to_string();
-    let mut outputs = vec![stdout.clone(), meta];
+    let mut outputs = vec![stdout.clone(), meta.clone()];
     for f in ["network_report.json", "monitor.meta.json"] {
         outputs.push(fs::read_to_string(dir.join("out").join(f)).expect("output file"));
     }
@@ -233,4 +280,41 @@ fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
         assert!(!o.contains(INFER_MARKER), "infer text leaked: {o}");
         assert!(!o.contains(&tmp), "temp path leaked: {o}");
     }
+}
+
+/// 実 CLI・実 trainer・両スクリプトを通して 7 工程が完走し、本ツール起因の通信拒否が 0 件になる
+/// （REQ-38 正常系のうち、実バイナリでの完走とスクリプトの判定の接続。評価データなし・`--smoke`・
+/// `evaluate` は `skipped`。証拠種別: テストハーネス）。
+#[test]
+#[ignore = "requires trainer/.venv (make py-sync) and MLX CPU; run via make test-trainer-integration"]
+fn req38_real_pipeline_completes_under_monitor_with_zero_tool_denials() {
+    let chain = run_chain(
+        "smoke",
+        "sandbox_run",
+        &["definition.json", "train.jsonl"],
+        true,
+    );
+    assert_chain_completed(&chain, "skipped");
+}
+
+/// 評価データあり（`--smoke` なし）で 7 工程が完走し、`evaluate` が凍結データへ 1 回だけ適用されて
+/// `status:"ok"` になり、評価完了記録と公開済みパッケージが残る（REQ-38・REQ-27・REQ-17・#348。
+/// 証拠種別: テストハーネス。実機の証拠ではない）。
+#[test]
+#[ignore = "requires trainer/.venv (make py-sync) and MLX CPU; run via make test-trainer-integration"]
+fn req38_real_pipeline_with_evaluation_data_completes_under_monitor_with_zero_tool_denials() {
+    let chain = run_chain(
+        "eval",
+        "sandbox_run_eval",
+        &["definition.json", "train.jsonl", "evaluation.jsonl"],
+        false,
+    );
+    assert_chain_completed(&chain, "ok");
+    let records = fs::read_dir(chain.dir.join("project/candidates"))
+        .expect("candidates dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("evaluation_record.json").is_file())
+        .count();
+    assert_eq!(records, 1, "exactly one evaluation_record.json expected");
+    assert!(chain.dir.join("project/package").is_dir());
 }

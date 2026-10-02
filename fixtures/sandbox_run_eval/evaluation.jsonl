@@ -1,0 +1,12 @@
+{"id":"e-alpha-0","input":"alpha evaluation 0","output":{"intent":"alpha"},"group_id":"eg-alpha-0"}
+{"id":"e-alpha-1","input":"alpha evaluation 1","output":{"intent":"alpha"},"group_id":"eg-alpha-1"}
+{"id":"e-alpha-2","input":"alpha evaluation 2","output":{"intent":"alpha"},"group_id":"eg-alpha-2"}
+{"id":"e-alpha-3","input":"alpha evaluation 3","output":{"intent":"alpha"},"group_id":"eg-alpha-3"}
+{"id":"e-beta-0","input":"beta evaluation 0","output":{"intent":"beta"},"group_id":"eg-beta-0"}
+{"id":"e-beta-1","input":"beta evaluation 1","output":{"intent":"beta"},"group_id":"eg-beta-1"}
+{"id":"e-beta-2","input":"beta evaluation 2","output":{"intent":"beta"},"group_id":"eg-beta-2"}
+{"id":"e-beta-3","input":"beta evaluation 3","output":{"intent":"beta"},"group_id":"eg-beta-3"}
+{"id":"e-gamma-0","input":"gamma evaluation 0","output":{"intent":"gamma"},"group_id":"eg-gamma-0"}
+{"id":"e-gamma-1","input":"gamma evaluation 1","output":{"intent":"gamma"},"group_id":"eg-gamma-1"}
+{"id":"e-gamma-2","input":"gamma evaluation 2","output":{"intent":"gamma"},"group_id":"eg-gamma-2"}
+{"id":"e-gamma-3","input":"gamma evaluation 3","output":{"intent":"gamma"},"group_id":"eg-gamma-3"}
