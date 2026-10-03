@@ -79,7 +79,13 @@ cd <作業ディレクトリ>
   `log_stream_override` が `false` であること、`out/run/run.meta.json` の `sandbox_exec_override` が `false` である
   ことを確認する。1 つでも異なれば実機の証拠として記録せず、環境変数を見直して再実行する
 - `out/network_report.json` の `counts`・`network_verdict`・`evidence_hint`・`positive_control`
-- `out/run/run.meta.json` の工程ごとの終了コード（7 工程すべて 0）
-  - 3-A（smoke）の場合: evaluate の `status` が `skipped` である旨
-  - 3-B（評価データあり）の場合: evaluate の `status` が `ok` で `skipped` が 0 件であること、`sandbox-run.sh` が出す集計の message が `all stages completed under sandbox`（`evaluation was skipped` を含まない）であること
+- `out/run/run.meta.json` の `exit_code` が 0・`failed_step` が `null` で、`steps[]` の全要素の `exit_code` が 0
+  （`--candidates 1` なら 7 要素）であること。あわせて `out/network_report.json` の `run_exit_code` が 0・
+  `run_code` が `ok` であること
+  - 3-A（smoke）の場合: `steps[]` のうち `step` が `evaluate` の要素の `status` が `skipped` である旨
+    （smoke は evaluate を起動せず skipped として記録される）
+  - 3-B（評価データあり）の場合: `step` が `evaluate` の要素の `status` が `ok` で、`steps[]` に `status` が
+    `skipped` の要素が 0 件であること（`status` に値が入るのは evaluate だけで、ほかの工程は `null`）
+- 記録はすべて `out/` 配下のファイルから取る。`sandbox-run.sh` の標準出力（集計 message）は
+  `sandbox-monitor.sh` が捨てるため残らず、記録項目に含めない
 - 生ログ `log_stream.ndjson` は他アプリのイベントを含むため**転記しない**。データ本文・パスも記録しない
