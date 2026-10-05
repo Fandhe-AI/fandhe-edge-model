@@ -181,6 +181,9 @@ LIBRARIES_PATH = ("items", "D", "direct_libraries")
 FIXTURE_FILES = ("definition.json", "train.jsonl", "evaluation.jsonl")
 INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
+# 2 回目の中断シグナルによる強制終了で stdout へ書く固定の 1 行（record は無い）
+FORCED_EXIT_LINE = b'{"code":"runtime_error","message":"interrupted (forced exit)"}\n'
+
 # 子の外側で動く薄い sh。コマンドを子として走らせ、終了コードを rc ファイル（位置引数 $1）へ
 # 書いてから、自分を含むグループ全体へ KILL を送る（TERM を無視する孫も残さない。REQ-39）。
 # リーダー（この sh）の生存中に行うので、reap 後の killpg による pid 再利用の誤爆がない。
@@ -203,6 +206,21 @@ class Interrupted(BaseException):  # Exception で捕まえられないよう Ba
 
 # 中断シグナルを受けた印。ハンドラ（`_on_signal`）が立て、`run()` の冒頭で下ろす（REQ-21・REQ-39）
 _interrupt_requested = False
+# 中断シグナルを受けた回数。2 回目以降は後始末の完了を待たず強制終了する（`_on_signal`。REQ-39）
+_signal_count = 0
+# 実行中の子のプロセスグループ id。`Popen` 生成直後に立て、回収の直後に下ろす（`run_cmd`）。
+# 2 回目のシグナルのハンドラが KILL を送る宛先。回収から下ろすまでの数命令の窓で pid が
+# 再利用される誤爆の余地は既知の限界（確率は無視できる）
+_active_pgid: int | None = None
+# 子の回収が上限時間内に終わらず、子（またはその孫）が残っている可能性がある印（REQ-39）。
+# record の `child_may_remain` へ出す。`run()` の冒頭で下ろす
+_child_may_remain = False
+# 後始末後の回収（`proc.wait`）を待つ上限秒数。KILL が効けば即時に回収できるため、実際に
+# 待つのは KILL が失敗した異常時だけ。超過したら諦めて先へ進む（無限待ちを作らない。REQ-39）。
+# モジュール変数にしてあるのはテストが縮めるため
+REAP_WAIT_LIMIT_SECONDS = 10.0
+# 回収を諦めたときの結果の理由（固定語彙）。項目は `failed` になり、通常の合否判定へ流さない
+REASON_UNREAPED = "unreaped"
 
 
 def check_interrupt() -> None:
@@ -461,7 +479,11 @@ def sanitize_record(rec: Any, _path: tuple[str, ...] = (), _in_list: bool = Fals
 
 @dataclass
 class RunResult:
-    """子プロセスの結果。reason は `timeout`・`output_limit`・`spawn_error`・`killed` か None。"""
+    """子プロセスの結果。
+
+    reason は `timeout`・`output_limit`・`spawn_error`・`killed`・`unreaped`（回収が上限時間内に
+    終わらなかった）か None。
+    """
 
     exit_code: int | None
     reason: str | None
@@ -477,12 +499,19 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _kill_group(pid: int) -> None:
-    """プロセスグループへ KILL を送る。リーダーが未回収（reap 前）のときだけ呼ぶこと。"""
+def _kill_group(pid: int) -> bool:
+    """プロセスグループへ KILL を送る。リーダーが未回収（reap 前）のときだけ呼ぶこと。
+
+    戻り値は「止める見込みが立ったか」。グループが既に無い（`ESRCH`）は成功扱い、それ以外の
+    `OSError` は False（呼び出し側がリーダー単体の KILL に切り替える）。
+    """
     try:
         os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _resolve_exe(name: str) -> str | None:
@@ -524,6 +553,7 @@ def run_cmd(
         # パスがディレクトリ・削除不能のとき。例外を外へ出さず、子を起動しない（#359）
         return RunResult(None, "spawn_error", 0, 0)
     full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
+    global _active_pgid, _child_may_remain
     reason = None
     spawn_failed = False
     try:
@@ -540,6 +570,7 @@ def run_cmd(
                 env=env,
                 start_new_session=True,
             )
+            _active_pgid = proc.pid
             try:
                 deadline = time.monotonic() + timeout
                 while proc.poll() is None:
@@ -554,9 +585,20 @@ def run_cmd(
                     time.sleep(0.02)
             finally:
                 # 例外・中断・期限超過で抜けたら、リーダーが未回収（poll が None）のうちに KILL する
-                if proc.poll() is None:
-                    _kill_group(proc.pid)
-                proc.wait()
+                if proc.poll() is None and not _kill_group(proc.pid):
+                    # グループへ送れなかったときは、せめてリーダーだけでも止める（best-effort）
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    # 回収を諦める。子が残っている可能性を記録し、結果は失敗側へ倒す（fail-closed）
+                    _child_may_remain = True
+                    reason = REASON_UNREAPED
+                finally:
+                    _active_pgid = None
     except (OSError, ValueError):
         spawn_failed = True
     # 後始末（グループの KILL と回収）が済んだ後でだけ中断を送出する。子が自然に終わった周に
@@ -1890,7 +1932,7 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
             timeouts += 1
         elif r.reason == "output_limit":
             output_limit += 1
-        elif r.reason == "killed":
+        elif r.reason in ("killed", REASON_UNREAPED):
             killed += 1
         elif r.reason == "spawn_error":
             spawn_error += 1
@@ -2192,6 +2234,11 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "（このスクリプトがビルドした CLI ではない。`commit`・`worktree_clean` は"
             " CLI の出所を表さない）"
         )
+    if rec.get("child_may_remain") is True:
+        lines.append(
+            "- 注意: 子プロセスの回収が上限時間内に終わらなかった（子・孫が残っている可能性。"
+            "`ps` で確認し、残っていれば手で止める。結果を採用しない）"
+        )
     stable = (rec.get("environment") or {}).get("stable")
     if stable is False:
         lines.append(
@@ -2277,9 +2324,28 @@ def emit(code: str, message: str, exit_code: int, with_record: bool) -> int:
 
 
 def _on_signal(signum: int, frame: Any) -> None:
-    """中断シグナルのハンドラ。印を立てて戻るだけ（例外を投げない。理由は `run_cmd`）。"""
-    global _interrupt_requested
+    """中断シグナルのハンドラ。1 回目は印を立てて戻るだけ（例外を投げない。理由は `run_cmd`）。
+
+    2 回目以降は後始末の完了を待たず強制終了する（後始末が終わらないときに SIGKILL 以外で
+    止める口。REQ-39）。子のグループへ KILL を送り、固定 JSON を 1 行書いて exit 70 する。
+    `Popen` の内部（`_waitpid_lock`）に触れず、例外も投げない。record は書かない。
+    """
+    global _interrupt_requested, _signal_count
     _interrupt_requested = True
+    _signal_count += 1
+    if _signal_count < 2:
+        return
+    pgid = _active_pgid
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.write(1, FORCED_EXIT_LINE)
+    except OSError:
+        pass
+    os._exit(EXIT_RUNTIME_ERROR)
 
 
 def build_cli(ctx: Ctx) -> Path | None:
@@ -2359,8 +2425,11 @@ def run(args: argparse.Namespace) -> int:
     記録の骨格は入力の採取より前に作る。前半（採取・ビルド）で中断されても、選んだ項目を
     すべて `not_run`（`interrupted`）にした記録を書く（REQ-21・REQ-39）。
     """
-    global _interrupt_requested
+    global _interrupt_requested, _signal_count, _active_pgid, _child_may_remain
     _interrupt_requested = False  # 前の回の印を引き継がない
+    _signal_count = 0
+    _active_pgid = None
+    _child_may_remain = False
     os.umask(0o077)
     for s in INTERRUPT_SIGNALS:
         signal.signal(s, _on_signal)
@@ -2399,6 +2468,7 @@ def run(args: argparse.Namespace) -> int:
             "with_ci": bool(args.with_ci),
             "cargo_offline": "A" not in items,
         },
+        "child_may_remain": False,
         "items": {},
     }
     stopped = False
@@ -2457,6 +2527,10 @@ def run(args: argparse.Namespace) -> int:
                 interrupted = True  # 採取中の中断。採取分は捨てる
         fill_end_environment(rec["environment"], end_vol)
         rec["environment"]["ended_local"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    if _child_may_remain:
+        rec["child_may_remain"] = True
+        sys.stderr.write("a child process may remain\n")
+        sys.stderr.flush()
     rec = sanitize_record(rec)
     # schema は固定定数（`/` を含む）なので伏せ処理の対象外にして戻す
     rec["schema"] = SCHEMA

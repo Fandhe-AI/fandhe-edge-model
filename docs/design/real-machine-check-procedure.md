@@ -274,7 +274,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
@@ -287,7 +287,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
 4. 終了コード 0 = 要求したすべての項目が `ok`、10 = 1 つ以上が `failed` / `not_run`
 
-**中断の方式**: SIGINT・SIGTERM・SIGHUP を受けたハンドラは印を立てるだけで、子プロセスを待つループ（20 ミリ秒ごと）と項目の境目で印を見て、子のプロセスグループを止めて回収してから中断として扱う（止まるまでの遅れは待機の周期程度）。中断のシグナルを受けていれば、項目がすべて完了していても最終結果は中断（終了コード 70・`interrupted`）になる（項目の結果は記録に残る）。既知の限界: `setsid` で別セッションへ移った孫プロセスは止められず残る。KILL 自体が失敗した場合の待機に上限は無い。
+**中断の方式**: SIGINT・SIGTERM・SIGHUP を受けたハンドラは印を立てるだけで、子プロセスを待つループ（20 ミリ秒ごと）と項目の境目で印を見て、子のプロセスグループを止めて回収してから中断として扱う（止まるまでの遅れは待機の周期程度）。中断のシグナルを受けていれば、項目がすべて完了していても最終結果は中断（終了コード 70・`interrupted`）になる（項目の結果は記録に残る）。既知の限界: `setsid` で別セッションへ移った孫プロセスは止められず残る。子の回収の待機には上限（10 秒。`REAP_WAIT_LIMIT_SECONDS`）があり、KILL が失敗して回収できなければ待つのを諦めて先へ進む。このとき `record.json` の `child_may_remain` を `true` にし（既定は `false`）、その項目は `failed`（`reason` は `unreaped`）にして通常の合否判定へ流さず（fail-closed）、stderr に `a child process may remain` を 1 行出す。`record.md` にも警告行が出る。`ps` で残りを確認し、残っていれば手で止める。後始末が終わらないときのため、**同じ中断シグナルを 2 回受けると**、子のグループへ KILL を送って即座に終了コード 70 で終える（`record.json`・`record.md` は書かれず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` の 1 行。証拠種別: テストハーネス）。
 
 **項目ごとの成否判定**:
 
@@ -303,7 +303,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 **失敗時の報告の 5 点**:
 
 1. 終了コード
-2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名。組み込みの閉じた語彙で、語彙外は `<unexpected>`〕）
+2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable`・`unreaped`〔子の回収が上限時間内に終わらなかった。`child_may_remain` が `true`〕など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名。組み込みの閉じた語彙で、語彙外は `<unexpected>`〕）
 3. `step`（工程名。固定語彙：`register`・`inspect`・`train`・`select`・`evaluate`・`package`・`infer` など。工程が無い場合は省略）
 4. stdout の JSON（あれば）から `code`（7 種の語彙の値）・`message_bytes`・`message_sha256`（`message` の本文は記録されず、`<work-dir>` の stdout のファイルに残る）
 5. 実行したコマンド（固定語彙。パスは含めない）
@@ -369,6 +369,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   "schema": "real-machine-check/1",
   "evidence_hint": "requires_human_review" | "test_harness",
   "bin_override": true | false,
+  "child_may_remain": true | false (子の回収が上限時間内に終わらず、子・孫が残っている可能性。既定は false),
   "environment": null (項目の開始前に中断された場合) | {
     "hw_model": "string (^[A-Za-z0-9 ._,()+-]{1,64}$) or null",
     "cpu": "string (same rule) or null",
@@ -442,6 +443,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - `bin_override: true` の場合：「注意: CLI を `FANDHE_EDGE_BIN` で差し替えた（このスクリプトがビルドした CLI ではない）」
   あわせて「`commit`・`worktree_clean` は CLI の出所を表さない」旨が出ます
 - `environment.stable` が `false` の場合：「注意: 開始時と終了時で commit・worktree_clean・CLI の sha256 のいずれかが一致しない」
+- `child_may_remain` が `true` の場合：「注意: 子プロセスの回収が上限時間内に終わらなかった」（子・孫が残っている可能性。結果を採用しない）
 - 証拠の種別は「人が確認して記入」と指示されます
 - 「項目ごとの結果」の表の「要点」には、各項目の `record.json` の欄から `status`・`steps`・`package_files`・`capacity`・`p95`・`capacity_limit`・`message_sha256` を除いたものを JSON で出します（B は `total_bytes` と `capacity_sum_matches_total`、C は `p95` と `capacity_limit` を足す）。失敗の要点は `reason`・`step`・`exit_code` と、`code`・`message_bytes` です（`message_sha256` は `record.json` だけ）
 

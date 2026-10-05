@@ -20,8 +20,9 @@ use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use fandhe_edge_core::definition::MAX_LIMIT_INFER_P95_US;
@@ -216,7 +217,7 @@ ci)
 check-runtime-linkage)
   if [ -n "${FAKE_MAKE_SLEEP:-}" ]; then
     echo $$ > "$FAKE_DIR/make.pid"
-    sleep 60 &
+    sleep 300 &
     echo $! > "$FAKE_DIR/make.cpid"
     : > "$FAKE_DIR/make.started"
     wait
@@ -246,14 +247,17 @@ esac
 /// （カンマ区切り。`ok`・`inc`・`plain`・`zero`・`short`・`ignored`・`killed`・`overflow`・`unexec`）の
 /// n 番目で n 回目の結果を決める。`-- --list` も回数に数えず、`FAKE_LIST_COUNT`（既定 12）件を出す
 /// （`FAKE_LIST_RC` で終了コードを変える）。
-/// `FAKE_CARGO_BUILD_SLEEP`（`build` で長く待つ。ビルド中の中断のテスト用）。
+/// `FAKE_CARGO_BUILD_SLEEP`（`build` で長く待つ。ビルド中の中断のテスト用）・
+/// `FAKE_CARGO_BUILD_FAIL`（`build` が失敗する）。
 const FAKE_CARGO: &str = r##"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DIR/cargo.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cargo.env"
 if [ "$1" = build ]; then
+  # FAKE_CARGO_BUILD_FAIL: ビルド失敗（スクリプト自身の実行不能 70 の経路）
+  [ -n "${FAKE_CARGO_BUILD_FAIL:-}" ] && exit 1
   if [ -n "${FAKE_CARGO_BUILD_SLEEP:-}" ]; then
     echo $$ > "$FAKE_DIR/cargo.pid"
-    sleep 60 &
+    sleep 300 &
     echo $! > "$FAKE_DIR/cargo.cpid"
     : > "$FAKE_DIR/cargo.started"
     wait
@@ -294,6 +298,35 @@ esac
 struct Out {
     code: Option<i32>,
     stdout: String,
+    stderr: String,
+}
+
+impl Out {
+    /// 失敗時の表示用。stdout と stderr（上限つきで取得したもの）を並べる。
+    fn diag(&self) -> String {
+        format!("stdout={} stderr={}", self.stdout, self.stderr)
+    }
+}
+
+/// 子の出力の読み取り上限（失敗時の診断用。超えた分は読み捨ててパイプを詰まらせない。REQ-39）。
+const CAP_DIAG: u64 = 64 * 1024;
+/// 読み取りスレッドの結果を待つ上限（孫がパイプを握り続けても固まらない）。
+const DRAIN_WAIT: Duration = Duration::from_secs(10);
+
+/// 子の出力を別スレッドで上限つきで読む。先頭 `CAP_DIAG` バイトを結果として送り、残りは読み捨てる。
+fn drain<R: Read + Send + 'static>(mut r: R) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut r).take(CAP_DIAG).read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        let _ = std::io::copy(&mut r, &mut std::io::sink());
+    });
+    rx
+}
+
+fn collect(rx: &Receiver<String>) -> String {
+    rx.recv_timeout(DRAIN_WAIT).unwrap_or_default()
 }
 
 /// テストごとの作業ディレクトリと偽のコマンド群。
@@ -352,7 +385,7 @@ impl Env {
             .env("FANDHE_EDGE_CARGO_CMD", &self.cargo)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(d) = cwd {
             cmd.current_dir(d);
         }
@@ -368,13 +401,9 @@ impl Env {
 
     fn run_cwd(&self, args: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Out {
         let mut child = self.command(args, envs, cwd).spawn().expect("spawn sh");
-        let mut so = child.stdout.take().expect("stdout");
+        let rx_out = drain(child.stdout.take().expect("stdout"));
+        let rx_err = drain(child.stderr.take().expect("stderr"));
         let pgid = child.id();
-        let h_out = std::thread::spawn(move || {
-            let mut s = String::new();
-            so.read_to_string(&mut s).ok();
-            s
-        });
         let start = Instant::now();
         let status = loop {
             if let Some(st) = child.try_wait().expect("try_wait") {
@@ -387,14 +416,18 @@ impl Env {
                     .ok();
                 child.kill().ok();
                 child.wait().ok();
-                h_out.join().ok();
-                panic!("script timed out");
+                panic!(
+                    "script timed out: stdout={} stderr={}",
+                    collect(&rx_out),
+                    collect(&rx_err)
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         Out {
             code: status.code(),
-            stdout: h_out.join().expect("join"),
+            stdout: collect(&rx_out),
+            stderr: collect(&rx_err),
         }
     }
 
@@ -491,7 +524,7 @@ const JUDGED_FAIL: &str = "{\"code\":\"judged_fail\",\"message\":\"one or more r
 /// 渡した `--work-dir` も作られていないことを確かめる。
 fn assert_rejected_before_start(e: &Env, args: &[String], envs: &[(&str, &str)], message: &str) {
     let o = e.run(args, envs);
-    assert_eq!(o.code, Some(64), "args={args:?} stdout={}", o.stdout);
+    assert_eq!(o.code, Some(64), "args={args:?} {}", o.diag());
     assert_eq!(
         o.stdout,
         format!("{INVALID}{message}\"}}\n"),
@@ -653,7 +686,7 @@ fn req33_relative_bin_path_is_resolved() {
         &[("FANDHE_EDGE_BIN", "./fake-cli")],
         Some(&e.dir),
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("bin_override"), "true");
     assert_eq!(e.count_calls("register B"), 1);
 }
@@ -666,7 +699,7 @@ fn req33_normal_run_records_all_items() {
         &with_work(&e, &["--items", "B,C,D,E,F", "--repeat", "3"]),
         &[],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(
         o.stdout,
         "{\"code\":\"ok\",\"message\":\"all requested items completed\",\"record\":\"record.json\"}\n"
@@ -798,7 +831,7 @@ fn req38_offline_env_is_passed_except_to_make_ci() {
         &with_work(&e, &["--items", "A,B,D,F", "--repeat", "1", "--with-ci"]),
         &[],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(
         e.lines("make.env"),
         ["ci unset", "check-runtime-linkage true"]
@@ -820,7 +853,7 @@ fn req39_record_does_not_leak_path_body_or_id() {
         &with_work(&e, &["--items", "B,C,D,E,F", "--repeat", "2"]),
         &[("FAKE_LEAK", "1")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let json = e.text("record.json");
     let md = e.text("record.md");
     let mut forbidden = vec![
@@ -850,6 +883,7 @@ fn req39_record_does_not_leak_path_body_or_id() {
         ("record.json", &json),
         ("record.md", &md),
         ("stdout", &o.stdout),
+        ("stderr", &o.stderr),
     ] {
         for f in &forbidden {
             assert!(!text.contains(f.as_str()), "{name} contains {f:?}");
@@ -871,7 +905,7 @@ fn req21_step_failure_stops_following_steps_and_items() {
         &with_work(&e, &["--items", "B,C,D,E,F", "--repeat", "2"]),
         &[("FAKE_FAIL_STAGE", "train")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.B.status"), "\"failed\"");
     assert_eq!(e.q("items.B.reason"), "\"unexpected_exit_code\"");
@@ -908,7 +942,7 @@ fn req21_step_failure_stops_following_steps_and_items() {
 fn req27_evaluate_runs_exactly_once_per_project() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B,C"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     for entry in ["evaluate B", "evaluate C1", "evaluate C2"] {
         assert_eq!(e.count_calls(entry), 1, "{entry}");
     }
@@ -917,7 +951,7 @@ fn req27_evaluate_runs_exactly_once_per_project() {
         &with_work(&e, &["--items", "B,C"]),
         &[("FAKE_FAIL_STAGE", "evaluate")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.count_calls("evaluate B"), 1);
     assert_eq!(e.count_calls("evaluate C1"), 0);
     assert_eq!(e.count_calls("package B"), 0);
@@ -932,7 +966,7 @@ fn req39_item_f_runs_all_repeats_even_when_some_fail() {
         &with_work(&e, &["--items", "F", "--repeat", "6"]),
         &[("FAKE_CARGO_PATTERN", "ok,inc,plain,ok,inc,ok")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.F.status"), "\"failed\"");
     assert_eq!(e.q("items.F.reason"), "\"test_failures\"");
     assert_eq!(e.q("items.F.runs"), "6");
@@ -954,7 +988,7 @@ fn req39_item_f_counts_zero_tests_as_failure() {
         &with_work(&e, &["--items", "F", "--repeat", "3"]),
         &[("FAKE_CARGO_PATTERN", "ok,zero,zero")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.F.status"), "\"failed\"");
     assert_eq!(e.q("items.F.runs"), "3");
     assert_eq!(e.q("items.F.passed"), "1");
@@ -971,7 +1005,7 @@ fn req39_item_f_counts_zero_tests_as_failure() {
 fn req27_item_e_uses_train_inputs_not_evaluation_data() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B,E"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let train_ids = fixture_ids("train.jsonl");
     let eval_ids = fixture_ids("evaluation.jsonl");
     assert_eq!(train_ids.len(), 90);
@@ -1002,7 +1036,7 @@ fn req28_item_e_mismatch_fails_without_ids_in_record() {
         &with_work(&e, &["--items", "B,E"]),
         &[("FAKE_E_MISMATCH", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.E.status"), "\"failed\"");
     assert_eq!(e.q("items.E.reason"), "\"mismatch\"");
@@ -1042,7 +1076,7 @@ fn req28_item_e_requires_successful_b() {
         &with_work(&e, &["--items", "B,E"]),
         &[("FAKE_FAIL_STAGE", "train")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.E.status"), "\"not_run\"");
     assert_eq!(e.q("items.E.reason"), "\"previous_item_failed\"");
     assert_eq!(e.count_calls("infer B"), 0);
@@ -1055,14 +1089,14 @@ fn req28_item_e_requires_successful_b() {
 fn req39_make_ci_runs_only_with_with_ci() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B,D"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.lines("make.log"), ["check-runtime-linkage"]);
     assert_eq!(e.q("items.A.status"), "\"not_run\"");
     assert_eq!(e.q("items.A.reason"), "\"not_selected\"");
 
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "A", "--with-ci"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.lines("make.log"), ["ci"]);
     assert_eq!(e.q("options.with_ci"), "true");
     assert_eq!(e.q("items.A.status"), "\"ok\"");
@@ -1130,7 +1164,7 @@ fn req31_c1_p95_exceeded_is_recorded_not_failed() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C1_EXCEED", "1")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("items.C.status"), "\"ok\"");
     assert_eq!(e.q("items.C.p95.exceeded"), "true");
     assert_eq!(e.q("items.C.p95.package_exit_code"), "20");
@@ -1160,13 +1194,13 @@ fn req30_c2_unenforced_capacity_limit_fails() {
 fn req31_quiet_machine_under_harness_stays_reference_only() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "C", "--quiet-machine"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("items.C.p95.classification"), "\"reference_only\"");
     assert_eq!(e.q("options.quiet_machine"), "true");
     assert_eq!(e.q("evidence_hint"), "\"test_harness\"");
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "C"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("items.C.p95.classification"), "\"reference_only\"");
     assert_eq!(e.q("options.quiet_machine"), "false");
 }
@@ -1188,7 +1222,7 @@ fn req30_limit_options_reach_the_definition_limits() {
         ),
         &[],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let d1 = fs::read_to_string(e.dir.join("def-C1.json")).expect("C1 definition");
     let d2 = fs::read_to_string(e.dir.join("def-C2.json")).expect("C2 definition");
     assert!(
@@ -1233,7 +1267,7 @@ fn req31_p95_limit_at_max_is_accepted() {
         &with_work(&e, &["--items", "C", "--p95-limit-us", &max]),
         &[],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("items.C.status"), "\"ok\"");
     assert_eq!(e.q("items.C.p95.limit_us"), max);
     assert_eq!(e.q("options.p95_limit_us"), max);
@@ -1248,7 +1282,7 @@ fn req33_unset_bin_uses_cargo_reported_executable() {
         &with_work(&e, &["--items", "B"]),
         &[("FANDHE_EDGE_BIN", "")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(
         e.lines("cargo.args"),
         ["build --locked --release -p fandhe-edge-cli --bin fandhe-edge --message-format=json"]
@@ -1267,7 +1301,7 @@ fn req33_unset_bin_uses_cargo_reported_executable() {
 fn evidence_hint_and_record_md_header_for_harness_run() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "D"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let hint = e.q("evidence_hint");
     assert_eq!(hint, "\"test_harness\"");
     assert!(!hint.contains("real_machine"));
@@ -1288,73 +1322,87 @@ fn evidence_hint_and_record_md_header_for_harness_run() {
         &with_work(&e, &["--items", "D"]),
         &[("FANDHE_EDGE_BIN", "")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let md = e.text("record.md");
     assert!(md.contains("- bin_override: False\n"), "{md}");
     assert!(!md.contains("注意: CLI を"), "{md}");
 }
 
-/// REQ-21: SIGTERM を受けたら子のグループを止め、実行中の項目を `interrupted`、残りを `not_run` として
-/// record を書き、exit 70 と固定メッセージを返す。子プロセスは残らない。
-#[test]
-fn req21_sigterm_stops_children_and_records_interrupted() {
-    let e = Env::new();
-    let mut child = e
-        .command(
-            &with_work(&e, &["--items", "D,F", "--repeat", "2"]),
-            &[("FAKE_MAKE_SLEEP", "1")],
-            None,
-        )
-        .spawn()
-        .expect("spawn");
-    let started = e.dir.join("make.started");
+/// 起動済みのスクリプトと、stdout・stderr の読み取り口。
+struct Running {
+    child: Child,
+    out: Receiver<String>,
+    err: Receiver<String>,
+}
+
+/// スクリプトを起動し、偽コマンドが `started` ファイルを置く（子が走り出す）まで待つ。
+fn start_until(e: &Env, args: &[String], envs: &[(&str, &str)], started: &str) -> Running {
+    let mut child = e.command(args, envs, None).spawn().expect("spawn");
+    let out = drain(child.stdout.take().expect("stdout"));
+    let err = drain(child.stderr.take().expect("stderr"));
+    let mut r = Running { child, out, err };
+    let path = e.dir.join(started);
     let start = Instant::now();
-    while !started.exists() {
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "script exited early"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "make not started"
-        );
+    while !path.exists() {
+        if r.child.try_wait().expect("try_wait").is_some() {
+            panic!("script exited early: stderr={}", collect(&r.err));
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            r.kill_group();
+            panic!("{started} not created: stderr={}", collect(&r.err));
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    let status = loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "script did not stop"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .expect("stdout")
-        .read_to_string(&mut out)
-        .expect("read");
-    assert_eq!(status.code(), Some(70), "stdout={out}");
-    assert_eq!(
-        out,
-        "{\"code\":\"runtime_error\",\"message\":\"interrupted\",\"record\":\"record.json\"}\n"
-    );
-    assert_eq!(e.q("items.D.status"), "\"failed\"");
-    assert_eq!(e.q("items.D.reason"), "\"interrupted\"");
-    assert_eq!(e.q("items.F.status"), "\"not_run\"");
-    assert_eq!(e.q("items.F.reason"), "\"interrupted\"");
-    assert!(e.lines("cargo.args").is_empty());
-    // 偽 make と、その子の sleep が残っていない（kill -0 が失敗するまで短く待つ）
-    for name in ["make.pid", "make.cpid"] {
+    r
+}
+
+impl Running {
+    fn kill_group(&mut self) {
+        Command::new("kill")
+            .args(["-KILL", &format!("-{}", self.child.id())])
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+
+    /// スクリプト本体（python3 へ exec 済み）へシグナルを送る。送り先が既に無くても失敗にしない。
+    fn signal(&self, sig: &str) {
+        Command::new("kill")
+            .args([&format!("-{sig}"), &self.child.id().to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+    }
+
+    /// 終了を待つ。期限は呼び出した時点（シグナルを送った後）から測るので、止め損ねて
+    /// 偽コマンドの sleep が自然終了するのを待った場合は期限内に終わらず失敗する。
+    fn finish(mut self) -> (std::process::ExitStatus, String, String) {
+        let from = Instant::now();
+        let status = loop {
+            if let Some(st) = self.child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if from.elapsed() > Duration::from_secs(60) {
+                self.kill_group();
+                panic!(
+                    "script did not stop: stdout={} stderr={}",
+                    collect(&self.out),
+                    collect(&self.err)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        (status, collect(&self.out), collect(&self.err))
+    }
+}
+
+/// 偽コマンドが書いた pid が、短い猶予のうちに消える（子・孫が残らない）ことを確かめる。
+fn assert_pids_gone(e: &Env, names: &[&str]) {
+    for name in names {
         let pid = e.lines(name).first().cloned().expect("pid");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let alive = Command::new("kill")
                 .args(["-0", &pid])
@@ -1371,61 +1419,99 @@ fn req21_sigterm_stops_children_and_records_interrupted() {
     }
 }
 
+const INTERRUPTED: &str =
+    "{\"code\":\"runtime_error\",\"message\":\"interrupted\",\"record\":\"record.json\"}\n";
+
+/// 項目 D の `make` の実行中に `sig` を 1 回送り、子のグループを止めて record を書き exit 70 で終える。
+fn interrupt_during_make(sig: &str) {
+    let e = Env::new();
+    let r = start_until(
+        &e,
+        &with_work(&e, &["--items", "D,F", "--repeat", "2"]),
+        &[("FAKE_MAKE_SLEEP", "1")],
+        "make.started",
+    );
+    r.signal(sig);
+    let (status, out, err) = r.finish();
+    let code = status.code();
+    assert_eq!(code, Some(70), "stdout={out} stderr={err}");
+    assert_eq!(out, INTERRUPTED, "stderr={err}");
+    assert_eq!(e.q("items.D.status"), "\"failed\"");
+    assert_eq!(e.q("items.D.reason"), "\"interrupted\"");
+    assert_eq!(e.q("items.F.status"), "\"not_run\"");
+    assert_eq!(e.q("items.F.reason"), "\"interrupted\"");
+    assert!(e.lines("cargo.args").is_empty());
+    assert_pids_gone(&e, &["make.pid", "make.cpid"]);
+}
+
+/// REQ-21: SIGTERM を受けたら子のグループを止め、実行中の項目を `interrupted`、残りを `not_run` として
+/// record を書き、exit 70 と固定メッセージを返す。子プロセスは残らない。
+#[test]
+fn req21_sigterm_stops_children_and_records_interrupted() {
+    interrupt_during_make("TERM");
+}
+
+/// REQ-21: SIGINT でも SIGTERM と同じ（Ctrl-C。子を止め、record を書き、exit 70）。
+#[test]
+fn req21_sigint_stops_children_and_records_interrupted() {
+    interrupt_during_make("INT");
+}
+
+/// REQ-21: SIGHUP でも SIGTERM と同じ（端末を閉じた場合）。
+#[test]
+fn req21_sighup_stops_children_and_records_interrupted() {
+    interrupt_during_make("HUP");
+}
+
+/// REQ-21・REQ-39: 同じシグナルを続けて 2 回受けても、exit 70・固定 JSON 1 行（record あり、または
+/// 強制終了の固定メッセージ）で終わり、偽 make とその子は残らない。2 回目が先に処理されて強制終了に
+/// なるか、1 回目の後始末が先に終わって record が書かれるかは時間次第で、仕様はどちらも許す。
+/// 決定的な強制終了の検証は Python 側（`test_second_signal_forces_exit_while_cleanup_is_stuck`）。
+#[test]
+fn req21_double_sigterm_exits_70_without_leftover_children() {
+    let e = Env::new();
+    let r = start_until(
+        &e,
+        &with_work(&e, &["--items", "D,F"]),
+        &[("FAKE_MAKE_SLEEP", "1")],
+        "make.started",
+    );
+    r.signal("TERM");
+    r.signal("TERM");
+    let (status, out, err) = r.finish();
+    let code = status.code();
+    // 2 回目が、1 回目の後始末を終えた python3 の終了処理中（ハンドラの復元後）に届くと、既定の動作で
+    // SIGTERM により終わる。この場合も record は書き終えている（stdout が `interrupted` の固定 JSON）
+    if code.is_none() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(15), "stdout={out} stderr={err}");
+        assert_eq!(out, INTERRUPTED, "stderr={err}");
+        assert_pids_gone(&e, &["make.pid", "make.cpid"]);
+        return;
+    }
+    assert_eq!(code, Some(70), "stdout={out} stderr={err}");
+    let forced = "{\"code\":\"runtime_error\",\"message\":\"interrupted (forced exit)\"}\n";
+    assert!(out == INTERRUPTED || out == forced, "stdout={out:?}");
+    assert_pids_gone(&e, &["make.pid", "make.cpid"]);
+}
+
 /// REQ-21: CLI のビルド中（項目の開始前）に SIGTERM を受けても、記録の骨格から `record.json`・`record.md` を書き、
 /// exit 70 と `record` 付きの固定メッセージを返す。選んだ項目は `interrupted`、他は `not_selected`。
 /// 環境の採取は未了のため `environment` は null。偽 cargo と子の sleep は残らない。
 #[test]
 fn req21_sigterm_during_cli_build_still_writes_record() {
     let e = Env::new();
-    let mut child = e
-        .command(
-            &with_work(&e, &["--items", "D,F"]),
-            &[("FANDHE_EDGE_BIN", ""), ("FAKE_CARGO_BUILD_SLEEP", "1")],
-            None,
-        )
-        .spawn()
-        .expect("spawn");
-    let started = e.dir.join("cargo.started");
-    let start = Instant::now();
-    while !started.exists() {
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "script exited early"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "cargo build not started"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    // 期限はシグナルを送った時点から測る（止め損ねて子の自然終了を待った場合と区別する）
-    let sent = Instant::now();
-    let status = loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
-        }
-        assert!(
-            sent.elapsed() < Duration::from_secs(30),
-            "script did not stop"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .expect("stdout")
-        .read_to_string(&mut out)
-        .expect("read");
-    assert_eq!(status.code(), Some(70), "stdout={out}");
-    assert_eq!(
-        out,
-        "{\"code\":\"runtime_error\",\"message\":\"interrupted\",\"record\":\"record.json\"}\n"
+    let r = start_until(
+        &e,
+        &with_work(&e, &["--items", "D,F"]),
+        &[("FANDHE_EDGE_BIN", ""), ("FAKE_CARGO_BUILD_SLEEP", "1")],
+        "cargo.started",
     );
+    r.signal("TERM");
+    let (status, out, err) = r.finish();
+    let code = status.code();
+    assert_eq!(code, Some(70), "stdout={out} stderr={err}");
+    assert_eq!(out, INTERRUPTED, "stderr={err}");
     for item in ["D", "F"] {
         assert_eq!(e.q(&format!("items.{item}.status")), "\"not_run\"");
         assert_eq!(e.q(&format!("items.{item}.reason")), "\"interrupted\"");
@@ -1435,22 +1521,99 @@ fn req21_sigterm_during_cli_build_still_writes_record() {
     assert_eq!(e.q("environment"), "null");
     assert_eq!(e.q("inputs.train_records"), "90");
     assert!(e.work.join("record.md").exists(), "record.md missing");
-    for name in ["cargo.pid", "cargo.cpid"] {
-        let pid = e.lines(name).first().cloned().expect("pid");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let alive = Command::new("kill")
-                .args(["-0", &pid])
-                .stderr(Stdio::null())
-                .status()
-                .expect("kill -0")
-                .success();
-            if !alive {
-                break;
-            }
-            assert!(Instant::now() < deadline, "{name} ({pid}) still alive");
-            std::thread::sleep(Duration::from_millis(50));
+    assert_pids_gone(&e, &["cargo.pid", "cargo.cpid"]);
+}
+
+/// REQ-21: ラッパーの終了コードと stdout の `code` が対応する（0=ok・10=judged_fail・64=invalid_input・
+/// 70=runtime_error。ビルド失敗）。
+#[test]
+fn req21_script_propagates_exit_code_and_stdout_json() {
+    let one_line = |o: &Out, code: &str| {
+        assert_eq!(o.stdout.lines().count(), 1, "{}", o.diag());
+        assert!(
+            o.stdout.starts_with(&format!("{{\"code\":\"{code}\"")),
+            "{}",
+            o.diag()
+        );
+    };
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "D"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    one_line(&o, "ok");
+
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[("FAKE_FAIL_STAGE", "train")],
+    );
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    one_line(&o, "judged_fail");
+
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "Z"]), &[]);
+    assert_eq!(o.code, Some(64), "{}", o.diag());
+    one_line(&o, "invalid_input");
+
+    // Python 側の 70: CLI のビルドに失敗する
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "D"]),
+        &[("FANDHE_EDGE_BIN", ""), ("FAKE_CARGO_BUILD_FAIL", "1")],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.diag());
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"cannot build the CLI\"}\n",
+        "{}",
+        o.diag()
+    );
+}
+
+/// REQ-39: 記号・空白・改行を含む `--work-dir` と `FANDHE_EDGE_BIN` が、シェルに解釈されずそのまま
+/// 渡る。注入のための副作用（`touch pwned`）が起きず、record は指定した場所にできる。
+#[test]
+fn req39_symbols_and_newlines_in_paths_pass_through_verbatim() {
+    let e = Env::new();
+    let weird = "we ird$(touch pwned)'\"\n;`touch pwned2`name";
+    let work = e.dir.join(weird);
+    let bin_dir = e.dir.join("b in$(touch pwned3)");
+    fs::create_dir_all(&bin_dir).expect("mkdir");
+    let bin = bin_dir.join("fake-cli");
+    write_exe(&bin, FAKE_CLI);
+    let o = e.run_cwd(
+        &s(&["--work-dir", &work.display().to_string(), "--items", "B"]),
+        &[("FANDHE_EDGE_BIN", &bin.display().to_string())],
+        Some(&e.dir),
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert!(work.join("record.json").is_file(), "record.json missing");
+    for name in ["pwned", "pwned2", "pwned3"] {
+        assert!(!e.dir.join(name).exists(), "{name} was created");
+        assert!(!work.join(name).exists(), "{name} was created");
+    }
+}
+
+/// REQ-39: 記号を含む不正な値は、値をエコーせずに 64 で拒否される。注入の副作用も起きない。
+#[test]
+fn req39_invalid_values_with_symbols_are_rejected_without_echo() {
+    let e = Env::new();
+    let cases: [&[&str]; 4] = [
+        &["--items", "B;touch pwned"],
+        &["--items", "B\nC"],
+        &["--repeat", "1;touch pwned"],
+        &["--p95-limit-us", "1 2"],
+    ];
+    for extra in cases {
+        let o = e.run(&with_work(&e, extra), &[]);
+        assert_eq!(o.code, Some(64), "{}", o.diag());
+        assert!(o.stdout.starts_with(INVALID), "{}", o.diag());
+        assert_eq!(o.stdout.lines().count(), 1, "{}", o.diag());
+        for v in extra.iter().skip(1) {
+            assert!(!o.stdout.contains(v), "value echoed: {}", o.diag());
+            assert!(!o.stderr.contains(v), "value echoed: {}", o.diag());
         }
+        assert!(!e.dir.join("pwned").exists());
+        assert!(!e.work.exists(), "work dir created for {extra:?}");
     }
 }
 
@@ -1464,7 +1627,7 @@ fn req30_c2_wrong_limit_or_inconsistent_excess_fails() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C2_LIMIT_WRONG", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.C.status"), "\"failed\"");
     assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
@@ -1474,7 +1637,7 @@ fn req30_c2_wrong_limit_or_inconsistent_excess_fails() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C2_MODE", "small")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     // total_bytes <= limit_bytes の exceeded:true は package の報告値の不整合として工程で止まる
     assert_eq!(e.q("items.C.status"), "\"failed\"");
     assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
@@ -1492,7 +1655,7 @@ fn req31_c1_inconsistent_p95_excess_fails() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C1_EXCEED", "low")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.C.status"), "\"failed\"");
     assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.C.case"), "\"C-1\"");
@@ -1506,7 +1669,7 @@ fn req39_term_ignoring_grandchild_does_not_outlive_script() {
         &with_work(&e, &["--items", "D"]),
         &[("FAKE_MAKE_ORPHAN", "1")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let pid = e.lines("orphan.pid").first().cloned().expect("pid");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1530,7 +1693,7 @@ fn req39_term_ignoring_grandchild_does_not_outlive_script() {
 fn req33_evaluate_n_total_mismatch_fails_b() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B"]), &[("FAKE_EVAL_N", "13")]);
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.B.status"), "\"failed\"");
     assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
@@ -1546,7 +1709,7 @@ fn req33_infer_label_outside_options_fails_b() {
         &with_work(&e, &["--items", "B"]),
         &[("FAKE_INFER_BAD_LABEL", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.B.status"), "\"failed\"");
     assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.B.step"), "\"infer\"");
@@ -1560,7 +1723,7 @@ fn req31_c1_exit_20_with_published_package_fails() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C1_EXCEED", "1"), ("FAKE_C1_KEEPDIR", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.C.status"), "\"failed\"");
     assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.C.case"), "\"C-1\"");
@@ -1575,7 +1738,7 @@ fn req32_item_d_requires_exactly_three_env_i_tests() {
         &with_work(&e, &["--items", "D"]),
         &[("FAKE_LINK_MODE", "two")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.D.status"), "\"failed\"");
     assert_eq!(e.q("items.D.reason"), "\"unexpected_output\"");
@@ -1587,7 +1750,7 @@ fn req32_item_d_requires_exactly_three_env_i_tests() {
 fn req28_item_e_duplicate_batch_id_fails() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B,E"]), &[("FAKE_E_DUP", "1")]);
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.E.status"), "\"failed\"");
     assert_eq!(e.q("items.E.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.E.step"), "\"infer-batch\"");
@@ -1603,7 +1766,7 @@ fn req28_item_e_score_difference_within_1e9_fails() {
         &with_work(&e, &["--items", "B,E"]),
         &[("FAKE_BAD", "batch_score_shift")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, JUDGED_FAIL);
     assert_eq!(e.q("items.E.status"), "\"failed\"");
     assert_eq!(e.q("items.E.reason"), "\"mismatch\"");
@@ -1713,7 +1876,7 @@ fn req39_summary_is_built_from_allowlisted_fields_only() {
         &with_work(&e, &["--items", "B,C,E", "--repeat", "1"]),
         &[("FAKE_LEAK", "1")],
     );
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let json = e.text("record.json");
     let md = e.text("record.md");
     for (name, text) in [
@@ -1754,7 +1917,7 @@ fn req39_failed_stage_message_is_recorded_as_size_and_hash_only() {
             ("FAKE_FAIL_MSG", "SECRET_BODY_7c1 and more"),
         ],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     for (name, text) in [
         ("record.json", e.text("record.json")),
         ("record.md", e.text("record.md")),
@@ -1779,7 +1942,7 @@ fn req39_nested_status_and_code_do_not_reach_record() {
         &with_work(&e, &["--items", "B"]),
         &[("FAKE_INFER_STATUS_NESTED", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.B.status"), "\"failed\"");
     assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.B.step"), "\"infer\"");
@@ -1793,7 +1956,7 @@ fn req39_nested_status_and_code_do_not_reach_record() {
         &with_work(&e, &["--items", "C"]),
         &[("FAKE_C2_CODE_NESTED", "1")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.C.status"), "\"failed\"");
     for text in [e.text("record.json"), e.text("record.md"), o.stdout.clone()] {
         assert!(!text.contains(LEAK_BODY));
@@ -1806,7 +1969,7 @@ fn req39_nested_status_and_code_do_not_reach_record() {
 fn req39_unrecognized_package_file_name_is_not_recorded() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "B"]), &[("FAKE_PKG_ODD", "1")]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     let json = e.text("record.json");
     assert!(!json.contains("odd name"), "{json}");
     assert!(!e.text("record.md").contains("odd name"));
@@ -1830,7 +1993,7 @@ fn req30_c_staging_left_fails() {
     }
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "C"]), &[]);
-    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
     assert_eq!(e.q("items.C.p95.package_staging_present"), "false");
     assert_eq!(
         e.q("items.C.capacity_limit.package_staging_present"),
@@ -1915,7 +2078,7 @@ fn req39_item_f_list_failures_fail_closed() {
         &with_work(&e, &["--items", "F"]),
         &[("FAKE_LIST_COUNT", "0")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert!(e.lines("cargo.count").is_empty());
 }
 
@@ -1928,7 +2091,7 @@ fn req39_item_f_counts_each_failure_kind() {
         &with_work(&e, &["--items", "F", "--repeat", "3"]),
         &[("FAKE_CARGO_PATTERN", "ok,short,ignored")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.F.status"), "\"failed\"");
     assert_eq!(e.q("items.F.reason"), "\"test_failures\"");
     assert_eq!(e.q("items.F.expected_tests"), "12");
@@ -1943,7 +2106,7 @@ fn req39_item_f_counts_each_failure_kind() {
         &with_work(&e, &["--items", "F", "--repeat", "2"]),
         &[("FAKE_LIST_COUNT", "5"), ("FAKE_CARGO_PATTERN", "short,ok")],
     );
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.F.expected_tests"), "5");
     assert_eq!(e.q("items.F.passed"), "1");
     assert_eq!(e.q("items.F.count_mismatch"), "1");

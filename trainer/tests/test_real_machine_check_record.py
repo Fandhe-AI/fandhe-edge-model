@@ -448,8 +448,9 @@ def test_find_built_executable_reads_compiler_artifact(tmp_path: Path) -> None:
     assert mod.find_built_executable("") is None
 
 
-def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
-    """REQ-39: SIGTERM で子グループを残さず、中断時点の record を書き exit 70 で終える。"""
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_interrupt_stops_children_and_writes_record(tmp_path: Path, sig: int) -> None:
+    """REQ-39: SIGINT・SIGTERM・SIGHUP で子グループを残さず、record を書き exit 70 で終える。"""
     pidfile = tmp_path / "pids"
     make = _script(
         tmp_path,
@@ -492,7 +493,7 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
             break
         time.sleep(0.05)
     pids = [int(x) for x in pidfile.read_text().split()]
-    proc.send_signal(signal.SIGTERM)
+    proc.send_signal(sig)
     out, _ = proc.communicate(timeout=30)
     assert proc.returncode == 70
     assert json.loads(out) == {
@@ -515,8 +516,14 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
 def _reset_interrupt_mark() -> Any:
     """モジュールの中断の印を、各テストの前後で下ろす（テスト間で引き継がない）。"""
     mod._interrupt_requested = False
+    mod._signal_count = 0
+    mod._active_pgid = None
+    mod._child_may_remain = False
     yield
     mod._interrupt_requested = False
+    mod._signal_count = 0
+    mod._active_pgid = None
+    mod._child_may_remain = False
 
 
 def _wait_for(pred: Any, seconds: float = 30.0) -> bool:
@@ -861,7 +868,17 @@ def _run(tmp_path: Path, argv: list[str], name: str = "o") -> Any:
     return mod.run_cmd(argv, tmp_path, tmp_path / name, tmp_path / (name + ".e"), 20, 4096, 4096)
 
 
-@pytest.mark.parametrize(("script", "want"), [("exit 0", 0), ("exit 20", 20), ("kill -9 $$", 137)])
+@pytest.mark.parametrize(
+    ("script", "want"),
+    [
+        ("exit 0", 0),
+        ("exit 1", 1),
+        ("exit 20", 20),
+        ("exit 127", 127),
+        ("exit 255", 255),
+        ("kill -9 $$", 137),
+    ],
+)
 def test_run_cmd_propagates_exit_code_through_wrapper(
     tmp_path: Path, script: str, want: int
 ) -> None:
@@ -3162,3 +3179,178 @@ def test_nonzero_exit_with_non_json_reports_unexpected_exit_code(tmp_path: Path)
         "exit_code": 64,
         "exit_code_unexpected": True,
     }
+
+
+def test_run_cmd_gives_up_waiting_when_the_group_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: KILL が失敗し回収が終わらなくても、上限で諦めて `unreaped` を返す。"""
+    pidfile = tmp_path / "pid"
+    real_wait = subprocess.Popen.wait
+    seen: list[int] = []
+
+    def fake_wait(self: Any, timeout: float | None = None) -> int:
+        seen.append(self.pid)
+        if timeout is None:
+            raise AssertionError("wait without a timeout")
+        time.sleep(timeout)
+        raise subprocess.TimeoutExpired("x", timeout)
+
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+    monkeypatch.setattr(mod, "REAP_WAIT_LIMIT_SECONDS", 0.5)
+    monkeypatch.setattr(subprocess.Popen, "wait", fake_wait)
+    mod._interrupt_requested = False
+    started = time.monotonic()
+    try:
+        r = mod.run_cmd(
+            ["/bin/sh", "-c", f'echo $$ > "{pidfile}"; exec sleep 60'],
+            tmp_path,
+            tmp_path / "o",
+            tmp_path / "o.e",
+            1,
+            4096,
+            4096,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(subprocess.Popen, "wait", real_wait)
+        for pid in seen:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+    assert (r.exit_code, r.reason) == (None, "unreaped")
+    assert mod._child_may_remain is True
+    assert mod._active_pgid is None
+    assert elapsed < 10.0
+
+
+def test_run_cmd_leaves_child_may_remain_false_on_the_normal_path(tmp_path: Path) -> None:
+    """REQ-39: 通常の回収では `child_may_remain` は立たない。"""
+    r = _run(tmp_path, ["/bin/sh", "-c", "exit 0"])
+    assert (r.exit_code, r.reason) == (0, None)
+    assert mod._child_may_remain is False
+    assert mod._active_pgid is None
+
+
+def test_unreaped_child_is_recorded_as_a_failed_item_with_child_may_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: 回収を諦めたら record に `child_may_remain: true`、項目は failed（10）。"""
+
+    def fake_item(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._child_may_remain = True
+        return mod.fail_item("unreaped"), b_ok
+
+    rc, rec = _run_in_process(tmp_path, "B", fake_item, monkeypatch)
+    assert rc == 10
+    assert rec["child_may_remain"] is True
+    assert rec["items"]["B"] == {"status": "failed", "reason": "unreaped"}
+    assert (
+        "子プロセスの回収が上限時間内に終わらなかった" in (tmp_path / "w" / "record.md").read_text()
+    )
+    assert "a child process may remain" in capsys.readouterr().err
+
+
+def test_normal_record_has_child_may_remain_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 既定の record では `child_may_remain` は false。"""
+    rc, rec = _run_in_process(
+        tmp_path, "B", lambda ctx, name, b_ok: (mod.fail_item("x"), b_ok), monkeypatch
+    )
+    assert rec["child_may_remain"] is False
+    assert rc == 10
+
+
+def test_second_signal_forces_exit_while_cleanup_is_stuck(tmp_path: Path) -> None:
+    """REQ-39: 後始末が固まっても、シグナルの 2 回目で子を KILL し exit 70 で強制終了する。"""
+    pidfile = tmp_path / "pids"
+    make = _script(
+        tmp_path,
+        "fake-make",
+        f'trap "" TERM\necho $$ >> "{pidfile}"\nsleep 60 &\necho $! >> "{pidfile}"\nwait\n',
+    )
+    launcher = tmp_path / "launch.py"
+    launcher.write_text(
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['m'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "m._kill_group = lambda pid: True\n"
+        "m.REAP_WAIT_LIMIT_SECONDS = 120\n"
+        "sys.exit(m.main(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    env = dict(os.environ, FANDHE_EDGE_MAKE_CMD=str(make))
+    proc = subprocess.Popen(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+        [
+            sys.executable,
+            str(launcher),
+            "run",
+            "--repo-root",
+            str(REPO),
+            "--work-dir",
+            str(work),
+            "--bin",
+            str(_fake_cli(tmp_path, "exit 0\n")),
+            "--bin-override",
+            "--items",
+            "D",
+            "--repeat",
+            "1",
+            "--p95-limit-us",
+            "50000",
+            "--package-limit-bytes",
+            "1000",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert _wait_for(lambda: len(_pids(pidfile)) >= 2)
+        pids = _pids(pidfile)
+        proc.send_signal(signal.SIGTERM)
+        # 後始末は固まっている（KILL を送らない模擬）ので、1 回目では終わらない
+        time.sleep(1.0)
+        assert proc.poll() is None
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for pid in _pids(pidfile):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    assert proc.returncode == 70
+    assert json.loads(out) == {
+        "code": "runtime_error",
+        "message": "interrupted (forced exit)",
+    }
+    assert not (work / "record.json").exists()
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def test_run_cmd_timeout_kills_term_ignoring_grandchild(tmp_path: Path) -> None:
+    """REQ-39: 期限超過（timeout）でも、TERM を無視する孫まで止める。"""
+    pidfile = tmp_path / "pids"
+    script = f'trap "" TERM; sleep 60 & echo $! > "{pidfile}"; wait'
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", script], tmp_path, tmp_path / "o", tmp_path / "o.e", 1, 4096, 4096
+    )
+    assert (r.exit_code, r.reason) == (None, "timeout")
+    pids = _pids(pidfile)
+    assert len(pids) == 1
+    assert _wait_for(lambda: not _alive(pids[0]), 10)
