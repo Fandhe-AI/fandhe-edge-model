@@ -99,9 +99,9 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 必要環境: Mac（Apple Silicon）・Python 3.9 以上・`make py-sync` 済みの `trainer/.venv`・MLX CPU・`cargo fetch --locked` 済みの依存（通信を伴うため承認を得てから実行する。`make setup` は cargo の依存を取得しない。REQ-38）
 - 環境変数: `FANDHE_EDGE_BIN`（`/` を含む相対・絶対パス。未設定なら `cargo build --locked` で 1800 秒・ビルド失敗は exit 70。差し替えた CLI が cargo のビルドした CLI とバイト単位で同一でない限り D は失敗する〔代役の下では照合しない〕）・`FANDHE_EDGE_MAKE_CMD` / `FANDHE_EDGE_CARGO_CMD`（**絶対パスの実行ファイル**。テスト用。どちらか設定時は `evidence_hint:"test_harness"` に変わり、`otool` は実行されず `direct_libraries:null`）
 - 通信抑止（REQ-38）: A 以外の子プロセスに `CARGO_NET_OFFLINE=true` を渡す。`cargo build --locked` / `cargo test --locked` でビルド・テスト。未構築依存の場合は失敗
-- 実行フロー: A→F の順で各項目を実行。最初の `failed` 項目で以降の項目は `not_run`（`previous_item_failed`）になる。E は B が要求されていなければ `not_run`（`requires_B`）。SIGINT・SIGTERM・SIGHUP で中断時は子を止めて `record.json` を書く（当時点までの結果。中断項目の `reason` は `interrupted`）
+- 実行フロー: A→F の順で各項目を実行。最初の `failed` 項目で以降の項目は `not_run`（`previous_item_failed`）になる。E は B が要求されていなければ `not_run`（`requires_B`）。SIGINT・SIGTERM・SIGHUP で中断時は子を止めて `record.json`・`record.md` を書く（当時点までの結果。中断項目の `reason` は `interrupted`）。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）の中断でも書き、選んだ項目はすべて `not_run` / `interrupted`、未採取の `environment`・`inputs` は `null`（ビルド中の中断では `inputs` は値あり）。ハンドラは印を立てるだけで、子の待機ループ（20 ミリ秒ごと）と項目の境目で印を見て子のプロセスグループを止める。印が立っていれば項目がすべて完了していても最終結果は中断（exit 70）。fixture が読めない・CLI のビルド失敗は `record.json` なしで exit 70
 - 出力: stdout に JSON 1 行（`{"code":"...","message":"...","record":"record.json"}`）+ `<work-dir>/record.json`・`record.md`
-- 終了コード: 0（要求項目すべて `ok`）・10（1 項目以上 `failed` / `not_run`）・64（引数エラー）・70（実行環境エラー・中断・項目の想定外の例外〔`reason:"internal_error"`〕。中断時と `internal_error` 時も `record.json` あり）
+- 終了コード: 0（要求項目すべて `ok`）・10（1 項目以上 `failed` / `not_run`）・64（引数エラー）・70（実行環境エラー・中断・項目の想定外の例外〔`reason:"internal_error"`〕。中断時と `internal_error` 時も `record.json` あり。中断時の stdout は `{"code":"runtime_error","message":"interrupted","record":"record.json"}`）
 - 作業ディレクトリ: umask 077・chmod 700（ユーザーのみ読み書き可。中に生の stdout・入力ファイルがあるため共有・転記しない）
 - 人の担当: 実機での実行。`evidence_hint` の確認（MAKE_CMD / CARGO_CMD 無い場合は `requires_human_review`、有れば `test_harness`）。`bin_override:true` 時は「差し替えた CLI は実証拠にならない」を確認。`--quiet-machine` は人の申告で、実際に他のアプリを閉じた静かな状態のみを「実機」として扱う。E は学習データ（`train.jsonl`）のみ使用（REQ-27）
 - Agent の範囲: スクリプト・手順書の準備まで。実機での実行・確定は人が行う。テストハーネス結果（MAKE_CMD / CARGO_CMD 設定時）を実機証拠と混ぜない

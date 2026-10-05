@@ -269,19 +269,21 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--work-dir` がリポジトリ内、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
 1. 要求した項目（`--items LIST`）を A→F の順で実行する
 2. 各項目の実行：
    - 要求されていない → `not_run` / `not_selected`
-   - 中断済み → `not_run` / `interrupted`
+   - 中断済み → `not_run` / `interrupted`（前の項目が `failed` の場合よりも優先する）
    - 前の項目が `failed` → `not_run` / `previous_item_failed`（B の失敗で止まった E もこれ）
    - E で B が要求されておらず成功していない → `not_run` / `requires_B`
    - それ以外 → 実行して結果を記録
 3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
 4. 終了コード 0 = 要求したすべての項目が `ok`、10 = 1 つ以上が `failed` / `not_run`
+
+**中断の方式**: SIGINT・SIGTERM・SIGHUP を受けたハンドラは印を立てるだけで、子プロセスを待つループ（20 ミリ秒ごと）と項目の境目で印を見て、子のプロセスグループを止めて回収してから中断として扱う（止まるまでの遅れは待機の周期程度）。中断のシグナルを受けていれば、項目がすべて完了していても最終結果は中断（終了コード 70・`interrupted`）になる（項目の結果は記録に残る）。既知の限界: `setsid` で別セッションへ移った孫プロセスは止められず残る。KILL 自体が失敗した場合の待機に上限は無い。
 
 **項目ごとの成否判定**:
 
@@ -360,7 +362,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   "schema": "real-machine-check/1",
   "evidence_hint": "requires_human_review" | "test_harness",
   "bin_override": true | false,
-  "environment": {
+  "environment": null (項目の開始前に中断された場合) | {
     "hw_model": "string (^[A-Za-z0-9 ._,()+-]{1,64}$) or null",
     "cpu": "string (same rule) or null",
     "ncpu": "int (ASCII digits, 1-20) or null",
@@ -376,7 +378,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
     "cli_bytes": "int or null",
     "cli_profile": "release" | null
   },
-  "inputs": {
+  "inputs": null (項目の開始前に中断された場合) | {
     "train_records": "int",
     "evaluation_records": "int",
     "definition_sha256": "64-char hex",
@@ -405,7 +407,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
-- `interrupted`: 実行中に SIGINT・SIGTERM・SIGHUP で中断
+- `interrupted`: 実行中（項目の開始前を含む）に SIGINT・SIGTERM・SIGHUP で中断。前の項目が `failed` で止まった後に中断を受けた場合も、未実行の項目はこの値になる（`previous_item_failed` より優先）
 - `requires_B`: E で B が要求されていない（B が失敗した場合は `previous_item_failed`）
 
 ### `record.md`
