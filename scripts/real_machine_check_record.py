@@ -2681,5 +2681,29 @@ def main(argv: list[str] | None = None) -> int:
         return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, False)
 
 
+def _ignore_interrupt_signals() -> None:
+    """中断シグナルをすべて無視へ設定する（プロセスの終了直前にだけ呼ぶ）。
+
+    最終の JSON を出した後、インタプリタの終了処理は Python のハンドラを既定の動作へ戻す。
+    その窓へ 2 回目のシグナルが届くと exit 70 でなくシグナルで終わるため、明示的に
+    `SIG_IGN` にして終了コードを 70 に保つ（`SIG_IGN` は終了処理で既定へ戻されない）。
+    `run`・`emit` の中では呼ばない（同じプロセスで `run` を呼ぶ pytest が中断を受けられなくなる）。
+    REQ-21・REQ-39。
+    """
+    for s in INTERRUPT_SIGNALS:
+        try:
+            signal.signal(s, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+
+
+def _entry(argv: list[str] | None = None) -> int:
+    """プロセスの入口。`main` から抜けるすべての経路（SystemExit・例外を含む）で無視へ設定する。"""
+    try:
+        return main(argv)
+    finally:
+        _ignore_interrupt_signals()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())

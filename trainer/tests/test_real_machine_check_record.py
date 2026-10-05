@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import stat
@@ -3520,3 +3521,128 @@ def test_build_cli_unreaped_reports_child_may_remain(
         for s, h in saved.items():
             signal.signal(s, h)
     assert "a child process may remain" in capsys.readouterr().err
+
+
+def test_entry_ignores_interrupt_signals_on_every_exit_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-21・REQ-39: 入口は戻る・SystemExit・例外のどの経路でも中断シグナルを SIG_IGN にする。"""
+    assert mod.INTERRUPT_SIGNALS == (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+
+    def reset() -> None:
+        for s in mod.INTERRUPT_SIGNALS:
+            signal.signal(s, mod._on_signal)
+
+    def current() -> list[Any]:
+        return [signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS]
+
+    def raise_exit(argv: Any = None) -> int:
+        raise SystemExit(64)
+
+    def raise_err(argv: Any = None) -> int:
+        raise RuntimeError("x")
+
+    try:
+        reset()
+        monkeypatch.setattr(mod, "main", lambda argv=None: 70)
+        assert mod._entry([]) == 70
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+
+        reset()
+        monkeypatch.setattr(mod, "main", raise_exit)
+        with pytest.raises(SystemExit) as ei:
+            mod._entry([])
+        assert ei.value.code == 64
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+
+        reset()
+        monkeypatch.setattr(mod, "main", raise_err)
+        with pytest.raises(RuntimeError):
+            mod._entry([])
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+
+def test_main_itself_does_not_leave_signals_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: `main`（`run`・`emit` を含む）は SIG_IGN にしない。無視は `_entry` だけが行う。
+
+    `run` がハンドラを登録し、`emit` まで届く経路（項目 B を偽物に差し替えた最小の実行）で
+    `main` を呼び、戻った時点で 3 シグナルのハンドラが `_on_signal` のままであることを確かめる。
+    `emit` に SIG_IGN の設定を入れるとこのテストは落ちる。
+    """
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    # `emit` は `_final_emitted` を True のまま残す。後続のテストへ持ち越さないよう復元を登録する
+    monkeypatch.setattr(mod, "_final_emitted", mod._final_emitted)
+    monkeypatch.setattr(mod, "run_item", lambda ctx, name, b_ok: ({"status": "ok"}, True))
+    (tmp_path / "w").mkdir()
+    argv = ["run", "--repo-root", str(REPO), "--work-dir", str(tmp_path / "w")]
+    argv += ["--bin", str(_fake_cli(tmp_path, "exit 0\n")), "--bin-override", "--items", "B"]
+    argv += ["--repeat", "1", "--p95-limit-us", "1", "--package-limit-bytes", "1"]
+    try:
+        for s in mod.INTERRUPT_SIGNALS:
+            signal.signal(s, signal.SIG_DFL)  # `run` が登録した結果だけを検出する
+        rc = mod.main(argv)
+        handlers = [signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS]
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    out = json.loads(capsys.readouterr().out)
+    assert out["record"] == "record.json"  # emit まで到達した
+    assert rc == 0
+    assert handlers == [mod._on_signal] * 3
+
+
+_TRIALS_A = 40
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_entry_process_exits_70_for_signal_sent_around_final_json(tmp_path: Path, sig: int) -> None:
+    """REQ-21・REQ-39: 最終 JSON の前後にシグナルを連打しても、入口のプロセスは exit 70 で終わる。
+
+    子で `main` を固定 JSON の出力に差し替え、ハンドラ登録後（ready を読んだ後）から終了まで
+    シグナルを送り続ける。ready が読めない・子が 5 秒で終わらない場合は失敗にする。
+    検出力（証拠種別: テストハーネス。Mac のローカル実行 2026-10-06）: `_ignore_interrupt_signals`
+    を子の側で無効にすると、シグナルごとに 200 回中 200 回（SIGHUP は 199 回）が 70 以外
+    （シグナルによる終了。returncode は -2・-15・-1）になる。有効なら 200 回中 0 回。
+    40 回でも無効側は 40 回中 40 回が落ちるため、試行回数は 40 回とする（1 件あたり約 1.5 秒）。
+    """
+    code = (
+        "import sys, signal, importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['m'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "for s in m.INTERRUPT_SIGNALS: signal.signal(s, m._on_signal)\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "m.main = lambda argv=None: m.emit('runtime_error', 'interrupted', 70, False)\n"
+        "sys.exit(m._entry([]))\n"
+    )
+    for _ in range(_TRIALS_A):
+        proc = subprocess.Popen(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+            [sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            assert proc.stdout is not None
+            ready, _, _ = select.select([proc.stdout], [], [], 10)
+            assert ready, "child did not become ready within 10s"
+            assert proc.stdout.readline() == b"ready\n", "child died before ready"
+            deadline = time.monotonic() + 5
+            while proc.poll() is None and time.monotonic() < deadline:
+                try:
+                    proc.send_signal(sig)
+                except ProcessLookupError:
+                    break
+            if proc.poll() is None:
+                pytest.fail("child still alive 5s after signals started")
+            out, _ = proc.communicate(timeout=5)
+            assert proc.returncode == 70, (proc.returncode, out)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()

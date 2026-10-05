@@ -1466,6 +1466,7 @@ fn req21_sighup_stops_children_and_records_interrupted() {
 /// REQ-21・REQ-39: 同じシグナルを続けて 2 回受けても、exit 70・固定 JSON 1 行（record あり、または
 /// 強制終了の固定メッセージ）で終わり、偽 make とその子は残らない。2 回目が先に処理されて強制終了に
 /// なるか、1 回目の後始末が先に終わって record が書かれるかは時間次第で、仕様はどちらも許す。
+/// シグナルによる終了は許さない（終了処理の窓では中断シグナルを無視して exit 70 を保つ）。
 /// 決定的な強制終了の検証は Python 側（`test_second_signal_forces_exit_while_cleanup_is_stuck`）。
 #[test]
 fn req21_double_sigterm_exits_70_without_leftover_children() {
@@ -1480,15 +1481,6 @@ fn req21_double_sigterm_exits_70_without_leftover_children() {
     r.signal("TERM");
     let (status, out, err) = r.finish();
     let code = status.code();
-    // 2 回目が、1 回目の後始末を終えた python3 の終了処理中（ハンドラの復元後）に届くと、既定の動作で
-    // SIGTERM により終わる。この場合も record は書き終えている（stdout が `interrupted` の固定 JSON）
-    if code.is_none() {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(status.signal(), Some(15), "stdout={out} stderr={err}");
-        assert_eq!(out, INTERRUPTED, "stderr={err}");
-        assert_pids_gone(&e, &["make.pid", "make.cpid"]);
-        return;
-    }
     assert_eq!(code, Some(70), "stdout={out} stderr={err}");
     let forced = "{\"code\":\"runtime_error\",\"message\":\"interrupted (forced exit)\"}\n";
     assert!(out == INTERRUPTED || out == forced, "stdout={out:?}");
