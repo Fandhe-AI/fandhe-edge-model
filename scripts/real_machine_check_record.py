@@ -223,6 +223,9 @@ _final_emitted = False
 # 子の回収が上限時間内に終わらず、子（またはその孫）が残っている可能性がある印（REQ-39）。
 # record の `child_may_remain` へ出す。`run()` の冒頭で下ろす
 _child_may_remain = False
+# 回収・停止できなかった子のプロセスグループ id。2 回目のシグナルの強制終了（`_force_exit`）が
+# 再度 KILL を試みるため残す（親だけが終わって子が残るのを避ける。REQ-39）。`run()` の冒頭で空にする
+_leftover_pgids: list[int] = []
 # 後始末後の回収（`proc.wait`）を待つ上限秒数。KILL が効けば即時に回収できるため、実際に
 # 待つのは KILL が失敗した異常時だけ。超過したら諦めて先へ進む（無限待ちを作らない。REQ-39）。
 # モジュール変数にしてあるのはテストが縮めるため
@@ -603,8 +606,8 @@ def run_cmd(
                     # グループへ送れなかったときは孫が残りうる。回収の成否に関わらず残留の可能性を
                     # 記録し、結果は採用しない（fail-closed。REQ-39）。せめてリーダーだけでも止める
                     _child_may_remain = True
-                    if reason is None:
-                        reason = REASON_UNREAPED
+                    _leftover_pgids.append(proc.pid)
+                    reason = REASON_UNREAPED  # timeout 等より優先（次の回を始めさせない）
                     try:
                         proc.kill()
                     except OSError:
@@ -614,6 +617,7 @@ def run_cmd(
                 except subprocess.TimeoutExpired:
                     # 回収を諦める。子が残っている可能性を記録し、結果は失敗側へ倒す（fail-closed）
                     _child_may_remain = True
+                    _leftover_pgids.append(proc.pid)
                     reason = REASON_UNREAPED
                 finally:
                     _active_pgid = None
@@ -2371,9 +2375,11 @@ def _on_signal(signum: int, frame: Any) -> None:
 
 def _force_exit(pgid: int | None) -> None:
     """子のグループへ KILL を送り、固定 JSON を 1 行書いて exit 70 する（戻らない）。"""
-    if pgid is not None:
+    for target in [pgid, *_leftover_pgids]:
+        if target is None:
+            continue
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(target, signal.SIGKILL)
         except OSError:
             pass
     try:
@@ -2476,6 +2482,7 @@ def run(args: argparse.Namespace) -> int:
     _final_emitted = False
     _active_pgid = None
     _child_may_remain = False
+    _leftover_pgids.clear()
     os.umask(0o077)
     for s in INTERRUPT_SIGNALS:
         signal.signal(s, _on_signal)
