@@ -1909,6 +1909,15 @@ def _representative_record(tmp_path: Path) -> dict[str, Any]:
             "os_build": "24A335",
             "commit": "0" * 40,
             "worktree_clean": True,
+            "commit_end": "0" * 40,
+            "worktree_clean_end": True,
+            "cli_end_sha256": HEX64,
+            "commit_unchanged": True,
+            "worktree_clean_unchanged": True,
+            "cli_unchanged": True,
+            "stable": True,
+            "cli_origin": "built_by_script",
+            "trainer_origin": "build_default",
             "started_local": "2026-10-05T10:00:00+0900",
             "ended_local": "2026-10-05T10:05:00+0900",
             "cli_sha256": HEX64,
@@ -2664,3 +2673,235 @@ def test_unreadable_log_is_output_unreadable_not_output_limit(
     res = getattr(mod, item)(_ctx(tmp_path, tmp_path / "cli"))
     assert res["status"] == "failed"
     assert res["reason"] == "output_unreadable"
+
+
+# --------------------------------------------------------------------------------------
+# 終了時の環境の再採取（#360。REQ-21・REQ-32）
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "want"),
+    [
+        ("a" * 40, "a" * 40, True),
+        ("a" * 40, "b" * 40, False),
+        ("a" * 40, None, False),
+        (None, "a" * 40, False),
+        (None, None, None),
+        (True, True, True),
+        (True, False, False),
+        (False, False, True),
+        (HEX64, HEX64, True),
+        (HEX64, "b" * 64, False),
+    ],
+)
+def test_compare_start_end_is_fail_closed(start: Any, end: Any, want: Any) -> None:
+    """REQ-21: 片方だけ取れないのは同一と確認できず False。両方 None だけが None。"""
+    assert mod.compare_start_end(start, end) is want
+
+
+@pytest.mark.parametrize(
+    ("flags", "want"),
+    [
+        ((True, True, True), True),
+        ((True, None, False), False),
+        ((True, None, None), None),
+        ((None, None, None), None),
+    ],
+)
+def test_judge_environment_stable_aggregates(flags: Any, want: Any) -> None:
+    """REQ-21: 1 つでも False なら False、全部 True のときだけ True、他は None（未確認）。"""
+    env = dict(zip(("commit_unchanged", "worktree_clean_unchanged", "cli_unchanged"), flags))  # noqa: B905
+    assert mod.judge_environment_stable(env) is want
+
+
+def _ok_item(ctx: Any, name: str, b_ok: bool) -> Any:
+    return {"status": "ok"}, True
+
+
+def test_end_environment_unchanged_is_stable_and_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-21: 変化が無ければ stable が true で exit 0。"""
+    monkeypatch.setattr(mod, "_probe", lambda *a, **k: "0" * 40)
+    monkeypatch.setattr(mod, "_worktree_clean", lambda *a, **k: True)
+    rc, rec = _run_in_process(tmp_path, "B", _ok_item, monkeypatch)
+    env = rec["environment"]
+    assert rc == 0
+    assert env["stable"] is True
+    assert env["commit_end"] == "0" * 40
+    assert env["cli_end_sha256"] == env["cli_sha256"]
+
+
+def test_cli_rebuilt_during_run_is_judged_fail_and_item_status_stays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-32: 実行中に CLI が書き換わると、項目が ok でも exit 10・stable false。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        ctx.bin.write_bytes(b"#!/bin/sh\nexit 1\n")
+        return {"status": "ok"}, True
+
+    rc, rec = _run_in_process(tmp_path, "B", fake, monkeypatch)
+    env = rec["environment"]
+    assert rc == 10
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "judged_fail",
+        "message": "environment changed during the run",
+        "record": "record.json",
+    }
+    assert env["cli_unchanged"] is False
+    assert env["stable"] is False
+    assert env["cli_end_sha256"] != env["cli_sha256"]
+    assert rec["items"]["B"] == {"status": "ok"}
+    assert "実行中に環境が変わった" in (tmp_path / "w" / "record.md").read_text()
+
+
+def _sequence(monkeypatch: pytest.MonkeyPatch, name: str, values: list[Any]) -> None:
+    """name の関数を、呼ばれるたび values を順に返す偽に差し替える（尽きたら最後の値）。"""
+    it = iter(values)
+    last: list[Any] = [values[-1]]
+
+    def fake(*a: Any, **k: Any) -> Any:
+        try:
+            last[0] = next(it)
+        except StopIteration:
+            pass
+        return last[0]
+
+    monkeypatch.setattr(mod, name, fake)
+
+
+def test_commit_change_during_run_is_judged_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-21: 開始時と終了時で commit が違えば stable false・exit 10。"""
+    _sequence(monkeypatch, "_probe", ["0" * 40, "1" * 40])
+    monkeypatch.setattr(mod, "_worktree_clean", lambda *a, **k: True)
+    rc, rec = _run_in_process(tmp_path, "B", _ok_item, monkeypatch)
+    assert rc == 10
+    assert rec["environment"]["commit_unchanged"] is False
+    assert rec["environment"]["stable"] is False
+
+
+def test_worktree_change_during_run_is_judged_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-21: 開始時 clean・終了時 dirty なら stable false・exit 10。"""
+    monkeypatch.setattr(mod, "_probe", lambda *a, **k: "0" * 40)
+    _sequence(monkeypatch, "_worktree_clean", [True, False])
+    rc, rec = _run_in_process(tmp_path, "B", _ok_item, monkeypatch)
+    assert rc == 10
+    assert rec["environment"]["worktree_clean_end"] is False
+    assert rec["environment"]["worktree_clean_unchanged"] is False
+
+
+def test_end_probe_failure_is_not_treated_as_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-21: 終了時だけ commit が取れなければ、同一と確認できず exit 10。"""
+    _sequence(monkeypatch, "_probe", ["0" * 40, None])
+    monkeypatch.setattr(mod, "_worktree_clean", lambda *a, **k: True)
+    rc, rec = _run_in_process(tmp_path, "B", _ok_item, monkeypatch)
+    assert rc == 10
+    assert rec["environment"]["commit_end"] is None
+    assert rec["environment"]["commit_unchanged"] is False
+
+
+def test_interrupt_wins_over_environment_change_and_skips_end_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21: 中断の印があれば終了時の採取をせず null のまま。優先は中断（exit 70）。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._on_signal(signal.SIGTERM, None)
+        return {"status": "ok"}, True
+
+    rc, rec = _run_in_process(tmp_path, "B", fake, monkeypatch)
+    env = rec["environment"]
+    assert rc == 70
+    assert json.loads(capsys.readouterr().out)["message"] == "interrupted"
+    assert env["commit_end"] is None
+    assert env["cli_end_sha256"] is None
+    assert env["stable"] is None
+
+
+def test_unverifiable_environment_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21: 開始・終了とも採取できず stable が None なら、成功扱いにせず exit 10。"""
+    monkeypatch.setattr(mod, "_probe", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_worktree_clean", lambda *a, **k: None)
+    rc, rec = _run_in_process(tmp_path, "B", _ok_item, monkeypatch)
+    assert rc == 10
+    assert rec["environment"]["commit_unchanged"] is None
+    assert rec["environment"]["stable"] is None
+    assert json.loads(capsys.readouterr().out)["code"] == "judged_fail"
+
+
+@pytest.mark.parametrize("override", [True, False])
+def test_cli_origin_follows_bin_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    """REQ-33: cli_origin は差し替えなら env_override、そうでなければ built_by_script。"""
+    ctx = _c_ctx(tmp_path)
+    ctx.bin_override = override
+    env = mod.collect_environment(ctx, None)
+    assert env["cli_origin"] == ("env_override" if override else "built_by_script")
+
+
+def test_record_md_notes_commit_does_not_represent_cli_origin() -> None:
+    """REQ-33: bin_override の注意行に、commit が CLI の出所を表さない旨を出す。"""
+    rec = {
+        "schema": "real-machine-check/1",
+        "evidence_hint": "test_harness",
+        "bin_override": True,
+        "environment": None,
+        "inputs": None,
+        "options": {},
+        "items": {n: {"status": "not_run"} for n in mod.ITEM_ORDER},
+    }
+    assert "CLI の出所を表さない" in mod.render_markdown(rec)
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [(None, "build_default"), ("", "env"), ("/dummy/trainer-dir-xyz", "env")],
+)
+def test_trainer_origin_records_only_the_origin_not_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any, want: str
+) -> None:
+    """REQ-39: trainer の出所は閉じた語彙だけ。パスは記録に出ない（空文字も設定扱い）。"""
+    ctx = _c_ctx(tmp_path)
+    ctx.offline_env = {k: v for k, v in ctx.offline_env.items() if k != "FANDHE_EDGE_TRAINER_DIR"}
+    if value is not None:
+        ctx.offline_env["FANDHE_EDGE_TRAINER_DIR"] = value
+    env = mod.collect_environment(ctx, None)
+    assert env["trainer_origin"] == want
+    assert "trainer-dir-xyz" not in json.dumps(mod.sanitize_record({"environment": env}))
+
+
+@pytest.mark.parametrize(("items", "want"), [("A,B", False), ("B,D", True)])
+def test_cargo_offline_reflects_whether_item_a_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, items: str, want: bool
+) -> None:
+    """REQ-38: A（make ci は offline を強制しない）を含む実行では cargo_offline が false。"""
+    monkeypatch.setattr(mod, "run_item", lambda ctx, name, b_ok: ({"status": "ok"}, True))
+    (tmp_path / "w").mkdir()
+    args = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin=str(_fake_cli(tmp_path, "exit 0\n")),
+        bin_override=True,
+        items=items,
+        quiet_machine=False,
+        with_ci="A" in items,
+    )
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    try:
+        mod.run(args)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    rec = json.loads((tmp_path / "w" / "record.json").read_text())
+    assert rec["options"]["cargo_offline"] is want
