@@ -14,7 +14,8 @@
 #                         [--p95-limit-us N] [--package-limit-bytes N]
 #   値を取るオプションは `--key VALUE` と `--key=VALUE` の両方を受け付ける。
 #   --work-dir: 必須。存在しないか空のディレクトリで、リポジトリ配下でないこと（物理パスで比較）
-#   --items:    A,B,C,D,E,F の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F。実行順は常に A→F
+#   --items:    A,B,C,D,E,F の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F。実行順は常に A→F。
+#               E は B の成果物を使うため B と一緒に指定する（B なしの E は invalid_input(64)）
 #   --with-ci:  A（make ci）を実行する明示の同意。A は通信を伴いうる（uv sync・advisory DB・npx）。
 #               --items に A があり --with-ci が無ければ invalid_input(64) で何も実行しない
 #   --repeat:   F の回数（1〜1000。既定 50）
@@ -24,7 +25,7 @@
 #
 # 環境変数:
 #   FANDHE_EDGE_BIN        CLI のバイナリ（`/` を含むパス。相対は呼び出し時のカレント基準で絶対化する）。
-#                          未設定なら cargo build --locked --release の `compiler-artifact` の executable を使う
+#                          存在しない・実行できない場合は invalid_input(64)。未設定なら cargo build --locked --release の `compiler-artifact` の executable を使う
 #   FANDHE_EDGE_MAKE_CMD   make の代役（テスト専用。絶対パスの実行ファイル）
 #   FANDHE_EDGE_CARGO_CMD  cargo の代役（テスト専用。絶対パスの実行ファイル）
 #   FANDHE_EDGE_TRAINER_DIR  CLI の train が読む trainer の場所。値は読まず、設定の有無だけを記録する
@@ -34,7 +35,8 @@
 #   - 引数の誤りは CLI・make・cargo を起動する前に {"code":"invalid_input","message":"<固定>"} を 1 行出して exit 64
 #   - 終了コード: 全項目 ok なら 0、項目の失敗（または未実行の要求項目）は 10、引数の誤りは 64、
 #     実行中に commit・worktree_clean・CLI の sha256 が変わった場合も 10（#360）、
-#     スクリプト自身の実行不能（python3 が無い・作業ディレクトリを作れない・CLI が無い等）は 70（REQ-21）
+#     スクリプト自身の実行不能（python3 が無い・作業ディレクトリを作れない・CLI のビルド失敗等。
+#     起動前に分かる入力の誤りの FANDHE_EDGE_BIN の不在・実行不可は 64）は 70（REQ-21）
 #   - stdout は最後に JSON を 1 つだけ出す（REQ-33）: {"code":..,"message":..,"record":"record.json"}。
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない
 #   - 子プロセスには上限時間と出力サイズ上限を設ける（REQ-39。値は real_machine_check_record.py の定数）。
@@ -132,6 +134,15 @@ case "$item_seen" in
         [ "$with_ci" -eq 1 ] || fail 64 invalid_input "item A requires --with-ci (make ci may use the network)"
         ;;
 esac
+# E は B の成果物（package/ と train.jsonl）を使うため、B なしの指定は起動前に拒否する
+case "$item_seen" in
+    *" E "*)
+        case "$item_seen" in
+            *" B "*) ;;
+            *) fail 64 invalid_input "item E requires item B" ;;
+        esac
+        ;;
+esac
 
 # 整数オプション（先頭 0 は拒否。桁数を制限して算術の桁あふれを避ける）
 case "$repeat" in
@@ -226,10 +237,10 @@ if [ -n "${FANDHE_EDGE_BIN:-}" ]; then
     esac
     case "$bin" in /*) ;; *) bin="$PWD/$bin" ;; esac
     bin_dir=$(cd -P -- "$(dirname -- "$bin")" 2>/dev/null && pwd -P) \
-        || fail 70 runtime_error "fandhe-edge binary not found or not executable"
+        || fail 64 invalid_input "FANDHE_EDGE_BIN must be a path to an executable file"
     bin="${bin_dir%/}/$(basename -- "$bin")"
     if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
-        fail 70 runtime_error "fandhe-edge binary not found or not executable"
+        fail 64 invalid_input "FANDHE_EDGE_BIN must be a path to an executable file"
     fi
 fi
 
