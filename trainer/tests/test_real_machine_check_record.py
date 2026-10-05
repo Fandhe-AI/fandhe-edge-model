@@ -3256,6 +3256,21 @@ def test_unreaped_child_is_recorded_as_a_failed_item_with_child_may_remain(
     assert "a child process may remain" in capsys.readouterr().err
 
 
+def test_child_may_remain_from_env_probe_never_ends_in_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: 項目がすべて ok でも、採取経路で子が残りうるなら成功（0）にせず 70 を返す。"""
+
+    def fake_item(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._child_may_remain = True  # 環境採取（sysctl 等）の回収超過を模す
+        return {"status": "ok", "exit_code": 0}, b_ok
+
+    rc, rec = _run_in_process(tmp_path, "B", fake_item, monkeypatch)
+    assert rc == 70
+    assert rec["child_may_remain"] is True
+    assert "a child process may remain" in capsys.readouterr().err
+
+
 def test_normal_record_has_child_may_remain_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

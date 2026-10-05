@@ -2595,6 +2595,10 @@ def run(args: argparse.Namespace) -> int:
         # （成功扱いにしない。#360）
         return emit("judged_fail", "environment changed during the run", EXIT_JUDGED_FAIL, True)
     if all(rec["items"][n]["status"] == "ok" for n in items):
+        if rec["child_may_remain"]:
+            # 子が残りうる実行は採取経路（環境採取の sysctl・sw_vers 等を含む）を問わず成功にしない
+            # （資源上限。REQ-39）。record は書いてある
+            return emit("runtime_error", "a child process may remain", EXIT_RUNTIME_ERROR, True)
         return emit("ok", "all requested items completed", EXIT_OK, True)
     return emit(
         "judged_fail", "one or more requested items failed or were not run", EXIT_JUDGED_FAIL, True
