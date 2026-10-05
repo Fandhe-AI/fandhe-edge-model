@@ -2463,3 +2463,170 @@ def test_collect_environment_validates_probe_output(
         monkeypatch.setattr(mod, "_probe", fake({n: bad for n in names_int}))
         env = mod.collect_environment(ctx, None)
         assert (env["ncpu"], env["memory_bytes"]) == (None, None)
+
+
+# --- #359: 記録の書き込みと rc の読み取りの硬化（REQ-39・REQ-33。テストハーネス） ---
+
+
+def test_write_atomic_replaces_and_keeps_old_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: record は一時ファイル経由で置換し、失敗しても既存 JSON を壊さない。"""
+    p = tmp_path / "record.json"
+    mod.write_atomic(p, '{"a": 1}\n')
+    assert json.loads(p.read_text(encoding="utf-8")) == {"a": 1}
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("boom")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="boom"):
+        mod.write_atomic(p, '{"a": 2}\n')
+    assert json.loads(p.read_text(encoding="utf-8")) == {"a": 1}
+    assert [x.name for x in tmp_path.iterdir()] == ["record.json"]
+
+
+def test_write_atomic_fsync_failure_on_new_file_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 新規作成の途中失敗で壊れた record.json を残さない。"""
+
+    def boom(_fd: int) -> None:
+        raise OSError("x")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError, match="x"):
+        mod.write_atomic(tmp_path / "record.json", "{}\n")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["record.json", "record.md"])
+def test_write_atomic_refuses_symlink_target(tmp_path: Path, name: str) -> None:
+    """REQ-39: record のパスに symlink が置かれていたら辿らず失敗し、標的は不変。"""
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    (tmp_path / name).symlink_to(target)
+    with pytest.raises(OSError, match="not a regular file"):
+        mod.write_atomic(tmp_path / name, "new")
+    assert target.read_text(encoding="utf-8") == "keep"
+    assert (tmp_path / name).is_symlink()
+
+
+def test_write_text_nofollow_refuses_symlink(tmp_path: Path) -> None:
+    """REQ-39: symlink へは書かない。通常ファイルへは書ける。"""
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    (tmp_path / "l").symlink_to(target)
+    with pytest.raises(OSError, match=r"Too many|symbolic|loop"):
+        mod.write_text_nofollow(tmp_path / "l", "x")
+    assert target.read_text(encoding="utf-8") == "keep"
+    mod.write_text_nofollow(tmp_path / "ok", "y")
+    assert (tmp_path / "ok").read_text(encoding="utf-8") == "y"
+
+
+def test_run_cmd_refuses_symlinked_stdout_file(tmp_path: Path) -> None:
+    """REQ-39: stdout ファイルが symlink なら spawn_error で、標的は不変。"""
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    (tmp_path / "o").symlink_to(target)
+    r = mod.run_cmd(["/bin/echo", "hi"], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 100)
+    assert (r.exit_code, r.reason) == (None, "spawn_error")
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_read_rc_only_accepts_regular_files(tmp_path: Path) -> None:
+    """REQ-39: rc は通常ファイルだけを読む。symlink・FIFO・ディレクトリ・超過は None。"""
+    ok = tmp_path / "ok"
+    ok.write_text("7", encoding="utf-8")
+    assert mod._read_rc(ok) == 7
+    big = tmp_path / "big"
+    big.write_text("1" * 4, encoding="utf-8")
+    assert mod._read_rc(big) is None
+    link = tmp_path / "link"
+    link.symlink_to(ok)
+    assert mod._read_rc(link) is None
+    d = tmp_path / "dir"
+    d.mkdir()
+    assert mod._read_rc(d) is None
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    assert mod._read_rc(fifo) is None
+    assert time.monotonic() - t0 < 2
+
+
+def test_run_cmd_removes_preplaced_rc_symlink(tmp_path: Path) -> None:
+    """REQ-39: 起動前に rc が symlink なら除去され、標的へ書かれず成功する。"""
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    (tmp_path / "o.rc").symlink_to(target)
+    r = mod.run_cmd(["/bin/echo", "hi"], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 100)
+    assert (r.exit_code, r.reason) == (0, None)
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_run_cmd_child_swapping_rc_for_symlink_is_killed_not_ok(tmp_path: Path) -> None:
+    """REQ-39: 子が rc を symlink にすり替えても辿らず、結果は killed（成功扱いにしない）。"""
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    script = f"ln -s {target} {tmp_path}/o.rc"
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", script], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 4096
+    )
+    assert (r.exit_code, r.reason) == (None, "killed")
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_run_cmd_child_making_rc_fifo_does_not_block(tmp_path: Path) -> None:
+    """REQ-39: 子が rc を FIFO にしても成功扱いにせず、期限内に止まる（timeout）。"""
+    script = f"mkfifo {tmp_path}/o.rc"
+    t0 = time.monotonic()
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", script], tmp_path, tmp_path / "o", tmp_path / "e", 1, 100, 100
+    )
+    assert (r.exit_code, r.reason) == (None, "timeout")
+    assert time.monotonic() - t0 < 4
+
+
+def test_run_cmd_rc_path_is_directory_returns_spawn_error_without_running(
+    tmp_path: Path,
+) -> None:
+    """REQ-39: rc のパスがディレクトリでも例外を出さず spawn_error。子は起動しない。"""
+    (tmp_path / "o.rc").mkdir()
+    marker = tmp_path / "marker"
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", f"touch {marker}"],
+        tmp_path,
+        tmp_path / "o",
+        tmp_path / "e",
+        5,
+        100,
+        100,
+    )
+    assert (r.exit_code, r.reason, r.out_bytes, r.err_bytes) == (
+        None,
+        "spawn_error",
+        0,
+        0,
+    )
+    assert not marker.exists()
+
+
+def test_read_capped_ex_distinguishes_limit_and_unreadable(tmp_path: Path) -> None:
+    """REQ-39: 上限超過（output_limit）と読めない（output_unreadable）を区別する。"""
+    f = tmp_path / "f"
+    f.write_text("hello", encoding="utf-8")
+    assert mod.read_capped_ex(f, 100) == ("hello", None)
+    assert mod.read_capped_ex(f, 2) == (None, "output_limit")
+    assert mod.read_capped_ex(tmp_path / "none", 100) == (None, "output_unreadable")
+
+
+@pytest.mark.parametrize("item", ["item_a", "item_d"])
+def test_unreadable_log_is_output_unreadable_not_output_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, item: str
+) -> None:
+    """REQ-39: A・D のログが読めないときは output_unreadable（output_limit に見せない）。"""
+    monkeypatch.setattr(mod, "run_cmd", lambda *a, **k: mod.RunResult(0, None, 0, 0))
+    res = getattr(mod, item)(_ctx(tmp_path, tmp_path / "cli"))
+    assert res["status"] == "failed"
+    assert res["reason"] == "output_unreadable"
