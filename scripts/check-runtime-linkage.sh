@@ -6,6 +6,8 @@
 #   - Darwin の `otool -L`: 実機（Mac）
 #   - Linux の `ldd`: 補助（Mac 実機の証拠ではない）
 #
+# cargo は `--locked` で起動し、Cargo.lock を暗黙に更新しない（REQ-38）。
+#
 # 確認対象:
 #   1. CLI バイナリ `fandhe-edge`（`fandhe-edge-train` を含むが、Python へは子プロセスでしか
 #      到達せず動的リンクは無い見込み）
@@ -28,11 +30,11 @@ TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT INT TERM
 
 echo "== build =="
-cargo build --release -p fandhe-edge-cli --bin fandhe-edge
+cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge
 CLI_BIN="$TARGET_DIR/release/fandhe-edge"
 [ -x "$CLI_BIN" ] || { echo "error: CLI binary not found: $CLI_BIN" >&2; exit 1; }
 
-cargo test -p fandhe-edge-runtime --test env_isolation --no-run 2>"$TMP"
+cargo test --locked -p fandhe-edge-runtime --test env_isolation --no-run 2>"$TMP"
 TEST_BIN=$(sed -n 's/^ *Executable .*(\(.*\))$/\1/p' "$TMP" | head -n 1)
 [ -n "$TEST_BIN" ] && [ -x "$TEST_BIN" ] || { echo "error: env_isolation executable not found" >&2; exit 1; }
 
