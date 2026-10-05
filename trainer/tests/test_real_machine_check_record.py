@@ -750,19 +750,24 @@ def test_judge_linkage_target_fixes_the_three_hashes() -> None:
     assert j(None, a, a) == "cli_changed"
 
 
-def test_linkage_target_path_follows_cargo_target_dir_rule(tmp_path: Path) -> None:
-    """D: 検査対象のパスは check-runtime-linkage.sh と同じ CARGO_TARGET_DIR 規則。"""
-    ctx = _ctx(tmp_path, _fake_cli(tmp_path, "exit 0\n"))
-    ctx.repo = Path("/repo")
-    assert mod.linkage_target_path(ctx) == Path("/repo/target/release/fandhe-edge")
-    ctx.offline_env = {"CARGO_TARGET_DIR": "/abs/t"}
-    assert mod.linkage_target_path(ctx) == Path("/abs/t/release/fandhe-edge")
-    ctx.offline_env = {"CARGO_TARGET_DIR": "rel"}
-    assert mod.linkage_target_path(ctx) == Path("/repo/rel/release/fandhe-edge")
+def test_parse_linkage_cli_path_reads_exactly_one_absolute_cli_bin_line() -> None:
+    """REQ-32: `cli_bin:` 行がちょうど 1 行で絶対パスのときだけ Path を返す。"""
+    p = mod.parse_linkage_cli_path
+    assert p("cli_bin: /abs/t/release/fandhe-edge\n") == Path("/abs/t/release/fandhe-edge")
+    mixed = (
+        "== build ==\ncli_bin: /x/y/fandhe-edge\nok: req32_a\nOK: tool=otool evidence=e targets=t\n"
+    )
+    assert p(mixed) == Path("/x/y/fandhe-edge")
+    assert p("== build ==\nok: req32_a\n") is None
+    assert p("cli_bin: /a/fandhe-edge\ncli_bin: /b/fandhe-edge\n") is None
+    assert p("cli_bin: rel/release/fandhe-edge\n") is None
 
 
-def _linkage_make_body(n_ok: int, tool_line: str = "OK: tool=otool evidence=x targets=y") -> str:
-    lines = [f"echo 'ok: req32_t{i}'" for i in range(n_ok)]
+def _linkage_make_body(
+    n_ok: int, tool_line: str = "OK: tool=otool evidence=x targets=y", cli_bin: str = ""
+) -> str:
+    lines = [f"echo 'cli_bin: {cli_bin}'"] if cli_bin else []
+    lines += [f"echo 'ok: req32_t{i}'" for i in range(n_ok)]
     if tool_line:
         lines.append(f"echo '{tool_line}'")
     return "\n".join(lines) + "\nexit 0\n"
@@ -774,7 +779,10 @@ def _linkage_ctx(tmp_path: Path, cli_bytes: bytes, target_bytes: bytes) -> Any:
     (repo / "target" / "release" / "fandhe-edge").write_bytes(target_bytes)
     cli = tmp_path / "cli"
     cli.write_bytes(cli_bytes)
-    make = _script(tmp_path, "fake-make", _linkage_make_body(mod.LINKAGE_ENV_I_TESTS))
+    body = _linkage_make_body(
+        mod.LINKAGE_ENV_I_TESTS, cli_bin=str(repo / "target" / "release" / "fandhe-edge")
+    )
+    make = _script(tmp_path, "fake-make", body)
     ctx = _ctx(tmp_path / "w", cli)
     ctx.work.mkdir()
     ctx.repo = repo
@@ -798,6 +806,17 @@ def test_item_d_requires_linkage_target_to_match_executed_cli(tmp_path: Path) ->
     ctx = _linkage_ctx(tmp_path / "c", b"one", b"one")
     ctx.cli_sha256 = "0" * 64
     assert mod.item_d(ctx)["reason"] == "cli_changed"
+
+
+def test_item_d_without_cli_bin_line_is_linkage_target_unreadable(tmp_path: Path) -> None:
+    """REQ-32: `cli_bin:` 行が無ければ（harness でない）D は linkage_target_unreadable。"""
+    ctx = _linkage_ctx(tmp_path, b"same", b"same")
+    ctx.make_cmd = str(
+        _script(tmp_path, "make-no-line", _linkage_make_body(mod.LINKAGE_ENV_I_TESTS))
+    )
+    res = mod.item_d(ctx)
+    assert (res["status"], res["reason"]) == ("failed", "linkage_target_unreadable")
+    assert res["linkage_target_sha256"] is None
 
 
 def test_harness_skips_linkage_comparison_and_record_has_no_path(tmp_path: Path) -> None:

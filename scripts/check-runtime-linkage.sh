@@ -17,22 +17,32 @@
 # CLI `infer` は工程の接続（#136）済みだが、推論そのものの `env -i` 実行 smoke は本スクリプトに
 # 未追加（別課題。現状は help のみ smoke）。
 #
+# CLI の場所は cargo の `--message-format=json` が報告した実物から取る（`build.target-dir`・
+# `CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれにも追従する。規則を再実装しない）。
+# 取り出した絶対パスは `cli_bin: <path>` の 1 行で stdout へ出す（real_machine_check_record.py が
+# 読み、B・C・E で実行する CLI との同一性照合に使う。形式を変えない）。
+#
 # eval は使わない。ネットワークには接続しない（REQ-38）。
 
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 PATTERN='python|libpython|Python\.framework|mlx|libmlx'
 
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT INT TERM
+trap 'rm -f "$TMP" "$TMP.build" "$TMP.rp"' EXIT INT TERM
 
 echo "== build =="
-cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge
-CLI_BIN="$TARGET_DIR/release/fandhe-edge"
-[ -x "$CLI_BIN" ] || { echo "error: CLI binary not found: $CLI_BIN" >&2; exit 1; }
+cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge \
+  --message-format=json-render-diagnostics >"$TMP.build"
+CLI_BIN=$(grep '"reason":"compiler-artifact"' "$TMP.build" | grep '"kind":\["bin"\]' \
+  | grep '"name":"fandhe-edge"' | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
+case $CLI_BIN in
+  ''|*\\*|[!/]*) echo "error: CLI binary not found" >&2; exit 1 ;;
+esac
+[ -x "$CLI_BIN" ] || { echo "error: CLI binary not found" >&2; exit 1; }
+echo "cli_bin: $CLI_BIN"
 
 cargo test --locked -p fandhe-edge-runtime --test env_isolation --no-run 2>"$TMP"
 TEST_BIN=$(sed -n 's/^ *Executable .*(\(.*\))$/\1/p' "$TMP" | head -n 1)

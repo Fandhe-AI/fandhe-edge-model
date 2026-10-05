@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -301,7 +302,9 @@ def read_capped(path: Path, cap: int) -> str | None:
 def sha256_file(path: Path, cap: int) -> str | None:
     """ファイルの sha256。サイズ上限超過・読めない場合は None。"""
     try:
-        if path.stat().st_size > cap:
+        # FIFO・ディレクトリ等は open で固まる・落ちるため、通常ファイルだけを読む
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
             return None
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -959,13 +962,16 @@ def parse_linkage_tool(text: str) -> str | None:
     return None
 
 
-def linkage_target_path(ctx: Ctx) -> Path:
-    """check-runtime-linkage.sh の検査対象のパス（`CARGO_TARGET_DIR`、既定は repo の target）。"""
-    raw = ctx.offline_env.get("CARGO_TARGET_DIR")
-    base = Path(raw) if raw else ctx.repo / "target"
-    if not base.is_absolute():
-        base = ctx.repo / base
-    return base / "release" / "fandhe-edge"
+def parse_linkage_cli_path(text: str) -> Path | None:
+    """check-runtime-linkage.sh が出す `cli_bin: <絶対パス>` 行から検査対象の Path を得る。
+
+    cargo の報告から取った実物のパスが唯一の出どころ（REQ-32）。該当行がちょうど 1 行で、
+    値が絶対パスのときだけ返し、0 行・2 行以上・相対パスは None（照合不能として扱う）。
+    """
+    found = [m.group(1) for ln in text.splitlines() if (m := re.match(r"^cli_bin: (.+)$", ln))]
+    if len(found) != 1 or not found[0].startswith("/"):
+        return None
+    return Path(found[0])
 
 
 def judge_linkage_target(
@@ -1026,11 +1032,12 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         return dict(rec, status="failed", reason="unexpected_output")
     if sys.platform == "darwin" and rec["linkage_tool"] != "otool":
         return dict(rec, status="failed", reason="unexpected_output")
-    # check-runtime-linkage.sh が検査したバイナリ（`CARGO_TARGET_DIR` 規則）が、B・C・E で実行した
-    # CLI と同一でなければ、リンク確認は実行した CLI の証拠にならない。代役の下の偽 make は何も
-    # 検査していないので照合しない（matches は null のまま）
+    # check-runtime-linkage.sh が検査したバイナリ（`cli_bin:` 行で報告された cargo の実物）が、
+    # B・C・E で実行した CLI と同一でなければ、リンク確認は実行した CLI の証拠にならない。
+    # 代役の下の偽 make は何も検査していないので照合しない（matches は null のまま）
     if not ctx.harness:
-        target_sha = sha256_file(linkage_target_path(ctx), CAP_CLI_BINARY)
+        target = parse_linkage_cli_path(text)
+        target_sha = sha256_file(target, CAP_CLI_BINARY) if target is not None else None
         now_sha = sha256_file(ctx.bin, CAP_CLI_BINARY)
         rec["linkage_target_sha256"] = target_sha
         reason = judge_linkage_target(ctx.cli_sha256, now_sha, target_sha)
