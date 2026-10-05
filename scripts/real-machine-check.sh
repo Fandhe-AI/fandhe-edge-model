@@ -41,7 +41,9 @@
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない
 #   - 子プロセスには上限時間と出力サイズ上限を設ける（REQ-39。値は real_machine_check_record.py の定数）。
 #     A 以外の子プロセスには CARGO_NET_OFFLINE=true を渡し、cargo は --locked で起動する（REQ-38）。
-#     SIGINT・SIGTERM・SIGHUP を受けたら子のグループを止め、その時点までの record を書いて exit 70
+#     SIGINT・SIGTERM・SIGHUP を受けたら子のグループを止め、その時点までの record を書いて exit 70。
+#     後始末が終わらないときのため、シグナルを 2 回受けたら子のグループへ KILL を送って即座に
+#     exit 70 する（record なし。stdout は固定 JSON `interrupted (forced exit)`。REQ-39）
 set -eu
 
 # 固定メッセージの JSON を 1 行出して終了する。$1=終了コード $2=code 名 $3=固定メッセージ

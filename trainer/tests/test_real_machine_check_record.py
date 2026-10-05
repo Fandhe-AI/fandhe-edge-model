@@ -14,12 +14,14 @@ import importlib.util
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
+import types
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -448,8 +450,9 @@ def test_find_built_executable_reads_compiler_artifact(tmp_path: Path) -> None:
     assert mod.find_built_executable("") is None
 
 
-def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
-    """REQ-39: SIGTERM で子グループを残さず、中断時点の record を書き exit 70 で終える。"""
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_interrupt_stops_children_and_writes_record(tmp_path: Path, sig: int) -> None:
+    """REQ-39: SIGINT・SIGTERM・SIGHUP で子グループを残さず、record を書き exit 70 で終える。"""
     pidfile = tmp_path / "pids"
     make = _script(
         tmp_path,
@@ -492,7 +495,7 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
             break
         time.sleep(0.05)
     pids = [int(x) for x in pidfile.read_text().split()]
-    proc.send_signal(signal.SIGTERM)
+    proc.send_signal(sig)
     out, _ = proc.communicate(timeout=30)
     assert proc.returncode == 70
     assert json.loads(out) == {
@@ -515,8 +518,14 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
 def _reset_interrupt_mark() -> Any:
     """モジュールの中断の印を、各テストの前後で下ろす（テスト間で引き継がない）。"""
     mod._interrupt_requested = False
+    mod._signal_count = 0
+    mod._active_pgid = None
+    mod._child_may_remain = False
     yield
     mod._interrupt_requested = False
+    mod._signal_count = 0
+    mod._active_pgid = None
+    mod._child_may_remain = False
 
 
 def _wait_for(pred: Any, seconds: float = 30.0) -> bool:
@@ -861,7 +870,17 @@ def _run(tmp_path: Path, argv: list[str], name: str = "o") -> Any:
     return mod.run_cmd(argv, tmp_path, tmp_path / name, tmp_path / (name + ".e"), 20, 4096, 4096)
 
 
-@pytest.mark.parametrize(("script", "want"), [("exit 0", 0), ("exit 20", 20), ("kill -9 $$", 137)])
+@pytest.mark.parametrize(
+    ("script", "want"),
+    [
+        ("exit 0", 0),
+        ("exit 1", 1),
+        ("exit 20", 20),
+        ("exit 127", 127),
+        ("exit 255", 255),
+        ("kill -9 $$", 137),
+    ],
+)
 def test_run_cmd_propagates_exit_code_through_wrapper(
     tmp_path: Path, script: str, want: int
 ) -> None:
@@ -3162,3 +3181,468 @@ def test_nonzero_exit_with_non_json_reports_unexpected_exit_code(tmp_path: Path)
         "exit_code": 64,
         "exit_code_unexpected": True,
     }
+
+
+def test_run_cmd_gives_up_waiting_when_the_group_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: KILL が失敗し回収が終わらなくても、上限で諦めて `unreaped` を返す。"""
+    pidfile = tmp_path / "pid"
+    real_wait = subprocess.Popen.wait
+    seen: list[int] = []
+
+    def fake_wait(self: Any, timeout: float | None = None) -> int:
+        seen.append(self.pid)
+        if timeout is None:
+            raise AssertionError("wait without a timeout")
+        time.sleep(timeout)
+        raise subprocess.TimeoutExpired("x", timeout)
+
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+    monkeypatch.setattr(mod, "REAP_WAIT_LIMIT_SECONDS", 0.5)
+    monkeypatch.setattr(subprocess.Popen, "wait", fake_wait)
+    mod._interrupt_requested = False
+    started = time.monotonic()
+    try:
+        r = mod.run_cmd(
+            ["/bin/sh", "-c", f'echo $$ > "{pidfile}"; exec sleep 60'],
+            tmp_path,
+            tmp_path / "o",
+            tmp_path / "o.e",
+            1,
+            4096,
+            4096,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(subprocess.Popen, "wait", real_wait)
+        for pid in seen:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+    assert (r.exit_code, r.reason) == (None, "unreaped")
+    assert mod._child_may_remain is True
+    assert mod._active_pgid is None
+    assert elapsed < 10.0
+
+
+def test_run_cmd_does_not_adopt_the_result_when_the_group_kill_fails_but_leader_is_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: グループ KILL 失敗時は、期限超過でも reason を `unreaped` にし残留を記録する。"""
+    pidfile = tmp_path / "pid"
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+    mod._interrupt_requested = False
+    mod._child_may_remain = False
+    mod._leftover_procs.clear()
+    try:
+        r = mod.run_cmd(
+            ["/bin/sh", "-c", f'echo $$ > "{pidfile}"; exec sleep 60'],
+            tmp_path,
+            tmp_path / "o",
+            tmp_path / "o.e",
+            1,
+            4096,
+            4096,
+        )
+        leftover = list(mod._leftover_procs)
+    finally:
+        # _kill_group を差し替えているため内側の sleep が残る。グループごと確実に止める
+        for lp in list(mod._leftover_procs):
+            try:
+                os.killpg(lp.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        mod._leftover_procs.clear()
+        try:
+            os.killpg(int(pidfile.read_text().strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    assert (r.exit_code, r.reason) == (None, "unreaped")
+    assert mod._child_may_remain is True
+    assert mod._active_pgid is None
+    # リーダーは回収済み（pid 再利用の恐れ）なので、強制終了での再送用に pgid を残さない
+    assert leftover == []
+
+
+def test_force_exit_retries_kill_on_leftover_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: 回収できなかった子のグループへ、強制終了時に再度 KILL を送る。"""
+    killed: list[int] = []
+    exits: list[int] = []
+    monkeypatch.setattr(mod.os, "killpg", lambda pg, sig: killed.append(pg))
+    monkeypatch.setattr(mod.os, "write", lambda fd, b: len(b))
+    monkeypatch.setattr(mod.os, "_exit", lambda code: exits.append(code))
+    monkeypatch.setattr(
+        mod,
+        "_leftover_procs",
+        [types.SimpleNamespace(pid=111), types.SimpleNamespace(pid=222)],
+    )
+    mod._force_exit(None)
+    assert killed == [111, 222]
+    assert exits == [mod.EXIT_RUNTIME_ERROR]
+
+
+def test_run_cmd_leaves_child_may_remain_false_on_the_normal_path(tmp_path: Path) -> None:
+    """REQ-39: 通常の回収では `child_may_remain` は立たない。"""
+    r = _run(tmp_path, ["/bin/sh", "-c", "exit 0"])
+    assert (r.exit_code, r.reason) == (0, None)
+    assert mod._child_may_remain is False
+    assert mod._active_pgid is None
+
+
+def test_unreaped_child_is_recorded_as_a_failed_item_with_child_may_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: 回収を諦めたら record に `child_may_remain: true`、項目は failed（10）。"""
+
+    def fake_item(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._child_may_remain = True
+        return mod.fail_item("unreaped"), b_ok
+
+    rc, rec = _run_in_process(tmp_path, "B", fake_item, monkeypatch)
+    assert rc == 10
+    assert rec["child_may_remain"] is True
+    assert rec["items"]["B"] == {"status": "failed", "reason": "unreaped"}
+    assert (
+        "子プロセスの回収が上限時間内に終わらなかった" in (tmp_path / "w" / "record.md").read_text()
+    )
+    assert "a child process may remain" in capsys.readouterr().err
+
+
+def test_child_may_remain_from_env_probe_never_ends_in_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: 項目がすべて ok でも、採取経路で子が残りうるなら成功（0）にせず 70 を返す。"""
+
+    def fake_item(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._child_may_remain = True  # 環境採取（sysctl 等）の回収超過を模す
+        return {"status": "ok", "exit_code": 0}, b_ok
+
+    rc, rec = _run_in_process(tmp_path, "B", fake_item, monkeypatch)
+    assert rc == 70
+    assert rec["child_may_remain"] is True
+    assert "a child process may remain" in capsys.readouterr().err
+
+
+def test_normal_record_has_child_may_remain_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 既定の record では `child_may_remain` は false。"""
+    rc, rec = _run_in_process(
+        tmp_path, "B", lambda ctx, name, b_ok: (mod.fail_item("x"), b_ok), monkeypatch
+    )
+    assert rec["child_may_remain"] is False
+    assert rc == 10
+
+
+def test_second_signal_forces_exit_while_cleanup_is_stuck(tmp_path: Path) -> None:
+    """REQ-39: 後始末が固まっても、シグナルの 2 回目で子を KILL し exit 70 で強制終了する。"""
+    pidfile = tmp_path / "pids"
+    make = _script(
+        tmp_path,
+        "fake-make",
+        f'trap "" TERM\necho $$ >> "{pidfile}"\nsleep 60 &\necho $! >> "{pidfile}"\nwait\n',
+    )
+    launcher = tmp_path / "launch.py"
+    launcher.write_text(
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['m'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "m._kill_group = lambda pid: True\n"
+        "m.REAP_WAIT_LIMIT_SECONDS = 120\n"
+        "sys.exit(m.main(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    env = dict(os.environ, FANDHE_EDGE_MAKE_CMD=str(make))
+    proc = subprocess.Popen(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+        [
+            sys.executable,
+            str(launcher),
+            "run",
+            "--repo-root",
+            str(REPO),
+            "--work-dir",
+            str(work),
+            "--bin",
+            str(_fake_cli(tmp_path, "exit 0\n")),
+            "--bin-override",
+            "--items",
+            "D",
+            "--repeat",
+            "1",
+            "--p95-limit-us",
+            "50000",
+            "--package-limit-bytes",
+            "1000",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert _wait_for(lambda: len(_pids(pidfile)) >= 2)
+        pids = _pids(pidfile)
+        proc.send_signal(signal.SIGTERM)
+        # 後始末は固まっている（KILL を送らない模擬）ので、1 回目では終わらない
+        time.sleep(1.0)
+        assert proc.poll() is None
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for pid in _pids(pidfile):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    assert proc.returncode == 70
+    assert json.loads(out) == {
+        "code": "runtime_error",
+        "message": "interrupted (forced exit)",
+    }
+    assert not (work / "record.json").exists()
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def test_run_cmd_timeout_kills_term_ignoring_grandchild(tmp_path: Path) -> None:
+    """REQ-39: 期限超過（timeout）でも、TERM を無視する孫まで止める。"""
+    pidfile = tmp_path / "pids"
+    script = f'trap "" TERM; sleep 60 & echo $! > "{pidfile}"; wait'
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", script], tmp_path, tmp_path / "o", tmp_path / "o.e", 1, 4096, 4096
+    )
+    assert (r.exit_code, r.reason) == (None, "timeout")
+    pids = _pids(pidfile)
+    assert len(pids) == 1
+    assert _wait_for(lambda: not _alive(pids[0]), 10)
+
+
+def test_item_f_stops_at_unreaped_and_fails_with_reason_unreaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: F は回収を諦めた回で打ち切り、次の回を始めず failed（reason: unreaped）にする。"""
+    ctx = _ctx(tmp_path / "w", _fake_cli(tmp_path, "exit 0\n"))
+    ctx.work.mkdir()
+    ctx.repeat = 5
+    ctx.cargo_cmd = str(
+        _script(tmp_path, "cg", 'case "$*" in *--no-run*) exit 0;; esac\n' + _list_script(3))
+    )
+    calls: list[int] = []
+    real = mod.run_cmd
+
+    def fake(argv: Any, cwd: Any, out: Path, *a: Any, **k: Any) -> Any:
+        if out.name.startswith("run-"):
+            calls.append(1)
+            return mod.RunResult(None, mod.REASON_UNREAPED, 0, 0)
+        return real(argv, cwd, out, *a, **k)
+
+    monkeypatch.setattr(mod, "run_cmd", fake)
+    res = mod.item_f(ctx)
+    assert len(calls) == 1
+    assert (res["status"], res["reason"], res["failed"], res["killed"]) == (
+        "failed",
+        "unreaped",
+        1,
+        0,
+    )
+    # 開始した回数だけを記録する（repeat=5 のまま偽らない）
+    assert res["runs"] == 1
+
+
+def test_second_signal_after_final_json_does_not_write_a_second_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21・REQ-33: 最終 JSON の後の 2 回目のシグナルは強制終了の行を書かない。"""
+    monkeypatch.setattr(mod, "_final_emitted", False)
+    monkeypatch.setattr(mod, "_signal_count", 1)
+    writes: list[bytes] = []
+    monkeypatch.setattr(mod.os, "write", lambda fd, b: writes.append(b) or len(b))
+
+    def no_exit(code: int) -> None:
+        raise AssertionError("exit")
+
+    monkeypatch.setattr(mod.os, "_exit", no_exit)
+    assert mod.emit("runtime_error", "interrupted", 70, True) == 70
+    mod._on_signal(signal.SIGTERM, None)
+    assert writes == []
+    assert capsys.readouterr().out.count("\n") == 1
+
+
+def test_second_signal_during_spawn_window_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: Popen から pgid 登録までの間の 2 回目のシグナルは強制終了せず保留する。"""
+    monkeypatch.setattr(mod, "_final_emitted", False)
+    monkeypatch.setattr(mod, "_force_pending", False)
+    monkeypatch.setattr(mod, "_spawning", True)
+    monkeypatch.setattr(mod, "_signal_count", 1)
+
+    def no_exit(code: int) -> None:
+        raise AssertionError("exit")
+
+    monkeypatch.setattr(mod.os, "_exit", no_exit)
+    mod._on_signal(signal.SIGTERM, None)
+    assert mod._force_pending is True
+
+
+def test_build_cli_unreaped_reports_child_may_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: CLI のビルドで回収を諦めても、record が無くても stderr に残留の可能性を出す。"""
+    monkeypatch.setattr(mod, "collect_inputs", lambda repo: {"x": 1})
+
+    def fake_build(ctx: Any) -> None:
+        mod._child_may_remain = True
+
+    monkeypatch.setattr(mod, "build_cli", fake_build)
+    ns = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin_override=False,
+        quiet_machine=False,
+    )
+    (tmp_path / "w").mkdir()
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    try:
+        assert mod.run(ns) == 70
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    assert "a child process may remain" in capsys.readouterr().err
+
+
+def test_entry_ignores_interrupt_signals_on_every_exit_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-21・REQ-39: 入口は戻る・SystemExit・例外のどの経路でも中断シグナルを SIG_IGN にする。"""
+    assert mod.INTERRUPT_SIGNALS == (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+
+    def reset() -> None:
+        for s in mod.INTERRUPT_SIGNALS:
+            signal.signal(s, mod._on_signal)
+
+    def current() -> list[Any]:
+        return [signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS]
+
+    def raise_exit(argv: Any = None) -> int:
+        raise SystemExit(64)
+
+    def raise_err(argv: Any = None) -> int:
+        raise RuntimeError("x")
+
+    try:
+        reset()
+        monkeypatch.setattr(mod, "main", lambda argv=None: 70)
+        assert mod._entry([]) == 70
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+
+        reset()
+        monkeypatch.setattr(mod, "main", raise_exit)
+        with pytest.raises(SystemExit) as ei:
+            mod._entry([])
+        assert ei.value.code == 64
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+
+        reset()
+        monkeypatch.setattr(mod, "main", raise_err)
+        with pytest.raises(RuntimeError):
+            mod._entry([])
+        assert current() == [signal.SIG_IGN, signal.SIG_IGN, signal.SIG_IGN]
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+
+def test_main_itself_does_not_leave_signals_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: `main`（`run`・`emit` を含む）は SIG_IGN にしない。無視は `_entry` だけが行う。
+
+    `run` がハンドラを登録し、`emit` まで届く経路（項目 B を偽物に差し替えた最小の実行）で
+    `main` を呼び、戻った時点で 3 シグナルのハンドラが `_on_signal` のままであることを確かめる。
+    `emit` に SIG_IGN の設定を入れるとこのテストは落ちる。
+    """
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    # `emit` は `_final_emitted` を True のまま残す。後続のテストへ持ち越さないよう復元を登録する
+    monkeypatch.setattr(mod, "_final_emitted", mod._final_emitted)
+    monkeypatch.setattr(mod, "run_item", lambda ctx, name, b_ok: ({"status": "ok"}, True))
+    (tmp_path / "w").mkdir()
+    argv = ["run", "--repo-root", str(REPO), "--work-dir", str(tmp_path / "w")]
+    argv += ["--bin", str(_fake_cli(tmp_path, "exit 0\n")), "--bin-override", "--items", "B"]
+    argv += ["--repeat", "1", "--p95-limit-us", "1", "--package-limit-bytes", "1"]
+    try:
+        for s in mod.INTERRUPT_SIGNALS:
+            signal.signal(s, signal.SIG_DFL)  # `run` が登録した結果だけを検出する
+        rc = mod.main(argv)
+        handlers = [signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS]
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    out = json.loads(capsys.readouterr().out)
+    assert out["record"] == "record.json"  # emit まで到達した
+    assert rc == 0
+    assert handlers == [mod._on_signal] * 3
+
+
+_TRIALS_A = 40
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_entry_process_exits_70_for_signal_sent_around_final_json(tmp_path: Path, sig: int) -> None:
+    """REQ-21・REQ-39: 最終 JSON の前後にシグナルを連打しても、入口のプロセスは exit 70 で終わる。
+
+    子で `main` を固定 JSON の出力に差し替え、ハンドラ登録後（ready を読んだ後）から終了まで
+    シグナルを送り続ける。ready が読めない・子が 5 秒で終わらない場合は失敗にする。
+    検出力（証拠種別: テストハーネス。Mac のローカル実行 2026-10-06）: `_ignore_interrupt_signals`
+    を子の側で無効にすると、シグナルごとに 200 回中 200 回（SIGHUP は 199 回）が 70 以外
+    （シグナルによる終了。returncode は -2・-15・-1）になる。有効なら 200 回中 0 回。
+    40 回でも無効側は 40 回中 40 回が落ちるため、試行回数は 40 回とする（1 件あたり約 1.5 秒）。
+    """
+    code = (
+        "import sys, signal, importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['m'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "for s in m.INTERRUPT_SIGNALS: signal.signal(s, m._on_signal)\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "m.main = lambda argv=None: m.emit('runtime_error', 'interrupted', 70, False)\n"
+        "sys.exit(m._entry([]))\n"
+    )
+    for _ in range(_TRIALS_A):
+        proc = subprocess.Popen(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+            [sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            assert proc.stdout is not None
+            ready, _, _ = select.select([proc.stdout], [], [], 10)
+            assert ready, "child did not become ready within 10s"
+            assert proc.stdout.readline() == b"ready\n", "child died before ready"
+            deadline = time.monotonic() + 5
+            while proc.poll() is None and time.monotonic() < deadline:
+                try:
+                    proc.send_signal(sig)
+                except ProcessLookupError:
+                    break
+            if proc.poll() is None:
+                pytest.fail("child still alive 5s after signals started")
+            out, _ = proc.communicate(timeout=5)
+            assert proc.returncode == 70, (proc.returncode, out)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
