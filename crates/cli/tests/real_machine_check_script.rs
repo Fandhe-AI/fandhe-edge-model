@@ -69,11 +69,22 @@ package)
   c2mode=${FAKE_C2_MODE:-limit}
   if [ "$here" = C2 ] && [ "$c2mode" != exit0 ]; then
     [ "$c2mode" = keepdir ] && mkdir -p project/package
-    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":true,%s},"infer_p95":null}\n' "$pkglim" "$comps"
+    # 実 CLI と同じく total_bytes > limit_bytes で超過。内訳の合計は total_bytes と一致させる。
+    # small は total_bytes <= limit_bytes なのに exceeded:true を返す不正な出力
+    wb=$((pkglim + 1))
+    [ "$c2mode" = small ] && wb=100
+    total=$((wb + 35))
+    rl=$pkglim
+    [ -n "${FAKE_C2_LIMIT_WRONG:-}" ] && rl=$((pkglim + 7))
+    c2comps="\"components\":{\"weights\":{\"bytes\":$wb,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":20,\"file_count\":1},\"label_table\":{\"bytes\":5,\"file_count\":1},\"calibration\":{\"bytes\":3,\"file_count\":1},\"metadata\":{\"bytes\":7,\"file_count\":1}}"
+    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":true,%s},"infer_p95":null}\n' "$total" "$rl" "$c2comps"
     exit 20
   fi
   if [ "$here" = C1 ] && [ -n "${FAKE_C1_EXCEED:-}" ]; then
-    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":40000000,"exceeded":false,%s},"infer_p95":{"p95_us":99999,"limit_us":%s,"exceeded":true}}\n' "$comps" "$p95lim"
+    # low は p95_us が上限未満なのに exceeded:true・exit 20 を返す不正な出力
+    pv=99999
+    [ "$FAKE_C1_EXCEED" = low ] && pv=2
+    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":40000000,"exceeded":false,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$comps" "$pv" "$p95lim"
     exit 20
   fi
   mkdir -p project/package
@@ -135,6 +146,11 @@ check-runtime-linkage)
     echo $! > "$FAKE_DIR/make.cpid"
     : > "$FAKE_DIR/make.started"
     wait
+  fi
+  if [ -n "${FAKE_MAKE_ORPHAN:-}" ]; then
+    # TERM を無視する孫を残して正常終了する（ラッパーが最後に KILL で片付けること）
+    sh -c 'trap "" TERM; echo $$ > "$FAKE_DIR/orphan.pid"; exec sleep 60' &
+    while [ ! -s "$FAKE_DIR/orphan.pid" ]; do sleep 0.05; done
   fi
   mode=${FAKE_LINK_MODE:-ok}
   [ "$mode" = skip ] && echo "skip: no cargo"
@@ -1153,5 +1169,71 @@ fn req21_sigterm_stops_children_and_records_interrupted() {
             assert!(Instant::now() < deadline, "{name} ({pid}) still alive");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// REQ-30: C-2 で CLI が指定値と違う `limit_bytes` を返したら（上限が伝わっていない）C は failed
+/// （`unexpected_output`）・exit 10。`total_bytes <= limit_bytes` なのに `exceeded:true`・exit 20 を
+/// 返した場合も failed（`capacity_limit_not_enforced`）。
+#[test]
+fn req30_c2_wrong_limit_or_inconsistent_excess_fails() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C"]),
+        &[("FAKE_C2_LIMIT_WRONG", "1")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.stdout, JUDGED_FAIL);
+    assert_eq!(e.q("items.C.status"), "\"failed\"");
+    assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
+
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C"]),
+        &[("FAKE_C2_MODE", "small")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.status"), "\"failed\"");
+    assert_eq!(e.q("items.C.reason"), "\"capacity_limit_not_enforced\"");
+}
+
+/// REQ-31: C-1 で `p95_us` が上限未満なのに `exceeded:true`・exit 20 を返したら C は failed
+/// （`unexpected_output`）。
+#[test]
+fn req31_c1_inconsistent_p95_excess_fails() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C"]),
+        &[("FAKE_C1_EXCEED", "low")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.status"), "\"failed\"");
+    assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.C.case"), "\"C-1\"");
+}
+
+/// REQ-39: 偽 make が TERM を無視する孫を残して正常終了しても、スクリプトの終了後に孫が残らない。
+#[test]
+fn req39_term_ignoring_grandchild_does_not_outlive_script() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "D"]),
+        &[("FAKE_MAKE_ORPHAN", "1")],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    let pid = e.lines("orphan.pid").first().cloned().expect("pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(Instant::now() < deadline, "grandchild {pid} still alive");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

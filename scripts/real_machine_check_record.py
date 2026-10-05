@@ -93,10 +93,13 @@ LIB_RE = re.compile(r"^/(usr/lib|System)/[A-Za-z0-9._+/-]+$")
 FIXTURE_FILES = ("definition.json", "train.jsonl", "evaluation.jsonl")
 INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
-# 子の外側で動く薄い sh。コマンドを子として走らせ、終了後に同じグループの残りへ TERM を送る。
+# 子の外側で動く薄い sh。コマンドを子として走らせ、終了コードを rc ファイル（位置引数 $1）へ
+# 書いてから、自分を含むグループ全体へ KILL を送る（TERM を無視する孫も残さない。REQ-39）。
 # リーダー（この sh）の生存中に行うので、reap 後の killpg による pid 再利用の誤爆がない。
-# trap はハンドラ（`:`）にする（`''` の無視設定は exec 先へ継承されるため使わない）
-GROUP_WRAPPER = 'trap ":" TERM; "$@"; rc=$?; kill -s TERM 0 2>/dev/null; exit $rc'
+# 文字列は定数で、値は位置引数で渡す
+GROUP_WRAPPER = 'RC=$1; shift; "$@"; rc=$?; printf "%s" "$rc" > "$RC"; kill -s KILL 0'
+# rc ファイルの上限（3 桁の整数だけが入る）
+CAP_RC_FILE = 16
 
 
 class Interrupted(BaseException):  # Exception で捕まえられないよう BaseException にする
@@ -175,7 +178,7 @@ def sanitize_record(rec: Any, _in_libs: bool = False) -> Any:
 
 @dataclass
 class RunResult:
-    """子プロセスの結果。`reason` は `timeout`・`output_limit`・`spawn_error`（無ければ None）。"""
+    """子プロセスの結果。reason は `timeout`・`output_limit`・`spawn_error`・`killed` か None。"""
 
     exit_code: int | None
     reason: str | None
@@ -226,7 +229,9 @@ def run_cmd(
     exe = _resolve_exe(argv[0])
     if exe is None:
         return RunResult(None, "spawn_error", 0, 0)
-    full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", exe, *argv[1:]]
+    rc_path = out_path.with_name(out_path.name + ".rc")
+    rc_path.unlink(missing_ok=True)
+    full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
     reason = None
     try:
         with open(out_path, "wb") as fo, open(err_path, "wb") as fe:
@@ -259,7 +264,20 @@ def run_cmd(
     ob, eb = _size(out_path), _size(err_path)
     if reason is None and (ob > out_cap or eb > err_cap):
         reason = "output_limit"
-    return RunResult(None if reason else proc.returncode, reason, ob, eb)
+    if reason is not None:
+        return RunResult(None, reason, ob, eb)
+    code = _read_rc(rc_path)
+    # rc ファイルが無い・読めない（ラッパーが外から KILL された等）は成功扱いにしない（fail-closed）
+    return RunResult(code, None if code is not None else "killed", ob, eb)
+
+
+def _read_rc(path: Path) -> int | None:
+    """rc ファイルを 0〜255 の整数として読む。無い・上限超過・形が違えば None。"""
+    text = read_capped(path, CAP_RC_FILE)
+    if text is None or not re.fullmatch(r"[0-9]{1,3}", text):
+        return None
+    n = int(text)
+    return n if n <= 255 else None
 
 
 def read_capped(path: Path, cap: int) -> str | None:
@@ -663,6 +681,51 @@ def package_files(pdir: Path) -> list[dict[str, Any]] | None:
     return out or None
 
 
+def judge_p95(rc: int, p95: Any, cap: dict[str, Any] | None, limit_us: int) -> str | None:
+    """C-1 の判定。満たさなければ reason、満たせば None。
+
+    CLI の規則は `p95_us > limit_us` で超過（crates/cli/src/stages/package.rs）。exit 20 は p95 超過
+    のときだけで、容量超過など p95 以外の理由の exit 20 は ok にしない。
+    C-1 の capacity が欠落・要約不能・超過のいずれでも `unexpected_output`。
+    """
+    if (
+        not isinstance(p95, dict)
+        or not _is_int(p95.get("p95_us"))
+        or not _is_int(p95.get("limit_us"))
+        or not isinstance(p95.get("exceeded"), bool)
+    ):
+        return "missing_field"
+    exceeded = p95["exceeded"]
+    if exceeded != (p95["p95_us"] > p95["limit_us"]) or exceeded != (rc == 20):
+        return "unexpected_output"
+    if p95["limit_us"] != limit_us or cap is None or cap["exceeded"]:
+        return "unexpected_output"
+    return None
+
+
+def judge_capacity_limit(
+    rc: int, code: Any, cap: dict[str, Any] | None, limit_bytes: int, published: bool
+) -> str | None:
+    """C-2 の判定。満たさなければ reason、満たせば None。
+
+    CLI の規則は `total_bytes > limit_bytes` で超過（上限ちょうどは超過でない。
+    crates/runtime/src/package_outcome.rs）。報告された上限が指定値と一致しない場合は
+    上限が CLI に伝わっていないので `unexpected_output`、それ以外の不成立は
+    `capacity_limit_not_enforced`。
+    """
+    if cap is None or not _is_int(cap["limit_bytes"]) or cap["limit_bytes"] != limit_bytes:
+        return "unexpected_output"
+    if (
+        rc != 20
+        or code != "limit_exceeded"
+        or cap["exceeded"] is not True
+        or not cap["total_bytes"] > cap["limit_bytes"]
+        or published
+    ):
+        return "capacity_limit_not_enforced"
+    return None
+
+
 def item_c(ctx: Ctx) -> dict[str, Any]:
     """C: 上限つきの定義で package を実行する（C-1 は p95、C-2 は容量上限で exit 20 が期待）。"""
     c1 = ctx.work / "C1"
@@ -673,16 +736,9 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
         return dict(failure, case="C-1", steps=steps1)
     rc1 = next(s["exit_code"] for s in steps1 if s["step"] == "package")
     p95 = pkg1.get("infer_p95") if isinstance(pkg1, dict) else None
-    if (
-        not isinstance(p95, dict)
-        or not _is_int(p95.get("p95_us"))
-        or not _is_int(p95.get("limit_us"))
-        or not isinstance(p95.get("exceeded"), bool)
-    ):
-        return fail_item("missing_field", case="C-1", step="package", exit_code=rc1)
-    # exit 20 なら p95 超過、exit 0 なら超過なし。指定した上限が CLI に伝わっていること
-    if p95["exceeded"] != (rc1 == 20) or p95["limit_us"] != ctx.p95_limit_us:
-        return fail_item("unexpected_output", case="C-1", step="package", exit_code=rc1)
+    reason1 = judge_p95(rc1, p95, capacity_summary(pkg1), ctx.p95_limit_us)
+    if reason1 is not None:
+        return fail_item(reason1, case="C-1", step="package", exit_code=rc1)
     p95_rec = {
         "p95_us": p95["p95_us"],
         "limit_us": p95["limit_us"],
@@ -713,16 +769,14 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
         ),
         "package_published": published,
     }
-    ok = (
-        rc2 == 20
-        and code2 == "limit_exceeded"
-        and cap2 is not None
-        and cap2["exceeded"] is True
-        and not published
-    )
-    rec = {"status": "ok" if ok else "failed", "p95": p95_rec, "capacity_limit": limit_rec}
-    if not ok:
-        rec["reason"] = "capacity_limit_not_enforced"
+    reason2 = judge_capacity_limit(rc2, code2, cap2, ctx.package_limit_bytes, published)
+    rec = {
+        "status": "ok" if reason2 is None else "failed",
+        "p95": p95_rec,
+        "capacity_limit": limit_rec,
+    }
+    if reason2 is not None:
+        rec["reason"] = reason2
     return rec
 
 
@@ -816,6 +870,7 @@ def compare_infer(
 
     `predicted_label` が str でない・両側で異なる行、スコアに NaN・無限大・非数がある行は不一致。
     `max_abs_score_diff` は有限の差だけから求める（非有限は `scores_nonfinite` として数える）。
+    許容差（`SCORE_TOLERANCE`）を超えた行の id も `mismatch_ids` に入れる。
     """
     label_match = 0
     scores_exact = 0
@@ -831,13 +886,15 @@ def compare_infer(
         same_label = isinstance(bl, str) and isinstance(sl, str) and bl == sl
         bs, ss = b.get("scores"), s.get("scores")
         finite = isinstance(bs, dict) and isinstance(ss, dict)
+        row_diff = 0.0
         if finite:
             for k in set(bs) | set(ss):
                 x, y = bs.get(k), ss.get(k)
                 if not (_is_finite_number(x) and _is_finite_number(y)):
                     finite = False
                     continue
-                max_diff = max(max_diff, abs(float(x) - float(y)))
+                row_diff = max(row_diff, abs(float(x) - float(y)))
+        max_diff = max(max_diff, row_diff)
         if same_label:
             label_match += 1
         if finite:
@@ -845,7 +902,8 @@ def compare_infer(
                 scores_exact += 1
         else:
             nonfinite += 1
-        if not same_label or not finite:
+        # 許容差を超えた行も mismatch_ids へ入れる（件数欄の意味は変えない）
+        if not same_label or not finite or not (row_diff <= SCORE_TOLERANCE):
             mismatch_ids.append(rid)
     return {
         "label_match": label_match,

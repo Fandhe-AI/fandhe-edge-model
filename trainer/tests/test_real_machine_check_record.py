@@ -585,3 +585,134 @@ def test_main_rejects_invalid_arguments_without_traceback(
     assert mod.main(argv) == 64
     out = json.loads(capsys.readouterr().out)
     assert out["code"] == "invalid_input"
+
+
+def _run(tmp_path: Path, argv: list[str], name: str = "o") -> Any:
+    return mod.run_cmd(argv, tmp_path, tmp_path / name, tmp_path / (name + ".e"), 20, 4096, 4096)
+
+
+@pytest.mark.parametrize(("script", "want"), [("exit 0", 0), ("exit 20", 20), ("kill -9 $$", 137)])
+def test_run_cmd_propagates_exit_code_through_wrapper(
+    tmp_path: Path, script: str, want: int
+) -> None:
+    """REQ-39: ラッパーが rc ファイル経由で終了コード（子が KILL で死んだ 137 を含む）を伝える。"""
+    r = _run(tmp_path, ["/bin/sh", "-c", script])
+    assert (r.exit_code, r.reason) == (want, None)
+
+
+def test_run_cmd_kills_term_ignoring_grandchild_after_normal_exit(tmp_path: Path) -> None:
+    """REQ-39: コマンドが正常終了しても、TERM を無視してグループに残った孫を KILL で止める。"""
+    pidfile = tmp_path / "gpid"
+    script = f'trap "" TERM; sleep 60 & echo $! > "{pidfile}"; exit 0'
+    r = _run(tmp_path, ["/bin/sh", "-c", script])
+    assert (r.exit_code, r.reason) == (0, None)
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_run_cmd_is_not_success_when_rc_file_is_missing(tmp_path: Path) -> None:
+    """REQ-39: ラッパーが外から KILL され rc ファイルが無いときは exit_code None（fail-closed）。"""
+    r = _run(tmp_path, ["/bin/sh", "-c", "kill -9 $PPID; sleep 0.3"])
+    assert (r.exit_code, r.reason) == (None, "killed")
+
+
+def test_run_cmd_passes_awkward_arguments_as_single_arguments(tmp_path: Path) -> None:
+    """REQ-39: `-n`・`$HOME`・`*`・改行を含む引数がシェルに解釈されず 1 引数のまま渡る。"""
+    script = 'printf "%s|" "$#" "$1" "$2" "$3" "$4"'
+    r = _run(tmp_path, ["/bin/sh", "-c", script, "sh", "-n", "$HOME", "*", "a\nb"])
+    assert r.exit_code == 0
+    assert (tmp_path / "o").read_text() == "4|-n|$HOME|*|a\nb|"
+
+
+def _cap(total: int, limit: Any, exceeded: bool) -> dict[str, Any]:
+    return {"total_bytes": total, "limit_bytes": limit, "exceeded": exceeded, "components": {}}
+
+
+def test_judge_capacity_limit_checks_reported_limit_and_boundary() -> None:
+    """C-2: 報告された上限が指定値と一致し、total > limit で exceeded のときだけ ok。"""
+    ok = mod.judge_capacity_limit
+    assert ok(20, "limit_exceeded", _cap(1001, 1000, True), 1000, False) is None
+    assert ok(20, "limit_exceeded", _cap(1001, 999, True), 1000, False) == "unexpected_output"
+    assert ok(20, "limit_exceeded", _cap(1001, None, True), 1000, False) == "unexpected_output"
+    assert ok(20, "limit_exceeded", None, 1000, False) == "unexpected_output"
+    # 上限ちょうどは超過でない（CLI の規則は total_bytes > limit_bytes）
+    want = "capacity_limit_not_enforced"
+    assert ok(20, "limit_exceeded", _cap(1000, 1000, True), 1000, False) == want
+    assert ok(20, "limit_exceeded", _cap(1001, 1000, False), 1000, False) == want
+    assert ok(0, "limit_exceeded", _cap(1001, 1000, True), 1000, False) == want
+    assert ok(20, "invalid_input", _cap(1001, 1000, True), 1000, False) == want
+    assert ok(20, "limit_exceeded", _cap(1001, 1000, True), 1000, True) == want
+
+
+def test_judge_p95_requires_value_exceeded_exit_code_consistency() -> None:
+    """C-1: exceeded は p95_us > limit_us と exit 20 の両方と一致し、容量超過の exit 20 は不可。"""
+    j = mod.judge_p95
+    limit = 50000
+    over = {"p95_us": 60000, "limit_us": limit, "exceeded": True}
+    under = {"p95_us": 4, "limit_us": limit, "exceeded": False}
+    good = _cap(5, 40000000, False)
+    assert j(20, over, good, limit) is None
+    assert j(0, under, good, limit) is None
+    # capacity が欠落・要約不能なら、p95 側が整合していても不合格
+    assert j(0, under, None, limit) == "unexpected_output"
+    assert j(20, over, None, limit) == "unexpected_output"
+    # p95 が上限未満なのに exceeded true かつ exit 20
+    assert j(20, dict(under, exceeded=True), good, limit) == "unexpected_output"
+    # p95 が上限超過なのに exceeded false
+    assert j(0, dict(over, exceeded=False), good, limit) == "unexpected_output"
+    # p95 は超過していないが容量超過で exit 20（p95 以外の理由）
+    assert j(20, under, _cap(9, 5, True), limit) == "unexpected_output"
+    assert j(0, under, _cap(9, 5, True), limit) == "unexpected_output"
+    assert j(0, dict(under, limit_us=7), good, limit) == "unexpected_output"
+    assert j(0, {"p95_us": 1}, good, limit) == "missing_field"
+
+
+def test_compare_infer_lists_rows_over_tolerance_in_mismatch_ids() -> None:
+    """REQ-28: ラベルが一致しても、スコア差が許容差を超えた行の id は mismatch_ids に入る。"""
+    batch = {
+        "a": {"predicted_label": "x", "scores": {"x": 0.5}},
+        "b": {"predicted_label": "x", "scores": {"x": 0.5}},
+    }
+    single = {
+        "a": {"predicted_label": "x", "scores": {"x": 0.5 + 1e-12}},
+        "b": {"predicted_label": "x", "scores": {"x": 0.5 + 1e-6}},
+    }
+    cmp = mod.compare_infer(batch, single)
+    assert cmp["mismatch_ids"] == ["b"]
+    assert (cmp["label_match"], cmp["label_mismatch"]) == (2, 0)
+
+
+def test_item_e_writes_nonempty_mismatch_ids_when_scores_differ(tmp_path: Path) -> None:
+    """REQ-28: E が failed のとき mismatch-ids.txt は空にならない（スコア差のみの不一致でも）。"""
+    fake = tmp_path / "fake-cli"
+    fake.write_text(
+        f"""#!{sys.executable}
+import json, sys
+a = sys.argv[1:]
+if "--input-file" in a:
+    for line in open(a[a.index("--input-file") + 1]):
+        r = json.loads(line)
+        print(json.dumps({{"id": r["id"], "status": "ok", "predicted_label": "x",
+                          "scores": {{"x": 0.5}}}}))
+else:
+    print(json.dumps({{"id": a[a.index("--id") + 1], "status": "ok", "predicted_label": "x",
+                      "scores": {{"x": 0.6}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    ctx = _ctx(tmp_path / "w", fake)
+    ctx.work.mkdir()
+    assert mod.stage_inputs(ctx, ctx.work / "B", None)
+    res = mod.item_e(ctx)
+    assert (res["status"], res["reason"], res["label_mismatch"]) == ("failed", "mismatch", 0)
+    ids = (ctx.work / "E" / "mismatch-ids.txt").read_text().split()
+    assert len(ids) == res["records"] == 90
