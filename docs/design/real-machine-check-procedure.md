@@ -219,24 +219,25 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 **重要**: `evaluation.jsonl`（凍結した評価データ）は使いません。学習データ（`train.jsonl`）を使うことで、REQ-27（評価の独立性）を保ちます。
 
-- **確かめること**: 1 件ずつの推論とバッチ推論の予測ラベルが全件一致し、スコアに NaN・無限大がなく、差が許容値以下であること。
+- **確かめること**: 1 件ずつの推論とバッチ推論の予測ラベルが全件一致し、スコアに NaN・無限大がなく、スコアが全件で完全に一致すること。
 - **想定する終了コード**: 0
-- **E の合格条件**: B が `ok` + 次の整合 + 予測ラベル不一致 0 件 + NaN・無限大 0 件 + スコア差の最大値が 1e-9 以下
+- **E の合格条件**: B が `ok` + 次の整合 + 予測ラベル不一致 0 件 + NaN・無限大 0 件 + スコアが全件で完全に一致（`scores_exact_match` が件数と同じ）
+  - 根拠: 同一実装の単体対バッチはスコアも含めて完全一致を要求する（`runtime-batch-mismatch-procedure.md`。REQ-28）。スコア差の最大値は参考値で、合否には使わない
   - バッチ出力の行数が入力の件数と一致し、各行が JSON で `status` が `ok`・`id` が文字列で重複なし
   - バッチの各行と単体の出力が、どちらも infer の規則（`predicted_label` が選択肢 ID・`scores` のキー集合が選択肢 ID と一致・各値が有限で 0 以上 1 以下・和が 1 から 1e-6 以内・`predicted_label` が最大スコアの選択肢〔同点は定義の宣言順で先頭〕）を満たし、単体の出力の `id` が入力の `id` と一致
 - **E が実行されない場合**（`not_run`）: B が要求されていない（`requires_B`）、または前の項目が失敗している（`previous_item_failed`。B の失敗を含む）
-- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測またはスコアが一致しない。NaN・無限大も含む）、`unexpected_output`（バッチ側は行数の不一致・`status` が `ok` でない・出力に `step` の欄がある・`id` が文字列でない・`id` の重複・infer の規則の不整合〔`step` は `infer-batch`〕。単体側は stdout が JSON オブジェクトとして読めない〔JSON でない・入れ子が深すぎる・空の dict〕・`status` が `ok` でない・出力に `step` の欄がある・`id` が入力と一致しない・infer の規則の不整合〔`step` は `infer-single`〕）、`invalid_json`（バッチの行が JSON として読めない〔JSON でない・入れ子が深すぎる〕場合だけ。`step` は `infer-batch`。単体側は `invalid_json` にならない）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`。`timeout`・`output_limit`・`spawn_error`・`killed`・`unexpected_exit_code` を含む）
+- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測ラベルが一致しない、またはスコアが完全一致でない〔少しでも違えば失敗〕。NaN・無限大も含む）、`unexpected_output`（バッチ側は行数の不一致・`status` が `ok` でない・出力に `step` の欄がある・`id` が文字列でない・`id` の重複・infer の規則の不整合〔`step` は `infer-batch`〕。単体側は stdout が JSON オブジェクトとして読めない〔JSON でない・入れ子が深すぎる・空の dict〕・`status` が `ok` でない・出力に `step` の欄がある・`id` が入力と一致しない・infer の規則の不整合〔`step` は `infer-single`〕）、`invalid_json`（バッチの行が JSON として読めない〔JSON でない・入れ子が深すぎる〕場合だけ。`step` は `infer-batch`。単体側は `invalid_json` にならない）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`。`timeout`・`output_limit`・`spawn_error`・`killed`・`unexpected_exit_code` を含む）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` / `"failed"` / `"not_run"`
   - `reason`（`not_run` 時）: `requires_B`・`previous_item_failed`
   - `records`: 推論した件数
   - `label_match`・`label_mismatch`: 予測ラベルの一致数・不一致数
-  - `scores_exact_match`: スコアが完全に一致した件数
-  - `scores_nonfinite`: スコアに NaN・無限大があった件数
-  - `max_abs_score_diff`: 有限なスコア差の最大値（非有限は除外）
+  - `scores_exact_match`: スコアが完全に一致した件数（合否に使う。件数と同じでなければ失敗）
+  - `scores_nonfinite`: スコアに NaN・無限大があった件数（合否に使う。1 件でもあれば失敗）
+  - `max_abs_score_diff`: 有限なスコア差の最大値（非有限は除外）。参考値で、合否には使わない
   - `input_sha256`: 推論に使った入力ファイルのハッシュ
   - `reason`（失敗時のみ）: `mismatch`
-  - 失敗時の詳細は `.../E/mismatch-ids.txt` に以下のいずれかに該当する `id` を記録（1 行ずつ）：予測ラベル不一致・スコアに NaN・無限大・スコア差が許容差超過
+  - 失敗時の詳細は `.../E/mismatch-ids.txt` に以下のいずれかに該当する `id` を記録（1 行ずつ）：予測ラベル不一致・スコアに NaN・無限大・スコアが完全一致でない（少しでも違う）
 
 ### 4-F. ガード層の時間制限テスト再発確認（#346）
 
