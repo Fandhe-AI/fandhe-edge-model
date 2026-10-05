@@ -3949,9 +3949,30 @@ def test_run_overall_timeout_in_cli_build_marks_all_items_not_run(
     overall = {"status": "not_run", "reason": "overall_timeout"}
     assert rec["items"]["B"] == overall
     assert rec["items"]["C"] == overall
+    md = (tmp_path / "w" / "record.md").read_text()
+    assert "全体の上限時間（overall_timeout）を超えたため未採取" in md
+    assert "中断されたため未採取" not in md
     pids = _pids(pidfile)
     assert len(pids) == 2
     assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def test_run_overall_expiry_after_last_item_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39・#364: 最後の項目が ok で終わった後に期限を過ぎていた場合も、期限を下ろす前に
+    超過を判定し、成功にせず exit 10 で `overall_timeout_exceeded` を記録する。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        time.sleep(1.3)  # 子を使わず、項目が ok のまま期限（1 秒）を過ぎる
+        return {"status": "ok"}, True
+
+    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B", fake, 1)
+    assert rc == 10
+    assert json.loads(capsys.readouterr().out)["message"] == "overall time limit exceeded"
+    assert rec["overall_timeout_exceeded"] is True
+    assert rec["items"]["B"] == {"status": "ok"}
+    assert "上限時間" in (tmp_path / "w" / "record.md").read_text()
 
 
 def test_interrupt_wins_over_overall_timeout(

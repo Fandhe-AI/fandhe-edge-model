@@ -2389,7 +2389,7 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "- 注意: 子プロセスの回収が上限時間内に終わらなかった（子・孫が残っている可能性。"
             "`ps` で確認し、残っていれば手で止める。結果を採用しない）"
         )
-    if any(
+    if rec.get("overall_timeout_exceeded") is True or any(
         it.get("reason") == REASON_OVERALL_TIMEOUT
         for it in rec["items"].values()
         if isinstance(it, dict)
@@ -2409,14 +2409,23 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "- 注意: 開始時と終了時の commit・worktree_clean・CLI の sha256 の一致を"
             "確認できなかった（採取不能。成功扱いにしない）"
         )
+    # 未採取の理由は中断（シグナル）と全体の上限時間の超過で書き分ける
+    if rec.get("overall_timeout_exceeded") is True or any(
+        it.get("reason") == REASON_OVERALL_TIMEOUT
+        for it in rec["items"].values()
+        if isinstance(it, dict)
+    ):
+        not_collected = "項目の開始前に全体の上限時間（overall_timeout）を超えたため未採取"
+    else:
+        not_collected = "項目の開始前に中断されたため未採取"
     lines += ["", "## 環境", "", "| 項目 | 値 |", "| ---- | -- |"]
     if env is None:
-        lines.append("| (not collected) | 項目の開始前に中断されたため未採取 |")
+        lines.append(f"| (not collected) | {not_collected} |")
     for k, v in (env or {}).items():
         lines.append(f"| {_cell(k)} | {_cell(v)} |")
     lines += ["", "## 入力と指定", "", "| 項目 | 値 |", "| ---- | -- |"]
     if rec.get("inputs") is None:
-        lines.append("| (not collected) | 項目の開始前に中断されたため未採取 |")
+        lines.append(f"| (not collected) | {not_collected} |")
     for k, v in (rec.get("inputs") or {}).items():
         lines.append(f"| {_cell(k)} | {_cell(v)} |")
     for k, v in rec["options"].items():
@@ -2735,6 +2744,12 @@ def _run(args: argparse.Namespace) -> int:
     # 記録を書く直前に印を 1 回だけ読む。書き出し中に届いた中断は結果を変えない（印を立てるだけ）
     if _interrupt_requested:
         interrupted = True
+    # 期限を下ろす前に超過を判定する。最後の項目の終了後に期限を過ぎていた場合も成功にしない
+    # （REQ-39）。項目自身の status は書き換えず、超過は別軸（`overall_timeout_exceeded`）で記録する
+    if not exceeded and not interrupted and overall_expired():
+        exceeded = True
+    if exceeded:
+        rec["overall_timeout_exceeded"] = True
     clear_overall()  # 終了時の再採取と記録の書き出しは期限の外で行う（所要は子ごとの上限で頭打ち）
     if rec["environment"] is not None:
         end_vol: dict[str, Any] | None = None
