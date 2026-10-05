@@ -3896,19 +3896,21 @@ def test_run_overall_timeout_marks_running_item_failed_and_rest_not_run(
     期限の外で行われる（commit_end が入る）。"""
 
     def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        # 前半の所要に依らないよう、期限は項目の中で張り直す（遅い CI での競合を避ける）
+        mod._overall_deadline = time.monotonic() + 0.5
         r = mod.run_cmd(
             ["/bin/sh", "-c", "sleep 30"], ctx.work, ctx.work / "o", ctx.work / "e", 20, 1, 1
         )
         return {"status": "ok", "exit_code": r.exit_code}, True
 
-    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B,C", fake, 1)
+    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B,C", fake, 600)
     assert rc == 10
     assert json.loads(capsys.readouterr().out) == {
         "code": "judged_fail",
         "message": "overall time limit exceeded",
         "record": "record.json",
     }
-    assert rec["options"]["overall_timeout_sec"] == 1
+    assert rec["options"]["overall_timeout_sec"] == 600
     assert rec["items"]["B"] == {"status": "failed", "reason": "overall_timeout"}
     assert rec["items"]["C"] == {"status": "not_run", "reason": "overall_timeout"}
     assert re.fullmatch(r"[0-9a-f]{40}", rec["environment"]["commit_end"])
@@ -3964,15 +3966,20 @@ def test_run_overall_expiry_after_last_item_is_not_success(
     超過を判定し、成功にせず exit 10 で `overall_timeout_exceeded` を記録する。"""
 
     def fake(ctx: Any, name: str, b_ok: bool) -> Any:
-        time.sleep(1.3)  # 子を使わず、項目が ok のまま期限（1 秒）を過ぎる
+        # 前半の所要に依らないよう期限を張り直し、子を使わず ok のまま過ぎる
+        mod._overall_deadline = time.monotonic() + 0.2
+        time.sleep(0.6)
         return {"status": "ok"}, True
 
-    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B", fake, 1)
+    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B", fake, 600)
     assert rc == 10
     assert json.loads(capsys.readouterr().out)["message"] == "overall time limit exceeded"
     assert rec["overall_timeout_exceeded"] is True
     assert rec["items"]["B"] == {"status": "ok"}
-    assert "上限時間" in (tmp_path / "w" / "record.md").read_text()
+    md = (tmp_path / "w" / "record.md").read_text()
+    assert "上限時間" in md
+    # 項目が ok のまま超過した場合の注記（実行中の項目が failed とは述べない）
+    assert "全項目の完了後" in md
 
 
 def test_interrupt_wins_over_overall_timeout(

@@ -2389,14 +2389,20 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "- 注意: 子プロセスの回収が上限時間内に終わらなかった（子・孫が残っている可能性。"
             "`ps` で確認し、残っていれば手で止める。結果を採用しない）"
         )
-    if rec.get("overall_timeout_exceeded") is True or any(
+    cut_items = any(
         it.get("reason") == REASON_OVERALL_TIMEOUT
         for it in rec["items"].values()
         if isinstance(it, dict)
-    ):
+    )
+    if cut_items:
         lines.append(
             "- 注意: 実行全体の上限時間（`options.overall_timeout_sec`）を超えて打ち切った"
             "（実行中の項目は failed、残りは not_run。結果を採用しない）"
+        )
+    elif rec.get("overall_timeout_exceeded") is True:
+        lines.append(
+            "- 注意: 実行全体の上限時間（`options.overall_timeout_sec`）を"
+            "全項目の完了後に超えていた（各項目の status は変えていない。結果を採用しない）"
         )
     stable = (rec.get("environment") or {}).get("stable")
     if stable is False:
