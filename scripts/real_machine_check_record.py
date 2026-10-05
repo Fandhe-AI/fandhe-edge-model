@@ -564,15 +564,28 @@ def _read_regular_capped(path: Path, cap: int) -> str | None:
 def _open_write_nofollow(path: Path, excl: bool) -> Any:
     """symlink を辿らずに通常ファイルを書き込み用に開く（0600）。通常ファイルでなければ OSError。
 
-    `excl` なら新規作成のみ（O_EXCL）、でなければ切り詰め。
+    `excl` なら新規作成のみ（O_EXCL）、でなければ既存を切り詰める。
     先に置かれた symlink へ書かない（REQ-39・#359）。
+
+    FIFO は読み手が居ないと open が無期限に止まるため、O_NONBLOCK で開く（読み手が居なければ
+    ENXIO で失敗する）。通常ファイルと確認してからブロッキングへ戻す。切り詰めは確認後に行う
+    （O_TRUNC を open に付けると、ハードリンクで作られた標的を検査前に切り詰めてしまう）。
+    リンク数が 1 でない既存ファイル（ハードリンク）は拒否する。
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    flags |= os.O_EXCL if excl else os.O_TRUNC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    if excl:
+        flags |= os.O_EXCL
     fd = os.open(path, flags, 0o600)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise OSError("not a regular file")
+        if st.st_nlink != 1:
+            raise OSError("file has multiple hard links")
+        os.set_blocking(fd, True)
+        if not excl:
+            os.ftruncate(fd, 0)
         return os.fdopen(fd, "wb")
     except BaseException:
         os.close(fd)

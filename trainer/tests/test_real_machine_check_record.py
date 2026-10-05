@@ -8,6 +8,7 @@ REQ-39（子プロセスの上限時間・出力サイズ上限）・REQ-27（�
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -2531,6 +2532,29 @@ def test_run_cmd_refuses_symlinked_stdout_file(tmp_path: Path) -> None:
     (tmp_path / "o").symlink_to(target)
     r = mod.run_cmd(["/bin/echo", "hi"], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 100)
     assert (r.exit_code, r.reason) == (None, "spawn_error")
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_run_cmd_does_not_block_on_preplaced_fifo_output(tmp_path: Path) -> None:
+    """REQ-39: 出力先に FIFO が先置きされても open で固まらず spawn_error になる（#359）。"""
+    os.mkfifo(tmp_path / "o")
+    t0 = time.monotonic()
+    r = mod.run_cmd(["/bin/echo", "hi"], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 100)
+    assert (r.exit_code, r.reason) == (None, "spawn_error")
+    assert time.monotonic() - t0 < 4
+
+
+def test_write_text_nofollow_refuses_fifo_and_hardlink_without_truncating(tmp_path: Path) -> None:
+    """REQ-39: FIFO は即失敗、ハードリンクの標的は切り詰めずに拒否する（#359）。"""
+    os.mkfifo(tmp_path / "f")
+    with pytest.raises(OSError, match=r"Errno 6") as ei:
+        mod.write_text_nofollow(tmp_path / "f", "x")
+    assert ei.value.errno == errno.ENXIO
+    target = tmp_path / "victim"
+    target.write_text("keep", encoding="utf-8")
+    os.link(target, tmp_path / "hl")
+    with pytest.raises(OSError, match="hard links"):
+        mod.write_text_nofollow(tmp_path / "hl", "x")
     assert target.read_text(encoding="utf-8") == "keep"
 
 
