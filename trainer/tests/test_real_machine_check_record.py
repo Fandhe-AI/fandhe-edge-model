@@ -3354,3 +3354,95 @@ def test_run_cmd_timeout_kills_term_ignoring_grandchild(tmp_path: Path) -> None:
     pids = _pids(pidfile)
     assert len(pids) == 1
     assert _wait_for(lambda: not _alive(pids[0]), 10)
+
+
+def test_item_f_stops_at_unreaped_and_fails_with_reason_unreaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: F は回収を諦めた回で打ち切り、次の回を始めず failed（reason: unreaped）にする。"""
+    ctx = _ctx(tmp_path / "w", _fake_cli(tmp_path, "exit 0\n"))
+    ctx.work.mkdir()
+    ctx.repeat = 5
+    ctx.cargo_cmd = str(
+        _script(tmp_path, "cg", 'case "$*" in *--no-run*) exit 0;; esac\n' + _list_script(3))
+    )
+    calls: list[int] = []
+    real = mod.run_cmd
+
+    def fake(argv: Any, cwd: Any, out: Path, *a: Any, **k: Any) -> Any:
+        if out.name.startswith("run-"):
+            calls.append(1)
+            return mod.RunResult(None, mod.REASON_UNREAPED, 0, 0)
+        return real(argv, cwd, out, *a, **k)
+
+    monkeypatch.setattr(mod, "run_cmd", fake)
+    res = mod.item_f(ctx)
+    assert len(calls) == 1
+    assert (res["status"], res["reason"], res["failed"], res["killed"]) == (
+        "failed",
+        "unreaped",
+        1,
+        0,
+    )
+
+
+def test_second_signal_after_final_json_does_not_write_a_second_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21・REQ-33: 最終 JSON の後の 2 回目のシグナルは強制終了の行を書かない。"""
+    monkeypatch.setattr(mod, "_final_emitted", False)
+    monkeypatch.setattr(mod, "_signal_count", 1)
+    writes: list[bytes] = []
+    monkeypatch.setattr(mod.os, "write", lambda fd, b: writes.append(b) or len(b))
+
+    def no_exit(code: int) -> None:
+        raise AssertionError("exit")
+
+    monkeypatch.setattr(mod.os, "_exit", no_exit)
+    assert mod.emit("runtime_error", "interrupted", 70, True) == 70
+    mod._on_signal(signal.SIGTERM, None)
+    assert writes == []
+    assert capsys.readouterr().out.count("\n") == 1
+
+
+def test_second_signal_during_spawn_window_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: Popen から pgid 登録までの間の 2 回目のシグナルは強制終了せず保留する。"""
+    monkeypatch.setattr(mod, "_final_emitted", False)
+    monkeypatch.setattr(mod, "_force_pending", False)
+    monkeypatch.setattr(mod, "_spawning", True)
+    monkeypatch.setattr(mod, "_signal_count", 1)
+
+    def no_exit(code: int) -> None:
+        raise AssertionError("exit")
+
+    monkeypatch.setattr(mod.os, "_exit", no_exit)
+    mod._on_signal(signal.SIGTERM, None)
+    assert mod._force_pending is True
+
+
+def test_build_cli_unreaped_reports_child_may_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: CLI のビルドで回収を諦めても、record が無くても stderr に残留の可能性を出す。"""
+    monkeypatch.setattr(mod, "collect_inputs", lambda repo: {"x": 1})
+
+    def fake_build(ctx: Any) -> None:
+        mod._child_may_remain = True
+
+    monkeypatch.setattr(mod, "build_cli", fake_build)
+    ns = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin_override=False,
+        quiet_machine=False,
+    )
+    (tmp_path / "w").mkdir()
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    try:
+        assert mod.run(ns) == 70
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    assert "a child process may remain" in capsys.readouterr().err

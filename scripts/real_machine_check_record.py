@@ -212,6 +212,14 @@ _signal_count = 0
 # 2 回目のシグナルのハンドラが KILL を送る宛先。回収から下ろすまでの数命令の窓で pid が
 # 再利用される誤爆の余地は既知の限界（確率は無視できる）
 _active_pgid: int | None = None
+# `Popen` の呼び出しから `_active_pgid` の登録までの間だけ立てる印。この間は宛先の pgid が
+# まだ無いため、2 回目のシグナルでも強制終了せず `_force_pending` を立てて戻る（REQ-39）
+_spawning = False
+# 起動の窓の間に 2 回目のシグナルを受けた印。登録の直後に `run_cmd` が強制終了する
+_force_pending = False
+# 最終の JSON を stdout へ書き始めた印。以後の 2 回目のシグナルは強制終了の行を書かず無視し、
+# stdout の JSON を 1 つに保つ（REQ-21・REQ-33）
+_final_emitted = False
 # 子の回収が上限時間内に終わらず、子（またはその孫）が残っている可能性がある印（REQ-39）。
 # record の `child_may_remain` へ出す。`run()` の冒頭で下ろす
 _child_may_remain = False
@@ -553,7 +561,7 @@ def run_cmd(
         # パスがディレクトリ・削除不能のとき。例外を外へ出さず、子を起動しない（#359）
         return RunResult(None, "spawn_error", 0, 0)
     full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
-    global _active_pgid, _child_may_remain
+    global _active_pgid, _child_may_remain, _spawning
     reason = None
     spawn_failed = False
     try:
@@ -561,16 +569,22 @@ def run_cmd(
             _open_write_nofollow(out_path, False) as fo,
             _open_write_nofollow(err_path, False) as fe,
         ):
-            proc = subprocess.Popen(  # noqa: S603  引数リストで起動する。argv は固定語彙と検証済みの値のみ
-                full,
-                cwd=str(cwd),
-                stdin=subprocess.DEVNULL,
-                stdout=fo,
-                stderr=fe,
-                env=env,
-                start_new_session=True,
-            )
-            _active_pgid = proc.pid
+            _spawning = True
+            try:
+                proc = subprocess.Popen(  # noqa: S603  引数リストで起動する。argv は固定語彙と検証済みの値のみ
+                    full,
+                    cwd=str(cwd),
+                    stdin=subprocess.DEVNULL,
+                    stdout=fo,
+                    stderr=fe,
+                    env=env,
+                    start_new_session=True,
+                )
+                _active_pgid = proc.pid
+            finally:
+                _spawning = False
+            if _force_pending:
+                _force_exit(_active_pgid)  # 起動の窓で受けた 2 回目のシグナル。戻らない
             try:
                 deadline = time.monotonic() + timeout
                 while proc.poll() is None:
@@ -1916,6 +1930,7 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
     load_start = load_average()
     passed = failed = timeouts = no_tests = count_mismatch = 0
     output_limit = killed = spawn_error = incomplete = plain = 0
+    unreaped = False
     for i in range(1, ctx.repeat + 1):
         log = fdir / f"run-{i:04d}.log"
         r = run_cmd(
@@ -1932,10 +1947,15 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
             timeouts += 1
         elif r.reason == "output_limit":
             output_limit += 1
-        elif r.reason in ("killed", REASON_UNREAPED):
+        elif r.reason == "killed":
             killed += 1
         elif r.reason == "spawn_error":
             spawn_error += 1
+        if r.reason == REASON_UNREAPED:
+            # 子が残っている可能性がある。次の回を始めず、この回を失敗として打ち切る（fail-closed）
+            failed += 1
+            unreaped = True
+            break
         text = read_capped(log, CAP_LOG_STDOUT) or ""
         ran, ran_failed, ran_ignored = test_result_totals(text)
         # 合格は「exit 0・失敗なし・passed が `--list` の件数と一致・ignored 0」
@@ -1975,7 +1995,7 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
         "load_end": load_average(),
     }
     if failed:
-        rec["reason"] = "test_failures"
+        rec["reason"] = REASON_UNREAPED if unreaped else "test_failures"
     return rec
 
 
@@ -2316,6 +2336,8 @@ def render_markdown(rec: dict[str, Any]) -> str:
 
 def emit(code: str, message: str, exit_code: int, with_record: bool) -> int:
     """stdout へ固定メッセージの JSON を 1 行だけ出す（パスは書かない）。"""
+    global _final_emitted
+    _final_emitted = True  # 以後の 2 回目のシグナルが 2 行目を書かないようにする
     obj: dict[str, Any] = {"code": code, "message": message}
     if with_record:
         obj["record"] = "record.json"
@@ -2330,12 +2352,21 @@ def _on_signal(signum: int, frame: Any) -> None:
     止める口。REQ-39）。子のグループへ KILL を送り、固定 JSON を 1 行書いて exit 70 する。
     `Popen` の内部（`_waitpid_lock`）に触れず、例外も投げない。record は書かない。
     """
-    global _interrupt_requested, _signal_count
+    global _interrupt_requested, _signal_count, _force_pending
     _interrupt_requested = True
     _signal_count += 1
     if _signal_count < 2:
         return
-    pgid = _active_pgid
+    if _final_emitted:
+        return  # 最終の JSON を書き始めた後。後始末は済んでいるので 2 行目は書かない
+    if _spawning:
+        _force_pending = True  # pgid が未登録。登録の直後に `run_cmd` が強制終了する
+        return
+    _force_exit(_active_pgid)
+
+
+def _force_exit(pgid: int | None) -> None:
+    """子のグループへ KILL を送り、固定 JSON を 1 行書いて exit 70 する（戻らない）。"""
     if pgid is not None:
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -2346,6 +2377,13 @@ def _on_signal(signum: int, frame: Any) -> None:
     except OSError:
         pass
     os._exit(EXIT_RUNTIME_ERROR)
+
+
+def _warn_child_may_remain() -> None:
+    """子が残っている可能性を stderr へ 1 行出す（`_child_may_remain` が立っているときだけ）。"""
+    if _child_may_remain:
+        sys.stderr.write("a child process may remain\n")
+        sys.stderr.flush()
 
 
 def build_cli(ctx: Ctx) -> Path | None:
@@ -2426,8 +2464,12 @@ def run(args: argparse.Namespace) -> int:
     すべて `not_run`（`interrupted`）にした記録を書く（REQ-21・REQ-39）。
     """
     global _interrupt_requested, _signal_count, _active_pgid, _child_may_remain
+    global _spawning, _force_pending, _final_emitted
     _interrupt_requested = False  # 前の回の印を引き継がない
     _signal_count = 0
+    _spawning = False
+    _force_pending = False
+    _final_emitted = False
     _active_pgid = None
     _child_may_remain = False
     os.umask(0o077)
@@ -2478,12 +2520,14 @@ def run(args: argparse.Namespace) -> int:
     try:
         inputs = collect_inputs(ctx.repo)
         if inputs is None:
+            _warn_child_may_remain()
             return emit("runtime_error", "cannot read fixture inputs", EXIT_RUNTIME_ERROR, False)
         rec["inputs"] = inputs
         cli_profile: str | None = None
         if not args.bin_override:
             built = build_cli(ctx)
             if built is None:
+                _warn_child_may_remain()  # 回収を諦めたビルドが残っていれば知らせる
                 return emit("runtime_error", "cannot build the CLI", EXIT_RUNTIME_ERROR, False)
             ctx.bin = built
             cli_profile = "release"
@@ -2529,8 +2573,7 @@ def run(args: argparse.Namespace) -> int:
         rec["environment"]["ended_local"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     if _child_may_remain:
         rec["child_may_remain"] = True
-        sys.stderr.write("a child process may remain\n")
-        sys.stderr.flush()
+        _warn_child_may_remain()
     rec = sanitize_record(rec)
     # schema は固定定数（`/` を含む）なので伏せ処理の対象外にして戻す
     rec["schema"] = SCHEMA
