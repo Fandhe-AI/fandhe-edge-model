@@ -2002,10 +2002,16 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "（このスクリプトがビルドした CLI ではない。`commit`・`worktree_clean` は"
             " CLI の出所を表さない）"
         )
-    if (rec.get("environment") or {}).get("stable") is False:
+    stable = (rec.get("environment") or {}).get("stable")
+    if stable is False:
         lines.append(
             "- 注意: 開始時と終了時で commit・worktree_clean・CLI の sha256 のいずれかが"
             "一致しない（実行中に環境が変わった。結果を採用しない）"
+        )
+    elif rec.get("environment") is not None and stable is None:
+        lines.append(
+            "- 注意: 開始時と終了時の commit・worktree_clean・CLI の sha256 の一致を"
+            "確認できなかった（採取不能。成功扱いにしない）"
         )
     lines += ["", "## 環境", "", "| 項目 | 値 |", "| ---- | -- |"]
     if env is None:
