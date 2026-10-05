@@ -43,7 +43,7 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 | `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可） | `B,C,D,E,F`（A は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
-| `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。あるときだけ p95 の分類が `real_machine`、無ければ `reference_only` | — |
+| `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
 | `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒） | 50000 |
 | `--package-limit-bytes N` | C-2 の容量上限（バイト） | 1000 |
 | `--help` | 使い方を表示して exit 0。JSON は出力されない（`{"code":"ok","message":"usage: ..."}` 形式） | — |
@@ -71,7 +71,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 | 環境変数 | 説明 | 備考 |
 | ------- | ---- | ---- |
-| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルルドして、`compiler-artifact` の executable を特定する（`CARGO_TARGET_DIR` や `build.target-dir` に依存）。ビルド時間の目安は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない） |
+| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えると D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは `$CARGO_TARGET_DIR`（未設定なら `<repo>/target`）の `release/fandhe-edge` で、差し替えた CLI と一致しないため（`linkage_target_mismatch`。§4-D）。cargo の出力先を変えるときは `CARGO_TARGET_DIR` 環境変数で指定する |
 | `FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` | 検査用（テスト専用の上書き）。**絶対パスの実行ファイル**（PATH で探さない）。どちらかを設定すると `evidence_hint` が `test_harness` に変わり、`otool -L` は実行されず `direct_libraries` が `null` になる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64） | テスト用のみ。両方同時に設定可能 |
 
 ### 3-4. 実行時の上限（REQ-39）
@@ -83,12 +83,16 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 | CLI 1 工程（register / inspect / train / select / evaluate / package / infer） | 600 秒 | 1 MiB | 8 MiB | B・C・E |
 | `make ci` | 3600 秒 | 64 MiB | 64 MiB | A（通信するため `--locked` なし） |
 | `make check-runtime-linkage` | 1800 秒 | 64 MiB | 64 MiB | D（オフラインモード） |
-| `cargo test --locked` / 1 回（F） | 300 秒 | 64 MiB | 64 MiB | F（1 回目は `--no-run`・未計上） |
+| `cargo test --locked` / 1 回（F） | 300 秒 | 64 MiB | 64 MiB | F（N 回の各回） |
 | `cargo build --locked`（FANDHE_EDGE_BIN 未設定時） | 1800 秒 | 64 MiB | 64 MiB | ビルド（オフラインモード。REQ-38） |
+| `cargo test --locked ... --no-run`（F の事前ビルド） | 1800 秒 | 64 MiB | 64 MiB | F（オフラインモード。REQ-38） |
 | `otool -L`・`git` コマンド・環境採取 | 30 秒 | 64 KiB | 64 KiB | 環境情報 |
 | 入力ファイル（定義・学習・評価） | — | 16 MiB | — | 読み込み前に確認 |
+| CLI バイナリの sha256 計算 | — | 1 GiB | — | 計算時に確認（超過は計算せず `null`） |
 | パッケージファイル個別（model.onnx・vocab.json 等） | — | 256 MiB | — | sha256 計算時に確認 |
 | E の推論件数 | — | 1000 件 | — | `train.jsonl` 件数上限 |
+
+スクリプトと `check-runtime-linkage.sh` が自分で起動する `cargo` は、すべて `--locked`（`Cargo.lock` を暗黙に更新しない）。A の `make ci` は make の中の cargo であり、スクリプトは `--locked` を付けない。
 
 ## 4. 各項目 A〜F が何を確かめるか
 
@@ -102,9 +106,9 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - exit 0
   - stdout が読めた
   - `skip:` で始まる行が 0 件（skip は検証済みと扱わない）
-  - Rust のテストが 1 件以上実行され、failed 0 件
-  - pytest の要約行が読めて failed 0 件
-- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（テストなし または stdout 読めず）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）
+  - Rust のテストが 1 件以上通り（`passed` の合計が 1 以上）、failed 0 件
+  - pytest の要約行が読めて、`passed` が 1 以上・failed 0 件
+- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（Rust の `passed` が 0、または pytest の要約行が無い・`passed` が 0）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）、`output_limit`（stdout が上限超過で読めない）、`timeout`・`spawn_error`・`killed`（実行の失敗）
 - **記録する `record.json` フィールド**: 終了コード（`exit_code`）、`skip_lines`（`skip:` で始まる行の件数）、`rust_tests`（`passed`・`failed`・`ignored`）、`pytest`（`passed`・`skipped`・`failed`）、`stderr_bytes`
 - **pytest の skip**: Mac では Linux 用の POSIX ACL テスト 3 件が skip になる。検証済みと扱わない。記録には残す
 
@@ -114,10 +118,16 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 入力データ（`fixtures/sandbox_run_eval/`）をコピーして、7 工程を順に実行し、正常系での完走を確かめます。学習は CPU で、`--smoke` は付けません。候補は 1 個（ID 0）。
 
-- **確かめること**: 各工程が連続して終了コード 0 で成功し、出力される JSON が定義の構造を持つこと。`package` の容量内訳（5 項目）が合計と一致すること。
+- **確かめること**: 各工程が連続して終了コード 0 で成功し、出力される JSON の報告値が、作業ディレクトリへコピーした fixture から導いた値と整合すること。`package` の容量内訳（5 項目）が合計と一致すること。
 - **想定する終了コード**: 0（全工程成功）
-- **B の成功条件**: 7 工程すべてが exit 0 + `capacity` の 5 要素（`weights`・`vocab_or_feature_transform`・`label_table`・`calibration`・`metadata`）が各々 `bytes` と `file_count` を持つ + 5 要素の合計が `capacity.total_bytes` と一致
-- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`）
+- **B の成功条件**: 7 工程すべてが exit 0 で `status` が `ok`、かつ各工程の報告値が次のとおり整合し、`capacity` の 5 要素（`weights`・`vocab_or_feature_transform`・`label_table`・`calibration`・`metadata`）が各々 `bytes` と `file_count`（0 以上の整数）を持ち、5 要素の合計が `capacity.total_bytes` と一致する（C も同じ照合を通る。REQ-21・REQ-33）
+  - `register`: `options` が定義の選択肢の数、`evaluation_defined` が「評価データの行数が 1 以上」と一致
+  - `inspect`: `valid_records` が `train.jsonl` の行数（空行を除く）と一致し、`split` の `train`・`validation`・`test` の和が `valid_records` と一致
+  - `train`・`select`: `candidate` が 0（B・C は候補 0 を学習する）で、`kind` が文字列
+  - `evaluate`: `candidate` が `select` の報告値、`n_total` が `evaluation.jsonl` の行数、`correct` が 0 以上 `n_total` 以下
+  - `package`: `capacity` は各値が 0 以上の整数で、`exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過していない。B の定義は合否基準と上限を持たないため、`judgment` が `null`・`acceptance_defined` が `false`・`infer_p95` が `null`
+  - `infer`（B の単発）: `predicted_label` が定義の選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で、和が 1 から 1e-6 以内
+- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `steps`: 工程の配列（各工程：`step`（固定語彙）・`command`（固定語彙）・`exit_code`・`stderr_bytes`・`summary`（JSON の要約））
@@ -137,16 +147,17 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 - **確かめること**: `package` が exit 0 または 20 で成功し、`infer_p95`（推論 p95 の値・上限・超過フラグ）が記録されること。指定した上限が CLI に伝わること。
 - **想定する終了コード**: 0 または 20
 - **C-1 の合格条件**:
-  - exit 0 または 20（どちらでも ok）
-  - `infer_p95` に `p95_us`・`limit_us`・`exceeded` が boolean である
+  - exit 0 または 20（どちらでも ok。ただし下の対応を満たすこと）
+  - `infer_p95` の `p95_us`・`limit_us` が整数で、`exceeded` が boolean
   - `exceeded` が `p95_us > limit_us` の値と一致
   - `exceeded` が exit コード 20 の有無と一致：`exceeded == true` ↔ `exit 20`
-  - `limit_us` が指定値（`ctx.p95_limit_us`）と一致
-  - C-1 の `capacity` は超過していない
-- **失敗の理由**: `missing_field`（`infer_p95` が不完全）、`unexpected_output`（`exceeded` と計算値・終了コード・`limit_us` のいずれか不整合、または `capacity` 超過）、工程別の失敗
+  - exit 20 のときは `code == "limit_exceeded"` で、`package/` が作られていない。exit 0 のときは `status == "ok"` で、`package/` が公開されている
+  - `limit_us` が指定値（`--p95-limit-us`）と一致
+  - C-1 の `capacity` が要約でき（各値が 0 以上の整数で `exceeded == (total_bytes > limit_bytes)`）、超過していない
+- **失敗の理由**: `missing_field`（`infer_p95` が不完全）、`unexpected_output`（`exceeded` と計算値・終了コードの不一致、`code`・`status` の不整合、`package/` の有無と終了コードの不一致、`limit_us` の不一致、`capacity` の欠落・超過のいずれか）、工程別の失敗
 - **記録する `record.json` フィールド**:
-  - `p95.p95_us`・`p95.limit_us`・`p95.exceeded`・`p95.classification`（`real_machine` / `reference_only`）・`p95.package_exit_code`（0 または 20）
-- **注意**: p95 の値は参考値です。`--quiet-machine` を付け、他のアプリを実際に閉じた状態でのみ「実機の p95」として扱います。それ以外は `classification` が `reference_only` になります。
+  - `p95.p95_us`・`p95.limit_us`・`p95.exceeded`・`p95.classification`（`real_machine` / `reference_only`）・`p95.package_exit_code`（0 または 20）・`p95.package_published`（C-1 の `package/` の有無）
+- **注意**: p95 の値は参考値です。`--quiet-machine` を付け、他のアプリを実際に閉じた状態でのみ「実機の p95」として扱います。`--quiet-machine` があっても、`make`・`cargo` の代役（`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD`）か `FANDHE_EDGE_BIN` の差し替えの下では `classification` は `reference_only` で、それ以外でも静かな状態は人の申告です。
 
 #### 4-C-2. `limits.max_package_bytes`
 
@@ -159,33 +170,38 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `code == "limit_exceeded"`
   - `capacity.exceeded == true`
   - `capacity.total_bytes > capacity.limit_bytes`（超過判定の一致）
-  - `capacity.limit_bytes` が指定値（`ctx.package_limit_bytes`）と一致
+  - `capacity.limit_bytes` が指定値（`--package-limit-bytes`）と一致
   - `package/` ディレクトリが存在しない
-- **失敗の理由**: `unexpected_output`（上限値の不一致・欠落・exit コードや code が不適切）、`capacity_limit_not_enforced`（上限の値は正しいが超過判定・発行が機能していない）、工程別の失敗
+- **失敗の理由**: `unexpected_output`（`capacity` の欠落・上限値の不一致、または工程の報告値の不整合）、`capacity_limit_not_enforced`（上限の値は正しいが、`code` が `limit_exceeded` でない・超過と判定されていない・`package/` が公開されている）、工程別の失敗（`package` が exit 0 のときは `unexpected_exit_code`。C-2 の `package` が許すのは exit 20 だけ）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `p95`: C-1 の結果（再利用）
-  - `capacity_limit.package_exit_code`（20）、`.code`（`"limit_exceeded"`）、`.capacity_exceeded`（true または null）、`.total_bytes`・`.limit_bytes`、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）
+  - `capacity_limit.package_exit_code`（20）、`.code`（`"limit_exceeded"`）、`.capacity_exceeded`（boolean または null）、`.total_bytes`・`.limit_bytes`、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）
   - `reason`（失敗時のみ）: `unexpected_output` / `capacity_limit_not_enforced`
 
 ### 4-D. 推論が学習に依存しないこと（REQ-32）
 
 リポジトリのルートで `make check-runtime-linkage` を実行し、CLI が Python・MLX への動的リンクを持たないこと、および環境変数ゼロの環境での実行が成功することを確かめます。
 
-- **確かめること**: `make check-runtime-linkage` の exit 0。macOS の場合は `otool -L` で Python・MLX への直接リンクが無いこと（情報目的）。
+- **確かめること**: `make check-runtime-linkage` の exit 0 と、その成功の印（env -i テスト 3 件・最終行 `OK: tool=...`）。リンクを確認したバイナリが、B・C・E で実行した CLI と同一であること。macOS の場合は、実行した CLI への `otool -L` の結果を記録する（`check-runtime-linkage.sh` の判定とは別の、情報としての記録）。
 - **想定する終了コード**: 0
 - **D の合格条件**:
   - exit 0
   - stdout が読めた
   - `skip:` で始まる行が 0 件
-  - `ok: req32_*` が 1 件以上（env -i テストが成功）
-- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（env -i テストなし）、`unexpected_exit_code`（0 以外）、`otool_failed`（macOS で otool 実行に失敗）
+  - `ok: req32_*` の行がちょうど 3 件（env -i テストが成功。件数は `check-runtime-linkage.sh` の env -i テスト数の定数 `LINKAGE_ENV_I_TESTS`）
+  - 最終行 `OK: tool=<otool|ldd> ...` があり、macOS では tool が `otool`（`ldd` は実機の確認にならない）
+  - リンクを確認したバイナリ（`$CARGO_TARGET_DIR`、未設定なら `<repo>/target` の `release/fandhe-edge`）の sha256 が、いま実行した CLI の sha256 と、開始時に記録した `cli_sha256` の両方に一致する。`make`・`cargo` の代役の下では偽の `make` が何も検査しないため照合しない（`linkage_target_matches_cli` は `null`）
+- **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` 行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `exit_code`: make の終了コード
   - `skip_lines`: stdout に `skip:` で始まる行の件数
   - `env_i_tests_ok`: stdout の `ok: req32_*` の件数
-  - `direct_libraries`: `otool -L` の出力から抽出した直接リンク（macOS のみ。`/usr/lib/`・`/System/` で始まる。テスト環境では null）
+  - `linkage_tool`: 最終行 `OK: tool=...` の tool（`otool`・`ldd`。読み取れなければ `null`）
+  - `linkage_target_sha256`: リンクを確認したバイナリの sha256（照合しない場合・照合前に失敗した場合は `null`）
+  - `linkage_target_matches_cli`: 検査対象が実行した CLI と一致したか（boolean。照合しない場合・照合前に失敗した場合は `null`）
+  - `direct_libraries`: 実行した CLI への `otool -L` の出力から抽出した直接リンク（macOS のみ。記録では `/usr/lib/`・`/System/` で始まるものだけが名前のまま残り、それ以外は `<redacted>` に置き換わる。代役の下では取らず `null`）
   - `reason`（失敗時のみ）: 上記の失敗理由
 
 ### 4-E. 1 件ずつとバッチ推論の一致（REQ-28）
@@ -196,9 +212,11 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 - **確かめること**: 1 件ずつの推論とバッチ推論の予測ラベルが全件一致し、スコアに NaN・無限大がなく、差が許容値以下であること。
 - **想定する終了コード**: 0
-- **E の合格条件**: B が `ok` + 予測ラベル不一致 0 件 + NaN・無限大 0 件 + スコア差の最大値が 1e-9 以下
-- **E が実行されない場合**（`not_run`）: B が要求されていない（`requires_B`）または B が成功していない（`previous_item_failed`）
-- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測またはスコアが一致しない。NaN・無限大も含む）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`）
+- **E の合格条件**: B が `ok` + 次の整合 + 予測ラベル不一致 0 件 + NaN・無限大 0 件 + スコア差の最大値が 1e-9 以下
+  - バッチ出力の行数が入力の件数と一致し、各行が JSON で `status` が `ok`・`id` が文字列で重複なし
+  - バッチの各行と単体の出力が、どちらも infer の規則（`predicted_label` が選択肢 ID・`scores` のキー集合が選択肢 ID と一致・各値が有限・和が 1 から 1e-6 以内）を満たし、単体の出力の `id` が入力の `id` と一致
+- **E が実行されない場合**（`not_run`）: B が要求されていない（`requires_B`）、または前の項目が失敗している（`previous_item_failed`。B の失敗を含む）
+- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測またはスコアが一致しない。NaN・無限大も含む）、`unexpected_output`（バッチの行数・`status`・`id` の重複、または infer の規則の不整合）、`invalid_json`（バッチの行が JSON でない）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`。`timeout`・`output_limit`・`spawn_error`・`killed`・`unexpected_exit_code` を含む）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` / `"failed"` / `"not_run"`
   - `reason`（`not_run` 時）: `requires_B`・`previous_item_failed`
@@ -213,22 +231,22 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 ### 4-F. ガード層の時間制限テスト再発確認（#346）
 
-`cargo test --locked -p fandhe-edge-guard --test time_limit` を N 回実行し、#346 の再発（`ReadOutput`・`ReadOutputIncomplete` のログ出現）が無いこと、および並行 spawn の fd 継承競合が無いことを確かめます。
+`cargo test --locked -p fandhe-edge-guard --test time_limit` を N 回実行し、1 回も失敗しないこと（#346 の再発〔並行 spawn の fd 継承競合〕が無いこと）を確かめます。
 
-- **確かめること**: テストバイナリのコンパイル（初回）が成功し、その後 N 回のテスト実行で、失敗 0 件、かつ `ReadOutput`・`ReadOutputIncomplete` がログに出現しないこと。
+- **確かめること**: テストバイナリのコンパイル（初回）が成功し、その後 N 回のテスト実行がすべて成功すること。#346 の再発の兆候として、失敗した回のログにある `ReadOutput`・`ReadOutputIncomplete` を数えて記録する（成功した回のログは数えない。成功の判定は各回の exit 0 と `test result: ok. N passed`〔N >= 1〕で、これらの語が成功した回に出ても失敗にしない）。
 - **想定する終了コード**: 0（失敗 0 回）または 10（失敗あり）
-- **F の成功条件**: テストバイナリビルド成功 + 実行回数 N 回 + 失敗 0 回 + `test result: ok. N passed` の形式（N >= 1）
-- **失敗の理由**: `build_failed`（テストバイナリのコンパイル失敗）、`no_tests`（テストが 0 件、または `test result:` 行が読めない）、`test_failures`（1 回以上の失敗）、工程別（`timeout`・`output_limit`）
+- **F の成功条件**: テストバイナリビルド成功 + 実行回数 N 回 + 失敗 0 回（各回が exit 0・期限内・出力上限内で、ログに `test result: ok. N passed`（N >= 1）がある）
+- **失敗の理由**: `build_failed`（`--no-run` のビルドが失敗・期限超過・出力上限超過）、`test_failures`（N 回のうち 1 回以上の失敗。失敗の内訳は `timeouts`・`no_tests` の件数欄に出る）。`no_tests`・`timeout` は `reason` ではなく件数の欄
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` / `"failed"`
   - `runs`: 実行回数（N）
   - `passed`・`failed`: 成功・失敗の回数
   - `timeouts`: 制限時間超過の回数
-  - `no_tests`: テスト 0 件で終了した回数
-  - `read_output`: ログに `ReadOutput`（Incomplete 以外）が出現した回数
-  - `read_output_incomplete`: ログに `ReadOutputIncomplete` が出現した回数
+  - `no_tests`: exit 0 で終わったが `test result: ok. N passed`（N >= 1）が無かった回数（失敗に数える）
+  - `read_output`: 失敗した回のうち、ログに `ReadOutput`（Incomplete 以外）が出現した回数（成功した回は数えない）
+  - `read_output_incomplete`: 失敗した回のうち、ログに `ReadOutputIncomplete` が出現した回数（成功した回は数えない）
   - `load_start`・`load_end`: 実行開始・終了時の load average（3 要素の配列。macOS のみ。Linux では null）
-  - `reason`（失敗時のみ）: `build_failed` / `no_tests` / `test_failures`
+  - `reason`（失敗時のみ）: `build_failed` / `test_failures`
 - **実行特性**: F だけは全 N 回を数えてから成否を決めます（失敗があっても止めず最後まで実行する）。失敗 0 回で `ok`、1 件以上で `failed`。
 - **初回実行の自動準備**: スクリプトが N 回実行の前に `cargo test --locked ... --no-run` を 1 回実行し、テストバイナリをコンパイルします（回数に数えない。失敗は `build_failed`）。事前準備は不要ですが、初回実行は通常より時間がかかります。
 
@@ -241,32 +259,35 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--work-dir` がリポジトリ内、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、実行中に SIGINT・SIGTERM・SIGHUP で中断、など。環境を確認またはスクリプトを再実行。**中断時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される |
 
 **項目の実行フロー**:
 
 1. 要求した項目（`--items LIST`）を A→F の順で実行する
 2. 各項目の実行：
    - 要求されていない → `not_run` / `not_selected`
-   - E で B が `failed` または `not_run` → `not_run` / `requires_B`
-   - 前の項目が `failed` → `not_run` / `previous_item_failed`
+   - 中断済み → `not_run` / `interrupted`
+   - 前の項目が `failed` → `not_run` / `previous_item_failed`（B の失敗で止まった E もこれ）
+   - E で B が要求されておらず成功していない → `not_run` / `requires_B`
    - それ以外 → 実行して結果を記録
-3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる
+3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
 4. 終了コード 0 = 要求したすべての項目が `ok`、10 = 1 つ以上が `failed` / `not_run`
 
 **項目ごとの成否判定**:
 
-- **A**: 終了コード 0 = `ok`、0 以外 = `failed`
-- **B**: 全 7 工程が exit 0 + 容量計算に成功 = `ok`。1 工程でも非 0 または容量ハッシュ不一致 = `failed`
-- **C**: C-1 と C-2 の両方が成功（C-1 は exit 0 または 20、C-2 は exit 20 + 容量超過 + `package/` 非公開）= `ok`。1 つでも失敗 = `failed`。C 全体で 1 つの `status` を持つ
-- **D**: 終了コード 0 = `ok`、0 以外 = `failed`
-- **E**: B が `failed` または `not_run` → `not_run`。B が `ok` で E の予測・スコアが全一致 = `ok`。一致しない = `failed`
+各項目の合格条件は §4 のとおりで、満たす = `ok`、満たさない = `failed` です（終了コード 0 だけでは `ok` にならない）。要点:
+
+- **A**: exit 0 + `skip:` 行 0 件 + Rust と pytest のテストが 1 件以上通り failed 0 件
+- **B**: 全 7 工程が exit 0 で報告値が整合 + 容量の 5 要素の合計が `total_bytes` と一致 = `ok`。1 工程でも非 0・報告値の不整合・容量の不一致 = `failed`
+- **C**: C-1 と C-2 の両方が成功（C-1 は exit 0 または 20 で p95 と容量・`package/` の有無が整合、C-2 は exit 20 + 容量超過 + `package/` 非公開）= `ok`。1 つでも失敗 = `failed`。C 全体で 1 つの `status` を持つ
+- **D**: exit 0 + 成功の印（env -i テスト 3 件・`OK: tool=...`）+ リンクを確認したバイナリが実行した CLI と一致 = `ok`
+- **E**: B が要求されていない、または前の項目が失敗 → `not_run`。それ以外で、バッチと単体が整合し予測・スコアが全一致 = `ok`。一致しない = `failed`
 - **F**: `failed == 0` = `ok`、`failed > 0` = `failed`
 
 **失敗時の報告の 5 点**:
 
 1. 終了コード
-2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`spawn_error`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など）
+2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名〕）
 3. `step`（工程名。固定語彙：`register`・`inspect`・`train`・`select`・`evaluate`・`package`・`infer` など。工程が無い場合は省略）
 4. stdout の JSON（あれば）から `code`・`message`（固定語彙）
 5. 実行したコマンド（固定語彙。パスは含めない）
@@ -283,7 +304,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 **項目ごとの扱い**:
 
 - **A**: 終了のみが実機証拠。中のテスト（Rust unit・integration、pytest）はテストハーネス。記録には区別して記載する
-- **C-1 の p95**: `--quiet-machine` フラグが **あり、かつ実際に他のアプリを閉じた状態** でのみ `classification: "real_machine"`。フラグが無い、またはフラグはあるが実際に静かでない = `reference_only`。参考値扱いで「実機の p95」としない
+- **C-1 の p95**: `--quiet-machine` フラグが **あり、かつ実際に他のアプリを閉じた状態** でのみ `classification: "real_machine"`。フラグが無い、フラグはあるが実際に静かでない、`make`・`cargo` の代役か `FANDHE_EDGE_BIN` の差し替えの下で実行した = `reference_only`（最後の 2 つはフラグがあっても `reference_only`）。参考値扱いで「実機の p95」としない
 - **E**: 学習データ（`train.jsonl`）のみ使用し、評価データ（`evaluation.jsonl`）は使わない（REQ-27。評価の独立性）
 - **F**: テストハーネスを実機で実行したもの。テストの実装（偽の sleeper、実時計）は実機ですが、判定対象（予測値・スコア）は合成に依存しているため、実機の証拠としては「テストハーネス」扱い
 
@@ -372,7 +393,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
 - `interrupted`: 実行中に SIGINT・SIGTERM・SIGHUP で中断
-- `requires_B`: E で B が成功していない
+- `requires_B`: E で B が要求されていない（B が失敗した場合は `previous_item_failed`）
 
 ### `record.md`
 
