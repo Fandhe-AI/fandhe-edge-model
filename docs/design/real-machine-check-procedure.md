@@ -109,7 +109,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `skip:` で始まる行が 0 件（skip は検証済みと扱わない）
   - Rust のテストが 1 件以上通り（`passed` の合計が 1 以上）、failed 0 件
   - pytest の要約行が読めて、`passed` が 1 以上・failed 0 件
-- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（Rust の `passed` が 0、または pytest の要約行が無い・`passed` が 0）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）、`output_limit`（stdout が上限超過で読めない）、`timeout`・`spawn_error`・`killed`（実行の失敗）
+- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（Rust の `passed` が 0、または pytest の要約行が無い・`passed` が 0）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）、`output_limit`（stdout が上限超過）、`output_unreadable`（ログが読めない）、`timeout`・`spawn_error`・`killed`（実行の失敗）
 - **記録する `record.json` フィールド**: 終了コード（`exit_code`）、`skip_lines`（`skip:` で始まる行の件数）、`rust_tests`（`passed`・`failed`・`ignored`）、`pytest`（`passed`・`skipped`・`failed`）、`stderr_bytes`
 - **pytest の skip**: Mac では Linux 用の POSIX ACL テスト 3 件が skip になる。検証済みと扱わない。記録には残す
 
@@ -201,7 +201,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `ok: req32_*` の行がちょうど 3 件（env -i テストが成功。件数は `check-runtime-linkage.sh` の env -i テスト数の定数 `LINKAGE_ENV_I_TESTS`）
   - `OK: tool=<otool|ldd> ...` の行があり（stdout を後ろから見て最初に一致した行を使う）、macOS では tool が `otool`（`ldd` は実機の確認にならない）
   - リンクを確認したバイナリ（`check-runtime-linkage.sh` が cargo の報告〔`--message-format=json-render-diagnostics` の `compiler-artifact` の `executable`〕から取り、ログ `<work-dir>/D/linkage.log` に `cli_bin: <絶対パス>` の 1 行で出す。記録側はこの行からパスを読んで sha256 を計算する。パスは `record.json`・`record.md` に出ない）の sha256 が、いま実行した CLI の sha256 と、開始時に記録した `cli_sha256` の両方に一致する。`make`・`cargo` の代役の下では偽の `make` が何も検査しないため照合しない（`linkage_target_matches_cli` は `null`）
-- **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` の行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（`cli_bin:` 行が無い・2 行以上ある・絶対パスでない、または検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
+- **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` の行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（`cli_bin:` 行が無い・2 行以上ある・絶対パスでない、または検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、`output_unreadable`（`make` のログが読めない）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `exit_code`: make の終了コード
@@ -299,7 +299,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 **失敗時の報告の 5 点**:
 
 1. 終了コード
-2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名〕）
+2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名〕）
 3. `step`（工程名。固定語彙：`register`・`inspect`・`train`・`select`・`evaluate`・`package`・`infer` など。工程が無い場合は省略）
 4. stdout の JSON（あれば）から `code`（7 種の語彙の値）・`message_bytes`・`message_sha256`（`message` の本文は記録されず、`<work-dir>` の stdout のファイルに残る）
 5. 実行したコマンド（固定語彙。パスは含めない）
@@ -327,6 +327,8 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 ### 保存先と形式
 
 `record.json` は `<work-dir>/` の直下に保存され、実行時のマスク（umask 077）で 0600 の権限を持ちます。各項目の詳細ログは `<work-dir>/<項目>/steps/` などに `*.log`・`*.err` として保存されますが、このログは `record.json` に含まれず、PR・Issue へも転記されません。
+
+`record.json`・`record.md` は同じディレクトリの一時ファイルへ書いてから置き換えるため、中断しても壊れた JSON は残りません。出力先のファイルが symlink などの通常ファイルでない場合は辿らずに失敗し、`runtime_error`（exit 70）になります。ログ・入力ファイルの書き込みも symlink を辿りません。
 
 ### 記録してよい項目（転記を許可）
 

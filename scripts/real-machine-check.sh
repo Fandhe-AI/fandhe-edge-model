@@ -235,8 +235,8 @@ fi
 umask 077
 mkdir -p -- "$work_canon" || fail 70 runtime_error "cannot create work directory"
 chmod 700 "$work_canon" || fail 70 runtime_error "cannot create work directory"
-probe="$work_canon/.write-probe.$$"
-{ : >"$probe"; } 2>/dev/null || fail 70 runtime_error "cannot write to work directory"
+# mktemp は O_EXCL で作るため、予測可能な名前への symlink 事前配置を辿らない（#359）
+probe=$(mktemp "$work_canon/.write-probe.XXXXXX" 2>/dev/null) || fail 70 runtime_error "cannot write to work directory"
 rm -f -- "$probe"
 
 # 以降は python3 が項目の実行と記録を行い、stdout の JSON と終了コードを返す。

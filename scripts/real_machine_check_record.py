@@ -174,7 +174,14 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # 書いてから、自分を含むグループ全体へ KILL を送る（TERM を無視する孫も残さない。REQ-39）。
 # リーダー（この sh）の生存中に行うので、reap 後の killpg による pid 再利用の誤爆がない。
 # 文字列は定数で、値は位置引数で渡す
-GROUP_WRAPPER = 'RC=$1; shift; "$@"; rc=$?; printf "%s" "$rc" > "$RC"; kill -s KILL 0'
+# rc の書き込み直前の `set -C`（noclobber）は、子の実行中に rc のパスへ置かれた
+# symlink・既存ファイルをシェルが辿って書かないため（書けなければ rc が無く、
+# 呼び出し側は `killed` にする。fail-closed。#359）
+# 書けなかったとき（子が置いた通常ファイル・symlink が残っている）は `rm -f` でそれを消し、
+# 偽の終了コードを呼び出し側へ読ませない（rc が無ければ `killed`。fail-closed。#359）
+GROUP_WRAPPER = (
+    'RC=$1; shift; "$@"; rc=$?; set -C; printf "%s" "$rc" > "$RC" || rm -f "$RC"; kill -s KILL 0'
+)
 # rc ファイルの上限（3 桁の整数だけが入る）
 CAP_RC_FILE = 16
 
@@ -450,12 +457,19 @@ def run_cmd(
     if exe is None:
         return RunResult(None, "spawn_error", 0, 0)
     rc_path = out_path.with_name(out_path.name + ".rc")
-    rc_path.unlink(missing_ok=True)
+    try:
+        rc_path.unlink(missing_ok=True)
+    except OSError:
+        # パスがディレクトリ・削除不能のとき。例外を外へ出さず、子を起動しない（#359）
+        return RunResult(None, "spawn_error", 0, 0)
     full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
     reason = None
     spawn_failed = False
     try:
-        with open(out_path, "wb") as fo, open(err_path, "wb") as fe:
+        with (
+            _open_write_nofollow(out_path, False) as fo,
+            _open_write_nofollow(err_path, False) as fe,
+        ):
             proc = subprocess.Popen(  # noqa: S603  引数リストで起動する。argv は固定語彙と検証済みの値のみ
                 full,
                 cwd=str(cwd),
@@ -500,22 +514,118 @@ def run_cmd(
 
 
 def _read_rc(path: Path) -> int | None:
-    """rc ファイルを 0〜255 の整数として読む。無い・上限超過・形が違えば None。"""
-    text = read_capped(path, CAP_RC_FILE)
+    """rc ファイルを 0〜255 の整数として読む。無い・上限超過・形が違えば None。
+
+    symlink・FIFO・ディレクトリなど通常ファイルでないものは辿らず None（ブロックもしない）。
+    """
+    text = _read_regular_capped(path, CAP_RC_FILE)
     if text is None or not re.fullmatch(r"[0-9]{1,3}", text):
         return None
     n = int(text)
     return n if n <= 255 else None
 
 
-def read_capped(path: Path, cap: int) -> str | None:
-    """サイズが上限以下のときだけファイルを UTF-8 で読む。超過・読めない場合は None。"""
+def read_capped_ex(path: Path, cap: int) -> tuple[str | None, str | None]:
+    """上限以下のときだけ UTF-8 で読む。戻り値は (本文, 失敗理由)。
+
+    理由は `None`（成功）・`output_limit`（サイズ超過）・`output_unreadable`（読めない）。
+    上限超過と読み取り失敗を区別して記録するため（#359）。
+    """
     try:
         if path.stat().st_size > cap:
-            return None
-        return path.read_bytes().decode("utf-8", errors="replace")
+            return None, "output_limit"
+        return path.read_bytes().decode("utf-8", errors="replace"), None
+    except OSError:
+        return None, "output_unreadable"
+
+
+def read_capped(path: Path, cap: int) -> str | None:
+    """サイズが上限以下のときだけファイルを UTF-8 で読む。超過・読めない場合は None。"""
+    return read_capped_ex(path, cap)[0]
+
+
+def _read_regular_capped(path: Path, cap: int) -> str | None:
+    """通常ファイルだけを、symlink を辿らず・ブロックせず・上限ぶんだけ読む。それ以外は None。"""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
     except OSError:
         return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
+            return None
+        data = os.read(fd, cap + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _open_write_nofollow(path: Path, excl: bool) -> Any:
+    """symlink を辿らずに通常ファイルを書き込み用に開く（0600）。通常ファイルでなければ OSError。
+
+    `excl` なら新規作成のみ（O_EXCL）、でなければ既存を切り詰める。
+    先に置かれた symlink へ書かない（REQ-39・#359）。
+
+    FIFO は読み手が居ないと open が無期限に止まるため、O_NONBLOCK で開く（読み手が居なければ
+    ENXIO で失敗する）。通常ファイルと確認してからブロッキングへ戻す。切り詰めは確認後に行う
+    （O_TRUNC を open に付けると、ハードリンクで作られた標的を検査前に切り詰めてしまう）。
+    リンク数が 1 でない既存ファイル（ハードリンク）は拒否する。
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    if excl:
+        flags |= os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_nlink != 1:
+            raise OSError("file has multiple hard links")
+        os.set_blocking(fd, True)
+        if not excl:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def write_text_nofollow(path: Path, text: str, excl: bool = False) -> None:
+    """UTF-8 のテキストを symlink を辿らずに書く。"""
+    with _open_write_nofollow(path, excl) as f:
+        f.write(text.encode("utf-8"))
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """同じディレクトリの一時ファイル経由で原子的に置き換える（壊れた JSON を残さない。#359）。
+
+    既存が通常ファイルでなければ（symlink・ディレクトリ・FIFO）失敗する。失敗時は一時ファイルを消し、
+    既存の内容は変えない。
+    """
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise OSError("existing path is not a regular file")
+    except FileNotFoundError:
+        pass
+    tmp = path.with_name("." + path.name + ".tmp." + str(os.getpid()))
+    try:
+        with _open_write_nofollow(tmp, True) as f:
+            f.write(text.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def sha256_file(path: Path, cap: int) -> str | None:
@@ -995,7 +1105,7 @@ def stage_inputs(ctx: Ctx, dest: Path, extra_limits: dict[str, int] | None) -> b
                 return False
             d = json.loads(text)
             d["limits"] = extra_limits
-            (dest / name).write_text(json.dumps(d), encoding="utf-8")
+            write_text_nofollow(dest / name, json.dumps(d))
         else:
             shutil.copyfile(src / name, dest / name)
     return True
@@ -1066,9 +1176,9 @@ def item_a(ctx: Ctx) -> dict[str, Any]:
     )
     if r.reason is not None:
         return fail_item(r.reason, exit_code=r.exit_code)
-    text = read_capped(d / "make-ci.log", CAP_LOG_STDOUT)
+    text, why = read_capped_ex(d / "make-ci.log", CAP_LOG_STDOUT)
     if text is None:
-        return fail_item("output_limit", exit_code=r.exit_code)
+        return fail_item(why or "output_unreadable", exit_code=r.exit_code)
     counts = parse_make_ci_log(text)
     counts["stderr_bytes"] = r.err_bytes
     if r.exit_code != 0:
@@ -1338,9 +1448,9 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
     )
     if r.reason is not None:
         return fail_item(r.reason, exit_code=r.exit_code)
-    text = read_capped(d / "linkage.log", CAP_LOG_STDOUT)
+    text, why = read_capped_ex(d / "linkage.log", CAP_LOG_STDOUT)
     if text is None:
-        return fail_item("output_limit", exit_code=r.exit_code)
+        return fail_item(why or "output_unreadable", exit_code=r.exit_code)
     rec: dict[str, Any] = {
         "exit_code": r.exit_code,
         "skip_lines": sum(1 for ln in text.splitlines() if ln.startswith("skip:")),
@@ -1488,9 +1598,16 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
     if len({rid for rid, _ in recs}) != len(recs):
         return fail_item("duplicate_id", records=len(recs))
     inputs = bdir / "e-inputs.jsonl"
-    with open(inputs, "w", encoding="utf-8") as f:
-        for rid, text in recs:
-            f.write(json.dumps({"id": rid, "input": text}, ensure_ascii=False) + "\n")
+    try:
+        write_text_nofollow(
+            inputs,
+            "".join(
+                json.dumps({"id": rid, "input": text}, ensure_ascii=False) + "\n"
+                for rid, text in recs
+            ),
+        )
+    except OSError:
+        return fail_item("spawn_error")
     digest = sha256_file(inputs, CAP_INPUT_FILE)
     r = run_cmd(
         [str(ctx.bin), "infer", "--package", "project/package", "--input-file", "e-inputs.jsonl"],
@@ -1549,7 +1666,7 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
         single[rid] = obj
     cmp = compare_infer(batch, single)
     ids = cmp.pop("mismatch_ids")
-    (edir / "mismatch-ids.txt").write_text("".join(i + "\n" for i in ids), encoding="utf-8")
+    write_text_nofollow(edir / "mismatch-ids.txt", "".join(i + "\n" for i in ids))
     # 合否はラベル全件一致・非有限 0 件・スコア全件完全一致。max_abs_score_diff は参考値
     ok = (
         cmp["label_mismatch"] == 0
@@ -2058,11 +2175,11 @@ def run(args: argparse.Namespace) -> int:
     # schema は固定定数（`/` を含む）なので伏せ処理の対象外にして戻す
     rec["schema"] = SCHEMA
     try:
-        (ctx.work / "record.json").write_text(
+        write_atomic(
+            ctx.work / "record.json",
             json.dumps(rec, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-            encoding="utf-8",
         )
-        (ctx.work / "record.md").write_text(render_markdown(rec), encoding="utf-8")
+        write_atomic(ctx.work / "record.md", render_markdown(rec))
     except (OSError, ValueError):
         return emit("runtime_error", "cannot write the record", EXIT_RUNTIME_ERROR, False)
     if interrupted:
