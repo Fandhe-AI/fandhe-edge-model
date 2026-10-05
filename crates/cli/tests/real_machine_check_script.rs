@@ -35,6 +35,9 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// 偽の CLI。`FAKE_DIR` へ呼び出しを記録し、環境変数で挙動を切り替える
 /// （`FAKE_FAIL_STAGE`・`FAKE_LEAK`・`FAKE_C1_EXCEED`・`FAKE_C2_MODE`・`FAKE_E_MISMATCH`）。
+/// 既定の出力は実 CLI の形（`crates/core/src/stage_report.rs`）に揃え、スクリプトの判定
+/// （REQ-21・REQ-28・REQ-30・REQ-31・REQ-33）を満たす。矛盾した出力は `FAKE_BAD=<種別>:<case>`
+/// （case は cwd 末尾の B・C1・C2。種別は `bad` 判定の箇所を参照）で個別に作る。
 /// cwd の末尾（B・C1・C2）で package の挙動を変え、定義ファイルの `limits` を読んで上限を返す。
 const FAKE_CLI: &str = r##"#!/bin/sh
 stage=$1
@@ -44,43 +47,60 @@ printf '%s\n' "$*" >> "$FAKE_DIR/cli.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cli.env"
 [ "$stage" = register ] && cp definition.json "$FAKE_DIR/def-$here.json"
 SC='{"alpha":0.5,"beta":0.25,"gamma":0.25}'
+bad=${FAKE_BAD:-}
+[ "$bad" = scores_high ] && SC='{"alpha":1.5,"beta":0.0,"gamma":-0.5}'
+[ "$bad" = scores_neg ] && SC='{"alpha":0.75,"beta":0.5,"gamma":-0.25}'
+SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 p95lim=$(sed -n 's/.*"max_infer_p95_us": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
 [ -n "$p95lim" ] || p95lim=50000
 pkglim=$(sed -n 's/.*"max_package_bytes": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
 [ -n "$pkglim" ] || pkglim=40000000
 extra=
+extra_infer=
 if [ -n "${FAKE_LEAK:-}" ] && [ "$stage" != infer ]; then
-  extra=",\"project_dir\":\"$PWD/project\",\"rel\":\"a/b\",\"win\":\"C:\\\\Users\\\\x\",\"input\":\"SECRET_BODY_7c1\",\"text\":\"SECRET_BODY_7c1\",\"id\":\"leakid-4711\",\"note\":\"SECRET_BODY_7c1 in $PWD\""
+  extra=",\"project_dir\":\"$PWD/project\",\"rel\":\"a/b\",\"win\":\"C:\\\\Users\\\\x\",\"input\":\"SECRET_BODY_7c1\",\"text\":\"SECRET_BODY_7c1\",\"id\":\"leakid-4711\",\"note\":\"SECRET_BODY_7c1 in $PWD\",\"body\":\"SECRET_BODY_7c1\",\"nested\":{\"k\":\"SECRET_BODY_7c1\",\"l\":[\"SECRET_BODY_7c1\"]},\"arr\":[\"SECRET_BODY_7c1\",{\"x\":\"SECRET_BODY_7c1\"}]"
+  extra_infer=",\"body\":\"SECRET_BODY_7c1\",\"nested\":{\"k\":\"SECRET_BODY_7c1\"},\"arr\":[\"SECRET_BODY_7c1\"]"
 fi
 if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
-  printf '{"code":"runtime_error","message":"stage failed at /secret/dir","step":"%s"}\n' "$stage"
+  printf '{"code":"runtime_error","message":"%s","step":"%s"}\n' "${FAKE_FAIL_MSG:-stage failed at /secret/dir}" "$stage"
   exit "${FAKE_FAIL_RC:-70}"
 fi
 comps='"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":20,"file_count":1},"label_table":{"bytes":5,"file_count":1},"calibration":{"bytes":3,"file_count":1},"metadata":{"bytes":7,"file_count":1}}'
 case "$stage" in
 register)
-  printf '{"step":"register","status":"ok","definition_sha256":"abc","options":3,"evaluation_defined":true%s}\n' "$extra" ;;
+  printf '{"step":"register","status":"ok","definition_sha256":"%s","options":3,"evaluation_defined":true%s}\n' "$SHA" "$extra" ;;
 inspect)
   printf '{"step":"inspect","status":"ok","valid_records":90,"split":{"train":72,"validation":9,"test":9}%s}\n' "$extra" ;;
 train)
-  printf '{"step":"train","status":"ok","candidate":0,"kind":"c1"%s}\n' "$extra" ;;
+  cand=0
+  [ "$bad" = cand_false ] && cand=false
+  printf '{"step":"train","status":"ok","candidate":%s,"kind":"c1"%s}\n' "$cand" "$extra" ;;
 select)
-  printf '{"step":"select","status":"ok","candidate":0,"kind":"c1"%s}\n' "$extra" ;;
+  k=c1
+  [ "$bad" = select_kind ] && k=c3
+  printf '{"step":"select","status":"ok","candidate":0,"kind":"%s"%s}\n' "$k" "$extra" ;;
 evaluate)
-  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":1.0,"macro_f1":1.0%s}\n' "${FAKE_EVAL_N:-12}" "$extra" ;;
+  acc=1.0
+  [ "$bad" = accuracy ] && acc=0.5
+  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":%s,"macro_f1":1.0%s}\n' "${FAKE_EVAL_N:-12}" "$acc" "$extra" ;;
 package)
   c2mode=${FAKE_C2_MODE:-limit}
+  # 内訳の合計。bad=sum:<case> のときだけ total_bytes を 1 多く返す
+  extrab=0
+  [ "$bad" = "sum:$here" ] && extrab=1
   if [ "$here" = C2 ] && [ "$c2mode" != exit0 ]; then
     [ "$c2mode" = keepdir ] && mkdir -p project/package
     # 実 CLI と同じく total_bytes > limit_bytes で超過。内訳の合計は total_bytes と一致させる。
     # small は total_bytes <= limit_bytes なのに exceeded:true を返す不正な出力
     wb=$((pkglim + 1))
     [ "$c2mode" = small ] && wb=100
-    total=$((wb + 35))
+    total=$((wb + 35 + extrab))
     rl=$pkglim
     [ -n "${FAKE_C2_LIMIT_WRONG:-}" ] && rl=$((pkglim + 7))
+    code='"limit_exceeded"'
+    [ -n "${FAKE_C2_CODE_NESTED:-}" ] && code='{"k":"SECRET_BODY_7c1"}'
     c2comps="\"components\":{\"weights\":{\"bytes\":$wb,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":20,\"file_count\":1},\"label_table\":{\"bytes\":5,\"file_count\":1},\"calibration\":{\"bytes\":3,\"file_count\":1},\"metadata\":{\"bytes\":7,\"file_count\":1}}"
-    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":true,%s},"infer_p95":null}\n' "$total" "$rl" "$c2comps"
+    printf '{"code":%s,"message":"resource limit exceeded","step":"package","capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":true,%s},"infer_p95":null}\n' "$code" "$total" "$rl" "$c2comps"
     exit 20
   fi
   if [ "$here" = C1 ] && [ -n "${FAKE_C1_EXCEED:-}" ]; then
@@ -91,12 +111,25 @@ package)
     printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":40000000,"exceeded":false,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$comps" "$pv" "$p95lim"
     exit 20
   fi
+  total=$((135 + extrab))
+  lim=$pkglim
+  [ "$bad" = "limit:$here" ] && lim=39999999
+  # package/ の通常ファイルの合計は total_bytes と一致させる（pkgsum は 1 バイト少なくする）
+  odd=0
+  [ -n "${FAKE_PKG_ODD:-}" ] && odd=10
+  mb=$((total - 35 - odd))
+  [ "$bad" = "pkgsum:$here" ] && mb=$((mb - 1))
   mkdir -p project/package
-  printf 'weights' > project/package/model.onnx
-  printf '{}' > project/package/artifact.json
+  head -c "$mb" /dev/zero > project/package/model.onnx
+  head -c 35 /dev/zero > project/package/artifact.json
+  [ "$odd" != 0 ] && head -c "$odd" /dev/zero > "project/package/odd name.bin"
   p95=null
-  [ "$here" = C1 ] && p95=$(printf '{"p95_us":2,"limit_us":%s,"exceeded":false}' "$p95lim")
-  printf '{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,"capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":false,%s},"infer_p95":%s%s}\n' "$pkglim" "$comps" "$p95" "$extra" ;;
+  pv=2
+  [ "$bad" = "p95neg:$here" ] && pv=-1
+  [ "$here" = C1 ] && p95=$(printf '{"p95_us":%s,"limit_us":%s,"exceeded":false}' "$pv" "$p95lim")
+  jfield='"judgment":null,'
+  [ "$bad" = "nojudgment:$here" ] && jfield=
+  printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s},"infer_p95":%s%s}\n' "$jfield" "$total" "$lim" "$comps" "$p95" "$extra" ;;
 infer)
   file=
   id=input
@@ -109,7 +142,11 @@ infer)
   if [ -n "$file" ]; then
     cp "$file" "$FAKE_DIR/batch-input.jsonl"
     lab=alpha
-    [ -n "${FAKE_E_MISMATCH:-}" ] && lab=beta
+    BSC=$SC
+    # バッチだけ最大スコアの選択肢が変わる（スコアと label は整合。単体と食い違う）
+    [ -n "${FAKE_E_MISMATCH:-}" ] && lab=beta && BSC='{"alpha":0.25,"beta":0.5,"gamma":0.25}'
+    # label だけが最大スコアでない（スコアは単体と同じ）
+    [ "$bad" = batch_notmax ] && lab=beta
     first=
     n=0
     while IFS= read -r line; do
@@ -117,12 +154,15 @@ infer)
       [ -n "$first" ] || first=$rid
       n=$((n + 1))
       [ -n "${FAKE_E_DUP:-}" ] && [ "$n" = 2 ] && rid=$first
-      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$SC"'}\n' "$rid" "$lab"
+      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$BSC"'}\n' "$rid" "$lab"
     done < "$file"
   else
     lab=alpha
     [ -n "${FAKE_INFER_BAD_LABEL:-}" ] && lab=zzz
-    printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$SC"'}\n' "$id" "$lab"
+    [ "$bad" = infer_notmax ] && lab=beta
+    st='"ok"'
+    [ -n "${FAKE_INFER_STATUS_NESTED:-}" ] && st='{"k":"SECRET_BODY_7c1"}'
+    printf '{"id":"%s","status":%s,"predicted_label":"%s","scores":'"$SC"'%s}\n' "$id" "$st" "$lab" "$extra_infer"
   fi ;;
 *) exit 99 ;;
 esac
@@ -728,13 +768,12 @@ fn req39_record_does_not_leak_path_body_or_id() {
             assert!(!text.contains(f.as_str()), "{name} contains {f:?}");
         }
     }
-    // 伏せ処理が働いた形跡（B の工程要約のパス値は `<redacted>`）
-    assert_eq!(e.q("items.B.steps.0.summary.project_dir"), "\"<redacted>\"");
-    assert_eq!(e.q("items.B.steps.0.summary.rel"), "\"<redacted>\"");
-    assert_eq!(e.q("items.B.steps.0.summary.win"), "\"<redacted>\"");
-    // 本文を運びうるキーは要約から落ちる
-    assert!(!json.contains("\"input\""), "input key kept");
-    assert!(!json.contains("\"text\""), "text key kept");
+    // 契約 §1-1: 許可リスト外の欄（パス値の欄を含む）は工程の要約へ組み立てられず、キーごと落ちる
+    for key in ["project_dir", "rel", "win", "input", "text", "id", "note"] {
+        assert!(!json.contains(&format!("\"{key}\"")), "{key} key kept");
+    }
+    assert_eq!(e.q("items.B.steps.0.summary.options"), "3");
+    assert_eq!(e.q("items.B.steps.0.summary.evaluation_defined"), "true");
 }
 
 /// REQ-21: 工程が失敗したら B を failed と記録し、後続の項目・工程を実行せず exit 10。
@@ -752,8 +791,14 @@ fn req21_step_failure_stops_following_steps_and_items() {
     assert_eq!(e.q("items.B.step"), "\"train\"");
     assert_eq!(e.q("items.B.exit_code"), "70");
     assert_eq!(e.q("items.B.code"), "\"runtime_error\"");
-    // メッセージにパス文字が含まれるため全体が伏せられる
-    assert_eq!(e.q("items.B.message"), "\"<redacted>\"");
+    // 契約: `message` は記録せず、UTF-8 のバイト数と sha256 だけを出す（本文は work-dir の stdout に残る）
+    assert_eq!(e.q("items.B.message_bytes"), "27");
+    assert_eq!(
+        e.q("items.B.message_sha256"),
+        "\"4273680ba876c1fa9378313783d827c53318f42ada32574d6a111a9e12974c8a\""
+    );
+    assert!(!e.text("record.json").contains("stage failed"));
+    assert!(!e.text("record.md").contains("stage failed"));
     assert_eq!(
         e.q("items.B.steps.*.step"),
         "[\"register\",\"inspect\",\"train\"]"
@@ -1369,4 +1414,196 @@ fn req28_item_e_duplicate_batch_id_fails() {
     assert_eq!(e.q("items.E.status"), "\"failed\"");
     assert_eq!(e.q("items.E.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.E.step"), "\"infer-batch\"");
+}
+
+/// 偽 CLI へ `FAKE_BAD` を与えて `items` を実行し、`item` が failed・exit 10 で、`reason`・`step`
+/// が期待値どおりであることを確かめる（観測用の補助。期待値は実行して確かめた値）。
+fn assert_bad_output_fails(
+    items: &str,
+    envs: &[(&str, &str)],
+    item: &str,
+    reason: &str,
+    step: Option<&str>,
+) -> Env {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", items]), envs);
+    assert_eq!(o.code, Some(10), "{envs:?}: {}", o.stdout);
+    assert_eq!(o.stdout, JUDGED_FAIL, "{envs:?}");
+    assert_eq!(
+        e.q(&format!("items.{item}.status")),
+        "\"failed\"",
+        "{envs:?}"
+    );
+    assert_eq!(
+        e.q(&format!("items.{item}.reason")),
+        format!("\"{reason}\""),
+        "{envs:?}"
+    );
+    if let Some(st) = step {
+        assert_eq!(
+            e.q(&format!("items.{item}.step")),
+            format!("\"{st}\""),
+            "{envs:?}"
+        );
+    }
+    e
+}
+
+/// REQ-30・REQ-31・REQ-33: CLI の出力が契約と矛盾すると（容量の内訳が合計と違う・`select` の `kind` が
+/// `train` と違う・`predicted_label` が最大スコアでない・スコアが範囲外・`p95_us` が負数・`candidate` が
+/// 真偽値・`accuracy` が `correct / n_total` と違う・`judgment` の欠落・`limit_bytes` が既定値でない・
+/// `package/` の合計が `total_bytes` と違う）、その項目は failed（`unexpected_output`）・exit 10。
+#[test]
+fn req33_contradicting_cli_output_fails_the_item() {
+    // (FAKE_BAD, items, 失敗する項目, 失敗した工程)
+    let cases: [(&str, &str, &str, &str); 13] = [
+        ("sum:C1", "C", "C", "package"),
+        ("sum:C2", "C", "C", "package"),
+        ("select_kind", "B", "B", "select"),
+        ("infer_notmax", "B", "B", "infer"),
+        ("scores_high", "B", "B", "infer"),
+        ("scores_neg", "B", "B", "infer"),
+        ("p95neg:C1", "C", "C", "package"),
+        ("cand_false", "B", "B", "train"),
+        ("accuracy", "B", "B", "evaluate"),
+        ("nojudgment:B", "B", "B", "package"),
+        ("nojudgment:C1", "C", "C", "package"),
+        ("limit:B", "B", "B", "package"),
+        ("pkgsum:B", "B", "B", "package"),
+    ];
+    for (bad, items, item, step) in cases {
+        assert_bad_output_fails(
+            items,
+            &[("FAKE_BAD", bad)],
+            item,
+            "unexpected_output",
+            Some(step),
+        );
+    }
+}
+
+/// REQ-28: E のバッチ出力の `predicted_label` が最大スコアでなければ（スコアは単体と同じ）E は failed
+/// （`unexpected_output`）で、不一致（`mismatch`）とは区別される。
+#[test]
+fn req28_item_e_batch_label_not_max_score_fails() {
+    assert_bad_output_fails(
+        "B,E",
+        &[("FAKE_BAD", "batch_notmax")],
+        "E",
+        "unexpected_output",
+        Some("infer-batch"),
+    );
+}
+
+/// REQ-21・REQ-33・security.md: 許可リスト外の欄（本文らしい文字列・入れ子の dict・list）は、
+/// 各工程の JSON へ足しても `record.json`・`record.md`・stdout のどこにも出ない。
+/// 工程の要約は決まった欄だけの新しい dict になる。
+#[test]
+fn req39_summary_is_built_from_allowlisted_fields_only() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B,C,E", "--repeat", "1"]),
+        &[("FAKE_LEAK", "1")],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    let json = e.text("record.json");
+    let md = e.text("record.md");
+    for (name, text) in [
+        ("record.json", &json),
+        ("record.md", &md),
+        ("stdout", &o.stdout),
+    ] {
+        assert!(!text.contains(LEAK_BODY), "{name} contains the body");
+    }
+    for key in ["body", "nested", "arr", "note"] {
+        assert!(!json.contains(&format!("\"{key}\"")), "{key} key kept");
+    }
+    assert_eq!(
+        e.q("items.B.steps.0.summary"),
+        "{\"definition_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\
+         \"evaluation_defined\":true,\"options\":3,\"status\":\"ok\",\"step\":\"register\"}"
+    );
+    assert_eq!(
+        e.q("items.B.steps.2.summary"),
+        "{\"candidate\":0,\"kind\":\"c1\",\"status\":\"ok\",\"step\":\"train\"}"
+    );
+    // infer の要約は選択肢 ID（利用者が決める文字列）を記録せず、何番目かだけを残す
+    assert_eq!(
+        e.q("items.B.steps.6.summary"),
+        "{\"predicted_index\":0,\"scores_keys\":3,\"status\":\"ok\"}"
+    );
+}
+
+/// REQ-21・security.md: 失敗した工程の `message`（パス文字を含まない本文らしい文字列）は記録せず、
+/// `message_bytes`（UTF-8 のバイト数）と `message_sha256` だけが出る。
+#[test]
+fn req39_failed_stage_message_is_recorded_as_size_and_hash_only() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[
+            ("FAKE_FAIL_STAGE", "inspect"),
+            ("FAKE_FAIL_MSG", "SECRET_BODY_7c1 and more"),
+        ],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    for (name, text) in [
+        ("record.json", e.text("record.json")),
+        ("record.md", e.text("record.md")),
+        ("stdout", o.stdout.clone()),
+    ] {
+        assert!(!text.contains(LEAK_BODY), "{name} contains the message");
+    }
+    assert_eq!(e.q("items.B.step"), "\"inspect\"");
+    assert_eq!(e.q("items.B.code"), "\"runtime_error\"");
+    assert_eq!(e.q("items.B.message_bytes"), "24");
+    assert_eq!(
+        e.q("items.B.message_sha256"),
+        "\"93f946f9a72f3acc1597af6ab33b70624eed2a7ad7556da5ff3567c1a7c84f9f\""
+    );
+}
+
+/// REQ-21・security.md: `infer` の `status` や C-2 の `code` が入れ子の dict でも、中の文字列は記録に出ない。
+#[test]
+fn req39_nested_status_and_code_do_not_reach_record() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[("FAKE_INFER_STATUS_NESTED", "1")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.B.status"), "\"failed\"");
+    assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.B.step"), "\"infer\"");
+    for text in [e.text("record.json"), e.text("record.md"), o.stdout.clone()] {
+        assert!(!text.contains(LEAK_BODY));
+    }
+    assert_eq!(e.q("items.B.steps.6.summary.status"), "null");
+
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C"]),
+        &[("FAKE_C2_CODE_NESTED", "1")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.status"), "\"failed\"");
+    for text in [e.text("record.json"), e.text("record.md"), o.stdout.clone()] {
+        assert!(!text.contains(LEAK_BODY));
+    }
+}
+
+/// REQ-30・security.md: `package/` に規則外の名前（空白を含む）のファイルがあると、
+/// 記録の `package_files[].name` は `<unrecognized>` になり、元の名前は出ない。
+#[test]
+fn req39_unrecognized_package_file_name_is_not_recorded() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B"]), &[("FAKE_PKG_ODD", "1")]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    let json = e.text("record.json");
+    assert!(!json.contains("odd name"), "{json}");
+    assert!(!e.text("record.md").contains("odd name"));
+    assert_eq!(
+        e.q("items.B.package_files.*.name"),
+        "[\"artifact.json\",\"model.onnx\",\"<unrecognized>\"]"
+    );
 }

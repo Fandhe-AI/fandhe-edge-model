@@ -8,9 +8,11 @@ REQ-39（子プロセスの上限時間・出力サイズ上限）・REQ-27（�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -33,40 +35,10 @@ sys.modules["real_machine_check_record"] = mod
 spec.loader.exec_module(mod)
 
 
-def test_redact_value_replaces_path_strings_and_drops_data_keys() -> None:
-    """REQ-33: `/` か `\\` を含む文字列は伏せ、input・text・id のキーは落とす。"""
-    obj = {
-        "step": "register",
-        "message": "cannot open /home/user/secret.json",
-        "win": "C:\\data\\x",
-        "input": "private body",
-        "text": "private body",
-        "id": "row-1",
-        "nested": {"path": "a/b", "n": 3, "ok": True},
-        "items": ["x/y", "plain"],
-    }
-    assert mod.redact_value(obj) == {
-        "step": "register",
-        "message": "<redacted>",
-        "win": "<redacted>",
-        "nested": {"path": "<redacted>", "n": 3, "ok": True},
-        "items": ["<redacted>", "plain"],
-    }
-
-
-def test_summarize_infer_keeps_only_status_label_and_score_key_count() -> None:
-    """REQ-33: infer の要約は id（データの id）と scores の値を含まない。"""
-    obj = {
-        "id": "train-row-7",
-        "status": "ok",
-        "predicted_label": "beta",
-        "scores": {"alpha": 0.1, "beta": 0.8, "gamma": 0.1},
-    }
-    assert mod.summarize_infer(obj) == {
-        "status": "ok",
-        "predicted_label": "beta",
-        "scores_keys": 3,
-    }
+def test_redact_value_is_removed_in_favor_of_the_allowlist() -> None:
+    """REQ-33: 拒否リスト方式の `redact_value` は残さない（許可リスト方式へ置き換えた）。"""
+    assert not hasattr(mod, "redact_value")
+    assert not hasattr(mod, "DENY_KEYS")
 
 
 def test_sanitize_record_allows_only_system_library_paths() -> None:
@@ -79,6 +51,8 @@ def test_sanitize_record_allows_only_system_library_paths() -> None:
                     "/System/Library/Frameworks/X.framework/X",
                     "/opt/homebrew/lib/libz.dylib",
                     "/usr/lib/../../etc/passwd",
+                    "/usr/lib/libx.dylib\n",
+                    "/usr/lib/" + "a" * 120,
                 ]
             }
         },
@@ -88,6 +62,8 @@ def test_sanitize_record_allows_only_system_library_paths() -> None:
     assert out["items"]["D"]["direct_libraries"] == [
         "/usr/lib/libSystem.B.dylib",
         "/System/Library/Frameworks/X.framework/X",
+        "<redacted>",
+        "<redacted>",
         "<redacted>",
         "<redacted>",
     ]
@@ -225,8 +201,8 @@ def _ctx(tmp_path: Path, cli: Path) -> Any:
     )
 
 
-def test_failed_step_records_exit_code_and_redacted_message(tmp_path: Path) -> None:
-    """REQ-33・REQ-21: 失敗した工程は exit_code・code・伏せた message を記録して止まる。"""
+def test_failed_step_records_exit_code_and_message_size_and_hash(tmp_path: Path) -> None:
+    """REQ-33・REQ-21: 失敗した工程は exit_code・code・message の大きさとハッシュだけを記録する。"""
     cli = _fake_cli(
         tmp_path,
         'echo \'{"code":"invalid_input","message":"cannot read /private/secret/file"}\'\nexit 64\n',
@@ -241,8 +217,10 @@ def test_failed_step_records_exit_code_and_redacted_message(tmp_path: Path) -> N
         "step": "register",
         "exit_code": 64,
         "code": "invalid_input",
-        "message": "<redacted>",
+        "message_bytes": 32,
+        "message_sha256": hashlib.sha256(b"cannot read /private/secret/file").hexdigest(),
     }
+    assert "message" not in failure
 
 
 def test_invalid_json_stdout_is_a_failure_not_a_pass(tmp_path: Path) -> None:
@@ -397,17 +375,24 @@ def test_sanitize_record_nulls_nonfinite_floats_and_json_rejects_nan() -> None:
     assert json.dumps(out, allow_nan=False) == '{"a": null, "b": [null, 1.5]}'
 
 
-def test_redaction_is_case_insensitive_and_covers_lookalike_slashes() -> None:
-    """REQ-33: `Input`・`TEXT` のキーも落とし、U+2215・U+2044・U+FF0F もパス文字として伏せる。"""
+def test_sanitize_record_treats_lookalike_slashes_as_path_chars() -> None:
+    """REQ-33: U+2215・U+2044・U+FF0F もパス文字として伏せる。キー側のパス文字も伏せる。"""
     obj = {
-        "Input": "body",
-        "TEXT": "body",
-        "Id": "r1",
-        "a": "x\u2215y",
-        "b": "x\u2044y",
-        "c": "x\uff0fy",
+        "reason": "x\u2215y",
+        "step": "x\u2044y",
+        "code": "x\uff0fy",
+        "name": "x\\y",
+        "status": "ok",
+        "k\u2215x": "ok",
     }
-    assert mod.redact_value(obj) == {"a": "<redacted>", "b": "<redacted>", "c": "<redacted>"}
+    assert mod.sanitize_record(obj) == {
+        "reason": "<redacted>",
+        "step": "<redacted>",
+        "code": "<redacted>",
+        "name": "<redacted>",
+        "status": "ok",
+        "<redacted>": "<redacted>",
+    }
 
 
 def test_cell_escapes_markdown_and_html() -> None:
@@ -695,20 +680,22 @@ def scores(delta):
     v[0] += delta
     v[1] -= delta
     return dict(zip(ids, v))
-def row(rid, delta):
-    return json.dumps({{"id": rid, "status": "ok", "predicted_label": ids[0],
-                       "scores": scores(delta)}})
 mode = {mode!r}
+def row(rid, delta, step=False):
+    d = {{"id": rid, "status": "ok", "predicted_label": ids[0], "scores": scores(delta)}}
+    if step:
+        d["step"] = "infer"
+    return json.dumps(d)
 if "--input-file" in a:
     rows = [json.loads(line)["id"] for line in open(a[a.index("--input-file") + 1])]
     if mode == "short":
         rows = rows[:-1]
     if mode == "dup":
         rows[-1] = rows[0]
-    for rid in rows:
-        print(row(rid, 0.0))
+    for i, rid in enumerate(rows):
+        print(row(rid, 0.0, mode == "batch-step" and i == 1))
 else:
-    print(row(a[a.index("--id") + 1], {delta!r}))
+    print(row(a[a.index("--id") + 1], {delta!r}, mode == "single-step"))
 """
 
 
@@ -753,6 +740,18 @@ def test_item_e_rejects_batch_row_count_and_duplicate_ids(tmp_path: Path, mode: 
         "unexpected_output",
         "infer-batch",
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "step"),
+    [("batch-step", "infer-batch"), ("single-step", "infer-single")],
+)
+def test_item_e_rejects_infer_output_with_a_step_field(
+    tmp_path: Path, mode: str, step: str
+) -> None:
+    """REQ-28・REQ-33: E の infer 出力に `step` があれば（B の単発と同じく）unexpected_output。"""
+    res = mod.item_e(_e_ctx(tmp_path, _infer_cli(tmp_path, mode=mode)))
+    assert (res["status"], res["reason"], res["step"]) == ("failed", "unexpected_output", step)
 
 
 def test_judge_p95_requires_limit_exceeded_code_on_exit_20() -> None:
@@ -881,6 +880,7 @@ def _valid_reports(facts: Any) -> dict[str, dict[str, Any]]:
             "status": "ok",
             "options": len(facts.option_ids),
             "evaluation_defined": facts.eval_records > 0,
+            "definition_sha256": "a" * 64,
         },
         "inspect": {
             "step": "inspect",
@@ -897,6 +897,8 @@ def _valid_reports(facts: Any) -> dict[str, dict[str, Any]]:
             "kind": "c1",
             "n_total": facts.eval_records,
             "correct": facts.eval_records,
+            "accuracy": 1.0,
+            "macro_f1": 1.0,
         },
     }
 
@@ -917,7 +919,7 @@ def test_read_facts_derives_expectations_from_the_fixture_copy() -> None:
 def test_step_check_accepts_valid_reports(name: str) -> None:
     """正常な工程出力は合格する。"""
     f = _facts()
-    assert mod._step_check(name, _valid_reports(f)[name], set(), 0, f, 0) is True
+    assert mod._step_check(name, _valid_reports(f)[name], set(), 0, f, 0, "c1") is True
 
 
 @pytest.mark.parametrize(
@@ -931,6 +933,9 @@ def test_step_check_accepts_valid_reports(name: str) -> None:
         ("inspect", {"split": {"train": -1, "validation": 1, "test": 1}}),
         ("train", {"candidate": 1}),
         ("train", {"kind": 3}),
+        ("train", {"kind": "zzz"}),
+        ("select", {"kind": "c3"}),
+        ("evaluate", {"kind": "c3"}),
         ("select", {"candidate": 1}),
         ("evaluate", {"candidate": 1}),
         ("evaluate", {"n_total": 1}),
@@ -945,7 +950,7 @@ def test_step_check_rejects_reports_that_contradict_the_input(
     """REQ-21: 指定値・入力から分かる値と食い違う報告は不合格。"""
     f = _facts()
     bad = dict(_valid_reports(f)[name], **patch)
-    assert mod._step_check(name, bad, set(), 0, f, 0) is False
+    assert mod._step_check(name, bad, set(), 0, f, 0, "c1") is False
 
 
 def _scores(facts: Any, delta: float = 0.0) -> dict[str, float]:
@@ -972,8 +977,12 @@ def test_check_infer_output_validates_label_keys_finiteness_and_sum() -> None:
     assert mod.check_infer_output(dict(ok, scores=_scores(f, 5e-7)), f) is True
 
 
-def _cap_json(total: int = 3, limit: int = 40000000, exceeded: bool = False) -> dict[str, Any]:
+def _cap_json(
+    total: int = 5, limit: int = 40000000, exceeded: bool = False, sum_delta: int = 0
+) -> dict[str, Any]:
+    """5 項目の合計が total になる容量内訳（`sum_delta` で合計をずらして不一致にできる）。"""
     comp = {n: {"bytes": 1, "file_count": 1} for n in mod.CAPACITY_COMPONENTS}
+    comp["weights"]["bytes"] = total - 4 + sum_delta
     return {"total_bytes": total, "limit_bytes": limit, "exceeded": exceeded, "components": comp}
 
 
@@ -1000,10 +1009,15 @@ def test_package_report_is_checked_against_definition_and_capacity_rules() -> No
     # exit 0 で capacity が超過・不整合・要約不能
     assert chk(_pkg(f, capacity=_cap_json(total=9, limit=5, exceeded=True))) is False
     assert chk(_pkg(f, capacity=_cap_json(total=9, limit=5, exceeded=False))) is False
-    assert chk(_pkg(f, capacity=_cap_json(total=3, limit=5, exceeded=True))) is False
+    assert chk(_pkg(f, capacity=_cap_json(total=5, limit=3, exceeded=True))) is False
     assert chk(_pkg(f, capacity=None)) is False
-    # exit 20 で容量超過（整合）は許容される
-    over = {"step": "package", "capacity": _cap_json(9, 5, True), "infer_p95": None}
+    # exit 20 で容量超過（整合。上限は定義の既定値）は許容される
+    over = {
+        "code": "limit_exceeded",
+        "step": "package",
+        "capacity": _cap_json(40000001, 40000000, True),
+        "infer_p95": None,
+    }
     assert chk(over, rc=20) is True
     # p95 上限のある定義では infer_p95 が非 null
     with_limit = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, 100)
@@ -1037,40 +1051,55 @@ n_train, n_eval = lines("train.jsonl"), lines("evaluation.jsonl")
 limits = d.get("limits", {{}})
 c2 = "max_package_bytes" in limits
 cmd = sys.argv[1]
-comps = {{k: {{"bytes": 1, "file_count": 1}} for k in
-         ["weights", "vocab_or_feature_transform", "label_table", "calibration", "metadata"]}}
+names = ["weights", "vocab_or_feature_transform", "label_table", "calibration", "metadata"]
+def comps(total):
+    c = {{k: {{"bytes": 1, "file_count": 1}} for k in names}}
+    c["weights"]["bytes"] = total - 4 + cfg["comp_delta"]
+    return c
 def out(o, rc=0):
     print(json.dumps(o))
     sys.exit(rc)
 if cmd == "register":
     out({{"step": "register", "status": "ok", "options": len(d["options"]),
-         "evaluation_defined": True}})
+         "evaluation_defined": True, "definition_sha256": "a" * 64}})
 if cmd == "inspect":
     out({{"step": "inspect", "status": "ok", "valid_records": n_train,
          "split": {{"train": n_train - 2, "validation": 1, "test": 1}}}})
 if cmd in ("train", "select"):
-    out({{"step": cmd, "status": "ok", "candidate": 0, "kind": "c1"}})
+    kind = cfg["train_kind"] if cmd == "train" else cfg["select_kind"]
+    out({{"step": cmd, "status": "ok", "candidate": 0, "kind": kind}})
 if cmd == "evaluate":
-    out({{"step": "evaluate", "status": "ok", "candidate": 0, "kind": "c1",
-         "n_total": n_eval, "correct": n_eval}})
+    out({{"step": "evaluate", "status": "ok", "candidate": 0, "kind": cfg["eval_kind"],
+         "n_total": n_eval, "correct": n_eval, "accuracy": cfg["accuracy"],
+         "macro_f1": cfg["macro_f1"]}})
+if cmd == "infer":
+    ids = [o["id"] for o in d["options"]]
+    scores = {{i: 1.0 / len(ids) for i in ids}}
+    out({{"id": "x", "status": "ok", "predicted_label": ids[0], "scores": scores}})
 if cmd == "package":
     if c2:
         total = cfg["c2_total"]
         limit = cfg["c2_limit"] or limits["max_package_bytes"]
         out({{"code": cfg["c2_code"], "message": "resource limit exceeded", "step": "package",
              "capacity": {{"total_bytes": total, "limit_bytes": limit,
-                          "exceeded": cfg["c2_exceeded"], "components": comps}},
+                          "exceeded": cfg["c2_exceeded"], "components": comps(total)}},
              "infer_p95": None}}, cfg["c2_rc"])
     rc = cfg["rc1"]
-    p95 = {{"p95_us": cfg["p95_us"], "limit_us": limits["max_infer_p95_us"],
-           "exceeded": cfg["p95_exceeded"]}}
-    cap = {{"total_bytes": 3, "limit_bytes": 40000000, "exceeded": False, "components": comps}}
+    p95 = None
+    if "max_infer_p95_us" in limits:
+        p95 = {{"p95_us": cfg["p95_us"], "limit_us": limits["max_infer_p95_us"],
+               "exceeded": cfg["p95_exceeded"]}}
+    total = cfg["total1"]
+    cap = {{"total_bytes": total, "limit_bytes": cfg["limit1"], "exceeded": False,
+           "components": comps(total)}}
     if cfg["publish"] is None:
         publish = rc == 0
     else:
         publish = cfg["publish"]
     if publish:
         os.makedirs("project/package", exist_ok=True)
+        with open("project/package/model.onnx", "wb") as f:
+            f.write(b"x" * cfg["actual_bytes"])
     if rc == 20:
         out({{"code": cfg["code1"], "message": "m", "step": "package", "capacity": cap,
              "infer_p95": p95}}, 20)
@@ -1089,6 +1118,15 @@ C_DEFAULT = {
     "c2_total": 5000,
     "c2_limit": None,
     "c2_exceeded": True,
+    "total1": 10,
+    "limit1": 40000000,
+    "actual_bytes": 10,
+    "comp_delta": 0,
+    "train_kind": "c1",
+    "select_kind": "c1",
+    "eval_kind": "c1",
+    "accuracy": 1.0,
+    "macro_f1": 1.0,
 }
 
 
@@ -1236,3 +1274,898 @@ def test_internal_error_makes_the_script_exit_70_and_still_writes_record(
         "reason": "internal_error",
         "error_type": "RuntimeError",
     }
+
+
+# ---- 記録の許可リスト方式（型 1。REQ-33・REQ-21） ----
+
+HEX64 = "a" * 64
+CAP_SUMMARY = {
+    "total_bytes": 5,
+    "limit_bytes": 40000000,
+    "exceeded": False,
+    "components": {n: {"bytes": 1, "file_count": 1} for n in mod.CAPACITY_COMPONENTS},
+}
+# 許可した欄の外に置く値。データ本文・選択肢 ID・入れ子の dict・list を含む
+EXTRA = {
+    "text": "private body",
+    "note": "plain-looking-secret",
+    "label": "beta",
+    "nested": {"input": "private body", "deep": ["x"]},
+    "rows": [{"id": "row-1"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "obj", "want"),
+    [
+        (
+            "register",
+            {
+                "step": "register",
+                "status": "ok",
+                "options": 3,
+                "evaluation_defined": True,
+                "definition_sha256": HEX64,
+            },
+            {
+                "step": "register",
+                "status": "ok",
+                "options": 3,
+                "evaluation_defined": True,
+                "definition_sha256": HEX64,
+            },
+        ),
+        (
+            "inspect",
+            {
+                "step": "inspect",
+                "status": "ok",
+                "valid_records": 9,
+                "split": {"train": 7, "validation": 1, "test": 1, "extra": "x"},
+            },
+            {
+                "step": "inspect",
+                "status": "ok",
+                "valid_records": 9,
+                "split": {"train": 7, "validation": 1, "test": 1},
+            },
+        ),
+        (
+            "train",
+            {"step": "train", "status": "ok", "candidate": 0, "kind": "c1"},
+            {"step": "train", "status": "ok", "candidate": 0, "kind": "c1"},
+        ),
+        (
+            "select",
+            {"step": "select", "status": "ok", "candidate": 1, "kind": "autoregressive"},
+            {"step": "select", "status": "ok", "candidate": 1, "kind": "autoregressive"},
+        ),
+        (
+            "evaluate",
+            {
+                "step": "evaluate",
+                "status": "ok",
+                "candidate": 0,
+                "kind": "c3",
+                "n_total": 10,
+                "correct": 9,
+                "accuracy": 0.9,
+                "macro_f1": None,
+            },
+            {
+                "step": "evaluate",
+                "status": "ok",
+                "candidate": 0,
+                "kind": "c3",
+                "n_total": 10,
+                "correct": 9,
+                "accuracy": 0.9,
+                "macro_f1": None,
+            },
+        ),
+        (
+            "package",
+            {
+                "step": "package",
+                "status": "ok",
+                "judgment": "pass",
+                "acceptance_defined": True,
+                "capacity": CAP_SUMMARY,
+                "infer_p95": {"p95_us": 7, "limit_us": 50, "exceeded": False, "extra": "x"},
+            },
+            {
+                "step": "package",
+                "status": "ok",
+                "code": None,
+                "judgment": "pass",
+                "acceptance_defined": True,
+                "capacity": CAP_SUMMARY,
+                "infer_p95": {"p95_us": 7, "limit_us": 50, "exceeded": False},
+            },
+        ),
+        (
+            "infer",
+            {
+                "id": "train-row-7",
+                "status": "ok",
+                "predicted_label": "beta",
+                "scores": {"alpha": 0.1, "beta": 0.8, "gamma": 0.1},
+            },
+            {"status": "ok", "scores_keys": 3, "predicted_index": 1},
+        ),
+    ],
+)
+def test_summarize_step_keeps_only_allowlisted_fields(
+    name: str, obj: dict[str, Any], want: dict[str, Any]
+) -> None:
+    """REQ-33: 工程ごとの許可した欄だけを組み立て、他の欄（文字列・入れ子）は捨てる。"""
+    ids = ["alpha", "beta", "gamma"]
+    assert mod.summarize_step(name, obj, ids) == want
+    got = mod.summarize_step(name, dict(obj, **EXTRA), ids)
+    assert got == want
+    text = json.dumps(got)
+    for leak in ("private body", "plain-looking-secret", "row-1", "train-row-7"):
+        assert leak not in text
+
+
+def test_summarize_step_replaces_out_of_vocabulary_and_wrongly_typed_values() -> None:
+    """REQ-33: 語彙外の文字列は `<unexpected>`、型違い・入れ子・欠落は null（具体値）。"""
+    ids = ["alpha"]
+    got = mod.summarize_step("train", {"step": "select", "status": "weird", "kind": "rm -rf"}, ids)
+    assert got == {
+        "step": "<unexpected>",
+        "status": "<unexpected>",
+        "candidate": None,
+        "kind": "<unexpected>",
+    }
+    got = mod.summarize_step(
+        "train", {"step": {"a": 1}, "status": ["ok"], "candidate": True, "kind": {"k": "c1"}}, ids
+    )
+    assert got == {"step": None, "status": None, "candidate": None, "kind": None}
+    got = mod.summarize_step("register", {"options": -1, "evaluation_defined": 1}, ids)
+    assert got == {
+        "step": None,
+        "status": None,
+        "options": None,
+        "evaluation_defined": None,
+        "definition_sha256": None,
+    }
+    for bad in (HEX64.upper(), HEX64 + "\n", "a" * 63, {"x": HEX64}, 5):
+        got = mod.summarize_step("register", {"definition_sha256": bad}, ids)
+        assert got["definition_sha256"] is None
+    # split は 1 欄でも形が違えば split ごと null
+    for bad in ({"train": 1, "validation": 1}, {"train": 1, "validation": 1, "test": "1"}, [1]):
+        assert mod.summarize_step("inspect", {"split": bad}, ids)["split"] is None
+    # evaluate の指標は有限で 0 以上 1 以下の数だけ
+    for bad in (7.0, -0.1, float("nan"), float("inf"), "x", True, {"v": 1}):
+        got = mod.summarize_step("evaluate", {"accuracy": bad, "macro_f1": bad}, ids)
+        assert (got["accuracy"], got["macro_f1"]) == (None, None)
+    got = mod.summarize_step("evaluate", {"accuracy": 1, "macro_f1": 0.0}, ids)
+    assert (got["accuracy"], got["macro_f1"]) == (1, 0.0)
+    # package: code・judgment は語彙、capacity・infer_p95 は形が違えば null
+    got = mod.summarize_step(
+        "package",
+        {
+            "code": "limit_exceeded",
+            "judgment": "maybe",
+            "acceptance_defined": "yes",
+            "capacity": {"total_bytes": 1},
+            "infer_p95": {"p95_us": -1, "limit_us": 1, "exceeded": False},
+        },
+        ids,
+    )
+    assert got == {
+        "step": None,
+        "status": None,
+        "code": "limit_exceeded",
+        "judgment": "<unexpected>",
+        "acceptance_defined": None,
+        "capacity": None,
+        "infer_p95": None,
+    }
+    for bad_p95 in ({"p95_us": True, "limit_us": 1, "exceeded": False}, {"p95_us": 1}, "x"):
+        assert mod.summarize_step("package", {"infer_p95": bad_p95}, ids)["infer_p95"] is None
+
+
+def test_summarize_infer_gives_index_and_never_the_label_or_nested_values() -> None:
+    """REQ-33: infer の要約は選択肢の番号だけ。選択肢に無い・型違いの label は null。"""
+    ids = ["alpha", "beta"]
+    base = {"status": "ok", "scores": {"alpha": 0.5, "beta": 0.5}}
+    assert mod.summarize_infer(dict(base, predicted_label="alpha"), ids)["predicted_index"] == 0
+    assert mod.summarize_infer(dict(base, predicted_label="beta"), ids)["predicted_index"] == 1
+    for bad in ("gamma", {"x": "alpha"}, ["alpha"], 1, None):
+        assert mod.summarize_infer(dict(base, predicted_label=bad), ids)["predicted_index"] is None
+    got = mod.summarize_infer({"status": {"a": [1]}, "scores": [1, 2]}, ids)
+    assert got == {"status": None, "scores_keys": 0, "predicted_index": None}
+    assert mod.summarize_infer({"status": "oops"}, ids)["status"] == "<unexpected>"
+
+
+def test_error_fields_record_code_vocabulary_and_message_size_and_hash_only() -> None:
+    """REQ-21・REQ-33: code は語彙、message は本文でなく UTF-8 のバイト数と sha256。"""
+    f = mod.error_fields
+    msg = "文字 abc"
+    want_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    assert f({"code": "invalid_input", "message": msg}) == {
+        "code": "invalid_input",
+        "message_bytes": 10,
+        "message_sha256": want_hash,
+    }
+    assert f({"code": "plain-looking-secret", "message": ""}) == {
+        "code": "<unexpected>",
+        "message_bytes": 0,
+        "message_sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    assert f({"code": {"a": 1}, "message": ["x"]}) == {}
+    assert f({"code": 70}) == {}
+    assert f(None) == {}
+    assert f({"message": "\ud800"})["message_bytes"] == 1  # 孤立サロゲートでも落ちない
+
+
+def test_package_files_validates_names_and_keeps_sizes(tmp_path: Path) -> None:
+    """REQ-33: ファイル名は `[A-Za-z0-9._-]{1,64}` だけを記録し、他は `<unrecognized>`。"""
+    d = tmp_path / "package"
+    d.mkdir()
+    (d / "model.onnx").write_bytes(b"abcd")
+    (d / "my secret name.bin").write_bytes(b"xy")
+    (d / ("a" * 65)).write_bytes(b"z")
+    (d / ("b" * 64)).write_bytes(b"zz")
+    (d / "sub").mkdir()
+    files = mod.package_files(d)
+    assert files is not None
+    names = sorted(f["name"] for f in files)
+    assert names == sorted(["model.onnx", "<unrecognized>", "<unrecognized>", "b" * 64])
+    assert {f["bytes"] for f in files if f["name"] == "model.onnx"} == {4}
+    assert all(len(f["sha256"]) == 64 for f in files)
+    assert mod.package_dir_bytes(d) == 4 + 2 + 1 + 2
+
+
+def test_environment_text_and_ascii_int_validation() -> None:
+    """REQ-33: 環境の文字列欄は安全な文字 64 字以内、数値欄は ASCII の 1〜20 桁だけ。"""
+    for ok in ("Mac15,3", "Apple M3 Pro", "macOS", "15.0.1 (a)", "24A335", "a" * 64):
+        assert mod.env_text(ok) == ok
+    for bad in ("", "a" * 65, "x/y", "x\ny", "ok\n", "日本語", "a|b", "<b>", None):
+        assert mod.env_text(bad) is None
+    assert mod.ascii_int("12") == 12
+    assert mod.ascii_int("1" * 20) == int("1" * 20)
+    for bad in ("", "1" * 21, "１２", "²", "-1", "1.5", " 1", "1\n", None):
+        assert mod.ascii_int(bad) is None  # `isdigit()` なら "²"・"１２" は通って `int()` が落ちる
+
+
+def test_sanitize_record_redacts_strings_under_keys_outside_the_set() -> None:
+    """REQ-33: 集合に無いキーの下の文字列は（パス文字なしでも）`<redacted>`。list も同様。"""
+    rec = {
+        "items": {
+            "B": {
+                "status": "ok",
+                "note": "plain-looking-secret",
+                "extra": {"deep": {"label": "beta"}},
+                "tags": ["plain-looking-secret"],
+                "reason": "x" * 201,
+            }
+        },
+        "options": {"items": ["A", "B"], "other": ["A"]},
+    }
+    out = mod.sanitize_record(rec)
+    assert out == {
+        "items": {
+            "B": {
+                "status": "ok",
+                "note": "<redacted>",
+                "extra": {"deep": {"label": "<redacted>"}},
+                "tags": ["<redacted>"],
+                "reason": "<redacted>",
+            }
+        },
+        "options": {"items": ["A", "B"], "other": ["<redacted>"]},
+    }
+
+
+def test_sanitize_record_direct_libraries_exception_only_at_its_position() -> None:
+    """REQ-33: ライブラリ名の例外は `items.D.direct_libraries` の位置だけで効く。"""
+    lib = "/usr/lib/libSystem.B.dylib"
+    rec = {
+        "items": {"D": {"direct_libraries": [lib]}, "C": {"direct_libraries": [lib]}},
+        "direct_libraries": [lib],
+        "environment": {"direct_libraries": lib},
+        "steps": [{"direct_libraries": [lib]}],
+    }
+    out = mod.sanitize_record(rec)
+    assert out["items"]["D"]["direct_libraries"] == [lib]
+    assert out["items"]["C"]["direct_libraries"] == ["<redacted>"]
+    assert out["direct_libraries"] == ["<redacted>"]
+    assert out["environment"]["direct_libraries"] == "<redacted>"
+    assert out["steps"] == [{"direct_libraries": ["<redacted>"]}]
+
+
+def _representative_record(tmp_path: Path) -> dict[str, Any]:
+    """実際の記録に現れる文字列の欄を一通り持つ記録（C は偽 CLI の実出力から作る）。"""
+    c_res = mod.item_c(_c_ctx(tmp_path))
+    assert c_res["status"] == "ok"
+    c_dir = tmp_path / "w" / "C1"
+    assert (c_dir / "project" / "package").is_dir()
+    b_res = mod.item_b(_c_ctx(tmp_path / "b"))[0]
+    assert b_res["status"] == "ok"
+    items = {
+        "A": {"status": "ok", "exit_code": 0, "skip_lines": 0, "stderr_bytes": 3},
+        "B": b_res,
+        "C": c_res,
+        "D": {
+            "status": "ok",
+            "exit_code": 0,
+            "linkage_tool": "otool",
+            "direct_libraries": ["/usr/lib/libSystem.B.dylib"],
+            "linkage_target_sha256": HEX64,
+            "linkage_target_matches_cli": True,
+        },
+        "E": {"status": "ok", "records": 4, "input_sha256": HEX64, "max_abs_score_diff": 0.0},
+        "F": {"status": "failed", "reason": "test_failures", "load_start": [1.5, 2.0, 3.0]},
+    }
+    return {
+        "schema": "real-machine-check/1",
+        "evidence_hint": "requires_human_review",
+        "bin_override": False,
+        "environment": {
+            "hw_model": "Mac15,3",
+            "cpu": "Apple M3 Pro",
+            "ncpu": 12,
+            "memory_bytes": 38654705664,
+            "os_name": "macOS",
+            "os_version": "15.0.1",
+            "os_build": "24A335",
+            "commit": "0" * 40,
+            "worktree_clean": True,
+            "started_local": "2026-10-05T10:00:00+0900",
+            "ended_local": "2026-10-05T10:05:00+0900",
+            "cli_sha256": HEX64,
+            "cli_bytes": 3000000,
+            "cli_profile": "release",
+        },
+        "inputs": {"train_records": 8, "definition_sha256": HEX64, "train_sha256": HEX64},
+        "options": {"items": ["A", "B", "C", "D", "E", "F"], "repeat": 1, "p95_limit_us": 5},
+        "items": items,
+    }
+
+
+def _diff_paths(a: Any, b: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """2 つの JSON 値の違う位置（キー・添字の並び）。"""
+    if isinstance(a, dict) and isinstance(b, dict):
+        assert set(a) == set(b)
+        return [q for k in a for q in _diff_paths(a[k], b[k], (*path, k))]
+    if isinstance(a, list) and isinstance(b, list):
+        assert len(a) == len(b)
+        return [q for i, (x, y) in enumerate(zip(a, b)) for q in _diff_paths(x, y, (*path, i))]  # noqa: B905
+    return [] if a == b else [path]
+
+
+def test_sanitize_record_keeps_a_normal_record_unchanged(tmp_path: Path) -> None:
+    """REQ-33: 正常な記録は `sanitize_record` で変わらない（正当な欄を伏せる退行を止める）。
+
+    変わってよいのは、パス文字（`project/package`）を含む infer の `command` だけ。従来どおり。
+    schema は run() が伏せ処理後に戻す固定定数のため比較から除く。
+    """
+    rec = _representative_record(tmp_path)
+    out = mod.sanitize_record(rec)
+    changed = _diff_paths(
+        {k: v for k, v in rec.items() if k != "schema"},
+        {k: v for k, v in out.items() if k != "schema"},
+    )
+    assert changed == [("items", "B", "steps", 6, "command")]
+    assert mod.sanitize_record(out) == out
+    # 工程の要約と package_files が実際に含まれていること（空の比較にしない）
+    assert out["items"]["B"]["steps"][5]["summary"]["capacity"]["total_bytes"] == 10
+    assert out["items"]["B"]["package_files"][0]["name"] == "model.onnx"
+    assert out["items"]["C"]["capacity_limit"]["code"] == "limit_exceeded"
+
+
+def test_deeply_nested_stdout_is_invalid_json_not_an_internal_error(tmp_path: Path) -> None:
+    """REQ-39・REQ-21: 深すぎる入れ子の JSON は `RecursionError` でなく `invalid_json`。"""
+    deep = "[" * 300000
+    with pytest.raises(ValueError, match="too deep"):
+        mod._loads(deep)
+    f = tmp_path / "out.json"
+    f.write_text(deep, encoding="utf-8")
+    assert mod.parse_json_object(f, 1 << 20) is None
+    cli = _fake_cli(tmp_path, f'cat "{f}"\nexit 0\n')
+    d = tmp_path / "B"
+    assert mod.stage_inputs(_ctx(tmp_path, cli), d, None)
+    steps, _pkg, failure = mod.run_pipeline(_ctx(tmp_path, cli), d, "sample", {0})
+    assert failure == {
+        "status": "failed",
+        "reason": "invalid_json",
+        "step": "register",
+        "exit_code": 0,
+    }
+    assert "summary" not in steps[0]
+
+
+def test_unexpected_extra_fields_do_not_reach_step_summaries(tmp_path: Path) -> None:
+    """REQ-33: CLI が許可リスト外の欄（本文・入れ子）を返しても、`steps[].summary` に出ない。"""
+    cli = _fake_cli(
+        tmp_path,
+        'echo \'{"step":"register","status":"ok","options":3,'
+        '"evaluation_defined":true,"note":"plain-looking-secret",'
+        '"rows":[{"text":"private body"}]}\'\nexit 0\n',
+    )
+    d = tmp_path / "B"
+    ctx = _ctx(tmp_path, cli)
+    assert mod.stage_inputs(ctx, d, None)
+    steps, _pkg, failure = mod.run_pipeline(ctx, d, "sample", {0})
+    assert failure is not None
+    assert steps[0]["summary"] == {
+        "step": "register",
+        "status": "ok",
+        "options": 3,
+        "evaluation_defined": True,
+        "definition_sha256": None,
+    }
+    assert "plain-looking-secret" not in json.dumps(steps)
+
+
+# ---- 判定の強化（型 2。REQ-21・REQ-28・REQ-30・REQ-31・REQ-33） ----
+
+
+def _infer_obj(facts: Any, scores: dict[str, Any], label: Any) -> dict[str, Any]:
+    return {"id": "x", "status": "ok", "predicted_label": label, "scores": scores}
+
+
+def test_check_infer_output_requires_the_label_to_be_the_argmax() -> None:
+    """REQ-21 §2-3: predicted_label は最大スコアの選択肢（同点は宣言順の先頭）。矛盾は不合格。"""
+    f = mod.Facts(["alpha", "beta", "gamma"], 8, 4, False, None)
+    chk = mod.check_infer_output
+    s = {"alpha": 0.9, "beta": 0.05, "gamma": 0.05}
+    # 背景: 最大でない gamma を予測しても、キー・合計が合っていれば通っていた
+    assert chk(_infer_obj(f, s, "gamma"), f) is False
+    assert chk(_infer_obj(f, s, "beta"), f) is False
+    assert chk(_infer_obj(f, s, "alpha"), f) is True
+    # 同点は宣言順の先頭（beta と gamma が同点の最大なら beta）
+    tie = {"alpha": 0.2, "beta": 0.4, "gamma": 0.4}
+    assert chk(_infer_obj(f, tie, "beta"), f) is True
+    assert chk(_infer_obj(f, tie, "gamma"), f) is False
+    flat = {k: 1 / 3 for k in f.option_ids}
+    assert chk(_infer_obj(f, flat, "alpha"), f) is True
+    assert chk(_infer_obj(f, flat, "beta"), f) is False
+    # 許容差なしの比較: わずかに大きい後ろの選択肢が argmax
+    close = {"alpha": 0.5 - 1e-12, "beta": 0.5 + 1e-12, "gamma": 0.0}
+    assert chk(_infer_obj(f, close, "beta"), f) is True
+    assert chk(_infer_obj(f, close, "alpha"), f) is False
+    # label が選択肢 ID でない・文字列でない
+    assert chk(_infer_obj(f, s, ["alpha"]), f) is False
+    assert chk(_infer_obj(f, s, None), f) is False
+
+
+def test_check_infer_output_requires_scores_within_zero_and_one() -> None:
+    """REQ-21 §2-3: 各スコアは 0 以上 1 以下（合計が 1 でも範囲外は不合格）。境界値は合格。"""
+    f = mod.Facts(["alpha", "beta"], 8, 4, False, None)
+    chk = mod.check_infer_output
+    assert chk(_infer_obj(f, {"alpha": 1.5, "beta": -0.5}, "alpha"), f) is False
+    assert chk(_infer_obj(f, {"alpha": 1.0, "beta": 0.0}, "alpha"), f) is True
+    assert chk(_infer_obj(f, {"alpha": 0, "beta": 1}, "beta"), f) is True
+    assert chk(_infer_obj(f, {"alpha": 1.000001, "beta": 0.0}, "alpha"), f) is False
+    assert chk(_infer_obj(f, {"alpha": True, "beta": 0.0}, "alpha"), f) is False
+
+
+def test_p95_values_must_be_nonnegative_integers() -> None:
+    """REQ-31 §2-4: p95_us・limit_us は 0 以上の整数（真偽値・負数・小数を拒否）。0 は合格。"""
+    good = _cap(5, 40000000, False)
+    j = _j95
+    assert j(0, {"p95_us": 0, "limit_us": 0, "exceeded": False}, good, 0) is None
+    # 背景: p95_us=-5 が通っていた
+    assert j(0, {"p95_us": -5, "limit_us": 50000, "exceeded": False}, good, 50000) == (
+        "unexpected_output"
+    )
+    assert j(0, {"p95_us": 1, "limit_us": -1, "exceeded": False}, good, -1) == "unexpected_output"
+    for bad in (True, 1.5, "1"):
+        p95 = {"p95_us": bad, "limit_us": 50000, "exceeded": False}
+        assert j(0, p95, good, 50000) == "missing_field"
+    assert mod.p95_summary({"p95_us": -5, "limit_us": 1, "exceeded": False}) is None
+    assert mod.p95_summary({"p95_us": 0, "limit_us": 0, "exceeded": False}) == {
+        "p95_us": 0,
+        "limit_us": 0,
+        "exceeded": False,
+    }
+    f = mod.Facts(["a"], 8, 4, False, 100)
+    pkg = _pkg(f, infer_p95={"p95_us": -5, "limit_us": 100, "exceeded": False})
+    assert mod._step_check("package", pkg, {0}, 0, f, 0) is False
+
+
+@pytest.mark.parametrize(
+    ("name", "patch"),
+    [
+        ("register", {"options": 3.0}),
+        ("register", {"options": False}),
+        ("train", {"candidate": False}),
+        ("train", {"candidate": 0.0}),
+        ("select", {"candidate": False}),
+        ("select", {"candidate": 0.0}),
+        ("evaluate", {"candidate": False}),
+        ("evaluate", {"candidate": 0.0}),
+        ("evaluate", {"n_total": 4.0}),
+        ("evaluate", {"correct": 4.0}),
+    ],
+)
+def test_reported_values_must_be_real_integers(name: str, patch: dict[str, Any]) -> None:
+    """REQ-21 §2-5: `False == 0`・`0.0 == 0` のような型違いの一致を通さない。"""
+    f = _facts()
+    reports = _valid_reports(f)
+    if name == "register":
+        # 期待値と同じ数値の float でも通さない（fixture の選択肢数は 3）
+        assert len(f.option_ids) == 3
+    good = reports[name]
+    assert mod._step_check(name, good, set(), 0, f, 0, "c1") is True
+    assert mod._step_check(name, dict(good, **patch), set(), 0, f, 0, "c1") is False
+
+
+def test_evaluate_accuracy_and_macro_f1_are_checked() -> None:
+    """REQ-24 §2-6: accuracy は correct / n_total と一致（1e-9 以内）、macro_f1 は null か 0〜1。"""
+    f = _facts()
+    n = f.eval_records
+    assert n >= 2
+    good = _valid_reports(f)["evaluate"]
+    chk = lambda **p: mod._step_check("evaluate", dict(good, **p), set(), 0, f, 0, "c1")  # noqa: E731
+    assert chk() is True
+    # 背景: accuracy:7.0・macro_f1:"x" が通っていた
+    assert chk(accuracy=7.0, macro_f1="x") is False
+    assert chk(accuracy=7.0) is False
+    assert chk(macro_f1="x") is False
+    # accuracy が correct / n_total と食い違う
+    assert chk(correct=n - 1) is False
+    assert chk(correct=n - 1, accuracy=(n - 1) / n) is True
+    assert chk(accuracy=1.0 - 1e-8) is False
+    assert chk(accuracy=1.0 - 1e-10) is True
+    for bad in (float("nan"), float("inf"), None, True, "1"):
+        assert chk(accuracy=bad) is False
+    # macro_f1: null・0・1 は合格。範囲外・非有限・型違い・欄の欠落は不合格
+    for ok in (None, 0, 0.0, 1, 1.0, 0.5):
+        assert chk(macro_f1=ok) is True
+    for bad in (-0.1, 1.0000001, float("nan"), float("inf"), True, [1], {"a": 1}):
+        assert chk(macro_f1=bad) is False
+    missing = dict(good)
+    del missing["macro_f1"]
+    assert mod._step_check("evaluate", missing, set(), 0, f, 0, "c1") is False
+
+
+def test_kind_must_be_in_vocabulary_and_consistent_across_train_select_evaluate() -> None:
+    """REQ-39・REQ-21 §2-2: train の kind は語彙内、select は train・evaluate は select と同じ。"""
+    f = _facts()
+    reports = _valid_reports(f)
+    for kind in ("c1", "c3", "autoregressive"):
+        chk = mod._step_check
+        assert chk("train", dict(reports["train"], kind=kind), set(), 0, f, 0) is True
+        assert chk("select", dict(reports["select"], kind=kind), set(), 0, f, 0, kind) is True
+        assert chk("evaluate", dict(reports["evaluate"], kind=kind), set(), 0, f, 0, kind) is True
+    assert mod._step_check("train", dict(reports["train"], kind="c9"), set(), 0, f, 0) is False
+    # 語彙内でも前の工程と違えば不合格。前の kind が分からない（None）場合も通さない
+    assert mod._step_check("select", reports["select"], set(), 0, f, 0, "c3") is False
+    assert mod._step_check("evaluate", reports["evaluate"], set(), 0, f, 0, "c3") is False
+    assert mod._step_check("select", reports["select"], set(), 0, f, 0, None) is False
+
+
+@pytest.mark.parametrize(
+    ("cfg", "step"),
+    [
+        ({"train_kind": "c9"}, "train"),
+        ({"select_kind": "c3"}, "select"),
+        ({"eval_kind": "c3"}, "evaluate"),
+        ({"accuracy": 0.5}, "evaluate"),
+        ({"macro_f1": 7}, "evaluate"),
+    ],
+)
+def test_pipeline_stops_at_the_step_that_contradicts_the_previous_one(
+    tmp_path: Path, cfg: dict[str, Any], step: str
+) -> None:
+    """REQ-21 §2-2・§2-6: kind の不一致・語彙外・accuracy の食い違いは、その工程で止まる。"""
+    ctx = _c_ctx(tmp_path, **cfg)
+    d = ctx.work / "B"
+    assert mod.stage_inputs(ctx, d, None)
+    steps, _pkg, failure = mod.run_pipeline(ctx, d, None, {0})
+    assert failure is not None
+    assert (failure["reason"], failure["step"]) == ("unexpected_output", step)
+    assert steps[-1]["step"] == step
+
+
+def test_package_report_requires_judgment_and_infer_p95_keys() -> None:
+    """REQ-21 §2-7: exit 0 の package は judgment・infer_p95 のキーが必要（値は null でよい）。"""
+    f = _facts()
+    chk = lambda obj: mod._step_check("package", obj, {0}, 0, f, 0)  # noqa: E731
+    assert chk(_pkg(f)) is True
+    for key in ("judgment", "infer_p95"):
+        broken = _pkg(f)
+        del broken[key]
+        assert chk(broken) is False
+    only_status = {"step": "package", "status": "ok", "acceptance_defined": False}
+    assert chk(only_status) is False
+    assert chk(dict(_pkg(f), capacity=None)) is False
+
+
+def test_package_with_acceptance_requires_pass_on_exit_0() -> None:
+    """REQ-21・REQ-33 §2-7: 合否基準のある定義で exit 0 なら judgment は pass だけ。"""
+    f = mod.Facts(["a", "b"], 8, 4, True, None)
+    chk = lambda **p: mod._step_check("package", _pkg(f, **p), {0}, 0, f, 0)  # noqa: E731
+    assert chk(judgment="pass", acceptance_defined=True) is True
+    for bad in (None, "fail", "undeterminable", "PASS", True):
+        assert chk(judgment=bad, acceptance_defined=True) is False
+    assert chk(judgment="pass", acceptance_defined=False) is False
+
+
+def test_package_exit_20_requires_the_fields_the_real_cli_always_emits() -> None:
+    """REQ-21・REQ-30・REQ-31 §2-7: exit 20 は code・step・capacity・infer_p95 と超過の実在。"""
+    f = _facts()
+    over = {
+        "code": "limit_exceeded",
+        "message": "m",
+        "step": "package",
+        "capacity": _cap_json(40000001, 40000000, True),
+        "infer_p95": None,
+    }
+    chk = lambda obj: mod._step_check("package", obj, {20}, 20, f, 0)  # noqa: E731
+    assert chk(over) is True
+    assert chk(dict(over, code="runtime_error")) is False
+    assert chk({k: v for k, v in over.items() if k != "code"}) is False
+    assert chk({k: v for k, v in over.items() if k != "infer_p95"}) is False
+    assert chk(dict(over, step="train")) is False
+    # exit 20 なのにどの上限も超過していない
+    assert chk(dict(over, capacity=_cap_json())) is False
+    # exit 20 は allowed に無ければ不合格
+    assert mod._step_check("package", over, {0}, 20, f, 0) is False
+
+
+def test_p95_over_with_exit_20_is_accepted_only_with_consistent_exceeded() -> None:
+    """REQ-31 §2-4・§2-7: p95 超過の exit 20 は、定義の limit_us・exceeded と整合したときだけ。"""
+    f = mod.Facts(["a"], 8, 4, False, 100)
+    mk = lambda **p: {  # noqa: E731
+        "code": "limit_exceeded",
+        "step": "package",
+        "capacity": _cap_json(),
+        "infer_p95": dict({"p95_us": 101, "limit_us": 100, "exceeded": True}, **p),
+    }
+    chk = lambda obj: mod._step_check("package", obj, {0, 20}, 20, f, 0)  # noqa: E731
+    assert chk(mk()) is True
+    assert chk(mk(p95_us=100)) is False  # 境界: p95_us == limit_us は超過でない
+    assert chk(mk(limit_us=99, p95_us=100)) is False  # 定義の上限（100）と違う
+    assert chk(mk(exceeded=False)) is False
+
+
+def test_capacity_component_sum_must_match_total_for_every_package_check() -> None:
+    """REQ-30 §2-1: 5 項目の合計が total_bytes と一致しなければ、exit 0・20 のどちらも不合格。"""
+    f = _facts()
+    bad = _cap_json(sum_delta=1)
+    assert mod.capacity_sum_matches(mod.capacity_summary({"capacity": _cap_json()})) is True
+    assert mod.capacity_sum_matches(mod.capacity_summary({"capacity": bad})) is False
+    assert mod._step_check("package", _pkg(f, capacity=bad), {0}, 0, f, 0) is False
+    over = {"code": "limit_exceeded", "step": "package", "infer_p95": None}
+    ok_cap = _cap_json(40000001, 40000000, True)
+    bad_cap = _cap_json(40000001, 40000000, True, sum_delta=-1)
+    assert mod._step_check("package", dict(over, capacity=ok_cap), {20}, 20, f, 0) is True
+    assert mod._step_check("package", dict(over, capacity=bad_cap), {20}, 20, f, 0) is False
+    # B は項目側で `capacity_sum_mismatch` として判定するため、工程側の照合を外せる
+    assert mod._step_check("package", _pkg(f, capacity=bad), {0}, 0, f, 0, None, False) is True
+
+
+def test_item_b_rejects_mismatching_capacity_sum_with_its_own_reason(tmp_path: Path) -> None:
+    """REQ-30 §2-1: B は内訳の合計の不一致を `capacity_sum_mismatch` として失敗にする。"""
+    res, ok = mod.item_b(_c_ctx(tmp_path, comp_delta=1))
+    assert (ok, res["status"], res["reason"]) == (False, "failed", "capacity_sum_mismatch")
+
+
+def test_item_c1_rejects_mismatching_capacity_sum(tmp_path: Path) -> None:
+    """REQ-30 §2-1: C-1 でも内訳の合計の不一致は unexpected_output の失敗。"""
+    res = mod.item_c(_c_ctx(tmp_path, comp_delta=1))
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "unexpected_output", "C-1")
+    assert res["step"] == "package"
+
+
+def test_item_c2_rejects_mismatching_capacity_sum(tmp_path: Path) -> None:
+    """REQ-30 §2-1: C-2（exit 20 の JSON）でも内訳の合計の不一致は失敗。"""
+    ctx = _c_ctx(tmp_path)
+    d = ctx.work / "C2"
+    assert mod.stage_inputs(ctx, d, {"max_package_bytes": ctx.package_limit_bytes})
+    _steps, _pkg_obj, failure = mod.run_pipeline(ctx, d, None, {20})
+    assert failure is None
+    ctx = _c_ctx(tmp_path / "bad", comp_delta=1)
+    d = ctx.work / "C2"
+    assert mod.stage_inputs(ctx, d, {"max_package_bytes": ctx.package_limit_bytes})
+    _steps, _pkg_obj, failure = mod.run_pipeline(ctx, d, None, {20})
+    assert failure is not None
+    assert (failure["reason"], failure["step"]) == ("unexpected_output", "package")
+    assert failure["code"] == "limit_exceeded"
+
+
+def test_expected_limit_bytes_comes_from_the_definition_or_the_default(tmp_path: Path) -> None:
+    """REQ-30 §2-8: 期待する limit_bytes は定義の max_package_bytes、無ければ 40_000_000。"""
+    assert mod.DEFAULT_CAPACITY_LIMIT_BYTES == 40_000_000
+    assert _facts().limit_bytes == 40_000_000
+    ctx = _c_ctx(tmp_path)
+    d = tmp_path / "defn"
+    assert mod.stage_inputs(ctx, d, {"max_package_bytes": 1234})
+    facts = mod.read_facts(d)
+    assert facts is not None
+    assert facts.limit_bytes == 1234
+    # 背景: B で limit_bytes=7 が通っていた
+    f = _facts()
+    assert mod._step_check("package", _pkg(f, capacity=_cap_json(limit=7)), {0}, 0, f, 0) is False
+    assert mod._step_check("package", _pkg(f, capacity=_cap_json(limit=40000000)), {0}, 0, f, 0)
+    f2 = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, None, 1234)
+    assert mod._step_check("package", _pkg(f2, capacity=_cap_json(limit=1234)), {0}, 0, f2, 0)
+    assert not mod._step_check("package", _pkg(f2, capacity=_cap_json()), {0}, 0, f2, 0)
+
+
+def test_item_b_rejects_limit_bytes_that_differ_from_the_default(tmp_path: Path) -> None:
+    """REQ-30 §2-8: B で CLI が報告した limit_bytes が既定値と違えば失敗する。"""
+    res, ok = mod.item_b(_c_ctx(tmp_path, limit1=7))
+    assert (ok, res["status"], res["reason"], res["step"]) == (
+        False,
+        "failed",
+        "unexpected_output",
+        "package",
+    )
+    res, ok = mod.item_b(_c_ctx(tmp_path / "ok"))
+    assert (ok, res["status"]) == (True, "ok")
+    assert res["capacity"]["limit_bytes"] == 40000000
+    assert res["capacity_sum_matches_total"] is True
+
+
+def test_item_b_requires_published_files_to_match_total_bytes(tmp_path: Path) -> None:
+    """REQ-30 §2-9: package/ 直下の通常ファイルの合計が total_bytes と一致しなければ B は失敗。"""
+    res, ok = mod.item_b(_c_ctx(tmp_path / "a", actual_bytes=11))
+    assert (ok, res["status"], res["reason"], res["step"]) == (
+        False,
+        "failed",
+        "unexpected_output",
+        "package",
+    )
+    res, ok = mod.item_b(_c_ctx(tmp_path / "b", actual_bytes=9))
+    assert (ok, res["reason"]) == (False, "unexpected_output")
+    res, ok = mod.item_b(_c_ctx(tmp_path / "c", actual_bytes=10))
+    assert ok is True
+    assert [f["bytes"] for f in res["package_files"]] == [10]
+
+
+def test_item_c1_requires_published_files_to_match_total_bytes(tmp_path: Path) -> None:
+    """REQ-30 §2-9: C-1 の exit 0 も実ファイルの合計が total_bytes と一致すること。"""
+    res = mod.item_c(_c_ctx(tmp_path / "a", actual_bytes=11))
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "unexpected_output", "C-1")
+    res = mod.item_c(_c_ctx(tmp_path / "b", actual_bytes=0))
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "unexpected_output", "C-1")
+    res = mod.item_c(_c_ctx(tmp_path / "c", actual_bytes=10))
+    assert res["status"] == "ok"
+    assert "package_files" not in res
+    assert "package_files" not in json.dumps(res)
+    # p95 超過の exit 20（package/ が作られない）では実ファイルの照合は行わない
+    res = mod.item_c(_c_ctx(tmp_path / "d", rc1=20, p95_us=60000, p95_exceeded=True))
+    assert res["status"] == "ok"
+
+
+def test_item_c2_code_is_recorded_only_from_the_vocabulary(tmp_path: Path) -> None:
+    """REQ-21・REQ-33: C-2 の code は語彙内ならその値、語彙外なら `<unexpected>`。"""
+    res = mod.item_c(_c_ctx(tmp_path / "a"))
+    assert res["capacity_limit"]["code"] == "limit_exceeded"
+    res = mod.item_c(_c_ctx(tmp_path / "b", c2_code="plain-looking-secret"))
+    # 語彙外の code は exit 20 の JSON として不合格（工程で止まる）で、値は記録に出ない
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "unexpected_output", "C-2")
+    assert res["code"] == "<unexpected>"
+    assert "plain-looking-secret" not in json.dumps(res)
+
+
+# ---- 定数の機械照合（fixtures・Rust のソースと一致すること） ----
+
+
+def test_code_vocabulary_matches_the_exit_code_fixture() -> None:
+    """REQ-21: `CODE_VOCAB` は終了コード 7 種の fixture の name と一致する。"""
+    fx = json.loads((REPO / "fixtures" / "exitcode" / "exit_codes.json").read_text("utf-8"))
+    assert {e["name"] for e in fx["exit_codes"]} == set(mod.CODE_VOCAB)
+    assert len(mod.CODE_VOCAB) == 7
+
+
+def test_kind_vocabulary_covers_default_candidates_and_the_guard_allowlist() -> None:
+    """REQ-19・REQ-39: `KIND_VOCAB` は既定候補の kind を含み、ガード層の許可リストと一致する。"""
+    fx = json.loads(
+        (REPO / "fixtures" / "train_contract" / "default_candidates.json").read_text("utf-8")
+    )
+    assert {c["kind"] for c in fx["default_candidates"]} <= set(mod.KIND_VOCAB)
+    src = (REPO / "crates" / "guard" / "src" / "kind.rs").read_text("utf-8")
+    m = re.search(r"const SUPPORTED_KINDS: \[&str; \d+\] = \[([^\]]*)\];", src)
+    assert m is not None, "SUPPORTED_KINDS が見つからない"
+    assert set(re.findall(r'"([a-z0-9_]+)"', m.group(1))) == set(mod.KIND_VOCAB)
+
+
+def test_score_sum_tolerance_matches_the_shared_fixture() -> None:
+    """REQ-21: `SCORE_SUM_TOLERANCE` は共有 fixture の値と一致する。"""
+    fx = json.loads(
+        (REPO / "fixtures" / "score_tolerance" / "score_sum_tolerance.json").read_text("utf-8")
+    )
+    assert mod.SCORE_SUM_TOLERANCE == fx["score_sum_tolerance"]
+    assert mod.SCORE_SUM_TOLERANCE == 1e-6
+
+
+def test_default_limit_bytes_matches_the_rust_constant() -> None:
+    """REQ-30: 既定の limit_bytes は `package.rs` の `DEFAULT_CAPACITY_LIMIT_BYTES` と一致する。"""
+    src = (REPO / "crates" / "cli" / "src" / "stages" / "package.rs").read_text("utf-8")
+    m = re.search(r"const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = ([0-9_]+);", src)
+    assert m is not None, "DEFAULT_CAPACITY_LIMIT_BYTES が見つからない"
+    assert int(m.group(1).replace("_", "")) == mod.DEFAULT_CAPACITY_LIMIT_BYTES
+
+
+def test_sanitize_record_checks_every_direct_library_regardless_of_path_chars() -> None:
+    """REQ-33: ライブラリ名の要素はパス文字の有無によらず形式・`..`・長さを満たすものだけ残る。"""
+    lib = "/usr/lib/libSystem.B.dylib"
+    rec = {
+        "items": {
+            "D": {
+                "direct_libraries": [
+                    lib,
+                    "SECRETBODY",
+                    "libX.dylib\n",
+                    "/usr/lib/libx.dylib\n",
+                    "/usr/lib/" + "a" * 120,
+                    "",
+                ]
+            }
+        }
+    }
+    got = mod.sanitize_record(rec)["items"]["D"]["direct_libraries"]
+    assert got == [lib] + ["<redacted>"] * 5
+
+
+def test_sanitize_record_redacts_keys_outside_the_key_rule() -> None:
+    """REQ-33: dict のキーは `^[A-Za-z0-9_.-]{1,64}$` のときだけ残り、他は `<redacted>`。"""
+    got = mod.sanitize_record({"ok_key-1.x": 1, "a b": 2, "k" * 65: 3, "日本語": 4, "": 5})
+    assert got == {"ok_key-1.x": 1, "<redacted>": 5}
+    assert mod.sanitize_record({"k" * 64: 1}) == {"k" * 64: 1}
+    assert mod.sanitize_record({"k\n": 1}) == {"<redacted>": 1}
+
+
+def test_huge_integers_do_not_raise_and_fail_range_checks() -> None:
+    """REQ-21・REQ-33: `float` へ変換できない巨大な整数は例外を出さず、範囲の検査で不合格。"""
+    huge = 10**400
+    assert mod._is_finite_number(huge) is False
+    assert mod._unit_number(huge) is False
+    f = _facts()
+    ids = f.option_ids
+    got = mod.summarize_step("evaluate", {"accuracy": huge, "macro_f1": huge}, ids)
+    assert (got["accuracy"], got["macro_f1"]) == (None, None)
+    good = _valid_reports(f)["evaluate"]
+    assert mod.check_stage_report("evaluate", dict(good, accuracy=huge), f, 0, "c1") is False
+    assert mod._step_check("evaluate", dict(good, macro_f1=huge), set(), 0, f, 0, "c1") is False
+    ok = {"id": "x", "status": "ok", "predicted_label": ids[0], "scores": _scores(f)}
+    assert mod.check_infer_output(dict(ok, scores=dict(_scores(f), **{ids[0]: huge})), f) is False
+    # E の突き合わせも例外にならず、非有限の扱いになる
+    b = {"a": {"predicted_label": "x", "scores": {"x": huge}}}
+    s = {"a": {"predicted_label": "x", "scores": {"x": 0.5}}}
+    assert mod.compare_infer(b, s)["scores_nonfinite"] == 1
+
+
+def test_collect_environment_validates_probe_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-33: `collect_environment` は外部コマンドの出力を `env_text`・`ascii_int` へ通す。"""
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    ctx = _ctx(tmp_path, tmp_path / "no-such-cli")
+    names_text = ("hw", "cpu", "osn", "osv", "osb")
+    names_int = ("ncpu", "mem")
+
+    def fake(values: dict[str, str]) -> Any:
+        return lambda _w, _r, argv, name: values.get(name)
+
+    good = {
+        "hw": "Mac16,6",
+        "cpu": "Apple M4 Max",
+        "osn": "macOS",
+        "osv": "27.0",
+        "osb": "26A428",
+        "ncpu": "16",
+        "mem": "68719476736",
+    }
+    monkeypatch.setattr(mod, "_probe", fake(good))
+    env = mod.collect_environment(ctx, None)
+    assert (env["hw_model"], env["cpu"], env["os_name"]) == ("Mac16,6", "Apple M4 Max", "macOS")
+    assert (env["os_version"], env["os_build"]) == ("27.0", "26A428")
+    assert (env["ncpu"], env["memory_bytes"]) == (16, 68719476736)
+    for bad in ("a|b", "a" * 65, "ok\nx", "日本語"):
+        monkeypatch.setattr(mod, "_probe", fake({n: bad for n in names_text}))
+        env = mod.collect_environment(ctx, None)
+        got = [env[k] for k in ("hw_model", "cpu", "os_name", "os_version", "os_build")]
+        assert got == [None] * 5
+    for bad in ("１６", "12abc"):
+        monkeypatch.setattr(mod, "_probe", fake({n: bad for n in names_int}))
+        env = mod.collect_environment(ctx, None)
+        assert (env["ncpu"], env["memory_bytes"]) == (None, None)

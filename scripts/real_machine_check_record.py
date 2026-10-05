@@ -13,10 +13,12 @@ REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-38・REQ-39。特定�
 - CLI の JSON の要約と、記録へ出してよい値だけへの絞り込み（伏せ処理は `sanitize_record` に集約）
 - `record.json`・`record.md` の書き出しと、stdout への固定メッセージ JSON 1 行
 
-記録の規則（最重要）: 記録に書くのは件数・ハッシュ・サイズ・終了コード・固定語彙・JSON の要約だけ。
-パス（`/` や `\\` などを含む文字列。例外は D のライブラリ名）・
-データ本文（`input`・`text`・`id` の値）・
-stderr の内容は書かない。
+記録の規則（最重要）: 記録に書くのは件数・ハッシュ・サイズ・終了コード・固定語彙・検証済みの
+数値と真偽値だけ（許可リスト方式）。工程の要約は工程ごとの許可した欄だけを組み立て、失敗時の
+`message` は本文でなくバイト数とハッシュだけにする。パス（`/` や `\\` などを含む文字列。例外は D の
+ライブラリ名）・データ本文・利用者が決めた文字列（選択肢 ID・`input`・`text`・`id` の値）・
+stderr の内容は書かない。最後の関門 `sanitize_record` は、文字列を持ってよいキーの集合に無い
+位置の文字列を伏せる。
 
 証拠種別: このスクリプトは測定と整形までを行い、「実機」の証拠としての確定は人が行う
 （`evidence_hint` は `requires_human_review` か `test_harness` のみ）。
@@ -87,9 +89,32 @@ MAX_P95_LIMIT_US = 3_600_000_000
 SCORE_TOLERANCE = 1e-9
 
 REDACTED = "<redacted>"
+# 閉じた語彙の欄で、文字列だが語彙外の値の代わりに出す固定の文字列
+UNEXPECTED = "<unexpected>"
+# `package_files[].name` が安全な名前の形に一致しないときの固定の文字列
+UNRECOGNIZED = "<unrecognized>"
 MAX_STR = 200
-# 要約から落とす、データ本文を運びうるキー（大文字小文字を区別しない）
-DENY_KEYS = frozenset({"input", "text", "id", "output"})
+# 記録の文字列の欄の語彙（閉じた集合。fixtures・Rust のソースとの一致は pytest で機械照合する）
+STATUS_VOCAB = frozenset({"ok", "skipped"})
+# 終了コード 7 種の名前（`fixtures/exitcode/exit_codes.json` の `name`。REQ-21）
+CODE_VOCAB = frozenset(
+    {
+        "ok",
+        "judged_fail",
+        "out_of_scope",
+        "pending",
+        "limit_exceeded",
+        "invalid_input",
+        "runtime_error",
+    }
+)
+# `PackageJudgment`（crates/core/src/stage_report.rs）
+JUDGMENT_VOCAB = frozenset({"pass", "fail", "undeterminable"})
+# `kind` の許可リスト（crates/guard/src/kind.rs の `SUPPORTED_KINDS`。REQ-39）
+KIND_VOCAB = frozenset({"c1", "c3", "autoregressive"})
+# `package` の容量上限の既定値（crates/cli/src/stages/package.rs の `DEFAULT_CAPACITY_LIMIT_BYTES`。
+# 定義に `limits.max_package_bytes` が無いときの期待値。REQ-30。pytest で Rust のソースと照合する）
+DEFAULT_CAPACITY_LIMIT_BYTES = 40_000_000
 # パス区切りとして扱う文字（`/`・`\`・U+2215 DIVISION SLASH・U+2044 FRACTION SLASH・
 # U+FF0F FULLWIDTH SOLIDUS）
 PATH_CHARS = ("/", "\\", "∕", "⁄", "／")
@@ -100,7 +125,47 @@ CAPACITY_COMPONENTS = (
     "calibration",
     "metadata",
 )
-LIB_RE = re.compile(r"^/(usr/lib|System)/[A-Za-z0-9._+/-]+$")
+LIB_RE = re.compile(r"/(usr/lib|System)/[A-Za-z0-9._+/-]+")
+# D のライブラリ名 1 件の長さの上限
+MAX_LIB_LEN = 128
+# record の dict のキーに許す形（規則外のキーは `<redacted>` へ置き換える）
+KEY_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+PACKAGE_FILE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+ENV_TEXT_RE = re.compile(r"[A-Za-z0-9 ._,()+-]{1,64}")
+ASCII_INT_RE = re.compile(r"[0-9]{1,20}")
+# 文字列の値を持ってよいキー（`sanitize_record` の閉じた集合）。実際に記録へ出す文字列の欄だけを
+# 並べる。`sha256`・`*_sha256` は関数側で扱う。集合に無いキーの下の文字列は伏せる
+STR_KEYS = frozenset(
+    {
+        "schema",
+        "evidence_hint",
+        "status",
+        "reason",
+        "step",
+        "command",
+        "code",
+        "kind",
+        "judgment",
+        "classification",
+        "case",
+        "error_type",
+        "linkage_tool",
+        "name",
+        "commit",
+        "cli_profile",
+        "started_local",
+        "ended_local",
+        "hw_model",
+        "cpu",
+        "os_name",
+        "os_version",
+        "os_build",
+    }
+)
+# list の要素として文字列を持ってよい位置（`options.items`・`items.D.direct_libraries`）
+LIST_STR_PATHS = frozenset({("options", "items"), ("items", "D", "direct_libraries")})
+LIBRARIES_PATH = ("items", "D", "direct_libraries")
 FIXTURE_FILES = ("definition.json", "train.jsonl", "evaluation.jsonl")
 INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -118,7 +183,7 @@ class Interrupted(BaseException):  # Exception で捕まえられないよう Ba
 
 
 # --------------------------------------------------------------------------------------
-# 伏せ処理（記録へ出す値の唯一の関門）
+# 記録へ出す値の絞り込み（許可リスト方式。最後の関門は `sanitize_record`）
 # --------------------------------------------------------------------------------------
 
 
@@ -127,57 +192,182 @@ def _has_path_char(s: str) -> bool:
     return any(c in s for c in PATH_CHARS)
 
 
-def redact_value(value: Any) -> Any:
-    """CLI の JSON を再帰的に伏せる。
+def _loads(text: str) -> Any:
+    """`json.loads`。深すぎる入れ子の `RecursionError` も `ValueError` として扱う（REQ-39）。"""
+    try:
+        return json.loads(text)
+    except RecursionError as e:
+        raise ValueError("json nesting is too deep") from e
 
-    文字列値のうちパス文字を含むものは `<redacted>` へ、長い文字列は切り詰める。
-    `DENY_KEYS` のキー（大文字小文字不問）は落とし、キー自体にパス文字があれば落とす。
+
+def _is_int(v: Any) -> bool:
+    """bool を除く整数か。"""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _nonneg_int(v: Any) -> bool:
+    """bool を除く 0 以上の整数か。"""
+    return _is_int(v) and v >= 0
+
+
+def _is_finite_number(v: Any) -> bool:
+    """bool を除く有限の数か。
+
+    `float` へ変換できない巨大な整数（`math.isfinite` が `OverflowError` を出す）は、後段の
+    `float` 変換・引き算でも例外になるため「有限の数」に数えず False にする（内部エラーにしない）。
     """
-    if isinstance(value, str):
-        if _has_path_char(value):
-            return REDACTED
-        return value[:MAX_STR]
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if not isinstance(k, str) or k.lower() in DENY_KEYS or _has_path_char(k):
-                continue
-            out[k[:MAX_STR]] = redact_value(v)
-        return out
-    if isinstance(value, list):
-        return [redact_value(v) for v in value[:100]]
-    return value
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
-def summarize_infer(obj: dict[str, Any]) -> dict[str, Any]:
-    """`infer` の判定 JSON の要約。`status`・`predicted_label`・`scores` のキー数だけ。"""
+def _unit_number(v: Any) -> bool:
+    """bool を除く有限で 0 以上 1 以下の数か。"""
+    return _is_finite_number(v) and 0 <= v <= 1
+
+
+def vocab_value(v: Any, vocab: frozenset[str]) -> str | None:
+    """閉じた語彙の文字列欄。語彙内ならその値、文字列だが語彙外なら `<unexpected>`、他は None。"""
+    if not isinstance(v, str):
+        return None
+    return v if v in vocab else UNEXPECTED
+
+
+def _step_value(v: Any, name: str) -> str | None:
+    """`step` 欄。工程名と一致すれば工程名、文字列だが不一致なら `<unexpected>`、他は None。"""
+    return vocab_value(v, frozenset({name}))
+
+
+def _int_or_none(v: Any) -> int | None:
+    """0 以上の整数ならそのまま、違えば None（入れ子の dict・list や真偽値を通さない）。"""
+    return v if _nonneg_int(v) else None
+
+
+def _bool_or_none(v: Any) -> bool | None:
+    """真偽値ならそのまま、違えば None。"""
+    return v if isinstance(v, bool) else None
+
+
+def _unit_or_none(v: Any) -> int | float | None:
+    """有限で 0 以上 1 以下の数ならそのまま、違えば None。"""
+    return v if _unit_number(v) else None
+
+
+def p95_summary(v: Any) -> dict[str, Any] | None:
+    """`infer_p95` を固定構造へ写す。`p95_us`・`limit_us` は 0 以上の整数、`exceeded` は真偽値。
+
+    形が違えば None（REQ-31）。
+    """
+    if not isinstance(v, dict):
+        return None
+    p95, limit, exceeded = v.get("p95_us"), v.get("limit_us"), v.get("exceeded")
+    if not _nonneg_int(p95) or not _nonneg_int(limit) or not isinstance(exceeded, bool):
+        return None
+    return {"p95_us": p95, "limit_us": limit, "exceeded": exceeded}
+
+
+def _split_summary(v: Any) -> dict[str, int] | None:
+    """`inspect` の `split`。3 欄とも 0 以上の整数のときだけ。形が違えば None。"""
+    if not isinstance(v, dict):
+        return None
+    parts = {k: v.get(k) for k in ("train", "validation", "test")}
+    return parts if all(_nonneg_int(x) for x in parts.values()) else None
+
+
+def summarize_infer(obj: dict[str, Any], option_ids: list[str]) -> dict[str, Any]:
+    """`infer` の判定 JSON の要約（REQ-33）。
+
+    `status`・`scores_keys`（`scores` が dict ならキー数、違えば 0）・`predicted_index`
+    （`predicted_label` が定義の選択肢 ID の何番目か。0 始まり。選択肢に無ければ None）だけ。
+    選択肢 ID・データの id・スコアの値は利用者の値のため記録しない。
+    """
     scores = obj.get("scores")
+    label = obj.get("predicted_label")
+    index = option_ids.index(label) if isinstance(label, str) and label in option_ids else None
     return {
-        "status": redact_value(obj.get("status")),
-        "predicted_label": redact_value(obj.get("predicted_label")),
+        "status": vocab_value(obj.get("status"), STATUS_VOCAB),
         "scores_keys": len(scores) if isinstance(scores, dict) else 0,
+        "predicted_index": index,
     }
 
 
-def sanitize_record(rec: Any, _in_libs: bool = False) -> Any:
-    """record 全体の最終関門。パス文字を含む文字列は `<redacted>`、非有限の浮動小数は None にする。
+def summarize_step(name: str, obj: dict[str, Any], option_ids: list[str]) -> dict[str, Any]:
+    """工程の JSON を、工程ごとの許可した欄だけの新しい dict へ組み立てる（REQ-33）。
 
-    例外は `items.D.direct_libraries` の要素で、`/usr/lib/`・`/System/` で始まり安全な文字だけの
-    ものに限る。個別の要約で伏せ漏れがあっても、ここで必ず止まる。
+    元の JSON の他の欄は捨てる。欄は常に出し、欄が無い・型や形が検証に通らなければ None、
+    閉じた語彙の欄で語彙外なら `<unexpected>`。入れ子の dict・list は文字列欄・数値欄へ通さない。
+    """
+    if name == "infer":
+        return summarize_infer(obj, option_ids)
+    out: dict[str, Any] = {
+        "step": _step_value(obj.get("step"), name),
+        "status": vocab_value(obj.get("status"), STATUS_VOCAB),
+    }
+    if name == "register":
+        sha = obj.get("definition_sha256")
+        out["options"] = _int_or_none(obj.get("options"))
+        out["evaluation_defined"] = _bool_or_none(obj.get("evaluation_defined"))
+        out["definition_sha256"] = (
+            sha if isinstance(sha, str) and SHA256_RE.fullmatch(sha) else None
+        )
+    elif name == "inspect":
+        out["valid_records"] = _int_or_none(obj.get("valid_records"))
+        out["split"] = _split_summary(obj.get("split"))
+    elif name in ("train", "select", "evaluate"):
+        out["candidate"] = _int_or_none(obj.get("candidate"))
+        out["kind"] = vocab_value(obj.get("kind"), KIND_VOCAB)
+        if name == "evaluate":
+            out["n_total"] = _int_or_none(obj.get("n_total"))
+            out["correct"] = _int_or_none(obj.get("correct"))
+            out["accuracy"] = _unit_or_none(obj.get("accuracy"))
+            out["macro_f1"] = _unit_or_none(obj.get("macro_f1"))
+    elif name == "package":
+        out["code"] = vocab_value(obj.get("code"), CODE_VOCAB)
+        out["judgment"] = vocab_value(obj.get("judgment"), JUDGMENT_VOCAB)
+        out["acceptance_defined"] = _bool_or_none(obj.get("acceptance_defined"))
+        out["capacity"] = capacity_summary(obj)
+        out["infer_p95"] = p95_summary(obj.get("infer_p95"))
+    return out
+
+
+def sanitize_record(rec: Any, _path: tuple[str, ...] = (), _in_list: bool = False) -> Any:
+    """record 全体の最後の関門（二段構えの 2 段目）。個別の要約で漏れてもここで止まる。
+
+    文字列の値は、`STR_KEYS`（`sha256`・`*_sha256` を含む）に載るキーの下か、`LIST_STR_PATHS`
+    の位置の list の要素のときだけ通す。集合に無い位置の文字列と、`MAX_STR` を超える文字列は
+    `<redacted>`。パス文字を含む文字列も伏せる。非有限の浮動小数は None にする。
+    例外は `items.D.direct_libraries` の位置の要素で、`/usr/lib/`・`/System/` で始まり安全な
+    文字だけの `MAX_LIB_LEN` 字以内のものに限る（キー名だけでは効かせない）。
     """
     if isinstance(rec, dict):
         out = {}
         for k, v in rec.items():
-            key = k if isinstance(k, str) and not _has_path_char(k) else REDACTED
-            out[key] = sanitize_record(v, key == "direct_libraries")
+            ok = isinstance(k, str) and KEY_RE.fullmatch(k) is not None
+            key = k if ok and not _has_path_char(k) else REDACTED
+            out[key] = sanitize_record(v, (*_path, key), False)
         return out
     if isinstance(rec, list):
-        return [sanitize_record(v, _in_libs) for v in rec]
+        return [sanitize_record(v, _path, True) for v in rec]
     if isinstance(rec, float) and not math.isfinite(rec):
         return None
-    if isinstance(rec, str) and _has_path_char(rec):
-        if _in_libs and LIB_RE.match(rec) and ".." not in rec:
+    if not isinstance(rec, str):
+        return rec
+    if _in_list:
+        allowed = _path in LIST_STR_PATHS
+    else:
+        key = _path[-1] if _path else ""
+        allowed = key in STR_KEYS or key == "sha256" or key.endswith("_sha256")
+    if not allowed or len(rec) > MAX_STR:
+        return REDACTED
+    if _in_list and _path == LIBRARIES_PATH:
+        # ライブラリ名はパス文字の有無によらず、形式・`..`・長さのすべてを満たすものだけ残す
+        if LIB_RE.fullmatch(rec) and ".." not in rec and len(rec) <= MAX_LIB_LEN:
             return rec
+        return REDACTED
+    if _has_path_char(rec):
         return REDACTED
     return rec
 
@@ -364,32 +554,31 @@ def parse_json_object(path: Path, cap: int) -> dict[str, Any] | None:
     if text is None:
         return None
     try:
-        v = json.loads(text)
+        v = _loads(text)
     except ValueError:
         return None
     return v if isinstance(v, dict) and v else None
 
 
 def error_fields(obj: dict[str, Any] | None) -> dict[str, Any]:
-    """失敗時に記録する `code`・`message`（伏せ処理後）。"""
+    """失敗時に記録する `code` と、`message` の大きさ・ハッシュ（REQ-21・REQ-33）。
+
+    `code` は文字列で語彙内ならその値、語彙外なら `<unexpected>`、文字列でなければ欄を出さない。
+    `message` は本文を記録せず、文字列のときだけ `message_bytes`（UTF-8 のバイト数）と
+    `message_sha256`（UTF-8 の sha256）を出す。本文は `<work-dir>` の stdout のファイルに残る。
+    """
     if not isinstance(obj, dict):
         return {}
     out: dict[str, Any] = {}
-    if isinstance(obj.get("code"), str):
-        out["code"] = redact_value(obj["code"])
-    if isinstance(obj.get("message"), str):
-        out["message"] = redact_value(obj["message"])
+    code = vocab_value(obj.get("code"), CODE_VOCAB)
+    if code is not None:
+        out["code"] = code
+    msg = obj.get("message")
+    if isinstance(msg, str):
+        raw = msg.encode("utf-8", errors="replace")
+        out["message_bytes"] = len(raw)
+        out["message_sha256"] = hashlib.sha256(raw).hexdigest()
     return out
-
-
-def _is_int(v: Any) -> bool:
-    """bool を除く整数か。"""
-    return isinstance(v, int) and not isinstance(v, bool)
-
-
-def _is_finite_number(v: Any) -> bool:
-    """bool を除く有限の数か。"""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 # --------------------------------------------------------------------------------------
@@ -406,6 +595,8 @@ class Facts:
     eval_records: int
     has_acceptance: bool
     p95_limit_us: int | None
+    # 定義の `limits.max_package_bytes`。無ければ既定値（REQ-30。package の `limit_bytes` の期待値）
+    limit_bytes: int = DEFAULT_CAPACITY_LIMIT_BYTES
 
 
 def _count_lines(path: Path) -> int | None:
@@ -423,7 +614,7 @@ def read_facts(pdir: Path) -> Facts | None:
     if text is None or train is None or evaluation is None:
         return None
     try:
-        d = json.loads(text)
+        d = _loads(text)
     except ValueError:
         return None
     options = d.get("options") if isinstance(d, dict) else None
@@ -434,43 +625,69 @@ def read_facts(pdir: Path) -> Facts | None:
         return None
     limits = d.get("limits")
     p95 = limits.get("max_infer_p95_us") if isinstance(limits, dict) else None
+    max_bytes = limits.get("max_package_bytes") if isinstance(limits, dict) else None
     return Facts(
         option_ids=ids,
         train_records=train,
         eval_records=evaluation,
         has_acceptance="acceptance" in d,
         p95_limit_us=p95 if _is_int(p95) else None,
+        limit_bytes=max_bytes if _is_int(max_bytes) else DEFAULT_CAPACITY_LIMIT_BYTES,
     )
+
+
+def _eq_int(v: Any, expected: int) -> bool:
+    """bool を除く整数で、期待値と等しいか（`False == 0`・`0.0 == 0` を通さない）。"""
+    return _is_int(v) and v == expected
 
 
 def check_infer_output(obj: dict[str, Any], facts: Facts) -> bool:
     """infer の判定が定義と整合するか（REQ-21・REQ-33）。
 
-    `predicted_label` が選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で、
-    合計が 1 から `SCORE_SUM_TOLERANCE` 以内（実 CLI の runtime が保証する範囲）。
+    `predicted_label` が選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で
+    0 以上 1 以下、合計（宣言順の逐次和で実 CLI と同じ）が 1 から `SCORE_SUM_TOLERANCE` 以内、
+    `predicted_label` が最大スコアの選択肢（同点は定義の宣言順の先頭。
+    crates/core/src/judgment.rs の規則。比較は許容差なし）。
+    実 CLI の判定型（`JudgmentResult`）が検証する範囲のうち、定義と入力から照合できる分を見る。
     """
     scores = obj.get("scores")
-    if not isinstance(scores, dict) or obj.get("predicted_label") not in facts.option_ids:
+    label = obj.get("predicted_label")
+    if not isinstance(scores, dict) or not isinstance(label, str):
+        return False
+    if label not in facts.option_ids:
         return False
     if set(scores) != set(facts.option_ids) or len(scores) != len(facts.option_ids):
         return False
-    if not all(_is_finite_number(v) for v in scores.values()):
+    if not all(_unit_number(v) for v in scores.values()):
         return False
-    return abs(sum(float(v) for v in scores.values()) - 1.0) <= SCORE_SUM_TOLERANCE
+    total = 0.0
+    for oid in facts.option_ids:
+        total += float(scores[oid])
+    if abs(total - 1.0) > SCORE_SUM_TOLERANCE:
+        return False
+    best = facts.option_ids[0]
+    for oid in facts.option_ids:
+        if scores[oid] > scores[best]:
+            best = oid
+    return label == best
 
 
-def _nonneg_int(v: Any) -> bool:
-    """bool を除く 0 以上の整数か。"""
-    return _is_int(v) and v >= 0
-
-
-def check_stage_report(name: str, obj: dict[str, Any], facts: Facts, selected: int | None) -> bool:
+def check_stage_report(
+    name: str,
+    obj: dict[str, Any],
+    facts: Facts,
+    selected: int | None,
+    kind_before: str | None = None,
+) -> bool:
     """exit 0 の工程 JSON が、指定値・入力から分かる値と整合するか（REQ-21・REQ-33）。
 
-    欄名・形は crates/core/src/stage_report.rs に合わせる。CLI の計算は再実装しない。
+    欄名・形は crates/core/src/stage_report.rs に合わせる。CLI の計算は再実装しないが、
+    `accuracy` は `correct / n_total` との一致だけ照合する。`==` で比べる報告値は真偽値を除く
+    整数であることを確かめる。`kind_before` は直前の `kind` を出す工程（`select` なら `train`、
+    `evaluate` なら `select`）の `kind` で、`select`・`evaluate` はこれと同じでなければならない。
     """
     if name == "register":
-        return obj.get("options") == len(facts.option_ids) and (
+        return _eq_int(obj.get("options"), len(facts.option_ids)) and (
             obj.get("evaluation_defined") is (facts.eval_records > 0)
         )
     if name == "inspect":
@@ -480,37 +697,85 @@ def check_stage_report(name: str, obj: dict[str, Any], facts: Facts, selected: i
             return False
         parts = [split.get(k) for k in ("train", "validation", "test")]
         return all(_nonneg_int(x) for x in parts) and sum(parts) == vr
+    if name in ("train", "select", "evaluate"):
+        kind = obj.get("kind")
+        if not isinstance(kind, str) or kind not in KIND_VOCAB:
+            return False
+        if name != "train" and kind != kind_before:
+            return False
     if name in ("train", "select"):
-        return obj.get("candidate") == TRAIN_CANDIDATE and isinstance(obj.get("kind"), str)
+        return _eq_int(obj.get("candidate"), TRAIN_CANDIDATE)
     if name == "evaluate":
         n_total, correct = obj.get("n_total"), obj.get("correct")
-        return (
-            selected is not None
-            and obj.get("candidate") == selected
-            and n_total == facts.eval_records
-            and _nonneg_int(correct)
-            and correct <= n_total
-        )
+        if (
+            selected is None
+            or not _eq_int(obj.get("candidate"), selected)
+            or not _eq_int(n_total, facts.eval_records)
+            or n_total <= 0
+            or not _nonneg_int(correct)
+            or correct > n_total
+        ):
+            return False
+        accuracy = obj.get("accuracy")
+        if not _is_finite_number(accuracy) or abs(accuracy - correct / n_total) > SCORE_TOLERANCE:
+            return False
+        # macro_f1 は分母 0 の指標で null になりうる（REQ-24）。欄自体は実 CLI が必ず出す
+        return "macro_f1" in obj and (obj["macro_f1"] is None or _unit_number(obj["macro_f1"]))
     if name == "package":
+        # 実 CLI は judgment・infer_p95 を値が null のときも必ず出す（欠落は偽の報告）
+        if "judgment" not in obj or "infer_p95" not in obj:
+            return False
         # 合否基準の無い定義では judgment:null・acceptance_defined:false
         if not facts.has_acceptance:
-            return obj.get("judgment") is None and obj.get("acceptance_defined") is False
-        return obj.get("acceptance_defined") is True
+            return obj["judgment"] is None and obj.get("acceptance_defined") is False
+        return obj.get("acceptance_defined") is True and obj["judgment"] == "pass"
     return True
 
 
-def check_package_metrics(obj: dict[str, Any], rc: int, facts: Facts) -> bool:
+def capacity_sum_matches(cap: dict[str, Any]) -> bool:
+    """`capacity_summary` の 5 項目の `bytes` の合計が `total_bytes` と一致するか（REQ-30）。"""
+    return sum(c["bytes"] for c in cap["components"].values()) == cap["total_bytes"]
+
+
+def check_package_metrics(
+    obj: dict[str, Any], rc: int, facts: Facts, check_sum: bool = True
+) -> bool:
     """package（exit 0・20）の `capacity`・`infer_p95` の整合（REQ-30・REQ-31）。
 
-    capacity は要約でき、`exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過なし。
-    `infer_p95` は定義に `max_infer_p95_us` があるときだけ非 null。
+    capacity は要約でき、`limit_bytes` が定義から導く期待値（`facts.limit_bytes`）と一致し、
+    `exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過なし。`check_sum` なら 5 項目の合計が
+    `total_bytes` と一致すること（B は項目側で `capacity_sum_mismatch` として判定するため外す）。
+    `infer_p95` は定義に `max_infer_p95_us` があるときだけ非 null で、`limit_us` が定義の値と
+    一致し、`exceeded == (p95_us > limit_us)`、exit 0 なら超過なし。exit 20 は `code` が
+    `limit_exceeded` で、容量か p95 のどちらかが超過していること。
     """
     cap = capacity_summary(obj)
     if cap is None or cap["exceeded"] != (cap["total_bytes"] > cap["limit_bytes"]):
         return False
-    if rc == 0 and cap["exceeded"]:
+    if cap["limit_bytes"] != facts.limit_bytes or (check_sum and not capacity_sum_matches(cap)):
         return False
-    return (obj.get("infer_p95") is None) == (facts.p95_limit_us is None)
+    if "infer_p95" not in obj:
+        return False
+    raw = obj["infer_p95"]
+    p95 = p95_summary(raw)
+    if facts.p95_limit_us is None:
+        if raw is not None:
+            return False
+    elif (
+        p95 is None
+        or p95["limit_us"] != facts.p95_limit_us
+        or p95["exceeded"] != (p95["p95_us"] > p95["limit_us"])
+    ):
+        return False
+    any_exceeded = cap["exceeded"] or (p95 is not None and p95["exceeded"])
+    if rc == 0:
+        return not any_exceeded
+    return obj.get("code") == "limit_exceeded" and any_exceeded
+
+
+def _infer_envelope_ok(obj: dict[str, Any]) -> bool:
+    """infer の出力が `status:"ok"`・`step` 欄なし・文字列の `id` か（B の単発・E で共通）。"""
+    return obj.get("status") == "ok" and "step" not in obj and isinstance(obj.get("id"), str)
 
 
 def _step_check(
@@ -520,23 +785,21 @@ def _step_check(
     rc: int,
     facts: Facts,
     selected: int | None,
+    kind_before: str | None = None,
+    check_sum: bool = True,
 ) -> bool:
     """工程の stdout JSON が契約と整合するか（exit 0 は報告値まで照合、非 0 は許容と step）。"""
     if name == "infer":
-        return (
-            rc == 0
-            and obj.get("status") == "ok"
-            and "step" not in obj
-            and isinstance(obj.get("id"), str)
-            and check_infer_output(obj, facts)
-        )
+        return rc == 0 and _infer_envelope_ok(obj) and check_infer_output(obj, facts)
     if obj.get("step") != name:
         return False
     if rc != 0:
-        return rc in allowed and (name != "package" or check_package_metrics(obj, rc, facts))
-    if obj.get("status") != "ok" or not check_stage_report(name, obj, facts, selected):
+        return rc in allowed and (
+            name != "package" or check_package_metrics(obj, rc, facts, check_sum)
+        )
+    if obj.get("status") != "ok" or not check_stage_report(name, obj, facts, selected, kind_before):
         return False
-    return name != "package" or check_package_metrics(obj, rc, facts)
+    return name != "package" or check_package_metrics(obj, rc, facts, check_sum)
 
 
 def run_pipeline(
@@ -544,12 +807,14 @@ def run_pipeline(
     pdir: Path,
     sample_text: str | None,
     package_allowed: set[int],
+    check_sum: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
     """`pdir` で register〜package（と、あれば infer）を実行する。
 
     `pdir` に definition.json・train.jsonl・evaluation.jsonl が置かれている前提で、そこをカレントに
     する（経路の閉じ込め。REQ-39）。戻り値は (工程記録, package の JSON, 失敗記録)。
-    失敗記録が None でなければ以降の工程は実行していない。
+    失敗記録が None でなければ以降の工程は実行していない。`kind` は train → select → evaluate の
+    一貫性を照合する。`check_sum` は package の容量内訳の合計の照合を工程側で行うか（B は項目側）。
     """
     facts = read_facts(pdir)
     if facts is None:
@@ -559,6 +824,7 @@ def run_pipeline(
     steps: list[dict[str, Any]] = []
     package_obj: dict[str, Any] | None = None
     selected: int | None = None
+    kind_before: str | None = None
 
     def go(
         name: str, argv: list[str], command: str, allowed: set[int]
@@ -588,12 +854,12 @@ def run_pipeline(
             steps.append(entry)
             return None, fail_item("invalid_json", step=name, exit_code=r.exit_code)
         rc = r.exit_code if r.exit_code is not None else EXIT_RUNTIME_ERROR
-        entry["summary"] = summarize_infer(obj) if name == "infer" else redact_value(obj)
+        entry["summary"] = summarize_step(name, obj, facts.option_ids)
         steps.append(entry)
         if rc != 0 and rc not in allowed:
             err = error_fields(obj)
             return None, fail_item("unexpected_exit_code", step=name, exit_code=rc, **err)
-        if not _step_check(name, obj, allowed, rc, facts, selected):
+        if not _step_check(name, obj, allowed, rc, facts, selected, kind_before, check_sum):
             return None, fail_item(
                 "unexpected_output", step=name, exit_code=rc, **error_fields(obj)
             )
@@ -622,11 +888,14 @@ def run_pipeline(
     )
     if failure:
         return steps, package_obj, failure
+    # 直前の `kind`（検証済み）。select は train と、evaluate は select と同じでなければならない
+    kind_before = obj.get("kind") if isinstance(obj, dict) else None
     obj, failure = go(
         "select", ["select", "--project-dir", "project"], "select --project-dir project", set()
     )
     if failure:
         return steps, package_obj, failure
+    kind_before = obj.get("kind") if isinstance(obj, dict) else None
     c = obj.get("candidate") if isinstance(obj, dict) else None
     if not _is_int(c) or c < 0:
         return steps, package_obj, fail_item("missing_field", step="select", exit_code=0)
@@ -788,16 +1057,20 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
     bdir = ctx.work / "B"
     if not stage_inputs(ctx, bdir, None):
         return fail_item("input_unreadable"), False
-    steps, pkg, failure = run_pipeline(ctx, bdir, "sandbox check 0123456789", {0})
+    # 内訳の合計の照合は項目側で行い、不一致を `capacity_sum_mismatch` として記録する
+    steps, pkg, failure = run_pipeline(ctx, bdir, "sandbox check 0123456789", {0}, check_sum=False)
     if failure:
         return dict(failure, steps=steps), False
     cap = capacity_summary(pkg)
     if cap is None:
         return fail_item("missing_field", step="package", steps=steps), False
-    matches = sum(c["bytes"] for c in cap["components"].values()) == cap["total_bytes"]
+    matches = capacity_sum_matches(cap)
     files = package_files(bdir / "project" / "package")
     if files is None:
         return fail_item("package_unreadable", steps=steps), False
+    # 公開された package/ の実ファイルの合計が、CLI の報告した total_bytes と一致すること（REQ-30）
+    if matches and sum(f["bytes"] for f in files) != cap["total_bytes"]:
+        return fail_item("unexpected_output", step="package", steps=steps), False
     rec = {
         "status": "ok" if matches else "failed",
         "steps": steps,
@@ -810,8 +1083,25 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
     return rec, matches
 
 
+def package_dir_bytes(pdir: Path) -> int | None:
+    """`package/` 直下の通常ファイル（symlink を除く）のバイト数の合計。読めなければ None。"""
+    try:
+        entries = list(os.scandir(pdir))
+        return sum(
+            e.stat(follow_symlinks=False).st_size
+            for e in entries
+            if e.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return None
+
+
 def package_files(pdir: Path) -> list[dict[str, Any]] | None:
-    """`package/` 直下の通常ファイルの名前・バイト数・sha256。読めなければ None。"""
+    """`package/` 直下の通常ファイルの名前・バイト数・sha256。読めなければ None。
+
+    名前が `PACKAGE_FILE_NAME_RE` に一致しなければ `<unrecognized>` を記録する（利用者が決める
+    文字列を記録へ出さない）。
+    """
     out: list[dict[str, Any]] = []
     try:
         entries = sorted(os.scandir(pdir), key=lambda e: e.name)
@@ -823,7 +1113,8 @@ def package_files(pdir: Path) -> list[dict[str, Any]] | None:
         digest = sha256_file(Path(e.path), CAP_PACKAGE_FILE)
         if digest is None:
             return None
-        out.append({"name": e.name, "bytes": e.stat().st_size, "sha256": digest})
+        name = e.name if PACKAGE_FILE_NAME_RE.fullmatch(e.name) else UNRECOGNIZED
+        out.append({"name": name, "bytes": e.stat().st_size, "sha256": digest})
     return out or None
 
 
@@ -839,6 +1130,8 @@ def judge_p95(rc: int, pkg: Any, p95: Any, cap: dict[str, Any] | None, limit_us:
 
     CLI の規則は `p95_us > limit_us` で超過（crates/cli/src/stages/package.rs）。exit 20 は p95 超過
     のときだけで、容量超過など p95 以外の理由の exit 20 は ok にしない。
+    `p95_us`・`limit_us` は 0 以上の整数・`exceeded` は真偽値でなければならず、型違い・欠落は
+    `missing_field`、負数は `unexpected_output`。
     C-1 の capacity が欠落・要約不能・超過のいずれでも `unexpected_output`。
     exit 20 は `code == "limit_exceeded"`、exit 0 は `status == "ok"` の JSON のときだけ合格。
     """
@@ -849,6 +1142,8 @@ def judge_p95(rc: int, pkg: Any, p95: Any, cap: dict[str, Any] | None, limit_us:
         or not isinstance(p95.get("exceeded"), bool)
     ):
         return "missing_field"
+    if p95["p95_us"] < 0 or p95["limit_us"] < 0:
+        return "unexpected_output"
     exceeded = p95["exceeded"]
     if exceeded != (p95["p95_us"] > p95["limit_us"]) or exceeded != (rc == 20):
         return "unexpected_output"
@@ -871,7 +1166,9 @@ def judge_capacity_limit(
     CLI の規則は `total_bytes > limit_bytes` で超過（上限ちょうどは超過でない。
     crates/runtime/src/package_outcome.rs）。報告された上限が指定値と一致しない場合は
     上限が CLI に伝わっていないので `unexpected_output`、それ以外の不成立は
-    `capacity_limit_not_enforced`。
+    `capacity_limit_not_enforced`。`code` や超過の不整合は、先に工程の検査
+    （`check_package_metrics`）が `unexpected_output` で止めるため、この関数へ届くのは
+    「exit 0 で報告値に矛盾が無い」か「exit 20 なのに `package/` が公開されている」場合だけ。
     """
     if cap is None or not _is_int(cap["limit_bytes"]) or cap["limit_bytes"] != limit_bytes:
         return "unexpected_output"
@@ -901,6 +1198,11 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
     published1 = (c1 / "project" / "package").exists()
     if reason1 is None and published1 != (rc1 == 0):
         reason1 = "unexpected_output"
+    if reason1 is None and rc1 == 0:
+        # 公開された package/ の実ファイルの合計が total_bytes と一致すること（記録へは足さない）
+        actual, cap1 = package_dir_bytes(c1 / "project" / "package"), capacity_summary(pkg1)
+        if actual is None or cap1 is None or actual != cap1["total_bytes"]:
+            reason1 = "unexpected_output"
     if reason1 is not None:
         return fail_item(reason1, case="C-1", step="package", exit_code=rc1)
     p95_rec = {
@@ -925,7 +1227,7 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
     code2 = pkg2.get("code") if isinstance(pkg2, dict) else None
     limit_rec = {
         "package_exit_code": rc2,
-        "code": redact_value(code2),
+        "code": vocab_value(code2, CODE_VOCAB),
         "capacity_exceeded": cap2["exceeded"] if cap2 else None,
         "total_bytes": cap2["total_bytes"] if cap2 else None,
         "limit_bytes": cap2["limit_bytes"] if cap2 else None,
@@ -956,7 +1258,7 @@ def parse_otool_libraries(text: str) -> list[str]:
 
 
 def parse_linkage_tool(text: str) -> str | None:
-    """check-runtime-linkage.sh の最終行 `OK: tool=<otool|ldd> ...` の tool。無ければ None。"""
+    """stdout を後ろから見て最初に一致した `OK: tool=<otool|ldd> ...` 行の tool。無ければ None。"""
     for line in reversed(text.splitlines()):
         m = re.match(r"^OK: tool=(\S+)", line)
         if m:
@@ -1028,7 +1330,8 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         return dict(rec, status="failed", reason="skipped")
     if rec["env_i_tests_ok"] < 1:
         return dict(rec, status="failed", reason="no_test_results")
-    # 成功の印を厳密に: テスト数が定数と一致し、最終の `OK: tool=...` 行があること。
+    # 成功の印を厳密に: テスト数が定数と一致し、stdout を後ろから見て最初に一致した
+    # `OK: tool=...` の行があること。
     # macOS では動的リンクの確認が otool で行われたこと（ldd 等の補助では実機の確認にならない）
     if rec["env_i_tests_ok"] != LINKAGE_ENV_I_TESTS or rec["linkage_tool"] is None:
         return dict(rec, status="failed", reason="unexpected_output")
@@ -1076,7 +1379,7 @@ def read_train_inputs(path: Path) -> list[tuple[str, str]] | None:
         if not line.strip():
             continue
         try:
-            v = json.loads(line)
+            v = _loads(line)
         except ValueError:
             return None
         if not isinstance(v, dict) or not isinstance(v.get("id"), str):
@@ -1180,10 +1483,10 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
         return fail_item("unexpected_output", step="infer-batch", exit_code=0)
     for line in lines:
         try:
-            v = json.loads(line)
+            v = _loads(line)
         except ValueError:
             return fail_item("invalid_json", step="infer-batch", exit_code=0)
-        if not isinstance(v, dict) or v.get("status") != "ok" or not isinstance(v.get("id"), str):
+        if not isinstance(v, dict) or not _infer_envelope_ok(v):
             return fail_item("unexpected_output", step="infer-batch", exit_code=0)
         # id の重複は後勝ちで潰さない
         if v["id"] in batch or not check_infer_output(v, facts):
@@ -1209,7 +1512,7 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
         obj = parse_json_object(edir / "single.stdout", CAP_CLI_STDOUT)
         if (
             obj is None
-            or obj.get("status") != "ok"
+            or not _infer_envelope_ok(obj)
             or obj.get("id") != rid
             or not check_infer_output(obj, facts)
         ):
@@ -1357,6 +1660,16 @@ def _worktree_clean(work: Path, repo: Path) -> bool | None:
     return None
 
 
+def env_text(s: str | None) -> str | None:
+    """環境の文字列欄。`ENV_TEXT_RE`（64 字以内の安全な文字）に一致しなければ None。"""
+    return s if s is not None and ENV_TEXT_RE.fullmatch(s) else None
+
+
+def ascii_int(s: str | None) -> int | None:
+    """ASCII の 10 進数字 1〜20 桁だけの文字列を整数へ。違えば None（`isdigit` は使わない）。"""
+    return int(s) if s is not None and ASCII_INT_RE.fullmatch(s) else None
+
+
 def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
     """環境の採取。macOS 以外・コマンド不在で取れない欄は null。"""
     w, rp = ctx.work, ctx.repo
@@ -1370,10 +1683,6 @@ def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
         """macOS の sw_vers 値（macOS 以外は None）。"""
         return _probe(w, rp, ["sw_vers", flag], name) if on_mac else None
 
-    def as_int(s: str | None) -> int | None:
-        """10 進数字だけの文字列を整数へ。違えば None。"""
-        return int(s) if s is not None and s.isdigit() else None
-
     commit = _probe(w, rp, ["git", "rev-parse", "HEAD"], "commit")
     if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
         commit = None
@@ -1382,13 +1691,13 @@ def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
     except OSError:
         cli_bytes = None
     return {
-        "hw_model": sysctl("hw.model", "hw"),
-        "cpu": sysctl("machdep.cpu.brand_string", "cpu"),
-        "ncpu": as_int(sysctl("hw.ncpu", "ncpu")),
-        "memory_bytes": as_int(sysctl("hw.memsize", "mem")),
-        "os_name": sw_vers("-productName", "osn"),
-        "os_version": sw_vers("-productVersion", "osv"),
-        "os_build": sw_vers("-buildVersion", "osb"),
+        "hw_model": env_text(sysctl("hw.model", "hw")),
+        "cpu": env_text(sysctl("machdep.cpu.brand_string", "cpu")),
+        "ncpu": ascii_int(sysctl("hw.ncpu", "ncpu")),
+        "memory_bytes": ascii_int(sysctl("hw.memsize", "mem")),
+        "os_name": env_text(sw_vers("-productName", "osn")),
+        "os_version": env_text(sw_vers("-productVersion", "osv")),
+        "os_build": env_text(sw_vers("-buildVersion", "osb")),
         "commit": commit,
         "worktree_clean": _worktree_clean(w, rp),
         "started_local": None,
@@ -1480,7 +1789,16 @@ def render_markdown(rec: dict[str, Any]) -> str:
         detail = {
             k: v
             for k, v in it.items()
-            if k not in ("status", "steps", "package_files", "capacity", "p95", "capacity_limit")
+            if k
+            not in (
+                "status",
+                "steps",
+                "package_files",
+                "capacity",
+                "p95",
+                "capacity_limit",
+                "message_sha256",
+            )
         }
         if name == "B" and "capacity" in it:
             detail["total_bytes"] = it["capacity"]["total_bytes"]
@@ -1573,7 +1891,7 @@ def find_built_executable(text: str) -> Path | None:
     exe = None
     for line in text.splitlines():
         try:
-            v = json.loads(line)
+            v = _loads(line)
         except ValueError:
             continue
         if not isinstance(v, dict) or v.get("reason") != "compiler-artifact":
