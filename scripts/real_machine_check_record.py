@@ -46,6 +46,12 @@ from typing import Any
 
 SCHEMA = "real-machine-check/1"
 ITEM_ORDER = ["A", "B", "C", "D", "E", "F"]
+# 公開前の組み立て先ディレクトリ名。`package` の実行後（exit 0・20 のどちらも）に残ってはならない
+# （crates/cli/src/project.rs の `PACKAGE_STAGING_DIR` と一致。pytest が機械照合する。REQ-30）
+PACKAGE_STAGING_DIR = "package.staging"
+# `infer --text` で `--id` を省略したときの既定 id（crates/cli/src/stages/infer.rs の
+# `DEFAULT_TEXT_ID` と一致。pytest が機械照合する。REQ-33）
+DEFAULT_TEXT_ID = "input"
 
 # 終了コード 7 種（REQ-21）のうち本スクリプトが使うもの
 EXIT_OK = 0
@@ -982,7 +988,13 @@ def _step_check(
 ) -> bool:
     """工程の stdout JSON が契約と整合するか（exit 0 は報告値まで照合、非 0 は許容と step）。"""
     if name == "infer":
-        return rc == 0 and _infer_envelope_ok(obj) and check_infer_output(obj, facts)
+        # B の単発 infer は `--id` を付けないので、id は既定値（`DEFAULT_TEXT_ID`）でなければ不合格
+        return (
+            rc == 0
+            and _infer_envelope_ok(obj)
+            and obj.get("id") == DEFAULT_TEXT_ID
+            and check_infer_output(obj, facts)
+        )
     if obj.get("step") != name:
         return False
     if rc != 0:
@@ -1266,11 +1278,22 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
     if cap is None:
         return fail_item("missing_field", step="package", steps=steps), False
     matches = capacity_sum_matches(cap)
-    files = package_files(bdir / "project" / "package")
+    pdir = bdir / "project" / "package"
+    regular = package_entries_regular(pdir)
+    if regular is None:
+        return fail_item("package_unreadable", steps=steps), False
+    # 通常ファイル以外（symlink・ディレクトリ・FIFO 等）は計測対象外のまま見逃さず失敗にする
+    if not regular:
+        return fail_item("package_entry_not_regular", steps=steps), False
+    files = package_files(pdir)
     if files is None:
         return fail_item("package_unreadable", steps=steps), False
-    # 公開された package/ の実ファイルの合計が、CLI の報告した total_bytes と一致すること（REQ-30）
-    if matches and sum(f["bytes"] for f in files) != cap["total_bytes"]:
+    # 公開された package/ の実ファイルの合計・件数が、CLI の報告した total_bytes と
+    # `file_count` の合計に一致すること（REQ-30。計測対象は公開される集合そのもの）
+    if matches and (
+        sum(f["bytes"] for f in files) != cap["total_bytes"]
+        or len(files) != capacity_file_count(cap)
+    ):
         return fail_item("unexpected_output", step="package", steps=steps), False
     rec = {
         "status": "ok" if matches else "failed",
@@ -1284,21 +1307,37 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
     return rec, matches
 
 
-def package_dir_bytes(pdir: Path) -> int | None:
-    """`package/` 直下の通常ファイル（symlink を除く）のバイト数の合計。読めなければ None。"""
+def capacity_file_count(cap: dict[str, Any]) -> int:
+    """`capacity_summary` の 5 項目の `file_count` の合計（REQ-30）。"""
+    return sum(c["file_count"] for c in cap["components"].values())
+
+
+def package_entries_regular(pdir: Path) -> bool | None:
+    """`package/` 直下がすべて通常ファイルか。読めなければ None、通常ファイル以外があれば False。"""
     try:
-        entries = list(os.scandir(pdir))
-        return sum(
-            e.stat(follow_symlinks=False).st_size
-            for e in entries
-            if e.is_file(follow_symlinks=False)
-        )
+        return all(e.is_file(follow_symlinks=False) for e in os.scandir(pdir))
     except OSError:
         return None
 
 
+def package_dir_stats(pdir: Path) -> tuple[int, int] | None:
+    """`package/` 直下の (通常ファイル数, バイト数の合計)。読めない・通常以外があれば None。"""
+    try:
+        entries = list(os.scandir(pdir))
+        if not all(e.is_file(follow_symlinks=False) for e in entries):
+            return None
+        return len(entries), sum(e.stat(follow_symlinks=False).st_size for e in entries)
+    except OSError:
+        return None
+
+
+def staging_present(project_dir: Path) -> bool:
+    """`package.staging` が残っているか（symlink でも真。辿らない）。"""
+    return os.path.lexists(project_dir / PACKAGE_STAGING_DIR)
+
+
 def package_files(pdir: Path) -> list[dict[str, Any]] | None:
-    """`package/` 直下の通常ファイルの名前・バイト数・sha256。読めなければ None。
+    """`package/` 直下の通常ファイルの名前・バイト数・sha256。読めない・通常以外があれば None。
 
     名前が `PACKAGE_FILE_NAME_RE` に一致しなければ `<unrecognized>` を記録する（利用者が決める
     文字列を記録へ出さない）。
@@ -1310,7 +1349,7 @@ def package_files(pdir: Path) -> list[dict[str, Any]] | None:
         return None
     for e in entries:
         if not e.is_file(follow_symlinks=False):
-            continue
+            return None  # 通常ファイル以外は黙って飛ばさない
         digest = sha256_file(Path(e.path), CAP_PACKAGE_FILE)
         if digest is None:
             return None
@@ -1400,10 +1439,19 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
     if reason1 is None and published1 != (rc1 == 0):
         reason1 = "unexpected_output"
     if reason1 is None and rc1 == 0:
-        # 公開された package/ の実ファイルの合計が total_bytes と一致すること（記録へは足さない）
-        actual, cap1 = package_dir_bytes(c1 / "project" / "package"), capacity_summary(pkg1)
-        if actual is None or cap1 is None or actual != cap1["total_bytes"]:
+        # 公開された package/ が通常ファイルだけで、実ファイルの合計・件数が total_bytes と
+        # `file_count` の合計に一致すること（記録へは足さない）
+        stats, cap1 = package_dir_stats(c1 / "project" / "package"), capacity_summary(pkg1)
+        if (
+            stats is None
+            or cap1 is None
+            or stats != (capacity_file_count(cap1), cap1["total_bytes"])
+        ):
             reason1 = "unexpected_output"
+    # exit 0・20 のどちらでも、組み立て先は残らない（crates/cli/src/stages/package.rs）
+    staging1 = staging_present(c1 / "project")
+    if reason1 is None and staging1:
+        reason1 = "staging_left"
     if reason1 is not None:
         return fail_item(reason1, case="C-1", step="package", exit_code=rc1)
     p95_rec = {
@@ -1414,6 +1462,7 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
         "classification": classify_p95(ctx),
         "package_exit_code": rc1,
         "package_published": published1,
+        "package_staging_present": staging1,
     }
     c2 = ctx.work / "C2"
     if not stage_inputs(ctx, c2, {"max_package_bytes": ctx.package_limit_bytes}):
@@ -1424,6 +1473,7 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
     rc2 = next(s["exit_code"] for s in steps2 if s["step"] == "package")
     cap2 = capacity_summary(pkg2)
     published = (c2 / "project" / "package").exists()
+    staging2 = staging_present(c2 / "project")
     p95_2 = pkg2.get("infer_p95") if isinstance(pkg2, dict) else None
     code2 = pkg2.get("code") if isinstance(pkg2, dict) else None
     limit_rec = {
@@ -1436,8 +1486,11 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
             p95_2.get("exceeded") if isinstance(p95_2, dict) and "exceeded" in p95_2 else None
         ),
         "package_published": published,
+        "package_staging_present": staging2,
     }
     reason2 = judge_capacity_limit(rc2, code2, cap2, ctx.package_limit_bytes, published)
+    if reason2 is None and staging2:
+        reason2 = "staging_left"
     rec = {
         "status": "ok" if reason2 is None else "failed",
         "p95": p95_rec,
@@ -1691,12 +1744,15 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
     lines = split_lines(text)
     if len(lines) != len(recs):
         return fail_item("unexpected_output", step="infer-batch", exit_code=0)
-    for line in lines:
+    for (expected_id, _), line in zip(recs, lines):  # noqa: B905  Python 3.9 互換のため strict なし
         try:
             v = _loads(line)
         except ValueError:
             return fail_item("invalid_json", step="infer-batch", exit_code=0)
         if not isinstance(v, dict) or not _infer_envelope_ok(v):
+            return fail_item("unexpected_output", step="infer-batch", exit_code=0)
+        # 出力は入力順（crates/cli/src/infer_batch.rs）。dict へ入れる前に行ごとに順序を確かめる
+        if v["id"] != expected_id:
             return fail_item("unexpected_output", step="infer-batch", exit_code=0)
         # id の重複は後勝ちで潰さない
         if v["id"] in batch or not check_infer_output(v, facts):
@@ -1759,9 +1815,23 @@ def count_read_output(text: str) -> tuple[int, int]:
     return incomplete, plain
 
 
-def ran_tests(text: str) -> bool:
-    """ログに `test result: ok. N passed`（N は 1 以上）の行があるか（0 件実行は pass でない）。"""
-    return any(int(n) >= 1 for n in re.findall(r"test result: ok\. (\d+) passed", text))
+TEST_RESULT_OK_RE = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+LIST_TEST_LINE_RE = re.compile(r"^\S.*: test$")
+
+
+def test_result_totals(text: str) -> tuple[int, int, int]:
+    """ログの `test result: ok.` 行の (passed, failed, ignored) の合計。該当行が無ければ全部 0。"""
+    rows = [tuple(int(n) for n in m) for m in TEST_RESULT_OK_RE.findall(text)]
+    return (
+        sum(r[0] for r in rows),
+        sum(r[1] for r in rows),
+        sum(r[2] for r in rows),
+    )
+
+
+def count_listed_tests(text: str) -> int:
+    """`cargo test -- --list` の出力のテスト数（`<name>: test` の行。末尾の集計行は数えない）。"""
+    return sum(1 for line in split_lines(text) if LIST_TEST_LINE_RE.match(line))
 
 
 def item_f(ctx: Ctx) -> dict[str, Any]:
@@ -1784,8 +1854,26 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
     )
     if b.reason is not None or b.exit_code != 0:
         return fail_item("build_failed", exit_code=b.exit_code)
+    # 1 回あたりに実行されるべき件数を `--list` から得る（固定値と比べず、テストの増減に追随する）。
+    # 回数には数えず、ビルド済みなので短い上限で足りる
+    lst = run_cmd(
+        [ctx.cargo_cmd, *test_args, "--", "--list"],
+        ctx.repo,
+        fdir / "list.log",
+        fdir / "list.err",
+        TIMEOUT_CARGO_TEST,
+        CAP_LOG_STDOUT,
+        CAP_LOG_STDERR,
+        ctx.offline_env,
+    )
+    if lst.reason is not None or lst.exit_code != 0:
+        return fail_item("list_failed", exit_code=lst.exit_code)
+    expected = count_listed_tests(read_capped(fdir / "list.log", CAP_LOG_STDOUT) or "")
+    if expected < 1:
+        return fail_item("no_tests_listed")
     load_start = load_average()
-    passed = failed = timeouts = no_tests = incomplete = plain = 0
+    passed = failed = timeouts = no_tests = count_mismatch = 0
+    output_limit = killed = spawn_error = incomplete = plain = 0
     for i in range(1, ctx.repeat + 1):
         log = fdir / f"run-{i:04d}.log"
         r = run_cmd(
@@ -1800,23 +1888,45 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
         )
         if r.reason == "timeout":
             timeouts += 1
+        elif r.reason == "output_limit":
+            output_limit += 1
+        elif r.reason == "killed":
+            killed += 1
+        elif r.reason == "spawn_error":
+            spawn_error += 1
         text = read_capped(log, CAP_LOG_STDOUT) or ""
-        if r.exit_code == 0 and r.reason is None and ran_tests(text):
+        ran, ran_failed, ran_ignored = test_result_totals(text)
+        # 合格は「exit 0・失敗なし・passed が `--list` の件数と一致・ignored 0」
+        if (
+            r.exit_code == 0
+            and r.reason is None
+            and ran == expected
+            and ran_failed == 0
+            and ran_ignored == 0
+        ):
             passed += 1
             continue
         failed += 1
         if r.exit_code == 0 and r.reason is None:
-            no_tests += 1
+            if ran == 0 and ran_failed == 0:
+                no_tests += 1
+            else:
+                count_mismatch += 1
         a, p = count_read_output(text)
         incomplete += a
         plain += p
     rec = {
         "status": "ok" if failed == 0 else "failed",
         "runs": ctx.repeat,
+        "expected_tests": expected,
         "passed": passed,
         "failed": failed,
         "timeouts": timeouts,
         "no_tests": no_tests,
+        "count_mismatch": count_mismatch,
+        "output_limit": output_limit,
+        "killed": killed,
+        "spawn_error": spawn_error,
         "read_output": plain,
         "read_output_incomplete": incomplete,
         "load_start": load_start,
@@ -2322,8 +2432,6 @@ def run(args: argparse.Namespace) -> int:
         elif interrupted or stopped:
             reason = "interrupted" if interrupted else "previous_item_failed"
             rec["items"][name] = {"status": "not_run", "reason": reason}
-        elif name == "E" and not b_ok:
-            rec["items"][name] = {"status": "not_run", "reason": "requires_B"}
         else:
             sys.stderr.write(f"running item {name}\n")
             sys.stderr.flush()
@@ -2390,6 +2498,9 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--items must be a comma-separated subset of A,B,C,D,E,F"
     if "A" in parts and not args.with_ci:
         return "item A requires --with-ci"
+    # E は B の成果物（package/ と train.jsonl）を使う。B が無ければ起動前に拒否する
+    if "E" in parts and "B" not in parts:
+        return "item E requires item B"
     if not 1 <= args.repeat <= MAX_REPEAT:
         return "--repeat must be an integer from 1 to 1000"
     if not 1 <= args.p95_limit_us <= MAX_P95_LIMIT_US:
@@ -2398,6 +2509,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--package-limit-bytes must be a positive integer"
     if args.bin_override and not args.bin:
         return "--bin-override requires --bin"
+    if args.bin_override:
+        b = Path(args.bin)
+        if not b.is_absolute() or not b.is_file() or not os.access(b, os.X_OK):
+            return "FANDHE_EDGE_BIN must be a path to an executable file"
     return None
 
 

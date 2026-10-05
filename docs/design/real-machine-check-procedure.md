@@ -40,7 +40,7 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 | 引数 | 説明 | 既定値 / 必須 |
 | ---- | ---- | ---------- |
 | `--work-dir DIR` | 作業と記録の置き場。存在しないか空であること。**作業ディレクトリがリポジトリ自身・その配下・その祖先のどれかなら拒否される。symlink・非ディレクトリ・空でないディレクトリも拒否される**（物理パスへ正規化して比較） | 必須 |
-| `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可） | `B,C,D,E,F`（A は既定では含まない） |
+| `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可）。E は B の成果物を使うため B と一緒に指定する（B なしの E は引数エラー〔exit 64。何も実行しない〕。#362） | `B,C,D,E,F`（A は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
 | `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
@@ -72,7 +72,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 | 環境変数 | 説明 | 備考 |
 | ------- | ---- | ---- |
-| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えた CLI が、cargo がビルドした CLI とバイト単位で同一でない限り D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは cargo がビルドした CLI（cargo の報告から取る。`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えていても追従する）で、その sha256 が差し替えた CLI と一致しなければ `linkage_target_mismatch`（§4-D） |
+| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。存在しない・通常ファイルでない・実行権限が無い場合は、何も起動する前に引数エラー（exit 64。`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` の不正と同じ分類。#362）。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えた CLI が、cargo がビルドした CLI とバイト単位で同一でない限り D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは cargo がビルドした CLI（cargo の報告から取る。`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えていても追従する）で、その sha256 が差し替えた CLI と一致しなければ `linkage_target_mismatch`（§4-D） |
 | `FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` | 検査用（テスト専用の上書き）。**絶対パスの実行ファイル**（PATH で探さない）。どちらかを設定すると `evidence_hint` が `test_harness` に変わり、`otool -L` は実行されず `direct_libraries` が `null` になる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64） | テスト用のみ。両方同時に設定可能 |
 | `FANDHE_EDGE_TRAINER_DIR` | 学習ワーカー（`trainer/`）の場所。CLI の `train` 工程が読む（設定の有無は空文字も設定扱い）。このスクリプトは値を読まず、設定の有無だけを `environment.trainer_origin`（`env` または `build_default`）へ記録する。パスは記録しない | 未設定なら CLI をビルドしたツリーの `trainer/`（ビルド時の既定）を使う。`FANDHE_EDGE_BIN` で差し替えた CLI の既定は、その CLI をビルドしたツリーを指し、このリポジトリの `trainer/` とは限らない。`train` を使わない項目（A・D・F のみ）の実行でも、この欄は環境変数の状態を表す |
 
@@ -122,14 +122,14 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 - **確かめること**: 各工程が連続して終了コード 0 で成功し、出力される JSON の報告値が、作業ディレクトリへコピーした fixture から導いた値と整合すること。`package` の容量内訳（5 項目）が合計と一致すること。
 - **想定する終了コード**: 0（全工程成功）
-- **B の成功条件**: 7 工程すべてが exit 0 で `status` が `ok`、かつ各工程の報告値が次のとおり整合し、`capacity` の 5 要素（`weights`・`vocab_or_feature_transform`・`label_table`・`calibration`・`metadata`）が各々 `bytes` と `file_count`（0 以上の整数）を持ち、5 要素の合計が `capacity.total_bytes` と一致する（C も同じ照合を通る。REQ-21・REQ-33）。さらに、公開された `package/` 直下の通常ファイルのバイト数の合計が `capacity.total_bytes` と一致する（REQ-30）。`==` で比べる報告値（`options`・`candidate`・`n_total` など）は、比べる前に真偽値を除く整数であることを確かめる
+- **B の成功条件**: 7 工程すべてが exit 0 で `status` が `ok`、かつ各工程の報告値が次のとおり整合し、`capacity` の 5 要素（`weights`・`vocab_or_feature_transform`・`label_table`・`calibration`・`metadata`）が各々 `bytes` と `file_count`（0 以上の整数）を持ち、5 要素の合計が `capacity.total_bytes` と一致する（C も同じ照合を通る。REQ-21・REQ-33）。さらに、公開された `package/` 直下が通常ファイルだけ（symlink・ディレクトリ・FIFO 等があれば失敗）で、そのバイト数の合計が `capacity.total_bytes` と、ファイル数が `capacity` の 5 要素の `file_count` の合計と一致する（REQ-30。計測の対象は組み立て先から公開される集合そのものなので、`package/` の全ファイルが数えられる。#362）。`==` で比べる報告値（`options`・`candidate`・`n_total` など）は、比べる前に真偽値を除く整数であることを確かめる
   - `register`: `options` が定義の選択肢の数、`evaluation_defined` が「評価データの行数が 1 以上」と一致
   - `inspect`: `valid_records` が `train.jsonl` の行数（空行を除く）と一致し、`split` の `train`・`validation`・`test` の和が `valid_records` と一致
   - `train`・`select`: `candidate` が 0（B・C は候補 0 を学習する）で、`kind` が `c1`・`c3`・`autoregressive` のどれか（`crates/guard/src/kind.rs` の `SUPPORTED_KINDS` と一致することを pytest が機械照合する）。`select` の `kind` は `train` と同じ値
   - `evaluate`: `candidate` が `select` の報告値、`kind` が `select` と同じ値、`n_total` が `evaluation.jsonl` の行数（1 以上）、`correct` が 0 以上 `n_total` 以下、`accuracy` が `correct / n_total` と 1e-9 以内で一致、キー `macro_f1` が存在して `null` か 0 以上 1 以下（分母 0 の指標は `null`。REQ-24）
   - `package`: キー `judgment`・`infer_p95` が値が `null` でも存在する。`capacity` は各値が 0 以上の整数で、`limit_bytes` が定義の `limits.max_package_bytes`（無ければ既定値 40000000。`crates/cli/src/stages/package.rs` の `DEFAULT_CAPACITY_LIMIT_BYTES` と一致することを pytest が機械照合する）と一致し、`exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過していない。B の定義は合否基準と上限を持たないため、`judgment` が `null`・`acceptance_defined` が `false`・`infer_p95` が `null`
-  - `infer`（B の単発）: `predicted_label` が定義の選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で 0 以上 1 以下、和が 1 から 1e-6 以内（`SCORE_SUM_TOLERANCE` は `fixtures/score_tolerance/score_sum_tolerance.json` と一致することを pytest が機械照合する）、`predicted_label` が最大スコアの選択肢（同点は定義の宣言順で先頭）
-- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。非 0 終了で stdout が JSON でない場合は `invalid_json` のまま、許容外の終了コードであることを補助欄 `exit_code_unexpected: true` で示す。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と合わない場合は `unexpected_output`（`step` は `package`）
+  - `infer`（B の単発）: `predicted_label` が定義の選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で 0 以上 1 以下、和が 1 から 1e-6 以内（`SCORE_SUM_TOLERANCE` は `fixtures/score_tolerance/score_sum_tolerance.json` と一致することを pytest が機械照合する）、`predicted_label` が最大スコアの選択肢（同点は定義の宣言順で先頭）。B の単発は `--id` を付けないので、`id` が既定値 `input`（`crates/cli/src/stages/infer.rs` の `DEFAULT_TEXT_ID` と一致することを pytest が機械照合する。#362）
+- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`package_entry_not_regular`（`package/` 直下に通常ファイル以外がある。#362）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。非 0 終了で stdout が JSON でない場合は `invalid_json` のまま、許容外の終了コードであることを補助欄 `exit_code_unexpected: true` で示す。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と、ファイル数が `file_count` の合計と合わない場合は `unexpected_output`（`step` は `package`）。単発 `infer` の `id` が既定値でない場合も `unexpected_output`（`step` は `infer`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `steps`: 工程の配列（各工程：`step`（固定語彙）・`command`（固定語彙。infer は `infer --package <package-dir> --text <fixed-sample>` で、引数の値・パスは出さない）・`exit_code`・`stderr_bytes`・`summary`）。`summary` は工程ごとに決まった欄だけを新しく組み立てた要約で、CLI の JSON の他の欄は捨てる（欄は常に出し、無い・型が違う値は `null`、閉じた語彙の欄で語彙外の文字列は `<unexpected>`）
@@ -162,11 +162,12 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - exit 20 のときは `code == "limit_exceeded"` で、`package/` が作られていない。exit 0 のときは `status == "ok"` で、`package/` が公開されている
   - `limit_us` が指定値（`--p95-limit-us`）と一致
   - C-1 の `capacity` が要約でき（各値が 0 以上の整数で `exceeded == (total_bytes > limit_bytes)`、5 項目の `bytes` の合計が `total_bytes` と一致、`limit_bytes` が既定値 40000000 と一致）、超過していない
-  - exit 0 のときは、公開された `package/` 直下の通常ファイルのバイト数の合計が `capacity.total_bytes` と一致する（C-1 は一覧を記録へ足さず、照合だけ行う。REQ-30）
+  - exit 0 のときは、公開された `package/` 直下が通常ファイルだけで、そのバイト数の合計が `capacity.total_bytes` と、ファイル数が `file_count` の合計と一致する（C-1 は一覧を記録へ足さず、照合だけ行う。REQ-30）
+  - exit 0・20 のどちらでも、`package` の実行後に `package.staging/`（公開前の組み立て先）が残っていない（公開後・失敗後に残らない設計。REQ-30。#362）
   - 工程の検査（B と同じ。`kind` の一貫性・`evaluate` の `accuracy`・`macro_f1`・`package` のキー `judgment`・`infer_p95` の存在）を通る
-- **失敗の理由**: `unexpected_output`（`exceeded` と計算値・終了コードの不一致、`code`・`status` の不整合、`package/` の有無と終了コードの不一致、`limit_us` の不一致、`p95_us`・`limit_us` が負数、`capacity` の欠落・超過・内訳の合計の不一致・`limit_bytes` の不一致、`package/` のファイルの合計と `total_bytes` の不一致のいずれか）、`missing_field`（C-1 の判定〔`judge_p95`〕が `infer_p95` の型違い・欠落を見つけたとき。通常は工程の検査が先に `unexpected_output` で止める）、工程別の失敗
+- **失敗の理由**: `unexpected_output`（`exceeded` と計算値・終了コードの不一致、`code`・`status` の不整合、`package/` の有無と終了コードの不一致、`limit_us` の不一致、`p95_us`・`limit_us` が負数、`capacity` の欠落・超過・内訳の合計の不一致・`limit_bytes` の不一致、`package/` のファイルの合計・件数と `total_bytes`・`file_count` の合計の不一致、`package/` に通常ファイル以外があるのいずれか）、`staging_left`（`package.staging/` が残っている。#362）、`missing_field`（C-1 の判定〔`judge_p95`〕が `infer_p95` の型違い・欠落を見つけたとき。通常は工程の検査が先に `unexpected_output` で止める）、工程別の失敗
 - **記録する `record.json` フィールド**:
-  - `p95.p95_us`・`p95.limit_us`・`p95.exceeded`・`p95.classification`（`real_machine` / `reference_only`）・`p95.package_exit_code`（0 または 20）・`p95.package_published`（C-1 の `package/` の有無）
+  - `p95.p95_us`・`p95.limit_us`・`p95.exceeded`・`p95.classification`（`real_machine` / `reference_only`）・`p95.package_exit_code`（0 または 20）・`p95.package_published`（C-1 の `package/` の有無）・`p95.package_staging_present`（C-1 の実行後に `package.staging/` が残っていたか。成功時は常に `false`。#362）
 - **注意**: p95 の値は参考値です。`--quiet-machine` を付け、他のアプリを実際に閉じた状態でのみ「実機の p95」として扱います。`--quiet-machine` があっても、`make`・`cargo` の代役（`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD`）か `FANDHE_EDGE_BIN` の差し替えの下では `classification` は `reference_only` で、それ以外でも静かな状態は人の申告です。
 
 #### 4-C-2. `limits.max_package_bytes`
@@ -224,13 +225,13 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - **想定する終了コード**: 0
 - **E の合格条件**: B が `ok` + 次の整合 + 予測ラベル不一致 0 件 + NaN・無限大 0 件 + スコアが全件で完全に一致（`scores_exact_match` が件数と同じ）
   - 根拠: 同一実装の単体対バッチはスコアも含めて完全一致を要求する（`runtime-batch-mismatch-procedure.md`。REQ-28）。スコア差の最大値は参考値で、合否には使わない
-  - バッチ出力の行数が入力の件数と一致し、各行が JSON で `status` が `ok`・`id` が文字列で重複なし
+  - バッチ出力の行数が入力の件数と一致し、各行が JSON で `status` が `ok`・`id` が文字列で重複なし、かつ出力が入力順（`i` 行目の `id` が入力の `i` 件目の `id` と一致。`crates/cli/src/infer_batch.rs` が入力順に出す。#362）
   - バッチの各行と単体の出力が、どちらも infer の規則（`predicted_label` が選択肢 ID・`scores` のキー集合が選択肢 ID と一致・各値が有限で 0 以上 1 以下・和が 1 から 1e-6 以内・`predicted_label` が最大スコアの選択肢〔同点は定義の宣言順で先頭〕）を満たし、単体の出力の `id` が入力の `id` と一致
-- **E が実行されない場合**（`not_run`）: B が要求されていない（`requires_B`）、または前の項目が失敗している（`previous_item_failed`。B の失敗を含む）
-- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測ラベルが一致しない、またはスコアが完全一致でない〔少しでも違えば失敗〕。NaN・無限大も含む）、`unexpected_output`（バッチ側は行数の不一致・`status` が `ok` でない・出力に `step` の欄がある・`id` が文字列でない・`id` の重複・infer の規則の不整合〔`step` は `infer-batch`〕。単体側は stdout が JSON オブジェクトとして読めない〔JSON でない・入れ子が深すぎる・空の dict〕・`status` が `ok` でない・出力に `step` の欄がある・`id` が入力と一致しない・infer の規則の不整合〔`step` は `infer-single`〕）、`invalid_json`（バッチの行が JSON として読めない〔JSON でない・入れ子が深すぎる〕場合だけ。`step` は `infer-batch`。単体側は `invalid_json` にならない）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`。`timeout`・`output_limit`・`spawn_error`・`killed`・`unexpected_exit_code` を含む）
+- **E が実行されない場合**（`not_run`）: 前の項目が失敗している（`previous_item_failed`。B の失敗を含む）。E を B なしで指定した場合は起動前に引数エラー（exit 64。§3-2）で、記録は作られない
+- **失敗の理由**: `input_unreadable`（学習データが読めない）、`record_count_out_of_range`（件数 0 または 1000 超）、`duplicate_id`（id の重複）、`mismatch`（予測ラベルが一致しない、またはスコアが完全一致でない〔少しでも違えば失敗〕。NaN・無限大も含む）、`unexpected_output`（バッチ側は行数の不一致・`status` が `ok` でない・出力に `step` の欄がある・`id` が文字列でない・`id` の重複・出力順が入力順でない・infer の規則の不整合〔`step` は `infer-batch`〕。単体側は stdout が JSON オブジェクトとして読めない〔JSON でない・入れ子が深すぎる・空の dict〕・`status` が `ok` でない・出力に `step` の欄がある・`id` が入力と一致しない・infer の規則の不整合〔`step` は `infer-single`〕）、`invalid_json`（バッチの行が JSON として読めない〔JSON でない・入れ子が深すぎる〕場合だけ。`step` は `infer-batch`。単体側は `invalid_json` にならない）、工程別の失敗（`step:"infer-batch"` / `"infer-single"`。`timeout`・`output_limit`・`spawn_error`・`killed`・`unexpected_exit_code` を含む）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` / `"failed"` / `"not_run"`
-  - `reason`（`not_run` 時）: `requires_B`・`previous_item_failed`
+  - `reason`（`not_run` 時）: `previous_item_failed`
   - `records`: 推論した件数
   - `label_match`・`label_mismatch`: 予測ラベルの一致数・不一致数
   - `scores_exact_match`: スコアが完全に一致した件数（合否に使う。件数と同じでなければ失敗）
@@ -244,22 +245,25 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 `cargo test --locked -p fandhe-edge-guard --test time_limit` を N 回実行し、1 回も失敗しないこと（#346 の再発〔並行 spawn の fd 継承競合〕が無いこと）を確かめます。
 
-- **確かめること**: テストバイナリのコンパイル（初回）が成功し、その後 N 回のテスト実行がすべて成功すること。#346 の再発の兆候として、失敗した回のログにある `ReadOutput`・`ReadOutputIncomplete` を数えて記録する（成功した回のログは数えない。成功の判定は各回の exit 0 と `test result: ok. N passed`〔N >= 1〕で、これらの語が成功した回に出ても失敗にしない）。
+- **確かめること**: テストバイナリのコンパイル（初回）が成功し、その後 N 回のテスト実行がすべて成功すること。#346 の再発の兆候として、失敗した回のログにある `ReadOutput`・`ReadOutputIncomplete` を数えて記録する（成功した回のログは数えない。成功の判定は後述の各回の合格条件で、これらの語が成功した回に出ても失敗にしない）。1 回あたりに実行されるべき件数は、事前に `cargo test --locked -p fandhe-edge-guard --test time_limit -- --list` を 1 回実行して得る（固定値と比べない。#362）。
 - **想定する終了コード**: 0（失敗 0 回）または 10（失敗あり）
-- **F の成功条件**: テストバイナリビルド成功 + 実行回数 N 回 + 失敗 0 回（各回が exit 0・期限内・出力上限内で、ログに `test result: ok. N passed`（N >= 1）がある）
-- **失敗の理由**: `build_failed`（`--no-run` のビルドが失敗・期限超過・出力上限超過）、`test_failures`（N 回のうち 1 回以上の失敗。失敗の内訳は `timeouts`・`no_tests` の件数欄に出る）。`no_tests`・`timeout` は `reason` ではなく件数の欄
+- **F の成功条件**: テストバイナリビルド成功 + 実行回数 N 回 + 失敗 0 回（各回が exit 0・期限内・出力上限内で、ログの `test result: ok.` 行の `passed` の合計が `--list` の件数（`expected_tests`）と一致し、`failed`・`ignored` が 0）
+- **失敗の理由**: `build_failed`（`--no-run` のビルドが失敗・期限超過・出力上限超過）、`list_failed`（`--list` が失敗・期限超過・出力上限超過。#362）、`no_tests_listed`（`--list` が 0 件。#362）、`test_failures`（N 回のうち 1 回以上の失敗。失敗の内訳は `timeouts`・`no_tests`・`count_mismatch`・`output_limit`・`killed`・`spawn_error` の件数欄に出る）。これらの件数の語は `reason` ではなく件数の欄
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` / `"failed"`
   - `runs`: 実行回数（N）
+  - `expected_tests`: `--list` で得た 1 回あたりの件数（整数。#362）
   - `passed`・`failed`: 成功・失敗の回数
   - `timeouts`: 制限時間超過の回数
-  - `no_tests`: exit 0 で終わったが `test result: ok. N passed`（N >= 1）が無かった回数（失敗に数える）
+  - `no_tests`: exit 0 で終わったが 0 件しか実行されなかった（`passed` も `failed` も 0）回数（失敗に数える）
+  - `count_mismatch`: exit 0 で終わったが `passed` が `expected_tests` と違う、または `failed`・`ignored` が 0 でなかった回数（失敗に数える。#362）
+  - `output_limit`・`killed`・`spawn_error`: 出力上限超過・子の回収の失敗（rc の欠落）・起動失敗の回数（それぞれ失敗に数える。#362）
   - `read_output`: 失敗した回のうち、ログに `ReadOutput`（Incomplete 以外）が出現した回数（成功した回は数えない）
   - `read_output_incomplete`: 失敗した回のうち、ログに `ReadOutputIncomplete` が出現した回数（成功した回は数えない）
   - `load_start`・`load_end`: 実行開始・終了時の load average（3 要素の配列。`os.getloadavg()` で取れなければ `null`）
   - `reason`（失敗時のみ）: `build_failed` / `test_failures`
 - **実行特性**: F だけは全 N 回を数えてから成否を決めます（失敗があっても止めず最後まで実行する）。失敗 0 回で `ok`、1 件以上で `failed`。
-- **初回実行の自動準備**: スクリプトが N 回実行の前に `cargo test --locked ... --no-run` を 1 回実行し、テストバイナリをコンパイルします（回数に数えない。失敗は `build_failed`）。事前準備は不要ですが、初回実行は通常より時間がかかります。
+- **初回実行の自動準備**: スクリプトが N 回実行の前に `cargo test --locked ... --no-run` を 1 回実行し、テストバイナリをコンパイルします（回数に数えない。失敗は `build_failed`）。続けて `-- --list` を 1 回実行して件数を得ます（回数に数えない。失敗は `list_failed`）。事前準備は不要ですが、初回実行は通常より時間がかかります。
 
 ## 5. 判定の読み方
 
@@ -269,8 +273,8 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | -------- | ---- | ---- |
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
-| 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--work-dir` がリポジトリ内、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
+| 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
@@ -279,7 +283,6 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
    - 要求されていない → `not_run` / `not_selected`
    - 中断済み → `not_run` / `interrupted`（前の項目が `failed` の場合よりも優先する）
    - 前の項目が `failed` → `not_run` / `previous_item_failed`（B の失敗で止まった E もこれ）
-   - E で B が要求されておらず成功していない → `not_run` / `requires_B`
    - それ以外 → 実行して結果を記録
 3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
 4. 終了コード 0 = 要求したすべての項目が `ok`、10 = 1 つ以上が `failed` / `not_run`
@@ -421,7 +424,6 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
 - `interrupted`: 実行中（項目の開始前を含む）に SIGINT・SIGTERM・SIGHUP で中断。前の項目が `failed` で止まった後に中断を受けた場合も、未実行の項目はこの値になる（`previous_item_failed` より優先）
-- `requires_B`: E で B が要求されていない（B が失敗した場合は `previous_item_failed`）
 
 ### 終了時の環境の再採取（#360）
 

@@ -325,13 +325,19 @@ def test_item_d_requires_env_i_tests_and_no_skips(tmp_path: Path) -> None:
     assert mod.item_d(ctx)["reason"] == "no_test_results"
 
 
+def _list_script(n: int = 12) -> str:
+    """`cargo test -- --list` に n 件で答える偽 cargo の前置き（他の引数では何もしない）。"""
+    echoes = "".join(f"echo 't{i}: test'; " for i in range(n))
+    return f'case "$*" in *--list*) {echoes}exit 0;; esac\n'
+
+
 def test_item_f_rejects_zero_tests_and_failed_prebuild(tmp_path: Path) -> None:
     """F: 0 件実行は pass に数えず no_tests に計上する。`--no-run` の失敗は build_failed。"""
     ctx = _ctx(tmp_path / "w", _fake_cli(tmp_path, "exit 0\n"))
     ctx.work.mkdir()
     ctx.repeat = 2
     zero = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
-    ctx.cargo_cmd = str(_script(tmp_path, "c0", f"echo '{zero}'\nexit 0\n"))
+    ctx.cargo_cmd = str(_script(tmp_path, "c0", _list_script() + f"echo '{zero}'\nexit 0\n"))
     res = mod.item_f(ctx)
     assert (res["passed"], res["failed"], res["no_tests"]) == (0, 2, 2)
     shutil.rmtree(ctx.work / "F")
@@ -341,7 +347,7 @@ def test_item_f_rejects_zero_tests_and_failed_prebuild(tmp_path: Path) -> None:
     assert mod.item_f(ctx) == {"status": "failed", "reason": "build_failed", "exit_code": 101}
     shutil.rmtree(ctx.work / "F")
     good = CARGO_RUST_LINE
-    ctx.cargo_cmd = str(_script(tmp_path, "c2", f"echo '{good}'\nexit 0\n"))
+    ctx.cargo_cmd = str(_script(tmp_path, "c2", _list_script() + f"echo '{good}'\nexit 0\n"))
     res = mod.item_f(ctx)
     assert (res["status"], res["passed"], res["no_tests"]) == ("ok", 2, 0)
 
@@ -771,6 +777,8 @@ def test_sanitize_and_markdown_accept_null_environment_and_inputs() -> None:
         ["--repeat", "0"],
         ["--repeat", "1001"],
         ["--items", "A"],
+        ["--items", "E"],
+        ["--items", "C,E"],
     ],
 )
 def test_main_rejects_invalid_arguments_without_traceback(
@@ -819,6 +827,34 @@ def _ns(**over: Any) -> argparse.Namespace:
 def test_validate_args_limits_boundaries(over: dict[str, Any], want: str | None) -> None:
     """REQ-21・REQ-31: p95 上限は 1〜3600000000（定義ファイルの上限と対）、package は 1 以上。"""
     assert mod.validate_args(_ns(**over)) == want
+
+
+@pytest.mark.parametrize(
+    ("over", "want"),
+    [
+        ({"items": "E"}, "item E requires item B"),
+        ({"items": "C,D,E,F"}, "item E requires item B"),
+        ({"items": "B,E"}, None),
+        ({"items": "A,B,E", "with_ci": True}, None),
+    ],
+)
+def test_validate_args_requires_item_b_for_item_e(over: dict[str, Any], want: str | None) -> None:
+    """REQ-21・REQ-28・#362: E は B の成果物を使うので、B なしの E は起動前に引数エラー（64）。"""
+    assert mod.validate_args(_ns(**over)) == want
+
+
+def test_validate_args_rejects_an_unusable_bin_override(tmp_path: Path) -> None:
+    """REQ-21・#362: `FANDHE_EDGE_BIN` が相対・不在・非実行・ディレクトリなら起動前に 64 の分類。"""
+    msg = "FANDHE_EDGE_BIN must be a path to an executable file"
+    plain = tmp_path / "plain"
+    plain.write_text("x", "utf-8")
+    plain.chmod(0o600)
+    good = tmp_path / "good"
+    good.write_text("#!/bin/sh\n", "utf-8")
+    good.chmod(0o700)
+    for bad in ("relative/bin", str(tmp_path / "missing"), str(plain), str(tmp_path)):
+        assert mod.validate_args(_ns(bin_override=True, bin=bad)) == msg, bad
+    assert mod.validate_args(_ns(bin_override=True, bin=str(good))) is None
 
 
 def _run(tmp_path: Path, argv: list[str], name: str = "o") -> Any:
@@ -969,6 +1005,8 @@ if "--input-file" in a:
         rows = rows[:-1]
     if mode == "dup":
         rows[-1] = rows[0]
+    if mode == "swap":
+        rows[0], rows[1] = rows[1], rows[0]
     for i, rid in enumerate(rows):
         print(row(rid, 0.0, mode == "batch-step" and i == 1))
 else:
@@ -1027,9 +1065,9 @@ def test_item_e_passes_when_batch_and_single_agree(tmp_path: Path) -> None:
     assert res["scores_exact_match"] == res["records"]
 
 
-@pytest.mark.parametrize("mode", ["short", "dup"])
+@pytest.mark.parametrize("mode", ["short", "dup", "swap"])
 def test_item_e_rejects_batch_row_count_and_duplicate_ids(tmp_path: Path, mode: str) -> None:
-    """REQ-28: バッチ出力の行数が違う・id が重複する場合は unexpected_output（後勝ちにしない）。"""
+    """REQ-28: バッチ出力の行数が違う・id が重複する・入力順でない（#362）は unexpected_output。"""
     res = mod.item_e(_e_ctx(tmp_path, _infer_cli(tmp_path, mode=mode)))
     assert (res["status"], res["reason"], res["step"]) == (
         "failed",
@@ -1260,9 +1298,16 @@ def test_check_infer_output_validates_label_keys_finiteness_and_sum() -> None:
     """REQ-21: infer の label は選択肢 ID、scores のキーは選択肢 ID と一致、有限で和が 1 近傍。"""
     f = _facts()
     ids = f.option_ids
-    ok = {"id": "x", "status": "ok", "predicted_label": ids[0], "scores": _scores(f)}
+    ok = {
+        "id": mod.DEFAULT_TEXT_ID,
+        "status": "ok",
+        "predicted_label": ids[0],
+        "scores": _scores(f),
+    }
     assert mod.check_infer_output(ok, f) is True
     assert mod._step_check("infer", ok, set(), 0, f, None) is True
+    # B の単発 infer は `--id` なしなので、id が既定値以外なら不合格（#362）
+    assert mod._step_check("infer", dict(ok, id="x"), set(), 0, f, None) is False
     assert mod.check_infer_output(dict(ok, predicted_label="nope"), f) is False
     assert mod.check_infer_output(dict(ok, scores={ids[0]: 1.0}), f) is False
     assert mod.check_infer_output(dict(ok, scores=dict(_scores(f), extra=0.0)), f) is False
@@ -1349,8 +1394,10 @@ c2 = "max_package_bytes" in limits
 cmd = sys.argv[1]
 names = ["weights", "vocab_or_feature_transform", "label_table", "calibration", "metadata"]
 def comps(total):
-    c = {{k: {{"bytes": 1, "file_count": 1}} for k in names}}
+    # file_count は公開される package/ の実ファイル数（model.onnx の 1 つ）に合わせる
+    c = {{k: {{"bytes": 1, "file_count": 0}} for k in names}}
     c["weights"]["bytes"] = total - 4 + cfg["comp_delta"]
+    c["weights"]["file_count"] = 1 + cfg["fc_delta"]
     return c
 def out(o, rc=0):
     print(json.dumps(o))
@@ -1371,8 +1418,13 @@ if cmd == "evaluate":
 if cmd == "infer":
     ids = [o["id"] for o in d["options"]]
     scores = {{i: 1.0 / len(ids) for i in ids}}
-    out({{"id": "x", "status": "ok", "predicted_label": ids[0], "scores": scores}})
+    rid = cfg["default_id"]
+    if "--id" in sys.argv:
+        rid = sys.argv[sys.argv.index("--id") + 1]
+    out({{"id": rid, "status": "ok", "predicted_label": ids[0], "scores": scores}})
 if cmd == "package":
+    if cfg["staging"] == ("C2" if c2 else "C1"):
+        os.makedirs("project/package.staging", exist_ok=True)
     if c2:
         total = cfg["c2_total"]
         limit = cfg["c2_limit"] or limits["max_package_bytes"]
@@ -1396,6 +1448,10 @@ if cmd == "package":
         os.makedirs("project/package", exist_ok=True)
         with open("project/package/model.onnx", "wb") as f:
             f.write(b"x" * cfg["actual_bytes"])
+        if cfg["package_kind"] == "symlink":
+            os.symlink("model.onnx", "project/package/link")
+        if cfg["package_kind"] == "dir":
+            os.makedirs("project/package/sub")
     if rc == 20:
         out({{"code": cfg["code1"], "message": "m", "step": "package", "capacity": cap,
              "infer_p95": p95}}, 20)
@@ -1418,6 +1474,10 @@ C_DEFAULT = {
     "limit1": 40000000,
     "actual_bytes": 10,
     "comp_delta": 0,
+    "fc_delta": 0,
+    "package_kind": "",
+    "staging": "",
+    "default_id": "input",
     "train_kind": "c1",
     "select_kind": "c1",
     "eval_kind": "c1",
@@ -1805,14 +1865,24 @@ def test_package_files_validates_names_and_keeps_sizes(tmp_path: Path) -> None:
     (d / "my secret name.bin").write_bytes(b"xy")
     (d / ("a" * 65)).write_bytes(b"z")
     (d / ("b" * 64)).write_bytes(b"zz")
-    (d / "sub").mkdir()
     files = mod.package_files(d)
     assert files is not None
     names = sorted(f["name"] for f in files)
     assert names == sorted(["model.onnx", "<unrecognized>", "<unrecognized>", "b" * 64])
     assert {f["bytes"] for f in files if f["name"] == "model.onnx"} == {4}
     assert all(len(f["sha256"]) == 64 for f in files)
-    assert mod.package_dir_bytes(d) == 4 + 2 + 1 + 2
+    assert mod.package_dir_stats(d) == (4, 4 + 2 + 1 + 2)
+    # 通常ファイル以外（ディレクトリ・symlink）は黙って飛ばさず、どちらの関数も None（#362）
+    (d / "sub").mkdir()
+    assert mod.package_entries_regular(d) is False
+    assert mod.package_files(d) is None
+    assert mod.package_dir_stats(d) is None
+    (d / "sub").rmdir()
+    (d / "link").symlink_to("model.onnx")
+    assert mod.package_entries_regular(d) is False
+    assert mod.package_files(d) is None
+    assert mod.package_dir_stats(d) is None
+    assert mod.package_entries_regular(tmp_path / "missing") is None
 
 
 def test_environment_text_and_ascii_int_validation() -> None:
@@ -2388,6 +2458,110 @@ def test_default_limit_bytes_matches_the_rust_constant() -> None:
     m = re.search(r"const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = ([0-9_]+);", src)
     assert m is not None, "DEFAULT_CAPACITY_LIMIT_BYTES が見つからない"
     assert int(m.group(1).replace("_", "")) == mod.DEFAULT_CAPACITY_LIMIT_BYTES
+
+
+def test_staging_and_default_id_constants_match_the_rust_sources() -> None:
+    """REQ-30・REQ-33・#362: 組み立て先ディレクトリ名と既定 id は Rust 側の定数と一致する。"""
+    project = (REPO / "crates" / "cli" / "src" / "project.rs").read_text("utf-8")
+    m = re.search(r'pub const PACKAGE_STAGING_DIR: &str = "([^"]+)";', project)
+    assert m is not None, "PACKAGE_STAGING_DIR が見つからない"
+    assert m.group(1) == mod.PACKAGE_STAGING_DIR == "package.staging"
+    infer = (REPO / "crates" / "cli" / "src" / "stages" / "infer.rs").read_text("utf-8")
+    m = re.search(r'const DEFAULT_TEXT_ID: &str = "([^"]+)";', infer)
+    assert m is not None, "DEFAULT_TEXT_ID が見つからない"
+    assert m.group(1) == mod.DEFAULT_TEXT_ID == "input"
+
+
+def test_item_b_rejects_non_regular_entries_and_file_count_mismatch(tmp_path: Path) -> None:
+    """REQ-30・#362: B は package/ の通常ファイル以外・file_count の合計との不一致で失敗。"""
+    for kind in ("symlink", "dir"):
+        res, ok = mod.item_b(_c_ctx(tmp_path / kind, package_kind=kind))
+        assert (ok, res["status"], res["reason"]) == (False, "failed", "package_entry_not_regular")
+    res, ok = mod.item_b(_c_ctx(tmp_path / "fc", fc_delta=1))
+    assert (ok, res["reason"], res["step"]) == (False, "unexpected_output", "package")
+    res, ok = mod.item_b(_c_ctx(tmp_path / "ok"))
+    assert (ok, res["status"], len(res["package_files"])) == (True, "ok", 1)
+
+
+def test_item_b_rejects_a_default_id_other_than_input(tmp_path: Path) -> None:
+    """REQ-33・#362: B の単発 infer は `--id` なしなので、id が既定値 input でなければ失敗。"""
+    res, ok = mod.item_b(_c_ctx(tmp_path, default_id="x"))
+    assert (ok, res["reason"], res["step"]) == (False, "unexpected_output", "infer")
+
+
+def test_item_c1_rejects_non_regular_entries_and_file_count_mismatch(tmp_path: Path) -> None:
+    """REQ-30・#362: C-1（exit 0）も package/ の通常ファイル以外・ファイル数の不一致で失敗。"""
+    for name, over in (
+        ("s", {"package_kind": "symlink"}),
+        ("d", {"package_kind": "dir"}),
+        ("f", {"fc_delta": 1}),
+    ):
+        res = mod.item_c(_c_ctx(tmp_path / name, **over))
+        assert (res["status"], res["reason"], res["case"]) == ("failed", "unexpected_output", "C-1")
+
+
+def test_item_c_fails_when_package_staging_is_left(tmp_path: Path) -> None:
+    """REQ-30・#362: package.staging/ が残っていれば C は staging_left（exit 0・20 とも）。"""
+    res = mod.item_c(_c_ctx(tmp_path / "a", staging="C1"))
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "staging_left", "C-1")
+    over = {"rc1": 20, "p95_us": 60000, "p95_exceeded": True}
+    res = mod.item_c(_c_ctx(tmp_path / "b", staging="C1", **over))
+    assert (res["status"], res["reason"], res["case"]) == ("failed", "staging_left", "C-1")
+    res = mod.item_c(_c_ctx(tmp_path / "c", staging="C2"))
+    assert (res["status"], res["reason"]) == ("failed", "staging_left")
+    assert res["capacity_limit"]["package_staging_present"] is True
+    res = mod.item_c(_c_ctx(tmp_path / "d"))
+    assert res["status"] == "ok"
+    assert res["p95"]["package_staging_present"] is False
+    assert res["capacity_limit"]["package_staging_present"] is False
+
+
+def test_item_f_compares_each_run_with_the_listed_test_count(tmp_path: Path) -> None:
+    """REQ-39・#362: F は `--list` の件数と各回の passed を照合し、失敗の内訳を欄ごとに数える。"""
+    ctx = _ctx(tmp_path / "w", _fake_cli(tmp_path, "exit 0\n"))
+    ctx.work.mkdir()
+    ctx.repeat = 1
+
+    def run(name: str, body: str, n: int = 12) -> dict[str, Any]:
+        # `--no-run` のビルドは常に成功させ、本番の回の挙動だけを `body` で変える
+        prefix = 'case "$*" in *--no-run*) exit 0;; esac\n' + _list_script(n)
+        ctx.cargo_cmd = str(_script(tmp_path, name, prefix + body))
+        shutil.rmtree(ctx.work / "F", ignore_errors=True)
+        return mod.item_f(ctx)
+
+    def line(passed: int, failed: int = 0, ignored: int = 0) -> str:
+        return (
+            f"echo 'test result: ok. {passed} passed; {failed} failed; {ignored} ignored; "
+            "0 measured; 0 filtered out'\nexit 0\n"
+        )
+
+    res = run("ok", line(12))
+    assert (res["status"], res["expected_tests"], res["passed"]) == ("ok", 12, 1)
+    res = run("short", line(5))
+    assert (res["status"], res["failed"], res["count_mismatch"], res["no_tests"]) == (
+        "failed",
+        1,
+        1,
+        0,
+    )
+    res = run("ignored", line(12, 0, 1))
+    assert (res["failed"], res["count_mismatch"]) == (1, 1)
+    res = run("follow-list", line(7), n=7)
+    assert (res["status"], res["expected_tests"]) == ("ok", 7)
+    res = run("zero", line(0))
+    assert (res["no_tests"], res["count_mismatch"]) == (1, 0)
+    res = run("killed", "kill -9 $PPID\nexit 0\n")
+    assert (res["killed"], res["failed"]) == (1, 1)
+    res = run("fail-rc", "exit 101\n")
+    assert (res["failed"], res["killed"], res["output_limit"], res["spawn_error"]) == (1, 0, 0, 0)
+    assert res["no_tests"] == 0
+    res = run("empty-list", line(12), n=0)
+    assert res == {"status": "failed", "reason": "no_tests_listed"}
+    ctx.cargo_cmd = str(
+        _script(tmp_path, "list-fail", 'case "$*" in *--list*) exit 101;; esac\nexit 0\n')
+    )
+    shutil.rmtree(ctx.work / "F")
+    assert mod.item_f(ctx) == {"status": "failed", "reason": "list_failed", "exit_code": 101}
 
 
 def test_sanitize_record_checks_every_direct_library_regardless_of_path_chars() -> None:

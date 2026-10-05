@@ -65,7 +65,13 @@ if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
   printf '{"code":"runtime_error","message":"%s","step":"%s"}\n' "${FAKE_FAIL_MSG:-stage failed at /secret/dir}" "$stage"
   exit "${FAKE_FAIL_RC:-70}"
 fi
-comps='"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":20,"file_count":1},"label_table":{"bytes":5,"file_count":1},"calibration":{"bytes":3,"file_count":1},"metadata":{"bytes":7,"file_count":1}}'
+# 内訳の file_count は、公開される package/ の実ファイル数（model.onnx と artifact.json の 2 つ。
+# FAKE_PKG_ODD なら `odd name.bin` を足した 3 つ）と一致させる。FAKE_FC_SHIFT は weights を 1 多く報告する
+wfc=1
+[ -n "${FAKE_FC_SHIFT:-}" ] && wfc=2
+ltfc=0
+[ -n "${FAKE_PKG_ODD:-}" ] && ltfc=1
+comps=$(printf '"components":{"weights":{"bytes":100,"file_count":%s},"vocab_or_feature_transform":{"bytes":20,"file_count":0},"label_table":{"bytes":5,"file_count":%s},"calibration":{"bytes":3,"file_count":0},"metadata":{"bytes":7,"file_count":1}}' "$wfc" "$ltfc")
 case "$stage" in
 register)
   printf '{"step":"register","status":"ok","definition_sha256":"%s","options":3,"evaluation_defined":true%s}\n' "$SHA" "$extra" ;;
@@ -85,6 +91,8 @@ evaluate)
   printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":%s,"macro_f1":1.0%s}\n' "${FAKE_EVAL_N:-12}" "$acc" "$extra" ;;
 package)
   c2mode=${FAKE_C2_MODE:-limit}
+  # 組み立て先が残る欠陥の再現（値は残す cwd 名 C1・C2。exit 0・20 のどちらでも残る）
+  [ "${FAKE_STAGING_LEFT:-}" = "$here" ] && mkdir -p project/package.staging
   # 内訳の合計。bad=sum:<case> のときだけ total_bytes を 1 多く返す
   extrab=0
   [ "$bad" = "sum:$here" ] && extrab=1
@@ -122,6 +130,9 @@ package)
   mkdir -p project/package
   head -c "$mb" /dev/zero > project/package/model.onnx
   head -c 35 /dev/zero > project/package/artifact.json
+  # 通常ファイル以外の混入の再現（計測対象外のまま見逃されないことの確認）
+  [ "${FAKE_PKG_KIND:-}" = symlink ] && ln -s model.onnx project/package/link
+  [ "${FAKE_PKG_KIND:-}" = dir ] && mkdir project/package/sub
   [ "$odd" != 0 ] && head -c "$odd" /dev/zero > "project/package/odd name.bin"
   p95=null
   pv=2
@@ -132,7 +143,7 @@ package)
   printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s},"infer_p95":%s%s}\n' "$jfield" "$total" "$lim" "$comps" "$p95" "$extra" ;;
 infer)
   file=
-  id=input
+  id=${FAKE_DEFAULT_ID:-input}
   prev=
   for a in "$@"; do
     [ "$prev" = --input-file ] && file=$a
@@ -152,6 +163,7 @@ infer)
     [ "$bad" = batch_score_shift ] && SC2='{"alpha":0.500000000001,"beta":0.25,"gamma":0.25}'
     first=
     n=0
+    {
     while IFS= read -r line; do
       rid=$(printf '%s' "$line" | sed -n 's/^{"id": "\([^"]*\)".*/\1/p')
       [ -n "$first" ] || first=$rid
@@ -161,6 +173,12 @@ infer)
       [ "$n" = 2 ] && rowsc=$SC2
       printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$rowsc"'}\n' "$rid" "$lab"
     done < "$file"
+    } | if [ "${FAKE_E_ORDER:-}" = swap ]; then
+      # 1 行目と 2 行目の出力順を入れ替える（入力順の保証の違反）
+      awk 'NR==1{a=$0;next} NR==2{print $0; print a; next} {print}'
+    else
+      cat
+    fi
   else
     lab=alpha
     [ -n "${FAKE_INFER_BAD_LABEL:-}" ] && lab=zzz
@@ -225,7 +243,9 @@ esac
 
 /// 偽の cargo。`build`（`--message-format=json`）は `FAKE_CLI_PATH` を `compiler-artifact` で報告する。
 /// `test ... --no-run` は回数に数えない。それ以外の `test` は `FAKE_CARGO_PATTERN`
-/// （カンマ区切り。`ok`・`inc`・`plain`・`zero`）の n 番目で n 回目の結果を決める。
+/// （カンマ区切り。`ok`・`inc`・`plain`・`zero`・`short`・`ignored`・`killed`・`overflow`・`unexec`）の
+/// n 番目で n 回目の結果を決める。`-- --list` も回数に数えず、`FAKE_LIST_COUNT`（既定 12）件を出す
+/// （`FAKE_LIST_RC` で終了コードを変える）。
 /// `FAKE_CARGO_BUILD_SLEEP`（`build` で長く待つ。ビルド中の中断のテスト用）。
 const FAKE_CARGO: &str = r##"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DIR/cargo.args"
@@ -242,6 +262,16 @@ if [ "$1" = build ]; then
   exit 0
 fi
 case "$*" in *--no-run*) exit 0 ;; esac
+case "$*" in
+*--list*)
+  # `-- --list` は回数に数えない。FAKE_LIST_COUNT 件のテストを `<name>: test` で出す
+  c=${FAKE_LIST_COUNT:-12}
+  i=1
+  while [ "$i" -le "$c" ]; do echo "tests::t$i: test"; i=$((i + 1)); done
+  echo
+  echo "$c tests, 0 benchmarks"
+  exit "${FAKE_LIST_RC:-0}" ;;
+esac
 n=$(( $(cat "$FAKE_DIR/cargo.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$FAKE_DIR/cargo.count"
 mode=$(echo "${FAKE_CARGO_PATTERN:-}" | cut -d, -f"$n")
@@ -249,6 +279,14 @@ case "$mode" in
 inc) echo "error: ReadOutputIncomplete"; exit 101 ;;
 plain) echo "error: ReadOutput(Io)"; exit 101 ;;
 zero) echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"; exit 0 ;;
+short) echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0 ;;
+ignored) echo "test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0 ;;
+killed) kill -9 $PPID; exit 0 ;;
+overflow) head -c 70000000 /dev/zero | tr '\0' 'x'; exit 0 ;;
+unexec)
+  # 自分自身の実行権限を外す。次の回の起動が spawn_error になる
+  chmod 000 "$0"
+  echo "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0 ;;
 *) echo "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0 ;;
 esac
 "##;
@@ -543,6 +581,24 @@ fn req39_invalid_overrides_and_work_dirs_are_rejected() {
         &[("FANDHE_EDGE_BIN", "fake-cli")],
         "FANDHE_EDGE_BIN must be a path containing a slash",
     );
+    // 存在しない・実行権限が無い・ディレクトリ・親が無い FANDHE_EDGE_BIN は起動前に 64（70 ではない）
+    let bin_msg = "FANDHE_EDGE_BIN must be a path to an executable file";
+    let e = Env::new();
+    let not_exec = e.dir.join("not-exec");
+    fs::write(&not_exec, "#!/bin/sh\n").expect("write");
+    fs::set_permissions(&not_exec, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let a_dir = e.dir.join("a-dir");
+    fs::create_dir_all(&a_dir).expect("mkdir");
+    let missing = e.dir.join("missing");
+    let no_parent = e.dir.join("no-such-dir").join("fandhe-edge");
+    for bad in [&missing, &not_exec, &a_dir, &no_parent] {
+        assert_rejected_before_start(
+            &e,
+            &with_work(&e, &["--items", "B"]),
+            &[("FANDHE_EDGE_BIN", &bad.display().to_string())],
+            bin_msg,
+        );
+    }
 
     // 空でない作業ディレクトリ
     let e = Env::new();
@@ -710,16 +766,24 @@ fn req33_normal_run_records_all_items() {
     assert_eq!(e.q("items.F.passed"), "3");
     assert_eq!(e.q("items.F.failed"), "0");
     assert_eq!(e.q("items.F.no_tests"), "0");
-    // `--no-run` の 1 回 + 本番 3 回。`--no-run` は回数に数えない
+    assert_eq!(e.q("items.F.expected_tests"), "12");
+    for k in ["count_mismatch", "output_limit", "killed", "spawn_error"] {
+        assert_eq!(e.q(&format!("items.F.{k}")), "0", "{k}");
+    }
+    // `--no-run` と `--list` の各 1 回 + 本番 3 回。前者 2 つは回数に数えない
     assert_eq!(e.lines("cargo.count"), ["3"]);
     let cargo = e.lines("cargo.args");
     assert_eq!(
         cargo[0],
         "test --locked -p fandhe-edge-guard --test time_limit --no-run"
     );
-    assert_eq!(cargo.len(), 4);
+    assert_eq!(
+        cargo[1],
+        "test --locked -p fandhe-edge-guard --test time_limit -- --list"
+    );
+    assert_eq!(cargo.len(), 5);
     assert!(
-        cargo[1..]
+        cargo[2..]
             .iter()
             .all(|l| l == "test --locked -p fandhe-edge-guard --test time_limit")
     );
@@ -739,7 +803,8 @@ fn req38_offline_env_is_passed_except_to_make_ci() {
         e.lines("make.env"),
         ["ci unset", "check-runtime-linkage true"]
     );
-    assert_eq!(e.lines("cargo.env"), ["true", "true"]);
+    // `--no-run`・`--list`・本番 1 回
+    assert_eq!(e.lines("cargo.env"), ["true", "true", "true"]);
     // A を含む実行は make ci が offline で起動されないため cargo_offline は false（#360）
     assert_eq!(e.q("options.cargo_offline"), "false");
     let cli_env = e.lines("cli.env");
@@ -896,8 +961,8 @@ fn req39_item_f_counts_zero_tests_as_failure() {
     assert_eq!(e.q("items.F.failed"), "2");
     assert_eq!(e.q("items.F.no_tests"), "2");
     assert_eq!(e.q("items.F.read_output"), "0");
-    // `--no-run` 1 回 + 本番 3 回の計 4 回呼ばれるが、数えるのは本番だけ
-    assert_eq!(e.lines("cargo.args").len(), 4);
+    // `--no-run`・`--list` 各 1 回 + 本番 3 回の計 5 回呼ばれるが、数えるのは本番だけ
+    assert_eq!(e.lines("cargo.args").len(), 5);
     assert_eq!(e.lines("cargo.count"), ["3"]);
 }
 
@@ -954,16 +1019,23 @@ fn req28_item_e_mismatch_fails_without_ids_in_record() {
     }
 }
 
-/// REQ-27・REQ-28: `--items E` 単独は B が無いので `not_run`（requires_B）で exit 10。
+/// REQ-27・REQ-28・REQ-21: `--items E` 単独は B が無いので、起動前に引数エラー（exit 64）にする。
 /// B が失敗したときも E は実行されない。
 #[test]
 fn req28_item_e_requires_successful_b() {
     let e = Env::new();
-    let o = e.run(&with_work(&e, &["--items", "E"]), &[]);
-    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
-    assert_eq!(e.q("items.E.status"), "\"not_run\"");
-    assert_eq!(e.q("items.E.reason"), "\"requires_B\"");
-    assert!(e.lines("cli.log").is_empty());
+    assert_rejected_before_start(
+        &e,
+        &with_work(&e, &["--items", "E"]),
+        &[],
+        "item E requires item B",
+    );
+    assert_rejected_before_start(
+        &e,
+        &with_work(&e, &["--items", "C,D,E,F"]),
+        &[],
+        "item E requires item B",
+    );
 
     let e = Env::new();
     let o = e.run(
@@ -1742,4 +1814,159 @@ fn req39_unrecognized_package_file_name_is_not_recorded() {
         e.q("items.B.package_files.*.name"),
         "[\"artifact.json\",\"model.onnx\",\"<unrecognized>\"]"
     );
+}
+/// REQ-30・#362: `package` の実行後（exit 0・20 のどちらでも）に `package.staging/` が残っていれば
+/// C は failed（`staging_left`）・exit 10。残っていない通常の実行では記録の欄が false になる。
+#[test]
+fn req30_c_staging_left_fails() {
+    // C-1 の exit 0、C-1 の exit 20、C-2 の exit 20
+    let cases: [&[(&str, &str)]; 3] = [
+        &[("FAKE_STAGING_LEFT", "C1")],
+        &[("FAKE_STAGING_LEFT", "C1"), ("FAKE_C1_EXCEED", "1")],
+        &[("FAKE_STAGING_LEFT", "C2")],
+    ];
+    for envs in cases {
+        assert_bad_output_fails("C", envs, "C", "staging_left", None);
+    }
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "C"]), &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.p95.package_staging_present"), "false");
+    assert_eq!(
+        e.q("items.C.capacity_limit.package_staging_present"),
+        "false"
+    );
+}
+
+/// REQ-30・#362: `package/` に通常ファイル以外（symlink・ディレクトリ）があれば B は
+/// `package_entry_not_regular`、C-1 は `unexpected_output`。黙って飛ばして合格にしない。
+#[test]
+fn req30_package_entry_not_regular_fails() {
+    for kind in ["symlink", "dir"] {
+        assert_bad_output_fails(
+            "B",
+            &[("FAKE_PKG_KIND", kind)],
+            "B",
+            "package_entry_not_regular",
+            None,
+        );
+        assert_bad_output_fails(
+            "C",
+            &[("FAKE_PKG_KIND", kind)],
+            "C",
+            "unexpected_output",
+            Some("package"),
+        );
+    }
+}
+
+/// REQ-30・#362: `package/` の通常ファイル数が `capacity` の `file_count` の合計と違えば
+/// B・C-1 は `unexpected_output`。
+#[test]
+fn req30_file_count_mismatch_fails() {
+    for items in ["B", "C"] {
+        assert_bad_output_fails(
+            items,
+            &[("FAKE_FC_SHIFT", "1")],
+            items,
+            "unexpected_output",
+            Some("package"),
+        );
+    }
+}
+
+/// REQ-33・#362: B の単発 `infer`（`--id` なし）の `id` が既定値 `input` でなければ B は failed。
+#[test]
+fn req33_infer_default_id_must_be_input() {
+    assert_bad_output_fails(
+        "B",
+        &[("FAKE_DEFAULT_ID", "x")],
+        "B",
+        "unexpected_output",
+        Some("infer"),
+    );
+}
+
+/// REQ-28・#362: バッチ出力が入力順でなければ E は failed（`unexpected_output`）。
+#[test]
+fn req28_item_e_batch_order_must_match_input() {
+    assert_bad_output_fails(
+        "B,E",
+        &[("FAKE_E_ORDER", "swap")],
+        "E",
+        "unexpected_output",
+        Some("infer-batch"),
+    );
+}
+
+/// REQ-39・#362: F の `--list` が失敗・0 件なら F は failed（本番の cargo は呼ばない）。
+#[test]
+fn req39_item_f_list_failures_fail_closed() {
+    assert_bad_output_fails("F", &[("FAKE_LIST_RC", "101")], "F", "list_failed", None);
+    assert_bad_output_fails(
+        "F",
+        &[("FAKE_LIST_COUNT", "0")],
+        "F",
+        "no_tests_listed",
+        None,
+    );
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "F"]),
+        &[("FAKE_LIST_COUNT", "0")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert!(e.lines("cargo.count").is_empty());
+}
+
+/// REQ-39・#362: F の各回は `passed` が `--list` の件数（`expected_tests`）と一致し、`ignored` が 0
+/// のときだけ合格。件数違い・ignored 付き・killed・出力上限超過・起動失敗はそれぞれの欄に数える。
+#[test]
+fn req39_item_f_counts_each_failure_kind() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "F", "--repeat", "3"]),
+        &[("FAKE_CARGO_PATTERN", "ok,short,ignored")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.F.status"), "\"failed\"");
+    assert_eq!(e.q("items.F.reason"), "\"test_failures\"");
+    assert_eq!(e.q("items.F.expected_tests"), "12");
+    assert_eq!(e.q("items.F.passed"), "1");
+    assert_eq!(e.q("items.F.failed"), "2");
+    assert_eq!(e.q("items.F.count_mismatch"), "2");
+    assert_eq!(e.q("items.F.no_tests"), "0");
+
+    // `--list` の件数に追随する（固定値の 12 とは比べない）
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "F", "--repeat", "2"]),
+        &[("FAKE_LIST_COUNT", "5"), ("FAKE_CARGO_PATTERN", "short,ok")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.F.expected_tests"), "5");
+    assert_eq!(e.q("items.F.passed"), "1");
+    assert_eq!(e.q("items.F.count_mismatch"), "1");
+
+    for (mode, key) in [
+        ("killed", "killed"),
+        ("overflow", "output_limit"),
+        ("unexec", "spawn_error"),
+    ] {
+        let pattern = if mode == "unexec" {
+            "unexec,ok".to_string()
+        } else {
+            format!("ok,{mode}")
+        };
+        let e = Env::new();
+        let o = e.run(
+            &with_work(&e, &["--items", "F", "--repeat", "2"]),
+            &[("FAKE_CARGO_PATTERN", &pattern)],
+        );
+        assert_eq!(o.code, Some(10), "{mode}: stdout={}", o.stdout);
+        assert_eq!(e.q("items.F.status"), "\"failed\"", "{mode}");
+        assert_eq!(e.q("items.F.passed"), "1", "{mode}");
+        assert_eq!(e.q("items.F.failed"), "1", "{mode}");
+        assert_eq!(e.q(&format!("items.F.{key}")), "1", "{mode}");
+    }
 }
