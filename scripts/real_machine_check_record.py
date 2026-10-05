@@ -858,8 +858,12 @@ def write_atomic(path: Path, text: str) -> None:
         raise
 
 
-def sha256_file(path: Path, cap: int) -> str | None:
-    """ファイルの sha256。サイズ上限超過・読めない場合は None。"""
+def sha256_file(path: Path, cap: int, *, deadline_check: bool = False) -> str | None:
+    """ファイルの sha256。サイズ上限超過・読めない場合は None。
+
+    `deadline_check` が真なら 1 チャンクごとに全体の期限を見て、超過で `OverallTimeout` を送出する
+    （入力採取が期限の外で止まらないようにする。REQ-39）。
+    """
     try:
         # FIFO・ディレクトリ等は open で固まる・落ちるため、通常ファイルだけを読む
         st = path.stat()
@@ -868,6 +872,8 @@ def sha256_file(path: Path, cap: int) -> str | None:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
+                if deadline_check:
+                    check_overall()
                 h.update(chunk)
         return h.hexdigest()
     except OSError:
@@ -2307,8 +2313,11 @@ def collect_inputs(repo: Path) -> dict[str, Any] | None:
         ("definition.json", "definition"),
     ):
         p = src / fname
-        text = read_capped(p, CAP_INPUT_FILE)
-        digest = sha256_file(p, CAP_INPUT_FILE)
+        check_overall()  # 入力採取も全体の期限の内（REQ-39）
+        # 通常ファイルだけを先にハッシュし（FIFO 等は None で止まる）、期限を見ながら読む
+        digest = sha256_file(p, CAP_INPUT_FILE, deadline_check=True)
+        text = _read_regular_capped(p, CAP_INPUT_FILE) if digest is not None else None
+        check_overall()
         if text is None or digest is None:
             return None
         if key != "definition":
@@ -2785,6 +2794,10 @@ def _run(args: argparse.Namespace) -> int:
     if internal_error:
         # 想定外の例外はスクリプト自身の実行不能（70）。record は書いてある
         return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, True)
+    if _child_may_remain and exceeded:
+        # 回収を諦めた子が残りうる場合は、期限超過（10）に隠さず実行不能（70）を返す（REQ-39）。
+        # record は書いてある（`overall_timeout_exceeded` も立っている）
+        return emit("runtime_error", "a child process may remain", EXIT_RUNTIME_ERROR, True)
     if exceeded:
         return emit("judged_fail", "overall time limit exceeded", EXIT_JUDGED_FAIL, True)
     if (rec["environment"] or {}).get("stable") is not True:

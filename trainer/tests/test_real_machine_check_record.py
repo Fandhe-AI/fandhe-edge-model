@@ -4029,3 +4029,25 @@ def test_main_maps_a_stray_overall_timeout_to_runtime_error(
     ]
     assert mod.main(argv) == 70
     assert json.loads(capsys.readouterr().out)["code"] == "runtime_error"
+
+
+def test_child_may_remain_takes_precedence_over_overall_timeout_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39・#364: 期限超過と子の回収失敗が重なったら、10 でなく 70（runtime_error）を返す。"""
+
+    def fake_item(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._child_may_remain = True
+        raise mod.OverallTimeout()
+
+    rc, rec = _run_in_process(tmp_path, "B", fake_item, monkeypatch)
+    assert rc == 70
+    assert rec["child_may_remain"] is True
+    assert rec["overall_timeout_exceeded"] is True
+
+
+def test_collect_inputs_stops_at_the_overall_deadline(tmp_path: Path) -> None:
+    """REQ-39・#364: 入力採取（読み込み・ハッシュ）も全体の期限の内で、期限切れなら送出する。"""
+    mod._overall_deadline = time.monotonic() - 1.0
+    with pytest.raises(mod.OverallTimeout):
+        mod.collect_inputs(Path(__file__).resolve().parents[2])
