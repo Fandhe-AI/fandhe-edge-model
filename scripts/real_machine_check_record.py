@@ -605,8 +605,9 @@ def run_cmd(
                 if proc.poll() is None and not _kill_group(proc.pid):
                     # グループへ送れなかったときは孫が残りうる。回収の成否に関わらず残留の可能性を
                     # 記録し、結果は採用しない（fail-closed。REQ-39）。せめてリーダーだけでも止める
+                    # pgid は残さない: リーダーが回収されると pid が再利用されうるため、回収済みの
+                    # id への再送は無関係なグループを止めうる。未回収のまま残る場合だけ下で保持する
                     _child_may_remain = True
-                    _leftover_pgids.append(proc.pid)
                     reason = REASON_UNREAPED  # timeout 等より優先（次の回を始めさせない）
                     try:
                         proc.kill()
@@ -1939,7 +1940,9 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
     passed = failed = timeouts = no_tests = count_mismatch = 0
     output_limit = killed = spawn_error = incomplete = plain = 0
     unreaped = False
+    started = 0  # 実際に開始した回数（途中で打ち切ると repeat 未満になる）
     for i in range(1, ctx.repeat + 1):
+        started += 1
         log = fdir / f"run-{i:04d}.log"
         r = run_cmd(
             [ctx.cargo_cmd, *test_args],
@@ -1987,7 +1990,7 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
         plain += p
     rec = {
         "status": "ok" if failed == 0 else "failed",
-        "runs": ctx.repeat,
+        "runs": started,
         "expected_tests": expected,
         "passed": passed,
         "failed": failed,

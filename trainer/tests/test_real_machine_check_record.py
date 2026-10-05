@@ -3264,7 +3264,8 @@ def test_run_cmd_does_not_adopt_the_result_when_the_group_kill_fails_but_leader_
     assert (r.exit_code, r.reason) == (None, "unreaped")
     assert mod._child_may_remain is True
     assert mod._active_pgid is None
-    assert len(leftover) == 1
+    # リーダーは回収済み（pid 再利用の恐れ）なので、強制終了での再送用に pgid を残さない
+    assert leftover == []
 
 
 def test_force_exit_retries_kill_on_leftover_groups(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3450,6 +3451,8 @@ def test_item_f_stops_at_unreaped_and_fails_with_reason_unreaped(
         1,
         0,
     )
+    # 開始した回数だけを記録する（repeat=5 のまま偽らない）
+    assert res["runs"] == 1
 
 
 def test_second_signal_after_final_json_does_not_write_a_second_line(
