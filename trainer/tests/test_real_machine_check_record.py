@@ -7,6 +7,7 @@ REQ-39（子プロセスの上限時間・出力サイズ上限）・REQ-27（�
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -545,6 +546,34 @@ def test_main_rejects_invalid_arguments_without_traceback(
     assert mod.main(argv) == 64
     out = json.loads(capsys.readouterr().out)
     assert out["code"] == "invalid_input"
+
+
+def _ns(**over: Any) -> argparse.Namespace:
+    base: dict[str, Any] = {
+        "items": "B",
+        "with_ci": False,
+        "repeat": 1,
+        "p95_limit_us": 1,
+        "package_limit_bytes": 1,
+        "bin_override": False,
+        "bin": None,
+    }
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+@pytest.mark.parametrize(
+    ("over", "want"),
+    [
+        ({"p95_limit_us": 3_600_000_000}, None),
+        ({"p95_limit_us": 3_600_000_001}, "--p95-limit-us must be an integer from 1 to 3600000000"),
+        ({"p95_limit_us": 0}, "--p95-limit-us must be an integer from 1 to 3600000000"),
+        ({"package_limit_bytes": 0}, "--package-limit-bytes must be a positive integer"),
+    ],
+)
+def test_validate_args_limits_boundaries(over: dict[str, Any], want: str | None) -> None:
+    """REQ-21・REQ-31: p95 上限は 1〜3600000000（定義ファイルの上限と対）、package は 1 以上。"""
+    assert mod.validate_args(_ns(**over)) == want
 
 
 def _run(tmp_path: Path, argv: list[str], name: str = "o") -> Any:

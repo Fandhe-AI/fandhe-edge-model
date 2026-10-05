@@ -81,6 +81,8 @@ LINKAGE_ENV_I_TESTS = 3
 # E の件数上限（子プロセスを件数ぶん起動するため）
 MAX_E_RECORDS = 1000
 MAX_REPEAT = 1000
+# --p95-limit-us の上限（µs）。crates/core/src/definition.rs の MAX_LIMIT_INFER_P95_US と対
+MAX_P95_LIMIT_US = 3_600_000_000
 # 浮動小数の許容差（evaluation-contract.md）
 SCORE_TOLERANCE = 1e-9
 
@@ -1726,8 +1728,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "item A requires --with-ci"
     if not 1 <= args.repeat <= MAX_REPEAT:
         return "--repeat must be an integer from 1 to 1000"
-    if args.p95_limit_us < 1 or args.package_limit_bytes < 1:
-        return "limits must be positive integers"
+    if not 1 <= args.p95_limit_us <= MAX_P95_LIMIT_US:
+        return "--p95-limit-us must be an integer from 1 to 3600000000"
+    if args.package_limit_bytes < 1:
+        return "--package-limit-bytes must be a positive integer"
     if args.bin_override and not args.bin:
         return "--bin-override requires --bin"
     return None

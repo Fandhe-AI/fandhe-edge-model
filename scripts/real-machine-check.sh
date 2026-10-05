@@ -19,7 +19,8 @@
 #               --items に A があり --with-ci が無ければ invalid_input(64) で何も実行しない
 #   --repeat:   F の回数（1〜1000。既定 50）
 #   --quiet-machine: 他のアプリを閉じた静かな状態という人の申告。あるときだけ p95 の区分が real_machine
-#   --p95-limit-us / --package-limit-bytes: C-1・C-2 の limits（既定 50000 / 1000）
+#   --p95-limit-us / --package-limit-bytes: C-1・C-2 の limits（既定 50000 / 1000）。
+#               --p95-limit-us は 1〜3600000000（定義ファイル側の上限と同じ）
 #
 # 環境変数:
 #   FANDHE_EDGE_BIN        CLI のバイナリ（`/` を含むパス。相対は呼び出し時のカレント基準で絶対化する）。
@@ -137,11 +138,15 @@ case "$repeat" in
 esac
 case "$p95_limit" in
     [1-9] | [1-9][0-9]* ) ;;
-    *) fail 64 invalid_input "--p95-limit-us must be a positive integer" ;;
+    *) fail 64 invalid_input "--p95-limit-us must be an integer from 1 to 3600000000" ;;
 esac
 case "$p95_limit" in
-    *[!0-9]* | ????????????????*) fail 64 invalid_input "--p95-limit-us must be a positive integer" ;;
+    *[!0-9]* | ????????????????*) fail 64 invalid_input "--p95-limit-us must be an integer from 1 to 3600000000" ;;
 esac
+# 上限は定義ファイルの limits.max_infer_p95_us の上限（crates/core/src/definition.rs の
+# MAX_LIMIT_INFER_P95_US = 3,600,000,000 µs）と対。超過を C-1 の register まで持ち越さず、
+# ここで引数の誤り（64）にする。15 桁以内に絞った後なので算術の桁あふれは起きない
+[ "$p95_limit" -le 3600000000 ] || fail 64 invalid_input "--p95-limit-us must be an integer from 1 to 3600000000"
 case "$pkg_limit" in
     [1-9] | [1-9][0-9]*) ;;
     *) fail 64 invalid_input "--package-limit-bytes must be a positive integer" ;;

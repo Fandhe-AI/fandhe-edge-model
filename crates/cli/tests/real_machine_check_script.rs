@@ -24,6 +24,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use fandhe_edge_core::definition::MAX_LIMIT_INFER_P95_US;
+
 /// 子プロセスの上限時間（資源上限。REQ-39）。
 const TIMEOUT: Duration = Duration::from_secs(120);
 const LEAK_BODY: &str = "SECRET_BODY_7c1";
@@ -1062,6 +1064,40 @@ fn req30_limit_options_reach_the_definition_limits() {
     assert_eq!(e.q("items.C.capacity_limit.limit_bytes"), "4321");
     assert_eq!(e.q("options.p95_limit_us"), "1234");
     assert_eq!(e.q("options.package_limit_bytes"), "4321");
+}
+
+/// REQ-21・REQ-31: `--p95-limit-us` は 1 から `MAX_LIMIT_INFER_P95_US` の整数に限り、範囲外
+/// （上限超過・0・16 桁）は何も起動せず exit 64。上限は core の定数から組み立てるため、
+/// core が上限を変えるとスクリプト側のリテラルとの食い違いでこのテストが落ちる。
+#[test]
+fn req31_p95_limit_out_of_range_is_rejected_before_start() {
+    let message = format!("--p95-limit-us must be an integer from 1 to {MAX_LIMIT_INFER_P95_US}");
+    let over = (MAX_LIMIT_INFER_P95_US + 1).to_string();
+    for bad in [over.as_str(), "0", "1234567890123456"] {
+        let e = Env::new();
+        assert_rejected_before_start(
+            &e,
+            &with_work(&e, &["--items", "C", "--p95-limit-us", bad]),
+            &[],
+            &message,
+        );
+    }
+}
+
+/// REQ-31: `--p95-limit-us` の上限ちょうど（`MAX_LIMIT_INFER_P95_US`）は引数の検証を通り、
+/// 項目 C の記録へその値が入る（core の定数との対応。範囲外側は上のテスト）。
+#[test]
+fn req31_p95_limit_at_max_is_accepted() {
+    let max = MAX_LIMIT_INFER_P95_US.to_string();
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C", "--p95-limit-us", &max]),
+        &[],
+    );
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.status"), "\"ok\"");
+    assert_eq!(e.q("items.C.p95.limit_us"), max);
+    assert_eq!(e.q("options.p95_limit_us"), max);
 }
 
 /// REQ-33: `FANDHE_EDGE_BIN` を設定しない経路では、偽 cargo の `compiler-artifact` の
