@@ -180,7 +180,20 @@ CAP_RC_FILE = 16
 
 
 class Interrupted(BaseException):  # Exception で捕まえられないよう BaseException にする
-    """SIGINT・SIGTERM・SIGHUP を受けた（最上位でだけ捕まえる）。"""
+    """SIGINT・SIGTERM・SIGHUP を受けた（`check_interrupt` の位置でだけ同期的に送出する）。"""
+
+
+# 中断シグナルを受けた印。ハンドラ（`_on_signal`）が立て、`run()` の冒頭で下ろす（REQ-21・REQ-39）
+_interrupt_requested = False
+
+
+def check_interrupt() -> None:
+    """印が立っていれば `Interrupted` を送出する。呼ぶ位置は決まった安全な境目だけ。
+
+    `run_cmd` の入口・後始末の後と、`run()` の項目の開始前から呼ぶ（REQ-21・REQ-39）。
+    """
+    if _interrupt_requested:
+        raise Interrupted
 
 
 # --------------------------------------------------------------------------------------
@@ -425,9 +438,14 @@ def run_cmd(
     """子プロセスを独立したプロセスグループで起動し、期限と出力サイズを監視する（REQ-39）。
 
     stdin は /dev/null、stdout・stderr はファイルへ書く（呼び出し側が読む前に `out_bytes` を
-    上限と照らす）。超過・期限切れ・例外・中断（`Interrupted`）のいずれでも、リーダーが未回収の
+    上限と照らす）。超過・期限切れ・例外・中断（印）のいずれでも、リーダーが未回収の
     うちにグループごと KILL してから回収する。`shell=True` は使わない。
+
+    中断はシグナルハンドラから例外を投げず、ハンドラが立てた印をこの関数が待機の周ごとに見る。
+    例外が `Popen` の内部へ割り込むと、`_waitpid_lock` が解放されず `proc.wait()` が終わらなく
+    なる・`Popen` の生成の途中なら子が回収されずに残るため。後始末の後で `Interrupted` を投げる。
     """
+    check_interrupt()  # 印があれば子を起動しない
     exe = _resolve_exe(argv[0])
     if exe is None:
         return RunResult(None, "spawn_error", 0, 0)
@@ -435,6 +453,7 @@ def run_cmd(
     rc_path.unlink(missing_ok=True)
     full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
     reason = None
+    spawn_failed = False
     try:
         with open(out_path, "wb") as fo, open(err_path, "wb") as fe:
             proc = subprocess.Popen(  # noqa: S603  引数リストで起動する。argv は固定語彙と検証済みの値のみ
@@ -449,6 +468,8 @@ def run_cmd(
             try:
                 deadline = time.monotonic() + timeout
                 while proc.poll() is None:
+                    if _interrupt_requested:
+                        break  # 例外にせず、下の後始末で止める（reason は None のまま）
                     if time.monotonic() >= deadline:
                         reason = "timeout"
                         break
@@ -462,6 +483,11 @@ def run_cmd(
                     _kill_group(proc.pid)
                 proc.wait()
     except (OSError, ValueError):
+        spawn_failed = True
+    # 後始末（グループの KILL と回収）が済んだ後でだけ中断を送出する。子が自然に終わった周に
+    # 印が立っていた場合も結果は捨てる
+    check_interrupt()
+    if spawn_failed:
         return RunResult(None, "spawn_error", 0, 0)
     ob, eb = _size(out_path), _size(err_path)
     if reason is None and (ob > out_cap or eb > err_cap):
@@ -1780,9 +1806,13 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "（このスクリプトがビルドした CLI ではない）"
         )
     lines += ["", "## 環境", "", "| 項目 | 値 |", "| ---- | -- |"]
-    for k, v in env.items():
+    if env is None:
+        lines.append("| (not collected) | 項目の開始前に中断されたため未採取 |")
+    for k, v in (env or {}).items():
         lines.append(f"| {_cell(k)} | {_cell(v)} |")
     lines += ["", "## 入力と指定", "", "| 項目 | 値 |", "| ---- | -- |"]
+    if rec.get("inputs") is None:
+        lines.append("| (not collected) | 項目の開始前に中断されたため未採取 |")
     for k, v in (rec.get("inputs") or {}).items():
         lines.append(f"| {_cell(k)} | {_cell(v)} |")
     for k, v in rec["options"].items():
@@ -1849,10 +1879,9 @@ def emit(code: str, message: str, exit_code: int, with_record: bool) -> int:
 
 
 def _on_signal(signum: int, frame: Any) -> None:
-    """中断シグナルのハンドラ。以降のシグナルを無視して後始末を終え `Interrupted` を送出する。"""
-    for s in INTERRUPT_SIGNALS:
-        signal.signal(s, signal.SIG_IGN)
-    raise Interrupted
+    """中断シグナルのハンドラ。印を立てて戻るだけ（例外を投げない。理由は `run_cmd`）。"""
+    global _interrupt_requested
+    _interrupt_requested = True
 
 
 def build_cli(ctx: Ctx) -> Path | None:
@@ -1927,7 +1956,13 @@ def run_item(ctx: Ctx, name: str, b_ok: bool) -> tuple[dict[str, Any], bool]:
 
 
 def run(args: argparse.Namespace) -> int:
-    """項目を A→F の順に実行し、record.json・record.md を書く。"""
+    """項目を A→F の順に実行し、record.json・record.md を書く。
+
+    記録の骨格は入力の採取より前に作る。前半（採取・ビルド）で中断されても、選んだ項目を
+    すべて `not_run`（`interrupted`）にした記録を書く（REQ-21・REQ-39）。
+    """
+    global _interrupt_requested
+    _interrupt_requested = False  # 前の回の印を引き継がない
     os.umask(0o077)
     for s in INTERRUPT_SIGNALS:
         signal.signal(s, _on_signal)
@@ -1950,27 +1985,13 @@ def run(args: argparse.Namespace) -> int:
         harness=harness,
         offline_env=make_offline_env(),
     )
-    inputs = collect_inputs(ctx.repo)
-    if inputs is None:
-        return emit("runtime_error", "cannot read fixture inputs", EXIT_RUNTIME_ERROR, False)
-    cli_profile: str | None = None
-    if not args.bin_override:
-        built = build_cli(ctx)
-        if built is None:
-            return emit("runtime_error", "cannot build the CLI", EXIT_RUNTIME_ERROR, False)
-        ctx.bin = built
-        cli_profile = "release"
-    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    env = collect_environment(ctx, cli_profile)
-    env["started_local"] = started
-    ctx.cli_sha256 = env["cli_sha256"]
     ctx.bin_override = bool(args.bin_override)
     rec: dict[str, Any] = {
         "schema": SCHEMA,
         "evidence_hint": "test_harness" if harness else "requires_human_review",
         "bin_override": bool(args.bin_override),
-        "environment": env,
-        "inputs": inputs,
+        "environment": None,
+        "inputs": None,
         "options": {
             "items": items,
             "repeat": ctx.repeat,
@@ -1986,7 +2007,28 @@ def run(args: argparse.Namespace) -> int:
     interrupted = False
     internal_error = False
     b_ok = False
+    try:
+        inputs = collect_inputs(ctx.repo)
+        if inputs is None:
+            return emit("runtime_error", "cannot read fixture inputs", EXIT_RUNTIME_ERROR, False)
+        rec["inputs"] = inputs
+        cli_profile: str | None = None
+        if not args.bin_override:
+            built = build_cli(ctx)
+            if built is None:
+                return emit("runtime_error", "cannot build the CLI", EXIT_RUNTIME_ERROR, False)
+            ctx.bin = built
+            cli_profile = "release"
+        started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        env = collect_environment(ctx, cli_profile)
+        env["started_local"] = started
+        ctx.cli_sha256 = env["cli_sha256"]
+        rec["environment"] = env
+    except Interrupted:
+        interrupted = True  # 前半の中断。以降の項目はすべて not_run（interrupted）
     for name in ITEM_ORDER:
+        if name in items and _interrupt_requested:
+            interrupted = True  # 項目の開始前に印を見る
         if name not in items:
             rec["items"][name] = {"status": "not_run", "reason": "not_selected"}
         elif interrupted or stopped:
@@ -2007,10 +2049,11 @@ def run(args: argparse.Namespace) -> int:
             rec["items"][name] = res
             if res["status"] != "ok":
                 stopped = True
-    # 記録の書き出し中は中断シグナルを無視して、record を必ず完成させる
-    for s in INTERRUPT_SIGNALS:
-        signal.signal(s, signal.SIG_IGN)
-    env["ended_local"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # 記録を書く直前に印を 1 回だけ読む。書き出し中に届いた中断は結果を変えない（印を立てるだけ）
+    if _interrupt_requested:
+        interrupted = True
+    if rec["environment"] is not None:
+        rec["environment"]["ended_local"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     rec = sanitize_record(rec)
     # schema は固定定数（`/` を含む）なので伏せ処理の対象外にして戻す
     rec["schema"] = SCHEMA

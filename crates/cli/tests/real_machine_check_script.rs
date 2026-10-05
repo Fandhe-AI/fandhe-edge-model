@@ -226,10 +226,18 @@ esac
 /// 偽の cargo。`build`（`--message-format=json`）は `FAKE_CLI_PATH` を `compiler-artifact` で報告する。
 /// `test ... --no-run` は回数に数えない。それ以外の `test` は `FAKE_CARGO_PATTERN`
 /// （カンマ区切り。`ok`・`inc`・`plain`・`zero`）の n 番目で n 回目の結果を決める。
+/// `FAKE_CARGO_BUILD_SLEEP`（`build` で長く待つ。ビルド中の中断のテスト用）。
 const FAKE_CARGO: &str = r##"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DIR/cargo.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cargo.env"
 if [ "$1" = build ]; then
+  if [ -n "${FAKE_CARGO_BUILD_SLEEP:-}" ]; then
+    echo $$ > "$FAKE_DIR/cargo.pid"
+    sleep 60 &
+    echo $! > "$FAKE_DIR/cargo.cpid"
+    : > "$FAKE_DIR/cargo.started"
+    wait
+  fi
   printf '{"reason":"compiler-artifact","target":{"name":"fandhe-edge","kind":["bin"]},"executable":"%s"}\n' "$FAKE_CLI_PATH"
   exit 0
 fi
@@ -1264,6 +1272,89 @@ fn req21_sigterm_stops_children_and_records_interrupted() {
     assert!(e.lines("cargo.args").is_empty());
     // 偽 make と、その子の sleep が残っていない（kill -0 が失敗するまで短く待つ）
     for name in ["make.pid", "make.cpid"] {
+        let pid = e.lines(name).first().cloned().expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill -0")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{name} ({pid}) still alive");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// REQ-21: CLI のビルド中（項目の開始前）に SIGTERM を受けても、記録の骨格から `record.json`・`record.md` を書き、
+/// exit 70 と `record` 付きの固定メッセージを返す。選んだ項目は `interrupted`、他は `not_selected`。
+/// 環境の採取は未了のため `environment` は null。偽 cargo と子の sleep は残らない。
+#[test]
+fn req21_sigterm_during_cli_build_still_writes_record() {
+    let e = Env::new();
+    let mut child = e
+        .command(
+            &with_work(&e, &["--items", "D,F"]),
+            &[("FANDHE_EDGE_BIN", ""), ("FAKE_CARGO_BUILD_SLEEP", "1")],
+            None,
+        )
+        .spawn()
+        .expect("spawn");
+    let started = e.dir.join("cargo.started");
+    let start = Instant::now();
+    while !started.exists() {
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "script exited early"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "cargo build not started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill");
+    // 期限はシグナルを送った時点から測る（止め損ねて子の自然終了を待った場合と区別する）
+    let sent = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
+        assert!(
+            sent.elapsed() < Duration::from_secs(30),
+            "script did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read");
+    assert_eq!(status.code(), Some(70), "stdout={out}");
+    assert_eq!(
+        out,
+        "{\"code\":\"runtime_error\",\"message\":\"interrupted\",\"record\":\"record.json\"}\n"
+    );
+    for item in ["D", "F"] {
+        assert_eq!(e.q(&format!("items.{item}.status")), "\"not_run\"");
+        assert_eq!(e.q(&format!("items.{item}.reason")), "\"interrupted\"");
+    }
+    assert_eq!(e.q("items.A.status"), "\"not_run\"");
+    assert_eq!(e.q("items.A.reason"), "\"not_selected\"");
+    assert_eq!(e.q("environment"), "null");
+    assert_eq!(e.q("inputs.train_records"), "90");
+    assert!(e.work.join("record.md").exists(), "record.md missing");
+    for name in ["cargo.pid", "cargo.cpid"] {
         let pid = e.lines(name).first().cloned().expect("pid");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

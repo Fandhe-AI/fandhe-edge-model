@@ -503,6 +503,264 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path) -> None:
     assert rec["options"]["with_ci"] is False
 
 
+@pytest.fixture(autouse=True)
+def _reset_interrupt_mark() -> Any:
+    """モジュールの中断の印を、各テストの前後で下ろす（テスト間で引き継がない）。"""
+    mod._interrupt_requested = False
+    yield
+    mod._interrupt_requested = False
+
+
+def _wait_for(pred: Any, seconds: float = 30.0) -> bool:
+    """期限つきのポーリング。固定の sleep に頼らず、条件が成り立つまで待つ。"""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return bool(pred())
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _pids(path: Path) -> list[int]:
+    return [int(x) for x in path.read_text().split()] if path.exists() else []
+
+
+def test_on_signal_only_sets_the_mark_and_run_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21・REQ-39: ハンドラは例外を投げず印を立てるだけ。`run()` の冒頭で印が下りる。"""
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    mod._on_signal(signal.SIGTERM, None)
+    assert mod._interrupt_requested is True
+    assert {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS} == saved
+    with pytest.raises(mod.Interrupted):
+        mod.check_interrupt()
+    seen: list[bool] = []
+
+    def spy(repo: Path) -> None:
+        seen.append(mod._interrupt_requested)
+
+    monkeypatch.setattr(mod, "collect_inputs", spy)
+    (tmp_path / "w").mkdir()
+    args = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin="x",
+        bin_override=True,
+        items="B",
+        repeat=1,
+        p95_limit_us=1,
+        package_limit_bytes=1,
+        quiet_machine=False,
+        with_ci=False,
+    )
+    try:
+        rc = mod.run(args)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    assert (rc, seen) == (70, [False])
+    assert json.loads(capsys.readouterr().out)["message"] == "cannot read fixture inputs"
+
+
+def test_run_cmd_does_not_start_the_child_when_the_mark_is_set(tmp_path: Path) -> None:
+    """REQ-39: 印が立っていれば子を起動せずに `Interrupted`（子が書くはずの印ファイルが無い）。"""
+    marker = tmp_path / "started"
+    mod._interrupt_requested = True
+    with pytest.raises(mod.Interrupted):
+        _run(tmp_path, ["/bin/sh", "-c", f'echo x > "{marker}"'])
+    assert not marker.exists()
+
+
+def test_run_cmd_raises_interrupted_after_stopping_child_and_grandchild(tmp_path: Path) -> None:
+    """REQ-39: 子の実行中に印が立つと、子と孫を止めて回収してから `Interrupted` を送出する。
+
+    印から送出までの時間（5 秒未満）も確かめる。
+    """
+    import threading
+
+    pidfile = tmp_path / "pids"
+    script = f'echo $$ >> "{pidfile}"; sleep 60 & echo $! >> "{pidfile}"; wait'
+
+    tripped_at: list[float] = []
+
+    def trip() -> None:
+        _wait_for(lambda: len(_pids(pidfile)) >= 2)
+        tripped_at.append(time.monotonic())
+        mod._on_signal(signal.SIGTERM, None)
+
+    t = threading.Thread(target=trip)
+    t.start()
+    try:
+        with pytest.raises(mod.Interrupted):
+            _run(tmp_path, ["/bin/sh", "-c", script])
+        raised_at = time.monotonic()
+    finally:
+        t.join(timeout=30)
+    pids = _pids(pidfile)
+    assert len(pids) == 2
+    # 待機ループが印を見て抜けること。_run の期限（20 秒）や子の sleep 60 に頼った停止と区別する
+    assert len(tripped_at) == 1
+    assert raised_at - tripped_at[0] < 5.0
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def _run_script(args_extra: list[str], work: Path, env: dict[str, str]) -> Any:
+    return subprocess.Popen(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+        [
+            sys.executable,
+            str(SCRIPT),
+            "run",
+            "--repo-root",
+            str(REPO),
+            "--work-dir",
+            str(work),
+            "--repeat",
+            "1",
+            "--p95-limit-us",
+            "50000",
+            "--package-limit-bytes",
+            "1000",
+            *args_extra,
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def test_interrupt_during_cli_build_writes_a_skeleton_record(tmp_path: Path) -> None:
+    """REQ-21・REQ-39: CLI のビルド中の SIGTERM でも record を書き、項目は not_run/interrupted。"""
+    pidfile = tmp_path / "pids"
+    cargo = _script(
+        tmp_path,
+        "fake-cargo",
+        f'echo $$ >> "{pidfile}"\nsleep 60 &\necho $! >> "{pidfile}"\nwait\n',
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    env = dict(os.environ, FANDHE_EDGE_CARGO_CMD=str(cargo))
+    proc = _run_script(["--items", "B,C"], work, env)
+    try:
+        assert _wait_for(lambda: len(_pids(pidfile)) >= 2)
+        pids = _pids(pidfile)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 70
+    assert json.loads(out) == {
+        "code": "runtime_error",
+        "message": "interrupted",
+        "record": "record.json",
+    }
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+    rec = json.loads((work / "record.json").read_text())
+    assert rec["environment"] is None
+    assert rec["inputs"]["train_records"] > 0
+    assert rec["schema"] == "real-machine-check/1"
+    interrupted = {"status": "not_run", "reason": "interrupted"}
+    unselected = {"status": "not_run", "reason": "not_selected"}
+    assert rec["items"] == {
+        "A": unselected,
+        "B": interrupted,
+        "C": interrupted,
+        "D": unselected,
+        "E": unselected,
+        "F": unselected,
+    }
+    assert "(not collected)" in (work / "record.md").read_text()
+
+
+def _run_in_process(tmp_path: Path, items: str, fake_item: Any, monkeypatch: Any) -> Any:
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    monkeypatch.setattr(mod, "run_item", fake_item)
+    (tmp_path / "w").mkdir()
+    args = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin=str(_fake_cli(tmp_path, "exit 0\n")),
+        bin_override=True,
+        items=items,
+        repeat=1,
+        p95_limit_us=1,
+        package_limit_bytes=1,
+        quiet_machine=False,
+        with_ci=False,
+    )
+    try:
+        rc = mod.run(args)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    return rc, json.loads((tmp_path / "w" / "record.json").read_text())
+
+
+def test_mark_after_an_item_stops_the_next_item_and_keeps_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21: 項目の合間に印が立てば、次の項目は not_run/interrupted。終えた項目は残す。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._on_signal(signal.SIGTERM, None)
+        return {"status": "ok"}, True
+
+    rc, rec = _run_in_process(tmp_path, "B,C", fake, monkeypatch)
+    assert rc == 70
+    assert json.loads(capsys.readouterr().out)["message"] == "interrupted"
+    assert rec["items"]["B"] == {"status": "ok"}
+    assert rec["items"]["C"] == {"status": "not_run", "reason": "interrupted"}
+
+
+def test_mark_after_all_items_still_makes_the_result_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21: 全項目の完了後・記録の書き出し前に印が立てば、結果は中断（exit 70）。項目は残す。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._on_signal(signal.SIGTERM, None)
+        return {"status": "ok"}, True
+
+    rc, rec = _run_in_process(tmp_path, "B", fake, monkeypatch)
+    assert rc == 70
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "runtime_error",
+        "message": "interrupted",
+        "record": "record.json",
+    }
+    assert rec["items"]["B"] == {"status": "ok"}
+
+
+def test_sanitize_and_markdown_accept_null_environment_and_inputs() -> None:
+    """REQ-21: 未採取（null）の environment・inputs の記録でも落ちず、未採取と分かる文言を出す。"""
+    items = {n: {"status": "not_run", "reason": "interrupted"} for n in mod.ITEM_ORDER}
+    rec = {
+        "schema": mod.SCHEMA,
+        "evidence_hint": "requires_human_review",
+        "bin_override": False,
+        "environment": None,
+        "inputs": None,
+        "options": {"items": ["B"], "repeat": 1},
+        "items": items,
+    }
+    out = mod.sanitize_record(rec)
+    assert out["environment"] is None
+    assert out["inputs"] is None
+    assert out["items"]["B"] == {"status": "not_run", "reason": "interrupted"}
+    assert mod.render_markdown(out).count("(not collected)") == 2
+
+
 @pytest.mark.parametrize(
     "extra",
     [
