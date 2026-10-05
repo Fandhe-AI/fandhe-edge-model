@@ -44,7 +44,7 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
 | `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
-| `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒） | 50000 |
+| `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒）。1 以上 3600000000 以下の整数（上限は定義ファイルの `limits.max_infer_p95_us` の上限と同じ。REQ-31）。範囲外は CLI・make・cargo を起動する前に引数エラー（exit 64） | 50000 |
 | `--package-limit-bytes N` | C-2 の容量上限（バイト） | 1000 |
 | `--help` | 使い方を表示して exit 0。JSON は出力されない（`{"code":"ok","message":"usage: ..."}` 形式） | — |
 

@@ -95,7 +95,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 #### Mac 実機での動作確認（項目 A〜F。REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-39・#354）
 
 - 実行コマンド: `make real-machine-check ARGS="--work-dir <dir> ..."` または `<repo>/scripts/real-machine-check.sh --work-dir <dir> ...`（後者は空白を含む値を渡せるため推奨）
-- 引数（シェル側が `--key VALUE` / `--key=VALUE` 両方を受け付け、重複は拒否）: `--work-dir`（必須、リポジトリ外に物理パス正規化。symlink・リポジトリの祖先配下も拒否）・`--items A,B,C,D,E,F`（既定は `B,C,D,E,F`。カンマ区切り・大文字・重複不可）・`--with-ci`（A 実行時は必須。通信を伴う）・`--repeat N`（F の実行回数・1〜1000・既定 50）・`--quiet-machine`・`--p95-limit-us N`（既定 50000 µs）・`--package-limit-bytes N`（既定 1000）・`--help`
+- 引数（シェル側が `--key VALUE` / `--key=VALUE` 両方を受け付け、重複は拒否）: `--work-dir`（必須、リポジトリ外に物理パス正規化。symlink・リポジトリの祖先配下も拒否）・`--items A,B,C,D,E,F`（既定は `B,C,D,E,F`。カンマ区切り・大文字・重複不可）・`--with-ci`（A 実行時は必須。通信を伴う）・`--repeat N`（F の実行回数・1〜1000・既定 50）・`--quiet-machine`・`--p95-limit-us N`（1〜3600000000 µs・既定 50000 µs）・`--package-limit-bytes N`（既定 1000）・`--help`
 - 必要環境: Mac（Apple Silicon）・Python 3.9 以上・`make py-sync` 済みの `trainer/.venv`・MLX CPU・`cargo fetch --locked` 済みの依存（通信を伴うため承認を得てから実行する。`make setup` は cargo の依存を取得しない。REQ-38）
 - 環境変数: `FANDHE_EDGE_BIN`（`/` を含む相対・絶対パス。未設定なら `cargo build --locked` で 1800 秒・ビルド失敗は exit 70。差し替えると D は失敗する〔D が確認する cargo がビルドした CLI と一致しないため。代役の下では照合しない〕）・`FANDHE_EDGE_MAKE_CMD` / `FANDHE_EDGE_CARGO_CMD`（**絶対パスの実行ファイル**。テスト用。どちらか設定時は `evidence_hint:"test_harness"` に変わり、`otool` は実行されず `direct_libraries:null`）
 - 通信抑止（REQ-38）: A 以外の子プロセスに `CARGO_NET_OFFLINE=true` を渡す。`cargo build --locked` / `cargo test --locked` でビルド・テスト。未構築依存の場合は失敗
