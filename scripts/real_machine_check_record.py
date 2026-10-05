@@ -177,7 +177,11 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # rc の書き込み直前の `set -C`（noclobber）は、子の実行中に rc のパスへ置かれた
 # symlink・既存ファイルをシェルが辿って書かないため（書けなければ rc が無く、
 # 呼び出し側は `killed` にする。fail-closed。#359）
-GROUP_WRAPPER = 'RC=$1; shift; "$@"; rc=$?; set -C; printf "%s" "$rc" > "$RC"; kill -s KILL 0'
+# 書けなかったとき（子が置いた通常ファイル・symlink が残っている）は `rm -f` でそれを消し、
+# 偽の終了コードを呼び出し側へ読ませない（rc が無ければ `killed`。fail-closed。#359）
+GROUP_WRAPPER = (
+    'RC=$1; shift; "$@"; rc=$?; set -C; printf "%s" "$rc" > "$RC" || rm -f "$RC"; kill -s KILL 0'
+)
 # rc ファイルの上限（3 桁の整数だけが入る）
 CAP_RC_FILE = 16
 

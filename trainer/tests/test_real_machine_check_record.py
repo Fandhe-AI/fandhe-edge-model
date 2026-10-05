@@ -2601,6 +2601,16 @@ def test_run_cmd_child_swapping_rc_for_symlink_is_killed_not_ok(tmp_path: Path) 
     assert target.read_text(encoding="utf-8") == "keep"
 
 
+def test_run_cmd_child_forging_rc_file_with_zero_is_killed_not_ok(tmp_path: Path) -> None:
+    """REQ-39: 子が rc に偽の終了コード 0 を置いて失敗しても、成功扱いにせず killed。"""
+    script = f"printf 0 > {tmp_path}/o.rc; exit 3"
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", script], tmp_path, tmp_path / "o", tmp_path / "e", 5, 100, 4096
+    )
+    assert (r.exit_code, r.reason) == (None, "killed")
+    assert not (tmp_path / "o.rc").exists()
+
+
 def test_run_cmd_child_making_rc_fifo_does_not_block(tmp_path: Path) -> None:
     """REQ-39: 子が rc を FIFO にしても成功扱いにせず、期限内に止まる（timeout）。"""
     script = f"mkfifo {tmp_path}/o.rc"
