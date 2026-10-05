@@ -11,7 +11,7 @@
 #
 # 使い方:
 #   real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci]
-#                         [--p95-limit-us N] [--package-limit-bytes N]
+#                         [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]
 #   値を取るオプションは `--key VALUE` と `--key=VALUE` の両方を受け付ける。
 #   --work-dir: 必須。存在しないか空のディレクトリで、リポジトリ配下でないこと（物理パスで比較）
 #   --items:    A,B,C,D,E,F の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F。実行順は常に A→F。
@@ -21,7 +21,11 @@
 #   --repeat:   F の回数（1〜1000。既定 50）
 #   --quiet-machine: 他のアプリを閉じた静かな状態という人の申告。あるときだけ p95 の区分が real_machine
 #   --p95-limit-us / --package-limit-bytes: C-1・C-2 の limits（既定 50000 / 1000）。
-#               --p95-limit-us は 1〜3600000000（定義ファイル側の上限と同じ）
+#               --p95-limit-us は 1〜3600000000（定義ファイル側の上限と同じ）、
+#               --package-limit-bytes は 1〜999999999999999（15 桁まで）
+#   --overall-timeout-sec: 実行全体の上限時間（秒。1〜86400。既定 14400）。契約に定めのない値（自分で決めた暫定値。
+#               REQ-39）。超えたら子のグループを止め、実行中の項目は failed、残りは not_run（reason は
+#               overall_timeout）で record を書いて exit 10。F の --repeat を大きくするときは併せて上げる
 #
 # 環境変数:
 #   FANDHE_EDGE_BIN        CLI のバイナリ（`/` を含むパス。相対は呼び出し時のカレント基準で絶対化する）。
@@ -41,10 +45,14 @@
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない
 #   - 子プロセスには上限時間と出力サイズ上限を設ける（REQ-39。値は real_machine_check_record.py の定数）。
 #     A 以外の子プロセスには CARGO_NET_OFFLINE=true を渡し、cargo は --locked で起動する（REQ-38）。
+#     全体の上限時間（--overall-timeout-sec）も同様に設ける。上限超過は stdout が固定 JSON
+#     `overall time limit exceeded`・exit 10（終了時の再採取と記録の書き出しは上限の外で行う）。
+#     環境採取（git・sysctl・sw_vers・otool）は固定の絶対パスと最小の環境で起動し、PATH・GIT_* を引き継がない（REQ-38・REQ-39）。
 #     SIGINT・SIGTERM・SIGHUP を受けたら子のグループを止め、その時点までの record を書いて exit 70。
 #     後始末が終わらないときのため、シグナルを 2 回受けたら子のグループへ KILL を送って即座に
 #     exit 70 する（record なし。stdout は固定 JSON `interrupted (forced exit)`。REQ-39）
-set -eu
+# -f: パス名展開を止める（`--items '*'` がカレントのファイル名に化けて検証を通るのを防ぐ）
+set -euf
 
 # 固定メッセージの JSON を 1 行出して終了する。$1=終了コード $2=code 名 $3=固定メッセージ
 fail() {
@@ -60,6 +68,7 @@ quiet=0
 with_ci=0
 p95_limit=50000
 pkg_limit=1000
+overall_timeout=14400
 seen=
 while [ $# -gt 0 ]; do
     key=$1
@@ -74,7 +83,7 @@ while [ $# -gt 0 ]; do
     esac
     case "$key" in
         --help)
-            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N]"
+            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]"
             ;;
         --quiet-machine | --with-ci)
             [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
@@ -84,7 +93,7 @@ while [ $# -gt 0 ]; do
             shift
             continue
             ;;
-        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes) ;;
+        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes | --overall-timeout-sec) ;;
         *) fail 64 invalid_input "unknown option" ;;
     esac
     if [ "$has_val" -eq 0 ]; then
@@ -102,13 +111,16 @@ while [ $# -gt 0 ]; do
         --repeat) repeat=$val ;;
         --p95-limit-us) p95_limit=$val ;;
         --package-limit-bytes) pkg_limit=$val ;;
+        --overall-timeout-sec) overall_timeout=$val ;;
     esac
 done
 
 [ -n "$work_dir" ] || fail 64 invalid_input "--work-dir is required"
 
-# --items: A〜F の部分集合（大文字・重複なし・空要素なし）
+# --items: A〜F の部分集合（大文字・重複なし・空要素なし）。分割の前に文字種を絞る（二重の守り。
+# 範囲指定 A-F は照合順序に左右されるため使わない）
 case "$items" in
+    *[!ABCDEF,]*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F" ;;
     '' | ,* | *, | *,,*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F" ;;
 esac
 item_seen=
@@ -170,6 +182,15 @@ case "$pkg_limit" in
     *[!0-9]* | ????????????????*) fail 64 invalid_input "--package-limit-bytes must be a positive integer" ;;
 esac
 
+case "$overall_timeout" in
+    [1-9] | [1-9][0-9]*) ;;
+    *) fail 64 invalid_input "--overall-timeout-sec must be an integer from 1 to 86400" ;;
+esac
+case "$overall_timeout" in
+    *[!0-9]* | ??????*) fail 64 invalid_input "--overall-timeout-sec must be an integer from 1 to 86400" ;;
+esac
+[ "$overall_timeout" -le 86400 ] || fail 64 invalid_input "--overall-timeout-sec must be an integer from 1 to 86400"
+
 # パスを物理パスへ正規化する（未作成の末尾は字句的に連結。macOS に realpath -m が無いため）。
 # 未作成部分に `..` を含む・祖先がディレクトリでない場合は 1 を返す。結果は canon_out へ入れる
 canon_out=
@@ -192,6 +213,16 @@ canon_path() {
     canon_out="${_phys%/}$_rest"
 }
 
+# 末尾の `/` と `/.` を取り除いてから symlink を判定する（`link/` や `link/.` は `[ -L ]` が偽になり
+# 拒否を通り抜けるため。`/` 単独は残す）
+while :; do
+    case "$work_dir" in
+        */.) work_dir=${work_dir%/.} ;;
+        ?*/) work_dir=${work_dir%/} ;;
+        *) break ;;
+    esac
+    [ -n "$work_dir" ] || work_dir=/
+done
 if [ -e "$work_dir" ] || [ -L "$work_dir" ]; then
     if [ ! -d "$work_dir" ] || [ -L "$work_dir" ]; then
         fail 64 invalid_input "work directory is not a directory"
@@ -262,7 +293,8 @@ set -- run \
     --items "$items" \
     --repeat "$repeat" \
     --p95-limit-us "$p95_limit" \
-    --package-limit-bytes "$pkg_limit"
+    --package-limit-bytes "$pkg_limit" \
+    --overall-timeout-sec "$overall_timeout"
 [ -z "${bin:-}" ] || set -- "$@" --bin "$bin" --bin-override
 [ "$quiet" -eq 0 ] || set -- "$@" --quiet-machine
 [ "$with_ci" -eq 0 ] || set -- "$@" --with-ci

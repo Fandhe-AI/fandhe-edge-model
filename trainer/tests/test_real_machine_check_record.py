@@ -483,6 +483,8 @@ def test_interrupt_stops_children_and_writes_record(tmp_path: Path, sig: int) ->
             "50000",
             "--package-limit-bytes",
             "1000",
+            "--overall-timeout-sec",
+            "14400",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -521,11 +523,13 @@ def _reset_interrupt_mark() -> Any:
     mod._signal_count = 0
     mod._active_pgid = None
     mod._child_may_remain = False
+    mod.clear_overall()
     yield
     mod._interrupt_requested = False
     mod._signal_count = 0
     mod._active_pgid = None
     mod._child_may_remain = False
+    mod.clear_overall()
 
 
 def _wait_for(pred: Any, seconds: float = 30.0) -> bool:
@@ -646,6 +650,7 @@ def _run_script(args_extra: list[str], work: Path, env: dict[str, str]) -> Any:
             "50000",
             "--package-limit-bytes",
             "1000",
+            *([] if "--overall-timeout-sec" in args_extra else ["--overall-timeout-sec", "14400"]),
             *args_extra,
         ],
         env=env,
@@ -799,6 +804,7 @@ def test_main_rejects_invalid_arguments_without_traceback(
         "--repeat": "1",
         "--p95-limit-us": "1",
         "--package-limit-bytes": "1",
+        "--overall-timeout-sec": "14400",
         "--repo-root": str(REPO),
         "--work-dir": str(tmp_path),
     }
@@ -817,6 +823,7 @@ def _ns(**over: Any) -> argparse.Namespace:
         "repeat": 1,
         "p95_limit_us": 1,
         "package_limit_bytes": 1,
+        "overall_timeout_sec": 14400,
         "bin_override": False,
         "bin": None,
     }
@@ -831,6 +838,18 @@ def _ns(**over: Any) -> argparse.Namespace:
         ({"p95_limit_us": 3_600_000_001}, "--p95-limit-us must be an integer from 1 to 3600000000"),
         ({"p95_limit_us": 0}, "--p95-limit-us must be an integer from 1 to 3600000000"),
         ({"package_limit_bytes": 0}, "--package-limit-bytes must be a positive integer"),
+        ({"package_limit_bytes": 999_999_999_999_999}, None),
+        (
+            {"package_limit_bytes": 10**15},
+            "--package-limit-bytes must be a positive integer",
+        ),
+        ({"overall_timeout_sec": 1}, None),
+        ({"overall_timeout_sec": 86400}, None),
+        ({"overall_timeout_sec": 0}, "--overall-timeout-sec must be an integer from 1 to 86400"),
+        (
+            {"overall_timeout_sec": 86401},
+            "--overall-timeout-sec must be an integer from 1 to 86400",
+        ),
     ],
 )
 def test_validate_args_limits_boundaries(over: dict[str, Any], want: str | None) -> None:
@@ -1628,6 +1647,7 @@ def test_internal_error_makes_the_script_exit_70_and_still_writes_record(
         repeat=1,
         p95_limit_us=1,
         package_limit_bytes=1,
+        overall_timeout_sec=14400,
         quiet_machine=False,
         with_ci=False,
     )
@@ -3383,6 +3403,8 @@ def test_second_signal_forces_exit_while_cleanup_is_stuck(tmp_path: Path) -> Non
             "50000",
             "--package-limit-bytes",
             "1000",
+            "--overall-timeout-sec",
+            "14400",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -3583,6 +3605,7 @@ def test_main_itself_does_not_leave_signals_ignored(
     argv = ["run", "--repo-root", str(REPO), "--work-dir", str(tmp_path / "w")]
     argv += ["--bin", str(_fake_cli(tmp_path, "exit 0\n")), "--bin-override", "--items", "B"]
     argv += ["--repeat", "1", "--p95-limit-us", "1", "--package-limit-bytes", "1"]
+    argv += ["--overall-timeout-sec", "14400"]
     try:
         for s in mod.INTERRUPT_SIGNALS:
             signal.signal(s, signal.SIG_DFL)  # `run` が登録した結果だけを検出する
@@ -3646,3 +3669,335 @@ def test_entry_process_exits_70_for_signal_sent_around_final_json(tmp_path: Path
             proc.wait()
             if proc.stdout is not None:
                 proc.stdout.close()
+
+
+# ---- #364: 環境採取の固定パス・最小の環境・全体の上限時間 ----
+
+
+def test_resolve_tool_uses_fixed_candidates_and_never_searches_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-38・REQ-39: 候補表の最初の実行可能なものを返し、無ければ PATH に同名があっても None。"""
+    good = _script(tmp_path, "good-tool", "exit 0\n")
+    plain = tmp_path / "not-executable"
+    plain.write_text("x", encoding="utf-8")
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    _script(decoy_dir, "git", "echo decoy\n")
+    monkeypatch.setenv("PATH", f"{decoy_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    monkeypatch.setattr(
+        mod, "TOOL_CANDIDATES_OTHER", {"git": (str(tmp_path / "missing"), str(plain), str(good))}
+    )
+    assert mod.resolve_tool("git") == str(good)
+    monkeypatch.setattr(mod, "TOOL_CANDIDATES_OTHER", {"git": (str(tmp_path / "missing"),)})
+    assert mod.resolve_tool("git") is None  # PATH 先頭の囮へは戻らない
+    assert mod.resolve_tool("sysctl") is None  # 表に無い名前
+    assert mod.TOOL_CANDIDATES_DARWIN == {
+        "git": ("/usr/bin/git",),
+        "sysctl": ("/usr/sbin/sysctl",),
+        "sw_vers": ("/usr/bin/sw_vers",),
+        "otool": ("/usr/bin/otool",),
+    }
+
+
+def test_probe_env_is_an_allowlist_with_fixed_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-38・REQ-39: 親に GIT_*・DEVELOPER_DIR 等があっても、PATH・LC_ALL・HOME だけが届く。"""
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "DEVELOPER_DIR"):
+        monkeypatch.setenv(k, "/nowhere")
+    monkeypatch.setenv("HOME", "/home/someone")
+    assert mod.probe_env() == {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LC_ALL": "C",
+        "HOME": "/home/someone",
+    }
+    monkeypatch.delenv("HOME")
+    assert mod.probe_env() == {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
+
+
+def _clean_git_head() -> str:
+    """環境を空にして固定パスの git で取った本リポジトリの HEAD（期待値）。"""
+    exe = mod.resolve_tool("git")
+    assert exe is not None
+    out = subprocess.run(  # noqa: S603  固定パスの git を引数リストで起動する（テストの期待値の取得）
+        [exe, "-C", str(REPO), "rev-parse", "HEAD"],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+def test_collect_volatile_ignores_decoy_git_on_path_and_git_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-38・REQ-39・#364: PATH 先頭の囮の git は起動されず、GIT_DIR・GIT_WORK_TREE を
+    別のリポジトリへ向けても、記録される commit は本リポジトリの HEAD。"""
+    marker = tmp_path / "decoy-started"
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    _script(decoy_dir, "git", f'echo x > "{marker}"\necho {"0" * 40}\n')
+    other = tmp_path / "other"
+    other.mkdir()
+    exe = mod.resolve_tool("git")
+    assert exe is not None
+    other_env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    for argv in (
+        ["init", "-q"],
+        [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+    ):
+        subprocess.run(  # noqa: S603  固定パスの git で一時ディレクトリに別のリポジトリを作る
+            [exe, "-C", str(other), *argv], env=other_env, check=True, capture_output=True
+        )
+    monkeypatch.setenv("PATH", f"{decoy_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    work = tmp_path / "w"
+    work.mkdir()
+    ctx = _ctx(work, _fake_cli(tmp_path, "exit 0\n"))
+    vol = mod.collect_volatile(ctx)
+    assert vol["commit"] == _clean_git_head()
+    assert not marker.exists()
+
+
+def test_probe_commands_get_the_minimal_env_and_resolved_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-38・REQ-39・#364: `_probe`・`_worktree_clean`・D の otool が `run_cmd` へ渡す env は
+    `probe_env()` で、argv[0] は固定パスへ解決済み（論理名のままではない）。"""
+    seen: list[tuple[list[str], Any]] = []
+
+    def fake_run_cmd(argv: list[str], *a: Any, env: Any = None, **k: Any) -> Any:
+        seen.append((argv, env if env is not None else (a[-1] if len(a) >= 7 else None)))
+        return mod.RunResult(0, None, 0, 0)
+
+    monkeypatch.setattr(mod, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(mod, "resolve_tool", lambda name: f"/fixed/{name}")
+    monkeypatch.setenv("GIT_DIR", "/nowhere")
+    (tmp_path / "w").mkdir()
+    mod._probe(tmp_path / "w", REPO, ["sysctl", "-n", "hw.ncpu"], "ncpu")
+    mod._worktree_clean(tmp_path / "w", REPO)
+    assert [a[0] for a, _ in seen] == ["/fixed/sysctl", "/fixed/git"]
+    assert all(e == mod.probe_env() for _, e in seen)
+    assert all("GIT_DIR" not in e for _, e in seen)
+
+
+def test_probe_tool_missing_is_unavailable_not_a_path_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-38・REQ-39・#364: 固定パスに無いコマンドは「使えない」（None）。PATH へは戻らない。"""
+    monkeypatch.setattr(mod, "resolve_tool", lambda name: None)
+    (tmp_path / "w").mkdir()
+    assert mod._probe(tmp_path / "w", REPO, ["git", "rev-parse", "HEAD"], "commit") is None
+    assert mod._worktree_clean(tmp_path / "w", REPO) is None
+
+
+def test_item_d_fails_when_otool_is_missing_on_macos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-32・REQ-39・#364: macOS（非 harness）で otool が固定パスに無ければ D は
+    failed / otool_failed（黙って ok にしない）。PATH 上の同名は使わない。"""
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod, "resolve_tool", lambda name: None)
+    res = mod.item_d(_linkage_ctx(tmp_path, b"same", b"same"))
+    assert (res["status"], res["reason"]) == ("failed", "otool_failed")
+
+
+def test_run_cmd_raises_overall_timeout_and_stops_child_and_grandchild(tmp_path: Path) -> None:
+    """REQ-39・#364: 全体の期限を超えたら子と孫を止めて回収してから `OverallTimeout`。"""
+    pidfile = tmp_path / "pids"
+    script = f'echo $$ >> "{pidfile}"; sleep 60 & echo $! >> "{pidfile}"; wait'
+    mod._overall_deadline = time.monotonic() + 0.5
+    start = time.monotonic()
+    with pytest.raises(mod.OverallTimeout):
+        _run(tmp_path, ["/bin/sh", "-c", script])
+    assert time.monotonic() - start < 10.0  # 子ごとの期限（20 秒）や sleep 60 に頼らない
+    pids = _pids(pidfile)
+    assert len(pids) == 2
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def test_run_cmd_does_not_start_the_child_after_the_overall_deadline(tmp_path: Path) -> None:
+    """REQ-39・#364: 期限切れの状態では子を起動しない（子が書くはずの印ファイルが無い）。"""
+    marker = tmp_path / "started"
+    mod._overall_deadline = time.monotonic() - 1.0
+    with pytest.raises(mod.OverallTimeout):
+        _run(tmp_path, ["/bin/sh", "-c", f'echo x > "{marker}"'])
+    assert not marker.exists()
+
+
+def test_item_f_stops_at_the_overall_deadline_not_at_repeat_times_child_limit(
+    tmp_path: Path,
+) -> None:
+    """REQ-39・#364: F は repeat × 子の上限まで延びず、全体の期限で打ち切られる。"""
+    cargo = _script(
+        tmp_path,
+        "fake-cargo",
+        'case "$*" in\n'
+        "*--no-run*) exit 0 ;;\n"
+        '*--list*) echo "t::a: test"; echo; echo "1 tests, 0 benchmarks"; exit 0 ;;\n'
+        "esac\n"
+        "sleep 1\n"
+        'echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"\n',
+    )
+    work = tmp_path / "w"
+    work.mkdir()
+    ctx = _ctx(work, _fake_cli(tmp_path, "exit 0\n"))
+    ctx.cargo_cmd = str(cargo)
+    ctx.repeat = 1000
+    mod._overall_deadline = time.monotonic() + 3.0
+    start = time.monotonic()
+    with pytest.raises(mod.OverallTimeout):
+        mod.item_f(ctx)
+    assert time.monotonic() - start < 30.0
+
+
+def _run_with_overall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, items: str, fake_item: Any, seconds: int
+) -> Any:
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    monkeypatch.setattr(mod, "run_item", fake_item)
+    (tmp_path / "w").mkdir()
+    args = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        bin=str(_fake_cli(tmp_path, "exit 0\n")),
+        bin_override=True,
+        items=items,
+        overall_timeout_sec=seconds,
+        quiet_machine=False,
+    )
+    try:
+        rc = mod.run(args)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    return rc, json.loads((tmp_path / "w" / "record.json").read_text())
+
+
+def test_run_overall_timeout_marks_running_item_failed_and_rest_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39・REQ-21・#364: 項目の実行中の上限超過は exit 10。実行中の項目は failed、残りは not_run
+    （reason は overall_timeout）。options に上限が入り、record.md に注意行が出る。終了時の再採取は
+    期限の外で行われる（commit_end が入る）。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        r = mod.run_cmd(
+            ["/bin/sh", "-c", "sleep 30"], ctx.work, ctx.work / "o", ctx.work / "e", 20, 1, 1
+        )
+        return {"status": "ok", "exit_code": r.exit_code}, True
+
+    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B,C", fake, 1)
+    assert rc == 10
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "judged_fail",
+        "message": "overall time limit exceeded",
+        "record": "record.json",
+    }
+    assert rec["options"]["overall_timeout_sec"] == 1
+    assert rec["items"]["B"] == {"status": "failed", "reason": "overall_timeout"}
+    assert rec["items"]["C"] == {"status": "not_run", "reason": "overall_timeout"}
+    assert re.fullmatch(r"[0-9a-f]{40}", rec["environment"]["commit_end"])
+    assert "上限時間" in (tmp_path / "w" / "record.md").read_text()
+    assert mod._overall_deadline is None  # `run` は戻るとき期限を下ろす
+
+
+def test_run_overall_timeout_in_cli_build_marks_all_items_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39・#364: CLI のビルド中の上限超過でも record を書き、環境は未採取、選んだ項目は
+    not_run / overall_timeout、exit 10。ビルドの子は残らない。"""
+    pidfile = tmp_path / "pids"
+    cargo = _script(
+        tmp_path,
+        "fake-cargo",
+        f'echo $$ >> "{pidfile}"\nsleep 60 &\necho $! >> "{pidfile}"\nwait\n',
+    )
+    monkeypatch.setenv("FANDHE_EDGE_CARGO_CMD", str(cargo))
+    saved = {s: signal.getsignal(s) for s in mod.INTERRUPT_SIGNALS}
+    (tmp_path / "w").mkdir()
+    args = _ns(
+        repo_root=str(REPO),
+        work_dir=str(tmp_path / "w"),
+        items="B,C",
+        overall_timeout_sec=1,
+        quiet_machine=False,
+    )
+    try:
+        rc = mod.run(args)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+    assert rc == 10
+    assert json.loads(capsys.readouterr().out)["message"] == "overall time limit exceeded"
+    rec = json.loads((tmp_path / "w" / "record.json").read_text())
+    assert rec["environment"] is None
+    overall = {"status": "not_run", "reason": "overall_timeout"}
+    assert rec["items"]["B"] == overall
+    assert rec["items"]["C"] == overall
+    pids = _pids(pidfile)
+    assert len(pids) == 2
+    assert _wait_for(lambda: not any(_alive(p) for p in pids), 10)
+
+
+def test_interrupt_wins_over_overall_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21・REQ-39・#364: 中断の印と上限超過が重なったら中断が勝つ（exit 70・interrupted）。"""
+
+    def fake(ctx: Any, name: str, b_ok: bool) -> Any:
+        mod._on_signal(signal.SIGTERM, None)
+        mod._overall_deadline = time.monotonic() - 1.0
+        mod.run_cmd(["/bin/sh", "-c", "exit 0"], ctx.work, ctx.work / "o", ctx.work / "e", 20, 1, 1)
+        return {"status": "ok"}, True
+
+    rc, rec = _run_with_overall(tmp_path, monkeypatch, "B,C", fake, 14400)
+    assert rc == 70
+    assert json.loads(capsys.readouterr().out)["message"] == "interrupted"
+    assert rec["items"]["B"] == {"status": "failed", "reason": "interrupted"}
+    assert rec["items"]["C"] == {"status": "not_run", "reason": "interrupted"}
+
+
+def test_main_maps_a_stray_overall_timeout_to_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21・#364: 取りこぼした `OverallTimeout` も traceback を出さず runtime_error(70)。"""
+
+    def boom(args: Any) -> int:
+        raise mod.OverallTimeout
+
+    monkeypatch.setattr(mod, "run", boom)
+    monkeypatch.setattr(mod, "_final_emitted", mod._final_emitted)
+    argv = [
+        "run",
+        "--repo-root",
+        str(REPO),
+        "--work-dir",
+        str(tmp_path / "x"),
+        "--items",
+        "B",
+        "--repeat",
+        "1",
+        "--p95-limit-us",
+        "1",
+        "--package-limit-bytes",
+        "1",
+        "--overall-timeout-sec",
+        "1",
+    ]
+    assert mod.main(argv) == 70
+    assert json.loads(capsys.readouterr().out)["code"] == "runtime_error"

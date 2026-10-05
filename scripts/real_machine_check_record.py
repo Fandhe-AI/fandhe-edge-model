@@ -10,6 +10,8 @@ REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-38・REQ-39。特定�
 
 責務:
 - 項目 A〜F の子プロセス起動（上限時間・出力サイズ上限つき。中断時は子のグループを止める。REQ-39）
+- 実行全体の上限時間（`--overall-timeout-sec`）と、環境採取の子（git・sysctl・sw_vers・otool）の
+  固定パス・最小の環境での起動（PATH・GIT_* に左右されない。REQ-38・REQ-39・#364）
 - CLI の JSON の要約と、記録へ出してよい値だけへの絞り込み（伏せ処理は `sanitize_record` に集約）
 - `record.json`・`record.md` の書き出しと、stdout への固定メッセージ JSON 1 行
 
@@ -93,6 +95,14 @@ MAX_E_RECORDS = 1000
 MAX_REPEAT = 1000
 # --p95-limit-us の上限（µs）。crates/core/src/definition.rs の MAX_LIMIT_INFER_P95_US と対
 MAX_P95_LIMIT_US = 3_600_000_000
+# --package-limit-bytes の上限（15 桁。シェル側の桁数検査と対。算術の桁あふれを避ける）
+MAX_PACKAGE_LIMIT_BYTES = 999_999_999_999_999
+# --overall-timeout-sec（実行全体の上限時間。秒。REQ-39）。契約に定めのない値（自分で決めた点）:
+# 既定 4 時間は記録簿の通し実行（A〜F・`--repeat 50`）を収め、F の暴走（最大 1000 × 300 秒）を
+# 止める桁。
+# 下限 1 はテストハーネスが短い値で発火させるため。既定値の出所はシェル側の 1 箇所だけ
+MIN_OVERALL_TIMEOUT_SEC = 1
+MAX_OVERALL_TIMEOUT_SEC = 86400
 # 浮動小数の許容差（evaluation-contract.md）。evaluate の accuracy の照合に使う。
 # E の単体対バッチはスコアも完全一致で、この許容差は使わない
 SCORE_TOLERANCE = 1e-9
@@ -184,6 +194,25 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # 2 回目の中断シグナルによる強制終了で stdout へ書く固定の 1 行（record は無い）
 FORCED_EXIT_LINE = b'{"code":"runtime_error","message":"interrupted (forced exit)"}\n'
 
+# 環境採取（git・sysctl・sw_vers・otool）に使うコマンドの固定パス（PATH を探さない。
+# REQ-38・REQ-39）。PATH の先頭に同名の実行ファイルを置かれても別物の出力が記録に入らない
+# ようにする。`/usr/local/bin` は
+# 利用者が書ける構成があるため候補に入れない。表に無い・実行できない場合は「使えない」として扱い、
+# PATH へは戻らない（git が無ければ commit・worktree_clean が null → stable が null → exit 10。
+# sysctl・sw_vers が無ければ該当欄が null。macOS で otool が無ければ D は otool_failed）。
+# Linux 側の表はテストハーネス用で、実機の証拠にならない（sysctl・sw_vers・otool は使わない）
+TOOL_CANDIDATES_DARWIN: dict[str, tuple[str, ...]] = {
+    "git": ("/usr/bin/git",),
+    "sysctl": ("/usr/sbin/sysctl",),
+    "sw_vers": ("/usr/bin/sw_vers",),
+    "otool": ("/usr/bin/otool",),
+}
+TOOL_CANDIDATES_OTHER: dict[str, tuple[str, ...]] = {
+    "git": ("/usr/bin/git", "/bin/git"),
+}
+# 環境採取の子へ渡す PATH（固定。`run_cmd` の外側の /bin/sh ラッパーが rm を呼ぶため /bin も含める）
+PROBE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
 # 子の外側で動く薄い sh。コマンドを子として走らせ、終了コードを rc ファイル（位置引数 $1）へ
 # 書いてから、自分を含むグループ全体へ KILL を送る（TERM を無視する孫も残さない。REQ-39）。
 # リーダー（この sh）の生存中に行うので、reap 後の killpg による pid 再利用の誤爆がない。
@@ -198,6 +227,10 @@ GROUP_WRAPPER = (
 )
 # rc ファイルの上限（3 桁の整数だけが入る）
 CAP_RC_FILE = 16
+
+
+class OverallTimeout(BaseException):  # `except Exception` に飲まれないよう BaseException にする
+    """実行全体の上限時間（`--overall-timeout-sec`）を超えた。`Interrupted` と同じ形で送出する。"""
 
 
 class Interrupted(BaseException):  # Exception で捕まえられないよう BaseException にする
@@ -235,6 +268,37 @@ _leftover_procs: list[subprocess.Popen[bytes]] = []
 REAP_WAIT_LIMIT_SECONDS = 10.0
 # 回収を諦めたときの結果の理由（固定語彙）。項目は `failed` になり、通常の合否判定へ流さない
 REASON_UNREAPED = "unreaped"
+# 実行全体の上限時間を超えたときの理由（固定語彙。`failed`・`not_run` の両方に使う）
+REASON_OVERALL_TIMEOUT = "overall_timeout"
+
+
+# 全体の期限（`time.monotonic()` 基準）と超過の印。`run()` が設定し、`run_cmd` が子ごとの期限より
+# 先に見る。
+# 超過を受けた `run()` は両方を下ろし、終了時の再採取と記録の書き出しを期限の外で行う（REQ-39）
+_overall_deadline: float | None = None
+_overall_timed_out = False
+
+
+def overall_expired() -> bool:
+    """全体の期限を超えたか（超過の印が立っている場合を含む）。"""
+    return _overall_timed_out or (
+        _overall_deadline is not None and time.monotonic() >= _overall_deadline
+    )
+
+
+def clear_overall() -> None:
+    """全体の期限と印を下ろす（超過を受けた後の再採取・記録の書き出しを期限の外で行うため）。"""
+    global _overall_deadline, _overall_timed_out
+    _overall_deadline = None
+    _overall_timed_out = False
+
+
+def check_overall() -> None:
+    """期限を超えていれば `OverallTimeout` を送出する（`run_cmd` の入口から呼ぶ）。"""
+    global _overall_timed_out
+    if overall_expired():
+        _overall_timed_out = True
+        raise OverallTimeout
 
 
 def check_interrupt() -> None:
@@ -536,6 +600,36 @@ def _resolve_exe(name: str) -> str | None:
     return exe
 
 
+def resolve_tool(name: str) -> str | None:
+    """環境採取用コマンドの固定パスを返す（PATH は探さない）。表に無い・実行できなければ None。
+
+    `sys.platform` は呼び出し時に読む（テストが差し替えるため）。無いときの扱いは
+    `TOOL_CANDIDATES_DARWIN` のコメントを参照（REQ-38・REQ-39）。
+    """
+    table = TOOL_CANDIDATES_DARWIN if sys.platform == "darwin" else TOOL_CANDIDATES_OTHER
+    for cand in table.get(name, ()):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def probe_env() -> dict[str, str]:
+    """環境採取の子（git・sysctl・sw_vers・otool）へ渡す環境（許可リスト方式）。
+
+    PATH は固定値、LC_ALL=C、HOME は親にあるときだけ通す。`GIT_DIR`・`GIT_WORK_TREE` 等
+    （git フックの中から起動すると実際に設定される）や `DEVELOPER_DIR`（xcrun の shim の差し替え）を
+    列挙して消す拒否リストにせず、一括で届かなくする。HOME を残すのは、利用者のグローバル設定
+    （`safe.directory` 等）が効かないと所有者の違うチェックアウトで commit が取れなくなり、
+    `worktree_clean` の意味も変わるため（HOME 配下の設定では git ディレクトリの向き先は
+    変えられない）。
+    """
+    env = {"PATH": PROBE_PATH, "LC_ALL": "C"}
+    home = os.environ.get("HOME")
+    if home is not None:
+        env["HOME"] = home
+    return env
+
+
 def run_cmd(
     argv: list[str],
     cwd: Path,
@@ -555,8 +649,10 @@ def run_cmd(
     中断はシグナルハンドラから例外を投げず、ハンドラが立てた印をこの関数が待機の周ごとに見る。
     例外が `Popen` の内部へ割り込むと、`_waitpid_lock` が解放されず `proc.wait()` が終わらなく
     なる・`Popen` の生成の途中なら子が回収されずに残るため。後始末の後で `Interrupted` を投げる。
+    全体の上限時間の超過（`OverallTimeout`）も同じ形で、優先順は `Interrupted` ＞ `OverallTimeout`。
     """
     check_interrupt()  # 印があれば子を起動しない
+    check_overall()  # 全体の期限が切れていれば子を起動しない
     exe = _resolve_exe(argv[0])
     if exe is None:
         return RunResult(None, "spawn_error", 0, 0)
@@ -567,7 +663,7 @@ def run_cmd(
         # パスがディレクトリ・削除不能のとき。例外を外へ出さず、子を起動しない（#359）
         return RunResult(None, "spawn_error", 0, 0)
     full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
-    global _active_pgid, _child_may_remain, _spawning
+    global _active_pgid, _child_may_remain, _spawning, _overall_timed_out
     reason = None
     spawn_failed = False
     try:
@@ -596,6 +692,9 @@ def run_cmd(
                 while proc.poll() is None:
                     if _interrupt_requested:
                         break  # 例外にせず、下の後始末で止める（reason は None のまま）
+                    if _overall_deadline is not None and time.monotonic() >= _overall_deadline:
+                        _overall_timed_out = True  # 子ごとの期限より先に全体の期限を見る
+                        break
                     if time.monotonic() >= deadline:
                         reason = "timeout"
                         break
@@ -630,6 +729,8 @@ def run_cmd(
     # 後始末（グループの KILL と回収）が済んだ後でだけ中断を送出する。子が自然に終わった周に
     # 印が立っていた場合も結果は捨てる
     check_interrupt()
+    if _overall_timed_out:
+        raise OverallTimeout  # 中断が優先。後始末の後でだけ送出する
     if spawn_failed:
         return RunResult(None, "spawn_error", 0, 0)
     ob, eb = _size(out_path), _size(err_path)
@@ -1672,8 +1773,11 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         if reason is not None:
             return dict(rec, status="failed", reason=reason)
     # テストの偽 CLI（スクリプト）には otool が失敗するため、代役の下では取らない
-    otool = shutil.which("otool")
-    if sys.platform == "darwin" and otool and not ctx.harness:
+    # macOS で otool が固定パスに無ければ確認できていない（PATH へは戻らず、黙って ok にしない）
+    if sys.platform == "darwin" and not ctx.harness:
+        otool = resolve_tool("otool")
+        if otool is None:
+            return dict(rec, status="failed", reason="otool_failed")
         o = run_cmd(
             [otool, "-L", str(ctx.bin)],
             ctx.repo,
@@ -1682,7 +1786,7 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
             TIMEOUT_PROBE,
             CAP_PROBE,
             CAP_PROBE,
-            ctx.offline_env,
+            probe_env(),
         )
         body = read_capped(d / "otool.out", CAP_PROBE)
         if o.reason is not None or o.exit_code != 0 or body is None:
@@ -2019,17 +2123,25 @@ def item_f(ctx: Ctx) -> dict[str, Any]:
 
 
 def _probe(work: Path, repo: Path, argv: list[str], name: str) -> str | None:
-    """短い出力のコマンドを実行して先頭を返す。使えない・失敗は None。"""
+    """短い出力のコマンドを実行して先頭を返す。使えない・失敗は None。
+
+    `argv[0]` は論理名で、固定パスへ解決する（PATH は探さない）。子には最小の環境だけを渡す
+    （`resolve_tool`・`probe_env`。REQ-38・REQ-39）。
+    """
+    exe = resolve_tool(argv[0])
+    if exe is None:
+        return None
     pdir = work / ".probe"
     pdir.mkdir(exist_ok=True)
     r = run_cmd(
-        argv,
+        [exe, *argv[1:]],
         repo,
         pdir / (name + ".out"),
         pdir / (name + ".err"),
         TIMEOUT_PROBE,
         CAP_PROBE,
         CAP_PROBE,
+        probe_env(),
     )
     if r.reason is not None or r.exit_code != 0:
         return None
@@ -2039,16 +2151,20 @@ def _probe(work: Path, repo: Path, argv: list[str], name: str) -> str | None:
 
 def _worktree_clean(work: Path, repo: Path) -> bool | None:
     """`git status --porcelain` が空か。出力が上限を超えれば汚れている扱い。取れなければ None。"""
+    git = resolve_tool("git")
+    if git is None:
+        return None
     pdir = work / ".probe"
     pdir.mkdir(exist_ok=True)
     r = run_cmd(
-        ["git", "status", "--porcelain"],
+        [git, "status", "--porcelain"],
         repo,
         pdir / "status.out",
         pdir / "status.err",
         TIMEOUT_PROBE,
         CAP_PROBE,
         CAP_PROBE,
+        probe_env(),
     )
     if r.reason == "output_limit":
         return False
@@ -2273,6 +2389,15 @@ def render_markdown(rec: dict[str, Any]) -> str:
             "- 注意: 子プロセスの回収が上限時間内に終わらなかった（子・孫が残っている可能性。"
             "`ps` で確認し、残っていれば手で止める。結果を採用しない）"
         )
+    if any(
+        it.get("reason") == REASON_OVERALL_TIMEOUT
+        for it in rec["items"].values()
+        if isinstance(it, dict)
+    ):
+        lines.append(
+            "- 注意: 実行全体の上限時間（`options.overall_timeout_sec`）を超えて打ち切った"
+            "（実行中の項目は failed、残りは not_run。結果を採用しない）"
+        )
     stable = (rec.get("environment") or {}).get("stable")
     if stable is False:
         lines.append(
@@ -2474,6 +2599,21 @@ def run_item(ctx: Ctx, name: str, b_ok: bool) -> tuple[dict[str, Any], bool]:
 
 
 def run(args: argparse.Namespace) -> int:
+    """全体の上限時間（`--overall-timeout-sec`）を設けて `_run` を実行する。
+
+    期限は入力の採取・CLI のビルド・開始時の環境採取も含めて数える。戻るとき（例外を含む）に
+    期限を必ず下ろし、次の呼び出しへ持ち越さない（REQ-39）。
+    """
+    global _overall_deadline
+    clear_overall()
+    _overall_deadline = time.monotonic() + args.overall_timeout_sec
+    try:
+        return _run(args)
+    finally:
+        clear_overall()
+
+
+def _run(args: argparse.Namespace) -> int:
     """項目を A→F の順に実行し、record.json・record.md を書く。
 
     記録の骨格は入力の採取より前に作る。前半（採取・ビルド）で中断されても、選んだ項目を
@@ -2524,6 +2664,7 @@ def run(args: argparse.Namespace) -> int:
             "quiet_machine": ctx.quiet_machine,
             "p95_limit_us": ctx.p95_limit_us,
             "package_limit_bytes": ctx.package_limit_bytes,
+            "overall_timeout_sec": args.overall_timeout_sec,
             "with_ci": bool(args.with_ci),
             "cargo_offline": "A" not in items,
         },
@@ -2533,6 +2674,7 @@ def run(args: argparse.Namespace) -> int:
     stopped = False
     interrupted = False
     internal_error = False
+    exceeded = False  # 全体の上限時間を超えた（超過を受けたら期限を下ろし、以降の再採取は期限の外）
     b_ok = False
     try:
         inputs = collect_inputs(ctx.repo)
@@ -2555,13 +2697,24 @@ def run(args: argparse.Namespace) -> int:
         rec["environment"] = env
     except Interrupted:
         interrupted = True  # 前半の中断。以降の項目はすべて not_run（interrupted）
+    except OverallTimeout:
+        exceeded = True  # 前半の上限超過。以降の項目はすべて not_run（overall_timeout）
+        clear_overall()
     for name in ITEM_ORDER:
         if name in items and _interrupt_requested:
             interrupted = True  # 項目の開始前に印を見る
+        if name in items and not exceeded and not interrupted and overall_expired():
+            exceeded = True  # 項目の開始前に全体の期限も見る
+            clear_overall()
         if name not in items:
             rec["items"][name] = {"status": "not_run", "reason": "not_selected"}
-        elif interrupted or stopped:
-            reason = "interrupted" if interrupted else "previous_item_failed"
+        elif interrupted or exceeded or stopped:
+            if interrupted:
+                reason = "interrupted"
+            elif exceeded:
+                reason = REASON_OVERALL_TIMEOUT
+            else:
+                reason = "previous_item_failed"
             rec["items"][name] = {"status": "not_run", "reason": reason}
         else:
             sys.stderr.write(f"running item {name}\n")
@@ -2570,6 +2723,9 @@ def run(args: argparse.Namespace) -> int:
                 res, b_ok = run_item(ctx, name, b_ok)
             except Interrupted:
                 res, interrupted = fail_item("interrupted"), True
+            except OverallTimeout:
+                res, exceeded = fail_item(REASON_OVERALL_TIMEOUT), True
+                clear_overall()
             except Exception as e:
                 res = fail_item("internal_error", error_type=error_type_name(e))
                 internal_error = True
@@ -2579,6 +2735,7 @@ def run(args: argparse.Namespace) -> int:
     # 記録を書く直前に印を 1 回だけ読む。書き出し中に届いた中断は結果を変えない（印を立てるだけ）
     if _interrupt_requested:
         interrupted = True
+    clear_overall()  # 終了時の再採取と記録の書き出しは期限の外で行う（所要は子ごとの上限で頭打ち）
     if rec["environment"] is not None:
         end_vol: dict[str, Any] | None = None
         if not _interrupt_requested:
@@ -2607,6 +2764,8 @@ def run(args: argparse.Namespace) -> int:
     if internal_error:
         # 想定外の例外はスクリプト自身の実行不能（70）。record は書いてある
         return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, True)
+    if exceeded:
+        return emit("judged_fail", "overall time limit exceeded", EXIT_JUDGED_FAIL, True)
     if (rec["environment"] or {}).get("stable") is not True:
         # 項目の status は書き換えず、環境の食い違い・未確認（採取不能）を別軸の失敗として返す
         # （成功扱いにしない。#360）
@@ -2630,7 +2789,11 @@ class _ArgParser(argparse.ArgumentParser):
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
-    """引数の検証（シェル側と同じ条件の再確認）。問題があれば固定メッセージ、無ければ None。"""
+    """引数の検証（シェル側と同じ条件の再確認）。問題があれば固定メッセージ、無ければ None。
+
+    数値の範囲（`--repeat`・`--p95-limit-us`・`--package-limit-bytes` の 15 桁上限・
+    `--overall-timeout-sec`）もシェル側と同じ値で確認する。
+    """
     parts = args.items.split(",")
     if not parts or any(p not in ITEM_ORDER for p in parts) or len(set(parts)) != len(parts):
         return "--items must be a comma-separated subset of A,B,C,D,E,F"
@@ -2643,8 +2806,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--repeat must be an integer from 1 to 1000"
     if not 1 <= args.p95_limit_us <= MAX_P95_LIMIT_US:
         return "--p95-limit-us must be an integer from 1 to 3600000000"
-    if args.package_limit_bytes < 1:
+    if not 1 <= args.package_limit_bytes <= MAX_PACKAGE_LIMIT_BYTES:
         return "--package-limit-bytes must be a positive integer"
+    if not MIN_OVERALL_TIMEOUT_SEC <= args.overall_timeout_sec <= MAX_OVERALL_TIMEOUT_SEC:
+        return "--overall-timeout-sec must be an integer from 1 to 86400"
     if args.bin_override and not args.bin:
         return "--bin-override requires --bin"
     if args.bin_override:
@@ -2667,6 +2832,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--repeat", type=int, required=True)
     r.add_argument("--p95-limit-us", type=int, required=True)
     r.add_argument("--package-limit-bytes", type=int, required=True)
+    r.add_argument("--overall-timeout-sec", type=int, required=True)
     r.add_argument("--quiet-machine", action="store_true")
     r.add_argument("--with-ci", action="store_true")
     ns = p.parse_args(argv)
@@ -2677,6 +2843,8 @@ def main(argv: list[str] | None = None) -> int:
         return run(ns)
     except Interrupted:
         return emit("runtime_error", "interrupted", EXIT_RUNTIME_ERROR, False)
+    except OverallTimeout:  # 取りこぼしても traceback を出さない
+        return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, False)
     except Exception:
         return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, False)
 
