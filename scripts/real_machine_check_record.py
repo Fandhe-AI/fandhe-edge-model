@@ -600,7 +600,11 @@ def run_cmd(
             finally:
                 # 例外・中断・期限超過で抜けたら、リーダーが未回収（poll が None）のうちに KILL する
                 if proc.poll() is None and not _kill_group(proc.pid):
-                    # グループへ送れなかったときは、せめてリーダーだけでも止める（best-effort）
+                    # グループへ送れなかったときは孫が残りうる。回収の成否に関わらず残留の可能性を
+                    # 記録し、結果は採用しない（fail-closed。REQ-39）。せめてリーダーだけでも止める
+                    _child_may_remain = True
+                    if reason is None:
+                        reason = REASON_UNREAPED
                     try:
                         proc.kill()
                     except OSError:

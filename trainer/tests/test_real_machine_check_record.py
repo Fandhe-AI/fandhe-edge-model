@@ -3229,6 +3229,27 @@ def test_run_cmd_gives_up_waiting_when_the_group_kill_fails(
     assert elapsed < 10.0
 
 
+def test_run_cmd_does_not_adopt_the_result_when_the_group_kill_fails_but_leader_is_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: グループ KILL 失敗時は、リーダーを回収できても残留を記録し結果を採用しない。"""
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+    mod._interrupt_requested = False
+    mod._child_may_remain = False
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", "exec sleep 60"],
+        tmp_path,
+        tmp_path / "o",
+        tmp_path / "o.e",
+        1,
+        4096,
+        4096,
+    )
+    assert (r.exit_code, r.reason) == (None, "timeout")
+    assert mod._child_may_remain is True
+    assert mod._active_pgid is None
+
+
 def test_run_cmd_leaves_child_may_remain_false_on_the_normal_path(tmp_path: Path) -> None:
     """REQ-39: 通常の回収では `child_may_remain` は立たない。"""
     r = _run(tmp_path, ["/bin/sh", "-c", "exit 0"])
