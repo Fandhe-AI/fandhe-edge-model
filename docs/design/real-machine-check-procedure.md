@@ -71,7 +71,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 | 環境変数 | 説明 | 備考 |
 | ------- | ---- | ---- |
-| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えると D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは `$CARGO_TARGET_DIR`（未設定なら `<repo>/target`）の `release/fandhe-edge` で、差し替えた CLI と一致しないため（`linkage_target_mismatch`。§4-D）。cargo の出力先を変えるときは `CARGO_TARGET_DIR` 環境変数で指定する |
+| `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えると D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは cargo がビルドした CLI（cargo の報告から取る。`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えていても追従する）で、差し替えた CLI と一致しないため（`linkage_target_mismatch`。§4-D） |
 | `FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` | 検査用（テスト専用の上書き）。**絶対パスの実行ファイル**（PATH で探さない）。どちらかを設定すると `evidence_hint` が `test_harness` に変わり、`otool -L` は実行されず `direct_libraries` が `null` になる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64） | テスト用のみ。両方同時に設定可能 |
 
 ### 3-4. 実行時の上限（REQ-39）
@@ -191,8 +191,8 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `skip:` で始まる行が 0 件
   - `ok: req32_*` の行がちょうど 3 件（env -i テストが成功。件数は `check-runtime-linkage.sh` の env -i テスト数の定数 `LINKAGE_ENV_I_TESTS`）
   - 最終行 `OK: tool=<otool|ldd> ...` があり、macOS では tool が `otool`（`ldd` は実機の確認にならない）
-  - リンクを確認したバイナリ（`$CARGO_TARGET_DIR`、未設定なら `<repo>/target` の `release/fandhe-edge`）の sha256 が、いま実行した CLI の sha256 と、開始時に記録した `cli_sha256` の両方に一致する。`make`・`cargo` の代役の下では偽の `make` が何も検査しないため照合しない（`linkage_target_matches_cli` は `null`）
-- **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` 行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
+  - リンクを確認したバイナリ（`check-runtime-linkage.sh` が cargo の報告〔`--message-format=json-render-diagnostics` の `compiler-artifact` の `executable`〕から取り、ログ `<work-dir>/D/linkage.log` に `cli_bin: <絶対パス>` の 1 行で出す。記録側はこの行からパスを読んで sha256 を計算する。パスは `record.json`・`record.md` に出ない）の sha256 が、いま実行した CLI の sha256 と、開始時に記録した `cli_sha256` の両方に一致する。`make`・`cargo` の代役の下では偽の `make` が何も検査しないため照合しない（`linkage_target_matches_cli` は `null`）
+- **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` 行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（`cli_bin:` 行が無い・2 行以上ある・絶対パスでない、または検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `exit_code`: make の終了コード
