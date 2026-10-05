@@ -223,9 +223,12 @@ _final_emitted = False
 # 子の回収が上限時間内に終わらず、子（またはその孫）が残っている可能性がある印（REQ-39）。
 # record の `child_may_remain` へ出す。`run()` の冒頭で下ろす
 _child_may_remain = False
-# 回収・停止できなかった子のプロセスグループ id。2 回目のシグナルの強制終了（`_force_exit`）が
-# 再度 KILL を試みるため残す（親だけが終わって子が残るのを避ける。REQ-39）。`run()` の冒頭で空にする
-_leftover_pgids: list[int] = []
+# 回収できなかった子の `Popen`。2 回目のシグナルの強制終了（`_force_exit`）が再度 KILL を
+# 試みるため残す（親だけが終わって子が残るのを避ける。REQ-39）。pid の数値ではなく `Popen` を
+# 保持するのは、参照が生きている間は GC による暗黙の回収が起きず、リーダーは未回収（zombie を
+# 含む）のままなので pid が再利用されず、宛先が無関係なグループにならないため。`_force_exit` は
+# `poll()` 等の回収を一切呼ばない。`run()` の冒頭で空にする
+_leftover_procs: list[subprocess.Popen[bytes]] = []
 # 後始末後の回収（`proc.wait`）を待つ上限秒数。KILL が効けば即時に回収できるため、実際に
 # 待つのは KILL が失敗した異常時だけ。超過したら諦めて先へ進む（無限待ちを作らない。REQ-39）。
 # モジュール変数にしてあるのはテストが縮めるため
@@ -618,7 +621,7 @@ def run_cmd(
                 except subprocess.TimeoutExpired:
                     # 回収を諦める。子が残っている可能性を記録し、結果は失敗側へ倒す（fail-closed）
                     _child_may_remain = True
-                    _leftover_pgids.append(proc.pid)
+                    _leftover_procs.append(proc)
                     reason = REASON_UNREAPED
                 finally:
                     _active_pgid = None
@@ -2378,7 +2381,7 @@ def _on_signal(signum: int, frame: Any) -> None:
 
 def _force_exit(pgid: int | None) -> None:
     """子のグループへ KILL を送り、固定 JSON を 1 行書いて exit 70 する（戻らない）。"""
-    for target in [pgid, *_leftover_pgids]:
+    for target in [pgid, *(p.pid for p in _leftover_procs)]:
         if target is None:
             continue
         try:
@@ -2485,7 +2488,7 @@ def run(args: argparse.Namespace) -> int:
     _final_emitted = False
     _active_pgid = None
     _child_may_remain = False
-    _leftover_pgids.clear()
+    _leftover_procs.clear()
     os.umask(0o077)
     for s in INTERRUPT_SIGNALS:
         signal.signal(s, _on_signal)

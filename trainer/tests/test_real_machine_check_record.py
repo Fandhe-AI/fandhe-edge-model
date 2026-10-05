@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -3237,7 +3238,7 @@ def test_run_cmd_does_not_adopt_the_result_when_the_group_kill_fails_but_leader_
     monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
     mod._interrupt_requested = False
     mod._child_may_remain = False
-    mod._leftover_pgids.clear()
+    mod._leftover_procs.clear()
     try:
         r = mod.run_cmd(
             ["/bin/sh", "-c", f'echo $$ > "{pidfile}"; exec sleep 60'],
@@ -3248,15 +3249,15 @@ def test_run_cmd_does_not_adopt_the_result_when_the_group_kill_fails_but_leader_
             4096,
             4096,
         )
-        leftover = list(mod._leftover_pgids)
+        leftover = list(mod._leftover_procs)
     finally:
         # _kill_group を差し替えているため内側の sleep が残る。グループごと確実に止める
-        for pgid in list(mod._leftover_pgids):
+        for lp in list(mod._leftover_procs):
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(lp.pid, signal.SIGKILL)
             except OSError:
                 pass
-        mod._leftover_pgids.clear()
+        mod._leftover_procs.clear()
         try:
             os.killpg(int(pidfile.read_text().strip()), signal.SIGKILL)
         except (OSError, ValueError):
@@ -3275,7 +3276,11 @@ def test_force_exit_retries_kill_on_leftover_groups(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(mod.os, "killpg", lambda pg, sig: killed.append(pg))
     monkeypatch.setattr(mod.os, "write", lambda fd, b: len(b))
     monkeypatch.setattr(mod.os, "_exit", lambda code: exits.append(code))
-    monkeypatch.setattr(mod, "_leftover_pgids", [111, 222])
+    monkeypatch.setattr(
+        mod,
+        "_leftover_procs",
+        [types.SimpleNamespace(pid=111), types.SimpleNamespace(pid=222)],
+    )
     mod._force_exit(None)
     assert killed == [111, 222]
     assert exits == [mod.EXIT_RUNTIME_ERROR]
