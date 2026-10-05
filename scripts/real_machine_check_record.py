@@ -69,6 +69,14 @@ CAP_PACKAGE_FILE = 256 * 1024 * 1024
 # CLI 本体のハッシュを取る上限（release ビルドは数 MB。異常に大きいものは読まない）
 CAP_CLI_BINARY = 1024 * 1024 * 1024
 
+# 学習する候補の番号（B・C の `train --candidate`。select は同じ候補を返す）
+TRAIN_CANDIDATE = 0
+# スコア合計が 1 から外れてよい許容差。crates/core/src/judgment.rs の `SCORE_SUM_TOLERANCE` と同じ値
+# （実 CLI の runtime は合計がこの範囲に収まらない出力を `RuntimeError` にする）
+SCORE_SUM_TOLERANCE = 1e-6
+# check-runtime-linkage.sh の `for t in ...` に並ぶ env -i テストの数（pytest で照合する）
+LINKAGE_ENV_I_TESTS = 3
+
 # E の件数上限（子プロセスを件数ぶん起動するため）
 MAX_E_RECORDS = 1000
 MAX_REPEAT = 1000
@@ -325,6 +333,10 @@ class Ctx:
     harness: bool
     # A 以外の子へ渡す環境（CARGO_NET_OFFLINE=true。REQ-38）
     offline_env: dict[str, str]
+    # 開始時に記録した CLI の sha256（D が、リンクを確認した対象と同一かを照合する）
+    cli_sha256: str | None = None
+    # FANDHE_EDGE_BIN で CLI を差し替えたか（差し替えなら p95 は参考値に固定する）
+    bin_override: bool = False
 
 
 def make_offline_env() -> dict[str, str]:
@@ -380,22 +392,146 @@ def _is_finite_number(v: Any) -> bool:
 # --------------------------------------------------------------------------------------
 
 
-def _step_check(name: str, obj: dict[str, Any], allowed: set[int], rc: int) -> bool:
-    """工程の stdout JSON が契約に合うか（exit 0 は status ok、許容された非 0 は step 名一致）。"""
+@dataclass
+class Facts:
+    """作業ディレクトリへコピーした fixture から導く、報告値の照合用の期待値。"""
+
+    option_ids: list[str]
+    train_records: int
+    eval_records: int
+    has_acceptance: bool
+    p95_limit_us: int | None
+
+
+def _count_lines(path: Path) -> int | None:
+    """空行を除く行数。読めなければ None。"""
+    text = read_capped(path, CAP_INPUT_FILE)
+    if text is None:
+        return None
+    return sum(1 for ln in text.splitlines() if ln.strip())
+
+
+def read_facts(pdir: Path) -> Facts | None:
+    """`pdir` の 3 ファイルから期待値を導く。読めなければ None。"""
+    text = read_capped(pdir / "definition.json", CAP_INPUT_FILE)
+    train, evaluation = _count_lines(pdir / "train.jsonl"), _count_lines(pdir / "evaluation.jsonl")
+    if text is None or train is None or evaluation is None:
+        return None
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return None
+    options = d.get("options") if isinstance(d, dict) else None
+    if not isinstance(options, list):
+        return None
+    ids = [o.get("id") for o in options if isinstance(o, dict)]
+    if not ids or len(ids) != len(options) or not all(isinstance(i, str) for i in ids):
+        return None
+    limits = d.get("limits")
+    p95 = limits.get("max_infer_p95_us") if isinstance(limits, dict) else None
+    return Facts(
+        option_ids=ids,
+        train_records=train,
+        eval_records=evaluation,
+        has_acceptance="acceptance" in d,
+        p95_limit_us=p95 if _is_int(p95) else None,
+    )
+
+
+def check_infer_output(obj: dict[str, Any], facts: Facts) -> bool:
+    """infer の判定が定義と整合するか（REQ-21・REQ-33）。
+
+    `predicted_label` が選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で、
+    合計が 1 から `SCORE_SUM_TOLERANCE` 以内（実 CLI の runtime が保証する範囲）。
+    """
+    scores = obj.get("scores")
+    if not isinstance(scores, dict) or obj.get("predicted_label") not in facts.option_ids:
+        return False
+    if set(scores) != set(facts.option_ids) or len(scores) != len(facts.option_ids):
+        return False
+    if not all(_is_finite_number(v) for v in scores.values()):
+        return False
+    return abs(sum(float(v) for v in scores.values()) - 1.0) <= SCORE_SUM_TOLERANCE
+
+
+def _nonneg_int(v: Any) -> bool:
+    """bool を除く 0 以上の整数か。"""
+    return _is_int(v) and v >= 0
+
+
+def check_stage_report(name: str, obj: dict[str, Any], facts: Facts, selected: int | None) -> bool:
+    """exit 0 の工程 JSON が、指定値・入力から分かる値と整合するか（REQ-21・REQ-33）。
+
+    欄名・形は crates/core/src/stage_report.rs に合わせる。CLI の計算は再実装しない。
+    """
+    if name == "register":
+        return obj.get("options") == len(facts.option_ids) and (
+            obj.get("evaluation_defined") is (facts.eval_records > 0)
+        )
+    if name == "inspect":
+        split = obj.get("split")
+        vr = obj.get("valid_records")
+        if not isinstance(split, dict) or not _nonneg_int(vr) or vr != facts.train_records:
+            return False
+        parts = [split.get(k) for k in ("train", "validation", "test")]
+        return all(_nonneg_int(x) for x in parts) and sum(parts) == vr
+    if name in ("train", "select"):
+        return obj.get("candidate") == TRAIN_CANDIDATE and isinstance(obj.get("kind"), str)
+    if name == "evaluate":
+        n_total, correct = obj.get("n_total"), obj.get("correct")
+        return (
+            selected is not None
+            and obj.get("candidate") == selected
+            and n_total == facts.eval_records
+            and _nonneg_int(correct)
+            and correct <= n_total
+        )
+    if name == "package":
+        # 合否基準の無い定義では judgment:null・acceptance_defined:false
+        if not facts.has_acceptance:
+            return obj.get("judgment") is None and obj.get("acceptance_defined") is False
+        return obj.get("acceptance_defined") is True
+    return True
+
+
+def check_package_metrics(obj: dict[str, Any], rc: int, facts: Facts) -> bool:
+    """package（exit 0・20）の `capacity`・`infer_p95` の整合（REQ-30・REQ-31）。
+
+    capacity は要約でき、`exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過なし。
+    `infer_p95` は定義に `max_infer_p95_us` があるときだけ非 null。
+    """
+    cap = capacity_summary(obj)
+    if cap is None or cap["exceeded"] != (cap["total_bytes"] > cap["limit_bytes"]):
+        return False
+    if rc == 0 and cap["exceeded"]:
+        return False
+    return (obj.get("infer_p95") is None) == (facts.p95_limit_us is None)
+
+
+def _step_check(
+    name: str,
+    obj: dict[str, Any],
+    allowed: set[int],
+    rc: int,
+    facts: Facts,
+    selected: int | None,
+) -> bool:
+    """工程の stdout JSON が契約と整合するか（exit 0 は報告値まで照合、非 0 は許容と step）。"""
     if name == "infer":
         return (
             rc == 0
             and obj.get("status") == "ok"
             and "step" not in obj
             and isinstance(obj.get("id"), str)
-            and isinstance(obj.get("predicted_label"), str)
-            and isinstance(obj.get("scores"), dict)
+            and check_infer_output(obj, facts)
         )
     if obj.get("step") != name:
         return False
-    if rc == 0:
-        return obj.get("status") == "ok"
-    return rc in allowed
+    if rc != 0:
+        return rc in allowed and (name != "package" or check_package_metrics(obj, rc, facts))
+    if obj.get("status") != "ok" or not check_stage_report(name, obj, facts, selected):
+        return False
+    return name != "package" or check_package_metrics(obj, rc, facts)
 
 
 def run_pipeline(
@@ -410,10 +546,14 @@ def run_pipeline(
     する（経路の閉じ込め。REQ-39）。戻り値は (工程記録, package の JSON, 失敗記録)。
     失敗記録が None でなければ以降の工程は実行していない。
     """
+    facts = read_facts(pdir)
+    if facts is None:
+        return [], None, fail_item("input_unreadable")
     logs = pdir / "steps"
     logs.mkdir(exist_ok=True)
     steps: list[dict[str, Any]] = []
     package_obj: dict[str, Any] | None = None
+    selected: int | None = None
 
     def go(
         name: str, argv: list[str], command: str, allowed: set[int]
@@ -448,7 +588,7 @@ def run_pipeline(
         if rc != 0 and rc not in allowed:
             err = error_fields(obj)
             return None, fail_item("unexpected_exit_code", step=name, exit_code=rc, **err)
-        if not _step_check(name, obj, allowed, rc):
+        if not _step_check(name, obj, allowed, rc, facts, selected):
             return None, fail_item(
                 "unexpected_output", step=name, exit_code=rc, **error_fields(obj)
             )
@@ -471,8 +611,8 @@ def run_pipeline(
         return steps, package_obj, failure
     obj, failure = go(
         "train",
-        ["train", "--project-dir", "project", "--candidate", "0"],
-        "train --project-dir project --candidate 0",
+        ["train", "--project-dir", "project", "--candidate", str(TRAIN_CANDIDATE)],
+        f"train --project-dir project --candidate {TRAIN_CANDIDATE}",
         set(),
     )
     if failure:
@@ -485,6 +625,7 @@ def run_pipeline(
     c = obj.get("candidate") if isinstance(obj, dict) else None
     if not _is_int(c) or c < 0:
         return steps, package_obj, fail_item("missing_field", step="select", exit_code=0)
+    selected = c
     obj, failure = go(
         "evaluate",
         ["evaluate", "--project-dir", "project", "--candidate", str(c)],
@@ -515,7 +656,7 @@ def run_pipeline(
 
 
 def capacity_summary(pkg: dict[str, Any] | None) -> dict[str, Any] | None:
-    """package の `capacity` を数値・真偽値だけの固定構造へ写す。形が違えば None。"""
+    """package の `capacity` を固定構造へ写す。欠落・負・型違いは None（REQ-30）。"""
     cap = pkg.get("capacity") if isinstance(pkg, dict) else None
     if not isinstance(cap, dict):
         return None
@@ -528,15 +669,15 @@ def capacity_summary(pkg: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(c, dict):
             return None
         b, fc = c.get("bytes"), c.get("file_count")
-        if not _is_int(b) or not _is_int(fc):
+        if not _nonneg_int(b) or not _nonneg_int(fc):
             return None
         out_comps[name] = {"bytes": b, "file_count": fc}
     total, limit, exceeded = cap.get("total_bytes"), cap.get("limit_bytes"), cap.get("exceeded")
-    if not _is_int(total) or not isinstance(exceeded, bool):
+    if not _nonneg_int(total) or not _nonneg_int(limit) or not isinstance(exceeded, bool):
         return None
     return {
         "total_bytes": total,
-        "limit_bytes": limit if _is_int(limit) else None,
+        "limit_bytes": limit,
         "exceeded": exceeded,
         "components": out_comps,
     }
@@ -604,7 +745,7 @@ def judge_make_ci(counts: dict[str, Any]) -> str | None:
         return "skipped"
     if rust["failed"] > 0 or (pytest is not None and pytest["failed"] > 0):
         return "test_failures"
-    if rust["passed"] < 1 or pytest is None:
+    if rust["passed"] < 1 or pytest is None or pytest["passed"] < 1:
         return "no_test_results"
     return None
 
@@ -681,12 +822,20 @@ def package_files(pdir: Path) -> list[dict[str, Any]] | None:
     return out or None
 
 
-def judge_p95(rc: int, p95: Any, cap: dict[str, Any] | None, limit_us: int) -> str | None:
+def classify_p95(ctx: Ctx) -> str:
+    """p95 の区分。静かな状態の申告があり、代役・CLI 差し替えが無いときだけ real_machine。"""
+    if ctx.quiet_machine and not ctx.harness and not ctx.bin_override:
+        return "real_machine"
+    return "reference_only"
+
+
+def judge_p95(rc: int, pkg: Any, p95: Any, cap: dict[str, Any] | None, limit_us: int) -> str | None:
     """C-1 の判定。満たさなければ reason、満たせば None。
 
     CLI の規則は `p95_us > limit_us` で超過（crates/cli/src/stages/package.rs）。exit 20 は p95 超過
     のときだけで、容量超過など p95 以外の理由の exit 20 は ok にしない。
     C-1 の capacity が欠落・要約不能・超過のいずれでも `unexpected_output`。
+    exit 20 は `code == "limit_exceeded"`、exit 0 は `status == "ok"` の JSON のときだけ合格。
     """
     if (
         not isinstance(p95, dict)
@@ -697,6 +846,12 @@ def judge_p95(rc: int, p95: Any, cap: dict[str, Any] | None, limit_us: int) -> s
         return "missing_field"
     exceeded = p95["exceeded"]
     if exceeded != (p95["p95_us"] > p95["limit_us"]) or exceeded != (rc == 20):
+        return "unexpected_output"
+    if not isinstance(pkg, dict):
+        return "unexpected_output"
+    if rc == 20 and pkg.get("code") != "limit_exceeded":
+        return "unexpected_output"
+    if rc == 0 and pkg.get("status") != "ok":
         return "unexpected_output"
     if p95["limit_us"] != limit_us or cap is None or cap["exceeded"]:
         return "unexpected_output"
@@ -736,7 +891,11 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
         return dict(failure, case="C-1", steps=steps1)
     rc1 = next(s["exit_code"] for s in steps1 if s["step"] == "package")
     p95 = pkg1.get("infer_p95") if isinstance(pkg1, dict) else None
-    reason1 = judge_p95(rc1, p95, capacity_summary(pkg1), ctx.p95_limit_us)
+    reason1 = judge_p95(rc1, pkg1, p95, capacity_summary(pkg1), ctx.p95_limit_us)
+    # exit 20 なら package/ は作られず、exit 0 なら公開される（crates/cli/src/stages/package.rs）
+    published1 = (c1 / "project" / "package").exists()
+    if reason1 is None and published1 != (rc1 == 0):
+        reason1 = "unexpected_output"
     if reason1 is not None:
         return fail_item(reason1, case="C-1", step="package", exit_code=rc1)
     p95_rec = {
@@ -744,8 +903,9 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
         "limit_us": p95["limit_us"],
         "exceeded": p95["exceeded"],
         # 静かな状態という人の申告があるときだけ real_machine（`--quiet-machine`）
-        "classification": "real_machine" if ctx.quiet_machine else "reference_only",
+        "classification": classify_p95(ctx),
         "package_exit_code": rc1,
+        "package_published": published1,
     }
     c2 = ctx.work / "C2"
     if not stage_inputs(ctx, c2, {"max_package_bytes": ctx.package_limit_bytes}):
@@ -790,8 +950,43 @@ def parse_otool_libraries(text: str) -> list[str]:
     return libs
 
 
+def parse_linkage_tool(text: str) -> str | None:
+    """check-runtime-linkage.sh の最終行 `OK: tool=<otool|ldd> ...` の tool。無ければ None。"""
+    for line in reversed(text.splitlines()):
+        m = re.match(r"^OK: tool=(\S+)", line)
+        if m:
+            return m.group(1) if m.group(1) in ("otool", "ldd") else None
+    return None
+
+
+def linkage_target_path(ctx: Ctx) -> Path:
+    """check-runtime-linkage.sh の検査対象のパス（`CARGO_TARGET_DIR`、既定は repo の target）。"""
+    raw = ctx.offline_env.get("CARGO_TARGET_DIR")
+    base = Path(raw) if raw else ctx.repo / "target"
+    if not base.is_absolute():
+        base = ctx.repo / base
+    return base / "release" / "fandhe-edge"
+
+
+def judge_linkage_target(
+    start_sha: str | None, bin_sha_now: str | None, target_sha: str | None
+) -> str | None:
+    """D の同一性判定（REQ-32）。リンクを確認した対象・いまの CLI・開始時の CLI が一致すれば None。
+
+    検査対象を読めなければ `linkage_target_unreadable`、いまの CLI が開始時と違う（または読めない）
+    なら `cli_changed`、検査対象だけ違えば `linkage_target_mismatch`。
+    """
+    if target_sha is None:
+        return "linkage_target_unreadable"
+    if start_sha is None or bin_sha_now is None or bin_sha_now != start_sha:
+        return "cli_changed"
+    if target_sha != bin_sha_now:
+        return "linkage_target_mismatch"
+    return None
+
+
 def item_d(ctx: Ctx) -> dict[str, Any]:
-    """D: `make check-runtime-linkage` と、CLI の `otool -L`（macOS のみ。取れなければ null）。"""
+    """D: `make check-runtime-linkage`・検査対象と実行 CLI の同一性・`otool -L`（macOS のみ）。"""
     d = ctx.work / "D"
     d.mkdir()
     r = run_cmd(
@@ -813,7 +1008,10 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         "exit_code": r.exit_code,
         "skip_lines": sum(1 for ln in text.splitlines() if ln.startswith("skip:")),
         "env_i_tests_ok": sum(1 for ln in text.splitlines() if ln.startswith("ok: req32_")),
+        "linkage_tool": parse_linkage_tool(text),
         "direct_libraries": None,
+        "linkage_target_sha256": None,
+        "linkage_target_matches_cli": None,
     }
     if r.exit_code != 0:
         return dict(rec, status="failed", reason="unexpected_exit_code")
@@ -822,6 +1020,23 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         return dict(rec, status="failed", reason="skipped")
     if rec["env_i_tests_ok"] < 1:
         return dict(rec, status="failed", reason="no_test_results")
+    # 成功の印を厳密に: テスト数が定数と一致し、最終の `OK: tool=...` 行があること。
+    # macOS では動的リンクの確認が otool で行われたこと（ldd 等の補助では実機の確認にならない）
+    if rec["env_i_tests_ok"] != LINKAGE_ENV_I_TESTS or rec["linkage_tool"] is None:
+        return dict(rec, status="failed", reason="unexpected_output")
+    if sys.platform == "darwin" and rec["linkage_tool"] != "otool":
+        return dict(rec, status="failed", reason="unexpected_output")
+    # check-runtime-linkage.sh が検査したバイナリ（`CARGO_TARGET_DIR` 規則）が、B・C・E で実行した
+    # CLI と同一でなければ、リンク確認は実行した CLI の証拠にならない。代役の下の偽 make は何も
+    # 検査していないので照合しない（matches は null のまま）
+    if not ctx.harness:
+        target_sha = sha256_file(linkage_target_path(ctx), CAP_CLI_BINARY)
+        now_sha = sha256_file(ctx.bin, CAP_CLI_BINARY)
+        rec["linkage_target_sha256"] = target_sha
+        reason = judge_linkage_target(ctx.cli_sha256, now_sha, target_sha)
+        rec["linkage_target_matches_cli"] = reason is None
+        if reason is not None:
+            return dict(rec, status="failed", reason=reason)
     # テストの偽 CLI（スクリプト）には otool が失敗するため、代役の下では取らない
     otool = shutil.which("otool")
     if sys.platform == "darwin" and otool and not ctx.harness:
@@ -924,7 +1139,8 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
     edir = ctx.work / "E"
     edir.mkdir()
     recs = read_train_inputs(bdir / "train.jsonl")
-    if recs is None:
+    facts = read_facts(bdir)
+    if recs is None or facts is None:
         return fail_item("input_unreadable")
     if not recs or len(recs) > MAX_E_RECORDS:
         return fail_item("record_count_out_of_range", records=len(recs))
@@ -950,16 +1166,20 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
         return fail_item(reason, step="infer-batch", exit_code=r.exit_code)
     text = read_capped(edir / "batch.stdout", CAP_CLI_STDOUT) or ""
     batch: dict[str, dict[str, Any]] = {}
-    for line in text.splitlines():
+    lines = text.splitlines()
+    if len(lines) != len(recs):
+        return fail_item("unexpected_output", step="infer-batch", exit_code=0)
+    for line in lines:
         try:
             v = json.loads(line)
         except ValueError:
             return fail_item("invalid_json", step="infer-batch", exit_code=0)
         if not isinstance(v, dict) or v.get("status") != "ok" or not isinstance(v.get("id"), str):
             return fail_item("unexpected_output", step="infer-batch", exit_code=0)
+        # id の重複は後勝ちで潰さない
+        if v["id"] in batch or not check_infer_output(v, facts):
+            return fail_item("unexpected_output", step="infer-batch", exit_code=0)
         batch[v["id"]] = v
-    if len(batch) != len(recs):
-        return fail_item("unexpected_output", step="infer-batch", exit_code=0)
     single: dict[str, dict[str, Any]] = {}
     for rid, inp in recs:
         # `--text` の値が `-` で始まっても値として消費される（crates/cli/src/args.rs）
@@ -978,7 +1198,12 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
             reason = r.reason or "unexpected_exit_code"
             return fail_item(reason, step="infer-single", exit_code=r.exit_code)
         obj = parse_json_object(edir / "single.stdout", CAP_CLI_STDOUT)
-        if obj is None or obj.get("status") != "ok" or obj.get("id") != rid:
+        if (
+            obj is None
+            or obj.get("status") != "ok"
+            or obj.get("id") != rid
+            or not check_infer_output(obj, facts)
+        ):
             return fail_item("unexpected_output", step="infer-single", exit_code=0)
         single[rid] = obj
     cmp = compare_infer(batch, single)
@@ -1258,6 +1483,13 @@ def render_markdown(rec: dict[str, Any]) -> str:
                 detail["capacity_limit"] = it["capacity_limit"]
         text = json.dumps(detail, ensure_ascii=False, sort_keys=True)
         lines.append(f"| {name} | {_cell(it['status'])} | {_cell(text)} |")
+    d_item = rec["items"]["D"]
+    lines += [
+        "",
+        "- D のリンク検査対象と実行した CLI の一致: "
+        f"{_cell(d_item.get('linkage_target_matches_cli'))}"
+        f"（検査対象 sha256: {_cell(d_item.get('linkage_target_sha256'))}）",
+    ]
     lines += [
         "",
         "## 検証済みと扱わない点",
@@ -1400,6 +1632,8 @@ def run(args: argparse.Namespace) -> int:
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     env = collect_environment(ctx, cli_profile)
     env["started_local"] = started
+    ctx.cli_sha256 = env["cli_sha256"]
+    ctx.bin_override = bool(args.bin_override)
     rec: dict[str, Any] = {
         "schema": SCHEMA,
         "evidence_hint": "test_harness" if harness else "requires_human_review",
@@ -1419,6 +1653,7 @@ def run(args: argparse.Namespace) -> int:
     }
     stopped = False
     interrupted = False
+    internal_error = False
     b_ok = False
     for name in ITEM_ORDER:
         if name not in items:
@@ -1437,6 +1672,7 @@ def run(args: argparse.Namespace) -> int:
                 res, interrupted = fail_item("interrupted"), True
             except Exception as e:
                 res = fail_item("internal_error", error_type=type(e).__name__)
+                internal_error = True
             rec["items"][name] = res
             if res["status"] != "ok":
                 stopped = True
@@ -1457,6 +1693,9 @@ def run(args: argparse.Namespace) -> int:
         return emit("runtime_error", "cannot write the record", EXIT_RUNTIME_ERROR, False)
     if interrupted:
         return emit("runtime_error", "interrupted", EXIT_RUNTIME_ERROR, True)
+    if internal_error:
+        # 想定外の例外はスクリプト自身の実行不能（70）。record は書いてある
+        return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, True)
     if all(rec["items"][n]["status"] == "ok" for n in items):
         return emit("ok", "all requested items completed", EXIT_OK, True)
     return emit(

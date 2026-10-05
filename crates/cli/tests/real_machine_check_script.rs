@@ -41,6 +41,7 @@ echo "$stage $here" >> "$FAKE_DIR/cli.log"
 printf '%s\n' "$*" >> "$FAKE_DIR/cli.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cli.env"
 [ "$stage" = register ] && cp definition.json "$FAKE_DIR/def-$here.json"
+SC='{"alpha":0.5,"beta":0.25,"gamma":0.25}'
 p95lim=$(sed -n 's/.*"max_infer_p95_us": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
 [ -n "$p95lim" ] || p95lim=50000
 pkglim=$(sed -n 's/.*"max_package_bytes": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
@@ -64,7 +65,7 @@ train)
 select)
   printf '{"step":"select","status":"ok","candidate":0,"kind":"c1"%s}\n' "$extra" ;;
 evaluate)
-  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":12,"correct":12,"accuracy":1.0,"macro_f1":1.0%s}\n' "$extra" ;;
+  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":1.0,"macro_f1":1.0%s}\n' "${FAKE_EVAL_N:-12}" "$extra" ;;
 package)
   c2mode=${FAKE_C2_MODE:-limit}
   if [ "$here" = C2 ] && [ "$c2mode" != exit0 ]; then
@@ -84,6 +85,7 @@ package)
     # low は p95_us が上限未満なのに exceeded:true・exit 20 を返す不正な出力
     pv=99999
     [ "$FAKE_C1_EXCEED" = low ] && pv=2
+    [ -n "${FAKE_C1_KEEPDIR:-}" ] && mkdir -p project/package
     printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":40000000,"exceeded":false,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$comps" "$pv" "$p95lim"
     exit 20
   fi
@@ -104,14 +106,21 @@ infer)
   done
   if [ -n "$file" ]; then
     cp "$file" "$FAKE_DIR/batch-input.jsonl"
-    lab=a
-    [ -n "${FAKE_E_MISMATCH:-}" ] && lab=b
+    lab=alpha
+    [ -n "${FAKE_E_MISMATCH:-}" ] && lab=beta
+    first=
+    n=0
     while IFS= read -r line; do
       rid=$(printf '%s' "$line" | sed -n 's/^{"id": "\([^"]*\)".*/\1/p')
-      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":{"a":0.5,"b":0.5}}\n' "$rid" "$lab"
+      [ -n "$first" ] || first=$rid
+      n=$((n + 1))
+      [ -n "${FAKE_E_DUP:-}" ] && [ "$n" = 2 ] && rid=$first
+      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$SC"'}\n' "$rid" "$lab"
     done < "$file"
   else
-    printf '{"id":"%s","status":"ok","predicted_label":"a","scores":{"a":0.5,"b":0.5}}\n' "$id"
+    lab=alpha
+    [ -n "${FAKE_INFER_BAD_LABEL:-}" ] && lab=zzz
+    printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$SC"'}\n' "$id" "$lab"
   fi ;;
 *) exit 99 ;;
 esac
@@ -154,9 +163,12 @@ check-runtime-linkage)
   fi
   mode=${FAKE_LINK_MODE:-ok}
   [ "$mode" = skip ] && echo "skip: no cargo"
+  [ "$(uname -s)" = Darwin ] && tool=otool || tool=ldd
   if [ "$mode" != none ]; then
     echo "ok: req32_one"
     echo "ok: req32_two"
+    [ "$mode" = two ] || echo "ok: req32_three"
+    [ "$mode" = fail ] || echo "OK: tool=$tool evidence=transitive targets=fandhe-edge,env_isolation"
   fi
   [ "$mode" = fail ] && exit 2
   exit 0 ;;
@@ -619,7 +631,15 @@ fn req33_normal_run_records_all_items() {
     assert_eq!(e.q("items.C.capacity_limit.package_published"), "false");
 
     // D・E・F（REQ-28）
-    assert_eq!(e.q("items.D.env_i_tests_ok"), "2");
+    assert_eq!(e.q("items.D.env_i_tests_ok"), "3");
+    assert_eq!(
+        e.q("items.D.linkage_tool"),
+        if cfg!(target_os = "macos") {
+            "\"otool\""
+        } else {
+            "\"ldd\""
+        }
+    );
     assert_eq!(e.q("items.E.records"), "90");
     assert_eq!(e.q("items.E.label_match"), "90");
     assert_eq!(e.q("items.E.label_mismatch"), "0");
@@ -992,18 +1012,22 @@ fn req30_c2_unenforced_capacity_limit_fails() {
     }
 }
 
-/// REQ-31: `--quiet-machine` ありのときだけ p95 の区分が `real_machine`、なしでは `reference_only`。
+/// REQ-31: 偽 make・偽 cargo の代役（と `FANDHE_EDGE_BIN` の差し替え）の下では、`--quiet-machine` が
+/// あっても p95 の区分は `reference_only`（実機の測定でないものを `real_machine` にしない）。
+/// `real_machine` になる経路は実 make・実 cargo を要するため、Python 側のテストで固定している。
 #[test]
-fn req31_quiet_machine_sets_p95_classification() {
+fn req31_quiet_machine_under_harness_stays_reference_only() {
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "C", "--quiet-machine"]), &[]);
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
-    assert_eq!(e.q("items.C.p95.classification"), "\"real_machine\"");
+    assert_eq!(e.q("items.C.p95.classification"), "\"reference_only\"");
     assert_eq!(e.q("options.quiet_machine"), "true");
+    assert_eq!(e.q("evidence_hint"), "\"test_harness\"");
     let e = Env::new();
     let o = e.run(&with_work(&e, &["--items", "C"]), &[]);
     assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
     assert_eq!(e.q("items.C.p95.classification"), "\"reference_only\"");
+    assert_eq!(e.q("options.quiet_machine"), "false");
 }
 
 /// REQ-30・REQ-31: `--p95-limit-us`・`--package-limit-bytes` が定義ファイルの `limits` に反映される。
@@ -1174,7 +1198,7 @@ fn req21_sigterm_stops_children_and_records_interrupted() {
 
 /// REQ-30: C-2 で CLI が指定値と違う `limit_bytes` を返したら（上限が伝わっていない）C は failed
 /// （`unexpected_output`）・exit 10。`total_bytes <= limit_bytes` なのに `exceeded:true`・exit 20 を
-/// 返した場合も failed（`capacity_limit_not_enforced`）。
+/// 返した場合も failed（package の報告値の不整合。`unexpected_output`）。
 #[test]
 fn req30_c2_wrong_limit_or_inconsistent_excess_fails() {
     let e = Env::new();
@@ -1193,8 +1217,12 @@ fn req30_c2_wrong_limit_or_inconsistent_excess_fails() {
         &[("FAKE_C2_MODE", "small")],
     );
     assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    // total_bytes <= limit_bytes の exceeded:true は package の報告値の不整合として工程で止まる
     assert_eq!(e.q("items.C.status"), "\"failed\"");
-    assert_eq!(e.q("items.C.reason"), "\"capacity_limit_not_enforced\"");
+    assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.C.case"), "\"C-2\"");
+    assert_eq!(e.q("items.C.step"), "\"package\"");
+    assert_eq!(e.q("items.C.exit_code"), "20");
 }
 
 /// REQ-31: C-1 で `p95_us` が上限未満なのに `exceeded:true`・exit 20 を返したら C は failed
@@ -1236,4 +1264,73 @@ fn req39_term_ignoring_grandchild_does_not_outlive_script() {
         assert!(Instant::now() < deadline, "grandchild {pid} still alive");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// REQ-33: evaluate の `n_total` が評価データの行数（12）と違えば B は failed（`unexpected_output`）で
+/// exit 10。後続の工程は起動されない。
+#[test]
+fn req33_evaluate_n_total_mismatch_fails_b() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B"]), &[("FAKE_EVAL_N", "13")]);
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.stdout, JUDGED_FAIL);
+    assert_eq!(e.q("items.B.status"), "\"failed\"");
+    assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.B.step"), "\"evaluate\"");
+    assert_eq!(e.count_calls("package B"), 0);
+}
+
+/// REQ-33: infer の `predicted_label` が定義の選択肢 ID でなければ B は failed（`unexpected_output`）。
+#[test]
+fn req33_infer_label_outside_options_fails_b() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[("FAKE_INFER_BAD_LABEL", "1")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.B.status"), "\"failed\"");
+    assert_eq!(e.q("items.B.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.B.step"), "\"infer\"");
+}
+
+/// REQ-31: C-1 が exit 20 なのに `package/` が残っていれば C は failed（`unexpected_output`）。
+#[test]
+fn req31_c1_exit_20_with_published_package_fails() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "C"]),
+        &[("FAKE_C1_EXCEED", "1"), ("FAKE_C1_KEEPDIR", "1")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.C.status"), "\"failed\"");
+    assert_eq!(e.q("items.C.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.C.case"), "\"C-1\"");
+    assert_eq!(e.q("items.C.exit_code"), "20");
+}
+
+/// REQ-32: D は `ok: req32_` が 3 件でない（2 件）と failed（`unexpected_output`）で exit 10。
+#[test]
+fn req32_item_d_requires_exactly_three_env_i_tests() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "D"]),
+        &[("FAKE_LINK_MODE", "two")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.stdout, JUDGED_FAIL);
+    assert_eq!(e.q("items.D.status"), "\"failed\"");
+    assert_eq!(e.q("items.D.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.D.env_i_tests_ok"), "2");
+}
+
+/// REQ-28: バッチ出力に id の重複があれば（行数は合っていても）E は failed（`unexpected_output`）。
+#[test]
+fn req28_item_e_duplicate_batch_id_fails() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B,E"]), &[("FAKE_E_DUP", "1")]);
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(e.q("items.E.status"), "\"failed\"");
+    assert_eq!(e.q("items.E.reason"), "\"unexpected_output\"");
+    assert_eq!(e.q("items.E.step"), "\"infer-batch\"");
 }
