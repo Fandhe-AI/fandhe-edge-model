@@ -139,9 +139,11 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 - **C-1 の合格条件**:
   - exit 0 または 20（どちらでも ok）
   - `infer_p95` に `p95_us`・`limit_us`・`exceeded` が boolean である
-  - `exceeded` の値と終了コードが整合：`exceeded == true` ↔ `exit 20`
+  - `exceeded` が `p95_us > limit_us` の値と一致
+  - `exceeded` が exit コード 20 の有無と一致：`exceeded == true` ↔ `exit 20`
   - `limit_us` が指定値（`ctx.p95_limit_us`）と一致
-- **失敗の理由**: `missing_field`（`infer_p95` が不完全）、`unexpected_output`（`exceeded` と終了コードが不整合、または `limit_us` が指定値と異なる）、工程別の失敗
+  - C-1 の `capacity` は超過していない
+- **失敗の理由**: `missing_field`（`infer_p95` が不完全）、`unexpected_output`（`exceeded` と計算値・終了コード・`limit_us` のいずれか不整合、または `capacity` 超過）、工程別の失敗
 - **記録する `record.json` フィールド**:
   - `p95.p95_us`・`p95.limit_us`・`p95.exceeded`・`p95.classification`（`real_machine` / `reference_only`）・`p95.package_exit_code`（0 または 20）
 - **注意**: p95 の値は参考値です。`--quiet-machine` を付け、他のアプリを実際に閉じた状態でのみ「実機の p95」として扱います。それ以外は `classification` が `reference_only` になります。
@@ -156,13 +158,15 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - exit 20
   - `code == "limit_exceeded"`
   - `capacity.exceeded == true`
+  - `capacity.total_bytes > capacity.limit_bytes`（超過判定の一致）
+  - `capacity.limit_bytes` が指定値（`ctx.package_limit_bytes`）と一致
   - `package/` ディレクトリが存在しない
-- **失敗の理由**: `capacity_limit_not_enforced`（上限が機能していない）、工程別の失敗
+- **失敗の理由**: `unexpected_output`（上限値の不一致・欠落・exit コードや code が不適切）、`capacity_limit_not_enforced`（上限の値は正しいが超過判定・発行が機能していない）、工程別の失敗
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `p95`: C-1 の結果（再利用）
-  - `capacity_limit.package_exit_code`（20）、`.code`（`"limit_exceeded"`）、`.capacity_exceeded`（true または null）、`.total_bytes`・`.limit_bytes`（null の場合あり）、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）
-  - `reason`（失敗時のみ）: `capacity_limit_not_enforced`
+  - `capacity_limit.package_exit_code`（20）、`.code`（`"limit_exceeded"`）、`.capacity_exceeded`（true または null）、`.total_bytes`・`.limit_bytes`、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）
+  - `reason`（失敗時のみ）: `unexpected_output` / `capacity_limit_not_enforced`
 
 ### 4-D. 推論が学習に依存しないこと（REQ-32）
 
@@ -205,7 +209,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   - `max_abs_score_diff`: 有限なスコア差の最大値（非有限は除外）
   - `input_sha256`: 推論に使った入力ファイルのハッシュ
   - `reason`（失敗時のみ）: `mismatch`
-  - 失敗時の詳細は `.../E/mismatch-ids.txt` に不一致の `id` を記録（1 行ずつ）
+  - 失敗時の詳細は `.../E/mismatch-ids.txt` に以下のいずれかに該当する `id` を記録（1 行ずつ）：予測ラベル不一致・スコアに NaN・無限大・スコア差が許容差超過
 
 ### 4-F. ガード層の時間制限テスト再発確認（#346）
 
@@ -237,7 +241,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--work-dir` がリポジトリ内、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、実行中に SIGINT・SIGTERM・SIGHUP で中断、など。環境を確認またはスクリプトを再実行。**中断時は `record.json` が書かれる**（当時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。建ずと時点までの `record.md` も出力される |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、実行中に SIGINT・SIGTERM・SIGHUP で中断、など。環境を確認またはスクリプトを再実行。**中断時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される |
 
 **項目の実行フロー**:
 
