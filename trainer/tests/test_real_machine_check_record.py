@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -1944,7 +1945,7 @@ def _diff_paths(a: Any, b: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, .
 def test_sanitize_record_keeps_a_normal_record_unchanged(tmp_path: Path) -> None:
     """REQ-33: 正常な記録は `sanitize_record` で変わらない（正当な欄を伏せる退行を止める）。
 
-    変わってよいのは、パス文字（`project/package`）を含む infer の `command` だけ。従来どおり。
+    infer の `command` は固定の表示名でパス文字を含まないため、変わる欄はない（#361）。
     schema は run() が伏せ処理後に戻す固定定数のため比較から除く。
     """
     rec = _representative_record(tmp_path)
@@ -1953,7 +1954,7 @@ def test_sanitize_record_keeps_a_normal_record_unchanged(tmp_path: Path) -> None
         {k: v for k, v in rec.items() if k != "schema"},
         {k: v for k, v in out.items() if k != "schema"},
     )
-    assert changed == [("items", "B", "steps", 6, "command")]
+    assert changed == []
     assert mod.sanitize_record(out) == out
     # 工程の要約と package_files が実際に含まれていること（空の比較にしない）
     assert out["items"]["B"]["steps"][5]["summary"]["capacity"]["total_bytes"] == 10
@@ -2905,3 +2906,85 @@ def test_cargo_offline_reflects_whether_item_a_ran(
             signal.signal(s, h)
     rec = json.loads((tmp_path / "w" / "record.json").read_text())
     assert rec["options"]["cargo_offline"] is want
+
+
+# --- #361: 記録へ入る文字列の扱い（REQ-21・REQ-33・REQ-39） ---
+
+
+def test_cell_strips_control_and_bidi_chars() -> None:
+    """REQ-39: record.md のセルから制御・bidi 制御・ゼロ幅文字を除く。"""
+    assert mod._cell("a\u202eb\u2066c\u2069d\x00e\x1bf\u200bg") == "abcdefg"
+    assert mod._cell("x\ny\u0085z\u2028w\r\nq\tv") == "x y z w  q v"
+    assert mod._cell("<a&b>") == "&lt;a&amp;b&gt;"
+
+
+def test_render_markdown_has_no_control_chars_or_extra_lines() -> None:
+    """REQ-39: U+2028・bidi 制御・制御文字を含む値でも record.md に制御文字が残らない。"""
+    evil = "v\u202ex\u2028y\x07z\u2066"
+    items = {n: {"status": "not_run", "reason": "not_selected"} for n in mod.ITEM_ORDER}
+    items["B"] = {"status": "failed", "reason": "invalid_json", "step": evil}
+    rec = {
+        "schema": mod.SCHEMA,
+        "evidence_hint": evil,
+        "options": {"x": evil},
+        "environment": {"y": evil},
+        "items": items,
+    }
+    md = mod.render_markdown(rec)
+    bad = [c for c in md if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")]
+    assert bad == []
+
+
+def test_infer_command_is_a_fixed_display_name(tmp_path: Path) -> None:
+    """REQ-33: infer の command は固定語彙で、`<redacted>` にならず、パス文字を含まない。"""
+    assert mod.INFER_COMMAND_DISPLAY == "infer --package <package-dir> --text <fixed-sample>"
+    assert not any(c in mod.INFER_COMMAND_DISPLAY for c in mod.PATH_CHARS)
+    rec = _representative_record(tmp_path)
+    steps = rec["items"]["B"]["steps"]
+    assert steps[6]["command"] == mod.INFER_COMMAND_DISPLAY
+    out = mod.sanitize_record(rec)
+    assert out["items"]["B"]["steps"][6]["command"] == mod.INFER_COMMAND_DISPLAY
+    for st in steps:
+        assert not any(c in st["command"] for c in mod.PATH_CHARS)
+
+
+def test_error_type_name_is_a_closed_vocabulary() -> None:
+    """REQ-21: error_type は組み込みの語彙だけ。語彙外・名乗りだけの自作クラスは `<unexpected>`。"""
+    assert mod.error_type_name(ValueError()) == "ValueError"
+    assert mod.error_type_name(StopIteration()) == "<unexpected>"
+    assert mod.error_type_name(type("Evil\u202e", (Exception,), {})()) == "<unexpected>"
+    assert mod.error_type_name(type("ValueError", (Exception,), {})()) == "<unexpected>"
+    assert mod.sanitize_record({"error_type": "Evil\u202e"}) == {"error_type": "<unexpected>"}
+    assert mod.sanitize_record({"error_type": "RuntimeError"}) == {"error_type": "RuntimeError"}
+
+
+def test_split_lines_splits_only_on_lf(tmp_path: Path) -> None:
+    """REQ-28: 行分割は LF（と行末 CR）だけ。U+2028・U+0085 では割らない。"""
+    assert mod.split_lines("a\nb\r\nc") == ["a", "b", "c"]
+    assert mod.split_lines("a\u2028b\u0085c\n") == ["a\u2028b\u0085c"]
+    assert mod.split_lines("") == []
+    f = tmp_path / "t.jsonl"
+    f.write_text('{"a":"x\u2028y"}\n', encoding="utf-8")
+    assert mod._count_lines(f) == 1
+    assert mod.parse_otool_libraries("hdr\n  lib\u2028x.dylib (c)\n") == ["lib\u2028x.dylib"]
+
+
+def test_script_has_no_standard_line_splitting() -> None:
+    """REQ-28: 標準の行分割の再混入を止める。"""
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    assert ".splitlines(" not in src
+
+
+def test_nonzero_exit_with_non_json_reports_unexpected_exit_code(tmp_path: Path) -> None:
+    """REQ-21: 非 0 終了かつ非 JSON は invalid_json に加え、終了コードの不一致を明示する。"""
+    cli = _fake_cli(tmp_path, "echo not-json\nexit 64\n")
+    d = tmp_path / "B"
+    assert mod.stage_inputs(_ctx(tmp_path, cli), d, None)
+    _steps, _pkg, failure = mod.run_pipeline(_ctx(tmp_path, cli), d, "sample", {0})
+    assert failure == {
+        "status": "failed",
+        "reason": "invalid_json",
+        "step": "register",
+        "exit_code": 64,
+        "exit_code_unexpected": True,
+    }

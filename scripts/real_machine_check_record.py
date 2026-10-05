@@ -27,6 +27,7 @@ stderr の内容は書かない。最後の関門 `sanitize_record` は、文字
 from __future__ import annotations
 
 import argparse
+import builtins
 import hashlib
 import json
 import math
@@ -38,6 +39,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -253,6 +255,54 @@ def _unit_number(v: Any) -> bool:
     return _is_finite_number(v) and 0 <= v <= 1
 
 
+# `error_type` の閉じた語彙。例外の型名は利用者・環境由来の任意文字列になりうるため、
+# 組み込みの型名だけを残し、他は `UNEXPECTED` へ寄せる（REQ-21・REQ-39。#361）
+ERROR_TYPE_VOCAB = frozenset(
+    {
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "IndexError",
+        "AttributeError",
+        "OSError",
+        "FileNotFoundError",
+        "PermissionError",
+        "RuntimeError",
+        "RecursionError",
+        "MemoryError",
+        "OverflowError",
+        "ZeroDivisionError",
+        "AssertionError",
+        "UnicodeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "NotImplementedError",
+    }
+)
+# infer 工程の command の表示名。引数の値・パスは出さない（`/` を含めない。#361）
+INFER_COMMAND_DISPLAY = "infer --package <package-dir> --text <fixed-sample>"
+
+
+def error_type_name(e: BaseException) -> str:
+    """例外の型名を閉じた語彙へ写す。語彙外・組み込みを名乗る自作クラスは `<unexpected>`。"""
+    t = type(e)
+    name = t.__name__
+    if name in ERROR_TYPE_VOCAB and getattr(builtins, name, None) is t:
+        return name
+    return UNEXPECTED
+
+
+def split_lines(text: str) -> list[str]:
+    """LF だけで行に割る（行末の CR は除く）。Rust の `lines()` と JSONL の定義に揃える。
+
+    標準の行分割は U+2028・U+0085・VT・FF でも割れ、JSONL の 1 行 1 JSON と食い違う（#361）。
+    """
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [p[:-1] if p.endswith("\r") else p for p in parts]
+
+
 def vocab_value(v: Any, vocab: frozenset[str]) -> str | None:
     """閉じた語彙の文字列欄。語彙内ならその値、文字列だが語彙外なら `<unexpected>`、他は None。"""
     if not isinstance(v, str):
@@ -383,6 +433,8 @@ def sanitize_record(rec: Any, _path: tuple[str, ...] = (), _in_list: bool = Fals
         allowed = _path in LIST_STR_PATHS
     else:
         key = _path[-1] if _path else ""
+        if key == "error_type":
+            return rec if rec in ERROR_TYPE_VOCAB else UNEXPECTED
         allowed = key in STR_KEYS or key == "sha256" or key.endswith("_sha256")
     if not allowed or len(rec) > MAX_STR:
         return REDACTED
@@ -744,7 +796,7 @@ def _count_lines(path: Path) -> int | None:
     text = read_capped(path, CAP_INPUT_FILE)
     if text is None:
         return None
-    return sum(1 for ln in text.splitlines() if ln.strip())
+    return sum(1 for ln in split_lines(text) if ln.strip())
 
 
 def read_facts(pdir: Path) -> Facts | None:
@@ -992,6 +1044,15 @@ def run_pipeline(
         obj = parse_json_object(so, CAP_CLI_STDOUT)
         if obj is None:
             steps.append(entry)
+            rc0 = r.exit_code if r.exit_code is not None else EXIT_RUNTIME_ERROR
+            if rc0 != 0 and rc0 not in allowed:
+                # 非 0 終了かつ JSON でない: 終了コードが許容外であることも理由へ出す（#361）
+                return None, fail_item(
+                    "invalid_json",
+                    step=name,
+                    exit_code=r.exit_code,
+                    exit_code_unexpected=True,
+                )
             return None, fail_item("invalid_json", step=name, exit_code=r.exit_code)
         rc = r.exit_code if r.exit_code is not None else EXIT_RUNTIME_ERROR
         entry["summary"] = summarize_step(name, obj, facts.option_ids)
@@ -1061,7 +1122,7 @@ def run_pipeline(
         obj, failure = go(
             "infer",
             ["infer", "--package", "project/package", "--text", sample_text],
-            "infer --package project/package --text <fixed-sample>",
+            INFER_COMMAND_DISPLAY,
             set(),
         )
         if failure:
@@ -1133,7 +1194,7 @@ def parse_make_ci_log(text: str) -> dict[str, Any]:
     skip_lines = 0
     rust = {"passed": 0, "failed": 0, "ignored": 0}
     pytest_line = None
-    for raw in text.splitlines():
+    for raw in split_lines(text):
         line = raw.strip()
         if raw.startswith("skip:"):
             skip_lines += 1
@@ -1390,7 +1451,7 @@ def item_c(ctx: Ctx) -> dict[str, Any]:
 def parse_otool_libraries(text: str) -> list[str]:
     """`otool -L` の出力から直接リンクのライブラリ名（1 行目と括弧以降を除く）を取り出す。"""
     libs = []
-    for line in text.splitlines()[1:]:
+    for line in split_lines(text)[1:]:
         name = line.strip().split(" (")[0].strip()
         if name:
             libs.append(name)
@@ -1399,7 +1460,7 @@ def parse_otool_libraries(text: str) -> list[str]:
 
 def parse_linkage_tool(text: str) -> str | None:
     """stdout を後ろから見て最初に一致した `OK: tool=<otool|ldd> ...` 行の tool。無ければ None。"""
-    for line in reversed(text.splitlines()):
+    for line in reversed(split_lines(text)):
         m = re.match(r"^OK: tool=(\S+)", line)
         if m:
             return m.group(1) if m.group(1) in ("otool", "ldd") else None
@@ -1412,7 +1473,7 @@ def parse_linkage_cli_path(text: str) -> Path | None:
     cargo の報告から取った実物のパスが唯一の出どころ（REQ-32）。該当行がちょうど 1 行で、
     値が絶対パスのときだけ返し、0 行・2 行以上・相対パスは None（照合不能として扱う）。
     """
-    found = [m.group(1) for ln in text.splitlines() if (m := re.match(r"^cli_bin: (.+)$", ln))]
+    found = [m.group(1) for ln in split_lines(text) if (m := re.match(r"^cli_bin: (.+)$", ln))]
     if len(found) != 1 or not found[0].startswith("/"):
         return None
     return Path(found[0])
@@ -1456,8 +1517,8 @@ def item_d(ctx: Ctx) -> dict[str, Any]:
         return fail_item(why or "output_unreadable", exit_code=r.exit_code)
     rec: dict[str, Any] = {
         "exit_code": r.exit_code,
-        "skip_lines": sum(1 for ln in text.splitlines() if ln.startswith("skip:")),
-        "env_i_tests_ok": sum(1 for ln in text.splitlines() if ln.startswith("ok: req32_")),
+        "skip_lines": sum(1 for ln in split_lines(text) if ln.startswith("skip:")),
+        "env_i_tests_ok": sum(1 for ln in split_lines(text) if ln.startswith("ok: req32_")),
         "linkage_tool": parse_linkage_tool(text),
         "direct_libraries": None,
         "linkage_target_sha256": None,
@@ -1515,7 +1576,7 @@ def read_train_inputs(path: Path) -> list[tuple[str, str]] | None:
     if text is None:
         return None
     out: list[tuple[str, str]] = []
-    for line in text.splitlines():
+    for line in split_lines(text):
         if not line.strip():
             continue
         try:
@@ -1627,7 +1688,7 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
         return fail_item(reason, step="infer-batch", exit_code=r.exit_code)
     text = read_capped(edir / "batch.stdout", CAP_CLI_STDOUT) or ""
     batch: dict[str, dict[str, Any]] = {}
-    lines = text.splitlines()
+    lines = split_lines(text)
     if len(lines) != len(recs):
         return fail_item("unexpected_output", step="infer-batch", exit_code=0)
     for line in lines:
@@ -1949,7 +2010,7 @@ def collect_inputs(repo: Path) -> dict[str, Any] | None:
         if text is None or digest is None:
             return None
         if key != "definition":
-            out[key + "_records"] = sum(1 for ln in text.splitlines() if ln.strip())
+            out[key + "_records"] = sum(1 for ln in split_lines(text) if ln.strip())
         out[key + "_sha256"] = digest
     return {
         "train_records": out["train_records"],
@@ -1965,11 +2026,30 @@ def collect_inputs(repo: Path) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------------------
 
 
+_LINE_BREAKS = frozenset("\r\n\v\f\x85\u2028\u2029\t")
+
+
+def strip_control_chars(s: str) -> str:
+    """record.md へ入る文字列から制御文字・bidi 制御・ゼロ幅等（Cc・Cf・Cs）を除く。
+
+    行区切り類とタブは空白 1 個へ置く。表示の欺瞞（Trojan Source 系）と行の増殖を止める（#361）。
+    """
+    out = []
+    for ch in s:
+        if ch in _LINE_BREAKS:
+            out.append(" ")
+        elif unicodedata.category(ch) in ("Cc", "Cf", "Cs"):
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _cell(v: Any) -> str:
     """Markdown・HTML として解釈されないよう、セルの値をエスケープする。"""
     if v is None:
         return "-"
-    s = str(v)
+    s = strip_control_chars(str(v))
     for a, b in (
         ("&", "&amp;"),
         ("<", "&lt;"),
@@ -2130,7 +2210,7 @@ def build_cli(ctx: Ctx) -> Path | None:
 def find_built_executable(text: str) -> Path | None:
     """cargo の `--message-format=json` 出力から bin `fandhe-edge` の executable（最後の 1 件）。"""
     exe = None
-    for line in text.splitlines():
+    for line in split_lines(text):
         try:
             v = _loads(line)
         except ValueError:
@@ -2252,7 +2332,7 @@ def run(args: argparse.Namespace) -> int:
             except Interrupted:
                 res, interrupted = fail_item("interrupted"), True
             except Exception as e:
-                res = fail_item("internal_error", error_type=type(e).__name__)
+                res = fail_item("internal_error", error_type=error_type_name(e))
                 internal_error = True
             rec["items"][name] = res
             if res["status"] != "ok":

@@ -129,10 +129,10 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `evaluate`: `candidate` が `select` の報告値、`kind` が `select` と同じ値、`n_total` が `evaluation.jsonl` の行数（1 以上）、`correct` が 0 以上 `n_total` 以下、`accuracy` が `correct / n_total` と 1e-9 以内で一致、キー `macro_f1` が存在して `null` か 0 以上 1 以下（分母 0 の指標は `null`。REQ-24）
   - `package`: キー `judgment`・`infer_p95` が値が `null` でも存在する。`capacity` は各値が 0 以上の整数で、`limit_bytes` が定義の `limits.max_package_bytes`（無ければ既定値 40000000。`crates/cli/src/stages/package.rs` の `DEFAULT_CAPACITY_LIMIT_BYTES` と一致することを pytest が機械照合する）と一致し、`exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過していない。B の定義は合否基準と上限を持たないため、`judgment` が `null`・`acceptance_defined` が `false`・`infer_p95` が `null`
   - `infer`（B の単発）: `predicted_label` が定義の選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で 0 以上 1 以下、和が 1 から 1e-6 以内（`SCORE_SUM_TOLERANCE` は `fixtures/score_tolerance/score_sum_tolerance.json` と一致することを pytest が機械照合する）、`predicted_label` が最大スコアの選択肢（同点は定義の宣言順で先頭）
-- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と合わない場合は `unexpected_output`（`step` は `package`）
+- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。非 0 終了で stdout が JSON でない場合は `invalid_json` のまま、許容外の終了コードであることを補助欄 `exit_code_unexpected: true` で示す。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と合わない場合は `unexpected_output`（`step` は `package`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
-  - `steps`: 工程の配列（各工程：`step`（固定語彙）・`command`（固定語彙）・`exit_code`・`stderr_bytes`・`summary`）。`summary` は工程ごとに決まった欄だけを新しく組み立てた要約で、CLI の JSON の他の欄は捨てる（欄は常に出し、無い・型が違う値は `null`、閉じた語彙の欄で語彙外の文字列は `<unexpected>`）
+  - `steps`: 工程の配列（各工程：`step`（固定語彙）・`command`（固定語彙。infer は `infer --package <package-dir> --text <fixed-sample>` で、引数の値・パスは出さない）・`exit_code`・`stderr_bytes`・`summary`）。`summary` は工程ごとに決まった欄だけを新しく組み立てた要約で、CLI の JSON の他の欄は捨てる（欄は常に出し、無い・型が違う値は `null`、閉じた語彙の欄で語彙外の文字列は `<unexpected>`）
     - `register`: `step`・`status`・`options`・`evaluation_defined`・`definition_sha256`
     - `inspect`: `step`・`status`・`valid_records`・`split`（`train`・`validation`・`test`）
     - `train`・`select`: `step`・`status`・`candidate`・`kind`
@@ -300,7 +300,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 **失敗時の報告の 5 点**:
 
 1. 終了コード
-2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名〕）
+2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable` など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名。組み込みの閉じた語彙で、語彙外は `<unexpected>`〕）
 3. `step`（工程名。固定語彙：`register`・`inspect`・`train`・`select`・`evaluate`・`package`・`infer` など。工程が無い場合は省略）
 4. stdout の JSON（あれば）から `code`（7 種の語彙の値）・`message_bytes`・`message_sha256`（`message` の本文は記録されず、`<work-dir>` の stdout のファイルに残る）
 5. 実行したコマンド（固定語彙。パスは含めない）
@@ -341,7 +341,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - 機種・メモリ・OS・コミット SHA・実行日（`hw_model`・`cpu`・`os_name`・`os_version`・`os_build` は `^[A-Za-z0-9 ._,()+-]{1,64}$` に一致しなければ `null`。`ncpu`・`memory_bytes` は ASCII の数字 1〜20 桁だけを整数にし、それ以外は `null`）
 - `record.json` / `record.md` の内容（伏せ処理済み）
 
-**記録の作り方（許可リスト方式）**: 記録は、記録してよい欄を先に決めて組み立てる。工程の要約（`steps[].summary`）は、工程ごとに決まった欄だけを新しい dict へ組み立て、CLI の JSON の他の欄は捨てる（§4-B）。閉じた語彙の欄で、文字列だが語彙外の値は `<unexpected>`、`package_files[].name` が規則外なら `<unrecognized>`、型が違う欄は `null` になる。最後の関門（`sanitize_record`）で、文字列の値を持ってよいキーの閉じた集合に無い位置の文字列と、200 字を超える文字列を `<redacted>` に置き換える（個別の要約で漏れても止まる）。パス区切りを含む文字列も、`items.D.direct_libraries` の要素（`/usr/lib/`・`/System/` で始まる 128 字以内のもの）を除いて `<redacted>` になる。非有限の浮動小数は `null` になる。値が `<unexpected>`・`<unrecognized>`・`<redacted>` の欄は、記録の規則が働いた印であり、原因は `<work-dir>` のログで確かめる
+**記録の作り方（許可リスト方式）**: 記録は、記録してよい欄を先に決めて組み立てる。工程の要約（`steps[].summary`）は、工程ごとに決まった欄だけを新しい dict へ組み立て、CLI の JSON の他の欄は捨てる（§4-B）。閉じた語彙の欄で、文字列だが語彙外の値は `<unexpected>`、`package_files[].name` が規則外なら `<unrecognized>`、型が違う欄は `null` になる。最後の関門（`sanitize_record`）で、文字列の値を持ってよいキーの閉じた集合に無い位置の文字列と、200 字を超える文字列を `<redacted>` に置き換える（個別の要約で漏れても止まる）。パス区切りを含む文字列も、`items.D.direct_libraries` の要素（`/usr/lib/`・`/System/` で始まる 128 字以内のもの）を除いて `<redacted>` になる。非有限の浮動小数は `null` になる。`record.md` では、セルへ入る文字列から制御文字・bidi 制御文字・ゼロ幅文字（Unicode カテゴリ Cc・Cf・Cs）を除き、行区切り類とタブは空白 1 個にする（表示の欺瞞と行の増殖を防ぐ）。JSONL・ログの行は LF だけで割る（U+2028 等では割らない）。値が `<unexpected>`・`<unrecognized>`・`<redacted>` の欄は、記録の規則が働いた印であり、原因は `<work-dir>` のログで確かめる
 
 ### 転記してはいけないもの（記録簿から除外）
 
