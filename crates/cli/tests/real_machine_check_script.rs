@@ -147,6 +147,9 @@ infer)
     [ -n "${FAKE_E_MISMATCH:-}" ] && lab=beta && BSC='{"alpha":0.25,"beta":0.5,"gamma":0.25}'
     # label だけが最大スコアでない（スコアは単体と同じ）
     [ "$bad" = batch_notmax ] && lab=beta
+    # 2 行目のスコアだけ 1e-12 ずらす（label・最大スコア・合計の規則は保つ。許容差内だが完全一致ではない）
+    SC2=$BSC
+    [ "$bad" = batch_score_shift ] && SC2='{"alpha":0.500000000001,"beta":0.25,"gamma":0.25}'
     first=
     n=0
     while IFS= read -r line; do
@@ -154,7 +157,9 @@ infer)
       [ -n "$first" ] || first=$rid
       n=$((n + 1))
       [ -n "${FAKE_E_DUP:-}" ] && [ "$n" = 2 ] && rid=$first
-      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$BSC"'}\n' "$rid" "$lab"
+      rowsc=$BSC
+      [ "$n" = 2 ] && rowsc=$SC2
+      printf '{"id":"%s","status":"ok","predicted_label":"%s","scores":'"$rowsc"'}\n' "$rid" "$lab"
     done < "$file"
   else
     lab=alpha
@@ -1414,6 +1419,37 @@ fn req28_item_e_duplicate_batch_id_fails() {
     assert_eq!(e.q("items.E.status"), "\"failed\"");
     assert_eq!(e.q("items.E.reason"), "\"unexpected_output\"");
     assert_eq!(e.q("items.E.step"), "\"infer-batch\"");
+}
+
+/// REQ-28: 同一実装の単体対バッチはスコアも含めて完全一致する。バッチの 1 行だけスコアが 1e-12
+/// ずれていれば、許容差（1e-9）以内でも E は failed（`mismatch`）で、その行の id だけが
+/// `mismatch-ids.txt` に載る。
+#[test]
+fn req28_item_e_score_difference_within_1e9_fails() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B,E"]),
+        &[("FAKE_BAD", "batch_score_shift")],
+    );
+    assert_eq!(o.code, Some(10), "stdout={}", o.stdout);
+    assert_eq!(o.stdout, JUDGED_FAIL);
+    assert_eq!(e.q("items.E.status"), "\"failed\"");
+    assert_eq!(e.q("items.E.reason"), "\"mismatch\"");
+    assert_eq!(e.q("items.E.records"), "90");
+    assert_eq!(e.q("items.E.label_mismatch"), "0");
+    assert_eq!(e.q("items.E.scores_nonfinite"), "0");
+    assert_eq!(e.q("items.E.scores_exact_match"), "89");
+    let diff: f64 = e.q("items.E.max_abs_score_diff").parse().expect("diff");
+    assert!(diff > 0.0 && diff <= 1e-9, "diff={diff}");
+    // ずらした行は 2 行目。その id だけが載る
+    let batch = fs::read_to_string(e.dir.join("batch-input.jsonl")).expect("batch input");
+    let second = batch.lines().nth(1).expect("second row");
+    let id = second
+        .split("\"id\": \"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .expect("id");
+    assert_eq!(e.text("E/mismatch-ids.txt"), format!("{id}\n"));
 }
 
 /// 偽 CLI へ `FAKE_BAD` を与えて `items` を実行し、`item` が failed・exit 10 で、`reason`・`step`

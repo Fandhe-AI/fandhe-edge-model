@@ -85,7 +85,8 @@ MAX_E_RECORDS = 1000
 MAX_REPEAT = 1000
 # --p95-limit-us の上限（µs）。crates/core/src/definition.rs の MAX_LIMIT_INFER_P95_US と対
 MAX_P95_LIMIT_US = 3_600_000_000
-# 浮動小数の許容差（evaluation-contract.md）
+# 浮動小数の許容差（evaluation-contract.md）。evaluate の accuracy の照合に使う。
+# E の単体対バッチはスコアも完全一致で、この許容差は使わない
 SCORE_TOLERANCE = 1e-9
 
 REDACTED = "<redacted>"
@@ -1397,7 +1398,9 @@ def compare_infer(
 
     `predicted_label` が str でない・両側で異なる行、スコアに NaN・無限大・非数がある行は不一致。
     `max_abs_score_diff` は有限の差だけから求める（非有限は `scores_nonfinite` として数える）。
-    許容差（`SCORE_TOLERANCE`）を超えた行の id も `mismatch_ids` に入れる。
+    スコアが完全一致（`==`）でない行の id も `mismatch_ids` に入れる（同一実装の単体とバッチは
+    スコアも完全一致という決まり。`SCORE_TOLERANCE` は使わない）。`max_abs_score_diff` は
+    参考値で、合否には使わない。
     """
     label_match = 0
     scores_exact = 0
@@ -1429,8 +1432,8 @@ def compare_infer(
                 scores_exact += 1
         else:
             nonfinite += 1
-        # 許容差を超えた行も mismatch_ids へ入れる（件数欄の意味は変えない）
-        if not same_label or not finite or not (row_diff <= SCORE_TOLERANCE):
+        # スコアが完全一致でない行も mismatch_ids へ入れる（件数欄の意味は変えない）
+        if not same_label or not finite or bs != ss:
             mismatch_ids.append(rid)
     return {
         "label_match": label_match,
@@ -1521,10 +1524,11 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
     cmp = compare_infer(batch, single)
     ids = cmp.pop("mismatch_ids")
     (edir / "mismatch-ids.txt").write_text("".join(i + "\n" for i in ids), encoding="utf-8")
+    # 合否はラベル全件一致・非有限 0 件・スコア全件完全一致。max_abs_score_diff は参考値
     ok = (
         cmp["label_mismatch"] == 0
         and cmp["scores_nonfinite"] == 0
-        and not (cmp["max_abs_score_diff"] > SCORE_TOLERANCE)
+        and cmp["scores_exact_match"] == len(single)
     )
     rec = dict({"status": "ok" if ok else "failed", "records": len(recs)}, **cmp)
     rec["input_sha256"] = digest

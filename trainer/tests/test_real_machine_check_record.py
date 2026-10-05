@@ -655,8 +655,8 @@ def test_judge_p95_requires_value_exceeded_exit_code_consistency() -> None:
     assert j(0, {"p95_us": 1}, good, limit) == "missing_field"
 
 
-def test_compare_infer_lists_rows_over_tolerance_in_mismatch_ids() -> None:
-    """REQ-28: ラベルが一致しても、スコア差が許容差を超えた行の id は mismatch_ids に入る。"""
+def test_compare_infer_lists_rows_without_exact_score_match_in_mismatch_ids() -> None:
+    """REQ-28: ラベルが一致しても、スコアが完全一致でない行の id は mismatch_ids に入る。"""
     batch = {
         "a": {"predicted_label": "x", "scores": {"x": 0.5}},
         "b": {"predicted_label": "x", "scores": {"x": 0.5}},
@@ -666,8 +666,24 @@ def test_compare_infer_lists_rows_over_tolerance_in_mismatch_ids() -> None:
         "b": {"predicted_label": "x", "scores": {"x": 0.5 + 1e-6}},
     }
     cmp = mod.compare_infer(batch, single)
-    assert cmp["mismatch_ids"] == ["b"]
+    assert cmp["mismatch_ids"] == ["a", "b"]
     assert (cmp["label_match"], cmp["label_mismatch"]) == (2, 0)
+    assert cmp["scores_exact_match"] == 0
+
+
+def test_compare_infer_one_row_off_by_1e12_is_the_only_mismatch() -> None:
+    """REQ-28: 1 行だけスコアが 1e-12 ずれると scores_exact_match が 1 減り、その id だけが入る。"""
+    batch = {
+        "a": {"predicted_label": "x", "scores": {"x": 0.75, "y": 0.25}},
+        "b": {"predicted_label": "x", "scores": {"x": 0.75, "y": 0.25}},
+        "c": {"predicted_label": "x", "scores": {"x": 0.75, "y": 0.25}},
+    }
+    single = {k: {"predicted_label": "x", "scores": {"x": 0.75, "y": 0.25}} for k in "abc"}
+    single["b"] = {"predicted_label": "x", "scores": {"x": 0.75 + 1e-12, "y": 0.25 - 1e-12}}
+    cmp = mod.compare_infer(batch, single)
+    assert cmp["scores_exact_match"] == 2
+    assert cmp["mismatch_ids"] == ["b"]
+    assert (cmp["label_mismatch"], cmp["scores_nonfinite"]) == (0, 0)
 
 
 FAKE_INFER = """#!{python}
@@ -681,6 +697,7 @@ def scores(delta):
     v[1] -= delta
     return dict(zip(ids, v))
 mode = {mode!r}
+only_id = {only_id!r}
 def row(rid, delta, step=False):
     d = {{"id": rid, "status": "ok", "predicted_label": ids[0], "scores": scores(delta)}}
     if step:
@@ -695,13 +712,18 @@ if "--input-file" in a:
     for i, rid in enumerate(rows):
         print(row(rid, 0.0, mode == "batch-step" and i == 1))
 else:
-    print(row(a[a.index("--id") + 1], {delta!r}, mode == "single-step"))
+    rid = a[a.index("--id") + 1]
+    print(row(rid, {delta!r} if only_id in (None, rid) else 0.0, mode == "single-step"))
 """
 
 
-def _infer_cli(tmp_path: Path, mode: str = "ok", delta: float = 0.0) -> Path:
+def _infer_cli(
+    tmp_path: Path, mode: str = "ok", delta: float = 0.0, only_id: str | None = None
+) -> Path:
     fake = tmp_path / "fake-infer"
-    fake.write_text(FAKE_INFER.format(python=sys.executable, mode=mode, delta=delta), "utf-8")
+    fake.write_text(
+        FAKE_INFER.format(python=sys.executable, mode=mode, delta=delta, only_id=only_id), "utf-8"
+    )
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     return fake
 
@@ -721,6 +743,20 @@ def test_item_e_writes_nonempty_mismatch_ids_when_scores_differ(tmp_path: Path) 
     ids = (ctx.work / "E" / "mismatch-ids.txt").read_text().split()
     assert len(ids) == res["records"]
     assert res["records"] == mod.read_facts(ctx.work / "B").train_records
+
+
+def test_item_e_fails_when_one_row_score_is_off_by_1e12(tmp_path: Path) -> None:
+    """REQ-28: ラベルが同じでスコアが 1e-12 ずれた 1 行があれば E は failed（完全一致が条件）。"""
+    ctx = _e_ctx(tmp_path, _infer_cli(tmp_path))
+    first = mod.read_train_inputs(ctx.work / "B" / "train.jsonl")
+    assert first is not None
+    target = first[0][0]
+    # 同じパスの偽 CLI を、先頭 id の単体推論だけ 1e-12 ずらす版へ書き換える
+    _infer_cli(tmp_path, delta=1e-12, only_id=target)
+    res = mod.item_e(ctx)
+    assert (res["status"], res["reason"], res["label_mismatch"]) == ("failed", "mismatch", 0)
+    assert res["scores_exact_match"] == res["records"] - 1
+    assert (ctx.work / "E" / "mismatch-ids.txt").read_text() == target + "\n"
 
 
 def test_item_e_passes_when_batch_and_single_agree(tmp_path: Path) -> None:
