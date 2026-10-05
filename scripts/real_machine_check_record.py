@@ -154,6 +154,9 @@ STR_KEYS = frozenset(
         "linkage_tool",
         "name",
         "commit",
+        "commit_end",
+        "cli_origin",
+        "trainer_origin",
         "cli_profile",
         "started_local",
         "ended_local",
@@ -1817,6 +1820,70 @@ def ascii_int(s: str | None) -> int | None:
     return int(s) if s is not None and ASCII_INT_RE.fullmatch(s) else None
 
 
+def collect_volatile(ctx: Ctx) -> dict[str, Any]:
+    """実行中に変わりうる値（commit・worktree_clean・CLI の sha256）の採取。
+
+    開始時（`collect_environment`）と終了時（`run`）で同じ関数を使い、採取の規則を 1 箇所に
+    集約する。取れない欄は None（#360）。
+    """
+    commit = _probe(ctx.work, ctx.repo, ["git", "rev-parse", "HEAD"], "commit")
+    if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
+        commit = None
+    return {
+        "commit": commit,
+        "worktree_clean": _worktree_clean(ctx.work, ctx.repo),
+        "cli_sha256": sha256_file(ctx.bin, CAP_CLI_BINARY),
+    }
+
+
+def compare_start_end(start: Any, end: Any) -> bool | None:
+    """開始時と終了時の値の比較（fail-closed）。
+
+    両方 None は比較不能で None。片方だけ None は同一と確認できないので False。
+    両方あれば一致で True、不一致で False（#360）。
+    """
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        return False
+    return bool(start == end)
+
+
+def judge_environment_stable(env: dict[str, Any]) -> bool | None:
+    """3 つの比較結果の集約（fail-closed）。1 つでも False なら False、全部 True のときだけ True。
+
+    一部でも None（両端とも取れず確認できない）が残れば None（未確認）。None は成功扱いにしない
+    （`run` は stable が True でなければ exit 10 にする。#360）。
+    """
+    flags = [env.get(k) for k in ("commit_unchanged", "worktree_clean_unchanged", "cli_unchanged")]
+    if any(f is False for f in flags):
+        return False
+    if all(f is True for f in flags):
+        return True
+    return None
+
+
+def fill_end_environment(env: dict[str, Any], end: dict[str, Any] | None) -> None:
+    """終了時の採取値と比較結果を環境の欄へ入れる。end が None（未採取）なら比較も None。"""
+    if end is None:
+        env["commit_end"] = None
+        env["worktree_clean_end"] = None
+        env["cli_end_sha256"] = None
+        env["commit_unchanged"] = None
+        env["worktree_clean_unchanged"] = None
+        env["cli_unchanged"] = None
+    else:
+        env["commit_end"] = end["commit"]
+        env["worktree_clean_end"] = end["worktree_clean"]
+        env["cli_end_sha256"] = end["cli_sha256"]
+        env["commit_unchanged"] = compare_start_end(env.get("commit"), end["commit"])
+        env["worktree_clean_unchanged"] = compare_start_end(
+            env.get("worktree_clean"), end["worktree_clean"]
+        )
+        env["cli_unchanged"] = compare_start_end(env.get("cli_sha256"), end["cli_sha256"])
+    env["stable"] = judge_environment_stable(env)
+
+
 def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
     """環境の採取。macOS 以外・コマンド不在で取れない欄は null。"""
     w, rp = ctx.work, ctx.repo
@@ -1830,9 +1897,7 @@ def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
         """macOS の sw_vers 値（macOS 以外は None）。"""
         return _probe(w, rp, ["sw_vers", flag], name) if on_mac else None
 
-    commit = _probe(w, rp, ["git", "rev-parse", "HEAD"], "commit")
-    if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
-        commit = None
+    vol = collect_volatile(ctx)
     try:
         cli_bytes: int | None = ctx.bin.stat().st_size
     except OSError:
@@ -1845,13 +1910,27 @@ def collect_environment(ctx: Ctx, cli_profile: str | None) -> dict[str, Any]:
         "os_name": env_text(sw_vers("-productName", "osn")),
         "os_version": env_text(sw_vers("-productVersion", "osv")),
         "os_build": env_text(sw_vers("-buildVersion", "osb")),
-        "commit": commit,
-        "worktree_clean": _worktree_clean(w, rp),
+        "commit": vol["commit"],
+        "worktree_clean": vol["worktree_clean"],
         "started_local": None,
         "ended_local": None,
-        "cli_sha256": sha256_file(ctx.bin, CAP_CLI_BINARY),
+        "cli_sha256": vol["cli_sha256"],
         "cli_bytes": cli_bytes,
         "cli_profile": cli_profile,
+        # 以下は終了時の再採取と比較（#360）。`run` が埋める。未採取は null
+        "commit_end": None,
+        "worktree_clean_end": None,
+        "cli_end_sha256": None,
+        "commit_unchanged": None,
+        "worktree_clean_unchanged": None,
+        "cli_unchanged": None,
+        "stable": None,
+        # CLI・trainer の出所（閉じた語彙。パスは記録しない）
+        "cli_origin": "env_override" if ctx.bin_override else "built_by_script",
+        # Rust 側 `worker_launcher` の判定（var_os の is_some。空文字も設定扱い）と対応させる
+        "trainer_origin": (
+            "env" if "FANDHE_EDGE_TRAINER_DIR" in ctx.offline_env else "build_default"
+        ),
     }
 
 
@@ -1920,7 +1999,19 @@ def render_markdown(rec: dict[str, Any]) -> str:
     if rec.get("bin_override"):
         lines.append(
             "- 注意: CLI を `FANDHE_EDGE_BIN` で差し替えた"
-            "（このスクリプトがビルドした CLI ではない）"
+            "（このスクリプトがビルドした CLI ではない。`commit`・`worktree_clean` は"
+            " CLI の出所を表さない）"
+        )
+    stable = (rec.get("environment") or {}).get("stable")
+    if stable is False:
+        lines.append(
+            "- 注意: 開始時と終了時で commit・worktree_clean・CLI の sha256 のいずれかが"
+            "一致しない（実行中に環境が変わった。結果を採用しない）"
+        )
+    elif rec.get("environment") is not None and stable is None:
+        lines.append(
+            "- 注意: 開始時と終了時の commit・worktree_clean・CLI の sha256 の一致を"
+            "確認できなかった（採取不能。成功扱いにしない）"
         )
     lines += ["", "## 環境", "", "| 項目 | 値 |", "| ---- | -- |"]
     if env is None:
@@ -2116,7 +2207,7 @@ def run(args: argparse.Namespace) -> int:
             "p95_limit_us": ctx.p95_limit_us,
             "package_limit_bytes": ctx.package_limit_bytes,
             "with_ci": bool(args.with_ci),
-            "cargo_offline": True,
+            "cargo_offline": "A" not in items,
         },
         "items": {},
     }
@@ -2170,6 +2261,13 @@ def run(args: argparse.Namespace) -> int:
     if _interrupt_requested:
         interrupted = True
     if rec["environment"] is not None:
+        end_vol: dict[str, Any] | None = None
+        if not _interrupt_requested:
+            try:
+                end_vol = collect_volatile(ctx)
+            except Interrupted:
+                interrupted = True  # 採取中の中断。採取分は捨てる
+        fill_end_environment(rec["environment"], end_vol)
         rec["environment"]["ended_local"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     rec = sanitize_record(rec)
     # schema は固定定数（`/` を含む）なので伏せ処理の対象外にして戻す
@@ -2187,6 +2285,10 @@ def run(args: argparse.Namespace) -> int:
     if internal_error:
         # 想定外の例外はスクリプト自身の実行不能（70）。record は書いてある
         return emit("runtime_error", "internal error", EXIT_RUNTIME_ERROR, True)
+    if (rec["environment"] or {}).get("stable") is not True:
+        # 項目の status は書き換えず、環境の食い違い・未確認（採取不能）を別軸の失敗として返す
+        # （成功扱いにしない。#360）
+        return emit("judged_fail", "environment changed during the run", EXIT_JUDGED_FAIL, True)
     if all(rec["items"][n]["status"] == "ok" for n in items):
         return emit("ok", "all requested items completed", EXIT_OK, True)
     return emit(

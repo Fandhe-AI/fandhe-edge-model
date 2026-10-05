@@ -27,11 +27,13 @@
 #                          未設定なら cargo build --locked --release の `compiler-artifact` の executable を使う
 #   FANDHE_EDGE_MAKE_CMD   make の代役（テスト専用。絶対パスの実行ファイル）
 #   FANDHE_EDGE_CARGO_CMD  cargo の代役（テスト専用。絶対パスの実行ファイル）
+#   FANDHE_EDGE_TRAINER_DIR  CLI の train が読む trainer の場所。値は読まず、設定の有無だけを記録する
 #   MAKE_CMD・CARGO_CMD のどちらかを設定すると record の evidence_hint は test_harness になる
 #
 # 契約:
 #   - 引数の誤りは CLI・make・cargo を起動する前に {"code":"invalid_input","message":"<固定>"} を 1 行出して exit 64
 #   - 終了コード: 全項目 ok なら 0、項目の失敗（または未実行の要求項目）は 10、引数の誤りは 64、
+#     実行中に commit・worktree_clean・CLI の sha256 が変わった場合も 10（#360）、
 #     スクリプト自身の実行不能（python3 が無い・作業ディレクトリを作れない・CLI が無い等）は 70（REQ-21）
 #   - stdout は最後に JSON を 1 つだけ出す（REQ-33）: {"code":..,"message":..,"record":"record.json"}。
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない

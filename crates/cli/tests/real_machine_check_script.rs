@@ -625,6 +625,13 @@ fn req33_normal_run_records_all_items() {
     assert_eq!(e.q("options.repeat"), "3");
     assert_eq!(e.q("options.with_ci"), "false");
     assert_eq!(e.q("options.cargo_offline"), "true");
+    // 終了時の再採取（#360）: CLI は差し替え（env_override）で、開始時と終了時のハッシュが一致する
+    assert_eq!(e.q("environment.cli_origin"), "\"env_override\"");
+    assert_eq!(e.q("environment.cli_unchanged"), "true");
+    assert_eq!(
+        e.q("environment.cli_end_sha256"),
+        e.q("environment.cli_sha256")
+    );
     assert_eq!(e.q("items.A.status"), "\"not_run\"");
     for item in ["B", "C", "D", "E", "F"] {
         assert_eq!(e.q(&format!("items.{item}.status")), "\"ok\"", "{item}");
@@ -733,6 +740,8 @@ fn req38_offline_env_is_passed_except_to_make_ci() {
         ["ci unset", "check-runtime-linkage true"]
     );
     assert_eq!(e.lines("cargo.env"), ["true", "true"]);
+    // A を含む実行は make ci が offline で起動されないため cargo_offline は false（#360）
+    assert_eq!(e.q("options.cargo_offline"), "false");
     let cli_env = e.lines("cli.env");
     assert_eq!(cli_env.len(), 7);
     assert!(cli_env.iter().all(|l| l == "true"));

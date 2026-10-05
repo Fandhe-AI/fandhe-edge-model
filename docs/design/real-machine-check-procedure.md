@@ -74,6 +74,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 | ------- | ---- | ---- |
 | `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えた CLI が、cargo がビルドした CLI とバイト単位で同一でない限り D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは cargo がビルドした CLI（cargo の報告から取る。`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えていても追従する）で、その sha256 が差し替えた CLI と一致しなければ `linkage_target_mismatch`（§4-D） |
 | `FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` | 検査用（テスト専用の上書き）。**絶対パスの実行ファイル**（PATH で探さない）。どちらかを設定すると `evidence_hint` が `test_harness` に変わり、`otool -L` は実行されず `direct_libraries` が `null` になる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64） | テスト用のみ。両方同時に設定可能 |
+| `FANDHE_EDGE_TRAINER_DIR` | 学習ワーカー（`trainer/`）の場所。CLI の `train` 工程が読む（設定の有無は空文字も設定扱い）。このスクリプトは値を読まず、設定の有無だけを `environment.trainer_origin`（`env` または `build_default`）へ記録する。パスは記録しない | 未設定なら CLI をビルドしたツリーの `trainer/`（ビルド時の既定）を使う。`FANDHE_EDGE_BIN` で差し替えた CLI の既定は、その CLI をビルドしたツリーを指し、このリポジトリの `trainer/` とは限らない。`train` を使わない項目（A・D・F のみ）の実行でも、この欄は環境変数の状態を表す |
 
 ### 3-4. 実行時の上限（REQ-39）
 
@@ -267,7 +268,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 終了コード | 意味 | 行動 |
 | -------- | ---- | ---- |
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
-| 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
+| 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--work-dir` がリポジトリ内、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
 | 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、`FANDHE_EDGE_BIN` が実行不可、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
@@ -336,6 +337,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - 件数・ハッシュ・サイズ・ライブラリ名（`/usr/lib/`・`/System/` で始まるもの）
 - load average・開始・終了の時刻
 - 工程の要約（工程ごとに決まった欄だけ。固定語彙・検証済みの数値と真偽値）。`message` の `message_bytes`・`message_sha256`
+- 終了時の再採取と比較（`commit_end`・`worktree_clean_end`・`cli_end_sha256`・`commit_unchanged`・`worktree_clean_unchanged`・`cli_unchanged`・`stable`）と、CLI・trainer の出所（`cli_origin`・`trainer_origin`。閉じた語彙。パスは記録しない）
 - 機種・メモリ・OS・コミット SHA・実行日（`hw_model`・`cpu`・`os_name`・`os_version`・`os_build` は `^[A-Za-z0-9 ._,()+-]{1,64}$` に一致しなければ `null`。`ncpu`・`memory_bytes` は ASCII の数字 1〜20 桁だけを整数にし、それ以外は `null`）
 - `record.json` / `record.md` の内容（伏せ処理済み）
 
@@ -378,7 +380,16 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
     "ended_local": "ISO8601 with offset",
     "cli_sha256": "64-char hex or null",
     "cli_bytes": "int or null",
-    "cli_profile": "release" | null
+    "cli_profile": "release" | null,
+    "commit_end": "40-char hex or null (終了時。取れなければ null)",
+    "worktree_clean_end": "true | false | null (終了時)",
+    "cli_end_sha256": "64-char hex or null (終了時)",
+    "commit_unchanged": "true | false | null",
+    "worktree_clean_unchanged": "true | false | null",
+    "cli_unchanged": "true | false | null",
+    "stable": "true | false | null",
+    "cli_origin": "built_by_script | env_override",
+    "trainer_origin": "env | build_default"
   },
   "inputs": null (項目の開始前に中断された場合) | {
     "train_records": "int",
@@ -394,7 +405,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
     "p95_limit_us": "int",
     "package_limit_bytes": "int",
     "with_ci": "true | false",
-    "cargo_offline": true
+    "cargo_offline": "true | false (A を含まなければ true)"
   },
   "items": {
     "A": { "status": "ok" | "failed" | "not_run", ... },
@@ -412,11 +423,23 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - `interrupted`: 実行中（項目の開始前を含む）に SIGINT・SIGTERM・SIGHUP で中断。前の項目が `failed` で止まった後に中断を受けた場合も、未実行の項目はこの値になる（`previous_item_failed` より優先）
 - `requires_B`: E で B が要求されていない（B が失敗した場合は `previous_item_failed`）
 
+### 終了時の環境の再採取（#360）
+
+`environment` の `commit`・`worktree_clean`・`cli_sha256` は開始時の値のままです（意味は変えません）。実行の終わり（記録を書く直前）に同じ採取をやり直し、`*_end`・`cli_end_sha256` と比較結果（`*_unchanged`）、集約の `stable` を足します。
+
+- 比較は fail-closed: 片方だけ取れなければ「一致しない」（`false`）、両方取れていなければ `null`（比較できない）
+- `stable` は 1 つでも `false` なら `false`。`false` のときの最終結果は `judged_fail`（10）。判定の優先は、中断・内部エラー（70）、`stable` が `false`（10）、項目の失敗（10）、ok（0）の順
+- 中断の印が立っているときは終了時の採取をせず、`*_end`・`*_unchanged`・`stable` は `null`
+- `options.cargo_offline` は「すべての子プロセスが offline で起動したか」を表す。A の `make ci` は offline を強制しないため、A を含む実行では `false`（以前の記録は A 実行時も `true` で、実態を表していなかった）
+- 限界: `worktree_clean` が開始時も終了時も `false` のとき、差分の中身が変わっても検出できない（差分のハッシュは本文を扱う危険があるため取らない）
+
 ### `record.md`
 
 自動生成の Markdown テンプレート。冒頭に `bin_override`・`evidence_hint`・harness の有無が表示され、以下は注意行が出ます：
 
 - `bin_override: true` の場合：「注意: CLI を `FANDHE_EDGE_BIN` で差し替えた（このスクリプトがビルドした CLI ではない）」
+  あわせて「`commit`・`worktree_clean` は CLI の出所を表さない」旨が出ます
+- `environment.stable` が `false` の場合：「注意: 開始時と終了時で commit・worktree_clean・CLI の sha256 のいずれかが一致しない」
 - 証拠の種別は「人が確認して記入」と指示されます
 - 「項目ごとの結果」の表の「要点」には、各項目の `record.json` の欄から `status`・`steps`・`package_files`・`capacity`・`p95`・`capacity_limit`・`message_sha256` を除いたものを JSON で出します（B は `total_bytes` と `capacity_sum_matches_total`、C は `p95` と `capacity_limit` を足す）。失敗の要点は `reason`・`step`・`exit_code` と、`code`・`message_bytes` です（`message_sha256` は `record.json` だけ）
 
