@@ -30,6 +30,7 @@ make deny        # cargo deny --locked check advisories bans licenses sources
 make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest（uv run --locked）
 make test-trainer-integration  # 実 trainer（MLX CPU）を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 make check-runtime-linkage  # 推論ランタイムの動的リンク確認（Mac 実機前提。make ci には含まれない。#115）
+make real-machine-check  # Mac 実機での動作確認 A〜F（人が実行。make ci には含まれない。#354）
 make ci          # lint-docs + check-workspace-manifest + 上記 6 つを一括実行
 make doctor      # 環境診断のみ（何も導入しない）
 ```
@@ -91,11 +92,27 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 確認は [docs/design/claude-code-permission-prompt-procedure.md](docs/design/claude-code-permission-prompt-procedure.md) の手順で、確認画面が出る権限モードの Claude Code を使い**人が手動実行**する。Agent は手順と記録テンプレートの準備までで、実機の結果を Agent が確定させない。受け入れ条件は人の実測記録（証拠種別: 実機）が貼られて初めて満たされ、M9 もそれまで完了扱いにしない
 - Agent が一時ディレクトリで行う予行は確認画面を通さないテストハーネスで、実機の証拠にならない。`crates/cli/tests/bash_noninteractive.rs` の `req36_infer_real_package_exit_zero_via_sh` も同様（証拠種別: テストハーネス）
 
+#### Mac 実機での動作確認（項目 A〜F。REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-39・#354）
+
+- 実行コマンド: `make real-machine-check ARGS="--work-dir <dir> ..."` または `<repo>/scripts/real-machine-check.sh --work-dir <dir> ...`（後者は空白を含む値を渡せるため推奨）
+- 引数（シェル側が `--key VALUE` / `--key=VALUE` 両方を受け付け、重複は拒否）: `--work-dir`（必須、物理パスへ正規化し、リポジトリ自身・その配下・その祖先のどれかなら拒否。symlink・非ディレクトリ・空でないディレクトリも拒否）・`--items A,B,C,D,E,F`（既定は `B,C,D,E,F`。カンマ区切り・大文字・重複不可）・`--with-ci`（A 実行時は必須。通信を伴う）・`--repeat N`（F の実行回数・1〜1000・既定 50）・`--quiet-machine`・`--p95-limit-us N`（1〜3600000000 µs・既定 50000 µs）・`--package-limit-bytes N`（既定 1000）・`--help`（使い方を JSON 1 行で出して exit 0）
+- 必要環境: Mac（Apple Silicon）・Python 3.9 以上・`make py-sync` 済みの `trainer/.venv`・MLX CPU・`cargo fetch --locked` 済みの依存（通信を伴うため承認を得てから実行する。`make setup` は cargo の依存を取得しない。REQ-38）
+- 環境変数: `FANDHE_EDGE_BIN`（`/` を含む相対・絶対パス。未設定なら `cargo build --locked` で 1800 秒・ビルド失敗は exit 70。差し替えた CLI が cargo のビルドした CLI とバイト単位で同一でない限り D は失敗する〔代役の下では照合しない〕）・`FANDHE_EDGE_MAKE_CMD` / `FANDHE_EDGE_CARGO_CMD`（**絶対パスの実行ファイル**。テスト用。どちらか設定時は `evidence_hint:"test_harness"` に変わり、`otool` は実行されず `direct_libraries:null`）
+- 通信抑止（REQ-38）: A 以外の子プロセスに `CARGO_NET_OFFLINE=true` を渡す。`cargo build --locked` / `cargo test --locked` でビルド・テスト。未構築依存の場合は失敗
+- 実行フロー: A→F の順で各項目を実行。最初の `failed` 項目で以降の項目は `not_run`（`previous_item_failed`）になる。E は B が要求されていなければ `not_run`（`requires_B`）。SIGINT・SIGTERM・SIGHUP で中断時は子を止めて `record.json`・`record.md` を書く（当時点までの結果。中断項目の `reason` は `interrupted`）。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）の中断でも書き、選んだ項目はすべて `not_run` / `interrupted`、未採取の `environment`・`inputs` は `null`（ビルド中の中断では `inputs` は値あり）。ハンドラは印を立てるだけで、子の待機ループ（20 ミリ秒ごと）と項目の境目で印を見て子のプロセスグループを止める。印が立っていれば項目がすべて完了していても最終結果は中断（exit 70）。fixture が読めない・CLI のビルド失敗は `record.json` なしで exit 70
+- 出力: stdout に JSON 1 行（`{"code":"...","message":"...","record":"record.json"}`）+ `<work-dir>/record.json`・`record.md`
+- 終了コード: 0（要求項目すべて `ok`）・10（1 項目以上 `failed` / `not_run`）・64（引数エラー）・70（実行環境エラー・中断・項目の想定外の例外〔`reason:"internal_error"`〕。中断時と `internal_error` 時も `record.json` あり。中断時の stdout は `{"code":"runtime_error","message":"interrupted","record":"record.json"}`）
+- 作業ディレクトリ: umask 077・chmod 700（ユーザーのみ読み書き可。中に生の stdout・入力ファイルがあるため共有・転記しない）
+- 人の担当: 実機での実行。`evidence_hint` の確認（MAKE_CMD / CARGO_CMD 無い場合は `requires_human_review`、有れば `test_harness`）。`bin_override:true` 時は「差し替えた CLI は実証拠にならない」を確認。`--quiet-machine` は人の申告で、実際に他のアプリを閉じた静かな状態のみを「実機」として扱う。E は学習データ（`train.jsonl`）のみ使用（REQ-27）
+- Agent の範囲: スクリプト・手順書の準備まで。実機での実行・確定は人が行う。テストハーネス結果（MAKE_CMD / CARGO_CMD 設定時）を実機証拠と混ぜない
+- 記録: `<work-dir>/record.json`・`record.md` を PR に貼る（パス・ログは含めない。step の stdout・stderr は `<work-dir>/**/steps/` に保存）。記録は許可リスト方式（工程ごとに決まった欄だけを組み立て、最後の関門で許可されたキー以外の文字列を `<redacted>` に伏せる）。CLI の `message` は記録されず `message_bytes`・`message_sha256` になり、`infer` の `predicted_label` は `predicted_index` になる
+- 前提・詳細・注意点: [docs/design/real-machine-check-procedure.md](docs/design/real-machine-check-procedure.md)
+
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 
 - `crates/runtime/tests/env_isolation.rs` は、環境変数を空にした子プロセスで C1・C3 の fixture 推論が exit 0 になることを確かめ、既定の `make test` で実行される（unix 限定。rust-ci の Linux・macOS runner で実行。証拠種別: テストハーネス）。実機前提へ移す差分は P0
 - CLI `fandhe-edge infer` の `env -i` 確認は、工程の接続（#136）は済んだが未追加（現時点の確認は推論ランタイム層のみ。別課題）
-- `make check-runtime-linkage`（`scripts/check-runtime-linkage.sh`）は Mac 実機で人間が実行し、`otool -L` で Python・MLX への動的リンクが無いことと `env -i` 実行の結果を「実機」として PR に記録する。Linux の `ldd` の結果は補助で、Mac 実機の証拠にはならない。未実施の間は「未実施」と書く
+- `make check-runtime-linkage`（`scripts/check-runtime-linkage.sh`。cargo は `--locked` で起動し、CLI の場所は cargo の報告から取って `cli_bin:` の行で出す）は Mac 実機で人間が実行し、`otool -L` で Python・MLX への動的リンクが無いことと `env -i` 実行の結果を「実機」として PR に記録する（`real-machine-check` の D は stdout の後ろから見て最初の `OK: tool=` の行と `cli_bin:` の行を使う）。Linux の `ldd` の結果は補助で、Mac 実機の証拠にはならない。未実施の間は「未実施」と書く
 
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
