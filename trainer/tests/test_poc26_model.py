@@ -34,9 +34,21 @@ def _sha(model_dir: Path) -> str:
         return "0" * 64
 
 
+def _sha_config(model_dir: Path) -> str:
+    try:
+        return hashlib.sha256((Path(model_dir) / "config.json").read_bytes()).hexdigest()
+    except OSError:
+        return "0" * 64
+
+
 def _load(model_dir: Path, *, dtype: mx.Dtype):
-    """現在の重みファイルの sha256 を期待値として load_qwen2 を呼ぶ（合成ファイル用）。"""
-    return load_qwen2(model_dir, dtype=dtype, expected_sha256=_sha(model_dir))
+    """現在の重み・config の sha256 を期待値として load_qwen2 を呼ぶ（合成ファイル用）。"""
+    return load_qwen2(
+        model_dir,
+        dtype=dtype,
+        expected_sha256=_sha(model_dir),
+        expected_config_sha256=_sha_config(model_dir),
+    )
 
 
 IDS = mx.array([[1, 5, 9, 20, 7], [3, 3, 8, 2, 4]])
@@ -351,6 +363,7 @@ def test_model_swapped_after_check_reads_verified_content(
 ) -> None:
     """REQ-39: 検証後にパスが別ファイルへ差し替わっても、検証済み fd の中身が読まれる。"""
     expected = np.array(_load(model_dir, dtype=mx.float32)(IDS))
+    original_sha, config_sha = _sha(model_dir), _sha_config(model_dir)  # 差し替え前の元ファイル
     other = synthetic.write_model_dir(_mk(tmp_path / "other"), seed=1)
     real_open = qwen2_model._open_regular
 
@@ -361,8 +374,11 @@ def test_model_swapped_after_check_reads_verified_content(
         return result
 
     monkeypatch.setattr(qwen2_model, "_open_regular", swapping_open)
-    got = np.array(_load(model_dir, dtype=mx.float32)(IDS))
-    assert np.abs(got - expected).max() < 1e-6
+    m = load_qwen2(
+        model_dir, dtype=mx.float32, expected_sha256=original_sha, expected_config_sha256=config_sha
+    )
+    assert _sha(model_dir) != original_sha  # 差し替えが実際に起きている
+    assert np.abs(np.array(m(IDS)) - expected).max() < 1e-6
 
 
 def test_lora_bf16_model_forward_and_grad(model_dir: Path) -> None:
@@ -640,7 +656,13 @@ def test_sha256_verification(model_dir: Path) -> None:
     """REQ-39: 期待 sha256 と一致すれば読め、1 バイト違い・形式不正は構築前に拒否する。"""
     good = _sha(model_dir)
     assert (
-        load_qwen2(model_dir, dtype=mx.float32, expected_sha256=good).config.num_hidden_layers == 2
+        load_qwen2(
+            model_dir,
+            dtype=mx.float32,
+            expected_sha256=good,
+            expected_config_sha256=_sha_config(model_dir),
+        ).config.num_hidden_layers
+        == 2
     )
     flipped = ("0" if good[0] != "0" else "1") + good[1:]
     for bad, match in (
@@ -651,11 +673,21 @@ def test_sha256_verification(model_dir: Path) -> None:
         ("", "64 lowercase hex"),
     ):
         with pytest.raises(ValueError, match=match):
-            load_qwen2(model_dir, dtype=mx.float32, expected_sha256=bad)
+            load_qwen2(
+                model_dir,
+                dtype=mx.float32,
+                expected_sha256=bad,
+                expected_config_sha256=_sha_config(model_dir),
+            )
     path = model_dir / "model.safetensors"
     path.write_bytes(path.read_bytes() + b"\0")  # 1 バイト違いのファイル
     with pytest.raises(ValueError, match="sha256 mismatch"):
-        load_qwen2(model_dir, dtype=mx.float32, expected_sha256=good)
+        load_qwen2(
+            model_dir,
+            dtype=mx.float32,
+            expected_sha256=good,
+            expected_config_sha256=_sha_config(model_dir),
+        )
 
 
 def test_sha256_checked_before_construction(
@@ -664,7 +696,12 @@ def test_sha256_checked_before_construction(
     """REQ-39: ハッシュ不一致はモデル構築より前に拒否する。"""
     _forbid_build(monkeypatch)
     with pytest.raises(ValueError, match="sha256 mismatch"):
-        load_qwen2(model_dir, dtype=mx.float32, expected_sha256="0" * 64)
+        load_qwen2(
+            model_dir,
+            dtype=mx.float32,
+            expected_sha256="0" * 64,
+            expected_config_sha256=_sha_config(model_dir),
+        )
 
 
 @pytest.mark.parametrize("scale", [0.0, -1.0, 1000.5, 1e9])
@@ -674,3 +711,29 @@ def test_apply_lora_scale_range(model_dir: Path, scale: float) -> None:
     with pytest.raises(ValueError, match="invalid LoRA scale"):
         apply_lora(m, num_layers=1, rank=4, scale=scale, dropout=0.0, seed=0)
     apply_lora(m, num_layers=1, rank=4, scale=1000.0, dropout=0.0, seed=0)
+
+
+def test_config_sha256_verification(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: config.json の sha256 が一致すれば読め、不一致・形式不正は構築前に拒否する。"""
+    good_w, good_c = _sha(model_dir), _sha_config(model_dir)
+    m = load_qwen2(
+        model_dir, dtype=mx.float32, expected_sha256=good_w, expected_config_sha256=good_c
+    )
+    assert m.config.hidden_size == 16
+    _forbid_build(monkeypatch)
+    monkeypatch.setattr(mx, "load", lambda *a, **k: pytest.fail("weights must not be read"))
+    for bad, match in (
+        ("0" * 64, "config.json sha256 mismatch"),
+        (good_c.upper(), "64 lowercase hex"),
+        ("", "64 lowercase hex"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            load_qwen2(
+                model_dir, dtype=mx.float32, expected_sha256=good_w, expected_config_sha256=bad
+            )
+    cfg = model_dir / "config.json"
+    cfg.write_bytes(cfg.read_bytes() + b" ")  # 1 バイト違い
+    with pytest.raises(ValueError, match=r"config\.json sha256 mismatch"):
+        load_qwen2(
+            model_dir, dtype=mx.float32, expected_sha256=good_w, expected_config_sha256=good_c
+        )

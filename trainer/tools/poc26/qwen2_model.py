@@ -127,8 +127,12 @@ class Qwen2Config:
 
     @classmethod
     def from_file(cls, path: Path) -> Qwen2Config:
-        """`config.json` を検証して読む。対応範囲外は ValueError。"""
-        raw = _read_limited(path, MAX_CONFIG_BYTES, "config.json")
+        """`config.json` を上限つきで読んで検証する。対応範囲外は ValueError。"""
+        return cls.from_bytes(_read_limited(path, MAX_CONFIG_BYTES, "config.json"))
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> Qwen2Config:
+        """`config.json` のバイト列を検証して読む（検証済みバイト列の再利用口）。"""
 
         def _no_const(_: str) -> None:
             raise ValueError
@@ -430,7 +434,9 @@ def trainable_parameter_count(model: nn.Module) -> int:
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
-def load_qwen2(model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str) -> Qwen2Model:
+def load_qwen2(
+    model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str, expected_config_sha256: str
+) -> Qwen2Model:
     """`config.json`・`model.safetensors` を検証して読み、`dtype` へ揃えたモデルを返す。
 
     順序: config 検証 → 重みファイルの存在・種類・サイズ検証 → 同時保持メモリの見積もり検査 →
@@ -440,16 +446,18 @@ def load_qwen2(model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str) -> Qwe
     `expected_sha256`（64 桁の小文字 16 進）は `model.safetensors` の期待ハッシュで、#387 で
     ベースモデルを取得した時に記録した sha256（信頼できる記録）を呼び出し側が渡す。検証済み fd
     から上限つきで全バイトを 1 度だけ読み、その bytes のハッシュを照合し、不一致なら構築前に
-    拒否する。一致したら同じ bytes を `io.BytesIO` 経由で読む（検査と使用の間の差し替えなし）。
+    拒否する。`expected_config_sha256` は #387 で記録した `config.json` の sha256 で、config も
+    1 度だけ読んだ bytes を照合してから解釈する（不一致は構築・重み読み込みより前に拒否）。
+    一致したら同じ bytes を `io.BytesIO` 経由で読む（検査と使用の間の差し替えなし）。
     """
-    if (
-        not isinstance(expected_sha256, str)
-        or len(expected_sha256) != 64
-        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
-    ):
-        raise ValueError("expected_sha256 must be 64 lowercase hex characters")
+    for h in (expected_sha256, expected_config_sha256):
+        if not isinstance(h, str) or len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
+            raise ValueError("expected sha256 must be 64 lowercase hex characters")
     model_dir = Path(model_dir)
-    config = Qwen2Config.from_file(model_dir / "config.json")
+    config_bytes = _read_limited(model_dir / "config.json", MAX_CONFIG_BYTES, "config.json")
+    if hashlib.sha256(config_bytes).hexdigest() != expected_config_sha256:
+        raise ValueError("config.json sha256 mismatch")
+    config = Qwen2Config.from_bytes(config_bytes)
     params = config.estimated_params()
     fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
     with os.fdopen(fd, "rb") as f:
