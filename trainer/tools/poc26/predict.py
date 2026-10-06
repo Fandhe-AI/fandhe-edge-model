@@ -33,9 +33,9 @@ from tools.poc26.io_records import (
     check_out_dir,
     common_run,
     json_text,
+    load_adapter,
     load_label_order,
     load_records,
-    load_weights,
     read_adapter_config,
     write_scores,
 )
@@ -58,7 +58,18 @@ def cmd_predict(a: argparse.Namespace) -> int:
     """
     budget = Budget()
     check_out_dir(a.out_dir)
-    cfg = read_adapter_config(a.adapter_dir / "adapter_config.json")
+    # adapter は検証済み fd から読んだバイト列の sha256 を `--adapter-sha256` と照合する。設定
+    # （rank・scale・sha256 群など）は同じバイト列の metadata が正本で、adapter_config.json は
+    # 人間向けの写し（一致しなければ 64）。ファイル全体のハッシュなので設定も完全性で守られる。
+    adapter_bytes = read_input(
+        a.adapter_dir / "adapters.safetensors", MAX_ADAPTER_BYTES, "adapters"
+    )
+    if sha256(adapter_bytes) != a.adapter_sha256:
+        raise invalid("adapters.safetensors does not match the expected sha256")
+    weights, cfg = load_adapter(adapter_bytes)  # sha256 を照合したのと同じバイト列
+    del adapter_bytes
+    if read_adapter_config(a.adapter_dir / "adapter_config.json") != cfg:
+        raise invalid("adapter_config.json does not match the adapters.safetensors metadata")
     if cfg["dtype"] != a.dtype or cfg["max_seq_length"] != a.max_seq_length:
         raise invalid("dtype / max-seq-length differ from the values the adapter was trained with")
     label_order, def_sha = load_label_order(a.definition)
@@ -71,13 +82,6 @@ def cmd_predict(a: argparse.Namespace) -> int:
     ctx = build_prompting(assets, system, label_order, assets.config.vocab_size, a.max_seq_length)
     records, in_sha = load_records(a.input, labels=None, what="input data")
     prompts = prepare_prompts(ctx, records, budget)
-    adapter_path = a.adapter_dir / "adapters.safetensors"
-    adapter_bytes = read_input(adapter_path, MAX_ADAPTER_BYTES, "adapters")
-    actual_sha = sha256(adapter_bytes)
-    if actual_sha != a.adapter_sha256:
-        raise invalid("adapters.safetensors does not match the expected sha256")
-    if actual_sha != cfg["adapters_sha256"]:
-        raise invalid("adapters.safetensors does not match adapter_config.json")
     model, sha, size = load_base_model(a.model_dir, to_dtype(a.dtype), pins_from_args(a))
     if cfg["base_model_sha256"] != sha:
         raise invalid("adapter was trained on a different base model")
@@ -96,8 +100,6 @@ def cmd_predict(a: argparse.Namespace) -> int:
             dropout=cfg["dropout"],
             seed=cfg["lora_init_seed"],
         )
-    weights = load_weights(adapter_bytes, "adapters")  # sha256 を照合したのと同じバイト列
-    del adapter_bytes
     expected = dict(tree_flatten(model.trainable_parameters()))
     if weights.keys() != expected.keys() or any(
         weights[k].shape != v.shape for k, v in expected.items()
@@ -118,6 +120,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
             "definition_sha256": def_sha,
             "input_data_sha256": in_sha,
             "adapter_config": cfg,
+            "adapters_sha256": a.adapter_sha256,
             "max_score_seconds": a.max_score_seconds,
             "records": len(records),
             "scoring": stats,

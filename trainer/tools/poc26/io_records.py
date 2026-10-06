@@ -210,9 +210,22 @@ class OutputDir:
         if self.tmp is None:
             raise RuntimeError("OutputDir is not open")
         check_out_dir(self.out_dir)
+        # 宛先を先に排他作成（os.mkdir は既存なら失敗する）してから、その空ディレクトリを rename で
+        # 置き換える。POSIX の rename(dir, dir) は宛先が**空**のときだけ置き換え、空でなければ
+        # ENOTEMPTY 等で失敗する。したがって mkdir から rename の間に他者が宛先へファイルを置いても
+        # 上書き・混在は起きない（rename が失敗する）。置き換えられるのは自分が作った空ディレクトリ
+        # だけで、他者が先に作った宛先は mkdir の時点で拒否する。
+        try:
+            os.mkdir(self.out_dir, 0o700)
+        except OSError:
+            raise invalid("out-dir already exists (or cannot be created)") from None
         try:
             os.rename(self.tmp, self.out_dir)
         except OSError:
+            try:
+                os.rmdir(self.out_dir)  # 自分が作った空ディレクトリだけを消す（中身があれば失敗）
+            except OSError:
+                pass
             raise invalid("cannot move the output directory into place") from None
         self._committed = True
 
@@ -237,11 +250,35 @@ def write_new_file(path: Path, data: str) -> None:
         os.close(dir_fd)
 
 
-def adapters_to_bytes(adapters: dict[str, mx.array]) -> bytes:
-    """adapter を safetensors のバイト列にする（書く内容と sha256 を同じバイト列にそろえる）。"""
+ADAPTER_METADATA_KEY = "fandhe_adapter_config"
+
+
+def adapters_to_bytes(adapters: dict[str, mx.array], cfg: dict[str, Any]) -> bytes:
+    """adapter を safetensors のバイト列にする。
+
+    adapter の設定 `cfg`（predict が使う全項目）は metadata に JSON 文字列 1 つとして埋め込む。
+    `--adapter-sha256` がファイル全体のハッシュなので、重みと設定の両方が完全性で守られる。
+    書く内容と sha256 を同じバイト列にそろえる。
+    """
     buf = io.BytesIO()
-    mx.save_safetensors(buf, adapters)
+    meta = {ADAPTER_METADATA_KEY: json.dumps(cfg, sort_keys=True, separators=(",", ":"))}
+    mx.save_safetensors(buf, adapters, metadata=meta)
     return buf.getvalue()
+
+
+def load_adapter(data: bytes) -> tuple[dict[str, mx.array], dict[str, Any]]:
+    """読み済みのバイト列から adapter の重みと metadata の設定を読む（設定はこちらが正）。"""
+    try:
+        weights, meta = mx.load(io.BytesIO(data), format="safetensors", return_metadata=True)
+        mx.eval(weights)
+    except (RuntimeError, ValueError, OSError):
+        raise invalid("invalid adapters") from None
+    if not isinstance(weights, dict) or not isinstance(meta, dict):
+        raise invalid("invalid adapters")
+    text = meta.get(ADAPTER_METADATA_KEY)
+    if not isinstance(text, str):
+        raise invalid("adapters.safetensors has no adapter config metadata")
+    return weights, parse_adapter_config(loads(text.encode("utf-8"), "adapter metadata"))
 
 
 def json_text(doc: dict[str, Any]) -> str:
@@ -287,7 +324,6 @@ ADAPTER_CONFIG_KEYS = (
     "config_sha256",
     "tokenizer_sha256",
     "tokenizer_config_sha256",
-    "adapters_sha256",
     "dtype",
     "system_prompt_sha256",
     "label_order",
@@ -296,12 +332,17 @@ ADAPTER_CONFIG_KEYS = (
 
 
 def read_adapter_config(path: Path) -> dict[str, Any]:
-    """`adapter_config.json` を読み、既知のキーだけを検証して返す（余分なキーは捨てる）。"""
+    """`adapter_config.json`（人間向けの写し）を読み、既知のキーだけを検証して返す。"""
     raw = loads(
         read_input(path, MAX_ADAPTER_CONFIG_BYTES, "adapter_config.json"), "adapter_config.json"
     )
+    return parse_adapter_config(raw)
+
+
+def parse_adapter_config(raw: Any) -> dict[str, Any]:
+    """adapter の設定（metadata の正本・adapter_config.json の写し）の既知キーを検証する。"""
     if not isinstance(raw, dict) or not all(k in raw for k in ADAPTER_CONFIG_KEYS):
-        raise invalid("invalid adapter_config.json")
+        raise invalid("invalid adapter config")
     cfg = {k: raw[k] for k in ADAPTER_CONFIG_KEYS}
 
     def is_int(v: object) -> bool:
@@ -328,11 +369,10 @@ def read_adapter_config(path: Path) -> dict[str, Any]:
                 "config_sha256",
                 "tokenizer_sha256",
                 "tokenizer_config_sha256",
-                "adapters_sha256",
                 "system_prompt_sha256",
             )
         )
     )
     if not ok:
-        raise invalid("invalid adapter_config.json")
+        raise invalid("invalid adapter config")
     return cfg

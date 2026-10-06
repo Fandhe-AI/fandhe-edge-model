@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import unicodedata
@@ -116,6 +117,7 @@ def cmd_probe(a: argparse.Namespace) -> int:
         budget.check()
         ids = ctx.encode(text)
         logits = last_logits(model, ids)
+        budget.check()  # forward の後にも確認する
         cases.append(
             {
                 "text": text,
@@ -133,6 +135,7 @@ def cmd_probe(a: argparse.Namespace) -> int:
         for _ in range(GREEDY_TOKENS):
             budget.check()
             nxt = int(np.argmax(last_logits(model, [*ids, *out])))
+            budget.check()
             out.append(nxt)
             if nxt == end:
                 break
@@ -159,7 +162,7 @@ def decode_logits(b64: object, vocab: int) -> np.ndarray:
         raise invalid("invalid probe logits")
     try:
         raw = base64.b64decode(b64, validate=True)
-    except ValueError:
+    except (ValueError, binascii.Error):  # binascii.Error は ValueError の部分型だが明示する
         raise invalid("invalid probe logits") from None
     if len(raw) != 4 * vocab or len(raw) > MAX_PROBE_LOGITS_BYTES:
         raise invalid("invalid probe logits length")

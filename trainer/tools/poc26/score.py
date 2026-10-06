@@ -226,6 +226,7 @@ def score_records(
         t0 = time.perf_counter()
         loglik = score_labels(model, ids, ctx.label_ids, ctx.pad_id)
         secs.append(time.perf_counter() - t0)
+        budget.check()  # forward の後にも確認する（最後の 1 件で超過しても 20）
         mapping = map_scores_to_choice(loglik, ctx.label_order, choice_ids)
         pred.append(
             prediction_record_to_json_line(

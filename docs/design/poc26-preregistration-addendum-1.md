@@ -166,11 +166,12 @@ iters 600 の実行（GPU 本番の前に 1 回。#391）の所要時間と最�
 - 入力は PoC を実行する人が渡すローカルの信頼できるパスだけを想定する。ガード層（REQ-39）の `safe_join` 相当は持たない。
 - `O_NOFOLLOW` は最後の要素だけに効き、パスの途中のディレクトリの symlink は辿る。これは脅威モデル上許容する。
 - ベースモデルは PR-B の `load_qwen2` が、#387 で記録した sha256（必須引数 `--model-sha256`・`--config-sha256`）と照合してから読む（検証済み fd から全バイトを 1 度だけ読んだバイト列の照合・形状と dtype の検証・ピークメモリの見積もりを含む）。`tokenizer.json`・`tokenizer_config.json` も同様に必須引数（`--tokenizer-sha256`・`--tokenizer-config-sha256`）で照合する。token id（学習・採点の入力）と chat template の前提を、記録したものと同一に固定するため。不一致は終了コード 64。照合済みの値を `run.json`（`sha256_pinned: true`）と `adapter_config.json` に記録する。`adapters.safetensors` は検証済みの fd から全バイトを 1 度だけ読み、そのバイト列から sha256 と配列（`mx.load` に `BytesIO` を渡す）の両方を作る（開き直さない）。
-- `predict` は adapter のバイト列を必須引数 `--adapter-sha256`（学習時に `run.json`・`adapter_config.json` に記録した値）と `adapter_config.json` の記録値の両方と照合する。あわせてベースモデルと config・tokenizer の sha256（記録値と指定した期待値の両方）・ラベル順・system プロンプト・dtype・max_seq_length を学習時の記録と照合し、重みの構造・形状・dtype（float32 / bfloat16 / float16 のみ）・有限性を検査する。JSON は NaN・Infinity・重複キーを拒否する。
+- adapter の設定（rank・scale・dropout・num_layers・keys・lora_init_seed・dtype・max_seq_length・ベースモデル / config / tokenizer の sha256 群・system プロンプトの sha256・ラベル順）は `adapters.safetensors` の **metadata**（キー `fandhe_adapter_config`、JSON 文字列 1 つ）に埋め込む。`predict` は必須引数 `--adapter-sha256`（学習時に `run.json` の `adapters_sha256` へ記録した、ファイル全体のハッシュ）と読んだバイト列を照合するので、重みと設定の両方が完全性で守られる。`predict` は metadata の設定を正とし、`adapter_config.json` は人間向けの写しで、metadata と一致しなければ終了コード 64（写しの書き換えだけでは設定を変えられない）。あわせてベースモデルと config・tokenizer の sha256（metadata の値と指定した期待値の両方）・ラベル順・system プロンプト・dtype・max_seq_length を照合し、重みの構造・形状・dtype（float32 / bfloat16 / float16 のみ）・有限性を検査する。JSON は NaN・Infinity・重複キーを拒否する。
 
 ## 10. 出力の確定と失敗後の再実行
 
 - `--out-dir`（`probe` は `--out`）は**存在しない**ことを要求し、親ディレクトリは存在している必要がある（`mkdir -p` はしない）。
-- `train`・`predict` は同じ親に `.<名前>.tmp-XXXX`（0700）の一時ディレクトリを作り、各ファイルをそのディレクトリ fd 起点で排他作成（0600）して、全出力が揃ってから `out-dir` へ rename する。採点中などの失敗では一時ディレクトリを消すため、半端な出力は残らず、**同じ `--out-dir` でそのまま再実行できる**。プロセスの強制終了（SIGKILL）では一時ディレクトリが残りうる（隠し名のため手で消す）。
+- `train`・`predict` は同じ親に `.<名前>.tmp-XXXX`（0700）の一時ディレクトリを作り、各ファイルをそのディレクトリ fd 起点で排他作成（0600）して、全出力が揃ってから `out-dir` へ確定する。確定は、宛先を `mkdir`（0700）で排他作成してからその空ディレクトリを `rename` で置き換える（POSIX の rename は宛先が空のときだけ置き換えるので、間に他者が宛先へファイルを置いても上書きせず失敗する。既存の宛先は mkdir で 64）。採点中などの失敗では一時ディレクトリを消すため、半端な出力は残らず、**同じ `--out-dir` でそのまま再実行できる**。プロセスの強制終了（SIGKILL）では一時ディレクトリが残りうる（隠し名のため手で消す）。
 - 入力の読み込み・検証とモデル・LoRA の準備をすべて終えてから一時ディレクトリを作る。既存の `out-dir` は上書きしない（終了コード 64）。
 - `probe` は出力ファイルを親ディレクトリ fd 起点で排他作成（0600）する。
+- 採点・probe の壁時計上限は、各 forward の**後**にも確認する（最後の 1 件で超過しても終了コード 20）。

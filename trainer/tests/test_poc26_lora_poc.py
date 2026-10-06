@@ -535,17 +535,35 @@ def _copy_adapter(env: dict, dst: Path) -> Path:
     return dst
 
 
+def _rebuild_adapter(env: dict, dst: Path, weights_fn=None, cfg_fn=None) -> str:
+    """adapter を metadata つきで作り直し（重み・設定を加工可）、adapter_config.json も更新して
+    新しいファイル全体の sha256 を返す。"""
+    d = _copy_adapter(env, dst)
+    w, meta = mx.load(str(d / "adapters.safetensors"), return_metadata=True)
+    cfg = json.loads(meta[io_records.ADAPTER_METADATA_KEY])
+    if weights_fn:
+        w = weights_fn(w)
+    if cfg_fn:
+        cfg_fn(cfg)
+    (d / "adapters.safetensors").unlink()
+    (d / "adapters.safetensors").write_bytes(io_records.adapters_to_bytes(w, cfg))
+    (d / "adapter_config.json").write_text(json.dumps(cfg))
+    return _sha(d / "adapters.safetensors")
+
+
 def test_adapter_sha256_recorded_and_checked(env: dict, tmp_path: Path) -> None:
     """REQ-39: adapters の sha256 を記録・照合する。dtype・max_seq_length 不一致は 64。"""
     cfg = json.loads((env["outs"][0] / "adapter_config.json").read_text())
     run = json.loads((env["outs"][0] / "run.json").read_text())
     want = _sha(env["outs"][0] / "adapters.safetensors")
-    assert cfg["adapters_sha256"] == want
+    assert (
+        "adapters_sha256" not in cfg
+    )  # ファイル全体のハッシュは --adapter-sha256（設定は metadata）
     assert run["adapters_sha256"] == want
     tampered = _copy_adapter(env, tmp_path / "t")
     with (tampered / "adapters.safetensors").open("ab") as f:
         f.write(b"\0")
-    assert main(_predict_argv(env, tampered, tmp_path / "o1")) == 64
+    assert main(_predict_argv(env, tampered, tmp_path / "o1", adapter_sha=want)) == 64
     ok = _copy_adapter(env, tmp_path / "ok")
     argv = _predict_argv(env, ok, tmp_path / "o2")
     argv[argv.index("--dtype") + 1] = "bf16"
@@ -556,18 +574,18 @@ def test_adapter_sha256_recorded_and_checked(env: dict, tmp_path: Path) -> None:
     assert not (tmp_path / "o1").exists()
 
 
-def test_predict_rejects_non_finite_weights(env: dict, tmp_path: Path) -> None:
-    """REQ-39: 非有限の adapter 重み（sha256 は一致）は拒否する。"""
-    d = _copy_adapter(env, tmp_path / "nan")
-    w = mx.load(str(d / "adapters.safetensors"))
-    key = next(iter(w))
-    w[key] = mx.full(w[key].shape, float("nan"))
-    (d / "adapters.safetensors").unlink()
-    mx.save_safetensors(str(d / "adapters.safetensors"), w)
-    cfg = json.loads((d / "adapter_config.json").read_text())
-    cfg["adapters_sha256"] = _sha(d / "adapters.safetensors")
-    (d / "adapter_config.json").write_text(json.dumps(cfg))
-    assert main(_predict_argv(env, d, tmp_path / "o")) == 64
+def test_predict_rejects_non_finite_weights(
+    env: dict, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-39: 非有限の adapter 重み（sha256・metadata は一致）は拒否する。"""
+
+    def nan_weights(w: dict) -> dict:
+        key = next(iter(w))
+        return {**w, key: mx.full(w[key].shape, float("nan"))}
+
+    sha = _rebuild_adapter(env, tmp_path / "nan", weights_fn=nan_weights)
+    assert main(_predict_argv(env, tmp_path / "nan", tmp_path / "o", adapter_sha=sha)) == 64
+    assert "not finite" in capsys.readouterr().err
     assert not (tmp_path / "o").exists()
 
 
@@ -856,11 +874,11 @@ def test_pins_are_recorded_and_checked_by_predict(env: dict, tmp_path: Path) -> 
     assert run["config_json_sha256"] == v["config"]
     assert run["tokenizer_json_sha256"] == v["tokenizer"]
     assert run["sha256_pinned"] is True
-    d = _copy_adapter(env, tmp_path / "a")
-    bad = json.loads((d / "adapter_config.json").read_text())
-    bad["tokenizer_sha256"] = "1" * 64  # 学習時と別の tokenizer だったことにする
-    (d / "adapter_config.json").write_text(json.dumps(bad))
-    assert main(_predict_argv(env, d, tmp_path / "o")) == 64
+    sha = _rebuild_adapter(
+        env, tmp_path / "a", cfg_fn=lambda c: c.update(tokenizer_sha256="1" * 64)
+    )  # 学習時と別の tokenizer だったことにする（metadata ごと整合させる）
+    argv = _predict_argv(env, tmp_path / "a", tmp_path / "o", adapter_sha=sha)
+    assert main(argv) == 64
     assert not (tmp_path / "o").exists()
 
 
@@ -987,18 +1005,37 @@ def test_adapter_sha256_argument_is_required_and_checked(env: dict, tmp_path: Pa
     assert _leftovers(tmp_path, "o") == []
 
 
-def test_predict_rejects_unsupported_adapter_dtype(env: dict, tmp_path: Path) -> None:
+def test_predict_rejects_unsupported_adapter_dtype(
+    env: dict, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """REQ-39: adapter の重み dtype は float32 / bfloat16 / float16 だけ。"""
-    d = _copy_adapter(env, tmp_path / "i32")
-    w = mx.load(str(d / "adapters.safetensors"))
-    w = {k: v.astype(mx.int32) for k, v in w.items()}
-    (d / "adapters.safetensors").unlink()
-    mx.save_safetensors(str(d / "adapters.safetensors"), w)
-    new = _sha(d / "adapters.safetensors")
+    sha = _rebuild_adapter(
+        env, tmp_path / "i32", weights_fn=lambda w: {k: v.astype(mx.int32) for k, v in w.items()}
+    )
+    assert main(_predict_argv(env, tmp_path / "i32", tmp_path / "o", adapter_sha=sha)) == 64
+    assert "dtype" in capsys.readouterr().err
+
+
+def test_adapter_config_is_protected_by_the_adapter_hash(
+    env: dict, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1: 設定は adapters.safetensors の metadata に入り、--adapter-sha256 が守る。
+
+    adapter_config.json（人間向けの写し）の scale だけを書き換えると metadata と不一致で 64。
+    """
+    d = _copy_adapter(env, tmp_path / "t")
     cfg = json.loads((d / "adapter_config.json").read_text())
-    cfg["adapters_sha256"] = new
+    _, meta = mx.load(str(d / "adapters.safetensors"), return_metadata=True)
+    assert json.loads(meta[io_records.ADAPTER_METADATA_KEY]) == cfg
+    cfg["scale"] = 1000.0
     (d / "adapter_config.json").write_text(json.dumps(cfg))
-    assert main(_predict_argv(env, d, tmp_path / "o", adapter_sha=new)) == 64
+    assert main(_predict_argv(env, d, tmp_path / "o")) == 64
+    assert "does not match" in capsys.readouterr().err
+    # metadata の設定を書き換えたファイルは、元の --adapter-sha256 とは別のハッシュになり拒否される
+    sha = _rebuild_adapter(env, tmp_path / "m", cfg_fn=lambda c: c.update(scale=1000.0))
+    orig = _sha(env["outs"][0] / "adapters.safetensors")
+    assert sha != orig
+    assert main(_predict_argv(env, tmp_path / "m", tmp_path / "o2", adapter_sha=orig)) == 64
 
 
 def test_run_json_records_verified_size_and_memory_peak(env: dict) -> None:
@@ -1044,3 +1081,78 @@ def test_safe_decode_reraises_limit_exceeded() -> None:
     with pytest.raises(LimitExceededError):
         probe_mod.safe_decode(Tok(LimitExceededError("x")), [1])
     assert probe_mod.safe_decode(Tok(ValueError("unknown token id")), [1]) == "<undecodable>"
+
+
+def test_budget_is_checked_after_the_last_forward(
+    ctx_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: 最後の forward の後に壁時計上限を超えていれば 20（forward の前だけでは見逃す）。"""
+    ctx, model = ctx_model
+    recs = [io_records.Record("r1", "abc", None)]
+    prompts = score_mod.prepare_prompts(ctx, recs, common.Budget())
+    budget = common.Budget(wall_limit=1000.0)
+    calls = {"n": 0}
+    real = score_mod.score_labels
+
+    def slow_last(*a, **k):
+        calls["n"] += 1
+        budget.start -= 5000.0  # この forward の間に上限を超えた状況を作る
+        return real(*a, **k)
+
+    monkeypatch.setattr(score_mod, "score_labels", slow_last)
+    # forward の前の check は通る（start を動かすのは forward の中）
+    with pytest.raises(WorkerError) as exc:
+        score_mod.score_records(model, ctx, recs, prompts, budget)
+    assert calls["n"] == 1
+    assert exc.value.exit_code == 20
+
+
+def test_commit_refuses_existing_destination_and_never_overwrites(tmp_path: Path) -> None:
+    """P1: 宛先を mkdir で排他作成してから rename する。既存・直前に作られた宛先は上書きしない。"""
+    target = tmp_path / "out"
+
+    def attempt() -> None:
+        with io_records.OutputDir(target) as out:
+            out.write("a.txt", "x")
+            target.mkdir()  # 確定直前に他者が作った
+            (target / "theirs.txt").write_text("keep")
+            out.commit()
+
+    with pytest.raises(WorkerError):
+        attempt()
+    assert (target / "theirs.txt").read_text() == "keep"
+    assert not (target / "a.txt").exists()
+    assert _leftovers(tmp_path, "out") == ["out"]  # 一時ディレクトリは消える
+
+
+def test_commit_fails_if_someone_fills_the_destination_after_mkdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: mkdir と rename の間に宛先へファイルを置かれたら rename が失敗し、上書きは起きない。"""
+    target = tmp_path / "out"
+    real_rename = os.rename
+
+    def racing_rename(src, dst):
+        (Path(dst) / "intruder.txt").write_text("theirs")  # mkdir 直後に割り込む
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(io_records.os, "rename", racing_rename)
+
+    def attempt() -> None:
+        with io_records.OutputDir(target) as out:
+            out.write("a.txt", "x")
+            out.commit()
+
+    with pytest.raises(WorkerError):
+        attempt()
+    assert (target / "intruder.txt").read_text() == "theirs"  # 他者のファイルはそのまま
+    assert not (target / "a.txt").exists()
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")] == []
+
+
+@pytest.mark.parametrize("bad", ["!!!", "QUJD=", "é", "A"])
+def test_decode_logits_maps_base64_errors_to_input_error(bad: str) -> None:
+    """P1: 不正な base64（padding・非 ASCII・非 alphabet）は 64（未処理の例外にしない）。"""
+    with pytest.raises(WorkerError) as exc:
+        probe_mod.decode_logits(bad, 4)
+    assert exc.value.exit_code == 64

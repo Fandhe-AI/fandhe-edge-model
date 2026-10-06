@@ -212,8 +212,6 @@ def cmd_train(a: argparse.Namespace) -> int:
         seed=a.seed, budget=budget, max_wall_seconds=a.max_wall_seconds,
     )  # fmt: skip
     train_seconds = budget.elapsed()
-    adapter_bytes = adapters_to_bytes(dict(tree_flatten(model.trainable_parameters())))
-    adapters_sha = sha256(adapter_bytes)
     adapter_cfg = {
         "rank": a.rank,
         "scale": a.scale,
@@ -225,12 +223,15 @@ def cmd_train(a: argparse.Namespace) -> int:
         "config_sha256": a.config_sha256,
         "tokenizer_sha256": a.tokenizer_sha256,
         "tokenizer_config_sha256": a.tokenizer_config_sha256,
-        "adapters_sha256": adapters_sha,
         "dtype": a.dtype,
         "system_prompt_sha256": sha256(system.encode("utf-8")),
         "label_order": label_order,
         "max_seq_length": a.max_seq_length,
     }
+    # 設定は adapters.safetensors の metadata に埋め込む（`--adapter-sha256` がファイル全体の
+    # ハッシュとして重みと設定の両方を守る）。adapter_config.json は人間向けの写し。
+    adapter_bytes = adapters_to_bytes(dict(tree_flatten(model.trainable_parameters())), adapter_cfg)
+    adapters_sha = sha256(adapter_bytes)
     pred, raw, stats = score_records(
         model, ctx, val, val_prompts, Budget(wall_limit=a.max_score_seconds)
     )
