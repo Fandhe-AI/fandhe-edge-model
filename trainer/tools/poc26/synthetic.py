@@ -83,6 +83,8 @@ def tiny_config(*, tie: bool = True, rope_theta: float = 10000.0) -> dict:
         "rope_theta": rope_theta,
         "tie_word_embeddings": tie,
         "use_sliding_window": False,
+        "hidden_act": "silu",
+        "attention_dropout": 0.0,
         "max_position_embeddings": 64,
     }
 

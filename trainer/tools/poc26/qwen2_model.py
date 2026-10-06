@@ -149,6 +149,20 @@ class Qwen2Config:
             raise ValueError(f"unsupported rope_scaling; {_SUPPORTED}")
         if doc.get("use_sliding_window", False):
             raise ValueError(f"unsupported use_sliding_window; {_SUPPORTED}")
+        # forward の計算を固定している設定は、許可値だけを受理する（無視して誤った計算をしない）。
+        if doc.get("hidden_act") != "silu":
+            raise ValueError(f"unsupported hidden_act; {_SUPPORTED}, hidden_act=silu")
+        for key, allowed in (
+            ("attention_dropout", 0),
+            ("partial_rotary_factor", 1),
+            ("mlp_bias", False),
+            ("attention_bias", True),  # Qwen2 は q/k/v に bias を持つ（実装が固定）
+        ):
+            if key in doc:
+                v = doc[key]
+                same = v == allowed and isinstance(v, bool) == isinstance(allowed, bool)
+                if not same:
+                    raise ValueError(f"unsupported {key}; {_SUPPORTED}")
         ints = [
             "hidden_size",
             "num_hidden_layers",
@@ -169,6 +183,11 @@ class Qwen2Config:
             or doc["num_attention_heads"] % doc["num_key_value_heads"]
         ):
             raise ValueError("invalid config: heads do not divide hidden_size / kv heads")
+        if (
+            "head_dim" in doc
+            and doc["head_dim"] != doc["hidden_size"] // doc["num_attention_heads"]
+        ):
+            raise ValueError(f"unsupported head_dim; {_SUPPORTED}")
         if (doc["hidden_size"] // doc["num_attention_heads"]) % 2:
             raise ValueError("invalid config: head_dim must be even (RoPE)")
         eps, theta = doc.get("rms_norm_eps"), doc.get("rope_theta")
@@ -434,6 +453,21 @@ def trainable_parameter_count(model: nn.Module) -> int:
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
+def load_peak_bytes(config: Qwen2Config, file_size: int, dtype: mx.Dtype) -> int:
+    """読み込みの各段階の同時保持量の最大（バイト）。上限判定に使う（REQ-39）。
+
+    段階（C = params × dtype、F = params × 4 = 構築時の float32 既定パラメータ、S = file_size、
+    T = 最大テンソル 1 個分の余裕 = max(vocab, intermediate) × hidden × 4）:
+      (a) bytes + mx.load した重み                 = 2S（読み込み後に bytes を del）
+      (b) 重みを 1 キーずつ dtype へ変換し元を解放   = max(S, C) + T
+      (c) 構築（F）+ 変換済みの重み                  = C + F（load_weights 後に F は解放）
+    """
+    params = config.estimated_params()
+    t = max(config.vocab_size, config.intermediate_size) * config.hidden_size * 4
+    c, f = params * dtype.size, params * 4
+    return max(2 * file_size, max(file_size, c) + t, c + f)
+
+
 def load_qwen2(
     model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str, expected_config_sha256: str
 ) -> Qwen2Model:
@@ -461,11 +495,11 @@ def load_qwen2(
     params = config.estimated_params()
     fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
     with os.fdopen(fd, "rb") as f:
-        # 同時保持: ファイルの bytes（st_size）+ 読み込んだ重み（st_size）+ 構築時の既定
-        # パラメータ（mlx の nn.Linear / Embedding は float32 のため params × 4）+ dtype 変換後。
+        # 各段階の同時保持の最大で判定する（式は load_peak_bytes。構築時の既定パラメータは
+        # mlx の nn.Linear / Embedding が float32 のため params × 4）。
         if (
             params * 2 > MAX_MODEL_BYTES
-            or 2 * st.st_size + params * 4 + params * dtype.size > MAX_MODEL_MEMORY_BYTES
+            or load_peak_bytes(config, st.st_size, dtype) > MAX_MODEL_MEMORY_BYTES
         ):
             raise ValueError("config implies a model larger than the supported size limit")
         # 検証済みの fd から全バイトを 1 度だけ読み、そのバイト列を照合・使用する
@@ -499,7 +533,14 @@ def load_qwen2(
             f"weight keys mismatch (missing={len(missing)}, unexpected={len(extra)}); "
             f"{_SUPPORTED}{hint}"
         )
-    model = Qwen2Model(config)
-    model.load_weights([(k, v.astype(dtype)) for k, v in weights.items()], strict=True)
+    # (b) 1 キーずつ変換して元を即解放する（一時保持は最大テンソル 1 個分）
+    for k in list(weights):
+        converted = weights[k].astype(dtype)
+        mx.eval(converted)
+        weights[k] = converted
+        del converted
+    model = Qwen2Model(config)  # (c)
+    model.load_weights(list(weights.items()), strict=True)
+    del weights
     mx.eval(model.parameters())
     return model

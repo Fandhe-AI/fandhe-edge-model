@@ -639,12 +639,27 @@ def test_forward_total_memory_estimate_limit(
     assert m(ids).shape == (3, 17, synthetic.TINY_VOCAB)
 
 
-def test_load_memory_estimate_uses_float32_construction(
-    model_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """REQ-39: 読み込み見積もり = bytes+重み（2×ファイル）+ 構築時 f32 + 変換後。"""
+def test_load_peak_bytes_stages() -> None:
+    """REQ-39: 読み込みのピーク = max(a: 2S, b: max(S, C) + T, c: C + F)。具体値で各段階を確認。"""
+    cfg = qwen2_model.Qwen2Config(16, 2, 2, 1, 32, 300, 1e-6, 1e4, True, 64)
+    p = cfg.estimated_params()
+    t = 300 * 16 * 4
+    assert p == 4800 + 2 * 2368 + 16  # 手計算: embed + 2 層（q/k/v/o・bias・MLP・norm）+ 最終 norm
+    f32 = mx.float32
+    assert qwen2_model.load_peak_bytes(cfg, 10**9, f32) == 2 * 10**9  # (a) 支配
+    assert qwen2_model.load_peak_bytes(cfg, 10, f32) == p * 8  # (c) C + F 支配
+    assert qwen2_model.load_peak_bytes(cfg, 10, mx.bfloat16) == p * 6
+    assert qwen2_model.load_peak_bytes(cfg, 4 * p, mx.bfloat16) == 8 * p  # (a)
+    assert max(10, p * 4) + t < p * 8  # (b) は (c) より小さい（max の前提）
+    # (b) が支配する場合: S が大きく C が小さい（file 12p > 2S 未満にはならない）ため式で直接確認
+    assert qwen2_model.load_peak_bytes(cfg, 4 * p, mx.bfloat16) >= 4 * p + t
+
+
+def test_load_memory_estimate_boundary(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: 見積もり（load_peak_bytes）ちょうどで読め、1 バイト下では拒否する。"""
     cfg = qwen2_model.Qwen2Config.from_file(model_dir / "config.json")
-    need = 2 * (model_dir / "model.safetensors").stat().st_size + cfg.estimated_params() * (4 + 2)
+    size = (model_dir / "model.safetensors").stat().st_size
+    need = qwen2_model.load_peak_bytes(cfg, size, mx.bfloat16)
     monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", need - 1)
     with pytest.raises(ValueError, match="larger than the supported size"):
         _load(model_dir, dtype=mx.bfloat16)
@@ -737,3 +752,62 @@ def test_config_sha256_verification(model_dir: Path, monkeypatch: pytest.MonkeyP
         load_qwen2(
             model_dir, dtype=mx.float32, expected_sha256=good_w, expected_config_sha256=good_c
         )
+
+
+REAL_QWEN_LIKE = {
+    "architectures": ["Qwen2ForCausalLM"],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "hidden_act": "silu",
+    "hidden_size": 896,
+    "initializer_range": 0.02,
+    "intermediate_size": 4864,
+    "max_position_embeddings": 32768,
+    "max_window_layers": 24,
+    "model_type": "qwen2",
+    "num_attention_heads": 14,
+    "num_hidden_layers": 24,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000.0,
+    "sliding_window": 32768,
+    "tie_word_embeddings": True,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.43.1",
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 151936,
+}
+
+
+def test_real_qwen_config_shape_is_accepted() -> None:
+    """REQ-41: 実物 Qwen2.5-0.5B-Instruct 相当の config.json（余分なキーを含む）が通る。"""
+    cfg = qwen2_model.Qwen2Config.from_bytes(json.dumps(REAL_QWEN_LIKE).encode())
+    assert (cfg.hidden_size, cfg.num_hidden_layers, cfg.head_dim) == (896, 24, 64)
+    assert cfg.max_position_embeddings == 32768
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"hidden_act": "gelu"},
+        {"hidden_act": None},
+        {"attention_dropout": 0.1},
+        {"attention_dropout": True},
+        {"partial_rotary_factor": 0.5},
+        {"mlp_bias": True},
+        {"attention_bias": False},
+        {"head_dim": 32},
+    ],
+)
+def test_unsupported_compute_settings_rejected(changes: dict) -> None:
+    """REQ-41: forward が固定している演算設定は許可値以外を拒否する。"""
+    doc = REAL_QWEN_LIKE | changes
+    with pytest.raises(ValueError, match="unsupported"):
+        qwen2_model.Qwen2Config.from_bytes(json.dumps(doc).encode())
+    missing = {k: v for k, v in REAL_QWEN_LIKE.items() if k != "hidden_act"}
+    with pytest.raises(ValueError, match="hidden_act"):
+        qwen2_model.Qwen2Config.from_bytes(json.dumps(missing).encode())
+    ok = REAL_QWEN_LIKE | {"attention_bias": True, "head_dim": 64, "mlp_bias": False}
+    qwen2_model.Qwen2Config.from_bytes(json.dumps(ok).encode())
