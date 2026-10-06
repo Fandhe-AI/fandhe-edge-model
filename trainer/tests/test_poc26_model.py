@@ -498,3 +498,71 @@ def test_lora_seed_validation(model_dir: Path, seed: object) -> None:
     m = load_qwen2(model_dir, dtype=mx.float32)
     with pytest.raises(ValueError, match="invalid LoRA"):
         apply_lora(m, num_layers=1, rank=4, scale=20.0, dropout=0.0, seed=seed)
+
+
+def test_apply_lora_memory_rejected_before_replace(
+    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: LoRA 行列の追加でメモリ上限を超えるなら、置換前に拒否する。"""
+    from mlx.utils import tree_flatten
+
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    current = sum(v.nbytes for _, v in tree_flatten(m.parameters()))
+    # rank 8・2 層の LoRA は 4096 要素 × 4 バイト = 16384 バイト
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", current + 16384 - 1)
+    with pytest.raises(ValueError, match="exceed the memory limit"):
+        apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0, seed=0)
+    assert not isinstance(m.model.layers[1].self_attn.q_proj, LoRALinear)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", current + 16384)
+    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0, seed=0)
+    assert isinstance(m.model.layers[1].self_attn.q_proj, LoRALinear)
+
+
+@pytest.mark.parametrize(
+    ("ids", "match"),
+    [
+        (mx.array([[0, -1, 2]]), "out of range"),
+        (mx.array([[0, 1, synthetic.TINY_VOCAB]]), "out of range"),
+        (mx.array([[0.0, 1.0, 2.0]]), "integer dtype"),
+    ],
+)
+def test_forward_rejects_bad_ids(model_dir: Path, ids: mx.array, match: str) -> None:
+    """REQ-39: id の dtype・範囲（0 <= id < vocab）を embed 参照前に検証する。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    with pytest.raises(ValueError, match=match):
+        m(ids)
+    assert m(mx.array([[0, 1, synthetic.TINY_VOCAB - 1]])).shape[-1] == synthetic.TINY_VOCAB
+
+
+@pytest.mark.parametrize(
+    ("mask", "match"),
+    [
+        ([[0, 1, 1, 1]], "start with a real token"),  # 左 pad
+        ([[1, 0, 1, 1]], "1s followed by 0s"),  # 途中の穴
+        ([[0, 0, 0, 0]], "start with a real token"),  # 全 0 行
+        ([[1, 1, 2, 0]], "0 or 1"),
+        ([[1, 1, -1, 0]], "0 or 1"),
+    ],
+)
+def test_attention_mask_right_pad_only(model_dir: Path, mask: list, match: str) -> None:
+    """REQ-41: attention_mask は 0/1 で「1 の連続 → 0 の連続」の右 pad のみ受け付ける。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    ids = mx.array([[1, 2, 3, 4]])
+    with pytest.raises(ValueError, match=match):
+        m(ids, mx.array(mask))
+    m(ids, mx.array([[1, 1, 0, 0]]))
+    m(ids, mx.array([[True, True, True, False]]))
+    with pytest.raises(ValueError, match="bool or integer"):
+        m(ids, mx.array([[1.0, 1.0, 0.0, 0.0]]))
+
+
+@pytest.mark.parametrize("field", ["rms_norm_eps", "rope_theta"])
+def test_config_huge_int_is_value_error(model_dir: Path, field: str) -> None:
+    """REQ-39: float に収まらない巨大整数は OverflowError でなく固定の ValueError。"""
+    cfg = model_dir / "config.json"
+    text = json.dumps(json.loads(cfg.read_text()) | {field: 0}).replace(
+        f'"{field}": 0', f'"{field}": 1' + "0" * 400
+    )
+    cfg.write_text(text)
+    with pytest.raises(ValueError, match=f"invalid config field: {field}"):
+        load_qwen2(model_dir, dtype=mx.float32)

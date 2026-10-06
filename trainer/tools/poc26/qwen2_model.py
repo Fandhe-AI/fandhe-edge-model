@@ -165,18 +165,22 @@ class Qwen2Config:
         if (doc["hidden_size"] // doc["num_attention_heads"]) % 2:
             raise ValueError("invalid config: head_dim must be even (RoPE)")
         eps, theta = doc.get("rms_norm_eps"), doc.get("rope_theta")
+        floats = {}
         for name, v in (("rms_norm_eps", eps), ("rope_theta", theta)):
-            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
-                raise ValueError(f"invalid config field: {name}")
-            if v <= 0:
-                raise ValueError(f"invalid config field: {name}")
+            try:
+                ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+                floats[name] = float(v) if ok else math.nan
+            except OverflowError:  # float に収まらない巨大整数
+                floats[name] = math.nan
+            if not math.isfinite(floats[name]) or floats[name] <= 0:
+                raise ValueError(f"invalid config field: {name}") from None
         tie = doc.get("tie_word_embeddings", True)
         if not isinstance(tie, bool):
             raise ValueError("invalid config field: tie_word_embeddings")
         return cls(
             **{k: doc[k] for k in ints},
-            rms_norm_eps=float(eps),
-            rope_theta=float(theta),
+            rms_norm_eps=floats["rms_norm_eps"],
+            rope_theta=floats["rope_theta"],
             tie_word_embeddings=tie,
         )
 
@@ -261,6 +265,8 @@ class Qwen2Model(nn.Module):
         c = self.config
         if n > c.max_position_embeddings:
             raise ValueError(f"sequence too long: {n} > {c.max_position_embeddings}")
+        if not mx.issubdtype(ids.dtype, mx.integer):
+            raise ValueError("ids must have an integer dtype")
         if b * n > MAX_FORWARD_TOKENS:
             raise ValueError(f"too many tokens: {b * n} > {MAX_FORWARD_TOKENS}")
         if b * n * c.vocab_size > MAX_FORWARD_ELEMENTS:
@@ -270,6 +276,22 @@ class Qwen2Model(nn.Module):
                 raise ValueError("attention_mask shape must equal ids shape")
             if b * n * n > MAX_FORWARD_ELEMENTS:
                 raise ValueError("attention mask would be too large for one forward")
+        # 値の検証（embed 参照・マスク構築の前）。
+        if mx.min(ids).item() < 0 or mx.max(ids).item() >= c.vocab_size:
+            raise ValueError("token id out of range [0, vocab_size)")
+        if attention_mask is not None:
+            am = attention_mask
+            if am.dtype != mx.bool_ and not mx.issubdtype(am.dtype, mx.integer):
+                raise ValueError("attention_mask must be bool or integer")
+            am = am.astype(mx.int32)
+            if mx.min(am).item() < 0 or mx.max(am).item() > 1:
+                raise ValueError("attention_mask values must be 0 or 1")
+            if mx.min(am[:, 0]).item() != 1:
+                raise ValueError(
+                    "attention_mask rows must start with a real token (right pad only)"
+                )
+            if n > 1 and mx.max(am[:, 1:] - am[:, :-1]).item() > 0:
+                raise ValueError("attention_mask must be 1s followed by 0s (right pad only)")
 
     def __call__(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から logits `[B, L, vocab]` を返す。
@@ -351,6 +373,19 @@ def apply_lora(
             raise ValueError("invalid LoRA scale / dropout: must be finite number")
     if not 0.0 <= dropout < 1.0:
         raise ValueError("invalid LoRA dropout: 0 <= dropout < 1")
+    # 置換前に、追加する LoRA 行列（float32）と現在のパラメータの合計を見積もって拒否する。
+    added = (
+        4
+        * rank
+        * sum(
+            sum(sum(getattr(getattr(b, o), n).weight.shape) for n in names)
+            for b in layers[-num_layers:]
+            for o, names in _LORA_TARGETS
+        )
+    )
+    current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+    if current + added > MAX_MODEL_MEMORY_BYTES:
+        raise ValueError("LoRA matrices would exceed the memory limit")
     model.freeze()
     n_each = sum(len(names) for _, names in _LORA_TARGETS)
     keys = iter(mx.random.split(mx.random.key(seed), num_layers * n_each))
