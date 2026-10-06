@@ -49,6 +49,11 @@ def write_tokenizer_json(directory: Path, *, merges_as_lists: bool = False) -> P
         "decoder": {"type": "ByteLevel"},
         "model": {
             "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": False,
             "byte_fallback": False,
             "vocab": vocab,
             "merges": [list(m) if merges_as_lists else " ".join(m) for m in MERGES],

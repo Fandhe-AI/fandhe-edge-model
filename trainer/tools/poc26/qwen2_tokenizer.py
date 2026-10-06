@@ -63,6 +63,16 @@ _WHITE_SPACE_CODEPOINTS = [
 _WHITE_SPACE = "".join(chr(c) for c in _WHITE_SPACE_CODEPOINTS)
 
 _INVALID = "invalid tokenizer.json"
+# model 節の BPE 設定（実物 Qwen2.5-0.5B-Instruct の値。ignore_merges は実物ではキー無し）。
+_MODEL_SETTINGS: dict[str, object] = {
+    "dropout": None,
+    "unk_token": None,
+    "continuing_subword_prefix": "",
+    "end_of_word_suffix": "",
+    "fuse_unk": False,
+    "byte_fallback": False,
+    "ignore_merges": False,
+}
 
 
 def bytes_to_unicode() -> dict[int, str]:
@@ -170,8 +180,14 @@ class Qwen2Tokenizer:
         model = doc.get("model")
         if not isinstance(model, dict):
             raise ValueError(_INVALID)
-        if model.get("type") != "BPE" or model.get("byte_fallback") or model.get("ignore_merges"):
+        if model.get("type") != "BPE":
             raise ValueError(_INVALID)
+        # 実物 Qwen2.5 の値に厳密一致を要求する（欠落は HF の既定値と同じ意味なので受理）。
+        for key, expected in _MODEL_SETTINGS.items():
+            if model.get(key, expected) != expected or type(model.get(key, expected)) is not type(
+                expected
+            ):
+                raise ValueError(_INVALID)
         vocab = model.get("vocab")
         raw_merges = model.get("merges")
         added = doc.get("added_tokens")

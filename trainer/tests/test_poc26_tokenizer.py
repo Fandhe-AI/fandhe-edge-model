@@ -262,6 +262,35 @@ def test_unsupported_or_malformed_config_rejected(tmp_path: Path, mutate) -> Non
         Qwen2Tokenizer(doc)
 
 
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("dropout", 0.1),
+        ("unk_token", "<unk>"),
+        ("continuing_subword_prefix", "##"),
+        ("end_of_word_suffix", "</w>"),
+        ("fuse_unk", True),
+        ("byte_fallback", True),
+        ("ignore_merges", True),
+        ("byte_fallback", 0),
+    ],
+)
+def test_bpe_model_settings_must_match_qwen(tmp_path: Path, key: str, bad: object) -> None:
+    """REQ-41: model 節の BPE 設定が実物 Qwen2.5 と異なれば拒否する。"""
+    doc = _doc(tmp_path)
+    doc["model"][key] = bad
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer(doc)
+
+
+def test_bpe_model_settings_may_be_absent(tmp_path: Path) -> None:
+    """REQ-41: 既定値と同じ意味の設定はキー欠落でも受理する（実物は ignore_merges が無い）。"""
+    doc = _doc(tmp_path)
+    for key in ("dropout", "unk_token", "fuse_unk", "ignore_merges"):
+        doc["model"].pop(key, None)
+    assert Qwen2Tokenizer(doc).encode("hello") == [260]
+
+
 def test_byte_level_post_processor_accepted(tmp_path: Path) -> None:
     """REQ-41: 実物と同じ ByteLevel の post_processor（id を足さない）は受理する。"""
     doc = _doc(tmp_path)
