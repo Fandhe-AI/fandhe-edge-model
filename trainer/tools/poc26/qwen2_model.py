@@ -11,6 +11,8 @@ logits `[B, L, vocab]` を返す forward と、mlx-lm と同形の LoRA を提�
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import math
 import os
@@ -52,6 +54,7 @@ _CONFIG_LIMITS = {
 }
 
 MAX_LORA_RANK = 256
+MAX_LORA_SCALE = 1000.0  # mlx-lm 既定 20 の十分上
 
 
 def _open_regular(path: Path, limit: int, what: str) -> tuple[int, os.stat_result]:
@@ -394,6 +397,8 @@ def apply_lora(
     for v in (scale, dropout):
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
             raise ValueError("invalid LoRA scale / dropout: must be finite number")
+    if not 0.0 < scale <= MAX_LORA_SCALE:
+        raise ValueError(f"invalid LoRA scale: 0 < scale <= {MAX_LORA_SCALE}")
     if not 0.0 <= dropout < 1.0:
         raise ValueError("invalid LoRA dropout: 0 <= dropout < 1")
     # 置換前に、追加する LoRA 行列（float32）と現在のパラメータの合計を見積もって拒否する。
@@ -425,33 +430,51 @@ def trainable_parameter_count(model: nn.Module) -> int:
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
-def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
+def load_qwen2(model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str) -> Qwen2Model:
     """`config.json`・`model.safetensors` を検証して読み、`dtype` へ揃えたモデルを返す。
 
     順序: config 検証 → 重みファイルの存在・種類・サイズ検証 → 同時保持メモリの見積もり検査 →
     重み読み込みとキー検査 → モデル構築 → dtype 変換して `strict=True` で load。
     構築（確保）は、重みが存在し上限内でキーが合うと分かった後に行う。
+
+    `expected_sha256`（64 桁の小文字 16 進）は `model.safetensors` の期待ハッシュで、#387 で
+    ベースモデルを取得した時に記録した sha256（信頼できる記録）を呼び出し側が渡す。検証済み fd
+    から上限つきで全バイトを 1 度だけ読み、その bytes のハッシュを照合し、不一致なら構築前に
+    拒否する。一致したら同じ bytes を `io.BytesIO` 経由で読む（検査と使用の間の差し替えなし）。
     """
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise ValueError("expected_sha256 must be 64 lowercase hex characters")
     model_dir = Path(model_dir)
     config = Qwen2Config.from_file(model_dir / "config.json")
     params = config.estimated_params()
     fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
     with os.fdopen(fd, "rb") as f:
-        # 同時保持: 読み込んだ重み（ファイルサイズ）+ 構築時の既定パラメータ（mlx の
-        # nn.Linear / Embedding は float32 で確保するため params × 4）+ dtype 変換後の重み。
+        # 同時保持: ファイルの bytes（st_size）+ 読み込んだ重み（st_size）+ 構築時の既定
+        # パラメータ（mlx の nn.Linear / Embedding は float32 のため params × 4）+ dtype 変換後。
         if (
             params * 2 > MAX_MODEL_BYTES
-            or st.st_size + params * 4 + params * dtype.size > MAX_MODEL_MEMORY_BYTES
+            or 2 * st.st_size + params * 4 + params * dtype.size > MAX_MODEL_MEMORY_BYTES
         ):
             raise ValueError("config implies a model larger than the supported size limit")
-        # 検証済みの fd をそのまま読む（パスで開き直さない）ため、検査後にパスが差し替わっても
-        # 検証した実体が読まれる（TOCTOU 対策）。mx.load は遅延読み込みのことがあるので、
-        # ファイルを閉じる前に mx.eval で全配列を実体化する（閉じた後は fd に依存しない）。
-        try:
-            weights = mx.load(f, format="safetensors")
-            mx.eval(weights)
-        except (RuntimeError, ValueError, OSError):
-            raise ValueError("invalid model.safetensors") from None
+        # 検証済みの fd から全バイトを 1 度だけ読み、そのバイト列を照合・使用する
+        # （パスで開き直さない。TOCTOU 対策）。mx.load は遅延読み込みのことがあるため、
+        # BytesIO を閉じる前に mx.eval で実体化する。
+        data = f.read(MAX_MODEL_BYTES + 1)
+    if len(data) > MAX_MODEL_BYTES:
+        raise ValueError(f"model.safetensors too large: > {MAX_MODEL_BYTES} bytes")
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("model.safetensors sha256 mismatch")
+    try:
+        weights = mx.load(io.BytesIO(data), format="safetensors")
+        mx.eval(weights)
+    except (RuntimeError, ValueError, OSError):
+        raise ValueError("invalid model.safetensors") from None
+    finally:
+        del data  # バイト列を解放する
     if not isinstance(weights, dict):
         raise ValueError("invalid model.safetensors")
     expected = config.expected_keys()
