@@ -209,6 +209,18 @@ def _mut_merge_piece(d: dict) -> None:
     d["model"]["merges"].append("zz qq")
 
 
+def _mut_merge_result_missing(d: dict) -> None:
+    d["model"]["merges"].append("a b")  # "ab" は vocab に無い
+
+
+def _mut_special_false(d: dict) -> None:
+    d["added_tokens"][2]["special"] = False
+
+
+def _mut_special_missing(d: dict) -> None:
+    d["added_tokens"][1]["content"] = "<|other|>"
+
+
 def _mut_merges_type(d: dict) -> None:
     d["model"]["merges"] = {"a": "b"}
 
@@ -229,6 +241,9 @@ def _mut_merges_type(d: dict) -> None:
         _mut_added_overlap,
         _mut_merge_piece,
         _mut_merges_type,
+        _mut_merge_result_missing,
+        _mut_special_false,
+        _mut_special_missing,
     ],
 )
 def test_unsupported_or_malformed_config_rejected(tmp_path: Path, mutate) -> None:
@@ -267,6 +282,13 @@ def test_decode_rejects_non_int_ids(tok: Qwen2Tokenizer) -> None:
     for bad in (True, "1", 1.0):
         with pytest.raises(ValueError, match="int"):
             tok.decode([bad])  # type: ignore[list-item]
+
+
+def test_piece_length_limit(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: 1 piece が 4096 文字を超えると BPE の二次処理量を避けて拒否する。"""
+    assert tok.encode("a" * 4096) == [97] * 4096
+    with pytest.raises(ValueError, match="piece is too long"):
+        tok.encode("a" * 4097)
 
 
 def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:

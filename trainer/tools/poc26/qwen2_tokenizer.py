@@ -43,6 +43,10 @@ MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 MAX_ENCODE_CHARS = 1 << 20
 # BPE キャッシュの件数上限。超えたら格納しない（メモリを際限なく増やさない）。
 MAX_BPE_CACHE_ENTRIES = 100_000
+# BPE 1 piece あたりの長さ上限（文字数）。
+# ponytail: 併合ごとに最小順位を線形探索するため最悪 O(n^2)。PoC の入力は短文なので上限で
+# 抑える。長文が要るなら優先度付きキュー（順位つきヒープ＋連結リスト）へ置き換える。
+MAX_PIECE_CHARS = 4096
 
 # Qwen2 の Split 正規表現（tokenizer.json の pre_tokenizer と一致を要求する定数）。
 SPLIT_REGEX = (
@@ -190,6 +194,7 @@ class Qwen2Tokenizer:
             raise ValueError(_INVALID)
 
         added_map: dict[int, str] = {}
+        special_contents: set[str] = set()
         for entry in added:
             if not isinstance(entry, dict):
                 raise ValueError(_INVALID)
@@ -199,6 +204,8 @@ class Qwen2Tokenizer:
             if i in seen_ids or i in added_map:
                 raise ValueError(_INVALID)
             added_map[i] = content
+            if entry.get("special") is True:
+                special_contents.add(content)
 
         ranks: dict[tuple[str, str], int] = {}
         for rank, merge in enumerate(raw_merges):
@@ -212,9 +219,15 @@ class Qwen2Tokenizer:
                 raise ValueError(_INVALID)
             if (pair[0], pair[1]) in ranks:  # 重複の解釈が HF と一致する保証がないため拒否
                 raise ValueError(_INVALID)
+            if pair[0] + pair[1] not in vocab:  # HF の BpeBuilder も同条件でエラー
+                raise ValueError(_INVALID)
             ranks[(pair[0], pair[1])] = rank
 
         by_content = {content: i for i, content in added_map.items()}
+        # build_chat_ids が使う 3 件は special=true で存在することを要求する。
+        required = ("<|im_start|>", "<|im_end|>", "<|endoftext|>")
+        if not all(c in special_contents for c in required):
+            raise ValueError(_INVALID)
         try:
             self.special_ids = {
                 "im_start": by_content["<|im_start|>"],
@@ -274,6 +287,8 @@ class Qwen2Tokenizer:
         cached = self._cache.get(piece)
         if cached is not None:
             return cached
+        if len(piece) > MAX_PIECE_CHARS:
+            raise ValueError("piece is too long")
         parts = [self._b2u[b] for b in piece.encode("utf-8")]
         while len(parts) > 1:
             best = min(
