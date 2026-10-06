@@ -241,6 +241,14 @@ def _mut_duplicate_content(d: dict) -> None:
     d["added_tokens"].append({"id": 265, "content": "<|im_end|>", "special": True})
 
 
+def _mut_added_surrogate(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "x\ud800", "special": False})
+
+
+def _mut_added_too_long(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "x" * 257, "special": False})
+
+
 def _mut_special_false(d: dict) -> None:
     d["added_tokens"][2]["special"] = False
 
@@ -271,6 +279,8 @@ def _mut_merges_type(d: dict) -> None:
         _mut_merges_type,
         _mut_merge_result_missing,
         _mut_special_false,
+        _mut_added_surrogate,
+        _mut_added_too_long,
         _mut_duplicate_content,
         _mut_special_missing,
     ],
@@ -403,6 +413,16 @@ def test_long_pieces_are_not_cached(tok: Qwen2Tokenizer) -> None:
     assert tok._cache == {}
     tok.encode("a" * 64)
     assert list(tok._cache) == ["a" * 64]
+
+
+def test_decode_resource_limits(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: decode は件数と展開後バイト数の上限を超えると ValueError にする。"""
+    with pytest.raises(ValueError, match="too many"):
+        tok.decode([97] * ((1 << 20) + 1))
+    assert tok.decode([97] * (1 << 20)) == "a" * (1 << 20)
+    # <|im_start|> は 12 バイトなので 350,000 件強で 4 MiB を超える
+    with pytest.raises(ValueError, match="too large"):
+        tok.decode([START] * 400_000)
 
 
 def test_encode_rejects_unencodable_text(tok: Qwen2Tokenizer) -> None:

@@ -44,6 +44,13 @@ from pathlib import Path
 MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 # encode の入力上限。PoC の入力は 1 件数文で、1 MiB 文字あれば十分余裕がある。
 MAX_ENCODE_CHARS = 1 << 20
+# decode の上限。件数は encode 上限（1 MiB 文字）と同程度、展開後バイト数は 4 MiB（1 件あたり
+# 最大 4 バイト程度の token を想定した余裕のある値）。超えたら ValueError。
+MAX_DECODE_IDS = 1 << 20
+MAX_DECODE_BYTES = 4 << 20
+# added_tokens の content の長さ上限（文字数）。実物の最長（`<|fim_suffix|>` 等の十数文字）に
+# 対して十分な余裕のある値。
+MAX_ADDED_CONTENT_CHARS = 256
 # BPE キャッシュの上限。短い piece（64 文字以下）だけを最大 20,000 件まで格納し、超えたら
 # 格納しない（長い piece は毎回計算する）。1 件は最悪でも key 約 300 B＋値のリスト約 2 KiB
 # （id の int は vocab 側の既存オブジェクトを共有）なので、総量は最悪で約 50 MB に収まる。
@@ -226,6 +233,12 @@ class Qwen2Tokenizer:
                 raise ValueError(_INVALID)
             if i in seen_ids or i in added_map:
                 raise ValueError(_INVALID)
+            if len(content) > MAX_ADDED_CONTENT_CHARS:
+                raise ValueError(_INVALID)
+            try:
+                content.encode("utf-8")  # 孤立サロゲートは decode の出力を壊すため拒否
+            except UnicodeEncodeError:
+                raise ValueError(_INVALID) from None
             if content in seen_contents:  # content の重複は id の取り違えを招くため拒否
                 raise ValueError(_INVALID)
             seen_contents.add(content)
@@ -373,17 +386,22 @@ class Qwen2Tokenizer:
 
     def decode(self, ids: list[int]) -> str:
         """token id 列を文字列へ。added_tokens はその content をそのまま出す。"""
+        if len(ids) > MAX_DECODE_IDS:
+            raise ValueError("too many token ids")
         out = bytearray()
         for i in ids:
             if not _is_int(i):
                 raise ValueError("token id must be an int")
             if i in self._added:
-                out.extend(self._added[i].encode("utf-8"))
-                continue
-            token = self._id_to_token.get(i)
-            if token is None:
-                raise ValueError("unknown token id")
-            out.extend(self._u2b[c] for c in token)
+                chunk = self._added[i].encode("utf-8")
+            else:
+                token = self._id_to_token.get(i)
+                if token is None:
+                    raise ValueError("unknown token id")
+                chunk = bytes(self._u2b[c] for c in token)
+            if len(out) + len(chunk) > MAX_DECODE_BYTES:  # 追加前に累積長で判定
+                raise ValueError("decoded output is too large")
+            out.extend(chunk)
         return out.decode("utf-8", errors="replace")
 
     def build_chat_ids(
