@@ -157,8 +157,11 @@ def train_loop(
         done = step
         if step % 10 == 0 or step == iters:
             log(f"step {step}/{iters} loss {loss_value:.6f} elapsed {budget.elapsed():.1f}s")
+    # 最終ステップの後にも確認する（最後のステップ中の超過を記録する。iters_done は全件のまま）
+    if not reached and budget.wall_exceeded(max_wall_seconds):
+        reached = True
     if reached:
-        log(f"budget reached: stopped after {done}/{iters} steps")
+        log(f"budget reached: {done}/{iters} steps done")
     model.eval()
     return TrainResult(loss_value, done, reached)
 

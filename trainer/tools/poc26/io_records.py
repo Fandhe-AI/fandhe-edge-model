@@ -59,12 +59,16 @@ class Record:
 
 
 def check_id(value: object) -> str:
+    # 上限は UTF-8 のバイト数で判定する（`build_prediction_record` と同じ。多バイト文字は文字数より
+    # バイト数が大きい）。文字数は 1 文字 1 バイト以上なので、符号化前の安価な足切りに使う。
     if not isinstance(value, str) or not value or len(value) > MAX_PREDICTION_ID_BYTES:
         raise invalid("record id must be a non-empty string within the length limit")
     try:
-        value.encode("utf-8")
+        size = len(value.encode("utf-8"))
     except UnicodeEncodeError:
         raise invalid("record id is not valid unicode") from None
+    if size > MAX_PREDICTION_ID_BYTES:
+        raise invalid("record id must be a non-empty string within the length limit")
     return value
 
 

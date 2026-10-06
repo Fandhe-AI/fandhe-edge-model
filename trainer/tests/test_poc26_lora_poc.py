@@ -1232,3 +1232,41 @@ def test_compare_probes_requires_matching_vocab_sizes() -> None:
         assert exc.value.exit_code == 64
         with pytest.raises(WorkerError):
             probe_mod.compare_probes(other, ok, 1e-3)
+
+
+def test_record_id_limit_is_counted_in_utf8_bytes(tmp_path: Path) -> None:
+    """P1: id の上限は UTF-8 バイト数（文字数は上限内でもバイト数で超えれば拒否）。"""
+    limit = io_records.MAX_PREDICTION_ID_BYTES
+    ok = "あ" * (limit // 3)  # 3 バイト x 341 = 1023 バイト
+    too_long = "あ" * (limit // 3 + 1)  # 文字数 342 <= 1024 だが 1026 バイト
+    assert len(too_long) <= limit
+    assert io_records.check_id(ok) == ok
+    with pytest.raises(WorkerError) as exc:
+        io_records.check_id(too_long)
+    assert exc.value.exit_code == 64
+    path = _jsonl(tmp_path / "v.jsonl", [{"id": too_long, "input": "x"}])
+    with pytest.raises(WorkerError):
+        io_records.load_records(path, labels=None, what="input data")
+
+
+def test_budget_reached_is_recorded_when_exceeded_during_the_last_step(
+    ctx_model, env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2: 最終ステップ中に予算を超えたら budget_reached を記録する（iters_done は全件）。"""
+    ctx, _ = ctx_model
+    now = {"t": 0.0}
+    monkeypatch.setattr(common.time, "monotonic", lambda: now["t"])
+    budget = common.Budget()
+    real_collate = train_mod.collate
+
+    def advancing(*a, **k):
+        now["t"] += 60.0  # 1 ステップごとに 60 秒（3 ステップ目の途中で 150 秒を超える）
+        return real_collate(*a, **k)
+
+    monkeypatch.setattr(train_mod, "collate", advancing)
+    result = train_mod.train_loop(
+        _fresh_lora_model(env), _seqs(ctx), pad_id=ctx.pad_id, iters=3, lr=1e-3,
+        batch_size=2, seed=0, budget=budget, max_wall_seconds=150,
+    )  # fmt: skip
+    assert result.iters_done == 3
+    assert result.budget_reached is True
