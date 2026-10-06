@@ -41,6 +41,7 @@
 #     実行中に commit・worktree_clean・CLI の sha256 が変わった場合も 10（#360）、
 #     スクリプト自身の実行不能（python3 が無い・作業ディレクトリを作れない・CLI のビルド失敗等。
 #     起動前に分かる入力の誤りの FANDHE_EDGE_BIN の不在・実行不可は 64）は 70（REQ-21）
+#   - 最終 JSON を stdout へ書けなかった場合（閉じたパイプ等）は本来の値によらず 70（REQ-21。record は先に書き終えている）
 #   - stdout は最後に JSON を 1 つだけ出す（REQ-33）: {"code":..,"message":..,"record":"record.json"}。
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない
 #   - 子プロセスには上限時間と出力サイズ上限を設ける（REQ-39。値は real_machine_check_record.py の定数）。
@@ -55,11 +56,16 @@
 #     exit 70 する（record なし。stdout は固定 JSON `interrupted (forced exit)`。REQ-39）
 # -f: パス名展開を止める（`--items '*'` がカレントのファイル名に化けて検証を通るのを防ぐ）
 set -euf
+# SIGPIPE で shell が死ぬと 141 になる。無視して printf の失敗を戻り値で受け、70 へ写す（REQ-21）
+trap '' PIPE
 
 # 固定メッセージの JSON を 1 行出して終了する。$1=終了コード $2=code 名 $3=固定メッセージ
 fail() {
-    printf '{"code":"%s","message":"%s"}\n' "$2" "$3"
-    exit "$1"
+    # stdout へ書けなかった（閉じたパイプ・満杯）場合は本来の値によらず 70（REQ-21）
+    if printf '{"code":"%s","message":"%s"}\n' "$2" "$3" 2>/dev/null; then
+        exit "$1"
+    fi
+    exit 70
 }
 
 # ---- 引数の検証（ここで失敗したら make・cargo・CLI を起動しない） ----

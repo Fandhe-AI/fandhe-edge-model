@@ -254,6 +254,8 @@ _force_pending = False
 # 最終の JSON を stdout へ書き始めた印。以後の 2 回目のシグナルは強制終了の行を書かず無視し、
 # stdout の JSON を 1 つに保つ（REQ-21・REQ-33）
 _final_emitted = False
+# 最終 JSON を stdout へ書けなかった印。終了処理のフラッシュ失敗（exit 120）を防ぐ（REQ-21）
+_stdout_failed = False
 # 子の回収が上限時間内に終わらず、子（またはその孫）が残っている可能性がある印（REQ-39）。
 # record の `child_may_remain` へ出す。`run()` の冒頭で下ろす
 _child_may_remain = False
@@ -2523,14 +2525,48 @@ def render_markdown(rec: dict[str, Any]) -> str:
 
 
 def emit(code: str, message: str, exit_code: int, with_record: bool) -> int:
-    """stdout へ固定メッセージの JSON を 1 行だけ出す（パスは書かない）。"""
-    global _final_emitted
+    """stdout へ固定メッセージの JSON を 1 行だけ出す（パスは書かない）。
+
+    書き込み・フラッシュに失敗した（読み手が閉じたパイプ・書き込めないファイル・
+    閉じた stdout）場合は、本来の `exit_code` によらず 70（`runtime_error`）を返す。
+    約束した JSON を渡せていないのに 0 を返さず、終了コードを 7 種の内に保つため
+    （REQ-21・REQ-33）。`record.json`・`record.md` は `emit` の前に書き終えているので
+    失敗の影響を受けない。例外は投げない（`main` の例外経路からの再呼び出しでも
+    落ちないため）。
+    """
+    global _final_emitted, _stdout_failed
     _final_emitted = True  # 以後の 2 回目のシグナルが 2 行目を書かないようにする
     obj: dict[str, Any] = {"code": code, "message": message}
     if with_record:
         obj["record"] = "record.json"
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        # OSError は BrokenPipeError・ENOSPC を含む。ValueError は閉じたファイル、
+        # AttributeError は `sys.stdout is None`（fd 1 が閉じた起動）。
+        _stdout_failed = True
+        return EXIT_RUNTIME_ERROR
     return exit_code
+
+
+def _silence_stdout_for_exit() -> None:
+    """書き込み失敗後に fd 1 を /dev/null へ向ける（プロセスの終了直前にだけ呼ぶ）。
+
+    失敗した行がバッファに残っていると、終了処理のフラッシュが再び失敗して exit 120 と
+    `Exception ignored` の出力になる。残りを /dev/null へ流して 70 を保つ。`emit`・`run` の中では
+    呼ばない（同じプロセスで `run` を呼ぶ pytest の fd 1 を壊さないため）。REQ-21。
+    """
+    if not _stdout_failed:
+        return
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(fd, 1)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _on_signal(signum: int, frame: Any) -> None:
@@ -2931,6 +2967,7 @@ def _entry(argv: list[str] | None = None) -> int:
         return main(argv)
     finally:
         _ignore_interrupt_signals()
+        _silence_stdout_for_exit()
 
 
 if __name__ == "__main__":

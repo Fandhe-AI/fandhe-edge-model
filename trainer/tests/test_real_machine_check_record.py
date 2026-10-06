@@ -4054,6 +4054,118 @@ def test_collect_inputs_stops_at_the_overall_deadline(tmp_path: Path) -> None:
         mod.collect_inputs(Path(__file__).resolve().parents[2])
 
 
+# ---- #376: stdout への書き込み失敗は 70（REQ-21・REQ-33） ----
+
+
+class _FailingStdout:
+    """`write` が指定の例外を投げる stdout の代役。"""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def write(self, _s: str) -> int:
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [BrokenPipeError(errno.EPIPE, "pipe"), OSError(errno.ENOSPC, "full"), ValueError("closed")],
+)
+def test_emit_maps_stdout_write_failure_to_70(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """REQ-21: 書き込み失敗は本来が 0 でも 70 を返し、例外を漏らさない。"""
+    monkeypatch.setattr(mod, "_stdout_failed", False)
+    monkeypatch.setattr(sys, "stdout", _FailingStdout(exc))
+    assert mod.emit("ok", "x", 0, True) == 70
+    assert mod._stdout_failed is True
+
+
+def test_emit_maps_missing_stdout_to_70(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-21: `sys.stdout is None`（fd 1 が閉じた起動）でも 70。"""
+    monkeypatch.setattr(mod, "_stdout_failed", False)
+    monkeypatch.setattr(sys, "stdout", None)
+    assert mod.emit("ok", "x", 0, True) == 70
+    assert mod._stdout_failed is True
+
+
+def test_emit_keeps_exit_code_when_stdout_works(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-21: 成功時は従来どおり `exit_code` を返し、失敗の印は立たない。"""
+    monkeypatch.setattr(mod, "_stdout_failed", False)
+    assert mod.emit("judged_fail", "x", 10, False) == 10
+    assert capsys.readouterr().out == '{"code":"judged_fail","message":"x"}\n'
+    assert mod._stdout_failed is False
+
+
+def test_main_with_missing_stdout_returns_70(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-21: 引数エラー（本来 64）の経路でも、stdout が無ければ 70 で落ちない。"""
+    monkeypatch.setattr(mod, "_stdout_failed", False)
+    monkeypatch.setattr(sys, "stdout", None)
+    with pytest.raises(SystemExit) as ei:  # argparse の誤りは `sys.exit(emit(...))` で抜ける
+        mod.main(["run", "--bogus-option"])
+    assert ei.value.code == 70
+
+
+def _run_with_broken_stdout(closed_pipe: bool) -> tuple[int, str]:
+    """不正引数で起動し、stdout を閉じたパイプか閉じた fd にして (終了コード, stderr) を返す。"""
+    args = [sys.executable, "-I", str(SCRIPT), "run", "--bogus-option"]
+    if closed_pipe:
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            proc = subprocess.run(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+                args, stdout=w, stderr=subprocess.PIPE, timeout=30, check=False
+            )
+        finally:
+            os.close(w)
+    else:
+        proc = subprocess.run(  # noqa: S603  固定の補助コマンドに値は引数で渡す
+            ["sh", "-c", 'exec "$@" >&-', "sh", *args],  # noqa: S607
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    return proc.returncode, proc.stderr.decode(errors="replace")
+
+
+@pytest.mark.parametrize("closed_pipe", [True, False])
+def test_process_exits_70_when_stdout_is_unwritable(closed_pipe: bool) -> None:
+    """REQ-21: 閉じたパイプ・閉じた fd のどちらでも exit 70。traceback も終了時の警告も出ない。"""
+    code, err = _run_with_broken_stdout(closed_pipe)
+    assert code == 70, err
+    assert "Traceback" not in err
+    assert "Exception ignored" not in err
+
+
+def test_force_exit_is_70_even_when_stdout_pipe_is_closed() -> None:
+    """REQ-21・REQ-39: 強制終了の固定 JSON を書けなくても exit 70。"""
+    code = (
+        "import sys, importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['m'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "m._force_exit(None)\n"
+    )
+    r, w = os.pipe()
+    os.close(r)
+    try:
+        proc = subprocess.run(  # noqa: S603  テスト用に自リポジトリのスクリプトを引数リストで起動する
+            [sys.executable, "-I", "-c", code],
+            stdout=w,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        os.close(w)
+    assert proc.returncode == 70, proc.stderr
+
+
 def test_offline_env_disables_rustup_auto_install_even_if_parent_enables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
