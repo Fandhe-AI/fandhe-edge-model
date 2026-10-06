@@ -13,6 +13,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -304,7 +305,7 @@ def test_real_qwen_size_fits_limits() -> None:
     cfg = qwen2_model.Qwen2Config(896, 24, 14, 2, 4864, 151936, 1e-6, 1e6, True, 32768)
     assert 490_000_000 < cfg.estimated_params() < 500_000_000
     assert cfg.estimated_params() * 2 <= qwen2_model.MAX_MODEL_BYTES
-    assert 988_000_000 + 2 * cfg.estimated_params() * 4 <= qwen2_model.MAX_MODEL_MEMORY_BYTES
+    assert 988_000_000 + cfg.estimated_params() * 8 <= qwen2_model.MAX_MODEL_MEMORY_BYTES
 
 
 def test_invalid_config_bytes_are_value_error(model_dir: Path) -> None:
@@ -582,3 +583,40 @@ def test_wide_integer_values_not_truncated(model_dir: Path) -> None:
     with pytest.raises(ValueError, match="out of range"):
         m(mx.array([[1, 2, -(1 << 40)]], dtype=mx.int64))
     m(mx.array([[1, 2, 3]], dtype=mx.uint64), mx.array([[1, 1, 0]], dtype=mx.uint64))
+
+
+def test_forward_total_memory_estimate_limit(
+    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: モデルが小さくても B・L の同時保持の合計が上限を超えたら確保前に拒否する。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    ids = mx.zeros((3, 17), dtype=mx.int32)
+    need = m.forward_bytes(3, 17, False)
+    c = m.config
+    # 見積もりに logits・注意スコア・活性・パラメータの各項が入っていること（具体値）
+    params = sum(v.nbytes for _, v in tree_flatten(m.parameters()))
+    assert need == (
+        params
+        + 3 * 17 * c.vocab_size * 4
+        + 3 * c.num_attention_heads * 17 * 17 * 4
+        + 3 * 17 * (8 * c.hidden_size + 3 * c.intermediate_size) * 4
+    )
+    assert m.forward_bytes(3, 17, True) == need + 3 * 17 * 17
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", need - 1)
+    with pytest.raises(ValueError, match="forward would exceed the memory limit"):
+        m(ids)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", need)
+    assert m(ids).shape == (3, 17, synthetic.TINY_VOCAB)
+
+
+def test_load_memory_estimate_uses_float32_construction(
+    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 読み込み見積もり = ファイル + 構築時 f32（params×4）+ 変換後。"""
+    cfg = qwen2_model.Qwen2Config.from_file(model_dir / "config.json")
+    need = (model_dir / "model.safetensors").stat().st_size + cfg.estimated_params() * (4 + 2)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", need - 1)
+    with pytest.raises(ValueError, match="larger than the supported size"):
+        load_qwen2(model_dir, dtype=mx.bfloat16)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", need)
+    assert load_qwen2(model_dir, dtype=mx.bfloat16).config == cfg

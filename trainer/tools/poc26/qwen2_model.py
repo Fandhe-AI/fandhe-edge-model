@@ -257,6 +257,26 @@ class Qwen2Model(nn.Module):
         if not c.tie_word_embeddings:
             self.lm_head = nn.Linear(c.hidden_size, c.vocab_size, bias=False)
 
+    def forward_bytes(self, b: int, n: int, with_mask: bool) -> int:
+        """forward が同時に保持するバイト数の保守的な見積もり（確保前の拒否用。REQ-39）。
+
+        合計 = 現在のパラメータ（実 dtype。LoRA を含む）
+             + logits（B×L×vocab。float32 化を想定し 4 バイト以上）
+             + マスク（B×L×L × 1。指定時のみ）
+             + 注意スコア（B×heads×L×L。SDPA の実装によらず 1 層分を 4 バイト以上で）
+             + 活性（B×L×(8×hidden + 3×intermediate)。残差・norm・q/k/v・MLP 中間を数個分）。
+        実測より大きめに出す設計で、厳密な上限ではなく暴走防止の目安。
+        """
+        c = self.config
+        size = self.model.embed_tokens.weight.dtype.size
+        wide = max(4, size)
+        params = sum(v.nbytes for _, v in tree_flatten(self.parameters()))
+        logits = b * n * c.vocab_size * wide
+        mask = b * n * n if with_mask else 0
+        scores = b * c.num_attention_heads * n * n * wide
+        acts = b * n * (8 * c.hidden_size + 3 * c.intermediate_size) * size
+        return params + logits + mask + scores + acts
+
     def _check_input(self, ids: mx.array, attention_mask: mx.array | None) -> None:
         """確保の前に B・L を検証する（REQ-39）。超過は ValueError。"""
         if ids.ndim != 2 or 0 in ids.shape:
@@ -276,6 +296,8 @@ class Qwen2Model(nn.Module):
                 raise ValueError("attention_mask shape must equal ids shape")
             if b * n * n > MAX_FORWARD_ELEMENTS:
                 raise ValueError("attention mask would be too large for one forward")
+        if self.forward_bytes(b, n, attention_mask is not None) > MAX_MODEL_MEMORY_BYTES:
+            raise ValueError("forward would exceed the memory limit")
         # 値の検証（embed 参照・マスク構築の前）。
         if mx.min(ids).item() < 0 or mx.max(ids).item() >= c.vocab_size:
             raise ValueError("token id out of range [0, vocab_size)")
@@ -415,10 +437,11 @@ def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
     params = config.estimated_params()
     fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
     with os.fdopen(fd, "rb") as f:
-        # 同時保持: 読み込んだ重み（ファイルサイズ）+ dtype 変換後 + 構築したモデル
+        # 同時保持: 読み込んだ重み（ファイルサイズ）+ 構築時の既定パラメータ（mlx の
+        # nn.Linear / Embedding は float32 で確保するため params × 4）+ dtype 変換後の重み。
         if (
             params * 2 > MAX_MODEL_BYTES
-            or st.st_size + 2 * params * dtype.size > MAX_MODEL_MEMORY_BYTES
+            or st.st_size + params * 4 + params * dtype.size > MAX_MODEL_MEMORY_BYTES
         ):
             raise ValueError("config implies a model larger than the supported size limit")
         # 検証済みの fd をそのまま読む（パスで開き直さない）ため、検査後にパスが差し替わっても
