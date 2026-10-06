@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -354,6 +355,13 @@ def test_long_pieces_are_not_cached(tok: Qwen2Tokenizer) -> None:
     assert list(tok._cache) == ["a" * 64]
 
 
+def test_encode_rejects_unencodable_text(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: 孤立サロゲートなど UTF-8 にできない文字列は、入力値を含めず ValueError にする。"""
+    with pytest.raises(ValueError, match="not valid unicode") as info:
+        tok.encode("ok\ud800")
+    assert "ud800" not in str(info.value).lower()
+
+
 def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:
     """REQ-39: 入力長上限を超えると拒否し、BPE キャッシュは上限件数で打ち止めになる。"""
     with pytest.raises(ValueError, match="too long"):
@@ -365,17 +373,31 @@ def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> 
 
 _QWEN_DIR = os.environ.get("FANDHE_EDGE_QWEN_DIR")
 _GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "poc26" / "tokenizer_golden.json"
+_GOLDEN_SOURCE_KEYS = {"tokenizer_json_sha256", "tokenizers_version", "generated_on"}
 
 
 @pytest.mark.skipif(
     not (_QWEN_DIR and (Path(_QWEN_DIR) / "tokenizer.json").is_file() and _GOLDEN.is_file()),
-    reason="REQ-41: real-machine check; needs FANDHE_EDGE_QWEN_DIR/tokenizer.json and "
-    "fixtures/poc26/tokenizer_golden.json",
+    reason="REQ-41: real-machine check (human); needs FANDHE_EDGE_QWEN_DIR/tokenizer.json and "
+    "fixtures/poc26/tokenizer_golden.json; see docs/design/poc26-tokenizer-golden-procedure.md",
 )
 def test_golden_ids_match_real_tokenizer() -> None:
-    """REQ-41: 実 tokenizer.json の encode が参照（HF tokenizers）の id と全件一致する。"""
-    real = Qwen2Tokenizer.from_file(Path(_QWEN_DIR or "") / "tokenizer.json")
-    cases = json.loads(_GOLDEN.read_text(encoding="utf-8"))["cases"]
-    assert cases
+    """REQ-41: 実 tokenizer.json の encode が参照（HF tokenizers）の id と全件一致する。
+
+    fixture の形式と生成手順は `docs/design/poc26-tokenizer-golden-procedure.md`。fixture の
+    `source.tokenizer_json_sha256` が手元の実ファイルの sha256 と一致することも確認する。
+    case の本文に added_tokens の文字列を含めない（本実装は本文中で照合せず HF と差が出るため）。
+    """
+    path = Path(_QWEN_DIR or "") / "tokenizer.json"
+    doc = json.loads(_GOLDEN.read_text(encoding="utf-8"))
+    assert set(doc["source"]) == _GOLDEN_SOURCE_KEYS
+    assert all(isinstance(v, str) and v for v in doc["source"].values())
+    assert doc["source"]["tokenizer_json_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    real = Qwen2Tokenizer.from_file(path)
+    added = list(real._added.values())
+    cases = doc["cases"]
+    assert 20 <= len(cases) <= 30
     for case in cases:
+        assert set(case) == {"text", "ids"}
+        assert not any(a in case["text"] for a in added), "case contains an added token string"
         assert real.encode(case["text"]) == case["ids"], case["text"]

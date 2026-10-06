@@ -271,6 +271,10 @@ class Qwen2Tokenizer:
         """NFC 正規化後に Split(Isolated) した piece 列（byte 写像前）。"""
         if len(text) > MAX_ENCODE_CHARS:
             raise ValueError("input text is too long")
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:  # 孤立サロゲート等。入力値はメッセージに載せない
+            raise ValueError("input text is not valid unicode") from None
         text = unicodedata.normalize("NFC", text)
         pieces: list[str] = []
         pos = 0
