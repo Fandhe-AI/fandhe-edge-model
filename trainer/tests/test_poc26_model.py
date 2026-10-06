@@ -274,7 +274,7 @@ def test_shape_mismatch_rejected(model_dir: Path) -> None:
     w = mx.load(str(path))
     w["model.norm.weight"] = mx.zeros((3,))
     _resave(path, w)
-    with pytest.raises(ValueError, match="norm"):
+    with pytest.raises(ValueError, match="shape mismatch"):
         _load(model_dir, dtype=mx.float32)
 
 
@@ -811,3 +811,41 @@ def test_unsupported_compute_settings_rejected(changes: dict) -> None:
         qwen2_model.Qwen2Config.from_bytes(json.dumps(missing).encode())
     ok = REAL_QWEN_LIKE | {"attention_bias": True, "head_dim": 64, "mlp_bias": False}
     qwen2_model.Qwen2Config.from_bytes(json.dumps(ok).encode())
+
+
+def test_expected_shapes_match_built_model(model_dir: Path) -> None:
+    """REQ-41: expected_shapes は構築したモデルの全パラメータ形状と一致する（tie・非 tie）。"""
+    for tie in (True, False):
+        d = synthetic.write_model_dir(_mk(model_dir / f"t{tie}"), tie=tie)
+        cfg = qwen2_model.Qwen2Config.from_file(d / "config.json")
+        built = {
+            k: tuple(v.shape) for k, v in tree_flatten(qwen2_model.Qwen2Model(cfg).parameters())
+        }
+        assert cfg.expected_shapes() == built
+        assert sum(int(np.prod(sh)) for sh in built.values()) == cfg.estimated_params()
+
+
+def test_wrong_shape_and_dtype_rejected_before_astype(
+    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: キーが正しくても形状違い・非浮動小数のテンソルは、変換（astype）の前に拒否する。"""
+    path = model_dir / "model.safetensors"
+    good = mx.load(str(path))
+    mx.eval(good)
+
+    real_eval = mx.eval
+
+    def eval_guard(*args: object) -> None:
+        # 変換は 1 テンソルずつ mx.eval する。読み込み直後の eval は dict 全体を渡す。
+        if len(args) == 1 and isinstance(args[0], mx.array):
+            raise AssertionError("astype/eval of a tensor must not run before validation")
+        real_eval(*args)
+
+    bad_shape = dict(good) | {"model.layers.0.mlp.up_proj.weight": mx.zeros((32, 17))}
+    bad_dtype = dict(good) | {"model.norm.weight": mx.zeros((16,), dtype=mx.int32)}
+    for weights, match in ((bad_shape, "shape mismatch"), (bad_dtype, "dtype must be")):
+        _resave(path, weights)
+        monkeypatch.setattr(qwen2_model.mx, "eval", eval_guard)
+        with pytest.raises(ValueError, match=match):
+            _load(model_dir, dtype=mx.bfloat16)
+        monkeypatch.undo()

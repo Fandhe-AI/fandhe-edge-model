@@ -54,6 +54,7 @@ _CONFIG_LIMITS = {
 }
 
 MAX_LORA_RANK = 256
+_FLOAT_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
 MAX_LORA_SCALE = 1000.0  # mlx-lm 既定 20 の十分上
 
 
@@ -111,6 +112,38 @@ class Qwen2Config:
         layer = 2 * h * h + 2 * h * kv + h + 2 * kv + 3 * h * self.intermediate_size + 2 * h
         total = self.vocab_size * h + self.num_hidden_layers * layer + h
         return total + (0 if self.tie_word_embeddings else self.vocab_size * h)
+
+    def expected_shapes(self) -> dict[str, tuple[int, ...]]:
+        """モデルを構築せずに、期待する重みキー名と形状を返す（HF の命名・Linear は (out, in)）。"""
+        h, d = self.hidden_size, self.head_dim
+        q, kv, inter = (
+            self.num_attention_heads * d,
+            self.num_key_value_heads * d,
+            self.intermediate_size,
+        )
+        shapes: dict[str, tuple[int, ...]] = {
+            "model.embed_tokens.weight": (self.vocab_size, h),
+            "model.norm.weight": (h,),
+        }
+        if not self.tie_word_embeddings:
+            shapes["lm_head.weight"] = (self.vocab_size, h)
+        for i in range(self.num_hidden_layers):
+            p = f"model.layers.{i}."
+            shapes |= {
+                p + "self_attn.q_proj.weight": (q, h),
+                p + "self_attn.k_proj.weight": (kv, h),
+                p + "self_attn.v_proj.weight": (kv, h),
+                p + "self_attn.o_proj.weight": (h, q),
+                p + "self_attn.q_proj.bias": (q,),
+                p + "self_attn.k_proj.bias": (kv,),
+                p + "self_attn.v_proj.bias": (kv,),
+                p + "mlp.gate_proj.weight": (inter, h),
+                p + "mlp.up_proj.weight": (inter, h),
+                p + "mlp.down_proj.weight": (h, inter),
+                p + "input_layernorm.weight": (h,),
+                p + "post_attention_layernorm.weight": (h,),
+            }
+        return shapes
 
     def expected_keys(self) -> set[str]:
         """モデルを構築せずに、期待する重みキー名の集合を返す（HF の命名）。"""
@@ -533,6 +566,14 @@ def load_qwen2(
             f"weight keys mismatch (missing={len(missing)}, unexpected={len(extra)}); "
             f"{_SUPPORTED}{hint}"
         )
+    # 変換（astype）の前に、全テンソルの形状と dtype（浮動小数のみ）を config 由来の期待値と
+    # 照合する。形状が一致すれば、実テンソルの合計要素数は estimated_params と同値になる。
+    for k, shape in config.expected_shapes().items():
+        w = weights[k]
+        if tuple(w.shape) != shape:
+            raise ValueError("weight shape mismatch")
+        if w.dtype not in _FLOAT_DTYPES:
+            raise ValueError("weight dtype must be float16, bfloat16 or float32")
     # (b) 1 キーずつ変換して元を即解放する（一時保持は最大テンソル 1 個分）
     for k in list(weights):
         converted = weights[k].astype(dtype)
