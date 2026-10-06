@@ -373,7 +373,22 @@ impl Env {
 
     /// スクリプトを起動する Command。`envs` の値が空文字ならスクリプトからは未設定と同じに見える。
     fn command(&self, args: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Command {
+        self.command_inner(args, envs, cwd, false)
+    }
+
+    /// `closed_fd` が真なら、補助の `sh -c 'exec ... >&-'` 経由で fd 1 を閉じた状態で起動する
+    /// （`sys.stdout is None` の経路。macOS・Linux 共通で動く）。
+    fn command_inner(
+        &self,
+        args: &[String],
+        envs: &[(&str, &str)],
+        cwd: Option<&Path>,
+        closed_fd: bool,
+    ) -> Command {
         let mut cmd = Command::new("sh");
+        if closed_fd {
+            cmd.args(["-c", "exec sh \"$@\" >&-", "sh"]);
+        }
         cmd.process_group(0)
             .arg(repo_root().join("scripts").join("real-machine-check.sh"))
             .args(args)
@@ -429,6 +444,53 @@ impl Env {
             stdout: collect(&rx_out),
             stderr: collect(&rx_err),
         }
+    }
+
+    /// stdout を `kind` の状態にして起動し、終了コードと stderr だけを返す（REQ-21）。
+    fn run_with_stdout(
+        &self,
+        args: &[String],
+        envs: &[(&str, &str)],
+        kind: StdoutKind,
+    ) -> (Option<i32>, String) {
+        let mut cmd = self.command_inner(args, envs, None, matches!(kind, StdoutKind::ClosedFd));
+        match kind {
+            StdoutKind::ClosedPipe => {
+                let (reader, writer) = std::io::pipe().expect("pipe");
+                drop(reader);
+                cmd.stdout(Stdio::from(writer));
+            }
+            StdoutKind::ClosedFd => {}
+            // macOS に /dev/full は無いため Linux に局所化する。閉じたパイプ・閉じた fd の検証は全 OS で行う
+            #[cfg(target_os = "linux")]
+            StdoutKind::Full => {
+                let f = fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .expect("open /dev/full");
+                cmd.stdout(Stdio::from(f));
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn sh");
+        let rx_err = drain(child.stderr.take().expect("stderr"));
+        let pgid = child.id();
+        let start = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if start.elapsed() > TIMEOUT {
+                Command::new("kill")
+                    .args(["-KILL", &format!("-{pgid}")])
+                    .status()
+                    .ok();
+                child.kill().ok();
+                child.wait().ok();
+                panic!("script timed out: stderr={}", collect(&rx_err));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        (status.code(), collect(&rx_err))
     }
 
     fn text(&self, name: &str) -> String {
@@ -517,6 +579,79 @@ fn fixture_ids(name: &str) -> Vec<String> {
 
 const INVALID: &str = "{\"code\":\"invalid_input\",\"message\":\"";
 const ITEMS_MSG: &str = "--items must be a comma-separated subset of A,B,C,D,E,F";
+/// stdout の状態（REQ-21: 最終 JSON を書けない場合の終了コードの確認用）。
+#[derive(Clone, Copy)]
+enum StdoutKind {
+    /// 読み手が先に閉じたパイプ（EPIPE）
+    ClosedPipe,
+    /// fd 1 が閉じている（Python 側は `sys.stdout is None`）
+    ClosedFd,
+    /// 書き込みが ENOSPC になる `/dev/full`
+    #[cfg(target_os = "linux")]
+    Full,
+}
+
+fn assert_stdout_failure_exit_70(e: &Env, kind: StdoutKind) {
+    let mut args = e.work_arg();
+    args.extend(["--items".into(), "D".into()]);
+    let (code, err) = e.run_with_stdout(&args, &[], kind);
+    assert_eq!(code, Some(70), "stderr={err}");
+    assert!(!err.contains("Traceback"), "stderr={err}");
+    assert!(!err.contains("Exception ignored"), "stderr={err}");
+    assert!(e.work.join("record.json").is_file());
+    assert!(e.work.join("record.md").is_file());
+    // stdout の失敗が項目の判定を書き換えない
+    assert_eq!(e.q("items.D.status"), "\"ok\"");
+}
+
+/// REQ-21: 読み手が閉じたパイプでも exit 70 で、record は書き終えている。
+#[test]
+fn req21_stdout_closed_pipe_exits_70_after_writing_record() {
+    assert_stdout_failure_exit_70(&Env::new(), StdoutKind::ClosedPipe);
+}
+
+/// REQ-21: stdout が閉じていても exit 70 で、record は書き終えている。
+#[test]
+fn req21_stdout_closed_fd_exits_70_after_writing_record() {
+    assert_stdout_failure_exit_70(&Env::new(), StdoutKind::ClosedFd);
+}
+
+/// REQ-21: 書き込めない stdout（`/dev/full`）でも exit 70。
+#[cfg(target_os = "linux")]
+#[test]
+fn req21_stdout_full_exits_70_after_writing_record() {
+    assert_stdout_failure_exit_70(&Env::new(), StdoutKind::Full);
+}
+
+/// REQ-21: 早期終了（shell の `fail()`）・引数エラー・判定失敗でも、stdout が書けなければ 141・1 でなく 70。
+#[test]
+fn req21_stdout_failure_in_early_exits_maps_to_70() {
+    type Case = (Vec<String>, Vec<(&'static str, &'static str)>);
+    let cases: Vec<Case> = vec![
+        (vec!["--help".into()], vec![]),
+        (vec!["--items".into(), "Z".into()], vec![]),
+        (vec!["--items".into(), "A".into()], vec![]),
+        (
+            vec!["--items".into(), "D".into()],
+            vec![("FAKE_FAIL_STAGE", "train")],
+        ),
+    ];
+    for kind in [StdoutKind::ClosedPipe, StdoutKind::ClosedFd] {
+        for (extra, envs) in &cases {
+            let e = Env::new();
+            let mut args = e.work_arg();
+            args.extend(extra.clone());
+            let (code, err) = e.run_with_stdout(&args, envs, kind);
+            assert_eq!(code, Some(70), "args={args:?} stderr={err}");
+            assert!(!err.contains("Traceback"), "args={args:?} stderr={err}");
+            assert!(
+                !err.contains("Exception ignored"),
+                "args={args:?} stderr={err}"
+            );
+        }
+    }
+}
+
 const REPEAT_MSG: &str = "--repeat must be an integer from 1 to 1000";
 const JUDGED_FAIL: &str = "{\"code\":\"judged_fail\",\"message\":\"one or more requested items failed or were not run\",\"record\":\"record.json\"}\n";
 

@@ -109,6 +109,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - 確認できた発生条件（証拠種別: 模擬。計画時の小さな試行で、`make ci` 全体での再現ではない）: pytest 9.1.1 は `FORCE_COLOR=1` または `PY_COLORS=1` で、出力先がファイルでも要約行に色が付く（`NO_COLOR=1` は `FORCE_COLOR=1` に勝つ）。cargo 1.98.1 の libtest の `test result:` 行は、`CARGO_TERM_COLOR=always`・`.cargo/config.toml` の `[term] color`・`FORCE_COLOR`・`CLICOLOR_FORCE` のいずれでも、出力先がファイルなら色が付かなかった（色が付いたのは `-- --color always` を渡したときだけで、`make ci` も F もこれを渡さない）
   - 見分け方: A が `exit_code: 0`・`reason: no_test_results` で、`<work-dir>/A/make-ci.log` に ESC（0x1b）が含まれる
   - 対処: `FORCE_COLOR`・`PY_COLORS` を外して、新しい `--work-dir` で実行し直す。判定は `failed` のままで、色つきの結果を合格と読み替えない。スクリプト・Makefile 側で色を無効にする改善は本手順の範囲外（別課題の候補）
+- **stdout を `head` などのパイプへつなぎ、先に閉じられると 70 になる**（証拠種別: テストハーネス。実機の確認ではなく、macOS 実機での実測は人が行う）: 最終 JSON を stdout へ書けなかった場合の終了コードは、本来の値によらず 70（REQ-21）。判定の中身は `<work-dir>/record.json` で確認する（記録を作った後の最終出力に失敗した場合に限り、`record.json`・`record.md` は stdout の書き込みより前に書き終えている。引数エラーは記録を作る前に終了するため、両ファイルは存在しない）。traceback や `Exception ignored` は stderr に出ない
 - **スクリプト自身が SIGKILL・SIGQUIT で落ちると、子が残る**（証拠種別: 推定。コードの読解で、この場合を固定するテストはない）: ハンドラを置くのは SIGINT・SIGTERM・SIGHUP だけで、SIGQUIT（端末の Ctrl-\）は既定の動作（終了）、SIGKILL は捕捉できない。子は別セッション・別プロセスグループで動くため、スクリプトの終了も端末からのシグナルも子へ届かない。`record.json`・`record.md` は書かれず、stdout の最終 JSON も出ない。実行中の子は自然に終わるまで走り続け、上限時間・出力上限の監視も効かなくなる。`ps` で残りを確認して手で止め（`pkill -f` のような広い一致で無関係なプロセスを止めない）、同じ `--work-dir` は空でないため使えない（exit 64）ので新しいディレクトリで実行し直す。§5「中断の方式」の既知の限界を参照
 
 ## 4. 各項目 A〜F が何を確かめるか
@@ -296,14 +297,14 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 ## 5. 判定の読み方
 
-スクリプトの終了コードは 4 種です。
+スクリプトの終了コードは 4 種です（120・141・1 など 7 種の外の値は出さず、70 へ写します。下の 70 の行の「stdout へ書けなかった場合」）。
 
 | 終了コード | 意味 | 行動 |
 | -------- | ---- | ---- |
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、実行全体の上限時間（`--overall-timeout-sec`）を超えた（stdout の `message` は `overall time limit exceeded`。実行中の項目は `failed`・残りは `not_run`〔`reason` は `overall_timeout`〕。子のグループは止めて回収する。終了時の再採取と記録の書き出しは上限の外で行うため、全体の所要は上限 ＋ 再採取〔最大 60 秒〕＋ 回収待ち〔10 秒〕で頭打ちになる。#364）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、子が残りうる状態で（全体の上限時間を超えた、または全項目が `ok`）終わった（stdout の `message` は `a child process may remain`。上限超過の 10 には隠さない）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
+| 70 | 実行環境エラー・中断 | 最終 JSON を stdout へ書けなかった（読み手が先に閉じたパイプ・書き込めないファイル・閉じた stdout）場合は、本来が 0・10・64 でも 70（記録作成後の最終出力に失敗した 0・10 では `record.json`・`record.md` を書き終えているので work-dir で確認する。引数エラー〔64〕は記録作成前に終了するため両ファイルは存在しない）。python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、子が残りうる状態で（全体の上限時間を超えた、または全項目が `ok`）終わった（stdout の `message` は `a child process may remain`。上限超過の 10 には隠さない）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
