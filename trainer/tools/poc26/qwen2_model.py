@@ -73,10 +73,6 @@ def _read_limited(path: Path, limit: int, what: str) -> bytes:
     return data
 
 
-def _identity(st: os.stat_result) -> tuple[int, int, int, int]:
-    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
-
-
 @dataclass(frozen=True)
 class Qwen2Config:
     """Qwen2 の形状設定（`config.json` から）。"""
@@ -274,7 +270,8 @@ class LoRALinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.linear(x)
-        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        # LoRA 側は float32 で計算し（bf16 の丸めを避ける）、最後に入力の dtype へ戻す。
+        z = (self.dropout(x.astype(mx.float32)) @ self.lora_a) @ self.lora_b
         return y + (self.scale * z).astype(x.dtype)
 
 
@@ -328,20 +325,16 @@ def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
         raise ValueError("config implies a model larger than the supported size limit")
     model = Qwen2Model(config)
     path = model_dir / "model.safetensors"
-    fd, before = _open_regular(path, MAX_MODEL_BYTES, "model.safetensors")
-    try:
-        # mx.load は fd を受け取れないため、fd を開いたまま読み、前後の同一性を比較して
-        # 検査後の差し替え（TOCTOU）を検出する。
+    fd, _ = _open_regular(path, MAX_MODEL_BYTES, "model.safetensors")
+    # 検証済みの fd をそのまま読む（パスで開き直さない）ため、検査後にパスが差し替わっても
+    # 検証した実体が読まれる（TOCTOU 対策）。mx.load は遅延読み込みのことがあるので、
+    # ファイルを閉じる前に mx.eval で全配列を実体化する（閉じた後は fd に依存しない）。
+    with os.fdopen(fd, "rb") as f:
         try:
-            weights = mx.load(str(path))
+            weights = mx.load(f, format="safetensors")
             mx.eval(weights)
         except (RuntimeError, ValueError, OSError):
             raise ValueError("invalid model.safetensors") from None
-        after, current = os.fstat(fd), os.stat(path, follow_symlinks=False)
-    finally:
-        os.close(fd)
-    if not (_identity(before) == _identity(after) == _identity(current)):
-        raise ValueError("model.safetensors changed while loading")
     if not isinstance(weights, dict):
         raise ValueError("invalid model.safetensors")
     expected = {k for k, _ in tree_flatten(model.parameters())}

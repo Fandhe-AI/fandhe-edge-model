@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -330,21 +331,40 @@ def test_symlink_and_non_regular_rejected(model_dir: Path, tmp_path: Path) -> No
         load_qwen2(model_dir, dtype=mx.float32)
 
 
-def test_model_swapped_during_load_rejected(
-    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+def test_model_swapped_after_check_reads_verified_content(
+    model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-39: 読み込み中にファイルが差し替わったら（stat 不一致）拒否する。"""
-    real_load = mx.load
+    """REQ-39: 検証後にパスが別ファイルへ差し替わっても、検証済み fd の中身が読まれる。"""
+    expected = np.array(load_qwen2(model_dir, dtype=mx.float32)(IDS))
+    other = synthetic.write_model_dir(_mk(tmp_path / "other"), seed=1)
+    real_open = qwen2_model._open_regular
 
-    def swapping_load(path: str):
-        out = real_load(path)
-        mx.eval(out)
-        Path(path).write_bytes(Path(path).read_bytes() + b" ")  # size / mtime を変える
-        return out
+    def swapping_open(path: Path, limit: int, what: str):
+        result = real_open(path, limit, what)
+        if what == "model.safetensors":
+            os.replace(other / "model.safetensors", path)  # 新しい inode に差し替える
+        return result
 
-    monkeypatch.setattr(qwen2_model.mx, "load", swapping_load)
-    with pytest.raises(ValueError, match="changed while loading"):
-        load_qwen2(model_dir, dtype=mx.float32)
+    monkeypatch.setattr(qwen2_model, "_open_regular", swapping_open)
+    got = np.array(load_qwen2(model_dir, dtype=mx.float32)(IDS))
+    assert np.abs(got - expected).max() < 1e-6
+
+
+def test_lora_bf16_model_forward_and_grad(model_dir: Path) -> None:
+    """REQ-41: bf16 モデルに LoRA を適用しても forward・勾配が通り、出力は bf16。"""
+    import mlx.nn as nn
+
+    m = load_qwen2(model_dir, dtype=mx.bfloat16)
+    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0)
+    out = m(IDS)
+    assert out.dtype == mx.bfloat16
+    loss, grads = nn.value_and_grad(m, lambda mm: mm(IDS).astype(mx.float32).sum())(m)
+    assert bool(mx.isfinite(loss))
+    from mlx.utils import tree_flatten
+
+    flat = tree_flatten(grads)
+    assert len(flat) == 2 * 7 * 2
+    assert all(g.dtype == mx.float32 for _, g in flat)
 
 
 def test_tie_with_lm_head_conflict_message(model_dir: Path) -> None:
