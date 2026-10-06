@@ -5,7 +5,8 @@ REQ-41・TASK-41.1-5・#390。PoC-26（Playwright MCP のツール選択）の�
 相互変換するために使う。通信・`transformers`・`tokenizers` に依存しない（REQ-38）。
 Phase 3 の Rust 実装の参照実装・ゴールデンベクタの生成元も兼ねる。
 
-処理: NFC 正規化 -> 前処理の正規表現で Isolated 分割 -> 各 piece を UTF-8 バイト列の
+処理: NFC 正規化（normalizer が NFC のときだけ。null・キー無しなら行わない）
+-> 前処理の正規表現で Isolated 分割 -> 各 piece を UTF-8 バイト列の
 GPT-2 風文字表（`bytes_to_unicode`）へ写す -> merges の順位で BPE（`ignore_merges=false`）。
 
 HF `tokenizers` との既知の差:
@@ -129,15 +130,17 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _check_pipeline(doc: dict) -> None:
+def _check_pipeline(doc: dict) -> bool:
     """normalizer / pre_tokenizer / decoder / post_processor が対応範囲かを検証する。
 
-    実装は NFC・固定の Split＋ByteLevel・ByteLevel decode だけを再現するため、
+    実装は NFC（または normalizer なし）・固定の Split＋ByteLevel・ByteLevel decode だけを
+    再現するため、
     それ以外の設定は黙って誤変換せず拒否する（fail-closed）。
     """
     norm = doc.get("normalizer")
-    if not isinstance(norm, dict) or norm.get("type") != "NFC":
+    if norm is not None and not (isinstance(norm, dict) and norm.get("type") == "NFC"):
         raise ValueError(_INVALID)
+    nfc = norm is not None
     pre = doc.get("pre_tokenizer")
     parts = pre.get("pretokenizers") if isinstance(pre, dict) else None
     if not (isinstance(pre, dict) and pre.get("type") == "Sequence" and isinstance(parts, list)):
@@ -168,6 +171,7 @@ def _check_pipeline(doc: dict) -> None:
     post = doc.get("post_processor")
     if post is not None and not (isinstance(post, dict) and post.get("type") == "ByteLevel"):
         raise ValueError(_INVALID)
+    return nfc  # 戻り値: NFC 正規化を行うか
 
 
 class Qwen2Tokenizer:
@@ -176,7 +180,7 @@ class Qwen2Tokenizer:
     def __init__(self, doc: dict) -> None:
         if not isinstance(doc, dict):
             raise ValueError(_INVALID)
-        _check_pipeline(doc)
+        self._nfc = _check_pipeline(doc)
         model = doc.get("model")
         if not isinstance(model, dict):
             raise ValueError(_INVALID)
@@ -284,14 +288,15 @@ class Qwen2Tokenizer:
         return cls(doc)
 
     def pre_tokenize(self, text: str) -> list[str]:
-        """NFC 正規化後に Split(Isolated) した piece 列（byte 写像前）。"""
+        """NFC 正規化（normalizer が NFC のときのみ）後に Split(Isolated) した piece 列。"""
         if len(text) > MAX_ENCODE_CHARS:
             raise ValueError("input text is too long")
         try:
             text.encode("utf-8")
         except UnicodeEncodeError:  # 孤立サロゲート等。入力値はメッセージに載せない
             raise ValueError("input text is not valid unicode") from None
-        text = unicodedata.normalize("NFC", text)
+        if self._nfc:
+            text = unicodedata.normalize("NFC", text)
         pieces: list[str] = []
         pos = 0
         for m in _pre_tokenize_pattern().finditer(text):

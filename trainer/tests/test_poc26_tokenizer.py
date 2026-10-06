@@ -96,6 +96,20 @@ def test_nfc_and_unknown_bytes(tok: Qwen2Tokenizer) -> None:
     assert tok.decode([0xC3, 0xA9]) == "é"
 
 
+@pytest.mark.parametrize("remove_key", [False, True])
+def test_null_normalizer_skips_nfc(tmp_path: Path, remove_key: bool) -> None:
+    """REQ-41: normalizer が null（キー無しも可）なら NFC 合成をしない（NFD 入力はそのまま）。"""
+    doc = _doc(tmp_path)
+    if remove_key:
+        del doc["normalizer"]
+    else:
+        doc["normalizer"] = None
+    tok = Qwen2Tokenizer(doc)
+    # e + U+0301 は UTF-8 で 65 cc 81。NFC なら c3 a9（[195, 169]）になる
+    assert tok.encode("e\u0301") == [101, 204, 129]
+    assert tok.decode(tok.encode("e\u0301")) == "e\u0301"
+
+
 def test_roundtrip(tok: Qwen2Tokenizer) -> None:
     """REQ-41: encode -> decode が NFC 済みの入力を復元する。"""
     text = "hello 世界 \n 😀 ok  \t1+1=2"
