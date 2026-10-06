@@ -69,6 +69,7 @@ doc = {
         {"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in PROBES
     ],
 }
+out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 ```
 
