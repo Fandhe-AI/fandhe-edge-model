@@ -434,8 +434,14 @@ def test_encode_rejects_unencodable_text(tok: Qwen2Tokenizer) -> None:
 
 def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:
     """REQ-39: 入力長上限を超えると拒否し、BPE キャッシュは上限件数で打ち止めになる。"""
+    limit = 262144
+    assert len(tok.encode("a" * limit)) == limit  # ちょうど上限は通る
     with pytest.raises(ValueError, match="too long"):
-        tok.encode("a" * ((1 << 20) + 1))
+        tok.encode("a" * (limit + 1))
+    # 多バイト文字: 文字数は上限の 1/3 でもバイト数で超える（"あ" は UTF-8 で 3 バイト）
+    assert len(tok.encode("\u3042" * (limit // 3))) == limit // 3 * 3  # 262143 バイトは通る
+    with pytest.raises(ValueError, match="too long"):
+        tok.encode("\u3042" * (limit // 3 + 1))
     monkeypatch.setattr(qwen2_tokenizer, "MAX_BPE_CACHE_ENTRIES", 1)
     tok.encode("a b c")
     assert len(tok._cache) == 1

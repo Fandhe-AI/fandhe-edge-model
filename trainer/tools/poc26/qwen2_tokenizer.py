@@ -42,8 +42,10 @@ from functools import lru_cache
 from pathlib import Path
 
 MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
-# encode の入力上限。PoC の入力は 1 件数文で、1 MiB 文字あれば十分余裕がある。
-MAX_ENCODE_CHARS = 1 << 20
+# encode の入力上限（UTF-8 バイト数）。PoC の入力は 1 件数文（高々数 KB）なので 256 KiB で
+# 十分に余裕がある。BPE の作業領域（parts・prev/nxt・ver・heap）は入力バイト数に比例し、
+# 1 バイトあたり数百 B と見て最大でも数十 MB に収まる。
+MAX_ENCODE_BYTES = 262144
 # decode の上限。件数は encode 上限（1 MiB 文字）と同程度、展開後バイト数は 4 MiB（1 件あたり
 # 最大 4 バイト程度の token を想定した余裕のある値）。超えたら ValueError。
 MAX_DECODE_IDS = 1 << 20
@@ -307,12 +309,14 @@ class Qwen2Tokenizer:
 
     def pre_tokenize(self, text: str) -> list[str]:
         """NFC 正規化（normalizer が NFC のときのみ）後に Split(Isolated) した piece 列。"""
-        if len(text) > MAX_ENCODE_CHARS:
+        if len(text) > MAX_ENCODE_BYTES:  # 1 文字 1 バイト以上なので、符号化前の安価な足切り
             raise ValueError("input text is too long")
         try:
-            text.encode("utf-8")
+            size = len(text.encode("utf-8"))
         except UnicodeEncodeError:  # 孤立サロゲート等。入力値はメッセージに載せない
             raise ValueError("input text is not valid unicode") from None
+        if size > MAX_ENCODE_BYTES:
+            raise ValueError("input text is too long")
         if self._nfc:
             text = unicodedata.normalize("NFC", text)
         pieces: list[str] = []
