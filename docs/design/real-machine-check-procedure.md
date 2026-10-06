@@ -17,6 +17,7 @@ PC を変えても同じ手順で main の動作確認（項目 A〜F）を再�
    - `make setup`: Rust ツールチェーン（`rust-toolchain.toml` で管理）。
    - `make py-sync`: `trainer/.venv`（Python 3、uv）・MLX（CPU）。
    - **`cargo fetch --locked`**: 依存を前もってダウンロードする（通信を伴うため承認を得てから実行する。`make setup` は cargo の依存を取得しない）。未実行の場合、実行時に `cargo build --locked` が失敗する（オフラインモード。REQ-38）
+   - **ツールチェーンの導入**: `rust-toolchain.toml` の指すツールチェーンが未導入だと、実行は `cargo` の失敗（`toolchain ... is not installed`）で止まる（スクリプトは取得を止めて通信しないため。#375）。先に `make setup` か `rustup toolchain install` を、通信を伴うので承認を得てから実行する
 4. 前提を満たしたら `make real-machine-check` を実行できる。
 
 ## 3. 実行方法
@@ -84,11 +85,11 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 | 対象 | 上限時間 | stdout | stderr | 用途 |
 | ---- | ------- | ------ | ------ | ---- |
 | CLI 1 工程（register / inspect / train / select / evaluate / package / infer） | 600 秒 | 1 MiB | 8 MiB | B・C・E |
-| `make ci` | 3600 秒 | 64 MiB | 64 MiB | A（通信するため `--locked` なし） |
-| `make check-runtime-linkage` | 1800 秒 | 64 MiB | 64 MiB | D（オフラインモード） |
+| `make ci` | 3600 秒 | 64 MiB | 64 MiB | A（通信するため `--locked` なし。`RUSTUP_AUTO_INSTALL=0` のみ渡す。#375） |
+| `make check-runtime-linkage` | 1800 秒 | 64 MiB | 64 MiB | D（オフラインモード。`CARGO_NET_OFFLINE=true`・`RUSTUP_AUTO_INSTALL=0`） |
 | `cargo test --locked` / 1 回（F） | 300 秒 | 64 MiB | 64 MiB | F（N 回の各回） |
-| `cargo build --locked`（FANDHE_EDGE_BIN 未設定時） | 1800 秒 | 64 MiB | 64 MiB | ビルド（オフラインモード。REQ-38） |
-| `cargo test --locked ... --no-run`（F の事前ビルド） | 1800 秒 | 64 MiB | 64 MiB | F（オフラインモード。REQ-38） |
+| `cargo build --locked`（FANDHE_EDGE_BIN 未設定時） | 1800 秒 | 64 MiB | 64 MiB | ビルド（オフラインモード。`CARGO_NET_OFFLINE=true`・`RUSTUP_AUTO_INSTALL=0`。REQ-38） |
+| `cargo test --locked ... --no-run`（F の事前ビルド） | 1800 秒 | 64 MiB | 64 MiB | F（オフラインモード。`CARGO_NET_OFFLINE=true`・`RUSTUP_AUTO_INSTALL=0`。REQ-38） |
 | `otool -L`・`git` コマンド・環境採取 | 30 秒 | 64 KiB | 64 KiB | 環境情報 |
 | 実行全体（`--overall-timeout-sec`） | 既定 14400 秒 | — | — | 全項目の合計。超過は §5 |
 | 入力ファイル（定義・学習・評価） | — | 16 MiB | — | 読み込み前に確認 |
@@ -99,6 +100,11 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 **環境採取の子（`git`・`sysctl`・`sw_vers`・`otool`）**は、`PATH` を探さず固定の絶対パス（macOS は `/usr/bin/git`・`/usr/sbin/sysctl`・`/usr/bin/sw_vers`・`/usr/bin/otool`。Linux のテストハーネスは `/usr/bin/git` か `/bin/git` だけで、実機の証拠にならない）で起動し、最小の環境（`PATH` 固定・`LC_ALL=C`・親にあるときだけ `HOME`）だけを渡します。親の `GIT_DIR`・`GIT_WORK_TREE`・`DEVELOPER_DIR` 等は届かないため、`PATH` の先頭の同名の実行ファイルや環境変数で、別物・別リポジトリの値が `commit`・機種・OS・直接リンクの欄に入ることはありません（#364）。`HOME` を残すのは、利用者のグローバル設定（`safe.directory` 等）が効かないと所有者の違うチェックアウトで `commit` が取れなくなるためです。固定パスに無い場合は「使えない」として扱い、`PATH` へは戻りません（`git` が無ければ `commit`・`worktree_clean` が `null` → `stable` が `null` → exit 10。`sysctl`・`sw_vers` が無ければ該当欄が `null`。macOS で `otool` が無ければ D は `failed` / `otool_failed`）。`make`・`cargo`・`python3` は利用者のツールチェーンで場所が決まるため `PATH` のままです。
 
 スクリプトと `check-runtime-linkage.sh` が自分で起動する `cargo` は、すべて `--locked`（`Cargo.lock` を暗黙に更新しない）。A の `make ci` は make の中の cargo であり、スクリプトは `--locked` を付けない。
+
+**rustup のツールチェーン自動取得を止める（REQ-38・#375）**: スクリプトは A を含む全ての子に `RUSTUP_AUTO_INSTALL=0` を渡す（親に同名の変数があっても `0` で上書きする）。`CARGO_NET_OFFLINE` は cargo 自身の設定で rustup プロキシを止めないため、別に必要になる。A の `make ci` には `CARGO_NET_OFFLINE` を渡さず（`--with-ci` の同意が覆う通信は許す）、ツールチェーンの自動取得だけを止める。`rustup set auto-install disable` は `settings.toml` を書き換えるため使わない。ツールチェーンが無いときの失敗は既存の分類で現れる（CLI のビルド失敗は exit 70・`cannot build the CLI`、F は `build_failed`・`list_failed`）。`record.json` のスキーマは変えず、この抑止は `options.cargo_offline` とは別で、記録には出ない。
+
+- **確かめた内容**（証拠種別: 模擬。Linux x86_64・rustup 1.29.1 の実バイナリ。通信は loopback の閉じたポートだけ）: 空の `RUSTUP_HOME`・`RUSTUP_DIST_SERVER=http://127.0.0.1:1` で `rust-toolchain.toml`（stable）のあるディレクトリから `~/.cargo/bin/cargo --version` を実行すると、環境変数なしでは `syncing channel updates` の後にダウンロードを試みた（自動取得は起きる）。`RUSTUP_AUTO_INSTALL=0` では `toolchain ... is not installed` で即停止し、ダウンロードを試みない。出典: rustup 1.29.1 の文言（`you may opt out with RUSTUP_AUTO_INSTALL=0`）と rust-lang/rustup#4836。macOS 実機では未確認
+- **既知の限界**（いずれも証拠種別: 推定・未確認）: ① `RUSTUP_AUTO_INSTALL` を認識しない古い rustup では止められない（版の境界は公式文書を参照しておらず未確認）。② rustup を経由しない cargo（直接配置・`FANDHE_EDGE_CARGO_CMD` の代役）には効果がない。③ `RUSTUP_TOOLCHAIN` や `+toolchain` で別のツールチェーンを指す場合の挙動は未確認。④ コンポーネント（rustfmt・clippy）欠落時の自動導入が同じ変数で止まるかは未確認
 
 ### 3-5. 運用上の注意（#365）
 
@@ -508,7 +514,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - 比較は fail-closed: 片方だけ取れなければ「一致しない」（`false`）、両方取れていなければ `null`（比較できない）
 - `stable` は 1 つでも `false` なら `false`。`false` のときの最終結果は `judged_fail`（10）。判定の優先は、中断・内部エラー（70）、`stable` が `false`（10）、項目の失敗（10）、ok（0）の順
 - 中断の印が立っているときは終了時の採取をせず、`*_end`・`*_unchanged`・`stable` は `null`
-- `options.cargo_offline` は「すべての子プロセスが offline で起動したか」を表す。A の `make ci` は offline を強制しないため、A を含む実行では `false`（以前の記録は A 実行時も `true` で、実態を表していなかった）
+- `options.cargo_offline` は「すべての子プロセスが offline で起動したか」を表す。A の `make ci` は offline を強制しないため、A を含む実行では `false`（以前の記録は A 実行時も `true` で、実態を表していなかった）。rustup の自動取得の抑止（`RUSTUP_AUTO_INSTALL=0`）は A を含め常に効き、この欄とは別でスキーマも不変（#375）
 - 限界: `worktree_clean` が開始時も終了時も `false` のとき、差分の中身が変わっても検出できない（差分のハッシュは本文を扱う危険があるため取らない）
 
 ### `record.md`
