@@ -482,3 +482,13 @@ def test_golden_ids_match_real_tokenizer() -> None:
         assert set(case) == {"text", "ids"}
         assert not any(a in case["text"] for a in added), "case contains an added token string"
         assert real.encode(case["text"]) == case["ids"], case["text"]
+
+
+def test_from_file_rejects_symlink(tmp_path: Path) -> None:
+    """REQ-39: tokenizer.json の最後の要素の symlink は辿らず拒否する（invalid tokenizer.json）。"""
+    real = synthetic.write_tokenizer_json(tmp_path)
+    link = tmp_path / "link.json"
+    os.symlink(real, link)
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer.from_file(link)
+    assert Qwen2Tokenizer.from_file(real).encode("hello") == [260]

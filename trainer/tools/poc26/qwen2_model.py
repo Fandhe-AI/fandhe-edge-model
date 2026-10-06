@@ -11,18 +11,18 @@ logits `[B, L, vocab]` を返す forward と、mlx-lm と同形の LoRA を提�
 
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import math
 import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
+from tools.poc26.safe_io import LimitExceededError, loads_json, sha256_hex
+from tools.poc26.safe_io import open_regular as _open_regular
+from tools.poc26.safe_io import read_limited as _read_limited
 
 #: `config.json` の上限（64 KiB）と `model.safetensors` の上限（1 GiB。実物は約 988MB）。
 MAX_CONFIG_BYTES = 64 * 1024
@@ -56,34 +56,6 @@ _CONFIG_LIMITS = {
 MAX_LORA_RANK = 256
 _FLOAT_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
 MAX_LORA_SCALE = 1000.0  # mlx-lm 既定 20 の十分上
-
-
-def _open_regular(path: Path, limit: int, what: str) -> tuple[int, os.stat_result]:
-    """symlink を辿らず通常ファイルだけを開き、サイズ上限を確認して (fd, stat) を返す。"""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        raise ValueError(f"cannot open {what}") from None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError(f"{what} is not a regular file")
-        if st.st_size > limit:
-            raise ValueError(f"{what} too large: {st.st_size} bytes > {limit}")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd, st
-
-
-def _read_limited(path: Path, limit: int, what: str) -> bytes:
-    """通常ファイルを fd 経由で読む（open 後の fstat で上限確認。読み超過も拒否）。"""
-    fd, _ = _open_regular(path, limit, what)
-    with os.fdopen(fd, "rb") as f:
-        data = f.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{what} too large: > {limit} bytes")
-    return data
 
 
 @dataclass(frozen=True)
@@ -166,14 +138,7 @@ class Qwen2Config:
     @classmethod
     def from_bytes(cls, raw: bytes) -> Qwen2Config:
         """`config.json` のバイト列を検証して読む（検証済みバイト列の再利用口）。"""
-
-        def _no_const(_: str) -> None:
-            raise ValueError
-
-        try:
-            doc = json.loads(raw.decode("utf-8"), parse_constant=_no_const)
-        except (ValueError, RecursionError):  # JSONDecodeError・UnicodeDecodeError を含む
-            raise ValueError("invalid config.json") from None
+        doc = loads_json(raw, "config.json")
         if not isinstance(doc, dict):
             raise ValueError("invalid config.json")
         if doc.get("model_type") != "qwen2":
@@ -210,7 +175,7 @@ class Qwen2Config:
             if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
                 raise ValueError(f"invalid config field: {k}")
             if v > _CONFIG_LIMITS.get(k, MAX_POSITIONS_LIMIT):
-                raise ValueError(f"config field too large: {k}")
+                raise LimitExceededError(f"config field too large: {k}")
         if (
             doc["hidden_size"] % doc["num_attention_heads"]
             or doc["num_attention_heads"] % doc["num_key_value_heads"]
@@ -337,26 +302,26 @@ class Qwen2Model(nn.Module):
         return params + logits + mask + scores + acts
 
     def _check_input(self, ids: mx.array, attention_mask: mx.array | None) -> None:
-        """確保の前に B・L を検証する（REQ-39）。超過は ValueError。"""
+        """確保の前に B・L を検証する（REQ-39）。形の不正は ValueError、超過は LimitExceeded。"""
         if ids.ndim != 2 or 0 in ids.shape:
             raise ValueError("ids must be a non-empty [B, L] array")
         b, n = ids.shape
         c = self.config
         if n > c.max_position_embeddings:
-            raise ValueError(f"sequence too long: {n} > {c.max_position_embeddings}")
+            raise LimitExceededError(f"sequence too long: {n} > {c.max_position_embeddings}")
         if not mx.issubdtype(ids.dtype, mx.integer):
             raise ValueError("ids must have an integer dtype")
         if b * n > MAX_FORWARD_TOKENS:
-            raise ValueError(f"too many tokens: {b * n} > {MAX_FORWARD_TOKENS}")
+            raise LimitExceededError(f"too many tokens: {b * n} > {MAX_FORWARD_TOKENS}")
         if b * n * c.vocab_size > MAX_FORWARD_ELEMENTS:
-            raise ValueError("logits would be too large for one forward")
+            raise LimitExceededError("logits would be too large for one forward")
         if attention_mask is not None:
             if attention_mask.shape != ids.shape:
                 raise ValueError("attention_mask shape must equal ids shape")
             if b * n * n > MAX_FORWARD_ELEMENTS:
-                raise ValueError("attention mask would be too large for one forward")
+                raise LimitExceededError("attention mask would be too large for one forward")
         if self.forward_bytes(b, n, attention_mask is not None) > MAX_MODEL_MEMORY_BYTES:
-            raise ValueError("forward would exceed the memory limit")
+            raise LimitExceededError("forward would exceed the memory limit")
         # 値の検証（embed 参照・マスク構築の前）。
         if mx.min(ids).item() < 0 or mx.max(ids).item() >= c.vocab_size:
             raise ValueError("token id out of range [0, vocab_size)")
@@ -376,14 +341,22 @@ class Qwen2Model(nn.Module):
                 raise ValueError("attention_mask must be 1s followed by 0s (right pad only)")
 
     def __call__(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
-        """`ids` `[B, L]` から logits `[B, L, vocab]` を返す。
+        """`ids` `[B, L]` から logits `[B, L, vocab]` を返す（`hidden_states`＋`project`）。"""
+        return self.project(self.hidden_states(ids, attention_mask))
+
+    def hidden_states(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
+        """`ids` `[B, L]` から最終 norm 後の隠れ状態 `[B, L, hidden]` を返す。
+
+        採点・損失は必要な位置の隠れ状態だけを `project` へ渡し、全位置の `[B, L, vocab]` を
+        float32 に広げない（REQ-39 のメモリ上限。#390 PR-C）。入力検証（`_check_input`）は
+        forward と同じ。
 
         `attention_mask` は右 pad 用の `[B, L]`（真 = 実 token）。因果マスクと key 側の pad 除外を
         合成する。pad の query 行が全遮蔽で NaN にならないよう対角は常に許可する。
         **左 pad は非対応**（位置 id は 0 始まりで、pad 分だけ RoPE 位置がずれる）。
 
         入力は `max_position_embeddings`（config 必須）以下の長さ、B×L・B×L×vocab・B×L×L に
-        上限があり、超過は ValueError。
+        上限があり、超過は LimitExceededError。
 
         dropout の有効 / 無効（train / eval）は呼び出し側の責務で、本 forward は切り替えない
         （PR-C の学習ループが `model.train()` / `model.eval()` を呼ぶ）。
@@ -399,9 +372,26 @@ class Qwen2Model(nn.Module):
         h = inner.embed_tokens(ids)
         for layer in inner.layers:
             h = layer(h, mask)
-        h = inner.norm(h)
-        if self.config.tie_word_embeddings:
-            return inner.embed_tokens.as_linear(h)
+        return inner.norm(h)
+
+    def project(self, h: mx.array) -> mx.array:
+        """隠れ状態 `[..., hidden]` を logits `[..., vocab]` へ射影する（tie なら埋め込み共有）。
+
+        確保の前に形と logits の要素数（`MAX_FORWARD_ELEMENTS`）・同時保持量を検証する。
+        """
+        c = self.config
+        if h.ndim < 1 or h.shape[-1] != c.hidden_size or 0 in h.shape:
+            raise ValueError("hidden states must be a non-empty [..., hidden_size] array")
+        if not mx.issubdtype(h.dtype, mx.floating):
+            raise ValueError("hidden states must have a floating dtype")
+        rows = h.size // c.hidden_size
+        if rows * c.vocab_size > MAX_FORWARD_ELEMENTS:
+            raise LimitExceededError("logits would be too large for one projection")
+        params = sum(v.nbytes for _, v in tree_flatten(self.parameters()))
+        if params + rows * c.vocab_size * max(4, h.dtype.size) > MAX_MODEL_MEMORY_BYTES:
+            raise LimitExceededError("projection would exceed the memory limit")
+        if c.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(h)
         return self.lm_head(h)
 
 
@@ -469,7 +459,7 @@ def apply_lora(
     )
     current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
     if current + added > MAX_MODEL_MEMORY_BYTES:
-        raise ValueError("LoRA matrices would exceed the memory limit")
+        raise LimitExceededError("LoRA matrices would exceed the memory limit")
     model.freeze()
     n_each = sum(len(names) for _, names in _LORA_TARGETS)
     keys = iter(mx.random.split(mx.random.key(seed), num_layers * n_each))
@@ -522,7 +512,7 @@ def load_qwen2(
             raise ValueError("expected sha256 must be 64 lowercase hex characters")
     model_dir = Path(model_dir)
     config_bytes = _read_limited(model_dir / "config.json", MAX_CONFIG_BYTES, "config.json")
-    if hashlib.sha256(config_bytes).hexdigest() != expected_config_sha256:
+    if sha256_hex(config_bytes) != expected_config_sha256:
         raise ValueError("config.json sha256 mismatch")
     config = Qwen2Config.from_bytes(config_bytes)
     params = config.estimated_params()
@@ -534,14 +524,15 @@ def load_qwen2(
             params * 2 > MAX_MODEL_BYTES
             or load_peak_bytes(config, st.st_size, dtype) > MAX_MODEL_MEMORY_BYTES
         ):
-            raise ValueError("config implies a model larger than the supported size limit")
+            raise LimitExceededError("config implies a model larger than the supported size limit")
         # 検証済みの fd から全バイトを 1 度だけ読み、そのバイト列を照合・使用する
         # （パスで開き直さない。TOCTOU 対策）。mx.load は遅延読み込みのことがあるため、
         # BytesIO を閉じる前に mx.eval で実体化する。
         data = f.read(MAX_MODEL_BYTES + 1)
     if len(data) > MAX_MODEL_BYTES:
-        raise ValueError(f"model.safetensors too large: > {MAX_MODEL_BYTES} bytes")
-    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise LimitExceededError(f"model.safetensors too large: > {MAX_MODEL_BYTES} bytes")
+    source_bytes = len(data)
+    if sha256_hex(data) != expected_sha256:
         raise ValueError("model.safetensors sha256 mismatch")
     try:
         weights = mx.load(io.BytesIO(data), format="safetensors")
@@ -581,6 +572,8 @@ def load_qwen2(
         weights[k] = converted
         del converted
     model = Qwen2Model(config)  # (c)
+    # 照合した bytes の長さ（呼び出し側が記録に使う。fstat の値ではなく検証済みの実体の大きさ）
+    model.source_bytes = source_bytes
     model.load_weights(list(weights.items()), strict=True)
     del weights
     mx.eval(model.parameters())

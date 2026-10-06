@@ -31,15 +31,13 @@ HF `tokenizers` との既知の差:
 
 from __future__ import annotations
 
-import hashlib
 import heapq
-import json
-import os
 import re
-import stat
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
+
+from tools.poc26.safe_io import LimitExceededError, loads_json, read_limited, sha256_hex
 
 MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 # encode の入力上限（UTF-8 バイト数）。PoC の入力は 1 件数文（高々数 KB）なので 256 KiB で
@@ -291,39 +289,34 @@ class Qwen2Tokenizer:
 
     @classmethod
     def from_file(cls, path: str | Path) -> Qwen2Tokenizer:
-        """通常ファイルかつ上限以下であることを確認して `tokenizer.json` を読む（REQ-39）。"""
+        """通常ファイルかつ上限以下であることを確認して `tokenizer.json` を読む（REQ-39）。
+
+        `safe_io.read_limited` で読む: 最後の要素の symlink は辿らない（拒否する。パス途中の
+        ディレクトリの symlink は辿る。PoC・ローカルの信頼できるパス前提）。JSON は NaN・Infinity・
+        重複キーを拒否する。いずれも `invalid tokenizer.json`、上限超過は `LimitExceededError`。
+        """
         try:
-            with Path(path).open("rb") as f:
-                st = os.fstat(f.fileno())
-                if not stat.S_ISREG(st.st_mode):
-                    raise ValueError(_INVALID)
-                if st.st_size > MAX_TOKENIZER_JSON_BYTES:
-                    raise ValueError("tokenizer.json is too large")
-                data = f.read(MAX_TOKENIZER_JSON_BYTES + 1)
-            if len(data) > MAX_TOKENIZER_JSON_BYTES:
-                raise ValueError("tokenizer.json is too large")
-            doc = json.loads(data)
-        except ValueError as exc:  # JSONDecodeError・UnicodeDecodeError を含む
-            if str(exc) == "tokenizer.json is too large":
-                raise
-            raise ValueError(_INVALID) from None
-        except (OSError, RecursionError):
+            data = read_limited(path, MAX_TOKENIZER_JSON_BYTES, "tokenizer.json")
+            doc = loads_json(data, "tokenizer.json")
+        except LimitExceededError:
+            raise
+        except ValueError:  # 開けない・通常ファイルでない・不正な JSON はまとめて invalid にする
             raise ValueError(_INVALID) from None
         tok = cls(doc)
         # 解析したのと同じバイト列の sha256（golden 照合で実ファイルとの一致確認に使う）
-        tok.source_sha256 = hashlib.sha256(data).hexdigest()
+        tok.source_sha256 = sha256_hex(data)
         return tok
 
     def pre_tokenize(self, text: str) -> list[str]:
         """NFC 正規化（normalizer が NFC のときのみ）後に Split(Isolated) した piece 列。"""
         if len(text) > MAX_ENCODE_BYTES:  # 1 文字 1 バイト以上なので、符号化前の安価な足切り
-            raise ValueError("input text is too long")
+            raise LimitExceededError("input text is too long")
         try:
             size = len(text.encode("utf-8"))
         except UnicodeEncodeError:  # 孤立サロゲート等。入力値はメッセージに載せない
             raise ValueError("input text is not valid unicode") from None
         if size > MAX_ENCODE_BYTES:
-            raise ValueError("input text is too long")
+            raise LimitExceededError("input text is too long")
         if self._nfc:
             text = unicodedata.normalize("NFC", text)
         pieces: list[str] = []
@@ -398,7 +391,7 @@ class Qwen2Tokenizer:
     def decode(self, ids: list[int]) -> str:
         """token id 列を文字列へ。added_tokens はその content をそのまま出す。"""
         if len(ids) > MAX_DECODE_IDS:
-            raise ValueError("too many token ids")
+            raise LimitExceededError("too many token ids")
         out = bytearray()
         for i in ids:
             if not _is_int(i):
@@ -411,7 +404,7 @@ class Qwen2Tokenizer:
                     raise ValueError("unknown token id")
                 chunk = bytes(self._u2b[c] for c in token)
             if len(out) + len(chunk) > MAX_DECODE_BYTES:  # 追加前に累積長で判定
-                raise ValueError("decoded output is too large")
+                raise LimitExceededError("decoded output is too large")
             out.extend(chunk)
         return out.decode("utf-8", errors="replace")
 
