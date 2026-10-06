@@ -1,0 +1,484 @@
+"""PoC-26 Qwen2 トークナイザーの検査（REQ-41・TASK-41.1-5・#390。テストハーネス）。
+
+極小 `tokenizer.json`（`tools/poc26/synthetic.py`）で挙動を固定する。実物の `tokenizer.json` との
+全件一致は実機前提の golden 照合（末尾）で、fixture と環境変数がそろったときだけ走る。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.poc26 import qwen2_tokenizer, synthetic
+from tools.poc26.qwen2_tokenizer import MAX_TOKENIZER_JSON_BYTES, Qwen2Tokenizer
+
+START, END = synthetic.ID_IM_START, synthetic.ID_IM_END
+ASSISTANT_HEADER = [START, 97, 115, 115, 105, 115, 116, 97, 110, 116, 10]
+
+
+@pytest.fixture
+def tok(tmp_path: Path) -> Qwen2Tokenizer:
+    return Qwen2Tokenizer.from_file(synthetic.write_tokenizer_json(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("text", "pieces"),
+    [
+        ("I'm", ["I", "'m"]),
+        ("DON'T", ["DON", "'T"]),
+        ("a, b", ["a", ",", " b"]),
+        ("hi!!\n", ["hi", "!!\n"]),
+        ("x  y", ["x", " ", " y"]),
+        ("a\n\nb", ["a", "\n\n", "b"]),
+        ("a \nb", ["a", " \n", "b"]),
+        ("2024", ["2", "0", "2", "4"]),
+        ("年1月", ["年", "1", "月"]),
+        ("x$5", ["x", "$", "5"]),
+        ("ab-cd", ["ab", "-cd"]),
+        # U+001C は Unicode White_Space ではない（Python の \s とは異なる）
+        ("a\x1cb", ["a", "\x1cb"]),
+        ("x\u3000\u3000y", ["x", "\u3000", "\u3000y"]),
+        ("x\u00a0\u00a0y", ["x", "\u00a0", "\u00a0y"]),
+        ("x\x85\x85y", ["x", "\x85", "\x85y"]),
+        ("x  ", ["x", "  "]),
+        ("a\r\nb", ["a", "\r\n", "b"]),
+        ("'S", ["'S"]),
+        ("I'LL", ["I", "'LL"]),
+        ("x\u00b2", ["x", "\u00b2"]),
+    ],
+)
+def test_pre_tokenize_pieces(tok: Qwen2Tokenizer, text: str, pieces: list[str]) -> None:
+    """REQ-41: 前処理の分割が Qwen2 の正規表現と同じ piece 列になる。"""
+    assert tok.pre_tokenize(text) == pieces
+
+
+def test_merges_applied_in_rank_order(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: merges の順位どおりに併合される。"""
+    assert tok.encode("hello") == [260]
+    assert tok.encode("hell") == [259]
+    assert tok.encode("help") == [257, 108, 112]
+    assert tok.encode(" hello") == [32, 260]
+    assert tok.encode(" t") == [256]
+    assert tok.encode("hello hello") == [260, 32, 260]
+
+
+def test_merge_rank_beats_left_to_right(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: 右側の低順位ペア（ll=2）が左側の高順位ペア（el=5）より先に併合される。"""
+    assert tok.encode("ell") == [101, 258]
+
+
+def test_duplicate_merges_rejected(tmp_path: Path) -> None:
+    """REQ-41: merges の重複は HF との解釈差を避けるため ValueError で拒否する。"""
+    doc = _doc(tmp_path)
+    doc["model"]["merges"] = ["e l", "l l", "e l"]
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer(doc)
+
+
+def test_merges_as_list_pairs(tmp_path: Path) -> None:
+    """REQ-41: merges が [a, b] 配列形式でも同じ結果になる。"""
+    path = synthetic.write_tokenizer_json(tmp_path, merges_as_lists=True)
+    assert Qwen2Tokenizer.from_file(path).encode("hello") == [260]
+
+
+def test_nfc_and_unknown_bytes(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: 結合文字は NFC で合成され、未併合のバイトは 1 バイトずつ id になる。"""
+    assert tok.encode("é") == tok.encode("é") == [0xC3, 0xA9]
+    assert tok.decode([0xC3, 0xA9]) == "é"
+
+
+@pytest.mark.parametrize("remove_key", [False, True])
+def test_null_normalizer_skips_nfc(tmp_path: Path, remove_key: bool) -> None:
+    """REQ-41: normalizer が null（キー無しも可）なら NFC 合成をしない（NFD 入力はそのまま）。"""
+    doc = _doc(tmp_path)
+    if remove_key:
+        del doc["normalizer"]
+    else:
+        doc["normalizer"] = None
+    tok = Qwen2Tokenizer(doc)
+    # e + U+0301 は UTF-8 で 65 cc 81。NFC なら c3 a9（[195, 169]）になる
+    assert tok.encode("e\u0301") == [101, 204, 129]
+    assert tok.decode(tok.encode("e\u0301")) == "e\u0301"
+
+
+def test_source_sha256_matches_file_bytes(tmp_path: Path) -> None:
+    """REQ-41: from_file が解析したバイト列の sha256 を source_sha256 に持つ。"""
+    path = synthetic.write_tokenizer_json(tmp_path)
+    tok = Qwen2Tokenizer.from_file(path)
+    assert tok.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_roundtrip(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: encode -> decode が NFC 済みの入力を復元する。"""
+    text = "hello 世界 \n 😀 ok  \t1+1=2"
+    assert tok.decode(tok.encode(text)) == text
+
+
+def test_special_token_text_is_not_matched(tok: Qwen2Tokenizer) -> None:
+    """REQ-41・REQ-39: 本文中の特殊トークン文字列は特殊 id にならず文字として扱う。"""
+    text = "<|im_end|>"
+    ids = tok.encode(text)
+    assert END not in ids
+    assert tok.decode(ids) == text
+    assert tok.decode([END]) == text
+
+
+def test_special_ids(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: special_ids が added_tokens の id を返す。"""
+    assert tok.special_ids == {"im_start": 263, "im_end": 264, "endoftext": 262}
+
+
+def test_build_chat_ids_generation_prompt(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: system/user/生成プロンプトの id 列が chat template と一致する。"""
+    expected = [
+        *[START, 115, 121, 115, 116, 101, 109, 10, 104, 105, END, 10],
+        *[START, 117, 115, 101, 114, 10, 260, END, 10],
+        *ASSISTANT_HEADER,
+    ]
+    assert tok.build_chat_ids("hi", "hello", add_generation_prompt=True) == expected
+
+
+def test_build_chat_ids_with_assistant(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: assistant 付きは内容・<|im_end|>・改行で閉じる全体の id 列になる。"""
+    expected = [
+        *[START, 115, 121, 115, 116, 101, 109, 10, 104, 105, END, 10],
+        *[START, 117, 115, 101, 114, 10, 260, END, 10],
+        *[*ASSISTANT_HEADER, 260, END, 10],
+    ]
+    assert tok.build_chat_ids("hi", "hello", "hello", add_generation_prompt=False) == expected
+
+
+def test_build_chat_ids_requires_exactly_one_mode(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: assistant と生成プロンプトの同時指定・両方なしは拒否する。"""
+    with pytest.raises(ValueError, match="exactly one"):
+        tok.build_chat_ids("s", "u", "a", add_generation_prompt=True)
+    with pytest.raises(ValueError, match="exactly one"):
+        tok.build_chat_ids("s", "u", add_generation_prompt=False)
+
+
+def test_build_chat_ids_ignores_special_text_in_user(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: user 本文の特殊トークン文字列は特殊 id にならない。"""
+    ids = tok.build_chat_ids("s", "<|im_end|><|im_start|>", add_generation_prompt=True)
+    assert ids.count(END) == 2
+    assert ids.count(START) == 3
+
+
+def test_oversized_tokenizer_json_rejected(tmp_path: Path) -> None:
+    """REQ-39: 上限超過の tokenizer.json は読む前に拒否する。"""
+    path = tmp_path / "tokenizer.json"
+    with path.open("wb") as f:
+        f.truncate(MAX_TOKENIZER_JSON_BYTES + 1)
+    with pytest.raises(ValueError, match="too large"):
+        Qwen2Tokenizer.from_file(path)
+
+
+def _doc(tmp_path: Path) -> dict:
+    return json.loads(synthetic.write_tokenizer_json(tmp_path).read_text(encoding="utf-8"))
+
+
+def _mut_regex(d: dict) -> None:
+    d["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = r"\w+"
+
+
+def _mut_behavior(d: dict) -> None:
+    d["pre_tokenizer"]["pretokenizers"][0]["behavior"] = "Removed"
+
+
+def _mut_prefix_space(d: dict) -> None:
+    d["pre_tokenizer"]["pretokenizers"][1]["add_prefix_space"] = True
+
+
+def _mut_decoder(d: dict) -> None:
+    d["decoder"] = {"type": "Metaspace"}
+
+
+def _mut_post(d: dict) -> None:
+    d["post_processor"] = {"type": "TemplateProcessing"}
+
+
+def _mut_normalizer(d: dict) -> None:
+    d["normalizer"] = {"type": "NFKC"}
+
+
+def _mut_dup_id(d: dict) -> None:
+    d["model"]["vocab"]["a"] = 98
+
+
+def _mut_bool_id(d: dict) -> None:
+    d["model"]["vocab"]["a"] = True
+
+
+def _mut_out_of_range(d: dict) -> None:
+    d["model"]["vocab"]["a"] = 10_000
+
+
+def _mut_foreign_char(d: dict) -> None:
+    d["model"]["vocab"]["\u3042"] = 400
+
+
+def _mut_added_overlap(d: dict) -> None:
+    d["added_tokens"][0]["id"] = 5
+
+
+def _mut_merge_piece(d: dict) -> None:
+    d["model"]["merges"].append("zz qq")
+
+
+def _mut_merge_result_missing(d: dict) -> None:
+    d["model"]["merges"].append("a b")  # "ab" は vocab に無い
+
+
+def _mut_duplicate_content(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "<|im_end|>", "special": True})
+
+
+def _mut_vocab_token_too_long(d: dict) -> None:
+    d["model"]["vocab"]["a" * 1025] = 265
+
+
+def _mut_added_surrogate(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "x\ud800", "special": False})
+
+
+def _mut_added_too_long(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "x" * 257, "special": False})
+
+
+def _mut_special_false(d: dict) -> None:
+    d["added_tokens"][2]["special"] = False
+
+
+def _mut_special_missing(d: dict) -> None:
+    d["added_tokens"][1]["content"] = "<|other|>"
+
+
+def _mut_merges_type(d: dict) -> None:
+    d["model"]["merges"] = {"a": "b"}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _mut_regex,
+        _mut_behavior,
+        _mut_prefix_space,
+        _mut_decoder,
+        _mut_post,
+        _mut_normalizer,
+        _mut_dup_id,
+        _mut_bool_id,
+        _mut_out_of_range,
+        _mut_foreign_char,
+        _mut_added_overlap,
+        _mut_merge_piece,
+        _mut_merges_type,
+        _mut_merge_result_missing,
+        _mut_special_false,
+        _mut_vocab_token_too_long,
+        _mut_added_surrogate,
+        _mut_added_too_long,
+        _mut_duplicate_content,
+        _mut_special_missing,
+    ],
+)
+def test_unsupported_or_malformed_config_rejected(tmp_path: Path, mutate) -> None:
+    """REQ-41・REQ-39: 再現できない設定・壊れた構造は ValueError で拒否する。"""
+    doc = _doc(tmp_path)
+    mutate(doc)
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer(doc)
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("dropout", 0.1),
+        ("unk_token", "<unk>"),
+        ("continuing_subword_prefix", "##"),
+        ("end_of_word_suffix", "</w>"),
+        ("fuse_unk", True),
+        ("byte_fallback", True),
+        ("ignore_merges", True),
+        ("byte_fallback", 0),
+    ],
+)
+def test_bpe_model_settings_must_match_qwen(tmp_path: Path, key: str, bad: object) -> None:
+    """REQ-41: model 節の BPE 設定が実物 Qwen2.5 と異なれば拒否する。"""
+    doc = _doc(tmp_path)
+    doc["model"][key] = bad
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer(doc)
+
+
+def test_bpe_model_settings_may_be_absent(tmp_path: Path) -> None:
+    """REQ-41: 既定値と同じ意味の設定はキー欠落でも受理する（実物は ignore_merges が無い）。"""
+    doc = _doc(tmp_path)
+    for key in ("dropout", "unk_token", "fuse_unk", "ignore_merges"):
+        doc["model"].pop(key, None)
+    assert Qwen2Tokenizer(doc).encode("hello") == [260]
+
+
+def test_byte_level_post_processor_accepted(tmp_path: Path) -> None:
+    """REQ-41: 実物と同じ ByteLevel の post_processor（id を足さない）は受理する。"""
+    doc = _doc(tmp_path)
+    doc["post_processor"] = {
+        "type": "ByteLevel",
+        "add_prefix_space": False,
+        "trim_offsets": False,
+        "use_regex": False,
+    }
+    assert Qwen2Tokenizer(doc).encode("hello") == [260]
+
+
+def test_invalid_files_rejected(tmp_path: Path) -> None:
+    """REQ-39: ディレクトリ・非 JSON・非 UTF-8・深すぎる入れ子は ValueError に写す。"""
+    for name, data in [("bad.json", b"{"), ("utf.json", b"\xff\xfe"), ("deep.json", b"[" * 100000)]:
+        path = tmp_path / name
+        path.write_bytes(data)
+        with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+            Qwen2Tokenizer.from_file(path)
+    with pytest.raises(ValueError, match=r"invalid tokenizer\.json"):
+        Qwen2Tokenizer.from_file(tmp_path)
+
+
+def test_decode_rejects_non_int_ids(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: bool・文字列の id は ValueError。"""
+    for bad in (True, "1", 1.0):
+        with pytest.raises(ValueError, match="int"):
+            tok.decode([bad])  # type: ignore[list-item]
+
+
+def _naive_bpe(tok: Qwen2Tokenizer, piece: str) -> list[int]:
+    """参照実装（オラクル）: 最小順位のペアを左から非重複で併合する素朴な BPE。"""
+    parts = [tok._b2u[b] for b in piece.encode("utf-8")]
+    while len(parts) > 1:
+        best = min(
+            range(len(parts) - 1),
+            key=lambda i: tok._ranks.get((parts[i], parts[i + 1]), len(tok._ranks)),
+        )
+        pair = (parts[best], parts[best + 1])
+        if pair not in tok._ranks:
+            break
+        merged: list[str] = []
+        i = 0
+        while i < len(parts):
+            if i < len(parts) - 1 and (parts[i], parts[i + 1]) == pair:
+                merged.append(parts[i] + parts[i + 1])
+                i += 2
+            else:
+                merged.append(parts[i])
+                i += 1
+        parts = merged
+    return [tok._vocab[p] for p in parts]
+
+
+def _random_texts() -> list[str]:
+    rng = random.Random(20261006)  # noqa: S311  # テスト用の seed 固定乱数
+    texts = ["a" * k for k in range(1, 20)] + ["ll" * k for k in range(1, 12)]
+    texts += ["hello" * k for k in range(1, 8)] + ["ell" * k for k in range(1, 8)]
+    for _ in range(400):
+        length = rng.randint(1, 40)
+        texts.append("".join(rng.choice("helo t\u00e9") for _ in range(length)))
+    return texts
+
+
+@pytest.mark.parametrize("extra_merge", [False, True])
+def test_heap_bpe_matches_naive_oracle(tmp_path: Path, extra_merge: bool) -> None:
+    """REQ-41: 優先度付きキューの BPE が素朴な参照実装と乱択入力で id 列まで一致する。"""
+    doc = _doc(tmp_path)
+    if extra_merge:  # 同順位の重なり（ll ll）を増やす
+        doc["model"]["vocab"]["llll"] = 265
+        doc["model"]["merges"].append("ll ll")
+    tok = Qwen2Tokenizer(doc)
+    for text in _random_texts():
+        expected = [i for piece in tok.pre_tokenize(text) for i in _naive_bpe(tok, piece)]
+        assert tok.encode(text) == expected, text
+
+
+def test_long_piece_merges_finish_quickly(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: 1 piece 4 万文字超の連続併合が O(n log n) で数秒以内に終わる（緩い閾値）。"""
+    start = time.monotonic()
+    ids = tok.encode("hello" * 8000)
+    assert ids == [260] * 8000
+    assert time.monotonic() - start < 10
+
+
+def test_long_pieces_are_not_cached(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: 64 文字を超える piece は BPE キャッシュに格納しない（短い piece は格納する）。"""
+    tok.encode("a" * 65)
+    assert tok._cache == {}
+    tok.encode("a" * 64)
+    assert list(tok._cache) == ["a" * 64]
+
+
+def test_decode_resource_limits(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: decode は件数と展開後バイト数の上限を超えると ValueError にする。"""
+    with pytest.raises(ValueError, match="too many"):
+        tok.decode([97] * ((1 << 20) + 1))
+    assert tok.decode([97] * (1 << 20)) == "a" * (1 << 20)
+    # <|im_start|> は 12 バイトなので 350,000 件強で 4 MiB を超える
+    with pytest.raises(ValueError, match="too large"):
+        tok.decode([START] * 400_000)
+
+
+def test_encode_rejects_unencodable_text(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: 孤立サロゲートなど UTF-8 にできない文字列は、入力値を含めず ValueError にする。"""
+    with pytest.raises(ValueError, match="not valid unicode") as info:
+        tok.encode("ok\ud800")
+    assert "ud800" not in str(info.value).lower()
+
+
+def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:
+    """REQ-39: 入力長上限を超えると拒否し、BPE キャッシュは上限件数で打ち止めになる。"""
+    limit = 262144
+    assert len(tok.encode("a" * limit)) == limit  # ちょうど上限は通る
+    with pytest.raises(ValueError, match="too long"):
+        tok.encode("a" * (limit + 1))
+    # 多バイト文字: 文字数は上限の 1/3 でもバイト数で超える（"あ" は UTF-8 で 3 バイト）
+    assert len(tok.encode("\u3042" * (limit // 3))) == limit // 3 * 3  # 262143 バイトは通る
+    with pytest.raises(ValueError, match="too long"):
+        tok.encode("\u3042" * (limit // 3 + 1))
+    monkeypatch.setattr(qwen2_tokenizer, "MAX_BPE_CACHE_ENTRIES", 1)
+    tok.encode("a b c")
+    assert len(tok._cache) == 1
+
+
+_QWEN_DIR = os.environ.get("FANDHE_EDGE_QWEN_DIR")
+_GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "poc26" / "tokenizer_golden.json"
+_GOLDEN_SOURCE_KEYS = {"tokenizer_json_sha256", "tokenizers_version", "generated_on"}
+
+
+@pytest.mark.skipif(
+    not (_QWEN_DIR and (Path(_QWEN_DIR) / "tokenizer.json").is_file() and _GOLDEN.is_file()),
+    reason="REQ-41: real-machine check (human); needs FANDHE_EDGE_QWEN_DIR/tokenizer.json and "
+    "fixtures/poc26/tokenizer_golden.json; see docs/design/poc26-tokenizer-golden-procedure.md",
+)
+def test_golden_ids_match_real_tokenizer() -> None:
+    """REQ-41: 実 tokenizer.json の encode が参照（HF tokenizers）の id と全件一致する。
+
+    fixture の形式と生成手順は `docs/design/poc26-tokenizer-golden-procedure.md`。fixture の
+    `source.tokenizer_json_sha256` が手元の実ファイルの sha256 と一致することも確認する。
+    case の本文に added_tokens の文字列を含めない（本実装は本文中で照合せず HF と差が出るため）。
+    """
+    path = Path(_QWEN_DIR or "") / "tokenizer.json"
+    doc = json.loads(_GOLDEN.read_text(encoding="utf-8"))
+    assert set(doc["source"]) == _GOLDEN_SOURCE_KEYS
+    assert all(isinstance(v, str) and v for v in doc["source"].values())
+    real = Qwen2Tokenizer.from_file(path)
+    assert doc["source"]["tokenizer_json_sha256"] == real.source_sha256
+    added = list(real._added.values())
+    cases = doc["cases"]
+    assert 20 <= len(cases) <= 30
+    for case in cases:
+        assert set(case) == {"text", "ids"}
+        assert not any(a in case["text"] for a in added), "case contains an added token string"
+        assert real.encode(case["text"]) == case["ids"], case["text"]
