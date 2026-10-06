@@ -100,6 +100,17 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 スクリプトと `check-runtime-linkage.sh` が自分で起動する `cargo` は、すべて `--locked`（`Cargo.lock` を暗黙に更新しない）。A の `make ci` は make の中の cargo であり、スクリプトは `--locked` を付けない。
 
+### 3-5. 運用上の注意（#365）
+
+実行の前に知っておくと原因の切り分けが早くなる点です。証拠種別は各項に書きます。
+
+- **出力先を変えた環境でも D は追従する**（証拠種別: 推定。コードの読解で、出力先を変えた実行での確認はしていない）: CLI のビルド（`build_cli`）も `check-runtime-linkage.sh` も、CLI の場所を cargo の報告（`compiler-artifact` の `executable`）から取る。どちらもリポジトリのルートで同じ環境の cargo を起動するため、`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えても同じ実物を指す。`target/` を決め打ちする箇所はない。D が `linkage_target_mismatch` になるのは、`FANDHE_EDGE_BIN` で差し替えた CLI が cargo のビルドした CLI とバイト単位で違うときである（§3-3・§4-D）
+- **色を強制する環境では A が `no_test_results` になりうる**: A の合否は `make ci` の stdout を行頭一致で読んで決める（Rust の `test result:` 行・pytest の要約行）。ANSI エスケープ（色）は取り除かないため、どちらかの行に色が付くと読めず、exit 0 でも `no_test_results` で `failed` になる（`rust_tests.passed` が 0、または `pytest` が `null`）。
+  - 確認できた発生条件（証拠種別: 模擬。計画時の小さな試行で、`make ci` 全体での再現ではない）: pytest 9.1.1 は `FORCE_COLOR=1` または `PY_COLORS=1` で、出力先がファイルでも要約行に色が付く（`NO_COLOR=1` は `FORCE_COLOR=1` に勝つ）。cargo 1.98.1 の libtest の `test result:` 行は、`CARGO_TERM_COLOR=always`・`.cargo/config.toml` の `[term] color`・`FORCE_COLOR`・`CLICOLOR_FORCE` のいずれでも、出力先がファイルなら色が付かなかった（色が付いたのは `-- --color always` を渡したときだけで、`make ci` も F もこれを渡さない）
+  - 見分け方: A が `exit_code: 0`・`reason: no_test_results` で、`<work-dir>/A/make-ci.log` に ESC（0x1b）が含まれる
+  - 対処: `FORCE_COLOR`・`PY_COLORS` を外して、新しい `--work-dir` で実行し直す。判定は `failed` のままで、色つきの結果を合格と読み替えない。スクリプト・Makefile 側で色を無効にする改善は本手順の範囲外（別課題の候補）
+- **スクリプト自身が SIGKILL・SIGQUIT で落ちると、子が残る**（証拠種別: 推定。コードの読解で、この場合を固定するテストはない）: ハンドラを置くのは SIGINT・SIGTERM・SIGHUP だけで、SIGQUIT（端末の Ctrl-\）は既定の動作（終了）、SIGKILL は捕捉できない。子は別セッション・別プロセスグループで動くため、スクリプトの終了も端末からのシグナルも子へ届かない。`record.json`・`record.md` は書かれず、stdout の最終 JSON も出ない。実行中の子は自然に終わるまで走り続け、上限時間・出力上限の監視も効かなくなる。`ps` で残りを確認して手で止め（`pkill -f` のような広い一致で無関係なプロセスを止めない）、同じ `--work-dir` は空でないため使えない（exit 64）ので新しいディレクトリで実行し直す。§5「中断の方式」の既知の限界を参照
+
 ## 4. 各項目 A〜F が何を確かめるか
 
 ### 4-A. `make ci`（ローカルゲート）
@@ -114,7 +125,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `skip:` で始まる行が 0 件（skip は検証済みと扱わない）
   - Rust のテストが 1 件以上通り（`passed` の合計が 1 以上）、failed 0 件
   - pytest の要約行が読めて、`passed` が 1 以上・failed 0 件
-- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（Rust の `passed` が 0、または pytest の要約行が無い・`passed` が 0）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）、`output_limit`（stdout が上限超過）、`output_unreadable`（ログが読めない）、`timeout`・`spawn_error`・`killed`（実行の失敗）
+- **失敗の理由**: `skipped`（skip 行あり）、`no_test_results`（Rust の `passed` が 0、または pytest の要約行が無い・`passed` が 0。色つきの行は読めないためこれになりうる。§3-5）、`test_failures`（failed あり）、`unexpected_exit_code`（0 以外）、`output_limit`（stdout が上限超過）、`output_unreadable`（ログが読めない）、`timeout`・`spawn_error`・`killed`（実行の失敗）
 - **記録する `record.json` フィールド**: 終了コード（`exit_code`）、`skip_lines`（`skip:` で始まる行の件数）、`rust_tests`（`passed`・`failed`・`ignored`）、`pytest`（`passed`・`skipped`・`failed`）、`stderr_bytes`
 - **pytest の skip**: Mac では Linux 用の POSIX ACL テスト 3 件が skip になる。検証済みと扱わない。記録には残す
 
@@ -187,12 +198,25 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `capacity.total_bytes > capacity.limit_bytes`（超過判定の一致）
   - `capacity.limit_bytes` が指定値（`--package-limit-bytes`）と一致
   - `package/` ディレクトリが存在しない
-- **失敗の理由**: `unexpected_output`（工程の検査が先に止めるもの。`package` の JSON の `step` の不一致、`capacity` の欠落・上限値の不一致・内訳の合計の不一致・`exceeded` と計算値の不一致、`infer_p95` が null でない〔C-2 の定義に p95 の上限は無い〕など報告値の不整合。exit 20 で `code` が `limit_exceeded` でない場合、または容量も p95 も超過と報告されていない場合もここで `unexpected_output` になる。`case` は `C-2`）、`capacity_limit_not_enforced`（工程の検査を通ったあとの C-2 の判定〔`judge_capacity_limit`〕で落ちるもの。実際に届くのは 2 つだけで、`package` が exit 0 で報告値に不整合がない〔上限を超えていないと報告された〕場合と、exit 20 なのに `package/` が公開されている場合）、工程別の失敗（`package` が exit 0・20 以外のときは `unexpected_exit_code`。exit 0 は工程の検査では許され、C-2 の判定で落ちる）。C-2 の判定にも `capacity` の欠落・上限値の不一致で `unexpected_output` を返す分岐があるが、工程の検査が先に同じ条件で止めるため通常は届かない。工程の検査で止まった失敗には `capacity_limit` の欄は付かず（`case`・`steps`・`p95` のみ）、`capacity_limit` は C-2 の判定まで届いたときだけ記録される
+- **失敗の理由**: `unexpected_output`（工程の検査が先に止めるもの。`package` の JSON の `step` の不一致、`capacity` の欠落・上限値の不一致・内訳の合計の不一致・`exceeded` と計算値の不一致、`infer_p95` が null でない〔C-2 の定義に p95 の上限は無い〕など報告値の不整合。exit 20 で `code` が `limit_exceeded` でない場合、または容量も p95 も超過と報告されていない場合もここで `unexpected_output` になる。`case` は `C-2`）、`capacity_limit_not_enforced`（工程の検査を通ったあとの C-2 の判定〔`judge_capacity_limit`〕で落ちるもの。実際に届くのは 2 つだけ〔ほかに `package.staging/` が残っていれば `staging_left`〕で、`package` が exit 0 で報告値に不整合がない〔上限を超えていないと報告された〕場合と、exit 20 なのに `package/` が公開されている場合）、工程別の失敗（`package` が exit 0・20 以外のときは `unexpected_exit_code`。C-2 の許容終了コードは 20 だけだが、exit 0 は許容外として工程失敗にはならず、工程の検査〔`_step_check`〕へ進む。そこで `status` が `ok` でない・報告値が不整合ならば `unexpected_output` で止まり、整合していれば C-2 の判定へ届いて `capacity_limit_not_enforced` になる）。C-2 の判定にも `capacity` の欠落・上限値の不一致で `unexpected_output` を返す分岐があるが、工程の検査が先に同じ条件で止めるため通常は届かない。工程の検査で止まった失敗には `capacity_limit` の欄は付かず（`case`・`steps`・`p95` のみ）、`capacity_limit` は C-2 の判定まで届いたときだけ記録される
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `p95`: C-1 の結果（再利用）
-  - `capacity_limit.package_exit_code`（20）、`.code`（7 種の語彙の値。語彙外の文字列は `<unexpected>`、文字列でなければ `null`）、`.capacity_exceeded`（boolean または null）、`.total_bytes`・`.limit_bytes`、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）
-  - `reason`（失敗時のみ）: `capacity_limit_not_enforced`（`capacity_limit` 欄を伴う場合。判定が `unexpected_output` を返す分岐は上記のとおり通常届かない）。工程の検査で止まった失敗は `reason` が `unexpected_output`・`unexpected_exit_code` などで、`capacity_limit` 欄は付かない
+  - `capacity_limit.package_exit_code`（20）、`.code`（7 種の語彙の値。語彙外の文字列は `<unexpected>`、文字列でなければ `null`）、`.capacity_exceeded`（boolean または null）、`.total_bytes`・`.limit_bytes`、`.infer_p95_exceeded`（boolean または null）、`.package_published`（`package/` ディレクトリの存在）、`.package_staging_present`（実行後に `package.staging/` が残っていたか）
+  - `reason`（失敗時のみ）: `capacity_limit_not_enforced`（`capacity_limit` 欄を伴う場合。判定が `unexpected_output` を返す分岐は上記のとおり通常届かない）、`staging_left`（`package.staging/` が残っている。`capacity_limit` 欄を伴う）。工程の検査で止まった失敗は `reason` が `unexpected_output`・`unexpected_exit_code` などで、`capacity_limit` 欄は付かない
+
+#### 4-C-3. C の失敗記録の形（`case`・`steps`）
+
+失敗した場所で `case`・`steps` の付き方が変わる（成功時はどちらも付かない）。`case` の値は `C-1`・`C-2` の 2 つだけ。`steps` の各要素の形は B と同じ（§4-B）。`record.md` の「要点」は `case` を出すが `steps` は出さない。
+
+| 失敗した場所 | `case` | `steps` | ほかの欄 |
+| ---- | ---- | ---- | ---- |
+| C-1 の入力の複製 | なし | なし | `reason: input_unreadable` だけ |
+| C-1 の工程 | `C-1` | あり（失敗した工程まで。fixture を読めず始められなければ空の配列） | `reason`・`step`・`exit_code` ほか工程失敗の欄 |
+| C-1 の判定（p95・`package/` の有無と終了コード・`package/` の合計と件数・`staging_left`） | `C-1` | なし | `step: package`・`exit_code`・`reason` |
+| C-2 の入力の複製 | なし | なし | `reason: input_unreadable` だけ（`p95` も付かない） |
+| C-2 の工程 | `C-2` | あり | `p95`（C-1 の結果）＋工程失敗の欄 |
+| C-2 の判定（`capacity_limit_not_enforced`・`staging_left`） | なし | なし | `p95`・`capacity_limit`・`reason` |
 
 ### 4-D. 推論が学習に依存しないこと（REQ-32）
 
@@ -208,6 +232,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `OK: tool=<otool|ldd> ...` の行があり（stdout を後ろから見て最初に一致した行を使う）、macOS では tool が `otool`（`ldd` は実機の確認にならない）
   - リンクを確認したバイナリ（`check-runtime-linkage.sh` が cargo の報告〔`--message-format=json-render-diagnostics` の `compiler-artifact` の `executable`〕から取り、ログ `<work-dir>/D/linkage.log` に `cli_bin: <絶対パス>` の 1 行で出す。記録側はこの行からパスを読んで sha256 を計算する。パスは `record.json`・`record.md` に出ない）の sha256 が、いま実行した CLI の sha256 と、開始時に記録した `cli_sha256` の両方に一致する。`make`・`cargo` の代役の下では偽の `make` が何も検査しないため照合しない（`linkage_target_matches_cli` は `null`）
 - **失敗の理由**: `unexpected_exit_code`（0 以外）、`skipped`（skip 行あり）、`no_test_results`（env -i テストの `ok:` 行が 0 件）、`unexpected_output`（`ok: req32_*` が 3 件でない・`OK: tool=` の行が無い・macOS で tool が `otool` でない）、`linkage_target_unreadable`（`cli_bin:` 行が無い・2 行以上ある・絶対パスでない、または検査対象を読めない・上限超過）、`cli_changed`（いまの CLI が開始時と異なる、または読めない）、`linkage_target_mismatch`（検査対象が実行した CLI と異なる）、`otool_failed`（macOS で `otool -L` に失敗）、`output_unreadable`（`make` のログが読めない）、実行の失敗（`timeout`・`output_limit`・`spawn_error`・`killed`）
+- **出力先の変更**: `build.target-dir` などで出力先を変えていても、検査対象は cargo の報告から取るため追従する（§3-3・§3-5）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `exit_code`: make の終了コード
@@ -242,7 +267,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   - `scores_nonfinite`: スコアに NaN・無限大があった件数（合否に使う。1 件でもあれば失敗）
   - `max_abs_score_diff`: 有限なスコア差の最大値（非有限は除外）。参考値で、合否には使わない
   - `input_sha256`: 推論に使った入力ファイルのハッシュ
-  - `reason`（失敗時のみ）: `mismatch`
+  - `reason`（失敗時のみ）: 上記の失敗の理由のいずれか（`mismatch` は予測・スコアの不一致。語彙の一覧は §5）。`records` の欄は `record_count_out_of_range`・`duplicate_id` のときに付く
   - 失敗時の詳細は `.../E/mismatch-ids.txt` に以下のいずれかに該当する `id` を記録（1 行ずつ）：予測ラベル不一致・スコアに NaN・無限大・スコアが完全一致でない（少しでも違う）
 
 ### 4-F. ガード層の時間制限テスト再発確認（#346）
@@ -265,7 +290,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   - `read_output`: 失敗した回のうち、ログに `ReadOutput`（Incomplete 以外）が出現した回数（成功した回は数えない）
   - `read_output_incomplete`: 失敗した回のうち、ログに `ReadOutputIncomplete` が出現した回数（成功した回は数えない）
   - `load_start`・`load_end`: 実行開始・終了時の load average（3 要素の配列。`os.getloadavg()` で取れなければ `null`）
-  - `reason`（失敗時のみ）: `build_failed` / `test_failures`
+  - `reason`（失敗時のみ）: `build_failed` / `list_failed` / `no_tests_listed` / `test_failures` / `unreaped`（KILL 後の回収が上限時間内に終わらず、その回で打ち切る。`runs` が `--repeat` 未満になる。`child_may_remain` が `true`。§5）
 - **実行特性**: F だけは全 N 回を数えてから成否を決めます（失敗があっても止めず最後まで実行する）。失敗 0 回で `ok`、1 件以上で `failed`。
 - **初回実行の自動準備**: スクリプトが N 回実行の前に `cargo test --locked ... --no-run` を 1 回実行し、テストバイナリをコンパイルします（回数に数えない。失敗は `build_failed`）。続けて `-- --list` を 1 回実行して件数を得ます（回数に数えない。失敗は `list_failed`）。事前準備は不要ですが、初回実行は通常より時間がかかります。
 
@@ -278,7 +303,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、実行全体の上限時間（`--overall-timeout-sec`）を超えた（stdout の `message` は `overall time limit exceeded`。実行中の項目は `failed`・残りは `not_run`〔`reason` は `overall_timeout`〕。子のグループは止めて回収する。終了時の再採取と記録の書き出しは上限の外で行うため、全体の所要は上限 ＋ 再採取〔最大 60 秒〕＋ 回収待ち〔10 秒〕で頭打ちになる。#364）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
-| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
+| 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、子が残りうる状態で（全体の上限時間を超えた、または全項目が `ok`）終わった（stdout の `message` は `a child process may remain`。上限超過の 10 には隠さない）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
@@ -292,7 +317,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
 4. 終了コード 0 = 要求したすべての項目が `ok`、10 = 1 つ以上が `failed` / `not_run`
 
-**中断の方式**: SIGINT・SIGTERM・SIGHUP を受けたハンドラは印を立てるだけで、子プロセスを待つループ（20 ミリ秒ごと）と項目の境目で印を見て、子のプロセスグループを止めて回収してから中断として扱う（止まるまでの遅れは待機の周期程度）。中断のシグナルを受けていれば、項目がすべて完了していても最終結果は中断（終了コード 70・`interrupted`）になる（項目の結果は記録に残る）。既知の限界: `setsid` で別セッションへ移った孫プロセスは止められず残る。子の回収の待機には上限（10 秒。`REAP_WAIT_LIMIT_SECONDS`）があり、KILL が失敗して回収できなければ待つのを諦めて先へ進む。このとき `record.json` の `child_may_remain` を `true` にし（既定は `false`）、その項目は `failed`（`reason` は `unreaped`）にして通常の合否判定へ流さず（fail-closed）、stderr に `a child process may remain` を 1 行出す。`record.md` にも警告行が出る。`ps` で残りを確認し、残っていれば手で止める。後始末が終わらないときのため、**同じ中断シグナルを 2 回受けると**、子のグループへ KILL を送って即座に終了コード 70 で終える（`record.json`・`record.md` は書かれず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` の 1 行。証拠種別: テストハーネス）。最終の JSON を出した後に届いたシグナルは 2 行目の JSON を出さず、プロセスの入口（`_entry`）は `main` から抜ける直前に 3 つの中断シグナルを無視（`SIG_IGN`）へ設定するので、終了処理中にシグナルが届いても、シグナルで終わらず終了コードは 70 のままになる。
+**中断の方式**: SIGINT・SIGTERM・SIGHUP を受けたハンドラは印を立てるだけで、子プロセスを待つループ（20 ミリ秒ごと）と項目の境目で印を見て、子のプロセスグループを止めて回収してから中断として扱う（止まるまでの遅れは待機の周期程度）。中断のシグナルを受けていれば、項目がすべて完了していても最終結果は中断（終了コード 70・`interrupted`）になる（項目の結果は記録に残る）。既知の限界: `setsid` で別セッションへ移った孫プロセスは止められず残る。子の回収の待機には上限（10 秒。`REAP_WAIT_LIMIT_SECONDS`）があり、KILL が失敗して回収できなければ待つのを諦めて先へ進む。このとき `record.json` の `child_may_remain` を `true` にし（既定は `false`）、その項目は `failed`（`reason` は `unreaped`）にして通常の合否判定へ流さず（fail-closed）、stderr に `a child process may remain` を 1 行出す。`record.md` にも警告行が出る。`ps` で残りを確認し、残っていれば手で止める。もう 1 つの既知の限界として、スクリプト自身が SIGKILL・SIGQUIT で落ちた場合は何も後始末されない（§3-5。証拠種別: 推定）。後始末が終わらないときのため、**同じ中断シグナルを 2 回受けると**、子のグループへ KILL を送って即座に終了コード 70 で終える（`record.json`・`record.md` は書かれず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` の 1 行。証拠種別: テストハーネス）。最終の JSON を出した後に届いたシグナルは 2 行目の JSON を出さず、プロセスの入口（`_entry`）は `main` から抜ける直前に 3 つの中断シグナルを無視（`SIG_IGN`）へ設定するので、終了処理中にシグナルが届いても、シグナルで終わらず終了コードは 70 のままになる。
 
 **項目ごとの成否判定**:
 
@@ -308,10 +333,52 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 **失敗時の報告の 5 点**:
 
 1. 終了コード
-2. `reason`（失敗の理由。固定語彙：`timeout`・`output_limit`・`output_unreadable`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`input_unreadable`・`unreaped`〔子の回収が上限時間内に終わらなかった。`child_may_remain` が `true`〕など。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名。組み込みの閉じた語彙で、語彙外は `<unexpected>`〕）
+2. `reason`（失敗の理由。固定語彙の一覧と意味は下の「`reason` の語彙」。項目ごとの語彙は §4。想定外の例外は `internal_error`〔`error_type` に例外の型名。組み込みの閉じた語彙で、語彙外は `<unexpected>`〕）
 3. `step`（工程名。固定語彙：`register`・`inspect`・`train`・`select`・`evaluate`・`package`・`infer` など。工程が無い場合は省略）
 4. stdout の JSON（あれば）から `code`（7 種の語彙の値）・`message_bytes`・`message_sha256`（`message` の本文は記録されず、`<work-dir>` の stdout のファイルに残る）
 5. 実行したコマンド（固定語彙。パスは含めない）
+
+### `reason` の語彙（一覧。#365）
+
+`reason` は文字列の欄で、値はすべてスクリプト内の固定文字列である（閉じた語彙の機械検査はない。語彙外は記録の許可リストが `<unexpected>` に置き換える。§7）。出所ごとに分けて示す。語彙に載っていても、原因を確かめずに再実行しない（fail-closed）。
+
+**(a) 子プロセスの起動・回収**
+
+| reason | 意味 | 出る場所 |
+| ---- | ---- | ---- |
+| `timeout` | 子ごとの上限時間（§3-4）を超え、スクリプトがプロセスグループを KILL した | 全項目 |
+| `output_limit` | stdout・stderr のファイルが上限を超えた（実行中・終了後）。A・D はログを読む時点のサイズ超過でも同じ語 | 全項目 |
+| `spawn_error` | 実行ファイルが見つからない・実行できない、終了コードのファイルを事前に消せない、ログを開けない、起動に失敗した | 全項目 |
+| `killed` | 子は期限内・上限内で終わったが、**終了コードを確認できなかった**。ラッパーの sh が終了コードを書く前に外から止められた、終了コードのファイルが無い・通常ファイルでない（symlink 等への差し替え）・1〜3 桁の数字でない・255 超。成功扱いにしない（#359） | 全項目（F は件数欄） |
+| `unreaped` | KILL 後の回収が 10 秒（`REAP_WAIT_LIMIT_SECONDS`）で終わらない、またはグループへ KILL を送れない。`child_may_remain` が `true` になり、stderr に `a child process may remain` を出す | 全項目（F では `reason` になり、その回で打ち切る） |
+
+`killed` の読み方（誤読されやすい点。証拠種別: テストハーネス）:
+
+- スクリプト自身が上限超過で止めた場合は `timeout`・`output_limit` で、`killed` ではない。
+- 子のコマンドがシグナルで終わった場合、ラッパーは `$?`（128 ＋ シグナル番号）を終了コードとして書くので `killed` にならず、終了コード側の失敗になる（A・D は `unexpected_exit_code`。B・C の工程は stdout が JSON でなければ `invalid_json` ＋ `exit_code_unexpected: true`）。
+- 終了コードのファイルの欠落・形式不正（数字でない・桁数超過・255 超）・symlink 等への差し替えは `killed` になる。ただし 0〜255 の数字を持つ通常ファイルは書き手の正当性を検証せずそのまま受け入れるため、有効な形式で 0 などに書き換えられた場合は検出できず `ok` になりうる（テストハーネスの範囲。改ざん耐性の保証ではない）。
+
+**(b) 項目ごとの判定**
+
+| 項目 | reason |
+| ---- | ---- |
+| A | `output_unreadable`・`unexpected_exit_code`・`skipped`・`test_failures`・`no_test_results`（判定順は skipped → test_failures → no_test_results） |
+| B | `input_unreadable`・`invalid_json`（補助欄 `exit_code_unexpected`）・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`package_unreadable`・`package_entry_not_regular`・`capacity_sum_mismatch` |
+| C | B の工程の語、`staging_left`（C-1・C-2 の両方）、`capacity_limit_not_enforced`（C-2）、C-1 の判定の `missing_field`・`unexpected_output` |
+| D | `output_unreadable`・`unexpected_exit_code`・`skipped`・`no_test_results`・`unexpected_output`・`linkage_target_unreadable`・`cli_changed`・`linkage_target_mismatch`・`otool_failed` |
+| E | `input_unreadable`・`record_count_out_of_range`・`duplicate_id`・`unexpected_exit_code`・`unexpected_output`・`invalid_json`・`mismatch`。`e-inputs.jsonl` を書けないときは `step` なしの `spawn_error`（子の起動失敗ではない。現状の挙動で、語の見直しは別課題の候補） |
+| F | `build_failed`・`list_failed`・`no_tests_listed`・`test_failures`・`unreaped` |
+
+**(c) 実行の制御**
+
+- `failed` の項目: `interrupted`・`overall_timeout`・`internal_error`（`error_type` つき）
+- `not_run` の項目: `not_selected`・`previous_item_failed`・`interrupted`・`overall_timeout`
+
+**(d) 付随する欄と、畳まれる箇所**
+
+- 付随する欄: `step`・`exit_code`（B・C の工程の起動失敗・回収失敗では `null`）・`exit_code_unexpected`・`code`・`message_bytes`・`message_sha256`（`unexpected_exit_code`・`unexpected_output` の工程失敗）・`case`・`steps`（§4-C-3）・`p95`・`capacity_limit`（C）・`records`（E の `record_count_out_of_range`・`duplicate_id`）・`error_type`
+- F の各回の `timeout`・`output_limit`・`killed`・`spawn_error` は `reason` にならず件数欄（`timeouts`・`output_limit`・`killed`・`spawn_error`）に出る。F の `--no-run` の失敗は `build_failed`、`--list` の失敗は `list_failed` に畳まれる
+- D の `otool -L` の失敗は `otool_failed` に畳まれる。項目の開始前の CLI のビルド失敗は記録なしの exit 70。環境採取の失敗は該当欄が `null`
 
 ## 6. 証拠の種別の扱い
 
@@ -375,6 +442,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   "evidence_hint": "requires_human_review" | "test_harness",
   "bin_override": true | false,
   "child_may_remain": true | false (子の回収が上限時間内に終わらず、子・孫が残っている可能性。既定は false),
+  "overall_timeout_exceeded": true (実行全体の上限時間を超えたときだけ付く欄。超えなければ欄が無い),
   "environment": null (項目の開始前に中断された場合) | {
     "hw_model": "string (^[A-Za-z0-9 ._,()+-]{1,64}$) or null",
     "cpu": "string (same rule) or null",
@@ -451,6 +519,8 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   あわせて「`commit`・`worktree_clean` は CLI の出所を表さない」旨が出ます
 - `environment.stable` が `false` の場合：「注意: 開始時と終了時で commit・worktree_clean・CLI の sha256 のいずれかが一致しない」
 - `child_may_remain` が `true` の場合：「注意: 子プロセスの回収が上限時間内に終わらなかった」（子・孫が残っている可能性。結果を採用しない）
+- 実行全体の上限時間を超えた場合は 2 通り：項目が `overall_timeout` で打ち切られたときは「上限時間を超えて打ち切った」、全項目の完了後に超えていたときは「全項目の完了後に超えていた（各項目の `status` は変えていない）」（どちらも結果を採用しない。#364）
+- `environment.stable` が `null`（開始時か終了時の値を採取できず比較できない）の場合：「注意: …一致を確認できなかった（採取不能。成功扱いにしない）」
 - 証拠の種別は「人が確認して記入」と指示されます
 - 「項目ごとの結果」の表の「要点」には、各項目の `record.json` の欄から `status`・`steps`・`package_files`・`capacity`・`p95`・`capacity_limit`・`message_sha256` を除いたものを JSON で出します（B は `total_bytes` と `capacity_sum_matches_total`、C は `p95` と `capacity_limit` を足す）。失敗の要点は `reason`・`step`・`exit_code` と、`code`・`message_bytes` です（`message_sha256` は `record.json` だけ）
 

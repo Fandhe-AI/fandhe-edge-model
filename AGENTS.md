@@ -106,12 +106,12 @@ make doctor      # 環境診断のみ（何も導入しない）
 - 人の担当: 実機での実行。`evidence_hint` の確認（MAKE_CMD / CARGO_CMD 無い場合は `requires_human_review`、有れば `test_harness`）。`bin_override:true` 時は「差し替えた CLI は実証拠にならない」を確認。`--quiet-machine` は人の申告で、実際に他のアプリを閉じた静かな状態のみを「実機」として扱う。E は学習データ（`train.jsonl`）のみ使用（REQ-27）
 - Agent の範囲: スクリプト・手順書の準備まで。実機での実行・確定は人が行う。テストハーネス結果（MAKE_CMD / CARGO_CMD 設定時）を実機証拠と混ぜない
 - 記録: `<work-dir>/record.json`・`record.md` を PR に貼る（パス・ログは含めない。step の stdout・stderr は `<work-dir>/**/steps/` に保存）。記録は許可リスト方式（工程ごとに決まった欄だけを組み立て、最後の関門で許可されたキー以外の文字列を `<redacted>` に伏せる）。CLI の `message` は記録されず `message_bytes`・`message_sha256` になり、`infer` の `predicted_label` は `predicted_index` になる
-- 前提・詳細・注意点: [docs/design/real-machine-check-procedure.md](docs/design/real-machine-check-procedure.md)
+- 前提・詳細・注意点: [docs/design/real-machine-check-procedure.md](docs/design/real-machine-check-procedure.md)（`reason` の語彙の一覧は §5、運用上の注意〔色を強制する環境変数・SIGKILL / SIGQUIT・出力先の変更〕は §3-5。#365）
 
 ### `env -i` 環境での推論（TASK-32.3・#115・REQ-32）
 
 - `crates/runtime/tests/env_isolation.rs` は、環境変数を空にした子プロセスで C1・C3 の fixture 推論が exit 0 になることを確かめ、既定の `make test` で実行される（unix 限定。rust-ci の Linux・macOS runner で実行。証拠種別: テストハーネス）。実機前提へ移す差分は P0
-- CLI `fandhe-edge infer` の `env -i` 確認は、工程の接続（#136）は済んだが未追加（現時点の確認は推論ランタイム層のみ。別課題）
+- CLI `fandhe-edge infer` の `env -i` 下での起動確認は、`scripts/check-runtime-linkage.sh` が `infer --help` だけを `env -i PATH=/usr/bin:/bin` で起動して行う（help のみの smoke。失敗すれば D は `unexpected_exit_code`）。未追加なのは、配布パッケージを読んで推論そのものを `env -i` 下で実行する確認（別課題）。`env -i` 下の推論の確認は推論ランタイム層（`env_isolation`）に限る
 - `make check-runtime-linkage`（`scripts/check-runtime-linkage.sh`。cargo は `--locked` で起動し、CLI の場所は cargo の報告から取って `cli_bin:` の行で出す）は Mac 実機で人間が実行し、`otool -L` で Python・MLX への動的リンクが無いことと `env -i` 実行の結果を「実機」として PR に記録する（`real-machine-check` の D は stdout の後ろから見て最初の `OK: tool=` の行と `cli_bin:` の行を使う）。Linux の `ldd` の結果は補助で、Mac 実機の証拠にはならない。未実施の間は「未実施」と書く
 
 ### 実行環境（uv venv）を要するテスト（issue #258）
