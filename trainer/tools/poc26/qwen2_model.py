@@ -29,8 +29,17 @@ MAX_MODEL_BYTES = 1 << 30
 _SUPPORTED = "supported: model_type=qwen2, no rope_scaling, use_sliding_window=false"
 
 
-#: メモリ上の重みの上限（4 GiB。0.5B 級の float32 昇格 約 2 GB を許す）。
-MAX_MODEL_MEMORY_BYTES = 4 << 30
+#: 読み込み時に同時保持するメモリの上限（8 GiB）。見積もりは
+#: 「重みファイル（読み込んだ重み）＋ dtype 変換後の重み ＋ 構築したモデル」の合計
+#: （0.5B 級を float32 へ昇格しても約 5 GiB で収まる）。
+MAX_MODEL_MEMORY_BYTES = 8 << 30
+
+#: forward 入力の上限（token 数 B×L・logits 要素数 B×L×vocab・マスク要素数 B×L×L）。
+MAX_FORWARD_TOKENS = 1 << 20
+MAX_FORWARD_ELEMENTS = 1 << 31
+
+#: config の `max_position_embeddings` の上限（これを超える設定は拒否）。
+MAX_POSITIONS_LIMIT = 1 << 20
 
 #: config の各整数の上限（Qwen2.5 の 0.5B〜数 B 級を許し、巨大割り当てを構築前に止める）。
 _CONFIG_LIMITS = {
@@ -86,6 +95,7 @@ class Qwen2Config:
     rms_norm_eps: float
     rope_theta: float
     tie_word_embeddings: bool
+    max_position_embeddings: int
 
     @property
     def head_dim(self) -> int:
@@ -98,6 +108,19 @@ class Qwen2Config:
         layer = 2 * h * h + 2 * h * kv + h + 2 * kv + 3 * h * self.intermediate_size + 2 * h
         total = self.vocab_size * h + self.num_hidden_layers * layer + h
         return total + (0 if self.tie_word_embeddings else self.vocab_size * h)
+
+    def expected_keys(self) -> set[str]:
+        """モデルを構築せずに、期待する重みキー名の集合を返す（HF の命名）。"""
+        keys = {"model.embed_tokens.weight", "model.norm.weight"}
+        if not self.tie_word_embeddings:
+            keys.add("lm_head.weight")
+        for i in range(self.num_hidden_layers):
+            p = f"model.layers.{i}."
+            keys |= {p + f"self_attn.{n}_proj.weight" for n in "qkvo"}
+            keys |= {p + f"self_attn.{n}_proj.bias" for n in "qkv"}
+            keys |= {p + f"mlp.{n}_proj.weight" for n in ("gate", "up", "down")}
+            keys |= {p + "input_layernorm.weight", p + "post_attention_layernorm.weight"}
+        return keys
 
     @classmethod
     def from_file(cls, path: Path) -> Qwen2Config:
@@ -126,12 +149,13 @@ class Qwen2Config:
             "num_key_value_heads",
             "intermediate_size",
             "vocab_size",
+            "max_position_embeddings",
         ]
         for k in ints:
             v = doc.get(k)
             if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
                 raise ValueError(f"invalid config field: {k}")
-            if v > _CONFIG_LIMITS[k]:
+            if v > _CONFIG_LIMITS.get(k, MAX_POSITIONS_LIMIT):
                 raise ValueError(f"config field too large: {k}")
         if (
             doc["hidden_size"] % doc["num_attention_heads"]
@@ -229,6 +253,24 @@ class Qwen2Model(nn.Module):
         if not c.tie_word_embeddings:
             self.lm_head = nn.Linear(c.hidden_size, c.vocab_size, bias=False)
 
+    def _check_input(self, ids: mx.array, attention_mask: mx.array | None) -> None:
+        """確保の前に B・L を検証する（REQ-39）。超過は ValueError。"""
+        if ids.ndim != 2 or 0 in ids.shape:
+            raise ValueError("ids must be a non-empty [B, L] array")
+        b, n = ids.shape
+        c = self.config
+        if n > c.max_position_embeddings:
+            raise ValueError(f"sequence too long: {n} > {c.max_position_embeddings}")
+        if b * n > MAX_FORWARD_TOKENS:
+            raise ValueError(f"too many tokens: {b * n} > {MAX_FORWARD_TOKENS}")
+        if b * n * c.vocab_size > MAX_FORWARD_ELEMENTS:
+            raise ValueError("logits would be too large for one forward")
+        if attention_mask is not None:
+            if attention_mask.shape != ids.shape:
+                raise ValueError("attention_mask shape must equal ids shape")
+            if b * n * n > MAX_FORWARD_ELEMENTS:
+                raise ValueError("attention mask would be too large for one forward")
+
     def __call__(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から logits `[B, L, vocab]` を返す。
 
@@ -236,9 +278,13 @@ class Qwen2Model(nn.Module):
         合成する。pad の query 行が全遮蔽で NaN にならないよう対角は常に許可する。
         **左 pad は非対応**（位置 id は 0 始まりで、pad 分だけ RoPE 位置がずれる）。
 
+        入力は `max_position_embeddings`（config 必須）以下の長さ、B×L・B×L×vocab・B×L×L に
+        上限があり、超過は ValueError。
+
         dropout の有効 / 無効（train / eval）は呼び出し側の責務で、本 forward は切り替えない
         （PR-C の学習ループが `model.train()` / `model.eval()` を呼ぶ）。
         """
+        self._check_input(ids, attention_mask)
         mask: mx.array | str = "causal"
         if attention_mask is not None:
             n = ids.shape[1]
@@ -258,14 +304,16 @@ class Qwen2Model(nn.Module):
 class LoRALinear(nn.Module):
     """mlx-lm と同形の LoRA。a ~ U(±1/sqrt(in))・b = 0・float32。"""
 
-    def __init__(self, base: nn.Module, rank: int, scale: float, dropout: float) -> None:
+    def __init__(
+        self, base: nn.Module, rank: int, scale: float, dropout: float, key: mx.array
+    ) -> None:
         super().__init__()
         out_dim, in_dim = base.weight.shape
         self.linear = base
         self.dropout = nn.Dropout(p=dropout)
         self.scale = scale
         bound = 1.0 / math.sqrt(in_dim)
-        self.lora_a = mx.random.uniform(-bound, bound, (in_dim, rank), dtype=mx.float32)
+        self.lora_a = mx.random.uniform(-bound, bound, (in_dim, rank), key=key, dtype=mx.float32)
         self.lora_b = mx.zeros((rank, out_dim), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -282,13 +330,18 @@ _LORA_TARGETS = (
 
 
 def apply_lora(
-    model: Qwen2Model, *, num_layers: int, rank: int, scale: float, dropout: float
+    model: Qwen2Model, *, num_layers: int, rank: int, scale: float, dropout: float, seed: int
 ) -> None:
-    """base を freeze し、末尾 `num_layers` ブロックの 7 Linear を LoRA に置き換える。"""
+    """base を freeze し、末尾 `num_layers` ブロックの 7 Linear を LoRA に置き換える。
+
+    lora_a は `mx.random.key(seed)` を split した鍵で初期化し、グローバル乱数状態に依存しない。
+    """
     layers = model.model.layers
-    for v in (num_layers, rank):
+    for v in (num_layers, rank, seed):
         if not isinstance(v, int) or isinstance(v, bool):
             raise ValueError("invalid LoRA rank / num_layers: must be int")
+    if not 0 <= seed < 1 << 32:
+        raise ValueError("invalid LoRA seed: 0 <= seed < 2^32")
     if not 1 <= num_layers <= len(layers):
         raise ValueError(f"num_layers out of range: 1..{len(layers)}")
     if not 1 <= rank <= MAX_LORA_RANK:
@@ -299,11 +352,14 @@ def apply_lora(
     if not 0.0 <= dropout < 1.0:
         raise ValueError("invalid LoRA dropout: 0 <= dropout < 1")
     model.freeze()
+    n_each = sum(len(names) for _, names in _LORA_TARGETS)
+    keys = iter(mx.random.split(mx.random.key(seed), num_layers * n_each))
     for block in layers[-num_layers:]:
         for owner, names in _LORA_TARGETS:
             parent = getattr(block, owner)
             for name in names:
-                setattr(parent, name, LoRALinear(getattr(parent, name), rank, scale, dropout))
+                lora = LoRALinear(getattr(parent, name), rank, scale, dropout, next(keys))
+                setattr(parent, name, lora)
 
 
 def trainable_parameter_count(model: nn.Module) -> int:
@@ -314,22 +370,24 @@ def trainable_parameter_count(model: nn.Module) -> int:
 def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
     """`config.json`・`model.safetensors` を検証して読み、`dtype` へ揃えたモデルを返す。
 
-    `model.safetensors` は 1 GiB 上限を読み込み前に確認し、キーの過不足は `strict=True` の
-    前に検査する。
+    順序: config 検証 → 重みファイルの存在・種類・サイズ検証 → 同時保持メモリの見積もり検査 →
+    重み読み込みとキー検査 → モデル構築 → dtype 変換して `strict=True` で load。
+    構築（確保）は、重みが存在し上限内でキーが合うと分かった後に行う。
     """
     model_dir = Path(model_dir)
     config = Qwen2Config.from_file(model_dir / "config.json")
     params = config.estimated_params()
-    # 構築（nn.Linear 等の割り当て）より前に、ファイル上とメモリ上の大きさを見積もって拒否する。
-    if params * 2 > MAX_MODEL_BYTES or params * dtype.size > MAX_MODEL_MEMORY_BYTES:
-        raise ValueError("config implies a model larger than the supported size limit")
-    model = Qwen2Model(config)
-    path = model_dir / "model.safetensors"
-    fd, _ = _open_regular(path, MAX_MODEL_BYTES, "model.safetensors")
-    # 検証済みの fd をそのまま読む（パスで開き直さない）ため、検査後にパスが差し替わっても
-    # 検証した実体が読まれる（TOCTOU 対策）。mx.load は遅延読み込みのことがあるので、
-    # ファイルを閉じる前に mx.eval で全配列を実体化する（閉じた後は fd に依存しない）。
+    fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
     with os.fdopen(fd, "rb") as f:
+        # 同時保持: 読み込んだ重み（ファイルサイズ）+ dtype 変換後 + 構築したモデル
+        if (
+            params * 2 > MAX_MODEL_BYTES
+            or st.st_size + 2 * params * dtype.size > MAX_MODEL_MEMORY_BYTES
+        ):
+            raise ValueError("config implies a model larger than the supported size limit")
+        # 検証済みの fd をそのまま読む（パスで開き直さない）ため、検査後にパスが差し替わっても
+        # 検証した実体が読まれる（TOCTOU 対策）。mx.load は遅延読み込みのことがあるので、
+        # ファイルを閉じる前に mx.eval で全配列を実体化する（閉じた後は fd に依存しない）。
         try:
             weights = mx.load(f, format="safetensors")
             mx.eval(weights)
@@ -337,7 +395,7 @@ def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
             raise ValueError("invalid model.safetensors") from None
     if not isinstance(weights, dict):
         raise ValueError("invalid model.safetensors")
-    expected = {k for k, _ in tree_flatten(model.parameters())}
+    expected = config.expected_keys()
     missing, extra = expected - weights.keys(), weights.keys() - expected
     if config.tie_word_embeddings and "lm_head.weight" in extra:
         raise ValueError(
@@ -351,6 +409,7 @@ def load_qwen2(model_dir: Path, *, dtype: mx.Dtype) -> Qwen2Model:
             f"weight keys mismatch (missing={len(missing)}, unexpected={len(extra)}); "
             f"{_SUPPORTED}{hint}"
         )
+    model = Qwen2Model(config)
     model.load_weights([(k, v.astype(dtype)) for k, v in weights.items()], strict=True)
     mx.eval(model.parameters())
     return model

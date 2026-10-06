@@ -79,7 +79,7 @@ def test_lora_initially_equals_base(model_dir: Path) -> None:
     """REQ-41: LoRA 適用直後（b = 0）は base と出力一致（atol 1e-6）。"""
     m = load_qwen2(model_dir, dtype=mx.float32)
     before = m(IDS)
-    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0)
+    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0, seed=0)
     assert isinstance(m.model.layers[1].self_attn.q_proj, LoRALinear)
     assert mx.allclose(before, m(IDS), atol=1e-6).item()
 
@@ -87,7 +87,7 @@ def test_lora_initially_equals_base(model_dir: Path) -> None:
 def test_lora_a_range_dtype_and_b_zero(model_dir: Path) -> None:
     """REQ-41: a は U(±1/sqrt(in))・b は 0・float32（bf16 モデルでも）。"""
     m = load_qwen2(model_dir, dtype=mx.bfloat16)
-    apply_lora(m, num_layers=1, rank=8, scale=20.0, dropout=0.0)
+    apply_lora(m, num_layers=1, rank=8, scale=20.0, dropout=0.0, seed=0)
     lin = m.model.layers[1].mlp.down_proj  # in = 32
     assert lin.lora_a.dtype == mx.float32
     assert lin.lora_b.dtype == mx.float32
@@ -102,7 +102,7 @@ def test_lora_a_range_dtype_and_b_zero(model_dir: Path) -> None:
 def test_trainable_parameter_count(model_dir: Path, num_layers: int, expected: int) -> None:
     """REQ-41: 層数×7 Linear×rank×(in+out)。q/o 16→16・k/v 16→8・gate/up 16→32・down 32→16"""
     m = load_qwen2(model_dir, dtype=mx.float32)
-    apply_lora(m, num_layers=num_layers, rank=8, scale=20.0, dropout=0.0)
+    apply_lora(m, num_layers=num_layers, rank=8, scale=20.0, dropout=0.0, seed=0)
     per_layer = 8 * ((16 + 16) + (16 + 8) * 2 + (16 + 16) + (16 + 32) * 2 + (32 + 16))
     assert per_layer * num_layers == expected
     assert trainable_parameter_count(m) == expected
@@ -114,7 +114,7 @@ def test_lora_nonzero_b_changes_output_and_grads_only_lora(model_dir: Path) -> N
     from mlx.utils import tree_flatten
 
     m = load_qwen2(model_dir, dtype=mx.float32)
-    apply_lora(m, num_layers=1, rank=4, scale=20.0, dropout=0.0)
+    apply_lora(m, num_layers=1, rank=4, scale=20.0, dropout=0.0, seed=0)
     names = [k for k, _ in tree_flatten(m.trainable_parameters())]
     assert names
     assert all(("lora_a" in k or "lora_b" in k) for k in names)
@@ -266,7 +266,7 @@ def test_apply_lora_argument_validation(model_dir: Path) -> None:
     """REQ-41: 範囲外の num_layers / rank / dropout は ValueError。"""
     m = load_qwen2(model_dir, dtype=mx.float32)
     for kw in ({"num_layers": 0}, {"num_layers": 3}, {"rank": 0}, {"dropout": 1.0}):
-        args = {"num_layers": 1, "rank": 8, "scale": 20.0, "dropout": 0.0, **kw}
+        args = {"num_layers": 1, "rank": 8, "scale": 20.0, "dropout": 0.0, "seed": 0, **kw}
         with pytest.raises(ValueError, match=r"out of range|invalid LoRA"):
             apply_lora(m, **args)
 
@@ -301,10 +301,10 @@ def test_estimated_size_rejected_before_build(
 
 def test_real_qwen_size_fits_limits() -> None:
     """REQ-41: Qwen2.5-0.5B の形状は bf16 で 1 GiB 未満、float32 でもメモリ上限内（概算 494M）。"""
-    cfg = qwen2_model.Qwen2Config(896, 24, 14, 2, 4864, 151936, 1e-6, 1e6, True)
+    cfg = qwen2_model.Qwen2Config(896, 24, 14, 2, 4864, 151936, 1e-6, 1e6, True, 32768)
     assert 490_000_000 < cfg.estimated_params() < 500_000_000
     assert cfg.estimated_params() * 2 <= qwen2_model.MAX_MODEL_BYTES
-    assert cfg.estimated_params() * 4 <= qwen2_model.MAX_MODEL_MEMORY_BYTES
+    assert 988_000_000 + 2 * cfg.estimated_params() * 4 <= qwen2_model.MAX_MODEL_MEMORY_BYTES
 
 
 def test_invalid_config_bytes_are_value_error(model_dir: Path) -> None:
@@ -355,7 +355,7 @@ def test_lora_bf16_model_forward_and_grad(model_dir: Path) -> None:
     import mlx.nn as nn
 
     m = load_qwen2(model_dir, dtype=mx.bfloat16)
-    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0)
+    apply_lora(m, num_layers=2, rank=8, scale=20.0, dropout=0.0, seed=0)
     out = m(IDS)
     assert out.dtype == mx.bfloat16
     loss, grads = nn.value_and_grad(m, lambda mm: mm(IDS).astype(mx.float32).sum())(m)
@@ -393,6 +393,108 @@ def test_tie_with_lm_head_conflict_message(model_dir: Path) -> None:
 def test_apply_lora_strict_types(model_dir: Path, kw: dict) -> None:
     """REQ-41: bool・float の rank、上限超過、非有限の scale / dropout を拒否する。"""
     m = load_qwen2(model_dir, dtype=mx.float32)
-    args = {"num_layers": 1, "rank": 8, "scale": 20.0, "dropout": 0.0, **kw}
+    args = {"num_layers": 1, "rank": 8, "scale": 20.0, "dropout": 0.0, "seed": 0, **kw}
     with pytest.raises(ValueError, match=r"invalid LoRA|out of range"):
         apply_lora(m, **args)
+
+
+def _forbid_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("model must not be constructed")
+
+    monkeypatch.setattr(qwen2_model, "Qwen2Model", boom)
+
+
+def test_rejected_before_construction(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: 重み欠落・過大・メモリ見積もり超過・キー不一致は、モデル構築の前に拒否する。"""
+    _forbid_build(monkeypatch)
+    path = model_dir / "model.safetensors"
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", 100)
+    with pytest.raises(ValueError, match="larger than the supported size"):
+        load_qwen2(model_dir, dtype=mx.float32)
+    monkeypatch.undo()
+    _forbid_build(monkeypatch)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_BYTES", 20000)
+    with pytest.raises(ValueError, match=r"model\.safetensors too large"):
+        load_qwen2(model_dir, dtype=mx.float32)
+    monkeypatch.undo()
+    _forbid_build(monkeypatch)
+    w = mx.load(str(path))
+    _resave(path, {k: v for k, v in w.items() if k != "model.norm.weight"})
+    with pytest.raises(ValueError, match="weight keys mismatch"):
+        load_qwen2(model_dir, dtype=mx.float32)
+    path.unlink()
+    with pytest.raises(ValueError, match=r"cannot open model\.safetensors"):
+        load_qwen2(model_dir, dtype=mx.float32)
+
+
+def test_missing_max_position_embeddings_rejected(model_dir: Path) -> None:
+    """REQ-41: max_position_embeddings が無い config は拒否する（既定値で補わない）。"""
+    cfg = json.loads((model_dir / "config.json").read_text())
+    del cfg["max_position_embeddings"]
+    (model_dir / "config.json").write_text(json.dumps(cfg))
+    with pytest.raises(ValueError, match="invalid config field"):
+        load_qwen2(model_dir, dtype=mx.float32)
+
+
+def test_forward_input_limits(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: forward は確保前に L・B×L・B×L×vocab・B×L×L・形状を検証する。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    with pytest.raises(ValueError, match="sequence too long"):
+        m(mx.zeros((1, 65), dtype=mx.int32))
+    assert m(mx.zeros((1, 64), dtype=mx.int32)).shape == (1, 64, synthetic.TINY_VOCAB)
+    monkeypatch.setattr(qwen2_model, "MAX_FORWARD_TOKENS", 9)
+    with pytest.raises(ValueError, match="too many tokens"):
+        m(mx.zeros((2, 5), dtype=mx.int32))
+    monkeypatch.undo()
+    monkeypatch.setattr(qwen2_model, "MAX_FORWARD_ELEMENTS", 2 * 5 * synthetic.TINY_VOCAB - 1)
+    with pytest.raises(ValueError, match="logits would be too large"):
+        m(mx.zeros((2, 5), dtype=mx.int32))
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="attention_mask shape"):
+        m(mx.zeros((2, 5), dtype=mx.int32), mx.ones((2, 4), dtype=mx.int32))
+    with pytest.raises(ValueError, match="non-empty"):
+        m(mx.zeros((5,), dtype=mx.int32))
+
+
+def test_forward_mask_elements_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: マスクの B×L×L が上限を超えたら確保前に拒否する（vocab=1 で logits 検査を外す）。"""
+    cfg = qwen2_model.Qwen2Config(16, 2, 2, 1, 32, 1, 1e-6, 1e4, True, 64)
+    m = qwen2_model.Qwen2Model(cfg)
+    ids, am = mx.zeros((2, 5), dtype=mx.int32), mx.ones((2, 5), dtype=mx.int32)
+    monkeypatch.setattr(qwen2_model, "MAX_FORWARD_ELEMENTS", 2 * 5 * 5)
+    m._check_input(ids, am)  # 上限ちょうどは許可
+    monkeypatch.setattr(qwen2_model, "MAX_FORWARD_ELEMENTS", 2 * 5 * 5 - 1)
+    with pytest.raises(ValueError, match="attention mask would be too large"):
+        m._check_input(ids, am)
+
+
+def test_lora_seed_determinism(model_dir: Path) -> None:
+    """REQ-26・REQ-41: 同 seed なら lora_a 一致（乱数状態に依存しない）・seed が違えば不一致。"""
+
+    def lora_a(seed: int, noise: bool = False) -> np.ndarray:
+        m = load_qwen2(model_dir, dtype=mx.float32)
+        if noise:
+            mx.random.uniform(shape=(3,))
+        apply_lora(m, num_layers=2, rank=4, scale=20.0, dropout=0.0, seed=seed)
+        return np.concatenate(
+            [
+                np.array(getattr(blk.self_attn, n).lora_a).ravel()
+                for blk in m.model.layers
+                for n in ("q_proj", "k_proj")
+            ]
+        )
+
+    base = lora_a(3)
+    assert np.array_equal(base, lora_a(3, noise=True))
+    mx.random.seed(999)
+    assert np.array_equal(base, lora_a(3))
+    assert not np.array_equal(base, lora_a(4))
+
+
+@pytest.mark.parametrize("seed", [-1, 1 << 32, True, 1.5])
+def test_lora_seed_validation(model_dir: Path, seed: object) -> None:
+    """REQ-41: seed は 0 以上 2^32 未満の int（bool 除外）。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    with pytest.raises(ValueError, match="invalid LoRA"):
+        apply_lora(m, num_layers=1, rank=4, scale=20.0, dropout=0.0, seed=seed)
