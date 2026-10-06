@@ -97,7 +97,10 @@ def batch_loss(model: Qwen2Model, inputs: mx.array, pos: mx.array, tgt: mx.array
     # ponytail: 損失位置の隠れ状態だけを float32 の logits にする。全 [B,L,vocab] は作らない。
     """
     h = model.hidden_states(inputs)
-    logits = model.project(h.reshape(-1, h.shape[-1])[pos]).astype(mx.float32)
+    hv = h.reshape(-1, h.shape[-1])[pos]
+    logits = model.project(
+        hv, source_shape=(inputs.shape[0], inputs.shape[1]), with_mask=False
+    ).astype(mx.float32)
     return nn.losses.cross_entropy(logits, tgt, reduction="mean")
 
 

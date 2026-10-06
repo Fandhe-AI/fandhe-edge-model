@@ -81,7 +81,7 @@ PROBE_TEXTS = [
 
 def last_logits(model: Qwen2Model, ids: list[int]) -> np.ndarray:
     h = model.hidden_states(mx.array(np.array([ids], dtype=np.int32)))
-    out = model.project(h[:, -1]).astype(mx.float32)
+    out = model.project(h[:, -1], source_shape=(1, len(ids)), with_mask=False).astype(mx.float32)
     mx.eval(out)
     return np.array(out, dtype="<f4")[0]
 

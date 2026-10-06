@@ -355,7 +355,11 @@ class Qwen2Model(nn.Module):
     def __call__(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から logits `[B, L, vocab]` を返す（`hidden_states`＋`project`）。"""
         self._check_input(ids, attention_mask, with_logits=True)  # 全位置 logits を含む全体で判定
-        return self.project(self._hidden(ids, attention_mask))
+        return self.project(
+            self._hidden(ids, attention_mask),
+            source_shape=(ids.shape[0], ids.shape[1]),
+            with_mask=attention_mask is not None,
+        )
 
     def hidden_states(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から最終 norm 後の隠れ状態 `[B, L, hidden]` を返す。
@@ -391,12 +395,20 @@ class Qwen2Model(nn.Module):
             h = layer(h, mask)
         return inner.norm(h)
 
-    def project(self, h: mx.array) -> mx.array:
+    def project(self, h: mx.array, *, source_shape: tuple[int, int], with_mask: bool) -> mx.array:
         """隠れ状態 `[..., hidden]` を logits `[..., vocab]` へ射影する（tie なら埋め込み共有）。
 
-        確保の前に形と logits の要素数（`MAX_FORWARD_ELEMENTS`）・同時保持量を検証する。
+        確保の前に形と logits の要素数（`MAX_FORWARD_ELEMENTS`）・同時保持量を検証する。同時保持量は
+        呼び出し元が保持している隠れ状態・活性を含めて合算する: `source_shape=(B, L)`（`h` の元に
+        なった `hidden_states` の入力形状）と `with_mask`（そのマスクの有無）から
+        `forward_bytes(B, L, with_mask, with_logits=False)`（hidden_states が保持する量）を求め、
+        この呼び出しが作る logits のバイト数と足して `MAX_MODEL_MEMORY_BYTES` と比べる。
         """
         c = self.config
+        if len(source_shape) != 2 or not all(
+            isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in source_shape
+        ):
+            raise ValueError("source_shape must be (B, L) of positive ints")
         if h.ndim < 1 or h.shape[-1] != c.hidden_size or 0 in h.shape:
             raise ValueError("hidden states must be a non-empty [..., hidden_size] array")
         if not mx.issubdtype(h.dtype, mx.floating):
@@ -404,8 +416,8 @@ class Qwen2Model(nn.Module):
         rows = h.size // c.hidden_size
         if rows * c.vocab_size > MAX_FORWARD_ELEMENTS:
             raise LimitExceededError("logits would be too large for one projection")
-        params = sum(v.nbytes for _, v in tree_flatten(self.parameters()))
-        if params + rows * c.vocab_size * max(4, h.dtype.size) > MAX_MODEL_MEMORY_BYTES:
+        held = self.forward_bytes(*source_shape, with_mask, with_logits=False)
+        if held + rows * c.vocab_size * max(4, h.dtype.size) > MAX_MODEL_MEMORY_BYTES:
             raise LimitExceededError("projection would exceed the memory limit")
         if c.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(h)

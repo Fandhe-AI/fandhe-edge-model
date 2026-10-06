@@ -908,10 +908,10 @@ def test_project_and_hidden_states_share_forward_validation(
 
     _, model = ctx_model
     with pytest.raises(ValueError, match="hidden"):
-        model.project(mx.zeros((2, 5)))  # 幅が hidden_size ではない
+        model.project(mx.zeros((2, 5)), source_shape=(1, 2), with_mask=False)  # 幅が違う
     monkeypatch.setattr(qwen2_model, "MAX_FORWARD_ELEMENTS", 10)
     with pytest.raises(LimitExceededError):
-        model.project(mx.zeros((4, model.config.hidden_size)))
+        model.project(mx.zeros((4, model.config.hidden_size)), source_shape=(1, 4), with_mask=False)
     with pytest.raises(LimitExceededError):
         model(mx.zeros((1, 8), dtype=mx.int32))  # 全位置 logits は従来どおり拒否される
     monkeypatch.setattr(qwen2_model, "MAX_FORWARD_TOKENS", 4)
@@ -1270,3 +1270,37 @@ def test_budget_reached_is_recorded_when_exceeded_during_the_last_step(
     )  # fmt: skip
     assert result.iters_done == 3
     assert result.budget_reached is True
+
+
+def test_project_adds_the_callers_held_hidden_and_activation_bytes(
+    ctx_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: project は呼び出し元が保持する隠れ状態・活性を合算して判定する。
+
+    hidden_states 単独・logits 単独では上限内でも、合算で超える境界では project が拒否する。
+    実際の採点形状（K x 幅の hidden と必要位置の logits）では通る。
+    """
+    from tools.poc26.safe_io import LimitExceededError
+
+    ctx, model = ctx_model
+    c = model.config
+    k, n = 8, 600  # 大きめの hidden（source_shape）
+    held = model.forward_bytes(k, n, False, with_logits=False)
+    rows = 4000  # 必要位置の logits
+    logits_bytes = rows * c.vocab_size * 4
+    # 個別には通り、合算で超える上限（held < limit, logits_bytes + params < limit, 合計 > limit）
+    limit = held + logits_bytes - 1
+    params = model.forward_bytes(1, 1, False, with_logits=False)
+    assert limit > held
+    assert limit > params + logits_bytes
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", limit)
+    h = mx.zeros((rows, c.hidden_size))
+    with pytest.raises(LimitExceededError):
+        model.project(h, source_shape=(k, n), with_mask=False)
+    # 小さい source_shape（保持量が小さい）なら同じ logits でも通る
+    out = model.project(h, source_shape=(1, 8), with_mask=False)
+    assert out.shape == (rows, c.vocab_size)
+    # 実際の採点形状（chunk = K 件）は通る
+    monkeypatch.undo()
+    prompt = ctx.prompt_ids("shape check")
+    assert score_labels(model, prompt, ctx.label_ids, ctx.pad_id).shape == (len(ctx.label_ids),)

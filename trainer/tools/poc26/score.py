@@ -151,7 +151,7 @@ def score_chunk(
             owner.append(i)
     h = model.hidden_states(mx.array(seqs))
     hv = h.reshape(-1, h.shape[-1])[mx.array(np.array(pos, dtype=np.int32))]
-    logits = model.project(hv).astype(mx.float32)
+    logits = model.project(hv, source_shape=(k, width), with_mask=False).astype(mx.float32)
     ce = nn.losses.cross_entropy(logits, mx.array(np.array(tgt, dtype=np.int32)), reduction="none")
     mx.eval(ce)
     return -np.bincount(owner, weights=np.array(ce, dtype=np.float64), minlength=k)
