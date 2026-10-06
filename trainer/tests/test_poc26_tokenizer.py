@@ -346,6 +346,14 @@ def test_long_piece_merges_finish_quickly(tok: Qwen2Tokenizer) -> None:
     assert time.monotonic() - start < 10
 
 
+def test_long_pieces_are_not_cached(tok: Qwen2Tokenizer) -> None:
+    """REQ-39: 64 文字を超える piece は BPE キャッシュに格納しない（短い piece は格納する）。"""
+    tok.encode("a" * 65)
+    assert tok._cache == {}
+    tok.encode("a" * 64)
+    assert list(tok._cache) == ["a" * 64]
+
+
 def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:
     """REQ-39: 入力長上限を超えると拒否し、BPE キャッシュは上限件数で打ち止めになる。"""
     with pytest.raises(ValueError, match="too long"):

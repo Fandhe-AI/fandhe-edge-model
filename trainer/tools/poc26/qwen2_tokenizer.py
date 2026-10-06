@@ -42,8 +42,11 @@ from pathlib import Path
 MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 # encode の入力上限。PoC の入力は 1 件数文で、1 MiB 文字あれば十分余裕がある。
 MAX_ENCODE_CHARS = 1 << 20
-# BPE キャッシュの件数上限。超えたら格納しない（メモリを際限なく増やさない）。
-MAX_BPE_CACHE_ENTRIES = 100_000
+# BPE キャッシュの上限。短い piece（64 文字以下）だけを最大 20,000 件まで格納し、超えたら
+# 格納しない（長い piece は毎回計算する）。1 件は最悪でも key 約 300 B＋値のリスト約 2 KiB
+# （id の int は vocab 側の既存オブジェクトを共有）なので、総量は最悪で約 50 MB に収まる。
+MAX_BPE_CACHE_ENTRIES = 20_000
+MAX_CACHED_PIECE_CHARS = 64
 
 # Qwen2 の Split 正規表現（tokenizer.json の pre_tokenizer と一致を要求する定数）。
 SPLIT_REGEX = (
@@ -327,7 +330,7 @@ class Qwen2Tokenizer:
                 i = nxt[i]
         except KeyError as exc:
             raise ValueError("BPE result is not in vocab") from exc
-        if len(self._cache) < MAX_BPE_CACHE_ENTRIES:
+        if len(piece) <= MAX_CACHED_PIECE_CHARS and len(self._cache) < MAX_BPE_CACHE_ENTRIES:
             self._cache[piece] = ids
         return ids
 
