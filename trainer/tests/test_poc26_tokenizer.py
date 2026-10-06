@@ -241,6 +241,10 @@ def _mut_duplicate_content(d: dict) -> None:
     d["added_tokens"].append({"id": 265, "content": "<|im_end|>", "special": True})
 
 
+def _mut_vocab_token_too_long(d: dict) -> None:
+    d["model"]["vocab"]["a" * 1025] = 265
+
+
 def _mut_added_surrogate(d: dict) -> None:
     d["added_tokens"].append({"id": 265, "content": "x\ud800", "special": False})
 
@@ -279,6 +283,7 @@ def _mut_merges_type(d: dict) -> None:
         _mut_merges_type,
         _mut_merge_result_missing,
         _mut_special_false,
+        _mut_vocab_token_too_long,
         _mut_added_surrogate,
         _mut_added_too_long,
         _mut_duplicate_content,

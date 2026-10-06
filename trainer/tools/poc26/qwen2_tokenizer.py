@@ -53,6 +53,11 @@ MAX_DECODE_BYTES = 4 << 20
 # added_tokens の content の長さ上限（文字数）。実物の最長（`<|fim_suffix|>` 等の十数文字）に
 # 対して十分な余裕のある値。
 MAX_ADDED_CONTENT_CHARS = 256
+# vocab のキー（byte 表の文字列）の長さ上限。実物 Qwen2.5 の最長 token は数十文字程度で、
+# 1024 は十分に上回る。vocab は 1 文字が 1 バイトに戻るので 1 token は高々 1 KiB、added は
+# 256 文字×最大 4 バイトで高々 1 KiB となり、decode の 1 token 分の bytes は数 KB 以内に収まる
+# （MAX_DECODE_BYTES の判定前に作る bytes が巨大にならない）。
+MAX_VOCAB_TOKEN_CHARS = 1024
 # BPE キャッシュの上限。短い piece（64 文字以下）だけを最大 20,000 件まで格納し、超えたら
 # 格納しない（長い piece は毎回計算する）。1 件は最悪でも key 約 300 B＋値のリスト約 2 KiB
 # （id の int は vocab 側の既存オブジェクトを共有）なので、総量は最悪で約 50 MB に収まる。
@@ -217,6 +222,8 @@ class Qwen2Tokenizer:
         seen_ids: set[int] = set()
         for token, i in vocab.items():
             if not (isinstance(token, str) and _is_int(i) and 0 <= i < id_limit):
+                raise ValueError(_INVALID)
+            if len(token) > MAX_VOCAB_TOKEN_CHARS:
                 raise ValueError(_INVALID)
             if i in seen_ids or any(c not in u2b for c in token):
                 raise ValueError(_INVALID)
