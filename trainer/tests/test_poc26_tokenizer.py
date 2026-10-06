@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -213,6 +215,10 @@ def _mut_merge_result_missing(d: dict) -> None:
     d["model"]["merges"].append("a b")  # "ab" は vocab に無い
 
 
+def _mut_duplicate_content(d: dict) -> None:
+    d["added_tokens"].append({"id": 265, "content": "<|im_end|>", "special": True})
+
+
 def _mut_special_false(d: dict) -> None:
     d["added_tokens"][2]["special"] = False
 
@@ -243,6 +249,7 @@ def _mut_merges_type(d: dict) -> None:
         _mut_merges_type,
         _mut_merge_result_missing,
         _mut_special_false,
+        _mut_duplicate_content,
         _mut_special_missing,
     ],
 )
@@ -284,11 +291,59 @@ def test_decode_rejects_non_int_ids(tok: Qwen2Tokenizer) -> None:
             tok.decode([bad])  # type: ignore[list-item]
 
 
-def test_piece_length_limit(tok: Qwen2Tokenizer) -> None:
-    """REQ-39: 1 piece が 4096 文字を超えると BPE の二次処理量を避けて拒否する。"""
-    assert tok.encode("a" * 4096) == [97] * 4096
-    with pytest.raises(ValueError, match="piece is too long"):
-        tok.encode("a" * 4097)
+def _naive_bpe(tok: Qwen2Tokenizer, piece: str) -> list[int]:
+    """参照実装（オラクル）: 最小順位のペアを左から非重複で併合する素朴な BPE。"""
+    parts = [tok._b2u[b] for b in piece.encode("utf-8")]
+    while len(parts) > 1:
+        best = min(
+            range(len(parts) - 1),
+            key=lambda i: tok._ranks.get((parts[i], parts[i + 1]), len(tok._ranks)),
+        )
+        pair = (parts[best], parts[best + 1])
+        if pair not in tok._ranks:
+            break
+        merged: list[str] = []
+        i = 0
+        while i < len(parts):
+            if i < len(parts) - 1 and (parts[i], parts[i + 1]) == pair:
+                merged.append(parts[i] + parts[i + 1])
+                i += 2
+            else:
+                merged.append(parts[i])
+                i += 1
+        parts = merged
+    return [tok._vocab[p] for p in parts]
+
+
+def _random_texts() -> list[str]:
+    rng = random.Random(20261006)  # noqa: S311  # テスト用の seed 固定乱数
+    texts = ["a" * k for k in range(1, 20)] + ["ll" * k for k in range(1, 12)]
+    texts += ["hello" * k for k in range(1, 8)] + ["ell" * k for k in range(1, 8)]
+    for _ in range(400):
+        length = rng.randint(1, 40)
+        texts.append("".join(rng.choice("helo t\u00e9") for _ in range(length)))
+    return texts
+
+
+@pytest.mark.parametrize("extra_merge", [False, True])
+def test_heap_bpe_matches_naive_oracle(tmp_path: Path, extra_merge: bool) -> None:
+    """REQ-41: 優先度付きキューの BPE が素朴な参照実装と乱択入力で id 列まで一致する。"""
+    doc = _doc(tmp_path)
+    if extra_merge:  # 同順位の重なり（ll ll）を増やす
+        doc["model"]["vocab"]["llll"] = 265
+        doc["model"]["merges"].append("ll ll")
+    tok = Qwen2Tokenizer(doc)
+    for text in _random_texts():
+        expected = [i for piece in tok.pre_tokenize(text) for i in _naive_bpe(tok, piece)]
+        assert tok.encode(text) == expected, text
+
+
+def test_long_piece_merges_finish_quickly(tok: Qwen2Tokenizer) -> None:
+    """REQ-41: 1 piece 4 万文字超の連続併合が O(n log n) で数秒以内に終わる（緩い閾値）。"""
+    start = time.monotonic()
+    ids = tok.encode("hello" * 8000)
+    assert ids == [260] * 8000
+    assert time.monotonic() - start < 10
 
 
 def test_encode_length_limit_and_cache_cap(tok: Qwen2Tokenizer, monkeypatch) -> None:

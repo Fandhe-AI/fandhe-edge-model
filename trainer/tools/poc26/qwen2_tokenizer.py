@@ -30,6 +30,7 @@ HF `tokenizers` との既知の差:
 
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import re
@@ -43,10 +44,6 @@ MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 MAX_ENCODE_CHARS = 1 << 20
 # BPE キャッシュの件数上限。超えたら格納しない（メモリを際限なく増やさない）。
 MAX_BPE_CACHE_ENTRIES = 100_000
-# BPE 1 piece あたりの長さ上限（文字数）。
-# ponytail: 併合ごとに最小順位を線形探索するため最悪 O(n^2)。PoC の入力は短文なので上限で
-# 抑える。長文が要るなら優先度付きキュー（順位つきヒープ＋連結リスト）へ置き換える。
-MAX_PIECE_CHARS = 4096
 
 # Qwen2 の Split 正規表現（tokenizer.json の pre_tokenizer と一致を要求する定数）。
 SPLIT_REGEX = (
@@ -194,7 +191,8 @@ class Qwen2Tokenizer:
             raise ValueError(_INVALID)
 
         added_map: dict[int, str] = {}
-        special_contents: set[str] = set()
+        special_ids: dict[str, int] = {}
+        seen_contents: set[str] = set()
         for entry in added:
             if not isinstance(entry, dict):
                 raise ValueError(_INVALID)
@@ -203,9 +201,12 @@ class Qwen2Tokenizer:
                 raise ValueError(_INVALID)
             if i in seen_ids or i in added_map:
                 raise ValueError(_INVALID)
+            if content in seen_contents:  # content の重複は id の取り違えを招くため拒否
+                raise ValueError(_INVALID)
+            seen_contents.add(content)
             added_map[i] = content
             if entry.get("special") is True:
-                special_contents.add(content)
+                special_ids[content] = i
 
         ranks: dict[tuple[str, str], int] = {}
         for rank, merge in enumerate(raw_merges):
@@ -223,16 +224,12 @@ class Qwen2Tokenizer:
                 raise ValueError(_INVALID)
             ranks[(pair[0], pair[1])] = rank
 
-        by_content = {content: i for i, content in added_map.items()}
         # build_chat_ids が使う 3 件は special=true で存在することを要求する。
-        required = ("<|im_start|>", "<|im_end|>", "<|endoftext|>")
-        if not all(c in special_contents for c in required):
-            raise ValueError(_INVALID)
         try:
             self.special_ids = {
-                "im_start": by_content["<|im_start|>"],
-                "im_end": by_content["<|im_end|>"],
-                "endoftext": by_content["<|endoftext|>"],
+                "im_start": special_ids["<|im_start|>"],
+                "im_end": special_ids["<|im_end|>"],
+                "endoftext": special_ids["<|endoftext|>"],
             }
         except KeyError as exc:
             raise ValueError(_INVALID) from exc
@@ -284,32 +281,50 @@ class Qwen2Tokenizer:
         return pieces
 
     def _bpe(self, piece: str) -> list[int]:
+        """1 piece を BPE する。優先度付きキュー＋双方向リンクで O(n log n)。
+
+        順位が同じなら左側を先に併合する（「最小順位のペアを左から非重複で併合」と同じ結果）。
+        併合で変わったトークンは版番号を上げ、古いキュー項目を読み出し時に捨てる。
+        """
         cached = self._cache.get(piece)
         if cached is not None:
             return cached
-        if len(piece) > MAX_PIECE_CHARS:
-            raise ValueError("piece is too long")
         parts = [self._b2u[b] for b in piece.encode("utf-8")]
-        while len(parts) > 1:
-            best = min(
-                range(len(parts) - 1),
-                key=lambda i: self._ranks.get((parts[i], parts[i + 1]), len(self._ranks)),
-            )
-            pair = (parts[best], parts[best + 1])
-            if pair not in self._ranks:
-                break
-            merged: list[str] = []
-            i = 0
-            while i < len(parts):
-                if i < len(parts) - 1 and (parts[i], parts[i + 1]) == pair:
-                    merged.append(parts[i] + parts[i + 1])
-                    i += 2
-                else:
-                    merged.append(parts[i])
-                    i += 1
-            parts = merged
+        n = len(parts)
+        nxt = list(range(1, n + 1))
+        prev = list(range(-1, n - 1))
+        alive = [True] * n
+        ver = [0] * n
+        ranks = self._ranks
+        heap: list[tuple[int, int, int, int, int]] = []
+
+        def push(i: int, j: int) -> None:
+            rank = ranks.get((parts[i], parts[j]))
+            if rank is not None:
+                heapq.heappush(heap, (rank, i, j, ver[i], ver[j]))
+
+        for i in range(n - 1):
+            push(i, i + 1)
+        while heap:
+            _, i, j, vi, vj = heapq.heappop(heap)
+            if not (alive[i] and nxt[i] == j and ver[i] == vi and ver[j] == vj):
+                continue
+            parts[i] += parts[j]
+            ver[i] += 1
+            alive[j] = False
+            nxt[i] = nxt[j]
+            if nxt[j] < n:
+                prev[nxt[j]] = i
+            if prev[i] >= 0:
+                push(prev[i], i)
+            if nxt[i] < n:
+                push(i, nxt[i])
         try:
-            ids = [self._vocab[p] for p in parts]
+            ids: list[int] = []
+            i = 0
+            while i < n:
+                ids.append(self._vocab[parts[i]])
+                i = nxt[i]
         except KeyError as exc:
             raise ValueError("BPE result is not in vocab") from exc
         if len(self._cache) < MAX_BPE_CACHE_ENTRIES:
