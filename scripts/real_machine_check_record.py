@@ -2,7 +2,8 @@
 
 REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-38・REQ-39。特定の TASK には対応しない横断の
 確認ツール。REQ-38 のうち sandbox 下の通信 0 件の判定は対象外（`sandbox-monitor.sh` の担当）。
-本スクリプトは通信を起こさない側に倒す（cargo は `--locked`、A 以外の子には `CARGO_NET_OFFLINE`）。
+本スクリプトは通信を起こさない側に倒す（cargo は `--locked`、A 以外の子には `CARGO_NET_OFFLINE`、
+A を含む全ての子には rustup のツールチェーン自動取得を止める `RUSTUP_AUTO_INSTALL=0`。#375）。
 
 呼び出し元: `scripts/real-machine-check.sh`（引数検証・作業ディレクトリの用意の後に
 `python3 -I` で `run` を起動する）。製品（CLI・推論経路・配布物）には入らない検証用スクリプトで、
@@ -901,18 +902,38 @@ class Ctx:
     quiet_machine: bool
     repeat: int
     harness: bool
-    # A 以外の子へ渡す環境（CARGO_NET_OFFLINE=true。REQ-38）
+    # A 以外の子へ渡す環境（CARGO_NET_OFFLINE=true・RUSTUP_AUTO_INSTALL=0。REQ-38）
     offline_env: dict[str, str]
+    # A の `make ci` へ渡す環境（RUSTUP_AUTO_INSTALL=0 のみ。`--with-ci` の同意が覆う通信は許す）
+    ci_env: dict[str, str]
     # 開始時に記録した CLI の sha256（D が、リンクを確認した対象と同一かを照合する）
     cli_sha256: str | None = None
     # FANDHE_EDGE_BIN で CLI を差し替えたか（差し替えなら p95 は参考値に固定する）
     bin_override: bool = False
 
 
+# rustup プロキシ（~/.cargo/bin/cargo）は `rust-toolchain.toml` の指すツールチェーンが未導入だと
+# 自動取得して通信しうる。`CARGO_NET_OFFLINE` は cargo 自身の設定で rustup を止めないため、
+# 別に `RUSTUP_AUTO_INSTALL=0` を渡す（REQ-38・#375）。一次情報: rustup 1.29.1 の文言
+# 「you may opt out with RUSTUP_AUTO_INSTALL=0」・rust-lang/rustup#4836。`rustup set auto-install
+# disable` は settings.toml へ永続書き込みするため使わない。値は固定リテラルで、
+# 親の同名の変数は上書きする。
+RUSTUP_AUTO_INSTALL_ENV = "RUSTUP_AUTO_INSTALL"
+RUSTUP_AUTO_INSTALL_OFF = "0"
+
+
 def make_offline_env() -> dict[str, str]:
-    """現在の環境に `CARGO_NET_OFFLINE=true` を足したコピー（A の `make ci` には渡さない）。"""
+    """A 以外の子へ渡す環境。`CARGO_NET_OFFLINE=true` と `RUSTUP_AUTO_INSTALL=0` を足したコピー。"""
     env = dict(os.environ)
     env["CARGO_NET_OFFLINE"] = "true"
+    env[RUSTUP_AUTO_INSTALL_ENV] = RUSTUP_AUTO_INSTALL_OFF
+    return env
+
+
+def make_ci_env() -> dict[str, str]:
+    """A の `make ci` へ渡す環境。`RUSTUP_AUTO_INSTALL=0` だけを足す。"""
+    env = dict(os.environ)
+    env[RUSTUP_AUTO_INSTALL_ENV] = RUSTUP_AUTO_INSTALL_OFF
     return env
 
 
@@ -1415,7 +1436,10 @@ def judge_make_ci(counts: dict[str, Any]) -> str | None:
 
 
 def item_a(ctx: Ctx) -> dict[str, Any]:
-    """A: `make ci`。通信しうるため `--with-ci` のときだけ呼ばれる（offline 環境は渡さない）。"""
+    """A: `make ci`。通信しうるため `--with-ci` のときだけ呼ばれる。
+
+    `CARGO_NET_OFFLINE` は渡さず、ツールチェーンの自動取得だけ止める（#375）。
+    """
     d = ctx.work / "A"
     d.mkdir()
     r = run_cmd(
@@ -1426,6 +1450,7 @@ def item_a(ctx: Ctx) -> dict[str, Any]:
         TIMEOUT_MAKE_CI,
         CAP_LOG_STDOUT,
         CAP_LOG_STDERR,
+        ctx.ci_env,
     )
     if r.reason is not None:
         return fail_item(r.reason, exit_code=r.exit_code)
@@ -2710,6 +2735,7 @@ def _run(args: argparse.Namespace) -> int:
         repeat=args.repeat,
         harness=harness,
         offline_env=make_offline_env(),
+        ci_env=make_ci_env(),
     )
     ctx.bin_override = bool(args.bin_override)
     rec: dict[str, Any] = {

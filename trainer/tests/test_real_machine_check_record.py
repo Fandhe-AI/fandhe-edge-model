@@ -202,6 +202,7 @@ def _ctx(tmp_path: Path, cli: Path) -> Any:
         repeat=1,
         harness=True,
         offline_env={"CARGO_NET_OFFLINE": "true"},
+        ci_env={},
     )
 
 
@@ -4163,3 +4164,24 @@ def test_force_exit_is_70_even_when_stdout_pipe_is_closed() -> None:
     finally:
         os.close(w)
     assert proc.returncode == 70, proc.stderr
+
+
+def test_offline_env_disables_rustup_auto_install_even_if_parent_enables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-38・#375: 子の環境は RUSTUP_AUTO_INSTALL=0・CARGO_NET_OFFLINE=true（親の =1 を上書き）"""
+    monkeypatch.setenv("RUSTUP_AUTO_INSTALL", "1")
+    env = mod.make_offline_env()
+    assert env["RUSTUP_AUTO_INSTALL"] == "0"
+    assert env["CARGO_NET_OFFLINE"] == "true"
+
+
+def test_ci_env_disables_rustup_auto_install_without_cargo_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-38・#375: A の環境は RUSTUP_AUTO_INSTALL=0 だけを足し、CARGO_NET_OFFLINE は足さない。"""
+    monkeypatch.setenv("RUSTUP_AUTO_INSTALL", "1")
+    monkeypatch.delenv("CARGO_NET_OFFLINE", raising=False)
+    env = mod.make_ci_env()
+    assert env["RUSTUP_AUTO_INSTALL"] == "0"
+    assert "CARGO_NET_OFFLINE" not in env

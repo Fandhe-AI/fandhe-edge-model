@@ -46,6 +46,7 @@ here=$(basename "$PWD")
 echo "$stage $here" >> "$FAKE_DIR/cli.log"
 printf '%s\n' "$*" >> "$FAKE_DIR/cli.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cli.env"
+echo "${RUSTUP_AUTO_INSTALL:-unset}" >> "$FAKE_DIR/cli.rustup"
 [ "$stage" = register ] && cp definition.json "$FAKE_DIR/def-$here.json"
 SC='{"alpha":0.5,"beta":0.25,"gamma":0.25}'
 bad=${FAKE_BAD:-}
@@ -199,6 +200,7 @@ esac
 const FAKE_MAKE: &str = r##"#!/bin/sh
 echo "$*" >> "$FAKE_DIR/make.log"
 echo "$1 ${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/make.env"
+echo "$1 ${RUSTUP_AUTO_INSTALL:-unset}" >> "$FAKE_DIR/make.rustup"
 case "$1" in
 ci)
   mode=${FAKE_CI_MODE:-ok}
@@ -248,10 +250,21 @@ esac
 /// n 番目で n 回目の結果を決める。`-- --list` も回数に数えず、`FAKE_LIST_COUNT`（既定 12）件を出す
 /// （`FAKE_LIST_RC` で終了コードを変える）。
 /// `FAKE_CARGO_BUILD_SLEEP`（`build` で長く待つ。ビルド中の中断のテスト用）・
-/// `FAKE_CARGO_BUILD_FAIL`（`build` が失敗する）。
+/// `FAKE_CARGO_BUILD_FAIL`（`build` が失敗する）・
+/// `FAKE_TOOLCHAIN_MISSING`（rustup プロキシの代役。ツールチェーン未導入で、`RUSTUP_AUTO_INSTALL` が
+/// `0` 以外なら取得を試みた印 `rustup.download` を作り、`0` なら取得せず exit 1。REQ-38・#375）。
 const FAKE_CARGO: &str = r##"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DIR/cargo.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cargo.env"
+echo "${RUSTUP_AUTO_INSTALL:-unset}" >> "$FAKE_DIR/cargo.rustup"
+if [ -n "${FAKE_TOOLCHAIN_MISSING:-}" ]; then
+  if [ "${RUSTUP_AUTO_INSTALL:-}" != 0 ]; then
+    : > "$FAKE_DIR/rustup.download"
+    exit 0
+  fi
+  echo "error: toolchain 'stable' is not installed" >&2
+  exit 1
+fi
 if [ "$1" = build ]; then
   # FAKE_CARGO_BUILD_FAIL: ビルド失敗（スクリプト自身の実行不能 70 の経路）
   [ -n "${FAKE_CARGO_BUILD_FAIL:-}" ] && exit 1
@@ -978,6 +991,73 @@ fn req38_offline_env_is_passed_except_to_make_ci() {
     let cli_env = e.lines("cli.env");
     assert_eq!(cli_env.len(), 7);
     assert!(cli_env.iter().all(|l| l == "true"));
+}
+
+/// REQ-38・#375: rustup の自動取得を止める `RUSTUP_AUTO_INSTALL=0` が、A の `make ci` を含む
+/// 全ての子（make・cargo・CLI）へ届く。A には `CARGO_NET_OFFLINE` を渡さないまま。
+#[test]
+fn req38_rustup_auto_install_is_disabled_for_every_child() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(
+            &e,
+            &["--items", "A,B,C,D,E,F", "--repeat", "1", "--with-ci"],
+        ),
+        &[],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.lines("make.env")[0], "ci unset");
+    assert_eq!(e.lines("make.rustup"), ["ci 0", "check-runtime-linkage 0"]);
+    let cargo = e.lines("cargo.rustup");
+    assert!(!cargo.is_empty());
+    assert!(cargo.iter().all(|l| l == "0"), "{cargo:?}");
+    let cli = e.lines("cli.rustup");
+    assert!(!cli.is_empty());
+    assert!(cli.iter().all(|l| l == "0"), "{cli:?}");
+}
+
+/// REQ-38・#375: 親が `RUSTUP_AUTO_INSTALL=1` を渡しても、子には `0` が届く。
+#[test]
+fn req38_parent_rustup_auto_install_is_overridden() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "A,D,F", "--repeat", "1", "--with-ci"]),
+        &[("RUSTUP_AUTO_INSTALL", "1")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.lines("make.rustup"), ["ci 0", "check-runtime-linkage 0"]);
+    assert!(e.lines("cargo.rustup").iter().all(|l| l == "0"));
+}
+
+/// REQ-38・#375: ツールチェーンが無くても取得は試みられず（`rustup.download` が作られない）、
+/// 失敗は成功を装わず既存の分類（CLI ビルド失敗は exit 70）で見える。
+#[test]
+fn req38_missing_toolchain_does_not_download() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "D"]),
+        &[("FANDHE_EDGE_BIN", ""), ("FAKE_TOOLCHAIN_MISSING", "1")],
+    );
+    assert_eq!(o.code, Some(70), "{}", o.diag());
+    assert!(!e.dir.join("rustup.download").exists());
+    assert_eq!(
+        o.stdout,
+        "{\"code\":\"runtime_error\",\"message\":\"cannot build the CLI\"}\n",
+        "{}",
+        o.diag()
+    );
+
+    // F でも取得は試みられず、record と stdout に rustup の語（環境変数名を含む）が出ない（スキーマ不変）
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "F", "--repeat", "1"]),
+        &[("FAKE_TOOLCHAIN_MISSING", "1")],
+    );
+    assert!(!e.dir.join("rustup.download").exists());
+    let rec = fs::read_to_string(e.work.join("record.json")).unwrap_or_default();
+    assert!(!rec.contains("RUSTUP"), "{}", o.diag());
+    assert!(!rec.contains("rustup"), "{}", o.diag());
+    assert!(!o.stdout.contains("RUSTUP"), "{}", o.diag());
 }
 
 /// security.md: 記録・stdout に、作業ディレクトリのパス・データ本文・id の値が現れない。

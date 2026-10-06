@@ -46,6 +46,8 @@
 #     パスは書かない。進行状況は stderr へ出す。record にはパス・データ本文・stderr の内容を書かない
 #   - 子プロセスには上限時間と出力サイズ上限を設ける（REQ-39。値は real_machine_check_record.py の定数）。
 #     A 以外の子プロセスには CARGO_NET_OFFLINE=true を渡し、cargo は --locked で起動する（REQ-38）。
+#     rustup のツールチェーン自動取得（通信）を止めるため、A を含む全ての子に RUSTUP_AUTO_INSTALL=0 も渡す
+#     （CARGO_NET_OFFLINE は rustup を止めない。A には CARGO_NET_OFFLINE を渡さない。#375）。
 #     全体の上限時間（--overall-timeout-sec）も同様に設ける。上限超過は stdout が固定 JSON
 #     `overall time limit exceeded`・exit 10（終了時の再採取と記録の書き出しは上限の外で行う）。
 #     環境採取（git・sysctl・sw_vers・otool）は固定の絶対パスと最小の環境で起動し、PATH・GIT_* を引き継がない（REQ-38・REQ-39）。
