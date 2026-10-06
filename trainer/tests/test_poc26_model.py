@@ -566,3 +566,19 @@ def test_config_huge_int_is_value_error(model_dir: Path, field: str) -> None:
     cfg.write_text(text)
     with pytest.raises(ValueError, match=f"invalid config field: {field}"):
         load_qwen2(model_dir, dtype=mx.float32)
+
+
+def test_wide_integer_values_not_truncated(model_dir: Path) -> None:
+    """REQ-39: uint64 / int64 の巨大値・負数は縮小変換で化けず、元の dtype のまま拒否する。"""
+    m = load_qwen2(model_dir, dtype=mx.float32)
+    big = (1 << 32) + 1
+    ids = mx.array([[1, 2, 3]])
+    with pytest.raises(ValueError, match="0 or 1"):
+        m(ids, mx.array([[1, 1, big]], dtype=mx.uint64))
+    with pytest.raises(ValueError, match="0 or 1"):
+        m(ids, mx.array([[1, 1, -(1 << 40)]], dtype=mx.int64))
+    with pytest.raises(ValueError, match="out of range"):
+        m(mx.array([[1, 2, big]], dtype=mx.uint64))
+    with pytest.raises(ValueError, match="out of range"):
+        m(mx.array([[1, 2, -(1 << 40)]], dtype=mx.int64))
+    m(mx.array([[1, 2, 3]], dtype=mx.uint64), mx.array([[1, 1, 0]], dtype=mx.uint64))

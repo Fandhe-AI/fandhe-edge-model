@@ -283,9 +283,10 @@ class Qwen2Model(nn.Module):
             am = attention_mask
             if am.dtype != mx.bool_ and not mx.issubdtype(am.dtype, mx.integer):
                 raise ValueError("attention_mask must be bool or integer")
-            am = am.astype(mx.int32)
+            # 値域は縮小変換の前に元の dtype で検査する（uint64 の巨大値が 1 に化けない）。
             if mx.min(am).item() < 0 or mx.max(am).item() > 1:
                 raise ValueError("attention_mask values must be 0 or 1")
+            am = am.astype(mx.int32)
             if mx.min(am[:, 0]).item() != 1:
                 raise ValueError(
                     "attention_mask rows must start with a real token (right pad only)"
