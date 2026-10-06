@@ -2125,3 +2125,248 @@ fn req39_item_f_counts_each_failure_kind() {
         assert_eq!(e.q(&format!("items.F.{key}")), "1", "{mode}");
     }
 }
+
+// ---- #364: 子プロセスの環境・全体の上限時間・ARGS・--work-dir の末尾スラッシュ ----
+
+const OVERALL_MSG: &str = "--overall-timeout-sec must be an integer from 1 to 86400";
+const OVERALL_EXCEEDED: &str = "{\"code\":\"judged_fail\",\"message\":\"overall time limit exceeded\",\"record\":\"record.json\"}\n";
+
+/// `assert_rejected_before_start` の cwd 指定版（パス名展開の対象になるファイルがある cwd で確かめる）。
+fn assert_rejected_in(e: &Env, args: &[String], cwd: &Path, message: &str) {
+    let o = e.run_cwd(args, &[], Some(cwd));
+    assert_eq!(o.code, Some(64), "args={args:?} {}", o.diag());
+    assert_eq!(
+        o.stdout,
+        format!("{INVALID}{message}\"}}\n"),
+        "args={args:?}"
+    );
+    for log in ["make.log", "cargo.args", "cli.log"] {
+        assert!(e.lines(log).is_empty(), "{log} was written for {args:?}");
+    }
+    assert!(!e.work.exists(), "work dir created for {args:?}");
+}
+
+/// REQ-39・#364: `--items` のパス名展開の文字（`*`・`?`・`[B]`）は、cwd に `B`・`C` という名のファイルが
+/// あっても、そのファイル名に化けて検証を通らず、起動前に 64 になる（作業ディレクトリも作られない）。
+#[test]
+fn req39_items_glob_characters_do_not_expand_to_file_names() {
+    for bad in ["*", "?", "[B]", "B,*", "B-C"] {
+        let e = Env::new();
+        let cwd = e.dir.join("globdir");
+        fs::create_dir_all(&cwd).expect("mkdir");
+        fs::write(cwd.join("B"), "x").expect("write");
+        fs::write(cwd.join("C"), "x").expect("write");
+        assert_rejected_in(&e, &with_work(&e, &["--items", bad]), &cwd, ITEMS_MSG);
+    }
+}
+
+/// REQ-39・#364: `--work-dir` が symlink なら、末尾の `/`・`//`・`/.`・`/./` を付けても拒否される。
+/// 実ディレクトリの末尾スラッシュは通る。
+#[test]
+fn req39_work_dir_symlink_is_rejected_with_trailing_slash_forms() {
+    for suffix in ["/", "//", "/.", "/./"] {
+        let e = Env::new();
+        let real = e.dir.join("real-empty");
+        fs::create_dir_all(&real).expect("mkdir");
+        let link = e.dir.join("link-work");
+        symlink(&real, &link).expect("symlink");
+        let arg = format!("{}{suffix}", link.display());
+        let o = e.run(&s(&["--work-dir", &arg]), &[]);
+        assert_eq!(o.code, Some(64), "{suffix}: {}", o.diag());
+        assert_eq!(
+            o.stdout,
+            format!("{INVALID}work directory is not a directory\"}}\n"),
+            "{suffix}"
+        );
+        assert!(e.lines("cli.log").is_empty(), "{suffix}");
+    }
+    let e = Env::new();
+    let real = e.dir.join("real-empty");
+    fs::create_dir_all(&real).expect("mkdir");
+    let arg = format!("{}/", real.display());
+    let o = e.run(&s(&["--work-dir", &arg, "--items", "B"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert!(real.join("record.json").is_file());
+}
+
+/// REQ-39・#364: `--overall-timeout-sec` の範囲外・形の誤りは起動前に 64（固定メッセージ）。
+#[test]
+fn req39_overall_timeout_out_of_range_is_rejected_before_start() {
+    for bad in ["0", "86401", "01", "abc", "123456", "-1", ""] {
+        let e = Env::new();
+        assert_rejected_before_start(
+            &e,
+            &with_work(&e, &["--overall-timeout-sec", bad]),
+            &[],
+            OVERALL_MSG,
+        );
+    }
+    let e = Env::new();
+    assert_rejected_before_start(
+        &e,
+        &with_work(&e, &["--overall-timeout-sec=0"]),
+        &[],
+        OVERALL_MSG,
+    );
+    let e = Env::new();
+    assert_rejected_before_start(
+        &e,
+        &with_work(
+            &e,
+            &["--overall-timeout-sec", "5", "--overall-timeout-sec", "6"],
+        ),
+        &[],
+        "duplicate option",
+    );
+    // 範囲の端（86400）は通り、記録へ入る
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B", "--overall-timeout-sec=86400"]),
+        &[],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("options.overall_timeout_sec"), "86400");
+}
+
+/// REQ-39・#364: 既定の全体の上限時間（14400 秒）が記録される。
+#[test]
+fn req39_default_overall_timeout_is_recorded() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("options.overall_timeout_sec"), "14400");
+}
+
+/// REQ-39・#364: 全体の上限時間を超えたら子のグループを止め、実行中の項目は failed、残りは not_run
+/// （reason は `overall_timeout`）で record を書き、exit 10 と固定メッセージを返す。子は残らない。
+#[test]
+fn req39_overall_timeout_stops_running_item_and_marks_rest_not_run() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "D,F", "--overall-timeout-sec", "5"]),
+        &[("FAKE_MAKE_SLEEP", "1")],
+    );
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(o.stdout, OVERALL_EXCEEDED, "stderr={}", o.stderr);
+    assert_eq!(e.q("options.overall_timeout_sec"), "5");
+    assert_eq!(e.q("items.D.status"), "\"failed\"");
+    assert_eq!(e.q("items.D.reason"), "\"overall_timeout\"");
+    assert_eq!(e.q("items.F.status"), "\"not_run\"");
+    assert_eq!(e.q("items.F.reason"), "\"overall_timeout\"");
+    assert!(e.lines("cargo.args").is_empty());
+    assert!(e.text("record.md").contains("上限時間"));
+    assert_pids_gone(&e, &["make.pid", "make.cpid"]);
+}
+
+/// REQ-38・REQ-39・#364: 環境採取の `git`・`sysctl`・`sw_vers` は PATH を探さず固定パスで起動され、
+/// 親の `GIT_DIR`・`GIT_WORK_TREE` も届かない。PATH の先頭に囮を置き、`GIT_*` を存在しない場所へ向けても、
+/// `environment.commit` は環境を空にした固定パスの git で取った HEAD と一致し、囮は起動されない。
+#[test]
+fn req38_probe_commands_ignore_path_and_git_env() {
+    let e = Env::new();
+    let decoy = e.dir.join("decoy");
+    fs::create_dir_all(&decoy).expect("mkdir");
+    let body = "#!/bin/sh\necho \"$0\" >> \"$FAKE_DIR/decoy.log\"\necho 0000000000000000000000000000000000000000\n";
+    for name in ["git", "sysctl", "sw_vers", "otool"] {
+        write_exe(&decoy.join(name), body);
+    }
+    let path = format!(
+        "{}:{}",
+        decoy.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let nowhere = e.dir.join("no-such-git-dir").display().to_string();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[
+            ("PATH", &path),
+            ("GIT_DIR", &nowhere),
+            ("GIT_WORK_TREE", &nowhere),
+        ],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    let head = Command::new("/usr/bin/git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse");
+    let head = String::from_utf8(head.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string();
+    assert_eq!(head.len(), 40, "{head}");
+    assert_eq!(e.q("environment.commit"), format!("\"{head}\""));
+    assert!(e.lines("decoy.log").is_empty(), "decoy was started");
+}
+
+/// REQ-39・#364: `make real-machine-check` は環境変数の `ARGS` を拾わず（スクリプトを起動せず非 0 終了）、
+/// コマンドラインの `ARGS` はパス名展開されない（`[5]` が `5` というファイルに化けない）。
+/// 正しい経路（`ARGS=--help`）は通る。雛形は一時ディレクトリに作り、リポジトリへは何も書かない。
+#[test]
+fn req39_make_target_rejects_env_args_and_stops_glob_expansion() {
+    let e = Env::new();
+    let tmpl = e.dir.join("tmpl");
+    fs::create_dir_all(tmpl.join("crates").join("x")).expect("mkdir");
+    fs::write(tmpl.join("Cargo.toml"), "").expect("write");
+    fs::write(tmpl.join("crates").join("x").join("Cargo.toml"), "").expect("write");
+    fs::write(tmpl.join("5"), "x").expect("write");
+    symlink(repo_root().join("scripts"), tmpl.join("scripts")).expect("symlink");
+    let makefile = repo_root().join("Makefile");
+    let make = |args: &[&str], env_args: Option<&str>| {
+        let mut cmd = Command::new("make");
+        cmd.arg("-s")
+            .arg("-C")
+            .arg(&tmpl)
+            .arg("-f")
+            .arg(&makefile)
+            .arg("real-machine-check")
+            .args(args)
+            .env_remove("MAKEFLAGS")
+            .env_remove("MFLAGS")
+            .env_remove("MAKELEVEL")
+            .env_remove("ARGS")
+            .env("FAKE_DIR", &e.dir)
+            .env("FAKE_CLI_PATH", &e.cli)
+            .env("FANDHE_EDGE_BIN", &e.cli)
+            .env("FANDHE_EDGE_MAKE_CMD", &e.make)
+            .env("FANDHE_EDGE_CARGO_CMD", &e.cargo)
+            .stdin(Stdio::null());
+        if let Some(v) = env_args {
+            cmd.env("ARGS", v);
+        }
+        cmd.output().expect("make")
+    };
+    let work = e.work.display().to_string();
+
+    // 環境変数だけの ARGS: スクリプトを起動せず非 0 終了（作業ディレクトリも作られない）
+    let o = make(&[], Some("--help"));
+    assert!(!o.status.success());
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&o.stderr)
+            .contains("ARGS must be given on the make command line, not through the environment")
+    );
+    let o = make(&[], Some(&format!("--work-dir {work}")));
+    assert!(!o.status.success());
+    assert!(!e.work.exists());
+
+    // コマンドラインの ARGS: `[5]` はパス名展開されず --repeat の検証で 64 になる
+    let args = format!("ARGS=--work-dir {work} --repeat [5]");
+    let o = make(&[&args], None);
+    assert!(!o.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        format!("{INVALID}{REPEAT_MSG}\"}}\n")
+    );
+    assert!(!e.work.exists());
+
+    // 正しい経路は通る
+    let o = make(&["ARGS=--help"], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("{\"code\":\"ok\",\"message\":\"usage:")
+    );
+}

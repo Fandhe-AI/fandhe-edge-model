@@ -24,7 +24,7 @@ PC を変えても同じ手順で main の動作確認（項目 A〜F）を再�
 ### 3-1. コマンドラインの形式
 
 ```bash
-make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N]"
+make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]"
 ```
 
 または、スクリプトを直接実行する場合：
@@ -35,17 +35,18 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 
 ### 3-2. 引数
 
-値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
+値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes` / `--overall-timeout-sec`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
 
 | 引数 | 説明 | 既定値 / 必須 |
 | ---- | ---- | ---------- |
-| `--work-dir DIR` | 作業と記録の置き場。存在しないか空であること。**作業ディレクトリがリポジトリ自身・その配下・その祖先のどれかなら拒否される。symlink・非ディレクトリ・空でないディレクトリも拒否される**（物理パスへ正規化して比較） | 必須 |
-| `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可）。E は B の成果物を使うため B と一緒に指定する（B なしの E は引数エラー〔exit 64。何も実行しない〕。#362） | `B,C,D,E,F`（A は既定では含まない） |
+| `--work-dir DIR` | 作業と記録の置き場。存在しないか空であること。**作業ディレクトリがリポジトリ自身・その配下・その祖先のどれかなら拒否される。symlink・非ディレクトリ・空でないディレクトリも拒否される**（物理パスへ正規化して比較。末尾の `/`・`/.` は判定の前に取り除くため、`link/` や `link/.` でも symlink は拒否される。#364） | 必須 |
+| `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可）。E は B の成果物を使うため B と一緒に指定する（B なしの E は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`F` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364） | `B,C,D,E,F`（A は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
 | `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
 | `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒）。1 以上 3600000000 以下の整数（上限は定義ファイルの `limits.max_infer_p95_us` の上限と同じ。REQ-31）。範囲外は CLI・make・cargo を起動する前に引数エラー（exit 64） | 50000 |
-| `--package-limit-bytes N` | C-2 の容量上限（バイト） | 1000 |
+| `--package-limit-bytes N` | C-2 の容量上限（バイト）。1 以上 999999999999999（15 桁）以下の整数（桁あふれを避けるための上限。シェルと Python が同じ値で検査する）。範囲外は引数エラー（exit 64） | 1000 |
+| `--overall-timeout-sec N` | 実行全体の上限時間（秒。入力の採取・CLI のビルド・開始時の環境採取を含み、終了時の再採取と記録の書き出しは含まない）。1 以上 86400 以下の整数。範囲外は引数エラー（exit 64）。契約に定めのない暫定値（自分で決めた点。REQ-39）。超えたら §5 のとおり打ち切る。`--repeat` を大きくする場合は併せて上げる | 14400（4 時間） |
 | `--help` | 使い方を JSON 1 行（`{"code":"ok","message":"usage: ..."}` の形）で stdout へ出して exit 0 | — |
 
 **A を実行する場合の注意**: `--items` に `A` を含めても、`--with-ci` が無ければ以下の JSON を出して exit 64（`invalid_input`）で停止します。実行順は常に A→F です。
@@ -54,7 +55,7 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 {"code":"invalid_input","message":"<固定メッセージ>"}
 ```
 
-**`make real-machine-check ARGS=...` の制約**: シェルが `$(ARGS)` を単語分割するため、パスなど空白を含む値は渡せません。その場合はスクリプトを直接実行してください：
+**`make real-machine-check ARGS=...` の制約**: シェルが `$(ARGS)` を単語分割するため、パスなど空白を含む値は渡せません。`ARGS` は **make のコマンドラインで渡した値だけ**を受け付けます（環境変数の `ARGS` は拾わず、スクリプトを起動せず固定のエラーで非 0 終了します。#364）。レシピは `set -f` でパス名展開を止めてから起動します（止まるのはパス名展開だけで、変数展開・コマンド置換は残るため、`ARGS` には自分で書いたリテラル値だけを渡してください）。空白を含む値はスクリプトを直接実行してください：
 
 ```bash
 scripts/real-machine-check.sh --work-dir '/path with space' ...
@@ -89,10 +90,13 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 | `cargo build --locked`（FANDHE_EDGE_BIN 未設定時） | 1800 秒 | 64 MiB | 64 MiB | ビルド（オフラインモード。REQ-38） |
 | `cargo test --locked ... --no-run`（F の事前ビルド） | 1800 秒 | 64 MiB | 64 MiB | F（オフラインモード。REQ-38） |
 | `otool -L`・`git` コマンド・環境採取 | 30 秒 | 64 KiB | 64 KiB | 環境情報 |
+| 実行全体（`--overall-timeout-sec`） | 既定 14400 秒 | — | — | 全項目の合計。超過は §5 |
 | 入力ファイル（定義・学習・評価） | — | 16 MiB | — | 読み込み前に確認 |
 | CLI バイナリの sha256 計算 | — | 1 GiB | — | 計算時に確認（超過は計算せず `null`） |
 | パッケージファイル個別（model.onnx・vocab.json 等） | — | 256 MiB | — | sha256 計算時に確認 |
 | E の推論件数 | — | 1000 件 | — | `train.jsonl` 件数上限 |
+
+**環境採取の子（`git`・`sysctl`・`sw_vers`・`otool`）**は、`PATH` を探さず固定の絶対パス（macOS は `/usr/bin/git`・`/usr/sbin/sysctl`・`/usr/bin/sw_vers`・`/usr/bin/otool`。Linux のテストハーネスは `/usr/bin/git` か `/bin/git` だけで、実機の証拠にならない）で起動し、最小の環境（`PATH` 固定・`LC_ALL=C`・親にあるときだけ `HOME`）だけを渡します。親の `GIT_DIR`・`GIT_WORK_TREE`・`DEVELOPER_DIR` 等は届かないため、`PATH` の先頭の同名の実行ファイルや環境変数で、別物・別リポジトリの値が `commit`・機種・OS・直接リンクの欄に入ることはありません（#364）。`HOME` を残すのは、利用者のグローバル設定（`safe.directory` 等）が効かないと所有者の違うチェックアウトで `commit` が取れなくなるためです。固定パスに無い場合は「使えない」として扱い、`PATH` へは戻りません（`git` が無ければ `commit`・`worktree_clean` が `null` → `stable` が `null` → exit 10。`sysctl`・`sw_vers` が無ければ該当欄が `null`。macOS で `otool` が無ければ D は `failed` / `otool_failed`）。`make`・`cargo`・`python3` は利用者のツールチェーンで場所が決まるため `PATH` のままです。
 
 スクリプトと `check-runtime-linkage.sh` が自分で起動する `cargo` は、すべて `--locked`（`Cargo.lock` を暗黙に更新しない）。A の `make ci` は make の中の cargo であり、スクリプトは `--locked` を付けない。
 
@@ -272,7 +276,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 終了コード | 意味 | 行動 |
 | -------- | ---- | ---- |
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
-| 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
+| 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、実行全体の上限時間（`--overall-timeout-sec`）を超えた（stdout の `message` は `overall time limit exceeded`。実行中の項目は `failed`・残りは `not_run`〔`reason` は `overall_timeout`〕。子のグループは止めて回収する。終了時の再採取と記録の書き出しは上限の外で行うため、全体の所要は上限 ＋ 再採取〔最大 60 秒〕＋ 回収待ち〔10 秒〕で頭打ちになる。#364）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
 | 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
 | 70 | 実行環境エラー・中断 | python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
@@ -282,6 +286,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 2. 各項目の実行：
    - 要求されていない → `not_run` / `not_selected`
    - 中断済み → `not_run` / `interrupted`（前の項目が `failed` の場合よりも優先する）
+   - 全体の上限時間の超過済み → `not_run` / `overall_timeout`（`interrupted` の次、`previous_item_failed` より優先）。実行中に超えた項目は `failed` / `overall_timeout`。終了コードは中断（70）が内部エラー（70）より、内部エラーが上限超過（10）より優先する
    - 前の項目が `failed` → `not_run` / `previous_item_failed`（B の失敗で止まった E もこれ）
    - それ以外 → 実行して結果を記録
 3. 最初に `failed` になった項目があれば、以降の要求項目は実行されず `not_run` になる（`not_run` の `reason` は §8）
@@ -408,6 +413,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
     "quiet_machine": "true | false",
     "p95_limit_us": "int",
     "package_limit_bytes": "int",
+    "overall_timeout_sec": "int (実行全体の上限時間。#364)",
     "with_ci": "true | false",
     "cargo_offline": "true | false (A を含まなければ true)"
   },
@@ -425,6 +431,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
 - `interrupted`: 実行中（項目の開始前を含む）に SIGINT・SIGTERM・SIGHUP で中断。前の項目が `failed` で止まった後に中断を受けた場合も、未実行の項目はこの値になる（`previous_item_failed` より優先）
+- `overall_timeout`: 実行全体の上限時間（`options.overall_timeout_sec`）を超えた（`failed` の項目の `reason` にも使う）。`record.md` に注意行が出る（#364）
 
 ### 終了時の環境の再採取（#360）
 

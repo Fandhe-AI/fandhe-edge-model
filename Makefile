@@ -299,12 +299,23 @@ endif
 
 # Mac 実機での動作確認 A〜F（`ci` には含めない。引数は `make real-machine-check ARGS='--work-dir DIR ...'`。
 # 値に空白を含むパスは渡せない。A（make ci）は `--with-ci` が無ければ実行しない。
-# `ARGS` には自分で書いたリテラル値だけを渡す（信頼できない文字列から組み立てない。シェルが展開する）。
+# `ARGS` はコマンドラインで渡した値だけを受け付ける（`$(origin ARGS)` が command line のとき）。環境変数の
+# `ARGS` は拾わず、スクリプトを起動せずエラーにする（意図しない引数の混入を防ぐ。fail-closed。REQ-39・#364）。
+# レシピは `set -f` でパス名展開を止めてから起動する（`--items '*'` や `[5]` がカレントのファイル名に
+# 化けない）。止まるのはパス名展開だけで、変数展開・コマンド置換は残るため、`ARGS` には自分で書いた
+# リテラル値だけを渡す（信頼できない文字列から組み立てない）。
 # 人が実行する確認なので、前提が欠けていれば `skip:` で成功扱いにせず、エラーで非 0 終了する）
 .PHONY: real-machine-check
 real-machine-check: ## Mac 実機での動作確認 A〜F（ARGS='--work-dir DIR [--items B,C,D,E,F] ...'。ci には含めない）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	sh scripts/real-machine-check.sh $(ARGS)
+ifeq ($(origin ARGS),command line)
+	set -f; sh scripts/real-machine-check.sh $(ARGS)
+else ifeq ($(origin ARGS),undefined)
+	set -f; sh scripts/real-machine-check.sh
+else
+	@echo "error: ARGS must be given on the make command line, not through the environment" >&2
+	@exit 1
+endif
 else
 	@echo "error: Cargo.toml または workspace のメンバー crate が無く real-machine-check の対象が欠けている（fail-closed）" >&2
 	@exit 1
