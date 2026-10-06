@@ -21,7 +21,7 @@
 | 損失 | pad 以外の全 token の cross_entropy 平均（prompt もマスクしない）。float32 | P4（`mask_prompt=False`） |
 | dtype | 重みは bf16 のまま読む。LoRA・loss・対数尤度は float32。`--dtype float32` で全体を float32 に昇格 | mlx-lm と同じ。CPU で bf16 が動かない場合・決定性確認用 |
 | seed | `random`・`numpy`・`mlx` の 3 系統。必須引数 | REQ-26 |
-| 学習の壁時計予算 | `--max-wall-seconds`（既定 3600 = 事前登録 4 節の 1 時間。上限 86400）。**学習ループだけ**に適用し、到達したら学習を打ち切って adapter を保存し、`run.json` に `budget_reached: true`・実施 iters（`iters_done`）を記録して validation 採点へ進む（「予算到達は記録してその時点の最良で評価する」） | 事前登録 4 節。時間はコマンド開始（読み込みを含む）からで、1 ステップ以上は必ず行う。予算で打ち切った実行は決定的な再現の対象外。実機の CPU 決定性確認（6.4）では `--max-wall-seconds` を延ばして打ち切りを避ける |
+| 学習の壁時計予算 | `--max-wall-seconds`（既定 3600 = 事前登録 4 節の 1 時間。上限 86400）。**学習ループだけ**に適用し、到達したら学習を打ち切って adapter を保存し、`run.json` に `budget_reached: true`・実施 iters（`iters_done`）を記録して validation 採点へ進む（「予算到達は記録してその時点の最良で評価する」） | 事前登録 4 節。時間は**学習ループ開始時**から数える（データ・モデルの読み込みやトークナイズの時間は含めない。採点の上限は採点開始時から別に数える）。1 ステップ以上は必ず行う。予算で打ち切った実行は決定的な再現の対象外。実機の CPU 決定性確認（6.4）では `--max-wall-seconds` を延ばして打ち切りを避ける |
 | 資源上限（停止） | メモリ: RSS と MLX のピーク確保量（`mx.get_peak_memory()`）の大きい方が 8 GiB（`limits.MAX_TRAIN_RSS_BYTES`）を超えたら停止（ステップ・レコードの境界で確認。1 回の forward / backward の途中では止められない）。コマンド全体の壁時計 24 時間の天井。採点（train の validation 採点・predict・probe の forward）の壁時計上限 `--max-score-seconds`（既定 3600。上限 86400）は学習とは別枠で、到達は停止（20）。モデル読み込みは 1 回の処理なので壁時計上限の対象外。事前見積もり: 学習は batch_size x max_seq_length x vocab ≤ 5e8 要素（backward の保持を forward の約 3 倍と**推定**して 2 GB x 3 = 6 GB < 8 GiB。係数は実測ではない）、採点は 1 件の K x 系列長 ≤ 2^20 token。超過は終了コード 20。採点は K を 8 件ずつに分けて forward する（合算は分割に依らない） | REQ-39 |
 
 ## 3. 採点（P4 からの意図的な変更）
@@ -114,13 +114,15 @@ for case in ours["cases"]:
     cases.append(
         {"text": case["text"], "ids": ids, "last_logits_f32_b64": base64.b64encode(raw).decode()}
     )
-json.dump({"evidence": "real_machine", "cases": cases}, open(out_path, "w", encoding="utf-8"))
+doc = {"evidence": "real_machine", "vocab_size": int(logits.shape[0]), "cases": cases}
+json.dump(doc, open(out_path, "w", encoding="utf-8"))
 ```
 
 ```bash
 lora_poc compare-probe <work>/probe_ours.json <work>/probe_ref.json --atol 1e-3
 ```
 
+- 参照側の JSON には `vocab_size`（logits の長さ）も書く（上のスニペット）。`compare-probe` は両側の `vocab_size` が存在し一致することを要求し、不一致・欠落は入力の不整合として終了コード 64（モデル出力の差ではないので judged_fail の 10 にはしない）。
 - 合格条件: 終了コード 0（`status` が `match`）。すなわち token id が全 case で完全一致・logits の最大絶対差が 1e-3 以下・argmax が全 case で一致（両側 float32。bf16 同士なら `--atol 5e-2`）。
 - 不合格（終了コード 10）なら、`id_mismatches` > 0 はトークナイザー、`logits_mismatches` > 0 は forward を疑い、`golden` 手順書と同様に原因を特定する。許容差を広げて通さない。
 

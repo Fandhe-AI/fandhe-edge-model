@@ -134,6 +134,7 @@ def train_loop(
     rng = np.random.default_rng(seed)
     opt = optim.Adam(learning_rate=lr)
     step_fn = nn.value_and_grad(model, batch_loss)
+    budget.begin_phase()  # 学習予算は学習ループ開始時から数える（事前処理を含めない）
     model.train()
     order: list[int] = []
     loss_value = float("nan")
@@ -211,7 +212,7 @@ def cmd_train(a: argparse.Namespace) -> int:
         model, seqs, pad_id=ctx.pad_id, iters=a.iters, lr=a.lr, batch_size=a.batch_size,
         seed=a.seed, budget=budget, max_wall_seconds=a.max_wall_seconds,
     )  # fmt: skip
-    train_seconds = budget.elapsed()
+    train_seconds = budget.phase_elapsed()
     adapter_cfg = {
         "rank": a.rank,
         "scale": a.scale,

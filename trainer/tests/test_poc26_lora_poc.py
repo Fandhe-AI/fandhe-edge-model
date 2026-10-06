@@ -913,9 +913,12 @@ def test_project_and_hidden_states_share_forward_validation(
     with pytest.raises(LimitExceededError):
         model.project(mx.zeros((4, model.config.hidden_size)))
     with pytest.raises(LimitExceededError):
-        model.hidden_states(mx.zeros((1, 8), dtype=mx.int32))
+        model(mx.zeros((1, 8), dtype=mx.int32))  # 全位置 logits は従来どおり拒否される
+    monkeypatch.setattr(qwen2_model, "MAX_FORWARD_TOKENS", 4)
     with pytest.raises(LimitExceededError):
-        model(mx.zeros((1, 8), dtype=mx.int32))
+        model.hidden_states(
+            mx.zeros((1, 8), dtype=mx.int32)
+        )  # トークン数の上限は hidden にも掛かる
 
 
 def _leftovers(parent: Path, name: str) -> list[str]:
@@ -1156,3 +1159,76 @@ def test_decode_logits_maps_base64_errors_to_input_error(bad: str) -> None:
     with pytest.raises(WorkerError) as exc:
         probe_mod.decode_logits(bad, 4)
     assert exc.value.exit_code == 64
+
+
+def test_hidden_states_is_not_rejected_by_logits_sized_estimate(
+    ctx_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: hidden_states は logits を除いた量で判定する。
+
+    全位置 logits を含む見積もりでは拒否される大きさでも、採点（score_labels の project は必要位置の
+    logits だけ）は拒否されない。`__call__`（全位置 logits）は従来どおり拒否される。
+    """
+    from tools.poc26.safe_io import LimitExceededError
+
+    ctx, model = ctx_model
+    prompt = ctx.prompt_ids("limit probe")
+    longest = max(len(c) for c in ctx.label_ids)
+    n, k = len(prompt) + longest, len(ctx.label_ids)
+    without = model.forward_bytes(k, n, False, with_logits=False)
+    with_logits = model.forward_bytes(k, n, False, with_logits=True)
+    assert with_logits > without
+    # hidden は通り、全体（logits 込み）は通らない境界に上限を置く
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", (without + with_logits) // 2)
+    ids = mx.zeros((k, n), dtype=mx.int32)
+    assert model.hidden_states(ids).shape == (k, n, model.config.hidden_size)
+    with pytest.raises(LimitExceededError):
+        model(ids)
+    scores = score_labels(model, prompt, ctx.label_ids, ctx.pad_id, chunk=k)
+    assert scores.shape == (k,)
+
+
+def test_train_wall_budget_starts_at_the_training_loop(
+    ctx_model, env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1: 学習の壁時計予算は学習ループ開始時から数える（事前処理の時間で減らない）。"""
+    ctx, _ = ctx_model
+    now = {"t": 0.0}
+    monkeypatch.setattr(common.time, "monotonic", lambda: now["t"])
+    budget = common.Budget()
+    now["t"] = 50_000.0  # 事前処理（読み込み・トークナイズ）に 50000 秒かかった状況
+    model = _fresh_lora_model(env)
+    result = train_mod.train_loop(
+        model, _seqs(ctx), pad_id=ctx.pad_id, iters=3, lr=1e-3, batch_size=2, seed=0,
+        budget=budget, max_wall_seconds=100,
+    )  # fmt: skip
+    assert result.iters_done == 3
+    assert result.budget_reached is False
+    # ループ中に学習予算を超えれば従来どおり打ち切る
+    budget2 = common.Budget()
+    real_collate = train_mod.collate
+
+    def advancing(*a, **k):
+        now["t"] += 60.0
+        return real_collate(*a, **k)
+
+    monkeypatch.setattr(train_mod, "collate", advancing)
+    result2 = train_mod.train_loop(
+        _fresh_lora_model(env), _seqs(ctx), pad_id=ctx.pad_id, iters=6, lr=1e-3,
+        batch_size=2, seed=0, budget=budget2, max_wall_seconds=100,
+    )  # fmt: skip
+    assert result2.budget_reached is True
+    assert result2.iters_done == 2
+
+
+def test_compare_probes_requires_matching_vocab_sizes() -> None:
+    """P1: 両側の vocab_size が存在し一致すること。不一致・欠落は入力の不整合として 64。"""
+    case = {"text": "a", "ids": [1], "last_logits_f32_b64": base64.b64encode(b"\0" * 8).decode()}
+    ok = {"vocab_size": 2, "cases": [case]}
+    assert probe_mod.compare_probes(ok, ok, 1e-3)["status"] == "match"
+    for other in ({"vocab_size": 3, "cases": [case]}, {"cases": [case]}):
+        with pytest.raises(WorkerError) as exc:
+            probe_mod.compare_probes(ok, other, 1e-3)
+        assert exc.value.exit_code == 64
+        with pytest.raises(WorkerError):
+            probe_mod.compare_probes(other, ok, 1e-3)

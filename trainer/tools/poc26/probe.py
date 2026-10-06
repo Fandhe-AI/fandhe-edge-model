@@ -178,9 +178,15 @@ def compare_probes(ours: Any, ref: Any, atol: float) -> dict[str, Any]:
     cb = ref.get("cases") if isinstance(ref, dict) else None
     if not (isinstance(ca, list) and isinstance(cb, list) and ca and len(ca) == len(cb)):
         raise invalid("probe files must have the same non-empty cases")
-    vocab = ours.get("vocab_size")
-    if not isinstance(vocab, int) or isinstance(vocab, bool) or not 0 < vocab <= (1 << 20):
-        raise invalid("invalid probe vocab_size")
+    # 両側の vocab_size が存在し一致することを要求する（logits の長さの解釈を固定する）。不一致は
+    # モデル出力の差ではなく入力ファイルの不整合なので judged_fail ではなく 64 にする。
+    sizes = [d.get("vocab_size") if isinstance(d, dict) else None for d in (ours, ref)]
+    for v in sizes:
+        if not isinstance(v, int) or isinstance(v, bool) or not 0 < v <= (1 << 20):
+            raise invalid("invalid probe vocab_size")
+    if sizes[0] != sizes[1]:
+        raise invalid("probe vocab_size differs between the two files")
+    vocab = sizes[0]
     id_mismatch = argmax_mismatch = logits_mismatch = 0
     max_diff = 0.0
     for x, y in zip(ca, cb, strict=True):

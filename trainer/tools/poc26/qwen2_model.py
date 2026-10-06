@@ -281,7 +281,7 @@ class Qwen2Model(nn.Module):
         if not c.tie_word_embeddings:
             self.lm_head = nn.Linear(c.hidden_size, c.vocab_size, bias=False)
 
-    def forward_bytes(self, b: int, n: int, with_mask: bool) -> int:
+    def forward_bytes(self, b: int, n: int, with_mask: bool, with_logits: bool = True) -> int:
         """forward が同時に保持するバイト数の保守的な見積もり（確保前の拒否用。REQ-39）。
 
         合計 = 現在のパラメータ（実 dtype。LoRA を含む）
@@ -289,20 +289,29 @@ class Qwen2Model(nn.Module):
              + マスク（B×L×L × 1。指定時のみ）
              + 注意スコア（B×heads×L×L。SDPA の実装によらず 1 層分を 4 バイト以上で）
              + 活性（B×L×(8×hidden + 3×intermediate)。残差・norm・q/k/v・MLP 中間を数個分）。
-        実測より大きめに出す設計で、厳密な上限ではなく暴走防止の目安。
+        `with_logits=False` は logits を除いた量（`hidden_states` 用。logits は `project` が自分の
+        分を        見積もる）。実測より大きめに出す設計で、厳密な上限ではなく暴走防止の目安。
         """
         c = self.config
         size = self.model.embed_tokens.weight.dtype.size
         wide = max(4, size)
         params = sum(v.nbytes for _, v in tree_flatten(self.parameters()))
-        logits = b * n * c.vocab_size * wide
+        logits = b * n * c.vocab_size * wide if with_logits else 0
         mask = b * n * n if with_mask else 0
         scores = b * c.num_attention_heads * n * n * wide
         acts = b * n * (8 * c.hidden_size + 3 * c.intermediate_size) * size
         return params + logits + mask + scores + acts
 
-    def _check_input(self, ids: mx.array, attention_mask: mx.array | None) -> None:
-        """確保の前に B・L を検証する（REQ-39）。形の不正は ValueError、超過は LimitExceeded。"""
+    def _check_input(
+        self, ids: mx.array, attention_mask: mx.array | None, *, with_logits: bool = True
+    ) -> None:
+        """確保の前に入力とメモリ見積もりを検証する（REQ-39）。
+
+        形の不正は ValueError、超過は LimitExceeded。入力の型・範囲・マスク・B・L の検証は常に行う。
+        メモリ見積もりは `with_logits` で分かれる: True（`__call__`）は全位置 logits を含む全体、
+        False（`hidden_states`）は logits を除いた同時保持量（パラメータ＋マスク＋注意スコア
+        1 層分＋        活性）。logits は `project` が自分の作る分を判定する。
+        """
         if ids.ndim != 2 or 0 in ids.shape:
             raise ValueError("ids must be a non-empty [B, L] array")
         b, n = ids.shape
@@ -313,14 +322,17 @@ class Qwen2Model(nn.Module):
             raise ValueError("ids must have an integer dtype")
         if b * n > MAX_FORWARD_TOKENS:
             raise LimitExceededError(f"too many tokens: {b * n} > {MAX_FORWARD_TOKENS}")
-        if b * n * c.vocab_size > MAX_FORWARD_ELEMENTS:
+        if with_logits and b * n * c.vocab_size > MAX_FORWARD_ELEMENTS:
             raise LimitExceededError("logits would be too large for one forward")
         if attention_mask is not None:
             if attention_mask.shape != ids.shape:
                 raise ValueError("attention_mask shape must equal ids shape")
             if b * n * n > MAX_FORWARD_ELEMENTS:
                 raise LimitExceededError("attention mask would be too large for one forward")
-        if self.forward_bytes(b, n, attention_mask is not None) > MAX_MODEL_MEMORY_BYTES:
+        if (
+            self.forward_bytes(b, n, attention_mask is not None, with_logits)
+            > MAX_MODEL_MEMORY_BYTES
+        ):
             raise LimitExceededError("forward would exceed the memory limit")
         # 値の検証（embed 参照・マスク構築の前）。
         if mx.min(ids).item() < 0 or mx.max(ids).item() >= c.vocab_size:
@@ -342,14 +354,15 @@ class Qwen2Model(nn.Module):
 
     def __call__(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から logits `[B, L, vocab]` を返す（`hidden_states`＋`project`）。"""
-        return self.project(self.hidden_states(ids, attention_mask))
+        self._check_input(ids, attention_mask, with_logits=True)  # 全位置 logits を含む全体で判定
+        return self.project(self._hidden(ids, attention_mask))
 
     def hidden_states(self, ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """`ids` `[B, L]` から最終 norm 後の隠れ状態 `[B, L, hidden]` を返す。
 
         採点・損失は必要な位置の隠れ状態だけを `project` へ渡し、全位置の `[B, L, vocab]` を
-        float32 に広げない（REQ-39 のメモリ上限。#390 PR-C）。入力検証（`_check_input`）は
-        forward と同じ。
+        float32 に広げない（REQ-39 のメモリ上限。#390 PR-C）。入力の型・範囲・マスク・B・L の検証は
+        forward と同じで、メモリ見積もりは logits を除いた量（logits は `project` が判定する）。
 
         `attention_mask` は右 pad 用の `[B, L]`（真 = 実 token）。因果マスクと key 側の pad 除外を
         合成する。pad の query 行が全遮蔽で NaN にならないよう対角は常に許可する。
@@ -361,7 +374,11 @@ class Qwen2Model(nn.Module):
         dropout の有効 / 無効（train / eval）は呼び出し側の責務で、本 forward は切り替えない
         （PR-C の学習ループが `model.train()` / `model.eval()` を呼ぶ）。
         """
-        self._check_input(ids, attention_mask)
+        self._check_input(ids, attention_mask, with_logits=False)
+        return self._hidden(ids, attention_mask)
+
+    def _hidden(self, ids: mx.array, attention_mask: mx.array | None) -> mx.array:
+        """検証済みの入力から隠れ状態を計算する（検査は呼び出し側）。"""
         mask: mx.array | str = "causal"
         if attention_mask is not None:
             n = ids.shape[1]

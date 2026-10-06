@@ -107,7 +107,9 @@ class Budget:
       （指定時。採点フェーズの `--max-score-seconds`）の超過は停止する（`LimitExceededError`
       相当の `WorkerError` -> 20）。
     - `wall_exceeded(limit)`: 学習ループだけが使う「予算到達」の判定（事前登録 4 節: 到達は記録して
-      その時点の最良で評価する。停止しない）。時間は生成時点からの経過。
+      その時点の最良で評価する。停止しない）。時間は `begin_phase`（学習ループ開始時）からの経過で、
+      データ読み込み・トークナイズ・モデル読み込みは数えない。採点の上限は別の `Budget`
+      （`wall_limit`。採点開始時に生成）が持つ。RSS / MLX ピークは全体で見る。
 
     モデル読み込みは 1 回の処理（途中で止められない）なので、フェーズの壁時計上限の対象外とする
     （24 時間の天井と RSS だけを前後で確認する）。
@@ -115,6 +117,7 @@ class Budget:
 
     def __init__(self, wall_limit: float | None = None) -> None:
         self.start = time.monotonic()
+        self.phase_start = self.start  # 学習予算の起点（`begin_phase` で学習ループ開始時に更新）
         self.wall_limit = wall_limit
 
     def check(self) -> None:
@@ -125,8 +128,16 @@ class Budget:
         if max_rss_bytes() > limits.MAX_TRAIN_RSS_BYTES:
             raise too_large("RSS budget exceeded")
 
+    def begin_phase(self) -> None:
+        """フェーズ（学習ループ）の開始時刻を今にする。事前処理の時間は予算に数えない。"""
+        self.phase_start = time.monotonic()
+
+    def phase_elapsed(self) -> float:
+        return time.monotonic() - self.phase_start
+
     def wall_exceeded(self, limit: float) -> bool:
-        return self.elapsed() > limit
+        """`begin_phase` 以降（未呼び出しなら生成時点から）の経過が `limit` を超えたか。"""
+        return self.phase_elapsed() > limit
 
     def elapsed(self) -> float:
         return time.monotonic() - self.start
