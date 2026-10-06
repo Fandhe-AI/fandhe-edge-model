@@ -51,10 +51,17 @@ PROBES = [
 qwen_dir = Path(sys.argv[1])  # tokenizer.json のあるディレクトリ
 out = Path(sys.argv[2])  # <repo>/fixtures/poc26/tokenizer_golden.json
 path = qwen_dir / "tokenizer.json"
+MAX_BYTES = 16 * 1024 * 1024  # 本実装の上限と同じ
+if not path.is_file() or path.stat().st_size > MAX_BYTES:
+    sys.exit("tokenizer.json must be a regular file of at most 16 MiB")
+digest = hashlib.sha256()
+with path.open("rb") as f:
+    while chunk := f.read(1 << 20):
+        digest.update(chunk)
 tok = Tokenizer.from_file(str(path))
 doc = {
     "source": {
-        "tokenizer_json_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "tokenizer_json_sha256": digest.hexdigest(),
         "tokenizers_version": tokenizers.__version__,
         "generated_on": datetime.date.today().isoformat(),
     },
@@ -84,7 +91,7 @@ FANDHE_EDGE_QWEN_DIR=<dir> uv run --locked --directory trainer pytest tests/test
 
 - 合格: `test_golden_ids_match_real_tokenizer` が PASS する（skip ではない）。確認される内容は次のとおり。
   - `source` のキーが 3 つそろう。
-  - `tokenizer_json_sha256` が手元の実ファイルの sha256 と一致する。
+  - `tokenizer_json_sha256` が、自作側が解析したのと同じバイト列の sha256 と一致する。
   - case が 20〜30 件ある。
   - どの case の本文にも added_tokens の文字列がない。
   - 全 case で自作の `encode` が `ids` と完全一致する。

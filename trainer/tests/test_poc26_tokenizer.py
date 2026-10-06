@@ -110,6 +110,13 @@ def test_null_normalizer_skips_nfc(tmp_path: Path, remove_key: bool) -> None:
     assert tok.decode(tok.encode("e\u0301")) == "e\u0301"
 
 
+def test_source_sha256_matches_file_bytes(tmp_path: Path) -> None:
+    """REQ-41: from_file が解析したバイト列の sha256 を source_sha256 に持つ。"""
+    path = synthetic.write_tokenizer_json(tmp_path)
+    tok = Qwen2Tokenizer.from_file(path)
+    assert tok.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_roundtrip(tok: Qwen2Tokenizer) -> None:
     """REQ-41: encode -> decode が NFC 済みの入力を復元する。"""
     text = "hello 世界 \n 😀 ok  \t1+1=2"
@@ -435,8 +442,8 @@ def test_golden_ids_match_real_tokenizer() -> None:
     doc = json.loads(_GOLDEN.read_text(encoding="utf-8"))
     assert set(doc["source"]) == _GOLDEN_SOURCE_KEYS
     assert all(isinstance(v, str) and v for v in doc["source"].values())
-    assert doc["source"]["tokenizer_json_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     real = Qwen2Tokenizer.from_file(path)
+    assert doc["source"]["tokenizer_json_sha256"] == real.source_sha256
     added = list(real._added.values())
     cases = doc["cases"]
     assert 20 <= len(cases) <= 30

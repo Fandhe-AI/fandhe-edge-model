@@ -31,6 +31,7 @@ HF `tokenizers` との既知の差:
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
 import os
@@ -181,6 +182,7 @@ class Qwen2Tokenizer:
         if not isinstance(doc, dict):
             raise ValueError(_INVALID)
         self._nfc = _check_pipeline(doc)
+        self.source_sha256: str | None = None  # from_file で設定する
         model = doc.get("model")
         if not isinstance(model, dict):
             raise ValueError(_INVALID)
@@ -285,7 +287,10 @@ class Qwen2Tokenizer:
             raise ValueError(_INVALID) from None
         except (OSError, RecursionError):
             raise ValueError(_INVALID) from None
-        return cls(doc)
+        tok = cls(doc)
+        # 解析したのと同じバイト列の sha256（golden 照合で実ファイルとの一致確認に使う）
+        tok.source_sha256 = hashlib.sha256(data).hexdigest()
+        return tok
 
     def pre_tokenize(self, text: str) -> list[str]:
         """NFC 正規化（normalizer が NFC のときのみ）後に Split(Isolated) した piece 列。"""
