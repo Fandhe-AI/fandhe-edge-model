@@ -20,6 +20,9 @@
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
 //! 5. Holm: 採点対象の [対 majority, 対 `--compare` 各相手] を族の大きさ 3 固定で補正（相手が欠けても
 //!    m は 3。事前登録。脱落は保守側）。`--reference` は族に入れず McNemar の生の値だけ出す
+//!    P 以外（C1・C3・AR。`evaluate` が保存した予測）は、同じディレクトリの `evaluation_record.json` の
+//!    `predictions_sha256` が予測ファイルの sha256 と一致することを必須にする（記録なし・欄なし・不一致は
+//!    `invalid_input`。手編集した予測を比較相手にできない。#445・REQ-27）。P は評価記録を持たず対象外
 //! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
 //!
 //! # 1 回限りの担保（REQ-27）
@@ -54,6 +57,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
@@ -71,7 +75,9 @@ use fandhe_edge_guard::path::open_confined;
 
 use crate::error_report::ToErrorReport;
 use crate::prediction_lines::{json_f64, json_string};
-use crate::project::{MAX_PROJECT_FILE_BYTES, Project, fs_report, invalid, runtime};
+use crate::project::{
+    EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project, fs_report, invalid, runtime,
+};
 use crate::stages::baseline::majority_from_train;
 use crate::stages::inspect::load_frozen_evaluation;
 use crate::stages::train::verified_split;
@@ -246,6 +252,28 @@ struct Loaded<'a> {
     outcomes: Vec<Outcome>,
 }
 
+/// 予測ファイルの sha256 が、同じディレクトリの評価記録の `predictions_sha256` と一致することを確認する
+/// （#445・REQ-27。記録なし・欄なし・不一致はいずれも `invalid_input`）。
+fn verify_bound_to_record(cwd: &Path, named: &NamedPath, sha256: &str) -> Result<(), ErrorReport> {
+    let record_path = named
+        .path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(EVALUATION_RECORD_FILE);
+    let (file, confined) = open_confined(cwd, &record_path)
+        .map_err(|_| invalid("evaluation record is missing for the prediction file"))?;
+    let bytes = read_bounded_open_file(file, confined.as_path(), MAX_EVALUATION_RECORD_BYTES)
+        .map_err(|e| fs_report(&e))?;
+    let record = EvaluationRecord::from_json_slice(&bytes)
+        .map_err(|_| invalid("evaluation record is malformed"))?;
+    if record.predictions_sha256.as_deref() != Some(sha256) {
+        return Err(invalid(
+            "prediction file does not match the evaluation record",
+        ));
+    }
+    Ok(())
+}
+
 /// 予測ファイルを閉じ込めつきで上限付きに読み、評価入力として分類する。
 fn load_prediction<'a>(
     cwd: &Path,
@@ -257,6 +285,10 @@ fn load_prediction<'a>(
     let (file, confined) = open_confined(cwd, &named.path).map_err(|e| e.to_error_report())?;
     let bytes = read_bounded_open_file(file, confined.as_path(), MAX_PROJECT_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
+    let sha256 = Sha256Digest::of_bytes(&bytes).to_hex();
+    if named.name != "P" {
+        verify_bound_to_record(cwd, named, &sha256)?;
+    }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| invalid("prediction file is not valid UTF-8"))?;
     let outcome = prepare_evaluation_input(gold_text, text, labels).map_err(|stop| {
@@ -269,7 +301,7 @@ fn load_prediction<'a>(
     let mut loaded = Loaded {
         role,
         named,
-        sha256: Sha256Digest::of_bytes(&bytes).to_hex(),
+        sha256,
         ids: Vec::with_capacity(outcome.active.len()),
         golds: Vec::with_capacity(outcome.active.len()),
         outcomes: Vec::with_capacity(outcome.active.len()),

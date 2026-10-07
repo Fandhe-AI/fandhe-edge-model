@@ -1029,6 +1029,7 @@ mod tests {
             correct,
             total,
             baseline_comparison: None,
+            predictions_sha256: None,
         }
     }
 

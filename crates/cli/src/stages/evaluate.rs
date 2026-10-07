@@ -509,6 +509,10 @@ fn finalize_evaluation(
     )
     .ok_or_else(|| runtime("cannot build evaluation report"))?;
 
+    // 予測ファイルの本文を先に作り、そのバイト列の sha256 を評価記録へ束縛する（#445・REQ-27）。
+    let predictions_jsonl = predictions
+        .to_jsonl(&labels, &applied.output)
+        .ok_or_else(|| runtime("cannot build evaluation predictions"))?;
     let record = EvaluationRecord {
         candidate_index: candidate,
         candidate_id: target.candidate_id.clone(),
@@ -521,6 +525,7 @@ fn finalize_evaluation(
         correct,
         total,
         baseline_comparison,
+        predictions_sha256: Some(Sha256Digest::of_bytes(predictions_jsonl.as_bytes()).to_hex()),
     };
     let record_json = record
         .to_json_vec()
@@ -530,13 +535,7 @@ fn finalize_evaluation(
         return Err(runtime("evaluation record is too large"));
     }
     // 1 件ごとの予測を先に書く（記録があるのに予測が無い状態を作らない）。失敗は記録の失敗と同じ扱い。
-    project.write_new(
-        predictions.rel,
-        predictions
-            .to_jsonl(&labels, &applied.output)
-            .ok_or_else(|| runtime("cannot build evaluation predictions"))?
-            .as_bytes(),
-    )?;
+    project.write_new(predictions.rel, predictions_jsonl.as_bytes())?;
     // 書いた後は読み取り専用にする（凍結データの配置と同じ扱い。改ざんの抑止であり、
     // 記録の封印は外部台帳〔#168〕の範囲）。
     project.set_read_only(predictions.rel)?;

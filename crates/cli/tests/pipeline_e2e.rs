@@ -1315,6 +1315,15 @@ mod suite {
         );
         // 既存なら上書きしない（評価記録と同じく 1 回限り）。
         env.fails(&EVALUATE_1, 64, "invalid_input");
+        // 評価記録の `predictions_sha256` は予測ファイルの実 sha256（#445・REQ-27）。
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        let preds_sha = file_sha256(&env, "candidates/1/evaluation_predictions.jsonl");
+        assert!(
+            record.ends_with(&format!(",\"predictions_sha256\":\"{preds_sha}\"}}\n")),
+            "{record}"
+        );
         // 保存した予測は PoC-26 の採点入口（`fandhe-edge-score`）でそのまま読め、`evaluate` と同じ正解数になる。
         let scored = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
             .args([
@@ -1334,6 +1343,32 @@ mod suite {
             number_field(&scored, "correct").to_bits(),
             f64::to_bits(matched),
             "{scored}"
+        );
+        // 予測ファイルを 1 バイト変える（0400 を外す）と、評価記録の sha256 と合わず拒否される。
+        let pred_file = env.project_file("candidates/1/evaluation_predictions.jsonl");
+        let mut perm = std::fs::metadata(&pred_file).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&pred_file, perm).expect("chmod");
+        let mut bytes = std::fs::read(&pred_file).expect("read");
+        bytes[0] = b'[';
+        std::fs::write(&pred_file, bytes).expect("tamper");
+        let rejected = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "2",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        assert_eq!(rejected.status.code(), Some(64));
+        assert!(
+            String::from_utf8(rejected.stdout)
+                .expect("utf8")
+                .contains("prediction file does not match the evaluation record"),
         );
     }
 
@@ -2022,7 +2057,11 @@ mod suite {
         assert!(!stdout.contains("baseline"), "{stdout}");
         let record = evaluation_record(&env);
         assert!(!record.contains("baseline_comparison"), "{record}");
-        assert!(record.ends_with("\"total\":12}\n"), "{record}");
+        // 末尾は予測ファイルの sha256 束縛（#445）。比較欄は無い。
+        assert!(
+            record.contains("\"total\":12,\"predictions_sha256\":\""),
+            "{record}"
+        );
         env.ok(&PACKAGE);
     }
 
