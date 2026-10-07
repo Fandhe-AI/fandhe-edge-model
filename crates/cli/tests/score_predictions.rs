@@ -108,6 +108,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     String::from_utf8(out.stdout).expect("utf8")[..64].to_string()
 }
 
+/// 合成の評価記録の来歴欄。
+struct Rec {
+    candidate_id: String,
+    index: usize,
+    evaluation_sha256: String,
+    evaluation_bytes: u64,
+    definition_sha256: String,
+}
+
 struct Env {
     base: PathBuf,
     work: PathBuf,
@@ -149,16 +158,45 @@ impl Env {
         std::fs::write(self.work.join(name), body).expect("write pred");
     }
 
-    /// `evaluate` が保存した予測の代わり（C1・C3・AR 用）。`dir/` に予測ファイルと、その sha256 を束縛した
-    /// 合成の評価記録を置き、予測ファイルの相対パスを返す。
-    fn bound(&self, dir: &str, body: &str) -> String {
-        let sha = sha256_hex(body.as_bytes());
-        self.write_in(dir, "evaluation_predictions.jsonl", body);
+    /// `proj` の現在の状態（凍結記録・定義）に正しく束縛した合成の評価記録の材料。
+    fn rec(&self, proj: &str, candidate_id: &str, index: usize) -> Rec {
+        let eval = std::fs::read(self.work.join(proj).join("data/evaluation.jsonl")).expect("eval");
+        let def = std::fs::read_to_string(self.work.join(proj).join("definition.json"))
+            .expect("definition");
+        Rec {
+            candidate_id: candidate_id.to_string(),
+            index,
+            evaluation_sha256: sha256_hex(&eval),
+            evaluation_bytes: eval.len() as u64,
+            definition_sha256: fandhe_edge_core::definition::Definition::parse(&def)
+                .expect("parse")
+                .canonical_hash()
+                .expect("hash")
+                .to_hex(),
+        }
+    }
+
+    /// `evaluate` が保存した予測の代わり（C1・C3・AR 用）。`proj/candidates/<index>/` に予測ファイルと、
+    /// その sha256 と現在のプロジェクトの来歴を束縛した合成の評価記録を置き、予測ファイルの相対パスを返す。
+    fn bound(&self, candidate_id: &str, index: usize, body: &str) -> String {
+        self.bound_rec("proj", &self.rec("proj", candidate_id, index), body)
+    }
+
+    fn bound_rec(&self, proj: &str, rec: &Rec, body: &str) -> String {
+        let dir = format!("{proj}/candidates/{}", rec.index);
+        self.write_in(&dir, "evaluation_predictions.jsonl", body);
         self.write_in(
-            dir,
+            &dir,
             "evaluation_record.json",
             &format!(
-                r#"{{"candidate_index":1,"candidate_id":"c1","config_id":"c1:seed0","evaluation_sha256":"{z}","evaluation_bytes":1,"onnx_sha256":"{z}","artifact_meta_sha256":"{z}","definition_sha256":"{z}","correct":1,"total":1,"predictions_sha256":"{sha}"}}"#,
+                r#"{{"candidate_index":{},"candidate_id":"{}","config_id":"{}:seed0","evaluation_sha256":"{}","evaluation_bytes":{},"onnx_sha256":"{z}","artifact_meta_sha256":"{z}","definition_sha256":"{}","correct":1,"total":1,"predictions_sha256":"{}"}}"#,
+                rec.index,
+                rec.candidate_id,
+                rec.candidate_id,
+                rec.evaluation_sha256,
+                rec.evaluation_bytes,
+                rec.definition_sha256,
+                sha256_hex(body.as_bytes()),
                 z = "0".repeat(64)
             ),
         );
@@ -215,7 +253,7 @@ fn args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
 fn req41_scores_candidate_with_expected_counts() {
     let env = Env::new("ok");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let a = env.bound("c1", &pred_jsonl(pred_a));
+    let a = env.bound("c1", 1, &pred_jsonl(pred_a));
     let out = env.ok(&args(&[
         "--candidate",
         "P=p.jsonl",
@@ -282,7 +320,7 @@ fn req25_holm_family_size_is_three_even_without_compares() {
 fn req25_reference_is_outside_the_holm_family() {
     let env = Env::new("reference");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let a = env.bound("c3", &pred_jsonl(pred_a));
+    let a = env.bound("c3", 2, &pred_jsonl(pred_a));
     let out = env.ok(&args(&[
         "--candidate",
         "P=p.jsonl",
@@ -403,7 +441,7 @@ fn ledger_file(env: &Env, seed: u32, name: &str) -> PathBuf {
 fn req27_ledger_enforces_single_application() {
     let env = Env::new("ledger");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let a = env.bound("c1", &pred_jsonl(pred_a));
+    let a = env.bound("c1", 1, &pred_jsonl(pred_a));
     let c1 = format!("C1={a}");
     env.ok(&args(&["--candidate", &c1]));
     assert!(ledger_file(&env, 0, "C1").is_file());
@@ -413,11 +451,13 @@ fn req27_ledger_enforces_single_application() {
     );
     env.ok(&args(&["--candidate", "P=p.jsonl", "--compare", &c1]));
     let a2 = env.bound(
-        "c1b",
+        "c1",
+        4,
         &pred_jsonl(|i| Some(if i < 61 { "gamma" } else { gold_of(i) })),
     );
     let ar = env.bound(
-        "ar",
+        "autoregressive",
+        3,
         &pred_jsonl(|i| Some(if i < 10 { "gamma" } else { gold_of(i) })),
     );
     env.fails(
@@ -438,7 +478,7 @@ fn req27_ledger_enforces_single_application() {
 fn req27_same_sha256_under_another_name_is_rejected() {
     let env = Env::new("othername");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let c3 = format!("C3={}", env.bound("c3", &pred_jsonl(pred_p)));
+    let c3 = format!("C3={}", env.bound("c3", 2, &pred_jsonl(pred_p)));
     env.ok(&args(&["--candidate", "P=p.jsonl"]));
     env.fails(
         &args(&["--candidate", &c3]),
@@ -519,7 +559,7 @@ fn req39_rejects_escaping_paths_and_bad_names() {
 #[test]
 fn req27_issue445_tampered_prediction_is_rejected() {
     let env = Env::new("tamper");
-    let c1 = env.bound("c1", &pred_jsonl(pred_a));
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
     let file = env.work.join(&c1);
     let mut body = std::fs::read(&file).expect("read");
     let at = body.windows(5).position(|w| w == b"alpha").expect("alpha");
@@ -537,21 +577,143 @@ fn req27_issue445_tampered_prediction_is_rejected() {
 #[test]
 fn req27_issue445_missing_record_or_field_is_rejected() {
     let env = Env::new("norecord");
-    env.write_in("c1", "evaluation_predictions.jsonl", &pred_jsonl(pred_a));
+    env.write_in(
+        "proj/candidates/1",
+        "evaluation_predictions.jsonl",
+        &pred_jsonl(pred_a),
+    );
     env.fails(
-        &args(&["--candidate", "C1=c1/evaluation_predictions.jsonl"]),
+        &args(&[
+            "--candidate",
+            "C1=proj/candidates/1/evaluation_predictions.jsonl",
+        ]),
         "evaluation record is missing for the prediction file",
     );
     env.write(
-        "c1/evaluation_record.json",
+        "proj/candidates/1/evaluation_record.json",
         &format!(
             r#"{{"candidate_index":1,"candidate_id":"c1","config_id":"c1:seed0","evaluation_sha256":"{z}","evaluation_bytes":1,"onnx_sha256":"{z}","artifact_meta_sha256":"{z}","definition_sha256":"{z}","correct":1,"total":1}}"#,
             z = "0".repeat(64)
         ),
     );
     env.fails(
-        &args(&["--candidate", "C1=c1/evaluation_predictions.jsonl"]),
+        &args(&[
+            "--candidate",
+            "C1=proj/candidates/1/evaluation_predictions.jsonl",
+        ]),
         "prediction file does not match the evaluation record",
     );
+    assert!(!env.work.join("proj/poc26_score_ledger").exists());
+}
+
+/// 来歴の不一致（別プロジェクト・凍結記録・定義・候補・配置）は、sha256 が合っていても拒否し、
+/// 台帳を作らない（#445・REQ-27）。
+#[test]
+fn req27_issue445_provenance_mismatch_is_rejected() {
+    let env = Env::new("prov");
+    let body = pred_jsonl(pred_a);
+    let no_ledger = || assert!(!env.work.join("proj/poc26_score_ledger").exists());
+    let check = |path: &str, name: &str, message: &str| {
+        env.fails(&args(&["--candidate", &format!("{name}={path}")]), message);
+        no_ledger();
+    };
+    let mismatch = "evaluation record does not belong to this project state";
+
+    // 別プロジェクト（凍結 test が違う）の記録と予測。
+    std::fs::create_dir_all(env.work.join("other/data")).expect("other");
+    std::fs::write(env.work.join("other/data/evaluation.jsonl"), "x\n").expect("eval");
+    std::fs::write(env.work.join("other/definition.json"), definition_text()).expect("def");
+    let rec = env.rec("other", "c1", 1);
+    check(&env.bound_rec("proj", &rec, &body), "C1", mismatch);
+
+    // evaluation_sha256・evaluation_bytes・definition_sha256 の個別の改変。
+    let mut rec = env.rec("proj", "c1", 1);
+    rec.evaluation_sha256 = "1".repeat(64);
+    check(&env.bound_rec("proj", &rec, &body), "C1", mismatch);
+    let mut rec = env.rec("proj", "c1", 1);
+    rec.evaluation_bytes += 1;
+    check(&env.bound_rec("proj", &rec, &body), "C1", mismatch);
+    let mut rec = env.rec("proj", "c1", 1);
+    rec.definition_sha256 = "2".repeat(64);
+    check(&env.bound_rec("proj", &rec, &body), "C1", mismatch);
+
+    // C1 に c3 の記録、AR に c1 の記録。
+    let c3 = env.bound("c3", 1, &body);
+    check(
+        &c3,
+        "C1",
+        "evaluation record does not match the candidate name",
+    );
+    let c1 = env.bound("c1", 1, &body);
+    check(
+        &c1,
+        "AR",
+        "evaluation record does not match the candidate name",
+    );
+
+    // 記録の candidate_index と置き場所の N の不一致。
+    let path = env.bound("c1", 9, &body);
+    let record9 = env.work.join("proj/candidates/9/evaluation_record.json");
+    let text = std::fs::read_to_string(&record9).expect("record");
+    std::fs::write(
+        &record9,
+        text.replace("\"candidate_index\":9", "\"candidate_index\":1"),
+    )
+    .expect("rewrite");
+    check(
+        &path,
+        "C1",
+        "evaluation record does not match the candidate name",
+    );
+
+    // candidates の外（プロジェクト直下・別ディレクトリ）に置いた予測と記録。
+    env.write_in("proj/elsewhere", "evaluation_predictions.jsonl", &body);
+    std::fs::copy(
+        env.work.join("proj/candidates/1/evaluation_record.json"),
+        env.work.join("proj/elsewhere/evaluation_record.json"),
+    )
+    .expect("copy");
+    let outside = "prediction file is not under the project candidates directory";
+    check("proj/elsewhere/evaluation_predictions.jsonl", "C1", outside);
+    let bad_name = env.bound("c1", 1, &body);
+    let copy = env.work.join("proj/candidates/1/copy.jsonl");
+    std::fs::copy(env.work.join(&bad_name), &copy).expect("copy");
+    check("proj/candidates/1/copy.jsonl", "C1", outside);
+}
+
+/// REQ-27・#445: 公開 API から `ScoreArgs` を直接組んでも、`run` が事前登録の制限（seed・NAME）を
+/// 検証し、拒否したときは台帳を作らない。
+#[test]
+fn req27_issue445_run_revalidates_public_args() {
+    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, run};
+    let env = Env::new("api");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let named = |name: &str| NamedPath {
+        name: name.to_string(),
+        path: PathBuf::from("p.jsonl"),
+    };
+    let build = |seed: u32, name: &str| ScoreArgs {
+        project_dir: PathBuf::from("proj"),
+        seed,
+        candidate: named(name),
+        compares: vec![],
+        references: vec![],
+    };
+    for (args, message) in [
+        (build(3, "P"), "seed is not in the preregistered list"),
+        (build(0, "X"), "name is not in the preregistered list"),
+    ] {
+        let err = run(&args, &env.work).expect_err("rejected");
+        assert_eq!(
+            err.to_json_line().expect("json"),
+            format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}")
+        );
+    }
+    let mut many = build(0, "P");
+    many.compares = vec![named("C1"), named("C3"), named("AR")];
+    assert!(run(&many, &env.work).is_err());
+    let mut dup = build(0, "P");
+    dup.references = vec![named("P")];
+    assert!(run(&dup, &env.work).is_err());
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }

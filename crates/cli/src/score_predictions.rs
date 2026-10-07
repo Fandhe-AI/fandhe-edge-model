@@ -20,9 +20,14 @@
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
 //! 5. Holm: 採点対象の [対 majority, 対 `--compare` 各相手] を族の大きさ 3 固定で補正（相手が欠けても
 //!    m は 3。事前登録。脱落は保守側）。`--reference` は族に入れず McNemar の生の値だけ出す
-//!    P 以外（C1・C3・AR。`evaluate` が保存した予測）は、同じディレクトリの `evaluation_record.json` の
-//!    `predictions_sha256` が予測ファイルの sha256 と一致することを必須にする（記録なし・欄なし・不一致は
-//!    `invalid_input`。手編集した予測を比較相手にできない。#445・REQ-27）。P は評価記録を持たず対象外
+//!    P 以外（C1・C3・AR。`evaluate` が保存した予測）は、予測ファイルが現在の `--project-dir` の
+//!    `candidates/<N>/evaluation_predictions.jsonl` にあり、同じディレクトリの `evaluation_record.json` が
+//!    次をすべて満たすことを必須にする（満たさなければ `invalid_input`。手編集した予測・別プロジェクトや
+//!    別候補の予測を比較相手にできない。#445・REQ-27）。P は評価記録を持たず対象外
+//!    - `predictions_sha256` が予測ファイルの sha256 と一致
+//!    - `evaluation_sha256`・`evaluation_bytes` が現在の凍結記録と一致
+//!    - `definition_sha256` が現在の定義の正準化ハッシュと一致（`evaluate` と同じ計算）
+//!    - `candidate_index` が `<N>` と一致し、`candidate_id`（kind）が NAME に対応（C1→c1・C3→c3・AR→autoregressive）
 //! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
 //!
 //! # 1 回限りの担保（REQ-27）
@@ -76,7 +81,8 @@ use fandhe_edge_guard::path::open_confined;
 use crate::error_report::ToErrorReport;
 use crate::prediction_lines::{json_f64, json_string};
 use crate::project::{
-    EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project, fs_report, invalid, runtime,
+    CANDIDATES_DIR, EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES,
+    Project, fs_report, invalid, runtime,
 };
 use crate::stages::baseline::majority_from_train;
 use crate::stages::inspect::load_frozen_evaluation;
@@ -121,21 +127,57 @@ pub struct ScoreArgs {
     pub references: Vec<NamedPath>,
 }
 
-/// `NAME=PATH` を分解する（NAME の文字種・長さを検査する）。
-fn parse_named(value: &str) -> Result<NamedPath, ErrorReport> {
-    let (name, path) = value
-        .split_once('=')
-        .ok_or_else(|| invalid("argument must be NAME=PATH"))?;
+impl ScoreArgs {
+    /// 事前登録の制限（seed・NAME の許可リスト・件数・NAME の重複）を検査する。`parse_args` と `run` の
+    /// 双方が呼ぶ（公開 API から直接組んだ値でも制限を迂回させない。REQ-27）。
+    fn validate(&self) -> Result<(), ErrorReport> {
+        if !ALLOWED_SEEDS.contains(&self.seed) {
+            return Err(invalid("seed is not in the preregistered list"));
+        }
+        if self.references.len() > MAX_REFERENCES {
+            return Err(invalid("too many --reference options"));
+        }
+        if self.compares.len() > MAX_COMPARES {
+            return Err(invalid("too many --compare options"));
+        }
+        let mut names = BTreeSet::new();
+        for (_, n) in self.entries() {
+            validate_name(&n.name)?;
+            if n.path.as_os_str().is_empty() {
+                return Err(invalid("name must match [A-Za-z0-9_-]{1,32}"));
+            }
+            if !names.insert(n.name.as_str()) {
+                return Err(invalid("duplicate NAME"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// NAME の文字種・長さと許可リストを検査する。
+fn validate_name(name: &str) -> Result<(), ErrorReport> {
     let name_ok = (1..=32).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if !name_ok || path.is_empty() {
+    if !name_ok {
         return Err(invalid("name must match [A-Za-z0-9_-]{1,32}"));
     }
     if !ALLOWED_NAMES.contains(&name) {
         return Err(invalid("name is not in the preregistered list"));
     }
+    Ok(())
+}
+
+/// `NAME=PATH` を分解する（NAME の文字種・長さを検査する）。
+fn parse_named(value: &str) -> Result<NamedPath, ErrorReport> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("argument must be NAME=PATH"))?;
+    if path.is_empty() {
+        return Err(invalid("name must match [A-Za-z0-9_-]{1,32}"));
+    }
+    validate_name(name)?;
     Ok(NamedPath {
         name: name.to_string(),
         path: PathBuf::from(path),
@@ -195,12 +237,6 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ScoreArgs
             _ => return Err(invalid("unknown argument")),
         }
     }
-    if references.len() > MAX_REFERENCES {
-        return Err(invalid("too many --reference options"));
-    }
-    if compares.len() > MAX_COMPARES {
-        return Err(invalid("too many --compare options"));
-    }
     let args = ScoreArgs {
         project_dir: project_dir.ok_or_else(|| invalid("--project-dir is required"))?,
         seed: seed.ok_or_else(|| invalid("--seed is required"))?,
@@ -208,10 +244,7 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ScoreArgs
         compares,
         references,
     };
-    let mut names = BTreeSet::new();
-    if !args.entries().all(|(_, n)| names.insert(n.name.as_str())) {
-        return Err(invalid("duplicate NAME"));
-    }
+    args.validate()?;
     Ok(args)
 }
 
@@ -252,23 +285,76 @@ struct Loaded<'a> {
     outcomes: Vec<Outcome>,
 }
 
-/// 予測ファイルの sha256 が、同じディレクトリの評価記録の `predictions_sha256` と一致することを確認する
-/// （#445・REQ-27。記録なし・欄なし・不一致はいずれも `invalid_input`）。
-fn verify_bound_to_record(cwd: &Path, named: &NamedPath, sha256: &str) -> Result<(), ErrorReport> {
-    let record_path = named
-        .path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
+/// 評価記録の来歴照合に使う、現在のプロジェクトの値（#445・REQ-27）。
+struct Provenance<'a> {
+    project: &'a Project,
+    evaluation_sha256: String,
+    evaluation_bytes: u64,
+    definition_sha256: String,
+}
+
+/// NAME に対応する `candidate_id`（= kind）。
+fn expected_candidate_id(name: &str) -> Option<&'static str> {
+    match name {
+        "C1" => Some("c1"),
+        "C3" => Some("c3"),
+        "AR" => Some("autoregressive"),
+        _ => None,
+    }
+}
+
+/// 予測ファイルが現在のプロジェクトの `candidates/<N>/evaluation_predictions.jsonl` にあり、同じ
+/// ディレクトリの評価記録が予測ファイルの sha256・現在の凍結記録・定義・候補に束縛されていることを確認する
+/// （#445・REQ-27。いずれの不一致・欠落も `invalid_input`）。
+fn verify_bound_to_record(
+    prov: &Provenance<'_>,
+    named: &NamedPath,
+    real: &Path,
+    sha256: &str,
+) -> Result<(), ErrorReport> {
+    let outside = || invalid("prediction file is not under the project candidates directory");
+    let rel = real
+        .strip_prefix(prov.project.dir())
+        .map_err(|_| outside())?;
+    let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    let [dir, index, file] = parts.as_slice() else {
+        return Err(outside());
+    };
+    let index: usize = index.parse().map_err(|_| outside())?;
+    if *dir != CANDIDATES_DIR || *file != EVALUATION_PREDICTIONS_FILE || rel.iter().count() != 3 {
+        return Err(outside());
+    }
+    let record_rel = Path::new(CANDIDATES_DIR)
+        .join(index.to_string())
         .join(EVALUATION_RECORD_FILE);
-    let (file, confined) = open_confined(cwd, &record_path)
-        .map_err(|_| invalid("evaluation record is missing for the prediction file"))?;
-    let bytes = read_bounded_open_file(file, confined.as_path(), MAX_EVALUATION_RECORD_BYTES)
-        .map_err(|e| fs_report(&e))?;
+    let Some(bytes) = prov
+        .project
+        .read_optional(&record_rel, MAX_EVALUATION_RECORD_BYTES)?
+    else {
+        return Err(invalid(
+            "evaluation record is missing for the prediction file",
+        ));
+    };
     let record = EvaluationRecord::from_json_slice(&bytes)
         .map_err(|_| invalid("evaluation record is malformed"))?;
     if record.predictions_sha256.as_deref() != Some(sha256) {
         return Err(invalid(
             "prediction file does not match the evaluation record",
+        ));
+    }
+    if record.evaluation_sha256 != prov.evaluation_sha256
+        || record.evaluation_bytes != prov.evaluation_bytes
+        || record.definition_sha256 != prov.definition_sha256
+    {
+        return Err(invalid(
+            "evaluation record does not belong to this project state",
+        ));
+    }
+    if record.candidate_index != index
+        || expected_candidate_id(&named.name) != Some(record.candidate_id.as_str())
+    {
+        return Err(invalid(
+            "evaluation record does not match the candidate name",
         ));
     }
     Ok(())
@@ -277,6 +363,7 @@ fn verify_bound_to_record(cwd: &Path, named: &NamedPath, sha256: &str) -> Result
 /// 予測ファイルを閉じ込めつきで上限付きに読み、評価入力として分類する。
 fn load_prediction<'a>(
     cwd: &Path,
+    prov: &Provenance<'_>,
     gold_text: &str,
     labels: &BTreeSet<String>,
     role: Role,
@@ -287,7 +374,7 @@ fn load_prediction<'a>(
         .map_err(|e| fs_report(&e))?;
     let sha256 = Sha256Digest::of_bytes(&bytes).to_hex();
     if named.name != "P" {
-        verify_bound_to_record(cwd, named, &sha256)?;
+        verify_bound_to_record(prov, named, confined.as_path(), &sha256)?;
     }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| invalid("prediction file is not valid UTF-8"))?;
@@ -500,6 +587,7 @@ fn write_ledger(
 /// 凍結ハッシュ不一致・評価データなし・予測の不備・台帳違反は `invalid_input`（64）、
 /// 上限超過は `limit_exceeded`（20）、評価器・I/O の失敗は `runtime_error`（70）。
 pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
+    args.validate()?;
     let project = Project::open(cwd, &args.project_dir)?;
     let Some((freeze, eval_bytes)) = load_frozen_evaluation(&project)? else {
         return Err(invalid("evaluation data is not provided"));
@@ -510,9 +598,18 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
     let gold_text = std::str::from_utf8(&eval_bytes)
         .map_err(|_| invalid("evaluation data is not valid UTF-8"))?;
 
+    let prov = Provenance {
+        project: &project,
+        evaluation_sha256: freeze.sha256().to_hex(),
+        evaluation_bytes: freeze.byte_len(),
+        definition_sha256: definition
+            .canonical_hash()
+            .map_err(|_| runtime("cannot hash definition"))?
+            .to_hex(),
+    };
     let loaded = args
         .entries()
-        .map(|(role, named)| load_prediction(cwd, gold_text, &label_set, role, named))
+        .map(|(role, named)| load_prediction(cwd, &prov, gold_text, &label_set, role, named))
         .collect::<Result<Vec<_>, _>>()?;
     let first = loaded
         .first()
