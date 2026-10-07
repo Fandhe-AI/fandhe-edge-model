@@ -1337,6 +1337,25 @@ mod suite {
         );
     }
 
+    /// REQ-27・#445: `evaluation_predictions.jsonl` が先に置かれていると、適用権を取る前に 64 で止まる。
+    /// 取り除けばそのまま評価でき（適用権は未消費）、書いた予測ファイルは読み取り専用（0400）になる。
+    pub fn evaluate_stops_before_acquiring_when_predictions_exist() {
+        let env = eval_trained("evalpreplaced");
+        env.ok(&SELECT);
+        let preplaced = env.project_file("candidates/1/evaluation_predictions.jsonl");
+        std::fs::write(&preplaced, "x\n").expect("preplace");
+        assert_eq!(
+            env.fails(&EVALUATE_1, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n"
+        );
+        std::fs::remove_file(&preplaced).expect("remove");
+        env.ok(&EVALUATE_1);
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&preplaced).expect("meta").permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o400);
+    }
+
     /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した
     /// 予測と正解の一致件数に等しい（評価経路と推論経路の全件一致）。
     pub fn evaluate_correct_matches_infer_on_package() {
@@ -2840,6 +2859,10 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_saves_per_record_predictions",
             suite::evaluate_saves_per_record_predictions,
+        ),
+        (
+            "evaluate_stops_before_acquiring_when_predictions_exist",
+            suite::evaluate_stops_before_acquiring_when_predictions_exist,
         ),
         (
             "evaluate_correct_matches_infer_on_package",

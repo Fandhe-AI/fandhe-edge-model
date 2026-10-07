@@ -225,12 +225,16 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         definition.options().len(),
     )?;
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
-    decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    let decoded = decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
     // 1 件ごとの予測の保存用に id を控える（`decode_evaluation` と同じ検査・同じ行順。推論側には渡さない）。
     let eval_ids: Vec<String> = inspect_bytes(&eval_bytes, &definition)?
         .into_iter()
         .map(|r| r.id)
         .collect();
+    // 予測行の件数照合は適用権を取る前に済ませる（保存の失敗で適用権を失わない）。
+    if eval_ids.len() != decoded.len() {
+        return Err(runtime("evaluation record count mismatch"));
+    }
     // 推論ごとのスコア（保存用。推論関数の戻り値の型は変えず、横で受ける）。
     let scores_log: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
     // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
@@ -533,6 +537,9 @@ fn finalize_evaluation(
             .ok_or_else(|| runtime("cannot build evaluation predictions"))?
             .as_bytes(),
     )?;
+    // 書いた後は読み取り専用にする（凍結データの配置と同じ扱い。改ざんの抑止であり、
+    // 記録の封印は外部台帳〔#168〕の範囲）。
+    project.set_read_only(predictions.rel)?;
     project.write_new(record_rel, &record_json)?;
     Ok(report)
 }

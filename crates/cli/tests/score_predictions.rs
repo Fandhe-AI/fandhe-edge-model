@@ -163,7 +163,7 @@ impl Drop for Env {
     }
 }
 
-const BASE: [&str; 4] = ["--project-dir", "proj", "--seed", "7"];
+const BASE: [&str; 4] = ["--project-dir", "proj", "--seed", "0"];
 
 fn args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
     BASE.iter().chain(extra).copied().collect()
@@ -180,10 +180,10 @@ fn req41_scores_candidate_with_expected_counts() {
         "--candidate",
         "P=p.jsonl",
         "--compare",
-        "A=a.jsonl",
+        "C1=a.jsonl",
     ]));
     assert!(
-        out.starts_with("{\"step\":\"score_predictions\",\"status\":\"ok\",\"seed\":7,"),
+        out.starts_with("{\"step\":\"score_predictions\",\"status\":\"ok\",\"seed\":0,"),
         "{out}"
     );
     assert!(
@@ -201,7 +201,7 @@ fn req41_scores_candidate_with_expected_counts() {
     );
     // 比較相手 A の正解は 240。
     assert!(
-        out.contains("\"name\":\"A\",\"role\":\"compare\","),
+        out.contains("\"name\":\"C1\",\"role\":\"compare\","),
         "{out}"
     );
     assert!(out.contains("\"correct\":240,\"accuracy\":0.8,"), "{out}");
@@ -211,7 +211,7 @@ fn req41_scores_candidate_with_expected_counts() {
         "{out}"
     );
     assert!(
-        out.contains("{\"against\":\"A\",\"b\":30,\"c\":0,\"p_raw\":"),
+        out.contains("{\"against\":\"C1\",\"b\":30,\"c\":0,\"p_raw\":"),
         "{out}"
     );
     // 混同行列の P 行（alpha の正解 150 件のうち 30 件を beta、120 件を alpha と予測）。
@@ -247,11 +247,11 @@ fn req25_reference_is_outside_the_holm_family() {
         "--candidate",
         "P=p.jsonl",
         "--reference",
-        "R=a.jsonl",
+        "C3=a.jsonl",
     ]));
     assert!(
         out.contains(
-            "\"references\":[{\"candidate\":\"P\",\"against\":\"R\",\"b\":30,\"c\":0,\"p_raw\":"
+            "\"references\":[{\"candidate\":\"P\",\"against\":\"C3\",\"b\":30,\"c\":0,\"p_raw\":"
         ),
         "{out}"
     );
@@ -345,54 +345,115 @@ fn req23_invalid_scores_count_as_wrong() {
     assert!(out.contains("\"correct\":295,"), "{out}");
 }
 
+/// 台帳ファイルのパス（凍結 test の sha256 のディレクトリ配下。唯一のサブディレクトリを探す）。
+fn ledger_file(env: &Env, seed: u32, name: &str) -> PathBuf {
+    let root = env.work.join("proj/poc26_score_ledger");
+    let sub: Vec<_> = std::fs::read_dir(&root)
+        .expect("ledger root")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(sub.len(), 1, "one evaluation sha256 dir");
+    assert_eq!(sub[0].file_name().expect("name").len(), 64);
+    sub[0].join(format!("seed-{seed}/{name}.sha256"))
+}
+
 /// REQ-27: 台帳。同一 candidate の 2 回目は（同じ sha256 でも）拒否し、compare は同じ sha256 の
-/// 再読込を許可し、別の sha256 は拒否する。
+/// 再読込を許可し、別の sha256 は拒否する。別 seed の台帳は独立。
 #[test]
 fn req27_ledger_enforces_single_application() {
     let env = Env::new("ledger");
     env.write("p.jsonl", &pred_jsonl(pred_p));
     env.write("a.jsonl", &pred_jsonl(pred_a));
-    env.ok(&args(&["--candidate", "A=a.jsonl"]));
-    assert!(
-        env.work
-            .join("proj/poc26_score_ledger/seed-7/A.sha256")
-            .is_file()
-    );
-    // 同じ NAME・同じ sha256 でも、採点対象としての 2 回目は拒否する。
+    env.ok(&args(&["--candidate", "C1=a.jsonl"]));
+    assert!(ledger_file(&env, 0, "C1").is_file());
     env.fails(
-        &args(&["--candidate", "A=a.jsonl"]),
+        &args(&["--candidate", "C1=a.jsonl"]),
         "candidate has already been scored",
     );
-    // A を比較相手として再読込（同じ sha256）は許可。
     env.ok(&args(&[
         "--candidate",
         "P=p.jsonl",
         "--compare",
-        "A=a.jsonl",
+        "C1=a.jsonl",
     ]));
-    // 別の sha256（予測の差し替え）は拒否。拒否した実行は P の台帳に影響しない（P は記録済みなので別名で確認）。
     env.write(
         "a2.jsonl",
         &pred_jsonl(|i| Some(if i < 61 { "gamma" } else { gold_of(i) })),
     );
+    env.write(
+        "c.jsonl",
+        &pred_jsonl(|i| Some(if i < 10 { "gamma" } else { gold_of(i) })),
+    );
     env.fails(
-        &args(&["--candidate", "Q=p.jsonl", "--compare", "A=a2.jsonl"]),
+        &args(&["--candidate", "AR=c.jsonl", "--compare", "C1=a2.jsonl"]),
         "prediction file differs from the one recorded for this name",
     );
-    assert!(
-        !env.work
-            .join("proj/poc26_score_ledger/seed-7/Q.sha256")
-            .exists()
-    );
-    // 別の seed の台帳は独立（同じ NAME を採点対象にできる）。
+    assert!(!ledger_file(&env, 0, "AR").exists());
     env.ok(&[
         "--project-dir",
         "proj",
         "--seed",
-        "8",
+        "1",
         "--candidate",
-        "A=a.jsonl",
+        "C1=a.jsonl",
     ]);
+}
+
+/// REQ-27: 同じ seed で、同じ sha256 の予測ファイルを別 NAME の採点対象として出すと拒否する。
+#[test]
+fn req27_same_sha256_under_another_name_is_rejected() {
+    let env = Env::new("othername");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.ok(&args(&["--candidate", "P=p.jsonl"]));
+    env.fails(
+        &args(&["--candidate", "C3=p.jsonl"]),
+        "prediction file has already been scored under another name",
+    );
+    // 別 seed なら独立。
+    env.ok(&[
+        "--project-dir",
+        "proj",
+        "--seed",
+        "2",
+        "--candidate",
+        "C3=p.jsonl",
+    ]);
+}
+
+/// REQ-27: 事前登録外の NAME・seed と、reference 2 個を拒否する（適用は最大 4 候補 × 3 seed）。
+#[test]
+fn req27_rejects_names_seeds_and_references_outside_preregistration() {
+    let env = Env::new("prereg");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    for name in ["X", "p", "c1", "ar", "C2"] {
+        env.fails(
+            &args(&["--candidate", &format!("{name}=p.jsonl")]),
+            "name is not in the preregistered list",
+        );
+    }
+    env.fails(
+        &[
+            "--project-dir",
+            "proj",
+            "--seed",
+            "3",
+            "--candidate",
+            "P=p.jsonl",
+        ],
+        "seed is not in the preregistered list",
+    );
+    env.fails(
+        &args(&[
+            "--candidate",
+            "P=p.jsonl",
+            "--reference",
+            "C1=p.jsonl",
+            "--reference",
+            "C3=p.jsonl",
+        ]),
+        "too many --reference options",
+    );
+    assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
 
 /// REQ-39: 経路の閉じ込め（`../`・絶対パス）と NAME の文字種を拒否する。

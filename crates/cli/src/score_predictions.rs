@@ -20,7 +20,7 @@
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
 //! 5. Holm: 採点対象の [対 majority, 対 `--compare` 各相手] を族の大きさ 3 固定で補正（相手が欠けても
 //!    m は 3。事前登録。脱落は保守側）。`--reference` は族に入れず McNemar の生の値だけ出す
-//! 6. 台帳: `poc26_score_ledger/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
+//! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
 //!
 //! # 1 回限りの担保（REQ-27）
 //!
@@ -28,6 +28,16 @@
 //! 結果を見て予測ファイルを作り直して再採点できない）。`--compare`・`--reference` は同じ sha256 の
 //! 再読込だけ許可し、別の sha256 は拒否する（比較相手の差し替えを許さない）。台帳の書き込みは全検証が
 //! 通った後、出力の直前に行う（比較相手を先に、採点対象を最後に書く）。
+//!
+//! # 適用回数の機械的な制限（事前登録 4〜5 節）
+//!
+//! NAME は許可リスト {P, C1, C3, AR}、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の sha256 単位に分ける。
+//! 採点対象としての適用は 4 候補 × 3 seed = 最大 12 回に機械的に制限される。予測ファイルを作り直して
+//! 同名・別 sha256 で出すと拒否し、別名は許可リストで、同じ sha256 の別名での再採点は台帳の照合で塞ぐ。
+//! `--reference` は最大 1 個、`--compare` は最大 2 個。許可リスト外の候補を足すには、事前登録の追補と
+//! コード変更が要る。
+//!
+//! ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
 //!
 //! # 必要件数の仮定（事前登録 4〜5 節）
 //!
@@ -72,6 +82,14 @@ const LEDGER_DIR: &str = "poc26_score_ledger";
 const FAMILY_SIZE: usize = 3;
 /// `--compare` の最大数（族の大きさ 3 から対 majority の 1 を引いた数）。
 const MAX_COMPARES: usize = FAMILY_SIZE - 1;
+/// 事前登録 4 節の候補名（P・C1・C3・AR〔autoregressive〕）。大文字小文字は区別する。
+///
+/// ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
+const ALLOWED_NAMES: [&str; 4] = ["P", "C1", "C3", "AR"];
+/// 事前登録 5 節の seed。
+const ALLOWED_SEEDS: [u32; 3] = [0, 1, 2];
+/// `--reference` の最大数。
+const MAX_REFERENCES: usize = 1;
 /// 台帳ファイルの読み込み上限（sha256 の 16 進 64 文字と改行の余裕）。
 const MAX_LEDGER_BYTES: u64 = 128;
 
@@ -109,6 +127,9 @@ fn parse_named(value: &str) -> Result<NamedPath, ErrorReport> {
     if !name_ok || path.is_empty() {
         return Err(invalid("name must match [A-Za-z0-9_-]{1,32}"));
     }
+    if !ALLOWED_NAMES.contains(&name) {
+        return Err(invalid("name is not in the preregistered list"));
+    }
     Ok(NamedPath {
         name: name.to_string(),
         path: PathBuf::from(path),
@@ -144,6 +165,9 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ScoreArgs
                     .to_str()
                     .and_then(|v| v.parse::<u32>().ok())
                     .ok_or_else(|| invalid("seed must be a u32"))?;
+                if !ALLOWED_SEEDS.contains(&parsed) {
+                    return Err(invalid("seed is not in the preregistered list"));
+                }
                 if seed.replace(parsed).is_some() {
                     return Err(invalid("duplicate option"));
                 }
@@ -164,6 +188,9 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ScoreArgs
             }
             _ => return Err(invalid("unknown argument")),
         }
+    }
+    if references.len() > MAX_REFERENCES {
+        return Err(invalid("too many --reference options"));
     }
     if compares.len() > MAX_COMPARES {
         return Err(invalid("too many --compare options"));
@@ -353,23 +380,45 @@ fn metrics_json(labels: &[&str], m: &SingleSelectMetrics) -> Result<(String, Str
     Ok((format!("[{}]", per_label.join(",")), confusion))
 }
 
-/// 台帳ファイルのプロジェクト内の相対パス。
-fn ledger_rel(seed: u32, name: &str) -> PathBuf {
+/// 台帳のディレクトリ（凍結 test の sha256 単位・seed 単位）のプロジェクト内の相対パス。
+fn ledger_dir(eval_sha: &str, seed: u32) -> PathBuf {
     Path::new(LEDGER_DIR)
+        .join(eval_sha)
         .join(format!("seed-{seed}"))
-        .join(format!("{name}.sha256"))
+}
+
+/// 台帳ファイルのプロジェクト内の相対パス。
+fn ledger_rel(eval_sha: &str, seed: u32, name: &str) -> PathBuf {
+    ledger_dir(eval_sha, seed).join(format!("{name}.sha256"))
 }
 
 /// 台帳を照合し、書くべきもの（名前・sha256）を返す。違反は書き込み前に `invalid_input`。
+///
+/// 採点対象は、同名が台帳にある場合に加え、同じ seed の台帳に同じ sha256 が別の NAME で既にある場合も
+/// 拒否する（別名での再採点を塞ぐ）。
 fn check_ledger<'a>(
     project: &Project,
+    eval_sha: &str,
     seed: u32,
     loaded: &'a [Loaded<'_>],
 ) -> Result<Vec<&'a Loaded<'a>>, ErrorReport> {
     let mut to_write = Vec::new();
     for l in loaded {
-        match project.read_optional(ledger_rel(seed, &l.named.name), MAX_LEDGER_BYTES)? {
-            None => to_write.push(l),
+        match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
+            None => {
+                if l.role == Role::Candidate {
+                    for other in ALLOWED_NAMES.iter().filter(|n| **n != l.named.name) {
+                        let recorded = project
+                            .read_optional(ledger_rel(eval_sha, seed, other), MAX_LEDGER_BYTES)?;
+                        if recorded.is_some_and(|r| r.trim_ascii() == l.sha256.as_bytes()) {
+                            return Err(invalid(
+                                "prediction file has already been scored under another name",
+                            ));
+                        }
+                    }
+                }
+                to_write.push(l);
+            }
             Some(_) if l.role == Role::Candidate => {
                 return Err(invalid("candidate has already been scored"));
             }
@@ -386,10 +435,16 @@ fn check_ledger<'a>(
 }
 
 /// 台帳へ書く（比較相手を先、採点対象を最後。親ディレクトリが無ければ作る）。
-fn write_ledger(project: &Project, seed: u32, to_write: &[&Loaded<'_>]) -> Result<(), ErrorReport> {
+fn write_ledger(
+    project: &Project,
+    eval_sha: &str,
+    seed: u32,
+    to_write: &[&Loaded<'_>],
+) -> Result<(), ErrorReport> {
     let root = Path::new(LEDGER_DIR);
-    let dir = root.join(format!("seed-{seed}"));
-    for d in [root, dir.as_path()] {
+    let by_eval = root.join(eval_sha);
+    let by_seed = ledger_dir(eval_sha, seed);
+    for d in [root, by_eval.as_path(), by_seed.as_path()] {
         if !project.exists(d)? {
             project.create_dir(d)?;
         }
@@ -400,7 +455,7 @@ fn write_ledger(project: &Project, seed: u32, to_write: &[&Loaded<'_>]) -> Resul
         .chain(to_write.iter().filter(|l| l.role == Role::Candidate));
     for l in ordered {
         project.write_new(
-            ledger_rel(seed, &l.named.name),
+            ledger_rel(eval_sha, seed, &l.named.name),
             format!("{}\n", l.sha256).as_bytes(),
         )?;
     }
@@ -538,8 +593,9 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
     }
 
     // 台帳は全検証が通った後、出力の直前に書く（検証の失敗で適用権を使わない）。
-    let to_write = check_ledger(&project, args.seed, &loaded)?;
-    write_ledger(&project, args.seed, &to_write)?;
+    let eval_sha = freeze.sha256().to_hex();
+    let to_write = check_ledger(&project, &eval_sha, args.seed, &loaded)?;
+    write_ledger(&project, &eval_sha, args.seed, &to_write)?;
 
     Ok(format!(
         "{{\"step\":\"score_predictions\",\"status\":\"ok\",\"seed\":{},\"evaluation_sha256\":\"{}\",\"n_total\":{},\"required_sample_size\":{},\"candidates\":[{}],\"holm\":{{\"candidate\":{},\"m\":{},\"comparisons\":[{}]}},\"references\":[{}]}}",

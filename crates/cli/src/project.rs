@@ -303,6 +303,24 @@ impl Project {
         Ok(())
     }
 
+    /// 既存ファイルを読み取り専用（0400）にする（開いた fd への `fchmod`。パスを開き直さない）。
+    /// 評価の予測ファイルなど、書いた後に差し替えさせたくない記録に使う（非 unix では何もしない）。
+    ///
+    /// # Errors
+    /// 開けない場合は経路の拒否、`fchmod` 失敗は `runtime_error`。
+    pub fn set_read_only(&self, rel: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let (file, _) = self.open_file(rel)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .map_err(|_| runtime("cannot protect project file"))?;
+        }
+        #[cfg(not(unix))]
+        drop(file);
+        Ok(())
+    }
+
     /// `rel` の通常ファイルを保持 fd 起点で削除する。無ければ何もしない（削除に失敗したら
     /// `runtime_error`。古い記録を残さないための fail-closed）。
     ///

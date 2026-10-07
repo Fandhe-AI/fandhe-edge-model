@@ -106,6 +106,12 @@ mod tests {
         );
     }
 
+    /// REQ-27: `\r`・`\t` はエスケープ、非 ASCII（絵文字）と DEL（0x7f）はそのまま出す（JSON として有効）。
+    #[test]
+    fn req27_json_string_handles_cr_tab_emoji_del() {
+        assert_eq!(json_string("\r\t😀\u{7f}"), "\"\\r\\t😀\u{7f}\"");
+    }
+
     /// REQ-27: 制御文字は `\u00XX` にエスケープする。
     #[test]
     fn req27_json_string_escapes_control_characters() {
