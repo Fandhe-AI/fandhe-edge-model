@@ -1320,12 +1320,15 @@ def test_main_limits_mlx_cache_and_restores_it(monkeypatch: pytest.MonkeyPatch) 
         return 0
 
     before = 3 * 1024 * 1024 * 1024
-    mx.set_cache_limit(before)
-    p = cli._build_parser()
-    monkeypatch.setattr(cli, "_build_parser", lambda: p)
-    for action in p._subparsers._group_actions[0].choices.values():
-        if action.prog.endswith("compare-probe"):
-            action.set_defaults(func=fake_cmd)
-    assert main(["compare-probe", "a.json", "b.json"]) == 0
-    assert seen == [512 * 1024 * 1024]
-    assert mx.set_cache_limit(before) == before
+    original = mx.set_cache_limit(before)
+    try:
+        p = cli._build_parser()
+        monkeypatch.setattr(cli, "_build_parser", lambda: p)
+        for action in p._subparsers._group_actions[0].choices.values():
+            if action.prog.endswith("compare-probe"):
+                action.set_defaults(func=fake_cmd)
+        assert main(["compare-probe", "a.json", "b.json"]) == 0
+        assert seen == [512 * 1024 * 1024]
+        assert mx.set_cache_limit(before) == before
+    finally:
+        mx.set_cache_limit(original)
