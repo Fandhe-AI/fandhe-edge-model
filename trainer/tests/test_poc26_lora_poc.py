@@ -1304,3 +1304,31 @@ def test_project_adds_the_callers_held_hidden_and_activation_bytes(
     monkeypatch.undo()
     prompt = ctx.prompt_ids("shape check")
     assert score_labels(model, prompt, ctx.label_ids, ctx.pad_id).shape == (len(ctx.label_ids),)
+
+
+def test_main_limits_mlx_cache_and_restores_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: 実行中は MLX の buffer cache を上限つきにし、終了後に元へ戻す。
+
+    CPU では cache が溜まって RSS 上限を数ステップで超えるため。
+    """
+    from tools.poc26 import cli
+
+    seen: list[int] = []
+
+    def fake_cmd(_a: object) -> int:
+        seen.append(mx.set_cache_limit(cli.CACHE_LIMIT_BYTES))
+        return 0
+
+    before = 3 * 1024 * 1024 * 1024
+    original = mx.set_cache_limit(before)
+    try:
+        p = cli._build_parser()
+        monkeypatch.setattr(cli, "_build_parser", lambda: p)
+        for action in p._subparsers._group_actions[0].choices.values():
+            if action.prog.endswith("compare-probe"):
+                action.set_defaults(func=fake_cmd)
+        assert main(["compare-probe", "a.json", "b.json"]) == 0
+        assert seen == [512 * 1024 * 1024]
+        assert mx.set_cache_limit(before) == before
+    finally:
+        mx.set_cache_limit(original)
