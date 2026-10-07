@@ -94,17 +94,31 @@ pub(crate) fn prepare_baseline(
     let Some(assumption) = definition.baseline_comparison() else {
         return Ok(None);
     };
+    let majority_label = majority_from_train(definition, records, split)?;
+    let required = required_from_assumption(assumption)?;
+    Ok(Some(PreparedBaseline {
+        majority_label,
+        required,
+    }))
+}
+
+/// train 分割のラベルだけから majority のラベルを求める（`prepare_baseline` と PoC-26 の採点入口
+/// `score_predictions` が共有する。評価データを引数に取らない。REQ-27・REQ-41・#445）。
+///
+/// # Errors
+/// train の行が無い・ラベルが選択肢に無い場合は `invalid_input`。
+pub(crate) fn majority_from_train(
+    definition: &Definition,
+    records: &[ValidRecord],
+    split: &SplitResult,
+) -> Result<String, ErrorReport> {
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let train_labels: Vec<&str> = train_rows(records, split)
         .map(|r| r.label_id.as_str())
         .collect();
-    let majority = fit_majority(&labels, &train_labels)
-        .map_err(|_| invalid("baseline comparison cannot be prepared"))?;
-    let required = required_from_assumption(assumption)?;
-    Ok(Some(PreparedBaseline {
-        majority_label: majority.to_string(),
-        required,
-    }))
+    fit_majority(&labels, &train_labels)
+        .map(str::to_string)
+        .map_err(|_| invalid("baseline comparison cannot be prepared"))
 }
 
 /// 評価器の判定を記録の語彙へ写す。将来 variant が増えたら黙って通さず失敗させる（fail-closed）。

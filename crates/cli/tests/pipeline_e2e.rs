@@ -1315,6 +1315,26 @@ mod suite {
         );
         // 既存なら上書きしない（評価記録と同じく 1 回限り）。
         env.fails(&EVALUATE_1, 64, "invalid_input");
+        // 保存した予測は PoC-26 の採点入口（`fandhe-edge-score`）でそのまま読め、`evaluate` と同じ正解数になる。
+        let scored = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "1",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        let scored = String::from_utf8(scored.stdout).expect("utf8");
+        assert!(scored.contains("\"n_total\":12,"), "{scored}");
+        assert_eq!(
+            number_field(&scored, "correct").to_bits(),
+            f64::to_bits(matched),
+            "{scored}"
+        );
     }
 
     /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した

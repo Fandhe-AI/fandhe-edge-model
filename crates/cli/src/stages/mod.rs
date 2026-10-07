@@ -41,7 +41,7 @@ use crate::error_report::emit_error_report;
 use crate::output::write_stage_line;
 use crate::stage_output::{emit_evaluate_skipped, emit_package_outcome};
 
-mod baseline;
+pub(crate) mod baseline;
 pub mod candidate_artifact;
 pub mod evaluate;
 pub mod infer;

@@ -45,5 +45,6 @@ pub mod log;
 pub mod output;
 pub(crate) mod prediction_lines;
 pub mod project;
+pub mod score_predictions;
 pub mod stage_output;
 pub mod stages;
