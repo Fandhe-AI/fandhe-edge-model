@@ -116,8 +116,8 @@ use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
-    resolve_candidates, verified_split,
+    candidate_rel, effective_train_seed, load_trained, request_is_smoke_trained,
+    request_matches_candidate, resolve_candidates, verified_split,
 };
 
 /// `evaluate` の成功結果（stdout の JSON 1 つへ写す）。
@@ -320,6 +320,7 @@ fn prepare_candidate(
     index: usize,
     is_target: bool,
 ) -> Result<Option<PreparedCandidate>, ErrorReport> {
+    let seed = effective_train_seed(project, index, seed)?;
     let candidates = resolve_candidates(project, definition, index, seed)?;
     let candidate = candidates
         .get(index)

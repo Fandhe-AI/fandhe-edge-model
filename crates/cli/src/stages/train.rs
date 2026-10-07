@@ -46,7 +46,7 @@ use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANDIDATES_DIR, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE, RESULT_FILE,
-    SPLIT_FILE, TRAIN_INPUT_FILE, fail, invalid, runtime,
+    SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -145,7 +145,11 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     super::inspect::ensure_evaluation_frozen(&project)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
-    let (split, seed) = verified_split(&project, &records)?;
+    let (split, split_seed) = verified_split(&project, &records)?;
+    // 学習 seed は既定で分割の seed。`--train-seed` は学習だけを上書きし、分割・凍結は変えない。
+    // 上書き時は実際に使った値を `train_seed.txt` に記録し、下流（evaluate・select・package）は
+    // [`effective_train_seed`] でそれを正とする（`request.json` の seed 改ざんは従来どおり照合で弾く）。
+    let seed = args.train_seed.unwrap_or(split_seed);
 
     let mut candidates = resolve_candidates(&project, &definition, args.candidate, seed)?;
     if args.candidate >= candidates.len() {
@@ -183,6 +187,7 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
         &request,
         &train_jsonl,
         &request_json,
+        args.train_seed,
     );
     match trained {
         Ok(()) => Ok(TrainReport::new(args.candidate, candidate.candidate_id)),
@@ -207,10 +212,14 @@ fn train_in_candidate_dir(
     request: &TrainRequest,
     train_jsonl: &[u8],
     request_json: &[u8],
+    train_seed_override: Option<u32>,
 ) -> Result<(), ErrorReport> {
     let job_dir = project.create_dir(rel.join(JOB_DIR))?;
     project.write_new(rel.join(TRAIN_INPUT_FILE), train_jsonl)?;
     project.write_new(rel.join(REQUEST_FILE), request_json)?;
+    if let Some(seed) = train_seed_override {
+        project.write_new(rel.join(TRAIN_SEED_FILE), seed.to_string().as_bytes())?;
+    }
 
     let run = run_train(
         launcher,
@@ -252,6 +261,26 @@ pub fn verified_split(
         .verify_against(&rows)
         .map_err(|_| invalid("split record does not match the data"))?;
     Ok((result, seed))
+}
+
+/// 候補 `index` の学習 seed を返す。`train --train-seed` で上書きされた候補は `train_seed.txt` の値、
+/// それ以外は `split_seed`（`split.json` の seed）。`evaluate`・`select`・`package` が期待する
+/// 学習リクエストを組み立てるときに使う（REQ-17・REQ-41）。
+///
+/// # Errors
+/// 記録が読めない・`u32` として不正な場合は `invalid_input`（64）。
+pub fn effective_train_seed(
+    project: &Project,
+    index: usize,
+    split_seed: u32,
+) -> Result<u32, ErrorReport> {
+    let Some(bytes) = project.read_optional(candidate_rel(index).join(TRAIN_SEED_FILE), 16)? else {
+        return Ok(split_seed);
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|t| t.parse::<u32>().ok())
+        .ok_or_else(|| invalid("train seed record is invalid"))
 }
 
 /// `split.json` を読んで解析する（検証はしない。`package` が記録済みの seed を取り出すのにも使う）。

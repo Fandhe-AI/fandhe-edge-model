@@ -144,6 +144,12 @@ const TRAIN_OPTS: &[OptSpec] = &[
         required: false,
         help: "Run a short smoke training",
     },
+    opt(
+        "--train-seed",
+        "N",
+        false,
+        "Training seed override (u32, default: the seed recorded in split.json; the split is unchanged)",
+    ),
 ];
 const EVALUATE_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
@@ -205,6 +211,8 @@ pub struct TrainArgs {
     pub project_dir: PathBuf,
     pub candidate: usize,
     pub smoke: bool,
+    /// `--train-seed`: 学習 seed の上書き（省略時は `split.json` の seed。分割は変えない。REQ-17・REQ-41）。
+    pub train_seed: Option<u32>,
 }
 /// `evaluate` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +296,8 @@ pub enum ArgsError {
     InvalidCandidate,
     /// `--seed` が `u32` の範囲の非負整数でない。
     InvalidSeed,
+    /// `--train-seed` が `u32` の範囲の非負整数でない。
+    InvalidTrainSeed,
     ConflictingInferSource,
     MissingInferSource,
     /// `--id` は `--text` とだけ、`--out` は `--input-file` とだけ併用できる。
@@ -336,6 +346,9 @@ impl fmt::Display for ArgsError {
             }
             ArgsError::InvalidSeed => {
                 f.write_str("option --seed must be an integer in the range 0 to 4294967295")
+            }
+            ArgsError::InvalidTrainSeed => {
+                f.write_str("option --train-seed must be an integer in the range 0 to 4294967295")
             }
             ArgsError::ConflictingInferSource => {
                 f.write_str("options --text and --input-file cannot be used together")
@@ -515,6 +528,16 @@ impl Values {
                 .map_err(|_| ArgsError::InvalidSeed),
         }
     }
+    fn train_seed(&mut self) -> Result<Option<u32>, ArgsError> {
+        self.take("--train-seed")
+            .map(|v| {
+                v.into_string()
+                    .map_err(|_| ArgsError::NonUtf8Argument)?
+                    .parse::<u32>()
+                    .map_err(|_| ArgsError::InvalidTrainSeed)
+            })
+            .transpose()
+    }
     fn candidate(&mut self) -> Result<usize, ArgsError> {
         let v = self
             .take("--candidate")
@@ -542,6 +565,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
             project_dir: v.path("--project-dir")?,
             candidate: v.candidate()?,
             smoke: v.take("--smoke").is_some(),
+            train_seed: v.train_seed()?,
         }),
         Subcommand::Evaluate => Command::Evaluate(EvaluateArgs {
             project_dir: v.path("--project-dir")?,
@@ -715,6 +739,36 @@ mod tests {
         );
     }
 
+    /// REQ-17・REQ-41: `train --train-seed` は u32 の範囲で受理し、省略時は `None`。範囲外・負数・非数は
+    /// `InvalidTrainSeed`（`invalid_input`）。
+    #[test]
+    fn req17_train_seed_parses_with_range() {
+        let t = |v: &str| {
+            p(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "0",
+                "--train-seed",
+                v,
+            ])
+        };
+        let seed_of = |v: &str| match t(v) {
+            Ok(Invocation::Run(Command::Train(a))) => a.train_seed,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(seed_of("2"), Some(2));
+        assert_eq!(seed_of("4294967295"), Some(u32::MAX));
+        assert_eq!(t("4294967296"), Err(ArgsError::InvalidTrainSeed));
+        assert_eq!(t("-1"), Err(ArgsError::InvalidTrainSeed));
+        assert_eq!(t("abc"), Err(ArgsError::InvalidTrainSeed));
+        assert_eq!(
+            ArgsError::InvalidTrainSeed.exit_code(),
+            ExitCode::InvalidInput
+        );
+    }
+
     #[test]
     fn req33_train_and_evaluate_parse() {
         assert_eq!(
@@ -729,7 +783,8 @@ mod tests {
             Command::Train(TrainArgs {
                 project_dir: "proj".into(),
                 candidate: 2,
-                smoke: true
+                smoke: true,
+                train_seed: None
             })
         );
         assert_eq!(
@@ -737,7 +792,8 @@ mod tests {
             Command::Train(TrainArgs {
                 project_dir: "proj".into(),
                 candidate: 0,
-                smoke: false
+                smoke: false,
+                train_seed: None
             })
         );
         assert_eq!(

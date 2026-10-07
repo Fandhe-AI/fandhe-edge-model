@@ -50,7 +50,10 @@ use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
 };
 use super::infer::load_backend;
-use super::train::{load_trained, request_matches_candidate, resolve_candidates, verified_split};
+use super::train::{
+    effective_train_seed, load_trained, request_matches_candidate, resolve_candidates,
+    verified_split,
+};
 
 /// `select` を実行する。
 ///
@@ -142,16 +145,17 @@ pub fn compute_selection_with_exclusions(
         .collect();
     // 分割記録をデータから再現して照合する。保存済みの `request.json` の validation を信用すると、
     // 記録の改変で任意の部分集合の正解率により候補を選べてしまう（REQ-27）。
-    let (split, seed) = verified_split(project, &records)?;
+    let (split, split_seed) = verified_split(project, &records)?;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
 
     let mut evaluated = Vec::new();
     let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
-    let candidate_count = resolve_candidates(project, definition, 0, seed)?.len();
+    let candidate_count = resolve_candidates(project, definition, 0, split_seed)?.len();
     let candidates = (0..candidate_count)
         .map(|i| {
+            let seed = effective_train_seed(project, i, split_seed)?;
             let mut all = resolve_candidates(project, definition, i, seed)?;
             if i < all.len() {
                 Ok(all.swap_remove(i))

@@ -121,8 +121,8 @@ use super::infer::build_pipeline;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, load_trained, request_is_smoke_trained, request_matches_candidate,
-    resolve_candidates, train_rows, verified_split,
+    candidate_rel, effective_train_seed, load_trained, request_is_smoke_trained,
+    request_matches_candidate, resolve_candidates, train_rows, verified_split,
 };
 
 /// 容量の上限の既定値（バイト。REQ-30 の目安 40MB）。定義の `limits.max_package_bytes` が無いときだけ使う
@@ -168,7 +168,8 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 期待する seed・validation 入力は固定値ではなく `split.json` の記録とデータから求める
     // （`compute_selection` が分割を検証済みだが、期待値の組み立てのため同じ検証をもう一度通す）。
     let records = project.load_records(&definition)?;
-    let (split, seed) = verified_split(&project, &records)?;
+    let (split, split_seed) = verified_split(&project, &records)?;
+    let seed = effective_train_seed(&project, selection.candidate_index, split_seed)?;
     let candidates = resolve_candidates(&project, &definition, selection.candidate_index, seed)?;
     let candidate = candidates
         .get(selection.candidate_index)
