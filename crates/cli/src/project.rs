@@ -72,6 +72,8 @@ pub const CANDIDATES_DIR: &str = "candidates";
 pub const FINAL_TEST_LEDGER_DIR: &str = "final_test_ledger";
 /// 候補ディレクトリ内の評価完了記録のファイル名（`evaluate` が新規に書き、`package` が確認する。#314）。
 pub const EVALUATION_RECORD_FILE: &str = "evaluation_record.json";
+/// 評価データの 1 件ごとの予測（`evaluate` が評価記録と同じ候補ディレクトリへ保存する JSONL。REQ-27・#445）。
+pub const EVALUATION_PREDICTIONS_FILE: &str = "evaluation_predictions.jsonl";
 /// 選定記録のファイル名。
 pub const SELECTION_FILE: &str = "selection_record.json";
 /// 全候補が容量超過で除外された `select` の除外結果（内部記録。他工程は読まない。#125）。

@@ -1283,6 +1283,40 @@ mod suite {
         assert!(record.contains("\"config_id\":\"c3:seed42\""), "{record}");
     }
 
+    /// REQ-27・REQ-41・#445: `evaluate` は評価データの 1 件ごとの予測を `evaluation_predictions.jsonl` へ
+    /// 保存する。件数・id の順・予測ラベルが評価データ・`correct` と整合し、2 行目以降も同じ形式。
+    pub fn evaluate_saves_per_record_predictions() {
+        let env = eval_trained("evalpreds");
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+        let text =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_predictions.jsonl"))
+                .expect("predictions");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 12, "{text}");
+        let mut matched = 0.0;
+        let mut index = 0;
+        for i in 0..4 {
+            for l in LABELS {
+                let line = lines[index];
+                index += 1;
+                let prefix =
+                    format!("{{\"id\":\"e-{l}-{i}\",\"status\":\"ok\",\"predicted_label\":\"");
+                assert!(line.starts_with(&prefix), "{line}");
+                if line[prefix.len()..].starts_with(&format!("{l}\"")) {
+                    matched += 1.0;
+                }
+                assert!(line.contains("\"scores\":{\"alpha\":"), "{line}");
+            }
+        }
+        assert_eq!(
+            number_field(&out, "correct").to_bits(),
+            f64::to_bits(matched)
+        );
+        // 既存なら上書きしない（評価記録と同じく 1 回限り）。
+        env.fails(&EVALUATE_1, 64, "invalid_input");
+    }
+
     /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した
     /// 予測と正解の一致件数に等しい（評価経路と推論経路の全件一致）。
     pub fn evaluate_correct_matches_infer_on_package() {
@@ -2782,6 +2816,10 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_keeps_model_and_evaluation_hashes",
             suite::evaluate_keeps_model_and_evaluation_hashes,
+        ),
+        (
+            "evaluate_saves_per_record_predictions",
+            suite::evaluate_saves_per_record_predictions,
         ),
         (
             "evaluate_correct_matches_infer_on_package",

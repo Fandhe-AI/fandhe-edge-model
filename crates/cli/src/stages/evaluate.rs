@@ -52,6 +52,14 @@
 //! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
 //! 台帳は完了状態にならず（適用権のロックのみが残る）、記録の無い完了を作らない（REQ-27）。
 //!
+//! # 1 件ごとの予測の保存（REQ-27・REQ-41・#445）
+//!
+//! 評価記録と同じ候補ディレクトリへ `evaluation_predictions.jsonl`（評価データの行順。
+//! `{id,status,predicted_label,scores}`。[`crate::prediction_lines`]）を新規に書く（既存なら適用権を取る前に
+//! `invalid_input`）。PoC-26 の採点入口（`fandhe-edge-score`）が、他候補の予測と同じ形式で読む。
+//! stdout の JSON・[`EvaluationRecord`] のスキーマは変えない。書き込みは評価記録と同じ位置
+//! （台帳への完了記録の前）で行い、失敗時の扱いも同じ。
+//!
 //! # 選定との順序（REQ-27）
 //!
 //! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
@@ -69,6 +77,7 @@
 //! majority は train 分割のラベルだけから作り、必要件数は定義の仮定から求める。どちらも適用権を取る前に
 //! 確定する（[`super::baseline::prepare_baseline`]）。欄が無い定義では比較しない。
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::Instant;
 
@@ -102,8 +111,10 @@ use crate::error_report::{
     EvalPredictFailure, ToErrorReport, acquire_error_report, apply_once_error_report,
 };
 use crate::infer_batch::judgment_from_prediction;
+use crate::prediction_lines::prediction_line;
 use crate::project::{
-    EVALUATION_RECORD_FILE, Project, SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
+    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, Project, SELECTION_FILE, fail,
+    inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -215,6 +226,13 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     )?;
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
     decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    // 1 件ごとの予測の保存用に id を控える（`decode_evaluation` と同じ検査・同じ行順。推論側には渡さない）。
+    let eval_ids: Vec<String> = inspect_bytes(&eval_bytes, &definition)?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    // 推論ごとのスコア（保存用。推論関数の戻り値の型は変えず、横で受ける）。
+    let scores_log: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
     // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
     // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
     let baseline = prepare_baseline(&definition, &records, &split)?;
@@ -241,6 +259,14 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .ledger()
         .pin_selection(&freeze.sha256(), &target.config_id, &selection_sha256)
         .map_err(|e| acquire_error_report(&e))?;
+    // 1 件ごとの予測ファイルも、適用権を取る前に不在を確認する（書けないことで適用権を失わない）。
+    // 台帳の選定固定より後に置く（選定不一致の拒否を優先する既存の挙動を変えない）。
+    let predictions_rel = candidate_rel(args.candidate).join(EVALUATION_PREDICTIONS_FILE);
+    if project.exists(&predictions_rel)? {
+        return Err(invalid(
+            "candidate has already been evaluated on the frozen data",
+        ));
+    }
 
     // 指標の算出・評価記録の書き込みは、台帳へ完了を記録する前（`finish`）に済ませる。失敗しても
     // 台帳は完了状態にならず、記録の無い完了（台帳だけが完了）を作らない（REQ-27）。
@@ -253,6 +279,11 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             &target,
             args.candidate,
             &record_rel,
+            &PredictionsSink {
+                rel: &predictions_rel,
+                ids: &eval_ids,
+                scores: &scores_log.borrow(),
+            },
             definition_sha256,
             onnx_digest,
             baseline.as_ref(),
@@ -270,6 +301,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         &eval_bytes,
         &target,
         onnx_digest,
+        &scores_log,
         finish,
     ) {
         Ok(v) => v,
@@ -434,6 +466,7 @@ fn finalize_evaluation(
     target: &PreparedCandidate,
     candidate: usize,
     record_rel: &Path,
+    predictions: &PredictionsSink<'_>,
     definition_sha256: String,
     onnx_digest: Sha256Digest,
     baseline: Option<&PreparedBaseline>,
@@ -492,11 +525,46 @@ fn finalize_evaluation(
     if u64::try_from(record_json.len()).map_or(true, |n| n > MAX_EVALUATION_RECORD_BYTES) {
         return Err(runtime("evaluation record is too large"));
     }
+    // 1 件ごとの予測を先に書く（記録があるのに予測が無い状態を作らない）。失敗は記録の失敗と同じ扱い。
+    project.write_new(
+        predictions.rel,
+        predictions
+            .to_jsonl(&labels, &applied.output)
+            .ok_or_else(|| runtime("cannot build evaluation predictions"))?
+            .as_bytes(),
+    )?;
     project.write_new(record_rel, &record_json)?;
     Ok(report)
 }
 
+/// 1 件ごとの予測の保存に必要な材料（書き込み先・評価データの id 列・推論ごとのスコア）。
+///
+/// 行形式は [`crate::prediction_lines`]。stdout の JSON・[`EvaluationRecord`] のスキーマには影響しない
+/// （REQ-27。PoC-26 の採点入口 `fandhe-edge-score` が読む。REQ-41・#445）。
+struct PredictionsSink<'a> {
+    rel: &'a Path,
+    ids: &'a [String],
+    scores: &'a [Vec<f64>],
+}
+
+impl PredictionsSink<'_> {
+    /// 評価データの行順の JSONL を作る。id・予測の件数が合わなければ `None`。
+    fn to_jsonl(&self, labels: &[&str], outcomes: &[Outcome]) -> Option<String> {
+        if self.ids.len() != outcomes.len() {
+            return None;
+        }
+        let mut out = String::new();
+        for (i, (id, outcome)) in self.ids.iter().zip(outcomes).enumerate() {
+            let scores = self.scores.get(i).map(|s| (labels, s.as_slice()));
+            out.push_str(&prediction_line(id, outcome, scores));
+            out.push('\n');
+        }
+        Some(out)
+    }
+}
+
 /// 台帳で適用権を取り、凍結した評価データへ 1 回だけ推論を当てる。
+#[allow(clippy::too_many_arguments)]
 fn apply_to_frozen_data<R>(
     ledger: &FinalTestLedger,
     freeze: &FreezeRecord,
@@ -504,6 +572,7 @@ fn apply_to_frozen_data<R>(
     eval_bytes: &[u8],
     target: &PreparedCandidate,
     onnx_digest: Sha256Digest,
+    scores_log: &RefCell<Vec<Vec<f64>>>,
     finish: impl FnOnce(&AppliedOnce<Vec<Outcome>>) -> Result<R, EvalPredictFailure>,
 ) -> Result<(AppliedOnce<Vec<Outcome>>, R), ErrorReport> {
     // 評価器はパスから開き直すため、閉じ込めつきで読み検証済みのバイト列を、この実行だけの
@@ -566,6 +635,7 @@ fn apply_to_frozen_data<R>(
                 let judgment = judgment_from_prediction(options, PLACEHOLDER_ID, &prediction)
                     .map_err(|_| EvalPredictFailure::Failed)?;
                 outcomes.push(Outcome::Label(judgment.predicted_choice_id().to_string()));
+                scores_log.borrow_mut().push(prediction.scores().to_vec());
             }
             Ok(outcomes)
         },
