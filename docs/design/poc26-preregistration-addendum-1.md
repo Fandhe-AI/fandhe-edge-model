@@ -141,9 +141,9 @@ iters 600 の実行（GPU 本番の前に 1 回。#391）の所要時間と最�
 
 | 項目 | 記入 |
 | ---- | ---- |
-| 6.1 往復・貪欲生成（実機） | 未実施 |
-| 6.2 参照との突き合わせ（実機。件数・最大絶対差・argmax 一致・mlx-lm／tokenizers の版・日時） | 未実施 |
-| 6.3 chat_template の sha256（実測・既知値・一致） | 未実施 |
+| 6.1 往復・貪欲生成（実機） | 合格（2026-10-07・実機）。20 case すべて `roundtrip_ok`。貪欲生成 3 件は日本語・英語として読める文。mlx 0.32.2・GPU・float32 |
+| 6.2 参照との突き合わせ（実機。件数・最大絶対差・argmax 一致・mlx-lm／tokenizers の版・日時） | 合格（2026-10-07・実機）。20 case で token id 全件一致・argmax 全件一致。CPU 同士（自作 mlx 0.32.2／参照 mlx-lm 0.31.3・mlx 0.32.3・tokenizers 0.23.2）で最大絶対差 3.5e-5（`status: match`）。GPU 同士では最大絶対差 0.023 で `mismatch` となったが、同じ mlx 0.32.3 の環境で自作モデルと mlx-lm を並べると CPU・GPU とも差 0.0 だったため、mlx の版違いによる GPU カーネルの差と判断した。mlx-lm は計画の 0.32.0 ではなく、公開から 7 日を過ぎた 0.31.3 を使った（利用者の uv 設定 `exclude-newer = "7 days"` に従ったため） |
+| 6.3 chat_template の sha256（実測・既知値・一致） | 一致（2026-10-07・実機）。`run.json` の `chat_template_sha256` と、HF 公式配布（revision `7ae557604adf67be50417f59c2c2f167def9a775`）の `tokenizer_config.json` の `chat_template` の sha256 がともに `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`。golden fixture（23 case）を生成し、照合テストが PASS |
 | 6.4 CPU 決定性（実機。dtype・sha256 の一致） | 未実施 |
 | iters 600 の所要時間（`train_seconds`）と `max_rss_bytes`（実機。`budget_reached` の有無・device・dtype） | 未実施 |
 
