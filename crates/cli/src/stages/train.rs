@@ -277,9 +277,10 @@ pub fn effective_train_seed(
     let Some(bytes) = project.read_optional(candidate_rel(index).join(TRAIN_SEED_FILE), 16)? else {
         return Ok(split_seed);
     };
+    // 正準形（`u32::to_string` と完全一致。`+7`・`007`・末尾改行は不可）だけを受理する。
     std::str::from_utf8(&bytes)
         .ok()
-        .and_then(|t| t.parse::<u32>().ok())
+        .and_then(|t| t.parse::<u32>().ok().filter(|v| v.to_string() == t))
         .ok_or_else(|| invalid("train seed record is invalid"))
 }
 
