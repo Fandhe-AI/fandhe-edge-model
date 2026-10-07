@@ -160,11 +160,12 @@ CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 def main(argv: list[str] | None = None) -> int:
     """エントリポイント。`WorkerError` の終了コードで返し、エラーは stderr に JSON 1 行で出す。"""
     prev = mx.default_device()
-    # MLX の buffer cache は CPU でほぼ再利用されず 1 ステップ約 3 GiB ずつ増え、
-    # RSS 上限（8 GiB。REQ-39）を数ステップで超える（2026-10-07 実機で計測）。
-    # cache を上限つきにして RSS が実際の使用量を表すようにする。計算内容は変わらない。
-    prev_cache_limit = mx.set_cache_limit(CACHE_LIMIT_BYTES)
+    prev_cache_limit: int | None = None
     try:
+        # MLX の buffer cache は CPU でほぼ再利用されず 1 ステップ約 3 GiB ずつ増え、
+        # RSS 上限（8 GiB。REQ-39）を数ステップで超える（2026-10-07 実機で計測）。
+        # cache を上限つきにして RSS が実際の使用量を表すようにする。計算内容は変わらない。
+        prev_cache_limit = mx.set_cache_limit(CACHE_LIMIT_BYTES)
         a = _build_parser().parse_args(argv)
         _validate(a)
         if hasattr(a, "device"):
@@ -185,4 +186,5 @@ def main(argv: list[str] | None = None) -> int:
         return int(ExitCode.RUNTIME_ERROR)
     finally:
         mx.set_default_device(prev)
-        mx.set_cache_limit(prev_cache_limit)
+        if prev_cache_limit is not None:
+            mx.set_cache_limit(prev_cache_limit)
