@@ -113,6 +113,7 @@ def _run_json(p95_seconds: float) -> dict:
             "choices_per_prompt": 26,
             "forward_chunk": 8,
         },
+        **{k: "a" * 64 for k in measure.HASH_KEYS},
         "max_rss_bytes": 1,
         "mlx_peak_memory_bytes": 2,
         "elapsed_seconds": 3.0,
@@ -243,6 +244,14 @@ def test_measure_end_to_end_on_synthetic_model(env: dict, tmp_path: Path) -> Non
     c = rec["conditions"]["cpu_bf16"]
     assert (c["measured"], c["warmup_excluded"], c["classification"]) == (3, 1, "test_harness")
     assert c["rss_time_l_bytes"] > 0
+    assert c["hashes"]["adapters_sha256"] == _sha(env["bf16"] / "adapters.safetensors")
+    assert c["hashes"]["model_safetensors_sha256"] == pin_values(env["model"])["model"]
+    assert rec["hash_consistency"] == {
+        "compared_conditions": 1,
+        "match": True,
+        "mismatched_keys": [],
+    }
+    assert c["hashes"]["adapters_sha256"] in (out / "record.md").read_text()
     assert out.stat().st_mode & 0o777 == 0o700
     assert (out / "record.json").stat().st_mode & 0o777 == 0o600
     text = (out / "record.json").read_text() + (out / "record.md").read_text()
@@ -433,3 +442,37 @@ def test_forwarded_numbers_are_range_checked_before_anything_runs(
     assert err["code"] == "invalid_input"
     assert err["message"] == message
     assert not out.exists()
+
+
+def test_hashes_are_copied_with_allowlist_and_validated() -> None:
+    """codex P2: モデル・アダプタ・定義の sha256 を固定キーだけ転記し、不正な値は拒否する。"""
+    tl = {"max_rss_bytes": 1, "peak_memory_footprint_bytes": None}
+    run = _run_json(0.1)
+    run["unrelated_path"] = "/secret/path"
+    got = measure.summarize(run, tl, "x", 0.0)
+    assert got["hashes"] == dict.fromkeys(measure.HASH_KEYS, "a" * 64)
+    assert "/secret/path" not in json.dumps(got)
+    for bad in ("A" * 64, "a" * 63, None, "/secret/path"):
+        run["adapters_sha256"] = bad
+        with pytest.raises(measure.MeasureError, match="malformed sha256"):
+            measure.summarize(run, tl, "x", 0.0)
+    del run["adapters_sha256"]
+    with pytest.raises(measure.MeasureError):
+        measure.summarize(run, tl, "x", 0.0)
+
+
+def test_hash_consistency_flags_mismatch() -> None:
+    """codex P2: 条件間でアダプタの sha256 が違えば不一致として明示（error 条件は比較しない）。"""
+    h = dict.fromkeys(measure.HASH_KEYS, "a" * 64)
+    conds = {
+        "gpu_bf16": {"status": "ok", "hashes": h},
+        "cpu_bf16": {"status": "ok", "hashes": {**h, "adapters_sha256": "b" * 64}},
+        "x": {"status": "error", "code": "y"},
+    }
+    assert measure.hash_consistency(conds) == {
+        "compared_conditions": 2,
+        "match": False,
+        "mismatched_keys": ["adapters_sha256"],
+    }
+    del conds["cpu_bf16"]
+    assert measure.hash_consistency(conds)["match"] is True

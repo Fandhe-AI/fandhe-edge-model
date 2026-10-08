@@ -38,6 +38,16 @@ from tools.poc26.common import MAX_WALL_SECONDS_CAP, SHA_RE
 
 from fandhe_edge_trainer.errors import WorkerError
 
+# run.json から記録へ転記してよい sha256 の固定キー（許可リスト。パス・他の文字列は転記しない）
+HASH_KEYS = (
+    "model_safetensors_sha256",
+    "config_json_sha256",
+    "tokenizer_json_sha256",
+    "tokenizer_config_sha256",
+    "adapters_sha256",
+    "definition_sha256",
+)
+
 MB = 1_000_000  # 容量は 10 進 MB（オーナー確定 2026-10-08）
 CAPACITY_TARGET_MB = 40
 P95_LIMIT_MS = 250.0
@@ -121,10 +131,14 @@ def summarize(
         raise MeasureError("forward_chunk must be positive")
     if time_l["max_rss_bytes"] is None:
         raise MeasureError("time -l output has no maximum resident set size")
+    hashes = {k: run.get(k) for k in HASH_KEYS}
+    if not all(isinstance(v, str) and SHA_RE.fullmatch(v) for v in hashes.values()):
+        raise MeasureError("run.json has a missing or malformed sha256")
     p95_ms = sc["p95_seconds"] * 1000.0
     rss = time_l["max_rss_bytes"]
     k, chunk = sc["choices_per_prompt"], sc["forward_chunk"]
     return {
+        "hashes": hashes,
         "device": run["device"],
         "dtype": run["dtype"],
         "classification": classification,
@@ -149,6 +163,13 @@ def summarize(
         "mlx_peak_memory_bytes": run["mlx_peak_memory_bytes"],
         "elapsed_seconds": round(run["elapsed_seconds"], 3),
     }
+
+
+def hash_consistency(conds: dict[str, Any]) -> dict[str, Any]:
+    """成功した条件の間で sha256 が一致するか。不一致のキーを列挙する（判定は人）。"""
+    oks = [c["hashes"] for c in conds.values() if c.get("status") == "ok"]
+    bad = [k for k in HASH_KEYS if len({h[k] for h in oks}) > 1]
+    return {"compared_conditions": len(oks), "match": not bad, "mismatched_keys": bad}
 
 
 def run_child(cmd: list[str], timeout: int) -> str:
@@ -214,7 +235,14 @@ def render_md(rec: dict[str, Any]) -> str:
             f"| {round(c['internal_max_rss_bytes'] / MB, 1)} |"
         )
     L.append("")
+    hc = rec["hash_consistency"]
+    L.append(
+        "- sha256 の条件間一致: "
+        + ("一致" if hc["match"] else f"不一致 {hc['mismatched_keys']}（判定は人）")
+        + f"（比較 {hc['compared_conditions']} 条件）"
+    )
     for c0 in list(ok_conds.values())[:1]:
+        L += [f"- {k}: {v}" for k, v in c0["hashes"].items()]
         L.append(
             f"- 1 件あたり採点: K={c0['choices_per_prompt']}・forward chunk {c0['forward_chunk']}"
             f"（forward {c0['forward_calls_per_prompt']} 回）"
@@ -375,6 +403,7 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
             "quiet_machine_declared": a.quiet_machine,
             "capacity": cap,
             "conditions": conds,
+            "hash_consistency": hash_consistency(conds),
             "jev_reference": {**JEV_REFERENCE, "note": "E2E vs inference-only: not comparable"},
         }
         try:
