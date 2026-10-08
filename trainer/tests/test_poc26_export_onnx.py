@@ -327,3 +327,89 @@ def test_summary_shape_is_validated(summary: object) -> None:
     with pytest.raises(WorkerError) as ei:
         _summary_hashes(summary)
     assert ei.value.exit_code == 64
+
+
+def _tamper_tensor(proto: onnx.ModelProto, **kw: object) -> onnx.ModelProto:
+    """最初の external tensor の宣言（length / offset / dims）を書き換える。"""
+    t = next(t for t in proto.graph.initializer if t.data_location == onnx.TensorProto.EXTERNAL)
+    for e in t.external_data:
+        if e.key in kw:
+            e.value = str(kw[e.key])
+    if "dims" in kw:
+        del t.dims[:]
+        t.dims.extend(kw["dims"])  # type: ignore[arg-type]
+    return proto
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"length": 1 << 60},  # 巨大 length
+        {"dims": [1 << 40, 1 << 40]},  # 巨大 dims（np.int64 ならあふれる積）
+        {"dims": [-4, -4]},  # 負の次元（積は正）
+        {"length": -4},
+        {"offset": -64},
+        {"offset": 1 << 40},  # offset+length がファイルを超える
+        {"length": 4},  # 次元積×4 と不一致
+    ],
+)
+def test_declared_external_ranges_rejected_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kw: dict
+) -> None:
+    """REQ-41・REQ-39: 宣言値が不正なら bytearray を確保する前に 64 で拒否する。"""
+    from tools.poc26 import export_onnx as ex
+    from tools.poc26.common import Budget
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    mp, dp = _export(_lora_model(), tmp_path / "o")
+    mp.write_bytes(
+        _tamper_tensor(onnx.load(str(mp), load_external_data=False), **kw).SerializeToString()
+    )
+    summary = _summary_for(mp, dp)  # 改ざん後のバイト列で sha256 は一致させる
+
+    class NoAlloc(bytearray):
+        def __init__(self, *a: object) -> None:
+            pytest.fail("allocated before validation")
+
+    monkeypatch.setattr(ex, "bytearray", NoAlloc, raising=False)
+    with pytest.raises(WorkerError) as ei:
+        ex.load_verified_onnx(mp.parent, summary, Budget())
+    assert ei.value.exit_code == 64
+
+
+def test_overlapping_external_ranges_rejected(tmp_path: Path) -> None:
+    """REQ-41・REQ-39: 範囲が重なる宣言は 64。"""
+    from tools.poc26 import export_onnx as ex
+    from tools.poc26.common import Budget
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    mp, dp = _export(_lora_model(), tmp_path / "o")
+    proto = onnx.load(str(mp), load_external_data=False)
+    ext = [t for t in proto.graph.initializer if t.data_location == onnx.TensorProto.EXTERNAL]
+    first = {e.key: e.value for e in ext[0].external_data}["offset"]
+    for e in ext[1].external_data:
+        if e.key == "offset":
+            e.value = first  # 先頭と同じ位置へ重ねる
+    mp.write_bytes(proto.SerializeToString())
+    with pytest.raises(WorkerError) as ei:
+        ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget())
+    assert ei.value.exit_code == 64
+
+
+def test_declared_length_counts_toward_memory_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 見積もりは宣言長の合計を含み、上限超過は確保前に 20。"""
+    from tools.poc26 import export_onnx as ex
+    from tools.poc26.common import Budget
+
+    from fandhe_edge_trainer import limits
+    from fandhe_edge_trainer.errors import WorkerError
+
+    mp, dp = _export(_lora_model(), tmp_path / "o")
+    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1 << 30)  # 1 GiB 固定分だけで超過
+    with pytest.raises(WorkerError) as ei:
+        ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget())
+    assert ei.value.exit_code == 20

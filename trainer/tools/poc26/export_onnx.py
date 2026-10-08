@@ -464,8 +464,15 @@ def _summary_hashes(summary: Any) -> dict[str, str]:
     return out
 
 
-def _external_tensors(proto: onnx.ModelProto, data_name: str) -> list[tuple[Any, int, int]]:
-    """external data を持つ initializer を (tensor, offset, length) で offset 順に返す。"""
+def _external_tensors(
+    proto: onnx.ModelProto, data_name: str, file_size: int
+) -> list[tuple[Any, int, int]]:
+    """external data を持つ initializer を (tensor, offset, length) で offset 順に返す。
+
+    宣言値（dims・offset・length）は untrusted なので、確保の前にすべて検証する（REQ-39）:
+    非負、次元積（Python int。実ファイルサイズ超で即拒否）×4 == length、
+    offset+length <= 実ファイルサイズ、範囲の重なりなし。不正は 64。
+    """
     found = []
     for t in proto.graph.initializer:
         if t.data_location != TensorProto.EXTERNAL:
@@ -475,16 +482,29 @@ def _external_tensors(proto: onnx.ModelProto, data_name: str) -> list[tuple[Any,
             offset, length = int(kv["offset"]), int(kv["length"])
         except (KeyError, ValueError):
             raise invalid("initializer has malformed external data") from None
-        expected = int(np.prod(t.dims, dtype=np.int64)) * 4
+        count = 1
+        for d in t.dims:
+            if d < 0:
+                raise invalid("initializer has a negative dimension")
+            count *= int(d)
+            if count * 4 > file_size:  # 0 次元を含む場合は 0 のまま。超過は即拒否
+                raise invalid("initializer dims exceed the data file size")
         if (
             kv.get("location") != data_name
             or t.data_type != TensorProto.FLOAT
             or offset < 0
-            or length != expected
+            or length < 0
+            or length != count * 4
+            or offset + length > file_size
         ):
             raise invalid("initializer has unexpected external data")
         found.append((t, offset, length))
     found.sort(key=lambda x: x[1])
+    end = 0
+    for _, offset, length in found:
+        if offset < end:
+            raise invalid("initializer external data overlaps")
+        end = offset + length
     return found
 
 
@@ -505,7 +525,6 @@ def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.Mod
     except Exception:  # protobuf の DecodeError 等。入力値は載せない
         raise invalid("model.onnx is not a valid ONNX model") from None
     del raw
-    tensors = _external_tensors(proto, "model.onnx.data")
     try:
         fd, st = open_regular(onnx_dir / "model.onnx.data", MAX_ONNX_DATA_BYTES, "model.onnx.data")
     except LimitExceededError as exc:
@@ -513,8 +532,13 @@ def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.Mod
     except ValueError as exc:
         raise invalid(str(exc)) from None
     with os.fdopen(fd, "rb") as f:
-        # 重み本体（raw_data）＋ evaluator 内の numpy 化の分を見込む
-        check_memory(2 * st.st_size + (1 << 30), "verify-onnx weights")
+        tensors = _external_tensors(proto, "model.onnx.data", st.st_size)  # 確保の前に検証
+        declared = sum(length for _, _, length in tensors)
+        # 宣言長の合計（raw_data）＋ evaluator 内の numpy 化の分＋最大 1 本の一時コピーを見込む
+        check_memory(
+            2 * max(st.st_size, declared) + max((n for _, _, n in tensors), default=0) + (1 << 30),
+            "verify-onnx weights",
+        )
         h, pos = hashlib.sha256(), 0
 
         def take(n: int, sink: bytearray | None) -> None:
