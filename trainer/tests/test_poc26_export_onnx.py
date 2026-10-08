@@ -517,3 +517,11 @@ def test_intermediate_bound_concrete_value() -> None:
         + 2 * 7 * cfg.vocab_size
     )
     assert intermediate_bound(cfg, 7) == want > 0
+
+
+def test_run_memory_estimate_counts_weights_twice() -> None:
+    """REQ-39: 実行前の見積もりは protobuf 重み＋numpy 重み（2 倍）＋中間テンソル上界＋1 GiB。"""
+    from tools.poc26.export_onnx import run_memory_estimate
+
+    assert run_memory_estimate(1000, 300) == 2 * 1000 + 300 + (1 << 30)
+    assert run_memory_estimate(0, 0) == 1 << 30

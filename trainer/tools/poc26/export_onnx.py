@@ -344,6 +344,18 @@ def check_structure(proto: onnx.ModelProto, expected: onnx.ModelProto) -> None:
                 raise invalid("initializer inline data length does not match its dims")
 
 
+def run_memory_estimate(weights_bytes: int, bound: int) -> int:
+    """evaluator 実行時の同時保持量の見積もり（byte）。
+
+    ReferenceEvaluator は ModelProto の raw_data（protobuf。`del proto` では解放されない）と
+    initializer を numpy 化した重みの両方を保持するため、重みは 2 倍で数える。これに中間テンソルの
+    上界（`intermediate_bound`）と 1 GiB の余裕を足す。読み込み時（`load_verified_onnx`）の
+    見積もりは protobuf 重み＋evaluator 構築時の numpy 化の途中を見込む同じ 2 倍の式で、
+    実行時はそこへ中間テンソルが加わる。
+    """
+    return 2 * weights_bytes + bound + (1 << 30)
+
+
 #: 照合用プロンプトの長さの上限（`VERIFY_USERS` は数十トークン）。
 MAX_VERIFY_TOKENS = 512
 
@@ -710,7 +722,7 @@ def cmd_verify_onnx(a: argparse.Namespace) -> int:
     weights_bytes = sum(
         int(np.prod(t.dims, dtype=np.int64)) * 4 for t in proto.graph.initializer
     )  # 構造照合済みなので dims は期待どおり
-    check_memory(weights_bytes + bound + (1 << 30), "verify-onnx run")  # 重み + 中間テンソル
+    check_memory(run_memory_estimate(weights_bytes, bound), "verify-onnx run")
     ref = ReferenceEvaluator(proto)
     del proto
     budget.check()
