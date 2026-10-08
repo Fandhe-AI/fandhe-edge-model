@@ -24,9 +24,11 @@
 //!    `candidates/<N>/evaluation_predictions.jsonl` にあり、同じディレクトリの `evaluation_record.json` が
 //!    次をすべて満たすことを必須にする（満たさなければ `invalid_input`。手編集した予測・別プロジェクトや
 //!    別候補の予測を比較相手にできない。#445・REQ-27）。P は評価記録を持たず対象外
+//!    （P の seed・来歴は自己申告のまま。PoC スクリプトの出力は評価記録で束縛できない）
 //!    - `predictions_sha256` が予測ファイルの sha256 と一致
 //!    - `evaluation_sha256`・`evaluation_bytes` が現在の凍結記録と一致
 //!    - `definition_sha256` が現在の定義の正準化ハッシュと一致（`evaluate` と同じ計算）
+//!    - `config_id`（`<candidate_id>:seed<N>`）の seed が `--seed` と一致（形式不正も拒否）
 //!    - `candidate_index` が `<N>` と一致し、`candidate_id`（kind）が NAME に対応（C1→c1・C3→c3・AR→autoregressive）
 //! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
 //!
@@ -42,7 +44,10 @@
 //! NAME は許可リスト {P, C1, C3, AR}、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の sha256 単位に分ける。
 //! 採点対象としての適用は 4 候補 × 3 seed = 最大 12 回に機械的に制限される。予測ファイルを作り直して
 //! 同名・別 sha256 で出すと拒否し、別名は許可リストで、同じ sha256 の別名での再採点は台帳の照合で塞ぐ。
-//! `--reference` は最大 1 個、`--compare` は最大 2 個。許可リスト外の候補を足すには、事前登録の追補と
+//! `--reference` は最大 1 個、`--compare` は最大 2 個。役割も固定: `--compare` は C1・C3 のみ、
+//! `--reference` は AR のみで、どちらも `--candidate P` のときだけ許す（`--candidate` は 4 つのいずれでもよい）。
+//! 台帳の確認から書き込みまでは `<evaluation_sha256>/seed-<n>/.lock` の排他ロック（`flock`。プロセス終了で
+//! 解放される）の中で行い、同時実行による二重適用を防ぐ。許可リスト外の候補を足すには、事前登録の追補と
 //! コード変更が要る。
 //!
 //! ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
@@ -149,6 +154,21 @@ impl ScoreArgs {
             if !names.insert(n.name.as_str()) {
                 return Err(invalid("duplicate NAME"));
             }
+        }
+        // 役割の制約（事前登録 5 節）: compare は C1・C3、reference は AR、どちらも採点対象が P のときだけ。
+        let has_others = !self.compares.is_empty() || !self.references.is_empty();
+        if has_others && self.candidate.name != "P" {
+            return Err(invalid("--compare and --reference require --candidate P"));
+        }
+        if self
+            .compares
+            .iter()
+            .any(|n| !matches!(n.name.as_str(), "C1" | "C3"))
+        {
+            return Err(invalid("--compare accepts only C1 or C3"));
+        }
+        if self.references.iter().any(|n| n.name != "AR") {
+            return Err(invalid("--reference accepts only AR"));
         }
         Ok(())
     }
@@ -291,6 +311,7 @@ struct Provenance<'a> {
     evaluation_sha256: String,
     evaluation_bytes: u64,
     definition_sha256: String,
+    seed: u32,
 }
 
 /// NAME に対応する `candidate_id`（= kind）。
@@ -349,6 +370,16 @@ fn verify_bound_to_record(
         return Err(invalid(
             "evaluation record does not belong to this project state",
         ));
+    }
+    // 代表構成 ID は `<candidate_id>:seed<N>`。N が `--seed` と一致しなければ別 seed の予測。
+    let seed_ok = record
+        .config_id
+        .strip_prefix(record.candidate_id.as_str())
+        .and_then(|r| r.strip_prefix(":seed"))
+        .and_then(|n| n.parse::<u32>().ok())
+        == Some(prov.seed);
+    if !seed_ok {
+        return Err(invalid("evaluation record seed does not match --seed"));
     }
     if record.candidate_index != index
         || expected_candidate_id(&named.name) != Some(record.candidate_id.as_str())
@@ -511,18 +542,9 @@ fn ledger_rel(eval_sha: &str, seed: u32, name: &str) -> PathBuf {
     ledger_dir(eval_sha, seed).join(format!("{name}.sha256"))
 }
 
-/// 台帳を照合し、書くべきもの（名前・sha256）を返す。違反は書き込み前に `invalid_input`。
-///
-/// 採点対象は、同名が台帳にある場合に加え、同じ seed の台帳に同じ sha256 が別の NAME で既にある場合も
-/// 拒否する（別名での再採点を塞ぐ）。
-fn check_ledger<'a>(
-    project: &Project,
-    eval_sha: &str,
-    seed: u32,
-    loaded: &'a [Loaded<'_>],
-) -> Result<Vec<&'a Loaded<'a>>, ErrorReport> {
-    // 今回の入力同士で同じ sha256 が別 NAME に使われていないこと（未記録の相手と同じ予測を
-    // 採点対象にして別名での再採点を迂回させない）。
+/// 今回の入力同士で同じ sha256 が別 NAME に使われていないこと（未記録の相手と同じ予測を採点対象に
+/// して別名での再採点を迂回させない）。入力だけで決まるため、台帳ディレクトリを作る前に呼ぶ。
+fn check_distinct_inputs(loaded: &[Loaded<'_>]) -> Result<(), ErrorReport> {
     for (i, a) in loaded.iter().enumerate() {
         if loaded
             .iter()
@@ -534,6 +556,19 @@ fn check_ledger<'a>(
             ));
         }
     }
+    Ok(())
+}
+
+/// 台帳を照合し、書くべきもの（名前・sha256）を返す。違反は書き込み前に `invalid_input`。
+///
+/// 採点対象は、同名が台帳にある場合に加え、同じ seed の台帳に同じ sha256 が別の NAME で既にある場合も
+/// 拒否する（別名での再採点を塞ぐ）。
+fn check_ledger<'a>(
+    project: &Project,
+    eval_sha: &str,
+    seed: u32,
+    loaded: &'a [Loaded<'_>],
+) -> Result<Vec<&'a Loaded<'a>>, ErrorReport> {
     let mut to_write = Vec::new();
     for l in loaded {
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
@@ -564,6 +599,32 @@ fn check_ledger<'a>(
         }
     }
     Ok(to_write)
+}
+
+/// `<ledger>/<evaluation_sha256>/seed-<n>/.lock` に排他ロック（`flock`）を取る。戻り値を保持している間
+/// 有効で、drop またはプロセス終了で解放される（クラッシュ後に残って次を止めない）。最大 10 秒待つ
+/// （無限待ちを作らない。REQ-39）。
+fn lock_ledger(project: &Project, eval_sha: &str, seed: u32) -> Result<std::fs::File, ErrorReport> {
+    let root = Path::new(LEDGER_DIR);
+    let by_eval = root.join(eval_sha);
+    let by_seed = ledger_dir(eval_sha, seed);
+    for d in [root, by_eval.as_path(), by_seed.as_path()] {
+        project.ensure_dir(d)?;
+    }
+    let rel = by_seed.join(".lock");
+    // 既存なら作成が失敗するだけ（無視）。開けなければ次の open_file が拒否する。
+    let _ = project.write_new(&rel, b"");
+    let (file, _) = project.open_file(&rel)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return Err(runtime("cannot lock score ledger")),
+        }
+    }
 }
 
 /// 台帳へ書く（比較相手を先、採点対象を最後。親ディレクトリが無ければ作る）。
@@ -613,6 +674,7 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
         project: &project,
         evaluation_sha256: freeze.sha256().to_hex(),
         evaluation_bytes: freeze.byte_len(),
+        seed: args.seed,
         definition_sha256: definition
             .canonical_hash()
             .map_err(|_| runtime("cannot hash definition"))?
@@ -734,6 +796,9 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
 
     // 台帳は全検証が通った後、出力の直前に書く（検証の失敗で適用権を使わない）。
     let eval_sha = freeze.sha256().to_hex();
+    // 確認から書き込みまでを seed 単位の排他ロックの中で行う（同時実行による二重適用を防ぐ）。
+    check_distinct_inputs(&loaded)?;
+    let _lock = lock_ledger(&project, &eval_sha, args.seed)?;
     let to_write = check_ledger(&project, &eval_sha, args.seed, &loaded)?;
     write_ledger(&project, &eval_sha, args.seed, &to_write)?;
 

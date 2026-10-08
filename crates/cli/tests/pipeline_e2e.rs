@@ -1324,6 +1324,25 @@ mod suite {
             record.ends_with(&format!(",\"predictions_sha256\":\"{preds_sha}\"}}\n")),
             "{record}"
         );
+        // 現状の学習 seed は 42 で事前登録の seed {0,1,2} に合わないため、採点入口は拒否する（学習 seed を
+        // 指定できるようにする #455 まで）。#455 後の記録を、`config_id` の seed だけ書き換えて模す。
+        let record_path = env.project_file("candidates/1/evaluation_record.json");
+        let rejected_seed = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "1",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        assert_eq!(rejected_seed.status.code(), Some(64));
+        let record_text = std::fs::read_to_string(&record_path).expect("record");
+        std::fs::write(&record_path, record_text.replace("c3:seed42", "c3:seed1"))
+            .expect("rewrite seed");
         // 保存した予測は PoC-26 の採点入口（`fandhe-edge-score`）でそのまま読め、`evaluate` と同じ正解数になる。
         let scored = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
             .args([
@@ -1357,7 +1376,7 @@ mod suite {
                 "--project-dir",
                 "proj",
                 "--seed",
-                "2",
+                "1",
                 "--candidate",
                 "C3=proj/candidates/1/evaluation_predictions.jsonl",
             ])

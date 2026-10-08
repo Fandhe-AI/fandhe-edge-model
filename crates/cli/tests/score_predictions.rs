@@ -115,6 +115,7 @@ struct Rec {
     evaluation_sha256: String,
     evaluation_bytes: u64,
     definition_sha256: String,
+    seed: u32,
 }
 
 struct Env {
@@ -168,6 +169,7 @@ impl Env {
             index,
             evaluation_sha256: sha256_hex(&eval),
             evaluation_bytes: eval.len() as u64,
+            seed: 0,
             definition_sha256: fandhe_edge_core::definition::Definition::parse(&def)
                 .expect("parse")
                 .canonical_hash()
@@ -182,6 +184,13 @@ impl Env {
         self.bound_rec("proj", &self.rec("proj", candidate_id, index), body)
     }
 
+    /// `bound` の seed 指定版（評価記録の `config_id` の seed を変える）。
+    fn bound_seed(&self, candidate_id: &str, index: usize, seed: u32, body: &str) -> String {
+        let mut rec = self.rec("proj", candidate_id, index);
+        rec.seed = seed;
+        self.bound_rec("proj", &rec, body)
+    }
+
     fn bound_rec(&self, proj: &str, rec: &Rec, body: &str) -> String {
         let dir = format!("{proj}/candidates/{}", rec.index);
         self.write_in(&dir, "evaluation_predictions.jsonl", body);
@@ -189,10 +198,11 @@ impl Env {
             &dir,
             "evaluation_record.json",
             &format!(
-                r#"{{"candidate_index":{},"candidate_id":"{}","config_id":"{}:seed0","evaluation_sha256":"{}","evaluation_bytes":{},"onnx_sha256":"{z}","artifact_meta_sha256":"{z}","definition_sha256":"{}","correct":1,"total":1,"predictions_sha256":"{}"}}"#,
+                r#"{{"candidate_index":{},"candidate_id":"{}","config_id":"{}:seed{}","evaluation_sha256":"{}","evaluation_bytes":{},"onnx_sha256":"{z}","artifact_meta_sha256":"{z}","definition_sha256":"{}","correct":1,"total":1,"predictions_sha256":"{}"}}"#,
                 rec.index,
                 rec.candidate_id,
                 rec.candidate_id,
+                rec.seed,
                 rec.evaluation_sha256,
                 rec.evaluation_bytes,
                 rec.definition_sha256,
@@ -320,16 +330,16 @@ fn req25_holm_family_size_is_three_even_without_compares() {
 fn req25_reference_is_outside_the_holm_family() {
     let env = Env::new("reference");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let a = env.bound("c3", 2, &pred_jsonl(pred_a));
+    let a = env.bound("autoregressive", 3, &pred_jsonl(pred_a));
     let out = env.ok(&args(&[
         "--candidate",
         "P=p.jsonl",
         "--reference",
-        &format!("C3={a}"),
+        &format!("AR={a}"),
     ]));
     assert!(
         out.contains(
-            "\"references\":[{\"candidate\":\"P\",\"against\":\"C3\",\"b\":30,\"c\":0,\"p_raw\":"
+            "\"references\":[{\"candidate\":\"P\",\"against\":\"AR\",\"b\":30,\"c\":0,\"p_raw\":"
         ),
         "{out}"
     );
@@ -449,28 +459,28 @@ fn req27_ledger_enforces_single_application() {
         &args(&["--candidate", &c1]),
         "candidate has already been scored",
     );
-    env.ok(&args(&["--candidate", "P=p.jsonl", "--compare", &c1]));
+    // 比較相手の差し替え（別 sha256）は、採点対象 P を記録する前に拒否される。
     let a2 = env.bound(
         "c1",
         4,
         &pred_jsonl(|i| Some(if i < 61 { "gamma" } else { gold_of(i) })),
     );
-    let ar = env.bound(
-        "autoregressive",
-        3,
-        &pred_jsonl(|i| Some(if i < 10 { "gamma" } else { gold_of(i) })),
-    );
     env.fails(
-        &args(&[
-            "--candidate",
-            &format!("AR={ar}"),
-            "--compare",
-            &format!("C1={a2}"),
-        ]),
+        &args(&["--candidate", "P=p.jsonl", "--compare", &format!("C1={a2}")]),
         "prediction file differs from the one recorded for this name",
     );
-    assert!(!ledger_file(&env, 0, "AR").exists());
-    env.ok(&["--project-dir", "proj", "--seed", "1", "--candidate", &c1]);
+    assert!(!ledger_file(&env, 0, "P").exists());
+    env.ok(&args(&["--candidate", "P=p.jsonl", "--compare", &c1]));
+    // 別 seed の台帳は独立（評価記録の seed も 1 の予測を使う）。
+    let a_seed1 = env.bound_seed("c1", 5, 1, &pred_jsonl(pred_a));
+    env.ok(&[
+        "--project-dir",
+        "proj",
+        "--seed",
+        "1",
+        "--candidate",
+        &format!("C1={a_seed1}"),
+    ]);
 }
 
 /// REQ-27: 同じ seed で、同じ sha256 の予測ファイルを別 NAME の採点対象として出すと拒否する。
@@ -485,7 +495,15 @@ fn req27_same_sha256_under_another_name_is_rejected() {
         "prediction file has already been scored under another name",
     );
     // 別 seed なら独立。
-    env.ok(&["--project-dir", "proj", "--seed", "2", "--candidate", &c3]);
+    let c3_seed2 = format!("C3={}", env.bound_seed("c3", 5, 2, &pred_jsonl(pred_p)));
+    env.ok(&[
+        "--project-dir",
+        "proj",
+        "--seed",
+        "2",
+        "--candidate",
+        &c3_seed2,
+    ]);
 }
 
 /// REQ-27: 事前登録外の NAME・seed と、reference 2 個を拒否する（適用は最大 4 候補 × 3 seed）。
@@ -758,4 +776,96 @@ fn req27_issue445_existing_ledger_dir_is_tolerated_but_symlink_is_rejected() {
             .count(),
         0
     );
+}
+
+/// REQ-27・#445: 評価記録の `config_id` の seed が `--seed` と違う予測（seed 0 の記録を --seed 1 で渡す）と、
+/// `config_id` の形式不正は、台帳を作らず拒否される。
+#[test]
+fn req27_issue445_record_seed_must_match_seed_argument() {
+    let env = Env::new("seed");
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
+    env.fails(
+        &[
+            "--project-dir",
+            "proj",
+            "--seed",
+            "1",
+            "--candidate",
+            &format!("C1={c1}"),
+        ],
+        "evaluation record seed does not match --seed",
+    );
+    let record = env.work.join("proj/candidates/1/evaluation_record.json");
+    let text = std::fs::read_to_string(&record).expect("record");
+    std::fs::write(&record, text.replace("c1:seed0", "c1-seed0")).expect("rewrite");
+    env.fails(
+        &args(&["--candidate", &format!("C1={c1}")]),
+        "evaluation record seed does not match --seed",
+    );
+    assert!(!env.work.join("proj/poc26_score_ledger").exists());
+}
+
+/// REQ-27・事前登録 5 節: `--compare` は C1・C3 のみ、`--reference` は AR のみ、どちらも `--candidate P` の
+/// ときだけ許す。`--candidate` 単独は 4 つのいずれでもよい。
+#[test]
+fn req27_roles_are_restricted_by_preregistration() {
+    let env = Env::new("roles");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.fails(
+        &args(&["--candidate", "P=p.jsonl", "--compare", "AR=p.jsonl"]),
+        "--compare accepts only C1 or C3",
+    );
+    env.fails(
+        &args(&["--candidate", "P=p.jsonl", "--reference", "C1=p.jsonl"]),
+        "--reference accepts only AR",
+    );
+    env.fails(
+        &args(&["--candidate", "C1=p.jsonl", "--compare", "C3=p.jsonl"]),
+        "--compare and --reference require --candidate P",
+    );
+    assert!(!env.work.join("proj/poc26_score_ledger").exists());
+}
+
+/// REQ-27・#445: 同じ台帳に対する同時実行は排他ロックで直列化され、同じ sha256 を別 NAME で採点する
+/// 2 つの呼び出しのうち成功は 1 つだけ（もう一方は `invalid_input`）。
+#[test]
+fn req27_issue445_concurrent_scoring_of_same_bytes_applies_once() {
+    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, run};
+    let env = Env::new("concurrent");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let c3 = env.bound("c3", 2, &pred_jsonl(pred_p));
+    let barrier = std::sync::Barrier::new(2);
+    let results: Vec<bool> = std::thread::scope(|scope| {
+        let handles: Vec<_> = [("P", "p.jsonl".to_string()), ("C3", c3)]
+            .into_iter()
+            .map(|(name, path)| {
+                let (barrier, work) = (&barrier, &env.work);
+                scope.spawn(move || {
+                    let args = ScoreArgs {
+                        project_dir: PathBuf::from("proj"),
+                        seed: 0,
+                        candidate: NamedPath {
+                            name: name.to_string(),
+                            path: PathBuf::from(path),
+                        },
+                        compares: vec![],
+                        references: vec![],
+                    };
+                    barrier.wait();
+                    match run(&args, work) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            assert_eq!(e.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+                            false
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect()
+    });
+    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
 }
