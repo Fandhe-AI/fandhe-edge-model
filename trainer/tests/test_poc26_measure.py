@@ -391,3 +391,45 @@ def test_timeout_seconds_is_range_checked_before_anything_runs(
         "message": "invalid arguments: --timeout-seconds out of range: 1..86400",
     }
     assert not out.exists()
+
+
+def test_module_entry_works_like_the_procedure() -> None:
+    """codex P1: 手順書と同じ起動（-m・cwd=trainer・PYTHONPATH 無し）で --help が 0 終了する。"""
+    env_ = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    r = subprocess.run(
+        [sys.executable, "-m", "tools.poc26.measure", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env_,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert (r.returncode, b"--warmup" in r.stdout) == (0, True), r.stderr[-300:]
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--warmup", "-1", "warmup out of range: 0..100000"),
+        ("--warmup", "100001", "warmup out of range: 0..100000"),
+        ("--max-seq-length", "0", "max-seq-length out of range: 8..4096"),
+        ("--max-seq-length", "4097", "max-seq-length out of range: 8..4096"),
+    ],
+)
+def test_forwarded_numbers_are_range_checked_before_anything_runs(
+    env: dict,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flag: str,
+    value: str,
+    message: str,
+) -> None:
+    """codex P1: predict へ転送する数値は measure で 64（子の起動・out-dir 作成より前）。"""
+    out = tmp_path / "rec"
+    argv = _argv(env, out, flag, value)
+    # `_argv` が既定の --warmup / --max-seq-length を先に入れるため、後勝ちで上書きされる
+    assert measure.main(argv, time_cmd=["/nonexistent"]) == 64
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "invalid_input"
+    assert err["message"] == message
+    assert not out.exists()

@@ -28,7 +28,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+# `python -m tools.poc26.measure` を cwd=trainer・PYTHONPATH 無しで起動しても `tools`・
+# `fandhe_edge_trainer` を import できるよう、`lora_poc.py` と同じ作法で 2 つのパスを先頭に足す
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+
+from tools.poc26.cli import _validate
 from tools.poc26.common import MAX_WALL_SECONDS_CAP, SHA_RE
+
+from fandhe_edge_trainer.errors import WorkerError
 
 MB = 1_000_000  # 容量は 10 進 MB（オーナー確定 2026-10-08）
 CAPACITY_TARGET_MB = 40
@@ -295,8 +303,15 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
             raise _ArgError(
                 f"invalid arguments: --timeout-seconds out of range: 1..{MAX_WALL_SECONDS_CAP}"
             )
+        # predict へ転送する数値は predict（cli.py）と同じ範囲検査を子の起動前に行う
+        _validate(
+            argparse.Namespace(command="predict", max_seq_length=a.max_seq_length, warmup=a.warmup)
+        )
     except _ArgError as exc:
         print(json.dumps({"code": "invalid_input", "message": str(exc)}), file=sys.stderr)
+        return 64
+    except WorkerError as exc:  # 範囲外（メッセージは名前と範囲だけ。値は含まない）
+        print(json.dumps({"code": exc.code, "message": exc.message}), file=sys.stderr)
         return 64
     # 相対パスは子（cwd が trainer/）でも同じ場所を指すよう絶対化する
     for f in ("model_dir", "definition", "adapter_dir", "input", "onnx_dir"):
