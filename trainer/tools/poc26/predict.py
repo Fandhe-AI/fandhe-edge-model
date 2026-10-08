@@ -39,12 +39,38 @@ from tools.poc26.io_records import (
     read_adapter_config,
     write_scores,
 )
-from tools.poc26.qwen2_model import (
-    apply_lora,
-)
+from tools.poc26.qwen2_model import Qwen2Model, apply_lora
 from tools.poc26.score import build_prompting, prepare_prompts, score_records
 
 ADAPTER_DTYPES = (mx.float32, mx.bfloat16, mx.float16)
+
+
+def attach_adapter(model: Qwen2Model, cfg: dict, weights: dict[str, mx.array]) -> None:
+    """`model` へ LoRA を適用し、構造・dtype・有限性を検査した adapter 重みを float32 で載せる。
+
+    `cmd_predict` と ONNX 書き出し（`export_onnx.py`。REQ-41・TASK-41.1-7・#392）が共有する。
+    不一致は終了コード 64。
+    """
+    with as_input_error():
+        apply_lora(
+            model,
+            num_layers=cfg["num_layers"],
+            rank=cfg["rank"],
+            scale=cfg["scale"],
+            dropout=cfg["dropout"],
+            seed=cfg["lora_init_seed"],
+        )
+    expected = dict(tree_flatten(model.trainable_parameters()))
+    if weights.keys() != expected.keys() or any(
+        weights[k].shape != v.shape for k, v in expected.items()
+    ):
+        raise invalid("adapter weights do not match the model structure")
+    if any(v.dtype not in ADAPTER_DTYPES for v in weights.values()):
+        raise invalid("adapter weight dtype must be float32, bfloat16 or float16")
+    if not all(bool(mx.all(mx.isfinite(v)).item()) for v in weights.values()):
+        raise invalid("adapter weights are not finite")
+    model.load_weights([(k, v.astype(mx.float32)) for k, v in weights.items()], strict=False)
+    mx.eval(model.parameters())
 
 
 def cmd_predict(a: argparse.Namespace) -> int:
@@ -91,26 +117,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
         a.tokenizer_config_sha256,
     ):
         raise invalid("adapter was trained with a different config / tokenizer")
-    with as_input_error():
-        apply_lora(
-            model,
-            num_layers=cfg["num_layers"],
-            rank=cfg["rank"],
-            scale=cfg["scale"],
-            dropout=cfg["dropout"],
-            seed=cfg["lora_init_seed"],
-        )
-    expected = dict(tree_flatten(model.trainable_parameters()))
-    if weights.keys() != expected.keys() or any(
-        weights[k].shape != v.shape for k, v in expected.items()
-    ):
-        raise invalid("adapter weights do not match the model structure")
-    if any(v.dtype not in ADAPTER_DTYPES for v in weights.values()):
-        raise invalid("adapter weight dtype must be float32, bfloat16 or float16")
-    if not all(bool(mx.all(mx.isfinite(v)).item()) for v in weights.values()):
-        raise invalid("adapter weights are not finite")
-    model.load_weights([(k, v.astype(mx.float32)) for k, v in weights.items()], strict=False)
-    mx.eval(model.parameters())
+    attach_adapter(model, cfg, weights)
     pred, raw, stats = score_records(
         model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds)
     )

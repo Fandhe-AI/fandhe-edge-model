@@ -8,7 +8,8 @@ REQ-41・TASK-41.1-5・#390。ローカルの Qwen2.5-0.5B-Instruct を LoRA で
 に従う。`python -m tools.poc26.lora_poc` が呼ぶ（`lora_poc.py` は薄い入口）。
 
 サブコマンド: `train`（`train.py`）・`predict`（`predict.py`）・`probe`・`compare-probe`
-（`probe.py`）。共通部品は `common.py`、入出力は `io_records.py`、資産は `assets.py`、採点は
+（`probe.py`）・`export-onnx`・`verify-onnx`（`export_onnx.py`。ONNX 書き出し可否。#392）。
+共通部品は `common.py`、入出力は `io_records.py`、資産は `assets.py`、採点は
 `score.py`、ファイルを安全に読む処理は `safe_io.py`。
 
 契約:
@@ -39,6 +40,7 @@ from tools.poc26.common import (
     SHA_RE,
     invalid,
 )
+from tools.poc26.export_onnx import cmd_export_onnx, cmd_verify_onnx
 from tools.poc26.predict import cmd_predict
 from tools.poc26.probe import cmd_compare_probe, cmd_probe
 from tools.poc26.safe_io import LimitExceededError
@@ -81,11 +83,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ap = _Parser(prog="lora_poc", description=__doc__.splitlines()[0], allow_abbrev=False)
     sub = ap.add_subparsers(dest="command", required=True)
 
-    def common(p: argparse.ArgumentParser) -> None:
+    def pins(p: argparse.ArgumentParser) -> None:
         p.add_argument("--model-dir", type=Path, required=True)
         # #387 でベースモデルを取得した時に記録した sha256（64 桁の小文字 16 進。必須）
         for flag in ("model", "config", "tokenizer", "tokenizer-config"):
             p.add_argument(f"--{flag}-sha256", type=_sha_arg, required=True)
+
+    def common(p: argparse.ArgumentParser) -> None:
+        pins(p)
         p.add_argument("--device", choices=["gpu", "cpu"], default="gpu")
         p.add_argument("--dtype", choices=["bf16", "float32"], default="bf16")
         p.add_argument("--evidence", choices=["real_machine", "test_harness"], required=True)
@@ -121,6 +126,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adapter-sha256", type=_sha_arg, required=True)  # 学習時に記録した値
     p.add_argument("--input", type=Path, required=True)
     p.set_defaults(func=cmd_predict)
+
+    # ONNX 書き出し可否の確認（#392）。MLX は常に CPU・float32 で動かす
+    for name, func in (("export-onnx", cmd_export_onnx), ("verify-onnx", cmd_verify_onnx)):
+        e = sub.add_parser(name, allow_abbrev=False)
+        pins(e)
+        e.add_argument("--adapter-dir", type=Path, required=True)
+        e.add_argument("--adapter-sha256", type=_sha_arg, required=True)
+        e.add_argument("--evidence", choices=["real_machine", "test_harness"], required=True)
+        e.set_defaults(func=func)
+        if name == "export-onnx":
+            e.add_argument("--out-dir", type=Path, required=True)
+        else:
+            e.add_argument("--onnx-dir", type=Path, required=True)
+            # ReferenceEvaluator の 1 件あたりの壁時計上限（到達は 20）
+            e.add_argument("--max-score-seconds", type=int, default=DEFAULT_MAX_SCORE_SECONDS)
 
     pr = sub.add_parser("probe", allow_abbrev=False)
     common(pr)
