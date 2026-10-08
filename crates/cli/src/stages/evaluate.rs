@@ -55,7 +55,7 @@
 //! # 1 件ごとの予測の保存（REQ-27・REQ-41・#445）
 //!
 //! 評価記録と同じ候補ディレクトリへ `evaluation_predictions.jsonl`（評価データの行順。
-//! `{id,status,predicted_label,scores}`。[`crate::prediction_lines`]）を新規に書く（既存なら適用権を取る前に
+//! `{id,status,predicted_label,scores}`。[`PredictionLine`]）を新規に書く（既存なら適用権を取る前に
 //! `invalid_input`）。PoC-26 の採点入口（`fandhe-edge-score`）が、他候補の予測と同じ形式で読む。
 //! stdout の JSON・[`EvaluationRecord`] のスキーマは変えない。書き込みは評価記録と同じ位置
 //! （台帳への完了記録の前）で行い、失敗時の扱いも同じ。
@@ -87,7 +87,9 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::limits::INFER_TIME_LIMIT;
-use fandhe_edge_core::stage_report::{EvaluateCompletedReport, EvaluateReport};
+use fandhe_edge_core::stage_report::{
+    EvaluateCompletedReport, EvaluateReport, PredictionLine, PredictionLineOutcome,
+};
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
@@ -111,7 +113,6 @@ use crate::error_report::{
     EvalPredictFailure, ToErrorReport, acquire_error_report, apply_once_error_report,
 };
 use crate::infer_batch::judgment_from_prediction;
-use crate::prediction_lines::prediction_line;
 use crate::project::{
     EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project,
     SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
@@ -280,20 +281,22 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     let mut finish_error: Option<ErrorReport> = None;
     let finish = |applied: &AppliedOnce<Vec<Outcome>>| -> Result<EvaluateCompletedReport, EvalPredictFailure> {
         finalize_evaluation(
-            &project,
-            &definition,
-            &freeze,
-            &target,
-            args.candidate,
-            &record_rel,
+            FinalizeContext {
+                project: &project,
+                definition: &definition,
+                freeze: &freeze,
+                target: &target,
+                candidate: args.candidate,
+                record_rel: &record_rel,
+                definition_sha256,
+                onnx_digest,
+                baseline: baseline.as_ref(),
+            },
             &PredictionsSink {
                 rel: &predictions_rel,
                 ids: &eval_ids,
                 scores: &scores_log.borrow(),
             },
-            definition_sha256,
-            onnx_digest,
-            baseline.as_ref(),
             applied,
         )
         .map_err(|e| {
@@ -303,12 +306,14 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     };
     let (_applied, report) = match apply_to_frozen_data(
         held_ledger.ledger(),
-        &freeze,
-        &definition,
-        &eval_bytes,
-        &target,
-        onnx_digest,
-        &scores_log,
+        FrozenApplication {
+            freeze: &freeze,
+            definition: &definition,
+            eval_bytes: &eval_bytes,
+            target: &target,
+            onnx_digest,
+            scores_log: &scores_log,
+        },
         finish,
     ) {
         Ok(v) => v,
@@ -461,24 +466,39 @@ fn decode_evaluation(
         .collect())
 }
 
+/// [`finalize_evaluation`] へ渡す、評価の確定に要るプロジェクト・候補・凍結データの情報。
+struct FinalizeContext<'a> {
+    project: &'a Project,
+    definition: &'a Definition,
+    freeze: &'a FreezeRecord,
+    target: &'a PreparedCandidate,
+    candidate: usize,
+    record_rel: &'a Path,
+    definition_sha256: String,
+    onnx_digest: Sha256Digest,
+    baseline: Option<&'a PreparedBaseline>,
+}
+
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
 ///
 /// 指標は評価器（`fandhe-edge-eval`）で求め、CLI では再実装しない（REQ-24）。記録の書き込みは最後に行い、
 /// それ以前の失敗では記録を残さない。
-#[allow(clippy::too_many_arguments)]
 fn finalize_evaluation(
-    project: &Project,
-    definition: &Definition,
-    freeze: &FreezeRecord,
-    target: &PreparedCandidate,
-    candidate: usize,
-    record_rel: &Path,
+    ctx: FinalizeContext<'_>,
     predictions: &PredictionsSink<'_>,
-    definition_sha256: String,
-    onnx_digest: Sha256Digest,
-    baseline: Option<&PreparedBaseline>,
     applied: &AppliedOnce<Vec<Outcome>>,
 ) -> Result<EvaluateCompletedReport, ErrorReport> {
+    let FinalizeContext {
+        project,
+        definition,
+        freeze,
+        target,
+        candidate,
+        record_rel,
+        definition_sha256,
+        onnx_digest,
+        baseline,
+    } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
         .golds
@@ -550,7 +570,7 @@ fn finalize_evaluation(
 
 /// 1 件ごとの予測の保存に必要な材料（書き込み先・評価データの id 列・推論ごとのスコア）。
 ///
-/// 行形式は [`crate::prediction_lines`]。stdout の JSON・[`EvaluationRecord`] のスキーマには影響しない
+/// 行形式は [`PredictionLine`]。stdout の JSON・[`EvaluationRecord`] のスキーマには影響しない
 /// （REQ-27。PoC-26 の採点入口 `fandhe-edge-score` が読む。REQ-41・#445）。
 struct PredictionsSink<'a> {
     rel: &'a Path,
@@ -573,7 +593,16 @@ impl PredictionsSink<'_> {
         let mut out = String::new();
         for (i, (id, outcome)) in self.ids.iter().zip(outcomes).enumerate() {
             let scores = self.scores.get(i).map(|s| (labels, s.as_slice()));
-            out.push_str(&prediction_line(id, outcome, scores));
+            let line_outcome = match outcome {
+                Outcome::Label(l) => PredictionLineOutcome::Label(l.clone()),
+                Outcome::Invalid => PredictionLineOutcome::Invalid,
+                Outcome::Abstain => PredictionLineOutcome::Abstain,
+                Outcome::Error => PredictionLineOutcome::Error,
+            };
+            let line = PredictionLine::new(id, line_outcome, scores)
+                .to_json_line()
+                .map_err(|_| runtime("cannot serialize evaluation predictions"))?;
+            out.push_str(&line);
             out.push('\n');
             if u64::try_from(out.len()).map_or(true, |n| n > limit) {
                 return Err(predictions_limit_error());
@@ -611,18 +640,30 @@ fn check_predictions_limit(ids: &[String], labels: &[&str], limit: u64) -> Resul
     }
 }
 
+/// [`apply_to_frozen_data`] へ渡す、凍結データへの適用に要る情報。
+struct FrozenApplication<'a> {
+    freeze: &'a FreezeRecord,
+    definition: &'a Definition,
+    eval_bytes: &'a [u8],
+    target: &'a PreparedCandidate,
+    onnx_digest: Sha256Digest,
+    scores_log: &'a RefCell<Vec<Vec<f64>>>,
+}
+
 /// 台帳で適用権を取り、凍結した評価データへ 1 回だけ推論を当てる。
-#[allow(clippy::too_many_arguments)]
 fn apply_to_frozen_data<R>(
     ledger: &FinalTestLedger,
-    freeze: &FreezeRecord,
-    definition: &Definition,
-    eval_bytes: &[u8],
-    target: &PreparedCandidate,
-    onnx_digest: Sha256Digest,
-    scores_log: &RefCell<Vec<Vec<f64>>>,
+    application: FrozenApplication<'_>,
     finish: impl FnOnce(&AppliedOnce<Vec<Outcome>>) -> Result<R, EvalPredictFailure>,
 ) -> Result<(AppliedOnce<Vec<Outcome>>, R), ErrorReport> {
+    let FrozenApplication {
+        freeze,
+        definition,
+        eval_bytes,
+        target,
+        onnx_digest,
+        scores_log,
+    } = application;
     // 評価器はパスから開き直すため、閉じ込めつきで読み検証済みのバイト列を、この実行だけの
     // 私用ディレクトリ（0700・新規作成）へ複製し、そのパスを渡す。プロジェクト内のパスを渡すと、
     // 検証後に symlink へ差し替えられてプロジェクト外を読みうる（REQ-39）。
