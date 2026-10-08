@@ -525,3 +525,44 @@ def test_run_memory_estimate_counts_weights_twice() -> None:
 
     assert run_memory_estimate(1000, 300) == 2 * 1000 + 300 + (1 << 30)
     assert run_memory_estimate(0, 0) == 1 << 30
+
+
+def test_export_failure_leaves_no_output_or_temp(
+    adapter_env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 書き出し途中（checker）で失敗しても、最終出力先も一時ディレクトリも残らない。"""
+    a = adapter_env
+    flags = _flags(a, a["adapter"])
+    parent = a["tmp"] / "atomic"
+    parent.mkdir()
+    seen: list[bool] = []
+
+    def boom(path: str) -> None:
+        seen.append((parent / "out").exists())  # 途中では最終出力先が見えない
+        raise RuntimeError("checker failed")
+
+    monkeypatch.setattr(onnx.checker, "check_model", boom)
+    assert main(["export-onnx", *flags, "--out-dir", str(parent / "out")]) == 70
+    assert seen == [False]
+    assert list(parent.iterdir()) == []
+
+
+def test_export_publishes_complete_dir_with_relative_data_location(
+    adapter_env: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """REQ-41: 成功時は 3 ファイルが揃って公開され、external の location は相対名のまま。"""
+    a = adapter_env
+    out = a["tmp"] / "atomic_ok"
+    assert main(["export-onnx", *_flags(a, a["adapter"]), "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    assert sorted(p.name for p in out.iterdir()) == [
+        "export_summary.json",
+        "model.onnx",
+        "model.onnx.data",
+    ]
+    proto = onnx.load(str(out / "model.onnx"), load_external_data=False)
+    locs = {
+        e.value for t in proto.graph.initializer for e in t.external_data if e.key == "location"
+    }
+    assert locs == {"model.onnx.data"}
+    assert not [p for p in a["tmp"].iterdir() if ".tmp-" in p.name]

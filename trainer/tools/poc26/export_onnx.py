@@ -19,7 +19,6 @@ import argparse
 import hashlib
 import os
 import re
-import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -37,7 +36,13 @@ from tools.poc26.assets import (
     pins_from_args,
 )
 from tools.poc26.common import SHA_RE, Budget, invalid, loads, read_input, sha256, too_large
-from tools.poc26.io_records import MAX_ADAPTER_BYTES, check_out_dir, json_text, load_adapter
+from tools.poc26.io_records import (
+    MAX_ADAPTER_BYTES,
+    OutputDir,
+    check_out_dir,
+    json_text,
+    load_adapter,
+)
 from tools.poc26.predict import attach_adapter
 from tools.poc26.qwen2_model import LoRALinear, Qwen2Config, Qwen2Model
 from tools.poc26.safe_io import LimitExceededError, open_regular
@@ -486,12 +491,14 @@ def _sha256_file(path: Path, limit: int, what: str) -> str:
 def cmd_export_onnx(a: argparse.Namespace) -> int:
     """`export-onnx`: LoRA 統合 -> ONNX 手組み -> `onnx.checker` -> 集計 JSON を出力先へ書く。
 
-    出力先は 0700 で新規作成し、途中で失敗したら作ったディレクトリごと消す。`OutputDir`（一時
-    ディレクトリ経由の rename）は 2 GB 超の外部データを二重に置くため使わない。
+    出力は `OutputDir` の一時ディレクトリ（同じ親・0700。データを複製しない）へ書き、書き出し・
+    checker・ハッシュ・summary が全部揃ってから rename で公開する。途中の失敗は一時ディレクトリごと
+    消え、最終出力先は現れない。external data の location は相対名（`model.onnx.data`）なので
+    rename 後も有効。
     """
     t0 = time.monotonic()
     budget = Budget()
-    check_out_dir(a.out_dir)
+    check_out_dir(a.out_dir)  # 重い処理の前に早く失敗させる（OutputDir も入るときに再確認する）
     model, cfg, _ = _load_fused_source(a)
     budget.check()
     # MLX モデル保持中に全重みの numpy コピーを作る。最大の 1 本は転置で更にコピーされる
@@ -499,13 +506,14 @@ def cmd_export_onnx(a: argparse.Namespace) -> int:
     check_memory(2 * sum(sizes) + max(sizes, default=0), "export-onnx weights")
     weights = fused_weights(model)
     budget.check()
-    a.out_dir.mkdir(mode=0o700)
-    try:
-        model_path, data_path = a.out_dir / "model.onnx", a.out_dir / "model.onnx.data"
+    with OutputDir(a.out_dir) as out:
+        if out.tmp is None:
+            raise RuntimeError("OutputDir is not open")
+        model_path, data_path = out.tmp / "model.onnx", out.tmp / "model.onnx.data"
         # O_EXCL 相当の新規作成（上書きしない）
         fd = os.open(data_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
-            proto = build_onnx(model.config, weights, _Graph(f, data_path.name, budget))
+            proto = build_onnx(model.config, weights, _Graph(f, "model.onnx.data", budget))
         onnx.save_model(proto, str(model_path))
         del weights, proto
         budget.check()
@@ -529,10 +537,8 @@ def cmd_export_onnx(a: argparse.Namespace) -> int:
             "elapsed_seconds": round(time.monotonic() - t0, 1),
         }
         text = json_text(summary)
-        (a.out_dir / "export_summary.json").write_text(text, encoding="utf-8")
-    except BaseException:
-        shutil.rmtree(a.out_dir, ignore_errors=True)
-        raise
+        out.write("export_summary.json", text)
+        out.commit()
     print(text, end="")
     return 0
 
