@@ -6,7 +6,7 @@
 //! # 役割
 //!
 //! PoC-26 の追加学習候補 P（Python の PoC スクリプトが `pred.jsonl` を出す）を、現行候補
-//! （`evaluate` が保存する `evaluation_predictions.jsonl`。[`crate::prediction_lines`]）と同じ評価器・
+//! （`evaluate` が保存する `evaluation_predictions.jsonl`。[`fandhe_edge_core::stage_report::PredictionLine`]）と同じ評価器・
 //! 同じ凍結 test で採点する。指標・検定は評価器（`fandhe-edge-eval`）のものをそのまま使い、
 //! 本モジュールは入力の接続と JSON 出力だけを持つ（評価ロジックを再実装しない。REQ-24）。
 //!
@@ -54,23 +54,40 @@
 //!
 //! # 必要件数の仮定（事前登録 4〜5 節）
 //!
-//! b 側 0.15・c 側 0.05・検出力 0.8・α = 0.05 / 3（Holm の族 m = 3）。
+//! b 側 0.15・c 側 0.05・検出力 0.8・α = 0.05 / 3（Holm の族 m = 3）。名前付き定数は
+//! `ASSUMED_B_RATE` 等（出典は事前登録）。
 //!
 //! # 入出力
 //!
-//! 引数は [`parse_args`]、結果は [`run`] が JSON 1 行の文字列で返す。エラーは既存 CLI と同じ
+//! 引数は [`parse_args`]、結果は [`run`] が構造化型（core の `ScoreReport`）で返す純粋な関数。
+//! 出力は [`emit`] が 7 工程と同じ出口（`write_stage_line`・`emit_error_report`）で JSON 1 行にし、
+//! 呼び出し全体に時間上限（[`MAX_SCORE_DURATION`]）を持つ。エラーは既存 CLI と同じ
 //! [`ErrorReport`]（`code`・`message`。終了コード 7 種）。予測・評価データの本文は出さない。
-//! cli は `serde_json` に依存しないため JSON は手組み（任意の文字列は [`json_string`] で
-//! エスケープ）。
+//! JSON の直列化は core の型に閉じる（cli は `serde_json` に依存しない）。
+//!
+//! # 既知の限界
+//!
+//! - 台帳は project-dir 単位で、同じ凍結 test でも再 `register` すると別台帳になる
+//!   （`final_test_ledger` と同じ既知の限界。オーナー了承の残余リスク）
+//! - RSS 上限はプロセス内で強制しない（7 工程と同じ）。入力は予測ファイル 1 つ 64 MiB
+//!   （`MAX_PROJECT_FILE_BYTES`）× 最大 4 ファイルと評価データで有界
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
-use fandhe_edge_core::exitcode::ErrorReport;
+use fandhe_edge_core::evaluation_record::{
+    BaselineComparisonVerdict, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES,
+};
+use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::stage_report::{
+    ScoreCandidate, ScoreConfusionMatrix, ScoreHolm, ScoreHolmComparison, ScorePerLabel,
+    ScoreReference, ScoreReport, ScoreRole, ScoreVsMajority,
+};
 use fandhe_edge_data::eval_input::{PredictionOutcome, prepare_evaluation_input};
 use fandhe_edge_eval::holm::{FamilySize, compare_candidates_with_holm};
 use fandhe_edge_eval::metrics::{
@@ -83,8 +100,11 @@ use fandhe_edge_eval::significance::{
 use fandhe_edge_eval::wilson::wilson_ci95;
 use fandhe_edge_guard::path::open_confined;
 
-use crate::error_report::ToErrorReport;
-use crate::prediction_lines::{json_f64, json_string};
+use crate::error_report::{ToErrorReport, emit_error_report};
+use crate::infer_batch::{
+    MAX_INFER_BATCH_OUTPUT_DURATION, OutputWatchdog, StallPolicy, run_with_stall_guard,
+};
+use crate::output::write_stage_line;
 use crate::project::{
     CANDIDATES_DIR, EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES,
     Project, fs_report, invalid, runtime,
@@ -93,6 +113,13 @@ use crate::stages::baseline::majority_from_train;
 use crate::stages::inspect::load_frozen_evaluation;
 use crate::stages::train::verified_split;
 
+/// 採点 1 呼び出し全体（読み込み・計算・台帳の書き込み）の時間上限（暫定 600 秒。REQ-39）。
+///
+/// 暫定値（推定。実機での採点時間は未測定）。入力は有界（予測 64 MiB × 最大 4 ファイルと評価データ）。
+/// 実測後に見直す。
+pub const MAX_SCORE_DURATION: Duration = Duration::from_secs(600);
+/// 台帳ロックの最大待ち時間（無限待ちを作らない。REQ-39）。
+const LEDGER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// 台帳のディレクトリ名（プロジェクト直下。`seed-<seed>/<NAME>.sha256` を置く）。
 const LEDGER_DIR: &str = "poc26_score_ledger";
 /// 族の大きさ（事前登録: 対 majority・対 2 相手。相手が欠けても固定）。
@@ -277,11 +304,11 @@ enum Role {
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    fn report_role(self) -> ScoreRole {
         match self {
-            Role::Candidate => "candidate",
-            Role::Compare => "compare",
-            Role::Reference => "reference",
+            Role::Candidate => ScoreRole::Candidate,
+            Role::Compare => ScoreRole::Compare,
+            Role::Reference => ScoreRole::Reference,
         }
     }
 }
@@ -437,21 +464,35 @@ fn load_prediction<'a>(
     Ok(loaded)
 }
 
-/// 事前登録の仮定（b 側 0.15・c 側 0.05・検出力 0.8・α = 0.05 / 3）から必要件数を求める。
+/// 事前登録の仮定: b 側（候補のみ正解）の割合。
+///
+/// 出典: 事前登録 4〜5 節（`poc26-preregistration.md`。REQ-41・TASK-41.1・#386）。
+const ASSUMED_B_RATE: f64 = 0.15;
+/// 事前登録の仮定: c 側（下限基準のみ正解）の割合（出典は [`ASSUMED_B_RATE`] と同じ）。
+const ASSUMED_C_RATE: f64 = 0.05;
+/// 事前登録の検出力（出典は [`ASSUMED_B_RATE`] と同じ）。
+const TARGET_POWER: f64 = 0.8;
+/// Holm の族 m = 3 に対する有意水準 α = 0.05 / 3（出典は [`ASSUMED_B_RATE`] と同じ）。
+/// [`FAMILY_SIZE`] を変えるときはここも合わせる（下の const assert が食い違いを止める）。
+const HOLM_ALPHA: f64 = 0.05 / 3.0;
+const _: () = assert!(FAMILY_SIZE == 3);
+
+/// 事前登録の仮定から必要件数を求める。
 fn required_sample_size() -> Result<RequiredSampleSize, ErrorReport> {
-    #[allow(clippy::cast_precision_loss)]
-    let alpha = 0.05 / FAMILY_SIZE as f64;
-    let model = McNemarSampleSizeAssumption::new(0.15, 0.05, alpha, 0.8)
-        .map_err(|_| invalid("sample size cannot be computed"))?;
+    let model =
+        McNemarSampleSizeAssumption::new(ASSUMED_B_RATE, ASSUMED_C_RATE, HOLM_ALPHA, TARGET_POWER)
+            .map_err(|_| invalid("sample size cannot be computed"))?;
     required_sample_size_mcnemar(&model).map_err(|_| invalid("sample size cannot be computed"))
 }
 
 /// 評価器の判定を出力の語彙へ写す（将来 variant が増えたら黙って通さず失敗させる）。
-fn verdict_str(v: BaselineVerdict) -> Result<&'static str, ErrorReport> {
+fn verdict_of(v: BaselineVerdict) -> Result<BaselineComparisonVerdict, ErrorReport> {
     match v {
-        BaselineVerdict::SignificantlyBetter => Ok("significantly_better"),
-        BaselineVerdict::NotSignificantlyBetter => Ok("not_significantly_better"),
-        BaselineVerdict::Undeterminable(_) => Ok("undeterminable"),
+        BaselineVerdict::SignificantlyBetter => Ok(BaselineComparisonVerdict::SignificantlyBetter),
+        BaselineVerdict::NotSignificantlyBetter => {
+            Ok(BaselineComparisonVerdict::NotSignificantlyBetter)
+        }
+        BaselineVerdict::Undeterminable(_) => Ok(BaselineComparisonVerdict::Undeterminable),
         _ => Err(runtime("unsupported verdict")),
     }
 }
@@ -478,33 +519,29 @@ fn compare_with(
         .map_err(|_| runtime("cannot compute comparison"))
 }
 
-fn opt(v: Option<f64>) -> String {
-    v.map_or_else(|| "null".to_string(), json_f64)
-}
-
-/// ラベル別指標と混同行列の JSON（`per_label`・`confusion_matrix`）。
-fn metrics_json(labels: &[&str], m: &SingleSelectMetrics) -> Result<(String, String), ErrorReport> {
-    let per_label: Vec<String> = m
+/// ラベル別指標と混同行列を出力用の型へ写す。
+fn metrics_report(
+    labels: &[&str],
+    m: &SingleSelectMetrics,
+) -> Result<(Vec<ScorePerLabel>, ScoreConfusionMatrix), ErrorReport> {
+    let per_label = m
         .per_label
         .iter()
-        .map(|l| {
-            format!(
-                "{{\"label\":{},\"support\":{},\"predicted_count\":{},\"tp\":{},\"fp\":{},\"fn\":{},\"precision\":{},\"recall\":{},\"f1\":{}}}",
-                json_string(&l.label),
-                l.support,
-                l.predicted_count,
-                l.tp,
-                l.fp,
-                l.fn_,
-                opt(l.precision),
-                opt(l.recall),
-                opt(l.f1)
-            )
+        .map(|l| ScorePerLabel {
+            label: l.label.clone(),
+            support: l.support,
+            predicted_count: l.predicted_count,
+            tp: l.tp,
+            fp: l.fp,
+            fn_: l.fn_,
+            precision: l.precision,
+            recall: l.recall,
+            f1: l.f1,
         })
         .collect();
     let mut rows = Vec::with_capacity(labels.len());
     for gold in 0..labels.len() {
-        let columns = (0..labels.len())
+        let row = (0..labels.len())
             .map(ConfusionColumn::Label)
             .chain([
                 ConfusionColumn::Invalid,
@@ -514,20 +551,15 @@ fn metrics_json(labels: &[&str], m: &SingleSelectMetrics) -> Result<(String, Str
             .map(|c| {
                 m.confusion
                     .get(gold, c)
-                    .map(|n| n.to_string())
                     .ok_or_else(|| runtime("cannot read confusion matrix"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        rows.push(format!("[{}]", columns.join(",")));
+        rows.push(row);
     }
-    let label_list: Vec<String> = labels.iter().map(|l| json_string(l)).collect();
-    let confusion = format!(
-        "{{\"labels\":[{}],\"columns\":[{},\"invalid\",\"abstain\",\"error\"],\"rows\":[{}]}}",
-        label_list.join(","),
-        label_list.join(","),
-        rows.join(",")
-    );
-    Ok((format!("[{}]", per_label.join(",")), confusion))
+    let confusion =
+        ScoreConfusionMatrix::new(labels.iter().map(|l| (*l).to_string()).collect(), rows)
+            .ok_or_else(|| runtime("cannot read confusion matrix"))?;
+    Ok((per_label, confusion))
 }
 
 /// 台帳のディレクトリ（凍結 test の sha256 単位・seed 単位）のプロジェクト内の相対パス。
@@ -615,12 +647,12 @@ fn lock_ledger(project: &Project, eval_sha: &str, seed: u32) -> Result<std::fs::
     // 既存なら作成が失敗するだけ（無視）。開けなければ次の open_file が拒否する。
     let _ = project.write_new(&rel, b"");
     let (file, _) = project.open_file(&rel)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + LEDGER_LOCK_TIMEOUT;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => return Err(runtime("cannot lock score ledger")),
         }
@@ -653,12 +685,16 @@ fn write_ledger(
     Ok(())
 }
 
-/// 採点して結果の JSON 1 行（改行なし）を返す。
+/// 採点して構造化した結果を返す（出力・時間上限は持たない純粋な計算。台帳への書き込みは伴う）。
+///
+/// 呼び出し全体の時間上限（[`MAX_SCORE_DURATION`]）と出力の期限は [`emit`] が持つ（`infer_batch` の
+/// `run_with_stall_guard` と同じ見張り。REQ-39）。長寿命プロセスから本関数を直接呼ぶ場合は、
+/// 呼び出し側が期限を持つこと。
 ///
 /// # Errors
 /// 凍結ハッシュ不一致・評価データなし・予測の不備・台帳違反は `invalid_input`（64）、
 /// 上限超過は `limit_exceeded`（20）、評価器・I/O の失敗は `runtime_error`（70）。
-pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
+pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<ScoreReport, ErrorReport> {
     args.validate()?;
     let project = Project::open(cwd, &args.project_dir)?;
     let Some((freeze, eval_bytes)) = load_frozen_evaluation(&project)? else {
@@ -702,7 +738,7 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
     let majority_outcomes = vec![majority; first.golds.len()];
     let required = required_sample_size()?;
 
-    let mut candidates_json = Vec::with_capacity(loaded.len());
+    let mut candidates = Vec::with_capacity(loaded.len());
     for l in &loaded {
         let eval_records: Vec<EvalRecord<'_>> = l
             .golds
@@ -718,24 +754,24 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
         let vs_majority =
             compare_with(&labels, &l.golds, &l.outcomes, &majority_outcomes, required)?;
         let counts = vs_majority.counts();
-        let (per_label, confusion) = metrics_json(&labels, &m)?;
-        candidates_json.push(format!(
-            "{{\"name\":{},\"role\":\"{}\",\"pred_sha256\":\"{}\",\"correct\":{},\"accuracy\":{},\"accuracy_wilson95\":[{},{}],\"macro_f1\":{},\"per_label\":{},\"confusion_matrix\":{},\"vs_majority\":{{\"b\":{},\"c\":{},\"p\":{},\"verdict\":\"{}\"}}}}",
-            json_string(&l.named.name),
-            l.role.as_str(),
-            l.sha256,
+        let (per_label, confusion_matrix) = metrics_report(&labels, &m)?;
+        candidates.push(ScoreCandidate {
+            name: l.named.name.clone(),
+            role: l.role.report_role(),
+            pred_sha256: l.sha256.clone(),
             correct,
-            json_f64(m.accuracy.overall.value()),
-            json_f64(wilson.lo()),
-            json_f64(wilson.hi()),
-            opt(m.macro_f1.value()),
+            accuracy: m.accuracy.overall.value(),
+            accuracy_wilson95: [wilson.lo(), wilson.hi()],
+            macro_f1: m.macro_f1.value(),
             per_label,
-            confusion,
-            counts.b_candidate_only,
-            counts.c_baseline_only,
-            json_f64(vs_majority.test().p_two_sided().value()),
-            verdict_str(vs_majority.verdict())?,
-        ));
+            confusion_matrix,
+            vs_majority: ScoreVsMajority {
+                b: counts.b_candidate_only,
+                c: counts.c_baseline_only,
+                p: vs_majority.test().p_two_sided().value(),
+                verdict: verdict_of(vs_majority.verdict())?,
+            },
+        });
     }
 
     // Holm: 採点対象の [対 majority, 対 compare 各相手] を m = 3 固定で補正する。
@@ -761,21 +797,20 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
     let family = FamilySize::new(FAMILY_SIZE).ok_or_else(|| runtime("invalid family size"))?;
     let adjusted = compare_candidates_with_holm(&comparisons, family)
         .map_err(|_| runtime("cannot adjust p values"))?;
-    let mut holm_json = Vec::with_capacity(adjusted.len());
-    for (name, h) in against.iter().zip(&adjusted) {
+    let mut holm_comparisons = Vec::with_capacity(adjusted.len());
+    for (name, h) in against.into_iter().zip(&adjusted) {
         let c = h.comparison();
-        holm_json.push(format!(
-            "{{\"against\":{},\"b\":{},\"c\":{},\"p_raw\":{},\"p_adjusted\":{},\"verdict\":\"{}\"}}",
-            json_string(name),
-            c.counts().b_candidate_only,
-            c.counts().c_baseline_only,
-            json_f64(c.test().p_two_sided().value()),
-            json_f64(h.adjusted_p().value()),
-            verdict_str(h.verdict())?,
-        ));
+        holm_comparisons.push(ScoreHolmComparison {
+            against: name,
+            b: c.counts().b_candidate_only,
+            c: c.counts().c_baseline_only,
+            p_raw: c.test().p_two_sided().value(),
+            p_adjusted: h.adjusted_p().value(),
+            verdict: verdict_of(h.verdict())?,
+        });
     }
 
-    let mut references_json = Vec::new();
+    let mut references = Vec::new();
     for l in loaded.iter().filter(|l| l.role == Role::Reference) {
         let c = compare_with(
             &labels,
@@ -784,14 +819,13 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
             &l.outcomes,
             required,
         )?;
-        references_json.push(format!(
-            "{{\"candidate\":{},\"against\":{},\"b\":{},\"c\":{},\"p_raw\":{}}}",
-            json_string(&target.named.name),
-            json_string(&l.named.name),
-            c.counts().b_candidate_only,
-            c.counts().c_baseline_only,
-            json_f64(c.test().p_two_sided().value()),
-        ));
+        references.push(ScoreReference {
+            candidate: target.named.name.clone(),
+            against: l.named.name.clone(),
+            b: c.counts().b_candidate_only,
+            c: c.counts().c_baseline_only,
+            p_raw: c.test().p_two_sided().value(),
+        });
     }
 
     // 台帳は全検証が通った後、出力の直前に書く（検証の失敗で適用権を使わない）。
@@ -802,16 +836,96 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<String, ErrorReport> {
     let to_write = check_ledger(&project, &eval_sha, args.seed, &loaded)?;
     write_ledger(&project, &eval_sha, args.seed, &to_write)?;
 
-    Ok(format!(
-        "{{\"step\":\"score_predictions\",\"status\":\"ok\",\"seed\":{},\"evaluation_sha256\":\"{}\",\"n_total\":{},\"required_sample_size\":{},\"candidates\":[{}],\"holm\":{{\"candidate\":{},\"m\":{},\"comparisons\":[{}]}},\"references\":[{}]}}",
+    Ok(ScoreReport::new(
         args.seed,
-        freeze.sha256().to_hex(),
+        eval_sha,
         n_total,
         required.get(),
-        candidates_json.join(","),
-        json_string(&target.named.name),
-        FAMILY_SIZE,
-        holm_json.join(","),
-        references_json.join(","),
+        candidates,
+        ScoreHolm {
+            candidate: target.named.name.clone(),
+            m: FAMILY_SIZE,
+            comparisons: holm_comparisons,
+        },
+        references,
     ))
+}
+
+/// 採点を [`MAX_SCORE_DURATION`] 以内に実行し、結果を 7 工程と同じ出口で書く（成功は 1 行 JSON を
+/// `write_stage_line`、失敗は `emit_error_report`）。バイナリ `fandhe-edge-score` の本体。
+///
+/// 期限超過は `limit_exceeded`（20）。採点を切り離してプロセスを終了する（`infer_batch` の
+/// `run_with_stall_guard` と同じ。台帳の書き込みが途中で止まっても、ロックはプロセス終了で解放され、
+/// 比較相手を先・採点対象を最後に書くため、採点対象が未記録なら再実行できる）。
+/// 出力段階は `MAX_INFER_BATCH_OUTPUT_DURATION` のウォッチドッグで見張る（REQ-39）。
+///
+/// # Errors
+/// 出力先への書き込み失敗（呼び出し側は exit 70 に写す）。
+pub fn emit<W: Write>(out: &mut W, args: &ScoreArgs, cwd: &Path) -> io::Result<ExitCode> {
+    let (args, cwd) = (args.clone(), cwd.to_path_buf());
+    emit_with(
+        out,
+        MAX_SCORE_DURATION,
+        StallPolicy::TerminateProcess,
+        move || run(&args, &cwd),
+    )
+}
+
+/// [`emit`] の本体。計算と回収方式を差し替えられる（crate 内部。テストが実時間を待たないため）。
+pub(crate) fn emit_with<W: Write>(
+    out: &mut W,
+    duration: Duration,
+    policy: StallPolicy,
+    work: impl FnOnce() -> Result<ScoreReport, ErrorReport> + Send + 'static,
+) -> io::Result<ExitCode> {
+    let outcome =
+        run_with_stall_guard(out, duration, MAX_INFER_BATCH_OUTPUT_DURATION, policy, work);
+    // 書き込みの停止も期限でプロセス終了へ倒す（7 工程の `infer` と同じ見張り）。
+    let _watchdog = OutputWatchdog::arm(policy.terminates(), MAX_INFER_BATCH_OUTPUT_DURATION)?;
+    match outcome {
+        Ok(report) => write_stage_line(out, report.to_json_line()),
+        Err(error) => emit_error_report(out, &error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REQ-39: 採点が期限内に返らなければ `limit_exceeded`（20）の `ErrorReport` を 1 行書いて返す
+    /// （実時間 600 秒を待たず、回収しない方式で検証する）。
+    #[test]
+    fn req39_score_deadline_returns_limit_exceeded() {
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_with(
+            &mut out,
+            Duration::from_millis(50),
+            StallPolicy::Leak,
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                Err(invalid("unreachable"))
+            },
+        )
+        .expect("write");
+        assert_eq!(code, ExitCode::LimitExceeded);
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.starts_with("{\"code\":\"limit_exceeded\""), "{text}");
+    }
+
+    /// REQ-39: 期限内に返る失敗はその `ErrorReport` の終了コードで 1 行書く。
+    #[test]
+    fn req39_score_in_time_failure_keeps_its_code() {
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_with(&mut out, Duration::from_secs(5), StallPolicy::Leak, || {
+            Err(invalid("bad"))
+        })
+        .expect("write");
+        assert_eq!(code, ExitCode::InvalidInput);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with("{\"code\":\"invalid_input\"")
+        );
+    }
 }

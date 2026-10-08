@@ -308,7 +308,7 @@ pub(crate) enum StallPolicy {
 }
 
 impl StallPolicy {
-    const fn terminates(self) -> bool {
+    pub(crate) const fn terminates(self) -> bool {
         match self {
             Self::TerminateProcess => true,
             #[cfg(test)]
@@ -321,7 +321,7 @@ impl StallPolicy {
 ///
 /// `write_all` / `flush` が出力先の停止でブロックしても、協調的な期限確認は戻らないため、
 /// 別スレッドが期限で `process::exit` して回収する（REQ-39。CLI の 1 プロセス専用）。
-struct OutputWatchdog {
+pub(crate) struct OutputWatchdog {
     _disarm: mpsc::Sender<()>,
 }
 
@@ -331,7 +331,7 @@ impl OutputWatchdog {
     /// # Errors
     /// スレッドを起動できなければ `Err`。上限なしで続行せず、呼び出し側は fail-closed で
     /// 終える（REQ-39）。
-    fn arm(enabled: bool, duration: Duration) -> io::Result<Option<Self>> {
+    pub(crate) fn arm(enabled: bool, duration: Duration) -> io::Result<Option<Self>> {
         Self::arm_with(enabled, duration, |task| {
             thread::Builder::new()
                 .name("infer-batch-watchdog".to_string())
