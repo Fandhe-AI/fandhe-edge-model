@@ -303,6 +303,44 @@ impl Project {
         Ok(())
     }
 
+    /// 新規ファイルを原子的に作る（`rel` は「無い」か「完全」のどちらかでしか見えない。既存なら拒否）。
+    ///
+    /// 同じディレクトリの一時名 `.tmp-<ファイル名>-<pid>` へ書いて fsync し、保持 fd 起点の
+    /// `NOREPLACE` の名前替えで `rel` に置く。書き込み途中でプロセスが終了しても残るのは一時名だけで、
+    /// `rel` の名前は塞がれない（`write_new` は途中終了で 0 バイト／部分的な `rel` を残す。
+    /// REQ-27・REQ-39）。一時名の残骸は同じ pid の次回実行が先に消すほか、他の読み取りは見ない。
+    /// ディレクトリエントリ自体の fsync は行わない（電源断までは保証しない。プロセス終了に対する原子性）。
+    ///
+    /// # Errors
+    /// 既存は `invalid_input`、書き込み・名前替えの失敗は `runtime_error`（一時ファイルは片付ける）。
+    pub fn publish_new_file(&self, rel: impl AsRef<Path>, bytes: &[u8]) -> Result<(), ErrorReport> {
+        let rel = rel.as_ref();
+        let Some(file_name) = rel.file_name() else {
+            return Err(invalid("project file path is invalid"));
+        };
+        let mut tmp_name = std::ffi::OsString::from(".tmp-");
+        tmp_name.push(file_name);
+        tmp_name.push(format!("-{}", std::process::id()));
+        let tmp = rel.with_file_name(tmp_name);
+        self.remove_file_if_exists(&tmp)?;
+        self.write_new(&tmp, bytes)?;
+        let published = self
+            .open_file(&tmp)
+            .and_then(|(f, _)| {
+                f.sync_all()
+                    .map_err(|_| runtime("cannot write project file"))
+            })
+            .and_then(|()| {
+                self.package.rename_member(&tmp, rel).map_err(|e| {
+                    write_rejection(&e, "file already exists", "cannot write project file")
+                })
+            });
+        if published.is_err() {
+            let _ = self.package.remove_file_member(&tmp);
+        }
+        published
+    }
+
     /// 既存ファイルを読み取り専用（0400）にする（開いた fd への `fchmod`。パスを開き直さない）。
     /// 評価の予測ファイルなど、書いた後に差し替えさせたくない記録に使う（非 unix では何もしない）。
     ///

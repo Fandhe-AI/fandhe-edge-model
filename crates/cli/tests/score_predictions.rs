@@ -453,11 +453,21 @@ fn req27_ledger_enforces_single_application() {
     env.write("p.jsonl", &pred_jsonl(pred_p));
     let a = env.bound("c1", 1, &pred_jsonl(pred_a));
     let c1 = format!("C1={a}");
-    env.ok(&args(&["--candidate", &c1]));
+    let first = env.ok(&args(&["--candidate", &c1]));
     assert!(ledger_file(&env, 0, "C1").is_file());
+    // 結果は台帳と同じディレクトリに保存され、出力 JSON と一致する。再実行の拒否 message にその
+    // project 相対パスが入る（stdout が失敗しても結果を取り戻せる。REQ-27）。
+    let report = ledger_file(&env, 0, "C1.report.json");
+    let rel = report
+        .strip_prefix(env.work.join("proj"))
+        .expect("under project");
+    assert_eq!(std::fs::read_to_string(&report).expect("report"), first);
     env.fails(
         &args(&["--candidate", &c1]),
-        "candidate has already been scored",
+        &format!(
+            "candidate has already been scored; result saved in {}",
+            rel.display()
+        ),
     );
     // 比較相手の差し替え（別 sha256）は、採点対象 P を記録する前に拒否される。
     let a2 = env.bound(

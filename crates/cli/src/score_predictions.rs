@@ -30,14 +30,19 @@
 //!    - `definition_sha256` が現在の定義の正準化ハッシュと一致（`evaluate` と同じ計算）
 //!    - `config_id`（`<candidate_id>:seed<N>`）の seed が `--seed` と一致（形式不正も拒否）
 //!    - `candidate_index` が `<N>` と一致し、`candidate_id`（kind）が NAME に対応（C1→c1・C3→c3・AR→autoregressive）
-//! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を新規作成で記録
+//! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を
+//!    記録し、採点結果を同じディレクトリの `<採点対象 NAME>.report.json` に保存する（いずれも一時名への
+//!    書き込み・fsync・上書きしない名前替えで原子的に作る。確定は呼び出し期限の内側ではなく [`emit`] が行う）
 //!
 //! # 1 回限りの担保（REQ-27）
 //!
 //! `--candidate` の NAME が台帳に既にあれば、同じ sha256 でも拒否する（採点対象としての適用は 1 回限り。
 //! 結果を見て予測ファイルを作り直して再採点できない）。`--compare`・`--reference` は同じ sha256 の
-//! 再読込だけ許可し、別の sha256 は拒否する（比較相手の差し替えを許さない）。台帳の書き込みは全検証が
-//! 通った後、出力の直前に行う（比較相手を先に、採点対象を最後に書く）。
+//! 再読込だけ許可し、別の sha256 は拒否する（比較相手の差し替えを許さない）。台帳の確定は全検証が
+//! 通り、期限内に採点が返り、出力の準備（直列化・ウォッチドッグ起動）が済んだ後に [`emit`] のメイン
+//! スレッドだけが行う（結果の保存 → 比較相手の台帳 → 採点対象の台帳の順）。採点対象の結果ファイルか
+//! 台帳のどちらかがあれば適用済みとして拒否し、その message に結果の project 相対パスを含める
+//! （stdout が失敗しても結果を取り戻せる）。
 //!
 //! # 適用回数の機械的な制限（事前登録 4〜5 節）
 //!
@@ -67,6 +72,11 @@
 //!
 //! # 既知の限界
 //!
+//! - 結果の保存と台帳の確定の間（および台帳エントリ間）でプロセスが終了すると、台帳は部分的になりうる
+//!   が、採点対象は結果ファイルの存在で適用済みと扱うため二重適用はできない（再採点はできず、結果は
+//!   `<NAME>.report.json` から読む）。電源断に対するディレクトリエントリの永続化までは保証しない
+//! - 出力は選択肢数 L の 2 乗に比例する（混同行列）。L は定義の検査で `MAX_OPTIONS`（1024。core の
+//!   `judgment`）以下に限られるため、1 候補あたり約 100 万セル、最大 4 候補で有界
 //! - 台帳は project-dir 単位で、同じ凍結 test でも再 `register` すると別台帳になる
 //!   （`final_test_ledger` と同じ既知の限界。オーナー了承の残余リスク）
 //! - RSS 上限はプロセス内で強制しない（7 工程と同じ）。入力は予測ファイル 1 つ 64 MiB
@@ -569,6 +579,11 @@ fn ledger_dir(eval_sha: &str, seed: u32) -> PathBuf {
         .join(format!("seed-{seed}"))
 }
 
+/// 採点対象の結果の保存先（台帳と同じディレクトリ。台帳確定の直前に原子的に作る。REQ-27）。
+fn report_rel(eval_sha: &str, seed: u32, name: &str) -> PathBuf {
+    ledger_dir(eval_sha, seed).join(format!("{name}.report.json"))
+}
+
 /// 台帳ファイルのプロジェクト内の相対パス。
 fn ledger_rel(eval_sha: &str, seed: u32, name: &str) -> PathBuf {
     ledger_dir(eval_sha, seed).join(format!("{name}.sha256"))
@@ -591,6 +606,19 @@ fn check_distinct_inputs(loaded: &[Loaded<'_>]) -> Result<(), ErrorReport> {
     Ok(())
 }
 
+/// 採点対象が適用済みのときの `invalid_input`。結果の保存先（project 相対パス。データ本文は含めない）が
+/// あれば message に添え、出力に失敗した場合も結果を取り戻せるようにする（REQ-27）。
+fn already_scored(project: &Project, eval_sha: &str, seed: u32, name: &str) -> ErrorReport {
+    let rel = report_rel(eval_sha, seed, name);
+    match project.exists(&rel) {
+        Ok(true) => invalid(&format!(
+            "candidate has already been scored; result saved in {}",
+            rel.display()
+        )),
+        _ => invalid("candidate has already been scored"),
+    }
+}
+
 /// 台帳を照合し、書くべきもの（名前・sha256）を返す。違反は書き込み前に `invalid_input`。
 ///
 /// 採点対象は、同名が台帳にある場合に加え、同じ seed の台帳に同じ sha256 が別の NAME で既にある場合も
@@ -606,6 +634,10 @@ fn check_ledger<'a>(
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
             None => {
                 if l.role == Role::Candidate {
+                    // 結果は保存済みで台帳だけ未確定（確定の途中で終了した）場合も適用済みとして扱う。
+                    if project.exists(report_rel(eval_sha, seed, &l.named.name))? {
+                        return Err(already_scored(project, eval_sha, seed, &l.named.name));
+                    }
                     for other in ALLOWED_NAMES.iter().filter(|n| **n != l.named.name) {
                         let recorded = project
                             .read_optional(ledger_rel(eval_sha, seed, other), MAX_LEDGER_BYTES)?;
@@ -619,7 +651,7 @@ fn check_ledger<'a>(
                 to_write.push(l);
             }
             Some(_) if l.role == Role::Candidate => {
-                return Err(invalid("candidate has already been scored"));
+                return Err(already_scored(project, eval_sha, seed, &l.named.name));
             }
             Some(recorded) => {
                 if recorded.trim_ascii() != l.sha256.as_bytes() {
@@ -659,42 +691,68 @@ fn lock_ledger(project: &Project, eval_sha: &str, seed: u32) -> Result<std::fs::
     }
 }
 
-/// 台帳へ書く（比較相手を先、採点対象を最後。親ディレクトリが無ければ作る）。
-fn write_ledger(
-    project: &Project,
-    eval_sha: &str,
+/// 採点が済み、台帳への確定を待っている状態（REQ-27・REQ-39）。
+///
+/// [`run`] が返し、確定は [`emit`] のメインスレッドが期限内の返却を確認した後に [`PendingScore::commit`]
+/// で行う。期限超過で切り離されたワーカーはこの型を作っても台帳を書けない（書くコードは `commit` だけで、
+/// 呼ぶのは emit 側）。ロック（`flock` の fd）を保持し続け、確定または drop で解放される。
+#[derive(Debug)]
+pub struct PendingScore {
+    project: Project,
+    _lock: std::fs::File,
+    eval_sha: String,
     seed: u32,
-    to_write: &[&Loaded<'_>],
-) -> Result<(), ErrorReport> {
-    let root = Path::new(LEDGER_DIR);
-    let by_eval = root.join(eval_sha);
-    let by_seed = ledger_dir(eval_sha, seed);
-    for d in [root, by_eval.as_path(), by_seed.as_path()] {
-        project.ensure_dir(d)?;
-    }
-    let ordered = to_write
-        .iter()
-        .filter(|l| l.role != Role::Candidate)
-        .chain(to_write.iter().filter(|l| l.role == Role::Candidate));
-    for l in ordered {
-        project.write_new(
-            ledger_rel(eval_sha, seed, &l.named.name),
-            format!("{}\n", l.sha256).as_bytes(),
-        )?;
-    }
-    Ok(())
+    candidate: String,
+    /// 書くべき台帳エントリ（NAME・sha256）。比較相手を先、採点対象を最後に並べる。
+    entries: Vec<(String, String)>,
+    report: ScoreReport,
 }
 
-/// 採点して構造化した結果を返す（出力・時間上限は持たない純粋な計算。台帳への書き込みは伴う）。
+impl PendingScore {
+    /// 結果の JSON 1 行（末尾の改行なし）。
+    ///
+    /// # Errors
+    /// 直列化の失敗は `runtime_error`（台帳は未確定のまま）。
+    pub fn report_line(&self) -> Result<String, ErrorReport> {
+        self.report
+            .to_json_line()
+            .map_err(|_| runtime("cannot serialize score report"))
+    }
+
+    /// 結果 `<NAME>.report.json` を原子的に保存してから、台帳エントリを原子的に確定する
+    /// （比較相手を先、採点対象を最後。ロックの中。途中で終了しても各ファイルは「無い」か「完全」）。
+    ///
+    /// 結果の保存後に台帳の確定が途切れても、次回は結果の存在で適用済みと拒否する
+    /// （[`check_ledger`]）。結果は出力に失敗しても保存先から読める。
+    ///
+    /// # Errors
+    /// 書き込み失敗は `runtime_error`、既存は `invalid_input`。
+    pub fn commit(self, report_line: &str) -> Result<(), ErrorReport> {
+        self.project.publish_new_file(
+            report_rel(&self.eval_sha, self.seed, &self.candidate),
+            format!("{report_line}\n").as_bytes(),
+        )?;
+        for (name, sha) in &self.entries {
+            self.project.publish_new_file(
+                ledger_rel(&self.eval_sha, self.seed, name),
+                format!("{sha}\n").as_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// 採点して、台帳確定待ちの結果を返す（出力・時間上限・台帳の書き込みは持たない。ロックの取得と台帳の
+/// 検査までを行い、書き込みは [`PendingScore::commit`] が行う）。
 ///
 /// 呼び出し全体の時間上限（[`MAX_SCORE_DURATION`]）と出力の期限は [`emit`] が持つ（`infer_batch` の
 /// `run_with_stall_guard` と同じ見張り。REQ-39）。長寿命プロセスから本関数を直接呼ぶ場合は、
-/// 呼び出し側が期限を持つこと。
+/// 呼び出し側が期限を持ち、期限内に返ったときだけ `commit` すること。
 ///
 /// # Errors
 /// 凍結ハッシュ不一致・評価データなし・予測の不備・台帳違反は `invalid_input`（64）、
 /// 上限超過は `limit_exceeded`（20）、評価器・I/O の失敗は `runtime_error`（70）。
-pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<ScoreReport, ErrorReport> {
+pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
     args.validate()?;
     let project = Project::open(cwd, &args.project_dir)?;
     let Some((freeze, eval_bytes)) = load_frozen_evaluation(&project)? else {
@@ -828,17 +886,22 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<ScoreReport, ErrorReport> {
         });
     }
 
-    // 台帳は全検証が通った後、出力の直前に書く（検証の失敗で適用権を使わない）。
+    // 台帳は全検証が通った後に照合する。書き込みは emit 側の `commit`（検証の失敗・期限超過で適用権を
+    // 使わない）。照合から確定までを seed 単位の排他ロックで保持する（同時実行による二重適用を防ぐ）。
     let eval_sha = freeze.sha256().to_hex();
-    // 確認から書き込みまでを seed 単位の排他ロックの中で行う（同時実行による二重適用を防ぐ）。
     check_distinct_inputs(&loaded)?;
-    let _lock = lock_ledger(&project, &eval_sha, args.seed)?;
+    let lock = lock_ledger(&project, &eval_sha, args.seed)?;
     let to_write = check_ledger(&project, &eval_sha, args.seed, &loaded)?;
-    write_ledger(&project, &eval_sha, args.seed, &to_write)?;
+    let entries = to_write
+        .iter()
+        .filter(|l| l.role != Role::Candidate)
+        .chain(to_write.iter().filter(|l| l.role == Role::Candidate))
+        .map(|l| (l.named.name.clone(), l.sha256.clone()))
+        .collect();
 
-    Ok(ScoreReport::new(
+    let report = ScoreReport::new(
         args.seed,
-        eval_sha,
+        eval_sha.clone(),
         n_total,
         required.get(),
         candidates,
@@ -848,16 +911,33 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<ScoreReport, ErrorReport> {
             comparisons: holm_comparisons,
         },
         references,
-    ))
+    );
+    Ok(PendingScore {
+        project,
+        _lock: lock,
+        eval_sha,
+        seed: args.seed,
+        candidate: args.candidate.name.clone(),
+        entries,
+        report,
+    })
 }
 
 /// 採点を [`MAX_SCORE_DURATION`] 以内に実行し、結果を 7 工程と同じ出口で書く（成功は 1 行 JSON を
 /// `write_stage_line`、失敗は `emit_error_report`）。バイナリ `fandhe-edge-score` の本体。
 ///
 /// 期限超過は `limit_exceeded`（20）。採点を切り離してプロセスを終了する（`infer_batch` の
-/// `run_with_stall_guard` と同じ。台帳の書き込みが途中で止まっても、ロックはプロセス終了で解放され、
-/// 比較相手を先・採点対象を最後に書くため、採点対象が未記録なら再実行できる）。
-/// 出力段階は `MAX_INFER_BATCH_OUTPUT_DURATION` のウォッチドッグで見張る（REQ-39）。
+/// `run_with_stall_guard` と同じ）。台帳を書くのは切り離されないメインスレッドだけなので、切り離された
+/// ワーカーが走り切っても台帳・結果ファイルは書かれず、期限超過の再実行は適用権を消費していない。
+///
+/// 順序（REQ-27・REQ-39）: (a) 直列化 → (b) 出力のウォッチドッグ起動 → (c) 結果を
+/// `<NAME>.report.json` へ原子的に保存 → (d) 台帳エントリを原子的に確定（比較相手が先、採点対象が最後）
+/// → (e) ロック解放 → (f) stdout へ出力。失敗しうる (a)(b) は台帳を消費する前に行う。(f) が失敗・停止
+/// しても結果は (c) に残り、再実行の「already scored」拒否の message にその project 相対パスが入る。
+///
+/// 残る限界: (c)〜(d) の間でプロセスが終了した場合、結果は保存済みで台帳が未確定になるが、次回は結果の
+/// 存在で適用済みと拒否する（再採点はできない。結果は保存先から読む）。ファイルは各々が一時名への
+/// 書き込み・fsync・`NOREPLACE` の名前替えで作られ、最終名は「無い」か「完全」のどちらかである。
 ///
 /// # Errors
 /// 出力先への書き込み失敗（呼び出し側は exit 70 に写す）。
@@ -876,14 +956,24 @@ pub(crate) fn emit_with<W: Write>(
     out: &mut W,
     duration: Duration,
     policy: StallPolicy,
-    work: impl FnOnce() -> Result<ScoreReport, ErrorReport> + Send + 'static,
+    work: impl FnOnce() -> Result<PendingScore, ErrorReport> + Send + 'static,
 ) -> io::Result<ExitCode> {
     let outcome =
         run_with_stall_guard(out, duration, MAX_INFER_BATCH_OUTPUT_DURATION, policy, work);
-    // 書き込みの停止も期限でプロセス終了へ倒す（7 工程の `infer` と同じ見張り）。
+    // (a) 直列化。台帳を消費する前に失敗を確定させる。
+    let prepared = outcome.and_then(|pending| {
+        let line = pending.report_line()?;
+        Ok((pending, line))
+    });
+    // (b) 書き込みの停止も期限でプロセス終了へ倒す（7 工程の `infer` と同じ見張り）。
+    // 起動に失敗しても、ここでは台帳をまだ書いていない（`pending` は drop されロックが解ける）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), MAX_INFER_BATCH_OUTPUT_DURATION)?;
-    match outcome {
-        Ok(report) => write_stage_line(out, report.to_json_line()),
+    match prepared {
+        Ok((pending, line)) => match pending.commit(&line) {
+            // (c)(d)(e): commit が結果・台帳を確定し、pending（ロック）を消費して解放する。
+            Ok(()) => write_stage_line(out, Ok::<_, std::convert::Infallible>(line)),
+            Err(error) => emit_error_report(out, &error),
+        },
         Err(error) => emit_error_report(out, &error),
     }
 }
@@ -891,6 +981,139 @@ pub(crate) fn emit_with<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 単体テスト用の作業ディレクトリ（cwd）と、その下の project を作る。
+    fn scratch(case: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fe-score-unit-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proj")).expect("mkdir");
+        root.canonicalize().expect("canonicalize")
+    }
+
+    const EVAL_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// ロックを取り済みの確定待ち（比較相手 C1 → 採点対象 P の順）。
+    fn pending(root: &Path) -> Result<PendingScore, ErrorReport> {
+        let project = Project::open(root, Path::new("proj"))?;
+        let lock = lock_ledger(&project, EVAL_SHA, 0)?;
+        let report = ScoreReport::new(
+            0,
+            EVAL_SHA.to_string(),
+            1,
+            1,
+            Vec::new(),
+            ScoreHolm {
+                candidate: "P".into(),
+                m: FAMILY_SIZE,
+                comparisons: Vec::new(),
+            },
+            Vec::new(),
+        );
+        Ok(PendingScore {
+            project,
+            _lock: lock,
+            eval_sha: EVAL_SHA.to_string(),
+            seed: 0,
+            candidate: "P".into(),
+            entries: vec![
+                ("C1".into(), "aa".repeat(32)),
+                ("P".into(), "bb".repeat(32)),
+            ],
+            report,
+        })
+    }
+
+    fn ledger_path(root: &Path, file: &str) -> PathBuf {
+        root.join("proj").join(ledger_dir(EVAL_SHA, 0)).join(file)
+    }
+
+    /// REQ-27・REQ-39: 期限を超えて切り離されたワーカーが走り切っても台帳・結果は書かれず、
+    /// 期限超過の再実行は適用権を消費していないので成功する。
+    #[test]
+    fn req27_req39_timed_out_worker_never_writes_ledger() {
+        let root = scratch("timeout");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_with(
+            &mut out,
+            Duration::from_millis(50),
+            StallPolicy::Leak,
+            move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let pending = pending(&worker_root);
+                let _ = done_tx.send(());
+                pending
+            },
+        )
+        .expect("write");
+        assert_eq!(code, ExitCode::LimitExceeded);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker finished");
+        for f in ["C1.sha256", "P.sha256", "P.report.json"] {
+            assert!(!ledger_path(&root, f).exists(), "{f}");
+        }
+        let worker_root = root.clone();
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_with(
+            &mut out,
+            Duration::from_secs(30),
+            StallPolicy::Leak,
+            move || pending(&worker_root),
+        )
+        .expect("write");
+        assert_eq!(code, ExitCode::Ok);
+        let line = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+            line
+        );
+        assert_eq!(
+            std::fs::read_to_string(ledger_path(&root, "C1.sha256")).expect("c1"),
+            format!("{}\n", "aa".repeat(32))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REQ-27・REQ-39: 孤立した一時ファイル（途中終了の残骸）があっても確定でき、残骸は台帳として
+    /// 読まれない。確定後に同じ名前を確定しようとすると上書きせず拒否する。
+    #[test]
+    fn req27_leftover_tmp_files_do_not_block_commit() {
+        let root = scratch("tmp");
+        let p = pending(&root).expect("pending");
+        let pid = std::process::id();
+        std::fs::write(
+            ledger_path(&root, &format!(".tmp-P.sha256-{pid}")),
+            b"partial",
+        )
+        .expect("tmp");
+        std::fs::write(
+            ledger_path(&root, &format!(".tmp-P.report.json-{pid}")),
+            b"{",
+        )
+        .expect("tmp");
+        p.commit("{\"ok\":true}").expect("commit");
+        assert_eq!(
+            std::fs::read_to_string(ledger_path(&root, "P.sha256")).expect("p"),
+            format!("{}\n", "bb".repeat(32))
+        );
+        assert_eq!(
+            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+            "{\"ok\":true}\n"
+        );
+        // 一時名は片付けられ、2 回目の確定（二重適用）は上書きせず拒否される。
+        assert!(!ledger_path(&root, &format!(".tmp-P.sha256-{pid}")).exists());
+        let again = pending(&root).expect("pending");
+        let err = again.commit("{}").expect_err("must not overwrite");
+        assert_eq!(err.code, ExitCode::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+            "{\"ok\":true}\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// REQ-39: 採点が期限内に返らなければ `limit_exceeded`（20）の `ErrorReport` を 1 行書いて返す
     /// （実時間 600 秒を待たず、回収しない方式で検証する）。
