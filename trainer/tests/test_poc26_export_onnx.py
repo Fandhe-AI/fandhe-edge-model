@@ -190,3 +190,140 @@ def test_verify_rejects_tampered_onnx(
     raw[0] ^= 1
     data.write_bytes(bytes(raw))
     assert main(["verify-onnx", *flags, "--onnx-dir", str(onnx_dir)]) == 64
+
+
+# --- 資源予算・照合済みバイトの読み込み・summary 検証（REQ-41・REQ-39） -----------------------
+
+
+def _summary_for(mp: Path, dp: Path) -> dict:
+    import hashlib
+
+    return {
+        "model_onnx_sha256": hashlib.sha256(mp.read_bytes()).hexdigest(),
+        "model_onnx_data_sha256": hashlib.sha256(dp.read_bytes()).hexdigest(),
+    }
+
+
+def test_memory_estimate_over_budget_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-39: 同時保持量の見積もりが RSS 上限を超えるなら確保前に 20 で止める。"""
+    from tools.poc26.export_onnx import check_memory
+
+    from fandhe_edge_trainer import limits
+    from fandhe_edge_trainer.errors import WorkerError
+    from fandhe_edge_trainer.exitcode import ExitCode
+
+    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1000)
+    check_memory(1000, "x")  # 境界は通る
+    with pytest.raises(WorkerError) as ei:
+        check_memory(1001, "x")
+    assert ei.value.exit_code == ExitCode.LIMIT_EXCEEDED
+
+
+def test_cli_export_and_verify_reject_when_estimate_exceeds_budget(
+    adapter_env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 予算を極小にすると export は重みコピー前に、verify は照合の前に 20 で拒否する。"""
+    from fandhe_edge_trainer import limits
+
+    a = adapter_env
+    flags = _flags(a, a["adapter"])
+    ok = a["tmp"] / "onnx_budget"
+    assert main(["export-onnx", *flags, "--out-dir", str(ok)]) == 0
+    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1)
+    assert main(["export-onnx", *flags, "--out-dir", str(a["tmp"] / "onnx_over")]) == 20
+    assert not (a["tmp"] / "onnx_over").exists()
+    assert main(["verify-onnx", *flags, "--onnx-dir", str(ok)]) == 20
+
+
+def test_graph_checks_budget_per_weight(tmp_path: Path) -> None:
+    """REQ-39: 重み 1 本ごとに Budget.check が呼ばれ、超過の例外はそのまま伝わる。"""
+
+    class Over:
+        def check(self) -> None:
+            raise RuntimeError("over")
+
+    with (tmp_path / "d").open("wb") as f, pytest.raises(RuntimeError, match="over"):
+        _Graph(f, "d", Over()).weight("w", np.zeros((64, 64), np.float32))  # type: ignore[arg-type]
+
+
+def test_verified_load_ignores_swap_after_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-41・REQ-39: 開いた後にパスのファイルを差し替えても、使うのは照合済みバイトだけ。"""
+    from tools.poc26 import export_onnx as ex
+    from tools.poc26.common import Budget
+
+    mp, dp = _export(_lora_model(), tmp_path / "o")
+    summary = _summary_for(mp, dp)
+    want = ReferenceEvaluator(onnx.load(str(mp)))  # 差し替え前の正しい結果
+    ids = np.arange(5, dtype=np.int64)[None]
+    expected = want.run(None, {"input_ids": ids})[0]
+
+    def swap(path: Path) -> None:
+        tmp = path.with_name(path.name + ".evil")
+        tmp.write_bytes(b"\xff" * path.stat().st_size)
+        tmp.replace(path)  # 別 inode で置換（既に開いた fd は元の inode を指す）
+
+    real_open, real_read = ex.open_regular, ex.read_input
+
+    def open_then_swap(path, limit, what):
+        r = real_open(path, limit, what)
+        swap(Path(path))
+        return r
+
+    def read_then_swap(path, limit, what):
+        r = real_read(path, limit, what)
+        swap(Path(path))
+        return r
+
+    monkeypatch.setattr(ex, "open_regular", open_then_swap)
+    monkeypatch.setattr(ex, "read_input", read_then_swap)
+    monkeypatch.setattr(onnx, "load", lambda *_a, **_k: pytest.fail("path re-read"))
+    proto = ex.load_verified_onnx(mp.parent, summary, Budget())
+    assert not any(t.data_location == onnx.TensorProto.EXTERNAL for t in proto.graph.initializer)
+    got = ReferenceEvaluator(proto).run(None, {"input_ids": ids})[0]
+    np.testing.assert_array_equal(got, expected)
+    assert dp.read_bytes()[:1] == b"\xff"  # 差し替えは実際に起きている
+
+
+@pytest.mark.parametrize("target", ["model.onnx", "model.onnx.data"])
+def test_verified_load_rejects_mismatch(tmp_path: Path, target: str) -> None:
+    """REQ-41・REQ-39: 照合値と違う内容は invalid_input(64) で、解析に進まない。"""
+    from tools.poc26.common import Budget
+    from tools.poc26.export_onnx import load_verified_onnx
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    mp, dp = _export(_lora_model(), tmp_path / "o")
+    summary = _summary_for(mp, dp)
+    p = mp.parent / target
+    p.write_bytes(p.read_bytes() + b"\0")
+    with pytest.raises(WorkerError) as ei:
+        load_verified_onnx(mp.parent, summary, Budget())
+    assert ei.value.exit_code == 64
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        [],
+        None,
+        "x",
+        {},
+        {"model_onnx_sha256": "0" * 64},  # data 欠落
+        {"model_onnx_sha256": "0" * 64, "model_onnx_data_sha256": None},
+        {"model_onnx_sha256": "0" * 64, "model_onnx_data_sha256": 5},
+        {"model_onnx_sha256": "0" * 63, "model_onnx_data_sha256": "0" * 64},
+        {"model_onnx_sha256": "0" * 64, "model_onnx_data_sha256": "G" * 64},
+        {"model_onnx_sha256": "A" * 64, "model_onnx_data_sha256": "0" * 64},
+    ],
+)
+def test_summary_shape_is_validated(summary: object) -> None:
+    """REQ-39: export_summary.json のルート型・ハッシュ欄の型と形式が不正なら 64。"""
+    from tools.poc26.export_onnx import _summary_hashes
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    with pytest.raises(WorkerError) as ei:
+        _summary_hashes(summary)
+    assert ei.value.exit_code == 64

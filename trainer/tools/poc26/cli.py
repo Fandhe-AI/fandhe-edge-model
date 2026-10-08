@@ -139,6 +139,8 @@ def _build_parser() -> argparse.ArgumentParser:
             e.add_argument("--out-dir", type=Path, required=True)
         else:
             e.add_argument("--onnx-dir", type=Path, required=True)
+            # ReferenceEvaluator の 1 件あたりの壁時計上限（到達は 20）
+            e.add_argument("--max-score-seconds", type=int, default=DEFAULT_MAX_SCORE_SECONDS)
 
     pr = sub.add_parser("probe", allow_abbrev=False)
     common(pr)

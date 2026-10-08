@@ -27,6 +27,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 import onnx
+from mlx.utils import tree_flatten
 from onnx import TensorProto, helper, numpy_helper
 from tools.poc26.assets import (
     Pins,
@@ -34,11 +35,13 @@ from tools.poc26.assets import (
     load_base_model,
     pins_from_args,
 )
-from tools.poc26.common import invalid, loads, read_input, sha256, too_large
+from tools.poc26.common import SHA_RE, Budget, invalid, loads, read_input, sha256, too_large
 from tools.poc26.io_records import MAX_ADAPTER_BYTES, check_out_dir, json_text, load_adapter
 from tools.poc26.predict import attach_adapter
 from tools.poc26.qwen2_model import LoRALinear, Qwen2Config, Qwen2Model
 from tools.poc26.safe_io import LimitExceededError, open_regular
+
+from fandhe_edge_trainer import limits
 
 OPSET = 13
 IR_VERSION = (
@@ -127,7 +130,8 @@ def fused_weights(model: Qwen2Model) -> dict[str, np.ndarray]:
 class _Graph:
     """ノードと initializer を溜めるビルダー。大きな重みは external data へ逐次書く。"""
 
-    def __init__(self, data_file: Any, data_name: str) -> None:
+    def __init__(self, data_file: Any, data_name: str, budget: Budget | None = None) -> None:
+        self._budget = budget  # 重み 1 本ごとに RSS・壁時計を確認する（REQ-39）
         self.nodes: list[onnx.NodeProto] = []
         self.inits: list[onnx.TensorProto] = []
         self._f, self._name, self._offset, self._n = data_file, data_name, 0, 0
@@ -149,6 +153,8 @@ class _Graph:
 
     def weight(self, name: str, arr: np.ndarray) -> str:
         """重み。`EXTERNAL_THRESHOLD` 以上なら external data へ書き、位置と長さだけを持つ。"""
+        if self._budget is not None:
+            self._budget.check()
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         if arr.nbytes < EXTERNAL_THRESHOLD:
             self.inits.append(numpy_helper.from_array(arr, name))
@@ -335,6 +341,15 @@ def summarize(model_path: Path, data_path: Path) -> dict[str, Any]:
 # --- サブコマンド ------------------------------------------------------------------------
 
 
+def check_memory(estimate: int, what: str) -> None:
+    """同時保持量の見積もりが RSS 上限（`limits.MAX_TRAIN_RSS_BYTES`）超なら 20 で止める。
+
+    確保の前に呼ぶ（`Budget.check` はピーク実測で確保後にしか検知できないため。REQ-39）。
+    """
+    if estimate > limits.MAX_TRAIN_RSS_BYTES:
+        raise too_large(f"{what} needs about {estimate} bytes, over the RSS budget")
+
+
 def _load_fused_source(a: argparse.Namespace) -> tuple[Qwen2Model, dict[str, Any], Pins]:
     """base（float32）と adapter を読み、LoRA 付きのモデル（未統合）と adapter 設定を返す。"""
     mx.set_default_device(mx.cpu)
@@ -386,19 +401,27 @@ def cmd_export_onnx(a: argparse.Namespace) -> int:
     ディレクトリ経由の rename）は 2 GB 超の外部データを二重に置くため使わない。
     """
     t0 = time.monotonic()
+    budget = Budget()
     check_out_dir(a.out_dir)
     model, cfg, _ = _load_fused_source(a)
+    budget.check()
+    # MLX モデル保持中に全重みの numpy コピーを作る。最大の 1 本は転置で更にコピーされる
+    sizes = [int(v.nbytes) for _, v in tree_flatten(model.parameters())]
+    check_memory(2 * sum(sizes) + max(sizes, default=0), "export-onnx weights")
     weights = fused_weights(model)
+    budget.check()
     a.out_dir.mkdir(mode=0o700)
     try:
         model_path, data_path = a.out_dir / "model.onnx", a.out_dir / "model.onnx.data"
         # O_EXCL 相当の新規作成（上書きしない）
         fd = os.open(data_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
-            proto = build_onnx(model.config, weights, _Graph(f, data_path.name))
+            proto = build_onnx(model.config, weights, _Graph(f, data_path.name, budget))
         onnx.save_model(proto, str(model_path))
         del weights, proto
+        budget.check()
         onnx.checker.check_model(str(model_path))  # パス渡し（2 GB 超でも検査できる）
+        budget.check()
         summary = {
             "evidence": a.evidence,
             "command": a.command,
@@ -425,29 +448,130 @@ def cmd_export_onnx(a: argparse.Namespace) -> int:
     return 0
 
 
+_SUMMARY_HASH_KEYS = ("model_onnx_sha256", "model_onnx_data_sha256")
+
+
+def _summary_hashes(summary: Any) -> dict[str, str]:
+    """`export_summary.json` のルート型と 2 つのハッシュ欄（64 桁小文字 hex）を検証（REQ-39）。"""
+    if not isinstance(summary, dict):
+        raise invalid("export_summary.json must be a JSON object")
+    out: dict[str, str] = {}
+    for key in _SUMMARY_HASH_KEYS:
+        v = summary.get(key)
+        if not isinstance(v, str) or not SHA_RE.fullmatch(v):
+            raise invalid(f"export_summary.json: {key} must be a 64-char lowercase hex string")
+        out[key] = v
+    return out
+
+
+def _external_tensors(proto: onnx.ModelProto, data_name: str) -> list[tuple[Any, int, int]]:
+    """external data を持つ initializer を (tensor, offset, length) で offset 順に返す。"""
+    found = []
+    for t in proto.graph.initializer:
+        if t.data_location != TensorProto.EXTERNAL:
+            continue
+        kv = {e.key: e.value for e in t.external_data}
+        try:
+            offset, length = int(kv["offset"]), int(kv["length"])
+        except (KeyError, ValueError):
+            raise invalid("initializer has malformed external data") from None
+        expected = int(np.prod(t.dims, dtype=np.int64)) * 4
+        if (
+            kv.get("location") != data_name
+            or t.data_type != TensorProto.FLOAT
+            or offset < 0
+            or length != expected
+        ):
+            raise invalid("initializer has unexpected external data")
+        found.append((t, offset, length))
+    found.sort(key=lambda x: x[1])
+    return found
+
+
+def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.ModelProto:
+    """sha256 を照合した**同じバイト列**だけから、重みを inline に持つ ModelProto を作る。
+
+    REQ-41・REQ-39: ファイルは fd で開いて読み（通常ファイル・symlink・サイズ検証は
+    `open_regular` / `read_input`）、パスを開き直さない。照合後に差し替えられても、
+    解析に使うのは照合したバイト列だけ。model.onnx.data は 1 回の逐次読みで sha256 を計算しながら
+    各 tensor の raw_data へ詰める（全体を別に持たず、同時保持は proto 分＋1 本分）。
+    """
+    hashes = _summary_hashes(summary)
+    raw = read_input(onnx_dir / "model.onnx", MAX_ONNX_BYTES, "model.onnx")
+    if sha256(raw) != hashes["model_onnx_sha256"]:
+        raise invalid("model.onnx does not match the sha256 recorded at export")
+    try:
+        proto = onnx.load_model_from_string(raw)
+    except Exception:  # protobuf の DecodeError 等。入力値は載せない
+        raise invalid("model.onnx is not a valid ONNX model") from None
+    del raw
+    tensors = _external_tensors(proto, "model.onnx.data")
+    try:
+        fd, st = open_regular(onnx_dir / "model.onnx.data", MAX_ONNX_DATA_BYTES, "model.onnx.data")
+    except LimitExceededError as exc:
+        raise too_large(str(exc)) from None
+    except ValueError as exc:
+        raise invalid(str(exc)) from None
+    with os.fdopen(fd, "rb") as f:
+        # 重み本体（raw_data）＋ evaluator 内の numpy 化の分を見込む
+        check_memory(2 * st.st_size + (1 << 30), "verify-onnx weights")
+        h, pos = hashlib.sha256(), 0
+
+        def take(n: int, sink: bytearray | None) -> None:
+            nonlocal pos
+            got = 0
+            while got < n:
+                chunk = f.read(min(1 << 20, n - got))
+                if not chunk:
+                    raise invalid("model.onnx.data is truncated")
+                h.update(chunk)
+                if sink is not None:
+                    sink[got : got + len(chunk)] = chunk
+                got += len(chunk)
+            pos += n
+
+        for t, offset, length in tensors:
+            if offset < pos:
+                raise invalid("initializer external data overlaps")
+            take(offset - pos, None)
+            buf = bytearray(length)
+            take(length, buf)
+            t.raw_data = bytes(buf)
+            del buf, t.external_data[:]
+            t.data_location = TensorProto.DEFAULT
+            budget.check()
+        while chunk := f.read(1 << 20):  # 残り（末尾のパディング等）も照合対象
+            h.update(chunk)
+            pos += len(chunk)
+            if pos > MAX_ONNX_DATA_BYTES:
+                raise too_large("model.onnx.data too large")
+    if h.hexdigest() != hashes["model_onnx_data_sha256"]:
+        raise invalid("model.onnx.data does not match the sha256 recorded at export")
+    return proto
+
+
 def cmd_verify_onnx(a: argparse.Namespace) -> int:
     """`verify-onnx`: 書き出した ONNX（ReferenceEvaluator）と LoRA 付き MLX の logits を比べる。
 
     **合否は出さない**（事前登録に許容差が無いため。一致の判定は人が行い、数値だけを出す）。
-    読む前に 2 ファイルのサイズ上限と、`export_summary.json` に記録した sha256 を確認し、
-    不一致は拒否する。ピークメモリ（float32 の概算）: モデル読み込み時 約 4 GB（MLX の重み＋
-    構築）、MLX の logits を取って解放した後の ONNX 段階は 約 2 GB（重み）＋約 0.6 GB（tie の
-    転置）＋ logits。両段階を同時には持たない。
+    `export_summary.json` の検証と、2 ファイルの fd 読みでの sha256 照合・解析は
+    `load_verified_onnx`（不一致は 64。パスの開き直しをしない）。資源は `Budget`（RSS・24 時間の
+    天井）で各境界を確認し、ReferenceEvaluator の実行は `--max-score-seconds` の壁時計上限を
+    1 件ごとの前後で確認する（実行中の割り込みはできない）。ピークメモリ（float32 の概算）:
+    モデル読み込み時 約 4 GB、MLX の logits を取って解放した後の ONNX 段階は 約 2 GB（raw_data）＋
+    evaluator 内の numpy 約 2 GB。両段階を同時には持たない。
     """
     from onnx.reference import ReferenceEvaluator
 
     t0 = time.monotonic()
+    budget = Budget()
     summary = loads(
         read_input(a.onnx_dir / "export_summary.json", MAX_ONNX_BYTES, "export_summary.json"),
         "export_summary.json",
     )
-    for name, key, limit in (
-        ("model.onnx", "model_onnx_sha256", MAX_ONNX_BYTES),
-        ("model.onnx.data", "model_onnx_data_sha256", MAX_ONNX_DATA_BYTES),
-    ):
-        if _sha256_file(a.onnx_dir / name, limit, name) != summary.get(key):
-            raise invalid(f"{name} does not match the sha256 recorded at export")
+    _summary_hashes(summary)  # 重い処理の前に形式だけ先に確認する
     model, cfg, pins = _load_fused_source(a)
+    budget.check()
     assets = load_assets(a.model_dir, pins)
     ids_list = [
         assets.tok.build_chat_ids(VERIFY_SYSTEM, user, add_generation_prompt=True)
@@ -456,12 +580,18 @@ def cmd_verify_onnx(a: argparse.Namespace) -> int:
     wants = [np.array(model(mx.array([ids])), dtype=np.float32) for ids in ids_list]
     del model  # MLX の重みを解放してから ONNX を読む（ピークを重ねない）
     mx.clear_cache()
-    proto = onnx.load(str(a.onnx_dir / "model.onnx"))  # external data を読み込む
+    budget.check()
+    proto = load_verified_onnx(a.onnx_dir, summary, budget)
     ref = ReferenceEvaluator(proto)
     del proto
+    budget.check()
+    run_budget = Budget(wall_limit=a.max_score_seconds)
     results = []
     for ids, want in zip(ids_list, wants, strict=True):
+        run_budget.check()
         got = ref.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0]
+        run_budget.check()
+        budget.check()
         diff = np.abs(want - got)
         am_w, am_g = want.argmax(-1), got.argmax(-1)
         results.append(
