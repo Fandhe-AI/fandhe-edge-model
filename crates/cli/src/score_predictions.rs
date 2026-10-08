@@ -14,7 +14,8 @@
 //!
 //! 1. 凍結 test のハッシュ照合（[`load_frozen_evaluation`]。不一致・凍結記録の欠落は `invalid_input`）。
 //!    評価データが無ければ `invalid_input`（`skipped` にはしない。採点対象が無いため）
-//! 2. 各予測を `prepare_evaluation_input` へ通す（id 重複・欠落・不正 JSON は停止。不正な `scores` は
+//! 2. 評価対象は `evaluate` と共有のデコード（`evaluation_records`。矛盾入力も除外しない）から作り、各予測を
+//!    `prepare_evaluation_input` へ通す（id 重複・欠落・不正 JSON は停止。不正な `scores` は
 //!    不正解）。全予測で評価対象の id 列が一致することを確認
 //! 3. majority は train 分割のラベルだけから作る（[`majority_from_train`]。`evaluate` と同じ関数）
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
@@ -39,7 +40,7 @@
 //! `--candidate` の NAME が台帳に既にあれば、同じ sha256 でも拒否する（採点対象としての適用は 1 回限り。
 //! 結果を見て予測ファイルを作り直して再採点できない）。`--compare`・`--reference` は同じ sha256 の
 //! 再読込だけ許可し、別の sha256 は拒否する（比較相手の差し替えを許さない）。台帳の確定は全検証が
-//! 通り、期限内に採点が返り、出力の準備（直列化・ウォッチドッグ起動）が済んだ後に [`emit`] のメイン
+//! 通り、期限内に採点が返り、出力のウォッチドッグ起動が済んだ後（直列化は台帳確定の直前）に [`emit`] のメイン
 //! スレッドだけが行う（比較相手の台帳 → 採点対象の台帳 → 結果 `<NAME>.report.json` の順）。適用済みの判定は台帳の
 //! `.sha256` だけが正で、結果ファイルは検査に使わない。拒否 message には結果があればその project
 //! 相対パスを含め、無ければ `result was not saved` と明示する（stdout が失敗しても結果を取り戻せる）。
@@ -48,7 +49,9 @@
 //!
 //! NAME は許可リスト {P, C1, C3, AR}、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の sha256 単位に分ける。
 //! 採点対象としての適用は 4 候補 × 3 seed = 最大 12 回に機械的に制限される。予測ファイルを作り直して
-//! 同名・別 sha256 で出すと拒否し、別名は許可リストで、同じ sha256 の別名での再採点は台帳の照合で塞ぐ。
+//! 同名・別 sha256 で出すと拒否し、別名は許可リストで塞ぐ。
+//! 別 NAME の予測が同じバイト列でも拒否しない（異なる候補が同じ予測を返す正当な比較がある。同じバイト列を
+//! 別 NAME で再採点しても新しい情報は得られず、C1・C3・AR は評価記録の来歴照合で束縛される）。
 //! `--reference` は最大 1 個、`--compare` は最大 2 個。役割も固定: `--compare` は C1・C3 のみ、
 //! `--reference` は AR のみで、どちらも `--candidate P` のときだけ許す（`--candidate` は 4 つのいずれでもよい）。
 //! 台帳の確認から書き込みまでは `<evaluation_sha256>/seed-<n>/.lock` の排他ロック（`flock`。プロセス終了で
@@ -64,7 +67,8 @@
 //!
 //! # 入出力
 //!
-//! 引数は [`parse_args`]、結果は [`run`] が構造化型（core の `ScoreReport`）で返す純粋な関数。
+//! 引数は [`parse_args`]、結果は [`score`] が構造化型（core の `ScoreReport`）で返す。確定前の結果は
+//! crate 内部の `PendingScore` に閉じ、`commit`（台帳確定）を経ないと読めない。
 //! 出力は [`emit`] が 7 工程と同じ出口（`write_stage_line`・`emit_error_report`）で JSON 1 行にし、
 //! 呼び出し全体に時間上限（[`MAX_SCORE_DURATION`]）を持つ。エラーは既存 CLI と同じ
 //! [`ErrorReport`]（`code`・`message`。終了コード 7 種）。予測・評価データの本文は出さない。
@@ -99,6 +103,7 @@ use fandhe_edge_core::stage_report::{
     ScoreReference, ScoreReport, ScoreRole, ScoreVsMajority,
 };
 use fandhe_edge_data::eval_input::{PredictionOutcome, prepare_evaluation_input};
+use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_eval::holm::{FamilySize, compare_candidates_with_holm};
 use fandhe_edge_eval::metrics::{
     ConfusionColumn, EvalRecord, Outcome, SingleSelectMetrics, evaluate_single_select,
@@ -120,6 +125,7 @@ use crate::project::{
     Project, fs_report, invalid, runtime,
 };
 use crate::stages::baseline::majority_from_train;
+use crate::stages::evaluate::evaluation_records;
 use crate::stages::inspect::load_frozen_evaluation;
 use crate::stages::train::verified_split;
 
@@ -429,6 +435,36 @@ fn verify_bound_to_record(
     Ok(())
 }
 
+/// 評価対象のレコードから、`prepare_evaluation_input` へ渡す gold の JSONL（`{"id","label"}`）を作る。
+///
+/// `input` を載せないため、評価器側の正規化 input による重複・矛盾グループの除外が働かず、
+/// `evaluate` と同じ全レコードが評価対象になる（REQ-27・#445）。
+fn gold_jsonl(records: &[ValidRecord]) -> String {
+    let mut out = String::new();
+    for r in records {
+        out.push_str("{\"id\":");
+        push_json_string(&mut out, &r.id);
+        out.push_str(",\"label\":");
+        push_json_string(&mut out, &r.label_id);
+        out.push_str("}\n");
+    }
+    out
+}
+
+/// JSON の文字列リテラルとして `value` を追記する（cli は `serde_json` に依存しない）。
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 /// 予測ファイルを閉じ込めつきで上限付きに読み、評価入力として分類する。
 fn load_prediction<'a>(
     cwd: &Path,
@@ -590,23 +626,6 @@ fn ledger_rel(eval_sha: &str, seed: u32, name: &str) -> PathBuf {
     ledger_dir(eval_sha, seed).join(format!("{name}.sha256"))
 }
 
-/// 今回の入力同士で同じ sha256 が別 NAME に使われていないこと（未記録の相手と同じ予測を採点対象に
-/// して別名での再採点を迂回させない）。入力だけで決まるため、台帳ディレクトリを作る前に呼ぶ。
-fn check_distinct_inputs(loaded: &[Loaded<'_>]) -> Result<(), ErrorReport> {
-    for (i, a) in loaded.iter().enumerate() {
-        if loaded
-            .iter()
-            .skip(i + 1)
-            .any(|b| b.sha256 == a.sha256 && b.named.name != a.named.name)
-        {
-            return Err(invalid(
-                "the same prediction file is used under more than one name",
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// 採点対象が適用済み（台帳に NAME がある）のときの `invalid_input`。判定は台帳の `.sha256` だけが正で、
 /// 結果ファイルは検査に使わない。結果があればその project 相対パス（データ本文は含めない）を message に
 /// 添え、無ければ保存されていないことを明示する（REQ-27）。
@@ -623,8 +642,8 @@ fn already_scored(project: &Project, eval_sha: &str, seed: u32, name: &str) -> E
 
 /// 台帳を照合し、書くべきもの（名前・sha256）を返す。違反は書き込み前に `invalid_input`。
 ///
-/// 採点対象は、同名が台帳にある場合に加え、同じ seed の台帳に同じ sha256 が別の NAME で既にある場合も
-/// 拒否する（別名での再採点を塞ぐ）。
+/// 採点対象は同名が台帳にあれば拒否する。別 NAME の予測が同じバイト列でも拒否しない（異なる候補が
+/// 同じ予測を返す正当な比較がある。1 回限りは NAME × seed の台帳と、C1・C3・AR の来歴照合で担保する）。
 fn check_ledger<'a>(
     project: &Project,
     eval_sha: &str,
@@ -635,17 +654,6 @@ fn check_ledger<'a>(
     for l in loaded {
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
             None => {
-                if l.role == Role::Candidate {
-                    for other in ALLOWED_NAMES.iter().filter(|n| **n != l.named.name) {
-                        let recorded = project
-                            .read_optional(ledger_rel(eval_sha, seed, other), MAX_LEDGER_BYTES)?;
-                        if recorded.is_some_and(|r| r.trim_ascii() == l.sha256.as_bytes()) {
-                            return Err(invalid(
-                                "prediction file has already been scored under another name",
-                            ));
-                        }
-                    }
-                }
                 to_write.push(l);
             }
             Some(_) if l.role == Role::Candidate => {
@@ -695,7 +703,7 @@ fn lock_ledger(project: &Project, eval_sha: &str, seed: u32) -> Result<std::fs::
 /// で行う。期限超過で切り離されたワーカーはこの型を作っても台帳を書けない（書くコードは `commit` だけで、
 /// 呼ぶのは emit 側）。ロック（`flock` の fd）を保持し続け、確定または drop で解放される。
 #[derive(Debug)]
-pub struct PendingScore {
+pub(crate) struct PendingScore {
     project: Project,
     _lock: std::fs::File,
     eval_sha: String,
@@ -707,16 +715,6 @@ pub struct PendingScore {
 }
 
 impl PendingScore {
-    /// 結果の JSON 1 行（末尾の改行なし）。
-    ///
-    /// # Errors
-    /// 直列化の失敗は `runtime_error`（台帳は未確定のまま）。
-    pub fn report_line(&self) -> Result<String, ErrorReport> {
-        self.report
-            .to_json_line()
-            .map_err(|_| runtime("cannot serialize score report"))
-    }
-
     /// 台帳エントリを原子的に確定し（比較相手が先、採点対象が最後）、最後に結果
     /// `<NAME>.report.json` を原子的に置く。ロックの中。先に台帳ディレクトリの `.tmp-*` 残骸を消す。
     /// 途中で終了しても各ファイルは「無い」か「完全」で、適用済みの判定は台帳だけが正のため、採点対象の
@@ -729,7 +727,12 @@ impl PendingScore {
     /// # Errors
     /// 書き込み失敗は `runtime_error`、既存は `invalid_input`。採点対象の台帳確定後の失敗は、確定済みで
     /// 結果が保存されていないことを message に含める。
-    pub fn commit(self, report_line: &str) -> Result<(), ErrorReport> {
+    pub(crate) fn commit(self) -> Result<(ScoreReport, String), ErrorReport> {
+        // 直列化は台帳を消費する前に済ませる（失敗しても適用権を使わない）。
+        let report_line = self
+            .report
+            .to_json_line()
+            .map_err(|_| runtime("cannot serialize score report"))?;
         self.project
             .remove_tmp_files(ledger_dir(&self.eval_sha, self.seed))?;
         for (name, sha) in &self.entries {
@@ -746,21 +749,33 @@ impl PendingScore {
                     e.code,
                     "candidate ledger committed but the result was not saved",
                 )
-            })
+            })?;
+        Ok((self.report, report_line))
     }
+}
+
+/// 採点して台帳を確定し、結果を返す（`run` ＋ `commit`）。公開 API はこれだけで、確定前の結果には
+/// 触れられない（台帳を消費せずに結果だけを取得する経路を作らない。REQ-27）。
+///
+/// 時間上限は持たない。呼び出し側が期限を持つこと（バイナリは [`emit`] が持つ）。
+///
+/// # Errors
+/// [`run`]・[`PendingScore::commit`] と同じ。
+pub fn score(args: &ScoreArgs, cwd: &Path) -> Result<ScoreReport, ErrorReport> {
+    run(args, cwd)?.commit().map(|(report, _)| report)
 }
 
 /// 採点して、台帳確定待ちの結果を返す（出力・時間上限・台帳の書き込みは持たない。ロックの取得と台帳の
 /// 検査までを行い、書き込みは [`PendingScore::commit`] が行う）。
 ///
 /// 呼び出し全体の時間上限（[`MAX_SCORE_DURATION`]）と出力の期限は [`emit`] が持つ（`infer_batch` の
-/// `run_with_stall_guard` と同じ見張り。REQ-39）。長寿命プロセスから本関数を直接呼ぶ場合は、
-/// 呼び出し側が期限を持ち、期限内に返ったときだけ `commit` すること。
+/// `run_with_stall_guard` と同じ見張り。REQ-39）。crate 内部専用で、確定前の結果（`PendingScore`）は
+/// `commit` を経ないと読めない。
 ///
 /// # Errors
 /// 凍結ハッシュ不一致・評価データなし・予測の不備・台帳違反は `invalid_input`（64）、
 /// 上限超過は `limit_exceeded`（20）、評価器・I/O の失敗は `runtime_error`（70）。
-pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
+pub(crate) fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
     args.validate()?;
     let project = Project::open(cwd, &args.project_dir)?;
     let Some((freeze, eval_bytes)) = load_frozen_evaluation(&project)? else {
@@ -769,8 +784,12 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
     let definition = project.load_definition()?;
     let label_set: BTreeSet<String> = definition.options().iter().map(|c| c.id.clone()).collect();
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
-    let gold_text = std::str::from_utf8(&eval_bytes)
-        .map_err(|_| invalid("evaluation data is not valid UTF-8"))?;
+    // 評価対象は `evaluate` と同じデコード経路（`evaluation_records`）から取る。矛盾入力グループも
+    // 除外しない（件数・ID・順序が evaluate の評価記録と一致する。REQ-27・#445）。
+    let eval_records =
+        evaluation_records(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    let gold_text = gold_jsonl(&eval_records);
+    let gold_text = gold_text.as_str();
 
     let prov = Provenance {
         project: &project,
@@ -794,6 +813,16 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
         .any(|l| l.ids != first.ids || l.golds != first.golds)
     {
         return Err(invalid("prediction files cover different records"));
+    }
+    // 予測側の評価対象が evaluate の評価対象と同じ ID・同じ並びであること（厳密に保つ）。
+    if first.ids.len() != eval_records.len()
+        || first
+            .ids
+            .iter()
+            .zip(&eval_records)
+            .any(|(id, r)| *id != r.id)
+    {
+        return Err(invalid("prediction files do not match the evaluation data"));
     }
     let n_total = u64::try_from(first.ids.len()).map_err(|_| runtime("too many records"))?;
 
@@ -897,7 +926,6 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
     // 台帳は全検証が通った後に照合する。書き込みは emit 側の `commit`（検証の失敗・期限超過で適用権を
     // 使わない）。照合から確定までを seed 単位の排他ロックで保持する（同時実行による二重適用を防ぐ）。
     let eval_sha = freeze.sha256().to_hex();
-    check_distinct_inputs(&loaded)?;
     let lock = lock_ledger(&project, &eval_sha, args.seed)?;
     let to_write = check_ledger(&project, &eval_sha, args.seed, &loaded)?;
     let entries = to_write
@@ -938,7 +966,7 @@ pub fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorReport> {
 /// `run_with_stall_guard` と同じ）。台帳を書くのは切り離されないメインスレッドだけなので、切り離された
 /// ワーカーが走り切っても台帳・結果ファイルは書かれず、期限超過の再実行は適用権を消費していない。
 ///
-/// 順序（REQ-27・REQ-39）: (a) 直列化 → (b) 出力のウォッチドッグ起動 → (c) 台帳エントリを原子的に
+/// 順序（REQ-27・REQ-39）: (b) 出力のウォッチドッグ起動 → (a) 直列化（`commit` の先頭。台帳の前）→ (c) 台帳エントリを原子的に
 /// 確定（比較相手が先、採点対象が最後） → (d) 結果を `<NAME>.report.json` へ原子的に保存 → (e) ロック
 /// 解放 → (f) stdout へ出力。失敗しうる (a)(b) は台帳を消費する前に行う。(f) が失敗・停止しても結果は
 /// (d) に残り、再実行の「already scored」拒否の message にその project 相対パスが入る。
@@ -968,20 +996,12 @@ pub(crate) fn emit_with<W: Write>(
 ) -> io::Result<ExitCode> {
     let outcome =
         run_with_stall_guard(out, duration, MAX_INFER_BATCH_OUTPUT_DURATION, policy, work);
-    // (a) 直列化。台帳を消費する前に失敗を確定させる。
-    let prepared = outcome.and_then(|pending| {
-        let line = pending.report_line()?;
-        Ok((pending, line))
-    });
     // (b) 書き込みの停止も期限でプロセス終了へ倒す（7 工程の `infer` と同じ見張り）。
-    // 起動に失敗しても、ここでは台帳をまだ書いていない（`pending` は drop されロックが解ける）。
+    // 起動に失敗しても、ここでは台帳をまだ書いていない（`outcome` は drop されロックが解ける）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), MAX_INFER_BATCH_OUTPUT_DURATION)?;
-    match prepared {
-        Ok((pending, line)) => match pending.commit(&line) {
-            // (c)(d)(e): commit が台帳・結果を確定し、pending（ロック）を消費して解放する。
-            Ok(()) => write_stage_line(out, Ok::<_, std::convert::Infallible>(line)),
-            Err(error) => emit_error_report(out, &error),
-        },
+    // (a)(c)(d)(e): commit が直列化 → 台帳 → 結果を確定し、pending（ロック）を消費して解放する。
+    match outcome.and_then(PendingScore::commit) {
+        Ok((_, line)) => write_stage_line(out, Ok::<_, std::convert::Infallible>(line)),
         Err(error) => emit_error_report(out, &error),
     }
 }
@@ -990,239 +1010,244 @@ pub(crate) fn emit_with<W: Write>(
 mod tests {
     use super::*;
 
-    /// 単体テスト用の作業ディレクトリ（cwd）と、その下の project を作る。
-    fn scratch(case: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("fe-score-unit-{case}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("proj")).expect("mkdir");
-        root.canonicalize().expect("canonicalize")
-    }
+    /// 台帳の確定・復旧のテスト。ガード層の閉じ込め（`openat` 等）は Linux・macOS 限定のため、
+    /// Windows では `unsupported_platform` になり成立しない（プラットフォーム前提を明示する）。
+    #[cfg(unix)]
+    mod ledger {
+        use super::*;
 
-    const EVAL_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        /// 単体テスト用の作業ディレクトリ（cwd）と、その下の project を作る。
+        fn scratch(case: &str) -> PathBuf {
+            let root =
+                std::env::temp_dir().join(format!("fe-score-unit-{case}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("proj")).expect("mkdir");
+            root.canonicalize().expect("canonicalize")
+        }
 
-    /// ロックを取り済みの確定待ち（比較相手 C1 → 採点対象 P の順）。
-    fn pending(root: &Path) -> Result<PendingScore, ErrorReport> {
-        let project = Project::open(root, Path::new("proj"))?;
-        let lock = lock_ledger(&project, EVAL_SHA, 0)?;
-        let report = ScoreReport::new(
-            0,
-            EVAL_SHA.to_string(),
-            1,
-            1,
-            Vec::new(),
-            ScoreHolm {
+        const EVAL_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        /// ロックを取り済みの確定待ち（比較相手 C1 → 採点対象 P の順）。
+        fn pending(root: &Path) -> Result<PendingScore, ErrorReport> {
+            let project = Project::open(root, Path::new("proj"))?;
+            let lock = lock_ledger(&project, EVAL_SHA, 0)?;
+            let report = ScoreReport::new(
+                0,
+                EVAL_SHA.to_string(),
+                1,
+                1,
+                Vec::new(),
+                ScoreHolm {
+                    candidate: "P".into(),
+                    m: FAMILY_SIZE,
+                    comparisons: Vec::new(),
+                },
+                Vec::new(),
+            );
+            Ok(PendingScore {
+                project,
+                _lock: lock,
+                eval_sha: EVAL_SHA.to_string(),
+                seed: 0,
                 candidate: "P".into(),
-                m: FAMILY_SIZE,
-                comparisons: Vec::new(),
-            },
-            Vec::new(),
-        );
-        Ok(PendingScore {
-            project,
-            _lock: lock,
-            eval_sha: EVAL_SHA.to_string(),
-            seed: 0,
-            candidate: "P".into(),
-            entries: vec![
-                ("C1".into(), "aa".repeat(32)),
-                ("P".into(), "bb".repeat(32)),
-            ],
-            report,
-        })
-    }
-
-    fn ledger_path(root: &Path, file: &str) -> PathBuf {
-        root.join("proj").join(ledger_dir(EVAL_SHA, 0)).join(file)
-    }
-
-    /// REQ-27・REQ-39: 期限を超えて切り離されたワーカーが走り切っても台帳・結果は書かれず、
-    /// 期限超過の再実行は適用権を消費していないので成功する。
-    #[test]
-    fn req27_req39_timed_out_worker_never_writes_ledger() {
-        let root = scratch("timeout");
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker_root = root.clone();
-        let mut out: Vec<u8> = Vec::new();
-        let code = emit_with(
-            &mut out,
-            Duration::from_millis(50),
-            StallPolicy::Leak,
-            move || {
-                std::thread::sleep(Duration::from_millis(300));
-                let pending = pending(&worker_root);
-                let _ = done_tx.send(());
-                pending
-            },
-        )
-        .expect("write");
-        assert_eq!(code, ExitCode::LimitExceeded);
-        done_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("worker finished");
-        for f in ["C1.sha256", "P.sha256", "P.report.json"] {
-            assert!(!ledger_path(&root, f).exists(), "{f}");
+                entries: vec![
+                    ("C1".into(), "aa".repeat(32)),
+                    ("P".into(), "bb".repeat(32)),
+                ],
+                report,
+            })
         }
-        let worker_root = root.clone();
-        let mut out: Vec<u8> = Vec::new();
-        let code = emit_with(
-            &mut out,
-            Duration::from_secs(30),
-            StallPolicy::Leak,
-            move || pending(&worker_root),
-        )
-        .expect("write");
-        assert_eq!(code, ExitCode::Ok);
-        let line = String::from_utf8(out).expect("utf8");
-        assert_eq!(
-            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
-            line
-        );
-        assert_eq!(
-            std::fs::read_to_string(ledger_path(&root, "C1.sha256")).expect("c1"),
-            format!("{}\n", "aa".repeat(32))
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    /// REQ-27・REQ-39: 孤立した一時ファイル（途中終了の残骸）があっても確定でき、残骸は台帳として
-    /// 読まれない。確定後に同じ名前を確定しようとすると上書きせず拒否する。
-    #[test]
-    fn req27_leftover_tmp_files_do_not_block_commit() {
-        let root = scratch("tmp");
-        let p = pending(&root).expect("pending");
-        let pid = std::process::id();
-        std::fs::write(
-            ledger_path(&root, &format!(".tmp-P.sha256-{pid}")),
-            b"partial",
-        )
-        .expect("tmp");
-        std::fs::write(
-            ledger_path(&root, &format!(".tmp-P.report.json-{pid}")),
-            b"{",
-        )
-        .expect("tmp");
-        p.commit("{\"ok\":true}").expect("commit");
-        assert_eq!(
-            std::fs::read_to_string(ledger_path(&root, "P.sha256")).expect("p"),
-            format!("{}\n", "bb".repeat(32))
-        );
-        assert_eq!(
-            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
-            "{\"ok\":true}\n"
-        );
-        // 一時名は片付けられ、2 回目の確定（二重適用）は上書きせず拒否される。
-        assert!(!ledger_path(&root, &format!(".tmp-P.sha256-{pid}")).exists());
-        // 残骸は `.tmp-*` を pid に関係なく消す。
-        std::fs::write(ledger_path(&root, ".tmp-X-1"), b"old").expect("tmp");
-        let again = pending(&root).expect("pending");
-        let err = again.commit("{}").expect_err("must not overwrite");
-        assert_eq!(err.code, ExitCode::InvalidInput);
-        assert!(!ledger_path(&root, ".tmp-X-1").exists());
-        assert_eq!(
-            std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
-            "{\"ok\":true}\n"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    fn loaded<'a>(role: Role, named: &'a NamedPath, sha: &str) -> Loaded<'a> {
-        Loaded {
-            role,
-            named,
-            sha256: sha.to_string(),
-            ids: Vec::new(),
-            golds: Vec::new(),
-            outcomes: Vec::new(),
+        fn ledger_path(root: &Path, file: &str) -> PathBuf {
+            root.join("proj").join(ledger_dir(EVAL_SHA, 0)).join(file)
         }
-    }
 
-    fn named(name: &str) -> NamedPath {
-        NamedPath {
-            name: name.to_string(),
-            path: PathBuf::from("x.jsonl"),
-        }
-    }
-
-    /// REQ-27: 採点対象の台帳確定後・結果の公開前に中断しても、同じ予測ファイルを別 NAME で渡すと
-    /// 拒否され、同名の再実行の message は結果が保存されていないことを示す。
-    #[test]
-    fn req27_interrupt_after_candidate_ledger_still_rejects_other_name() {
-        let root = scratch("after-candidate");
-        let project = Project::open(&root, Path::new("proj")).expect("open");
-        let _lock = lock_ledger(&project, EVAL_SHA, 0).expect("lock");
-        let sha = "bb".repeat(32);
-        project
-            .publish_new_file(ledger_rel(EVAL_SHA, 0, "P"), format!("{sha}\n").as_bytes())
-            .expect("ledger");
-        let (ar, p) = (named("AR"), named("P"));
-        let err = check_ledger(&project, EVAL_SHA, 0, &[loaded(Role::Candidate, &ar, &sha)])
-            .expect_err("other name");
-        assert_eq!(
-            err.message,
-            "prediction file has already been scored under another name"
-        );
-        let err = check_ledger(&project, EVAL_SHA, 0, &[loaded(Role::Candidate, &p, &sha)])
-            .expect_err("same name");
-        assert_eq!(
-            err.message,
-            "candidate has already been scored; result was not saved"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// REQ-27: 比較相手の台帳だけ確定して中断した状態の再実行は成功し、比較相手は同じ sha256 のみ許可。
-    #[test]
-    fn req27_interrupt_after_compare_ledger_allows_rerun() {
-        let root = scratch("after-compare");
-        let project = Project::open(&root, Path::new("proj")).expect("open");
-        let lock = lock_ledger(&project, EVAL_SHA, 0).expect("lock");
-        let (c1_sha, p_sha) = ("aa".repeat(32), "bb".repeat(32));
-        project
-            .publish_new_file(
-                ledger_rel(EVAL_SHA, 0, "C1"),
-                format!("{c1_sha}\n").as_bytes(),
+        /// REQ-27・REQ-39: 期限を超えて切り離されたワーカーが走り切っても台帳・結果は書かれず、
+        /// 期限超過の再実行は適用権を消費していないので成功する。
+        #[test]
+        fn req27_req39_timed_out_worker_never_writes_ledger() {
+            let root = scratch("timeout");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_root = root.clone();
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_with(
+                &mut out,
+                Duration::from_millis(50),
+                StallPolicy::Leak,
+                move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let pending = pending(&worker_root);
+                    let _ = done_tx.send(());
+                    pending
+                },
             )
-            .expect("ledger");
-        let (p, c1) = (named("P"), named("C1"));
-        let both = [
-            loaded(Role::Candidate, &p, &p_sha),
-            loaded(Role::Compare, &c1, &c1_sha),
-        ];
-        let ok = check_ledger(&project, EVAL_SHA, 0, &both).expect("rerun");
-        assert_eq!(ok.len(), 1);
-        let other = "cc".repeat(32);
-        let err = check_ledger(
-            &project,
-            EVAL_SHA,
-            0,
-            &[
-                loaded(Role::Candidate, &p, &p_sha),
-                loaded(Role::Compare, &c1, &other),
-            ],
-        )
-        .expect_err("swapped compare");
-        assert_eq!(
-            err.message,
-            "prediction file differs from the one recorded for this name"
-        );
-        drop(lock);
-        let _ = std::fs::remove_dir_all(&root);
-    }
+            .expect("write");
+            assert_eq!(code, ExitCode::LimitExceeded);
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker finished");
+            for f in ["C1.sha256", "P.sha256", "P.report.json"] {
+                assert!(!ledger_path(&root, f).exists(), "{f}");
+            }
+            let worker_root = root.clone();
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_with(
+                &mut out,
+                Duration::from_secs(30),
+                StallPolicy::Leak,
+                move || pending(&worker_root),
+            )
+            .expect("write");
+            assert_eq!(code, ExitCode::Ok);
+            let line = String::from_utf8(out).expect("utf8");
+            assert_eq!(
+                std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+                line
+            );
+            assert_eq!(
+                std::fs::read_to_string(ledger_path(&root, "C1.sha256")).expect("c1"),
+                format!("{}\n", "aa".repeat(32))
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
 
-    /// REQ-39: 結果の公開に失敗したら、採点対象の台帳は確定済みで結果が保存されていないと message に示す。
-    #[test]
-    fn req27_report_failure_after_ledger_is_explicit() {
-        let root = scratch("report-fail");
-        let p = pending(&root).expect("pending");
-        std::fs::write(ledger_path(&root, "P.report.json"), b"x").expect("squat");
-        let err = p.commit("{}").expect_err("report exists");
-        assert_eq!(
-            err.message,
-            "candidate ledger committed but the result was not saved"
-        );
-        assert!(ledger_path(&root, "P.sha256").is_file());
-        let _ = std::fs::remove_dir_all(&root);
+        /// REQ-27・REQ-39: 孤立した一時ファイル（途中終了の残骸）があっても確定でき、残骸は台帳として
+        /// 読まれない。確定後に同じ名前を確定しようとすると上書きせず拒否する。
+        #[test]
+        fn req27_leftover_tmp_files_do_not_block_commit() {
+            let root = scratch("tmp");
+            let p = pending(&root).expect("pending");
+            let pid = std::process::id();
+            std::fs::write(
+                ledger_path(&root, &format!(".tmp-P.sha256-{pid}")),
+                b"partial",
+            )
+            .expect("tmp");
+            std::fs::write(
+                ledger_path(&root, &format!(".tmp-P.report.json-{pid}")),
+                b"{",
+            )
+            .expect("tmp");
+            let (_, line) = p.commit().expect("commit");
+            assert_eq!(
+                std::fs::read_to_string(ledger_path(&root, "P.sha256")).expect("p"),
+                format!("{}\n", "bb".repeat(32))
+            );
+            assert_eq!(
+                std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+                format!("{line}\n")
+            );
+            // 一時名は片付けられ、2 回目の確定（二重適用）は上書きせず拒否される。
+            assert!(!ledger_path(&root, &format!(".tmp-P.sha256-{pid}")).exists());
+            // 残骸は `.tmp-*` を pid に関係なく消す。
+            std::fs::write(ledger_path(&root, ".tmp-X-1"), b"old").expect("tmp");
+            let again = pending(&root).expect("pending");
+            let err = again.commit().expect_err("must not overwrite");
+            assert_eq!(err.code, ExitCode::InvalidInput);
+            assert!(!ledger_path(&root, ".tmp-X-1").exists());
+            assert_eq!(
+                std::fs::read_to_string(ledger_path(&root, "P.report.json")).expect("report"),
+                format!("{line}\n")
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        fn loaded<'a>(role: Role, named: &'a NamedPath, sha: &str) -> Loaded<'a> {
+            Loaded {
+                role,
+                named,
+                sha256: sha.to_string(),
+                ids: Vec::new(),
+                golds: Vec::new(),
+                outcomes: Vec::new(),
+            }
+        }
+
+        fn named(name: &str) -> NamedPath {
+            NamedPath {
+                name: name.to_string(),
+                path: PathBuf::from("x.jsonl"),
+            }
+        }
+
+        /// REQ-27: 採点対象の台帳確定後・結果の公開前に中断しても、同名の再実行は拒否され、message は結果が
+        /// 保存されていないことを示す。別 NAME は独立。
+        #[test]
+        fn req27_interrupt_after_candidate_ledger_rejects_same_name() {
+            let root = scratch("after-candidate");
+            let project = Project::open(&root, Path::new("proj")).expect("open");
+            let _lock = lock_ledger(&project, EVAL_SHA, 0).expect("lock");
+            let sha = "bb".repeat(32);
+            project
+                .publish_new_file(ledger_rel(EVAL_SHA, 0, "P"), format!("{sha}\n").as_bytes())
+                .expect("ledger");
+            let p = named("P");
+            // 別 NAME は同じバイト列でも採点できる（NAME × seed が 1 回限りの単位。REQ-27）。
+            let ar = named("AR");
+            check_ledger(&project, EVAL_SHA, 0, &[loaded(Role::Candidate, &ar, &sha)])
+                .expect("other name is independent");
+            let err = check_ledger(&project, EVAL_SHA, 0, &[loaded(Role::Candidate, &p, &sha)])
+                .expect_err("same name");
+            assert_eq!(
+                err.message,
+                "candidate has already been scored; result was not saved"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// REQ-27: 比較相手の台帳だけ確定して中断した状態の再実行は成功し、比較相手は同じ sha256 のみ許可。
+        #[test]
+        fn req27_interrupt_after_compare_ledger_allows_rerun() {
+            let root = scratch("after-compare");
+            let project = Project::open(&root, Path::new("proj")).expect("open");
+            let lock = lock_ledger(&project, EVAL_SHA, 0).expect("lock");
+            let (c1_sha, p_sha) = ("aa".repeat(32), "bb".repeat(32));
+            project
+                .publish_new_file(
+                    ledger_rel(EVAL_SHA, 0, "C1"),
+                    format!("{c1_sha}\n").as_bytes(),
+                )
+                .expect("ledger");
+            let (p, c1) = (named("P"), named("C1"));
+            let both = [
+                loaded(Role::Candidate, &p, &p_sha),
+                loaded(Role::Compare, &c1, &c1_sha),
+            ];
+            let ok = check_ledger(&project, EVAL_SHA, 0, &both).expect("rerun");
+            assert_eq!(ok.len(), 1);
+            let other = "cc".repeat(32);
+            let err = check_ledger(
+                &project,
+                EVAL_SHA,
+                0,
+                &[
+                    loaded(Role::Candidate, &p, &p_sha),
+                    loaded(Role::Compare, &c1, &other),
+                ],
+            )
+            .expect_err("swapped compare");
+            assert_eq!(
+                err.message,
+                "prediction file differs from the one recorded for this name"
+            );
+            drop(lock);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// REQ-39: 結果の公開に失敗したら、採点対象の台帳は確定済みで結果が保存されていないと message に示す。
+        #[test]
+        fn req27_report_failure_after_ledger_is_explicit() {
+            let root = scratch("report-fail");
+            let p = pending(&root).expect("pending");
+            std::fs::write(ledger_path(&root, "P.report.json"), b"x").expect("squat");
+            let err = p.commit().expect_err("report exists");
+            assert_eq!(
+                err.message,
+                "candidate ledger committed but the result was not saved"
+            );
+            assert!(ledger_path(&root, "P.sha256").is_file());
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// REQ-39: 採点が期限内に返らなければ `limit_exceeded`（20）の `ErrorReport` を 1 行書いて返す

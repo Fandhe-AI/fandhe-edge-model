@@ -51,11 +51,14 @@ fn eval_id(i: usize) -> String {
     format!("e-{i}")
 }
 
+/// 149 番（alpha）と 150 番（beta）は同じ `input` で異なるラベルの矛盾入力。`evaluate` と同じく
+/// 評価対象から除外されない（採点の n_total は 300 のまま。REQ-27・#445）。
 fn evaluation_jsonl() -> String {
     (0..N_EVAL)
         .map(|i| {
+            let k = if i == 150 { 149 } else { i };
             format!(
-                r#"{{"id":"{}","input":"evaluation {i}","output":{{"intent":"{}"}},"group_id":"eg-{i}"}}"#,
+                r#"{{"id":"{}","input":"evaluation {k}","output":{{"intent":"{}"}},"group_id":"eg-{i}"}}"#,
                 eval_id(i),
                 gold_of(i)
             ) + "\n"
@@ -493,27 +496,45 @@ fn req27_ledger_enforces_single_application() {
     ]);
 }
 
-/// REQ-27: 同じ seed で、同じ sha256 の予測ファイルを別 NAME の採点対象として出すと拒否する。
+/// REQ-27: 同じバイト列の予測でも、別 NAME の採点対象なら採点できる（NAME × seed が 1 回限りの単位）。
 #[test]
-fn req27_same_sha256_under_another_name_is_rejected() {
+fn req27_same_bytes_under_another_name_is_scored_independently() {
     let env = Env::new("othername");
     env.write("p.jsonl", &pred_jsonl(pred_p));
     let c3 = format!("C3={}", env.bound("c3", 2, &pred_jsonl(pred_p)));
     env.ok(&args(&["--candidate", "P=p.jsonl"]));
-    env.fails(
-        &args(&["--candidate", &c3]),
-        "prediction file has already been scored under another name",
-    );
-    // 別 seed なら独立。
-    let c3_seed2 = format!("C3={}", env.bound_seed("c3", 5, 2, &pred_jsonl(pred_p)));
-    env.ok(&[
-        "--project-dir",
-        "proj",
-        "--seed",
-        "2",
+    env.ok(&args(&["--candidate", &c3]));
+    // 同名の再採点は拒否される。
+    let (code, _) = env.score(&args(&["--candidate", "P=p.jsonl"]));
+    assert_eq!(code, 64);
+}
+
+/// REQ-27・#445: 異なる候補が同じ予測バイト列を返す比較（P と C1 が同一）も採点でき、b = c = 0 になる。
+#[test]
+fn req27_issue445_identical_predictions_of_two_names_compare_as_tie() {
+    let env = Env::new("samebytes");
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
+    env.write("p.jsonl", &pred_jsonl(pred_a));
+    let out = env.ok(&args(&[
         "--candidate",
-        &c3_seed2,
-    ]);
+        "P=p.jsonl",
+        "--compare",
+        &format!("C1={c1}"),
+    ]));
+    assert!(
+        out.contains("{\"against\":\"C1\",\"b\":0,\"c\":0,\"p_raw\":"),
+        "{out}"
+    );
+}
+
+/// REQ-27・#445: 矛盾入力（同じ input で異なるラベル）を含む評価データでも、採点の n_total は
+/// 全レコード数（`evaluate` と共有のデコード経路。評価記録の total と一致する）。
+#[test]
+fn req27_issue445_contradictory_inputs_stay_in_the_evaluation_set() {
+    let env = Env::new("contradiction");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let out = env.ok(&args(&["--candidate", "P=p.jsonl"]));
+    assert!(out.contains("\"n_total\":300,"), "{out}");
 }
 
 /// REQ-27: 事前登録外の NAME・seed と、reference 2 個を拒否する（適用は最大 4 候補 × 3 seed）。
@@ -713,7 +734,7 @@ fn req27_issue445_provenance_mismatch_is_rejected() {
 /// 検証し、拒否したときは台帳を作らない。
 #[test]
 fn req27_issue445_run_revalidates_public_args() {
-    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, run};
+    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, score};
     let env = Env::new("api");
     env.write("p.jsonl", &pred_jsonl(pred_p));
     let named = |name: &str| NamedPath {
@@ -731,7 +752,7 @@ fn req27_issue445_run_revalidates_public_args() {
         (build(3, "P"), "seed is not in the preregistered list"),
         (build(0, "X"), "name is not in the preregistered list"),
     ] {
-        let err = run(&args, &env.work).expect_err("rejected");
+        let err = score(&args, &env.work).expect_err("rejected");
         assert_eq!(
             err.to_json_line().expect("json"),
             format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}")
@@ -739,24 +760,10 @@ fn req27_issue445_run_revalidates_public_args() {
     }
     let mut many = build(0, "P");
     many.compares = vec![named("C1"), named("C3"), named("AR")];
-    assert!(run(&many, &env.work).is_err());
+    assert!(score(&many, &env.work).is_err());
     let mut dup = build(0, "P");
     dup.references = vec![named("P")];
-    assert!(run(&dup, &env.work).is_err());
-    assert!(!env.work.join("proj/poc26_score_ledger").exists());
-}
-
-/// REQ-27・#445: 未記録の相手（`--compare`）と同じバイト列を別 NAME の採点対象にすると、台帳の書き込み前に
-/// 拒否され、台帳が作られない。
-#[test]
-fn req27_issue445_same_bytes_in_one_invocation_under_two_names_is_rejected() {
-    let env = Env::new("samebytes");
-    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
-    env.write("p.jsonl", &pred_jsonl(pred_a));
-    env.fails(
-        &args(&["--candidate", "P=p.jsonl", "--compare", &format!("C1={c1}")]),
-        "the same prediction file is used under more than one name",
-    );
+    assert!(score(&dup, &env.work).is_err());
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
 
@@ -836,17 +843,16 @@ fn req27_roles_are_restricted_by_preregistration() {
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
 
-/// REQ-27・#445: 同じ台帳に対する同時実行は排他ロックで直列化され、同じ sha256 を別 NAME で採点する
+/// REQ-27・#445: 同じ台帳に対する同時実行は排他ロックで直列化され、同じ NAME（P）を採点する
 /// 2 つの呼び出しのうち成功は 1 つだけ（もう一方は `invalid_input`）。
 #[test]
-fn req27_issue445_concurrent_scoring_of_same_bytes_applies_once() {
-    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, run};
+fn req27_issue445_concurrent_scoring_of_same_name_applies_once() {
+    use fandhe_edge_cli::score_predictions::{NamedPath, ScoreArgs, score};
     let env = Env::new("concurrent");
     env.write("p.jsonl", &pred_jsonl(pred_p));
-    let c3 = env.bound("c3", 2, &pred_jsonl(pred_p));
     let barrier = std::sync::Barrier::new(2);
     let results: Vec<bool> = std::thread::scope(|scope| {
-        let handles: Vec<_> = [("P", "p.jsonl".to_string()), ("C3", c3)]
+        let handles: Vec<_> = [("P", "p.jsonl".to_string()), ("P", "p.jsonl".to_string())]
             .into_iter()
             .map(|(name, path)| {
                 let (barrier, work) = (&barrier, &env.work);
@@ -862,13 +868,8 @@ fn req27_issue445_concurrent_scoring_of_same_bytes_applies_once() {
                         references: vec![],
                     };
                     barrier.wait();
-                    match run(&args, work) {
-                        Ok(pending) => {
-                            // 台帳の確定は emit 側の commit。ロックを保持したまま確定して解放する。
-                            let line = pending.report_line().expect("line");
-                            pending.commit(&line).expect("commit");
-                            true
-                        }
+                    match score(&args, work) {
+                        Ok(_) => true,
                         Err(e) => {
                             assert_eq!(e.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
                             false

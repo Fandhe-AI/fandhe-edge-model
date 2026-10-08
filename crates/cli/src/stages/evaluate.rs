@@ -91,6 +91,7 @@ use fandhe_edge_core::stage_report::{
     EvaluateCompletedReport, EvaluateReport, PredictionLine, PredictionLineOutcome,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
+use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
@@ -423,7 +424,7 @@ fn check_candidate_artifact(
 
 /// 評価データの分解の失敗（本文・行番号を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvalDecodeError {
+pub(crate) enum EvalDecodeError {
     /// 検査で異常があった・0 件。
     Invalid,
     /// 件数が上限を超えた。
@@ -442,14 +443,16 @@ impl ToErrorReport for EvalDecodeError {
     }
 }
 
-/// 照合済みの評価データのバイト列を、`input` と正解ラベルへ分ける。
+/// 照合済みの評価データのバイト列を、評価対象のレコード列へ検査して分ける（`evaluate` と採点入口
+/// `fandhe-edge-score` が共有する唯一のデコード経路。評価対象の件数・順序・ID が両者で食い違わない。
+/// REQ-27・#445）。
 ///
 /// 件数は推論バッチの上限（[`MAX_INFER_BATCH_LEN`]）までとし、0 件は拒否する
 /// （`evaluate_single_select` が適用後に失敗しないよう、適用前の事前検査にも使う。REQ-39）。
-fn decode_evaluation(
+pub(crate) fn evaluation_records(
     bytes: &[u8],
     definition: &Definition,
-) -> Result<Vec<LabeledInput>, EvalDecodeError> {
+) -> Result<Vec<ValidRecord>, EvalDecodeError> {
     let records = inspect_bytes(bytes, definition).map_err(|_| EvalDecodeError::Invalid)?;
     if records.is_empty() {
         return Err(EvalDecodeError::Invalid);
@@ -457,7 +460,15 @@ fn decode_evaluation(
     if records.len() > MAX_INFER_BATCH_LEN {
         return Err(EvalDecodeError::TooMany);
     }
-    Ok(records
+    Ok(records)
+}
+
+/// 照合済みの評価データのバイト列を、`input` と正解ラベルへ分ける（[`evaluation_records`] の薄い写像）。
+fn decode_evaluation(
+    bytes: &[u8],
+    definition: &Definition,
+) -> Result<Vec<LabeledInput>, EvalDecodeError> {
+    Ok(evaluation_records(bytes, definition)?
         .into_iter()
         .map(|r| LabeledInput {
             input: r.input,
@@ -854,6 +865,21 @@ mod tests {
                     gold: "a".to_string()
                 },
             ]
+        );
+    }
+
+    /// REQ-27・#445: 同じ `input` に異なるラベルが付いた矛盾入力も評価対象から除外されない
+    /// （採点入口と共有するデコード経路。件数は全レコード）。
+    #[test]
+    fn req27_issue445_evaluation_records_keep_contradictory_inputs() {
+        let data = b"{\"id\":\"1\",\"input\":\"x\",\"output\":{\"intent\":\"a\"}}\n{\"id\":\"2\",\"input\":\"x\",\"output\":{\"intent\":\"b\"}}\n";
+        let records = evaluation_records(data, &definition()).expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            decode_evaluation(data, &definition())
+                .expect("decode")
+                .len(),
+            2
         );
     }
 
