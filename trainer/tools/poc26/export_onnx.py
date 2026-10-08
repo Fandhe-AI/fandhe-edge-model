@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import time
 from collections import Counter
@@ -88,23 +89,32 @@ VERIFY_USERS = ("Open the page and take a screenshot.", "Click the login button,
 # --- LoRA の統合 -------------------------------------------------------------------------
 
 
-def fused_weights(model: Qwen2Model) -> dict[str, np.ndarray]:
+def fused_weights(model: Qwen2Model, shapes_only: bool = False) -> dict[str, np.ndarray]:
     """LoRA を base へ統合した重みを HF のキー名・float32・Linear は (out, in) で返す。
 
     mlx の Linear 重みは (out, in)、lora_a は (in, r)、lora_b は (r, out) なので
     `W' = W + scale * (A @ B).T`（`LoRALinear.__call__` の `y + scale * (x @ A @ B)` と等価）。
+
+    `shapes_only=True` は値を持たない（メモリ 0 の broadcast 配列で形だけ返す）。`verify-onnx` が
+    期待グラフを重みデータ無しで組み直すために使う（`expected_graph`）。
     """
     out: dict[str, np.ndarray] = {}
+
+    def np_array(a: Any, dtype: Any = None) -> np.ndarray:
+        if shapes_only:
+            return np.broadcast_to(np.float32(0), tuple(a.shape))
+        return np.array(a, dtype=dtype)
+
     c = model.config
     inner = model.model
-    out["model.embed_tokens.weight"] = np.array(inner.embed_tokens.weight, dtype=np.float32)
-    out["model.norm.weight"] = np.array(inner.norm.weight, dtype=np.float32)
+    out["model.embed_tokens.weight"] = np_array(inner.embed_tokens.weight, dtype=np.float32)
+    out["model.norm.weight"] = np_array(inner.norm.weight, dtype=np.float32)
     if not c.tie_word_embeddings:
-        out["lm_head.weight"] = np.array(model.lm_head.weight, dtype=np.float32)
+        out["lm_head.weight"] = np_array(model.lm_head.weight, dtype=np.float32)
     for i, block in enumerate(inner.layers):
         p = f"model.layers.{i}."
         for norm in ("input_layernorm", "post_attention_layernorm"):
-            out[p + norm + ".weight"] = np.array(getattr(block, norm).weight, dtype=np.float32)
+            out[p + norm + ".weight"] = np_array(getattr(block, norm).weight, dtype=np.float32)
         for owner, names in (
             ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
             ("mlp", ("gate_proj", "up_proj", "down_proj")),
@@ -112,15 +122,15 @@ def fused_weights(model: Qwen2Model) -> dict[str, np.ndarray]:
             for name in names:
                 lin = getattr(getattr(block, owner), name)
                 w = lin.linear.weight if isinstance(lin, LoRALinear) else lin.weight
-                w = np.array(w, dtype=np.float32)
-                if isinstance(lin, LoRALinear):
-                    delta = lin.scale * (np.array(lin.lora_a) @ np.array(lin.lora_b)).T
+                w = np_array(w, dtype=np.float32)
+                if isinstance(lin, LoRALinear) and not shapes_only:
+                    delta = lin.scale * (np_array(lin.lora_a) @ np_array(lin.lora_b)).T
                     w = w + delta.astype(np.float32)
                 key = f"{p}{owner}.{name}."
                 out[key + "weight"] = w
                 base = lin.linear if isinstance(lin, LoRALinear) else lin
                 if "bias" in base:
-                    out[key + "bias"] = np.array(base.bias, dtype=np.float32)
+                    out[key + "bias"] = np_array(base.bias, dtype=np.float32)
     return out
 
 
@@ -130,7 +140,7 @@ def fused_weights(model: Qwen2Model) -> dict[str, np.ndarray]:
 class _Graph:
     """ノードと initializer を溜めるビルダー。大きな重みは external data へ逐次書く。"""
 
-    def __init__(self, data_file: Any, data_name: str, budget: Budget | None = None) -> None:
+    def __init__(self, data_file: Any | None, data_name: str, budget: Budget | None = None) -> None:
         self._budget = budget  # 重み 1 本ごとに RSS・壁時計を確認する（REQ-39）
         self.nodes: list[onnx.NodeProto] = []
         self.inits: list[onnx.TensorProto] = []
@@ -155,12 +165,21 @@ class _Graph:
         """重み。`EXTERNAL_THRESHOLD` 以上なら external data へ書き、位置と長さだけを持つ。"""
         if self._budget is not None:
             self._budget.check()
-        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        shape_only = self._f is None  # 値を持たない構築（期待グラフ用。`expected_graph`）
+        if not shape_only:
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
         if arr.nbytes < EXTERNAL_THRESHOLD:
-            self.inits.append(numpy_helper.from_array(arr, name))
+            if shape_only:
+                t = TensorProto()
+                t.name, t.data_type = name, TensorProto.FLOAT
+                t.dims.extend(arr.shape)
+                self.inits.append(t)
+            else:
+                self.inits.append(numpy_helper.from_array(arr, name))
             return name
         pad = -self._offset % 64  # 64 byte 境界へ揃える
-        self._f.write(b"\0" * pad)
+        if not shape_only:
+            self._f.write(b"\0" * pad)
         self._offset += pad
         t = TensorProto()
         t.name, t.data_type = name, TensorProto.FLOAT
@@ -170,7 +189,8 @@ class _Graph:
         for k, v in (("location", self._name), ("offset", self._offset), ("length", arr.nbytes)):
             e = t.external_data.add()
             e.key, e.value = k, str(v)
-        self._f.write(memoryview(arr).cast("B"))
+        if not shape_only:
+            self._f.write(memoryview(arr).cast("B"))
         self._offset += arr.nbytes
         self.inits.append(t)
         return name
@@ -281,6 +301,63 @@ def build_onnx(c: Qwen2Config, w: dict[str, np.ndarray], g: _Graph) -> onnx.Mode
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
     model.ir_version = IR_VERSION
     return model
+
+
+def expected_graph(model: Qwen2Model, data_name: str) -> onnx.ModelProto:
+    """`export-onnx` が組むグラフを、重みの値なしで同じ関数（`build_onnx`）から組み直す。
+
+    nodes・入出力・opset・ir_version・小さな定数は export と同一で、重みの initializer は名前・
+    dtype・dims（大きいものは external の location / offset / length）だけを持つ。
+    `verify-onnx` が読んだグラフとの構造照合に使う（`check_structure`）。
+    """
+    return build_onnx(model.config, fused_weights(model, shapes_only=True), _Graph(None, data_name))
+
+
+_CONST_NAME = re.compile(r"c_\d+")  # `_Graph.const` の名前。重みは HF のドット区切り名で衝突しない
+
+
+def _without_weight_values(proto: onnx.ModelProto) -> bytes:
+    """重みの inline 値を除いた正準バイト列（定数と external の位置情報は残す）。"""
+    c = onnx.ModelProto()
+    c.CopyFrom(proto)
+    for t in c.graph.initializer:
+        if t.data_location != TensorProto.EXTERNAL and not _CONST_NAME.fullmatch(t.name):
+            t.ClearField("raw_data")
+    return c.SerializeToString(deterministic=True)
+
+
+def check_structure(proto: onnx.ModelProto, expected: onnx.ModelProto) -> None:
+    """読んだグラフが期待グラフと完全一致するときだけ通す。不一致は 64（REQ-41・REQ-39）。
+
+    任意グラフの実行を許さない: `ReferenceEvaluator` は壁時計を中断できず、Loop・ConstantOfShape・
+    Expand 等で中間テンソルも無制限になるため、実行前に構造（nodes・attributes・入出力・
+    initializer の名前 / dtype / dims・external の位置・opset・ir_version）が export 側の
+    グラフと一致することを要求する。これで計算量と中間テンソルは T と config で上界が決まる
+    （`intermediate_bound`）。子プロセス化はしない: 検証済みバイト列（約 2 GB）の受け渡しが要り、
+    子での再読み込みは照合後の差し替え（TOCTOU）対策と矛盾するため。
+    """
+    if _without_weight_values(proto) != _without_weight_values(expected):
+        raise invalid("model.onnx graph does not match the graph built from the config")
+    for t in proto.graph.initializer:  # 構造は一致済み（dims は小さい）。inline 重みの値長を確認
+        if t.data_location != TensorProto.EXTERNAL and not _CONST_NAME.fullmatch(t.name):
+            if len(t.raw_data) != int(np.prod(t.dims, dtype=np.int64)) * 4:
+                raise invalid("initializer inline data length does not match its dims")
+
+
+#: 照合用プロンプトの長さの上限（`VERIFY_USERS` は数十トークン）。
+MAX_VERIFY_TOKENS = 512
+
+
+def intermediate_bound(c: Qwen2Config, t: int) -> int:
+    """ReferenceEvaluator が保持する中間テンソルの合計の概算上界（byte）。
+
+    evaluator は全ノードの出力を実行終了まで解放しないため、層ごとに最大の隠れ状態系
+    （hidden・MLP の中間幅）を約 40 本、注意スコア（nh×T×T）を約 4 本、加えて logits
+    （T×V）を数える保守的な見積もり。T は照合用プロンプトの長さ（`MAX_VERIFY_TOKENS` 以下）。
+    """
+    wide = max(c.hidden_size, c.intermediate_size)
+    per_layer = 40 * t * wide + 4 * c.num_attention_heads * t * t
+    return 4 * (c.num_hidden_layers * per_layer + 2 * t * c.vocab_size)
 
 
 # --- 集計 --------------------------------------------------------------------------------
@@ -508,13 +585,16 @@ def _external_tensors(
     return found
 
 
-def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.ModelProto:
+def load_verified_onnx(
+    onnx_dir: Path, summary: Any, budget: Budget, expected: onnx.ModelProto
+) -> onnx.ModelProto:
     """sha256 を照合した**同じバイト列**だけから、重みを inline に持つ ModelProto を作る。
 
     REQ-41・REQ-39: ファイルは fd で開いて読み（通常ファイル・symlink・サイズ検証は
     `open_regular` / `read_input`）、パスを開き直さない。照合後に差し替えられても、
     解析に使うのは照合したバイト列だけ。model.onnx.data は 1 回の逐次読みで sha256 を計算しながら
     各 tensor の raw_data へ詰める（全体を別に持たず、同時保持は proto 分＋1 本分）。
+    重みを読む前に `check_structure` で期待グラフと構造照合する（不一致は 64）。
     """
     hashes = _summary_hashes(summary)
     raw = read_input(onnx_dir / "model.onnx", MAX_ONNX_BYTES, "model.onnx")
@@ -525,6 +605,7 @@ def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.Mod
     except Exception:  # protobuf の DecodeError 等。入力値は載せない
         raise invalid("model.onnx is not a valid ONNX model") from None
     del raw
+    check_structure(proto, expected)  # 重みの確保・evaluator 構築の前
     try:
         fd, st = open_regular(onnx_dir / "model.onnx.data", MAX_ONNX_DATA_BYTES, "model.onnx.data")
     except LimitExceededError as exc:
@@ -574,6 +655,19 @@ def load_verified_onnx(onnx_dir: Path, summary: Any, budget: Budget) -> onnx.Mod
     return proto
 
 
+def _checked_logits(outs: list[Any], tokens: int, vocab: int) -> np.ndarray:
+    """出力が logits 1 本・float32・[1, tokens, vocab]・全要素有限であることを確認する（64）。"""
+    got = outs[0] if len(outs) == 1 else None
+    if (
+        not isinstance(got, np.ndarray)
+        or got.dtype != np.float32
+        or got.shape != (1, tokens, vocab)
+        or not np.isfinite(got).all()
+    ):
+        raise invalid("ONNX output is not finite float32 logits of shape [1, T, V]")
+    return got
+
+
 def cmd_verify_onnx(a: argparse.Namespace) -> int:
     """`verify-onnx`: 書き出した ONNX（ReferenceEvaluator）と LoRA 付き MLX の logits を比べる。
 
@@ -601,11 +695,22 @@ def cmd_verify_onnx(a: argparse.Namespace) -> int:
         assets.tok.build_chat_ids(VERIFY_SYSTEM, user, add_generation_prompt=True)
         for user in VERIFY_USERS
     ]
+    if max(len(ids) for ids in ids_list) > MAX_VERIFY_TOKENS:
+        raise invalid("verification prompt is too long")
     wants = [np.array(model(mx.array([ids])), dtype=np.float32) for ids in ids_list]
+    expected = expected_graph(model, "model.onnx.data")
+    vocab, bound = (
+        model.config.vocab_size,
+        intermediate_bound(model.config, max(len(ids) for ids in ids_list)),
+    )
     del model  # MLX の重みを解放してから ONNX を読む（ピークを重ねない）
     mx.clear_cache()
     budget.check()
-    proto = load_verified_onnx(a.onnx_dir, summary, budget)
+    proto = load_verified_onnx(a.onnx_dir, summary, budget, expected)
+    weights_bytes = sum(
+        int(np.prod(t.dims, dtype=np.int64)) * 4 for t in proto.graph.initializer
+    )  # 構造照合済みなので dims は期待どおり
+    check_memory(weights_bytes + bound + (1 << 30), "verify-onnx run")  # 重み + 中間テンソル
     ref = ReferenceEvaluator(proto)
     del proto
     budget.check()
@@ -613,9 +718,10 @@ def cmd_verify_onnx(a: argparse.Namespace) -> int:
     results = []
     for ids, want in zip(ids_list, wants, strict=True):
         run_budget.check()
-        got = ref.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0]
+        outs = ref.run(None, {"input_ids": np.array([ids], dtype=np.int64)})
         run_budget.check()
         budget.check()
+        got = _checked_logits(outs, len(ids), vocab)
         diff = np.abs(want - got)
         am_w, am_g = want.argmax(-1), got.argmax(-1)
         results.append(

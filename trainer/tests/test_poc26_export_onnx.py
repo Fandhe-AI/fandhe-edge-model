@@ -81,7 +81,8 @@ def test_lora_fuse_changes_weights_by_scale_times_ab() -> None:
 
 def test_summary_lists_ops_and_runtime_gaps(tmp_path: Path) -> None:
     """REQ-41: 集計は opset 13・演算数・ランタイム未対応 op・上限超過を返す。"""
-    mp, dp = _export(_lora_model(), tmp_path / "o")
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
     s = summarize(mp, dp)
     assert (s["opset"], s["ir_version"]) == (13, 8)
     assert s["op_counts"]["Softmax"] == 2
@@ -195,6 +196,12 @@ def test_verify_rejects_tampered_onnx(
 # --- 資源予算・照合済みバイトの読み込み・summary 検証（REQ-41・REQ-39） -----------------------
 
 
+def _expected(model: qwen2_model.Qwen2Model) -> onnx.ModelProto:
+    from tools.poc26.export_onnx import expected_graph
+
+    return expected_graph(model, "model.onnx.data")
+
+
 def _summary_for(mp: Path, dp: Path) -> dict:
     import hashlib
 
@@ -253,7 +260,8 @@ def test_verified_load_ignores_swap_after_check(
     from tools.poc26 import export_onnx as ex
     from tools.poc26.common import Budget
 
-    mp, dp = _export(_lora_model(), tmp_path / "o")
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
     summary = _summary_for(mp, dp)
     want = ReferenceEvaluator(onnx.load(str(mp)))  # 差し替え前の正しい結果
     ids = np.arange(5, dtype=np.int64)[None]
@@ -279,7 +287,7 @@ def test_verified_load_ignores_swap_after_check(
     monkeypatch.setattr(ex, "open_regular", open_then_swap)
     monkeypatch.setattr(ex, "read_input", read_then_swap)
     monkeypatch.setattr(onnx, "load", lambda *_a, **_k: pytest.fail("path re-read"))
-    proto = ex.load_verified_onnx(mp.parent, summary, Budget())
+    proto = ex.load_verified_onnx(mp.parent, summary, Budget(), _expected(model))
     assert not any(t.data_location == onnx.TensorProto.EXTERNAL for t in proto.graph.initializer)
     got = ReferenceEvaluator(proto).run(None, {"input_ids": ids})[0]
     np.testing.assert_array_equal(got, expected)
@@ -294,12 +302,13 @@ def test_verified_load_rejects_mismatch(tmp_path: Path, target: str) -> None:
 
     from fandhe_edge_trainer.errors import WorkerError
 
-    mp, dp = _export(_lora_model(), tmp_path / "o")
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
     summary = _summary_for(mp, dp)
     p = mp.parent / target
     p.write_bytes(p.read_bytes() + b"\0")
     with pytest.raises(WorkerError) as ei:
-        load_verified_onnx(mp.parent, summary, Budget())
+        load_verified_onnx(mp.parent, summary, Budget(), _expected(model))
     assert ei.value.exit_code == 64
 
 
@@ -358,15 +367,11 @@ def test_declared_external_ranges_rejected_before_allocation(
 ) -> None:
     """REQ-41・REQ-39: 宣言値が不正なら bytearray を確保する前に 64 で拒否する。"""
     from tools.poc26 import export_onnx as ex
-    from tools.poc26.common import Budget
 
     from fandhe_edge_trainer.errors import WorkerError
 
     mp, dp = _export(_lora_model(), tmp_path / "o")
-    mp.write_bytes(
-        _tamper_tensor(onnx.load(str(mp), load_external_data=False), **kw).SerializeToString()
-    )
-    summary = _summary_for(mp, dp)  # 改ざん後のバイト列で sha256 は一致させる
+    proto = _tamper_tensor(onnx.load(str(mp), load_external_data=False), **kw)
 
     class NoAlloc(bytearray):
         def __init__(self, *a: object) -> None:
@@ -374,14 +379,13 @@ def test_declared_external_ranges_rejected_before_allocation(
 
     monkeypatch.setattr(ex, "bytearray", NoAlloc, raising=False)
     with pytest.raises(WorkerError) as ei:
-        ex.load_verified_onnx(mp.parent, summary, Budget())
+        ex._external_tensors(proto, "model.onnx.data", dp.stat().st_size)
     assert ei.value.exit_code == 64
 
 
 def test_overlapping_external_ranges_rejected(tmp_path: Path) -> None:
     """REQ-41・REQ-39: 範囲が重なる宣言は 64。"""
     from tools.poc26 import export_onnx as ex
-    from tools.poc26.common import Budget
 
     from fandhe_edge_trainer.errors import WorkerError
 
@@ -392,9 +396,8 @@ def test_overlapping_external_ranges_rejected(tmp_path: Path) -> None:
     for e in ext[1].external_data:
         if e.key == "offset":
             e.value = first  # 先頭と同じ位置へ重ねる
-    mp.write_bytes(proto.SerializeToString())
     with pytest.raises(WorkerError) as ei:
-        ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget())
+        ex._external_tensors(proto, "model.onnx.data", dp.stat().st_size)
     assert ei.value.exit_code == 64
 
 
@@ -408,8 +411,109 @@ def test_declared_length_counts_toward_memory_estimate(
     from fandhe_edge_trainer import limits
     from fandhe_edge_trainer.errors import WorkerError
 
-    mp, dp = _export(_lora_model(), tmp_path / "o")
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
     monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1 << 30)  # 1 GiB 固定分だけで超過
     with pytest.raises(WorkerError) as ei:
-        ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget())
+        ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget(), _expected(model))
     assert ei.value.exit_code == 20
+
+
+# --- 構造照合・出力検証（任意グラフの実行を許さない。REQ-41・REQ-39） --------------------------
+
+
+def _rewrite(tmp_path: Path, mutate) -> tuple[Path, dict, qwen2_model.Qwen2Model]:
+    """model.onnx を改変して書き戻し、改変後のバイト列に対する summary を返す。"""
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
+    proto = onnx.load(str(mp), load_external_data=False)
+    mutate(proto)
+    mp.write_bytes(proto.SerializeToString())
+    return mp, _summary_for(mp, dp), model
+
+
+def _add_loop(p: onnx.ModelProto) -> None:
+    p.graph.node.append(onnx.helper.make_node("Loop", ["", "", ""], ["lp"], name="evil"))
+
+
+def _add_constant_of_shape(p: onnx.ModelProto) -> None:
+    p.graph.node.append(onnx.helper.make_node("ConstantOfShape", ["c_1"], ["big"], name="evil"))
+
+
+def _change_attribute(p: onnx.ModelProto) -> None:
+    node = next(n for n in p.graph.node if n.op_type == "Softmax")
+    node.attribute[0].i = 1
+
+
+def _change_dims(p: onnx.ModelProto) -> None:
+    t = next(t for t in p.graph.initializer if t.name == "model.norm.weight")
+    t.dims[0] += 1
+
+
+@pytest.mark.parametrize(
+    "mutate", [_add_loop, _add_constant_of_shape, _change_attribute, _change_dims]
+)
+def test_structure_mismatch_rejected_before_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate
+) -> None:
+    """REQ-41・REQ-39: Loop / ConstantOfShape 追加・attribute / dims 改変は構築前に 64。"""
+    from tools.poc26 import export_onnx as ex
+    from tools.poc26.common import Budget
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    mp, summary, model = _rewrite(tmp_path, mutate)
+    monkeypatch.setattr(
+        ReferenceEvaluator, "__init__", lambda *_a, **_k: pytest.fail("evaluator built")
+    )
+    with pytest.raises(WorkerError) as ei:
+        ex.load_verified_onnx(mp.parent, summary, Budget(), _expected(model))
+    assert ei.value.exit_code == 64
+
+
+def test_unmodified_graph_passes_structure_check(tmp_path: Path) -> None:
+    """REQ-41: 無改変なら構造照合を通り、重みは inline になる（期待グラフは値なしで組んだもの）。"""
+    from tools.poc26.common import Budget
+    from tools.poc26.export_onnx import load_verified_onnx
+
+    model = _lora_model()
+    mp, dp = _export(model, tmp_path / "o")
+    proto = load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget(), _expected(model))
+    assert len(proto.graph.node) > 0
+
+
+@pytest.mark.parametrize(
+    ("outs", "tokens"),
+    [
+        ([np.zeros((1, 1, 300), np.float32)], 5),  # 形状 [1,1,V]（broadcast で通ってしまう形）
+        ([np.full((1, 5, 300), np.nan, np.float32)], 5),  # NaN
+        ([np.full((1, 5, 300), np.inf, np.float32)], 5),
+        ([np.zeros((1, 5, 300), np.float64)], 5),  # dtype
+        ([], 5),  # 出力 0 個
+        ([np.zeros((1, 5, 300), np.float32)] * 2, 5),  # 出力 2 個
+    ],
+)
+def test_output_validation_rejects(outs: list, tokens: int) -> None:
+    """REQ-41・REQ-39: 出力の個数・dtype・形状 [1,T,V]・有限性が違えば 64。"""
+    from tools.poc26.export_onnx import _checked_logits
+
+    from fandhe_edge_trainer.errors import WorkerError
+
+    with pytest.raises(WorkerError) as ei:
+        _checked_logits(outs, tokens, 300)
+    assert ei.value.exit_code == 64
+    ok = np.zeros((1, 5, 300), np.float32)
+    assert _checked_logits([ok], 5, 300) is ok
+
+
+def test_intermediate_bound_concrete_value() -> None:
+    """REQ-39: 中間テンソルの上界は config と T で決まる（具体値）。"""
+    from tools.poc26.export_onnx import intermediate_bound
+
+    cfg = _lora_model().config  # hidden 32?: 値は config から式どおりに計算して固定する
+    wide = max(cfg.hidden_size, cfg.intermediate_size)
+    want = 4 * (
+        cfg.num_hidden_layers * (40 * 7 * wide + 4 * cfg.num_attention_heads * 49)
+        + 2 * 7 * cfg.vocab_size
+    )
+    assert intermediate_bound(cfg, 7) == want > 0
