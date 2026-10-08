@@ -132,7 +132,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 - **ワークフロー系**: create-commit / create-pr / create-issue / create-issue-tree / create-plan / implement-issue / implement-issue-tree / implement-review / implement-review-pr / update-issue-tree / update-docs / comment-code
 - **メンテ系**: init-claude / update-claude / contribute-skill / setup-repo-guards
-- **リファレンス系**: rust / make / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / openai-codex / fandhe-ai / fandhe-backend / fandhe-frontend / fandhe-vector-db
+- **リファレンス系**: rust / make / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / openai-codex / fandhe-ai / fandhe-backend / fandhe-db / fandhe-frontend
 
 ## Conventions
 

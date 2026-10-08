@@ -73,17 +73,17 @@
       "skillPath": "skills/fandhe-backend/SKILL.md",
       "computedHash": "72dd7d7a220a211bfa11e5d005fe1e93cb4e56976ddfa7c18259ab9cbc5133b6"
     },
+    "fandhe-db": {
+      "source": "Fandhe-AI/agent-reference-skills",
+      "sourceType": "github",
+      "skillPath": "skills/fandhe-db/SKILL.md",
+      "computedHash": "3081e4db7711ef2045c48ecba35074df4c9b4c4460d03efe14712f70aeee4051"
+    },
     "fandhe-frontend": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/fandhe-frontend/SKILL.md",
       "computedHash": "243d56a8a152eca60eb03cfef7eaccc0808c8c43cf9a0d700866ef402affe7e3"
-    },
-    "fandhe-vector-db": {
-      "source": "Fandhe-AI/agent-reference-skills",
-      "sourceType": "github",
-      "skillPath": "skills/fandhe-vector-db/SKILL.md",
-      "computedHash": "54f731107ead019182cb43c7957347268c6cf9afd94e6a45930ad546cbabcb46"
     },
     "github-docs": {
       "source": "Fandhe-AI/agent-reference-skills",
