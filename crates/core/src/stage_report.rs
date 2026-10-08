@@ -34,6 +34,8 @@
 
 use serde::Serialize;
 
+use crate::evaluation_record::BaselineComparisonVerdict;
+
 /// CLI の 7 工程（REQ-33。工程順）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -599,6 +601,304 @@ impl SelectReport {
     }
 }
 
+/// 採点入口の `step` 値（固定。7 工程の [`Stage`] には含めない。7 工程の契約外。REQ-41・#445）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScoreStep {
+    ScorePredictions,
+}
+
+/// 採点入口での予測ファイルの役割（REQ-41・#445）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreRole {
+    /// 採点対象。
+    Candidate,
+    /// Holm の族に入れる比較相手。
+    Compare,
+    /// 族に入れず McNemar の生の値だけを出す相手。
+    Reference,
+}
+
+/// ラベル別指標 1 行（分母 0 の指標は `null`。REQ-24）。`label` は定義の選択肢 ID でデータ本文ではない。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScorePerLabel {
+    /// 選択肢 ID。
+    pub label: String,
+    /// 正解ラベルがこのラベルの件数。
+    pub support: u64,
+    /// このラベルと予測した件数。
+    pub predicted_count: u64,
+    /// 真陽性。
+    pub tp: u64,
+    /// 偽陽性。
+    pub fp: u64,
+    /// 偽陰性。
+    #[serde(rename = "fn")]
+    pub fn_: u64,
+    /// 適合率。
+    pub precision: Option<f64>,
+    /// 再現率。
+    pub recall: Option<f64>,
+    /// F1。
+    pub f1: Option<f64>,
+}
+
+/// 混同行列（行＝正解ラベル、列＝選択肢 ID ＋ `invalid`・`abstain`・`error`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScoreConfusionMatrix {
+    labels: Vec<String>,
+    columns: Vec<String>,
+    rows: Vec<Vec<u64>>,
+}
+
+impl ScoreConfusionMatrix {
+    /// 選択肢 ID 列と行から作る。`columns` は選択肢 ID に `invalid`・`abstain`・`error` を足して導く。
+    /// 各行の長さが `labels.len() + 3`、行数が `labels.len()` でなければ `None`。
+    #[must_use]
+    pub fn new(labels: Vec<String>, rows: Vec<Vec<u64>>) -> Option<Self> {
+        let width = labels.len() + 3;
+        if rows.len() != labels.len() || rows.iter().any(|r| r.len() != width) {
+            return None;
+        }
+        let mut columns = labels.clone();
+        columns.extend(["invalid", "abstain", "error"].map(String::from));
+        Some(Self {
+            labels,
+            columns,
+            rows,
+        })
+    }
+}
+
+/// 対 majority の McNemar 結果（`b`＝候補のみ正解、`c`＝majority のみ正解）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ScoreVsMajority {
+    /// 候補だけが正解した件数。
+    pub b: u64,
+    /// 下限基準だけが正解した件数。
+    pub c: u64,
+    /// 両側 p 値。
+    pub p: f64,
+    /// 判定。
+    pub verdict: BaselineComparisonVerdict,
+}
+
+/// 予測ファイル 1 つ分の採点結果。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreCandidate {
+    /// 候補名（P・C1・C3・AR）。
+    pub name: String,
+    /// 役割。
+    pub role: ScoreRole,
+    /// 予測ファイルの sha256（16 進）。
+    pub pred_sha256: String,
+    /// 正解数。
+    pub correct: u64,
+    /// 正解率。
+    pub accuracy: f64,
+    /// 正解率の Wilson 95% 区間 `[下限, 上限]`。
+    pub accuracy_wilson95: [f64; 2],
+    /// Macro-F1（未定義なら `null`）。
+    pub macro_f1: Option<f64>,
+    /// ラベル別指標。
+    pub per_label: Vec<ScorePerLabel>,
+    /// 混同行列。
+    pub confusion_matrix: ScoreConfusionMatrix,
+    /// 対 majority。
+    pub vs_majority: ScoreVsMajority,
+}
+
+/// Holm 補正の比較 1 行。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreHolmComparison {
+    /// 比較相手（`majority` または NAME）。
+    pub against: String,
+    /// 候補だけが正解した件数。
+    pub b: u64,
+    /// 相手だけが正解した件数。
+    pub c: u64,
+    /// 補正前の p 値。
+    pub p_raw: f64,
+    /// Holm 補正後の p 値。
+    pub p_adjusted: f64,
+    /// 判定。
+    pub verdict: BaselineComparisonVerdict,
+}
+
+/// Holm 補正の結果（`m` は族の大きさ）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreHolm {
+    /// 採点対象の NAME。
+    pub candidate: String,
+    /// 族の大きさ。
+    pub m: usize,
+    /// 比較。
+    pub comparisons: Vec<ScoreHolmComparison>,
+}
+
+/// 族に入れない参照相手との McNemar の生の値。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreReference {
+    /// 採点対象の NAME。
+    pub candidate: String,
+    /// 参照相手の NAME。
+    pub against: String,
+    /// 候補だけが正解した件数。
+    pub b: u64,
+    /// 参照相手だけが正解した件数。
+    pub c: u64,
+    /// 補正前の p 値。
+    pub p_raw: f64,
+}
+
+/// PoC-26 の採点入口 `fandhe-edge-score` が exit 0 で返す JSON（REQ-41・REQ-27・#445）。
+///
+/// 7 工程の入出力契約の外（`step:"score_predictions"`）。cli は `serde_json` に依存しないため
+/// 直列化を core に閉じる。ラベル ID は定義の選択肢 ID でありデータ本文ではない
+/// （`majority_label` と同格。オーナー判断 2026-10-08）。フィールドは宣言順に直列化し、
+/// 分母 0 の指標は `null`、非有限の浮動小数も `null`。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreReport {
+    step: ScoreStep,
+    status: StageStatus,
+    seed: u32,
+    evaluation_sha256: String,
+    n_total: u64,
+    required_sample_size: u64,
+    candidates: Vec<ScoreCandidate>,
+    holm: ScoreHolm,
+    references: Vec<ScoreReference>,
+}
+
+impl ScoreReport {
+    /// 採点結果を組み立てる（`status` は常に `ok`）。
+    #[must_use]
+    pub fn new(
+        seed: u32,
+        evaluation_sha256: String,
+        n_total: u64,
+        required_sample_size: u64,
+        candidates: Vec<ScoreCandidate>,
+        holm: ScoreHolm,
+        references: Vec<ScoreReference>,
+    ) -> Self {
+        Self {
+            step: ScoreStep::ScorePredictions,
+            status: StageStatus::Ok,
+            seed,
+            evaluation_sha256,
+            n_total,
+            required_sample_size,
+            candidates,
+            holm,
+            references,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// 予測 1 件の結果（[`PredictionLine`] の入力。評価器の `Outcome` と同じ 4 分類。cli が写す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredictionLineOutcome {
+    /// 選択肢 ID を返した。
+    Label(String),
+    /// 型不正（`ok` かつ `predicted_label:null`）。
+    Invalid,
+    /// 保留。
+    Abstain,
+    /// 実行エラー。
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PredictionLineStatus {
+    Ok,
+    Abstain,
+    Error,
+}
+
+/// 選択肢 ID 順を保つスコアの JSON オブジェクト。
+#[derive(Debug, Clone, PartialEq)]
+struct PredictionScores(Vec<(String, f64)>);
+
+impl Serialize for PredictionScores {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+/// `evaluate` が `evaluation_predictions.jsonl` へ書く 1 行（REQ-27・REQ-41・#445）。
+///
+/// 行形式は `{"id","status","predicted_label","scores"?}`。データ契約層の読み手が評価器の
+/// 4 分類へ戻せる形に限る。`id` は評価データのレコード ID、`predicted_label` は定義の選択肢 ID
+/// （データ本文ではない）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PredictionLine {
+    id: String,
+    status: PredictionLineStatus,
+    predicted_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scores: Option<PredictionScores>,
+}
+
+impl PredictionLine {
+    /// 1 行を作る。`scores` は（選択肢 ID 列, スコア列）で、長さが違う・非有限の値を含むときは
+    /// 出さない（読み手が不正なスコアを不正解に数えるため、壊れた値を書かない）。
+    #[must_use]
+    pub fn new(
+        id: &str,
+        outcome: PredictionLineOutcome,
+        scores: Option<(&[&str], &[f64])>,
+    ) -> Self {
+        let (status, predicted_label) = match outcome {
+            PredictionLineOutcome::Label(l) => (PredictionLineStatus::Ok, Some(l)),
+            PredictionLineOutcome::Invalid => (PredictionLineStatus::Ok, None),
+            PredictionLineOutcome::Abstain => (PredictionLineStatus::Abstain, None),
+            PredictionLineOutcome::Error => (PredictionLineStatus::Error, None),
+        };
+        let scores = scores
+            .filter(|(ids, values)| {
+                ids.len() == values.len() && values.iter().all(|v| v.is_finite())
+            })
+            .map(|(ids, values)| {
+                PredictionScores(
+                    ids.iter()
+                        .map(|k| (*k).to_string())
+                        .zip(values.iter().copied())
+                        .collect(),
+                )
+            });
+        Self {
+            id: id.to_string(),
+            status,
+            predicted_label,
+            scores,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +1153,124 @@ mod tests {
                 .to_json_line()
                 .expect("json"),
             "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}"
+        );
+    }
+
+    /// REQ-27・#445: 予測行の exact JSON（キー順・null・エスケープ・scores 欠落）。
+    #[test]
+    fn req27_prediction_line_json_is_exact() {
+        let line = |id, o, s| PredictionLine::new(id, o, s).to_json_line().expect("json");
+        assert_eq!(
+            line(
+                "a\"1\n",
+                PredictionLineOutcome::Label("x".into()),
+                Some((&["y", "x"], &[0.25, 0.75]))
+            ),
+            r#"{"id":"a\"1\n","status":"ok","predicted_label":"x","scores":{"y":0.25,"x":0.75}}"#
+        );
+        assert_eq!(
+            line("b", PredictionLineOutcome::Abstain, None),
+            r#"{"id":"b","status":"abstain","predicted_label":null}"#
+        );
+        assert_eq!(
+            line("c", PredictionLineOutcome::Error, None),
+            r#"{"id":"c","status":"error","predicted_label":null}"#
+        );
+        assert_eq!(
+            line(
+                "d",
+                PredictionLineOutcome::Invalid,
+                Some((&["x"], &[f64::NAN]))
+            ),
+            r#"{"id":"d","status":"ok","predicted_label":null}"#
+        );
+        assert_eq!(
+            line(
+                "e",
+                PredictionLineOutcome::Invalid,
+                Some((&["x", "y"], &[0.5]))
+            ),
+            r#"{"id":"e","status":"ok","predicted_label":null}"#
+        );
+    }
+
+    /// REQ-41・#445: 採点出力の exact JSON（キー順・`fn` の改名・null・非有限は null）。
+    #[test]
+    fn req41_score_report_json_is_exact() {
+        let matrix = ScoreConfusionMatrix::new(
+            vec!["a\"".into(), "b".into()],
+            vec![vec![1, 0, 0, 0, 0], vec![0, 2, 0, 0, 1]],
+        )
+        .expect("matrix");
+        assert!(ScoreConfusionMatrix::new(vec!["a".into()], vec![vec![1]]).is_none());
+        let candidate = ScoreCandidate {
+            name: "P".into(),
+            role: ScoreRole::Candidate,
+            pred_sha256: "ab".into(),
+            correct: 3,
+            accuracy: 0.75,
+            accuracy_wilson95: [0.5, f64::NAN],
+            macro_f1: None,
+            per_label: vec![ScorePerLabel {
+                label: "a\"".into(),
+                support: 1,
+                predicted_count: 1,
+                tp: 1,
+                fp: 0,
+                fn_: 0,
+                precision: Some(1.5),
+                recall: None,
+                f1: None,
+            }],
+            confusion_matrix: matrix,
+            vs_majority: ScoreVsMajority {
+                b: 2,
+                c: 0,
+                p: 0.5,
+                verdict: BaselineComparisonVerdict::Undeterminable,
+            },
+        };
+        let holm = ScoreHolm {
+            candidate: "P".into(),
+            m: 3,
+            comparisons: vec![ScoreHolmComparison {
+                against: "majority".into(),
+                b: 2,
+                c: 0,
+                p_raw: 0.5,
+                p_adjusted: 0.25,
+                verdict: BaselineComparisonVerdict::SignificantlyBetter,
+            }],
+        };
+        let reference = ScoreReference {
+            candidate: "P".into(),
+            against: "AR".into(),
+            b: 1,
+            c: 2,
+            p_raw: 0.125,
+        };
+        let json = ScoreReport::new(
+            1,
+            "ee".into(),
+            4,
+            30,
+            vec![candidate],
+            holm,
+            vec![reference],
+        )
+        .to_json_line()
+        .expect("json");
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"step":"score_predictions","status":"ok","seed":1,"evaluation_sha256":"ee","n_total":4,"required_sample_size":30,"#,
+                r#""candidates":[{"name":"P","role":"candidate","pred_sha256":"ab","correct":3,"accuracy":0.75,"accuracy_wilson95":[0.5,null],"macro_f1":null,"#,
+                r#""per_label":[{"label":"a\"","support":1,"predicted_count":1,"tp":1,"fp":0,"fn":0,"precision":1.5,"recall":null,"f1":null}],"#,
+                r#""confusion_matrix":{"labels":["a\"","b"],"columns":["a\"","b","invalid","abstain","error"],"rows":[[1,0,0,0,0],[0,2,0,0,1]]},"#,
+                r#""vs_majority":{"b":2,"c":0,"p":0.5,"verdict":"undeterminable"}}],"#,
+                r#""holm":{"candidate":"P","m":3,"comparisons":[{"against":"majority","b":2,"c":0,"p_raw":0.5,"p_adjusted":0.25,"verdict":"significantly_better"}]},"#,
+                r#""references":[{"candidate":"P","against":"AR","b":1,"c":2,"p_raw":0.125}]}"#
+            )
         );
     }
 }
