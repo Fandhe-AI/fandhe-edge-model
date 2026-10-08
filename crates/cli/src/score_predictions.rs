@@ -21,10 +21,11 @@
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
 //! 5. Holm: 採点対象の [対 majority, 対 `--compare` 各相手] を族の大きさ 3 固定で補正（相手が欠けても
 //!    m は 3。事前登録。脱落は保守側）。`--reference` は族に入れず McNemar の生の値だけ出す
-//!    P 以外（C1・C3・AR。`evaluate` が保存した予測）は、予測ファイルが現在の `--project-dir` の
-//!    `candidates/<N>/evaluation_predictions.jsonl` にあり、同じディレクトリの `evaluation_record.json` が
-//!    次をすべて満たすことを必須にする（満たさなければ `invalid_input`。手編集した予測・別プロジェクトや
-//!    別候補の予測を比較相手にできない。#445・REQ-27）。P は評価記録を持たず対象外
+//!    P 以外（C1・C3・AR。`evaluate` が保存した予測）は、予測ファイルが（cwd 配下の）
+//!    `…/candidates/<N>/evaluation_predictions.jsonl` にあり、同じディレクトリの `evaluation_record.json` が
+//!    次をすべて満たすことを必須にする（満たさなければ `invalid_input`。手編集した予測・別の凍結 test や
+//!    別候補の予測を比較相手にできない。#445・REQ-27）。比較対象は採点側（`--project-dir`）の凍結記録と
+//!    定義。予測ファイルは `--project-dir` の外（同じ凍結 test の複製プロジェクト）でもよい（下の運用）。P は評価記録を持たず対象外
 //!    （P の seed・来歴は自己申告のまま。PoC スクリプトの出力は評価記録で束縛できない）
 //!    - `predictions_sha256` が予測ファイルの sha256 と一致
 //!    - `evaluation_sha256`・`evaluation_bytes` が現在の凍結記録と一致
@@ -34,6 +35,14 @@
 //! 6. 台帳: `poc26_score_ledger/<evaluation_sha256>/seed-<seed>/<NAME>.sha256` に予測ファイルの sha256 を
 //!    記録し、採点結果を同じディレクトリの `<採点対象 NAME>.report.json` に保存する（いずれも一時名への
 //!    書き込み・fsync・上書きしない名前替えで原子的に作る。確定は呼び出し期限の内側ではなく [`emit`] が行う）
+//!
+//! # 運用（PoC-26。REQ-27・REQ-41・#445）
+//!
+//! `evaluate` は選定固定により 1 プロジェクト 1 候補しか評価できない。そこで、凍結済み（`register` →
+//! `inspect` 済み）のプロジェクトを学習前に候補×seed ごとに複製し（C1×3・C3×3）、各複製で 1 候補だけ
+//! `train --train-seed` → `select` → `evaluate` を行う。採点は原本プロジェクト 1 か所だけで行い、比較相手は
+//! 複製側の `candidates/<N>/evaluation_predictions.jsonl` を読むだけ（複製を開かず、書かない）。
+//! `--reference AR` の経路は残すが、AR は 7 工程から学習・評価できないため PoC-26 では欠測になる。
 //!
 //! # 1 回限りの担保（REQ-27）
 //!
@@ -81,7 +90,8 @@
 //!   比較相手は同じ sha256 のみ許可される。電源断に対するディレクトリエントリの永続化までは保証しない
 //! - 出力は選択肢数 L の 2 乗に比例する（混同行列）。L は定義の検査で `MAX_OPTIONS`（1024。core の
 //!   `judgment`）以下に限られるため、1 候補あたり約 100 万セル、最大 4 候補で有界
-//! - 台帳は project-dir 単位で、同じ凍結 test でも再 `register` すると別台帳になる
+//! - 台帳は採点を行うプロジェクト（`--project-dir`）単位。採点は原本 1 か所で行う運用で 1 回限りを守る。
+//!   プロジェクトを複製して台帳を空にする操作、再 `register` による別台帳は塞げない
 //!   （`final_test_ledger` と同じ既知の限界。オーナー了承の残余リスク）
 //! - RSS 上限はプロセス内で強制しない（7 工程と同じ）。入力は予測ファイル 1 つ 64 MiB
 //!   （`MAX_PROJECT_FILE_BYTES`）× 最大 4 ファイルと評価データで有界
@@ -351,7 +361,8 @@ struct Loaded<'a> {
 
 /// 評価記録の来歴照合に使う、現在のプロジェクトの値（#445・REQ-27）。
 struct Provenance<'a> {
-    project: &'a Project,
+    /// 予測ファイルと評価記録を cwd 配下へ閉じ込めて開く起点。
+    cwd: &'a Path,
     evaluation_sha256: String,
     evaluation_bytes: u64,
     definition_sha256: String,
@@ -368,38 +379,43 @@ fn expected_candidate_id(name: &str) -> Option<&'static str> {
     }
 }
 
-/// 予測ファイルが現在のプロジェクトの `candidates/<N>/evaluation_predictions.jsonl` にあり、同じ
-/// ディレクトリの評価記録が予測ファイルの sha256・現在の凍結記録・定義・候補に束縛されていることを確認する
-/// （#445・REQ-27。いずれの不一致・欠落も `invalid_input`）。
+/// 予測ファイルが `…/candidates/<N>/evaluation_predictions.jsonl`（`evaluate` の保存先。別プロジェクト
+/// でもよい）にあり、同じディレクトリの評価記録が予測ファイルの sha256・**採点側**（`--project-dir`）の
+/// 凍結記録・定義・候補に束縛されていることを確認する（#445・REQ-27・REQ-41。いずれの不一致・欠落も
+/// `invalid_input`）。
+///
+/// `evaluate` は選定固定により 1 プロジェクト 1 候補しか評価できないため、PoC-26 では候補×seed ごとに
+/// 凍結済みプロジェクトを学習前に複製して評価し、採点は原本 1 か所で行う。比較相手の複製側は
+/// 読むだけで、`Project::open` も書き込みもしない（cwd 配下への閉じ込めで 2 ファイルを開く）。
 fn verify_bound_to_record(
     prov: &Provenance<'_>,
     named: &NamedPath,
     real: &Path,
     sha256: &str,
 ) -> Result<(), ErrorReport> {
-    let outside = || invalid("prediction file is not under the project candidates directory");
-    let rel = real
-        .strip_prefix(prov.project.dir())
-        .map_err(|_| outside())?;
-    let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
-    let [dir, index, file] = parts.as_slice() else {
+    let outside = || invalid("prediction file is not under a candidates directory");
+    let parts: Vec<&str> = real.iter().filter_map(|c| c.to_str()).collect();
+    let [.., dir, index, file] = parts.as_slice() else {
         return Err(outside());
     };
     let index: usize = index.parse().map_err(|_| outside())?;
-    if *dir != CANDIDATES_DIR || *file != EVALUATION_PREDICTIONS_FILE || rel.iter().count() != 3 {
+    if *dir != CANDIDATES_DIR || *file != EVALUATION_PREDICTIONS_FILE {
         return Err(outside());
     }
-    let record_rel = Path::new(CANDIDATES_DIR)
-        .join(index.to_string())
-        .join(EVALUATION_RECORD_FILE);
-    let Some(bytes) = prov
-        .project
-        .read_optional(&record_rel, MAX_EVALUATION_RECORD_BYTES)?
-    else {
-        return Err(invalid(
-            "evaluation record is missing for the prediction file",
-        ));
-    };
+    // 同じディレクトリの評価記録を、予測ファイルと同じく cwd 配下へ閉じ込めて上限付きで読む。
+    let record_path = real.with_file_name(EVALUATION_RECORD_FILE);
+    let missing = || invalid("evaluation record is missing for the prediction file");
+    let (record_file, record_real) =
+        open_confined(prov.cwd, &record_path).map_err(|_| missing())?;
+    if record_real.as_path().parent() != real.parent() {
+        return Err(missing());
+    }
+    let bytes = read_bounded_open_file(
+        record_file,
+        record_real.as_path(),
+        MAX_EVALUATION_RECORD_BYTES,
+    )
+    .map_err(|e| fs_report(&e))?;
     let record = EvaluationRecord::from_json_slice(&bytes)
         .map_err(|_| invalid("evaluation record is malformed"))?;
     if record.predictions_sha256.as_deref() != Some(sha256) {
@@ -412,7 +428,7 @@ fn verify_bound_to_record(
         || record.definition_sha256 != prov.definition_sha256
     {
         return Err(invalid(
-            "evaluation record does not belong to this project state",
+            "evaluation record does not belong to this evaluation data",
         ));
     }
     // 代表構成 ID は `<candidate_id>:seed<N>`。N が `--seed` と一致しなければ別 seed の予測。
@@ -792,7 +808,7 @@ pub(crate) fn run(args: &ScoreArgs, cwd: &Path) -> Result<PendingScore, ErrorRep
     let gold_text = gold_text.as_str();
 
     let prov = Provenance {
-        project: &project,
+        cwd,
         evaluation_sha256: freeze.sha256().to_hex(),
         evaluation_bytes: freeze.byte_len(),
         seed: args.seed,

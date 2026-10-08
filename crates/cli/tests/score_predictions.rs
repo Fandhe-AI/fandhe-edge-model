@@ -158,6 +158,27 @@ impl Env {
         env
     }
 
+    /// 同じ定義・同じデータで別名のプロジェクトを `register` → `inspect` する（同じ凍結 test の複製）。
+    fn register_inspect(&self, proj: &str) {
+        for args in [
+            &[
+                "register",
+                "--definition",
+                "def/definition.json",
+                "--project-dir",
+                proj,
+            ][..],
+            &["inspect", "--project-dir", proj][..],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+                .args(args)
+                .current_dir(&self.work)
+                .output()
+                .expect("run fandhe-edge");
+            assert_eq!(out.status.code(), Some(0), "{args:?}");
+        }
+    }
+
     fn write(&self, name: &str, body: &str) {
         std::fs::write(self.work.join(name), body).expect("write pred");
     }
@@ -666,14 +687,14 @@ fn req27_issue445_provenance_mismatch_is_rejected() {
         env.fails(&args(&["--candidate", &format!("{name}={path}")]), message);
         no_ledger();
     };
-    let mismatch = "evaluation record does not belong to this project state";
+    let mismatch = "evaluation record does not belong to this evaluation data";
 
-    // 別プロジェクト（凍結 test が違う）の記録と予測。
+    // 別プロジェクト（凍結 test が違う）の記録と予測は、そのプロジェクト自身に束縛されていても拒否する。
     std::fs::create_dir_all(env.work.join("other/data")).expect("other");
     std::fs::write(env.work.join("other/data/evaluation.jsonl"), "x\n").expect("eval");
     std::fs::write(env.work.join("other/definition.json"), definition_text()).expect("def");
     let rec = env.rec("other", "c1", 1);
-    check(&env.bound_rec("proj", &rec, &body), "C1", mismatch);
+    check(&env.bound_rec("other", &rec, &body), "C1", mismatch);
 
     // evaluation_sha256・evaluation_bytes・definition_sha256 の個別の改変。
     let mut rec = env.rec("proj", "c1", 1);
@@ -722,12 +743,48 @@ fn req27_issue445_provenance_mismatch_is_rejected() {
         env.work.join("proj/elsewhere/evaluation_record.json"),
     )
     .expect("copy");
-    let outside = "prediction file is not under the project candidates directory";
+    let outside = "prediction file is not under a candidates directory";
     check("proj/elsewhere/evaluation_predictions.jsonl", "C1", outside);
     let bad_name = env.bound("c1", 1, &body);
     let copy = env.work.join("proj/candidates/1/copy.jsonl");
     std::fs::copy(env.work.join(&bad_name), &copy).expect("copy");
     check("proj/candidates/1/copy.jsonl", "C1", outside);
+}
+
+/// REQ-27・REQ-41・#445: 同じ凍結 test の別プロジェクト（`register` → `inspect` 済みの複製）に保存された
+/// 予測は比較相手として受理される（`evaluate` が 1 プロジェクト 1 候補しか評価できないための運用）。
+/// 複製側は読むだけで、台帳は採点側（`proj`）にだけ作られる。cwd の外（`../`）は拒否する。
+#[test]
+fn req27_req41_issue445_sibling_project_with_same_frozen_test_is_accepted() {
+    let env = Env::new("sibling");
+    env.register_inspect("dup");
+    let c1 = env.bound_rec("dup", &env.rec("dup", "c1", 0), &pred_jsonl(pred_a));
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let out = env.ok(&args(&[
+        "--candidate",
+        "P=p.jsonl",
+        "--compare",
+        &format!("C1={c1}"),
+    ]));
+    assert!(
+        out.contains("\"name\":\"C1\",\"role\":\"compare\","),
+        "{out}"
+    );
+    assert!(env.work.join("proj/poc26_score_ledger").is_dir());
+    assert!(!env.work.join("dup/poc26_score_ledger").exists());
+    // cwd の外は拒否する。
+    let outside = env.base.join("outside");
+    std::fs::create_dir_all(outside.join("candidates/0")).expect("outside");
+    std::fs::copy(
+        env.work.join(&c1),
+        outside.join("candidates/0/evaluation_predictions.jsonl"),
+    )
+    .expect("copy");
+    let (code, _) = env.score(&args(&[
+        "--candidate",
+        "C3=../outside/candidates/0/evaluation_predictions.jsonl",
+    ]));
+    assert_eq!(code, 64);
 }
 
 /// REQ-27・#445: 公開 API から `ScoreArgs` を直接組んでも、`run` が事前登録の制限（seed・NAME）を
