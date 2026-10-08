@@ -247,3 +247,79 @@ def test_measure_end_to_end_on_synthetic_model(env: dict, tmp_path: Path) -> Non
     assert "SECRETBODY" not in text
     assert str(tmp_path) not in text
     assert measure.main(argv) == 70  # 既存の out-dir は上書きしない
+
+
+def test_argument_errors_map_to_64_without_values(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-1: 引数エラーは SystemExit(2)＋usage でなく 64 と JSON（値は出さない）。"""
+    assert measure.main(["--bogus", "SECRETVALUE"]) == 64
+    err = json.loads(capsys.readouterr().err)
+    assert err == {
+        "code": "invalid_input",
+        "message": "invalid arguments: the following arguments are required: "
+        "--model-dir, --model-sha256, --config-sha256, --tokenizer-sha256, "
+        "--tokenizer-config-sha256, --adapter-sha256, --definition, --adapter-dir, "
+        "--input, --out-dir, --evidence",
+    }
+    assert measure.main(["--model-sha256", "SECRETVALUE"]) == 64
+    assert "SECRETVALUE" not in capsys.readouterr().err
+
+
+def test_duplicate_conditions_rejected_before_any_child(env: dict, tmp_path: Path) -> None:
+    """P1-2: 条件の重複は子の起動前に 64。out-dir も作らない。"""
+    out = tmp_path / "rec"
+    argv = _argv(env, out, "--conditions", "cpu_bf16", "cpu_bf16")
+    assert measure.main(argv, time_cmd=["/nonexistent"]) == 64
+    assert not out.exists()
+
+
+def test_record_write_failure_is_runtime_error(
+    env: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-3: record の書き込み失敗は traceback でなく 70 とパスなしの JSON。"""
+
+    def fail(*_a, **_k):
+        raise OSError("/secret/path")
+
+    monkeypatch.setattr(measure, "_write_new", fail)
+    argv = _argv(env, tmp_path / "rec", "--conditions", "cpu_bf16")
+    assert measure.main(argv, time_cmd=FAKE_TIME) == 70
+    assert json.loads(capsys.readouterr().err) == {"code": "runtime_error", "message": "OSError"}
+
+
+def test_killpg_lookup_error_keeps_original_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bugbot: 子が既に終了して killpg が ProcessLookupError でも元の超過を MeasureError で返す。"""
+    real = os.killpg
+
+    def gone(pid: int, sig: int) -> None:
+        real(pid, sig)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(measure.os, "killpg", gone)
+    with pytest.raises(measure.MeasureError, match="timed out"):
+        measure.run_child(["/bin/sleep", "30"], 1)
+
+
+def test_keyboard_interrupt_stops_remaining_conditions_but_keeps_record(
+    env: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bugbot: 中断は残りの条件を実行せず、成功済みの記録を残して KeyboardInterrupt を再送出。"""
+    real = measure.run_child
+    calls: list[int] = []
+
+    def flaky(cmd: list[str], timeout: int) -> str:
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return real(cmd, timeout)
+
+    monkeypatch.setattr(measure, "run_child", flaky)
+    out = tmp_path / "rec"
+    argv = _argv(env, out, "--conditions", "cpu_bf16", "gpu_bf16")
+    with pytest.raises(KeyboardInterrupt):
+        measure.main(argv, time_cmd=FAKE_TIME)
+    assert len(calls) == 2
+    conds = json.loads((out / "record.json").read_text())["conditions"]
+    assert list(conds) == ["cpu_bf16"]
+    assert conds["cpu_bf16"]["status"] == "ok"

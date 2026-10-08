@@ -159,7 +159,10 @@ def run_child(cmd: list[str], timeout: int) -> str:
         try:
             proc.wait(timeout=timeout)
         except BaseException as exc:
-            os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # 子が既に終了。元の例外（中断・超過）を置き換えない
             proc.wait()
             if isinstance(exc, subprocess.TimeoutExpired):
                 raise MeasureError("predict timed out") from None
@@ -228,9 +231,23 @@ def _sha_arg(v: str) -> str:
     return v
 
 
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # type: ignore[override]
+        """引数エラーは引数名だけを JSON に出し（値は出さない）、終了コード 64 にする。
+
+        `tools/poc26/cli.py` の `_Parser` と同じ作法（SystemExit(2)＋usage にしない）。
+        """
+        m = re.match(r"(argument [^:]+|the following arguments are required: .*)", message)
+        raise _ArgError(f"invalid arguments: {m.group(1) if m else 'see usage'}")
+
+
+class _ArgError(Exception):
+    """引数不正（終了コード 64）。"""
+
+
 def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> int:
     """全条件を直列に測定し、record.json・record.md を書く。失敗は 70、引数不正は 64。"""
-    ap = argparse.ArgumentParser(prog="measure", allow_abbrev=False)
+    ap = _Parser(prog="measure", allow_abbrev=False)
     ap.add_argument("--model-dir", type=Path, required=True)
     for f in ("model", "config", "tokenizer", "tokenizer-config", "adapter"):
         ap.add_argument(f"--{f}-sha256", type=_sha_arg, required=True)
@@ -245,14 +262,19 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
     ap.add_argument("--max-seq-length", type=int, default=512)
     ap.add_argument("--timeout-seconds", type=int, default=5400)
     ap.add_argument("--conditions", nargs="+", choices=list(CONDITIONS), default=list(CONDITIONS))
-    a = ap.parse_args(argv)
+    try:
+        a = ap.parse_args(argv)
+        if len(set(a.conditions)) != len(a.conditions):
+            raise _ArgError("invalid arguments: --conditions must not repeat a condition")
+    except _ArgError as exc:
+        print(json.dumps({"code": "invalid_input", "message": str(exc)}), file=sys.stderr)
+        return 64
     # 相対パスは子（cwd が trainer/）でも同じ場所を指すよう絶対化する
     for f in ("model_dir", "definition", "adapter_dir", "input", "onnx_dir"):
         v = getattr(a, f)
         setattr(a, f, None if v is None else v.resolve())
     a.out_dir = a.out_dir.parent.resolve() / a.out_dir.name
     conds: dict[str, Any] = {}
-    cap: dict[str, Any] | None = None
     failed = False
     try:
         if os.path.lexists(a.out_dir) or not a.out_dir.parent.is_dir():
@@ -261,6 +283,12 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
         os.mkdir(a.out_dir, 0o700)
         os.chmod(a.out_dir, 0o700)  # umask に依らず 0700
         cls = classify(a.evidence, a.quiet_machine)
+    except (MeasureError, OSError) as exc:
+        msg = str(exc) if isinstance(exc, MeasureError) else type(exc).__name__
+        print(json.dumps({"code": "runtime_error", "message": msg}), file=sys.stderr)
+        return 70
+    interrupted: BaseException | None = None
+    try:
         for name in a.conditions:
             device, dtype = CONDITIONS[name]
             out = a.out_dir / name
@@ -292,24 +320,30 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
                 failed = True
                 code = str(exc) if isinstance(exc, MeasureError) else type(exc).__name__
                 conds[name] = {"status": "error", "code": code}
-    except (MeasureError, OSError) as exc:
-        msg = str(exc) if isinstance(exc, MeasureError) else type(exc).__name__
-        print(json.dumps({"code": "runtime_error", "message": msg}), file=sys.stderr)
-        return 70
-    finally:
-        # 中断（Ctrl-C 等）でも成功済みの条件を record に残す。out-dir を作る前の失敗では書かない
-        if cap is not None and a.out_dir.is_dir() and conds:
-            rec = {
-                "schema": "poc26-measure/1",
-                "requirements": ["REQ-41", "TASK-41.1-8", "#393"],
-                "quiet_machine_declared": a.quiet_machine,
-                "capacity": cap,
-                "conditions": conds,
-                "jev_reference": {**JEV_REFERENCE, "note": "E2E vs inference-only: not comparable"},
-            }
+    except BaseException as exc:  # 中断でも成功済みの記録を書いてから再送出する
+        interrupted = exc
+    rc = 70 if failed else 0
+    if conds:
+        rec = {
+            "schema": "poc26-measure/1",
+            "requirements": ["REQ-41", "TASK-41.1-8", "#393"],
+            "quiet_machine_declared": a.quiet_machine,
+            "capacity": cap,
+            "conditions": conds,
+            "jev_reference": {**JEV_REFERENCE, "note": "E2E vs inference-only: not comparable"},
+        }
+        try:
             _write_new(a.out_dir, "record.json", json.dumps(rec, indent=2, allow_nan=False) + "\n")
             _write_new(a.out_dir, "record.md", render_md(rec))
-    return 70 if failed else 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(
+                json.dumps({"code": "runtime_error", "message": type(exc).__name__}),
+                file=sys.stderr,
+            )
+            rc = 70
+    if interrupted is not None:
+        raise interrupted
+    return rc
 
 
 if __name__ == "__main__":
