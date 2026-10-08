@@ -83,6 +83,9 @@ pub const PACKAGE_DIR: &str = "package";
 pub const PACKAGE_STAGING_DIR: &str = "package.staging";
 /// 候補ディレクトリ内の学習リクエスト（`select` が結果の再検証に使う）。
 pub const REQUEST_FILE: &str = "request.json";
+/// `train --train-seed` で学習 seed を上書きした候補だけに置く、実際に使った seed の記録
+/// （10 進数の u32。省略時は作らず、下流は `split.json` の seed を使う。REQ-17・REQ-41）。
+pub const TRAIN_SEED_FILE: &str = "train_seed.txt";
 /// 候補ディレクトリ内の学習結果。
 pub const RESULT_FILE: &str = "result.json";
 /// 候補ディレクトリ内の trainer 形式の学習データ。

@@ -801,6 +801,7 @@ mod tests {
                 project_dir: p(),
                 candidate: 0,
                 smoke: false,
+                train_seed: None,
             }),
             Command::Evaluate(EvaluateArgs {
                 project_dir: p(),

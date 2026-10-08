@@ -709,6 +709,128 @@ mod suite {
         env.ok(&["package", "--project-dir", "proj"]);
     }
 
+    /// REQ-17・REQ-41: `train --train-seed 1` は学習リクエストと `train_seed.txt` に 1 を残し、`split.json`
+    /// （seed 42）は変えない。`select`・`package` は記録した seed で通る。省略時は従来どおり split の seed
+    /// （42）で `train_seed.txt` を作らない。不正値（負数・範囲外・非数）は `invalid_input`（64）で何も作らない。
+    pub fn train_seed_override_is_recorded_and_split_is_unchanged() {
+        let env = inspected("trainseed");
+        let split_path = env.project_file("split.json");
+        let split_before = std::fs::read(&split_path).expect("split.json");
+        for bad in ["-1", "4294967296", "abc"] {
+            env.fails(
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "0",
+                    "--train-seed",
+                    bad,
+                ],
+                64,
+                "invalid_input",
+            );
+            assert!(!env.project_file("candidates").exists(), "{bad}");
+        }
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--train-seed",
+            "1",
+        ]);
+        let request = std::fs::read_to_string(env.project_file("candidates/0/request.json"))
+            .expect("request");
+        assert!(
+            request.contains("\"seed\":1,") || request.contains("\"seed\":1}"),
+            "{request}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.project_file("candidates/0/train_seed.txt")).expect("seed"),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read(&split_path).expect("split.json"),
+            split_before
+        );
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&["package", "--project-dir", "proj"]);
+    }
+
+    /// REQ-17・REQ-41: `--train-seed 1` で学習した候補を `select` → `evaluate`（評価データあり）まで通し、
+    /// 評価記録の config ID が `c3:seed1` になる。
+    pub fn train_seed_override_reaches_evaluation_record() {
+        let env = eval_env_until(
+            "trainseedevl",
+            &[
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "0",
+                    "--train-seed",
+                    "1",
+                ],
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "1",
+                    "--train-seed",
+                    "1",
+                ],
+            ],
+        );
+        env.ok(&SELECT);
+        env.ok(&EVALUATE_1);
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        assert!(record.contains("\"config_id\":\"c3:seed1\""), "{record}");
+    }
+
+    /// REQ-27・REQ-39: `train_seed.txt` を `1`→`2` に書き換えると `select` は request 不一致で止まる。
+    /// 正準形でない内容（`+1`・`abc`・範囲外・空・末尾改行・先頭ゼロ）は記録不正で `invalid_input`。
+    pub fn train_seed_record_tamper_is_rejected() {
+        let env = inspected("trainseedtamper");
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--train-seed",
+            "1",
+        ]);
+        let path = env.project_file("candidates/0/train_seed.txt");
+        std::fs::write(&path, "2").expect("tamper");
+        assert_eq!(
+            env.fails(&SELECT, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n"
+        );
+        let invalid = "{\"code\":\"invalid_input\",\"message\":\"train seed record is invalid\"}\n";
+        for bad in ["+1", "abc", "4294967296", "", "1\n", "01"] {
+            std::fs::write(&path, bad).expect("tamper");
+            assert_eq!(env.fails(&SELECT, 64, "invalid_input"), invalid, "{bad:?}");
+        }
+        std::fs::write(&path, "1").expect("restore");
+        env.ok(&SELECT);
+    }
+
+    /// REQ-17: `--train-seed` 省略時は split の seed（42）がリクエストに入り、`train_seed.txt` は作らない。
+    pub fn train_seed_default_uses_split_seed() {
+        let env = inspected("trainseeddef");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let request = std::fs::read_to_string(env.project_file("candidates/0/request.json"))
+            .expect("request");
+        assert!(request.contains("\"seed\":42"), "{request}");
+        assert!(!env.project_file("candidates/0/train_seed.txt").exists());
+    }
+
     /// REQ-39: データに異常（重複 id 等）があると inspect が停止し、分割記録を残さない。
     pub fn inspect_rejects_invalid_records() {
         let env = Env::new("badrecords", false);
@@ -2792,6 +2914,22 @@ fn main() -> std::process::ExitCode {
         (
             "train_failure_cleans_candidate_dir_and_allows_retry",
             suite::train_failure_cleans_candidate_dir_and_allows_retry,
+        ),
+        (
+            "train_seed_override_is_recorded_and_split_is_unchanged",
+            suite::train_seed_override_is_recorded_and_split_is_unchanged,
+        ),
+        (
+            "train_seed_override_reaches_evaluation_record",
+            suite::train_seed_override_reaches_evaluation_record,
+        ),
+        (
+            "train_seed_record_tamper_is_rejected",
+            suite::train_seed_record_tamper_is_rejected,
+        ),
+        (
+            "train_seed_default_uses_split_seed",
+            suite::train_seed_default_uses_split_seed,
         ),
         (
             "inspect_seed_is_recorded_and_used_by_train",
