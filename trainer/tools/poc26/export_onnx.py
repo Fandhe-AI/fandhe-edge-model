@@ -726,10 +726,10 @@ def cmd_verify_onnx(a: argparse.Namespace) -> int:
     ref = ReferenceEvaluator(proto)
     del proto
     budget.check()
-    run_budget = Budget(wall_limit=a.max_score_seconds)
     results = []
     for ids, want in zip(ids_list, wants, strict=True):
-        run_budget.check()
+        # --max-score-seconds は 1 件あたりの上限なので件ごとに計り直す（全体の天井は budget）
+        run_budget = Budget(wall_limit=a.max_score_seconds)
         outs = ref.run(None, {"input_ids": np.array([ids], dtype=np.int64)})
         run_budget.check()
         budget.check()
