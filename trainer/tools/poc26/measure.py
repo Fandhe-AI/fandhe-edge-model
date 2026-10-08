@@ -24,10 +24,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from tools.poc26.common import SHA_RE
+from tools.poc26.common import MAX_WALL_SECONDS_CAP, SHA_RE
 
 MB = 1_000_000  # 容量は 10 進 MB（オーナー確定 2026-10-08）
 CAPACITY_TARGET_MB = 40
@@ -241,6 +242,30 @@ class _Parser(argparse.ArgumentParser):
         raise _ArgError(f"invalid arguments: {m.group(1) if m else 'see usage'}")
 
 
+class _Terminated(BaseException):
+    """SIGTERM・SIGHUP の受信（KeyboardInterrupt と同じく子を止め、成功済みの記録を残す）。"""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextmanager
+def terminate_as_exception():
+    """測定中だけ SIGTERM・SIGHUP を `_Terminated` に変え、抜けるときハンドラを元に戻す。"""
+
+    def handler(signum: int, _frame: Any) -> None:
+        raise _Terminated(signum)
+
+    sigs = (signal.SIGTERM, signal.SIGHUP)
+    prev = [signal.signal(sg, handler) for sg in sigs]
+    try:
+        yield
+    finally:
+        for sg, h in zip(sigs, prev, strict=True):
+            signal.signal(sg, h)
+
+
 class _ArgError(Exception):
     """引数不正（終了コード 64）。"""
 
@@ -266,6 +291,10 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
         a = ap.parse_args(argv)
         if len(set(a.conditions)) != len(a.conditions):
             raise _ArgError("invalid arguments: --conditions must not repeat a condition")
+        if not 1 <= a.timeout_seconds <= MAX_WALL_SECONDS_CAP:
+            raise _ArgError(
+                f"invalid arguments: --timeout-seconds out of range: 1..{MAX_WALL_SECONDS_CAP}"
+            )
     except _ArgError as exc:
         print(json.dumps({"code": "invalid_input", "message": str(exc)}), file=sys.stderr)
         return 64
@@ -289,37 +318,38 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
         return 70
     interrupted: BaseException | None = None
     try:
-        for name in a.conditions:
-            device, dtype = CONDITIONS[name]
-            out = a.out_dir / name
-            cmd = [
-                *(TIME_CMD if time_cmd is None else time_cmd),
-                sys.executable, "-m", "tools.poc26.lora_poc", "predict",
-                "--model-dir", str(a.model_dir),
-                "--model-sha256", a.model_sha256,
-                "--config-sha256", a.config_sha256,
-                "--tokenizer-sha256", a.tokenizer_sha256,
-                "--tokenizer-config-sha256", a.tokenizer_config_sha256,
-                "--definition", str(a.definition),
-                "--adapter-dir", str(a.adapter_dir),
-                "--adapter-sha256", a.adapter_sha256,
-                "--input", str(a.input),
-                "--out-dir", str(out),
-                "--device", device, "--dtype", dtype,
-                "--evidence", a.evidence,
-                "--max-seq-length", str(a.max_seq_length),
-                "--warmup", str(a.warmup),
-            ]  # fmt: skip
-            try:
-                load = os.getloadavg()[0]
-                err = run_child(cmd, a.timeout_seconds)
-                run = json.loads((out / "run.json").read_text(encoding="utf-8"))
-                conds[name] = {"status": "ok", **summarize(run, parse_time_l(err), cls, load)}
-            except (MeasureError, OSError, KeyError, ValueError) as exc:
-                # 条件ごとに失敗を記録して続行する（成功済みの条件は残す）。型名・固定文言だけ
-                failed = True
-                code = str(exc) if isinstance(exc, MeasureError) else type(exc).__name__
-                conds[name] = {"status": "error", "code": code}
+        with terminate_as_exception():
+            for name in a.conditions:
+                device, dtype = CONDITIONS[name]
+                out = a.out_dir / name
+                cmd = [
+                    *(TIME_CMD if time_cmd is None else time_cmd),
+                    sys.executable, "-m", "tools.poc26.lora_poc", "predict",
+                    "--model-dir", str(a.model_dir),
+                    "--model-sha256", a.model_sha256,
+                    "--config-sha256", a.config_sha256,
+                    "--tokenizer-sha256", a.tokenizer_sha256,
+                    "--tokenizer-config-sha256", a.tokenizer_config_sha256,
+                    "--definition", str(a.definition),
+                    "--adapter-dir", str(a.adapter_dir),
+                    "--adapter-sha256", a.adapter_sha256,
+                    "--input", str(a.input),
+                    "--out-dir", str(out),
+                    "--device", device, "--dtype", dtype,
+                    "--evidence", a.evidence,
+                    "--max-seq-length", str(a.max_seq_length),
+                    "--warmup", str(a.warmup),
+                ]  # fmt: skip
+                try:
+                    load = os.getloadavg()[0]
+                    err = run_child(cmd, a.timeout_seconds)
+                    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+                    conds[name] = {"status": "ok", **summarize(run, parse_time_l(err), cls, load)}
+                except (MeasureError, OSError, KeyError, ValueError) as exc:
+                    # 条件ごとに失敗を記録して続行する（成功済みの条件は残す）。型名・固定文言だけ
+                    failed = True
+                    code = str(exc) if isinstance(exc, MeasureError) else type(exc).__name__
+                    conds[name] = {"status": "error", "code": code}
     except BaseException as exc:  # 中断でも成功済みの記録を書いてから再送出する
         interrupted = exc
     rc = 70 if failed else 0
@@ -341,6 +371,8 @@ def main(argv: list[str] | None = None, time_cmd: list[str] | None = None) -> in
                 file=sys.stderr,
             )
             rc = 70
+    if isinstance(interrupted, _Terminated):
+        return 128 + interrupted.signum  # 記録は書いた。非ゼロで終える（シェル慣習）
     if interrupted is not None:
         raise interrupted
     return rc

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -323,3 +325,69 @@ def test_keyboard_interrupt_stops_remaining_conditions_but_keeps_record(
     conds = json.loads((out / "record.json").read_text())["conditions"]
     assert list(conds) == ["cpu_bf16"]
     assert conds["cpu_bf16"]["status"] == "ok"
+
+
+def test_sigterm_kills_child_group_and_restores_handlers() -> None:
+    """codex P1: SIGTERM で子グループを止めて _Terminated を出し、ハンドラを元に戻す。"""
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    pids: list[int] = []
+    real = subprocess.Popen
+
+    class Spy(real):  # type: ignore[valid-type, misc]
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            pids.append(self.pid)
+
+    timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGHUP))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(measure.subprocess, "Popen", Spy)
+
+        def run() -> None:
+            with measure.terminate_as_exception():
+                timer.start()
+                measure.run_child(["/bin/sleep", "30"], 60)
+
+        with pytest.raises(measure._Terminated) as ei:
+            run()
+    assert ei.value.signum == signal.SIGHUP
+    with pytest.raises(ProcessLookupError):
+        os.kill(pids[0], 0)
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
+
+
+def test_sigterm_stops_remaining_conditions_and_keeps_record(
+    env: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex P1: 2 条件目の最中の SIGTERM は 143 で終え、成功済み（cpu_bf16）の記録を残す。"""
+    real = measure.run_child
+    calls: list[int] = []
+
+    def term(cmd: list[str], timeout: int) -> str:
+        calls.append(1)
+        if len(calls) == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real(cmd, timeout)
+
+    monkeypatch.setattr(measure, "run_child", term)
+    out = tmp_path / "rec"
+    argv = _argv(env, out, "--conditions", "cpu_bf16", "gpu_bf16")
+    assert measure.main(argv, time_cmd=FAKE_TIME) == 143
+    assert len(calls) == 2
+    conds = json.loads((out / "record.json").read_text())["conditions"]
+    assert list(conds) == ["cpu_bf16"]
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "86401", "99999999999999999999"])
+def test_timeout_seconds_is_range_checked_before_anything_runs(
+    env: dict, tmp_path: Path, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """codex P1: --timeout-seconds は 1..86400 のみ。範囲外は 64 で、out-dir も作らない。"""
+    out = tmp_path / "rec"
+    argv = _argv(env, out, "--timeout-seconds", value)
+    assert measure.main(argv, time_cmd=["/nonexistent"]) == 64
+    assert json.loads(capsys.readouterr().err) == {
+        "code": "invalid_input",
+        "message": "invalid arguments: --timeout-seconds out of range: 1..86400",
+    }
+    assert not out.exists()
