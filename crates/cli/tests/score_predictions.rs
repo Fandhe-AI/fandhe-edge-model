@@ -420,19 +420,31 @@ fn req23_stops_on_duplicate_id_and_malformed_json() {
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
 
-/// REQ-23: pred に行が無い id は不正解（エラー）として分母に数える。
+/// REQ-27・#445: 空・1 件欠け・余分な id の予測ファイルは `invalid_input` で止まり、台帳も report.json も
+/// 作られない（適用権を消費しない）。その後に正しいファイルで採点できる。invalid / error の行は
+/// 欠落ではなく不正解として数える（既存の扱い）。
 #[test]
-fn req23_missing_prediction_counts_as_wrong() {
-    let env = Env::new("missing");
-    // 最後の 10 件（gamma）の行を欠落させる。
-    let body: String = pred_jsonl(|i| Some(gold_of(i)))
-        .lines()
-        .take(N_EVAL - 10)
-        .map(|l| format!("{l}\n"))
-        .collect();
-    env.write("p.jsonl", &body);
+fn req27_issue445_incomplete_prediction_file_is_rejected_without_consuming_ledger() {
+    let env = Env::new("incomplete");
+    let full = pred_jsonl(|i| Some(gold_of(i)));
+    let msg = "prediction file must contain every evaluation id exactly once for P";
+    let missing_one: String = full.lines().skip(1).map(|l| format!("{l}\n")).collect();
+    let extra = format!(
+        "{full}{}\n",
+        r#"{"id":"not-in-gold","status":"ok","predicted_label":"alpha","scores":{"alpha":1.0}}"#
+    );
+    for body in ["", missing_one.as_str(), extra.as_str()] {
+        env.write("p.jsonl", body);
+        env.fails(&args(&["--candidate", "P=p.jsonl"]), msg);
+        assert!(!env.work.join("proj/poc26_score_ledger").exists());
+    }
+    env.write("p.jsonl", &full);
     let out = env.ok(&args(&["--candidate", "P=p.jsonl"]));
-    assert!(out.contains("\"n_total\":300,"), "{out}");
+    assert!(out.contains("\"n_total\":300,\"required"), "{out}");
+    // 予測の失敗（status:error）は欠落ではなく不正解。
+    let env = Env::new("incomplete-error");
+    env.write("p.jsonl", &pred_jsonl(|i| (i >= 10).then_some(gold_of(i))));
+    let out = env.ok(&args(&["--candidate", "P=p.jsonl"]));
     assert!(out.contains("\"correct\":290,"), "{out}");
 }
 

@@ -16,7 +16,7 @@
 //!    評価データが無ければ `invalid_input`（`skipped` にはしない。採点対象が無いため）
 //! 2. 評価対象は `evaluate` と共有のデコード（`evaluation_records`。矛盾入力も除外しない）から作り、各予測を
 //!    `prepare_evaluation_input` へ通す（id 重複・欠落・不正 JSON は停止。不正な `scores` は
-//!    不正解）。全予測で評価対象の id 列が一致することを確認
+//!    不正解。評価対象の id の欠け・余分・空ファイルは停止し、台帳を消費しない）。全予測で評価対象の id 列が一致することを確認
 //! 3. majority は train 分割のラベルだけから作る（[`majority_from_train`]。`evaluate` と同じ関数）
 //! 4. 各予測: 正解率・Macro-F1・ラベル別・混同行列・Wilson 95% 区間・対 majority の McNemar
 //! 5. Holm: 採点対象の [対 majority, 対 `--compare` 各相手] を族の大きさ 3 固定で補正（相手が欠けても
@@ -506,6 +506,18 @@ fn load_prediction<'a>(
             stop.code()
         ))
     })?;
+    // 評価対象の全 id をちょうど 1 回ずつ含むこと（欠け・余分は停止。空も拒否）。予測の失敗（invalid・
+    // abstain・error の行）は不正解として数える既存の扱いのままで、欠落とは区別する。台帳の確定
+    // （適用権の消費）より前の検査のため、不完全なファイルで 1 回限りの枠を失わない（REQ-27・#445）。
+    // id の重複は `prepare_evaluation_input` が停止し、欠けは `pred_line == None`、余分は行数の超過で分かる。
+    let pred_rows = text.lines().filter(|l| !l.trim().is_empty()).count();
+    if outcome.active.iter().any(|row| row.pred_line.is_none()) || pred_rows != outcome.active.len()
+    {
+        return Err(invalid(&format!(
+            "prediction file must contain every evaluation id exactly once for {}",
+            named.name
+        )));
+    }
     let mut loaded = Loaded {
         role,
         named,
