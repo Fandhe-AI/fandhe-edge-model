@@ -113,8 +113,8 @@ use crate::error_report::{
 use crate::infer_batch::judgment_from_prediction;
 use crate::prediction_lines::prediction_line;
 use crate::project::{
-    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, Project, SELECTION_FILE, fail,
-    inspect_bytes, invalid, runtime,
+    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project,
+    SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -235,6 +235,9 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     if eval_ids.len() != decoded.len() {
         return Err(runtime("evaluation record count mismatch"));
     }
+    // 予測ファイルの大きさの上界も適用権を取る前に確認する（採点側の読み込み上限と同じ定数。#445）。
+    let option_ids: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
+    check_predictions_limit(&eval_ids, &option_ids, MAX_PROJECT_FILE_BYTES)?;
     // 推論ごとのスコア（保存用。推論関数の戻り値の型は変えず、横で受ける）。
     let scores_log: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
     // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
@@ -510,9 +513,8 @@ fn finalize_evaluation(
     .ok_or_else(|| runtime("cannot build evaluation report"))?;
 
     // 予測ファイルの本文を先に作り、そのバイト列の sha256 を評価記録へ束縛する（#445・REQ-27）。
-    let predictions_jsonl = predictions
-        .to_jsonl(&labels, &applied.output)
-        .ok_or_else(|| runtime("cannot build evaluation predictions"))?;
+    let predictions_jsonl =
+        predictions.to_jsonl(&labels, &applied.output, MAX_PROJECT_FILE_BYTES)?;
     let record = EvaluationRecord {
         candidate_index: candidate,
         candidate_id: target.candidate_id.clone(),
@@ -557,18 +559,55 @@ struct PredictionsSink<'a> {
 }
 
 impl PredictionsSink<'_> {
-    /// 評価データの行順の JSONL を作る。id・予測の件数が合わなければ `None`。
-    fn to_jsonl(&self, labels: &[&str], outcomes: &[Outcome]) -> Option<String> {
+    /// 評価データの行順の JSONL を作る。id・予測の件数が合わなければ `runtime_error`、構築中に `limit`
+    /// バイトを超えたら打ち切って `limit_exceeded`。
+    fn to_jsonl(
+        &self,
+        labels: &[&str],
+        outcomes: &[Outcome],
+        limit: u64,
+    ) -> Result<String, ErrorReport> {
         if self.ids.len() != outcomes.len() {
-            return None;
+            return Err(runtime("cannot build evaluation predictions"));
         }
         let mut out = String::new();
         for (i, (id, outcome)) in self.ids.iter().zip(outcomes).enumerate() {
             let scores = self.scores.get(i).map(|s| (labels, s.as_slice()));
             out.push_str(&prediction_line(id, outcome, scores));
             out.push('\n');
+            if u64::try_from(out.len()).map_or(true, |n| n > limit) {
+                return Err(predictions_limit_error());
+            }
         }
-        Some(out)
+        Ok(out)
+    }
+}
+
+fn predictions_limit_error() -> ErrorReport {
+    fail(
+        ExitCode::LimitExceeded,
+        "evaluation predictions exceed size limit",
+    )
+}
+
+/// 予測ファイルの大きさの上界（件数 × (固定部 + id の最大長 + 全ラベル ID 長の合計 + ラベルごとの固定部。
+/// JSON エスケープで最大 6 倍）が `limit` 以下であることを確認する。超えれば `limit_exceeded`
+/// （適用権を取る前に呼ぶ。#445・REQ-39）。
+fn check_predictions_limit(ids: &[String], labels: &[&str], limit: u64) -> Result<(), ErrorReport> {
+    let escaped = |n: usize| (n as u64).saturating_mul(6);
+    let max_id = ids.iter().map(String::len).max().unwrap_or(0);
+    let max_label = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    let per_label_sum: u64 = labels
+        .iter()
+        .map(|l| escaped(l.len()).saturating_add(40))
+        .fold(0, u64::saturating_add);
+    let per_line = 128u64
+        .saturating_add(escaped(max_id))
+        .saturating_add(escaped(max_label))
+        .saturating_add(per_label_sum);
+    match (ids.len() as u64).checked_mul(per_line) {
+        Some(bound) if bound <= limit => Ok(()),
+        _ => Err(predictions_limit_error()),
     }
 }
 
@@ -720,6 +759,36 @@ const PLACEHOLDER_ID: &str = "evaluation";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39・#445: 予測ファイルの上界（2 件 × (128 + 6×2 + 6×1 + 2×(6+40)) = 476）が上限を超えると、
+    /// 適用権を取る前の確認が `limit_exceeded` になる。ちょうど上限なら通る。
+    #[test]
+    fn req39_issue445_predictions_upper_bound_is_checked_against_limit() {
+        let ids = vec!["e1".to_string(), "e2".to_string()];
+        let labels = ["a", "b"];
+        assert!(check_predictions_limit(&ids, &labels, 476).is_ok());
+        let err = check_predictions_limit(&ids, &labels, 475).expect_err("over");
+        assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
+    /// REQ-39・#445: 予測行の構築中に上限を超えたら打ち切って `limit_exceeded`。
+    #[test]
+    fn req39_issue445_predictions_building_stops_at_limit() {
+        let ids = vec!["e1".to_string(), "e2".to_string()];
+        let sink = PredictionsSink {
+            rel: Path::new("x"),
+            ids: &ids,
+            scores: &[],
+        };
+        let outcomes = [Outcome::Label("a".into()), Outcome::Label("b".into())];
+        let one_line = sink.to_jsonl(&["a", "b"], &outcomes, 1 << 20).expect("ok");
+        let first_len = one_line.find('\n').expect("nl") as u64 + 1;
+        assert!(sink.to_jsonl(&["a", "b"], &outcomes, first_len * 2).is_ok());
+        let err = sink
+            .to_jsonl(&["a", "b"], &outcomes, first_len * 2 - 1)
+            .expect_err("over");
+        assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
 
     const DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#;
 
