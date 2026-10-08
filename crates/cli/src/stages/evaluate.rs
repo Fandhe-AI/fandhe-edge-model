@@ -535,6 +535,9 @@ fn finalize_evaluation(
         return Err(runtime("evaluation record is too large"));
     }
     // 1 件ごとの予測を先に書く（記録があるのに予測が無い状態を作らない）。失敗は記録の失敗と同じ扱い。
+    // この時点で適用権は取得済み（ロックは消費され、`finish` が失敗しても残る）で、再実行は
+    // `AlreadyApplied` で拒否される（fail-closed）。以降の失敗で予測ファイルだけが残っても、
+    // 凍結 test に適用した痕跡として消さない（REQ-27。eval の `apply_once_then` の doc も参照）。
     project.write_new(predictions.rel, predictions_jsonl.as_bytes())?;
     // 書いた後は読み取り専用にする（凍結データの配置と同じ扱い。改ざんの抑止であり、
     // 記録の封印は外部台帳〔#168〕の範囲）。
