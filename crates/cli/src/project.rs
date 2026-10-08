@@ -308,7 +308,7 @@ impl Project {
     /// 同じディレクトリの一時名 `.tmp-<ファイル名>-<pid>` へ書いて fsync し、保持 fd 起点の
     /// `NOREPLACE` の名前替えで `rel` に置く。書き込み途中でプロセスが終了しても残るのは一時名だけで、
     /// `rel` の名前は塞がれない（`write_new` は途中終了で 0 バイト／部分的な `rel` を残す。
-    /// REQ-27・REQ-39）。一時名の残骸は同じ pid の次回実行が先に消すほか、他の読み取りは見ない。
+    /// REQ-27・REQ-39）。一時名の残骸は [`Project::remove_tmp_files`] で消せ、他の読み取りは見ない。
     /// ディレクトリエントリ自体の fsync は行わない（電源断までは保証しない。プロセス終了に対する原子性）。
     ///
     /// # Errors
@@ -323,22 +323,47 @@ impl Project {
         tmp_name.push(format!("-{}", std::process::id()));
         let tmp = rel.with_file_name(tmp_name);
         self.remove_file_if_exists(&tmp)?;
-        self.write_new(&tmp, bytes)?;
-        let published = self
-            .open_file(&tmp)
-            .and_then(|(f, _)| {
-                f.sync_all()
-                    .map_err(|_| runtime("cannot write project file"))
+        let mut file = self
+            .package
+            .create_new_member(&tmp)
+            .map_err(|e| write_rejection(&e, "file already exists", "cannot write project file"))?;
+        // 書いた fd のまま fsync する（開き直さない）。
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|_| runtime("cannot write project file"));
+        drop(file);
+        let published = written.and_then(|()| {
+            self.package.rename_member(&tmp, rel).map_err(|e| {
+                write_rejection(&e, "file already exists", "cannot write project file")
             })
-            .and_then(|()| {
-                self.package.rename_member(&tmp, rel).map_err(|e| {
-                    write_rejection(&e, "file already exists", "cannot write project file")
-                })
-            });
+        });
         if published.is_err() {
             let _ = self.package.remove_file_member(&tmp);
         }
         published
+    }
+
+    /// ディレクトリ `dir` 直下の `.tmp-*`（[`Project::publish_new_file`] の途中終了の残骸）をすべて消す。
+    /// 呼び出し側が排他ロックを持ち、他の書き手がいないことを前提にする（pid を問わない）。
+    ///
+    /// # Errors
+    /// 列挙・削除の失敗は `runtime_error`。
+    pub fn remove_tmp_files(&self, dir: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let dir = dir.as_ref();
+        let names = self
+            .package
+            .open_subdir(dir)
+            .map_err(|e| e.to_error_report())?
+            .list_entry_names(1024)
+            .map_err(|_| runtime("cannot list project directory"))?;
+        for name in names {
+            if name.to_string_lossy().starts_with(".tmp-") {
+                self.remove_file_if_exists(dir.join(name))?;
+            }
+        }
+        Ok(())
     }
 
     /// 既存ファイルを読み取り専用（0400）にする（開いた fd への `fchmod`。パスを開き直さない）。

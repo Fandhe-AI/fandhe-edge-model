@@ -457,7 +457,7 @@ fn req27_ledger_enforces_single_application() {
     assert!(ledger_file(&env, 0, "C1").is_file());
     // 結果は台帳と同じディレクトリに保存され、出力 JSON と一致する。再実行の拒否 message にその
     // project 相対パスが入る（stdout が失敗しても結果を取り戻せる。REQ-27）。
-    let report = ledger_file(&env, 0, "C1.report.json");
+    let report = ledger_file(&env, 0, "C1").with_file_name("C1.report.json");
     let rel = report
         .strip_prefix(env.work.join("proj"))
         .expect("under project");
@@ -863,7 +863,12 @@ fn req27_issue445_concurrent_scoring_of_same_bytes_applies_once() {
                     };
                     barrier.wait();
                     match run(&args, work) {
-                        Ok(_) => true,
+                        Ok(pending) => {
+                            // 台帳の確定は emit 側の commit。ロックを保持したまま確定して解放する。
+                            let line = pending.report_line().expect("line");
+                            pending.commit(&line).expect("commit");
+                            true
+                        }
                         Err(e) => {
                             assert_eq!(e.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
                             false
