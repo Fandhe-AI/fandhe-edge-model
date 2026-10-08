@@ -405,6 +405,21 @@ impl Project {
         Ok(self.path(rel))
     }
 
+    /// ディレクトリを作る。既に（通常の）ディレクトリがあれば許容する（`exists` → 作成の競合を避ける。
+    /// symlink・非ディレクトリが先にあれば従来どおり拒否する）。
+    ///
+    /// # Errors
+    /// [`Project::create_dir`] と同じ（既存が通常のディレクトリのときを除く）。
+    pub fn ensure_dir(&self, rel: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let rel = rel.as_ref();
+        match self.create_dir(rel) {
+            Ok(_) => Ok(()),
+            // `symlink_metadata` は symlink を追従しないため、symlink は `is_dir` が偽になる。
+            Err(_) if std::fs::symlink_metadata(self.path(rel)).is_ok_and(|m| m.is_dir()) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// [`Project::create_dir`] と同じくディレクトリを新規作成し、fd を保持したハンドルも返す
     /// （失敗時に [`Project::remove_created_dir`] で同一の実体だけを片付けるため）。
     ///

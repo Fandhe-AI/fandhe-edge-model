@@ -521,6 +521,19 @@ fn check_ledger<'a>(
     seed: u32,
     loaded: &'a [Loaded<'_>],
 ) -> Result<Vec<&'a Loaded<'a>>, ErrorReport> {
+    // 今回の入力同士で同じ sha256 が別 NAME に使われていないこと（未記録の相手と同じ予測を
+    // 採点対象にして別名での再採点を迂回させない）。
+    for (i, a) in loaded.iter().enumerate() {
+        if loaded
+            .iter()
+            .skip(i + 1)
+            .any(|b| b.sha256 == a.sha256 && b.named.name != a.named.name)
+        {
+            return Err(invalid(
+                "the same prediction file is used under more than one name",
+            ));
+        }
+    }
     let mut to_write = Vec::new();
     for l in loaded {
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
@@ -564,9 +577,7 @@ fn write_ledger(
     let by_eval = root.join(eval_sha);
     let by_seed = ledger_dir(eval_sha, seed);
     for d in [root, by_eval.as_path(), by_seed.as_path()] {
-        if !project.exists(d)? {
-            project.create_dir(d)?;
-        }
+        project.ensure_dir(d)?;
     }
     let ordered = to_write
         .iter()

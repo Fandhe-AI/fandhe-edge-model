@@ -717,3 +717,45 @@ fn req27_issue445_run_revalidates_public_args() {
     assert!(run(&dup, &env.work).is_err());
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
+
+/// REQ-27・#445: 未記録の相手（`--compare`）と同じバイト列を別 NAME の採点対象にすると、台帳の書き込み前に
+/// 拒否され、台帳が作られない。
+#[test]
+fn req27_issue445_same_bytes_in_one_invocation_under_two_names_is_rejected() {
+    let env = Env::new("samebytes");
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
+    env.write("p.jsonl", &pred_jsonl(pred_a));
+    env.fails(
+        &args(&["--candidate", "P=p.jsonl", "--compare", &format!("C1={c1}")]),
+        "the same prediction file is used under more than one name",
+    );
+    assert!(!env.work.join("proj/poc26_score_ledger").exists());
+}
+
+/// REQ-27・#445: 台帳ディレクトリが既にある状態でも採点できる。symlink が先にあれば拒否する。
+#[test]
+fn req27_issue445_existing_ledger_dir_is_tolerated_but_symlink_is_rejected() {
+    let env = Env::new("ledgerdir");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    std::fs::create_dir(env.work.join("proj/poc26_score_ledger")).expect("mkdir");
+    env.ok(&args(&["--candidate", "P=p.jsonl"]));
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
+    env.ok(&args(&["--candidate", &format!("C1={c1}")]));
+
+    let env = Env::new("ledgersym");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    std::fs::create_dir(env.base.join("elsewhere")).expect("mkdir");
+    std::os::unix::fs::symlink(
+        env.base.join("elsewhere"),
+        env.work.join("proj/poc26_score_ledger"),
+    )
+    .expect("symlink");
+    let (code, stdout) = env.score(&args(&["--candidate", "P=p.jsonl"]));
+    assert_eq!(code, 64, "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(env.base.join("elsewhere"))
+            .expect("read")
+            .count(),
+        0
+    );
+}
