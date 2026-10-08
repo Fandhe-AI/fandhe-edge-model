@@ -107,6 +107,8 @@ def cmd_predict(a: argparse.Namespace) -> int:
         raise invalid("adapter was trained with a different system prompt")
     ctx = build_prompting(assets, system, label_order, assets.config.vocab_size, a.max_seq_length)
     records, in_sha = load_records(a.input, labels=None, what="input data")
+    if not 0 <= a.warmup < len(records):  # モデル読み込み前に弾く（統計が空になる指定）
+        raise invalid("warmup must be at least 0 and less than the number of records")
     prompts = prepare_prompts(ctx, records, budget)
     model, sha, size = load_base_model(a.model_dir, to_dtype(a.dtype), pins_from_args(a))
     if cfg["base_model_sha256"] != sha:
@@ -119,7 +121,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
         raise invalid("adapter was trained with a different config / tokenizer")
     attach_adapter(model, cfg, weights)
     pred, raw, stats = score_records(
-        model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds)
+        model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds), warmup=a.warmup
     )
     run = common_run(a, assets.hashes, sha, size)
     run.update(
@@ -133,6 +135,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
             "scoring": stats,
             "elapsed_seconds": budget.elapsed(),
             "max_rss_bytes": max_rss_bytes(),
+            "mlx_peak_memory_bytes": int(mx.get_peak_memory()),  # #393 の併記用
         }
     )
     with OutputDir(a.out_dir) as out:

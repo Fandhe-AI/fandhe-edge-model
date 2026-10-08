@@ -211,13 +211,19 @@ def score_records(
     records: list[Record],
     prompts: list[list[int]],
     budget: Budget,
+    warmup: int = 0,
 ) -> tuple[list[str], list[str], dict[str, Any]]:
     """各レコードを採点し、`pred.jsonl`・`raw_scores.jsonl` の行と採点時間の統計を返す。
 
     `prompts` は `prepare_prompts` で検査済みのもの。対応づけと予測レコードの組み立ては既存の
     対応づけ (b)（`map_scores_to_choice`・`build_prediction_record`）に委ねる。非有限の対数尤度は
     `status:"error"`（`scores` なし）になり、`raw_scores.jsonl` では null で記録する。
+
+    `warmup` 件（先頭から）は予測・raw には出すが採点時間の統計から除く（#393 の p95 測定。除外件数
+    は `warmup_excluded` に記録）。統計の対象が 0 件になる指定は 64。既定 0 は従来の挙動。
     """
+    if not 0 <= warmup < len(records):
+        raise invalid("warmup must be at least 0 and less than the number of records")
     choice_ids = {x: [b + 1 for b in x.encode("utf-8")] for x in ctx.label_order}
     model.eval()
     pred, raw, secs = [], [], []
@@ -242,8 +248,10 @@ def score_records(
                 separators=(",", ":"),
             )
         )
+    secs = secs[warmup:]
     stats = {
         "count": len(secs),
+        "warmup_excluded": warmup,
         "total_seconds": sum(secs),
         "mean_seconds": sum(secs) / len(secs),
         "p95_seconds": p95(secs),

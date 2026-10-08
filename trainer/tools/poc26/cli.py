@@ -125,6 +125,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adapter-dir", type=Path, required=True)
     p.add_argument("--adapter-sha256", type=_sha_arg, required=True)  # 学習時に記録した値
     p.add_argument("--input", type=Path, required=True)
+    # 先頭 N 件を採点時間の統計から除く（#393 のウォームアップ。既定 0 は従来どおり）
+    p.add_argument("--warmup", type=int, default=0)
     p.set_defaults(func=cmd_predict)
 
     # ONNX 書き出し可否の確認（#392）。MLX は常に CPU・float32 で動かす
@@ -170,6 +172,8 @@ def _validate(a: argparse.Namespace) -> None:
         _range("max-wall-seconds", a.max_wall_seconds, 1, MAX_WALL_SECONDS_CAP)
     if hasattr(a, "max_score_seconds"):
         _range("max-score-seconds", a.max_score_seconds, 1, MAX_WALL_SECONDS_CAP)
+    if a.command == "predict":
+        _range("warmup", a.warmup, 0, MAX_ITERS)
     if a.command == "compare-probe":
         _range("atol", a.atol, 0.0, 1e6)
 
