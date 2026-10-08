@@ -105,6 +105,11 @@ pub struct EvaluationRecord {
     /// 欄の無い古い記録はそのまま読める。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_comparison: Option<BaselineComparisonRecord>,
+    /// 同じディレクトリの `evaluation_predictions.jsonl` のバイト列の sha256（hex。#445・REQ-27）。
+    /// PoC-26 の採点入口が予測ファイルの手編集を検出するために照合する。欄の無い古い記録は
+    /// そのまま読める（その場合、採点入口は拒否する）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictions_sha256: Option<String>,
 }
 
 impl EvaluationRecord {
@@ -144,6 +149,7 @@ mod tests {
             correct: 7,
             total: 12,
             baseline_comparison: None,
+            predictions_sha256: None,
         }
     }
 
@@ -207,6 +213,20 @@ mod tests {
         assert!(text.ends_with(
             ",\"baseline_comparison\":{\"majority_label\":\"alpha\",\"baseline_correct\":5,\"b\":3,\"c\":1,\"required_n\":221,\"verdict\":\"undeterminable\"}}\n"
         ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+
+    /// REQ-27・#445: 予測ファイルの sha256 は末尾に完全一致で直列化され、往復できる。
+    #[test]
+    fn req27_issue445_predictions_sha256_round_trips_with_exact_json() {
+        let mut record = sample();
+        record.predictions_sha256 = Some("e".repeat(64));
+        let bytes = record.to_json_vec().expect("json");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.ends_with(&format!(
+            ",\"predictions_sha256\":\"{}\"}}\n",
+            "e".repeat(64)
+        )));
         assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
     }
 
@@ -274,6 +294,7 @@ mod tests {
                 required_n: u64::MAX,
                 verdict: BaselineComparisonVerdict::NotSignificantlyBetter,
             }),
+            predictions_sha256: Some("e".repeat(64)),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
         assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");

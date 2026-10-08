@@ -793,6 +793,73 @@ mod suite {
         assert!(record.contains("\"config_id\":\"c3:seed1\""), "{record}");
     }
 
+    /// REQ-27・REQ-41・#445: PoC-26 の運用。凍結済みプロジェクトを学習前に候補ごとに複製し（C1 を候補 0、
+    /// C3 を候補 1）、各複製で 1 候補だけ `train --train-seed` → `select` → `evaluate` する。採点は原本から
+    /// `--candidate P --compare C1 --compare C3` で行え、複製側は読むだけ（台帳は原本にだけ作られる）。
+    /// 学習ワーカーは偽物（実 trainer は不要）。
+    pub fn poc26_clones_are_scored_from_the_original() {
+        let env = eval_env_until("poc26clones", &[]);
+        for (name, index) in [("c1proj", "0"), ("c3proj", "1")] {
+            copy_dir(
+                &env.project_file(""),
+                &env.project_file(&format!("../{name}")),
+            );
+            env.ok(&[
+                "train",
+                "--project-dir",
+                name,
+                "--candidate",
+                index,
+                "--train-seed",
+                "1",
+            ]);
+            env.ok(&["select", "--project-dir", name]);
+            env.ok(&["evaluate", "--project-dir", name, "--candidate", index]);
+        }
+        let c1 = "c1proj/candidates/0/evaluation_predictions.jsonl";
+        let c3 = "c3proj/candidates/1/evaluation_predictions.jsonl";
+        std::fs::copy(env.work.join(c3), env.work.join("p.jsonl")).expect("p");
+        let scored = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "1",
+                "--candidate",
+                "P=p.jsonl",
+                "--compare",
+                &format!("C1={c1}"),
+                "--compare",
+                &format!("C3={c3}"),
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        let out = String::from_utf8(scored.stdout).expect("utf8");
+        assert_eq!(scored.status.code(), Some(0), "{out}");
+        assert!(out.contains("\"n_total\":12,"), "{out}");
+        assert!(out.contains("{\"against\":\"C1\","), "{out}");
+        assert!(out.contains("{\"against\":\"C3\","), "{out}");
+        assert!(env.project_file("poc26_score_ledger").is_dir());
+        assert!(!env.work.join("c1proj/poc26_score_ledger").exists());
+    }
+
+    /// ディレクトリを再帰的に複製する（権限を保つ。テスト用）。
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+        std::fs::set_permissions(to, std::fs::metadata(from).expect("meta").permissions())
+            .expect("chmod");
+    }
+
     /// REQ-27・REQ-39: `train_seed.txt` を `1`→`2` に書き換えると `select` は request 不一致で止まる。
     /// 正準形でない内容（`+1`・`abc`・範囲外・空・末尾改行・先頭ゼロ）は記録不正で `invalid_input`。
     pub fn train_seed_record_tamper_is_rejected() {
@@ -1281,6 +1348,151 @@ mod suite {
             );
         }
         assert!(record.contains("\"config_id\":\"c3:seed42\""), "{record}");
+    }
+
+    /// REQ-27・REQ-41・#445: `evaluate` は評価データの 1 件ごとの予測を `evaluation_predictions.jsonl` へ
+    /// 保存する。件数・id の順・予測ラベルが評価データ・`correct` と整合し、2 行目以降も同じ形式。
+    pub fn evaluate_saves_per_record_predictions() {
+        // 学習 seed を 1 にして学習する（採点入口は事前登録の seed {0,1,2} だけを受ける。#455）。
+        let env = eval_env_until(
+            "evalpreds",
+            &[
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "0",
+                    "--train-seed",
+                    "1",
+                ],
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "1",
+                    "--train-seed",
+                    "1",
+                ],
+            ],
+        );
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+        let text =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_predictions.jsonl"))
+                .expect("predictions");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 12, "{text}");
+        let mut matched = 0.0;
+        let mut index = 0;
+        for i in 0..4 {
+            for l in LABELS {
+                let line = lines[index];
+                index += 1;
+                let prefix =
+                    format!("{{\"id\":\"e-{l}-{i}\",\"status\":\"ok\",\"predicted_label\":\"");
+                assert!(line.starts_with(&prefix), "{line}");
+                if line[prefix.len()..].starts_with(&format!("{l}\"")) {
+                    matched += 1.0;
+                }
+                assert!(line.contains("\"scores\":{\"alpha\":"), "{line}");
+            }
+        }
+        assert_eq!(
+            number_field(&out, "correct").to_bits(),
+            f64::to_bits(matched)
+        );
+        // 既存なら上書きしない（評価記録と同じく 1 回限り）。
+        env.fails(&EVALUATE_1, 64, "invalid_input");
+        // 評価記録の `predictions_sha256` は予測ファイルの実 sha256（#445・REQ-27）。
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        let preds_sha = file_sha256(&env, "candidates/1/evaluation_predictions.jsonl");
+        assert!(
+            record.ends_with(&format!(",\"predictions_sha256\":\"{preds_sha}\"}}\n")),
+            "{record}"
+        );
+        // 評価記録の seed（1）と違う `--seed` の採点は、来歴照合で拒否される。
+        let rejected_seed = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "2",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        assert_eq!(rejected_seed.status.code(), Some(64));
+        // 保存した予測は PoC-26 の採点入口（`fandhe-edge-score`）でそのまま読め、`evaluate` と同じ正解数になる。
+        let scored = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "1",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        let scored = String::from_utf8(scored.stdout).expect("utf8");
+        assert!(scored.contains("\"n_total\":12,"), "{scored}");
+        assert_eq!(
+            number_field(&scored, "correct").to_bits(),
+            f64::to_bits(matched),
+            "{scored}"
+        );
+        // 予測ファイルを 1 バイト変える（0400 を外す）と、評価記録の sha256 と合わず拒否される。
+        let pred_file = env.project_file("candidates/1/evaluation_predictions.jsonl");
+        let mut perm = std::fs::metadata(&pred_file).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(&pred_file, perm).expect("chmod");
+        let mut bytes = std::fs::read(&pred_file).expect("read");
+        bytes[0] = b'[';
+        std::fs::write(&pred_file, bytes).expect("tamper");
+        let rejected = Command::new(env!("CARGO_BIN_EXE_fandhe-edge-score"))
+            .args([
+                "--project-dir",
+                "proj",
+                "--seed",
+                "1",
+                "--candidate",
+                "C3=proj/candidates/1/evaluation_predictions.jsonl",
+            ])
+            .current_dir(&env.work)
+            .output()
+            .expect("run fandhe-edge-score");
+        assert_eq!(rejected.status.code(), Some(64));
+        assert!(
+            String::from_utf8(rejected.stdout)
+                .expect("utf8")
+                .contains("prediction file does not match the evaluation record"),
+        );
+    }
+
+    /// REQ-27・#445: `evaluation_predictions.jsonl` が先に置かれていると、適用権を取る前に 64 で止まる。
+    /// 取り除けばそのまま評価でき（適用権は未消費）、書いた予測ファイルは読み取り専用（0400）になる。
+    pub fn evaluate_stops_before_acquiring_when_predictions_exist() {
+        let env = eval_trained("evalpreplaced");
+        env.ok(&SELECT);
+        let preplaced = env.project_file("candidates/1/evaluation_predictions.jsonl");
+        std::fs::write(&preplaced, "x\n").expect("preplace");
+        assert_eq!(
+            env.fails(&EVALUATE_1, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate has already been evaluated on the frozen data\"}\n"
+        );
+        std::fs::remove_file(&preplaced).expect("remove");
+        env.ok(&EVALUATE_1);
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&preplaced).expect("meta").permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o400);
     }
 
     /// REQ-28・REQ-27: 評価の `correct` は、同じ入力を配布パッケージへ `infer --input-file` した
@@ -1949,7 +2161,11 @@ mod suite {
         assert!(!stdout.contains("baseline"), "{stdout}");
         let record = evaluation_record(&env);
         assert!(!record.contains("baseline_comparison"), "{record}");
-        assert!(record.ends_with("\"total\":12}\n"), "{record}");
+        // 末尾は予測ファイルの sha256 束縛（#445）。比較欄は無い。
+        assert!(
+            record.contains("\"total\":12,\"predictions_sha256\":\""),
+            "{record}"
+        );
         env.ok(&PACKAGE);
     }
 
@@ -2784,6 +3000,14 @@ fn main() -> std::process::ExitCode {
             suite::evaluate_keeps_model_and_evaluation_hashes,
         ),
         (
+            "evaluate_saves_per_record_predictions",
+            suite::evaluate_saves_per_record_predictions,
+        ),
+        (
+            "evaluate_stops_before_acquiring_when_predictions_exist",
+            suite::evaluate_stops_before_acquiring_when_predictions_exist,
+        ),
+        (
             "evaluate_correct_matches_infer_on_package",
             suite::evaluate_correct_matches_infer_on_package,
         ),
@@ -2922,6 +3146,10 @@ fn main() -> std::process::ExitCode {
         (
             "train_seed_override_reaches_evaluation_record",
             suite::train_seed_override_reaches_evaluation_record,
+        ),
+        (
+            "poc26_clones_are_scored_from_the_original",
+            suite::poc26_clones_are_scored_from_the_original,
         ),
         (
             "train_seed_record_tamper_is_rejected",

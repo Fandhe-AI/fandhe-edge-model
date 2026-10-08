@@ -52,6 +52,14 @@
 //! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
 //! 台帳は完了状態にならず（適用権のロックのみが残る）、記録の無い完了を作らない（REQ-27）。
 //!
+//! # 1 件ごとの予測の保存（REQ-27・REQ-41・#445）
+//!
+//! 評価記録と同じ候補ディレクトリへ `evaluation_predictions.jsonl`（評価データの行順。
+//! `{id,status,predicted_label,scores}`。[`PredictionLine`]）を新規に書く（既存なら適用権を取る前に
+//! `invalid_input`）。PoC-26 の採点入口（`fandhe-edge-score`）が、他候補の予測と同じ形式で読む。
+//! stdout の JSON・[`EvaluationRecord`] のスキーマは変えない。書き込みは評価記録と同じ位置
+//! （台帳への完了記録の前）で行い、失敗時の扱いも同じ。
+//!
 //! # 選定との順序（REQ-27）
 //!
 //! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
@@ -69,6 +77,7 @@
 //! majority は train 分割のラベルだけから作り、必要件数は定義の仮定から求める。どちらも適用権を取る前に
 //! 確定する（[`super::baseline::prepare_baseline`]）。欄が無い定義では比較しない。
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::Instant;
 
@@ -78,8 +87,11 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::limits::INFER_TIME_LIMIT;
-use fandhe_edge_core::stage_report::{EvaluateCompletedReport, EvaluateReport};
+use fandhe_edge_core::stage_report::{
+    EvaluateCompletedReport, EvaluateReport, PredictionLine, PredictionLineOutcome,
+};
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
+use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
@@ -103,7 +115,8 @@ use crate::error_report::{
 };
 use crate::infer_batch::judgment_from_prediction;
 use crate::project::{
-    EVALUATION_RECORD_FILE, Project, SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
+    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project,
+    SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -214,7 +227,21 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         definition.options().len(),
     )?;
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
-    decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    let decoded = decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
+    // 1 件ごとの予測の保存用に id を控える（`decode_evaluation` と同じ検査・同じ行順。推論側には渡さない）。
+    let eval_ids: Vec<String> = inspect_bytes(&eval_bytes, &definition)?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    // 予測行の件数照合は適用権を取る前に済ませる（保存の失敗で適用権を失わない）。
+    if eval_ids.len() != decoded.len() {
+        return Err(runtime("evaluation record count mismatch"));
+    }
+    // 予測ファイルの大きさの上界も適用権を取る前に確認する（採点側の読み込み上限と同じ定数。#445）。
+    let option_ids: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
+    check_predictions_limit(&eval_ids, &option_ids, MAX_PROJECT_FILE_BYTES)?;
+    // 推論ごとのスコア（保存用。推論関数の戻り値の型は変えず、横で受ける）。
+    let scores_log: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
     // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
     // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
     let baseline = prepare_baseline(&definition, &records, &split)?;
@@ -241,21 +268,36 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .ledger()
         .pin_selection(&freeze.sha256(), &target.config_id, &selection_sha256)
         .map_err(|e| acquire_error_report(&e))?;
+    // 1 件ごとの予測ファイルも、適用権を取る前に不在を確認する（書けないことで適用権を失わない）。
+    // 台帳の選定固定より後に置く（選定不一致の拒否を優先する既存の挙動を変えない）。
+    let predictions_rel = candidate_rel(args.candidate).join(EVALUATION_PREDICTIONS_FILE);
+    if project.exists(&predictions_rel)? {
+        return Err(invalid(
+            "candidate has already been evaluated on the frozen data",
+        ));
+    }
 
     // 指標の算出・評価記録の書き込みは、台帳へ完了を記録する前（`finish`）に済ませる。失敗しても
     // 台帳は完了状態にならず、記録の無い完了（台帳だけが完了）を作らない（REQ-27）。
     let mut finish_error: Option<ErrorReport> = None;
     let finish = |applied: &AppliedOnce<Vec<Outcome>>| -> Result<EvaluateCompletedReport, EvalPredictFailure> {
         finalize_evaluation(
-            &project,
-            &definition,
-            &freeze,
-            &target,
-            args.candidate,
-            &record_rel,
-            definition_sha256,
-            onnx_digest,
-            baseline.as_ref(),
+            FinalizeContext {
+                project: &project,
+                definition: &definition,
+                freeze: &freeze,
+                target: &target,
+                candidate: args.candidate,
+                record_rel: &record_rel,
+                definition_sha256,
+                onnx_digest,
+                baseline: baseline.as_ref(),
+            },
+            &PredictionsSink {
+                rel: &predictions_rel,
+                ids: &eval_ids,
+                scores: &scores_log.borrow(),
+            },
             applied,
         )
         .map_err(|e| {
@@ -265,11 +307,14 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     };
     let (_applied, report) = match apply_to_frozen_data(
         held_ledger.ledger(),
-        &freeze,
-        &definition,
-        &eval_bytes,
-        &target,
-        onnx_digest,
+        FrozenApplication {
+            freeze: &freeze,
+            definition: &definition,
+            eval_bytes: &eval_bytes,
+            target: &target,
+            onnx_digest,
+            scores_log: &scores_log,
+        },
         finish,
     ) {
         Ok(v) => v,
@@ -379,7 +424,7 @@ fn check_candidate_artifact(
 
 /// 評価データの分解の失敗（本文・行番号を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvalDecodeError {
+pub(crate) enum EvalDecodeError {
     /// 検査で異常があった・0 件。
     Invalid,
     /// 件数が上限を超えた。
@@ -398,14 +443,16 @@ impl ToErrorReport for EvalDecodeError {
     }
 }
 
-/// 照合済みの評価データのバイト列を、`input` と正解ラベルへ分ける。
+/// 照合済みの評価データのバイト列を、評価対象のレコード列へ検査して分ける（`evaluate` と採点入口
+/// `fandhe-edge-score` が共有する唯一のデコード経路。評価対象の件数・順序・ID が両者で食い違わない。
+/// REQ-27・#445）。
 ///
 /// 件数は推論バッチの上限（[`MAX_INFER_BATCH_LEN`]）までとし、0 件は拒否する
 /// （`evaluate_single_select` が適用後に失敗しないよう、適用前の事前検査にも使う。REQ-39）。
-fn decode_evaluation(
+pub(crate) fn evaluation_records(
     bytes: &[u8],
     definition: &Definition,
-) -> Result<Vec<LabeledInput>, EvalDecodeError> {
+) -> Result<Vec<ValidRecord>, EvalDecodeError> {
     let records = inspect_bytes(bytes, definition).map_err(|_| EvalDecodeError::Invalid)?;
     if records.is_empty() {
         return Err(EvalDecodeError::Invalid);
@@ -413,7 +460,15 @@ fn decode_evaluation(
     if records.len() > MAX_INFER_BATCH_LEN {
         return Err(EvalDecodeError::TooMany);
     }
-    Ok(records
+    Ok(records)
+}
+
+/// 照合済みの評価データのバイト列を、`input` と正解ラベルへ分ける（[`evaluation_records`] の薄い写像）。
+fn decode_evaluation(
+    bytes: &[u8],
+    definition: &Definition,
+) -> Result<Vec<LabeledInput>, EvalDecodeError> {
+    Ok(evaluation_records(bytes, definition)?
         .into_iter()
         .map(|r| LabeledInput {
             input: r.input,
@@ -422,23 +477,39 @@ fn decode_evaluation(
         .collect())
 }
 
+/// [`finalize_evaluation`] へ渡す、評価の確定に要るプロジェクト・候補・凍結データの情報。
+struct FinalizeContext<'a> {
+    project: &'a Project,
+    definition: &'a Definition,
+    freeze: &'a FreezeRecord,
+    target: &'a PreparedCandidate,
+    candidate: usize,
+    record_rel: &'a Path,
+    definition_sha256: String,
+    onnx_digest: Sha256Digest,
+    baseline: Option<&'a PreparedBaseline>,
+}
+
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
 ///
 /// 指標は評価器（`fandhe-edge-eval`）で求め、CLI では再実装しない（REQ-24）。記録の書き込みは最後に行い、
 /// それ以前の失敗では記録を残さない。
-#[allow(clippy::too_many_arguments)]
 fn finalize_evaluation(
-    project: &Project,
-    definition: &Definition,
-    freeze: &FreezeRecord,
-    target: &PreparedCandidate,
-    candidate: usize,
-    record_rel: &Path,
-    definition_sha256: String,
-    onnx_digest: Sha256Digest,
-    baseline: Option<&PreparedBaseline>,
+    ctx: FinalizeContext<'_>,
+    predictions: &PredictionsSink<'_>,
     applied: &AppliedOnce<Vec<Outcome>>,
 ) -> Result<EvaluateCompletedReport, ErrorReport> {
+    let FinalizeContext {
+        project,
+        definition,
+        freeze,
+        target,
+        candidate,
+        record_rel,
+        definition_sha256,
+        onnx_digest,
+        baseline,
+    } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
         .golds
@@ -472,6 +543,9 @@ fn finalize_evaluation(
     )
     .ok_or_else(|| runtime("cannot build evaluation report"))?;
 
+    // 予測ファイルの本文を先に作り、そのバイト列の sha256 を評価記録へ束縛する（#445・REQ-27）。
+    let predictions_jsonl =
+        predictions.to_jsonl(&labels, &applied.output, MAX_PROJECT_FILE_BYTES)?;
     let record = EvaluationRecord {
         candidate_index: candidate,
         candidate_id: target.candidate_id.clone(),
@@ -484,6 +558,7 @@ fn finalize_evaluation(
         correct,
         total,
         baseline_comparison,
+        predictions_sha256: Some(Sha256Digest::of_bytes(predictions_jsonl.as_bytes()).to_hex()),
     };
     let record_json = record
         .to_json_vec()
@@ -492,20 +567,114 @@ fn finalize_evaluation(
     if u64::try_from(record_json.len()).map_or(true, |n| n > MAX_EVALUATION_RECORD_BYTES) {
         return Err(runtime("evaluation record is too large"));
     }
+    // 1 件ごとの予測を先に書く（記録があるのに予測が無い状態を作らない）。失敗は記録の失敗と同じ扱い。
+    // この時点で適用権は取得済み（ロックは消費され、`finish` が失敗しても残る）で、再実行は
+    // `AlreadyApplied` で拒否される（fail-closed）。以降の失敗で予測ファイルだけが残っても、
+    // 凍結 test に適用した痕跡として消さない（REQ-27。eval の `apply_once_then` の doc も参照）。
+    project.write_new(predictions.rel, predictions_jsonl.as_bytes())?;
+    // 書いた後は読み取り専用にする（凍結データの配置と同じ扱い。改ざんの抑止であり、
+    // 記録の封印は外部台帳〔#168〕の範囲）。
+    project.set_read_only(predictions.rel)?;
     project.write_new(record_rel, &record_json)?;
     Ok(report)
+}
+
+/// 1 件ごとの予測の保存に必要な材料（書き込み先・評価データの id 列・推論ごとのスコア）。
+///
+/// 行形式は [`PredictionLine`]。stdout の JSON・[`EvaluationRecord`] のスキーマには影響しない
+/// （REQ-27。PoC-26 の採点入口 `fandhe-edge-score` が読む。REQ-41・#445）。
+struct PredictionsSink<'a> {
+    rel: &'a Path,
+    ids: &'a [String],
+    scores: &'a [Vec<f64>],
+}
+
+impl PredictionsSink<'_> {
+    /// 評価データの行順の JSONL を作る。id・予測の件数が合わなければ `runtime_error`、構築中に `limit`
+    /// バイトを超えたら打ち切って `limit_exceeded`。
+    fn to_jsonl(
+        &self,
+        labels: &[&str],
+        outcomes: &[Outcome],
+        limit: u64,
+    ) -> Result<String, ErrorReport> {
+        if self.ids.len() != outcomes.len() {
+            return Err(runtime("cannot build evaluation predictions"));
+        }
+        let mut out = String::new();
+        for (i, (id, outcome)) in self.ids.iter().zip(outcomes).enumerate() {
+            let scores = self.scores.get(i).map(|s| (labels, s.as_slice()));
+            let line_outcome = match outcome {
+                Outcome::Label(l) => PredictionLineOutcome::Label(l.clone()),
+                Outcome::Invalid => PredictionLineOutcome::Invalid,
+                Outcome::Abstain => PredictionLineOutcome::Abstain,
+                Outcome::Error => PredictionLineOutcome::Error,
+            };
+            let line = PredictionLine::new(id, line_outcome, scores)
+                .to_json_line()
+                .map_err(|_| runtime("cannot serialize evaluation predictions"))?;
+            out.push_str(&line);
+            out.push('\n');
+            if u64::try_from(out.len()).map_or(true, |n| n > limit) {
+                return Err(predictions_limit_error());
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn predictions_limit_error() -> ErrorReport {
+    fail(
+        ExitCode::LimitExceeded,
+        "evaluation predictions exceed size limit",
+    )
+}
+
+/// 予測ファイルの大きさの上界（件数 × (固定部 + id の最大長 + 全ラベル ID 長の合計 + ラベルごとの固定部。
+/// JSON エスケープで最大 6 倍）が `limit` 以下であることを確認する。超えれば `limit_exceeded`
+/// （適用権を取る前に呼ぶ。#445・REQ-39）。
+fn check_predictions_limit(ids: &[String], labels: &[&str], limit: u64) -> Result<(), ErrorReport> {
+    let escaped = |n: usize| (n as u64).saturating_mul(6);
+    let max_id = ids.iter().map(String::len).max().unwrap_or(0);
+    let max_label = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    let per_label_sum: u64 = labels
+        .iter()
+        .map(|l| escaped(l.len()).saturating_add(40))
+        .fold(0, u64::saturating_add);
+    let per_line = 128u64
+        .saturating_add(escaped(max_id))
+        .saturating_add(escaped(max_label))
+        .saturating_add(per_label_sum);
+    match (ids.len() as u64).checked_mul(per_line) {
+        Some(bound) if bound <= limit => Ok(()),
+        _ => Err(predictions_limit_error()),
+    }
+}
+
+/// [`apply_to_frozen_data`] へ渡す、凍結データへの適用に要る情報。
+struct FrozenApplication<'a> {
+    freeze: &'a FreezeRecord,
+    definition: &'a Definition,
+    eval_bytes: &'a [u8],
+    target: &'a PreparedCandidate,
+    onnx_digest: Sha256Digest,
+    scores_log: &'a RefCell<Vec<Vec<f64>>>,
 }
 
 /// 台帳で適用権を取り、凍結した評価データへ 1 回だけ推論を当てる。
 fn apply_to_frozen_data<R>(
     ledger: &FinalTestLedger,
-    freeze: &FreezeRecord,
-    definition: &Definition,
-    eval_bytes: &[u8],
-    target: &PreparedCandidate,
-    onnx_digest: Sha256Digest,
+    application: FrozenApplication<'_>,
     finish: impl FnOnce(&AppliedOnce<Vec<Outcome>>) -> Result<R, EvalPredictFailure>,
 ) -> Result<(AppliedOnce<Vec<Outcome>>, R), ErrorReport> {
+    let FrozenApplication {
+        freeze,
+        definition,
+        eval_bytes,
+        target,
+        onnx_digest,
+        scores_log,
+    } = application;
     // 評価器はパスから開き直すため、閉じ込めつきで読み検証済みのバイト列を、この実行だけの
     // 私用ディレクトリ（0700・新規作成）へ複製し、そのパスを渡す。プロジェクト内のパスを渡すと、
     // 検証後に symlink へ差し替えられてプロジェクト外を読みうる（REQ-39）。
@@ -566,6 +735,7 @@ fn apply_to_frozen_data<R>(
                 let judgment = judgment_from_prediction(options, PLACEHOLDER_ID, &prediction)
                     .map_err(|_| EvalPredictFailure::Failed)?;
                 outcomes.push(Outcome::Label(judgment.predicted_choice_id().to_string()));
+                scores_log.borrow_mut().push(prediction.scores().to_vec());
             }
             Ok(outcomes)
         },
@@ -642,6 +812,36 @@ const PLACEHOLDER_ID: &str = "evaluation";
 mod tests {
     use super::*;
 
+    /// REQ-39・#445: 予測ファイルの上界（2 件 × (128 + 6×2 + 6×1 + 2×(6+40)) = 476）が上限を超えると、
+    /// 適用権を取る前の確認が `limit_exceeded` になる。ちょうど上限なら通る。
+    #[test]
+    fn req39_issue445_predictions_upper_bound_is_checked_against_limit() {
+        let ids = vec!["e1".to_string(), "e2".to_string()];
+        let labels = ["a", "b"];
+        assert!(check_predictions_limit(&ids, &labels, 476).is_ok());
+        let err = check_predictions_limit(&ids, &labels, 475).expect_err("over");
+        assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
+    /// REQ-39・#445: 予測行の構築中に上限を超えたら打ち切って `limit_exceeded`。
+    #[test]
+    fn req39_issue445_predictions_building_stops_at_limit() {
+        let ids = vec!["e1".to_string(), "e2".to_string()];
+        let sink = PredictionsSink {
+            rel: Path::new("x"),
+            ids: &ids,
+            scores: &[],
+        };
+        let outcomes = [Outcome::Label("a".into()), Outcome::Label("b".into())];
+        let one_line = sink.to_jsonl(&["a", "b"], &outcomes, 1 << 20).expect("ok");
+        let first_len = one_line.find('\n').expect("nl") as u64 + 1;
+        assert!(sink.to_jsonl(&["a", "b"], &outcomes, first_len * 2).is_ok());
+        let err = sink
+            .to_jsonl(&["a", "b"], &outcomes, first_len * 2 - 1)
+            .expect_err("over");
+        assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
     const DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#;
 
     fn definition() -> Definition {
@@ -665,6 +865,21 @@ mod tests {
                     gold: "a".to_string()
                 },
             ]
+        );
+    }
+
+    /// REQ-27・#445: 同じ `input` に異なるラベルが付いた矛盾入力も評価対象から除外されない
+    /// （採点入口と共有するデコード経路。件数は全レコード）。
+    #[test]
+    fn req27_issue445_evaluation_records_keep_contradictory_inputs() {
+        let data = b"{\"id\":\"1\",\"input\":\"x\",\"output\":{\"intent\":\"a\"}}\n{\"id\":\"2\",\"input\":\"x\",\"output\":{\"intent\":\"b\"}}\n";
+        let records = evaluation_records(data, &definition()).expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            decode_evaluation(data, &definition())
+                .expect("decode")
+                .len(),
+            2
         );
     }
 

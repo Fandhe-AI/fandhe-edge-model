@@ -44,5 +44,6 @@ pub mod infer_guard;
 pub mod log;
 pub mod output;
 pub mod project;
+pub mod score_predictions;
 pub mod stage_output;
 pub mod stages;

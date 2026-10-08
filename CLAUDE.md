@@ -34,7 +34,7 @@ fandhe-edge-model/
 ├── unsafe-allowlist.json           # `allow(unsafe_code)` の許可リスト（`scripts/check_unsafe_allowlist.py` が出現箇所と照合。REQ-39・#335）
 ├── crates/                         # 層に対応する crate 群（残りの層は後続 TASK で追加）
 │   ├── core/                       # `fandhe-edge-core`（lib。共通コア。作り直し判定〔`rebuild`。REQ-20・TASK-20.1〜20.3〕を含む。REQ-15）
-│   ├── cli/                        # `fandhe-edge-cli`（lib＋bin `fandhe-edge`。操作アダプター - CLI。REQ-33）
+│   ├── cli/                        # `fandhe-edge-cli`（lib＋bin `fandhe-edge`。操作アダプター - CLI。REQ-33。PoC-26 用の別 bin `fandhe-edge-score`（外部の予測ファイルを凍結 test で採点。7 工程の契約外。REQ-41・#445）。`evaluate` は候補ディレクトリに 1 件ごとの予測 `evaluation_predictions.jsonl` も保存する（#445））
 │   ├── data/                       # `fandhe-edge-data`（lib。データ契約 - 検査・group 単位分割・凍結記録・読み取り専用配置・ハッシュ不一致時の停止・分割記録のレコード内容ハッシュ・来歴の記録型と取り込み記録・データ検査との接続を実装済み。REQ-16/17/40。TASK-16.1-1・#38・TASK-17.1-1・#44・TASK-17.2-2・#227・TASK-17.3・#251・TASK-40.1-1・#74・TASK-40.1-2・#75・TASK-40.2・#76）
 │   ├── eval/                       # `fandhe-edge-eval`（lib。評価器 - 正解率・ラベル別指標・Macro-F1・混同行列・McNemar / Holm・下限基準比較・回帰・Wilson 区間と再現性・不変性・推論関数への input のみ受け渡し・凍結 test の 1 回限り適用・校正と棄権を実装済み。対象外ラベル〔TASK-22.2〕・coverage〔TASK-22.3〕・quadrant の multi-item・レポート系〔REQ-29〕・CLI 配線は McNemar の下限基準比較のみ接続済み〔#339〕でそれ以外は未実装。REQ-24〜27。TASK-24.1-1・#59）
 │   ├── guard/                      # `fandhe-edge-guard`（lib。ガード層。許可リストによるファイル形式判定〔TASK-39.2-1・#153〕・経路の閉じ込め〔`safe_join` 相当。TASK-39.4-1・#158〕・`infer` の `--package`・`onnx_file` への統合〔TASK-39.4-2・#159〕・`kind` の許可リストの `infer` の `artifact.json` への統合〔TASK-39.2-4・#156〕・`kind_version` の許可リスト〔TASK-39.6-1・#174〕・実行時間上限〔暫定 10 秒。TASK-39.5-1・#170〕・RSS 上限〔暫定 2 GiB・RSS ポーリングによる模擬。TASK-39.5-2・#171〕を実装済み。REQ-39）

@@ -15,6 +15,11 @@ path = "src/lib.rs"
 name = "fandhe-edge"
 path = "src/main.rs"
 
+# PoC-26 用の採点入口（7 工程の契約外。REQ-41・TASK-41.1・#445）。
+[[bin]]
+name = "fandhe-edge-score"
+path = "src/score_main.rs"
+
 [dependencies]
 fandhe-edge-core.workspace = true
 # 各層のエラー型を ErrorReport へ写す変換（TASK-33.2-1・#138）のための

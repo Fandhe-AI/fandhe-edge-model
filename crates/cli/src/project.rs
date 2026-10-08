@@ -72,6 +72,8 @@ pub const CANDIDATES_DIR: &str = "candidates";
 pub const FINAL_TEST_LEDGER_DIR: &str = "final_test_ledger";
 /// 候補ディレクトリ内の評価完了記録のファイル名（`evaluate` が新規に書き、`package` が確認する。#314）。
 pub const EVALUATION_RECORD_FILE: &str = "evaluation_record.json";
+/// 評価データの 1 件ごとの予測（`evaluate` が評価記録と同じ候補ディレクトリへ保存する JSONL。REQ-27・#445）。
+pub const EVALUATION_PREDICTIONS_FILE: &str = "evaluation_predictions.jsonl";
 /// 選定記録のファイル名。
 pub const SELECTION_FILE: &str = "selection_record.json";
 /// 全候補が容量超過で除外された `select` の除外結果（内部記録。他工程は読まない。#125）。
@@ -301,6 +303,87 @@ impl Project {
         Ok(())
     }
 
+    /// 新規ファイルを原子的に作る（`rel` は「無い」か「完全」のどちらかでしか見えない。既存なら拒否）。
+    ///
+    /// 同じディレクトリの一時名 `.tmp-<ファイル名>-<pid>` へ書いて fsync し、保持 fd 起点の
+    /// `NOREPLACE` の名前替えで `rel` に置く。書き込み途中でプロセスが終了しても残るのは一時名だけで、
+    /// `rel` の名前は塞がれない（`write_new` は途中終了で 0 バイト／部分的な `rel` を残す。
+    /// REQ-27・REQ-39）。一時名の残骸は [`Project::remove_tmp_files`] で消せ、他の読み取りは見ない。
+    /// ディレクトリエントリ自体の fsync は行わない（電源断までは保証しない。プロセス終了に対する原子性）。
+    ///
+    /// # Errors
+    /// 既存は `invalid_input`、書き込み・名前替えの失敗は `runtime_error`（一時ファイルは片付ける）。
+    pub fn publish_new_file(&self, rel: impl AsRef<Path>, bytes: &[u8]) -> Result<(), ErrorReport> {
+        let rel = rel.as_ref();
+        let Some(file_name) = rel.file_name() else {
+            return Err(invalid("project file path is invalid"));
+        };
+        let mut tmp_name = std::ffi::OsString::from(".tmp-");
+        tmp_name.push(file_name);
+        tmp_name.push(format!("-{}", std::process::id()));
+        let tmp = rel.with_file_name(tmp_name);
+        self.remove_file_if_exists(&tmp)?;
+        let mut file = self
+            .package
+            .create_new_member(&tmp)
+            .map_err(|e| write_rejection(&e, "file already exists", "cannot write project file"))?;
+        // 書いた fd のまま fsync する（開き直さない）。
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|_| runtime("cannot write project file"));
+        drop(file);
+        let published = written.and_then(|()| {
+            self.package.rename_member(&tmp, rel).map_err(|e| {
+                write_rejection(&e, "file already exists", "cannot write project file")
+            })
+        });
+        if published.is_err() {
+            let _ = self.package.remove_file_member(&tmp);
+        }
+        published
+    }
+
+    /// ディレクトリ `dir` 直下の `.tmp-*`（[`Project::publish_new_file`] の途中終了の残骸）をすべて消す。
+    /// 呼び出し側が排他ロックを持ち、他の書き手がいないことを前提にする（pid を問わない）。
+    ///
+    /// # Errors
+    /// 列挙・削除の失敗は `runtime_error`。
+    pub fn remove_tmp_files(&self, dir: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let dir = dir.as_ref();
+        let names = self
+            .package
+            .open_subdir(dir)
+            .map_err(|e| e.to_error_report())?
+            .list_entry_names(1024)
+            .map_err(|_| runtime("cannot list project directory"))?;
+        for name in names {
+            if name.to_string_lossy().starts_with(".tmp-") {
+                self.remove_file_if_exists(dir.join(name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 既存ファイルを読み取り専用（0400）にする（開いた fd への `fchmod`。パスを開き直さない）。
+    /// 評価の予測ファイルなど、書いた後に差し替えさせたくない記録に使う（非 unix では何もしない）。
+    ///
+    /// # Errors
+    /// 開けない場合は経路の拒否、`fchmod` 失敗は `runtime_error`。
+    pub fn set_read_only(&self, rel: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let (file, _) = self.open_file(rel)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .map_err(|_| runtime("cannot protect project file"))?;
+        }
+        #[cfg(not(unix))]
+        drop(file);
+        Ok(())
+    }
+
     /// `rel` の通常ファイルを保持 fd 起点で削除する。無ければ何もしない（削除に失敗したら
     /// `runtime_error`。古い記録を残さないための fail-closed）。
     ///
@@ -383,6 +466,21 @@ impl Project {
             write_rejection(&e, "directory already exists", "cannot create directory")
         })?;
         Ok(self.path(rel))
+    }
+
+    /// ディレクトリを作る。既に（通常の）ディレクトリがあれば許容する（`exists` → 作成の競合を避ける。
+    /// symlink・非ディレクトリが先にあれば従来どおり拒否する）。
+    ///
+    /// # Errors
+    /// [`Project::create_dir`] と同じ（既存が通常のディレクトリのときを除く）。
+    pub fn ensure_dir(&self, rel: impl AsRef<Path>) -> Result<(), ErrorReport> {
+        let rel = rel.as_ref();
+        match self.create_dir(rel) {
+            Ok(_) => Ok(()),
+            // `symlink_metadata` は symlink を追従しないため、symlink は `is_dir` が偽になる。
+            Err(_) if std::fs::symlink_metadata(self.path(rel)).is_ok_and(|m| m.is_dir()) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// [`Project::create_dir`] と同じくディレクトリを新規作成し、fd を保持したハンドルも返す
