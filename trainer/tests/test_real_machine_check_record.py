@@ -1438,6 +1438,10 @@ def test_capacity_summary_rejects_negative_bool_and_missing_values() -> None:
     boolc = _cap_json()
     boolc["components"]["weights"]["file_count"] = True
     assert mod.capacity_summary({"capacity": boolc}) is None
+    # limit_bytes のキー欠落は明示的な null と区別して拒否する（REQ-33・#406）
+    missing = _cap_json()
+    del missing["limit_bytes"]
+    assert mod.capacity_summary({"capacity": missing}) is None
 
 
 # ---- C（C-1・C-2）の結合: 偽 CLI は定義・入力ファイルから値を導いて出力する ----

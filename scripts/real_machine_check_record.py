@@ -1370,7 +1370,9 @@ def capacity_summary(pkg: dict[str, Any] | None) -> dict[str, Any] | None:
         out_comps[name] = {"bytes": b, "file_count": fc}
     total, limit, exceeded = cap.get("total_bytes"), cap.get("limit_bytes"), cap.get("exceeded")
     guide, over = cap.get("guideline_bytes"), cap.get("over_guideline")
-    # `limit_bytes` は利用者設定の上限で、未設定なら null（REQ-30）
+    # `limit_bytes` は利用者設定の上限で、未設定なら明示的な null（REQ-30）。キーの欠落は受理しない
+    if "limit_bytes" not in cap:
+        return None
     if not _nonneg_int(total) or not (limit is None or _nonneg_int(limit)):
         return None
     if not isinstance(exceeded, bool) or not _nonneg_int(guide) or not isinstance(over, bool):
