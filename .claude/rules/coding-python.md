@@ -12,7 +12,7 @@
 
 - 整形・lint は ruff（`ruff format`・`ruff check`。bandit 系の `S` ルールで `pickle`・`eval`・`shell=True` 等を機械検出する）、テストは pytest、環境・lock は uv（いずれも 2026-09-27 ユーザー承認済み。pytest の推移的依存は `iniconfig`・`packaging`・`pluggy`・`pygments`〔`trainer/uv.lock` で確認〕で、親の承認に包含。版は `trainer/pyproject.toml` と Makefile の `UV_VERSION` が正）
 - `trainer/pyproject.toml` で依存を `==x.y.z` 固定し、`trainer/uv.lock` をコミットする。Python の版は `trainer/.python-version` で固定する。依存の追加・更新はユーザー承認を経る（[dependency-policy](./dependency-policy.md)）
-- 検証は `make py-ci`（`py-fmt-check`・`py-lint`・`py-test`。`uv run --locked` で lock を暗黙更新しない）。CI は `.github/workflows/python-ci.yml`（[ci](./ci.md)）
+- 検証は `make py-ci`（`py-fmt-check`・`py-lint`・`py-test`。`uv --no-config run --locked` で lock を暗黙更新しない。`--no-config` はユーザー設定の `exclude-newer` が `--locked` と衝突するのを避けるため。ミラーは環境変数で指定し、uv の版は Makefile の `require_uv` が検査する）。CI は `.github/workflows/python-ci.yml`（[ci](./ci.md)）
 - MLX を使うテストは CPU で実行し、Metal に依存するテストは実機前提テストとして既定の集合から分離する。CI（python-ci）は検証環境の macOS（arm64）で実行する。開発環境の Linux x86_64 でも `mlx[cpu]`（mlx-cpu）で `make py-ci` を実行できる（`trainer/pyproject.toml` の `[tool.uv] environments`）。macOS 固有の検査（拡張 ACL）には Linux 用の対（POSIX ACL）を用意し、片方の OS で検査を無効化しない
 
 ## コーディング

@@ -27,7 +27,7 @@ make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
 make test        # cargo test --workspace（既定 feature）
 make deny        # cargo deny --locked check advisories bans licenses sources
-make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest（uv run --locked）
+make py-ci       # 学習ワーカー（trainer/）: ruff format --check・ruff check・pytest（`uv --no-config run --locked`。ユーザー設定の exclude-newer と衝突させない。ミラーは環境変数で指定）
 make test-trainer-integration  # 実 trainer（MLX CPU）を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 make check-runtime-linkage  # 推論ランタイムの動的リンク確認（Mac 実機前提。make ci には含まれない。#115）
 make real-machine-check  # Mac 実機での動作確認 A〜F（人が実行。make ci には含まれない。#354）
@@ -122,7 +122,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 ### PoC-26 の実機前提テスト（REQ-41・TASK-41.1-5・#390）
 
-- トークナイザーの golden 照合は実物の `tokenizer.json` と `fixtures/poc26/tokenizer_golden.json` が要るため、環境変数 `FANDHE_EDGE_QWEN_DIR` が無い間は skip する（人間が実機で実行。手順は [docs/design/poc26-tokenizer-golden-procedure.md](docs/design/poc26-tokenizer-golden-procedure.md)）: `FANDHE_EDGE_QWEN_DIR=<dir> uv run --locked --directory trainer pytest tests/test_poc26_tokenizer.py -k golden`
+- トークナイザーの golden 照合は実物の `tokenizer.json` と `fixtures/poc26/tokenizer_golden.json` が要るため、環境変数 `FANDHE_EDGE_QWEN_DIR` が無い間は skip する（人間が実機で実行。手順は [docs/design/poc26-tokenizer-golden-procedure.md](docs/design/poc26-tokenizer-golden-procedure.md)）: `FANDHE_EDGE_QWEN_DIR=<dir> uv --no-config run --locked --directory trainer pytest tests/test_poc26_tokenizer.py -k golden`
 - 学習・採点 CLI（`trainer/tools/poc26/lora_poc.py`）の実重みでの確認（往復・参照との突き合わせ・CPU 決定性）は人間が実機で行う。`train`・`predict`・`probe` は #387 で記録した sha256 を必須引数（`--model-sha256`・`--config-sha256`・`--tokenizer-sha256`・`--tokenizer-config-sha256`。64 桁の小文字 16 進）で受け、不一致は終了コード 64。`predict` は学習時に記録した `--adapter-sha256`（`adapters.safetensors` 全体のハッシュ。設定は metadata に入り同時に守られる）も必須。`--out-dir` は存在しない新規ディレクトリで、失敗時は一時ディレクトリを消すため同じ `--out-dir` で再実行できる（追補 1 の 10 節）。手順・合格条件・記録欄は [docs/design/poc26-preregistration-addendum-1.md](docs/design/poc26-preregistration-addendum-1.md) の 6 節。CI の pytest は合成モデル・CPU のテストハーネスのみ（実機の証拠にならない）
 
 ### 学習ワーカーの起動契約（Issue #12）
