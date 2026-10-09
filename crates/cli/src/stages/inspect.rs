@@ -286,13 +286,16 @@ const EVAL_MSGS: [&str; 4] = [
 fn load_provenance_json(project: &Project) -> Result<Option<String>, ErrorReport> {
     let mut parts = Vec::new();
     // キー順（evaluation < train）に固定して決定的にする。
-    for (key, name) in [
-        ("evaluation", EVALUATION_PROVENANCE_FILE),
-        ("train", TRAIN_PROVENANCE_FILE),
+    for (key, name, is_training) in [
+        ("evaluation", EVALUATION_PROVENANCE_FILE, false),
+        ("train", TRAIN_PROVENANCE_FILE, true),
     ] {
         let rel = Path::new(DATA_DIR).join(name);
         if let Some(bytes) = project.read_optional(rel, MAX_PROVENANCE_FILE_BYTES)? {
-            parts.push(format!("\"{key}\":{}", check_provenance(&bytes)?));
+            parts.push(format!(
+                "\"{key}\":{}",
+                check_provenance(&bytes, is_training)?
+            ));
         }
     }
     Ok((!parts.is_empty()).then(|| format!("{{{}}}", parts.join(","))))
@@ -370,9 +373,15 @@ pub fn run_with_log<W: std::io::Write>(
         .record()
         .to_json()
         .map_err(|_| runtime("cannot serialize split record"))?;
-    project.write_new(SPLIT_FILE, json.as_bytes())?;
-    if let Some(provenance_json) = provenance_json {
+    // 来歴を先に書き、split.json の失敗時は片付ける（再実行が `file already exists` で詰まらない。REQ-40）。
+    if let Some(provenance_json) = &provenance_json {
         project.write_new(PROVENANCE_RECORD_FILE, provenance_json.as_bytes())?;
+    }
+    if let Err(e) = project.write_new(SPLIT_FILE, json.as_bytes()) {
+        if provenance_json.is_some() {
+            let _ = project.remove_file_if_exists(PROVENANCE_RECORD_FILE);
+        }
+        return Err(e);
     }
     Ok(InspectStageReport::new(
         records.len(),

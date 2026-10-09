@@ -599,14 +599,20 @@ pub fn parse_definition(bytes: &[u8]) -> Result<Definition, ErrorReport> {
 /// 同じ parse → `check_default_training_source` だが、データ検査を含まないため直接呼ぶ。
 ///
 /// # Errors
-/// 解析失敗は `provenance record is invalid`、Jev 出力は `training data source is not allowed`
-/// （いずれも `invalid_input`。message は固定語彙で本文を含めない）。
-pub fn check_provenance(bytes: &[u8]) -> Result<String, ErrorReport> {
+/// `is_training` は学習データの来歴か。Jev 出力の拒否は REQ-40 が「学習データ」に限って定めるため、
+/// 評価データの来歴（`false`）は形式の検証のみで生成元の採否は見ない（評価データの独立性は REQ-17・REQ-27 側）。
+///
+/// # Errors
+/// 解析失敗は `provenance record is invalid`、学習データの Jev 出力は
+/// `training data source is not allowed`（いずれも `invalid_input`。message は固定語彙で本文を含めない）。
+pub fn check_provenance(bytes: &[u8], is_training: bool) -> Result<String, ErrorReport> {
     let invalid_record = || invalid("provenance record is invalid");
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_record())?;
     let record = parse_provenance_json(text).map_err(|_| invalid_record())?;
-    check_default_training_source(&record)
-        .map_err(|_| invalid("training data source is not allowed"))?;
+    if is_training {
+        check_default_training_source(&record)
+            .map_err(|_| invalid("training data source is not allowed"))?;
+    }
     Ok(provenance_to_json(&record))
 }
 

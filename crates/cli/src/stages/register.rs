@@ -9,7 +9,8 @@
 //! - 出力: `--project-dir`（未作成であること。cwd 配下の既存の親の下へ新規作成）
 //!
 //! 同じディレクトリの任意の `train.provenance.json`・`evaluation.provenance.json`（来歴。REQ-40。
-//! 固定名は暫定）も、検証して通れば `data/` へ写す。Jev 出力が生成元なら `invalid_input`。
+//! 固定名は暫定）も、検証して通れば `data/` へ写す。学習データの来歴の Jev 出力は `invalid_input`（評価来歴は形式のみ検証。
+//! REQ-40 の Jev 不使用は学習データに限る）。評価データが無いのに評価来歴だけがあれば `invalid_input`。
 //!
 //! # 評価契約
 //!
@@ -126,9 +127,18 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         if let Some((bytes, _)) =
             read_confined_optional(cwd, &src_dir.join(name), MAX_PROVENANCE_FILE_BYTES)?
         {
-            check_provenance(&bytes)?;
+            check_provenance(&bytes, name == TRAIN_PROVENANCE_FILE)?;
             provenance.push((name, bytes));
         }
+    }
+
+    // 評価データが無いのに評価来歴だけがある記録は、評価済みを装うため拒否する（REQ-17・REQ-40）。
+    if evaluation.is_none()
+        && provenance
+            .iter()
+            .any(|(n, _)| *n == EVALUATION_PROVENANCE_FILE)
+    {
+        return Err(invalid("evaluation provenance without evaluation data"));
     }
 
     let project = Project::create(cwd, &args.project_dir)?;

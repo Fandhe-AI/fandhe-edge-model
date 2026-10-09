@@ -146,3 +146,94 @@ fn req40_tampered_provenance_fails_inspect() {
     assert_eq!(o.status.code(), Some(64));
     assert!(!exists(&e.proj().join("split.json")));
 }
+
+fn put_eval(e: &Env) {
+    let mut s = String::new();
+    for (i, l) in LABELS.iter().enumerate() {
+        s.push_str(&format!(
+            "{{\"id\":\"ev-{i}\",\"input\":\"held out {l} case\",\"output\":{{\"intent\":\"{l}\"}},\"group_id\":\"ge-{i}\"}}\n"
+        ));
+    }
+    e.put("evaluation.jsonl", &s);
+}
+
+/// REQ-40・REQ-39: ルート（cwd）外を指す symlink の来歴は拒否し、プロジェクトを残さない。
+#[test]
+fn req39_symlinked_provenance_is_rejected() {
+    let e = Env::new("symlink");
+    let outside = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("prov-outside.json");
+    std::fs::write(&outside, format!(r#"{{{PROV_BASE}}}"#)).expect("outside");
+    std::os::unix::fs::symlink(&outside, e.0.join("train.provenance.json")).expect("symlink");
+    let o = e.register();
+    assert_eq!(o.status.code(), Some(64), "{}", stdout(&o));
+    assert!(!exists(&e.proj()));
+}
+
+/// REQ-39: 64 KiB を超える来歴は exit 20（`limit_exceeded`）。
+#[test]
+fn req39_oversized_provenance_is_limit_exceeded() {
+    let e = Env::new("big");
+    let pad = " ".repeat(64 * 1024 + 1);
+    e.put("train.provenance.json", &format!(r#"{{{PROV_BASE}}}{pad}"#));
+    let o = e.register();
+    assert_eq!(o.status.code(), Some(20), "{}", stdout(&o));
+    assert!(!exists(&e.proj()));
+}
+
+/// REQ-40: 不正 UTF-8・重複キー・`source: null` は 64。
+#[test]
+fn req40_invalid_utf8_duplicate_key_and_null_source_are_rejected() {
+    let e = Env::new("shapes");
+    std::fs::write(e.0.join("train.provenance.json"), [0xff, 0xfe, b'{', b'}']).expect("w");
+    assert_eq!(e.register().status.code(), Some(64));
+    e.put(
+        "train.provenance.json",
+        &format!(r#"{{{PROV_BASE},"source":"self","source":"self"}}"#),
+    );
+    assert_eq!(e.register().status.code(), Some(64));
+    e.put(
+        "train.provenance.json",
+        &format!(r#"{{{PROV_BASE},"source":null}}"#),
+    );
+    let o = e.register();
+    assert_eq!(o.status.code(), Some(64), "{}", stdout(&o));
+    assert!(stdout(&o).contains("provenance record is invalid"));
+}
+
+/// REQ-17・REQ-40: 評価データ無しの評価来歴は 64（評価済みを装う記録を作らない）。
+#[test]
+fn req40_orphan_evaluation_provenance_is_rejected() {
+    let e = Env::new("orphan");
+    e.put("evaluation.provenance.json", &format!(r#"{{{PROV_BASE}}}"#));
+    let o = e.register();
+    assert_eq!(o.status.code(), Some(64));
+    assert!(stdout(&o).contains("evaluation provenance without evaluation data"));
+    assert!(!exists(&e.proj()));
+}
+
+/// REQ-40: 評価来歴は評価データとともに取り込まれ、`inspect` が `evaluation` キーで記録する。
+#[test]
+fn req40_evaluation_provenance_is_recorded() {
+    let e = Env::new("evalprov");
+    put_eval(&e);
+    e.put("evaluation.provenance.json", &format!(r#"{{{PROV_BASE}}}"#));
+    assert_eq!(e.register().status.code(), Some(0));
+    assert!(exists(&e.proj().join("data/evaluation.provenance.json")));
+    let o = e.inspect();
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let rec = std::fs::read_to_string(e.proj().join("provenance_record.json")).expect("record");
+    assert!(rec.starts_with(r#"{"evaluation":{"#), "{rec}");
+}
+
+/// REQ-40: Jev 不使用は学習データに限る（spec 受け入れ基準 2）。評価来歴は形式のみ検証。
+#[test]
+fn req40_jev_source_in_evaluation_provenance_is_format_checked_only() {
+    let e = Env::new("evaljev");
+    put_eval(&e);
+    e.put(
+        "evaluation.provenance.json",
+        &format!(r#"{{{PROV_BASE},"source":"jev_output"}}"#),
+    );
+    assert_eq!(e.register().status.code(), Some(0));
+    assert_eq!(e.inspect().status.code(), Some(0));
+}
