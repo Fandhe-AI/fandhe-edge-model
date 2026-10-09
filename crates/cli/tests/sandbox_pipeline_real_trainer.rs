@@ -267,8 +267,28 @@ fn assert_chain_completed(chain: &Chain, evaluate_status: &str) {
     }
     assert_eq!(meta.matches(&expected_status).count(), 1, "{meta}");
     assert_eq!(meta.matches("\"status\":null").count(), 6, "{meta}");
-    // 全体（1）と 7 工程（7）の exit_code がすべて 0
-    assert_eq!(meta.matches("\"exit_code\":0").count(), 8, "{meta}");
+    // 全体（1）と 7 工程（7）の exit_code が 0。ただし infer の判定は校正による保留（12）・対象外（11）も
+    // 完了として扱う（評価データありでは validation の校正が同梱される。REQ-22・#497）
+    let infer_entry = meta
+        .split("{\"step\":\"infer\"")
+        .nth(1)
+        .and_then(|e| e.split('}').next())
+        .expect("infer entry");
+    let infer_judged = [
+        "\"exit_code\":11,\"code\":\"out_of_scope\"",
+        "\"exit_code\":12,\"code\":\"pending\"",
+    ]
+    .iter()
+    .any(|m| infer_entry.contains(m));
+    assert!(
+        infer_judged || infer_entry.contains("\"exit_code\":0,"),
+        "{infer_entry}"
+    );
+    assert_eq!(
+        meta.matches("\"exit_code\":0").count(),
+        if infer_judged { 7 } else { 8 },
+        "{meta}"
+    );
 
     // 利用者の値・一時パスが出力物へ漏れない（生文字列非保存）
     let tmp = dir.display().to_string();
