@@ -521,6 +521,9 @@ fn verify_evaluation_record(
     let matches = record.candidate_index == selection.candidate_index
         && record.config_id == config_id
         && record.correct <= record.total
+        && record
+            .type_meaning_quadrant
+            .is_none_or(|q| q.total() == Some(record.total))
         && usize::try_from(record.total).is_ok_and(|t| t == expected_total)
         && record.candidate_id == selection.candidate_id
         && record.evaluation_sha256 == freeze.sha256().to_hex()
@@ -1074,6 +1077,7 @@ mod tests {
             total,
             baseline_comparison: None,
             predictions_sha256: None,
+            type_meaning_quadrant: None,
         }
     }
 

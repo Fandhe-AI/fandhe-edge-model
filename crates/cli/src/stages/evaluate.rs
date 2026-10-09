@@ -57,7 +57,7 @@
 //! 評価記録と同じ候補ディレクトリへ `evaluation_predictions.jsonl`（評価データの行順。
 //! `{id,status,predicted_label,scores}`。[`PredictionLine`]）を新規に書く（既存なら適用権を取る前に
 //! `invalid_input`）。PoC-26 の採点入口（`fandhe-edge-score`）が、他候補の予測と同じ形式で読む。
-//! stdout の JSON・[`EvaluationRecord`] のスキーマは変えない。書き込みは評価記録と同じ位置
+//! 予測ファイルは stdout の JSON・[`EvaluationRecord`] のスキーマに影響しない。書き込みは評価記録と同じ位置
 //! （台帳への完了記録の前）で行い、失敗時の扱いも同じ。
 //!
 //! # 選定との順序（REQ-27）
@@ -83,13 +83,16 @@ use std::path::Path;
 use std::time::Instant;
 
 use fandhe_edge_core::definition::Definition;
-use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
+use fandhe_edge_core::evaluation_record::{
+    EvaluationRecord, MAX_EVALUATION_RECORD_BYTES, TypeMeaningQuadrantRecord,
+};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 use fandhe_edge_core::stage_report::{
-    EvaluateCompletedReport, EvaluateReport, PredictionLine, PredictionLineOutcome,
+    EvaluateCompletedReport, EvaluateDetails, EvaluateLabelMetrics, EvaluateReport, PredictionLine,
+    PredictionLineOutcome,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
@@ -140,7 +143,7 @@ pub enum EvaluateOutcome {
     /// 評価データ未定義（exit 0。評価済みを装わない）。
     Skipped(EvaluateReport),
     /// 凍結した評価データへの適用が完了した。
-    Completed(EvaluateCompletedReport),
+    Completed(Box<EvaluateCompletedReport>),
 }
 
 /// 推論に使う、事前検証済みの候補（評価する 1 候補分）。
@@ -322,7 +325,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         Err(report) => return Err(finish_error.take().unwrap_or(report)),
     };
 
-    Ok(EvaluateOutcome::Completed(report))
+    Ok(EvaluateOutcome::Completed(Box::new(report)))
 }
 
 /// `select` の記録があり、保存済みの結果から再計算した選定と一致し、対象候補が選定された候補で
@@ -535,12 +538,37 @@ fn finalize_evaluation(
             Some(record)
         }
     };
+    let q = &computed.type_meaning_quadrant;
+    let quadrant = TypeMeaningQuadrantRecord {
+        type_ok_meaning_ok: q.type_ok_meaning_ok(),
+        type_ok_meaning_ng: q.type_ok_meaning_ng(),
+        type_ng_count: q.type_ng_count(),
+        abstain: q.abstain(),
+        error: q.error(),
+    };
+    let details = EvaluateDetails {
+        macro_f1_excluded_labels: computed.macro_f1.excluded_labels().to_vec(),
+        per_label: computed
+            .per_label
+            .iter()
+            .map(|m| EvaluateLabelMetrics {
+                label: m.label.clone(),
+                support: m.support,
+                predicted: m.predicted_count,
+                precision: m.precision,
+                recall: m.recall,
+                f1: m.f1,
+            })
+            .collect(),
+        type_meaning_quadrant: quadrant,
+    };
     let report = EvaluateCompletedReport::completed(
         candidate,
         target.kind_name.clone(),
         correct,
         total,
         computed.macro_f1.value(),
+        details,
     )
     .ok_or_else(|| runtime("cannot build evaluation report"))?;
 
@@ -560,6 +588,7 @@ fn finalize_evaluation(
         total,
         baseline_comparison,
         predictions_sha256: Some(Sha256Digest::of_bytes(predictions_jsonl.as_bytes()).to_hex()),
+        type_meaning_quadrant: Some(quadrant),
     };
     let record_json = record
         .to_json_vec()
