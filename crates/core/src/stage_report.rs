@@ -130,11 +130,34 @@ pub struct EvaluateCompletedReport {
     macro_f1_excluded_labels: Vec<String>,
     per_label: Vec<EvaluateLabelMetrics>,
     type_meaning_quadrant: TypeMeaningQuadrantRecord,
-    // `out_of_scope_label`・`abstention` は後続 issue（#478・#479）が
-    // 型つきで置き換える。それまでは常に `null` を出し、キーの形だけ先に固定する（#480）。
     out_of_scope_label: Option<String>,
     calibration: Option<EvaluateCalibration>,
-    abstention: Option<serde_json::Value>,
+    abstention: Option<EvaluateAbstention>,
+}
+
+/// `evaluate` の `abstention`（validation の T・τ を凍結 test に適用した保留・対象外の件数。
+/// REQ-22・REQ-27・#479・#478）。
+///
+/// 対象外は「答えた」側（評価器の coverage の定義）で、`out_of_scope` は `answered` の内数。
+/// `answered + abstained` は評価件数、`coverage = answered / total`（80% は参考値で合否条件ではない）。
+/// `correct_answered` は答えた行（対象外ラベルの行を含む）のうち正解の件数。`adopted_error` は
+/// 分母 = `answered` で、全件保留のとき `null`。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateAbstention {
+    /// 保留にならず答えた件数（対象外を含む）。
+    pub answered: u64,
+    /// 保留した件数。
+    pub abstained: u64,
+    /// `answered` のうち、argmax が定義の対象外ラベルだった件数（内数）。
+    pub out_of_scope: u64,
+    /// 保留にならず答えた割合（対象外を含む）。
+    pub coverage: f64,
+    /// 答えた行（対象外を含む）のうち正解の件数。
+    pub correct_answered: u64,
+    /// 保留込みの誤り率（分母 = 全件 − 保留。全件保留で `None`）。
+    pub adopted_error: Option<f64>,
+    /// 保留なしの誤り率（分母 = 全件）。
+    pub unconditional_error: f64,
 }
 
 /// `evaluate` の `calibration`（validation だけで決めた温度・保留しきい値。REQ-22・REQ-27・#477）。
@@ -185,6 +208,10 @@ pub struct EvaluateDetails {
     pub type_meaning_quadrant: TypeMeaningQuadrantRecord,
     /// 校正（validation だけから決めたもの。無ければ `None`）。
     pub calibration: Option<EvaluateCalibration>,
+    /// 定義の対象外ラベル（無ければ `None`。#478）。
+    pub out_of_scope_label: Option<String>,
+    /// 保留・対象外の件数（校正が無ければ `None`。#479）。
+    pub abstention: Option<EvaluateAbstention>,
 }
 
 impl EvaluateCompletedReport {
@@ -217,6 +244,14 @@ impl EvaluateCompletedReport {
                     || !(0.0..=1.0).contains(&c.threshold)
                     || !(0.0..=1.0).contains(&c.validation_coverage)
             })
+            || details.abstention.is_some_and(|a| {
+                a.answered.checked_add(a.abstained) != Some(total)
+                    || a.out_of_scope > a.answered
+                    || a.correct_answered > a.answered
+                    || bad(Some(a.coverage))
+                    || bad(a.adopted_error)
+                    || bad(Some(a.unconditional_error))
+            })
         {
             return None;
         }
@@ -232,9 +267,9 @@ impl EvaluateCompletedReport {
             macro_f1_excluded_labels: details.macro_f1_excluded_labels,
             per_label: details.per_label,
             type_meaning_quadrant: details.type_meaning_quadrant,
-            out_of_scope_label: None,
+            out_of_scope_label: details.out_of_scope_label,
             calibration: details.calibration,
-            abstention: None,
+            abstention: details.abstention,
         })
     }
 
@@ -1219,7 +1254,57 @@ mod tests {
                 error: quadrant[4],
             },
             calibration: None,
+            out_of_scope_label: None,
+            abstention: None,
         }
+    }
+
+    /// REQ-22・REQ-27・#479・#478: `abstention`・`out_of_scope_label` つきの JSON が完全一致し、
+    /// `answered + abstained` が評価件数と合わないもの・`out_of_scope > answered`・全件保留の `adopted_error` は `null`。
+    #[test]
+    fn req22_issue479_abstention_json_is_exact() {
+        let build = |a: EvaluateAbstention| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.out_of_scope_label = Some("c".to_string());
+            d.abstention = Some(a);
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        let ok = EvaluateAbstention {
+            answered: 3,
+            abstained: 1,
+            out_of_scope: 1,
+            coverage: 0.75,
+            correct_answered: 3,
+            adopted_error: Some(0.0),
+            unconditional_error: 0.25,
+        };
+        let line = build(ok).expect("report").to_json_line().expect("json");
+        assert!(
+            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25}}"#),
+            "{line}"
+        );
+        let all_abstained = EvaluateAbstention {
+            answered: 0,
+            abstained: 4,
+            out_of_scope: 0,
+            coverage: 0.0,
+            correct_answered: 0,
+            adopted_error: None,
+            unconditional_error: 0.25,
+        };
+        let line = build(all_abstained)
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(line.contains(r#""adopted_error":null,"#), "{line}");
+        assert_eq!(build(EvaluateAbstention { answered: 4, ..ok }), None);
+        assert_eq!(
+            build(EvaluateAbstention {
+                out_of_scope: 4,
+                ..ok
+            }),
+            None
+        );
     }
 
     /// REQ-22・REQ-27・#477: 校正つきの JSON は `calibration` が完全一致し、範囲外のしきい値は作れない。

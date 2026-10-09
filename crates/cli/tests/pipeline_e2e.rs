@@ -1570,10 +1570,12 @@ mod suite {
             "\"per_label\":[{\"label\":\"alpha\",\"support\":4,",
             "\"type_meaning_quadrant\":{\"type_ok_meaning_ok\":",
             "\"out_of_scope_label\":null,\"calibration\":{\"temperature\":",
+            "\"abstention\":{\"answered\":",
         ];
         let at: Vec<usize> = keys.iter().map(|k| out.find(k).expect(k)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{out}");
-        assert!(out.ends_with(",\"abstention\":null}\n"), "{out}");
+        assert!(out.contains(",\"abstention\":{\"answered\":"), "{out}");
+        assert!(out.ends_with("}}\n"), "{out}");
         // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
         let quadrant: f64 = [
             "type_ok_meaning_ok",
@@ -1690,6 +1692,143 @@ mod suite {
                 "{record}"
             );
         }
+    }
+
+    /// `out_of_scope_label` を（あれば）足し、評価データの正解ラベルを（`rotate` なら）すべて alpha にして
+    /// `evaluate` まで進め、stdout・評価記録・予測ファイルを返す（#479・#478）。
+    fn evaluate_with_oos(case: &str, oos: Option<&str>, rotate: bool) -> (String, String, String) {
+        let (env, out) = evaluate_with_oos_env(case, oos, rotate);
+        let read = |rel: &str| std::fs::read_to_string(env.project_file(rel)).expect(rel);
+        (
+            out,
+            read("candidates/1/evaluation_record.json"),
+            read("candidates/1/evaluation_predictions.jsonl"),
+        )
+    }
+
+    /// [`evaluate_with_oos`] と同じ手順で、`evaluate` まで済んだ環境と stdout を返す。
+    fn evaluate_with_oos_env(case: &str, oos: Option<&str>, rotate: bool) -> (Env, String) {
+        let env = Env::new(case, true);
+        if let Some(label) = oos {
+            let text = definition_text().replace(
+                r#""io":{"input":"bytes"}"#,
+                &format!(r#""io":{{"input":"bytes"}},"out_of_scope_label":"{label}""#),
+            );
+            std::fs::write(env.work.join("def").join("definition.json"), text).expect("def");
+        }
+        if rotate {
+            let rotated = evaluation_jsonl()
+                .replace("\"intent\":\"gamma\"", "\"intent\":\"alpha\"")
+                .replace("\"intent\":\"beta\"", "\"intent\":\"alpha\"");
+            std::fs::write(env.work.join("def").join("evaluation.jsonl"), rotated).expect("eval");
+        }
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+        (env, out)
+    }
+
+    /// REQ-22・REQ-27・#479・#478: 保留の件数を持つ評価記録から対象外ラベルの欄だけ消すと、
+    /// `package` は 64 で公開しない。元に戻せば成功する。
+    pub fn package_rejects_abstention_record_without_out_of_scope_label() {
+        let (env, _) = evaluate_with_oos_env("pkg-oos", Some("alpha"), false);
+        let record_path = env.project_file("candidates/1/evaluation_record.json");
+        let original = std::fs::read_to_string(&record_path).expect("record");
+        assert!(original.contains("\"abstention\":{"), "{original}");
+        let dropped = original.replacen("\"out_of_scope_label\":\"alpha\",", "", 1);
+        assert_ne!(dropped, original);
+        std::fs::write(&record_path, dropped).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&record_path, original).expect("restore");
+        env.ok(&PACKAGE);
+    }
+
+    /// `"abstention":{...}` の部分文字列。
+    fn abstention_json(json: &str) -> &str {
+        let start = json.find("\"abstention\":{").expect("abstention");
+        let rest = &json[start..];
+        &rest[..=rest.find('}').expect("end")]
+    }
+
+    /// REQ-22・REQ-27・#479・#478: `abstention` は validation の T・τ を凍結 test に適用した件数で、
+    /// 対象外ラベルは τ ではなく定義の `out_of_scope_label` で数える。対象外は answered の内数で、
+    /// answered + abstained が 12、coverage = answered / 12。対象外を指定しても `calibration` は不変で、評価データの正解ラベルを入れ替えても
+    /// 件数（正解数以外）は変わらない。
+    pub fn evaluate_abstention_counts_out_of_scope_within_answered() {
+        let (plain, plain_record, preds) = evaluate_with_oos("abst-plain", None, false);
+        let a = abstention_json(&plain);
+        let n = |json: &str, key: &str| number_field(json, key) as u64;
+        assert_eq!(n(a, "out_of_scope"), 0, "{plain}");
+        assert_eq!(n(a, "answered") + n(a, "abstained"), 12, "{plain}");
+        assert!(
+            (number_field(a, "coverage") - n(a, "answered") as f64 / 12.0).abs() < 1e-9,
+            "{plain}"
+        );
+        assert!(a.contains("\"adopted_error\":"), "{plain}");
+        assert!(
+            plain_record.contains(&format!(
+                "\"abstention\":{{\"answered\":{},\"abstained\":{},\"out_of_scope\":0,\"correct_answered\":{}}}",
+                n(a, "answered"),
+                n(a, "abstained"),
+                n(a, "correct_answered")
+            )),
+            "{plain_record}"
+        );
+        assert!(
+            !plain_record.contains("\"out_of_scope_label\""),
+            "{plain_record}"
+        );
+
+        // 最も多く予測されたラベルを対象外にする（argmax が対象外の行が必ず存在する）。
+        let oos = LABELS
+            .iter()
+            .max_by_key(|l| {
+                preds
+                    .matches(&format!("\"predicted_label\":\"{l}\""))
+                    .count()
+            })
+            .expect("label");
+        let argmax_oos = preds
+            .matches(&format!("\"predicted_label\":\"{oos}\""))
+            .count() as u64;
+        assert!(argmax_oos > 0);
+        let (out, record, _) = evaluate_with_oos("abst-oos", Some(oos), false);
+        let b = abstention_json(&out);
+        assert!(
+            out.contains(&format!("\"out_of_scope_label\":\"{oos}\",\"calibration\"")),
+            "{out}"
+        );
+        assert_eq!(n(b, "out_of_scope"), argmax_oos, "{out}");
+        assert_eq!(n(b, "answered") + n(b, "abstained"), 12, "{out}");
+        assert!(n(b, "out_of_scope") <= n(b, "answered"), "{out}");
+        assert!(
+            (number_field(b, "coverage") - n(b, "answered") as f64 / 12.0).abs() < 1e-9,
+            "{out}"
+        );
+        // 対象外の行は保留から外れ、残りの判定は対象外なしと同じ T・τ のまま。
+        assert!(n(b, "abstained") <= n(a, "abstained"), "{out}");
+        assert_eq!(calibration_json(&out), calibration_json(&plain));
+        assert!(
+            record.contains(&format!(
+                "\"out_of_scope_label\":\"{oos}\",\"abstention\":{{"
+            )),
+            "{record}"
+        );
+
+        // 凍結 test の正解ラベルを入れ替えても、保留・対象外の件数は変わらない（正解数だけが変わる）。
+        let (rotated, _, _) = evaluate_with_oos("abst-rot", Some(oos), true);
+        let c = abstention_json(&rotated);
+        for key in ["answered", "abstained", "out_of_scope"] {
+            assert_eq!(n(b, key), n(c, key), "{out}\n{rotated}");
+        }
+        assert_eq!(calibration_json(&out), calibration_json(&rotated));
     }
 
     /// REQ-27: `evaluate` の前後で、モデル（ONNX・`artifact.json`）と評価データの sha256 が一致し、
@@ -2895,6 +3034,18 @@ mod suite {
             "quadrant"
         );
         assert!(!env.project_file("package").exists());
+        // REQ-22・#479: 保留の件数があるのに校正だけ消した改変も公開できない。
+        let start = original.find(",\"calibration\":{").expect("calibration");
+        let end = start + original[start..].find('}').expect("calibration end") + 1;
+        let mut dropped = original.clone();
+        dropped.replace_range(start..end, "");
+        assert!(dropped.contains("\"abstention\":{"), "{dropped}");
+        std::fs::write(&record_path, dropped).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            mismatch,
+            "abstention"
+        );
         let unknown = original.trim_end().trim_end_matches('}').to_string() + ",\"extra\":1}\n";
         std::fs::write(&record_path, unknown).expect("tamper");
         assert_eq!(
@@ -3394,6 +3545,14 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_calibration_ignores_frozen_test_labels",
             suite::evaluate_calibration_ignores_frozen_test_labels,
+        ),
+        (
+            "evaluate_abstention_counts_out_of_scope_within_answered",
+            suite::evaluate_abstention_counts_out_of_scope_within_answered,
+        ),
+        (
+            "package_rejects_abstention_record_without_out_of_scope_label",
+            suite::package_rejects_abstention_record_without_out_of_scope_label,
         ),
         (
             "evaluate_keeps_model_and_evaluation_hashes",

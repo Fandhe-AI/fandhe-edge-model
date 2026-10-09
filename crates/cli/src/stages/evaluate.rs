@@ -67,7 +67,7 @@
 //!
 //! # 未接続（実装済みを装わない）
 //!
-//! 診断レポート（REQ-29）・棄権（REQ-22。`abstention` は #479）は結線していない。Wilson 区間は評価記録・結果 JSON には
+//! 診断レポート（REQ-29）は結線していない。Wilson 区間は評価記録・結果 JSON には
 //! 含めず、合否基準の照合で `package` 工程が使う（#328）。結果 JSON は正解率と Macro-F1 のみ
 //! （スキーマは 2026-09-30 オーナー承認済み）。
 //!
@@ -81,6 +81,14 @@
 //! オーナー決定 2026-10-09）。最小件数は設けず、少件数でも T・τ が確定する。件数は `n_validation` で
 //! 利用者に示す（REQ-22 に基準なし。オーナー判断 2026-10-09）。T・τ を決める口は定義にも CLI 引数にも無い。
 //!
+//! # 保留と対象外（REQ-22・REQ-27・#479・#478）
+//!
+//! 校正があるとき、凍結 test の各行のスコア `ln(p)` に validation で決めた T・τ を適用して保留・対象外を
+//! 数え、`abstention` と評価記録へ出す（[`count_abstention`]。評価器の
+//! `compare_abstention_with_out_of_scope` を呼ぶだけ）。T・τ を test から決め直さない。対象外は τ ではなく
+//! 定義の `out_of_scope_label` で判定する。対象外は「答えた」側で、`out_of_scope` は `answered` の内数
+//! （`answered + abstained` が評価件数、`coverage = answered / total`）（80% は参考値で合否条件にしない）。校正が `null` なら `abstention` も `null`。
+
 //! # 下限基準との比較（REQ-25・REQ-27・#339）
 //!
 //! 定義に `baseline_comparison`（事前登録した仮定）があるときだけ、majority との McNemar 比較
@@ -94,19 +102,21 @@ use std::time::Instant;
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::evaluation_record::{
-    CalibrationRecord, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES, TypeMeaningQuadrantRecord,
+    AbstentionRecord, CalibrationRecord, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES,
+    TypeMeaningQuadrantRecord,
 };
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 use fandhe_edge_core::stage_report::{
-    EvaluateCalibration, EvaluateCompletedReport, EvaluateDetails, EvaluateLabelMetrics,
-    EvaluateReport, PredictionLine, PredictionLineOutcome,
+    EvaluateAbstention, EvaluateCalibration, EvaluateCompletedReport, EvaluateDetails,
+    EvaluateLabelMetrics, EvaluateReport, PredictionLine, PredictionLineOutcome,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::Split;
+use fandhe_edge_eval::abstention::{OutOfScopeLabel, compare_abstention_with_out_of_scope};
 use fandhe_edge_eval::calibration::{
     Calibration, CalibrationRecord as CalibrationInput, MAX_CALIBRATION_CELLS, calibrate,
 };
@@ -474,7 +484,7 @@ fn calibrate_on_validation(
     let options = definition.options();
     // 推論とロジットの確保の前に「件数 × 選択肢数」を、バッチ推論の保持スコア上限と
     // 校正の計算量上限の小さい方で検証する（REQ-39 資源の上限）。
-    if !validation_cells_within_limit(validation.len(), options.len()) {
+    if !score_cells_within_limit(validation.len(), options.len()) {
         return Err(fail(
             ExitCode::LimitExceeded,
             "validation data has too many scores",
@@ -513,8 +523,8 @@ fn calibrate_on_validation(
     calibrate_checked(&labels, &inputs).map(Some)
 }
 
-/// 校正用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
-fn validation_cells_within_limit(records: usize, options: usize) -> bool {
+/// 校正・保留の計算用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
+fn score_cells_within_limit(records: usize, options: usize) -> bool {
     records
         .checked_mul(options)
         .is_some_and(|n| n <= MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS))
@@ -642,6 +652,19 @@ fn finalize_evaluation(
             Some(record)
         }
     };
+    // 保留・対象外の件数。T・τ は適用権を取る前に validation から確定した値をそのまま使う
+    // （凍結 test の結果で決め直さない。REQ-22・REQ-27・#479）。
+    let abstention = match calibration {
+        None => None,
+        Some(c) => Some(count_abstention(
+            c,
+            &labels,
+            definition.out_of_scope_label(),
+            &applied.golds,
+            predictions.scores,
+            correct,
+        )?),
+    };
     let q = &computed.type_meaning_quadrant;
     let quadrant = TypeMeaningQuadrantRecord {
         type_ok_meaning_ok: q.type_ok_meaning_ok(),
@@ -672,6 +695,8 @@ fn finalize_evaluation(
             n_validation: c.n_validation(),
             validation_coverage: c.validation_coverage().value(),
         }),
+        out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
+        abstention: abstention.map(|(report, _)| report),
     };
     let report = EvaluateCompletedReport::completed(
         candidate,
@@ -707,6 +732,8 @@ fn finalize_evaluation(
             n_validation: c.n_validation(),
             validation_answered: c.validation_coverage().numerator(),
         }),
+        out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
+        abstention: abstention.map(|(_, record)| record),
     };
     let record_json = record
         .to_json_vec()
@@ -725,6 +752,77 @@ fn finalize_evaluation(
     project.set_read_only(predictions.rel)?;
     project.write_new(record_rel, &record_json)?;
     Ok(report)
+}
+
+/// 凍結 test の各行のスコア（確率）から `ln(p)` をロジットとして、validation で決めた T・τ を適用し、
+/// 保留・対象外の件数を数える（REQ-22・REQ-27・#479・#478）。評価ロジックは評価器の
+/// [`compare_abstention_with_out_of_scope`] に委ね、CLI では再実装しない。
+///
+/// 対象外は τ ではなく定義の `out_of_scope_label` で判定する（REQ-22 異常系）。対象外は「答えた」側で、
+/// `out_of_scope` は `answered` の内数（`answered + abstained` が評価件数、`coverage = answered / total`）。
+/// `correct_answered`・`adopted_error`（分母 = 全件 − 保留 = `answered`）も対象外の行を採用判定に含める
+/// （評価器の定義どおり）。計算に失敗したら握りつぶさず `runtime_error`。
+fn count_abstention(
+    calibration: &Calibration,
+    labels: &[&str],
+    out_of_scope_label: Option<&str>,
+    golds: &[String],
+    scores: &[Vec<f64>],
+    expected_correct: u64,
+) -> Result<(EvaluateAbstention, AbstentionRecord), ErrorReport> {
+    let fail_abstention = || runtime("abstention failed");
+    if golds.len() != scores.len() {
+        return Err(fail_abstention());
+    }
+    // ロジットの複製を確保する前に総数を上限で検証する（REQ-39 資源の上限）。
+    if !score_cells_within_limit(scores.len(), labels.len()) {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "evaluation data has too many scores",
+        ));
+    }
+    let logits: Vec<Vec<f64>> = scores
+        .iter()
+        .map(|s| s.iter().map(|p| p.ln()).collect())
+        .collect();
+    let inputs: Vec<CalibrationInput<'_>> = golds
+        .iter()
+        .zip(&logits)
+        .map(|(g, l)| CalibrationInput { gold: g, logits: l })
+        .collect();
+    let oos = out_of_scope_label
+        .map(|id| OutOfScopeLabel::new(calibration, id))
+        .transpose()
+        .map_err(|_| fail_abstention())?;
+    let cmp = compare_abstention_with_out_of_scope(labels, calibration, oos.as_ref(), &inputs)
+        .map_err(|_| fail_abstention())?;
+    // 保留なしの正解数は評価指標の `correct` と別経路（評価器の argmax）で求まる。ずれは記録前に止める。
+    if cmp.without_abstention().accuracy.overall.numerator() != expected_correct {
+        return Err(runtime("abstention disagrees with metrics"));
+    }
+    let cov = cmp.coverage();
+    let with = cmp.with_abstention();
+    let out_of_scope = cmp.out_of_scope();
+    let answered = cov.answered();
+    let abstained = cov.abstained();
+    let correct_answered = with.accuracy.overall.numerator();
+    Ok((
+        EvaluateAbstention {
+            answered,
+            abstained,
+            out_of_scope,
+            coverage: cov.coverage().value(),
+            correct_answered,
+            adopted_error: cmp.adopted_error().map(|r| r.value()),
+            unconditional_error: cmp.unconditional_error().value(),
+        },
+        AbstentionRecord {
+            answered,
+            abstained,
+            out_of_scope,
+            correct_answered,
+        },
+    ))
 }
 
 /// 1 件ごとの予測の保存に必要な材料（書き込み先・評価データの id 列・推論ごとのスコア）。
@@ -995,10 +1093,10 @@ mod tests {
     #[test]
     fn req39_validation_cells_are_limited_before_inference() {
         let limit = MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS);
-        assert!(validation_cells_within_limit(limit, 1));
-        assert!(!validation_cells_within_limit(limit + 1, 1));
-        assert!(!validation_cells_within_limit(100_000, 1024));
-        assert!(!validation_cells_within_limit(usize::MAX, 2));
+        assert!(score_cells_within_limit(limit, 1));
+        assert!(!score_cells_within_limit(limit + 1, 1));
+        assert!(!score_cells_within_limit(100_000, 1024));
+        assert!(!score_cells_within_limit(usize::MAX, 2));
     }
 
     #[test]
@@ -1010,6 +1108,90 @@ mod tests {
         let err = calibrate_checked(&["a", "b"], &bad).expect_err("length mismatch");
         assert_eq!(err.code, ExitCode::RuntimeError);
         assert_eq!(err.message, "calibration failed");
+    }
+
+    /// REQ-22・REQ-27・#479・#478: validation の T・τ を test のスコアに適用すると、確信度の低い誤りが
+    /// 保留になって `adopted_error < unconditional_error`、argmax が対象外ラベルの行は τ に関係なく
+    /// `out_of_scope` に数えられ（`answered` の内数）、保留にならない（`answered + abstained` は評価件数）。
+    #[test]
+    fn req22_issue479_count_abstention_counts_out_of_scope_within_answered() {
+        let labels = ["a", "b", "c"];
+        let confident = |i: usize| {
+            let mut p = [0.05_f64; 3];
+            p[i] = 0.9;
+            p.to_vec()
+        };
+        let unsure = vec![0.45, 0.40, 0.15];
+        // validation: 確信度の高い正解 9 件と、確信度の低い誤り 2 件（τ は 11 件の下から 3 番目の確信度）。
+        let mut validation: Vec<(&str, Vec<f64>)> = Vec::new();
+        for _ in 0..4 {
+            validation.push(("a", confident(0)));
+            validation.push(("b", confident(1)));
+        }
+        validation.push(("b", confident(1)));
+        validation.push(("b", unsure.clone()));
+        validation.push(("b", vec![0.5, 0.4, 0.1]));
+        let logits = |p: &[f64]| p.iter().map(|v| v.ln()).collect::<Vec<f64>>();
+        let val_logits: Vec<Vec<f64>> = validation.iter().map(|(_, p)| logits(p)).collect();
+        let inputs: Vec<CalibrationInput<'_>> = validation
+            .iter()
+            .zip(&val_logits)
+            .map(|((g, _), l)| CalibrationInput { gold: g, logits: l })
+            .collect();
+        let calibration = calibrate_checked(&labels, &inputs).expect("calibrate");
+        // test: 確信度の高い正解 4 件、確信度の低い誤り 2 件、argmax が対象外 c の行 2 件（正解 1・誤り 1）。
+        let cases: [(&str, Vec<f64>); 8] = [
+            ("a", confident(0)),
+            ("a", confident(0)),
+            ("b", confident(1)),
+            ("b", confident(1)),
+            ("b", unsure.clone()),
+            ("b", unsure),
+            ("c", vec![0.2, 0.1, 0.7]),
+            ("a", vec![0.3, 0.2, 0.5]),
+        ];
+        let golds: Vec<String> = cases.iter().map(|(g, _)| g.to_string()).collect();
+        let scores: Vec<Vec<f64>> = cases.iter().map(|(_, p)| p.clone()).collect();
+        let (plain, _) =
+            count_abstention(&calibration, &labels, None, &golds, &scores, 5).expect("plain");
+        let (report, record) =
+            count_abstention(&calibration, &labels, Some("c"), &golds, &scores, 5).expect("oos");
+        // 保留なしの正解数が評価指標とずれたら記録前に止める。
+        assert_eq!(
+            count_abstention(&calibration, &labels, None, &golds, &scores, 4)
+                .expect_err("mismatch")
+                .message,
+            "abstention disagrees with metrics"
+        );
+        // 対象外なし: 確信度の高い 4 件だけが答え、残り 4 件（対象外ラベルの 2 件を含む）は保留。
+        assert_eq!(
+            (
+                plain.answered,
+                plain.abstained,
+                plain.out_of_scope,
+                plain.correct_answered
+            ),
+            (4, 4, 0, 4)
+        );
+        assert_eq!(plain.adopted_error, Some(0.0));
+        // 対象外あり: argmax が c の 2 件は保留でなく answered に入り、うち 2 件が out_of_scope（内数）。
+        // 答えた行は 4 + 対象外 2 の 6 件で coverage 6/8、正解は 4 + gold が c の 1 件、誤りは 1/6。
+        assert_eq!(
+            (
+                report.answered,
+                report.abstained,
+                report.out_of_scope,
+                report.correct_answered
+            ),
+            (6, 2, 2, 5)
+        );
+        assert_eq!(record.answered + record.abstained, 8);
+        assert!(record.out_of_scope <= record.answered);
+        assert!((report.coverage - report.answered as f64 / 8.0).abs() < 1e-9);
+        assert!((report.coverage - 0.75).abs() < 1e-9);
+        assert!((report.adopted_error.expect("answered") - 1.0 / 6.0).abs() < 1e-9);
+        assert!((report.unconditional_error - 0.375).abs() < 1e-9);
+        assert!(report.adopted_error.expect("answered") < report.unconditional_error);
     }
 
     const DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#;
