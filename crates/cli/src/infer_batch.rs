@@ -257,11 +257,30 @@ pub fn judgment_from_prediction(
     id: &str,
     prediction: &Prediction,
 ) -> Result<JudgmentResult, ErrorReport> {
+    judgment_from_prediction_scoped(options, None, id, prediction)
+}
+
+/// [`judgment_from_prediction`] に定義の `out_of_scope_label` を渡す版（`infer` 用。REQ-22・#478）。
+/// argmax がそのラベルなら `status` を `out_of_scope` にする（`None` なら従来と同じ）。
+///
+/// # Errors
+/// [`judgment_from_prediction`] と同じ。
+pub fn judgment_from_prediction_scoped(
+    options: &[Choice],
+    out_of_scope_label: Option<&str>,
+    id: &str,
+    prediction: &Prediction,
+) -> Result<JudgmentResult, ErrorReport> {
     let choice = options
         .get(prediction.label_index())
         .ok_or_else(|| report(ExitCode::RuntimeError))?;
-    JudgmentResult::new(options, id, &choice.id, prediction.scores())
-        .map_err(|error| judgment_error_report(&error))
+    let result = JudgmentResult::new(options, id, &choice.id, prediction.scores())
+        .map_err(|error| judgment_error_report(&error))?;
+    Ok(if out_of_scope_label == Some(choice.id.as_str()) {
+        result.into_out_of_scope()
+    } else {
+        result
+    })
 }
 
 /// バッチ全体の総出力バイト数の上限（暫定。REQ-39）。
@@ -379,6 +398,7 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     io: &IoSchema,
     options: &[Choice],
     pipeline: &InferencePipeline<P, B>,
+    out_of_scope_label: Option<&str>,
     deadline: Option<Instant>,
     output_byte_limit: usize,
 ) -> Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport> {
@@ -398,7 +418,10 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
                     .map_or_else(|| report(ExitCode::RuntimeError), |e| e.to_error_report()));
             }
         };
-        let result = judgment_from_prediction(options, record.id(), &prediction)?;
+        // 書き込み（`write_results`）と同じ関数・同じ値で行を作り、出力量を照合する（REQ-39・REQ-22。
+        // 対象外の行は `status` が長いため、ok 前提の長さで数えると実出力が上限を超えうる）。
+        let result =
+            judgment_from_prediction_scoped(options, out_of_scope_label, record.id(), &prediction)?;
         let line = result
             .to_json_line()
             .map_err(|_| report(ExitCode::RuntimeError))?;
@@ -449,6 +472,35 @@ where
     emit_infer_batch_with_limits(out, reader, io, options, pipeline, BatchLimits::default())
 }
 
+/// [`emit_infer_batch`] に定義の `out_of_scope_label` を渡す版（REQ-22・#478）。行の `status` だけが
+/// 変わり、終了コードは全行を計算できれば 0 のまま。
+pub(crate) fn emit_infer_batch_scoped<W, R, P, B>(
+    out: &mut W,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    out_of_scope_label: Option<&str>,
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_batch_inner(
+        out,
+        None,
+        reader,
+        io,
+        options,
+        out_of_scope_label,
+        pipeline,
+        BatchLimits::default(),
+        StallPolicy::TerminateProcess,
+    )
+}
+
 /// [`emit_infer_batch`] の資源上限を指定できる版（REQ-39）。
 ///
 /// 読み取り・推論・出力量の検証は専用スレッドで行い、呼び出し側は `limits.duration` で
@@ -484,6 +536,7 @@ where
         reader,
         io,
         options,
+        None,
         pipeline,
         limits,
         StallPolicy::TerminateProcess,
@@ -535,6 +588,7 @@ pub(crate) fn emit_infer_batch_split<W, R, P, B>(
     reader: R,
     io: &IoSchema,
     options: &[Choice],
+    out_of_scope_label: Option<&str>,
     pipeline: Arc<InferencePipeline<P, B>>,
 ) -> io::Result<ExitCode>
 where
@@ -549,6 +603,7 @@ where
         reader,
         io,
         options,
+        out_of_scope_label,
         pipeline,
         BatchLimits::default(),
         StallPolicy::TerminateProcess,
@@ -567,6 +622,7 @@ pub(crate) fn emit_infer_batch_inner<W, R, P, B>(
     reader: R,
     io: &IoSchema,
     options: &[Choice],
+    out_of_scope_label: Option<&str>,
     pipeline: Arc<InferencePipeline<P, B>>,
     limits: BatchLimits,
     policy: StallPolicy,
@@ -583,6 +639,7 @@ where
     let (tx, rx) = mpsc::channel();
     let worker_io = io.clone();
     let worker_options = options.to_vec();
+    let worker_oos = out_of_scope_label.map(str::to_string);
     let worker_pipeline = Arc::clone(&pipeline);
     let output_bytes = limits.output_bytes;
     let spawned = thread::Builder::new()
@@ -593,6 +650,7 @@ where
                 &worker_io,
                 &worker_options,
                 &worker_pipeline,
+                worker_oos.as_deref(),
                 deadline,
                 output_bytes,
             );
@@ -642,9 +700,15 @@ where
             } else {
                 WriteFailure::Stdout
             };
-            write_results(&mut sink, options, &records, &predictions)
-                .map(|()| ExitCode::Ok)
-                .map_err(to_failure)
+            write_results(
+                &mut sink,
+                options,
+                out_of_scope_label,
+                &records,
+                &predictions,
+            )
+            .map(|()| ExitCode::Ok)
+            .map_err(to_failure)
         }
         Err(error) => emit_error_report(out, &error).map_err(WriteFailure::Stdout),
     };
@@ -659,14 +723,16 @@ where
 fn write_results(
     sink: &mut &mut dyn Write,
     options: &[Choice],
+    out_of_scope_label: Option<&str>,
     records: &[InferInput],
     predictions: &[Prediction],
 ) -> io::Result<()> {
     for (record, prediction) in records.iter().zip(predictions) {
         // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
         // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
-        let result = judgment_from_prediction(options, record.id(), prediction)
-            .map_err(|error| io::Error::other(error.message))?;
+        let result =
+            judgment_from_prediction_scoped(options, out_of_scope_label, record.id(), prediction)
+                .map_err(|error| io::Error::other(error.message))?;
         write_ok_judgment(sink, &result)?;
     }
     Ok(())
@@ -782,6 +848,27 @@ where
     )
 }
 
+/// [`emit_infer_single`] に定義の `out_of_scope_label` を渡す版（REQ-22・#478）。argmax がその
+/// ラベルなら判定行の `status` は `out_of_scope` で、終了コードは 11。
+pub(crate) fn emit_infer_single_scoped<W, P, B>(
+    out: &mut W,
+    call: SingleCall<'_>,
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_single_inner(
+        out,
+        pipeline,
+        call,
+        default_single_limits(),
+        StallPolicy::TerminateProcess,
+    )
+}
+
 /// [`emit_infer_single`] の上限を指定できる版。停止の回収は常にプロセス終了（CLI の 1 呼び出し
 /// 1 プロセス専用。[`emit_infer_batch_with_limits`] と同じ）。
 ///
@@ -810,6 +897,7 @@ where
         SingleCall {
             io,
             options,
+            out_of_scope_label: None,
             id,
             text,
         },
@@ -822,6 +910,8 @@ where
 pub(crate) struct SingleCall<'a> {
     pub(crate) io: &'a IoSchema,
     pub(crate) options: &'a [Choice],
+    /// 定義の `out_of_scope_label`（REQ-22・#478）。
+    pub(crate) out_of_scope_label: Option<&'a str>,
     pub(crate) id: &'a str,
     pub(crate) text: &'a str,
 }
@@ -842,6 +932,7 @@ where
     let SingleCall {
         io,
         options,
+        out_of_scope_label,
         id,
         text,
     } = call;
@@ -852,12 +943,18 @@ where
     let cooperative = limits.duration;
     let hard = cooperative.saturating_add(SINGLE_HARD_LIMIT_GRACE);
     let worker_options = options.to_vec();
+    let worker_oos = out_of_scope_label.map(str::to_string);
     let outcome = run_with_stall_guard(out, hard, limits.output_duration, policy, move || {
         // 推論側へ渡すのは `input` のみ（REQ-27）。
         let prediction = pipeline
             .infer_one_within(input.input(), cooperative)
             .map_err(|e| e.to_error_report())?;
-        judgment_from_prediction(&worker_options, input.id(), &prediction)
+        judgment_from_prediction_scoped(
+            &worker_options,
+            worker_oos.as_deref(),
+            input.id(),
+            &prediction,
+        )
     });
     // 書き込みの停止も期限でプロセス終了へ倒す（バッチと同じ見張り）。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
@@ -1049,6 +1146,7 @@ mod tests {
             definition.io(),
             definition.options(),
             &pipeline,
+            None,
             deadline,
             usize::MAX,
         )
@@ -1147,6 +1245,7 @@ mod tests {
             ),
             definition.io(),
             definition.options(),
+            None,
             pipeline,
             BatchLimits {
                 output_duration: Duration::from_millis(50),
@@ -1159,6 +1258,140 @@ mod tests {
         let text = String::from_utf8(out.0).unwrap();
         assert_eq!(text.matches('\n').count(), 2);
         assert!(!text.contains("\"code\""));
+    }
+
+    /// 先頭バイトが `b` なら b 優勢、それ以外は a 優勢（対象外ラベルの argmax 制御用）。
+    struct MixBackend;
+    impl ScoringBackend for MixBackend {
+        fn scores(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            Ok(if ids.as_slice().first() == Some(&98) {
+                vec![0.25, 0.5, 0.25]
+            } else {
+                vec![0.5, 0.25, 0.25]
+            })
+        }
+        fn scores_limited(
+            &self,
+            ids: &fandhe_edge_runtime::pipeline::TokenIds,
+            _limit: Duration,
+        ) -> Result<Vec<f64>, fandhe_edge_runtime::pipeline::BackendError> {
+            self.scores(ids)
+        }
+    }
+
+    fn abc_definition() -> fandhe_edge_core::definition::Definition {
+        fandhe_edge_core::definition::Definition::parse(
+            r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,
+"judgment_type":"single_select","options":[
+{"id":"a","display_name":"A","description":"a"},
+{"id":"b","display_name":"B","description":"b"},
+{"id":"c","display_name":"C","description":"c"}],"io":{"input":"bytes"}}"#,
+        )
+        .expect("valid definition")
+    }
+
+    /// REQ-22・REQ-21: `--text` は argmax が対象外ラベルなら exit 11・`status:"out_of_scope"`、
+    /// それ以外は exit 0・`ok`。`out_of_scope_label` なしは従来と同じ（exit 0）。
+    #[test]
+    fn req22_single_out_of_scope_label_argmax_exits_11() {
+        let definition = abc_definition();
+        let run = |oos: Option<&str>, text: &str| {
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_infer_single_scoped(
+                &mut out,
+                SingleCall {
+                    io: definition.io(),
+                    options: definition.options(),
+                    out_of_scope_label: oos,
+                    id: "t",
+                    text,
+                },
+                Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+            )
+            .unwrap();
+            (code, String::from_utf8(out).unwrap())
+        };
+        let row = |status: &str, label: &str, scores: &str| {
+            format!(
+                "{{\"id\":\"t\",\"status\":\"{status}\",\"predicted_label\":\"{label}\",\"scores\":{scores}}}\n"
+            )
+        };
+        let a_scores = "{\"a\":0.5,\"b\":0.25,\"c\":0.25}";
+        let b_scores = "{\"a\":0.25,\"b\":0.5,\"c\":0.25}";
+        assert_eq!(
+            run(Some("a"), "x"),
+            (ExitCode::OutOfScope, row("out_of_scope", "a", a_scores))
+        );
+        assert_eq!(
+            run(Some("a"), "b"),
+            (ExitCode::Ok, row("ok", "b", b_scores))
+        );
+        assert_eq!(run(None, "x"), (ExitCode::Ok, row("ok", "a", a_scores)));
+    }
+
+    /// REQ-22・REQ-21・REQ-28: `--input-file` は対象外の行が混じっても exit 0 で、該当行だけ
+    /// `out_of_scope`。scores は単件と同じ。
+    #[test]
+    fn req22_batch_out_of_scope_rows_keep_exit_0_and_mark_only_those_rows() {
+        let definition = abc_definition();
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_infer_batch_scoped(
+            &mut out,
+            std::io::Cursor::new(
+                b"{\"id\":\"r1\",\"input\":\"x\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n".to_vec(),
+            ),
+            definition.io(),
+            definition.options(),
+            Some("a"),
+            Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"id\":\"r1\",\"status\":\"out_of_scope\",\"predicted_label\":\"a\",\"scores\":{\"a\":0.5,\"b\":0.25,\"c\":0.25}}\n\
+             {\"id\":\"r2\",\"status\":\"ok\",\"predicted_label\":\"b\",\"scores\":{\"a\":0.25,\"b\":0.5,\"c\":0.25}}\n"
+        );
+    }
+
+    /// REQ-39・REQ-22: 出力量の上限は書き込みと同じ行（対象外の行は `out_of_scope`）で照合する。
+    /// ok 前提の長さでは上限内でも実出力は超える上限で `limit_exceeded`（20）となり、何も書かない。
+    #[test]
+    fn req39_output_limit_counts_out_of_scope_rows_as_written() {
+        let definition = abc_definition();
+        let input = b"{\"id\":\"r1\",\"input\":\"x\"}\n{\"id\":\"r2\",\"input\":\"x\"}\n".to_vec();
+        let run_with = |oos: Option<&str>, output_bytes: usize| {
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_infer_batch_inner(
+                &mut out,
+                None,
+                std::io::Cursor::new(input.clone()),
+                definition.io(),
+                definition.options(),
+                oos,
+                Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+                BatchLimits {
+                    output_bytes,
+                    ..BatchLimits::default()
+                },
+                StallPolicy::Leak,
+            )
+            .unwrap();
+            (code, String::from_utf8(out).unwrap())
+        };
+        let (code, ok_text) = run_with(None, usize::MAX);
+        assert_eq!(code, ExitCode::Ok);
+        // 2 行とも対象外なら、`"ok"` が `"out_of_scope"` になり 1 行あたり 10 バイト増える。
+        let ok_len = ok_text.len();
+        let (code, text) = run_with(Some("a"), ok_len + 19);
+        assert_eq!(code, ExitCode::LimitExceeded);
+        assert!(!text.contains("predicted_label"));
+        let (code, text) = run_with(Some("a"), ok_len + 20);
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(text.len(), ok_len + 20);
     }
 
     /// REQ-39: 回収しない方式（テスト専用）では、返らない処理を期限で見切って `limit_exceeded`（20）を

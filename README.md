@@ -47,6 +47,8 @@
 
 定義ファイルに省略可能な `baseline_comparison`（例 `{"assumed_p_b_bp":1500,"assumed_p_c_bp":500,"power_bp":8000}`）を書いたときだけ、`evaluate` は下限基準（majority）との McNemar 比較を行い、結果（`majority_label`・`baseline_correct`・`b`・`c`・`required_n`・`verdict`）を評価記録 `evaluation_record.json` の `baseline_comparison` に残します（出力 JSON は変わりません。REQ-25・#339）。3 つの値は 1 万分率の整数で、`assumed_p_b_bp`・`assumed_p_c_bp` は 0..=10000（`p_b > p_c`・和は 10000 以下）、`power_bp` は 1..=9999、有意水準 α は 0.05 で固定です。`verdict` は `significantly_better`・`not_significantly_better`・`undeterminable`（評価件数が仮定から事前計算した必要件数に満たない）です。majority は train 分割のラベルだけから作り（validation・評価データは使わない）、最終 test の適用前に確定します。`package` は記録の比較欄を計算し直して照合し、majority・必要件数・`baseline_correct`（凍結した評価データから数え直し）・件数の整合・`verdict` の改変、欄の有無の食い違いは `invalid_input` で止めます。`b` と `c` を同じ量だけずらす改変は検出できません（候補の予測の封印記録が要る。#168 の範囲）。`verdict` は `package` の合否（`judgment`・終了コード）には使いません（記録と照合のみ。`baseline_comparison` だけの定義の `package` は `judgment:null`・`acceptance_defined:false`・exit 0 で、`acceptance` と併記しても合否は正解率だけで決まります。#344）。
 
+定義ファイルに省略可能な `out_of_scope_label`（`options[].id` のいずれか）を書くと、`infer` は argmax がそのラベルの行の `status` を `out_of_scope` にします（行の形は `ok` と同じで、`scores` も変わりません。`JudgmentStatus` の値は `ok`・`out_of_scope`）。`infer --text` はその行を stdout に出して exit 11（`out_of_scope`。`{"code","message"}` 形ではない）で終わり、`infer --input-file`（`--out` を含む）は全行を計算できれば exit 0 のままで、行の `status` で区別します（`--out` の要約は不変）。存在しない id・`null`・空文字・文字列以外は `invalid_input`、省略時は従来と同じ出力で定義の正準化ハッシュも変わりません（REQ-22・REQ-21・TASK-22.2・#478。`evaluate` への出力は後続）。
+
 ## 開発環境構築
 
 ```bash

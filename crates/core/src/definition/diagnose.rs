@@ -301,9 +301,20 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         }
     }
 
+    // 5e. out_of_scope_label（省略可能。#478）。キーがあれば string。`null` は型エラー。
+    if let Some(value) = root.get("out_of_scope_label")
+        && !value.is_string()
+    {
+        return Some(DefinitionError::TypeMismatch {
+            field: FieldPath::OutOfScopeLabel,
+            expected: ExpectedType::String,
+            actual: json_type(value),
+        });
+    }
+
     // 6. トップレベルの未知キー（`serde_json::Map` は既定で `BTreeMap` の
     // ためキー順走査は決定的）。
-    const KNOWN_TOP_LEVEL_KEYS: [&str; 9] = [
+    const KNOWN_TOP_LEVEL_KEYS: [&str; 10] = [
         "schema",
         "name",
         "version",
@@ -313,6 +324,7 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         "acceptance",
         "limits",
         "baseline_comparison",
+        "out_of_scope_label",
     ];
     for key in root.keys() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
