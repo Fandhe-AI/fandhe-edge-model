@@ -154,6 +154,7 @@ mod tests {
             input: input.to_string(),
             label_id: label_id.to_string(),
             output_key: output_key.to_string(),
+            output_original: output_key.to_string(),
             tags: None,
             group_id: None,
         }

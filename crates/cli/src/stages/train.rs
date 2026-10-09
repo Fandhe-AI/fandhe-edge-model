@@ -432,6 +432,7 @@ pub(crate) mod test_support {
                 input: format!("input-{id}"),
                 label_id: (*label).to_string(),
                 output_key: String::new(),
+                output_original: String::new(),
                 tags: None,
                 group_id: None,
             })

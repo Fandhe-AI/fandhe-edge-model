@@ -679,6 +679,30 @@ mod suite {
         );
     }
 
+    /// REQ-16・PoC-9 A-10: 元のキー順（z, a）のまま input に混入した arguments 全体・output 全体
+    /// （compact・空白入り）も正解の直列化表現の混入として数える（4 行 = 4 件。o3・o4 は output 全体に含まれるラベル名も拾うため label が 2 件）。
+    pub fn req16_inspect_detects_gold_json_in_original_key_order() {
+        let env = Env::new("req16order", false);
+        let mut data = clean_filler();
+        for l in [
+            r#"{"id":"o1","input":"see {\"z\":1,\"a\":2}","output":{"intent":"alpha","arguments":{"z":1,"a":2}},"group_id":"go1"}"#,
+            r#"{"id":"o2","input":"see {\"z\": 1, \"a\": 2}","output":{"intent":"beta","arguments":{"z":1,"a":2}},"group_id":"go2"}"#,
+            r#"{"id":"o3","input":"see {\"intent\":\"alpha\",\"arguments\":{\"z\":1,\"a\":2}}","output":{"intent":"alpha","arguments":{"z":1,"a":2}},"group_id":"go3"}"#,
+            r#"{"id":"o4","input":"see {\"intent\": \"beta\", \"arguments\": {\"z\": 1, \"a\": 2}}","output":{"intent":"beta","arguments":{"z":1,"a":2}},"group_id":"go4"}"#,
+        ] {
+            data.push_str(l);
+            data.push('\n');
+        }
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        let out = env.cli(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).expect("utf8"),
+            "fandhe-edge: inspect: train metadata gold label in input: 2\nfandhe-edge: inspect: train metadata gold serialization in input: 4\n"
+        );
+    }
+
     /// REQ-16: 矛盾もメタデータ混入も無いデータでは `inspect` の stderr は空（誤検出 0）。
     pub fn req16_inspect_clean_data_reports_nothing_on_stderr() {
         let env = Env::new("req16clean", false);
@@ -3272,6 +3296,10 @@ fn main() -> std::process::ExitCode {
         (
             "req16_inspect_reports_contradiction_and_metadata_counts_on_stderr",
             suite::req16_inspect_reports_contradiction_and_metadata_counts_on_stderr,
+        ),
+        (
+            "req16_inspect_detects_gold_json_in_original_key_order",
+            suite::req16_inspect_detects_gold_json_in_original_key_order,
         ),
         (
             "req16_inspect_clean_data_reports_nothing_on_stderr",

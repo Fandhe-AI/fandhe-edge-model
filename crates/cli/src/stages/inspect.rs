@@ -191,7 +191,7 @@ impl<'a> ConsistencyRow<'a> {
     fn new(record: &'a ValidRecord) -> Self {
         Self {
             record,
-            serializations: gold_serializations(&record.output_key),
+            serializations: gold_serializations(&record.output_key, &record.output_original),
         }
     }
 }
