@@ -497,8 +497,29 @@ where
 pub(crate) trait BatchResults: Write {
     /// 書き出し（または計算失敗の `ErrorReport` 出力）の結果 `result` を受けて後処理をし、
     /// 最終的な戻り値を返す。`out` は stdout。
-    fn finish(&mut self, out: &mut dyn Write, result: io::Result<ExitCode>)
-    -> io::Result<ExitCode>;
+    fn finish(
+        &mut self,
+        out: &mut dyn Write,
+        result: Result<ExitCode, WriteFailure>,
+    ) -> io::Result<ExitCode>;
+}
+
+/// 書き出し失敗の発生源（REQ-21・REQ-33）。stdout の失敗は部分書き込みの可能性があるため
+/// 追加の出力をせず、結果ファイル側の失敗だけを `ErrorReport` にできるよう型で区別する。
+#[derive(Debug)]
+pub(crate) enum WriteFailure {
+    /// stdout（`out`）への書き込み・flush の失敗。
+    Stdout(io::Error),
+    /// 結果の出力先（`--out` の一時ファイル）への書き込みの失敗。
+    Results(io::Error),
+}
+
+impl WriteFailure {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Stdout(e) | Self::Results(e) => e,
+        }
+    }
 }
 
 /// [`emit_infer_batch`] の結果行（成功時のみ）を `results` へ、`ErrorReport` を `out` へ
@@ -603,6 +624,7 @@ where
         let watchdog = OutputWatchdog::arm(true, limits.output_duration);
         std::process::exit(finish_abandoned(out, &outcome, watchdog));
     }
+    let has_results = results.is_some();
     // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
     // 起動に失敗したら上限なしで書かず、何も書かずに Err（exit 70）で終える。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
@@ -615,14 +637,21 @@ where
                 Some(results) => results,
                 None => &mut *out,
             };
-            write_results(&mut sink, options, &records, &predictions).map(|()| ExitCode::Ok)
+            let to_failure = if has_results {
+                WriteFailure::Results
+            } else {
+                WriteFailure::Stdout
+            };
+            write_results(&mut sink, options, &records, &predictions)
+                .map(|()| ExitCode::Ok)
+                .map_err(to_failure)
         }
-        Err(error) => emit_error_report(out, &error),
+        Err(error) => emit_error_report(out, &error).map_err(WriteFailure::Stdout),
     };
     // 公開・要約の出力・失敗時の報告も、ウォッチドッグを解除する前に行う（REQ-39）。
     match results {
         Some(results) => results.finish(&mut *out, written),
-        None => written,
+        None => written.map_err(WriteFailure::into_io),
     }
 }
 

@@ -47,7 +47,7 @@ use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
 use crate::infer_batch::{
-    BatchResults, emit_infer_batch, emit_infer_batch_split, emit_infer_single,
+    BatchResults, WriteFailure, emit_infer_batch, emit_infer_batch_split, emit_infer_single,
 };
 use crate::infer_guard::check_infer_path_and_format;
 use crate::output::write_stage_line;
@@ -222,11 +222,16 @@ impl<'a> LazyOut<'a> {
         }
     }
 
-    /// 書き込み失敗後の後始末。一時ファイルを消し（best effort）、返す報告を決める。
-    fn abort(&mut self) -> ErrorReport {
+    /// 作りかけの一時ファイルを消す（best effort）。
+    fn cleanup(&mut self) {
         if self.file.take().is_some() {
             let _ = self.target.parent.remove_file_member(&self.tmp);
         }
+    }
+
+    /// 結果ファイル側の書き込み失敗後の後始末。一時ファイルを消し、返す報告を決める。
+    fn abort(&mut self) -> ErrorReport {
+        self.cleanup();
         self.create_error
             .take()
             .unwrap_or_else(|| runtime("cannot write output file"))
@@ -269,7 +274,7 @@ impl BatchResults for LazyOut<'_> {
     fn finish(
         &mut self,
         mut out: &mut dyn Write,
-        result: io::Result<ExitCode>,
+        result: Result<ExitCode, WriteFailure>,
     ) -> io::Result<ExitCode> {
         match result {
             Ok(ExitCode::Ok) => {
@@ -287,7 +292,12 @@ impl BatchResults for LazyOut<'_> {
                 written
             }
             Ok(code) => Ok(code),
-            Err(_) => {
+            // stdout の失敗は部分書き込みの可能性があり、追加の出力はしない（元のエラーを返す）。
+            Err(WriteFailure::Stdout(error)) => {
+                self.cleanup();
+                Err(error)
+            }
+            Err(WriteFailure::Results(_)) => {
                 let report = self.abort();
                 emit_error_report(&mut out, &report)
             }
@@ -526,6 +536,79 @@ mod tests {
         std::fs::write(cwd.join(&sink.tmp), "squatter").expect("squat");
         assert!(sink.write_all(b"x").is_err());
         assert_eq!(sink.abort().code, ExitCode::InvalidInput);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// 常に失敗し、書き込みの試行回数を数える stdout。
+    struct FailingOut {
+        attempts: usize,
+    }
+
+    impl Write for FailingOut {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            Err(io::Error::other("stdout closed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.attempts += 1;
+            Err(io::Error::other("stdout closed"))
+        }
+    }
+
+    /// REQ-21・REQ-33: stdout 側の失敗では追加の出力をせず元のエラーを返し、一時ファイルは消す。
+    #[test]
+    fn req33_stdout_failure_adds_no_output_and_removes_tmp() {
+        let cwd = workdir("stdoutfail");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"a\n").expect("write");
+        let mut stdout = FailingOut { attempts: 0 };
+        let result = sink.finish(
+            &mut stdout,
+            Err(WriteFailure::Stdout(io::Error::other("stdout closed"))),
+        );
+        assert_eq!(
+            result.expect_err("original error").to_string(),
+            "stdout closed"
+        );
+        assert_eq!(stdout.attempts, 0);
+        assert!(entries(&cwd).is_empty());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-21: 要約の出力に失敗したら（公開後でも）追加の出力をせず、OUT も残さない。
+    #[test]
+    fn req33_summary_write_failure_removes_published_out() {
+        let cwd = workdir("summaryfail");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"a\n").expect("write");
+        let mut stdout = FailingOut { attempts: 0 };
+        assert!(sink.finish(&mut stdout, Ok(ExitCode::Ok)).is_err());
+        assert_eq!(stdout.attempts, 1);
+        assert!(entries(&cwd).is_empty());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-21: 結果ファイル側の失敗だけが `runtime_error` の `ErrorReport` を 1 つ出し、一時ファイルを消す。
+    #[test]
+    fn req21_results_failure_emits_one_runtime_error() {
+        let cwd = workdir("resultsfail");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"a\n").expect("write");
+        let mut stdout: Vec<u8> = Vec::new();
+        let code = sink
+            .finish(
+                &mut stdout,
+                Err(WriteFailure::Results(io::Error::other("disk full"))),
+            )
+            .expect("report written");
+        assert_eq!(code, ExitCode::RuntimeError);
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.starts_with("{\"code\":\"runtime_error\""));
+        assert!(entries(&cwd).is_empty());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 }
