@@ -1110,6 +1110,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// REQ-22・REQ-39・#497: 評価記録の T・τ が範囲外なら `calibration.json` を作らず `invalid_input`
+    /// （`infer` が読めないパッケージを公開しない）。境界値は通り、校正の無い記録は書かない。
+    #[test]
+    fn req22_issue497_package_calibration_rejects_out_of_range_parameters() {
+        use fandhe_edge_core::evaluation_record::CalibrationRecord;
+        let definition = definition_with(None);
+        let with = |temperature: f64, threshold: f64| {
+            let mut r = record_with(12, 12);
+            r.calibration = Some(CalibrationRecord {
+                temperature,
+                adopted: true,
+                threshold,
+                n_validation: 10,
+                validation_answered: 8,
+            });
+            package_calibration(Some(&r), &definition, b"onnx")
+        };
+        for (t, tau) in [
+            (0.04, 0.5),
+            (20.5, 0.5),
+            (1.0, -0.1),
+            (1.0, 1.5),
+            (f64::NAN, 0.5),
+        ] {
+            assert_eq!(
+                with(t, tau).expect_err("out of range").message,
+                "evaluation record is invalid",
+                "{t} {tau}"
+            );
+        }
+        for (t, tau) in [(TEMPERATURE_MIN, 0.0), (TEMPERATURE_MAX, 1.0)] {
+            assert!(with(t, tau).expect("in range").is_some(), "{t} {tau}");
+        }
+        assert_eq!(
+            package_calibration(Some(&record_with(12, 12)), &definition, b"onnx"),
+            Ok(None)
+        );
+        assert_eq!(package_calibration(None, &definition, b"onnx"), Ok(None));
+    }
+
     fn definition_with(acceptance: Option<u32>) -> Definition {
         definition_with_baseline(acceptance, false)
     }
