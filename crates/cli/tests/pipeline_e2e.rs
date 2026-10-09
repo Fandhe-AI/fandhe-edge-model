@@ -1697,6 +1697,17 @@ mod suite {
     /// `out_of_scope_label` を（あれば）足し、評価データの正解ラベルを（`rotate` なら）すべて alpha にして
     /// `evaluate` まで進め、stdout・評価記録・予測ファイルを返す（#479・#478）。
     fn evaluate_with_oos(case: &str, oos: Option<&str>, rotate: bool) -> (String, String, String) {
+        let (env, out) = evaluate_with_oos_env(case, oos, rotate);
+        let read = |rel: &str| std::fs::read_to_string(env.project_file(rel)).expect(rel);
+        (
+            out,
+            read("candidates/1/evaluation_record.json"),
+            read("candidates/1/evaluation_predictions.jsonl"),
+        )
+    }
+
+    /// [`evaluate_with_oos`] と同じ手順で、`evaluate` まで済んだ環境と stdout を返す。
+    fn evaluate_with_oos_env(case: &str, oos: Option<&str>, rotate: bool) -> (Env, String) {
         let env = Env::new(case, true);
         if let Some(label) = oos {
             let text = definition_text().replace(
@@ -1717,12 +1728,26 @@ mod suite {
         env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
         env.ok(&SELECT);
         let out = env.ok(&EVALUATE_1);
-        let read = |rel: &str| std::fs::read_to_string(env.project_file(rel)).expect(rel);
-        (
-            out,
-            read("candidates/1/evaluation_record.json"),
-            read("candidates/1/evaluation_predictions.jsonl"),
-        )
+        (env, out)
+    }
+
+    /// REQ-22・REQ-27・#479・#478: 保留の件数を持つ評価記録から対象外ラベルの欄だけ消すと、
+    /// `package` は 64 で公開しない。元に戻せば成功する。
+    pub fn package_rejects_abstention_record_without_out_of_scope_label() {
+        let (env, _) = evaluate_with_oos_env("pkg-oos", Some("alpha"), false);
+        let record_path = env.project_file("candidates/1/evaluation_record.json");
+        let original = std::fs::read_to_string(&record_path).expect("record");
+        assert!(original.contains("\"abstention\":{"), "{original}");
+        let dropped = original.replacen("\"out_of_scope_label\":\"alpha\",", "", 1);
+        assert_ne!(dropped, original);
+        std::fs::write(&record_path, dropped).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"evaluation record does not match the package\"}\n"
+        );
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&record_path, original).expect("restore");
+        env.ok(&PACKAGE);
     }
 
     /// `"abstention":{...}` の部分文字列。
@@ -3524,6 +3549,10 @@ fn main() -> std::process::ExitCode {
         (
             "evaluate_abstention_counts_out_of_scope_within_answered",
             suite::evaluate_abstention_counts_out_of_scope_within_answered,
+        ),
+        (
+            "package_rejects_abstention_record_without_out_of_scope_label",
+            suite::package_rejects_abstention_record_without_out_of_scope_label,
         ),
         (
             "evaluate_keeps_model_and_evaluation_hashes",
