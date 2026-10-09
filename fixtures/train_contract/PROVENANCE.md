@@ -106,7 +106,10 @@ contract.py`・`limits.py`・`artifact.py`・`guard.py`・`supervisor.py`）を
   `suffixes` を `request_full.json` の `root`（プレースホルダー。pytest では
   `str(tmp_path)`）の後ろへ連結したリクエストを、Rust・Python の両方が受理する
   （`.`・末尾 `/`・連続 `/`。証拠種別: テストハーネス）。
-- `result_ok.json`: 成功時の結果 JSON。`onnx_sha256` はダミーバイト列
+- `result_ok.json`: 成功時の結果 JSON。トップレベルの `empty_input_ids`（`[0]`）は
+  `encoding.encode_bytes("", max_bytes)` の出力で、成功結果では必須（REQ-23・TASK-23.2・#476。
+  CLI `train` が推論ランタイムの前処理と照合する。`result_ok_with_validation.json` も同じ）。
+  `onnx_sha256` はダミーバイト列
   `b"dummy-onnx-bytes-for-fixture"` の SHA-256（形式が妥当な値であること
   だけを確認するためのダミーで、実際の `model.onnx` とは対応しない）。
   `artifact` の各フィールドは `trainer/src/fandhe_edge_trainer/artifact.py::

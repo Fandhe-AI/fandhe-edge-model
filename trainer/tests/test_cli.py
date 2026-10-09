@@ -114,6 +114,8 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     payload = json.loads(lines[0])
     assert payload["status"] == "ok"
     assert payload["artifact"]["kind"] == "c3"
+    # REQ-23・TASK-23.2: 空入力の前処理結果（`encode_bytes("", max_bytes)` = `[0]`）を載せる。
+    assert payload["empty_input_ids"] == [0]
     assert (out_dir / "artifact.json").exists()
     assert (out_dir / "model.onnx").exists()
     # 予約に使った作業用一時ディレクトリ（`.out.tmp-*`）が残置されていない

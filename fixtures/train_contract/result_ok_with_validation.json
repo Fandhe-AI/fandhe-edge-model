@@ -31,6 +31,9 @@
     "created_utc": "2026-09-28T00:00:00Z",
     "candidate_label": "c3"
   },
+  "empty_input_ids": [
+    0
+  ],
   "validation_predictions": [
     {
       "id": "val-001",

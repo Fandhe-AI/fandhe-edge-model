@@ -56,6 +56,7 @@ from . import budget as budget_mod
 from . import contract
 from . import predict as predict_mod
 from . import supervisor as supervisor_mod
+from .encoding import encode_bytes
 from .errors import WorkerError
 from .exitcode import ExitCode
 from .kinds import resolve_kind
@@ -371,6 +372,9 @@ def run_worker_train(out_fd: int) -> ExitCode:
         "status": "ok",
         "artifact_dir": str(request.out_dir.display),
         "artifact": art,
+        # 空入力の前処理結果。Rust 側 CLI が推論ランタイムの前処理と照合し、食い違いを
+        # 検知する（REQ-23・TASK-23.2・#476）。学習に使った `trained.max_bytes` で計算する。
+        "empty_input_ids": encode_bytes("", trained.max_bytes),
     }
     if validation_predictions is not None:
         payload["validation_predictions"] = validation_predictions

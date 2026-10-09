@@ -64,7 +64,7 @@ fn default_config(kind: &str) -> &'static str {
 
 fn ok_worker_json(kind: &str) -> String {
     format!(
-        r#"{{"status":"ok","artifact_dir":"{ROOT}/out","artifact":{{"kind":"{kind}","kind_version":1,"selector_version":"0.1","config":{config},"label_order":["positive","negative","neutral"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"{kind}"}}}}"#,
+        r#"{{"status":"ok","artifact_dir":"{ROOT}/out","artifact":{{"kind":"{kind}","kind_version":1,"selector_version":"0.1","config":{config},"label_order":["positive","negative","neutral"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"{kind}"}},"empty_input_ids":[0]}}"#,
         config = default_config(kind)
     )
 }

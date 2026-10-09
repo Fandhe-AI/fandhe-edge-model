@@ -22,5 +22,8 @@
     "onnx_sha256": "ae2c3277fb02c187294c01f4e19e3eca57815d28e9ebc05f4d013a05a02ecfbe",
     "created_utc": "2026-09-28T00:00:00Z",
     "candidate_label": "c3"
-  }
+  },
+  "empty_input_ids": [
+    0
+  ]
 }

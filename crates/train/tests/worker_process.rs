@@ -53,7 +53,7 @@ const FIXTURE_ROOT: &str = "/fandhe-edge-worker-process-fixture-root";
 /// `c3` の `DEFAULT_CONFIG`（`fixtures/train_contract/kind_defaults.json`と
 /// 一致する具体値）を埋め込んだ、成功結果 JSON の固定テンプレート。
 /// `{ARTIFACT_DIR}` を実際の `artifact_dir` へ置換して使う。
-const OK_JSON_TEMPLATE: &str = r#"{"status":"ok","artifact_dir":"{ARTIFACT_DIR}","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"}}"#;
+const OK_JSON_TEMPLATE: &str = r#"{"status":"ok","artifact_dir":"{ARTIFACT_DIR}","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"},"empty_input_ids":[0]}"#;
 
 fn ok_json(artifact_dir: &str) -> String {
     OK_JSON_TEMPLATE.replace("{ARTIFACT_DIR}", artifact_dir)
