@@ -26,8 +26,9 @@
 //! 4. 定義の `limits.max_infer_p95_us` があるときだけ、`train` 分割の入力（[`latency_inputs`]）で
 //!    推論待ち時間 p95 を計測し（warmup 20・iters 1000 固定）、上限と照合する（REQ-31。#338）。
 //!    ステージングを作る前に行う。計測の失敗（推論失敗・時計の逆行・タイムアウト）は `runtime_error`（70）
-//! 5. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、上限（`limits.max_package_bytes`。
-//!    無ければ [`DEFAULT_CAPACITY_LIMIT_BYTES`]）を超えたら `limit_exceeded`
+//! 5. 容量を計測し（[`measure_opened_files_with_limit`]。REQ-30）、利用者が設定した上限
+//!    （`limits.max_package_bytes`）を超えたら `limit_exceeded`。上限が無ければ照合しない
+//!    （既定の強制上限は無い。2026-10-06 オーナー判断）
 //!
 //! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
 //! 公開する。途中の失敗・容量または p95 の上限超過ではステージングを片付け、`package/` を作らない
@@ -48,7 +49,7 @@
 //!
 //! # 上限（#338・REQ-30・REQ-31・REQ-21）
 //!
-//! 定義ファイルの省略可能な `limits`（`max_infer_p95_us`・`max_package_bytes`）を照合する。合否
+//! 定義ファイルの省略可能な `limits`（`max_infer_p95_us`・`max_package_bytes`）を、設定されたものだけ照合する。合否
 //! （`acceptance`）とは別で、超過は exit 20 とし合否より優先する（`resolve_package_outcome`）。
 //! p95 の計測入力は `train` 分割の `input` だけで（validation・test と凍結した評価データは使わない。
 //! REQ-27）、件数・総バイト数の上限で先頭から切り詰める。計測回数は利用者設定にしない。
@@ -56,10 +57,12 @@
 //!
 //! # 計測値の出力（#340・REQ-30・REQ-31・REQ-33）
 //!
-//! exit 0・10・12・20 の stdout JSON の末尾に `capacity`（常に。5 構成要素の内訳・合計・上限・`exceeded`）と
+//! exit 0・10・12・20 の stdout JSON の末尾に `capacity`（常に。5 構成要素の内訳・合計・上限〔未設定は
+//! `null`〕・`exceeded`・目安 `guideline_bytes`〔40MB〕・`over_guideline`）と
 //! `infer_p95`（`limits.max_infer_p95_us` があるときだけ。µs へ切り上げ。無ければ `null`）を載せる。
 //! 値は [`PackageRunResult::metrics`] で返し、`exceeded` は runtime の照合結果から写す（[`capacity_report`]・
 //! [`infer_p95_report`]。写像の不整合は公開前に `runtime_error`）。p95 は上限が無いとき計測しない。
+//! 目安超過（`over_guideline`）は警告で、終了コード・`package/` の公開に影響しない（REQ-30）。
 //!
 //! 評価記録の `correct` は
 //! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
@@ -86,7 +89,8 @@ use fandhe_edge_runtime::capacity::{
     CapacityBreakdown, MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
 use fandhe_edge_runtime::capacity_limit::{
-    CapacityLimit, CapacityLimitCheck, check_capacity_limit,
+    CapacityLimit, CapacityLimitCheck, REFERENCE_CAPACITY_BYTES, check_capacity_limit,
+    exceeds_reference,
 };
 use fandhe_edge_runtime::latency::{
     Clock, LatencyConfig, LatencyError, MonotonicClock, measure_latency,
@@ -124,10 +128,6 @@ use super::train::{
     candidate_rel, effective_train_seed, load_trained, request_is_smoke_trained,
     request_matches_candidate, resolve_candidates, train_rows, verified_split,
 };
-
-/// 容量の上限の既定値（バイト。REQ-30 の目安 40MB）。定義の `limits.max_package_bytes` が無いときだけ使う
-/// （未設定時の挙動は従来と同じ。#338）。`run` が `CapacityLimit::from_bytes` で検証済み型へ変換して使う。
-const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = 40_000_000;
 
 /// `package` の結果（終了コードの決定と、stdout へ載せる計測値。#340）。
 ///
@@ -283,20 +283,21 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
             return Err(report);
         }
     };
-    // 利用者設定（無ければ既定値）を検証済み型へ変換し、runtime の照合（`check_capacity_limit`）の結果を
-    // 渡す。変換失敗（0）は `invalid_input`。ステージングは片付けてから返す。
-    let capacity_limit_bytes = definition
+    // 利用者が設定した上限だけを検証済み型へ変換し、runtime の照合（`check_capacity_limit`）の結果を
+    // 渡す。未設定なら `None`（照合しない）。変換失敗（0）は `invalid_input`。ステージングは片付けてから返す。
+    let limit = match definition
         .limits()
         .and_then(Limits::max_package_bytes)
-        .unwrap_or(DEFAULT_CAPACITY_LIMIT_BYTES);
-    let limit = match CapacityLimit::from_bytes(capacity_limit_bytes) {
+        .map(CapacityLimit::from_bytes)
+        .transpose()
+    {
         Ok(limit) => limit,
         Err(e) => {
             let _ = project.remove_created_dir(&staging);
             return Err(invalid(&e.to_string()));
         }
     };
-    let check = check_capacity_limit(&breakdown, Some(limit));
+    let check = check_capacity_limit(&breakdown, limit);
     // 写像（fail-closed）は公開（`finalize_staging`）より前に行い、失敗したらステージングを片付ける。
     let capacity = match capacity_report(&breakdown, &check) {
         Ok(capacity) => capacity,
@@ -323,8 +324,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
 
 /// runtime の容量照合結果と内訳を、stdout 用の値型へ写す（REQ-30・#340）。
 ///
-/// `exceeded` は照合結果（`Within`・`Exceeded`）から決め、`>` を再計算しない。照合していない
-/// （`NotConfigured`）・合計が内訳と食い違う・未知の区分は `runtime_error`（fail-closed）。
+/// `exceeded` は照合結果（`Within`・`Exceeded`）から決め、`>` を再計算しない。上限未設定
+/// （`NotConfigured`）は `limit_bytes:None`・`exceeded:false`。合計が内訳と食い違う・未知の区分は
+/// `runtime_error`（fail-closed）。目安 40MB の超過（`over_guideline`）は警告のみ（REQ-30）。
 fn capacity_report(
     breakdown: &CapacityBreakdown,
     check: &CapacityLimitCheck,
@@ -333,11 +335,12 @@ fn capacity_report(
         CapacityLimitCheck::Within {
             total_bytes,
             limit_bytes,
-        } => (*total_bytes, *limit_bytes, false),
+        } => (*total_bytes, Some(*limit_bytes), false),
+        CapacityLimitCheck::NotConfigured { total_bytes } => (*total_bytes, None, false),
         CapacityLimitCheck::Exceeded(LimitBreach::Capacity {
             measured_bytes,
             limit_bytes,
-        }) => (*measured_bytes, *limit_bytes, true),
+        }) => (*measured_bytes, Some(*limit_bytes), true),
         _ => return Err(runtime("capacity check is inconsistent")),
     };
     if total_bytes != breakdown.total_bytes() {
@@ -351,6 +354,7 @@ fn capacity_report(
         total_bytes,
         limit_bytes,
         exceeded,
+        (REFERENCE_CAPACITY_BYTES, exceeds_reference(total_bytes)),
         PackageCapacityComponents::new(
             size(PackageComponent::Weights),
             size(PackageComponent::VocabOrFeatureTransform),
@@ -776,23 +780,63 @@ mod tests {
         assert_eq!(ok, capacity_of(125, 125, false));
         let over = capacity_report(&breakdown, &check_of(125, 124)).expect("exceeded");
         assert_eq!(over, capacity_of(125, 124, true));
-        // 合計が内訳と食い違う・上限を照合していない結果は fail-closed。
+        // 合計が内訳と食い違う結果は fail-closed。
         assert!(capacity_report(&breakdown, &check_of(126, 200)).is_err());
         assert!(
             capacity_report(
                 &breakdown,
-                &CapacityLimitCheck::NotConfigured { total_bytes: 125 }
+                &CapacityLimitCheck::NotConfigured { total_bytes: 126 }
             )
             .is_err()
         );
+        // 上限未設定は limit_bytes:None・exceeded:false（目安以下なら over_guideline も false）。
+        let unset = capacity_report(
+            &breakdown,
+            &CapacityLimitCheck::NotConfigured { total_bytes: 125 },
+        )
+        .expect("not configured");
+        assert_eq!(unset.limit_bytes(), None);
+        assert!(!unset.exceeded());
+        assert!(!unset.over_guideline());
+    }
+
+    /// REQ-30: 上限未設定で目安 40MB を超えても警告（`over_guideline:true`）のみで、`exceeded:false`・
+    /// breach なし（exit 20 にならない）。目安ちょうどは超過でない。疎ファイルで測る（実データは書かない）。
+    #[test]
+    fn req30_not_configured_over_guideline_is_warning_only() {
+        let dir = std::env::temp_dir().join(format!("fandhe-pkg-guideline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let measure = |len: u64| {
+            let path = dir.join(format!("w{len}.bin"));
+            let f = File::create(&path).expect("create");
+            f.set_len(len).expect("sparse");
+            let f = File::open(&path).expect("open");
+            measure_opened_files_with_limit(&[(PackageComponent::Weights, path, f)], MAX_FILE_BYTES)
+                .expect("measure")
+        };
+        for (len, over) in [
+            (REFERENCE_CAPACITY_BYTES, false),
+            (REFERENCE_CAPACITY_BYTES + 1, true),
+        ] {
+            let b = measure(len);
+            let check = check_capacity_limit(&b, None);
+            let cap = capacity_report(&b, &check).expect("report");
+            assert_eq!(cap.limit_bytes(), None);
+            assert!(!cap.exceeded());
+            assert_eq!(cap.over_guideline(), over);
+            assert_eq!(check.breach(), None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn capacity_of(total: u64, limit: u64, exceeded: bool) -> PackageCapacity {
         let c = PackageComponentSize::new;
         PackageCapacity::new(
             total,
-            limit,
+            Some(limit),
             exceeded,
+            (40_000_000, false),
             PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
         )
     }

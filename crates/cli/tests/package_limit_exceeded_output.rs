@@ -48,8 +48,9 @@ fn metrics(limit_bytes: u64, cap_exceeded: bool, p95: Option<(u64, bool)>) -> Pa
     PackageMetrics {
         capacity: PackageCapacity::new(
             1549,
-            limit_bytes,
+            Some(limit_bytes),
             cap_exceeded,
+            (40_000_000, false),
             PackageCapacityComponents::new(c(1549, 1), c(0, 0), c(0, 0), c(0, 0), c(0, 0)),
         ),
         infer_p95: p95.map(|(limit_us, e)| InferP95::new(1, limit_us, e)),
@@ -66,7 +67,7 @@ const COMPONENTS: &str = "\"components\":{\"weights\":{\"bytes\":1549,\"file_cou
 
 fn cap_json(limit: u64, exceeded: bool) -> String {
     format!(
-        "\"capacity\":{{\"total_bytes\":1549,\"limit_bytes\":{limit},\"exceeded\":{exceeded},{COMPONENTS}}}"
+        "\"capacity\":{{\"total_bytes\":1549,\"limit_bytes\":{limit},\"exceeded\":{exceeded},\"guideline_bytes\":40000000,\"over_guideline\":false,{COMPONENTS}}}"
     )
 }
 

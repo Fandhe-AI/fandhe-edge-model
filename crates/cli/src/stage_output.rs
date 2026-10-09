@@ -262,8 +262,8 @@ mod tests {
     };
     use fandhe_edge_runtime::package_outcome::{PackageQualityJudgment, resolve_package_outcome};
 
-    const CAP_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
-    const CAP_OVER: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const CAP_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const CAP_OVER: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
     const RUNTIME_ERROR: &str = "{\"code\":\"runtime_error\",\"message\":\"runtime error\"}\n";
 
     fn metrics(capacity_exceeded: bool, p95: Option<(u64, u64, bool)>) -> PackageMetrics {
@@ -272,8 +272,9 @@ mod tests {
         PackageMetrics {
             capacity: PackageCapacity::new(
                 125,
-                limit,
+                Some(limit),
                 capacity_exceeded,
+                (40_000_000, false),
                 PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
             ),
             infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
@@ -451,6 +452,40 @@ mod tests {
         let code =
             emit_package_outcome(&mut buf, &o, &metrics(false, Some((7, 6, true)))).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
+    }
+
+    /// REQ-30・TASK-41.9・#406: 上限未設定で目安超過は警告（`over_guideline:true`）だけで、
+    /// `limit_bytes:null`・`exceeded:false` のまま exit 0（判定不能なら 12）になる。
+    #[test]
+    fn req30_unset_limit_over_guideline_is_warning_only() {
+        let c = PackageComponentSize::new;
+        let m = PackageMetrics {
+            capacity: PackageCapacity::new(
+                41_000_000,
+                None,
+                false,
+                (40_000_000, true),
+                PackageCapacityComponents::new(
+                    c(41_000_000, 1),
+                    c(0, 0),
+                    c(0, 0),
+                    c(0, 0),
+                    c(0, 0),
+                ),
+            ),
+            infer_p95: None,
+        };
+        let cap = "\"capacity\":{\"total_bytes\":41000000,\"limit_bytes\":null,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":true,\"components\":{\"weights\":{\"bytes\":41000000,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":0,\"file_count\":0},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":0,\"file_count\":0}}}";
+        let (code, out) = emit(&[], PackageQualityJudgment::NotDefined, &m);
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(
+            out,
+            format!(
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{cap},\"infer_p95\":null}}\n"
+            )
+        );
+        let (code, _) = emit(&[], PackageQualityJudgment::Undeterminable, &m);
+        assert_eq!(code, ExitCode::Pending);
     }
 
     /// REQ-21・REQ-30・REQ-31・#340: breaches と計測値の `exceeded` が食い違えば runtime_error

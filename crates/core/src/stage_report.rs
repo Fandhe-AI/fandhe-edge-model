@@ -214,13 +214,17 @@ impl PackageCapacityComponents {
 
 /// `package` の容量の計測値と上限照合の結果（REQ-30・#340）。
 ///
-/// `exceeded` は呼び出し側（cli）が runtime の照合結果から渡す。ここでは `total_bytes > limit_bytes`
-/// を計算しない（境界規則は runtime の `LimitBreach` が唯一の実装）。
+/// `limit_bytes` は利用者が `limits.max_package_bytes` を設定したときだけ `Some`（未設定は JSON の
+/// `null`・`exceeded:false`）。`exceeded`・`over_guideline` は呼び出し側（cli）が runtime の照合結果から
+/// 渡す。ここでは `>` を計算しない（境界規則は runtime の `LimitBreach` が唯一の実装）。
+/// `guideline_bytes`（目安 40MB。REQ-30）の超過は警告であり、終了コードに影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PackageCapacity {
     total_bytes: u64,
-    limit_bytes: u64,
+    limit_bytes: Option<u64>,
     exceeded: bool,
+    guideline_bytes: u64,
+    over_guideline: bool,
     components: PackageCapacityComponents,
 }
 
@@ -229,16 +233,31 @@ impl PackageCapacity {
     #[must_use]
     pub const fn new(
         total_bytes: u64,
-        limit_bytes: u64,
+        limit_bytes: Option<u64>,
         exceeded: bool,
+        (guideline_bytes, over_guideline): (u64, bool),
         components: PackageCapacityComponents,
     ) -> Self {
         Self {
             total_bytes,
             limit_bytes,
             exceeded,
+            guideline_bytes,
+            over_guideline,
             components,
         }
+    }
+
+    /// 利用者設定の上限（未設定は `None`）。
+    #[must_use]
+    pub const fn limit_bytes(&self) -> Option<u64> {
+        self.limit_bytes
+    }
+
+    /// 目安（40MB）を超えたか（警告。終了コードに影響しない）。
+    #[must_use]
+    pub const fn over_guideline(&self) -> bool {
+        self.over_guideline
     }
 
     /// 容量の上限を超えたか（runtime の照合結果）。
@@ -905,8 +924,8 @@ mod tests {
 
     /// 5 構成要素が宣言順（重み・語彙/特徴量変換・選択肢表・校正・メタデータ）で常に出る（REQ-30）。
     const COMPONENTS: &str = r#""components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}"#;
-    const CAP_OK: &str = r#""capacity":{"total_bytes":125,"limit_bytes":40000000,"exceeded":false,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
-    const CAP_EXCEEDED: &str = r#"{"total_bytes":125,"limit_bytes":100,"exceeded":true,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
+    const CAP_OK: &str = r#""capacity":{"total_bytes":125,"limit_bytes":40000000,"exceeded":false,"guideline_bytes":40000000,"over_guideline":false,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
+    const CAP_EXCEEDED: &str = r#"{"total_bytes":125,"limit_bytes":100,"exceeded":true,"guideline_bytes":40000000,"over_guideline":false,"components":{"weights":{"bytes":100,"file_count":1},"vocab_or_feature_transform":{"bytes":0,"file_count":0},"label_table":{"bytes":20,"file_count":1},"calibration":{"bytes":0,"file_count":0},"metadata":{"bytes":5,"file_count":1}}}"#;
 
     /// 合成の計測値。`capacity_exceeded` が true のときは上限 100・false のときは 40,000,000。
     fn metrics(capacity_exceeded: bool, p95: Option<(u64, u64, bool)>) -> PackageMetrics {
@@ -915,7 +934,13 @@ mod tests {
             PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1));
         let limit = if capacity_exceeded { 100 } else { 40_000_000 };
         PackageMetrics {
-            capacity: PackageCapacity::new(125, limit, capacity_exceeded, components),
+            capacity: PackageCapacity::new(
+                125,
+                Some(limit),
+                capacity_exceeded,
+                (40_000_000, false),
+                components,
+            ),
             infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
         }
     }

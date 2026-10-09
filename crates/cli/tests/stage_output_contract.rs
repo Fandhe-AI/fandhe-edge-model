@@ -13,7 +13,7 @@ use fandhe_edge_core::stage_report::{
 };
 use fandhe_edge_runtime::package_outcome::{PackageQualityJudgment, resolve_package_outcome};
 
-const PASS_LINE: &str = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,\"capacity\":{\"total_bytes\":10,\"limit_bytes\":40000000,\"exceeded\":false,\"components\":{\"weights\":{\"bytes\":10,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":0,\"file_count\":0},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":0,\"file_count\":0}}},\"infer_p95\":null}\n";
+const PASS_LINE: &str = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,\"capacity\":{\"total_bytes\":10,\"limit_bytes\":40000000,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":10,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":0,\"file_count\":0},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":0,\"file_count\":0}}},\"infer_p95\":null}\n";
 
 /// 合成の計測値（重み 10 バイト・p95 の上限なし。#340）。
 fn metrics() -> PackageMetrics {
@@ -21,8 +21,9 @@ fn metrics() -> PackageMetrics {
     PackageMetrics {
         capacity: PackageCapacity::new(
             10,
-            40_000_000,
+            Some(40_000_000),
             false,
+            (40_000_000, false),
             PackageCapacityComponents::new(c(10, 1), c(0, 0), c(0, 0), c(0, 0), c(0, 0)),
         ),
         infer_p95: None,

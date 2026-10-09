@@ -132,9 +132,10 @@ CODE_VOCAB = frozenset(
 JUDGMENT_VOCAB = frozenset({"pass", "fail", "undeterminable"})
 # `kind` の許可リスト（crates/guard/src/kind.rs の `SUPPORTED_KINDS`。REQ-39）
 KIND_VOCAB = frozenset({"c1", "c3", "autoregressive"})
-# `package` の容量上限の既定値（crates/cli/src/stages/package.rs の `DEFAULT_CAPACITY_LIMIT_BYTES`。
-# 定義に `limits.max_package_bytes` が無いときの期待値。REQ-30。pytest で Rust のソースと照合する）
-DEFAULT_CAPACITY_LIMIT_BYTES = 40_000_000
+# `package` の容量の目安（crates/runtime/src/capacity_limit.rs の `REFERENCE_CAPACITY_BYTES`。
+# 強制上限ではなく、超過は `over_guideline` の警告のみ。REQ-30・TASK-41.9。
+# pytest で Rust のソースと照合する）
+REFERENCE_CAPACITY_BYTES = 40_000_000
 # パス区切りとして扱う文字（`/`・`\`・U+2215 DIVISION SLASH・U+2044 FRACTION SLASH・
 # U+FF0F FULLWIDTH SOLIDUS）
 PATH_CHARS = ("/", "\\", "∕", "⁄", "／")
@@ -991,8 +992,8 @@ class Facts:
     eval_records: int
     has_acceptance: bool
     p95_limit_us: int | None
-    # 定義の `limits.max_package_bytes`。無ければ既定値（REQ-30。package の `limit_bytes` の期待値）
-    limit_bytes: int = DEFAULT_CAPACITY_LIMIT_BYTES
+    # 定義の `limits.max_package_bytes`。無ければ None（package の `limit_bytes` は null。REQ-30）
+    limit_bytes: int | None = None
 
 
 def _count_lines(path: Path) -> int | None:
@@ -1028,7 +1029,7 @@ def read_facts(pdir: Path) -> Facts | None:
         eval_records=evaluation,
         has_acceptance="acceptance" in d,
         p95_limit_us=p95 if _is_int(p95) else None,
-        limit_bytes=max_bytes if _is_int(max_bytes) else DEFAULT_CAPACITY_LIMIT_BYTES,
+        limit_bytes=max_bytes if _is_int(max_bytes) else None,
     )
 
 
@@ -1139,14 +1140,24 @@ def check_package_metrics(
     """package（exit 0・20）の `capacity`・`infer_p95` の整合（REQ-30・REQ-31）。
 
     capacity は要約でき、`limit_bytes` が定義から導く期待値（`facts.limit_bytes`）と一致し、
-    `exceeded == (total_bytes > limit_bytes)`、exit 0 なら超過なし。`check_sum` なら 5 項目の合計が
-    `total_bytes` と一致すること（B は項目側で `capacity_sum_mismatch` として判定するため外す）。
+    `exceeded == (limit_bytes is not None and total_bytes > limit_bytes)`（上限なしは常に false）、
+    `guideline_bytes` が目安（40000000）で `over_guideline == (total_bytes > guideline_bytes)`
+    （目安超過は警告のみで exit 0 を妨げない）、exit 0 なら上限超過なし。`check_sum` なら
+    5 項目の合計が `total_bytes` と一致すること（B は項目側で `capacity_sum_mismatch` として
+    判定するため外す）。
     `infer_p95` は定義に `max_infer_p95_us` があるときだけ非 null で、`limit_us` が定義の値と
     一致し、`exceeded == (p95_us > limit_us)`、exit 0 なら超過なし。exit 20 は `code` が
     `limit_exceeded` で、容量か p95 のどちらかが超過していること。
     """
     cap = capacity_summary(obj)
-    if cap is None or cap["exceeded"] != (cap["total_bytes"] > cap["limit_bytes"]):
+    if cap is None:
+        return False
+    lim, total = cap["limit_bytes"], cap["total_bytes"]
+    if cap["exceeded"] != (lim is not None and total > lim):
+        return False
+    if cap["guideline_bytes"] != REFERENCE_CAPACITY_BYTES or cap["over_guideline"] != (
+        total > REFERENCE_CAPACITY_BYTES
+    ):
         return False
     if cap["limit_bytes"] != facts.limit_bytes or (check_sum and not capacity_sum_matches(cap)):
         return False
@@ -1358,12 +1369,18 @@ def capacity_summary(pkg: dict[str, Any] | None) -> dict[str, Any] | None:
             return None
         out_comps[name] = {"bytes": b, "file_count": fc}
     total, limit, exceeded = cap.get("total_bytes"), cap.get("limit_bytes"), cap.get("exceeded")
-    if not _nonneg_int(total) or not _nonneg_int(limit) or not isinstance(exceeded, bool):
+    guide, over = cap.get("guideline_bytes"), cap.get("over_guideline")
+    # `limit_bytes` は利用者設定の上限で、未設定なら null（REQ-30）
+    if not _nonneg_int(total) or not (limit is None or _nonneg_int(limit)):
+        return None
+    if not isinstance(exceeded, bool) or not _nonneg_int(guide) or not isinstance(over, bool):
         return None
     return {
         "total_bytes": total,
         "limit_bytes": limit,
         "exceeded": exceeded,
+        "guideline_bytes": guide,
+        "over_guideline": over,
         "components": out_comps,
     }
 

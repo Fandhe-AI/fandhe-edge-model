@@ -56,7 +56,10 @@ SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 p95lim=$(sed -n 's/.*"max_infer_p95_us": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
 [ -n "$p95lim" ] || p95lim=50000
 pkglim=$(sed -n 's/.*"max_package_bytes": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
+# 定義に上限が無ければ実 CLI は `limit_bytes:null`（REQ-30）。算術用の既定値は別に持つ
+pkgjson=${pkglim:-null}
 [ -n "$pkglim" ] || pkglim=40000000
+G='"guideline_bytes":40000000,"over_guideline":false'
 extra=
 extra_infer=
 if [ -n "${FAKE_LEAK:-}" ] && [ "$stage" != infer ]; then
@@ -110,7 +113,7 @@ package)
     code='"limit_exceeded"'
     [ -n "${FAKE_C2_CODE_NESTED:-}" ] && code='{"k":"SECRET_BODY_7c1"}'
     c2comps="\"components\":{\"weights\":{\"bytes\":$wb,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":20,\"file_count\":1},\"label_table\":{\"bytes\":5,\"file_count\":1},\"calibration\":{\"bytes\":3,\"file_count\":1},\"metadata\":{\"bytes\":7,\"file_count\":1}}"
-    printf '{"code":%s,"message":"resource limit exceeded","step":"package","capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":true,%s},"infer_p95":null}\n' "$code" "$total" "$rl" "$c2comps"
+    printf '{"code":%s,"message":"resource limit exceeded","step":"package","capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":true,%s,%s},"infer_p95":null}\n' "$code" "$total" "$rl" "$G" "$c2comps"
     exit 20
   fi
   if [ "$here" = C1 ] && [ -n "${FAKE_C1_EXCEED:-}" ]; then
@@ -118,11 +121,11 @@ package)
     pv=99999
     [ "$FAKE_C1_EXCEED" = low ] && pv=2
     [ -n "${FAKE_C1_KEEPDIR:-}" ] && mkdir -p project/package
-    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":40000000,"exceeded":false,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$comps" "$pv" "$p95lim"
+    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$pkgjson" "$G" "$comps" "$pv" "$p95lim"
     exit 20
   fi
   total=$((135 + extrab))
-  lim=$pkglim
+  lim=$pkgjson
   [ "$bad" = "limit:$here" ] && lim=39999999
   # package/ の通常ファイルの合計は total_bytes と一致させる（pkgsum は 1 バイト少なくする）
   odd=0
@@ -142,7 +145,7 @@ package)
   [ "$here" = C1 ] && p95=$(printf '{"p95_us":%s,"limit_us":%s,"exceeded":false}' "$pv" "$p95lim")
   jfield='"judgment":null,'
   [ "$bad" = "nojudgment:$here" ] && jfield=
-  printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s},"infer_p95":%s%s}\n' "$jfield" "$total" "$lim" "$comps" "$p95" "$extra" ;;
+  printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":%s%s}\n' "$jfield" "$total" "$lim" "$G" "$comps" "$p95" "$extra" ;;
 infer)
   file=
   id=${FAKE_DEFAULT_ID:-input}

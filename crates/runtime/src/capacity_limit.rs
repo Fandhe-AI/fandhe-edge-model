@@ -7,8 +7,10 @@
 //!
 //! # 設計上の不変条件
 //!
-//! - 判定は利用者の設定値に対して行う。40MB（[`REFERENCE_CAPACITY_BYTES`]）は目安の参考値であり、
-//!   `Default` もコンストラクタからの参照も持たない（事実上の閾値にしない）
+//! - 強制の判定は利用者の設定値に対してだけ行う。上限が無ければ照合せず（[`CapacityLimitCheck::NotConfigured`]）、
+//!   exit 20 にも `package/` 非公開にもならない（2026-10-06 オーナー判断）。40MB
+//!   （[`REFERENCE_CAPACITY_BYTES`]）は目安で、`Default` もコンストラクタからの参照も持たない。
+//!   目安の超過は [`exceeds_reference`] で警告として知らせるだけで、終了コードに影響しない
 //! - 境界規則（`>` で超過・`==` は超過でない）は [`LimitBreach::capacity_if_exceeded`] の
 //!   1 箇所に集約されており、本モジュールは再実装せず 1 回だけ呼ぶ
 //! - 終了コードの決定は `resolve_package_outcome` に一本化する。本モジュールは終了コードを持たず、
@@ -20,8 +22,8 @@
 //!
 //! # 範囲外（実装済みを装わない）
 //!
-//! - 上限値の定義ファイル・CLI 引数からの取り込み: 入出力契約の変更を伴い、ユーザー承認が必要なため
-//!   未実装。CLI は当面暫定固定値を [`CapacityLimit`] に包んで渡す
+//! - 上限値の取り込みは CLI `package` が定義ファイルの `limits.max_package_bytes` から行う
+//!   （無ければ `None` を渡す。`CapacityLimit` の既定値は無い）
 //! - 語彙ファイル超過構成の除外記録（TASK-30.3）・JSON 出力（CLI 側）
 //! - 証拠種別: テストハーネス。本番データでの `limit_exceeded` 再実演は未実施
 
@@ -32,6 +34,15 @@ use std::fmt;
 
 /// 容量の目安（バイト。REQ-30 の 40MB）。参考値であり合否のしきい値ではない。
 pub const REFERENCE_CAPACITY_BYTES: u64 = 40_000_000;
+
+/// 合計容量が目安（[`REFERENCE_CAPACITY_BYTES`]）を超えたか（警告用。REQ-30）。
+///
+/// 目安ちょうどは超過でない。境界規則は [`LimitBreach::capacity_if_exceeded`] に任せ再実装しない。
+/// 結果は終了コードの決定（`resolve_package_outcome`）には渡さない。
+#[must_use]
+pub fn exceeds_reference(total_bytes: u64) -> bool {
+    LimitBreach::capacity_if_exceeded(total_bytes, REFERENCE_CAPACITY_BYTES).is_some()
+}
 
 /// 検証済みの容量上限（バイト。1 以上）。
 ///
@@ -199,6 +210,14 @@ mod tests {
                 limit_bytes: 99
             })
         );
+    }
+
+    /// REQ-30: 目安ちょうどは超過でなく、1 バイト超えると超過（警告のみ）。
+    #[test]
+    fn req30_exceeds_reference_boundary() {
+        assert!(!exceeds_reference(40_000_000));
+        assert!(exceeds_reference(40_000_001));
+        assert!(!exceeds_reference(0));
     }
 
     #[test]

@@ -78,8 +78,10 @@ def _capacity(total: int, parts: dict[str, int]) -> dict[str, Any]:
     return {
         "capacity": {
             "total_bytes": total,
-            "limit_bytes": 40000000,
+            "limit_bytes": None,
             "exceeded": False,
+            "guideline_bytes": 40000000,
+            "over_guideline": False,
             "components": {k: {"bytes": v, "file_count": 1} for k, v in parts.items()},
         }
     }
@@ -1358,12 +1360,19 @@ def test_check_infer_output_validates_label_keys_finiteness_and_sum() -> None:
 
 
 def _cap_json(
-    total: int = 5, limit: int = 40000000, exceeded: bool = False, sum_delta: int = 0
+    total: int = 5, limit: int | None = None, exceeded: bool = False, sum_delta: int = 0
 ) -> dict[str, Any]:
     """5 項目の合計が total になる容量内訳（`sum_delta` で合計をずらして不一致にできる）。"""
     comp = {n: {"bytes": 1, "file_count": 1} for n in mod.CAPACITY_COMPONENTS}
     comp["weights"]["bytes"] = total - 4 + sum_delta
-    return {"total_bytes": total, "limit_bytes": limit, "exceeded": exceeded, "components": comp}
+    return {
+        "total_bytes": total,
+        "limit_bytes": limit,
+        "exceeded": exceeded,
+        "guideline_bytes": 40000000,
+        "over_guideline": total > 40000000,
+        "components": comp,
+    }
 
 
 def _pkg(facts: Any, **patch: Any) -> dict[str, Any]:
@@ -1381,7 +1390,10 @@ def _pkg(facts: Any, **patch: Any) -> dict[str, Any]:
 def test_package_report_is_checked_against_definition_and_capacity_rules() -> None:
     """REQ-30・REQ-31: 基準・p95 上限が無い定義の package は judgment・infer_p95 が null。"""
     f = _facts()
-    chk = lambda obj, rc=0: mod._step_check("package", obj, {0, 20}, rc, f, 0)  # noqa: E731
+    f40 = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, None, 40000000)
+    chk = lambda obj, rc=0, facts=f: mod._step_check(  # noqa: E731
+        "package", obj, {0, 20}, rc, facts, 0
+    )
     assert chk(_pkg(f)) is True
     assert chk(_pkg(f, judgment="pass")) is False
     assert chk(_pkg(f, acceptance_defined=True)) is False
@@ -1391,14 +1403,14 @@ def test_package_report_is_checked_against_definition_and_capacity_rules() -> No
     assert chk(_pkg(f, capacity=_cap_json(total=9, limit=5, exceeded=False))) is False
     assert chk(_pkg(f, capacity=_cap_json(total=5, limit=3, exceeded=True))) is False
     assert chk(_pkg(f, capacity=None)) is False
-    # exit 20 で容量超過（整合。上限は定義の既定値）は許容される
+    # exit 20 で容量超過（整合。上限は定義の max_package_bytes）は許容される
     over = {
         "code": "limit_exceeded",
         "step": "package",
         "capacity": _cap_json(40000001, 40000000, True),
         "infer_p95": None,
     }
-    assert chk(over, rc=20) is True
+    assert chk(over, rc=20, facts=f40) is True
     # p95 上限のある定義では infer_p95 が非 null
     with_limit = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, 100)
     assert mod._step_check("package", _pkg(f), {0}, 0, with_limit, 0) is False
@@ -1410,7 +1422,15 @@ def test_capacity_summary_rejects_negative_bool_and_missing_values() -> None:
     """REQ-30: bytes・file_count・total_bytes・limit_bytes は 0 以上の int に限る。"""
     ok = {"capacity": _cap_json()}
     assert mod.capacity_summary(ok) is not None
-    for patch in ({"total_bytes": -1}, {"limit_bytes": None}, {"limit_bytes": True}):
+    # 上限未設定（limit_bytes: null）は許す（REQ-30・TASK-41.9）
+    assert mod.capacity_summary(ok)["limit_bytes"] is None
+    for patch in (
+        {"total_bytes": -1},
+        {"limit_bytes": -1},
+        {"limit_bytes": True},
+        {"guideline_bytes": None},
+        {"over_guideline": None},
+    ):
         assert mod.capacity_summary({"capacity": dict(_cap_json(), **patch)}) is None
     neg = _cap_json()
     neg["components"]["weights"]["bytes"] = -1
@@ -1467,9 +1487,11 @@ if cmd == "package":
     if c2:
         total = cfg["c2_total"]
         limit = cfg["c2_limit"] or limits["max_package_bytes"]
+        guide = {{"guideline_bytes": 40000000, "over_guideline": total > 40000000}}
         out({{"code": cfg["c2_code"], "message": "resource limit exceeded", "step": "package",
              "capacity": {{"total_bytes": total, "limit_bytes": limit,
-                          "exceeded": cfg["c2_exceeded"], "components": comps(total)}},
+                          "exceeded": cfg["c2_exceeded"], **guide,
+                          "components": comps(total)}},
              "infer_p95": None}}, cfg["c2_rc"])
     rc = cfg["rc1"]
     p95 = None
@@ -1478,6 +1500,7 @@ if cmd == "package":
                "exceeded": cfg["p95_exceeded"]}}
     total = cfg["total1"]
     cap = {{"total_bytes": total, "limit_bytes": cfg["limit1"], "exceeded": False,
+           "guideline_bytes": 40000000, "over_guideline": total > 40000000,
            "components": comps(total)}}
     if cfg["publish"] is None:
         publish = rc == 0
@@ -1510,7 +1533,7 @@ C_DEFAULT = {
     "c2_limit": None,
     "c2_exceeded": True,
     "total1": 10,
-    "limit1": 40000000,
+    "limit1": None,
     "actual_bytes": 10,
     "comp_delta": 0,
     "fc_delta": 0,
@@ -1677,8 +1700,10 @@ def test_internal_error_makes_the_script_exit_70_and_still_writes_record(
 HEX64 = "a" * 64
 CAP_SUMMARY = {
     "total_bytes": 5,
-    "limit_bytes": 40000000,
+    "limit_bytes": None,
     "exceeded": False,
+    "guideline_bytes": 40000000,
+    "over_guideline": False,
     "components": {n: {"bytes": 1, "file_count": 1} for n in mod.CAPACITY_COMPONENTS},
 }
 # 許可した欄の外に置く値。データ本文・選択肢 ID・入れ子の dict・list を含む
@@ -2305,6 +2330,7 @@ def test_package_with_acceptance_requires_pass_on_exit_0() -> None:
 def test_package_exit_20_requires_the_fields_the_real_cli_always_emits() -> None:
     """REQ-21・REQ-30・REQ-31 §2-7: exit 20 は code・step・capacity・infer_p95 と超過の実在。"""
     f = _facts()
+    f = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, None, 40000000)
     over = {
         "code": "limit_exceeded",
         "message": "m",
@@ -2343,6 +2369,7 @@ def test_p95_over_with_exit_20_is_accepted_only_with_consistent_exceeded() -> No
 def test_capacity_component_sum_must_match_total_for_every_package_check() -> None:
     """REQ-30 §2-1: 5 項目の合計が total_bytes と一致しなければ、exit 0・20 のどちらも不合格。"""
     f = _facts()
+    f40 = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, None, 40000000)
     bad = _cap_json(sum_delta=1)
     assert mod.capacity_sum_matches(mod.capacity_summary({"capacity": _cap_json()})) is True
     assert mod.capacity_sum_matches(mod.capacity_summary({"capacity": bad})) is False
@@ -2350,8 +2377,8 @@ def test_capacity_component_sum_must_match_total_for_every_package_check() -> No
     over = {"code": "limit_exceeded", "step": "package", "infer_p95": None}
     ok_cap = _cap_json(40000001, 40000000, True)
     bad_cap = _cap_json(40000001, 40000000, True, sum_delta=-1)
-    assert mod._step_check("package", dict(over, capacity=ok_cap), {20}, 20, f, 0) is True
-    assert mod._step_check("package", dict(over, capacity=bad_cap), {20}, 20, f, 0) is False
+    assert mod._step_check("package", dict(over, capacity=ok_cap), {20}, 20, f40, 0) is True
+    assert mod._step_check("package", dict(over, capacity=bad_cap), {20}, 20, f40, 0) is False
     # B は項目側で `capacity_sum_mismatch` として判定するため、工程側の照合を外せる
     assert mod._step_check("package", _pkg(f, capacity=bad), {0}, 0, f, 0, None, False) is True
 
@@ -2385,10 +2412,10 @@ def test_item_c2_rejects_mismatching_capacity_sum(tmp_path: Path) -> None:
     assert failure["code"] == "limit_exceeded"
 
 
-def test_expected_limit_bytes_comes_from_the_definition_or_the_default(tmp_path: Path) -> None:
-    """REQ-30 §2-8: 期待する limit_bytes は定義の max_package_bytes、無ければ 40_000_000。"""
-    assert mod.DEFAULT_CAPACITY_LIMIT_BYTES == 40_000_000
-    assert _facts().limit_bytes == 40_000_000
+def test_expected_limit_bytes_comes_from_the_definition_or_none(tmp_path: Path) -> None:
+    """REQ-30・TASK-41.9: 期待する limit_bytes は定義の値、無ければ None（null）。"""
+    assert mod.REFERENCE_CAPACITY_BYTES == 40_000_000
+    assert _facts().limit_bytes is None
     ctx = _c_ctx(tmp_path)
     d = tmp_path / "defn"
     assert mod.stage_inputs(ctx, d, {"max_package_bytes": 1234})
@@ -2398,14 +2425,16 @@ def test_expected_limit_bytes_comes_from_the_definition_or_the_default(tmp_path:
     # 背景: B で limit_bytes=7 が通っていた
     f = _facts()
     assert mod._step_check("package", _pkg(f, capacity=_cap_json(limit=7)), {0}, 0, f, 0) is False
-    assert mod._step_check("package", _pkg(f, capacity=_cap_json(limit=40000000)), {0}, 0, f, 0)
+    assert mod._step_check("package", _pkg(f, capacity=_cap_json()), {0}, 0, f, 0)
+    # 既定の強制上限は無い: 旧既定値 40000000 の報告は不一致（上限未設定は null が正）
+    assert not mod._step_check("package", _pkg(f, capacity=_cap_json(limit=40000000)), {0}, 0, f, 0)
     f2 = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, None, 1234)
     assert mod._step_check("package", _pkg(f2, capacity=_cap_json(limit=1234)), {0}, 0, f2, 0)
     assert not mod._step_check("package", _pkg(f2, capacity=_cap_json()), {0}, 0, f2, 0)
 
 
-def test_item_b_rejects_limit_bytes_that_differ_from_the_default(tmp_path: Path) -> None:
-    """REQ-30 §2-8: B で CLI が報告した limit_bytes が既定値と違えば失敗する。"""
+def test_item_b_rejects_limit_bytes_that_differ_from_the_definition(tmp_path: Path) -> None:
+    """REQ-30 §2-8: B で CLI が報告した limit_bytes が定義（未設定なら null）と違えば失敗する。"""
     res, ok = mod.item_b(_c_ctx(tmp_path, limit1=7))
     assert (ok, res["status"], res["reason"], res["step"]) == (
         False,
@@ -2415,7 +2444,8 @@ def test_item_b_rejects_limit_bytes_that_differ_from_the_default(tmp_path: Path)
     )
     res, ok = mod.item_b(_c_ctx(tmp_path / "ok"))
     assert (ok, res["status"]) == (True, "ok")
-    assert res["capacity"]["limit_bytes"] == 40000000
+    assert res["capacity"]["limit_bytes"] is None
+    assert res["capacity"]["guideline_bytes"] == 40000000
     assert res["capacity_sum_matches_total"] is True
 
 
@@ -2492,12 +2522,29 @@ def test_score_sum_tolerance_matches_the_shared_fixture() -> None:
     assert mod.SCORE_SUM_TOLERANCE == 1e-6
 
 
-def test_default_limit_bytes_matches_the_rust_constant() -> None:
-    """REQ-30: 既定の limit_bytes は `package.rs` の `DEFAULT_CAPACITY_LIMIT_BYTES` と一致する。"""
-    src = (REPO / "crates" / "cli" / "src" / "stages" / "package.rs").read_text("utf-8")
-    m = re.search(r"const DEFAULT_CAPACITY_LIMIT_BYTES: u64 = ([0-9_]+);", src)
-    assert m is not None, "DEFAULT_CAPACITY_LIMIT_BYTES が見つからない"
-    assert int(m.group(1).replace("_", "")) == mod.DEFAULT_CAPACITY_LIMIT_BYTES
+def test_reference_capacity_matches_the_rust_constant() -> None:
+    """REQ-30・TASK-41.9: 目安は runtime の `REFERENCE_CAPACITY_BYTES` と一致する。"""
+    src = (REPO / "crates" / "runtime" / "src" / "capacity_limit.rs").read_text("utf-8")
+    m = re.search(r"pub const REFERENCE_CAPACITY_BYTES: u64 = ([0-9_]+);", src)
+    assert m is not None, "REFERENCE_CAPACITY_BYTES が見つからない"
+    assert int(m.group(1).replace("_", "")) == mod.REFERENCE_CAPACITY_BYTES
+
+
+def test_check_package_metrics_guideline_and_null_limit() -> None:
+    """REQ-30・TASK-41.9: limit null は exceeded false、目安の不整合は不合格。"""
+    f = _facts()
+
+    def chk(**patch: Any) -> bool:
+        cap = dict(_cap_json(), **patch)
+        return mod.check_package_metrics(_pkg(f, capacity=cap), 0, f)
+
+    assert chk()
+    assert not chk(exceeded=True)
+    assert not chk(guideline_bytes=1)
+    assert not chk(over_guideline=True)
+    # 目安超過は警告のみ: exit 0 のまま合格（total > guideline で over_guideline true）
+    big = _cap_json(40000001)
+    assert mod.check_package_metrics(_pkg(f, capacity=big), 0, f)
 
 
 def test_staging_and_default_id_constants_match_the_rust_sources() -> None:
