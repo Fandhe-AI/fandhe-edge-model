@@ -15,10 +15,11 @@
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
 //! - [`SelectionRecord`]: `select` の記録（`package` が選定候補を読み戻す）。有意性判定
-//!   （[`crate::selection_significance`]）は本記録に含めていない（未接続）
+//!   （[`crate::selection_significance`] の結果）は定義に `baseline_comparison` があるときだけ持つ（#481）
 //!
 //! エラーはデータ本文・ラベル・パスを含まない固定の列挙値で返す（`security.md`）。
 
+use fandhe_edge_core::evaluation_record::SelectionSignificanceRecord;
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
 
@@ -116,22 +117,10 @@ pub fn validation_accuracy(
     gold: &[&str],
     predictions: &[ValidationPrediction],
 ) -> Result<Ratio, StageFileError> {
-    if predictions.len() != ids.len() || gold.len() != ids.len() {
+    if gold.len() != ids.len() {
         return Err(StageFileError::Scoring);
     }
-    let mut outcomes = Vec::with_capacity(predictions.len());
-    for (prediction, expected_id) in predictions.iter().zip(ids.iter()) {
-        if prediction.id() != *expected_id {
-            return Err(StageFileError::Scoring);
-        }
-        outcomes.push(match (prediction.status(), prediction.predicted_label()) {
-            (ValidationPredictionStatus::Ok, Some(label)) => Outcome::Label(label.to_string()),
-            (ValidationPredictionStatus::Abstain, _) => Outcome::Abstain,
-            (ValidationPredictionStatus::Error | ValidationPredictionStatus::Ok, _) => {
-                Outcome::Error
-            }
-        });
-    }
+    let outcomes = validation_outcomes(ids, predictions)?;
     let records: Vec<EvalRecord<'_>> = gold
         .iter()
         .zip(outcomes.iter())
@@ -142,9 +131,43 @@ pub fn validation_accuracy(
     Ok(m.accuracy.overall)
 }
 
+/// 学習ジョブが返した validation 予測（入力順）を評価器の [`Outcome`] 列へ写す（[`validation_accuracy`] と
+/// `select` の有意性判定〔#481〕が同じ写像を使う）。件数・`id` の順序が `ids` と一致しなければ
+/// [`StageFileError::Scoring`]。
+///
+/// `ok` かつラベルありは [`Outcome::Label`]、`abstain` は [`Outcome::Abstain`]、それ以外は [`Outcome::Error`]。
+///
+/// # Errors
+/// 件数・`id` 順序の不一致。
+pub fn validation_outcomes(
+    ids: &[&str],
+    predictions: &[ValidationPrediction],
+) -> Result<Vec<Outcome>, StageFileError> {
+    if predictions.len() != ids.len() {
+        return Err(StageFileError::Scoring);
+    }
+    predictions
+        .iter()
+        .zip(ids.iter())
+        .map(|(prediction, expected_id)| {
+            if prediction.id() != *expected_id {
+                return Err(StageFileError::Scoring);
+            }
+            Ok(match (prediction.status(), prediction.predicted_label()) {
+                (ValidationPredictionStatus::Ok, Some(label)) => Outcome::Label(label.to_string()),
+                (ValidationPredictionStatus::Abstain, _) => Outcome::Abstain,
+                (ValidationPredictionStatus::Error | ValidationPredictionStatus::Ok, _) => {
+                    Outcome::Error
+                }
+            })
+        })
+        .collect()
+}
+
 /// `select` の記録（`selection_record.json`）。`package` が選定候補を読み戻す。
 ///
-/// 有意性判定（McNemar・Holm）は含まない（未接続。合否には使わない）。
+/// 有意性判定（McNemar・Holm）は定義に `baseline_comparison` があるときだけ `significance` に残す
+/// （記録のみ。選定・合否には使わない。REQ-25・#481）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionRecord {
@@ -162,6 +185,10 @@ pub struct SelectionRecord {
     /// 除外が無いときはキーごと省略する（従来の記録と互換）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_candidates: Vec<ExcludedCandidate>,
+    /// 選定候補の下限基準に対する有意性判定（validation のみ・Holm 補正後。REQ-18・REQ-25・
+    /// TASK-18.3・#481）。定義に `baseline_comparison` が無いときはキーごと省略する（従来の記録と互換）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub significance: Option<SelectionSignificanceRecord>,
 }
 
 /// 語彙ファイルを持つ構成が容量の目安（40MB）を超えたため選定対象から外した候補の記録
@@ -280,6 +307,7 @@ mod tests {
             validation_correct: 3,
             validation_total: 4,
             excluded_candidates: Vec::new(),
+            significance: None,
         };
         let bytes = r.to_json_vec().expect("json");
         // 除外が無い記録は従来どおり `excluded_candidates` キーを出さない。
@@ -307,9 +335,37 @@ mod tests {
                 total_bytes: 46_365_993,
                 guideline_bytes: 40_000_000,
             }],
+            significance: None,
         };
         let bytes = r.to_json_vec().expect("json");
         assert!(String::from_utf8_lossy(&bytes).contains("\"total_bytes\":46365993"));
+        assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
+    }
+
+    /// REQ-25・#481: 有意性判定つきの記録は往復でき、欄の無い従来の記録も読める（`None`）。
+    #[test]
+    fn req25_issue481_selection_record_significance_is_optional() {
+        use fandhe_edge_core::evaluation_record::BaselineComparisonVerdict;
+        let old = br#"{"candidate_index":0,"candidate_id":"c1","rule":"r","validation_correct":1,"validation_total":2}"#;
+        let r = SelectionRecord::from_json_slice(old).expect("old record");
+        assert_eq!(r.significance, None);
+        let r = SelectionRecord {
+            significance: Some(SelectionSignificanceRecord {
+                majority_label: "a".to_string(),
+                baseline_correct: 1,
+                b: 1,
+                c: 0,
+                required_n: 7,
+                family_size: 2,
+                verdict: BaselineComparisonVerdict::Undeterminable,
+            }),
+            ..r
+        };
+        let bytes = r.to_json_vec().expect("json");
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "{\"candidate_index\":0,\"candidate_id\":\"c1\",\"rule\":\"r\",\"validation_correct\":1,\"validation_total\":2,\"significance\":{\"majority_label\":\"a\",\"baseline_correct\":1,\"b\":1,\"c\":0,\"required_n\":7,\"family_size\":2,\"verdict\":\"undeterminable\"}}\n"
+        );
         assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
     }
 }

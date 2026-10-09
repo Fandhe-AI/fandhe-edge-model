@@ -58,6 +58,32 @@ pub enum BaselineComparisonVerdict {
     Undeterminable,
 }
 
+/// `select` が選定候補について残す、下限基準（majority）に対する有意性判定の記録
+/// （REQ-18・REQ-25・REQ-27・TASK-18.3・#481）。
+///
+/// validation 分割だけで求め（凍結した最終 test・評価データは使わない）、`verdict` は既定候補の総数
+/// `family_size`（脱落候補を含む）で Holm 補正した後の判定。p 値は `b`・`c`・`family_size` から計算し直せる
+/// ため持たない。記録・報告のみで、選定・終了コードには使わない。`select` の stdout の `significance` と
+/// `selection_record.json` の同名欄が同じ形を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionSignificanceRecord {
+    /// train 分割のラベルだけから決めた多数派ラベルの選択肢 ID。
+    pub majority_label: String,
+    /// validation での下限基準の正解数。
+    pub baseline_correct: u64,
+    /// 選定候補だけが正解した件数。
+    pub b: u64,
+    /// 下限基準だけが正解した件数。
+    pub c: u64,
+    /// 定義の仮定から事前計算した必要件数。
+    pub required_n: u64,
+    /// Holm 補正の族サイズ（既定候補の総数）。
+    pub family_size: usize,
+    /// Holm 補正後の判定。
+    pub verdict: BaselineComparisonVerdict,
+}
+
 /// 下限基準との比較の記録（#339・REQ-25）。p 値は `b`・`c` から計算し直せるため持たない。
 /// 値の整合は `package` が定義と train 分割から計算し直して照合する。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

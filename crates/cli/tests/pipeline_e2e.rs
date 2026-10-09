@@ -264,7 +264,7 @@ mod suite {
         // c3（先頭の語で予測する偽ワーカー）が c1（常に alpha）より validation 正解率が高い。
         assert_eq!(
             env.ok(&["select", "--project-dir", "proj"]),
-            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":null}\n"
         );
         assert_eq!(
             env.ok(&["package", "--project-dir", "proj"]),
@@ -1545,7 +1545,7 @@ mod suite {
         assert!(!env.project_file("final_test_ledger").exists());
         assert_eq!(
             env.ok(&["select", "--project-dir", "proj"]),
-            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":null}\n"
         );
         // 選定されていない候補は評価できない（台帳にも触れない）。
         assert_eq!(
@@ -2301,6 +2301,13 @@ mod suite {
 
     /// `acceptance_env` と同じ進め方で、学習データも差し替える（`register → … → select` まで）。
     fn baseline_env(case: &str, definition: &str, train: &str, golds: &[String]) -> Env {
+        let env = baseline_env_trained(case, definition, train, golds);
+        env.ok(&SELECT);
+        env
+    }
+
+    /// [`baseline_env`] の `select` の手前（`register → … → train 1`）まで進める（#481）。
+    fn baseline_env_trained(case: &str, definition: &str, train: &str, golds: &[String]) -> Env {
         let env = Env::new(case, false);
         std::fs::write(env.work.join("def").join("train.jsonl"), train).expect("train");
         std::fs::write(env.work.join("def").join("definition.json"), definition)
@@ -2317,7 +2324,6 @@ mod suite {
         env.ok(&["inspect", "--project-dir", "proj"]);
         env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
         env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
-        env.ok(&SELECT);
         env
     }
 
@@ -2685,20 +2691,174 @@ mod suite {
         }
     }
 
-    /// REQ-25・REQ-27・#339: 定義は有効でも必要件数を算出できない仮定（`2/1/9999`）では、`evaluate` は
-    /// 最終 test の適用前に `invalid_input` で止まり、評価記録も台帳も作らない（適用権を使い切らない）。
+    /// 評価データなしで `register → inspect → train 0 → train 1 → select` まで進め、`select` の stdout を返す（#481）。
+    fn selected_env(case: &str, definition: &str, train: &str) -> (Env, String) {
+        let env = Env::new(case, false);
+        std::fs::write(env.work.join("def").join("train.jsonl"), train).expect("train");
+        std::fs::write(env.work.join("def").join("definition.json"), definition)
+            .expect("definition");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        let stdout = env.ok(&SELECT);
+        (env, stdout)
+    }
+
+    fn selection_record(env: &Env) -> String {
+        std::fs::read_to_string(env.project_file("selection_record.json")).expect("selection")
+    }
+
+    /// 選ばれる c3 の `select` の stdout（#481）。
+    fn select_line(significance: &str) -> String {
+        format!(
+            "{{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":{significance}}}\n"
+        )
+    }
+
+    /// `significance` の期待する JSON（族サイズは既定候補 c1・c3 の 2。#481）。
+    fn significance_json(
+        majority: &str,
+        baseline_correct: u64,
+        (b, c): (u64, u64),
+        required_n: u64,
+        verdict: &str,
+    ) -> String {
+        format!(
+            "{{\"majority_label\":\"{majority}\",\"baseline_correct\":{baseline_correct},\"b\":{b},\"c\":{c},\"required_n\":{required_n},\"family_size\":2,\"verdict\":\"{verdict}\"}}"
+        )
+    }
+
+    /// `train_jsonl_with_majority("gamma")`（110 件）の `significance`。validation は 11 件で alpha 3・beta 3・gamma 5
+    /// （ラベルごとの件数割り当ては `split.json` の per_label で確認。決定的）。c3（常に正解）は b=6・c=0 で生の p=2×0.5^6=0.03125 だが、c1 を含む族サイズ 2 の
+    /// Holm 補正で 0.0625 になり有意差なし（族サイズを効かせた既知解）。
+    fn gamma_significance(required_n: u64, verdict: &str) -> String {
+        significance_json("gamma", 5, (6, 0), required_n, verdict)
+    }
+
+    /// REQ-18・REQ-25・REQ-27・TASK-18.3・#481: `select` は定義に `baseline_comparison` があるときだけ、選定候補の
+    /// validation での下限基準（train の majority）に対する有意性を Holm 補正（族サイズ = 既定候補 2 件）
+    /// つきで stdout と選定記録に残す。判定（有意差なし・判定不能を含む）で選定候補・exit 0 は変わらない。
+    /// 欄が無い定義では `significance:null` で、記録にキーは現れない。
+    /// 証拠の種別: テストハーネス（偽ワーカー〔c1 は常に alpha・c3 は常に正解〕・固定 fixture ONNX・合成データ）。
+    pub fn select_reports_significance_against_baseline() {
+        let train = train_jsonl_with_majority("gamma");
+        let (plain, stdout) = selected_env("selsigplain", &definition_text(), &train);
+        assert_eq!(stdout, select_line("null"));
+        let plain_record = selection_record(&plain);
+        assert!(!plain_record.contains("significance"), "{plain_record}");
+
+        let (env, stdout) = selected_env(
+            "selsig",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train,
+        );
+        let expected = gamma_significance(7, "not_significantly_better");
+        assert_eq!(stdout, select_line(&expected));
+        // 記録は比較なしの定義の記録の末尾に同じ欄を足しただけ（選定の候補・正解数は変わらない）。
+        assert_eq!(
+            selection_record(&env),
+            plain_record.replacen("}\n", &format!(",\"significance\":{expected}}}\n"), 1)
+        );
+
+        // 件数不足（必要件数 168 > 11 件）: 判定不能でも選定候補・exit 0 は変わらない。
+        let (_, stdout) = selected_env(
+            "selsigundet",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_168),
+            &train,
+        );
+        assert_eq!(
+            stdout,
+            select_line(&gamma_significance(168, "undeterminable"))
+        );
+
+        // 有意に上回る: ラベルごとに 30 件を足した 200 件では validation が 20 件（alpha 6・beta 6・gamma 8。
+        // `split.json` の per_label で確認）。c3 は b=12・c=0 で生の p=2×0.5^12≈0.00049、Holm 補正後も 0.05 未満。
+        let more = train_jsonl()
+            .replace("\"id\":\"", "\"id\":\"m-")
+            .replace(" sample ", " more ")
+            .replace("\"group_id\":\"g-", "\"group_id\":\"m-");
+        let (_, stdout) = selected_env(
+            "selsigbetter",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &(train + &more),
+        );
+        assert_eq!(
+            stdout,
+            select_line(&significance_json(
+                "gamma",
+                8,
+                (12, 0),
+                7,
+                "significantly_better"
+            ))
+        );
+    }
+
+    /// REQ-27・#481: `package` は選定をやり直して記録と完全一致を求めるため、選定記録の `significance` の
+    /// 改変・削除を `invalid_input`（64）で止め、`package/` を作らない。元に戻すと成功する。
+    pub fn package_rejects_tampered_selection_significance() {
+        let (env, _) = selected_env(
+            "selsigtamper",
+            &baseline_definition_text(BASELINE_ASSUMPTION_REQUIRED_7),
+            &train_jsonl_with_majority("gamma"),
+        );
+        let path = env.project_file("selection_record.json");
+        let original = selection_record(&env);
+        let expected = gamma_significance(7, "not_significantly_better");
+        assert!(original.contains(&expected), "{original}");
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"selection record does not match the candidate\"}\n";
+        let tampered = [
+            original.replacen(
+                "\"verdict\":\"not_significantly_better\"",
+                "\"verdict\":\"significantly_better\"",
+                1,
+            ),
+            original.replacen("\"b\":6,", "\"b\":7,", 1),
+            original.replacen("\"family_size\":2,", "\"family_size\":1,", 1),
+            original.replacen(
+                "\"majority_label\":\"gamma\"",
+                "\"majority_label\":\"alpha\"",
+                1,
+            ),
+            original.replacen(&format!(",\"significance\":{expected}"), "", 1),
+        ];
+        for (i, t) in tampered.iter().enumerate() {
+            assert_ne!(t, &original, "mutation {i}");
+            std::fs::write(&path, t).expect("tamper");
+            assert_eq!(
+                env.fails(&PACKAGE, 64, "invalid_input"),
+                mismatch,
+                "mutation {i}"
+            );
+            assert!(!env.project_file("package").exists(), "mutation {i}");
+        }
+        std::fs::write(&path, &original).expect("restore");
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
+    }
+
+    /// REQ-25・REQ-27・#339・#481: 定義は有効でも必要件数を算出できない仮定（`2/1/9999`）では、`select` は
+    /// 選定記録を作らずに止まり、`evaluate` は最終 test の適用前に `invalid_input` で止まり、評価記録も台帳も
+    /// 作らない（適用権を使い切らない）。
     pub fn evaluate_sample_size_failure_does_not_consume_apply_right() {
         let golds: Vec<String> = vec!["alpha".to_string(); 12];
-        let env = baseline_env(
+        let env = baseline_env_trained(
             "bcnosize",
             &baseline_definition_text(r#"{"assumed_p_b_bp":2,"assumed_p_c_bp":1,"power_bp":9999}"#),
             &train_jsonl(),
             &golds,
         );
-        assert_eq!(
-            env.fails(&EVALUATE_1, 64, "invalid_input"),
-            "{\"code\":\"invalid_input\",\"message\":\"baseline comparison sample size cannot be computed\"}\n"
-        );
+        let no_size = "{\"code\":\"invalid_input\",\"message\":\"baseline comparison sample size cannot be computed\"}\n";
+        // `select` も同じ準備（#481）を通すため、選定記録を作らずに止まる（fail-closed）。
+        assert_eq!(env.fails(&SELECT, 64, "invalid_input"), no_size);
+        assert!(!env.project_file("selection_record.json").exists());
+        // 選定記録を手で置いても、`evaluate` は選定の再計算（同じ準備）で適用前に止まる。
+        std::fs::write(
+            env.project_file("selection_record.json"),
+            "{\"candidate_index\":1,\"candidate_id\":\"c3\",\"rule\":\"validation_accuracy_desc_then_candidate_order\",\"validation_correct\":9,\"validation_total\":9}\n",
+        )
+        .expect("selection record");
+        assert_eq!(env.fails(&EVALUATE_1, 64, "invalid_input"), no_size);
         assert!(!evaluation_record_path(&env).exists());
         assert!(!env.project_file("final_test_ledger").exists());
     }
@@ -2794,7 +2954,7 @@ mod suite {
         // select は validation だけで選ぶため candidate 1（c3）を選ぶ。
         assert_eq!(
             env.ok(&SELECT),
-            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":null}\n"
         );
         assert_eq!(
             env.fails(&PACKAGE, 64, "invalid_input"),
@@ -2974,7 +3134,7 @@ mod suite {
         std::fs::remove_file(env.project_file("selection_record.json")).expect("remove selection");
         assert_eq!(
             env.ok(&SELECT),
-            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}\n"
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\",\"significance\":null}\n"
         );
         assert_eq!(
             env.fails(&EVALUATE_0, 64, "invalid_input"),
@@ -3470,6 +3630,14 @@ fn main() -> std::process::ExitCode {
         (
             "register_rejects_invalid_baseline_comparison",
             suite::register_rejects_invalid_baseline_comparison,
+        ),
+        (
+            "select_reports_significance_against_baseline",
+            suite::select_reports_significance_against_baseline,
+        ),
+        (
+            "package_rejects_tampered_selection_significance",
+            suite::package_rejects_tampered_selection_significance,
         ),
         (
             "evaluate_sample_size_failure_does_not_consume_apply_right",

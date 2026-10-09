@@ -34,7 +34,9 @@
 
 use serde::Serialize;
 
-use crate::evaluation_record::{BaselineComparisonVerdict, TypeMeaningQuadrantRecord};
+use crate::evaluation_record::{
+    BaselineComparisonVerdict, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
+};
 use crate::hash::Sha256Digest;
 
 /// CLI の 7 工程（REQ-33。工程順）。
@@ -712,17 +714,24 @@ pub struct SelectReport {
     status: StageStatus,
     candidate: usize,
     kind: String,
+    /// 下限基準に対する有意性判定（定義に `baseline_comparison` が無いときは `null`。#481）。
+    significance: Option<SelectionSignificanceRecord>,
 }
 
 impl SelectReport {
-    /// `select` の完了結果を作る（選ばれた候補の添字と種類）。
+    /// `select` の完了結果を作る（選ばれた候補の添字・種類・有意性判定。REQ-18・REQ-25・#481）。
     #[must_use]
-    pub fn new(candidate: usize, kind: String) -> Self {
+    pub fn new(
+        candidate: usize,
+        kind: String,
+        significance: Option<SelectionSignificanceRecord>,
+    ) -> Self {
         Self {
             step: Stage::Select,
             status: StageStatus::Ok,
             candidate,
             kind,
+            significance,
         }
     }
 
@@ -1395,10 +1404,30 @@ mod tests {
             "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}"
         );
         assert_eq!(
-            SelectReport::new(1, "c3".to_string())
+            SelectReport::new(1, "c3".to_string(), None)
                 .to_json_line()
                 .expect("json"),
-            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}"
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\",\"significance\":null}"
+        );
+    }
+
+    /// REQ-18・REQ-25・#481: 有意性判定つきの select の JSON が完全一致する（既存キーの後ろ・p 値なし）。
+    #[test]
+    fn req25_issue481_select_report_with_significance_json_is_exact() {
+        let significance = SelectionSignificanceRecord {
+            majority_label: "a".to_string(),
+            baseline_correct: 40,
+            b: 30,
+            c: 5,
+            required_n: 168,
+            family_size: 2,
+            verdict: BaselineComparisonVerdict::SignificantlyBetter,
+        };
+        assert_eq!(
+            SelectReport::new(0, "c1".to_string(), Some(significance))
+                .to_json_line()
+                .expect("json"),
+            "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\",\"significance\":{\"majority_label\":\"a\",\"baseline_correct\":40,\"b\":30,\"c\":5,\"required_n\":168,\"family_size\":2,\"verdict\":\"significantly_better\"}}"
         );
     }
 
