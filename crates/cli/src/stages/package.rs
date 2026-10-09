@@ -524,6 +524,14 @@ fn verify_evaluation_record(
         && record
             .type_meaning_quadrant
             .is_none_or(|q| q.total() == Some(record.total))
+        // 保留・対象外の構造整合（answered + abstained = total かつ out_of_scope <= answered。T・τ の再計算照合は
+        // しない。REQ-22・#479）と、記録した対象外ラベルが定義と一致すること（#478）。
+        && record
+            .abstention
+            .is_none_or(|a| a.total() == Some(record.total)
+                    && a.out_of_scope <= a.answered
+                    && a.correct_answered <= a.answered)
+        && record.out_of_scope_label.as_deref() == definition.out_of_scope_label()
         && usize::try_from(record.total).is_ok_and(|t| t == expected_total)
         && record.candidate_id == selection.candidate_id
         && record.evaluation_sha256 == freeze.sha256().to_hex()
@@ -1079,6 +1087,8 @@ mod tests {
             predictions_sha256: None,
             calibration: None,
             type_meaning_quadrant: None,
+            out_of_scope_label: None,
+            abstention: None,
         }
     }
 

@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 
 /// 評価完了記録の読み込み上限（バイト。読み込み前のサイズ確認に使う。REQ-39）。
 ///
-/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）のみを持つ。通常は 1 KiB 程度で、
-/// 比較欄の `majority_label`（最大 256 バイト）が全て JSON の `\u00XX` に膨らむ最悪でも
-/// この上限に収まる（テスト `req39_issue339_record_fits_size_limit`）。
-pub const MAX_EVALUATION_RECORD_BYTES: u64 = 4 * 1024;
+/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）・対象外ラベル（#478）のみを持つ。
+/// 通常は 1 KiB 程度で、`majority_label`・`out_of_scope_label`（各最大 256 バイト）が全て JSON の
+/// `\u00XX` に膨らむ最悪でもこの上限に収まる（テスト `req39_issue339_record_fits_size_limit`。
+/// #478 で 4 KiB から 8 KiB に引き上げた）。
+pub const MAX_EVALUATION_RECORD_BYTES: u64 = 8 * 1024;
 
 /// 評価完了記録の保存・読み込みの失敗（内容を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +130,31 @@ pub struct CalibrationRecord {
     pub validation_answered: u64,
 }
 
+/// 保留・対象外の件数の記録（REQ-22・#479・#478）。`evaluate` の stdout `abstention` の件数部分と同じ意味。
+///
+/// 対象外は「答えた」側で、`out_of_scope` は `answered` の内数。`answered + abstained` は評価件数
+/// （`total`）と一致する。T・τ の再計算照合はしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbstentionRecord {
+    /// 保留にならず答えた件数（対象外を含む）。
+    pub answered: u64,
+    /// 保留した件数。
+    pub abstained: u64,
+    /// `answered` のうち対象外ラベルと判定した件数（内数）。
+    pub out_of_scope: u64,
+    /// 答えた行（対象外を含む）のうち正解の件数。
+    pub correct_answered: u64,
+}
+
+impl AbstentionRecord {
+    /// 答えた件数と保留件数の合計（評価件数と一致すべき値）。桁あふれ時は `None`。
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        self.answered.checked_add(self.abstained)
+    }
+}
+
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,12 +184,17 @@ pub struct EvaluationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_comparison: Option<BaselineComparisonRecord>,
     /// 型と意味の 5 区分（#480・REQ-24）。欄の無い古い記録はそのまま読める。
-    /// `out_of_scope_label`・`abstention` の記録欄は #478・#479 で追加する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_meaning_quadrant: Option<TypeMeaningQuadrantRecord>,
     /// 校正と保留しきい値（#477・REQ-22）。欄の無い古い記録はそのまま読める。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationRecord>,
+    /// 評価時点の定義の対象外ラベル（#478）。欄の無い古い記録はそのまま読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_scope_label: Option<String>,
+    /// 保留・対象外の件数（#479・REQ-22。校正が無ければ無い）。欄の無い古い記録はそのまま読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstention: Option<AbstentionRecord>,
     /// 同じディレクトリの `evaluation_predictions.jsonl` のバイト列の sha256（hex。#445・REQ-27）。
     /// PoC-26 の採点入口が予測ファイルの手編集を検出するために照合する。欄の無い古い記録は
     /// そのまま読める（その場合、採点入口は拒否する）。
@@ -211,6 +242,8 @@ mod tests {
             predictions_sha256: None,
             type_meaning_quadrant: None,
             calibration: None,
+            out_of_scope_label: None,
+            abstention: None,
         }
     }
 
@@ -370,6 +403,13 @@ mod tests {
                 n_validation: u64::MAX,
                 validation_answered: u64::MAX,
             }),
+            out_of_scope_label: Some("\u{1}".repeat(256)),
+            abstention: Some(AbstentionRecord {
+                answered: u64::MAX,
+                abstained: u64::MAX,
+                out_of_scope: u64::MAX,
+                correct_answered: u64::MAX,
+            }),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
         assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");
@@ -426,6 +466,28 @@ mod tests {
         let bytes = record.to_json_vec().expect("json");
         assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
             ",\"calibration\":{\"temperature\":1.25,\"adopted\":true,\"threshold\":0.5,\"n_validation\":10,\"validation_answered\":8}}\n"
+        ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+
+    /// REQ-22・#479・#478: 欄つきの記録は往復でき、欄の無い古い記録は `None` で読める。
+    #[test]
+    fn req22_issue479_abstention_round_trips_and_old_record_reads() {
+        let old = sample().to_json_vec().expect("json");
+        let read = EvaluationRecord::from_json_slice(&old).expect("old");
+        assert_eq!((read.abstention, read.out_of_scope_label), (None, None));
+        let mut record = sample();
+        record.out_of_scope_label = Some("other".to_string());
+        record.abstention = Some(AbstentionRecord {
+            answered: 5,
+            abstained: 7,
+            out_of_scope: 3,
+            correct_answered: 4,
+        });
+        assert_eq!(record.abstention.and_then(|a| a.total()), Some(12));
+        let bytes = record.to_json_vec().expect("json");
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
+            "\"out_of_scope_label\":\"other\",\"abstention\":{\"answered\":5,\"abstained\":7,\"out_of_scope\":3,\"correct_answered\":4}}\n"
         ));
         assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
     }
