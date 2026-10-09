@@ -2010,6 +2010,7 @@ mod tests {
             input: "hello".to_string(),
             label_id: "A".to_string(),
             output_key: "{\"intent\":\"A\"}".to_string(),
+            output_original: "{\"intent\":\"A\"}".to_string(),
             tags: None,
             group_id: None,
         }];

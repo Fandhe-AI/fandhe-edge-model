@@ -336,6 +336,143 @@ fn is_meaningful_serialization(s: &str) -> bool {
     !s.is_empty() && s != "{}" && s != "null"
 }
 
+/// キーの出現順を保った JSON 木（REQ-16・PoC-9 A-10）。
+///
+/// workspace の `serde_json` は `preserve_order` 無効で `Value` がキーを整列するため、
+/// 元のキー順で混入した正解 JSON を照合する用途にだけ、順序を保つ小さな型を持つ。
+/// 重複キーは検査（`inspect_records`）で除外済みの前提で、そのまま並べる。
+/// 再帰の深さは `serde_json::Deserializer` の上限（128）が止める。
+pub(crate) enum OrderedJson {
+    Scalar(serde_json::Value),
+    Array(Vec<OrderedJson>),
+    Object(Vec<(String, OrderedJson)>),
+}
+
+impl<'de> serde::Deserialize<'de> for OrderedJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = OrderedJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_unit<E>(self) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(serde_json::Value::Null))
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(v.into()))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(v.into()))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(v.into()))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(v.into()))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<OrderedJson, E> {
+                Ok(OrderedJson::Scalar(v.into()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<OrderedJson, A::Error> {
+                let mut items = Vec::new();
+                while let Some(x) = a.next_element()? {
+                    items.push(x);
+                }
+                Ok(OrderedJson::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<OrderedJson, A::Error> {
+                let mut items = Vec::new();
+                while let Some(kv) = a.next_entry()? {
+                    items.push(kv);
+                }
+                Ok(OrderedJson::Object(items))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl OrderedJson {
+    /// 元のキー順を保った compact JSON を返す。
+    pub(crate) fn compact(&self) -> String {
+        self.render(false)
+    }
+
+    /// Python の `json.dumps` 既定（`", "`・`": "` 区切り）で返す。文字列は serde_json の表記。
+    fn spaced(&self) -> String {
+        self.render(true)
+    }
+
+    fn render(&self, spaced: bool) -> String {
+        let (item, kv) = if spaced { (", ", ": ") } else { (",", ":") };
+        match self {
+            Self::Scalar(v) => v.to_string(),
+            Self::Array(a) => format!(
+                "[{}]",
+                a.iter()
+                    .map(|x| x.render(spaced))
+                    .collect::<Vec<_>>()
+                    .join(item)
+            ),
+            Self::Object(m) => format!(
+                "{{{}}}",
+                m.iter()
+                    .map(|(k, x)| format!(
+                        "{}{kv}{}",
+                        serde_json::Value::String(k.clone()),
+                        x.render(spaced)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(item)
+            ),
+        }
+    }
+
+    fn arguments(&self) -> Option<&OrderedJson> {
+        let Self::Object(m) = self else { return None };
+        match m.iter().find(|(k, _)| k == "arguments") {
+            Some((_, a @ Self::Object(items))) if !items.is_empty() => Some(a),
+            _ => None,
+        }
+    }
+}
+
+/// `output` の正解 JSON から、メタデータ混入の判定に使う直列化表現を作る（REQ-16・PoC-9 A-10）。
+///
+/// 入力は整列済みの `output_key` と、元のキー順の `output_original`
+/// （[`crate::inspect::ValidRecord::output_original`]）の両方。それぞれについて
+/// `output` 全体と、`arguments` が空でないオブジェクトのときその全体を、compact 表記と
+/// Python の `json.dumps` 既定の空白入り表記の 2 通りで作る（重複は除く）。引数の値単体は含めない。
+/// JSON として解釈できなければ入力文字列そのものだけを返す。
+pub fn gold_serializations(output_key: &str, output_original: &str) -> Vec<String> {
+    let mut out = vec![output_key.to_string()];
+    for src in [output_key, output_original] {
+        if !out.iter().any(|x| x == src) {
+            out.push(src.to_string());
+        }
+        let Ok(tree) = serde_json::from_str::<OrderedJson>(src) else {
+            continue;
+        };
+        let mut targets = vec![&tree];
+        targets.extend(tree.arguments());
+        for t in targets {
+            for s in [t.compact(), t.spaced()] {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// レコードの `input` に、そのレコード自身の id・正解ラベル・正解の直列化
 /// 表現が部分文字列として含まれていないかを検出する（REQ-16・PoC-9 A-10）。
 ///
@@ -403,6 +540,49 @@ where
 mod tests {
     use super::*;
     use crate::normalize::NfkcWhitespaceNormalizer;
+
+    /// REQ-16: 引数 JSON 全体・空白入り JSON が表現に含まれ、値単体と空 arguments は含まれない。
+    #[test]
+    fn req16_gold_serializations_cover_arguments_and_spaced_forms() {
+        let s = gold_serializations(
+            r#"{"arguments":{"a":1,"b":[1,2]},"intent":"x"}"#,
+            r#"{"arguments":{"a":1,"b":[1,2]},"intent":"x"}"#,
+        );
+        for want in [
+            r#"{"arguments":{"a":1,"b":[1,2]},"intent":"x"}"#,
+            r#"{"arguments": {"a": 1, "b": [1, 2]}, "intent": "x"}"#,
+            r#"{"a":1,"b":[1,2]}"#,
+            r#"{"a": 1, "b": [1, 2]}"#,
+        ] {
+            assert!(s.iter().any(|x| x == want), "{want}");
+        }
+        assert!(!s.iter().any(|x| x == "1" || x == "\"x\""));
+        let e = gold_serializations(
+            r#"{"arguments":{},"intent":"x"}"#,
+            r#"{"arguments":{},"intent":"x"}"#,
+        );
+        assert!(!e.iter().any(|x| x == "{}") || !is_meaningful_serialization("{}"));
+    }
+
+    /// REQ-16・PoC-9 A-10: 元のキー順（非整列）の output 全体・arguments も compact / 空白入りで候補になる。
+    #[test]
+    fn req16_gold_serializations_include_original_key_order() {
+        let s = gold_serializations(
+            r#"{"arguments":{"a":2,"z":1},"intent":"x"}"#,
+            r#"{"intent":"x","arguments":{"z":1,"a":2}}"#,
+        );
+        for want in [
+            r#"{"intent":"x","arguments":{"z":1,"a":2}}"#,
+            r#"{"intent": "x", "arguments": {"z": 1, "a": 2}}"#,
+            r#"{"z":1,"a":2}"#,
+            r#"{"z": 1, "a": 2}"#,
+            r#"{"a":2,"z":1}"#,
+            r#"{"a": 2, "z": 1}"#,
+        ] {
+            assert!(s.iter().any(|x| x == want), "{want}");
+        }
+        assert_eq!(s.len(), 8, "{s:?}");
+    }
 
     struct TestRecord {
         id: &'static str,

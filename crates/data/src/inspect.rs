@@ -149,6 +149,9 @@ pub struct ValidRecord {
     /// キーを整列済みで出力する。この前提が崩れると
     /// `output_key_is_independent_of_raw_json_key_order` が検知する）。
     pub output_key: String,
+    /// `output` を元のキー順のまま compact JSON にしたもの。キー順違いで input に混入した
+    /// 正解 JSON の検出に使う（REQ-16・PoC-9 A-10。[`crate::consistency::gold_serializations`]）。
+    pub output_original: String,
     pub tags: Option<Vec<String>>,
     pub group_id: Option<String>,
 }
@@ -534,12 +537,21 @@ pub fn inspect_records(
             && let (Some(id), Some(input), Some((label_id, output_key))) =
                 (id_opt, input_opt, label_id_opt)
         {
+            // 検査済みの行から `output` だけを元のキー順で読み直す（上限は上のパースと同じ深さ）。
+            #[derive(serde::Deserialize)]
+            struct OutputOnly {
+                output: crate::consistency::OrderedJson,
+            }
+            let output_original = serde_json::from_str::<OutputOnly>(raw_line)
+                .map(|o| o.output.compact())
+                .unwrap_or_else(|_| output_key.clone());
             valid_records.push(ValidRecord {
                 line,
                 id,
                 input,
                 label_id,
                 output_key,
+                output_original,
                 tags: tags_opt,
                 group_id: group_id_opt,
             });
@@ -583,6 +595,7 @@ mod tests {
                 input: "hello".to_string(),
                 label_id: "tier-s__low".to_string(),
                 output_key: "{\"intent\":\"tier-s__low\"}".to_string(),
+                output_original: "{\"intent\":\"tier-s__low\"}".to_string(),
                 tags: None,
                 group_id: None,
             }
@@ -595,6 +608,7 @@ mod tests {
                 input: "world".to_string(),
                 label_id: "tier-s__high".to_string(),
                 output_key: "{\"intent\":\"tier-s__high\"}".to_string(),
+                output_original: "{\"intent\":\"tier-s__high\"}".to_string(),
                 tags: Some(vec!["a".to_string(), "b".to_string()]),
                 group_id: Some("g1".to_string()),
             }
@@ -627,6 +641,22 @@ mod tests {
         assert_eq!(
             outcome.report.unique_outputs, 1,
             "同じ output を意味の同じキー順違いは 1 件として集計されること"
+        );
+    }
+
+    /// REQ-16・PoC-9 A-10: `output_original` は元のキー順を保ち、`output_key` は整列される。
+    #[test]
+    fn output_original_keeps_raw_key_order() {
+        let raw = r#"{"id":"r1","input":"x","output":{"intent":"tier-s__low","arguments":{"z":1,"a":[2,{"y":"s","b":null}]}}}"#;
+        let outcome = inspect_records(raw, &labels(&["tier-s__low"])).expect("labels");
+        let r = &outcome.valid_records[0];
+        assert_eq!(
+            r.output_original,
+            r#"{"intent":"tier-s__low","arguments":{"z":1,"a":[2,{"y":"s","b":null}]}}"#
+        );
+        assert_eq!(
+            r.output_key,
+            r#"{"arguments":{"a":[2,{"b":null,"y":"s"}],"z":1},"intent":"tier-s__low"}"#
         );
     }
 

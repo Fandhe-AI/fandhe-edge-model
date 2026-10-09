@@ -647,6 +647,85 @@ mod suite {
         );
     }
 
+    /// REQ-16: 矛盾（正規化後同一・ラベル違い）とメタデータ混入を含むデータでも `inspect` は止まらず
+    /// （exit 0・stdout は通常の 1 JSON）、stderr に理由別の件数だけを出す（ID・本文・ラベルは出さない）。
+    pub fn req16_inspect_reports_contradiction_and_metadata_counts_on_stderr() {
+        let env = Env::new("req16dirty", false);
+        let mut data = clean_filler();
+        for l in [
+            r#"{"id":"c1","input":"same  text","output":{"intent":"alpha"},"group_id":"gc"}"#,
+            r#"{"id":"c2","input":"same text","output":{"intent":"beta"},"group_id":"gc"}"#,
+            r#"{"id":"idrec","input":"contains idrec here","output":{"intent":"alpha"},"group_id":"gi"}"#,
+            r#"{"id":"ar1","input":"answer: {\"title\":\"x\"}","output":{"intent":"alpha","arguments":{"title":"x"}},"group_id":"ga1"}"#,
+            r#"{"id":"ar2","input":"answer: {\"n\": 1, \"title\": \"y\"}","output":{"intent":"beta","arguments":{"title":"y","n":1}},"group_id":"ga2"}"#,
+            r#"{"id":"ar3","input":"just x here","output":{"intent":"beta","arguments":{"title":"x"}},"group_id":"ga3"}"#,
+            r#"{"id":"lab","input":"this is gamma","output":{"intent":"gamma"},"group_id":"gl"}"#,
+        ] {
+            data.push_str(l);
+            data.push('\n');
+        }
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        let out = env.cli(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        assert!(
+            stdout.starts_with("{\"step\":\"inspect\",\"status\":\"ok\",\"valid_records\":97,"),
+            "{stdout}"
+        );
+        assert_eq!(
+            String::from_utf8(out.stderr).expect("utf8"),
+            "fandhe-edge: inspect: train contradictory inputs: 1\nfandhe-edge: inspect: train metadata id in input: 1\nfandhe-edge: inspect: train metadata gold label in input: 1\nfandhe-edge: inspect: train metadata gold serialization in input: 2\n"
+        );
+    }
+
+    /// REQ-16・PoC-9 A-10: 元のキー順（z, a）のまま input に混入した arguments 全体・output 全体
+    /// （compact・空白入り）も正解の直列化表現の混入として数える（4 行 = 4 件。o3・o4 は output 全体に含まれるラベル名も拾うため label が 2 件）。
+    pub fn req16_inspect_detects_gold_json_in_original_key_order() {
+        let env = Env::new("req16order", false);
+        let mut data = clean_filler();
+        for l in [
+            r#"{"id":"o1","input":"see {\"z\":1,\"a\":2}","output":{"intent":"alpha","arguments":{"z":1,"a":2}},"group_id":"go1"}"#,
+            r#"{"id":"o2","input":"see {\"z\": 1, \"a\": 2}","output":{"intent":"beta","arguments":{"z":1,"a":2}},"group_id":"go2"}"#,
+            r#"{"id":"o3","input":"see {\"intent\":\"alpha\",\"arguments\":{\"z\":1,\"a\":2}}","output":{"intent":"alpha","arguments":{"z":1,"a":2}},"group_id":"go3"}"#,
+            r#"{"id":"o4","input":"see {\"intent\": \"beta\", \"arguments\": {\"z\": 1, \"a\": 2}}","output":{"intent":"beta","arguments":{"z":1,"a":2}},"group_id":"go4"}"#,
+        ] {
+            data.push_str(l);
+            data.push('\n');
+        }
+        std::fs::write(env.work.join("def").join("train.jsonl"), data).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        let out = env.cli(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).expect("utf8"),
+            "fandhe-edge: inspect: train metadata gold label in input: 2\nfandhe-edge: inspect: train metadata gold serialization in input: 4\n"
+        );
+    }
+
+    /// REQ-16: 矛盾もメタデータ混入も無いデータでは `inspect` の stderr は空（誤検出 0）。
+    pub fn req16_inspect_clean_data_reports_nothing_on_stderr() {
+        let env = Env::new("req16clean", false);
+        std::fs::write(env.work.join("def").join("train.jsonl"), clean_filler()).expect("data");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        let out = env.cli(&["inspect", "--project-dir", "proj"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8(out.stderr).expect("utf8"), "");
+    }
+
+    /// 矛盾・メタデータ混入の無い合成データ（ラベル名・ID・正解 JSON を input に含めない）。
+    fn clean_filler() -> String {
+        let mut data = String::new();
+        for (n, l) in LABELS.iter().enumerate() {
+            for i in 0..30 {
+                data.push_str(&format!(
+                    "{{\"id\":\"f{n}-{i}\",\"input\":\"zzz {n} {i}\",\"output\":{{\"intent\":\"{l}\"}},\"group_id\":\"fg-{n}-{i}\"}}\n"
+                ));
+            }
+        }
+        data
+    }
+
     /// REQ-17: group が 1 件だけで validation 分割が空になるデータは、`inspect` が `invalid_input`（64）で
     /// 拒否し、分割記録（split.json）を保存しない（後続の train が必ず失敗する状態を ok にしない）。
     pub fn inspect_rejects_empty_validation_split_without_split_record() {
@@ -3240,6 +3319,18 @@ fn main() -> std::process::ExitCode {
         (
             "register_rejects_existing_and_escaping_paths",
             suite::register_rejects_existing_and_escaping_paths,
+        ),
+        (
+            "req16_inspect_reports_contradiction_and_metadata_counts_on_stderr",
+            suite::req16_inspect_reports_contradiction_and_metadata_counts_on_stderr,
+        ),
+        (
+            "req16_inspect_detects_gold_json_in_original_key_order",
+            suite::req16_inspect_detects_gold_json_in_original_key_order,
+        ),
+        (
+            "req16_inspect_clean_data_reports_nothing_on_stderr",
+            suite::req16_inspect_clean_data_reports_nothing_on_stderr,
         ),
         (
             "inspect_rejects_empty_validation_split_without_split_record",
