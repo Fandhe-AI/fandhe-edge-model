@@ -67,9 +67,19 @@
 //!
 //! # 未接続（実装済みを装わない）
 //!
-//! 診断レポート（REQ-29）・校正と棄権（REQ-22）は結線していない。Wilson 区間は評価記録・結果 JSON には
+//! 診断レポート（REQ-29）・棄権（REQ-22。`abstention` は #479）は結線していない。Wilson 区間は評価記録・結果 JSON には
 //! 含めず、合否基準の照合で `package` 工程が使う（#328）。結果 JSON は正解率と Macro-F1 のみ
 //! （スキーマは 2026-09-30 オーナー承認済み）。
+//!
+//! # 校正（REQ-22・REQ-27・#477）
+//!
+//! 温度 T・保留しきい値 τ は **validation 分割だけ** から決める（[`calibrate_on_validation`]）。候補の
+//! ONNX を validation の `input` だけに当て（正解ラベルは `calibrate` にだけ渡る）、確率 p から
+//! ロジット `ln(p)` を得て評価器の `calibrate` に渡す。凍結 test の結果は T・τ に影響せず、適用権を取る
+//! 前に確定する。`calibration:null` は validation が 0 件のときだけ（0 や 1 で埋めない）。校正の計算が
+//! 失敗したら握りつぶさず `runtime_error`（`calibration failed`）で止める（適用権は消費しない。
+//! オーナー決定 2026-10-09）。最小件数は設けず、少件数でも T・τ が確定する。件数は `n_validation` で
+//! 利用者に示す（REQ-22 に基準なし。オーナー判断 2026-10-09）。T・τ を決める口は定義にも CLI 引数にも無い。
 //!
 //! # 下限基準との比較（REQ-25・REQ-27・#339）
 //!
@@ -84,18 +94,22 @@ use std::time::Instant;
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::evaluation_record::{
-    EvaluationRecord, MAX_EVALUATION_RECORD_BYTES, TypeMeaningQuadrantRecord,
+    CalibrationRecord, EvaluationRecord, MAX_EVALUATION_RECORD_BYTES, TypeMeaningQuadrantRecord,
 };
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::limits::INFER_TIME_LIMIT;
 use fandhe_edge_core::stage_report::{
-    EvaluateCompletedReport, EvaluateDetails, EvaluateLabelMetrics, EvaluateReport, PredictionLine,
-    PredictionLineOutcome,
+    EvaluateCalibration, EvaluateCompletedReport, EvaluateDetails, EvaluateLabelMetrics,
+    EvaluateReport, PredictionLine, PredictionLineOutcome,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
+use fandhe_edge_data::split::Split;
+use fandhe_edge_eval::calibration::{
+    Calibration, CalibrationRecord as CalibrationInput, MAX_CALIBRATION_CELLS, calibrate,
+};
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
@@ -107,6 +121,7 @@ use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::onnx::{MAX_MODEL_FILE_BYTES, ModelKind};
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferError, InferencePipeline, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
+    MAX_INFER_BATCH_TOTAL_SCORES,
 };
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_train::request::TrainRequest;
@@ -249,6 +264,8 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     // 下限基準（majority）と必要件数は適用権を取る前に確定する（失敗しても適用権を使い切らない）。
     // 引数は train 側の入力だけで、評価データを渡せない（REQ-27・#339）。
     let baseline = prepare_baseline(&definition, &records, &split)?;
+    // 校正は validation だけから、適用権を取る前に確定する（REQ-22・REQ-27・#477）。
+    let calibration = calibrate_on_validation(&target, &definition, &records, &split)?;
     let definition_sha256 = definition
         .canonical_hash()
         .map_err(|_| runtime("cannot hash definition"))?
@@ -296,6 +313,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
                 definition_sha256,
                 onnx_digest,
                 baseline: baseline.as_ref(),
+                calibration: calibration.as_ref(),
             },
             &PredictionsSink {
                 rel: &predictions_rel,
@@ -426,6 +444,90 @@ fn check_candidate_artifact(
     )
 }
 
+/// validation 分割だけから校正（温度 T・保留しきい値 τ）を決める（REQ-22・REQ-27・#477）。
+///
+/// 推論には `input` だけを渡し（`evaluate` の推論関数と同じ経路）、確率 p から `ln(p)` をロジットとして
+/// 評価器の [`calibrate`] へ渡す。正解ラベルは評価器にだけ渡り、凍結 test のデータ・結果は使わない。
+/// 適用権（`apply_once`）より前に呼ぶ。validation が 0 件のときだけ `None`（`calibration:null`。
+/// 0 や 1 で埋めない）。最小件数は設けず、少件数でも T・τ が確定する（件数は `n_validation` で示す。
+/// REQ-22 に基準なし。オーナー判断 2026-10-09）。校正の計算の失敗は `runtime_error`、
+/// 上限（件数・時間）超過は `limit_exceeded`。
+fn calibrate_on_validation(
+    target: &PreparedCandidate,
+    definition: &Definition,
+    records: &[ValidRecord],
+    split: &fandhe_edge_data::split::SplitResult,
+) -> Result<Option<Calibration>, ErrorReport> {
+    let validation: Vec<&ValidRecord> = records
+        .iter()
+        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
+        .collect();
+    if validation.is_empty() {
+        return Ok(None);
+    }
+    if validation.len() > MAX_INFER_BATCH_LEN {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "validation data has too many records",
+        ));
+    }
+    let options = definition.options();
+    // 推論とロジットの確保の前に「件数 × 選択肢数」を、バッチ推論の保持スコア上限と
+    // 校正の計算量上限の小さい方で検証する（REQ-39 資源の上限）。
+    if !validation_cells_within_limit(validation.len(), options.len()) {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "validation data has too many scores",
+        ));
+    }
+    let backend = load_backend(
+        &target.artifact.onnx_bytes,
+        target.kind,
+        target.artifact.meta.kind_version(),
+        options.len(),
+    )?;
+    let pipeline = InferencePipeline::new(ByteEncodingPreprocessor::new(target.max_bytes), backend);
+    let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
+    let mut logits: Vec<Vec<f64>> = Vec::with_capacity(validation.len());
+    for record in &validation {
+        if deadline.is_some_and(|d| Instant::now() > d) {
+            return Err(fail(
+                ExitCode::LimitExceeded,
+                "validation inference exceeded the time limit",
+            ));
+        }
+        let prediction = pipeline
+            .infer_one_within(&record.input, INFER_TIME_LIMIT)
+            .map_err(|e| e.to_error_report())?;
+        logits.push(prediction.scores().iter().map(|p| p.ln()).collect());
+    }
+    let labels: Vec<&str> = options.iter().map(|c| c.id.as_str()).collect();
+    let inputs: Vec<CalibrationInput<'_>> = validation
+        .iter()
+        .zip(&logits)
+        .map(|(r, l)| CalibrationInput {
+            gold: &r.label_id,
+            logits: l,
+        })
+        .collect();
+    calibrate_checked(&labels, &inputs).map(Some)
+}
+
+/// 校正用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
+fn validation_cells_within_limit(records: usize, options: usize) -> bool {
+    records
+        .checked_mul(options)
+        .is_some_and(|n| n <= MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS))
+}
+
+/// 評価器の [`calibrate`] を呼び、失敗を握りつぶさず `runtime_error`（固定 message）へ写す。
+fn calibrate_checked(
+    labels: &[&str],
+    inputs: &[CalibrationInput<'_>],
+) -> Result<Calibration, ErrorReport> {
+    calibrate(labels, inputs).map_err(|_| runtime("calibration failed"))
+}
+
 /// 評価データの分解の失敗（本文・行番号を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvalDecodeError {
@@ -492,6 +594,7 @@ struct FinalizeContext<'a> {
     definition_sha256: String,
     onnx_digest: Sha256Digest,
     baseline: Option<&'a PreparedBaseline>,
+    calibration: Option<&'a Calibration>,
 }
 
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
@@ -513,6 +616,7 @@ fn finalize_evaluation(
         definition_sha256,
         onnx_digest,
         baseline,
+        calibration,
     } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
@@ -561,6 +665,13 @@ fn finalize_evaluation(
             })
             .collect(),
         type_meaning_quadrant: quadrant,
+        calibration: calibration.map(|c| EvaluateCalibration {
+            temperature: c.chosen_temperature(),
+            adopted: c.adopted(),
+            threshold: c.threshold(),
+            n_validation: c.n_validation(),
+            validation_coverage: c.validation_coverage().value(),
+        }),
     };
     let report = EvaluateCompletedReport::completed(
         candidate,
@@ -589,6 +700,13 @@ fn finalize_evaluation(
         baseline_comparison,
         predictions_sha256: Some(Sha256Digest::of_bytes(predictions_jsonl.as_bytes()).to_hex()),
         type_meaning_quadrant: Some(quadrant),
+        calibration: calibration.map(|c| CalibrationRecord {
+            temperature: c.chosen_temperature(),
+            adopted: c.adopted(),
+            threshold: c.threshold(),
+            n_validation: c.n_validation(),
+            validation_answered: c.validation_coverage().numerator(),
+        }),
     };
     let record_json = record
         .to_json_vec()
@@ -870,6 +988,28 @@ mod tests {
             .to_jsonl(&["a", "b"], &outcomes, first_len * 2 - 1)
             .expect_err("over");
         assert_eq!(err.code, ExitCode::LimitExceeded);
+    }
+
+    /// REQ-22・REQ-27・#477: 校正の計算の失敗は握りつぶさず `runtime_error`（exit 70）になる。
+    /// REQ-39: 校正用ロジットの総数は確保前に上限で拒否する（桁あふれも拒否）。
+    #[test]
+    fn req39_validation_cells_are_limited_before_inference() {
+        let limit = MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS);
+        assert!(validation_cells_within_limit(limit, 1));
+        assert!(!validation_cells_within_limit(limit + 1, 1));
+        assert!(!validation_cells_within_limit(100_000, 1024));
+        assert!(!validation_cells_within_limit(usize::MAX, 2));
+    }
+
+    #[test]
+    fn req22_issue477_calibration_failure_is_runtime_error() {
+        let bad = [CalibrationInput {
+            gold: "a",
+            logits: &[0.0],
+        }];
+        let err = calibrate_checked(&["a", "b"], &bad).expect_err("length mismatch");
+        assert_eq!(err.code, ExitCode::RuntimeError);
+        assert_eq!(err.message, "calibration failed");
     }
 
     const DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"t","version":1,"judgment_type":"single_select","options":[{"id":"a","display_name":"a","description":"d"},{"id":"b","display_name":"b","description":"d"}],"io":{"input":"bytes"}}"#;

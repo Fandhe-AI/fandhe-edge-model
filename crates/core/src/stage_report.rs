@@ -130,11 +130,29 @@ pub struct EvaluateCompletedReport {
     macro_f1_excluded_labels: Vec<String>,
     per_label: Vec<EvaluateLabelMetrics>,
     type_meaning_quadrant: TypeMeaningQuadrantRecord,
-    // 以下 3 キーは後続 issue（#478 out_of_scope_label・#477 calibration・#479 abstention）が
+    // `out_of_scope_label`・`abstention` は後続 issue（#478・#479）が
     // 型つきで置き換える。それまでは常に `null` を出し、キーの形だけ先に固定する（#480）。
     out_of_scope_label: Option<String>,
-    calibration: Option<serde_json::Value>,
+    calibration: Option<EvaluateCalibration>,
     abstention: Option<serde_json::Value>,
+}
+
+/// `evaluate` の `calibration`（validation だけで決めた温度・保留しきい値。REQ-22・REQ-27・#477）。
+///
+/// `temperature` は実際に使う温度（不採用なら 1.0）。`validation_coverage` は validation で
+/// 確信度が `threshold` 以上の割合。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateCalibration {
+    /// 実際に使う温度。
+    pub temperature: f64,
+    /// 推定した温度を採用したか。
+    pub adopted: bool,
+    /// 保留しきい値 τ。
+    pub threshold: f64,
+    /// 校正に使った validation の件数。
+    pub n_validation: u64,
+    /// validation で τ 以上の割合。
+    pub validation_coverage: f64,
 }
 
 /// `evaluate` の `per_label[]` の 1 要素（REQ-24・TASK-24.2・#480）。
@@ -165,6 +183,8 @@ pub struct EvaluateDetails {
     pub per_label: Vec<EvaluateLabelMetrics>,
     /// 型と意味の 5 区分。合計は評価件数と一致すること。
     pub type_meaning_quadrant: TypeMeaningQuadrantRecord,
+    /// 校正（validation だけから決めたもの。無ければ `None`）。
+    pub calibration: Option<EvaluateCalibration>,
 }
 
 impl EvaluateCompletedReport {
@@ -191,6 +211,12 @@ impl EvaluateCompletedReport {
                 .iter()
                 .any(|l| bad(l.precision) || bad(l.recall) || bad(l.f1))
             || details.type_meaning_quadrant.total() != Some(total)
+            || details.calibration.is_some_and(|c| {
+                !c.temperature.is_finite()
+                    || c.temperature <= 0.0
+                    || !(0.0..=1.0).contains(&c.threshold)
+                    || !(0.0..=1.0).contains(&c.validation_coverage)
+            })
         {
             return None;
         }
@@ -207,7 +233,7 @@ impl EvaluateCompletedReport {
             per_label: details.per_label,
             type_meaning_quadrant: details.type_meaning_quadrant,
             out_of_scope_label: None,
-            calibration: None,
+            calibration: details.calibration,
             abstention: None,
         })
     }
@@ -1192,7 +1218,47 @@ mod tests {
                 abstain: quadrant[3],
                 error: quadrant[4],
             },
+            calibration: None,
         }
+    }
+
+    /// REQ-22・REQ-27・#477: 校正つきの JSON は `calibration` が完全一致し、範囲外のしきい値は作れない。
+    #[test]
+    fn req22_issue477_calibration_json_is_exact() {
+        let calibration = |threshold: f64| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.calibration = Some(EvaluateCalibration {
+                temperature: 1.23,
+                adopted: true,
+                threshold,
+                n_validation: 120,
+                validation_coverage: 0.8,
+            });
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        let line = calibration(0.61)
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(
+            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null}"#),
+            "{line}"
+        );
+        assert_eq!(calibration(1.5), None);
+        let bad_temperature = |t: f64| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.calibration = Some(EvaluateCalibration {
+                temperature: t,
+                adopted: false,
+                threshold: 0.5,
+                n_validation: 1,
+                validation_coverage: 1.0,
+            });
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        assert_eq!(bad_temperature(0.0), None);
+        assert_eq!(bad_temperature(-1.0), None);
+        assert_eq!(bad_temperature(f64::NAN), None);
     }
 
     /// REQ-33・REQ-24・#480: 評価完了の JSON が完全一致する（キーは宣言順・後続 3 キーは `null`・

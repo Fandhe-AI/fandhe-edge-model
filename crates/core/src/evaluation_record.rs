@@ -108,8 +108,29 @@ impl TypeMeaningQuadrantRecord {
     }
 }
 
+/// 校正（温度スケーリング）と保留しきい値の記録（REQ-22・REQ-27・#477）。
+///
+/// validation 分割だけから決めた値で、凍結 test の結果は入らない。`temperature` は実際に使う温度
+/// （不採用なら 1.0）。`validation_answered` は validation で確信度が `threshold` 以上の件数。
+/// 最小件数は設けず、少件数でも T・τ が確定する。件数は `n_validation` で示す
+/// （REQ-22 に基準なし。オーナー判断 2026-10-09）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationRecord {
+    /// 実際に使う温度。
+    pub temperature: f64,
+    /// 推定した温度を採用したか（ECE が下がらなければ `false`）。
+    pub adopted: bool,
+    /// 保留しきい値 τ。
+    pub threshold: f64,
+    /// 校正に使った validation の件数。
+    pub n_validation: u64,
+    /// validation で τ 以上（保留されない）の件数。
+    pub validation_answered: u64,
+}
+
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationRecord {
     /// 評価した候補の添字（`--candidate` と同じ）。
@@ -137,9 +158,12 @@ pub struct EvaluationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_comparison: Option<BaselineComparisonRecord>,
     /// 型と意味の 5 区分（#480・REQ-24）。欄の無い古い記録はそのまま読める。
-    /// `out_of_scope_label`・`calibration`・`abstention` の記録欄は #477〜#479 で追加する。
+    /// `out_of_scope_label`・`abstention` の記録欄は #478・#479 で追加する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_meaning_quadrant: Option<TypeMeaningQuadrantRecord>,
+    /// 校正と保留しきい値（#477・REQ-22）。欄の無い古い記録はそのまま読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationRecord>,
     /// 同じディレクトリの `evaluation_predictions.jsonl` のバイト列の sha256（hex。#445・REQ-27）。
     /// PoC-26 の採点入口が予測ファイルの手編集を検出するために照合する。欄の無い古い記録は
     /// そのまま読める（その場合、採点入口は拒否する）。
@@ -186,6 +210,7 @@ mod tests {
             baseline_comparison: None,
             predictions_sha256: None,
             type_meaning_quadrant: None,
+            calibration: None,
         }
     }
 
@@ -338,6 +363,13 @@ mod tests {
                 abstain: u64::MAX,
                 error: u64::MAX,
             }),
+            calibration: Some(CalibrationRecord {
+                temperature: f64::MIN_POSITIVE,
+                adopted: true,
+                threshold: -1.234_567_890_123_456_7e-300,
+                n_validation: u64::MAX,
+                validation_answered: u64::MAX,
+            }),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
         assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");
@@ -368,6 +400,32 @@ mod tests {
         let bytes = record.to_json_vec().expect("json");
         assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
             ",\"type_meaning_quadrant\":{\"type_ok_meaning_ok\":7,\"type_ok_meaning_ng\":5,\"type_ng_count\":0,\"abstain\":0,\"error\":0}}\n"
+        ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+
+    /// REQ-22・REQ-27・#477: 校正欄つきの記録は完全一致で直列化され、往復できる。
+    /// 欄の無い古い記録は `None` で読める。
+    #[test]
+    fn req22_issue477_calibration_round_trips_and_old_record_reads() {
+        let mut record = sample();
+        let old = record.to_json_vec().expect("json");
+        assert_eq!(
+            EvaluationRecord::from_json_slice(&old)
+                .expect("old")
+                .calibration,
+            None
+        );
+        record.calibration = Some(CalibrationRecord {
+            temperature: 1.25,
+            adopted: true,
+            threshold: 0.5,
+            n_validation: 10,
+            validation_answered: 8,
+        });
+        let bytes = record.to_json_vec().expect("json");
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
+            ",\"calibration\":{\"temperature\":1.25,\"adopted\":true,\"threshold\":0.5,\"n_validation\":10,\"validation_answered\":8}}\n"
         ));
         assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
     }

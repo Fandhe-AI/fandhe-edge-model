@@ -1569,11 +1569,11 @@ mod suite {
             "\"macro_f1_excluded_labels\":[",
             "\"per_label\":[{\"label\":\"alpha\",\"support\":4,",
             "\"type_meaning_quadrant\":{\"type_ok_meaning_ok\":",
-            "\"out_of_scope_label\":null,\"calibration\":null,\"abstention\":null}\n",
+            "\"out_of_scope_label\":null,\"calibration\":{\"temperature\":",
         ];
         let at: Vec<usize> = keys.iter().map(|k| out.find(k).expect(k)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{out}");
-        assert!(out.ends_with(keys[4]), "{out}");
+        assert!(out.ends_with(",\"abstention\":null}\n"), "{out}");
         // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
         let quadrant: f64 = [
             "type_ok_meaning_ok",
@@ -1616,6 +1616,80 @@ mod suite {
             "batch.jsonl",
         ]);
         assert_eq!(code, 0, "{batch}");
+    }
+
+    /// `evaluate` を最後まで進め、stdout と評価記録を返す。`rotate` なら評価データの正解ラベルを
+    /// すべて alpha にする（凍結前に差し替える。validation・train は変えない）。
+    fn evaluate_with_eval_labels(case: &str, rotate: bool) -> (String, String) {
+        let env = Env::new(case, true);
+        if rotate {
+            let rotated = evaluation_jsonl()
+                .replace("\"intent\":\"gamma\"", "\"intent\":\"alpha\"")
+                .replace("\"intent\":\"beta\"", "\"intent\":\"alpha\"");
+            std::fs::write(env.work.join("def").join("evaluation.jsonl"), rotated).expect("eval");
+        }
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        (out, record)
+    }
+
+    /// `"calibration":{...}` の部分文字列（stdout 用）。
+    fn calibration_json(json: &str) -> &str {
+        let start = json.find("\"calibration\":{").expect("calibration");
+        let rest = &json[start..];
+        &rest[..=rest.find('}').expect("end")]
+    }
+
+    /// REQ-22・REQ-27・#477: 校正（T・τ）は validation だけから決まる。凍結 test の正解ラベルを入れ替えて
+    /// 正解数が変わっても、stdout・評価記録の `calibration` は変わらない。validation 9 件を使い、
+    /// 記録の `validation_answered` は stdout の `validation_coverage` × 件数と一致する。
+    pub fn evaluate_calibration_ignores_frozen_test_labels() {
+        let (out_a, record_a) = evaluate_with_eval_labels("calib-a", false);
+        let (out_b, record_b) = evaluate_with_eval_labels("calib-b", true);
+        let calib = calibration_json(&out_a);
+        assert_eq!(calib, calibration_json(&out_b), "{out_a}\n{out_b}");
+        // 正解ラベルをずらすと正解数は変わる（評価データの変更が効いている）。
+        assert_ne!(
+            number_field(&out_a, "correct"),
+            number_field(&out_b, "correct")
+        );
+        // 具体値（浮動小数は許容差 1e-9。OS ごとの exp / ln の末尾桁の差を吸収する）。
+        assert!(calib.contains("\"adopted\":true,"), "{calib}");
+        for (key, expected) in [
+            ("temperature", 0.632_290_658_237_596_8),
+            ("threshold", 0.435_068_099_450_584_67),
+            ("validation_coverage", 8.0 / 9.0),
+        ] {
+            assert!(
+                (number_field(calib, key) - expected).abs() < 1e-9,
+                "{calib}"
+            );
+        }
+        assert_eq!(number_field(calib, "n_validation"), 9.0, "{calib}");
+        let t = number_field(calib, "temperature");
+        let tau = number_field(calib, "threshold");
+        let coverage = number_field(calib, "validation_coverage");
+        assert!(
+            (0.05..=20.0).contains(&t) && (0.0..=1.0).contains(&tau),
+            "{calib}"
+        );
+        let answered = (coverage * 9.0).round() as u64;
+        assert!(answered >= 8, "coverage >= 80%: {calib}");
+        for record in [&record_a, &record_b] {
+            assert!(
+                record.contains(&format!(
+                    "\"calibration\":{{\"temperature\":{t},\"adopted\":true,\"threshold\":{tau},\"n_validation\":9,\"validation_answered\":{answered}}}"
+                )),
+                "{record}"
+            );
+        }
     }
 
     /// REQ-27: `evaluate` の前後で、モデル（ONNX・`artifact.json`）と評価データの sha256 が一致し、
@@ -2453,11 +2527,12 @@ mod suite {
         assert!(!stdout.contains("baseline"), "{stdout}");
         let record = evaluation_record(&env);
         assert!(!record.contains("baseline_comparison"), "{record}");
-        // 比較欄は無く、5 区分（#480）の後に予測ファイルの sha256 束縛（#445）が続く。
+        // 比較欄は無く、5 区分（#480）・校正（#477）の後に予測ファイルの sha256 束縛（#445）が続く。
         assert!(
-            record.contains("\"abstain\":0,\"error\":0},\"predictions_sha256\":\""),
+            record.contains("\"abstain\":0,\"error\":0},\"calibration\":{\"temperature\":"),
             "{record}"
         );
+        assert!(record.contains(",\"predictions_sha256\":\""), "{record}");
         env.ok(&PACKAGE);
     }
 
@@ -3315,6 +3390,10 @@ fn main() -> std::process::ExitCode {
         (
             "full_pipeline_completes_with_evaluation_data",
             suite::full_pipeline_completes_with_evaluation_data,
+        ),
+        (
+            "evaluate_calibration_ignores_frozen_test_labels",
+            suite::evaluate_calibration_ignores_frozen_test_labels,
         ),
         (
             "evaluate_keeps_model_and_evaluation_hashes",
