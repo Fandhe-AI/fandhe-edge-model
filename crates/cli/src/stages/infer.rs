@@ -47,7 +47,8 @@ use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
 use crate::infer_batch::{
-    BatchResults, WriteFailure, emit_infer_batch, emit_infer_batch_split, emit_infer_single,
+    BatchResults, SingleCall, WriteFailure, emit_infer_batch_scoped, emit_infer_batch_split,
+    emit_infer_single_scoped,
 };
 use crate::infer_guard::check_infer_path_and_format;
 use crate::output::write_stage_line;
@@ -106,13 +107,17 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
     match &args.source {
         // 単件推論も上限つきで、止まったらバッチと同じ見張りで `limit_exceeded`・exit 20 に終える
         // （runtime の協調的な期限＋CLI のプロセス境界。REQ-39）。
-        InferSource::Text { text, id } => emit_infer_single(
+        // 定義に `out_of_scope_label` があり argmax がそれなら exit 11（REQ-22・#478）。
+        InferSource::Text { text, id } => emit_infer_single_scoped(
             out,
-            &prepared.definition.io().clone(),
-            prepared.definition.options(),
+            SingleCall {
+                io: &prepared.definition.io().clone(),
+                options: prepared.definition.options(),
+                out_of_scope_label: prepared.definition.out_of_scope_label(),
+                id: id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
+                text,
+            },
             Arc::new(prepared.pipeline),
-            id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
-            text,
         ),
         InferSource::InputFile { path, .. } => {
             let file = match open_confined(cwd, path) {
@@ -122,11 +127,12 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
             let io_schema = prepared.definition.io().clone();
             let pipeline = Arc::new(prepared.pipeline);
             let Some(target) = target else {
-                return emit_infer_batch(
+                return emit_infer_batch_scoped(
                     out,
                     file,
                     &io_schema,
                     prepared.definition.options(),
+                    prepared.definition.out_of_scope_label(),
                     pipeline,
                 );
             };
@@ -137,6 +143,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 file,
                 &io_schema,
                 prepared.definition.options(),
+                prepared.definition.out_of_scope_label(),
                 pipeline,
             )
         }

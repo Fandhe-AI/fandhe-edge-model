@@ -1053,6 +1053,95 @@ mod suite {
         env.ok(&text_args);
     }
 
+    /// `out_of_scope_label` を（あれば）定義へ足して package までを通した環境（#478）。
+    fn packaged_with_out_of_scope(case: &str, out_of_scope: Option<&str>) -> Env {
+        let env = Env::new(case, false);
+        if let Some(label) = out_of_scope {
+            let text = definition_text().replace(
+                r#""io":{"input":"bytes"}"#,
+                &format!(r#""io":{{"input":"bytes"}},"out_of_scope_label":"{label}""#),
+            );
+            std::fs::write(env.work.join("def").join("definition.json"), text).expect("def");
+        }
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "proj"]);
+        env.ok(&["package", "--project-dir", "proj"]);
+        env
+    }
+
+    /// REQ-22・REQ-21・REQ-28・#478: 定義の `out_of_scope_label` が argmax の行は `--text` で
+    /// exit 11（判定行を stdout に出す）、`--input-file`（`--out` を含む）では exit 0 のまま
+    /// 該当行だけ `out_of_scope`。scores は `out_of_scope_label` なしと完全に同じ。
+    pub fn infer_out_of_scope_label_marks_rows_and_exits_11() {
+        let plain = packaged_with_out_of_scope("oos0", None);
+        let infer_text = |env: &Env, text: &str| {
+            env.run(&["infer", "--package", "proj/package", "--text", text])
+        };
+        let label_of = |line: &str| {
+            let key = "\"predicted_label\":\"";
+            let start = line.find(key).expect("label key") + key.len();
+            let rest = &line[start..];
+            rest[..rest.find('"').expect("quote")].to_string()
+        };
+        let to_oos = |line: &str| line.replace("\"status\":\"ok\"", "\"status\":\"out_of_scope\"");
+        let probes = ["x", "yy", "alpha", "beta", "gamma", "zzzzzz"];
+        let first = infer_text(&plain, probes[0]);
+        assert_eq!(first.0, 0, "{}", first.1);
+        let oos = label_of(&first.1);
+        let other = probes
+            .iter()
+            .find(|t| label_of(&infer_text(&plain, t).1) != oos)
+            .expect("a probe with a different label");
+
+        let env = packaged_with_out_of_scope("oos1", Some(&oos));
+        let (code, line) = infer_text(&env, probes[0]);
+        assert_eq!(code, 11, "{line}");
+        assert_eq!(line, to_oos(&first.1));
+        let (code, line) = infer_text(&env, other);
+        assert_eq!(code, 0, "{line}");
+        assert_eq!(line, infer_text(&plain, other).1);
+
+        let input = format!(
+            "{{\"id\":\"a\",\"input\":\"{}\"}}\n{{\"id\":\"b\",\"input\":\"{other}\"}}\n",
+            probes[0]
+        );
+        std::fs::write(env.work.join("in.jsonl"), &input).expect("in");
+        std::fs::write(plain.work.join("in.jsonl"), &input).expect("in");
+        let batch = [
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "in.jsonl",
+        ];
+        let (code, rows) = env.run(&batch);
+        assert_eq!(code, 0, "{rows}");
+        let (_, plain_rows) = plain.run(&batch);
+        let mut lines = rows.lines();
+        assert_eq!(
+            lines.next().expect("row a"),
+            to_oos(plain_rows.lines().next().expect("plain a"))
+        );
+        assert_eq!(
+            lines.next().expect("row b"),
+            plain_rows.lines().nth(1).expect("plain b")
+        );
+        let summary = env.ok(&infer_out_args("out.jsonl"));
+        assert_eq!(
+            summary,
+            format!(
+                "{{\"step\":\"infer\",\"status\":\"ok\",\"count\":2,\"sha256\":\"{}\"}}\n",
+                Sha256Digest::of_bytes(rows.as_bytes()).to_hex()
+            )
+        );
+        assert_eq!(
+            std::fs::read(env.work.join("out.jsonl")).expect("out"),
+            rows.as_bytes()
+        );
+    }
+
     const OUT_INPUT: &str = "{\"id\":\"a\",\"input\":\"x\"}\n{\"id\":\"b\",\"input\":\"yy\"}\n";
 
     fn infer_out_args(out: &str) -> [&str; 7] {
@@ -3522,6 +3611,10 @@ fn main() -> std::process::ExitCode {
         (
             "infer_out_writes_same_bytes_and_summary",
             suite::infer_out_writes_same_bytes_and_summary,
+        ),
+        (
+            "infer_out_of_scope_label_marks_rows_and_exits_11",
+            suite::infer_out_of_scope_label_marks_rows_and_exits_11,
         ),
         (
             "infer_out_rejects_unsafe_targets",

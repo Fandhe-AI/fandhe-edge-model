@@ -47,8 +47,10 @@
 //!   `predicted_choice_id` は最高スコアの選択肢（タイブレークは宣言順）と
 //!   一致することを要求する
 //!
-//! `JudgmentStatus` の variant は現状 `Ok` のみ。保留・対象外
-//! （REQ-22。`abstain`／`out_of_scope` 等）は後続 TASK で追加する。
+//! `JudgmentStatus` の variant は `Ok` と `OutOfScope`（REQ-22・#478）。`OutOfScope` は定義の
+//! `out_of_scope_label` が argmax のときに呼び出し側が [`JudgmentResult::into_out_of_scope`] で
+//! 立てる（行の形は `Ok` と同じで `status` だけが `out_of_scope`。終了コードは 11）。
+//! 保留（REQ-22。`abstain` 等）は後続 TASK（#497）で追加する。
 //!
 //! # 検証（fail-closed）
 //!
@@ -125,7 +127,7 @@ pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
 /// 乖離は機械的に検出される（PR #202 レビュー指摘・P1 対応）。
 pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
-/// 判定結果の状態。現状は `Ok`（正常終了）のみを持つ（REQ-21 正常系）。
+/// 判定結果の状態。`Ok`（正常終了）と `OutOfScope`（対象外ラベルが argmax。REQ-22・#478）。
 ///
 /// `#[non_exhaustive]` にはしない。CLI 側で全 variant を網羅した `match` を
 /// 書けるようにし、REQ-22 で variant を追加する際にコンパイルエラーで
@@ -135,6 +137,8 @@ pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 pub enum JudgmentStatus {
     /// 単一選択の判定に成功した（REQ-21 正常系。終了コード `ok` に対応）。
     Ok,
+    /// 定義の `out_of_scope_label` が argmax だった（REQ-22・#478。終了コード `out_of_scope`）。
+    OutOfScope,
 }
 
 /// [`JudgmentResult::new`] が拒否する入力の種類。
@@ -312,6 +316,7 @@ pub struct JudgmentResult {
     predicted_choice_id: String,
     /// 定義ファイルの `options` 宣言順を保った (選択肢 ID, スコア) の列。
     scores: Vec<(String, f64)>,
+    status: JudgmentStatus,
 }
 
 impl JudgmentResult {
@@ -484,7 +489,16 @@ impl JudgmentResult {
             id,
             predicted_choice_id: predicted_choice_id.to_string(),
             scores: pairs,
+            status: JudgmentStatus::Ok,
         })
+    }
+
+    /// 状態を `OutOfScope` にする（判定行の形は変えない。REQ-22・#478）。
+    /// argmax が定義の `out_of_scope_label` かの判断は呼び出し側（CLI の `infer`）が行う。
+    #[must_use]
+    pub fn into_out_of_scope(mut self) -> Self {
+        self.status = JudgmentStatus::OutOfScope;
+        self
     }
 
     /// 入力の識別子。入力本文は含まない（security.md）。
@@ -493,10 +507,10 @@ impl JudgmentResult {
         &self.id
     }
 
-    /// 判定結果の状態。現状は常に `Ok`（TASK-21.1-2 の対象は正常系のみ）。
+    /// 判定結果の状態（既定は `Ok`。[`JudgmentResult::into_out_of_scope`] で `OutOfScope`）。
     #[must_use]
     pub const fn status(&self) -> JudgmentStatus {
-        JudgmentStatus::Ok
+        self.status
     }
 
     /// 選ばれた選択肢の ID（`Choice.id`）。
@@ -510,10 +524,13 @@ impl JudgmentResult {
         self.scores.iter().map(|(id, score)| (id.as_str(), *score))
     }
 
-    /// 対応する終了コード。判定結果が構築できた時点で常に `ExitCode::Ok`。
+    /// 対応する終了コード（`Ok` は 0、`OutOfScope` は 11。REQ-21・REQ-22）。
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
-        ExitCode::Ok
+        match self.status {
+            JudgmentStatus::Ok => ExitCode::Ok,
+            JudgmentStatus::OutOfScope => ExitCode::OutOfScope,
+        }
     }
 
     /// JSON 1 行（末尾の改行なし）へ直列化する。
@@ -609,6 +626,21 @@ mod tests {
 
         let collected: Vec<(&str, f64)> = result.scores().collect();
         assert_eq!(collected, vec![("z", 0.5), ("a", 0.3), ("m", 0.2)]);
+    }
+
+    /// REQ-22・REQ-21: 対象外にした行は `status:"out_of_scope"`・exit 11 で、他は変わらない。
+    #[test]
+    fn req22_out_of_scope_judgment_has_status_and_exit_code_11() {
+        let options = [choice("a"), choice("b")];
+        let result = JudgmentResult::new(&options, "i", "b", &[0.25, 0.75])
+            .unwrap()
+            .into_out_of_scope();
+        assert_eq!(result.status(), JudgmentStatus::OutOfScope);
+        assert_eq!(result.exit_code(), ExitCode::OutOfScope);
+        assert_eq!(
+            result.to_json_line().unwrap(),
+            r#"{"id":"i","status":"out_of_scope","predicted_label":"b","scores":{"a":0.25,"b":0.75}}"#
+        );
     }
 
     /// REQ-21: `status` の直列化値が `ExitCode::Ok.name()` と一致すること。

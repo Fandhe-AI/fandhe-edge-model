@@ -321,6 +321,9 @@ pub struct Definition {
     /// 省略可能な下限基準比較の事前登録（#339）。`None` は比較しない。
     #[serde(skip_serializing_if = "Option::is_none")]
     baseline_comparison: Option<BaselineComparisonAssumption>,
+    /// 省略可能な対象外ラベル（`options[].id`。#478・REQ-22）。`None` は対象外を区別しない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_of_scope_label: Option<String>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -346,6 +349,16 @@ struct RawDefinition {
     limits: Option<RawLimits>,
     #[serde(default, deserialize_with = "deserialize_present_baseline_comparison")]
     baseline_comparison: Option<RawBaselineComparison>,
+    #[serde(default, deserialize_with = "deserialize_present_string")]
+    out_of_scope_label: Option<String>,
+}
+
+/// キーがあるのに値が `null` のとき `None` として黙って受理せず型エラーにする（#478）。
+fn deserialize_present_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(d).map(Some)
 }
 
 /// 定義ファイル内のフィールドの位置を表すパス（TASK-15.3-2）。
@@ -396,6 +409,8 @@ pub enum FieldPath {
     BaselineComparisonAssumedPCBp,
     /// `baseline_comparison.power_bp`（#339）。
     BaselineComparisonPowerBp,
+    /// `out_of_scope_label`（#478・REQ-22）。
+    OutOfScopeLabel,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -424,6 +439,7 @@ impl std::fmt::Display for FieldPath {
                 write!(f, "baseline_comparison.assumed_p_c_bp")
             }
             FieldPath::BaselineComparisonPowerBp => write!(f, "baseline_comparison.power_bp"),
+            FieldPath::OutOfScopeLabel => write!(f, "out_of_scope_label"),
         }
     }
 }
@@ -1014,6 +1030,15 @@ impl Definition {
             }
         };
 
+        // 対象外ラベル（#478・REQ-22）: `options[].id` のいずれかに一致すること。
+        if let Some(label) = &raw.out_of_scope_label
+            && !seen_ids.contains(label.as_str())
+        {
+            return Err(DefinitionError::UnsupportedValue {
+                field: FieldPath::OutOfScopeLabel,
+            });
+        }
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -1024,6 +1049,7 @@ impl Definition {
             acceptance,
             limits,
             baseline_comparison,
+            out_of_scope_label: raw.out_of_scope_label,
         })
     }
 
@@ -1101,6 +1127,12 @@ impl Definition {
     #[must_use]
     pub fn baseline_comparison(&self) -> Option<&BaselineComparisonAssumption> {
         self.baseline_comparison.as_ref()
+    }
+
+    /// 対象外ラベルの `options[].id`（#478・REQ-22）。`None` は対象外を区別しない。
+    #[must_use]
+    pub fn out_of_scope_label(&self) -> Option<&str> {
+        self.out_of_scope_label.as_deref()
     }
 
     /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
@@ -2031,6 +2063,57 @@ mod tests {
             with.canonical_hash().expect("hash")
         );
         assert_eq!(without.identity(), with.identity());
+    }
+
+    /// 対象外ラベルを `value_json` で差し込んだ定義 JSON（#478）。
+    fn with_out_of_scope(value_json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "out_of_scope_label": {value_json}"#),
+            1,
+        )
+    }
+
+    /// REQ-22・#478: 実在する `options[].id` は受理し、省略時は `None`・正準化 JSON に現れない
+    /// （既存定義のハッシュ不変。golden は `canonical` のテストが固定）。
+    #[test]
+    fn req22_issue478_out_of_scope_label_accepts_existing_id_and_omits_when_absent() {
+        let def = Definition::parse(&with_out_of_scope(r#""no""#)).expect("parse");
+        assert_eq!(def.out_of_scope_label(), Some("no"));
+        assert!(
+            def.canonical_json()
+                .expect("canon")
+                .contains(r#""out_of_scope_label":"no""#)
+        );
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("parse");
+        assert_eq!(without.out_of_scope_label(), None);
+        assert!(
+            !without
+                .canonical_json()
+                .expect("canon")
+                .contains("out_of_scope_label")
+        );
+    }
+
+    /// REQ-22・REQ-21・#478: 存在しない id・空文字は `unsupported_value`、`null`・型違いは
+    /// `type_mismatch`。いずれも `invalid_input`（exit 64）。
+    #[test]
+    fn req22_issue478_out_of_scope_label_rejects_invalid_values() {
+        for (value, reason) in [
+            (r#""maybe""#, "unsupported_value"),
+            (r#""""#, "unsupported_value"),
+            ("null", "type_mismatch"),
+            ("1", "type_mismatch"),
+            ("[]", "type_mismatch"),
+        ] {
+            let err = Definition::parse(&with_out_of_scope(value)).unwrap_err();
+            assert_eq!(err.reason_code(), reason, "value={value}");
+            assert_eq!(
+                err.exit_code(),
+                crate::exitcode::ExitCode::InvalidInput,
+                "value={value}"
+            );
+        }
     }
 
     /// 上限を `limits_json` に差し込んだ定義 JSON（#338）。
