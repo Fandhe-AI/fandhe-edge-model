@@ -656,6 +656,9 @@ mod suite {
             r#"{"id":"c1","input":"same  text","output":{"intent":"alpha"},"group_id":"gc"}"#,
             r#"{"id":"c2","input":"same text","output":{"intent":"beta"},"group_id":"gc"}"#,
             r#"{"id":"idrec","input":"contains idrec here","output":{"intent":"alpha"},"group_id":"gi"}"#,
+            r#"{"id":"ar1","input":"answer: {\"title\":\"x\"}","output":{"intent":"alpha","arguments":{"title":"x"}},"group_id":"ga1"}"#,
+            r#"{"id":"ar2","input":"answer: {\"n\": 1, \"title\": \"y\"}","output":{"intent":"beta","arguments":{"title":"y","n":1}},"group_id":"ga2"}"#,
+            r#"{"id":"ar3","input":"just x here","output":{"intent":"beta","arguments":{"title":"x"}},"group_id":"ga3"}"#,
             r#"{"id":"lab","input":"this is gamma","output":{"intent":"gamma"},"group_id":"gl"}"#,
         ] {
             data.push_str(l);
@@ -667,12 +670,12 @@ mod suite {
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         let stdout = String::from_utf8(out.stdout).expect("utf8");
         assert!(
-            stdout.starts_with("{\"step\":\"inspect\",\"status\":\"ok\",\"valid_records\":94,"),
+            stdout.starts_with("{\"step\":\"inspect\",\"status\":\"ok\",\"valid_records\":97,"),
             "{stdout}"
         );
         assert_eq!(
             String::from_utf8(out.stderr).expect("utf8"),
-            "fandhe-edge: inspect: train contradictory inputs: 1\nfandhe-edge: inspect: train metadata id in input: 1\nfandhe-edge: inspect: train metadata gold label in input: 1\n"
+            "fandhe-edge: inspect: train contradictory inputs: 1\nfandhe-edge: inspect: train metadata id in input: 1\nfandhe-edge: inspect: train metadata gold label in input: 1\nfandhe-edge: inspect: train metadata gold serialization in input: 2\n"
         );
     }
 

@@ -28,7 +28,7 @@ use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{InspectStageReport, SplitCounts};
 use fandhe_edge_data::consistency::{
     ConsistencyError, ContradictionRecord, MetadataMixReason, MetadataRecord, find_contradictions,
-    find_metadata_mixed,
+    find_metadata_mixed, gold_serializations,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
@@ -184,14 +184,14 @@ fn ensure_splits_non_empty(
 /// 矛盾・メタデータ混入の検査用に `ValidRecord` を借用する（正解は `output_key` / `label_id`）。
 struct ConsistencyRow<'a> {
     record: &'a ValidRecord,
-    serializations: [String; 1],
+    serializations: Vec<String>,
 }
 
 impl<'a> ConsistencyRow<'a> {
     fn new(record: &'a ValidRecord) -> Self {
         Self {
             record,
-            serializations: [record.output_key.clone()],
+            serializations: gold_serializations(&record.output_key),
         }
     }
 }

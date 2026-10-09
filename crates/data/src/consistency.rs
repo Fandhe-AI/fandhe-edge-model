@@ -336,6 +336,51 @@ fn is_meaningful_serialization(s: &str) -> bool {
     !s.is_empty() && s != "{}" && s != "null"
 }
 
+/// `Value` を Python の `json.dumps` 既定（`", "`・`": "` 区切り）で直列化する。
+/// 文字列は serde_json の表記（非 ASCII はそのまま）を使う。
+fn to_spaced_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => format!(
+            "[{}]",
+            a.iter().map(to_spaced_json).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, x)| format!("{}: {}", Value::String(k.clone()), to_spaced_json(x)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// `output_key`（`output` 全体のキー整列済み JSON）から、メタデータ混入の判定に使う
+/// 直列化表現を作る（REQ-16・PoC-9 A-10）。
+///
+/// 対象は `output` 全体と、`arguments` が空でないオブジェクトのときその全体で、それぞれ
+/// compact 表記と Python の `json.dumps` 既定の空白入り表記の 2 通り。引数の値単体は含めない。
+/// JSON として解釈できなければ `output_key` そのものだけを返す。
+pub fn gold_serializations(output_key: &str) -> Vec<String> {
+    let mut out = vec![output_key.to_string()];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output_key) else {
+        return out;
+    };
+    let mut targets = vec![&value];
+    if let Some(args) = value.get("arguments").filter(|a| a.is_object()) {
+        targets.push(args);
+    }
+    for t in targets {
+        for s in [t.to_string(), to_spaced_json(t)] {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 /// レコードの `input` に、そのレコード自身の id・正解ラベル・正解の直列化
 /// 表現が部分文字列として含まれていないかを検出する（REQ-16・PoC-9 A-10）。
 ///
@@ -403,6 +448,23 @@ where
 mod tests {
     use super::*;
     use crate::normalize::NfkcWhitespaceNormalizer;
+
+    /// REQ-16: 引数 JSON 全体・空白入り JSON が表現に含まれ、値単体と空 arguments は含まれない。
+    #[test]
+    fn req16_gold_serializations_cover_arguments_and_spaced_forms() {
+        let s = gold_serializations(r#"{"arguments":{"a":1,"b":[1,2]},"intent":"x"}"#);
+        for want in [
+            r#"{"arguments":{"a":1,"b":[1,2]},"intent":"x"}"#,
+            r#"{"arguments": {"a": 1, "b": [1, 2]}, "intent": "x"}"#,
+            r#"{"a":1,"b":[1,2]}"#,
+            r#"{"a": 1, "b": [1, 2]}"#,
+        ] {
+            assert!(s.iter().any(|x| x == want), "{want}");
+        }
+        assert!(!s.iter().any(|x| x == "1" || x == "\"x\""));
+        let e = gold_serializations(r#"{"arguments":{},"intent":"x"}"#);
+        assert!(!e.iter().any(|x| x == "{}") || !is_meaningful_serialization("{}"));
+    }
 
     struct TestRecord {
         id: &'static str,
