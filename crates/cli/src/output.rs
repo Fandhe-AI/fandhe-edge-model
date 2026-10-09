@@ -386,8 +386,8 @@ mod tests {
     use super::*;
     use fandhe_edge_core::definition::Choice;
 
-    const SAMPLE_CAPACITY_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
-    const SAMPLE_CAPACITY_EXCEEDED: &str = "{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const SAMPLE_CAPACITY_OK: &str = "\"capacity\":{\"total_bytes\":125,\"limit_bytes\":40000000,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
+    const SAMPLE_CAPACITY_EXCEEDED: &str = "{\"total_bytes\":125,\"limit_bytes\":100,\"exceeded\":true,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":100,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":20,\"file_count\":1},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":5,\"file_count\":1}}}";
 
     /// 合成の計測値（`stage_report` のテストと同じ値。上限は超過時 100・それ以外 40,000,000）。
     fn sample_metrics(
@@ -403,8 +403,9 @@ mod tests {
         PackageMetrics {
             capacity: PackageCapacity::new(
                 125,
-                limit,
+                Some(limit),
                 capacity_exceeded,
+                (40_000_000, false),
                 PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
             ),
             infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),

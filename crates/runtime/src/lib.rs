@@ -22,7 +22,7 @@
 //!   写像（TASK-30.1-2・#123）を持ち、JSON 直列化は CLI 側
 //! - [`capacity_limit`][]: 利用者設定の容量上限の検証済み型と合計容量との照合（REQ-30・REQ-21・
 //!   TASK-30.2・#124）。超過は `LimitBreach::Capacity` として `package_outcome` へ渡す。
-//!   定義ファイル・CLI からの上限取り込みは未実装
+//!   CLI `package` が定義の `limits.max_package_bytes` から取り込む（#338。未設定なら照合しない。#406）
 //! - [`export_exclusion`][]: 書き出し不能・予測ずれの構成を配布候補から外し理由を記録する
 //!   （REQ-32 異常系・TASK-32.2・#114）。既知制約は PoC-14 実測の表、実行時検出はテストハーネス。
 //!   `tract-onnx`・`ort` は未承認のため実行しない。JSON 直列化は CLI 側、`package` への配線は TASK-33.x
@@ -32,12 +32,12 @@
 //!   （REQ-31・TASK-31.1-2・#128）。合否・上限照合は持たない（上限照合は `latency_limit`）
 //! - [`latency_limit`][]: 利用者設定の待ち時間上限の検証済み型と p95 との照合（REQ-31・REQ-21・
 //!   TASK-31.2・#129）。超過は `LimitBreach::Latency` として `package_outcome` へ渡す。
-//!   定義ファイル・CLI からの上限取り込み、CLI 配線は未実装
+//!   CLI `package` が定義の `limits.max_infer_p95_us` から取り込んで照合する（#338）
 //! - [`package_outcome`][]: 上限超過を合否判定より優先して `limit_exceeded`（20）へ写す
 //!   終了コード決定（REQ-21・TASK-21.3-1・#132）。待ち時間（p95）の上限超過
 //!   （`LimitBreach::Latency`・境界規則 `latency_if_exceeded`。REQ-31・TASK-21.3-2・#133）も
-//!   扱う。容量の照合は `capacity_limit` 経由で CLI `package` に結線済み（上限は暫定固定 40MB。
-//!   `crates/cli/src/stages/package.rs`）。待ち時間（p95）の CLI 配線と利用者設定上限の取り込みは未実装。
+//!   扱う。容量の照合は `capacity_limit` 経由で CLI `package` に結線済み（上限は定義の `limits.max_package_bytes` のみで
+//!   既定の強制上限は無い。40MB は目安で警告のみ。`crates/cli/src/stages/package.rs`）。待ち時間（p95）も定義の `limits.max_infer_p95_us` があるときだけ照合する（#338）。
 //!   容量・待ち時間の合流点確認は `tests/limit_exceeded_boundary.rs`（TASK-21.3・#131。
 //!   証拠種別はテストハーネスで、本番データでの再実演は未実施）
 //! - [`prediction_provenance`][]: 参考測定でバッチ予測 API を使った記録への明記ルール

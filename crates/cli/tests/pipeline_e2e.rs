@@ -177,12 +177,16 @@ mod suite {
     const PENDING_HEAD: &str = "{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true";
     const LIMIT_HEAD: &str =
         "{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\"";
-    const DEFAULT_CAPACITY_LIMIT: u64 = 40_000_000;
 
     /// `capacity` オブジェクトの期待値を、公開元のファイルのバイト数から組み立てる（REQ-30・#340）。
     /// 公開した `package/` の中身は複写なので、成果物ディレクトリの ONNX・`artifact.json`・語彙ファイルと
     /// 登録済みの `definition.json` のサイズに等しい（`package/` が作られない exit 20 でも同じ式で比べる）。
-    fn capacity_json(env: &Env, model_dir: &str, limit_bytes: u64, exceeded: bool) -> String {
+    fn capacity_json(
+        env: &Env,
+        model_dir: &str,
+        limit_bytes: Option<u64>,
+        exceeded: bool,
+    ) -> String {
         let size = |rel: String| -> (u64, u32) {
             match std::fs::metadata(env.project_file(&rel)) {
                 Ok(m) => (m.len(), 1),
@@ -194,9 +198,10 @@ mod suite {
         let label = size("definition.json".to_string());
         let meta = size(format!("{model_dir}/artifact.json"));
         let total = weights.0 + vocab.0 + label.0 + meta.0;
+        let limit = limit_bytes.map_or("null".to_string(), |l| l.to_string());
         let c = |(b, n): (u64, u32)| format!("{{\"bytes\":{b},\"file_count\":{n}}}");
         format!(
-            "\"capacity\":{{\"total_bytes\":{total},\"limit_bytes\":{limit_bytes},\"exceeded\":{exceeded},\"components\":{{\"weights\":{},\"vocab_or_feature_transform\":{},\"label_table\":{},\"calibration\":{{\"bytes\":0,\"file_count\":0}},\"metadata\":{}}}}}",
+            "\"capacity\":{{\"total_bytes\":{total},\"limit_bytes\":{limit},\"exceeded\":{exceeded},\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{{\"weights\":{},\"vocab_or_feature_transform\":{},\"label_table\":{},\"calibration\":{{\"bytes\":0,\"file_count\":0}},\"metadata\":{}}}}}",
             c(weights),
             c(vocab),
             c(label),
@@ -204,11 +209,11 @@ mod suite {
         )
     }
 
-    /// 上限なし（容量は既定の 40,000,000・p95 は `null`）の `package` の出力行の期待値（#340）。
+    /// 上限なし（容量の `limit_bytes` は `null`・p95 は `null`）の `package` の出力行の期待値（#340）。
     fn package_line(env: &Env, model_dir: &str, head: &str) -> String {
         format!(
             "{head},{},\"infer_p95\":null}}\n",
-            capacity_json(env, model_dir, DEFAULT_CAPACITY_LIMIT, false)
+            capacity_json(env, model_dir, None, false)
         )
     }
 
@@ -1758,10 +1763,7 @@ mod suite {
     pub fn package_latency_limit_1us_is_limit_exceeded() {
         let env = limits_env("lat1us", r#"{"max_infer_p95_us":1}"#);
         let out = env.fails(&PACKAGE, 20, "limit_exceeded");
-        let head = format!(
-            "{LIMIT_HEAD},{},",
-            capacity_json(&env, C1_DIR, DEFAULT_CAPACITY_LIMIT, false)
-        );
+        let head = format!("{LIMIT_HEAD},{},", capacity_json(&env, C1_DIR, None, false));
         assert!(out.starts_with(&head), "{out}");
         assert_p95_tail(&out, 1, true);
         assert!(!env.project_file("package").exists());
@@ -1772,10 +1774,7 @@ mod suite {
     pub fn package_latency_limit_large_is_ok() {
         let env = limits_env("latlarge", r#"{"max_infer_p95_us":3600000000}"#);
         let out = env.ok(&PACKAGE);
-        let head = format!(
-            "{NULL_HEAD},{},",
-            capacity_json(&env, C1_DIR, DEFAULT_CAPACITY_LIMIT, false)
-        );
+        let head = format!("{NULL_HEAD},{},", capacity_json(&env, C1_DIR, None, false));
         assert!(out.starts_with(&head), "{out}");
         assert_p95_tail(&out, 3_600_000_000, false);
         assert!(env.project_file("package/artifact.json").is_file());
@@ -1789,7 +1788,7 @@ mod suite {
             env.fails(&PACKAGE, 20, "limit_exceeded"),
             format!(
                 "{LIMIT_HEAD},{},\"infer_p95\":null}}\n",
-                capacity_json(&env, C1_DIR, 1, true)
+                capacity_json(&env, C1_DIR, Some(1), true)
             )
         );
         assert!(!env.project_file("package").exists());
