@@ -112,17 +112,14 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
             id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
             text,
         ),
-        InferSource::InputFile {
-            path,
-            out: out_path,
-        } => {
+        InferSource::InputFile { path, .. } => {
             let file = match open_confined(cwd, path) {
                 Ok((file, _)) => file,
                 Err(rejection) => return emit_error_report(out, &rejection.to_error_report()),
             };
             let io_schema = prepared.definition.io().clone();
             let pipeline = Arc::new(prepared.pipeline);
-            let Some(target) = target.filter(|_| out_path.is_some()) else {
+            let Some(target) = target else {
                 return emit_infer_batch(
                     out,
                     file,
@@ -141,8 +138,16 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 pipeline,
             ) {
                 Ok(ExitCode::Ok) => {
-                    let report = InferBatchReport::new(sink.lines, sink.hash.finish());
-                    write_stage_line(out, report.to_json_line())
+                    let report = match sink.publish() {
+                        Ok(report) => report,
+                        Err(error) => return emit_error_report(out, &error),
+                    };
+                    let written = write_stage_line(out, report.to_json_line());
+                    if written.is_err() {
+                        // 要約を返せなかった OUT は残さない（best effort）。
+                        let _ = target.parent.remove_file_member(Path::new(&target.leaf));
+                    }
+                    written
                 }
                 // 失敗は `ErrorReport` が stdout に出済みで、OUT は作られていない。
                 Ok(code) => Ok(code),
@@ -197,11 +202,16 @@ impl OutTarget {
     }
 }
 
-/// 最初の書き込みで OUT を `O_EXCL` 作成する出力先。書いたバイト列から行数と sha256 を数える
-/// （要約と書いた内容が必ず一致する）。結果行の書き込みは計算成功の確定後にだけ始まるため、
-/// 失敗時は作られない（REQ-33・#459）。
+/// OUT の出力先。最初の書き込みで同じ親の一時名（`.tmp-<leaf>-<pid>`。`Project::publish_new_file`
+/// と同じ命名）を `O_EXCL` 作成して書き、成功確定後に [`LazyOut::publish`] が名前替え
+/// （上書きしない）で OUT を公開する。書いたバイト列から行数と sha256 を数える（要約と書いた
+/// 内容が必ず一致する）。結果行の書き込みは計算成功の確定後にだけ始まるため、失敗時は何も作られない。
+///
+/// 書き出し中のウォッチドッグ終了（exit 20）や SIGKILL で残りうるのは一時名だけで、OUT に
+/// 半端な内容は現れない。そのときの一時名の残骸は片付けない（best effort。REQ-33・REQ-39・#459）。
 struct LazyOut<'a> {
     target: &'a OutTarget,
+    tmp: std::path::PathBuf,
     file: Option<File>,
     hash: Sha256Stream,
     lines: usize,
@@ -210,8 +220,12 @@ struct LazyOut<'a> {
 
 impl<'a> LazyOut<'a> {
     fn new(target: &'a OutTarget) -> Self {
+        let mut tmp_name = OsString::from(".tmp-");
+        tmp_name.push(&target.leaf);
+        tmp_name.push(format!("-{}", std::process::id()));
         Self {
             target,
+            tmp: tmp_name.into(),
             file: None,
             hash: Sha256Stream::new(),
             lines: 0,
@@ -219,28 +233,50 @@ impl<'a> LazyOut<'a> {
         }
     }
 
-    /// 書き込み失敗後の後始末。作りかけを消し（best effort）、返す報告を決める。
+    /// 書き込み失敗後の後始末。一時ファイルを消し（best effort）、返す報告を決める。
     fn abort(&mut self) -> ErrorReport {
         if self.file.take().is_some() {
-            let _ = self
-                .target
-                .parent
-                .remove_file_member(Path::new(&self.target.leaf));
+            let _ = self.target.parent.remove_file_member(&self.tmp);
         }
         self.create_error
             .take()
             .unwrap_or_else(|| runtime("cannot write output file"))
+    }
+
+    /// 一時ファイルを OUT へ名前替えで公開し、要約を返す。OUT が先に作られていれば `invalid_input`、
+    /// それ以外の失敗は `runtime_error`。どちらも一時ファイルを消す。
+    fn publish(mut self) -> Result<InferBatchReport, ErrorReport> {
+        let synced = match self.file.take() {
+            Some(file) => file.sync_all().is_ok(),
+            None => false,
+        };
+        if !synced {
+            let _ = self.target.parent.remove_file_member(&self.tmp);
+            return Err(runtime("cannot write output file"));
+        }
+        let renamed = self
+            .target
+            .parent
+            .rename_member(&self.tmp, Path::new(&self.target.leaf));
+        if let Err(e) = renamed {
+            let _ = self.target.parent.remove_file_member(&self.tmp);
+            return Err(write_rejection(
+                &e,
+                "output file already exists",
+                "cannot write output file",
+            ));
+        }
+        Ok(InferBatchReport::new(self.lines, self.hash.finish()))
     }
 }
 
 impl Write for LazyOut<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.file.is_none() {
-            // 存在確認と作成の間の競合は `O_EXCL` が拒否し、既存ファイルとして 64 にする。
             let file = self
                 .target
                 .parent
-                .create_new_member(Path::new(&self.target.leaf))
+                .create_new_member(&self.tmp)
                 .map_err(|e| {
                     self.create_error = Some(write_rejection(
                         &e,
@@ -373,4 +409,97 @@ pub(crate) fn build_pipeline(
         ByteEncodingPreprocessor::new(max_bytes),
         backend,
     ))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テスト用の作業ディレクトリ（cwd 相当）。
+    fn workdir(name: &str) -> std::path::PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!("fandhe-infer-out-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// REQ-33: 公開は名前替えで行い、OUT には書いた全体だけが現れ、一時名は残らない。
+    #[test]
+    fn req33_publish_renames_tmp_to_out_with_summary() {
+        let cwd = workdir("ok");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"a\nb\n").expect("write");
+        assert_eq!(entries(&cwd), vec![sink.tmp.to_string_lossy().into_owned()]);
+        let report = sink.publish().expect("publish");
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            format!(
+                r#"{{"step":"infer","status":"ok","count":2,"sha256":"{}"}}"#,
+                Sha256Digest::of_bytes(b"a\nb\n").to_hex()
+            )
+        );
+        assert_eq!(entries(&cwd), vec!["out.jsonl".to_string()]);
+        assert_eq!(
+            std::fs::read(cwd.join("out.jsonl")).expect("out"),
+            b"a\nb\n"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・REQ-21: 書き込み後に OUT が先に作られていた場合は `invalid_input`（64）で、
+    /// 先客の中身は変わらず、一時ファイルは消える。
+    #[test]
+    fn req39_publish_refuses_when_out_appeared_first() {
+        let cwd = workdir("race");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"new\n").expect("write");
+        std::fs::write(cwd.join("out.jsonl"), "first").expect("racer");
+        let error = sink.publish().expect_err("must refuse");
+        assert_eq!(error.code, ExitCode::InvalidInput);
+        assert_eq!(std::fs::read(cwd.join("out.jsonl")).expect("out"), b"first");
+        assert_eq!(entries(&cwd), vec!["out.jsonl".to_string()]);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-21・REQ-39: 書き込み失敗後の `abort` は一時ファイルを消して `runtime_error`（70）。
+    /// 何も書かなかった出力先は何も作らない。
+    #[test]
+    fn req21_abort_removes_tmp_and_reports_runtime_error() {
+        let cwd = workdir("abort");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut untouched = LazyOut::new(&target);
+        assert_eq!(untouched.abort().code, ExitCode::RuntimeError);
+        assert!(entries(&cwd).is_empty());
+        let mut sink = LazyOut::new(&target);
+        sink.write_all(b"partial").expect("write");
+        let error = sink.abort();
+        assert_eq!(error.code, ExitCode::RuntimeError);
+        assert!(entries(&cwd).is_empty());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-21・REQ-39: 一時名が既に塞がれていて作れない場合は、書き込みが失敗し `abort` が
+    /// 作成失敗の報告（既存は 64）を返す。
+    #[test]
+    fn req39_tmp_name_collision_is_invalid_input() {
+        let cwd = workdir("tmpcol");
+        let target = OutTarget::preflight(&cwd, Path::new("out.jsonl")).expect("preflight");
+        let mut sink = LazyOut::new(&target);
+        std::fs::write(cwd.join(&sink.tmp), "squatter").expect("squat");
+        assert!(sink.write_all(b"x").is_err());
+        assert_eq!(sink.abort().code, ExitCode::InvalidInput);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 }

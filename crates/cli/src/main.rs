@@ -11,7 +11,7 @@
 //!   exit 64（フィールドは増やさない）。
 //! - 解析に成功したコマンド: カレントディレクトリ（経路の閉じ込めの基準）とともに
 //!   [`fandhe_edge_cli::stages::run`] へ渡す。7 工程の下位層への接続と、未接続の区間
-//!   （`evaluate` の評価データありの本体・`infer --out` 等）は `stages` の doc を参照。
+//!   （`evaluate` の評価データありの本体等）は `stages` の doc を参照。
 //!   `infer` の経路・形式のガード（REQ-39・#159）も `stages::infer` の中で通る。
 
 use fandhe_edge_cli::args::{self, Invocation};

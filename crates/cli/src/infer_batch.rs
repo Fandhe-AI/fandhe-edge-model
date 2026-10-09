@@ -26,7 +26,6 @@
 //!   （選択肢 ID の合計長 × 件数）が入力に比例して膨らまない。保持するのは
 //!   `Prediction`（スコア総数に runtime 側の上限あり）と検証済みレコードのみ
 //! - 空行・空白のみの行は読み飛ばす。有効レコードが 0 件なら `invalid_input`（成功を装わない）
-//!
 //! - `--out`（#459。オーナー承認 2026-10-09）: 成功時だけ結果行（上と同一バイト列）を OUT へ書き、
 //!   stdout は要約 JSON 1 つ。失敗は `ErrorReport` を stdout へ出し OUT を作らない。結果行と
 //!   `ErrorReport` の書き分けは [`emit_infer_batch_split`]、OUT の閉じ込め・遅延作成は
@@ -498,7 +497,7 @@ where
 ///
 /// # Errors
 /// [`emit_infer_batch_with_limits`] と同じ（`results` への書き込み失敗を含む）。
-pub fn emit_infer_batch_split<W, R, P, B>(
+pub(crate) fn emit_infer_batch_split<W, R, P, B>(
     out: &mut W,
     results: &mut dyn Write,
     reader: R,
