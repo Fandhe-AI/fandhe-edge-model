@@ -1077,6 +1077,7 @@ mod tests {
             total,
             baseline_comparison: None,
             predictions_sha256: None,
+            calibration: None,
             type_meaning_quadrant: None,
         }
     }
