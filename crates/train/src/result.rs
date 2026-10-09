@@ -421,6 +421,7 @@ impl std::fmt::Debug for ValidationPrediction {
 pub struct SuccessOutcome {
     artifact_dir: String,
     artifact: Box<ArtifactRecord>,
+    empty_input_ids: Vec<i64>,
     validation_predictions: Option<Vec<ValidationPrediction>>,
 }
 
@@ -449,6 +450,14 @@ impl SuccessOutcome {
     #[must_use]
     pub fn artifact(&self) -> &ArtifactRecord {
         &self.artifact
+    }
+
+    /// 学習ワーカーの前処理が空入力（`encode_bytes("", max_bytes)`）に対して出したトークン列。
+    /// CLI の `train` 工程が推論ランタイムの前処理と照合する（REQ-23・TASK-23.2・#476）。
+    /// 値は信頼しない外部入力のままで、照合は呼び出し元の責務（本 crate は形のみ検査する）。
+    #[must_use]
+    pub fn empty_input_ids(&self) -> &[i64] {
+        &self.empty_input_ids
     }
 
     /// 学習ジョブ内で採点した validation の予測列。リクエストが
@@ -483,6 +492,9 @@ struct RawOutcome {
     code: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_present")]
     message: Option<Option<String>>,
+    /// `status:"ok"` で必須（REQ-23・TASK-23.2・#476）。古い学習ワーカーの結果を黙って通さない。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    empty_input_ids: Option<Option<Vec<i64>>>,
     /// `status:"ok"` のとき、リクエストが `validation_inputs` を持つ場合に
     /// 限り現れる。`null` は拒否する（キー欠落と区別する double-Option）。
     #[serde(default, deserialize_with = "deserialize_present")]
@@ -720,8 +732,19 @@ impl TrainOutcome {
                 // （`None`）を要求する。`"code":null` のようにキーは在るが値が
                 // `null` の場合（`Some(None)`）は、キー欠落と区別してここで
                 // 拒否する（REQ-21・REQ-39・P1。codex 指摘 PR #220）。
-                let (Some(Some(artifact_dir)), Some(Some(raw_artifact)), None, None) =
-                    (raw.artifact_dir, raw.artifact, raw.code, raw.message)
+                let (
+                    Some(Some(artifact_dir)),
+                    Some(Some(raw_artifact)),
+                    Some(Some(empty_input_ids)),
+                    None,
+                    None,
+                ) = (
+                    raw.artifact_dir,
+                    raw.artifact,
+                    raw.empty_input_ids,
+                    raw.code,
+                    raw.message,
+                )
                 else {
                     return Err(TrainResultError::MalformedOutcome);
                 };
@@ -845,18 +868,20 @@ impl TrainOutcome {
                         created_utc: raw_artifact.created_utc,
                         candidate_label: raw_artifact.candidate_label,
                     }),
+                    empty_input_ids,
                     validation_predictions,
                 }))
             }
             "error" => {
                 // 対称的に、`code`／`message` はキーがあり値も入っていること、
                 // `artifact_dir`／`artifact` はキー自体が無いことを要求する。
-                let (None, None, Some(Some(code)), Some(Some(message)), None) = (
+                let (None, None, Some(Some(code)), Some(Some(message)), None, None) = (
                     raw.artifact_dir,
                     raw.artifact,
                     raw.code,
                     raw.message,
                     raw.validation_predictions,
+                    raw.empty_input_ids,
                 ) else {
                     return Err(TrainResultError::MalformedOutcome);
                 };
@@ -889,14 +914,15 @@ impl Serialize for TrainOutcome {
         match self {
             TrainOutcome::Ok(success) => {
                 let entries = if success.validation_predictions().is_some() {
-                    4
+                    5
                 } else {
-                    3
+                    4
                 };
                 let mut map = serializer.serialize_map(Some(entries))?;
                 map.serialize_entry("status", "ok")?;
                 map.serialize_entry("artifact_dir", success.artifact_dir())?;
                 map.serialize_entry("artifact", success.artifact())?;
+                map.serialize_entry("empty_input_ids", success.empty_input_ids())?;
                 if let Some(predictions) = success.validation_predictions() {
                     map.serialize_entry("validation_predictions", predictions)?;
                 }
@@ -946,7 +972,7 @@ mod tests {
     // REQ-19・REQ-21・REQ-39・P1。codex 指摘 PR #220「成果物の追加 config
     // 値を検証せず成功扱いにしている」対応で完全一致検査に変更したため、
     // 空オブジェクトのままでは拒否されてしまう）。
-    const VALID_OK_JSON: &str = r#"{"status":"ok","artifact_dir":"/fandhe-edge-fixture-root/out","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"}}"#;
+    const VALID_OK_JSON: &str = r#"{"status":"ok","artifact_dir":"/fandhe-edge-fixture-root/out","artifact":{"kind":"c3","kind_version":1,"selector_version":"0.1","config":{"lr":0.001,"weight_decay":0.0001,"epochs":40,"batch_size":64,"emb":64,"filters":128,"widths":[3,5,7],"dropout":0.3},"label_order":["a","b"],"output_type":"choice","max_bytes":512,"onnx_file":"model.onnx","onnx_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","created_utc":"2026-09-28T00:00:00Z","candidate_label":"c3"},"empty_input_ids":[0]}"#;
 
     /// `VALID_OK_JSON` 内の `config` フィールド全体（キーと値）。他のテストが
     /// `config` だけを差し替える際、旧・部分一致検査の時代に使っていた
@@ -970,6 +996,33 @@ mod tests {
             }
             TrainOutcome::Error(_) => panic!("expected Ok"),
         }
+    }
+
+    /// REQ-23・TASK-23.2: `empty_input_ids` は成功結果で必須。欠落・`null` は拒否し、
+    /// 値は呼び出し元が照合できるよう保持する。
+    #[test]
+    fn req23_ok_outcome_requires_empty_input_ids() {
+        let ok = TrainOutcome::from_worker_stdout(VALID_OK_JSON.as_bytes(), &test_request())
+            .expect("valid outcome");
+        let TrainOutcome::Ok(success) = ok else {
+            panic!("expected Ok")
+        };
+        assert_eq!(success.empty_input_ids(), &[0]);
+        for replacement in ["", r#","empty_input_ids":null"#] {
+            let json = VALID_OK_JSON.replace(r#","empty_input_ids":[0]"#, replacement);
+            let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request())
+                .expect_err("missing or null empty_input_ids must be rejected");
+            assert!(matches!(err, TrainResultError::MalformedOutcome));
+        }
+    }
+
+    /// REQ-23: 失敗結果に `empty_input_ids` が付いていたら拒否する。
+    #[test]
+    fn req23_error_outcome_rejects_empty_input_ids() {
+        let json =
+            r#"{"status":"error","code":"invalid_request","message":"m","empty_input_ids":[0]}"#;
+        let err = TrainOutcome::from_worker_stdout(json.as_bytes(), &test_request()).unwrap_err();
+        assert!(matches!(err, TrainResultError::MalformedOutcome));
     }
 
     #[test]

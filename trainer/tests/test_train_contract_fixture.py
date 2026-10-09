@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from fandhe_edge_trainer import artifact, cli, contract, limits
+from fandhe_edge_trainer import artifact, cli, contract, encoding, limits
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
 from fandhe_edge_trainer.kinds import c3
@@ -134,6 +134,14 @@ def test_req18_validation_inputs_absent_resolves_to_none(tmp_path: Path) -> None
         assert req.validation_inputs is None
     finally:
         req.close_resources()
+
+
+def test_req23_result_fixtures_carry_empty_input_ids_of_encoder() -> None:
+    """REQ-23・TASK-23.2: 結果 fixture の `empty_input_ids` が encoder の空入力出力と一致する。"""
+    for result in (_RESULT_OK, _RESULT_OK_WITH_VALIDATION):
+        assert result["empty_input_ids"] == encoding.encode_bytes(
+            "", result["artifact"]["max_bytes"]
+        )
 
 
 def test_req27_result_ok_with_validation_fixture_matches_request_ids() -> None:

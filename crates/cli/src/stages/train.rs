@@ -29,6 +29,7 @@ use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::TrainReport;
 use fandhe_edge_data::inspect::ValidRecord;
+use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty_input_encodings};
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
@@ -231,15 +232,36 @@ fn train_in_candidate_dir(
     if let Some(report) = train_outcome_error_report(run.outcome()) {
         return Err(report);
     }
-    let TrainOutcome::Ok(_) = run.outcome() else {
+    let TrainOutcome::Ok(success) = run.outcome() else {
         return Err(ErrorReport::new(
             ExitCode::RuntimeError,
             "unexpected train outcome",
         ));
     };
+    check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())?;
     let result_json =
         outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
     project.write_new(rel.join(RESULT_FILE), &result_json)
+}
+
+/// 学習ワーカー（Python）が報告した空入力のトークン列を、推論ランタイム（Rust）の前処理
+/// （`encode_bytes(normalize_input(""), max_bytes)`）と照合する（REQ-23 境界値・TASK-23.2・#476）。
+///
+/// CLI 内の評価経路と推論経路は同じ Rust の pipeline なので食い違わない。食い違いうるのは学習時の
+/// 前処理（`trainer/`）と推論ランタイムの間だけで、その検知をここで行う。食い違いは利用者入力が原因では
+/// ないため `runtime_error`（70）・固定 message で止める（`max_bytes` は学習リクエストの値で、成果物の
+/// `max_bytes` と一致することは `TrainOutcome::from_worker_stdout` が保証済み）。
+fn check_empty_input_preprocessing(trainer_ids: &[i64], max_bytes: u32) -> Result<(), ErrorReport> {
+    let runtime_ids = fandhe_edge_runtime::preprocess::encode_bytes(
+        &fandhe_edge_runtime::preprocess::normalize_input(""),
+        max_bytes as usize,
+    );
+    match compare_empty_input_encodings(&runtime_ids, trainer_ids) {
+        Ok(EmptyInputConsistency::Consistent(_)) => Ok(()),
+        Ok(EmptyInputConsistency::Diverged { .. }) | Err(_) => Err(runtime(
+            "empty input preprocessing diverges between trainer and runtime",
+        )),
+    }
 }
 
 /// `split.json`（`inspect` の記録）を読み、取り込んだデータから分割を再現して照合する

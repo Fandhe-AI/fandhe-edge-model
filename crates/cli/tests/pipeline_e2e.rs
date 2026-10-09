@@ -692,6 +692,23 @@ mod suite {
         assert!(env.project_file("candidates/0/result.json").is_file());
     }
 
+    /// REQ-23・TASK-23.2: 学習ワーカーの空入力の前処理が推論ランタイムと食い違う結果を返すと、`train` は
+    /// `runtime_error`（70）・固定 message で止まり、候補ディレクトリを残さない。一致する場合は他のテストが
+    /// 示すとおり成功する。
+    pub fn req23_train_detects_empty_input_preprocessing_divergence() {
+        let env = inspected("req23div");
+        std::fs::write(env.project_file("diverge_empty_input"), "").expect("marker");
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--candidate", "0"],
+                70,
+                "runtime_error"
+            ),
+            "{\"code\":\"runtime_error\",\"message\":\"empty input preprocessing diverges between trainer and runtime\"}\n"
+        );
+        assert!(!env.project_file("candidates/0").exists());
+    }
+
     /// REQ-17: `inspect --seed 7` は分割記録の seed を 7 にし、`train` の学習リクエストの seed も 7 になる
     /// （分割と学習で seed がずれない）。範囲外（u32 超）の `--seed` は引数エラーの `invalid_input`。
     pub fn inspect_seed_is_recorded_and_used_by_train() {
@@ -3023,6 +3040,16 @@ mod suite {
         };
         let (kind, version, max_bytes) =
             (request.kind(), request.kind_version(), request.max_bytes());
+        // 空入力の前処理の食い違いの模擬（REQ-23・TASK-23.2・#476）: プロジェクト直下に目印があれば
+        // 推論ランタイムと異なる（詰め物 2 個の）トークン列を返す。通常は `[0]`。
+        let empty_input_ids = if Path::new(request.root())
+            .join("../../diverge_empty_input")
+            .exists()
+        {
+            "[0,0]"
+        } else {
+            "[0]"
+        };
         std::fs::write(
             format!("{out_dir}/artifact.json"),
             format!(
@@ -3047,7 +3074,7 @@ mod suite {
             })
             .collect();
         println!(
-            r#"{{"status":"ok","artifact_dir":"{out_dir}","artifact":{{"kind":"{kind}","kind_version":{version},"selector_version":"0.1","config":{config},"label_order":[{labels}],"output_type":"choice","max_bytes":{max_bytes},"onnx_file":"model.onnx","onnx_sha256":"{sha}","created_utc":"2026-09-30T00:00:00Z","candidate_label":"{kind}"}},"validation_predictions":[{}]}}"#,
+            r#"{{"status":"ok","artifact_dir":"{out_dir}","artifact":{{"kind":"{kind}","kind_version":{version},"selector_version":"0.1","config":{config},"label_order":[{labels}],"output_type":"choice","max_bytes":{max_bytes},"onnx_file":"model.onnx","onnx_sha256":"{sha}","created_utc":"2026-09-30T00:00:00Z","candidate_label":"{kind}"}},"empty_input_ids":{empty_input_ids},"validation_predictions":[{}]}}"#,
             predictions.join(",")
         );
         std::process::exit(0);
@@ -3221,6 +3248,10 @@ fn main() -> std::process::ExitCode {
         (
             "train_failure_cleans_candidate_dir_and_allows_retry",
             suite::train_failure_cleans_candidate_dir_and_allows_retry,
+        ),
+        (
+            "req23_train_detects_empty_input_preprocessing_divergence",
+            suite::req23_train_detects_empty_input_preprocessing_divergence,
         ),
         (
             "train_seed_override_is_recorded_and_split_is_unchanged",
