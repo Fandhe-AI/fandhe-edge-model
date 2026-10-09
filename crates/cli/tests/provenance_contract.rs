@@ -211,6 +211,20 @@ fn req40_orphan_evaluation_provenance_is_rejected() {
     assert!(!exists(&e.proj()));
 }
 
+/// REQ-40: 評価データなしで取り込んだ後に評価来歴を `data/` へ足しても、`inspect` は 64 で記録しない。
+#[test]
+fn req40_orphan_evaluation_provenance_added_after_register_fails_inspect() {
+    let e = Env::new("orphan-late");
+    assert_eq!(e.register().status.code(), Some(0));
+    let p = e.proj().join("data/evaluation.provenance.json");
+    std::fs::write(&p, format!(r#"{{{PROV_BASE}}}"#)).expect("add");
+    let o = e.inspect();
+    assert_eq!(o.status.code(), Some(64));
+    assert!(stdout(&o).contains("evaluation provenance without evaluation data"));
+    assert!(!exists(&e.proj().join("split.json")));
+    assert!(!exists(&e.proj().join("provenance_record.json")));
+}
+
 /// REQ-40: 評価来歴は評価データとともに取り込まれ、`inspect` が `evaluation` キーで記録する。
 #[test]
 fn req40_evaluation_provenance_is_recorded() {

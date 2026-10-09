@@ -283,7 +283,11 @@ const EVAL_MSGS: [&str; 4] = [
 /// キーの正準 JSON）を返す。来歴が 1 つも無ければ `None`（REQ-40）。
 ///
 /// 取り込み後の改変・差し替えは `register` と同じ検査（[`check_provenance`]）で `invalid_input`。
-fn load_provenance_json(project: &Project) -> Result<Option<String>, ErrorReport> {
+/// 評価データが無いのに評価来歴がある状態も `register` と同じく `invalid_input`（評価済みを装わない）。
+fn load_provenance_json(
+    project: &Project,
+    has_evaluation: bool,
+) -> Result<Option<String>, ErrorReport> {
     let mut parts = Vec::new();
     // キー順（evaluation < train）に固定して決定的にする。
     for (key, name, is_training) in [
@@ -292,6 +296,9 @@ fn load_provenance_json(project: &Project) -> Result<Option<String>, ErrorReport
     ] {
         let rel = Path::new(DATA_DIR).join(name);
         if let Some(bytes) = project.read_optional(rel, MAX_PROVENANCE_FILE_BYTES)? {
+            if !is_training && !has_evaluation {
+                return Err(invalid("evaluation provenance without evaluation data"));
+            }
             parts.push(format!(
                 "\"{key}\":{}",
                 check_provenance(&bytes, is_training)?
@@ -322,7 +329,6 @@ pub fn run_with_log<W: std::io::Write>(
     let project = Project::open(cwd, &args.project_dir)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
-    let provenance_json = load_provenance_json(&project)?;
     report_consistency(log, &records, TRAIN_MSGS)?;
     let train_rows = split_rows(&records)?;
 
@@ -335,6 +341,7 @@ pub fn run_with_log<W: std::io::Write>(
         }
         None => None,
     };
+    let provenance_json = load_provenance_json(&project, eval_bytes.is_some())?;
 
     let recorded = split_and_record(&train_rows, u64::from(args.seed), &SplitRatios::default())
         .map_err(|_| invalid("cannot split records"))?;
