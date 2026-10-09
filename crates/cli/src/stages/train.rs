@@ -444,8 +444,8 @@ fn all_outcome(
         .map(|(index, entry)| TrainAllCandidate {
             candidate: index,
             kind: entry.candidate_id.clone(),
-            result: entry.result.tag(),
-            budget_reached: entry.budget_reached().map(|scope| scope.tag()),
+            result: (&entry.result).into(),
+            budget_reached: entry.budget_reached().map(Into::into),
         })
         .collect();
     Ok(TrainAllReport::new(

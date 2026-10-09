@@ -109,6 +109,7 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
+use fandhe_edge_core::stage_report::{TrainBudgetScope, TrainSearchResult};
 use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
@@ -320,14 +321,30 @@ pub enum BudgetReachedScope {
     CandidateTimeLimit,
 }
 
-impl BudgetReachedScope {
-    /// 直列化と同じ snake_case のタグ（CLI `train --all` の stdout 用。`serde_json` を持たない
-    /// CLI が固定語彙として使う。REQ-18・TASK-18.2・#483）。
-    #[must_use]
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::SearchBudget => "search_budget",
-            Self::CandidateTimeLimit => "candidate_time_limit",
+impl From<&CandidateSearchResult> for TrainSearchResult {
+    /// CLI `train --all` の出力契約の語彙へ写す（共通コアの enum。REQ-18・TASK-18.1・#482）。
+    fn from(result: &CandidateSearchResult) -> Self {
+        match result {
+            CandidateSearchResult::Evaluated { .. } => Self::Evaluated,
+            CandidateSearchResult::TrainingNotCompleted => Self::TrainingNotCompleted,
+            CandidateSearchResult::ScoringFailed => Self::ScoringFailed,
+            CandidateSearchResult::ScoringExceededBudget { .. } => Self::ScoringExceededBudget,
+            CandidateSearchResult::ScoringSkippedBudgetExhausted => {
+                Self::ScoringSkippedBudgetExhausted
+            }
+            CandidateSearchResult::TrainingExceededTimeLimit => Self::TrainingExceededTimeLimit,
+            CandidateSearchResult::TrainingTimedOut => Self::TrainingTimedOut,
+            CandidateSearchResult::NotStarted { .. } => Self::NotStarted,
+        }
+    }
+}
+
+impl From<BudgetReachedScope> for TrainBudgetScope {
+    /// CLI `train --all` の出力契約の語彙へ写す（共通コアの enum。REQ-18・TASK-18.2・#483）。
+    fn from(scope: BudgetReachedScope) -> Self {
+        match scope {
+            BudgetReachedScope::SearchBudget => Self::SearchBudget,
+            BudgetReachedScope::CandidateTimeLimit => Self::CandidateTimeLimit,
         }
     }
 }
@@ -438,22 +455,6 @@ pub enum CandidateSearchResult {
 }
 
 impl CandidateSearchResult {
-    /// 直列化の `result` タグと同じ snake_case の名前（CLI `train --all` の stdout 用。
-    /// REQ-18・TASK-18.1・#482）。
-    #[must_use]
-    pub fn tag(&self) -> &'static str {
-        match self {
-            Self::Evaluated { .. } => "evaluated",
-            Self::TrainingNotCompleted => "training_not_completed",
-            Self::ScoringFailed => "scoring_failed",
-            Self::ScoringExceededBudget { .. } => "scoring_exceeded_budget",
-            Self::ScoringSkippedBudgetExhausted => "scoring_skipped_budget_exhausted",
-            Self::TrainingExceededTimeLimit => "training_exceeded_time_limit",
-            Self::TrainingTimedOut => "training_timed_out",
-            Self::NotStarted { .. } => "not_started",
-        }
-    }
-
     /// 予算到達にあたる場合にその範囲を返す（TASK-18.2・REQ-18 異常系）。
     /// 予算到達は合格・選定扱いにせず、不合格（`TrainingNotCompleted`・
     /// `ScoringFailed`）とも区別する。バリアントを足すときに分類を強制する
@@ -2867,16 +2868,23 @@ mod tests {
         ];
         for result in results {
             let value = serde_json::to_value(&result).expect("ser");
-            assert_eq!(value["result"], result.tag(), "{result:?}");
+            let mapped = serde_json::to_value(TrainSearchResult::from(&result)).expect("ser");
+            assert_eq!(value["result"], mapped, "{result:?}");
         }
         for scope in [
             BudgetReachedScope::SearchBudget,
             BudgetReachedScope::CandidateTimeLimit,
         ] {
-            assert_eq!(serde_json::to_value(scope).expect("ser"), scope.tag());
+            assert_eq!(
+                serde_json::to_value(scope).expect("ser"),
+                serde_json::to_value(TrainBudgetScope::from(scope)).expect("ser")
+            );
         }
         assert_eq!(
-            CandidateSearchResult::TrainingTimedOut.tag(),
+            serde_json::to_value(TrainSearchResult::from(
+                &CandidateSearchResult::TrainingTimedOut
+            ))
+            .expect("ser"),
             "training_timed_out"
         );
     }

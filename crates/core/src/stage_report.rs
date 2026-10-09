@@ -747,8 +747,9 @@ impl TrainReport {
 /// TASK-18.2・#482・#483）。
 ///
 /// 値は学習ワーカー層の探索記録（`fandhe_edge_train::search::SearchRecord`）から CLI が写す。共通コアは
-/// 学習ワーカー層に依存しないため、`result`・`budget_reached` は学習ワーカー層が定める固定語彙の文字列で
-/// 受け取る（`CandidateSearchResult::tag`・`BudgetReachedScope::tag`）。パス・データ本文は載せない。
+/// 学習ワーカー層に依存しないため、`result`・`budget_reached` は出力契約用の enum
+/// （[`TrainSearchResult`]・[`TrainBudgetScope`]）で受け取り、契約外の値を表せないようにする。
+/// パス・データ本文は載せない。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrainAllReport {
     step: Stage,
@@ -766,10 +767,42 @@ pub struct TrainAllCandidate {
     pub candidate: usize,
     /// 候補の種類 ID（`c1` 等）。
     pub kind: String,
-    /// 探索結果の分類（`evaluated`・`training_timed_out`・`not_started` 等）。
-    pub result: &'static str,
-    /// 予算到達の範囲（`search_budget`・`candidate_time_limit`）。該当しなければ `null`。
-    pub budget_reached: Option<&'static str>,
+    /// 探索結果の分類。
+    pub result: TrainSearchResult,
+    /// 予算到達の範囲。該当しなければ `null`。
+    pub budget_reached: Option<TrainBudgetScope>,
+}
+
+/// `train --all` の候補ごとの探索結果（学習ワーカー層の `CandidateSearchResult` のタグと同じ語彙）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainSearchResult {
+    /// 学習・validation 推論・正解率算出まで完了した。
+    Evaluated,
+    /// 学習が完了しなかった。
+    TrainingNotCompleted,
+    /// validation の採点に失敗した。
+    ScoringFailed,
+    /// 採点中に探索予算を超えた。
+    ScoringExceededBudget,
+    /// 予算切れで採点しなかった。
+    ScoringSkippedBudgetExhausted,
+    /// 学習が持ち時間を超えた。
+    TrainingExceededTimeLimit,
+    /// 学習が壁時計の期限で打ち切られた。
+    TrainingTimedOut,
+    /// 予算切れで開始しなかった。
+    NotStarted,
+}
+
+/// `train --all` の予算到達の範囲（学習ワーカー層の `BudgetReachedScope` と同じ語彙）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainBudgetScope {
+    /// 探索全体の予算に達した。
+    SearchBudget,
+    /// 候補ごとの持ち時間に達した。
+    CandidateTimeLimit,
 }
 
 impl TrainAllReport {
@@ -1548,14 +1581,14 @@ mod tests {
                 TrainAllCandidate {
                     candidate: 0,
                     kind: "c1".to_string(),
-                    result: "evaluated",
+                    result: TrainSearchResult::Evaluated,
                     budget_reached: None,
                 },
                 TrainAllCandidate {
                     candidate: 1,
                     kind: "c3".to_string(),
-                    result: "training_timed_out",
-                    budget_reached: Some("candidate_time_limit"),
+                    result: TrainSearchResult::TrainingTimedOut,
+                    budget_reached: Some(TrainBudgetScope::CandidateTimeLimit),
                 },
             ],
         );
