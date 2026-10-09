@@ -124,6 +124,55 @@ pub fn search_record_json_vec(record: &SearchRecord) -> Result<Vec<u8>, StageFil
     Ok(bytes)
 }
 
+/// 探索記録の読み戻しに使う部分（候補ごとの ID・結果・配分した持ち時間だけを読む）。
+#[derive(Deserialize)]
+struct StoredSearchRecord {
+    candidates: Vec<StoredSearchEntry>,
+}
+
+#[derive(Deserialize)]
+struct StoredSearchEntry {
+    candidate_id: String,
+    result: String,
+    time: Option<StoredCandidateTime>,
+}
+
+#[derive(Deserialize)]
+struct StoredCandidateTime {
+    time_limit_seconds: u32,
+}
+
+/// 保存済みの探索記録から、候補 `index`（ID `candidate_id`）へ配分した持ち時間（秒）を返す
+/// （`select`・`package`・`evaluate` が `train --all` の候補の `request.json` の `time_limit_seconds` を照合する
+/// ための期待値。REQ-18・REQ-27・#482）。値は学習リクエストへ渡した持ち時間そのもの
+/// （[`crate::time_allotment::CandidateTimeRecord::time_limit_seconds`]）。
+///
+/// # Errors
+/// [`MAX_SEARCH_RECORD_BYTES`] 超過・JSON として不正・候補が記録に無い・ID が違う・`evaluated` でない・
+/// 持ち時間が無いか `1..=MAX_TRAIN_WALL_SECONDS` の外の場合は [`StageFileError::Malformed`]（fail-closed）。
+pub fn allotted_time_limit_seconds(
+    bytes: &[u8],
+    index: usize,
+    candidate_id: &str,
+) -> Result<u32, StageFileError> {
+    if bytes.len() > MAX_SEARCH_RECORD_BYTES {
+        return Err(StageFileError::Malformed);
+    }
+    let record: StoredSearchRecord =
+        serde_json::from_slice(bytes).map_err(|_| StageFileError::Malformed)?;
+    let entry = record
+        .candidates
+        .get(index)
+        .filter(|e| e.candidate_id == candidate_id && e.result == "evaluated")
+        .ok_or(StageFileError::Malformed)?;
+    entry
+        .time
+        .as_ref()
+        .map(|t| t.time_limit_seconds)
+        .filter(|s| (1..=crate::limits::MAX_TRAIN_WALL_SECONDS).contains(s))
+        .ok_or(StageFileError::Malformed)
+}
+
 /// 学習ジョブが返した validation 予測（入力順）を、正解ラベル `gold`（同じ順序）と突き合わせて
 /// 全体正解率を返す。件数・`id` の順序が入力 `ids` と一致しなければ [`StageFileError::Scoring`]。
 ///
@@ -387,5 +436,29 @@ mod tests {
             "{\"candidate_index\":0,\"candidate_id\":\"c1\",\"rule\":\"r\",\"validation_correct\":1,\"validation_total\":2,\"significance\":{\"majority_label\":\"a\",\"baseline_correct\":1,\"b\":1,\"c\":0,\"required_n\":7,\"family_size\":2,\"verdict\":\"undeterminable\"}}\n"
         );
         assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
+    }
+
+    /// REQ-18・REQ-27・#482: 探索記録から評価済み候補の持ち時間を読む。候補が無い・ID 違い・
+    /// `evaluated` でない・持ち時間が無いか範囲外・JSON 不正はすべて `Malformed`（fail-closed）。
+    #[test]
+    fn req18_allotted_time_limit_reads_only_evaluated_candidates() {
+        let record = br#"{"budget_seconds":10,"candidates":[{"candidate_id":"c1","time":{"time_limit_seconds":5,"status":"completed"},"result":"evaluated","budget_reached":null},{"candidate_id":"c3","time":{"time_limit_seconds":4},"result":"training_timed_out"},{"candidate_id":"c9","time":null,"result":"evaluated"},{"candidate_id":"c8","time":{"time_limit_seconds":3601},"result":"evaluated"}]}"#;
+        assert_eq!(allotted_time_limit_seconds(record, 0, "c1"), Ok(5));
+        for (index, id) in [(0, "c3"), (1, "c3"), (2, "c9"), (3, "c8"), (4, "c1")] {
+            assert_eq!(
+                allotted_time_limit_seconds(record, index, id),
+                Err(StageFileError::Malformed),
+                "{index} {id}"
+            );
+        }
+        assert_eq!(
+            allotted_time_limit_seconds(b"{}", 0, "c1"),
+            Err(StageFileError::Malformed)
+        );
+        let oversized = vec![b' '; MAX_SEARCH_RECORD_BYTES + 1];
+        assert_eq!(
+            allotted_time_limit_seconds(&oversized, 0, "c1"),
+            Err(StageFileError::Malformed)
+        );
     }
 }

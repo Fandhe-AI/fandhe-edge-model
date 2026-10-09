@@ -125,8 +125,9 @@ use super::infer::build_pipeline;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, effective_train_seed, load_trained, request_is_smoke_trained,
-    request_matches_candidate, resolve_candidates, train_rows, verified_split,
+    allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
+    request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
+    verified_split,
 };
 
 /// `package` の結果（終了コードの決定と、stdout へ載せる計測値。#340）。
@@ -177,7 +178,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         .ok_or_else(|| invalid("selection record does not match the candidate"))?;
     let (request, outcome) = load_trained(&project, selection.candidate_index)?
         .ok_or_else(|| invalid("selected candidate is not trained"))?;
-    if !request_matches_candidate(&request, &candidate.params, &records, &split) {
+    let allotted =
+        allotted_time_limit(&project, selection.candidate_index, &candidate.candidate_id)?;
+    if !request_matches_candidate(&request, &candidate.params, allotted, &records, &split) {
         return Err(invalid("selection record does not match the candidate"));
     }
     // 短縮学習（`train --smoke`）の結果は、検証専用の `--allow-smoke` を明示しない限り配布しない

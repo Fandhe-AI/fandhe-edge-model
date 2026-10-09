@@ -475,8 +475,9 @@ mod suite {
     /// REQ-27・REQ-39: 保存済みの `request.json` の `device`・`train_path`（結果 `result.json` とは
     /// 整合したまま）を書き換えると、`select` も `package` も、期待するリクエストを丸ごと組み立てた比較で
     /// `invalid_input`（64）・固定 message で止まり、選定記録・`package/` を作らない。`epochs` だけが違う
-    /// smoke の結果はこの照合を通る（別テストで確認済み）。時間制限（`time_limit_seconds`）は `train --all`
-    /// が探索予算から配分する値のため照合の例外で、`1..=3600` の値なら通る（REQ-18・#482）。
+    /// smoke の結果はこの照合を通る（別テストで確認済み）。単発の `train` の候補では時間制限
+    /// （`time_limit_seconds`）も既定値と厳密に照合する（`train --all` の候補は探索記録の配分値と照合する。
+    /// `train_all_trains_every_candidate_within_budget`。REQ-18・#482）。
     pub fn select_and_package_reject_request_fields_beyond_kind_and_seed() {
         let env = inspected("reqfields");
         env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
@@ -484,6 +485,8 @@ mod suite {
         let original = std::fs::read_to_string(&request).expect("request.json");
         let tampers = [
             ("device", "\"device\":\"cpu\"", "\"device\":\"gpu\""),
+            // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加える。
+            ("time limit", "{", "{\"time_limit_seconds\":1,"),
             (
                 "train_path",
                 "\"train_path\":\"train_input.jsonl\"",
@@ -504,12 +507,7 @@ mod suite {
                 "{label}"
             );
         }
-        // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加えても照合を通る（#482）。
-        std::fs::write(
-            &request,
-            original.replacen('{', "{\"time_limit_seconds\":1,", 1),
-        )
-        .expect("time limit");
+        std::fs::write(&request, &original).expect("restore");
         env.ok(&["select", "--project-dir", "proj"]);
         for (label, from, to) in &tampers {
             std::fs::write(&request, original.replacen(from, to, 1)).expect("tamper");
@@ -763,8 +761,9 @@ mod suite {
 
     /// REQ-18・REQ-27・TASK-18.1・TASK-18.2・#482・#483: `train --all`（既定予算 3600 秒）は既定候補の
     /// 全件を学習し、候補ごとに `result.json` を書いて stdout に候補別の結果を返す。`request.json` には
-    /// 均等割りの持ち時間（1 候補目は 1800 秒）が入り、それでも `select`・`package` の照合を通る。
-    /// `search_record.json` は予測本文を含まない。
+    /// 均等割りの持ち時間（1 候補目は 1800 秒）が入り、探索記録の配分値と一致するので `select`・`package` の
+    /// 照合を通る。記録と違う値へ書き換えた `request.json`・壊れた探索記録は `select`・`package` とも
+    /// `invalid_input`（64）。`search_record.json` は予測本文を含まない。
     pub fn train_all_trains_every_candidate_within_budget() {
         let env = inspected("trainall");
         let stdout = env.ok(&["train", "--project-dir", "proj", "--all"]);
@@ -790,11 +789,42 @@ mod suite {
         for leak in ["predicted", "sample"] {
             assert!(!record.contains(leak), "{record}");
         }
+
+        // 記録と違う持ち時間へ書き換えた request（1 候補目。select は全候補を照合する）は拒否する。
+        let request_path = env.project_file("candidates/0/request.json");
+        let tampered = request.replacen(
+            "\"time_limit_seconds\":1800,",
+            "\"time_limit_seconds\":1799,",
+            1,
+        );
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n";
+        std::fs::write(&request_path, &tampered).expect("tamper");
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            mismatch
+        );
+        // 壊れた探索記録も拒否する（fail-closed）。
+        let record_path = env.project_file("search_record.json");
+        std::fs::write(&request_path, &request).expect("restore");
+        std::fs::remove_file(&record_path).expect("remove record");
+        std::fs::write(&record_path, "{}\n").expect("broken record");
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"search record is invalid\"}\n"
+        );
+        std::fs::remove_file(&record_path).expect("remove broken record");
+        std::fs::write(&record_path, &record).expect("restore record");
+        assert!(!env.project_file("selection_record.json").exists());
+
         assert!(
             env.ok(&["select", "--project-dir", "proj"]).starts_with(
                 "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\""
             )
         );
+        std::fs::write(&request_path, &tampered).expect("tamper");
+        env.fails(&["package", "--project-dir", "proj"], 64, "invalid_input");
+        assert!(!env.project_file("package").exists());
+        std::fs::write(&request_path, &request).expect("restore");
         assert_eq!(
             env.ok(&["package", "--project-dir", "proj"]),
             package_line(&env, C3_DIR, NULL_HEAD)

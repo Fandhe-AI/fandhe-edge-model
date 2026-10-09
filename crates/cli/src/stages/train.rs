@@ -59,7 +59,8 @@ use fandhe_edge_train::search::{
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    StageFileError, outcome_json_vec, search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, allotted_time_limit_seconds, outcome_json_vec,
+    search_record_json_vec, trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
@@ -674,6 +675,29 @@ pub fn read_split_record(project: &Project) -> Result<SplitRecord, ErrorReport> 
     SplitRecord::from_json_str(split_text).map_err(|_| invalid("split record is invalid"))
 }
 
+/// `train --all` 済みのプロジェクトで、探索記録が候補 `index`（ID `candidate_id`）へ配分した持ち時間（秒）を
+/// 返す（[`request_matches_candidate`] の期待値。REQ-18・REQ-27・#482）。`search_record.json` が無い（単発の
+/// `train` だけの）プロジェクトは `None` で、時間制限は既定値と厳密に照合される。
+///
+/// 記録は保持 fd 起点・[`MAX_SEARCH_RECORD_BYTES`] の上限で読む（REQ-39）。
+///
+/// # Errors
+/// 記録が壊れている・候補が記録に無い・ID が違う・`evaluated` でない場合は `invalid_input`（64。fail-closed）。
+/// 読み込みの失敗は [`Project::read_optional`] と同じ写像（上限超過は 20、I/O 失敗は 70）。
+pub fn allotted_time_limit(
+    project: &Project,
+    index: usize,
+    candidate_id: &str,
+) -> Result<Option<u32>, ErrorReport> {
+    let Some(bytes) = project.read_optional(SEARCH_RECORD_FILE, MAX_SEARCH_RECORD_BYTES as u64)?
+    else {
+        return Ok(None);
+    };
+    allotted_time_limit_seconds(&bytes, index, candidate_id)
+        .map(Some)
+        .map_err(|_| invalid("search record is invalid"))
+}
+
 /// 学習済みの候補 `index` の学習リクエストと結果を読み戻す（学習済みでなければ `None`）。
 ///
 /// 結果は保存されたファイルをそのまま信用せず、学習ワーカーの標準出力と同じ再検証
@@ -738,21 +762,25 @@ pub fn build_train_request(
 /// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
 /// 移動すると一致せず拒否される（fail-closed として許容する）。
 ///
-/// **例外は `epochs` と `time_limit_seconds` の 2 か所だけ**: `epochs` は `train --smoke` が 1 へ上書きする
-/// 項目のため、期待値の `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
-/// [`request_is_smoke_trained`] で判定する）。`time_limit_seconds` は `train --all` が探索予算から配分した
-/// 持ち時間で、型で `1..=MAX_TRAIN_WALL_SECONDS` に収まる（REQ-18・#482）。どちらも学習の構成・データ・
-/// 出力先を変えない。実行時の環境でしか決まらない値（学習ワーカーの実行ファイルのパス等）はリクエストに
-/// 含まれないため、除外した項目は他にない。
+/// **例外は `epochs` の 1 か所だけ**: `train --smoke` が 1 へ上書きする項目のため、期待値の `epochs` を
+/// 保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に [`request_is_smoke_trained`] で判定する）。
+/// `time_limit_seconds` は除外しない: `allotted_time_limit` が `Some`（`train --all` の候補。
+/// [`allotted_time_limit`] で探索記録から読んだ配分値）ならその値、`None`（単発の `train`）なら既定値を
+/// 期待値にして厳密に比べる（保存後に時間制限だけを書き換えた request を通さない。REQ-18・REQ-27・#482）。
+/// 実行時の環境でしか決まらない値（学習ワーカーの実行ファイルのパス等）はリクエストに含まれないため、
+/// 除外した項目は他にない。
 #[must_use]
 pub fn request_matches_candidate(
     request: &TrainRequest,
     params: &TrainRequestParams,
+    allotted_time_limit: Option<u32>,
     records: &[ValidRecord],
     split: &SplitResult,
 ) -> bool {
     let mut expected_params = params.clone();
-    expected_params.time_limit_seconds = Some(request.time_limit_seconds());
+    if allotted_time_limit.is_some() {
+        expected_params.time_limit_seconds = allotted_time_limit;
+    }
     match request.config().get("epochs") {
         Some(epochs) => {
             expected_params
