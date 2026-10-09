@@ -35,6 +35,7 @@
 use serde::Serialize;
 
 use crate::evaluation_record::BaselineComparisonVerdict;
+use crate::hash::Sha256Digest;
 
 /// CLI の 7 工程（REQ-33。工程順）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -502,6 +503,40 @@ impl RegisterReport {
             definition_sha256,
             options,
             evaluation_defined,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `infer --input-file ... --out` が exit 0 で stdout へ返す要約 JSON（REQ-33・#459）。
+///
+/// `count` は OUT へ書いた結果行数、`sha256` は OUT に書いたバイト列の sha256（小文字 16 進）。
+/// パスは載せない（security.md）。宣言順（`step`・`status`・`count`・`sha256`）に直列化する。
+/// この JSON スキーマは 2026-10-09 にオーナー承認済み。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InferBatchReport {
+    step: Stage,
+    status: StageStatus,
+    count: usize,
+    sha256: Sha256Digest,
+}
+
+impl InferBatchReport {
+    /// 書き出し完了の要約を作る。
+    #[must_use]
+    pub fn new(count: usize, sha256: Sha256Digest) -> Self {
+        Self {
+            step: Stage::Infer,
+            status: StageStatus::Ok,
+            count,
+            sha256,
         }
     }
 
@@ -1296,6 +1331,16 @@ mod tests {
                 r#""holm":{"candidate":"P","m":3,"comparisons":[{"against":"majority","b":2,"c":0,"p_raw":0.5,"p_adjusted":0.25,"verdict":"significantly_better"}]},"#,
                 r#""references":[{"candidate":"P","against":"AR","b":1,"c":2,"p_raw":0.125}]}"#
             )
+        );
+    }
+
+    /// REQ-33: `infer --out` の要約はキー順 `step`・`status`・`count`・`sha256` で出る。
+    #[test]
+    fn req33_infer_batch_report_json_shape() {
+        let report = InferBatchReport::new(2, Sha256Digest::of_bytes(b"abc"));
+        assert_eq!(
+            report.to_json_line().unwrap(),
+            r#"{"step":"infer","status":"ok","count":2,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}"#
         );
     }
 }

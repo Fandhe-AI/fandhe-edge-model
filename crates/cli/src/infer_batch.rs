@@ -27,11 +27,14 @@
 //!   `Prediction`（スコア総数に runtime 側の上限あり）と検証済みレコードのみ
 //! - 空行・空白のみの行は読み飛ばす。有効レコードが 0 件なら `invalid_input`（成功を装わない）
 //!
+//! - `--out`（#459。オーナー承認 2026-10-09）: 成功時だけ結果行（上と同一バイト列）を OUT へ書き、
+//!   stdout は要約 JSON 1 つ。失敗は `ErrorReport` を stdout へ出し OUT を作らない。結果行と
+//!   `ErrorReport` の書き分けは [`emit_infer_batch_split`]、OUT の閉じ込め・遅延作成は
+//!   `stages::infer` が担う
+//!
 //! # 実装しないもの（入出力契約の変更・後続作業。REQ-21・REQ-33）
 //!
 //! - PoC-16 の行単位エラー行（`status:"error"`）: `JudgmentStatus` の variant 追加を伴うため未実装
-//! - `--out`（行をファイルへ書き stdout に要約を出す）: 要約スキーマ未確定・書き込み先の
-//!   ガード（REQ-39）が要るため未実装。出力関数は `Write` に汎用化してあり、後続で差し替えられる
 //!
 //! # 資源上限（REQ-39・暫定）
 //!
@@ -107,7 +110,7 @@ pub enum OutputMode {
 ///
 /// 全 variant を網羅 `match` し、コマンドが増えたらコンパイルエラーで気付けるようにする
 /// （REQ-33）。`JsonLines` は `--out` なしの `infer --input-file` のみ。`--out` 付きは
-/// 「行はファイル・stdout は単一 JSON」の想定（実処理は後続）で `SingleDocument` とする。
+/// 「行はファイル・stdout は単一 JSON」で `SingleDocument` とする（#459）。
 #[must_use]
 pub const fn output_mode(command: &Command) -> OutputMode {
     match command {
@@ -478,6 +481,7 @@ where
 {
     emit_infer_batch_inner(
         out,
+        None,
         reader,
         io,
         options,
@@ -487,9 +491,45 @@ where
     )
 }
 
+/// [`emit_infer_batch`] の結果行（成功時のみ）を `results` へ、`ErrorReport` を `out` へ
+/// 分けて書く版（`infer --out`。REQ-33・#459）。上限・停止の回収は既定どおり（CLI 専用）。
+///
+/// 失敗時は `results` へ何も書かない（遅延作成の出力先がファイルを作らずに済む）。
+///
+/// # Errors
+/// [`emit_infer_batch_with_limits`] と同じ（`results` への書き込み失敗を含む）。
+pub fn emit_infer_batch_split<W, R, P, B>(
+    out: &mut W,
+    results: &mut dyn Write,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_batch_inner(
+        out,
+        Some(results),
+        reader,
+        io,
+        options,
+        pipeline,
+        BatchLimits::default(),
+        StallPolicy::TerminateProcess,
+    )
+}
+
 /// [`emit_infer_batch_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
+/// `results` が `Some` なら結果行はそこへ、`ErrorReport` は常に `out` へ書く（REQ-33・#459）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_infer_batch_inner<W, R, P, B>(
     out: &mut W,
+    results: Option<&mut dyn Write>,
     reader: R,
     io: &IoSchema,
     options: &[Choice],
@@ -558,12 +598,16 @@ where
             // 計算段階で期限内に全件が済んだ時点で結果は成功として確定している。書き出しと
             // flush の完了後に期限を理由に失敗へ変えない（確定点は 1 つ）。書き出しの停止は
             // ウォッチドッグ（CLI 経路）だけが扱う。
+            let mut sink: &mut dyn Write = match results {
+                Some(results) => results,
+                None => &mut *out,
+            };
             for (record, prediction) in records.iter().zip(&predictions) {
                 // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
                 // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
                 let result = judgment_from_prediction(options, record.id(), prediction)
                     .map_err(|error| io::Error::other(error.message))?;
-                write_ok_judgment(out, &result)?;
+                write_ok_judgment(&mut sink, &result)?;
             }
             Ok(ExitCode::Ok)
         }
@@ -1040,6 +1084,7 @@ mod tests {
         let mut out = SlowWriter(Vec::new());
         let code = emit_infer_batch_inner(
             &mut out,
+            None,
             std::io::Cursor::new(
                 b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n".to_vec(),
             ),

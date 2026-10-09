@@ -602,7 +602,11 @@ pub fn inspect_bytes(
 ///
 /// 既存は `invalid_input`、経路の拒否・未対応 OS は下位層の写像、それ以外（権限・容量等）は
 /// `runtime_error`。
-fn write_rejection(e: &PathRejection, exists_message: &str, other_message: &str) -> ErrorReport {
+pub(crate) fn write_rejection(
+    e: &PathRejection,
+    exists_message: &str,
+    other_message: &str,
+) -> ErrorReport {
     match e {
         PathRejection::Unresolvable { source, .. } if source.kind() == ErrorKind::AlreadyExists => {
             invalid(exists_message)

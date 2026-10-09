@@ -957,30 +957,96 @@ mod suite {
         env.ok(&text_args);
     }
 
-    /// REQ-33: 未実装の `infer --out` は成功を装わず `runtime_error`。
-    pub fn infer_out_option_is_not_faked() {
-        let env = packaged("out");
+    const OUT_INPUT: &str = "{\"id\":\"a\",\"input\":\"x\"}\n{\"id\":\"b\",\"input\":\"yy\"}\n";
+
+    fn infer_out_args(out: &str) -> [&str; 7] {
+        [
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "in.jsonl",
+            "--out",
+            out,
+        ]
+    }
+
+    /// REQ-33: `infer --out` は `--out` なしの stdout と同一バイト列を OUT へ書き、stdout は要約 1 つ。
+    pub fn infer_out_writes_same_bytes_and_summary() {
+        let env = packaged("outok");
+        std::fs::write(env.work.join("in.jsonl"), OUT_INPUT).expect("in");
+        let (code, expected) = env.run(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "in.jsonl",
+        ]);
+        assert_eq!(code, 0, "{expected}");
+        assert_eq!(expected.lines().count(), 2);
+        let args = infer_out_args("out.jsonl");
+        let summary = env.ok(&args);
+        assert_eq!(
+            summary,
+            format!(
+                "{{\"step\":\"infer\",\"status\":\"ok\",\"count\":2,\"sha256\":\"{}\"}}\n",
+                Sha256Digest::of_bytes(expected.as_bytes()).to_hex()
+            )
+        );
+        assert_eq!(
+            std::fs::read(env.work.join("out.jsonl")).expect("out"),
+            expected.as_bytes()
+        );
+    }
+
+    /// REQ-33・REQ-39・REQ-21: OUT が既存・`..`・絶対パス・親なし・symlink（OUT 自体・親）は
+    /// `invalid_input`（64）で、計算前に拒否し、何も作らず既存ファイルも変えない。
+    pub fn infer_out_rejects_unsafe_targets() {
+        let env = packaged("outbad");
+        std::fs::write(env.work.join("in.jsonl"), OUT_INPUT).expect("in");
+        std::fs::write(env.work.join("existing.jsonl"), "keep").expect("existing");
+        std::fs::create_dir(env.work.join("d")).expect("d");
+        std::os::unix::fs::symlink("d", env.work.join("dlink")).expect("dir symlink");
+        std::os::unix::fs::symlink("d/target.jsonl", env.work.join("dangling.jsonl"))
+            .expect("dangling symlink");
+        std::os::unix::fs::symlink("existing.jsonl", env.work.join("filelink.jsonl"))
+            .expect("file symlink");
+        let absolute = env.work.join("abs.jsonl");
+        let cases = [
+            "existing.jsonl",
+            "../escaped.jsonl",
+            absolute.to_str().expect("utf8"),
+            "nodir/x.jsonl",
+            "dangling.jsonl",
+            "filelink.jsonl",
+            "dlink/x.jsonl",
+            "d/..",
+        ];
+        for out in cases {
+            let args = infer_out_args(out);
+            env.fails(&args, 64, "invalid_input");
+        }
+        assert_eq!(
+            std::fs::read_to_string(env.work.join("existing.jsonl")).expect("existing"),
+            "keep"
+        );
+        assert!(!absolute.exists());
+        assert!(!env.work.join("d/target.jsonl").exists());
+        assert!(!env.work.join("d/x.jsonl").exists());
+        assert!(!env.work.join("../escaped.jsonl").exists());
+    }
+
+    /// REQ-33・REQ-21: 計算失敗（不正な入力行）は stdout に `ErrorReport` だけを出し、OUT を作らない。
+    pub fn infer_out_failure_leaves_no_file() {
+        let env = packaged("outfail");
         std::fs::write(
             env.work.join("in.jsonl"),
-            "{\"id\":\"a\",\"input\":\"x\"}\n",
+            "{\"id\":\"a\",\"input\":\"x\"}\nnot json\n",
         )
         .expect("in");
-        assert_eq!(
-            env.fails(
-                &[
-                    "infer",
-                    "--package",
-                    "proj/package",
-                    "--input-file",
-                    "in.jsonl",
-                    "--out",
-                    "out.jsonl"
-                ],
-                70,
-                "runtime_error"
-            ),
-            "{\"code\":\"runtime_error\",\"message\":\"infer --out is not implemented yet\"}\n"
-        );
+        let args = infer_out_args("out.jsonl");
+        env.fails(&args, 64, "invalid_input");
+        assert!(!env.work.join("out.jsonl").exists());
     }
 
     /// REQ-27: `select` は保存済みの学習リクエストの validation が分割記録の validation 全体と
@@ -3271,8 +3337,16 @@ fn main() -> std::process::ExitCode {
             suite::select_reports_invalid_vocab_with_dedicated_message,
         ),
         (
-            "infer_out_option_is_not_faked",
-            suite::infer_out_option_is_not_faked,
+            "infer_out_writes_same_bytes_and_summary",
+            suite::infer_out_writes_same_bytes_and_summary,
+        ),
+        (
+            "infer_out_rejects_unsafe_targets",
+            suite::infer_out_rejects_unsafe_targets,
+        ),
+        (
+            "infer_out_failure_leaves_no_file",
+            suite::infer_out_failure_leaves_no_file,
         ),
     ];
     let mut failed = 0;

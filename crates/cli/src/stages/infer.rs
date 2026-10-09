@@ -14,7 +14,10 @@
 //!
 //! 推論関数へ渡すのは `input` のみ（REQ-27）。`--text` は 1 件・`--input-file` は 1 行 1 JSON
 //! （[`crate::infer_batch`]。REQ-33 の唯一の例外）。`--text` も上限つき（`INFER_TIME_LIMIT`。runtime の
-//! 協調的な期限＋バッチと共通の見張りで `limit_exceeded`・exit 20。REQ-39）。`--out` は未実装で `runtime_error`。
+//! 協調的な期限＋バッチと共通の見張りで `limit_exceeded`・exit 20。REQ-39）。
+//! `--out` は結果行をファイルへ書き stdout に要約 JSON（[`InferBatchReport`]）を出す（#459。
+//! 契約は 2026-10-09 オーナー承認）。OUT は推論の計算前に cwd 配下の既存の親・非存在の名前で
+//! あることを確認し（違反は `invalid_input`）、計算成功が確定してから `O_EXCL` で作る。上書きはしない。
 //!
 //! # 未検証の項目（「検証済み」ではない）
 //!
@@ -22,6 +25,8 @@
 //! 行う sha256 照合は、パッケージ自身が記す値との一致だけを確認する。`kind_version` は
 //! 許可リスト（[`ALLOWED_KIND_VERSIONS`]）で検証し、未許可の版は `invalid_input` で拒否する（REQ-39）。
 
+use std::ffi::OsString;
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +35,9 @@ use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
-use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::hash::{Sha256Digest, Sha256Stream};
+use fandhe_edge_core::stage_report::InferBatchReport;
+use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::{PathRejection, open_confined};
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
 use fandhe_edge_runtime::pipeline::InferencePipeline;
@@ -39,9 +46,12 @@ use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
-use crate::infer_batch::{emit_infer_batch, emit_infer_single};
+use crate::infer_batch::{emit_infer_batch, emit_infer_batch_split, emit_infer_single};
 use crate::infer_guard::check_infer_path_and_format;
-use crate::project::{DEFINITION_FILE, fs_report, invalid, parse_definition, runtime};
+use crate::output::write_stage_line;
+use crate::project::{
+    DEFINITION_FILE, fs_report, invalid, parse_definition, runtime, write_rejection,
+};
 
 /// パッケージ内のメタデータのファイル名。
 const ARTIFACT_META_FILE: &str = "artifact.json";
@@ -76,6 +86,17 @@ struct Prepared {
 /// # Errors
 /// `out` への書き込み失敗（呼び出し側は exit 70 に写し、追加の出力をしない）。
 pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<ExitCode> {
+    // OUT の検査は推論の計算（パッケージの読み込みを含む）より前に行う（#459）。
+    let target = match &args.source {
+        InferSource::InputFile {
+            out: Some(out_path),
+            ..
+        } => match OutTarget::preflight(cwd, out_path) {
+            Ok(target) => Some(target),
+            Err(report) => return emit_error_report(out, &report),
+        },
+        _ => None,
+    };
     let prepared = match prepare(cwd, args) {
         Ok(p) => p,
         Err(report) => return emit_error_report(out, &report),
@@ -95,22 +116,153 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
             path,
             out: out_path,
         } => {
-            if out_path.is_some() {
-                // TODO(後続): `--out` への書き出し。未実装のため実装済みを装わず拒否する。
-                return emit_error_report(out, &runtime("infer --out is not implemented yet"));
-            }
             let file = match open_confined(cwd, path) {
                 Ok((file, _)) => file,
                 Err(rejection) => return emit_error_report(out, &rejection.to_error_report()),
             };
-            emit_infer_batch(
+            let io_schema = prepared.definition.io().clone();
+            let pipeline = Arc::new(prepared.pipeline);
+            let Some(target) = target.filter(|_| out_path.is_some()) else {
+                return emit_infer_batch(
+                    out,
+                    file,
+                    &io_schema,
+                    prepared.definition.options(),
+                    pipeline,
+                );
+            };
+            let mut sink = LazyOut::new(&target);
+            match emit_infer_batch_split(
                 out,
+                &mut sink,
                 file,
-                &prepared.definition.io().clone(),
+                &io_schema,
                 prepared.definition.options(),
-                Arc::new(prepared.pipeline),
-            )
+                pipeline,
+            ) {
+                Ok(ExitCode::Ok) => {
+                    let report = InferBatchReport::new(sink.lines, sink.hash.finish());
+                    write_stage_line(out, report.to_json_line())
+                }
+                // 失敗は `ErrorReport` が stdout に出済みで、OUT は作られていない。
+                Ok(code) => Ok(code),
+                Err(_) => {
+                    let report = sink.abort();
+                    emit_error_report(out, &report)
+                }
+            }
         }
+    }
+}
+
+/// 事前検査済みの OUT（保持した親ディレクトリ fd と末尾の名前。REQ-39・#459）。
+struct OutTarget {
+    parent: ConfinedPackage,
+    leaf: OsString,
+}
+
+impl OutTarget {
+    /// OUT が cwd 配下の既存の親の下の、まだ無い通常の名前であることを確認する。
+    ///
+    /// # Errors
+    /// 絶対パス・`..` 終わり・親の経路拒否（cwd 外・symlink・親なし）・既存（symlink を含む）は
+    /// `invalid_input`。
+    fn preflight(cwd: &Path, out_path: &Path) -> Result<Self, ErrorReport> {
+        let leaf = out_path
+            .file_name()
+            .filter(|_| !out_path.is_absolute())
+            .ok_or_else(|| invalid("output path is invalid"))?;
+        let parent = out_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        // 閉じ込めは cwd 内を指す symlink を通すため、親の各成分が symlink でないことも確認する。
+        let mut walked = cwd.to_path_buf();
+        for component in parent.components() {
+            walked.push(component);
+            if std::fs::symlink_metadata(&walked).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(invalid("output path is invalid"));
+            }
+        }
+        let parent = confine_package(cwd, parent).map_err(|e| e.to_error_report())?;
+        match parent.open_member(Path::new(leaf)) {
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(invalid("output file already exists")),
+        }
+        Ok(Self {
+            parent,
+            leaf: leaf.to_os_string(),
+        })
+    }
+}
+
+/// 最初の書き込みで OUT を `O_EXCL` 作成する出力先。書いたバイト列から行数と sha256 を数える
+/// （要約と書いた内容が必ず一致する）。結果行の書き込みは計算成功の確定後にだけ始まるため、
+/// 失敗時は作られない（REQ-33・#459）。
+struct LazyOut<'a> {
+    target: &'a OutTarget,
+    file: Option<File>,
+    hash: Sha256Stream,
+    lines: usize,
+    create_error: Option<ErrorReport>,
+}
+
+impl<'a> LazyOut<'a> {
+    fn new(target: &'a OutTarget) -> Self {
+        Self {
+            target,
+            file: None,
+            hash: Sha256Stream::new(),
+            lines: 0,
+            create_error: None,
+        }
+    }
+
+    /// 書き込み失敗後の後始末。作りかけを消し（best effort）、返す報告を決める。
+    fn abort(&mut self) -> ErrorReport {
+        if self.file.take().is_some() {
+            let _ = self
+                .target
+                .parent
+                .remove_file_member(Path::new(&self.target.leaf));
+        }
+        self.create_error
+            .take()
+            .unwrap_or_else(|| runtime("cannot write output file"))
+    }
+}
+
+impl Write for LazyOut<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.file.is_none() {
+            // 存在確認と作成の間の競合は `O_EXCL` が拒否し、既存ファイルとして 64 にする。
+            let file = self
+                .target
+                .parent
+                .create_new_member(Path::new(&self.target.leaf))
+                .map_err(|e| {
+                    self.create_error = Some(write_rejection(
+                        &e,
+                        "output file already exists",
+                        "cannot write output file",
+                    ));
+                    io::Error::other("cannot create output file")
+                })?;
+            self.file = Some(file);
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(io::Error::other("output file is not open"));
+        };
+        let n = file.write(buf)?;
+        let written = buf.get(..n).unwrap_or_default();
+        self.hash.update(written);
+        self.lines += written.iter().filter(|b| **b == b'\n').count();
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), Write::flush)
     }
 }
 

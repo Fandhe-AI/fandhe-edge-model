@@ -83,6 +83,30 @@ impl Sha256Digest {
     }
 }
 
+/// 書いたバイト列を逐次ハッシュする sha256 計算器（REQ-33。`infer --out` が、ファイルへ書いた
+/// バイト列と要約の sha256 を必ず一致させるために使う）。
+#[derive(Default)]
+pub struct Sha256Stream(Sha256);
+
+impl Sha256Stream {
+    /// 空の計算器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// バイト列を追加する。
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// ダイジェストを確定する。
+    #[must_use]
+    pub fn finish(self) -> Sha256Digest {
+        Sha256Digest(self.0.finalize().into())
+    }
+}
+
 /// バイト列を小文字 16 進文字列に変換する（[`Sha256Digest::to_hex`]・
 /// [`crate::canonical::DefinitionHash::to_hex`] の共通実装）。
 ///
@@ -283,6 +307,15 @@ pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-33: 分割して追加しても一括計算と同じ（`infer --out` の要約 sha256）。
+    #[test]
+    fn req33_stream_matches_of_bytes() {
+        let mut stream = Sha256Stream::new();
+        stream.update(b"a");
+        stream.update(b"bc");
+        assert_eq!(stream.finish(), Sha256Digest::of_bytes(b"abc"));
+    }
 
     /// 既知ベクタ（NIST 標準の sha256 空文字列・`"abc"`）。証拠の種別: 一次資料。
     #[test]
