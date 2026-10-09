@@ -16,11 +16,13 @@
 //! 開始時（記録の書き込み前）に評価データの凍結ハッシュを確認し、不一致・凍結記録の欠落は
 //! `invalid_input` で停止する（[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
 //!
-//! # 未接続
+//! # 有意性判定（REQ-18・REQ-25・TASK-18.3・#481）
 //!
-//! McNemar・Holm による選定結果の有意性判定（[`fandhe_edge_train::selection_significance`]）は
-//! 本工程に**未接続**で、記録にも含めない（合否には使わない。REQ-25）。最終 test は使わない
-//! （REQ-27。validation のみで選ぶ）。
+//! 定義に `baseline_comparison` があるときだけ、選定候補が下限基準（train 分割の majority）を
+//! validation で有意に上回るかを McNemar・Holm（族サイズ = 既定候補の総数。脱落候補を含む）で求め、
+//! stdout の `significance` と選定記録へ残す（[`super::baseline::selection_significance`]）。比べる候補は
+//! 選定対象（学習済み・`Ok`・容量除外なし）だけ。判定は記録・報告のみで、選定・終了コードには使わない。
+//! 最終 test・評価データは使わない（REQ-27。validation のみ）。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -36,8 +38,10 @@ use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::vocab_exclusion::{VOCAB_GUIDELINE_BYTES, screen_vocab_candidates};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
+use fandhe_edge_train::selection_significance::CandidateValidation;
 use fandhe_edge_train::stage_files::{
     ExcludedCandidate, SelectionExclusions, SelectionRecord, validation_accuracy,
+    validation_outcomes,
 };
 
 use crate::args::SelectArgs;
@@ -94,6 +98,7 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
     Ok(SelectReport::new(
         record.candidate_index,
         record.candidate_id,
+        record.significance,
     ))
 }
 
@@ -192,6 +197,9 @@ pub fn compute_selection_with_exclusions(
             .ok_or_else(|| runtime("validation record is missing"))?;
         let accuracy = validation_accuracy(&labels, &ids, &gold_labels, predictions)
             .map_err(|_| runtime("cannot score validation predictions"))?;
+        // 有意性判定用の予測（`validation_accuracy` と同じ写像。#481）。
+        let outcomes = validation_outcomes(&ids, predictions)
+            .map_err(|_| runtime("cannot score validation predictions"))?;
         // 整合性の確認（上の validation 入力・予測・正解率）を通した候補にだけ、語彙ファイルの
         // 検証と容量による除外を適用する（改ざん候補を「容量超過で除外」として正常扱いしない。
         // 語彙ファイルは記録ハッシュ・形式も照合する。REQ-30・REQ-39・TASK-30.3・#125。
@@ -202,12 +210,18 @@ pub fn compute_selection_with_exclusions(
             excluded.push(entry);
             continue;
         }
-        evaluated.push((index, candidate.candidate_id.as_str(), accuracy));
+        evaluated.push((
+            index,
+            candidate.candidate_id.as_str(),
+            accuracy,
+            gold_labels,
+            outcomes,
+        ));
     }
 
     let inputs: Vec<EvaluatedCandidate<'_>> = evaluated
         .iter()
-        .map(|(_, id, accuracy)| EvaluatedCandidate {
+        .map(|(_, id, accuracy, _, _)| EvaluatedCandidate {
             candidate_id: id,
             accuracy: *accuracy,
         })
@@ -222,8 +236,41 @@ pub fn compute_selection_with_exclusions(
     else {
         return Ok((None, excluded));
     };
-    let Some((index, _, _)) = evaluated.iter().find(|(_, id, _)| *id == candidate_id) else {
+    let Some((index, _, _, selected_gold, _)) = evaluated
+        .iter()
+        .find(|(_, id, _, _, _)| *id == candidate_id)
+    else {
         return Err(runtime("selected candidate is not evaluated"));
+    };
+    // 有意性判定は定義に `baseline_comparison` があるときだけ（記録のみ。選定には使わない。#481）。
+    let significance = match super::baseline::prepare_baseline(definition, &records, &split)? {
+        None => None,
+        Some(prepared) => {
+            // 各候補の validation は分割記録の validation 全体と照合済みで同じ順のはず。食い違えば
+            // 対応のある比較にならないため止める（fail-closed）。
+            if evaluated.iter().any(|(_, _, _, g, _)| g != selected_gold) {
+                return Err(runtime("validation order differs between candidates"));
+            }
+            let train_labels: Vec<&str> = super::train::train_rows(&records, &split)
+                .map(|r| r.label_id.as_str())
+                .collect();
+            let validations: Vec<CandidateValidation<'_>> = evaluated
+                .iter()
+                .map(|(_, id, _, _, outcomes)| CandidateValidation {
+                    candidate_id: id,
+                    outcomes,
+                })
+                .collect();
+            Some(super::baseline::selection_significance(
+                &prepared,
+                &labels,
+                &train_labels,
+                selected_gold,
+                &validations,
+                &candidate_id,
+                candidate_count,
+            )?)
+        }
     };
     Ok((
         Some(SelectionRecord {
@@ -233,6 +280,7 @@ pub fn compute_selection_with_exclusions(
             validation_correct: accuracy.correct,
             validation_total: accuracy.total,
             excluded_candidates: excluded.clone(),
+            significance,
         }),
         excluded,
     ))

@@ -6,6 +6,9 @@
 //!   確定し、適用後の `finish` 内で [`compare`] を呼んで評価記録へ残す
 //! - `package` 工程が、同じ [`prepare_baseline`] で計算し直した値で、評価記録の比較欄を
 //!   [`record_matches`] で照合する（記録の改変の検出）
+//! - `select` 工程が、同じ [`prepare_baseline`] の結果を [`selection_significance`] へ渡し、選定候補の
+//!   validation での有意性判定（Holm 補正後）を選定記録へ残す（#481。`package` は選定の再計算との
+//!   完全一致で照合する）
 //!
 //! 比較の部品（majority の作成・必要件数・McNemar・判定）は評価器 `fandhe-edge-eval` にあり、
 //! 本ファイルは定義・分割・記録との接続だけを持つ（評価ロジックを再実装しない。REQ-24）。
@@ -22,17 +25,23 @@
 //! 準備の失敗はすべて `invalid_input`（64）で、message は固定語彙（データの本文・ラベルを含めない）。
 
 use fandhe_edge_core::definition::{BaselineComparisonAssumption, Definition};
-use fandhe_edge_core::evaluation_record::{BaselineComparisonRecord, BaselineComparisonVerdict};
+use fandhe_edge_core::evaluation_record::{
+    BaselineComparisonRecord, BaselineComparisonVerdict, SelectionSignificanceRecord,
+};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::baseline::fit_majority;
+use fandhe_edge_eval::holm::FamilySize;
 use fandhe_edge_eval::mcnemar::mcnemar_exact_two_sided;
 use fandhe_edge_eval::metrics::Outcome;
 use fandhe_edge_eval::sample_size::{McNemarSampleSizeAssumption, required_sample_size_mcnemar};
 use fandhe_edge_eval::significance::{
     BaselineVerdict, PairedRecord, RequiredSampleSize, SIGNIFICANCE_ALPHA, compare_with_baseline,
     judge,
+};
+use fandhe_edge_train::selection_significance::{
+    CandidateValidation, SelectionSignificanceInput, assess_selection_significance,
 };
 
 use crate::project::{invalid, runtime};
@@ -168,6 +177,50 @@ pub(crate) fn compare(
         verdict: map_verdict(comparison.verdict())?,
     };
     Ok((record, comparison.candidate_correct()))
+}
+
+/// 選定候補の validation 予測と下限基準を McNemar で比べ、既定候補の総数 `family_size` で Holm 補正した
+/// 判定を選定記録の欄として返す（`select` 用。REQ-18・REQ-25・TASK-18.3・#481）。
+///
+/// 計算は学習ワーカー層の [`assess_selection_significance`] に任せる（再実装しない）。`train_labels` は
+/// train 分割のラベル（[`prepare_baseline`] と同じ行）、`validation_gold` と各候補の `outcomes` は同じ順の
+/// validation 分割だけ（凍結した最終 test・評価データは渡さない。REQ-27）。`majority_label`・`required_n` は
+/// `prepared` の値（同じ train ラベルに同じ `fit_majority` を適用した結果）。
+///
+/// # Errors
+/// 族サイズが 0・評価器が比較できない場合は `runtime_error`。
+pub(crate) fn selection_significance(
+    prepared: &PreparedBaseline,
+    labels: &[&str],
+    train_labels: &[&str],
+    validation_gold: &[&str],
+    candidates: &[CandidateValidation<'_>],
+    selected_candidate_id: &str,
+    family_size: usize,
+) -> Result<SelectionSignificanceRecord, ErrorReport> {
+    let family = FamilySize::new(family_size)
+        .ok_or_else(|| runtime("cannot compute selection significance"))?;
+    let result = assess_selection_significance(&SelectionSignificanceInput {
+        label_order: labels,
+        train_labels,
+        validation_gold,
+        candidates,
+        selected_candidate_id,
+        required: prepared.required,
+        family_size: family,
+    })
+    .map_err(|_| runtime("cannot compute selection significance"))?;
+    let comparison = result.comparison();
+    let counts = result.counts();
+    Ok(SelectionSignificanceRecord {
+        majority_label: prepared.majority_label.clone(),
+        baseline_correct: comparison.baseline_correct(),
+        b: counts.b_candidate_only,
+        c: counts.c_baseline_only,
+        required_n: comparison.required().get(),
+        family_size: result.family_size().get(),
+        verdict: map_verdict(result.verdict())?,
+    })
 }
 
 /// 評価記録の比較欄が、計算し直した majority・必要件数・判定と矛盾しないかを確かめる（`package` 用）。
