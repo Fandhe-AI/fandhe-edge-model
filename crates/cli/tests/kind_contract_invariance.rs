@@ -253,8 +253,7 @@ fn req19_unsupported_kind_uses_same_error_shape() {
 
 /// 種類ごとに異なるトークン列を作る前処理のスタブ。
 ///
-/// 本物の種類別 ONNX 推論経路は未実装（`crates/runtime` は前処理・ONNX 推論が
-/// 未着手）のため、本テストは「種類が違えば前処理と backend の経路の中身が違う」
+/// 本物の種類別 ONNX 推論経路（#113）はこのテストの対象外のため、本テストは「種類が違えば前処理と backend の経路の中身が違う」
 /// 状況をスタブで作り、その差が CLI の出力契約へ漏れないことだけを確認する。
 struct KindPreprocessor {
     kind: &'static str,
@@ -321,7 +320,7 @@ const DEFINITION_JSON: &str = r#"{
 }"#;
 
 /// REQ-19・REQ-21・REQ-33・TASK-19.4: 種類ごとに前処理・backend の経路が異なり
-/// （スタブ。本物の種類別 ONNX 推論は未実装）スコアも違っても、`infer` の
+/// （スタブ。本物の種類別 ONNX 推論〔#113〕は使わない）スコアも違っても、`infer` の
 /// stdout は同じ骨格（キー順 `id`→`status`→`predicted_label`→`scores`、`scores` は
 /// 選択肢の宣言順）の 1 行で、exit 0、種類名を含まないこと。
 #[test]

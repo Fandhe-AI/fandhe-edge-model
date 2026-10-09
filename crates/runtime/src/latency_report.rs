@@ -4,7 +4,7 @@
 //!
 //! [`crate::latency::measure_latency`]（#127）が返す [`LatencySamples`] から p95 を算出し、
 //! 既定の目安 250ms を**参考値**として明記したレポート [`LatencyReport`] を作る。
-//! 呼び出し元（想定）: CLI の `package` / bench 工程（TASK-33.x）。合否とは分離する。
+//! 呼び出し元: CLI の `package` 工程（`stages::package`。#338・#340）。合否とは分離する。
 //!
 //! # p95 の定義
 //!
@@ -23,8 +23,8 @@
 //!
 //! 250ms は目安であり合否条件ではない（TASK-31.1）。本モジュールは上限照合を呼ばず、
 //! 合否フィールド・終了コードを持たない。利用者設定の上限との照合と `limit_exceeded` への
-//! 結線は [`crate::latency_limit::check_latency_limit`]（TASK-31.2・#129）、上限ちょうどの境界判定は #130。JSON 直列化・CLI 配線は
-//! TASK-33.x（serde 系の配置はオーナー承認事項）。実機（静かな Mac）での実計測は人間の作業で、
+//! 結線は [`crate::latency_limit::check_latency_limit`]（TASK-31.2・#129）、上限ちょうどの境界判定は #130。JSON 直列化は CLI 側
+//! （`stage_output` の `infer_p95`。#340）、配線は `stages::package` で済み（#338）。実機（静かな Mac）での実計測は人間の作業で、
 //! 本モジュールのテストの証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ。
 
 use crate::latency::LatencySamples;

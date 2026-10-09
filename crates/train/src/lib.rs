@@ -92,8 +92,8 @@
 //!   将来のガード層（TASK-39.x）が担う）。子プロセス起動後の `artifact_dir`
 //!   の閉じ込め検証は [`result::TrainOutcome::from_worker_stdout`]（#177）が
 //!   引き続き担う
-//! - CLI `train`／`select` 工程への配線・`trainer_dir` の発見（CLI 引数・
-//!   設定からの解決。TASK-33.x）
+//! - `trainer_dir` の CLI 引数・設定からの解決（現行は環境変数の暫定。TASK-33.x）。
+//!   CLI の `train`・`select` 工程への接続は `stages` で済み（#136）
 //! - Rust 側での RSS 監視（学習ワーカー自身の `supervisor.py` が担う）。
 //!   外側の壁時計締め切り超過時、[`process::run_train`] は直接の子
 //!   （supervisor）だけを `Child::kill()` で終了させる。`_worker` を含む
@@ -107,8 +107,8 @@
 //!   `kill(2)` の直接呼び出し〔`libc`／`unsafe`〕は依存追加・`unsafe`
 //!   新規導入のいずれもユーザー承認事項のため対象外）
 //! - McNemar・Holm による有意性判定の選定記録への統合（TASK-18.3-1・issue #87）
-//! - 探索記録のファイルへの永続化・CLI `select` 工程の JSON 出力・終了コード
-//!   への写像（TASK-33.x）
+//! - 探索記録のファイルへの永続化・CLI `select` 工程の JSON 出力は `stages::select`・
+//!   `stage_files` で接続済み（#136）。終了コードへの写像は CLI の `error_report` が担う
 
 pub mod error;
 pub mod job;

@@ -3,11 +3,10 @@
 //!
 //! # 呼び出し文脈
 //!
-//! 呼び出し元は CLI の `infer` サブコマンド（TASK-33.1。現状は未配線。
-//! `main.rs` は引数解析までで、解析成功後は工程を実行せず未実装の
-//! `ErrorReport` を書いて exit 70 を返す）。配線後
-//! は `std::io::stdout().lock()` を渡し、戻り値の [`ExitCode`] を
-//! `main` の戻り値としてそのまま使う想定。`--input-file` 経由の一括推論
+//! 呼び出し元は CLI の `infer` 工程（[`crate::stages::infer`]・TASK-33.1-2・#136）。
+//! `main.rs` は引数解析に成功すると [`crate::stages::run`] へ渡し、
+//! 戻り値の [`ExitCode`] を `main` の戻り値としてそのまま使う。
+//! `--input-file` 経由の一括推論
 //! （evaluation-contract.md が認める「1 行 1 JSON」の例外）は
 //! `infer_batch::emit_infer_batch` が入力 1 件ごとに本関数を 1 回呼ぶ形で同じ契約を再利用する。
 //!
@@ -43,8 +42,9 @@
 //! # 容量内訳（TASK-30.1-2・#123）
 //!
 //! [`package_capacity_json`]・[`write_package_capacity`] は容量計測（`fandhe-edge-runtime`）の
-//! 内訳を `package` 工程（TASK-33.1。未配線）の JSON へ出す部品。`status`・`judgment` は
-//! TASK-33.x・TASK-30.2 の責務で、ここでは出さない。
+//! 内訳を JSON へ出す単独の部品。`package` 工程の stdout の `capacity` は
+//! `stage_output` が組み立てる（#340）ため、本関数は工程からは呼ばれない（テストと
+//! examples のみ）。`status`・`judgment` は TASK-33.x・TASK-30.2 の責務で、ここでは出さない。
 //!
 //! # 除外記録（TASK-32.2・#114）
 //!
@@ -83,7 +83,7 @@ use std::io::{self, Write};
 /// 「不完全な JSON の後ろに別の JSON が連結される」事態を本関数の中では
 /// 起こさない。
 ///
-/// 呼び出し側（CLI の `infer` 一括推論。TASK-33.1。現状は未配線）は、本
+/// 呼び出し側（CLI の `infer` 一括推論〔`infer_batch`。#141〕）は、本
 /// 関数が `Err` を返した時点で **その入力ファイルに対する後続の呼び出し
 /// を打ち切り**、以降の入力に対して本関数を呼ばないこと。打ち切らずに
 /// 次の入力へ処理を進めると、直前の不完全な行の直後に次の JSON 行が書か

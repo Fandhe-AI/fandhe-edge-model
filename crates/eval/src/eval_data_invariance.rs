@@ -1,7 +1,7 @@
 //! 評価データ（正解ラベルを含む本体）の評価前後ハッシュ比較・凍結記録との接続
 //! （REQ-27「評価の独立性」・REQ-17「データの分割と凍結」・TASK-27.1-2・issue #70）。
 //!
-//! CLI の `evaluate` 工程（REQ-33・issue #140 で配線予定）から、データ契約層
+//! CLI の `evaluate` 工程（REQ-33・#314 で接続済み）から、データ契約層
 //! （`fandhe-edge-data`）が凍結した評価データの sha256・バイト長を受け取り、
 //! 実際の評価処理（`eval` クロージャ）を前後のディスク再読み込み＋ハッシュ比較で
 //! 包むために呼ばれる想定。[`invariance`][crate::invariance]（モデルパッケージ側。
@@ -39,7 +39,7 @@
 //! `eval` クロージャが受け取る `&[u8]` は正解ラベルを含む評価データ本体そのもので、
 //! 評価器側の経路（本モジュール）を通る。「推論関数には `input` だけを渡す」
 //! （`.claude/rules/evaluation-contract.md`「評価の独立性」・TASK-27.2）は別の話で、
-//! 推論関数へ渡す情報を絞るのは TASK-27.2（未実装）の責務であり、本モジュールは
+//! 推論関数へ渡す情報を絞るのは TASK-27.2（[`crate::input_only`]）の責務であり、本モジュールは
 //! 評価データ本体の完全性（改変されていないこと）だけを保証する。
 //!
 //! # 資源上限
@@ -59,7 +59,7 @@
 //!   台帳連携（TASK-17.3・issue #49）は本モジュールの対象外
 //! - 終了コード（[`fandhe_edge_core::exitcode::ExitCode`]）への写像は行わない
 //!   （`fandhe_edge_data::eval_freeze::FreezeError` の doc と同様、TASK-33.3 に委ねる）
-//! - CLI `evaluate` 工程への配線（issue #140）は未実装
+//! - CLI `evaluate` 工程へは #314 で接続済み（`stages::evaluate` が [`FrozenEvalData`] を組み立てる）
 
 use fandhe_edge_core::fs::{self, FsError};
 use fandhe_edge_core::hash::Sha256Digest;
@@ -255,7 +255,7 @@ fn evaluate_with_eval_data_invariance_limited<T, E>(
 /// 評価経路そのものを評価データの評価前後ハッシュ比較で包む（REQ-27「評価の
 /// 独立性」・REQ-17「データの分割と凍結」・TASK-27.1-2・issue #70）。
 ///
-/// CLI の `evaluate` 工程（将来。issue #140 で配線予定）が、データ契約層の
+/// CLI の `evaluate` 工程（`stages::evaluate`。#314 で接続済み）が、データ契約層の
 /// `fandhe_edge_data::eval_freeze::evaluate_gate` を通して得た
 /// `FreezeRecord`（`Proceed` の場合のみ）から [`FrozenEvalData`] を組み立て、
 /// 実際の評価処理を `eval` クロージャとして渡す想定。処理順はモジュール doc

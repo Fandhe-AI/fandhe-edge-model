@@ -2,11 +2,10 @@
 //! （[`crate::provenance::ingest::parse_provenance_json`]）の接続点
 //! （REQ-40・TASK-40.1-2・issue #75）。
 //!
-//! 呼び出し文脈: 将来は CLI の `inspect` 工程（TASK-33.x・パス未確定）
+//! 呼び出し文脈: 将来は CLI の `inspect` 工程（`stages::inspect`）
 //! から、ガード層を通過済みの JSONL 本文と（任意の）来歴 JSON 文字列を
-//! 受け取って呼ばれる想定。`crates/cli` は本 crate に未依存（TASK-33.1
-//! 未着手）のため、本モジュールは接続点となるライブラリ関数を提供する
-//! に留まる。
+//! 受け取って呼ばれる想定。現行の `stages::inspect` からは未接続（来歴の取り込みの配線は未着手）
+//! のため、本モジュールは接続点となるライブラリ関数を提供するに留まる。
 //!
 //! [`crate::inspect::InspectOutcome`]・[`crate::inspect::inspect_records`]
 //! のシグネチャ・構造は変更しない（既存テスト

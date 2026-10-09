@@ -9,7 +9,7 @@
 //!
 //! # 呼び出し文脈
 //!
-//! CLI の `evaluate` 工程（issue #140 で配線予定・未配線）が、データ契約層の
+//! CLI の `evaluate` 工程（`stages::evaluate`。#314）が、データ契約層の
 //! 凍結記録から組み立てた [`FrozenEvalData`] を渡して [`apply_once`] を呼ぶ想定。
 //!
 //! # 唯一の公開経路（ロック・凍結記録・実モデルの結び付け）
@@ -94,7 +94,7 @@
 //!
 //! # 範囲外（実装済みを装わない）
 //!
-//! - CLI `evaluate` への配線（issue #140）・終了コードへの写像（TASK-33.3）は未実装。
+//! - CLI `evaluate` への配線は #314 で済み。終了コードへの写像は cli の `error_report`（`apply_once_error_report`）が担う。
 //! - 事前登録集合の内容（どの候補・seed を登録するか）の決定は呼び出し側（選定工程）の
 //!   責務。本モジュールは登録の凍結と照合のみを行う。
 //! - 台帳ディレクトリの配置・ルート配下への閉じ込めはガード層（REQ-39）と呼び出し側の
@@ -1135,7 +1135,7 @@ pub struct DecodeFailed;
 
 /// 評価データ 1 件を評価器側で `input` と正解に分けた所有値（REQ-27）。
 ///
-/// 分解は呼び出し側の `decode`（CLI の `evaluate` 配線。issue #140）が行い、
+/// 分解は呼び出し側の `decode`（CLI の `stages::evaluate` の `decode_evaluation`。#314）が行い、
 /// `gold` は評価器側にのみ残して予測関数へは渡さない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabeledInput {

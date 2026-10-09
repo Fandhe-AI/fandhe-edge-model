@@ -392,7 +392,7 @@ impl TrainResultError {
 /// 学習ワーカーの子プロセス起動・監視・終了コード写像（REQ-21・REQ-34・
 /// REQ-39・#178）で発生するエラー。[`crate::process::run_train`] が返す。
 ///
-/// 呼び出し元・呼び出し先の文脈: Rust 側 CLI／ジョブ管理（未配線。TASK-33.x）
+/// 呼び出し元・呼び出し先の文脈: CLI の `train` 工程（`stages::train`。#136）
 /// が学習ワーカー（`trainer/launch.py`）を子プロセスとして起動する経路の
 /// エラーを表す。外部入力（子プロセスの終了コード・標準出力・OS のエラー）
 /// の経路のため `panic`・`unwrap` はせず、すべて `Result` で返す

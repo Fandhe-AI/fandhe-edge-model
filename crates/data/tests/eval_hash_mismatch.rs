@@ -7,7 +7,7 @@
 //! （`.claude/rules/evaluation-contract.md`「データの分割と凍結」の fail-closed）。
 //! ゴールデン sha256 は `printf '%s' '<bytes>' | sha256sum` で独立に計算した値。
 //! 評価工程は [`simulated_evaluate_step`] で模擬する（実際の評価器は
-//! `fandhe-edge-eval`、CLI への配線は TASK-33.3・issue #140）。
+//! `fandhe-edge-eval`。CLI の `evaluate` 工程への接続は #314 で済み、本テストは模擬のまま）。
 
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_data::eval_freeze::{

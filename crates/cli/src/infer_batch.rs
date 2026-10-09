@@ -4,7 +4,7 @@
 //! # 呼び出し文脈
 //!
 //! CLI の `infer` 工程が `--input-file` の入力を開き、[`emit_infer_batch`] へ `Read` として
-//! 渡す想定（`main.rs` への配線は TASK-33.1-2・#136。入力ファイルを開く際の経路の閉じ込めも
+//! 渡す（`stages::infer` から配線済み。#136・#141。入力ファイルを開く際の経路の閉じ込めも
 //! guard 層の責務で、ここではパスを扱わない）。推論は `fandhe-edge-runtime` の
 //! `InferencePipeline::infer_batch` に委ね、単体推論と同じ 1 系列の経路を通す（REQ-28）。
 //! 推論関数へ渡すのは各レコードの `input` だけで、`id` は出力の組み立てにのみ使う

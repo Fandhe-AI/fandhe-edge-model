@@ -322,8 +322,8 @@ pub trait CandidateRunner {
 /// `code == "limit_exceeded"` は学習ワーカー側で時間以外の資源上限
 /// （RSS・ステップ数・トークン数・モデルサイズ・`RLIMIT_CPU` 等）にも
 /// 使われる共通コードであり、本モジュールはワーカーから打ち切り原因を
-/// 型付きで受け取っていない（実行器 [`CandidateRunner`] は #178 が実装する
-/// スタブで、原因の受け渡しは未実装）。そのため `code == "limit_exceeded"`
+/// 型付きで受け取っていない（実行器は [`crate::process::WorkerCandidateRunner`]〔#178〕。
+/// 打ち切り原因の型付きの受け渡しは本モジュールでは行わない）。そのため `code == "limit_exceeded"`
 /// の打ち切りは [`LimitExceeded`](CandidateTimeStatus::LimitExceeded) 1 種
 /// にまとめ、単調時計で測った経過時間が持ち時間以上だったかを観測値として
 /// 添えるに留め、原因を断定しない（P1 指摘。#178 が原因を型付きで供給する
