@@ -178,7 +178,7 @@ make doctor      # 環境診断のみ（何も導入しない）
 | 有意性判定 | 下限基準（majority）との比較が McNemar 検定（p < 0.05）か。複数候補の比較で Holm 補正を行っているか。件数不足を「判定不能」として返し、合格扱いにしていないか（REQ-25） | P0 |
 | 指標の扱い | 分母が 0 の指標を `null` とし平均から除外しているか（0 や 1 で埋めていないか）。型の正しさと意味の正しさを別々に数えているか（REQ-24） | P1 |
 | 推論の一致 | 1 件ずつの推論とバッチ推論の結果が全件一致することを機械照合するテストがあるか（REQ-28） | P0 |
-| 入出力契約 | 終了コードが 7 種（`ok`=0・`judged_fail`=10・`out_of_scope`=11・`pending`=12・`limit_exceeded`=20・`invalid_input`=64・`runtime_error`=70）から外れていないか。CLI の出力が 1 呼び出し 1 JSON（例外は `infer --input-file` の 1 行 1 JSON のみ）か。エラーが機械可読な `code` / `message` の JSON か（REQ-21・REQ-33） | P1 |
+| 入出力契約 | 終了コードが 7 種（`ok`=0・`judged_fail`=10・`out_of_scope`=11・`pending`=12・`limit_exceeded`=20・`invalid_input`=64・`runtime_error`=70）から外れていないか。CLI の出力が 1 呼び出し 1 JSON（例外は `infer --input-file` の 1 行 1 JSON のみ。`--out` 付きは結果行をファイルへ書き、stdout は `{"step":"infer","status":"ok","count","sha256"}` の要約 1 つ。OUT が既存・cwd 外・`..`・絶対パス・親なし・symlink は計算前に `invalid_input`〔64〕、書き込み失敗は `runtime_error`〔70〕。上書きしない。#459）か。エラーが機械可読な `code` / `message` の JSON か（REQ-21・REQ-33） | P1 |
 | 契約の破壊的変更 | JSON 出力・終了コード・引数・配布パッケージ形式を変える差分が、`!` と `BREAKING CHANGE:` 付きのコミットで、PR 本文にユーザー承認の記録があるか | P1 |
 | 決定性 | 乱数の seed を引数で受け取り、グローバルな乱数状態に依存していないか。浮動小数を `==` で比較せず許容差（1e-9）を明示しているか。GPU 学習の非決定性をテストの許容幅拡大で吸収していないか | P1 |
 | 証拠の種別 | 測定値・判定を記録する箇所（ドキュメント・PR 本文・テスト名）に証拠の種別（テストハーネス / 模擬 / 推定 / 実機）が明記されているか | P1 |

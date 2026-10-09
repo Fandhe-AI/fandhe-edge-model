@@ -26,12 +26,14 @@
 //!   （選択肢 ID の合計長 × 件数）が入力に比例して膨らまない。保持するのは
 //!   `Prediction`（スコア総数に runtime 側の上限あり）と検証済みレコードのみ
 //! - 空行・空白のみの行は読み飛ばす。有効レコードが 0 件なら `invalid_input`（成功を装わない）
+//! - `--out`（#459。オーナー承認 2026-10-09）: 成功時だけ結果行（上と同一バイト列）を OUT へ書き、
+//!   stdout は要約 JSON 1 つ。失敗は `ErrorReport` を stdout へ出し OUT を作らない。結果行と
+//!   `ErrorReport` の書き分けは [`emit_infer_batch_split`]、OUT の閉じ込め・遅延作成は
+//!   `stages::infer` が担う
 //!
 //! # 実装しないもの（入出力契約の変更・後続作業。REQ-21・REQ-33）
 //!
 //! - PoC-16 の行単位エラー行（`status:"error"`）: `JudgmentStatus` の variant 追加を伴うため未実装
-//! - `--out`（行をファイルへ書き stdout に要約を出す）: 要約スキーマ未確定・書き込み先の
-//!   ガード（REQ-39）が要るため未実装。出力関数は `Write` に汎用化してあり、後続で差し替えられる
 //!
 //! # 資源上限（REQ-39・暫定）
 //!
@@ -107,7 +109,7 @@ pub enum OutputMode {
 ///
 /// 全 variant を網羅 `match` し、コマンドが増えたらコンパイルエラーで気付けるようにする
 /// （REQ-33）。`JsonLines` は `--out` なしの `infer --input-file` のみ。`--out` 付きは
-/// 「行はファイル・stdout は単一 JSON」の想定（実処理は後続）で `SingleDocument` とする。
+/// 「行はファイル・stdout は単一 JSON」で `SingleDocument` とする（#459）。
 #[must_use]
 pub const fn output_mode(command: &Command) -> OutputMode {
     match command {
@@ -478,6 +480,7 @@ where
 {
     emit_infer_batch_inner(
         out,
+        None,
         reader,
         io,
         options,
@@ -487,9 +490,80 @@ where
     )
 }
 
+/// 結果行の出力先（`infer --out`。REQ-33・#459）。
+///
+/// [`BatchResults::finish`] は出力段階のウォッチドッグを解除する前に呼ばれ、公開・要約の出力・
+/// 失敗時の報告まで同じ時間上限の対象にする（REQ-39）。
+pub(crate) trait BatchResults: Write {
+    /// 書き出し（または計算失敗の `ErrorReport` 出力）の結果 `result` を受けて後処理をし、
+    /// 最終的な戻り値を返す。`out` は stdout。
+    fn finish(
+        &mut self,
+        out: &mut dyn Write,
+        result: Result<ExitCode, WriteFailure>,
+    ) -> io::Result<ExitCode>;
+}
+
+/// 書き出し失敗の発生源（REQ-21・REQ-33）。stdout の失敗は部分書き込みの可能性があるため
+/// 追加の出力をせず、結果ファイル側の失敗だけを `ErrorReport` にできるよう型で区別する。
+#[derive(Debug)]
+pub(crate) enum WriteFailure {
+    /// stdout（`out`）への書き込み・flush の失敗。
+    Stdout(io::Error),
+    /// 結果の出力先（`--out` の一時ファイル）への書き込みの失敗。
+    Results(io::Error),
+}
+
+impl WriteFailure {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Stdout(e) | Self::Results(e) => e,
+        }
+    }
+}
+
+/// [`emit_infer_batch`] の結果行（成功時のみ）を `results` へ、`ErrorReport` を `out` へ
+/// 分けて書く版（`infer --out`。REQ-33・#459）。上限・停止の回収は既定どおり（CLI 専用）。
+///
+/// 失敗時は `results` へ何も書かない（遅延作成の出力先がファイルを作らずに済む）。
+///
+/// # Errors
+/// [`emit_infer_batch_with_limits`] と同じ（`results` への書き込み失敗を含む）。
+pub(crate) fn emit_infer_batch_split<W, R, P, B>(
+    out: &mut W,
+    results: &mut dyn BatchResults,
+    reader: R,
+    io: &IoSchema,
+    options: &[Choice],
+    pipeline: Arc<InferencePipeline<P, B>>,
+) -> io::Result<ExitCode>
+where
+    W: Write,
+    R: Read + Send + 'static,
+    P: Preprocessor + Send + Sync + 'static,
+    B: ScoringBackend + Send + Sync + 'static,
+{
+    emit_infer_batch_inner(
+        out,
+        Some(results),
+        reader,
+        io,
+        options,
+        pipeline,
+        BatchLimits::default(),
+        StallPolicy::TerminateProcess,
+    )
+}
+
 /// [`emit_infer_batch_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
+/// `results` が `Some` なら結果行はそこへ、`ErrorReport` は常に `out` へ書く（REQ-33・#459）。
+// 引数が 8 個になるのは、公開 API 3 本（既定・上限指定・分割）が共有する本体で、入力・出力先・
+// 定義・パイプライン・上限・回収方式をそれぞれ独立に差し替えるため。束ねる型を増やすと
+// 公開経路ごとの呼び出しが読みにくくなるので、ここでは許容する。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_infer_batch_inner<W, R, P, B>(
     out: &mut W,
+    mut results: Option<&mut dyn BatchResults>,
     reader: R,
     io: &IoSchema,
     options: &[Choice],
@@ -550,25 +624,52 @@ where
         let watchdog = OutputWatchdog::arm(true, limits.output_duration);
         std::process::exit(finish_abandoned(out, &outcome, watchdog));
     }
+    let has_results = results.is_some();
     // 書き込み（結果行・ErrorReport とも）を対象に、停止を期限でプロセス終了へ倒す。
     // 起動に失敗したら上限なしで書かず、何も書かずに Err（exit 70）で終える。
     let _watchdog = OutputWatchdog::arm(policy.terminates(), limits.output_duration)?;
-    match outcome {
+    let written = match outcome {
         Ok((records, predictions)) => {
             // 計算段階で期限内に全件が済んだ時点で結果は成功として確定している。書き出しと
             // flush の完了後に期限を理由に失敗へ変えない（確定点は 1 つ）。書き出しの停止は
             // ウォッチドッグ（CLI 経路）だけが扱う。
-            for (record, prediction) in records.iter().zip(&predictions) {
-                // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
-                // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
-                let result = judgment_from_prediction(options, record.id(), prediction)
-                    .map_err(|error| io::Error::other(error.message))?;
-                write_ok_judgment(out, &result)?;
-            }
-            Ok(ExitCode::Ok)
+            let mut sink: &mut dyn Write = match results.as_deref_mut() {
+                Some(results) => results,
+                None => &mut *out,
+            };
+            let to_failure = if has_results {
+                WriteFailure::Results
+            } else {
+                WriteFailure::Stdout
+            };
+            write_results(&mut sink, options, &records, &predictions)
+                .map(|()| ExitCode::Ok)
+                .map_err(to_failure)
         }
-        Err(error) => emit_error_report(out, &error),
+        Err(error) => emit_error_report(out, &error).map_err(WriteFailure::Stdout),
+    };
+    // 公開・要約の出力・失敗時の報告も、ウォッチドッグを解除する前に行う（REQ-39）。
+    match results {
+        Some(results) => results.finish(&mut *out, written),
+        None => written.map_err(WriteFailure::into_io),
     }
+}
+
+/// 検証済みの全件を 1 行ずつ作り直して書く。
+fn write_results(
+    sink: &mut &mut dyn Write,
+    options: &[Choice],
+    records: &[InferInput],
+    predictions: &[Prediction],
+) -> io::Result<()> {
+    for (record, prediction) in records.iter().zip(predictions) {
+        // predict_batch で検証済みのため、ここでの再構築は失敗しない想定。
+        // 万一失敗しても部分出力のまま続けず、書き込み失敗と同じく打ち切る。
+        let result = judgment_from_prediction(options, record.id(), prediction)
+            .map_err(|error| io::Error::other(error.message))?;
+        write_ok_judgment(sink, &result)?;
+    }
+    Ok(())
 }
 
 /// 計算スレッドを切り離した後の終了処理。ErrorReport を書いて flush し、終了コード（常に
@@ -1040,6 +1141,7 @@ mod tests {
         let mut out = SlowWriter(Vec::new());
         let code = emit_infer_batch_inner(
             &mut out,
+            None,
             std::io::Cursor::new(
                 b"{\"id\":\"r1\",\"input\":\"a\"}\n{\"id\":\"r2\",\"input\":\"b\"}\n".to_vec(),
             ),
