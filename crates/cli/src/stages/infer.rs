@@ -9,8 +9,12 @@
 //! 2. 同じ閉じ込め済みパッケージから `artifact.json`（拡張メタ）と `definition.json` を上限付きで
 //!    読み、`onnx_sha256` と保持した ONNX のバイト列の sha256 の一致（パッケージの自己整合性）・
 //!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する
-//! 3. 保持したバイト列から ONNX バックエンドを組み立て、前処理と束ねて推論する
-//!    （推論経路は学習側〔`fandhe-edge-train`・Python〕に依存しない。REQ-32）
+//! 3. `calibration.json`（あれば。`package` が評価記録に校正があるときだけ書く）を同じ閉じ込めと上限
+//!    （`MAX_DEFINITION_FILE_BYTES`）で読み、`onnx_sha256`・`label_order` が保持した ONNX・定義と一致し、
+//!    T・τ が範囲内であることを確認する（[`load_calibration`]。REQ-22・REQ-39・#497）
+//! 4. 保持したバイト列から ONNX バックエンドを組み立て、前処理と束ねて推論する
+//!    （推論経路は学習側〔`fandhe-edge-train`・Python〕に依存しない。REQ-32。保留の判定は評価器
+//!    〔`fandhe-edge-eval`。core にのみ依存〕の 1 行判定関数を通す）
 //!
 //! 推論関数へ渡すのは `input` のみ（REQ-27）。`--text` は 1 件・`--input-file` は 1 行 1 JSON
 //! （[`crate::infer_batch`]。REQ-33 の唯一の例外）。`--text` も上限つき（`INFER_TIME_LIMIT`。runtime の
@@ -36,7 +40,9 @@ use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
 use fandhe_edge_core::hash::{Sha256Digest, Sha256Stream};
+use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
 use fandhe_edge_core::stage_report::InferBatchReport;
+use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::{PathRejection, open_confined};
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
@@ -47,8 +53,8 @@ use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
 use crate::infer_batch::{
-    BatchResults, SingleCall, WriteFailure, emit_infer_batch_scoped, emit_infer_batch_split,
-    emit_infer_single_scoped,
+    BatchResults, InferCalibration, JudgmentScope, SingleCall, WriteFailure,
+    emit_infer_batch_scoped, emit_infer_batch_split, emit_infer_single_scoped,
 };
 use crate::infer_guard::check_infer_path_and_format;
 use crate::output::write_stage_line;
@@ -82,6 +88,8 @@ pub(crate) type Pipeline = InferencePipeline<ByteEncodingPreprocessor, OnnxBacke
 struct Prepared {
     definition: Definition,
     pipeline: Pipeline,
+    /// 定義の対象外ラベルとパッケージの校正（REQ-22・#478・#497）。
+    scope: JudgmentScope,
 }
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
@@ -107,13 +115,14 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
     match &args.source {
         // 単件推論も上限つきで、止まったらバッチと同じ見張りで `limit_exceeded`・exit 20 に終える
         // （runtime の協調的な期限＋CLI のプロセス境界。REQ-39）。
-        // 定義に `out_of_scope_label` があり argmax がそれなら exit 11（REQ-22・#478）。
+        // 定義に `out_of_scope_label` があり argmax がそれなら exit 11（REQ-22・#478）。校正があり
+        // 確信度が τ 未満なら exit 12（REQ-22・#497。11 を優先）。
         InferSource::Text { text, id } => emit_infer_single_scoped(
             out,
             SingleCall {
                 io: &prepared.definition.io().clone(),
                 options: prepared.definition.options(),
-                out_of_scope_label: prepared.definition.out_of_scope_label(),
+                scope: &prepared.scope,
                 id: id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
                 text,
             },
@@ -132,7 +141,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                     file,
                     &io_schema,
                     prepared.definition.options(),
-                    prepared.definition.out_of_scope_label(),
+                    &prepared.scope,
                     pipeline,
                 );
             };
@@ -143,7 +152,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 file,
                 &io_schema,
                 prepared.definition.options(),
-                prepared.definition.out_of_scope_label(),
+                &prepared.scope,
                 pipeline,
             )
         }
@@ -421,11 +430,59 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
         return Err(invalid("package label order does not match definition"));
     }
+    let calibration = load_calibration(&checked.package, onnx, &definition)?;
     let pipeline = build_pipeline(onnx, &meta, definition.options().len())?;
+    let scope = JudgmentScope {
+        out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
+        calibration,
+    };
     Ok(Prepared {
         definition,
         pipeline,
+        scope,
     })
+}
+
+/// パッケージの `calibration.json` を閉じ込めつき・上限つきで読み、保持した ONNX と定義に一致する
+/// 校正だけを返す（無ければ `None`。保留を返さない。REQ-22・REQ-30・REQ-39・#497）。
+///
+/// # Errors
+/// 解析できない・未知キー・T（`TEMPERATURE_MIN..=TEMPERATURE_MAX`）や τ（`0..=1`）が範囲外・非有限は
+/// `invalid_input`（`package calibration is invalid`）。`onnx_sha256`・`label_order` の不一致は
+/// `invalid_input`（`package calibration does not match the model`）。経路の拒否（symlink 等）・
+/// 上限超過は他のメンバーと同じ写像。
+fn load_calibration(
+    package: &ConfinedPackage,
+    onnx: &[u8],
+    definition: &Definition,
+) -> Result<Option<InferCalibration>, ErrorReport> {
+    let (file, path) = match package.open_member(Path::new(PACKAGE_CALIBRATION_FILE)) {
+        Ok(opened) => opened,
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
+    let bytes = read_bounded_open_file(file, path.as_path(), MAX_DEFINITION_FILE_BYTES)
+        .map_err(|e| fs_report(&e))?;
+    let parsed = PackageCalibration::from_json_slice(&bytes)
+        .map_err(|_| invalid("package calibration is invalid"))?;
+    let temperature_ok = (TEMPERATURE_MIN..=TEMPERATURE_MAX).contains(&parsed.temperature);
+    if !temperature_ok || !(0.0..=1.0).contains(&parsed.threshold) {
+        return Err(invalid("package calibration is invalid"));
+    }
+    let option_ids = definition.options().iter().map(|c| c.id.as_str());
+    if parsed.onnx_sha256 != Sha256Digest::of_bytes(onnx).to_hex()
+        || !parsed.label_order.iter().map(String::as_str).eq(option_ids)
+    {
+        return Err(invalid("package calibration does not match the model"));
+    }
+    Ok(Some(InferCalibration {
+        temperature: parsed.temperature,
+        threshold: parsed.threshold,
+    }))
 }
 
 /// `max_bytes` の範囲検査・`kind` の解析・[`load_backend`] を行い、前処理と束ねた推論パイプラインを

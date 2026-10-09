@@ -7,7 +7,10 @@
 //!
 //! 本 crate は推論経路には入らない。CLI の `evaluate` 工程（REQ-33）が、
 //! データ契約層（`fandhe-edge-data`）で検証済みの gold・推論結果を本 crate の
-//! 関数へ渡し、返ってきた指標を JSON へ整形して出力する想定。
+//! 関数へ渡し、返ってきた指標を JSON へ整形して出力する想定。例外は `infer` の保留判定で、
+//! `evaluate` と同じ規則を通すため [`abstention::decide_abstention_with_parameters`]（gold を
+//! 受け取らない 1 行判定）だけを呼ぶ（REQ-22・REQ-28・#497）。本 crate は core にしか依存せず、
+//! 学習側の依存は入らない（REQ-32）。
 //!
 //! - [`metrics`][]: 正解率・ラベル別指標（適合率・再現率・F1）・Macro-F1・
 //!   混同行列の算出（REQ-24 正常系・TASK-24.1-1・issue #59）

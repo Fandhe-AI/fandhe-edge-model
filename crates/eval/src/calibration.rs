@@ -246,6 +246,12 @@ pub enum CalibrationError {
     /// 本モジュール・`abstention` モジュールで再実装せず、評価器の唯一の実装
     /// 〔TASK-24.1〕へ委譲するために包む）。
     Evaluation(EvalError),
+    /// [`crate::abstention::decide_abstention_with_parameters`] に渡された温度・しきい値・対象外ラベルの
+    /// 添字が範囲外（`infer` が配布パッケージから読んだ値の防御。REQ-22・REQ-39・#497）。
+    InvalidParameter {
+        /// 範囲外だった引数名。
+        name: &'static str,
+    },
 }
 
 impl fmt::Display for CalibrationError {
@@ -335,6 +341,9 @@ impl fmt::Display for CalibrationError {
             },
             CalibrationError::Evaluation(err) => {
                 write!(f, "evaluation failed: {err}")
+            }
+            CalibrationError::InvalidParameter { name } => {
+                write!(f, "invalid calibration parameter: {name}")
             }
         }
     }
@@ -448,7 +457,7 @@ impl Calibration {
 }
 
 /// `β = 1/T`（温度からベータへの変換式を 1 箇所に集約する）。
-fn beta_of_temperature(temperature: f64) -> f64 {
+pub(crate) fn beta_of_temperature(temperature: f64) -> f64 {
     1.0 / temperature
 }
 

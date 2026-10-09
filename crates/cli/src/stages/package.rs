@@ -30,6 +30,11 @@
 //!    （`limits.max_package_bytes`）を超えたら `limit_exceeded`。上限が無ければ照合しない
 //!    （既定の強制上限は無い。2026-10-06 オーナー判断）
 //!
+//! 校正（#497・REQ-22・REQ-30）: 選定候補の評価記録に `calibration` があるときだけ、`calibration.json`
+//! （[`PackageCalibration`]。T・τ と、配布する ONNX の sha256・定義の宣言順）を同梱し、容量内訳の
+//! `calibration` 枠に計上する。評価データが無い・`calibration:null` では書かない（`infer` は保留しない）。
+//! `artifact.json` は学習ワーカーの出力のまま書き換えない。
+//!
 //! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
 //! 公開する。途中の失敗・容量または p95 の上限超過ではステージングを片付け、`package/` を作らない
 //! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
@@ -76,6 +81,7 @@ use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
 use fandhe_edge_core::stage_report::{
     InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
 };
@@ -83,6 +89,7 @@ use fandhe_edge_data::eval_freeze::FreezeRecord;
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
+use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
@@ -241,6 +248,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     };
     // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
     let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
+    let calibration = package_calibration(verified_record.as_ref(), &definition, &onnx_bytes)?;
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -276,7 +284,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         onnx_file,
         &meta_bytes,
         &onnx_bytes,
-        &definition_bytes,
+        (&definition_bytes, calibration.as_deref()),
         &meta,
         vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
     ) {
@@ -457,6 +465,36 @@ fn quality_from_acceptance(
     })
 }
 
+/// 照合済みの評価記録に校正があるときだけ、同梱する `calibration.json` のバイト列を作る
+/// （REQ-22・REQ-30・#497）。評価記録が無い・`calibration:null` なら `None`（書かない）。
+///
+/// T・τ は記録の値をそのまま使う（再計算しない。T・τ の改変の検出は外部台帳〔#168〕の範囲）。
+/// `infer` が拒否する範囲外の値（T が `TEMPERATURE_MIN..=TEMPERATURE_MAX` の外・τ が `0..=1` の外）は
+/// 公開前に `evaluation record is invalid`（`invalid_input`）で止め、読めないパッケージを公開しない。
+fn package_calibration(
+    record: Option<&EvaluationRecord>,
+    definition: &Definition,
+    onnx_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, ErrorReport> {
+    let Some(c) = record.and_then(|r| r.calibration) else {
+        return Ok(None);
+    };
+    if !(TEMPERATURE_MIN..=TEMPERATURE_MAX).contains(&c.temperature)
+        || !(0.0..=1.0).contains(&c.threshold)
+    {
+        return Err(invalid("evaluation record is invalid"));
+    }
+    PackageCalibration {
+        onnx_sha256: Sha256Digest::of_bytes(onnx_bytes).to_hex(),
+        label_order: definition.options().iter().map(|o| o.id.clone()).collect(),
+        temperature: c.temperature,
+        threshold: c.threshold,
+    }
+    .to_json_line()
+    .map(Some)
+    .map_err(|_| runtime("cannot serialize package calibration"))
+}
+
 /// 評価記録の `baseline_comparison` が定義と一致するか（#339・REQ-25）。
 ///
 /// 定義に欄があるのに記録に無い（欄の削除）、定義に欄が無いのに記録にある（欄の追加）は不一致。
@@ -603,7 +641,8 @@ fn finalize_staging(
     Ok(Vec::new())
 }
 
-/// ステージングへ 3 ファイル（語彙ファイルがあれば 4）を新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+/// ステージングへ 3 ファイル（語彙ファイル・`calibration.json` があればそれも）を新規に書き、閉じ込めつきで
+/// 開いたハンドルで容量を計測する（REQ-30。校正は `calibration` 枠。#497）。
 ///
 /// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
@@ -611,7 +650,8 @@ fn assemble_and_measure(
     onnx_file: &str,
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
-    definition_bytes: &[u8],
+    // 登録済みの定義と、同梱する校正（あれば）のバイト列。
+    (definition_bytes, calibration): (&[u8], Option<&[u8]>),
     meta: &ArtifactMeta,
     vocab: Option<(&File, &Path)>,
 ) -> Result<CapacityBreakdown, ErrorReport> {
@@ -624,6 +664,10 @@ fn assemble_and_measure(
         (PackageComponent::LabelTable, DEFINITION_FILE),
         (PackageComponent::Metadata, ARTIFACT_META_FILE),
     ];
+    if let Some(bytes) = calibration {
+        project.write_new(pkg.join(PACKAGE_CALIBRATION_FILE), bytes)?;
+        members.push((PackageComponent::Calibration, PACKAGE_CALIBRATION_FILE));
+    }
     if let Some((mut file, _)) = vocab {
         // 保持 fd を先頭へ戻し、固定長バッファで複写する（全体をメモリへ読まない）。
         file.seek(SeekFrom::Start(0))
