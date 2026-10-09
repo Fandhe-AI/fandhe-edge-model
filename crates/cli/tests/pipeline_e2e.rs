@@ -1474,6 +1474,30 @@ mod suite {
             "{out}"
         );
         assert!(out.contains("\"macro_f1\":"), "{out}");
+        // REQ-24・#480: 既存 8 キーの後ろに 6 キーが宣言順で並び、後続 issue 分の 3 キーは null。
+        let keys = [
+            "\"macro_f1\":",
+            "\"macro_f1_excluded_labels\":[",
+            "\"per_label\":[{\"label\":\"alpha\",\"support\":4,",
+            "\"type_meaning_quadrant\":{\"type_ok_meaning_ok\":",
+            "\"out_of_scope_label\":null,\"calibration\":null,\"abstention\":null}\n",
+        ];
+        let at: Vec<usize> = keys.iter().map(|k| out.find(k).expect(k)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{out}");
+        assert!(out.ends_with(keys[4]), "{out}");
+        // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
+        let quadrant: f64 = [
+            "type_ok_meaning_ok",
+            "type_ok_meaning_ng",
+            "type_ng_count",
+            "abstain",
+            "error",
+        ]
+        .iter()
+        .map(|k| number_field(&out, k))
+        .sum();
+        assert_eq!(quadrant, 12.0, "{out}");
+        assert_eq!(number_field(&out, "type_ok_meaning_ok"), correct, "{out}");
         assert!(
             env.project_file("candidates/1/evaluation_record.json")
                 .is_file()
@@ -2340,9 +2364,9 @@ mod suite {
         assert!(!stdout.contains("baseline"), "{stdout}");
         let record = evaluation_record(&env);
         assert!(!record.contains("baseline_comparison"), "{record}");
-        // 末尾は予測ファイルの sha256 束縛（#445）。比較欄は無い。
+        // 比較欄は無く、5 区分（#480）の後に予測ファイルの sha256 束縛（#445）が続く。
         assert!(
-            record.contains("\"total\":12,\"predictions_sha256\":\""),
+            record.contains("\"abstain\":0,\"error\":0},\"predictions_sha256\":\""),
             "{record}"
         );
         env.ok(&PACKAGE);
@@ -2687,6 +2711,25 @@ mod suite {
             std::fs::write(&record_path, bumped).expect("tamper");
             assert_eq!(env.fails(&PACKAGE, 64, "invalid_input"), mismatch, "{key}");
         }
+        // REQ-24・#480: 型と意味の 5 区分の合計が評価件数と食い違う改変も公開できない。
+        assert!(
+            original.contains("\"type_meaning_quadrant\":"),
+            "{original}"
+        );
+        let marker = "\"type_ok_meaning_ok\":";
+        let at = original.find(marker).expect("quadrant") + marker.len();
+        let end = at
+            + original[at..]
+                .find(|c: char| !c.is_ascii_digit())
+                .expect("number end");
+        let mut bumped = original.clone();
+        bumped.replace_range(at..end, "99999");
+        std::fs::write(&record_path, bumped).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            mismatch,
+            "quadrant"
+        );
         assert!(!env.project_file("package").exists());
         let unknown = original.trim_end().trim_end_matches('}').to_string() + ",\"extra\":1}\n";
         std::fs::write(&record_path, unknown).expect("tamper");

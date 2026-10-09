@@ -34,7 +34,7 @@
 
 use serde::Serialize;
 
-use crate::evaluation_record::BaselineComparisonVerdict;
+use crate::evaluation_record::{BaselineComparisonVerdict, TypeMeaningQuadrantRecord};
 use crate::hash::Sha256Digest;
 
 /// CLI の 7 工程（REQ-33。工程順）。
@@ -112,7 +112,8 @@ impl EvaluateReport {
 /// フィールドは非公開でコンストラクタ [`Self::completed`] のみが作る（`total == 0`・
 /// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
 /// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
-/// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`）に直列化し、`macro_f1` が未定義なら
+/// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`・`macro_f1_excluded_labels`・`per_label`・
+/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
 /// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
@@ -126,12 +127,51 @@ pub struct EvaluateCompletedReport {
     correct: u64,
     accuracy: f64,
     macro_f1: Option<f64>,
+    macro_f1_excluded_labels: Vec<String>,
+    per_label: Vec<EvaluateLabelMetrics>,
+    type_meaning_quadrant: TypeMeaningQuadrantRecord,
+    // 以下 3 キーは後続 issue（#478 out_of_scope_label・#477 calibration・#479 abstention）が
+    // 型つきで置き換える。それまでは常に `null` を出し、キーの形だけ先に固定する（#480）。
+    out_of_scope_label: Option<String>,
+    calibration: Option<serde_json::Value>,
+    abstention: Option<serde_json::Value>,
+}
+
+/// `evaluate` の `per_label[]` の 1 要素（REQ-24・TASK-24.2・#480）。
+///
+/// 分母 0 の `precision`・`recall`・`f1` は `null`（0 で埋めない）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvaluateLabelMetrics {
+    /// 選択肢 ID（宣言順に並べる）。
+    pub label: String,
+    /// 正解がこのラベルの件数。
+    pub support: u64,
+    /// このラベルと予測した件数。
+    pub predicted: u64,
+    /// 適合率（`predicted == 0` で `None`）。
+    pub precision: Option<f64>,
+    /// 再現率（`support == 0` で `None`）。
+    pub recall: Option<f64>,
+    /// F1（未定義で `None`）。
+    pub f1: Option<f64>,
+}
+
+/// [`EvaluateCompletedReport::completed`] へ渡す、評価器が求めた詳細指標（#480）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluateDetails {
+    /// Macro-F1 の平均から除いたラベル（宣言順）。
+    pub macro_f1_excluded_labels: Vec<String>,
+    /// ラベル別指標（宣言順）。
+    pub per_label: Vec<EvaluateLabelMetrics>,
+    /// 型と意味の 5 区分。合計は評価件数と一致すること。
+    pub type_meaning_quadrant: TypeMeaningQuadrantRecord,
 }
 
 impl EvaluateCompletedReport {
     /// 評価完了の結果を作る。`accuracy` は `correct / total` から求める。
     ///
-    /// `total == 0`、`correct > total`、有限でない・`[0, 1]` の外の `macro_f1` は `None`。
+    /// `total == 0`、`correct > total`、有限でない・`[0, 1]` の外の指標、
+    /// 合計が `total` と一致しない `type_meaning_quadrant` は `None`。
     #[must_use]
     pub fn completed(
         candidate: usize,
@@ -139,11 +179,19 @@ impl EvaluateCompletedReport {
         correct: u64,
         total: u64,
         macro_f1: Option<f64>,
+        details: EvaluateDetails,
     ) -> Option<Self> {
         if total == 0 || correct > total {
             return None;
         }
-        if macro_f1.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+        let bad = |v: Option<f64>| v.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v));
+        if bad(macro_f1)
+            || details
+                .per_label
+                .iter()
+                .any(|l| bad(l.precision) || bad(l.recall) || bad(l.f1))
+            || details.type_meaning_quadrant.total() != Some(total)
+        {
             return None;
         }
         Some(Self {
@@ -155,6 +203,12 @@ impl EvaluateCompletedReport {
             correct,
             accuracy: correct as f64 / total as f64,
             macro_f1,
+            macro_f1_excluded_labels: details.macro_f1_excluded_labels,
+            per_label: details.per_label,
+            type_meaning_quadrant: details.type_meaning_quadrant,
+            out_of_scope_label: None,
+            calibration: None,
+            abstention: None,
         })
     }
 
@@ -1110,39 +1164,105 @@ mod tests {
         );
     }
 
-    /// REQ-33・REQ-24: 評価完了の JSON が完全一致する（キーは宣言順。`macro_f1` は数値）。
+    fn details(quadrant: [u64; 5]) -> EvaluateDetails {
+        EvaluateDetails {
+            macro_f1_excluded_labels: vec!["c".to_string()],
+            per_label: vec![
+                EvaluateLabelMetrics {
+                    label: "a".to_string(),
+                    support: 2,
+                    predicted: 2,
+                    precision: Some(0.5),
+                    recall: Some(0.5),
+                    f1: Some(0.5),
+                },
+                EvaluateLabelMetrics {
+                    label: "c".to_string(),
+                    support: 0,
+                    predicted: 0,
+                    precision: None,
+                    recall: None,
+                    f1: None,
+                },
+            ],
+            type_meaning_quadrant: TypeMeaningQuadrantRecord {
+                type_ok_meaning_ok: quadrant[0],
+                type_ok_meaning_ng: quadrant[1],
+                type_ng_count: quadrant[2],
+                abstain: quadrant[3],
+                error: quadrant[4],
+            },
+        }
+    }
+
+    /// REQ-33・REQ-24・#480: 評価完了の JSON が完全一致する（キーは宣言順・後続 3 キーは `null`・
+    /// 分母 0 のラベルは `null`・除外ラベルを列挙）。
     #[test]
-    fn req33_evaluate_completed_report_json_is_exact() {
-        let report = EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5))
-            .expect("report");
+    fn req24_evaluate_completed_report_json_is_exact() {
+        let report = EvaluateCompletedReport::completed(
+            1,
+            "c3".to_string(),
+            3,
+            4,
+            Some(0.5),
+            details([3, 1, 0, 0, 0]),
+        )
+        .expect("report");
         assert_eq!(
             report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5}"#
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null}"#
         );
     }
 
     /// REQ-24: `macro_f1` が未定義なら `null`（0 や 1 で埋めない）。
     #[test]
     fn req24_evaluate_completed_report_macro_f1_null() {
-        let report =
-            EvaluateCompletedReport::completed(0, "c1".to_string(), 0, 2, None).expect("report");
-        assert_eq!(
-            report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":2,"correct":0,"accuracy":0.0,"macro_f1":null}"#
+        let report = EvaluateCompletedReport::completed(
+            0,
+            "c1".to_string(),
+            0,
+            2,
+            None,
+            details([0, 2, 0, 0, 0]),
+        )
+        .expect("report");
+        assert!(
+            report
+                .to_json_line()
+                .expect("json")
+                .contains(r#""accuracy":0.0,"macro_f1":null,"macro_f1_excluded_labels""#)
         );
     }
 
-    /// REQ-33: 壊れた値（件数 0・正解数が件数超過・範囲外や非有限の macro_f1）は作れない。
+    /// REQ-33: 壊れた値（件数 0・正解数が件数超過・範囲外や非有限の指標・合計が件数と違う quadrant）は作れない。
     #[test]
     fn req33_evaluate_completed_report_rejects_broken_values() {
-        let make = |c, t, f| EvaluateCompletedReport::completed(0, "c1".to_string(), c, t, f);
-        assert_eq!(make(0, 0, None), None);
+        let make = |c: u64, t: u64, f| {
+            EvaluateCompletedReport::completed(
+                0,
+                "c1".to_string(),
+                c,
+                t,
+                f,
+                details([c, t.saturating_sub(c), 0, 0, 0]),
+            )
+        };
         assert_eq!(make(5, 4, None), None);
         assert_eq!(make(1, 2, Some(f64::NAN)), None);
         assert_eq!(make(1, 2, Some(f64::INFINITY)), None);
         assert_eq!(make(1, 2, Some(1.5)), None);
         assert_eq!(make(1, 2, Some(-0.1)), None);
         assert!(make(2, 2, Some(1.0)).is_some());
+        assert_eq!(make(0, 0, None), None);
+        let mismatch = EvaluateCompletedReport::completed(
+            0,
+            "c1".to_string(),
+            1,
+            2,
+            None,
+            details([1, 0, 0, 0, 0]),
+        );
+        assert_eq!(mismatch, None);
     }
 
     /// REQ-33: 工程状態は snake_case。

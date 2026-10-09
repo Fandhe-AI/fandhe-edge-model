@@ -77,6 +77,37 @@ pub struct BaselineComparisonRecord {
     pub verdict: BaselineComparisonVerdict,
 }
 
+/// 型と意味の正しさの 5 区分の件数（REQ-24・TASK-24.3・#480）。評価器の `TypeMeaningQuadrant` の写し。
+///
+/// 合計は評価件数（`total`）と一致する。`evaluate` の stdout の同名キーと同じ形で、`package` が
+/// 合計と `total` の構造照合に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeMeaningQuadrantRecord {
+    /// 型が正しく意味も正しい件数。
+    pub type_ok_meaning_ok: u64,
+    /// 型は正しいが意味が誤りの件数。
+    pub type_ok_meaning_ng: u64,
+    /// 型が不正の件数。
+    pub type_ng_count: u64,
+    /// 判定保留の件数。
+    pub abstain: u64,
+    /// 推論エラーの件数。
+    pub error: u64,
+}
+
+impl TypeMeaningQuadrantRecord {
+    /// 5 区分の合計。桁あふれ時は `None`。
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        self.type_ok_meaning_ok
+            .checked_add(self.type_ok_meaning_ng)?
+            .checked_add(self.type_ng_count)?
+            .checked_add(self.abstain)?
+            .checked_add(self.error)
+    }
+}
+
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +136,10 @@ pub struct EvaluationRecord {
     /// 欄の無い古い記録はそのまま読める。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_comparison: Option<BaselineComparisonRecord>,
+    /// 型と意味の 5 区分（#480・REQ-24）。欄の無い古い記録はそのまま読める。
+    /// `out_of_scope_label`・`calibration`・`abstention` の記録欄は #477〜#479 で追加する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_meaning_quadrant: Option<TypeMeaningQuadrantRecord>,
     /// 同じディレクトリの `evaluation_predictions.jsonl` のバイト列の sha256（hex。#445・REQ-27）。
     /// PoC-26 の採点入口が予測ファイルの手編集を検出するために照合する。欄の無い古い記録は
     /// そのまま読める（その場合、採点入口は拒否する）。
@@ -150,6 +185,7 @@ mod tests {
             total: 12,
             baseline_comparison: None,
             predictions_sha256: None,
+            type_meaning_quadrant: None,
         }
     }
 
@@ -295,8 +331,44 @@ mod tests {
                 verdict: BaselineComparisonVerdict::NotSignificantlyBetter,
             }),
             predictions_sha256: Some("e".repeat(64)),
+            type_meaning_quadrant: Some(TypeMeaningQuadrantRecord {
+                type_ok_meaning_ok: u64::MAX,
+                type_ok_meaning_ng: u64::MAX,
+                type_ng_count: u64::MAX,
+                abstain: u64::MAX,
+                error: u64::MAX,
+            }),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
         assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");
+    }
+
+    /// REQ-24・#480: quadrant 欄つきの記録は末尾に完全一致で直列化され、往復できる。
+    /// 欄の無い古い記録は `None` で読める。
+    #[test]
+    fn req24_issue480_quadrant_round_trips_and_old_record_reads() {
+        let mut record = sample();
+        let old = record.to_json_vec().expect("json");
+        assert!(!String::from_utf8(old.clone()).unwrap().contains("quadrant"));
+        assert_eq!(
+            EvaluationRecord::from_json_slice(&old)
+                .expect("old")
+                .type_meaning_quadrant,
+            None
+        );
+        let q = TypeMeaningQuadrantRecord {
+            type_ok_meaning_ok: 7,
+            type_ok_meaning_ng: 5,
+            type_ng_count: 0,
+            abstain: 0,
+            error: 0,
+        };
+        assert_eq!(q.total(), Some(12));
+        record.type_meaning_quadrant = Some(q);
+        let bytes = record.to_json_vec().expect("json");
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
+            ",\"type_meaning_quadrant\":{\"type_ok_meaning_ok\":7,\"type_ok_meaning_ng\":5,\"type_ng_count\":0,\"abstain\":0,\"error\":0}}\n"
+        ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
     }
 }
