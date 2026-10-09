@@ -1034,6 +1034,24 @@ mod suite {
         assert!(!env.work.join("d/target.jsonl").exists());
         assert!(!env.work.join("d/x.jsonl").exists());
         assert!(!env.work.join("../escaped.jsonl").exists());
+        // リンク先のない symlink は計算前（パッケージの読み込み前）に拒否される: 存在しない
+        // `--package` でも、先に出るのは OUT の拒否。
+        assert_eq!(
+            env.fails(
+                &[
+                    "infer",
+                    "--package",
+                    "nopkg",
+                    "--input-file",
+                    "in.jsonl",
+                    "--out",
+                    "dangling.jsonl",
+                ],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"output file already exists\"}\n"
+        );
     }
 
     /// REQ-33・REQ-21: 計算失敗（不正な入力行）は stdout に `ErrorReport` だけを出し、OUT を作らない。

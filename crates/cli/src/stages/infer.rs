@@ -46,7 +46,9 @@ use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::{ToErrorReport, emit_error_report};
-use crate::infer_batch::{emit_infer_batch, emit_infer_batch_split, emit_infer_single};
+use crate::infer_batch::{
+    BatchResults, emit_infer_batch, emit_infer_batch_split, emit_infer_single,
+};
 use crate::infer_guard::check_infer_path_and_format;
 use crate::output::write_stage_line;
 use crate::project::{
@@ -129,33 +131,14 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 );
             };
             let mut sink = LazyOut::new(&target);
-            match emit_infer_batch_split(
+            emit_infer_batch_split(
                 out,
                 &mut sink,
                 file,
                 &io_schema,
                 prepared.definition.options(),
                 pipeline,
-            ) {
-                Ok(ExitCode::Ok) => {
-                    let report = match sink.publish() {
-                        Ok(report) => report,
-                        Err(error) => return emit_error_report(out, &error),
-                    };
-                    let written = write_stage_line(out, report.to_json_line());
-                    if written.is_err() {
-                        // 要約を返せなかった OUT は残さない（best effort）。
-                        let _ = target.parent.remove_file_member(Path::new(&target.leaf));
-                    }
-                    written
-                }
-                // 失敗は `ErrorReport` が stdout に出済みで、OUT は作られていない。
-                Ok(code) => Ok(code),
-                Err(_) => {
-                    let report = sink.abort();
-                    emit_error_report(out, &report)
-                }
-            }
+            )
         }
     }
 }
@@ -190,10 +173,16 @@ impl OutTarget {
             }
         }
         let parent = confine_package(cwd, parent).map_err(|e| e.to_error_report())?;
+        // リンク先のない symlink は `open_member` では NotFound に見えるため、末尾も lstat で確認する。
+        if std::fs::symlink_metadata(parent.dir().join(leaf)).is_ok() {
+            return Err(invalid("output file already exists"));
+        }
         match parent.open_member(Path::new(leaf)) {
             Err(PathRejection::Unresolvable { source, .. })
                 if source.kind() == io::ErrorKind::NotFound => {}
-            _ => return Err(invalid("output file already exists")),
+            Ok(_) => return Err(invalid("output file already exists")),
+            // 非対応 OS（`UnsupportedPlatform`）や閉じ込め違反を「既存」と偽らず、他工程と同じ写像にする。
+            Err(e) => return Err(e.to_error_report()),
         }
         Ok(Self {
             parent,
@@ -245,7 +234,7 @@ impl<'a> LazyOut<'a> {
 
     /// 一時ファイルを OUT へ名前替えで公開し、要約を返す。OUT が先に作られていれば `invalid_input`、
     /// それ以外の失敗は `runtime_error`。どちらも一時ファイルを消す。
-    fn publish(mut self) -> Result<InferBatchReport, ErrorReport> {
+    fn publish(&mut self) -> Result<InferBatchReport, ErrorReport> {
         let synced = match self.file.take() {
             Some(file) => file.sync_all().is_ok(),
             None => false,
@@ -266,7 +255,43 @@ impl<'a> LazyOut<'a> {
                 "cannot write output file",
             ));
         }
-        Ok(InferBatchReport::new(self.lines, self.hash.finish()))
+        Ok(InferBatchReport::new(
+            self.lines,
+            std::mem::take(&mut self.hash).finish(),
+        ))
+    }
+}
+
+impl BatchResults for LazyOut<'_> {
+    /// 成功なら公開して要約を stdout へ出す（要約を返せなければ公開済みの OUT を best effort で
+    /// 消す）。書き込み失敗なら一時ファイルを消して報告する。計算失敗の `ErrorReport` は出力済みで、
+    /// OUT は作られていない。ウォッチドッグ解除前に呼ばれる（REQ-39）。
+    fn finish(
+        &mut self,
+        mut out: &mut dyn Write,
+        result: io::Result<ExitCode>,
+    ) -> io::Result<ExitCode> {
+        match result {
+            Ok(ExitCode::Ok) => {
+                let report = match self.publish() {
+                    Ok(report) => report,
+                    Err(error) => return emit_error_report(&mut out, &error),
+                };
+                let written = write_stage_line(&mut out, report.to_json_line());
+                if written.is_err() {
+                    let _ = self
+                        .target
+                        .parent
+                        .remove_file_member(Path::new(&self.target.leaf));
+                }
+                written
+            }
+            Ok(code) => Ok(code),
+            Err(_) => {
+                let report = self.abort();
+                emit_error_report(&mut out, &report)
+            }
+        }
     }
 }
 
@@ -410,7 +435,8 @@ pub(crate) fn build_pipeline(
         backend,
     ))
 }
-#[cfg(test)]
+// 閉じ込めは Linux・macOS 前提のため、guard を使う他のテスト（e2e）と同じく unix に限る。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
