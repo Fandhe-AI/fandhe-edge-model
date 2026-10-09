@@ -16,7 +16,8 @@
 //!
 //! - `group_id` は必須とする（欠損は `invalid_input`）。group を推測して割り付けると
 //!   同一 group の跨ぎを見逃しうるため（REQ-17）。暫定の判断でオーナー確認事項
-//! - 来歴の取り込み（`data::ingest`・REQ-40）は本工程に未接続（後続で結線）
+//! - 来歴（REQ-40）: `data/*.provenance.json` があれば再検証し（改変対策・fail-closed）、正準 JSON を
+//!   `provenance_record.json` として `split.json` と並べて書く。来歴なしは許可
 //! - 矛盾（正規化後同一・ラベル違い）とメタデータ混入（`data::consistency`・REQ-16・TASK-16.2）は
 //!   **報告のみで止めない**（spec は「検出して報告」でオーナー判断 2026-10-09）。stderr に理由別の
 //!   件数だけを固定文で出し、終了コード・stdout JSON は変えない。学習・評価データを別々に検査する
@@ -40,8 +41,9 @@ use fandhe_edge_data::split_record::split_and_record;
 use crate::args::{InspectArgs, Subcommand};
 use crate::log::StderrLog;
 use crate::project::{
-    DATA_DIR, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project, SPLIT_FILE, fail,
-    inspect_bytes, invalid, runtime,
+    DATA_DIR, EVALUATION_DATA_FILE, EVALUATION_PROVENANCE_FILE, FREEZE_FILE,
+    MAX_PROJECT_FILE_BYTES, MAX_PROVENANCE_FILE_BYTES, PROVENANCE_RECORD_FILE, Project, SPLIT_FILE,
+    TRAIN_PROVENANCE_FILE, check_provenance, fail, inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -277,6 +279,25 @@ const EVAL_MSGS: [&str; 4] = [
     "evaluation metadata gold serialization in input",
 ];
 
+/// 取り込み済みの来歴を再検証し、`provenance_record.json` の内容（あるものだけの `evaluation`・`train`
+/// キーの正準 JSON）を返す。来歴が 1 つも無ければ `None`（REQ-40）。
+///
+/// 取り込み後の改変・差し替えは `register` と同じ検査（[`check_provenance`]）で `invalid_input`。
+fn load_provenance_json(project: &Project) -> Result<Option<String>, ErrorReport> {
+    let mut parts = Vec::new();
+    // キー順（evaluation < train）に固定して決定的にする。
+    for (key, name) in [
+        ("evaluation", EVALUATION_PROVENANCE_FILE),
+        ("train", TRAIN_PROVENANCE_FILE),
+    ] {
+        let rel = Path::new(DATA_DIR).join(name);
+        if let Some(bytes) = project.read_optional(rel, MAX_PROVENANCE_FILE_BYTES)? {
+            parts.push(format!("\"{key}\":{}", check_provenance(&bytes)?));
+        }
+    }
+    Ok((!parts.is_empty()).then(|| format!("{{{}}}", parts.join(","))))
+}
+
 /// `inspect` を実行する（検出の報告は実プロセスの stderr へ出す）。
 ///
 /// # Errors
@@ -298,6 +319,7 @@ pub fn run_with_log<W: std::io::Write>(
     let project = Project::open(cwd, &args.project_dir)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
+    let provenance_json = load_provenance_json(&project)?;
     report_consistency(log, &records, TRAIN_MSGS)?;
     let train_rows = split_rows(&records)?;
 
@@ -349,6 +371,9 @@ pub fn run_with_log<W: std::io::Write>(
         .to_json()
         .map_err(|_| runtime("cannot serialize split record"))?;
     project.write_new(SPLIT_FILE, json.as_bytes())?;
+    if let Some(provenance_json) = provenance_json {
+        project.write_new(PROVENANCE_RECORD_FILE, provenance_json.as_bytes())?;
+    }
     Ok(InspectStageReport::new(
         records.len(),
         SplitCounts {
