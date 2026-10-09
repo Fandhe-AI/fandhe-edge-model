@@ -16,20 +16,29 @@
 //!
 //! - `group_id` は必須とする（欠損は `invalid_input`）。group を推測して割り付けると
 //!   同一 group の跨ぎを見逃しうるため（REQ-17）。暫定の判断でオーナー確認事項
-//! - 来歴の取り込み（`data::ingest`・REQ-40）・矛盾検出（`data::consistency`）は本工程に
-//!   未接続（後続で結線）
+//! - 来歴の取り込み（`data::ingest`・REQ-40）は本工程に未接続（後続で結線）
+//! - 矛盾（正規化後同一・ラベル違い）とメタデータ混入（`data::consistency`・REQ-16・TASK-16.2）は
+//!   **報告のみで止めない**（spec は「検出して報告」でオーナー判断 2026-10-09）。stderr に理由別の
+//!   件数だけを固定文で出し、終了コード・stdout JSON は変えない。学習・評価データを別々に検査する
+//!   （学習と評価を跨ぐ矛盾は対象外）
 
 use std::path::Path;
 
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{InspectStageReport, SplitCounts};
+use fandhe_edge_data::consistency::{
+    ConsistencyError, ContradictionRecord, MetadataMixReason, MetadataRecord, find_contradictions,
+    find_metadata_mixed,
+};
 use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::leak::{LeakCheckable, Partitions, inspect_leakage};
+use fandhe_edge_data::normalize::NfkcWhitespaceNormalizer;
 use fandhe_edge_data::split::{Groupable, Split, SplitRatios};
 use fandhe_edge_data::split_record::split_and_record;
 
-use crate::args::InspectArgs;
+use crate::args::{InspectArgs, Subcommand};
+use crate::log::StderrLog;
 use crate::project::{
     DATA_DIR, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project, SPLIT_FILE, fail,
     inspect_bytes, invalid, runtime,
@@ -172,20 +181,133 @@ fn ensure_splits_non_empty(
     Ok(())
 }
 
-/// `inspect` を実行する。
+/// 矛盾・メタデータ混入の検査用に `ValidRecord` を借用する（正解は `output_key` / `label_id`）。
+struct ConsistencyRow<'a> {
+    record: &'a ValidRecord,
+    serializations: [String; 1],
+}
+
+impl<'a> ConsistencyRow<'a> {
+    fn new(record: &'a ValidRecord) -> Self {
+        Self {
+            record,
+            serializations: [record.output_key.clone()],
+        }
+    }
+}
+
+impl ContradictionRecord for ConsistencyRow<'_> {
+    fn id(&self) -> &str {
+        &self.record.id
+    }
+    fn input(&self) -> &str {
+        &self.record.input
+    }
+    fn gold_key(&self) -> &str {
+        &self.record.output_key
+    }
+    fn group_id(&self) -> Option<&str> {
+        self.record.group_id.as_deref()
+    }
+}
+
+impl MetadataRecord for ConsistencyRow<'_> {
+    fn id(&self) -> &str {
+        &self.record.id
+    }
+    fn input(&self) -> &str {
+        &self.record.input
+    }
+    fn gold_label(&self) -> Option<&str> {
+        Some(&self.record.label_id)
+    }
+    fn gold_serializations(&self) -> &[String] {
+        &self.serializations
+    }
+}
+
+/// 矛盾とメタデータ混入を検出し、理由別の件数だけを stderr へ報告する（止めない。REQ-16・TASK-16.2）。
+///
+/// 0 件の理由は出さない。ID・本文・ラベルは出さない（`msgs` は固定語彙）。
+///
+/// # Errors
+/// 検査済みデータでは起きない id の空・重複のみ `runtime_error`（fail-closed）。
+fn report_consistency<W: std::io::Write>(
+    log: &mut StderrLog<W>,
+    records: &[ValidRecord],
+    msgs: [&'static str; 4],
+) -> Result<(), ErrorReport> {
+    let rows: Vec<ConsistencyRow<'_>> = records.iter().map(ConsistencyRow::new).collect();
+    let map_err = |_: ConsistencyError| runtime("unexpected inconsistent record ids");
+    let contradictions = find_contradictions(&rows, &NfkcWhitespaceNormalizer).map_err(map_err)?;
+    let mixed = find_metadata_mixed(&rows).map_err(map_err)?;
+    let count_of = |reason: MetadataMixReason| {
+        mixed
+            .hits
+            .values()
+            .filter(|set| set.contains(&reason))
+            .count()
+    };
+    for (msg, n) in [
+        (msgs[0], contradictions.entries.len()),
+        (msgs[1], count_of(MetadataMixReason::IdInInput)),
+        (msgs[2], count_of(MetadataMixReason::GoldLabelInInput)),
+        (
+            msgs[3],
+            count_of(MetadataMixReason::GoldSerializationInInput),
+        ),
+    ] {
+        if n > 0 {
+            log.info_count(Subcommand::Inspect, msg, n);
+        }
+    }
+    Ok(())
+}
+
+const TRAIN_MSGS: [&str; 4] = [
+    "train contradictory inputs",
+    "train metadata id in input",
+    "train metadata gold label in input",
+    "train metadata gold serialization in input",
+];
+const EVAL_MSGS: [&str; 4] = [
+    "evaluation contradictory inputs",
+    "evaluation metadata id in input",
+    "evaluation metadata gold label in input",
+    "evaluation metadata gold serialization in input",
+];
+
+/// `inspect` を実行する（検出の報告は実プロセスの stderr へ出す）。
+///
+/// # Errors
+/// [`run_with_log`] と同じ。
+pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorReport> {
+    run_with_log(args, cwd, &mut StderrLog::new(std::io::stderr().lock()))
+}
+
+/// [`run`] の本体。`log` は矛盾・メタデータ混入の件数報告の出力先（REQ-16）。
 ///
 /// # Errors
 /// データの異常・漏洩・凍結記録の不一致は `invalid_input`（64）、上限超過は
 /// `limit_exceeded`（20）、I/O 失敗は `runtime_error`（70）。
-pub fn run(args: &InspectArgs, cwd: &Path) -> Result<InspectStageReport, ErrorReport> {
+pub fn run_with_log<W: std::io::Write>(
+    args: &InspectArgs,
+    cwd: &Path,
+    log: &mut StderrLog<W>,
+) -> Result<InspectStageReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     let definition = project.load_definition()?;
     let records = project.load_records(&definition)?;
+    report_consistency(log, &records, TRAIN_MSGS)?;
     let train_rows = split_rows(&records)?;
 
     let eval_bytes = load_evaluation_bytes(&project)?;
     let eval_records = match &eval_bytes {
-        Some(bytes) => Some(inspect_bytes(bytes, &definition)?),
+        Some(bytes) => {
+            let eval = inspect_bytes(bytes, &definition)?;
+            report_consistency(log, &eval, EVAL_MSGS)?;
+            Some(eval)
+        }
         None => None,
     };
 

@@ -39,6 +39,11 @@ impl<W: Write> StderrLog<W> {
         let _ = writeln!(self.out, "{PREFIX}{}: {msg}", stage.name());
     }
 
+    /// `fandhe-edge: <stage>: <msg>: <count>` を 1 行書く（件数だけを添える。失敗は無視する）。
+    pub fn info_count(&mut self, stage: Subcommand, msg: &'static str, count: usize) {
+        let _ = writeln!(self.out, "{PREFIX}{}: {msg}: {count}", stage.name());
+    }
+
     /// 工程が決まる前の行 `fandhe-edge: <msg>` を書く。失敗は無視する。
     pub fn info_top(&mut self, msg: &'static str) {
         let _ = writeln!(self.out, "{PREFIX}{msg}");
