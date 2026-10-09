@@ -3009,6 +3009,18 @@ mod suite {
             "quadrant"
         );
         assert!(!env.project_file("package").exists());
+        // REQ-22・#479: 保留の件数があるのに校正だけ消した改変も公開できない。
+        let start = original.find(",\"calibration\":{").expect("calibration");
+        let end = start + original[start..].find('}').expect("calibration end") + 1;
+        let mut dropped = original.clone();
+        dropped.replace_range(start..end, "");
+        assert!(dropped.contains("\"abstention\":{"), "{dropped}");
+        std::fs::write(&record_path, dropped).expect("tamper");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            mismatch,
+            "abstention"
+        );
         let unknown = original.trim_end().trim_end_matches('}').to_string() + ",\"extra\":1}\n";
         std::fs::write(&record_path, unknown).expect("tamper");
         assert_eq!(

@@ -531,7 +531,13 @@ fn verify_evaluation_record(
             .is_none_or(|a| a.total() == Some(record.total)
                     && a.out_of_scope <= a.answered
                     && a.correct_answered <= a.answered)
-        && record.out_of_scope_label.as_deref() == definition.out_of_scope_label()
+        // 保留の件数は校正があるときだけ記録される（校正なしの保留は改変として扱う）。欄の無い旧記録
+        // （#501・#498 以前）は通す（定義の一致は definition_sha256 で照合済み）。
+        && (record.abstention.is_none() || record.calibration.is_some())
+        && record
+            .out_of_scope_label
+            .as_deref()
+            .is_none_or(|l| Some(l) == definition.out_of_scope_label())
         && usize::try_from(record.total).is_ok_and(|t| t == expected_total)
         && record.candidate_id == selection.candidate_id
         && record.evaluation_sha256 == freeze.sha256().to_hex()

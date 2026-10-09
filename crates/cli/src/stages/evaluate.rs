@@ -662,6 +662,7 @@ fn finalize_evaluation(
             definition.out_of_scope_label(),
             &applied.golds,
             predictions.scores,
+            correct,
         )?),
     };
     let q = &computed.type_meaning_quadrant;
@@ -767,6 +768,7 @@ fn count_abstention(
     out_of_scope_label: Option<&str>,
     golds: &[String],
     scores: &[Vec<f64>],
+    expected_correct: u64,
 ) -> Result<(EvaluateAbstention, AbstentionRecord), ErrorReport> {
     let fail_abstention = || runtime("abstention failed");
     if golds.len() != scores.len() {
@@ -794,6 +796,10 @@ fn count_abstention(
         .map_err(|_| fail_abstention())?;
     let cmp = compare_abstention_with_out_of_scope(labels, calibration, oos.as_ref(), &inputs)
         .map_err(|_| fail_abstention())?;
+    // 保留なしの正解数は評価指標の `correct` と別経路（評価器の argmax）で求まる。ずれは記録前に止める。
+    if cmp.without_abstention().accuracy.overall.numerator() != expected_correct {
+        return Err(runtime("abstention disagrees with metrics"));
+    }
     let cov = cmp.coverage();
     let with = cmp.with_abstention();
     let out_of_scope = cmp.out_of_scope();
@@ -1147,9 +1153,16 @@ mod tests {
         let golds: Vec<String> = cases.iter().map(|(g, _)| g.to_string()).collect();
         let scores: Vec<Vec<f64>> = cases.iter().map(|(_, p)| p.clone()).collect();
         let (plain, _) =
-            count_abstention(&calibration, &labels, None, &golds, &scores).expect("plain");
+            count_abstention(&calibration, &labels, None, &golds, &scores, 5).expect("plain");
         let (report, record) =
-            count_abstention(&calibration, &labels, Some("c"), &golds, &scores).expect("oos");
+            count_abstention(&calibration, &labels, Some("c"), &golds, &scores, 5).expect("oos");
+        // 保留なしの正解数が評価指標とずれたら記録前に止める。
+        assert_eq!(
+            count_abstention(&calibration, &labels, None, &golds, &scores, 4)
+                .expect_err("mismatch")
+                .message,
+            "abstention disagrees with metrics"
+        );
         // 対象外なし: 確信度の高い 4 件だけが答え、残り 4 件（対象外ラベルの 2 件を含む）は保留。
         assert_eq!(
             (
