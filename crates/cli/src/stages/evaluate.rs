@@ -108,7 +108,7 @@ use fandhe_edge_data::eval_freeze::{EvalDataState, FreezeRecord};
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::Split;
 use fandhe_edge_eval::calibration::{
-    Calibration, CalibrationRecord as CalibrationInput, calibrate,
+    Calibration, CalibrationRecord as CalibrationInput, MAX_CALIBRATION_CELLS, calibrate,
 };
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
@@ -121,6 +121,7 @@ use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::onnx::{MAX_MODEL_FILE_BYTES, ModelKind};
 use fandhe_edge_runtime::pipeline::{
     BackendError, InferError, InferencePipeline, MAX_INFER_BATCH_DURATION, MAX_INFER_BATCH_LEN,
+    MAX_INFER_BATCH_TOTAL_SCORES,
 };
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
 use fandhe_edge_train::request::TrainRequest;
@@ -471,6 +472,14 @@ fn calibrate_on_validation(
         ));
     }
     let options = definition.options();
+    // 推論とロジットの確保の前に「件数 × 選択肢数」を、バッチ推論の保持スコア上限と
+    // 校正の計算量上限の小さい方で検証する（REQ-39 資源の上限）。
+    if !validation_cells_within_limit(validation.len(), options.len()) {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "validation data has too many scores",
+        ));
+    }
     let backend = load_backend(
         &target.artifact.onnx_bytes,
         target.kind,
@@ -502,6 +511,13 @@ fn calibrate_on_validation(
         })
         .collect();
     calibrate_checked(&labels, &inputs).map(Some)
+}
+
+/// 校正用に保持するロジットの総数（件数 × 選択肢数）が上限内か。桁あふれは上限超過として扱う。
+fn validation_cells_within_limit(records: usize, options: usize) -> bool {
+    records
+        .checked_mul(options)
+        .is_some_and(|n| n <= MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS))
 }
 
 /// 評価器の [`calibrate`] を呼び、失敗を握りつぶさず `runtime_error`（固定 message）へ写す。
@@ -975,6 +991,16 @@ mod tests {
     }
 
     /// REQ-22・REQ-27・#477: 校正の計算の失敗は握りつぶさず `runtime_error`（exit 70）になる。
+    /// REQ-39: 校正用ロジットの総数は確保前に上限で拒否する（桁あふれも拒否）。
+    #[test]
+    fn req39_validation_cells_are_limited_before_inference() {
+        let limit = MAX_INFER_BATCH_TOTAL_SCORES.min(MAX_CALIBRATION_CELLS);
+        assert!(validation_cells_within_limit(limit, 1));
+        assert!(!validation_cells_within_limit(limit + 1, 1));
+        assert!(!validation_cells_within_limit(100_000, 1024));
+        assert!(!validation_cells_within_limit(usize::MAX, 2));
+    }
+
     #[test]
     fn req22_issue477_calibration_failure_is_runtime_error() {
         let bad = [CalibrationInput {
