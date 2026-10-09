@@ -85,7 +85,8 @@
 //! - 推論ランタイム（REQ-28 系）を使った採点（本モジュールの採点は学習ワーカー
 //!   内の学習直後の予測。ONNX 書き出しモデルとの一致は各 kind のテストで確認する）
 //! - 記録のファイルへの永続化・CLI `select` 工程の JSON 出力は `stages::select`・
-//!   `stage_files` で接続済み（#136）
+//!   `stage_files` で接続済み（#136）。CLI `train --all` が本モジュールの [`run_search`] で
+//!   全候補を学習し、[`SearchRecord`] を `search_record.json` へ保存する（#482・#483）
 //! - `package_bytes`・速度（p95）を使う PoC-17 の threshold／pareto 選定
 //! - 自動選択と固定規則で結果が分かれた場合の最終 test 適用（TASK-18.4。
 //!   見送り確定）
@@ -108,6 +109,7 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
+use fandhe_edge_core::stage_report::{TrainBudgetScope, TrainSearchResult};
 use fandhe_edge_eval::metrics::{self, EvalError, EvalRecord, Outcome, Ratio};
 use fandhe_edge_eval::significance::MAX_EVAL_RECORDS;
 
@@ -317,6 +319,34 @@ pub enum BudgetReachedScope {
     SearchBudget,
     /// 候補ごとの持ち時間に達した。
     CandidateTimeLimit,
+}
+
+impl From<&CandidateSearchResult> for TrainSearchResult {
+    /// CLI `train --all` の出力契約の語彙へ写す（共通コアの enum。REQ-18・TASK-18.1・#482）。
+    fn from(result: &CandidateSearchResult) -> Self {
+        match result {
+            CandidateSearchResult::Evaluated { .. } => Self::Evaluated,
+            CandidateSearchResult::TrainingNotCompleted => Self::TrainingNotCompleted,
+            CandidateSearchResult::ScoringFailed => Self::ScoringFailed,
+            CandidateSearchResult::ScoringExceededBudget { .. } => Self::ScoringExceededBudget,
+            CandidateSearchResult::ScoringSkippedBudgetExhausted => {
+                Self::ScoringSkippedBudgetExhausted
+            }
+            CandidateSearchResult::TrainingExceededTimeLimit => Self::TrainingExceededTimeLimit,
+            CandidateSearchResult::TrainingTimedOut => Self::TrainingTimedOut,
+            CandidateSearchResult::NotStarted { .. } => Self::NotStarted,
+        }
+    }
+}
+
+impl From<BudgetReachedScope> for TrainBudgetScope {
+    /// CLI `train --all` の出力契約の語彙へ写す（共通コアの enum。REQ-18・TASK-18.2・#483）。
+    fn from(scope: BudgetReachedScope) -> Self {
+        match scope {
+            BudgetReachedScope::SearchBudget => Self::SearchBudget,
+            BudgetReachedScope::CandidateTimeLimit => Self::CandidateTimeLimit,
+        }
+    }
 }
 
 /// 候補 1 件の探索結果の分類。
@@ -2809,6 +2839,54 @@ mod tests {
         for (result, expected) in cases {
             assert_eq!(result.budget_reached(), expected, "{result:?}");
         }
+    }
+
+    /// (REQ-18・TASK-18.1・#482) `tag` は全バリアントで直列化の `result` タグと一致し、
+    /// 予算到達の範囲の `tag` も直列化と一致する（CLI はこの固定語彙を stdout に使う）。
+    #[test]
+    fn req18_tags_match_serialized_names() {
+        let acc = ValidationAccuracy {
+            correct: 1,
+            total: 2,
+            value: 0.5,
+        };
+        let results = [
+            CandidateSearchResult::Evaluated {
+                validation_accuracy: acc,
+            },
+            CandidateSearchResult::TrainingNotCompleted,
+            CandidateSearchResult::ScoringFailed,
+            CandidateSearchResult::ScoringExceededBudget {
+                validation_accuracy: acc,
+            },
+            CandidateSearchResult::ScoringSkippedBudgetExhausted,
+            CandidateSearchResult::TrainingExceededTimeLimit,
+            CandidateSearchResult::TrainingTimedOut,
+            CandidateSearchResult::NotStarted {
+                reason: NotStartedReason::BudgetExhausted,
+            },
+        ];
+        for result in results {
+            let value = serde_json::to_value(&result).expect("ser");
+            let mapped = serde_json::to_value(TrainSearchResult::from(&result)).expect("ser");
+            assert_eq!(value["result"], mapped, "{result:?}");
+        }
+        for scope in [
+            BudgetReachedScope::SearchBudget,
+            BudgetReachedScope::CandidateTimeLimit,
+        ] {
+            assert_eq!(
+                serde_json::to_value(scope).expect("ser"),
+                serde_json::to_value(TrainBudgetScope::from(scope)).expect("ser")
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(TrainSearchResult::from(
+                &CandidateSearchResult::TrainingTimedOut
+            ))
+            .expect("ser"),
+            "training_timed_out"
+        );
     }
 
     /// (TASK-18.2) 範囲は snake_case で直列化される。

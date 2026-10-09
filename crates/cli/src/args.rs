@@ -27,6 +27,7 @@
 
 use crate::project::DEFAULT_SEED;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_train::search::SearchBudget;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -137,7 +138,24 @@ const INSPECT_OPTS: &[OptSpec] = &[
 ];
 const TRAIN_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
-    opt("--candidate", "N", true, "Candidate number"),
+    opt(
+        "--candidate",
+        "N",
+        false,
+        "Candidate number (exactly one of --candidate / --all)",
+    ),
+    OptSpec {
+        name: "--all",
+        value: None,
+        required: false,
+        help: "Train all default candidates within the search budget (exactly one of --candidate / --all)",
+    },
+    opt(
+        "--budget-seconds",
+        "N",
+        false,
+        "Search budget in seconds for --all (1 to 921600, default 3600)",
+    ),
     OptSpec {
         name: "--smoke",
         value: None,
@@ -205,11 +223,21 @@ pub struct InspectArgs {
     /// 既定は [`DEFAULT_SEED`]。REQ-17）。
     pub seed: u32,
 }
+/// `train` の対象。`--candidate` と `--all` の排他を型で表す（REQ-18・#482）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainTarget {
+    /// `--candidate N`: 候補 1 件を学習する。
+    Candidate(usize),
+    /// `--all [--budget-seconds N]`: 既定候補の全件を探索予算内で学習する（持ち時間は均等割り固定）。
+    All { budget: SearchBudget },
+}
+
 /// `train` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainArgs {
     pub project_dir: PathBuf,
-    pub candidate: usize,
+    pub target: TrainTarget,
+    /// `--smoke`（`--all` では全候補に適用する）。
     pub smoke: bool,
     /// `--train-seed`: 学習 seed の上書き（省略時は `split.json` の seed。分割は変えない。REQ-17・REQ-41）。
     pub train_seed: Option<u32>,
@@ -298,6 +326,12 @@ pub enum ArgsError {
     InvalidSeed,
     /// `--train-seed` が `u32` の範囲の非負整数でない。
     InvalidTrainSeed,
+    /// `--budget-seconds` が `1..=MAX_SEARCH_BUDGET_SECONDS` の整数でない。
+    InvalidBudgetSeconds,
+    /// `train` に `--candidate` と `--all` の両方が指定された。
+    ConflictingTrainTarget,
+    /// `train` に `--candidate` も `--all` も指定されていない。
+    MissingTrainTarget,
     ConflictingInferSource,
     MissingInferSource,
     /// `--id` は `--text` とだけ、`--out` は `--input-file` とだけ併用できる。
@@ -350,6 +384,13 @@ impl fmt::Display for ArgsError {
             ArgsError::InvalidTrainSeed => {
                 f.write_str("option --train-seed must be an integer in the range 0 to 4294967295")
             }
+            ArgsError::InvalidBudgetSeconds => {
+                f.write_str("option --budget-seconds must be an integer in the range 1 to 921600")
+            }
+            ArgsError::ConflictingTrainTarget => {
+                f.write_str("options --candidate and --all cannot be used together")
+            }
+            ArgsError::MissingTrainTarget => f.write_str("one of --candidate or --all is required"),
             ArgsError::ConflictingInferSource => {
                 f.write_str("options --text and --input-file cannot be used together")
             }
@@ -538,6 +579,37 @@ impl Values {
             })
             .transpose()
     }
+    fn budget(&mut self) -> Result<SearchBudget, ArgsError> {
+        match self.take("--budget-seconds") {
+            None => Ok(SearchBudget::default()),
+            Some(v) => v
+                .into_string()
+                .map_err(|_| ArgsError::NonUtf8Argument)?
+                .parse::<u64>()
+                .ok()
+                .and_then(SearchBudget::new)
+                .ok_or(ArgsError::InvalidBudgetSeconds),
+        }
+    }
+    fn train_target(&mut self) -> Result<TrainTarget, ArgsError> {
+        let all = self.take("--all").is_some();
+        let has_candidate = self.0.iter().any(|(n, _)| *n == "--candidate");
+        match (has_candidate, all) {
+            (true, true) => Err(ArgsError::ConflictingTrainTarget),
+            (false, false) => Err(ArgsError::MissingTrainTarget),
+            (true, false) => {
+                if self.take("--budget-seconds").is_some() {
+                    return Err(ArgsError::IncompatibleOption {
+                        option: "--budget-seconds",
+                    });
+                }
+                Ok(TrainTarget::Candidate(self.candidate()?))
+            }
+            (false, true) => Ok(TrainTarget::All {
+                budget: self.budget()?,
+            }),
+        }
+    }
     fn candidate(&mut self) -> Result<usize, ArgsError> {
         let v = self
             .take("--candidate")
@@ -563,7 +635,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         }),
         Subcommand::Train => Command::Train(TrainArgs {
             project_dir: v.path("--project-dir")?,
-            candidate: v.candidate()?,
+            target: v.train_target()?,
             smoke: v.take("--smoke").is_some(),
             train_seed: v.train_seed()?,
         }),
@@ -782,7 +854,7 @@ mod tests {
             ]),
             Command::Train(TrainArgs {
                 project_dir: "proj".into(),
-                candidate: 2,
+                target: TrainTarget::Candidate(2),
                 smoke: true,
                 train_seed: None
             })
@@ -791,7 +863,7 @@ mod tests {
             run(&["train", "--candidate=0", "--project-dir", "proj"]),
             Command::Train(TrainArgs {
                 project_dir: "proj".into(),
-                candidate: 0,
+                target: TrainTarget::Candidate(0),
                 smoke: false,
                 train_seed: None
             })
@@ -802,6 +874,90 @@ mod tests {
                 project_dir: "proj".into(),
                 candidate: 3
             })
+        );
+    }
+
+    /// REQ-18・#482: `train --all` は `--budget-seconds` を `1..=921600`（既定 3600）で受理し、
+    /// `--smoke`・`--train-seed` と併用できる。`--candidate` との併用・どちらも無し・範囲外の予算・
+    /// `--candidate` と `--budget-seconds` の併用はいずれも `invalid_input`（64）。
+    #[test]
+    fn req18_train_all_parses_and_rejects_conflicts() {
+        let all = |extra: &[&str]| {
+            let mut a = vec!["train", "--project-dir", "proj", "--all"];
+            a.extend_from_slice(extra);
+            p(&a)
+        };
+        let target = |r: Result<Invocation, ArgsError>| match r {
+            Ok(Invocation::Run(Command::Train(a))) => Ok(a.target),
+            Err(e) => Err(e),
+            other => panic!("unexpected {other:?}"),
+        };
+        let budget = |s: u64| TrainTarget::All {
+            budget: SearchBudget::new(s).expect("budget"),
+        };
+        assert_eq!(target(all(&[])), Ok(budget(3600)));
+        assert_eq!(target(all(&["--budget-seconds", "1"])), Ok(budget(1)));
+        assert_eq!(
+            target(all(&["--budget-seconds=921600"])),
+            Ok(budget(921_600))
+        );
+        assert_eq!(
+            run(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--all",
+                "--smoke",
+                "--train-seed",
+                "7"
+            ]),
+            Command::Train(TrainArgs {
+                project_dir: "proj".into(),
+                target: budget(3600),
+                smoke: true,
+                train_seed: Some(7)
+            })
+        );
+        for bad in ["0", "921601", "-1", "abc", "18446744073709551616"] {
+            assert_eq!(
+                target(all(&["--budget-seconds", bad])),
+                Err(ArgsError::InvalidBudgetSeconds),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            target(all(&["--candidate", "0"])),
+            Err(ArgsError::ConflictingTrainTarget)
+        );
+        assert_eq!(
+            target(p(&["train", "--project-dir", "proj"])),
+            Err(ArgsError::MissingTrainTarget)
+        );
+        assert_eq!(
+            target(p(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "0",
+                "--budget-seconds",
+                "10"
+            ])),
+            Err(ArgsError::IncompatibleOption {
+                option: "--budget-seconds"
+            })
+        );
+        for e in [
+            ArgsError::InvalidBudgetSeconds,
+            ArgsError::ConflictingTrainTarget,
+            ArgsError::MissingTrainTarget,
+        ] {
+            assert_eq!(args_error_report(&e).code, ExitCode::InvalidInput);
+        }
+        // 上限の表示値は型の上限と一致する（help・エラー文の 921600）。
+        assert_eq!(
+            fandhe_edge_train::search::MAX_SEARCH_BUDGET_SECONDS,
+            921_600
         );
     }
 
@@ -1036,7 +1192,13 @@ mod tests {
     #[test]
     fn req33_help_lists_all_options_and_subcommands() {
         let train = render_help(Some(Subcommand::Train));
-        for o in ["--project-dir", "--candidate", "--smoke"] {
+        for o in [
+            "--project-dir",
+            "--candidate",
+            "--all",
+            "--budget-seconds",
+            "--smoke",
+        ] {
             assert!(train.contains(o), "{train}");
         }
         for sub in Subcommand::ALL {

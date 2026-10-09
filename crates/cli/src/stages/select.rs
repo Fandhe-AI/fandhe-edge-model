@@ -55,8 +55,8 @@ use super::candidate_artifact::{
 };
 use super::infer::load_backend;
 use super::train::{
-    effective_train_seed, load_trained, request_matches_candidate, resolve_candidates,
-    verified_split,
+    allotted_time_limit, effective_train_seed, load_trained, request_matches_candidate,
+    resolve_candidates, verified_split,
 };
 
 /// `select` を実行する。
@@ -178,7 +178,8 @@ pub fn compute_selection_with_exclusions(
         };
         // 保存済みのリクエストが既定候補 N の種類・構成と一致すること（別の種類の学習結果を
         // 候補 N として採点しない。記録の差し替え対策。REQ-27）。
-        if !request_matches_candidate(&request, &candidate.params, &records, &split) {
+        let allotted = allotted_time_limit(project, index, &candidate.candidate_id)?;
+        if !request_matches_candidate(&request, &candidate.params, allotted, &records, &split) {
             return Err(invalid("train request does not match the candidate"));
         }
         let inputs = request

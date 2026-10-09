@@ -158,8 +158,8 @@ use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
-    candidate_rel, effective_train_seed, load_trained, request_is_smoke_trained,
-    request_matches_candidate, resolve_candidates, verified_split,
+    allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
+    request_is_smoke_trained, request_matches_candidate, resolve_candidates, verified_split,
 };
 
 /// `evaluate` の成功結果（stdout の JSON 1 つへ写す）。
@@ -410,7 +410,8 @@ fn prepare_candidate(
             Ok(None)
         };
     };
-    if !request_matches_candidate(&request, &candidate.params, records, split) {
+    let allotted = allotted_time_limit(project, index, &candidate.candidate_id)?;
+    if !request_matches_candidate(&request, &candidate.params, allotted, records, split) {
         return Err(invalid("train request does not match the candidate"));
     }
     if request_is_smoke_trained(&request, &candidate.params) {

@@ -11,6 +11,7 @@
 //! # 入出力
 //!
 //! - [`trainer_jsonl`]: trainer が受け付ける `{"input","label"}`（2 キー限定）の JSONL を作る
+//! - [`search_record_json_vec`]: `train --all` の探索記録 `search_record.json`（#483）
 //! - [`outcome_json_vec`]: 学習結果の保存用 JSON（保存後も
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
@@ -24,6 +25,7 @@ use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
 
 use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
+use crate::search::SearchRecord;
 
 /// 保存・採点の失敗（内容を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,73 @@ pub fn outcome_json_vec(outcome: &TrainOutcome) -> Result<Vec<u8>, StageFileErro
     let mut bytes = serde_json::to_vec(outcome).map_err(|_| StageFileError::Serialize)?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// `train --all` が書く探索記録 `search_record.json` の上限（バイト。読み書き共通。REQ-18・REQ-39・
+/// TASK-18.2・#483）。候補数の上限（256）でも数十 KiB に収まる大きさで、超えるものは書かない。
+pub const MAX_SEARCH_RECORD_BYTES: usize = 1024 * 1024;
+
+/// 探索記録（[`SearchRecord`]）を保存用の JSON 1 行（末尾改行つき）へ直列化する。validation の予測本文は
+/// [`SearchRecord`] の直列化が出さない（REQ-27・security.md）。
+///
+/// # Errors
+/// 直列化に失敗した場合（`Serialize`）、または [`MAX_SEARCH_RECORD_BYTES`] を超える場合（`LimitExceeded`）。
+pub fn search_record_json_vec(record: &SearchRecord) -> Result<Vec<u8>, StageFileError> {
+    let mut bytes = serde_json::to_vec(record).map_err(|_| StageFileError::Serialize)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_SEARCH_RECORD_BYTES {
+        return Err(StageFileError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+/// 探索記録の読み戻しに使う部分（候補ごとの ID・結果・配分した持ち時間だけを読む）。
+#[derive(Deserialize)]
+struct StoredSearchRecord {
+    candidates: Vec<StoredSearchEntry>,
+}
+
+#[derive(Deserialize)]
+struct StoredSearchEntry {
+    candidate_id: String,
+    result: String,
+    time: Option<StoredCandidateTime>,
+}
+
+#[derive(Deserialize)]
+struct StoredCandidateTime {
+    time_limit_seconds: u32,
+}
+
+/// 保存済みの探索記録から、候補 `index`（ID `candidate_id`）へ配分した持ち時間（秒）を返す
+/// （`select`・`package`・`evaluate` が `train --all` の候補の `request.json` の `time_limit_seconds` を照合する
+/// ための期待値。REQ-18・REQ-27・#482）。値は学習リクエストへ渡した持ち時間そのもの
+/// （[`crate::time_allotment::CandidateTimeRecord::time_limit_seconds`]）。
+///
+/// # Errors
+/// [`MAX_SEARCH_RECORD_BYTES`] 超過・JSON として不正・候補が記録に無い・ID が違う・`evaluated` でない・
+/// 持ち時間が無いか `1..=MAX_TRAIN_WALL_SECONDS` の外の場合は [`StageFileError::Malformed`]（fail-closed）。
+pub fn allotted_time_limit_seconds(
+    bytes: &[u8],
+    index: usize,
+    candidate_id: &str,
+) -> Result<u32, StageFileError> {
+    if bytes.len() > MAX_SEARCH_RECORD_BYTES {
+        return Err(StageFileError::Malformed);
+    }
+    let record: StoredSearchRecord =
+        serde_json::from_slice(bytes).map_err(|_| StageFileError::Malformed)?;
+    let entry = record
+        .candidates
+        .get(index)
+        .filter(|e| e.candidate_id == candidate_id && e.result == "evaluated")
+        .ok_or(StageFileError::Malformed)?;
+    entry
+        .time
+        .as_ref()
+        .map(|t| t.time_limit_seconds)
+        .filter(|s| (1..=crate::limits::MAX_TRAIN_WALL_SECONDS).contains(s))
+        .ok_or(StageFileError::Malformed)
 }
 
 /// 学習ジョブが返した validation 予測（入力順）を、正解ラベル `gold`（同じ順序）と突き合わせて
@@ -367,5 +436,29 @@ mod tests {
             "{\"candidate_index\":0,\"candidate_id\":\"c1\",\"rule\":\"r\",\"validation_correct\":1,\"validation_total\":2,\"significance\":{\"majority_label\":\"a\",\"baseline_correct\":1,\"b\":1,\"c\":0,\"required_n\":7,\"family_size\":2,\"verdict\":\"undeterminable\"}}\n"
         );
         assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
+    }
+
+    /// REQ-18・REQ-27・#482: 探索記録から評価済み候補の持ち時間を読む。候補が無い・ID 違い・
+    /// `evaluated` でない・持ち時間が無いか範囲外・JSON 不正はすべて `Malformed`（fail-closed）。
+    #[test]
+    fn req18_allotted_time_limit_reads_only_evaluated_candidates() {
+        let record = br#"{"budget_seconds":10,"candidates":[{"candidate_id":"c1","time":{"time_limit_seconds":5,"status":"completed"},"result":"evaluated","budget_reached":null},{"candidate_id":"c3","time":{"time_limit_seconds":4},"result":"training_timed_out"},{"candidate_id":"c9","time":null,"result":"evaluated"},{"candidate_id":"c8","time":{"time_limit_seconds":3601},"result":"evaluated"}]}"#;
+        assert_eq!(allotted_time_limit_seconds(record, 0, "c1"), Ok(5));
+        for (index, id) in [(0, "c3"), (1, "c3"), (2, "c9"), (3, "c8"), (4, "c1")] {
+            assert_eq!(
+                allotted_time_limit_seconds(record, index, id),
+                Err(StageFileError::Malformed),
+                "{index} {id}"
+            );
+        }
+        assert_eq!(
+            allotted_time_limit_seconds(b"{}", 0, "c1"),
+            Err(StageFileError::Malformed)
+        );
+        let oversized = vec![b' '; MAX_SEARCH_RECORD_BYTES + 1];
+        assert_eq!(
+            allotted_time_limit_seconds(&oversized, 0, "c1"),
+            Err(StageFileError::Malformed)
+        );
     }
 }
