@@ -65,7 +65,9 @@ LEFTHOOK_VERSION := 2.1.10
 CARGO_DENY_VERSION := 0.20.2
 # trainer/pyproject.toml の [tool.uv] required-version と同一の値を維持する
 # （pyproject.toml 側を正とし、乖離したらこちらを追従させる。乖離したまま放置すると
-# uv 自身が required-version 違反で fail するため、更新時は 2 箇所を同時に直す）
+# 2 箇所を同時に直す）。make 経由の uv は `--no-config` のため pyproject.toml の
+# required-version を読まず、Makefile 側の版検査（require_uv）が正。required-version は
+# uv を直接叩く場合の保険
 UV_VERSION := 0.12.19
 
 .PHONY: help
@@ -340,12 +342,19 @@ endif
 # uv 0.12.19 を経由してのみ実行する（uv 未導入時は curl|sh 等の自動導入をしない。
 # rustup ターゲットと同一のサプライチェーン方針）。`--locked` を必ず付け、
 # lock ファイルと pyproject.toml が食い違う場合は fail-closed で止める
-# （uv sync が lock を無言で書き換えることを防ぐ）。
+# （uv sync が lock を無言で書き換えることを防ぐ）。`--no-config` で開発者のユーザー設定
+# （~/.config/uv/uv.toml の exclude-newer 等）を読まない（--locked は lock どおりで再解決しないため
+# exclude-newer が守るものは無く、衝突して失敗するのを避ける。#465）。ミラー等は環境変数で指定する。
 
 # uv 自体の有無を確認するヘルパ（無ければ導入方法を案内して停止する）
 define require_uv
 	if ! command -v uv >/dev/null 2>&1; then \
 		echo "error: uv が見つかりません。brew install uv（バージョン $(UV_VERSION) 系）または https://docs.astral.sh/uv/getting-started/installation/ の公式手順で導入してから再実行してください" >&2; \
+		exit 1; \
+	fi; \
+	uv_ver=$$(uv --version 2>/dev/null | awk '{print $$2}'); \
+	if [ "$$uv_ver" != "$(UV_VERSION)" ]; then \
+		echo "error: uv の版が固定版と不一致です（検出 $${uv_ver}、必要 $(UV_VERSION)）。--no-config のため pyproject.toml の required-version が効かず、ここで検査します" >&2; \
 		exit 1; \
 	fi
 endef
@@ -354,7 +363,7 @@ endef
 py-sync: ## uv sync --locked で学習ワーカーの仮想環境を lock どおりに同期する
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv sync --locked --directory $(PY_DIR)
+	uv --no-config sync --locked --directory $(PY_DIR)
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-sync をスキップ"
 endif
@@ -363,7 +372,7 @@ endif
 py-fmt: ## ruff format で学習ワーカー・scripts/ の Python を整形する（書き換える）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff format . ../scripts
+	uv --no-config run --locked --directory $(PY_DIR) ruff format . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt をスキップ"
 endif
@@ -372,7 +381,7 @@ endif
 py-fmt-check: ## ruff format --check（整形差分の検出。書き換えない）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff format --check . ../scripts
+	uv --no-config run --locked --directory $(PY_DIR) ruff format --check . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt-check をスキップ"
 endif
@@ -381,7 +390,7 @@ endif
 py-lint: ## ruff check（学習ワーカーの lint ゲート。S ルールで危険な逆シリアル化等を検出）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) ruff check . ../scripts
+	uv --no-config run --locked --directory $(PY_DIR) ruff check . ../scripts
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-lint をスキップ"
 endif
@@ -390,7 +399,7 @@ endif
 py-test: ## pytest（学習ワーカーのテスト）
 ifneq ($(HAS_PY),)
 	@$(require_uv)
-	uv run --locked --directory $(PY_DIR) pytest
+	uv --no-config run --locked --directory $(PY_DIR) pytest
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-test をスキップ"
 endif
