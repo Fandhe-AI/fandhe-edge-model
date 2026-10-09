@@ -30,6 +30,10 @@
 //! **定義ファイルと同じディレクトリの固定名** `train.jsonl`（必須）・`evaluation.jsonl`（任意）を
 //! 取り込む。
 //!
+//! 来歴（REQ-40）も同じ流儀で、同じディレクトリの任意の `train.provenance.json`・
+//! `evaluation.provenance.json` を取り込む（固定名は暫定）。来歴なしは許可。評価データの凍結ハッシュは
+//! `evaluation.jsonl` のバイト列のみで、来歴は凍結対象外のメタデータ。
+//!
 //! # 閉じ込め（REQ-39）
 //!
 //! プロジェクト内の読み取り・書き込みはガード層の [`ConfinedPackage`]（ディレクトリ fd 起点の
@@ -48,6 +52,8 @@ use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::{FsError, read_bounded_open_file};
 use fandhe_edge_data::inspect::{ValidRecord, inspect_records};
+use fandhe_edge_data::provenance::check_default_training_source;
+use fandhe_edge_data::provenance::ingest::{parse_provenance_json, provenance_to_json};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::PathRejection;
 
@@ -61,6 +67,14 @@ pub const DATA_DIR: &str = "data";
 pub const TRAIN_DATA_FILE: &str = "train.jsonl";
 /// 独立した評価データのファイル名（入力元・取り込み先で共通）。
 pub const EVALUATION_DATA_FILE: &str = "evaluation.jsonl";
+/// 学習データの来歴ファイル名（任意。入力元・取り込み先で共通。REQ-40。固定名は暫定）。
+pub const TRAIN_PROVENANCE_FILE: &str = "train.provenance.json";
+/// 評価データの来歴ファイル名（任意。凍結対象外のメタデータ。REQ-40。固定名は暫定）。
+pub const EVALUATION_PROVENANCE_FILE: &str = "evaluation.provenance.json";
+/// `inspect` が書く来歴の正準 JSON（`train`・`evaluation` キー。あるものだけ）のファイル名。
+pub const PROVENANCE_RECORD_FILE: &str = "provenance_record.json";
+/// 来歴ファイルの読み込み上限（バイト。来歴は 1 レコードの小さな JSON。REQ-39）。
+pub const MAX_PROVENANCE_FILE_BYTES: u64 = 64 * 1024;
 /// 評価データの凍結記録のファイル名。
 pub const FREEZE_FILE: &str = "eval_freeze.json";
 /// 分割記録のファイル名。
@@ -577,6 +591,29 @@ pub fn parse_definition(bytes: &[u8]) -> Result<Definition, ErrorReport> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| invalid("definition file is not valid UTF-8"))?;
     Definition::parse(text).map_err(|e| e.to_error_report())
+}
+
+/// 来歴ファイルのバイト列を解析して生成元の採否を判定し、正準 JSON を返す（REQ-40・TASK-40.1・40.2）。
+///
+/// `register`（取り込み時）と `inspect`（改変の再検証）の共通手順。data 層の `ingest_records` と
+/// 同じ parse → `check_default_training_source` だが、データ検査を含まないため直接呼ぶ。
+///
+/// # Errors
+/// `is_training` は学習データの来歴か。Jev 出力の拒否は REQ-40 が「学習データ」に限って定めるため、
+/// 評価データの来歴（`false`）は形式の検証のみで生成元の採否は見ない（評価データの独立性は REQ-17・REQ-27 側）。
+///
+/// # Errors
+/// 解析失敗は `provenance record is invalid`、学習データの Jev 出力は
+/// `training data source is not allowed`（いずれも `invalid_input`。message は固定語彙で本文を含めない）。
+pub fn check_provenance(bytes: &[u8], is_training: bool) -> Result<String, ErrorReport> {
+    let invalid_record = || invalid("provenance record is invalid");
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_record())?;
+    let record = parse_provenance_json(text).map_err(|_| invalid_record())?;
+    if is_training {
+        check_default_training_source(&record)
+            .map_err(|_| invalid("training data source is not allowed"))?;
+    }
+    Ok(provenance_to_json(&record))
 }
 
 /// JSONL のバイト列を検査し、異常がなければ妥当なレコードを返す（`inspect_records` の薄い写像）。

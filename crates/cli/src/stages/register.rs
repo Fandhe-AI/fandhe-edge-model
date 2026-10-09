@@ -8,6 +8,10 @@
 //!   ため固定名で取り込む（暫定・オーナー確認事項。[`crate::project`]）
 //! - 出力: `--project-dir`（未作成であること。cwd 配下の既存の親の下へ新規作成）
 //!
+//! 同じディレクトリの任意の `train.provenance.json`・`evaluation.provenance.json`（来歴。REQ-40。
+//! 固定名は暫定）も、検証して通れば `data/` へ写す。学習データの来歴の Jev 出力は `invalid_input`（評価来歴は形式のみ検証。
+//! REQ-40 の Jev 不使用は学習データに限る）。評価データが無いのに評価来歴だけがあれば `invalid_input`。
+//!
 //! # 評価契約
 //!
 //! 評価データは取り込み時に凍結記録（sha256・バイト長。[`freeze_eval_data`]）を作り、
@@ -32,8 +36,9 @@ use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 use crate::args::RegisterArgs;
 use crate::error_report::ToErrorReport;
 use crate::project::{
-    DATA_DIR, DEFINITION_FILE, EVALUATION_DATA_FILE, FREEZE_FILE, MAX_PROJECT_FILE_BYTES, Project,
-    TRAIN_DATA_FILE, fs_report, invalid, parse_definition, runtime,
+    DATA_DIR, DEFINITION_FILE, EVALUATION_DATA_FILE, EVALUATION_PROVENANCE_FILE, FREEZE_FILE,
+    MAX_PROJECT_FILE_BYTES, MAX_PROVENANCE_FILE_BYTES, Project, TRAIN_DATA_FILE,
+    TRAIN_PROVENANCE_FILE, check_provenance, fs_report, invalid, parse_definition, runtime,
 };
 
 /// 「対象が存在しない」を表す拒否か（`NotFound` のみ。権限拒否・I/O 失敗は含めない）。
@@ -115,8 +120,35 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         Err(_) => return Err(runtime("cannot inspect evaluation data file")),
     };
 
+    // 来歴は任意。あれば取り込み前に検証し（Jev 出力・壊れた記録は 64）、通ったものを data/ へ写す
+    // （REQ-40）。
+    let mut provenance: Vec<(&str, Vec<u8>)> = Vec::new();
+    for name in [TRAIN_PROVENANCE_FILE, EVALUATION_PROVENANCE_FILE] {
+        if let Some((bytes, _)) =
+            read_confined_optional(cwd, &src_dir.join(name), MAX_PROVENANCE_FILE_BYTES)?
+        {
+            check_provenance(&bytes, name == TRAIN_PROVENANCE_FILE)?;
+            provenance.push((name, bytes));
+        }
+    }
+
+    // 評価データが無いのに評価来歴だけがある記録は、評価済みを装うため拒否する（REQ-17・REQ-40）。
+    if evaluation.is_none()
+        && provenance
+            .iter()
+            .any(|(n, _)| *n == EVALUATION_PROVENANCE_FILE)
+    {
+        return Err(invalid("evaluation provenance without evaluation data"));
+    }
+
     let project = Project::create(cwd, &args.project_dir)?;
-    let placed = place_project(&project, &def_bytes, &train_bytes, evaluation.as_ref());
+    let placed = place_project(
+        &project,
+        &def_bytes,
+        &train_bytes,
+        evaluation.as_ref(),
+        &provenance,
+    );
     if let Err(report) = placed {
         // 本工程が作ったディレクトリだけを、保持した fd 起点で片付ける（best effort。REQ-39）。
         project.remove_created();
@@ -135,10 +167,14 @@ fn place_project(
     def_bytes: &[u8],
     train_bytes: &[u8],
     evaluation: Option<&(Vec<u8>, FreezeRecord)>,
+    provenance: &[(&str, Vec<u8>)],
 ) -> Result<(), ErrorReport> {
     project.write_new(DEFINITION_FILE, def_bytes)?;
     project.create_dir(DATA_DIR)?;
     project.write_new(Path::new(DATA_DIR).join(TRAIN_DATA_FILE), train_bytes)?;
+    for (name, bytes) in provenance {
+        project.write_new(Path::new(DATA_DIR).join(name), bytes)?;
+    }
     if let Some((eval_bytes, record)) = evaluation {
         place_evaluation(project, eval_bytes, record)?;
         let json = record
