@@ -398,6 +398,7 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
     io: &IoSchema,
     options: &[Choice],
     pipeline: &InferencePipeline<P, B>,
+    out_of_scope_label: Option<&str>,
     deadline: Option<Instant>,
     output_byte_limit: usize,
 ) -> Result<(Vec<InferInput>, Vec<Prediction>), ErrorReport> {
@@ -417,7 +418,10 @@ fn compute_batch<R: Read, P: Preprocessor, B: ScoringBackend>(
                     .map_or_else(|| report(ExitCode::RuntimeError), |e| e.to_error_report()));
             }
         };
-        let result = judgment_from_prediction(options, record.id(), &prediction)?;
+        // 書き込み（`write_results`）と同じ関数・同じ値で行を作り、出力量を照合する（REQ-39・REQ-22。
+        // 対象外の行は `status` が長いため、ok 前提の長さで数えると実出力が上限を超えうる）。
+        let result =
+            judgment_from_prediction_scoped(options, out_of_scope_label, record.id(), &prediction)?;
         let line = result
             .to_json_line()
             .map_err(|_| report(ExitCode::RuntimeError))?;
@@ -635,6 +639,7 @@ where
     let (tx, rx) = mpsc::channel();
     let worker_io = io.clone();
     let worker_options = options.to_vec();
+    let worker_oos = out_of_scope_label.map(str::to_string);
     let worker_pipeline = Arc::clone(&pipeline);
     let output_bytes = limits.output_bytes;
     let spawned = thread::Builder::new()
@@ -645,6 +650,7 @@ where
                 &worker_io,
                 &worker_options,
                 &worker_pipeline,
+                worker_oos.as_deref(),
                 deadline,
                 output_bytes,
             );
@@ -1140,6 +1146,7 @@ mod tests {
             definition.io(),
             definition.options(),
             &pipeline,
+            None,
             deadline,
             usize::MAX,
         )
@@ -1348,6 +1355,43 @@ mod tests {
             "{\"id\":\"r1\",\"status\":\"out_of_scope\",\"predicted_label\":\"a\",\"scores\":{\"a\":0.5,\"b\":0.25,\"c\":0.25}}\n\
              {\"id\":\"r2\",\"status\":\"ok\",\"predicted_label\":\"b\",\"scores\":{\"a\":0.25,\"b\":0.5,\"c\":0.25}}\n"
         );
+    }
+
+    /// REQ-39・REQ-22: 出力量の上限は書き込みと同じ行（対象外の行は `out_of_scope`）で照合する。
+    /// ok 前提の長さでは上限内でも実出力は超える上限で `limit_exceeded`（20）となり、何も書かない。
+    #[test]
+    fn req39_output_limit_counts_out_of_scope_rows_as_written() {
+        let definition = abc_definition();
+        let input = b"{\"id\":\"r1\",\"input\":\"x\"}\n{\"id\":\"r2\",\"input\":\"x\"}\n".to_vec();
+        let run_with = |oos: Option<&str>, output_bytes: usize| {
+            let mut out: Vec<u8> = Vec::new();
+            let code = emit_infer_batch_inner(
+                &mut out,
+                None,
+                std::io::Cursor::new(input.clone()),
+                definition.io(),
+                definition.options(),
+                oos,
+                Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
+                BatchLimits {
+                    output_bytes,
+                    ..BatchLimits::default()
+                },
+                StallPolicy::Leak,
+            )
+            .unwrap();
+            (code, String::from_utf8(out).unwrap())
+        };
+        let (code, ok_text) = run_with(None, usize::MAX);
+        assert_eq!(code, ExitCode::Ok);
+        // 2 行とも対象外なら、`"ok"` が `"out_of_scope"` になり 1 行あたり 10 バイト増える。
+        let ok_len = ok_text.len();
+        let (code, text) = run_with(Some("a"), ok_len + 19);
+        assert_eq!(code, ExitCode::LimitExceeded);
+        assert!(!text.contains("predicted_label"));
+        let (code, text) = run_with(Some("a"), ok_len + 20);
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(text.len(), ok_len + 20);
     }
 
     /// REQ-39: 回収しない方式（テスト専用）では、返らない処理を期限で見切って `limit_exceeded`（20）を
