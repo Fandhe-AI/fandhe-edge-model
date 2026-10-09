@@ -19,12 +19,11 @@
 //! PR #230 レビュー指摘・P0: 算出時に緩い α を仮定すると、実際の判定の
 //! 厳しい α では目標検出力を満たせない必要件数を返しかねないため）。
 //!
-//! 呼び出し文脈は、CLI の `evaluate` 工程（将来・TASK-33.x）や事前登録手続き
-//! が、仮定した候補・下限基準の正解率の差（`p_b`・`p_c`）と α・power から
+//! 呼び出し文脈は、CLI の `evaluate` 工程（`stages::baseline`。#339）が、定義の
+//! `baseline_comparison`（事前登録した仮定）の `p_b`・`p_c` と α・power から
 //! 必要件数を求め、[`crate::significance::judge`]・
-//! [`crate::significance::compare_with_baseline`] へ渡す想定。仮定値
-//! そのものをどこから受け取るか（定義ファイル・CLI 引数）は未確定
-//! （TASK-33.x）。
+//! [`crate::significance::compare_with_baseline`] へ渡す。仮定値は定義ファイルから受け取り、
+//! CLI 引数からは受け取らない。
 //!
 //! # 対象外（本 issue の範囲外）
 //!

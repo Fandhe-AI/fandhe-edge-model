@@ -49,10 +49,10 @@
 //!   - 漏洩・group 跨ぎ検出（TASK-16.2-1・[`leak`]）: 実装済み
 //!   - 検査レポート（行数・ユニーク数・ラベル別件数の集計。TASK-16.1-2）:
 //!     実装済み
-//!   - JSONL の読み込み・型・必須項目の検査（TASK-16.1）: 未実装
-//!     （TASK-16.1 のローダがファイル I/O・サイズ上限検査（REQ-39）を担い、
-//!     [`consistency`]・[`leak`] の trait を実装したレコード列を渡す想定）
-//!   - 正規化した入力での漏洩照合（NFKC 等）: 未実装（TASK-15.5 の完了が前提。
+//!   - JSONL の型・必須項目・ラベル enum の検査（TASK-16.1-1・#38。[`inspect::inspect_records`]）:
+//!     実装済み。ファイル読み込みとサイズ上限検査（REQ-39）は呼び出し側（CLI の `stages::inspect`）が担う
+//!   - 正規化した入力での漏洩照合（NFKC 等）: [`leak`] は未実装（byte 完全一致のみ。正規化規則は
+//!     [`normalize`] にあり、矛盾・メタデータ検出の [`consistency`] では使う。
 //!     [`leak`] のスコープの境界を参照）
 //! - 分割結果のハッシュ計算・記録は [`split_record`] で実装済み
 //!   （REQ-17・TASK-17.1-2・issue #45）。評価データの凍結（[`eval_freeze`]・
@@ -63,8 +63,8 @@
 //!   で処理を止める分岐（不一致の報告内容・終了コード写像・不一致検知テスト。
 //!   [`eval_freeze::FreezeError::HashMismatch`]。REQ-17・TASK-17.3・issue
 //!   #49）も実装済み。CLI `evaluate` 工程
-//!   への配線・学習・パッケージ化・推論を通した完走確認（TASK-33.3・
-//!   issue #140）も未実装。（[`inspect::inspect_records`] が返す
+//!   への接続は #314 で済み。学習・パッケージ化・推論を通した完走確認（TASK-33.3・
+//!   issue #140）の範囲は `stages` の doc を参照。（[`inspect::inspect_records`] が返す
 //!   [`inspect::ValidRecord`] は [`split::Groupable`] を実装しないため、
 //!   [`split::split_by_group`]・[`split_record::split_and_record`] へ渡す際は
 //!   呼び出し側（CLI 等）が変換する）

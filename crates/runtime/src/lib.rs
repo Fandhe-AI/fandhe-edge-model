@@ -4,7 +4,7 @@
 //!
 //! - 依存は共通コア（`fandhe-edge-core`）のみ。評価器・データ契約・学習ワーカーには依存しない
 //!   （推論は学習に依存しない。REQ-32）
-//! - 呼び出し元（想定）: CLI の `infer` 工程（TASK-33.x）・評価器の推論関数（TASK-27.2 経由。#118）
+//! - 呼び出し元: CLI の `infer` 工程（`stages::infer`・`infer_batch`。#136・#141）・`package` 工程（`stages::package`）・CLI の `evaluate` 工程（`stages::evaluate` が `pipeline` を直接使う。#314。評価器の `input_only`〔TASK-27.2〕経由は未配線）
 //!
 //! # 現状
 //!
@@ -14,8 +14,8 @@
 //!   実装済み。共有ゴールデンベクタで学習ワーカーの出力と機械照合する
 //! - [`onnx`][]: C1・C3 の ONNX を読む自作の推論バックエンド（`ScoringBackend` 実装。REQ-32・REQ-28・
 //!   TASK-32.1-2・#113）。std と承認済み依存のみで、書き出し器のグラフとの完全一致を照合する許可制。
-//!   `ort`・`tract-onnx` は未承認のため使わない（承認事項）。`artifact.json` の読み込み・CLI 配線は
-//!   後続（TASK-33.x）。`autoregressive` は未対応（REQ-19b の後続 TASK）。共有 fixture
+//!   `ort`・`tract-onnx` は未承認のため使わない（承認事項）。`artifact.json` の読み込みと CLI 配線は
+//!   `stages::infer`・`stages::package` で接続済み（#136）。`autoregressive` は未対応（REQ-19b の後続 TASK）。共有 fixture
 //!   `fixtures/onnx_parity/` との全件一致は `tests/onnx_parity.rs`（証拠種別: テストハーネス）
 //! - [`capacity`][]: 容量計測コア（REQ-30・TASK-30.1-1・#122）。実装済み。配布パッケージ形式は
 //!   後続 TASK（上限照合は `capacity_limit`）。エラーの終了コード・公開メッセージへの
@@ -44,7 +44,7 @@
 //!   （REQ-28 境界値・TASK-28.3・#120）。CLI 出力への配線は TASK-33.x で未実装
 //! - [`vocab_exclusion`][]: 語彙ファイルを持つ構成が容量の目安 40MB を超える場合の既定候補からの
 //!   除外と記録（REQ-30 境界値・TASK-30.3・#125。根拠 PoC-13 実機）。終了コードは変えない。
-//!   `select`・`package` への配線は TASK-33.x で未接続
+//!   `select` 工程（`stages::select`）へは接続済み。`package` への配線は未着手
 //!
 //! TASK-28.1-2（#118）で、650 件の入力に対する単体・バッチ・評価器経路の予測ラベル全件一致
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と

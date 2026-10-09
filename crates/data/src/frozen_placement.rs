@@ -3,7 +3,7 @@
 //!
 //! # 呼び出し文脈
 //!
-//! 将来の CLI `evaluate` 工程（REQ-33・TASK-33.3・issue #140）から、
+//! CLI の `register` 工程（`stages::register`。REQ-33・#136）から、
 //! [`crate::eval_freeze::freeze_eval_data`] で凍結記録を作った直後に呼ばれる
 //! 想定の順序は「凍結（[`crate::eval_freeze`]）→ 配置（本モジュール）→
 //! 評価時の再計算（[`crate::eval_freeze::evaluate_gate`]）」。

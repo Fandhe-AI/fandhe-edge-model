@@ -1,7 +1,7 @@
 //! ok 終了時の判定結果型（REQ-21 正常系・TASK-21.1-2）。
 //!
-//! CLI の `infer` 工程（TASK-33.1。現状は未配線）が単一選択の判定に成功した
-//! ときに stdout へ書く JSON 1 行の中身を表す。終了コード（`exitcode`
+//! CLI の `infer` 工程（単件・`--input-file` の一括。TASK-33.1-2・#136・#141）が単一選択の判定に
+//! 成功したときに stdout へ書く JSON 1 行の中身を表す。終了コード（`exitcode`
 //! モジュール）とは別モジュールに分けているのは、終了コード自体は 7 種の
 //! 状態を表す薄い型であるのに対し、判定結果は「どの選択肢が選ばれ、各選択
 //! 肢のスコアは何か」という値を持つ型で、検証すべき不変条件（選択肢数・
@@ -16,13 +16,13 @@
 //!
 //! # 呼び出し文脈
 //!
-//! - 呼び出し元（想定・TASK-33.1 で配線）: CLI の `infer` サブコマンド。
+//! - 呼び出し元: CLI の `infer` 工程（`fandhe-edge-cli` の `infer_batch`）。
 //!   [`crate::definition::Definition::options`] と、推論ランタイム
-//!   （TASK-30.x/31.x。未実装）が返す確率の列から [`JudgmentResult::new`] を
+//!   （`fandhe-edge-runtime`）が返すスコアの列から [`JudgmentResult::new`] を
 //!   呼んで組み立てる
-//! - 呼び出し先（想定）: `fandhe-edge-cli` の出力関数
-//!   （`crates/cli/src/output.rs`）が [`JudgmentResult::to_json_line`] を
-//!   stdout へ書き、`ExitCode::Ok` を返す
+//! - 呼び出し先: `fandhe-edge-cli` の出力関数
+//!   （`crates/cli/src/output.rs` の `write_ok_judgment`）が [`JudgmentResult::to_json_line`] の
+//!   JSON を stdout へ書き、`ExitCode::Ok` を返す
 //!
 //! # スキーマ（本 TASK で確定。呼び出し側で変更しない）
 //!

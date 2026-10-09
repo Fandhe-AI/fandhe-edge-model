@@ -30,7 +30,8 @@
 //! - 読み込み前のサイズ上限の正式値: #172（TASK-39.5-3）
 //!
 //! パッケージ形式のうち sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。`kind_version` の許可リスト検査は TASK-39.6-1（#174）で実装済み。
-//! `--input-file`・`--out` の閉じ込めも範囲外。
+//! `--input-file` と `--out` の閉じ込めは本関数の範囲外で、`stages::infer` が個別に行う
+//! （`--input-file` は `open_confined`、`--out` は `OutTarget::preflight`。#459）。
 //!
 //! # 推論への接続（#136。`stages::infer`）
 //!
@@ -38,8 +39,9 @@
 //!   `ModelKind::parse` へ写すこと。ガードの許可集合（`c1`・`c3`・`autoregressive`）はランタイムの
 //!   対応（`c1`・`c3`）より広く、`autoregressive` はガードを通ってもランタイムで
 //!   `unsupported_kind` になる（別の層の検査。autoregressive の ONNX 推論は未着手）
-//! - `train`・`register` への `kind` 検査の統合は #136／TASK-33.x の範囲（現行 CLI に入口が無い）。
-//!   `train` 接続時は学習ワーカー起動前に `KindAllowlist` を通すこと
+//! - `train`・`register` への `kind` 検査の統合は未了（#136）。両工程は下位層へ接続済みだが、
+//!   ガードの `KindAllowlist` は通していない（候補の `artifact.json` の `kind` 検査は
+//!   `stages::candidate_artifact` が担う）。`train` へ統合する際は学習ワーカー起動前に通すこと
 //! - 返す [`PathFormatCheckedInputs::onnx`] は閉じ込めつきで開いて形式検査のみを通した [`CheckedFile`]。推論への接続では、この
 //!   バイト列（`as_bytes`・`Read`）をランタイムへ渡す（`stages::infer` はそうしている）。パスから開き直すと検証後の差し替え
 //!   （TOCTOU）が残るため、パスを受け取って自前で開く読み込み API は使わない。

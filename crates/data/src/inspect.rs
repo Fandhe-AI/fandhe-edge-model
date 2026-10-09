@@ -1,6 +1,6 @@
 //! JSONL 形式の学習・評価データを検査する（REQ-16・TASK-16.1-1・TASK-16.1-2）。
 //!
-//! CLI の `inspect` 工程（TASK-33.x で配線予定）から、ガード層を通過済みの
+//! CLI の `inspect` 工程（`stages::inspect`。#136）から、ガード層を通過済みの
 //! JSONL 本文を受け取って呼ばれることを想定する。[`inspect_records`] は
 //! 「型・必須項目・ラベル enum の検査」「妥当なレコードの抽出」に加え、
 //! 件数集計は [`crate::report`] が行い、結果を [`InspectOutcome::report`] に

@@ -2,7 +2,7 @@
 //!
 //! # 呼び出し文脈
 //!
-//! 呼び出し元（想定・TASK-33.1 で配線）: CLI の `infer` サブコマンドが
+//! 呼び出し元: CLI の `infer` 工程（`fandhe-edge-cli` の `infer_batch`。#136・#141）が
 //! `--text`／`--input-file`（1 行 1 JSON）から読んだ 1 件分の文字列を
 //! [`InferInput::parse`] へ渡す。本モジュール自体はファイル I/O・argv 解析
 //! を行わない（層の境界を保つ。`.claude/rules/coding-rust.md`「操作アダプ
@@ -10,8 +10,8 @@
 //! （`OsString`）の扱いは引数解析と一体のため TASK-33.1 の対象とし、本
 //! モジュールでは扱わない。
 //!
-//! 呼び出し先（想定）: 検証を通った [`InferInput`] は推論ランタイム
-//! （TASK-30.x/31.x。未実装）へ `input()` のみを渡す想定（評価契約
+//! 呼び出し先: 検証を通った [`InferInput`] は推論ランタイム
+//! （`fandhe-edge-runtime`）へ `input()` のみを渡す（評価契約
 //! 「推論関数には `input` だけを渡す」。`.claude/rules/evaluation-contract.md`）。
 //!
 //! # 「未知の入力形式・型不正」の解釈

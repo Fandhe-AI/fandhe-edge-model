@@ -2,8 +2,8 @@
 //!
 //! 計測（`latency`。#127）と p95 算出（`latency_report`。#128）の結果を、利用者が設定した上限と
 //! 突き合わせて [`LimitBreach::Latency`] を作る「上限超過ハンドラ」。CLI の `package`／bench 工程
-//! （TASK-33.x）が、ここで得た [`LatencyLimitCheck::breach`] を
-//! [`crate::package_outcome::resolve_package_outcome`] へ渡して終了コード 20（`limit_exceeded`）を得る想定。
+//! （`stages::package`。#338）が、ここで得た [`LatencyLimitCheck::breach`] を
+//! [`crate::package_outcome::resolve_package_outcome`] へ渡して終了コード 20（`limit_exceeded`）を得る。
 //!
 //! # 設計上の不変条件
 //!

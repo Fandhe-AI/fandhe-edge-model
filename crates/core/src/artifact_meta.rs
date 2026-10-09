@@ -492,7 +492,7 @@ impl ArtifactMeta {
         &self.kind
     }
 
-    /// 種類の版（許可リスト検証は #174 で未実装）。
+    /// 種類の版（許可リスト検証は `fandhe-edge-guard` の `kind_version`〔#174〕が担う）。
     #[must_use]
     pub const fn kind_version(&self) -> u32 {
         self.kind_version

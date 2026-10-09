@@ -56,7 +56,7 @@
 //!   [`crate::eval_data_invariance`] が同じ [`fandhe_edge_core::hash::Sha256Digest`]
 //!   とスナップショット比較の形で実装する（REQ-17・TASK-27.1-2・issue #70）
 //! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2。PoC-9
-//!   `ArgumentRecordingPredictor` 相当）は未実装
+//!   `ArgumentRecordingPredictor` 相当）は [`crate::input_only`] で実装済み（本モジュールの対象外）
 //! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3）は
 //!   [`crate::final_test_once`] が担う
 //! - パッケージ全体を 1 つにまとめた合成ダイジェスト・配布パッケージの
@@ -740,7 +740,7 @@ impl<E: std::error::Error + 'static> std::error::Error for EvaluationInvarianceE
 /// 評価経路そのものを前後のパッケージハッシュ比較で包む（REQ-27「評価の
 /// 独立性」・TASK-27.1-1・issue #69）。
 ///
-/// CLI の `evaluate` 工程（将来。REQ-33・issue #140 で配線予定）が、実際の
+/// CLI の `evaluate` 工程（REQ-33。`stages::evaluate` が [`ModelPackagePaths`] を組み立てる。#314）が、実際の
 /// 推論・集計処理を `eval` クロージャとして本関数へ渡す想定。呼び出しの流れ:
 ///
 /// 1. `paths` からディスク上の構成要素を読み込み、評価前スナップショットを作る

@@ -1,7 +1,7 @@
 //! 学習ワーカーの子プロセス起動・タイムアウト・終了コード写像（REQ-21・
 //! REQ-34・REQ-39。issue #178）。
 //!
-//! Rust 側 CLI・ジョブ管理（未配線。TASK-33.x）が、学習ワーカー
+//! Rust 側 CLI の `train` 工程（`stages::train`。#136）が、学習ワーカー
 //! （`trainer/launch.py`。`train --request <path> --cancel-on-stdin-eof`）を
 //! 引数リストで子プロセス起動し、壁時計タイムアウト
 //! と標準出力／標準エラー出力の読み取り上限を掛けたうえで、
@@ -253,9 +253,8 @@ impl WorkerLauncher {
     }
 
     /// `trainer_dir`（絶対パス）から venv の python と `launch.py` を導く
-    /// 補助コンストラクタ。`trainer_dir` の発見（CLI 引数・環境変数からの
-    /// 解決）自体は本 issue の対象外で、CLI 配線（TASK-33.x）が担う
-    /// （issue #178 実装計画 3.1）。
+    /// 補助コンストラクタ。`trainer_dir` の発見は CLI の `stages::train` が
+    /// 環境変数で暫定に行う（#136。配布形態は未確定。issue #178 実装計画 3.1）。
     pub fn from_trainer_dir(trainer_dir: &Path) -> Result<Self, TrainProcessError> {
         if !trainer_dir.is_absolute() {
             return Err(TrainProcessError::InvalidLauncher {

@@ -22,7 +22,7 @@
 //! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
 //! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
 //! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
-//! 出力に含めない（未結線）。
+//! 出力に含めない（McNemar の下限基準比較は評価記録にだけ残す。#339）。
 //!
 //! [`PackageReport`]（exit 0）は `pass` と基準未定義のみを表す。`fail`（exit 10）・判定不能
 //! （exit 12）は合否基準が定義されているときにだけ生じ、判定項目つきの
