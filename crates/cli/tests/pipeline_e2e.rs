@@ -472,10 +472,11 @@ mod suite {
         assert!(env.project_file("package/artifact.json").is_file());
     }
 
-    /// REQ-27・REQ-39: 保存済みの `request.json` の `device`・時間制限・`train_path`（結果 `result.json` とは
+    /// REQ-27・REQ-39: 保存済みの `request.json` の `device`・`train_path`（結果 `result.json` とは
     /// 整合したまま）を書き換えると、`select` も `package` も、期待するリクエストを丸ごと組み立てた比較で
     /// `invalid_input`（64）・固定 message で止まり、選定記録・`package/` を作らない。`epochs` だけが違う
-    /// smoke の結果はこの照合を通る（別テストで確認済み）。
+    /// smoke の結果はこの照合を通る（別テストで確認済み）。時間制限（`time_limit_seconds`）は `train --all`
+    /// が探索予算から配分する値のため照合の例外で、`1..=3600` の値なら通る（REQ-18・#482）。
     pub fn select_and_package_reject_request_fields_beyond_kind_and_seed() {
         let env = inspected("reqfields");
         env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
@@ -483,8 +484,6 @@ mod suite {
         let original = std::fs::read_to_string(&request).expect("request.json");
         let tampers = [
             ("device", "\"device\":\"cpu\"", "\"device\":\"gpu\""),
-            // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加える。
-            ("time limit", "{", "{\"time_limit_seconds\":1,"),
             (
                 "train_path",
                 "\"train_path\":\"train_input.jsonl\"",
@@ -505,7 +504,12 @@ mod suite {
                 "{label}"
             );
         }
-        std::fs::write(&request, &original).expect("restore");
+        // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加えても照合を通る（#482）。
+        std::fs::write(
+            &request,
+            original.replacen('{', "{\"time_limit_seconds\":1,", 1),
+        )
+        .expect("time limit");
         env.ok(&["select", "--project-dir", "proj"]);
         for (label, from, to) in &tampers {
             std::fs::write(&request, original.replacen(from, to, 1)).expect("tamper");
@@ -745,6 +749,186 @@ mod suite {
             "{\"code\":\"invalid_input\",\"message\":\"validation split is empty\"}\n"
         );
         assert!(!env.project_file("split.json").exists());
+    }
+
+    /// `train --all` の stdout から `total_elapsed_ms`（実時間で変わる）の値を除いた文字列。
+    fn without_total_elapsed(stdout: &str) -> String {
+        let (head, rest) = stdout
+            .split_once("\"total_elapsed_ms\":")
+            .expect("total_elapsed_ms");
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        assert!(digits > 0, "{stdout}");
+        format!("{head}\"total_elapsed_ms\":_{}", &rest[digits..])
+    }
+
+    /// REQ-18・REQ-27・TASK-18.1・TASK-18.2・#482・#483: `train --all`（既定予算 3600 秒）は既定候補の
+    /// 全件を学習し、候補ごとに `result.json` を書いて stdout に候補別の結果を返す。`request.json` には
+    /// 均等割りの持ち時間（1 候補目は 1800 秒）が入り、それでも `select`・`package` の照合を通る。
+    /// `search_record.json` は予測本文を含まない。
+    pub fn train_all_trains_every_candidate_within_budget() {
+        let env = inspected("trainall");
+        let stdout = env.ok(&["train", "--project-dir", "proj", "--all"]);
+        assert_eq!(
+            without_total_elapsed(&stdout),
+            "{\"step\":\"train\",\"status\":\"ok\",\"budget_seconds\":3600,\"budget_reached\":false,\"total_elapsed_ms\":_,\"candidates\":[{\"candidate\":0,\"kind\":\"c1\",\"result\":\"evaluated\",\"budget_reached\":null},{\"candidate\":1,\"kind\":\"c3\",\"result\":\"evaluated\",\"budget_reached\":null}]}\n"
+        );
+        assert!(env.project_file("candidates/0/result.json").is_file());
+        assert!(env.project_file("candidates/1/result.json").is_file());
+        let request =
+            std::fs::read_to_string(env.project_file("candidates/0/request.json")).expect("req");
+        assert!(
+            request.contains("\"time_limit_seconds\":1800,"),
+            "{request}"
+        );
+        let record =
+            std::fs::read_to_string(env.project_file("search_record.json")).expect("record");
+        assert!(
+            record.starts_with("{\"budget_seconds\":3600,\"per_candidate_policy\":\"even_split\","),
+            "{record}"
+        );
+        assert!(record.ends_with("\"budget_reached\":false}\n"), "{record}");
+        for leak in ["predicted", "sample"] {
+            assert!(!record.contains(leak), "{record}");
+        }
+        assert!(
+            env.ok(&["select", "--project-dir", "proj"]).starts_with(
+                "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\""
+            )
+        );
+        assert_eq!(
+            env.ok(&["package", "--project-dir", "proj"]),
+            package_line(&env, C3_DIR, NULL_HEAD)
+        );
+    }
+
+    /// REQ-18・REQ-34・#482: `--all` と `--candidate` の併用・どちらも無し・範囲外の `--budget-seconds`・
+    /// `--candidate` と `--budget-seconds` の併用は `invalid_input`（64）。既存の候補ディレクトリ・
+    /// `search_record.json` があっても 64 で、何も作らない（やり直しは新規）。
+    pub fn train_all_rejects_invalid_arguments_and_existing_outputs() {
+        let env = inspected("trainallbad");
+        for args in [
+            &[
+                "train",
+                "--project-dir",
+                "proj",
+                "--all",
+                "--candidate",
+                "0",
+            ][..],
+            &["train", "--project-dir", "proj"][..],
+            &[
+                "train",
+                "--project-dir",
+                "proj",
+                "--all",
+                "--budget-seconds",
+                "0",
+            ][..],
+            &[
+                "train",
+                "--project-dir",
+                "proj",
+                "--all",
+                "--budget-seconds",
+                "921601",
+            ][..],
+            &[
+                "train",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "0",
+                "--budget-seconds",
+                "5",
+            ][..],
+        ] {
+            env.fails(args, 64, "invalid_input");
+        }
+        assert!(!env.project_file("candidates").exists());
+
+        std::fs::create_dir_all(env.project_file("candidates/1")).expect("existing");
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--all"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate directory already exists\"}\n"
+        );
+        assert!(!env.project_file("candidates/0").exists());
+        std::fs::remove_dir(env.project_file("candidates/1")).expect("remove");
+
+        std::fs::write(env.project_file("search_record.json"), "{}\n").expect("record");
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--all"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"search record already exists\"}\n"
+        );
+        assert!(!env.project_file("candidates/0").exists());
+    }
+
+    /// REQ-18・REQ-39・TASK-18.2・#483: 予算 1 秒は 2 候補の均等割りで持ち時間が 1 秒未満になり、全候補が
+    /// 未着手（予算到達）。評価済みが 0 件なので `limit_exceeded`（20）。`result.json`・候補ディレクトリは
+    /// 残らず、予算到達を記録した `search_record.json` は残る。
+    pub fn train_all_budget_reached_for_every_candidate_is_limit_exceeded() {
+        let env = inspected("trainallnone");
+        assert_eq!(
+            env.fails(
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--all",
+                    "--budget-seconds",
+                    "1"
+                ],
+                20,
+                "limit_exceeded"
+            ),
+            "{\"code\":\"limit_exceeded\",\"message\":\"search budget reached before any candidate was evaluated\"}\n"
+        );
+        assert!(!env.project_file("candidates/0").exists());
+        assert!(!env.project_file("candidates/1").exists());
+        let record =
+            std::fs::read_to_string(env.project_file("search_record.json")).expect("record");
+        assert_eq!(
+            record.matches("\"result\":\"not_started\"").count(),
+            2,
+            "{record}"
+        );
+        assert!(record.ends_with("\"budget_reached\":true}\n"), "{record}");
+    }
+
+    /// REQ-18・REQ-39・TASK-18.1・TASK-18.2・#482・#483: 予算 2 秒で 1 候補目（c1）が持ち時間 1 秒内に
+    /// 完了し、2 候補目（c3）の学習ワーカーが持ち時間（1 秒）を使い切って `limit_exceeded` を返すと、
+    /// c3 は `training_timed_out`・`candidate_time_limit`。評価済みが 1 件あるので exit 0・
+    /// `budget_reached:true`。c3 の候補ディレクトリは片付けられ、`select` は c1 を選ぶ。
+    pub fn train_all_candidate_time_limit_keeps_evaluated_candidate() {
+        let env = inspected("trainalltimeout");
+        std::fs::write(env.project_file("slow_c3_worker"), "").expect("marker");
+        let stdout = env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--budget-seconds",
+            "2",
+        ]);
+        assert_eq!(
+            without_total_elapsed(&stdout),
+            "{\"step\":\"train\",\"status\":\"ok\",\"budget_seconds\":2,\"budget_reached\":true,\"total_elapsed_ms\":_,\"candidates\":[{\"candidate\":0,\"kind\":\"c1\",\"result\":\"evaluated\",\"budget_reached\":null},{\"candidate\":1,\"kind\":\"c3\",\"result\":\"training_timed_out\",\"budget_reached\":\"candidate_time_limit\"}]}\n"
+        );
+        assert!(env.project_file("candidates/0/result.json").is_file());
+        assert!(!env.project_file("candidates/1").exists());
+        assert!(env.project_file("search_record.json").is_file());
+        assert!(
+            env.ok(&["select", "--project-dir", "proj"]).starts_with(
+                "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\""
+            ),
+        );
     }
 
     /// REQ-34: 学習ワーカーが失敗（異常終了・残骸あり）すると `candidates/<N>/` は片付けられ、
@@ -3609,6 +3793,20 @@ mod suite {
             std::fs::write(format!("{out_dir}/partial.bin"), b"debris").expect("debris");
             std::process::exit(1);
         }
+        // 持ち時間切れの模擬（`train --all`・#482）: 目印があれば c3 は持ち時間を使い切ってから
+        // 学習ワーカーと同じ形の `limit_exceeded`（終了コード 20）を返す。
+        if request.kind() == "c3"
+            && Path::new(request.root())
+                .join("../../slow_c3_worker")
+                .exists()
+        {
+            let limit_ms = u64::from(request.time_limit_seconds()) * 1000;
+            std::thread::sleep(std::time::Duration::from_millis(limit_ms + 100));
+            print!(
+                r#"{{"status":"error","code":"limit_exceeded","message":"worker exceeded the time limit"}}"#
+            );
+            std::process::exit(20);
+        }
         let onnx_src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/onnx_parity")
             .join(format!("{}.onnx", request.kind()));
@@ -3877,6 +4075,22 @@ fn main() -> std::process::ExitCode {
         (
             "train_failure_cleans_candidate_dir_and_allows_retry",
             suite::train_failure_cleans_candidate_dir_and_allows_retry,
+        ),
+        (
+            "train_all_trains_every_candidate_within_budget",
+            suite::train_all_trains_every_candidate_within_budget,
+        ),
+        (
+            "train_all_rejects_invalid_arguments_and_existing_outputs",
+            suite::train_all_rejects_invalid_arguments_and_existing_outputs,
+        ),
+        (
+            "train_all_budget_reached_for_every_candidate_is_limit_exceeded",
+            suite::train_all_budget_reached_for_every_candidate_is_limit_exceeded,
+        ),
+        (
+            "train_all_candidate_time_limit_keeps_evaluated_candidate",
+            suite::train_all_candidate_time_limit_keeps_evaluated_candidate,
         ),
         (
             "req23_train_detects_empty_input_preprocessing_divergence",

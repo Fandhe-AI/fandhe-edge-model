@@ -13,7 +13,8 @@
 //!
 //! `package` 工程の [`PackageReport`] のほか、TASK-33.1-2（#136）で `register`・`inspect`・
 //! `train`・`select` の完了結果（[`RegisterReport`]・[`InspectStageReport`]・[`TrainReport`]・
-//! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。
+//! [`SelectReport`]。件数・固定語彙のみでパス・本文を含まない）を追加した。`train --all`（探索予算内の
+//! 全候補の学習。#482・#483）の結果は [`TrainAllReport`]。
 //!
 //! `package` 工程の [`PackageReport`] のフィールドは PoC-16 の package 工程の
 //! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に、容量内訳と p95 の計測値
@@ -730,6 +731,63 @@ impl TrainReport {
             status: StageStatus::Ok,
             candidate,
             kind,
+        }
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// `serde_json` 側の直列化エラーをそのまま返す。
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// `train --all` が exit 0 で返す JSON（探索予算内の全候補の学習。REQ-18・REQ-33・TASK-18.1・
+/// TASK-18.2・#482・#483）。
+///
+/// 値は学習ワーカー層の探索記録（`fandhe_edge_train::search::SearchRecord`）から CLI が写す。共通コアは
+/// 学習ワーカー層に依存しないため、`result`・`budget_reached` は学習ワーカー層が定める固定語彙の文字列で
+/// 受け取る（`CandidateSearchResult::tag`・`BudgetReachedScope::tag`）。パス・データ本文は載せない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrainAllReport {
+    step: Stage,
+    status: StageStatus,
+    budget_seconds: u64,
+    budget_reached: bool,
+    total_elapsed_ms: u64,
+    candidates: Vec<TrainAllCandidate>,
+}
+
+/// [`TrainAllReport`] の候補 1 件（宣言順）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrainAllCandidate {
+    /// 候補の添字（`--candidate` と同じ）。
+    pub candidate: usize,
+    /// 候補の種類 ID（`c1` 等）。
+    pub kind: String,
+    /// 探索結果の分類（`evaluated`・`training_timed_out`・`not_started` 等）。
+    pub result: &'static str,
+    /// 予算到達の範囲（`search_budget`・`candidate_time_limit`）。該当しなければ `null`。
+    pub budget_reached: Option<&'static str>,
+}
+
+impl TrainAllReport {
+    /// `train --all` の完了結果を作る。
+    #[must_use]
+    pub fn new(
+        budget_seconds: u64,
+        budget_reached: bool,
+        total_elapsed_ms: u64,
+        candidates: Vec<TrainAllCandidate>,
+    ) -> Self {
+        Self {
+            step: Stage::Train,
+            status: StageStatus::Ok,
+            budget_seconds,
+            budget_reached,
+            total_elapsed_ms,
+            candidates,
         }
     }
 
@@ -1476,6 +1534,34 @@ mod tests {
                 .to_json_line()
                 .expect("json"),
             "{\"step\":\"inspect\",\"status\":\"ok\",\"valid_records\":10,\"split\":{\"train\":8,\"validation\":1,\"test\":1}}"
+        );
+    }
+
+    /// REQ-18・#482・#483: `train --all` の JSON が契約どおりのキー順・値で完全一致する。
+    #[test]
+    fn req18_train_all_report_json_is_exact() {
+        let report = TrainAllReport::new(
+            3600,
+            true,
+            4210,
+            vec![
+                TrainAllCandidate {
+                    candidate: 0,
+                    kind: "c1".to_string(),
+                    result: "evaluated",
+                    budget_reached: None,
+                },
+                TrainAllCandidate {
+                    candidate: 1,
+                    kind: "c3".to_string(),
+                    result: "training_timed_out",
+                    budget_reached: Some("candidate_time_limit"),
+                },
+            ],
+        );
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            "{\"step\":\"train\",\"status\":\"ok\",\"budget_seconds\":3600,\"budget_reached\":true,\"total_elapsed_ms\":4210,\"candidates\":[{\"candidate\":0,\"kind\":\"c1\",\"result\":\"evaluated\",\"budget_reached\":null},{\"candidate\":1,\"kind\":\"c3\",\"result\":\"training_timed_out\",\"budget_reached\":\"candidate_time_limit\"}]}"
         );
     }
 

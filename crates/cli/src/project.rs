@@ -97,6 +97,9 @@ pub const PACKAGE_DIR: &str = "package";
 /// `package` 工程の組み立て・容量計測用のステージング。上限内のときだけ [`PACKAGE_DIR`] へ
 /// 原子的に名前替えして公開する（推論可能な場所に超過したパッケージを残さない。REQ-30・REQ-39）。
 pub const PACKAGE_STAGING_DIR: &str = "package.staging";
+/// `train --all` が書く探索記録（`SearchRecord`。予算到達の記録。読み込み上限は
+/// `fandhe_edge_train::stage_files::MAX_SEARCH_RECORD_BYTES`。REQ-18・TASK-18.2・#483）。
+pub const SEARCH_RECORD_FILE: &str = "search_record.json";
 /// 候補ディレクトリ内の学習リクエスト（`select` が結果の再検証に使う）。
 pub const REQUEST_FILE: &str = "request.json";
 /// `train --train-seed` で学習 seed を上書きした候補だけに置く、実際に使った seed の記録

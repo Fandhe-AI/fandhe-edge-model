@@ -11,6 +11,7 @@
 //! # 入出力
 //!
 //! - [`trainer_jsonl`]: trainer が受け付ける `{"input","label"}`（2 キー限定）の JSONL を作る
+//! - [`search_record_json_vec`]: `train --all` の探索記録 `search_record.json`（#483）
 //! - [`outcome_json_vec`]: 学習結果の保存用 JSON（保存後も
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
@@ -24,6 +25,7 @@ use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
 
 use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
+use crate::search::SearchRecord;
 
 /// 保存・採点の失敗（内容を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,24 @@ where
 pub fn outcome_json_vec(outcome: &TrainOutcome) -> Result<Vec<u8>, StageFileError> {
     let mut bytes = serde_json::to_vec(outcome).map_err(|_| StageFileError::Serialize)?;
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// `train --all` が書く探索記録 `search_record.json` の上限（バイト。読み書き共通。REQ-18・REQ-39・
+/// TASK-18.2・#483）。候補数の上限（256）でも数十 KiB に収まる大きさで、超えるものは書かない。
+pub const MAX_SEARCH_RECORD_BYTES: usize = 1024 * 1024;
+
+/// 探索記録（[`SearchRecord`]）を保存用の JSON 1 行（末尾改行つき）へ直列化する。validation の予測本文は
+/// [`SearchRecord`] の直列化が出さない（REQ-27・security.md）。
+///
+/// # Errors
+/// 直列化に失敗した場合（`Serialize`）、または [`MAX_SEARCH_RECORD_BYTES`] を超える場合（`LimitExceeded`）。
+pub fn search_record_json_vec(record: &SearchRecord) -> Result<Vec<u8>, StageFileError> {
+    let mut bytes = serde_json::to_vec(record).map_err(|_| StageFileError::Serialize)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_SEARCH_RECORD_BYTES {
+        return Err(StageFileError::LimitExceeded);
+    }
     Ok(bytes)
 }
 

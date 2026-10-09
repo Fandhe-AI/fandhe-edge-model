@@ -18,6 +18,20 @@
 //! 作成後に失敗した場合は、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける
 //! （同じ `--candidate` を再試行できる。チェックポイントからの再開は提供しない。REQ-34）。
 //!
+//! # `--all`（探索予算内の全候補。REQ-18・TASK-18.1・TASK-18.2・#482・#483）
+//!
+//! [`run_all`] は既定候補の全件を、学習ワーカー層の [`run_search`]（1 プロセス・1 時計で探索予算全体を
+//! 追跡し、持ち時間は均等割り固定）と [`WorkerCandidateRunner`] で宣言順に学習する。探索・選定・予算到達の
+//! 判定は学習ワーカー層のものをそのまま使い、本モジュールは再実装しない。候補 N の学習ジョブの直前に
+//! `candidates/<N>/` を作って `train_input.jsonl`・`request.json`（配分した持ち時間入り）・`job/` を置き、
+//! 探索後に `evaluated` の候補だけ `result.json` を書く。それ以外（予算到達・失敗・未着手）の候補ディレクトリは
+//! 片付ける（選定対象にしない）。探索記録はプロジェクト直下の `search_record.json`（#483）。
+//!
+//! 終了コード: `evaluated` が 1 件以上なら 0。0 件で予算到達があれば `limit_exceeded`（20）、予算到達が
+//! 無ければ宣言順で最初の失敗候補のワーカー失敗コードの写像（単発の `train` と同じ）。探索自体の失敗は
+//! `runtime_error`（70。候補の準備・子プロセスの起動失敗は単発の `train` と同じ写像）。探索が完了していれば
+//! 失敗時も `search_record.json` は残す。
+//!
 //! # 学習ワーカーの発見（暫定）
 //!
 //! 環境変数 [`TRAINER_DIR_ENV`]（絶対パスのみ）。未設定なら開発ツリーの `trainer/`
@@ -27,27 +41,37 @@ use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
-use fandhe_edge_core::stage_report::TrainReport;
+use fandhe_edge_core::stage_report::{TrainAllCandidate, TrainAllReport, TrainReport};
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty_input_encodings};
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
+use fandhe_edge_train::error::TrainProcessError;
 use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
-use fandhe_edge_train::process::{RunLimits, WorkerLauncher, run_train};
+use fandhe_edge_train::process::{RunLimits, WorkerCandidateRunner, WorkerLauncher, run_train};
 use fandhe_edge_train::request::{
     Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
 use fandhe_edge_train::result::TrainOutcome;
-use fandhe_edge_train::search::SearchCandidate;
-use fandhe_edge_train::stage_files::{StageFileError, outcome_json_vec, trainer_jsonl};
+use fandhe_edge_train::search::{
+    CandidateSearchResult, SearchBudget, SearchCandidate, SearchError, SearchInput, SearchRecord,
+    run_search,
+};
+use fandhe_edge_train::stage_files::{
+    StageFileError, outcome_json_vec, search_record_json_vec, trainer_jsonl,
+};
+use fandhe_edge_train::time_allotment::{
+    CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
+};
 
 use super::inspect::split_rows;
 use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
-    CANDIDATES_DIR, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE, RESULT_FILE,
-    SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
+    CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE,
+    RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid,
+    runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -135,12 +159,12 @@ pub fn resolve_candidates(
     Ok(resolution.into_candidates())
 }
 
-/// `train` を実行する。
+/// `train --candidate <index>` を実行する。
 ///
 /// # Errors
 /// 前提（`inspect` 済み）の欠落・候補の範囲外・既存の候補ディレクトリは `invalid_input`（64）、
 /// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。
-pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
+pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
     super::inspect::ensure_evaluation_frozen(&project)?;
@@ -152,17 +176,13 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     // [`effective_train_seed`] でそれを正とする（`request.json` の seed 改ざんは従来どおり照合で弾く）。
     let seed = args.train_seed.unwrap_or(split_seed);
 
-    let mut candidates = resolve_candidates(&project, &definition, args.candidate, seed)?;
-    if args.candidate >= candidates.len() {
+    let mut candidates = resolve_candidates(&project, &definition, index, seed)?;
+    if index >= candidates.len() {
         return Err(invalid("candidate index is out of range"));
     }
-    let mut candidate = candidates.swap_remove(args.candidate);
+    let mut candidate = candidates.swap_remove(index);
     if args.smoke {
-        // 動作確認用の軽量実行（エポック数のみ 1 へ）。全種類の既定設定が `epochs` を持つ。
-        candidate
-            .params
-            .config
-            .insert("epochs".to_string(), 1.into());
+        apply_smoke(&mut candidate);
     }
 
     let train_jsonl = trainer_jsonl(
@@ -170,10 +190,9 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     )
     .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
     let request = build_train_request(candidate.params, &records, &split)?;
-    let request_json = request.to_json_vec().map_err(|e| e.to_error_report())?;
     let launcher = worker_launcher()?;
 
-    let rel = candidate_rel(args.candidate);
+    let rel = candidate_rel(index);
     if !project.exists(CANDIDATES_DIR)? {
         project.create_dir(CANDIDATES_DIR)?;
     }
@@ -187,11 +206,10 @@ pub fn run(args: &TrainArgs, cwd: &Path) -> Result<TrainReport, ErrorReport> {
         &launcher,
         &request,
         &train_jsonl,
-        &request_json,
         args.train_seed,
     );
     match trained {
-        Ok(()) => Ok(TrainReport::new(args.candidate, candidate.candidate_id)),
+        Ok(()) => Ok(TrainReport::new(index, candidate.candidate_id)),
         Err(mut report) => {
             if !project.remove_created_dir(&created) {
                 // 元のエラーの終了コードは変えず、残骸があることだけ固定文言で付記する。
@@ -212,15 +230,9 @@ fn train_in_candidate_dir(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
     train_jsonl: &[u8],
-    request_json: &[u8],
     train_seed_override: Option<u32>,
 ) -> Result<(), ErrorReport> {
-    let job_dir = project.create_dir(rel.join(JOB_DIR))?;
-    project.write_new(rel.join(TRAIN_INPUT_FILE), train_jsonl)?;
-    project.write_new(rel.join(REQUEST_FILE), request_json)?;
-    if let Some(seed) = train_seed_override {
-        project.write_new(rel.join(TRAIN_SEED_FILE), seed.to_string().as_bytes())?;
-    }
+    let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)?;
 
     let run = run_train(
         launcher,
@@ -242,6 +254,322 @@ fn train_in_candidate_dir(
     let result_json =
         outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
     project.write_new(rel.join(RESULT_FILE), &result_json)
+}
+
+/// 作成済みの候補ディレクトリ `rel` へ `job/`・`train_input.jsonl`・`request.json`（・`--train-seed` の
+/// 記録）を置き、`job/` の絶対パスを返す（単発の `train` と `train --all` が共有する）。
+fn prepare_candidate_dir(
+    project: &Project,
+    rel: &Path,
+    request: &TrainRequest,
+    train_jsonl: &[u8],
+    train_seed_override: Option<u32>,
+) -> Result<PathBuf, ErrorReport> {
+    let request_json = request.to_json_vec().map_err(|e| e.to_error_report())?;
+    let job_dir = project.create_dir(rel.join(JOB_DIR))?;
+    project.write_new(rel.join(TRAIN_INPUT_FILE), train_jsonl)?;
+    project.write_new(rel.join(REQUEST_FILE), &request_json)?;
+    if let Some(seed) = train_seed_override {
+        project.write_new(rel.join(TRAIN_SEED_FILE), seed.to_string().as_bytes())?;
+    }
+    Ok(job_dir)
+}
+
+/// `train --smoke`: 動作確認用の軽量実行（エポック数のみ 1 へ）。全種類の既定設定が `epochs` を持つ。
+fn apply_smoke(candidate: &mut SearchCandidate) {
+    candidate
+        .params
+        .config
+        .insert("epochs".to_string(), 1.into());
+}
+
+/// 候補 1 件の学習ジョブを、用意済みの `job/` で実行する関数の型（本番は [`WorkerCandidateRunner`]。
+/// テストは偽の実行で差し替える）。
+type JobFn<'a> = dyn FnMut(&TrainRequest, &Path) -> Result<TrainOutcome, TrainProcessError> + 'a;
+
+/// `train --all` を実行する（REQ-18・REQ-27・REQ-34・REQ-39・TASK-18.1・TASK-18.2・#482・#483）。
+///
+/// # Errors
+/// 前提の欠落・既存の候補ディレクトリ・既存の `search_record.json` は `invalid_input`（64）。
+/// 評価済みの候補が無いときの終了コードはモジュール doc「`--all`」のとおり。
+pub fn run_all(
+    args: &TrainArgs,
+    budget: SearchBudget,
+    cwd: &Path,
+) -> Result<TrainAllReport, ErrorReport> {
+    let launcher_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+        let launcher = worker_launcher()?;
+        Ok(Box::new(move |request: &TrainRequest, job_dir: &Path| {
+            WorkerCandidateRunner::new(&launcher, job_dir).run(request)
+        }))
+    };
+    run_all_with(args, budget, cwd, launcher_job, &SystemClock::new())
+}
+
+/// [`run_all`] の本体。学習ジョブの実行（`make_job`。前提の確認後に 1 回だけ呼ぶ）と時計を差し替えられる。
+fn run_all_with<'a, M, C>(
+    args: &TrainArgs,
+    budget: SearchBudget,
+    cwd: &Path,
+    make_job: M,
+    clock: &C,
+) -> Result<TrainAllReport, ErrorReport>
+where
+    M: FnOnce() -> Result<Box<JobFn<'a>>, ErrorReport>,
+    C: Clock,
+{
+    let project = Project::open(cwd, &args.project_dir)?;
+    // 副作用の前に、評価データが凍結記録どおりか確認する（REQ-17）。
+    super::inspect::ensure_evaluation_frozen(&project)?;
+    let definition = project.load_definition()?;
+    let records = project.load_records(&definition)?;
+    let (split, split_seed) = verified_split(&project, &records)?;
+    let split_record = read_split_record(&project)?;
+    let seed = args.train_seed.unwrap_or(split_seed);
+
+    // 候補 N の `root` は `candidates/<N>`。単発の `train --candidate N` と同じ解決を候補ごとに行う。
+    let n_candidates = resolve_candidates(&project, &definition, 0, seed)?.len();
+    let mut candidates = Vec::with_capacity(n_candidates);
+    for index in 0..n_candidates {
+        let mut candidate = resolve_candidates(&project, &definition, index, seed)?
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| runtime("candidate resolution is inconsistent"))?;
+        if args.smoke {
+            apply_smoke(&mut candidate);
+        }
+        candidates.push(candidate);
+    }
+    // やり直しは新規（REQ-34）。既存の探索記録・候補ディレクトリがあれば何も作らずに止める。
+    if project.exists(SEARCH_RECORD_FILE)? {
+        return Err(invalid("search record already exists"));
+    }
+    for index in 0..n_candidates {
+        if project.exists(candidate_rel(index))? {
+            return Err(invalid("candidate directory already exists"));
+        }
+    }
+
+    let train_jsonl = trainer_jsonl(
+        train_rows(&records, &split).map(|r| (r.input.as_str(), r.label_id.as_str())),
+    )
+    .map_err(|e| stage_file_error_report(e, "cannot build training data"))?;
+    let label_order = label_order_from_definition(&definition)
+        .map_err(|e| e.to_error_report())?
+        .into_vec();
+    let label_refs: Vec<&str> = label_order.iter().map(String::as_str).collect();
+    // validation は分割記録の validation のみ（凍結した最終 test・評価データは使わない。REQ-27）。
+    // 並びは `build_train_request` と同じ（`select`・`package` の照合が通るように）。
+    let validation: Vec<&ValidRecord> = records
+        .iter()
+        .filter(|r| split.by_record.get(&r.id) == Some(&Split::Validation))
+        .collect();
+    let gold: Vec<&str> = validation.iter().map(|r| r.label_id.as_str()).collect();
+    let ids: Vec<&str> = validation.iter().map(|r| r.id.as_str()).collect();
+    let inputs: Vec<&[u8]> = validation.iter().map(|r| r.input.as_bytes()).collect();
+    let roots: Vec<String> = candidates.iter().map(|c| c.params.root.clone()).collect();
+    let job = make_job()?;
+
+    if !project.exists(CANDIDATES_DIR)? {
+        project.create_dir(CANDIDATES_DIR)?;
+    }
+    let mut runner = CandidateDirRunner {
+        project: &project,
+        train_jsonl: &train_jsonl,
+        train_seed_override: args.train_seed,
+        created: std::iter::repeat_with(|| None).take(roots.len()).collect(),
+        outcomes: vec![None; roots.len()],
+        roots,
+        job,
+    };
+    let searched = run_search(
+        &mut runner,
+        clock,
+        SearchInput {
+            label_order: &label_refs,
+            validation_gold: &gold,
+            validation_record_ids: &ids,
+            validation_inputs: &inputs,
+            validation_split_record: &split_record,
+            candidates,
+            budget,
+            policy: PerCandidatePolicy::EvenSplit,
+        },
+    );
+    let record = match searched {
+        Ok(record) => record,
+        Err(error) => return Err(runner.clean_up(search_error_report(error))),
+    };
+    if let Err(report) = runner.publish(&record) {
+        return Err(runner.clean_up(report));
+    }
+    all_outcome(&record, &runner.outcomes)
+}
+
+/// 探索結果から `train --all` の終了コードと stdout を決める（モジュール doc「`--all`」）。
+fn all_outcome(
+    record: &SearchRecord,
+    outcomes: &[Option<TrainOutcome>],
+) -> Result<TrainAllReport, ErrorReport> {
+    let is_evaluated =
+        |r: &CandidateSearchResult| matches!(r, CandidateSearchResult::Evaluated { .. });
+    if !record.candidates.iter().any(|e| is_evaluated(&e.result)) {
+        if record.budget_reached {
+            return Err(fail(
+                ExitCode::LimitExceeded,
+                "search budget reached before any candidate was evaluated",
+            ));
+        }
+        // 宣言順で最初の失敗候補。ワーカーの失敗は単発の `train` と同じ写像、採点の失敗は 70。
+        let first_failure = record.candidates.iter().enumerate().find(|(_, e)| {
+            matches!(
+                e.result,
+                CandidateSearchResult::TrainingNotCompleted | CandidateSearchResult::ScoringFailed
+            )
+        });
+        return Err(first_failure
+            .and_then(|(index, _)| outcomes.get(index).and_then(Option::as_ref))
+            .and_then(train_outcome_error_report)
+            .unwrap_or_else(|| runtime("no candidate was evaluated")));
+    }
+    let candidates = record
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| TrainAllCandidate {
+            candidate: index,
+            kind: entry.candidate_id.clone(),
+            result: entry.result.tag(),
+            budget_reached: entry.budget_reached().map(|scope| scope.tag()),
+        })
+        .collect();
+    Ok(TrainAllReport::new(
+        record.budget_seconds,
+        record.budget_reached,
+        record.total_elapsed_ms,
+        candidates,
+    ))
+}
+
+/// 探索自体の失敗の写像。候補の準備・学習ジョブの起動の失敗は単発の `train` と同じ写像、それ以外は
+/// `runtime_error`（70。分割は探索の前に検証済みのため、探索の入力検証で止まるのは内部の不整合）。
+fn search_error_report(error: SearchError<AllRunError>) -> ErrorReport {
+    match error {
+        SearchError::Candidate {
+            source: CandidateTimeError::Runner(AllRunError::Report(report)),
+            ..
+        } => report,
+        SearchError::Candidate {
+            source: CandidateTimeError::Runner(AllRunError::Process(process)),
+            ..
+        } => process.to_error_report(),
+        _ => runtime("candidate search failed"),
+    }
+}
+
+/// [`CandidateDirRunner`] の失敗（学習ジョブの子プロセスの失敗と、候補の準備・検査の失敗）。
+enum AllRunError {
+    Process(TrainProcessError),
+    Report(ErrorReport),
+}
+
+/// `train --all` の実行器: 候補の学習ジョブの直前に `candidates/<N>/` を作って入力を置き、学習ジョブを
+/// 実行して結果を控える（[`run_search`] の [`CandidateRunner`]）。候補は `request.root()` で特定する。
+struct CandidateDirRunner<'p, 'j> {
+    project: &'p Project,
+    roots: Vec<String>,
+    train_jsonl: &'p [u8],
+    train_seed_override: Option<u32>,
+    /// 候補ごとに作ったディレクトリ（後始末用）。
+    created: Vec<Option<CreatedDir>>,
+    /// 候補ごとの学習結果（`result.json` と失敗コードの写像に使う）。
+    outcomes: Vec<Option<TrainOutcome>>,
+    job: Box<JobFn<'j>>,
+}
+
+impl CandidateRunner for CandidateDirRunner<'_, '_> {
+    type Error = AllRunError;
+
+    fn run(&mut self, request: &TrainRequest) -> Result<TrainOutcome, AllRunError> {
+        let index = self
+            .roots
+            .iter()
+            .position(|root| root == request.root())
+            .ok_or_else(|| AllRunError::Report(runtime("unexpected candidate request")))?;
+        let rel = candidate_rel(index);
+        let created = self
+            .project
+            .create_dir_tracked(&rel)
+            .map_err(AllRunError::Report)?;
+        if let Some(slot) = self.created.get_mut(index) {
+            *slot = Some(created);
+        }
+        let job_dir = prepare_candidate_dir(
+            self.project,
+            &rel,
+            request,
+            self.train_jsonl,
+            self.train_seed_override,
+        )
+        .map_err(AllRunError::Report)?;
+        let outcome = (self.job)(request, &job_dir).map_err(AllRunError::Process)?;
+        if let TrainOutcome::Ok(success) = &outcome {
+            check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())
+                .map_err(AllRunError::Report)?;
+        }
+        if let Some(slot) = self.outcomes.get_mut(index) {
+            *slot = Some(outcome.clone());
+        }
+        Ok(outcome)
+    }
+
+    fn is_wall_timeout(error: &AllRunError) -> bool {
+        matches!(error, AllRunError::Process(e) if <WorkerCandidateRunner<'_> as CandidateRunner>::is_wall_timeout(e))
+    }
+}
+
+impl CandidateDirRunner<'_, '_> {
+    /// 探索記録を書き、`evaluated` の候補だけ `result.json` を書いて、それ以外の候補ディレクトリを片付ける。
+    fn publish(&mut self, record: &SearchRecord) -> Result<(), ErrorReport> {
+        let bytes = search_record_json_vec(record)
+            .map_err(|_| runtime("cannot serialize search record"))?;
+        self.project.write_new(SEARCH_RECORD_FILE, &bytes)?;
+        let mut cleaned = true;
+        for (index, entry) in record.candidates.iter().enumerate() {
+            if matches!(entry.result, CandidateSearchResult::Evaluated { .. }) {
+                let outcome = self
+                    .outcomes
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| runtime("evaluated candidate has no train result"))?;
+                let result_json = outcome_json_vec(outcome)
+                    .map_err(|_| runtime("cannot serialize train result"))?;
+                self.project
+                    .write_new(candidate_rel(index).join(RESULT_FILE), &result_json)?;
+            } else if let Some(created) = self.created.get_mut(index).and_then(Option::take) {
+                cleaned &= self.project.remove_created_dir(&created);
+            }
+        }
+        if cleaned {
+            Ok(())
+        } else {
+            Err(runtime("candidate directory could not be cleaned up"))
+        }
+    }
+
+    /// 作った候補ディレクトリをすべて片付け、`report` を返す（片付けられなければ固定文言を付記する）。
+    fn clean_up(&mut self, mut report: ErrorReport) -> ErrorReport {
+        let mut cleaned = true;
+        for created in self.created.iter_mut().filter_map(Option::take) {
+            cleaned &= self.project.remove_created_dir(&created);
+        }
+        if !cleaned {
+            report
+                .message
+                .push_str("; candidate directory could not be cleaned up");
+        }
+        report
+    }
 }
 
 /// 学習ワーカー（Python）が報告した空入力のトークン列を、推論ランタイム（Rust）の前処理
@@ -370,7 +698,7 @@ pub fn build_train_request(
         .map_err(|e| e.to_error_report())
 }
 
-/// 保存済みの学習リクエストが、期待する学習リクエストと（`epochs` を除いて）完全に一致するかを返す
+/// 保存済みの学習リクエストが、期待する学習リクエストと（`epochs`・`time_limit_seconds` を除いて）完全に一致するかを返す
 /// （`select`・`package` が、別の構成・別の場所の学習結果を候補 N として扱わないための照合。
 /// REQ-27・REQ-39）。
 ///
@@ -381,10 +709,12 @@ pub fn build_train_request(
 /// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
 /// 移動すると一致せず拒否される（fail-closed として許容する）。
 ///
-/// **例外は `epochs` の 1 か所だけ**: `train --smoke` が 1 へ上書きする唯一の項目のため、期待値の
-/// `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
-/// [`request_is_smoke_trained`] で判定する）。実行時の環境でしか決まらない値（学習ワーカーの実行
-/// ファイルのパス等）はリクエストに含まれないため、除外した項目は他にない。
+/// **例外は `epochs` と `time_limit_seconds` の 2 か所だけ**: `epochs` は `train --smoke` が 1 へ上書きする
+/// 項目のため、期待値の `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
+/// [`request_is_smoke_trained`] で判定する）。`time_limit_seconds` は `train --all` が探索予算から配分した
+/// 持ち時間で、型で `1..=MAX_TRAIN_WALL_SECONDS` に収まる（REQ-18・#482）。どちらも学習の構成・データ・
+/// 出力先を変えない。実行時の環境でしか決まらない値（学習ワーカーの実行ファイルのパス等）はリクエストに
+/// 含まれないため、除外した項目は他にない。
 #[must_use]
 pub fn request_matches_candidate(
     request: &TrainRequest,
@@ -393,6 +723,7 @@ pub fn request_matches_candidate(
     split: &SplitResult,
 ) -> bool {
     let mut expected_params = params.clone();
+    expected_params.time_limit_seconds = Some(request.time_limit_seconds());
     match request.config().get("epochs") {
         Some(epochs) => {
             expected_params
@@ -503,5 +834,247 @@ mod tests {
             stage_file_error_report(StageFileError::Serialize, "cannot build training data");
         assert_eq!(report.code, ExitCode::RuntimeError);
         assert_eq!(report.message, "cannot build training data");
+    }
+}
+/// `train --all` の探索予算の配線（REQ-18・REQ-34・REQ-39・TASK-18.1・TASK-18.2・#482・#483）。
+///
+/// 証拠の種別: テストハーネス。学習ジョブは偽の実行（`JobFn`）、時計は偽の単調時計で、子プロセスも
+/// MLX も使わない（GPU を使わない）。データは本モジュールが生成する合成データのみ。
+#[cfg(all(test, unix))]
+mod all_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use fandhe_edge_core::hash::Sha256Digest;
+    use fandhe_edge_train::time_allotment::TimeAllotmentError;
+
+    use crate::args::{InspectArgs, RegisterArgs, SelectArgs, TrainTarget};
+
+    const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
+    /// `c1` の既定設定（`fixtures/train_contract/kind_defaults.json` と同じ具体値。結果の `config` は
+    /// 既定値と完全一致する必要がある）。
+    const C1_CONFIG: &str = r#"{"ngram_min":1,"ngram_max":4,"min_df":2,"max_features":200000,"C":1.0,"epochs":30,"batch_size":64,"lr":0.5}"#;
+
+    /// 呼ばれるたびに 300 ms 進む偽の単調時計（候補の学習ジョブの外の処理時間の模擬。学習ジョブの
+    /// 所要時間は `JobFn` が `now` を進めて表す）。
+    struct FakeClock {
+        now_ms: Rc<Cell<u64>>,
+    }
+
+    impl Clock for FakeClock {
+        fn monotonic(&self) -> Duration {
+            let now = self.now_ms.get() + 300;
+            self.now_ms.set(now);
+            Duration::from_millis(now)
+        }
+        fn unix_millis(&self) -> Result<u64, TimeAllotmentError> {
+            Ok(1_790_000_000_000)
+        }
+    }
+
+    /// `register`・`inspect` 済みのプロジェクト `proj` を持つ作業ディレクトリ（cwd）。
+    fn inspected_workdir(case: &str) -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!("fandhe-train-all-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("def")).expect("mkdir");
+        let options: Vec<String> = LABELS
+            .iter()
+            .map(|l| format!(r#"{{"id":"{l}","display_name":"{l}","description":"dummy"}}"#))
+            .collect();
+        std::fs::write(
+            dir.join("def/definition.json"),
+            format!(
+                r#"{{"schema":"fandhe-edge-model-definition/v1","name":"train_all","version":1,"judgment_type":"single_select","options":[{}],"io":{{"input":"bytes"}}}}"#,
+                options.join(",")
+            ),
+        )
+        .expect("definition");
+        let mut data = String::new();
+        for i in 0..30 {
+            for l in LABELS {
+                data.push_str(&format!(
+                    "{{\"id\":\"{l}-{i}\",\"input\":\"{l} sample {i}\",\"output\":{{\"intent\":\"{l}\"}},\"group_id\":\"g-{l}-{i}\"}}\n"
+                ));
+            }
+        }
+        std::fs::write(dir.join("def/train.jsonl"), data).expect("train");
+        super::super::register::run(
+            &RegisterArgs {
+                definition: "def/definition.json".into(),
+                project_dir: "proj".into(),
+            },
+            &dir,
+        )
+        .expect("register");
+        super::super::inspect::run(
+            &InspectArgs {
+                project_dir: "proj".into(),
+                seed: 42,
+            },
+            &dir,
+        )
+        .expect("inspect");
+        dir
+    }
+
+    fn all_args() -> TrainArgs {
+        TrainArgs {
+            project_dir: "proj".into(),
+            target: TrainTarget::All {
+                budget: SearchBudget::default(),
+            },
+            smoke: false,
+            train_seed: None,
+        }
+    }
+
+    /// 偽の `c1` 学習: 成果物（共有 fixture の ONNX と `artifact.json`）を置き、validation を常に `alpha` と
+    /// 予測した成功結果を返す。
+    fn fake_c1_success(request: &TrainRequest) -> TrainOutcome {
+        assert_eq!(request.kind(), "c1", "only c1 is expected to run");
+        let out_dir = format!("{}/{}", request.root(), request.out_dir());
+        std::fs::create_dir(&out_dir).expect("out dir");
+        let onnx = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/onnx_parity/c1.onnx"
+        ))
+        .expect("fixture onnx");
+        std::fs::write(format!("{out_dir}/model.onnx"), &onnx).expect("onnx");
+        let sha = Sha256Digest::of_bytes(&onnx).to_hex();
+        let labels = r#""alpha","beta","gamma""#;
+        let (version, max_bytes) = (request.kind_version(), request.max_bytes());
+        std::fs::write(
+            format!("{out_dir}/artifact.json"),
+            format!(
+                r#"{{"kind":"c1","kind_version":{version},"max_bytes":{max_bytes},"label_order":[{labels}],"onnx_file":"model.onnx","onnx_sha256":"{sha}"}}"#
+            ),
+        )
+        .expect("artifact.json");
+        let predictions: Vec<String> = request
+            .validation_inputs()
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                format!(
+                    r#"{{"id":"{}","status":"ok","predicted_label":"alpha"}}"#,
+                    v.id()
+                )
+            })
+            .collect();
+        let stdout = format!(
+            r#"{{"status":"ok","artifact_dir":"{out_dir}","artifact":{{"kind":"c1","kind_version":{version},"selector_version":"0.1","config":{C1_CONFIG},"label_order":[{labels}],"output_type":"choice","max_bytes":{max_bytes},"onnx_file":"model.onnx","onnx_sha256":"{sha}","created_utc":"2026-09-30T00:00:00Z","candidate_label":"c1"}},"empty_input_ids":[0],"validation_predictions":[{}]}}"#,
+            predictions.join(",")
+        );
+        TrainOutcome::from_worker_stdout(stdout.as_bytes(), request).expect("fake outcome")
+    }
+
+    /// REQ-18・TASK-18.1・TASK-18.2・#482・#483: 予算 3 秒（開始時の残り 2 秒台を均等割りし、1 候補目の
+    /// 持ち時間は 1 秒）で 1 候補目が持ち時間内（900 ms）に完了し、候補の外の処理と合わせて 2.4 秒を
+    /// 使うと、残り予算が 1 秒未満になり 2 候補目は未着手（`not_started`・
+    /// `search_budget`）。評価済みが 1 件あるので exit 0・`budget_reached:true`。`result.json` は
+    /// 1 候補目だけ、2 候補目の候補ディレクトリは作られず、`search_record.json` が残り、`select` は
+    /// 1 候補目を選ぶ（保存済み `request.json` の `time_limit_seconds:1` が照合を通る）。
+    #[test]
+    fn req18_issue482_small_budget_evaluates_first_and_leaves_second_not_started() {
+        let cwd = inspected_workdir("small");
+        let now_ms = Rc::new(Cell::new(0));
+        let clock = FakeClock {
+            now_ms: Rc::clone(&now_ms),
+        };
+        let job_now = Rc::clone(&now_ms);
+        let make_job = move || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(move |request: &TrainRequest, _job: &Path| {
+                job_now.set(job_now.get() + 600);
+                Ok(fake_c1_success(request))
+            }))
+        };
+        let budget = SearchBudget::new(3).expect("budget");
+        let report =
+            run_all_with(&all_args(), budget, &cwd, make_job, &clock).expect("train --all");
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            "{\"step\":\"train\",\"status\":\"ok\",\"budget_seconds\":3,\"budget_reached\":true,\"total_elapsed_ms\":2700,\"candidates\":[{\"candidate\":0,\"kind\":\"c1\",\"result\":\"evaluated\",\"budget_reached\":null},{\"candidate\":1,\"kind\":\"c3\",\"result\":\"not_started\",\"budget_reached\":\"search_budget\"}]}"
+        );
+        let proj = cwd.join("proj");
+        assert!(proj.join("candidates/0/result.json").is_file());
+        assert!(!proj.join("candidates/1").exists());
+        let request =
+            std::fs::read_to_string(proj.join("candidates/0/request.json")).expect("request.json");
+        assert!(request.contains("\"time_limit_seconds\":1,"), "{request}");
+        let record = std::fs::read_to_string(proj.join(SEARCH_RECORD_FILE)).expect("record");
+        assert!(
+            record.starts_with("{\"budget_seconds\":3,\"per_candidate_policy\":\"even_split\",")
+        );
+        assert!(record.ends_with("\"budget_reached\":true}\n"), "{record}");
+        assert!(!record.contains("predicted"), "{record}");
+
+        let selected = super::super::select::run(
+            &SelectArgs {
+                project_dir: "proj".into(),
+            },
+            &cwd,
+        )
+        .expect("select")
+        .to_json_line()
+        .expect("json");
+        assert!(
+            selected.starts_with(
+                "{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\""
+            ),
+            "{selected}"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-18・REQ-34・#482: 全候補の学習ワーカーが失敗（予算到達なし）すると、宣言順で最初の失敗候補の
+    /// 失敗コードの写像（`training_diverged` は 12）で終わる。候補ディレクトリはすべて片付けられ、
+    /// `search_record.json` は残る。再実行は既存の探索記録で `invalid_input`（やり直しは新規。REQ-34）。
+    #[test]
+    fn req18_issue482_all_failed_maps_first_worker_failure_and_keeps_record() {
+        let cwd = inspected_workdir("failed");
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(|request: &TrainRequest, _job: &Path| {
+                let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+            }))
+        };
+        let error = run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
+            .expect_err("no candidate evaluated");
+        assert_eq!(error.code, ExitCode::Pending);
+        assert_eq!(error.message, "train worker failed: training_diverged");
+        let proj = cwd.join("proj");
+        assert!(!proj.join("candidates/0").exists());
+        assert!(!proj.join("candidates/1").exists());
+        let record = std::fs::read_to_string(proj.join(SEARCH_RECORD_FILE)).expect("record");
+        assert!(
+            record.contains("\"result\":\"training_not_completed\""),
+            "{record}"
+        );
+        assert!(record.ends_with("\"budget_reached\":false}\n"), "{record}");
+
+        let again = run_all_with(
+            &all_args(),
+            SearchBudget::default(),
+            &cwd,
+            || -> Result<Box<JobFn<'static>>, ErrorReport> { panic!("must not start jobs") },
+            &clock,
+        )
+        .expect_err("existing record");
+        assert_eq!(
+            error_pair(&again),
+            (ExitCode::InvalidInput, "search record already exists")
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn error_pair(report: &ErrorReport) -> (ExitCode, &str) {
+        (report.code, report.message.as_str())
     }
 }
