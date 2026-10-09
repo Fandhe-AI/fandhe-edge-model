@@ -507,11 +507,17 @@ fn req39_step_timeout_kills_descendants_and_returns_70() {
         &e.base_args(),
         &[
             ("FANDHE_EDGE_SANDBOX_STEP_TIMEOUT_SECS", "1"),
+            // 期限を対象工程だけに効かせ、前段（register）が負荷で 1 秒を超えても影響させない
+            ("FANDHE_EDGE_SANDBOX_STEP_TIMEOUT_ONLY", "inspect"),
             ("FAKE_HANG_STAGE", "inspect"),
         ],
     );
     assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
-    assert!(o.stdout.contains("\"failed_step\":\"inspect\""));
+    assert!(
+        o.stdout.contains("\"failed_step\":\"inspect\""),
+        "stdout={}",
+        o.stdout
+    );
     let pid = fs::read_to_string(e.dir.join("pid")).expect("pidfile");
     let pid = pid.trim();
     // 子孫（sleep）が残っていないこと（KILL 後の回収を少し待つ）

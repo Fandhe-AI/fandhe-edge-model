@@ -309,7 +309,13 @@ run_step() {
     rm -f "$rcf" "$rcf.tmp"
     : >"$so"
     : >"$se"
-    deadline=$((SECONDS + step_timeout + 1))
+    # テスト専用の絞り込み: STEP_TIMEOUT_ONLY が設定されていれば、その工程名だけに短い期限を掛け、
+    # 他工程は既定 3600 秒にする（負荷下で前段が短い期限を超えるのを避ける。未設定なら全工程に掛ける）
+    this_timeout=$step_timeout
+    if [ -n "${FANDHE_EDGE_SANDBOX_STEP_TIMEOUT_ONLY:-}" ] && [ "$name" != "$FANDHE_EDGE_SANDBOX_STEP_TIMEOUT_ONLY" ]; then
+        this_timeout=3600
+    fi
+    deadline=$((SECONDS + this_timeout + 1))
     # 工程は set -m で独立したプロセスグループ（pgid = 子の PID）として起動する
     set -m
     (
