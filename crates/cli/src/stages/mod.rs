@@ -52,6 +52,7 @@ use train::TrainError;
 
 pub(crate) mod baseline;
 pub mod candidate_artifact;
+mod diagnostics;
 pub mod evaluate;
 pub mod infer;
 pub mod inspect;
