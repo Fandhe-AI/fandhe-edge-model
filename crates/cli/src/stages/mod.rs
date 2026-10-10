@@ -13,7 +13,8 @@
 //! - `register`・`inspect`・`train`・`select`・`package`・`infer` は下位層へ接続済み。`train --all` は
 //!   探索予算内で既定候補の全件を学習し、`search_record.json` を残す（#482・#483。[`train`] 参照）。
 //!   学習ジョブは `candidates/<N>/job/` に記録し、`train --status` がクラッシュを検出して報告する（#485）。
-//!   ジョブの開始後に終わった `train` の失敗は、ジョブ状態とやり直し案内つきの JSON で返す（#486）
+//!   ジョブの開始後に終わった `train` の失敗は、ジョブ状態とやり直し案内つきの JSON で返す（#486）。
+//!   `train --cancel` は実行中のジョブへキャンセル要求を置いて即座に戻る（#484）
 //! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
 //!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。診断（REQ-29）は未結線
@@ -39,7 +40,9 @@ use fandhe_edge_core::stage_report::{
     InspectStageReport, RegisterReport, SelectReport, TrainAllReport, TrainReport,
 };
 
-use fandhe_edge_train::stage_files::{TrainStatusEntry, train_status_json_line};
+use fandhe_edge_train::stage_files::{
+    TrainCancelEntry, TrainStatusEntry, train_cancel_json_line, train_status_json_line,
+};
 
 use crate::args::{Command, TrainOp, TrainTarget};
 use crate::error_report::emit_error_report;
@@ -65,6 +68,7 @@ enum Done {
     Train(TrainReport),
     TrainAll(TrainAllReport),
     TrainStatus(Vec<TrainStatusEntry>),
+    TrainCancel(Vec<TrainCancelEntry>),
     Evaluate(evaluate::EvaluateOutcome),
     Select(SelectReport),
     Package(package::PackageRunResult),
@@ -92,6 +96,9 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
                 TrainOp::Status(candidate) => train::status(args, candidate, cwd)
                     .map(Done::TrainStatus)
                     .map_err(TrainError::Report),
+                TrainOp::Cancel(candidate) => train::cancel(args, candidate, cwd)
+                    .map(Done::TrainCancel)
+                    .map_err(TrainError::Report),
             };
             match trained {
                 Ok(done) => Ok(done),
@@ -114,6 +121,7 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
         Ok(Done::Train(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::TrainAll(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::TrainStatus(jobs)) => write_stage_line(out, train_status_json_line(&jobs)),
+        Ok(Done::TrainCancel(entries)) => write_stage_line(out, train_cancel_json_line(&entries)),
         Ok(Done::Select(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Skipped(r))) => emit_evaluate_skipped(out, &r),
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Completed(r))) => {

@@ -16,6 +16,7 @@
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
 //! - [`train_status_json_line`]: `train --status` の stdout（候補ごとのジョブ記録の状態とやり直し案内。#485）
+//! - [`train_cancel_json_line`]: `train --cancel` の stdout（候補ごとのキャンセル要求の結果。#484）
 //! - [`TrainInterruptedReport`]: ジョブ開始後に終わった `train` の失敗の stdout（ジョブ状態とやり直し案内。#486）
 //! - [`SelectionRecord`]: `select` の記録（`package` が選定候補を読み戻す）。有意性判定
 //!   （[`crate::selection_significance`] の結果）は定義に `baseline_comparison` があるときだけ持つ（#481）
@@ -28,6 +29,7 @@ use fandhe_edge_core::stage_report::{Stage, StageStatus};
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
 
+use crate::job::CancelOutcome;
 use crate::job_record::JobStatusReport;
 use crate::restart::{RestartGuidance, guidance_for_state};
 use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
@@ -372,6 +374,44 @@ pub fn train_status_json_line(jobs: &[TrainStatusEntry]) -> Result<String, Stage
     .map_err(|_| StageFileError::Serialize)
 }
 
+/// `train --cancel` の候補 1 件（REQ-34・TASK-34.1・#484）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrainCancelEntry {
+    candidate: usize,
+    cancel: CancelOutcome,
+}
+
+impl TrainCancelEntry {
+    /// 候補 `candidate` へのキャンセル要求の結果。
+    #[must_use]
+    pub const fn new(candidate: usize, cancel: CancelOutcome) -> Self {
+        Self { candidate, cancel }
+    }
+}
+
+#[derive(Serialize)]
+struct TrainCancelLine<'a> {
+    step: Stage,
+    status: StageStatus,
+    cancellations: &'a [TrainCancelEntry],
+}
+
+/// `train --cancel` の stdout（JSON 1 行・末尾改行なし。`{"step":"train","status":"ok","cancellations":[...]}`。
+/// #484）。
+///
+/// # Errors
+/// 直列化に失敗した場合（実務上は起こらない）。
+pub fn train_cancel_json_line(
+    cancellations: &[TrainCancelEntry],
+) -> Result<String, StageFileError> {
+    serde_json::to_string(&TrainCancelLine {
+        step: Stage::Train,
+        status: StageStatus::Ok,
+        cancellations,
+    })
+    .map_err(|_| StageFileError::Serialize)
+}
+
 /// ジョブ開始後に終わった `train` の失敗（ワーカー失敗・クラッシュ・壁時計超過・キャンセル）の stdout
 /// （REQ-21・REQ-33・REQ-34・TASK-34.3・#486）。
 ///
@@ -600,6 +640,25 @@ mod tests {
         assert_eq!(
             TrainInterruptedReport::new(ok.clone(), 0, job, restart),
             Err(ok)
+        );
+    }
+
+    /// REQ-34・TASK-34.1・#484: `train --cancel` の stdout はキー順を含めて固定され、`cancel` は
+    /// `CancelOutcome` の 3 語彙。対象 0 件は空配列。
+    #[test]
+    fn req34_issue484_train_cancel_line_is_exact() {
+        assert_eq!(
+            train_cancel_json_line(&[
+                TrainCancelEntry::new(0, CancelOutcome::Requested),
+                TrainCancelEntry::new(1, CancelOutcome::AlreadyCancelling),
+                TrainCancelEntry::new(2, CancelOutcome::AlreadyFinished),
+            ])
+            .expect("json"),
+            "{\"step\":\"train\",\"status\":\"ok\",\"cancellations\":[{\"candidate\":0,\"cancel\":\"requested\"},{\"candidate\":1,\"cancel\":\"already_cancelling\"},{\"candidate\":2,\"cancel\":\"already_finished\"}]}"
+        );
+        assert_eq!(
+            train_cancel_json_line(&[]).expect("json"),
+            "{\"step\":\"train\",\"status\":\"ok\",\"cancellations\":[]}"
         );
     }
 }

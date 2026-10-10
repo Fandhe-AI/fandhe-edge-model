@@ -46,6 +46,27 @@
 //! 返す。学習の副作用が無いため凍結の検査はしない。書き込みは `running` の残骸を `failed`＋`owner_lost` へ
 //! 書き戻す `job.json` だけ（MCP では参照系だが、この書き戻しを伴う。REQ-36）。
 //!
+//! # `--cancel` とキャンセル（REQ-34・REQ-39・TASK-34.1・#484）
+//!
+//! [`cancel`] は実行中（`running`・`cancelling`）のジョブの `job/` に空のキャンセル要求
+//! `cancel.request` を保持 fd 起点・`O_EXCL` で作って即座に戻る（非同期。既にあれば `already_cancelling`、
+//! 終端なら `already_finished`）。シグナル・PID は使わない。学習の副作用が無いため凍結の検査はしない。
+//! MCP（REQ-36）では学習と同じく副作用の大きい群に置く（`--status` は参照系）。
+//!
+//! 実行中の `train`（単発・`--all` 共通の [`run_recorded_job`]）は監視スレッドで `cancel.request` の出現を
+//! [`CANCEL_POLL_INTERVAL`] ごとに確かめ、現れたら [`fandhe_edge_train::job::JobHandle::cancel`] でキャンセルを
+//! 立てる。以降は学習ワーカー層の協調キャンセル（stdin の EOF。猶予の後は `SIGKILL`、子孫は supervisor の
+//! `killpg` と lifeline。REQ-39）。キャンセルで終わった単発の `train` は `runtime_error`（70）・
+//! `message:"training cancelled"` の [`TrainInterruptedReport`]（`job.state:"cancelled"`）で、候補ディレクトリは
+//! 残す（次の `train` が「ジョブ記録とやり直し」の規則で消す）。`out_dir` が公開済みの可能性があれば
+//! `CancelOutcomeUnconfirmed`（`failed`・70）。`--all` のキャンセルは探索全体の中断で、全候補ディレクトリを
+//! 片付け、`search_record.json` は書かずに同じ形の 70 を返す。`--all` では実行中に要求を検出した候補が
+//! 壁時計超過・ワーカー失敗・成功のどれで終わっても中断として扱う（壁時計超過で探索が次の候補へ進まない）。
+//! 監視スレッドを起動できなければジョブを始めず 70（`cannot start cancel watcher`）。
+//!
+//! Ctrl-C（`SIGINT`）にはハンドラを置かない（既知の限界）。端末から止めた `train` の記録は `running` のまま
+//! 残り、次の `--status` が `failed`＋`owner_lost` として検出する（子孫は lifeline で止まる）。
+//!
 //! # 記録の読み書きの閉じ込め（REQ-39・#510）
 //!
 //! `candidates/<N>/` と `job/` は保持 fd 起点（`O_NOFOLLOW`）で開き、`job/` の中の `job.json`・`job.lock`・
@@ -73,6 +94,9 @@
 //! （ビルド時の `CARGO_MANIFEST_DIR` 起点）。配布形態は未確定のため暫定（オーナー確認事項）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
@@ -82,7 +106,7 @@ use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::error::TrainProcessError;
-use fandhe_edge_train::job::{JobState, TrainJob};
+use fandhe_edge_train::job::{CancelOutcome, JobHandle, JobState, RecordedRun, TrainJob};
 use fandhe_edge_train::job_record::{
     JobDirOps, JobRecordError, JobStatusReport, read_job_status_in, unix_now,
 };
@@ -92,15 +116,16 @@ use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, 
 use fandhe_edge_train::request::{
     Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
-use fandhe_edge_train::restart::{RestartGuidance, guidance_for_run};
+use fandhe_edge_train::restart::{RestartGuidance, guidance_for_run, guidance_for_state};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{
     CandidateSearchResult, SearchBudget, SearchCandidate, SearchError, SearchInput, SearchRecord,
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainInterruptedReport, TrainStatusEntry,
-    allotted_time_limit_seconds, outcome_json_vec, search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainCancelEntry, TrainInterruptedReport,
+    TrainStatusEntry, allotted_time_limit_seconds, outcome_json_vec, search_record_json_vec,
+    trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
@@ -113,9 +138,9 @@ use super::inspect::split_rows;
 use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
-    CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE,
-    RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid,
-    runtime,
+    CANCEL_REQUEST_FILE, CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR,
+    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE,
+    TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -411,11 +436,15 @@ fn train_in_candidate_dir(
     let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)
         .map_err(TrainFailure::cleanup)?;
 
-    let (outcome, restart) = run_recorded_job(launcher, request, job_dir).map_err(|e| match e {
+    // 単発の `train` は実行結果だけで写す（キャンセル要求と壁時計超過が重なれば壁時計を優先する規則のまま）。
+    let (recorded, _) = run_recorded_job(launcher, request, job_dir);
+    let (outcome, restart) = recorded.map_err(|e| match e {
         RecordedJobError::Run(e, restart) => TrainFailure::job(e.to_error_report(), restart),
+        RecordedJobError::Cancelled(restart) => TrainFailure::job(cancelled_report(), restart),
         RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
             TrainFailure::cleanup(e.to_error_report())
         }
+        RecordedJobError::Watcher => TrainFailure::cleanup(watcher_report()),
     })?;
     if let Some(report) = train_outcome_error_report(&outcome) {
         return Err(TrainFailure::job(report, restart));
@@ -439,8 +468,58 @@ enum RecordedJobError {
     /// ジョブが失敗した（終端記録は `failed`。書けなかった場合も次の状態確認が `owner_lost` を検出する）。
     /// 実行結果から決めたやり直し案内（[`guidance_for_run`]）を添える。
     Run(TrainProcessError, Option<RestartGuidance>),
+    /// キャンセル要求（`cancel.request`）で止めた（終端記録は `cancelled`。#484）。
+    Cancelled(Option<RestartGuidance>),
     /// 学習は成功したが終端記録を書けなかった（記録と結果が食い違うため成功として扱わない）。
     Record(JobRecordError),
+    /// キャンセル要求の監視スレッドを起動できなかった（ジョブは開始していない。#484）。
+    Watcher,
+}
+
+/// キャンセルで終わった学習ジョブの報告（`runtime_error`・70。#484）。
+fn cancelled_report() -> ErrorReport {
+    runtime("training cancelled")
+}
+
+/// キャンセル要求の監視スレッドを起動できなかったときの報告（`runtime_error`・70。#484）。
+fn watcher_report() -> ErrorReport {
+    runtime("cannot start cancel watcher")
+}
+
+/// 実行中の `train` が `cancel.request` を確かめる間隔（#484）。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `job_dir` に `cancel.request` が現れるまで [`CANCEL_POLL_INTERVAL`] ごとに確かめ、現れたら `handle` で
+/// キャンセルを立てて `true` を返す。`stop` の送り手が drop されたら（ジョブの終了）すぐ `false` で戻る
+/// （REQ-34・#484）。
+///
+/// 確認は保持 fd 起点・`O_NOFOLLOW`（[`member_exists`]）。「無い」と言えるのは `NotFound` だけで、symlink・
+/// 通常ファイル以外・それ以外の失敗（`EACCES`・`job/` の差し替え等）はすべてキャンセルへ倒す（fail-closed）。
+fn watch_cancel_request(
+    job_dir: &ConfinedPackage,
+    handle: &JobHandle,
+    stop: &Receiver<()>,
+) -> bool {
+    // 要求が無いと確認できたとき（`Ok(false)`）以外はキャンセル側へ倒す（fail-closed）。
+    let requested = || !matches!(member_exists(job_dir, CANCEL_REQUEST_FILE), Ok(false));
+    loop {
+        if requested() {
+            handle.cancel();
+            return true;
+        }
+        match stop.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Err(RecvTimeoutError::Timeout) => {}
+            // 停止時にも最後に確認する。待っている間（ジョブの終了直前）に受理された要求を取りこぼさず、
+            // `--all` の探索中断の判定へ渡す（ジョブは終わっているので `cancel` は何もしない）。
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let late = requested();
+                if late {
+                    handle.cancel();
+                }
+                return late;
+            }
+        }
+    }
 }
 
 /// 学習ジョブを保持した `job_dir` に記録しながら実行する（単発の `train` と `train --all` が共有する。
@@ -448,34 +527,63 @@ enum RecordedJobError {
 /// ワーカーの起動（`request.json`・作業ディレクトリ）にだけ渡す。ワーカーが返した失敗
 /// （`TrainOutcome::Error`）は `Ok` で返す（呼び出し元が写す）。`Ok` の 2 要素目は実行結果のやり直し案内
 /// （[`guidance_for_run`]。成功なら `None`）。
+///
+/// 戻り値の 2 要素目は、実行中に監視スレッドがキャンセル要求を検出してキャンセルを立てたか（`--all` は
+/// 実行結果が壁時計超過等でも探索全体の中断として扱う。[`all_job_result`]。#484）。
 fn run_recorded_job(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
     job_dir: ConfinedPackage,
-) -> Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError> {
+) -> (
+    Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError>,
+    bool,
+) {
     let path = job_dir.dir().to_path_buf();
-    let recorded = TrainJob::new()
-        .run_recorded_in(
-            launcher,
-            request,
-            &path,
-            Box::new(ConfinedJobDir(job_dir)),
-            &RunLimits::for_request(request),
-        )
-        .map_err(RecordedJobError::Begin)?;
+    let job_dir = Arc::new(job_dir);
+    let job = TrainJob::new();
+    let handle = job.handle();
+    // ジョブの実行中だけ `cancel.request` を監視する（#484）。`stop` を drop すると監視は即座に終わる。
+    // 監視スレッドを起動できなければジョブを始めない（キャンセルできない学習を走らせない）。
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let (recorded, cancel_requested) = std::thread::scope(|scope| {
+        let watched = Arc::clone(&job_dir);
+        let Ok(watcher) = std::thread::Builder::new()
+            .name("cancel-watcher".to_string())
+            .spawn_scoped(scope, move || {
+                watch_cancel_request(&watched, &handle, &stopped)
+            })
+        else {
+            return (Err(RecordedJobError::Watcher), false);
+        };
+        let recorded = job
+            .run_recorded_in(
+                launcher,
+                request,
+                &path,
+                Box::new(ConfinedJobDir(job_dir)),
+                &RunLimits::for_request(request),
+            )
+            .map_err(RecordedJobError::Begin);
+        drop(stop);
+        // 監視スレッドは panic しない（`Err` はキャンセルを立てる前の異常で、立てていない側に数える）。
+        (recorded, watcher.join().unwrap_or(false))
+    });
+    let recorded = match recorded {
+        Ok(recorded) => recorded,
+        Err(e) => return (Err(e), cancel_requested),
+    };
+    (recorded_outcome(recorded), cancel_requested)
+}
+
+/// [`run_recorded_job`] の実行結果を、成果と案内・失敗の種類へ写す。
+fn recorded_outcome(
+    recorded: RecordedRun,
+) -> Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError> {
     // 案内は写像の前の実行結果から決める（キャンセルは残置の観測を使う。#486）。
     let restart = guidance_for_run(&recorded.run);
     let outcome = match recorded.run {
         Ok(TrainRunEnd::Completed(run)) => run.outcome().clone(),
-        // キャンセルの口を持たないため起こらない。`run_train` と同じ写像にする（キャンセルは #484）。
-        Ok(TrainRunEnd::Cancelled(_)) => {
-            return Err(RecordedJobError::Run(
-                TrainProcessError::Wait {
-                    kind: std::io::ErrorKind::Interrupted,
-                },
-                restart,
-            ));
-        }
+        Ok(TrainRunEnd::Cancelled(_)) => return Err(RecordedJobError::Cancelled(restart)),
         Err(e) => return Err(RecordedJobError::Run(e, restart)),
     };
     match (recorded.record, &outcome) {
@@ -498,7 +606,7 @@ fn job_status_in(candidate_dir: &ConfinedPackage) -> Result<Option<JobStatusRepo
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    match read_job_status_in(&ConfinedJobDir(job_dir), unix_now()) {
+    match read_job_status_in(&ConfinedJobDir(Arc::new(job_dir)), unix_now()) {
         Ok(report) => Ok(Some(report)),
         // `job.json`・`job.lock` のどちらも無い（ジョブを開始する前に止まった）。
         Err(JobRecordError::Io {
@@ -513,8 +621,10 @@ fn job_status_in(candidate_dir: &ConfinedPackage) -> Result<Option<JobStatusRepo
 ///
 /// 名前は `job/` 直下の 1 成分だけ。各操作は保持 fd の実パスが開いた時点の場所の配下にあることも
 /// 確かめ、`job/` が移動・差し替えられていれば拒否する（[`JobRecordError::InvalidJobDir`]）。
+///
+/// 実行中の `train` は同じ fd を `cancel.request` の監視とも共有するため `Arc` で持つ（#484）。
 #[derive(Debug)]
-pub(crate) struct ConfinedJobDir(pub(crate) ConfinedPackage);
+pub(crate) struct ConfinedJobDir(pub(crate) Arc<ConfinedPackage>);
 
 /// ガード層の拒否をジョブ記録のエラーへ写す（パス・内容は含めない）。
 fn job_dir_error(e: PathRejection) -> JobRecordError {
@@ -603,14 +713,85 @@ pub fn status(
     candidate: Option<usize>,
     cwd: &Path,
 ) -> Result<Vec<TrainStatusEntry>, ErrorReport> {
+    visit_jobs(args, candidate, cwd, |index, _, job| {
+        Ok(Some(TrainStatusEntry::new(index, job)))
+    })
+}
+
+/// `train --cancel [--candidate N]`（REQ-34・REQ-39・TASK-34.1・#484。モジュール doc「`--cancel` とキャンセル」）。
+///
+/// 非終端のジョブには `job/cancel.request` を保持 fd 起点・`O_EXCL` で作って `requested`（既にあれば
+/// `already_cancelling`）、終端のジョブは `already_finished`（何も作らない）。`candidate` 省略時は非終端
+/// （`running`・`cancelling`）の候補だけを添字順に返す（無ければ空）。要求を置くだけで、止まるのは待たない。
+/// 状態の読み取りは [`status`] と同じ（`running` の残骸は `failed`＋`owner_lost` へ書き戻した上で
+/// `already_finished`）。凍結の検査はしない。
+///
+/// 2 段で行う: 先に全候補の状態を読んで対象を決め、対象の `job/` を保持 fd で開く。ここまでに 1 件でも失敗
+/// すれば、何も置かずにエラーを返す（一部だけ置いて報告から落とさない。fail-closed）。その後で対象へ要求を
+/// 置く。保持する fd は非終端のジョブの分だけ（`job.lock` を保持する生きたプロセスの数が上限）。
+///
+/// # Errors
+/// [`status`] と同じ。`cancel.request` を作れない（I/O 失敗・`job/` の差し替え）場合は経路の拒否の写像。
+/// 作成自体が途中の候補で失敗した場合（`EACCES`・容量不足等。状態の読み取りと `job/` を開く検査は済んで
+/// いる）は、それより前に置いた要求を報告できずにエラーを返す（置いた要求は残り、再度の `--cancel` が
+/// `already_cancelling` と報告する）。
+pub fn cancel(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+) -> Result<Vec<TrainCancelEntry>, ErrorReport> {
+    let targets = visit_jobs(args, candidate, cwd, |index, dir, job| {
+        if job.state.is_terminal() {
+            // 終端は `--candidate N` の指定時だけ `already_finished` で返す（何も置かない）。
+            return Ok(candidate.is_some().then_some((index, None)));
+        }
+        let job_dir = dir
+            .open_subdir(Path::new(JOB_DIR))
+            .map_err(|e| e.to_error_report())?;
+        Ok(Some((index, Some(job_dir))))
+    })?;
+    targets
+        .into_iter()
+        .map(|(index, job_dir)| {
+            let outcome = match job_dir {
+                Some(dir) => request_cancel(&dir)?,
+                None => CancelOutcome::AlreadyFinished,
+            };
+            Ok(TrainCancelEntry::new(index, outcome))
+        })
+        .collect()
+}
+
+/// 保持した `job/` にキャンセル要求を `O_EXCL` で作る（既存なら symlink でも `already_cancelling`。#484）。
+fn request_cancel(job_dir: &ConfinedPackage) -> Result<CancelOutcome, ErrorReport> {
+    match job_dir.create_new_private_member(Path::new(CANCEL_REQUEST_FILE)) {
+        Ok(_) => Ok(CancelOutcome::Requested),
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            Ok(CancelOutcome::AlreadyCancelling)
+        }
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// 記録のある候補のジョブ状態を添字順に `visit` へ渡し、`Some` を集める（[`status`]・[`cancel`] の共通部。
+/// 候補ディレクトリの fd は 1 件ずつ開いて閉じる）。`candidate` 指定時はその候補だけで、記録が無ければ
+/// `invalid_input`（64）`job record not found`。
+fn visit_jobs<T>(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+    mut visit: impl FnMut(usize, &ConfinedPackage, JobStatusReport) -> Result<Option<T>, ErrorReport>,
+) -> Result<Vec<T>, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     if let Some(index) = candidate {
-        let job = match project.open_subdir_optional(candidate_rel(index))? {
-            Some(dir) => job_status_in(&dir)?,
-            None => None,
-        }
-        .ok_or_else(|| invalid("job record not found"))?;
-        return Ok(vec![TrainStatusEntry::new(index, job)]);
+        let not_found = || invalid("job record not found");
+        let dir = project
+            .open_subdir_optional(candidate_rel(index))?
+            .ok_or_else(not_found)?;
+        let job = job_status_in(&dir)?.ok_or_else(not_found)?;
+        return Ok(visit(index, &dir, job)?.into_iter().collect());
     }
     let Some(candidates_dir) = project.open_subdir_optional(CANDIDATES_DIR)? else {
         return Ok(Vec::new());
@@ -644,8 +825,10 @@ pub fn status(
             }
             Err(e) => return Err(e.to_error_report()),
         };
-        if let Some(job) = job_status_in(&dir)? {
-            jobs.push(TrainStatusEntry::new(index, job));
+        if let Some(job) = job_status_in(&dir)?
+            && let Some(entry) = visit(index, &dir, job)?
+        {
+            jobs.push(entry);
         }
     }
     Ok(jobs)
@@ -699,19 +882,47 @@ pub fn run_all(
         let launcher = worker_launcher()?;
         Ok(Box::new(
             move |request: &TrainRequest, job_dir: ConfinedPackage| {
-                run_recorded_job(&launcher, request, job_dir)
-                    .map_err(|e| match e {
-                        RecordedJobError::Run(e, restart) => AllRunError::Process(e, restart),
-                        RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
-                            AllRunError::Report(e.to_error_report())
-                        }
-                    })
-                    // 探索が続く候補のワーカー失敗は従来どおり（案内は探索を中断する失敗にだけ添える）。
-                    .map(|(outcome, _)| outcome)
+                let (recorded, cancel_requested) = run_recorded_job(&launcher, request, job_dir);
+                all_job_result(recorded, cancel_requested)
             },
         ))
     };
     run_all_with(args, budget, cwd, launcher_job, &SystemClock::new())
+}
+
+/// `train --all` の候補 1 件の学習ジョブの結果を [`CandidateDirRunner`] の結果へ写す（REQ-34・#484）。
+///
+/// 実行中にキャンセル要求を検出していれば（`cancel_requested`）、実行結果が壁時計超過・ワーカー失敗・成功の
+/// いずれでも探索全体の中断（[`AllRunError::Cancelled`]）にする（壁時計超過がキャンセルに勝って探索が次の
+/// 候補へ進むのを防ぐ）。案内は実行結果のもの、無ければ（成功・記録の失敗）`out_dir` 未確認の案内。
+/// 候補の間（実行中のジョブが無い時間）に置かれた要求は対象外（契約どおり）。
+fn all_job_result(
+    recorded: Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError>,
+    cancel_requested: bool,
+) -> Result<TrainOutcome, AllRunError> {
+    if cancel_requested {
+        let restart = match &recorded {
+            Ok((_, restart))
+            | Err(RecordedJobError::Run(_, restart) | RecordedJobError::Cancelled(restart)) => {
+                *restart
+            }
+            Err(_) => None,
+        };
+        return Err(AllRunError::Cancelled(
+            restart.or_else(|| guidance_for_state(JobState::Failed)),
+        ));
+    }
+    recorded
+        .map_err(|e| match e {
+            RecordedJobError::Run(e, restart) => AllRunError::Process(e, restart),
+            RecordedJobError::Cancelled(restart) => AllRunError::Cancelled(restart),
+            RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+                AllRunError::Report(e.to_error_report())
+            }
+            RecordedJobError::Watcher => AllRunError::Report(watcher_report()),
+        })
+        // 探索が続く候補のワーカー失敗は従来どおり（案内は探索を中断する失敗にだけ添える）。
+        .map(|(outcome, _)| outcome)
 }
 
 /// [`run_all`] の本体。学習ジョブの実行（`make_job`。前提の確認後に 1 回だけ呼ぶ）と時計を差し替えられる。
@@ -819,7 +1030,11 @@ where
             let interrupted = match &error {
                 SearchError::Candidate {
                     index,
-                    source: CandidateTimeError::Runner(AllRunError::Process(_, Some(restart))),
+                    source:
+                        CandidateTimeError::Runner(
+                            AllRunError::Process(_, Some(restart))
+                            | AllRunError::Cancelled(Some(restart)),
+                        ),
                 } => Some((*index, *restart, candidate_job_status(&project, *index))),
                 _ => None,
             };
@@ -899,6 +1114,11 @@ fn search_error_report(error: SearchError<AllRunError>) -> ErrorReport {
             source: CandidateTimeError::Runner(AllRunError::Process(process, _)),
             ..
         } => process.to_error_report(),
+        // キャンセルは探索全体の中断（#484）。
+        SearchError::Candidate {
+            source: CandidateTimeError::Runner(AllRunError::Cancelled(_)),
+            ..
+        } => cancelled_report(),
         _ => runtime("candidate search failed"),
     }
 }
@@ -908,6 +1128,8 @@ enum AllRunError {
     /// 子プロセスの失敗と、実行結果のやり直し案内（[`guidance_for_run`]。ジョブを記録しない偽の実行は
     /// `None` で、探索を中断しても従来の 2 キーで報告する）。
     Process(TrainProcessError, Option<RestartGuidance>),
+    /// `cancel.request` で学習ジョブを止めた（探索全体を中断する。#484）と、そのやり直し案内。
+    Cancelled(Option<RestartGuidance>),
     Report(ErrorReport),
 }
 
@@ -1855,6 +2077,71 @@ mod all_tests {
     }
 
     /// 従来の 2 キーの失敗であることを確かめて `(code, message)` を返す。
+    /// REQ-34・REQ-39・TASK-34.1・#484: `--all` で実行中にキャンセル要求を検出した候補は、学習ジョブが壁時計超過
+    /// （`WallTimeout`。本来は候補の時間切れで探索が次へ進む）で終わっても探索全体の中断として扱う。c3 は
+    /// 起動せず、候補ディレクトリ・`candidates/` を片付け、`search_record.json` を書かず、70・`training cancelled`
+    /// の中断報告（ジョブ記録は `failed`＋`limit_exceeded`）を返す。要求を検出していなければ従来どおり時間切れ。
+    #[test]
+    fn req34_issue484_cancel_beats_wall_timeout_and_aborts_search() {
+        use fandhe_edge_train::job_record::{JobRecorder, classify_run_end};
+        let wall = || TrainProcessError::WallTimeout {
+            limit_ms: 1000,
+            child_reaped: true,
+        };
+        // 要求を検出していなければ壁時計超過のまま（`is_wall_timeout` で探索が続く側）。
+        let not_cancelled = all_job_result(
+            Err(RecordedJobError::Run(
+                wall(),
+                guidance_for_run(&Err(wall())),
+            )),
+            false,
+        );
+        assert!(
+            matches!(&not_cancelled, Err(e) if <CandidateDirRunner<'_, '_> as CandidateRunner>::is_wall_timeout(e)),
+            "wall timeout must stay a candidate time limit without a cancel request"
+        );
+
+        let cwd = inspected_workdir("cancelwall");
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let started = Rc::new(Cell::new(0_u32));
+        let job_started = Rc::clone(&started);
+        let make_job = move || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(
+                move |_request: &TrainRequest, job: ConfinedPackage| {
+                    job_started.set(job_started.get() + 1);
+                    // 本番と同じく記録を残す（壁時計超過の終端記録）。
+                    let run: Result<TrainRunEnd, TrainProcessError> = Err(wall());
+                    let (state, failure) = classify_run_end(&run, 130);
+                    JobRecorder::begin_in(Box::new(ConfinedJobDir(Arc::new(job))), 100)
+                        .expect("begin")
+                        .finish(state, failure, 130)
+                        .expect("finish");
+                    all_job_result(
+                        Err(RecordedJobError::Run(wall(), guidance_for_run(&run))),
+                        true,
+                    )
+                },
+            ))
+        };
+        let error = run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
+            .expect_err("cancelled");
+        let TrainError::Interrupted(report) = error else {
+            panic!("expected interrupted report: {error:?}");
+        };
+        assert_eq!(report.exit_code(), ExitCode::RuntimeError);
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            "{\"code\":\"runtime_error\",\"message\":\"training cancelled\",\"step\":\"train\",\"candidate\":0,\"job\":{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{\"kind\":\"error\",\"code\":\"limit_exceeded\"},\"record_updated\":false},\"restart\":{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"not_inspected\",\"message\":\"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse.\"}}"
+        );
+        assert_eq!(started.get(), 1, "the search must not continue to c3");
+        let proj = cwd.join("proj");
+        assert!(!proj.join("candidates").exists());
+        assert!(!proj.join(SEARCH_RECORD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     fn train_error_pair(error: &TrainError) -> (ExitCode, &str) {
         match error {
             TrainError::Report(report) => error_pair(report),
@@ -2298,11 +2585,11 @@ mod status_tests {
     /// 保持 fd で開いた `candidates/0/job` の [`ConfinedJobDir`]。
     fn held_job_dir(cwd: &Path) -> ConfinedJobDir {
         let project = Project::open(cwd, Path::new("proj")).expect("project");
-        ConfinedJobDir(
+        ConfinedJobDir(Arc::new(
             project
                 .open_subdir(candidate_rel(0).join(JOB_DIR))
                 .expect("job dir"),
-        )
+        ))
     }
 
     /// REQ-39・REQ-34・#510: `--status` の状態確認は、検証（`job/` を保持 fd で開く）後に親の
@@ -2395,5 +2682,134 @@ mod status_tests {
         assert!(moved.contains(r#""state":"running""#), "{moved}");
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&cwd2);
+    }
+
+    /// 保持 fd で開いた `candidates/0/job`（監視スレッドに渡すもの）。
+    fn held_package(cwd: &Path) -> ConfinedPackage {
+        Project::open(cwd, Path::new("proj"))
+            .expect("project")
+            .open_subdir(candidate_rel(0).join(JOB_DIR))
+            .expect("job dir")
+    }
+
+    /// `watch_cancel_request` を、停止の送り手を `stop_now` なら drop した状態で 1 回走らせ、戻り値と
+    /// ジョブの状態を返す（停止させない場合は要求が無いと戻らない）。
+    fn watch_once(cwd: &Path, stop_now: bool) -> (bool, JobState) {
+        let job = TrainJob::new();
+        let handle = job.handle();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let _keep = (!stop_now).then_some(stop);
+        let detected = watch_cancel_request(&held_package(cwd), &handle, &stopped);
+        (detected, handle.state())
+    }
+
+    /// REQ-34・#484: 要求が無ければ、停止（送り手の drop）で要求を待たずに `false` で戻り、キャンセルしない。
+    #[test]
+    fn req34_issue484_watcher_returns_on_stop_without_cancelling() {
+        let cwd = workdir("watchstop");
+        job_dir(&cwd, 0);
+        assert_eq!(watch_once(&cwd, true), (false, JobState::Queued));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#484: 監視が待っている間（ジョブの終了直前）に置かれた要求も、停止時の最終確認で `true` を返す
+    /// （`--all` の探索中断の判定へ渡す）。
+    #[test]
+    fn req34_issue484_watcher_reports_request_placed_before_stop() {
+        let cwd = workdir("watchlate");
+        let dir = job_dir(&cwd, 0);
+        let job = TrainJob::new();
+        let handle = job.handle();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let package = held_package(&cwd);
+        let detected = std::thread::scope(|scope| {
+            let watcher = scope.spawn(move || watch_cancel_request(&package, &handle, &stopped));
+            // 最初の確認（要求なし）の後、待っている間に要求を置いてから停止する。
+            std::thread::sleep(CANCEL_POLL_INTERVAL / 5);
+            std::fs::write(dir.join(CANCEL_REQUEST_FILE), b"").expect("request");
+            drop(stop);
+            watcher.join().expect("join")
+        });
+        assert!(detected);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-39・#484: 要求（空の通常ファイル）があればキャンセルを立てて `true`。symlink（宛先なし）と、
+    /// 開けない要求（`EACCES`。`NotFound` 以外の失敗）もキャンセル側へ倒す（fail-closed）。
+    #[test]
+    fn req34_issue484_watcher_cancels_on_request_symlink_and_eacces() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = workdir("watchcancel");
+        let dir = job_dir(&cwd, 0);
+        let request = dir.join(CANCEL_REQUEST_FILE);
+
+        std::fs::write(&request, b"").expect("request");
+        assert_eq!(watch_once(&cwd, false), (true, JobState::Cancelled));
+        std::fs::remove_file(&request).expect("rm");
+
+        std::os::unix::fs::symlink(cwd.join("nowhere"), &request).expect("symlink");
+        assert_eq!(watch_once(&cwd, false), (true, JobState::Cancelled));
+        std::fs::remove_file(&request).expect("rm");
+
+        std::fs::write(&request, b"").expect("request");
+        std::fs::set_permissions(&request, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        assert_eq!(watch_once(&cwd, false), (true, JobState::Cancelled));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn cancel_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
+        let args = TrainArgs {
+            project_dir: "proj".into(),
+            op: TrainOp::Cancel(candidate),
+            smoke: false,
+            train_seed: None,
+        };
+        cancel(&args, candidate, cwd).map(|entries| {
+            fandhe_edge_train::stage_files::train_cancel_json_line(&entries).expect("json")
+        })
+    }
+
+    /// REQ-34・REQ-39・#484: 一覧の `--cancel` は先に全候補の状態を読む。途中の候補（1）の記録が壊れていれば、
+    /// 実行中の候補（0）にも要求を置かずにエラーを返す（置いた要求を報告から落とさない。fail-closed）。
+    #[test]
+    fn req34_issue484_cancel_list_is_fail_closed() {
+        let cwd = workdir("cancelfailclosed");
+        let recorder = JobRecorder::begin(&job_dir(&cwd, 0), 100).expect("begin");
+        std::fs::write(job_dir(&cwd, 1).join("job.json"), b"not json").expect("broken");
+        let error = cancel_line(&cwd, None).expect_err("broken record");
+        assert_eq!(error.code, ExitCode::InvalidInput);
+        assert!(
+            !cwd.join("proj/candidates/0/job")
+                .join(CANCEL_REQUEST_FILE)
+                .exists()
+        );
+        // 壊れた記録を除けば、実行中の候補にだけ要求を置く。
+        std::fs::remove_dir_all(cwd.join("proj/candidates/1")).expect("rm");
+        assert_eq!(
+            cancel_line(&cwd, None).expect("cancel"),
+            r#"{"step":"train","status":"ok","cancellations":[{"candidate":0,"cancel":"requested"}]}"#
+        );
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・REQ-34・#484: `cancel.request` が symlink なら辿らず（宛先を作らない）`already_cancelling`。
+    #[test]
+    fn req39_issue484_cancel_request_symlink_is_already_cancelling() {
+        let cwd = workdir("cancelsymlink");
+        let dir = job_dir(&cwd, 0);
+        let recorder = JobRecorder::begin(&dir, 100).expect("begin");
+        let target = cwd.join("outside-target");
+        std::os::unix::fs::symlink(&target, dir.join(CANCEL_REQUEST_FILE)).expect("symlink");
+        assert_eq!(
+            cancel_line(&cwd, None).expect("cancel"),
+            r#"{"step":"train","status":"ok","cancellations":[{"candidate":0,"cancel":"already_cancelling"}]}"#
+        );
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "target must not be created"
+        );
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 }

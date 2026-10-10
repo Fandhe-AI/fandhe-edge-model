@@ -180,6 +180,12 @@ const TRAIN_OPTS: &[OptSpec] = &[
         required: false,
         help: "Report recorded training jobs (optionally only --candidate N); not with --all, --budget-seconds, --smoke or --train-seed",
     },
+    OptSpec {
+        name: "--cancel",
+        value: None,
+        required: false,
+        help: "Request cancellation of running training jobs (optionally only --candidate N) and return immediately; not with --status, --all, --budget-seconds, --smoke or --train-seed",
+    },
 ];
 const EVALUATE_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
@@ -246,15 +252,16 @@ pub enum TrainTarget {
     All { budget: SearchBudget },
 }
 
-/// `train` の操作。学習と状態確認の排他を型で表す（REQ-34・#485）。
-///
-/// 学習ジョブのキャンセル（`--cancel`）は #484 で足す（それまでは未知のオプションとして `invalid_input`）。
+/// `train` の操作。学習・状態確認・キャンセルの三者排他を型で表す（REQ-34・#485・#484）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainOp {
     /// 学習する（`--candidate N` または `--all`）。
     Run(TrainTarget),
     /// `--status [--candidate N]`: 記録された学習ジョブの状態を報告する（学習しない）。
     Status(Option<usize>),
+    /// `--cancel [--candidate N]`: 実行中の学習ジョブへキャンセル要求を置いて即座に戻る（学習しない。
+    /// 副作用の大きい操作。REQ-34・REQ-36・#484）。
+    Cancel(Option<usize>),
 }
 
 /// `train` の引数。
@@ -361,6 +368,10 @@ pub enum ArgsError {
     IncompatibleWithStatus {
         option: &'static str,
     },
+    /// `train --cancel` に学習専用のオプションが併用された（#484）。
+    IncompatibleWithCancel {
+        option: &'static str,
+    },
     ConflictingInferSource,
     MissingInferSource,
     /// `--id` は `--text` とだけ、`--out` は `--input-file` とだけ併用できる。
@@ -422,6 +433,9 @@ impl fmt::Display for ArgsError {
             ArgsError::MissingTrainTarget => f.write_str("one of --candidate or --all is required"),
             ArgsError::IncompatibleWithStatus { option } => {
                 write!(f, "option {option} cannot be used with --status")
+            }
+            ArgsError::IncompatibleWithCancel { option } => {
+                write!(f, "option {option} cannot be used with --cancel")
             }
             ArgsError::ConflictingInferSource => {
                 f.write_str("options --text and --input-file cannot be used together")
@@ -623,15 +637,24 @@ impl Values {
                 .ok_or(ArgsError::InvalidBudgetSeconds),
         }
     }
-    /// `--status` があれば状態確認（学習専用のオプションとの併用は拒否）、無ければ学習の対象を解析する。
-    /// `--smoke`・`--train-seed` の取り出しより前に呼ぶ（併用の検出のため）。
+    /// `--status`・`--cancel` があれば状態確認・キャンセル（両者の併用と、学習専用のオプションとの併用は
+    /// 拒否）、どちらも無ければ学習の対象を解析する。`--smoke`・`--train-seed` の取り出しより前に呼ぶ
+    /// （併用の検出のため）。
     fn train_op(&mut self) -> Result<TrainOp, ArgsError> {
-        if self.take("--status").is_none() {
-            return self.train_target().map(TrainOp::Run);
+        let status = self.take("--status").is_some();
+        let cancel = self.take("--cancel").is_some();
+        match (status, cancel) {
+            (false, false) => return self.train_target().map(TrainOp::Run),
+            (true, true) => return Err(ArgsError::IncompatibleWithStatus { option: "--cancel" }),
+            _ => {}
         }
         for option in ["--all", "--budget-seconds", "--smoke", "--train-seed"] {
             if self.0.iter().any(|(n, _)| *n == option) {
-                return Err(ArgsError::IncompatibleWithStatus { option });
+                return Err(if status {
+                    ArgsError::IncompatibleWithStatus { option }
+                } else {
+                    ArgsError::IncompatibleWithCancel { option }
+                });
             }
         }
         let candidate = if self.0.iter().any(|(n, _)| *n == "--candidate") {
@@ -639,7 +662,11 @@ impl Values {
         } else {
             None
         };
-        Ok(TrainOp::Status(candidate))
+        Ok(if status {
+            TrainOp::Status(candidate)
+        } else {
+            TrainOp::Cancel(candidate)
+        })
     }
     fn train_target(&mut self) -> Result<TrainTarget, ArgsError> {
         let all = self.take("--all").is_some();
@@ -1033,7 +1060,6 @@ mod tests {
 
     /// REQ-34・#485: `train --status` は単独または `--candidate N` と受理し、学習専用のオプション
     /// （`--all`・`--budget-seconds`・`--smoke`・`--train-seed`）との併用は `invalid_input`（64）。
-    /// `--cancel` は #484 まで未知のオプション。
     #[test]
     fn req34_train_status_parses_and_rejects_training_options() {
         let op = |extra: &[&str]| {
@@ -1067,11 +1093,57 @@ mod tests {
             op(&["--status"]),
             Err(ArgsError::DuplicateOption { option: "--status" })
         );
+    }
+
+    /// REQ-34・REQ-39・#484: `train --cancel` は単独または `--candidate N` と受理し、`--status` と学習専用の
+    /// オプション（`--all`・`--budget-seconds`・`--smoke`・`--train-seed`）との併用は `invalid_input`（64）。
+    #[test]
+    fn req34_train_cancel_parses_and_rejects_other_operations() {
+        let op = |args: &[&str]| {
+            let mut a = vec!["train", "--project-dir", "proj"];
+            a.extend_from_slice(args);
+            match p(&a) {
+                Ok(Invocation::Run(Command::Train(a))) => Ok(a.op),
+                Err(e) => Err(e),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(op(&["--cancel"]), Ok(TrainOp::Cancel(None)));
         assert_eq!(
-            p(&["train", "--project-dir", "proj", "--cancel"]),
-            Err(ArgsError::UnknownOption {
-                subcommand: Subcommand::Train
-            })
+            op(&["--cancel", "--candidate", "2"]),
+            Ok(TrainOp::Cancel(Some(2)))
+        );
+        assert_eq!(
+            op(&["--cancel", "--candidate", "x"]),
+            Err(ArgsError::InvalidCandidate)
+        );
+        for (extra, option) in [
+            (&["--all"][..], "--all"),
+            (&["--budget-seconds", "10"][..], "--budget-seconds"),
+            (&["--smoke"][..], "--smoke"),
+            (&["--train-seed", "7"][..], "--train-seed"),
+            (&["--candidate", "0", "--all"][..], "--all"),
+        ] {
+            let mut a = vec!["--cancel"];
+            a.extend_from_slice(extra);
+            let e = op(&a).expect_err("incompatible");
+            assert_eq!(e, ArgsError::IncompatibleWithCancel { option });
+            assert_eq!(args_error_report(&e).code, ExitCode::InvalidInput);
+        }
+        assert_eq!(
+            ArgsError::IncompatibleWithCancel { option: "--all" }.to_string(),
+            "option --all cannot be used with --cancel"
+        );
+        // `--status` と `--cancel` は順序によらず排他。
+        for a in [&["--status", "--cancel"][..], &["--cancel", "--status"][..]] {
+            assert_eq!(
+                op(a),
+                Err(ArgsError::IncompatibleWithStatus { option: "--cancel" })
+            );
+        }
+        assert_eq!(
+            op(&["--cancel", "--cancel"]),
+            Err(ArgsError::DuplicateOption { option: "--cancel" })
         );
     }
 

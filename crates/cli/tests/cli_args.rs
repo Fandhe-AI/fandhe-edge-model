@@ -123,11 +123,11 @@ fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
     }
 }
 
-/// REQ-34・TASK-34.3・#486: 再開の口は作らない。`train` の `--resume` は（学習・`--status` のどちらと
-/// 併せても）未知オプションの `invalid_input`（64）で、作業ディレクトリに触れる前に止まる。
+/// REQ-34・TASK-34.3・#486: 再開の口は作らない。`train` の `--resume` は（学習・`--status`・`--cancel` の
+/// どれと併せても）未知オプションの `invalid_input`（64）で、作業ディレクトリに触れる前に止まる。
 #[test]
 fn req34_train_resume_option_is_unknown_invalid_input() {
-    let cases: [&[&str]; 3] = [
+    let cases: [&[&str]; 4] = [
         &[
             "train",
             "--project-dir",
@@ -138,6 +138,7 @@ fn req34_train_resume_option_is_unknown_invalid_input() {
         ],
         &["train", "--project-dir", "p", "--all", "--resume"],
         &["train", "--project-dir", "p", "--status", "--resume"],
+        &["train", "--project-dir", "p", "--cancel", "--resume"],
     ];
     for args in cases {
         let o = run(args);
@@ -145,6 +146,78 @@ fn req34_train_resume_option_is_unknown_invalid_input() {
         assert_eq!(
             String::from_utf8_lossy(&o.stdout),
             "{\"code\":\"invalid_input\",\"message\":\"unknown option for subcommand train\"}\n",
+            "args: {args:?}"
+        );
+    }
+}
+
+/// REQ-34・REQ-33・REQ-39・TASK-34.1・#484: `train` の学習（`--candidate N`／`--all`）・`--status`・`--cancel` は
+/// 三者排他で、`--status`／`--cancel` と学習専用のオプション（`--all`・`--budget-seconds`・`--smoke`・
+/// `--train-seed`）の併用は、作業ディレクトリに触れる前に `invalid_input`（64）の固定 message で止まる。
+#[test]
+fn req34_train_operations_are_mutually_exclusive() {
+    let cases: [(&[&str], &str); 13] = [
+        (
+            &["--status", "--cancel"],
+            "option --cancel cannot be used with --status",
+        ),
+        (
+            &["--cancel", "--status"],
+            "option --cancel cannot be used with --status",
+        ),
+        (
+            &["--status", "--cancel", "--candidate", "0"],
+            "option --cancel cannot be used with --status",
+        ),
+        (
+            &["--cancel", "--all"],
+            "option --all cannot be used with --cancel",
+        ),
+        (
+            &["--cancel", "--candidate", "0", "--all"],
+            "option --all cannot be used with --cancel",
+        ),
+        (
+            &["--cancel", "--budget-seconds", "10"],
+            "option --budget-seconds cannot be used with --cancel",
+        ),
+        (
+            &["--cancel", "--smoke"],
+            "option --smoke cannot be used with --cancel",
+        ),
+        (
+            &["--cancel", "--train-seed", "1"],
+            "option --train-seed cannot be used with --cancel",
+        ),
+        (
+            &["--status", "--all"],
+            "option --all cannot be used with --status",
+        ),
+        (
+            &["--status", "--budget-seconds", "10"],
+            "option --budget-seconds cannot be used with --status",
+        ),
+        (
+            &["--status", "--smoke"],
+            "option --smoke cannot be used with --status",
+        ),
+        (
+            &["--status", "--train-seed", "1"],
+            "option --train-seed cannot be used with --status",
+        ),
+        (
+            &["--candidate", "0", "--all"],
+            "options --candidate and --all cannot be used together",
+        ),
+    ];
+    for (extra, message) in cases {
+        let mut args = vec!["train", "--project-dir", "p"];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(64), "args: {args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout),
+            format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n"),
             "args: {args:?}"
         );
     }
