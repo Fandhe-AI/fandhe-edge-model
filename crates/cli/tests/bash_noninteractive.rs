@@ -893,16 +893,32 @@ fn req39_ps_failure_is_fail_closed_and_kills_group() {
     );
     let pid = std::fs::read_to_string(&pid_file).expect("pid file");
     let pid = pid.trim().to_string();
-    // `ps -o stat=` で状態を取り、プロセスが無い（出力なし）かゾンビ（Z）なら終了済みとみなす
-    // （`kill -0` はゾンビにも成功するため使わない。scripts/cli-infer-noninteractive.sh の group_alive と同じ規則）。
-    // 最大 5 秒待ち、終了済みなら即座に抜ける。`ps` 自体を起動できなければテストを失敗させる。
+    // `ps -A -o pid=,stat=` で全プロセスの一覧を取り、ps の終了ステータスと各行の形式を検証してから
+    // PID を照合する（取得失敗を「子孫が終了済み」と誤読しない）。一覧に無いかゾンビ（Z）なら終了済み
+    // （`kill -0` はゾンビにも成功するため使わない。scripts/cli-infer-noninteractive.sh の group_alive と
+    // 同じ規則）。最大 5 秒待ち、終了済みなら即座に抜ける。
     let alive = || {
         let out = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid])
+            .args(["-A", "-o", "pid=,stat="])
             .output()
             .expect("run ps");
-        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        !stat.is_empty() && !stat.starts_with('Z')
+        assert!(out.status.success(), "ps failed: {:?}", out.status);
+        let list = String::from_utf8(out.stdout).expect("ps output is utf-8");
+        let rows: Vec<(&str, &str)> = list
+            .lines()
+            .map(|line| {
+                let mut cols = line.split_whitespace();
+                let row = (cols.next(), cols.next());
+                assert!(
+                    matches!(row, (Some(p), Some(_)) if p.bytes().all(|b| b.is_ascii_digit())),
+                    "unexpected ps line: {line}"
+                );
+                (row.0.unwrap_or_default(), row.1.unwrap_or_default())
+            })
+            .collect();
+        assert!(!rows.is_empty(), "ps returned no processes");
+        rows.iter()
+            .any(|(p, stat)| *p == pid && !stat.starts_with('Z'))
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while alive() && std::time::Instant::now() < deadline {
