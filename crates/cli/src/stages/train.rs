@@ -15,8 +15,34 @@
 //! （[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
 //!
 //! 学習ワーカーへ渡す validation は `id` と `input` のみ（正解ラベルは渡さない。REQ-27）。
-//! 作成後に失敗した場合は、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける
-//! （同じ `--candidate` を再試行できる。チェックポイントからの再開は提供しない。REQ-34）。
+//!
+//! # ジョブ記録とやり直し（REQ-34・TASK-34.2・TASK-34.3・#485）
+//!
+//! 学習ジョブは単発・`--all` とも [`TrainJob::run_recorded_in`] で実行し、`candidates/<N>/job/` に
+//! `job.json`（状態）と `job.lock`（生存確認の flock。PID は使わない）を残す。ジョブが失敗で終わった
+//! 単発の `train` は `candidates/<N>/` を片付けずに残し（[`status`] が報告できるように）、ジョブの
+//! 開始前・成功後の失敗では、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける。
+//!
+//! 開始時に `candidates/<N>/` が既にあれば [`discard_failed_candidate`] の規則で扱う: `result.json` あり・
+//! `succeeded`・記録なしは `candidate directory already exists`、`running`・`cancelling` は `job is running`
+//! （いずれも 64）、`failed`・`cancelled`（記録が `running` のまま所有者が消えたものは、状態確認が `failed`＋
+//! `owner_lost` へ書き戻してから）は丸ごと消して新規に学習する（チェックポイントからの再開は提供しない）。
+//! 判定は保持した候補ディレクトリの fd 起点で行い、削除は名前が今も同じ実体を指すことを確かめてから
+//! 保持 fd 起点で行う（symlink は辿らない。差し替えられていれば何も消さず 70）。`train --all` の開始時も
+//! 同じ規則で既存の候補ディレクトリを扱う。
+//!
+//! # `--status`（#485）
+//!
+//! [`status`] は記録のある候補のジョブ状態（[`read_job_status_in`] の結果をそのまま）とやり直し案内を
+//! 返す。学習の副作用が無いため凍結の検査はしない。書き込みは `running` の残骸を `failed`＋`owner_lost` へ
+//! 書き戻す `job.json` だけ（MCP では参照系だが、この書き戻しを伴う。REQ-36）。
+//!
+//! # 記録の読み書きの閉じ込め（REQ-39・#510）
+//!
+//! `candidates/<N>/` と `job/` は保持 fd 起点（`O_NOFOLLOW`）で開き、`job/` の中の `job.json`・`job.lock`・
+//! `job.check.lock`・一時ファイルの読み書きも、その保持 fd を起点にした [`ConfinedJobDir`]（ガード層の
+//! `openat` 系。学習ワーカー層の [`JobDirOps`] の実装）で行う。パスを再解決しないため、検証後に `job/` や
+//! その親が symlink へ差し替えられても、プロジェクトの外を読み書きしない（差し替え・移動を検出すると拒否）。
 //!
 //! # `--all`（探索予算内の全候補。REQ-18・TASK-18.1・TASK-18.2・#482・#483）
 //!
@@ -47,9 +73,13 @@ use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::error::TrainProcessError;
+use fandhe_edge_train::job::{JobState, TrainJob};
+use fandhe_edge_train::job_record::{
+    JobDirOps, JobRecordError, JobStatusReport, read_job_status_in, unix_now,
+};
 use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
-use fandhe_edge_train::process::{RunLimits, WorkerCandidateRunner, WorkerLauncher, run_train};
+use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, WorkerLauncher};
 use fandhe_edge_train::request::{
     Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
@@ -59,12 +89,15 @@ use fandhe_edge_train::search::{
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    MAX_SEARCH_RECORD_BYTES, StageFileError, allotted_time_limit_seconds, outcome_json_vec,
-    search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainStatusEntry, allotted_time_limit_seconds,
+    outcome_json_vec, search_record_json_vec, trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
 };
+
+use fandhe_edge_guard::package::ConfinedPackage;
+use fandhe_edge_guard::path::PathRejection;
 
 use super::inspect::split_rows;
 use crate::args::TrainArgs;
@@ -163,9 +196,9 @@ pub fn resolve_candidates(
 /// `train --candidate <index>` を実行する。
 ///
 /// # Errors
-/// 前提（`inspect` 済み）の欠落・候補の範囲外・既存の候補ディレクトリ・既存の `search_record.json`
-/// （`train --all` 済み）は `invalid_input`（64）、ワーカーの失敗は結果の失敗コードに応じた終了コード、
-/// I/O 失敗は `runtime_error`（70）。
+/// 前提（`inspect` 済み）の欠落・候補の範囲外・やり直せない既存の候補ディレクトリ（モジュール doc
+/// 「ジョブ記録とやり直し」）・既存の `search_record.json`（`train --all` 済み）は `invalid_input`（64）、
+/// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。
 pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
@@ -203,9 +236,13 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     if !project.exists(CANDIDATES_DIR)? {
         project.create_dir(CANDIDATES_DIR)?;
     }
-    // 以降の失敗では、今回作った候補ディレクトリだけを片付けてから返す（同じ `--candidate` を
-    // 再試行できるようにする。名前替えの公開方式は使わない: 結果の `artifact_dir` は絶対パスで
-    // 記録されるため、移動すると記録と実体がずれる。REQ-34: 再開は提供せず、やり直しは新規）。
+    if project.exists(&rel)? {
+        discard_failed_candidate(&project, index)?;
+    }
+    // ジョブの開始前・成功後の失敗では、今回作った候補ディレクトリだけを片付けてから返す（同じ
+    // `--candidate` を再試行できるようにする。名前替えの公開方式は使わない: 結果の `artifact_dir` は
+    // 絶対パスで記録されるため、移動すると記録と実体がずれる）。ジョブが失敗で終わった場合は
+    // `--status` のために残す（次の `train` が [`discard_failed_candidate`] で消す。REQ-34）。
     let created = project.create_dir_tracked(&rel)?;
     let trained = train_in_candidate_dir(
         &project,
@@ -217,8 +254,11 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     );
     match trained {
         Ok(()) => Ok(TrainReport::new(index, candidate.candidate_id)),
-        Err(mut report) => {
-            if !project.remove_created_dir(&created) {
+        Err(TrainFailure {
+            mut report,
+            job_failed,
+        }) => {
+            if !job_failed && !project.remove_created_dir(&created) {
                 // 元のエラーの終了コードは変えず、残骸があることだけ固定文言で付記する。
                 report
                     .message
@@ -229,8 +269,78 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     }
 }
 
-/// 作成済みの候補ディレクトリへ学習入力を置き、学習ワーカーを実行して結果を保存する。
-/// 失敗時の後始末は呼び出し元（[`run`]）が行う。
+/// 開始時に既にある `candidates/<index>/` を、モジュール doc「ジョブ記録とやり直し」の規則で扱う
+/// （やり直せるときだけ丸ごと消す。REQ-34・#485）。
+///
+/// 判定より先に候補ディレクトリの fd を保持し、`result.json` の確認と `job/` の状態確認はその fd 起点で
+/// 行う。削除は、名前が今も保持した実体を指すことを確かめてから保持 fd 起点で行い、差し替えられていれば
+/// 何も消さず `runtime_error`（70。REQ-39）。
+fn discard_failed_candidate(project: &Project, index: usize) -> Result<(), ErrorReport> {
+    let held = project.track_existing_dir(candidate_rel(index))?;
+    ensure_restartable(&held)?;
+    project.remove_tracked_dir_if_unchanged(&held)
+}
+
+/// 保持済みの候補ディレクトリ `held` がやり直せる（消して新規に学習してよい）かを判定する（消さない）。
+/// 単発の `train`（[`discard_failed_candidate`]）と `train --all` の開始時が共有する規則（REQ-34・#485）。
+fn ensure_restartable(held: &CreatedDir) -> Result<(), ErrorReport> {
+    if member_exists(held.handle(), RESULT_FILE)? {
+        return Err(invalid("candidate directory already exists"));
+    }
+    match job_status_in(held.handle())?.map(|job| job.state) {
+        Some(JobState::Failed | JobState::Cancelled) => {}
+        Some(JobState::Queued | JobState::Running | JobState::Cancelling) => {
+            return Err(invalid("job is running"));
+        }
+        // `succeeded`（`result.json` の保存前に止まった等）・記録なしは、何が残っているか分からないため
+        // 消さない（保守側）。
+        Some(JobState::Succeeded) | None => {
+            return Err(invalid("candidate directory already exists"));
+        }
+    }
+    Ok(())
+}
+
+/// 保持ディレクトリ `dir` 直下に `name` があるか（保持 fd 起点・`O_NOFOLLOW` で開いて確かめる。`NotFound`
+/// のみ「無い」。symlink・通常ファイル以外も「ある」とする＝やり直しを拒む側へ倒す）。
+fn member_exists(dir: &ConfinedPackage, name: &str) -> Result<bool, ErrorReport> {
+    match dir.open_regular_member(Path::new(name)) {
+        Ok(_) | Err(PathRejection::NotRegularFile { .. }) => Ok(true),
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// 単発の `train` の失敗。`job_failed` はジョブ記録が失敗で終わった（候補ディレクトリを残す）か。
+struct TrainFailure {
+    report: ErrorReport,
+    job_failed: bool,
+}
+
+impl TrainFailure {
+    /// ジョブの開始前・成功後の失敗（候補ディレクトリは片付ける）。
+    fn cleanup(report: ErrorReport) -> Self {
+        Self {
+            report,
+            job_failed: false,
+        }
+    }
+
+    /// ジョブが失敗で終わった（候補ディレクトリは `--status` のために残す）。
+    fn job(report: ErrorReport) -> Self {
+        Self {
+            report,
+            job_failed: true,
+        }
+    }
+}
+
+/// 作成済みの候補ディレクトリへ学習入力を置き、学習ジョブを記録つきで実行して結果を保存する。
+/// 失敗時の後始末は呼び出し元（[`run`]）が [`TrainFailure`] に従って行う。
 fn train_in_candidate_dir(
     project: &Project,
     rel: &Path,
@@ -238,42 +348,255 @@ fn train_in_candidate_dir(
     request: &TrainRequest,
     train_jsonl: &[u8],
     train_seed_override: Option<u32>,
-) -> Result<(), ErrorReport> {
-    let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)?;
+) -> Result<(), TrainFailure> {
+    let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)
+        .map_err(TrainFailure::cleanup)?;
 
-    let run = run_train(
-        launcher,
-        request,
-        &job_dir,
-        &RunLimits::for_request(request),
-    )
-    .map_err(|e| e.to_error_report())?;
-    if let Some(report) = train_outcome_error_report(run.outcome()) {
-        return Err(report);
+    let outcome = run_recorded_job(launcher, request, job_dir).map_err(|e| match e {
+        RecordedJobError::Run(e) => TrainFailure::job(e.to_error_report()),
+        RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+            TrainFailure::cleanup(e.to_error_report())
+        }
+    })?;
+    if let Some(report) = train_outcome_error_report(&outcome) {
+        return Err(TrainFailure::job(report));
     }
-    let TrainOutcome::Ok(success) = run.outcome() else {
-        return Err(ErrorReport::new(
-            ExitCode::RuntimeError,
-            "unexpected train outcome",
-        ));
+    let TrainOutcome::Ok(success) = &outcome else {
+        return Err(TrainFailure::cleanup(runtime("unexpected train outcome")));
     };
-    check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())?;
-    let result_json =
-        outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
-    project.write_new(rel.join(RESULT_FILE), &result_json)
+    check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())
+        .map_err(TrainFailure::cleanup)?;
+    let result_json = outcome_json_vec(&outcome)
+        .map_err(|_| TrainFailure::cleanup(runtime("cannot serialize train result")))?;
+    project
+        .write_new(rel.join(RESULT_FILE), &result_json)
+        .map_err(TrainFailure::cleanup)
+}
+
+/// [`run_recorded_job`] の失敗。
+enum RecordedJobError {
+    /// ジョブ記録を開始できなかった（子は起動していない・記録は残らない）。
+    Begin(JobRecordError),
+    /// ジョブが失敗した（終端記録は `failed`。書けなかった場合も次の状態確認が `owner_lost` を検出する）。
+    Run(TrainProcessError),
+    /// 学習は成功したが終端記録を書けなかった（記録と結果が食い違うため成功として扱わない）。
+    Record(JobRecordError),
+}
+
+/// 学習ジョブを保持した `job_dir` に記録しながら実行する（単発の `train` と `train --all` が共有する。
+/// REQ-34・TASK-34.2・#485）。記録の読み書きは保持 fd 起点（[`ConfinedJobDir`]。#510）で、パスは学習
+/// ワーカーの起動（`request.json`・作業ディレクトリ）にだけ渡す。ワーカーが返した失敗
+/// （`TrainOutcome::Error`）は `Ok` で返す（呼び出し元が写す）。
+fn run_recorded_job(
+    launcher: &WorkerLauncher,
+    request: &TrainRequest,
+    job_dir: ConfinedPackage,
+) -> Result<TrainOutcome, RecordedJobError> {
+    let path = job_dir.dir().to_path_buf();
+    let recorded = TrainJob::new()
+        .run_recorded_in(
+            launcher,
+            request,
+            &path,
+            Box::new(ConfinedJobDir(job_dir)),
+            &RunLimits::for_request(request),
+        )
+        .map_err(RecordedJobError::Begin)?;
+    let outcome = match recorded.run {
+        Ok(TrainRunEnd::Completed(run)) => run.outcome().clone(),
+        // キャンセルの口を持たないため起こらない。`run_train` と同じ写像にする（キャンセルは #484）。
+        Ok(TrainRunEnd::Cancelled(_)) => {
+            return Err(RecordedJobError::Run(TrainProcessError::Wait {
+                kind: std::io::ErrorKind::Interrupted,
+            }));
+        }
+        Err(e) => return Err(RecordedJobError::Run(e)),
+    };
+    match (recorded.record, &outcome) {
+        (Err(e), TrainOutcome::Ok(_)) => Err(RecordedJobError::Record(e)),
+        _ => Ok(outcome),
+    }
+}
+
+/// 保持した候補ディレクトリ `candidate_dir` のジョブ記録を確認する（記録が無ければ `None`）。
+///
+/// `job/` は保持 fd 起点の `open_subdir`（`O_NOFOLLOW`）で開き、記録の読み書きもその fd 起点
+/// （[`ConfinedJobDir`]）で行う（REQ-34・REQ-39・#510）。
+fn job_status_in(candidate_dir: &ConfinedPackage) -> Result<Option<JobStatusReport>, ErrorReport> {
+    let job_dir = match candidate_dir.open_subdir(Path::new(JOB_DIR)) {
+        Ok(dir) => dir,
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.to_error_report()),
+    };
+    match read_job_status_in(&ConfinedJobDir(job_dir), unix_now()) {
+        Ok(report) => Ok(Some(report)),
+        // `job.json`・`job.lock` のどちらも無い（ジョブを開始する前に止まった）。
+        Err(JobRecordError::Io {
+            kind: std::io::ErrorKind::NotFound,
+        }) => Ok(None),
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// 保持した `job/` の fd を起点にした [`JobDirOps`] の実装（ガード層の `openat` 系。パスを再解決しない。
+/// REQ-34・REQ-39・#510）。
+///
+/// 名前は `job/` 直下の 1 成分だけ。各操作は保持 fd の実パスが開いた時点の場所の配下にあることも
+/// 確かめ、`job/` が移動・差し替えられていれば拒否する（[`JobRecordError::InvalidJobDir`]）。
+#[derive(Debug)]
+pub(crate) struct ConfinedJobDir(pub(crate) ConfinedPackage);
+
+/// ガード層の拒否をジョブ記録のエラーへ写す（パス・内容は含めない）。
+fn job_dir_error(e: PathRejection) -> JobRecordError {
+    match e {
+        PathRejection::NotRegularFile { .. } => JobRecordError::NotRegularFile,
+        PathRejection::Unresolvable { source, .. } => JobRecordError::Io {
+            kind: source.kind(),
+        },
+        // 移動・差し替え（実パスがルート外）・未対応 OS など。
+        _ => JobRecordError::InvalidJobDir,
+    }
+}
+
+impl JobDirOps for ConfinedJobDir {
+    fn open_regular(&self, name: &str) -> Result<Option<std::fs::File>, JobRecordError> {
+        match self.0.open_regular_member(Path::new(name)) {
+            Ok(file) => Ok(Some(file)),
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(job_dir_error(e)),
+        }
+    }
+
+    fn open_or_create(&self, name: &str) -> Result<std::fs::File, JobRecordError> {
+        self.0
+            .open_or_create_private_member(Path::new(name))
+            .map_err(job_dir_error)
+    }
+
+    fn create_new(&self, name: &str) -> Result<std::fs::File, JobRecordError> {
+        self.0
+            .create_new_private_member(Path::new(name))
+            .map_err(job_dir_error)
+    }
+
+    fn link(&self, from: &str, to: &str) -> Result<(), JobRecordError> {
+        self.0
+            .link_member(Path::new(from), Path::new(to))
+            .map_err(job_dir_error)
+    }
+
+    fn replace(&self, from: &str, to: &str) -> Result<(), JobRecordError> {
+        self.0
+            .replace_member(Path::new(from), Path::new(to))
+            .map_err(job_dir_error)
+    }
+
+    fn remove(&self, name: &str) -> Result<(), JobRecordError> {
+        match self.0.remove_file_member(Path::new(name)) {
+            Ok(()) => Ok(()),
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(job_dir_error(e)),
+        }
+    }
+
+    fn sync_dir(&self) -> Result<(), JobRecordError> {
+        self.0
+            .sync_all()
+            .map_err(|e| JobRecordError::Io { kind: e.kind() })
+    }
+}
+
+/// `--status` で列挙する候補ディレクトリ数の上限（REQ-39）。
+const MAX_STATUS_CANDIDATES: usize = 1024;
+
+/// `train --status [--candidate N]`（REQ-34・TASK-34.2・TASK-34.3・#485）。
+///
+/// `candidate` 省略時は記録のある候補だけを添字順に返す（無ければ空）。各 `candidates/<N>` は先に
+/// `O_NOFOLLOW` で開き、symlink・非ディレクトリは一覧から除外する（リンク先を見ない。REQ-39）。
+/// 記録のある候補で 1 件でも照会が失敗すれば（`LockMissing` 等）、一覧全体をその失敗で返す
+/// （一部だけを成功として返さない。保守側）。凍結の検査はしない。
+///
+/// # Errors
+/// `--candidate N` に記録が無い・`candidates/<N>` が symlink や非ディレクトリ・記録の形式の不正は
+/// `invalid_input`（64）、記録のサイズ超過・候補が多すぎる場合は `limit_exceeded`（20）、lock・I/O の
+/// 失敗は `runtime_error`（70）。
+pub fn status(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+) -> Result<Vec<TrainStatusEntry>, ErrorReport> {
+    let project = Project::open(cwd, &args.project_dir)?;
+    if let Some(index) = candidate {
+        let job = match project.open_subdir_optional(candidate_rel(index))? {
+            Some(dir) => job_status_in(&dir)?,
+            None => None,
+        }
+        .ok_or_else(|| invalid("job record not found"))?;
+        return Ok(vec![TrainStatusEntry::new(index, job)]);
+    }
+    let Some(candidates_dir) = project.open_subdir_optional(CANDIDATES_DIR)? else {
+        return Ok(Vec::new());
+    };
+    let names = candidates_dir
+        .list_entry_names(MAX_STATUS_CANDIDATES)
+        .map_err(|_| runtime("cannot list project directory"))?;
+    if names.len() > MAX_STATUS_CANDIDATES {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "too many candidate directories",
+        ));
+    }
+    // 添字の正準形（`candidate_rel` が作る名前）だけを候補とする。
+    let mut indices: Vec<usize> = names
+        .iter()
+        .filter_map(|n| n.to_str())
+        .filter_map(|s| s.parse::<usize>().ok().filter(|i| i.to_string() == s))
+        .collect();
+    indices.sort_unstable();
+    let mut jobs = Vec::new();
+    for index in indices {
+        let dir = match candidates_dir.open_subdir(Path::new(&index.to_string())) {
+            Ok(dir) => dir,
+            // symlink・非ディレクトリ（`O_NOFOLLOW`・`O_DIRECTORY` の拒否）と、列挙後に消えたもの。
+            Err(PathRejection::Escapes { .. }) => continue,
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.to_error_report()),
+        };
+        if let Some(job) = job_status_in(&dir)? {
+            jobs.push(TrainStatusEntry::new(index, job));
+        }
+    }
+    Ok(jobs)
 }
 
 /// 作成済みの候補ディレクトリ `rel` へ `job/`・`train_input.jsonl`・`request.json`（・`--train-seed` の
-/// 記録）を置き、`job/` の絶対パスを返す（単発の `train` と `train --all` が共有する）。
+/// 記録）を置き、作った直後に保持 fd で開いた `job/` を返す（単発の `train` と `train --all` が共有する）。
 fn prepare_candidate_dir(
     project: &Project,
     rel: &Path,
     request: &TrainRequest,
     train_jsonl: &[u8],
     train_seed_override: Option<u32>,
-) -> Result<PathBuf, ErrorReport> {
+) -> Result<ConfinedPackage, ErrorReport> {
     let request_json = request.to_json_vec().map_err(|e| e.to_error_report())?;
-    let job_dir = project.create_dir(rel.join(JOB_DIR))?;
+    project.create_dir(rel.join(JOB_DIR))?;
+    let job_dir = project.open_subdir(rel.join(JOB_DIR))?;
     project.write_new(rel.join(TRAIN_INPUT_FILE), train_jsonl)?;
     project.write_new(rel.join(REQUEST_FILE), &request_json)?;
     if let Some(seed) = train_seed_override {
@@ -290,9 +613,10 @@ fn apply_smoke(candidate: &mut SearchCandidate) {
         .insert("epochs".to_string(), 1.into());
 }
 
-/// 候補 1 件の学習ジョブを、用意済みの `job/` で実行する関数の型（本番は [`WorkerCandidateRunner`]。
-/// テストは偽の実行で差し替える）。
-type JobFn<'a> = dyn FnMut(&TrainRequest, &Path) -> Result<TrainOutcome, TrainProcessError> + 'a;
+/// 候補 1 件の学習ジョブを、用意済みの `job/` で実行する関数の型（本番は [`run_recorded_job`] で
+/// `job/` に記録しながら実行する。テストは偽の実行で差し替える）。
+type JobFn<'a> =
+    dyn FnMut(&TrainRequest, ConfinedPackage) -> Result<TrainOutcome, AllRunError> + 'a;
 
 /// `train --all` を実行する（REQ-18・REQ-27・REQ-34・REQ-39・TASK-18.1・TASK-18.2・#482・#483）。
 ///
@@ -306,9 +630,16 @@ pub fn run_all(
 ) -> Result<TrainAllReport, ErrorReport> {
     let launcher_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
         let launcher = worker_launcher()?;
-        Ok(Box::new(move |request: &TrainRequest, job_dir: &Path| {
-            WorkerCandidateRunner::new(&launcher, job_dir).run(request)
-        }))
+        Ok(Box::new(
+            move |request: &TrainRequest, job_dir: ConfinedPackage| {
+                run_recorded_job(&launcher, request, job_dir).map_err(|e| match e {
+                    RecordedJobError::Run(e) => AllRunError::Process(e),
+                    RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+                        AllRunError::Report(e.to_error_report())
+                    }
+                })
+            },
+        ))
     };
     run_all_with(args, budget, cwd, launcher_job, &SystemClock::new())
 }
@@ -347,13 +678,19 @@ where
         }
         candidates.push(candidate);
     }
-    // やり直しは新規（REQ-34）。既存の探索記録・候補ディレクトリがあれば何も作らずに止める。
+    // やり直しは新規（REQ-34）。既存の探索記録があれば何も作らずに止める。既存の候補ディレクトリは単発の
+    // `train` と同じ規則（[`ensure_restartable`]）で、全候補がやり直せる場合だけ、学習ジョブの開始直前に
+    // まとめて消す（1 件でもやり直せなければ何も消さずに止める）。
     if project.exists(SEARCH_RECORD_FILE)? {
         return Err(invalid("search record already exists"));
     }
+    let mut stale = Vec::new();
     for index in 0..n_candidates {
-        if project.exists(candidate_rel(index))? {
-            return Err(invalid("candidate directory already exists"));
+        let rel = candidate_rel(index);
+        if project.exists(&rel)? {
+            let held = project.track_existing_dir(&rel)?;
+            ensure_restartable(&held)?;
+            stale.push(held);
         }
     }
 
@@ -376,6 +713,9 @@ where
     let inputs: Vec<&[u8]> = validation.iter().map(|r| r.input.as_bytes()).collect();
     let roots: Vec<String> = candidates.iter().map(|c| c.params.root.clone()).collect();
     let job = make_job()?;
+    for held in &stale {
+        project.remove_tracked_dir_if_unchanged(held)?;
+    }
 
     let mut runner = CandidateDirRunner {
         project: &project,
@@ -484,6 +824,12 @@ enum AllRunError {
     Report(ErrorReport),
 }
 
+impl From<TrainProcessError> for AllRunError {
+    fn from(e: TrainProcessError) -> Self {
+        Self::Process(e)
+    }
+}
+
 /// `train --all` の実行器: 候補の学習ジョブの直前に `candidates/<N>/` を作って入力を置き、学習ジョブを
 /// 実行して結果を控える（[`run_search`] の [`CandidateRunner`]）。候補は `request.root()` で特定する。
 struct CandidateDirRunner<'p, 'j> {
@@ -537,7 +883,7 @@ impl CandidateRunner for CandidateDirRunner<'_, '_> {
             self.train_seed_override,
         )
         .map_err(AllRunError::Report)?;
-        let outcome = (self.job)(request, &job_dir).map_err(AllRunError::Process)?;
+        let outcome = (self.job)(request, job_dir)?;
         if let TrainOutcome::Ok(success) = &outcome {
             check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())
                 .map_err(AllRunError::Report)?;
@@ -908,7 +1254,7 @@ mod all_tests {
     use fandhe_edge_train::error::TrainRequestError;
     use fandhe_edge_train::time_allotment::TimeAllotmentError;
 
-    use crate::args::{InspectArgs, RegisterArgs, SelectArgs, TrainTarget};
+    use crate::args::{InspectArgs, RegisterArgs, SelectArgs, TrainOp, TrainTarget};
 
     const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
     /// `c1` の既定設定（`fixtures/train_contract/kind_defaults.json` と同じ具体値。結果の `config` は
@@ -982,9 +1328,9 @@ mod all_tests {
     fn all_args() -> TrainArgs {
         TrainArgs {
             project_dir: "proj".into(),
-            target: TrainTarget::All {
+            op: TrainOp::Run(TrainTarget::All {
                 budget: SearchBudget::default(),
-            },
+            }),
             smoke: false,
             train_seed: None,
         }
@@ -1050,10 +1396,12 @@ mod all_tests {
         };
         let job_now = Rc::clone(&now_ms);
         let make_job = move || -> Result<Box<JobFn<'static>>, ErrorReport> {
-            Ok(Box::new(move |request: &TrainRequest, _job: &Path| {
-                job_now.set(job_now.get() + 600);
-                Ok(fake_c1_success(request))
-            }))
+            Ok(Box::new(
+                move |request: &TrainRequest, _job: ConfinedPackage| {
+                    job_now.set(job_now.get() + 600);
+                    Ok(fake_c1_success(request))
+                },
+            ))
         };
         let budget = SearchBudget::new(3).expect("budget");
         let report =
@@ -1103,7 +1451,7 @@ mod all_tests {
             now_ms: Rc::new(Cell::new(0)),
         };
         let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
-            Ok(Box::new(|request: &TrainRequest, _job: &Path| {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
                 let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
                 Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
             }))
@@ -1137,7 +1485,7 @@ mod all_tests {
         // `train --all` 済みのプロジェクトへの単発の `train --candidate` も同じく拒否する（予算内と予算外で
         // 学習した候補を混ぜない。REQ-18）。学習ワーカーの発見より前に止まり、候補ディレクトリを作らない。
         let single = TrainArgs {
-            target: TrainTarget::Candidate(0),
+            op: TrainOp::Run(TrainTarget::Candidate(0)),
             ..all_args()
         };
         let rejected = run(&single, 0, &cwd).expect_err("existing record");
@@ -1159,12 +1507,13 @@ mod all_tests {
             now_ms: Rc::new(Cell::new(0)),
         };
         let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
-            Ok(Box::new(|request: &TrainRequest, _job: &Path| {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
                 if request.kind() == "c3" {
                     return Err(TrainProcessError::WallTimeout {
                         limit_ms: 1000,
                         child_reaped: true,
-                    });
+                    }
+                    .into());
                 }
                 Ok(fake_c1_success(request))
             }))
@@ -1197,11 +1546,12 @@ mod all_tests {
             now_ms: Rc::new(Cell::new(0)),
         };
         let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
-            Ok(Box::new(|request: &TrainRequest, _job: &Path| {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
                 if request.kind() == "c3" {
                     return Err(TrainProcessError::Spawn {
                         kind: std::io::ErrorKind::NotFound,
-                    });
+                    }
+                    .into());
                 }
                 Ok(fake_c1_success(request))
             }))
@@ -1230,7 +1580,7 @@ mod all_tests {
             now_ms: Rc::new(Cell::new(0)),
         };
         let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
-            Ok(Box::new(|request: &TrainRequest, _job: &Path| {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
                 Ok(fake_c1_outcome(request, "[0,0]"))
             }))
         };
@@ -1304,7 +1654,594 @@ mod all_tests {
         );
     }
 
+    /// `proj/candidates/<index>/job/` に `state` の終端記録を作り、目印のファイルを候補ディレクトリへ置く。
+    fn leftover_candidate(cwd: &Path, index: usize, state: JobState) {
+        use fandhe_edge_train::job_record::{JobFailure, JobRecorder};
+        let job = cwd.join(format!("proj/candidates/{index}/job"));
+        std::fs::create_dir_all(&job).expect("job dir");
+        let failure = (state == JobState::Failed).then_some(JobFailure::Error {
+            code: ExitCode::RuntimeError,
+        });
+        JobRecorder::begin(&job, 100)
+            .expect("begin")
+            .finish(state, failure, 110)
+            .expect("finish");
+        std::fs::write(cwd.join(format!("proj/candidates/{index}/stale.bin")), b"x").expect("mark");
+    }
+
+    /// REQ-34・#485: `train --all` の開始時も単発の `train` と同じやり直し規則を使う。`failed`・`cancelled`
+    /// で `result.json` の無い候補ディレクトリは消して新規に学習する（残骸の目印は消える）。
+    #[test]
+    fn req34_train_all_restarts_failed_and_cancelled_candidates() {
+        let cwd = inspected_workdir("allrestart");
+        leftover_candidate(&cwd, 0, JobState::Failed);
+        leftover_candidate(&cwd, 1, JobState::Cancelled);
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
+                if request.kind() == "c3" {
+                    let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                    return Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"));
+                }
+                Ok(fake_c1_success(request))
+            }))
+        };
+        run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
+            .expect("train --all");
+        let proj = cwd.join("proj");
+        assert!(proj.join("candidates/0/result.json").is_file());
+        assert!(!proj.join("candidates/0/stale.bin").exists());
+        // c3 は今回も失敗したため、`--all` の規則どおり片付けられる。
+        assert!(!proj.join("candidates/1").exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485: `train --all` の開始時、1 件でもやり直せない候補（実行中・成功済み・`result.json` あり・
+    /// 記録なし）があれば 64 で止まり、やり直せる候補も含めて何も消さない（学習ジョブも始めない）。
+    #[test]
+    fn req34_train_all_refuses_unrestartable_candidates_without_deleting() {
+        use fandhe_edge_train::job_record::JobRecorder;
+        let never =
+            || -> Result<Box<JobFn<'static>>, ErrorReport> { panic!("must not start jobs") };
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let cwd = inspected_workdir("allrefuse");
+        let proj = cwd.join("proj");
+        leftover_candidate(&cwd, 0, JobState::Failed);
+
+        // 記録なし。
+        std::fs::create_dir_all(proj.join("candidates/1")).expect("no record");
+        let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
+            .expect_err("no record");
+        assert_eq!(
+            error_pair(&e),
+            (ExitCode::InvalidInput, "candidate directory already exists")
+        );
+        assert!(proj.join("candidates/0/stale.bin").is_file());
+        std::fs::remove_dir(proj.join("candidates/1")).expect("rm");
+
+        // 実行中（所有者が lock を保持）。
+        std::fs::create_dir_all(proj.join("candidates/1/job")).expect("job");
+        let owner = JobRecorder::begin(&proj.join("candidates/1/job"), 100).expect("begin");
+        let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
+            .expect_err("running");
+        assert_eq!(error_pair(&e), (ExitCode::InvalidInput, "job is running"));
+        assert!(proj.join("candidates/0/stale.bin").is_file());
+        owner
+            .finish(JobState::Succeeded, None, 110)
+            .expect("finish");
+
+        // 成功済み。
+        let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
+            .expect_err("succeeded");
+        assert_eq!(
+            error_pair(&e),
+            (ExitCode::InvalidInput, "candidate directory already exists")
+        );
+        std::fs::remove_dir_all(proj.join("candidates/1")).expect("rm");
+
+        // `failed` でも `result.json` あり。
+        std::fs::write(proj.join("candidates/0/result.json"), b"{}").expect("result");
+        let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
+            .expect_err("result.json");
+        assert_eq!(
+            error_pair(&e),
+            (ExitCode::InvalidInput, "candidate directory already exists")
+        );
+        assert!(proj.join("candidates/0/stale.bin").is_file());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     fn error_pair(report: &ErrorReport) -> (ExitCode, &str) {
         (report.code, report.message.as_str())
+    }
+}
+
+/// `train --status` とジョブ記録の配線（REQ-34・TASK-34.2・TASK-34.3・REQ-21・#485）。
+///
+/// 証拠の種別: テストハーネス。記録は学習ワーカー層の `JobRecorder` で直接作り、学習ワーカーは
+/// 起動しない（GPU を使わない）。
+#[cfg(all(test, unix))]
+mod status_tests {
+    use super::*;
+    use fandhe_edge_train::job_record::{JobFailure, JobRecorder};
+    use fandhe_edge_train::stage_files::train_status_json_line;
+
+    use crate::args::TrainOp;
+
+    /// `proj/` だけを持つ作業ディレクトリ（cwd。正準化済み）。
+    fn workdir(case: &str) -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!("fandhe-train-status-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).expect("mkdir");
+        dir
+    }
+
+    /// `candidates/<index>/job/` を作って絶対パスを返す。
+    fn job_dir(cwd: &Path, index: usize) -> PathBuf {
+        let dir = cwd.join(format!("proj/candidates/{index}/job"));
+        std::fs::create_dir_all(&dir).expect("job dir");
+        dir
+    }
+
+    fn status_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
+        let args = TrainArgs {
+            project_dir: "proj".into(),
+            op: TrainOp::Status(candidate),
+            smoke: false,
+            train_seed: None,
+        };
+        status(&args, candidate, cwd).map(|jobs| train_status_json_line(&jobs).expect("json"))
+    }
+
+    const NOT_INSPECTED: &str = r#"{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse."}"#;
+
+    /// REQ-34・#485 (a): 終端記録（`succeeded`・`failed`）をそのまま写し、記録のある候補だけを添字順に
+    /// 並べる（記録の無い候補・添字の正準形でない名前は出さない）。`failed` にだけやり直し案内が付く。
+    /// プロジェクトは定義・凍結記録を持たない（`--status` は凍結の検査をしない）。
+    #[test]
+    fn req34_status_reports_terminal_records_exactly() {
+        let cwd = workdir("terminal");
+        JobRecorder::begin(&job_dir(&cwd, 10), 100)
+            .expect("begin")
+            .finish(JobState::Succeeded, None, 120)
+            .expect("finish");
+        JobRecorder::begin(&job_dir(&cwd, 2), 100)
+            .expect("begin")
+            .finish(
+                JobState::Failed,
+                Some(JobFailure::Error {
+                    code: ExitCode::Pending,
+                }),
+                130,
+            )
+            .expect("finish");
+        job_dir(&cwd, 3);
+        std::fs::create_dir_all(cwd.join("proj/candidates/07/job")).expect("non-canonical");
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            format!(
+                r#"{{"step":"train","status":"ok","jobs":[{{"candidate":2,"job":{{"state":"failed","crash_detected":false,"failure":{{"kind":"error","code":"pending"}},"record_updated":false}},"restart":{NOT_INSPECTED}}},{{"candidate":10,"job":{{"state":"succeeded","crash_detected":false,"failure":null,"record_updated":false}},"restart":null}}]}}"#
+            )
+        );
+        assert_eq!(
+            status_line(&cwd, Some(10)).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[{"candidate":10,"job":{"state":"succeeded","crash_detected":false,"failure":null,"record_updated":false},"restart":null}]}"#
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485 (b): 別スレッドが `JobRecorder::begin` で lock を保持している間は `running`
+    /// （クラッシュと誤報しない）。保持者が `finish` すれば終端記録を返す。
+    #[test]
+    fn req34_status_reports_running_while_lock_is_held() {
+        let cwd = workdir("running");
+        let dir = job_dir(&cwd, 0);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let recorder = JobRecorder::begin(&dir, 100).expect("begin");
+            held_tx.send(()).expect("send");
+            done_rx.recv().expect("recv");
+            recorder
+                .finish(JobState::Succeeded, None, 110)
+                .expect("finish");
+        });
+        held_rx.recv().expect("held");
+        assert_eq!(
+            status_line(&cwd, Some(0)).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[{"candidate":0,"job":{"state":"running","crash_detected":false,"failure":null,"record_updated":false},"restart":null}]}"#
+        );
+        done_tx.send(()).expect("done");
+        owner.join().expect("owner");
+        assert!(
+            status_line(&cwd, Some(0))
+                .expect("status")
+                .contains(r#""state":"succeeded""#)
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485 (c): `running` の記録が残り lock の保持者がいない（所有プロセスが落ちた）と、
+    /// `failed`＋`owner_lost` を書き戻して `record_updated:true`、2 回目は同じ記録を `false` で返す。
+    #[test]
+    fn req34_status_detects_owner_lost_once() {
+        let cwd = workdir("ownerlost");
+        // `finish` せずに drop すると lock だけが解放され、記録は `running` のまま残る。
+        drop(JobRecorder::begin(&job_dir(&cwd, 1), 100).expect("begin"));
+        let crashed = |updated: bool| {
+            let line = status_line(&cwd, None).expect("status");
+            let (head, tail) = line
+                .split_once(r#""detected_at_unix":"#)
+                .expect("detected_at_unix");
+            assert_eq!(
+                head,
+                r#"{"step":"train","status":"ok","jobs":[{"candidate":1,"job":{"state":"failed","crash_detected":true,"failure":{"kind":"crashed","cause":"owner_lost","signal":null,"#
+            );
+            let (time, rest) = tail.split_once('}').expect("time");
+            assert!(time.parse::<u64>().is_ok_and(|t| t >= 100), "{time}");
+            assert_eq!(
+                rest,
+                format!(r#","record_updated":{updated}}},"restart":{NOT_INSPECTED}}}]}}"#)
+            );
+        };
+        crashed(true);
+        crashed(false);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-21・#485 (d): `--candidate N` に記録が無ければ `invalid_input`・`job record not found`
+    /// （候補ディレクトリが無い・`job/` に記録が無いのどちらも）。省略時に記録が無ければ `jobs:[]`。
+    #[test]
+    fn req34_status_without_record_is_invalid_input() {
+        let cwd = workdir("missing");
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[]}"#
+        );
+        let missing = status_line(&cwd, Some(0)).expect_err("no candidate dir");
+        assert_eq!(
+            (missing.code, missing.message.as_str()),
+            (ExitCode::InvalidInput, "job record not found")
+        );
+        job_dir(&cwd, 0);
+        let empty = status_line(&cwd, Some(0)).expect_err("no record");
+        assert_eq!(
+            (empty.code, empty.message.as_str()),
+            (ExitCode::InvalidInput, "job record not found")
+        );
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[]}"#
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-39・#485: 壊れた記録は `invalid_input`・固定 message、`job/` が symlink なら経路の
+    /// 拒否（`invalid_input`）でリンク先を読まない。
+    #[test]
+    fn req34_status_rejects_malformed_record_and_symlinked_job_dir() {
+        let cwd = workdir("malformed");
+        let dir = job_dir(&cwd, 0);
+        std::fs::write(dir.join("job.json"), b"{").expect("job.json");
+        let malformed = status_line(&cwd, Some(0)).expect_err("malformed");
+        assert_eq!(
+            (malformed.code, malformed.message.as_str()),
+            (ExitCode::InvalidInput, "job record is malformed")
+        );
+        std::fs::create_dir_all(cwd.join("proj/candidates/1")).expect("mkdir");
+        std::os::unix::fs::symlink(&dir, cwd.join("proj/candidates/1/job")).expect("symlink");
+        let escaped = status_line(&cwd, Some(1)).expect_err("symlink");
+        assert_eq!(escaped.code, ExitCode::InvalidInput, "{}", escaped.message);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// 候補 `index` に `state`（`failed` は `runtime_error`）の終端記録を作る。
+    fn finished(cwd: &Path, index: usize, state: JobState) {
+        let failure = (state == JobState::Failed).then_some(JobFailure::Error {
+            code: ExitCode::RuntimeError,
+        });
+        JobRecorder::begin(&job_dir(cwd, index), 100)
+            .expect("begin")
+            .finish(state, failure, 110)
+            .expect("finish");
+    }
+
+    fn discard(cwd: &Path, index: usize) -> Result<(), ErrorReport> {
+        let project = Project::open(cwd, Path::new("proj")).expect("project");
+        discard_failed_candidate(&project, index)
+    }
+
+    fn pair(report: &ErrorReport) -> (ExitCode, &str) {
+        (report.code, report.message.as_str())
+    }
+
+    /// REQ-34・#485: `failed` の記録でも `result.json` があれば消さず 64、記録の無い既存ディレクトリも
+    /// 64（何が残っているか分からないため消さない）。どちらも中身に触れない。
+    #[test]
+    fn req34_restart_refuses_result_or_missing_record() {
+        let cwd = workdir("refuse");
+        finished(&cwd, 0, JobState::Failed);
+        std::fs::write(cwd.join("proj/candidates/0/result.json"), b"{}").expect("result");
+        assert_eq!(
+            pair(&discard(&cwd, 0).expect_err("result.json")),
+            (ExitCode::InvalidInput, "candidate directory already exists")
+        );
+        assert!(cwd.join("proj/candidates/0/job/job.json").is_file());
+
+        std::fs::create_dir_all(cwd.join("proj/candidates/1/model-c3")).expect("no record");
+        assert_eq!(
+            pair(&discard(&cwd, 1).expect_err("no record")),
+            (ExitCode::InvalidInput, "candidate directory already exists")
+        );
+        assert!(cwd.join("proj/candidates/1/model-c3").is_dir());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485: `cancelled` で終わった候補はやり直しで丸ごと消える（`failed` と同じ）。
+    #[test]
+    fn req34_restart_discards_cancelled_candidate() {
+        let cwd = workdir("cancelled");
+        finished(&cwd, 0, JobState::Cancelled);
+        assert!(
+            status_line(&cwd, Some(0))
+                .expect("status")
+                .contains(r#""state":"cancelled""#)
+        );
+        discard(&cwd, 0).expect("discard");
+        assert!(!cwd.join("proj/candidates/0").exists());
+        assert!(cwd.join("proj/candidates").is_dir());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-39・#485: やり直しの削除は候補内の symlink（プロジェクトの外を指す）を辿らず、リンク
+    /// 自身だけを消す。
+    #[test]
+    fn req39_restart_does_not_follow_symlink_out_of_project() {
+        let cwd = workdir("symlinkout");
+        let outside = cwd.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("keep.txt"), b"keep").expect("keep");
+        finished(&cwd, 0, JobState::Failed);
+        std::os::unix::fs::symlink(&outside, cwd.join("proj/candidates/0/link")).expect("link");
+        discard(&cwd, 0).expect("discard");
+        assert!(!cwd.join("proj/candidates/0").exists());
+        assert_eq!(
+            std::fs::read(outside.join("keep.txt")).expect("kept"),
+            b"keep"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・#485: 保持した候補ディレクトリの名前が別の実体へ差し替えられていれば、何も消さず
+    /// `runtime_error`（70）。
+    #[test]
+    fn req39_restart_removal_checks_identity_before_clearing() {
+        let cwd = workdir("identity");
+        finished(&cwd, 0, JobState::Failed);
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        let held = project.track_existing_dir(candidate_rel(0)).expect("track");
+        let proj = cwd.join("proj/candidates");
+        std::fs::rename(proj.join("0"), proj.join("0.old")).expect("rename");
+        std::fs::create_dir(proj.join("0")).expect("replacement");
+        std::fs::write(proj.join("0/other.txt"), b"other").expect("other");
+        assert_eq!(
+            pair(
+                &project
+                    .remove_tracked_dir_if_unchanged(&held)
+                    .expect_err("replaced")
+            ),
+            (
+                ExitCode::RuntimeError,
+                "candidate directory could not be cleaned up"
+            )
+        );
+        assert!(proj.join("0/other.txt").is_file());
+        assert!(proj.join("0.old/job/job.json").is_file());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-39・#485: `candidates/<N>` が symlink・通常ファイルなら一覧から除外し（リンク先の記録を
+    /// 読まない）、`--candidate N` で指定すると経路の拒否（`invalid_input`）。
+    #[test]
+    fn req39_status_excludes_symlinked_and_file_candidates() {
+        let cwd = workdir("candlink");
+        finished(&cwd, 2, JobState::Succeeded);
+        let candidates = cwd.join("proj/candidates");
+        std::os::unix::fs::symlink(candidates.join("2"), candidates.join("5")).expect("symlink");
+        std::fs::write(candidates.join("6"), b"file").expect("file");
+        let line = status_line(&cwd, None).expect("status");
+        assert!(line.contains(r#""candidate":2,"#), "{line}");
+        assert!(!line.contains(r#""candidate":5,"#), "{line}");
+        assert!(!line.contains(r#""candidate":6,"#), "{line}");
+        for index in [5, 6] {
+            let rejected = status_line(&cwd, Some(index)).expect_err("rejected");
+            assert_eq!(
+                rejected.code,
+                ExitCode::InvalidInput,
+                "{}",
+                rejected.message
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・#485: `candidates/` 直下が列挙上限（1024 件）を超えると `limit_exceeded`（20）。
+    #[test]
+    fn req39_status_listing_limit_is_limit_exceeded() {
+        let cwd = workdir("listlimit");
+        let candidates = cwd.join("proj/candidates");
+        std::fs::create_dir_all(&candidates).expect("candidates");
+        for i in 0..=MAX_STATUS_CANDIDATES {
+            std::fs::write(candidates.join(format!("x{i}")), b"").expect("entry");
+        }
+        assert_eq!(
+            pair(&status_line(&cwd, None).expect_err("too many")),
+            (ExitCode::LimitExceeded, "too many candidate directories")
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-21・#485: 非終端の記録なのに `job.lock` が無い（生存を否定できない）と `runtime_error`
+    /// （70）。一覧でもその候補を除外せず全体を失敗させる（保守側）。
+    #[test]
+    fn req34_status_lock_missing_is_runtime_error() {
+        let cwd = workdir("lockmissing");
+        finished(&cwd, 0, JobState::Succeeded);
+        let dir = job_dir(&cwd, 1);
+        drop(JobRecorder::begin(&dir, 100).expect("begin"));
+        std::fs::remove_file(dir.join("job.lock")).expect("remove lock");
+        let expected = (
+            ExitCode::RuntimeError,
+            "job lock file is missing for a non-terminal job record",
+        );
+        assert_eq!(
+            pair(&status_line(&cwd, Some(1)).expect_err("single")),
+            expected
+        );
+        assert_eq!(pair(&status_line(&cwd, None).expect_err("list")), expected);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// プロジェクトの外に、候補ディレクトリと同じ形（`job/job.json`・`job/job.lock`。`running` で所有者なし）
+    /// を作り、`job.json` のバイト列を返す。差し替え先として使う。
+    fn outside_candidate(cwd: &Path) -> (PathBuf, Vec<u8>) {
+        let outside = cwd.join("outside");
+        let job = outside.join("job");
+        std::fs::create_dir_all(&job).expect("outside job");
+        drop(JobRecorder::begin(&job, 100).expect("begin outside"));
+        let bytes = std::fs::read(job.join("job.json")).expect("outside job.json");
+        (outside, bytes)
+    }
+
+    /// ルート外の `job/` が読み書きされていない（`job.json` が不変・`job.check.lock`・一時ファイルが無い）。
+    fn assert_outside_untouched(outside: &Path, bytes: &[u8]) {
+        let job = outside.join("job");
+        assert_eq!(
+            std::fs::read(job.join("job.json")).expect("job.json"),
+            bytes
+        );
+        assert!(!job.join("job.check.lock").exists());
+        assert!(!job.join("job.json.tmp").exists());
+        let mut names: Vec<String> = std::fs::read_dir(&job)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["job.json", "job.lock"]);
+    }
+
+    /// `proj/candidates/0` を `0.moved` へ移し、ルート外を指す symlink に差し替える。
+    fn swap_candidate_to(cwd: &Path, outside: &Path) {
+        let candidates = cwd.join("proj/candidates");
+        std::fs::rename(candidates.join("0"), candidates.join("0.moved")).expect("move");
+        std::os::unix::fs::symlink(outside, candidates.join("0")).expect("symlink");
+    }
+
+    /// 保持 fd で開いた `candidates/0/job` の [`ConfinedJobDir`]。
+    fn held_job_dir(cwd: &Path) -> ConfinedJobDir {
+        let project = Project::open(cwd, Path::new("proj")).expect("project");
+        ConfinedJobDir(
+            project
+                .open_subdir(candidate_rel(0).join(JOB_DIR))
+                .expect("job dir"),
+        )
+    }
+
+    /// REQ-39・REQ-34・#510: `--status` の状態確認は、検証（`job/` を保持 fd で開く）後に親の
+    /// `candidates/<N>` をルート外への symlink に差し替えられても、ルート外の `job.json` を読まず・書き戻さず・
+    /// `job.check.lock` を作らない（差し替えを検出して拒否する）。
+    #[test]
+    fn req39_status_after_swap_does_not_touch_outside() {
+        let cwd = workdir("swapstatus");
+        drop(JobRecorder::begin(&job_dir(&cwd, 0), 100).expect("begin"));
+        let (outside, bytes) = outside_candidate(&cwd);
+        let held = held_job_dir(&cwd);
+        swap_candidate_to(&cwd, &outside);
+        let error = read_job_status_in(&held, unix_now()).expect_err("swapped");
+        assert_eq!(error, JobRecordError::InvalidJobDir);
+        assert_outside_untouched(&outside, &bytes);
+        // パスから辿り直す `--status` も、symlink の候補は除外・拒否する。
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[]}"#
+        );
+        assert_eq!(
+            status_line(&cwd, Some(0)).expect_err("symlink").code,
+            ExitCode::InvalidInput
+        );
+        assert_outside_untouched(&outside, &bytes);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・REQ-34・#510: やり直し判定は、候補ディレクトリを保持した後に名前をルート外への symlink に
+    /// 差し替えられても、ルート外を読まず・書かず・消さない（判定・削除とも拒否する）。
+    #[test]
+    fn req39_restart_after_swap_does_not_touch_outside() {
+        let cwd = workdir("swaprestart");
+        finished(&cwd, 0, JobState::Failed);
+        let (outside, bytes) = outside_candidate(&cwd);
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        let held = project.track_existing_dir(candidate_rel(0)).expect("track");
+        swap_candidate_to(&cwd, &outside);
+        assert!(ensure_restartable(&held).is_err());
+        assert_eq!(
+            pair(
+                &project
+                    .remove_tracked_dir_if_unchanged(&held)
+                    .expect_err("swapped")
+            ),
+            (
+                ExitCode::RuntimeError,
+                "candidate directory could not be cleaned up"
+            )
+        );
+        assert_outside_untouched(&outside, &bytes);
+        assert!(cwd.join("proj/candidates/0.moved/job/job.json").is_file());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-39・REQ-34・#510: 学習時の記録（`begin`・`finish`）は、`job/` を保持 fd で開いた後に親を
+    /// ルート外への symlink に差し替えられても、ルート外に `job.json`・`job.lock` 等を作らない。差し替えの
+    /// 前に始めたジョブの `finish` も、ルート外へは書かない。
+    #[test]
+    fn req39_begin_and_finish_after_swap_do_not_touch_outside() {
+        let cwd = workdir("swapbegin");
+        job_dir(&cwd, 0);
+        let outside = cwd.join("outside");
+        std::fs::create_dir_all(outside.join("job")).expect("outside job");
+        let held = held_job_dir(&cwd);
+        swap_candidate_to(&cwd, &outside);
+        assert_eq!(
+            JobRecorder::begin_in(Box::new(held), 100).expect_err("swapped"),
+            JobRecordError::InvalidJobDir
+        );
+        let entries = |dir: &Path| std::fs::read_dir(dir).expect("list").count();
+        assert_eq!(entries(&outside.join("job")), 0);
+
+        // 差し替えの前に始めたジョブ。
+        let cwd2 = workdir("swapfinish");
+        job_dir(&cwd2, 0);
+        let outside2 = cwd2.join("outside");
+        std::fs::create_dir_all(outside2.join("job")).expect("outside job");
+        let recorder = JobRecorder::begin_in(Box::new(held_job_dir(&cwd2)), 100).expect("begin");
+        swap_candidate_to(&cwd2, &outside2);
+        assert_eq!(
+            recorder
+                .finish(JobState::Succeeded, None, 110)
+                .expect_err("swapped"),
+            JobRecordError::InvalidJobDir
+        );
+        assert_eq!(entries(&outside2.join("job")), 0);
+        let moved = std::fs::read_to_string(cwd2.join("proj/candidates/0.moved/job/job.json"))
+            .expect("job.json");
+        assert!(moved.contains(r#""state":"running""#), "{moved}");
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&cwd2);
     }
 }

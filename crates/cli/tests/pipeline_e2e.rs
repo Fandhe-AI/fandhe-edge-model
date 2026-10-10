@@ -782,6 +782,14 @@ mod suite {
         );
         assert!(env.project_file("candidates/0/result.json").is_file());
         assert!(env.project_file("candidates/1/result.json").is_file());
+        // `--all` も学習ジョブを `job/` に記録する（REQ-34・#485）。
+        for index in 0..2 {
+            let job = std::fs::read_to_string(
+                env.project_file(&format!("candidates/{index}/job/job.json")),
+            )
+            .expect("job.json");
+            assert!(job.contains("\"state\":\"succeeded\""), "{job}");
+        }
         let request =
             std::fs::read_to_string(env.project_file("candidates/0/request.json")).expect("req");
         assert!(
@@ -970,9 +978,11 @@ mod suite {
         );
     }
 
-    /// REQ-34: 学習ワーカーが失敗（異常終了・残骸あり）すると `candidates/<N>/` は片付けられ、
-    /// 同じ `--candidate N` を成功するワーカーで再実行すると成功する（再開ではなく新規のやり直し）。
-    pub fn train_failure_cleans_candidate_dir_and_allows_retry() {
+    /// REQ-34・#485 (e)(f): 学習ワーカーが失敗（異常終了・残骸あり）すると、`candidates/<N>/` は
+    /// `job.json`（`failed`）とともに残り、`train --status` が失敗とやり直し案内を報告する。同じ
+    /// `--candidate N` を成功するワーカーで再実行すると、残骸ごと消して新規に学習する（再開ではない）。
+    /// 学習後の `job.json` は `succeeded` で、`result.json` のある候補の再学習は `invalid_input`（64）。
+    pub fn req34_failed_job_is_kept_reported_and_restarted_from_scratch() {
         let env = inspected("trainretry");
         let marker = env.project_file("fail_worker");
         std::fs::write(&marker, "").expect("marker");
@@ -982,9 +992,20 @@ mod suite {
             stdout,
             "{\"code\":\"runtime_error\",\"message\":\"worker process exited with unknown exit code 1\"}\n"
         );
-        assert!(!env.project_file("candidates/0").exists());
-        // 別の候補の領域には触れない（親の `candidates/` は残る）。
-        assert!(env.project_file("candidates").is_dir());
+        assert!(
+            env.project_file("candidates/0/model-c1/partial.bin")
+                .is_file()
+        );
+        assert!(!env.project_file("candidates/0/result.json").exists());
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--status"]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"jobs\":[{\"candidate\":0,\"job\":{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{\"kind\":\"error\",\"code\":\"runtime_error\"},\"record_updated\":false},\"restart\":{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"not_inspected\",\"message\":\"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse.\"}}]}\n"
+        );
+        // 失敗した候補は未学習扱い（`select` は採点できる候補が無いときと同じ `pending`・12）。
+        assert_eq!(
+            env.fails(&["select", "--project-dir", "proj"], 12, "pending"),
+            "{\"code\":\"pending\",\"message\":\"result is pending\"}\n"
+        );
 
         std::fs::remove_file(&marker).expect("remove marker");
         assert_eq!(
@@ -992,6 +1013,93 @@ mod suite {
             "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}\n"
         );
         assert!(env.project_file("candidates/0/result.json").is_file());
+        assert!(
+            !env.project_file("candidates/0/model-c1/partial.bin")
+                .exists()
+        );
+        let job =
+            std::fs::read_to_string(env.project_file("candidates/0/job/job.json")).expect("job");
+        assert!(job.contains("\"state\":\"succeeded\""), "{job}");
+        assert_eq!(
+            env.ok(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--status",
+                "--candidate",
+                "0"
+            ]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"jobs\":[{\"candidate\":0,\"job\":{\"state\":\"succeeded\",\"crash_detected\":false,\"failure\":null,\"record_updated\":false},\"restart\":null}]}\n"
+        );
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--candidate", "0"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate directory already exists\"}\n"
+        );
+        assert!(env.project_file("candidates/0/result.json").is_file());
+    }
+
+    /// REQ-39・REQ-34・#485: 別プロセス（本テスト）が読み手の直列化 lock（`job.check.lock`）を保持し
+    /// 続けると、`train --status` は無期限に待たず、上限（5 秒）後に `runtime_error`（70）で終わる。
+    pub fn req39_status_check_lock_held_by_another_process_times_out() {
+        let env = registered("checklock", false);
+        let job_dir = env.project_file("candidates/0/job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        let job_dir = std::fs::canonicalize(job_dir).expect("canonical");
+        // 所有者が消えた `running` の記録（直列化 lock を取りに行く経路）。
+        drop(fandhe_edge_train::job_record::JobRecorder::begin(&job_dir, 100).expect("begin"));
+        let holder = std::fs::File::create(job_dir.join("job.check.lock")).expect("check lock");
+        holder.lock().expect("hold");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--status"],
+                70,
+                "runtime_error"
+            ),
+            "{\"code\":\"runtime_error\",\"message\":\"job lock is held by another process\"}\n"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        drop(holder);
+        assert!(
+            env.ok(&["train", "--project-dir", "proj", "--status"])
+                .contains("\"cause\":\"owner_lost\"")
+        );
+    }
+
+    /// REQ-34・#485 (e): 別プロセス（本テスト）が `job.lock` を保持している `running` の候補への `train` は
+    /// `invalid_input`・`job is running` で、候補ディレクトリに触れない。保持者が消える（lock 解放・記録は
+    /// `running` のまま）と、`train` が `failed`＋`owner_lost` を検出して丸ごと消し、新規に学習する。
+    pub fn req34_running_job_blocks_train_until_owner_is_lost() {
+        let env = inspected("trainrunning");
+        let job_dir = env.project_file("candidates/1/job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        let job_dir = std::fs::canonicalize(job_dir).expect("canonical");
+        let recorder =
+            fandhe_edge_train::job_record::JobRecorder::begin(&job_dir, 100).expect("begin");
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--candidate", "1"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"job is running\"}\n"
+        );
+        assert!(job_dir.join("job.json").is_file());
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--status"]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"jobs\":[{\"candidate\":1,\"job\":{\"state\":\"running\",\"crash_detected\":false,\"failure\":null,\"record_updated\":false},\"restart\":null}]}\n"
+        );
+        drop(recorder);
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":1,\"kind\":\"c3\"}\n"
+        );
+        let job = std::fs::read_to_string(job_dir.join("job.json")).expect("job");
+        assert!(job.contains("\"state\":\"succeeded\""), "{job}");
     }
 
     /// REQ-23・TASK-23.2: 学習ワーカーの空入力の前処理が推論ランタイムと食い違う結果を返すと、`train` は
@@ -4478,8 +4586,16 @@ fn main() -> std::process::ExitCode {
             suite::inspect_rejects_empty_validation_split_without_split_record,
         ),
         (
-            "train_failure_cleans_candidate_dir_and_allows_retry",
-            suite::train_failure_cleans_candidate_dir_and_allows_retry,
+            "req34_failed_job_is_kept_reported_and_restarted_from_scratch",
+            suite::req34_failed_job_is_kept_reported_and_restarted_from_scratch,
+        ),
+        (
+            "req34_running_job_blocks_train_until_owner_is_lost",
+            suite::req34_running_job_blocks_train_until_owner_is_lost,
+        ),
+        (
+            "req39_status_check_lock_held_by_another_process_times_out",
+            suite::req39_status_check_lock_held_by_another_process_times_out,
         ),
         (
             "train_all_trains_every_candidate_within_budget",
