@@ -316,6 +316,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             cwd,
             &args.seed_run_projects,
             &OwnRun {
+                project: &project,
                 freeze: &freeze,
                 definition_sha256: &definition_sha256,
                 candidate_id: &target.candidate_id,

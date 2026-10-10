@@ -1618,7 +1618,7 @@ mod suite {
 
     /// REQ-26・REQ-27・REQ-39・TASK-26.3・#490: seed ごとの複製プロジェクト（学習前に複製し、各複製で
     /// `train --train-seed S → select → evaluate`）の評価記録を `--seed-run-project` で読み、3 seed の
-    /// Wilson 95% 区間の重なりを stdout・評価記録の `reproducibility` へ出す。照合の違反・run 数の
+    /// Wilson 95% 区間の重なりを stdout・評価記録の `reproducibility` へ出す。照合の違反（学習データ・分割の違いを含む）・run 数の
     /// 不足 / 超過・cwd 外は `invalid_input`（64）で台帳を作らず（適用権を失わない）、同じ候補をその後
     /// 評価できる。正解数を書き換えた合成記録で `some_pairs_disjoint` も確認する（テストハーネス。
     /// 学習ワーカーは偽物で、GPU の実学習は行わない）。
@@ -1702,6 +1702,54 @@ mod suite {
         rejected(
             &["r1"; 100],
             "too many seed run projects for a reproducibility check",
+        );
+        // 学習 seed 以外の条件が違う複製（学習データを 1 行変えたもの・`inspect --seed` を変えたもの）は、
+        // 評価データ・定義・候補が同じでも再現性に使えない（PR #516 指摘）。
+        let changed_train = train_jsonl().replacen("\"alpha sample 0\"", "\"alpha sample x\"", 1);
+        assert_ne!(changed_train, train_jsonl());
+        write_def_dir(
+            &env,
+            "defdata",
+            &definition_text(),
+            &changed_train,
+            &evaluation_jsonl(),
+        );
+        write_def_dir(
+            &env,
+            "defsplit",
+            &definition_text(),
+            &train_jsonl(),
+            &evaluation_jsonl(),
+        );
+        for (def, name, split_seed) in [("defdata", "rdata", "42"), ("defsplit", "rsplit", "7")] {
+            let definition = format!("{def}/definition.json");
+            env.ok(&[
+                "register",
+                "--definition",
+                &definition,
+                "--project-dir",
+                name,
+            ]);
+            env.ok(&["inspect", "--project-dir", name, "--seed", split_seed]);
+            env.ok(&[
+                "train",
+                "--project-dir",
+                name,
+                "--candidate",
+                "1",
+                "--train-seed",
+                "4",
+            ]);
+            env.ok(&["select", "--project-dir", name]);
+            env.ok(&["evaluate", "--project-dir", name, "--candidate", "1"]);
+        }
+        rejected(
+            &["rdata", "r2"],
+            "seed run project was trained on different data or split",
+        );
+        rejected(
+            &["rsplit", "r2"],
+            "seed run project was trained on different data or split",
         );
 
         // 偽ワーカーの正解数は 4/12（区間 [0.138, 0.609]）。正解数を 12 にした合成記録（seed 1。区間

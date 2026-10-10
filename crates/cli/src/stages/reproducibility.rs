@@ -26,15 +26,19 @@ use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::stage_report::{EvaluateInterval, EvaluateReproducibility, EvaluateSeedRun};
 use fandhe_edge_data::eval_freeze::FreezeRecord;
+use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_eval::reproducibility::{
     MAX_REPRODUCIBILITY_RUNS, MIN_REPRODUCIBILITY_RUNS, OverlapVerdict, SeedRun,
     judge_reproducibility,
 };
 use fandhe_edge_eval::wilson::wilson_ci95;
 
-use crate::project::{Project, invalid, runtime};
+use crate::project::{
+    DATA_DIR, MAX_PROJECT_FILE_BYTES, Project, TRAIN_DATA_FILE, invalid, runtime,
+};
 
 use super::previous_comparison::{SelectedRecordMessages, read_selected_evaluation_record};
+use super::train::read_split_record;
 
 /// 自分を含む run 数（`seed_run_projects + 1`）を検証する。指定なし（0 件）は判定しないので通す。
 ///
@@ -60,6 +64,8 @@ pub(super) fn check_run_count(seed_run_projects: usize) -> Result<(), ErrorRepor
 
 /// 自分（評価する候補）の照合用の値。
 pub(super) struct OwnRun<'a> {
+    /// 自分のプロジェクト（学習データと分割記録の照合に使う。読むだけ）。
+    pub project: &'a Project,
     pub freeze: &'a FreezeRecord,
     pub definition_sha256: &'a str,
     pub candidate_id: &'a str,
@@ -83,6 +89,29 @@ pub(super) struct SeedRuns {
     others: Vec<RunCount>,
 }
 
+/// 学習条件の照合に使う値（取り込み済みの学習データのバイト列の sha256 と分割記録）。
+///
+/// 分割記録（`split.json`。seed・分割規則・各分割のレコード内容ハッシュ。REQ-17）は train / validation の
+/// 割付を、学習データの sha256 は行順を含む学習データ全体を固定する。学習 seed 以外の条件が違う複製の結果を
+/// 再現性として扱わないため、自分と複製で両方が一致することを求める（PR #516 指摘）。
+#[derive(Debug, PartialEq, Eq)]
+struct TrainingFingerprint {
+    train_sha256: Sha256Digest,
+    split: SplitRecord,
+}
+
+/// プロジェクトの学習データ（上限つき・保持 fd 起点で読む）と分割記録から [`TrainingFingerprint`] を作る。
+fn training_fingerprint(project: &Project) -> Result<TrainingFingerprint, ErrorReport> {
+    let train = project.read(
+        Path::new(DATA_DIR).join(TRAIN_DATA_FILE),
+        MAX_PROJECT_FILE_BYTES,
+    )?;
+    Ok(TrainingFingerprint {
+        train_sha256: Sha256Digest::of_bytes(&train),
+        split: read_split_record(project)?,
+    })
+}
+
 /// `"<candidate_id>:seed<S>"` から S を取り出す（正準形の u32 だけ。`train` の seed 記録と同じ規則）。
 fn seed_from_config_id(config_id: &str, candidate_id: &str) -> Option<u32> {
     let text = config_id
@@ -95,8 +124,8 @@ fn seed_from_config_id(config_id: &str, candidate_id: &str) -> Option<u32> {
 
 /// 各複製プロジェクトの評価記録を読み、自分と照合する（適用権を取る前に呼ぶ）。
 ///
-/// 照合: 評価データの sha256・バイト長（凍結記録）・定義の正準化ハッシュ・候補 ID・評価件数が自分と一致し、
-/// `config_id` から取り出した seed が自分とも他の複製とも重複しないこと。
+/// 照合: 評価データの sha256・バイト長（凍結記録）・定義の正準化ハッシュ・学習データの sha256 と分割記録・
+/// 候補 ID・評価件数が自分と一致し、`config_id` から取り出した seed が自分とも他の複製とも重複しないこと。
 ///
 /// # Errors
 /// 経路の拒否・記録が無い / 不正・照合の不一致は `invalid_input`、記録の上限超過は `limit_exceeded`。
@@ -108,6 +137,7 @@ pub(super) fn load_seed_runs(
     let own_seed = seed_from_config_id(own.config_id, own.candidate_id)
         .ok_or_else(|| runtime("cannot determine train seed"))?;
     let evaluation_sha256 = own.freeze.sha256().to_hex();
+    let own_training = training_fingerprint(own.project)?;
     let mut others: Vec<RunCount> = Vec::with_capacity(seed_run_projects.len());
     for dir in seed_run_projects {
         let project = Project::open(cwd, dir)?;
@@ -130,6 +160,11 @@ pub(super) fn load_seed_runs(
         }
         if record.definition_sha256 != own.definition_sha256 {
             return Err(invalid("seed run definition does not match"));
+        }
+        if training_fingerprint(&project)? != own_training {
+            return Err(invalid(
+                "seed run project was trained on different data or split",
+            ));
         }
         if record.candidate_id != own.candidate_id {
             return Err(invalid("seed run candidate does not match"));
