@@ -1,6 +1,6 @@
-//! `scripts/real-machine-check.sh`（Mac 実機での動作確認 A〜F の入口）と
+//! `scripts/real-machine-check.sh`（Mac 実機での動作確認 A〜J の入口）と
 //! `scripts/real_machine_check_record.py`（実行・伏せ処理・記録の生成）の結合テスト
-//! （REQ-21・REQ-27・REQ-28・REQ-30・REQ-31・REQ-33・REQ-39・Issue #354）。
+//! （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-33・REQ-34・REQ-39・Issue #354）。
 //!
 //! 証拠種別: テストハーネス。偽の make・偽の cargo・偽の CLI を一時ディレクトリへ書き出して使うため、
 //! **実 make・実 cargo・実 CLI・実機の測定は一切行っていない**。ここで検証するのは
@@ -44,18 +44,39 @@ const FAKE_CLI: &str = r##"#!/bin/sh
 stage=$1
 here=$(basename "$PWD")
 echo "$stage $here" >> "$FAKE_DIR/cli.log"
+# 引数の解析（G〜J の新しいオプションを含む。値は直前の引数で拾う）
+pd=project; defn=; prevdir=; ledger=; vid=; cnum=0; tseed=; budget=; pkgdir=; seed_runs=0
+allf=; status_f=; cancel_f=; prev=
+for a in "$@"; do
+  case "$prev" in
+    --project-dir) pd=$a ;;
+    --definition) defn=$a ;;
+    --previous-project-dir) prevdir=$a ;;
+    --version-ledger) ledger=$a ;;
+    --version-id) vid=$a ;;
+    --candidate) cnum=$a ;;
+    --train-seed) tseed=$a ;;
+    --budget-seconds) budget=$a ;;
+    --package) pkgdir=$a ;;
+    --seed-run-project) seed_runs=$((seed_runs + 1)) ;;
+  esac
+  case "$a" in --all) allf=1 ;; --status) status_f=1 ;; --cancel) cancel_f=1 ;; esac
+  prev=$a
+done
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 printf '%s\n' "$*" >> "$FAKE_DIR/cli.args"
 echo "${CARGO_NET_OFFLINE:-unset}" >> "$FAKE_DIR/cli.env"
 echo "${RUSTUP_AUTO_INSTALL:-unset}" >> "$FAKE_DIR/cli.rustup"
-[ "$stage" = register ] && cp definition.json "$FAKE_DIR/def-$here.json"
+[ "$stage" = register ] && cp "${defn:-definition.json}" "$FAKE_DIR/def-$here.json"
 SC='{"alpha":0.5,"beta":0.25,"gamma":0.25}'
 bad=${FAKE_BAD:-}
 [ "$bad" = scores_high ] && SC='{"alpha":1.5,"beta":0.0,"gamma":-0.5}'
 [ "$bad" = scores_neg ] && SC='{"alpha":0.75,"beta":0.5,"gamma":-0.25}'
 SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-p95lim=$(sed -n 's/.*"max_infer_p95_us": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
+ddef="$(dirname "$pd")/definition.json"
+p95lim=$(sed -n 's/.*"max_infer_p95_us": *\([0-9]*\).*/\1/p' "$ddef" 2>/dev/null)
 [ -n "$p95lim" ] || p95lim=50000
-pkglim=$(sed -n 's/.*"max_package_bytes": *\([0-9]*\).*/\1/p' definition.json 2>/dev/null)
+pkglim=$(sed -n 's/.*"max_package_bytes": *\([0-9]*\).*/\1/p' "$ddef" 2>/dev/null)
 # 定義に上限が無ければ実 CLI は `limit_bytes:null`（REQ-30）。算術用の既定値は別に持つ
 pkgjson=${pkglim:-null}
 [ -n "$pkglim" ] || pkglim=40000000
@@ -70,39 +91,153 @@ if [ "${FAKE_FAIL_STAGE:-}" = "$stage" ]; then
   printf '{"code":"runtime_error","message":"%s","step":"%s"}\n' "${FAKE_FAIL_MSG:-stage failed at /secret/dir}" "$stage"
   exit "${FAKE_FAIL_RC:-70}"
 fi
-# 内訳の file_count は、公開される package/ の実ファイル数（model.onnx と artifact.json の 2 つ。
-# FAKE_PKG_ODD なら `odd name.bin` を足した 3 つ）と一致させる。FAKE_FC_SHIFT は weights を 1 多く報告する
+# 内訳の file_count は、公開される package/ の実ファイル数（model.onnx・artifact.json・calibration.json
+# の 3 つ。FAKE_PKG_ODD なら `odd name.bin` を足した 4 つ）と一致させる。FAKE_FC_SHIFT は weights を 1 多く報告する
 wfc=1
 [ -n "${FAKE_FC_SHIFT:-}" ] && wfc=2
 ltfc=0
 [ -n "${FAKE_PKG_ODD:-}" ] && ltfc=1
-comps=$(printf '"components":{"weights":{"bytes":100,"file_count":%s},"vocab_or_feature_transform":{"bytes":20,"file_count":0},"label_table":{"bytes":5,"file_count":%s},"calibration":{"bytes":3,"file_count":0},"metadata":{"bytes":7,"file_count":1}}' "$wfc" "$ltfc")
+comps=$(printf '"components":{"weights":{"bytes":100,"file_count":%s},"vocab_or_feature_transform":{"bytes":20,"file_count":0},"label_table":{"bytes":5,"file_count":%s},"calibration":{"bytes":3,"file_count":1},"metadata":{"bytes":7,"file_count":1}}' "$wfc" "$ltfc")
 case "$stage" in
 register)
+  mkdir -p "$pd"
   printf '{"step":"register","status":"ok","definition_sha256":"%s","options":3,"evaluation_defined":true%s}\n' "$SHA" "$extra" ;;
 inspect)
   printf '{"step":"inspect","status":"ok","valid_records":90,"split":{"train":72,"validation":9,"test":9}%s}\n' "$extra" ;;
 train)
+  # --status・--cancel: ジョブ記録（candidates/N/job/job.json）の照会と要求（REQ-34・#484・#485）
+  jd="$pd/candidates/$cnum/job"
+  if [ -n "$status_f" ]; then
+    if [ ! -f "$jd/job.json" ]; then
+      printf '{"code":"invalid_input","message":"job record not found"}\n'
+      exit 64
+    fi
+    st=$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$jd/job.json")
+    upd=false
+    if [ "$st" = running ] && ! kill -0 "$(cat "$jd/owner.pid")" 2>/dev/null; then
+      st=failed
+      upd=true
+      printf '{"schema_version":1,"state":"failed","started_at_unix":1,"finished_at_unix":2,"failure":{"kind":"crashed","cause":"owner_lost","signal":null,"detected_at_unix":2}}\n' > "$jd/job.json"
+    fi
+    R='{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"m"}'
+    case "$st" in
+      cancelled) job='{"state":"cancelled","crash_detected":false,"failure":null,"record_updated":false}' ;;
+      failed)
+        job="{\"state\":\"failed\",\"crash_detected\":true,\"failure\":{\"kind\":\"crashed\",\"cause\":\"owner_lost\",\"signal\":null,\"detected_at_unix\":2},\"record_updated\":$upd}"
+        [ "$bad" = status_not_crashed ] && job='{"state":"failed","crash_detected":true,"failure":{"kind":"error","code":"runtime_error"},"record_updated":true}' ;;
+      *) job="{\"state\":\"$st\",\"crash_detected\":false,\"failure\":null,\"record_updated\":false}"; R=null ;;
+    esac
+    printf '{"step":"train","status":"ok","jobs":[{"candidate":%s,"job":%s,"restart":%s}]}\n' "$cnum" "$job" "$R"
+    exit 0
+  fi
+  if [ -n "$cancel_f" ]; then
+    if [ ! -f "$jd/job.json" ]; then
+      printf '{"code":"invalid_input","message":"job record not found"}\n'
+      exit 64
+    fi
+    st=$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$jd/job.json")
+    c=already_finished
+    if [ "$st" = running ]; then
+      : > "$jd/cancel.request"
+      c=requested
+    fi
+    printf '{"step":"train","status":"ok","cancellations":[{"candidate":%s,"cancel":"%s"}]}\n' "$cnum" "$c"
+    exit 0
+  fi
+  # --all: 探索予算内の全候補（REQ-18・#482・#483）。evaluated の候補だけ result.json が残る
+  if [ -n "$allf" ]; then
+    mkdir -p "$pd/candidates/0"
+    mode=${FAKE_ALL_MODE:-}
+    [ "$mode" = exit20 ] || : > "$pd/candidates/0/result.json"
+    [ "$bad" = all_dirleft ] && mkdir -p "$pd/candidates/1"
+    [ "$bad" = all_nosearch ] || printf '{"candidates":[]}\n' > "$pd/search_record.json"
+    if [ "$mode" = exit20 ]; then
+      printf '{"code":"limit_exceeded","message":"search budget reached before any candidate was evaluated"}\n'
+      exit 20
+    fi
+    r1=training_timed_out
+    [ "$bad" = all_result ] && r1=weird
+    printf '{"step":"train","status":"ok","budget_seconds":%s,"budget_reached":true,"total_elapsed_ms":1234,"candidates":[{"candidate":0,"kind":"c1","result":"evaluated","budget_reached":null},{"candidate":1,"kind":"c3","result":"%s","budget_reached":"candidate_time_limit"}]%s}\n' "${budget:-3600}" "$r1" "$extra"
+    exit 0
+  fi
+  # H（cwd 末尾が H）: ジョブ記録を残して cancel.request か KILL を待つ。子（ワーカーの代役）は親の死で
+  # 終わる（lifeline の代役）。FAKE_H_LEAK なら子が残る（CLI が子孫を止めなかった欠陥の再現）
+  if [ "$here" = H ]; then
+    rm -rf "$pd/candidates/$cnum"
+    mkdir -p "$jd"
+    printf '{"schema_version":1,"state":"running","started_at_unix":1,"finished_at_unix":null,"failure":null}\n' > "$jd/job.json"
+    echo $$ > "$jd/owner.pid"
+    if [ -n "${FAKE_H_LEAK:-}" ]; then
+      sleep 300 &
+    else
+      sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.2; done' sh $$ &
+    fi
+    child=$!
+    n=0
+    while [ ! -e "$jd/cancel.request" ] && [ "$n" -lt 900 ]; do
+      sleep 0.1
+      n=$((n + 1))
+    done
+    if [ -e "$jd/cancel.request" ]; then
+      [ -n "${FAKE_H_LEAK:-}" ] || kill "$child" 2>/dev/null
+      printf '{"schema_version":1,"state":"cancelled","started_at_unix":1,"finished_at_unix":2,"failure":null}\n' > "$jd/job.json"
+      msg="training cancelled"
+      [ "$bad" = cancel_message ] && msg="training failed"
+      printf '{"code":"runtime_error","message":"%s","step":"train","candidate":%s,"job":{"state":"cancelled","crash_detected":false,"failure":null,"record_updated":false},"restart":{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"m"}}\n' "$msg" "$cnum"
+      exit 70
+    fi
+    kill "$child" 2>/dev/null
+    exit 1
+  fi
   cand=0
   [ "$bad" = cand_false ] && cand=false
   printf '{"step":"train","status":"ok","candidate":%s,"kind":"c1"%s}\n' "$cand" "$extra" ;;
 select)
   k=c1
   [ "$bad" = select_kind ] && k=c3
-  printf '{"step":"select","status":"ok","candidate":0,"kind":"%s"%s}\n' "$k" "$extra" ;;
+  sig=null
+  [ "${FAKE_SIG:-}" = undeterminable ] && sig='{"majority_label":"alpha","baseline_correct":1,"b":1,"c":0,"required_n":168,"family_size":2,"verdict":"undeterminable"}'
+  [ "$bad" = sig_bad ] && sig='{"verdict":"weird"}'
+  printf '{"step":"select","status":"ok","candidate":0,"kind":"%s","significance":%s%s}\n' "$k" "$sig" "$extra" ;;
 evaluate)
   acc=1.0
   [ "$bad" = accuracy ] && acc=0.5
-  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":%s,"macro_f1":1.0%s}\n' "${FAKE_EVAL_N:-12}" "$acc" "$extra" ;;
+  n=${FAKE_EVAL_N:-12}
+  cal='{"temperature":1.5,"adopted":true,"threshold":0.6,"n_validation":9,"validation_coverage":0.8}'
+  [ "$bad" = calib_null ] && cal=null
+  abst=0
+  [ "$bad" = abst_sum ] && abst=1
+  ab="{\"answered\":$n,\"abstained\":$abst,\"out_of_scope\":0,\"coverage\":1.0,\"correct_answered\":$n,\"adopted_error\":0.0,\"unconditional_error\":0.0}"
+  diag="{\"train\":{\"n_rows\":72},\"eval\":{\"n_rows\":$n},\"confusable_pairs\":[],\"limitations\":[],\"data_volume\":{\"train_rows\":72,\"level\":\"below_100\",\"effect\":\"large\",\"note\":\"n\"}}"
+  [ "$bad" = diag_missing ] && diag=null
+  # --previous-project-dir: 旧モデルとの比較（同じ定義・同じ凍結 test。REQ-26・#488・#489）
+  cmp=null
+  if [ -n "$prevdir" ]; then
+    premise=same_label_set
+    [ "$bad" = cmp_premise ] && premise=label_set_differs
+    cmp="{\"previous\":{\"candidate_id\":\"x\",\"onnx_sha256\":\"$SHA\",\"definition_sha256\":\"$SHA\",\"evaluation_sha256\":\"$SHA\"},\"premise\":\"$premise\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"same\",\"n_common\":$n,\"n_previous_only\":0,\"n_current_only\":0,\"counts\":{\"n\":$n,\"both_correct\":$((n - 1)),\"correct_to_incorrect\":1,\"incorrect_to_correct\":0,\"both_wrong\":0,\"correct_to_incorrect_ci95\":{\"lo\":0.0,\"hi\":0.2},\"incorrect_to_correct_ci95\":{\"lo\":0.0,\"hi\":0.1}}}"
+  fi
+  # --seed-run-project: 3 seed の再現性（REQ-26・#490）。FAKE_REPRO=disjoint は重ならない組あり
+  repro=null
+  if [ "$seed_runs" -ge 2 ]; then
+    s3=3
+    [ "$bad" = repro_seeds ] && s3=9
+    verdict=all_pairs_overlap
+    pairs='[]'
+    if [ "${FAKE_REPRO:-}" = disjoint ]; then verdict=some_pairs_disjoint; pairs='[[1,3]]'; fi
+    seedrun() { printf '{"seed":%s,"correct":12,"total":%s,"ci95":{"lo":0.7,"hi":1.0}}' "$1" "$n"; }
+    repro="{\"runs\":[$(seedrun 1),$(seedrun 2),$(seedrun $s3)],\"verdict\":\"$verdict\",\"disjoint_pairs\":$pairs}"
+  fi
+  printf '{"step":"evaluate","status":"ok","candidate":0,"kind":"c1","n_total":%s,"correct":12,"accuracy":%s,"macro_f1":1.0,"calibration":%s,"abstention":%s,"comparison":%s,"reproducibility":%s,"diagnostics":%s%s}\n' "$n" "$acc" "$cal" "$ab" "$cmp" "$repro" "$diag" "$extra" ;;
 package)
   c2mode=${FAKE_C2_MODE:-limit}
   # 組み立て先が残る欠陥の再現（値は残す cwd 名 C1・C2。exit 0・20 のどちらでも残る）
-  [ "${FAKE_STAGING_LEFT:-}" = "$here" ] && mkdir -p project/package.staging
+  [ "${FAKE_STAGING_LEFT:-}" = "$here" ] && mkdir -p "$pd/package.staging"
   # 内訳の合計。bad=sum:<case> のときだけ total_bytes を 1 多く返す
   extrab=0
   [ "$bad" = "sum:$here" ] && extrab=1
   if [ "$here" = C2 ] && [ "$c2mode" != exit0 ]; then
-    [ "$c2mode" = keepdir ] && mkdir -p project/package
+    [ "$c2mode" = keepdir ] && mkdir -p "$pd/package"
     # 実 CLI と同じく total_bytes > limit_bytes で超過。内訳の合計は total_bytes と一致させる。
     # small は total_bytes <= limit_bytes なのに exceeded:true を返す不正な出力
     wb=$((pkglim + 1))
@@ -120,7 +255,7 @@ package)
     # low は p95_us が上限未満なのに exceeded:true・exit 20 を返す不正な出力
     pv=99999
     [ "$FAKE_C1_EXCEED" = low ] && pv=2
-    [ -n "${FAKE_C1_KEEPDIR:-}" ] && mkdir -p project/package
+    [ -n "${FAKE_C1_KEEPDIR:-}" ] && mkdir -p "$pd/package"
     printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$pkgjson" "$G" "$comps" "$pv" "$p95lim"
     exit 20
   fi
@@ -130,22 +265,41 @@ package)
   # package/ の通常ファイルの合計は total_bytes と一致させる（pkgsum は 1 バイト少なくする）
   odd=0
   [ -n "${FAKE_PKG_ODD:-}" ] && odd=10
-  mb=$((total - 35 - odd))
+  # 版（#491）: --previous-project-dir があれば旧台帳の model 件数 + 1。台帳は project 直下
+  vnum=1
+  [ -n "$prevdir" ] && vnum=$(( $(grep -o '"kind":"model"' "$prevdir/version_ledger.json" | wc -l | tr -d ' ') + 1 ))
+  # 校正（#497）: calibration.json（3 バイト 'cal'）と、その sha256 を持つ配布用 artifact.json
+  calsha=f28c5d59eb1307e88ffc2943867931a33eaa9dbd2e246e40e60c1c12139bd960
+  [ "$bad" = calsha_bad ] && calsha=$SHA
+  mkdir -p "$pd/package"
+  printf 'cal' > "$pd/package/calibration.json"
+  printf '{"calibration_sha256":"%s","v":%s}' "$calsha" "$vnum" > "$pd/package/artifact.json"
+  ab=$(wc -c < "$pd/package/artifact.json" | tr -d ' ')
+  mb=$((total - ab - 3 - odd))
   [ "$bad" = "pkgsum:$here" ] && mb=$((mb - 1))
-  mkdir -p project/package
-  head -c "$mb" /dev/zero > project/package/model.onnx
-  head -c 35 /dev/zero > project/package/artifact.json
+  head -c "$mb" /dev/zero > "$pd/package/model.onnx"
   # 通常ファイル以外の混入の再現（計測対象外のまま見逃されないことの確認）
-  [ "${FAKE_PKG_KIND:-}" = symlink ] && ln -s model.onnx project/package/link
-  [ "${FAKE_PKG_KIND:-}" = dir ] && mkdir project/package/sub
-  [ "$odd" != 0 ] && head -c "$odd" /dev/zero > "project/package/odd name.bin"
+  [ "${FAKE_PKG_KIND:-}" = symlink ] && ln -s model.onnx "$pd/package/link"
+  [ "${FAKE_PKG_KIND:-}" = dir ] && mkdir "$pd/package/sub"
+  [ "$odd" != 0 ] && head -c "$odd" /dev/zero > "$pd/package/odd name.bin"
+  vprev=null
+  [ "$vnum" -gt 1 ] && vprev="\"v$((vnum - 1))\""
+  vid="v$vnum"
+  [ "$bad" = version_bad ] && vid=v7
+  if [ "$bad" != ledger_missing ]; then
+    old=
+    [ -n "$prevdir" ] && old=$(sed -n 's/^{"schema_version":1,"entries":\[\(.*\)\]}$/\1/p' "$prevdir/version_ledger.json")
+    new="{\"kind\":\"model\",\"id\":\"v$vnum\",\"sha256\":\"$(sha "$pd/package/artifact.json")\",\"created_at_unix\":1},{\"kind\":\"data\",\"id\":\"v$vnum\",\"sha256\":\"$SHA\",\"created_at_unix\":1},{\"kind\":\"experiment\",\"id\":\"v$vnum\",\"sha256\":\"$SHA\",\"created_at_unix\":1}"
+    [ -n "$old" ] && new="$old,$new"
+    printf '{"schema_version":1,"entries":[%s]}\n' "$new" > "$pd/version_ledger.json"
+  fi
   p95=null
   pv=2
   [ "$bad" = "p95neg:$here" ] && pv=-1
   [ "$here" = C1 ] && p95=$(printf '{"p95_us":%s,"limit_us":%s,"exceeded":false}' "$pv" "$p95lim")
   jfield='"judgment":null,'
   [ "$bad" = "nojudgment:$here" ] && jfield=
-  printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":%s%s}\n' "$jfield" "$total" "$lim" "$G" "$comps" "$p95" "$extra" ;;
+  printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":%s,"version":{"id":"%s","previous":%s}%s}\n' "$jfield" "$total" "$lim" "$G" "$comps" "$p95" "$vid" "$vprev" "$extra" ;;
 infer)
   file=
   id=${FAKE_DEFAULT_ID:-input}
@@ -155,6 +309,25 @@ infer)
     [ "$prev" = --id ] && id=$a
     prev=$a
   done
+  # 前の版への復帰（REQ-39・#491）: `--version-id` だけは 64。台帳があれば artifact.json の sha256 を
+  # 台帳の (model, V) の記録と照合する（V 省略は台帳の最新の model 版）
+  if [ -n "$vid" ] && [ -z "$ledger" ]; then
+    printf '{"code":"invalid_input","message":"--version-id requires --version-ledger"}\n'
+    exit 64
+  fi
+  if [ -n "$ledger" ] && [ "$bad" != ledger_skip ]; then
+    want=$vid
+    [ -n "$want" ] || want=$(grep -o '"kind":"model","id":"v[0-9]*"' "$ledger" | tail -1 | sed 's/.*"id":"\(v[0-9]*\)"/\1/')
+    exp=$(grep -o "{\"kind\":\"model\",\"id\":\"$want\",\"sha256\":\"[0-9a-f]*\"" "$ledger" | sed 's/.*"sha256":"\([0-9a-f]*\)"/\1/')
+    if [ -z "$exp" ]; then
+      printf '{"code":"invalid_input","message":"version is not recorded"}\n'
+      exit 64
+    fi
+    if [ "$exp" != "$(sha "$pkgdir/artifact.json")" ]; then
+      printf '{"code":"invalid_input","message":"package does not match version ledger"}\n'
+      exit 64
+    fi
+  fi
   if [ -n "$file" ]; then
     cp "$file" "$FAKE_DIR/batch-input.jsonl"
     lab=alpha
@@ -594,7 +767,7 @@ fn fixture_ids(name: &str) -> Vec<String> {
 }
 
 const INVALID: &str = "{\"code\":\"invalid_input\",\"message\":\"";
-const ITEMS_MSG: &str = "--items must be a comma-separated subset of A,B,C,D,E,F";
+const ITEMS_MSG: &str = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J";
 /// stdout の状態（REQ-21: 最終 JSON を書けない場合の終了コードの確認用）。
 #[derive(Clone, Copy)]
 enum StdoutKind {
@@ -919,7 +1092,7 @@ fn req33_normal_run_records_all_items() {
     }
     assert_eq!(
         e.q("items.B.package_files.*.name"),
-        "[\"artifact.json\",\"model.onnx\"]"
+        "[\"artifact.json\",\"calibration.json\",\"model.onnx\"]"
     );
 
     // C: p95 と容量上限（REQ-30・REQ-31）
@@ -2207,7 +2380,7 @@ fn req39_unrecognized_package_file_name_is_not_recorded() {
     assert!(!e.text("record.md").contains("odd name"));
     assert_eq!(
         e.q("items.B.package_files.*.name"),
-        "[\"artifact.json\",\"model.onnx\",\"<unrecognized>\"]"
+        "[\"artifact.json\",\"calibration.json\",\"model.onnx\",\"<unrecognized>\"]"
     );
 }
 /// REQ-30・#362: `package` の実行後（exit 0・20 のどちらでも）に `package.staging/` が残っていれば
@@ -2611,4 +2784,363 @@ fn req39_make_target_rejects_env_args_and_stops_glob_expansion() {
     assert!(
         String::from_utf8_lossy(&o.stdout).starts_with("{\"code\":\"ok\",\"message\":\"usage:")
     );
+}
+// ---- G〜J（#469 の CLI 結線で増えた機能の実機確認。偽 CLI のテストハーネス） ----
+
+/// 偽 CLI の `FAKE_BAD=<種別>` で、項目 `item` が `reason` で failed になり exit 10 になることを確かめる。
+fn assert_item_fails(items: &str, item: &str, bad: &str, reason: &str) {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", items]), &[("FAKE_BAD", bad)]);
+    assert_eq!(o.code, Some(10), "{bad}: {}", o.diag());
+    assert_eq!(e.q(&format!("items.{item}.status")), "\"failed\"", "{bad}");
+    assert_eq!(
+        e.q(&format!("items.{item}.reason")),
+        format!("\"{reason}\""),
+        "{bad}"
+    );
+}
+
+/// REQ-21・#469: 既定の項目は B,C,D,E,F,G,H,J（A は通信しうる、I は GPU・時間を長く占有しうるため含まない）。
+#[test]
+fn req33_default_items_include_g_h_j_but_not_a_or_i() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--repeat", "1"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(
+        e.q("options.items"),
+        "[\"B\",\"C\",\"D\",\"E\",\"F\",\"G\",\"H\",\"J\"]"
+    );
+    for item in ["B", "C", "D", "E", "F", "G", "H", "J"] {
+        assert_eq!(e.q(&format!("items.{item}.status")), "\"ok\"", "{item}");
+    }
+    for item in ["A", "I"] {
+        assert_eq!(
+            e.q(&format!("items.{item}.status")),
+            "\"not_run\"",
+            "{item}"
+        );
+        assert_eq!(e.q(&format!("items.{item}.reason")), "\"not_selected\"");
+    }
+    assert_eq!(e.q("options.g_budget_seconds"), "3600");
+    assert_eq!(e.q("options.i_device"), "\"cpu\"");
+}
+
+/// REQ-21: 項目 G〜J の語彙・組み合わせ・新しい引数の範囲は、起動前に 64 で拒否される。
+#[test]
+fn req21_new_items_and_options_are_validated_before_start() {
+    const BUDGET_MSG: &str = "--g-budget-seconds must be an integer from 1 to 921600";
+    for (extra, message) in [
+        (vec!["--items", "K"], ITEMS_MSG),
+        (vec!["--items", "J"], "item J requires item B"),
+        (vec!["--items", "C,J"], "item J requires item B"),
+        (vec!["--g-budget-seconds", "0"], BUDGET_MSG),
+        (vec!["--g-budget-seconds", "921601"], BUDGET_MSG),
+        (vec!["--g-budget-seconds", "1000000"], BUDGET_MSG),
+        (vec!["--g-budget-seconds", "abc"], BUDGET_MSG),
+        (vec!["--i-device", "tpu"], "--i-device must be cpu or gpu"),
+    ] {
+        let e = Env::new();
+        let o = e.run(&with_work(&e, &extra), &[]);
+        assert_eq!(o.code, Some(64), "{extra:?}: {}", o.diag());
+        assert_eq!(o.stdout, format!("{INVALID}{message}\"}}\n"), "{extra:?}");
+        assert!(e.lines("cli.log").is_empty(), "{extra:?}");
+        assert!(!e.work.join("record.json").exists(), "{extra:?}");
+    }
+    // 上限ちょうどと `--key=VALUE` 形式は通る
+    let e = Env::new();
+    let o = e.run(
+        &with_work(
+            &e,
+            &[
+                "--items",
+                "D",
+                "--g-budget-seconds=921600",
+                "--i-device=gpu",
+            ],
+        ),
+        &[],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("options.g_budget_seconds"), "921600");
+    assert_eq!(e.q("options.i_device"), "\"gpu\"");
+}
+
+/// REQ-22・REQ-25・REQ-29・REQ-30・REQ-39・#469: B は evaluate の校正・保留・診断、select の有意性、
+/// package の版・版管理台帳・校正の束縛を照合して要約を記録する。
+#[test]
+fn req22_b_checks_calibration_abstention_diagnostics_version_and_binding() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.B.contract_checks.calibration.n_validation"), "9");
+    assert_eq!(e.q("items.B.contract_checks.calibration.adopted"), "true");
+    assert_eq!(e.q("items.B.contract_checks.abstention.answered"), "12");
+    assert_eq!(e.q("items.B.contract_checks.abstention.abstained"), "0");
+    assert_eq!(e.q("items.B.contract_checks.abstention.out_of_scope"), "0");
+    assert_eq!(e.q("items.B.contract_checks.abstention.coverage"), "1.0");
+    assert_eq!(e.q("items.B.contract_checks.diagnostics_present"), "true");
+    // 定義に baseline_comparison が無いので significance は null
+    assert_eq!(e.q("items.B.contract_checks.significance_verdict"), "null");
+    assert_eq!(e.q("items.B.contract_checks.version_number"), "1");
+    assert_eq!(
+        e.q("items.B.contract_checks.version_ledger_present"),
+        "true"
+    );
+    assert_eq!(
+        e.q("items.B.contract_checks.calibration_sha256_matches"),
+        "true"
+    );
+    // 台帳は project 直下で、package/ には入らない
+    assert!(e.work.join("B/project/version_ledger.json").is_file());
+    assert!(
+        !e.work
+            .join("B/project/package/version_ledger.json")
+            .exists()
+    );
+}
+
+/// REQ-25: `undeterminable` は有意性の正常な値（合格扱いにはしないが、B の失敗にもしない）。
+#[test]
+fn req25_b_accepts_undeterminable_significance() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B"]),
+        &[("FAKE_SIG", "undeterminable")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(
+        e.q("items.B.contract_checks.significance_verdict"),
+        "\"undeterminable\""
+    );
+}
+
+/// REQ-22・REQ-25・REQ-29・REQ-30・REQ-39: B の追加検査に違反する出力は、固定の理由で B を failed にする。
+#[test]
+fn req22_b_extra_checks_fail_closed_with_distinct_reasons() {
+    for (bad, reason) in [
+        ("calib_null", "calibration_invalid"),
+        ("abst_sum", "abstention_invalid"),
+        ("diag_missing", "diagnostics_invalid"),
+        ("sig_bad", "significance_invalid"),
+        ("version_bad", "version_invalid"),
+        ("ledger_missing", "version_ledger_invalid"),
+        ("calsha_bad", "calibration_binding_mismatch"),
+    ] {
+        assert_item_fails("B", "B", bad, reason);
+    }
+}
+
+/// REQ-18・REQ-34・#482・#483: G は `train --all --budget-seconds N` の結果（`candidates[].result`・
+/// `budget_reached`）と `search_record.json`・候補ディレクトリの後始末を確かめて記録する。
+#[test]
+fn req18_g_train_all_records_results_and_budget() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "G", "--g-budget-seconds", "7"]),
+        &[],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.G.status"), "\"ok\"");
+    assert_eq!(e.q("items.G.outcome"), "\"evaluated\"");
+    assert_eq!(e.q("items.G.budget_seconds"), "7");
+    assert_eq!(e.q("items.G.budget_reached"), "true");
+    assert_eq!(e.q("items.G.search_record_present"), "true");
+    assert_eq!(
+        e.q("items.G.candidates.*.result"),
+        "[\"evaluated\",\"training_timed_out\"]"
+    );
+    assert_eq!(
+        e.q("items.G.candidates.*.budget_reached"),
+        "[null,\"candidate_time_limit\"]"
+    );
+    assert!(
+        e.lines("cli.args")
+            .contains(&"train --project-dir project --all --budget-seconds 7".to_string())
+    );
+    // evaluated の候補だけ result.json が残り、それ以外のディレクトリは無い
+    assert!(e.work.join("G/project/candidates/0/result.json").is_file());
+    assert!(!e.work.join("G/project/candidates/1").exists());
+}
+
+/// REQ-18・#482: 全候補が予算到達なら exit 20（stdout は `limit_exceeded` のエラー JSON）。想定内の結果で、
+/// `search_record.json` が残っていれば G は ok とし、`outcome` に区別して記録する。
+#[test]
+fn req18_g_accepts_exit_20_when_all_candidates_reached_the_budget() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "G", "--g-budget-seconds", "1"]),
+        &[("FAKE_ALL_MODE", "exit20")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.G.status"), "\"ok\"");
+    assert_eq!(e.q("items.G.outcome"), "\"budget_exhausted\"");
+    assert_eq!(e.q("items.G.exit_code"), "20");
+}
+
+/// REQ-18・REQ-34・#482・#483: `search_record.json` の欠落・候補ディレクトリの片付け漏れ・語彙外の結果は G の失敗。
+#[test]
+fn req18_g_fails_closed_on_missing_record_leftover_dir_or_unknown_result() {
+    assert_item_fails("G", "G", "all_nosearch", "search_record_missing");
+    assert_item_fails("G", "G", "all_dirleft", "candidate_dir_not_cleaned");
+    assert_item_fails("G", "G", "all_result", "unexpected_output");
+}
+
+/// REQ-34・REQ-39・#484〜#486: H は `train --cancel`（応答・exit 70・`training cancelled`）、`--status`
+/// （`cancelled`・やり直し案内）、`package/` が無いこと、子孫が 0 件になること、続けて train 本体の KILL による
+/// クラッシュ検出（`failed`・`owner_lost`）を確かめて記録する。
+#[test]
+fn req34_h_cancel_status_and_crash_detection() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "H"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.H.status"), "\"ok\"");
+    assert_eq!(e.q("items.H.cancel_check.cancel"), "\"requested\"");
+    assert_eq!(e.q("items.H.cancel_check.train_exit_code"), "70");
+    assert_eq!(e.q("items.H.cancel_check.state"), "\"cancelled\"");
+    assert_eq!(
+        e.q("items.H.cancel_check.restart_action"),
+        "\"restart_from_scratch\""
+    );
+    assert_eq!(e.q("items.H.cancel_check.package_absent"), "true");
+    assert_eq!(e.q("items.H.cancel_check.descendants_remaining"), "0");
+    let observed: u32 = e
+        .q("items.H.cancel_check.descendants_observed")
+        .parse()
+        .expect("number");
+    assert!(observed >= 2, "observed={observed}");
+    assert_eq!(e.q("items.H.crash_check.state"), "\"failed\"");
+    assert_eq!(e.q("items.H.crash_check.cause"), "\"owner_lost\"");
+    assert_ne!(e.q("items.H.crash_check.train_exit_code"), "0");
+    assert_eq!(e.q("items.H.crash_check.descendants_remaining"), "0");
+    assert!(!e.work.join("H/project/package").exists());
+    // 実行した CLI の引数（--candidate 0 の train を 2 回、--cancel、--status を 2 回）
+    let args = e.lines("cli.args");
+    let count = |l: &str| args.iter().filter(|a| *a == l).count();
+    assert_eq!(count("train --project-dir project --candidate 0"), 2);
+    assert_eq!(count("train --project-dir project --cancel"), 1);
+    assert_eq!(
+        count("train --project-dir project --status --candidate 0"),
+        2
+    );
+}
+
+/// REQ-34・REQ-39: キャンセル後も子孫が残る CLI は H の失敗（ラッパーの後始末に頼らず、観測した子孫を
+/// 控えて確認する）。残った子孫は記録の件数だけにして KILL する。
+#[test]
+fn req39_h_fails_when_descendants_remain_after_cancel() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "H"]), &[("FAKE_H_LEAK", "1")]);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.H.status"), "\"failed\"");
+    assert_eq!(e.q("items.H.reason"), "\"descendants_remain_after_cancel\"");
+    assert_eq!(e.q("items.H.descendants_remaining"), "1");
+}
+
+/// REQ-34: キャンセル応答・train の出力・status の内容が契約と違えば H の失敗（固定の理由）。
+#[test]
+fn req34_h_fails_closed_on_contract_violations() {
+    assert_item_fails("H", "H", "cancel_message", "train_output_invalid");
+    assert_item_fails("H", "H", "status_not_crashed", "status_unexpected");
+}
+
+/// REQ-26・REQ-27・#488〜#490: I は 4 複製（p1・p2・p3・old）を `--train-seed` ごとに学習し、最後の p1 の
+/// evaluate に `--previous-project-dir`・`--seed-run-project` を付けて、再現性と比較を記録する。
+/// 既定は CPU の申告（証拠種別 `cpu_real_machine`）。
+#[test]
+fn req26_i_records_reproducibility_and_comparison_with_cpu_evidence() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "I"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.I.status"), "\"ok\"");
+    assert_eq!(e.q("items.I.evidence"), "\"cpu_real_machine\"");
+    assert_eq!(e.q("items.I.device"), "\"cpu\"");
+    assert_eq!(e.q("items.I.seeds"), "[1,2,3,4]");
+    assert_eq!(
+        e.q("items.I.reproducibility.verdict"),
+        "\"all_pairs_overlap\""
+    );
+    assert_eq!(e.q("items.I.reproducibility.runs.*.seed"), "[1,2,3]");
+    assert_eq!(e.q("items.I.reproducibility.disjoint_pairs"), "[]");
+    assert_eq!(e.q("items.I.comparison.premise"), "\"same_label_set\"");
+    assert_eq!(e.q("items.I.comparison.evaluation_data"), "\"same\"");
+    assert_eq!(e.q("items.I.comparison.n_common"), "12");
+    assert_eq!(e.q("items.I.comparison.counts.correct_to_incorrect"), "1");
+    // 凍結 test への適用は複製ごとに 1 回（REQ-27）。p1 の evaluate だけが比較・再現性の引数を持つ
+    assert_eq!(e.count_calls("evaluate I"), 4);
+    let args = e.lines("cli.args");
+    let final_eval = "evaluate --project-dir p1 --candidate 0 --previous-project-dir old \
+                      --seed-run-project p2 --seed-run-project p3";
+    assert!(args.contains(&final_eval.to_string()), "{args:?}");
+    for (name, seed) in [("p1", 1), ("p2", 2), ("p3", 3), ("old", 4)] {
+        let want = format!("train --project-dir {name} --candidate 0 --train-seed {seed}");
+        assert!(args.contains(&want), "{want}");
+    }
+}
+
+/// REQ-26: `--i-device gpu` は証拠種別を `gpu_real_machine_declared`（人の申告）として記録する。
+/// 重ならない seed の組があっても（`some_pairs_disjoint`）I は失敗にせず、判定は人に委ねる。
+#[test]
+fn req26_i_gpu_declaration_and_disjoint_verdict_are_recorded_not_failed() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "I", "--i-device", "gpu"]),
+        &[("FAKE_REPRO", "disjoint")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.I.evidence"), "\"gpu_real_machine_declared\"");
+    assert_eq!(e.q("options.i_device"), "\"gpu\"");
+    assert_eq!(
+        e.q("items.I.reproducibility.verdict"),
+        "\"some_pairs_disjoint\""
+    );
+    assert_eq!(e.q("items.I.reproducibility.disjoint_pairs"), "[[1,3]]");
+}
+
+/// REQ-26: seed が期待と違う再現性・前提の違う比較は I の失敗。
+#[test]
+fn req26_i_fails_closed_on_contract_violations() {
+    assert_item_fails("I", "I", "repro_seeds", "reproducibility_invalid");
+    assert_item_fails("I", "I", "cmp_premise", "comparison_invalid");
+}
+
+/// REQ-39・REQ-27・#491: J は B の project（v1）を旧プロジェクトにして v2 を作り、v1 の package を
+/// 新しい台帳の `--version-id v1` で使えること、`--version-id` だけ・`artifact.json` 改変は 64 を確かめる。
+#[test]
+fn req39_j_version_rollback_and_rejections() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "B,J"]), &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.J.status"), "\"ok\"");
+    assert_eq!(e.q("items.J.version_number"), "2");
+    assert_eq!(e.q("items.J.previous_version_number"), "1");
+    assert_eq!(e.q("items.J.rollback_to_v1_ok"), "true");
+    assert_eq!(e.q("items.J.latest_ok"), "true");
+    assert_eq!(e.q("items.J.version_id_only_exit_code"), "64");
+    assert_eq!(e.q("items.J.tampered_artifact_exit_code"), "64");
+    let args = e.lines("cli.args");
+    assert!(
+        args.contains(
+            &"package --project-dir J/project --previous-project-dir B/project".to_string()
+        )
+    );
+    assert!(args.iter().any(|a| a.contains(
+        "--package B/project/package --version-ledger J/project/version_ledger.json --version-id v1"
+    )));
+    // 旧・新の package/ は変更しない（改変は複製）。台帳は新 project 直下に 6 件（旧 3 + 新 3）
+    let ledger = fs::read_to_string(e.work.join("J/project/version_ledger.json")).expect("ledger");
+    assert_eq!(ledger.matches("\"kind\"").count(), 6);
+    assert!(e.work.join("J/tampered/artifact.json").is_file());
+}
+
+/// REQ-39: 台帳の照合が働かない CLI（改変した artifact.json が通ってしまう）は J の失敗。
+#[test]
+fn req39_j_fails_when_a_tampered_package_is_not_rejected() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B,J"]),
+        &[("FAKE_BAD", "ledger_skip")],
+    );
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.J.status"), "\"failed\"");
+    assert_eq!(e.q("items.J.reason"), "\"rejection_not_64\"");
 }
