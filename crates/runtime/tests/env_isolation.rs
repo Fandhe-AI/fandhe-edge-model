@@ -7,8 +7,8 @@
 //! 証拠種別: テストハーネス（CI の rust-ci では Linux・macOS runner で実行される。Mac 実機の
 //! `otool -L` による動的リンク確認は `scripts/check-runtime-linkage.sh` を人間が実行する）。
 //!
-//! 対象外: CLI `fandhe-edge infer` の経路は工程の下位層への接続（TASK-33.1-2・#136）が未完のため
-//! 含まない。#136 完了後に CLI バイナリ版を追加する（実装済みを装わない）。
+//! 対象外: CLI `fandhe-edge infer` の経路（TASK-33.1-2・#136 で下位層へ接続済み）は本テストに
+//! 含まない。経路を含めるには CLI バイナリ版を別途追加する（実装済みを装わない）。
 //!
 //! `#![cfg(unix)]` の理由: `env -i` は POSIX の概念で、検証環境は Mac。失敗メッセージには
 //! ケース名・件数のみを出し、入力本文と環境変数の値は出さない（security.md）。

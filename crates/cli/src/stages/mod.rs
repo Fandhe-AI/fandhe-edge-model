@@ -17,7 +17,7 @@
 //!   `train --cancel` は実行中のジョブへキャンセル要求を置いて即座に戻る（#484）
 //! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
-//!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。診断（REQ-29）は未結線
+//!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。診断（REQ-29）は `evaluate` の `diagnostics` で接続済み（#492）
 //!   （[`evaluate`] 参照。Wilson 区間は `package` の合否照合で使う）
 //! - `package` は容量（REQ-30）を計測して `limits.max_package_bytes` が設定されているときだけ照合し（無ければ照合しない。目安 40MB の超過は警告のみ。#406）、
 //!   `limits.max_infer_p95_us` があれば `train` 分割の入力で推論待ち時間 p95 を計測して照合する

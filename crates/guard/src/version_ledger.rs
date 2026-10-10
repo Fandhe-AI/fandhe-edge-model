@@ -11,7 +11,8 @@
 //!   PoC-20 ケース 7 は台帳から記録を引くだけでファイルからは再計算していないため、本実装は
 //!   対象版の成果物を閉じ込め検証付きで開いて上限付きでメモリへ読み込み、そのバイト列から
 //!   sha256 を再計算して、一致したときだけ検証に使ったバイト列ごと [`VerifiedVersion`] を返す（不一致は [`LedgerError::HashMismatch`] で fail-closed）。
-//!   配置先への物理コピー・現在版ポインタ・CLI 配線は未実装（台帳は追記のみで可変状態を持たない）
+//!   配置先への物理コピー・現在版ポインタは未実装（台帳は追記のみで可変状態を持たない）。CLI 配線は
+//!   `package` が `version_ledger.json` を記録し `infer --version-ledger`・`--version-id` で照合する（#518）
 //! - 永続化は [`VersionLedger::to_file`]・[`VersionLedger::from_file`]（#491）。直列化の形は共通コアの
 //!   `version_ledger_record`（ガード層に `serde` を入れない）で、読み戻しは既存の [`VersionId::new`]・
 //!   [`CreatedAt::from_unix_seconds`]・[`VersionLedger::record`]（重複・件数の検査）を通す。台帳ファイル自体の
