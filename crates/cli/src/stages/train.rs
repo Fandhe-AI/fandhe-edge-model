@@ -500,14 +500,24 @@ fn watch_cancel_request(
     handle: &JobHandle,
     stop: &Receiver<()>,
 ) -> bool {
+    // 要求が無いと確認できたとき（`Ok(false)`）以外はキャンセル側へ倒す（fail-closed）。
+    let requested = || !matches!(member_exists(job_dir, CANCEL_REQUEST_FILE), Ok(false));
     loop {
-        if !matches!(member_exists(job_dir, CANCEL_REQUEST_FILE), Ok(false)) {
+        if requested() {
             handle.cancel();
             return true;
         }
         match stop.recv_timeout(CANCEL_POLL_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return false,
+            // 停止時にも最後に確認する。待っている間（ジョブの終了直前）に受理された要求を取りこぼさず、
+            // `--all` の探索中断の判定へ渡す（ジョブは終わっているので `cancel` は何もしない）。
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let late = requested();
+                if late {
+                    handle.cancel();
+                }
+                return late;
+            }
         }
     }
 }
@@ -2698,6 +2708,28 @@ mod status_tests {
         let cwd = workdir("watchstop");
         job_dir(&cwd, 0);
         assert_eq!(watch_once(&cwd, true), (false, JobState::Queued));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#484: 監視が待っている間（ジョブの終了直前）に置かれた要求も、停止時の最終確認で `true` を返す
+    /// （`--all` の探索中断の判定へ渡す）。
+    #[test]
+    fn req34_issue484_watcher_reports_request_placed_before_stop() {
+        let cwd = workdir("watchlate");
+        let dir = job_dir(&cwd, 0);
+        let job = TrainJob::new();
+        let handle = job.handle();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let package = held_package(&cwd);
+        let detected = std::thread::scope(|scope| {
+            let watcher = scope.spawn(move || watch_cancel_request(&package, &handle, &stopped));
+            // 最初の確認（要求なし）の後、待っている間に要求を置いてから停止する。
+            std::thread::sleep(CANCEL_POLL_INTERVAL / 5);
+            std::fs::write(dir.join(CANCEL_REQUEST_FILE), b"").expect("request");
+            drop(stop);
+            watcher.join().expect("join")
+        });
+        assert!(detected);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
