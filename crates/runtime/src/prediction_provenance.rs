@@ -19,18 +19,22 @@
 //!
 //! # 呼び出し元と範囲外
 //!
-//! - 呼び出し元（想定）: 参考測定を行う評価・診断側、CLI の JSON 出力（TASK-33.x）。
-//!   JSON のキー・注記は本モジュールの定数を SSOT とし、直列化は CLI 側で行う
-//!   （`latency_report::P95_METHOD` と同じ分担。runtime は serde に依存しない）
-//! - 範囲外（未実装。実装済みを装わない）: CLI 出力への `batch_prediction` の配線（TASK-33.x）、
-//!   評価器・診断側の参考測定そのもの、不一致発見時の原因特定プロセス（TASK-28.2・#119）
+//! - CLI に参考測定なし。規則は型とテストで固定（#493）。CLI のバッチ API 呼び出しは判定経路
+//!   （`infer --input-file`）だけで、`infer_batch_for_reference` の呼び出しは 0 件。これを
+//!   `crates/cli/tests/batch_prediction_sites.rs` が機械照合する（明記すべき記録が存在しないことの照合）
+//! - 今後 CLI が参考測定にバッチ API を使うときは `infer_batch_for_reference` を通し、その記録 JSON に
+//!   `"batch_prediction":true`（キーは [`BATCH_PREDICTION_FIELD`]）と `"batch_prediction_notice"`
+//!   （値は [`BATCH_PREDICTION_NOTICE`]）を出す。キー・注記は本モジュールの定数を SSOT とし、直列化は
+//!   CLI 側で行う（`latency_report::P95_METHOD` と同じ分担。runtime は serde に依存しない）
+//! - 範囲外（未実装。実装済みを装わない）: 評価器・診断側の参考測定そのもの、
+//!   不一致発見時の原因特定プロセス（TASK-28.2・#119）
 //!
 //! 証拠種別: テストハーネス（`tests/batch_prediction_notice.rs`）。
 
 use crate::pipeline::{BatchResult, InferError, Prediction};
 use std::fmt;
 
-/// JSON へ出す際のフラグのキー名（CLI が直列化に使う。TASK-33.x）。
+/// JSON へ出す際のフラグのキー名（CLI が直列化に使う。#493）。
 pub const BATCH_PREDICTION_FIELD: &str = "batch_prediction";
 
 /// バッチ予測を参考測定に使った記録へ付ける注記（機械処理向けに英語）。
