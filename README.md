@@ -51,6 +51,8 @@
 
 評価データがあり `evaluate` が校正（温度 T・保留しきい値 τ）を記録したプロジェクトでは、`package` が `package/calibration.json`（1 行 JSON。`{"onnx_sha256","label_order","temperature","threshold"}`）を同梱し、容量内訳の `calibration` 枠に計上します（`package` の stdout の形は不変）。`infer` は `calibration.json` があれば、校正後の確信度が τ 未満の行の `status` を `abstain` にします（行の形・`scores` は `ok` と同じ。判定規則は `evaluate` と共通）。優先順は `out_of_scope` > `abstain` > `ok` で、`infer --text` の `abstain` は exit 12（`pending`）、`--input-file`（`--out` を含む）は全行を計算できれば exit 0 のままです。`calibration.json` が配布 ONNX の sha256・定義の宣言順と一致しない、T・τ が範囲外、未知キーは `invalid_input`。評価データが無いプロジェクトには同梱されず、`infer` は保留を返しません。同梱するときは配布用の `package/artifact.json` に `calibration_sha256`（`calibration.json` 全体の sha256）を追記し（候補側の `artifact.json` は変えない）、`infer` は記録があるのにファイルが無い・記録が無いのにファイルがある・sha256 の不一致を `invalid_input` で拒否します（τ の改変や削除をパッケージ内の自己整合で検出。REQ-39）。`artifact.json` ごとの改変の検出は外部台帳（#168）の範囲です（REQ-22・REQ-28・REQ-30・#497）。
 
+`package` は配布用の `package/artifact.json` に `definition_sha256`（`package/definition.json` のバイト列の sha256）も追記し、`infer` は欄があれば `definition.json` と照合して、不一致を `invalid_input`（`package definition does not match its recorded hash`）で拒否します（欄の無い旧パッケージは照合しません）。あわせて `package` は版管理台帳 `<project>/version_ledger.json` に、配布用 `artifact.json`・`data/train.jsonl`・`selection_record.json` の sha256 を同じ版 ID（`v1`・`v2`…）で記録して読み取り専用にし、stdout の末尾に `"version":{"id","previous"}` を載せます（`--previous-project-dir OLD` で OLD の台帳を照合して引き継ぎます）。`infer --version-ledger L [--version-id V]` は配布用 `artifact.json` を台帳の model 版と照合してから推論します（前版への復帰。定義・ONNX・校正は `artifact.json` の記録を介して束縛されます。台帳ファイル自体の改変は検出しません。REQ-39・#491）。
+
 ## 開発環境構築
 
 ```bash

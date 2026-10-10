@@ -242,12 +242,14 @@ mod suite {
         let weights = size(format!("{model_dir}/model.onnx"));
         let vocab = size(format!("{model_dir}/vocab.json"));
         let label = size("definition.json".to_string());
-        // 校正つきのパッケージは配布用の `artifact.json` に `calibration_sha256` が足されるため、公開後は
-        // その実体から数える（#497）。`package/` が無ければ成果物ディレクトリの複写元から数える。
+        // 配布用の `artifact.json` には `definition_sha256`（#491）と、校正つきなら `calibration_sha256`（#497）が
+        // 足されるため、公開後はその実体から数える。`package/` が無ければ（exit 20。校正なしの経路のみ）成果物
+        // ディレクトリの複写元に `,"definition_sha256":"<64>"`（87 バイト）を足して数える。
         let meta = if env.project_file("package/artifact.json").is_file() {
             size("package/artifact.json".to_string())
         } else {
-            size(format!("{model_dir}/artifact.json"))
+            let (bytes, n) = size(format!("{model_dir}/artifact.json"));
+            (bytes + 87, n)
         };
         // `calibration.json` は評価記録に校正があるときだけ同梱される（#497）。公開後の実体から数える。
         let calibration = size("package/calibration.json".to_string());
@@ -2442,18 +2444,18 @@ mod suite {
             )
         );
 
-        // cwd 外の台帳は 64（経路の拒否）。
+        // cwd 外の台帳と、cwd 内に置いた cwd 外を指す symlink は 64（経路の拒否）。
         std::fs::copy(&ledger_path, env.base.join("outside.json")).expect("copy outside");
-        let (code, out) = infer_text(
-            &env,
-            "proj/package",
-            &["--version-ledger", "../outside.json"],
-        );
-        assert_eq!(code, 64, "{out}");
-        assert!(
-            out.starts_with("{\"code\":\"invalid_input\",\"message\":\"path rejected: "),
-            "{out}"
-        );
+        std::os::unix::fs::symlink(env.base.join("outside.json"), env.work.join("link.json"))
+            .expect("symlink");
+        for ledger in ["../outside.json", "link.json"] {
+            let (code, out) = infer_text(&env, "proj/package", &["--version-ledger", ledger]);
+            assert_eq!(code, 64, "{ledger}: {out}");
+            assert!(
+                out.starts_with("{\"code\":\"invalid_input\",\"message\":\"path rejected: "),
+                "{out}"
+            );
+        }
 
         // 未知キーの台帳は 64、2 MiB 超は 20。
         std::fs::write(
@@ -2499,6 +2501,47 @@ mod suite {
             infer_text(&env, "proj/package", &["--version-ledger", ledger_arg]),
             plain
         );
+
+        // `definition.json` を 1 バイト変える（末尾に空白。JSON としては有効）と、`artifact.json` の
+        // `definition_sha256` との照合で台帳の有無によらず 64（台帳の model ハッシュが定義にも束縛される）。
+        let definition = env.project_file("package/definition.json");
+        let original_def = std::fs::read(&definition).expect("definition.json");
+        overwrite_read_only(&definition, &[original_def.as_slice(), b" "].concat());
+        for extra in [&[][..], &["--version-ledger", ledger_arg][..]] {
+            assert_eq!(
+                infer_text(&env, "proj/package", extra),
+                (
+                    64,
+                    invalid_line("package definition does not match its recorded hash")
+                )
+            );
+        }
+        overwrite_read_only(&definition, &original_def);
+        assert_eq!(infer_text(&env, "proj/package", &[]), plain);
+    }
+
+    /// REQ-39・#491: `definition_sha256` は `package` が配布用にだけ書く欄で、候補側の `artifact.json` に最初から
+    /// あれば（追記で重複キーを作らないよう）`package` は 64 で拒否し、`package/` も台帳も作らない。
+    pub fn req39_issue491_package_rejects_candidate_with_definition_sha256() {
+        let env = inspected("defshacand");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&SELECT);
+        let meta = env.project_file(&format!("{C1_DIR}/artifact.json"));
+        let text = std::fs::read_to_string(&meta).expect("artifact.json");
+        let close = text.trim_end().len() - 1;
+        let tampered = format!(
+            "{},\"definition_sha256\":\"{}\"{}",
+            &text[..close],
+            "a".repeat(64),
+            &text[close..]
+        );
+        overwrite_read_only(&meta, tampered.as_bytes());
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            invalid_line("artifact metadata does not match the model file")
+        );
+        assert!(!env.project_file("package").exists());
+        assert!(!env.project_file("version_ledger.json").exists());
     }
 
     /// REQ-39・TASK-39.3-2・TASK-39.6・#491: `package --previous-project-dir OLD` は OLD の台帳の全件に今回の 3 件
@@ -2625,8 +2668,63 @@ mod suite {
             ),
             invalid_line("previous package does not match its version ledger")
         );
-        // 元に戻せば引き継げる（proj3 は OLD の台帳から v2 になる）。
         std::fs::write(&meta, &original).expect("restore");
+
+        // `--previous-project-dir` が cwd 外・cwd 外を指す symlink は 64（経路の拒否）。
+        std::fs::create_dir_all(env.base.join("outside-old")).expect("outside dir");
+        std::os::unix::fs::symlink(env.base.join("outside-old"), env.work.join("oldlink"))
+            .expect("symlink");
+        for previous in ["../outside-old", "oldlink"] {
+            let (code, out) = env.run(&[
+                "package",
+                "--project-dir",
+                "proj2",
+                "--previous-project-dir",
+                previous,
+            ]);
+            assert_eq!(code, 64, "{previous}: {out}");
+            assert!(
+                out.starts_with("{\"code\":\"invalid_input\",\"message\":\"path rejected: "),
+                "{out}"
+            );
+        }
+        // OLD の台帳が不正（未知キーは 64・2 MiB 超は 20）なら引き継がない。
+        let old_ledger_path = env.work.join("old/version_ledger.json");
+        overwrite_read_only(
+            &old_ledger_path,
+            old_ledger.replace("]}\n", "],\"x\":1}\n").as_bytes(),
+        );
+        assert_eq!(
+            env.fails(
+                &[
+                    "package",
+                    "--project-dir",
+                    "proj2",
+                    "--previous-project-dir",
+                    "old"
+                ],
+                64,
+                "invalid_input"
+            ),
+            invalid_line("previous version ledger is invalid")
+        );
+        overwrite_read_only(&old_ledger_path, &vec![b' '; 2 * 1024 * 1024 + 1]);
+        env.fails(
+            &[
+                "package",
+                "--project-dir",
+                "proj2",
+                "--previous-project-dir",
+                "old",
+            ],
+            20,
+            "limit_exceeded",
+        );
+        assert!(!env.work.join("proj2/version_ledger.json").exists());
+        assert!(!env.work.join("proj2/package").exists());
+        overwrite_read_only(&old_ledger_path, old_ledger.as_bytes());
+
+        // 元に戻せば引き継げる（proj3 は OLD の台帳から v2 になる）。
         let out = env.ok(&[
             "package",
             "--project-dir",
@@ -3508,8 +3606,8 @@ mod suite {
             )),
             "{capacity}"
         );
-        // 配布用の `artifact.json` は候補側の末尾に `calibration_sha256`（`calibration.json` 全体の sha256）を
-        // 足しただけ。候補側は書き換えない（評価記録の `artifact_meta_sha256` の照合対象。REQ-39）。
+        // 配布用の `artifact.json` は候補側の末尾に `calibration_sha256`（`calibration.json` 全体の sha256）と
+        // `definition_sha256`（#491）を足しただけ。候補側は書き換えない（評価記録の `artifact_meta_sha256` の照合対象。REQ-39）。
         let candidate_meta =
             std::fs::read_to_string(env.project_file(&format!("{C3_DIR}/artifact.json")))
                 .expect("candidate artifact.json");
@@ -3519,9 +3617,10 @@ mod suite {
             std::fs::read_to_string(env.project_file("package/artifact.json"))
                 .expect("artifact.json"),
             format!(
-                "{},\"calibration_sha256\":\"{}\"{}",
+                "{},\"calibration_sha256\":\"{}\",\"definition_sha256\":\"{}\"{}",
                 &candidate_meta[..close],
                 file_sha256(&env, "package/calibration.json"),
+                file_sha256(&env, "package/definition.json"),
                 &candidate_meta[close..]
             )
         );
@@ -6011,6 +6110,10 @@ fn main() -> std::process::ExitCode {
         (
             "req39_issue491_package_previous_project_dir_carries_ledger",
             suite::req39_issue491_package_previous_project_dir_carries_ledger,
+        ),
+        (
+            "req39_issue491_package_rejects_candidate_with_definition_sha256",
+            suite::req39_issue491_package_rejects_candidate_with_definition_sha256,
         ),
         (
             "select_rejects_request_validation_not_matching_split",

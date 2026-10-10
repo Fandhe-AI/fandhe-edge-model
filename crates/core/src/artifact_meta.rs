@@ -146,6 +146,7 @@ pub struct ArtifactMeta {
     onnx_sha256: String,
     vocab_sha256: Option<String>,
     calibration_sha256: Option<String>,
+    definition_sha256: Option<String>,
 }
 
 /// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
@@ -166,6 +167,9 @@ struct RawMeta {
     // `null` は欠落と区別して拒否する（`package` の追記で重複キーを作らない。#497）。
     #[serde(default, deserialize_with = "present_string")]
     calibration_sha256: Option<String>,
+    // 同上（`package` が配布用にだけ追記する。#491）。
+    #[serde(default, deserialize_with = "present_string")]
+    definition_sha256: Option<String>,
 }
 
 fn is_hex64(s: &str) -> bool {
@@ -471,7 +475,8 @@ impl ArtifactMeta {
                 .all(|l| !l.is_empty() && seen.insert(l.as_str()));
         let sha_ok = is_hex64(&raw.onnx_sha256)
             && raw.vocab_sha256.as_deref().is_none_or(is_hex64)
-            && raw.calibration_sha256.as_deref().is_none_or(is_hex64);
+            && raw.calibration_sha256.as_deref().is_none_or(is_hex64)
+            && raw.definition_sha256.as_deref().is_none_or(is_hex64);
         if raw.kind.is_empty()
             || raw.kind.len() > MAX_META_KIND_BYTES
             || raw.max_bytes == 0
@@ -489,6 +494,7 @@ impl ArtifactMeta {
             onnx_sha256: raw.onnx_sha256,
             vocab_sha256: raw.vocab_sha256,
             calibration_sha256: raw.calibration_sha256,
+            definition_sha256: raw.definition_sha256,
         })
     }
 
@@ -541,6 +547,14 @@ impl ArtifactMeta {
     #[must_use]
     pub fn calibration_sha256(&self) -> Option<&str> {
         self.calibration_sha256.as_deref()
+    }
+
+    /// 記載された `definition.json` の sha256（小文字 16 進 64 桁。REQ-39・#491）。`package` が配布用の
+    /// `artifact.json` にだけ書き、候補側の成果物と欄の無い旧パッケージでは `None`。あれば `infer` が
+    /// パッケージの `definition.json` と照合する（版管理台帳の model ハッシュを定義にも束縛する）。
+    #[must_use]
+    pub fn definition_sha256(&self) -> Option<&str> {
+        self.definition_sha256.as_deref()
     }
 }
 
@@ -661,6 +675,27 @@ mod tests {
         assert_eq!(m.onnx_sha256(), "0".repeat(64));
         assert_eq!(m.vocab_sha256(), None);
         assert_eq!(m.calibration_sha256(), None);
+        assert_eq!(m.definition_sha256(), None);
+    }
+
+    /// REQ-39・#491: 定義の sha256 は任意だが、あれば小文字 16 進 64 桁の文字列でなければならない（`null` も拒否）。
+    #[test]
+    fn req39_issue491_meta_definition_sha256_is_optional_and_validated() {
+        let ok = format!(r#","definition_sha256":"{}""#, "c".repeat(64));
+        let m = ArtifactMeta::parse(full_meta(&ok).as_bytes()).expect("ok");
+        assert_eq!(m.definition_sha256(), Some("c".repeat(64).as_str()));
+        for bad in [
+            r#","definition_sha256":"zz""#.to_string(),
+            format!(r#","definition_sha256":"{}""#, "C".repeat(64)),
+            r#","definition_sha256":1"#.to_string(),
+            r#","definition_sha256":null"#.to_string(),
+        ] {
+            assert_eq!(
+                ArtifactMeta::parse(full_meta(&bad).as_bytes()),
+                Err(ArtifactMetaError::Malformed),
+                "{bad}"
+            );
+        }
     }
 
     /// REQ-39: 語彙ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。

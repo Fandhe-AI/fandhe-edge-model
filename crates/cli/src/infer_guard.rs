@@ -96,8 +96,10 @@ pub struct PathFormatCheckedInputs {
     pub meta_bytes: Vec<u8>,
 }
 
-/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式のみ検査する。
-/// sha256 は検査しない（#168）。`kind_version` は許可リストで検査する（#174）。
+/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式を検査する。
+/// `kind_version` は許可リストで検査する（#174）。`args.version`（`--version-ledger`）があるときだけ、ONNX を
+/// 開く前に `artifact.json` のバイト列の sha256 を版管理台帳と照合する（#491）。ONNX・定義などパッケージ内の
+/// sha256 の自己整合は `stages::infer` が `artifact.json` の記録と照合する。
 ///
 /// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
 ///
@@ -167,7 +169,7 @@ pub fn check_infer_path_and_format(
 /// （REQ-39・TASK-39.6・#491）。`V` は `--version-id`、省略時は台帳の最新 model 版。`package/` には何も書かない。
 ///
 /// # Errors
-/// 台帳の経路の拒否（cwd 外・symlink 等）は経路の写像、上限超過は `limit_exceeded`、形の不正は
+/// 台帳の経路の拒否（cwd 外・cwd 外を指す symlink 等）は経路の写像、上限超過は `limit_exceeded`、形の不正は
 /// `version ledger is invalid`（[`fandhe_edge_guard::version_ledger::LedgerError::exit_code`] の写像）、
 /// 不正な版 ID はその検証の固定文、未記録は `version is not recorded`、不一致は
 /// `package does not match version ledger`（いずれも 64）。メッセージはパスを含めない。

@@ -8,7 +8,10 @@
 //!    以降パスから開き直さない。TOCTOU 対策）
 //! 2. 同じ閉じ込め済みパッケージから `artifact.json`（拡張メタ）と `definition.json` を上限付きで
 //!    読み、`onnx_sha256` と保持した ONNX のバイト列の sha256 の一致（パッケージの自己整合性）・
-//!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する
+//!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する。`artifact.json` に
+//!    `definition_sha256`（`package` が配布用にだけ書く）があれば、読んだ `definition.json` のバイト列の sha256 と
+//!    照合し、不一致は `package definition does not match its recorded hash`（64）。欄の無い旧パッケージは照合しない
+//!    （REQ-39・#491）
 //! 3. `calibration.json`（`package` が評価記録に校正があるときだけ書き、`artifact.json` に
 //!    `calibration_sha256` を記す）を同じ閉じ込めと上限（`MAX_DEFINITION_FILE_BYTES`）で読み、記録の sha256
 //!    との一致（欠落・記録なしの同梱も拒否）、`onnx_sha256`・`label_order` が保持した ONNX・定義と一致し、
@@ -389,6 +392,16 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         .map_err(|e| e.to_error_report())?;
     let def_bytes = read_bounded_open_file(def_file, def_path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
+    // 配布用 `artifact.json` に `definition_sha256` があれば、保持 fd から読んだこのバイト列と照合し、照合した
+    // バイト列そのものを解析する（再読込しない）。欄の無い旧パッケージは従来どおり（REQ-39・#491）。
+    if meta
+        .definition_sha256()
+        .is_some_and(|recorded| recorded != Sha256Digest::of_bytes(&def_bytes).to_hex())
+    {
+        return Err(invalid(
+            "package definition does not match its recorded hash",
+        ));
+    }
     let definition = parse_definition(&def_bytes)?;
 
     // ガードが開いた ONNX の実体パスと、メタデータの `onnx_file` が同じ対象を指すことを確認する
