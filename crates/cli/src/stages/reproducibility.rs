@@ -32,13 +32,14 @@ use fandhe_edge_eval::reproducibility::{
     judge_reproducibility,
 };
 use fandhe_edge_eval::wilson::wilson_ci95;
+use fandhe_edge_train::request::TrainRequest;
 
 use crate::project::{
     DATA_DIR, MAX_PROJECT_FILE_BYTES, Project, TRAIN_DATA_FILE, invalid, runtime,
 };
 
 use super::previous_comparison::{SelectedRecordMessages, read_selected_evaluation_record};
-use super::train::read_split_record;
+use super::train::{load_trained, read_split_record};
 
 /// 自分を含む run 数（`seed_run_projects + 1`）を検証する。指定なし（0 件）は判定しないので通す。
 ///
@@ -66,6 +67,8 @@ pub(super) fn check_run_count(seed_run_projects: usize) -> Result<(), ErrorRepor
 pub(super) struct OwnRun<'a> {
     /// 自分のプロジェクト（学習データと分割記録の照合に使う。読むだけ）。
     pub project: &'a Project,
+    /// 自分の候補の添字（学習リクエストの照合に使う）。
+    pub candidate: usize,
     pub freeze: &'a FreezeRecord,
     pub definition_sha256: &'a str,
     pub candidate_id: &'a str,
@@ -112,6 +115,34 @@ fn training_fingerprint(project: &Project) -> Result<TrainingFingerprint, ErrorR
     })
 }
 
+/// 学習 seed とプロジェクト固有の値を除いた学習設定が一致するか（PR #516 指摘 P1）。
+///
+/// 比べる項目は [`super::train::request_matches_candidate`] が照合するリクエストの全項目から、次の
+/// 4 つを除いたもの: `seed`（比べたい条件そのもの）・`root`（プロジェクトの絶対パス）・`train_path`・
+/// `out_dir`（どちらもプロジェクト内の配置）。比べる項目は `kind`・`kind_version`・`config`
+/// （`epochs` を含む全キー。`train --smoke` の短縮学習も違いとして拒否する）・`label_order`・`max_bytes`・
+/// `device`・`time_limit_seconds`（`train --all` の配分値を含む）・`rss_limit_bytes`・`validation_inputs`・
+/// `max_result_bytes`。`TrainRequest` に項目が増えたら、ここに足すか除外理由を書く。
+fn same_training_settings(a: &TrainRequest, b: &TrainRequest) -> bool {
+    a.kind() == b.kind()
+        && a.kind_version() == b.kind_version()
+        && a.config() == b.config()
+        && a.label_order() == b.label_order()
+        && a.max_bytes() == b.max_bytes()
+        && a.device() == b.device()
+        && a.time_limit_seconds() == b.time_limit_seconds()
+        && a.rss_limit_bytes() == b.rss_limit_bytes()
+        && a.validation_inputs() == b.validation_inputs()
+        && a.max_result_bytes() == b.max_result_bytes()
+}
+
+/// 候補 `index` の保存済み学習リクエストを読む（既存の上限・保持 fd 起点の [`load_trained`]）。
+fn stored_request(project: &Project, index: usize) -> Result<TrainRequest, ErrorReport> {
+    load_trained(project, index)?
+        .map(|(request, _)| request)
+        .ok_or_else(|| invalid("seed run project was trained with different settings"))
+}
+
 /// `"<candidate_id>:seed<S>"` から S を取り出す（正準形の u32 だけ。`train` の seed 記録と同じ規則）。
 fn seed_from_config_id(config_id: &str, candidate_id: &str) -> Option<u32> {
     let text = config_id
@@ -125,7 +156,8 @@ fn seed_from_config_id(config_id: &str, candidate_id: &str) -> Option<u32> {
 /// 各複製プロジェクトの評価記録を読み、自分と照合する（適用権を取る前に呼ぶ）。
 ///
 /// 照合: 評価データの sha256・バイト長（凍結記録）・定義の正準化ハッシュ・学習データの sha256 と分割記録・
-/// 候補 ID・評価件数が自分と一致し、`config_id` から取り出した seed が自分とも他の複製とも重複しないこと。
+/// 候補 ID・学習設定（[`same_training_settings`]）・評価件数が自分と一致し、`config_id` から取り出した seed が
+/// 保存済みリクエストの seed と一致し、自分とも他の複製とも重複しないこと。
 ///
 /// # Errors
 /// 経路の拒否・記録が無い / 不正・照合の不一致は `invalid_input`、記録の上限超過は `limit_exceeded`。
@@ -138,6 +170,7 @@ pub(super) fn load_seed_runs(
         .ok_or_else(|| runtime("cannot determine train seed"))?;
     let evaluation_sha256 = own.freeze.sha256().to_hex();
     let own_training = training_fingerprint(own.project)?;
+    let own_request = stored_request(own.project, own.candidate)?;
     let mut others: Vec<RunCount> = Vec::with_capacity(seed_run_projects.len());
     for dir in seed_run_projects {
         let project = Project::open(cwd, dir)?;
@@ -169,7 +202,14 @@ pub(super) fn load_seed_runs(
         if record.candidate_id != own.candidate_id {
             return Err(invalid("seed run candidate does not match"));
         }
+        let request = stored_request(&project, index)?;
+        if !same_training_settings(&request, &own_request) {
+            return Err(invalid(
+                "seed run project was trained with different settings",
+            ));
+        }
         let seed = seed_from_config_id(&record.config_id, own.candidate_id)
+            .filter(|seed| *seed == request.seed())
             .ok_or_else(|| invalid("seed run config id is invalid"))?;
         if seed == own_seed || others.iter().any(|r| r.seed == seed) {
             return Err(invalid("seed run seed is duplicated"));
@@ -334,6 +374,16 @@ mod tests {
                 .expect_err("many")
                 .code,
             ExitCode::InvalidInput
+        );
+    }
+
+    /// REQ-26・#490: 報告型の構造検査（core）が使う run 数の範囲は、評価器の定数と一致する。
+    #[test]
+    fn req26_issue490_report_run_limits_mirror_evaluator() {
+        use fandhe_edge_core::stage_report::{REPRODUCIBILITY_MAX_RUNS, REPRODUCIBILITY_MIN_RUNS};
+        assert_eq!(
+            (REPRODUCIBILITY_MIN_RUNS, REPRODUCIBILITY_MAX_RUNS),
+            (MIN_REPRODUCIBILITY_RUNS, MAX_REPRODUCIBILITY_RUNS)
         );
     }
 

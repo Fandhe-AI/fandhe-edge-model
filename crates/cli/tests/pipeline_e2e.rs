@@ -1618,13 +1618,13 @@ mod suite {
 
     /// REQ-26・REQ-27・REQ-39・TASK-26.3・#490: seed ごとの複製プロジェクト（学習前に複製し、各複製で
     /// `train --train-seed S → select → evaluate`）の評価記録を `--seed-run-project` で読み、3 seed の
-    /// Wilson 95% 区間の重なりを stdout・評価記録の `reproducibility` へ出す。照合の違反（学習データ・分割の違いを含む）・run 数の
+    /// Wilson 95% 区間の重なりを stdout・評価記録の `reproducibility` へ出す。照合の違反（学習データ・分割・学習設定の違いを含む）・run 数の
     /// 不足 / 超過・cwd 外は `invalid_input`（64）で台帳を作らず（適用権を失わない）、同じ候補をその後
     /// 評価できる。正解数を書き換えた合成記録で `some_pairs_disjoint` も確認する（テストハーネス。
     /// 学習ワーカーは偽物で、GPU の実学習は行わない）。
     pub fn req26_issue490_seed_run_projects_report_reproducibility() {
         let env = eval_env_until("repro490", &[]);
-        for name in ["r1", "r2", "r3"] {
+        for name in ["r1", "r2", "r3", "rall", "rsmoke"] {
             copy_dir(
                 &env.project_file(""),
                 &env.project_file(&format!("../{name}")),
@@ -1751,6 +1751,45 @@ mod suite {
             &["rsplit", "r2"],
             "seed run project was trained on different data or split",
         );
+        // 学習設定が違う複製（PR #516 指摘 P1）: `train --all` の配分された持ち時間で学習したもの、
+        // `--smoke`（epochs 1）で学習したもの。smoke の候補は `evaluate` できないため、seed 1 の評価記録を
+        // config ID だけ書き換えて置いた合成記録で照合させる（テストハーネス）。
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "rall",
+            "--all",
+            "--budget-seconds",
+            "600",
+            "--train-seed",
+            "6",
+        ]);
+        env.ok(&["select", "--project-dir", "rall"]);
+        env.ok(&["evaluate", "--project-dir", "rall", "--candidate", "1"]);
+        env.ok(&[
+            "train",
+            "--project-dir",
+            "rsmoke",
+            "--candidate",
+            "1",
+            "--train-seed",
+            "8",
+            "--smoke",
+        ]);
+        env.ok(&["select", "--project-dir", "rsmoke"]);
+        let mut smoke_record = r1.clone();
+        smoke_record.config_id = "c3:seed8".to_string();
+        std::fs::write(
+            env.work.join("rsmoke/candidates/1/evaluation_record.json"),
+            smoke_record.to_json_vec().expect("json"),
+        )
+        .expect("write");
+        for r in ["rall", "rsmoke"] {
+            rejected(
+                &[r, "r2"],
+                "seed run project was trained with different settings",
+            );
+        }
 
         // 偽ワーカーの正解数は 4/12（区間 [0.138, 0.609]）。正解数を 12 にした合成記録（seed 1。区間
         // [0.758, 1.0]）は seed 2・5 と区間が重ならない。

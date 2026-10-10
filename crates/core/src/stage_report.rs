@@ -252,6 +252,49 @@ pub struct EvaluateReproducibility {
     pub disjoint_pairs: Vec<[u32; 2]>,
 }
 
+/// 再現性の run 数の下限（評価器 `fandhe_edge_eval::reproducibility::MIN_REPRODUCIBILITY_RUNS` の写し。
+/// core は eval に依存できないため値を持ち、CLI のテストで一致を固定する）。
+pub const REPRODUCIBILITY_MIN_RUNS: usize = 3;
+/// 再現性の run 数の上限（評価器 `MAX_REPRODUCIBILITY_RUNS` の写し。同上）。
+pub const REPRODUCIBILITY_MAX_RUNS: usize = 100;
+
+impl EvaluateReproducibility {
+    /// 構造的に整合しているか（[`EvaluateCompletedReport::completed`] の検査用。PR #516 指摘）。
+    ///
+    /// - run 数が [`REPRODUCIBILITY_MIN_RUNS`]`..=`[`REPRODUCIBILITY_MAX_RUNS`]
+    /// - seed が狭義の昇順（重複なし）
+    /// - 各 run の `total` が評価件数 `total` と一致し `correct <= total`、区間は有限で `0 <= lo <= hi <= 1`
+    /// - `disjoint_pairs` の各組は `runs` の seed 2 つの昇順の組で、組は重複しない
+    /// - `disjoint_pairs` が空 ⇔ `verdict` が `all_pairs_overlap`
+    fn is_consistent(&self, total: u64) -> bool {
+        let seeds: Vec<u32> = self.runs.iter().map(|r| r.seed).collect();
+        let count_ok = (REPRODUCIBILITY_MIN_RUNS..=REPRODUCIBILITY_MAX_RUNS).contains(&seeds.len());
+        let ascending = seeds.windows(2).all(|w| matches!(w, [a, b] if a < b));
+        let runs_ok = self.runs.iter().all(|r| {
+            let ci = r.ci95;
+            r.total == total
+                && r.correct <= total
+                && ci.lo.is_finite()
+                && ci.hi.is_finite()
+                && 0.0 <= ci.lo
+                && ci.lo <= ci.hi
+                && ci.hi <= 1.0
+        });
+        let pairs_ok = self
+            .disjoint_pairs
+            .iter()
+            .all(|[a, b]| a < b && seeds.contains(a) && seeds.contains(b))
+            && self
+                .disjoint_pairs
+                .iter()
+                .enumerate()
+                .all(|(i, p)| !self.disjoint_pairs.iter().skip(i + 1).any(|q| q == p));
+        let verdict_ok = self.disjoint_pairs.is_empty()
+            == (self.verdict == ReproducibilityVerdict::AllPairsOverlap);
+        count_ok && ascending && runs_ok && pairs_ok && verdict_ok
+    }
+}
+
 /// `evaluate` の `abstention`（validation の T・τ を凍結 test に適用した保留・対象外の件数。
 /// REQ-22・REQ-27・#479・#478）。
 ///
@@ -377,15 +420,10 @@ impl EvaluateCompletedReport {
                 .comparison
                 .as_ref()
                 .is_some_and(|c| !c.is_consistent())
-            || details.reproducibility.as_ref().is_some_and(|r| {
-                r.runs.iter().any(|run| {
-                    run.total != total
-                        || run.correct > total
-                        || bad(Some(run.ci95.lo))
-                        || bad(Some(run.ci95.hi))
-                        || run.ci95.lo > run.ci95.hi
-                })
-            })
+            || details
+                .reproducibility
+                .as_ref()
+                .is_some_and(|r| !r.is_consistent(total))
         {
             return None;
         }
@@ -1650,8 +1688,9 @@ mod tests {
         );
     }
 
-    /// REQ-26・#490: `reproducibility` つきの JSON が末尾に完全一致し、評価件数と合わない run・
-    /// 範囲外の区間は作れない。
+    /// REQ-26・#490: `reproducibility` つきの JSON が末尾に完全一致する。構造的に整合しないもの（run 数が
+    /// 3 未満・上限超、seed の重複・非昇順、評価件数と合わない run・範囲外の区間、`runs` に無い seed や
+    /// 降順・重複した `disjoint_pairs`、`verdict` と `disjoint_pairs` の食い違い）は作れない（PR #516 指摘）。
     #[test]
     fn req26_issue490_reproducibility_json_is_exact() {
         let run = |seed: u32, correct: u64, lo: f64, hi: f64| EvaluateSeedRun {
@@ -1660,28 +1699,76 @@ mod tests {
             total: 4,
             ci95: EvaluateInterval { lo, hi },
         };
-        let build = |runs: Vec<EvaluateSeedRun>| {
+        let ok_runs = || {
+            vec![
+                run(1, 0, 0.0, 0.5),
+                run(7, 4, 0.5, 1.0),
+                run(42, 4, 0.5, 1.0),
+            ]
+        };
+        let build = |runs: Vec<EvaluateSeedRun>,
+                     verdict: ReproducibilityVerdict,
+                     disjoint_pairs: Vec<[u32; 2]>| {
             let mut d = details([3, 1, 0, 0, 0]);
             d.reproducibility = Some(EvaluateReproducibility {
                 runs,
-                verdict: ReproducibilityVerdict::SomePairsDisjoint,
-                disjoint_pairs: vec![[1, 42]],
+                verdict,
+                disjoint_pairs,
             });
             EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
         };
-        let line = build(vec![run(1, 0, 0.0, 0.5), run(42, 4, 0.5, 1.0)])
+        let disjoint = ReproducibilityVerdict::SomePairsDisjoint;
+        let overlap = ReproducibilityVerdict::AllPairsOverlap;
+        let line = build(ok_runs(), disjoint, vec![[1, 7], [1, 42]])
             .expect("report")
             .to_json_line()
             .expect("json");
         assert!(
-            line.ends_with(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,42]]}}"#),
+            line.ends_with(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":7,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,7],[1,42]]}}"#),
             "{line}"
         );
-        let mut other_total = run(1, 0, 0.0, 0.5);
-        other_total.total = 5;
-        assert_eq!(build(vec![other_total]), None);
-        assert_eq!(build(vec![run(1, 0, 0.6, 0.5)]), None);
-        assert_eq!(build(vec![run(1, 0, -0.1, 0.5)]), None);
+        let all = vec![run(1, 2, 0.1, 0.9); REPRODUCIBILITY_MAX_RUNS]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.seed = u32::try_from(i).expect("seed");
+                r
+            })
+            .collect::<Vec<_>>();
+        assert!(build(all.clone(), overlap, vec![]).is_some());
+        // run 数: 2 件・上限超は作れない。
+        assert_eq!(build(ok_runs()[..2].to_vec(), overlap, vec![]), None);
+        let mut too_many = all;
+        too_many.push(run(u32::MAX, 2, 0.1, 0.9));
+        assert_eq!(build(too_many, overlap, vec![]), None);
+        // seed の重複・非昇順。
+        let mut dup = ok_runs();
+        dup[1].seed = 1;
+        assert_eq!(build(dup, overlap, vec![]), None);
+        let mut unsorted = ok_runs();
+        unsorted.swap(1, 2);
+        assert_eq!(build(unsorted, overlap, vec![]), None);
+        // 評価件数と合わない run・範囲外の区間。
+        let mut other_total = ok_runs();
+        other_total[0].total = 5;
+        assert_eq!(build(other_total, overlap, vec![]), None);
+        for (lo, hi) in [(0.6, 0.5), (-0.1, 0.5), (0.1, 1.1), (f64::NAN, 0.5)] {
+            let mut bad = ok_runs();
+            bad[0].ci95 = EvaluateInterval { lo, hi };
+            assert_eq!(build(bad, overlap, vec![]), None, "{lo} {hi}");
+        }
+        // disjoint_pairs: runs に無い seed・降順・同じ seed・重複した組。
+        for pairs in [
+            vec![[1, 9]],
+            vec![[7, 1]],
+            vec![[1, 1]],
+            vec![[1, 7], [1, 7]],
+        ] {
+            assert_eq!(build(ok_runs(), disjoint, pairs.clone()), None, "{pairs:?}");
+        }
+        // verdict と disjoint_pairs の食い違い。
+        assert_eq!(build(ok_runs(), overlap, vec![[1, 7]]), None);
+        assert_eq!(build(ok_runs(), disjoint, vec![]), None);
     }
 
     /// REQ-22・REQ-27・#477: 校正つきの JSON は `calibration` が完全一致し、範囲外のしきい値は作れない。
