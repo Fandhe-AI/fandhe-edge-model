@@ -1617,24 +1617,46 @@ impl Running {
 }
 
 /// 偽コマンドが書いた pid が、短い猶予のうちに消える（子・孫が残らない）ことを確かめる。
+/// pid ファイルの各 PID が終了したことを、最大 10 秒待って確かめる。生存は `ps -A -o pid=,stat=` の一覧
+/// （終了ステータスと形式を検証）で判定し、一覧に無いかゾンビ（Z）なら終了済みとみなす（`kill -0` は
+/// ゾンビにも成功するため使わない。scripts/cli-infer-noninteractive.sh の group_alive と同じ規則）。
 fn assert_pids_gone(e: &Env, names: &[&str]) {
     for name in names {
         let pid = e.lines(name).first().cloned().expect("pid");
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let alive = Command::new("kill")
-                .args(["-0", &pid])
-                .stderr(Stdio::null())
-                .status()
-                .expect("kill -0")
-                .success();
-            if !alive {
-                break;
-            }
+        while process_alive(&pid) {
             assert!(Instant::now() < deadline, "{name} ({pid}) still alive");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// `pid` が一覧にあり、ゾンビでないか。`ps` の失敗・空の一覧・形式違反はテストの失敗にする。
+fn process_alive(pid: &str) -> bool {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,stat="])
+        .output()
+        .expect("run ps");
+    assert!(out.status.success(), "ps failed: {:?}", out.status);
+    let list = String::from_utf8(out.stdout).expect("ps output is utf-8");
+    let mut found = false;
+    let mut rows = 0usize;
+    for line in list.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(p), Some(stat)) = (cols.next(), cols.next()) else {
+            panic!("unexpected ps line: {line}");
+        };
+        assert!(
+            p.bytes().all(|b| b.is_ascii_digit()),
+            "unexpected ps line: {line}"
+        );
+        rows += 1;
+        if p == pid && !stat.starts_with('Z') {
+            found = true;
+        }
+    }
+    assert!(rows > 0, "ps returned no processes");
+    found
 }
 
 const INTERRUPTED: &str =
@@ -2457,16 +2479,18 @@ fn req39_default_overall_timeout_is_recorded() {
 
 /// REQ-39・#364: 全体の上限時間を超えたら子のグループを止め、実行中の項目は failed、残りは not_run
 /// （reason は `overall_timeout`）で record を書き、exit 10 と固定メッセージを返す。子は残らない。
+/// 上限時間は、負荷が高くても偽の make が子・孫を起動して pid を書いた後に来るよう 20 秒にする
+/// （偽の make は止められるまで眠るので、上限時間を延ばしても検証する性質は変わらない）。
 #[test]
 fn req39_overall_timeout_stops_running_item_and_marks_rest_not_run() {
     let e = Env::new();
     let o = e.run(
-        &with_work(&e, &["--items", "D,F", "--overall-timeout-sec", "5"]),
+        &with_work(&e, &["--items", "D,F", "--overall-timeout-sec", "20"]),
         &[("FAKE_MAKE_SLEEP", "1")],
     );
     assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, OVERALL_EXCEEDED, "stderr={}", o.stderr);
-    assert_eq!(e.q("options.overall_timeout_sec"), "5");
+    assert_eq!(e.q("options.overall_timeout_sec"), "20");
     assert_eq!(e.q("items.D.status"), "\"failed\"");
     assert_eq!(e.q("items.D.reason"), "\"overall_timeout\"");
     assert_eq!(e.q("items.F.status"), "\"not_run\"");
