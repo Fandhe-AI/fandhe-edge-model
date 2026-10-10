@@ -196,7 +196,13 @@ mod suite {
         let weights = size(format!("{model_dir}/model.onnx"));
         let vocab = size(format!("{model_dir}/vocab.json"));
         let label = size("definition.json".to_string());
-        let meta = size(format!("{model_dir}/artifact.json"));
+        // 校正つきのパッケージは配布用の `artifact.json` に `calibration_sha256` が足されるため、公開後は
+        // その実体から数える（#497）。`package/` が無ければ成果物ディレクトリの複写元から数える。
+        let meta = if env.project_file("package/artifact.json").is_file() {
+            size("package/artifact.json".to_string())
+        } else {
+            size(format!("{model_dir}/artifact.json"))
+        };
         // `calibration.json` は評価記録に校正があるときだけ同梱される（#497）。公開後の実体から数える。
         let calibration = size("package/calibration.json".to_string());
         let total = weights.0 + vocab.0 + label.0 + meta.0 + calibration.0;
@@ -2133,6 +2139,23 @@ mod suite {
             )),
             "{capacity}"
         );
+        // 配布用の `artifact.json` は候補側の末尾に `calibration_sha256`（`calibration.json` 全体の sha256）を
+        // 足しただけ。候補側は書き換えない（評価記録の `artifact_meta_sha256` の照合対象。REQ-39）。
+        let candidate_meta =
+            std::fs::read_to_string(env.project_file(&format!("{C3_DIR}/artifact.json")))
+                .expect("candidate artifact.json");
+        assert!(!candidate_meta.contains("calibration_sha256"));
+        let close = candidate_meta.trim_end().len() - 1;
+        assert_eq!(
+            std::fs::read_to_string(env.project_file("package/artifact.json"))
+                .expect("artifact.json"),
+            format!(
+                "{},\"calibration_sha256\":\"{}\"{}",
+                &candidate_meta[..close],
+                file_sha256(&env, "package/calibration.json"),
+                &candidate_meta[close..]
+            )
+        );
 
         let rows = evaluation_batch();
         let batch: String = rows
@@ -2241,8 +2264,16 @@ mod suite {
             }
         }
 
-        // 校正なし（`calibration.json` が無い）なら保留を返さない。
+        // 記録があるのに `calibration.json` を消すと 64（保留しない状態へ戻す削除を検出する。REQ-39）。
         std::fs::remove_file(env.project_file("package/calibration.json")).expect("rm");
+        assert_eq!(
+            env.fails(&EVAL_BATCH, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration is missing but its hash is recorded\"}\n"
+        );
+        // 校正なしのパッケージ（`calibration_sha256` も `calibration.json` も無い）なら保留を返さない。
+        let meta = env.project_file("package/artifact.json");
+        std::fs::copy(env.project_file(&format!("{C3_DIR}/artifact.json")), &meta)
+            .expect("restore candidate artifact.json");
         let (code, lines) = env.run(&EVAL_BATCH);
         assert_eq!(code, 0, "{lines}");
         assert_eq!(
@@ -2251,12 +2282,20 @@ mod suite {
         );
     }
 
-    /// REQ-22・REQ-39・#497: `calibration.json` の改変（`onnx_sha256`・`label_order` の不一致・範囲外の T・τ・
-    /// 未知キー・壊れた JSON・symlink）は `infer` が 64、上限超過は 20 で拒否する。元に戻せば成功する。
-    /// 評価データなしのパッケージには `calibration.json` が無く、容量の `calibration` 枠は 0 件。
+    /// REQ-22・REQ-39・#497: `calibration.json` の改変は `artifact.json` の `calibration_sha256` との照合で
+    /// `infer` が 64 で拒否する（τ を範囲内で変える・削除・記録なしの同梱を含む）。`artifact.json` の記録ごと
+    /// 書き換えた場合も、内容（`onnx_sha256`・`label_order` の不一致・範囲外の T・τ・未知キー・壊れた JSON）は 64、
+    /// symlink は 64、上限超過は 20 で拒否する。元に戻せば成功する。評価データなしのパッケージには
+    /// `calibration.json` も `calibration_sha256` も無く、容量の `calibration` 枠は 0 件で、従来どおり exit 0。
     pub fn infer_rejects_tampered_calibration() {
         let plain = packaged("calibnone");
         assert!(!plain.project_file("package/calibration.json").exists());
+        assert!(
+            !std::fs::read_to_string(plain.project_file("package/artifact.json"))
+                .expect("artifact.json")
+                .contains("calibration_sha256")
+        );
+        plain.ok(&["infer", "--package", "proj/package", "--text", "alpha"]);
         assert!(
             capacity_json(&plain, C1_DIR, None, false)
                 .contains("\"calibration\":{\"bytes\":0,\"file_count\":0}")
@@ -2273,6 +2312,42 @@ mod suite {
         let mismatch = "{\"code\":\"invalid_input\",\"message\":\"package calibration does not match the model\"}\n";
         let invalid =
             "{\"code\":\"invalid_input\",\"message\":\"package calibration is invalid\"}\n";
+        let meta = env.project_file("package/artifact.json");
+        let original_meta = std::fs::read_to_string(&meta).expect("artifact.json");
+        let recorded = file_sha256(&env, "package/calibration.json");
+        assert!(
+            original_meta.contains(&format!("\"calibration_sha256\":\"{recorded}\"")),
+            "{original_meta}"
+        );
+        let hash_mismatch = "{\"code\":\"invalid_input\",\"message\":\"package calibration does not match its recorded hash\"}\n";
+
+        // `artifact.json` を変えずに τ を範囲内で書き換える（保留の境界をずらす改変）。
+        assert_ne!(tau, "0.25");
+        std::fs::write(
+            &path,
+            original.replace(&format!("\"threshold\":{tau}"), "\"threshold\":0.25"),
+        )
+        .expect("tamper tau");
+        assert_eq!(env.fails(&text_args, 64, "invalid_input"), hash_mismatch);
+        // 削除（保留しない状態へ戻す）。
+        std::fs::remove_file(&path).expect("rm");
+        assert_eq!(
+            env.fails(&text_args, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration is missing but its hash is recorded\"}\n"
+        );
+        // `artifact.json` から記録を消して `calibration.json` だけ残す。
+        std::fs::write(&path, &original).expect("restore");
+        std::fs::write(
+            &meta,
+            original_meta.replace(&format!(",\"calibration_sha256\":\"{recorded}\""), ""),
+        )
+        .expect("strip");
+        assert_eq!(
+            env.fails(&text_args, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration has no recorded hash\"}\n"
+        );
+
+        // 以降は `artifact.json` の記録ごと書き換えた場合（#168 の範囲）でも、内容の検査で止まることを確かめる。
         let cases: Vec<(String, &str)> = vec![
             (original.replace(&onnx_hash, &"0".repeat(64)), mismatch),
             (
@@ -2308,6 +2383,14 @@ mod suite {
         for (tampered, expected) in &cases {
             assert_ne!(tampered, &original);
             std::fs::write(&path, tampered).expect("tamper");
+            std::fs::write(
+                &meta,
+                original_meta.replace(
+                    &recorded,
+                    &Sha256Digest::of_bytes(tampered.as_bytes()).to_hex(),
+                ),
+            )
+            .expect("rehash");
             assert_eq!(
                 env.fails(&text_args, 64, "invalid_input"),
                 *expected,
@@ -2324,6 +2407,7 @@ mod suite {
         env.fails(&text_args, 64, "invalid_input");
         std::fs::remove_file(&path).expect("rm link");
         std::fs::write(&path, &original).expect("restore");
+        std::fs::write(&meta, &original_meta).expect("restore meta");
         let (code, line) = env.run(&text_args);
         assert!(code == 0 || code == 12, "{line}");
     }

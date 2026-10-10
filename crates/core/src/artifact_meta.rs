@@ -145,6 +145,7 @@ pub struct ArtifactMeta {
     label_order: Vec<String>,
     onnx_sha256: String,
     vocab_sha256: Option<String>,
+    calibration_sha256: Option<String>,
 }
 
 /// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
@@ -162,6 +163,8 @@ struct RawMeta {
     onnx_sha256: String,
     #[serde(default)]
     vocab_sha256: Option<String>,
+    #[serde(default)]
+    calibration_sha256: Option<String>,
 }
 
 fn is_hex64(s: &str) -> bool {
@@ -460,7 +463,9 @@ impl ArtifactMeta {
                 .label_order
                 .iter()
                 .all(|l| !l.is_empty() && seen.insert(l.as_str()));
-        let sha_ok = is_hex64(&raw.onnx_sha256) && raw.vocab_sha256.as_deref().is_none_or(is_hex64);
+        let sha_ok = is_hex64(&raw.onnx_sha256)
+            && raw.vocab_sha256.as_deref().is_none_or(is_hex64)
+            && raw.calibration_sha256.as_deref().is_none_or(is_hex64);
         if raw.kind.is_empty()
             || raw.kind.len() > MAX_META_KIND_BYTES
             || raw.max_bytes == 0
@@ -477,6 +482,7 @@ impl ArtifactMeta {
             label_order: raw.label_order,
             onnx_sha256: raw.onnx_sha256,
             vocab_sha256: raw.vocab_sha256,
+            calibration_sha256: raw.calibration_sha256,
         })
     }
 
@@ -521,6 +527,14 @@ impl ArtifactMeta {
     #[must_use]
     pub fn vocab_sha256(&self) -> Option<&str> {
         self.vocab_sha256.as_deref()
+    }
+
+    /// 記載された `calibration.json` の sha256（小文字 16 進 64 桁。REQ-39・#497）。`package` が配布用の
+    /// `artifact.json` にだけ書き、校正を同梱しないパッケージと候補側の成果物では `None`。あれば
+    /// `calibration.json` が必須で、`infer` が照合する。
+    #[must_use]
+    pub fn calibration_sha256(&self) -> Option<&str> {
+        self.calibration_sha256.as_deref()
     }
 }
 
@@ -640,18 +654,27 @@ mod tests {
         assert_eq!(m.label_order(), ["a".to_string(), "b".to_string()]);
         assert_eq!(m.onnx_sha256(), "0".repeat(64));
         assert_eq!(m.vocab_sha256(), None);
+        assert_eq!(m.calibration_sha256(), None);
     }
 
-    /// REQ-39: 語彙ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
+    /// REQ-39・#497: 校正ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
     #[test]
-    fn req39_meta_vocab_sha256_is_optional_and_validated() {
-        let ok = format!(r#","vocab_sha256":"{}""#, "a".repeat(64));
+    fn req39_issue497_meta_calibration_sha256_is_optional_and_validated() {
+        let ok = format!(r#","calibration_sha256":"{}""#, "b".repeat(64));
         let m = ArtifactMeta::parse(full_meta(&ok).as_bytes()).expect("ok");
-        assert_eq!(m.vocab_sha256(), Some("a".repeat(64).as_str()));
-        assert_eq!(
-            ArtifactMeta::parse(full_meta(r#","vocab_sha256":"zz""#).as_bytes()),
-            Err(ArtifactMetaError::Malformed)
-        );
+        assert_eq!(m.calibration_sha256(), Some("b".repeat(64).as_str()));
+        assert_eq!(m.kind_version(), 1);
+        for bad in [
+            r#","calibration_sha256":"zz""#.to_string(),
+            format!(r#","calibration_sha256":"{}""#, "B".repeat(64)),
+            r#","calibration_sha256":1"#.to_string(),
+        ] {
+            assert_eq!(
+                ArtifactMeta::parse(full_meta(&bad).as_bytes()),
+                Err(ArtifactMetaError::Malformed),
+                "{bad}"
+            );
+        }
     }
 
     /// REQ-39: 語彙ファイルは「トークン -> 非負整数 ID」の JSON オブジェクトだけを許可する。

@@ -9,8 +9,9 @@
 //! 2. 同じ閉じ込め済みパッケージから `artifact.json`（拡張メタ）と `definition.json` を上限付きで
 //!    読み、`onnx_sha256` と保持した ONNX のバイト列の sha256 の一致（パッケージの自己整合性）・
 //!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する
-//! 3. `calibration.json`（あれば。`package` が評価記録に校正があるときだけ書く）を同じ閉じ込めと上限
-//!    （`MAX_DEFINITION_FILE_BYTES`）で読み、`onnx_sha256`・`label_order` が保持した ONNX・定義と一致し、
+//! 3. `calibration.json`（`package` が評価記録に校正があるときだけ書き、`artifact.json` に
+//!    `calibration_sha256` を記す）を同じ閉じ込めと上限（`MAX_DEFINITION_FILE_BYTES`）で読み、記録の sha256
+//!    との一致（欠落・記録なしの同梱も拒否）、`onnx_sha256`・`label_order` が保持した ONNX・定義と一致し、
 //!    T・τ が範囲内であることを確認する（[`load_calibration`]。REQ-22・REQ-39・#497）
 //! 4. 保持したバイト列から ONNX バックエンドを組み立て、前処理と束ねて推論する
 //!    （推論経路は学習側〔`fandhe-edge-train`・Python〕に依存しない。REQ-32。保留の判定は評価器
@@ -430,7 +431,12 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     if !meta.label_order().iter().map(String::as_str).eq(option_ids) {
         return Err(invalid("package label order does not match definition"));
     }
-    let calibration = load_calibration(&checked.package, onnx, &definition)?;
+    let calibration = load_calibration(
+        &checked.package,
+        meta.calibration_sha256(),
+        onnx,
+        &definition,
+    )?;
     let pipeline = build_pipeline(onnx, &meta, definition.options().len())?;
     let scope = JudgmentScope {
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
@@ -443,30 +449,53 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     })
 }
 
-/// パッケージの `calibration.json` を閉じ込めつき・上限つきで読み、保持した ONNX と定義に一致する
-/// 校正だけを返す（無ければ `None`。保留を返さない。REQ-22・REQ-30・REQ-39・#497）。
+/// パッケージの `calibration.json` を閉じ込めつき・上限つきで読み、`artifact.json` の `calibration_sha256`
+/// （`recorded`）・保持した ONNX・定義に一致する校正だけを返す（ファイルも記録も無ければ `None`。保留を返さない。
+/// REQ-22・REQ-30・REQ-39・#497）。
+///
+/// 記録の有無とファイルの有無は語彙ファイル（`verify_vocab_file`）と同じ規則で照合し、sha256 は解析より前に
+/// 保持 fd から読んだバイト列で確かめる（τ の範囲内の改変・ファイルの削除を検出する。`artifact.json` ごとの
+/// 改変は外部台帳〔#168〕の範囲）。
 ///
 /// # Errors
-/// 解析できない・未知キー・T（`TEMPERATURE_MIN..=TEMPERATURE_MAX`）や τ（`0..=1`）が範囲外・非有限は
+/// 記録があるのにファイルが無い（`package calibration is missing but its hash is recorded`）・記録が無いのに
+/// ファイルがある（`package calibration has no recorded hash`）・sha256 の不一致
+/// （`package calibration does not match its recorded hash`）は `invalid_input`。解析できない・未知キー・T（`TEMPERATURE_MIN..=TEMPERATURE_MAX`）や τ（`0..=1`）が範囲外・非有限は
 /// `invalid_input`（`package calibration is invalid`）。`onnx_sha256`・`label_order` の不一致は
 /// `invalid_input`（`package calibration does not match the model`）。経路の拒否（symlink 等）・
 /// 上限超過は他のメンバーと同じ写像。
 fn load_calibration(
     package: &ConfinedPackage,
+    recorded: Option<&str>,
     onnx: &[u8],
     definition: &Definition,
 ) -> Result<Option<InferCalibration>, ErrorReport> {
-    let (file, path) = match package.open_member(Path::new(PACKAGE_CALIBRATION_FILE)) {
-        Ok(opened) => opened,
+    let opened = match package.open_member(Path::new(PACKAGE_CALIBRATION_FILE)) {
+        Ok(opened) => Some(opened),
         Err(PathRejection::Unresolvable { source, .. })
             if source.kind() == io::ErrorKind::NotFound =>
         {
-            return Ok(None);
+            None
         }
         Err(e) => return Err(e.to_error_report()),
     };
+    let ((file, path), recorded) = match (opened, recorded) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            return Err(invalid(
+                "package calibration is missing but its hash is recorded",
+            ));
+        }
+        (Some(_), None) => return Err(invalid("package calibration has no recorded hash")),
+        (Some(opened), Some(recorded)) => (opened, recorded),
+    };
     let bytes = read_bounded_open_file(file, path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
+    if Sha256Digest::of_bytes(&bytes).to_hex() != recorded {
+        return Err(invalid(
+            "package calibration does not match its recorded hash",
+        ));
+    }
     let parsed = PackageCalibration::from_json_slice(&bytes)
         .map_err(|_| invalid("package calibration is invalid"))?;
     let temperature_ok = (TEMPERATURE_MIN..=TEMPERATURE_MAX).contains(&parsed.temperature);

@@ -6,9 +6,11 @@
 //!
 //! 形式は 1 行 JSON＋改行で、キー順は `onnx_sha256`・`label_order`・`temperature`・`threshold` に固定
 //! （構造体の宣言順で直列化する）。校正の完全性は `onnx_sha256`（配布する ONNX の sha256）と
-//! `label_order`（定義の選択肢の宣言順）による自己整合で重み・定義へ束縛する。τ の改変と、ファイル
-//! 自体の削除（`infer` は保留しない状態に戻る）の検出は外部台帳（#168）の範囲で、本型は扱わない。値の範囲（T・τ）の検証は読み手（`infer`）が評価器の
-//! 定数で行う（共通コアは評価器に依存しない）。
+//! `label_order`（定義の選択肢の宣言順）による自己整合で重み・定義へ束縛する。τ の改変とファイル自体の
+//! 削除は、`package` が配布用の `artifact.json` に記す `calibration_sha256`（本ファイル全体の sha256。
+//! [`crate::artifact_meta::ArtifactMeta::calibration_sha256`]）との照合で `infer` が検出する（パッケージ内の
+//! 自己整合。REQ-39）。`artifact.json` ごとの改変の検出は外部台帳（#168）の範囲。値の範囲（T・τ）の検証は
+//! 読み手（`infer`）が評価器の定数で行う（共通コアは評価器に依存しない）。
 
 use serde::{Deserialize, Serialize};
 

@@ -33,7 +33,10 @@
 //! 校正（#497・REQ-22・REQ-30）: 選定候補の評価記録に `calibration` があるときだけ、`calibration.json`
 //! （[`PackageCalibration`]。T・τ と、配布する ONNX の sha256・定義の宣言順）を同梱し、容量内訳の
 //! `calibration` 枠に計上する。評価データが無い・`calibration:null` では書かない（`infer` は保留しない）。
-//! `artifact.json` は学習ワーカーの出力のまま書き換えない。
+//! 校正を同梱するときは、配布用の `package/artifact.json` の末尾に `calibration_sha256`（`calibration.json`
+//! 全体の sha256）を追記し、`infer` が τ の改変・ファイルの削除を検出できるようにする
+//! （[`with_calibration_sha256`]。REQ-39）。候補側の `candidates/<N>/artifact.json` と、評価記録の
+//! `artifact_meta_sha256` の照合対象（候補側のバイト列）は変えない。校正なしでは学習ワーカーの出力のまま。
 //!
 //! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
 //! 公開する。途中の失敗・容量または p95 の上限超過ではステージングを片付け、`package/` を作らない
@@ -249,6 +252,10 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
     let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
     let calibration = package_calibration(verified_record.as_ref(), &definition, &onnx_bytes)?;
+    let package_meta_bytes = match calibration.as_deref() {
+        Some(bytes) => with_calibration_sha256(&meta_bytes, bytes)?,
+        None => meta_bytes,
+    };
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -282,7 +289,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     let breakdown = match assemble_and_measure(
         &project,
         onnx_file,
-        &meta_bytes,
+        &package_meta_bytes,
         &onnx_bytes,
         (&definition_bytes, calibration.as_deref()),
         &meta,
@@ -493,6 +500,25 @@ fn package_calibration(
     .to_json_line()
     .map(Some)
     .map_err(|_| runtime("cannot serialize package calibration"))
+}
+
+/// 候補側の `artifact.json` のバイト列の末尾の `}` の直前に `,"calibration_sha256":"<hex>"` を足した、配布用の
+/// バイト列を返す（REQ-39・#497）。他の欄・キー順・空白は変えない。
+///
+/// 候補側に同名の欄が無いことは [`load_candidate_artifact`] が確認済み（重複キーを作らない）。解析済みの
+/// 非空オブジェクトなので、末尾の空白を除いた最後のバイトは `}` で、直前に欄がある。
+fn with_calibration_sha256(meta_bytes: &[u8], calibration: &[u8]) -> Result<Vec<u8>, ErrorReport> {
+    let close = meta_bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .filter(|&i| meta_bytes.get(i) == Some(&b'}'))
+        .ok_or_else(|| invalid("artifact metadata does not match the model file"))?;
+    let (head, tail) = meta_bytes.split_at(close);
+    let field = format!(
+        r#","calibration_sha256":"{}""#,
+        Sha256Digest::of_bytes(calibration).to_hex()
+    );
+    Ok([head, field.as_bytes(), tail].concat())
 }
 
 /// 評価記録の `baseline_comparison` が定義と一致するか（#339・REQ-25）。
@@ -1148,6 +1174,29 @@ mod tests {
             Ok(None)
         );
         assert_eq!(package_calibration(None, &definition, b"onnx"), Ok(None));
+    }
+
+    /// REQ-39・#497: 配布用の `artifact.json` は候補側のバイト列の末尾に `calibration_sha256` を足しただけで、
+    /// 解析すると校正ファイルの sha256 が読め、他の欄は変わらない。
+    #[test]
+    fn req39_issue497_with_calibration_sha256_appends_field() {
+        let meta = format!(
+            "{{\"onnx_file\":\"model.onnx\",\"kind\":\"c1\",\"kind_version\":1,\"max_bytes\":48,\"label_order\":[\"a\"],\"onnx_sha256\":\"{}\"}}\n",
+            "0".repeat(64)
+        );
+        let out = with_calibration_sha256(meta.as_bytes(), b"calib\n").expect("append");
+        let hex = Sha256Digest::of_bytes(b"calib\n").to_hex();
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("utf8"),
+            meta.replace("}\n", &format!(",\"calibration_sha256\":\"{hex}\"}}\n"))
+        );
+        let parsed = ArtifactMeta::parse(&out).expect("parse");
+        assert_eq!(parsed.calibration_sha256(), Some(hex.as_str()));
+        assert_eq!(
+            ArtifactMeta::parse(meta.as_bytes()).map(|m| m.label_order().to_vec()),
+            Ok(parsed.label_order().to_vec())
+        );
+        assert!(with_calibration_sha256(b"[]", b"x").is_err());
     }
 
     fn definition_with(acceptance: Option<u32>) -> Definition {
