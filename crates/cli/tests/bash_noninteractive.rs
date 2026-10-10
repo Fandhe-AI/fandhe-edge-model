@@ -872,10 +872,13 @@ fn req39_ps_failure_is_fail_closed_and_kills_group() {
     let ps = dir.join("ps");
     std::fs::write(&ps, "#!/bin/sh\nexit 1\n").expect("write");
     std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let marker = std::env::temp_dir().join(format!("fandhe-psfail-{}", std::process::id()));
+    // 子孫は自分の PID を書いてから長く眠る。スクリプトの終了後にその PID が残っていないことを確かめる
+    // （「n 秒後に書く印」に頼ると、負荷が高いときにグループの終了より先に書かれて不安定になる）。
+    let pid_file = std::env::temp_dir().join(format!("fandhe-psfail-{}", std::process::id()));
     let body = format!(
-        "echo '{{\"code\":\"ok\"}}'\n(sleep 3; echo alive >'{}') &\nexit 0",
-        marker.display()
+        "echo '{{\"code\":\"ok\"}}'\nsh -c 'echo $$ >\"{}\"; exec sleep 60' &\nwhile [ ! -s '{}' ]; do sleep 0.05; done\nexit 0",
+        pid_file.display(),
+        pid_file.display()
     );
     let path = format!(
         "{}:{}",
@@ -888,9 +891,27 @@ fn req39_ps_failure_is_fail_closed_and_kills_group() {
         o.stdout,
         "{\"code\":\"runtime_error\",\"message\":\"fandhe-edge process monitoring failed\"}\n"
     );
-    std::thread::sleep(Duration::from_secs(4));
-    let survived = marker.exists();
-    std::fs::remove_file(&marker).ok();
+    let pid = std::fs::read_to_string(&pid_file).expect("pid file");
+    let pid = pid.trim().to_string();
+    // kill -0 が失敗する（プロセスが無い）まで最大 5 秒待つ。終了済みなら即座に抜ける。
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let survived = alive();
+    if survived {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    std::fs::remove_file(&pid_file).ok();
     std::fs::remove_dir_all(&dir).ok();
     assert!(!survived, "descendant survived ps failure");
 }
