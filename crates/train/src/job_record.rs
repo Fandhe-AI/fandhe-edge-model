@@ -68,7 +68,8 @@
 //!   プロセス内の取得が成功し、close で所有者の lock が失われるため）。
 //! - `finish` を呼ばずに drop（panic 等）された場合も lock は解放されるため、状態確認が
 //!   `OwnerLost` を検出する（意図した挙動）。
-//! - 読み手同士は `job.check.lock`（blocking の advisory lock）で直列化する。同時に
+//! - 読み手同士は `job.check.lock`（advisory lock。[`CHECK_LOCK_TIMEOUT`] まで再試行し、超えたら
+//!   [`JobRecordError::LockUnavailable`]。保持し続ける者がいても無期限に待たない。REQ-39）で直列化する。同時に
 //!   検出した読み手は先の書き戻しを待ち、取得後に記録を読み直して終端記録を返す
 //!   （書き戻し中の `job.lock` 保持を所有者の生存と誤認して `running` と誤報しない）。
 //!   次回以降の呼び出しは終端記録を返すだけ（冪等）。
@@ -76,8 +77,12 @@
 //! # 責務境界・未実装（実装済みを装わない）
 //!
 //! - `job_dir` の経路の閉じ込めはガード層（REQ-39・TASK-39.x）と CLI 配線（TASK-33.x）
-//!   の責務。本モジュールは絶対パスの既存ディレクトリで、`job.json`・`job.lock` が
-//!   symlink でないことだけを検査する（検査後の差し替えの余地は残る）。
+//!   の責務。本モジュールは**パス**（`job_dir` の絶対パス）で `job.json`・`job.lock`・
+//!   `job.check.lock` を開き、絶対パスの既存ディレクトリであることと、各ファイルが symlink で
+//!   ないことだけを検査する。CLI は `job/` を保持 fd 起点（`O_NOFOLLOW`）で検証してから
+//!   そのパスを渡すが、本モジュールが開き直すため、検証後に `job/` やその親を差し替えられる者
+//!   （プロジェクトへ同時に書き込める者）がいると、ルート外のファイルを読み書きする余地が残る
+//!   （既知の限界。ディレクトリ fd 起点の `openat` への置き換えは #510）。
 //! - CLI への状態確認の露出（TASK-33.x）・やり直しの案内と `SIGKILL` フォールバック後の
 //!   残置物の掃除（#147・TASK-34.3）は未実装。再開（チェックポイント）は提供しない
 //!   （REQ-34）ため記録に `resumable` は持たない。
@@ -665,7 +670,7 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
         check_options.mode(0o600);
     }
     let check_lock = check_options.open(&check_path).map_err(|e| io_err(&e))?;
-    check_lock.lock().map_err(|e| io_err(&e))?;
+    lock_with_timeout(&check_lock, CHECK_LOCK_TIMEOUT)?;
     let current = read_current(job_dir)?;
     if let Some(record) = current.as_ref().filter(|r| r.state.is_terminal()) {
         return Ok(report_of(record, false));
@@ -748,6 +753,26 @@ fn initializing_record(lock_path: &Path, now_unix: u64) -> JobRecord {
 /// 子プロセスが継承した fd による一過性のもの（`O_CLOEXEC` は `exec` で閉じるため
 /// 短時間だけ保持が見える）である場合を除くため、短時間だけ再試行してから
 /// 生存と判断する（`running` の確認は上限 [`LOCK_SETTLE_RETRIES`] × 間隔だけ遅れる）。
+/// 読み手同士の直列化 lock（`job.check.lock`）を待つ上限（REQ-39: 無期限の待ちを作らない）。
+/// 書き戻しは記録 1 件の原子的置き換えだけなので、正常な読み手はこの時間内に lock を手放す。
+pub const CHECK_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CHECK_LOCK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `lock` を `timeout` まで `try_lock` で再試行して取る。超えたら [`JobRecordError::LockUnavailable`]。
+fn lock_with_timeout(lock: &File, timeout: std::time::Duration) -> Result<(), JobRecordError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(e)) => return Err(io_err(&e)),
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(CHECK_LOCK_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(JobRecordError::LockUnavailable),
+        }
+    }
+}
+
 fn try_lock_settled(lock: &File) -> Result<bool, JobRecordError> {
     for attempt in 0..=LOCK_SETTLE_RETRIES {
         match lock.try_lock() {
@@ -1268,5 +1293,28 @@ mod tests {
         ] {
             assert_eq!(parse_worker_signal_message(bad), None, "{bad}");
         }
+    }
+
+    /// REQ-39・#485: 直列化 lock を他者が保持し続けると、上限後に `LockUnavailable`（無期限に待たない）。
+    /// 保持者が手放せば取れる。
+    #[test]
+    fn req39_check_lock_wait_is_bounded() {
+        let dir = tmp_dir("checklock");
+        let path = dir.join(JOB_CHECK_LOCK_FILE);
+        let holder = File::create(&path).expect("create");
+        holder.lock().expect("hold");
+        let waiter = File::open(&path).expect("open");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            lock_with_timeout(&waiter, std::time::Duration::from_millis(50)),
+            Err(JobRecordError::LockUnavailable)
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        drop(holder);
+        assert_eq!(
+            lock_with_timeout(&waiter, std::time::Duration::from_millis(50)),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1042,6 +1042,34 @@ mod suite {
         assert!(env.project_file("candidates/0/result.json").is_file());
     }
 
+    /// REQ-39・REQ-34・#485: 別プロセス（本テスト）が読み手の直列化 lock（`job.check.lock`）を保持し
+    /// 続けると、`train --status` は無期限に待たず、上限（5 秒）後に `runtime_error`（70）で終わる。
+    pub fn req39_status_check_lock_held_by_another_process_times_out() {
+        let env = registered("checklock", false);
+        let job_dir = env.project_file("candidates/0/job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        let job_dir = std::fs::canonicalize(job_dir).expect("canonical");
+        // 所有者が消えた `running` の記録（直列化 lock を取りに行く経路）。
+        drop(fandhe_edge_train::job_record::JobRecorder::begin(&job_dir, 100).expect("begin"));
+        let holder = std::fs::File::create(job_dir.join("job.check.lock")).expect("check lock");
+        holder.lock().expect("hold");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--status"],
+                70,
+                "runtime_error"
+            ),
+            "{\"code\":\"runtime_error\",\"message\":\"job lock is held by another process\"}\n"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        drop(holder);
+        assert!(
+            env.ok(&["train", "--project-dir", "proj", "--status"])
+                .contains("\"cause\":\"owner_lost\"")
+        );
+    }
+
     /// REQ-34・#485 (e): 別プロセス（本テスト）が `job.lock` を保持している `running` の候補への `train` は
     /// `invalid_input`・`job is running` で、候補ディレクトリに触れない。保持者が消える（lock 解放・記録は
     /// `running` のまま）と、`train` が `failed`＋`owner_lost` を検出して丸ごと消し、新規に学習する。
@@ -4564,6 +4592,10 @@ fn main() -> std::process::ExitCode {
         (
             "req34_running_job_blocks_train_until_owner_is_lost",
             suite::req34_running_job_blocks_train_until_owner_is_lost,
+        ),
+        (
+            "req39_status_check_lock_held_by_another_process_times_out",
+            suite::req39_status_check_lock_held_by_another_process_times_out,
         ),
         (
             "train_all_trains_every_candidate_within_budget",

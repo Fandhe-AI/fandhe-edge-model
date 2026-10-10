@@ -518,6 +518,46 @@ impl Project {
         })
     }
 
+    /// `rel` のディレクトリを [`Project::open_subdir`] と同じく開く。存在しなければ `None`
+    /// （`NotFound` のみ。symlink・非ディレクトリ・他の失敗は経路の拒否として返す。REQ-39）。
+    ///
+    /// # Errors
+    /// [`Project::open_subdir`] と同じ（`NotFound` を除く）。
+    pub fn open_subdir_optional(
+        &self,
+        rel: impl AsRef<Path>,
+    ) -> Result<Option<ConfinedPackage>, ErrorReport> {
+        match self.package.open_subdir(rel.as_ref()) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(PathRejection::Unresolvable { source, .. })
+                if source.kind() == ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_error_report()),
+        }
+    }
+
+    /// [`Project::track_existing_dir`] で保持したディレクトリを、名前が今も同じ実体を指すことを
+    /// **先に**確かめてから、保持 fd 起点で丸ごと消す（REQ-34・REQ-39・#485）。
+    ///
+    /// 差し替えられていれば何も消さない。中身の削除は保持 fd 起点で symlink を辿らない。
+    ///
+    /// # Errors
+    /// 同一性を確かめられない・差し替えられている・削除に失敗した場合は `runtime_error`（70）。
+    pub fn remove_tracked_dir_if_unchanged(&self, held: &CreatedDir) -> Result<(), ErrorReport> {
+        let failed = || runtime("candidate directory could not be cleaned up");
+        let current = self.package.open_subdir(&held.rel).map_err(|_| failed())?;
+        if !same_dir(&current, &held.handle) {
+            return Err(failed());
+        }
+        if self.remove_created_dir(held) {
+            Ok(())
+        } else {
+            Err(failed())
+        }
+    }
+
     /// 既存のディレクトリ `rel` を保持 fd 起点で開き、[`Project::remove_created_dir`] で片付けられる
     /// ハンドルにする（`train` が前回の失敗で残った候補ディレクトリを、判定した実体と同一のときだけ
     /// 消すため。REQ-34・REQ-39・#485）。
@@ -597,6 +637,32 @@ impl Project {
             MAX_PROJECT_FILE_BYTES,
         )?;
         inspect_bytes(&bytes, definition)
+    }
+}
+
+impl CreatedDir {
+    /// 保持しているディレクトリ（fd 起点で中身を開く用）。
+    #[must_use]
+    pub fn handle(&self) -> &ConfinedPackage {
+        &self.handle
+    }
+}
+
+/// 2 つの保持ディレクトリが同一の実体（デバイス・inode が一致）か。確かめられなければ `false`
+/// （fail-closed。非 unix は常に `false`）。
+fn same_dir(a: &ConfinedPackage, b: &ConfinedPackage) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (a.metadata(), b.metadata()) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
     }
 }
 
