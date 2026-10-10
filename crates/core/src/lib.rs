@@ -53,6 +53,8 @@
 //! （パッケージ形式の確定は TASK-28/32）。
 //! `stage_report` モジュールは TASK-33.2-2（issue #139）で exit 0 時の工程結果
 //! JSON（現状は `package` の [`stage_report::PackageReport`]）の型と直列化を実装済み。
+//! `version_ledger_record` モジュールは #491（TASK-39.3・TASK-39.6）で版管理台帳ファイルの直列化形式を
+//! 実装済み（検証はガード層の `VersionLedger::from_file`）。
 
 pub mod artifact_meta;
 pub mod canonical;
@@ -67,3 +69,4 @@ pub mod limits;
 pub mod package_calibration;
 pub mod rebuild;
 pub mod stage_report;
+pub mod version_ledger_record;

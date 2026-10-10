@@ -12,8 +12,10 @@
 //!   対象版の成果物を閉じ込め検証付きで開いて上限付きでメモリへ読み込み、そのバイト列から
 //!   sha256 を再計算して、一致したときだけ検証に使ったバイト列ごと [`VerifiedVersion`] を返す（不一致は [`LedgerError::HashMismatch`] で fail-closed）。
 //!   配置先への物理コピー・現在版ポインタ・CLI 配線は未実装（台帳は追記のみで可変状態を持たない）
-//! - 台帳はメモリ上のみで、永続化（JSON への保存・読み戻し）は未実装。ガード層への
-//!   `serde` 系の配置が dependency-policy で未承認のため（永続化時は台帳ファイルの改ざん検証も課題）
+//! - 永続化は [`VersionLedger::to_file`]・[`VersionLedger::from_file`]（#491）。直列化の形は共通コアの
+//!   `version_ledger_record`（ガード層に `serde` を入れない）で、読み戻しは既存の [`VersionId::new`]・
+//!   [`CreatedAt::from_unix_seconds`]・[`VersionLedger::record`]（重複・件数の検査）を通す。台帳ファイル自体の
+//!   改変（読み取り専用を外して全体を書き直すこと）は検出しない（#491 の契約で範囲外）
 //! - [`VersionLedger::record_file`] は `(root, candidate)` を受け取り、[`crate::path::open_confined`]
 //!   で閉じ込め検証と open を一体で行う。返されたハンドルだけからサイズ上限付きでハッシュを
 //!   計算し、パスを開き直さない（`../`・絶対パス・symlink によるルート外参照と、検証後の差し替え
@@ -30,6 +32,9 @@ use crate::path::{ConfinedPath, PathRejection, open_confined};
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::version_ledger_record::{
+    VERSION_LEDGER_SCHEMA_VERSION, VersionLedgerEntryRecord, VersionLedgerKind, VersionLedgerRecord,
+};
 use std::fmt;
 use std::io::Read as _;
 use std::path::Path;
@@ -379,6 +384,59 @@ impl VersionLedger {
         self.entries.iter().filter(move |e| e.kind == kind)
     }
 
+    /// 台帳ファイルの中身（1 行 JSON＋改行。記録順・キー順固定）を作る（#491）。
+    ///
+    /// # Errors
+    /// 直列化の失敗は [`LedgerError::Internal`]（到達しない想定）。
+    pub fn to_file(&self) -> Result<Vec<u8>, LedgerError> {
+        VersionLedgerRecord {
+            schema_version: VERSION_LEDGER_SCHEMA_VERSION,
+            entries: self
+                .entries
+                .iter()
+                .map(|e| VersionLedgerEntryRecord {
+                    kind: match e.kind {
+                        ArtifactKind::Model => VersionLedgerKind::Model,
+                        ArtifactKind::Data => VersionLedgerKind::Data,
+                        ArtifactKind::Experiment => VersionLedgerKind::Experiment,
+                    },
+                    id: e.id.as_str().to_owned(),
+                    sha256: e.sha256,
+                    created_at_unix: e.created_at.unix_seconds(),
+                })
+                .collect(),
+        }
+        .to_json_line()
+        .map_err(|_| LedgerError::Internal)
+    }
+
+    /// 台帳ファイルの中身を読み戻す（#491）。呼び出し側は読み込み前にサイズ上限
+    /// （`MAX_VERSION_LEDGER_BYTES`）を確認すること。各件は記録順に [`VersionId::new`]・
+    /// [`CreatedAt::from_unix_seconds`]・[`VersionLedger::record`] で検証する。
+    ///
+    /// # Errors
+    /// 形が不正・未知キー・`schema_version` 違いは [`LedgerError::InvalidLedgerFile`]、版 ID・時刻・重複・
+    /// 件数の違反は各検証のエラー。
+    pub fn from_file(bytes: &[u8]) -> Result<Self, LedgerError> {
+        let record = VersionLedgerRecord::from_json_slice(bytes)
+            .map_err(|_| LedgerError::InvalidLedgerFile)?;
+        if record.schema_version != VERSION_LEDGER_SCHEMA_VERSION {
+            return Err(LedgerError::InvalidLedgerFile);
+        }
+        let mut ledger = Self::new();
+        for e in record.entries {
+            let kind = match e.kind {
+                VersionLedgerKind::Model => ArtifactKind::Model,
+                VersionLedgerKind::Data => ArtifactKind::Data,
+                VersionLedgerKind::Experiment => ArtifactKind::Experiment,
+            };
+            let id = VersionId::new(&e.id)?;
+            let created_at = CreatedAt::from_unix_seconds(e.created_at_unix)?;
+            ledger.record(kind, id, e.sha256, created_at)?;
+        }
+        Ok(ledger)
+    }
+
     /// 記録済みの件数。
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -540,6 +598,8 @@ pub enum LedgerError {
         /// 指定された版 ID。
         id: VersionId,
     },
+    /// 台帳ファイルの形が不正（JSON・未知キー・`schema_version` 違い。#491）。
+    InvalidLedgerFile,
     /// 指定した版が先頭で、戻り先の前版が無い。
     NoPreviousVersion {
         /// 対象種別。
@@ -559,7 +619,8 @@ impl LedgerError {
             | LedgerError::CreatedAtOutOfRange { .. }
             | LedgerError::HashMismatch { .. }
             | LedgerError::VersionNotFound { .. }
-            | LedgerError::NoPreviousVersion { .. } => ExitCode::InvalidInput,
+            | LedgerError::NoPreviousVersion { .. }
+            | LedgerError::InvalidLedgerFile => ExitCode::InvalidInput,
             LedgerError::CapacityExceeded { .. } => ExitCode::LimitExceeded,
             LedgerError::ClockUnavailable | LedgerError::Internal => ExitCode::RuntimeError,
             LedgerError::Io(FsError::NotRegularFile { .. }) => ExitCode::InvalidInput,
@@ -605,6 +666,7 @@ impl fmt::Display for LedgerError {
             ),
             LedgerError::ClockUnavailable => f.write_str("system clock is unavailable"),
             LedgerError::Internal => f.write_str("internal ledger inconsistency"),
+            LedgerError::InvalidLedgerFile => f.write_str("version ledger is invalid"),
             LedgerError::Io(e) => write!(f, "{e}"),
             LedgerError::Path(p) => write!(f, "{p}"),
             LedgerError::HashMismatch {
@@ -842,5 +904,94 @@ mod tests {
                 "version v1 of kind model hash mismatch: recorded sha256={V1_HEX}, actual sha256=d121be3103007b41edf96f8262925f8c7d61894afe9a041843b631f69445bc57"
             )
         );
+    }
+
+    /// REQ-39・#491: 台帳ファイルの往復。宣言順のキーで 1 行＋改行、読み戻すと同じ記録で、もう一度書くと
+    /// バイト列が完全一致する。
+    #[test]
+    fn req39_issue491_to_file_from_file_round_trip_is_byte_exact() {
+        let mut l = VersionLedger::new();
+        let d = Sha256Digest::of_bytes(b"model-v1");
+        for (k, v) in [
+            (ArtifactKind::Model, "v1"),
+            (ArtifactKind::Data, "v1"),
+            (ArtifactKind::Experiment, "v1"),
+        ] {
+            l.record(k, id(v), d, at(1_790_000_000)).unwrap();
+        }
+        let bytes = l.to_file().unwrap();
+        let entry = |k: &str| {
+            format!(
+                r#"{{"kind":"{k}","id":"v1","sha256":"{V1_HEX}","created_at_unix":1790000000}}"#
+            )
+        };
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!(
+                "{{\"schema_version\":1,\"entries\":[{},{},{}]}}\n",
+                entry("model"),
+                entry("data"),
+                entry("experiment")
+            )
+        );
+        let back = VersionLedger::from_file(&bytes).unwrap();
+        assert_eq!(back.entries(), l.entries());
+        assert_eq!(back.to_file().unwrap(), bytes);
+        assert!(
+            VersionLedger::from_file(b"{\"schema_version\":1,\"entries\":[]}\n")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// REQ-39・REQ-21・#491: 未知キー・schema_version 違い・不正な ID / hex / 時刻・重複は 64、件数超過は 20。
+    #[test]
+    fn req39_issue491_from_file_rejects_invalid_contents() {
+        let entry = |id: &str, hex: &str, t: u64| {
+            format!(r#"{{"kind":"model","id":"{id}","sha256":"{hex}","created_at_unix":{t}}}"#)
+        };
+        let file = |entries: &[String], schema: u32| {
+            format!(
+                "{{\"schema_version\":{schema},\"entries\":[{}]}}\n",
+                entries.join(",")
+            )
+        };
+        let ok = entry("v1", V1_HEX, 1);
+        let cases = [
+            (
+                file(std::slice::from_ref(&ok), 1).replace("]}", "],\"x\":1}"),
+                "version ledger is invalid",
+            ),
+            (
+                file(std::slice::from_ref(&ok), 2),
+                "version ledger is invalid",
+            ),
+            (
+                file(&[entry("v1", &"A".repeat(64), 1)], 1),
+                "version ledger is invalid",
+            ),
+            (
+                file(&[entry("../v1", V1_HEX, 1)], 1),
+                "version id contains characters outside [A-Za-z0-9._-]",
+            ),
+            (
+                file(&[entry("v1", V1_HEX, CREATED_AT_MAX_UNIX_SECONDS + 1)], 1),
+                "created-at 253402300800 exceeds 253402300799",
+            ),
+            (
+                file(&[ok.clone(), ok.clone()], 1),
+                "version v1 of kind model is already recorded",
+            ),
+        ];
+        for (bytes, message) in cases {
+            let err = VersionLedger::from_file(bytes.as_bytes()).unwrap_err();
+            assert_eq!(err.exit_code(), ExitCode::InvalidInput, "{bytes}");
+            assert_eq!(err.to_string(), message);
+        }
+        let many: Vec<String> = (0..=LEDGER_MAX_ENTRIES)
+            .map(|i| entry(&format!("v{i}"), V1_HEX, 1))
+            .collect();
+        let err = VersionLedger::from_file(file(&many, 1).as_bytes()).unwrap_err();
+        assert_eq!(err.exit_code(), ExitCode::LimitExceeded);
     }
 }

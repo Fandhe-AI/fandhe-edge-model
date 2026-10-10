@@ -18,7 +18,8 @@
 //!
 //! `package` 工程の [`PackageReport`] のフィールドは PoC-16 の package 工程の
 //! 出力名（`step`・`status`・`judgment`・`acceptance_defined`）に、容量内訳と p95 の計測値
-//! （`capacity`・`infer_p95`。#340・REQ-30・REQ-31）を末尾へ足した集合で、載せるのは整数・
+//! （`capacity`・`infer_p95`。#340・REQ-30・REQ-31）と、exit 0・10・12 では記録した版（`version`。
+//! [`PackageVersion`]・#491・REQ-39）を末尾へ足した集合で、載せるのは整数・
 //! bool・固定キーだけ（パス・データ本文は載せない。security.md）。加えて `evaluate` 工程の評価データ
 //! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
 //! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
@@ -594,6 +595,25 @@ pub struct PackageMetrics {
     pub infer_p95: Option<InferP95>,
 }
 
+/// `package` が版管理台帳へ記録した版（REQ-39・#491）。exit 0・10・12 の stdout の末尾（`infer_p95` の後ろ）に
+/// `"version":{"id","previous"}` として載る。exit 20 は `package/` も台帳も作らないため載せない。
+///
+/// `id` は今回の model 版（`v<n>`）、`previous` は `--previous-project-dir` の旧台帳の最新 model 版
+/// （指定なしは `null`）。値はガード層で検証済みの版 ID の文字列。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageVersion {
+    id: String,
+    previous: Option<String>,
+}
+
+impl PackageVersion {
+    /// 版の組を作る。
+    #[must_use]
+    pub fn new(id: String, previous: Option<String>) -> Self {
+        Self { id, previous }
+    }
+}
+
 /// `package` 工程が上限超過（exit 20）で返す JSON（REQ-21・REQ-30・REQ-31・#340）。
 ///
 /// `{"code":"limit_exceeded","message","step":"package","capacity","infer_p95"}`。少なくとも一方の
@@ -667,12 +687,14 @@ pub struct PackageJudgedReport {
     capacity: PackageCapacity,
     /// 上限未設定のときは `null`（スキーマを固定する。#340）。
     infer_p95: Option<InferP95>,
+    /// 記録した版（#491）。
+    version: PackageVersion,
 }
 
 impl PackageJudgedReport {
     /// 合否基準を満たさない結果（exit 10・`judged_fail`）。
     #[must_use]
-    pub fn fail(message: String, metrics: PackageMetrics) -> Self {
+    pub fn fail(message: String, metrics: PackageMetrics, version: PackageVersion) -> Self {
         Self {
             code: crate::exitcode::ExitCode::JudgedFail,
             message,
@@ -681,12 +703,17 @@ impl PackageJudgedReport {
             acceptance_defined: true,
             capacity: metrics.capacity,
             infer_p95: metrics.infer_p95,
+            version,
         }
     }
 
     /// 判定不能の結果（exit 12・`pending`。合格扱いにしない）。
     #[must_use]
-    pub fn undeterminable(message: String, metrics: PackageMetrics) -> Self {
+    pub fn undeterminable(
+        message: String,
+        metrics: PackageMetrics,
+        version: PackageVersion,
+    ) -> Self {
         Self {
             code: crate::exitcode::ExitCode::Pending,
             message,
@@ -695,6 +722,7 @@ impl PackageJudgedReport {
             acceptance_defined: true,
             capacity: metrics.capacity,
             infer_p95: metrics.infer_p95,
+            version,
         }
     }
 
@@ -727,12 +755,14 @@ pub struct PackageReport {
     capacity: PackageCapacity,
     /// 上限未設定のときは `null`（スキーマを固定する。#340）。
     infer_p95: Option<InferP95>,
+    /// 記録した版（#491）。
+    version: PackageVersion,
 }
 
 impl PackageReport {
     /// 合否基準を満たした結果（PoC-16 実測の `judgment:"pass"`）。
     #[must_use]
-    pub fn pass(metrics: PackageMetrics) -> Self {
+    pub fn pass(metrics: PackageMetrics, version: PackageVersion) -> Self {
         Self {
             step: Stage::Package,
             status: StageStatus::Ok,
@@ -740,12 +770,13 @@ impl PackageReport {
             acceptance_defined: true,
             capacity: metrics.capacity,
             infer_p95: metrics.infer_p95,
+            version,
         }
     }
 
     /// 合否基準が未設定の結果（`judgment` は `null`。exit 0）。
     #[must_use]
-    pub fn acceptance_not_defined(metrics: PackageMetrics) -> Self {
+    pub fn acceptance_not_defined(metrics: PackageMetrics, version: PackageVersion) -> Self {
         Self {
             step: Stage::Package,
             status: StageStatus::Ok,
@@ -753,6 +784,7 @@ impl PackageReport {
             acceptance_defined: false,
             capacity: metrics.capacity,
             infer_p95: metrics.infer_p95,
+            version,
         }
     }
 
@@ -1474,6 +1506,13 @@ mod tests {
         }
     }
 
+    /// `version` の期待値（#491）。
+    const V2: &str = r#""version":{"id":"v2","previous":"v1"}"#;
+
+    fn v2() -> PackageVersion {
+        PackageVersion::new("v2".to_string(), Some("v1".to_string()))
+    }
+
     /// REQ-30・#340: components の JSON 断片は 5 項目をこの順で常に出す。
     #[test]
     fn req30_issue340_components_always_five_in_order() {
@@ -1484,11 +1523,11 @@ mod tests {
     #[test]
     fn req33_pass_report_json_is_exact() {
         assert_eq!(
-            PackageReport::pass(metrics(false, None))
+            PackageReport::pass(metrics(false, None), v2())
                 .to_json_line()
                 .expect("json"),
             format!(
-                r#"{{"step":"package","status":"ok","judgment":"pass","acceptance_defined":true,{CAP_OK},"infer_p95":null}}"#
+                r#"{{"step":"package","status":"ok","judgment":"pass","acceptance_defined":true,{CAP_OK},"infer_p95":null,{V2}}}"#
             )
         );
     }
@@ -1497,11 +1536,14 @@ mod tests {
     #[test]
     fn req33_not_defined_report_json_is_exact() {
         assert_eq!(
-            PackageReport::acceptance_not_defined(metrics(false, Some((5000, 6000, false))))
-                .to_json_line()
-                .expect("json"),
+            PackageReport::acceptance_not_defined(
+                metrics(false, Some((5000, 6000, false))),
+                PackageVersion::new("v1".to_string(), None)
+            )
+            .to_json_line()
+            .expect("json"),
             format!(
-                r#"{{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,{CAP_OK},"infer_p95":{{"p95_us":5000,"limit_us":6000,"exceeded":false}}}}"#
+                r#"{{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,{CAP_OK},"infer_p95":{{"p95_us":5000,"limit_us":6000,"exceeded":false}},"version":{{"id":"v1","previous":null}}}}"#
             )
         );
     }
@@ -1510,23 +1552,25 @@ mod tests {
     #[test]
     fn req33_issue328_judged_reports_json_and_exit_code_are_exact() {
         use crate::exitcode::ExitCode;
-        let fail = PackageJudgedReport::fail("judged as fail".to_string(), metrics(false, None));
+        let fail =
+            PackageJudgedReport::fail("judged as fail".to_string(), metrics(false, None), v2());
         assert_eq!(fail.exit_code(), ExitCode::JudgedFail);
         assert_eq!(
             fail.to_json_line().expect("json"),
             format!(
-                r#"{{"code":"judged_fail","message":"judged as fail","step":"package","judgment":"fail","acceptance_defined":true,{CAP_OK},"infer_p95":null}}"#
+                r#"{{"code":"judged_fail","message":"judged as fail","step":"package","judgment":"fail","acceptance_defined":true,{CAP_OK},"infer_p95":null,{V2}}}"#
             )
         );
         let pending = PackageJudgedReport::undeterminable(
             "result is pending".to_string(),
             metrics(false, Some((1, 2, false))),
+            v2(),
         );
         assert_eq!(pending.exit_code(), ExitCode::Pending);
         assert_eq!(
             pending.to_json_line().expect("json"),
             format!(
-                r#"{{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true,{CAP_OK},"infer_p95":{{"p95_us":1,"limit_us":2,"exceeded":false}}}}"#
+                r#"{{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true,{CAP_OK},"infer_p95":{{"p95_us":1,"limit_us":2,"exceeded":false}},{V2}}}"#
             )
         );
     }
@@ -1969,7 +2013,7 @@ mod tests {
     #[test]
     fn req33_report_is_single_line() {
         assert!(
-            !PackageReport::pass(metrics(false, None))
+            !PackageReport::pass(metrics(false, None), v2())
                 .to_json_line()
                 .expect("json")
                 .contains('\n')

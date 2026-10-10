@@ -13,6 +13,7 @@ use fandhe_edge_cli::stage_output::emit_package_outcome;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::stage_report::{
     InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
+    PackageVersion,
 };
 use fandhe_edge_runtime::capacity::{CapacityBreakdown, PackageComponent};
 use fandhe_edge_runtime::capacity_limit::{CapacityLimit, check_capacity_limit};
@@ -59,7 +60,13 @@ fn metrics(limit_bytes: u64, cap_exceeded: bool, p95: Option<(u64, bool)>) -> Pa
 
 fn emit(b: &[LimitBreach], q: PackageQualityJudgment, m: &PackageMetrics) -> (ExitCode, String) {
     let mut out = Vec::new();
-    let code = emit_package_outcome(&mut out, &resolve_package_outcome(b, q), m).unwrap();
+    let code = emit_package_outcome(
+        &mut out,
+        &resolve_package_outcome(b, q),
+        m,
+        Some(&PackageVersion::new("v1".to_string(), None)),
+    )
+    .unwrap();
     (code, String::from_utf8(out).unwrap())
 }
 
@@ -138,7 +145,10 @@ fn req21_equal_to_limit_keeps_quality_outputs() {
     b.extend(lat_breach(100));
     assert!(b.is_empty());
     let m = metrics(1549, false, Some((1, false)));
-    let tail = format!("{},\"infer_p95\":{P95_WITHIN}}}\n", cap_json(1549, false));
+    let tail = format!(
+        "{},\"infer_p95\":{P95_WITHIN},\"version\":{{\"id\":\"v1\",\"previous\":null}}}}\n",
+        cap_json(1549, false)
+    );
 
     let (code, out) = emit(&b, PackageQualityJudgment::Fail, &m);
     assert_eq!(

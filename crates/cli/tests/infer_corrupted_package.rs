@@ -108,6 +108,7 @@ mod unix_only {
                     text: "a".into(),
                     id: None,
                 },
+                version: None,
             }
         }
 

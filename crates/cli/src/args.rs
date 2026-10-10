@@ -132,6 +132,12 @@ const PACKAGE_OPTS: &[OptSpec] = &[
         required: false,
         help: "Allow packaging a smoke-trained candidate (for verification only; not for distribution)",
     },
+    opt(
+        "--previous-project-dir",
+        "DIR",
+        false,
+        "Packaged previous project whose version ledger is carried over (read only; its package is verified against it)",
+    ),
 ];
 const INSPECT_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
@@ -224,6 +230,18 @@ const INFER_OPTS: &[OptSpec] = &[
         false,
         "Output path (only with --input-file)",
     ),
+    opt(
+        "--version-ledger",
+        "PATH",
+        false,
+        "Version ledger to verify the package against (version_ledger.json)",
+    ),
+    opt(
+        "--version-id",
+        "ID",
+        false,
+        "Model version recorded in --version-ledger (default: the latest; only with --version-ledger)",
+    ),
 ];
 
 /// 複数回指定できるオプション（値は指定順に集める。#490）。
@@ -312,6 +330,9 @@ pub struct PackageArgs {
     /// `--allow-smoke`: `train --smoke` で短縮学習した候補の package を許す（検証専用。配布用ではない。
     /// 指定しなければ拒否する。REQ-27）。
     pub allow_smoke: bool,
+    /// `--previous-project-dir`: 版管理台帳を引き継ぐ `package` 済みの旧プロジェクト（cwd 配下。読むだけ。
+    /// REQ-39・#491）。
+    pub previous_project_dir: Option<PathBuf>,
 }
 
 /// `infer` の入力源。同時指定・不整合な組み合わせを型で表現できなくする。
@@ -324,11 +345,23 @@ pub enum InferSource {
     InputFile { path: PathBuf, out: Option<PathBuf> },
 }
 
+/// `infer --version-ledger L [--version-id V]`（前版復帰。REQ-39・TASK-39.6・#491）。`--version-id` だけの
+/// 指定を型で表せないようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferVersion {
+    /// 台帳ファイル（cwd 配下）。
+    pub ledger: PathBuf,
+    /// 照合する model 版 ID（未検証の文字列。省略時は台帳の最新 model 版）。
+    pub id: Option<String>,
+}
+
 /// `infer` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferArgs {
     pub package: PathBuf,
     pub source: InferSource,
+    /// 指定があれば、パッケージの `artifact.json` を版管理台帳の記録と照合する（#491）。
+    pub version: Option<InferVersion>,
 }
 
 /// 解析済みのコマンド。
@@ -398,6 +431,8 @@ pub enum ArgsError {
     IncompatibleOption {
         option: &'static str,
     },
+    /// `--version-id` が `--version-ledger` なしで指定された（#491）。
+    VersionIdWithoutLedger,
     /// パス値（`PATH` / `DIR`）が空文字列。空の `PathBuf` を後段へ渡さない。
     EmptyValue {
         option: &'static str,
@@ -468,6 +503,9 @@ impl fmt::Display for ArgsError {
                     f,
                     "option {option} cannot be used with the chosen input source"
                 )
+            }
+            ArgsError::VersionIdWithoutLedger => {
+                f.write_str("option --version-id requires --version-ledger")
             }
             ArgsError::EmptyValue { option } => {
                 write!(f, "option {option} requires a non-empty value")
@@ -765,6 +803,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         Subcommand::Package => Command::Package(PackageArgs {
             project_dir: v.path("--project-dir")?,
             allow_smoke: v.take("--allow-smoke").is_some(),
+            previous_project_dir: v.opt_path("--previous-project-dir"),
         }),
         Subcommand::Infer => {
             let package = v.path("--package")?;
@@ -772,6 +811,14 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
             let input_file = v.opt_path("--input-file");
             let id = v.opt_string("--id")?;
             let out = v.opt_path("--out");
+            let version = match (
+                v.opt_path("--version-ledger"),
+                v.opt_string("--version-id")?,
+            ) {
+                (Some(ledger), id) => Some(InferVersion { ledger, id }),
+                (None, Some(_)) => return Err(ArgsError::VersionIdWithoutLedger),
+                (None, None) => None,
+            };
             let source = match (text, input_file) {
                 (Some(_), Some(_)) => return Err(ArgsError::ConflictingInferSource),
                 (None, None) => return Err(ArgsError::MissingInferSource),
@@ -788,7 +835,11 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
                     InferSource::InputFile { path, out }
                 }
             };
-            Command::Infer(InferArgs { package, source })
+            Command::Infer(InferArgs {
+                package,
+                source,
+                version,
+            })
         }
     })
 }
@@ -889,7 +940,8 @@ mod tests {
             run(&["package", "--project-dir", "proj"]),
             Command::Package(PackageArgs {
                 project_dir: d,
-                allow_smoke: false
+                allow_smoke: false,
+                previous_project_dir: None,
             })
         );
     }
@@ -933,7 +985,8 @@ mod tests {
             run(&["package", "--project-dir", "proj", "--allow-smoke"]),
             Command::Package(PackageArgs {
                 project_dir: d,
-                allow_smoke: true
+                allow_smoke: true,
+                previous_project_dir: None,
             })
         );
         assert_eq!(
@@ -1240,6 +1293,57 @@ mod tests {
         );
     }
 
+    /// REQ-39・#491: `package --previous-project-dir` と `infer --version-ledger [--version-id]` の解析。
+    /// `--version-id` だけの指定は `invalid_input`。
+    #[test]
+    fn req39_issue491_version_options_parse() {
+        assert_eq!(
+            run(&[
+                "package",
+                "--project-dir",
+                "proj",
+                "--previous-project-dir",
+                "old"
+            ]),
+            Command::Package(PackageArgs {
+                project_dir: "proj".into(),
+                allow_smoke: false,
+                previous_project_dir: Some("old".into()),
+            })
+        );
+        let infer = |extra: &[&str]| {
+            let mut a = vec!["infer", "--package", "pkg", "--text", "t"];
+            a.extend_from_slice(extra);
+            p(&a)
+        };
+        let version_of = |extra: &[&str]| match infer(extra) {
+            Ok(Invocation::Run(Command::Infer(a))) => a.version,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(version_of(&[]), None);
+        assert_eq!(
+            version_of(&["--version-ledger", "l.json"]),
+            Some(InferVersion {
+                ledger: "l.json".into(),
+                id: None
+            })
+        );
+        assert_eq!(
+            version_of(&["--version-id", "v1", "--version-ledger", "l.json"]),
+            Some(InferVersion {
+                ledger: "l.json".into(),
+                id: Some("v1".into())
+            })
+        );
+        let e = infer(&["--version-id", "v1"]).expect_err("id alone");
+        assert_eq!(e, ArgsError::VersionIdWithoutLedger);
+        assert_eq!(args_error_report(&e).code, ExitCode::InvalidInput);
+        assert_eq!(
+            e.to_string(),
+            "option --version-id requires --version-ledger"
+        );
+    }
+
     #[test]
     fn req33_infer_four_shapes() {
         let pkg = PathBuf::from("pkg");
@@ -1250,7 +1354,8 @@ mod tests {
                 source: InferSource::Text {
                     text: "hello".into(),
                     id: None
-                }
+                },
+                version: None
             })
         );
         assert_eq!(
@@ -1260,7 +1365,8 @@ mod tests {
                 source: InferSource::Text {
                     text: "hello".into(),
                     id: Some("a1".into())
-                }
+                },
+                version: None
             })
         );
         assert_eq!(
@@ -1270,7 +1376,8 @@ mod tests {
                 source: InferSource::InputFile {
                     path: "in.jsonl".into(),
                     out: None
-                }
+                },
+                version: None
             })
         );
         assert_eq!(
@@ -1288,7 +1395,8 @@ mod tests {
                 source: InferSource::InputFile {
                     path: "in.jsonl".into(),
                     out: Some("o.jsonl".into())
-                }
+                },
+                version: None
             })
         );
     }
@@ -1302,7 +1410,8 @@ mod tests {
                 source: InferSource::Text {
                     text: "--leading".into(),
                     id: None
-                }
+                },
+                version: None
             })
         );
     }

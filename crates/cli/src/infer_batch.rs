@@ -1024,6 +1024,7 @@ mod tests {
             Command::Infer(InferArgs {
                 package: p(),
                 source,
+                version: None,
             })
         };
         let single = [
@@ -1052,6 +1053,7 @@ mod tests {
             Command::Package(PackageArgs {
                 project_dir: p(),
                 allow_smoke: false,
+                previous_project_dir: None,
             }),
             infer(InferSource::Text {
                 text: "t".to_string(),

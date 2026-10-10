@@ -264,10 +264,14 @@ mod suite {
         )
     }
 
+    /// 初回の `package` が記録する版（前版なし。#491）。
+    const V1: &str = "\"version\":{\"id\":\"v1\",\"previous\":null}";
+
     /// 上限なし（容量の `limit_bytes` は `null`・p95 は `null`）の `package` の出力行の期待値（#340）。
+    /// 公開した結果（exit 0・10・12）なので末尾に初回の版 `v1` が付く（#491）。
     fn package_line(env: &Env, model_dir: &str, head: &str) -> String {
         format!(
-            "{head},{},\"infer_p95\":null}}\n",
+            "{head},{},\"infer_p95\":null,{V1}}}\n",
             capacity_json(env, model_dir, None, false)
         )
     }
@@ -2297,6 +2301,345 @@ mod suite {
         env.ok(&text_args);
     }
 
+    /// 版管理台帳の 3 件の期待値（`id`・作成時刻は共通。#491）。
+    fn ledger_entries(env: &Env, project: &str, id: &str, created_at: &str) -> String {
+        let sha = |rel: &str| {
+            Sha256Digest::of_bytes(&std::fs::read(env.work.join(project).join(rel)).expect("read"))
+                .to_hex()
+        };
+        format!(
+            r#"{{"kind":"model","id":"{id}","sha256":"{}","created_at_unix":{created_at}}},{{"kind":"data","id":"{id}","sha256":"{}","created_at_unix":{created_at}}},{{"kind":"experiment","id":"{id}","sha256":"{}","created_at_unix":{created_at}}}"#,
+            sha("package/artifact.json"),
+            sha("data/train.jsonl"),
+            sha("selection_record.json"),
+        )
+    }
+
+    /// 台帳の先頭の `created_at_unix` の値（実時計のため値は決まらない）。
+    fn first_created_at(ledger: &str) -> String {
+        let rest = ledger
+            .split("\"created_at_unix\":")
+            .nth(1)
+            .expect("created_at_unix");
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        assert!(!digits.is_empty(), "{ledger}");
+        digits
+    }
+
+    /// `infer --package <package> --text alpha [extra...]` の実行結果。
+    fn infer_text(env: &Env, package: &str, extra: &[&str]) -> (i32, String) {
+        let mut args = vec!["infer", "--package", package, "--text", "alpha sample 1"];
+        args.extend_from_slice(extra);
+        env.run(&args)
+    }
+
+    fn invalid_line(message: &str) -> String {
+        format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+    }
+
+    /// REQ-39・REQ-33・TASK-39.3・TASK-39.6・#491: `package` が版管理台帳に model・data・experiment の 3 件
+    /// （`v1`・sha256 は配布用 `artifact.json`・`data/train.jsonl`・`selection_record.json`）を宣言順の 1 行 JSON で
+    /// 書いて読み取り専用にし、既存の台帳があれば `package/` の有無によらず 64 で止める。
+    /// `infer --version-ledger` は一致なら従来と同一の行（単件・`--input-file`）、`artifact.json` の改変・未記録の版・
+    /// `--version-id` 単独・cwd 外の台帳・不正な台帳は 64、2 MiB 超は 20。`kind_version` の拒否は台帳照合より先。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX）。
+    pub fn req39_issue491_package_records_ledger_and_infer_verifies_it() {
+        let env = packaged("ledger");
+        let ledger_path = env.project_file("version_ledger.json");
+        let ledger = std::fs::read_to_string(&ledger_path).expect("ledger");
+        let created_at = first_created_at(&ledger);
+        assert_eq!(
+            ledger,
+            format!(
+                "{{\"schema_version\":1,\"entries\":[{}]}}\n",
+                ledger_entries(&env, "proj", "v1", &created_at)
+            )
+        );
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&ledger_path).expect("meta").permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o400);
+
+        // 既存の台帳は上書きしない（`package/` を消しても同じ）。
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            invalid_line("version ledger already exists")
+        );
+        let package_dir = env.project_file("package");
+        let package_copy = env.work.join("package-copy");
+        copy_dir(&package_dir, &package_copy);
+        std::fs::remove_dir_all(&package_dir).expect("remove package");
+        assert_eq!(
+            env.fails(&PACKAGE, 64, "invalid_input"),
+            invalid_line("version ledger already exists")
+        );
+        assert!(!package_dir.exists());
+        copy_dir(&package_copy, &package_dir);
+        assert_eq!(
+            std::fs::read_to_string(&ledger_path).expect("ledger"),
+            ledger
+        );
+
+        // 一致なら従来と同一の行（単件・最新版の既定・`--version-id v1`・`--input-file`）。
+        let ledger_arg = "proj/version_ledger.json";
+        let plain = infer_text(&env, "proj/package", &[]);
+        assert_eq!(plain.0, 0, "{}", plain.1);
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-ledger", ledger_arg]),
+            plain
+        );
+        assert_eq!(
+            infer_text(
+                &env,
+                "proj/package",
+                &["--version-ledger", ledger_arg, "--version-id", "v1"]
+            ),
+            plain
+        );
+        std::fs::write(
+            env.work.join("batch.jsonl"),
+            "{\"id\":\"a\",\"input\":\"alpha sample 1\"}\n{\"id\":\"b\",\"input\":\"gamma sample 2\"}\n",
+        )
+        .expect("batch");
+        let batch = [
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "batch.jsonl",
+        ];
+        let plain_batch = env.run(&batch);
+        assert_eq!(plain_batch.0, 0, "{}", plain_batch.1);
+        let mut with_ledger = batch.to_vec();
+        with_ledger.extend_from_slice(&["--version-ledger", ledger_arg]);
+        assert_eq!(env.run(&with_ledger), plain_batch);
+
+        // 未記録の版・`--version-id` 単独・不正な版 ID は 64。
+        assert_eq!(
+            infer_text(
+                &env,
+                "proj/package",
+                &["--version-ledger", ledger_arg, "--version-id", "v2"]
+            ),
+            (64, invalid_line("version is not recorded"))
+        );
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-id", "v1"]),
+            (
+                64,
+                invalid_line("option --version-id requires --version-ledger")
+            )
+        );
+        assert_eq!(
+            infer_text(
+                &env,
+                "proj/package",
+                &["--version-ledger", ledger_arg, "--version-id", "../v1"]
+            ),
+            (
+                64,
+                invalid_line("version id contains characters outside [A-Za-z0-9._-]")
+            )
+        );
+
+        // cwd 外の台帳は 64（経路の拒否）。
+        std::fs::copy(&ledger_path, env.base.join("outside.json")).expect("copy outside");
+        let (code, out) = infer_text(
+            &env,
+            "proj/package",
+            &["--version-ledger", "../outside.json"],
+        );
+        assert_eq!(code, 64, "{out}");
+        assert!(
+            out.starts_with("{\"code\":\"invalid_input\",\"message\":\"path rejected: "),
+            "{out}"
+        );
+
+        // 未知キーの台帳は 64、2 MiB 超は 20。
+        std::fs::write(
+            env.work.join("unknown.json"),
+            ledger.replace("]}\n", "],\"x\":1}\n"),
+        )
+        .expect("unknown");
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-ledger", "unknown.json"]),
+            (64, invalid_line("version ledger is invalid"))
+        );
+        std::fs::write(env.work.join("big.json"), vec![b' '; 2 * 1024 * 1024 + 1]).expect("big");
+        let (code, out) = infer_text(&env, "proj/package", &["--version-ledger", "big.json"]);
+        assert_eq!(code, 20, "{out}");
+        assert!(out.starts_with("{\"code\":\"limit_exceeded\","), "{out}");
+
+        // `artifact.json` を 1 バイト変える（末尾に空白。JSON としては有効で台帳なしなら通る）と 64。
+        let meta = env.project_file("package/artifact.json");
+        let original = std::fs::read(&meta).expect("artifact.json");
+        overwrite_read_only(&meta, &[original.as_slice(), b" "].concat());
+        assert_eq!(infer_text(&env, "proj/package", &[]).0, 0);
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-ledger", ledger_arg]),
+            (64, invalid_line("package does not match version ledger"))
+        );
+        // `kind_version` の拒否は台帳照合より先（台帳とも一致しないが、版の拒否が返る）。
+        let text = String::from_utf8(original.clone()).expect("utf8");
+        assert!(text.contains("\"kind_version\":1"), "{text}");
+        overwrite_read_only(
+            &meta,
+            text.replace("\"kind_version\":1", "\"kind_version\":99")
+                .as_bytes(),
+        );
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-ledger", ledger_arg]),
+            (
+                64,
+                invalid_line("kind_version rejected: unsupported_kind_version")
+            )
+        );
+        overwrite_read_only(&meta, &original);
+        assert_eq!(
+            infer_text(&env, "proj/package", &["--version-ledger", ledger_arg]),
+            plain
+        );
+    }
+
+    /// REQ-39・TASK-39.3-2・TASK-39.6・#491: `package --previous-project-dir OLD` は OLD の台帳の全件に今回の 3 件
+    /// （`v2`）を足し、stdout に `"version":{"id":"v2","previous":"v1"}` を載せる。新台帳で旧パッケージは
+    /// `--version-id v1` で通り、`v2`（既定）では 64。OLD の `artifact.json` を 1 バイト変える・OLD の台帳が無い
+    /// ときは 64 で、新プロジェクトに台帳も `package/` も作らない。
+    pub fn req39_issue491_package_previous_project_dir_carries_ledger() {
+        let env = inspected("ledgerprev");
+        for name in ["old", "proj2", "proj3"] {
+            copy_dir(&env.project_file(""), &env.work.join(name));
+        }
+        // 旧は c1 だけ、新は c1・c3 を学習して c3 を選ぶ（配布用 `artifact.json` が旧と異なる）。
+        env.ok(&["train", "--project-dir", "old", "--candidate", "0"]);
+        env.ok(&["select", "--project-dir", "old"]);
+        for name in ["proj", "proj2", "proj3"] {
+            train_and_select(&env, name);
+        }
+        // OLD の台帳が無い（まだ package していない）と 64。
+        assert_eq!(
+            env.fails(
+                &[
+                    "package",
+                    "--project-dir",
+                    "proj",
+                    "--previous-project-dir",
+                    "old"
+                ],
+                64,
+                "invalid_input"
+            ),
+            invalid_line("previous version ledger is missing")
+        );
+        assert!(!env.project_file("version_ledger.json").exists());
+        assert!(!env.project_file("package").exists());
+
+        env.ok(&["package", "--project-dir", "old"]);
+        let old_ledger =
+            std::fs::read_to_string(env.work.join("old/version_ledger.json")).expect("old");
+        let out = env.ok(&[
+            "package",
+            "--project-dir",
+            "proj",
+            "--previous-project-dir",
+            "old",
+        ]);
+        assert!(
+            out.ends_with(",\"infer_p95\":null,\"version\":{\"id\":\"v2\",\"previous\":\"v1\"}}\n"),
+            "{out}"
+        );
+        let ledger =
+            std::fs::read_to_string(env.project_file("version_ledger.json")).expect("ledger");
+        let old_entries = old_ledger
+            .strip_prefix("{\"schema_version\":1,\"entries\":[")
+            .and_then(|r| r.strip_suffix("]}\n"))
+            .expect("old entries");
+        let new_created_at = first_created_at(ledger.split(",\"id\":\"v2\"").nth(1).expect("v2"));
+        assert_eq!(
+            ledger,
+            format!(
+                "{{\"schema_version\":1,\"entries\":[{old_entries},{}]}}\n",
+                ledger_entries(&env, "proj", "v2", &new_created_at)
+            )
+        );
+
+        // 前版復帰: 旧パッケージは v1 で通り、既定（最新の v2）では一致しない。新パッケージは v2 で通る。
+        let ledger_arg = "proj/version_ledger.json";
+        let old_plain = infer_text(&env, "old/package", &[]);
+        assert_eq!(old_plain.0, 0, "{}", old_plain.1);
+        assert_eq!(
+            infer_text(
+                &env,
+                "old/package",
+                &["--version-ledger", ledger_arg, "--version-id", "v1"]
+            ),
+            old_plain
+        );
+        assert_eq!(
+            infer_text(&env, "old/package", &["--version-ledger", ledger_arg]),
+            (64, invalid_line("package does not match version ledger"))
+        );
+        let new_plain = infer_text(&env, "proj/package", &[]);
+        assert_eq!(
+            infer_text(
+                &env,
+                "proj/package",
+                &["--version-ledger", ledger_arg, "--version-id", "v2"]
+            ),
+            new_plain
+        );
+
+        // OLD の `artifact.json` を 1 バイト変えると、引き継ぎを拒否して何も作らない。
+        let meta = env.work.join("old/package/artifact.json");
+        let original = std::fs::read(&meta).expect("artifact.json");
+        overwrite_read_only(&meta, &[original.as_slice(), b" "].concat());
+        assert_eq!(
+            env.fails(
+                &[
+                    "package",
+                    "--project-dir",
+                    "proj2",
+                    "--previous-project-dir",
+                    "old"
+                ],
+                64,
+                "invalid_input"
+            ),
+            invalid_line("previous package does not match its version ledger")
+        );
+        assert!(!env.work.join("proj2/version_ledger.json").exists());
+        assert!(!env.work.join("proj2/package").exists());
+        // OLD の `package/artifact.json` が無いときも同じ拒否。
+        std::fs::remove_file(&meta).expect("remove artifact.json");
+        assert_eq!(
+            env.fails(
+                &[
+                    "package",
+                    "--project-dir",
+                    "proj2",
+                    "--previous-project-dir",
+                    "old"
+                ],
+                64,
+                "invalid_input"
+            ),
+            invalid_line("previous package does not match its version ledger")
+        );
+        // 元に戻せば引き継げる（proj3 は OLD の台帳から v2 になる）。
+        std::fs::write(&meta, &original).expect("restore");
+        let out = env.ok(&[
+            "package",
+            "--project-dir",
+            "proj3",
+            "--previous-project-dir",
+            "old",
+        ]);
+        assert!(
+            out.ends_with(",\"version\":{\"id\":\"v2\",\"previous\":\"v1\"}}\n"),
+            "{out}"
+        );
+    }
+
     /// `out_of_scope_label` を（あれば）定義へ足して package までを通した環境（#478）。
     fn packaged_with_out_of_scope(case: &str, out_of_scope: Option<&str>) -> Env {
         let env = Env::new(case, false);
@@ -3889,6 +4232,11 @@ mod suite {
         let out = env.ok(&PACKAGE);
         let head = format!("{NULL_HEAD},{},", capacity_json(&env, C1_DIR, None, false));
         assert!(out.starts_with(&head), "{out}");
+        // 公開した結果は末尾に版が付く（#491）。p95 の検査はその手前までで行う。
+        let out = out
+            .strip_suffix(&format!(",{V1}}}\n"))
+            .map(|h| format!("{h}}}\n"))
+            .expect("version tail");
         assert_p95_tail(&out, 3_600_000_000, false);
         assert!(env.project_file("package/artifact.json").is_file());
     }
@@ -5655,6 +6003,14 @@ fn main() -> std::process::ExitCode {
         (
             "infer_rejects_tampered_package",
             suite::infer_rejects_tampered_package,
+        ),
+        (
+            "req39_issue491_package_records_ledger_and_infer_verifies_it",
+            suite::req39_issue491_package_records_ledger_and_infer_verifies_it,
+        ),
+        (
+            "req39_issue491_package_previous_project_dir_carries_ledger",
+            suite::req39_issue491_package_previous_project_dir_carries_ledger,
         ),
         (
             "select_rejects_request_validation_not_matching_split",

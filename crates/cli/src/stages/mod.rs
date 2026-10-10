@@ -129,7 +129,9 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Completed(r))) => {
             write_stage_line(out, r.to_json_line())
         }
-        Ok(Done::Package(r)) => emit_package_outcome(out, &r.outcome, &r.metrics),
+        Ok(Done::Package(r)) => {
+            emit_package_outcome(out, &r.outcome, &r.metrics, r.version.as_ref())
+        }
         Err(report) => emit_error_report(out, &report),
     }
 }
