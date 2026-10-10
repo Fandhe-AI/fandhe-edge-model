@@ -1,8 +1,8 @@
 //! 診断レポートの基礎統計（行数・ユニーク数・ラベル別件数）。
 //!
-//! CLI の `evaluate` 工程（配線は issue #140 で未実装）が、学習データ・評価データの
+//! CLI の `evaluate` 工程（`diagnostics` 欄。#492）が、学習データ・評価データの
 //! それぞれについて 1 回ずつ [`basic_stats`] を呼び、精度の変化要因を読み解く材料を
-//! 得る想定（REQ-29 正常系・TASK-29.1-1・issue #107）。定義は PoC-11 の
+//! 得る（REQ-29 正常系・TASK-29.1-1・issue #107）。定義は PoC-11 の
 //! `build_series.py::stat_of`（rows / unique_inputs / unique_outputs / label_counts）
 //! に対応する。期待値の出典ではなく統計の定義の出典であり、テストは手組みの合成
 //! データ（証拠種別: テストハーネス）で検証する。
@@ -43,7 +43,7 @@
 //! 傾向の目安であり保証ではなく、合否判定には使わない（精度の目安は REQ-29 で検討中）。
 //! 数えるのは学習データの行数のみで、複製行の割引（`unique_inputs`）は行わない。
 //!
-//! 未実装: group 数、JSON 直列化（CLI 層。`evaluate` 配線は #140）。
+//! 未実装: group 数。JSON 直列化は CLI 層が担う（`evaluate` の `diagnostics`。#492）。
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -773,8 +773,8 @@ impl DiagnosticReport {
 /// 旧のラベル集合と比べ、宣言ラベル数が異なれば限界注記を付与する（REQ-29 異常系・
 /// TASK-29.2・issue #109）。
 ///
-/// CLI の `evaluate` 工程（配線は #140）が、前回パッケージの選択肢 ID 等を
-/// `previous_labels`（宣言順）として渡す想定。比較は宣言ラベル数（観測数ではない）で行い、
+/// CLI の `evaluate` 工程（`--previous-project-dir` のとき。#492）が、前回の選択肢 ID 等を
+/// `previous_labels`（宣言順）として渡す。比較は宣言ラベル数（観測数ではない）で行い、
 /// 評価データで未出現のラベルがあるだけでは注記しない。レポートは値で受け取り返す
 /// （共有入力を書き換えない。REQ-27）。冪等: 既存の
 /// [`DiagnosticLimitation::LabelCountChanged`] は置き換え、同数なら取り除く
@@ -821,7 +821,7 @@ fn check_label_order(
 /// 基礎統計（学習・評価）と評価器の出力から診断レポートを組み立てる（REQ-29 正常系・
 /// TASK-29.1-2）。
 ///
-/// CLI の `evaluate` 工程（配線は #140）が、評価を実行した場合にのみ呼ぶ想定。評価データが
+/// CLI の `evaluate` 工程（#492）が、評価を実行した場合にのみ呼ぶ。評価データが
 /// 無く `skipped` の場合は混同行列が無いため本レポートは作らない（CLI 側の分岐）。
 /// 評価データの行と評価レコードが 1 対 1 で渡される前提で、`eval.n_rows` と
 /// `metrics.n_total` の一致、両基礎統計のラベル並びと `metrics.per_label` の一致、評価側のラベル別件数と

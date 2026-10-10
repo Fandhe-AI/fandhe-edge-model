@@ -7,9 +7,9 @@
 //! [`crate::metrics::evaluate_single_select`] に渡して得た指標から
 //! 保留込み／保留なしの誤り率を比較する（[`compare_abstention`]）。
 //!
-//! CLI の `evaluate` 工程（REQ-33・issue #140）から、校正済みの
+//! CLI の `evaluate` 工程（REQ-33・#479）から、校正済みの
 //! [`crate::calibration::Calibration`] と評価データ（validation に限らない）を
-//! 渡して呼ばれる想定（本モジュール自体は推論経路には入らない。`lib.rs`
+//! 渡して呼ばれる（本モジュール自体は推論経路には入らない。`lib.rs`
 //! 「層の境界・不変条件」参照）。
 //!
 //! # 評価契約との関係（REQ-17・REQ-27）
@@ -61,11 +61,10 @@
 //!
 //! # 対象外（本モジュールが扱わないこと）
 //!
-//! - 定義ファイルで対象外ラベルを指定する方法（REQ-15 のスキーマ変更で、設計と
-//!   承認が要る）。評価器は `fandhe-edge-core::definition` に依存せず、ID を
-//!   呼び出し側から受け取る
-//! - core の判定型 `out_of_scope` 状態の追加・CLI への配線・終了コード 11 への
-//!   写像（issue #140・TASK-33.x）
+//! - 定義ファイルで対象外ラベルを指定する方法（定義の `out_of_scope_label`。#478）。
+//!   評価器は `fandhe-edge-core::definition` に依存せず、ID を呼び出し側から受け取る
+//! - core の判定型 `out_of_scope` 状態・CLI への配線・終了コード 11 への写像
+//!   （core と cli の `infer`・`evaluate` が担う。#478）
 //! - REQ-22 正常系の 95% ブートストラップ信頼区間（PoC-12 は `n_boot=2000`・
 //!   `seed=12` の対応のあるブートストラップを使うが、本 issue の受入は
 //!   具体値での比較のみ。実装には乱数と依存の判断が要る）
@@ -155,8 +154,8 @@ impl AbstentionDecision {
 /// 判定時に同じ `calibration` のラベル集合と一致することを再検証する
 /// （別の校正結果との取り違えを fail-closed で拒否。REQ-17・REQ-27）。
 /// フィールドは非公開で、構築は [`OutOfScopeLabel::new`] に集約する。
-/// CLI の `evaluate` 工程（issue #140）が、定義ファイル側の指定に基づいて
-/// 構築して渡す想定。
+/// CLI の `evaluate` 工程（#478）が、定義の `out_of_scope_label` に基づいて
+/// 構築して渡す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutOfScopeLabel {
     index: usize,
