@@ -412,6 +412,11 @@ mod tests {
         }
     }
 
+    /// 記録した版（`v1`・前版なし。#491）。
+    fn sample_version() -> fandhe_edge_core::stage_report::PackageVersion {
+        fandhe_edge_core::stage_report::PackageVersion::new("v1".to_string(), None)
+    }
+
     fn choice(id: &str) -> Choice {
         Choice {
             id: id.to_string(),
@@ -629,13 +634,13 @@ mod tests {
     #[test]
     fn req33_write_package_report_writes_line_and_propagates_failure() {
         let mut buffer: Vec<u8> = Vec::new();
-        let report = PackageReport::pass(sample_metrics(false, None));
+        let report = PackageReport::pass(sample_metrics(false, None), sample_version());
         let code = write_package_report(&mut buffer, &report).unwrap();
         assert_eq!(code, ExitCode::Ok);
         assert_eq!(
             String::from_utf8(buffer).unwrap(),
             format!(
-                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null}}\n"
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null,\"version\":{{\"id\":\"v1\",\"previous\":null}}}}\n"
             )
         );
 
@@ -655,20 +660,24 @@ mod tests {
     #[test]
     fn req33_issue328_write_package_judged_report_writes_line_and_returns_exit_code() {
         let mut buffer: Vec<u8> = Vec::new();
-        let report =
-            PackageJudgedReport::fail("judged as fail".to_string(), sample_metrics(false, None));
+        let report = PackageJudgedReport::fail(
+            "judged as fail".to_string(),
+            sample_metrics(false, None),
+            sample_version(),
+        );
         let code = write_package_judged_report(&mut buffer, &report).unwrap();
         assert_eq!(code, ExitCode::JudgedFail);
         assert_eq!(
             String::from_utf8(buffer).unwrap(),
             format!(
-                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null}}\n"
+                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{SAMPLE_CAPACITY_OK},\"infer_p95\":null,\"version\":{{\"id\":\"v1\",\"previous\":null}}}}\n"
             )
         );
         let mut buffer: Vec<u8> = Vec::new();
         let report = PackageJudgedReport::undeterminable(
             "result is pending".to_string(),
             sample_metrics(false, None),
+            sample_version(),
         );
         assert_eq!(
             write_package_judged_report(&mut buffer, &report).unwrap(),

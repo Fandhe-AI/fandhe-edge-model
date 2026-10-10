@@ -16,17 +16,24 @@
 //!    `kind rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う（fail-closed）
 //! 5. `kind_version` を `kind` ごとの許可リスト（`KindVersionAllowlist::supported()`）で検査する。
 //!    拒否は `kind_version rejected: <reason_code>`・64。**モデルのバイト列に触れる前**に行う
-//! 6. `onnx_file` を、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
+//! 6. `--version-ledger L` があるときだけ、2 で読んだ `artifact.json` のバイト列の sha256 を台帳の
+//!    `(model, V)` の記録と照合する（[`verify_against_ledger`]。前版復帰。REQ-39・TASK-39.6・#491）。
+//!    `V` は `--version-id`、省略時は台帳の最新 model 版。`L` は cwd 配下へ閉じ込めて上限
+//!    （`MAX_VERSION_LEDGER_BYTES`）つきで読む。未記録は `version is not recorded`、不一致は
+//!    `package does not match version ledger`（いずれも 64）。ONNX を開く前に行う
+//! 7. `onnx_file` を、パッケージ配下（かつ workspace 配下）の ONNX ファイルを開き、
 //!    拡張子（`.onnx`）を確認し、保持した fd を上限（`MAX_MODEL_FILE_BYTES`）付きで読み切って
 //!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
 //!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
 //!
 //! # 未検証の項目（「検証済み」ではない）
 //!
-//! 本モジュールが行うのは経路の閉じ込めと形式の許可制のみ。次は**まだ検査していない**ため、
+//! 本モジュールが行うのは経路の閉じ込め・形式の許可制と、指定時の版管理台帳との照合のみ。次は**まだ検査していない**ため、
 //! 戻り値を「完全性・版まで検証済み」と扱ってはならない。
 //!
-//! - 完全性（モデルの sha256 照合・ハッシュ一致の検証）: #168（TASK-39.3-2。親 #166）
+//! - 完全性（モデルの sha256 照合）: `--version-ledger` を指定したときだけ、`artifact.json` を台帳と照合する
+//!   （ONNX・語彙・校正は `artifact.json` の記録との一致を `stages::infer` が確認するので、台帳の 1 件で
+//!   束縛される。#491）。指定しなければ外部台帳による照合は行わない。台帳ファイル自体の改変は検出しない
 //! - 読み込み前のサイズ上限の正式値: #172（TASK-39.5-3）
 //!
 //! パッケージ形式のうち sha256 の欄は未定義で、形式の確定は TASK-28・TASK-32 で行う。`kind_version` の許可リスト検査は TASK-39.6-1（#174）で実装済み。
@@ -49,17 +56,20 @@
 use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::{ArtifactOnnxRef, MAX_ARTIFACT_META_BYTES};
-use fandhe_edge_core::exitcode::ErrorReport;
+use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
+use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::version_ledger_record::MAX_VERSION_LEDGER_BYTES;
 use fandhe_edge_guard::format::{CheckedFile, FormatAllowlist, FormatRejection, check_open_file};
 use fandhe_edge_guard::kind::{CheckedKind, KindAllowlist};
 use fandhe_edge_guard::kind_version::{CheckedKindVersion, KindVersionAllowlist};
 use fandhe_edge_guard::model_file::MODEL_FILE_EXTENSION;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
-use fandhe_edge_guard::path::ConfinedPath;
+use fandhe_edge_guard::path::{ConfinedPath, open_confined};
+use fandhe_edge_guard::version_ledger::{ArtifactKind, VersionId, VersionLedger};
 use fandhe_edge_runtime::onnx::MAX_MODEL_FILE_BYTES;
 
-use crate::args::InferArgs;
+use crate::args::{InferArgs, InferVersion};
 use crate::error_report::ToErrorReport;
 
 /// パッケージ内のメタデータのファイル名（パッケージ形式の確定は TASK-28/32）。
@@ -67,8 +77,8 @@ const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 経路の閉じ込めと形式の許可制のみを通過した `infer` の入力。
 ///
-/// **完全性（sha256）は未検証**（#168。モジュール doc 参照）。改変されたモデルでも、経路・形式・版が
-/// 正しければ返る。`kind_version` は許可リスト検査済み。
+/// **完全性（sha256）は `--version-ledger` 指定時の `artifact.json` の照合のみ**（#491。モジュール doc 参照）。
+/// 台帳を指定しなければ、改変されたモデルでも経路・形式・版が正しければ返る。`kind_version` は許可リスト検査済み。
 #[derive(Debug)]
 pub struct PathFormatCheckedInputs {
     /// 許可リストで検査済みの `kind`（`&'static str`。入力の文字列は流れない）。
@@ -81,10 +91,15 @@ pub struct PathFormatCheckedInputs {
     pub onnx: CheckedFile,
     /// `onnx` の実パス（表示・診断用。開き直さない）。
     pub onnx_path: ConfinedPath,
+    /// 検査に使った `artifact.json` のバイト列（台帳と照合済みならその内容。`stages::infer` は開き直さず
+    /// これを解析する。#491）。
+    pub meta_bytes: Vec<u8>,
 }
 
-/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式のみ検査する。
-/// sha256 は検査しない（#168）。`kind_version` は許可リストで検査する（#174）。
+/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式を検査する。
+/// `kind_version` は許可リストで検査する（#174）。`args.version`（`--version-ledger`）があるときだけ、ONNX を
+/// 開く前に `artifact.json` のバイト列の sha256 を版管理台帳と照合する（#491）。ONNX・定義などパッケージ内の
+/// sha256 の自己整合は `stages::infer` が `artifact.json` の記録と照合する。
 ///
 /// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
 ///
@@ -114,6 +129,10 @@ pub fn check_infer_path_and_format(
     let kind_version = KindVersionAllowlist::supported()
         .check(kind, onnx_ref.kind_version())
         .map_err(|e| e.to_error_report())?;
+    // 前版復帰の照合も ONNX を開く前に行う（REQ-39・TASK-39.6・#491）。
+    if let Some(version) = &args.version {
+        verify_against_ledger(workspace, version, &bytes)?;
+    }
     let (onnx, onnx_path) = package
         .open_member(Path::new(onnx_ref.onnx_file()))
         .map_err(|e| e.to_error_report())?;
@@ -142,5 +161,43 @@ pub fn check_infer_path_and_format(
         package,
         onnx,
         onnx_path,
+        meta_bytes: bytes,
     })
+}
+
+/// `artifact.json` のバイト列（`meta_bytes`）の sha256 が、版管理台帳の `(model, V)` の記録と一致するか確認する
+/// （REQ-39・TASK-39.6・#491）。`V` は `--version-id`、省略時は台帳の最新 model 版。`package/` には何も書かない。
+///
+/// # Errors
+/// 台帳の経路の拒否（cwd 外・cwd 外を指す symlink 等）は経路の写像、上限超過は `limit_exceeded`、形の不正は
+/// `version ledger is invalid`（[`fandhe_edge_guard::version_ledger::LedgerError::exit_code`] の写像）、
+/// 不正な版 ID はその検証の固定文、未記録は `version is not recorded`、不一致は
+/// `package does not match version ledger`（いずれも 64）。メッセージはパスを含めない。
+fn verify_against_ledger(
+    workspace: &Path,
+    version: &InferVersion,
+    meta_bytes: &[u8],
+) -> Result<(), ErrorReport> {
+    let (file, path) =
+        open_confined(workspace, &version.ledger).map_err(|e| e.to_error_report())?;
+    let bytes = read_bounded_open_file(file, path.as_path(), MAX_VERSION_LEDGER_BYTES)
+        .map_err(|e| crate::project::fs_report(&e))?;
+    let ledger = VersionLedger::from_file(&bytes)
+        .map_err(|e| ErrorReport::new(e.exit_code(), "version ledger is invalid"))?;
+    let entry = match &version.id {
+        Some(raw) => {
+            let id =
+                VersionId::new(raw).map_err(|e| ErrorReport::new(e.exit_code(), e.to_string()))?;
+            ledger.get(ArtifactKind::Model, &id)
+        }
+        None => ledger.versions_of(ArtifactKind::Model).last(),
+    }
+    .ok_or_else(|| ErrorReport::new(ExitCode::InvalidInput, "version is not recorded"))?;
+    if *entry.sha256() != Sha256Digest::of_bytes(meta_bytes) {
+        return Err(ErrorReport::new(
+            ExitCode::InvalidInput,
+            "package does not match version ledger",
+        ));
+    }
+    Ok(())
 }

@@ -10,10 +10,16 @@ use fandhe_edge_cli::stage_output::emit_package_outcome;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::stage_report::{
     PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
+    PackageVersion,
 };
 use fandhe_edge_runtime::package_outcome::{PackageQualityJudgment, resolve_package_outcome};
 
-const PASS_LINE: &str = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,\"capacity\":{\"total_bytes\":10,\"limit_bytes\":40000000,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":10,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":0,\"file_count\":0},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":0,\"file_count\":0}}},\"infer_p95\":null}\n";
+const PASS_LINE: &str = "{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,\"capacity\":{\"total_bytes\":10,\"limit_bytes\":40000000,\"exceeded\":false,\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{\"weights\":{\"bytes\":10,\"file_count\":1},\"vocab_or_feature_transform\":{\"bytes\":0,\"file_count\":0},\"label_table\":{\"bytes\":0,\"file_count\":0},\"calibration\":{\"bytes\":0,\"file_count\":0},\"metadata\":{\"bytes\":0,\"file_count\":0}}},\"infer_p95\":null,\"version\":{\"id\":\"v1\",\"previous\":null}}\n";
+
+/// 記録した版（#491）。
+fn version() -> PackageVersion {
+    PackageVersion::new("v1".to_string(), None)
+}
 
 /// 合成の計測値（重み 10 バイト・p95 の上限なし。#340）。
 fn metrics() -> PackageMetrics {
@@ -35,7 +41,8 @@ fn metrics() -> PackageMetrics {
 fn req33_package_pass_writes_single_json_and_exit_zero() {
     let mut stdout = Vec::new();
     let outcome = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
-    let code = emit_package_outcome(&mut stdout, &outcome, &metrics()).expect("emit");
+    let code =
+        emit_package_outcome(&mut stdout, &outcome, &metrics(), Some(&version())).expect("emit");
 
     assert_eq!(code, ExitCode::Ok);
     assert_eq!(
@@ -55,7 +62,7 @@ fn req33_logs_go_to_stderr_and_never_reach_stdout() {
         log.info(Subcommand::Package, "start");
         log.info(Subcommand::Package, "measuring package");
         let outcome = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
-        emit_package_outcome(&mut stdout, &outcome, &metrics()).expect("emit");
+        emit_package_outcome(&mut stdout, &outcome, &metrics(), Some(&version())).expect("emit");
         log.info(Subcommand::Package, "done");
     }
 

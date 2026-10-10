@@ -8,7 +8,10 @@
 //!    以降パスから開き直さない。TOCTOU 対策）
 //! 2. 同じ閉じ込め済みパッケージから `artifact.json`（拡張メタ）と `definition.json` を上限付きで
 //!    読み、`onnx_sha256` と保持した ONNX のバイト列の sha256 の一致（パッケージの自己整合性）・
-//!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する
+//!    `label_order` と定義の選択肢の宣言順の一致・`max_bytes` の範囲を確認する。`artifact.json` に
+//!    `definition_sha256`（`package` が配布用にだけ書く）があれば、読んだ `definition.json` のバイト列の sha256 と
+//!    照合し、不一致は `package definition does not match its recorded hash`（64）。欄の無い旧パッケージは照合しない
+//!    （REQ-39・#491）
 //! 3. `calibration.json`（`package` が評価記録に校正があるときだけ書き、`artifact.json` に
 //!    `calibration_sha256` を記す）を同じ閉じ込めと上限（`MAX_DEFINITION_FILE_BYTES`）で読み、記録の sha256
 //!    との一致（欠落・記録なしの同梱も拒否）、`onnx_sha256`・`label_order` が保持した ONNX・定義と一致し、
@@ -26,8 +29,10 @@
 //!
 //! # 未検証の項目（「検証済み」ではない）
 //!
-//! 外部台帳による sha256 完全性（#168）・版管理台帳による前版への復帰（#174）は未検証。ここで
-//! 行う sha256 照合は、パッケージ自身が記す値との一致だけを確認する。`kind_version` は
+//! `--version-ledger L [--version-id V]` を指定したときだけ、`artifact.json` を版管理台帳の model 版と照合する
+//! （前版復帰。ガードの [`check_infer_path_and_format`] が `kind_version` の後・ONNX を開く前に行う。REQ-39・
+//! TASK-39.6・#491）。`package/` は変えない（物理コピー・現在版ポインタなし）。指定しなければ、ここで
+//! 行う sha256 照合はパッケージ自身が記す値との一致だけを確認する。台帳ファイル自体の改変は検出しない。`kind_version` は
 //! 許可リスト（[`ALLOWED_KIND_VERSIONS`]）で検証し、未許可の版は `invalid_input` で拒否する（REQ-39）。
 
 use std::ffi::OsString;
@@ -36,7 +41,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, MAX_ARTIFACT_META_BYTES};
+use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
@@ -62,9 +67,6 @@ use crate::output::write_stage_line;
 use crate::project::{
     DEFINITION_FILE, fs_report, invalid, parse_definition, runtime, write_rejection,
 };
-
-/// パッケージ内のメタデータのファイル名。
-const ARTIFACT_META_FILE: &str = "artifact.json";
 
 /// 推論を許可する `kind_version` の許可リスト（REQ-39。`kind` ごとに列挙する）。
 ///
@@ -380,14 +382,9 @@ pub(crate) fn load_backend(
 fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
     let checked = check_infer_path_and_format(cwd, args)?;
 
-    let (meta_file, meta_path) = checked
-        .package
-        .open_member(Path::new(ARTIFACT_META_FILE))
-        .map_err(|e| e.to_error_report())?;
-    let meta_bytes =
-        read_bounded_open_file(meta_file, meta_path.as_path(), MAX_ARTIFACT_META_BYTES)
-            .map_err(|e| fs_report(&e))?;
-    let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
+    // ガードが検査（`--version-ledger` があれば台帳と照合）したバイト列そのものを解析する
+    // （開き直さない。照合後の差し替えを受けない。#491）。
+    let meta = ArtifactMeta::parse(&checked.meta_bytes).map_err(|e| e.to_error_report())?;
 
     let (def_file, def_path) = checked
         .package
@@ -395,17 +392,26 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         .map_err(|e| e.to_error_report())?;
     let def_bytes = read_bounded_open_file(def_file, def_path.as_path(), MAX_DEFINITION_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
+    // 配布用 `artifact.json` に `definition_sha256` があれば、保持 fd から読んだこのバイト列と照合し、照合した
+    // バイト列そのものを解析する（再読込しない）。欄の無い旧パッケージは従来どおり（REQ-39・#491）。
+    if meta
+        .definition_sha256()
+        .is_some_and(|recorded| recorded != Sha256Digest::of_bytes(&def_bytes).to_hex())
+    {
+        return Err(invalid(
+            "package definition does not match its recorded hash",
+        ));
+    }
     let definition = parse_definition(&def_bytes)?;
 
-    // ガードが開いた ONNX の実体パスと、ここで読み直したメタデータの `onnx_file` が同じ対象を指す
-    // ことを確認する（`artifact.json` を 2 回読むため、間の差し替えを検出する。バイト列は
+    // ガードが開いた ONNX の実体パスと、メタデータの `onnx_file` が同じ対象を指すことを確認する
+    // （ガードの簡易リーダーと拡張メタのリーダーの解釈の食い違いを検出する。バイト列は
     // 次の sha256 照合でも束縛される）。
     if !checked.onnx_path.as_path().ends_with(meta.onnx_file()) {
         return Err(invalid("artifact metadata does not match the model file"));
     }
-    // 再読込したメタデータの `kind` が、ガードが検査した `kind` と一致することを確認する
-    // （2 回の読み込みの間に `artifact.json` を差し替えられても、検査した `kind` と別の `kind` で
-    // バックエンドを組み立てない。REQ-39）。
+    // 拡張メタの `kind` が、ガードが検査した `kind` と一致することを確認する
+    // （検査した `kind` と別の `kind` でバックエンドを組み立てない。REQ-39）。
     if meta.kind() != checked.kind.as_str() {
         return Err(invalid("artifact metadata does not match the model file"));
     }

@@ -35,7 +35,9 @@
 //! `calibration` 枠に計上する。評価データが無い・`calibration:null` では書かない（`infer` は保留しない）。
 //! 校正を同梱するときは、配布用の `package/artifact.json` の末尾に `calibration_sha256`（`calibration.json`
 //! 全体の sha256）を追記し、`infer` が τ の改変・ファイルの削除を検出できるようにする
-//! （[`with_calibration_sha256`]。REQ-39）。候補側の `candidates/<N>/artifact.json` と、評価記録の
+//! （[`with_package_hashes`]。REQ-39）。続けて常に `definition_sha256`（`package/definition.json` のバイト列の
+//! sha256）を追記し、`infer` が定義の改変を検出できるようにする（版管理台帳の model ハッシュ〔配布用
+//! `artifact.json`〕が定義にも束縛される。#491）。候補側の `candidates/<N>/artifact.json` と、評価記録の
 //! `artifact_meta_sha256` の照合対象（候補側のバイト列）は変えない。校正なしでは学習ワーカーの出力のまま。
 //!
 //! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
@@ -74,6 +76,20 @@
 //!
 //! 評価記録の `correct` は
 //! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
+//!
+//! # 版管理台帳（#491・REQ-39・TASK-39.3・TASK-39.6）
+//!
+//! `package` だけが `<project>/version_ledger.json`（形式は core の `version_ledger_record`）を書く。1 回の公開で
+//! 同じ `id`（`v<n>`。n は台帳の model 件数＋1）の 3 件を記録する: model ＝ 配布用 `package/artifact.json` の
+//! バイト列、data ＝ `data/train.jsonl`、experiment ＝ `selection_record.json`（[`next_version_ledger`]）。
+//! 既存の台帳があれば `package/` の有無によらず `version ledger already exists`（64）で止める（上書きしない）。
+//! `--previous-project-dir OLD` は OLD の台帳を読み（無い・不正は 64）、OLD の最新 model 版を、OLD の保持 fd
+//! 起点で読んだ `package/artifact.json` のバイト列の sha256 と照合し（不一致・欠落は 64
+//! `previous package does not match its version ledger`）、OLD の全件に今回の 3 件を足す。台帳は合否・容量の
+//! 確定後、`package/` の公開の直前に原子的に新規作成（一時名＋fsync＋NOREPLACE）して読み取り専用にし、
+//! 公開に失敗したら消す（[`finalize_staging`]）。data のハッシュは検査に使った `train.jsonl` のバイト列から計算する。
+//! 上限超過（exit 20）では公開しないので台帳も作らず、stdout にも `version` を載せない。台帳ファイル自体の
+//! 改変（読み取り専用を外して全体を書き直すこと）は検出しない（#491 の契約で範囲外）。
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -88,7 +104,9 @@ use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
 use fandhe_edge_core::stage_report::{
     InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
+    PackageVersion,
 };
+use fandhe_edge_core::version_ledger_record::{MAX_VERSION_LEDGER_BYTES, VERSION_LEDGER_FILE};
 use fandhe_edge_data::eval_freeze::FreezeRecord;
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::SplitResult;
@@ -96,6 +114,7 @@ use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
+use fandhe_edge_guard::version_ledger::{ArtifactKind, CreatedAt, VersionId, VersionLedger};
 use fandhe_edge_runtime::capacity::{
     CapacityBreakdown, MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
@@ -122,8 +141,9 @@ use fandhe_edge_train::stage_files::SelectionRecord;
 use crate::args::PackageArgs;
 use crate::error_report::{ToErrorReport, acquire_error_report};
 use crate::project::{
-    CreatedDir, DEFINITION_FILE, EVALUATION_RECORD_FILE, PACKAGE_DIR, PACKAGE_STAGING_DIR, Project,
-    SELECTION_FILE, inspect_bytes, invalid, parse_definition, runtime,
+    CreatedDir, DATA_DIR, DEFINITION_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES,
+    PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE, TRAIN_DATA_FILE, inspect_bytes,
+    invalid, parse_definition, runtime,
 };
 
 use super::baseline::{PreparedBaseline, prepare_baseline, record_matches};
@@ -151,6 +171,8 @@ pub struct PackageRunResult {
     pub outcome: PackageOutcome,
     /// 容量内訳と p95（REQ-30・REQ-31）。
     pub metrics: PackageMetrics,
+    /// 版管理台帳へ記録した版（公開したときだけ `Some`。上限超過では `None`。#491）。
+    pub version: Option<PackageVersion>,
 }
 
 /// `package` を実行する。
@@ -179,7 +201,12 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     }
     // 期待する seed・validation 入力は固定値ではなく `split.json` の記録とデータから求める
     // （`compute_selection` が分割を検証済みだが、期待値の組み立てのため同じ検証をもう一度通す）。
-    let records = project.load_records(&definition)?;
+    // 学習データは 1 回だけ読み、検査と版管理台帳の data ハッシュに同じバイト列を使う（開き直さない。#491）。
+    let train_bytes = project.read(
+        Path::new(DATA_DIR).join(TRAIN_DATA_FILE),
+        MAX_PROJECT_FILE_BYTES,
+    )?;
+    let records = inspect_bytes(&train_bytes, &definition)?;
     let (split, split_seed) = verified_split(&project, &records)?;
     let seed = effective_train_seed(&project, selection.candidate_index, split_seed)?;
     let candidates = resolve_candidates(&project, &definition, selection.candidate_index, seed)?;
@@ -253,14 +280,26 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
     let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
     let calibration = package_calibration(verified_record.as_ref(), &definition, &onnx_bytes)?;
-    let package_meta_bytes = match calibration.as_deref() {
-        Some(bytes) => with_calibration_sha256(&meta_bytes, bytes)?,
-        None => meta_bytes,
-    };
+    let package_meta_bytes =
+        with_package_hashes(&meta_bytes, &definition_bytes, calibration.as_deref())?;
 
+    // 版管理台帳は上書きしない（`package/` の有無によらず拒否する。#491）。
+    if project.exists(VERSION_LEDGER_FILE)? {
+        return Err(invalid("version ledger already exists"));
+    }
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
     }
+    // 旧プロジェクトの台帳の照合と今回の 3 件の記録は、ステージングを作る前にメモリ上で済ませる（#491）。
+    let (ledger_bytes, version) = next_version_ledger(
+        cwd,
+        args.previous_project_dir.as_deref(),
+        (
+            &package_meta_bytes,
+            &Sha256Digest::of_bytes(&train_bytes),
+            &selection_bytes,
+        ),
+    )?;
     // p95 の計測・照合（`limits.max_infer_p95_us` があるときだけ。REQ-31・#338）。ステージングを作る前に
     // 行うので、計測の失敗で片付ける分岐が要らず、既存の `package/` がある場合は推論を回す前に失敗する。
     let infer_p95 = match definition.limits().and_then(Limits::max_infer_p95_us) {
@@ -328,17 +367,103 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // p95 が超過しても組み立てと容量計測は行い、両方の超過を載せる。
     let mut breaches: Vec<LimitBreach> = check.breach().into_iter().collect();
     breaches.extend(infer_p95.as_ref().and_then(|(_, breach)| *breach));
-    let breaches = finalize_staging(&project, &staging, &breaches)?;
+    let breaches = finalize_staging(&project, &staging, &breaches, &ledger_bytes)?;
     let metrics = PackageMetrics {
         capacity,
         infer_p95: infer_p95.map(|(p95, _)| p95),
     };
+    let version = breaches.is_empty().then_some(version);
     // 上限超過（20）が合否より優先される規則は runtime の `resolve_package_outcome` に任せる。
     // Fail・Undeterminable でも公開の関門は容量・p95 だけ（`finalize_staging` は合否を見ない。#328）。
     Ok(PackageRunResult {
         outcome: resolve_package_outcome(&breaches, quality),
         metrics,
+        version,
     })
+}
+
+/// 今回の `package` で書く版管理台帳の中身と、stdout へ載せる版を作る（REQ-39・TASK-39.3・#491）。
+///
+/// `previous_dir`（`--previous-project-dir`）があれば [`load_previous_ledger`] の照合済みの台帳に、無ければ空の
+/// 台帳に、同じ `id`（`v<n>`。n は model 件数＋1）・同じ作成時刻で model（配布用 `artifact.json`）・data
+/// （`data/train.jsonl`。検査に使ったバイト列のハッシュ）・experiment（`selection_record.json`）の 3 件を足す。
+/// ファイルは書かない。
+///
+/// # Errors
+/// 旧台帳の拒否は [`load_previous_ledger`]、重複・件数超過・時計の失敗は `LedgerError::exit_code` の写像（固定文。パスを含めない）。
+fn next_version_ledger(
+    cwd: &Path,
+    previous_dir: Option<&Path>,
+    // 配布用 `artifact.json`・検査に使った `train.jsonl` の sha256・`selection_record.json`。
+    (package_meta_bytes, data_sha256, selection_bytes): (&[u8], &Sha256Digest, &[u8]),
+) -> Result<(Vec<u8>, PackageVersion), ErrorReport> {
+    let (mut ledger, previous) = match previous_dir {
+        Some(dir) => load_previous_ledger(cwd, dir)?,
+        None => (VersionLedger::new(), None),
+    };
+    let ledger_report = |e: &fandhe_edge_guard::version_ledger::LedgerError| {
+        ErrorReport::new(e.exit_code(), e.to_string())
+    };
+    let n = ledger.versions_of(ArtifactKind::Model).count() + 1;
+    let id = VersionId::new(&format!("v{n}")).map_err(|e| ledger_report(&e))?;
+    let created_at = CreatedAt::now().map_err(|e| ledger_report(&e))?;
+    for (kind, sha256) in [
+        (
+            ArtifactKind::Model,
+            Sha256Digest::of_bytes(package_meta_bytes),
+        ),
+        (ArtifactKind::Data, *data_sha256),
+        (
+            ArtifactKind::Experiment,
+            Sha256Digest::of_bytes(selection_bytes),
+        ),
+    ] {
+        ledger
+            .record(kind, id.clone(), sha256, created_at)
+            .map_err(|e| ledger_report(&e))?;
+    }
+    let bytes = ledger
+        .to_file()
+        .map_err(|_| runtime("cannot serialize version ledger"))?;
+    Ok((bytes, PackageVersion::new(id.as_str().to_owned(), previous)))
+}
+
+/// `--previous-project-dir` の旧プロジェクト（cwd 配下。読むだけ）の台帳を読み、最新 model 版を旧パッケージの
+/// `artifact.json`（旧プロジェクトの保持 fd 起点で読む）から再計算して照合する（REQ-39・TASK-39.3-2・#491）。照合済みの台帳と最新 model 版 ID を返す。
+///
+/// # Errors
+/// 経路の拒否は [`Project::open`] の写像。台帳が無ければ `previous version ledger is missing`、形・内容が不正なら
+/// `previous version ledger is invalid`（`LedgerError::exit_code` の写像。2 MiB 超は 20）。model 版が無い・
+/// 旧パッケージの `artifact.json` が無い・一致しないなら `previous package does not match its version ledger`。
+fn load_previous_ledger(
+    cwd: &Path,
+    dir: &Path,
+) -> Result<(VersionLedger, Option<String>), ErrorReport> {
+    let old = Project::open(cwd, dir)?;
+    let Some(bytes) = old.read_optional(VERSION_LEDGER_FILE, MAX_VERSION_LEDGER_BYTES)? else {
+        return Err(invalid("previous version ledger is missing"));
+    };
+    let ledger = VersionLedger::from_file(&bytes)
+        .map_err(|e| ErrorReport::new(e.exit_code(), "previous version ledger is invalid"))?;
+    const MISMATCH: &str = "previous package does not match its version ledger";
+    let latest = ledger
+        .versions_of(ArtifactKind::Model)
+        .last()
+        .ok_or_else(|| invalid(MISMATCH))?;
+    // OLD の保持 fd 起点で読み（cwd からパスを解決し直さない）、そのバイト列を台帳の記録と直接比べる。
+    // 経路の拒否・上限超過は終了コードを保ったまま固定文にそろえる。
+    let artifact = old
+        .read_optional(
+            Path::new(PACKAGE_DIR).join(ARTIFACT_META_FILE),
+            MAX_ARTIFACT_META_BYTES,
+        )
+        .map_err(|e| ErrorReport::new(e.code, MISMATCH))?
+        .ok_or_else(|| invalid(MISMATCH))?;
+    if Sha256Digest::of_bytes(&artifact) != *latest.sha256() {
+        return Err(invalid(MISMATCH));
+    }
+    let latest = latest.id().as_str().to_owned();
+    Ok((ledger, Some(latest)))
 }
 
 /// runtime の容量照合結果と内訳を、stdout 用の値型へ写す（REQ-30・#340）。
@@ -503,24 +628,36 @@ fn package_calibration(
     .map_err(|_| runtime("cannot serialize package calibration"))
 }
 
-/// 候補側の `artifact.json` のバイト列の末尾の `}` の直前に `,"calibration_sha256":"<hex>"` を足した、配布用の
-/// バイト列を返す（REQ-39・#497）。他の欄・キー順・空白は変えない。
+/// 候補側の `artifact.json` のバイト列の末尾の `}` の直前に、校正があれば `,"calibration_sha256":"<hex>"`
+/// （#497）、続けて常に `,"definition_sha256":"<hex>"`（配布する `definition.json` のバイト列の sha256。#491）を
+/// 足した配布用のバイト列を返す（REQ-39）。他の欄・キー順・空白は変えない。
 ///
 /// 候補側に同名の欄が無いことは [`load_candidate_artifact`] が確認済み（重複キーを作らない）。解析済みの
 /// 非空オブジェクトなので、末尾の空白を除いた最後のバイトは `}` で、直前に欄がある。
-fn with_calibration_sha256(meta_bytes: &[u8], calibration: &[u8]) -> Result<Vec<u8>, ErrorReport> {
+fn with_package_hashes(
+    meta_bytes: &[u8],
+    definition: &[u8],
+    calibration: Option<&[u8]>,
+) -> Result<Vec<u8>, ErrorReport> {
     let close = meta_bytes
         .iter()
         .rposition(|b| !b.is_ascii_whitespace())
         .filter(|&i| meta_bytes.get(i) == Some(&b'}'))
         .ok_or_else(|| invalid("artifact metadata does not match the model file"))?;
     let (head, tail) = meta_bytes.split_at(close);
-    let field = format!(
-        r#","calibration_sha256":"{}""#,
-        Sha256Digest::of_bytes(calibration).to_hex()
-    );
-    let out = [head, field.as_bytes(), tail].concat();
-    // 追記後も `infer` の上限付き読み込み（[`MAX_ARTIFACT_META_BYTES`]）で読めることを公開前に確かめる。
+    let mut fields = String::new();
+    if let Some(calibration) = calibration {
+        fields.push_str(&format!(
+            r#","calibration_sha256":"{}""#,
+            Sha256Digest::of_bytes(calibration).to_hex()
+        ));
+    }
+    fields.push_str(&format!(
+        r#","definition_sha256":"{}""#,
+        Sha256Digest::of_bytes(definition).to_hex()
+    ));
+    let out = [head, fields.as_bytes(), tail].concat();
+    // 両欄を足した後も `infer` の上限付き読み込み（[`MAX_ARTIFACT_META_BYTES`]）で読めることを公開前に確かめる。
     if u64::try_from(out.len()).map_or(true, |n| n > MAX_ARTIFACT_META_BYTES) {
         return Err(invalid("artifact metadata is too large"));
     }
@@ -653,12 +790,17 @@ fn verify_evaluation_record(
 /// 容量・p95 の超過（`breaches`）が無ければステージングを `package/` へ原子的に公開し、あれば公開せず片付ける
 /// （REQ-30・REQ-39）。公開に失敗した場合もステージングを片付けてエラーを返す。
 ///
+/// 公開する場合だけ、公開の直前に版管理台帳（`ledger`）を新規作成して読み取り専用にし、公開に失敗したら台帳も
+/// 消す（台帳の記録と `package/` の有無を食い違わせない。#491）。台帳の作成自体が失敗した場合（既存を含む）は
+/// 自分が作っていない台帳を消さない。
+///
 /// 超過があった場合はその一覧（[`LimitBreach::Capacity`]・[`LimitBreach::Latency`]）を返し、`package/` は作らない。既存の `package/` は
 /// 触らない（呼び出し元が事前に不在を確認済み。公開は `RENAME_NOREPLACE` 相当で置き換えない）。
 fn finalize_staging(
     project: &Project,
     staging: &CreatedDir,
     breaches: &[LimitBreach],
+    ledger: &[u8],
 ) -> Result<Vec<LimitBreach>, ErrorReport> {
     // 境界規則（`>` で超過・`==` は超過でない）は runtime の `check_capacity_limit`・`check_latency_limit`
     // （TASK-30.2・#124、TASK-31.x・#338）が決めて `breaches` に載せる。ここでは再実装しない。
@@ -666,7 +808,18 @@ fn finalize_staging(
         let _ = project.remove_created_dir(staging);
         return Ok(breaches.to_vec());
     }
-    if let Err(report) = project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR) {
+    // 一時名へ書いて fsync し NOREPLACE で置く（異常終了で部分的な台帳を残さない。既存は拒否する）。
+    if let Err(report) = project.publish_new_file(VERSION_LEDGER_FILE, ledger) {
+        let _ = project.remove_created_dir(staging);
+        return Err(report);
+    }
+    // 読み取り専用化は公開の前に行い、公開できたのに台帳が書き換え可能なまま、という状態を作らない
+    // （読み取り専用でも削除はディレクトリの権限で行えるため、失敗時の片付けは変わらない）。
+    let published = project
+        .set_read_only(VERSION_LEDGER_FILE)
+        .and_then(|()| project.publish_dir(PACKAGE_STAGING_DIR, PACKAGE_DIR));
+    if let Err(report) = published {
+        let _ = project.remove_file_if_exists(VERSION_LEDGER_FILE);
         let _ = project.remove_created_dir(staging);
         return Err(report);
     }
@@ -952,10 +1105,13 @@ mod tests {
         ])
         .expect("breakdown");
         let mapped = capacity_report(&breakdown, &check_of(125, 200)).expect("within");
-        let line = fandhe_edge_core::stage_report::PackageReport::pass(PackageMetrics {
-            capacity: mapped,
-            infer_p95: None,
-        })
+        let line = fandhe_edge_core::stage_report::PackageReport::pass(
+            PackageMetrics {
+                capacity: mapped,
+                infer_p95: None,
+            },
+            PackageVersion::new("v1".to_string(), None),
+        )
         .to_json_line()
         .expect("json");
         let legacy = crate::output::package_capacity_json(&breakdown);
@@ -1026,9 +1182,10 @@ mod tests {
             measured_p95_ns: 2,
             limit_ns: 1,
         };
-        let breaches = finalize_staging(&project, &staging, &[breach]).expect("finalize");
+        let breaches = finalize_staging(&project, &staging, &[breach], LEDGER).expect("finalize");
         assert_eq!(breaches, vec![breach]);
         assert!(!project.exists(PACKAGE_DIR).expect("exists"));
+        assert!(!project.exists(VERSION_LEDGER_FILE).expect("exists"));
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -1042,6 +1199,27 @@ mod tests {
                 limit_bytes,
             },
         }
+    }
+
+    /// `finalize_staging` に渡す台帳の中身（#491。中身は照合しない）。
+    const LEDGER: &[u8] = b"{\"schema_version\":1,\"entries\":[]}\n";
+
+    /// REQ-39・#491: 既に台帳があれば（自分が書いていない台帳）公開せず、その台帳を消さない。
+    #[test]
+    fn req39_issue491_existing_ledger_is_kept_and_package_is_not_published() {
+        let (cwd, project, staging) = setup("ledger-exists");
+        project
+            .write_new(VERSION_LEDGER_FILE, b"old")
+            .expect("old ledger");
+        let err = finalize_staging(&project, &staging, &[], LEDGER).expect_err("exists");
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+        assert_eq!(
+            project.read(VERSION_LEDGER_FILE, 16).expect("ledger"),
+            b"old"
+        );
+        assert!(!project.exists(PACKAGE_DIR).expect("exists"));
+        assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// 一時 cwd の下に `proj/` を新規作成し、ステージングにファイルを 1 つ置いて返す。
@@ -1068,6 +1246,7 @@ mod tests {
             &project,
             &staging,
             &check_of(41, 40).breach().into_iter().collect::<Vec<_>>(),
+            LEDGER,
         )
         .expect("finalize");
         assert_eq!(
@@ -1090,6 +1269,7 @@ mod tests {
             &project,
             &staging,
             &check_of(40, 40).breach().into_iter().collect::<Vec<_>>(),
+            LEDGER,
         )
         .expect("finalize");
         assert_eq!(breaches, Vec::new());
@@ -1098,6 +1278,24 @@ mod tests {
             .read(Path::new(PACKAGE_DIR).join("artifact.json"), 16)
             .expect("read published");
         assert_eq!(bytes, b"new");
+        // REQ-39・#491: 公開と同時に台帳が書かれ、読み取り専用（0400）になる。
+        assert_eq!(
+            project.read(VERSION_LEDGER_FILE, 64).expect("ledger"),
+            LEDGER
+        );
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(project.path(VERSION_LEDGER_FILE))
+                .expect("meta")
+                .permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o400);
+        // 台帳は一時名＋NOREPLACE の名前替えで置くため、一時名の残骸が残らない（#491）。
+        let leftovers: Vec<String> = std::fs::read_dir(project.dir())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert_eq!(leftovers, Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -1114,6 +1312,7 @@ mod tests {
             &project,
             &staging,
             &check_of(41, 40).breach().into_iter().collect::<Vec<_>>(),
+            LEDGER,
         )
         .expect("finalize");
         assert_eq!(breaches.len(), 1);
@@ -1135,10 +1334,13 @@ mod tests {
             &project,
             &staging,
             &check_of(1, 40).breach().into_iter().collect::<Vec<_>>(),
+            LEDGER,
         )
         .expect_err("must not replace");
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
+        // REQ-39・#491: 公開に失敗したら書いた台帳も消す（台帳と `package/` を食い違わせない）。
+        assert!(!project.exists(VERSION_LEDGER_FILE).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -1182,37 +1384,68 @@ mod tests {
         assert_eq!(package_calibration(None, &definition, b"onnx"), Ok(None));
     }
 
-    /// REQ-39・#497: 配布用の `artifact.json` は候補側のバイト列の末尾に `calibration_sha256` を足しただけで、
-    /// 解析すると校正ファイルの sha256 が読め、他の欄は変わらない。
+    /// REQ-39・#497・#491: 配布用の `artifact.json` は候補側のバイト列の末尾に `calibration_sha256`（あれば）と
+    /// `definition_sha256` を足しただけで、解析すると両方の sha256 が読め、他の欄は変わらない。
     #[test]
-    fn req39_issue497_with_calibration_sha256_appends_field() {
+    fn req39_issue497_issue491_with_package_hashes_appends_fields() {
         let meta = format!(
             "{{\"onnx_file\":\"model.onnx\",\"kind\":\"c1\",\"kind_version\":1,\"max_bytes\":48,\"label_order\":[\"a\"],\"onnx_sha256\":\"{}\"}}\n",
             "0".repeat(64)
         );
-        let out = with_calibration_sha256(meta.as_bytes(), b"calib\n").expect("append");
+        let out = with_package_hashes(meta.as_bytes(), b"def\n", Some(b"calib\n")).expect("append");
         let hex = Sha256Digest::of_bytes(b"calib\n").to_hex();
+        let def_hex = Sha256Digest::of_bytes(b"def\n").to_hex();
         assert_eq!(
             String::from_utf8(out.clone()).expect("utf8"),
-            meta.replace("}\n", &format!(",\"calibration_sha256\":\"{hex}\"}}\n"))
+            meta.replace(
+                "}\n",
+                &format!(
+                    ",\"calibration_sha256\":\"{hex}\",\"definition_sha256\":\"{def_hex}\"}}\n"
+                )
+            )
         );
         let parsed = ArtifactMeta::parse(&out).expect("parse");
         assert_eq!(parsed.calibration_sha256(), Some(hex.as_str()));
+        assert_eq!(parsed.definition_sha256(), Some(def_hex.as_str()));
+        // 校正なしは定義の欄だけを足す。
+        let out = with_package_hashes(meta.as_bytes(), b"def\n", None).expect("append");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            meta.replace("}\n", &format!(",\"definition_sha256\":\"{def_hex}\"}}\n"))
+        );
         assert_eq!(
             ArtifactMeta::parse(meta.as_bytes()).map(|m| m.label_order().to_vec()),
             Ok(parsed.label_order().to_vec())
         );
-        assert!(with_calibration_sha256(b"[]", b"x").is_err());
+        assert!(with_package_hashes(b"[]", b"d", Some(b"x")).is_err());
     }
 
-    /// REQ-39・#497: 追記で `infer` の読み込み上限を超える配布用メタデータは公開しない。
+    /// REQ-39・#497・#491: 両欄の追記で `infer` の読み込み上限を超える配布用メタデータは公開しない。
+    /// 定義の欄（`,"definition_sha256":"<64>"` の 87 バイト）だけでちょうど上限なら通り、1 バイト超えると拒否。
     #[test]
     fn req39_issue497_appended_meta_over_read_limit_is_rejected() {
         let limit = usize::try_from(MAX_ARTIFACT_META_BYTES).expect("limit");
-        let mut meta = vec![b' '; limit - 2];
-        meta.splice(0..0, b"{}".iter().copied());
+        let meta_of = |len: usize| {
+            let mut meta = vec![b' '; len - 2];
+            meta.splice(0..0, b"{}".iter().copied());
+            meta
+        };
+        let field = 87;
         assert_eq!(
-            with_calibration_sha256(&meta, b"{}")
+            with_package_hashes(&meta_of(limit - field), b"d", None)
+                .expect("at limit")
+                .len(),
+            limit
+        );
+        assert_eq!(
+            with_package_hashes(&meta_of(limit - field + 1), b"d", None)
+                .expect_err("over limit")
+                .message,
+            "artifact metadata is too large"
+        );
+        // 校正の欄も足すと、定義だけなら上限内の大きさでも拒否する。
+        assert_eq!(
+            with_package_hashes(&meta_of(limit - field), b"d", Some(b"{}"))
                 .expect_err("over limit")
                 .message,
             "artifact metadata is too large"

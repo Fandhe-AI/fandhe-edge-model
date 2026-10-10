@@ -11,6 +11,8 @@
 //! # 契約
 //!
 //! すべての出力の末尾に計測値 `capacity`・`infer_p95`（#340・REQ-30・REQ-31）が付く（exit 64・70 を除く）。
+//! exit 0・10・12 ではさらに末尾に、版管理台帳へ記録した版 `version`（`{"id","previous"}`。#491・REQ-39）が付く。
+//! exit 20 は `package/` も台帳も作らないため `version` を載せない。
 //!
 //! - exit 0（`Pass`・`NotDefined`）: core の `PackageReport` を JSON 1 行で stdout へ
 //! - exit 10・12（`Fail`・`Undeterminable`）: 合否基準が定義されているときにだけ生じる結果として、
@@ -41,6 +43,7 @@ use crate::output::{
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{
     EvaluateReport, PackageJudgedReport, PackageLimitExceededReport, PackageMetrics, PackageReport,
+    PackageVersion,
 };
 use fandhe_edge_data::eval_freeze::{EvalDataState, EvaluateGate, FreezeRecord, evaluate_gate};
 use fandhe_edge_runtime::package_outcome::{LimitBreach, PackageOutcome, PackageVerdict};
@@ -82,6 +85,7 @@ impl PackageStageOutput {
 pub fn package_outcome_report(
     outcome: &PackageOutcome,
     metrics: &PackageMetrics,
+    version: Option<&PackageVersion>,
 ) -> PackageStageOutput {
     let runtime_error = || {
         PackageStageOutput::Error(ErrorReport::new(
@@ -122,21 +126,31 @@ pub fn package_outcome_report(
         return runtime_error();
     }
     let metrics = *metrics;
+    // 公開した（exit 0・10・12）のに版が無い組は記録の欠落として fail-closed（#491）。
+    let published = |make: &dyn Fn(PackageVersion) -> PackageStageOutput| {
+        version.cloned().map_or_else(runtime_error, make)
+    };
     match outcome.verdict {
-        PackageVerdict::Pass => PackageStageOutput::Report(PackageReport::pass(metrics)),
-        PackageVerdict::NotDefined => {
-            PackageStageOutput::Report(PackageReport::acceptance_not_defined(metrics))
+        PackageVerdict::Pass => {
+            published(&|v| PackageStageOutput::Report(PackageReport::pass(metrics, v)))
         }
-        PackageVerdict::Fail => PackageStageOutput::Judged(PackageJudgedReport::fail(
-            default_message(ExitCode::JudgedFail).to_string(),
-            metrics,
-        )),
-        PackageVerdict::Undeterminable => {
+        PackageVerdict::NotDefined => published(&|v| {
+            PackageStageOutput::Report(PackageReport::acceptance_not_defined(metrics, v))
+        }),
+        PackageVerdict::Fail => published(&|v| {
+            PackageStageOutput::Judged(PackageJudgedReport::fail(
+                default_message(ExitCode::JudgedFail).to_string(),
+                metrics,
+                v,
+            ))
+        }),
+        PackageVerdict::Undeterminable => published(&|v| {
             PackageStageOutput::Judged(PackageJudgedReport::undeterminable(
                 default_message(ExitCode::Pending).to_string(),
                 metrics,
+                v,
             ))
-        }
+        }),
         PackageVerdict::LimitExceeded => PackageLimitExceededReport::new(
             default_message(ExitCode::LimitExceeded).to_string(),
             metrics,
@@ -154,8 +168,9 @@ pub fn emit_package_outcome<W: Write>(
     out: &mut W,
     outcome: &PackageOutcome,
     metrics: &PackageMetrics,
+    version: Option<&PackageVersion>,
 ) -> io::Result<ExitCode> {
-    match package_outcome_report(outcome, metrics) {
+    match package_outcome_report(outcome, metrics, version) {
         PackageStageOutput::Report(report) => write_package_report(out, &report),
         PackageStageOutput::Judged(report) => write_package_judged_report(out, &report),
         PackageStageOutput::LimitExceeded(report) => {
@@ -281,6 +296,40 @@ mod tests {
         }
     }
 
+    /// 記録した版の期待値（#491）。
+    const VER: &str = ",\"version\":{\"id\":\"v1\",\"previous\":null}";
+
+    fn v1() -> PackageVersion {
+        PackageVersion::new("v1".to_string(), None)
+    }
+
+    /// REQ-39・REQ-21・#491: 公開した結果（exit 0・10・12）に版が無ければ runtime_error（記録の欠落を成功に
+    /// しない）。exit 20 は版の有無によらず `version` を載せない。
+    #[test]
+    fn req39_issue491_version_is_required_for_published_outcomes_only() {
+        for q in [
+            PackageQualityJudgment::Pass,
+            PackageQualityJudgment::Fail,
+            PackageQualityJudgment::Undeterminable,
+            PackageQualityJudgment::NotDefined,
+        ] {
+            let o = resolve_package_outcome(&[], q);
+            let mut buf = Vec::new();
+            let code =
+                emit_package_outcome(&mut buf, &o, &metrics(false, None), None).expect("emit");
+            assert_eq!(code, ExitCode::RuntimeError);
+            assert_eq!(String::from_utf8(buf).expect("utf8"), RUNTIME_ERROR);
+        }
+        let o = resolve_package_outcome(&[cap_breach()], PackageQualityJudgment::Pass);
+        for version in [None, Some(&v1())] {
+            let mut buf = Vec::new();
+            let code =
+                emit_package_outcome(&mut buf, &o, &metrics(true, None), version).expect("emit");
+            assert_eq!(code, ExitCode::LimitExceeded);
+            assert!(!String::from_utf8(buf).expect("utf8").contains("version"));
+        }
+    }
+
     fn cap_breach() -> LimitBreach {
         LimitBreach::Capacity {
             measured_bytes: 125,
@@ -301,8 +350,13 @@ mod tests {
         m: &PackageMetrics,
     ) -> (ExitCode, String) {
         let mut buf = Vec::new();
-        let code =
-            emit_package_outcome(&mut buf, &resolve_package_outcome(breaches, q), m).expect("emit");
+        let code = emit_package_outcome(
+            &mut buf,
+            &resolve_package_outcome(breaches, q),
+            m,
+            Some(&v1()),
+        )
+        .expect("emit");
         (code, String::from_utf8(buf).expect("utf8"))
     }
 
@@ -314,7 +368,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":\"pass\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null{VER}}}\n"
             )
         );
     }
@@ -328,7 +382,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{CAP_OK},\"infer_p95\":{{\"p95_us\":5000,\"limit_us\":6000,\"exceeded\":false}}}}\n"
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{CAP_OK},\"infer_p95\":{{\"p95_us\":5000,\"limit_us\":6000,\"exceeded\":false}}{VER}}}\n"
             )
         );
     }
@@ -341,7 +395,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+                "{{\"code\":\"judged_fail\",\"message\":\"judged as fail\",\"step\":\"package\",\"judgment\":\"fail\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null{VER}}}\n"
             )
         );
 
@@ -354,7 +408,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null}}\n"
+                "{{\"code\":\"pending\",\"message\":\"result is pending\",\"step\":\"package\",\"judgment\":\"undeterminable\",\"acceptance_defined\":true,{CAP_OK},\"infer_p95\":null{VER}}}\n"
             )
         );
 
@@ -397,7 +451,7 @@ mod tests {
             PackageQualityJudgment::NotDefined,
         ] {
             let o = resolve_package_outcome(&[], q);
-            let output = package_outcome_report(&o, &metrics(false, None));
+            let output = package_outcome_report(&o, &metrics(false, None), Some(&v1()));
             assert_eq!(
                 matches!(output, PackageStageOutput::Report(_)),
                 o.exit_code == ExitCode::Ok
@@ -414,14 +468,14 @@ mod tests {
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
         o.exit_code = ExitCode::LimitExceeded;
         let mut buf = Vec::new();
-        let code = emit_package_outcome(&mut buf, &o, &m).expect("emit");
+        let code = emit_package_outcome(&mut buf, &o, &m, Some(&v1())).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
         assert_eq!(String::from_utf8(buf).expect("utf8"), RUNTIME_ERROR);
 
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         o.exit_code = ExitCode::Ok;
         assert!(matches!(
-            package_outcome_report(&o, &m),
+            package_outcome_report(&o, &m, Some(&v1())),
             PackageStageOutput::Error(_)
         ));
     }
@@ -434,14 +488,14 @@ mod tests {
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Pass);
         o.breaches = vec![cap_breach()];
         let mut buf = Vec::new();
-        let code = emit_package_outcome(&mut buf, &o, &m).expect("emit");
+        let code = emit_package_outcome(&mut buf, &o, &m, Some(&v1())).expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
         assert_eq!(String::from_utf8(buf).expect("utf8"), RUNTIME_ERROR);
 
         // verdict だけ LimitExceeded で exit_code が Ok の組も拒否する。
         o.verdict = PackageVerdict::LimitExceeded;
         assert!(matches!(
-            package_outcome_report(&o, &m),
+            package_outcome_report(&o, &m, Some(&v1())),
             PackageStageOutput::Error(_)
         ));
 
@@ -449,8 +503,13 @@ mod tests {
         let mut o = resolve_package_outcome(&[], PackageQualityJudgment::Fail);
         o.breaches = vec![lat_breach()];
         let mut buf = Vec::new();
-        let code =
-            emit_package_outcome(&mut buf, &o, &metrics(false, Some((7, 6, true)))).expect("emit");
+        let code = emit_package_outcome(
+            &mut buf,
+            &o,
+            &metrics(false, Some((7, 6, true))),
+            Some(&v1()),
+        )
+        .expect("emit");
         assert_eq!(code, ExitCode::RuntimeError);
     }
 
@@ -481,7 +540,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{cap},\"infer_p95\":null}}\n"
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{cap},\"infer_p95\":null{VER}}}\n"
             )
         );
         let (code, _) = emit(&[], PackageQualityJudgment::Undeterminable, &m);

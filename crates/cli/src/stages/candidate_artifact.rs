@@ -94,11 +94,12 @@ pub(crate) fn load_candidate_artifact(
         read_member(ARTIFACT_META_FILE, MAX_ARTIFACT_META_BYTES)?;
     let (onnx_bytes, onnx_handle, onnx_path) = read_member(onnx_file, MAX_MODEL_FILE_BYTES)?;
     let meta = ArtifactMeta::parse(&meta_bytes).map_err(|e| e.to_error_report())?;
-    // `calibration_sha256` は `package` が配布用の `artifact.json` にだけ書く欄で、候補側にあれば改変として
-    // 扱う（`package` が追記するときに重複キーを作らない。REQ-39・#497）。
+    // `calibration_sha256`・`definition_sha256` は `package` が配布用の `artifact.json` にだけ書く欄で、候補側に
+    // あれば改変として扱う（`package` が追記するときに重複キーを作らない。REQ-39・#497・#491）。
     if meta.onnx_file() != onnx_file
         || meta.onnx_sha256() != Sha256Digest::of_bytes(&onnx_bytes).to_hex()
         || meta.calibration_sha256().is_some()
+        || meta.definition_sha256().is_some()
     {
         return Err(invalid("artifact metadata does not match the model file"));
     }
