@@ -16,12 +16,14 @@
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
 //! - [`train_status_json_line`]: `train --status` の stdout（候補ごとのジョブ記録の状態とやり直し案内。#485）
+//! - [`TrainInterruptedReport`]: ジョブ開始後に終わった `train` の失敗の stdout（ジョブ状態とやり直し案内。#486）
 //! - [`SelectionRecord`]: `select` の記録（`package` が選定候補を読み戻す）。有意性判定
 //!   （[`crate::selection_significance`] の結果）は定義に `baseline_comparison` があるときだけ持つ（#481）
 //!
 //! エラーはデータ本文・ラベル・パスを含まない固定の列挙値で返す（`security.md`）。
 
 use fandhe_edge_core::evaluation_record::SelectionSignificanceRecord;
+use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::{Stage, StageStatus};
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
@@ -370,6 +372,62 @@ pub fn train_status_json_line(jobs: &[TrainStatusEntry]) -> Result<String, Stage
     .map_err(|_| StageFileError::Serialize)
 }
 
+/// ジョブ開始後に終わった `train` の失敗（ワーカー失敗・クラッシュ・壁時計超過・キャンセル）の stdout
+/// （REQ-21・REQ-33・REQ-34・TASK-34.3・#486）。
+///
+/// `{"code","message","step":"train","candidate","job","restart"}`。`code`・`message` は従来の
+/// [`ErrorReport`] の写像のまま、`job` は [`crate::job_record::read_job_status_in`] の結果、`restart` は
+/// [`crate::restart::guidance_for_run`] の結果（`resumable` は常に `false`）。ジョブ開始前の失敗には使わない
+/// （従来の 2 キーの [`ErrorReport`]）。パス・データ本文・ワーカーの出力は含めない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrainInterruptedReport {
+    code: ExitCode,
+    message: String,
+    step: Stage,
+    candidate: usize,
+    job: JobStatusReport,
+    restart: RestartGuidance,
+}
+
+impl TrainInterruptedReport {
+    /// 失敗 `error` に候補 `candidate` のジョブ状態とやり直し案内を添える。
+    ///
+    /// # Errors
+    /// `error.code` が `ok`（失敗でない）なら `error` をそのまま返す（成功を中断として出さない）。
+    pub fn new(
+        error: ErrorReport,
+        candidate: usize,
+        job: JobStatusReport,
+        restart: RestartGuidance,
+    ) -> Result<Self, ErrorReport> {
+        if error.code == ExitCode::Ok {
+            return Err(error);
+        }
+        Ok(Self {
+            code: error.code,
+            message: error.message,
+            step: Stage::Train,
+            candidate,
+            job,
+            restart,
+        })
+    }
+
+    /// 終了コード（従来の写像のまま）。
+    #[must_use]
+    pub const fn exit_code(&self) -> ExitCode {
+        self.code
+    }
+
+    /// JSON 1 行（末尾の改行なし）へ直列化する。
+    ///
+    /// # Errors
+    /// 直列化に失敗した場合（実務上は起こらない）。
+    pub fn to_json_line(&self) -> Result<String, StageFileError> {
+        serde_json::to_string(self).map_err(|_| StageFileError::Serialize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +566,40 @@ mod tests {
         assert_eq!(
             allotted_time_limit_seconds(&oversized, 0, "c1"),
             Err(StageFileError::Malformed)
+        );
+    }
+
+    /// REQ-21・REQ-34・TASK-34.3・#486: 中断の報告はキー順を含めて固定され、`resumable` は false。
+    /// `ok` の報告からは作れない（成功を中断として出さない）。
+    #[test]
+    fn req34_issue486_train_interrupted_report_is_exact() {
+        use crate::job::JobState;
+        use crate::job_record::JobFailure;
+        let job = JobStatusReport {
+            state: JobState::Failed,
+            crash_detected: false,
+            failure: Some(JobFailure::Error {
+                code: ExitCode::Pending,
+            }),
+            record_updated: false,
+        };
+        let restart = guidance_for_state(JobState::Failed).expect("guidance");
+        let report = TrainInterruptedReport::new(
+            ErrorReport::new(ExitCode::Pending, "train worker failed: training_diverged"),
+            1,
+            job.clone(),
+            restart,
+        )
+        .expect("failure");
+        assert_eq!(report.exit_code(), ExitCode::Pending);
+        assert_eq!(
+            report.to_json_line().expect("json"),
+            "{\"code\":\"pending\",\"message\":\"train worker failed: training_diverged\",\"step\":\"train\",\"candidate\":1,\"job\":{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{\"kind\":\"error\",\"code\":\"pending\"},\"record_updated\":false},\"restart\":{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"not_inspected\",\"message\":\"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse.\"}}"
+        );
+        let ok = ErrorReport::new(ExitCode::Ok, "x");
+        assert_eq!(
+            TrainInterruptedReport::new(ok.clone(), 0, job, restart),
+            Err(ok)
         );
     }
 }

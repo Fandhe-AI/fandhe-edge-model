@@ -978,8 +978,59 @@ mod suite {
         );
     }
 
-    /// REQ-34・#485 (e)(f): 学習ワーカーが失敗（異常終了・残骸あり）すると、`candidates/<N>/` は
-    /// `job.json`（`failed`）とともに残り、`train --status` が失敗とやり直し案内を報告する。同じ
+    /// `out_dir_action:"not_inspected"` のやり直し案内（`train` の中断報告と `--status` で同じ語彙。#486）。
+    const RESTART_NOT_INSPECTED: &str = "{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"not_inspected\",\"message\":\"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse.\"}";
+
+    /// REQ-34・REQ-21・TASK-34.3・#486: 学習ワーカーが時間上限超過（`limit_exceeded`・20）を返すと、`train` は
+    /// 20・従来の `code`・`message` のまま、ジョブ状態（`failed`・`limit_exceeded`）とやり直し案内を添えて返す。
+    /// ジョブ開始前の失敗（候補の範囲外）は従来の 2 キーのまま。
+    pub fn req34_issue486_limit_exceeded_job_is_reported_as_interrupted() {
+        let env = inspected("trainlimit");
+        std::fs::write(env.project_file("limit_worker"), "").expect("marker");
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--candidate", "1"],
+                20,
+                "limit_exceeded"
+            ),
+            format!(
+                "{{\"code\":\"limit_exceeded\",\"message\":\"train worker failed: limit_exceeded\",\"step\":\"train\",\"candidate\":1,\"job\":{{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{{\"kind\":\"error\",\"code\":\"limit_exceeded\"}},\"record_updated\":false}},\"restart\":{RESTART_NOT_INSPECTED}}}\n"
+            )
+        );
+        assert!(env.project_file("candidates/1/job/job.json").is_file());
+        assert_eq!(
+            env.fails(
+                &["train", "--project-dir", "proj", "--candidate", "9"],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"candidate index is out of range\"}\n"
+        );
+        assert!(!env.project_file("candidates/9").exists());
+    }
+
+    /// REQ-34・REQ-18・TASK-34.3・#486: `train --all` で学習ジョブのプロセス失敗が探索を中断すると、その候補の
+    /// ジョブ状態（片付けの前に読んだもの）とやり直し案内を添えて返す（終了コード・`code`・`message` は従来の
+    /// まま）。片付けの規則は不変（候補ディレクトリ・`candidates/` を残さず、探索記録も書かない）。
+    pub fn req34_issue486_train_all_interrupted_by_process_failure() {
+        let env = inspected("trainallfail");
+        std::fs::write(env.project_file("fail_worker"), "").expect("marker");
+        let (code, stdout) = env.run(&["train", "--project-dir", "proj", "--all"]);
+        assert_eq!(code, 70, "{stdout}");
+        assert_eq!(
+            stdout,
+            format!(
+                "{{\"code\":\"runtime_error\",\"message\":\"worker process exited with unknown exit code 1\",\"step\":\"train\",\"candidate\":0,\"job\":{{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{{\"kind\":\"error\",\"code\":\"runtime_error\"}},\"record_updated\":false}},\"restart\":{RESTART_NOT_INSPECTED}}}\n"
+            )
+        );
+        assert!(!env.project_file("candidates").exists());
+        assert!(!env.project_file("search_record.json").exists());
+    }
+
+    /// REQ-34・#485 (e)(f)・#486: 学習ワーカーが失敗（異常終了・残骸あり）すると、`train` は終了コード・
+    /// `code`・`message` を従来のまま、ジョブ状態とやり直し案内（`resumable:false`）を添えて返す。
+    /// `candidates/<N>/` は `job.json`（`failed`）とともに残り、`train --status` が同じ語彙のやり直し案内を
+    /// 報告する。同じ
     /// `--candidate N` を成功するワーカーで再実行すると、残骸ごと消して新規に学習する（再開ではない）。
     /// 学習後の `job.json` は `succeeded` で、`result.json` のある候補の再学習は `invalid_input`（64）。
     pub fn req34_failed_job_is_kept_reported_and_restarted_from_scratch() {
@@ -990,7 +1041,9 @@ mod suite {
         assert_eq!(code, 70, "{stdout}");
         assert_eq!(
             stdout,
-            "{\"code\":\"runtime_error\",\"message\":\"worker process exited with unknown exit code 1\"}\n"
+            format!(
+                "{{\"code\":\"runtime_error\",\"message\":\"worker process exited with unknown exit code 1\",\"step\":\"train\",\"candidate\":0,\"job\":{{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{{\"kind\":\"error\",\"code\":\"runtime_error\"}},\"record_updated\":false}},\"restart\":{RESTART_NOT_INSPECTED}}}\n"
+            )
         );
         assert!(
             env.project_file("candidates/0/model-c1/partial.bin")
@@ -999,7 +1052,9 @@ mod suite {
         assert!(!env.project_file("candidates/0/result.json").exists());
         assert_eq!(
             env.ok(&["train", "--project-dir", "proj", "--status"]),
-            "{\"step\":\"train\",\"status\":\"ok\",\"jobs\":[{\"candidate\":0,\"job\":{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{\"kind\":\"error\",\"code\":\"runtime_error\"},\"record_updated\":false},\"restart\":{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"not_inspected\",\"message\":\"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse.\"}}]}\n"
+            format!(
+                "{{\"step\":\"train\",\"status\":\"ok\",\"jobs\":[{{\"candidate\":0,\"job\":{{\"state\":\"failed\",\"crash_detected\":false,\"failure\":{{\"kind\":\"error\",\"code\":\"runtime_error\"}},\"record_updated\":false}},\"restart\":{RESTART_NOT_INSPECTED}}}]}}\n"
+            )
         );
         // 失敗した候補は未学習扱い（`select` は採点できる候補が無いときと同じ `pending`・12）。
         assert_eq!(
@@ -4298,6 +4353,16 @@ mod suite {
             std::fs::write(format!("{out_dir}/partial.bin"), b"debris").expect("debris");
             std::process::exit(1);
         }
+        // 学習ワーカー自身の時間上限超過の模擬（#486）: 目印があれば即座に `limit_exceeded`（終了コード 20）を返す。
+        if Path::new(request.root())
+            .join("../../limit_worker")
+            .exists()
+        {
+            print!(
+                r#"{{"status":"error","code":"limit_exceeded","message":"worker exceeded the time limit"}}"#
+            );
+            std::process::exit(20);
+        }
         // 持ち時間切れの模擬（`train --all`・#482）: 目印があれば c3 は持ち時間を使い切ってから
         // 学習ワーカーと同じ形の `limit_exceeded`（終了コード 20）を返す。
         if request.kind() == "c3"
@@ -4592,6 +4657,14 @@ fn main() -> std::process::ExitCode {
         (
             "req34_running_job_blocks_train_until_owner_is_lost",
             suite::req34_running_job_blocks_train_until_owner_is_lost,
+        ),
+        (
+            "req34_issue486_limit_exceeded_job_is_reported_as_interrupted",
+            suite::req34_issue486_limit_exceeded_job_is_reported_as_interrupted,
+        ),
+        (
+            "req34_issue486_train_all_interrupted_by_process_failure",
+            suite::req34_issue486_train_all_interrupted_by_process_failure,
         ),
         (
             "req39_status_check_lock_held_by_another_process_times_out",

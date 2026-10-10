@@ -122,3 +122,30 @@ fn req33_every_parsed_subcommand_emits_exactly_one_json_line() {
         one_json_line(&o, "invalid_input");
     }
 }
+
+/// REQ-34・TASK-34.3・#486: 再開の口は作らない。`train` の `--resume` は（学習・`--status` のどちらと
+/// 併せても）未知オプションの `invalid_input`（64）で、作業ディレクトリに触れる前に止まる。
+#[test]
+fn req34_train_resume_option_is_unknown_invalid_input() {
+    let cases: [&[&str]; 3] = [
+        &[
+            "train",
+            "--project-dir",
+            "p",
+            "--candidate",
+            "0",
+            "--resume",
+        ],
+        &["train", "--project-dir", "p", "--all", "--resume"],
+        &["train", "--project-dir", "p", "--status", "--resume"],
+    ];
+    for args in cases {
+        let o = run(args);
+        assert_eq!(o.status.code(), Some(64), "args: {args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout),
+            "{\"code\":\"invalid_input\",\"message\":\"unknown option for subcommand train\"}\n",
+            "args: {args:?}"
+        );
+    }
+}

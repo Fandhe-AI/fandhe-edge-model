@@ -12,7 +12,8 @@
 //!
 //! - `register`・`inspect`・`train`・`select`・`package`・`infer` は下位層へ接続済み。`train --all` は
 //!   探索予算内で既定候補の全件を学習し、`search_record.json` を残す（#482・#483。[`train`] 参照）。
-//!   学習ジョブは `candidates/<N>/job/` に記録し、`train --status` がクラッシュを検出して報告する（#485）
+//!   学習ジョブは `candidates/<N>/job/` に記録し、`train --status` がクラッシュを検出して報告する（#485）。
+//!   ジョブの開始後に終わった `train` の失敗は、ジョブ状態とやり直し案内つきの JSON で返す（#486）
 //! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
 //!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。診断（REQ-29）は未結線
@@ -44,6 +45,7 @@ use crate::args::{Command, TrainOp, TrainTarget};
 use crate::error_report::emit_error_report;
 use crate::output::write_stage_line;
 use crate::stage_output::{emit_evaluate_skipped, emit_package_outcome};
+use train::TrainError;
 
 pub(crate) mod baseline;
 pub mod candidate_artifact;
@@ -79,17 +81,28 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
     let result: Result<Done, ErrorReport> = match command {
         Command::Register(args) => register::run(args, cwd).map(Done::Register),
         Command::Inspect(args) => inspect::run(args, cwd).map(Done::Inspect),
-        Command::Train(args) => match args.op {
-            TrainOp::Run(TrainTarget::Candidate(index)) => {
-                train::run(args, index, cwd).map(Done::Train)
+        Command::Train(args) => {
+            let trained = match args.op {
+                TrainOp::Run(TrainTarget::Candidate(index)) => {
+                    train::run(args, index, cwd).map(Done::Train)
+                }
+                TrainOp::Run(TrainTarget::All { budget }) => {
+                    train::run_all(args, budget, cwd).map(Done::TrainAll)
+                }
+                TrainOp::Status(candidate) => train::status(args, candidate, cwd)
+                    .map(Done::TrainStatus)
+                    .map_err(TrainError::Report),
+            };
+            match trained {
+                Ok(done) => Ok(done),
+                Err(TrainError::Report(report)) => Err(report),
+                // 中断の報告は終了コードを従来の写像のまま返す（#486）。
+                Err(TrainError::Interrupted(report)) => {
+                    return write_stage_line(out, report.to_json_line())
+                        .map(|_| report.exit_code());
+                }
             }
-            TrainOp::Run(TrainTarget::All { budget }) => {
-                train::run_all(args, budget, cwd).map(Done::TrainAll)
-            }
-            TrainOp::Status(candidate) => {
-                train::status(args, candidate, cwd).map(Done::TrainStatus)
-            }
-        },
+        }
         Command::Evaluate(args) => evaluate::run(args, cwd).map(Done::Evaluate),
         Command::Select(args) => select::run(args, cwd).map(Done::Select),
         Command::Package(args) => package::run(args, cwd).map(Done::Package),
