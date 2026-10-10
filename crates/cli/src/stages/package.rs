@@ -80,6 +80,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
+use fandhe_edge_core::artifact_meta::MAX_ARTIFACT_META_BYTES;
 use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
@@ -518,7 +519,12 @@ fn with_calibration_sha256(meta_bytes: &[u8], calibration: &[u8]) -> Result<Vec<
         r#","calibration_sha256":"{}""#,
         Sha256Digest::of_bytes(calibration).to_hex()
     );
-    Ok([head, field.as_bytes(), tail].concat())
+    let out = [head, field.as_bytes(), tail].concat();
+    // 追記後も `infer` の上限付き読み込み（[`MAX_ARTIFACT_META_BYTES`]）で読めることを公開前に確かめる。
+    if u64::try_from(out.len()).map_or(true, |n| n > MAX_ARTIFACT_META_BYTES) {
+        return Err(invalid("artifact metadata is too large"));
+    }
+    Ok(out)
 }
 
 /// 評価記録の `baseline_comparison` が定義と一致するか（#339・REQ-25）。
@@ -1197,6 +1203,20 @@ mod tests {
             Ok(parsed.label_order().to_vec())
         );
         assert!(with_calibration_sha256(b"[]", b"x").is_err());
+    }
+
+    /// REQ-39・#497: 追記で `infer` の読み込み上限を超える配布用メタデータは公開しない。
+    #[test]
+    fn req39_issue497_appended_meta_over_read_limit_is_rejected() {
+        let limit = usize::try_from(MAX_ARTIFACT_META_BYTES).expect("limit");
+        let mut meta = vec![b' '; limit - 2];
+        meta.splice(0..0, b"{}".iter().copied());
+        assert_eq!(
+            with_calibration_sha256(&meta, b"{}")
+                .expect_err("over limit")
+                .message,
+            "artifact metadata is too large"
+        );
     }
 
     fn definition_with(acceptance: Option<u32>) -> Definition {

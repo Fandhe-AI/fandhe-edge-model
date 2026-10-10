@@ -657,6 +657,18 @@ mod tests {
         assert_eq!(m.calibration_sha256(), None);
     }
 
+    /// REQ-39: 語彙ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
+    #[test]
+    fn req39_meta_vocab_sha256_is_optional_and_validated() {
+        let ok = format!(r#","vocab_sha256":"{}""#, "a".repeat(64));
+        let m = ArtifactMeta::parse(full_meta(&ok).as_bytes()).expect("ok");
+        assert_eq!(m.vocab_sha256(), Some("a".repeat(64).as_str()));
+        assert_eq!(
+            ArtifactMeta::parse(full_meta(r#","vocab_sha256":"zz""#).as_bytes()),
+            Err(ArtifactMetaError::Malformed)
+        );
+    }
+
     /// REQ-39・#497: 校正ファイルの sha256 は任意だが、あれば小文字 16 進 64 桁でなければならない。
     #[test]
     fn req39_issue497_meta_calibration_sha256_is_optional_and_validated() {
