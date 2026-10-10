@@ -12,12 +12,23 @@
 #
 # 使い方:
 #   sandbox-run.sh --definition PATH --project-dir DIR --out-dir DIR
-#                  [--candidates N] [--infer-text TEXT] [--smoke]
+#                  [--candidates N] [--infer-text TEXT] [--smoke] [--extended]
 #   値を取るオプションは `--key VALUE` と `--key=VALUE` の両方を受け付ける。
 #   --project-dir は存在しないこと、--out-dir は存在しないか空であること
 #   （既存の内容を削除・上書きしない。違反は invalid_input(64)）。
 #
 # 契約:
+#   - `--extended`（任意。#469 の CLI 結線で増えた工程・引数も通信 0 件で完走することの確認用）:
+#     上の 7 工程に続けて、別プロジェクト <project-dir>-extended（存在しないこと。--project-dir と同じ
+#     検証）で register・inspect・`train --all --smoke --budget-seconds 600`・`train --status`・
+#     `train --cancel` を実行し、最後に本プロジェクトの package へ
+#     `infer --version-ledger <project-dir>/version_ledger.json --version-id v1` を実行する。
+#     `train --all` は既存の候補ディレクトリを拒否するため別プロジェクトで行う（実機では実 trainer が要る）。
+#     校正・保留（calibration・abstention）は上の evaluate が出し、--extended のときは評価ありの
+#     evaluate の結果に calibration・abstention がオブジェクトで含まれることも構造検証する
+#     （評価データありかつ smoke なしで使う。`fixtures/sandbox_run_eval`）。版管理台帳は上の package が
+#     `<project-dir>/version_ledger.json` として作る。許容する終了コードは全工程 0（infer は従来どおり
+#     11・12 も可）。--extended なしの挙動・出力は変えない
 #   - 各工程を `<launcher> -p '(version 1)(allow default)(deny network*)' <bin> <工程> ...`
 #     で起動する。遮断プロファイルは定数で、弱める経路（オプション・環境変数）を設けない。
 #     train が起動する学習ワーカー（Python）の子プロセスも sandbox を継承する前提で、
@@ -99,6 +110,7 @@ out_dir=
 candidates=1
 infer_text='sandbox check 0123456789'
 smoke=0
+extended=0
 seen=
 while [ $# -gt 0 ]; do
     key=$1
@@ -113,7 +125,15 @@ while [ $# -gt 0 ]; do
     esac
     case "$key" in
         --help)
-            fail 0 ok "usage: sandbox-run.sh --definition PATH --project-dir DIR --out-dir DIR [--candidates N] [--infer-text TEXT] [--smoke]"
+            fail 0 ok "usage: sandbox-run.sh --definition PATH --project-dir DIR --out-dir DIR [--candidates N] [--infer-text TEXT] [--smoke] [--extended]"
+            ;;
+        --extended)
+            [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
+            case "$seen" in *" extended "*) fail 64 invalid_input "duplicate option" ;; esac
+            seen="$seen extended "
+            extended=1
+            shift
+            continue
             ;;
         --smoke)
             [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
@@ -194,6 +214,23 @@ esac
 case "$canon_project/" in
     "$canon_out/"*) fail 64 invalid_input "output directory must be separate from project directory" ;;
 esac
+
+# --extended の別プロジェクト（train --all は既存の候補ディレクトリを拒否するため分ける）
+ext_project="${project_dir}-extended"
+if [ "$extended" -eq 1 ]; then
+    if [ -e "$ext_project" ] || [ -L "$ext_project" ]; then
+        fail 64 invalid_input "extended project directory already exists"
+    fi
+    canon_path "$ext_project" || fail 64 invalid_input "cannot resolve extended project directory"
+    _ext=$canon_out
+    canon_path "$out_dir" || fail 64 invalid_input "cannot resolve output directory"
+    case "$canon_out/" in
+        "$_ext/"*) fail 64 invalid_input "output directory must be separate from project directory" ;;
+    esac
+    case "$_ext/" in
+        "$canon_out/"*) fail 64 invalid_input "output directory must be separate from project directory" ;;
+    esac
+fi
 
 # ---- 前提（launcher・バイナリ）。CLI を起動する前に fail-closed で確認する ----
 override=false
@@ -446,7 +483,10 @@ elif v.get("step") != name:
 elif name == "evaluate" and v.get("status") == "skipped":
     print("skipped")
 elif v.get("status") == "ok":
-    if name == "select":
+    if name == "evaluate" and sys.argv[3] == "1" and not (isinstance(v.get("calibration"), dict) and isinstance(v.get("abstention"), dict)):
+        # --extended: 校正・保留（REQ-22）が出ていない評価を完了として扱わない
+        print("invalid")
+    elif name == "select":
         # select の出力の candidate（非負整数）を後段の evaluate の対象にする
         c = v.get("candidate")
         if isinstance(c, int) and not isinstance(c, bool) and c >= 0:
@@ -457,7 +497,7 @@ elif v.get("status") == "ok":
         print("ok")
 else:
     print("invalid")
-' "$name" "$infer_status" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
+' "$name" "$infer_status" "$extended" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;
             ok) [ "$name" != "evaluate" ] || status='"ok"' ;;
@@ -532,6 +572,19 @@ run_all() {
         do_step package - package --project-dir "$project_dir" || return 0
     fi
     do_step infer - infer --package "$project_dir/package" --text "$infer_text" || return 0
+    [ "$extended" -eq 1 ] || return 0
+    run_extended || return 0
+}
+
+# --extended の追加工程（REQ-38・#469）。全工程 0 のみ許容し、失敗で停止する
+run_extended() {
+    do_step register - register --definition "$definition" --project-dir "$ext_project" || return 1
+    do_step inspect - inspect --project-dir "$ext_project" || return 1
+    do_step train - train --project-dir "$ext_project" --all --smoke --budget-seconds 600 || return 1
+    do_step train - train --project-dir "$ext_project" --status || return 1
+    do_step train - train --project-dir "$ext_project" --cancel || return 1
+    do_step infer - infer --package "$project_dir/package" --text "$infer_text" \
+        --version-ledger "$project_dir/version_ledger.json" --version-id v1 || return 1
 }
 run_all
 ended=$(utc_now)

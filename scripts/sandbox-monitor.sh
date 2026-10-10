@@ -12,7 +12,7 @@
 #
 # 使い方:
 #   sandbox-monitor.sh --definition PATH --project-dir DIR --out-dir DIR
-#                      [--candidates N] [--infer-text TEXT] [--smoke]
+#                      [--candidates N] [--infer-text TEXT] [--smoke] [--extended]
 #   sandbox-run.sh と同じオプション体系（`--key VALUE` と `--key=VALUE`）。--project-dir は
 #   存在しないこと、--out-dir は存在しないか空であること（違反は invalid_input(64)）。
 #
@@ -101,6 +101,7 @@ has_candidates=0
 infer_text=
 has_infer_text=0
 smoke=0
+extended=0
 seen=
 while [ $# -gt 0 ]; do
     key=$1
@@ -115,7 +116,15 @@ while [ $# -gt 0 ]; do
     esac
     case "$key" in
         --help)
-            fail 0 ok "usage: sandbox-monitor.sh --definition PATH --project-dir DIR --out-dir DIR [--candidates N] [--infer-text TEXT] [--smoke]"
+            fail 0 ok "usage: sandbox-monitor.sh --definition PATH --project-dir DIR --out-dir DIR [--candidates N] [--infer-text TEXT] [--smoke] [--extended]"
+            ;;
+        --extended)
+            [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
+            case "$seen" in *" extended "*) fail 64 invalid_input "duplicate option" ;; esac
+            seen="$seen extended "
+            extended=1
+            shift
+            continue
             ;;
         --smoke)
             [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
@@ -409,6 +418,7 @@ set -- --definition "$definition" --project-dir "$project_dir" --out-dir "$out_d
 [ "$has_candidates" -eq 0 ] || set -- "$@" --candidates "$candidates"
 [ "$has_infer_text" -eq 0 ] || set -- "$@" --infer-text "$infer_text"
 [ "$smoke" -eq 0 ] || set -- "$@" --smoke
+[ "$extended" -eq 0 ] || set -- "$@" --extended
 run_rc=0
 "$run_script" "$@" </dev/null >/dev/null 2>&1 || run_rc=$?
 

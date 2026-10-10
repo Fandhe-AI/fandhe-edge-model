@@ -373,6 +373,104 @@ fn req27_allow_smoke_is_passed_to_package_only_with_smoke() {
     );
 }
 
+const EXT_EVAL_OK: &str = r#"{"step":"evaluate","status":"ok","calibration":{},"abstention":{}}"#;
+
+/// REQ-38・#469: `--extended` は 7 工程の後に別プロジェクトの register・inspect・`train --all --smoke`・
+/// `--status`・`--cancel` と、台帳つきの infer を同じ順で足す。証拠種別はテストハーネス（偽の launcher・偽の CLI）。
+#[test]
+fn req38_extended_appends_steps_in_order() {
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--extended".to_string());
+    let o = e.run(&args, &[("FAKE_EVAL_OUT", EXT_EVAL_OK)]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(e.launch_calls().len(), 13);
+    assert_eq!(
+        e.cli_calls(),
+        [
+            "register -",
+            "inspect -",
+            "train 0",
+            "select -",
+            "evaluate 0",
+            "package -",
+            "infer -",
+            "register -",
+            "inspect -",
+            "train -",
+            "train -",
+            "train -",
+            "infer -",
+        ]
+    );
+    let (p, x) = (
+        e.project().display().to_string(),
+        format!("{}-extended", e.project().display()),
+    );
+    let a = e.cli_args();
+    assert_eq!(
+        a[7],
+        format!(
+            "register --definition {} --project-dir {x}",
+            e.definition().display()
+        )
+    );
+    assert_eq!(a[8], format!("inspect --project-dir {x}"));
+    assert_eq!(
+        a[9],
+        format!("train --project-dir {x} --all --smoke --budget-seconds 600")
+    );
+    assert_eq!(a[10], format!("train --project-dir {x} --status"));
+    assert_eq!(a[11], format!("train --project-dir {x} --cancel"));
+    assert_eq!(
+        a[12],
+        format!(
+            "infer --package {p}/package --text sandbox check 0123456789 --version-ledger {p}/version_ledger.json --version-id v1"
+        )
+    );
+}
+
+/// `--extended` なしは追加工程を起動しない（従来の 7 回のまま）。値つき・重複・既存の別プロジェクトは 64。
+#[test]
+fn req38_extended_option_is_validated_and_opt_in() {
+    let e = Env::new();
+    let o = e.run(&e.base_args(), &[]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    assert_eq!(e.cli_calls().len(), 7);
+    for extra in [s(&["--extended=1"]), s(&["--extended", "--extended"])] {
+        let e = Env::new();
+        let mut args = e.base_args();
+        args.extend(extra);
+        let o = e.run(&args, &[("FAKE_EVAL_OUT", EXT_EVAL_OK)]);
+        assert_eq!(o.code, Some(64), "stdout={}", o.stdout);
+        assert!(e.cli_calls().is_empty());
+    }
+    let e = Env::new();
+    fs::create_dir(format!("{}-extended", e.project().display())).expect("mkdir");
+    let mut args = e.base_args();
+    args.push("--extended".to_string());
+    let o = e.run(&args, &[("FAKE_EVAL_OUT", EXT_EVAL_OK)]);
+    assert_eq!(o.code, Some(64), "stdout={}", o.stdout);
+    assert!(e.cli_calls().is_empty());
+}
+
+/// REQ-22・REQ-38: `--extended` では評価ありの evaluate が calibration・abstention を出さなければ 70 で止まる
+/// （追加工程は起動しない）。`--extended` なしの同じ出力は従来どおり完了する。
+#[test]
+fn req22_extended_requires_calibration_and_abstention_in_evaluate() {
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--extended".to_string());
+    let o = e.run(&args, &[]);
+    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
+    assert!(
+        o.stdout.contains("\"failed_step\":\"evaluate\""),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(e.cli_calls().len(), 5);
+}
+
 /// launcher へ渡す遮断プロファイルが PoC-14/16 と完全一致する（弱める経路がない）。
 #[test]
 fn req38_profile_argv_is_exact() {

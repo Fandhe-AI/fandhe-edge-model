@@ -55,6 +55,28 @@ cd <作業ディレクトリ>
   --out-dir out --candidates 1
 ```
 
+### 3-C. 拡張確認（`--extended`。評価データあり・smoke なし）
+
+REQ-38・#469 の CLI 結線で増えた工程・引数も、通信 0 件で完走することを確かめる任意の経路。3-B と同じ入力
+（`fixtures/sandbox_run_eval/`）・前提で、`--extended` を足す（`--smoke` と併用すると evaluate が skipped になり、
+校正・保留の確認が成立しない）。
+
+- 7 工程の後に、別プロジェクト `<project-dir>-extended`（未作成であること。`train --all` が既存の候補を拒否するため分ける）で
+  `register`・`inspect`・`train --all --smoke --budget-seconds 600`・`train --status`・`train --cancel` を実行し、
+  最後に本プロジェクトの package へ `infer --version-ledger <project-dir>/version_ledger.json --version-id v1` を実行する
+- 校正・保留（REQ-22）は 7 工程内の `evaluate` が出す。`--extended` では `calibration`・`abstention` がオブジェクトで
+  ない evaluate を完了扱いにせず 70 で止める。版管理台帳 `version_ledger.json` は 7 工程内の `package` が作る
+- `train --cancel` は対象のジョブ（実行中）が無いため、空の一覧を返して exit 0 になる想定（`cancellations` が空）
+- 許容する終了コードは全工程 0（infer は従来どおり判定行の status が一致する 11・12 も可）。1 つでも 0 以外なら
+  その工程で停止する
+- 実 trainer での学習を含むため 3-B より時間がかかる。実行は人の担当で、Agent は実行しない
+
+```bash
+cd <作業ディレクトリ>
+<REPO>/scripts/sandbox-monitor.sh --definition definition.json --project-dir project \
+  --out-dir out --candidates 1 --extended
+```
+
 ## 4. 判定の読み方
 
 | 終了コード | `network_verdict` | 意味 |
@@ -86,6 +108,9 @@ cd <作業ディレクトリ>
     （smoke は evaluate を起動せず skipped として記録される）
   - 3-B（評価データあり）の場合: `step` が `evaluate` の要素の `status` が `ok` で、`steps[]` に `status` が
     `skipped` の要素が 0 件であること（`status` に値が入るのは evaluate だけで、ほかの工程は `null`）
+  - 3-C（`--extended`）の場合: `steps[]` が `--candidates 1` で 13 要素（7 工程 + `register`・`inspect`・`train`×3・
+    `infer`）で全要素の `exit_code` が 0、`evaluate` の `status` が `ok`、`<project-dir>-extended` が作られていること。
+    証拠種別は実機（実機で未実施の間は「テストハーネスのみ。実機未確認」と明記する）
 - 記録はすべて `out/` 配下のファイルから取る。`sandbox-run.sh` の標準出力（集計 message）は
   `sandbox-monitor.sh` が捨てるため残らず、記録項目に含めない
 - 生ログ `log_stream.ndjson` は他アプリのイベントを含むため**転記しない**。データ本文・パスも記録しない
