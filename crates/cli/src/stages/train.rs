@@ -31,6 +31,15 @@
 //! 保持 fd 起点で行う（symlink は辿らない。差し替えられていれば何も消さず 70）。`train --all` の開始時も
 //! 同じ規則で既存の候補ディレクトリを扱う。
 //!
+//! # 中断時の報告（REQ-21・REQ-33・REQ-34・TASK-34.3・#486）
+//!
+//! ジョブの開始後に終わった失敗（ワーカー失敗・クラッシュ・壁時計超過・キャンセル）は、従来の
+//! `{"code","message"}` に `step`・`candidate`・`job`（ジョブ記録の状態）・`restart`（やり直し案内。
+//! `resumable` は常に `false`）を足した [`TrainInterruptedReport`] で返す（[`TrainError::Interrupted`]）。
+//! 終了コード・`code`・`message` は従来の写像のまま。ジョブ開始前の失敗は従来の 2 キー。`--all` では探索を
+//! 中断した候補の失敗（プロセス失敗・キャンセル）だけがこの形で、探索が続く候補のワーカー失敗は従来どおり。
+//! 再開の口（`--resume` 等）は作らない（チェックポイントからの再開は提供しない。REQ-34）。
+//!
 //! # `--status`（#485）
 //!
 //! [`status`] は記録のある候補のジョブ状態（[`read_job_status_in`] の結果をそのまま）とやり直し案内を
@@ -83,14 +92,15 @@ use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, 
 use fandhe_edge_train::request::{
     Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
+use fandhe_edge_train::restart::{RestartGuidance, guidance_for_run};
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{
     CandidateSearchResult, SearchBudget, SearchCandidate, SearchError, SearchInput, SearchRecord,
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainStatusEntry, allotted_time_limit_seconds,
-    outcome_json_vec, search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainInterruptedReport, TrainStatusEntry,
+    allotted_time_limit_seconds, outcome_json_vec, search_record_json_vec, trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
@@ -193,13 +203,54 @@ pub fn resolve_candidates(
     Ok(resolution.into_candidates())
 }
 
+/// `train`（学習。単発・`--all`）の失敗の stdout。
+#[derive(Debug)]
+pub enum TrainError {
+    /// ジョブの開始前の失敗など（従来の `{"code","message"}`）。
+    Report(ErrorReport),
+    /// ジョブの開始後に終わった失敗（モジュール doc「中断時の報告」。#486）。
+    Interrupted(TrainInterruptedReport),
+}
+
+impl From<ErrorReport> for TrainError {
+    fn from(report: ErrorReport) -> Self {
+        Self::Report(report)
+    }
+}
+
+/// 候補 `index` のジョブ記録の状態を読む（`--all` は片付けの前に呼ぶ）。記録が無い・照会に失敗した場合は
+/// `None`（[`interrupted_error`] は従来の 2 キーへ倒す。照会の失敗で元の失敗の終了コードを変えないため）。
+fn candidate_job_status(project: &Project, index: usize) -> Option<JobStatusReport> {
+    let dir = project
+        .open_subdir_optional(candidate_rel(index))
+        .ok()
+        .flatten()?;
+    job_status_in(&dir).ok().flatten()
+}
+
+/// ジョブの開始後に終わった候補 `index` の失敗 `report` を [`TrainInterruptedReport`] にする（単発・`--all`
+/// 共通。REQ-34・TASK-34.3・#486）。`job` が無ければ（記録を読めない）従来の 2 キーのまま返す。
+fn interrupted_error(
+    report: ErrorReport,
+    index: usize,
+    job: Option<JobStatusReport>,
+    restart: RestartGuidance,
+) -> TrainError {
+    let Some(job) = job else {
+        return TrainError::Report(report);
+    };
+    TrainInterruptedReport::new(report, index, job, restart)
+        .map_or_else(TrainError::Report, TrainError::Interrupted)
+}
+
 /// `train --candidate <index>` を実行する。
 ///
 /// # Errors
 /// 前提（`inspect` 済み）の欠落・候補の範囲外・やり直せない既存の候補ディレクトリ（モジュール doc
 /// 「ジョブ記録とやり直し」）・既存の `search_record.json`（`train --all` 済み）は `invalid_input`（64）、
-/// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。
-pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, ErrorReport> {
+/// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。ジョブの開始後に
+/// 終わった失敗は [`TrainError::Interrupted`]（モジュール doc「中断時の報告」）。
+pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, TrainError> {
     let project = Project::open(cwd, &args.project_dir)?;
     // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
     super::inspect::ensure_evaluation_frozen(&project)?;
@@ -209,7 +260,7 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     // `train --all` 済みのプロジェクトへ予算外で候補を足さない（予算内と予算外で学習した候補が混ざって
     // 選定されるのを防ぐ。`--all` が既存の候補ディレクトリを拒否するのと対称。REQ-18・#482）。
     if project.exists(SEARCH_RECORD_FILE)? {
-        return Err(invalid("search record already exists"));
+        return Err(invalid("search record already exists").into());
     }
     // 学習 seed は既定で分割の seed。`--train-seed` は学習だけを上書きし、分割・凍結は変えない。
     // 上書き時は実際に使った値を `train_seed.txt` に記録し、下流（evaluate・select・package）は
@@ -218,7 +269,7 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
 
     let mut candidates = resolve_candidates(&project, &definition, index, seed)?;
     if index >= candidates.len() {
-        return Err(invalid("candidate index is out of range"));
+        return Err(invalid("candidate index is out of range").into());
     }
     let mut candidate = candidates.swap_remove(index);
     if args.smoke {
@@ -255,16 +306,25 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     match trained {
         Ok(()) => Ok(TrainReport::new(index, candidate.candidate_id)),
         Err(TrainFailure {
+            report,
+            restart: Some(restart),
+        }) => Err(interrupted_error(
+            report,
+            index,
+            candidate_job_status(&project, index),
+            restart,
+        )),
+        Err(TrainFailure {
             mut report,
-            job_failed,
+            restart: None,
         }) => {
-            if !job_failed && !project.remove_created_dir(&created) {
+            if !project.remove_created_dir(&created) {
                 // 元のエラーの終了コードは変えず、残骸があることだけ固定文言で付記する。
                 report
                     .message
                     .push_str("; candidate directory could not be cleaned up");
             }
-            Err(report)
+            Err(report.into())
         }
     }
 }
@@ -315,10 +375,11 @@ fn member_exists(dir: &ConfinedPackage, name: &str) -> Result<bool, ErrorReport>
     }
 }
 
-/// 単発の `train` の失敗。`job_failed` はジョブ記録が失敗で終わった（候補ディレクトリを残す）か。
+/// 単発の `train` の失敗。`restart` はジョブが失敗で終わった（候補ディレクトリを残し、中断として報告する）
+/// ときのやり直し案内。
 struct TrainFailure {
     report: ErrorReport,
-    job_failed: bool,
+    restart: Option<RestartGuidance>,
 }
 
 impl TrainFailure {
@@ -326,16 +387,14 @@ impl TrainFailure {
     fn cleanup(report: ErrorReport) -> Self {
         Self {
             report,
-            job_failed: false,
+            restart: None,
         }
     }
 
-    /// ジョブが失敗で終わった（候補ディレクトリは `--status` のために残す）。
-    fn job(report: ErrorReport) -> Self {
-        Self {
-            report,
-            job_failed: true,
-        }
+    /// ジョブが失敗で終わった（候補ディレクトリは `--status` のために残す）。`restart` は
+    /// [`guidance_for_run`] の結果で、中断には必ず `Some`（`None` は内部の不整合で、片付ける側へ倒す）。
+    fn job(report: ErrorReport, restart: Option<RestartGuidance>) -> Self {
+        Self { report, restart }
     }
 }
 
@@ -352,14 +411,14 @@ fn train_in_candidate_dir(
     let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)
         .map_err(TrainFailure::cleanup)?;
 
-    let outcome = run_recorded_job(launcher, request, job_dir).map_err(|e| match e {
-        RecordedJobError::Run(e) => TrainFailure::job(e.to_error_report()),
+    let (outcome, restart) = run_recorded_job(launcher, request, job_dir).map_err(|e| match e {
+        RecordedJobError::Run(e, restart) => TrainFailure::job(e.to_error_report(), restart),
         RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
             TrainFailure::cleanup(e.to_error_report())
         }
     })?;
     if let Some(report) = train_outcome_error_report(&outcome) {
-        return Err(TrainFailure::job(report));
+        return Err(TrainFailure::job(report, restart));
     }
     let TrainOutcome::Ok(success) = &outcome else {
         return Err(TrainFailure::cleanup(runtime("unexpected train outcome")));
@@ -378,7 +437,8 @@ enum RecordedJobError {
     /// ジョブ記録を開始できなかった（子は起動していない・記録は残らない）。
     Begin(JobRecordError),
     /// ジョブが失敗した（終端記録は `failed`。書けなかった場合も次の状態確認が `owner_lost` を検出する）。
-    Run(TrainProcessError),
+    /// 実行結果から決めたやり直し案内（[`guidance_for_run`]）を添える。
+    Run(TrainProcessError, Option<RestartGuidance>),
     /// 学習は成功したが終端記録を書けなかった（記録と結果が食い違うため成功として扱わない）。
     Record(JobRecordError),
 }
@@ -386,12 +446,13 @@ enum RecordedJobError {
 /// 学習ジョブを保持した `job_dir` に記録しながら実行する（単発の `train` と `train --all` が共有する。
 /// REQ-34・TASK-34.2・#485）。記録の読み書きは保持 fd 起点（[`ConfinedJobDir`]。#510）で、パスは学習
 /// ワーカーの起動（`request.json`・作業ディレクトリ）にだけ渡す。ワーカーが返した失敗
-/// （`TrainOutcome::Error`）は `Ok` で返す（呼び出し元が写す）。
+/// （`TrainOutcome::Error`）は `Ok` で返す（呼び出し元が写す）。`Ok` の 2 要素目は実行結果のやり直し案内
+/// （[`guidance_for_run`]。成功なら `None`）。
 fn run_recorded_job(
     launcher: &WorkerLauncher,
     request: &TrainRequest,
     job_dir: ConfinedPackage,
-) -> Result<TrainOutcome, RecordedJobError> {
+) -> Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError> {
     let path = job_dir.dir().to_path_buf();
     let recorded = TrainJob::new()
         .run_recorded_in(
@@ -402,19 +463,24 @@ fn run_recorded_job(
             &RunLimits::for_request(request),
         )
         .map_err(RecordedJobError::Begin)?;
+    // 案内は写像の前の実行結果から決める（キャンセルは残置の観測を使う。#486）。
+    let restart = guidance_for_run(&recorded.run);
     let outcome = match recorded.run {
         Ok(TrainRunEnd::Completed(run)) => run.outcome().clone(),
         // キャンセルの口を持たないため起こらない。`run_train` と同じ写像にする（キャンセルは #484）。
         Ok(TrainRunEnd::Cancelled(_)) => {
-            return Err(RecordedJobError::Run(TrainProcessError::Wait {
-                kind: std::io::ErrorKind::Interrupted,
-            }));
+            return Err(RecordedJobError::Run(
+                TrainProcessError::Wait {
+                    kind: std::io::ErrorKind::Interrupted,
+                },
+                restart,
+            ));
         }
-        Err(e) => return Err(RecordedJobError::Run(e)),
+        Err(e) => return Err(RecordedJobError::Run(e, restart)),
     };
     match (recorded.record, &outcome) {
         (Err(e), TrainOutcome::Ok(_)) => Err(RecordedJobError::Record(e)),
-        _ => Ok(outcome),
+        _ => Ok((outcome, restart)),
     }
 }
 
@@ -622,22 +688,26 @@ type JobFn<'a> =
 ///
 /// # Errors
 /// 前提の欠落・既存の候補ディレクトリ・既存の `search_record.json` は `invalid_input`（64）。
-/// 評価済みの候補が無いときの終了コードはモジュール doc「`--all`」のとおり。
+/// 評価済みの候補が無いときの終了コードはモジュール doc「`--all`」のとおり。探索を中断した候補の
+/// プロセス失敗・キャンセルは [`TrainError::Interrupted`]（モジュール doc「中断時の報告」）。
 pub fn run_all(
     args: &TrainArgs,
     budget: SearchBudget,
     cwd: &Path,
-) -> Result<TrainAllReport, ErrorReport> {
+) -> Result<TrainAllReport, TrainError> {
     let launcher_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
         let launcher = worker_launcher()?;
         Ok(Box::new(
             move |request: &TrainRequest, job_dir: ConfinedPackage| {
-                run_recorded_job(&launcher, request, job_dir).map_err(|e| match e {
-                    RecordedJobError::Run(e) => AllRunError::Process(e),
-                    RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
-                        AllRunError::Report(e.to_error_report())
-                    }
-                })
+                run_recorded_job(&launcher, request, job_dir)
+                    .map_err(|e| match e {
+                        RecordedJobError::Run(e, restart) => AllRunError::Process(e, restart),
+                        RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+                            AllRunError::Report(e.to_error_report())
+                        }
+                    })
+                    // 探索が続く候補のワーカー失敗は従来どおり（案内は探索を中断する失敗にだけ添える）。
+                    .map(|(outcome, _)| outcome)
             },
         ))
     };
@@ -651,7 +721,7 @@ fn run_all_with<'a, M, C>(
     cwd: &Path,
     make_job: M,
     clock: &C,
-) -> Result<TrainAllReport, ErrorReport>
+) -> Result<TrainAllReport, TrainError>
 where
     M: FnOnce() -> Result<Box<JobFn<'a>>, ErrorReport>,
     C: Clock,
@@ -682,7 +752,7 @@ where
     // `train` と同じ規則（[`ensure_restartable`]）で、全候補がやり直せる場合だけ、学習ジョブの開始直前に
     // まとめて消す（1 件でもやり直せなければ何も消さずに止める）。
     if project.exists(SEARCH_RECORD_FILE)? {
-        return Err(invalid("search record already exists"));
+        return Err(invalid("search record already exists").into());
     }
     let mut stale = Vec::new();
     for index in 0..n_candidates {
@@ -743,12 +813,27 @@ where
     );
     let record = match searched {
         Ok(record) => record,
-        Err(error) => return Err(runner.clean_up(search_error_report(error))),
+        Err(error) => {
+            // 探索を中断した候補のプロセス失敗・キャンセルは、片付けの前にジョブ記録を読み、中断として
+            // 報告する（片付けの規則は不変。#486）。
+            let interrupted = match &error {
+                SearchError::Candidate {
+                    index,
+                    source: CandidateTimeError::Runner(AllRunError::Process(_, Some(restart))),
+                } => Some((*index, *restart, candidate_job_status(&project, *index))),
+                _ => None,
+            };
+            let report = runner.clean_up(search_error_report(error));
+            return Err(match interrupted {
+                Some((index, restart, job)) => interrupted_error(report, index, job, restart),
+                None => report.into(),
+            });
+        }
     };
     if let Err(report) = runner.publish(&record) {
-        return Err(runner.clean_up(report));
+        return Err(runner.clean_up(report).into());
     }
-    all_outcome(&record, &runner.outcomes)
+    all_outcome(&record, &runner.outcomes).map_err(Into::into)
 }
 
 /// 探索結果から `train --all` の終了コードと stdout を決める（モジュール doc「`--all`」）。
@@ -811,7 +896,7 @@ fn search_error_report(error: SearchError<AllRunError>) -> ErrorReport {
             ..
         } => report,
         SearchError::Candidate {
-            source: CandidateTimeError::Runner(AllRunError::Process(process)),
+            source: CandidateTimeError::Runner(AllRunError::Process(process, _)),
             ..
         } => process.to_error_report(),
         _ => runtime("candidate search failed"),
@@ -820,13 +905,15 @@ fn search_error_report(error: SearchError<AllRunError>) -> ErrorReport {
 
 /// [`CandidateDirRunner`] の失敗（学習ジョブの子プロセスの失敗と、候補の準備・検査の失敗）。
 enum AllRunError {
-    Process(TrainProcessError),
+    /// 子プロセスの失敗と、実行結果のやり直し案内（[`guidance_for_run`]。ジョブを記録しない偽の実行は
+    /// `None` で、探索を中断しても従来の 2 キーで報告する）。
+    Process(TrainProcessError, Option<RestartGuidance>),
     Report(ErrorReport),
 }
 
 impl From<TrainProcessError> for AllRunError {
     fn from(e: TrainProcessError) -> Self {
-        Self::Process(e)
+        Self::Process(e, None)
     }
 }
 
@@ -895,7 +982,7 @@ impl CandidateRunner for CandidateDirRunner<'_, '_> {
     }
 
     fn is_wall_timeout(error: &AllRunError) -> bool {
-        matches!(error, AllRunError::Process(e) if <WorkerCandidateRunner<'_> as CandidateRunner>::is_wall_timeout(e))
+        matches!(error, AllRunError::Process(e, _) if <WorkerCandidateRunner<'_> as CandidateRunner>::is_wall_timeout(e))
     }
 }
 
@@ -1458,8 +1545,11 @@ mod all_tests {
         };
         let error = run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
             .expect_err("no candidate evaluated");
-        assert_eq!(error.code, ExitCode::Pending);
-        assert_eq!(error.message, "train worker failed: training_diverged");
+        // 探索が続く候補のワーカー失敗は従来どおりの 2 キー（中断の形にしない。#486）。
+        assert_eq!(
+            train_error_pair(&error),
+            (ExitCode::Pending, "train worker failed: training_diverged")
+        );
         let proj = cwd.join("proj");
         assert!(!proj.join("candidates/0").exists());
         assert!(!proj.join("candidates/1").exists());
@@ -1479,7 +1569,7 @@ mod all_tests {
         )
         .expect_err("existing record");
         assert_eq!(
-            error_pair(&again),
+            train_error_pair(&again),
             (ExitCode::InvalidInput, "search record already exists")
         );
         // `train --all` 済みのプロジェクトへの単発の `train --candidate` も同じく拒否する（予算内と予算外で
@@ -1490,7 +1580,7 @@ mod all_tests {
         };
         let rejected = run(&single, 0, &cwd).expect_err("existing record");
         assert_eq!(
-            error_pair(&rejected),
+            train_error_pair(&rejected),
             (ExitCode::InvalidInput, "search record already exists")
         );
         assert!(!proj.join("candidates/0").exists());
@@ -1559,7 +1649,7 @@ mod all_tests {
         let error = run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
             .expect_err("spawn failure");
         assert_eq!(
-            error_pair(&error),
+            train_error_pair(&error),
             (
                 ExitCode::RuntimeError,
                 "failed to spawn worker process: NotFound"
@@ -1587,7 +1677,7 @@ mod all_tests {
         let error = run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
             .expect_err("divergence");
         assert_eq!(
-            error_pair(&error),
+            train_error_pair(&error),
             (
                 ExitCode::RuntimeError,
                 "empty input preprocessing diverges between trainer and runtime"
@@ -1631,6 +1721,7 @@ mod all_tests {
                     limit_ms: 5,
                     child_reaped: true,
                 },
+                None,
             )),
         };
         assert_eq!(search_error_report(wall).code, ExitCode::LimitExceeded);
@@ -1717,7 +1808,7 @@ mod all_tests {
         let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
             .expect_err("no record");
         assert_eq!(
-            error_pair(&e),
+            train_error_pair(&e),
             (ExitCode::InvalidInput, "candidate directory already exists")
         );
         assert!(proj.join("candidates/0/stale.bin").is_file());
@@ -1728,7 +1819,10 @@ mod all_tests {
         let owner = JobRecorder::begin(&proj.join("candidates/1/job"), 100).expect("begin");
         let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
             .expect_err("running");
-        assert_eq!(error_pair(&e), (ExitCode::InvalidInput, "job is running"));
+        assert_eq!(
+            train_error_pair(&e),
+            (ExitCode::InvalidInput, "job is running")
+        );
         assert!(proj.join("candidates/0/stale.bin").is_file());
         owner
             .finish(JobState::Succeeded, None, 110)
@@ -1738,7 +1832,7 @@ mod all_tests {
         let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
             .expect_err("succeeded");
         assert_eq!(
-            error_pair(&e),
+            train_error_pair(&e),
             (ExitCode::InvalidInput, "candidate directory already exists")
         );
         std::fs::remove_dir_all(proj.join("candidates/1")).expect("rm");
@@ -1748,7 +1842,7 @@ mod all_tests {
         let e = run_all_with(&all_args(), SearchBudget::default(), &cwd, never, &clock)
             .expect_err("result.json");
         assert_eq!(
-            error_pair(&e),
+            train_error_pair(&e),
             (ExitCode::InvalidInput, "candidate directory already exists")
         );
         assert!(proj.join("candidates/0/stale.bin").is_file());
@@ -1757,6 +1851,14 @@ mod all_tests {
 
     fn error_pair(report: &ErrorReport) -> (ExitCode, &str) {
         (report.code, report.message.as_str())
+    }
+
+    /// 従来の 2 キーの失敗であることを確かめて `(code, message)` を返す。
+    fn train_error_pair(error: &TrainError) -> (ExitCode, &str) {
+        match error {
+            TrainError::Report(report) => error_pair(report),
+            TrainError::Interrupted(report) => panic!("unexpected interrupted report: {report:?}"),
+        }
     }
 }
 
@@ -1800,6 +1902,55 @@ mod status_tests {
     }
 
     const NOT_INSPECTED: &str = r#"{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse."}"#;
+
+    /// REQ-34・REQ-21・TASK-34.3・#486: 壁時計の締め切りで止めたジョブ（`WallTimeout`。記録は `failed`＋
+    /// `limit_exceeded`）は、終了コード 20・従来の message のまま、ジョブ状態とやり直し案内（`--status` と
+    /// 同じ語彙）を添えて報告する。ジョブ記録を読めなければ従来の 2 キーへ倒す（終了コードは変えない）。
+    #[test]
+    fn req34_issue486_wall_timeout_is_reported_as_interrupted() {
+        use fandhe_edge_train::job_record::classify_run_end;
+        let cwd = workdir("walltimeout");
+        let wall = || TrainProcessError::WallTimeout {
+            limit_ms: 5,
+            child_reaped: true,
+        };
+        let run: Result<TrainRunEnd, TrainProcessError> = Err(wall());
+        let (state, failure) = classify_run_end(&run, 130);
+        JobRecorder::begin(&job_dir(&cwd, 1), 100)
+            .expect("begin")
+            .finish(state, failure, 130)
+            .expect("finish");
+        let restart = guidance_for_run(&run).expect("guidance");
+        let report = wall().to_error_report();
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+
+        let TrainError::Interrupted(interrupted) = interrupted_error(
+            report.clone(),
+            1,
+            candidate_job_status(&project, 1),
+            restart,
+        ) else {
+            panic!("expected interrupted report");
+        };
+        assert_eq!(interrupted.exit_code(), ExitCode::LimitExceeded);
+        assert_eq!(
+            interrupted.to_json_line().expect("json"),
+            format!(
+                r#"{{"code":"limit_exceeded","message":"worker process exceeded wall timeout of 5 ms (child_reaped=true)","step":"train","candidate":1,"job":{{"state":"failed","crash_detected":false,"failure":{{"kind":"error","code":"limit_exceeded"}},"record_updated":false}},"restart":{NOT_INSPECTED}}}"#
+            )
+        );
+
+        let TrainError::Report(plain) = interrupted_error(
+            report.clone(),
+            0,
+            candidate_job_status(&project, 0),
+            restart,
+        ) else {
+            panic!("expected plain report");
+        };
+        assert_eq!(plain, report);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 
     /// REQ-34・#485 (a): 終端記録（`succeeded`・`failed`）をそのまま写し、記録のある候補だけを添字順に
     /// 並べる（記録の無い候補・添字の正準形でない名前は出さない）。`failed` にだけやり直し案内が付く。
