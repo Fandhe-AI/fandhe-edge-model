@@ -1617,25 +1617,12 @@ impl Running {
 }
 
 /// 偽コマンドが書いた pid が、短い猶予のうちに消える（子・孫が残らない）ことを確かめる。
-fn assert_pids_gone(e: &Env, names: &[&str]) {
-    assert_pids_gone_inner(e, names, false);
-}
-
-/// [`assert_pids_gone`] と同じだが、pid ファイルが無い（プロセスが起動する前に止められた）ものは
-/// 「生き残りなし」として通す。全体の上限時間が負荷で先に来ると、偽の make が pid を書く前に止まりうる。
-fn assert_started_pids_gone(e: &Env, names: &[&str]) {
-    assert_pids_gone_inner(e, names, true);
-}
-
 /// pid ファイルの各 PID が終了したことを、最大 10 秒待って確かめる。生存は `ps -A -o pid=,stat=` の一覧
 /// （終了ステータスと形式を検証）で判定し、一覧に無いかゾンビ（Z）なら終了済みとみなす（`kill -0` は
 /// ゾンビにも成功するため使わない。scripts/cli-infer-noninteractive.sh の group_alive と同じ規則）。
-fn assert_pids_gone_inner(e: &Env, names: &[&str], allow_missing: bool) {
+fn assert_pids_gone(e: &Env, names: &[&str]) {
     for name in names {
-        let Some(pid) = e.lines(name).first().cloned() else {
-            assert!(allow_missing, "{name}: pid file is missing");
-            continue;
-        };
+        let pid = e.lines(name).first().cloned().expect("pid");
         let deadline = Instant::now() + Duration::from_secs(10);
         while process_alive(&pid) {
             assert!(Instant::now() < deadline, "{name} ({pid}) still alive");
@@ -2492,23 +2479,25 @@ fn req39_default_overall_timeout_is_recorded() {
 
 /// REQ-39・#364: 全体の上限時間を超えたら子のグループを止め、実行中の項目は failed、残りは not_run
 /// （reason は `overall_timeout`）で record を書き、exit 10 と固定メッセージを返す。子は残らない。
+/// 上限時間は、負荷が高くても偽の make が子・孫を起動して pid を書いた後に来るよう 20 秒にする
+/// （偽の make は止められるまで眠るので、上限時間を延ばしても検証する性質は変わらない）。
 #[test]
 fn req39_overall_timeout_stops_running_item_and_marks_rest_not_run() {
     let e = Env::new();
     let o = e.run(
-        &with_work(&e, &["--items", "D,F", "--overall-timeout-sec", "5"]),
+        &with_work(&e, &["--items", "D,F", "--overall-timeout-sec", "20"]),
         &[("FAKE_MAKE_SLEEP", "1")],
     );
     assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(o.stdout, OVERALL_EXCEEDED, "stderr={}", o.stderr);
-    assert_eq!(e.q("options.overall_timeout_sec"), "5");
+    assert_eq!(e.q("options.overall_timeout_sec"), "20");
     assert_eq!(e.q("items.D.status"), "\"failed\"");
     assert_eq!(e.q("items.D.reason"), "\"overall_timeout\"");
     assert_eq!(e.q("items.F.status"), "\"not_run\"");
     assert_eq!(e.q("items.F.reason"), "\"overall_timeout\"");
     assert!(e.lines("cargo.args").is_empty());
     assert!(e.text("record.md").contains("上限時間"));
-    assert_started_pids_gone(&e, &["make.pid", "make.cpid"]);
+    assert_pids_gone(&e, &["make.pid", "make.cpid"]);
 }
 
 /// REQ-38・REQ-39・#364: 環境採取の `git`・`sysctl`・`sw_vers` は PATH を探さず固定パスで起動され、
