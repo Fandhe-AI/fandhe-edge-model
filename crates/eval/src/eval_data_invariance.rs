@@ -58,7 +58,7 @@
 //!   `fandhe_edge_data::eval_freeze`（TASK-17.2-1・issue #47）が既に実装しており、
 //!   台帳連携（TASK-17.3・issue #49）は本モジュールの対象外
 //! - 終了コード（[`fandhe_edge_core::exitcode::ExitCode`]）への写像は行わない
-//!   （`fandhe_edge_data::eval_freeze::FreezeError` の doc と同様、TASK-33.3 に委ねる）
+//!   （`fandhe_edge_data::eval_freeze::FreezeError::exit_code` の写像と、CLI の `error_report` に委ねる）
 //! - CLI `evaluate` 工程へは #314 で接続済み（`stages::evaluate` が [`FrozenEvalData`] を組み立てる）
 
 use fandhe_edge_core::fs::{self, FsError};

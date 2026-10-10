@@ -259,7 +259,7 @@ pub enum RebuildReason {
 /// 学習ワーカー層（`trainer/`・`crates/train/`）が定義ファイルの更新を検知した際、
 /// 新旧の [`Definition`] を読み込んで `decide_rebuild` に渡し、3 通りの判定結果を
 /// 次のように扱う想定（TASK-20.1-1 の範囲は型と比較骨格のみで、学習ワーカー側の
-/// 実際の呼び出し配線は REQ-18〜20 の後続 TASK で行う）。
+/// 実際の呼び出しは CLI `register --previous-project-dir` が行う（#487））。
 ///
 /// ```
 /// use fandhe_edge_core::definition::Definition;

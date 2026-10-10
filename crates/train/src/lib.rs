@@ -64,7 +64,6 @@
 //! supervisor が保持中の fd で予約を解放するため公開場所に何も残らず、確定済みなら
 //! 成功として扱う。責務分担は [`process`] のモジュール doc）。後続・未実装:
 //! `SIGTERM` による graceful cancel（依存追加か `unsafe` が要りユーザー承認事項）・
-//! キャンセルの終了コード写像（TASK-33.x）・探索途中のキャンセル伝播・
 //! `SIGKILL` フォールバック後に残る予約はやり直しの案内（[`restart`]。再開は提供せず
 //! 自動では掃除しない。TASK-34.3・#147）。
 //!
@@ -75,7 +74,8 @@
 //! （worker・supervisor・ジョブの所有者）が異常終了しても、[`job_record::read_job_status`]
 //! （状態確認の中核）がクラッシュとして検出する。`supervisor.py::_classify_self_exit` の
 //! 資源上限（`limit_exceeded`）とクラッシュの区別は [`job_record`] のモジュール doc。
-//! 後続・未実装: CLI への状態確認の露出（TASK-33.x の承認事項）。
+//! CLI への露出（`train --status`・`train --cancel`・キャンセルの終了コード写像・`train --all` の
+//! 探索途中のキャンセルによる探索中断）は `stages::train` で接続済み（#484・#485）。
 //!
 //! # スコープ外（#178 以降も対象外）
 //!

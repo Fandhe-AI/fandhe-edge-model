@@ -6,8 +6,8 @@
 //! 期待どおり（1 行・宣言順・改行 1 つ）であることを確認する。
 //!
 //! 本テストは `fandhe-edge-cli` の lib ターゲット（`fandhe_edge_cli`）を直
-//! 接呼ぶ。CLI バイナリ（`fandhe-edge`）は TASK-33.1 でまだ配線しておらず、
-//! `tests/stub.rs` の exit 70・stdout 空の契約は変更しない。
+//! 接呼ぶ。CLI バイナリ（`fandhe-edge`）の 7 工程への接続（TASK-33.1-2・#136）とは独立に、
+//! この出力契約だけを確認する。
 
 use fandhe_edge_cli::output::write_ok_judgment;
 use fandhe_edge_core::definition::Definition;

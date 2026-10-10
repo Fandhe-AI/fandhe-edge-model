@@ -1,6 +1,6 @@
 //! 学習ジョブの状態遷移とキャンセル操作（REQ-34・TASK-34.1-1・issue #144）。
 //!
-//! Rust 側ジョブ管理（CLI `train` 工程への配線は TASK-33.x）が、
+//! Rust 側ジョブ管理（CLI `train` 工程は `stages::train` で接続済み）が、
 //! [`crate::process::run_train_cancellable`] を包んで「実行中 → キャンセル中
 //! → キャンセル済み」等の状態を管理する。語彙は PoC-19 の
 //! `queued → running → succeeded|failed|cancelled` に合わせる。
@@ -23,9 +23,9 @@
 //!
 //! # 未実装（実装済みを装わない）
 //!
-//! - 状態確認コマンド（CLI への露出。REQ-33 の 7 工程の変更にあたり TASK-33.x の
-//!   承認事項）。`job.json` への永続化とクラッシュ検出は [`crate::job_record`]・
-//!   [`TrainJob::run_recorded`]（TASK-34.2・#146）で実装済み。やり直しの案内は
+//! - `job.json` への永続化とクラッシュ検出は [`crate::job_record`]・
+//!   [`TrainJob::run_recorded`]（TASK-34.2・#146）で実装済み。状態確認の CLI への露出
+//!   （`train --status`・#485）は `stages::train` で接続済み。やり直しの案内は
 //!   [`crate::restart`]（TASK-34.3・#147）。
 //! - `SIGKILL` フォールバック（協調キャンセルの猶予超過）後に残りうる予約済み
 //!   `out_dir`・tmp は自動では削除せず、[`crate::restart`] が案内する（TASK-34.3・#147）。協調キャンセル

@@ -4,7 +4,7 @@
 //!
 //! - 依存は共通コア（`fandhe-edge-core`）のみ。評価器・データ契約・学習ワーカーには依存しない
 //!   （推論は学習に依存しない。REQ-32）
-//! - 呼び出し元: CLI の `infer` 工程（`stages::infer`・`infer_batch`。#136・#141）・`package` 工程（`stages::package`）・CLI の `evaluate` 工程（`stages::evaluate` が `pipeline` を直接使う。#314。評価器の `input_only`〔TASK-27.2〕経由は未配線）
+//! - 呼び出し元: CLI の `infer` 工程（`stages::infer`・`infer_batch`。#136・#141）・`package` 工程（`stages::package`）・CLI の `evaluate` 工程（`stages::evaluate` が `pipeline` を直接使う。#314。評価器の `input_only`〔TASK-27.2〕は経由せず、`final_test_once` の `predict` へ `input` の列だけを渡す）
 //!
 //! # 現状
 //!

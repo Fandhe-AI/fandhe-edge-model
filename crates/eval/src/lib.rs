@@ -126,8 +126,8 @@
 //!   `tests/reproducibility_determinism.rs`）。GPU（事前登録条件）での確認は
 //!   人間担当の未実施事項（#103）。
 //!   CLI へは `evaluate --seed-run-project` の `reproducibility` で接続済み（#490）。
-//!   3 seed 再学習ジョブ（REQ-34）との接続・旧モデル比較（TASK-26.1・issue #99）との
-//!   統合は未実装
+//!   旧モデル比較（TASK-26.1・issue #99）は `evaluate --previous-project-dir` の `comparison` で接続済み（#488・#489）。
+//!   3 seed の再学習をジョブ管理（REQ-34）から自動で行う接続は未実装（人が複製プロジェクトで学習する）
 //! - 基礎統計（REQ-29・TASK-29.1-1・issue #107。[`diagnostics`]）: 実装済み
 //!   （診断専用。合否判定に使わない）。混同しやすいラベルの組とレポート統合
 //!   （TASK-29.1-2・issue #108）・診断限界の明記（TASK-29.2・issue #109）・データ量水準別の効果報告（TASK-29.3・issue #110）も実装済み。
@@ -138,7 +138,8 @@
 //!   `abstention` に出す
 //! - 評価データのハッシュの前後比較・凍結記録との接続（REQ-17・REQ-27）:
 //!   実装済み（TASK-27.1-2・issue #70。[`eval_data_invariance`]）。ただし
-//!   台帳との突き合わせ・来歴の記録（TASK-17.3 の停止分岐本体・issue #49）は未実装。
+//!   凍結記録とのハッシュ不一致で止める分岐（TASK-17.3・issue #49）は
+//!   `fandhe_edge_data::eval_freeze::FreezeError::HashMismatch` で実装済み。
 //!   CLI `evaluate` 工程へは #314 で接続済み（終了コードへの写像は cli の `error_report`）
 //! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2・issue #71。
 //!   PoC-9 `ArgumentRecordingPredictor` 相当）: 実装済み（[`input_only`]）。

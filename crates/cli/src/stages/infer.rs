@@ -71,7 +71,8 @@ use crate::project::{
 /// 推論を許可する `kind_version` の許可リスト（REQ-39。`kind` ごとに列挙する）。
 ///
 /// 学習ワーカーの登録簿（`trainer` の `resolve_kind`）と同じ版だけを許可し、未知の版のパッケージを
-/// 推論へ進めない。版管理台帳による前版への復帰（#174・TASK-39.6）は未実装。
+/// 推論へ進めない。版管理台帳による前版の照合は `infer --version-ledger`・`--version-id` で接続済み
+/// （#491・#518。TASK-39.6）。
 const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] =
     &[(ModelKind::C1, &[1]), (ModelKind::C3, &[1])];
 

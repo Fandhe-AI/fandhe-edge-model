@@ -31,7 +31,7 @@
 //!
 //! # 対象外（本 issue の範囲外）
 //!
-//! - CLI の JSON 出力・終了コードへの写像（TASK-33.x・issue #140）
+//! - CLI の JSON 出力・終了コードへの写像は本モジュールの範囲外（`select` の `significance` へは接続済み）
 //! - 選定への統合（TASK-18.3。`crates/train` の `selection_significance` が担う。#87）
 //! - 「3 seed すべてで有意」の集約
 //! - 必要件数の算出（Connor 式・TASK-25.2）
