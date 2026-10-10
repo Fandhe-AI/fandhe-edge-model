@@ -1008,6 +1008,32 @@ def test_compare_infer_lists_rows_without_exact_score_match_in_mismatch_ids() ->
     assert cmp["scores_exact_match"] == 0
 
 
+def test_compare_infer_lists_rows_whose_status_differs_in_mismatch_ids() -> None:
+    """REQ-28・#506: ラベル・スコアが同じでも status が両側で違う行の id は mismatch_ids に入る。"""
+    row = {"predicted_label": "x", "scores": {"x": 0.75, "y": 0.25}}
+    batch = {
+        "a": dict(row, status="ok"),
+        "b": dict(row, status="abstain"),
+        "c": dict(row, status="out_of_scope"),
+    }
+    single = {
+        "a": dict(row, status="ok"),
+        "b": dict(row, status="ok"),
+        "c": dict(row, status="out_of_scope"),
+    }
+    cmp = mod.compare_infer(batch, single)
+    assert cmp["mismatch_ids"] == ["b"]
+    assert (cmp["label_match"], cmp["label_mismatch"], cmp["scores_exact_match"]) == (3, 0, 3)
+
+
+def test_infer_exit_status_maps_exit_codes_to_judgment_statuses() -> None:
+    """REQ-21・REQ-22・#506: infer の終了コードと status の対応は 3 組で、記録の語彙に入る。"""
+    assert mod.INFER_EXIT_STATUS == {0: "ok", 11: "out_of_scope", 12: "abstain"}
+    assert set(mod.INFER_EXIT_STATUS.values()) <= mod.STATUS_VOCAB
+    summary = mod.summarize_infer({"status": "abstain"}, ["x"])
+    assert summary["status"] == "abstain"
+
+
 def test_compare_infer_one_row_off_by_1e12_is_the_only_mismatch() -> None:
     """REQ-28: 1 行だけスコアが 1e-12 ずれると scores_exact_match が 1 減り、その id だけが入る。"""
     batch = {
@@ -1035,8 +1061,8 @@ def scores(delta):
     return dict(zip(ids, v))
 mode = {mode!r}
 only_id = {only_id!r}
-def row(rid, delta, step=False):
-    d = {{"id": rid, "status": "ok", "predicted_label": ids[0], "scores": scores(delta)}}
+def row(rid, delta, step=False, status="ok"):
+    d = {{"id": rid, "status": status, "predicted_label": ids[0], "scores": scores(delta)}}
     if step:
         d["step"] = "infer"
     return json.dumps(d)
@@ -1049,19 +1075,36 @@ if "--input-file" in a:
     if mode == "swap":
         rows[0], rows[1] = rows[1], rows[0]
     for i, rid in enumerate(rows):
-        print(row(rid, 0.0, mode == "batch-step" and i == 1))
+        print(row(rid, 0.0, mode == "batch-step" and i == 1, {batch_status!r}))
 else:
     rid = a[a.index("--id") + 1]
-    print(row(rid, {delta!r} if only_id in (None, rid) else 0.0, mode == "single-step"))
+    d = {delta!r} if only_id in (None, rid) else 0.0
+    print(row(rid, d, mode == "single-step", {single_status!r}))
+    sys.exit({single_rc!r})
 """
 
 
 def _infer_cli(
-    tmp_path: Path, mode: str = "ok", delta: float = 0.0, only_id: str | None = None
+    tmp_path: Path,
+    mode: str = "ok",
+    delta: float = 0.0,
+    only_id: str | None = None,
+    batch_status: str = "ok",
+    single_status: str = "ok",
+    single_rc: int = 0,
 ) -> Path:
     fake = tmp_path / "fake-infer"
     fake.write_text(
-        FAKE_INFER.format(python=sys.executable, mode=mode, delta=delta, only_id=only_id), "utf-8"
+        FAKE_INFER.format(
+            python=sys.executable,
+            mode=mode,
+            delta=delta,
+            only_id=only_id,
+            batch_status=batch_status,
+            single_status=single_status,
+            single_rc=single_rc,
+        ),
+        "utf-8",
     )
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     return fake
@@ -1104,6 +1147,52 @@ def test_item_e_passes_when_batch_and_single_agree(tmp_path: Path) -> None:
     assert res["status"] == "ok"
     assert res["label_mismatch"] == 0
     assert res["scores_exact_match"] == res["records"]
+
+
+@pytest.mark.parametrize(("status", "rc"), [("out_of_scope", 11), ("abstain", 12)])
+def test_item_e_passes_out_of_scope_and_abstain_when_exit_code_matches(
+    tmp_path: Path, status: str, rc: int
+) -> None:
+    """REQ-22・REQ-28・#506: 単発が exit 11・12 で status が対応し、バッチ行も同じなら ok。"""
+    fake = _infer_cli(tmp_path, batch_status=status, single_status=status, single_rc=rc)
+    res = mod.item_e(_e_ctx(tmp_path, fake))
+    assert (res["status"], res["label_mismatch"]) == ("ok", 0)
+    assert res["scores_exact_match"] == res["records"]
+
+
+@pytest.mark.parametrize(("status", "rc"), [("abstain", 0), ("ok", 12), ("out_of_scope", 12)])
+def test_item_e_rejects_single_infer_whose_status_contradicts_exit_code(
+    tmp_path: Path, status: str, rc: int
+) -> None:
+    """REQ-21・REQ-22・#506: 単発の終了コードと status の食い違いは unexpected_output。"""
+    fake = _infer_cli(tmp_path, batch_status=status, single_status=status, single_rc=rc)
+    res = mod.item_e(_e_ctx(tmp_path, fake))
+    assert (res["status"], res["reason"], res["step"], res["exit_code"]) == (
+        "failed",
+        "unexpected_output",
+        "infer-single",
+        rc,
+    )
+
+
+def test_item_e_counts_rows_whose_status_differs_as_mismatch(tmp_path: Path) -> None:
+    """REQ-28・#506: ラベル・スコアが同じでも、バッチと単発の status が違う行は不一致。"""
+    ctx = _e_ctx(tmp_path, _infer_cli(tmp_path, batch_status="abstain"))
+    res = mod.item_e(ctx)
+    assert (res["status"], res["reason"], res["label_mismatch"]) == ("failed", "mismatch", 0)
+    assert res["scores_exact_match"] == res["records"]
+    ids = (ctx.work / "E" / "mismatch-ids.txt").read_text().split()
+    assert len(ids) == res["records"]
+
+
+def test_item_e_rejects_batch_row_with_status_outside_the_three_values(tmp_path: Path) -> None:
+    """REQ-22・#506: バッチ行の status が ok・out_of_scope・abstain 以外なら unexpected_output。"""
+    res = mod.item_e(_e_ctx(tmp_path, _infer_cli(tmp_path, batch_status="pending")))
+    assert (res["status"], res["reason"], res["step"]) == (
+        "failed",
+        "unexpected_output",
+        "infer-batch",
+    )
 
 
 @pytest.mark.parametrize("mode", ["short", "dup", "swap"])
@@ -1349,6 +1438,14 @@ def test_check_infer_output_validates_label_keys_finiteness_and_sum() -> None:
     assert mod._step_check("infer", ok, set(), 0, f, None) is True
     # B の単発 infer は `--id` なしなので、id が既定値以外なら不合格（#362）
     assert mod._step_check("infer", dict(ok, id="x"), set(), 0, f, None) is False
+    # 対象外 11・保留 12 は status が終了コードに対応すれば合格、食い違えば不合格（REQ-22・#506）
+    oos, abst = dict(ok, status="out_of_scope"), dict(ok, status="abstain")
+    assert mod._step_check("infer", oos, {11, 12}, 11, f, None) is True
+    assert mod._step_check("infer", abst, {11, 12}, 12, f, None) is True
+    assert mod._step_check("infer", abst, {11, 12}, 0, f, None) is False
+    assert mod._step_check("infer", ok, {11, 12}, 12, f, None) is False
+    assert mod._step_check("infer", oos, {11, 12}, 12, f, None) is False
+    assert mod._step_check("infer", dict(ok, status="pending"), {11, 12}, 10, f, None) is False
     assert mod.check_infer_output(dict(ok, predicted_label="nope"), f) is False
     assert mod.check_infer_output(dict(ok, scores={ids[0]: 1.0}), f) is False
     assert mod.check_infer_output(dict(ok, scores=dict(_scores(f), extra=0.0)), f) is False
