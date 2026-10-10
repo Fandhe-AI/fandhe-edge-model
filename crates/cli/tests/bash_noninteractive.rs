@@ -893,13 +893,16 @@ fn req39_ps_failure_is_fail_closed_and_kills_group() {
     );
     let pid = std::fs::read_to_string(&pid_file).expect("pid file");
     let pid = pid.trim().to_string();
-    // kill -0 が失敗する（プロセスが無い）まで最大 5 秒待つ。終了済みなら即座に抜ける。
+    // `ps -o stat=` で状態を取り、プロセスが無い（出力なし）かゾンビ（Z）なら終了済みとみなす
+    // （`kill -0` はゾンビにも成功するため使わない。scripts/cli-infer-noninteractive.sh の group_alive と同じ規則）。
+    // 最大 5 秒待ち、終了済みなら即座に抜ける。`ps` 自体を起動できなければテストを失敗させる。
     let alive = || {
-        std::process::Command::new("kill")
-            .args(["-0", &pid])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("run ps");
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while alive() && std::time::Instant::now() < deadline {
