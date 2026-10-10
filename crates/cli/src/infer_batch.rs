@@ -1045,6 +1045,7 @@ mod tests {
             Command::Evaluate(EvaluateArgs {
                 project_dir: p(),
                 candidate: 0,
+                previous_project_dir: None,
             }),
             Command::Select(SelectArgs { project_dir: p() }),
             Command::Package(PackageArgs {

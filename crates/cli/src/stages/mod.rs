@@ -57,6 +57,7 @@ pub mod infer;
 pub mod inspect;
 mod ledger;
 pub mod package;
+mod previous_comparison;
 pub mod register;
 pub mod select;
 pub mod train;
