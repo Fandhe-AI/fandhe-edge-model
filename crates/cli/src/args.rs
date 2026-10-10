@@ -190,6 +190,12 @@ const TRAIN_OPTS: &[OptSpec] = &[
 const EVALUATE_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
     opt("--candidate", "N", true, "Candidate number"),
+    opt(
+        "--previous-project-dir",
+        "DIR",
+        false,
+        "Evaluated previous project to compare against (read only; its saved predictions are used, no re-inference)",
+    ),
 ];
 const INFER_OPTS: &[OptSpec] = &[
     opt("--package", "PATH", true, "Path to the package"),
@@ -279,6 +285,9 @@ pub struct TrainArgs {
 pub struct EvaluateArgs {
     pub project_dir: PathBuf,
     pub candidate: usize,
+    /// `--previous-project-dir`: 正誤の遷移を比べる評価済みの旧プロジェクト（cwd 配下。読むだけ。
+    /// REQ-26・#488・#489）。
+    pub previous_project_dir: Option<PathBuf>,
 }
 /// `select` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,6 +729,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         Subcommand::Evaluate => Command::Evaluate(EvaluateArgs {
             project_dir: v.path("--project-dir")?,
             candidate: v.candidate()?,
+            previous_project_dir: v.opt_path("--previous-project-dir"),
         }),
         Subcommand::Select => Command::Select(SelectArgs {
             project_dir: v.path("--project-dir")?,
@@ -967,7 +977,25 @@ mod tests {
             run(&["evaluate", "--project-dir", "proj", "--candidate", "3"]),
             Command::Evaluate(EvaluateArgs {
                 project_dir: "proj".into(),
-                candidate: 3
+                candidate: 3,
+                previous_project_dir: None
+            })
+        );
+        // REQ-26・#488: `--previous-project-dir` は任意（値つき）。
+        assert_eq!(
+            run(&[
+                "evaluate",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "3",
+                "--previous-project-dir",
+                "old"
+            ]),
+            Command::Evaluate(EvaluateArgs {
+                project_dir: "proj".into(),
+                candidate: 3,
+                previous_project_dir: Some("old".into())
             })
         );
     }

@@ -418,19 +418,13 @@ fn verify_bound_to_record(
     .map_err(|e| fs_report(&e))?;
     let record = EvaluationRecord::from_json_slice(&bytes)
         .map_err(|_| invalid("evaluation record is malformed"))?;
-    if record.predictions_sha256.as_deref() != Some(sha256) {
-        return Err(invalid(
-            "prediction file does not match the evaluation record",
-        ));
-    }
-    if record.evaluation_sha256 != prov.evaluation_sha256
-        || record.evaluation_bytes != prov.evaluation_bytes
-        || record.definition_sha256 != prov.definition_sha256
-    {
-        return Err(invalid(
-            "evaluation record does not belong to this evaluation data",
-        ));
-    }
+    check_record_binding(
+        &record,
+        sha256,
+        &prov.evaluation_sha256,
+        prov.evaluation_bytes,
+        &prov.definition_sha256,
+    )?;
     // 代表構成 ID は `<candidate_id>:seed<N>`。N が `--seed` と一致しなければ別 seed の予測。
     let seed_ok = record
         .config_id
@@ -451,11 +445,40 @@ fn verify_bound_to_record(
     Ok(())
 }
 
+/// 評価記録が予測ファイル（sha256）・評価データ（sha256・バイト長）・定義（正準化ハッシュ）に束縛されて
+/// いることを確認する（`fandhe-edge-score` の比較相手と、`evaluate --previous-project-dir` の旧モデルが共有する
+/// 唯一の照合。#445・#488・REQ-27）。`predictions_sha256` の無い記録は拒否する。
+///
+/// # Errors
+/// いずれかの不一致は `invalid_input`（固定 message）。
+pub(crate) fn check_record_binding(
+    record: &EvaluationRecord,
+    predictions_sha256: &str,
+    evaluation_sha256: &str,
+    evaluation_bytes: u64,
+    definition_sha256: &str,
+) -> Result<(), ErrorReport> {
+    if record.predictions_sha256.as_deref() != Some(predictions_sha256) {
+        return Err(invalid(
+            "prediction file does not match the evaluation record",
+        ));
+    }
+    if record.evaluation_sha256 != evaluation_sha256
+        || record.evaluation_bytes != evaluation_bytes
+        || record.definition_sha256 != definition_sha256
+    {
+        return Err(invalid(
+            "evaluation record does not belong to this evaluation data",
+        ));
+    }
+    Ok(())
+}
+
 /// 評価対象のレコードから、`prepare_evaluation_input` へ渡す gold の JSONL（`{"id","label"}`）を作る。
 ///
 /// `input` を載せないため、評価器側の正規化 input による重複・矛盾グループの除外が働かず、
 /// `evaluate` と同じ全レコードが評価対象になる（REQ-27・#445）。
-fn gold_jsonl(records: &[ValidRecord]) -> String {
+pub(crate) fn gold_jsonl(records: &[ValidRecord]) -> String {
     let mut out = String::new();
     for r in records {
         out.push_str("{\"id\":");
@@ -497,12 +520,42 @@ fn load_prediction<'a>(
     if named.name != "P" {
         verify_bound_to_record(prov, named, confined.as_path(), &sha256)?;
     }
+    let classified = classify_predictions(&bytes, gold_text, labels, &named.name)?;
+    Ok(Loaded {
+        role,
+        named,
+        sha256,
+        ids: classified.ids,
+        golds: classified.golds,
+        outcomes: classified.outcomes,
+    })
+}
+
+/// 評価データの行順に分類した予測（id・正解ラベル・予測）。
+#[derive(Debug)]
+pub(crate) struct ClassifiedPredictions {
+    pub(crate) ids: Vec<String>,
+    pub(crate) golds: Vec<String>,
+    pub(crate) outcomes: Vec<Outcome>,
+}
+
+/// 予測ファイルのバイト列を、評価対象の gold（[`gold_jsonl`]）と突き合わせて分類する（`fandhe-edge-score` と
+/// `evaluate --previous-project-dir` が共有する読み込み。#445・#488・REQ-27）。`name` は message に添える名前。
+///
+/// # Errors
+/// UTF-8 でない・`prepare_evaluation_input` の停止・評価対象の id の欠け・余分は `invalid_input`。
+pub(crate) fn classify_predictions(
+    bytes: &[u8],
+    gold_text: &str,
+    labels: &BTreeSet<String>,
+    name: &str,
+) -> Result<ClassifiedPredictions, ErrorReport> {
     let text =
-        std::str::from_utf8(&bytes).map_err(|_| invalid("prediction file is not valid UTF-8"))?;
+        std::str::from_utf8(bytes).map_err(|_| invalid("prediction file is not valid UTF-8"))?;
     let outcome = prepare_evaluation_input(gold_text, text, labels).map_err(|stop| {
         invalid(&format!(
             "prediction input rejected for {}: {}",
-            named.name,
+            name,
             stop.code()
         ))
     })?;
@@ -514,29 +567,25 @@ fn load_prediction<'a>(
     if outcome.active.iter().any(|row| row.pred_line.is_none()) || pred_rows != outcome.active.len()
     {
         return Err(invalid(&format!(
-            "prediction file must contain every evaluation id exactly once for {}",
-            named.name
+            "prediction file must contain every evaluation id exactly once for {name}"
         )));
     }
-    let mut loaded = Loaded {
-        role,
-        named,
-        sha256,
+    let mut classified = ClassifiedPredictions {
         ids: Vec::with_capacity(outcome.active.len()),
         golds: Vec::with_capacity(outcome.active.len()),
         outcomes: Vec::with_capacity(outcome.active.len()),
     };
     for row in outcome.active {
-        loaded.outcomes.push(match row.prediction {
+        classified.outcomes.push(match row.prediction {
             PredictionOutcome::Label(l) => Outcome::Label(l),
             PredictionOutcome::Invalid(_) => Outcome::Invalid,
             PredictionOutcome::Abstain => Outcome::Abstain,
             PredictionOutcome::Error(_) => Outcome::Error,
         });
-        loaded.ids.push(row.id);
-        loaded.golds.push(row.gold_label);
+        classified.ids.push(row.id);
+        classified.golds.push(row.gold_label);
     }
-    Ok(loaded)
+    Ok(classified)
 }
 
 /// 事前登録の仮定: b 側（候補のみ正解）の割合。

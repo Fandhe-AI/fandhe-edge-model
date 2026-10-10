@@ -89,6 +89,14 @@
 //! 定義の `out_of_scope_label` で判定する。対象外は「答えた」側で、`out_of_scope` は `answered` の内数
 //! （`answered + abstained` が評価件数、`coverage = answered / total`）（80% は参考値で合否条件にしない）。校正が `null` なら `abstention` も `null`。
 
+//! # 旧モデルとの比較（REQ-26・REQ-27・#488・#489）
+//!
+//! `--previous-project-dir` があるときだけ、旧プロジェクトが保存した予測（再推論しない）と新の適用結果の
+//! 正誤の遷移（2×2・遷移率の Wilson 95% 区間・ラベル集合の前提）を stdout の `comparison` と評価記録の
+//! `previous_comparison` へ出す（[`super::previous_comparison`]）。旧側の読み込み・照合はすべて台帳を開く
+//! 前（適用権を取る前）に済ませ、違反は `invalid_input`（台帳を作らない・触れない）。終了コードに影響しない。
+//! 無ければ `comparison:null`。
+
 //! # 下限基準との比較（REQ-25・REQ-27・#339）
 //!
 //! 定義に `baseline_comparison`（事前登録した仮定）があるときだけ、majority との McNemar 比較
@@ -156,6 +164,7 @@ use super::candidate_artifact::{
 use super::infer::load_backend;
 use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
+use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_previous};
 use super::select::compute_selection;
 use super::train::{
     allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
@@ -258,10 +267,9 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     // 評価データも事前に検査する（ロック取得後の分解失敗で適用権を失わない）。
     let decoded = decode_evaluation(&eval_bytes, &definition).map_err(|e| e.to_error_report())?;
     // 1 件ごとの予測の保存用に id を控える（`decode_evaluation` と同じ検査・同じ行順。推論側には渡さない）。
-    let eval_ids: Vec<String> = inspect_bytes(&eval_bytes, &definition)?
-        .into_iter()
-        .map(|r| r.id)
-        .collect();
+    // 旧モデルとの比較の共通レコードの照合にも使う（#488）。
+    let current_records = inspect_bytes(&eval_bytes, &definition)?;
+    let eval_ids: Vec<String> = current_records.iter().map(|r| r.id.clone()).collect();
     // 予測行の件数照合は適用権を取る前に済ませる（保存の失敗で適用権を失わない）。
     if eval_ids.len() != decoded.len() {
         return Err(runtime("evaluation record count mismatch"));
@@ -281,6 +289,13 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .map_err(|_| runtime("cannot hash definition"))?
         .to_hex();
     let onnx_digest = Sha256Digest::of_bytes(&target.artifact.onnx_bytes);
+
+    // 旧モデルとの比較の材料は、台帳を開く前（適用権を取る前）に読み・照合して確定する（#488・REQ-27）。
+    let previous = args
+        .previous_project_dir
+        .as_deref()
+        .map(|dir| prepare_previous(cwd, dir, &definition, &freeze, &current_records))
+        .transpose()?;
 
     // 台帳は保持 fd 起点で開き、以降の操作もすべて fd 相対で行う（REQ-39。[`HeldLedger`]）。
     let held_ledger = HeldLedger::open(&project, true)?
@@ -324,6 +339,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
                 onnx_digest,
                 baseline: baseline.as_ref(),
                 calibration: calibration.as_ref(),
+                previous: previous.as_ref(),
             },
             &PredictionsSink {
                 rel: &predictions_rel,
@@ -606,6 +622,7 @@ struct FinalizeContext<'a> {
     onnx_digest: Sha256Digest,
     baseline: Option<&'a PreparedBaseline>,
     calibration: Option<&'a Calibration>,
+    previous: Option<&'a PreparedPrevious>,
 }
 
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
@@ -628,6 +645,7 @@ fn finalize_evaluation(
         onnx_digest,
         baseline,
         calibration,
+        previous,
     } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
@@ -666,6 +684,14 @@ fn finalize_evaluation(
             correct,
         )?),
     };
+    // 旧モデルとの比較（`--previous-project-dir` のときだけ。新側の正誤は適用済みの予測から求める。#488）。
+    let comparison = match previous {
+        None => None,
+        Some(p) => {
+            let current = current_correctness(&labels, &applied.golds, &applied.output)?;
+            Some(p.compare(&labels, &current)?)
+        }
+    };
     let q = &computed.type_meaning_quadrant;
     let quadrant = TypeMeaningQuadrantRecord {
         type_ok_meaning_ok: q.type_ok_meaning_ok(),
@@ -698,6 +724,7 @@ fn finalize_evaluation(
         }),
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         abstention: abstention.map(|(report, _)| report),
+        comparison: comparison.as_ref().map(|(report, _)| report.clone()),
     };
     let report = EvaluateCompletedReport::completed(
         candidate,
@@ -735,6 +762,7 @@ fn finalize_evaluation(
         }),
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         abstention: abstention.map(|(_, record)| record),
+        previous_comparison: comparison.map(|(_, record)| record),
     };
     let record_json = record
         .to_json_vec()

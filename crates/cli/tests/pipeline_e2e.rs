@@ -1599,6 +1599,267 @@ mod suite {
             .expect("chmod");
     }
 
+    /// 旧モデルとの比較の `evaluate` 引数（`--previous-project-dir`。#488）。
+    fn evaluate_with_previous<'a>(project: &'a str, previous: &'a str) -> [&'a str; 7] {
+        [
+            "evaluate",
+            "--project-dir",
+            project,
+            "--candidate",
+            "1",
+            "--previous-project-dir",
+            previous,
+        ]
+    }
+
+    /// `work/<name>/` で `train 0 → train 1 → select` まで進める（`register → inspect` 済みのプロジェクト）。
+    fn train_and_select(env: &Env, name: &str) {
+        for index in ["0", "1"] {
+            env.ok(&["train", "--project-dir", name, "--candidate", index]);
+        }
+        env.ok(&["select", "--project-dir", name]);
+    }
+
+    /// ディレクトリ配下（再帰）のファイルの相対パスとバイト列（旧プロジェクトを書き換えないことの確認用）。
+    fn tree_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    out.push((path.strip_prefix(dir).expect("prefix").to_path_buf(), bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 最終 test の台帳に適用ロック `config-*.lock` が 1 つでもあるか（再帰。台帳が無ければ `false`）。
+    fn has_config_lock(env: &Env, project: &str) -> bool {
+        let ledger = env.work.join(project).join("final_test_ledger");
+        ledger.is_dir()
+            && tree_snapshot(&ledger).iter().any(|(p, _)| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("config-"))
+            })
+    }
+
+    /// 読み取り専用に置かれたファイルを書き換える（改ざんの模擬）。
+    fn overwrite_read_only(path: &Path, bytes: &[u8]) {
+        let mut perm = std::fs::metadata(path).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o600);
+        std::fs::set_permissions(path, perm).expect("chmod");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    /// `"key":"<string>"` の文字列値を取り出す。
+    fn string_field<'a>(json: &'a str, key: &str) -> &'a str {
+        let marker = format!("\"{key}\":\"");
+        let rest = json.split(&marker).nth(1).expect("key exists");
+        &rest[..rest.find('"').expect("value end")]
+    }
+
+    /// REQ-26・REQ-27・REQ-39・TASK-26.1・#488: `evaluate --previous-project-dir` は旧プロジェクトの保存済み予測
+    /// （再推論しない）と正誤を比べる。旧の評価未完了・予測の改ざん・凍結データの不一致・cwd 外は `invalid_input`
+    /// で、新の台帳に適用ロックを作らず（適用権を失わない）、旧プロジェクトは書き換えない。同じ凍結データでは
+    /// `evaluation_data:"same"`・全 12 件が共通で、同じモデルなら遷移は 0（両方正解 = 正解数）。終了コードは 0 の
+    /// まま、評価記録に区間を持たない `previous_comparison` が入り、`package` はそれを照合しない。
+    pub fn req26_issue488_evaluate_compares_with_previous_project() {
+        let env = eval_env_until("prevsame", &[]);
+        copy_dir(&env.project_file(""), &env.work.join("old"));
+        train_and_select(&env, "old");
+        train_and_select(&env, "proj");
+        let with_prev = evaluate_with_previous("proj", "old");
+        let rejected = |message: &str| {
+            assert_eq!(
+                env.fails(&with_prev, 64, "invalid_input"),
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+            assert!(!has_config_lock(&env, "proj"));
+        };
+        rejected("previous candidate has not been evaluated");
+        env.ok(&["evaluate", "--project-dir", "old", "--candidate", "1"]);
+
+        // 予測ファイルの改ざん（評価記録の `predictions_sha256` と不一致）。
+        let preds = env
+            .work
+            .join("old/candidates/1/evaluation_predictions.jsonl");
+        let original = std::fs::read(&preds).expect("preds");
+        overwrite_read_only(&preds, &[original.as_slice(), b"\n"].concat());
+        rejected("prediction file does not match the evaluation record");
+        overwrite_read_only(&preds, &original);
+        // 旧の凍結データの改ざん（凍結記録と不一致）。
+        let old_eval = env.work.join("old/data/evaluation.jsonl");
+        let eval_original = std::fs::read(&old_eval).expect("eval");
+        overwrite_read_only(&old_eval, &eval_original.repeat(2));
+        let out = env.fails(&with_prev, 64, "invalid_input");
+        assert!(out.contains("eval data hash mismatch"), "{out}");
+        assert!(!has_config_lock(&env, "proj"));
+        overwrite_read_only(&old_eval, &eval_original);
+        // cwd 外の旧プロジェクト。
+        env.fails(&evaluate_with_previous("proj", ".."), 64, "invalid_input");
+        assert!(!has_config_lock(&env, "proj"));
+
+        let old_before = tree_snapshot(&env.work.join("old"));
+        let out = env.ok(&with_prev);
+        assert_eq!(tree_snapshot(&env.work.join("old")), old_before);
+        let correct = number_field(&out, "correct") as u64;
+        let old_record =
+            std::fs::read_to_string(env.work.join("old/candidates/1/evaluation_record.json"))
+                .expect("old record");
+        let previous = format!(
+            "{{\"candidate_id\":\"c3\",\"onnx_sha256\":\"{}\",\"definition_sha256\":\"{}\",\"evaluation_sha256\":\"{}\"}}",
+            Sha256Digest::of_bytes(
+                &std::fs::read(env.work.join("old").join(C3_DIR).join("model.onnx"))
+                    .expect("old onnx")
+            )
+            .to_hex(),
+            string_field(&old_record, "definition_sha256"),
+            string_field(&old_record, "evaluation_sha256"),
+        );
+        let counts = format!(
+            "\"n\":12,\"both_correct\":{correct},\"correct_to_incorrect\":0,\"incorrect_to_correct\":0,\"both_wrong\":{}",
+            12 - correct
+        );
+        assert!(
+            out.contains(&format!(
+                "}},\"comparison\":{{\"previous\":{previous},\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"same\",\"n_common\":12,\"n_previous_only\":0,\"n_current_only\":0,\"counts\":{{{counts},\"correct_to_incorrect_ci95\":{{\"lo\":0.0,\"hi\":"
+            )),
+            "{out}"
+        );
+        // 遷移 0 件の Wilson 95% 区間（0/12）: 下限 0・上限 = z² / (n + z²) = 3.8416 / 15.8416。
+        for key in ["correct_to_incorrect_ci95", "incorrect_to_correct_ci95"] {
+            let ci = out.split(&format!("\"{key}\":")).nth(1).expect("ci");
+            assert!(number_field(ci, "lo").abs() < 1e-9, "{out}");
+            assert!(
+                (number_field(ci, "hi") - 0.242_500_757_499_242_5).abs() < 1e-9,
+                "{out}"
+            );
+        }
+        assert!(out.ends_with("}}}}\n"), "{out}");
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        assert!(
+            record.ends_with(&format!(
+                ",\"previous_comparison\":{{\"previous\":{previous},\"premise\":\"same_label_set\",\"evaluation_data\":\"same\",\"n_common\":12,\"counts\":{{{counts}}}}}}}\n"
+            )),
+            "{record}"
+        );
+        // 比較の欄は `package` の照合対象ではない（記録の他の欄は従来どおり照合される）。
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
+    }
+
+    /// 定義・学習データ・評価データを `work/<dir>/` に置く（`register` の入力元。#488）。
+    fn write_def_dir(env: &Env, dir: &str, definition: &str, train: &str, evaluation: &str) {
+        let d = env.work.join(dir);
+        std::fs::create_dir_all(&d).expect("def dir");
+        std::fs::write(d.join("definition.json"), definition).expect("definition");
+        std::fs::write(d.join("train.jsonl"), train).expect("train");
+        std::fs::write(d.join("evaluation.jsonl"), evaluation).expect("evaluation");
+    }
+
+    /// `work/<dir>/definition.json` から `name` を登録し、`inspect → train 0 → train 1 → select` まで進める。
+    fn register_and_select(env: &Env, dir: &str, name: &str) {
+        let definition = format!("{dir}/definition.json");
+        env.ok(&[
+            "register",
+            "--definition",
+            &definition,
+            "--project-dir",
+            name,
+        ]);
+        env.ok(&["inspect", "--project-dir", name]);
+        train_and_select(env, name);
+    }
+
+    /// 旧の予測ファイルで、id が `prefix` で始まる行のうち予測ラベルが正解（id の 2 番目の語）と一致する件数。
+    fn old_correct_with_prefix(env: &Env, prefix: &str) -> u64 {
+        let preds = std::fs::read_to_string(
+            env.work
+                .join("old/candidates/1/evaluation_predictions.jsonl"),
+        )
+        .expect("preds");
+        preds
+            .lines()
+            .filter(|l| string_field(l, "id").starts_with(prefix))
+            .filter(|l| {
+                let gold = string_field(l, "id").split('-').nth(1).expect("label");
+                string_field(l, "predicted_label") == gold
+            })
+            .count() as u64
+    }
+
+    /// REQ-26・REQ-17・TASK-26.1・26.2・#488・#489: 評価データが異なれば `common_subset` で、id・input・正解ラベルが
+    /// すべて一致する行だけを比べる。選択肢 gamma を delta に置き換えた新プロジェクトでは、前提は
+    /// `label_set_differs`（削除 gamma・追加 delta）、共通は alpha・beta の 8 件（旧のみ 4・新のみ 4）。
+    /// id をすべて変えた評価データでは共通 0 件で `counts:null`（停止しない・exit 0）。
+    pub fn req26_issue489_previous_comparison_on_different_data_and_labels() {
+        let env = eval_env_until("prevdiff", &[]);
+        copy_dir(&env.project_file(""), &env.work.join("old"));
+        train_and_select(&env, "old");
+        env.ok(&["evaluate", "--project-dir", "old", "--candidate", "1"]);
+
+        let swap = |text: String| text.replace("gamma", "delta");
+        write_def_dir(
+            &env,
+            "def_delta",
+            &swap(definition_text()),
+            &swap(train_jsonl()),
+            &swap(evaluation_jsonl()),
+        );
+        register_and_select(&env, "def_delta", "delta");
+        let out = env.ok(&evaluate_with_previous("delta", "old"));
+        let both_correct =
+            old_correct_with_prefix(&env, "e-alpha-") + old_correct_with_prefix(&env, "e-beta-");
+        assert!(
+            out.contains(&format!(
+                ",\"premise\":\"label_set_differs\",\"removed_labels\":[\"gamma\"],\"added_labels\":[\"delta\"],\"evaluation_data\":\"common_subset\",\"n_common\":8,\"n_previous_only\":4,\"n_current_only\":4,\"counts\":{{\"n\":8,\"both_correct\":{both_correct},\"correct_to_incorrect\":0,\"incorrect_to_correct\":0,\"both_wrong\":{},",
+                8 - both_correct
+            )),
+            "{out}"
+        );
+        let record =
+            std::fs::read_to_string(env.work.join("delta/candidates/1/evaluation_record.json"))
+                .expect("record");
+        assert!(
+            record.contains(
+                ",\"premise\":\"label_set_differs\",\"evaluation_data\":\"common_subset\",\"n_common\":8,"
+            ),
+            "{record}"
+        );
+
+        write_def_dir(
+            &env,
+            "def_renamed",
+            &definition_text(),
+            &train_jsonl(),
+            &evaluation_jsonl().replace("\"id\":\"e-", "\"id\":\"n-"),
+        );
+        register_and_select(&env, "def_renamed", "renamed");
+        let out = env.ok(&evaluate_with_previous("renamed", "old"));
+        assert!(
+            out.ends_with(
+                ",\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"common_subset\",\"n_common\":0,\"n_previous_only\":12,\"n_current_only\":12,\"counts\":null}}\n"
+            ),
+            "{out}"
+        );
+        let record =
+            std::fs::read_to_string(env.work.join("renamed/candidates/1/evaluation_record.json"))
+                .expect("record");
+        assert!(
+            record.ends_with(
+                ",\"premise\":\"same_label_set\",\"evaluation_data\":\"common_subset\",\"n_common\":0,\"counts\":null}}\n"
+            ),
+            "{record}"
+        );
+    }
     /// REQ-27・REQ-39: `train_seed.txt` を `1`→`2` に書き換えると `select` は request 不一致で止まる。
     /// 正準形でない内容（`+1`・`abc`・範囲外・空・末尾改行・先頭ゼロ）は記録不正で `invalid_input`。
     pub fn train_seed_record_tamper_is_rejected() {
@@ -2213,7 +2474,8 @@ mod suite {
         let at: Vec<usize> = keys.iter().map(|k| out.find(k).expect(k)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{out}");
         assert!(out.contains(",\"abstention\":{\"answered\":"), "{out}");
-        assert!(out.ends_with("}}\n"), "{out}");
+        // REQ-26・#488: `--previous-project-dir` が無ければ `comparison` は `null`（`abstention` の後ろ）。
+        assert!(out.ends_with("},\"comparison\":null}\n"), "{out}");
         // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
         let quadrant: f64 = [
             "type_ok_meaning_ok",
@@ -5008,6 +5270,14 @@ fn main() -> std::process::ExitCode {
         (
             "poc26_clones_are_scored_from_the_original",
             suite::poc26_clones_are_scored_from_the_original,
+        ),
+        (
+            "req26_issue488_evaluate_compares_with_previous_project",
+            suite::req26_issue488_evaluate_compares_with_previous_project,
+        ),
+        (
+            "req26_issue489_previous_comparison_on_different_data_and_labels",
+            suite::req26_issue489_previous_comparison_on_different_data_and_labels,
         ),
         (
             "train_seed_record_tamper_is_rejected",

@@ -39,7 +39,8 @@ use serde::Serialize;
 
 use crate::definition::JudgmentType;
 use crate::evaluation_record::{
-    BaselineComparisonVerdict, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
+    BaselineComparisonVerdict, ComparisonEvaluationData, ComparisonPremiseKind,
+    PreviousModelRecord, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
 };
 use crate::hash::Sha256Digest;
 use crate::rebuild::{RebuildDecision, RebuildReason};
@@ -120,7 +121,7 @@ impl EvaluateReport {
 /// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
 /// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
 /// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`・`macro_f1_excluded_labels`・`per_label`・
-/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`）に直列化し、`macro_f1` が未定義なら
+/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
 /// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
@@ -140,6 +141,86 @@ pub struct EvaluateCompletedReport {
     out_of_scope_label: Option<String>,
     calibration: Option<EvaluateCalibration>,
     abstention: Option<EvaluateAbstention>,
+    comparison: Option<EvaluateComparison>,
+}
+
+/// 区間（`{"lo","hi"}`。Wilson 95% など）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateInterval {
+    /// 下限。
+    pub lo: f64,
+    /// 上限。
+    pub hi: f64,
+}
+
+/// `evaluate` の `comparison.counts`（旧・新の正誤の 2×2 と遷移率の Wilson 95% 区間。REQ-26・#488・#489）。
+///
+/// 4 区分の合計は `n`。区間は `correct_to_incorrect / n`・`incorrect_to_correct / n` の率に対するもの。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateRegressionCounts {
+    /// 比較した件数（共通レコード数）。
+    pub n: u64,
+    /// 旧・新ともに正解。
+    pub both_correct: u64,
+    /// 旧は正解・新は不正解（回帰）。
+    pub correct_to_incorrect: u64,
+    /// 旧は不正解・新は正解（改善）。
+    pub incorrect_to_correct: u64,
+    /// 旧・新ともに不正解。
+    pub both_wrong: u64,
+    /// 回帰率の Wilson 95% 区間。
+    pub correct_to_incorrect_ci95: EvaluateInterval,
+    /// 改善率の Wilson 95% 区間。
+    pub incorrect_to_correct_ci95: EvaluateInterval,
+}
+
+/// `evaluate --previous-project-dir` の `comparison`（旧モデルとの正誤の遷移。REQ-26・TASK-26.1・26.2・
+/// #488・#489）。p 値・有意性判定は持たず、終了コードに影響しない。
+///
+/// `counts` は `n_common == 0` のとき `None`（`null`）。`removed_labels`・`added_labels` は旧のみ・新のみの
+/// ラベル（各側の宣言順。同一集合なら空）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvaluateComparison {
+    /// 比較した旧モデル。
+    pub previous: PreviousModelRecord,
+    /// 比較の前提。
+    pub premise: ComparisonPremiseKind,
+    /// 旧のみにあるラベル。
+    pub removed_labels: Vec<String>,
+    /// 新のみにあるラベル。
+    pub added_labels: Vec<String>,
+    /// 比較に使った評価データの範囲。
+    pub evaluation_data: ComparisonEvaluationData,
+    /// 比較した共通レコード数。
+    pub n_common: u64,
+    /// 旧の評価データにだけあるレコード数。
+    pub n_previous_only: u64,
+    /// 新の評価データにだけあるレコード数。
+    pub n_current_only: u64,
+    /// 2×2 の件数と区間（`n_common == 0` で `None`）。
+    pub counts: Option<EvaluateRegressionCounts>,
+}
+
+impl EvaluateComparison {
+    /// 件数・区間が整合しているか（`completed` の検査用）。
+    fn is_consistent(&self) -> bool {
+        let interval_ok = |i: &EvaluateInterval| {
+            i.lo.is_finite() && i.hi.is_finite() && 0.0 <= i.lo && i.lo <= i.hi && i.hi <= 1.0
+        };
+        match &self.counts {
+            None => self.n_common == 0,
+            Some(c) => {
+                c.n == self.n_common
+                    && c.both_correct
+                        .checked_add(c.correct_to_incorrect)
+                        .and_then(|v| v.checked_add(c.incorrect_to_correct))
+                        .and_then(|v| v.checked_add(c.both_wrong))
+                        == Some(c.n)
+                    && interval_ok(&c.correct_to_incorrect_ci95)
+                    && interval_ok(&c.incorrect_to_correct_ci95)
+            }
+        }
+    }
 }
 
 /// `evaluate` の `abstention`（validation の T・τ を凍結 test に適用した保留・対象外の件数。
@@ -219,6 +300,8 @@ pub struct EvaluateDetails {
     pub out_of_scope_label: Option<String>,
     /// 保留・対象外の件数（校正が無ければ `None`。#479）。
     pub abstention: Option<EvaluateAbstention>,
+    /// 旧モデルとの比較（`--previous-project-dir` が無ければ `None`。#488・#489）。
+    pub comparison: Option<EvaluateComparison>,
 }
 
 impl EvaluateCompletedReport {
@@ -259,6 +342,10 @@ impl EvaluateCompletedReport {
                     || bad(a.adopted_error)
                     || bad(Some(a.unconditional_error))
             })
+            || details
+                .comparison
+                .as_ref()
+                .is_some_and(|c| !c.is_consistent())
         {
             return None;
         }
@@ -277,6 +364,7 @@ impl EvaluateCompletedReport {
             out_of_scope_label: details.out_of_scope_label,
             calibration: details.calibration,
             abstention: details.abstention,
+            comparison: details.comparison,
         })
     }
 
@@ -1468,6 +1556,7 @@ mod tests {
             calibration: None,
             out_of_scope_label: None,
             abstention: None,
+            comparison: None,
         }
     }
 
@@ -1492,7 +1581,7 @@ mod tests {
         };
         let line = build(ok).expect("report").to_json_line().expect("json");
         assert!(
-            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25}}"#),
+            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null}"#),
             "{line}"
         );
         let all_abstained = EvaluateAbstention {
@@ -1538,7 +1627,7 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null}"#),
+            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null}"#),
             "{line}"
         );
         assert_eq!(calibration(1.5), None);
@@ -1573,8 +1662,80 @@ mod tests {
         .expect("report");
         assert_eq!(
             report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null}"#
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null}"#
         );
+    }
+
+    /// REQ-26・#488・#489: `comparison` つきの JSON が `abstention` の後ろに完全一致で並ぶ。`counts` は
+    /// `n_common == 0` で `null`。件数の合計・`n` と `n_common` の食い違い・区間の範囲外は構築できない。
+    #[test]
+    fn req26_issue488_comparison_json_is_exact_and_checked() {
+        let interval = |lo: f64, hi: f64| EvaluateInterval { lo, hi };
+        let comparison =
+            |counts: Option<EvaluateRegressionCounts>, n_common: u64| EvaluateComparison {
+                previous: PreviousModelRecord {
+                    candidate_id: "c1".to_string(),
+                    onnx_sha256: "1".repeat(64),
+                    definition_sha256: "2".repeat(64),
+                    evaluation_sha256: "3".repeat(64),
+                },
+                premise: ComparisonPremiseKind::LabelSetDiffers,
+                removed_labels: vec!["c".to_string()],
+                added_labels: vec!["d".to_string()],
+                evaluation_data: ComparisonEvaluationData::CommonSubset,
+                n_common,
+                n_previous_only: 2,
+                n_current_only: 1,
+                counts,
+            };
+        let build = |c: EvaluateComparison| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.comparison = Some(c);
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        let counts = EvaluateRegressionCounts {
+            n: 3,
+            both_correct: 1,
+            correct_to_incorrect: 1,
+            incorrect_to_correct: 1,
+            both_wrong: 0,
+            correct_to_incorrect_ci95: interval(0.25, 0.5),
+            incorrect_to_correct_ci95: interval(0.125, 0.75),
+        };
+        let line = build(comparison(Some(counts), 3))
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(
+            line.ends_with(&format!(
+                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}}}}"#,
+                "1".repeat(64),
+                "2".repeat(64),
+                "3".repeat(64)
+            )),
+            "{line}"
+        );
+        let empty = build(comparison(None, 0))
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(
+            empty.ends_with(
+                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null}}"#
+            ),
+            "{empty}"
+        );
+        assert_eq!(build(comparison(None, 3)), None);
+        assert_eq!(build(comparison(Some(counts), 4)), None);
+        let mut bad = counts;
+        bad.both_wrong = 1;
+        assert_eq!(build(comparison(Some(bad), 3)), None);
+        let mut bad = counts;
+        bad.incorrect_to_correct_ci95 = interval(0.8, 0.2);
+        assert_eq!(build(comparison(Some(bad), 3)), None);
+        let mut bad = counts;
+        bad.correct_to_incorrect_ci95 = interval(f64::NAN, 0.5);
+        assert_eq!(build(comparison(Some(bad), 3)), None);
     }
 
     /// REQ-24: `macro_f1` が未定義なら `null`（0 や 1 で埋めない）。

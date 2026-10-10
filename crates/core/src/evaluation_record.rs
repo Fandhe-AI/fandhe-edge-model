@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// 評価完了記録の読み込み上限（バイト。読み込み前のサイズ確認に使う。REQ-39）。
 ///
-/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）・対象外ラベル（#478）のみを持つ。
+/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）・対象外ラベル（#478）・旧モデルとの比較（#488）のみを持つ。
 /// 通常は 1 KiB 程度で、`majority_label`・`out_of_scope_label`（各最大 256 バイト）が全て JSON の
 /// `\u00XX` に膨らむ最悪でもこの上限に収まる（テスト `req39_issue339_record_fits_size_limit`。
 /// #478 で 4 KiB から 8 KiB に引き上げた）。
@@ -181,6 +181,91 @@ impl AbstentionRecord {
     }
 }
 
+/// 比較した旧モデル（旧プロジェクトの評価記録の値。REQ-26・TASK-26.1・#488）。
+///
+/// `evaluate --previous-project-dir` の stdout `comparison.previous` と評価記録の
+/// `previous_comparison.previous` が同じ形を使う。旧モデルの重み・ONNX は読まず、旧の評価記録の値を写すだけ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousModelRecord {
+    /// 旧の評価記録の候補 ID。
+    pub candidate_id: String,
+    /// 旧の評価記録の ONNX の sha256（hex）。
+    pub onnx_sha256: String,
+    /// 旧の評価記録の定義の正準化ハッシュ（hex）。
+    pub definition_sha256: String,
+    /// 旧の評価記録の評価データの sha256（hex）。
+    pub evaluation_sha256: String,
+}
+
+/// 旧・新のラベル集合から決まる比較の前提（評価器の `ComparisonPremise` の写し。REQ-26・TASK-26.2・#489）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonPremiseKind {
+    /// 旧・新が同一のラベル集合（並び順は問わない）。
+    SameLabelSet,
+    /// ラベル集合が異なる（件数は同じ問題での差分ではない）。
+    LabelSetDiffers,
+}
+
+/// 比較に使った評価データの範囲（REQ-26・REQ-17・#488）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonEvaluationData {
+    /// 旧の評価データの sha256 が新の凍結 sha256 と同じ（全件で比較）。
+    Same,
+    /// 評価データが異なり、id・input・正解ラベルがすべて一致する共通レコードだけで比較した。
+    CommonSubset,
+}
+
+/// 旧・新の正誤の 2×2 の件数（評価器の `RegressionCounts` の写し。CI は持たない。REQ-26・#488・#489）。
+///
+/// 4 区分の合計は `n`。`correct_to_incorrect` が回帰、`incorrect_to_correct` が改善。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegressionCountsRecord {
+    /// 比較した件数（共通レコード数）。
+    pub n: u64,
+    /// 旧・新ともに正解。
+    pub both_correct: u64,
+    /// 旧は正解・新は不正解（回帰）。
+    pub correct_to_incorrect: u64,
+    /// 旧は不正解・新は正解（改善）。
+    pub incorrect_to_correct: u64,
+    /// 旧・新ともに不正解。
+    pub both_wrong: u64,
+}
+
+impl RegressionCountsRecord {
+    /// 4 区分の合計。桁あふれ時は `None`。
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        self.both_correct
+            .checked_add(self.correct_to_incorrect)?
+            .checked_add(self.incorrect_to_correct)?
+            .checked_add(self.both_wrong)
+    }
+}
+
+/// 旧モデルとの比較の記録（`evaluate --previous-project-dir` のときだけ。REQ-26・TASK-26.1・26.2・
+/// #488・#489）。記録・報告のみで、終了コード・合否・`package` の照合には使わない。
+///
+/// `counts` は共通レコードが 0 件のとき `None`（`null`。0 で埋めない）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousComparisonRecord {
+    /// 比較した旧モデル。
+    pub previous: PreviousModelRecord,
+    /// 比較の前提（ラベル集合の一致・相違）。
+    pub premise: ComparisonPremiseKind,
+    /// 比較に使った評価データの範囲。
+    pub evaluation_data: ComparisonEvaluationData,
+    /// 比較した共通レコード数。
+    pub n_common: u64,
+    /// 2×2 の件数（`n_common == 0` で `None`）。
+    pub counts: Option<RegressionCountsRecord>,
+}
+
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,6 +311,10 @@ pub struct EvaluationRecord {
     /// そのまま読める（その場合、採点入口は拒否する）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predictions_sha256: Option<String>,
+    /// 旧モデルとの比較（`--previous-project-dir` のときだけ。REQ-26・#488・#489）。欄の無い古い記録は
+    /// そのまま読める。`package` は照合しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_comparison: Option<PreviousComparisonRecord>,
 }
 
 impl EvaluationRecord {
@@ -270,6 +359,7 @@ mod tests {
             calibration: None,
             out_of_scope_label: None,
             abstention: None,
+            previous_comparison: None,
         }
     }
 
@@ -436,6 +526,26 @@ mod tests {
                 out_of_scope: u64::MAX,
                 correct_answered: u64::MAX,
             }),
+            // 旧の候補 ID は `evaluate` が適用前に 128 バイト以下・制御文字なしに限る（#488）。
+            // `"` は JSON で 2 倍に膨らむ。sha256 は適用前に 64 桁の hex であることを確かめる。
+            previous_comparison: Some(PreviousComparisonRecord {
+                previous: PreviousModelRecord {
+                    candidate_id: "\"".repeat(128),
+                    onnx_sha256: "f".repeat(64),
+                    definition_sha256: "f".repeat(64),
+                    evaluation_sha256: "f".repeat(64),
+                },
+                premise: ComparisonPremiseKind::LabelSetDiffers,
+                evaluation_data: ComparisonEvaluationData::CommonSubset,
+                n_common: u64::MAX,
+                counts: Some(RegressionCountsRecord {
+                    n: u64::MAX,
+                    both_correct: u64::MAX,
+                    correct_to_incorrect: u64::MAX,
+                    incorrect_to_correct: u64::MAX,
+                    both_wrong: u64::MAX,
+                }),
+            }),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
         assert!(len <= MAX_EVALUATION_RECORD_BYTES, "len={len}");
@@ -514,6 +624,69 @@ mod tests {
         let bytes = record.to_json_vec().expect("json");
         assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
             "\"out_of_scope_label\":\"other\",\"abstention\":{\"answered\":5,\"abstained\":7,\"out_of_scope\":3,\"correct_answered\":4}}\n"
+        ));
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+    fn sample_previous(counts: Option<RegressionCountsRecord>) -> PreviousComparisonRecord {
+        PreviousComparisonRecord {
+            previous: PreviousModelRecord {
+                candidate_id: "c1".to_string(),
+                onnx_sha256: "1".repeat(64),
+                definition_sha256: "2".repeat(64),
+                evaluation_sha256: "3".repeat(64),
+            },
+            premise: ComparisonPremiseKind::SameLabelSet,
+            evaluation_data: ComparisonEvaluationData::Same,
+            n_common: 12,
+            counts,
+        }
+    }
+
+    /// REQ-26・#488・#489: 旧モデルとの比較欄つきの記録は末尾に完全一致で直列化され、往復できる。
+    /// `counts:null`（共通レコード 0 件）も往復でき、欄の無い古い記録は `None` で読める。
+    #[test]
+    fn req26_issue488_previous_comparison_round_trips_and_old_record_reads() {
+        let old = sample().to_json_vec().expect("json");
+        assert!(
+            !String::from_utf8(old.clone())
+                .unwrap()
+                .contains("previous_comparison")
+        );
+        assert_eq!(
+            EvaluationRecord::from_json_slice(&old)
+                .expect("old")
+                .previous_comparison,
+            None
+        );
+        let counts = RegressionCountsRecord {
+            n: 12,
+            both_correct: 6,
+            correct_to_incorrect: 2,
+            incorrect_to_correct: 3,
+            both_wrong: 1,
+        };
+        assert_eq!(counts.total(), Some(12));
+        let mut record = sample();
+        record.previous_comparison = Some(sample_previous(Some(counts)));
+        let bytes = record.to_json_vec().expect("json");
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(&format!(
+            ",\"previous_comparison\":{{\"previous\":{{\"candidate_id\":\"c1\",\"onnx_sha256\":\"{}\",\"definition_sha256\":\"{}\",\"evaluation_sha256\":\"{}\"}},\"premise\":\"same_label_set\",\"evaluation_data\":\"same\",\"n_common\":12,\"counts\":{{\"n\":12,\"both_correct\":6,\"correct_to_incorrect\":2,\"incorrect_to_correct\":3,\"both_wrong\":1}}}}}}\n",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64)
+        )));
+        assert_eq!(
+            EvaluationRecord::from_json_slice(&bytes),
+            Ok(record.clone())
+        );
+        let mut empty = sample_previous(None);
+        empty.n_common = 0;
+        empty.premise = ComparisonPremiseKind::LabelSetDiffers;
+        empty.evaluation_data = ComparisonEvaluationData::CommonSubset;
+        record.previous_comparison = Some(empty);
+        let bytes = record.to_json_vec().expect("json");
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(
+            "\"premise\":\"label_set_differs\",\"evaluation_data\":\"common_subset\",\"n_common\":0,\"counts\":null}}\n"
         ));
         assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
     }
