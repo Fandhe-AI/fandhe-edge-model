@@ -163,7 +163,8 @@ struct RawMeta {
     onnx_sha256: String,
     #[serde(default)]
     vocab_sha256: Option<String>,
-    #[serde(default)]
+    // `null` は欠落と区別して拒否する（`package` の追記で重複キーを作らない。#497）。
+    #[serde(default, deserialize_with = "present_string")]
     calibration_sha256: Option<String>,
 }
 
@@ -171,6 +172,11 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 欄があれば文字列を要求する（`null` は `Malformed`。欄の欠落は `#[serde(default)]` で `None`）。
+fn present_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <String as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// 語彙ファイル（`vocab.json`）の最大エントリ数（REQ-39。巨大な語彙でのアロケーション上限）。
@@ -680,6 +686,7 @@ mod tests {
             r#","calibration_sha256":"zz""#.to_string(),
             format!(r#","calibration_sha256":"{}""#, "B".repeat(64)),
             r#","calibration_sha256":1"#.to_string(),
+            r#","calibration_sha256":null"#.to_string(),
         ] {
             assert_eq!(
                 ArtifactMeta::parse(full_meta(&bad).as_bytes()),
