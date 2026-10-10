@@ -19,6 +19,13 @@
 //! 確認できない環境〔root・ACL 等〕では配置しない。凍結確認の単一の出所。REQ-17・REQ-39）。以後の
 //! `inspect`・`evaluate` は記録とのハッシュ一致を確認し、不一致なら停止する（fail-closed）。
 //!
+//! # 作り直し判定（REQ-20・TASK-20.1〜20.3・#487）
+//!
+//! `--previous-project-dir OLD`（cwd 配下の既存プロジェクト。読むだけ）を指定すると、`OLD/definition.json`
+//! と新しい定義を共通コアの `decide_rebuild` で比べ、stdout の `rebuild` 欄へ判定を載せる（無指定は `null`）。
+//! 終了コードは判定に関係なく 0 で、プロジェクトは常に作る。`--project-dir` が `OLD` と同じかその配下なら
+//! `invalid_input`（`OLD` へ書かない）。
+//!
 //! 取り込みの途中で失敗した場合、本工程が作った `--project-dir` は削除する（半端な状態の
 //! プロジェクトを残さない。既存の `--project-dir` は最初に拒否するため、削除対象は
 //! 本工程が作ったものに限る）。
@@ -26,10 +33,12 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use fandhe_edge_core::definition::MAX_DEFINITION_FILE_BYTES;
+use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::fs::read_bounded_open_file;
-use fandhe_edge_core::stage_report::RegisterReport;
+use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::rebuild::decide_rebuild;
+use fandhe_edge_core::stage_report::{RebuildReport, RegisterReport};
 use fandhe_edge_data::eval_freeze::{FreezeRecord, freeze_eval_data};
 use fandhe_edge_guard::path::{PathRejection, open_confined, safe_join};
 
@@ -141,6 +150,20 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         return Err(invalid("evaluation provenance without evaluation data"));
     }
 
+    // 作り直し判定（REQ-20・#487）は旧プロジェクトを読むだけで、`--project-dir` を作る前に済ませる
+    // （判定に関係なくプロジェクトは作る。判定の記録ファイルは作らない）。
+    let rebuild = match &args.previous_project_dir {
+        Some(old_dir) => Some(rebuild_report(
+            cwd,
+            old_dir,
+            &args.project_dir,
+            &definition,
+            &train_bytes,
+            evaluation.as_ref().map(|(bytes, _)| bytes.as_slice()),
+        )?),
+        None => None,
+    };
+
     let project = Project::create(cwd, &args.project_dir)?;
     let placed = place_project(
         &project,
@@ -158,7 +181,73 @@ pub fn run(args: &RegisterArgs, cwd: &Path) -> Result<RegisterReport, ErrorRepor
         hash.to_hex(),
         definition.options().len(),
         evaluation.is_some(),
+        rebuild,
     ))
+}
+
+/// `--previous-project-dir` の旧プロジェクトと比べて作り直しの要否を判定する（REQ-20・TASK-20.1〜20.3・
+/// #487）。
+///
+/// 旧プロジェクトは [`Project::open`]（cwd 配下へ閉じ込め・保持 fd 起点）で開いて読むだけ。判定は共通コアの
+/// [`decide_rebuild`] に任せ、ここでは再実装しない。データの差は取り込み済みの `data/train.jsonl`・
+/// `data/evaluation.jsonl` と今回取り込むバイト列の sha256 比較だけで、片側が無ければ `None`。
+///
+/// # Errors
+/// 旧プロジェクトが無い・cwd 外・`definition.json` が無い・不正、`--project-dir` が旧プロジェクトと同じか
+/// その配下（旧プロジェクトへ書き込むことになる）の場合は `invalid_input`（64）。データのサイズ超過は
+/// `limit_exceeded`（20）、I/O 失敗は `runtime_error`（70）。
+fn rebuild_report(
+    cwd: &Path,
+    old_dir: &Path,
+    project_dir: &Path,
+    definition: &Definition,
+    train_bytes: &[u8],
+    eval_bytes: Option<&[u8]>,
+) -> Result<RebuildReport, ErrorReport> {
+    let old = Project::open(cwd, old_dir)?;
+    reject_inside(cwd, project_dir, old.dir())?;
+    let old_definition = old.load_definition()?;
+    let decision = decide_rebuild(&old_definition, definition)
+        .map_err(|_| runtime("cannot compute definition hash"))?;
+    let old_hash = old_definition
+        .canonical_hash()
+        .map_err(|_| runtime("cannot compute definition hash"))?;
+    let changed = |name: &str, new: Option<&[u8]>| -> Result<Option<bool>, ErrorReport> {
+        let Some(new) = new else {
+            return Ok(None);
+        };
+        Ok(old
+            .read_optional(Path::new(DATA_DIR).join(name), MAX_PROJECT_FILE_BYTES)?
+            .map(|old| Sha256Digest::of_bytes(&old) != Sha256Digest::of_bytes(new)))
+    };
+    Ok(RebuildReport::new(
+        &decision,
+        old_hash.to_hex(),
+        changed(TRAIN_DATA_FILE, Some(train_bytes))?,
+        changed(EVALUATION_DATA_FILE, eval_bytes)?,
+    ))
+}
+
+/// `--project-dir` が旧プロジェクト（正準化済み `old_root`）と同じか配下なら拒否する（旧プロジェクトは
+/// 読むだけ・書かない。fail-closed）。
+///
+/// `--project-dir` は未作成のため、親を正準化して末尾の名前を足して比べる（symlink の親も実体で比べる）。
+/// 親を正準化できなければここでは判断せず、直後の [`Project::create`] が保持 fd 起点で拒否する。
+/// 旧プロジェクトが `--project-dir` の配下になることは、`--project-dir` が未作成である以上起こらない。
+fn reject_inside(cwd: &Path, project_dir: &Path, old_root: &Path) -> Result<(), ErrorReport> {
+    let Some(leaf) = project_dir.file_name() else {
+        return Ok(());
+    };
+    let parent = project_dir.parent().unwrap_or_else(|| Path::new(""));
+    let Ok(parent) = std::fs::canonicalize(cwd.join(parent)) else {
+        return Ok(());
+    };
+    if parent.join(leaf).starts_with(old_root) {
+        return Err(invalid(
+            "project directory must not be the previous project directory or inside it",
+        ));
+    }
+    Ok(())
 }
 
 /// 取り込んだファイルをプロジェクトへ置く（評価データは凍結記録つきで読み取り専用配置）。

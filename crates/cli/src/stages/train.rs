@@ -1397,6 +1397,7 @@ mod all_tests {
             &RegisterArgs {
                 definition: "def/definition.json".into(),
                 project_dir: "proj".into(),
+                previous_project_dir: None,
             },
             &dir,
         )
