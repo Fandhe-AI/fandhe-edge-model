@@ -15,8 +15,25 @@
 //! （[`super::inspect::ensure_evaluation_frozen`]。REQ-17）。
 //!
 //! 学習ワーカーへ渡す validation は `id` と `input` のみ（正解ラベルは渡さない。REQ-27）。
-//! 作成後に失敗した場合は、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける
-//! （同じ `--candidate` を再試行できる。チェックポイントからの再開は提供しない。REQ-34）。
+//!
+//! # ジョブ記録とやり直し（REQ-34・TASK-34.2・TASK-34.3・#485）
+//!
+//! 学習ジョブは単発・`--all` とも [`TrainJob::run_recorded`] で実行し、`candidates/<N>/job/` に
+//! `job.json`（状態）と `job.lock`（生存確認の flock。PID は使わない）を残す。ジョブが失敗で終わった
+//! 単発の `train` は `candidates/<N>/` を片付けずに残し（[`status`] が報告できるように）、ジョブの
+//! 開始前・成功後の失敗では、その呼び出しで作った `candidates/<N>/` だけを保持 fd 起点で片付ける。
+//!
+//! 開始時に `candidates/<N>/` が既にあれば [`discard_failed_candidate`] の規則で扱う: `result.json` あり・
+//! `succeeded`・記録なしは `candidate directory already exists`、`running`・`cancelling` は `job is running`
+//! （いずれも 64）、`failed`・`cancelled`（記録が `running` のまま所有者が消えたものは、状態確認が `failed`＋
+//! `owner_lost` へ書き戻してから）は保持 fd 起点で丸ごと消して新規に学習する（チェックポイントからの再開は
+//! 提供しない）。
+//!
+//! # `--status`（#485）
+//!
+//! [`status`] は記録のある候補のジョブ状態（[`read_job_status`] の結果をそのまま）とやり直し案内を返す。
+//! 学習の副作用が無いため凍結の検査はしない。書き込みは `running` の残骸を `failed`＋`owner_lost` へ
+//! 書き戻す `job.json` だけ（MCP では参照系だが、この書き戻しを伴う。REQ-36）。
 //!
 //! # `--all`（探索予算内の全候補。REQ-18・TASK-18.1・TASK-18.2・#482・#483）
 //!
@@ -47,9 +64,11 @@ use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::error::TrainProcessError;
+use fandhe_edge_train::job::{JobState, TrainJob};
+use fandhe_edge_train::job_record::{JobRecordError, JobStatusReport, read_job_status, unix_now};
 use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
-use fandhe_edge_train::process::{RunLimits, WorkerCandidateRunner, WorkerLauncher, run_train};
+use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, WorkerLauncher};
 use fandhe_edge_train::request::{
     Device, TrainRequest, TrainRequestParams, ValidationInput, label_order_from_definition,
 };
@@ -59,8 +78,8 @@ use fandhe_edge_train::search::{
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    MAX_SEARCH_RECORD_BYTES, StageFileError, allotted_time_limit_seconds, outcome_json_vec,
-    search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainStatusEntry, allotted_time_limit_seconds,
+    outcome_json_vec, search_record_json_vec, trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
@@ -163,9 +182,9 @@ pub fn resolve_candidates(
 /// `train --candidate <index>` を実行する。
 ///
 /// # Errors
-/// 前提（`inspect` 済み）の欠落・候補の範囲外・既存の候補ディレクトリ・既存の `search_record.json`
-/// （`train --all` 済み）は `invalid_input`（64）、ワーカーの失敗は結果の失敗コードに応じた終了コード、
-/// I/O 失敗は `runtime_error`（70）。
+/// 前提（`inspect` 済み）の欠落・候補の範囲外・やり直せない既存の候補ディレクトリ（モジュール doc
+/// 「ジョブ記録とやり直し」）・既存の `search_record.json`（`train --all` 済み）は `invalid_input`（64）、
+/// ワーカーの失敗は結果の失敗コードに応じた終了コード、I/O 失敗は `runtime_error`（70）。
 pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     // 副作用（学習・選定・書き出し）の前に、評価データが凍結記録どおりか確認する（REQ-17）。
@@ -203,9 +222,13 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     if !project.exists(CANDIDATES_DIR)? {
         project.create_dir(CANDIDATES_DIR)?;
     }
-    // 以降の失敗では、今回作った候補ディレクトリだけを片付けてから返す（同じ `--candidate` を
-    // 再試行できるようにする。名前替えの公開方式は使わない: 結果の `artifact_dir` は絶対パスで
-    // 記録されるため、移動すると記録と実体がずれる。REQ-34: 再開は提供せず、やり直しは新規）。
+    if project.exists(&rel)? {
+        discard_failed_candidate(&project, index)?;
+    }
+    // ジョブの開始前・成功後の失敗では、今回作った候補ディレクトリだけを片付けてから返す（同じ
+    // `--candidate` を再試行できるようにする。名前替えの公開方式は使わない: 結果の `artifact_dir` は
+    // 絶対パスで記録されるため、移動すると記録と実体がずれる）。ジョブが失敗で終わった場合は
+    // `--status` のために残す（次の `train` が [`discard_failed_candidate`] で消す。REQ-34）。
     let created = project.create_dir_tracked(&rel)?;
     let trained = train_in_candidate_dir(
         &project,
@@ -217,8 +240,11 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     );
     match trained {
         Ok(()) => Ok(TrainReport::new(index, candidate.candidate_id)),
-        Err(mut report) => {
-            if !project.remove_created_dir(&created) {
+        Err(TrainFailure {
+            mut report,
+            job_failed,
+        }) => {
+            if !job_failed && !project.remove_created_dir(&created) {
                 // 元のエラーの終了コードは変えず、残骸があることだけ固定文言で付記する。
                 report
                     .message
@@ -229,8 +255,61 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Er
     }
 }
 
-/// 作成済みの候補ディレクトリへ学習入力を置き、学習ワーカーを実行して結果を保存する。
-/// 失敗時の後始末は呼び出し元（[`run`]）が行う。
+/// 開始時に既にある `candidates/<index>/` を、モジュール doc「ジョブ記録とやり直し」の規則で扱う
+/// （やり直せるときだけ丸ごと消す。REQ-34・#485）。
+///
+/// 判定より先に候補ディレクトリの fd を保持し、削除は判定した実体と同一のときだけ行う（判定後に
+/// 差し替えられた別のディレクトリを消さない。REQ-39）。
+fn discard_failed_candidate(project: &Project, index: usize) -> Result<(), ErrorReport> {
+    let rel = candidate_rel(index);
+    let held = project.track_existing_dir(&rel)?;
+    if project.exists(rel.join(RESULT_FILE))? {
+        return Err(invalid("candidate directory already exists"));
+    }
+    match job_status(project, index)?.map(|job| job.state) {
+        Some(JobState::Failed | JobState::Cancelled) => {}
+        Some(JobState::Queued | JobState::Running | JobState::Cancelling) => {
+            return Err(invalid("job is running"));
+        }
+        // `succeeded`（`result.json` の保存前に止まった等）・記録なしは、何が残っているか分からないため
+        // 消さない（保守側）。
+        Some(JobState::Succeeded) | None => {
+            return Err(invalid("candidate directory already exists"));
+        }
+    }
+    if project.remove_created_dir(&held) {
+        Ok(())
+    } else {
+        Err(runtime("candidate directory could not be cleaned up"))
+    }
+}
+
+/// 単発の `train` の失敗。`job_failed` はジョブ記録が失敗で終わった（候補ディレクトリを残す）か。
+struct TrainFailure {
+    report: ErrorReport,
+    job_failed: bool,
+}
+
+impl TrainFailure {
+    /// ジョブの開始前・成功後の失敗（候補ディレクトリは片付ける）。
+    fn cleanup(report: ErrorReport) -> Self {
+        Self {
+            report,
+            job_failed: false,
+        }
+    }
+
+    /// ジョブが失敗で終わった（候補ディレクトリは `--status` のために残す）。
+    fn job(report: ErrorReport) -> Self {
+        Self {
+            report,
+            job_failed: true,
+        }
+    }
+}
+
+/// 作成済みの候補ディレクトリへ学習入力を置き、学習ジョブを記録つきで実行して結果を保存する。
+/// 失敗時の後始末は呼び出し元（[`run`]）が [`TrainFailure`] に従って行う。
 fn train_in_candidate_dir(
     project: &Project,
     rel: &Path,
@@ -238,29 +317,132 @@ fn train_in_candidate_dir(
     request: &TrainRequest,
     train_jsonl: &[u8],
     train_seed_override: Option<u32>,
-) -> Result<(), ErrorReport> {
-    let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)?;
+) -> Result<(), TrainFailure> {
+    let job_dir = prepare_candidate_dir(project, rel, request, train_jsonl, train_seed_override)
+        .map_err(TrainFailure::cleanup)?;
 
-    let run = run_train(
-        launcher,
-        request,
-        &job_dir,
-        &RunLimits::for_request(request),
-    )
-    .map_err(|e| e.to_error_report())?;
-    if let Some(report) = train_outcome_error_report(run.outcome()) {
-        return Err(report);
+    let outcome = run_recorded_job(launcher, request, &job_dir).map_err(|e| match e {
+        RecordedJobError::Run(e) => TrainFailure::job(e.to_error_report()),
+        RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+            TrainFailure::cleanup(e.to_error_report())
+        }
+    })?;
+    if let Some(report) = train_outcome_error_report(&outcome) {
+        return Err(TrainFailure::job(report));
     }
-    let TrainOutcome::Ok(success) = run.outcome() else {
-        return Err(ErrorReport::new(
-            ExitCode::RuntimeError,
-            "unexpected train outcome",
-        ));
+    let TrainOutcome::Ok(success) = &outcome else {
+        return Err(TrainFailure::cleanup(runtime("unexpected train outcome")));
     };
-    check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())?;
-    let result_json =
-        outcome_json_vec(run.outcome()).map_err(|_| runtime("cannot serialize train result"))?;
-    project.write_new(rel.join(RESULT_FILE), &result_json)
+    check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())
+        .map_err(TrainFailure::cleanup)?;
+    let result_json = outcome_json_vec(&outcome)
+        .map_err(|_| TrainFailure::cleanup(runtime("cannot serialize train result")))?;
+    project
+        .write_new(rel.join(RESULT_FILE), &result_json)
+        .map_err(TrainFailure::cleanup)
+}
+
+/// [`run_recorded_job`] の失敗。
+enum RecordedJobError {
+    /// ジョブ記録を開始できなかった（子は起動していない・記録は残らない）。
+    Begin(JobRecordError),
+    /// ジョブが失敗した（終端記録は `failed`。書けなかった場合も次の状態確認が `owner_lost` を検出する）。
+    Run(TrainProcessError),
+    /// 学習は成功したが終端記録を書けなかった（記録と結果が食い違うため成功として扱わない）。
+    Record(JobRecordError),
+}
+
+/// 学習ジョブを `job_dir` に記録しながら実行する（単発の `train` と `train --all` が共有する。REQ-34・
+/// TASK-34.2・#485）。ワーカーが返した失敗（`TrainOutcome::Error`）は `Ok` で返す（呼び出し元が写す）。
+fn run_recorded_job(
+    launcher: &WorkerLauncher,
+    request: &TrainRequest,
+    job_dir: &Path,
+) -> Result<TrainOutcome, RecordedJobError> {
+    let recorded = TrainJob::new()
+        .run_recorded(launcher, request, job_dir, &RunLimits::for_request(request))
+        .map_err(RecordedJobError::Begin)?;
+    let outcome = match recorded.run {
+        Ok(TrainRunEnd::Completed(run)) => run.outcome().clone(),
+        // キャンセルの口を持たないため起こらない。`run_train` と同じ写像にする（キャンセルは #484）。
+        Ok(TrainRunEnd::Cancelled(_)) => {
+            return Err(RecordedJobError::Run(TrainProcessError::Wait {
+                kind: std::io::ErrorKind::Interrupted,
+            }));
+        }
+        Err(e) => return Err(RecordedJobError::Run(e)),
+    };
+    match (recorded.record, &outcome) {
+        (Err(e), TrainOutcome::Ok(_)) => Err(RecordedJobError::Record(e)),
+        _ => Ok(outcome),
+    }
+}
+
+/// 候補 `index` のジョブ記録を確認する（記録が無ければ `None`）。経路は保持 fd 起点の `open_subdir`
+/// （`O_NOFOLLOW`）で検証してから、学習ワーカー層の [`read_job_status`] に渡す（REQ-34・REQ-39）。
+fn job_status(project: &Project, index: usize) -> Result<Option<JobStatusReport>, ErrorReport> {
+    let rel = candidate_rel(index).join(JOB_DIR);
+    if !project.exists(&rel)? {
+        return Ok(None);
+    }
+    let job_dir = project.open_subdir(&rel)?;
+    match read_job_status(job_dir.dir(), unix_now()) {
+        Ok(report) => Ok(Some(report)),
+        // `job.json`・`job.lock` のどちらも無い（ジョブを開始する前に止まった）。
+        Err(JobRecordError::Io {
+            kind: std::io::ErrorKind::NotFound,
+        }) => Ok(None),
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// `--status` で列挙する候補ディレクトリ数の上限（REQ-39）。
+const MAX_STATUS_CANDIDATES: usize = 1024;
+
+/// `train --status [--candidate N]`（REQ-34・TASK-34.2・TASK-34.3・#485）。
+///
+/// `candidate` 省略時は記録のある候補だけを添字順に返す（無ければ空）。凍結の検査はしない。
+///
+/// # Errors
+/// `--candidate N` に記録が無い・記録の形式の不正は `invalid_input`（64）、記録のサイズ超過・候補が
+/// 多すぎる場合は `limit_exceeded`（20）、lock・I/O の失敗は `runtime_error`（70）。
+pub fn status(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+) -> Result<Vec<TrainStatusEntry>, ErrorReport> {
+    let project = Project::open(cwd, &args.project_dir)?;
+    if let Some(index) = candidate {
+        let job = job_status(&project, index)?.ok_or_else(|| invalid("job record not found"))?;
+        return Ok(vec![TrainStatusEntry::new(index, job)]);
+    }
+    if !project.exists(CANDIDATES_DIR)? {
+        return Ok(Vec::new());
+    }
+    let names = project
+        .open_subdir(CANDIDATES_DIR)?
+        .list_entry_names(MAX_STATUS_CANDIDATES)
+        .map_err(|_| runtime("cannot list project directory"))?;
+    if names.len() > MAX_STATUS_CANDIDATES {
+        return Err(fail(
+            ExitCode::LimitExceeded,
+            "too many candidate directories",
+        ));
+    }
+    // 添字の正準形（`candidate_rel` が作る名前）だけを候補とする。
+    let mut indices: Vec<usize> = names
+        .iter()
+        .filter_map(|n| n.to_str())
+        .filter_map(|s| s.parse::<usize>().ok().filter(|i| i.to_string() == s))
+        .collect();
+    indices.sort_unstable();
+    let mut jobs = Vec::new();
+    for index in indices {
+        if let Some(job) = job_status(&project, index)? {
+            jobs.push(TrainStatusEntry::new(index, job));
+        }
+    }
+    Ok(jobs)
 }
 
 /// 作成済みの候補ディレクトリ `rel` へ `job/`・`train_input.jsonl`・`request.json`（・`--train-seed` の
@@ -290,9 +472,9 @@ fn apply_smoke(candidate: &mut SearchCandidate) {
         .insert("epochs".to_string(), 1.into());
 }
 
-/// 候補 1 件の学習ジョブを、用意済みの `job/` で実行する関数の型（本番は [`WorkerCandidateRunner`]。
-/// テストは偽の実行で差し替える）。
-type JobFn<'a> = dyn FnMut(&TrainRequest, &Path) -> Result<TrainOutcome, TrainProcessError> + 'a;
+/// 候補 1 件の学習ジョブを、用意済みの `job/` で実行する関数の型（本番は [`run_recorded_job`] で
+/// `job/` に記録しながら実行する。テストは偽の実行で差し替える）。
+type JobFn<'a> = dyn FnMut(&TrainRequest, &Path) -> Result<TrainOutcome, AllRunError> + 'a;
 
 /// `train --all` を実行する（REQ-18・REQ-27・REQ-34・REQ-39・TASK-18.1・TASK-18.2・#482・#483）。
 ///
@@ -307,7 +489,12 @@ pub fn run_all(
     let launcher_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
         let launcher = worker_launcher()?;
         Ok(Box::new(move |request: &TrainRequest, job_dir: &Path| {
-            WorkerCandidateRunner::new(&launcher, job_dir).run(request)
+            run_recorded_job(&launcher, request, job_dir).map_err(|e| match e {
+                RecordedJobError::Run(e) => AllRunError::Process(e),
+                RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
+                    AllRunError::Report(e.to_error_report())
+                }
+            })
         }))
     };
     run_all_with(args, budget, cwd, launcher_job, &SystemClock::new())
@@ -484,6 +671,12 @@ enum AllRunError {
     Report(ErrorReport),
 }
 
+impl From<TrainProcessError> for AllRunError {
+    fn from(e: TrainProcessError) -> Self {
+        Self::Process(e)
+    }
+}
+
 /// `train --all` の実行器: 候補の学習ジョブの直前に `candidates/<N>/` を作って入力を置き、学習ジョブを
 /// 実行して結果を控える（[`run_search`] の [`CandidateRunner`]）。候補は `request.root()` で特定する。
 struct CandidateDirRunner<'p, 'j> {
@@ -537,7 +730,7 @@ impl CandidateRunner for CandidateDirRunner<'_, '_> {
             self.train_seed_override,
         )
         .map_err(AllRunError::Report)?;
-        let outcome = (self.job)(request, &job_dir).map_err(AllRunError::Process)?;
+        let outcome = (self.job)(request, &job_dir)?;
         if let TrainOutcome::Ok(success) = &outcome {
             check_empty_input_preprocessing(success.empty_input_ids(), request.max_bytes())
                 .map_err(AllRunError::Report)?;
@@ -908,7 +1101,7 @@ mod all_tests {
     use fandhe_edge_train::error::TrainRequestError;
     use fandhe_edge_train::time_allotment::TimeAllotmentError;
 
-    use crate::args::{InspectArgs, RegisterArgs, SelectArgs, TrainTarget};
+    use crate::args::{InspectArgs, RegisterArgs, SelectArgs, TrainOp, TrainTarget};
 
     const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
     /// `c1` の既定設定（`fixtures/train_contract/kind_defaults.json` と同じ具体値。結果の `config` は
@@ -982,9 +1175,9 @@ mod all_tests {
     fn all_args() -> TrainArgs {
         TrainArgs {
             project_dir: "proj".into(),
-            target: TrainTarget::All {
+            op: TrainOp::Run(TrainTarget::All {
                 budget: SearchBudget::default(),
-            },
+            }),
             smoke: false,
             train_seed: None,
         }
@@ -1137,7 +1330,7 @@ mod all_tests {
         // `train --all` 済みのプロジェクトへの単発の `train --candidate` も同じく拒否する（予算内と予算外で
         // 学習した候補を混ぜない。REQ-18）。学習ワーカーの発見より前に止まり、候補ディレクトリを作らない。
         let single = TrainArgs {
-            target: TrainTarget::Candidate(0),
+            op: TrainOp::Run(TrainTarget::Candidate(0)),
             ..all_args()
         };
         let rejected = run(&single, 0, &cwd).expect_err("existing record");
@@ -1164,7 +1357,8 @@ mod all_tests {
                     return Err(TrainProcessError::WallTimeout {
                         limit_ms: 1000,
                         child_reaped: true,
-                    });
+                    }
+                    .into());
                 }
                 Ok(fake_c1_success(request))
             }))
@@ -1201,7 +1395,8 @@ mod all_tests {
                 if request.kind() == "c3" {
                     return Err(TrainProcessError::Spawn {
                         kind: std::io::ErrorKind::NotFound,
-                    });
+                    }
+                    .into());
                 }
                 Ok(fake_c1_success(request))
             }))
@@ -1306,5 +1501,187 @@ mod all_tests {
 
     fn error_pair(report: &ErrorReport) -> (ExitCode, &str) {
         (report.code, report.message.as_str())
+    }
+}
+
+/// `train --status` とジョブ記録の配線（REQ-34・TASK-34.2・TASK-34.3・REQ-21・#485）。
+///
+/// 証拠の種別: テストハーネス。記録は学習ワーカー層の `JobRecorder` で直接作り、学習ワーカーは
+/// 起動しない（GPU を使わない）。
+#[cfg(all(test, unix))]
+mod status_tests {
+    use super::*;
+    use fandhe_edge_train::job_record::{JobFailure, JobRecorder};
+    use fandhe_edge_train::stage_files::train_status_json_line;
+
+    use crate::args::TrainOp;
+
+    /// `proj/` だけを持つ作業ディレクトリ（cwd。正準化済み）。
+    fn workdir(case: &str) -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!("fandhe-train-status-{case}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).expect("mkdir");
+        dir
+    }
+
+    /// `candidates/<index>/job/` を作って絶対パスを返す。
+    fn job_dir(cwd: &Path, index: usize) -> PathBuf {
+        let dir = cwd.join(format!("proj/candidates/{index}/job"));
+        std::fs::create_dir_all(&dir).expect("job dir");
+        dir
+    }
+
+    fn status_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
+        let args = TrainArgs {
+            project_dir: "proj".into(),
+            op: TrainOp::Status(candidate),
+            smoke: false,
+            train_seed: None,
+        };
+        status(&args, candidate, cwd).map(|jobs| train_status_json_line(&jobs).expect("json"))
+    }
+
+    const NOT_INSPECTED: &str = r#"{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"Resume is not supported. Restart the job from scratch; the state of out_dir was not inspected, so check it before reuse."}"#;
+
+    /// REQ-34・#485 (a): 終端記録（`succeeded`・`failed`）をそのまま写し、記録のある候補だけを添字順に
+    /// 並べる（記録の無い候補・添字の正準形でない名前は出さない）。`failed` にだけやり直し案内が付く。
+    /// プロジェクトは定義・凍結記録を持たない（`--status` は凍結の検査をしない）。
+    #[test]
+    fn req34_status_reports_terminal_records_exactly() {
+        let cwd = workdir("terminal");
+        JobRecorder::begin(&job_dir(&cwd, 10), 100)
+            .expect("begin")
+            .finish(JobState::Succeeded, None, 120)
+            .expect("finish");
+        JobRecorder::begin(&job_dir(&cwd, 2), 100)
+            .expect("begin")
+            .finish(
+                JobState::Failed,
+                Some(JobFailure::Error {
+                    code: ExitCode::Pending,
+                }),
+                130,
+            )
+            .expect("finish");
+        job_dir(&cwd, 3);
+        std::fs::create_dir_all(cwd.join("proj/candidates/07/job")).expect("non-canonical");
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            format!(
+                r#"{{"step":"train","status":"ok","jobs":[{{"candidate":2,"job":{{"state":"failed","crash_detected":false,"failure":{{"kind":"error","code":"pending"}},"record_updated":false}},"restart":{NOT_INSPECTED}}},{{"candidate":10,"job":{{"state":"succeeded","crash_detected":false,"failure":null,"record_updated":false}},"restart":null}}]}}"#
+            )
+        );
+        assert_eq!(
+            status_line(&cwd, Some(10)).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[{"candidate":10,"job":{"state":"succeeded","crash_detected":false,"failure":null,"record_updated":false},"restart":null}]}"#
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485 (b): 別スレッドが `JobRecorder::begin` で lock を保持している間は `running`
+    /// （クラッシュと誤報しない）。保持者が `finish` すれば終端記録を返す。
+    #[test]
+    fn req34_status_reports_running_while_lock_is_held() {
+        let cwd = workdir("running");
+        let dir = job_dir(&cwd, 0);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let recorder = JobRecorder::begin(&dir, 100).expect("begin");
+            held_tx.send(()).expect("send");
+            done_rx.recv().expect("recv");
+            recorder
+                .finish(JobState::Succeeded, None, 110)
+                .expect("finish");
+        });
+        held_rx.recv().expect("held");
+        assert_eq!(
+            status_line(&cwd, Some(0)).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[{"candidate":0,"job":{"state":"running","crash_detected":false,"failure":null,"record_updated":false},"restart":null}]}"#
+        );
+        done_tx.send(()).expect("done");
+        owner.join().expect("owner");
+        assert!(
+            status_line(&cwd, Some(0))
+                .expect("status")
+                .contains(r#""state":"succeeded""#)
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・#485 (c): `running` の記録が残り lock の保持者がいない（所有プロセスが落ちた）と、
+    /// `failed`＋`owner_lost` を書き戻して `record_updated:true`、2 回目は同じ記録を `false` で返す。
+    #[test]
+    fn req34_status_detects_owner_lost_once() {
+        let cwd = workdir("ownerlost");
+        // `finish` せずに drop すると lock だけが解放され、記録は `running` のまま残る。
+        drop(JobRecorder::begin(&job_dir(&cwd, 1), 100).expect("begin"));
+        let crashed = |updated: bool| {
+            let line = status_line(&cwd, None).expect("status");
+            let (head, tail) = line
+                .split_once(r#""detected_at_unix":"#)
+                .expect("detected_at_unix");
+            assert_eq!(
+                head,
+                r#"{"step":"train","status":"ok","jobs":[{"candidate":1,"job":{"state":"failed","crash_detected":true,"failure":{"kind":"crashed","cause":"owner_lost","signal":null,"#
+            );
+            let (time, rest) = tail.split_once('}').expect("time");
+            assert!(time.parse::<u64>().is_ok_and(|t| t >= 100), "{time}");
+            assert_eq!(
+                rest,
+                format!(r#","record_updated":{updated}}},"restart":{NOT_INSPECTED}}}]}}"#)
+            );
+        };
+        crashed(true);
+        crashed(false);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-21・#485 (d): `--candidate N` に記録が無ければ `invalid_input`・`job record not found`
+    /// （候補ディレクトリが無い・`job/` に記録が無いのどちらも）。省略時に記録が無ければ `jobs:[]`。
+    #[test]
+    fn req34_status_without_record_is_invalid_input() {
+        let cwd = workdir("missing");
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[]}"#
+        );
+        let missing = status_line(&cwd, Some(0)).expect_err("no candidate dir");
+        assert_eq!(
+            (missing.code, missing.message.as_str()),
+            (ExitCode::InvalidInput, "job record not found")
+        );
+        job_dir(&cwd, 0);
+        let empty = status_line(&cwd, Some(0)).expect_err("no record");
+        assert_eq!(
+            (empty.code, empty.message.as_str()),
+            (ExitCode::InvalidInput, "job record not found")
+        );
+        assert_eq!(
+            status_line(&cwd, None).expect("status"),
+            r#"{"step":"train","status":"ok","jobs":[]}"#
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-34・REQ-39・#485: 壊れた記録は `invalid_input`・固定 message、`job/` が symlink なら経路の
+    /// 拒否（`invalid_input`）でリンク先を読まない。
+    #[test]
+    fn req34_status_rejects_malformed_record_and_symlinked_job_dir() {
+        let cwd = workdir("malformed");
+        let dir = job_dir(&cwd, 0);
+        std::fs::write(dir.join("job.json"), b"{").expect("job.json");
+        let malformed = status_line(&cwd, Some(0)).expect_err("malformed");
+        assert_eq!(
+            (malformed.code, malformed.message.as_str()),
+            (ExitCode::InvalidInput, "job record is malformed")
+        );
+        std::fs::create_dir_all(cwd.join("proj/candidates/1")).expect("mkdir");
+        std::os::unix::fs::symlink(&dir, cwd.join("proj/candidates/1/job")).expect("symlink");
+        let escaped = status_line(&cwd, Some(1)).expect_err("symlink");
+        assert_eq!(escaped.code, ExitCode::InvalidInput, "{}", escaped.message);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 }

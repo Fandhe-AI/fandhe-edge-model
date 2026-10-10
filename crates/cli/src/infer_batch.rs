@@ -1008,7 +1008,7 @@ mod tests {
     use super::*;
     use crate::args::{
         EvaluateArgs, InferArgs, InspectArgs, PackageArgs, RegisterArgs, SelectArgs, TrainArgs,
-        TrainTarget,
+        TrainOp, TrainTarget,
     };
     use fandhe_edge_core::definition::InputRepresentation;
     use std::path::PathBuf;
@@ -1037,7 +1037,7 @@ mod tests {
             }),
             Command::Train(TrainArgs {
                 project_dir: p(),
-                target: TrainTarget::Candidate(0),
+                op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,
                 train_seed: None,
             }),

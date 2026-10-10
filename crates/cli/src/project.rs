@@ -518,6 +518,20 @@ impl Project {
         })
     }
 
+    /// 既存のディレクトリ `rel` を保持 fd 起点で開き、[`Project::remove_created_dir`] で片付けられる
+    /// ハンドルにする（`train` が前回の失敗で残った候補ディレクトリを、判定した実体と同一のときだけ
+    /// 消すため。REQ-34・REQ-39・#485）。
+    ///
+    /// # Errors
+    /// [`Project::open_subdir`] と同じ。
+    pub fn track_existing_dir(&self, rel: impl AsRef<Path>) -> Result<CreatedDir, ErrorReport> {
+        let rel = rel.as_ref();
+        Ok(CreatedDir {
+            rel: rel.to_path_buf(),
+            handle: self.open_subdir(rel)?,
+        })
+    }
+
     /// プロジェクト内のディレクトリ `rel` を、保持 fd 起点の相対オープン（`O_NOFOLLOW`・
     /// `O_DIRECTORY`）で開き、新しい閉じ込めルートとして返す（パスの正規化・再解決をしない。
     /// 検証後の差し替えでも別のディレクトリを開かない。REQ-39）。

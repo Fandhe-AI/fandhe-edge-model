@@ -15,15 +15,19 @@
 //! - [`outcome_json_vec`]: 学習結果の保存用 JSON（保存後も
 //!   [`crate::result::TrainOutcome::from_worker_stdout`] で再検証つきで読み戻す）
 //! - [`validation_accuracy`]: 学習ジョブが返した validation 予測と正解ラベルから正解率を出す
+//! - [`train_status_json_line`]: `train --status` の stdout（候補ごとのジョブ記録の状態とやり直し案内。#485）
 //! - [`SelectionRecord`]: `select` の記録（`package` が選定候補を読み戻す）。有意性判定
 //!   （[`crate::selection_significance`] の結果）は定義に `baseline_comparison` があるときだけ持つ（#481）
 //!
 //! エラーはデータ本文・ラベル・パスを含まない固定の列挙値で返す（`security.md`）。
 
 use fandhe_edge_core::evaluation_record::SelectionSignificanceRecord;
+use fandhe_edge_core::stage_report::{Stage, StageStatus};
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome, Ratio};
 use serde::{Deserialize, Serialize};
 
+use crate::job_record::JobStatusReport;
+use crate::restart::{RestartGuidance, guidance_for_state};
 use crate::result::{TrainOutcome, ValidationPrediction, ValidationPredictionStatus};
 use crate::search::SearchRecord;
 
@@ -319,6 +323,51 @@ impl SelectionRecord {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, StageFileError> {
         serde_json::from_slice(bytes).map_err(|_| StageFileError::Malformed)
     }
+}
+
+/// `train --status` の候補 1 件（REQ-34・TASK-34.2・TASK-34.3・#485）。
+///
+/// `job` は [`crate::job_record::read_job_status`] の結果をそのまま、`restart` は
+/// [`guidance_for_state`]（`cancelled`・`failed` のときだけ。`resumable` は常に `false`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrainStatusEntry {
+    candidate: usize,
+    job: JobStatusReport,
+    restart: Option<RestartGuidance>,
+}
+
+impl TrainStatusEntry {
+    /// 候補 `candidate` の状態確認の結果から作る（やり直し案内は状態から決める）。
+    #[must_use]
+    pub fn new(candidate: usize, job: JobStatusReport) -> Self {
+        let restart = guidance_for_state(job.state);
+        Self {
+            candidate,
+            job,
+            restart,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TrainStatusLine<'a> {
+    step: Stage,
+    status: StageStatus,
+    jobs: &'a [TrainStatusEntry],
+}
+
+/// `train --status` の stdout（JSON 1 行・末尾改行なし。`{"step":"train","status":"ok","jobs":[...]}`）。
+/// パス・データ本文は含めない（#485）。
+///
+/// # Errors
+/// 直列化に失敗した場合（実務上は起こらない）。
+pub fn train_status_json_line(jobs: &[TrainStatusEntry]) -> Result<String, StageFileError> {
+    serde_json::to_string(&TrainStatusLine {
+        step: Stage::Train,
+        status: StageStatus::Ok,
+        jobs,
+    })
+    .map_err(|_| StageFileError::Serialize)
 }
 
 #[cfg(test)]

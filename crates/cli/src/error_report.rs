@@ -48,6 +48,7 @@ use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_guard::resource::{GuardRunError, ResourceKind, ResourceLimitExceeded};
 use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
+use fandhe_edge_train::job_record::JobRecordError;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::SearchError;
 use std::io::{self, Write};
@@ -166,6 +167,25 @@ impl ToErrorReport for TrainResultError {
 impl ToErrorReport for TrainProcessError {
     fn to_error_report(&self) -> ErrorReport {
         ErrorReport::new(self.exit_code(), self.to_string())
+    }
+}
+
+/// 学習ジョブ記録（`job.json`）の失敗（REQ-21・REQ-34・#485）。`Display` は固定の英語文で
+/// パス・内容を含まない。記録の形式・既存・ディレクトリの不正は `invalid_input`、サイズ超過は
+/// `limit_exceeded`、lock・I/O・不正な終端は `runtime_error`。
+impl ToErrorReport for JobRecordError {
+    fn to_error_report(&self) -> ErrorReport {
+        let code = match self {
+            Self::InvalidJobDir
+            | Self::AlreadyExists
+            | Self::NotRegularFile
+            | Self::Malformed
+            | Self::UnsupportedSchemaVersion => ExitCode::InvalidInput,
+            Self::TooLarge => ExitCode::LimitExceeded,
+            // `LockUnavailable`・`LockMissing`・`InvalidFinalState`・`Io` と、将来の追加（non_exhaustive）。
+            _ => ExitCode::RuntimeError,
+        };
+        ErrorReport::new(code, self.to_string())
     }
 }
 
@@ -414,6 +434,69 @@ pub fn apply_once_error_report(error: &ApplyOnceFailure) -> ErrorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-21・REQ-34・#485: ジョブ記録の失敗の終了コードと固定 message（パスを含まない）。
+    #[test]
+    fn req34_job_record_error_maps_to_exit_codes() {
+        let cases = [
+            (
+                JobRecordError::InvalidJobDir,
+                ExitCode::InvalidInput,
+                "job directory must be an absolute existing directory",
+            ),
+            (
+                JobRecordError::AlreadyExists,
+                ExitCode::InvalidInput,
+                "job record already exists in the job directory",
+            ),
+            (
+                JobRecordError::NotRegularFile,
+                ExitCode::InvalidInput,
+                "job record files must be regular files",
+            ),
+            (
+                JobRecordError::Malformed,
+                ExitCode::InvalidInput,
+                "job record is malformed",
+            ),
+            (
+                JobRecordError::UnsupportedSchemaVersion,
+                ExitCode::InvalidInput,
+                "job record schema version is not supported",
+            ),
+            (
+                JobRecordError::TooLarge,
+                ExitCode::LimitExceeded,
+                "job record exceeds the size limit",
+            ),
+            (
+                JobRecordError::LockUnavailable,
+                ExitCode::RuntimeError,
+                "job lock is held by another process",
+            ),
+            (
+                JobRecordError::LockMissing,
+                ExitCode::RuntimeError,
+                "job lock file is missing for a non-terminal job record",
+            ),
+            (
+                JobRecordError::InvalidFinalState,
+                ExitCode::RuntimeError,
+                "final job state and failure do not match",
+            ),
+            (
+                JobRecordError::Io {
+                    kind: io::ErrorKind::PermissionDenied,
+                },
+                ExitCode::RuntimeError,
+                "job record i/o failed",
+            ),
+        ];
+        for (error, code, message) in cases {
+            let report = error.to_error_report();
+            assert_eq!((report.code, report.message.as_str()), (code, message));
+        }
+    }
     use fandhe_edge_core::hash::Sha256Digest;
     use fandhe_edge_eval::final_test_once::AppliedBy;
     use fandhe_edge_guard::kind::KindAllowlist;

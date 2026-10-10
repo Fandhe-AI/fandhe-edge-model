@@ -11,7 +11,8 @@
 //! # 完走の範囲（実装済みを装わない）
 //!
 //! - `register`・`inspect`・`train`・`select`・`package`・`infer` は下位層へ接続済み。`train --all` は
-//!   探索予算内で既定候補の全件を学習し、`search_record.json` を残す（#482・#483。[`train`] 参照）
+//!   探索予算内で既定候補の全件を学習し、`search_record.json` を残す（#482・#483。[`train`] 参照）。
+//!   学習ジョブは `candidates/<N>/job/` に記録し、`train --status` がクラッシュを検出して報告する（#485）
 //! - `evaluate` は評価データ未定義なら `skipped`（exit 0）。評価データありなら評価器へ接続し、
 //!   凍結データへ 1 回だけ適用して正解率・Macro-F1 を返し、評価完了の記録を残す（#314）。
 //!   `package` はその記録を確認する。定義に `baseline_comparison` があれば majority との McNemar 比較を記録へ残す（#339）。診断（REQ-29）は未結線
@@ -37,7 +38,9 @@ use fandhe_edge_core::stage_report::{
     InspectStageReport, RegisterReport, SelectReport, TrainAllReport, TrainReport,
 };
 
-use crate::args::{Command, TrainTarget};
+use fandhe_edge_train::stage_files::{TrainStatusEntry, train_status_json_line};
+
+use crate::args::{Command, TrainOp, TrainTarget};
 use crate::error_report::emit_error_report;
 use crate::output::write_stage_line;
 use crate::stage_output::{emit_evaluate_skipped, emit_package_outcome};
@@ -59,6 +62,7 @@ enum Done {
     Inspect(InspectStageReport),
     Train(TrainReport),
     TrainAll(TrainAllReport),
+    TrainStatus(Vec<TrainStatusEntry>),
     Evaluate(evaluate::EvaluateOutcome),
     Select(SelectReport),
     Package(package::PackageRunResult),
@@ -75,9 +79,16 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
     let result: Result<Done, ErrorReport> = match command {
         Command::Register(args) => register::run(args, cwd).map(Done::Register),
         Command::Inspect(args) => inspect::run(args, cwd).map(Done::Inspect),
-        Command::Train(args) => match args.target {
-            TrainTarget::Candidate(index) => train::run(args, index, cwd).map(Done::Train),
-            TrainTarget::All { budget } => train::run_all(args, budget, cwd).map(Done::TrainAll),
+        Command::Train(args) => match args.op {
+            TrainOp::Run(TrainTarget::Candidate(index)) => {
+                train::run(args, index, cwd).map(Done::Train)
+            }
+            TrainOp::Run(TrainTarget::All { budget }) => {
+                train::run_all(args, budget, cwd).map(Done::TrainAll)
+            }
+            TrainOp::Status(candidate) => {
+                train::status(args, candidate, cwd).map(Done::TrainStatus)
+            }
         },
         Command::Evaluate(args) => evaluate::run(args, cwd).map(Done::Evaluate),
         Command::Select(args) => select::run(args, cwd).map(Done::Select),
@@ -89,6 +100,7 @@ pub fn run<W: Write>(out: &mut W, command: &Command, cwd: &Path) -> io::Result<E
         Ok(Done::Inspect(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::Train(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::TrainAll(r)) => write_stage_line(out, r.to_json_line()),
+        Ok(Done::TrainStatus(jobs)) => write_stage_line(out, train_status_json_line(&jobs)),
         Ok(Done::Select(r)) => write_stage_line(out, r.to_json_line()),
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Skipped(r))) => emit_evaluate_skipped(out, &r),
         Ok(Done::Evaluate(evaluate::EvaluateOutcome::Completed(r))) => {
