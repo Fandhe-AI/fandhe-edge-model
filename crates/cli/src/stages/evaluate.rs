@@ -65,12 +65,17 @@
 //! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
 //! `invalid_input`。最終 test の結果を見てから候補を選べない。
 //!
-//! # 未接続（実装済みを装わない）
+//! # 正解率の Wilson 区間
 //!
-//! 診断レポート（REQ-29）は結線していない。正解率の Wilson 区間は評価記録・結果 JSON には
-//! 含めず、合否基準の照合で `package` 工程が使う（#328。再現性の seed ごとの区間だけは `reproducibility`
-//! に出す。#490）。結果 JSON は正解率と Macro-F1 のみ
-//! （スキーマは 2026-09-30 オーナー承認済み）。
+//! 正解率の Wilson 区間は評価記録・結果 JSON には含めず、合否基準の照合で `package` 工程が使う
+//! （#328。再現性の seed ごとの区間だけは `reproducibility` に出す。#490）。
+//!
+//! # 診断レポート（REQ-29・TASK-29.1〜29.3・#492）
+//!
+//! stdout の末尾の `diagnostics` に、train 分割と凍結評価データの基礎統計・混同しやすい組（上位 10）・
+//! ラベル数の変化の注記（`--previous-project-dir` のときだけ）・データ量水準を出す（[`super::diagnostics`]）。
+//! 基礎統計は適用権を取る前に求め、混同しやすい組は同じ 1 回の適用の混同行列から求める（REQ-27）。
+//! 評価記録には入れず、終了コード・合否・`package` の照合に使わない。
 //!
 //! # 校正（REQ-22・REQ-27・#477）
 //!
@@ -169,6 +174,7 @@ use super::baseline::{PreparedBaseline, compare, prepare_baseline};
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
 };
+use super::diagnostics::{PreparedStats, prepare_stats};
 use super::infer::load_backend;
 use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
@@ -177,7 +183,8 @@ use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
     allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
-    request_is_smoke_trained, request_matches_candidate, resolve_candidates, verified_split,
+    request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
+    verified_split,
 };
 
 /// `evaluate` の成功結果（stdout の JSON 1 つへ写す）。
@@ -327,6 +334,10 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         )?)
     };
 
+    // 診断の基礎統計も適用権を取る前（台帳を開く前）に求める（失敗しても適用権を使わない。#492）。
+    let diagnostics_stats =
+        prepare_stats(&option_ids, train_rows(&records, &split), &current_records)?;
+
     // 台帳は保持 fd 起点で開き、以降の操作もすべて fd 相対で行う（REQ-39。[`HeldLedger`]）。
     let held_ledger = HeldLedger::open(&project, true)?
         .ok_or_else(|| runtime("cannot open final test ledger"))?;
@@ -371,6 +382,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
                 calibration: calibration.as_ref(),
                 previous: previous.as_ref(),
                 seed_runs: seed_runs.as_ref(),
+                diagnostics_stats,
             },
             &PredictionsSink {
                 rel: &predictions_rel,
@@ -655,6 +667,7 @@ struct FinalizeContext<'a> {
     calibration: Option<&'a Calibration>,
     previous: Option<&'a PreparedPrevious>,
     seed_runs: Option<&'a SeedRuns>,
+    diagnostics_stats: PreparedStats,
 }
 
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
@@ -679,6 +692,7 @@ fn finalize_evaluation(
         calibration,
         previous,
         seed_runs,
+        diagnostics_stats,
     } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
@@ -691,6 +705,10 @@ fn finalize_evaluation(
         .map_err(|_| runtime("cannot compute evaluation metrics"))?;
     let correct = computed.accuracy.overall.numerator();
     let total = computed.accuracy.overall.denominator();
+    // 診断は同じ 1 回の適用の混同行列から求める（記録の書き込みより前。REQ-27・#492）。
+    let previous_labels = previous.map(PreparedPrevious::previous_labels);
+    let diagnostics =
+        super::diagnostics::build(diagnostics_stats, &computed, previous_labels.as_deref())?;
     // 下限基準との比較（定義に `baseline_comparison` があるときだけ。出力 JSON には出さない。#339）。
     let baseline_comparison = match baseline {
         None => None,
@@ -763,6 +781,7 @@ fn finalize_evaluation(
         abstention: abstention.map(|(report, _)| report),
         comparison: comparison.as_ref().map(|(report, _)| report.clone()),
         reproducibility: reproducibility.as_ref().map(|(report, _)| report.clone()),
+        diagnostics,
     };
     let report = EvaluateCompletedReport::completed(
         candidate,

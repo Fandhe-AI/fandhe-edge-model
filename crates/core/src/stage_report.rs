@@ -23,8 +23,9 @@
 //! bool・固定キーだけ（パス・データ本文は載せない。security.md）。加えて `evaluate` 工程の評価データ
 //! 未定義時の [`EvaluateReport`]（`status:"skipped"`。TASK-33.3・#140）と、評価データありで
 //! 評価が完了したときの [`EvaluateCompletedReport`]（正解率・Macro-F1。#314）を持つ。
-//! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。Wilson 区間・McNemar / Holm・診断（REQ-29）は
-//! 出力に含めない（McNemar の下限基準比較は評価記録にだけ残す。#339）。
+//! 後者の JSON スキーマは 2026-09-30 オーナー承認済み。正解率の Wilson 区間・McNemar / Holm は
+//! 出力に含めない（McNemar の下限基準比較は評価記録にだけ残す。#339）。診断（REQ-29）は
+//! 末尾の `diagnostics`（[`EvaluateDiagnostics`]。#492）に出し、評価記録には入れない。
 //!
 //! [`PackageReport`]（exit 0）は `pass` と基準未定義のみを表す。`fail`（exit 10）・判定不能
 //! （exit 12）は合否基準が定義されているときにだけ生じ、判定項目つきの
@@ -123,7 +124,8 @@ impl EvaluateReport {
 /// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
 /// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
 /// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`・`macro_f1_excluded_labels`・`per_label`・
-/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`・`reproducibility`）に直列化し、`macro_f1` が未定義なら
+/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`・`reproducibility`・
+/// `diagnostics`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
 /// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
@@ -145,6 +147,101 @@ pub struct EvaluateCompletedReport {
     abstention: Option<EvaluateAbstention>,
     comparison: Option<EvaluateComparison>,
     reproducibility: Option<EvaluateReproducibility>,
+    diagnostics: EvaluateDiagnostics,
+}
+
+/// `evaluate` の `diagnostics.*.label_counts[]` の 1 要素（宣言順。0 件も含む。REQ-29・#492）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateLabelCount {
+    /// 選択肢 ID。
+    pub label: String,
+    /// 件数。
+    pub count: u64,
+}
+
+/// `evaluate` の `diagnostics.train`・`diagnostics.eval`（基礎統計。REQ-29・TASK-29.1・#492）。
+///
+/// 値は評価器 `fandhe_edge_eval::diagnostics::basic_stats` の写し（core は eval に依存できないため型を持つ）。
+/// 載せるのはラベル ID・件数・規則 ID のみで、入力本文は載せない（security.md）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateBasicStats {
+    /// 行数。
+    pub n_rows: u64,
+    /// ユニークな入力数（`input_key_rule` の規則で数える）。
+    pub unique_inputs: u64,
+    /// 1 件以上出現したラベルの数。
+    pub unique_labels: u64,
+    /// 宣言順のラベル別件数。
+    pub label_counts: Vec<EvaluateLabelCount>,
+    /// 観測ラベル（件数 1 以上）の最小件数（観測ラベルが無ければ `None`。未出現ラベルの 0 は含めない）。
+    pub min_label_count: Option<u64>,
+    /// 最小件数に並ぶ観測ラベル（宣言順）。
+    pub min_labels: Vec<String>,
+    /// 宣言済みで 1 件も出現しなかったラベル（宣言順）。
+    pub unobserved_labels: Vec<String>,
+    /// ユニーク数の数え方の規則 ID（評価器の固定語彙。`byte_exact`）。
+    pub input_key_rule: &'static str,
+}
+
+/// `evaluate` の `diagnostics.confusable_pairs[]`（有向。正解 `gold` を `predicted` と誤った件数。#492）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateConfusablePair {
+    /// 正解ラベル ID。
+    pub gold: String,
+    /// 誤って予測されたラベル ID。
+    pub predicted: String,
+    /// 誤り件数。
+    pub count: u64,
+    /// `gold` の正解件数。
+    pub gold_support: u64,
+}
+
+/// `evaluate` の `diagnostics.limitations[]`（診断の読み方の限界。REQ-29・TASK-29.2・#492）。
+///
+/// `kind`・`note` は評価器の固定語彙・固定英文の写し。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateLimitation {
+    /// 限界の種類（`label_count_changed`）。
+    pub kind: &'static str,
+    /// 旧の宣言ラベル数。
+    pub previous: u64,
+    /// 今回の宣言ラベル数。
+    pub current: u64,
+    /// 固定英文。
+    pub note: &'static str,
+}
+
+/// `evaluate` の `diagnostics.data_volume`（学習データ量の水準と効果の傾向。REQ-29・TASK-29.3・#492）。
+///
+/// `level`（`below_100`|`from_100_to_3000`|`from_3000`）・`effect`（`large`|`plateau`）・`note` は評価器の
+/// 固定語彙・固定英文の写し。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateDataVolume {
+    /// 分類に使った train 分割の行数。
+    pub train_rows: u64,
+    /// 水準。
+    pub level: &'static str,
+    /// 行数の効果の傾向。
+    pub effect: &'static str,
+    /// 固定英文。
+    pub note: &'static str,
+}
+
+/// `evaluate` の `diagnostics`（診断レポート。REQ-29・TASK-29.1〜29.3・#492）。
+///
+/// 評価完了時は常に出す。診断専用で、終了コード・合否・評価記録・`package` の照合には使わない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvaluateDiagnostics {
+    /// train 分割（validation を含まない）の基礎統計。
+    pub train: EvaluateBasicStats,
+    /// 凍結評価データの全行の基礎統計。
+    pub eval: EvaluateBasicStats,
+    /// 混同しやすいラベルの組（件数降順・同数は宣言順。誤りなしは空）。
+    pub confusable_pairs: Vec<EvaluateConfusablePair>,
+    /// 診断の限界（`--previous-project-dir` で宣言ラベル数が異なるときだけ要素を持つ）。
+    pub limitations: Vec<EvaluateLimitation>,
+    /// データ量水準。
+    pub data_volume: EvaluateDataVolume,
 }
 
 /// 区間（`{"lo","hi"}`。Wilson 95% など）。
@@ -377,6 +474,8 @@ pub struct EvaluateDetails {
     pub comparison: Option<EvaluateComparison>,
     /// 再現性（`--seed-run-project` が無ければ `None`。#490）。各 run の `total` は評価件数と一致すること。
     pub reproducibility: Option<EvaluateReproducibility>,
+    /// 診断レポート（常に出す。`eval.n_rows` は評価件数と一致すること。#492）。
+    pub diagnostics: EvaluateDiagnostics,
 }
 
 impl EvaluateCompletedReport {
@@ -425,6 +524,7 @@ impl EvaluateCompletedReport {
                 .reproducibility
                 .as_ref()
                 .is_some_and(|r| !r.is_consistent(total))
+            || details.diagnostics.eval.n_rows != total
         {
             return None;
         }
@@ -445,6 +545,7 @@ impl EvaluateCompletedReport {
             abstention: details.abstention,
             comparison: details.comparison,
             reproducibility: details.reproducibility,
+            diagnostics: details.diagnostics,
         })
     }
 
@@ -1681,6 +1782,52 @@ mod tests {
             abstention: None,
             comparison: None,
             reproducibility: None,
+            diagnostics: diagnostics(quadrant.iter().sum()),
+        }
+    }
+
+    /// 固定の診断レポート（評価件数 `n`。#492）。
+    fn diagnostics(n: u64) -> EvaluateDiagnostics {
+        let stats = |n_rows: u64, unique_inputs: u64| EvaluateBasicStats {
+            n_rows,
+            unique_inputs,
+            unique_labels: 1,
+            label_counts: vec![
+                EvaluateLabelCount {
+                    label: "a".to_string(),
+                    count: n_rows,
+                },
+                EvaluateLabelCount {
+                    label: "c".to_string(),
+                    count: 0,
+                },
+            ],
+            min_label_count: Some(n_rows),
+            min_labels: vec!["a".to_string()],
+            unobserved_labels: vec!["c".to_string()],
+            input_key_rule: "byte_exact",
+        };
+        EvaluateDiagnostics {
+            train: stats(5, 4),
+            eval: stats(n, n),
+            confusable_pairs: vec![EvaluateConfusablePair {
+                gold: "a".to_string(),
+                predicted: "c".to_string(),
+                count: 1,
+                gold_support: 2,
+            }],
+            limitations: vec![EvaluateLimitation {
+                kind: "label_count_changed",
+                previous: 3,
+                current: 2,
+                note: "fixed",
+            }],
+            data_volume: EvaluateDataVolume {
+                train_rows: 5,
+                level: "below_100",
+                effect: "large",
+                note: "fixed",
+            },
         }
     }
 
@@ -1705,7 +1852,7 @@ mod tests {
         };
         let line = build(ok).expect("report").to_json_line().expect("json");
         assert!(
-            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null,"reproducibility":null}"#),
+            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null,"reproducibility":null,"diagnostics":{"train":"#),
             "{line}"
         );
         let all_abstained = EvaluateAbstention {
@@ -1768,7 +1915,7 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.ends_with(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":7,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,7],[1,42]]}}"#),
+            line.contains(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":7,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,7],[1,42]]},"diagnostics":{"train":"#),
             "{line}"
         );
         let all = vec![run(1, 2, 0.1, 0.9); REPRODUCIBILITY_MAX_RUNS]
@@ -1834,7 +1981,7 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null,"reproducibility":null}"#),
+            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null,"reproducibility":null,"diagnostics":{"train":"#),
             "{line}"
         );
         assert_eq!(calibration(1.5), None);
@@ -1869,7 +2016,18 @@ mod tests {
         .expect("report");
         assert_eq!(
             report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null,"reproducibility":null}"#
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null,"reproducibility":null,"diagnostics":{"train":{"n_rows":5,"unique_inputs":4,"unique_labels":1,"label_counts":[{"label":"a","count":5},{"label":"c","count":0}],"min_label_count":5,"min_labels":["a"],"unobserved_labels":["c"],"input_key_rule":"byte_exact"},"eval":{"n_rows":4,"unique_inputs":4,"unique_labels":1,"label_counts":[{"label":"a","count":4},{"label":"c","count":0}],"min_label_count":4,"min_labels":["a"],"unobserved_labels":["c"],"input_key_rule":"byte_exact"},"confusable_pairs":[{"gold":"a","predicted":"c","count":1,"gold_support":2}],"limitations":[{"kind":"label_count_changed","previous":3,"current":2,"note":"fixed"}],"data_volume":{"train_rows":5,"level":"below_100","effect":"large","note":"fixed"}}}"#
+        );
+    }
+
+    /// REQ-29・#492: 診断の評価データ側の行数が評価件数と食い違う結果は作れない。
+    #[test]
+    fn req29_issue492_diagnostics_eval_rows_must_match_total() {
+        let mut d = details([3, 1, 0, 0, 0]);
+        d.diagnostics.eval.n_rows = 5;
+        assert_eq!(
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d),
+            None
         );
     }
 
@@ -1914,8 +2072,8 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.ends_with(&format!(
-                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}},"reproducibility":null}}"#,
+            line.contains(&format!(
+                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}},"reproducibility":null,"diagnostics":{{"train":"#,
                 "1".repeat(64),
                 "2".repeat(64),
                 "3".repeat(64)
@@ -1927,8 +2085,8 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            empty.ends_with(
-                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null},"reproducibility":null}"#
+            empty.contains(
+                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null},"reproducibility":null,"diagnostics":{"train":"#
             ),
             "{empty}"
         );

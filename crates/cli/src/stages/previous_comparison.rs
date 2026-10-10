@@ -82,6 +82,13 @@ pub(super) struct PreparedPrevious {
     common: Vec<CommonRow>,
 }
 
+impl PreparedPrevious {
+    /// 旧定義の選択肢 ID（宣言順。診断のラベル数の変化の注記に使う。REQ-29・#492）。
+    pub(super) fn previous_labels(&self) -> Vec<&str> {
+        self.previous_labels.iter().map(String::as_str).collect()
+    }
+}
+
 /// 旧プロジェクトを読み、記録との束縛を照合して、比較対象（共通レコードと旧の正誤）を確定する。
 ///
 /// `current_records` は新の凍結評価データを `inspect_bytes` で分解したもの（評価器へ渡すのと同じ行順）。

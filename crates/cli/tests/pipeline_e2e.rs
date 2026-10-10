@@ -1811,8 +1811,8 @@ mod suite {
             "{out}"
         );
         assert!(
-            out.ends_with(
-                "\"verdict\":\"some_pairs_disjoint\",\"disjoint_pairs\":[[1,2],[1,5]]}}\n"
+            out.contains(
+                "\"verdict\":\"some_pairs_disjoint\",\"disjoint_pairs\":[[1,2],[1,5]]},\"diagnostics\":{"
             ),
             "{out}"
         );
@@ -1855,7 +1855,9 @@ mod suite {
             "r2",
         ]);
         assert!(
-            out.ends_with("\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]}}\n"),
+            out.contains(
+                "\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]},\"diagnostics\":{"
+            ),
             "{out}"
         );
         let r3 = std::fs::read_to_string(env.work.join("r3/candidates/1/evaluation_record.json"))
@@ -1915,7 +1917,9 @@ mod suite {
             .expect("reproducibility");
         assert!(comparison < reproducibility, "{out}");
         assert!(
-            out.ends_with("\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]}}\n"),
+            out.contains(
+                "\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]},\"diagnostics\":{"
+            ),
             "{out}"
         );
         let record =
@@ -2093,7 +2097,12 @@ mod suite {
                 "{out}"
             );
         }
-        assert!(out.ends_with("}}},\"reproducibility\":null}\n"), "{out}");
+        assert!(
+            out.contains("}}},\"reproducibility\":null,\"diagnostics\":{"),
+            "{out}"
+        );
+        // REQ-29・#492: 旧定義と選択肢数が同じなら診断の限界の注記は無い。
+        assert!(out.contains(",\"limitations\":[],"), "{out}");
         let record =
             std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
                 .expect("record");
@@ -2196,8 +2205,8 @@ mod suite {
         register_and_select(&env, "def_renamed", "renamed");
         let out = env.ok(&evaluate_with_previous("renamed", "old"));
         assert!(
-            out.ends_with(
-                ",\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"common_subset\",\"n_common\":0,\"n_previous_only\":12,\"n_current_only\":12,\"counts\":null},\"reproducibility\":null}\n"
+            out.contains(
+                ",\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"common_subset\",\"n_common\":0,\"n_previous_only\":12,\"n_current_only\":12,\"counts\":null},\"reproducibility\":null,\"diagnostics\":{"
             ),
             "{out}"
         );
@@ -3263,7 +3272,7 @@ mod suite {
         // REQ-26・#488・#490: `--previous-project-dir`・`--seed-run-project` が無ければ `comparison`・
         // `reproducibility` は `null`（`abstention` の後ろにこの順）。
         assert!(
-            out.ends_with("},\"comparison\":null,\"reproducibility\":null}\n"),
+            out.contains("},\"comparison\":null,\"reproducibility\":null,\"diagnostics\":{"),
             "{out}"
         );
         // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
@@ -3910,6 +3919,119 @@ mod suite {
         assert!(record.contains("\"config_id\":\"c3:seed42\""), "{record}");
     }
 
+    /// 診断の基礎統計の期待 JSON（合成データは input がすべて異なるため `unique_inputs` は行数と同じ）。
+    fn diagnostics_stats_json(counts: [usize; 3]) -> String {
+        let n: usize = counts.iter().sum();
+        let min = counts
+            .iter()
+            .copied()
+            .filter(|c| *c > 0)
+            .min()
+            .expect("observed");
+        let pick = |want: &dyn Fn(usize) -> bool| -> String {
+            LABELS
+                .iter()
+                .zip(counts)
+                .filter(|(_, c)| want(*c))
+                .map(|(l, _)| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let label_counts: Vec<String> = LABELS
+            .iter()
+            .zip(counts)
+            .map(|(l, c)| format!("{{\"label\":\"{l}\",\"count\":{c}}}"))
+            .collect();
+        format!(
+            "{{\"n_rows\":{n},\"unique_inputs\":{n},\"unique_labels\":{},\"label_counts\":[{}],\"min_label_count\":{min},\"min_labels\":[{}],\"unobserved_labels\":[{}],\"input_key_rule\":\"byte_exact\"}}",
+            counts.iter().filter(|c| **c > 0).count(),
+            label_counts.join(","),
+            pick(&|c| c == min),
+            pick(&|c| c == 0),
+        )
+    }
+
+    /// REQ-29・REQ-27・TASK-29.1〜29.3・#492: `evaluate` の stdout の末尾 `diagnostics` が具体値で完全一致する。
+    /// `train` は分割記録の train の行だけ（validation を含まない）、`eval` は凍結評価データの全 12 行、
+    /// `confusable_pairs` は保存した予測（同じ 1 回の適用）の誤りを件数降順・同数は宣言順に並べたもの。
+    /// 入力本文は出さず、評価記録にも入れない（テストハーネス。学習ワーカーは偽物）。
+    pub fn req29_issue492_evaluate_outputs_diagnostics() {
+        let env = eval_trained("diag");
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+
+        let split = std::fs::read_to_string(env.project_file("split.json")).expect("split");
+        // 正準化 JSON（キーは辞書順）の `splits.train.record_ids`。
+        let ids = ["\"splits\":", "\"train\":", "\"record_ids\":["]
+            .iter()
+            .try_fold(split.as_str(), |rest, key| rest.split(key).nth(1))
+            .expect("train ids");
+        let train_ids: Vec<&str> = ids[..ids.find(']').expect("ids end")]
+            .split(',')
+            .map(|id| id.trim_matches('"'))
+            .collect();
+        let train_counts = LABELS.map(|l| {
+            train_ids
+                .iter()
+                .filter(|id| id.starts_with(&format!("{l}-")))
+                .count()
+        });
+        let n_train = train_ids.len();
+        assert!(
+            n_train < 90 && train_counts.iter().sum::<usize>() == n_train,
+            "{split}"
+        );
+
+        // 保存した予測から誤りの組を数える（gold は id の `e-<label>-<i>` から）。
+        let preds =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_predictions.jsonl"))
+                .expect("predictions");
+        let index = |l: &str| LABELS.iter().position(|x| *x == l).expect("label");
+        let mut cells = [[0u64; 3]; 3];
+        for line in preds.lines() {
+            let gold = string_field(line, "id").split('-').nth(1).expect("gold");
+            cells[index(gold)][index(string_field(line, "predicted_label"))] += 1;
+        }
+        let mut pairs: Vec<(u64, usize, usize)> = (0..3)
+            .flat_map(|g| (0..3).map(move |p| (g, p)))
+            .filter(|&(g, p)| g != p && cells[g][p] > 0)
+            .map(|(g, p)| (cells[g][p], g, p))
+            .collect();
+        pairs.sort_by_key(|&(count, g, p)| (std::cmp::Reverse(count), g, p));
+        let pairs: Vec<String> = pairs
+            .iter()
+            .take(10)
+            .map(|&(count, g, p)| {
+                format!(
+                    "{{\"gold\":\"{}\",\"predicted\":\"{}\",\"count\":{count},\"gold_support\":4}}",
+                    LABELS[g], LABELS[p]
+                )
+            })
+            .collect();
+
+        let expected = format!(
+            ",\"reproducibility\":null,\"diagnostics\":{{\"train\":{},\"eval\":{},\"confusable_pairs\":[{}],\"limitations\":[],\"data_volume\":{{\"train_rows\":{n_train},\"level\":\"below_100\",\"effect\":\"large\",\"note\":\"training row count is below 100; row count had a large effect on accuracy in the PoC-11 learning curve (tendency only, not a guarantee; not used for pass/fail)\"}}}}}}\n",
+            diagnostics_stats_json(train_counts),
+            diagnostics_stats_json([4, 4, 4]),
+            pairs.join(","),
+        );
+        assert!(out.ends_with(&expected), "{out}\n{expected}");
+        // 入力本文（`<label> sample <i>`・`<label> evaluation <i>`）は出さない。
+        assert!(
+            !out.contains(" sample ") && !out.contains(" evaluation "),
+            "{out}"
+        );
+        // 評価記録には入れない。
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        assert!(
+            !record.contains("diagnostics") && !record.contains("confusable"),
+            "{record}"
+        );
+        // 診断は `package` の照合対象ではなく、従来どおり公開できる。
+        env.ok(&PACKAGE);
+    }
     /// REQ-27・REQ-41・#445: `evaluate` は評価データの 1 件ごとの予測を `evaluation_predictions.jsonl` へ
     /// 保存する。件数・id の順・予測ラベルが評価データ・`correct` と整合し、2 行目以降も同じ形式。
     pub fn evaluate_saves_per_record_predictions() {
@@ -5822,6 +5944,10 @@ fn main() -> std::process::ExitCode {
         (
             "full_pipeline_completes_with_evaluation_data",
             suite::full_pipeline_completes_with_evaluation_data,
+        ),
+        (
+            "req29_issue492_evaluate_outputs_diagnostics",
+            suite::req29_issue492_evaluate_outputs_diagnostics,
         ),
         (
             "evaluate_calibration_ignores_frozen_test_labels",
