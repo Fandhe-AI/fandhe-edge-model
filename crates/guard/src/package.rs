@@ -142,6 +142,86 @@ impl ConfinedPackage {
         }
     }
 
+    /// 通常ファイルを読み取り用に開く（`O_NOFOLLOW`・パスを再解決しない。#510）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_regular_member`] と同じ。
+    pub fn open_regular_member(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.open_regular_member(member)
+        }
+    }
+
+    /// 所有者のみ（0600）の通常ファイルを開くか作る（lock ファイル用。#510）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::open_or_create_private_member`] と同じ。
+    pub fn open_or_create_private_member(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.open_or_create_private_member(member)
+        }
+    }
+
+    /// 新規ファイルを所有者のみ（0600）で作る（#510）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::create_new_private_member`] と同じ。
+    pub fn create_new_private_member(&self, member: &Path) -> Result<File, PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = member;
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.create_new_private_member(member)
+        }
+    }
+
+    /// `from` のハードリンクを `to` に作る（既存なら拒否。#510）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::link_member`] と同じ。
+    pub fn link_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (from, to);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.link_member(from, to)
+        }
+    }
+
+    /// `from` で `to` を置き換える（既存の `to` も原子的に置き換える。#510）。
+    ///
+    /// # Errors
+    /// [`crate::path::ConfinedDir::replace_member`] と同じ。
+    pub fn replace_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (from, to);
+            Err(PathRejection::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.replace_member(from, to)
+        }
+    }
+
     /// 書き込み失敗後の片付け用にファイルを削除する。
     ///
     /// # Errors

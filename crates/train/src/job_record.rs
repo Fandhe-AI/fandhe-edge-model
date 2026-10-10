@@ -1,10 +1,9 @@
 //! 学習ジョブ記録（`job.json`）の永続化とクラッシュ検出（REQ-34・TASK-34.2・issue #146）。
 //!
 //! 学習中のプロセスが異常終了しても、後から状態を確認するとクラッシュと判別できる
-//! ようにするモジュール。ジョブを所有する Rust 側（[`crate::job::TrainJob::run_recorded`]）
-//! が [`JobRecorder`] で記録を書き、状態確認の入口 [`read_job_status`]（将来の CLI の
-//! 状態確認の中核。CLI への配線は TASK-33.x で、REQ-33 の 7 工程の変更は承認事項の
-//! ため本 crate では露出しない）が記録を読んで、必要なら `failed`＋クラッシュへ
+//! ようにするモジュール。ジョブを所有する Rust 側（[`crate::job::TrainJob::run_recorded_in`]）
+//! が [`JobRecorder`] で記録を書き、状態確認の入口 [`read_job_status_in`]（CLI の
+//! `train --status`・やり直し判定。#485）が記録を読んで、必要なら `failed`＋クラッシュへ
 //! 遷移させる。PoC-19（`03-poc/model-lifecycle`）の「`running` のまま残った記録を
 //! 状態確認で `failed` へ」の方式に相当する（証拠種別: テストハーネス）。
 //!
@@ -76,16 +75,15 @@
 //!
 //! # 責務境界・未実装（実装済みを装わない）
 //!
-//! - `job_dir` の経路の閉じ込めはガード層（REQ-39・TASK-39.x）と CLI 配線（TASK-33.x）
-//!   の責務。本モジュールは**パス**（`job_dir` の絶対パス）で `job.json`・`job.lock`・
-//!   `job.check.lock` を開き、絶対パスの既存ディレクトリであることと、各ファイルが symlink で
-//!   ないことだけを検査する。CLI は `job/` を保持 fd 起点（`O_NOFOLLOW`）で検証してから
-//!   そのパスを渡すが、本モジュールが開き直すため、検証後に `job/` やその親を差し替えられる者
-//!   （プロジェクトへ同時に書き込める者）がいると、ルート外のファイルを読み書きする余地が残る
-//!   （既知の限界。ディレクトリ fd 起点の `openat` への置き換えは #510）。
-//! - CLI への状態確認の露出（TASK-33.x）・やり直しの案内と `SIGKILL` フォールバック後の
-//!   残置物の掃除（#147・TASK-34.3）は未実装。再開（チェックポイント）は提供しない
-//!   （REQ-34）ため記録に `resumable` は持たない。
+//! - ファイル操作は [`JobDirOps`]（ジョブディレクトリ起点の open・作成・リンク・置き換え・削除・
+//!   `sync`）に切り出し、本モジュールはパスを組み立てない。CLI はガード層の保持 fd
+//!   （`O_NOFOLLOW`・`openat` 系）で実装して [`read_job_status_in`]・[`JobRecorder::begin_in`]・
+//!   [`crate::job::TrainJob::run_recorded_in`] に渡すため、検証後に `job/` やその親が symlink へ
+//!   差し替えられてもルート外を読み書きしない（REQ-39・#510）。本 crate はガード層に依存しない。
+//!   パス版の [`read_job_status`]・[`JobRecorder::begin`]（[`PathJobDir`]）は開き直すため差し替えの
+//!   余地が残り、学習ワーカー層の単体テストと、閉じ込めを呼び出し元が担保する用途に限る。
+//! - `SIGKILL` フォールバック後の残置物の自動掃除は未実装（やり直しの案内は [`crate::restart`]。
+//!   #147・TASK-34.3）。再開（チェックポイント）は提供しない（REQ-34）ため記録に `resumable` は持たない。
 //! - 記録のスキーマ（`schema_version: 1`）は暫定の内部形式で、spec に明記が無い。
 
 use std::collections::HashSet;
@@ -382,90 +380,182 @@ pub fn classify_run_end(
     }
 }
 
-/// `job_dir` が絶対パスの既存ディレクトリ（symlink でない）であることを確認する。
-fn check_job_dir(job_dir: &Path) -> Result<(), JobRecordError> {
-    if !job_dir.is_absolute() {
-        return Err(JobRecordError::InvalidJobDir);
+/// ジョブディレクトリ（`job_dir`）を起点にした、記録の読み書きに要るファイル操作（REQ-34・REQ-39・#510）。
+///
+/// 名前（`name`）はジョブディレクトリ直下の 1 成分だけを渡す。実装はディレクトリを**保持した fd 起点**で
+/// 操作し、パスを再解決しないこと（検証後に `job_dir` やその親が symlink へ差し替えられてもルート外を
+/// 読み書きしない）。CLI はガード層の保持 fd（`ConfinedPackage`）で実装する。[`PathJobDir`] はパスで
+/// 開き直す実装で、学習ワーカー層の単体テストと、閉じ込めを呼び出し元が担保する用途に限る。
+///
+/// 失敗は [`JobRecordError`] で返す: symlink・通常ファイル以外は [`JobRecordError::NotRegularFile`]、
+/// I/O は [`JobRecordError::Io`]（既存は `AlreadyExists`・不在は `NotFound` の種別を保つ）。
+pub trait JobDirOps: std::fmt::Debug + Send {
+    /// `name` の通常ファイルを読み取り用に `O_NOFOLLOW` で開く。無ければ `Ok(None)`。
+    ///
+    /// # Errors
+    /// symlink・通常ファイル以外・I/O の失敗。
+    fn open_regular(&self, name: &str) -> Result<Option<File>, JobRecordError>;
+    /// `name` を所有者のみ（0600）の通常ファイルとして読み書き用に開く。無ければ作る（切り詰めない）。
+    ///
+    /// # Errors
+    /// symlink・通常ファイル以外・I/O の失敗。
+    fn open_or_create(&self, name: &str) -> Result<File, JobRecordError>;
+    /// `name` を所有者のみ（0600）で新規作成して書き込み用に返す（既存・symlink は `AlreadyExists`）。
+    ///
+    /// # Errors
+    /// 既存・I/O の失敗。
+    fn create_new(&self, name: &str) -> Result<File, JobRecordError>;
+    /// `from` のハードリンクを `to` に作る（`to` が既存なら `AlreadyExists`）。
+    ///
+    /// # Errors
+    /// 既存・I/O の失敗。
+    fn link(&self, from: &str, to: &str) -> Result<(), JobRecordError>;
+    /// `from` で `to` を原子的に置き換える（`to` が既存でもよい）。
+    ///
+    /// # Errors
+    /// I/O の失敗。
+    fn replace(&self, from: &str, to: &str) -> Result<(), JobRecordError>;
+    /// `name`（通常ファイルまたはリンク自身）を削除する。無ければ何もしない。
+    ///
+    /// # Errors
+    /// I/O の失敗（不在を除く）。
+    fn remove(&self, name: &str) -> Result<(), JobRecordError>;
+    /// ディレクトリのエントリ変更（rename）を永続化する。
+    ///
+    /// # Errors
+    /// I/O の失敗。
+    fn sync_dir(&self) -> Result<(), JobRecordError>;
+}
+
+/// パスで開き直す [`JobDirOps`] の実装（`job_dir` の絶対パス起点）。
+///
+/// 各操作の前に `symlink_metadata` で symlink を拒否するが、検査後の差し替えの余地が残る。
+/// 経路の閉じ込めが要る呼び出し元（CLI）は、保持 fd 起点の実装を使うこと（REQ-39・#510）。
+#[derive(Debug, Clone)]
+pub struct PathJobDir {
+    dir: PathBuf,
+}
+
+impl PathJobDir {
+    /// `job_dir`（絶対パスの既存ディレクトリ。symlink でない）を起点にする。
+    ///
+    /// # Errors
+    /// 条件を満たさない場合は [`JobRecordError::InvalidJobDir`]。
+    pub fn new(job_dir: &Path) -> Result<Self, JobRecordError> {
+        if !job_dir.is_absolute() {
+            return Err(JobRecordError::InvalidJobDir);
+        }
+        match std::fs::symlink_metadata(job_dir) {
+            Ok(meta) if meta.is_dir() => Ok(Self {
+                dir: job_dir.to_path_buf(),
+            }),
+            _ => Err(JobRecordError::InvalidJobDir),
+        }
     }
-    match std::fs::symlink_metadata(job_dir) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        _ => Err(JobRecordError::InvalidJobDir),
+
+    /// `name` が存在するなら通常ファイルであることを確認する（symlink を拒否）。
+    fn regular_exists(&self, name: &str) -> Result<bool, JobRecordError> {
+        match std::fs::symlink_metadata(self.dir.join(name)) {
+            Ok(meta) if meta.is_file() => Ok(true),
+            Ok(_) => Err(JobRecordError::NotRegularFile),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_err(&e)),
+        }
     }
 }
 
-/// `path` が存在するなら通常ファイルであることを確認する（symlink を拒否）。
-/// 存在しなければ `Ok(false)`。
-fn regular_file_exists(path: &Path) -> Result<bool, JobRecordError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => Ok(true),
-        Ok(_) => Err(JobRecordError::NotRegularFile),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(io_err(&e)),
+impl JobDirOps for PathJobDir {
+    fn open_regular(&self, name: &str) -> Result<Option<File>, JobRecordError> {
+        if !self.regular_exists(name)? {
+            return Ok(None);
+        }
+        File::open(self.dir.join(name))
+            .map(Some)
+            .map_err(|e| io_err(&e))
+    }
+
+    fn open_or_create(&self, name: &str) -> Result<File, JobRecordError> {
+        self.regular_exists(name)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(self.dir.join(name)).map_err(|e| io_err(&e))
+    }
+
+    fn create_new(&self, name: &str) -> Result<File, JobRecordError> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // 記録は所有者だけが読み書きできればよい。
+            options.mode(0o600);
+        }
+        options.open(self.dir.join(name)).map_err(|e| io_err(&e))
+    }
+
+    fn link(&self, from: &str, to: &str) -> Result<(), JobRecordError> {
+        std::fs::hard_link(self.dir.join(from), self.dir.join(to)).map_err(|e| io_err(&e))
+    }
+
+    fn replace(&self, from: &str, to: &str) -> Result<(), JobRecordError> {
+        std::fs::rename(self.dir.join(from), self.dir.join(to)).map_err(|e| io_err(&e))
+    }
+
+    fn remove(&self, name: &str) -> Result<(), JobRecordError> {
+        match std::fs::remove_file(self.dir.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&e)),
+        }
+    }
+
+    fn sync_dir(&self) -> Result<(), JobRecordError> {
+        #[cfg(unix)]
+        {
+            File::open(&self.dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| io_err(&e))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
     }
 }
 
-fn create_new_private(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // 記録は所有者だけが読み書きできればよい。
-        options.mode(0o600);
-    }
-    options.open(path)
+/// `name` が通常ファイルとして存在するか（symlink・非通常ファイルは拒否）。
+fn regular_file_exists(dir: &dyn JobDirOps, name: &str) -> Result<bool, JobRecordError> {
+    dir.open_regular(name).map(|f| f.is_some())
 }
 
-/// 記録を tmp への書き込み→`sync_all`→`rename` で原子的に置き換える。呼び出し元は
+/// 記録を tmp への書き込み→`sync_all`→置き換え→ディレクトリの `sync` で原子的に更新する。呼び出し元は
 /// `job.lock` を保持していること（書き手を 1 人に保つ）。
-fn write_record_atomic(job_dir: &Path, record: &JobRecord) -> Result<(), JobRecordError> {
-    let tmp = job_dir.join(JOB_RECORD_TMP_FILE);
+fn write_record_atomic(dir: &dyn JobDirOps, record: &JobRecord) -> Result<(), JobRecordError> {
     // lock 保持中の書き手は 1 人なので、前回の書き込み途中で残った tmp は消してよい
-    // （symlink であればリンク自体が消え、`create_new` は追跡しない）。
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_err(&e)),
-    }
+    // （symlink であればリンク自体が消え、新規作成は追跡しない）。
+    dir.remove(JOB_RECORD_TMP_FILE)?;
     let bytes = serde_json::to_vec(record).map_err(|_| JobRecordError::Malformed)?;
-    let write = || -> std::io::Result<()> {
-        let mut file = create_new_private(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, job_dir.join(JOB_RECORD_FILE))?;
-        // rename の永続化のため親ディレクトリも sync する。電源断で rename が失われ、
+    let write = || -> Result<(), JobRecordError> {
+        let mut file = dir.create_new(JOB_RECORD_TMP_FILE)?;
+        file.write_all(&bytes).map_err(|e| io_err(&e))?;
+        file.sync_all().map_err(|e| io_err(&e))?;
+        dir.replace(JOB_RECORD_TMP_FILE, JOB_RECORD_FILE)?;
+        // 置き換えの永続化のためディレクトリも sync する。電源断で置き換えが失われ、
         // 正常終了したジョブを後から `OwnerLost` と誤記録するのを防ぐ（REQ-34）。
-        sync_dir(job_dir)
+        dir.sync_dir()
     };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_err(&e)
+    write().inspect_err(|_| {
+        let _ = dir.remove(JOB_RECORD_TMP_FILE);
     })
 }
 
-/// ディレクトリのエントリ変更（rename）を永続化する。unix 以外ではディレクトリの
-/// open が使えないため何もしない。
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
-/// `job.json` を上限つきで読み、厳格に parse・検証する。
-fn read_record(job_dir: &Path) -> Result<JobRecord, JobRecordError> {
-    let path = job_dir.join(JOB_RECORD_FILE);
-    if !regular_file_exists(&path)? {
-        return Err(JobRecordError::Io {
-            kind: std::io::ErrorKind::NotFound,
-        });
-    }
-    let file = File::open(&path).map_err(|e| io_err(&e))?;
+/// 開いた `job.json` を上限つきで読み、厳格に parse・検証する。
+fn parse_record(file: File) -> Result<JobRecord, JobRecordError> {
     let len = file.metadata().map_err(|e| io_err(&e))?.len();
     if len > u64::try_from(MAX_JOB_RECORD_BYTES).unwrap_or(u64::MAX) {
         return Err(JobRecordError::TooLarge);
@@ -494,6 +584,13 @@ fn read_record(job_dir: &Path) -> Result<JobRecord, JobRecordError> {
     Ok(record)
 }
 
+/// `job.json` があれば読む。無ければ `None`（`begin` の初期化途中）。
+fn read_current(dir: &dyn JobDirOps) -> Result<Option<JobRecord>, JobRecordError> {
+    dir.open_regular(JOB_RECORD_FILE)?
+        .map(parse_record)
+        .transpose()
+}
+
 /// ジョブの所有者が持つ記録の書き手。生存期間中 `job.lock` を保持する。
 ///
 /// [`crate::job::TrainJob::run_recorded`] が [`Self::begin`]→学習実行→[`Self::finish`]
@@ -504,36 +601,45 @@ pub struct JobRecorder {
     _lock: File,
     // 同一プロセス内の状態確認に所有者の生存を示す（drop で解除）。
     _hold: InProcessHold,
-    job_dir: PathBuf,
+    dir: Box<dyn JobDirOps>,
     started_at_unix: u64,
 }
 
 impl JobRecorder {
-    /// `job_dir` に `job.lock` を作って保持し、`running` の記録を書く。
+    /// `job_dir`（パス）に記録を始める（[`PathJobDir`] で [`Self::begin_in`] を呼ぶ）。
+    ///
+    /// パスで開き直すため、経路の閉じ込めが要る呼び出し元は [`Self::begin_in`] に保持 fd 起点の
+    /// [`JobDirOps`] を渡すこと（REQ-39・#510）。
     ///
     /// # Errors
-    /// `job_dir` が不正・記録ファイルが既にある・書き込み失敗。失敗時は `job.lock` を
-    /// 残さない（可能な範囲で）。
+    /// [`Self::begin_in`] と同じ（`job_dir` が不正なら [`JobRecordError::InvalidJobDir`]）。
     pub fn begin(job_dir: &Path, now_unix: u64) -> Result<Self, JobRecordError> {
-        check_job_dir(job_dir)?;
-        let record_path = job_dir.join(JOB_RECORD_FILE);
-        let lock_path = job_dir.join(JOB_LOCK_FILE);
-        if regular_file_exists(&record_path)? || regular_file_exists(&lock_path)? {
+        Self::begin_in(Box::new(PathJobDir::new(job_dir)?), now_unix)
+    }
+
+    /// `dir` に `job.lock` を作って保持し、`running` の記録を書く。
+    ///
+    /// # Errors
+    /// 記録ファイルが既にある・書き込み失敗。失敗時は `job.lock` を残さない（可能な範囲で）。
+    pub fn begin_in(dir: Box<dyn JobDirOps>, now_unix: u64) -> Result<Self, JobRecordError> {
+        if regular_file_exists(&*dir, JOB_RECORD_FILE)?
+            || regular_file_exists(&*dir, JOB_LOCK_FILE)?
+        {
             return Err(JobRecordError::AlreadyExists);
         }
         // `job.lock` は「既に lock 済み」の状態でだけ公開する。先に `job.lock` を作ってから
         // lock すると、作成〜取得の隙間に状態確認が lock を取り、初期化中の所有者を
-        // 落ちたと誤検出する。lock 済みの一時ファイルを `hard_link`（既存なら失敗する
+        // 落ちたと誤検出する。lock 済みの一時ファイルをハードリンク（既存なら失敗する
         // 排他的な公開）で `job.lock` にする。一時ファイルは公開後に消す（公開前に
         // 落ちた場合の残置物は `job.lock` ではないため状態確認には影響しない）。
-        let init_path = job_dir.join(format!(
+        let init_name = format!(
             "{JOB_LOCK_FILE}.init.{}.{}",
             std::process::id(),
             INIT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let lock = create_new_private(&init_path).map_err(|e| io_err(&e))?;
+        );
+        let lock = dir.create_new(&init_name)?;
         let discard_init = || {
-            let _ = std::fs::remove_file(&init_path);
+            let _ = dir.remove(&init_name);
         };
         match lock.try_lock() {
             Ok(()) => {}
@@ -547,24 +653,18 @@ impl JobRecorder {
             }
         }
         let hold = InProcessHold::register(&lock);
-        let published = std::fs::hard_link(&init_path, &lock_path);
+        let published = dir.link(&init_name, JOB_LOCK_FILE);
         discard_init();
-        published.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                JobRecordError::AlreadyExists
-            } else {
-                io_err(&e)
-            }
+        published.map_err(|e| match e {
+            JobRecordError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+            } => JobRecordError::AlreadyExists,
+            other => other,
         })?;
         // ここから `job.lock` は自分のもの。以降の失敗では取り除く。
-        // `job.json` は rename 後の `sync_dir` の失敗でも公開済みになりうる。非終端の
+        // `job.json` は置き換え後の `sync_dir` の失敗でも公開済みになりうる。非終端の
         // 記録だけが残ると `LockMissing`・`AlreadyExists` で `job_dir` を回復も再利用も
         // できないため、lock 保持中に記録も取り除いてから lock を外す。
-        let rollback = |e: JobRecordError| {
-            let _ = std::fs::remove_file(&record_path);
-            let _ = std::fs::remove_file(&lock_path);
-            e
-        };
         let record = JobRecord {
             schema_version: JOB_RECORD_SCHEMA_VERSION,
             state: JobState::Running,
@@ -572,11 +672,15 @@ impl JobRecorder {
             finished_at_unix: None,
             failure: None,
         };
-        write_record_atomic(job_dir, &record).map_err(rollback)?;
+        if let Err(e) = write_record_atomic(&*dir, &record) {
+            let _ = dir.remove(JOB_RECORD_FILE);
+            let _ = dir.remove(JOB_LOCK_FILE);
+            return Err(e);
+        }
         Ok(Self {
             _lock: lock,
             _hold: hold,
-            job_dir: job_dir.to_path_buf(),
+            dir,
             started_at_unix: now_unix,
         })
     }
@@ -605,7 +709,7 @@ impl JobRecorder {
         record
             .validate()
             .map_err(|_| JobRecordError::InvalidFinalState)?;
-        write_record_atomic(&self.job_dir, &record)
+        write_record_atomic(&*self.dir, &record)
         // ここで `self` が drop され lock が解放される（書き込み後）。
     }
 }
@@ -619,7 +723,19 @@ fn report_of(record: &JobRecord, record_updated: bool) -> JobStatusReport {
     }
 }
 
-/// ジョブ状態を確認する（状態確認の中核。CLI への配線は TASK-33.x）。
+/// `job_dir`（パス）のジョブ状態を確認する（[`PathJobDir`] で [`read_job_status_in`] を呼ぶ）。
+///
+/// パスで開き直すため、経路の閉じ込めが要る呼び出し元は [`read_job_status_in`] に保持 fd 起点の
+/// [`JobDirOps`] を渡すこと（REQ-39・#510）。
+///
+/// # Errors
+/// [`read_job_status_in`] と同じ（`job_dir` が不正なら [`JobRecordError::InvalidJobDir`]）。
+pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport, JobRecordError> {
+    read_job_status_in(&PathJobDir::new(job_dir)?, now_unix)
+}
+
+/// ジョブ状態を確認する（状態確認の中核。CLI の `train --status`・やり直し判定が保持 fd 起点の
+/// `dir` で呼ぶ）。
 ///
 /// 終端の記録はそのまま返す。非終端の記録は `job.lock` の保持者がいなければ
 /// 所有プロセスが終了記録なしに消えたと判断し、`failed`＋[`CrashCause::OwnerLost`] を
@@ -627,27 +743,20 @@ fn report_of(record: &JobRecord, record_updated: bool) -> JobStatusReport {
 /// モジュール doc。
 ///
 /// # Errors
-/// `job_dir` 不正・記録の欠落や破損・`job.lock` の欠落（[`JobRecordError::LockMissing`]）・
-/// 書き戻し失敗。
-pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport, JobRecordError> {
-    check_job_dir(job_dir)?;
-    let record_path = job_dir.join(JOB_RECORD_FILE);
-    let lock_path = job_dir.join(JOB_LOCK_FILE);
+/// 記録の欠落や破損・`job.lock` の欠落（[`JobRecordError::LockMissing`]）・
+/// 直列化 lock の待ちの上限超過（[`JobRecordError::LockUnavailable`]）・書き戻し失敗。
+pub fn read_job_status_in(
+    dir: &dyn JobDirOps,
+    now_unix: u64,
+) -> Result<JobStatusReport, JobRecordError> {
     // `job.json` が無く `job.lock` だけがある場合は、`begin` が `job.lock` の公開後・
     // `job.json`（`running`）の確定前に所有プロセスが落ちた残置物か、初期化中の
     // 所有者かのどちらか。lock の保持有無で区別する（下の直列化区間で判定）。
-    let record_exists = regular_file_exists(&record_path)?;
-    let lock_exists = regular_file_exists(&lock_path)?;
-    let first = if record_exists {
-        let record = read_record(job_dir)?;
-        if record.state.is_terminal() {
-            return Ok(report_of(&record, false));
-        }
-        Some(record)
-    } else {
-        None
+    let first = match read_current(dir)? {
+        Some(record) if record.state.is_terminal() => return Ok(report_of(&record, false)),
+        other => other,
     };
-    if !lock_exists {
+    if !regular_file_exists(dir, JOB_LOCK_FILE)? {
         return match first {
             // 非終端の記録なのに lock が無い。生存中の可能性を否定できない。
             Some(_) => Err(JobRecordError::LockMissing),
@@ -660,22 +769,15 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
     // 読み手同士を直列化する。書き戻し中の別の読み手による `job.lock` の保持を
     // 「所有者が生存中」と誤認しないため、`job.lock` の取得試行と書き戻しをこの
     // lock の保持中に行い、待たされた読み手は取得後に記録を読み直す。
-    let check_path = job_dir.join(JOB_CHECK_LOCK_FILE);
-    regular_file_exists(&check_path)?;
-    let mut check_options = OpenOptions::new();
-    check_options.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        check_options.mode(0o600);
-    }
-    let check_lock = check_options.open(&check_path).map_err(|e| io_err(&e))?;
+    let check_lock = dir.open_or_create(JOB_CHECK_LOCK_FILE)?;
     lock_with_timeout(&check_lock, CHECK_LOCK_TIMEOUT)?;
-    let current = read_current(job_dir)?;
+    let current = read_current(dir)?;
     if let Some(record) = current.as_ref().filter(|r| r.state.is_terminal()) {
         return Ok(report_of(record, false));
     }
-    let lock = File::open(&lock_path).map_err(|e| io_err(&e))?;
+    let lock = dir
+        .open_regular(JOB_LOCK_FILE)?
+        .ok_or(JobRecordError::LockMissing)?;
     // 同一プロセスの所有者が保持中なら、lock の取得を試みず（fcntl 系の実装では取得が
     // 成功して close 時に所有者の lock を奪うため）生存中として扱う。
     let alive_in_process = held_in_process(&lock);
@@ -689,12 +791,12 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
         // （記録がまだ無い場合は初期化中。`running` として返す）。
         false => Ok(match current {
             Some(record) => report_of(&record, false),
-            None => report_of(&initializing_record(&lock_path, now_unix), false),
+            None => report_of(&initializing_record(&lock, now_unix), false),
         }),
         true => {
             // lock を保持したまま読み直す。最初の読み込み後に正常終了していれば
             // その終端記録を返し、crash と誤報しない。
-            let current = read_current(job_dir)?;
+            let current = read_current(dir)?;
             if let Some(record) = current.as_ref().filter(|r| r.state.is_terminal()) {
                 return Ok(report_of(record, false));
             }
@@ -702,7 +804,7 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
                 Some(record) => record.started_at_unix,
                 // `job.json` の確定前に落ちた場合の開始時刻は、公開済みの `job.lock`
                 // の更新時刻で近似する（無ければ検出時刻）。
-                None => initializing_record(&lock_path, now_unix).started_at_unix,
+                None => initializing_record(&lock, now_unix).started_at_unix,
             };
             let crashed = JobRecord {
                 schema_version: JOB_RECORD_SCHEMA_VERSION,
@@ -715,25 +817,17 @@ pub fn read_job_status(job_dir: &Path, now_unix: u64) -> Result<JobStatusReport,
                     detected_at_unix: now_unix,
                 }),
             };
-            write_record_atomic(job_dir, &crashed)?;
+            write_record_atomic(dir, &crashed)?;
             Ok(report_of(&crashed, true))
         }
     }
 }
 
-/// `job.json` があれば読む。無ければ `None`（`begin` の初期化途中）。
-fn read_current(job_dir: &Path) -> Result<Option<JobRecord>, JobRecordError> {
-    if regular_file_exists(&job_dir.join(JOB_RECORD_FILE))? {
-        read_record(job_dir).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
 /// `job.json` 確定前の初期化中（または初期化途中で落ちた）ジョブの暫定記録。
-/// 開始時刻は `job.lock` の更新時刻（`now_unix` を上限）。取れなければ `now_unix`。
-fn initializing_record(lock_path: &Path, now_unix: u64) -> JobRecord {
-    let started_at_unix = std::fs::metadata(lock_path)
+/// 開始時刻は開いた `job.lock` の更新時刻（`now_unix` を上限）。取れなければ `now_unix`。
+fn initializing_record(lock: &File, now_unix: u64) -> JobRecord {
+    let started_at_unix = lock
+        .metadata()
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -747,12 +841,6 @@ fn initializing_record(lock_path: &Path, now_unix: u64) -> JobRecord {
     }
 }
 
-/// `lock` の取得を試み、取れたら `true`、他者が保持していれば `false`。
-///
-/// 他者の保持が「所有者の生存」ではなく、同一マシンで並行する `fork`〜`exec` 間の
-/// 子プロセスが継承した fd による一過性のもの（`O_CLOEXEC` は `exec` で閉じるため
-/// 短時間だけ保持が見える）である場合を除くため、短時間だけ再試行してから
-/// 生存と判断する（`running` の確認は上限 [`LOCK_SETTLE_RETRIES`] × 間隔だけ遅れる）。
 /// 読み手同士の直列化 lock（`job.check.lock`）を待つ上限（REQ-39: 無期限の待ちを作らない）。
 /// 書き戻しは記録 1 件の原子的置き換えだけなので、正常な読み手はこの時間内に lock を手放す。
 pub const CHECK_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -773,6 +861,12 @@ fn lock_with_timeout(lock: &File, timeout: std::time::Duration) -> Result<(), Jo
     }
 }
 
+/// `lock` の取得を試み、取れたら `true`、他者が保持していれば `false`。
+///
+/// 他者の保持が「所有者の生存」ではなく、同一マシンで並行する `fork`〜`exec` 間の
+/// 子プロセスが継承した fd による一過性のもの（`O_CLOEXEC` は `exec` で閉じるため
+/// 短時間だけ保持が見える）である場合を除くため、短時間だけ再試行してから
+/// 生存と判断する（`running` の確認は上限 [`LOCK_SETTLE_RETRIES`] × 間隔だけ遅れる）。
 fn try_lock_settled(lock: &File) -> Result<bool, JobRecordError> {
     for attempt in 0..=LOCK_SETTLE_RETRIES {
         match lock.try_lock() {

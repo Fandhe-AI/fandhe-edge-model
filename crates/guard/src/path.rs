@@ -665,7 +665,16 @@ impl ConfinedDir {
     /// # Errors
     /// 経路の拒否・既存・作成失敗。
     pub fn create_new_member(&self, rel: &Path) -> Result<File, PathRejection> {
-        use rustix::fs::{Mode, OFlags, openat};
+        self.create_new_member_mode(rel, rustix::fs::Mode::from_raw_mode(0o666))
+    }
+
+    /// [`ConfinedDir::create_new_member`] の本体（作成時の権限 `mode`。umask が掛かる）。
+    fn create_new_member_mode(
+        &self,
+        rel: &Path,
+        mode: rustix::fs::Mode,
+    ) -> Result<File, PathRejection> {
+        use rustix::fs::{OFlags, openat};
 
         let (parent, name) = self.open_parent_of(rel)?;
         let dir = parent.as_ref().unwrap_or(&self.fd);
@@ -673,7 +682,7 @@ impl ConfinedDir {
             dir,
             name.as_os_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o666),
+            mode,
         )
         .map_err(|e| PathRejection::Unresolvable {
             candidate: rel.to_path_buf(),
@@ -697,6 +706,120 @@ impl ConfinedDir {
                 source: errno_to_io(e),
             }
         })
+    }
+
+    /// `rel` の通常ファイルを読み取り用に開く。親は保持 fd 起点、末尾は `O_NOFOLLOW` で、パスの正準化
+    /// （再解決）をしない（学習ジョブ記録の読み込み用。REQ-34・REQ-39・#510）。
+    ///
+    /// # Errors
+    /// 経路の拒否、symlink・通常ファイル以外は [`PathRejection::NotRegularFile`]、存在しなければ
+    /// `NotFound` の [`PathRejection::Unresolvable`]。
+    pub fn open_regular_member(&self, rel: &Path) -> Result<File, PathRejection> {
+        use rustix::fs::{Mode, OFlags};
+        self.open_member_with(
+            rel,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    }
+
+    /// `rel` を所有者のみ（0600）の通常ファイルとして読み書き用に開く。無ければ作る（切り詰めない。
+    /// `O_NOFOLLOW`。advisory lock のファイル用。REQ-34・REQ-39・#510）。
+    ///
+    /// # Errors
+    /// [`ConfinedDir::open_regular_member`] と同じ（`NotFound` を除く）。
+    pub fn open_or_create_private_member(&self, rel: &Path) -> Result<File, PathRejection> {
+        use rustix::fs::{Mode, OFlags};
+        self.open_member_with(
+            rel,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+    }
+
+    /// `rel` に新規の通常ファイルを所有者のみ（0600）で作る（[`ConfinedDir::create_new_member`] の
+    /// 権限違い。学習ジョブ記録用。REQ-34・REQ-39・#510）。
+    ///
+    /// # Errors
+    /// [`ConfinedDir::create_new_member`] と同じ。
+    pub fn create_new_private_member(&self, rel: &Path) -> Result<File, PathRejection> {
+        self.create_new_member_mode(rel, rustix::fs::Mode::from_raw_mode(0o600))
+    }
+
+    /// `rel` を `flags`・`mode` で開き、通常ファイルであることを `fstat` で確かめて返す
+    /// （symlink は `O_NOFOLLOW` の `ELOOP` で、FIFO 等は `fstat` で [`PathRejection::NotRegularFile`]）。
+    fn open_member_with(
+        &self,
+        rel: &Path,
+        flags: rustix::fs::OFlags,
+        mode: rustix::fs::Mode,
+    ) -> Result<File, PathRejection> {
+        use rustix::fs::{FileType, fstat, openat};
+        use rustix::io::Errno;
+
+        let not_regular = || PathRejection::NotRegularFile {
+            candidate: rel.to_path_buf(),
+        };
+        let (parent, name) = self.open_parent_of(rel)?;
+        let dir = parent.as_ref().unwrap_or(&self.fd);
+        let fd = openat(dir, name.as_os_str(), flags, mode).map_err(|e| match e {
+            Errno::LOOP => not_regular(),
+            other => PathRejection::Unresolvable {
+                candidate: rel.to_path_buf(),
+                source: errno_to_io(other),
+            },
+        })?;
+        let stat = fstat(&fd).map_err(|e| PathRejection::Unresolvable {
+            candidate: rel.to_path_buf(),
+            source: errno_to_io(e),
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(not_regular());
+        }
+        Ok(File::from(fd))
+    }
+
+    /// 本ディレクトリ配下の `from` のハードリンクを `to` に作る（`linkat`。symlink は辿らない。`to` が
+    /// 既存なら `AlreadyExists`。lock 済みファイルの排他的な公開用。REQ-34・REQ-39・#510）。
+    ///
+    /// # Errors
+    /// 経路の拒否・リンクの失敗。
+    pub fn link_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        use rustix::fs::{AtFlags, linkat};
+
+        let (from_parent, from_name) = self.open_parent_of(from)?;
+        let (to_parent, to_name) = self.open_parent_of(to)?;
+        let from_dir = from_parent.as_ref().unwrap_or(&self.fd);
+        let to_dir = to_parent.as_ref().unwrap_or(&self.fd);
+        linkat(
+            from_dir,
+            from_name.as_os_str(),
+            to_dir,
+            to_name.as_os_str(),
+            AtFlags::empty(),
+        )
+        .map_err(|e| PathRejection::Unresolvable {
+            candidate: to.to_path_buf(),
+            source: errno_to_io(e),
+        })
+    }
+
+    /// 本ディレクトリ配下の `from` で `to` を置き換える（`renameat`。`to` が既存でも原子的に置き換える。
+    /// 記録の原子的な更新用。[`ConfinedDir::rename_member`] は置き換えない。REQ-34・REQ-39・#510）。
+    ///
+    /// # Errors
+    /// 経路の拒否・名前替えの失敗。
+    pub fn replace_member(&self, from: &Path, to: &Path) -> Result<(), PathRejection> {
+        let (from_parent, from_name) = self.open_parent_of(from)?;
+        let (to_parent, to_name) = self.open_parent_of(to)?;
+        let from_dir = from_parent.as_ref().unwrap_or(&self.fd);
+        let to_dir = to_parent.as_ref().unwrap_or(&self.fd);
+        rustix::fs::renameat(from_dir, from_name.as_os_str(), to_dir, to_name.as_os_str()).map_err(
+            |e| PathRejection::Unresolvable {
+                candidate: to.to_path_buf(),
+                source: errno_to_io(e),
+            },
+        )
     }
 
     /// `rel` の通常ファイル（またはリンク自身）を削除する（書き込み失敗後の片付け用。ディレクトリは消さない）。
@@ -1276,5 +1399,84 @@ mod tests {
             esc.to_string(),
             "path escapes the root (parent_traversal): ../x"
         );
+    }
+
+    /// REQ-39・#510: ジョブ記録用の fd 起点の操作。通常ファイルだけを開き（symlink は辿らず
+    /// `NotRegularFile`）、lock ファイルは 0600 で作るか既存を開き（symlink 先を作らない）、ハードリンクは
+    /// 既存を拒み、置き換えは既存を原子的に置き換える。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn req39_job_record_member_ops_are_fd_based() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .expect("tmp")
+            .join(format!("fandhe-guard-jobops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("dir")).expect("dir");
+        std::fs::create_dir_all(base.join("outside")).expect("outside");
+        std::fs::write(base.join("outside/secret"), b"secret").expect("secret");
+        let dir = open_dir_confined(&ConfinedPath(base.join("dir"))).expect("open dir");
+        let link = base.join("dir/link");
+        std::os::unix::fs::symlink(base.join("outside/secret"), &link).expect("symlink");
+
+        assert!(matches!(
+            dir.open_regular_member(Path::new("link")),
+            Err(PathRejection::NotRegularFile { .. })
+        ));
+        assert!(matches!(
+            dir.open_regular_member(Path::new("missing")),
+            Err(PathRejection::Unresolvable { ref source, .. }) if source.kind() == io::ErrorKind::NotFound
+        ));
+        std::fs::create_dir(base.join("dir/sub")).expect("sub");
+        assert!(matches!(
+            dir.open_regular_member(Path::new("sub")),
+            Err(PathRejection::NotRegularFile { .. })
+        ));
+
+        std::os::unix::fs::symlink(base.join("outside/created"), base.join("dir/dangling"))
+            .expect("dangling");
+        assert!(matches!(
+            dir.open_or_create_private_member(Path::new("dangling")),
+            Err(PathRejection::NotRegularFile { .. })
+        ));
+        assert!(!base.join("outside/created").exists());
+        let lock = dir
+            .open_or_create_private_member(Path::new("a.lock"))
+            .expect("create lock");
+        assert_eq!(
+            lock.metadata().expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+        dir.open_or_create_private_member(Path::new("a.lock"))
+            .expect("open existing lock");
+
+        let mut tmp = dir
+            .create_new_private_member(Path::new("t"))
+            .expect("create");
+        std::io::Write::write_all(&mut tmp, b"new").expect("write");
+        drop(tmp);
+        std::fs::write(base.join("dir/target"), b"old").expect("target");
+        dir.replace_member(Path::new("t"), Path::new("target"))
+            .expect("replace");
+        let mut text = String::new();
+        dir.open_regular_member(Path::new("target"))
+            .expect("open target")
+            .read_to_string(&mut text)
+            .expect("read");
+        assert_eq!(text, "new");
+        assert!(matches!(
+            dir.link_member(Path::new("a.lock"), Path::new("target")),
+            Err(PathRejection::Unresolvable { ref source, .. }) if source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        dir.link_member(Path::new("a.lock"), Path::new("b.lock"))
+            .expect("link");
+        assert!(base.join("dir/b.lock").is_file());
+        assert_eq!(
+            std::fs::read(base.join("outside/secret")).expect("secret"),
+            b"secret"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

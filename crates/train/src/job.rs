@@ -38,7 +38,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::TrainProcessError;
-use crate::job_record::{JobRecordError, JobRecorder, classify_run_end, unix_now};
+use crate::job_record::{
+    JobDirOps, JobRecordError, JobRecorder, PathJobDir, classify_run_end, unix_now,
+};
 use crate::process::{
     CancelToken, CancelledRun, RunLimits, TrainRunEnd, WorkerLauncher, run_train_cancellable,
 };
@@ -247,7 +249,31 @@ impl TrainJob {
         job_dir: &Path,
         limits: &RunLimits,
     ) -> Result<RecordedRun, JobRecordError> {
-        let recorder = JobRecorder::begin(job_dir, unix_now())?;
+        self.run_recorded_in(
+            launcher,
+            request,
+            job_dir,
+            Box::new(PathJobDir::new(job_dir)?),
+            limits,
+        )
+    }
+
+    /// [`Self::run_recorded`] の記録先を、保持 fd 起点などの [`JobDirOps`] で渡す版（REQ-34・REQ-39・
+    /// #510）。`record_dir` は `job_dir` と同じディレクトリを指すこと（CLI はガード層の保持 fd で渡し、
+    /// 記録の読み書きでパスを再解決しない）。`job_dir` は学習ワーカーの起動（`request.json`・作業
+    /// ディレクトリ）にだけ使う。
+    ///
+    /// # Errors
+    /// [`Self::run_recorded`] と同じ。
+    pub fn run_recorded_in(
+        self,
+        launcher: &WorkerLauncher,
+        request: &TrainRequest,
+        job_dir: &Path,
+        record_dir: Box<dyn JobDirOps>,
+        limits: &RunLimits,
+    ) -> Result<RecordedRun, JobRecordError> {
+        let recorder = JobRecorder::begin_in(record_dir, unix_now())?;
         let run = self.run_inner(launcher, request, job_dir, limits);
         let (state, failure) = classify_run_end(&run, unix_now());
         let record = recorder.finish(state, failure, unix_now());
