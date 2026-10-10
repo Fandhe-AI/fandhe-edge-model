@@ -454,6 +454,43 @@ fn req38_extended_option_is_validated_and_opt_in() {
     assert!(e.cli_calls().is_empty());
 }
 
+/// REQ-17・REQ-38: `--extended` は `--smoke` との併用を起動前に 64 で拒否し、evaluate が skipped
+/// （評価データなし）なら 70 で止まる（評価の省略を通さない）。
+#[test]
+fn req17_extended_rejects_smoke_and_skipped_evaluation() {
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.extend(s(&["--extended", "--smoke"]));
+    let o = e.run(&args, &[]);
+    assert_eq!(o.code, Some(64), "stdout={}", o.stdout);
+    assert!(e.cli_calls().is_empty());
+
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--extended".to_string());
+    let o = e.run(&args, &[("FAKE_EVAL_SKIPPED", "1")]);
+    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
+    assert!(
+        o.stdout.contains("\"failed_step\":\"evaluate\""),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(e.cli_calls().len(), 5);
+}
+
+/// 末尾スラッシュつきの `--project-dir` でも別プロジェクトは兄弟ディレクトリ（`<dir>-extended`）になる。
+#[test]
+fn req38_extended_project_with_trailing_slash_is_a_sibling() {
+    let e = Env::new();
+    let mut args = e.base_args();
+    args[3] = format!("{}/", e.project().display());
+    args.push("--extended".to_string());
+    let o = e.run(&args, &[("FAKE_EVAL_OUT", EXT_EVAL_OK)]);
+    assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+    let x = format!("{}-extended", e.project().display());
+    assert_eq!(e.cli_args()[8], format!("inspect --project-dir {x}"));
+}
+
 /// REQ-22・REQ-38: `--extended` では評価ありの evaluate が calibration・abstention を出さなければ 70 で止まる
 /// （追加工程は起動しない）。`--extended` なしの同じ出力は従来どおり完了する。
 #[test]

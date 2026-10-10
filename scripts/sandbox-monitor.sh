@@ -161,6 +161,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+[ "$extended" -eq 0 ] || [ "$smoke" -eq 0 ] || fail 64 invalid_input "--extended cannot be combined with --smoke"
 [ -n "$definition" ] || fail 64 invalid_input "--definition is required"
 [ -n "$project_dir" ] || fail 64 invalid_input "--project-dir is required"
 [ -n "$out_dir" ] || fail 64 invalid_input "--out-dir is required"

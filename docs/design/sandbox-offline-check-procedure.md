@@ -58,8 +58,8 @@ cd <作業ディレクトリ>
 ### 3-C. 拡張確認（`--extended`。評価データあり・smoke なし）
 
 REQ-38・#469 の CLI 結線で増えた工程・引数も、通信 0 件で完走することを確かめる任意の経路。3-B と同じ入力
-（`fixtures/sandbox_run_eval/`）・前提で、`--extended` を足す（`--smoke` と併用すると evaluate が skipped になり、
-校正・保留の確認が成立しない）。
+（`fixtures/sandbox_run_eval/`）・前提で、`--extended` を足す。評価データが必要で、`--smoke` とは併用できない
+（併用は起動前に 64。評価データなしで evaluate が skipped になった場合は 70 で止まる。評価の省略を通さないため）。
 
 - 7 工程の後に、別プロジェクト `<project-dir>-extended`（未作成であること。`train --all` が既存の候補を拒否するため分ける）で
   `register`・`inspect`・`train --all --smoke --budget-seconds 600`・`train --status`・`train --cancel` を実行し、

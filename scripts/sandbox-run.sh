@@ -28,7 +28,8 @@
 #     evaluate の結果に calibration・abstention がオブジェクトで含まれることも構造検証する
 #     （評価データありかつ smoke なしで使う。`fixtures/sandbox_run_eval`）。版管理台帳は上の package が
 #     `<project-dir>/version_ledger.json` として作る。許容する終了コードは全工程 0（infer は従来どおり
-#     11・12 も可）。--extended なしの挙動・出力は変えない
+#     11・12 も可）。--extended なしの挙動・出力は変えない。--smoke との併用は 64、evaluate が
+#     skipped（評価データなし）なら 70 で止める（評価の省略を通さない）
 #   - 各工程を `<launcher> -p '(version 1)(allow default)(deny network*)' <bin> <工程> ...`
 #     で起動する。遮断プロファイルは定数で、弱める経路（オプション・環境変数）を設けない。
 #     train が起動する学習ワーカー（Python）の子プロセスも sandbox を継承する前提で、
@@ -216,8 +217,13 @@ case "$canon_project/" in
 esac
 
 # --extended の別プロジェクト（train --all は既存の候補ディレクトリを拒否するため分ける）
-ext_project="${project_dir}-extended"
+# 末尾の `/` は外してから付ける（`<dir>/-extended` で元のプロジェクトの中を指さない。`/` のみは既存の検証が拒否）
+_pd=$project_dir
+while [ "${_pd%/}" != "$_pd" ] && [ -n "${_pd%/}" ]; do _pd=${_pd%/}; done
+ext_project="${_pd}-extended"
 if [ "$extended" -eq 1 ]; then
+    # 評価の省略を拒否する（smoke は evaluate を起動しない。REQ-17・REQ-27）
+    [ "$smoke" -eq 0 ] || fail 64 invalid_input "--extended cannot be combined with --smoke"
     if [ -e "$ext_project" ] || [ -L "$ext_project" ]; then
         fail 64 invalid_input "extended project directory already exists"
     fi
@@ -481,7 +487,8 @@ elif name == "infer":
 elif v.get("step") != name:
     print("invalid")
 elif name == "evaluate" and v.get("status") == "skipped":
-    print("skipped")
+    # --extended: 評価の省略（評価データなしを含む）は失敗として止める
+    print("invalid" if sys.argv[3] == "1" else "skipped")
 elif v.get("status") == "ok":
     if name == "evaluate" and sys.argv[3] == "1" and not (isinstance(v.get("calibration"), dict) and isinstance(v.get("abstention"), dict)):
         # --extended: 校正・保留（REQ-22）が出ていない評価を完了として扱わない
