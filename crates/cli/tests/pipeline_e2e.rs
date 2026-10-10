@@ -29,6 +29,7 @@ mod suite {
     use std::process::{Child, Command, Output, Stdio};
 
     use fandhe_edge_core::definition::Definition;
+    use fandhe_edge_core::evaluation_record::{EvaluationRecord, ReproducibilityVerdict};
     use fandhe_edge_core::hash::Sha256Digest;
     use fandhe_edge_train::request::TrainRequest;
 
@@ -1583,6 +1584,263 @@ mod suite {
         assert!(!env.work.join("c1proj/poc26_score_ledger").exists());
     }
 
+    /// `evaluate` の stdout の `reproducibility.runs[]` から seed `seed` の `(lo, hi)` を取り出す。
+    fn seed_run_ci(out: &str, seed: u32) -> (f64, f64) {
+        let start = out
+            .find(&format!("{{\"seed\":{seed},"))
+            .unwrap_or_else(|| panic!("seed {seed}: {out}"));
+        let rest = &out[start..];
+        let num = |key: &str, end: char| -> f64 {
+            let at = rest.find(key).expect(key) + key.len();
+            let tail = &rest[at..];
+            tail[..tail.find(end).expect("end")].parse().expect("f64")
+        };
+        (num("\"lo\":", ','), num("\"hi\":", '}'))
+    }
+
+    /// 評価済みの複製 `from` を `to` へ複製し、評価記録（候補 1）を `edit` で書き換える（合成した評価記録）。
+    fn tampered_seed_run(
+        env: &Env,
+        from: &str,
+        to: &str,
+        edit: impl FnOnce(&mut EvaluationRecord),
+    ) {
+        copy_dir(&env.work.join(from), &env.work.join(to));
+        let path = env
+            .work
+            .join(to)
+            .join("candidates/1/evaluation_record.json");
+        let mut record = EvaluationRecord::from_json_slice(&std::fs::read(&path).expect("record"))
+            .expect("parse");
+        edit(&mut record);
+        std::fs::write(&path, record.to_json_vec().expect("json")).expect("write");
+    }
+
+    /// REQ-26・REQ-27・REQ-39・TASK-26.3・#490: seed ごとの複製プロジェクト（学習前に複製し、各複製で
+    /// `train --train-seed S → select → evaluate`）の評価記録を `--seed-run-project` で読み、3 seed の
+    /// Wilson 95% 区間の重なりを stdout・評価記録の `reproducibility` へ出す。照合の違反・run 数の
+    /// 不足 / 超過・cwd 外は `invalid_input`（64）で台帳を作らず（適用権を失わない）、同じ候補をその後
+    /// 評価できる。正解数を書き換えた合成記録で `some_pairs_disjoint` も確認する（テストハーネス。
+    /// 学習ワーカーは偽物で、GPU の実学習は行わない）。
+    pub fn req26_issue490_seed_run_projects_report_reproducibility() {
+        let env = eval_env_until("repro490", &[]);
+        for name in ["r1", "r2", "r3"] {
+            copy_dir(
+                &env.project_file(""),
+                &env.project_file(&format!("../{name}")),
+            );
+        }
+        for (dir, seed) in [("r1", "1"), ("r2", "2"), ("r3", "3"), ("proj", "5")] {
+            env.ok(&[
+                "train",
+                "--project-dir",
+                dir,
+                "--candidate",
+                "1",
+                "--train-seed",
+                seed,
+            ]);
+            env.ok(&["select", "--project-dir", dir]);
+        }
+        for dir in ["r1", "r2"] {
+            env.ok(&["evaluate", "--project-dir", dir, "--candidate", "1"]);
+        }
+        let r2_path = env.work.join("r2/candidates/1/evaluation_record.json");
+        let r2_before = std::fs::read(&r2_path).expect("r2");
+        let r1 = EvaluationRecord::from_json_slice(
+            &std::fs::read(env.work.join("r1/candidates/1/evaluation_record.json")).expect("r1"),
+        )
+        .expect("parse");
+        assert_eq!(
+            (r1.config_id.as_str(), r1.correct, r1.total),
+            ("c3:seed1", 4, 12)
+        );
+
+        // 照合の違反は適用前に `invalid_input`。台帳（適用権のロック）を作らない。
+        tampered_seed_run(&env, "r1", "rtotal", |r| {
+            r.total = 13;
+        });
+        tampered_seed_run(&env, "r1", "rsha", |r| {
+            r.evaluation_sha256 = "0".repeat(64);
+        });
+        tampered_seed_run(&env, "r1", "rcand", |r| {
+            r.candidate_id = "c1".to_string();
+        });
+        let eval = |runs: &[&str]| -> Vec<String> {
+            let mut a: Vec<String> = ["evaluate", "--project-dir", "proj", "--candidate", "1"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            for r in runs {
+                a.push("--seed-run-project".to_string());
+                a.push(r.to_string());
+            }
+            a
+        };
+        let rejected = |runs: &[&str], message: &str| {
+            let args = eval(runs);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = env.fails(&args, 64, "invalid_input");
+            if !message.is_empty() {
+                assert_eq!(
+                    out,
+                    format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+                );
+            }
+            assert!(!env.project_file("final_test_ledger").exists(), "{out}");
+        };
+        rejected(
+            &["r1"],
+            "too few seed run projects for a reproducibility check",
+        );
+        rejected(&["r1", "r1"], "seed run seed is duplicated");
+        rejected(&["rtotal", "r2"], "seed run total does not match");
+        rejected(&["rsha", "r2"], "seed run evaluation data does not match");
+        rejected(&["rcand", "r2"], "seed run candidate does not match");
+        rejected(&["r1", "../trainer"], "");
+        rejected(&["r1", "r3"], "seed run project has not been evaluated");
+        rejected(
+            &["r1"; 100],
+            "too many seed run projects for a reproducibility check",
+        );
+
+        // 偽ワーカーの正解数は 4/12（区間 [0.138, 0.609]）。正解数を 12 にした合成記録（seed 1。区間
+        // [0.758, 1.0]）は seed 2・5 と区間が重ならない。
+        tampered_seed_run(&env, "r1", "rfull", |r| {
+            r.correct = 12;
+        });
+        let args = eval(&["r2", "rfull"]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = env.ok(&args);
+        assert!(out.contains(",\"abstention\":{\"answered\":"), "{out}");
+        assert!(
+            out.contains(",\"reproducibility\":{\"runs\":[{\"seed\":1,\"correct\":12,\"total\":12,\"ci95\":{\"lo\":"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "\"verdict\":\"some_pairs_disjoint\",\"disjoint_pairs\":[[1,2],[1,5]]}}\n"
+            ),
+            "{out}"
+        );
+        for (seed, correct) in [(1, 12), (2, r1.correct), (5, r1.correct)] {
+            let (lo, hi) = seed_run_ci(&out, seed);
+            let ci = fandhe_edge_eval::wilson::wilson_ci95(correct, 12).expect("ci");
+            assert!(
+                (lo - ci.lo()).abs() < 1e-9 && (hi - ci.hi()).abs() < 1e-9,
+                "{out}"
+            );
+        }
+        let record = EvaluationRecord::from_json_slice(
+            &std::fs::read(env.project_file("candidates/1/evaluation_record.json")).expect("rec"),
+        )
+        .expect("parse");
+        let repro = record.reproducibility.expect("reproducibility");
+        assert_eq!(repro.seeds, vec![1, 2, 5]);
+        assert_eq!(
+            repro
+                .runs
+                .iter()
+                .map(|r| (r.seed, r.correct, r.total))
+                .collect::<Vec<_>>(),
+            vec![(1, 12, 12), (2, r1.correct, 12), (5, r1.correct, 12)]
+        );
+        assert_eq!(repro.verdict, ReproducibilityVerdict::SomePairsDisjoint);
+        // `package` は再現性の欄を照合しない（記録・報告のみ）。
+        env.ok(&PACKAGE);
+
+        // 同じ予測の 3 seed（1・2・3）は全組が重なる。
+        let out = env.ok(&[
+            "evaluate",
+            "--project-dir",
+            "r3",
+            "--candidate",
+            "1",
+            "--seed-run-project",
+            "r1",
+            "--seed-run-project",
+            "r2",
+        ]);
+        assert!(
+            out.ends_with("\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]}}\n"),
+            "{out}"
+        );
+        let r3 = std::fs::read_to_string(env.work.join("r3/candidates/1/evaluation_record.json"))
+            .expect("r3");
+        let c = r1.correct;
+        assert!(
+            r3.ends_with(&format!(",\"reproducibility\":{{\"seeds\":[1,2,3],\"runs\":[{{\"seed\":1,\"correct\":{c},\"total\":12}},{{\"seed\":2,\"correct\":{c},\"total\":12}},{{\"seed\":3,\"correct\":{c},\"total\":12}}],\"verdict\":\"all_pairs_overlap\"}}}}\n")),
+            "{r3}"
+        );
+        // 複製側は読むだけ（記録を書き換えない）。
+        assert_eq!(std::fs::read(&r2_path).expect("r2"), r2_before);
+    }
+
+    /// REQ-26・#488・#490: `--previous-project-dir` と `--seed-run-project` を併用すると、stdout は
+    /// `comparison` → `reproducibility` の順に両方の欄を持ち、評価記録も `previous_comparison` の後ろに
+    /// `reproducibility` を持つ（テストハーネス。学習ワーカーは偽物）。
+    pub fn req26_issue490_previous_and_seed_runs_together() {
+        let env = eval_env_until("prevrepro", &[]);
+        for name in ["old", "r1", "r2"] {
+            copy_dir(&env.project_file(""), &env.work.join(name));
+        }
+        train_and_select(&env, "old");
+        env.ok(&["evaluate", "--project-dir", "old", "--candidate", "1"]);
+        for (dir, seed) in [("r1", "1"), ("r2", "2"), ("proj", "5")] {
+            env.ok(&[
+                "train",
+                "--project-dir",
+                dir,
+                "--candidate",
+                "1",
+                "--train-seed",
+                seed,
+            ]);
+            env.ok(&["select", "--project-dir", dir]);
+        }
+        for dir in ["r1", "r2"] {
+            env.ok(&["evaluate", "--project-dir", dir, "--candidate", "1"]);
+        }
+        let out = env.ok(&[
+            "evaluate",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "1",
+            "--previous-project-dir",
+            "old",
+            "--seed-run-project",
+            "r1",
+            "--seed-run-project",
+            "r2",
+        ]);
+        let comparison = out
+            .find(",\"comparison\":{\"previous\":")
+            .expect("comparison");
+        let reproducibility = out
+            .find("},\"reproducibility\":{\"runs\":[{\"seed\":1,")
+            .expect("reproducibility");
+        assert!(comparison < reproducibility, "{out}");
+        assert!(
+            out.ends_with("\"verdict\":\"all_pairs_overlap\",\"disjoint_pairs\":[]}}\n"),
+            "{out}"
+        );
+        let record =
+            std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
+                .expect("record");
+        let previous = record
+            .find(",\"previous_comparison\":{")
+            .expect("previous_comparison");
+        let repro = record
+            .find("},\"reproducibility\":{\"seeds\":[1,2,5],")
+            .expect("reproducibility");
+        assert!(previous < repro, "{record}");
+        assert!(
+            record.ends_with(",\"verdict\":\"all_pairs_overlap\"}}\n"),
+            "{record}"
+        );
+    }
+
     /// ディレクトリを再帰的に複製する（権限を保つ。テスト用）。
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).expect("mkdir");
@@ -1742,7 +2000,7 @@ mod suite {
                 "{out}"
             );
         }
-        assert!(out.ends_with("}}}}\n"), "{out}");
+        assert!(out.ends_with("}}},\"reproducibility\":null}\n"), "{out}");
         let record =
             std::fs::read_to_string(env.project_file("candidates/1/evaluation_record.json"))
                 .expect("record");
@@ -1846,7 +2104,7 @@ mod suite {
         let out = env.ok(&evaluate_with_previous("renamed", "old"));
         assert!(
             out.ends_with(
-                ",\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"common_subset\",\"n_common\":0,\"n_previous_only\":12,\"n_current_only\":12,\"counts\":null}}\n"
+                ",\"premise\":\"same_label_set\",\"removed_labels\":[],\"added_labels\":[],\"evaluation_data\":\"common_subset\",\"n_common\":0,\"n_previous_only\":12,\"n_current_only\":12,\"counts\":null},\"reproducibility\":null}\n"
             ),
             "{out}"
         );
@@ -2474,8 +2732,12 @@ mod suite {
         let at: Vec<usize> = keys.iter().map(|k| out.find(k).expect(k)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{out}");
         assert!(out.contains(",\"abstention\":{\"answered\":"), "{out}");
-        // REQ-26・#488: `--previous-project-dir` が無ければ `comparison` は `null`（`abstention` の後ろ）。
-        assert!(out.ends_with("},\"comparison\":null}\n"), "{out}");
+        // REQ-26・#488・#490: `--previous-project-dir`・`--seed-run-project` が無ければ `comparison`・
+        // `reproducibility` は `null`（`abstention` の後ろにこの順）。
+        assert!(
+            out.ends_with("},\"comparison\":null,\"reproducibility\":null}\n"),
+            "{out}"
+        );
         // 型と意味の 5 区分の合計は n_total。評価器の正解数と ok_ok が一致する。
         let quadrant: f64 = [
             "type_ok_meaning_ok",
@@ -5278,6 +5540,14 @@ fn main() -> std::process::ExitCode {
         (
             "req26_issue489_previous_comparison_on_different_data_and_labels",
             suite::req26_issue489_previous_comparison_on_different_data_and_labels,
+        ),
+        (
+            "req26_issue490_seed_run_projects_report_reproducibility",
+            suite::req26_issue490_seed_run_projects_report_reproducibility,
+        ),
+        (
+            "req26_issue490_previous_and_seed_runs_together",
+            suite::req26_issue490_previous_and_seed_runs_together,
         ),
         (
             "train_seed_record_tamper_is_rejected",

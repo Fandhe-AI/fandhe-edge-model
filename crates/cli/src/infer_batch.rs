@@ -1046,6 +1046,7 @@ mod tests {
                 project_dir: p(),
                 candidate: 0,
                 previous_project_dir: None,
+                seed_run_projects: Vec::new(),
             }),
             Command::Select(SelectArgs { project_dir: p() }),
             Command::Package(PackageArgs {

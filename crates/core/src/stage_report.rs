@@ -40,7 +40,8 @@ use serde::Serialize;
 use crate::definition::JudgmentType;
 use crate::evaluation_record::{
     BaselineComparisonVerdict, ComparisonEvaluationData, ComparisonPremiseKind,
-    PreviousModelRecord, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
+    PreviousModelRecord, ReproducibilityVerdict, SelectionSignificanceRecord,
+    TypeMeaningQuadrantRecord,
 };
 use crate::hash::Sha256Digest;
 use crate::rebuild::{RebuildDecision, RebuildReason};
@@ -121,7 +122,7 @@ impl EvaluateReport {
 /// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
 /// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
 /// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`・`macro_f1_excluded_labels`・`per_label`・
-/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`）に直列化し、`macro_f1` が未定義なら
+/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`・`reproducibility`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
 /// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
@@ -142,6 +143,7 @@ pub struct EvaluateCompletedReport {
     calibration: Option<EvaluateCalibration>,
     abstention: Option<EvaluateAbstention>,
     comparison: Option<EvaluateComparison>,
+    reproducibility: Option<EvaluateReproducibility>,
 }
 
 /// 区間（`{"lo","hi"}`。Wilson 95% など）。
@@ -223,6 +225,33 @@ impl EvaluateComparison {
     }
 }
 
+/// `evaluate` の `reproducibility.runs[]` の 1 要素（1 seed 分。REQ-26・#490）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateSeedRun {
+    /// 学習 seed。
+    pub seed: u32,
+    /// 凍結 test での正解数。
+    pub correct: u64,
+    /// 凍結 test の評価件数。
+    pub total: u64,
+    /// 正解率の Wilson 95% 信頼区間。
+    pub ci95: EvaluateInterval,
+}
+
+/// `evaluate` の `reproducibility`（3 seed 以上の Wilson 95% 区間の重なり。REQ-26・TASK-26.3・#490）。
+///
+/// `runs` は seed 昇順、`disjoint_pairs` は区間が重ならなかった seed の組（各組は昇順）。記録・報告のみで
+/// 終了コードに影響しない。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvaluateReproducibility {
+    /// seed ごとの件数と区間（seed 昇順）。
+    pub runs: Vec<EvaluateSeedRun>,
+    /// 判定。
+    pub verdict: ReproducibilityVerdict,
+    /// 区間が重ならなかった seed の組。
+    pub disjoint_pairs: Vec<[u32; 2]>,
+}
+
 /// `evaluate` の `abstention`（validation の T・τ を凍結 test に適用した保留・対象外の件数。
 /// REQ-22・REQ-27・#479・#478）。
 ///
@@ -302,6 +331,8 @@ pub struct EvaluateDetails {
     pub abstention: Option<EvaluateAbstention>,
     /// 旧モデルとの比較（`--previous-project-dir` が無ければ `None`。#488・#489）。
     pub comparison: Option<EvaluateComparison>,
+    /// 再現性（`--seed-run-project` が無ければ `None`。#490）。各 run の `total` は評価件数と一致すること。
+    pub reproducibility: Option<EvaluateReproducibility>,
 }
 
 impl EvaluateCompletedReport {
@@ -346,6 +377,15 @@ impl EvaluateCompletedReport {
                 .comparison
                 .as_ref()
                 .is_some_and(|c| !c.is_consistent())
+            || details.reproducibility.as_ref().is_some_and(|r| {
+                r.runs.iter().any(|run| {
+                    run.total != total
+                        || run.correct > total
+                        || bad(Some(run.ci95.lo))
+                        || bad(Some(run.ci95.hi))
+                        || run.ci95.lo > run.ci95.hi
+                })
+            })
         {
             return None;
         }
@@ -365,6 +405,7 @@ impl EvaluateCompletedReport {
             calibration: details.calibration,
             abstention: details.abstention,
             comparison: details.comparison,
+            reproducibility: details.reproducibility,
         })
     }
 
@@ -1557,6 +1598,7 @@ mod tests {
             out_of_scope_label: None,
             abstention: None,
             comparison: None,
+            reproducibility: None,
         }
     }
 
@@ -1581,7 +1623,7 @@ mod tests {
         };
         let line = build(ok).expect("report").to_json_line().expect("json");
         assert!(
-            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null}"#),
+            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null,"reproducibility":null}"#),
             "{line}"
         );
         let all_abstained = EvaluateAbstention {
@@ -1608,6 +1650,40 @@ mod tests {
         );
     }
 
+    /// REQ-26・#490: `reproducibility` つきの JSON が末尾に完全一致し、評価件数と合わない run・
+    /// 範囲外の区間は作れない。
+    #[test]
+    fn req26_issue490_reproducibility_json_is_exact() {
+        let run = |seed: u32, correct: u64, lo: f64, hi: f64| EvaluateSeedRun {
+            seed,
+            correct,
+            total: 4,
+            ci95: EvaluateInterval { lo, hi },
+        };
+        let build = |runs: Vec<EvaluateSeedRun>| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.reproducibility = Some(EvaluateReproducibility {
+                runs,
+                verdict: ReproducibilityVerdict::SomePairsDisjoint,
+                disjoint_pairs: vec![[1, 42]],
+            });
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        let line = build(vec![run(1, 0, 0.0, 0.5), run(42, 4, 0.5, 1.0)])
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(
+            line.ends_with(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,42]]}}"#),
+            "{line}"
+        );
+        let mut other_total = run(1, 0, 0.0, 0.5);
+        other_total.total = 5;
+        assert_eq!(build(vec![other_total]), None);
+        assert_eq!(build(vec![run(1, 0, 0.6, 0.5)]), None);
+        assert_eq!(build(vec![run(1, 0, -0.1, 0.5)]), None);
+    }
+
     /// REQ-22・REQ-27・#477: 校正つきの JSON は `calibration` が完全一致し、範囲外のしきい値は作れない。
     #[test]
     fn req22_issue477_calibration_json_is_exact() {
@@ -1627,7 +1703,7 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null}"#),
+            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null,"reproducibility":null}"#),
             "{line}"
         );
         assert_eq!(calibration(1.5), None);
@@ -1662,7 +1738,7 @@ mod tests {
         .expect("report");
         assert_eq!(
             report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null}"#
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null,"reproducibility":null}"#
         );
     }
 
@@ -1708,7 +1784,7 @@ mod tests {
             .expect("json");
         assert!(
             line.ends_with(&format!(
-                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}}}}"#,
+                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}},"reproducibility":null}}"#,
                 "1".repeat(64),
                 "2".repeat(64),
                 "3".repeat(64)
@@ -1721,7 +1797,7 @@ mod tests {
             .expect("json");
         assert!(
             empty.ends_with(
-                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null}}"#
+                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null},"reproducibility":null}"#
             ),
             "{empty}"
         );

@@ -99,23 +99,15 @@ pub(super) fn prepare_previous(
 ) -> Result<PreparedPrevious, ErrorReport> {
     let old = Project::open(cwd, previous_dir)?;
     let old_definition = old.load_definition()?;
-    let Some(selection) = old.read_optional(SELECTION_FILE, 64 * 1024)? else {
-        return Err(invalid(
-            "previous candidate selection has not been recorded",
-        ));
-    };
-    let selection = SelectionRecord::from_json_slice(&selection)
-        .map_err(|_| invalid("previous selection record is invalid"))?;
-    let index = selection.candidate_index;
-    let Some(record_bytes) = old.read_optional(
-        candidate_rel(index).join(EVALUATION_RECORD_FILE),
-        MAX_EVALUATION_RECORD_BYTES,
-    )?
-    else {
-        return Err(invalid("previous candidate has not been evaluated"));
-    };
-    let record = EvaluationRecord::from_json_slice(&record_bytes)
-        .map_err(|_| invalid("previous evaluation record is malformed"))?;
+    let (index, record) = read_selected_evaluation_record(
+        &old,
+        &SelectedRecordMessages {
+            no_selection: "previous candidate selection has not been recorded",
+            invalid_selection: "previous selection record is invalid",
+            not_evaluated: "previous candidate has not been evaluated",
+            malformed: "previous evaluation record is malformed",
+        },
+    )?;
     check_previous_record_shape(&record, index)?;
     if record.predictions_sha256.is_none() {
         return Err(invalid("previous evaluation record has no predictions"));
@@ -214,6 +206,41 @@ pub(super) fn prepare_previous(
         .compare(&current_labels, &dry_run)
         .map_err(|_| invalid("previous comparison is not possible"))?;
     Ok(prepared)
+}
+
+/// [`read_selected_evaluation_record`] の失敗の message（呼び出し元ごとの固定文）。
+pub(super) struct SelectedRecordMessages {
+    pub no_selection: &'static str,
+    pub invalid_selection: &'static str,
+    pub not_evaluated: &'static str,
+    pub malformed: &'static str,
+}
+
+/// 別プロジェクト（旧・seed ごとの複製。読むだけ）の選定記録から選定候補を求め、その評価記録を読む
+/// （`--previous-project-dir`〔#488〕と `--seed-run-project`〔#490〕で共有）。
+///
+/// # Errors
+/// 選定記録・評価記録が無い / 不正は `invalid_input`（message は `messages`）、上限超過は `limit_exceeded`。
+pub(super) fn read_selected_evaluation_record(
+    project: &Project,
+    messages: &SelectedRecordMessages,
+) -> Result<(usize, EvaluationRecord), ErrorReport> {
+    let Some(selection) = project.read_optional(SELECTION_FILE, 64 * 1024)? else {
+        return Err(invalid(messages.no_selection));
+    };
+    let selection = SelectionRecord::from_json_slice(&selection)
+        .map_err(|_| invalid(messages.invalid_selection))?;
+    let index = selection.candidate_index;
+    let Some(record_bytes) = project.read_optional(
+        candidate_rel(index).join(EVALUATION_RECORD_FILE),
+        MAX_EVALUATION_RECORD_BYTES,
+    )?
+    else {
+        return Err(invalid(messages.not_evaluated));
+    };
+    let record = EvaluationRecord::from_json_slice(&record_bytes)
+        .map_err(|_| invalid(messages.malformed))?;
+    Ok((index, record))
 }
 
 /// 旧の評価記録のうち、新しい評価記録へ写す値の形を確かめる（記録の上限内に収めるため。REQ-39）。
