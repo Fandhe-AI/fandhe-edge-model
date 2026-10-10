@@ -115,7 +115,10 @@ UNEXPECTED = "<unexpected>"
 UNRECOGNIZED = "<unrecognized>"
 MAX_STR = 200
 # 記録の文字列の欄の語彙（閉じた集合。fixtures・Rust のソースとの一致は pytest で機械照合する）
-STATUS_VOCAB = frozenset({"ok", "skipped"})
+STATUS_VOCAB = frozenset({"ok", "skipped", "out_of_scope", "abstain"})
+# infer の終了コードと判定行の `status` の対応（REQ-21・REQ-22。対象外 11・保留 12。#478・#497）。
+# 単発は終了コードと `status` の対応が一致すれば合格、バッチは exit 0 で各行の `status` が値のどれか
+INFER_EXIT_STATUS = {0: "ok", 11: "out_of_scope", 12: "abstain"}
 # 終了コード 7 種の名前（`fixtures/exitcode/exit_codes.json` の `name`。REQ-21）
 CODE_VOCAB = frozenset(
     {
@@ -1180,9 +1183,19 @@ def check_package_metrics(
     return obj.get("code") == "limit_exceeded" and any_exceeded
 
 
-def _infer_envelope_ok(obj: dict[str, Any]) -> bool:
-    """infer の出力が `status:"ok"`・`step` 欄なし・文字列の `id` か（B の単発・E で共通）。"""
-    return obj.get("status") == "ok" and "step" not in obj and isinstance(obj.get("id"), str)
+def _infer_envelope_ok(obj: dict[str, Any], rc: int) -> bool:
+    """infer の出力の `status` が終了コード `rc` に対応し、`step` 欄なし・文字列の `id` か。
+
+    B の単発・E で共通（REQ-21・REQ-22）。E のバッチ行は exit 0 のため、行の `status` から引いた
+    終了コードを `rc` に渡す（`INFER_EXIT_STATUS` の値のどれかであれば合格）。
+    """
+    status = INFER_EXIT_STATUS.get(rc)
+    return (
+        status is not None
+        and obj.get("status") == status
+        and "step" not in obj
+        and isinstance(obj.get("id"), str)
+    )
 
 
 def _step_check(
@@ -1199,8 +1212,7 @@ def _step_check(
     if name == "infer":
         # B の単発 infer は `--id` を付けないので、id は既定値（`DEFAULT_TEXT_ID`）でなければ不合格
         return (
-            rc == 0
-            and _infer_envelope_ok(obj)
+            _infer_envelope_ok(obj, rc)
             and obj.get("id") == DEFAULT_TEXT_ID
             and check_infer_output(obj, facts)
         )
@@ -1344,7 +1356,7 @@ def run_pipeline(
             "infer",
             ["infer", "--package", "project/package", "--text", sample_text],
             INFER_COMMAND_DISPLAY,
-            set(),
+            set(INFER_EXIT_STATUS) - {0},
         )
         if failure:
             return steps, package_obj, failure
@@ -1873,7 +1885,8 @@ def compare_infer(
 ) -> dict[str, Any]:
     """バッチと単体の `infer` 結果を id で突き合わせる（REQ-28）。id の値は件数欄に含めない。
 
-    `predicted_label` が str でない・両側で異なる行、スコアに NaN・無限大・非数がある行は不一致。
+    `predicted_label` が str でない・両側で異なる行、スコアに NaN・無限大・非数がある行、
+    `status`（`ok`・`out_of_scope`・`abstain`。REQ-22）が両側で異なる行は不一致。
     `max_abs_score_diff` は有限の差だけから求める（非有限は `scores_nonfinite` として数える）。
     スコアが完全一致（`==`）でない行の id も `mismatch_ids` に入れる（同一実装の単体とバッチは
     スコアも完全一致という決まり。`SCORE_TOLERANCE` は使わない）。`max_abs_score_diff` は
@@ -1910,7 +1923,7 @@ def compare_infer(
         else:
             nonfinite += 1
         # スコアが完全一致でない行も mismatch_ids へ入れる（件数欄の意味は変えない）
-        if not same_label or not finite or bs != ss:
+        if not same_label or not finite or bs != ss or b.get("status") != s.get("status"):
             mismatch_ids.append(rid)
     return {
         "label_match": label_match,
@@ -1973,7 +1986,11 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
             v = _loads(line)
         except ValueError:
             return fail_item("invalid_json", step="infer-batch", exit_code=0)
-        if not isinstance(v, dict) or not _infer_envelope_ok(v):
+        # バッチは exit 0 で、各行の `status` は対象外・保留を含む 3 値のどれか（REQ-22）
+        if not isinstance(v, dict):
+            return fail_item("unexpected_output", step="infer-batch", exit_code=0)
+        row_rc = next((c for c, st in INFER_EXIT_STATUS.items() if st == v.get("status")), None)
+        if row_rc is None or not _infer_envelope_ok(v, row_rc):
             return fail_item("unexpected_output", step="infer-batch", exit_code=0)
         # 出力は入力順（crates/cli/src/infer_batch.rs）。dict へ入れる前に行ごとに順序を確かめる
         if v["id"] != expected_id:
@@ -1996,24 +2013,26 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
             CAP_CLI_STDERR,
             ctx.offline_env,
         )
-        if r.reason is not None or r.exit_code != 0:
+        # 単発は対象外 11・保留 12 も、`status` が終了コードに対応すれば正常（REQ-21・REQ-22）
+        if r.reason is not None or r.exit_code not in INFER_EXIT_STATUS:
             reason = r.reason or "unexpected_exit_code"
             return fail_item(reason, step="infer-single", exit_code=r.exit_code)
         obj = parse_json_object(edir / "single.stdout", CAP_CLI_STDOUT)
         if (
             obj is None
-            or not _infer_envelope_ok(obj)
+            or not _infer_envelope_ok(obj, r.exit_code)
             or obj.get("id") != rid
             or not check_infer_output(obj, facts)
         ):
-            return fail_item("unexpected_output", step="infer-single", exit_code=0)
+            return fail_item("unexpected_output", step="infer-single", exit_code=r.exit_code)
         single[rid] = obj
     cmp = compare_infer(batch, single)
     ids = cmp.pop("mismatch_ids")
     write_text_nofollow(edir / "mismatch-ids.txt", "".join(i + "\n" for i in ids))
-    # 合否はラベル全件一致・非有限 0 件・スコア全件完全一致。max_abs_score_diff は参考値
+    # 合否はラベル・status 全件一致・非有限 0 件・スコア全件完全一致。max_abs_score_diff は参考値
     ok = (
-        cmp["label_mismatch"] == 0
+        not ids
+        and cmp["label_mismatch"] == 0
         and cmp["scores_nonfinite"] == 0
         and cmp["scores_exact_match"] == len(single)
     )
