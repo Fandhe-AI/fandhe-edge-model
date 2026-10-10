@@ -111,6 +111,9 @@ pub const RESULT_FILE: &str = "result.json";
 pub const TRAIN_INPUT_FILE: &str = "train_input.jsonl";
 /// 候補ディレクトリ内の学習ジョブ作業ディレクトリ。
 pub const JOB_DIR: &str = "job";
+/// `job/` 内のキャンセル要求（空ファイル。`train --cancel` が `O_EXCL` で作り、実行中の `train` が監視する。
+/// REQ-34・#484）。
+pub const CANCEL_REQUEST_FILE: &str = "cancel.request";
 /// 候補ディレクトリ内の学習ワーカーの出力先（種類ごとに `-<kind>` が付く。REQ-19）。
 pub const MODEL_DIR: &str = "model";
 

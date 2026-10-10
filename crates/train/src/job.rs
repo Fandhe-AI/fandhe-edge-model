@@ -32,7 +32,9 @@
 //!   （supervisor が自ら解放）では公開場所に何も残らず、確定済みなら
 //!   `Cancelling` → `Succeeded`（`Completed`）になる（#145・TASK-34.1-2。
 //!   [`crate::process`] のモジュール doc「キャンセル」）。遷移表は変えない。
-//! - キャンセルの終了コード写像は TASK-33.x の承認事項。
+//! - CLI への露出（`train --status`・`train --cancel`・キャンセルの終了コード写像〔70〕）は
+//!   `fandhe-edge-cli` の `stages::train`（#485・#484）。CLI はキャンセル要求ファイルの出現を
+//!   [`JobHandle::cancel`] へ渡すだけで、本モジュールの遷移・停止の手順は変えない。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -115,8 +117,10 @@ pub const fn transition(from: JobState, event: JobEvent) -> Result<JobState, Inv
     }
 }
 
-/// [`JobHandle::cancel`] の結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`JobHandle::cancel`] の結果。CLI の `train --cancel` の `cancel` 値も同じ語彙
+/// （`requested|already_cancelling|already_finished`。#484）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancelOutcome {
     /// キャンセルを受け付けた。
     Requested,

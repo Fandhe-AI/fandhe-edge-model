@@ -26,7 +26,7 @@
 #[cfg(unix)]
 mod suite {
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, Output, Stdio};
 
     use fandhe_edge_core::definition::Definition;
     use fandhe_edge_core::hash::Sha256Digest;
@@ -125,6 +125,20 @@ mod suite {
                 .expect("run fandhe-edge")
         }
 
+        /// CLI を cwd = `work/` で起動したまま返す（stdout は回収用に pipe。キャンセルの確認用。#484）。
+        fn spawn(&self, args: &[&str]) -> Running {
+            Running(Some(
+                Command::new(env!("CARGO_BIN_EXE_fandhe-edge"))
+                    .args(args)
+                    .current_dir(&self.work)
+                    .env("FANDHE_EDGE_TRAINER_DIR", &self.trainer)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("spawn fandhe-edge"),
+            ))
+        }
+
         /// 実行して終了コードと stdout（1 呼び出し 1 JSON のため末尾改行つきの 1 行）を返す。
         fn run(&self, args: &[&str]) -> (i32, String) {
             let out = self.cli(args);
@@ -161,6 +175,35 @@ mod suite {
     impl Drop for Env {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// 起動中の CLI。テストが途中で失敗しても drop で止める（止めると偽ワーカーは stdin の EOF で、孫は
+    /// lifeline の EOF で終わる）。
+    struct Running(Option<Child>);
+
+    impl Running {
+        /// 終了を待ち、終了コードと stdout を返す。
+        fn finish(mut self) -> (i32, String) {
+            let out = self
+                .0
+                .take()
+                .expect("child")
+                .wait_with_output()
+                .expect("wait fandhe-edge");
+            (
+                out.status.code().expect("exit code"),
+                String::from_utf8(out.stdout).expect("utf8 stdout"),
+            )
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 
@@ -1155,6 +1198,213 @@ mod suite {
         );
         let job = std::fs::read_to_string(job_dir.join("job.json")).expect("job");
         assert!(job.contains("\"state\":\"succeeded\""), "{job}");
+    }
+
+    /// 偽ワーカーが孫の pid を書くファイル（プロジェクト直下。#484）。
+    const GRANDCHILD_PID_FILE: &str = "grandchild.pid";
+
+    /// `out_dir_action:"reuse_allowed"` のやり直し案内（協調キャンセルで何も残っていない。#484）。
+    const RESTART_REUSE_ALLOWED: &str = "{\"resumable\":false,\"action\":\"restart_from_scratch\",\"reason_code\":\"resume_not_supported\",\"out_dir_action\":\"reuse_allowed\",\"message\":\"Resume is not supported. Restart the job from scratch; the same out_dir can be reused.\"}";
+
+    /// `train --cancel` の対象が無いときの stdout（#484）。
+    const NO_CANCELLATIONS: &str = "{\"step\":\"train\",\"status\":\"ok\",\"cancellations\":[]}\n";
+
+    /// 候補 `candidate` の `train --cancel` の stdout（1 件。#484）。
+    fn cancellation(candidate: usize, cancel: &str) -> String {
+        format!(
+            "{{\"step\":\"train\",\"status\":\"ok\",\"cancellations\":[{{\"candidate\":{candidate},\"cancel\":\"{cancel}\"}}]}}\n"
+        )
+    }
+
+    /// キャンセルで終わった候補 `candidate` の `train` の stdout（#484）。
+    fn cancelled_line(candidate: usize) -> String {
+        format!(
+            "{{\"code\":\"runtime_error\",\"message\":\"training cancelled\",\"step\":\"train\",\"candidate\":{candidate},\"job\":{{\"state\":\"cancelled\",\"crash_detected\":false,\"failure\":null,\"record_updated\":false}},\"restart\":{RESTART_REUSE_ALLOWED}}}\n"
+        )
+    }
+
+    /// `cond` が真になるまで上限つき（60 秒）でポーリングする（負荷下でも固定の sleep に頼らない）。
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// 偽ワーカーが孫を起動して pid を書くまで待つ。
+    fn wait_grandchild_pid(env: &Env) -> u32 {
+        let path = env.project_file(GRANDCHILD_PID_FILE);
+        let mut pid = None;
+        wait_until("grandchild pid", || {
+            pid = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.parse().ok());
+            pid.is_some()
+        });
+        pid.expect("pid")
+    }
+
+    /// `pid` のプロセスが生きているか。`ps -A -o pid=,stat=` の一覧全体から探し、ゾンビ（`Z`）は終了済み
+    /// とみなす（`kill -0` はゾンビにも成功するため使わない）。
+    fn process_alive(pid: u32) -> bool {
+        let out = Command::new("/bin/ps")
+            .args(["-A", "-o", "pid=,stat="])
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .expect("run ps");
+        assert!(out.status.success(), "ps failed");
+        let pid = pid.to_string();
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let mut cols = line.split_whitespace();
+            cols.next() == Some(pid.as_str()) && cols.next().is_some_and(|st| !st.starts_with('Z'))
+        })
+    }
+
+    /// REQ-34・REQ-39・TASK-34.1・#484: 実行中の `train --candidate N` を別プロセスの `train --cancel` で止める。
+    /// `--cancel` は要求を置いて即座に `requested` を返し、`train` は 70・`training cancelled`・`job.state:
+    /// "cancelled"`・やり直し案内つきで終わる。`result.json` は無く、学習ワーカーの孫プロセスも終了している。
+    /// 対象 0 件は `[]`、記録の無い `--candidate` は 64、終端のジョブは `already_finished`。候補ディレクトリは
+    /// 残り、次の `train --candidate N` が丸ごと消して学習し直せる。
+    pub fn req34_issue484_cancel_stops_running_train_and_descendants() {
+        let env = inspected("traincancel");
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            NO_CANCELLATIONS
+        );
+        assert_eq!(
+            env.fails(
+                &[
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--cancel",
+                    "--candidate",
+                    "0"
+                ],
+                64,
+                "invalid_input"
+            ),
+            "{\"code\":\"invalid_input\",\"message\":\"job record not found\"}\n"
+        );
+        std::fs::write(env.project_file("cancel_worker"), "").expect("marker");
+        let train = env.spawn(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let grandchild = wait_grandchild_pid(&env);
+        assert!(
+            process_alive(grandchild),
+            "grandchild must be running before cancel"
+        );
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            cancellation(0, "requested")
+        );
+        assert_eq!(train.finish(), (70, cancelled_line(0)));
+        assert!(!env.project_file("candidates/0/result.json").exists());
+        assert!(
+            env.project_file("candidates/0/job/cancel.request")
+                .is_file()
+        );
+        wait_until("grandchild exit", || !process_alive(grandchild));
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            NO_CANCELLATIONS
+        );
+        assert_eq!(
+            env.ok(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--cancel",
+                "--candidate",
+                "0"
+            ]),
+            cancellation(0, "already_finished")
+        );
+        std::fs::remove_file(env.project_file("cancel_worker")).expect("marker");
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":0,\"kind\":\"c1\"}\n"
+        );
+        let job =
+            std::fs::read_to_string(env.project_file("candidates/0/job/job.json")).expect("job");
+        assert!(job.contains("\"state\":\"succeeded\""), "{job}");
+        assert!(!env.project_file("candidates/0/job/cancel.request").exists());
+    }
+
+    /// REQ-34・#484: キャンセル要求が既にある実行中のジョブは `already_cancelling`（要求は 1 つだけ）。
+    /// 所有者が消えたジョブは `--status` と同じく `failed`＋`owner_lost` へ書き戻され、`already_finished`
+    /// （`--candidate` 省略時は対象外）。
+    pub fn req34_issue484_cancel_outcomes_follow_job_record() {
+        let env = inspected("cancelrecord");
+        let job_dir = env.project_file("candidates/1/job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        let job_dir = std::fs::canonicalize(job_dir).expect("canonical");
+        let recorder =
+            fandhe_edge_train::job_record::JobRecorder::begin(&job_dir, 100).expect("begin");
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            cancellation(1, "requested")
+        );
+        assert_eq!(
+            std::fs::read(job_dir.join("cancel.request")).expect("request"),
+            b""
+        );
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            cancellation(1, "already_cancelling")
+        );
+        assert_eq!(
+            env.ok(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--cancel",
+                "--candidate",
+                "1"
+            ]),
+            cancellation(1, "already_cancelling")
+        );
+        drop(recorder);
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            NO_CANCELLATIONS
+        );
+        assert_eq!(
+            env.ok(&[
+                "train",
+                "--project-dir",
+                "proj",
+                "--cancel",
+                "--candidate",
+                "1"
+            ]),
+            cancellation(1, "already_finished")
+        );
+        let job = std::fs::read_to_string(job_dir.join("job.json")).expect("job");
+        assert!(job.contains("\"owner_lost\""), "{job}");
+    }
+
+    /// REQ-34・REQ-18・REQ-39・TASK-34.1・#484: `train --all` の実行中のキャンセルは探索全体の中断。`train` は
+    /// 70・`training cancelled` の中断報告で終わり、候補ディレクトリ・`candidates/` を残さず、`search_record.json`
+    /// も書かない。学習ワーカーの孫プロセスも終了している。
+    pub fn req34_issue484_cancel_aborts_train_all() {
+        let env = inspected("cancelall");
+        std::fs::write(env.project_file("cancel_worker"), "").expect("marker");
+        let train = env.spawn(&["train", "--project-dir", "proj", "--all"]);
+        let grandchild = wait_grandchild_pid(&env);
+        assert!(
+            process_alive(grandchild),
+            "grandchild must be running before cancel"
+        );
+        assert_eq!(
+            env.ok(&["train", "--project-dir", "proj", "--cancel"]),
+            cancellation(0, "requested")
+        );
+        assert_eq!(train.finish(), (70, cancelled_line(0)));
+        assert!(!env.project_file("candidates").exists());
+        assert!(!env.project_file("search_record.json").exists());
+        wait_until("grandchild exit", || !process_alive(grandchild));
     }
 
     /// REQ-23・TASK-23.2: 学習ワーカーの空入力の前処理が推論ランタイムと食い違う結果を返すと、`train` は
@@ -4341,11 +4591,51 @@ mod suite {
         );
     }
 
+    /// 偽ワーカーが起動する孫プロセス（`_worker` 役）の argv（#484）。
+    pub const FAKE_GRANDCHILD_ARG: &str = "--fake-grandchild";
+
+    /// 孫プロセス本体: lifeline（stdin）の EOF＝親（supervisor 役）の終了まで待って終わる（実際の `_worker` の
+    /// lifeline と同じく、親が消えたら自ら終了する）。
+    pub fn run_fake_grandchild() -> ! {
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+        std::process::exit(0);
+    }
+
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
         let bytes = std::fs::read(request_path).expect("read request");
         let request = TrainRequest::from_json_slice(&bytes).expect("valid request");
         let out_dir = format!("{}/{}", request.root(), request.out_dir());
+        // キャンセルの模擬（#484）: 目印があれば supervisor 役として、lifeline（孫の stdin）の書き込み端を
+        // 握ったまま孫を起動し、pid をプロジェクト直下へ書いてから stdin の EOF（Rust 側の協調キャンセル）を
+        // 待つ。EOF を受けたら supervisor と同じ所定のキャンセル応答（exit 70）を返して終わる（`out_dir` は
+        // 予約しない＝残置なし）。孫は lifeline の EOF で自ら終了する（このプロセスは孫を止めない）。
+        let project_dir = Path::new(request.root()).join("../..");
+        if project_dir.join("cancel_worker").exists() {
+            let mut grandchild = Command::new(std::env::current_exe().expect("current exe"))
+                .arg(FAKE_GRANDCHILD_ARG)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn grandchild");
+            let lifeline = grandchild.stdin.take();
+            let tmp = project_dir.join("grandchild.pid.tmp");
+            std::fs::write(&tmp, grandchild.id().to_string()).expect("write pid");
+            std::fs::rename(&tmp, project_dir.join(GRANDCHILD_PID_FILE)).expect("publish pid");
+            std::thread::spawn(move || {
+                let _ = grandchild.wait();
+            });
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            print!(
+                r#"{{"status":"error","code":"runtime_error","message":"training cancelled by caller"}}"#
+            );
+            drop(lifeline);
+            std::process::exit(70);
+        }
         std::fs::create_dir(&out_dir).expect("create out dir");
         // 失敗の模擬: プロジェクト直下に目印があれば、出力の残骸を残して異常終了する
         // （`root` は `<project>/candidates/<N>`）。
@@ -4456,6 +4746,9 @@ fn main() -> std::process::ExitCode {
     {
         let request = args.get(5).expect("request path");
         suite::run_fake_worker(request);
+    }
+    if args.get(1).map(String::as_str) == Some(suite::FAKE_GRANDCHILD_ARG) {
+        suite::run_fake_grandchild();
     }
     let tests: &[(&str, fn())] = &[
         (
@@ -4657,6 +4950,18 @@ fn main() -> std::process::ExitCode {
         (
             "req34_running_job_blocks_train_until_owner_is_lost",
             suite::req34_running_job_blocks_train_until_owner_is_lost,
+        ),
+        (
+            "req34_issue484_cancel_stops_running_train_and_descendants",
+            suite::req34_issue484_cancel_stops_running_train_and_descendants,
+        ),
+        (
+            "req34_issue484_cancel_outcomes_follow_job_record",
+            suite::req34_issue484_cancel_outcomes_follow_job_record,
+        ),
+        (
+            "req34_issue484_cancel_aborts_train_all",
+            suite::req34_issue484_cancel_aborts_train_all,
         ),
         (
             "req34_issue486_limit_exceeded_job_is_reported_as_interrupted",

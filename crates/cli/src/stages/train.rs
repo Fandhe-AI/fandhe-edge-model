@@ -46,6 +46,25 @@
 //! 返す。学習の副作用が無いため凍結の検査はしない。書き込みは `running` の残骸を `failed`＋`owner_lost` へ
 //! 書き戻す `job.json` だけ（MCP では参照系だが、この書き戻しを伴う。REQ-36）。
 //!
+//! # `--cancel` とキャンセル（REQ-34・REQ-39・TASK-34.1・#484）
+//!
+//! [`cancel`] は実行中（`running`・`cancelling`）のジョブの `job/` に空のキャンセル要求
+//! `cancel.request` を保持 fd 起点・`O_EXCL` で作って即座に戻る（非同期。既にあれば `already_cancelling`、
+//! 終端なら `already_finished`）。シグナル・PID は使わない。学習の副作用が無いため凍結の検査はしない。
+//! MCP（REQ-36）では学習と同じく副作用の大きい群に置く（`--status` は参照系）。
+//!
+//! 実行中の `train`（単発・`--all` 共通の [`run_recorded_job`]）は監視スレッドで `cancel.request` の出現を
+//! [`CANCEL_POLL_INTERVAL`] ごとに確かめ、現れたら [`fandhe_edge_train::job::JobHandle::cancel`] でキャンセルを
+//! 立てる。以降は学習ワーカー層の協調キャンセル（stdin の EOF。猶予の後は `SIGKILL`、子孫は supervisor の
+//! `killpg` と lifeline。REQ-39）。キャンセルで終わった単発の `train` は `runtime_error`（70）・
+//! `message:"training cancelled"` の [`TrainInterruptedReport`]（`job.state:"cancelled"`）で、候補ディレクトリは
+//! 残す（次の `train` が「ジョブ記録とやり直し」の規則で消す）。`out_dir` が公開済みの可能性があれば
+//! `CancelOutcomeUnconfirmed`（`failed`・70）。`--all` のキャンセルは探索全体の中断で、全候補ディレクトリを
+//! 片付け、`search_record.json` は書かずに同じ形の 70 を返す。
+//!
+//! Ctrl-C（`SIGINT`）にはハンドラを置かない（既知の限界）。端末から止めた `train` の記録は `running` のまま
+//! 残り、次の `--status` が `failed`＋`owner_lost` として検出する（子孫は lifeline で止まる）。
+//!
 //! # 記録の読み書きの閉じ込め（REQ-39・#510）
 //!
 //! `candidates/<N>/` と `job/` は保持 fd 起点（`O_NOFOLLOW`）で開き、`job/` の中の `job.json`・`job.lock`・
@@ -73,6 +92,9 @@
 //! （ビルド時の `CARGO_MANIFEST_DIR` 起点）。配布形態は未確定のため暫定（オーナー確認事項）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
@@ -82,7 +104,7 @@ use fandhe_edge_data::preprocess_boundary::{EmptyInputConsistency, compare_empty
 use fandhe_edge_data::split::{Split, SplitResult};
 use fandhe_edge_data::split_record::SplitRecord;
 use fandhe_edge_train::error::TrainProcessError;
-use fandhe_edge_train::job::{JobState, TrainJob};
+use fandhe_edge_train::job::{CancelOutcome, JobHandle, JobState, TrainJob};
 use fandhe_edge_train::job_record::{
     JobDirOps, JobRecordError, JobStatusReport, read_job_status_in, unix_now,
 };
@@ -99,8 +121,9 @@ use fandhe_edge_train::search::{
     run_search,
 };
 use fandhe_edge_train::stage_files::{
-    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainInterruptedReport, TrainStatusEntry,
-    allotted_time_limit_seconds, outcome_json_vec, search_record_json_vec, trainer_jsonl,
+    MAX_SEARCH_RECORD_BYTES, StageFileError, TrainCancelEntry, TrainInterruptedReport,
+    TrainStatusEntry, allotted_time_limit_seconds, outcome_json_vec, search_record_json_vec,
+    trainer_jsonl,
 };
 use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
@@ -113,9 +136,9 @@ use super::inspect::split_rows;
 use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
-    CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR, Project, REQUEST_FILE,
-    RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid,
-    runtime,
+    CANCEL_REQUEST_FILE, CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR,
+    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE,
+    TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -413,6 +436,7 @@ fn train_in_candidate_dir(
 
     let (outcome, restart) = run_recorded_job(launcher, request, job_dir).map_err(|e| match e {
         RecordedJobError::Run(e, restart) => TrainFailure::job(e.to_error_report(), restart),
+        RecordedJobError::Cancelled(restart) => TrainFailure::job(cancelled_report(), restart),
         RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
             TrainFailure::cleanup(e.to_error_report())
         }
@@ -439,8 +463,35 @@ enum RecordedJobError {
     /// ジョブが失敗した（終端記録は `failed`。書けなかった場合も次の状態確認が `owner_lost` を検出する）。
     /// 実行結果から決めたやり直し案内（[`guidance_for_run`]）を添える。
     Run(TrainProcessError, Option<RestartGuidance>),
+    /// キャンセル要求（`cancel.request`）で止めた（終端記録は `cancelled`。#484）。
+    Cancelled(Option<RestartGuidance>),
     /// 学習は成功したが終端記録を書けなかった（記録と結果が食い違うため成功として扱わない）。
     Record(JobRecordError),
+}
+
+/// キャンセルで終わった学習ジョブの報告（`runtime_error`・70。#484）。
+fn cancelled_report() -> ErrorReport {
+    runtime("training cancelled")
+}
+
+/// 実行中の `train` が `cancel.request` を確かめる間隔（#484）。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `job_dir` に `cancel.request` が現れるまで [`CANCEL_POLL_INTERVAL`] ごとに確かめ、現れたら `handle` で
+/// キャンセルを立てて戻る。`stop` の送り手が drop されたら（ジョブの終了）すぐ戻る（REQ-34・#484）。
+///
+/// 確認は保持 fd 起点・`O_NOFOLLOW`（[`member_exists`]）。symlink 等も「ある」とみなしてキャンセルへ倒す。
+fn watch_cancel_request(job_dir: &ConfinedPackage, handle: &JobHandle, stop: &Receiver<()>) {
+    loop {
+        if matches!(member_exists(job_dir, CANCEL_REQUEST_FILE), Ok(true)) {
+            handle.cancel();
+            return;
+        }
+        match stop.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// 学習ジョブを保持した `job_dir` に記録しながら実行する（単発の `train` と `train --all` が共有する。
@@ -454,28 +505,30 @@ fn run_recorded_job(
     job_dir: ConfinedPackage,
 ) -> Result<(TrainOutcome, Option<RestartGuidance>), RecordedJobError> {
     let path = job_dir.dir().to_path_buf();
-    let recorded = TrainJob::new()
-        .run_recorded_in(
+    let job_dir = Arc::new(job_dir);
+    let job = TrainJob::new();
+    let handle = job.handle();
+    // ジョブの実行中だけ `cancel.request` を監視する（#484）。`stop` を drop すると監視は即座に終わる。
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let recorded = std::thread::scope(|scope| {
+        let watched = Arc::clone(&job_dir);
+        scope.spawn(move || watch_cancel_request(&watched, &handle, &stopped));
+        let recorded = job.run_recorded_in(
             launcher,
             request,
             &path,
             Box::new(ConfinedJobDir(job_dir)),
             &RunLimits::for_request(request),
-        )
-        .map_err(RecordedJobError::Begin)?;
+        );
+        drop(stop);
+        recorded
+    })
+    .map_err(RecordedJobError::Begin)?;
     // 案内は写像の前の実行結果から決める（キャンセルは残置の観測を使う。#486）。
     let restart = guidance_for_run(&recorded.run);
     let outcome = match recorded.run {
         Ok(TrainRunEnd::Completed(run)) => run.outcome().clone(),
-        // キャンセルの口を持たないため起こらない。`run_train` と同じ写像にする（キャンセルは #484）。
-        Ok(TrainRunEnd::Cancelled(_)) => {
-            return Err(RecordedJobError::Run(
-                TrainProcessError::Wait {
-                    kind: std::io::ErrorKind::Interrupted,
-                },
-                restart,
-            ));
-        }
+        Ok(TrainRunEnd::Cancelled(_)) => return Err(RecordedJobError::Cancelled(restart)),
         Err(e) => return Err(RecordedJobError::Run(e, restart)),
     };
     match (recorded.record, &outcome) {
@@ -498,7 +551,7 @@ fn job_status_in(candidate_dir: &ConfinedPackage) -> Result<Option<JobStatusRepo
         }
         Err(e) => return Err(e.to_error_report()),
     };
-    match read_job_status_in(&ConfinedJobDir(job_dir), unix_now()) {
+    match read_job_status_in(&ConfinedJobDir(Arc::new(job_dir)), unix_now()) {
         Ok(report) => Ok(Some(report)),
         // `job.json`・`job.lock` のどちらも無い（ジョブを開始する前に止まった）。
         Err(JobRecordError::Io {
@@ -513,8 +566,10 @@ fn job_status_in(candidate_dir: &ConfinedPackage) -> Result<Option<JobStatusRepo
 ///
 /// 名前は `job/` 直下の 1 成分だけ。各操作は保持 fd の実パスが開いた時点の場所の配下にあることも
 /// 確かめ、`job/` が移動・差し替えられていれば拒否する（[`JobRecordError::InvalidJobDir`]）。
+///
+/// 実行中の `train` は同じ fd を `cancel.request` の監視とも共有するため `Arc` で持つ（#484）。
 #[derive(Debug)]
-pub(crate) struct ConfinedJobDir(pub(crate) ConfinedPackage);
+pub(crate) struct ConfinedJobDir(pub(crate) Arc<ConfinedPackage>);
 
 /// ガード層の拒否をジョブ記録のエラーへ写す（パス・内容は含めない）。
 fn job_dir_error(e: PathRejection) -> JobRecordError {
@@ -603,14 +658,72 @@ pub fn status(
     candidate: Option<usize>,
     cwd: &Path,
 ) -> Result<Vec<TrainStatusEntry>, ErrorReport> {
+    visit_jobs(args, candidate, cwd, |index, _, job| {
+        Ok(Some(TrainStatusEntry::new(index, job)))
+    })
+}
+
+/// `train --cancel [--candidate N]`（REQ-34・REQ-39・TASK-34.1・#484。モジュール doc「`--cancel` とキャンセル」）。
+///
+/// 非終端のジョブには `job/cancel.request` を保持 fd 起点・`O_EXCL` で作って `requested`（既にあれば
+/// `already_cancelling`）、終端のジョブは `already_finished`（何も作らない）。`candidate` 省略時は非終端
+/// （`running`・`cancelling`）の候補だけを添字順に返す（無ければ空）。要求を置くだけで、止まるのは待たない。
+/// 状態の読み取りは [`status`] と同じ（`running` の残骸は `failed`＋`owner_lost` へ書き戻した上で
+/// `already_finished`）。凍結の検査はしない。
+///
+/// # Errors
+/// [`status`] と同じ。`cancel.request` を作れない（I/O 失敗・`job/` の差し替え）場合は経路の拒否の写像。
+pub fn cancel(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+) -> Result<Vec<TrainCancelEntry>, ErrorReport> {
+    visit_jobs(args, candidate, cwd, |index, dir, job| {
+        let outcome = if job.state.is_terminal() {
+            if candidate.is_none() {
+                return Ok(None);
+            }
+            CancelOutcome::AlreadyFinished
+        } else {
+            request_cancel(dir)?
+        };
+        Ok(Some(TrainCancelEntry::new(index, outcome)))
+    })
+}
+
+/// 保持した候補ディレクトリ `candidate_dir` の `job/` にキャンセル要求を `O_EXCL` で作る（#484）。
+fn request_cancel(candidate_dir: &ConfinedPackage) -> Result<CancelOutcome, ErrorReport> {
+    let job_dir = candidate_dir
+        .open_subdir(Path::new(JOB_DIR))
+        .map_err(|e| e.to_error_report())?;
+    match job_dir.create_new_private_member(Path::new(CANCEL_REQUEST_FILE)) {
+        Ok(_) => Ok(CancelOutcome::Requested),
+        Err(PathRejection::Unresolvable { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            Ok(CancelOutcome::AlreadyCancelling)
+        }
+        Err(e) => Err(e.to_error_report()),
+    }
+}
+
+/// 記録のある候補のジョブ状態を添字順に `visit` へ渡し、`Some` を集める（[`status`]・[`cancel`] の共通部。
+/// 候補ディレクトリの fd は 1 件ずつ開いて閉じる）。`candidate` 指定時はその候補だけで、記録が無ければ
+/// `invalid_input`（64）`job record not found`。
+fn visit_jobs<T>(
+    args: &TrainArgs,
+    candidate: Option<usize>,
+    cwd: &Path,
+    mut visit: impl FnMut(usize, &ConfinedPackage, JobStatusReport) -> Result<Option<T>, ErrorReport>,
+) -> Result<Vec<T>, ErrorReport> {
     let project = Project::open(cwd, &args.project_dir)?;
     if let Some(index) = candidate {
-        let job = match project.open_subdir_optional(candidate_rel(index))? {
-            Some(dir) => job_status_in(&dir)?,
-            None => None,
-        }
-        .ok_or_else(|| invalid("job record not found"))?;
-        return Ok(vec![TrainStatusEntry::new(index, job)]);
+        let not_found = || invalid("job record not found");
+        let dir = project
+            .open_subdir_optional(candidate_rel(index))?
+            .ok_or_else(not_found)?;
+        let job = job_status_in(&dir)?.ok_or_else(not_found)?;
+        return Ok(visit(index, &dir, job)?.into_iter().collect());
     }
     let Some(candidates_dir) = project.open_subdir_optional(CANDIDATES_DIR)? else {
         return Ok(Vec::new());
@@ -644,8 +757,10 @@ pub fn status(
             }
             Err(e) => return Err(e.to_error_report()),
         };
-        if let Some(job) = job_status_in(&dir)? {
-            jobs.push(TrainStatusEntry::new(index, job));
+        if let Some(job) = job_status_in(&dir)?
+            && let Some(entry) = visit(index, &dir, job)?
+        {
+            jobs.push(entry);
         }
     }
     Ok(jobs)
@@ -702,6 +817,7 @@ pub fn run_all(
                 run_recorded_job(&launcher, request, job_dir)
                     .map_err(|e| match e {
                         RecordedJobError::Run(e, restart) => AllRunError::Process(e, restart),
+                        RecordedJobError::Cancelled(restart) => AllRunError::Cancelled(restart),
                         RecordedJobError::Begin(e) | RecordedJobError::Record(e) => {
                             AllRunError::Report(e.to_error_report())
                         }
@@ -819,7 +935,11 @@ where
             let interrupted = match &error {
                 SearchError::Candidate {
                     index,
-                    source: CandidateTimeError::Runner(AllRunError::Process(_, Some(restart))),
+                    source:
+                        CandidateTimeError::Runner(
+                            AllRunError::Process(_, Some(restart))
+                            | AllRunError::Cancelled(Some(restart)),
+                        ),
                 } => Some((*index, *restart, candidate_job_status(&project, *index))),
                 _ => None,
             };
@@ -899,6 +1019,11 @@ fn search_error_report(error: SearchError<AllRunError>) -> ErrorReport {
             source: CandidateTimeError::Runner(AllRunError::Process(process, _)),
             ..
         } => process.to_error_report(),
+        // キャンセルは探索全体の中断（#484）。
+        SearchError::Candidate {
+            source: CandidateTimeError::Runner(AllRunError::Cancelled(_)),
+            ..
+        } => cancelled_report(),
         _ => runtime("candidate search failed"),
     }
 }
@@ -908,6 +1033,8 @@ enum AllRunError {
     /// 子プロセスの失敗と、実行結果のやり直し案内（[`guidance_for_run`]。ジョブを記録しない偽の実行は
     /// `None` で、探索を中断しても従来の 2 キーで報告する）。
     Process(TrainProcessError, Option<RestartGuidance>),
+    /// `cancel.request` で学習ジョブを止めた（探索全体を中断する。#484）と、そのやり直し案内。
+    Cancelled(Option<RestartGuidance>),
     Report(ErrorReport),
 }
 
@@ -2297,11 +2424,11 @@ mod status_tests {
     /// 保持 fd で開いた `candidates/0/job` の [`ConfinedJobDir`]。
     fn held_job_dir(cwd: &Path) -> ConfinedJobDir {
         let project = Project::open(cwd, Path::new("proj")).expect("project");
-        ConfinedJobDir(
+        ConfinedJobDir(Arc::new(
             project
                 .open_subdir(candidate_rel(0).join(JOB_DIR))
                 .expect("job dir"),
-        )
+        ))
     }
 
     /// REQ-39・REQ-34・#510: `--status` の状態確認は、検証（`job/` を保持 fd で開く）後に親の
