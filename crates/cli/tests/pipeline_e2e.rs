@@ -183,18 +183,20 @@ mod suite {
     struct Running(Option<Child>);
 
     impl Running {
-        /// 終了を待ち、終了コードと stdout を返す。
+        /// 終了を上限つき（60 秒。超えたら drop で止めて失敗）で待ち、終了コードと stdout を返す。stdout は
+        /// 1 行の JSON だけなので、終了まで読まずに待っても pipe は詰まらない。
         fn finish(mut self) -> (i32, String) {
-            let out = self
-                .0
-                .take()
-                .expect("child")
-                .wait_with_output()
-                .expect("wait fandhe-edge");
-            (
-                out.status.code().expect("exit code"),
-                String::from_utf8(out.stdout).expect("utf8 stdout"),
-            )
+            let child = self.0.as_mut().expect("child");
+            let mut status = None;
+            wait_until("train exit", || {
+                status = child.try_wait().expect("try_wait fandhe-edge");
+                status.is_some()
+            });
+            let mut stdout = String::new();
+            std::io::Read::read_to_string(&mut child.stdout.take().expect("stdout"), &mut stdout)
+                .expect("read stdout");
+            self.0 = None;
+            (status.and_then(|s| s.code()).expect("exit code"), stdout)
         }
     }
 
