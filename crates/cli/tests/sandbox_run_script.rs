@@ -112,8 +112,8 @@ impl Env {
                  exit 0\n\
                  fi\n\
                  if [ \"$stage\" = infer ]; then\n\
-                 echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
-                 exit 0\n\
+                 printf '{{\"id\":\"input\",\"status\":\"%s\",\"predicted_label\":\"a\"}}\\n' \"${{FAKE_INFER_STATUS:-ok}}\"\n\
+                 exit \"${{FAKE_INFER_RC:-0}}\"\n\
                  fi\n\
                  printf '{{\"step\":\"%s\",\"status\":\"ok\"}}\\n' \"$stage\"\n\
                  exit 0\n",
@@ -433,6 +433,34 @@ fn req21_stops_at_failing_train_with_limit_exceeded() {
     assert!(o.stdout.starts_with("{\"code\":\"limit_exceeded\""));
     assert!(o.stdout.contains("\"failed_step\":\"train\""));
     assert_eq!(e.cli_calls(), ["register -", "inspect -", "train 0"]);
+}
+
+/// REQ-21・REQ-22・#478・#497: infer の対象外（11）・保留（12）は判定行の status が一致すれば完了として
+/// 扱い（exit 0）、記録には元の終了コードを残す。status が食い違えば 70 で止める。
+#[test]
+fn req22_infer_out_of_scope_and_abstain_complete_the_run() {
+    for (rc, status, code) in [
+        ("11", "out_of_scope", "out_of_scope"),
+        ("12", "abstain", "pending"),
+    ] {
+        let e = Env::new();
+        let o = e.run(
+            &e.base_args(),
+            &[("FAKE_INFER_RC", rc), ("FAKE_INFER_STATUS", status)],
+        );
+        assert_eq!(o.code, Some(0), "stdout={}", o.stdout);
+        let entry = format!(
+            "{{\"step\":\"infer\",\"candidate\":null,\"exit_code\":{rc},\"code\":\"{code}\",\"status\":null}}"
+        );
+        assert!(o.stdout.contains(&entry), "stdout={}", o.stdout);
+    }
+    let e = Env::new();
+    let o = e.run(
+        &e.base_args(),
+        &[("FAKE_INFER_RC", "12"), ("FAKE_INFER_STATUS", "ok")],
+    );
+    assert_eq!(o.code, Some(70), "stdout={}", o.stdout);
+    assert!(o.stdout.contains("\"failed_step\":\"infer\""));
 }
 
 /// 契約外の終了コード（3）は runtime_error(70) へ写す。

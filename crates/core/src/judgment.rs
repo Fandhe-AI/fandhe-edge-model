@@ -47,10 +47,11 @@
 //!   `predicted_choice_id` は最高スコアの選択肢（タイブレークは宣言順）と
 //!   一致することを要求する
 //!
-//! `JudgmentStatus` の variant は `Ok` と `OutOfScope`（REQ-22・#478）。`OutOfScope` は定義の
-//! `out_of_scope_label` が argmax のときに呼び出し側が [`JudgmentResult::into_out_of_scope`] で
-//! 立てる（行の形は `Ok` と同じで `status` だけが `out_of_scope`。終了コードは 11）。
-//! 保留（REQ-22。`abstain` 等）は後続 TASK（#497）で追加する。
+//! `JudgmentStatus` の variant は `Ok`・`OutOfScope`（REQ-22・#478）・`Abstain`（REQ-22・#497）。
+//! `OutOfScope` は定義の `out_of_scope_label` が argmax のときに呼び出し側が
+//! [`JudgmentResult::into_out_of_scope`] で立てる（終了コード 11）。`Abstain` は配布パッケージの
+//! 校正（T・τ）で確信度が τ 未満のときに [`JudgmentResult::into_abstain`] で立てる（終了コード 12）。
+//! いずれも行の形は `Ok` と同じで `status` だけが違う。
 //!
 //! # 検証（fail-closed）
 //!
@@ -127,7 +128,8 @@ pub const MAX_TOTAL_CHOICE_ID_BYTES: usize = 64 * 1024;
 /// 乖離は機械的に検出される（PR #202 レビュー指摘・P1 対応）。
 pub const SCORE_SUM_TOLERANCE: f64 = 1e-6;
 
-/// 判定結果の状態。`Ok`（正常終了）と `OutOfScope`（対象外ラベルが argmax。REQ-22・#478）。
+/// 判定結果の状態。`Ok`（正常終了）・`OutOfScope`（対象外ラベルが argmax。REQ-22・#478）・
+/// `Abstain`（確信度が τ 未満。REQ-22・#497）。
 ///
 /// `#[non_exhaustive]` にはしない。CLI 側で全 variant を網羅した `match` を
 /// 書けるようにし、REQ-22 で variant を追加する際にコンパイルエラーで
@@ -139,6 +141,8 @@ pub enum JudgmentStatus {
     Ok,
     /// 定義の `out_of_scope_label` が argmax だった（REQ-22・#478。終了コード `out_of_scope`）。
     OutOfScope,
+    /// 校正後の確信度がしきい値 τ 未満で保留した（REQ-22・#497。終了コード `pending`）。
+    Abstain,
 }
 
 /// [`JudgmentResult::new`] が拒否する入力の種類。
@@ -501,13 +505,22 @@ impl JudgmentResult {
         self
     }
 
+    /// 状態を `Abstain` にする（判定行の形は変えない。REQ-22・#497）。
+    /// 確信度と τ の比較は呼び出し側（CLI の `infer` が評価器の判定関数で）行う。
+    #[must_use]
+    pub fn into_abstain(mut self) -> Self {
+        self.status = JudgmentStatus::Abstain;
+        self
+    }
+
     /// 入力の識別子。入力本文は含まない（security.md）。
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// 判定結果の状態（既定は `Ok`。[`JudgmentResult::into_out_of_scope`] で `OutOfScope`）。
+    /// 判定結果の状態（既定は `Ok`。[`JudgmentResult::into_out_of_scope`] で `OutOfScope`、
+    /// [`JudgmentResult::into_abstain`] で `Abstain`）。
     #[must_use]
     pub const fn status(&self) -> JudgmentStatus {
         self.status
@@ -524,12 +537,13 @@ impl JudgmentResult {
         self.scores.iter().map(|(id, score)| (id.as_str(), *score))
     }
 
-    /// 対応する終了コード（`Ok` は 0、`OutOfScope` は 11。REQ-21・REQ-22）。
+    /// 対応する終了コード（`Ok` は 0、`OutOfScope` は 11、`Abstain` は 12。REQ-21・REQ-22）。
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
         match self.status {
             JudgmentStatus::Ok => ExitCode::Ok,
             JudgmentStatus::OutOfScope => ExitCode::OutOfScope,
+            JudgmentStatus::Abstain => ExitCode::Pending,
         }
     }
 
@@ -640,6 +654,21 @@ mod tests {
         assert_eq!(
             result.to_json_line().unwrap(),
             r#"{"id":"i","status":"out_of_scope","predicted_label":"b","scores":{"a":0.25,"b":0.75}}"#
+        );
+    }
+
+    /// REQ-22・REQ-21・#497: 保留にした行は `status:"abstain"`・exit 12 で、他は変わらない。
+    #[test]
+    fn req22_abstain_judgment_has_status_and_exit_code_12() {
+        let options = [choice("a"), choice("b")];
+        let result = JudgmentResult::new(&options, "i", "b", &[0.25, 0.75])
+            .unwrap()
+            .into_abstain();
+        assert_eq!(result.status(), JudgmentStatus::Abstain);
+        assert_eq!(result.exit_code(), ExitCode::Pending);
+        assert_eq!(
+            result.to_json_line().unwrap(),
+            r#"{"id":"i","status":"abstain","predicted_label":"b","scores":{"a":0.25,"b":0.75}}"#
         );
     }
 

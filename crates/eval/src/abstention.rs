@@ -69,12 +69,10 @@
 //! - REQ-22 正常系の 95% ブートストラップ信頼区間（PoC-12 は `n_boot=2000`・
 //!   `seed=12` の対応のあるブートストラップを使うが、本 issue の受入は
 //!   具体値での比較のみ。実装には乱数と依存の判断が要る）
-//! - 推論ランタイム側での保留判定（REQ-28・REQ-32）。評価器は推論経路に
-//!   入らない（`lib.rs`「層の境界・不変条件」）。将来ランタイムで同じ規則が
-//!   要る場合は、判定規則を下位層へ移して共有し、本モジュールの重複実装を
-//!   避ける方針とする
-//! - T・τ の永続化・配布パッケージへの格納（REQ-30）・CLI `evaluate` 工程への
-//!   配線（issue #140）
+//!
+//! `infer` の保留判定（REQ-22・REQ-28・#497）は、配布パッケージの `calibration.json` の T・τ を
+//! [`decide_abstention_with_parameters`] へ渡し、本モジュールと同じ判定規則（`decide_row`）を通す
+//! （規則を CLI で再実装しない）。T・τ の永続化は CLI の `package` 工程が担う。
 
 use crate::calibration::{self, Calibration, CalibrationError};
 use crate::coverage::CoverageReport;
@@ -203,14 +201,30 @@ impl OutOfScopeLabel {
     }
 }
 
-/// 判定結果の内部表現（`label_index` のみを持ち、ラベル文字列を確保しない）。
-/// [`compare_abstention`] の行ごとの処理専用で、外部へは公開しない
-/// （モジュール冒頭「資源上限」: 行ごとに `String` を確保しないための経路）。
+/// 添字だけの判定結果（ラベル文字列を確保しない）。[`compare_abstention`] の行ごとの処理と、
+/// `infer` 用の [`decide_abstention_with_parameters`] が返す（モジュール冒頭「資源上限」:
+/// 行ごとに `String` を確保しないための経路）。
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum RawDecision {
-    Adopt { label_index: usize, confidence: f64 },
-    Abstain { confidence: f64 },
-    OutOfScope { label_index: usize, confidence: f64 },
+pub enum IndexedDecision {
+    /// 採用（確信度が τ 以上）。
+    Adopt {
+        /// argmax の宣言順添字（同値は宣言順の先頭）。
+        label_index: usize,
+        /// 校正後の top1 確率。
+        confidence: f64,
+    },
+    /// 保留（確信度が τ 未満）。
+    Abstain {
+        /// 校正後の top1 確率。
+        confidence: f64,
+    },
+    /// 対象外（argmax が対象外ラベル。τ より優先）。
+    OutOfScope {
+        /// argmax（= 対象外ラベル）の宣言順添字。
+        label_index: usize,
+        /// 校正後の top1 確率。
+        confidence: f64,
+    },
 }
 
 /// `records` 内での位置付きで保留判定する内部経路。[`decide_abstention`]
@@ -223,39 +237,57 @@ fn decide_abstention_at(
     calibration: &Calibration,
     out_of_scope: Option<&OutOfScopeLabel>,
     logits: &[f64],
-) -> Result<RawDecision, CalibrationError> {
-    let (d, argmax_index) = calibration::preprocess_logits(index, logits, calibration.n_labels())?;
-    let confidence = calibration::top1_probability(calibration.chosen_beta(), &d);
+) -> Result<IndexedDecision, CalibrationError> {
+    decide_row(
+        index,
+        calibration.chosen_beta(),
+        calibration.threshold(),
+        calibration.n_labels(),
+        out_of_scope.map(OutOfScopeLabel::index),
+        logits,
+    )
+}
+
+/// 1 行の判定規則の本体（`evaluate` 経由の [`decide_abstention_at`] と `infer` 経由の
+/// [`decide_abstention_with_parameters`] が共有する。REQ-22・REQ-28）。
+fn decide_row(
+    index: usize,
+    beta: f64,
+    threshold: f64,
+    n_labels: usize,
+    out_of_scope_index: Option<usize>,
+    logits: &[f64],
+) -> Result<IndexedDecision, CalibrationError> {
+    let (d, argmax_index) = calibration::preprocess_logits(index, logits, n_labels)?;
+    let confidence = calibration::top1_probability(beta, &d);
     // 対象外ラベルはしきい値より優先する（REQ-22 異常系・TASK-22.2）。
-    if let Some(oos) = out_of_scope
-        && argmax_index == oos.index
-    {
-        return Ok(RawDecision::OutOfScope {
+    if out_of_scope_index == Some(argmax_index) {
+        return Ok(IndexedDecision::OutOfScope {
             label_index: argmax_index,
             confidence,
         });
     }
-    if confidence >= calibration.threshold() {
-        Ok(RawDecision::Adopt {
+    if confidence >= threshold {
+        Ok(IndexedDecision::Adopt {
             label_index: argmax_index,
             confidence,
         })
     } else {
-        Ok(RawDecision::Abstain { confidence })
+        Ok(IndexedDecision::Abstain { confidence })
     }
 }
 
-/// [`RawDecision`] を、判定に使った `calibration` の `labels()` から解決した
+/// [`IndexedDecision`] を、判定に使った `calibration` の `labels()` から解決した
 /// [`AbstentionDecision`] へ変換する（[`decide_abstention`] 専用）。
 /// `label_index` は `preprocess_logits` が `calibration.n_labels()` の範囲内
 /// でしか作らないため通常は必ず解決できるが、`[]` を使わず `get()` と
 /// fail-closed の [`CalibrationError::Internal`] で防御する。
 fn resolve_decision(
     calibration: &Calibration,
-    raw: RawDecision,
+    raw: IndexedDecision,
 ) -> Result<AbstentionDecision, CalibrationError> {
     match raw {
-        RawDecision::Adopt {
+        IndexedDecision::Adopt {
             label_index,
             confidence,
         } => {
@@ -273,8 +305,8 @@ fn resolve_decision(
                 confidence,
             })
         }
-        RawDecision::Abstain { confidence } => Ok(AbstentionDecision::Abstain { confidence }),
-        RawDecision::OutOfScope {
+        IndexedDecision::Abstain { confidence } => Ok(AbstentionDecision::Abstain { confidence }),
+        IndexedDecision::OutOfScope {
             label_index,
             confidence,
         } => {
@@ -338,6 +370,43 @@ pub fn decide_abstention_with_out_of_scope(
     }
     let raw = decide_abstention_at(0, calibration, out_of_scope, logits)?;
     resolve_decision(calibration, raw)
+}
+
+/// 配布パッケージの `calibration.json` の温度 T・しきい値 τ で 1 行を判定する（`infer` 用。
+/// REQ-22・REQ-28・REQ-32・#497）。
+///
+/// [`Calibration`] を持たない推論側から、`evaluate` の保留判定と同じ規則（[`decide_row`]:
+/// `preprocess_logits` → `top1_probability` → 対象外 > `confidence >= τ`）を通す。`temperature` は
+/// 有限で [`calibration::TEMPERATURE_MIN`]`..=`[`calibration::TEMPERATURE_MAX`]、`threshold` は有限で
+/// `0..=1`、`out_of_scope_index` は `logits` の範囲内であること（違反は
+/// [`CalibrationError::InvalidParameter`]）。**gold は受け取らない**（REQ-27）。
+pub fn decide_abstention_with_parameters(
+    temperature: f64,
+    threshold: f64,
+    out_of_scope_index: Option<usize>,
+    logits: &[f64],
+) -> Result<IndexedDecision, CalibrationError> {
+    if !(calibration::TEMPERATURE_MIN..=calibration::TEMPERATURE_MAX).contains(&temperature) {
+        return Err(CalibrationError::InvalidParameter {
+            name: "temperature",
+        });
+    }
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err(CalibrationError::InvalidParameter { name: "threshold" });
+    }
+    if out_of_scope_index.is_some_and(|i| i >= logits.len()) {
+        return Err(CalibrationError::InvalidParameter {
+            name: "out_of_scope_index",
+        });
+    }
+    decide_row(
+        0,
+        calibration::beta_of_temperature(temperature),
+        threshold,
+        logits.len(),
+        out_of_scope_index,
+        logits,
+    )
 }
 
 /// 保留込み／保留なしの評価指標と、そこから導く誤り率の比較。
@@ -508,9 +577,9 @@ pub fn compare_abstention_with_out_of_scope(
     for (index, record) in records.iter().enumerate() {
         let decision = decide_abstention_at(index, calibration, out_of_scope, record.logits)?;
         let label_index = match decision {
-            RawDecision::Adopt { label_index, .. } => label_index,
+            IndexedDecision::Adopt { label_index, .. } => label_index,
             // 対象外は argmax の添字を保持しているので再計算しない。
-            RawDecision::OutOfScope { label_index, .. } => {
+            IndexedDecision::OutOfScope { label_index, .. } => {
                 out_of_scope_count = out_of_scope_count.checked_add(1).ok_or_else(|| {
                     CalibrationError::Internal {
                         detail: "out-of-scope count overflow".to_string(),
@@ -518,7 +587,7 @@ pub fn compare_abstention_with_out_of_scope(
                 })?;
                 label_index
             }
-            RawDecision::Abstain { .. } => {
+            IndexedDecision::Abstain { .. } => {
                 // 保留の行でも「保留なし」側は argmax を採用するため、
                 // argmax の添字は判定結果に含まれない。`decide_abstention_at`
                 // 自体は argmax を常に計算しているが `Abstain` はそれを
@@ -542,8 +611,8 @@ pub fn compare_abstention_with_out_of_scope(
             outcome: label_outcome,
         });
         let with_outcome = match decision {
-            RawDecision::Adopt { .. } | RawDecision::OutOfScope { .. } => label_outcome,
-            RawDecision::Abstain { .. } => &abstain_outcome,
+            IndexedDecision::Adopt { .. } | IndexedDecision::OutOfScope { .. } => label_outcome,
+            IndexedDecision::Abstain { .. } => &abstain_outcome,
         };
         with_records.push(EvalRecord {
             gold: record.gold,
@@ -1342,7 +1411,7 @@ mod tests {
         let validation_records = as_records(&validation_rows);
         let calibration = calibrate(&LABELS, &validation_records).unwrap();
 
-        let raw = RawDecision::Adopt {
+        let raw = IndexedDecision::Adopt {
             label_index: 99,
             confidence: 0.9,
         };
@@ -1401,5 +1470,91 @@ mod tests {
         // `label` のみを返す。
         assert_eq!(decision_a.to_outcome(), Outcome::Label("l0".to_string()));
         assert_eq!(decision_b.to_outcome(), Outcome::Label("l1".to_string()));
+    }
+
+    /// REQ-22・REQ-28・#497: パラメータ版の 1 行判定は、同じ T・τ・対象外の添字で
+    /// `decide_abstention_with_out_of_scope` と同じ区分・同じ確信度を返す（evaluate と infer の規則の一致）。
+    #[test]
+    fn req22_issue497_parameter_decision_matches_calibration_decision() {
+        let validation = c1_validation();
+        let calibration = calibrate(&LABELS, &as_records(&validation)).unwrap();
+        let oos = OutOfScopeLabel::new(&calibration, "l2").unwrap();
+        let (mut adopt, mut abstain, mut out_of_scope) = (0, 0, 0);
+        for (_, logits) in c1_eval() {
+            for scoped in [None, Some(&oos)] {
+                let expected =
+                    decide_abstention_with_out_of_scope(&calibration, scoped, &logits).unwrap();
+                let got = decide_abstention_with_parameters(
+                    calibration.chosen_temperature(),
+                    calibration.threshold(),
+                    scoped.map(OutOfScopeLabel::index),
+                    &logits,
+                )
+                .unwrap();
+                match (&expected, got) {
+                    (
+                        AbstentionDecision::Adopt { label_index, .. },
+                        IndexedDecision::Adopt { label_index: i, .. },
+                    ) => {
+                        assert_eq!(*label_index, i);
+                        adopt += 1;
+                    }
+                    (AbstentionDecision::Abstain { .. }, IndexedDecision::Abstain { .. }) => {
+                        abstain += 1;
+                    }
+                    (
+                        AbstentionDecision::OutOfScope { label_index, .. },
+                        IndexedDecision::OutOfScope { label_index: i, .. },
+                    ) => {
+                        assert_eq!(*label_index, i);
+                        out_of_scope += 1;
+                    }
+                    other => panic!("decision mismatch: {other:?}"),
+                }
+                let confidence = match got {
+                    IndexedDecision::Adopt { confidence, .. }
+                    | IndexedDecision::Abstain { confidence }
+                    | IndexedDecision::OutOfScope { confidence, .. } => confidence,
+                };
+                assert_eq!(confidence.to_bits(), expected.confidence().to_bits());
+            }
+        }
+        // 3 区分すべてを通っていること（どれかが 0 件だと一致の確認にならない）。
+        assert!(
+            adopt > 0 && abstain > 0 && out_of_scope > 0,
+            "{adopt} {abstain} {out_of_scope}"
+        );
+    }
+
+    /// REQ-22・REQ-39・#497: 範囲外の T・τ・対象外の添字は `InvalidParameter` で拒否する。
+    #[test]
+    fn req22_issue497_parameter_decision_rejects_out_of_range_parameters() {
+        let logits = [0.0, 1.0];
+        let invalid = |name| Err(CalibrationError::InvalidParameter { name });
+        for t in [0.049, 20.001, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                decide_abstention_with_parameters(t, 0.5, None, &logits),
+                invalid("temperature")
+            );
+        }
+        for tau in [-0.001, 1.001, f64::NAN] {
+            assert_eq!(
+                decide_abstention_with_parameters(1.0, tau, None, &logits),
+                invalid("threshold")
+            );
+        }
+        assert_eq!(
+            decide_abstention_with_parameters(1.0, 0.5, Some(2), &logits),
+            invalid("out_of_scope_index")
+        );
+        // 境界値は受け付ける（τ = 1 は確信度 1 未満を保留）。
+        assert!(matches!(
+            decide_abstention_with_parameters(0.05, 1.0, Some(1), &logits),
+            Ok(IndexedDecision::OutOfScope { label_index: 1, .. })
+        ));
+        assert!(matches!(
+            decide_abstention_with_parameters(20.0, 1.0, None, &logits),
+            Ok(IndexedDecision::Abstain { .. })
+        ));
     }
 }

@@ -64,5 +64,6 @@ pub mod hash;
 pub mod infer_input;
 pub mod judgment;
 pub mod limits;
+pub mod package_calibration;
 pub mod rebuild;
 pub mod stage_report;

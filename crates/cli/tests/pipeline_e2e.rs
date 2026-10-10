@@ -196,15 +196,24 @@ mod suite {
         let weights = size(format!("{model_dir}/model.onnx"));
         let vocab = size(format!("{model_dir}/vocab.json"));
         let label = size("definition.json".to_string());
-        let meta = size(format!("{model_dir}/artifact.json"));
-        let total = weights.0 + vocab.0 + label.0 + meta.0;
+        // 校正つきのパッケージは配布用の `artifact.json` に `calibration_sha256` が足されるため、公開後は
+        // その実体から数える（#497）。`package/` が無ければ成果物ディレクトリの複写元から数える。
+        let meta = if env.project_file("package/artifact.json").is_file() {
+            size("package/artifact.json".to_string())
+        } else {
+            size(format!("{model_dir}/artifact.json"))
+        };
+        // `calibration.json` は評価記録に校正があるときだけ同梱される（#497）。公開後の実体から数える。
+        let calibration = size("package/calibration.json".to_string());
+        let total = weights.0 + vocab.0 + label.0 + meta.0 + calibration.0;
         let limit = limit_bytes.map_or("null".to_string(), |l| l.to_string());
         let c = |(b, n): (u64, u32)| format!("{{\"bytes\":{b},\"file_count\":{n}}}");
         format!(
-            "\"capacity\":{{\"total_bytes\":{total},\"limit_bytes\":{limit},\"exceeded\":{exceeded},\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{{\"weights\":{},\"vocab_or_feature_transform\":{},\"label_table\":{},\"calibration\":{{\"bytes\":0,\"file_count\":0}},\"metadata\":{}}}}}",
+            "\"capacity\":{{\"total_bytes\":{total},\"limit_bytes\":{limit},\"exceeded\":{exceeded},\"guideline_bytes\":40000000,\"over_guideline\":false,\"components\":{{\"weights\":{},\"vocab_or_feature_transform\":{},\"label_table\":{},\"calibration\":{},\"metadata\":{}}}}}",
             c(weights),
             c(vocab),
             c(label),
+            c(calibration),
             c(meta)
         )
     }
@@ -2043,6 +2052,364 @@ mod suite {
             assert_eq!(n(b, key), n(c, key), "{out}\n{rotated}");
         }
         assert_eq!(calibration_json(&out), calibration_json(&rotated));
+    }
+
+    /// `"key":<値>` の値の生の文字列（次の `,` または `}` まで）。
+    fn raw_field<'a>(json: &'a str, key: &str) -> &'a str {
+        let marker = format!("\"{key}\":");
+        let rest = json.split(&marker).nth(1).expect("key exists");
+        &rest[..rest.find([',', '}']).expect("value end")]
+    }
+
+    /// 保留の確認用の評価データ（input・正解ラベル。#497）。固定 fixture の ONNX と validation の T・τ のもとで、
+    /// 前半 6 件は確信度が τ 未満（予測は beta・gamma・gamma・gamma・beta・beta）、後半 6 件は τ 以上
+    /// （alpha・beta・gamma・beta・alpha・gamma）になる入力（テストハーネスでの観測値から選んだ）。
+    const ABSTAIN_EVAL: [(&str, &str); 12] = [
+        ("x", "alpha"),
+        ("zzz", "beta"),
+        ("12345", "gamma"),
+        ("beta sample", "alpha"),
+        ("?", "beta"),
+        ("..", "gamma"),
+        ("alpha", "alpha"),
+        ("beta", "beta"),
+        ("g", "gamma"),
+        ("bet", "alpha"),
+        ("ab", "beta"),
+        ("bg", "gamma"),
+    ];
+
+    /// [`ABSTAIN_EVAL`] の id・input（評価データと `--input-file` で共有する）。
+    fn evaluation_batch() -> Vec<(String, String)> {
+        ABSTAIN_EVAL
+            .iter()
+            .enumerate()
+            .map(|(i, (input, _))| (format!("ab-{i}"), (*input).to_string()))
+            .collect()
+    }
+
+    /// `evaluate`（`out_of_scope_label` は `oos`）→ `package` まで進め、`calibration.json` と容量内訳を確認したうえで、
+    /// 評価データの入力に `infer --input-file` を当てた行を返す（#497）。abstain・out_of_scope の行数は `evaluate` の
+    /// `abstention.abstained`・`out_of_scope` と一致し、各行は同じ id の `--text` の出力と一致する（abstain は exit 12・
+    /// out_of_scope は 11・ok は 0）。`--out` の要約は行の sha256 と件数のまま。
+    fn infer_on_evaluation_inputs(case: &str, oos: Option<&str>) -> (Env, String) {
+        let env = Env::new(case, true);
+        let mut definition = definition_text();
+        if let Some(label) = oos {
+            definition = definition.replace(
+                r#""io":{"input":"bytes"}"#,
+                &format!(r#""io":{{"input":"bytes"}},"out_of_scope_label":"{label}""#),
+            );
+        }
+        std::fs::write(env.work.join("def").join("definition.json"), definition).expect("def");
+        let evaluation: String = ABSTAIN_EVAL
+            .iter()
+            .enumerate()
+            .map(|(i, (input, gold))| {
+                format!(
+                    "{{\"id\":\"ab-{i}\",\"input\":\"{input}\",\"output\":{{\"intent\":\"{gold}\"}},\"group_id\":\"abg-{i}\"}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(env.work.join("def").join("evaluation.jsonl"), evaluation).expect("eval");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "1"]);
+        env.ok(&SELECT);
+        let out = env.ok(&EVALUATE_1);
+        assert_eq!(env.ok(&PACKAGE), package_line(&env, C3_DIR, NULL_HEAD));
+        let calib = std::fs::read_to_string(env.project_file("package/calibration.json"))
+            .expect("calibration.json");
+        let c = calibration_json(&out);
+        assert_eq!(
+            calib,
+            format!(
+                "{{\"onnx_sha256\":\"{}\",\"label_order\":[\"alpha\",\"beta\",\"gamma\"],\"temperature\":{},\"threshold\":{}}}\n",
+                file_sha256(&env, "package/model.onnx"),
+                raw_field(c, "temperature"),
+                raw_field(c, "threshold")
+            )
+        );
+        let capacity = capacity_json(&env, C3_DIR, None, false);
+        assert!(
+            capacity.contains(&format!(
+                "\"calibration\":{{\"bytes\":{},\"file_count\":1}}",
+                calib.len()
+            )),
+            "{capacity}"
+        );
+        // 配布用の `artifact.json` は候補側の末尾に `calibration_sha256`（`calibration.json` 全体の sha256）を
+        // 足しただけ。候補側は書き換えない（評価記録の `artifact_meta_sha256` の照合対象。REQ-39）。
+        let candidate_meta =
+            std::fs::read_to_string(env.project_file(&format!("{C3_DIR}/artifact.json")))
+                .expect("candidate artifact.json");
+        assert!(!candidate_meta.contains("calibration_sha256"));
+        let close = candidate_meta.trim_end().len() - 1;
+        assert_eq!(
+            std::fs::read_to_string(env.project_file("package/artifact.json"))
+                .expect("artifact.json"),
+            format!(
+                "{},\"calibration_sha256\":\"{}\"{}",
+                &candidate_meta[..close],
+                file_sha256(&env, "package/calibration.json"),
+                &candidate_meta[close..]
+            )
+        );
+
+        let rows = evaluation_batch();
+        let batch: String = rows
+            .iter()
+            .map(|(id, input)| format!("{{\"id\":\"{id}\",\"input\":\"{input}\"}}\n"))
+            .collect();
+        std::fs::write(env.work.join("batch.jsonl"), &batch).expect("batch");
+        let (code, lines) = env.run(&EVAL_BATCH);
+        assert_eq!(code, 0, "{lines}");
+        assert_eq!(lines.lines().count(), 12, "{lines}");
+        let a = abstention_json(&out);
+        let count =
+            |status: &str| lines.matches(&format!("\"status\":\"{status}\"")).count() as f64;
+        assert_eq!(
+            count("abstain"),
+            number_field(a, "abstained"),
+            "{out}\n{lines}"
+        );
+        assert_eq!(
+            count("out_of_scope"),
+            number_field(a, "out_of_scope"),
+            "{out}\n{lines}"
+        );
+        for ((id, input), line) in rows.iter().zip(lines.lines()) {
+            let (code, text) = env.run(&[
+                "infer",
+                "--package",
+                "proj/package",
+                "--text",
+                input,
+                "--id",
+                id,
+            ]);
+            assert_eq!(text, format!("{line}\n"));
+            let expected = if line.contains("\"status\":\"abstain\"") {
+                12
+            } else if line.contains("\"status\":\"out_of_scope\"") {
+                11
+            } else {
+                0
+            };
+            assert_eq!(code, expected, "{text}");
+        }
+        let summary = env.ok(&[
+            "infer",
+            "--package",
+            "proj/package",
+            "--input-file",
+            "batch.jsonl",
+            "--out",
+            "out.jsonl",
+        ]);
+        assert_eq!(
+            summary,
+            format!(
+                "{{\"step\":\"infer\",\"status\":\"ok\",\"count\":12,\"sha256\":\"{}\"}}\n",
+                Sha256Digest::of_bytes(lines.as_bytes()).to_hex()
+            )
+        );
+        (env, lines)
+    }
+
+    const EVAL_BATCH: [&str; 5] = [
+        "infer",
+        "--package",
+        "proj/package",
+        "--input-file",
+        "batch.jsonl",
+    ];
+
+    /// REQ-22・REQ-28・REQ-30・#497: 校正つきの評価記録から `package` が `calibration.json`（キー順固定・評価記録と同じ
+    /// T・τ・配布 ONNX の sha256・定義の宣言順）を同梱し、容量の `calibration` 枠に 1 件計上する。`infer` の保留・対象外
+    /// の行数は `evaluate` の件数と一致し（[`infer_on_evaluation_inputs`]）、対象外ラベルが argmax の行は τ 未満でも
+    /// out_of_scope（11 を優先）。`calibration.json` を消すと保留しない（従来どおり ok）。
+    /// 証拠の種別: テストハーネス（偽ワーカー・固定 fixture ONNX）。
+    pub fn infer_abstains_with_packaged_calibration_like_evaluate() {
+        let (env, plain) = infer_on_evaluation_inputs("inferabst", None);
+        let statuses: Vec<&str> = plain
+            .lines()
+            .map(|l| {
+                if l.contains("\"status\":\"abstain\"") {
+                    "abstain"
+                } else {
+                    "ok"
+                }
+            })
+            .collect();
+        assert_eq!(statuses, [["abstain"; 6], ["ok"; 6]].concat(), "{plain}");
+        // beta を対象外にすると、beta が argmax の保留行（x・?・..）も対象外が優先される（11 > 12）。
+        let label = "beta";
+        let (_, scoped) = infer_on_evaluation_inputs("inferoos", Some(label));
+        assert_eq!(
+            scoped.matches("\"status\":\"out_of_scope\"").count(),
+            5,
+            "{scoped}"
+        );
+        let to_oos = |line: &str| {
+            line.replace("\"status\":\"ok\"", "\"status\":\"out_of_scope\"")
+                .replace("\"status\":\"abstain\"", "\"status\":\"out_of_scope\"")
+        };
+        for (p, s) in plain.lines().zip(scoped.lines()) {
+            if p.contains(&format!("\"predicted_label\":\"{label}\"")) {
+                assert_eq!(s, to_oos(p));
+            } else {
+                assert_eq!(s, p);
+            }
+        }
+
+        // 記録があるのに `calibration.json` を消すと 64（保留しない状態へ戻す削除を検出する。REQ-39）。
+        std::fs::remove_file(env.project_file("package/calibration.json")).expect("rm");
+        assert_eq!(
+            env.fails(&EVAL_BATCH, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration is missing but its hash is recorded\"}\n"
+        );
+        // 校正なしのパッケージ（`calibration_sha256` も `calibration.json` も無い）なら保留を返さない。
+        let meta = env.project_file("package/artifact.json");
+        std::fs::copy(env.project_file(&format!("{C3_DIR}/artifact.json")), &meta)
+            .expect("restore candidate artifact.json");
+        let (code, lines) = env.run(&EVAL_BATCH);
+        assert_eq!(code, 0, "{lines}");
+        assert_eq!(
+            lines,
+            plain.replace("\"status\":\"abstain\"", "\"status\":\"ok\"")
+        );
+    }
+
+    /// REQ-22・REQ-39・#497: `calibration.json` の改変は `artifact.json` の `calibration_sha256` との照合で
+    /// `infer` が 64 で拒否する（τ を範囲内で変える・削除・記録なしの同梱を含む）。`artifact.json` の記録ごと
+    /// 書き換えた場合も、内容（`onnx_sha256`・`label_order` の不一致・範囲外の T・τ・未知キー・壊れた JSON）は 64、
+    /// symlink は 64、上限超過は 20 で拒否する。元に戻せば成功する。評価データなしのパッケージには
+    /// `calibration.json` も `calibration_sha256` も無く、容量の `calibration` 枠は 0 件で、従来どおり exit 0。
+    pub fn infer_rejects_tampered_calibration() {
+        let plain = packaged("calibnone");
+        assert!(!plain.project_file("package/calibration.json").exists());
+        assert!(
+            !std::fs::read_to_string(plain.project_file("package/artifact.json"))
+                .expect("artifact.json")
+                .contains("calibration_sha256")
+        );
+        plain.ok(&["infer", "--package", "proj/package", "--text", "alpha"]);
+        assert!(
+            capacity_json(&plain, C1_DIR, None, false)
+                .contains("\"calibration\":{\"bytes\":0,\"file_count\":0}")
+        );
+
+        let (env, _) = evaluate_with_oos_env("calibtamper", None, false);
+        env.ok(&PACKAGE);
+        let path = env.project_file("package/calibration.json");
+        let original = std::fs::read_to_string(&path).expect("calibration.json");
+        let text_args = ["infer", "--package", "proj/package", "--text", "alpha"];
+        let onnx_hash = file_sha256(&env, "package/model.onnx");
+        let t = raw_field(&original, "temperature").to_string();
+        let tau = raw_field(&original, "threshold").to_string();
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"package calibration does not match the model\"}\n";
+        let invalid =
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration is invalid\"}\n";
+        let meta = env.project_file("package/artifact.json");
+        let original_meta = std::fs::read_to_string(&meta).expect("artifact.json");
+        let recorded = file_sha256(&env, "package/calibration.json");
+        assert!(
+            original_meta.contains(&format!("\"calibration_sha256\":\"{recorded}\"")),
+            "{original_meta}"
+        );
+        let hash_mismatch = "{\"code\":\"invalid_input\",\"message\":\"package calibration does not match its recorded hash\"}\n";
+
+        // `artifact.json` を変えずに τ を範囲内で書き換える（保留の境界をずらす改変）。
+        assert_ne!(tau, "0.25");
+        std::fs::write(
+            &path,
+            original.replace(&format!("\"threshold\":{tau}"), "\"threshold\":0.25"),
+        )
+        .expect("tamper tau");
+        assert_eq!(env.fails(&text_args, 64, "invalid_input"), hash_mismatch);
+        // 削除（保留しない状態へ戻す）。
+        std::fs::remove_file(&path).expect("rm");
+        assert_eq!(
+            env.fails(&text_args, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration is missing but its hash is recorded\"}\n"
+        );
+        // `artifact.json` から記録を消して `calibration.json` だけ残す。
+        std::fs::write(&path, &original).expect("restore");
+        std::fs::write(
+            &meta,
+            original_meta.replace(&format!(",\"calibration_sha256\":\"{recorded}\""), ""),
+        )
+        .expect("strip");
+        assert_eq!(
+            env.fails(&text_args, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"package calibration has no recorded hash\"}\n"
+        );
+
+        // 以降は `artifact.json` の記録ごと書き換えた場合（#168 の範囲）でも、内容の検査で止まることを確かめる。
+        let cases: Vec<(String, &str)> = vec![
+            (original.replace(&onnx_hash, &"0".repeat(64)), mismatch),
+            (
+                original.replace(
+                    "[\"alpha\",\"beta\",\"gamma\"]",
+                    "[\"beta\",\"alpha\",\"gamma\"]",
+                ),
+                mismatch,
+            ),
+            (
+                original.replace("[\"alpha\",\"beta\",\"gamma\"]", "[\"alpha\",\"beta\"]"),
+                mismatch,
+            ),
+            (
+                original.replace(&format!("\"temperature\":{t}"), "\"temperature\":0.04"),
+                invalid,
+            ),
+            (
+                original.replace(&format!("\"temperature\":{t}"), "\"temperature\":20.5"),
+                invalid,
+            ),
+            (
+                original.replace(&format!("\"threshold\":{tau}"), "\"threshold\":1.5"),
+                invalid,
+            ),
+            (
+                original.replace(&format!("\"threshold\":{tau}"), "\"threshold\":-0.1"),
+                invalid,
+            ),
+            (original.replace("}\n", ",\"extra\":1}\n"), invalid),
+            ("not json".to_string(), invalid),
+        ];
+        for (tampered, expected) in &cases {
+            assert_ne!(tampered, &original);
+            std::fs::write(&path, tampered).expect("tamper");
+            std::fs::write(
+                &meta,
+                original_meta.replace(
+                    &recorded,
+                    &Sha256Digest::of_bytes(tampered.as_bytes()).to_hex(),
+                ),
+            )
+            .expect("rehash");
+            assert_eq!(
+                env.fails(&text_args, 64, "invalid_input"),
+                *expected,
+                "{tampered}"
+            );
+        }
+        // 上限（MAX_DEFINITION_FILE_BYTES = 1 MiB）を超えるファイルは読まずに 20。
+        std::fs::write(&path, vec![b' '; 1_048_577]).expect("oversize");
+        env.fails(&text_args, 20, "limit_exceeded");
+        // パッケージ外を指す symlink（正しい内容でも）は閉じ込めで拒否する。
+        std::fs::write(env.project_file("outside.json"), &original).expect("outside");
+        std::fs::remove_file(&path).expect("rm");
+        std::os::unix::fs::symlink("../outside.json", &path).expect("symlink");
+        env.fails(&text_args, 64, "invalid_input");
+        std::fs::remove_file(&path).expect("rm link");
+        std::fs::write(&path, &original).expect("restore");
+        std::fs::write(&meta, &original_meta).expect("restore meta");
+        let (code, line) = env.run(&text_args);
+        assert!(code == 0 || code == 12, "{line}");
     }
 
     /// REQ-27: `evaluate` の前後で、モデル（ONNX・`artifact.json`）と評価データの sha256 が一致し、
@@ -3941,6 +4308,14 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_abstention_record_without_out_of_scope_label",
             suite::package_rejects_abstention_record_without_out_of_scope_label,
+        ),
+        (
+            "infer_abstains_with_packaged_calibration_like_evaluate",
+            suite::infer_abstains_with_packaged_calibration_like_evaluate,
+        ),
+        (
+            "infer_rejects_tampered_calibration",
+            suite::infer_rejects_tampered_calibration,
         ),
         (
             "evaluate_keeps_model_and_evaluation_hashes",

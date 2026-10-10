@@ -30,6 +30,14 @@
 //!    （`limits.max_package_bytes`）を超えたら `limit_exceeded`。上限が無ければ照合しない
 //!    （既定の強制上限は無い。2026-10-06 オーナー判断）
 //!
+//! 校正（#497・REQ-22・REQ-30）: 選定候補の評価記録に `calibration` があるときだけ、`calibration.json`
+//! （[`PackageCalibration`]。T・τ と、配布する ONNX の sha256・定義の宣言順）を同梱し、容量内訳の
+//! `calibration` 枠に計上する。評価データが無い・`calibration:null` では書かない（`infer` は保留しない）。
+//! 校正を同梱するときは、配布用の `package/artifact.json` の末尾に `calibration_sha256`（`calibration.json`
+//! 全体の sha256）を追記し、`infer` が τ の改変・ファイルの削除を検出できるようにする
+//! （[`with_calibration_sha256`]。REQ-39）。候補側の `candidates/<N>/artifact.json` と、評価記録の
+//! `artifact_meta_sha256` の照合対象（候補側のバイト列）は変えない。校正なしでは学習ワーカーの出力のまま。
+//!
 //! 2・3・5 は `package.staging/` で行い、容量と p95 がともに上限内のときだけ `package/` へ原子的に名前替えして
 //! 公開する。途中の失敗・容量または p95 の上限超過ではステージングを片付け、`package/` を作らない
 //! （推論可能な場所に半端・超過のパッケージを残さない。既存の `package/` は事前に拒否し、
@@ -72,10 +80,12 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
+use fandhe_edge_core::artifact_meta::MAX_ARTIFACT_META_BYTES;
 use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
 use fandhe_edge_core::stage_report::{
     InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
 };
@@ -83,6 +93,7 @@ use fandhe_edge_data::eval_freeze::FreezeRecord;
 use fandhe_edge_data::inspect::ValidRecord;
 use fandhe_edge_data::split::SplitResult;
 use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
+use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
 use fandhe_edge_runtime::capacity::{
@@ -241,6 +252,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     };
     // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
     let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
+    let calibration = package_calibration(verified_record.as_ref(), &definition, &onnx_bytes)?;
+    let package_meta_bytes = match calibration.as_deref() {
+        Some(bytes) => with_calibration_sha256(&meta_bytes, bytes)?,
+        None => meta_bytes,
+    };
 
     if project.exists(PACKAGE_DIR)? {
         return Err(invalid("package directory already exists"));
@@ -274,9 +290,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     let breakdown = match assemble_and_measure(
         &project,
         onnx_file,
-        &meta_bytes,
+        &package_meta_bytes,
         &onnx_bytes,
-        &definition_bytes,
+        (&definition_bytes, calibration.as_deref()),
         &meta,
         vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
     ) {
@@ -457,6 +473,60 @@ fn quality_from_acceptance(
     })
 }
 
+/// 照合済みの評価記録に校正があるときだけ、同梱する `calibration.json` のバイト列を作る
+/// （REQ-22・REQ-30・#497）。評価記録が無い・`calibration:null` なら `None`（書かない）。
+///
+/// T・τ は記録の値をそのまま使う（再計算しない。T・τ の改変の検出は外部台帳〔#168〕の範囲）。
+/// `infer` が拒否する範囲外の値（T が `TEMPERATURE_MIN..=TEMPERATURE_MAX` の外・τ が `0..=1` の外）は
+/// 公開前に `evaluation record is invalid`（`invalid_input`）で止め、読めないパッケージを公開しない。
+fn package_calibration(
+    record: Option<&EvaluationRecord>,
+    definition: &Definition,
+    onnx_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, ErrorReport> {
+    let Some(c) = record.and_then(|r| r.calibration) else {
+        return Ok(None);
+    };
+    if !(TEMPERATURE_MIN..=TEMPERATURE_MAX).contains(&c.temperature)
+        || !(0.0..=1.0).contains(&c.threshold)
+    {
+        return Err(invalid("evaluation record is invalid"));
+    }
+    PackageCalibration {
+        onnx_sha256: Sha256Digest::of_bytes(onnx_bytes).to_hex(),
+        label_order: definition.options().iter().map(|o| o.id.clone()).collect(),
+        temperature: c.temperature,
+        threshold: c.threshold,
+    }
+    .to_json_line()
+    .map(Some)
+    .map_err(|_| runtime("cannot serialize package calibration"))
+}
+
+/// 候補側の `artifact.json` のバイト列の末尾の `}` の直前に `,"calibration_sha256":"<hex>"` を足した、配布用の
+/// バイト列を返す（REQ-39・#497）。他の欄・キー順・空白は変えない。
+///
+/// 候補側に同名の欄が無いことは [`load_candidate_artifact`] が確認済み（重複キーを作らない）。解析済みの
+/// 非空オブジェクトなので、末尾の空白を除いた最後のバイトは `}` で、直前に欄がある。
+fn with_calibration_sha256(meta_bytes: &[u8], calibration: &[u8]) -> Result<Vec<u8>, ErrorReport> {
+    let close = meta_bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .filter(|&i| meta_bytes.get(i) == Some(&b'}'))
+        .ok_or_else(|| invalid("artifact metadata does not match the model file"))?;
+    let (head, tail) = meta_bytes.split_at(close);
+    let field = format!(
+        r#","calibration_sha256":"{}""#,
+        Sha256Digest::of_bytes(calibration).to_hex()
+    );
+    let out = [head, field.as_bytes(), tail].concat();
+    // 追記後も `infer` の上限付き読み込み（[`MAX_ARTIFACT_META_BYTES`]）で読めることを公開前に確かめる。
+    if u64::try_from(out.len()).map_or(true, |n| n > MAX_ARTIFACT_META_BYTES) {
+        return Err(invalid("artifact metadata is too large"));
+    }
+    Ok(out)
+}
+
 /// 評価記録の `baseline_comparison` が定義と一致するか（#339・REQ-25）。
 ///
 /// 定義に欄があるのに記録に無い（欄の削除）、定義に欄が無いのに記録にある（欄の追加）は不一致。
@@ -603,7 +673,8 @@ fn finalize_staging(
     Ok(Vec::new())
 }
 
-/// ステージングへ 3 ファイル（語彙ファイルがあれば 4）を新規に書き、閉じ込めつきで開いたハンドルで容量を計測する（REQ-30）。
+/// ステージングへ 3 ファイル（語彙ファイル・`calibration.json` があればそれも）を新規に書き、閉じ込めつきで
+/// 開いたハンドルで容量を計測する（REQ-30。校正は `calibration` 枠。#497）。
 ///
 /// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
@@ -611,7 +682,8 @@ fn assemble_and_measure(
     onnx_file: &str,
     meta_bytes: &[u8],
     onnx_bytes: &[u8],
-    definition_bytes: &[u8],
+    // 登録済みの定義と、同梱する校正（あれば）のバイト列。
+    (definition_bytes, calibration): (&[u8], Option<&[u8]>),
     meta: &ArtifactMeta,
     vocab: Option<(&File, &Path)>,
 ) -> Result<CapacityBreakdown, ErrorReport> {
@@ -624,6 +696,10 @@ fn assemble_and_measure(
         (PackageComponent::LabelTable, DEFINITION_FILE),
         (PackageComponent::Metadata, ARTIFACT_META_FILE),
     ];
+    if let Some(bytes) = calibration {
+        project.write_new(pkg.join(PACKAGE_CALIBRATION_FILE), bytes)?;
+        members.push((PackageComponent::Calibration, PACKAGE_CALIBRATION_FILE));
+    }
     if let Some((mut file, _)) = vocab {
         // 保持 fd を先頭へ戻し、固定長バッファで複写する（全体をメモリへ読まない）。
         file.seek(SeekFrom::Start(0))
@@ -1064,6 +1140,83 @@ mod tests {
         assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
         assert!(!project.exists(PACKAGE_STAGING_DIR).expect("exists"));
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-22・REQ-39・#497: 評価記録の T・τ が範囲外なら `calibration.json` を作らず `invalid_input`
+    /// （`infer` が読めないパッケージを公開しない）。境界値は通り、校正の無い記録は書かない。
+    #[test]
+    fn req22_issue497_package_calibration_rejects_out_of_range_parameters() {
+        use fandhe_edge_core::evaluation_record::CalibrationRecord;
+        let definition = definition_with(None);
+        let with = |temperature: f64, threshold: f64| {
+            let mut r = record_with(12, 12);
+            r.calibration = Some(CalibrationRecord {
+                temperature,
+                adopted: true,
+                threshold,
+                n_validation: 10,
+                validation_answered: 8,
+            });
+            package_calibration(Some(&r), &definition, b"onnx")
+        };
+        for (t, tau) in [
+            (0.04, 0.5),
+            (20.5, 0.5),
+            (1.0, -0.1),
+            (1.0, 1.5),
+            (f64::NAN, 0.5),
+        ] {
+            assert_eq!(
+                with(t, tau).expect_err("out of range").message,
+                "evaluation record is invalid",
+                "{t} {tau}"
+            );
+        }
+        for (t, tau) in [(TEMPERATURE_MIN, 0.0), (TEMPERATURE_MAX, 1.0)] {
+            assert!(with(t, tau).expect("in range").is_some(), "{t} {tau}");
+        }
+        assert_eq!(
+            package_calibration(Some(&record_with(12, 12)), &definition, b"onnx"),
+            Ok(None)
+        );
+        assert_eq!(package_calibration(None, &definition, b"onnx"), Ok(None));
+    }
+
+    /// REQ-39・#497: 配布用の `artifact.json` は候補側のバイト列の末尾に `calibration_sha256` を足しただけで、
+    /// 解析すると校正ファイルの sha256 が読め、他の欄は変わらない。
+    #[test]
+    fn req39_issue497_with_calibration_sha256_appends_field() {
+        let meta = format!(
+            "{{\"onnx_file\":\"model.onnx\",\"kind\":\"c1\",\"kind_version\":1,\"max_bytes\":48,\"label_order\":[\"a\"],\"onnx_sha256\":\"{}\"}}\n",
+            "0".repeat(64)
+        );
+        let out = with_calibration_sha256(meta.as_bytes(), b"calib\n").expect("append");
+        let hex = Sha256Digest::of_bytes(b"calib\n").to_hex();
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("utf8"),
+            meta.replace("}\n", &format!(",\"calibration_sha256\":\"{hex}\"}}\n"))
+        );
+        let parsed = ArtifactMeta::parse(&out).expect("parse");
+        assert_eq!(parsed.calibration_sha256(), Some(hex.as_str()));
+        assert_eq!(
+            ArtifactMeta::parse(meta.as_bytes()).map(|m| m.label_order().to_vec()),
+            Ok(parsed.label_order().to_vec())
+        );
+        assert!(with_calibration_sha256(b"[]", b"x").is_err());
+    }
+
+    /// REQ-39・#497: 追記で `infer` の読み込み上限を超える配布用メタデータは公開しない。
+    #[test]
+    fn req39_issue497_appended_meta_over_read_limit_is_rejected() {
+        let limit = usize::try_from(MAX_ARTIFACT_META_BYTES).expect("limit");
+        let mut meta = vec![b' '; limit - 2];
+        meta.splice(0..0, b"{}".iter().copied());
+        assert_eq!(
+            with_calibration_sha256(&meta, b"{}")
+                .expect_err("over limit")
+                .message,
+            "artifact metadata is too large"
+        );
     }
 
     fn definition_with(acceptance: Option<u32>) -> Definition {

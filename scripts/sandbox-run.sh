@@ -46,7 +46,8 @@
 #     容量検査のために一時ディレクトリへ受けるが、終了時に必ず削除する
 #   - 終了コード 0 の工程は stdout を python3 の json で構造検証する。空でない単一の JSON オブジェクトで
 #     ないか、トップレベルに code があるのに "ok" でなければ、工程ごとの契約（step が工程名と一致し
-#     status が "ok"。evaluate のみ "skipped" も可。infer は step を持たず status:"ok"・id・predicted_label）
+#     status が "ok"。evaluate のみ "skipped" も可。infer は step を持たず status:"ok"・id・predicted_label。
+#     infer の exit 11・12 は判定行の status が out_of_scope・abstain なら完了として扱い、元の終了コードを記録する）
 #     に合わなければ、空出力・不正 JSON・code 不整合を含めて runtime_error(70) で停止する（fail-closed。REQ-21・REQ-33）。exit 0 の工程結果 JSON
 #     （register・inspect・train・evaluate・select・package と infer の判定）は code を持たず
 #     step・status 等のフィールドを持つ契約のため、code の欠如は許容する（cli-infer-noninteractive.sh
@@ -411,6 +412,15 @@ do_step() {
     run_step "$prefix" "$@"
     t1=$(utc_now)
     status=null
+    # infer の判定行は対象外（11）・保留（12）でも工程としては完了（REQ-21・REQ-22・#478・#497）。
+    # 判定行の status が終了コードと一致することを下の構造検証で確かめ、記録には元の終了コードを残す。
+    infer_rc=0
+    infer_status=ok
+    if [ "$name" = infer ] && { [ "$step_rc" -eq 11 ] || [ "$step_rc" -eq 12 ]; }; then
+        infer_rc=$step_rc
+        if [ "$step_rc" -eq 11 ]; then infer_status=out_of_scope; else infer_status=abstain; fi
+        step_rc=0
+    fi
     if [ "$step_rc" -eq 0 ]; then
         # 終了コード 0 でも出力を信用しない。stdout が単一の JSON オブジェクトで、
         # トップレベルに code があるなら "ok"（終了コード 0 と整合）であることを検証する。
@@ -426,8 +436,8 @@ name = sys.argv[1]
 if not isinstance(v, dict) or not v or ("code" in v and v.get("code") != "ok"):
     print("invalid")
 elif name == "infer":
-    # infer の判定 JSON は step を持たず、status:"ok" と id・predicted_label を持つ
-    if v.get("status") == "ok" and "step" not in v and isinstance(v.get("id"), str) and isinstance(v.get("predicted_label"), str):
+    # infer の判定 JSON は step を持たず、終了コードに対応する status と id・predicted_label を持つ
+    if v.get("status") == sys.argv[2] and "step" not in v and isinstance(v.get("id"), str) and isinstance(v.get("predicted_label"), str):
         print("ok")
     else:
         print("invalid")
@@ -447,7 +457,7 @@ elif v.get("status") == "ok":
         print("ok")
 else:
     print("invalid")
-' "$name" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
+' "$name" "$infer_status" <"$work/$prefix.stdout" 2>/dev/null) || verdict=invalid
         case "$verdict" in
             skipped) status='"skipped"' ;;
             ok) [ "$name" != "evaluate" ] || status='"ok"' ;;
@@ -455,15 +465,17 @@ else:
             *) step_rc=70 ;;
         esac
     fi
-    cn=$(code_name "$step_rc")
+    rec_rc=$step_rc
+    if [ "$step_rc" -eq 0 ] && [ "$infer_rc" -ne 0 ]; then rec_rc=$infer_rc; fi
+    cn=$(code_name "$rec_rc")
     obytes=$(wc -c <"$work/$prefix.stdout" | tr -d ' ')
     ebytes=$(wc -c <"$work/$prefix.stderr" | tr -d ' ')
     rm -f "$work/$prefix.stdout" "$work/$prefix.stderr"
     entry=$(printf '{"step":"%s","candidate":%s,"exit_code":%s,"code":"%s","status":%s}' \
-        "$name" "$cand_json" "$step_rc" "$cn" "$status")
+        "$name" "$cand_json" "$rec_rc" "$cn" "$status")
     steps_json="${steps_json:+$steps_json,}$entry"
     meta_entry=$(printf '{"step":"%s","candidate":%s,"exit_code":%s,"code":"%s","status":%s,"started_utc":"%s","ended_utc":"%s","stdout_bytes":%s,"stderr_bytes":%s}' \
-        "$name" "$cand_json" "$step_rc" "$cn" "$status" "$t0" "$t1" "$obytes" "$ebytes")
+        "$name" "$cand_json" "$rec_rc" "$cn" "$status" "$t0" "$t1" "$obytes" "$ebytes")
     steps_meta="${steps_meta:+$steps_meta,}$meta_entry"
     if [ "$step_rc" -ne 0 ]; then
         failed_step="\"$name\""
