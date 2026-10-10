@@ -196,6 +196,12 @@ const EVALUATE_OPTS: &[OptSpec] = &[
         false,
         "Evaluated previous project to compare against (read only; its saved predictions are used, no re-inference)",
     ),
+    opt(
+        "--seed-run-project",
+        "DIR",
+        false,
+        "Evaluated project of the same candidate trained with another seed (repeatable; at least 2 for a reproducibility check)",
+    ),
 ];
 const INFER_OPTS: &[OptSpec] = &[
     opt("--package", "PATH", true, "Path to the package"),
@@ -219,6 +225,9 @@ const INFER_OPTS: &[OptSpec] = &[
         "Output path (only with --input-file)",
     ),
 ];
+
+/// 複数回指定できるオプション（値は指定順に集める。#490）。
+const REPEATABLE_OPTS: &[&str] = &["--seed-run-project"];
 
 /// サブコマンドが受理するオプションの表。
 pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
@@ -288,6 +297,8 @@ pub struct EvaluateArgs {
     /// `--previous-project-dir`: 正誤の遷移を比べる評価済みの旧プロジェクト（cwd 配下。読むだけ。
     /// REQ-26・#488・#489）。
     pub previous_project_dir: Option<PathBuf>,
+    /// `--seed-run-project`（指定順。空なら再現性を判定しない。件数の検証は `evaluate` 工程。REQ-26・#490）。
+    pub seed_run_projects: Vec<PathBuf>,
 }
 /// `select` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,7 +523,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, Ar
             .iter()
             .find(|o| o.name == key.as_str())
             .ok_or(ArgsError::UnknownOption { subcommand: sub })?;
-        if values.iter().any(|(n, _)| *n == spec.name) {
+        if !REPEATABLE_OPTS.contains(&spec.name) && values.iter().any(|(n, _)| *n == spec.name) {
             return Err(ArgsError::DuplicateOption { option: spec.name });
         }
         let value = if spec.value.is_some() {
@@ -605,6 +616,18 @@ impl Values {
         self.take(name)
             .map(PathBuf::from)
             .ok_or(ArgsError::MissingRequired { option: name })
+    }
+    fn all_paths(&mut self, name: &'static str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        self.0.retain(|(n, v)| {
+            if *n == name {
+                paths.push(PathBuf::from(v));
+                false
+            } else {
+                true
+            }
+        });
+        paths
     }
     fn opt_path(&mut self, name: &'static str) -> Option<PathBuf> {
         self.take(name).map(PathBuf::from)
@@ -726,11 +749,16 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
             smoke: v.take("--smoke").is_some(),
             train_seed: v.train_seed()?,
         }),
-        Subcommand::Evaluate => Command::Evaluate(EvaluateArgs {
-            project_dir: v.path("--project-dir")?,
-            candidate: v.candidate()?,
-            previous_project_dir: v.opt_path("--previous-project-dir"),
-        }),
+        Subcommand::Evaluate => {
+            // 他の `take`（`swap_remove`）で並びが崩れる前に、指定順のまま取り出す。
+            let seed_run_projects = v.all_paths("--seed-run-project");
+            Command::Evaluate(EvaluateArgs {
+                project_dir: v.path("--project-dir")?,
+                candidate: v.candidate()?,
+                previous_project_dir: v.opt_path("--previous-project-dir"),
+                seed_run_projects,
+            })
+        }
         Subcommand::Select => Command::Select(SelectArgs {
             project_dir: v.path("--project-dir")?,
         }),
@@ -978,7 +1006,8 @@ mod tests {
             Command::Evaluate(EvaluateArgs {
                 project_dir: "proj".into(),
                 candidate: 3,
-                previous_project_dir: None
+                previous_project_dir: None,
+                seed_run_projects: Vec::new(),
             })
         );
         // REQ-26・#488: `--previous-project-dir` は任意（値つき）。
@@ -995,7 +1024,43 @@ mod tests {
             Command::Evaluate(EvaluateArgs {
                 project_dir: "proj".into(),
                 candidate: 3,
-                previous_project_dir: Some("old".into())
+                previous_project_dir: Some("old".into()),
+                seed_run_projects: Vec::new(),
+            })
+        );
+        // REQ-26・#490: `--seed-run-project` は複数回指定でき、指定順に集まる。
+        assert_eq!(
+            run(&[
+                "evaluate",
+                "--seed-run-project",
+                "r2",
+                "--project-dir",
+                "proj",
+                "--seed-run-project=r1",
+                "--candidate",
+                "0",
+                "--seed-run-project",
+                "r3",
+            ]),
+            Command::Evaluate(EvaluateArgs {
+                project_dir: "proj".into(),
+                candidate: 0,
+                previous_project_dir: None,
+                seed_run_projects: vec!["r2".into(), "r1".into(), "r3".into()],
+            })
+        );
+        assert_eq!(
+            p(&[
+                "evaluate",
+                "--project-dir",
+                "proj",
+                "--candidate",
+                "0",
+                "--seed-run-project",
+                ""
+            ]),
+            Err(ArgsError::EmptyValue {
+                option: "--seed-run-project"
             })
         );
     }

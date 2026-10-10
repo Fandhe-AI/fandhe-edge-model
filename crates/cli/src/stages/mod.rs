@@ -59,6 +59,7 @@ mod ledger;
 pub mod package;
 mod previous_comparison;
 pub mod register;
+mod reproducibility;
 pub mod select;
 pub mod train;
 

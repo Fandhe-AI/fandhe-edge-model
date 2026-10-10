@@ -21,11 +21,12 @@ use serde::{Deserialize, Serialize};
 
 /// 評価完了記録の読み込み上限（バイト。読み込み前のサイズ確認に使う。REQ-39）。
 ///
-/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）・対象外ラベル（#478）・旧モデルとの比較（#488）のみを持つ。
+/// 候補 ID・sha256（hex 64 桁）4 個・件数・下限基準比較（#339）・対象外ラベル（#478）・旧モデルとの比較（#488）・再現性（#490）のみを持つ。
 /// 通常は 1 KiB 程度で、`majority_label`・`out_of_scope_label`（各最大 256 バイト）が全て JSON の
 /// `\u00XX` に膨らむ最悪でもこの上限に収まる（テスト `req39_issue339_record_fits_size_limit`。
-/// #478 で 4 KiB から 8 KiB に引き上げた）。
-pub const MAX_EVALUATION_RECORD_BYTES: u64 = 8 * 1024;
+/// #478 で 4 KiB から 8 KiB に、#490 で再現性の欄〔最大 `MAX_REPRODUCIBILITY_RUNS` = 100 run。
+/// 1 run 最大 約 90 バイト〕のため 16 KiB に引き上げた。旧モデルとの比較〔#488〕と同時でも最悪 約 14.3 KiB）。
+pub const MAX_EVALUATION_RECORD_BYTES: u64 = 16 * 1024;
 
 /// 評価完了記録の保存・読み込みの失敗（内容を含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +267,43 @@ pub struct PreviousComparisonRecord {
     pub counts: Option<RegressionCountsRecord>,
 }
 
+/// 再現性の判定（REQ-26・TASK-26.3・#490）。評価器の `OverlapVerdict` の写し。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReproducibilityVerdict {
+    /// すべての seed の組で Wilson 95% 区間が重なる。
+    AllPairsOverlap,
+    /// 重ならない組が 1 組以上ある。
+    SomePairsDisjoint,
+}
+
+/// 再現性の判定に使った 1 seed 分の件数（REQ-26・#490）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReproducibilityRunRecord {
+    /// 学習 seed。
+    pub seed: u32,
+    /// 凍結 test での正解数。
+    pub correct: u64,
+    /// 凍結 test の評価件数。
+    pub total: u64,
+}
+
+/// 3 seed 以上の Wilson 95% 区間の重なりによる再現性の記録（REQ-26・TASK-26.3・#490）。
+///
+/// 自分と `--seed-run-project` の評価記録の件数を seed 昇順に並べたもの。記録・報告のみで、
+/// 終了コード・`package` の照合には使わない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReproducibilityRecord {
+    /// 判定に使った seed（昇順。`runs[].seed` と同じ並び）。
+    pub seeds: Vec<u32>,
+    /// seed ごとの件数（seed 昇順）。
+    pub runs: Vec<ReproducibilityRunRecord>,
+    /// 判定。
+    pub verdict: ReproducibilityVerdict,
+}
+
 /// 評価完了の記録（1 候補・1 評価データ・1 回の適用に 1 つ）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +353,9 @@ pub struct EvaluationRecord {
     /// そのまま読める。`package` は照合しない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_comparison: Option<PreviousComparisonRecord>,
+    /// 再現性（`--seed-run-project` を指定したときだけ。#490・REQ-26）。欄の無い古い記録はそのまま読める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproducibility: Option<ReproducibilityRecord>,
 }
 
 impl EvaluationRecord {
@@ -360,6 +401,7 @@ mod tests {
             out_of_scope_label: None,
             abstention: None,
             previous_comparison: None,
+            reproducibility: None,
         }
     }
 
@@ -482,7 +524,8 @@ mod tests {
         }
     }
 
-    /// REQ-39・#339: 最悪の大きさ（256 バイトの制御文字ラベル・全件数が `u64::MAX`）でも上限内。
+    /// REQ-39・#339・#488・#490: 最悪の大きさ（256 バイトの制御文字ラベル・全件数が `u64::MAX`・旧モデルとの比較と
+    /// 100 run の再現性を同時に持つ。2026-10-10 時点で 14,675 バイト）でも上限内。
     #[test]
     fn req39_issue339_record_fits_size_limit() {
         let record = EvaluationRecord {
@@ -545,6 +588,18 @@ mod tests {
                     incorrect_to_correct: u64::MAX,
                     both_wrong: u64::MAX,
                 }),
+            }),
+            reproducibility: Some(ReproducibilityRecord {
+                seeds: vec![u32::MAX; 100],
+                runs: vec![
+                    ReproducibilityRunRecord {
+                        seed: u32::MAX,
+                        correct: u64::MAX,
+                        total: u64::MAX,
+                    };
+                    100
+                ],
+                verdict: ReproducibilityVerdict::SomePairsDisjoint,
             }),
         };
         let len = record.to_json_vec().expect("json").len() as u64;
@@ -689,5 +744,54 @@ mod tests {
             "\"premise\":\"label_set_differs\",\"evaluation_data\":\"common_subset\",\"n_common\":0,\"counts\":null}}\n"
         ));
         assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+    }
+
+    /// REQ-26・#490: 再現性の欄つきの記録は末尾に完全一致で直列化され、往復できる。
+    /// 欄の無い古い記録は `None` で読め、未知キーは拒否する。
+    #[test]
+    fn req26_issue490_reproducibility_round_trips_and_old_record_reads() {
+        let old = sample().to_json_vec().expect("json");
+        assert_eq!(
+            EvaluationRecord::from_json_slice(&old)
+                .expect("old")
+                .reproducibility,
+            None
+        );
+        let mut record = sample();
+        record.reproducibility = Some(ReproducibilityRecord {
+            seeds: vec![1, 42, 77],
+            runs: vec![
+                ReproducibilityRunRecord {
+                    seed: 1,
+                    correct: 7,
+                    total: 12,
+                },
+                ReproducibilityRunRecord {
+                    seed: 42,
+                    correct: 7,
+                    total: 12,
+                },
+                ReproducibilityRunRecord {
+                    seed: 77,
+                    correct: 8,
+                    total: 12,
+                },
+            ],
+            verdict: ReproducibilityVerdict::AllPairsOverlap,
+        });
+        let bytes = record.to_json_vec().expect("json");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(
+            text.ends_with(
+                ",\"reproducibility\":{\"seeds\":[1,42,77],\"runs\":[{\"seed\":1,\"correct\":7,\"total\":12},{\"seed\":42,\"correct\":7,\"total\":12},{\"seed\":77,\"correct\":8,\"total\":12}],\"verdict\":\"all_pairs_overlap\"}}\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(EvaluationRecord::from_json_slice(&bytes), Ok(record));
+        let unknown = text.replace("\"verdict\"", "\"extra\":1,\"verdict\"");
+        assert_eq!(
+            EvaluationRecord::from_json_slice(unknown.as_bytes()),
+            Err(EvaluationRecordError::Malformed)
+        );
     }
 }

@@ -40,7 +40,8 @@ use serde::Serialize;
 use crate::definition::JudgmentType;
 use crate::evaluation_record::{
     BaselineComparisonVerdict, ComparisonEvaluationData, ComparisonPremiseKind,
-    PreviousModelRecord, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
+    PreviousModelRecord, ReproducibilityVerdict, SelectionSignificanceRecord,
+    TypeMeaningQuadrantRecord,
 };
 use crate::hash::Sha256Digest;
 use crate::rebuild::{RebuildDecision, RebuildReason};
@@ -121,7 +122,7 @@ impl EvaluateReport {
 /// `correct > total`・範囲外の `macro_f1` は `None`。壊れた値を表現できない型にする）。
 /// パス・データ本文・ラベルは載せない（security.md）。宣言順（`step`・`status`・`candidate`・
 /// `kind`・`n_total`・`correct`・`accuracy`・`macro_f1`・`macro_f1_excluded_labels`・`per_label`・
-/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`）に直列化し、`macro_f1` が未定義なら
+/// `type_meaning_quadrant`・`out_of_scope_label`・`calibration`・`abstention`・`comparison`・`reproducibility`）に直列化し、`macro_f1` が未定義なら
 /// `null`（`skip_serializing_if` を付けずスキーマを固定する。分母 0 の指標は `null`。REQ-24）。
 ///
 /// この JSON スキーマは 2026-09-30 にオーナー承認済み（入出力契約への加算的な追加）。
@@ -142,6 +143,7 @@ pub struct EvaluateCompletedReport {
     calibration: Option<EvaluateCalibration>,
     abstention: Option<EvaluateAbstention>,
     comparison: Option<EvaluateComparison>,
+    reproducibility: Option<EvaluateReproducibility>,
 }
 
 /// 区間（`{"lo","hi"}`。Wilson 95% など）。
@@ -220,6 +222,76 @@ impl EvaluateComparison {
                     && interval_ok(&c.incorrect_to_correct_ci95)
             }
         }
+    }
+}
+
+/// `evaluate` の `reproducibility.runs[]` の 1 要素（1 seed 分。REQ-26・#490）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvaluateSeedRun {
+    /// 学習 seed。
+    pub seed: u32,
+    /// 凍結 test での正解数。
+    pub correct: u64,
+    /// 凍結 test の評価件数。
+    pub total: u64,
+    /// 正解率の Wilson 95% 信頼区間。
+    pub ci95: EvaluateInterval,
+}
+
+/// `evaluate` の `reproducibility`（3 seed 以上の Wilson 95% 区間の重なり。REQ-26・TASK-26.3・#490）。
+///
+/// `runs` は seed 昇順、`disjoint_pairs` は区間が重ならなかった seed の組（各組は昇順）。記録・報告のみで
+/// 終了コードに影響しない。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvaluateReproducibility {
+    /// seed ごとの件数と区間（seed 昇順）。
+    pub runs: Vec<EvaluateSeedRun>,
+    /// 判定。
+    pub verdict: ReproducibilityVerdict,
+    /// 区間が重ならなかった seed の組。
+    pub disjoint_pairs: Vec<[u32; 2]>,
+}
+
+/// 再現性の run 数の下限（評価器 `fandhe_edge_eval::reproducibility::MIN_REPRODUCIBILITY_RUNS` の写し。
+/// core は eval に依存できないため値を持ち、CLI のテストで一致を固定する）。
+pub const REPRODUCIBILITY_MIN_RUNS: usize = 3;
+/// 再現性の run 数の上限（評価器 `MAX_REPRODUCIBILITY_RUNS` の写し。同上）。
+pub const REPRODUCIBILITY_MAX_RUNS: usize = 100;
+
+impl EvaluateReproducibility {
+    /// 構造的に整合しているか（[`EvaluateCompletedReport::completed`] の検査用。PR #516 指摘）。
+    ///
+    /// - run 数が [`REPRODUCIBILITY_MIN_RUNS`]`..=`[`REPRODUCIBILITY_MAX_RUNS`]
+    /// - seed が狭義の昇順（重複なし）
+    /// - 各 run の `total` が評価件数 `total` と一致し `correct <= total`、区間は有限で `0 <= lo <= hi <= 1`
+    /// - `disjoint_pairs` の各組は `runs` の seed 2 つの昇順の組で、組は重複しない
+    /// - `disjoint_pairs` が空 ⇔ `verdict` が `all_pairs_overlap`
+    fn is_consistent(&self, total: u64) -> bool {
+        let seeds: Vec<u32> = self.runs.iter().map(|r| r.seed).collect();
+        let count_ok = (REPRODUCIBILITY_MIN_RUNS..=REPRODUCIBILITY_MAX_RUNS).contains(&seeds.len());
+        let ascending = seeds.windows(2).all(|w| matches!(w, [a, b] if a < b));
+        let runs_ok = self.runs.iter().all(|r| {
+            let ci = r.ci95;
+            r.total == total
+                && r.correct <= total
+                && ci.lo.is_finite()
+                && ci.hi.is_finite()
+                && 0.0 <= ci.lo
+                && ci.lo <= ci.hi
+                && ci.hi <= 1.0
+        });
+        let pairs_ok = self
+            .disjoint_pairs
+            .iter()
+            .all(|[a, b]| a < b && seeds.contains(a) && seeds.contains(b))
+            && self
+                .disjoint_pairs
+                .iter()
+                .enumerate()
+                .all(|(i, p)| !self.disjoint_pairs.iter().skip(i + 1).any(|q| q == p));
+        let verdict_ok = self.disjoint_pairs.is_empty()
+            == (self.verdict == ReproducibilityVerdict::AllPairsOverlap);
+        count_ok && ascending && runs_ok && pairs_ok && verdict_ok
     }
 }
 
@@ -302,6 +374,8 @@ pub struct EvaluateDetails {
     pub abstention: Option<EvaluateAbstention>,
     /// 旧モデルとの比較（`--previous-project-dir` が無ければ `None`。#488・#489）。
     pub comparison: Option<EvaluateComparison>,
+    /// 再現性（`--seed-run-project` が無ければ `None`。#490）。各 run の `total` は評価件数と一致すること。
+    pub reproducibility: Option<EvaluateReproducibility>,
 }
 
 impl EvaluateCompletedReport {
@@ -346,6 +420,10 @@ impl EvaluateCompletedReport {
                 .comparison
                 .as_ref()
                 .is_some_and(|c| !c.is_consistent())
+            || details
+                .reproducibility
+                .as_ref()
+                .is_some_and(|r| !r.is_consistent(total))
         {
             return None;
         }
@@ -365,6 +443,7 @@ impl EvaluateCompletedReport {
             calibration: details.calibration,
             abstention: details.abstention,
             comparison: details.comparison,
+            reproducibility: details.reproducibility,
         })
     }
 
@@ -1557,6 +1636,7 @@ mod tests {
             out_of_scope_label: None,
             abstention: None,
             comparison: None,
+            reproducibility: None,
         }
     }
 
@@ -1581,7 +1661,7 @@ mod tests {
         };
         let line = build(ok).expect("report").to_json_line().expect("json");
         assert!(
-            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null}"#),
+            line.contains(r#""out_of_scope_label":"c","calibration":null,"abstention":{"answered":3,"abstained":1,"out_of_scope":1,"coverage":0.75,"correct_answered":3,"adopted_error":0.0,"unconditional_error":0.25},"comparison":null,"reproducibility":null}"#),
             "{line}"
         );
         let all_abstained = EvaluateAbstention {
@@ -1608,6 +1688,89 @@ mod tests {
         );
     }
 
+    /// REQ-26・#490: `reproducibility` つきの JSON が末尾に完全一致する。構造的に整合しないもの（run 数が
+    /// 3 未満・上限超、seed の重複・非昇順、評価件数と合わない run・範囲外の区間、`runs` に無い seed や
+    /// 降順・重複した `disjoint_pairs`、`verdict` と `disjoint_pairs` の食い違い）は作れない（PR #516 指摘）。
+    #[test]
+    fn req26_issue490_reproducibility_json_is_exact() {
+        let run = |seed: u32, correct: u64, lo: f64, hi: f64| EvaluateSeedRun {
+            seed,
+            correct,
+            total: 4,
+            ci95: EvaluateInterval { lo, hi },
+        };
+        let ok_runs = || {
+            vec![
+                run(1, 0, 0.0, 0.5),
+                run(7, 4, 0.5, 1.0),
+                run(42, 4, 0.5, 1.0),
+            ]
+        };
+        let build = |runs: Vec<EvaluateSeedRun>,
+                     verdict: ReproducibilityVerdict,
+                     disjoint_pairs: Vec<[u32; 2]>| {
+            let mut d = details([3, 1, 0, 0, 0]);
+            d.reproducibility = Some(EvaluateReproducibility {
+                runs,
+                verdict,
+                disjoint_pairs,
+            });
+            EvaluateCompletedReport::completed(1, "c3".to_string(), 3, 4, Some(0.5), d)
+        };
+        let disjoint = ReproducibilityVerdict::SomePairsDisjoint;
+        let overlap = ReproducibilityVerdict::AllPairsOverlap;
+        let line = build(ok_runs(), disjoint, vec![[1, 7], [1, 42]])
+            .expect("report")
+            .to_json_line()
+            .expect("json");
+        assert!(
+            line.ends_with(r#""abstention":null,"comparison":null,"reproducibility":{"runs":[{"seed":1,"correct":0,"total":4,"ci95":{"lo":0.0,"hi":0.5}},{"seed":7,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}},{"seed":42,"correct":4,"total":4,"ci95":{"lo":0.5,"hi":1.0}}],"verdict":"some_pairs_disjoint","disjoint_pairs":[[1,7],[1,42]]}}"#),
+            "{line}"
+        );
+        let all = vec![run(1, 2, 0.1, 0.9); REPRODUCIBILITY_MAX_RUNS]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.seed = u32::try_from(i).expect("seed");
+                r
+            })
+            .collect::<Vec<_>>();
+        assert!(build(all.clone(), overlap, vec![]).is_some());
+        // run 数: 2 件・上限超は作れない。
+        assert_eq!(build(ok_runs()[..2].to_vec(), overlap, vec![]), None);
+        let mut too_many = all;
+        too_many.push(run(u32::MAX, 2, 0.1, 0.9));
+        assert_eq!(build(too_many, overlap, vec![]), None);
+        // seed の重複・非昇順。
+        let mut dup = ok_runs();
+        dup[1].seed = 1;
+        assert_eq!(build(dup, overlap, vec![]), None);
+        let mut unsorted = ok_runs();
+        unsorted.swap(1, 2);
+        assert_eq!(build(unsorted, overlap, vec![]), None);
+        // 評価件数と合わない run・範囲外の区間。
+        let mut other_total = ok_runs();
+        other_total[0].total = 5;
+        assert_eq!(build(other_total, overlap, vec![]), None);
+        for (lo, hi) in [(0.6, 0.5), (-0.1, 0.5), (0.1, 1.1), (f64::NAN, 0.5)] {
+            let mut bad = ok_runs();
+            bad[0].ci95 = EvaluateInterval { lo, hi };
+            assert_eq!(build(bad, overlap, vec![]), None, "{lo} {hi}");
+        }
+        // disjoint_pairs: runs に無い seed・降順・同じ seed・重複した組。
+        for pairs in [
+            vec![[1, 9]],
+            vec![[7, 1]],
+            vec![[1, 1]],
+            vec![[1, 7], [1, 7]],
+        ] {
+            assert_eq!(build(ok_runs(), disjoint, pairs.clone()), None, "{pairs:?}");
+        }
+        // verdict と disjoint_pairs の食い違い。
+        assert_eq!(build(ok_runs(), overlap, vec![[1, 7]]), None);
+        assert_eq!(build(ok_runs(), disjoint, vec![]), None);
+    }
+
     /// REQ-22・REQ-27・#477: 校正つきの JSON は `calibration` が完全一致し、範囲外のしきい値は作れない。
     #[test]
     fn req22_issue477_calibration_json_is_exact() {
@@ -1627,7 +1790,7 @@ mod tests {
             .to_json_line()
             .expect("json");
         assert!(
-            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null}"#),
+            line.contains(r#""calibration":{"temperature":1.23,"adopted":true,"threshold":0.61,"n_validation":120,"validation_coverage":0.8},"abstention":null,"comparison":null,"reproducibility":null}"#),
             "{line}"
         );
         assert_eq!(calibration(1.5), None);
@@ -1662,7 +1825,7 @@ mod tests {
         .expect("report");
         assert_eq!(
             report.to_json_line().expect("json"),
-            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null}"#
+            r#"{"step":"evaluate","status":"ok","candidate":1,"kind":"c3","n_total":4,"correct":3,"accuracy":0.75,"macro_f1":0.5,"macro_f1_excluded_labels":["c"],"per_label":[{"label":"a","support":2,"predicted":2,"precision":0.5,"recall":0.5,"f1":0.5},{"label":"c","support":0,"predicted":0,"precision":null,"recall":null,"f1":null}],"type_meaning_quadrant":{"type_ok_meaning_ok":3,"type_ok_meaning_ng":1,"type_ng_count":0,"abstain":0,"error":0},"out_of_scope_label":null,"calibration":null,"abstention":null,"comparison":null,"reproducibility":null}"#
         );
     }
 
@@ -1708,7 +1871,7 @@ mod tests {
             .expect("json");
         assert!(
             line.ends_with(&format!(
-                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}}}}"#,
+                r#""abstention":null,"comparison":{{"previous":{{"candidate_id":"c1","onnx_sha256":"{}","definition_sha256":"{}","evaluation_sha256":"{}"}},"premise":"label_set_differs","removed_labels":["c"],"added_labels":["d"],"evaluation_data":"common_subset","n_common":3,"n_previous_only":2,"n_current_only":1,"counts":{{"n":3,"both_correct":1,"correct_to_incorrect":1,"incorrect_to_correct":1,"both_wrong":0,"correct_to_incorrect_ci95":{{"lo":0.25,"hi":0.5}},"incorrect_to_correct_ci95":{{"lo":0.125,"hi":0.75}}}}}},"reproducibility":null}}"#,
                 "1".repeat(64),
                 "2".repeat(64),
                 "3".repeat(64)
@@ -1721,7 +1884,7 @@ mod tests {
             .expect("json");
         assert!(
             empty.ends_with(
-                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null}}"#
+                r#""n_common":0,"n_previous_only":2,"n_current_only":1,"counts":null},"reproducibility":null}"#
             ),
             "{empty}"
         );

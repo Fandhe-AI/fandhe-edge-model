@@ -1257,6 +1257,7 @@ mod tests {
             out_of_scope_label: None,
             abstention: None,
             previous_comparison: None,
+            reproducibility: None,
         }
     }
 

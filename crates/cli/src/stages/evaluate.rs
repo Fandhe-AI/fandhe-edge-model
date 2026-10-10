@@ -67,8 +67,9 @@
 //!
 //! # 未接続（実装済みを装わない）
 //!
-//! 診断レポート（REQ-29）は結線していない。Wilson 区間は評価記録・結果 JSON には
-//! 含めず、合否基準の照合で `package` 工程が使う（#328）。結果 JSON は正解率と Macro-F1 のみ
+//! 診断レポート（REQ-29）は結線していない。正解率の Wilson 区間は評価記録・結果 JSON には
+//! 含めず、合否基準の照合で `package` 工程が使う（#328。再現性の seed ごとの区間だけは `reproducibility`
+//! に出す。#490）。結果 JSON は正解率と Macro-F1 のみ
 //! （スキーマは 2026-09-30 オーナー承認済み）。
 //!
 //! # 校正（REQ-22・REQ-27・#477）
@@ -103,6 +104,13 @@
 //! （Holm の族の大きさは 1 で恒等）の結果を評価記録の `baseline_comparison` へ残す（出力 JSON は変えない）。
 //! majority は train 分割のラベルだけから作り、必要件数は定義の仮定から求める。どちらも適用権を取る前に
 //! 確定する（[`super::baseline::prepare_baseline`]）。欄が無い定義では比較しない。
+//!
+//! # 再現性（REQ-26・REQ-27・TASK-26.3・#490）
+//!
+//! `--seed-run-project R`（反復可。自分を含め 3 run 以上）を指定すると、seed ごとの複製プロジェクトの
+//! 評価記録を適用権を取る前に読んで照合し（違反は `invalid_input`。適用権を失わない）、自分の正解数の
+//! 確定後に Wilson 95% 区間の重なりを判定して stdout・評価記録の `reproducibility` へ出す
+//! （[`super::reproducibility`]）。終了コードには影響しない。
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -165,6 +173,7 @@ use super::infer::load_backend;
 use super::inspect::load_frozen_evaluation;
 use super::ledger::HeldLedger;
 use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_previous};
+use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
     allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
@@ -197,6 +206,7 @@ struct PreparedCandidate {
 /// 推論・読み込みの上限超過は `limit_exceeded`（20）、I/O 失敗は `runtime_error`（70）。
 /// 適用権の消費後の失敗では、その候補は再評価できない（モジュール doc）。
 pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorReport> {
+    check_run_count(args.seed_run_projects.len())?;
     let project = Project::open(cwd, &args.project_dir)?;
     // 評価データの有無・凍結記録とのハッシュ一致を先に判定する。
     let Some((freeze, eval_bytes)) = load_frozen_evaluation(&project)? else {
@@ -289,13 +299,33 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         .map_err(|_| runtime("cannot hash definition"))?
         .to_hex();
     let onnx_digest = Sha256Digest::of_bytes(&target.artifact.onnx_bytes);
-
     // 旧モデルとの比較の材料は、台帳を開く前（適用権を取る前）に読み・照合して確定する（#488・REQ-27）。
     let previous = args
         .previous_project_dir
         .as_deref()
         .map(|dir| prepare_previous(cwd, dir, &definition, &freeze, &current_records))
         .transpose()?;
+
+    // 再現性の複製プロジェクトの読み込みと照合も適用権を取る前（台帳を開く前）に済ませる（#490）。
+    let seed_runs = if args.seed_run_projects.is_empty() {
+        None
+    } else {
+        let total =
+            u64::try_from(decoded.len()).map_err(|_| runtime("evaluation count overflow"))?;
+        Some(load_seed_runs(
+            cwd,
+            &args.seed_run_projects,
+            &OwnRun {
+                project: &project,
+                candidate: args.candidate,
+                freeze: &freeze,
+                definition_sha256: &definition_sha256,
+                candidate_id: &target.candidate_id,
+                config_id: target.config_id.as_str(),
+                total,
+            },
+        )?)
+    };
 
     // 台帳は保持 fd 起点で開き、以降の操作もすべて fd 相対で行う（REQ-39。[`HeldLedger`]）。
     let held_ledger = HeldLedger::open(&project, true)?
@@ -340,6 +370,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
                 baseline: baseline.as_ref(),
                 calibration: calibration.as_ref(),
                 previous: previous.as_ref(),
+                seed_runs: seed_runs.as_ref(),
             },
             &PredictionsSink {
                 rel: &predictions_rel,
@@ -623,6 +654,7 @@ struct FinalizeContext<'a> {
     baseline: Option<&'a PreparedBaseline>,
     calibration: Option<&'a Calibration>,
     previous: Option<&'a PreparedPrevious>,
+    seed_runs: Option<&'a SeedRuns>,
 }
 
 /// 評価結果を確定する（指標の算出・完了報告の構築・評価記録の書き込み。台帳への完了記録の前に呼ぶ）。
@@ -646,6 +678,7 @@ fn finalize_evaluation(
         baseline,
         calibration,
         previous,
+        seed_runs,
     } = ctx;
     let labels: Vec<&str> = definition.options().iter().map(|c| c.id.as_str()).collect();
     let eval_records: Vec<EvalRecord<'_>> = applied
@@ -692,6 +725,10 @@ fn finalize_evaluation(
             Some(p.compare(&labels, &current)?)
         }
     };
+    // 再現性（自分の正解数の確定後・記録の前。判定は評価器に委ねる。#490）。
+    let reproducibility = seed_runs
+        .map(|r| r.judge(correct, total, freeze.sha256()))
+        .transpose()?;
     let q = &computed.type_meaning_quadrant;
     let quadrant = TypeMeaningQuadrantRecord {
         type_ok_meaning_ok: q.type_ok_meaning_ok(),
@@ -725,6 +762,7 @@ fn finalize_evaluation(
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         abstention: abstention.map(|(report, _)| report),
         comparison: comparison.as_ref().map(|(report, _)| report.clone()),
+        reproducibility: reproducibility.as_ref().map(|(report, _)| report.clone()),
     };
     let report = EvaluateCompletedReport::completed(
         candidate,
@@ -763,6 +801,7 @@ fn finalize_evaluation(
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         abstention: abstention.map(|(_, record)| record),
         previous_comparison: comparison.map(|(_, record)| record),
+        reproducibility: reproducibility.map(|(_, record)| record),
     };
     let record_json = record
         .to_json_vec()
