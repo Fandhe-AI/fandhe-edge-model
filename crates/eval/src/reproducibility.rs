@@ -73,7 +73,7 @@
 //! - 旧モデル比較・回帰件数（TASK-26.1・issue #99。本モジュールとは独立に
 //!   実装する。#99 完了後にモジュール統合を検討する余地はあるが本 issue
 //!   では判断しない）
-//! - CLI `evaluate` への配線・JSON・終了コードへの写像（TASK-33.x・issue #140）
+//! - CLI `evaluate` への配線・JSON（cli の `--seed-run-project` が担う。#490）
 //! - `trainer/` 側の 3 seed 再学習ジョブ管理（REQ-34）
 
 use std::fmt;

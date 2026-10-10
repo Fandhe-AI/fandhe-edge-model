@@ -70,8 +70,7 @@
 //! - 再現性（3 seed の CI 重なり。TASK-26.3）
 //! - TASK-20.1 の作り直し判定（`RebuildDecision`）を受けて作り直し後にのみ
 //!   比較する接続（親 #99 / 後続）
-//! - CLI `evaluate` 工程への配線・JSON 化・終了コードへの写像
-//!   （#140・TASK-33.x）
+//! - CLI `evaluate` 工程への配線・JSON 化（cli の `previous_comparison` が担う。#488・#489）
 //!
 //! # 評価契約との関係（REQ-27）
 //!

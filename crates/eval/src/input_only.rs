@@ -1,10 +1,10 @@
 //! 推論関数へ `input` だけを渡す呼び出し境界と、渡した引数の事後照合。
 //!
-//! CLI の `evaluate` 工程（REQ-33。配線は issue #140 で未実装）が、評価データの
-//! 各レコードを推論へ流す際に呼ぶ想定の層である（REQ-27 異常系「推論関数に
+//! 評価データの各レコードを推論へ流す際に呼ぶ層である（REQ-27 異常系「推論関数に
 //! `input` 以外の情報〔正解・ID・タグ〕が渡っていないことを確認できる」・
 //! TASK-27.2・issue #71。PoC-9 `evaluator/harness.py` の
-//! `ArgumentRecordingPredictor` を移植する）。評価契約「推論関数には `input`
+//! `ArgumentRecordingPredictor` を移植する）。CLI の `evaluate` 工程（REQ-33）は本層を
+//! 経由せず、`final_test_once` の `predict` へ `input` の列だけを渡す（#314）。評価契約「推論関数には `input`
 //! だけを渡す」（`.claude/rules/evaluation-contract.md`）を、共通コア
 //! `fandhe_edge_core::infer_input` の「推論ランタイムへは `input()` のみを渡す」
 //! 想定と対応させて機械照合できる形にする。
@@ -298,8 +298,8 @@ pub fn verify_input_only<F>(
 ///
 /// 注意: この関数は常に `item.input` だけを渡すため、この関数経由では内部の照合は
 /// 恒真になる（実装済みを装わない）。違反検出が実効性を持つのは、呼び出し側が
-/// [`ArgumentRecorder`] を直接駆動して [`verify_input_only`] へ渡す経路であり、
-/// CLI 配線（issue #140）でその形になる想定（REQ-27）。
+/// [`ArgumentRecorder`] を直接駆動して [`verify_input_only`] へ渡す経路である（REQ-27）。
+/// CLI の `evaluate` はどちらの経路も使わない（#314）。
 ///
 /// # Errors
 ///

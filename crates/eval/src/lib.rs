@@ -85,8 +85,8 @@
 //!   [`calibration::calibrate`]）。保留状態への接続と保留込み／保留なしの
 //!   誤り率の比較も実装済み（TASK-22.1-2・issue #96・[`abstention`]）。
 //!   「対象外」ラベルによる扱いも実装済み（TASK-22.2・issue #97。
-//!   [`abstention::OutOfScopeLabel`]。定義ファイル側での指定方法・CLI 配線・
-//!   終了コード 11 への写像は未実装）。coverage の記録と表示も実装済み
+//!   [`abstention::OutOfScopeLabel`]。定義ファイルの `out_of_scope_label`・`evaluate` への出力・
+//!   `infer` の終了コード 11 は #478 で接続済み）。coverage の記録と表示も実装済み
 //!   （TASK-22.3・issue #98・[`coverage`]）
 //! - 分母 0 の指標の `None`（未定義）表示・Macro-F1 の平均から除いた
 //!   ラベルの列挙（[`metrics::MacroF1::excluded_labels`]）: 実装済み
@@ -111,34 +111,38 @@
 //!   仮定値（`p_b`・`p_c`・`alpha`・`power`）を
 //!   定義ファイルの `baseline_comparison`（事前登録した仮定。#339）から受け取る。CLI 引数からは受け取らない。
 //!   複数候補比較の Holm 補正（REQ-25）は実装済み（TASK-25.3・issue #67。
-//!   [`holm`] 参照。「3 seed すべてで有意」の集約・選定〔TASK-18.3〕への
-//!   統合は未実装）
+//!   [`holm`] 参照。選定〔TASK-18.3〕へは `select` の `significance` で接続済み。
+//!   「3 seed すべてで有意」の集約は未実装）
 //! - 旧モデルとの回帰件数・改善件数（REQ-26）: 件数の算出（TASK-26.1-1・
 //!   issue #100）・Wilson 95% 信頼区間の付与（TASK-26.1-2・issue #101）は
 //!   実装済み（[`regression`]）。ラベル集合相違時の前提明記（TASK-26.2・
 //!   issue #102。`regression::regression_report`）も実装済みで、`merges` による
 //!   予測の写像は未実装。
-//!   作り直し判定（TASK-20.1）との接続・CLI への配線は未配線（#469 で追跡）
+//!   CLI へは `evaluate --previous-project-dir` の `comparison` で接続済み（#488・#489）。
+//!   作り直し判定（TASK-20.1）は `register --previous-project-dir` が別に出す
 //! - 再現性判定（REQ-26。3 seed 以上の Wilson 95% 信頼区間の重なり）:
 //!   判定ロジックは実装済み（TASK-26.3-1・issue #104・[`reproducibility`]）。
 //!   CPU 決定性テストは実装済み（TASK-26.3-2・issue #105・
 //!   `tests/reproducibility_determinism.rs`）。GPU（事前登録条件）での確認は
 //!   人間担当の未実施事項（#103）。
-//!   CLI への配線（未配線。#469 で追跡）・3 seed 再学習ジョブ（REQ-34）との接続・
-//!   旧モデル比較（TASK-26.1・issue #99）との統合も未実装
+//!   CLI へは `evaluate --seed-run-project` の `reproducibility` で接続済み（#490）。
+//!   3 seed 再学習ジョブ（REQ-34）との接続・旧モデル比較（TASK-26.1・issue #99）との
+//!   統合は未実装
 //! - 基礎統計（REQ-29・TASK-29.1-1・issue #107。[`diagnostics`]）: 実装済み
 //!   （診断専用。合否判定に使わない）。混同しやすいラベルの組とレポート統合
 //!   （TASK-29.1-2・issue #108）・診断限界の明記（TASK-29.2・issue #109）・データ量水準別の効果報告（TASK-29.3・issue #110）も実装済み。
-//! - abstain_rate・error_rate 等の診断レポート系（REQ-29）: 未実装
-//!   （TASK-29.x。評価データ適用時の coverage は [`coverage`] に実装済み）。[`metrics::SingleSelectMetrics::outcome_counts`] の件数を
-//!   材料にして上位層が算出する
+//!   CLI へは `evaluate` の `diagnostics` で接続済み（#492）
+//! - abstain_rate・error_rate 等の率（REQ-29）: 本 crate では算出しない。
+//!   [`metrics::SingleSelectMetrics::outcome_counts`] の件数を材料に上位層が扱い、`evaluate` は
+//!   abstain・error の件数を `type_meaning_quadrant`、保留込み／保留なしの誤り率と coverage を
+//!   `abstention` に出す
 //! - 評価データのハッシュの前後比較・凍結記録との接続（REQ-17・REQ-27）:
 //!   実装済み（TASK-27.1-2・issue #70。[`eval_data_invariance`]）。ただし
 //!   台帳との突き合わせ・来歴の記録（TASK-17.3 の停止分岐本体・issue #49）は未実装。
 //!   CLI `evaluate` 工程へは #314 で接続済み（終了コードへの写像は cli の `error_report`）
 //! - 推論関数へ `input` 以外を渡さないことの記録・検査（TASK-27.2・issue #71。
 //!   PoC-9 `ArgumentRecordingPredictor` 相当）: 実装済み（[`input_only`]）。
-//!   CLI への配線は未配線（#469 で追跡）
+//!   CLI `evaluate` は [`input_only`] を経由せず、`final_test_once` の `predict` へ `input` の列だけを渡す（#314）
 //! - 凍結した最終 test への 1 回限り適用の強制（TASK-27.3・issue #72）:
 //!   実装済み（[`final_test_once`]。事前登録集合・代表構成ロック・重みロック）。CLI `evaluate`
 //!   工程へは #314 で接続済み（終了コードへの写像は cli の `error_report`）
@@ -146,8 +150,8 @@
 //!   マニフェスト形式（REQ-30・TASK-30.x）: 未実装。[`invariance`] は
 //!   構成要素ごとのダイジェストの集合までを提供し、配布パッケージ形式の
 //!   契約は先取りしない
-//! - CLI への配線: `evaluate` 工程（正解率・Macro-F1。#314）と下限基準比較（McNemar。#339）のみ接続済み。
-//!   上記の他の項目は未配線（#469 で追跡）
+//! - CLI への配線: `evaluate`・`select` へ接続済み（#469）。参考測定のバッチ予測は CLI に無く、
+//!   その規則はテストで固定する（#493）
 //!
 //! # 層の境界・不変条件
 //!
