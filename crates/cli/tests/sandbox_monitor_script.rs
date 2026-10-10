@@ -110,6 +110,10 @@ impl Env {
                  echo '{{\"step\":\"select\",\"status\":\"ok\",\"candidate\":0}}'\n\
                  exit 0\n\
                  fi\n\
+                 if [ \"$1\" = evaluate ] && [ -n \"${{FAKE_EVAL_OUT:-}}\" ]; then\n\
+                 printf '%s\\n' \"$FAKE_EVAL_OUT\"\n\
+                 exit 0\n\
+                 fi\n\
                  if [ \"$1\" = infer ]; then\n\
                  echo '{{\"id\":\"input\",\"status\":\"ok\",\"predicted_label\":\"a\"}}'\n\
                  exit 0\n\
@@ -307,6 +311,20 @@ fn req38_clean_stream_reports_zero_network_denials() {
     );
     assert!(e.out().join("run").join("run.meta.json").is_file());
     assert_eq!(e.cli_calls().len(), 7);
+}
+
+/// REQ-38・#469: `--extended` は sandbox-run.sh へ引き渡され、監視窓の中で追加工程（7 + 6 回の起動）が
+/// 完走して通信拒否 0 件になる。証拠種別はテストハーネス（偽の log・偽の launcher）。
+#[test]
+fn req38_extended_is_passed_through_the_monitor() {
+    let e = Env::new();
+    let mut args = e.base_args();
+    args.push("--extended".to_string());
+    let eval = r#"{"step":"evaluate","status":"ok","calibration":{},"abstention":{}}"#;
+    let o = e.run("clean.ndjson", &args, &[("FAKE_EVAL_OUT", eval)]);
+    assert_eq!(o.code, Some(0), "{}", o.stdout);
+    has(&o, "\"network_verdict\": \"zero_network_denials\"");
+    assert_eq!(e.cli_calls().len(), 13);
 }
 
 /// プロセス名が許可リストでも PID を照合できなければ帰属不明で pending(12)（名前だけで
