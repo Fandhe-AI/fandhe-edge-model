@@ -33,12 +33,16 @@
 //! 計測値の値型（[`PackageCapacity`]・[`InferP95`]）は runtime に依存しない整数・bool の型で、
 //! 境界規則（`>`）は runtime の `LimitBreach` が唯一の実装であり、ここでは比較しない。
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
+use crate::definition::JudgmentType;
 use crate::evaluation_record::{
     BaselineComparisonVerdict, SelectionSignificanceRecord, TypeMeaningQuadrantRecord,
 };
 use crate::hash::Sha256Digest;
+use crate::rebuild::{RebuildDecision, RebuildReason};
 
 /// CLI の 7 工程（REQ-33。工程順）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -601,7 +605,9 @@ impl PackageReport {
 ///
 /// パス・データ本文は載せない（security.md）。`definition_sha256` は定義の正準化ハッシュ
 /// （[`crate::definition::Definition::canonical_hash`]）、`options` は選択肢数、
-/// `evaluation_defined` は独立した評価データを取り込んだか（REQ-17）。
+/// `evaluation_defined` は独立した評価データを取り込んだか（REQ-17）。`rebuild` は
+/// `--previous-project-dir` を指定したときの作り直し判定（[`RebuildReport`]。REQ-20・#487）で、
+/// 指定しなければ `null`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegisterReport {
     step: Stage,
@@ -609,18 +615,25 @@ pub struct RegisterReport {
     definition_sha256: String,
     options: usize,
     evaluation_defined: bool,
+    rebuild: Option<RebuildReport>,
 }
 
 impl RegisterReport {
     /// `register` の完了結果を作る。
     #[must_use]
-    pub fn new(definition_sha256: String, options: usize, evaluation_defined: bool) -> Self {
+    pub fn new(
+        definition_sha256: String,
+        options: usize,
+        evaluation_defined: bool,
+        rebuild: Option<RebuildReport>,
+    ) -> Self {
         Self {
             step: Stage::Register,
             status: StageStatus::Ok,
             definition_sha256,
             options,
             evaluation_defined,
+            rebuild,
         }
     }
 
@@ -630,6 +643,105 @@ impl RegisterReport {
     /// `serde_json` 側の直列化エラーをそのまま返す。
     pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+}
+
+/// 作り直し判定の区分（[`RebuildDecision`] の 3 バリアントに対応。REQ-20）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RebuildDecisionKind {
+    Required,
+    NotRequired,
+    Unchanged,
+}
+
+/// 作り直しが必要な理由 1 件（[`RebuildReason`] の直列化形。`kind` で区別する）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RebuildReasonReport {
+    OptionIdsChanged {
+        added: BTreeSet<String>,
+        removed: BTreeSet<String>,
+    },
+    JudgmentTypeChanged {
+        old: JudgmentType,
+        new: JudgmentType,
+    },
+}
+
+/// `register --previous-project-dir` の作り直し判定（`RegisterReport` の `rebuild` 欄。
+/// REQ-20・TASK-20.1〜20.3・#487。契約は 2026-10-10 オーナー承認）。
+///
+/// 判定は共通コアの [`crate::rebuild::decide_rebuild`] の結果をそのまま写す（ここで再判定しない）。
+/// `reasons` は `required` のときだけ、`display_name_changed`・`description_changed` は
+/// `not_required` のときだけ中身を持ち、それ以外は空配列。ID は辞書順（`BTreeSet`）。
+/// `training_data_changed`・`evaluation_data_changed` は旧プロジェクトの取り込み済みデータとの
+/// sha256 比較（片側が無ければ `null`）で、`decision` には影響しない。パス・本文は載せない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RebuildReport {
+    decision: RebuildDecisionKind,
+    previous_definition_sha256: String,
+    reasons: Vec<RebuildReasonReport>,
+    display_name_changed: BTreeSet<String>,
+    description_changed: BTreeSet<String>,
+    training_data_changed: Option<bool>,
+    evaluation_data_changed: Option<bool>,
+}
+
+impl RebuildReport {
+    /// 判定結果と旧定義の正準化ハッシュ・データ差から作る。
+    #[must_use]
+    pub fn new(
+        decision: &RebuildDecision,
+        previous_definition_sha256: String,
+        training_data_changed: Option<bool>,
+        evaluation_data_changed: Option<bool>,
+    ) -> Self {
+        let (kind, reasons, display_name_changed, description_changed) = match decision {
+            RebuildDecision::Unchanged { .. } => (
+                RebuildDecisionKind::Unchanged,
+                Vec::new(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
+            RebuildDecision::NotRequired(n) => (
+                RebuildDecisionKind::NotRequired,
+                Vec::new(),
+                n.display_name_changed().clone(),
+                n.description_changed().clone(),
+            ),
+            RebuildDecision::Required(r) => (
+                RebuildDecisionKind::Required,
+                r.reasons()
+                    .iter()
+                    .map(|reason| match reason {
+                        RebuildReason::OptionIdsChanged { added, removed } => {
+                            RebuildReasonReport::OptionIdsChanged {
+                                added: added.clone(),
+                                removed: removed.clone(),
+                            }
+                        }
+                        RebuildReason::JudgmentTypeChanged { old, new } => {
+                            RebuildReasonReport::JudgmentTypeChanged {
+                                old: *old,
+                                new: *new,
+                            }
+                        }
+                    })
+                    .collect(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
+        };
+        Self {
+            decision: kind,
+            previous_definition_sha256,
+            reasons,
+            display_name_changed,
+            description_changed,
+            training_data_changed,
+            evaluation_data_changed,
+        }
     }
 }
 
@@ -1544,12 +1656,41 @@ mod tests {
     #[test]
     fn req33_register_report_json_is_exact() {
         assert_eq!(
-            RegisterReport::new("ab".repeat(32), 3, false)
+            RegisterReport::new("ab".repeat(32), 3, false, None)
                 .to_json_line()
                 .expect("json"),
             format!(
-                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":false}}",
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":false,\"rebuild\":null}}",
                 "ab".repeat(32)
+            )
+        );
+    }
+
+    /// REQ-20・#487: 判定型の変更と選択肢 ID の変更は `kind` で区別した理由として、ID は辞書順で出る。
+    #[test]
+    fn req20_register_rebuild_required_json_is_exact() {
+        let decision = RebuildDecision::Required(
+            crate::rebuild::RequiredRebuild::from_reasons(vec![
+                RebuildReason::OptionIdsChanged {
+                    added: ["d".to_string(), "b".to_string()].into(),
+                    removed: ["c".to_string()].into(),
+                },
+                RebuildReason::JudgmentTypeChanged {
+                    old: JudgmentType::SingleSelect,
+                    new: JudgmentType::TestOnlyAlternate,
+                },
+            ])
+            .expect("non-empty"),
+        );
+        let report = RebuildReport::new(&decision, "cd".repeat(32), Some(true), None);
+        assert_eq!(
+            RegisterReport::new("ab".repeat(32), 3, true, Some(report))
+                .to_json_line()
+                .expect("json"),
+            format!(
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":true,\"rebuild\":{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"option_ids_changed\",\"added\":[\"b\",\"d\"],\"removed\":[\"c\"]}},{{\"kind\":\"judgment_type_changed\",\"old\":\"single_select\",\"new\":\"test_only_alternate\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":true,\"evaluation_data_changed\":null}}}}",
+                "ab".repeat(32),
+                "cd".repeat(32)
             )
         );
     }

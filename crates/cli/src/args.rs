@@ -116,6 +116,12 @@ const fn opt(
 const REGISTER_OPTS: &[OptSpec] = &[
     opt("--definition", "PATH", true, "Path to the definition file"),
     opt("--project-dir", "DIR", true, "Project directory"),
+    opt(
+        "--previous-project-dir",
+        "DIR",
+        false,
+        "Existing project to compare against for the rebuild decision (read only)",
+    ),
 ];
 const PROJECT_OPTS: &[OptSpec] = &[opt("--project-dir", "DIR", true, "Project directory")];
 const PACKAGE_OPTS: &[OptSpec] = &[
@@ -220,6 +226,8 @@ pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
 pub struct RegisterArgs {
     pub definition: PathBuf,
     pub project_dir: PathBuf,
+    /// 作り直し判定（REQ-20・#487）の比較元となる既存プロジェクト。読むだけで書かない。
+    pub previous_project_dir: Option<PathBuf>,
 }
 /// `inspect` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,6 +678,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
         Subcommand::Register => Command::Register(RegisterArgs {
             definition: v.path("--definition")?,
             project_dir: v.path("--project-dir")?,
+            previous_project_dir: v.opt_path("--previous-project-dir"),
         }),
         Subcommand::Inspect => Command::Inspect(InspectArgs {
             project_dir: v.path("--project-dir")?,
@@ -773,7 +782,24 @@ mod tests {
             run(&["register", "--definition", "d.json", "--project-dir=proj"]),
             Command::Register(RegisterArgs {
                 definition: "d.json".into(),
-                project_dir: "proj".into()
+                project_dir: "proj".into(),
+                previous_project_dir: None,
+            })
+        );
+        assert_eq!(
+            run(&[
+                "register",
+                "--definition",
+                "d.json",
+                "--project-dir",
+                "proj",
+                "--previous-project-dir",
+                "old",
+            ]),
+            Command::Register(RegisterArgs {
+                definition: "d.json".into(),
+                project_dir: "proj".into(),
+                previous_project_dir: Some("old".into()),
             })
         );
     }

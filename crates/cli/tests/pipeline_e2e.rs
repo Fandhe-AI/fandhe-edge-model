@@ -249,7 +249,7 @@ mod suite {
         assert_eq!(
             env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]),
             format!(
-                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{hash}\",\"options\":3,\"evaluation_defined\":false}}\n"
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{hash}\",\"options\":3,\"evaluation_defined\":false,\"rebuild\":null}}\n"
             )
         );
         let inspect = env.ok(&["inspect", "--project-dir", "proj"]);

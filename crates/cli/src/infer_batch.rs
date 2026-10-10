@@ -1030,6 +1030,7 @@ mod tests {
             Command::Register(RegisterArgs {
                 definition: p(),
                 project_dir: p(),
+                previous_project_dir: None,
             }),
             Command::Inspect(InspectArgs {
                 project_dir: p(),
