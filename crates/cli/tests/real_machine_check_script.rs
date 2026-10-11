@@ -167,26 +167,37 @@ train)
     mkdir -p "$jd"
     printf '{"schema_version":1,"state":"running","started_at_unix":1,"finished_at_unix":null,"failure":null}\n' > "$jd/job.json"
     echo $$ > "$jd/owner.pid"
-    if [ -n "${FAKE_H_LEAK:-}" ]; then
-      sleep 300 &
-    else
-      sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.2; done' sh $$ &
-    fi
-    child=$!
+    # ワーカーの代役は実 trainer と同じ argv の印（launch.py _worker）を持つ。FAKE_H_WORKER_DELAY
+    # （0.1 秒の周回数）だけ遅れて起動する（CLI だけの状態で操作されないことの確認）
+    child=
+    wstarted=0
+    spawn_worker() {
+      if [ -n "${FAKE_H_LEAK:-}" ]; then
+        sh -c 'sleep 300; :' launch.py _worker &
+      else
+        sh -c 'while kill -0 "$2" 2>/dev/null; do sleep 0.2; done' launch.py _worker $$ &
+      fi
+      child=$!
+      wstarted=1
+    }
+    delay=${FAKE_H_WORKER_DELAY:-0}
+    [ "$delay" -gt 0 ] || spawn_worker
     n=0
     while [ ! -e "$jd/cancel.request" ] && [ "$n" -lt 900 ]; do
       sleep 0.1
       n=$((n + 1))
+      if [ "$wstarted" = 0 ] && [ "$n" -ge "$delay" ]; then spawn_worker; fi
     done
     if [ -e "$jd/cancel.request" ]; then
-      [ -n "${FAKE_H_LEAK:-}" ] || kill "$child" 2>/dev/null
+      echo "$wstarted" > "$FAKE_DIR/h.cancel_saw_worker"
+      [ -n "${FAKE_H_LEAK:-}" ] || [ -z "$child" ] || kill "$child" 2>/dev/null
       printf '{"schema_version":1,"state":"cancelled","started_at_unix":1,"finished_at_unix":2,"failure":null}\n' > "$jd/job.json"
       msg="training cancelled"
       [ "$bad" = cancel_message ] && msg="training failed"
       printf '{"code":"runtime_error","message":"%s","step":"train","candidate":%s,"job":{"state":"cancelled","crash_detected":false,"failure":null,"record_updated":false},"restart":{"resumable":false,"action":"restart_from_scratch","reason_code":"resume_not_supported","out_dir_action":"not_inspected","message":"m"}}\n' "$msg" "$cnum"
       exit 70
     fi
-    kill "$child" 2>/dev/null
+    [ -z "$child" ] || kill "$child" 2>/dev/null
     exit 1
   fi
   cand=0
@@ -363,7 +374,15 @@ infer)
     [ "$bad" = infer_notmax ] && lab=beta
     st='"ok"'
     [ -n "${FAKE_INFER_STATUS_NESTED:-}" ] && st='{"k":"SECRET_BODY_7c1"}'
+    # J: 台帳つきの infer は校正つきパッケージを模して対象外（11）・保留（12）を返しうる
+    jrc=0
+    if [ -n "$ledger" ] && [ -n "${FAKE_J_STATUS:-}" ]; then
+      st="\"$FAKE_J_STATUS\""
+      case "$FAKE_J_STATUS" in abstain) jrc=12 ;; out_of_scope) jrc=11 ;; esac
+      [ "$bad" = j_status_mismatch ] && jrc=0
+    fi
     printf '{"id":"%s","status":%s,"predicted_label":"%s","scores":'"$SC"'%s}\n' "$id" "$st" "$lab" "$extra_infer"
+    exit "$jrc"
   fi ;;
 *) exit 99 ;;
 esac
@@ -3033,7 +3052,8 @@ fn req39_h_fails_when_descendants_remain_after_cancel() {
     assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.H.status"), "\"failed\"");
     assert_eq!(e.q("items.H.reason"), "\"descendants_remain_after_cancel\"");
-    assert_eq!(e.q("items.H.descendants_remaining"), "1");
+    // ワーカーの代役の sh とその子の sleep の 2 プロセスが残る
+    assert_eq!(e.q("items.H.descendants_remaining"), "2");
 }
 
 /// REQ-34: キャンセル応答・train の出力・status の内容が契約と違えば H の失敗（固定の理由）。
@@ -3143,4 +3163,48 @@ fn req39_j_fails_when_a_tampered_package_is_not_rejected() {
     assert_eq!(o.code, Some(10), "{}", o.diag());
     assert_eq!(e.q("items.J.status"), "\"failed\"");
     assert_eq!(e.q("items.J.reason"), "\"rejection_not_64\"");
+}
+/// REQ-34・REQ-39: H は学習ワーカー（`launch.py _worker`）が現れるまで cancel を送らない。CLI と
+/// supervisor だけ（子孫 2 件）の状態で送ると、ワーカーの起動前に止めてしまい子孫の確認が空になる。
+#[test]
+fn req34_h_waits_for_the_worker_before_cancelling() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "H"]),
+        &[("FAKE_H_WORKER_DELAY", "25")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.H.status"), "\"ok\"");
+    let saw = fs::read_to_string(e.dir.join("h.cancel_saw_worker")).expect("marker");
+    assert_eq!(
+        saw.trim(),
+        "1",
+        "cancel was requested before the worker started"
+    );
+}
+
+/// REQ-34・#491: 校正つきのパッケージでは `infer` が対象外（exit 11）・保留（exit 12）を返しうる。
+/// J は終了コードと `status` の対応が合えば許容し、対応しない組（status が abstain で exit 0）は失敗にする。
+#[test]
+fn req34_j_accepts_out_of_scope_and_abstain_only_when_exit_code_matches() {
+    for status in ["abstain", "out_of_scope"] {
+        let e = Env::new();
+        let o = e.run(
+            &with_work(&e, &["--items", "B,J"]),
+            &[("FAKE_J_STATUS", status)],
+        );
+        assert_eq!(o.code, Some(0), "{status}: {}", o.diag());
+        assert_eq!(e.q("items.J.status"), "\"ok\"", "{status}");
+    }
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B,J"]),
+        &[
+            ("FAKE_J_STATUS", "abstain"),
+            ("FAKE_BAD", "j_status_mismatch"),
+        ],
+    );
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.J.status"), "\"failed\"");
+    assert_eq!(e.q("items.J.reason"), "\"unexpected_output\"");
 }

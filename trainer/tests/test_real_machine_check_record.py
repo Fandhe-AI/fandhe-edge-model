@@ -5004,3 +5004,173 @@ def test_run_cmd_calls_during_with_the_wrapper_pid_and_can_skip_the_group_kill(
         assert _wait_for(lambda p=pid: not _alive(p), 5.0) is reap
         if not reap:
             os.kill(pid, signal.SIGKILL)
+
+
+# ---- H の子孫の観測（#524 の指摘。ワーカーの出現待ち・pid 再利用・例外経路） ----
+
+
+def test_is_worker_matches_the_supervisor_argv() -> None:
+    """REQ-39: ワーカーは `launch.py _worker` の argv で見分ける（CLI・supervisor は除く）。"""
+    worker = "/py/bin/python -I /repo/trainer/launch.py _worker --out-fd 5 --lifeline-fd 6"
+    assert mod.is_worker(worker)
+    assert not mod.is_worker("/repo/target/release/fandhe-edge train --candidate 0")
+    assert not mod.is_worker("/py/bin/python -I /repo/trainer/launch.py train")
+    assert not mod.is_worker("sh -c _worker")
+
+
+def test_ps_procs_records_start_time_and_command_for_this_process() -> None:
+    """REQ-39: `ps` の表は開始時刻（pid の再利用の見分け）と引数全体を持つ。"""
+    procs = mod.ps_procs()
+    assert procs is not None
+    me = procs[os.getpid()]
+    assert me.ppid == os.getppid()
+    assert len(me.start.split()) == 5
+    assert "python" in me.command.lower() or "pytest" in me.command.lower()
+
+
+def _sleeper() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(["/bin/sleep", "60"])
+
+
+def test_kill_seen_does_not_signal_a_process_whose_start_time_differs() -> None:
+    """REQ-39: 開始時刻が控えと違う pid（再利用された別のプロセス）へは KILL を送らない。"""
+    proc = _sleeper()
+    try:
+        procs = mod.ps_procs()
+        assert procs is not None
+        start = procs[proc.pid].start
+        left = mod.kill_seen({proc.pid: "Mon Jan  1 00:00:00 1990"})
+        assert proc.poll() is None
+        assert left == []  # 別のプロセスなので「残った子孫」にも数えない
+        assert mod.alive_seen({proc.pid: start}) == [proc.pid]
+        mod.kill_seen({proc.pid: start})
+        assert proc.wait(timeout=10) != 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_settle_descendants_kills_confirmed_survivors_on_exception_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: `run()` の例外（中断・全体の期限）でも、控えた子孫は finally で止める。"""
+    for exc in (mod.Interrupted, mod.OverallTimeout):
+        proc = _sleeper()
+        try:
+            procs = mod.ps_procs()
+            assert procs is not None
+            drv = types.SimpleNamespace(seen={proc.pid: procs[proc.pid].start})
+
+            def boom(e: type[BaseException] = exc) -> Any:
+                raise e
+
+            with pytest.raises(exc):
+                mod.settle_descendants(drv, boom)  # type: ignore[arg-type]
+            assert proc.wait(timeout=10) != 0
+        finally:
+            proc.kill()
+            proc.wait()
+    # 待機中の中断も同じ
+    proc = _sleeper()
+    try:
+        procs = mod.ps_procs()
+        assert procs is not None
+        drv = types.SimpleNamespace(seen={proc.pid: procs[proc.pid].start})
+        monkeypatch.setattr(
+            mod,
+            "check_interrupt",
+            _raise_interrupt,
+        )
+        with pytest.raises(mod.Interrupted):
+            mod.settle_descendants(drv, lambda: None)  # type: ignore[arg-type]
+        assert proc.wait(timeout=10) != 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _raise_interrupt() -> None:
+    raise mod.Interrupted
+
+
+def test_kill_seen_marks_child_may_remain_when_a_survivor_cannot_be_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: KILL しても残る（`ps` で確認できない場合を含む）なら `child_may_remain` を立てる。"""
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "ps_procs", lambda: None)
+    assert mod.kill_seen({4242: "x"}) == [4242]
+    assert mod._child_may_remain is True
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    start = "Mon Jan  1 00:00:00 2026"
+    stuck = {4242: mod.Proc(1, start, "x")}
+    monkeypatch.setattr(mod, "ps_procs", lambda: stuck)
+    monkeypatch.setattr(mod.os, "kill", lambda pid, sig: None)
+    assert mod.kill_seen({4242: start}) == [4242]
+    assert mod._child_may_remain is True
+
+
+def _driver(tmp_path: Path, mode: str, procs: dict[int, Any]) -> tuple[Any, list[tuple[int, int]]]:
+    """`ps` と `os.kill` を差し替えた `JobDriver`（job.json は running）。"""
+    job = tmp_path / "project/candidates/0/job"
+    job.mkdir(parents=True)
+    (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
+    (tmp_path / "steps").mkdir()
+    cli = _fake_cli(
+        tmp_path,
+        'echo \'{"step":"train","status":"ok","cancellations":[]}\'\n',
+    )
+    drv = mod.JobDriver(_ctx(tmp_path, cli), tmp_path, mode)
+    return drv, []
+
+
+def test_job_driver_waits_for_the_worker_and_keeps_observing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34・REQ-39: CLI と supervisor だけでは操作せず、`_worker` の出現後に操作する。
+
+    操作の後に起動したワーカーも `seen` に控える。
+    """
+    start = "Mon Jan  1 00:00:00 2026"
+    proc_cls = mod.Proc
+    procs: dict[int, Any] = {
+        10: proc_cls(1, start, "sh wrapper"),
+        11: proc_cls(10, start, "fandhe-edge train --candidate 0"),
+        12: proc_cls(11, start, "python -I /t/launch.py train"),
+    }
+    drv, _ = _driver(tmp_path, "kill", procs)
+    killed: list[int] = []
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    drv(10)
+    assert drv.done is False
+    assert killed == []  # CLI と supervisor だけ（子孫 2 件）では送らない
+    assert set(drv.seen) == {11, 12}
+    procs[13] = proc_cls(12, start, "python -I /t/launch.py _worker --out-fd 5")
+    drv(10)
+    assert drv.done is True
+    assert killed == [11]
+    assert drv.worker_seen is True
+    # 操作の後に起動したワーカー（別のもの）も控える
+    procs[14] = proc_cls(12, start, "python -I /t/launch.py _worker --out-fd 7")
+    drv(10)
+    assert set(drv.seen) == {11, 12, 13, 14}
+    assert killed == [11]
+
+
+def test_job_driver_cancel_mode_runs_cancel_only_after_the_worker_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34: cancel モードも同様に、ワーカーが現れてから `train --cancel` を実行する。"""
+    start = "Mon Jan  1 00:00:00 2026"
+    proc_cls = mod.Proc
+    procs: dict[int, Any] = {11: proc_cls(10, start, "cli"), 12: proc_cls(11, start, "supervisor")}
+    drv, _ = _driver(tmp_path, "cancel", procs)
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    drv(10)
+    assert drv.cancel_rc is None
+    procs[13] = proc_cls(12, start, "python launch.py _worker")
+    drv(10)
+    assert drv.cancel_rc == 0

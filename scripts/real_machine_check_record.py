@@ -2544,13 +2544,23 @@ def item_g(ctx: Ctx) -> dict[str, Any]:
     return dict({"status": "ok", "exit_code": rc, "steps": steps}, **summary)
 
 
-def ps_table() -> dict[int, int] | None:
-    """`ps` の (pid → ppid) 表。固定パスの `ps` が使えなければ None（REQ-38・REQ-39）。"""
+# プロセスの識別情報（pid の再利用で無関係なプロセスを止めないため、開始時刻と併せて控える）
+@dataclass(frozen=True)
+class Proc:
+    """`ps` の 1 行。`start` は開始時刻（`lstart`。pid の再利用の見分け）、`command` は引数全体。"""
+
+    ppid: int
+    start: str
+    command: str
+
+
+def ps_procs() -> dict[int, Proc] | None:
+    """`ps` の (pid → `Proc`) 表。固定パスの `ps` が使えなければ None（REQ-38・REQ-39）。"""
     if not os.path.isfile(PS_PATH) or not os.access(PS_PATH, os.X_OK):
         return None
     try:
         r = subprocess.run(  # noqa: S603  固定の絶対パスと固定の引数
-            [PS_PATH, "-A", "-o", "pid=,ppid="],
+            [PS_PATH, "-A", "-o", "pid=,ppid=,lstart=,command="],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=TIMEOUT_AUX,
@@ -2561,12 +2571,21 @@ def ps_table() -> dict[int, int] | None:
         return None
     if r.returncode != 0:
         return None
-    table: dict[int, int] = {}
-    for line in split_lines(r.stdout.decode("ascii", errors="replace")):
-        parts = line.split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            table[int(parts[0])] = int(parts[1])
+    table: dict[int, Proc] = {}
+    for line in split_lines(r.stdout.decode("utf-8", errors="replace")):
+        parts = line.split(None, 7)
+        # pid ppid + lstart（曜日 月 日 時刻 年の 5 語）+ command
+        if len(parts) >= 7 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = Proc(
+                int(parts[1]), " ".join(parts[2:7]), parts[7] if len(parts) > 7 else ""
+            )
     return table
+
+
+def ps_table() -> dict[int, int] | None:
+    """`ps` の (pid → ppid) 表。使えなければ None。"""
+    procs = ps_procs()
+    return None if procs is None else {pid: pr.ppid for pid, pr in procs.items()}
 
 
 def descendants_of(table: dict[int, int], root: int) -> set[int]:
@@ -2580,17 +2599,31 @@ def descendants_of(table: dict[int, int], root: int) -> set[int]:
     return found
 
 
+def is_worker(command: str) -> bool:
+    """学習ワーカー（`_worker`）か。
+
+    supervisor は `<python> -I <trainer>/launch.py _worker --out-fd N --lifeline-fd N` で
+    起動する（trainer/src/fandhe_edge_trainer/supervisor.py の `worker_argv`）。
+    """
+    tokens = command.split()
+    return "_worker" in tokens and any(t.endswith("launch.py") for t in tokens)
+
+
+def _same_proc(procs: dict[int, Proc] | None, pid: int, start: str) -> bool:
+    """`pid` が控えた開始時刻と同じプロセスとして今も存在するか。"""
+    return procs is not None and pid in procs and procs[pid].start == start
+
+
 class JobDriver:
-    """H: 実行中の `train` の `job.json` が running になり子孫が現れたら、操作を行う。
+    """H: 実行中の `train` の `job.json` が running になり、学習ワーカーが現れたら操作を行う。
 
-    操作はキャンセル要求か KILL。
-
-    `run_cmd` の `during` コールバックとして呼ばれる（待機の周ごと。実際の確認は
-    `H_POLL_SEC` ごと）。
-    例外は外へ出さず `error` に固定語彙で残す。`mode` は `cancel`（`train --cancel` を実行）か
-    `kill`（train 本体の CLI を `SIGKILL`）。running を待つのは `H_WAIT_RUNNING_SEC` まで
-    で、超えたらそのまま実行し `timed_out` を立てる（呼び出し側が失敗にする）。観測した
-    子孫の pid は `seen` に残す。
+    操作はキャンセル要求か KILL。`run_cmd` の `during` コールバックとして呼ばれる（待機の周
+    ごと。実際の確認は `H_POLL_SEC` ごと）。例外は外へ出さず `error` に固定語彙で残す。
+    `mode` は `cancel`（`train --cancel` を実行）か `kill`（train 本体の CLI を `SIGKILL`）。
+    操作は `_worker`（`is_worker`。CLI と supervisor だけの状態では送らない）の出現後に行う。
+    running・ワーカーを待つのは `H_WAIT_RUNNING_SEC` までで、超えたらそのまま実行し
+    `timed_out` を立てる（呼び出し側が失敗にする）。操作後も、train の終了まで子孫を観測し続け、
+    見つけたプロセスを `seen`（pid → 開始時刻）に残す。
     """
 
     def __init__(self, ctx: Ctx, cwd: Path, mode: str) -> None:
@@ -2600,7 +2633,8 @@ class JobDriver:
         self.done = False
         self.timed_out = False
         self.error: str | None = None
-        self.seen: set[int] = set()
+        self.seen: dict[int, str] = {}
+        self.worker_seen = False
         self.cancel_rc: int | None = None
         self.killed = False
 
@@ -2611,7 +2645,7 @@ class JobDriver:
 
     def __call__(self, root: int) -> None:
         now = time.monotonic()
-        if self.done or now - self.last < H_POLL_SEC:
+        if self.error is not None or now - self.last < H_POLL_SEC:
             return
         self.last = now
         try:
@@ -2620,21 +2654,26 @@ class JobDriver:
             self.error, self.done = "driver_error", True
 
     def _tick(self, root: int, now: float) -> None:
-        table = ps_table()
-        if table is None:
+        procs = ps_procs()
+        if procs is None:
             self.error, self.done = "ps_unavailable", True
             return
+        table = {pid: pr.ppid for pid, pr in procs.items()}
         desc = descendants_of(table, root)
-        self.seen |= desc
+        for pid in desc:
+            self.seen.setdefault(pid, procs[pid].start)
+            if is_worker(procs[pid].command):
+                self.worker_seen = True
+        if self.done:
+            return  # 操作の後も観測は続ける（後から起動したワーカーも控える）
         waited_out = now - self.started > H_WAIT_RUNNING_SEC
-        # 外側の sh の子が CLI で、その下にワーカーが現れて初めて子孫の確認に意味がある（2 件以上）
-        if not (self._job_state() == "running" and len(desc) >= 2) and not waited_out:
+        if not (self._job_state() == "running" and self.worker_seen) and not waited_out:
             return
         self.timed_out = waited_out
         self.done = True
         if self.mode == "kill":
             cli = sorted(p for p in desc if table.get(p) == root)
-            if cli:
+            if cli and _same_proc(ps_procs(), cli[0], procs[cli[0]].start):
                 os.kill(cli[0], signal.SIGKILL)
                 self.killed = True
             return
@@ -2659,15 +2698,23 @@ class JobDriver:
         self.cancel_rc = r.returncode
 
 
-def wait_descendants_gone(seen: set[int]) -> list[int]:
-    """観測した子孫が終わるのを `H_DESCENDANT_GRACE_SEC` まで待ち、残った pid を返す（昇順）。
+def alive_seen(seen: dict[int, str]) -> list[int]:
+    """控えたプロセスのうち、同じプロセスとして今も生きているもの（昇順）。
 
-    `ps` が使えなければ全件が残っている扱い（fail-closed）。残ったものは呼び出し側が片付ける。
+    `ps` が使えなければ全件が残っている扱い（fail-closed）。開始時刻が違えば pid の再利用で
+    別のプロセスなので数えない。
     """
+    procs = ps_procs()
+    if procs is None:
+        return sorted(seen)
+    return sorted(p for p, start in seen.items() if _same_proc(procs, p, start))
+
+
+def wait_descendants_gone(seen: dict[int, str]) -> list[int]:
+    """観測した子孫が終わるのを `H_DESCENDANT_GRACE_SEC` まで待ち、残った pid を返す（昇順）。"""
     deadline = time.monotonic() + H_DESCENDANT_GRACE_SEC
     while True:
-        table = ps_table()
-        alive = sorted(seen) if table is None else sorted(p for p in seen if p in table)
+        alive = alive_seen(seen)
         if not alive or time.monotonic() >= deadline:
             return alive
         check_interrupt()
@@ -2675,13 +2722,48 @@ def wait_descendants_gone(seen: set[int]) -> list[int]:
         time.sleep(H_POLL_SEC)
 
 
-def kill_pids(pids: list[int]) -> None:
-    """観測済みの残留子孫を KILL する（GPU・メモリを塞いだまま残さない。失敗は無視）。"""
-    for p in pids:
-        try:
-            os.kill(p, signal.SIGKILL)
-        except OSError:
-            pass
+def kill_seen(seen: dict[int, str]) -> list[int]:
+    """控えたプロセスのうち、同じプロセスと確かめられたものだけを KILL し、なお残るものを返す。
+
+    送る直前に `ps` を取り直して pid と開始時刻の一致を確かめる（pid の再利用で無関係なプロセスへ
+    送らない。`run_cmd` が回収後の pgid へ送らないのと同じ考え方）。例外・中断の経路でも呼ぶため
+    中断検査は行わない。KILL 後も残る（確認できない場合を含む）なら `child_may_remain` を立てる。
+    """
+    global _child_may_remain
+    procs = ps_procs()
+    if procs is None:
+        _child_may_remain = bool(seen) or _child_may_remain
+        return sorted(seen)
+    for pid, start in seen.items():
+        if _same_proc(procs, pid, start):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    deadline = time.monotonic() + 2.0
+    alive = alive_seen(seen)
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = alive_seen(seen)
+    if alive:
+        _child_may_remain = True
+    return alive
+
+
+def settle_descendants(drv: JobDriver, run: Callable[[], Any]) -> tuple[Any, list[int]]:
+    """`run()`（train の実行）と子孫の終了待ちを行い、残った子孫は例外の経路でも止める。
+
+    戻り値は (`run()` の結果, 待った後も残っていた子孫の pid)。`Interrupted`・`OverallTimeout` が
+    `run()` か待機から出ても、`finally` で確認済みの子孫を KILL し、止められなければ
+    `child_may_remain` を立てる（REQ-39）。
+    """
+    leftover: list[int] = []
+    try:
+        result = run()
+        leftover = wait_descendants_gone(drv.seen)
+    finally:
+        kill_seen(drv.seen)
+    return result, leftover
 
 
 def _restart_guidance_ok(g: Any) -> bool:
@@ -2803,12 +2885,13 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
 
     # 1) キャンセル
     drv = JobDriver(ctx, hdir, "cancel")
-    rc, tobj, failure = go_step(
-        ctx, hdir, logs, steps, "train", "train-cancelled", train_argv,
-        "train --project-dir project --candidate 0", during=drv, reap_group=False,
+    (rc, tobj, failure), leftover = settle_descendants(
+        drv,
+        lambda: go_step(
+            ctx, hdir, logs, steps, "train", "train-cancelled", train_argv,
+            "train --project-dir project --candidate 0", during=drv, reap_group=False,
+        ),
     )  # fmt: skip
-    leftover = wait_descendants_gone(drv.seen)
-    kill_pids(leftover)
     if drv.error is not None or failure is not None:
         return dict(failure or fail_item(drv.error or "driver_error", step="train"), steps=steps)
     if drv.timed_out:
@@ -2830,7 +2913,7 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
         return fail_item(reason, step="train", exit_code=rc_s, steps=steps)
     if os.path.lexists(hdir / "project" / "package"):
         return fail_item("package_created", step="train", steps=steps)
-    if len(drv.seen) < 2:
+    if not drv.worker_seen:
         return fail_item("no_descendant_observed", step="train", steps=steps)
     if leftover:
         return fail_item(
@@ -2851,12 +2934,13 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
 
     # 2) クラッシュ検出（train 本体を KILL）
     drv2 = JobDriver(ctx, hdir, "kill")
-    rc2, _obj2, failure = go_step(
-        ctx, hdir, logs, steps, "train", "train-killed", train_argv,
-        "train --project-dir project --candidate 0", during=drv2, reap_group=False,
+    (rc2, _obj2, failure), leftover2 = settle_descendants(
+        drv2,
+        lambda: go_step(
+            ctx, hdir, logs, steps, "train", "train-killed", train_argv,
+            "train --project-dir project --candidate 0", during=drv2, reap_group=False,
+        ),
     )  # fmt: skip
-    leftover2 = wait_descendants_gone(drv2.seen)
-    kill_pids(leftover2)
     # KILL された train は JSON を出さない（invalid_json）のが正常。実行できなかった等だけ失敗にする
     if drv2.error is not None or (failure is not None and failure.get("reason") != "invalid_json"):
         return dict(
@@ -3154,18 +3238,19 @@ def item_j(ctx: Ctx) -> dict[str, Any]:
         return fail_item("version_ledger_invalid", step="package", exit_code=0, steps=steps)
 
     def infer_ok(tag: str, argv: list[str], command: str) -> dict[str, Any] | None:
-        """exit 0 の infer（判定の整合まで）。失敗なら失敗記録を返す。"""
+        """exit 0・11・12 の infer（status との対応と判定の整合まで）。失敗なら失敗記録を返す。"""
         rc, o, f = run("infer", tag, argv, command)
         if f:
             return f
-        if rc != 0 or o is None:
+        # 校正つきでは対象外（11）・保留（12）も正常。終了コードと status の対応を照合する
+        if rc not in INFER_EXIT_STATUS or o is None:
             return fail_item("unexpected_exit_code", step="infer", case=tag, exit_code=rc)
         if not (
-            _infer_envelope_ok(o, 0)
+            _infer_envelope_ok(o, rc)
             and o.get("id") == DEFAULT_TEXT_ID
             and check_infer_output(o, facts)
         ):
-            return fail_item("unexpected_output", step="infer", case=tag, exit_code=0)
+            return fail_item("unexpected_output", step="infer", case=tag, exit_code=rc)
         return None
 
     def infer_rejected(tag: str, argv: list[str], command: str) -> dict[str, Any] | None:

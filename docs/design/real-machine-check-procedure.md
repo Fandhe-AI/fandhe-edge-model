@@ -340,7 +340,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 新しい project（`H/project`）で `register → inspect` の後に、次の 2 つを順に行います。実 trainer（CPU）を起動し、`job.json` が running になるまで待つため、学習の立ち上がりの分だけ時間がかかります。
 
-1. **キャンセル**: `train --candidate 0` を起動し、`candidates/0/job/job.json` が `running` になり、CLI の下に子孫（ワーカー）が 2 件以上現れたら、別プロセスで `train --project-dir project --cancel` を送る。
+1. **キャンセル**: `train --candidate 0` を起動し、`candidates/0/job/job.json` が `running` になり、CLI の下に学習ワーカー（コマンドラインに `launch.py` と `_worker` を持つプロセス。supervisor の `worker_argv`）が現れたら（CLI と supervisor だけの状態では送らない）、別プロセスで `train --project-dir project --cancel` を送る。
 2. **クラッシュ検出**: もう一度 `train --candidate 0`（`cancelled` の候補は丸ごと消して新規に始まる。REQ-34）を起動し、同じく running を待って train 本体の CLI プロセスへ `SIGKILL` を送る。
 
 - **確かめること**: キャンセルの応答・train の終了コードと `message`・`--status` の状態・`package/` が生成されないこと・子孫が 0 件になること。続けて、`SIGKILL` した train の記録が `--status` で `failed`・`owner_lost` として検出されること。
@@ -349,7 +349,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
   - キャンセルされた train: exit 70・`code:"runtime_error"`・`message` が `training cancelled`・`step:"train"`・`candidate` 0・`job.state:"cancelled"`・`restart` が `resumable:false`・`action:"restart_from_scratch"`・`reason_code:"resume_not_supported"`（`train_exit_code_not_70`・`train_output_invalid`）
   - `--status --candidate 0`: exit 0・`jobs[0]` が `state:"cancelled"`・`crash_detected:false`・`failure:null`・`record_updated:false`、`restart` が同じ案内（`status_unexpected`・`status_invalid`）
   - `project/package` が存在しない（`package_created`）
-  - 観測した子孫（`ps` の `ppid` を辿って求めた pid。2 件以上）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残った pid は控えて KILL し、件数だけを記録する）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`
+  - 観測した子孫（`ps` の `ppid` を辿って求めた pid と開始時刻の組。操作の後も train の終了まで観測し続ける。ワーカーを 1 件以上観測できなければ失敗）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残ったものは、pid と開始時刻が控えと一致することを送る直前に確かめてから KILL し、件数だけを記録する。pid が再利用された別のプロセスへは送らない。中断・全体の期限の例外の経路でも同じ後始末を行い、止められなければ `child_may_remain` を立てる）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`
   - クラッシュ: `SIGKILL` した train は JSON を出さない（終了コードは 137 の見込みで、記録に残す）。子孫は 30 秒以内に終わる（`descendants_remain_after_crash`）。その後の `--status --candidate 0` が exit 0・`state:"failed"`・`crash_detected:true`・`failure.kind:"crashed"`・`failure.cause:"owner_lost"`・`record_updated:true`（running の残骸を書き戻した初回）・`restart` が同じ案内
 - **失敗の理由**: 上の括弧内の語、`driver_error`・`ps_unavailable`（監視の失敗）、工程別の失敗（`step:"train"`・`case`: `train-cancelled`・`status-cancelled`・`train-killed`・`status-crashed`）
 - **記録する `record.json` フィールド**: `cancel_check`（`cancel`・`train_exit_code`・`descendants_observed`・`descendants_remaining`・`package_absent`・`state`・`restart_action`）・`crash_check`（`train_exit_code`・`descendants_observed`・`descendants_remaining`・`state`・`cause`・`restart_action`）・`steps`
@@ -383,6 +383,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
   - `infer --package J/project/package --version-id v1`（`--version-ledger` なし）が exit 64・`code:"invalid_input"`
   - `B/project/package` を複製した `J/tampered` の `artifact.json` を 1 バイト改変し、`--version-id v1` で `infer` すると exit 64・`code:"invalid_input"`（`package does not match version ledger`）。**元の `package/` は変更しない**（改変は複製）
   - 64 の確認で、終了コードが 64 でない・`code` が `invalid_input` でないときは `rejection_not_64`
+- `infer` の確認（復帰・最新版）は、校正つきのパッケージでは対象外（exit 11・`out_of_scope`）・保留（exit 12・`abstain`）も正常として、B と同じく終了コードと `status` の対応で照合する（対応しなければ `unexpected_output`）
 - **失敗の理由**: `previous_package_missing`（B の `package/` が無い）・`copy_failed`・`version_invalid`・`version_ledger_invalid`・`rejection_not_64`・工程別の失敗（`case`: `package-v2`・`infer-rollback-v1`・`infer-latest`・`infer-version-id-only`・`infer-tampered-artifact`）
 - **記録する `record.json` フィールド**: `version_number`（2）・`previous_version_number`（1）・`rollback_to_v1_ok`・`latest_ok`・`version_id_only_exit_code`（64）・`tampered_artifact_exit_code`（64）・`steps`
 - **限界**: 台帳ファイル自体の改変は検出できない（読み取り専用化のみ。#491 の範囲外）
