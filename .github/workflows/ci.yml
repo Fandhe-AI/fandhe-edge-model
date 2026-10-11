@@ -111,6 +111,10 @@ jobs:
       # と誤検出して fail する既知の問題がある（fandhe-browser PR #409 で実測）。
       # 上流で修正され次第この条件式は削除してよい
       cache: ${{ matrix.os != 'windows-latest' }}
+      # 保存は main の push のみ（PR は main の cache を restore するだけ）。PR の実行が保存した cache は
+      # refs/pull/<n>/merge スコープに入り main・他 PR から読めず、10GB 上限の LRU で main の cache を
+      # 追い出すため（.claude/rules/github-actions.md「キャッシュ方針」。rust-ci-default-features の save-if と同じ方針）
+      cache-save: ${{ github.ref == 'refs/heads/main' }}
       cache-key-prefix: fandhe-edge-model
 
   # --------------------------------------------------

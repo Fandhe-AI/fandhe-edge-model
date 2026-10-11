@@ -72,11 +72,12 @@ description: >
 ## キャッシュ方針
 
 - 前提: リポジトリのキャッシュ上限は 10GB（超過分は LRU で古いものから追い出し、7 日間アクセスの無いものは削除）。
-  上限超過分の課金予算は $0 のため上限は引き上げられない。**10GB の中でヒット率を最大化する**ことを目的にする
+  上限超過分の課金は Org の Actions 予算 $10（超過で停止）に含まれるため、上限を超える前提にしない。**10GB の中でヒット率を最大化する**ことを目的にする
 - PR の実行が保存したキャッシュは `refs/pull/<n>/merge` スコープに入り、その PR 以外（main・他 PR）からは復元できない。
   main のスコープに保存したものは全 PR から復元できる。したがって**保存は main への push のみ**とし、PR は復元だけにする
-  （`Swatinem/rust-cache` は `save-if: ${{ github.ref == 'refs/heads/main' }}`。`actions/cache` は PR で
-  `actions/cache/restore`、main で `actions/cache` を使い分ける）。依存を変える PR の 2 回目以降の push は main の旧キーから
+  （`Swatinem/rust-cache` は `save-if: ${{ github.ref == 'refs/heads/main' }}`。reusable `rust-base-ci` は
+  `cache-save: ${{ github.ref == 'refs/heads/main' }}`。`actions/cache` は PR で `actions/cache/restore`、main で
+  `actions/cache` を使い分ける）。依存を変える PR の 2 回目以降の push は main の旧キーから
   部分復元になるが、依存の変更頻度が低いため複製の容量削減を優先する
 - キーに `github.sha`・`github.run_id` 等の実行ごとに一意な値を入れない（毎回新規保存になり再利用されない）。
   `Cargo.lock`・toolchain・OS のハッシュで決まるキーにし、ジョブ間で同一内容なら共有する
@@ -104,9 +105,11 @@ description: >
 - reusable `rust-ci`（Linux・macOS の clippy / test / deny）: 直近の PR・main とも全件 exact hit（14〜33MB/件、main スコープのみ）。
   `fmt` ジョブは毎回 `Cache not found`（保存されないキーを復元しようとしている。上流 Fandhe-AI/actions 側の挙動）。
   windows-latest は上流の既知問題で `cache: false`
-- reusable `rust-ci` のキー（`<prefix>-<OS>-<job>-v3-<hash>`）は上流で `hashFiles('**/Cargo.lock')` を使い、rustc のバージョンを
-  含まない。実測のハッシュ `bbff9d30…` はルートの `Cargo.lock` と `.agents/skills/make/samples` のサンプル 3 件の合計
-  （ルート単独なら `f04a779e…`）。修正は Fandhe-AI/actions 側で行う（本リポは `cache-key-prefix` のみ渡す）
+- reusable `rust-ci` の旧キー（`<prefix>-<OS>-<job>-v3-<hash>`）は `hashFiles('**/Cargo.lock')` で rustc のバージョンを含まず、
+  実測のハッシュ `bbff9d30…` はルートの `Cargo.lock` と `.agents/skills/make/samples` のサンプル 3 件の合計だった
+  （ルート単独なら `f04a779e…`）。Fandhe-AI/actions#165（`latest` = 3a41f93）でルートの `Cargo.lock` と rustc のハッシュを使う
+  `v4` キーに変わり、`cache-save` 入力が追加されたため、本リポは `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡す
+  （キー空間の切り替えで、次の main の push で一度だけ v4 キーが新規保存される）
 - `rust-ci-default-features`（`Swatinem/rust-cache`、#527 で追加）: 3 OS で 30〜43MB/件。#527 の PR 実行が PR スコープへ保存した
   複製 3 件（約 108MB）は main から使えず、main の初回 push は 3 OS とも `No cache found` で別途保存した。
   `save-if` 追加後（#528 の PR 実行）は 3 OS とも main のキャッシュから `full match: true` で復元し、PR スコープへの保存は 0 件。
