@@ -2600,13 +2600,22 @@ def run_bounded(
             time.sleep(0.02)
     finally:
         # リーダーが未回収のうちにグループごと KILL してから回収する（pid の再利用を避ける）
-        if proc.poll() is None:
-            if not _kill_group(proc.pid):
+        global _child_may_remain
+        if proc.poll() is None and not _kill_group(proc.pid):
+            # グループへ送れなかった。孫が残りうるので記録し、せめてリーダーだけでも止める
+            _child_may_remain = True
+            try:
                 proc.kill()
+            except OSError:
+                pass
         try:
             proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
         except subprocess.TimeoutExpired:
-            reason = reason or "timeout"
+            # 回収を諦める。子が残りうる印を立て、Popen を保持する（参照が生きている間は pid が
+            # 再利用されない。`run_cmd` と同じ扱い）
+            _child_may_remain = True
+            _leftover_procs.append(proc)
+            reason = REASON_UNREAPED
     if reason is None and (
         os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap
     ):
@@ -3346,29 +3355,32 @@ def item_j(ctx: Ctx) -> dict[str, Any]:
         return fail_item("copy_failed", steps=steps)
     base = ["infer", "--text", sample]
     cmd = "infer --package <package> --version-ledger <ledger> --text <fixed-sample>"
-    for failure in (
-        infer_ok(
+    # 遅延実行（lambda）で順に判定し、最初に失敗した時点で止める（後続の infer は実行しない）
+    checks = (
+        lambda: infer_ok(
             "infer-rollback-v1",
             [*base, "--package", "B/project/package", "--version-ledger", ledger,
              "--version-id", "v1"],
             cmd + " --version-id v1",
         ),
-        infer_ok(
+        lambda: infer_ok(
             "infer-latest",
             [*base, "--package", f"{p}/package", "--version-ledger", ledger],
             cmd,
         ),
-        infer_rejected(
+        lambda: infer_rejected(
             "infer-version-id-only",
             [*base, "--package", f"{p}/package", "--version-id", "v1"],
             "infer --package <package> --version-id v1 --text <fixed-sample>",
         ),
-        infer_rejected(
+        lambda: infer_rejected(
             "infer-tampered-artifact",
             [*base, "--package", "J/tampered", "--version-ledger", ledger, "--version-id", "v1"],
             cmd + " --version-id v1",
         ),
-    ):  # fmt: skip
+    )  # fmt: skip
+    for check in checks:
+        failure = check()
         if failure:
             return dict(failure, steps=steps)
     return {

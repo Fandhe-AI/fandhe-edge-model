@@ -3208,3 +3208,25 @@ fn req34_j_accepts_out_of_scope_and_abstain_only_when_exit_code_matches() {
     assert_eq!(e.q("items.J.status"), "\"failed\"");
     assert_eq!(e.q("items.J.reason"), "\"unexpected_output\"");
 }
+/// REQ-39: J は最初に失敗した infer の時点で止まり、後続の infer を実行しない（4 回すべてを先に
+/// 実行してから判定しない）。
+#[test]
+fn req39_j_stops_at_the_first_failing_infer() {
+    let e = Env::new();
+    let o = e.run(
+        &with_work(&e, &["--items", "B,J"]),
+        &[
+            ("FAKE_J_STATUS", "abstain"),
+            ("FAKE_BAD", "j_status_mismatch"),
+        ],
+    );
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.J.status"), "\"failed\"");
+    let args = e.lines("cli.args");
+    let ledger_infers = args
+        .iter()
+        .filter(|a| a.starts_with("infer ") && a.contains("--version-ledger"))
+        .count();
+    assert_eq!(ledger_infers, 1, "{args:?}");
+    assert!(!args.iter().any(|a| a.contains("J/tampered")), "{args:?}");
+}

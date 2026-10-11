@@ -5250,3 +5250,28 @@ def test_job_driver_cancel_fails_when_the_cancel_command_output_exceeds_the_cap(
     drv(10)
     assert drv.error == "cancel_output_limit"
     assert drv.cancel_rc is None
+
+
+def test_run_bounded_marks_child_may_remain_when_the_child_cannot_be_stopped_or_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: KILL を送れず回収もできない子は `unreaped`・`child_may_remain`・Popen を保持する。"""
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "REAP_WAIT_LIMIT_SECONDS", 0.2)
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+
+    def deny(self: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess.Popen, "kill", deny)
+    mod._leftover_procs.clear()
+    try:
+        res, _ = _bounded(tmp_path, "sleep 30", timeout=0.2)
+        assert res == (None, mod.REASON_UNREAPED)
+        assert mod._child_may_remain is True
+        assert len(mod._leftover_procs) == 1
+    finally:
+        for p in mod._leftover_procs:
+            os.kill(p.pid, signal.SIGKILL)
+            os.waitpid(p.pid, 0)
+        mod._leftover_procs.clear()
