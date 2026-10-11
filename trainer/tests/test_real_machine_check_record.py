@@ -5028,6 +5028,20 @@ def test_ps_procs_records_start_time_and_command_for_this_process() -> None:
     assert "python" in me.command.lower() or "pytest" in me.command.lower()
 
 
+def test_ps_procs_asks_for_unlimited_command_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-34: macOS の ps は -ww が無いと command を表示幅で切り詰め、`_worker` を見失う。"""
+    seen: list[list[str]] = []
+
+    def fake_run_bounded(argv: list[str], *_args: object) -> tuple[int, None]:
+        seen.append(argv)
+        return 1, None
+
+    monkeypatch.setattr(mod, "run_bounded", fake_run_bounded)
+    assert mod.ps_procs() is None
+    assert len(seen) == 1
+    assert "-ww" in seen[0]
+
+
 def _sleeper() -> subprocess.Popen[bytes]:
     return subprocess.Popen(["/bin/sleep", "60"])
 

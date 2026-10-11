@@ -2629,11 +2629,12 @@ def ps_procs() -> dict[int, Proc] | None:
     """`ps` の (pid → `Proc`) 表。固定パスの `ps` が使えなければ None（REQ-38・REQ-39）。"""
     if not os.path.isfile(PS_PATH) or not os.access(PS_PATH, os.X_OK):
         return None
-    # 全プロセスの引数を読むため出力は大きくなりうる。無名の一時ファイルへ書かせ、超えたら止める
+    # 全プロセスの引数を読むため出力は大きくなりうる。無名の一時ファイルへ書かせ、超えたら止める。
+    # macOS の ps は -ww が無いと command を表示幅で切り詰め、末尾の `_worker` が消える
     try:
         with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
             rc, _reason = run_bounded(
-                [PS_PATH, "-A", "-o", "pid=,ppid=,lstart=,command="],
+                [PS_PATH, "-A", "-ww", "-o", "pid=,ppid=,lstart=,command="],
                 None,
                 probe_env(),
                 fo,
