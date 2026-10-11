@@ -42,6 +42,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from collections.abc import Callable
@@ -115,6 +116,9 @@ H_DESCENDANT_GRACE_SEC = 30.0
 TIMEOUT_AUX = 30
 # 子孫の確認に使う `ps`（固定の絶対パス。PATH を探さない。REQ-38・REQ-39）
 PS_PATH = "/bin/ps"
+# H の `ps`（全プロセスの引数を読む）の出力上限（バイト。契約に定めのない値。REQ-39）
+CAP_PS_STDOUT = 8 * 1024 * 1024
+CAP_PS_STDERR = 64 * 1024
 # `version_ledger.json` の上限（crates/core/src/version_ledger_record.rs の
 # `MAX_VERSION_LEDGER_BYTES`）
 CAP_VERSION_LEDGER = 2 * 1024 * 1024
@@ -2554,25 +2558,91 @@ class Proc:
     command: str
 
 
+def run_bounded(
+    argv: list[str],
+    cwd: Path | None,
+    env: dict[str, str] | None,
+    out: Any,
+    err: Any,
+    timeout: float,
+    out_cap: int,
+    err_cap: int,
+) -> tuple[int | None, str | None]:
+    """上限つきの短い子プロセス実行（`during` コールバックの中から呼べる。REQ-39）。
+
+    `run_cmd` はグローバルな子の追跡（`_active_pgid` 等）を使うため、その待機中のコールバックから
+    入れ子では呼べない。ここは状態を持たず、独立したセッションで起動し、`out`・`err`（書き込み用の
+    ファイルオブジェクト）のサイズが上限を超える・期限を過ぎたら、回収の前にグループごと KILL
+    する。戻り値は (終了コード, 失敗理由)。理由は `timeout`・`output_limit`・`spawn_error`。
+    """
+    try:
+        proc = subprocess.Popen(  # noqa: S603  固定の引数。shell は使わない
+            argv,
+            cwd=None if cwd is None else str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            env=env,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return None, "spawn_error"
+    reason = None
+    deadline = time.monotonic() + timeout
+    try:
+        while proc.poll() is None:
+            if time.monotonic() >= deadline:
+                reason = "timeout"
+                break
+            if os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap:
+                reason = "output_limit"
+                break
+            time.sleep(0.02)
+    finally:
+        # リーダーが未回収のうちにグループごと KILL してから回収する（pid の再利用を避ける）
+        if proc.poll() is None:
+            if not _kill_group(proc.pid):
+                proc.kill()
+        try:
+            proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            reason = reason or "timeout"
+    if reason is None and (
+        os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap
+    ):
+        reason = "output_limit"
+    if reason is not None:
+        return None, reason
+    return proc.returncode, None
+
+
 def ps_procs() -> dict[int, Proc] | None:
     """`ps` の (pid → `Proc`) 表。固定パスの `ps` が使えなければ None（REQ-38・REQ-39）。"""
     if not os.path.isfile(PS_PATH) or not os.access(PS_PATH, os.X_OK):
         return None
+    # 全プロセスの引数を読むため出力は大きくなりうる。無名の一時ファイルへ書かせ、超えたら止める
     try:
-        r = subprocess.run(  # noqa: S603  固定の絶対パスと固定の引数
-            [PS_PATH, "-A", "-o", "pid=,ppid=,lstart=,command="],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=TIMEOUT_AUX,
-            env=probe_env(),
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+            rc, _reason = run_bounded(
+                [PS_PATH, "-A", "-o", "pid=,ppid=,lstart=,command="],
+                None,
+                probe_env(),
+                fo,
+                fe,
+                TIMEOUT_AUX,
+                CAP_PS_STDOUT,
+                CAP_PS_STDERR,
+            )
+            if rc != 0:
+                return None
+            fo.seek(0)
+            raw = fo.read(CAP_PS_STDOUT + 1)
+    except OSError:
         return None
-    if r.returncode != 0:
+    if len(raw) > CAP_PS_STDOUT:
         return None
     table: dict[int, Proc] = {}
-    for line in split_lines(r.stdout.decode("utf-8", errors="replace")):
+    for line in split_lines(raw.decode("utf-8", errors="replace")):
         parts = line.split(None, 7)
         # pid ppid + lstart（曜日 月 日 時刻 年の 5 語）+ command
         if len(parts) >= 7 and parts[0].isdigit() and parts[1].isdigit():
@@ -2685,17 +2755,21 @@ class JobDriver:
             _open_write_nofollow(so, False) as fo,
             _open_write_nofollow(se, False) as fe,
         ):
-            r = subprocess.run(  # noqa: S603  固定の引数。パスは cwd 相対の固定名
+            rc, reason = run_bounded(
                 [str(self.ctx.bin), "train", "--project-dir", "project", "--cancel"],
-                cwd=str(self.cwd),
-                stdin=subprocess.DEVNULL,
-                stdout=fo,
-                stderr=fe,
-                timeout=TIMEOUT_AUX,
-                env=self.ctx.offline_env,
-                check=False,
+                self.cwd,
+                self.ctx.offline_env,
+                fo,
+                fe,
+                TIMEOUT_AUX,
+                CAP_CLI_STDOUT,
+                CAP_CLI_STDERR,
             )
-        self.cancel_rc = r.returncode
+        if reason is not None:
+            # 出力が上限を超えた・期限切れ・起動失敗（子は止めてある）。cancel_rc は None のまま
+            self.error = f"cancel_{reason}"
+            return
+        self.cancel_rc = rc
 
 
 def alive_seen(seen: dict[int, str]) -> list[int]:

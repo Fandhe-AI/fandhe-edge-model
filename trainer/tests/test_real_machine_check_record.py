@@ -5174,3 +5174,79 @@ def test_job_driver_cancel_mode_runs_cancel_only_after_the_worker_appears(
     procs[13] = proc_cls(12, start, "python launch.py _worker")
     drv(10)
     assert drv.cancel_rc == 0
+
+
+# ---- 子プロセスの出力上限（#524 の指摘。H の `ps`・キャンセル要求。REQ-39） ----
+
+
+def _bounded(tmp_path: Path, script: str, **over: Any) -> tuple[Any, Any]:
+    args: dict[str, Any] = {"timeout": 10, "out_cap": 1000, "err_cap": 1000}
+    args.update(over)
+    with open(tmp_path / "o", "wb+") as fo, open(tmp_path / "e", "wb+") as fe:
+        res = mod.run_bounded(
+            ["/bin/sh", "-c", script], tmp_path, None, fo, fe,
+            args["timeout"], args["out_cap"], args["err_cap"],
+        )  # fmt: skip
+        return res, (os.fstat(fo.fileno()).st_size, os.fstat(fe.fileno()).st_size)
+
+
+def test_run_bounded_stops_the_child_when_stdout_or_stderr_exceeds_the_cap(
+    tmp_path: Path,
+) -> None:
+    """REQ-39: stdout・stderr が上限を超えたら子を止めて `output_limit`、期限切れは `timeout`。"""
+    assert _bounded(tmp_path, "echo hi")[0] == (0, None)
+    assert _bounded(tmp_path, "exit 3")[0] == (3, None)
+    for script in ("yes", "yes >&2"):
+        start = time.monotonic()
+        res, sizes = _bounded(tmp_path, script)
+        assert res == (None, "output_limit")
+        assert time.monotonic() - start < 10  # 無限に出力する子を放置せず止める
+        # 監視の周期の分は超えうるが、戻った後は子が止まっていて、出力はもう増えない
+        time.sleep(0.2)
+        assert (os.stat(tmp_path / "o").st_size, os.stat(tmp_path / "e").st_size) == sizes
+    assert _bounded(tmp_path, "sleep 30", timeout=0.3)[0] == (None, "timeout")
+    # 終了後に上限を超えていた場合も失敗
+    assert _bounded(tmp_path, "head -c 5000 /dev/zero", out_cap=1000)[0] == (
+        None,
+        "output_limit",
+    )
+
+
+def test_run_bounded_reports_spawn_error(tmp_path: Path) -> None:
+    """REQ-39: 実行できないコマンドは `spawn_error`。"""
+    with open(tmp_path / "o", "wb") as fo, open(tmp_path / "e", "wb") as fe:
+        res = mod.run_bounded(["/nonexistent/x"], None, None, fo, fe, 5, 10, 10)
+    assert res == (None, "spawn_error")
+
+
+def test_ps_procs_fails_closed_when_ps_output_exceeds_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: `ps` の出力が上限を超えたら表を作らず None（H は `ps_unavailable` で失敗する）。"""
+    assert mod.ps_procs() is not None
+    monkeypatch.setattr(mod, "CAP_PS_STDOUT", 64)
+    assert mod.ps_procs() is None
+    assert mod.ps_table() is None
+
+
+def test_job_driver_cancel_fails_when_the_cancel_command_output_exceeds_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: `train --cancel` の出力が上限を超えたら子を止め `cancel_output_limit` で失敗する。"""
+    job = tmp_path / "project/candidates/0/job"
+    job.mkdir(parents=True)
+    (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
+    (tmp_path / "steps").mkdir()
+    cli = _fake_cli(tmp_path, "yes\n")
+    drv = mod.JobDriver(_ctx(tmp_path, cli), tmp_path, "cancel")
+    start = "Mon Jan  1 00:00:00 2026"
+    procs = {
+        11: mod.Proc(10, start, "cli"),
+        12: mod.Proc(11, start, "python launch.py _worker"),
+    }
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    monkeypatch.setattr(mod, "CAP_CLI_STDOUT", 1000)
+    drv(10)
+    assert drv.error == "cancel_output_limit"
+    assert drv.cancel_rc is None
