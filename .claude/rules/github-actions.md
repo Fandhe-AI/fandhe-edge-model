@@ -84,7 +84,11 @@ description: >
   symlink 経由も）が混入し、依存が変わっていないのにスキル更新でキーが変わる。ルートの `Cargo.lock` を直接指定する（再帰が必要なら
   `'!.agents/**'`・`'!.claude/**'` で除外する）。Rust の target をキャッシュするキーには rustc のバージョン（`rustc -vV` の
   commit-hash 等）を含め、runner イメージ・toolchain の更新後に古い target を exact hit で復元し続けないようにする
-  （`Swatinem/rust-cache` は rustc のバージョンと workspace の `Cargo.lock` を自動でキーに含む）
+  （`Swatinem/rust-cache` v2.8.1 は rustc のバージョン・ルートの `Cargo.lock`・workspace メンバーの `Cargo.toml` を自動でキーに含む。
+  ただし `**/.cargo/config.toml`・`**/rust-toolchain(.toml)` は再帰 glob で拾い除外の入力も無いため、サンプルの
+  `.agents/skills/make/samples/projects/rust-workspace-xtask/.cargo/config.toml` もキーに入る。このファイルがスキル更新で
+  変わったときは 1 回だけ miss〔外部 crate の再ビルド約 20 秒〕と main への再保存〔3 OS で約 108MB〕が起きるが、許容する。
+  `.claude/skills` の symlink は辿らない）
 - キャッシュを追加・変更したら、PR と main の push の両方のログで結果を確認する:
 
     ```bash
