@@ -97,8 +97,9 @@ description: >
   windows-latest は上流の既知問題で `cache: false`
 - `rust-ci-default-features`（`Swatinem/rust-cache`、#527 で追加）: 3 OS で 30〜43MB/件。#527 の PR 実行が PR スコープへ保存した
   複製 3 件（約 108MB）は main から使えず、main の初回 push は 3 OS とも `No cache found` で別途保存した。
-  ヒット時（windows・full match）と miss 時の差は `cargo clippy` のビルドで数秒〜10 秒程度、`cargo test` のビルドはほぼ差なし
-  （依存 crate が少なく、所要時間の大半はメンバー crate のビルドとテスト実行のため）
+  `save-if` 追加後（#528 の PR 実行）は 3 OS とも main のキャッシュから `full match: true` で復元し、PR スコープへの保存は 0 件。
+  ヒット時は外部 crate のビルドが 0 件になる（miss 時は 39〜47 crate・約 16〜20 秒）。復元は 3〜4 秒のため、正味の短縮は
+  1 ジョブ約 10〜15 秒。ジョブ時間（138〜494 秒）の大半はメンバー crate のビルドとテスト実行で、キャッシュでは縮まない
 
 ## 所要時間の計測
 
