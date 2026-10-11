@@ -18,6 +18,11 @@
 # 追加時点で自動有効化される。スキップ時は必ず `skip:` を表示し、実行したかのように
 # 黙って成功扱いにはしない。
 # Fandhe-AI/fandhe-container の Makefile と同一方針。GNU Make 3.81 で動作する構文のみを使う。
+#
+# 各レシピは `scripts/<name>.sh` の 1 行呼び出し、または言語ネイティブの 1 行コマンド
+# （cargo・npx）に限る。複数行・条件分岐・環境依存の処理は scripts/ に置く（make スキル）。
+# Make を使わない場合の一覧は scripts/help.sh。ターゲットの追加・改名・削除や scripts/ の変更時は
+# .claude/rules/makefile.md に従う（scripts/help.sh も同じ変更で更新する）。
 
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
@@ -70,65 +75,30 @@ CARGO_DENY_VERSION := 0.20.2
 # uv を直接叩く場合の保険
 UV_VERSION := 0.12.19
 
+# 固定バージョンを scripts/ へ渡す（定義元は本ファイルのみ。scripts/ 側は既定値を持たない）
+export PIN_UV_VERSION := $(UV_VERSION)
+export PIN_LEFTHOOK_VERSION := $(LEFTHOOK_VERSION)
+export PIN_CARGO_DENY_VERSION := $(CARGO_DENY_VERSION)
+export PIN_YAMLLINT_VERSION := $(YAMLLINT_VERSION)
+export PIN_COMMITLINT_VERSION := $(COMMITLINT_VERSION)
+export PIN_COMMITLINT_CONFIG_VERSION := $(COMMITLINT_CONFIG_VERSION)
+
 .PHONY: help
-help: ## ターゲット一覧を表示する
+help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
 
 # --------------------------------------------------
 # 環境診断・環境構築
 # --------------------------------------------------
 
-# 診断のみ。何も導入・修復しない（導入は setup の責務）。必須ツールが欠けていれば
-# 非 0 で終了し、任意ツール（lint-docs 系・lefthook）は欠けていても警告に留める。
 .PHONY: doctor
 doctor: ## 開発環境を診断する（導入・変更は一切しない。必須ツール欠落時は非 0 終了）
-	@missing=0; \
-	for tool in git rustup cargo rustc; do \
-		if command -v "$$tool" >/dev/null 2>&1; then \
-			printf 'ok    %-16s %s\n' "$$tool" "$$("$$tool" --version 2>/dev/null | head -n 1)"; \
-		else \
-			printf 'miss  %-16s （必須）\n' "$$tool"; missing=1; \
-		fi; \
-	done; \
-	for comp in rustfmt cargo-clippy; do \
-		if command -v "$$comp" >/dev/null 2>&1 && "$$comp" --version >/dev/null 2>&1; then \
-			printf 'ok    %-16s %s\n' "$$comp" "$$("$$comp" --version 2>/dev/null | head -n 1)"; \
-		else \
-			printf 'miss  %-16s （必須。rust-toolchain.toml の components。rustup show で導入）\n' "$$comp"; missing=1; \
-		fi; \
-	done; \
-	for tool in npx lefthook yamllint uvx cargo-deny; do \
-		if command -v "$$tool" >/dev/null 2>&1; then \
-			printf 'ok    %-16s\n' "$$tool"; \
-		else \
-			printf 'warn  %-16s （任意。未導入の場合は該当ターゲットが導入案内または自動導入を行う）\n' "$$tool"; \
-		fi; \
-	done; \
-	if command -v uv >/dev/null 2>&1; then \
-		uv_ver=$$(uv --version 2>/dev/null | awk '{print $$2}'); \
-		if [ "$$uv_ver" = "$(UV_VERSION)" ]; then \
-			printf 'ok    %-16s %s\n' uv "$$uv_ver"; \
-		else \
-			printf 'warn  %-16s %s （固定版 $(UV_VERSION) と不一致。trainer/pyproject.toml の required-version が拒否します）\n' uv "$$uv_ver"; \
-		fi; \
-	else \
-		printf 'warn  %-16s （任意。py-* ターゲットに必要。brew install uv や https://docs.astral.sh/uv/ を参照）\n' uv; \
-	fi; \
-	if [ -f docs/spec/.git ] || [ -d docs/spec/.git ]; then \
-		echo 'ok    docs/spec        submodule 取得済み'; \
-	else \
-		echo 'warn  docs/spec        submodule 未取得（private。make submodule で取得を試行）'; \
-	fi; \
-	if [ "$$missing" -ne 0 ]; then \
-		echo "NG: 必須ツールが不足しています（make setup または公式手順で導入してください）" >&2; \
-		exit 1; \
-	fi
+	@scripts/doctor.sh
 
 # 依存ターゲット並記だと -j 実行時に順序が保証されず、cargo フォールバックを持つ hooks が
 # rustup より先に走りうるため、再帰 make で「submodule → rustup → hooks → py-sync」の
 # 順を明示する（py-sync は uv 未導入・trainer/pyproject.toml 未追加ならそれぞれ
-# 自身で fail-closed / skip する。hooks より後ろに置く積極的な理由は無いが、
-# 既存 3 ステップの後ろに素直に追加する）。
+# 自身で fail-closed / skip する）。
 .PHONY: setup
 setup: ## 開発環境を一括構築する（サブモジュール → rustup → lefthook → 学習ワーカー同期の順を保証）
 	$(MAKE) submodule
@@ -137,44 +107,19 @@ setup: ## 開発環境を一括構築する（サブモジュール → rustup �
 	$(MAKE) py-sync
 	@echo "setup 完了"
 
-# rustup は前提条件として確認のみ行い、自動導入はしない。取得したインストーラを検証なしに
-# 実行する経路（curl | sh）を作らないため（サプライチェーン対策）。未導入時は
-# 公式の導入手順を案内して停止する。toolchain は rust-toolchain.toml が単一真実源。
 .PHONY: rustup
 rustup: ## rustup（cargo）の導入を確認する（未導入なら公式手順を案内して停止）
-	@if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$$HOME/.cargo/bin/rustup" ]; then \
-		echo "error: rustup が見つかりません。公式手順（https://rustup.rs/）で導入してから再実行してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/check-rustup.sh
 
-# docs/spec（fandhe-edge-model-spec）は private リポジトリのため、アクセス権のない環境では
-# 取得に失敗する。実装コードのビルド・テストは docs/spec 抜きでも成立させる方針
-# （README.md）のため、失敗しても setup 全体は止めない。
 .PHONY: submodule
 submodule: ## docs/spec サブモジュールを初期化・更新する（private・アクセス権が無ければ警告のみ）
-	@git submodule update --init || \
-		echo "警告: docs/spec（private）の取得に失敗しました。アクセス権のない環境では想定内です（ビルド・テストは spec 抜きで成立します）"
+	@scripts/submodule.sh
 
-# lefthook（Go 製。crates.io には存在しないため cargo フォールバックは置かない）は
-# brew（バージョン固定不可だが常用導線）を優先し、無ければ npm 配布版を exact 固定の
-# npx ワンショットで実行する（lefthook が生成する hook スクリプトは PATH → npx の順で
-# 本体を解決するため、npx 経由の導入でもコミット時にフックが機能する）。
 # lefthook.yml が未追加の間は、設定の無い hooks を導入しないようスキップする。
 .PHONY: hooks
 hooks: ## lefthook の git hooks を導入する（未導入なら lefthook 本体も導入。lefthook.yml 未追加ならスキップ）
 ifneq ($(HAS_LEFTHOOK),)
-	@if command -v lefthook >/dev/null 2>&1; then \
-		lefthook install; \
-	elif command -v brew >/dev/null 2>&1; then \
-		echo "lefthook を導入します"; \
-		brew install lefthook && lefthook install; \
-	elif command -v npx >/dev/null 2>&1; then \
-		echo "lefthook（npx 固定版）で hooks を導入します"; \
-		npx --yes lefthook@$(LEFTHOOK_VERSION) install; \
-	else \
-		echo "brew / npx が見つかりません。https://lefthook.dev/installation/ を参照してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/install-hooks.sh
 else
 	@echo "skip: lefthook.yml 未追加のため hooks をスキップ"
 endif
@@ -187,46 +132,17 @@ endif
 lint-md: ## markdownlint（.markdownlint.jsonc / .markdownlintignore 参照）
 	npx --yes markdownlint-cli@$(MARKDOWNLINT_VERSION) --ignore-path .markdownlintignore "**/*.md"
 
-# yamllint は Python 製のため npx で賄えない。導入済みの実体（brew / pip）を優先し、
-# uvx があれば固定版のワンショット実行で代替する。いずれも無ければ fail-closed で
-# 導入方法を案内して失敗する（silent skip は CI との false-green 乖離になるため行わない）。
 .PHONY: lint-yaml
 lint-yaml: ## yamllint（.yamllint 参照）
-	@if command -v yamllint >/dev/null 2>&1; then \
-		yamllint .; \
-	elif command -v uvx >/dev/null 2>&1; then \
-		uvx yamllint==$(YAMLLINT_VERSION) .; \
-	else \
-		echo "yamllint 未導入: brew install yamllint / pip install yamllint==$(YAMLLINT_VERSION) で導入してください" >&2; \
-		exit 1; \
-	fi
+	@scripts/lint-yaml.sh
 
 .PHONY: lint-editorconfig
 lint-editorconfig: ## editorconfig-checker（.editorconfig + .editorconfig-checker.json 参照）
 	EC_VERSION=v$(EC_BIN_VERSION) npx --yes editorconfig-checker@$(EC_NPM_VERSION)
 
-# main からの分岐点以降のコミットを CI（lint-docs の commitlint ジョブ）と同じ
-# extends 構成で検証する。origin/main が未取得の環境では範囲を決められないためスキップする。
-# `git rev-parse --verify --quiet` は「参照が存在しない」場合に終了コード 1 を返すため、
-# これだけを skip 条件にし、それ以外の非 0（`fatal: detected dubious ownership` 等。
-# 典型的には終了コード 128）はエラーメッセージを表示して非 0 終了する（fail-closed）。
 .PHONY: lint-commits
 lint-commits: ## commitlint（origin/main からの分岐点以降のコミットを検証）
-	@out=$$(git rev-parse --verify --quiet refs/remotes/origin/main 2>&1 >/dev/null); st=$$?; \
-	if [ "$$st" -eq 1 ]; then \
-		echo "skip: origin/main が未取得のため commitlint をスキップ"; \
-		exit 0; \
-	elif [ "$$st" -ne 0 ]; then \
-		printf '%s\n' "$$out" >&2; \
-		echo "NG: origin/main の参照確認に失敗しました（git rev-parse exit=$$st ）" >&2; \
-		exit 1; \
-	fi; \
-	base=$$(git merge-base origin/main HEAD) || { \
-		echo "NG: git merge-base の実行に失敗しました" >&2; \
-		exit 1; \
-	}; \
-	npx --yes -p @commitlint/cli@$(COMMITLINT_VERSION) -p @commitlint/config-conventional@$(COMMITLINT_CONFIG_VERSION) \
-		commitlint --extends @commitlint/config-conventional --from "$$base" --to HEAD
+	@scripts/lint-commits.sh
 
 .PHONY: lint-docs
 lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメント／設定ファイル系 lint を一括実行する
@@ -235,22 +151,12 @@ lint-docs: lint-md lint-yaml lint-editorconfig lint-commits ## ドキュメン�
 # 品質チェック（Rust。Cargo.toml 追加後に有効化）
 # --------------------------------------------------
 
-# workspace 仮想 manifest（Cargo.toml）自体の構文・定義としての妥当性を検証する。
 # `cargo verify-project` は member crate が 0 件の仮想 workspace でも成功するため、
 # HAS_MEMBERS を条件にせず HAS_CARGO のみで常時実行する。
 .PHONY: check-workspace-manifest
 check-workspace-manifest: ## cargo verify-project で workspace manifest の妥当性を検証する
 ifneq ($(HAS_CARGO),)
-	@out=$$(cargo verify-project 2>&1) || { \
-		echo "$$out" >&2; \
-		echo "NG: Cargo.toml が cargo にとって不正な manifest です" >&2; \
-		exit 1; \
-	}; \
-	if ! printf '%s\n' "$$out" | grep -q '"success"'; then \
-		echo "$$out" >&2; \
-		echo "NG: cargo verify-project が success を返しませんでした" >&2; \
-		exit 1; \
-	fi
+	@scripts/check-workspace-manifest.sh
 else
 	@echo "skip: Cargo.toml 未追加のため check-workspace-manifest をスキップ"
 endif
@@ -303,6 +209,7 @@ endif
 # 値に空白を含むパスは渡せない。A（make ci）は `--with-ci` が無ければ実行しない。
 # `ARGS` はコマンドラインで渡した値だけを受け付ける（`$(origin ARGS)` が command line のとき）。環境変数の
 # `ARGS` は拾わず、スクリプトを起動せずエラーにする（意図しない引数の混入を防ぐ。fail-closed。REQ-39・#364）。
+# `$(origin)` 判定は Make でしかできないため、このターゲットの分岐は Makefile に残す。
 # レシピは `set -f` でパス名展開を止めてから起動する（`--items '*'` や `[5]` がカレントのファイル名に
 # 化けない）。止まるのはパス名展開だけで、変数展開・コマンド置換は残るため、`ARGS` には自分で書いた
 # リテラル値だけを渡す（信頼できない文字列から組み立てない）。
@@ -326,12 +233,7 @@ endif
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
-	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
-	command -v cargo-deny >/dev/null 2>&1 || { \
-		echo "cargo-deny を導入します"; \
-		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
-	}; \
-	cargo deny --locked check advisories bans licenses sources
+	@scripts/deny.sh
 else
 	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
@@ -339,31 +241,12 @@ endif
 # --------------------------------------------------
 # 品質チェック（Python 学習ワーカー。trainer/pyproject.toml 追加後に有効化）
 # --------------------------------------------------
-# uv 0.12.19 を経由してのみ実行する（uv 未導入時は curl|sh 等の自動導入をしない。
-# rustup ターゲットと同一のサプライチェーン方針）。`--locked` を必ず付け、
-# lock ファイルと pyproject.toml が食い違う場合は fail-closed で止める
-# （uv sync が lock を無言で書き換えることを防ぐ）。`--no-config` で開発者のユーザー設定
-# （~/.config/uv/uv.toml の exclude-newer 等）を読まない（--locked は lock どおりで再解決しないため
-# exclude-newer が守るものは無く、衝突して失敗するのを避ける。#465）。ミラー等は環境変数で指定する。
-
-# uv 自体の有無を確認するヘルパ（無ければ導入方法を案内して停止する）
-define require_uv
-	if ! command -v uv >/dev/null 2>&1; then \
-		echo "error: uv が見つかりません。brew install uv（バージョン $(UV_VERSION) 系）または https://docs.astral.sh/uv/getting-started/installation/ の公式手順で導入してから再実行してください" >&2; \
-		exit 1; \
-	fi; \
-	uv_ver=$$(uv --version 2>/dev/null | awk '{print $$2}'); \
-	if [ "$$uv_ver" != "$(UV_VERSION)" ]; then \
-		echo "error: uv の版が固定版と不一致です（検出 $${uv_ver}、必要 $(UV_VERSION)）。--no-config のため pyproject.toml の required-version が効かず、ここで検査します" >&2; \
-		exit 1; \
-	fi
-endef
+# uv の実行は scripts/py.sh に集約する（uv 固定版の検査・--locked・--no-config の方針は同ファイル冒頭）。
 
 .PHONY: py-sync
 py-sync: ## uv sync --locked で学習ワーカーの仮想環境を lock どおりに同期する
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv --no-config sync --locked --directory $(PY_DIR)
+	@scripts/py.sh sync
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-sync をスキップ"
 endif
@@ -371,8 +254,7 @@ endif
 .PHONY: py-fmt
 py-fmt: ## ruff format で学習ワーカー・scripts/ の Python を整形する（書き換える）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv --no-config run --locked --directory $(PY_DIR) ruff format . ../scripts
+	@scripts/py.sh fmt
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt をスキップ"
 endif
@@ -380,8 +262,7 @@ endif
 .PHONY: py-fmt-check
 py-fmt-check: ## ruff format --check（整形差分の検出。書き換えない）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv --no-config run --locked --directory $(PY_DIR) ruff format --check . ../scripts
+	@scripts/py.sh fmt-check
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-fmt-check をスキップ"
 endif
@@ -389,8 +270,7 @@ endif
 .PHONY: py-lint
 py-lint: ## ruff check（学習ワーカーの lint ゲート。S ルールで危険な逆シリアル化等を検出）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv --no-config run --locked --directory $(PY_DIR) ruff check . ../scripts
+	@scripts/py.sh lint
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-lint をスキップ"
 endif
@@ -398,8 +278,7 @@ endif
 .PHONY: py-test
 py-test: ## pytest（学習ワーカーのテスト）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv --no-config run --locked --directory $(PY_DIR) pytest
+	@scripts/py.sh test
 else
 	@echo "skip: trainer/pyproject.toml 未追加のため py-test をスキップ"
 endif
@@ -407,71 +286,41 @@ endif
 .PHONY: py-ci
 py-ci: py-fmt-check py-lint py-test ## 学習ワーカーのローカルゲートを一括実行する
 
+# 実 trainer（MLX CPU）を Rust の run_train から起動する結合テスト（issue #258。REQ-18/19/34/39）。
+# 実処理・テスト名の列挙は scripts/test-trainer-integration.sh（テスト名を変えたら同スクリプトも更新する）。
+# real_trainer.rs は unix 限定（`#![cfg(unix)]`）のため、Windows では skip を表示して成功扱いにする
+# （Windows は MLX の実機検証対象外。`.claude/rules/coding-rust.md`）。
 .PHONY: test-trainer-integration
-# 実 trainer（MLX CPU）を Rust の run_train から起動する結合テスト（issue #258。
-# REQ-18/19/34/39）。crates/train/tests/real_trainer.rs は #[ignore] で既定の
-# `make test` から分離してあり、ここで --ignored 付きで実行する（python-ci.yml と
-# `make ci` の両方で実行するため、CI を通すための skip ではない）。
-# libtest のテスト名フィルタは 1 回の起動につき 1 つしか渡せないため、テストごとに
-# 個別に起動する（「パッケージ:テストバイナリ:テスト名」の組で回す。sandbox_pipeline_real_trainer は
-# sandbox 監視チェーンの完走確認（評価なし・評価ありの 2 件）。REQ-38・TASK-38.1・#161）。cargo test 自体の終了状態を保持するためパイプ（tee）は使わず、
-# 一時ファイルへ出力してから表示する。--exact のテスト名がずれると 0 件実行で
-# 成功してしまうため、出力の「1 passed」も検査して fail-closed にする
-# （テスト名を変えたらここも更新する）。
-# real_trainer.rs は unix 限定（`#![cfg(unix)]`）のため、Windows では skip を表示して
-# 成功扱いにする（Windows は MLX の実機検証対象外。`.claude/rules/coding-rust.md`）。
 ifneq ($(IS_WINDOWS),)
 test-trainer-integration: ## 実 trainer を Rust から起動する結合テスト（Windows では対象外。issue #258）
 	@echo "skip: real_trainer は unix 限定のため Windows では test-trainer-integration をスキップ"
 else
 test-trainer-integration: py-sync ## 実 trainer を Rust から起動する結合テスト（#[ignore] 分離分。issue #258）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS),$(HAS_PY)),)
-	@$(require_uv)
-	@out="$$(mktemp)"; overall=0; \
-	for spec in \
-		fandhe-edge-train:real_trainer:req18_real_trainer_c1_job_completes_with_typed_outcome \
-		fandhe-edge-train:real_trainer:req18_real_trainer_c3_job_completes_with_validation_predictions \
-		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_completes_under_monitor_with_zero_tool_denials \
-		fandhe-edge-cli:sandbox_pipeline_real_trainer:req38_real_pipeline_with_evaluation_data_completes_under_monitor_with_zero_tool_denials; do \
-		pkg="$${spec%%:*}"; rest="$${spec#*:}"; bin="$${rest%%:*}"; t="$${rest#*:}"; \
-		cargo test -p "$$pkg" --test "$$bin" -- --ignored --exact "$$t" >"$$out" 2>&1; \
-		status=$$?; \
-		cat "$$out"; \
-		if [ "$$status" -ne 0 ]; then \
-			echo "error: $$bin の $$t が失敗しました（終了コード $$status）" >&2; overall=1; \
-		elif ! grep -q "test result: ok. 1 passed" "$$out"; then \
-			echo "error: $$bin の $$t が実行・成功していません（テスト名の不一致の可能性）" >&2; overall=1; \
-		fi; \
-	done; \
-	rm -f "$$out"; exit $$overall
+	@scripts/test-trainer-integration.sh
 else
 	@echo "skip: Cargo.toml / メンバー crate / trainer/pyproject.toml のいずれかが無いため test-trainer-integration をスキップ"
 endif
 endif
 
-.PHONY: check-dependency-approvals
 # 依存の承認台帳（dependency-approvals.json）と manifest・lock を照合し、承認記録のない
 # 依存の追加・更新・削除を止める（REQ-38・TASK-38.3・#165。手順: docs/design/dependency-approval-flow.md）。
-# tomllib が要るため trainer の Python（3.12。.python-version）で実行する。`uv run --locked` は環境未構築時に
-# 依存の解決・同期（通信）を起こしうるため使わず、`--no-project --offline` でプロジェクト同期と通信を
-# 抑止する（Python 本体が未導入ならダウンロードせず失敗する＝fail-closed）。標準ライブラリのみ。
+# 前提（trainer の Python で標準ライブラリのみ・`--no-project --offline`）は scripts/py.sh を参照。
+.PHONY: check-dependency-approvals
 check-dependency-approvals: ## 依存の承認台帳と manifest・lock を照合する（未承認の依存変更で失敗。#165）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv run --no-project --offline --directory $(PY_DIR) python -I ../scripts/check_dependency_approvals.py --root ..
+	@scripts/py.sh check-dependency-approvals
 else
 	@echo "error: trainer/pyproject.toml が無く check-dependency-approvals の照合対象が欠けている（fail-closed）" >&2
 	@exit 1
 endif
 
-.PHONY: check-unsafe-allowlist
 # `allow(unsafe_code)` の出現箇所を許可リスト（unsafe-allowlist.json）と照合し、承認記録のない
-# `unsafe` の追加を止める（REQ-39・#335。手順: docs/design/unsafe-allowlist-flow.md）。実行方法は
-# check-dependency-approvals と同じ（`--no-project --offline`。標準ライブラリのみ）。
+# `unsafe` の追加を止める（REQ-39・#335。手順: docs/design/unsafe-allowlist-flow.md）。
+.PHONY: check-unsafe-allowlist
 check-unsafe-allowlist: ## allow(unsafe_code) の出現を許可リストと照合する（未承認の追加で失敗。#335）
 ifneq ($(HAS_PY),)
-	@$(require_uv)
-	uv run --no-project --offline --directory $(PY_DIR) python -I ../scripts/check_unsafe_allowlist.py --root ..
+	@scripts/py.sh check-unsafe-allowlist
 else
 	@echo "error: trainer/pyproject.toml が無く check-unsafe-allowlist を実行できない（fail-closed）" >&2
 	@exit 1
@@ -484,15 +333,10 @@ ci: lint-docs check-workspace-manifest check-dependency-approvals check-unsafe-a
 # 後片付け
 # --------------------------------------------------
 
-# 素の `cargo clean` は CARGO_TARGET_DIR / build.target-dir が他 worktree と共有の
-# ディレクトリを指している場合にそれを丸ごと消すため、`--target-dir target` で本リポの
-# ./target に限定する。target/ が symlink（共有ディレクトリへの参照の可能性）なら
-# 辿らずに拒否する（make スキル rust-crate サンプルと同一方針）。
 .PHONY: clean
-clean: ## 本リポの ./target のみ削除する（共有 CARGO_TARGET_DIR には触れない）
+clean: ## 本リポの ./target のみ削除する（共有 CARGO_TARGET_DIR には触れない。symlink なら拒否）
 ifneq ($(HAS_CARGO),)
-	@if [ -L target ]; then echo "error: target/ が symlink です（共有ビルドディレクトリの可能性）。削除を拒否します" >&2; exit 1; fi
-	cargo clean --target-dir target
+	@scripts/clean.sh
 else
 	@echo "skip: Cargo.toml 未追加のため clean をスキップ"
 endif
