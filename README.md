@@ -63,6 +63,8 @@ git submodule update --init   # docs/spec（private・要アクセス権）
 
 `docs/spec`（`fandhe-edge-model-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
+ビルド成果物（`target/`）のディスク使用量とリンク時間を抑えるため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`dev`・`test` に効き、`crates/*` の crate は full debuginfo のままです。panic 位置・バックトレースの行番号は残り、デバッガで依存の変数・型を見られなくなるだけです）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
+
 学習ワーカー（`trainer/`）は `PYTHONPATH` の手動設定なしに、唯一の起動口 `trainer/launch.py` から起動できます（`-I` 隔離モード必須。Issue #12）:
 
 ```bash

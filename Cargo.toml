@@ -75,3 +75,22 @@ libc = "=0.2.189"
 # 局所的に許可する。`forbid` にすると crate 側で `#[allow]` による局所許可ができなくなるため
 # `deny` を採用する。
 unsafe_code = "deny"
+
+# 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
+# Org の他リポ（fandhe-ai・fandhe-db）と同じ設定で、ローカルの `target/` のディスク使用量と
+# リンク時間（統合テスト・bin の各バイナリへ依存が静的リンクされる）を減らす。開発時に依存の
+# 内部変数・型をデバッガで追う必要は薄いため、それを諦めて両方を減らす。
+# - 残るもの: panic 位置・バックトレースの file:line・プロファイラの行番号
+# - 失うもの: デバッガ（lldb / gdb）で依存クレートの変数・型を見る機能のみ
+# - `"*"` はメンバー以外にだけ効くため、`crates/*` の 7 crate は full debuginfo のまま
+# - 依存のビルドスクリプト・proc-macro（`build-override` 側の既定は debuginfo なし）にも
+#   適用され行番号付きになる（`build-override` より `package."*"` が優先されるため
+#   打ち消せない）。増分は依存本体の削減に比べて小さい
+# - `test` プロファイルは `dev` を継承するため `cargo test` にも効く。`release`・
+#   `bench`（`release` 継承）は既定どおり debuginfo なしで影響しない
+# 本設定を変えると CI の target キャッシュ（`.github/workflows/ci.yml`）の中身が合わなくなる。
+# `Swatinem/rust-cache` のキーは workspace メンバーの Cargo.toml しか含まず、仮想 manifest である
+# 本ファイルの変更を捕捉しないため、`prefix-key` の版セグメントを上げる
+# （`.claude/rules/github-actions.md`「キャッシュ方針」）。
+[profile.dev.package."*"]
+debug = "line-tables-only"

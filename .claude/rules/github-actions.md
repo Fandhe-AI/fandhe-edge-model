@@ -93,11 +93,19 @@ description: >
   `'!.agents/**'`・`'!.claude/**'` で除外する）。Rust の target をキャッシュするキーには rustc のバージョン（`rustc -vV` の
   commit-hash 等）を含め、runner イメージ・toolchain の更新後に古い target を exact hit で復元し続けないようにする
   （`Swatinem/rust-cache` v2.8.1 は rustc のバージョン・ルートの `Cargo.lock`・workspace メンバーの `Cargo.toml` を自動でキーに含む。
+  ルートの `Cargo.toml` は仮想 manifest〔メンバーではない〕のためキーに入らない。
   ただし `**/.cargo/config.toml`・`**/rust-toolchain(.toml)` は再帰 glob で拾い除外の入力も無いため、サンプルの
   `.agents/skills/make/samples/projects/rust-workspace-xtask/.cargo/config.toml` もキーに入る。このファイルがスキル更新で
   変わったときは 1 回だけ miss〔外部 crate の再ビルド約 20 秒〕と main への再保存〔3 OS で約 108MB〕が起きるが、許容する。
   `.claude/skills` の symlink は辿らない）。`actions/cache` を直接使う場合は `restore-keys` で前方一致の部分復元を許し、
   `Cargo.lock` が変わっても cold にしない
+- 保存内容をキー以外の要因で変えたら版セグメントを上げる: ルート `Cargo.toml` の `[profile]`（例: `[profile.dev.package."*"]` の
+  `debug`）・CI の `CARGO_*` env・ビルドコマンドなど、キーが捕捉しない変更で target の中身が変わると、既存キーに exact hit したまま
+  依存を毎回再ビルドし、exact hit では再保存もされない。`rust-ci-default-features` は `prefix-key` 末尾の `-v<N>` を上げる。
+  reusable `rust-ci` のキー（`<prefix>-<OS>-{clippy,test}-v4-<rustc>-<Cargo.lock>`）は本リポから変えない方針のため、
+  そうした変更のマージ後に main スコープの `fandhe-edge-model-{Linux,macOS}-{clippy,test}-v4-*` を `gh cache delete` で削除し、
+  次の main の push で保存し直させる（マージ前に消すと main の push が旧内容で保存し直す）。`deny` のキャッシュは target を
+  含まないため対象外
 - サイズと追い出し: 1 世代の合計（1 件のサイズ × 種別 × OS）が 10GB に余裕をもって収まるよう見積もる。毎回読まれる main の
   最新キャッシュは LRU で最後まで残るため、キー切替で古い世代が追い出されても新しい世代が保存済みならミスにならない。
   この状態を保てていれば上限を上げる必要はない
