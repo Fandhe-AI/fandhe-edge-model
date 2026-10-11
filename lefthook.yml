@@ -6,15 +6,20 @@
 #   （Makefile の HAS_CARGO 判定と同一方針）
 # - trainer/pyproject.toml 未追加の間、学習ワーカー（Python）系ジョブも同様にスキップする
 #   （Makefile の HAS_PY 判定と同一方針）
-# - 重いチェック（clippy・test・ruff check・pytest）は pre-push に置き、
-#   pre-commit は整形チェックのみで軽量に保つ
+# - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
+# - テスト・clippy・ruff check・pytest など重い検査や CI と重複する検査はフックに置かず、
+#   CI（.github/workflows/ci.yml・python-ci.yml）に任せる。pre-push は置かない。
+#   pre-commit は staged 限定・glob 限定の 1 秒未満の検査と、push 後では手遅れの
+#   秘密情報検査に限る（CI と重複して残す検査は git-hooks.md の「明示的な例外」に列挙）
 
 pre-commit:
   parallel: true
   jobs:
     # staged の .rs のみ rustfmt --check（整形は make fmt / PostToolUse フックで実施済みの想定）。
     # rustfmt 単体は Cargo.toml を読まず既定 edition 2015 で検査してしまうため、
-    # workspace の正である Cargo.toml の edition を明示指定する
+    # workspace の正である Cargo.toml の edition を明示指定する。
+    # CI（ci.yml の rust-ci の fmt）と重複するが、staged 限定で軽量なため例外として残す
+    # （.claude/rules/git-hooks.md「明示的な例外」）
     - name: rustfmt-check
       glob: "*.rs"
       run: |
@@ -28,7 +33,9 @@ pre-commit:
     # staged の trainer/**/*.py 変更を検出したら trainer プロジェクト全体を
     # ruff format --check する（{staged_files} は uv run --directory の cwd 変更後は
     # リポジトリルート相対のままになり、一部ファイルだけを渡すのは事故のもとのため、
-    # 軽量な単一プロジェクトの現状は全体チェックで代替する）
+    # 軽量な単一プロジェクトの現状は全体チェックで代替する）。
+    # CI（python-ci.yml の make py-ci → py-fmt-check）と重複するが、trainer/ の .py が
+    # staged のときだけ走り軽量なため例外として残す（.claude/rules/git-hooks.md「明示的な例外」）
     - name: ruff-format-check
       glob: "trainer/**/*.py"
       run: |
@@ -87,6 +94,10 @@ pre-commit:
     # 値そのものは出力しない。
     - name: secrets-content-guard
       run: |
+        # プロセス起動回数を diff 行数に比例させないため、awk 1 本で追加行の本文と
+        # ファイル名を行対応の一時ファイルへ書き出し、パターンごとに grep -E を 1 回だけ
+        # 実行する（Fandhe-AI/fandhe-browser の同名ジョブと同じ方式。awk の `{n}` 区間指定は
+        # 古い mawk / BSD awk で使えないため grep -E 側で照合する。BSD / GNU の両方で動く）
         patterns='
         -----BEGIN [A-Z ]*PRIVATE KEY-----|private-key
         AKIA[0-9A-Z]{16}|aws-access-key-id
@@ -96,35 +107,76 @@ pre-commit:
         xox[abprs]-[A-Za-z0-9-]{10,}|slack-token
         AIza[0-9A-Za-z_-]{35}|google-api-key
         '
-        # パイプの左辺（git diff）の失敗は右辺の while に隠れて成功扱いになるため、
-        # 先に変数へ取得して終了状態を確認する
-        if ! diff=$(git diff --cached --no-renames --diff-filter=ACMR -U0 --no-ext-diff --no-color -- .); then
+        tmp=$(mktemp -d) || exit 1
+        trap 'rm -rf "$tmp"' EXIT
+        # パイプの左辺（git diff）の失敗は右辺に隠れて成功扱いになるため、先にファイルへ
+        # 書き出して終了状態を確認する（fail-closed）
+        if ! git diff --cached --no-renames --diff-filter=ACMR -U0 --no-ext-diff --no-color -- . > "$tmp/diff"; then
           echo "NG: staged diff を取得できないため秘密情報の検査を実施できません" >&2
           exit 1
         fi
-        file=""
-        printf '%s\n' "$diff" | while IFS= read -r line; do
-          case "$line" in
-            "+++ b/"*)
-              file="${line#+++ b/}"
-              ;;
-            "+++ "*)
-              ;;
-            "+"*)
-              content="${line#+}"
-              printf '%s\n' "$patterns" | while IFS='|' read -r pat kind; do
-                [ -z "$pat" ] && continue
-                if printf '%s' "$content" | grep -Eq -- "$pat"; then
-                  echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
-                  exit 1
-                fi
-              done || exit 1
-              ;;
-          esac
-        done
+        # `+++ b/` ヘッダは `diff --git` から最初の `@@` までの間だけで解釈し、hunk 内の
+        # 追加行（本文が `++ b/` で始まる行を含む）をヘッダと取り違えないようにする。
+        # 空白を含むパスに git が付ける末尾のタブと、特殊文字を含むパスに付ける二重引用符
+        # （`+++ "b/..."`）も外す。BSD awk は UTF-8 ロケールで不正なマルチバイト列を含む行に
+        # 当たると異常終了するため LC_ALL=C で走査する（パターンは ASCII のみ）。
+        # 書き込み失敗（close の失敗）は非ゼロで返し、件数は stderr 経由で受け取って
+        # 書き出した行数と照合する（抽出漏れのまま合格させない）
+        if ! LC_ALL=C awk -v cf="$tmp/content" -v nf="$tmp/names" '
+          /^diff --git / { inhunk = 0; file = ""; next }
+          /^@@ /         { inhunk = 1; next }
+          !inhunk && /^\+\+\+ "b\// { file = substr($0, 8); sub(/\t$/, "", file); sub(/"$/, "", file); next }
+          !inhunk && /^\+\+\+ b\//  { file = substr($0, 7); sub(/\t$/, "", file); next }
+          !inhunk        { next }
+          /^\+/          { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
+          END {
+            if (n > 0 && (close(cf) != 0 || close(nf) != 0)) exit 2
+            print n + 0 > "/dev/stderr"
+          }
+        ' "$tmp/diff" 2> "$tmp/count"; then
+          echo "NG: 追加行の抽出に失敗したため秘密情報の検査を実施できません" >&2
+          exit 1
+        fi
+        n=$(cat "$tmp/count")
+        case "$n" in
+          ''|*[!0-9]*)
+            echo "NG: 追加行の件数を取得できないため秘密情報の検査を実施できません" >&2
+            exit 1
+            ;;
+        esac
+        if [ "$n" -eq 0 ]; then
+          exit 0
+        fi
+        if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
+          echo "NG: 追加行の抽出結果が不完全なため秘密情報の検査を実施できません" >&2
+          exit 1
+        fi
+        # grep の終了状態は 0=一致あり・1=一致なし・2 以上=検査エラー（fail-closed）。
+        # パターンは ASCII のみのため LC_ALL=C で照合し、非 UTF-8 の行で grep が
+        # 失敗しないようにする。-a は NUL 等を含む行をバイナリ扱いさせないため
+        rc=0
+        printf '%s\n' "$patterns" | {
+          while IFS='|' read -r pat kind; do
+            [ -z "$pat" ] && continue
+            LC_ALL=C grep -aEn -m1 -- "$pat" "$tmp/content" > "$tmp/hit"
+            grc=$?
+            if [ "$grc" -gt 1 ]; then
+              echo "NG: 秘密情報の判定でエラーが発生しました: pattern=$kind" >&2
+              rc=1
+            elif [ "$grc" -eq 0 ]; then
+              ln=$(head -n1 "$tmp/hit" | cut -d: -f1)
+              file=$(sed -n "${ln}p" "$tmp/names")
+              echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
+        }
 
     # 依存の承認台帳と manifest・lock の照合（REQ-38・TASK-38.3・#165）。依存ファイルまたは
-    # 台帳が staged のときだけ走らせる。承認記録のない依存変更はここで止まる
+    # 台帳が staged のときだけ走らせる。承認記録のない依存変更はここで止まる。
+    # CI（python-ci.yml の pytest: test_dependency_approvals.py）と重複するが、承認記録の
+    # 漏れを PR 前に検知する設計ゲートとして例外的に残す（.claude/rules/git-hooks.md「明示的な例外」）
     - name: dependency-approvals
       glob:
         - "Cargo.toml"
@@ -155,7 +207,9 @@ pre-commit:
         fi
 
     # allow(unsafe_code) の出現箇所と許可リストの照合（REQ-39・#335）。Rust ソース・manifest・許可リスト
-    # のいずれかが staged のときだけ走らせる。承認記録のない unsafe の追加はここで止まる
+    # のいずれかが staged のときだけ走らせる。承認記録のない unsafe の追加はここで止まる。
+    # CI（python-ci.yml の pytest: test_unsafe_allowlist.py）と重複するが、承認記録の
+    # 漏れを PR 前に検知する設計ゲートとして例外的に残す（.claude/rules/git-hooks.md「明示的な例外」）
     - name: unsafe-allowlist
       glob:
         - "crates/**/*.rs"
@@ -199,33 +253,4 @@ commit-msg:
           echo "NG: Conventional Commits 形式ではありません: $msg" >&2
           echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
           exit 1
-        fi
-
-pre-push:
-  jobs:
-    # clippy・test は Makefile の lint / test ターゲットへ委譲し、既定 feature のみで
-    # 実行する（`--all-features` 込みの検証は CI の rust-ci ジョブが担う）。
-    # Cargo.toml 未追加・メンバー crate 未作成なら make 側の HAS_CARGO / HAS_MEMBERS
-    # 判定で skip する
-    - name: clippy
-      run: |
-        if [ -f Cargo.toml ]; then
-          make lint
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    - name: test
-      run: |
-        if [ -f Cargo.toml ]; then
-          make test
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    # 学習ワーカー（trainer/）の lint・test。Cargo.toml 系と同様、未追加ならスキップする
-    - name: py-lint-test
-      run: |
-        if [ -f trainer/pyproject.toml ]; then
-          make py-lint py-test
-        else
-          echo "skip: trainer/pyproject.toml 未追加"
         fi
