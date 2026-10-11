@@ -10,6 +10,11 @@ name: Python CI
 # ci.yml の `ci-complete` 集約 needs への統合は検討中（統合する場合は ruleset の
 # 必須チェックから python-ci を外す作業と同時に行う）。
 #
+# 実行コストの削減: macOS runner は課金倍率が高いため、実行に影響しないファイル
+# （.claude/・.agents/・skills-lock.json・CLAUDE.md・AGENTS.md・README.md・LICENSE-*）のみを変更する
+# PR（日次のスキル同期 PR 等）では、ジョブ内の変更検知（scripts/ci-docs-only.sh）で重いステップを
+# 省略する。ジョブ自体は成功として報告されるため、必須チェック名 python-ci は維持される。
+#
 # paths フィルタを付けない理由: 本 workflow のジョブ名（python-ci）は
 # ruleset `main-protection` の必須チェックに登録しているため、trainer/ 以外
 # のみを変更する PR でも本 workflow 自体は必ず発火し「成功」を報告できる必要がある
@@ -44,6 +49,8 @@ name: Python CI
 # から取得する管理版 3.12.x）。uv の管理版マニフェストに無い patch 版を固定すると CI で
 # 解決できないため。版の一致は trainer/tests/test_environment.py が検証する。
 
+# ジョブ・トリガー・runner の追加や変更は .claude/rules/github-actions.md に従う。
+
 on:
   pull_request:
     branches: [main]
@@ -54,7 +61,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PR の古い実行だけ打ち切る（workflow_dispatch の実行は打ち切らない）
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python-ci:
@@ -63,10 +71,23 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+          fetch-depth: 1
+
+      # 変更ファイルが実行に影響しないものだけなら docs_only=true を出力する。
+      # 判定に失敗した場合・pull_request 以外は fail-closed で false（全ステップ実行）
+      - name: 変更ファイルの種別を判定する
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: scripts/ci-docs-only.sh
 
       # fail-closed: `macos-14` ラベルが指す実体が将来変わっても、arm64 以外
       # （MLX の wheel が存在しないアーキテクチャ）で「py-ci が通った」ことに
@@ -91,6 +112,7 @@ jobs:
           fi
 
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: steps.changes.outputs.docs_only != 'true'
         with:
           version: "0.12.19"
           # PR 間でのキャッシュ汚染リスクを避けて無効化する（mlx-metal 等の
@@ -98,12 +120,15 @@ jobs:
           enable-cache: false
 
       - name: make py-ci
+        if: steps.changes.outputs.docs_only != 'true'
         run: make py-ci
 
       # ci.yml と同じ SHA 固定。Rust 側の結合テスト（make test-trainer-integration）に必要。
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        if: steps.changes.outputs.docs_only != 'true'
         with:
           toolchain: stable
 
       - name: make test-trainer-integration
+        if: steps.changes.outputs.docs_only != 'true'
         run: make test-trainer-integration

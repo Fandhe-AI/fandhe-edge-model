@@ -1,5 +1,7 @@
 name: CI
 
+# ジョブ・トリガー・runner の追加や変更は .claude/rules/github-actions.md に従う。
+
 # 手動実行（workflow_dispatch）・PR（pull_request）・main への push（push）で発火する。
 # ruleset（branch protection）の必須チェックには、集約ジョブ `ci-complete` に加えて
 # 各ジョブの check も個別に登録済み（下の lint-docs ジョブのコメントを参照）。
@@ -8,6 +10,16 @@ on:
   pull_request:
   push:
     branches: [main]
+    # main への push には必須チェックが無い（必須チェックは pull_request の check）ため、
+    # 実行に影響しないファイルのみの変更では起動しない（日次の skills 同期 PR のマージ等）。
+    # pull_request には paths を付けない（必須チェックが pending のままマージ不能になるため）。
+    paths-ignore:
+      - '.claude/**'
+      - '.agents/**'
+      - 'skills-lock.json'
+      - 'CLAUDE.md'
+      - 'AGENTS.md'
+      - 'README.md'
 
 permissions:
   contents: read
@@ -16,7 +28,8 @@ concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
   # 別 PR が同一グループになり、互いの CI を cancel し合う）
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PR の古い実行だけ打ち切る（main への push の実行は打ち切らず、全 push の結果を残す）
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # --------------------------------------------------
@@ -130,6 +143,11 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # 依存クレートのビルド成果物を再利用する（rust-ci 側は reusable workflow の cache で同様）。
+      # key は OS ごとに分離される。第三者 action のため SHA 固定（v2.8.1）
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
+        with:
+          prefix-key: fandhe-edge-model-default-features
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
