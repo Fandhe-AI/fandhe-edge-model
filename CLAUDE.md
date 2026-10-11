@@ -125,6 +125,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・推論の学習非依存・完全固定・ユーザー承認制・通信の承認 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: MIT OR Apache-2.0・コピーレフト禁止・重み / データのライセンス確認 |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・CI 構成（有効化条件）・実機前提テストの扱い |
+| [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook の時間予算・CI と重複する検査を置かない方針・明示的な例外（承認台帳の照合等） |
 
 ## Current Skills
 
