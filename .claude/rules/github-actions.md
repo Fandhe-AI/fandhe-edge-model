@@ -61,7 +61,7 @@ description: >
 4. `actions/checkout` は `fetch-depth: 1`・`persist-credentials: false`（履歴が要るときだけ深くする）。submodule は取得しない
    （`docs/spec` は private）
 5. キャッシュ: Rust は reusable workflow の `cache` か `Swatinem/rust-cache`（SHA 固定）。`python-ci.yml` は意図的に
-   キャッシュ無効（汚染回避）なので変えない。キーの設計・保存条件は下の「キャッシュ方針」に従う
+   キャッシュ無効（汚染回避）なので変えない。キーの設計・保存条件は下の「キャッシュ方針」に従い、確認結果を PR 本文に書く
 6. サードパーティ action はコミット SHA で固定する（`Fandhe-AI/actions` のみ `@latest`）。`permissions` は最小権限・
    `timeout-minutes` を設定し、`${{ }}` は `run` に直接埋め込まず `env` 経由（[ci](./ci.md)）
 7. 処理は Makefile / `scripts/` の共通コマンドを呼ぶ。CI 独自のロジックを `run:` に長く書かない（[makefile](./makefile.md)）
@@ -71,8 +71,15 @@ description: >
 
 ## キャッシュ方針
 
-- 前提: リポジトリのキャッシュ上限は 10GB（超過分は LRU で古いものから追い出し、7 日間アクセスの無いものは削除）。
-  上限超過分の課金は Org の Actions 予算 $10（超過で停止）に含まれるため、上限を超える前提にしない。**10GB の中でヒット率を最大化する**ことを目的にする
+- 前提: リポジトリのキャッシュ上限は 10GB（Org 設定も 10GB。超過分は LRU で古いものから追い出し、7 日間アクセスの無いものは削除）。
+  Org の Actions 予算は $0（超過で停止）のため 10GB を超える上限は使えず（上げると 10GB を超えた時点でキャッシュが読み取り専用になる）、
+  上限を超える前提にしない。上限・予算の変更はユーザー判断。**10GB の中でヒット率を最大化する**ことを目的にする
+- 入れる前に効果を測る: キャッシュを足す・残す前に、ログ（外部 crate の再ビルド数・`downloaded` 件数・復元にかかった秒数）で
+  効果を確かめ、復元時間に見合わないものは入れない（例: 下の実測の `rust-ci-default-features` は正味 1 ジョブ約 10〜15 秒の短縮）。
+  本リポのジョブは GitHub ホステッド runner（毎回まっさら）だが、self-hosted runner ではツールチェーン・`CARGO_TARGET_DIR`・
+  パッケージストア等がジョブをまたいで残り、キャッシュが無意味になることがある（Org の実例: mirror-ui は pnpm キャッシュの復元に
+  1 ジョブ平均 75 秒かけて `downloaded 0`、team-hub は `Swatinem/rust-cache` が registry しか保存しておらず後処理が共有
+  `CARGO_HOME` の crate を消していたため、いずれも撤去）
 - PR の実行が保存したキャッシュは `refs/pull/<n>/merge` スコープに入り、その PR 以外（main・他 PR）からは復元できない。
   main のスコープに保存したものは全 PR から復元できる。したがって**保存は main への push のみ**とし、PR は復元だけにする
   （`Swatinem/rust-cache` は `save-if: ${{ github.ref == 'refs/heads/main' }}`。reusable `rust-base-ci` は
@@ -89,19 +96,30 @@ description: >
   ただし `**/.cargo/config.toml`・`**/rust-toolchain(.toml)` は再帰 glob で拾い除外の入力も無いため、サンプルの
   `.agents/skills/make/samples/projects/rust-workspace-xtask/.cargo/config.toml` もキーに入る。このファイルがスキル更新で
   変わったときは 1 回だけ miss〔外部 crate の再ビルド約 20 秒〕と main への再保存〔3 OS で約 108MB〕が起きるが、許容する。
-  `.claude/skills` の symlink は辿らない）
+  `.claude/skills` の symlink は辿らない）。`actions/cache` を直接使う場合は `restore-keys` で前方一致の部分復元を許し、
+  `Cargo.lock` が変わっても cold にしない
+- サイズと追い出し: 1 世代の合計（1 件のサイズ × 種別 × OS）が 10GB に余裕をもって収まるよう見積もる。毎回読まれる main の
+  最新キャッシュは LRU で最後まで残るため、キー切替で古い世代が追い出されても新しい世代が保存済みならミスにならない。
+  この状態を保てていれば上限を上げる必要はない
 - キャッシュを追加・変更したら、PR と main の push の両方のログで結果を確認する:
 
     ```bash
     gh api --paginate "repos/Fandhe-AI/fandhe-edge-model/actions/caches?per_page=100" \
       --jq '.actions_caches[]|[.key,.size_in_bytes,.ref,.last_accessed_at]|@tsv'   # 一覧（ref で PR 由来の複製を確認）
     gh api repos/Fandhe-AI/fandhe-edge-model/actions/cache/usage                   # 使用量
-    gh run view <run-id> --log | grep -E "Restored from cache key|No cache found|Cache restored from key|Cache not found"
+    gh cache list -R Fandhe-AI/fandhe-edge-model -L 100                            # key・サイズ・ref
+    gh run view <run-id> --log | grep -E "Restored from cache key|No cache found|Cache restored from key|Cache not found|Cache saved with key"
+    gh cache delete <id> -R Fandhe-AI/fandhe-edge-model                            # 不要なキャッシュの削除
     ```
+
+  `Cache restored from key:` が primary key と一致すれば exact、それ以外は partial。`gh cache delete` は全 PR・main で共有する
+  状態を消すため、一覧で対象（key・ref・最終アクセス）を確認してから行う
+- PR チェックリスト: キャッシュを追加・変更する PR では、上記（効果測定・保存は main のみ・キー設計・サイズ見積もり）を
+  確認したことを PR 本文に書く
 
 ### 実測（2026-10-11）
 
-- 使用量 0.39GB / 10GB（12 件）。追い出しによる miss は無し
+- 使用量 0.39GB / 10GB（12 件）。追い出しによる miss は無し（#528 マージ後の同日時点は 0.56GB・19 件）
 - reusable `rust-ci`（Linux・macOS の clippy / test / deny）: 直近の PR・main とも全件 exact hit（14〜33MB/件、main スコープのみ）。
   `fmt` ジョブは毎回 `Cache not found`（保存されないキーを復元しようとしている。上流 Fandhe-AI/actions 側の挙動）。
   windows-latest は上流の既知問題で `cache: false`
