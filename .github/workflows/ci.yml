@@ -152,9 +152,13 @@ jobs:
       # 保存は main の push のみ（PR は main のキャッシュを復元するだけ）。PR で保存すると
       # refs/pull/<n>/merge スコープに同内容の複製（3 OS で約 108MB）が残り、10GB 上限の
       # LRU で main のキャッシュを追い出す原因になる（.claude/rules/github-actions.md「キャッシュ方針」）
+      # prefix-key 末尾の `-v<N>` は版セグメント。rust-cache のキーはルートの Cargo.toml（仮想 manifest）を
+      # 含まないため、そこの [profile] 等で保存内容が変わったら上げる（既存キーに exact hit すると依存を毎回
+      # 再ビルドし、exact hit では再保存もされないため）。v2 はルート Cargo.toml へ
+      # `[profile.dev.package."*"]`（依存の debuginfo を行番号のみ）を追加したことによる bump
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
         with:
-          prefix-key: fandhe-edge-model-default-features
+          prefix-key: fandhe-edge-model-default-features-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
