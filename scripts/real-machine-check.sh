@@ -1,6 +1,7 @@
 #!/bin/sh
-# Mac 実機での動作確認（項目 A〜F）を、PC を変えても同じ手順で再現するための入口スクリプト
-# （REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-39。特定の TASK には対応しない横断の確認ツール。
+# Mac 実機での動作確認（項目 A〜J）を、PC を変えても同じ手順で再現するための入口スクリプト
+# （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39。
+# 特定の TASK には対応しない横断の確認ツール。
 # REQ-38 の sandbox 下の通信 0 件は対象外で、`sandbox-monitor.sh` の担当）。
 #
 # 呼び出し元: 人が macOS 実機で直接実行する（`make real-machine-check ARGS='...'`。`make ci` には含めない）／
@@ -12,10 +13,17 @@
 # 使い方:
 #   real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci]
 #                         [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]
+#                         [--g-budget-seconds N] [--i-device cpu|gpu]
 #   値を取るオプションは `--key VALUE` と `--key=VALUE` の両方を受け付ける。
 #   --work-dir: 必須。存在しないか空のディレクトリで、リポジトリ配下でないこと（物理パスで比較）
-#   --items:    A,B,C,D,E,F の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F。実行順は常に A→F。
-#               E は B の成果物を使うため B と一緒に指定する（B なしの E は invalid_input(64)）
+#   --items:    A,B,C,D,E,F,G,H,I,J の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F,G,H,J。
+#               実行順は常に A→J。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は
+#               invalid_input(64)）。A は通信しうる（--with-ci が要る）、I は 4 回の学習で GPU・時間を
+#               長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する
+#   G:          `train --all`（探索予算内の全候補の学習。REQ-18）。実 trainer を使う
+#   H:          `train --cancel`・`--status`・クラッシュ検出（REQ-34・REQ-39）。実 trainer を使う
+#   I:          3 seed の再現性と前のモデルとの比較（REQ-26・REQ-27）。学習 4 回
+#   J:          前の版への復帰（REQ-39。B の project を旧プロジェクトに使う）
 #   --with-ci:  A（make ci）を実行する明示の同意。A は通信を伴いうる（uv sync・advisory DB・npx）。
 #               --items に A があり --with-ci が無ければ invalid_input(64) で何も実行しない
 #   --repeat:   F の回数（1〜1000。既定 50）
@@ -23,6 +31,11 @@
 #   --p95-limit-us / --package-limit-bytes: C-1・C-2 の limits（既定 50000 / 1000）。
 #               --p95-limit-us は 1〜3600000000（定義ファイル側の上限と同じ）、
 #               --package-limit-bytes は 1〜999999999999999（15 桁まで）
+#   --g-budget-seconds: G の探索予算（秒。1〜921600。既定 3600。CLI の `--budget-seconds` と同じ上限）。
+#               小さくすると全候補が予算到達（exit 20）になりうる（それも想定内の結果として記録する）
+#   --i-device: I の証拠種別の申告（cpu・gpu。既定 cpu）。cpu → cpu_real_machine、gpu →
+#               gpu_real_machine_declared。CLI の train は現状 CPU 固定のため、gpu は人が別の手段で
+#               GPU 学習へ切り替えたときだけ指定する
 #   --overall-timeout-sec: 実行全体の上限時間（秒。1〜86400。既定 14400）。契約に定めのない値（自分で決めた暫定値。
 #               REQ-39）。超えたら子のグループを止め、実行中の項目は failed、残りは not_run（reason は
 #               overall_timeout）で record を書いて exit 10。F の --repeat を大きくするときは併せて上げる
@@ -70,12 +83,14 @@ fail() {
 
 # ---- 引数の検証（ここで失敗したら make・cargo・CLI を起動しない） ----
 work_dir=
-items=B,C,D,E,F
+items=B,C,D,E,F,G,H,J
 repeat=50
 quiet=0
 with_ci=0
 p95_limit=50000
 pkg_limit=1000
+g_budget=3600
+i_device=cpu
 overall_timeout=14400
 seen=
 while [ $# -gt 0 ]; do
@@ -91,7 +106,7 @@ while [ $# -gt 0 ]; do
     esac
     case "$key" in
         --help)
-            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]"
+            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu]"
             ;;
         --quiet-machine | --with-ci)
             [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
@@ -101,7 +116,7 @@ while [ $# -gt 0 ]; do
             shift
             continue
             ;;
-        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes | --overall-timeout-sec) ;;
+        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes | --overall-timeout-sec | --g-budget-seconds | --i-device) ;;
         *) fail 64 invalid_input "unknown option" ;;
     esac
     if [ "$has_val" -eq 0 ]; then
@@ -120,26 +135,28 @@ while [ $# -gt 0 ]; do
         --p95-limit-us) p95_limit=$val ;;
         --package-limit-bytes) pkg_limit=$val ;;
         --overall-timeout-sec) overall_timeout=$val ;;
+        --g-budget-seconds) g_budget=$val ;;
+        --i-device) i_device=$val ;;
     esac
 done
 
 [ -n "$work_dir" ] || fail 64 invalid_input "--work-dir is required"
 
-# --items: A〜F の部分集合（大文字・重複なし・空要素なし）。分割の前に文字種を絞る（二重の守り。
+# --items: A〜J の部分集合（大文字・重複なし・空要素なし）。分割の前に文字種を絞る（二重の守り。
 # 範囲指定 A-F は照合順序に左右されるため使わない）
 case "$items" in
-    *[!ABCDEF,]*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F" ;;
-    '' | ,* | *, | *,,*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F" ;;
+    *[!ABCDEFGHIJ,]*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J" ;;
+    '' | ,* | *, | *,,*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J" ;;
 esac
 item_seen=
 old_ifs=$IFS
 IFS=,
 for it in $items; do
     case "$it" in
-        A | B | C | D | E | F) ;;
+        A | B | C | D | E | F | G | H | I | J) ;;
         *)
             IFS=$old_ifs
-            fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F"
+            fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J"
             ;;
     esac
     case "$item_seen" in
@@ -166,6 +183,16 @@ case "$item_seen" in
         ;;
 esac
 
+# J も B の成果物（B/project の package と版管理台帳）を旧プロジェクトとして使う
+case "$item_seen" in
+    *" J "*)
+        case "$item_seen" in
+            *" B "*) ;;
+            *) fail 64 invalid_input "item J requires item B" ;;
+        esac
+        ;;
+esac
+
 # 整数オプション（先頭 0 は拒否。桁数を制限して算術の桁あふれを避ける）
 case "$repeat" in
     [1-9] | [1-9][0-9] | [1-9][0-9][0-9] | 1000) ;;
@@ -188,6 +215,21 @@ case "$pkg_limit" in
 esac
 case "$pkg_limit" in
     *[!0-9]* | ????????????????*) fail 64 invalid_input "--package-limit-bytes must be a positive integer" ;;
+esac
+
+case "$g_budget" in
+    [1-9] | [1-9][0-9]*) ;;
+    *) fail 64 invalid_input "--g-budget-seconds must be an integer from 1 to 921600" ;;
+esac
+case "$g_budget" in
+    *[!0-9]* | ???????*) fail 64 invalid_input "--g-budget-seconds must be an integer from 1 to 921600" ;;
+esac
+# 上限は crates/train/src/search.rs の `MAX_SEARCH_BUDGET_SECONDS`（3600 × 256）と対。7 桁以上は
+# 上で拒否済みのため算術の桁あふれは起きない
+[ "$g_budget" -le 921600 ] || fail 64 invalid_input "--g-budget-seconds must be an integer from 1 to 921600"
+case "$i_device" in
+    cpu | gpu) ;;
+    *) fail 64 invalid_input "--i-device must be cpu or gpu" ;;
 esac
 
 case "$overall_timeout" in
@@ -302,7 +344,9 @@ set -- run \
     --repeat "$repeat" \
     --p95-limit-us "$p95_limit" \
     --package-limit-bytes "$pkg_limit" \
-    --overall-timeout-sec "$overall_timeout"
+    --overall-timeout-sec "$overall_timeout" \
+    --g-budget-seconds "$g_budget" \
+    --i-device "$i_device"
 [ -z "${bin:-}" ] || set -- "$@" --bin "$bin" --bin-override
 [ "$quiet" -eq 0 ] || set -- "$@" --quiet-machine
 [ "$with_ci" -eq 0 ] || set -- "$@" --with-ci

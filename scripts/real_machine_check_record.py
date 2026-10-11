@@ -1,7 +1,8 @@
-"""Mac 実機での動作確認（項目 A〜F）の実行・要約・記録（record.json / record.md）の生成。
+"""Mac 実機での動作確認（項目 A〜J）の実行・要約・記録（record.json / record.md）の生成。
 
-REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-38・REQ-39。特定の TASK には対応しない横断の
-確認ツール。REQ-38 のうち sandbox 下の通信 0 件の判定は対象外（`sandbox-monitor.sh` の担当）。
+REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-38・
+REQ-39。特定の TASK には対応しない横断の確認ツール。REQ-38 のうち sandbox 下の通信 0 件の
+判定は対象外（`sandbox-monitor.sh` の担当）。
 本スクリプトは通信を起こさない側に倒す（cargo は `--locked`、A 以外の子には `CARGO_NET_OFFLINE`、
 A を含む全ての子には rustup のツールチェーン自動取得を止める `RUSTUP_AUTO_INSTALL=0`。#375）。
 
@@ -10,7 +11,7 @@ A を含む全ての子には rustup のツールチェーン自動取得を止�
 標準ライブラリだけを使う（依存の追加なし。Python 3.9 の文法で書く）。
 
 責務:
-- 項目 A〜F の子プロセス起動（上限時間・出力サイズ上限つき。中断時は子のグループを止める。REQ-39）
+- 項目 A〜J の子プロセス起動（上限時間・出力サイズ上限つき。中断時は子のグループを止める。REQ-39）
 - 実行全体の上限時間（`--overall-timeout-sec`）と、環境採取の子（git・sysctl・sw_vers・otool）の
   固定パス・最小の環境での起動（PATH・GIT_* に左右されない。REQ-38・REQ-39・#364）
 - CLI の JSON の要約と、記録へ出してよい値だけへの絞り込み（伏せ処理は `sanitize_record` に集約）
@@ -41,14 +42,20 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 SCHEMA = "real-machine-check/1"
-ITEM_ORDER = ["A", "B", "C", "D", "E", "F"]
+ITEM_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+# 既定の項目（`scripts/real-machine-check.sh` の `items` 既定値と一致。pytest が機械照合する）。
+# A は通信しうる（`--with-ci`）、I は GPU を長時間占有しうる（#103）ため既定に入れない
+DEFAULT_ITEMS = ["B", "C", "D", "E", "F", "G", "H", "J"]
+ITEMS_MESSAGE = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J"
 # 公開前の組み立て先ディレクトリ名。`package` の実行後（exit 0・20 のどちらも）に残ってはならない
 # （crates/cli/src/project.rs の `PACKAGE_STAGING_DIR` と一致。pytest が機械照合する。REQ-30）
 PACKAGE_STAGING_DIR = "package.staging"
@@ -91,6 +98,30 @@ SCORE_SUM_TOLERANCE = 1e-6
 # check-runtime-linkage.sh の `for t in ...` に並ぶ env -i テストの数（pytest で照合する）
 LINKAGE_ENV_I_TESTS = 3
 
+# G の `--g-budget-seconds` の上限（crates/train/src/search.rs の `MAX_SEARCH_BUDGET_SECONDS` =
+# 3600 × 256。CLI の `--budget-seconds` の上限と同じ）。既定は CLI の既定（3600）に揃える
+MAX_G_BUDGET_SECONDS = 921_600
+DEFAULT_G_BUDGET_SECONDS = 3600
+# G の子プロセスの上限時間は「探索予算 + この余裕」（予算内の学習が終わり次第戻るため）
+G_TIMEOUT_MARGIN = 300
+# H・I・J が使う固定の学習 seed（I は複製ごとに別の seed。`train --train-seed`。REQ-26・#490）
+I_SEEDS = (1, 2, 3)
+I_PREVIOUS_SEED = 4
+# H のジョブ監視: `job.json` が running になり子孫が現れるまで待つ上限（秒）と、確認の間隔
+H_WAIT_RUNNING_SEC = 120.0
+H_POLL_SEC = 0.5
+# H: 子孫の終了を待つ猶予（キャンセル猶予 15 秒の後の SIGKILL・lifeline を見込む。REQ-39）
+H_DESCENDANT_GRACE_SEC = 30.0
+# 契約に定めのない値（自分で決めた点）: `ps`・キャンセル要求の子の上限時間
+TIMEOUT_AUX = 30
+# 子孫の確認に使う `ps`（固定の絶対パス。PATH を探さない。REQ-38・REQ-39）
+PS_PATH = "/bin/ps"
+# H の `ps`（全プロセスの引数を読む）の出力上限（バイト。契約に定めのない値。REQ-39）
+CAP_PS_STDOUT = 8 * 1024 * 1024
+CAP_PS_STDERR = 64 * 1024
+# `version_ledger.json` の上限（crates/core/src/version_ledger_record.rs の
+# `MAX_VERSION_LEDGER_BYTES`）
+CAP_VERSION_LEDGER = 2 * 1024 * 1024
 # E の件数上限（子プロセスを件数ぶん起動するため）
 MAX_E_RECORDS = 1000
 MAX_REPEAT = 1000
@@ -99,7 +130,8 @@ MAX_P95_LIMIT_US = 3_600_000_000
 # --package-limit-bytes の上限（15 桁。シェル側の桁数検査と対。算術の桁あふれを避ける）
 MAX_PACKAGE_LIMIT_BYTES = 999_999_999_999_999
 # --overall-timeout-sec（実行全体の上限時間。秒。REQ-39）。契約に定めのない値（自分で決めた点）:
-# 既定 4 時間は記録簿の通し実行（A〜F・`--repeat 50`）を収め、F の暴走（最大 1000 × 300 秒）を
+# 既定 4 時間は記録簿の通し実行（A〜H・J・`--repeat 50`。G の既定の探索予算 1 時間を含む）を収め、
+# F の暴走（最大 1000 × 300 秒）を
 # 止める桁。
 # 下限 1 はテストハーネスが短い値で発火させるため。既定値の出所はシェル側の 1 箇所だけ
 MIN_OVERALL_TIMEOUT_SEC = 1
@@ -133,6 +165,44 @@ CODE_VOCAB = frozenset(
 )
 # `PackageJudgment`（crates/core/src/stage_report.rs）
 JUDGMENT_VOCAB = frozenset({"pass", "fail", "undeterminable"})
+# `select` の `significance.verdict`（crates/core/src/evaluation_record.rs の
+# `BaselineComparisonVerdict`。REQ-25・#481）。`undeterminable` も正常な値（件数不足は合格にしない）
+SIGNIFICANCE_VOCAB = frozenset(
+    {"significantly_better", "not_significantly_better", "undeterminable"}
+)
+# `train --all` の候補ごとの結果と予算到達の範囲（crates/core/src/stage_report.rs の
+# `TrainSearchResult`・`TrainBudgetScope`。REQ-18・#482）
+TRAIN_RESULT_VOCAB = frozenset(
+    {
+        "evaluated",
+        "training_not_completed",
+        "scoring_failed",
+        "scoring_exceeded_budget",
+        "scoring_skipped_budget_exhausted",
+        "training_exceeded_time_limit",
+        "training_timed_out",
+        "not_started",
+    }
+)
+BUDGET_SCOPE_VOCAB = frozenset({"search_budget", "candidate_time_limit"})
+# ジョブ状態・クラッシュの観測点・キャンセル要求の結果（crates/train/src/job_record.rs の
+# `JobState`・`CrashCause`、crates/train/src/stage_files.rs の `CancelOutcome`。REQ-34・#484・#485）
+JOB_STATE_VOCAB = frozenset({"queued", "running", "cancelling", "cancelled", "succeeded", "failed"})
+CRASH_CAUSE_VOCAB = frozenset({"worker_signal", "supervisor_signal", "owner_lost"})
+CANCEL_OUTCOME_VOCAB = frozenset({"requested", "already_cancelling", "already_finished"})
+# やり直し案内の固定語彙（crates/train/src/restart.rs。再開は提供しない。REQ-34）
+RESTART_ACTION = "restart_from_scratch"
+RESTART_REASON_CODE = "resume_not_supported"
+# キャンセルされた単発 `train` の `message`（crates/cli/src/stages/train.rs の `cancelled_report`）
+CANCELLED_MESSAGE = "training cancelled"
+# 再現性・旧モデルとの比較の語彙（crates/core/src/evaluation_record.rs。REQ-26・#488〜#490）
+REPRODUCIBILITY_VERDICT_VOCAB = frozenset({"all_pairs_overlap", "some_pairs_disjoint"})
+COMPARISON_PREMISE_VOCAB = frozenset({"same_label_set", "label_set_differs"})
+COMPARISON_DATA_VOCAB = frozenset({"same", "common_subset"})
+# I の証拠種別（`--i-device`。CLI の `train` は現状 CPU 固定のため、gpu は人の申告）
+I_EVIDENCE = {"cpu": "cpu_real_machine", "gpu": "gpu_real_machine_declared"}
+# 版 ID の形（`v<n>`。crates/cli/src/stages/package.rs の台帳の版）
+VERSION_ID_RE = re.compile(r"v[1-9][0-9]{0,8}")
 # `kind` の許可リスト（crates/guard/src/kind.rs の `SUPPORTED_KINDS`。REQ-39）
 KIND_VOCAB = frozenset({"c1", "c3", "autoregressive"})
 # `package` の容量の目安（crates/runtime/src/capacity_limit.rs の `REFERENCE_CAPACITY_BYTES`。
@@ -188,6 +258,21 @@ STR_KEYS = frozenset(
         "os_name",
         "os_version",
         "os_build",
+        "verdict",
+        "result",
+        "budget_reached",
+        "state",
+        "cause",
+        "action",
+        "evidence",
+        "device",
+        "premise",
+        "evaluation_data",
+        "cancel",
+        "significance_verdict",
+        "outcome",
+        "i_device",
+        "restart_action",
     }
 )
 # list の要素として文字列を持ってよい位置（`options.items`・`items.D.direct_libraries`）
@@ -229,6 +314,12 @@ PROBE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # 偽の終了コードを呼び出し側へ読ませない（rc が無ければ `killed`。fail-closed。#359）
 GROUP_WRAPPER = (
     'RC=$1; shift; "$@"; rc=$?; set -C; printf "%s" "$rc" > "$RC" || rm -f "$RC"; kill -s KILL 0'
+)
+# `GROUP_WRAPPER` から最後のグループ KILL を除いたもの。H が「CLI が子孫を自分で止めたか」を確かめる
+# ときだけ使う（ラッパーが孫を片付けると、lifeline・killpg が効いていなくても子孫が 0 件に見える）。
+# 残った子孫は H が pid を控えて確認し、片付ける（REQ-39）
+GROUP_WRAPPER_NO_REAP = (
+    'RC=$1; shift; "$@"; rc=$?; set -C; printf "%s" "$rc" > "$RC" || rm -f "$RC"'
 )
 # rc ファイルの上限（3 桁の整数だけが入る）
 CAP_RC_FILE = 16
@@ -646,8 +737,14 @@ def run_cmd(
     out_cap: int,
     err_cap: int,
     env: dict[str, str] | None = None,
+    during: Callable[[int], None] | None = None,
+    reap_group: bool = True,
 ) -> RunResult:
     """子プロセスを独立したプロセスグループで起動し、期限と出力サイズを監視する（REQ-39）。
+
+    `during` は待機の周ごとに子（外側の sh）の pid を渡して呼ぶコールバック（H のジョブ監視用）。
+    例外を外へ出さないこと。`reap_group` が偽なら、正常終了後のグループ KILL を行わない
+    （`GROUP_WRAPPER_NO_REAP`。期限・中断・出力超過の後始末のグループ KILL は常に行う）。
 
     stdin は /dev/null、stdout・stderr はファイルへ書く（呼び出し側が読む前に `out_bytes` を
     上限と照らす）。超過・期限切れ・例外・中断（印）のいずれでも、リーダーが未回収の
@@ -669,7 +766,8 @@ def run_cmd(
     except OSError:
         # パスがディレクトリ・削除不能のとき。例外を外へ出さず、子を起動しない（#359）
         return RunResult(None, "spawn_error", 0, 0)
-    full = ["/bin/sh", "-c", GROUP_WRAPPER, "sh", str(rc_path), exe, *argv[1:]]
+    wrapper = GROUP_WRAPPER if reap_group else GROUP_WRAPPER_NO_REAP
+    full = ["/bin/sh", "-c", wrapper, "sh", str(rc_path), exe, *argv[1:]]
     global _active_pgid, _child_may_remain, _spawning, _overall_timed_out
     reason = None
     spawn_failed = False
@@ -708,6 +806,8 @@ def run_cmd(
                     if _size(out_path) > out_cap or _size(err_path) > err_cap:
                         reason = "output_limit"
                         break
+                    if during is not None:
+                        during(proc.pid)
                     time.sleep(0.02)
             finally:
                 # 例外・中断・期限超過で抜けたら、リーダーが未回収（poll が None）のうちに KILL する
@@ -914,6 +1014,9 @@ class Ctx:
     cli_sha256: str | None = None
     # FANDHE_EDGE_BIN で CLI を差し替えたか（差し替えなら p95 は参考値に固定する）
     bin_override: bool = False
+    # G の探索予算（秒。`--g-budget-seconds`）と I の証拠種別の申告（`--i-device`）
+    g_budget_seconds: int = DEFAULT_G_BUDGET_SECONDS
+    i_device: str = "cpu"
 
 
 # rustup プロキシ（~/.cargo/bin/cargo）は `rust-toolchain.toml` の指すツールチェーンが未導入だと
@@ -1233,6 +1336,7 @@ def run_pipeline(
     sample_text: str | None,
     package_allowed: set[int],
     check_sum: bool = True,
+    raw: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
     """`pdir` で register〜package（と、あれば infer）を実行する。
 
@@ -1240,6 +1344,7 @@ def run_pipeline(
     する（経路の閉じ込め。REQ-39）。戻り値は (工程記録, package の JSON, 失敗記録)。
     失敗記録が None でなければ以降の工程は実行していない。`kind` は train → select → evaluate の
     一貫性を照合する。`check_sum` は package の容量内訳の合計の照合を工程側で行うか（B は項目側）。
+    `raw` を渡すと、検査に通った工程の JSON（exit 0・20）を工程名で入れる（B の追加検査用）。
     """
     facts = read_facts(pdir)
     if facts is None:
@@ -1299,6 +1404,8 @@ def run_pipeline(
             )
         if name == "package":
             package_obj = obj
+        if raw is not None:
+            raw[name] = obj
         return obj, None
 
     obj, failure = go(
@@ -1504,7 +1611,10 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
     if not stage_inputs(ctx, bdir, None):
         return fail_item("input_unreadable"), False
     # 内訳の合計の照合は項目側で行い、不一致を `capacity_sum_mismatch` として記録する
-    steps, pkg, failure = run_pipeline(ctx, bdir, "sandbox check 0123456789", {0}, check_sum=False)
+    raw: dict[str, dict[str, Any]] = {}
+    steps, pkg, failure = run_pipeline(
+        ctx, bdir, "sandbox check 0123456789", {0}, check_sum=False, raw=raw
+    )
     if failure:
         return dict(failure, steps=steps), False
     cap = capacity_summary(pkg)
@@ -1528,16 +1638,194 @@ def item_b(ctx: Ctx) -> tuple[dict[str, Any], bool]:
         or len(files) != capacity_file_count(cap)
     ):
         return fail_item("unexpected_output", step="package", steps=steps), False
+    # #469 の CLI 結線で増えた出力の整合（校正・保留・診断・有意性・版管理台帳・校正の束縛）
+    n_total = raw.get("evaluate", {}).get("n_total")
+    reason, extras = check_b_extras(raw, cap, bdir / "project", n_total)
+    if reason is not None:
+        return fail_item(reason, steps=steps), False
     rec = {
         "status": "ok" if matches else "failed",
         "steps": steps,
         "capacity": cap,
         "capacity_sum_matches_total": matches,
         "package_files": files,
+        "contract_checks": extras,
     }
     if not matches:
         rec["reason"] = "capacity_sum_mismatch"
     return rec, matches
+
+
+def _hex64(v: Any) -> bool:
+    """sha256（小文字 hex 64 桁）の文字列か。"""
+    return isinstance(v, str) and SHA256_RE.fullmatch(v) is not None
+
+
+def _json_file(path: Path, cap: int) -> Any:
+    """通常ファイルを上限つきで読んで JSON にする。読めない・JSON でなければ None。"""
+    text = _read_regular_capped(path, cap)
+    if text is None:
+        return None
+    try:
+        return _loads(text)
+    except ValueError:
+        return None
+
+
+def check_evaluate_extras(obj: dict[str, Any], n_total: Any) -> tuple[str | None, dict[str, Any]]:
+    """`evaluate` の `calibration`・`abstention`・`diagnostics` の整合（REQ-22・REQ-27・REQ-29）。
+
+    欄名・形は crates/core/src/stage_report.rs（`EvaluateCalibration`・`EvaluateAbstention`・
+    `EvaluateDiagnostics`）。`abstention` は `answered + abstained == n_total`（`out_of_scope` は
+    `answered` の内数。stage_report.rs の `EvaluateAbstention` の doc）で、`coverage` は 0〜1。
+    評価データありの B では `calibration` が null にならない（#477）。戻り値は (失敗理由, 要約)。
+    """
+    cal = obj.get("calibration")
+    if (
+        not isinstance(cal, dict)
+        or not _is_finite_number(cal.get("temperature"))
+        or cal["temperature"] <= 0
+        or not isinstance(cal.get("adopted"), bool)
+        or not _unit_number(cal.get("threshold"))
+        or not _nonneg_int(cal.get("n_validation"))
+        or cal["n_validation"] <= 0
+        or not _unit_number(cal.get("validation_coverage"))
+    ):
+        return "calibration_invalid", {}
+    ab = obj.get("abstention")
+    counts = ("answered", "abstained", "out_of_scope", "correct_answered")
+    if (
+        not isinstance(ab, dict)
+        or not all(_nonneg_int(ab.get(k)) for k in counts)
+        or not _unit_number(ab.get("coverage"))
+        or "adopted_error" not in ab
+        or not (ab["adopted_error"] is None or _unit_number(ab["adopted_error"]))
+        or not _unit_number(ab.get("unconditional_error"))
+        or ab["answered"] + ab["abstained"] != n_total
+        or ab["out_of_scope"] > ab["answered"]
+        or ab["correct_answered"] > ab["answered"]
+    ):
+        return "abstention_invalid", {}
+    dg = obj.get("diagnostics")
+    if (
+        not isinstance(dg, dict)
+        or not isinstance(dg.get("train"), dict)
+        or not isinstance(dg.get("eval"), dict)
+        or not isinstance(dg.get("confusable_pairs"), list)
+        or not isinstance(dg.get("limitations"), list)
+        or not isinstance(dg.get("data_volume"), dict)
+        or not _eq_int(dg["eval"].get("n_rows"), n_total)
+    ):
+        return "diagnostics_invalid", {}
+    return None, {
+        "calibration": {"n_validation": cal["n_validation"], "adopted": cal["adopted"]},
+        "abstention": {k: ab[k] for k in ("answered", "abstained", "out_of_scope", "coverage")},
+        "diagnostics_present": True,
+    }
+
+
+def check_select_significance(obj: dict[str, Any]) -> tuple[str | None, str | None]:
+    """`select` の `significance`（REQ-25・#481）。キーは必ず出る（定義に `baseline_comparison` が
+    無ければ null）。dict なら `verdict` が語彙内（`undeterminable` も正常）。
+    戻り値は (失敗理由, verdict)。
+    """
+    if "significance" not in obj:
+        return "significance_invalid", None
+    sig = obj["significance"]
+    if sig is None:
+        return None, None
+    verdict = sig.get("verdict") if isinstance(sig, dict) else None
+    if not isinstance(verdict, str) or verdict not in SIGNIFICANCE_VOCAB:
+        return "significance_invalid", None
+    return None, verdict
+
+
+def check_version_report(v: Any, previous_expected: str | None) -> bool:
+    """`package` の `version`（`{"id":"v<n>","previous":null|"v<m>"}`。REQ-39・#491）。"""
+    if not isinstance(v, dict) or "previous" not in v:
+        return False
+    vid, prev = v.get("id"), v["previous"]
+    if not isinstance(vid, str) or VERSION_ID_RE.fullmatch(vid) is None:
+        return False
+    if prev is not None and (not isinstance(prev, str) or VERSION_ID_RE.fullmatch(prev) is None):
+        return False
+    return prev == previous_expected
+
+
+def version_number(v: Any) -> int | None:
+    """`v<n>` の n。形が違えば None（記録には版 ID の文字列でなく番号を出す）。"""
+    if isinstance(v, str) and VERSION_ID_RE.fullmatch(v):
+        return int(v[1:])
+    return None
+
+
+def check_version_ledger(path: Path, version_id: str) -> bool:
+    """`version_ledger.json` が通常ファイルで、今回の版の model・data・experiment の 3 件を持つか。
+
+    形は crates/core/src/version_ledger_record.rs（`schema_version`・`entries[]` の
+    `kind`・`id`・`sha256`）。ファイルの改変検出は範囲外（#491 の限界）。
+    """
+    led = _json_file(path, CAP_VERSION_LEDGER)
+    if not isinstance(led, dict) or not _eq_int(led.get("schema_version"), 1):
+        return False
+    entries = led.get("entries")
+    if not isinstance(entries, list):
+        return False
+    mine = [e for e in entries if isinstance(e, dict) and e.get("id") == version_id]
+    kinds = sorted(e.get("kind") for e in mine if isinstance(e.get("kind"), str))
+    return kinds == ["data", "experiment", "model"] and all(_hex64(e.get("sha256")) for e in mine)
+
+
+def check_calibration_binding(pdir: Path, cap: dict[str, Any]) -> tuple[str | None, bool]:
+    """`package/artifact.json` の `calibration_sha256` が `calibration.json` の実 sha256 と一致し、
+    容量内訳の `calibration` 枠が `calibration.json` の 1 件・実サイズであること
+    （REQ-39・REQ-30・#497）。
+    """
+    art = _json_file(pdir / "artifact.json", CAP_INPUT_FILE)
+    declared = art.get("calibration_sha256") if isinstance(art, dict) else None
+    actual = sha256_file(pdir / "calibration.json", CAP_PACKAGE_FILE)
+    if not _hex64(declared) or actual is None or declared != actual:
+        return "calibration_binding_mismatch", False
+    try:
+        size = (pdir / "calibration.json").stat().st_size
+    except OSError:
+        return "calibration_binding_mismatch", False
+    if cap["components"]["calibration"] != {"bytes": size, "file_count": 1}:
+        return "calibration_capacity_mismatch", False
+    return None, True
+
+
+def check_b_extras(
+    raw: dict[str, dict[str, Any]], cap: dict[str, Any], project: Path, n_total: Any
+) -> tuple[str | None, dict[str, Any]]:
+    """B の追加検査（#469 の CLI 結線で増えた出力。REQ-22・REQ-25・REQ-29・REQ-30・REQ-39）。
+
+    `evaluate` の校正・保留・診断、`select` の有意性、`package` の版（B は `--previous-project-dir`
+    なしのため `v1`・previous は null）・`version_ledger.json`・校正の束縛。戻り値は
+    (失敗理由, 記録へ出す要約)。
+    """
+    ev, sel, pkg = raw.get("evaluate"), raw.get("select"), raw.get("package")
+    if not isinstance(ev, dict) or not isinstance(sel, dict) or not isinstance(pkg, dict):
+        return "missing_field", {}
+    reason, extras = check_evaluate_extras(ev, n_total)
+    if reason is not None:
+        return reason, {}
+    reason, verdict = check_select_significance(sel)
+    if reason is not None:
+        return reason, {}
+    version = pkg.get("version")
+    if not check_version_report(version, None) or version["id"] != "v1":
+        return "version_invalid", {}
+    if not check_version_ledger(project / "version_ledger.json", version["id"]):
+        return "version_ledger_invalid", {}
+    reason, bound = check_calibration_binding(project / "package", cap)
+    if reason is not None:
+        return reason, {}
+    extras["significance_verdict"] = verdict
+    extras["version_number"] = version_number(version["id"])
+    extras["version_ledger_present"] = True
+    extras["calibration_sha256_matches"] = bound
+    return None, extras
 
 
 def capacity_file_count(cap: dict[str, Any]) -> int:
@@ -2041,6 +2329,1071 @@ def item_e(ctx: Ctx) -> dict[str, Any]:
     if not ok:
         rec["reason"] = "mismatch"
     return rec
+
+
+# --------------------------------------------------------------------------------------
+# G〜J（#469 の CLI 結線で増えた機能の実機確認）
+# --------------------------------------------------------------------------------------
+
+
+def go_step(
+    ctx: Ctx,
+    cwd: Path,
+    logs: Path,
+    steps: list[dict[str, Any]],
+    name: str,
+    tag: str,
+    argv: list[str],
+    command: str,
+    *,
+    facts: Facts | None = None,
+    allowed: frozenset[int] = frozenset(),
+    selected: int | None = None,
+    kind_before: str | None = None,
+    timeout: int = TIMEOUT_CLI_STEP,
+    during: Callable[[int], None] | None = None,
+    reap_group: bool = True,
+) -> tuple[int | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """CLI を 1 回実行して `steps` へ記録する。戻り値は (終了コード, stdout の JSON, 失敗記録)。
+
+    `facts` があれば工程の契約検査（`_step_check`。exit 0 は報告値まで、非 0 は `allowed` の中か）を
+    行い、`summary` を付ける。無ければ呼び出し側が判定する（終了コードと JSON の取得までを保証）。
+    `command` は記録へ出す固定の表示名（パス・利用者の値を含めない）。
+    """
+    logs.mkdir(exist_ok=True)
+    so = logs / f"{len(steps) + 1:02d}-{tag}.stdout"
+    se = logs / f"{len(steps) + 1:02d}-{tag}.stderr"
+    r = run_cmd(
+        [str(ctx.bin), *argv],
+        cwd,
+        so,
+        se,
+        timeout,
+        CAP_CLI_STDOUT,
+        CAP_CLI_STDERR,
+        ctx.offline_env,
+        during=during,
+        reap_group=reap_group,
+    )
+    entry: dict[str, Any] = {
+        "step": name,
+        "case": tag,
+        "command": command,
+        "exit_code": r.exit_code,
+        "stderr_bytes": r.err_bytes,
+    }
+    steps.append(entry)
+    if r.reason is not None:
+        return (
+            None,
+            None,
+            fail_item(r.reason, step=name, case=tag, exit_code=r.exit_code),
+        )
+    rc = r.exit_code if r.exit_code is not None else EXIT_RUNTIME_ERROR
+    obj = parse_json_object(so, CAP_CLI_STDOUT)
+    if obj is None:
+        return rc, None, fail_item("invalid_json", step=name, case=tag, exit_code=rc)
+    if facts is not None:
+        entry["summary"] = summarize_step(name, obj, facts.option_ids)
+        if rc != 0 and rc not in allowed:
+            err = error_fields(obj)
+            return (
+                rc,
+                obj,
+                fail_item("unexpected_exit_code", step=name, case=tag, exit_code=rc, **err),
+            )
+        if not _step_check(name, obj, set(allowed), rc, facts, selected, kind_before):
+            return (
+                rc,
+                obj,
+                fail_item(
+                    "unexpected_output",
+                    step=name,
+                    case=tag,
+                    exit_code=rc,
+                    **error_fields(obj),
+                ),
+            )
+    return rc, obj, None
+
+
+def prepare_project(
+    ctx: Ctx, d: Path, facts: Facts, logs: Path, steps: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """`d`（定義・train・evaluation を置いたディレクトリ）で register → inspect を実行する。
+
+    プロジェクトは `d/project`。失敗記録（無ければ None）を返す。
+    """
+    for name, argv in (
+        (
+            "register",
+            ["register", "--definition", "definition.json", "--project-dir", "project"],
+        ),
+        ("inspect", ["inspect", "--project-dir", "project"]),
+    ):
+        command = " ".join(argv)
+        _rc, _obj, failure = go_step(ctx, d, logs, steps, name, name, argv, command, facts=facts)
+        if failure:
+            return failure
+    return None
+
+
+def judge_train_all(
+    rc: int, obj: dict[str, Any], budget_seconds: int, project: Path
+) -> tuple[str | None, dict[str, Any]]:
+    """G の `train --all` の判定（REQ-18・REQ-34・#482・#483）。戻り値は (失敗理由, 要約)。
+
+    終了コードは 0（`evaluated` が 1 件以上）か
+    20（全件が予算到達。stdout は `code:"limit_exceeded"` の
+    エラー JSON）のどちらか。どちらも `search_record.json` が残る。exit 0 は `candidates[].result`・
+    `budget_reached` を語彙・型で確かめ、`evaluated` の候補だけ `result.json` が残り、それ以外の
+    候補ディレクトリは片付いていること。
+    """
+    if rc not in (0, 20):
+        return "unexpected_exit_code", {}
+    record = _json_file(project / "search_record.json", 1024 * 1024)
+    if not isinstance(record, dict):
+        return "search_record_missing", {}
+    if rc == 20:
+        if vocab_value(obj.get("code"), CODE_VOCAB) != "limit_exceeded":
+            return "unexpected_output", {}
+        return None, {"outcome": "budget_exhausted", "search_record_present": True}
+    cands = obj.get("candidates")
+    if (
+        obj.get("step") != "train"
+        or obj.get("status") != "ok"
+        or not _eq_int(obj.get("budget_seconds"), budget_seconds)
+        or not isinstance(obj.get("budget_reached"), bool)
+        or not _nonneg_int(obj.get("total_elapsed_ms"))
+        or not isinstance(cands, list)
+        or not cands
+    ):
+        return "unexpected_output", {}
+    summary: list[dict[str, Any]] = []
+    evaluated = 0
+    for i, c in enumerate(cands):
+        if not isinstance(c, dict):
+            return "unexpected_output", {}
+        result, scope = c.get("result"), c.get("budget_reached")
+        if (
+            not _eq_int(c.get("candidate"), i)
+            or c.get("kind") not in KIND_VOCAB
+            or not isinstance(result, str)
+            or result not in TRAIN_RESULT_VOCAB
+            or not (scope is None or (isinstance(scope, str) and scope in BUDGET_SCOPE_VOCAB))
+        ):
+            return "unexpected_output", {}
+        cdir = project / "candidates" / str(i)
+        if result == "evaluated":
+            evaluated += 1
+            if _read_regular_capped(cdir / "result.json", CAP_INPUT_FILE) is None:
+                return "candidate_result_missing", {}
+        elif os.path.lexists(cdir):
+            return "candidate_dir_not_cleaned", {}
+        summary.append(
+            {
+                "candidate": i,
+                "kind": c["kind"],
+                "result": result,
+                "budget_reached": scope,
+            }
+        )
+    if evaluated < 1:
+        return "no_candidate_evaluated", {}
+    return None, {
+        "outcome": "evaluated",
+        "budget_seconds": budget_seconds,
+        "budget_reached": obj["budget_reached"],
+        "total_elapsed_ms": obj["total_elapsed_ms"],
+        "candidates": summary,
+        "search_record_present": True,
+    }
+
+
+def item_g(ctx: Ctx) -> dict[str, Any]:
+    """G: `train --all --budget-seconds N`（探索予算内の全候補の学習と予算到達の記録）。
+
+    REQ-18・#482。
+
+    学習は CLI 経由（実 trainer）。予算は `--g-budget-seconds`（既定 3600）。
+    exit 0 と exit 20（全件が予算到達）のどちらも想定内で、合否の解釈（予算が妥当か）は人が行う。
+    """
+    gdir = ctx.work / "G"
+    if not stage_inputs(ctx, gdir, None):
+        return fail_item("input_unreadable")
+    facts = read_facts(gdir)
+    if facts is None:
+        return fail_item("input_unreadable")
+    logs, steps = gdir / "steps", []
+    failure = prepare_project(ctx, gdir, facts, logs, steps)
+    if failure:
+        return dict(failure, steps=steps)
+    budget = ctx.g_budget_seconds
+    rc, obj, failure = go_step(
+        ctx,
+        gdir,
+        logs,
+        steps,
+        "train",
+        "train-all",
+        ["train", "--project-dir", "project", "--all", "--budget-seconds", str(budget)],
+        f"train --project-dir project --all --budget-seconds {budget}",
+        timeout=budget + G_TIMEOUT_MARGIN,
+    )
+    if failure or rc is None or obj is None:
+        return dict(failure or fail_item("invalid_json"), steps=steps)
+    reason, summary = judge_train_all(rc, obj, budget, gdir / "project")
+    if reason is not None:
+        return fail_item(reason, step="train", exit_code=rc, steps=steps, **error_fields(obj))
+    return dict({"status": "ok", "exit_code": rc, "steps": steps}, **summary)
+
+
+# プロセスの識別情報（pid の再利用で無関係なプロセスを止めないため、開始時刻と併せて控える）
+@dataclass(frozen=True)
+class Proc:
+    """`ps` の 1 行。`start` は開始時刻（`lstart`。pid の再利用の見分け）、`command` は引数全体。"""
+
+    ppid: int
+    start: str
+    command: str
+
+
+def run_bounded(
+    argv: list[str],
+    cwd: Path | None,
+    env: dict[str, str] | None,
+    out: Any,
+    err: Any,
+    timeout: float,
+    out_cap: int,
+    err_cap: int,
+) -> tuple[int | None, str | None]:
+    """上限つきの短い子プロセス実行（`during` コールバックの中から呼べる。REQ-39）。
+
+    `run_cmd` はグローバルな子の追跡（`_active_pgid` 等）を使うため、その待機中のコールバックから
+    入れ子では呼べない。ここは状態を持たず、独立したセッションで起動し、`out`・`err`（書き込み用の
+    ファイルオブジェクト）のサイズが上限を超える・期限を過ぎたら、回収の前にグループごと KILL
+    する。戻り値は (終了コード, 失敗理由)。理由は `timeout`・`output_limit`・`spawn_error`。
+    """
+    try:
+        proc = subprocess.Popen(  # noqa: S603  固定の引数。shell は使わない
+            argv,
+            cwd=None if cwd is None else str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            env=env,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return None, "spawn_error"
+    reason = None
+    deadline = time.monotonic() + timeout
+    try:
+        while proc.poll() is None:
+            if time.monotonic() >= deadline:
+                reason = "timeout"
+                break
+            if os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap:
+                reason = "output_limit"
+                break
+            time.sleep(0.02)
+    finally:
+        # リーダーが未回収のうちにグループごと KILL してから回収する（pid の再利用を避ける）
+        global _child_may_remain
+        if proc.poll() is None and not _kill_group(proc.pid):
+            # グループへ送れなかった。孫が残りうるので記録し、せめてリーダーだけでも止める
+            _child_may_remain = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=REAP_WAIT_LIMIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # 回収を諦める。子が残りうる印を立て、Popen を保持する（参照が生きている間は pid が
+            # 再利用されない。`run_cmd` と同じ扱い）
+            _child_may_remain = True
+            _leftover_procs.append(proc)
+            reason = REASON_UNREAPED
+    if reason is None and (
+        os.fstat(out.fileno()).st_size > out_cap or os.fstat(err.fileno()).st_size > err_cap
+    ):
+        reason = "output_limit"
+    if reason is not None:
+        return None, reason
+    return proc.returncode, None
+
+
+def ps_procs() -> dict[int, Proc] | None:
+    """`ps` の (pid → `Proc`) 表。固定パスの `ps` が使えなければ None（REQ-38・REQ-39）。"""
+    if not os.path.isfile(PS_PATH) or not os.access(PS_PATH, os.X_OK):
+        return None
+    # 全プロセスの引数を読むため出力は大きくなりうる。無名の一時ファイルへ書かせ、超えたら止める。
+    # macOS の ps は -ww が無いと command を表示幅で切り詰め、末尾の `_worker` が消える
+    try:
+        with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+            rc, _reason = run_bounded(
+                [PS_PATH, "-A", "-ww", "-o", "pid=,ppid=,lstart=,command="],
+                None,
+                probe_env(),
+                fo,
+                fe,
+                TIMEOUT_AUX,
+                CAP_PS_STDOUT,
+                CAP_PS_STDERR,
+            )
+            if rc != 0:
+                return None
+            fo.seek(0)
+            raw = fo.read(CAP_PS_STDOUT + 1)
+    except OSError:
+        return None
+    if len(raw) > CAP_PS_STDOUT:
+        return None
+    table: dict[int, Proc] = {}
+    for line in split_lines(raw.decode("utf-8", errors="replace")):
+        parts = line.split(None, 7)
+        # pid ppid + lstart（曜日 月 日 時刻 年の 5 語）+ command
+        if len(parts) >= 7 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = Proc(
+                int(parts[1]), " ".join(parts[2:7]), parts[7] if len(parts) > 7 else ""
+            )
+    return table
+
+
+def ps_table() -> dict[int, int] | None:
+    """`ps` の (pid → ppid) 表。使えなければ None。"""
+    procs = ps_procs()
+    return None if procs is None else {pid: pr.ppid for pid, pr in procs.items()}
+
+
+def descendants_of(table: dict[int, int], root: int) -> set[int]:
+    """`root` の子孫の pid（`root` 自身を除く）。"""
+    found: set[int] = set()
+    frontier = {root}
+    while frontier:
+        frontier = {p for p, pp in table.items() if pp in frontier and p not in found}
+        found |= frontier
+    found.discard(root)
+    return found
+
+
+def is_worker(command: str) -> bool:
+    """学習ワーカー（`_worker`）か。
+
+    supervisor は `<python> -I <trainer>/launch.py _worker --out-fd N --lifeline-fd N` で
+    起動する（trainer/src/fandhe_edge_trainer/supervisor.py の `worker_argv`）。
+    """
+    tokens = command.split()
+    return "_worker" in tokens and any(t.endswith("launch.py") for t in tokens)
+
+
+def _same_proc(procs: dict[int, Proc] | None, pid: int, start: str) -> bool:
+    """`pid` が控えた開始時刻と同じプロセスとして今も存在するか。"""
+    return procs is not None and pid in procs and procs[pid].start == start
+
+
+class JobDriver:
+    """H: 実行中の `train` の `job.json` が running になり、学習ワーカーが現れたら操作を行う。
+
+    操作はキャンセル要求か KILL。`run_cmd` の `during` コールバックとして呼ばれる（待機の周
+    ごと。実際の確認は `H_POLL_SEC` ごと）。例外は外へ出さず `error` に固定語彙で残す。
+    `mode` は `cancel`（`train --cancel` を実行）か `kill`（train 本体の CLI を `SIGKILL`）。
+    操作は `_worker`（`is_worker`。CLI と supervisor だけの状態では送らない）の出現後に行う。
+    running・ワーカーを待つのは `H_WAIT_RUNNING_SEC` までで、超えたらそのまま実行し
+    `timed_out` を立てる（呼び出し側が失敗にする）。操作後も、train の終了まで子孫を観測し続け、
+    見つけたプロセスを `seen`（pid → 開始時刻）に残す。
+    """
+
+    def __init__(self, ctx: Ctx, cwd: Path, mode: str) -> None:
+        self.ctx, self.cwd, self.mode = ctx, cwd, mode
+        self.started = time.monotonic()
+        self.last = 0.0
+        self.done = False
+        self.timed_out = False
+        self.error: str | None = None
+        self.seen: dict[int, str] = {}
+        self.worker_seen = False
+        self.cancel_rc: int | None = None
+        self.killed = False
+
+    def _job_state(self) -> str | None:
+        rec = _json_file(self.cwd / "project/candidates/0/job/job.json", CAP_INPUT_FILE)
+        state = rec.get("state") if isinstance(rec, dict) else None
+        return state if isinstance(state, str) else None
+
+    def __call__(self, root: int) -> None:
+        now = time.monotonic()
+        if self.error is not None or now - self.last < H_POLL_SEC:
+            return
+        self.last = now
+        try:
+            self._tick(root, now)
+        except Exception:  # コールバックから例外を出さない（run_cmd の後始末を守る）
+            self.error, self.done = "driver_error", True
+
+    def _tick(self, root: int, now: float) -> None:
+        procs = ps_procs()
+        if procs is None:
+            self.error, self.done = "ps_unavailable", True
+            return
+        table = {pid: pr.ppid for pid, pr in procs.items()}
+        desc = descendants_of(table, root)
+        for pid in desc:
+            self.seen.setdefault(pid, procs[pid].start)
+            if is_worker(procs[pid].command):
+                self.worker_seen = True
+        if self.done:
+            return  # 操作の後も観測は続ける（後から起動したワーカーも控える）
+        waited_out = now - self.started > H_WAIT_RUNNING_SEC
+        if not (self._job_state() == "running" and self.worker_seen) and not waited_out:
+            return
+        self.timed_out = waited_out
+        self.done = True
+        if self.mode == "kill":
+            cli = sorted(p for p in desc if table.get(p) == root)
+            if cli and _same_proc(ps_procs(), cli[0], procs[cli[0]].start):
+                os.kill(cli[0], signal.SIGKILL)
+                self.killed = True
+            return
+        so, se = (
+            self.cwd / "steps" / "cancel.stdout",
+            self.cwd / "steps" / "cancel.stderr",
+        )
+        with (
+            _open_write_nofollow(so, False) as fo,
+            _open_write_nofollow(se, False) as fe,
+        ):
+            rc, reason = run_bounded(
+                [str(self.ctx.bin), "train", "--project-dir", "project", "--cancel"],
+                self.cwd,
+                self.ctx.offline_env,
+                fo,
+                fe,
+                TIMEOUT_AUX,
+                CAP_CLI_STDOUT,
+                CAP_CLI_STDERR,
+            )
+        if reason is not None:
+            # 出力が上限を超えた・期限切れ・起動失敗（子は止めてある）。cancel_rc は None のまま
+            self.error = f"cancel_{reason}"
+            return
+        self.cancel_rc = rc
+
+
+def alive_seen(seen: dict[int, str]) -> list[int]:
+    """控えたプロセスのうち、同じプロセスとして今も生きているもの（昇順）。
+
+    `ps` が使えなければ全件が残っている扱い（fail-closed）。開始時刻が違えば pid の再利用で
+    別のプロセスなので数えない。
+    """
+    procs = ps_procs()
+    if procs is None:
+        return sorted(seen)
+    return sorted(p for p, start in seen.items() if _same_proc(procs, p, start))
+
+
+def wait_descendants_gone(seen: dict[int, str]) -> list[int]:
+    """観測した子孫が終わるのを `H_DESCENDANT_GRACE_SEC` まで待ち、残った pid を返す（昇順）。"""
+    deadline = time.monotonic() + H_DESCENDANT_GRACE_SEC
+    while True:
+        alive = alive_seen(seen)
+        if not alive or time.monotonic() >= deadline:
+            return alive
+        check_interrupt()
+        check_overall()
+        time.sleep(H_POLL_SEC)
+
+
+def kill_seen(seen: dict[int, str]) -> list[int]:
+    """控えたプロセスのうち、同じプロセスと確かめられたものだけを KILL し、なお残るものを返す。
+
+    送る直前に `ps` を取り直して pid と開始時刻の一致を確かめる（pid の再利用で無関係なプロセスへ
+    送らない。`run_cmd` が回収後の pgid へ送らないのと同じ考え方）。例外・中断の経路でも呼ぶため
+    中断検査は行わない。KILL 後も残る（確認できない場合を含む）なら `child_may_remain` を立てる。
+    """
+    global _child_may_remain
+    procs = ps_procs()
+    if procs is None:
+        _child_may_remain = bool(seen) or _child_may_remain
+        return sorted(seen)
+    for pid, start in seen.items():
+        if _same_proc(procs, pid, start):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    deadline = time.monotonic() + 2.0
+    alive = alive_seen(seen)
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = alive_seen(seen)
+    if alive:
+        _child_may_remain = True
+    return alive
+
+
+def settle_descendants(drv: JobDriver, run: Callable[[], Any]) -> tuple[Any, list[int]]:
+    """`run()`（train の実行）と子孫の終了待ちを行い、残った子孫は例外の経路でも止める。
+
+    戻り値は (`run()` の結果, 待った後も残っていた子孫の pid)。`Interrupted`・`OverallTimeout` が
+    `run()` か待機から出ても、`finally` で確認済みの子孫を KILL し、止められなければ
+    `child_may_remain` を立てる（REQ-39）。
+    """
+    leftover: list[int] = []
+    try:
+        result = run()
+        leftover = wait_descendants_gone(drv.seen)
+    finally:
+        kill_seen(drv.seen)
+    return result, leftover
+
+
+def _restart_guidance_ok(g: Any) -> bool:
+    """やり直し案内が再開なし・最初からのやり直し・固定の理由コードか（REQ-34）。"""
+    return (
+        isinstance(g, dict)
+        and g.get("resumable") is False
+        and g.get("action") == RESTART_ACTION
+        and g.get("reason_code") == RESTART_REASON_CODE
+    )
+
+
+def judge_cancel_response(rc: int | None, obj: dict[str, Any] | None) -> str | None:
+    """`train --cancel` の応答（exit 0・`cancellations[0].cancel == "requested"`。#484）。"""
+    if rc != 0 or obj is None or obj.get("step") != "train" or obj.get("status") != "ok":
+        return "cancel_response_invalid"
+    cs = obj.get("cancellations")
+    if not isinstance(cs, list) or len(cs) != 1 or not isinstance(cs[0], dict):
+        return "cancel_response_invalid"
+    return (
+        None
+        if _eq_int(cs[0].get("candidate"), 0) and cs[0].get("cancel") == "requested"
+        else ("cancel_not_requested")
+    )
+
+
+def judge_cancelled_train(rc: int | None, obj: dict[str, Any] | None) -> str | None:
+    """キャンセルされた `train` の出力（exit 70・固定の message・`job.state:"cancelled"`。
+
+    `TrainInterruptedReport`。#484・#486）。
+    """
+    if rc != 70 or obj is None:
+        return "train_exit_code_not_70"
+    job = obj.get("job")
+    if (
+        obj.get("code") != "runtime_error"
+        or obj.get("message") != CANCELLED_MESSAGE
+        or obj.get("step") != "train"
+        or not _eq_int(obj.get("candidate"), 0)
+        or not isinstance(job, dict)
+        or job.get("state") != "cancelled"
+        or not _restart_guidance_ok(obj.get("restart"))
+    ):
+        return "train_output_invalid"
+    return None
+
+
+def judge_status(
+    rc: int | None, obj: dict[str, Any] | None, *, crashed: bool
+) -> tuple[str | None, dict[str, Any]]:
+    """`train --status --candidate 0` の判定（exit 0・`jobs[0]`。#485）。
+
+    `crashed` が偽なら `state:"cancelled"`
+    （`crash_detected:false`・`failure:null`・`record_updated:false`）、
+    真なら `state:"failed"`・`crash_detected:true`・`failure:{kind:"crashed",cause:"owner_lost"}`・
+    `record_updated:true`（running の残骸を初回に書き戻した）。どちらも `restart` は再開なしの案内。
+    """
+    if rc != 0 or obj is None or obj.get("step") != "train" or obj.get("status") != "ok":
+        return "status_invalid", {}
+    jobs = obj.get("jobs")
+    if not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], dict):
+        return "status_invalid", {}
+    entry = jobs[0]
+    job = entry.get("job")
+    if not _eq_int(entry.get("candidate"), 0) or not isinstance(job, dict):
+        return "status_invalid", {}
+    failure = job.get("failure")
+    state = job.get("state")
+    if crashed:
+        ok = (
+            state == "failed"
+            and job.get("crash_detected") is True
+            and job.get("record_updated") is True
+            and isinstance(failure, dict)
+            and failure.get("kind") == "crashed"
+            and failure.get("cause") == "owner_lost"
+        )
+    else:
+        ok = (
+            state == "cancelled"
+            and job.get("crash_detected") is False
+            and job.get("record_updated") is False
+            and failure is None
+        )
+    if not ok or not _restart_guidance_ok(entry.get("restart")):
+        return "status_unexpected", {}
+    out: dict[str, Any] = {"state": state}
+    if crashed:
+        out["cause"] = failure["cause"]
+    out["restart_action"] = entry["restart"]["action"]
+    return None, out
+
+
+def item_h(ctx: Ctx) -> dict[str, Any]:
+    """H: `train --cancel`・`--status` とクラッシュ検出（REQ-34・REQ-39。#484・#485・#486）。
+
+    1) `train --candidate 0` を起動し、running・子孫の出現を待って別プロセスで
+       `train --cancel` を送る。train は exit 70・`training cancelled`、`--status` は
+       `cancelled`、`package/` は無く、観測した子孫は
+       CLI 自身が止めて 0 件になること（ラッパーの後始末に頼らない。`GROUP_WRAPPER_NO_REAP`）。
+    2) もう一度 `train --candidate 0`（`cancelled` は丸ごと消して新規に始まる）を起動し、
+       同じく running を待って CLI 本体を `SIGKILL` する。`--status` は `failed`・
+       `owner_lost`（初回検出）を返すこと。
+    実 trainer を使う（CPU）。残った子孫は pid を控えて KILL し、記録に件数だけ残す。
+    """
+    hdir = ctx.work / "H"
+    if not stage_inputs(ctx, hdir, None):
+        return fail_item("input_unreadable")
+    facts = read_facts(hdir)
+    if facts is None:
+        return fail_item("input_unreadable")
+    logs, steps = hdir / "steps", []
+    failure = prepare_project(ctx, hdir, facts, logs, steps)
+    if failure:
+        return dict(failure, steps=steps)
+    train_argv = ["train", "--project-dir", "project", "--candidate", "0"]
+    status_argv = ["train", "--project-dir", "project", "--status", "--candidate", "0"]
+    status_cmd = "train --project-dir project --status --candidate 0"
+
+    # 1) キャンセル
+    drv = JobDriver(ctx, hdir, "cancel")
+    (rc, tobj, failure), leftover = settle_descendants(
+        drv,
+        lambda: go_step(
+            ctx, hdir, logs, steps, "train", "train-cancelled", train_argv,
+            "train --project-dir project --candidate 0", during=drv, reap_group=False,
+        ),
+    )  # fmt: skip
+    if drv.error is not None or failure is not None:
+        return dict(failure or fail_item(drv.error or "driver_error", step="train"), steps=steps)
+    if drv.timed_out:
+        return fail_item("job_not_running", step="train", steps=steps)
+    cancel_obj = parse_json_object(logs / "cancel.stdout", CAP_CLI_STDOUT)
+    for reason in (
+        judge_cancel_response(drv.cancel_rc, cancel_obj),
+        judge_cancelled_train(rc, tobj),
+    ):
+        if reason is not None:
+            return fail_item(reason, step="train", exit_code=rc, steps=steps, **error_fields(tobj))
+    rc_s, sobj, failure = go_step(
+        ctx, hdir, logs, steps, "train", "status-cancelled", status_argv, status_cmd
+    )
+    if failure:
+        return dict(failure, steps=steps)
+    reason, cancel_status = judge_status(rc_s, sobj, crashed=False)
+    if reason is not None:
+        return fail_item(reason, step="train", exit_code=rc_s, steps=steps)
+    if os.path.lexists(hdir / "project" / "package"):
+        return fail_item("package_created", step="train", steps=steps)
+    if not drv.worker_seen:
+        return fail_item("no_descendant_observed", step="train", steps=steps)
+    if leftover:
+        return fail_item(
+            "descendants_remain_after_cancel",
+            step="train",
+            descendants_observed=len(drv.seen),
+            descendants_remaining=len(leftover),
+            steps=steps,
+        )
+    cancel_rec = {
+        "cancel": "requested",
+        "train_exit_code": rc,
+        "descendants_observed": len(drv.seen),
+        "descendants_remaining": 0,
+        "package_absent": True,
+        **cancel_status,
+    }
+
+    # 2) クラッシュ検出（train 本体を KILL）
+    drv2 = JobDriver(ctx, hdir, "kill")
+    (rc2, _obj2, failure), leftover2 = settle_descendants(
+        drv2,
+        lambda: go_step(
+            ctx, hdir, logs, steps, "train", "train-killed", train_argv,
+            "train --project-dir project --candidate 0", during=drv2, reap_group=False,
+        ),
+    )  # fmt: skip
+    # KILL された train は JSON を出さない（invalid_json）のが正常。実行できなかった等だけ失敗にする
+    if drv2.error is not None or (failure is not None and failure.get("reason") != "invalid_json"):
+        return dict(
+            failure or fail_item(drv2.error or "driver_error", step="train"),
+            steps=steps,
+        )
+    if drv2.timed_out or not drv2.killed:
+        return fail_item("job_not_running", step="train", steps=steps)
+    if leftover2:
+        return fail_item(
+            "descendants_remain_after_crash",
+            step="train",
+            descendants_observed=len(drv2.seen),
+            descendants_remaining=len(leftover2),
+            steps=steps,
+        )
+    rc_c, cobj, failure = go_step(
+        ctx, hdir, logs, steps, "train", "status-crashed", status_argv, status_cmd
+    )
+    if failure:
+        return dict(failure, steps=steps)
+    reason, crash_status = judge_status(rc_c, cobj, crashed=True)
+    if reason is not None:
+        return fail_item(reason, step="train", exit_code=rc_c, steps=steps)
+    return {
+        "status": "ok",
+        "steps": steps,
+        "cancel_check": cancel_rec,
+        "crash_check": {
+            "train_exit_code": rc2,
+            "descendants_observed": len(drv2.seen),
+            "descendants_remaining": 0,
+            **crash_status,
+        },
+    }
+
+
+def _unit_interval(v: Any) -> bool:
+    """`{"lo","hi"}` が有限で 0 ≤ lo ≤ hi ≤ 1 か。"""
+    return (
+        isinstance(v, dict)
+        and _unit_number(v.get("lo"))
+        and _unit_number(v.get("hi"))
+        and v["lo"] <= v["hi"]
+    )
+
+
+def judge_reproducibility(
+    rep: Any, n_total: int, seeds: tuple[int, ...]
+) -> tuple[str | None, dict[str, Any]]:
+    """`evaluate` の `reproducibility`（3 seed 以上の Wilson 95% 区間の重なり。REQ-26・#490）。
+
+    `runs` は seed 昇順で `seeds` と一致、各 run の `total` は評価件数・
+    `correct ≤ total`・区間は 0〜1。
+    `disjoint_pairs` は `runs` の seed の組で、空 ⇔ `all_pairs_overlap`。`some_pairs_disjoint` も
+    正常な出力（再現性の合否の解釈は人が行う）。戻り値は (失敗理由, 要約)。
+    """
+    if not isinstance(rep, dict):
+        return "reproducibility_invalid", {}
+    runs, verdict, pairs = (
+        rep.get("runs"),
+        rep.get("verdict"),
+        rep.get("disjoint_pairs"),
+    )
+    if (
+        not isinstance(runs, list)
+        or not isinstance(verdict, str)
+        or verdict not in REPRODUCIBILITY_VERDICT_VOCAB
+        or not isinstance(pairs, list)
+        or [r.get("seed") if isinstance(r, dict) else None for r in runs] != sorted(seeds)
+    ):
+        return "reproducibility_invalid", {}
+    out_runs = []
+    for r in runs:
+        if (
+            not _eq_int(r.get("total"), n_total)
+            or not _nonneg_int(r.get("correct"))
+            or r["correct"] > n_total
+            or not _unit_interval(r.get("ci95"))
+        ):
+            return "reproducibility_invalid", {}
+        out_runs.append({"seed": r["seed"], "correct": r["correct"], "total": r["total"]})
+    ok_pairs = all(
+        isinstance(p, list)
+        and len(p) == 2
+        and _is_int(p[0])
+        and _is_int(p[1])
+        and p[0] < p[1]
+        and p[0] in seeds
+        and p[1] in seeds
+        for p in pairs
+    )
+    if not ok_pairs or (not pairs) != (verdict == "all_pairs_overlap"):
+        return "reproducibility_invalid", {}
+    return None, {"verdict": verdict, "runs": out_runs, "disjoint_pairs": pairs}
+
+
+def judge_comparison(cmp: Any, n_total: int) -> tuple[str | None, dict[str, Any]]:
+    """`evaluate --previous-project-dir` の `comparison`（REQ-26・#488・#489）。
+
+    I の旧モデルは同じ定義・同じ凍結 test の別 seed の複製なので、`premise:"same_label_set"`・
+    `evaluation_data:"same"`・ラベルの増減なし・共通レコードは全件、`counts` は 4 区分の合計が `n`。
+    p 値・有意性は持たない契約のため、回帰の多寡の解釈は人が行う。戻り値は (失敗理由, 要約)。
+    """
+    if not isinstance(cmp, dict):
+        return "comparison_invalid", {}
+    counts = cmp.get("counts")
+    parts = (
+        "both_correct",
+        "correct_to_incorrect",
+        "incorrect_to_correct",
+        "both_wrong",
+    )
+    if (
+        cmp.get("premise") != "same_label_set"
+        or cmp.get("evaluation_data") != "same"
+        or cmp.get("removed_labels") != []
+        or cmp.get("added_labels") != []
+        or not _eq_int(cmp.get("n_common"), n_total)
+        or not _eq_int(cmp.get("n_previous_only"), 0)
+        or not _eq_int(cmp.get("n_current_only"), 0)
+        or not isinstance(cmp.get("previous"), dict)
+        or not isinstance(counts, dict)
+        or not _eq_int(counts.get("n"), n_total)
+        or not all(_nonneg_int(counts.get(k)) for k in parts)
+        or sum(counts[k] for k in parts) != n_total
+        or not _unit_interval(counts.get("correct_to_incorrect_ci95"))
+        or not _unit_interval(counts.get("incorrect_to_correct_ci95"))
+    ):
+        return "comparison_invalid", {}
+    return None, {
+        "premise": cmp["premise"],
+        "evaluation_data": cmp["evaluation_data"],
+        "n_common": cmp["n_common"],
+        "counts": {k: counts[k] for k in ("n", *parts)},
+    }
+
+
+def item_i(ctx: Ctx) -> dict[str, Any]:
+    """I: 3 seed の再現性と、前のモデルとの比較（REQ-26・REQ-27・#488〜#490・#103）。
+
+    register → inspect の後にプロジェクトを複製し（p1・p2・p3・old）、各複製で
+    `train --train-seed S → select → evaluate` を実行する（p2・p3・old を先に評価し、最後の p1 の
+    `evaluate` に `--seed-run-project p2 --seed-run-project p3`・
+    `--previous-project-dir old` を付ける。
+    凍結 test への適用は複製ごとに 1 回）。学習を 4 回行うため長時間かかる。既定の項目に入れず、
+    `--items I` のときだけ実行する。`--i-device` は証拠種別の申告（cpu → `cpu_real_machine`、
+    gpu → `gpu_real_machine_declared`）。CLI の `train` は現状 CPU 固定のため、gpu は人が別の手段で
+    GPU 学習へ切り替えたときだけ指定する（切り替えの有無は記録できない）。
+    """
+    idir = ctx.work / "I"
+    if not stage_inputs(ctx, idir, None):
+        return fail_item("input_unreadable")
+    facts = read_facts(idir)
+    if facts is None:
+        return fail_item("input_unreadable")
+    logs, steps = idir / "steps", []
+    failure = prepare_project(ctx, idir, facts, logs, steps)
+    if failure:
+        return dict(failure, steps=steps)
+    seeds = {
+        "p1": I_SEEDS[0],
+        "p2": I_SEEDS[1],
+        "p3": I_SEEDS[2],
+        "old": I_PREVIOUS_SEED,
+    }
+    try:
+        for name in seeds:
+            shutil.copytree(idir / "project", idir / name, symlinks=True)
+    except (OSError, shutil.Error):
+        return fail_item("copy_failed", steps=steps)
+    final: dict[str, Any] | None = None
+    for name in ("p2", "p3", "old", "p1"):
+        seed = seeds[name]
+        _rc, obj, failure = go_step(
+            ctx, idir, logs, steps, "train", f"train-{name}",
+            ["train", "--project-dir", name, "--candidate", "0", "--train-seed", str(seed)],
+            f"train --project-dir {name} --candidate 0 --train-seed {seed}",
+            facts=facts,
+        )  # fmt: skip
+        if failure or obj is None:
+            return dict(failure or fail_item("invalid_json"), steps=steps)
+        kind = obj.get("kind")
+        _rc, obj, failure = go_step(
+            ctx, idir, logs, steps, "select", f"select-{name}",
+            ["select", "--project-dir", name], f"select --project-dir {name}",
+            facts=facts, kind_before=kind,
+        )  # fmt: skip
+        if failure or obj is None:
+            return dict(failure or fail_item("invalid_json"), steps=steps)
+        c = obj.get("candidate")
+        if not _is_int(c) or c < 0:
+            return fail_item("missing_field", step="select", exit_code=0, steps=steps)
+        argv = ["evaluate", "--project-dir", name, "--candidate", str(c)]
+        command = f"evaluate --project-dir {name} --candidate {c}"
+        if name == "p1":
+            argv += ["--previous-project-dir", "old"]
+            for other in ("p2", "p3"):
+                argv += ["--seed-run-project", other]
+            command += " --previous-project-dir old --seed-run-project p2 --seed-run-project p3"
+        _rc, obj, failure = go_step(
+            ctx, idir, logs, steps, "evaluate", f"evaluate-{name}", argv, command,
+            facts=facts, selected=c, kind_before=kind,
+        )  # fmt: skip
+        if failure or obj is None:
+            return dict(failure or fail_item("invalid_json"), steps=steps)
+        final = obj
+    if final is None:
+        return fail_item("missing_field", steps=steps)
+    n_total = final.get("n_total")
+    reason, repro = judge_reproducibility(final.get("reproducibility"), n_total, I_SEEDS)
+    if reason is None:
+        reason, comparison = judge_comparison(final.get("comparison"), n_total)
+    if reason is not None:
+        return fail_item(reason, step="evaluate", exit_code=0, steps=steps)
+    return {
+        "status": "ok",
+        "steps": steps,
+        "evidence": I_EVIDENCE[ctx.i_device],
+        "device": ctx.i_device,
+        "seeds": [*I_SEEDS, I_PREVIOUS_SEED],
+        "reproducibility": repro,
+        "comparison": comparison,
+    }
+
+
+def item_j(ctx: Ctx) -> dict[str, Any]:
+    """J: 前の版への復帰（REQ-39・REQ-27・#491）。B の `project`（v1）を旧プロジェクトに使う。
+
+    新プロジェクト（`J/project`）を package まで実行し、`package --previous-project-dir`
+    で v2 を作る。続けて、v1 の `package`（B のもの）を新しい台帳の `--version-id v1` で
+    `infer` できること、台帳の最新版（v2）でも `infer` できること、`--version-id` だけの
+    指定は exit 64、`artifact.json` を 1 バイト改変した複製は exit 64 になることを確かめる。
+    旧・新の `package/` は変更しない（改変は複製）。CLI はカレント配下の相対パスだけを
+    受けるため、カレントは作業ディレクトリ（`B/`・`J/` の親）にする。
+    """
+    bproj = ctx.work / "B" / "project"
+    if not (bproj / "package").is_dir():
+        return fail_item("previous_package_missing")
+    jdir = ctx.work / "J"
+    if not stage_inputs(ctx, jdir, None):
+        return fail_item("input_unreadable")
+    facts = read_facts(jdir)
+    if facts is None:
+        return fail_item("input_unreadable")
+    cwd, logs, steps = ctx.work, jdir / "steps", []
+    sample = "sandbox check 0123456789"
+    ledger = "J/project/version_ledger.json"
+    p = "J/project"
+
+    def run(name: str, tag: str, argv: list[str], command: str, **kw: Any) -> Any:
+        return go_step(ctx, cwd, logs, steps, name, tag, argv, command, **kw)
+
+    selected: int | None = None
+    kind: str | None = None
+    for name, argv, command in (
+        ("register", ["register", "--definition", "J/definition.json", "--project-dir", p],
+         "register --definition <definition> --project-dir <project>"),
+        ("inspect", ["inspect", "--project-dir", p], "inspect --project-dir <project>"),
+        ("train", ["train", "--project-dir", p, "--candidate", "0"],
+         "train --project-dir <project> --candidate 0"),
+        ("select", ["select", "--project-dir", p], "select --project-dir <project>"),
+    ):  # fmt: skip
+        _rc, obj, failure = run(name, name, argv, command, facts=facts, kind_before=kind)
+        if failure or obj is None:
+            return dict(failure or fail_item("invalid_json"), steps=steps)
+        if name in ("train", "select"):
+            kind = obj.get("kind")
+        if name == "select":
+            selected = obj.get("candidate")
+    if not _is_int(selected) or selected < 0:
+        return fail_item("missing_field", step="select", exit_code=0, steps=steps)
+    _rc, obj, failure = run(
+        "evaluate", "evaluate",
+        ["evaluate", "--project-dir", p, "--candidate", str(selected)],
+        f"evaluate --project-dir <project> --candidate {selected}",
+        facts=facts, selected=selected, kind_before=kind,
+    )  # fmt: skip
+    if failure:
+        return dict(failure, steps=steps)
+    _rc, pkg, failure = run(
+        "package", "package-v2",
+        ["package", "--project-dir", p, "--previous-project-dir", "B/project"],
+        "package --project-dir <project> --previous-project-dir <previous-project>",
+        facts=facts, allowed=frozenset({0}),
+    )  # fmt: skip
+    if failure or pkg is None:
+        return dict(failure or fail_item("invalid_json"), steps=steps)
+    version = pkg.get("version")
+    if not check_version_report(version, "v1") or version["id"] != "v2":
+        return fail_item("version_invalid", step="package", exit_code=0, steps=steps)
+    if not check_version_ledger(ctx.work / ledger, "v2") or not check_version_ledger(
+        ctx.work / ledger, "v1"
+    ):
+        return fail_item("version_ledger_invalid", step="package", exit_code=0, steps=steps)
+
+    def infer_ok(tag: str, argv: list[str], command: str) -> dict[str, Any] | None:
+        """exit 0・11・12 の infer（status との対応と判定の整合まで）。失敗なら失敗記録を返す。"""
+        rc, o, f = run("infer", tag, argv, command)
+        if f:
+            return f
+        # 校正つきでは対象外（11）・保留（12）も正常。終了コードと status の対応を照合する
+        if rc not in INFER_EXIT_STATUS or o is None:
+            return fail_item("unexpected_exit_code", step="infer", case=tag, exit_code=rc)
+        if not (
+            _infer_envelope_ok(o, rc)
+            and o.get("id") == DEFAULT_TEXT_ID
+            and check_infer_output(o, facts)
+        ):
+            return fail_item("unexpected_output", step="infer", case=tag, exit_code=rc)
+        return None
+
+    def infer_rejected(tag: str, argv: list[str], command: str) -> dict[str, Any] | None:
+        """exit 64（`invalid_input`）の infer。それ以外は失敗記録を返す。"""
+        rc, o, f = run("infer", tag, argv, command)
+        if f:
+            return f
+        if rc != 64 or vocab_value((o or {}).get("code"), CODE_VOCAB) != "invalid_input":
+            return fail_item("rejection_not_64", step="infer", case=tag, exit_code=rc)
+        return None
+
+    # 旧版（B の package）を新しい台帳の v1 で使う。台帳の最新版（v2）は新しい package で使う
+    tampered = ctx.work / "J" / "tampered"
+    try:
+        shutil.copytree(bproj / "package", tampered, copy_function=shutil.copyfile)
+        with open(tampered / "artifact.json", "ab") as f:
+            f.write(b" ")
+    except (OSError, shutil.Error):
+        return fail_item("copy_failed", steps=steps)
+    base = ["infer", "--text", sample]
+    cmd = "infer --package <package> --version-ledger <ledger> --text <fixed-sample>"
+    # 遅延実行（lambda）で順に判定し、最初に失敗した時点で止める（後続の infer は実行しない）
+    checks = (
+        lambda: infer_ok(
+            "infer-rollback-v1",
+            [*base, "--package", "B/project/package", "--version-ledger", ledger,
+             "--version-id", "v1"],
+            cmd + " --version-id v1",
+        ),
+        lambda: infer_ok(
+            "infer-latest",
+            [*base, "--package", f"{p}/package", "--version-ledger", ledger],
+            cmd,
+        ),
+        lambda: infer_rejected(
+            "infer-version-id-only",
+            [*base, "--package", f"{p}/package", "--version-id", "v1"],
+            "infer --package <package> --version-id v1 --text <fixed-sample>",
+        ),
+        lambda: infer_rejected(
+            "infer-tampered-artifact",
+            [*base, "--package", "J/tampered", "--version-ledger", ledger, "--version-id", "v1"],
+            cmd + " --version-id v1",
+        ),
+    )  # fmt: skip
+    for check in checks:
+        failure = check()
+        if failure:
+            return dict(failure, steps=steps)
+    return {
+        "status": "ok",
+        "steps": steps,
+        "version_number": 2,
+        "previous_version_number": 1,
+        "rollback_to_v1_ok": True,
+        "latest_ok": True,
+        "version_id_only_exit_code": 64,
+        "tampered_artifact_exit_code": 64,
+    }
 
 
 def load_average() -> list[float] | None:
@@ -2718,7 +4071,15 @@ def run_item(ctx: Ctx, name: str, b_ok: bool) -> tuple[dict[str, Any], bool]:
         return item_d(ctx), b_ok
     if name == "E":
         return item_e(ctx), b_ok
-    return item_f(ctx), b_ok
+    if name == "F":
+        return item_f(ctx), b_ok
+    if name == "G":
+        return item_g(ctx), b_ok
+    if name == "H":
+        return item_h(ctx), b_ok
+    if name == "I":
+        return item_i(ctx), b_ok
+    return item_j(ctx), b_ok
 
 
 def run(args: argparse.Namespace) -> int:
@@ -2776,6 +4137,8 @@ def _run(args: argparse.Namespace) -> int:
         ci_env=make_ci_env(),
     )
     ctx.bin_override = bool(args.bin_override)
+    ctx.g_budget_seconds = args.g_budget_seconds
+    ctx.i_device = args.i_device
     rec: dict[str, Any] = {
         "schema": SCHEMA,
         "evidence_hint": "test_harness" if harness else "requires_human_review",
@@ -2790,6 +4153,8 @@ def _run(args: argparse.Namespace) -> int:
             "package_limit_bytes": ctx.package_limit_bytes,
             "overall_timeout_sec": args.overall_timeout_sec,
             "with_ci": bool(args.with_ci),
+            "g_budget_seconds": ctx.g_budget_seconds,
+            "i_device": ctx.i_device,
             "cargo_offline": "A" not in items,
         },
         "child_may_remain": False,
@@ -2930,12 +4295,15 @@ def validate_args(args: argparse.Namespace) -> str | None:
     """
     parts = args.items.split(",")
     if not parts or any(p not in ITEM_ORDER for p in parts) or len(set(parts)) != len(parts):
-        return "--items must be a comma-separated subset of A,B,C,D,E,F"
+        return ITEMS_MESSAGE
     if "A" in parts and not args.with_ci:
         return "item A requires --with-ci"
     # E は B の成果物（package/ と train.jsonl）を使う。B が無ければ起動前に拒否する
     if "E" in parts and "B" not in parts:
         return "item E requires item B"
+    # J は B の `project`（package 済み）を旧プロジェクトに使う
+    if "J" in parts and "B" not in parts:
+        return "item J requires item B"
     if not 1 <= args.repeat <= MAX_REPEAT:
         return "--repeat must be an integer from 1 to 1000"
     if not 1 <= args.p95_limit_us <= MAX_P95_LIMIT_US:
@@ -2944,6 +4312,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--package-limit-bytes must be a positive integer"
     if not MIN_OVERALL_TIMEOUT_SEC <= args.overall_timeout_sec <= MAX_OVERALL_TIMEOUT_SEC:
         return "--overall-timeout-sec must be an integer from 1 to 86400"
+    if not 1 <= args.g_budget_seconds <= MAX_G_BUDGET_SECONDS:
+        return "--g-budget-seconds must be an integer from 1 to 921600"
+    if args.i_device not in I_EVIDENCE:
+        return "--i-device must be cpu or gpu"
     if args.bin_override and not args.bin:
         return "--bin-override requires --bin"
     if args.bin_override:
@@ -2967,6 +4339,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--p95-limit-us", type=int, required=True)
     r.add_argument("--package-limit-bytes", type=int, required=True)
     r.add_argument("--overall-timeout-sec", type=int, required=True)
+    r.add_argument("--g-budget-seconds", type=int, default=DEFAULT_G_BUDGET_SECONDS)
+    r.add_argument("--i-device", default="cpu")
     r.add_argument("--quiet-machine", action="store_true")
     r.add_argument("--with-ci", action="store_true")
     ns = p.parse_args(argv)

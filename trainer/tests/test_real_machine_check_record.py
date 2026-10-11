@@ -585,6 +585,8 @@ def test_on_signal_only_sets_the_mark_and_run_clears_it(
         package_limit_bytes=1,
         quiet_machine=False,
         with_ci=False,
+        g_budget_seconds=3600,
+        i_device="cpu",
     )
     try:
         rc = mod.run(args)
@@ -704,6 +706,10 @@ def test_interrupt_during_cli_build_writes_a_skeleton_record(tmp_path: Path) -> 
         "D": unselected,
         "E": unselected,
         "F": unselected,
+        "G": unselected,
+        "H": unselected,
+        "I": unselected,
+        "J": unselected,
     }
     assert "(not collected)" in (work / "record.md").read_text()
 
@@ -723,6 +729,8 @@ def _run_in_process(tmp_path: Path, items: str, fake_item: Any, monkeypatch: Any
         package_limit_bytes=1,
         quiet_machine=False,
         with_ci=False,
+        g_budget_seconds=3600,
+        i_device="cpu",
     )
     try:
         rc = mod.run(args)
@@ -827,6 +835,8 @@ def _ns(**over: Any) -> argparse.Namespace:
         "p95_limit_us": 1,
         "package_limit_bytes": 1,
         "overall_timeout_sec": 14400,
+        "g_budget_seconds": 3600,
+        "i_device": "cpu",
         "bin_override": False,
         "bin": None,
     }
@@ -1544,7 +1554,7 @@ def test_capacity_summary_rejects_negative_bool_and_missing_values() -> None:
 # ---- C（C-1・C-2）の結合: 偽 CLI は定義・入力ファイルから値を導いて出力する ----
 
 FAKE_PIPELINE = """#!{python}
-import json, os, sys
+import hashlib, json, os, sys
 cfg = {cfg}
 d = json.load(open("definition.json"))
 lines = lambda n: len([x for x in open(n) if x.strip()])
@@ -1553,11 +1563,22 @@ limits = d.get("limits", {{}})
 c2 = "max_package_bytes" in limits
 cmd = sys.argv[1]
 names = ["weights", "vocab_or_feature_transform", "label_table", "calibration", "metadata"]
+in_b = os.path.basename(os.getcwd()) == "B"
+# B だけ、校正・版の追加検査のため package/ に calibration.json・artifact.json を足す
+CAL = b"cal"
+ART = json.dumps({{"calibration_sha256": hashlib.sha256(CAL).hexdigest()}}).encode()
+EXTRA_BYTES = len(CAL) + len(ART) if in_b else 0
 def comps(total):
-    # file_count は公開される package/ の実ファイル数（model.onnx の 1 つ）に合わせる
+    # file_count は公開される package/ の実ファイル数に合わせる（C は model.onnx の 1 つ、
+    # B は model.onnx・calibration.json・artifact.json の 3 つ）
     c = {{k: {{"bytes": 1, "file_count": 0}} for k in names}}
-    c["weights"]["bytes"] = total - 4 + cfg["comp_delta"]
+    cal_bytes = len(CAL) if in_b else 1
+    c["calibration"]["bytes"] = cal_bytes
+    c["weights"]["bytes"] = total - 3 - cal_bytes + cfg["comp_delta"]
     c["weights"]["file_count"] = 1 + cfg["fc_delta"]
+    if in_b:
+        c["calibration"]["file_count"] = 1
+        c["metadata"]["file_count"] = 1
     return c
 def out(o, rc=0):
     print(json.dumps(o))
@@ -1570,11 +1591,22 @@ if cmd == "inspect":
          "split": {{"train": n_train - 2, "validation": 1, "test": 1}}}})
 if cmd in ("train", "select"):
     kind = cfg["train_kind"] if cmd == "train" else cfg["select_kind"]
-    out({{"step": cmd, "status": "ok", "candidate": 0, "kind": kind}})
+    extra = {{"significance": None}} if cmd == "select" else {{}}
+    out({{"step": cmd, "status": "ok", "candidate": 0, "kind": kind, **extra}})
 if cmd == "evaluate":
     out({{"step": "evaluate", "status": "ok", "candidate": 0, "kind": cfg["eval_kind"],
          "n_total": n_eval, "correct": n_eval, "accuracy": cfg["accuracy"],
-         "macro_f1": cfg["macro_f1"]}})
+         "macro_f1": cfg["macro_f1"],
+         "calibration": {{"temperature": 1.5, "adopted": True, "threshold": 0.6,
+                         "n_validation": 1, "validation_coverage": 0.8}},
+         "abstention": {{"answered": n_eval, "abstained": 0, "out_of_scope": 0,
+                        "coverage": 1.0, "correct_answered": n_eval, "adopted_error": 0.0,
+                        "unconditional_error": 0.0}},
+         "comparison": None, "reproducibility": None,
+         "diagnostics": {{"train": {{"n_rows": n_train}}, "eval": {{"n_rows": n_eval}},
+                         "confusable_pairs": [], "limitations": [],
+                         "data_volume": {{"train_rows": n_train, "level": "below_100",
+                                         "effect": "large", "note": "n"}}}}}})
 if cmd == "infer":
     ids = [o["id"] for o in d["options"]]
     scores = {{i: 1.0 / len(ids) for i in ids}}
@@ -1599,7 +1631,7 @@ if cmd == "package":
     if "max_infer_p95_us" in limits:
         p95 = {{"p95_us": cfg["p95_us"], "limit_us": limits["max_infer_p95_us"],
                "exceeded": cfg["p95_exceeded"]}}
-    total = cfg["total1"]
+    total = cfg["total1"] + EXTRA_BYTES
     cap = {{"total_bytes": total, "limit_bytes": cfg["limit1"], "exceeded": False,
            "guideline_bytes": 40000000, "over_guideline": total > 40000000,
            "components": comps(total)}}
@@ -1611,6 +1643,15 @@ if cmd == "package":
         os.makedirs("project/package", exist_ok=True)
         with open("project/package/model.onnx", "wb") as f:
             f.write(b"x" * cfg["actual_bytes"])
+        if in_b:
+            with open("project/package/calibration.json", "wb") as f:
+                f.write(CAL)
+            with open("project/package/artifact.json", "wb") as f:
+                f.write(ART)
+        ledger = [{{"kind": k, "id": "v1", "sha256": "a" * 64, "created_at_unix": 1}}
+                  for k in ("model", "data", "experiment")]
+        with open("project/version_ledger.json", "w") as f:
+            f.write(json.dumps({{"schema_version": 1, "entries": ledger}}) + "\\n")
         if cfg["package_kind"] == "symlink":
             os.symlink("model.onnx", "project/package/link")
         if cfg["package_kind"] == "dir":
@@ -1619,7 +1660,7 @@ if cmd == "package":
         out({{"code": cfg["code1"], "message": "m", "step": "package", "capacity": cap,
              "infer_p95": p95}}, 20)
     out({{"step": "package", "status": "ok", "judgment": None, "acceptance_defined": False,
-         "capacity": cap, "infer_p95": p95}})
+         "capacity": cap, "infer_p95": p95, "version": {{"id": "v1", "previous": None}}}})
 """
 
 C_DEFAULT = {
@@ -1775,6 +1816,8 @@ def test_internal_error_makes_the_script_exit_70_and_still_writes_record(
         overall_timeout_sec=14400,
         quiet_machine=False,
         with_ci=False,
+        g_budget_seconds=3600,
+        i_device="cpu",
     )
     (tmp_path / "w").mkdir()
     try:
@@ -2131,6 +2174,79 @@ def _representative_record(tmp_path: Path) -> dict[str, Any]:
         },
         "E": {"status": "ok", "records": 4, "input_sha256": HEX64, "max_abs_score_diff": 0.0},
         "F": {"status": "failed", "reason": "test_failures", "load_start": [1.5, 2.0, 3.0]},
+        # G〜J: 許可した文字列の欄（outcome・result・budget_reached・state・cause・evidence 等）が
+        # 伏せ処理で消されないこと
+        "G": {
+            "status": "ok",
+            "exit_code": 0,
+            "outcome": "evaluated",
+            "budget_seconds": 3600,
+            "budget_reached": True,
+            "total_elapsed_ms": 1234,
+            "candidates": [
+                {"candidate": 0, "kind": "c1", "result": "evaluated", "budget_reached": None},
+                {
+                    "candidate": 1,
+                    "kind": "c3",
+                    "result": "training_timed_out",
+                    "budget_reached": "candidate_time_limit",
+                },
+            ],
+            "search_record_present": True,
+            "steps": [
+                {
+                    "step": "train",
+                    "case": "train-all",
+                    "command": "train --project-dir project --all --budget-seconds 3600",
+                    "exit_code": 0,
+                    "stderr_bytes": 0,
+                }
+            ],
+        },
+        "H": {
+            "status": "ok",
+            "cancel_check": {
+                "cancel": "requested",
+                "train_exit_code": 70,
+                "descendants_observed": 3,
+                "descendants_remaining": 0,
+                "package_absent": True,
+                "state": "cancelled",
+                "restart_action": "restart_from_scratch",
+            },
+            "crash_check": {
+                "train_exit_code": 137,
+                "descendants_observed": 3,
+                "descendants_remaining": 0,
+                "state": "failed",
+                "cause": "owner_lost",
+                "restart_action": "restart_from_scratch",
+            },
+        },
+        "I": {
+            "status": "ok",
+            "evidence": "cpu_real_machine",
+            "device": "cpu",
+            "seeds": [1, 2, 3, 4],
+            "reproducibility": {
+                "verdict": "some_pairs_disjoint",
+                "runs": [{"seed": 1, "correct": 10, "total": 12}],
+                "disjoint_pairs": [[1, 3]],
+            },
+            "comparison": {
+                "premise": "same_label_set",
+                "evaluation_data": "same",
+                "n_common": 12,
+                "counts": {"n": 12, "both_correct": 10},
+            },
+        },
+        "J": {
+            "status": "ok",
+            "version_number": 2,
+            "previous_version_number": 1,
+            "rollback_to_v1_ok": True,
+            "version_id_only_exit_code": 64,
+        },
     }
     return {
         "schema": "real-machine-check/1",
@@ -2162,7 +2278,13 @@ def _representative_record(tmp_path: Path) -> dict[str, Any]:
             "cli_profile": "release",
         },
         "inputs": {"train_records": 8, "definition_sha256": HEX64, "train_sha256": HEX64},
-        "options": {"items": ["A", "B", "C", "D", "E", "F"], "repeat": 1, "p95_limit_us": 5},
+        "options": {
+            "items": list("ABCDEFGHIJ"),
+            "repeat": 1,
+            "p95_limit_us": 5,
+            "g_budget_seconds": 3600,
+            "i_device": "cpu",
+        },
         "items": items,
     }
 
@@ -2193,8 +2315,14 @@ def test_sanitize_record_keeps_a_normal_record_unchanged(tmp_path: Path) -> None
     assert changed == []
     assert mod.sanitize_record(out) == out
     # 工程の要約と package_files が実際に含まれていること（空の比較にしない）
-    assert out["items"]["B"]["steps"][5]["summary"]["capacity"]["total_bytes"] == 10
-    assert out["items"]["B"]["package_files"][0]["name"] == "model.onnx"
+    # B の package/ は model.onnx（10）・calibration.json（3）・artifact.json（90）の 3 ファイル
+    assert out["items"]["B"]["steps"][5]["summary"]["capacity"]["total_bytes"] == 103
+    assert [f["name"] for f in out["items"]["B"]["package_files"]] == [
+        "artifact.json",
+        "calibration.json",
+        "model.onnx",
+    ]
+    assert out["items"]["B"]["contract_checks"]["version_number"] == 1
     assert out["items"]["C"]["capacity_limit"]["code"] == "limit_exceeded"
 
 
@@ -2563,7 +2691,12 @@ def test_item_b_requires_published_files_to_match_total_bytes(tmp_path: Path) ->
     assert (ok, res["reason"]) == (False, "unexpected_output")
     res, ok = mod.item_b(_c_ctx(tmp_path / "c", actual_bytes=10))
     assert ok is True
-    assert [f["bytes"] for f in res["package_files"]] == [10]
+    assert [f["name"] for f in res["package_files"]] == [
+        "artifact.json",
+        "calibration.json",
+        "model.onnx",
+    ]
+    assert [f["bytes"] for f in res["package_files"] if f["name"] == "model.onnx"] == [10]
 
 
 def test_item_c1_requires_published_files_to_match_total_bytes(tmp_path: Path) -> None:
@@ -2668,7 +2801,7 @@ def test_item_b_rejects_non_regular_entries_and_file_count_mismatch(tmp_path: Pa
     res, ok = mod.item_b(_c_ctx(tmp_path / "fc", fc_delta=1))
     assert (ok, res["reason"], res["step"]) == (False, "unexpected_output", "package")
     res, ok = mod.item_b(_c_ctx(tmp_path / "ok"))
-    assert (ok, res["status"], len(res["package_files"])) == (True, "ok", 1)
+    assert (ok, res["status"], len(res["package_files"])) == (True, "ok", 3)
 
 
 def test_item_b_rejects_a_default_id_other_than_input(tmp_path: Path) -> None:
@@ -4333,3 +4466,826 @@ def test_ci_env_disables_rustup_auto_install_without_cargo_offline(
     env = mod.make_ci_env()
     assert env["RUSTUP_AUTO_INSTALL"] == "0"
     assert "CARGO_NET_OFFLINE" not in env
+
+
+# ---- G〜J（#469 の CLI 結線で増えた機能の実機確認） ----
+
+
+def _camel(word: str) -> str:
+    """snake_case の語彙を Rust の enum のバリアント名（CamelCase）へ写す。"""
+    return "".join(p.capitalize() for p in word.split("_"))
+
+
+def test_new_vocabularies_match_the_rust_enums() -> None:
+    """REQ-18・REQ-25・REQ-26・REQ-34: 追加した語彙は Rust の enum のバリアントと一致する。
+
+    語彙の各要素が対応する enum の本体に現れ、enum が持つバリアントの数と語彙の数が一致する。
+    """
+
+    def variants(path: str, enum: str) -> set[str]:
+        src = (REPO / path).read_text(encoding="utf-8")
+        body = src.split(f"pub enum {enum} {{", 1)[1].split("\n}\n", 1)[0]
+        names = re.findall(r"^    ([A-Z][A-Za-z0-9]*),?$", body, re.MULTILINE)
+        assert names, enum
+        return set(names)
+
+    cases = [
+        (
+            mod.SIGNIFICANCE_VOCAB,
+            "crates/core/src/evaluation_record.rs",
+            "BaselineComparisonVerdict",
+        ),
+        (
+            mod.TRAIN_RESULT_VOCAB,
+            "crates/core/src/stage_report.rs",
+            "TrainSearchResult",
+        ),
+        (mod.BUDGET_SCOPE_VOCAB, "crates/core/src/stage_report.rs", "TrainBudgetScope"),
+        (mod.JOB_STATE_VOCAB, "crates/train/src/job.rs", "JobState"),
+        (mod.CRASH_CAUSE_VOCAB, "crates/train/src/job_record.rs", "CrashCause"),
+        (mod.CANCEL_OUTCOME_VOCAB, "crates/train/src/job.rs", "CancelOutcome"),
+        (
+            mod.REPRODUCIBILITY_VERDICT_VOCAB,
+            "crates/core/src/evaluation_record.rs",
+            "ReproducibilityVerdict",
+        ),
+        (
+            mod.COMPARISON_PREMISE_VOCAB,
+            "crates/core/src/evaluation_record.rs",
+            "ComparisonPremiseKind",
+        ),
+        (
+            mod.COMPARISON_DATA_VOCAB,
+            "crates/core/src/evaluation_record.rs",
+            "ComparisonEvaluationData",
+        ),
+    ]
+    for vocab, path, enum in cases:
+        assert {_camel(w) for w in vocab} == variants(path, enum), enum
+
+
+def test_fixed_strings_match_the_rust_sources() -> None:
+    """REQ-34: キャンセルの message・やり直し案内の語彙・G の予算の上限は Rust 側の値と一致する。"""
+    train = (REPO / "crates/cli/src/stages/train.rs").read_text(encoding="utf-8")
+    assert f'runtime("{mod.CANCELLED_MESSAGE}")' in train
+    restart = (REPO / "crates/train/src/restart.rs").read_text(encoding="utf-8")
+    assert f'REASON_RESUME_NOT_SUPPORTED: &str = "{mod.RESTART_REASON_CODE}"' in restart
+    assert "RestartFromScratch" in restart
+    assert mod.RESTART_ACTION == "restart_from_scratch"
+    search = (REPO / "crates/train/src/search.rs").read_text(encoding="utf-8")
+    assert "crate::limits::MAX_TRAIN_WALL_SECONDS as u64 * MAX_SEARCH_CANDIDATES as u64" in search
+    limits = (REPO / "crates/train/src/limits.rs").read_text(encoding="utf-8")
+    wall = int(re.search(r"MAX_TRAIN_WALL_SECONDS: u32 = (\d+);", limits).group(1))  # type: ignore[union-attr]
+    cands = int(re.search(r"MAX_SEARCH_CANDIDATES: usize = (\d+);", search).group(1))  # type: ignore[union-attr]
+    assert mod.MAX_G_BUDGET_SECONDS == wall * cands
+    assert f"DEFAULT_SEARCH_BUDGET_SECONDS: u64 = {mod.DEFAULT_G_BUDGET_SECONDS};" in search
+    ledger = (REPO / "crates/core/src/version_ledger_record.rs").read_text(encoding="utf-8")
+    assert (
+        f"MAX_VERSION_LEDGER_BYTES: u64 = {mod.CAP_VERSION_LEDGER // (1024 * 1024)} * 1024 * 1024;"
+        in ledger
+    )
+
+
+def test_default_items_match_the_shell_script_and_exclude_a_and_i() -> None:
+    """REQ-21: 既定の項目はシェル側の既定値と一致する（A は通信、I は GPU・長時間のため除く）。"""
+    sh = (REPO / "scripts" / "real-machine-check.sh").read_text(encoding="utf-8")
+    m = re.search(r"^items=(\S+)$", sh, re.MULTILINE)
+    assert m is not None
+    assert m.group(1).split(",") == mod.DEFAULT_ITEMS == ["B", "C", "D", "E", "F", "G", "H", "J"]
+    assert mod.ITEM_ORDER == list("ABCDEFGHIJ")
+    assert "A" not in mod.DEFAULT_ITEMS
+    assert "I" not in mod.DEFAULT_ITEMS
+    assert mod.ITEMS_MESSAGE in sh
+
+
+@pytest.mark.parametrize(
+    ("over", "want"),
+    [
+        ({"items": "J"}, "item J requires item B"),
+        ({"items": "C,J"}, "item J requires item B"),
+        ({"items": "B,J"}, None),
+        ({"items": "G,H,I"}, None),
+        (
+            {"items": "K"},
+            "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J",
+        ),
+        ({"g_budget_seconds": 921_600}, None),
+        (
+            {"g_budget_seconds": 0},
+            "--g-budget-seconds must be an integer from 1 to 921600",
+        ),
+        (
+            {"g_budget_seconds": 921_601},
+            "--g-budget-seconds must be an integer from 1 to 921600",
+        ),
+        ({"i_device": "gpu"}, None),
+        ({"i_device": "tpu"}, "--i-device must be cpu or gpu"),
+    ],
+)
+def test_validate_args_for_new_items_and_options(over: dict[str, Any], want: str | None) -> None:
+    """REQ-21: G〜J の語彙・J は B が必須・`--g-budget-seconds`・`--i-device` を検証する。"""
+    assert mod.validate_args(_ns(**over)) == want
+
+
+def _evaluate_report(**patch: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "n_total": 12,
+        "calibration": {
+            "temperature": 1.5,
+            "adopted": True,
+            "threshold": 0.6,
+            "n_validation": 9,
+            "validation_coverage": 0.8,
+        },
+        "abstention": {
+            "answered": 10,
+            "abstained": 2,
+            "out_of_scope": 0,
+            "coverage": 10 / 12,
+            "correct_answered": 9,
+            "adopted_error": 0.1,
+            "unconditional_error": 0.25,
+        },
+        "diagnostics": {
+            "train": {"n_rows": 72},
+            "eval": {"n_rows": 12},
+            "confusable_pairs": [],
+            "limitations": [],
+            "data_volume": {"level": "below_100"},
+        },
+    }
+    base.update(patch)
+    return base
+
+
+def test_check_evaluate_extras_accepts_the_contract_shape() -> None:
+    """REQ-22・REQ-29: 校正・保留（answered + abstained == n_total）・診断を受理する。"""
+    reason, extras = mod.check_evaluate_extras(_evaluate_report(), 12)
+    assert reason is None
+    assert extras["calibration"] == {"n_validation": 9, "adopted": True}
+    assert extras["abstention"]["answered"] == 10
+    assert extras["diagnostics_present"] is True
+
+
+@pytest.mark.parametrize(
+    ("patch", "reason"),
+    [
+        ({"calibration": None}, "calibration_invalid"),
+        ({"calibration": {"temperature": 1.5, "adopted": True, "threshold": 0.6,
+                          "n_validation": 0, "validation_coverage": 0.8}}, "calibration_invalid"),
+        ({"abstention": None}, "abstention_invalid"),
+        ({"abstention": {"answered": 10, "abstained": 1, "out_of_scope": 0, "coverage": 0.8,
+                         "correct_answered": 9, "adopted_error": None,
+                         "unconditional_error": 0.1}}, "abstention_invalid"),
+        ({"abstention": {"answered": 12, "abstained": 0, "out_of_scope": 0, "coverage": 1.5,
+                         "correct_answered": 9, "adopted_error": None,
+                         "unconditional_error": 0.1}}, "abstention_invalid"),
+        ({"abstention": {"answered": 12, "abstained": 0, "out_of_scope": 13, "coverage": 1.0,
+                         "correct_answered": 9, "adopted_error": None,
+                         "unconditional_error": 0.1}}, "abstention_invalid"),
+        ({"diagnostics": None}, "diagnostics_invalid"),
+        ({"diagnostics": {"train": {}, "eval": {"n_rows": 11}, "confusable_pairs": [],
+                          "limitations": [], "data_volume": {}}}, "diagnostics_invalid"),
+    ],
+)  # fmt: skip
+def test_check_evaluate_extras_rejects_contract_violations(
+    patch: dict[str, Any], reason: str
+) -> None:
+    """REQ-22・REQ-29: 校正なし・保留の件数不一致・coverage 範囲外・診断なしは固定の理由で失敗。"""
+    assert mod.check_evaluate_extras(_evaluate_report(**patch), 12)[0] == reason
+
+
+def test_check_select_significance_accepts_null_and_every_verdict() -> None:
+    """REQ-25: significance は null か語彙内の verdict（`undeterminable` も正常）。欠落は失敗。"""
+    assert mod.check_select_significance({"significance": None}) == (None, None)
+    for v in mod.SIGNIFICANCE_VOCAB:
+        assert mod.check_select_significance({"significance": {"verdict": v}}) == (
+            None,
+            v,
+        )
+    for bad in ({}, {"significance": {"verdict": "weird"}}, {"significance": {"verdict": ["x"]}},
+                {"significance": "x"}):  # fmt: skip
+        assert mod.check_select_significance(bad) == ("significance_invalid", None)
+
+
+def test_check_version_report_and_ledger(tmp_path: Path) -> None:
+    """REQ-39・#491: 版は `v<n>`、previous は null か `v<m>`。台帳は 3 種の記録を持つ。"""
+    assert mod.check_version_report({"id": "v1", "previous": None}, None)
+    assert mod.check_version_report({"id": "v2", "previous": "v1"}, "v1")
+    assert not mod.check_version_report({"id": "v2", "previous": "v1"}, None)
+    assert not mod.check_version_report({"id": "v0", "previous": None}, None)
+    assert not mod.check_version_report({"id": "v1"}, None)
+    assert mod.version_number("v12") == 12
+    assert mod.version_number("x") is None
+    entries = [{"kind": k, "id": "v1", "sha256": "a" * 64} for k in ("model", "data", "experiment")]
+    path = tmp_path / "version_ledger.json"
+    path.write_text(json.dumps({"schema_version": 1, "entries": entries}), encoding="utf-8")
+    assert mod.check_version_ledger(path, "v1")
+    assert not mod.check_version_ledger(path, "v2")
+    path.write_text(json.dumps({"schema_version": 1, "entries": entries[:2]}), encoding="utf-8")
+    assert not mod.check_version_ledger(path, "v1")
+    assert not mod.check_version_ledger(tmp_path / "missing.json", "v1")
+
+
+def test_check_calibration_binding_compares_the_real_sha256(tmp_path: Path) -> None:
+    """REQ-39・REQ-30・#497: artifact.json の calibration_sha256 は実際の sha256 と一致する。"""
+    pdir = tmp_path / "package"
+    pdir.mkdir()
+    (pdir / "calibration.json").write_bytes(b"cal")
+    real = hashlib.sha256(b"cal").hexdigest()
+    cap = {"components": {"calibration": {"bytes": 3, "file_count": 1}}}
+    (pdir / "artifact.json").write_text(json.dumps({"calibration_sha256": real}), encoding="utf-8")
+    assert mod.check_calibration_binding(pdir, cap) == (None, True)
+    (pdir / "artifact.json").write_text(
+        json.dumps({"calibration_sha256": "0" * 64}), encoding="utf-8"
+    )
+    assert mod.check_calibration_binding(pdir, cap)[0] == "calibration_binding_mismatch"
+    (pdir / "artifact.json").write_text(json.dumps({}), encoding="utf-8")
+    assert mod.check_calibration_binding(pdir, cap)[0] == "calibration_binding_mismatch"
+    (pdir / "artifact.json").write_text(json.dumps({"calibration_sha256": real}), encoding="utf-8")
+    bad_cap = {"components": {"calibration": {"bytes": 4, "file_count": 1}}}
+    assert mod.check_calibration_binding(pdir, bad_cap)[0] == "calibration_capacity_mismatch"
+
+
+def _train_all_report(**patch: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "step": "train",
+        "status": "ok",
+        "budget_seconds": 60,
+        "budget_reached": True,
+        "total_elapsed_ms": 1234,
+        "candidates": [
+            {
+                "candidate": 0,
+                "kind": "c1",
+                "result": "evaluated",
+                "budget_reached": None,
+            },
+            {
+                "candidate": 1,
+                "kind": "c3",
+                "result": "training_timed_out",
+                "budget_reached": "candidate_time_limit",
+            },
+        ],
+    }
+    base.update(patch)
+    return base
+
+
+def _train_all_project(tmp_path: Path) -> Path:
+    proj = tmp_path / "project"
+    (proj / "candidates" / "0").mkdir(parents=True)
+    (proj / "candidates" / "0" / "result.json").write_text("{}", encoding="utf-8")
+    (proj / "search_record.json").write_text('{"candidates":[]}\n', encoding="utf-8")
+    return proj
+
+
+def test_judge_train_all_exit_0_checks_results_record_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    """REQ-18・REQ-34: `candidates[].result`・`budget_reached`・search_record.json・後始末。"""
+    proj = _train_all_project(tmp_path)
+    reason, summary = mod.judge_train_all(0, _train_all_report(), 60, proj)
+    assert reason is None
+    assert summary["outcome"] == "evaluated"
+    assert summary["budget_seconds"] == 60
+    assert [c["result"] for c in summary["candidates"]] == [
+        "evaluated",
+        "training_timed_out",
+    ]
+    # 候補 1 のディレクトリが残っていれば失敗（evaluated 以外は片付ける契約）
+    (proj / "candidates" / "1").mkdir()
+    assert mod.judge_train_all(0, _train_all_report(), 60, proj)[0] == "candidate_dir_not_cleaned"
+    (proj / "candidates" / "1").rmdir()
+    for patch in (
+        {"budget_seconds": 61},
+        {"budget_reached": "yes"},
+        {"candidates": []},
+        {"candidates": [{"candidate": 1, "kind": "c1", "result": "evaluated",
+                         "budget_reached": None}]},
+        {"candidates": [{"candidate": 0, "kind": "c1", "result": "weird",
+                         "budget_reached": None}]},
+        {"candidates": [{"candidate": 0, "kind": "c1", "result": "evaluated",
+                         "budget_reached": "weird"}]},
+    ):  # fmt: skip
+        assert (
+            mod.judge_train_all(0, _train_all_report(**patch), 60, proj)[0] == "unexpected_output"
+        )
+    only_failed = _train_all_report(
+        candidates=[
+            {
+                "candidate": 0,
+                "kind": "c1",
+                "result": "not_started",
+                "budget_reached": None,
+            }
+        ]
+    )
+    assert mod.judge_train_all(0, only_failed, 60, proj)[0] in (
+        "candidate_dir_not_cleaned",
+        "no_candidate_evaluated",
+    )
+    (proj / "candidates" / "0" / "result.json").unlink()
+    assert mod.judge_train_all(0, _train_all_report(), 60, proj)[0] == "candidate_result_missing"
+    (proj / "search_record.json").unlink()
+    assert mod.judge_train_all(0, _train_all_report(), 60, proj)[0] == "search_record_missing"
+
+
+def test_judge_train_all_exit_20_needs_the_limit_error_and_the_record(
+    tmp_path: Path,
+) -> None:
+    """REQ-18: exit 20（全件が予算到達）は `limit_exceeded` のエラー JSON と search_record.json。"""
+    proj = _train_all_project(tmp_path)
+    err = {"code": "limit_exceeded", "message": "m"}
+    assert mod.judge_train_all(20, err, 60, proj) == (
+        None,
+        {"outcome": "budget_exhausted", "search_record_present": True},
+    )
+    assert mod.judge_train_all(20, {"code": "runtime_error"}, 60, proj)[0] == "unexpected_output"
+    assert mod.judge_train_all(64, err, 60, proj)[0] == "unexpected_exit_code"
+    (proj / "search_record.json").unlink()
+    assert mod.judge_train_all(20, err, 60, proj)[0] == "search_record_missing"
+
+
+_RESTART = {
+    "resumable": False,
+    "action": "restart_from_scratch",
+    "reason_code": "resume_not_supported",
+}
+
+
+def test_judge_cancel_response_and_cancelled_train() -> None:
+    """REQ-34・#484・#486: 応答は `requested`、train は exit 70・固定の message・`cancelled`。"""
+    ok = {
+        "step": "train",
+        "status": "ok",
+        "cancellations": [{"candidate": 0, "cancel": "requested"}],
+    }
+    assert mod.judge_cancel_response(0, ok) is None
+    done = {**ok, "cancellations": [{"candidate": 0, "cancel": "already_finished"}]}
+    assert mod.judge_cancel_response(0, done) == "cancel_not_requested"
+    assert mod.judge_cancel_response(64, ok) == "cancel_response_invalid"
+    assert mod.judge_cancel_response(0, None) == "cancel_response_invalid"
+    train = {
+        "code": "runtime_error",
+        "message": "training cancelled",
+        "step": "train",
+        "candidate": 0,
+        "job": {"state": "cancelled"},
+        "restart": _RESTART,
+    }
+    assert mod.judge_cancelled_train(70, train) is None
+    assert mod.judge_cancelled_train(0, train) == "train_exit_code_not_70"
+    assert mod.judge_cancelled_train(70, {**train, "message": "training failed"}) == (
+        "train_output_invalid"
+    )
+    assert mod.judge_cancelled_train(70, {**train, "job": {"state": "failed"}}) == (
+        "train_output_invalid"
+    )
+    assert mod.judge_cancelled_train(70, {**train, "restart": {**_RESTART, "resumable": True}}) == (
+        "train_output_invalid"
+    )
+
+
+def _status(job: dict[str, Any], restart: Any = _RESTART) -> dict[str, Any]:
+    return {
+        "step": "train",
+        "status": "ok",
+        "jobs": [{"candidate": 0, "job": job, "restart": restart}],
+    }
+
+
+def test_judge_status_cancelled_and_crashed() -> None:
+    """REQ-34・#485: cancelled は書き戻しなし、クラッシュは failed・owner_lost・初回検出。"""
+    cancelled = {"state": "cancelled", "crash_detected": False, "failure": None,
+                 "record_updated": False}  # fmt: skip
+    assert mod.judge_status(0, _status(cancelled), crashed=False) == (
+        None,
+        {"state": "cancelled", "restart_action": "restart_from_scratch"},
+    )
+    assert mod.judge_status(0, _status(cancelled), crashed=True)[0] == "status_unexpected"
+    crashed = {
+        "state": "failed",
+        "crash_detected": True,
+        "failure": {"kind": "crashed", "cause": "owner_lost", "signal": None,
+                    "detected_at_unix": 1},
+        "record_updated": True,
+    }  # fmt: skip
+    reason, out = mod.judge_status(0, _status(crashed), crashed=True)
+    assert reason is None
+    assert out["cause"] == "owner_lost"
+    for patch in ({"record_updated": False}, {"crash_detected": False},
+                  {"failure": {"kind": "error", "code": "runtime_error"}}):  # fmt: skip
+        assert mod.judge_status(0, _status({**crashed, **patch}), crashed=True)[0] == (
+            "status_unexpected"
+        )
+    assert mod.judge_status(0, _status(cancelled, None), crashed=False)[0] == "status_unexpected"
+    assert mod.judge_status(64, _status(cancelled), crashed=False)[0] == "status_invalid"
+
+
+def _interval(lo: float = 0.7, hi: float = 1.0) -> dict[str, float]:
+    return {"lo": lo, "hi": hi}
+
+
+def test_judge_reproducibility_requires_ascending_seeds_and_consistent_pairs() -> None:
+    """REQ-26・#490: runs は seed 昇順で期待と一致、disjoint_pairs が空 ⇔ all_pairs_overlap。"""
+    runs = [{"seed": s, "correct": 10, "total": 12, "ci95": _interval()} for s in (1, 2, 3)]
+    rep = {"runs": runs, "verdict": "all_pairs_overlap", "disjoint_pairs": []}
+    reason, out = mod.judge_reproducibility(rep, 12, (1, 2, 3))
+    assert reason is None
+    assert out["verdict"] == "all_pairs_overlap"
+    assert [r["seed"] for r in out["runs"]] == [1, 2, 3]
+    disjoint = {**rep, "verdict": "some_pairs_disjoint", "disjoint_pairs": [[1, 3]]}
+    assert mod.judge_reproducibility(disjoint, 12, (1, 2, 3))[0] is None
+    for bad in (
+        {**rep, "verdict": "some_pairs_disjoint"},
+        {**rep, "disjoint_pairs": [[1, 3]]},
+        {**rep, "disjoint_pairs": [[3, 1]], "verdict": "some_pairs_disjoint"},
+        {**rep, "disjoint_pairs": [[1, 9]], "verdict": "some_pairs_disjoint"},
+        {**rep, "runs": runs[:2]},
+        {**rep, "runs": [{**runs[0], "total": 11}, *runs[1:]]},
+        {**rep, "runs": [{**runs[0], "ci95": _interval(0.9, 0.8)}, *runs[1:]]},
+        {**rep, "verdict": "weird"},
+    ):
+        assert mod.judge_reproducibility(bad, 12, (1, 2, 3))[0] == "reproducibility_invalid"
+    assert mod.judge_reproducibility(None, 12, (1, 2, 3))[0] == "reproducibility_invalid"
+
+
+def test_judge_comparison_requires_same_data_and_consistent_counts() -> None:
+    """REQ-26・#488・#489: 同じ定義・同じ凍結 test の比較は全件・4 区分の合計が n・区間が 0〜1。"""
+    cmp = {
+        "previous": {},
+        "premise": "same_label_set",
+        "removed_labels": [],
+        "added_labels": [],
+        "evaluation_data": "same",
+        "n_common": 12,
+        "n_previous_only": 0,
+        "n_current_only": 0,
+        "counts": {
+            "n": 12,
+            "both_correct": 10,
+            "correct_to_incorrect": 1,
+            "incorrect_to_correct": 1,
+            "both_wrong": 0,
+            "correct_to_incorrect_ci95": _interval(0.0, 0.3),
+            "incorrect_to_correct_ci95": _interval(0.0, 0.3),
+        },
+    }
+    reason, out = mod.judge_comparison(cmp, 12)
+    assert reason is None
+    assert out["counts"]["both_correct"] == 10
+    for bad in (
+        {**cmp, "premise": "label_set_differs"},
+        {**cmp, "evaluation_data": "common_subset"},
+        {**cmp, "removed_labels": ["x"]},
+        {**cmp, "n_common": 11},
+        {**cmp, "counts": None},
+        {**cmp, "counts": {**cmp["counts"], "both_wrong": 1}},
+        {
+            **cmp,
+            "counts": {
+                **cmp["counts"],
+                "correct_to_incorrect_ci95": _interval(0.5, 0.4),
+            },
+        },
+    ):
+        assert mod.judge_comparison(bad, 12)[0] == "comparison_invalid"
+    assert mod.judge_comparison(None, 12)[0] == "comparison_invalid"
+
+
+def test_descendants_of_walks_the_process_tree() -> None:
+    """REQ-39: 子孫の pid は ppid の表を辿って求める（自身は含めない）。"""
+    table = {10: 1, 11: 10, 12: 10, 13: 11, 14: 99, 15: 14}
+    assert mod.descendants_of(table, 10) == {11, 12, 13}
+    assert mod.descendants_of(table, 14) == {15}
+    assert mod.descendants_of(table, 77) == set()
+
+
+def test_ps_table_lists_this_process_with_its_parent() -> None:
+    """REQ-39: 固定パスの `ps` の表に、このプロセスと親が載る。"""
+    table = mod.ps_table()
+    assert table is not None
+    assert table[os.getpid()] == os.getppid()
+
+
+def test_run_cmd_calls_during_with_the_wrapper_pid_and_can_skip_the_group_kill(
+    tmp_path: Path,
+) -> None:
+    """REQ-39: `during` は子の pid で呼ばれ、`reap_group=False` は正常終了後に孫を KILL しない。"""
+    seen: list[int] = []
+    out, err = tmp_path / "o", tmp_path / "e"
+    r = mod.run_cmd(
+        ["/bin/sh", "-c", "sleep 0.3"], tmp_path, out, err, 30, 1000, 1000, None,
+        during=seen.append,
+    )  # fmt: skip
+    assert r.exit_code == 0
+    assert seen
+    assert all(isinstance(p, int) for p in seen)
+    # 子が背景の孫を残して終わる。既定は孫も KILL、`reap_group=False` は孫を残す
+    marker = tmp_path / "grandchild.pid"
+    script = f'sleep 60 & echo $! > "{marker}"'
+    for reap in (True, False):
+        marker.unlink(missing_ok=True)
+        r = mod.run_cmd(
+            ["/bin/sh", "-c", script],
+            tmp_path,
+            out,
+            err,
+            30,
+            1000,
+            1000,
+            None,
+            reap_group=reap,
+        )
+        assert r.exit_code == 0
+        pid = int(marker.read_text().strip())
+        assert _wait_for(lambda p=pid: not _alive(p), 5.0) is reap
+        if not reap:
+            os.kill(pid, signal.SIGKILL)
+
+
+# ---- H の子孫の観測（#524 の指摘。ワーカーの出現待ち・pid 再利用・例外経路） ----
+
+
+def test_is_worker_matches_the_supervisor_argv() -> None:
+    """REQ-39: ワーカーは `launch.py _worker` の argv で見分ける（CLI・supervisor は除く）。"""
+    worker = "/py/bin/python -I /repo/trainer/launch.py _worker --out-fd 5 --lifeline-fd 6"
+    assert mod.is_worker(worker)
+    assert not mod.is_worker("/repo/target/release/fandhe-edge train --candidate 0")
+    assert not mod.is_worker("/py/bin/python -I /repo/trainer/launch.py train")
+    assert not mod.is_worker("sh -c _worker")
+
+
+def test_ps_procs_records_start_time_and_command_for_this_process() -> None:
+    """REQ-39: `ps` の表は開始時刻（pid の再利用の見分け）と引数全体を持つ。"""
+    procs = mod.ps_procs()
+    assert procs is not None
+    me = procs[os.getpid()]
+    assert me.ppid == os.getppid()
+    assert len(me.start.split()) == 5
+    assert "python" in me.command.lower() or "pytest" in me.command.lower()
+
+
+def test_ps_procs_asks_for_unlimited_command_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-34: macOS の ps は -ww が無いと command を表示幅で切り詰め、`_worker` を見失う。"""
+    seen: list[list[str]] = []
+
+    def fake_run_bounded(argv: list[str], *_args: object) -> tuple[int, None]:
+        seen.append(argv)
+        return 1, None
+
+    monkeypatch.setattr(mod, "run_bounded", fake_run_bounded)
+    assert mod.ps_procs() is None
+    assert len(seen) == 1
+    assert "-ww" in seen[0]
+
+
+def _sleeper() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(["/bin/sleep", "60"])
+
+
+def test_kill_seen_does_not_signal_a_process_whose_start_time_differs() -> None:
+    """REQ-39: 開始時刻が控えと違う pid（再利用された別のプロセス）へは KILL を送らない。"""
+    proc = _sleeper()
+    try:
+        procs = mod.ps_procs()
+        assert procs is not None
+        start = procs[proc.pid].start
+        left = mod.kill_seen({proc.pid: "Mon Jan  1 00:00:00 1990"})
+        assert proc.poll() is None
+        assert left == []  # 別のプロセスなので「残った子孫」にも数えない
+        assert mod.alive_seen({proc.pid: start}) == [proc.pid]
+        mod.kill_seen({proc.pid: start})
+        assert proc.wait(timeout=10) != 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_settle_descendants_kills_confirmed_survivors_on_exception_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: `run()` の例外（中断・全体の期限）でも、控えた子孫は finally で止める。"""
+    for exc in (mod.Interrupted, mod.OverallTimeout):
+        proc = _sleeper()
+        try:
+            procs = mod.ps_procs()
+            assert procs is not None
+            drv = types.SimpleNamespace(seen={proc.pid: procs[proc.pid].start})
+
+            def boom(e: type[BaseException] = exc) -> Any:
+                raise e
+
+            with pytest.raises(exc):
+                mod.settle_descendants(drv, boom)  # type: ignore[arg-type]
+            assert proc.wait(timeout=10) != 0
+        finally:
+            proc.kill()
+            proc.wait()
+    # 待機中の中断も同じ
+    proc = _sleeper()
+    try:
+        procs = mod.ps_procs()
+        assert procs is not None
+        drv = types.SimpleNamespace(seen={proc.pid: procs[proc.pid].start})
+        monkeypatch.setattr(
+            mod,
+            "check_interrupt",
+            _raise_interrupt,
+        )
+        with pytest.raises(mod.Interrupted):
+            mod.settle_descendants(drv, lambda: None)  # type: ignore[arg-type]
+        assert proc.wait(timeout=10) != 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _raise_interrupt() -> None:
+    raise mod.Interrupted
+
+
+def test_kill_seen_marks_child_may_remain_when_a_survivor_cannot_be_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: KILL しても残る（`ps` で確認できない場合を含む）なら `child_may_remain` を立てる。"""
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "ps_procs", lambda: None)
+    assert mod.kill_seen({4242: "x"}) == [4242]
+    assert mod._child_may_remain is True
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    start = "Mon Jan  1 00:00:00 2026"
+    stuck = {4242: mod.Proc(1, start, "x")}
+    monkeypatch.setattr(mod, "ps_procs", lambda: stuck)
+    monkeypatch.setattr(mod.os, "kill", lambda pid, sig: None)
+    assert mod.kill_seen({4242: start}) == [4242]
+    assert mod._child_may_remain is True
+
+
+def _driver(tmp_path: Path, mode: str, procs: dict[int, Any]) -> tuple[Any, list[tuple[int, int]]]:
+    """`ps` と `os.kill` を差し替えた `JobDriver`（job.json は running）。"""
+    job = tmp_path / "project/candidates/0/job"
+    job.mkdir(parents=True)
+    (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
+    (tmp_path / "steps").mkdir()
+    cli = _fake_cli(
+        tmp_path,
+        'echo \'{"step":"train","status":"ok","cancellations":[]}\'\n',
+    )
+    drv = mod.JobDriver(_ctx(tmp_path, cli), tmp_path, mode)
+    return drv, []
+
+
+def test_job_driver_waits_for_the_worker_and_keeps_observing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34・REQ-39: CLI と supervisor だけでは操作せず、`_worker` の出現後に操作する。
+
+    操作の後に起動したワーカーも `seen` に控える。
+    """
+    start = "Mon Jan  1 00:00:00 2026"
+    proc_cls = mod.Proc
+    procs: dict[int, Any] = {
+        10: proc_cls(1, start, "sh wrapper"),
+        11: proc_cls(10, start, "fandhe-edge train --candidate 0"),
+        12: proc_cls(11, start, "python -I /t/launch.py train"),
+    }
+    drv, _ = _driver(tmp_path, "kill", procs)
+    killed: list[int] = []
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    drv(10)
+    assert drv.done is False
+    assert killed == []  # CLI と supervisor だけ（子孫 2 件）では送らない
+    assert set(drv.seen) == {11, 12}
+    procs[13] = proc_cls(12, start, "python -I /t/launch.py _worker --out-fd 5")
+    drv(10)
+    assert drv.done is True
+    assert killed == [11]
+    assert drv.worker_seen is True
+    # 操作の後に起動したワーカー（別のもの）も控える
+    procs[14] = proc_cls(12, start, "python -I /t/launch.py _worker --out-fd 7")
+    drv(10)
+    assert set(drv.seen) == {11, 12, 13, 14}
+    assert killed == [11]
+
+
+def test_job_driver_cancel_mode_runs_cancel_only_after_the_worker_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-34: cancel モードも同様に、ワーカーが現れてから `train --cancel` を実行する。"""
+    start = "Mon Jan  1 00:00:00 2026"
+    proc_cls = mod.Proc
+    procs: dict[int, Any] = {11: proc_cls(10, start, "cli"), 12: proc_cls(11, start, "supervisor")}
+    drv, _ = _driver(tmp_path, "cancel", procs)
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    drv(10)
+    assert drv.cancel_rc is None
+    procs[13] = proc_cls(12, start, "python launch.py _worker")
+    drv(10)
+    assert drv.cancel_rc == 0
+
+
+# ---- 子プロセスの出力上限（#524 の指摘。H の `ps`・キャンセル要求。REQ-39） ----
+
+
+def _bounded(tmp_path: Path, script: str, **over: Any) -> tuple[Any, Any]:
+    args: dict[str, Any] = {"timeout": 10, "out_cap": 1000, "err_cap": 1000}
+    args.update(over)
+    with open(tmp_path / "o", "wb+") as fo, open(tmp_path / "e", "wb+") as fe:
+        res = mod.run_bounded(
+            ["/bin/sh", "-c", script], tmp_path, None, fo, fe,
+            args["timeout"], args["out_cap"], args["err_cap"],
+        )  # fmt: skip
+        return res, (os.fstat(fo.fileno()).st_size, os.fstat(fe.fileno()).st_size)
+
+
+def test_run_bounded_stops_the_child_when_stdout_or_stderr_exceeds_the_cap(
+    tmp_path: Path,
+) -> None:
+    """REQ-39: stdout・stderr が上限を超えたら子を止めて `output_limit`、期限切れは `timeout`。"""
+    assert _bounded(tmp_path, "echo hi")[0] == (0, None)
+    assert _bounded(tmp_path, "exit 3")[0] == (3, None)
+    for script in ("yes", "yes >&2"):
+        start = time.monotonic()
+        res, sizes = _bounded(tmp_path, script)
+        assert res == (None, "output_limit")
+        assert time.monotonic() - start < 10  # 無限に出力する子を放置せず止める
+        # 監視の周期の分は超えうるが、戻った後は子が止まっていて、出力はもう増えない
+        time.sleep(0.2)
+        assert (os.stat(tmp_path / "o").st_size, os.stat(tmp_path / "e").st_size) == sizes
+    assert _bounded(tmp_path, "sleep 30", timeout=0.3)[0] == (None, "timeout")
+    # 終了後に上限を超えていた場合も失敗
+    assert _bounded(tmp_path, "head -c 5000 /dev/zero", out_cap=1000)[0] == (
+        None,
+        "output_limit",
+    )
+
+
+def test_run_bounded_reports_spawn_error(tmp_path: Path) -> None:
+    """REQ-39: 実行できないコマンドは `spawn_error`。"""
+    with open(tmp_path / "o", "wb") as fo, open(tmp_path / "e", "wb") as fe:
+        res = mod.run_bounded(["/nonexistent/x"], None, None, fo, fe, 5, 10, 10)
+    assert res == (None, "spawn_error")
+
+
+def test_ps_procs_fails_closed_when_ps_output_exceeds_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-39: `ps` の出力が上限を超えたら表を作らず None（H は `ps_unavailable` で失敗する）。"""
+    assert mod.ps_procs() is not None
+    monkeypatch.setattr(mod, "CAP_PS_STDOUT", 64)
+    assert mod.ps_procs() is None
+    assert mod.ps_table() is None
+
+
+def test_job_driver_cancel_fails_when_the_cancel_command_output_exceeds_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: `train --cancel` の出力が上限を超えたら子を止め `cancel_output_limit` で失敗する。"""
+    job = tmp_path / "project/candidates/0/job"
+    job.mkdir(parents=True)
+    (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
+    (tmp_path / "steps").mkdir()
+    cli = _fake_cli(tmp_path, "yes\n")
+    drv = mod.JobDriver(_ctx(tmp_path, cli), tmp_path, "cancel")
+    start = "Mon Jan  1 00:00:00 2026"
+    procs = {
+        11: mod.Proc(10, start, "cli"),
+        12: mod.Proc(11, start, "python launch.py _worker"),
+    }
+    monkeypatch.setattr(mod, "ps_procs", lambda: dict(procs))
+    monkeypatch.setattr(mod, "H_POLL_SEC", 0.0)
+    monkeypatch.setattr(mod, "CAP_CLI_STDOUT", 1000)
+    drv(10)
+    assert drv.error == "cancel_output_limit"
+    assert drv.cancel_rc is None
+
+
+def test_run_bounded_marks_child_may_remain_when_the_child_cannot_be_stopped_or_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: KILL を送れず回収もできない子は `unreaped`・`child_may_remain`・Popen を保持する。"""
+    monkeypatch.setattr(mod, "_child_may_remain", False)
+    monkeypatch.setattr(mod, "REAP_WAIT_LIMIT_SECONDS", 0.2)
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: False)
+
+    def deny(self: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess.Popen, "kill", deny)
+    mod._leftover_procs.clear()
+    try:
+        res, _ = _bounded(tmp_path, "sleep 30", timeout=0.2)
+        assert res == (None, mod.REASON_UNREAPED)
+        assert mod._child_may_remain is True
+        assert len(mod._leftover_procs) == 1
+    finally:
+        for p in mod._leftover_procs:
+            os.kill(p.pid, signal.SIGKILL)
+            os.waitpid(p.pid, 0)
+        mod._leftover_procs.clear()

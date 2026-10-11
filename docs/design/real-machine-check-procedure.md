@@ -1,11 +1,11 @@
-# Mac 実機での動作確認（項目 A〜F）の手順と記録簿
+# Mac 実機での動作確認（項目 A〜J）の手順と記録簿
 
-対応: REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-39（横断の確認。spec の特定の TASK には対応しない）・#354。REQ-38（sandbox 下の通信 0 件）は対象外（`sandbox-offline-check-procedure.md` の担当）。
-spec の内容は要約であり、詳細は spec の REQ-21・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-39 を参照する。
+対応: REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39（横断の確認。spec の特定の TASK には対応しない）・#354・#469（G〜J と B の拡張）。REQ-38（sandbox 下の通信 0 件）は対象外（`sandbox-offline-check-procedure.md` の担当）。
+spec の内容は要約であり、詳細は spec の REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39 を参照する。
 
 ## 1. 目的と範囲
 
-PC を変えても同じ手順で main の動作確認（項目 A〜F）を再現できるようにする。
+PC を変えても同じ手順で main の動作確認（項目 A〜J）を再現できるようにする。G〜J は #469 の CLI 結線（`train --all`・`--cancel`・`--status`・再現性・旧モデルとの比較・版管理台帳）で増えた機能の確認で、実 trainer を使う（G・H は既定の項目、I は明示したときだけ）。
 スクリプト（`scripts/real-machine-check.sh`・`scripts/real_machine_check_record.py`）は実行と記録の整形までを行い、
 「実機」の証拠としての確定は人が行う。Agent の範囲はスクリプトと手順の準備までで、実機の結果を Agent が確定させない（`evidence_hint` は `requires_human_review` か `test_harness` のみ）。
 
@@ -25,7 +25,7 @@ PC を変えても同じ手順で main の動作確認（項目 A〜F）を再�
 ### 3-1. コマンドラインの形式
 
 ```bash
-make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]"
+make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu]"
 ```
 
 または、スクリプトを直接実行する場合：
@@ -36,21 +36,23 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 
 ### 3-2. 引数
 
-値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes` / `--overall-timeout-sec`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
+値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes` / `--overall-timeout-sec` / `--g-budget-seconds` / `--i-device`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
 
 | 引数 | 説明 | 既定値 / 必須 |
 | ---- | ---- | ---------- |
 | `--work-dir DIR` | 作業と記録の置き場。存在しないか空であること。**作業ディレクトリがリポジトリ自身・その配下・その祖先のどれかなら拒否される。symlink・非ディレクトリ・空でないディレクトリも拒否される**（物理パスへ正規化して比較。末尾の `/`・`/.` は判定の前に取り除くため、`link/` や `link/.` でも symlink は拒否される。#364） | 必須 |
-| `--items LIST` | 実行する項目。`A,B,C,D,E,F` の部分集合（カンマ区切り・大文字・重複不可）。E は B の成果物を使うため B と一緒に指定する（B なしの E は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`F` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364） | `B,C,D,E,F`（A は既定では含まない） |
+| `--items LIST` | 実行する項目。`A,B,C,D,E,F,G,H,I,J` の部分集合（カンマ区切り・大文字・重複不可）。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`J` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364）。A は通信しうる（`--with-ci`）、I は学習を 4 回行い GPU・時間を長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する | `B,C,D,E,F,G,H,J`（A・I は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
 | `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
 | `--p95-limit-us N` | C-1 の推論 p95 上限（マイクロ秒）。1 以上 3600000000 以下の整数（上限は定義ファイルの `limits.max_infer_p95_us` の上限と同じ。REQ-31）。範囲外は CLI・make・cargo を起動する前に引数エラー（exit 64） | 50000 |
 | `--package-limit-bytes N` | C-2 の容量上限（バイト）。1 以上 999999999999999（15 桁）以下の整数（桁あふれを避けるための上限。シェルと Python が同じ値で検査する）。範囲外は引数エラー（exit 64） | 1000 |
 | `--overall-timeout-sec N` | 実行全体の上限時間（秒。入力の採取・CLI のビルド・開始時の環境採取を含み、終了時の再採取と記録の書き出しは含まない）。1 以上 86400 以下の整数。範囲外は引数エラー（exit 64）。契約に定めのない暫定値（自分で決めた点。REQ-39）。超えたら §5 のとおり打ち切る。`--repeat` を大きくする場合は併せて上げる | 14400（4 時間） |
+| `--g-budget-seconds N` | G（`train --all`）の探索予算（秒）。1 以上 921600 以下の整数（CLI の `--budget-seconds` の上限 `MAX_SEARCH_BUDGET_SECONDS` と同じ。範囲外は引数エラー〔exit 64〕）。小さくすると全候補が予算到達（exit 20）になりうる。それも想定内の結果として記録する（§4-G） | 3600（CLI の既定） |
+| `--i-device cpu\|gpu` | I の証拠種別の申告。`cpu` → `cpu_real_machine`、`gpu` → `gpu_real_machine_declared`。**CLI の `train` は現状 CPU 固定**（`crates/cli/src/stages/train.rs` の `Device::Cpu`）のため、`gpu` は人が別の手段で GPU 学習へ切り替えたときだけ指定する（切り替えの有無はスクリプトが確認できない）。MLX の GPU 学習は同一 seed でも完全再現しないため、再現性の確認は CPU で行う（REQ-26・#103） | `cpu` |
 | `--help` | 使い方を JSON 1 行（`{"code":"ok","message":"usage: ..."}` の形）で stdout へ出して exit 0 | — |
 
-**A を実行する場合の注意**: `--items` に `A` を含めても、`--with-ci` が無ければ以下の JSON を出して exit 64（`invalid_input`）で停止します。実行順は常に A→F です。
+**A を実行する場合の注意**: `--items` に `A` を含めても、`--with-ci` が無ければ以下の JSON を出して exit 64（`invalid_input`）で停止します。実行順は常に A→J です。
 
 ```json
 {"code":"invalid_input","message":"<固定メッセージ>"}
@@ -84,7 +86,9 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 | 対象 | 上限時間 | stdout | stderr | 用途 |
 | ---- | ------- | ------ | ------ | ---- |
-| CLI 1 工程（register / inspect / train / select / evaluate / package / infer） | 600 秒 | 1 MiB | 8 MiB | B・C・E |
+| CLI 1 工程（register / inspect / train / select / evaluate / package / infer） | 600 秒 | 1 MiB | 8 MiB | B・C・E・H・I・J |
+| `train --all`（G） | `--g-budget-seconds` + 300 秒 | 1 MiB | 8 MiB | G（予算内の学習が終わり次第戻るため、余裕 300 秒を足す。契約に定めのない値） |
+| `ps`・H のキャンセル要求（`train --cancel`） | 30 秒 | — | — | H（子孫の確認は固定の `/bin/ps`。待つ上限は running の出現 120 秒・子孫の終了 30 秒。契約に定めのない値） |
 | `make ci` | 3600 秒 | 64 MiB | 64 MiB | A（通信するため `--locked` なし。`RUSTUP_AUTO_INSTALL=0` のみ渡す。#375） |
 | `make check-runtime-linkage` | 1800 秒 | 64 MiB | 64 MiB | D（オフラインモード。`CARGO_NET_OFFLINE=true`・`RUSTUP_AUTO_INSTALL=0`） |
 | `cargo test --locked` / 1 回（F） | 300 秒 | 64 MiB | 64 MiB | F（N 回の各回） |
@@ -125,7 +129,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - 補足（証拠種別: 推定。コードの読解）: `record.json`・`record.md` は最終 JSON の `emit` より前に書かれる（`main` の書き出しの後に `emit` を呼ぶ）ため、書き込みで止まった時点では書き終わっている場合が多い
   - 実装で止められるようにする（stdout 書き込みへの上限時間など）かは本手順では決めない。必要になれば別 Issue で扱う
 
-## 4. 各項目 A〜F が何を確かめるか
+## 4. 各項目 A〜J が何を確かめるか
 
 ### 4-A. `make ci`（ローカルゲート）
 
@@ -158,7 +162,14 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - `evaluate`: `candidate` が `select` の報告値、`kind` が `select` と同じ値、`n_total` が `evaluation.jsonl` の行数（1 以上）、`correct` が 0 以上 `n_total` 以下、`accuracy` が `correct / n_total` と 1e-9 以内で一致、キー `macro_f1` が存在して `null` か 0 以上 1 以下（分母 0 の指標は `null`。REQ-24）
   - `package`: キー `judgment`・`infer_p95` が値が `null` でも存在する。`capacity` は `total_bytes`・`exceeded`・`guideline_bytes`・`over_guideline` が正しい型で、`limit_bytes` が定義の `limits.max_package_bytes` と一致する。定義に無いときは `limit_bytes` が `null` で `exceeded` が `false`（上限を照合しない。REQ-30・TASK-41.9・#406）。設定があるときは `exceeded == (total_bytes > limit_bytes)`、exit 0 なら `exceeded` は `false`。`guideline_bytes` は pytest が runtime の `REFERENCE_CAPACITY_BYTES` と目安の値を照合し、`over_guideline == (total_bytes > guideline_bytes)` を検査する（目安超過は警告で、exit 0 に影響しない）。B の定義は合否基準と上限を持たないため、`judgment` が `null`・`acceptance_defined` が `false`・`infer_p95` が `null`
   - `infer`（B の単発）: `predicted_label` が定義の選択肢 ID のどれか、`scores` のキー集合が選択肢 ID と一致し、各値が有限で 0 以上 1 以下、和が 1 から 1e-6 以内（`SCORE_SUM_TOLERANCE` は `fixtures/score_tolerance/score_sum_tolerance.json` と一致することを pytest が機械照合する）、`predicted_label` が最大スコアの選択肢（同点は定義の宣言順で先頭）。B の単発は `--id` を付けないので、`id` が既定値 `input`（`crates/cli/src/stages/infer.rs` の `DEFAULT_TEXT_ID` と一致することを pytest が機械照合する。#362）
-- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`package_entry_not_regular`（`package/` 直下に通常ファイル以外がある。#362）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。非 0 終了で stdout が JSON でない場合は `invalid_json` のまま、許容外の終了コードであることを補助欄 `exit_code_unexpected: true` で示す。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と、ファイル数が `file_count` の合計と合わない場合は `unexpected_output`（`step` は `package`）。単発 `infer` の `id` が既定値でない場合も `unexpected_output`（`step` は `infer`）
+- **#469 で増えた出力の照合（B のみ。`contract_checks`）**: 7 工程の報告値の照合に加えて、次を確かめる（欄名・形は `crates/core/src/stage_report.rs` の `EvaluateCompletedReport`・`EvaluateCalibration`・`EvaluateAbstention`・`EvaluateDiagnostics`・`SelectReport`・`PackageReport`・`PackageVersion`。バッチの契約は #469 のコメント）。REQ-22・REQ-25・REQ-29・REQ-30・REQ-39
+  - `evaluate` の `calibration`: null でなく、`temperature` が正の有限数・`adopted` が真偽値・`threshold` が 0〜1・`n_validation` が 1 以上・`validation_coverage` が 0〜1（B は評価データありのため null を失敗にする）
+  - `evaluate` の `abstention`: `answered`・`abstained`・`out_of_scope`・`correct_answered` が 0 以上の整数、`coverage` が 0〜1、**`answered + abstained == n_total`**（`out_of_scope` は `answered` の内数で、`out_of_scope <= answered`。`stage_report.rs` の `EvaluateAbstention` の doc に従う。B は対象外ラベルを定義しないため `out_of_scope` は 0 で、`answered + abstained + out_of_scope` としても同じ値になる）、`correct_answered <= answered`
+  - `evaluate` の `diagnostics`: 非 null で、`train`・`eval`（`eval.n_rows == n_total`）・`confusable_pairs`・`limitations`・`data_volume` を持つ
+  - `select` の `significance`: キーが存在し、null（定義に `baseline_comparison` が無い。B の定義はこれ）か `verdict` が `significantly_better`・`not_significantly_better`・`undeterminable` のどれか。**`undeterminable` も正常**（件数不足は合格扱いにしないが、失敗にもしない。REQ-25）
+  - `package` の `version`: `{"id":"v1","previous":null}`（B は `--previous-project-dir` なし）。`project/version_ledger.json` が通常ファイルで、`schema_version` が 1・今回の版の `model`・`data`・`experiment` の 3 件（`sha256` は hex 64 桁）を持つ（台帳ファイル自体の改変検出は範囲外。#491）
+  - 校正の束縛: `package/artifact.json` の `calibration_sha256` が `package/calibration.json` の実際の sha256 と一致し、`capacity.components.calibration` が `calibration.json` の実サイズ・`file_count` 1（REQ-39・#497）
+- **失敗の理由**: `input_unreadable`（fixture が読めない）、`missing_field`（JSON に必須フィールドなし）、`package_unreadable`（`package/` が読めない）、`package_entry_not_regular`（`package/` 直下に通常ファイル以外がある。#362）、`capacity_sum_mismatch`（容量の 5 要素の合計と `total_bytes` が一致しない）、`calibration_invalid`・`abstention_invalid`・`diagnostics_invalid`・`significance_invalid`・`version_invalid`・`version_ledger_invalid`・`calibration_binding_mismatch`・`calibration_capacity_mismatch`（上の #469 の照合。順にそれぞれの欄の不整合）、工程別の失敗（`step` に工程名・`exit_code` に終了コード・`reason` に `timeout`・`output_limit`・`spawn_error`・`killed`・`invalid_json`・`unexpected_exit_code`・`unexpected_output`。報告値の不整合は `unexpected_output`。非 0 終了で stdout が JSON でない場合は `invalid_json` のまま、許容外の終了コードであることを補助欄 `exit_code_unexpected: true` で示す。stdout の JSON の入れ子が深すぎて読めない場合も `invalid_json`）。`package/` のファイルの合計が `total_bytes` と、ファイル数が `file_count` の合計と合わない場合は `unexpected_output`（`step` は `package`）。単発 `infer` の `id` が既定値でない場合も `unexpected_output`（`step` は `infer`）
 - **記録する `record.json` フィールド**:
   - `status`: `"ok"` または `"failed"`
   - `steps`: 工程の配列（各工程：`step`（固定語彙）・`command`（固定語彙。infer は `infer --package <package-dir> --text <fixed-sample>` で、引数の値・パスは出さない）・`exit_code`・`stderr_bytes`・`summary`）。`summary` は工程ごとに決まった欄だけを新しく組み立てた要約で、CLI の JSON の他の欄は捨てる（欄は常に出し、無い・型が違う値は `null`、閉じた語彙の欄で語彙外の文字列は `<unexpected>`）
@@ -170,6 +181,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
     - `infer`: `status`・`scores_keys`（`scores` のキー数）・`predicted_index`（`predicted_label` が定義の選択肢 ID の何番目か。0 始まり。選択肢に無ければ `null`）。選択肢 ID は利用者が決める文字列のため `predicted_label` は記録しない
   - `capacity`: `total_bytes`・`limit_bytes`（未設定なら `null`）・`exceeded`・`guideline_bytes`・`over_guideline`・`components`（5 項目。各々 `bytes` と `file_count`）
   - `capacity_sum_matches_total`: 5 要素の合計が `total_bytes` に一致したか（boolean）
+  - `contract_checks`: 上の #469 の照合の要約。`calibration`（`n_validation`・`adopted`）、`abstention`（`answered`・`abstained`・`out_of_scope`・`coverage`）、`diagnostics_present`、`significance_verdict`（null か語彙内の値）、`version_number`（1）、`version_ledger_present`、`calibration_sha256_matches`。選択肢 ID・ラベルは出さない
   - `package_files`: `package/` 内ファイルの配列（各ファイル：`name`・`bytes`・`sha256`。`name` が `^[A-Za-z0-9._-]{1,64}$` に一致しなければ `<unrecognized>`）
   - `reason`（失敗時のみ）: 上記の失敗理由。工程の `unexpected_exit_code`・`unexpected_output` では、あわせて `code`（CLI の stdout の `code` が 7 種の語彙の値ならその値、語彙外の文字列なら `<unexpected>`、文字列でなければ欄なし）と、`message` が文字列のときの `message_bytes`（UTF-8 のバイト数）・`message_sha256` を出す。`message` の本文は記録せず、`<work-dir>` の工程の stdout のファイルに残る
 
@@ -308,6 +320,74 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - **実行特性**: F だけは全 N 回を数えてから成否を決めます（失敗があっても止めず最後まで実行する）。失敗 0 回で `ok`、1 件以上で `failed`。
 - **初回実行の自動準備**: スクリプトが N 回実行の前に `cargo test --locked ... --no-run` を 1 回実行し、テストバイナリをコンパイルします（回数に数えない。失敗は `build_failed`）。続けて `-- --list` を 1 回実行して件数を得ます（回数に数えない。失敗は `list_failed`）。事前準備は不要ですが、初回実行は通常より時間がかかります。
 
+### 4-G. `train --all`（探索予算内の全候補の学習。REQ-18・#482・#483）
+
+新しい project（`G/project`）で `register → inspect` の後に `train --project-dir project --all --budget-seconds N` を実行します（`N` は `--g-budget-seconds`、既定 3600）。実 trainer（CPU）で既定候補を宣言順に学習するため、予算の分だけ時間がかかります。
+
+- **確かめること**: 候補ごとの結果（`candidates[].result`）と予算到達（`budget_reached`）が契約の語彙で出ること、探索記録 `search_record.json` が残ること、exit 0（`evaluated` が 1 件以上）か exit 20（全件が予算到達）であること。
+- **想定する終了コード**: 0 または 20（どちらも想定内。exit 20 の stdout は `code:"limit_exceeded"` のエラー JSON で、`candidates` を持たない）
+- **G の合格条件**:
+  - exit 0 または 20。それ以外は `unexpected_exit_code`
+  - どちらでも `project/search_record.json` が通常ファイルの JSON オブジェクトとして読める（無ければ `search_record_missing`）
+  - exit 20: `code` が `limit_exceeded`（`outcome:"budget_exhausted"`）
+  - exit 0: `step:"train"`・`status:"ok"`・`budget_seconds` が指定値・`budget_reached` が真偽値・`total_elapsed_ms` が 0 以上の整数・`candidates` が空でない配列。各要素は `candidate` が 0 からの連番・`kind` が語彙内・`result` が `evaluated`・`training_not_completed`・`scoring_failed`・`scoring_exceeded_budget`・`scoring_skipped_budget_exhausted`・`training_exceeded_time_limit`・`training_timed_out`・`not_started` のどれか・`budget_reached` が null か `search_budget`・`candidate_time_limit`（`TrainSearchResult`・`TrainBudgetScope`。pytest が Rust の enum と機械照合する）。`evaluated` が 1 件以上
+  - exit 0: `evaluated` の候補だけ `candidates/<N>/result.json` が残り、それ以外の候補ディレクトリは片付いている（選定対象にしない契約）
+- **失敗の理由**: `unexpected_exit_code`・`unexpected_output`（形・語彙の不整合）・`search_record_missing`・`candidate_result_missing`・`candidate_dir_not_cleaned`・`no_candidate_evaluated`、工程別の失敗（`step:"train"`・`case:"train-all"`）
+- **記録する `record.json` フィールド**: `status`・`exit_code`・`outcome`（`evaluated` / `budget_exhausted`）・`budget_seconds`・`budget_reached`・`total_elapsed_ms`・`candidates`（`candidate`・`kind`・`result`・`budget_reached`）・`search_record_present`・`steps`
+- **人が判断すること**: 予算が妥当か、どの候補がどの結果だったか、exit 20 のとき予算を増やして再実行するか。スクリプトは語彙・整合の確認だけで、探索結果の良し悪しは判定しない
+
+### 4-H. `train --cancel`・`--status` とクラッシュ検出（REQ-34・REQ-39・#484・#485・#486）
+
+新しい project（`H/project`）で `register → inspect` の後に、次の 2 つを順に行います。実 trainer（CPU）を起動し、`job.json` が running になるまで待つため、学習の立ち上がりの分だけ時間がかかります。
+
+1. **キャンセル**: `train --candidate 0` を起動し、`candidates/0/job/job.json` が `running` になり、CLI の下に学習ワーカー（コマンドラインに `launch.py` と `_worker` を持つプロセス。supervisor の `worker_argv`）が現れたら（CLI と supervisor だけの状態では送らない）、別プロセスで `train --project-dir project --cancel` を送る。
+2. **クラッシュ検出**: もう一度 `train --candidate 0`（`cancelled` の候補は丸ごと消して新規に始まる。REQ-34）を起動し、同じく running を待って train 本体の CLI プロセスへ `SIGKILL` を送る。
+
+- **確かめること**: キャンセルの応答・train の終了コードと `message`・`--status` の状態・`package/` が生成されないこと・子孫が 0 件になること。続けて、`SIGKILL` した train の記録が `--status` で `failed`・`owner_lost` として検出されること。
+- **H の合格条件**:
+  - キャンセルの応答: exit 0・`cancellations` が 1 件で `candidate` が 0・`cancel` が `requested`（`already_finished` は学習が先に終わった印で失敗。`cancel_not_requested`）
+  - キャンセルされた train: exit 70・`code:"runtime_error"`・`message` が `training cancelled`・`step:"train"`・`candidate` 0・`job.state:"cancelled"`・`restart` が `resumable:false`・`action:"restart_from_scratch"`・`reason_code:"resume_not_supported"`（`train_exit_code_not_70`・`train_output_invalid`）
+  - `--status --candidate 0`: exit 0・`jobs[0]` が `state:"cancelled"`・`crash_detected:false`・`failure:null`・`record_updated:false`、`restart` が同じ案内（`status_unexpected`・`status_invalid`）
+  - `project/package` が存在しない（`package_created`）
+  - 観測した子孫（`ps` の `ppid` を辿って求めた pid と開始時刻の組。操作の後も train の終了まで観測し続ける。ワーカーを 1 件以上観測できなければ失敗）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残ったものは、pid と開始時刻が控えと一致することを送る直前に確かめてから KILL し、件数だけを記録する。pid が再利用された別のプロセスへは送らない。中断・全体の期限の例外の経路でも同じ後始末を行い、止められなければ `child_may_remain` を立てる）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`
+  - クラッシュ: `SIGKILL` した train は JSON を出さない（終了コードは 137 の見込みで、記録に残す）。子孫は 30 秒以内に終わる（`descendants_remain_after_crash`）。その後の `--status --candidate 0` が exit 0・`state:"failed"`・`crash_detected:true`・`failure.kind:"crashed"`・`failure.cause:"owner_lost"`・`record_updated:true`（running の残骸を書き戻した初回）・`restart` が同じ案内
+- **失敗の理由**: 上の括弧内の語、`driver_error`・`ps_unavailable`（監視の失敗）、工程別の失敗（`step:"train"`・`case`: `train-cancelled`・`status-cancelled`・`train-killed`・`status-crashed`）
+- **記録する `record.json` フィールド**: `cancel_check`（`cancel`・`train_exit_code`・`descendants_observed`・`descendants_remaining`・`package_absent`・`state`・`restart_action`）・`crash_check`（`train_exit_code`・`descendants_observed`・`descendants_remaining`・`state`・`cause`・`restart_action`）・`steps`
+- **既知の限界**: Ctrl-C（`SIGINT`）にはハンドラを置かない契約（`owner_lost` として次の `--status` で検出）。H は `SIGKILL` で同じ状態を作る。子孫は H が起動した CLI の下だけを見る（`setsid` で別セッションへ移った孫は、`ppid` の連鎖が切れれば観測できない）
+
+### 4-I. 3 seed の再現性と前のモデルとの比較（REQ-26・REQ-27・#488〜#490・#103）
+
+**既定の項目に入れない**（`--items I` で明示したときだけ実行する）。学習を 4 回行うため、実機で時間がかかる。
+
+新しい project（`I/project`）で `register → inspect` の後にプロジェクトを複製し（`p1`・`p2`・`p3`・`old`）、各複製で `train --train-seed S → select → evaluate` を実行する（`p1`〜`p3` は seed 1・2・3、`old` は旧モデルの代役で seed 4）。最後の `p1` の `evaluate` だけに `--previous-project-dir old --seed-run-project p2 --seed-run-project p3` を付ける（`p2`・`p3`・`old` を先に評価する。凍結 test への適用は複製ごとに 1 回で、REQ-27 の 1 回限りは複製ごとに守られる）。
+
+- **確かめること**: `reproducibility`（`verdict`・`runs`・`disjoint_pairs`）と、旧モデルとの比較（`comparison`）の出力が契約の形で出ること。
+- **I の合格条件**:
+  - 7 工程の各報告値の整合（B と同じ `_step_check`）。`train` は `--train-seed` を受ける
+  - `reproducibility`: `runs` が seed 昇順で `[1,2,3]`、各 run の `total` が評価件数・`correct` が 0 以上 `total` 以下・`ci95` が 0〜1 で `lo <= hi`。`disjoint_pairs` は `runs` の seed の昇順の組で、空 ⇔ `verdict` が `all_pairs_overlap`。**`some_pairs_disjoint` も正常な出力**（再現性の合否の解釈は人が行う）
+  - `comparison`: 旧モデルは同じ定義・同じ凍結 test の別 seed のため、`premise` が `same_label_set`・`evaluation_data` が `same`・`removed_labels`・`added_labels` が空・`n_common` が評価件数・`n_previous_only`・`n_current_only` が 0。`counts` は `n` が評価件数・4 区分（`both_correct`・`correct_to_incorrect`・`incorrect_to_correct`・`both_wrong`）の合計が `n`・両方の `ci95` が 0〜1。p 値・有意性は持たない契約のため、回帰の多寡の解釈は人が行う
+- **失敗の理由**: `copy_failed`（複製の失敗）・`reproducibility_invalid`・`comparison_invalid`・工程別の失敗（`case`: `train-<複製>`・`select-<複製>`・`evaluate-<複製>`）
+- **証拠種別（`--i-device`）**: `cpu`（既定）→ `evidence: "cpu_real_machine"`、`gpu` → `evidence: "gpu_real_machine_declared"`。**CLI の `train` は現状 CPU 固定のため、`gpu` は人の申告で、スクリプトは GPU で学習したことを確認できない**。MLX の GPU 学習は同一 seed でも完全再現しないため、決定的な再現の確認は CPU で行う（#103 の限界「事前登録の条件の GPU ではなく CPU で確認した」を成果物へ書く）。`test_harness`（偽 CLI）の実行は実機の証拠にならない（`evidence_hint` が `test_harness`）
+- **記録する `record.json` フィールド**: `evidence`・`device`・`seeds`（`[1,2,3,4]`）・`reproducibility`（`verdict`・`runs`〔`seed`・`correct`・`total`〕・`disjoint_pairs`）・`comparison`（`premise`・`evaluation_data`・`n_common`・`counts`）・`steps`
+
+### 4-J. 前の版への復帰（REQ-39・REQ-27・#491）
+
+B の `project`（`package` 済み。版 v1）を旧プロジェクトとして使う（**B と一緒に指定する**）。カレントは作業ディレクトリ（`B/`・`J/` の親）にする（CLI はカレント配下の相対パスだけを受けるため）。
+
+新しい project（`J/project`）を `package` まで実行し（`package --project-dir J/project --previous-project-dir B/project`）、版 v2 を作る。続けて次を確かめる。
+
+- **J の合格条件**:
+  - `package` の `version` が `{"id":"v2","previous":"v1"}`。`J/project/version_ledger.json` が v1・v2 それぞれの `model`・`data`・`experiment` を持つ（`version_invalid`・`version_ledger_invalid`）
+  - `infer --package B/project/package --version-ledger J/project/version_ledger.json --version-id v1`（v1 の package を新しい台帳の v1 で使う）が exit 0 で、判定の整合を満たす
+  - `infer --package J/project/package --version-ledger <台帳>`（`--version-id` 省略 = 最新の v2）が exit 0
+  - `infer --package J/project/package --version-id v1`（`--version-ledger` なし）が exit 64・`code:"invalid_input"`
+  - `B/project/package` を複製した `J/tampered` の `artifact.json` を 1 バイト改変し、`--version-id v1` で `infer` すると exit 64・`code:"invalid_input"`（`package does not match version ledger`）。**元の `package/` は変更しない**（改変は複製）
+  - 64 の確認で、終了コードが 64 でない・`code` が `invalid_input` でないときは `rejection_not_64`
+- `infer` の確認（復帰・最新版）は、校正つきのパッケージでは対象外（exit 11・`out_of_scope`）・保留（exit 12・`abstain`）も正常として、B と同じく終了コードと `status` の対応で照合する（対応しなければ `unexpected_output`）
+- **失敗の理由**: `previous_package_missing`（B の `package/` が無い）・`copy_failed`・`version_invalid`・`version_ledger_invalid`・`rejection_not_64`・工程別の失敗（`case`: `package-v2`・`infer-rollback-v1`・`infer-latest`・`infer-version-id-only`・`infer-tampered-artifact`）
+- **記録する `record.json` フィールド**: `version_number`（2）・`previous_version_number`（1）・`rollback_to_v1_ok`・`latest_ok`・`version_id_only_exit_code`（64）・`tampered_artifact_exit_code`（64）・`steps`
+- **限界**: 台帳ファイル自体の改変は検出できない（読み取り専用化のみ。#491 の範囲外）
+
 ## 5. 判定の読み方
 
 スクリプトの終了コードは 4 種です（120・141・1 など 7 種の外の値は出さず、70 へ写します。下の 70 の行の「stdout へ書けなかった場合」）。
@@ -316,12 +396,12 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | -------- | ---- | ---- |
 | 0 | 要求したすべての項目が `ok` | 実機確認成功。`record.json`・`record.md` を PR に記録 |
 | 10 | 1 つ以上の要求項目が `failed` または `not_run`（E が B の失敗で `not_run` の場合を含む）。または、実行全体の上限時間（`--overall-timeout-sec`）を超えた（stdout の `message` は `overall time limit exceeded`。実行中の項目は `failed`・残りは `not_run`〔`reason` は `overall_timeout`〕。子のグループは止めて回収する。終了時の再採取と記録の書き出しは上限の外で行うため、全体の所要は上限 ＋ 再採取〔最大 60 秒〕＋ 回収待ち〔10 秒〕で頭打ちになる。#364）。または、開始時と終了時で `commit`・`worktree_clean`・CLI の sha256 のいずれかが一致しない（`environment.stable` が `false`。stdout の `message` は `environment changed during the run`。項目の `status` は書き換えず、全項目が `ok` でも 10 にする。#360） | 失敗した項目の記録を確認し、原因を特定する。原因不明のまま再実行しない |
-| 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E` で B が無い、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
+| 64 | 引数エラー（前処理で検出） | `--items A` 指定時に `--with-ci` が無い、`--items E`・`J` で B が無い、`--g-budget-seconds`・`--i-device` が範囲外、`--work-dir` がリポジトリ内、`FANDHE_EDGE_BIN` が無い・実行できない、など。エラーメッセージ（JSON）から原因を確認して引数を修正。`record.json` は出力されない |
 | 70 | 実行環境エラー・中断 | 最終 JSON を stdout へ書けなかった（読み手が先に閉じたパイプ・書き込めないファイル・閉じた stdout）場合は、本来が 0・10・64 でも 70（記録作成後の最終出力に失敗した 0・10 では `record.json`・`record.md` を書き終えているので work-dir で確認する。引数エラー〔64〕は記録作成前に終了するため両ファイルは存在しない）。python3 が無い・3.9 未満、作業ディレクトリを作成できない、fixture が読めない、`record.json` を書き込めない、`FANDHE_EDGE_BIN` 未設定で CLI をビルドできない、実行中に SIGINT・SIGTERM・SIGHUP で中断、項目に想定外の例外が出た（`reason` が `internal_error`。1 件でもあれば stdout の `code` は `runtime_error`）、子が残りうる状態で（全体の上限時間を超えた、または全項目が `ok`）終わった（stdout の `message` は `a child process may remain`。上限超過の 10 には隠さない）、など。環境を確認またはスクリプトを再実行。**中断時・`internal_error` 時は `record.json` が書かれる**（その時点までの項目の結果を記録。中断した項目の `reason` は `interrupted`）。その時点までの `record.md` も出力される。項目の開始前（入力の採取・CLI のビルド・環境の採取の途中）に中断された場合も `record.json`・`record.md` を書く（選んだ項目はすべて `not_run` / `interrupted`、選んでいない項目は `not_run` / `not_selected`、未採取の `environment`・`inputs` は `null`。CLI のビルド中の中断では `inputs` は値あり・`environment` は `null`）。この中断では stdout が `{"code":"runtime_error","message":"interrupted","record":"record.json"}`・終了コードが 70 になる。同じシグナルを 2 回受けた強制終了では `record.json` を書かず、stdout は `{"code":"runtime_error","message":"interrupted (forced exit)"}` になる（「中断の方式」）。中断以外の失敗（fixture が読めない・CLI のビルド失敗）は `record.json` なしで終了コード 70 になる |
 
 **項目の実行フロー**:
 
-1. 要求した項目（`--items LIST`）を A→F の順で実行する
+1. 要求した項目（`--items LIST`）を A→J の順で実行する
 2. 各項目の実行：
    - 要求されていない → `not_run` / `not_selected`
    - 中断済み → `not_run` / `interrupted`（前の項目が `failed` の場合よりも優先する）
@@ -343,6 +423,10 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - **D**: exit 0 + 成功の印（env -i テスト 3 件・`OK: tool=...`）+ リンクを確認したバイナリが実行した CLI と一致 = `ok`
 - **E**: B が要求されていない、または前の項目が失敗 → `not_run`。それ以外で、バッチと単体が整合し予測・スコアが全一致 = `ok`。一致しない = `failed`
 - **F**: `failed == 0` = `ok`、`failed > 0` = `failed`
+- **G**: exit 0（`evaluated` が 1 件以上で語彙・後始末が整合）または exit 20（`limit_exceeded`）で、どちらも `search_record.json` が残る = `ok`
+- **H**: キャンセル（応答・exit 70・`cancelled`・`package/` なし・子孫 0 件）とクラッシュ検出（`failed`・`owner_lost`）がすべて契約どおり = `ok`
+- **I**: 4 複製の 7 工程と、再現性・比較の出力が契約の形 = `ok`（`some_pairs_disjoint` も `ok`。解釈は人）
+- **J**: v2 の作成・v1 での復帰・最新版・`--version-id` 単独の 64・改変の 64 がすべて契約どおり = `ok`
 
 **失敗時の報告の 5 点**:
 
@@ -377,11 +461,15 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 | 項目 | reason |
 | ---- | ---- |
 | A | `output_unreadable`・`unexpected_exit_code`・`skipped`・`test_failures`・`no_test_results`（判定順は skipped → test_failures → no_test_results） |
-| B | `input_unreadable`・`invalid_json`（補助欄 `exit_code_unexpected`）・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`package_unreadable`・`package_entry_not_regular`・`capacity_sum_mismatch` |
+| B | `input_unreadable`・`invalid_json`（補助欄 `exit_code_unexpected`）・`unexpected_exit_code`・`unexpected_output`・`missing_field`・`package_unreadable`・`package_entry_not_regular`・`capacity_sum_mismatch`・`calibration_invalid`・`abstention_invalid`・`diagnostics_invalid`・`significance_invalid`・`version_invalid`・`version_ledger_invalid`・`calibration_binding_mismatch`・`calibration_capacity_mismatch` |
 | C | B の工程の語、`staging_left`（C-1・C-2 の両方）、`capacity_limit_not_enforced`（C-2）、C-1 の判定の `missing_field`・`unexpected_output` |
 | D | `output_unreadable`・`unexpected_exit_code`・`skipped`・`no_test_results`・`unexpected_output`・`linkage_target_unreadable`・`cli_changed`・`linkage_target_mismatch`・`otool_failed` |
 | E | `input_unreadable`・`record_count_out_of_range`・`duplicate_id`・`unexpected_exit_code`・`unexpected_output`・`invalid_json`・`mismatch`。`e-inputs.jsonl` を書けないときは `step` なしの `spawn_error`（子の起動失敗ではない。現状の挙動で、語の見直しは別課題の候補） |
 | F | `build_failed`・`list_failed`・`no_tests_listed`・`test_failures`・`unreaped` |
+| G | `input_unreadable`・`unexpected_exit_code`・`unexpected_output`・`invalid_json`・`search_record_missing`・`candidate_result_missing`・`candidate_dir_not_cleaned`・`no_candidate_evaluated` |
+| H | `input_unreadable`・`driver_error`・`ps_unavailable`・`job_not_running`・`cancel_response_invalid`・`cancel_not_requested`・`train_exit_code_not_70`・`train_output_invalid`・`status_invalid`・`status_unexpected`・`package_created`・`no_descendant_observed`・`descendants_remain_after_cancel`・`descendants_remain_after_crash`・工程別の失敗 |
+| I | `input_unreadable`・`copy_failed`・`missing_field`・`reproducibility_invalid`・`comparison_invalid`・工程別の失敗 |
+| J | `previous_package_missing`・`input_unreadable`・`copy_failed`・`missing_field`・`version_invalid`・`version_ledger_invalid`・`rejection_not_64`・`unexpected_exit_code`・`unexpected_output`・工程別の失敗 |
 
 **(c) 実行の制御**
 
@@ -408,6 +496,8 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - **A**: 終了のみが実機証拠。中のテスト（Rust unit・integration、pytest）はテストハーネス。記録には区別して記載する
 - **C-1 の p95**: `--quiet-machine` フラグが **あり、かつ実際に他のアプリを閉じた状態** でのみ `classification: "real_machine"`。フラグが無い、フラグはあるが実際に静かでない、`make`・`cargo` の代役か `FANDHE_EDGE_BIN` の差し替えの下で実行した = `reference_only`（最後の 2 つはフラグがあっても `reference_only`）。参考値扱いで「実機の p95」としない
 - **E**: 学習データ（`train.jsonl`）のみ使用し、評価データ（`evaluation.jsonl`）は使わない（REQ-27。評価の独立性）
+- **G・H・J**: 実 CLI・実 trainer（CPU）を実機で実行した結果。`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` の下（偽 CLI）の実行は `test_harness` で、実機の証拠にならない。H の子孫の観測は `ps`（固定パス）の `ppid` の連鎖によるもので、証拠種別は実機（人が確認して記入）
+- **I**: `--i-device` で証拠種別を区別して記録する（`cpu_real_machine`・`gpu_real_machine_declared`）。後者は人の申告で、CLI が GPU で学習した確認はスクリプトにはできない（CLI は CPU 固定）。再現性の合否・回帰の多寡の解釈は人が行い、スクリプトは出力の整合までを確かめる
 - **F**: テストハーネスを実機で実行したもの。テストの実装（偽の sleeper、実時計）は実機ですが、判定対象（予測値・スコア）は合成に依存しているため、実機の証拠としては「テストハーネス」扱い
 
 **B・C のプロジェクト**: 複数項目で同じ評価データを使う場合は、project ごとに 1 回だけ適用します。B・C-1・C-2 は各々異なる project を使い、各 project へ 1 回ずつ評価データを適用します（REQ-27）。
@@ -490,25 +580,31 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
     "evaluation_sha256": "64-char hex"
   },
   "options": {
-    "items": ["A" | "B" | ... | "F"],
+    "items": ["A" | "B" | ... | "J"],
     "repeat": "int",
     "quiet_machine": "true | false",
     "p95_limit_us": "int",
     "package_limit_bytes": "int",
     "overall_timeout_sec": "int (実行全体の上限時間。#364)",
     "with_ci": "true | false",
+    "g_budget_seconds": "int (G の探索予算。既定 3600)",
+    "i_device": "cpu | gpu (I の証拠種別の申告)",
     "cargo_offline": "true | false (A を含まなければ true)"
   },
   "items": {
     "A": { "status": "ok" | "failed" | "not_run", ... },
     "B": { "status": "ok" | "failed" | "not_run", ... },
     ...
-    "F": { "status": "ok" | "failed" | "not_run", ... }
+    "F": { "status": "ok" | "failed" | "not_run", ... },
+    "G": { "status": "ok" | "failed" | "not_run", ... },
+    "H": { "status": "ok" | "failed" | "not_run", ... },
+    "I": { "status": "ok" | "failed" | "not_run", ... },
+    "J": { "status": "ok" | "failed" | "not_run", ... }
   }
 }
 ```
 
-各項目の詳細フィールドは §4-A 〜 §4-F 参照。記録の文字列の欄は許可リスト方式で組み立てられ、語彙外の値は `<unexpected>`・`<unrecognized>`・`<redacted>`、型が違う欄は `null` になる（§7）。`schema` は `real-machine-check/1` のまま。`not_run` 項目の `reason` は：
+各項目の詳細フィールドは §4-A 〜 §4-J 参照。記録の文字列の欄は許可リスト方式で組み立てられ、語彙外の値は `<unexpected>`・`<unrecognized>`・`<redacted>`、型が違う欄は `null` になる（§7）。`schema` は `real-machine-check/1` のまま。`not_run` 項目の `reason` は：
 
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
@@ -542,10 +638,19 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 1 度の実行（PC・コミット・条件）ごとに 1 行を追加します。
 
-| 日付・機種・OS・コミット | 実行方法 | 全体結果 | A | B | C-1 | C-2 | D | E | F | 証拠種別 | 記録先 |
-| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-| 2026-10-04〜05 / Mac16,6（Apple M4 Max）・64 GiB / macOS 27.0（26A428） / 132a7da | 手動コマンド（スクリプト未使用） | 全項目成功 | ok | ok | ok | ok | ok | ok | ok（再発なし） | 実機（項目別注記あり） | #354 |
-| 2026-10-05 / Mac16,6（Apple M4 Max）・64 GiB / macOS 27.0（26A428） / 62e52da | スクリプト（`--items A,B,C,D,E,F --with-ci --repeat 50`。`--quiet-machine` なし） | 全項目成功（exit 0） | ok | ok | ok（p95 は参考値） | ok | ok | ok | ok（50 / 50） | 実機（項目別注記あり） | #354 |
+| 日付・機種・OS・コミット | 実行方法 | 全体結果 | A | B | C-1 | C-2 | D | E | F | G | H | I | J | 証拠種別 | 記録先 |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| 2026-10-04〜05 / Mac16,6（Apple M4 Max）・64 GiB / macOS 27.0（26A428） / 132a7da | 手動コマンド（スクリプト未使用） | 全項目成功 | ok | ok | ok | ok | ok | ok | ok（再発なし） | 未実施 | 未実施 | 未実施 | 未実施 | 実機（項目別注記あり） | #354 |
+| 2026-10-05 / Mac16,6（Apple M4 Max）・64 GiB / macOS 27.0（26A428） / 62e52da | スクリプト（`--items A,B,C,D,E,F --with-ci --repeat 50`。`--quiet-machine` なし） | 全項目成功（exit 0） | ok | ok | ok（p95 は参考値） | ok | ok | ok | ok（50 / 50） | 未実施 | 未実施 | 未実施 | 未実施 | 実機（項目別注記あり） | #354 |
+
+G〜J の記録欄（人が実行した結果を記入する。スクリプトの `record.json` の値を転記し、証拠種別は人が確認して書く）:
+
+| 項目 | 記入する内容 |
+| ---- | ------------ |
+| G | `outcome`（`evaluated` / `budget_exhausted`）・`--g-budget-seconds` の値・`budget_reached`・各候補の `result`（`kind` つき）・`total_elapsed_ms` |
+| H | `cancel_check`（応答・train の終了コード・`state`・`descendants_observed` / `descendants_remaining`・`package_absent`）・`crash_check`（train の終了コード・`state`・`cause`・`descendants_remaining`） |
+| I | `evidence`（`cpu_real_machine` / `gpu_real_machine_declared`）・`reproducibility.verdict`・`runs`（seed ごとの `correct` / `total`）・`disjoint_pairs`・`comparison.counts`（回帰・改善の件数）。再現性・回帰の解釈（人の判断）を別に書く |
+| J | `version_number` / `previous_version_number`・復帰・最新版・`--version-id` 単独・改変の各結果 |
 
 ## 10. 1 件目の詳細（2026-10-04〜05、コミット 132a7da）
 
