@@ -127,7 +127,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・CI 構成（有効化条件）・実機前提テストの扱い |
 | [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook の時間予算・CI と重複する検査を置かない方針・明示的な例外（承認台帳の照合等） |
 | [makefile.md](.claude/rules/makefile.md) | **リポ固有**: Makefile は薄い入口・scripts/ 規約・ターゲット追加手順・check / fix / clean の契約 |
-| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針・必須チェック名の維持・発火条件と paths の書き方・ジョブ追加チェックリスト・所要時間の実測 |
+| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針・必須チェック名の維持・発火条件と paths の書き方・ジョブ追加チェックリスト・キャッシュ方針（上限 10GB・キー設計・保存条件）・所要時間の実測 |
 
 ## Current Skills
 
