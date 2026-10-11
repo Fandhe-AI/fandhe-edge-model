@@ -145,9 +145,13 @@ jobs:
           components: clippy
       # 依存クレートのビルド成果物を再利用する（rust-ci 側は reusable workflow の cache で同様）。
       # key は OS ごとに分離される。第三者 action のため SHA 固定（v2.8.1）
+      # 保存は main の push のみ（PR は main のキャッシュを復元するだけ）。PR で保存すると
+      # refs/pull/<n>/merge スコープに同内容の複製（3 OS で約 108MB）が残り、10GB 上限の
+      # LRU で main のキャッシュを追い出す原因になる（.claude/rules/github-actions.md「キャッシュ方針」）
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
         with:
           prefix-key: fandhe-edge-model-default-features
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
