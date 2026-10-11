@@ -61,13 +61,60 @@ description: >
 4. `actions/checkout` は `fetch-depth: 1`・`persist-credentials: false`（履歴が要るときだけ深くする）。submodule は取得しない
    （`docs/spec` は private）
 5. キャッシュ: Rust は reusable workflow の `cache` か `Swatinem/rust-cache`（SHA 固定）。`python-ci.yml` は意図的に
-   キャッシュ無効（汚染回避）なので変えない
+   キャッシュ無効（汚染回避）なので変えない。キーの設計・保存条件は下の「キャッシュ方針」に従う
 6. サードパーティ action はコミット SHA で固定する（`Fandhe-AI/actions` のみ `@latest`）。`permissions` は最小権限・
    `timeout-minutes` を設定し、`${{ }}` は `run` に直接埋め込まず `env` 経由（[ci](./ci.md)）
 7. 処理は Makefile / `scripts/` の共通コマンドを呼ぶ。CI 独自のロジックを `run:` に長く書かない（[makefile](./makefile.md)）
 8. lefthook と同じ検査を二重に置かない（[git-hooks](./git-hooks.md)）。重い検査の正は CI 側
 9. 変更後に `actionlint .github/workflows/*.yml` を通す（`release.yml` は `inputs` を無効化中のため既存の指摘がある）。
    PR の CI で所要時間を前後比較する
+
+## キャッシュ方針
+
+- 前提: リポジトリのキャッシュ上限は 10GB（超過分は LRU で古いものから追い出し、7 日間アクセスの無いものは削除）。
+  上限超過分の課金は Org の Actions 予算 $10（超過で停止）に含まれるため、上限を超える前提にしない。**10GB の中でヒット率を最大化する**ことを目的にする
+- PR の実行が保存したキャッシュは `refs/pull/<n>/merge` スコープに入り、その PR 以外（main・他 PR）からは復元できない。
+  main のスコープに保存したものは全 PR から復元できる。したがって**保存は main への push のみ**とし、PR は復元だけにする
+  （`Swatinem/rust-cache` は `save-if: ${{ github.ref == 'refs/heads/main' }}`。reusable `rust-base-ci` は
+  `cache-save: ${{ github.ref == 'refs/heads/main' }}`。`actions/cache` は PR で `actions/cache/restore`、main で
+  `actions/cache` を使い分ける）。依存を変える PR の 2 回目以降の push は main の旧キーから
+  部分復元になるが、依存の変更頻度が低いため複製の容量削減を優先する
+- キーに `github.sha`・`github.run_id` 等の実行ごとに一意な値を入れない（毎回新規保存になり再利用されない）。
+  `Cargo.lock`・toolchain・OS のハッシュで決まるキーにし、ジョブ間で同一内容なら共有する
+- `hashFiles` に `**/Cargo.lock` 等の再帰 glob を使わない。`.agents/skills/make/samples/**` のサンプル lockfile（`.claude/skills` の
+  symlink 経由も）が混入し、依存が変わっていないのにスキル更新でキーが変わる。ルートの `Cargo.lock` を直接指定する（再帰が必要なら
+  `'!.agents/**'`・`'!.claude/**'` で除外する）。Rust の target をキャッシュするキーには rustc のバージョン（`rustc -vV` の
+  commit-hash 等）を含め、runner イメージ・toolchain の更新後に古い target を exact hit で復元し続けないようにする
+  （`Swatinem/rust-cache` v2.8.1 は rustc のバージョン・ルートの `Cargo.lock`・workspace メンバーの `Cargo.toml` を自動でキーに含む。
+  ただし `**/.cargo/config.toml`・`**/rust-toolchain(.toml)` は再帰 glob で拾い除外の入力も無いため、サンプルの
+  `.agents/skills/make/samples/projects/rust-workspace-xtask/.cargo/config.toml` もキーに入る。このファイルがスキル更新で
+  変わったときは 1 回だけ miss〔外部 crate の再ビルド約 20 秒〕と main への再保存〔3 OS で約 108MB〕が起きるが、許容する。
+  `.claude/skills` の symlink は辿らない）
+- キャッシュを追加・変更したら、PR と main の push の両方のログで結果を確認する:
+
+    ```bash
+    gh api --paginate "repos/Fandhe-AI/fandhe-edge-model/actions/caches?per_page=100" \
+      --jq '.actions_caches[]|[.key,.size_in_bytes,.ref,.last_accessed_at]|@tsv'   # 一覧（ref で PR 由来の複製を確認）
+    gh api repos/Fandhe-AI/fandhe-edge-model/actions/cache/usage                   # 使用量
+    gh run view <run-id> --log | grep -E "Restored from cache key|No cache found|Cache restored from key|Cache not found"
+    ```
+
+### 実測（2026-10-11）
+
+- 使用量 0.39GB / 10GB（12 件）。追い出しによる miss は無し
+- reusable `rust-ci`（Linux・macOS の clippy / test / deny）: 直近の PR・main とも全件 exact hit（14〜33MB/件、main スコープのみ）。
+  `fmt` ジョブは毎回 `Cache not found`（保存されないキーを復元しようとしている。上流 Fandhe-AI/actions 側の挙動）。
+  windows-latest は上流の既知問題で `cache: false`
+- reusable `rust-ci` の旧キー（`<prefix>-<OS>-<job>-v3-<hash>`）は `hashFiles('**/Cargo.lock')` で rustc のバージョンを含まず、
+  実測のハッシュ `bbff9d30…` はルートの `Cargo.lock` と `.agents/skills/make/samples` のサンプル 3 件の合計だった
+  （ルート単独なら `f04a779e…`）。Fandhe-AI/actions#165（`latest` = 3a41f93）でルートの `Cargo.lock` と rustc のハッシュを使う
+  `v4` キーに変わり、`cache-save` 入力が追加されたため、本リポは `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡す
+  （キー空間の切り替えで、次の main の push で一度だけ v4 キーが新規保存される）
+- `rust-ci-default-features`（`Swatinem/rust-cache`、#527 で追加）: 3 OS で 30〜43MB/件。#527 の PR 実行が PR スコープへ保存した
+  複製 3 件（約 108MB）は main から使えず、main の初回 push は 3 OS とも `No cache found` で別途保存した。
+  `save-if` 追加後（#528 の PR 実行）は 3 OS とも main のキャッシュから `full match: true` で復元し、PR スコープへの保存は 0 件。
+  ヒット時は外部 crate のビルドが 0 件になる（miss 時は 39〜47 crate・約 16〜20 秒）。復元は 3〜4 秒のため、正味の短縮は
+  1 ジョブ約 10〜15 秒。ジョブ時間（138〜494 秒）の大半はメンバー crate のビルドとテスト実行で、キャッシュでは縮まない
 
 ## 所要時間の計測
 
