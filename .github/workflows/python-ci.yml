@@ -71,22 +71,19 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # merge commit とその第 1 親（base）の差分で変更検知するため 2 を指定する
+          fetch-depth: 2
 
       # 変更ファイルが実行に影響しないものだけなら docs_only=true を出力する。
       # 判定に失敗した場合・pull_request 以外は fail-closed で false（全ステップ実行）
       - name: 変更ファイルの種別を判定する
         id: changes
         env:
-          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
         run: scripts/ci-docs-only.sh
 
       # fail-closed: `macos-14` ラベルが指す実体が将来変わっても、arm64 以外
