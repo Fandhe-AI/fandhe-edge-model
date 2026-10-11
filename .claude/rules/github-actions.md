@@ -80,6 +80,11 @@ description: >
   部分復元になるが、依存の変更頻度が低いため複製の容量削減を優先する
 - キーに `github.sha`・`github.run_id` 等の実行ごとに一意な値を入れない（毎回新規保存になり再利用されない）。
   `Cargo.lock`・toolchain・OS のハッシュで決まるキーにし、ジョブ間で同一内容なら共有する
+- `hashFiles` に `**/Cargo.lock` 等の再帰 glob を使わない。`.agents/skills/make/samples/**` のサンプル lockfile（`.claude/skills` の
+  symlink 経由も）が混入し、依存が変わっていないのにスキル更新でキーが変わる。ルートの `Cargo.lock` を直接指定する（再帰が必要なら
+  `'!.agents/**'`・`'!.claude/**'` で除外する）。Rust の target をキャッシュするキーには rustc のバージョン（`rustc -vV` の
+  commit-hash 等）を含め、runner イメージ・toolchain の更新後に古い target を exact hit で復元し続けないようにする
+  （`Swatinem/rust-cache` は rustc のバージョンと workspace の `Cargo.lock` を自動でキーに含む）
 - キャッシュを追加・変更したら、PR と main の push の両方のログで結果を確認する:
 
     ```bash
@@ -95,6 +100,9 @@ description: >
 - reusable `rust-ci`（Linux・macOS の clippy / test / deny）: 直近の PR・main とも全件 exact hit（14〜33MB/件、main スコープのみ）。
   `fmt` ジョブは毎回 `Cache not found`（保存されないキーを復元しようとしている。上流 Fandhe-AI/actions 側の挙動）。
   windows-latest は上流の既知問題で `cache: false`
+- reusable `rust-ci` のキー（`<prefix>-<OS>-<job>-v3-<hash>`）は上流で `hashFiles('**/Cargo.lock')` を使い、rustc のバージョンを
+  含まない。実測のハッシュ `bbff9d30…` はルートの `Cargo.lock` と `.agents/skills/make/samples` のサンプル 3 件の合計
+  （ルート単独なら `f04a779e…`）。修正は Fandhe-AI/actions 側で行う（本リポは `cache-key-prefix` のみ渡す）
 - `rust-ci-default-features`（`Swatinem/rust-cache`、#527 で追加）: 3 OS で 30〜43MB/件。#527 の PR 実行が PR スコープへ保存した
   複製 3 件（約 108MB）は main から使えず、main の初回 push は 3 OS とも `No cache found` で別途保存した。
   `save-if` 追加後（#528 の PR 実行）は 3 OS とも main のキャッシュから `full match: true` で復元し、PR スコープへの保存は 0 件。
