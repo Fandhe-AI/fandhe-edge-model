@@ -49,7 +49,8 @@
 //! # 除外記録（TASK-32.2・#114）
 //!
 //! [`export_exclusions_json`] は配布候補から外した構成と理由（`fandhe-edge-runtime` の
-//! `export_exclusion`）を `package`・`select` 工程（TASK-33.x。未配線）の JSON へ出す部品。
+//! `export_exclusion`）を `package`・`select` 工程の JSON へ出す部品。現行の候補には除外対象が無いため
+//! 未配線（2026-10-12 オーナー判断。REQ-41 の TASK-41.6 で再利用予定）。
 //! 入出力契約は変えず、`package` 出力への埋め込みは配線 TASK の責務。
 
 use fandhe_edge_core::definition::DefinitionError;
@@ -346,7 +347,7 @@ fn json_escape(s: &str) -> String {
 /// 配布候補の除外記録（REQ-32・TASK-32.2・#114）を `{"excluded":[...]}` へ直列化する
 /// （JSON 文字列。改行なし）。
 ///
-/// 後続の `package`・`select` 工程（TASK-33.x。未配線）が出力へ埋め込む部品。値は ASCII の
+/// `package`・`select` 工程が出力へ埋め込む部品（未配線。モジュール doc の「除外記録」）。値は ASCII の
 /// snake_case 固定リテラルと整数だけの想定だが、`load_code` は公開フィールドで任意の文字列を持てる
 /// ため、文字列値はすべて [`json_escape`] を通す（不正な JSON を作らない）。
 /// `detail`・`source`・`load_code`・`mismatched`・`total` は該当する場合だけ出し、キー順は固定。

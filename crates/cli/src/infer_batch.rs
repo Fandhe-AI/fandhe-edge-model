@@ -33,7 +33,9 @@
 //!
 //! # 実装しないもの（入出力契約の変更・後続作業。REQ-21・REQ-33）
 //!
-//! - PoC-16 の行単位エラー行（`status:"error"`）: `JudgmentStatus` の variant 追加を伴うため未実装
+//! - PoC-16 の行単位エラー行（`status:"error"`）: バッチは all-or-nothing で部分成功を返さない。
+//!   spec（REQ-28・REQ-33）は行単位のエラーを求めておらず、`JudgmentStatus` の variant 追加は
+//!   契約変更になるため実装しない（2026-10-12 オーナー判断）
 //!
 //! # 資源上限（REQ-39・暫定）
 //!
