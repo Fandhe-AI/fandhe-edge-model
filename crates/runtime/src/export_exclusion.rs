@@ -2,8 +2,11 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! 成果物・推論 SDK 層の一部。CLI の `package`・`select` 工程（TASK-33.x。未配線）が、候補構成
-//! （種類 × 推論ランタイム × 数値形式）ごとに [`screen_candidate`] を呼び、[`ExportScreening`] の
+//! 成果物・推論 SDK 層の一部。CLI の `package`・`select` 工程から呼ぶ想定の部品で、CLI からは呼んでいない。
+//! 現行の CLI は自作バックエンドだけを対象に ONNX の読み込み可否を検証し、失敗は除外でなく終了コードで
+//! 止める（fail-closed）ため、除外対象の構成が無い（2026-10-12 オーナー判断で未配線のまま。REQ-41 の
+//! TASK-41.6 で再利用予定）。呼ぶ場合は、候補構成（種類 × 推論ランタイム × 数値形式）ごとに
+//! [`screen_candidate`] を呼び、[`ExportScreening`] の
 //! `eligible` だけを配布候補に残し、`excluded` を機械可読な [`ExclusionRecord`] として出力する。
 //! JSON への直列化は CLI 側（`fandhe-edge-cli` の `output.rs`。runtime は serde を持たない）。
 //! 合否判定（[`crate::package_outcome`]）・容量（[`crate::capacity`]）は変更しない。
