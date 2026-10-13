@@ -173,7 +173,8 @@ def pretty(v: Any) -> str:
     text = json.dumps(v, ensure_ascii=False, indent=2)
     if len(text) > MAX_PRE_CHARS:
         text = text[:MAX_PRE_CHARS] + "\n…（省略）"
-    return f"<pre>{e(text)}</pre>"
+    # 整形 JSON は MAX_PRE_CHARS で切ってあるので、値 1 つの上限（e）はかけない
+    return f"<pre>{html.escape(text, quote=True)}</pre>"
 
 
 def _omitted(total: int, shown: int) -> str:

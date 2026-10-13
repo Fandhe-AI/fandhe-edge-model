@@ -228,3 +228,9 @@ def test_long_values_and_total_reads_are_bounded_req39(tmp_path: Path, monkeypat
     assert "k" * 1_001 not in h
     monkeypatch.setattr(mod, "MAX_TOTAL_READ", 10)
     assert "大きすぎるため省略" in run(root)
+
+
+def test_pretty_keeps_up_to_max_pre_chars_req35() -> None:
+    """整形 JSON は値 1 つの上限（1000 文字）ではなく MAX_PRE_CHARS まで表示する。"""
+    out = mod.pretty({"x": "y" * 5_000})
+    assert "y" * 5_000 in out
