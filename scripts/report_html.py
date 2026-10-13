@@ -209,7 +209,35 @@ def evaluation(p: Path) -> str:
         return out + render({"correct": rec.get("correct"), "total": rec.get("total")})
     if not isinstance(rep, dict):
         return pretty(rep)
-    return "".join(f"<h3>{e(k)}</h3>{render(v)}" for k, v in rep.items())
+    ab = rep.get("abstention") if isinstance(rep.get("abstention"), dict) else {}
+    cal = rep.get("calibration") if isinstance(rep.get("calibration"), dict) else {}
+    summary = {
+        "候補": rep.get("candidate"),
+        "種類": rep.get("kind"),
+        "正解 / 件数": f"{rep.get('correct')} / {rep.get('n_total')}",
+        "正解率": rep.get("accuracy"),
+        "Macro-F1": rep.get("macro_f1"),
+        "回答した割合（coverage）": ab.get("coverage"),
+        "校正の採用": cal.get("adopted"),
+    }
+    out = "<h3>要点</h3>" + render(summary)
+    # 要点に出したキーと見出しに不要なキーを除き、残りを評価器の出力のまま並べる（指標は計算しない）
+    titles = {
+        "per_label": "ラベル別",
+        "macro_f1_excluded_labels": "Macro-F1 から除いたラベル",
+        "out_of_scope_label": "対象外ラベル",
+        "type_meaning_quadrant": "型と意味",
+        "calibration": "校正",
+        "abstention": "棄権",
+        "comparison": "旧モデルとの比較",
+        "reproducibility": "再現性",
+        "diagnostics": "診断",
+    }
+    shown = {"step", "status", "candidate", "kind", "n_total", "correct", "accuracy", "macro_f1"}
+    for k, v in rep.items():
+        if k not in shown:
+            out += f"<h3>{e(titles.get(k, k))}</h3>{render(v)}"
+    return out
 
 
 def correct_label(output: Any) -> str:
