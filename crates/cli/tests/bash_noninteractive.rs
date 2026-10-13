@@ -623,6 +623,46 @@ fn req21_mismatch_edge_cases_map_to_runtime_error_70() {
     }
 }
 
+/// 判定の対象外（exit 11・`status:"out_of_scope"`）・保留（exit 12・`status:"abstain"`）は `code` の無い
+/// 判定行のまま中継する。`status` と終了コードが対応しなければ不一致（REQ-21・REQ-34・#491）。
+#[test]
+fn req34_out_of_scope_and_abstain_judgments_are_relayed() {
+    for (name, status, rc) in [("oos", "out_of_scope", 11), ("abst", "abstain", 12)] {
+        let line =
+            format!("{{\"id\":\"input\",\"status\":\"{status}\",\"predicted_label\":\"b\"}}");
+        let o = run_with_fake_bin(name, &format!("echo '{line}'\nexit {rc}"));
+        assert_eq!(o.code, Some(rc), "{name}");
+        assert_eq!(o.stdout, format!("{line}\n"), "{name}");
+    }
+    for (name, body) in [
+        (
+            "oos_12",
+            "echo '{\"id\":\"input\",\"status\":\"out_of_scope\"}'\nexit 12",
+        ),
+        (
+            "abst_11",
+            "echo '{\"id\":\"input\",\"status\":\"abstain\"}'\nexit 11",
+        ),
+        (
+            "ok_11",
+            "echo '{\"id\":\"input\",\"status\":\"ok\"}'\nexit 11",
+        ),
+        (
+            "nested_12",
+            "echo '{\"x\":{\"status\":\"abstain\"}}'\nexit 12",
+        ),
+        (
+            "dup_11",
+            "echo '{\"status\":\"out_of_scope\",\"status\":null}'\nexit 11",
+        ),
+        ("null_12", "echo '{\"status\":null}'\nexit 12"),
+    ] {
+        let o = run_with_fake_bin(name, body);
+        assert_eq!(o.code, Some(70), "{name}");
+        assert_eq!(o.stdout, CODE_MISMATCH, "{name}");
+    }
+}
+
 /// バッチ（`--input-file`）は 1 行 1 JSON を全行検証して中継すること（REQ-33）。
 #[test]
 fn req33_batch_input_file_relays_every_line() {
