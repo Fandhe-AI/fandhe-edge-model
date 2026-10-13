@@ -33,6 +33,8 @@ MAX_ITEMS = 500  # 1 つの表・リストの行数
 MAX_COLS = 50  # 辞書の配列を表にするときの列数
 MAX_CELLS = 200_000  # レポート全体で表示する値の数（超えた分は「省略」）
 MAX_PRE_CHARS = 100_000  # 整形 JSON の表示文字数
+MAX_RECORDS = 100_000  # JSONL の行数（超えたら節ごと省略。読みながら数え、全件は溜めない）
+MAX_ENTRIES = 1_000  # ディレクトリの項目数（候補の列挙）
 
 CSS = """
 :root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--line:#ccc;--head:#eee}
@@ -83,8 +85,14 @@ def _open_under_root(path: Path, directory: bool = False) -> int:
 def list_dir(path: Path) -> list[str]:
     """`ROOT` 配下のディレクトリの名前一覧（symlink のディレクトリは辿らない）。"""
     fd = _open_under_root(path, directory=True)
+    names: list[str] = []
     try:
-        return os.listdir(fd)
+        with os.scandir(fd) as it:
+            for ent in it:
+                if len(names) >= MAX_ENTRIES:
+                    raise Skip("項目が多すぎるため省略")
+                names.append(ent.name)
+        return names
     finally:
         os.close(fd)
 
@@ -127,10 +135,18 @@ def read_json(path: Path) -> Any:
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """JSONL を行ごとに読む（壊れた行・オブジェクト以外は捨てる）。"""
     rows: list[dict[str, Any]] = []
-    for line in read_text(path).splitlines():
+    text, pos = read_text(path), 0
+    while pos < len(text):
+        end = text.find("\n", pos)
+        end = len(text) if end < 0 else end
+        line, pos = text[pos:end], end + 1
+        if not line.strip():
+            continue
+        if len(rows) >= MAX_RECORDS:  # 溜める前に件数を確かめる（REQ-39）
+            raise Skip("件数が多すぎるため省略")
         try:
             obj = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(obj, dict):
             rows.append(obj)
@@ -314,8 +330,13 @@ def evaluation(p: Path) -> str:
 
 
 def correct_label(output: Any) -> str:
-    """正解を output から取る。1 値のオブジェクトはその値、文字列はそのまま。"""
-    if isinstance(output, dict) and len(output) == 1:
+    """正解を output から取る。データ契約どおり `output.intent` を優先する（data の inspect）。
+
+    intent が無い形は、1 値のオブジェクトならその値、文字列はそのまま。
+    """
+    if isinstance(output, dict) and "intent" in output:
+        output = output["intent"]
+    elif isinstance(output, dict) and len(output) == 1:
         output = next(iter(output.values()))
     return (
         output

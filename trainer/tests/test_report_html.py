@@ -197,3 +197,21 @@ def test_report_is_private_by_default_req39(tmp_path: Path) -> None:
     root = make_project(tmp_path)
     run(root)
     assert (root / "report.html").stat().st_mode & 0o777 == 0o600
+
+
+def test_record_and_entry_counts_are_bounded_req39(tmp_path: Path, monkeypatch: Any) -> None:
+    """JSONL の行数・候補の項目数が上限を超えたら、溜め込まずに節を省略する。"""
+    root = make_project(tmp_path)
+    monkeypatch.setattr(mod, "MAX_RECORDS", 2)
+    monkeypatch.setattr(mod, "MAX_ENTRIES", 1)
+    (root / "candidates" / "1").mkdir()
+    h = run(root)
+    assert "件数が多すぎるため省略" in h
+    assert "項目が多すぎるため省略" in h
+
+
+def test_correct_label_uses_output_intent_req35() -> None:
+    """正解は output.intent（追加キーがあっても intent を使う。データ契約）。"""
+    assert mod.correct_label({"intent": "a", "note": "x"}) == "a"
+    assert mod.correct_label({"label": "b"}) == "b"
+    assert mod.correct_label("c") == "c"
