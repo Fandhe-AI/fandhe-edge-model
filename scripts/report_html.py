@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import json
 import os
 import stat
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,11 @@ MAX_BYTES = 64 * 1024 * 1024  # 1 ファイルの読み込み上限
 MAX_ROWS = 500  # 誤判定表の最大行数
 INPUT_CHARS = 200  # 入力の表示文字数
 MAX_DEPTH = 6  # 汎用表示の入れ子上限（超えたら整形 JSON）
+# 汎用表示の上限（REQ-39）。入力が 64 MiB 未満でも、表の行 × 列の掛け算で出力が膨らまないようにする
+MAX_ITEMS = 500  # 1 つの表・リストの行数
+MAX_COLS = 50  # 辞書の配列を表にするときの列数
+MAX_CELLS = 200_000  # レポート全体で表示する値の数（超えた分は「省略」）
+MAX_PRE_CHARS = 100_000  # 整形 JSON の表示文字数
 
 CSS = """
 :root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--line:#ccc;--head:#eee}
@@ -130,37 +137,58 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+# 残りの表示セル数。build_html が MAX_CELLS で初期化し、render が値ごとに減らす
+_cells_left = MAX_CELLS
+
+
 def pretty(v: Any) -> str:
-    return f"<pre>{e(json.dumps(v, ensure_ascii=False, indent=2))}</pre>"
+    text = json.dumps(v, ensure_ascii=False, indent=2)
+    if len(text) > MAX_PRE_CHARS:
+        text = text[:MAX_PRE_CHARS] + "\n…（省略）"
+    return f"<pre>{e(text)}</pre>"
+
+
+def _omitted(total: int, shown: int) -> str:
+    return f'<p class="none">{total} 件中 先頭 {shown} 件を表示</p>' if total > shown else ""
 
 
 def render(v: Any, depth: int = 0) -> str:
-    """JSON 値を汎用に表示する。未知の形・深すぎる入れ子は整形 JSON に落とす。"""
+    """JSON 値を汎用に表示する。未知の形・深すぎる入れ子は整形 JSON に落とす。
+
+    行数・列数・全体のセル数に上限を置き、超えた分は省略と明示する（REQ-39）。
+    """
+    global _cells_left
+    if _cells_left <= 0:
+        return "…（省略）"
+    _cells_left -= 1
     if depth > MAX_DEPTH:
         return pretty(v)
     if isinstance(v, dict):
         if not v:
             return "-"
-        rows = "".join(
-            f"<tr><th>{e(k)}</th><td>{render(x, depth + 1)}</td></tr>" for k, x in v.items()
-        )
-        return f"<table>{rows}</table>"
+        items = list(v.items())[:MAX_ITEMS]
+        rows = "".join(f"<tr><th>{e(k)}</th><td>{render(x, depth + 1)}</td></tr>" for k, x in items)
+        return f"<table>{rows}</table>{_omitted(len(v), len(items))}"
     if isinstance(v, list):
         if not v:
             return "-"
-        if all(isinstance(x, dict) for x in v):
+        head_items = v[:MAX_ITEMS]
+        if all(isinstance(x, dict) for x in head_items):
             cols: list[str] = []
-            for x in v:
-                cols += [k for k in x if k not in cols]
+            for x in head_items:
+                cols += [k for k in x if k not in cols][: MAX_COLS - len(cols)]
+                if len(cols) >= MAX_COLS:
+                    break
             head = "".join(f"<th>{e(c)}</th>" for c in cols)
             body = "".join(
                 "<tr>"
                 + "".join(f"<td>{render(x[c], depth + 1) if c in x else ''}</td>" for c in cols)
                 + "</tr>"
-                for x in v
+                for x in head_items
             )
-            return f"<table><tr>{head}</tr>{body}</table>"
-        return "<ul>" + "".join(f"<li>{render(x, depth + 1)}</li>" for x in v) + "</ul>"
+            return f"<table><tr>{head}</tr>{body}</table>{_omitted(len(v), len(head_items))}"
+        lis = "".join(f"<li>{render(x, depth + 1)}</li>" for x in head_items)
+        return f"<ul>{lis}</ul>{_omitted(len(v), len(head_items))}"
     return e("null" if v is None else v)
 
 
@@ -367,8 +395,9 @@ def package(p: Path) -> str:
 
 
 def build_html(p: Path, show_input: bool) -> str:
-    global ROOT
+    global ROOT, _cells_left
     ROOT = p
+    _cells_left = MAX_CELLS
     secs = [
         section("概要", lambda: overview(p)),
         section("候補と選定", lambda: candidates(p)),
@@ -402,14 +431,25 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --out must not point into the project except report.html", file=sys.stderr)
         return 64
     text = build_html(a.project, not a.no_input_text)
+    tmp = None
     try:
-        # 出力先が symlink なら辿らず失敗させる
-        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        # 既存の出力先が通常ファイルでない（symlink 等）なら書かない。既存の inode は書き換えず、
+        # 同じディレクトリの新しい一時ファイルへ書いて名前を置き換える（hardlink 先を壊さない）
+        if out.is_symlink() or (out.exists() and not out.is_file()):
+            raise OSError("output is not a regular file")
+        fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".report-", suffix=".html")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, out)
+        tmp = None
     except OSError:
         print("error: failed to write the report", file=sys.stderr)
         return 70
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
     print(out)
     return 0
 

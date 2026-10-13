@@ -171,3 +171,22 @@ def test_out_into_project_is_refused_req39(tmp_path: Path) -> None:
     before = (root / "selection_record.json").read_bytes()
     assert mod.main(["--project", str(root), "--out", str(root / "selection_record.json")]) == 64
     assert (root / "selection_record.json").read_bytes() == before
+
+
+def test_generic_tables_are_bounded_req39(tmp_path: Path) -> None:
+    """互いに異なるキーの辞書が大量にあっても、行・列・セル数の上限で出力が膨らまない。"""
+    root = make_project(tmp_path)
+    big = [{f"k{i}": i} for i in range(20000)]
+    (root / "selection_record.json").write_text(json.dumps({"x": big}), encoding="utf-8")
+    h = run(root)
+    assert len(h) < 2_000_000
+    assert "20000 件中 先頭 500 件を表示" in h
+
+
+def test_out_hardlink_does_not_truncate_the_shared_file_req39(tmp_path: Path) -> None:
+    """report.html が入力への hardlink でも入力を書き換えない（新しい inode へ置き換える）。"""
+    root = make_project(tmp_path)
+    before = (root / "definition.json").read_bytes()
+    os.link(root / "definition.json", root / "report.html")
+    run(root)
+    assert (root / "definition.json").read_bytes() == before
