@@ -4820,18 +4820,20 @@ def test_judge_cancel_response_and_cancelled_train() -> None:
     ok = {
         "step": "train",
         "status": "ok",
-        "cancellations": [{"candidate": 0, "cancel": "requested"}],
+        "cancellations": [{"candidate": mod.H_CANDIDATE, "cancel": "requested"}],
     }
     assert mod.judge_cancel_response(0, ok) is None
-    done = {**ok, "cancellations": [{"candidate": 0, "cancel": "already_finished"}]}
+    done = {**ok, "cancellations": [{"candidate": mod.H_CANDIDATE, "cancel": "already_finished"}]}
     assert mod.judge_cancel_response(0, done) == "cancel_not_requested"
+    other = {**ok, "cancellations": [{"candidate": 0, "cancel": "requested"}]}
+    assert mod.judge_cancel_response(0, other) == "cancel_not_requested"
     assert mod.judge_cancel_response(64, ok) == "cancel_response_invalid"
     assert mod.judge_cancel_response(0, None) == "cancel_response_invalid"
     train = {
         "code": "runtime_error",
         "message": "training cancelled",
         "step": "train",
-        "candidate": 0,
+        "candidate": mod.H_CANDIDATE,
         "job": {"state": "cancelled"},
         "restart": _RESTART,
     }
@@ -4852,7 +4854,7 @@ def _status(job: dict[str, Any], restart: Any = _RESTART) -> dict[str, Any]:
     return {
         "step": "train",
         "status": "ok",
-        "jobs": [{"candidate": 0, "job": job, "restart": restart}],
+        "jobs": [{"candidate": mod.H_CANDIDATE, "job": job, "restart": restart}],
     }
 
 
@@ -5126,7 +5128,7 @@ def test_kill_seen_marks_child_may_remain_when_a_survivor_cannot_be_stopped(
 
 def _driver(tmp_path: Path, mode: str, procs: dict[int, Any]) -> tuple[Any, list[tuple[int, int]]]:
     """`ps` と `os.kill` を差し替えた `JobDriver`（job.json は running）。"""
-    job = tmp_path / "project/candidates/0/job"
+    job = tmp_path / "project/candidates" / str(mod.H_CANDIDATE) / "job"
     job.mkdir(parents=True)
     (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
     (tmp_path / "steps").mkdir()
@@ -5247,7 +5249,7 @@ def test_job_driver_cancel_fails_when_the_cancel_command_output_exceeds_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REQ-39: `train --cancel` の出力が上限を超えたら子を止め `cancel_output_limit` で失敗する。"""
-    job = tmp_path / "project/candidates/0/job"
+    job = tmp_path / "project/candidates" / str(mod.H_CANDIDATE) / "job"
     job.mkdir(parents=True)
     (job / "job.json").write_text('{"state":"running"}', encoding="utf-8")
     (tmp_path / "steps").mkdir()

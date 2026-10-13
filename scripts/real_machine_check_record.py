@@ -112,6 +112,11 @@ H_WAIT_RUNNING_SEC = 120.0
 H_POLL_SEC = 0.5
 # H: 子孫の終了を待つ猶予（キャンセル猶予 15 秒の後の SIGKILL・lifeline を見込む。REQ-39）
 H_DESCENDANT_GRACE_SEC = 30.0
+# H が学習する候補と train の件数。fixture の 90 件・c1 では速い Mac（M5 で約 0.5 秒）だと
+# 監視が running を見る前に学習が終わる。c3（バイト CNN・40 epoch）は件数に比例して遅く、
+# 4000 件で M5 でも約 14 秒かかる（2026-10-13 の実測）
+H_CANDIDATE = 1
+H_TRAIN_RECORDS = 4000
 # 契約に定めのない値（自分で決めた点）: `ps`・キャンセル要求の子の上限時間
 TIMEOUT_AUX = 30
 # 子孫の確認に使う `ps`（固定の絶対パス。PATH を探さない。REQ-38・REQ-39）
@@ -2719,7 +2724,9 @@ class JobDriver:
         self.killed = False
 
     def _job_state(self) -> str | None:
-        rec = _json_file(self.cwd / "project/candidates/0/job/job.json", CAP_INPUT_FILE)
+        rec = _json_file(
+            self.cwd / "project/candidates" / str(H_CANDIDATE) / "job/job.json", CAP_INPUT_FILE
+        )
         state = rec.get("state") if isinstance(rec, dict) else None
         return state if isinstance(state, str) else None
 
@@ -2869,7 +2876,7 @@ def judge_cancel_response(rc: int | None, obj: dict[str, Any] | None) -> str | N
         return "cancel_response_invalid"
     return (
         None
-        if _eq_int(cs[0].get("candidate"), 0) and cs[0].get("cancel") == "requested"
+        if _eq_int(cs[0].get("candidate"), H_CANDIDATE) and cs[0].get("cancel") == "requested"
         else ("cancel_not_requested")
     )
 
@@ -2886,7 +2893,7 @@ def judge_cancelled_train(rc: int | None, obj: dict[str, Any] | None) -> str | N
         obj.get("code") != "runtime_error"
         or obj.get("message") != CANCELLED_MESSAGE
         or obj.get("step") != "train"
-        or not _eq_int(obj.get("candidate"), 0)
+        or not _eq_int(obj.get("candidate"), H_CANDIDATE)
         or not isinstance(job, dict)
         or job.get("state") != "cancelled"
         or not _restart_guidance_ok(obj.get("restart"))
@@ -2898,7 +2905,7 @@ def judge_cancelled_train(rc: int | None, obj: dict[str, Any] | None) -> str | N
 def judge_status(
     rc: int | None, obj: dict[str, Any] | None, *, crashed: bool
 ) -> tuple[str | None, dict[str, Any]]:
-    """`train --status --candidate 0` の判定（exit 0・`jobs[0]`。#485）。
+    """`train --status --candidate H_CANDIDATE` の判定（exit 0・`jobs[0]`。#485）。
 
     `crashed` が偽なら `state:"cancelled"`
     （`crash_detected:false`・`failure:null`・`record_updated:false`）、
@@ -2912,7 +2919,7 @@ def judge_status(
         return "status_invalid", {}
     entry = jobs[0]
     job = entry.get("job")
-    if not _eq_int(entry.get("candidate"), 0) or not isinstance(job, dict):
+    if not _eq_int(entry.get("candidate"), H_CANDIDATE) or not isinstance(job, dict):
         return "status_invalid", {}
     failure = job.get("failure")
     state = job.get("state")
@@ -2944,14 +2951,15 @@ def judge_status(
 def item_h(ctx: Ctx) -> dict[str, Any]:
     """H: `train --cancel`・`--status` とクラッシュ検出（REQ-34・REQ-39。#484・#485・#486）。
 
-    1) `train --candidate 0` を起動し、running・子孫の出現を待って別プロセスで
+    1) `train --candidate H_CANDIDATE` を起動し、running・子孫の出現を待って別プロセスで
        `train --cancel` を送る。train は exit 70・`training cancelled`、`--status` は
        `cancelled`、`package/` は無く、観測した子孫は
        CLI 自身が止めて 0 件になること（ラッパーの後始末に頼らない。`GROUP_WRAPPER_NO_REAP`）。
-    2) もう一度 `train --candidate 0`（`cancelled` は丸ごと消して新規に始まる）を起動し、
+    2) もう一度 同じ `train`（`cancelled` は丸ごと消して新規に始まる）を起動し、
        同じく running を待って CLI 本体を `SIGKILL` する。`--status` は `failed`・
        `owner_lost`（初回検出）を返すこと。
     実 trainer を使う（CPU）。残った子孫は pid を控えて KILL し、記録に件数だけ残す。
+    train は操作が間に合う長さにするため合成の `H_TRAIN_RECORDS` 件へ差し替える。
     """
     hdir = ctx.work / "H"
     if not stage_inputs(ctx, hdir, None):
@@ -2959,13 +2967,34 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
     facts = read_facts(hdir)
     if facts is None:
         return fail_item("input_unreadable")
+    ids = facts.option_ids
+    write_text_nofollow(
+        hdir / "train.jsonl",
+        "".join(
+            json.dumps(
+                {
+                    "id": f"h-{i}",
+                    "input": f"{ids[i % len(ids)]} sample {i}",
+                    "output": {"intent": ids[i % len(ids)]},
+                    "group_id": f"hg-{i}",
+                }
+            )
+            + "\n"
+            for i in range(H_TRAIN_RECORDS)
+        ),
+    )
+    facts = read_facts(hdir)
+    if facts is None:
+        return fail_item("input_unreadable")
     logs, steps = hdir / "steps", []
     failure = prepare_project(ctx, hdir, facts, logs, steps)
     if failure:
         return dict(failure, steps=steps)
-    train_argv = ["train", "--project-dir", "project", "--candidate", "0"]
-    status_argv = ["train", "--project-dir", "project", "--status", "--candidate", "0"]
-    status_cmd = "train --project-dir project --status --candidate 0"
+    cand = str(H_CANDIDATE)
+    train_argv = ["train", "--project-dir", "project", "--candidate", cand]
+    train_cmd = f"train --project-dir project --candidate {cand}"
+    status_argv = ["train", "--project-dir", "project", "--status", "--candidate", cand]
+    status_cmd = f"train --project-dir project --status --candidate {cand}"
 
     # 1) キャンセル
     drv = JobDriver(ctx, hdir, "cancel")
@@ -2973,13 +3002,16 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
         drv,
         lambda: go_step(
             ctx, hdir, logs, steps, "train", "train-cancelled", train_argv,
-            "train --project-dir project --candidate 0", during=drv, reap_group=False,
+            train_cmd, during=drv, reap_group=False,
         ),
     )  # fmt: skip
     if drv.error is not None or failure is not None:
         return dict(failure or fail_item(drv.error or "driver_error", step="train"), steps=steps)
     if drv.timed_out:
         return fail_item("job_not_running", step="train", steps=steps)
+    if not drv.done:
+        # running とワーカーを観測する前に train が終わった（キャンセルを送っていない）
+        return fail_item("job_finished_before_cancel", step="train", exit_code=rc, steps=steps)
     cancel_obj = parse_json_object(logs / "cancel.stdout", CAP_CLI_STDOUT)
     for reason in (
         judge_cancel_response(drv.cancel_rc, cancel_obj),
@@ -3022,7 +3054,7 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
         drv2,
         lambda: go_step(
             ctx, hdir, logs, steps, "train", "train-killed", train_argv,
-            "train --project-dir project --candidate 0", during=drv2, reap_group=False,
+            train_cmd, during=drv2, reap_group=False,
         ),
     )  # fmt: skip
     # KILL された train は JSON を出さない（invalid_json）のが正常。実行できなかった等だけ失敗にする
@@ -3031,6 +3063,8 @@ def item_h(ctx: Ctx) -> dict[str, Any]:
             failure or fail_item(drv2.error or "driver_error", step="train"),
             steps=steps,
         )
+    if not drv2.done:
+        return fail_item("job_finished_before_cancel", step="train", exit_code=rc2, steps=steps)
     if drv2.timed_out or not drv2.killed:
         return fail_item("job_not_running", step="train", steps=steps)
     if leftover2:
