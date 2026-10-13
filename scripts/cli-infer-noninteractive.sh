@@ -591,7 +591,11 @@ check_output() {
                 else code = hasesc ? decode(strval) : strval
                 hascode = 1
             }
-            if (depth == 0 && key == "status" && first == "\"") status = hasesc ? decode(strval) : strval
+            if (depth == 0 && key == "status") {
+                if (hasstatus || first != "\"") statusbad = 1
+                else status = hasesc ? decode(strval) : strval
+                hasstatus = 1
+            }
             skipws()
             c = substr(s, pos, 1)
             if (c == ",") { pos++; continue }
@@ -619,7 +623,7 @@ check_output() {
     {
         lines++
         if (!batch && lines > 1) syntax = 1
-        s = $0; n = length(s); pos = 1; code = ""; hascode = 0; codebad = 0; status = ""
+        s = $0; n = length(s); pos = 1; code = ""; hascode = 0; codebad = 0; status = ""; hasstatus = 0; statusbad = 0
         skipws()
         if (substr(s, pos, 1) != "{" || !pvalue(0)) { syntax = 1; next }
         skipws()
@@ -630,9 +634,9 @@ check_output() {
         } else if (hascode) {
             if (codebad || code != expect) mismatch = 1
         } else if (rc == 11) {
-            if (status != "out_of_scope") mismatch = 1
+            if (statusbad || status != "out_of_scope") mismatch = 1
         } else if (rc == 12) {
-            if (status != "abstain") mismatch = 1
+            if (statusbad || status != "abstain") mismatch = 1
         } else if (rc != 0) {
             mismatch = 1
         }

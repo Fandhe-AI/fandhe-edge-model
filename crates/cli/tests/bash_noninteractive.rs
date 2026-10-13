@@ -651,6 +651,11 @@ fn req34_out_of_scope_and_abstain_judgments_are_relayed() {
             "nested_12",
             "echo '{\"x\":{\"status\":\"abstain\"}}'\nexit 12",
         ),
+        (
+            "dup_11",
+            "echo '{\"status\":\"out_of_scope\",\"status\":null}'\nexit 11",
+        ),
+        ("null_12", "echo '{\"status\":null}'\nexit 12"),
     ] {
         let o = run_with_fake_bin(name, body);
         assert_eq!(o.code, Some(70), "{name}");

@@ -17,6 +17,7 @@ Claude Code などの実クライアントへ登録し、MCP 経由で `infer` �
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -104,8 +105,7 @@ def handle(msg: Any) -> dict[str, Any] | None:
     if "id" not in msg:
         return None
     mid, method, params = msg["id"], msg["method"], msg.get("params")
-    # JSON-RPC の id は文字列・数値・null。入れ子の値を応答へ写さない
-    if mid is not None and (isinstance(mid, bool) or not isinstance(mid, (str, int, float))):
+    if not _valid_id(mid):
         return _error(None, -32600, "invalid request")
     if method == "initialize":
         asked = params.get("protocolVersion") if isinstance(params, dict) else None
@@ -127,6 +127,17 @@ def handle(msg: Any) -> dict[str, Any] | None:
             return _error(mid, -32602, "unknown tool")
         return _ok(mid, call_infer(params.get("arguments")))
     return _error(mid, -32601, "method not found")
+
+
+def _valid_id(mid: Any) -> bool:
+    """JSON-RPC の id は文字列・有限の数値・null。入れ子や Infinity を応答へ写さない。"""
+    if mid is None or (isinstance(mid, (str, int)) and not isinstance(mid, bool)):
+        return True
+    return isinstance(mid, float) and math.isfinite(mid)
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(name)
 
 
 def _ok(mid: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -151,7 +162,8 @@ def main() -> None:
             continue
         else:
             try:
-                msg = json.loads(line)
+                # NaN・Infinity は JSON の値ではない（1e999 は id の検査で拒否する）
+                msg = json.loads(line, parse_constant=_reject_constant)
             except (ValueError, RecursionError):
                 # RecursionError は深い入れ子（1 行の上限内でも起こる）。落ちずに拒否する
                 reply = _error(None, -32700, "parse error")
@@ -160,11 +172,10 @@ def main() -> None:
                     reply = handle(msg)
                 except Exception:  # 1 要求の失敗でサーバーを止めない。id を保って返す
                     mid = msg.get("id") if isinstance(msg, dict) else None
-                    ok_id = mid is None or isinstance(mid, (str, int, float))
-                    reply = _error(mid if ok_id else None, -32603, "internal error")
+                    reply = _error(mid if _valid_id(mid) else None, -32603, "internal error")
         if reply is not None:
             # ensure_ascii（既定）で単独サロゲートも \\uXXXX にエスケープし、書き込みで落とさない
-            stdout.write(json.dumps(reply) + "\n")
+            stdout.write(json.dumps(reply, allow_nan=False) + "\n")
             stdout.flush()
         if len(line) > MAX_LINE_BYTES:
             return

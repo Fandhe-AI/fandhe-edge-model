@@ -86,6 +86,8 @@ def test_req39_malformed_requests_do_not_stop_the_server() -> None:
         "null",
         '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"infer",'
         '"arguments":{"package":"p","text":"a\\u0000b"}}}',
+        '{"jsonrpc":"2.0","id":1e999,"method":"ping"}',
+        '{"jsonrpc":"2.0","id":NaN,"method":"ping"}',
         '{"jsonrpc":"2.0","id":8,"method":"ping"}',
     ]
     out = subprocess.run(  # noqa: S603  固定の引数
@@ -97,11 +99,13 @@ def test_req39_malformed_requests_do_not_stop_the_server() -> None:
         check=True,
     ).stdout
     replies = [json.loads(line) for line in out.splitlines()]
-    assert [r.get("id") for r in replies] == [None, "\ud800", None, None, 7, 8]
+    assert [r.get("id") for r in replies] == [None, "\ud800", None, None, 7, None, None, 8]
     assert replies[0]["error"]["code"] == -32700
     assert replies[1]["result"] == {}
     assert replies[2]["error"]["code"] == -32600
     assert replies[3]["error"]["code"] == -32600
     assert replies[4]["result"]["isError"] is True
     assert "invalid characters" in replies[4]["result"]["content"][0]["text"]
-    assert replies[5]["result"] == {}
+    assert replies[5]["error"]["code"] == -32600
+    assert replies[6]["error"]["code"] == -32700
+    assert replies[7]["result"] == {}
