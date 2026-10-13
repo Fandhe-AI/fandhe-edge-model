@@ -215,3 +215,16 @@ def test_correct_label_uses_output_intent_req35() -> None:
     assert mod.correct_label({"intent": "a", "note": "x"}) == "a"
     assert mod.correct_label({"label": "b"}) == "b"
     assert mod.correct_label("c") == "c"
+
+
+def test_long_values_and_total_reads_are_bounded_req39(tmp_path: Path, monkeypatch: Any) -> None:
+    """長い値は切り詰め、実行全体の読み込み量が上限を超えたら残りの節は省略する。"""
+    root = make_project(tmp_path)
+    (root / "candidates" / "0" / "result.json").write_text(
+        json.dumps({"status": "ok", "artifact": {"kind": "k" * 50_000}}), encoding="utf-8"
+    )
+    h = run(root)
+    assert "k" * 1_000 + "…" in h
+    assert "k" * 1_001 not in h
+    monkeypatch.setattr(mod, "MAX_TOTAL_READ", 10)
+    assert "大きすぎるため省略" in run(root)

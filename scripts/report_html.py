@@ -24,14 +24,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-MAX_BYTES = 64 * 1024 * 1024  # 1 ファイルの読み込み上限
+MAX_BYTES = 16 * 1024 * 1024  # JSONL 1 ファイルの読み込み上限
+# JSON 1 ファイルの上限。一括で解析するため JSONL より小さくし、解析後のオブジェクト数も抑える
+MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_ROWS = 500  # 誤判定表の最大行数
 INPUT_CHARS = 200  # 入力の表示文字数
 MAX_DEPTH = 6  # 汎用表示の入れ子上限（超えたら整形 JSON）
 # 汎用表示の上限（REQ-39）。入力が 64 MiB 未満でも、表の行 × 列の掛け算で出力が膨らまないようにする
 MAX_ITEMS = 500  # 1 つの表・リストの行数
 MAX_COLS = 50  # 辞書の配列を表にするときの列数
-MAX_CELLS = 200_000  # レポート全体で表示する値の数（超えた分は「省略」）
+MAX_CELLS = 50_000  # レポート全体で表示する値の数（超えた分は「省略」）
+MAX_VALUE_CHARS = 1_000  # 1 つの値の表示文字数（超えた分は「…」）
+MAX_TOTAL_READ = 64 * 1024 * 1024  # 1 回の実行で読む合計バイト数
+MAX_SECTION_CHARS = 16 * 1024 * 1024  # 1 節の HTML の文字数（超えたら節ごと省略）
 MAX_PRE_CHARS = 100_000  # 整形 JSON の表示文字数
 MAX_RECORDS = 100_000  # JSONL の行数（超えたら節ごと省略。読みながら数え、全件は溜めない）
 MAX_ENTRIES = 1_000  # ディレクトリの項目数（候補の列挙）
@@ -53,8 +58,11 @@ class Skip(Exception):
 
 
 def e(v: Any) -> str:
-    """全ての値を通す HTML エスケープ。"""
-    return html.escape(str(v), quote=True)
+    """全ての値を通す HTML エスケープ。長すぎる値は切り詰める（REQ-39）。"""
+    t = str(v)
+    if len(t) > MAX_VALUE_CHARS:
+        t = t[:MAX_VALUE_CHARS] + "…"
+    return html.escape(t, quote=True)
 
 
 # 読み込みの起点（--project）。build_html が設定する。読み込みはすべてこの配下に閉じ込める（REQ-39）
@@ -97,7 +105,7 @@ def list_dir(path: Path) -> list[str]:
         os.close(fd)
 
 
-def read_text(path: Path) -> str:
+def read_text(path: Path, max_bytes: int = MAX_BYTES) -> str:
     """上限つきで読む。無い・通常ファイルでない・壊れている・大きすぎるは Skip。"""
     try:
         fd = _open_under_root(path)
@@ -106,14 +114,17 @@ def read_text(path: Path) -> str:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise Skip("なし")
+        global _read_left
+        limit = min(max_bytes, _read_left)  # 1 ファイルと実行全体の両方の上限
         chunks, size = [], 0
-        while size <= MAX_BYTES:  # 確認後に伸びても上限 + 1 バイトまでしか読まない
-            b = os.read(fd, min(1 << 20, MAX_BYTES + 1 - size))
+        while size <= limit:  # 確認後に伸びても上限 + 1 バイトまでしか読まない
+            b = os.read(fd, min(1 << 20, limit + 1 - size))
             if not b:
                 break
             chunks.append(b)
             size += len(b)
-        if size > MAX_BYTES:
+        _read_left -= size
+        if size > limit:
             raise Skip("大きすぎるため省略")
         return b"".join(chunks).decode("utf-8")
     except UnicodeDecodeError:
@@ -127,7 +138,7 @@ def read_text(path: Path) -> str:
 def read_json(path: Path) -> Any:
     """JSON ファイルを読む。"""
     try:
-        return json.loads(read_text(path))
+        return json.loads(read_text(path, MAX_JSON_BYTES))
     except ValueError:
         raise Skip("なし") from None
 
@@ -153,8 +164,9 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-# 残りの表示セル数。build_html が MAX_CELLS で初期化し、render が値ごとに減らす
+# 残りの表示セル数・読み込みバイト数。build_html が初期化し、render・read_text が減らす
 _cells_left = MAX_CELLS
+_read_left = MAX_TOTAL_READ
 
 
 def pretty(v: Any) -> str:
@@ -216,6 +228,8 @@ def section(title: str, build: Callable[[], str]) -> str:
         body = f'<p class="none">{e(s)}</p>'
     except Exception:  # 想定外の形でも他の節を止めない
         body = '<p class="none">なし</p>'
+    if len(body) > MAX_SECTION_CHARS:
+        body = '<p class="none">大きすぎるため省略</p>'
     return f"<h2>{e(title)}</h2>{body}"
 
 
@@ -270,9 +284,10 @@ def candidates(p: Path) -> str:
             rows.append(
                 {
                     "candidate": d.name,
-                    "status": r.get("status"),
-                    "kind": a.get("kind"),
-                    "kind_version": a.get("kind_version"),
+                    # 保持する前に短くする（表示用の値だけを持つ。REQ-39）
+                    "status": str(r.get("status"))[: MAX_VALUE_CHARS + 1],
+                    "kind": str(a.get("kind"))[: MAX_VALUE_CHARS + 1],
+                    "kind_version": str(a.get("kind_version"))[: MAX_VALUE_CHARS + 1],
                 }
             )
         except Skip:
@@ -416,9 +431,10 @@ def package(p: Path) -> str:
 
 
 def build_html(p: Path, show_input: bool) -> str:
-    global ROOT, _cells_left
+    global ROOT, _cells_left, _read_left
     ROOT = p
     _cells_left = MAX_CELLS
+    _read_left = MAX_TOTAL_READ
     secs = [
         section("概要", lambda: overview(p)),
         section("候補と選定", lambda: candidates(p)),
