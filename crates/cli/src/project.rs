@@ -88,6 +88,8 @@ pub const FINAL_TEST_LEDGER_DIR: &str = "final_test_ledger";
 pub const EVALUATION_RECORD_FILE: &str = "evaluation_record.json";
 /// 評価データの 1 件ごとの予測（`evaluate` が評価記録と同じ候補ディレクトリへ保存する JSONL。REQ-27・#445）。
 pub const EVALUATION_PREDICTIONS_FILE: &str = "evaluation_predictions.jsonl";
+/// `evaluate` の stdout の JSON と同一の内容（成功時のみ。閲覧用レポートが読む。REQ-33・REQ-35）。
+pub const EVALUATION_REPORT_FILE: &str = "evaluation_report.json";
 /// 選定記録のファイル名。
 pub const SELECTION_FILE: &str = "selection_record.json";
 /// 全候補が容量超過で除外された `select` の除外結果（内部記録。他工程は読まない。#125）。

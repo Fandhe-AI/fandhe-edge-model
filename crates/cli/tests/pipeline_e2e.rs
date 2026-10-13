@@ -322,6 +322,11 @@ mod suite {
             env.ok(&["evaluate", "--project-dir", "proj", "--candidate", "0"]),
             "{\"step\":\"evaluate\",\"status\":\"skipped\",\"reason\":\"evaluation_data_not_defined\"}\n"
         );
+        // REQ-33・REQ-35: skipped では結果 JSON を保存しない。
+        assert!(
+            !env.project_file("candidates/0/evaluation_report.json")
+                .exists()
+        );
         // c3（先頭の語で予測する偽ワーカー）が c1（常に alpha）より validation 正解率が高い。
         assert_eq!(
             env.ok(&["select", "--project-dir", "proj"]),
@@ -4085,6 +4090,10 @@ mod suite {
             number_field(&out, "correct").to_bits(),
             f64::to_bits(matched)
         );
+        // REQ-33・REQ-35: 結果 JSON は stdout と同一バイトで保存される。
+        let saved =
+            std::fs::read(env.project_file("candidates/1/evaluation_report.json")).expect("report");
+        assert_eq!(saved, out.as_bytes());
         // 既存なら上書きしない（評価記録と同じく 1 回限り）。
         env.fails(&EVALUATE_1, 64, "invalid_input");
         // 評価記録の `predictions_sha256` は予測ファイルの実 sha256（#445・REQ-27）。
