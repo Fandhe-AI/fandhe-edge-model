@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -85,7 +86,7 @@ def run(root: Path, *extra: str) -> str:
 
 
 def test_all_sections_and_mistakes_req35(tmp_path: Path) -> None:
-    """全節が出て、誤判定は e2 だけ・e3 は保留表に出る。"""
+    """全節が出て、誤判定は e2 だけ・e3 は予測できなかった行の表に出る。"""
     h = run(make_project(tmp_path))
     for t in (
         "概要",
@@ -99,7 +100,7 @@ def test_all_sections_and_mistakes_req35(tmp_path: Path) -> None:
         "validation_correct",
     ):
         assert t in h
-    wrong, held = h.split("保留・対象外")
+    wrong, held = h.split("予測できなかった行")
     wrong = wrong.split("不一致")[1]
     assert "e2" in wrong
     assert "b: 0.700, a: 0.200, c: 0.100" in wrong
@@ -134,5 +135,39 @@ def test_out_symlink_not_followed_req39(tmp_path: Path) -> None:
     target.write_text("keep")
     link = tmp_path / "l.html"
     link.symlink_to(target)
-    assert mod.main(["--project", str(tmp_path), "--out", str(link)]) == 70
+    (tmp_path / "p").mkdir()
+    assert mod.main(["--project", str(tmp_path / "p"), "--out", str(link)]) == 70
     assert target.read_text() == "keep"
+
+
+def test_reads_stay_inside_the_project_req39(tmp_path: Path) -> None:
+    """symlink でプロジェクト外を指すファイル・候補ディレクトリは読まない（経路の閉じ込め）。"""
+    root = make_project(tmp_path / "p")
+    outside = tmp_path / "outside"
+    (outside / "9").mkdir(parents=True)
+    (outside / "secret.json").write_text(json.dumps({"kind": "LEAKED"}), encoding="utf-8")
+    (outside / "9" / "result.json").write_text(json.dumps({"status": "LEAKED2"}), encoding="utf-8")
+    art = root / "package" / "artifact.json"
+    art.unlink()
+    art.symlink_to(outside / "secret.json")
+    (root / "candidates" / "9").symlink_to(outside / "9")
+    h = run(root)
+    assert "LEAKED" not in h
+    assert "artifact.json: なし" in h
+
+
+def test_fifo_input_does_not_hang_req39(tmp_path: Path) -> None:
+    """通常ファイルでない入力（FIFO）は開いても待たず「なし」になる（資源の上限）。"""
+    root = make_project(tmp_path)
+    (root / "definition.json").unlink()
+    os.mkfifo(root / "definition.json")
+    h = run(root)
+    assert "definition.json: なし" in h
+
+
+def test_out_into_project_is_refused_req39(tmp_path: Path) -> None:
+    """--out にプロジェクトの入力（report.html 以外）を指定したら 64 で拒否し、上書きしない。"""
+    root = make_project(tmp_path)
+    before = (root / "selection_record.json").read_bytes()
+    assert mod.main(["--project", str(root), "--out", str(root / "selection_record.json")]) == 64
+    assert (root / "selection_record.json").read_bytes() == before

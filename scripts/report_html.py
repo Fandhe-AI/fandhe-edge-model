@@ -16,6 +16,7 @@ import argparse
 import html
 import json
 import os
+import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -47,16 +48,65 @@ def e(v: Any) -> str:
     return html.escape(str(v), quote=True)
 
 
-def read_text(path: Path) -> str:
-    """上限つきで読む。無い・壊れている・大きすぎるは Skip。"""
+# 読み込みの起点（--project）。build_html が設定する。読み込みはすべてこの配下に閉じ込める（REQ-39）
+ROOT = Path(".")
+
+
+def _open_under_root(path: Path, directory: bool = False) -> int:
+    """`ROOT` 配下の `path` を、途中も含めて symlink を辿らずに開いた fd を返す。
+
+    ルート外・`..`・symlink は OSError（呼び出し側で「なし」）。FIFO で止まらないよう
+    O_NONBLOCK で開き、通常ファイルかどうかは呼び出し側が fstat で確かめる。
+    """
+    parts = path.relative_to(ROOT).parts
+    if not parts or any(x in ("..", ".") for x in parts):
+        raise OSError("outside of the project")
+    fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        if path.stat().st_size > MAX_BYTES:
-            raise Skip("大きすぎるため省略")
-        return path.read_text(encoding="utf-8")
-    except Skip:
-        raise
-    except (OSError, UnicodeDecodeError):
+        for name in parts[:-1]:
+            nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        last = os.O_DIRECTORY if directory else os.O_NONBLOCK
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | last, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def list_dir(path: Path) -> list[str]:
+    """`ROOT` 配下のディレクトリの名前一覧（symlink のディレクトリは辿らない）。"""
+    fd = _open_under_root(path, directory=True)
+    try:
+        return os.listdir(fd)
+    finally:
+        os.close(fd)
+
+
+def read_text(path: Path) -> str:
+    """上限つきで読む。無い・通常ファイルでない・壊れている・大きすぎるは Skip。"""
+    try:
+        fd = _open_under_root(path)
+    except (OSError, ValueError):
         raise Skip("なし") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Skip("なし")
+        chunks, size = [], 0
+        while size <= MAX_BYTES:  # 確認後に伸びても上限 + 1 バイトまでしか読まない
+            b = os.read(fd, min(1 << 20, MAX_BYTES + 1 - size))
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+        if size > MAX_BYTES:
+            raise Skip("大きすぎるため省略")
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise Skip("なし") from None
+    except OSError:
+        raise Skip("なし") from None
+    finally:
+        os.close(fd)
 
 
 def read_json(path: Path) -> Any:
@@ -69,23 +119,15 @@ def read_json(path: Path) -> Any:
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """JSONL を行ごとに読む（壊れた行・オブジェクト以外は捨てる）。"""
-    try:
-        if path.stat().st_size > MAX_BYTES:
-            raise Skip("大きすぎるため省略")
-        rows: list[dict[str, Any]] = []
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict):
-                    rows.append(obj)
-        return rows
-    except Skip:
-        raise
-    except (OSError, UnicodeDecodeError):
-        raise Skip("なし") from None
+    rows: list[dict[str, Any]] = []
+    for line in read_text(path).splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
 
 
 def pretty(v: Any) -> str:
@@ -168,11 +210,14 @@ def selected_index(p: Path) -> int | None:
 def candidates(p: Path) -> str:
     rows = []
     try:
-        dirs = sorted(
-            (p / "candidates").iterdir(),
-            key=lambda x: (not x.name.isdigit(), int(x.name) if x.name.isdigit() else 0, x.name),
-        )
-    except OSError:
+        dirs = [
+            p / "candidates" / n
+            for n in sorted(
+                list_dir(p / "candidates"),
+                key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else 0, x),
+            )
+        ]
+    except (OSError, ValueError):
         dirs = []
     for d in dirs:
         try:
@@ -277,6 +322,9 @@ def mistakes(p: Path, show_input: bool) -> str:
         }
         if show_input:
             row["入力"] = str(rec.get("input", ""))[:INPUT_CHARS]
+        # evaluation_predictions.jsonl は校正前の予測（status は ok・abstain・error）。
+        # 校正による保留・対象外は行ごとに保存されていない。ここで判定し直さない
+        # （評価ロジックは評価器 1 か所）
         if pr.get("status") != "ok":
             row["status"] = pr.get("status")
             held.append(row)
@@ -293,7 +341,14 @@ def mistakes(p: Path, show_input: bool) -> str:
         )
         return note + render(rows[:MAX_ROWS])
 
-    return f"<h3>不一致</h3>{table(wrong)}<h3>保留・対象外</h3>{table(held)}"
+    note = (
+        '<p class="none">校正前の予測を正解と突き合わせたもの。校正による保留・対象外の件数は'
+        "「評価」の節の「棄権」を見てください（行ごとの内訳は保存されていません）。</p>"
+    )
+    return (
+        f"{note}<h3>不一致（校正前の予測）</h3>{table(wrong)}"
+        f"<h3>予測できなかった行（abstain・error）</h3>{table(held)}"
+    )
 
 
 def package(p: Path) -> str:
@@ -312,6 +367,8 @@ def package(p: Path) -> str:
 
 
 def build_html(p: Path, show_input: bool) -> str:
+    global ROOT
+    ROOT = p
     secs = [
         section("概要", lambda: overview(p)),
         section("候補と選定", lambda: candidates(p)),
@@ -338,6 +395,12 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --project is not a directory", file=sys.stderr)
         return 64
     out = a.out or a.project / "report.html"
+    # プロジェクトは読み取りのみ。配下へ書くのは report.html だけにし、入力・成果物の上書きを防ぐ
+    proj = a.project.resolve()
+    target = out.parent.resolve() / out.name
+    if target.is_relative_to(proj) and target != proj / "report.html":
+        print("error: --out must not point into the project except report.html", file=sys.stderr)
+        return 64
     text = build_html(a.project, not a.no_input_text)
     try:
         # 出力先が symlink なら辿らず失敗させる
