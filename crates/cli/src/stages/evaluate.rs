@@ -60,6 +60,11 @@
 //! 予測ファイルは stdout の JSON・[`EvaluationRecord`] のスキーマに影響しない。書き込みは評価記録と同じ位置
 //! （台帳への完了記録の前）で行い、失敗時の扱いも同じ。
 //!
+//! # 結果 JSON の保存（REQ-33・REQ-35）
+//!
+//! 成功（`status:"ok"`）時のみ、stdout と同一バイト列を `evaluation_report.json` へ保存する（予測ファイルと
+//! 同じ流儀・位置。skipped では書かない）。凍結 test は 1 回限りで stdout を取り逃がすと出し直せないため。
+//!
 //! # 選定との順序（REQ-27）
 //!
 //! `select` の記録（`selection_record.json`）が無い・再計算と不一致・対象が選定候補でない場合は
@@ -165,8 +170,8 @@ use crate::error_report::{
 };
 use crate::infer_batch::judgment_from_prediction;
 use crate::project::{
-    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES, Project,
-    SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
+    EVALUATION_PREDICTIONS_FILE, EVALUATION_RECORD_FILE, EVALUATION_REPORT_FILE,
+    MAX_PROJECT_FILE_BYTES, Project, SELECTION_FILE, fail, inspect_bytes, invalid, runtime,
 };
 use crate::stage_output::{EvaluateStart, evaluate_start};
 
@@ -359,6 +364,12 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     // 台帳の選定固定より後に置く（選定不一致の拒否を優先する既存の挙動を変えない）。
     let predictions_rel = candidate_rel(args.candidate).join(EVALUATION_PREDICTIONS_FILE);
     if project.exists(&predictions_rel)? {
+        return Err(invalid(
+            "candidate has already been evaluated on the frozen data",
+        ));
+    }
+    // 結果 JSON の保存先も同様に、適用権を取る前に不在を確認する（REQ-33・REQ-35）。
+    if project.exists(candidate_rel(args.candidate).join(EVALUATION_REPORT_FILE))? {
         return Err(invalid(
             "candidate has already been evaluated on the frozen data",
         ));
@@ -837,6 +848,15 @@ fn finalize_evaluation(
     // 書いた後は読み取り専用にする（凍結データの配置と同じ扱い。改ざんの抑止であり、
     // 記録の封印は外部台帳〔#168〕の範囲）。
     project.set_read_only(predictions.rel)?;
+    // stdout へ書くものと同じ直列化結果（`to_json_line` + 改行）を保存する（出し直せない結果の取り逃がし防止。
+    // 閲覧用レポートが読む。REQ-33・REQ-35）。予測ファイルと同じ位置・同じ失敗の扱い。
+    let report_rel = candidate_rel(candidate).join(EVALUATION_REPORT_FILE);
+    let mut report_line = report
+        .to_json_line()
+        .map_err(|_| runtime("cannot serialize evaluation report"))?;
+    report_line.push('\n');
+    project.write_new(&report_rel, report_line.as_bytes())?;
+    project.set_read_only(&report_rel)?;
     project.write_new(record_rel, &record_json)?;
     Ok(report)
 }
