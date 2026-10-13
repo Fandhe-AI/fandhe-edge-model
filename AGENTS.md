@@ -115,6 +115,11 @@ make doctor      # 環境診断のみ（何も導入しない）
 - CLI `fandhe-edge infer` の `env -i` 下での起動確認は、`scripts/check-runtime-linkage.sh` が `infer --help` だけを `env -i PATH=/usr/bin:/bin` で起動して行う（help のみの smoke。失敗すれば D は `unexpected_exit_code`）。未追加なのは、配布パッケージを読んで推論そのものを `env -i` 下で実行する確認（別課題）。`env -i` 下の推論の確認は推論ランタイム層（`env_isolation`）に限る
 - `make check-runtime-linkage`（`scripts/check-runtime-linkage.sh`。cargo は `--locked` で起動し、CLI の場所は cargo の報告から取って `cli_bin:` の行で出す）は Mac 実機で人間が実行し、`otool -L` で Python・MLX への動的リンクが無いことと `env -i` 実行の結果を「実機」として PR に記録する（`real-machine-check` の D は stdout の後ろから見て最初の `OK: tool=` の行と `cli_bin:` の行を使う）。Linux の `ldd` の結果は補助で、Mac 実機の証拠にはならない。未実施の間は「未実施」と書く
 
+### 閲覧用 HTML レポート（REQ-35・M11）
+
+- `python3 scripts/report_html.py --project <dir> [--out <file>] [--no-input-text]`（既定の出力は `<dir>/report.html`。stdout は出力パス 1 行）。標準ライブラリのみ・通信なし・JS なし。プロジェクトは読み取りのみで、出力先の symlink は辿らない
+- 評価節は `candidates/<選ばれた候補>/evaluation_report.json` を表示するだけで、指標は計算しない（評価契約）。ファイル欠落の節は「なし」と表示して続行する。テストは `trainer/tests/test_report_html.py`
+
 ### 実行環境（uv venv）を要するテスト（issue #258）
 
 - `crates/train/tests/real_trainer.rs` は実 `trainer/`（MLX・C1/C3・ONNX 書き出し）を Rust の `run_train` から起動して学習ジョブを完走させる（REQ-18/19/34/39。証拠種別: テストハーネス・合成データ・CPU）。`make py-sync` 済みの `trainer/.venv` と MLX CPU が必要で、`rust-ci` の 3 OS runner には無いため `#[ignore]` で既定の `make test` から分離している
