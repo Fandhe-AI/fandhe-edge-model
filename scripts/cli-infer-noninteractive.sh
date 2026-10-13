@@ -29,7 +29,8 @@
 #   - JSON の `code` と終了コードの対応（0=ok・10=judged_fail・11=out_of_scope・
 #     12=pending・20=limit_exceeded・64=invalid_input・70=runtime_error。
 #     fixtures/exitcode/exit_codes.json と同一）を検証し、不一致は runtime_error(70)
-#     へ置き換える（REQ-21）。単一 JSON で `code` が無い出力は終了コード 0 のときだけ認める。
+#     へ置き換える（REQ-21）。単一 JSON で `code` が無い出力（判定結果）は終了コード 0、
+#     または判定の `status` と対応する 11（`out_of_scope`）・12（`abstain`。REQ-34・#491）のときだけ認める。
 #     バッチでは各行の `code`（あれば）が既知の名前であることと、終了コード非 0 のとき
 #     最終行の `code` が終了コードと一致することを確認する
 #   - 終了コードは CLI のもの（7 種）をそのまま返す。契約外の値・バイナリ不在・出力なしは
@@ -590,6 +591,7 @@ check_output() {
                 else code = hasesc ? decode(strval) : strval
                 hascode = 1
             }
+            if (depth == 0 && key == "status" && first == "\"") status = hasesc ? decode(strval) : strval
             skipws()
             c = substr(s, pos, 1)
             if (c == ",") { pos++; continue }
@@ -617,7 +619,7 @@ check_output() {
     {
         lines++
         if (!batch && lines > 1) syntax = 1
-        s = $0; n = length(s); pos = 1; code = ""; hascode = 0; codebad = 0
+        s = $0; n = length(s); pos = 1; code = ""; hascode = 0; codebad = 0; status = ""
         skipws()
         if (substr(s, pos, 1) != "{" || !pvalue(0)) { syntax = 1; next }
         skipws()
@@ -627,6 +629,10 @@ check_output() {
             lastok = hascode && !codebad && code == expect
         } else if (hascode) {
             if (codebad || code != expect) mismatch = 1
+        } else if (rc == 11) {
+            if (status != "out_of_scope") mismatch = 1
+        } else if (rc == 12) {
+            if (status != "abstain") mismatch = 1
         } else if (rc != 0) {
             mismatch = 1
         }
