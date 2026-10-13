@@ -348,7 +348,7 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 - **確かめること**: キャンセルの応答・train の終了コードと `message`・`--status` の状態・`package/` が生成されないこと・子孫が 0 件になること。続けて、`SIGKILL` した train の記録が `--status` で `failed`・`owner_lost` として検出されること。
 - **H の合格条件**:
   - キャンセルの応答: exit 0・`cancellations` が 1 件で `candidate` が 1・`cancel` が `requested`（`already_finished` は学習が先に終わった印で失敗。`cancel_not_requested`）
-  - キャンセルされた train: exit 70・`code:"runtime_error"`・`message` が `training cancelled`・`step:"train"`・`candidate` 0・`job.state:"cancelled"`・`restart` が `resumable:false`・`action:"restart_from_scratch"`・`reason_code:"resume_not_supported"`（`train_exit_code_not_70`・`train_output_invalid`）
+  - キャンセルされた train: exit 70・`code:"runtime_error"`・`message` が `training cancelled`・`step:"train"`・`candidate` 1・`job.state:"cancelled"`・`restart` が `resumable:false`・`action:"restart_from_scratch"`・`reason_code:"resume_not_supported"`（`train_exit_code_not_70`・`train_output_invalid`）
   - `--status --candidate 1`: exit 0・`jobs[0]` が `state:"cancelled"`・`crash_detected:false`・`failure:null`・`record_updated:false`、`restart` が同じ案内（`status_unexpected`・`status_invalid`）
   - `project/package` が存在しない（`package_created`）
   - 観測した子孫（`ps` の `ppid` を辿って求めた pid と開始時刻の組。操作の後も train の終了まで観測し続ける。ワーカーを 1 件以上観測できなければ失敗）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残ったものは、pid と開始時刻が控えと一致することを送る直前に確かめてから KILL し、件数だけを記録する。pid が再利用された別のプロセスへは送らない。中断・全体の期限の例外の経路でも同じ後始末を行い、止められなければ `child_may_remain` を立てる）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`。running とワーカーを観測する前に train が終わったら（操作を送っていない）`job_finished_before_cancel`
