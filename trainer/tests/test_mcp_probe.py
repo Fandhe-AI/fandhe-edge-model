@@ -75,3 +75,33 @@ def test_req37_infer_relays_the_cli_json_and_flags_errors(
     assert mod.call_infer({"package": "p"})["isError"] is True
     big = "x" * (mod.MAX_TEXT_BYTES + 1)
     assert "too large" in mod.call_infer({"package": "p", "text": big})["content"][0]["text"]
+
+
+def test_req39_malformed_requests_do_not_stop_the_server() -> None:
+    """深い入れ子・単独サロゲートの id・NUL・`null` の行でも落ちずに応答する（REQ-39）。"""
+    lines = [
+        "[" * 100000 + "]" * 100000,
+        '{"jsonrpc":"2.0","id":"\\ud800","method":"ping"}',
+        '{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}',
+        "null",
+        '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"infer",'
+        '"arguments":{"package":"p","text":"a\\u0000b"}}}',
+        '{"jsonrpc":"2.0","id":8,"method":"ping"}',
+    ]
+    out = subprocess.run(  # noqa: S603  固定の引数
+        [sys.executable, "-I", str(SCRIPT)],
+        input="\n".join(lines) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    ).stdout
+    replies = [json.loads(line) for line in out.splitlines()]
+    assert [r.get("id") for r in replies] == [None, "\ud800", None, None, 7, 8]
+    assert replies[0]["error"]["code"] == -32700
+    assert replies[1]["result"] == {}
+    assert replies[2]["error"]["code"] == -32600
+    assert replies[3]["error"]["code"] == -32600
+    assert replies[4]["result"]["isError"] is True
+    assert "invalid characters" in replies[4]["result"]["content"][0]["text"]
+    assert replies[5]["result"] == {}

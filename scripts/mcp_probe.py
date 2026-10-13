@@ -61,6 +61,9 @@ def call_infer(args: Any) -> dict[str, Any]:
         return _text_result(
             '{"code":"invalid_input","message":"package and text are required"}', True
         )
+    # NUL は argv に渡せず、単独サロゲートは UTF-8 にできない。どちらも入力の誤りとして返す
+    if "\x00" in package or "\x00" in text or not _utf8_ok(package) or not _utf8_ok(text):
+        return _text_result('{"code":"invalid_input","message":"invalid characters"}', True)
     if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         return _text_result('{"code":"invalid_input","message":"text too large"}', True)
     try:
@@ -78,6 +81,14 @@ def call_infer(args: Any) -> dict[str, Any]:
     return _text_result(out, proc.returncode not in JUDGED_EXIT_CODES)
 
 
+def _utf8_ok(s: str) -> bool:
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _text_result(text: str, is_error: bool) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
@@ -93,6 +104,9 @@ def handle(msg: Any) -> dict[str, Any] | None:
     if "id" not in msg:
         return None
     mid, method, params = msg["id"], msg["method"], msg.get("params")
+    # JSON-RPC の id は文字列・数値・null。入れ子の値を応答へ写さない
+    if mid is not None and (isinstance(mid, bool) or not isinstance(mid, (str, int, float))):
+        return _error(None, -32600, "invalid request")
     if method == "initialize":
         asked = params.get("protocolVersion") if isinstance(params, dict) else None
         return _ok(
@@ -137,11 +151,20 @@ def main() -> None:
             continue
         else:
             try:
-                reply = handle(json.loads(line))
-            except ValueError:
+                msg = json.loads(line)
+            except (ValueError, RecursionError):
+                # RecursionError は深い入れ子（1 行の上限内でも起こる）。落ちずに拒否する
                 reply = _error(None, -32700, "parse error")
+            else:
+                try:
+                    reply = handle(msg)
+                except Exception:  # 1 要求の失敗でサーバーを止めない。id を保って返す
+                    mid = msg.get("id") if isinstance(msg, dict) else None
+                    ok_id = mid is None or isinstance(mid, (str, int, float))
+                    reply = _error(mid if ok_id else None, -32603, "internal error")
         if reply is not None:
-            stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            # ensure_ascii（既定）で単独サロゲートも \\uXXXX にエスケープし、書き込みで落とさない
+            stdout.write(json.dumps(reply) + "\n")
             stdout.flush()
         if len(line) > MAX_LINE_BYTES:
             return
