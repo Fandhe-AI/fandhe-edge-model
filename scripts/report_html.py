@@ -440,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=".report-", suffix=".html")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.chmod(tmp, 0o644)
+        # mkstemp の 0600 のまま置く（誤判定の入力本文を含みうるため。共有するなら利用者が変える）
         os.replace(tmp, out)
         tmp = None
     except OSError:

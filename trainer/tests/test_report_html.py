@@ -190,3 +190,10 @@ def test_out_hardlink_does_not_truncate_the_shared_file_req39(tmp_path: Path) ->
     os.link(root / "definition.json", root / "report.html")
     run(root)
     assert (root / "definition.json").read_bytes() == before
+
+
+def test_report_is_private_by_default_req39(tmp_path: Path) -> None:
+    """レポートは入力本文を含みうるため、所有者だけが読める 0600 で作る。"""
+    root = make_project(tmp_path)
+    run(root)
+    assert (root / "report.html").stat().st_mode & 0o777 == 0o600
