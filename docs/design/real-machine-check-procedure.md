@@ -340,17 +340,19 @@ B で成功した `package/` に対し、学習データの入力だけ（`train
 
 新しい project（`H/project`）で `register → inspect` の後に、次の 2 つを順に行います。実 trainer（CPU）を起動し、`job.json` が running になるまで待つため、学習の立ち上がりの分だけ時間がかかります。
 
-1. **キャンセル**: `train --candidate 0` を起動し、`candidates/0/job/job.json` が `running` になり、CLI の下に学習ワーカー（コマンドラインに `launch.py` と `_worker` を持つプロセス。supervisor の `worker_argv`）が現れたら（CLI と supervisor だけの状態では送らない）、別プロセスで `train --project-dir project --cancel` を送る。
-2. **クラッシュ検出**: もう一度 `train --candidate 0`（`cancelled` の候補は丸ごと消して新規に始まる。REQ-34）を起動し、同じく running を待って train 本体の CLI プロセスへ `SIGKILL` を送る。
+学習が先に終わらないよう、train は合成の 4000 件（`H_TRAIN_RECORDS`）へ差し替え、候補は c3（`--candidate 1`。`H_CANDIDATE`）を使います。fixture の 90 件・c1 では M5 で約 0.5 秒で学習が終わり、キャンセルが間に合いませんでした（2026-10-13 の実機）。c3 は 4000 件で M5 でも約 14 秒かかります。
+
+1. **キャンセル**: `train --candidate 1` を起動し、`candidates/1/job/job.json` が `running` になり、CLI の下に学習ワーカー（コマンドラインに `launch.py` と `_worker` を持つプロセス。supervisor の `worker_argv`）が現れたら（CLI と supervisor だけの状態では送らない）、別プロセスで `train --project-dir project --cancel` を送る。
+2. **クラッシュ検出**: もう一度 `train --candidate 1`（`cancelled` の候補は丸ごと消して新規に始まる。REQ-34）を起動し、同じく running を待って train 本体の CLI プロセスへ `SIGKILL` を送る。
 
 - **確かめること**: キャンセルの応答・train の終了コードと `message`・`--status` の状態・`package/` が生成されないこと・子孫が 0 件になること。続けて、`SIGKILL` した train の記録が `--status` で `failed`・`owner_lost` として検出されること。
 - **H の合格条件**:
-  - キャンセルの応答: exit 0・`cancellations` が 1 件で `candidate` が 0・`cancel` が `requested`（`already_finished` は学習が先に終わった印で失敗。`cancel_not_requested`）
+  - キャンセルの応答: exit 0・`cancellations` が 1 件で `candidate` が 1・`cancel` が `requested`（`already_finished` は学習が先に終わった印で失敗。`cancel_not_requested`）
   - キャンセルされた train: exit 70・`code:"runtime_error"`・`message` が `training cancelled`・`step:"train"`・`candidate` 0・`job.state:"cancelled"`・`restart` が `resumable:false`・`action:"restart_from_scratch"`・`reason_code:"resume_not_supported"`（`train_exit_code_not_70`・`train_output_invalid`）
-  - `--status --candidate 0`: exit 0・`jobs[0]` が `state:"cancelled"`・`crash_detected:false`・`failure:null`・`record_updated:false`、`restart` が同じ案内（`status_unexpected`・`status_invalid`）
+  - `--status --candidate 1`: exit 0・`jobs[0]` が `state:"cancelled"`・`crash_detected:false`・`failure:null`・`record_updated:false`、`restart` が同じ案内（`status_unexpected`・`status_invalid`）
   - `project/package` が存在しない（`package_created`）
-  - 観測した子孫（`ps` の `ppid` を辿って求めた pid と開始時刻の組。操作の後も train の終了まで観測し続ける。ワーカーを 1 件以上観測できなければ失敗）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残ったものは、pid と開始時刻が控えと一致することを送る直前に確かめてから KILL し、件数だけを記録する。pid が再利用された別のプロセスへは送らない。中断・全体の期限の例外の経路でも同じ後始末を行い、止められなければ `child_may_remain` を立てる）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`
-  - クラッシュ: `SIGKILL` した train は JSON を出さない（終了コードは 137 の見込みで、記録に残す）。子孫は 30 秒以内に終わる（`descendants_remain_after_crash`）。その後の `--status --candidate 0` が exit 0・`state:"failed"`・`crash_detected:true`・`failure.kind:"crashed"`・`failure.cause:"owner_lost"`・`record_updated:true`（running の残骸を書き戻した初回）・`restart` が同じ案内
+  - 観測した子孫（`ps` の `ppid` を辿って求めた pid と開始時刻の組。操作の後も train の終了まで観測し続ける。ワーカーを 1 件以上観測できなければ失敗）が、train の終了後 30 秒以内にすべて終わる。**ラッパーの後始末（グループ KILL）を外して起動する**ため、残っていなければ CLI 自身（協調キャンセル・`SIGKILL`・supervisor の `killpg`・lifeline。REQ-39）が止めたことになる。残っていれば `descendants_remain_after_cancel`（残ったものは、pid と開始時刻が控えと一致することを送る直前に確かめてから KILL し、件数だけを記録する。pid が再利用された別のプロセスへは送らない。中断・全体の期限の例外の経路でも同じ後始末を行い、止められなければ `child_may_remain` を立てる）。観測が 2 件未満なら `no_descendant_observed`。running にならないまま 120 秒待ったら `job_not_running`。running とワーカーを観測する前に train が終わったら（操作を送っていない）`job_finished_before_cancel`
+  - クラッシュ: `SIGKILL` した train は JSON を出さない（終了コードは 137 の見込みで、記録に残す）。子孫は 30 秒以内に終わる（`descendants_remain_after_crash`）。その後の `--status --candidate 1` が exit 0・`state:"failed"`・`crash_detected:true`・`failure.kind:"crashed"`・`failure.cause:"owner_lost"`・`record_updated:true`（running の残骸を書き戻した初回）・`restart` が同じ案内
 - **失敗の理由**: 上の括弧内の語、`driver_error`・`ps_unavailable`（監視の失敗）、工程別の失敗（`step:"train"`・`case`: `train-cancelled`・`status-cancelled`・`train-killed`・`status-crashed`）
 - **記録する `record.json` フィールド**: `cancel_check`（`cancel`・`train_exit_code`・`descendants_observed`・`descendants_remaining`・`package_absent`・`state`・`restart_action`）・`crash_check`（`train_exit_code`・`descendants_observed`・`descendants_remaining`・`state`・`cause`・`restart_action`）・`steps`
 - **既知の限界**: Ctrl-C（`SIGINT`）にはハンドラを置かない契約（`owner_lost` として次の `--status` で検出）。H は `SIGKILL` で同じ状態を作る。子孫は H が起動した CLI の下だけを見る（`setsid` で別セッションへ移った孫は、`ppid` の連鎖が切れれば観測できない）
@@ -467,7 +469,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 | E | `input_unreadable`・`record_count_out_of_range`・`duplicate_id`・`unexpected_exit_code`・`unexpected_output`・`invalid_json`・`mismatch`。`e-inputs.jsonl` を書けないときは `step` なしの `spawn_error`（子の起動失敗ではない。現状の挙動で、語の見直しは別課題の候補） |
 | F | `build_failed`・`list_failed`・`no_tests_listed`・`test_failures`・`unreaped` |
 | G | `input_unreadable`・`unexpected_exit_code`・`unexpected_output`・`invalid_json`・`search_record_missing`・`candidate_result_missing`・`candidate_dir_not_cleaned`・`no_candidate_evaluated` |
-| H | `input_unreadable`・`driver_error`・`ps_unavailable`・`job_not_running`・`cancel_response_invalid`・`cancel_not_requested`・`train_exit_code_not_70`・`train_output_invalid`・`status_invalid`・`status_unexpected`・`package_created`・`no_descendant_observed`・`descendants_remain_after_cancel`・`descendants_remain_after_crash`・工程別の失敗 |
+| H | `input_unreadable`・`driver_error`・`ps_unavailable`・`job_not_running`・`job_finished_before_cancel`・`cancel_response_invalid`・`cancel_not_requested`・`train_exit_code_not_70`・`train_output_invalid`・`status_invalid`・`status_unexpected`・`package_created`・`no_descendant_observed`・`descendants_remain_after_cancel`・`descendants_remain_after_crash`・工程別の失敗 |
 | I | `input_unreadable`・`copy_failed`・`missing_field`・`reproducibility_invalid`・`comparison_invalid`・工程別の失敗 |
 | J | `previous_package_missing`・`input_unreadable`・`copy_failed`・`missing_field`・`version_invalid`・`version_ledger_invalid`・`rejection_not_64`・`unexpected_exit_code`・`unexpected_output`・工程別の失敗 |
 

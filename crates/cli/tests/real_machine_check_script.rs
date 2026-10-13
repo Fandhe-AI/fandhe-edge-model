@@ -45,7 +45,7 @@ stage=$1
 here=$(basename "$PWD")
 echo "$stage $here" >> "$FAKE_DIR/cli.log"
 # 引数の解析（G〜J の新しいオプションを含む。値は直前の引数で拾う）
-pd=project; defn=; prevdir=; ledger=; vid=; cnum=0; tseed=; budget=; pkgdir=; seed_runs=0
+pd=project; defn=; prevdir=; ledger=; vid=; cnum=0; cnum_set=; tseed=; budget=; pkgdir=; seed_runs=0
 allf=; status_f=; cancel_f=; prev=
 for a in "$@"; do
   case "$prev" in
@@ -54,7 +54,7 @@ for a in "$@"; do
     --previous-project-dir) prevdir=$a ;;
     --version-ledger) ledger=$a ;;
     --version-id) vid=$a ;;
-    --candidate) cnum=$a ;;
+    --candidate) cnum=$a; cnum_set=1 ;;
     --train-seed) tseed=$a ;;
     --budget-seconds) budget=$a ;;
     --package) pkgdir=$a ;;
@@ -103,7 +103,11 @@ register)
   mkdir -p "$pd"
   printf '{"step":"register","status":"ok","definition_sha256":"%s","options":3,"evaluation_defined":true%s}\n' "$SHA" "$extra" ;;
 inspect)
-  printf '{"step":"inspect","status":"ok","valid_records":90,"split":{"train":72,"validation":9,"test":9}%s}\n' "$extra" ;;
+  # 件数は train.jsonl の行数（H は合成の 4000 件へ差し替える）。分割は 8:1:1
+  n=90
+  [ -f train.jsonl ] && n=$(wc -l < train.jsonl | tr -d ' ')
+  v=$((n / 10))
+  printf '{"step":"inspect","status":"ok","valid_records":%s,"split":{"train":%s,"validation":%s,"test":%s}%s}\n' "$n" "$((n - 2 * v))" "$v" "$v" "$extra" ;;
 train)
   # --status・--cancel: ジョブ記録（candidates/N/job/job.json）の照会と要求（REQ-34・#484・#485）
   jd="$pd/candidates/$cnum/job"
@@ -131,6 +135,12 @@ train)
     exit 0
   fi
   if [ -n "$cancel_f" ]; then
+    # --candidate なしは記録のある候補を探す（実 CLI は実行中の全候補へ要求する）
+    if [ -z "$cnum_set" ]; then
+      for d in "$pd"/candidates/*/job; do
+        if [ -f "$d/job.json" ]; then jd=$d; cnum=$(basename "$(dirname "$d")"); break; fi
+      done
+    fi
     if [ ! -f "$jd/job.json" ]; then
       printf '{"code":"invalid_input","message":"job record not found"}\n'
       exit 64
@@ -163,6 +173,11 @@ train)
   # H（cwd 末尾が H）: ジョブ記録を残して cancel.request か KILL を待つ。子（ワーカーの代役）は親の死で
   # 終わる（lifeline の代役）。FAKE_H_LEAK なら子が残る（CLI が子孫を止めなかった欠陥の再現）
   if [ "$here" = H ]; then
+    # FAKE_H_FAST: 監視が running を見る前に学習が終わる（速い Mac の再現）
+    if [ -n "${FAKE_H_FAST:-}" ]; then
+      printf '{"step":"train","status":"ok","candidate":%s,"kind":"c3"}\n' "$cnum"
+      exit 0
+    fi
     rm -rf "$pd/candidates/$cnum"
     mkdir -p "$jd"
     printf '{"schema_version":1,"state":"running","started_at_unix":1,"finished_at_unix":null,"failure":null}\n' > "$jd/job.json"
@@ -3032,15 +3047,28 @@ fn req34_h_cancel_status_and_crash_detection() {
     assert_ne!(e.q("items.H.crash_check.train_exit_code"), "0");
     assert_eq!(e.q("items.H.crash_check.descendants_remaining"), "0");
     assert!(!e.work.join("H/project/package").exists());
-    // 実行した CLI の引数（--candidate 0 の train を 2 回、--cancel、--status を 2 回）
+    // 実行した CLI の引数（--candidate 1〔c3〕の train を 2 回、--cancel、--status を 2 回）
     let args = e.lines("cli.args");
     let count = |l: &str| args.iter().filter(|a| *a == l).count();
-    assert_eq!(count("train --project-dir project --candidate 0"), 2);
+    assert_eq!(count("train --project-dir project --candidate 1"), 2);
     assert_eq!(count("train --project-dir project --cancel"), 1);
     assert_eq!(
-        count("train --project-dir project --status --candidate 0"),
+        count("train --project-dir project --status --candidate 1"),
         2
     );
+}
+
+/// REQ-34: 監視が running とワーカーを見る前に train が終わったら、キャンセルを送っていないことを
+/// `job_finished_before_cancel` として記録する（速い Mac で学習が先に終わる場合。2026-10-13 の実機）。
+#[test]
+fn req34_h_reports_train_finishing_before_cancel() {
+    let e = Env::new();
+    let o = e.run(&with_work(&e, &["--items", "H"]), &[("FAKE_H_FAST", "1")]);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.H.reason"), "\"job_finished_before_cancel\"");
+    assert_eq!(e.q("items.H.exit_code"), "0");
+    let lines = fs::read_to_string(e.work.join("H/train.jsonl")).expect("train");
+    assert_eq!(lines.lines().count(), 4000);
 }
 
 /// REQ-34・REQ-39: キャンセル後も子孫が残る CLI は H の失敗（ラッパーの後始末に頼らず、観測した子孫を
