@@ -138,12 +138,31 @@ def load_system_prompt(path: Path | None, label_order: list[str]) -> str:
     return text
 
 
+def shard_identity(index_sha: str, shards: list[tuple[str, str]]) -> str:
+    """シャード構成のベースモデル識別値（index の sha256 と全シャードの (名前, sha256) の束ね）。
+
+    index の weight_map は重みの内容ハッシュを持たないため、index だけでは別のシャード重みを
+    区別できない。名前順に正準化して束ねる（REQ-39 の完全性。#552）。
+    """
+    body = "".join(f"{n}\t{s}\n" for n, s in sorted(shards))
+    return sha256(f"qwen2-shards-v1\n{index_sha}\n{body}".encode())
+
+
+def base_identity(pins: Pins) -> str:
+    """ベースモデルの識別値（学習・predict・export-onnx の adapter 照合で共通に使う 1 か所）。
+
+    単一ファイルは従来どおり `model.safetensors` の sha256（`pins.model`）。シャードは
+    `shard_identity`。
+    """
+    return shard_identity(pins.model, list(pins.shards)) if pins.shards else pins.model
+
+
 def load_base_model(model_dir: Path, dtype: mx.Dtype, pins: Pins) -> tuple[Qwen2Model, str, int]:
     """PR-B の `load_qwen2` で読む。`model.safetensors`・`config.json` の sha256 照合も同関数。
 
-    返す sha256 は照合済みの期待値（`pins.model`）。不一致・形状不正・上限超過は `load_qwen2` が
-    構築前に拒否する（`ValueError` -> 64、`LimitExceededError` -> 20）。サイズは照合した
-    バイト列の長さ（記録用）。
+    返す sha256 は照合済みの期待値から決めた識別値（`base_identity`）。不一致・形状不正・
+    上限超過は `load_qwen2` が構築前に拒否する（`ValueError` -> 64、
+    `LimitExceededError` -> 20）。サイズは照合したバイト列の長さ（記録用）。
     """
     with as_input_error():
         model = load_qwen2(
@@ -154,7 +173,7 @@ def load_base_model(model_dir: Path, dtype: mx.Dtype, pins: Pins) -> tuple[Qwen2
             shard_sha256=dict(pins.shards) if pins.shards else None,
         )
     size = model.source_bytes  # 照合したバイト列の長さ（fstat の値ではない）
-    return model, pins.model, size
+    return model, base_identity(pins), size
 
 
 def pins_from_args(a: argparse.Namespace) -> Pins:

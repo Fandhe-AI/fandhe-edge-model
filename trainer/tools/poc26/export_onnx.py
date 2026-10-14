@@ -32,6 +32,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tools.poc26 import common
 from tools.poc26.assets import (
     Pins,
+    base_identity,
     load_assets,
     load_base_model,
     pins_from_args,
@@ -455,7 +456,7 @@ def _load_fused_source(a: argparse.Namespace) -> tuple[Qwen2Model, dict[str, Any
     weights, cfg = load_adapter(adapter_bytes)
     del adapter_bytes
     if tuple(cfg[k] for k in _PINS_FROM_CFG) != (
-        pins.model,
+        base_identity(pins),
         pins.config,
         pins.tokenizer,
         pins.tokenizer_config,

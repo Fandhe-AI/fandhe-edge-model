@@ -312,6 +312,10 @@ def common_run(
     extra: dict[str, Any] = {}
     if shards is not None:
         extra["model_safetensors_shards"] = shards
+        # `sha` はシャードの識別値（index の sha256 とシャード群の束ね）。index の sha256 は
+        # `--model-sha256` の値のまま `model_safetensors_sha256` に残す
+        extra["base_model_identity_sha256"] = sha
+        sha = a.model_sha256
     return {
         "evidence": a.evidence,
         "command": a.command,
