@@ -639,6 +639,20 @@ def _read_shard(
     return weights
 
 
+def _check_shard_tensors(shard: dict[str, mx.array], shapes: dict[str, tuple[int, ...]]) -> None:
+    """変換（astype）の前に、1 ファイル分の全テンソルの形状と dtype（浮動小数のみ）を照合する。
+
+    期待値は config 由来。未知のキーはキー検査で拒否する。関数に分けるのは、
+    ループ変数が元テンソルを次のシャードまで掴み続けないようにするため
+    （`load_peak_bytes` は前シャードの元テンソルを数えない）。
+    """
+    for k, w in shard.items():
+        if k in shapes and tuple(w.shape) != shapes[k]:
+            raise ValueError("weight shape mismatch")
+        if k in shapes and w.dtype not in _FLOAT_DTYPES:
+            raise ValueError("weight dtype must be float16, bfloat16 or float32")
+
+
 def load_qwen2(
     model_dir: Path,
     *,
@@ -694,30 +708,28 @@ def load_qwen2(
         raise LimitExceededError("config implies a model larger than the supported size limit")
     shapes = config.expected_shapes()
     weights: dict[str, mx.array] = {}
+    unknown: set[str] = set()
     for (name, sha), size in zip(files, sizes, strict=True):
         what = "model.safetensors" if weight_map is None else "model shard"
         shard = _read_shard(model_dir / name, what, size, sha)  # サイズは見積もりと同じ値
         if weight_map is not None and any(weight_map.get(k) != name for k in shard):
             raise ValueError("shard contents do not match weight_map")
-        # 変換（astype）の前に、そのファイルの全テンソルの形状と dtype（浮動小数のみ）を
-        # config 由来の期待値と照合する。未知のキーはキー検査で拒否する。
-        for k, w in shard.items():
-            if k in shapes and tuple(w.shape) != shapes[k]:
-                raise ValueError("weight shape mismatch")
-            if k in shapes and w.dtype not in _FLOAT_DTYPES:
-                raise ValueError("weight dtype must be float16, bfloat16 or float32")
-        if shard.keys() & weights.keys():
+        _check_shard_tensors(shard, shapes)
+        if shard.keys() & (weights.keys() | unknown):
             raise ValueError("duplicate weight key across shards")
         for k in list(shard):  # 1 キーずつ変換して元を即解放する
             if k not in shapes:
-                weights[k] = shard.pop(k)  # 後段のキー検査で拒否するため印だけ残す
+                del shard[k]  # 後段のキー検査で拒否するため名前だけ残す（テンソルは持ち越さない）
+                unknown.add(k)
                 continue
             converted = shard.pop(k).astype(dtype)
             mx.eval(converted)
             weights[k] = converted
             del converted
         del shard
-    _check_keys(config, set(weights), "model.safetensors" if weight_map is None else INDEX_NAME)
+    _check_keys(
+        config, set(weights) | unknown, "model.safetensors" if weight_map is None else INDEX_NAME
+    )
     model = Qwen2Model(config)
     # 記録用: 照合した実体の大きさ（fstat の値）とシャードごとの情報（単一ファイルは None）。
     # nn.Module は dict/list を重みとして扱うため `object.__setattr__` で素の属性にする。
