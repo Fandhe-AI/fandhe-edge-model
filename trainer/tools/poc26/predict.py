@@ -123,7 +123,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
     pred, raw, stats = score_records(
         model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds), warmup=a.warmup
     )
-    run = common_run(a, assets.hashes, sha, size)
+    run = common_run(a, assets.hashes, sha, size, shards=model.shard_info)
     run.update(
         {
             "definition_sha256": def_sha,

@@ -104,6 +104,16 @@ def batch_loss(model: Qwen2Model, inputs: mx.array, pos: mx.array, tgt: mx.array
     return nn.losses.cross_entropy(logits, tgt, reduction="mean")
 
 
+def longest_batch_first(order: list[int], n_batches: int) -> list[int]:
+    """`order`（バッチ番号の順列）の先頭を、最長の batch へ入れ替える（#552・追補 2 の 5 節）。
+
+    `make_batches` は長さ昇順なので最後の batch（番号 n_batches-1）が最長。順列の他の並びは
+    保つ（rng の消費は変えない）。短時間試行で最悪のメモリを最初の 1 step に含めるために使う。
+    """
+    last = n_batches - 1
+    return [last, *(i for i in order if i != last)]
+
+
 @dataclass(frozen=True)
 class TrainResult:
     """学習ループの結果。`budget_reached` は壁時計の予算に達して打ち切ったことを表す。"""
@@ -124,6 +134,7 @@ def train_loop(
     seed: int,
     budget: Budget,
     max_wall_seconds: float = MAX_WALL_SECONDS_CAP,
+    longest_first: bool = False,
 ) -> TrainResult:
     """Adam・定数 lr で最大 `iters` ステップ学習する。
 
@@ -150,6 +161,8 @@ def train_loop(
             break
         if not order:
             order = [int(i) for i in rng.permutation(len(batches))]
+            if longest_first and step == 1:
+                order = longest_batch_first(order, len(batches))
         inputs, pos, tgt = collate(seqs, batches[order.pop(0)], pad_id)
         loss, grads = step_fn(model, inputs, pos, tgt)
         opt.update(model, grads)
@@ -217,6 +230,7 @@ def cmd_train(a: argparse.Namespace) -> int:
     result = train_loop(
         model, seqs, pad_id=ctx.pad_id, iters=a.iters, lr=a.lr, batch_size=a.batch_size,
         seed=a.seed, budget=budget, max_wall_seconds=a.max_wall_seconds,
+        longest_first=a.longest_batch_first,
     )  # fmt: skip
     train_seconds = budget.phase_elapsed()
     adapter_cfg = {
@@ -242,7 +256,7 @@ def cmd_train(a: argparse.Namespace) -> int:
     pred, raw, stats = score_records(
         model, ctx, val, val_prompts, Budget(wall_limit=a.max_score_seconds)
     )
-    run = common_run(a, assets.hashes, sha, size)
+    run = common_run(a, assets.hashes, sha, size, shards=model.shard_info)
     run.update(
         {
             "definition_sha256": def_sha,
@@ -258,6 +272,7 @@ def cmd_train(a: argparse.Namespace) -> int:
             "iters_done": result.iters_done,
             "budget_reached": result.budget_reached,
             "max_wall_seconds": a.max_wall_seconds,
+            "longest_batch_first": a.longest_batch_first,
             "max_score_seconds": a.max_score_seconds,
             "lr": a.lr,
             "trainable_parameters": n_params,

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+from tools.poc26 import common, qwen2_model
 from tools.poc26.common import (
     SHA_RE,
     invalid,
@@ -296,9 +297,21 @@ def write_scores(out: OutputDir, pred: list[str], raw: list[str]) -> None:
 
 
 def common_run(
-    a: argparse.Namespace, hashes: dict[str, str], sha: str, size: int
+    a: argparse.Namespace,
+    hashes: dict[str, str],
+    sha: str,
+    size: int,
+    shards: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """`run.json` の共通部分（`hashes` は `Assets.hashes`: 照合済みの各ファイルの sha256）。"""
+    """`run.json` の共通部分（`hashes` は `Assets.hashes`: 照合済みの各ファイルの sha256）。
+
+    #552（追補 2 の 4・5 節）: 適用した上限・`mx.device_info()` の数値と文字列・MLX のピーク確保量を
+    常に残す。シャード時は `model_safetensors_shards`（ファイル名・byte・sha256）が増え、
+    `model_safetensors_bytes` は合計、`model_safetensors_sha256` は index の sha256 になる。
+    """
+    extra: dict[str, Any] = {}
+    if shards is not None:
+        extra["model_safetensors_shards"] = shards
     return {
         "evidence": a.evidence,
         "command": a.command,
@@ -314,6 +327,16 @@ def common_run(
         **hashes,
         "sha256_pinned": True,
         "truncated_count": 0,
+        **extra,
+        "applied_limits": {
+            "max_model_bytes": qwen2_model.MAX_MODEL_BYTES,
+            "max_memory_bytes": qwen2_model.MAX_MODEL_MEMORY_BYTES,
+            "max_train_rss_bytes": common.train_rss_limit,
+        },
+        "mx_device_info": {
+            k: v for k, v in mx.device_info().items() if isinstance(v, (int, float, str))
+        },
+        "mlx_peak_memory_bytes": int(mx.get_peak_memory()),
     }
 
 

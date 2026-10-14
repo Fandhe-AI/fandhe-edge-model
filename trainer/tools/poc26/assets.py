@@ -69,6 +69,9 @@ class Pins:
     config: str
     tokenizer: str
     tokenizer_config: str
+    # シャード時の (シャード名, sha256)。空なら単一 `model.safetensors`（`model` がその sha256）。
+    # シャード時は `model` が `model.safetensors.index.json` の sha256（#552）。
+    shards: tuple[tuple[str, str], ...] = ()
 
 
 def check_pin(raw: bytes, expected: str, what: str) -> None:
@@ -148,10 +151,16 @@ def load_base_model(model_dir: Path, dtype: mx.Dtype, pins: Pins) -> tuple[Qwen2
             dtype=dtype,
             expected_sha256=pins.model,
             expected_config_sha256=pins.config,
+            shard_sha256=dict(pins.shards) if pins.shards else None,
         )
     size = model.source_bytes  # 照合したバイト列の長さ（fstat の値ではない）
     return model, pins.model, size
 
 
 def pins_from_args(a: argparse.Namespace) -> Pins:
-    return Pins(a.model_sha256, a.config_sha256, a.tokenizer_sha256, a.tokenizer_config_sha256)
+    shards = tuple(getattr(a, "shard_sha256", None) or ())
+    if len({n for n, _ in shards}) != len(shards):
+        raise invalid("duplicate --shard-sha256 file name")
+    return Pins(
+        a.model_sha256, a.config_sha256, a.tokenizer_sha256, a.tokenizer_config_sha256, shards
+    )

@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 import mlx.core as mx
-from tools.poc26 import qwen2_model
+from tools.poc26 import common, qwen2_model
 from tools.poc26.common import (
     MAX_SEQ_LENGTH,
     MAX_WALL_SECONDS_CAP,
@@ -67,6 +67,14 @@ def _sha_arg(value: str) -> str:
     return value
 
 
+def _shard_arg(value: str) -> tuple[str, str]:
+    """`FILE=HEX`（シャード名と 64 桁の小文字 16 進 sha256）。名前の検証は読み込み側が行う。"""
+    name, sep, sha = value.partition("=")
+    if not sep or not name or not SHA_RE.fullmatch(sha):
+        raise argparse.ArgumentTypeError("must be FILE=<64 lowercase hex characters>")
+    return name, sha
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str):  # type: ignore[override]
         """引数エラーは引数名だけを出し、値（パス・本文を含みうる）は出さない（64）。"""
@@ -88,6 +96,13 @@ def _build_parser() -> argparse.ArgumentParser:
         # #387 でベースモデルを取得した時に記録した sha256（64 桁の小文字 16 進。必須）
         for flag in ("model", "config", "tokenizer", "tokenizer-config"):
             p.add_argument(f"--{flag}-sha256", type=_sha_arg, required=True)
+        # シャード読み込み（#552）: `--model-sha256` は index.json の sha256 になり、
+        # index が参照するシャードをちょうど 1 対 1 で `--shard-sha256 FILE=HEX` で渡す
+        p.add_argument("--shard-sha256", type=_shard_arg, action="append", default=[])
+        # PoC 専用の上限の上書き（#552・追補 2 の 4 節）。既定は従来の値。天井は MAX_*_CEILING
+        p.add_argument("--max-model-bytes", type=int, default=qwen2_model.MAX_MODEL_BYTES)
+        p.add_argument("--max-memory-bytes", type=int, default=qwen2_model.MAX_MODEL_MEMORY_BYTES)
+        p.add_argument("--max-train-rss-bytes", type=int, default=limits.MAX_TRAIN_RSS_BYTES)
 
     def common(p: argparse.ArgumentParser) -> None:
         pins(p)
@@ -117,6 +132,9 @@ def _build_parser() -> argparse.ArgumentParser:
     t.add_argument("--scale", type=float, default=20.0)
     t.add_argument("--dropout", type=float, default=0.0)
     t.add_argument("--max-wall-seconds", type=int, default=DEFAULT_MAX_WALL_SECONDS)
+    # 長さ順で最長の batch を最初の 1 step に必ず含める（短時間試行用。#552・追補 2 の 5 節）。
+    # 既定は無効で、従来のバッチ順と完全に同じ
+    t.add_argument("--longest-batch-first", action="store_true")
     t.set_defaults(func=cmd_train)
 
     p = sub.add_parser("predict", allow_abbrev=False)
@@ -158,6 +176,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _validate(a: argparse.Namespace) -> None:
+    if hasattr(a, "max_model_bytes"):
+        _range("max-model-bytes", a.max_model_bytes, 1, qwen2_model.MAX_MODEL_BYTES_CEILING)
+        _range("max-memory-bytes", a.max_memory_bytes, 1, qwen2_model.MAX_MODEL_MEMORY_CEILING)
+        _range(
+            "max-train-rss-bytes", a.max_train_rss_bytes, 1, qwen2_model.MAX_MODEL_MEMORY_CEILING
+        )
     if hasattr(a, "max_seq_length"):
         _range("max-seq-length", a.max_seq_length, MIN_SEQ_LENGTH, MAX_SEQ_LENGTH)
     if a.command == "train":
@@ -185,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     """エントリポイント。`WorkerError` の終了コードで返し、エラーは stderr に JSON 1 行で出す。"""
     prev = mx.default_device()
     prev_cache_limit: int | None = None
+    prev_limits = (
+        qwen2_model.MAX_MODEL_BYTES,
+        qwen2_model.MAX_MODEL_MEMORY_BYTES,
+        common.train_rss_limit,
+    )
     try:
         # MLX の buffer cache は CPU でほぼ再利用されず 1 ステップ約 3 GiB ずつ増え、
         # RSS 上限（8 GiB。REQ-39）を数ステップで超える（2026-10-07 実機で計測）。
@@ -192,6 +221,9 @@ def main(argv: list[str] | None = None) -> int:
         prev_cache_limit = mx.set_cache_limit(CACHE_LIMIT_BYTES)
         a = _build_parser().parse_args(argv)
         _validate(a)
+        if hasattr(a, "max_model_bytes"):  # 上書き値は終了時に復元する（プロセス内の再入のため）
+            qwen2_model.set_limits(model_bytes=a.max_model_bytes, memory_bytes=a.max_memory_bytes)
+            common.train_rss_limit = a.max_train_rss_bytes
         if hasattr(a, "device"):
             mx.set_default_device(mx.cpu if a.device == "cpu" else mx.gpu)
         return a.func(a)
@@ -209,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return int(ExitCode.RUNTIME_ERROR)
     finally:
+        qwen2_model.MAX_MODEL_BYTES, qwen2_model.MAX_MODEL_MEMORY_BYTES, common.train_rss_limit = (
+            prev_limits
+        )
         mx.set_default_device(prev)
         if prev_cache_limit is not None:
             mx.set_cache_limit(prev_cache_limit)

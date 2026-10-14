@@ -358,27 +358,36 @@ def test_symlink_and_non_regular_rejected(model_dir: Path, tmp_path: Path) -> No
         _load(model_dir, dtype=mx.float32)
 
 
-def test_model_swapped_after_check_reads_verified_content(
+def test_model_swapped_after_check_is_rejected(
     model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-39: 検証後にパスが別ファイルへ差し替わっても、検証済み fd の中身が読まれる。"""
-    expected = np.array(_load(model_dir, dtype=mx.float32)(IDS))
+    """REQ-39・#552: sha256 照合の後にパスが別ファイルへ差し替わったら、読まずに拒否する。
+
+    重みは全バイトを保持せずパスから `mx.load` するため、fd の stat とパスの lstat の一致で
+    差し替えを検出する（検査と使用の間の差し替えを黙って受理しない）。
+    """
     original_sha, config_sha = _sha(model_dir), _sha_config(model_dir)  # 差し替え前の元ファイル
     other = synthetic.write_model_dir(_mk(tmp_path / "other"), seed=1)
     real_open = qwen2_model._open_regular
+    calls: list[int] = []
 
     def swapping_open(path: Path, limit: int, what: str):
         result = real_open(path, limit, what)
         if what == "model.safetensors":
-            os.replace(other / "model.safetensors", path)  # 新しい inode に差し替える
+            calls.append(1)
+            if len(calls) == 2:  # 1 回目は事前のサイズ確認、2 回目が sha256 照合つきの読み込み
+                os.replace(other / "model.safetensors", path)  # 新しい inode に差し替える
         return result
 
     monkeypatch.setattr(qwen2_model, "_open_regular", swapping_open)
-    m = load_qwen2(
-        model_dir, dtype=mx.float32, expected_sha256=original_sha, expected_config_sha256=config_sha
-    )
+    with pytest.raises(ValueError, match="changed while reading"):
+        load_qwen2(
+            model_dir,
+            dtype=mx.float32,
+            expected_sha256=original_sha,
+            expected_config_sha256=config_sha,
+        )
     assert _sha(model_dir) != original_sha  # 差し替えが実際に起きている
-    assert np.abs(np.array(m(IDS)) - expected).max() < 1e-6
 
 
 def test_lora_bf16_model_forward_and_grad(model_dir: Path) -> None:
@@ -640,19 +649,13 @@ def test_forward_total_memory_estimate_limit(
 
 
 def test_load_peak_bytes_stages() -> None:
-    """REQ-39: 読み込みのピーク = max(a: 2S, b: max(S, C) + T, c: C + F)。具体値で各段階を確認。"""
+    """REQ-39・#552: 読み込みのピーク = C（変換済み全重み）+ S（最大の 1 ファイル）+ T。"""
     cfg = qwen2_model.Qwen2Config(16, 2, 2, 1, 32, 300, 1e-6, 1e4, True, 64)
     p = cfg.estimated_params()
     t = 300 * 16 * 4
     assert p == 4800 + 2 * 2368 + 16  # 手計算: embed + 2 層（q/k/v/o・bias・MLP・norm）+ 最終 norm
-    f32 = mx.float32
-    assert qwen2_model.load_peak_bytes(cfg, 10**9, f32) == 2 * 10**9  # (a) 支配
-    assert qwen2_model.load_peak_bytes(cfg, 10, f32) == p * 8  # (c) C + F 支配
-    assert qwen2_model.load_peak_bytes(cfg, 10, mx.bfloat16) == p * 6
-    assert qwen2_model.load_peak_bytes(cfg, 4 * p, mx.bfloat16) == 8 * p  # (a)
-    assert max(10, p * 4) + t < p * 8  # (b) は (c) より小さい（max の前提）
-    # (b) が支配する場合: S が大きく C が小さい（file 12p > 2S 未満にはならない）ため式で直接確認
-    assert qwen2_model.load_peak_bytes(cfg, 4 * p, mx.bfloat16) >= 4 * p + t
+    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.float32) == 4 * p + 1000 + t
+    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.bfloat16) == 2 * p + 1000 + t
 
 
 def test_load_memory_estimate_boundary(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
