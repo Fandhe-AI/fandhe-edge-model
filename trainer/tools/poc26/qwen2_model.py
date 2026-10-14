@@ -540,7 +540,7 @@ def set_limits(*, model_bytes: int | None = None, memory_bytes: int | None = Non
         (model_bytes, MAX_MODEL_BYTES_CEILING, "model bytes"),
         (memory_bytes, MAX_MODEL_MEMORY_CEILING, "memory bytes"),
     ):
-        if v is not None and not 1 <= v <= ceiling:
+        if v is not None and (isinstance(v, bool) or not 1 <= v <= ceiling):
             raise ValueError(f"{name} limit out of range: 1..{ceiling}")
     if model_bytes is not None:
         MAX_MODEL_BYTES = model_bytes
@@ -595,11 +595,15 @@ def _resolve_shards(
     return sorted(shard_sha.items()), wm
 
 
-def _read_shard(path: Path, what: str, expected_sha: str, limit: int) -> dict[str, mx.array]:
-    """通常ファイルの sha256 をストリームで照合してから `mx.load` で読む（全バイトを保持しない）。
+def _read_shard(
+    path: Path, what: str, expected_sha: str, limit: int
+) -> tuple[dict[str, mx.array], int]:
+    """通常ファイルの sha256 をストリームで照合し、同じファイルオブジェクトを巻き戻して読む。
 
-    照合から読み込みの間にファイルが差し替わらないよう、fd の stat とパスの lstat（dev・ino・
-    size・mtime）が前後で一致することを確認する（不一致は `ValueError`）。
+    照合に使った fd をそのまま `mx.load` に渡す（パスで開き直さない）ので、照合後のパス差し替え
+    （A→B→A・mtime 偽装・symlink）は読み込みに影響しない。全バイトは保持しない。
+    最後の `stable`（fd の stat の dev・ino・size・mtime が開いた時と同じか）は、同じ inode への
+    書き込みの検出用（不一致は `ValueError`）。実際に読んだバイト数 `n` も返す（総和の打ち切り用）。
     """
     fd, st = _open_regular(path, limit, what)
 
@@ -608,7 +612,7 @@ def _read_shard(path: Path, what: str, expected_sha: str, limit: int) -> dict[st
 
     def stable(f: object) -> bool:
         try:
-            return ident(os.fstat(f.fileno())) == ident(st) == ident(os.lstat(path))  # type: ignore[attr-defined]
+            return ident(os.fstat(f.fileno())) == ident(st)  # type: ignore[attr-defined]
         except OSError:
             return False
 
@@ -624,8 +628,9 @@ def _read_shard(path: Path, what: str, expected_sha: str, limit: int) -> dict[st
             raise ValueError(f"{what} sha256 mismatch")
         if not stable(f):
             raise ValueError(f"{what} changed while reading")
+        f.seek(0)
         try:
-            weights = mx.load(str(path), format="safetensors")
+            weights = mx.load(f, format="safetensors")
             mx.eval(weights)
         except (RuntimeError, ValueError, OSError):
             raise ValueError(f"invalid {what}") from None
@@ -633,7 +638,7 @@ def _read_shard(path: Path, what: str, expected_sha: str, limit: int) -> dict[st
             raise ValueError(f"invalid {what}")
         if not stable(f):
             raise ValueError(f"{what} changed while reading")
-    return weights
+    return weights, n
 
 
 def load_qwen2(
@@ -690,9 +695,11 @@ def load_qwen2(
         raise LimitExceededError("config implies a model larger than the supported size limit")
     shapes = config.expected_shapes()
     weights: dict[str, mx.array] = {}
+    read_total = 0  # 実際に読んだバイト数の累計（stat 後に膨らんだ場合も総和で打ち切る）
     for name, sha in files:
         what = "model.safetensors" if weight_map is None else "model shard"
-        shard = _read_shard(model_dir / name, what, sha, MAX_MODEL_BYTES)
+        shard, n = _read_shard(model_dir / name, what, sha, MAX_MODEL_BYTES - read_total)
+        read_total += n
         if weight_map is not None and any(weight_map.get(k) != name for k in shard):
             raise ValueError("shard contents do not match weight_map")
         # 変換（astype）の前に、そのファイルの全テンソルの形状と dtype（浮動小数のみ）を
@@ -713,7 +720,7 @@ def load_qwen2(
             weights[k] = converted
             del converted
         del shard
-    _check_keys(config, set(weights), "model.safetensors")
+    _check_keys(config, set(weights), "model.safetensors" if weight_map is None else INDEX_NAME)
     model = Qwen2Model(config)
     # 記録用: 照合した実体の大きさ（fstat の値）とシャードごとの情報（単一ファイルは None）。
     # nn.Module は dict/list を重みとして扱うため `object.__setattr__` で素の属性にする。

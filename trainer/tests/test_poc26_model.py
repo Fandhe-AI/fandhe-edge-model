@@ -358,15 +358,12 @@ def test_symlink_and_non_regular_rejected(model_dir: Path, tmp_path: Path) -> No
         _load(model_dir, dtype=mx.float32)
 
 
-def test_model_swapped_after_check_is_rejected(
+def test_model_swapped_after_check_reads_verified_content(
     model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-39・#552: sha256 照合の後にパスが別ファイルへ差し替わったら、読まずに拒否する。
-
-    重みは全バイトを保持せずパスから `mx.load` するため、fd の stat とパスの lstat の一致で
-    差し替えを検出する（検査と使用の間の差し替えを黙って受理しない）。
-    """
-    original_sha, config_sha = _sha(model_dir), _sha_config(model_dir)  # 差し替え前の元ファイル
+    """REQ-39・#552: 検証後にパスが別ファイルへ差し替わっても、照合した fd の中身が読まれる。"""
+    expected = np.array(_load(model_dir, dtype=mx.float32)(IDS))
+    original_sha, config_sha = _sha(model_dir), _sha_config(model_dir)
     other = synthetic.write_model_dir(_mk(tmp_path / "other"), seed=1)
     real_open = qwen2_model._open_regular
     calls: list[int] = []
@@ -375,19 +372,19 @@ def test_model_swapped_after_check_is_rejected(
         result = real_open(path, limit, what)
         if what == "model.safetensors":
             calls.append(1)
-            if len(calls) == 2:  # 1 回目は事前のサイズ確認、2 回目が sha256 照合つきの読み込み
-                os.replace(other / "model.safetensors", path)  # 新しい inode に差し替える
+            if len(calls) == 2:  # 2 回目が sha256 照合つきの読み込み（fd を開いた直後に差し替え）
+                os.replace(other / "model.safetensors", path)
         return result
 
     monkeypatch.setattr(qwen2_model, "_open_regular", swapping_open)
-    with pytest.raises(ValueError, match="changed while reading"):
-        load_qwen2(
-            model_dir,
-            dtype=mx.float32,
-            expected_sha256=original_sha,
-            expected_config_sha256=config_sha,
-        )
+    m = load_qwen2(
+        model_dir,
+        dtype=mx.float32,
+        expected_sha256=original_sha,
+        expected_config_sha256=config_sha,
+    )
     assert _sha(model_dir) != original_sha  # 差し替えが実際に起きている
+    assert np.abs(np.array(m(IDS)) - expected).max() < 1e-6
 
 
 def test_lora_bf16_model_forward_and_grad(model_dir: Path) -> None:

@@ -307,3 +307,66 @@ def test_train_loop_longest_batch_first(tmp_path: Path) -> None:
     perm = [int(i) for i in np.random.default_rng(3).permutation(4)]
     batches = train_mod.make_batches([len(s) for s in seqs], 2)
     assert off == [batches[i] for i in perm]
+
+
+def test_set_limits_rejects_bool_and_out_of_range(monkeypatch) -> None:
+    """REQ-39・#552: 上書き値の bool・範囲外は拒否する。"""
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_BYTES", qwen2_model.MAX_MODEL_BYTES)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", qwen2_model.MAX_MODEL_MEMORY_BYTES)
+    for kw in ({"model_bytes": True}, {"memory_bytes": True}, {"memory_bytes": 0}):
+        with pytest.raises(ValueError, match="out of range"):
+            qwen2_model.set_limits(**kw)
+    with pytest.raises(ValueError, match="out of range"):
+        qwen2_model.set_limits(memory_bytes=(30 << 30) + 1)
+
+
+def test_memory_override_limits_forward_estimate(tmp_path: Path, monkeypatch) -> None:
+    """REQ-39・#552: memory_bytes の上書きで forward の見積もりが上限超過になる。"""
+    d = synthetic.write_model_dir(tmp_path)
+    m = load_qwen2(
+        d,
+        dtype=mx.float32,
+        expected_sha256=_h(d / "model.safetensors"),
+        expected_config_sha256=_h(d / "config.json"),
+    )
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", qwen2_model.MAX_MODEL_MEMORY_BYTES)
+    need = m.forward_bytes(2, 5, False)
+    qwen2_model.set_limits(memory_bytes=need - 1)
+    with pytest.raises(qwen2_model.LimitExceededError):
+        m(IDS)
+    qwen2_model.set_limits(memory_bytes=need)
+    assert m(IDS).shape == (2, 5, synthetic.TINY_VOCAB)
+
+
+def test_rss_override_larger_than_default_passes(tmp_path: Path, monkeypatch) -> None:
+    """REQ-39・#552: 学習メモリ上限は既定より小さければ止まり、大きくすると通る。"""
+    monkeypatch.setattr(common, "train_rss_limit", 1)
+    with pytest.raises(Exception, match="RSS budget"):
+        common.Budget().check()
+    monkeypatch.setattr(common, "train_rss_limit", common.max_rss_bytes() + (1 << 30))
+    common.Budget().check()
+
+
+def test_read_total_cap_stops_growing_files(pair, monkeypatch) -> None:
+    """REQ-39・#552: 読んだバイト数の累計でも MAX_MODEL_BYTES の総和を打ち切る。"""
+    _, d, shards = pair
+    sizes = [(d / n).stat().st_size for n in sorted(shards)]
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_BYTES", sum(sizes))
+    real = qwen2_model._open_regular
+    first = []
+
+    def lying_open(path, limit, what):  # stat 時の大きさは正しく見せ、読み込み時の上限だけ縮める
+        return real(path, limit, what)
+
+    monkeypatch.setattr(qwen2_model, "_open_regular", lying_open)
+    # 2 つ目のシャードの上限 = 合計 - 1 つ目の読んだ量。1 つ目が大きく読めたと偽ると超過になる
+    real_read = qwen2_model._read_shard
+
+    def inflated(path, what, sha, limit):
+        w, n = real_read(path, what, sha, limit)
+        first.append(1)
+        return w, n + 1 if len(first) == 1 else n
+
+    monkeypatch.setattr(qwen2_model, "_read_shard", inflated)
+    with pytest.raises(qwen2_model.LimitExceededError):
+        _load_sharded(d, shards)

@@ -233,6 +233,7 @@ def cmd_train(a: argparse.Namespace) -> int:
         longest_first=a.longest_batch_first,
     )  # fmt: skip
     train_seconds = budget.phase_elapsed()
+    train_peak, train_rss = int(mx.get_peak_memory()), max_rss_bytes()  # 採点前（載る判定用）
     adapter_cfg = {
         "rank": a.rank,
         "scale": a.scale,
@@ -278,6 +279,8 @@ def cmd_train(a: argparse.Namespace) -> int:
             "trainable_parameters": n_params,
             "final_loss": result.final_loss,
             "train_seconds": train_seconds,
+            "train_peak_memory_bytes": train_peak,
+            "train_max_rss_bytes": train_rss,
             "validation_scoring": stats,
             "elapsed_seconds": budget.elapsed(),
             "max_rss_bytes": max_rss_bytes(),  # RSS と MLX ピークの大きい方（common.max_rss_bytes）

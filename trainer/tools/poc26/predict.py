@@ -135,7 +135,6 @@ def cmd_predict(a: argparse.Namespace) -> int:
             "scoring": stats,
             "elapsed_seconds": budget.elapsed(),
             "max_rss_bytes": max_rss_bytes(),
-            "mlx_peak_memory_bytes": int(mx.get_peak_memory()),  # #393 の併記用
         }
     )
     with OutputDir(a.out_dir) as out:
