@@ -56,13 +56,14 @@
 //!
 //! # 適用回数の機械的な制限（事前登録 4〜5 節）
 //!
-//! NAME は許可リスト {P, C1, C3, AR}、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の sha256 単位に分ける。
-//! 採点対象としての適用は 4 候補 × 3 seed = 最大 12 回に機械的に制限される。予測ファイルを作り直して
+//! NAME は許可リスト {P, P15, P7, C1, C3, AR}（P15・P7 は追補 2）、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の
+//! sha256 単位に分ける。採点対象としての適用は 6 候補 × 3 seed = 最大 18 回に機械的に制限される。予測ファイルを作り直して
 //! 同名・別 sha256 で出すと拒否し、別名は許可リストで塞ぐ。
 //! 別 NAME の予測が同じバイト列でも拒否しない（異なる候補が同じ予測を返す正当な比較がある。同じバイト列を
 //! 別 NAME で再採点しても新しい情報は得られず、C1・C3・AR は評価記録の来歴照合で束縛される）。
 //! `--reference` は最大 1 個、`--compare` は最大 2 個。役割も固定: `--compare` は C1・C3 のみ、
-//! `--reference` は AR のみで、どちらも `--candidate P` のときだけ許す（`--candidate` は 4 つのいずれでもよい）。
+//! `--reference` は AR のみで、どちらも `--candidate` が P 系（P・P15・P7）のときだけ許す（`--candidate` は 6 つの
+//! いずれでもよい）。P 系同士の比較は `--compare` の役割制約で拒否し、Holm の族は P 系の候補ごとに m=3 のまま。
 //! 台帳の確認から書き込みまでは `<evaluation_sha256>/seed-<n>/.lock` の排他ロック（`flock`。プロセス終了で
 //! 解放される）の中で行い、同時実行による二重適用を防ぐ。許可リスト外の候補を足すには、事前登録の追補と
 //! コード変更が要る。
@@ -152,10 +153,20 @@ const LEDGER_DIR: &str = "poc26_score_ledger";
 const FAMILY_SIZE: usize = 3;
 /// `--compare` の最大数（族の大きさ 3 から対 majority の 1 を引いた数）。
 const MAX_COMPARES: usize = FAMILY_SIZE - 1;
-/// 事前登録 4 節の候補名（P・C1・C3・AR〔autoregressive〕）。大文字小文字は区別する。
+/// 事前登録 4 節の候補名（P・P15・P7・C1・C3・AR〔autoregressive〕）。大文字小文字は区別する。
+/// P15・P7 は追補 2 の追加学習候補（REQ-41）。
 ///
 /// ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
-const ALLOWED_NAMES: [&str; 4] = ["P", "C1", "C3", "AR"];
+const ALLOWED_NAMES: [&str; 6] = ["P", "P15", "P7", "C1", "C3", "AR"];
+/// P 系候補（追加学習候補）。`--compare`・`--reference` を付けられる唯一の系統で、`evaluate` の保存予測を
+/// 持たないため来歴照合の対象外（REQ-41・追補 2）。P 系の判定はここに集約する。
+const P_FAMILY: [&str; 3] = ["P", "P15", "P7"];
+
+/// 名前が P 系（P・P15・P7）か。
+fn is_p_family(name: &str) -> bool {
+    P_FAMILY.contains(&name)
+}
+
 /// 事前登録 5 節の seed。
 const ALLOWED_SEEDS: [u32; 3] = [0, 1, 2];
 /// `--reference` の最大数。
@@ -208,10 +219,12 @@ impl ScoreArgs {
                 return Err(invalid("duplicate NAME"));
             }
         }
-        // 役割の制約（事前登録 5 節）: compare は C1・C3、reference は AR、どちらも採点対象が P のときだけ。
+        // 役割の制約（事前登録 5 節）: compare は C1・C3、reference は AR、どちらも採点対象が P 系のときだけ。
         let has_others = !self.compares.is_empty() || !self.references.is_empty();
-        if has_others && self.candidate.name != "P" {
-            return Err(invalid("--compare and --reference require --candidate P"));
+        if has_others && !is_p_family(&self.candidate.name) {
+            return Err(invalid(
+                "--compare and --reference require a P-family candidate (P, P15, P7)",
+            ));
         }
         if self
             .compares
@@ -517,7 +530,7 @@ fn load_prediction<'a>(
     let bytes = read_bounded_open_file(file, confined.as_path(), MAX_PROJECT_FILE_BYTES)
         .map_err(|e| fs_report(&e))?;
     let sha256 = Sha256Digest::of_bytes(&bytes).to_hex();
-    if named.name != "P" {
+    if !is_p_family(&named.name) {
         verify_bound_to_record(prov, named, confined.as_path(), &sha256)?;
     }
     let classified = classify_predictions(&bytes, gold_text, labels, &named.name)?;
