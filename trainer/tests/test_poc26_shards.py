@@ -347,26 +347,50 @@ def test_rss_override_larger_than_default_passes(tmp_path: Path, monkeypatch) ->
     common.Budget().check()
 
 
-def test_read_total_cap_stops_growing_files(pair, monkeypatch) -> None:
-    """REQ-39・#552: 読んだバイト数の累計でも MAX_MODEL_BYTES の総和を打ち切る。"""
-    _, d, shards = pair
-    sizes = [(d / n).stat().st_size for n in sorted(shards)]
-    monkeypatch.setattr(qwen2_model, "MAX_MODEL_BYTES", sum(sizes))
-    real = qwen2_model._open_regular
-    first = []
+def test_content_rewritten_after_check_uses_verified_bytes(pair, monkeypatch) -> None:
+    """REQ-39・#552: 照合後に同サイズで中身を書き換え mtime を戻しても、照合したバイト列を使う。"""
+    import os
 
-    def lying_open(path, limit, what):  # stat 時の大きさは正しく見せ、読み込み時の上限だけ縮める
+    _, d, shards = pair
+    ref = _load_sharded(d, shards)
+    real_sha = hashlib.sha256
+    path = d / "a.safetensors"
+    orig = path.read_bytes()
+    st = path.stat()
+    done = []
+
+    class Spy:
+        def __init__(self, data):
+            self.h = real_sha(data)
+            if len(data) == len(orig) and not done:
+                done.append(1)  # 照合の直後と同じ位置（sha256 計算後）に相当する書き換え
+                path.write_bytes(bytes(len(orig)))
+                os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        def hexdigest(self):
+            return self.h.hexdigest()
+
+    monkeypatch.setattr(qwen2_model.hashlib, "sha256", Spy)
+    m = _load_sharded(d, shards)
+    assert done
+    a, b = np.array(m(IDS)), np.array(ref(IDS))
+    assert np.array_equal(a, b)  # 書き換え後の（ゼロ）内容ではなく、照合した内容で読めている
+
+
+def test_file_grown_after_size_check_rejected(pair, monkeypatch) -> None:
+    """REQ-39・#552: サイズ検査の後にファイルが大きくなっていたら、読まずに拒否する。"""
+    _, d, shards = pair
+    real = qwen2_model._open_regular
+    calls = []
+
+    def growing(path, limit, what):
+        calls.append(path.name)
+        if len(calls) == 3:  # 事前 stat は 2 回（a・b）、3 回目が a の読み込み
+            with path.open("ab") as f:
+                f.write(b"\0" * 64)
+            return real(path, limit + 64, what)  # 上限側は通し、サイズ不一致の検査で止める
         return real(path, limit, what)
 
-    monkeypatch.setattr(qwen2_model, "_open_regular", lying_open)
-    # 2 つ目のシャードの上限 = 合計 - 1 つ目の読んだ量。1 つ目が大きく読めたと偽ると超過になる
-    real_read = qwen2_model._read_shard
-
-    def inflated(path, what, sha, limit):
-        w, n = real_read(path, what, sha, limit)
-        first.append(1)
-        return w, n + 1 if len(first) == 1 else n
-
-    monkeypatch.setattr(qwen2_model, "_read_shard", inflated)
-    with pytest.raises(qwen2_model.LimitExceededError):
+    monkeypatch.setattr(qwen2_model, "_open_regular", growing)
+    with pytest.raises(qwen2_model.LimitExceededError, match="changed size"):
         _load_sharded(d, shards)

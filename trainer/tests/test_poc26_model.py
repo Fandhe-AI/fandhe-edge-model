@@ -646,13 +646,13 @@ def test_forward_total_memory_estimate_limit(
 
 
 def test_load_peak_bytes_stages() -> None:
-    """REQ-39・#552: 読み込みのピーク = C（変換済み全重み）+ S（最大の 1 ファイル）+ T。"""
+    """REQ-39・#552: ピーク = C + 2S（最大 1 ファイルの bytes と重み）+ T。"""
     cfg = qwen2_model.Qwen2Config(16, 2, 2, 1, 32, 300, 1e-6, 1e4, True, 64)
     p = cfg.estimated_params()
     t = 300 * 16 * 4
     assert p == 4800 + 2 * 2368 + 16  # 手計算: embed + 2 層（q/k/v/o・bias・MLP・norm）+ 最終 norm
-    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.float32) == 4 * p + 1000 + t
-    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.bfloat16) == 2 * p + 1000 + t
+    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.float32) == 4 * p + 2000 + t
+    assert qwen2_model.load_peak_bytes(cfg, 1000, mx.bfloat16) == 2 * p + 2000 + t
 
 
 def test_load_memory_estimate_boundary(model_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:

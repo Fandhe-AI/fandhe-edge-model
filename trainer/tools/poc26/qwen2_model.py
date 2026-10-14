@@ -12,6 +12,7 @@ logits `[B, L, vocab]` を返す forward と、mlx-lm と同形の LoRA を提�
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import os
 import re
@@ -517,13 +518,14 @@ def load_peak_bytes(config: Qwen2Config, max_file_size: int, dtype: mx.Dtype) ->
     """読み込みの同時保持量の最大（バイト）。上限判定に使う（REQ-39）。
 
     シャードを 1 つずつ読んで即 `dtype` へ変換して溜めるため、ピークは
-    「変換済みの全重み C = params × dtype」＋「読み込み中の 1 ファイル S」＋「最大テンソル 1 個分
+    「変換済みの全重み C = params × dtype」＋「読み込み中の 1 ファイル分のバイト列 S と、そこから
+    `mx.load` した重み S（計 2S）」＋「最大テンソル 1 個分
     の余裕 T = max(vocab, intermediate) × hidden × 4」。モデルの既定パラメータ（float32）は MLX の
     遅延評価で実体化されないまま `load_weights` で置き換わるため数えない（#552）。
-    単一ファイルでは S がファイル全体になる（従来より保守的な見積もり）。
+    単一ファイルでは S がファイル全体になる。
     """
     t = max(config.vocab_size, config.intermediate_size) * config.hidden_size * 4
-    return config.estimated_params() * dtype.size + max_file_size + t
+    return config.estimated_params() * dtype.size + 2 * max_file_size + t
 
 
 _SHARD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.safetensors")
@@ -596,49 +598,35 @@ def _resolve_shards(
 
 
 def _read_shard(
-    path: Path, what: str, expected_sha: str, limit: int
-) -> tuple[dict[str, mx.array], int]:
-    """通常ファイルの sha256 をストリームで照合し、同じファイルオブジェクトを巻き戻して読む。
+    path: Path, what: str, expected_size: int, expected_sha: str
+) -> dict[str, mx.array]:
+    """通常ファイルを 1 度だけ読み、そのバイト列の sha256 を照合してから `mx.load` する。
 
-    照合に使った fd をそのまま `mx.load` に渡す（パスで開き直さない）ので、照合後のパス差し替え
-    （A→B→A・mtime 偽装・symlink）は読み込みに影響しない。全バイトは保持しない。
-    最後の `stable`（fd の stat の dev・ino・size・mtime が開いた時と同じか）は、同じ inode への
-    書き込みの検出用（不一致は `ValueError`）。実際に読んだバイト数 `n` も返す（総和の打ち切り用）。
+    照合したバイト列と使うバイト列が同一（`io.BytesIO`）なので、照合後のパス・ファイル内容の
+    書き換え（同サイズの上書き・mtime 偽装・A→B→A）は読み込みに影響しない。サイズは見積もりに
+    使った `expected_size` と一致しなければ拒否する（fstat と、`expected_size + 1` まで読んだ長さの
+    両方で確認。増えていれば `LimitExceededError`）。読み込み中は「バイト列 + 読み込んだ重み」を
+    保持する（`load_peak_bytes` が 2S で数える）。
     """
-    fd, st = _open_regular(path, limit, what)
-
-    def ident(s: os.stat_result) -> tuple[int, int, int, int]:
-        return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
-
-    def stable(f: object) -> bool:
-        try:
-            return ident(os.fstat(f.fileno())) == ident(st)  # type: ignore[attr-defined]
-        except OSError:
-            return False
-
+    fd, st = _open_regular(path, expected_size, what)
     with os.fdopen(fd, "rb") as f:
-        h = hashlib.sha256()
-        n = 0
-        while chunk := f.read(1 << 20):
-            n += len(chunk)
-            if n > limit:
-                raise LimitExceededError(f"{what} too large: > {limit} bytes")
-            h.update(chunk)
-        if h.hexdigest() != expected_sha:
-            raise ValueError(f"{what} sha256 mismatch")
-        if not stable(f):
-            raise ValueError(f"{what} changed while reading")
-        f.seek(0)
-        try:
-            weights = mx.load(f, format="safetensors")
-            mx.eval(weights)
-        except (RuntimeError, ValueError, OSError):
-            raise ValueError(f"invalid {what}") from None
-        if not isinstance(weights, dict):
-            raise ValueError(f"invalid {what}")
-        if not stable(f):
-            raise ValueError(f"{what} changed while reading")
-    return weights, n
+        if st.st_size != expected_size:
+            raise LimitExceededError(f"{what} changed size after the size check")
+        data = f.read(expected_size + 1)
+    if len(data) != expected_size:
+        raise LimitExceededError(f"{what} changed size after the size check")
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise ValueError(f"{what} sha256 mismatch")
+    try:
+        weights = mx.load(io.BytesIO(data), format="safetensors")
+        mx.eval(weights)
+    except (RuntimeError, ValueError, OSError):
+        raise ValueError(f"invalid {what}") from None
+    finally:
+        del data
+    if not isinstance(weights, dict):
+        raise ValueError(f"invalid {what}")
+    return weights
 
 
 def load_qwen2(
@@ -660,7 +648,8 @@ def load_qwen2(
     `model.safetensors` の、シャード時は `model.safetensors.index.json` の期待値になる。
     `shard_sha256` は {シャード名: sha256} で、index が参照するシャードとちょうど 1 対 1 でなければ
     拒否する。config は 1 度だけ読んだ bytes を照合してから解釈する。重みは全バイトを 1 度に
-    読まず、ストリームで sha256 を計算してから `mx.load` する（#552。ピークは `load_peak_bytes`）。
+    まとめては読まず、シャードごとに 1 度だけ読んで sha256 を照合した同じバイト列を `mx.load` する
+    （#552。ピークは `load_peak_bytes`。記録するサイズは見積もりと一致を確認済みの値）。
     """
     hashes = [expected_sha256, expected_config_sha256, *(shard_sha256 or {}).values()]
     for h in hashes:
@@ -695,11 +684,9 @@ def load_qwen2(
         raise LimitExceededError("config implies a model larger than the supported size limit")
     shapes = config.expected_shapes()
     weights: dict[str, mx.array] = {}
-    read_total = 0  # 実際に読んだバイト数の累計（stat 後に膨らんだ場合も総和で打ち切る）
-    for name, sha in files:
+    for (name, sha), size in zip(files, sizes, strict=True):
         what = "model.safetensors" if weight_map is None else "model shard"
-        shard, n = _read_shard(model_dir / name, what, sha, MAX_MODEL_BYTES - read_total)
-        read_total += n
+        shard = _read_shard(model_dir / name, what, size, sha)  # サイズは見積もりと同じ値
         if weight_map is not None and any(weight_map.get(k) != name for k in shard):
             raise ValueError("shard contents do not match weight_map")
         # 変換（astype）の前に、そのファイルの全テンソルの形状と dtype（浮動小数のみ）を
