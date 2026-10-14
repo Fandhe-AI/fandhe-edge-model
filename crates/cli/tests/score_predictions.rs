@@ -907,7 +907,7 @@ fn req27_roles_are_restricted_by_preregistration() {
     );
     env.fails(
         &args(&["--candidate", "C1=p.jsonl", "--compare", "C3=p.jsonl"]),
-        "--compare and --reference require --candidate P",
+        "--compare and --reference require a P-family candidate (P, P15, P7)",
     );
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
@@ -953,4 +953,78 @@ fn req27_issue445_concurrent_scoring_of_same_name_applies_once() {
             .collect()
     });
     assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
+}
+
+/// REQ-41・追補 2: P15・P7 も P と同じく `--compare` C1・C3 と `--reference` AR 込みで採点でき、
+/// Holm の族は m=3 のまま（来歴照合は P 系に課さない）。
+#[test]
+fn req41_p15_and_p7_score_with_compares_and_reference_holm_m3() {
+    let env = Env::new("p_family");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let c1 = env.bound("c1", 1, &pred_jsonl(pred_a));
+    let c3 = env.bound("c3", 2, &pred_jsonl(pred_a));
+    let ar = env.bound("autoregressive", 3, &pred_jsonl(pred_a));
+    for name in ["P15", "P7"] {
+        let out = env.ok(&args(&[
+            "--candidate",
+            &format!("{name}=p.jsonl"),
+            "--compare",
+            &format!("C1={c1}"),
+            "--compare",
+            &format!("C3={c3}"),
+            "--reference",
+            &format!("AR={ar}"),
+        ]));
+        assert!(
+            out.contains(&format!("\"holm\":{{\"candidate\":\"{name}\",\"m\":3,")),
+            "{out}"
+        );
+        assert_eq!(out.matches("\"against\":").count(), 4, "{out}");
+    }
+}
+
+/// REQ-27・REQ-41: 台帳は (NAME, seed) ごとに 1 回限り。P・P15・P7 は別枠。
+#[test]
+fn req27_req41_p_family_ledger_is_per_name_and_seed() {
+    let env = Env::new("p_family_ledger");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.ok(&args(&["--candidate", "P15=p.jsonl"]));
+    let report = ledger_file(&env, 0, "P15").with_file_name("P15.report.json");
+    let rel = report
+        .strip_prefix(env.work.join("proj"))
+        .expect("under project");
+    env.fails(
+        &args(&["--candidate", "P15=p.jsonl"]),
+        &format!(
+            "candidate has already been scored; result saved in {}",
+            rel.display()
+        ),
+    );
+    env.ok(&args(&["--candidate", "P7=p.jsonl"]));
+    env.ok(&args(&["--candidate", "P=p.jsonl"]));
+    env.ok(&[
+        "--project-dir",
+        "proj",
+        "--seed",
+        "1",
+        "--candidate",
+        "P15=p.jsonl",
+    ]);
+}
+
+/// REQ-41: P 系の `--compare` は C1・C3 のみ（P 系同士の比較は族 m=3 を崩すため拒否）。未許可名も拒否。
+#[test]
+fn req41_p_family_cannot_compare_with_p_family_and_unlisted_names_are_rejected() {
+    let env = Env::new("p_family_reject");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.fails(
+        &args(&["--candidate", "P15=p.jsonl", "--compare", "P=p.jsonl"]),
+        "--compare accepts only C1 or C3",
+    );
+    for name in ["P3", "p15", "P07", "P15x"] {
+        env.fails(
+            &args(&["--candidate", &format!("{name}=p.jsonl")]),
+            "name is not in the preregistered list",
+        );
+    }
 }

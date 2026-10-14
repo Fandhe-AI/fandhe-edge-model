@@ -161,9 +161,11 @@ const ALLOWED_NAMES: [&str; 6] = ["P", "P15", "P7", "C1", "C3", "AR"];
 /// 来歴照合の対象外（REQ-41・追補 2）。P 系の判定はここに集約する。
 const P_FAMILY: [&str; 3] = ["P", "P15", "P7"];
 
+/// 名前が P 系（P・P15・P7）か。
 fn is_p_family(name: &str) -> bool {
     P_FAMILY.contains(&name)
 }
+
 /// 事前登録 5 節の seed。
 const ALLOWED_SEEDS: [u32; 3] = [0, 1, 2];
 /// `--reference` の最大数。
@@ -216,10 +218,12 @@ impl ScoreArgs {
                 return Err(invalid("duplicate NAME"));
             }
         }
-        // 役割の制約（事前登録 5 節）: compare は C1・C3、reference は AR、どちらも採点対象が P のときだけ。
+        // 役割の制約（事前登録 5 節）: compare は C1・C3、reference は AR、どちらも採点対象が P 系のときだけ。
         let has_others = !self.compares.is_empty() || !self.references.is_empty();
         if has_others && !is_p_family(&self.candidate.name) {
-            return Err(invalid("--compare and --reference require --candidate P"));
+            return Err(invalid(
+                "--compare and --reference require a P-family candidate (P, P15, P7)",
+            ));
         }
         if self
             .compares
