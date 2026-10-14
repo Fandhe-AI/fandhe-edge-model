@@ -11,9 +11,11 @@ logits `[B, L, vocab]` を返す forward と、mlx-lm と同形の LoRA を提�
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +29,13 @@ from tools.poc26.safe_io import read_limited as _read_limited
 #: `config.json` の上限（64 KiB）と `model.safetensors` の上限（1 GiB。実物は約 988MB）。
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_MODEL_BYTES = 1 << 30
+#: シャードの index（`model.safetensors.index.json`）の上限とシャード数の上限（#552）。
+MAX_INDEX_BYTES = 1 << 20
+MAX_SHARDS = 256
+INDEX_NAME = "model.safetensors.index.json"
+#: PoC 専用の上書き値の天井（追補 2 の 4 節: モデル合計 32 GiB・メモリ系 30 GiB まで）。
+MAX_MODEL_BYTES_CEILING = 32 << 30
+MAX_MODEL_MEMORY_CEILING = 30 << 30
 
 _SUPPORTED = "supported: model_type=qwen2, no rope_scaling, use_sliding_window=false"
 
@@ -505,78 +514,59 @@ def trainable_parameter_count(model: nn.Module) -> int:
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
-def load_peak_bytes(config: Qwen2Config, file_size: int, dtype: mx.Dtype) -> int:
-    """読み込みの各段階の同時保持量の最大（バイト）。上限判定に使う（REQ-39）。
+def load_peak_bytes(config: Qwen2Config, sizes: list[int], dtype: mx.Dtype) -> int:
+    """読み込みの同時保持量の最大（バイト）。各段階の max で上限判定に使う（REQ-39）。
 
-    段階（C = params × dtype、F = params × 4 = 構築時の float32 既定パラメータ、S = file_size、
-    T = 最大テンソル 1 個分の余裕 = max(vocab, intermediate) × hidden × 4）:
-      (a) bytes + mx.load した重み                 = 2S（読み込み後に bytes を del）
-      (b) 重みを 1 キーずつ dtype へ変換し元を解放   = max(S, C) + T
-      (c) 構築（F）+ 変換済みの重み                  = C + F（load_weights 後に F は解放）
+    ファイル（シャード）i を順に処理し、`_read_shard` はバイト列を手放してから dtype 変換する。
+    P_i = 先に変換済みのファイルの変換後サイズの和、conv_i = ファイル i の変換後サイズ
+    （ファイルの dtype は読む前は不明なので 2 バイト幅と仮定して `S_i × dtype.size / 2`。
+    float32 のファイルなら実際はこれ以下）、T = 最大テンソル 1 個分の余裕
+    （`max(vocab, intermediate) × hidden × 4`）として:
+      読み込み: P_i + S_i（バイト列）+ S_i（`mx.load` した重み。ファイルの dtype）
+      変換:     P_i + S_i（読み込んだ重み）+ conv_i
+      最後:     C（= params × dtype）+ T
+    モデルの既定パラメータ（float32）は MLX の遅延評価で実体化されないまま `load_weights` で
+    置き換わるため数えない（#552）。
     """
-    params = config.estimated_params()
     t = max(config.vocab_size, config.intermediate_size) * config.hidden_size * 4
-    c, f = params * dtype.size, params * 4
-    return max(2 * file_size, max(file_size, c) + t, c + f)
+    peak = config.estimated_params() * dtype.size + t
+    done = 0
+    for s in sizes:
+        conv = s * dtype.size // 2
+        peak = max(peak, done + 2 * s, done + s + conv)
+        done += conv
+    return peak
 
 
-def load_qwen2(
-    model_dir: Path, *, dtype: mx.Dtype, expected_sha256: str, expected_config_sha256: str
-) -> Qwen2Model:
-    """`config.json`・`model.safetensors` を検証して読み、`dtype` へ揃えたモデルを返す。
+_SHARD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.safetensors")
 
-    順序: config 検証 → 重みファイルの存在・種類・サイズ検証 → 同時保持メモリの見積もり検査 →
-    重み読み込みとキー検査 → モデル構築 → dtype 変換して `strict=True` で load。
-    構築（確保）は、重みが存在し上限内でキーが合うと分かった後に行う。
 
-    `expected_sha256`（64 桁の小文字 16 進）は `model.safetensors` の期待ハッシュで、#387 で
-    ベースモデルを取得した時に記録した sha256（信頼できる記録）を呼び出し側が渡す。検証済み fd
-    から上限つきで全バイトを 1 度だけ読み、その bytes のハッシュを照合し、不一致なら構築前に
-    拒否する。`expected_config_sha256` は #387 で記録した `config.json` の sha256 で、config も
-    1 度だけ読んだ bytes を照合してから解釈する（不一致は構築・重み読み込みより前に拒否）。
-    一致したら同じ bytes を `io.BytesIO` 経由で読む（検査と使用の間の差し替えなし）。
+def set_limits(*, model_bytes: int | None = None, memory_bytes: int | None = None) -> None:
+    """モデル合計バイト・同時保持メモリの上限を PoC 専用に上書きする（#552・追補 2 の 4 節）。
+
+    既定（1 GiB・8 GiB）は変えず、引数を渡したときだけ天井（`MAX_MODEL_BYTES_CEILING`・
+    `MAX_MODEL_MEMORY_CEILING`）の範囲で差し替える。範囲外は `ValueError`。
     """
-    for h in (expected_sha256, expected_config_sha256):
-        if not isinstance(h, str) or len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
-            raise ValueError("expected sha256 must be 64 lowercase hex characters")
-    model_dir = Path(model_dir)
-    config_bytes = _read_limited(model_dir / "config.json", MAX_CONFIG_BYTES, "config.json")
-    if sha256_hex(config_bytes) != expected_config_sha256:
-        raise ValueError("config.json sha256 mismatch")
-    config = Qwen2Config.from_bytes(config_bytes)
-    params = config.estimated_params()
-    fd, st = _open_regular(model_dir / "model.safetensors", MAX_MODEL_BYTES, "model.safetensors")
-    with os.fdopen(fd, "rb") as f:
-        # 各段階の同時保持の最大で判定する（式は load_peak_bytes。構築時の既定パラメータは
-        # mlx の nn.Linear / Embedding が float32 のため params × 4）。
-        if (
-            params * 2 > MAX_MODEL_BYTES
-            or load_peak_bytes(config, st.st_size, dtype) > MAX_MODEL_MEMORY_BYTES
-        ):
-            raise LimitExceededError("config implies a model larger than the supported size limit")
-        # 検証済みの fd から全バイトを 1 度だけ読み、そのバイト列を照合・使用する
-        # （パスで開き直さない。TOCTOU 対策）。mx.load は遅延読み込みのことがあるため、
-        # BytesIO を閉じる前に mx.eval で実体化する。
-        data = f.read(MAX_MODEL_BYTES + 1)
-    if len(data) > MAX_MODEL_BYTES:
-        raise LimitExceededError(f"model.safetensors too large: > {MAX_MODEL_BYTES} bytes")
-    source_bytes = len(data)
-    if sha256_hex(data) != expected_sha256:
-        raise ValueError("model.safetensors sha256 mismatch")
-    try:
-        weights = mx.load(io.BytesIO(data), format="safetensors")
-        mx.eval(weights)
-    except (RuntimeError, ValueError, OSError):
-        raise ValueError("invalid model.safetensors") from None
-    finally:
-        del data  # バイト列を解放する
-    if not isinstance(weights, dict):
-        raise ValueError("invalid model.safetensors")
+    global MAX_MODEL_BYTES, MAX_MODEL_MEMORY_BYTES
+    for v, ceiling, name in (
+        (model_bytes, MAX_MODEL_BYTES_CEILING, "model bytes"),
+        (memory_bytes, MAX_MODEL_MEMORY_CEILING, "memory bytes"),
+    ):
+        if v is not None and (isinstance(v, bool) or not 1 <= v <= ceiling):
+            raise ValueError(f"{name} limit out of range: 1..{ceiling}")
+    if model_bytes is not None:
+        MAX_MODEL_BYTES = model_bytes
+    if memory_bytes is not None:
+        MAX_MODEL_MEMORY_BYTES = memory_bytes
+
+
+def _check_keys(config: Qwen2Config, present: set[str], where: str) -> None:
+    """重みキーの過不足を config 由来の期待値と照合する（tie と lm_head の矛盾も拒否）。"""
     expected = config.expected_keys()
-    missing, extra = expected - weights.keys(), weights.keys() - expected
+    missing, extra = expected - present, present - expected
     if config.tie_word_embeddings and "lm_head.weight" in extra:
         raise ValueError(
-            "tie_word_embeddings=true conflicts with lm_head.weight present in model.safetensors"
+            f"tie_word_embeddings=true conflicts with lm_head.weight present in {where}"
         )
     if missing or extra:
         hint = ""
@@ -586,23 +576,171 @@ def load_qwen2(
             f"weight keys mismatch (missing={len(missing)}, unexpected={len(extra)}); "
             f"{_SUPPORTED}{hint}"
         )
-    # 変換（astype）の前に、全テンソルの形状と dtype（浮動小数のみ）を config 由来の期待値と
-    # 照合する。形状が一致すれば、実テンソルの合計要素数は estimated_params と同値になる。
-    for k, shape in config.expected_shapes().items():
-        w = weights[k]
-        if tuple(w.shape) != shape:
+
+
+def _resolve_shards(
+    model_dir: Path, index_sha: str, shard_sha: dict[str, str], config: Qwen2Config
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """`model.safetensors.index.json` を読み、指定シャードとちょうど 1 対 1 か確認する。
+
+    index は sha256 照合後に解釈する。シャード名は単純なファイル名（英数字と `._-`、末尾
+    `.safetensors`）だけを許し、`../`・絶対パス・区切り文字を拒否する（symlink は
+    `open_regular` の `O_NOFOLLOW` が拒否）。返り値は (名前順の (名前, sha256), weight_map)。
+    """
+    raw = _read_limited(model_dir / INDEX_NAME, MAX_INDEX_BYTES, INDEX_NAME)
+    if sha256_hex(raw) != index_sha:
+        raise ValueError(f"{INDEX_NAME} sha256 mismatch")
+    doc = loads_json(raw, INDEX_NAME)
+    wm = doc.get("weight_map") if isinstance(doc, dict) else None
+    if (
+        not isinstance(wm, dict)
+        or not wm
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in wm.items())
+    ):
+        raise ValueError(f"invalid {INDEX_NAME}")
+    names = set(wm.values())
+    if len(names) > MAX_SHARDS or not all(_SHARD_NAME_RE.fullmatch(n) for n in names):
+        raise ValueError(f"invalid shard name in {INDEX_NAME}")
+    if names != shard_sha.keys():
+        raise ValueError("shard sha256 arguments do not match the shards in the index")
+    _check_keys(config, set(wm), INDEX_NAME)
+    return sorted(shard_sha.items()), wm
+
+
+def _read_shard(
+    path: Path, what: str, expected_size: int, expected_sha: str
+) -> dict[str, mx.array]:
+    """通常ファイルを 1 度だけ読み、そのバイト列の sha256 を照合してから `mx.load` する。
+
+    照合したバイト列と使うバイト列が同一（`io.BytesIO`）なので、照合後のパス・ファイル内容の
+    書き換え（同サイズの上書き・mtime 偽装・A→B→A）は読み込みに影響しない。サイズは見積もりに
+    使った `expected_size` と一致しなければ拒否する（fstat と、`expected_size + 1` まで読んだ長さの
+    両方で確認。増えていれば `LimitExceededError`）。読み込み中は「バイト列 + 読み込んだ重み」を
+    保持する（`load_peak_bytes` の読み込み段階で数える）。
+    """
+    fd, st = _open_regular(path, expected_size, what)
+    with os.fdopen(fd, "rb") as f:
+        if st.st_size != expected_size:
+            raise LimitExceededError(f"{what} changed size after the size check")
+        data = f.read(expected_size + 1)
+    if len(data) != expected_size:
+        raise LimitExceededError(f"{what} changed size after the size check")
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise ValueError(f"{what} sha256 mismatch")
+    try:
+        weights = mx.load(io.BytesIO(data), format="safetensors")
+        mx.eval(weights)
+    except (RuntimeError, ValueError, OSError):
+        raise ValueError(f"invalid {what}") from None
+    finally:
+        del data
+    if not isinstance(weights, dict):
+        raise ValueError(f"invalid {what}")
+    return weights
+
+
+def _check_shard_tensors(shard: dict[str, mx.array], shapes: dict[str, tuple[int, ...]]) -> None:
+    """変換（astype）の前に、1 ファイル分の全テンソルの形状と dtype（浮動小数のみ）を照合する。
+
+    期待値は config 由来。未知のキーはキー検査で拒否する。関数に分けるのは、
+    ループ変数が元テンソルを次のシャードまで掴み続けないようにするため
+    （`load_peak_bytes` は前シャードの元テンソルを数えない）。
+    """
+    for k, w in shard.items():
+        if k in shapes and tuple(w.shape) != shapes[k]:
             raise ValueError("weight shape mismatch")
-        if w.dtype not in _FLOAT_DTYPES:
+        if k in shapes and w.dtype not in _FLOAT_DTYPES:
             raise ValueError("weight dtype must be float16, bfloat16 or float32")
-    # (b) 1 キーずつ変換して元を即解放する（一時保持は最大テンソル 1 個分）
-    for k in list(weights):
-        converted = weights[k].astype(dtype)
-        mx.eval(converted)
-        weights[k] = converted
-        del converted
-    model = Qwen2Model(config)  # (c)
-    # 照合した bytes の長さ（呼び出し側が記録に使う。fstat の値ではなく検証済みの実体の大きさ）
-    model.source_bytes = source_bytes
+
+
+def load_qwen2(
+    model_dir: Path,
+    *,
+    dtype: mx.Dtype,
+    expected_sha256: str,
+    expected_config_sha256: str,
+    shard_sha256: dict[str, str] | None = None,
+) -> Qwen2Model:
+    """`config.json` と重み（単一ファイルまたはシャード）を検証して読み、`dtype` のモデルを返す。
+
+    順序: config 検証 → 重みファイルの存在・種類・サイズ検証 → 同時保持メモリの見積もり検査 →
+    （シャード時は index の検証）→ 1 ファイルずつ sha256 照合・読み込み・形状 / dtype 検証・
+    `dtype` への変換 → キー検査 → モデル構築（`strict=True` で load）。構築（確保）は、重みが
+    存在し上限内でキーが合うと分かった後に行う。
+
+    `expected_sha256` は #387 で記録した sha256。単一ファイル（`shard_sha256=None`）では
+    `model.safetensors` の、シャード時は `model.safetensors.index.json` の期待値になる。
+    `shard_sha256` は {シャード名: sha256} で、index が参照するシャードとちょうど 1 対 1 でなければ
+    拒否する。config は 1 度だけ読んだ bytes を照合してから解釈する。重みは全バイトを 1 度に
+    まとめては読まず、シャードごとに 1 度だけ読んで sha256 を照合した同じバイト列を `mx.load` する
+    （#552。ピークは `load_peak_bytes`。記録するサイズは見積もりと一致を確認済みの値）。
+    """
+    hashes = [expected_sha256, expected_config_sha256, *(shard_sha256 or {}).values()]
+    for h in hashes:
+        if not isinstance(h, str) or len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
+            raise ValueError("expected sha256 must be 64 lowercase hex characters")
+    model_dir = Path(model_dir)
+    config_bytes = _read_limited(model_dir / "config.json", MAX_CONFIG_BYTES, "config.json")
+    if sha256_hex(config_bytes) != expected_config_sha256:
+        raise ValueError("config.json sha256 mismatch")
+    config = Qwen2Config.from_bytes(config_bytes)
+    params = config.estimated_params()
+    weight_map: dict[str, str] | None = None
+    if shard_sha256 is None:
+        files = [("model.safetensors", expected_sha256)]
+    else:
+        files, weight_map = _resolve_shards(model_dir, expected_sha256, shard_sha256, config)
+    sizes: list[int] = []
+    for name, _ in files:  # 種類・サイズを読む前に確認する
+        fd, st = _open_regular(
+            model_dir / name,
+            MAX_MODEL_BYTES,
+            "model.safetensors" if weight_map is None else "model shard",
+        )
+        os.close(fd)
+        sizes.append(st.st_size)
+    if sum(sizes) > MAX_MODEL_BYTES:
+        raise LimitExceededError(f"model files too large: {sum(sizes)} bytes > {MAX_MODEL_BYTES}")
+    if (
+        params * 2 > MAX_MODEL_BYTES
+        or load_peak_bytes(config, sizes, dtype) > MAX_MODEL_MEMORY_BYTES
+    ):
+        raise LimitExceededError("config implies a model larger than the supported size limit")
+    shapes = config.expected_shapes()
+    weights: dict[str, mx.array] = {}
+    unknown: set[str] = set()
+    for (name, sha), size in zip(files, sizes, strict=True):
+        what = "model.safetensors" if weight_map is None else "model shard"
+        shard = _read_shard(model_dir / name, what, size, sha)  # サイズは見積もりと同じ値
+        if weight_map is not None and any(weight_map.get(k) != name for k in shard):
+            raise ValueError("shard contents do not match weight_map")
+        _check_shard_tensors(shard, shapes)
+        if shard.keys() & (weights.keys() | unknown):
+            raise ValueError("duplicate weight key across shards")
+        for k in list(shard):  # 1 キーずつ変換して元を即解放する
+            if k not in shapes:
+                del shard[k]  # 後段のキー検査で拒否するため名前だけ残す（テンソルは持ち越さない）
+                unknown.add(k)
+                continue
+            converted = shard.pop(k).astype(dtype)
+            mx.eval(converted)
+            weights[k] = converted
+            del converted
+        del shard
+    _check_keys(
+        config, set(weights) | unknown, "model.safetensors" if weight_map is None else INDEX_NAME
+    )
+    model = Qwen2Model(config)
+    # 記録用: 照合した実体の大きさ（fstat の値）とシャードごとの情報（単一ファイルは None）。
+    # nn.Module は dict/list を重みとして扱うため `object.__setattr__` で素の属性にする。
+    model.source_bytes = sum(sizes)
+    object.__setattr__(
+        model,
+        "shard_info",
+        None
+        if weight_map is None
+        else [{"file": n, "bytes": s, "sha256": h} for (n, h), s in zip(files, sizes, strict=True)],
+    )
     model.load_weights(list(weights.items()), strict=True)
     del weights
     mx.eval(model.parameters())

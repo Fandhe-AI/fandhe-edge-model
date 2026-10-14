@@ -106,8 +106,9 @@ def cmd_probe(a: argparse.Namespace) -> int:
     if os.path.lexists(out_path) or not out_path.parent.is_dir():
         raise invalid("output file must not exist and its parent directory must exist")
     budget = Budget()
-    assets = load_assets(a.model_dir, pins_from_args(a))
-    model, sha, size = load_base_model(a.model_dir, to_dtype(a.dtype), pins_from_args(a))
+    pins = pins_from_args(a)
+    assets = load_assets(a.model_dir, pins)
+    model, sha, size = load_base_model(a.model_dir, to_dtype(a.dtype), pins)
     model.eval()
     budget = Budget(wall_limit=a.max_score_seconds)  # 読み込み後の forward だけを対象にする
     tok = assets.tok
@@ -145,8 +146,9 @@ def cmd_probe(a: argparse.Namespace) -> int:
         "mlx_version": mx.__version__,
         "device": a.device,
         "dtype": a.dtype,
-        "model_safetensors_sha256": sha,
+        "model_safetensors_sha256": pins.model,  # シャード時は index の sha256
         "model_safetensors_bytes": size,
+        **({"base_model_identity_sha256": sha} if pins.shards else {}),
         **assets.hashes,
         "vocab_size": model.config.vocab_size,
         "cases": cases,

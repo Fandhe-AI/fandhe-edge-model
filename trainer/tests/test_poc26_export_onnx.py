@@ -18,7 +18,7 @@ from onnx.reference import ReferenceEvaluator
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.poc26 import qwen2_model, synthetic
+from tools.poc26 import common, qwen2_model, synthetic
 from tools.poc26.export_onnx import _Graph, build_onnx, fused_weights, summarize
 from tools.poc26.lora_poc import main
 
@@ -215,11 +215,10 @@ def test_memory_estimate_over_budget_is_rejected(monkeypatch: pytest.MonkeyPatch
     """REQ-39: 同時保持量の見積もりが RSS 上限を超えるなら確保前に 20 で止める。"""
     from tools.poc26.export_onnx import check_memory
 
-    from fandhe_edge_trainer import limits
     from fandhe_edge_trainer.errors import WorkerError
     from fandhe_edge_trainer.exitcode import ExitCode
 
-    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1000)
+    monkeypatch.setattr(common, "train_rss_limit", 1000)
     check_memory(1000, "x")  # 境界は通る
     with pytest.raises(WorkerError) as ei:
         check_memory(1001, "x")
@@ -230,16 +229,15 @@ def test_cli_export_and_verify_reject_when_estimate_exceeds_budget(
     adapter_env: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REQ-39: 予算を極小にすると export は重みコピー前に、verify は照合の前に 20 で拒否する。"""
-    from fandhe_edge_trainer import limits
 
     a = adapter_env
     flags = _flags(a, a["adapter"])
     ok = a["tmp"] / "onnx_budget"
     assert main(["export-onnx", *flags, "--out-dir", str(ok)]) == 0
-    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1)
-    assert main(["export-onnx", *flags, "--out-dir", str(a["tmp"] / "onnx_over")]) == 20
+    tiny = ["--max-train-rss-bytes", "1"]  # CLI の上書き（#552）が monkeypatch より優先される
+    assert main(["export-onnx", *flags, *tiny, "--out-dir", str(a["tmp"] / "onnx_over")]) == 20
     assert not (a["tmp"] / "onnx_over").exists()
-    assert main(["verify-onnx", *flags, "--onnx-dir", str(ok)]) == 20
+    assert main(["verify-onnx", *flags, *tiny, "--onnx-dir", str(ok)]) == 20
 
 
 def test_graph_checks_budget_per_weight(tmp_path: Path) -> None:
@@ -408,12 +406,11 @@ def test_declared_length_counts_toward_memory_estimate(
     from tools.poc26 import export_onnx as ex
     from tools.poc26.common import Budget
 
-    from fandhe_edge_trainer import limits
     from fandhe_edge_trainer.errors import WorkerError
 
     model = _lora_model()
     mp, dp = _export(model, tmp_path / "o")
-    monkeypatch.setattr(limits, "MAX_TRAIN_RSS_BYTES", 1 << 30)  # 1 GiB 固定分だけで超過
+    monkeypatch.setattr(common, "train_rss_limit", 1 << 30)  # 1 GiB 固定分だけで超過
     with pytest.raises(WorkerError) as ei:
         ex.load_verified_onnx(mp.parent, _summary_for(mp, dp), Budget(), _expected(model))
     assert ei.value.exit_code == 20

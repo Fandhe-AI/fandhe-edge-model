@@ -29,6 +29,9 @@ from fandhe_edge_trainer.exitcode import ExitCode
 MAX_WALL_SECONDS_CAP = 86_400
 MIN_SEQ_LENGTH, MAX_SEQ_LENGTH = 8, 4096
 SHA_RE = re.compile(r"[0-9a-f]{64}")
+# 学習メモリ（RSS と MLX ピークの大きい方）の上限。既定は製品側の定数で、PoC 専用の引数
+# `--max-train-rss-bytes` の上書きは `cli.py` が設定・復元する（#552・追補 2 の 4 節）。
+train_rss_limit = limits.MAX_TRAIN_RSS_BYTES
 
 
 def err(code: str, message: str, exit_code: ExitCode = ExitCode.INVALID_INPUT) -> WorkerError:
@@ -125,7 +128,7 @@ class Budget:
             raise too_large("wall-clock ceiling exceeded")
         if self.wall_limit is not None and self.elapsed() > self.wall_limit:
             raise too_large("scoring wall-clock budget exceeded")
-        if max_rss_bytes() > limits.MAX_TRAIN_RSS_BYTES:
+        if max_rss_bytes() > train_rss_limit:
             raise too_large("RSS budget exceeded")
 
     def begin_phase(self) -> None:

@@ -123,7 +123,7 @@ def cmd_predict(a: argparse.Namespace) -> int:
     pred, raw, stats = score_records(
         model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds), warmup=a.warmup
     )
-    run = common_run(a, assets.hashes, sha, size)
+    run = common_run(a, assets.hashes, sha, size, shards=model.shard_info)
     run.update(
         {
             "definition_sha256": def_sha,
@@ -135,7 +135,6 @@ def cmd_predict(a: argparse.Namespace) -> int:
             "scoring": stats,
             "elapsed_seconds": budget.elapsed(),
             "max_rss_bytes": max_rss_bytes(),
-            "mlx_peak_memory_bytes": int(mx.get_peak_memory()),  # #393 の併記用
         }
     )
     with OutputDir(a.out_dir) as out:

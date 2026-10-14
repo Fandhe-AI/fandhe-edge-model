@@ -29,8 +29,10 @@ import numpy as np
 import onnx
 from mlx.utils import tree_flatten
 from onnx import TensorProto, helper, numpy_helper
+from tools.poc26 import common
 from tools.poc26.assets import (
     Pins,
+    base_identity,
     load_assets,
     load_base_model,
     pins_from_args,
@@ -46,8 +48,6 @@ from tools.poc26.io_records import (
 from tools.poc26.predict import attach_adapter
 from tools.poc26.qwen2_model import LoRALinear, Qwen2Config, Qwen2Model
 from tools.poc26.safe_io import LimitExceededError, open_regular
-
-from fandhe_edge_trainer import limits
 
 OPSET = 13
 IR_VERSION = (
@@ -436,11 +436,11 @@ def summarize(model_path: Path, data_path: Path) -> dict[str, Any]:
 
 
 def check_memory(estimate: int, what: str) -> None:
-    """同時保持量の見積もりが RSS 上限（`limits.MAX_TRAIN_RSS_BYTES`）超なら 20 で止める。
+    """同時保持量の見積もりが RSS 上限（`common.train_rss_limit`）超なら 20 で止める。
 
     確保の前に呼ぶ（`Budget.check` はピーク実測で確保後にしか検知できないため。REQ-39）。
     """
-    if estimate > limits.MAX_TRAIN_RSS_BYTES:
+    if estimate > common.train_rss_limit:
         raise too_large(f"{what} needs about {estimate} bytes, over the RSS budget")
 
 
@@ -456,7 +456,7 @@ def _load_fused_source(a: argparse.Namespace) -> tuple[Qwen2Model, dict[str, Any
     weights, cfg = load_adapter(adapter_bytes)
     del adapter_bytes
     if tuple(cfg[k] for k in _PINS_FROM_CFG) != (
-        pins.model,
+        base_identity(pins),
         pins.config,
         pins.tokenizer,
         pins.tokenizer_config,
