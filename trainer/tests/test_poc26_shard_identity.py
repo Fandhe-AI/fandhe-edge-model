@@ -61,3 +61,21 @@ def test_shard_identity_binds_contents_and_rejects_other_shards(tmp_path: Path) 
     mx.save_safetensors(str(model / "b.safetensors"), {k: v + 0.5 for k, v in w.items()})
     other = {**shards, "b.safetensors": _h(model / "b.safetensors")}
     assert _predict_sharded(model, data, out, tmp_path / "p2", other) == 64
+
+
+def test_probe_records_index_sha_and_identity_for_shards(tmp_path: Path) -> None:
+    """REQ-41・#552: probe もシャード時は index の sha256 と識別値を別キーに記録する。"""
+    model = make_dir(tmp_path)
+    shards = _shard(model)
+    pins = pin_values(model)
+    pins["model"] = _h(model / INDEX)
+    out = tmp_path / "probe.json"
+    argv = ["probe", "--model-dir", str(model), "--out", str(out), "--device", "cpu"]
+    argv += ["--dtype", "float32", "--evidence", "test_harness", *_shard_flags(shards)]
+    argv += [x for k, v in pins.items() for x in (f"--{k}-sha256", v)]
+    assert main(argv) == 0
+    doc = json.loads(out.read_text())
+    assert doc["model_safetensors_sha256"] == _h(model / INDEX)
+    assert doc["base_model_identity_sha256"] == assets_mod.shard_identity(
+        _h(model / INDEX), sorted(shards.items())
+    )

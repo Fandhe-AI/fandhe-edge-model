@@ -514,18 +514,28 @@ def trainable_parameter_count(model: nn.Module) -> int:
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
-def load_peak_bytes(config: Qwen2Config, max_file_size: int, dtype: mx.Dtype) -> int:
-    """読み込みの同時保持量の最大（バイト）。上限判定に使う（REQ-39）。
+def load_peak_bytes(config: Qwen2Config, sizes: list[int], dtype: mx.Dtype) -> int:
+    """読み込みの同時保持量の最大（バイト）。各段階の max で上限判定に使う（REQ-39）。
 
-    シャードを 1 つずつ読んで即 `dtype` へ変換して溜めるため、ピークは
-    「変換済みの全重み C = params × dtype」＋「読み込み中の 1 ファイル分のバイト列 S と、そこから
-    `mx.load` した重み S（計 2S）」＋「最大テンソル 1 個分
-    の余裕 T = max(vocab, intermediate) × hidden × 4」。モデルの既定パラメータ（float32）は MLX の
-    遅延評価で実体化されないまま `load_weights` で置き換わるため数えない（#552）。
-    単一ファイルでは S がファイル全体になる。
+    ファイル（シャード）i を順に処理し、`_read_shard` はバイト列を手放してから dtype 変換する。
+    P_i = 先に変換済みのファイルの変換後サイズの和、conv_i = ファイル i の変換後サイズ
+    （ファイルの dtype は読む前は不明なので 2 バイト幅と仮定して `S_i × dtype.size / 2`。
+    float32 のファイルなら実際はこれ以下）、T = 最大テンソル 1 個分の余裕
+    （`max(vocab, intermediate) × hidden × 4`）として:
+      読み込み: P_i + S_i（バイト列）+ S_i（`mx.load` した重み。ファイルの dtype）
+      変換:     P_i + S_i（読み込んだ重み）+ conv_i
+      最後:     C（= params × dtype）+ T
+    モデルの既定パラメータ（float32）は MLX の遅延評価で実体化されないまま `load_weights` で
+    置き換わるため数えない（#552）。
     """
     t = max(config.vocab_size, config.intermediate_size) * config.hidden_size * 4
-    return config.estimated_params() * dtype.size + 2 * max_file_size + t
+    peak = config.estimated_params() * dtype.size + t
+    done = 0
+    for s in sizes:
+        conv = s * dtype.size // 2
+        peak = max(peak, done + 2 * s, done + s + conv)
+        done += conv
+    return peak
 
 
 _SHARD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.safetensors")
@@ -606,7 +616,7 @@ def _read_shard(
     書き換え（同サイズの上書き・mtime 偽装・A→B→A）は読み込みに影響しない。サイズは見積もりに
     使った `expected_size` と一致しなければ拒否する（fstat と、`expected_size + 1` まで読んだ長さの
     両方で確認。増えていれば `LimitExceededError`）。読み込み中は「バイト列 + 読み込んだ重み」を
-    保持する（`load_peak_bytes` が 2S で数える）。
+    保持する（`load_peak_bytes` の読み込み段階で数える）。
     """
     fd, st = _open_regular(path, expected_size, what)
     with os.fdopen(fd, "rb") as f:
@@ -679,7 +689,7 @@ def load_qwen2(
         raise LimitExceededError(f"model files too large: {sum(sizes)} bytes > {MAX_MODEL_BYTES}")
     if (
         params * 2 > MAX_MODEL_BYTES
-        or load_peak_bytes(config, max(sizes), dtype) > MAX_MODEL_MEMORY_BYTES
+        or load_peak_bytes(config, sizes, dtype) > MAX_MODEL_MEMORY_BYTES
     ):
         raise LimitExceededError("config implies a model larger than the supported size limit")
     shapes = config.expected_shapes()
