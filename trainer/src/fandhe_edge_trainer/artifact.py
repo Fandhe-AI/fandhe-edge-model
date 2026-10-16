@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import IO, Any
 
@@ -33,6 +34,14 @@ from .limits import MAX_MODEL_BYTES
 
 #: 選択口（本ワーカー）のバージョン。artifact.json の再現性の記録に使う。
 SELECTOR_VERSION = "0.1"
+
+#: 入力表現の宣言（`artifact.json` の任意の欄 `input_representation`）。欄が無ければ既定値。
+#: Rust 側 `PackageInputRepresentation` と共有 fixture
+#: `fixtures/input_representation/declaration_cases.json` で同一解釈を照合する
+#: （REQ-41・TASK-41.3-2・#403）。
+INPUT_REPRESENTATION_KEY = "input_representation"
+DEFAULT_INPUT_REPRESENTATION = "byte"
+INPUT_REPRESENTATIONS = ("byte", "tokenizer")
 
 ONNX_FILE_NAME = "model.onnx"
 ARTIFACT_FILE_NAME = "artifact.json"
@@ -101,6 +110,20 @@ def build_artifact(
         "created_utc": now_utc(),
         "candidate_label": candidate_label,
     }
+
+
+def parse_input_representation(artifact: Mapping[str, Any]) -> str | None:
+    """`artifact` の入力表現の宣言を解釈する（REQ-41・TASK-41.3-2・#403）。
+
+    欄が無ければ `byte`。許可値（大文字小文字を区別）以外は `None`（Rust 側の
+    `Malformed` に相当。fail-closed）。`null` も不正として `None`。
+    """
+    if INPUT_REPRESENTATION_KEY not in artifact:
+        return DEFAULT_INPUT_REPRESENTATION
+    value = artifact[INPUT_REPRESENTATION_KEY]
+    if isinstance(value, str) and value in INPUT_REPRESENTATIONS:
+        return value
+    return None
 
 
 def write_artifact(tmp_fd: int, artifact: dict[str, Any]) -> None:
@@ -209,6 +232,8 @@ def verify_output(dir_fd: int) -> None:
     artifact = _read_artifact_via_fd(dir_fd)
     if not isinstance(artifact, dict):
         raise _integrity_error("artifact.json is not a JSON object")
+    if parse_input_representation(artifact) is None:
+        raise _integrity_error("artifact.json input_representation is invalid")
     expected = artifact.get("onnx_sha256")
     if not isinstance(expected, str) or not expected:
         raise _integrity_error("artifact.json missing onnx_sha256")

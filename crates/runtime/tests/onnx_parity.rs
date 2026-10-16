@@ -156,3 +156,80 @@ fn req32_c1_labels_match_mlx() {
 fn req32_c3_labels_match_mlx() {
     check_kind(ModelKind::C3);
 }
+
+/// 宣言の有無で予測が変わらないこと（REQ-41・TASK-41.3-2・#403）。
+///
+/// `cases.json` の entry から `artifact.json` を組み（宣言なし／`byte`）、CLI の `build_pipeline` と
+/// 同じ順（meta → kind・max_bytes・sha・onnx）でパイプラインを組んで全件を推論する。宣言なしと
+/// `byte` はスコアを含めて全件一致し、MLX のラベルとも全件一致する。
+fn check_declaration_regression(kind: ModelKind) {
+    use fandhe_edge_core::artifact_meta::{ArtifactMeta, PackageInputRepresentation};
+    let doc = load_cases();
+    let entry = doc["kinds"][kind.as_str()].clone();
+    let cases = cases_of(&entry);
+    assert!(cases.len() >= 100, "{}: too few cases", kind.as_str());
+    let labels: Vec<String> = (0..cases[0].probs.len()).map(|i| format!("l{i}")).collect();
+    let inputs: Vec<&str> = cases.iter().map(|c| c.input.as_str()).collect();
+
+    let mut results = Vec::new();
+    for extra in ["", r#","input_representation":"byte""#] {
+        let json = format!(
+            r#"{{"kind":"{}","kind_version":1,"max_bytes":{},"label_order":{},"onnx_file":"{}","onnx_sha256":"{}"{extra}}}"#,
+            kind.as_str(),
+            entry["max_bytes"],
+            serde_json::to_string(&labels).expect("labels"),
+            entry["onnx"].as_str().expect("onnx"),
+            entry["onnx_sha256"].as_str().expect("sha"),
+        );
+        let meta = ArtifactMeta::parse(json.as_bytes()).expect("meta");
+        assert_eq!(
+            meta.input_representation(),
+            PackageInputRepresentation::Byte
+        );
+        let sha: Sha256Digest = meta.onnx_sha256().parse().expect("sha parse");
+        let max_bytes = usize::try_from(meta.max_bytes()).expect("usize");
+        let pipeline = load_pipeline(
+            ModelKind::parse(meta.kind()).expect("kind"),
+            max_bytes,
+            &fixture_dir().join(meta.onnx_file()),
+            &sha,
+        )
+        .expect("load pipeline");
+        let out: Vec<_> = pipeline
+            .infer_batch(&inputs)
+            .expect("infer_batch")
+            .into_iter()
+            .map(|r| r.expect("item"))
+            .collect();
+        results.push(out);
+    }
+    assert!(
+        results[0] == results[1],
+        "{}: undeclared and byte predictions differ",
+        kind.as_str()
+    );
+    let mismatched = results[0]
+        .iter()
+        .zip(&cases)
+        .filter(|(p, c)| p.label_index() != c.label)
+        .count();
+    assert_eq!(
+        mismatched,
+        0,
+        "{}: {mismatched} of {} labels differ from MLX",
+        kind.as_str(),
+        cases.len()
+    );
+}
+
+/// REQ-41 回帰: C1 は宣言の導入前後（宣言なし・`byte`）で予測が全件一致する。
+#[test]
+fn req41_c1_declaration_regression() {
+    check_declaration_regression(ModelKind::C1);
+}
+
+/// REQ-41 回帰: C3 は宣言の導入前後（宣言なし・`byte`）で予測が全件一致する。
+#[test]
+fn req41_c3_declaration_regression() {
+    check_declaration_regression(ModelKind::C3);
+}
