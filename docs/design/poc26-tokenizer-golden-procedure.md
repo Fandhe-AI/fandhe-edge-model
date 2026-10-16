@@ -8,7 +8,7 @@
 
 - 担当: 人間（実機で実行する。Agent は手順とスクリプトの準備までに留める）
 - 証拠の種別: 実機
-- 結果は参照側（HF `tokenizers`）の id を `fixtures/poc26/tokenizer_golden.json` に固定し、以後は参照側なしで自作側だけを検査できるようにする。Phase 3 の Rust 実装の共有ゴールデンベクタにもなる。
+- 結果は参照側（HF `tokenizers`）の id を `fixtures/poc26/tokenizer_golden.json` に固定し、以後は参照側なしで自作側だけを検査できるようにする。Phase 3 の Rust 実装の共有ゴールデンベクタにもなる。製品契約の形式は `fixtures/preprocess/tokenizer_vectors.json`（`fixtures/preprocess/PROVENANCE.md`）。
 
 ## 前提
 
