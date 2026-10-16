@@ -12,7 +12,8 @@
 //!   guard への依存は持たない。guard の型からの変換は CLI の配線（TASK-41.5・#425）が行う
 //! - ライセンス表記は記録するだけで、可否は判定しない（ライセンス判断は人が行う）
 //! - 取得元は通信せず文字列として記録する（REQ-38）。ローカル絶対パス
-//!   （`/`・`~`・`file:` 始まり）は配布メタデータへ環境情報を漏らすため拒否する
+//!   や資格情報入り URL は配布メタデータへ漏らすため、`https://` 始まりのみ許可し
+//!   `@`・`?`・`#` を含む値を拒否する
 //! - 読み戻し（JSON → 型）は呼び出し側が無いため未実装
 
 use std::collections::BTreeSet;
@@ -150,11 +151,12 @@ impl BaseModelProvenance {
         if !text_ok(license, LICENSE_MAX_BYTES) {
             return Err(E::InvalidLicense);
         }
-        // ponytail: 先頭文字列による簡易判定。Windows のドライブ文字パス等は拒否しない。
+        // https:// 始まりのみ許可し、資格情報（userinfo の `@`）・クエリ・フラグメントを拒否する。
+        // ローカルパス（絶対・相対・Windows ドライブ・UNC）は https:// で始まらないため落ちる。
         // URL としての正しさは通信しない方針（REQ-38）のため検証しない
         if !text_ok(origin, ORIGIN_MAX_BYTES)
-            || origin.starts_with(['/', '~'])
-            || origin.starts_with("file:")
+            || !origin.starts_with("https://")
+            || origin.contains(['@', '?', '#', '\\'])
         {
             return Err(E::InvalidOrigin);
         }
@@ -273,18 +275,37 @@ mod tests {
     #[test]
     fn req41_origin_boundaries() {
         let ok = |o: &str| make("MIT", o, vec![file("a")]);
-        assert!(ok(&"a".repeat(1024)).is_ok());
+        assert!(ok(&format!("https://{}", "a".repeat(1016))).is_ok());
+        assert!(ok("https://huggingface.co/org/model").is_ok());
         for bad in [
             String::new(),
-            "a".repeat(1025),
-            "a\0b".into(),
-            " a".into(),
+            format!("https://{}", "a".repeat(1017)),
+            "https://a\0b".into(),
+            " https://a".into(),
+            "a".into(),
             "/home/u/m".into(),
             "~/m".into(),
             "file:///m".into(),
+            "http://x".into(),
+            "https://user:token@host/m".into(),
+            "https://host/m?token=1".into(),
+            "https://host/m#frag".into(),
+            "C:/m".into(),
+            "//host/m".into(),
+            "./m".into(),
+            "../m".into(),
         ] {
             assert_eq!(ok(&bad), Err(BaseModelProvenanceError::InvalidOrigin));
         }
+    }
+
+    /// guard の `MAX_SPLIT_FILES` との値の一致を機械照合する（data は guard に依存しないため
+    /// ソース文字列で確認する）。
+    #[test]
+    fn req41_max_files_matches_guard() {
+        let src = include_str!("../../../guard/src/split_files.rs");
+        let want = format!("pub const MAX_SPLIT_FILES: usize = {MAX_FILES};");
+        assert!(src.contains(&want), "{want}");
     }
 
     #[test]

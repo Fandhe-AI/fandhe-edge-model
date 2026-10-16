@@ -71,7 +71,7 @@ fn req41_max_size_record_fits_artifact_meta_limit() {
     let p = BaseModelProvenance::new(
         ModelName::new(&"n".repeat(256)).unwrap(),
         &"l".repeat(256),
-        &"o".repeat(1024),
+        &format!("https://{}", "o".repeat(1016)),
         big,
     )
     .unwrap();
