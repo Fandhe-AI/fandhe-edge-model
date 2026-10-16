@@ -23,7 +23,9 @@
 //!   （REQ-23 境界値・TASK-23.2・issue #57）
 //! - [`provenance`]: 来歴レコード型（REQ-40・TASK-40.1-1・issue #74）。
 //!   [`provenance::ingest`] で取り込み時の JSON 検証・記録 JSON 生成を実装
-//!   （TASK-40.1-2・issue #75）
+//!   （TASK-40.1-2・issue #75）。[`provenance::base_model`] でベースモデルの
+//!   来歴（名前・ライセンス表記・取得元・ファイルごとの sha256。REQ-41・
+//!   TASK-41.2-3・issue #399）を記録
 //! - [`ingest`][]: データ検査（[`inspect::inspect_records`]）と来歴の取り込み
 //!   （[`provenance::ingest::parse_provenance_json`]）の接続点
 //!   （REQ-40・TASK-40.1-2・issue #75）
