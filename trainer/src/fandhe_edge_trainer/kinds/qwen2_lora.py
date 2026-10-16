@@ -84,6 +84,8 @@ def _validate_config(cfg: dict[str, Any]) -> None:
         raise _invalid_config("config.base_model_dir must be a non-empty string")
     if not isinstance(cfg["base_model_sha256"], dict):
         raise _invalid_config("config.base_model_sha256 must be an object")
+    # 範囲検査は `apply_lora` と重複する。`apply_lora` は単体でも公開されるため残し、こちらは
+    # ベース読み込み（重い処理）の前に弾くための早期検査として置く。
     _int_in(cfg, "lora_rank", 1, limits.MAX_LORA_RANK)
     _int_in(cfg, "lora_num_layers", 1, 1 << 10)  # ベースの層数との比較は `apply_lora`
     _int_in(cfg, "iters", 1, limits.MAX_LORA_ITERS)
@@ -111,7 +113,11 @@ def _system_prompt(label_order: list[str]) -> str:
 
 
 def make_batches(lengths: list[int], batch_size: int) -> list[list[int]]:
-    """長さ順に並べて `batch_size` 件ずつに区切る。端数は捨てる（mlx-lm の `iterate_batches`）。"""
+    """長さ順に並べて `batch_size` 件ずつに区切る。端数は捨てる（mlx-lm の `iterate_batches`）。
+
+    端数は長さ昇順の末尾（最大 `batch_size - 1` 件）＝最も長い例が落ちる。件数が `batch_size`
+    の倍数でない限り、最長の例は学習に使われない。
+    """
     order = sorted(range(len(lengths)), key=lambda i: lengths[i])
     return [order[i : i + batch_size] for i in range(0, len(order) - batch_size + 1, batch_size)]
 
