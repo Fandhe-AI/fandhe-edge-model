@@ -148,9 +148,43 @@ def test_activation_bytes_estimate() -> None:
 
     from fandhe_edge_trainer.kinds.qwen2_lora import _activation_bytes
 
-    c = SimpleNamespace(hidden_size=100, intermediate_size=200, num_attention_heads=4)
+    c = SimpleNamespace(
+        hidden_size=100, intermediate_size=200, num_attention_heads=4, vocab_size=50
+    )
     cfg = {"batch_size": 2, "max_seq_length": 10, "lora_num_layers": 3}
-    assert _activation_bytes(c, cfg) == 4 * 20 * (1000 + 600 + 40) * 3
+    # 層ごとの保持活性＋損失計算の logits（3 本分）
+    assert _activation_bytes(c, cfg) == 4 * 20 * (1000 + 600 + 40) * 3 + 12 * 20 * 50
+
+
+def test_huge_int_config_is_invalid_config() -> None:
+    """REQ-39: 10**400 は OverflowError でなく invalid_config(64)。"""
+    from fandhe_edge_trainer.kinds.qwen2_lora import _num_in
+
+    with pytest.raises(WorkerError) as e:
+        _num_in({"lr": 10**400}, "lr", 0.0, 1.0, lo_open=True)
+    assert e.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_total_tokens_checked_before_encoding() -> None:
+    """REQ-39: 件数 x max_seq_length が上限超なら列を保持する前に limit_exceeded(20)。"""
+    from types import SimpleNamespace
+
+    from fandhe_edge_trainer.kinds.qwen2_lora import _build_sequences
+
+    class Boom:
+        def encode(self, *_a: object) -> list[int]:
+            raise AssertionError("must not encode")
+
+    with pytest.raises(WorkerError) as e:
+        _build_sequences(
+            [None] * 60_000,  # type: ignore[list-item]
+            SimpleNamespace(label_order=["a"]),  # type: ignore[arg-type]
+            Boom(),
+            {"max_seq_length": 1000},
+            10,
+            None,  # type: ignore[arg-type]
+        )
+    assert e.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
 def test_export_onnx_is_not_implemented() -> None:

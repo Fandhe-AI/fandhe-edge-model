@@ -65,7 +65,12 @@ def _int_in(cfg: dict[str, Any], key: str, lo: int, hi: int) -> int:
 
 def _num_in(cfg: dict[str, Any], key: str, lo: float, hi: float, *, lo_open: bool) -> float:
     v = cfg[key]
-    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+    if ok:
+        try:
+            ok = math.isfinite(v)  # 10**400 等の巨大整数は float 変換で OverflowError になる
+        except OverflowError:
+            ok = False
     if not ok or v > hi or (v <= lo if lo_open else v < lo):
         raise _invalid_config(f"config.{key} is out of range")
     return float(v)
@@ -107,7 +112,9 @@ def _activation_bytes(c: Any, cfg: dict[str, Any]) -> int:
     tokens = cfg["batch_size"] * cfg["max_seq_length"]
     per_token = 10 * c.hidden_size + 3 * c.intermediate_size
     per_token += c.num_attention_heads * cfg["max_seq_length"]
-    return 4 * tokens * per_token * cfg["lora_num_layers"]
+    layers_bytes = 4 * tokens * per_token * cfg["lora_num_layers"]
+    # 損失計算の float32 logits（順伝播・softmax・勾配の 3 本分の上限寄り見積もり）
+    return layers_bytes + 3 * 4 * tokens * c.vocab_size
 
 
 def _seed_all(seed: int) -> None:
@@ -196,6 +203,8 @@ def _build_sequences(
     resource_budget: budget.ResourceBudget,
 ) -> tuple[list[list[int]], int]:
     """全件の学習列（chat template＋ラベル＋`<|im_end|>`）を組み立て、長さを確認する。"""
+    # 保持前に総トークン数の上限を件数 x max_seq_length で見積もる（REQ-39）
+    budget.check_total_tokens(len(examples), cfg["max_seq_length"])
     system = _system_prompt(request.label_order)
     header = tokenizer.encode("assistant\n")
     for label in request.label_order:
