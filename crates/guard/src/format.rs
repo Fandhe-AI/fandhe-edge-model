@@ -22,8 +22,17 @@
 //!
 //! pickle プロトコル 0/1（テキスト opcode 始まり）は誤検出が多いため固定シグネチャでは
 //! 判定せず、ONNX の構造検査にも通らないので `Unknown` として拒否される。
+//!
+//! # ベースモデル形式（REQ-41・TASK-41.2-1・#397）
+//!
+//! 判定順は固定シグネチャ → ONNX → safetensors → tokenizer JSON → `Unknown`。safetensors はヘッダーの形
+//! （データ部は解釈しない）、tokenizer JSON は `model.type` を持つ object の形だけを見る
+//! （検査本体は `fandhe_edge_core::base_model_format`。ガード層に serde を入れないため）。
+//! `.bin`・`.pt` の実体は pickle か zip で、固定シグネチャにより `Pickle`・`Zip` となり
+//! [`FormatAllowlist::base_model`] に入らず拒否される（中身は解釈しない）。
 
 use crate::file_size::effective_read_limit;
+use fandhe_edge_core::base_model_format;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, read_bounded, read_bounded_open_file};
 use std::collections::BTreeSet;
@@ -45,6 +54,10 @@ pub enum FileFormat {
     Zip,
     /// GGUF（先頭 `GGUF`）。
     Gguf,
+    /// safetensors（ヘッダーの形とテンソルのオフセット整合を検査したもの。REQ-41・TASK-41.2-1）。
+    Safetensors,
+    /// HF `tokenizer.json`（`model.type` を持つ JSON object。REQ-41・TASK-41.2-1）。
+    TokenizerJson,
     /// 上のいずれでもない（空ファイルを含む）。許可リストには入らない。
     Unknown,
 }
@@ -58,6 +71,8 @@ impl FileFormat {
             FileFormat::Npy => "npy",
             FileFormat::Zip => "zip",
             FileFormat::Gguf => "gguf",
+            FileFormat::Safetensors => "safetensors",
+            FileFormat::TokenizerJson => "tokenizer_json",
             FileFormat::Unknown => "unknown",
         }
     }
@@ -518,6 +533,9 @@ fn detect_format(bytes: &[u8]) -> FileFormat {
     };
     match scan_onnx_model(&mut src, total_len) {
         Ok(OnnxScan::Onnx) if has_no_external_data(bytes) => FileFormat::Onnx,
+        // ベースモデル形式（REQ-41・TASK-41.2-1）。ONNX を先に判定し既存の判定結果は変えない。
+        _ if base_model_format::is_safetensors(bytes) => FileFormat::Safetensors,
+        _ if base_model_format::is_tokenizer_json(bytes) => FileFormat::TokenizerJson,
         _ => FileFormat::Unknown,
     }
 }
@@ -542,6 +560,13 @@ impl FormatAllowlist {
     /// 推論・パッケージ用の既定（ONNX のみ）。
     pub fn onnx_only() -> Self {
         Self::new([FileFormat::Onnx])
+    }
+
+    /// ベースモデルの重み・トークナイザー用（REQ-41・TASK-41.2-1）。safetensors と tokenizer JSON のみ。
+    /// pickle・zip（`.bin`・`.pt`）・npy・gguf・ONNX・`Unknown` は入らない。
+    /// 重みとトークナイザーを個別に絞る呼び出し側は [`FormatAllowlist::new`] を使う。
+    pub fn base_model() -> Self {
+        Self::new([FileFormat::Safetensors, FileFormat::TokenizerJson])
     }
 
     /// 形式が許可されているか。
@@ -1054,6 +1079,36 @@ mod tests {
         ok.push(0x01);
         ok.extend_from_slice(&[0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78]);
         assert_eq!(d(&ok), FileFormat::Onnx);
+    }
+
+    /// REQ-39・REQ-41・TASK-41.2-1: safetensors と tokenizer JSON を判定し、許可リストの扱いを分ける。
+    #[test]
+    fn req41_base_model_formats() {
+        let hdr = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut st = (hdr.len() as u64).to_le_bytes().to_vec();
+        st.extend_from_slice(hdr.as_bytes());
+        st.extend_from_slice(&[0; 4]);
+        let tok = br#"{"model":{"type":"BPE"}}"#;
+        assert_eq!(d(&st), FileFormat::Safetensors);
+        assert_eq!(d(tok), FileFormat::TokenizerJson);
+        assert_eq!(FileFormat::Safetensors.name(), "safetensors");
+        assert_eq!(FileFormat::TokenizerJson.name(), "tokenizer_json");
+        let al = FormatAllowlist::base_model();
+        assert!(al.contains(FileFormat::Safetensors) && al.contains(FileFormat::TokenizerJson));
+        for f in [
+            FileFormat::Pickle,
+            FileFormat::Zip,
+            FileFormat::Npy,
+            FileFormat::Gguf,
+            FileFormat::Onnx,
+            FileFormat::Unknown,
+        ] {
+            assert!(!al.contains(f));
+        }
+        let only = FormatAllowlist::onnx_only();
+        assert!(
+            !only.contains(FileFormat::Safetensors) && !only.contains(FileFormat::TokenizerJson)
+        );
     }
 
     /// REQ-39・TASK-39.2-1: onnx_only は ONNX だけを通し、他は InvalidInput(64) で拒否する。

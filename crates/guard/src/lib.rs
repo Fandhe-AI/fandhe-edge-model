@@ -6,7 +6,7 @@
 //!
 //! # 現状
 //!
-//! - [`format`][]: 許可リストによるファイル形式判定（TASK-39.2-1・#153）。実装済み
+//! - [`format`][]: 許可リストによるファイル形式判定（TASK-39.2-1・#153）。実装済み。ベースモデル形式（safetensors・tokenizer JSON。`FormatAllowlist::base_model`）も実装済み（REQ-41・TASK-41.2-1・#397。ディレクトリ受付・閉じ込めは #398）
 //! - [`model_file`]: モデルファイルの拡張子（`.onnx`）と内容（ONNX）の照合による pickle 偽装・非 ONNX の拒否
 //!   （TASK-39.2-2・#154）。実装済み
 //! - [`path`]: 経路の閉じ込め（`safe_join` 相当・検証と open を一体化した `open_confined`。TASK-39.4-1・#158）。実装済み。
