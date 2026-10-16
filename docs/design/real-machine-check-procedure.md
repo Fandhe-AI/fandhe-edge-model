@@ -709,7 +709,8 @@ G〜J の記録欄（人が実行した結果を記入する。スクリプト�
 **C-1**（`max_infer_p95_us: 50000`）:
 
 - `package` exit 0
-- `infer_p95`: `p95_us` 2・`limit_us` 50000・`exceeded` false・`guideline_us` 250000・`over_guideline` false
+- `infer_p95`: `p95_us` 2・`limit_us` 50000・`exceeded` false
+  - 後日の計算による注記: 当時の CLI は `guideline_us`・`over_guideline` を出力していない。`p95_us` 2 は目標 250000 を下回るため、新形式なら `over_guideline` は false になる見込み（推定。新形式の実機確認は別の実行記録として追加する）
 - `classification: reference_only`（他アプリが動作中。load avg 8.10。`--quiet-machine` 無し）
 
 **C-2**（`max_package_bytes: 1000`）:
