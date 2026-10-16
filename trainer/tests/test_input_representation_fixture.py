@@ -29,15 +29,18 @@ def _load() -> dict[str, Any]:
 
 def test_req41_declaration_cases_match_fixture() -> None:
     doc = _load()
-    assert artifact.DEFAULT_INPUT_REPRESENTATION == doc["default"]
-    assert list(artifact.INPUT_REPRESENTATIONS) == doc["accepted_values"]
+    assert artifact.DEFAULT_INPUT_REPRESENTATION.value == doc["default"]
+    assert [m.value for m in artifact.InputRepresentation] == doc["accepted_values"]
     assert len(doc["cases"]) >= 10
     for c in doc["cases"]:
         art = dict(doc["base_artifact"])
         if c["present"]:
             art["input_representation"] = c["value"]
-        got = artifact.parse_input_representation(art)
-        assert (got if got is not None else "reject") == c["expect"], c["name"]
+        try:
+            got = artifact.parse_input_representation(art).value
+        except ValueError:
+            got = "reject"
+        assert got == c["expect"], c["name"]
 
 
 def test_req41_build_artifact_is_interpreted_as_byte() -> None:
@@ -51,4 +54,4 @@ def test_req41_build_artifact_is_interpreted_as_byte() -> None:
         candidate_label="c3",
         onnx_sha256="ab" * 32,
     )
-    assert artifact.parse_input_representation(art) == "byte"
+    assert artifact.parse_input_representation(art) is artifact.InputRepresentation.BYTE
