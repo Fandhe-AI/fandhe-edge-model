@@ -20,7 +20,7 @@
 
 隠れ状態は 2 次元 `[rows, H]` で持つ。prefix は `rows=T`、選択肢ブロックは `rows=K*M`。線形層がすべて `Gemm(transB=1)` になり、重みを HF の (out, in) のまま bf16 で持てる（転置コピーを作らない）。
 
-1. 共通の前処理: `Reshape(ids,[-1])`。`Shape`・`Gather`（スカラー T）・`Range(0,T,1)` で位置を作り、`Cast`（INT64 → FLOAT）・`Unsqueeze`・`Mul(inv_freq)` から `Cos`・`Sin` で RoPE 表を作る。prefix の因果マスクは `Unsqueeze`・`Greater` → `Where(future, -1e30, s)`（Trilu は opset 14 のため使わない）
+1. 共通の前処理: `Reshape(ids,[-1])`。`Shape`・`Gather`（INT64 の形状から INT64 スカラー T を取る。出力は INT64 のまま `Range(0,T,1)` へ渡す）で位置を作り、`Cast`（INT64 → FLOAT）・`Unsqueeze`・`Mul(inv_freq)` から `Cos`・`Sin` で RoPE 表を作る。prefix の因果マスクは `Unsqueeze`・`Greater` → `Where(future, -1e30, s)`（Trilu は opset 14 のため使わない）
 2. 埋め込み: 論理グラフは `Gather(Cast(embed_bf16), ids)`（BFLOAT16 は initializer と Cast の入力にだけ現れ、Gather の出力は FLOAT）。実行時は Cast と Gather を融合し、参照された行だけを f32 に展開する。埋め込み全体は f32 に展開しない
 3. 各層（prefix）
    - RMSNorm: `Mul(x,x)` → `ReduceMean` → `Add(eps)` → `Sqrt` → `Reciprocal` → `Mul` → `Mul(Cast(w_bf16))`
@@ -59,7 +59,7 @@
 | Sqrt / Reciprocal | RMSNorm | FLOAT | #416 |
 | Cast | bf16 の重みの展開・位置の型変換 | `to=FLOAT` だけ。入力は BFLOAT16（initializer のみ）か INT64 | #416 |
 | Shape | T の取得 | 属性 start・end は使わない | #417 |
-| Gather | 埋め込み・スカラー T | `axis=0`。data は FLOAT か `Cast(BFLOAT16 の initializer)`（埋め込み。2 節の融合実行）。index は INT64 で、範囲外は拒否 | #417 |
+| Gather | 埋め込み・スカラー T | `axis=0`。data は FLOAT か `Cast(BFLOAT16 の initializer)`（埋め込み。2 節の融合実行）か、Shape の出力である INT64（形状取得用。出力は INT64 のまま Range へ渡す）。index は INT64 で、範囲外は拒否 | #417 |
 | GatherElements | 目標 token の対数確率 | `axis=-1`。index は INT64 で、範囲外は拒否 | #417 |
 | Reshape | heads・平坦化 | shape は INT64 の入力。0 と -1 の意味は opset 13 のとおり | #417 |
 | Transpose | heads・k の転置 | `perm` は rank と一致する順列 | #417 |
