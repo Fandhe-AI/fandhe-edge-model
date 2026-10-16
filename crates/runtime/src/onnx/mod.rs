@@ -47,6 +47,7 @@
 
 mod c1;
 mod c3;
+pub mod ops;
 mod proto;
 mod wire;
 
