@@ -1,7 +1,6 @@
 """qwen2_lora の選択肢スコアリングによる予測（REQ-41・REQ-19b・REQ-39・TASK-41.5-4・#427）。
 
-極小の合成モデルで確かめる。証拠種別: テストハーネス（CPU）。全件一致の決定性・範囲外エラーの
-網羅は #428。
+極小の合成モデルで確かめる。証拠種別: テストハーネス（CPU）。範囲外エラーの網羅は #428。
 """
 
 from __future__ import annotations
@@ -94,3 +93,12 @@ def test_chunking_does_not_change_scores(trained) -> None:
     b = q.score_labels(trained.model, prompt, ids, pad, chunk=8)
     assert np.allclose(a, b, atol=1e-4)
     assert int(a.argmax()) == int(b.argmax())
+
+
+def test_single_and_batch_predictions_match(trained) -> None:
+    """REQ-28: 長さの異なる複数入力で、1 件ずつの結果と一括の結果が全件一致する。"""
+    rows = [*ROWS, ("d", "word " * 6), ("e", "x")]
+    batch = q.predict_records(trained, rows)
+    single = [r for row in rows for r in q.predict_records(trained, [row])]
+    keys = ("id", "status", "predicted_label")
+    assert [{k: r[k] for k in keys} for r in single] == [{k: r[k] for k in keys} for r in batch]
