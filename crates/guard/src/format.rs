@@ -25,7 +25,7 @@
 //!
 //! # ベースモデル形式（REQ-41・TASK-41.2-1・#397）
 //!
-//! 判定順は固定シグネチャ → ONNX → safetensors → tokenizer JSON → `Unknown`。safetensors はヘッダーの形
+//! 判定順は safetensors（pickle シグネチャとの衝突回避のため先頭）→ 固定シグネチャ → ONNX → tokenizer JSON → `Unknown`。safetensors はヘッダーの形
 //! （データ部は解釈しない）、tokenizer JSON は `model.type` を持つ object の形だけを見る
 //! （検査本体は `fandhe_edge_core::base_model_format`。ガード層に serde を入れないため）。
 //! `.bin`・`.pt` の実体は pickle か zip で、固定シグネチャにより `Pickle`・`Zip` となり
@@ -523,6 +523,12 @@ fn has_no_external_data(bytes: &[u8]) -> bool {
 /// 全バイトを走査して「ちょうど末尾で終わる」ことを確認する。長さ超過・途中切れ・走査回数の上限で
 /// 確認しきれない場合は `Unknown`（fail-closed。REQ-39）。
 fn detect_format(bytes: &[u8]) -> FileFormat {
+    // safetensors は先頭 8 バイトがヘッダー長（little-endian）で、0x80 0x02〜0x05 始まり
+    // （長さ 640 等）が pickle シグネチャと衝突する。構造検査に合格したものを先に確定する。
+    // 他のシグネチャ（PK・GGUF・NUMPY）はヘッダー長の上限（16 MiB）を超えるので衝突しない。
+    if base_model_format::check_safetensors(bytes).is_ok() {
+        return FileFormat::Safetensors;
+    }
     if let Some(f) = detect_signature(bytes) {
         return f;
     }
@@ -534,8 +540,7 @@ fn detect_format(bytes: &[u8]) -> FileFormat {
     match scan_onnx_model(&mut src, total_len) {
         Ok(OnnxScan::Onnx) if has_no_external_data(bytes) => FileFormat::Onnx,
         // ベースモデル形式（REQ-41・TASK-41.2-1）。ONNX を先に判定し既存の判定結果は変えない。
-        _ if base_model_format::is_safetensors(bytes) => FileFormat::Safetensors,
-        _ if base_model_format::is_tokenizer_json(bytes) => FileFormat::TokenizerJson,
+        _ if base_model_format::check_tokenizer_json(bytes).is_ok() => FileFormat::TokenizerJson,
         _ => FileFormat::Unknown,
     }
 }
@@ -1090,6 +1095,14 @@ mod tests {
         st.extend_from_slice(&[0; 4]);
         let tok = br#"{"model":{"type":"BPE"}}"#;
         assert_eq!(d(&st), FileFormat::Safetensors);
+        // ヘッダー長 640（LE で 0x80 0x02 始まり）の safetensors は pickle と誤判定されない。
+        let pad = format!("{hdr}{}", " ".repeat(640 - hdr.len()));
+        let mut st640 = 640u64.to_le_bytes().to_vec();
+        st640.extend_from_slice(pad.as_bytes());
+        st640.extend_from_slice(&[0; 4]);
+        assert_eq!(&st640[..2], &[0x80, 0x02]);
+        assert_eq!(d(&st640), FileFormat::Safetensors);
+        assert!(FormatAllowlist::base_model().check(d(&st640)).is_ok());
         assert_eq!(d(tok), FileFormat::TokenizerJson);
         assert_eq!(FileFormat::Safetensors.name(), "safetensors");
         assert_eq!(FileFormat::TokenizerJson.name(), "tokenizer_json");

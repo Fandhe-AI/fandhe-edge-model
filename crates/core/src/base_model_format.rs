@@ -4,12 +4,12 @@
 //! ガード層は serde を持たない（依存の配置を増やさない。`version_ledger_record` と同じ方針）ため、
 //! JSON の解析はこの層で行う。
 //!
-//! - [`is_safetensors`]: safetensors のヘッダー（先頭 8 バイトの長さ＋JSON）とテンソルのオフセット整合だけを見る。
+//! - [`check_safetensors`]: safetensors のヘッダー（先頭 8 バイトの長さ＋JSON）とテンソルのオフセット整合だけを見る。
 //!   データ部は解釈しない
-//! - [`is_tokenizer_json`]: HF `tokenizer.json` の最小の形（`model.type` を持つ object）だけを見る
+//! - [`check_tokenizer_json`]: HF `tokenizer.json` の最小の形（`model.type` を持つ object）だけを見る
 //!
 //! いずれも意味の検証ではなく形の検査。確認しきれないもの（上限超過・不正構造・未知の dtype）は
-//! 偽を返す（fail-closed）。pickle 系（`.bin`・`.pt`）は呼び出し側の固定シグネチャ判定で拒否する。
+//! `Err` を返す（fail-closed）。pickle 系（`.bin`・`.pt`）は呼び出し側の固定シグネチャ判定で拒否する。
 
 use serde_json::Value;
 
@@ -45,29 +45,49 @@ fn tensor_range(entry: &Value) -> Option<(u64, u64)> {
     (e.checked_sub(b)? == elems.checked_mul(size)?).then_some((b, e))
 }
 
-/// `bytes`（ファイル全体）が safetensors の形か。REQ-39・REQ-41・TASK-41.2-1。
-pub fn is_safetensors(bytes: &[u8]) -> bool {
-    let Some(n) = bytes
+/// ベースモデル入力ファイルの形の検査で拒否した理由（REQ-39・REQ-41・TASK-41.2-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BaseModelFormatError {
+    /// 先頭 8 バイトのヘッダー長が読めない・範囲外・上限超過・全長超過。
+    SafetensorsHeaderLength,
+    /// ヘッダーが `{` 始まりの JSON object ではない。
+    SafetensorsHeaderJson,
+    /// `__metadata__` が文字列→文字列の object ではない。
+    SafetensorsMetadata,
+    /// テンソルのエントリが不正（未知 dtype・shape 溢れ・オフセットとサイズの不一致）。
+    SafetensorsTensor,
+    /// テンソルが 0 件。
+    SafetensorsNoTensors,
+    /// オフセットに隙間・重なりがある、またはデータ部の長さと一致しない。
+    SafetensorsOffsets,
+    /// tokenizer JSON が上限を超える。
+    TokenizerTooLarge,
+    /// tokenizer JSON の形（`model.type` を持つ object）ではない。
+    TokenizerShape,
+}
+
+/// `bytes`（ファイル全体）が safetensors の形かを検査する。拒否理由を返す。REQ-39・REQ-41・TASK-41.2-1。
+pub fn check_safetensors(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
+    use BaseModelFormatError as E;
+    let n = bytes
         .get(..8)
         .and_then(|h| <[u8; 8]>::try_from(h).ok())
         .map(u64::from_le_bytes)
-    else {
-        return false;
-    };
-    if !(2..=MAX_SAFETENSORS_HEADER_BYTES).contains(&n) {
-        return false;
-    }
-    let Some(data_start) = n.checked_add(8).and_then(|v| usize::try_from(v).ok()) else {
-        return false;
-    };
+        .filter(|n| (2..=MAX_SAFETENSORS_HEADER_BYTES).contains(n))
+        .ok_or(E::SafetensorsHeaderLength)?;
+    let data_start = n
+        .checked_add(8)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or(E::SafetensorsHeaderLength)?;
     let (Some(header), Some(data)) = (bytes.get(8..data_start), bytes.get(data_start..)) else {
-        return false;
+        return Err(E::SafetensorsHeaderLength);
     };
     if header.first() != Some(&b'{') {
-        return false;
+        return Err(E::SafetensorsHeaderJson);
     }
     let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(header) else {
-        return false;
+        return Err(E::SafetensorsHeaderJson);
     };
     let mut ranges = Vec::new();
     for (k, v) in &map {
@@ -77,47 +97,58 @@ pub fn is_safetensors(bytes: &[u8]) -> bool {
                 .as_object()
                 .is_some_and(|m| m.values().all(Value::is_string))
             {
-                return false;
+                return Err(E::SafetensorsMetadata);
             }
             continue;
         }
-        let Some(r) = tensor_range(v) else {
-            return false;
-        };
-        ranges.push(r);
+        ranges.push(tensor_range(v).ok_or(E::SafetensorsTensor)?);
     }
     if ranges.is_empty() {
-        return false;
+        return Err(E::SafetensorsNoTensors);
     }
     ranges.sort_unstable();
     // 0 から隙間も重なりもなく連続し、データ部の長さちょうどで終わること。
     let mut next = 0u64;
     for (b, e) in ranges {
         if b != next {
-            return false;
+            return Err(E::SafetensorsOffsets);
         }
         next = e;
     }
-    u64::try_from(data.len()).is_ok_and(|l| l == next)
+    if u64::try_from(data.len()).is_ok_and(|l| l == next) {
+        Ok(())
+    } else {
+        Err(E::SafetensorsOffsets)
+    }
 }
 
-/// `bytes`（ファイル全体）が HF `tokenizer.json` の形か。REQ-39・REQ-41・TASK-41.2-1。
-pub fn is_tokenizer_json(bytes: &[u8]) -> bool {
+/// `bytes`（ファイル全体）が HF `tokenizer.json` の形かを検査する。拒否理由を返す。REQ-39・REQ-41・TASK-41.2-1。
+pub fn check_tokenizer_json(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
+    use BaseModelFormatError as E;
     if bytes.len() > MAX_TOKENIZER_JSON_BYTES {
-        return false;
+        return Err(E::TokenizerTooLarge);
     }
     let Ok(Value::Object(top)) = serde_json::from_slice::<Value>(bytes) else {
-        return false;
+        return Err(E::TokenizerShape);
     };
     top.get("model")
         .and_then(Value::as_object)
         .and_then(|m| m.get("type"))
         .is_some_and(Value::is_string)
+        .then_some(())
+        .ok_or(E::TokenizerShape)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_safetensors(b: &[u8]) -> bool {
+        check_safetensors(b).is_ok()
+    }
+    fn is_tokenizer_json(b: &[u8]) -> bool {
+        check_tokenizer_json(b).is_ok()
+    }
 
     /// 試験用: ヘッダー JSON とデータ部から safetensors を組み立てる。
     fn st(header: &str, data: &[u8]) -> Vec<u8> {
@@ -197,5 +228,31 @@ mod tests {
             b' ';
             MAX_TOKENIZER_JSON_BYTES + 1
         ]));
+    }
+
+    /// REQ-39・TASK-41.2-1: 拒否理由が区別される。
+    #[test]
+    fn req39_reasons_distinguished() {
+        assert_eq!(
+            check_safetensors(&[0; 7]),
+            Err(BaseModelFormatError::SafetensorsHeaderLength)
+        );
+        assert_eq!(
+            check_safetensors(&st("{}", &[])),
+            Err(BaseModelFormatError::SafetensorsNoTensors)
+        );
+        let bad = r#"{"a":{"dtype":"F4","shape":[1],"data_offsets":[0,1]}}"#;
+        assert_eq!(
+            check_safetensors(&st(bad, &[0])),
+            Err(BaseModelFormatError::SafetensorsTensor)
+        );
+        assert_eq!(
+            check_safetensors(&st(ONE, &[0; 5])),
+            Err(BaseModelFormatError::SafetensorsOffsets)
+        );
+        assert_eq!(
+            check_tokenizer_json(b"[]"),
+            Err(BaseModelFormatError::TokenizerShape)
+        );
     }
 }
