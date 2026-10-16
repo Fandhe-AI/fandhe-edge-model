@@ -96,6 +96,10 @@ pub fn gather_axis0<T: Copy, U>(
     let row = element_count(rest)?;
     let mut out_shape = indices.shape().to_vec();
     out_shape.extend_from_slice(rest);
+    // 出力 rank の上限は確保・走査より前に検証する（REQ-39）。
+    if out_shape.len() > MAX_RANK {
+        return Err(OpError::ShapeMismatch);
+    }
     let n = element_count(&out_shape)?;
     let mut out = Vec::with_capacity(n);
     for &i in indices.data() {
@@ -284,8 +288,19 @@ fn slice_ranges<T: Copy>(x: &Tensor<T>, ranges: &[(usize, usize)]) -> Result<Ten
     let mut base = 0usize;
     let mut out_shape = Vec::with_capacity(ranges.len());
     for (k, &(s, l)) in ranges.iter().enumerate() {
-        base += s * strides.get(k).copied().ok_or(OpError::ShapeMismatch)?;
+        let st = strides.get(k).copied().ok_or(OpError::ShapeMismatch)?;
+        // 空の出力ではオフセットを使わないため、あふれる積は検証せず空テンソルで返す。
+        base = s
+            .checked_mul(st)
+            .and_then(|v| v.checked_add(base))
+            .unwrap_or(usize::MAX);
         out_shape.push(l);
+    }
+    if element_count(&out_shape)? == 0 {
+        return Tensor::new(out_shape, Vec::new());
+    }
+    if base == usize::MAX {
+        return Err(OpError::LimitExceeded);
     }
     gather_by_strides(x.data(), out_shape, &strides, base)
 }
@@ -384,6 +399,10 @@ pub fn split<T: Copy>(
 
 /// Expand（双方向ブロードキャスト）。`shape` の負の次元は拒否する。
 pub fn expand<T: Copy>(x: &Tensor<T>, shape: &Tensor<i64>) -> Result<Tensor<T>, OpError> {
+    // rank 上限は target の確保・コピーより前に検証する（REQ-39）。
+    if shape.data().len() > MAX_RANK {
+        return Err(OpError::ShapeMismatch);
+    }
     let mut target = Vec::with_capacity(shape.data().len());
     for &v in shape.data() {
         target.push(usize::try_from(v).map_err(|_| OpError::InvalidAttribute)?);
@@ -597,6 +616,26 @@ mod tests {
         assert_eq!(
             split(&x, 1, &t(&[65], vec![0; 65])),
             Err(OpError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn req41_slice_empty_tensor_huge_stride_no_panic() {
+        let x = t::<f32>(&[0, 3, i64::MAX as usize], vec![]);
+        let o = slice(&x, &v(&[3]), &v(&[3]), Some(&v(&[1])), None).unwrap();
+        assert_eq!(o.shape(), &[0, 0, i64::MAX as usize]);
+    }
+
+    #[test]
+    fn req41_expand_gather_reject_rank_before_alloc() {
+        let x = t(&[1], vec![1.0f32]);
+        let big = Tensor::new(vec![MAX_RANK + 1], vec![1i64; MAX_RANK + 1]).unwrap();
+        assert_eq!(expand(&x, &big).unwrap_err(), OpError::ShapeMismatch);
+        let d = t(&[2, 1, 1, 1, 1], vec![0.0f32; 2]);
+        let i = t(&[1, 1], vec![0i64]);
+        assert_eq!(
+            gather_axis0(&d, &i, |v| v).unwrap_err(),
+            OpError::ShapeMismatch
         );
     }
 
