@@ -1,0 +1,201 @@
+//! ベースモデル（追加学習の種類。REQ-41）の入力ファイルの「形の検査」（REQ-39・TASK-41.2-1・#397）。
+//!
+//! ガード層の形式判定（`fandhe-edge-guard` の `format::detect_format`）から呼ばれる純関数を置く。
+//! ガード層は serde を持たない（依存の配置を増やさない。`version_ledger_record` と同じ方針）ため、
+//! JSON の解析はこの層で行う。
+//!
+//! - [`is_safetensors`]: safetensors のヘッダー（先頭 8 バイトの長さ＋JSON）とテンソルのオフセット整合だけを見る。
+//!   データ部は解釈しない
+//! - [`is_tokenizer_json`]: HF `tokenizer.json` の最小の形（`model.type` を持つ object）だけを見る
+//!
+//! いずれも意味の検証ではなく形の検査。確認しきれないもの（上限超過・不正構造・未知の dtype）は
+//! 偽を返す（fail-closed）。pickle 系（`.bin`・`.pt`）は呼び出し側の固定シグネチャ判定で拒否する。
+
+use serde_json::Value;
+
+/// safetensors ヘッダー JSON の上限（解析前に確認する。REQ-39）。
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// tokenizer JSON の上限（`Value` 化によるメモリ膨張を防ぐ。Qwen の tokenizer.json は約 7 MB）。
+const MAX_TOKENIZER_JSON_BYTES: usize = 64 * 1024 * 1024;
+
+/// バイト単位の dtype のサイズ。サブバイト型・未知の型は `None`。
+fn dtype_size(dtype: &str) -> Option<u64> {
+    match dtype {
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" => Some(1),
+        "I16" | "U16" | "F16" | "BF16" => Some(2),
+        "I32" | "U32" | "F32" => Some(4),
+        "I64" | "U64" | "F64" => Some(8),
+        _ => None,
+    }
+}
+
+/// テンソル 1 件のエントリを検査して `(begin, end)` を返す。
+fn tensor_range(entry: &Value) -> Option<(u64, u64)> {
+    let obj = entry.as_object()?;
+    let size = dtype_size(obj.get("dtype")?.as_str()?)?;
+    let mut elems: u64 = 1;
+    for d in obj.get("shape")?.as_array()? {
+        elems = elems.checked_mul(d.as_u64()?)?;
+    }
+    let [b, e] = obj.get("data_offsets")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let (b, e) = (b.as_u64()?, e.as_u64()?);
+    (e.checked_sub(b)? == elems.checked_mul(size)?).then_some((b, e))
+}
+
+/// `bytes`（ファイル全体）が safetensors の形か。REQ-39・REQ-41・TASK-41.2-1。
+pub fn is_safetensors(bytes: &[u8]) -> bool {
+    let Some(n) = bytes
+        .get(..8)
+        .and_then(|h| <[u8; 8]>::try_from(h).ok())
+        .map(u64::from_le_bytes)
+    else {
+        return false;
+    };
+    if !(2..=MAX_SAFETENSORS_HEADER_BYTES).contains(&n) {
+        return false;
+    }
+    let Some(data_start) = n.checked_add(8).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+    };
+    let (Some(header), Some(data)) = (bytes.get(8..data_start), bytes.get(data_start..)) else {
+        return false;
+    };
+    if header.first() != Some(&b'{') {
+        return false;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(header) else {
+        return false;
+    };
+    let mut ranges = Vec::new();
+    for (k, v) in &map {
+        if k == "__metadata__" {
+            // 任意。あれば文字列→文字列の object。
+            if !v
+                .as_object()
+                .is_some_and(|m| m.values().all(Value::is_string))
+            {
+                return false;
+            }
+            continue;
+        }
+        let Some(r) = tensor_range(v) else {
+            return false;
+        };
+        ranges.push(r);
+    }
+    if ranges.is_empty() {
+        return false;
+    }
+    ranges.sort_unstable();
+    // 0 から隙間も重なりもなく連続し、データ部の長さちょうどで終わること。
+    let mut next = 0u64;
+    for (b, e) in ranges {
+        if b != next {
+            return false;
+        }
+        next = e;
+    }
+    u64::try_from(data.len()).is_ok_and(|l| l == next)
+}
+
+/// `bytes`（ファイル全体）が HF `tokenizer.json` の形か。REQ-39・REQ-41・TASK-41.2-1。
+pub fn is_tokenizer_json(bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_TOKENIZER_JSON_BYTES {
+        return false;
+    }
+    let Ok(Value::Object(top)) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    top.get("model")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("type"))
+        .is_some_and(Value::is_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 試験用: ヘッダー JSON とデータ部から safetensors を組み立てる。
+    fn st(header: &str, data: &[u8]) -> Vec<u8> {
+        let mut v = (header.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(header.as_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    const ONE: &str = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+
+    /// REQ-39・TASK-41.2-1: 正しい safetensors（最小・metadata・空白パディング・複数）を受理する。
+    #[test]
+    fn req39_safetensors_accepts_valid() {
+        assert!(is_safetensors(&st(ONE, &[0; 4])));
+        let meta = r#"{"__metadata__":{"format":"pt"},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert!(is_safetensors(&st(meta, &[0; 4])));
+        let pad = format!("{ONE}   ");
+        assert!(is_safetensors(&st(&pad, &[0; 4])));
+        let two = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[2,3],"data_offsets":[4,10]}}"#;
+        assert!(is_safetensors(&st(two, &[0; 10])));
+    }
+
+    /// REQ-39・TASK-41.2-1: 壊れた safetensors は拒否する（fail-closed）。
+    #[test]
+    fn req39_safetensors_rejects_broken() {
+        assert!(!is_safetensors(&[0; 7]));
+        // 長さが全長超過
+        let mut over = 1000u64.to_le_bytes().to_vec();
+        over.extend_from_slice(b"{}");
+        assert!(!is_safetensors(&over));
+        // 長さが上限超過
+        let mut huge = (MAX_SAFETENSORS_HEADER_BYTES + 1).to_le_bytes().to_vec();
+        huge.extend_from_slice(b"{}");
+        assert!(!is_safetensors(&huge));
+        // 先頭が { でない・JSON 不正・配列トップ
+        assert!(!is_safetensors(&st(" {}", &[])));
+        assert!(!is_safetensors(&st("{not json", &[])));
+        assert!(!is_safetensors(&st("[1]", &[])));
+        // テンソル 0 件
+        assert!(!is_safetensors(&st("{}", &[])));
+        // 未知 dtype・サブバイト型
+        let bad = r#"{"a":{"dtype":"F4","shape":[1],"data_offsets":[0,1]}}"#;
+        assert!(!is_safetensors(&st(bad, &[0])));
+        // shape の積のオーバーフロー
+        let ovf = r#"{"a":{"dtype":"U8","shape":[4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        assert!(!is_safetensors(&st(ovf, &[])));
+        // サイズ不一致
+        let mism = r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#;
+        assert!(!is_safetensors(&st(mism, &[0; 4])));
+        // 隙間・重なり
+        let gap = r#"{"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"b":{"dtype":"U8","shape":[1],"data_offsets":[2,3]}}"#;
+        assert!(!is_safetensors(&st(gap, &[0; 3])));
+        let lap = r#"{"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"b":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}}"#;
+        assert!(!is_safetensors(&st(lap, &[0; 3])));
+        // 末尾の余り・不足
+        assert!(!is_safetensors(&st(ONE, &[0; 5])));
+        assert!(!is_safetensors(&st(ONE, &[0; 3])));
+        // metadata が文字列以外
+        let m = r#"{"__metadata__":{"k":1},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert!(!is_safetensors(&st(m, &[0; 4])));
+    }
+
+    /// REQ-39・TASK-41.2-1: tokenizer.json の形の検査。
+    #[test]
+    fn req39_tokenizer_json_shape() {
+        assert!(is_tokenizer_json(
+            br#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]}}"#
+        ));
+        assert!(!is_tokenizer_json(b"[]"));
+        assert!(!is_tokenizer_json(br#"{"version":"1.0"}"#));
+        assert!(!is_tokenizer_json(br#"{"model":[]}"#));
+        assert!(!is_tokenizer_json(br#"{"model":{"type":1}}"#));
+        assert!(!is_tokenizer_json(br#"{"model":{"type":"BPE"}} x"#));
+        assert!(!is_tokenizer_json(br#"{"model":{"type":"BPE""#));
+        assert!(!is_tokenizer_json(&vec![
+            b' ';
+            MAX_TOKENIZER_JSON_BYTES + 1
+        ]));
+    }
+}

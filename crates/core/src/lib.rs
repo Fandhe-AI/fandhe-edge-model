@@ -55,8 +55,11 @@
 //! JSON（現状は `package` の [`stage_report::PackageReport`]）の型と直列化を実装済み。
 //! `version_ledger_record` モジュールは #491（TASK-39.3・TASK-39.6）で版管理台帳ファイルの直列化形式を
 //! 実装済み（検証はガード層の `VersionLedger::from_file`）。
+//! `base_model_format` モジュールは TASK-41.2-1（issue #397）でベースモデルの safetensors・
+//! tokenizer JSON の「形の検査」を実装済み（ガード層の形式判定から呼ばれる。REQ-39・REQ-41）。
 
 pub mod artifact_meta;
+pub mod base_model_format;
 pub mod canonical;
 pub mod definition;
 pub mod evaluation_record;
