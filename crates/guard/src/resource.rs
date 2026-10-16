@@ -17,6 +17,12 @@
 //! [`run_with_limits`] で起動する。起動対象の経路検査（`path`・`package` の閉じ込め）は行わない。
 //! 呼び出し側が既存のガードを通した経路だけを渡す前提とする。
 //!
+//! # 種類ごとの安全上限
+//!
+//! [`safety_limits_for_kind`] が kind から時間・RSS の安全上限を引く（TASK-39.5-4・#578）。表に無い kind は
+//! 厳しい側（10 秒・2 GiB）に落ちる。8 GiB の [`MemoryLimit`] は表を通る経路でしか作れず、
+//! [`MemoryLimit::new`] の天井は 2 GiB のまま。推論経路への配線は #577。
+//!
 //! # 不変条件
 //!
 //! - シェルを経由せず、program は絶対パス必須（PATH 探索をしない）。stdin は null
@@ -187,6 +193,75 @@ impl MemoryLimit {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// 追加学習（Qwen 1.5B 等）の種類の推論 1 件の安全上限（時間）。60 秒（REQ-39・REQ-41・TASK-39.5-4・#578）。
+///
+/// 根拠は Qwen 1.5B の実測（1 件 2.8 秒・RSS 4.15 GB）の 2〜4 倍。出典は `poc26-result.md`
+/// 判断の記録（2026-10-16）。証拠種別は実測の倍率から決めた暫定値。
+pub const FINETUNE_INFER_TIME_LIMIT: Duration = Duration::from_secs(60);
+
+/// 追加学習の種類の安全上限（RSS）。8 GiB（2^30 × 8。REQ-39・REQ-41・TASK-39.5-4・#578）。
+///
+/// 根拠・証拠種別は [`FINETUNE_INFER_TIME_LIMIT`] と同じ。
+pub const FINETUNE_INFER_RSS_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// 種類（`kind`）ごとの安全上限（時間・RSS。REQ-39・TASK-39.5-4・#578）。
+///
+/// 性能の目標（警告のみ。#579）とは別の、暴走を止める上限。8 GiB の [`MemoryLimit`] は
+/// [`MemoryLimit::new`]（天井 2 GiB のまま）では作れず、本モジュールの表を通る経路だけが持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafetyLimits {
+    time: TimeLimit,
+    memory: MemoryLimit,
+}
+
+impl SafetyLimits {
+    /// 時間上限。
+    #[must_use]
+    pub const fn time(self) -> TimeLimit {
+        self.time
+    }
+
+    /// メモリ（RSS）上限。
+    #[must_use]
+    pub const fn memory(self) -> MemoryLimit {
+        self.memory
+    }
+
+    /// 既存の厳しい値（10 秒・2 GiB）。表に無い kind の落ち先。
+    const STRICT: Self = Self {
+        time: TimeLimit::infer_default(),
+        memory: MemoryLimit::infer_default(),
+    };
+
+    /// 追加学習の種類の値（60 秒・8 GiB）。
+    // 表へ行を足すのは kind 名を決める #424 の仕事。それまで表からは参照されない。
+    #[allow(dead_code)]
+    const FINETUNE: Self = Self {
+        time: TimeLimit(FINETUNE_INFER_TIME_LIMIT),
+        memory: MemoryLimit(FINETUNE_INFER_RSS_LIMIT_BYTES),
+    };
+}
+
+/// kind → 安全上限の表（唯一の置き場）。
+///
+/// 追加学習の kind 名・kind_version は #424（TASK-41.5-1）が決める。`KindAllowlist::supported()` に
+/// 足されたら照合テストが落ちるので、そのとき [`SafetyLimits::FINETUNE`] で行を足す。
+const KIND_SAFETY_LIMITS: [(&str, SafetyLimits); 3] = [
+    ("c1", SafetyLimits::STRICT),
+    ("c3", SafetyLimits::STRICT),
+    ("autoregressive", SafetyLimits::STRICT),
+];
+
+/// kind の安全上限を引く。完全一致のみで、表に無い kind は厳しい値（10 秒・2 GiB）に落ちる
+/// （fail-safe。REQ-39・TASK-39.5-4・#578）。
+#[must_use]
+pub fn safety_limits_for_kind(kind: &str) -> SafetyLimits {
+    KIND_SAFETY_LIMITS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(SafetyLimits::STRICT, |(_, l)| *l)
 }
 
 /// 超過した資源の種類。
@@ -1383,6 +1458,52 @@ pub fn run_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// REQ-39・TASK-39.5-4・#578: 既存の種類は従来の 10 秒・2 GiB のまま。
+    #[test]
+    fn req39_existing_kinds_keep_infer_defaults() {
+        for k in ["c1", "c3", "autoregressive"] {
+            let l = safety_limits_for_kind(k);
+            assert_eq!(l.time().get(), Duration::from_secs(10));
+            assert_eq!(l.memory().get(), 2_147_483_648);
+            assert_eq!(l.time(), TimeLimit::infer_default());
+            assert_eq!(l.memory(), MemoryLimit::infer_default());
+        }
+    }
+
+    /// REQ-39・TASK-39.5-4・#578: 表に無い kind は厳しい値に落ちる。
+    #[test]
+    fn req39_unknown_kind_falls_back_to_strict() {
+        let long = "a".repeat(100);
+        for k in ["", "C1", "c1 ", "qwen", "unknown_kind", long.as_str()] {
+            let l = safety_limits_for_kind(k);
+            assert_eq!(l.time().get(), Duration::from_secs(10));
+            assert_eq!(l.memory().get(), 2_147_483_648);
+        }
+    }
+
+    /// REQ-39・TASK-39.5-4・#578: 追加学習の値は 60 秒・8 GiB で、天井内。
+    #[test]
+    fn req39_finetune_limits_values() {
+        assert_eq!(FINETUNE_INFER_TIME_LIMIT, Duration::from_secs(60));
+        assert_eq!(FINETUNE_INFER_RSS_LIMIT_BYTES, 8_589_934_592);
+        assert_eq!(SafetyLimits::FINETUNE.time().get(), Duration::from_secs(60));
+        assert_eq!(SafetyLimits::FINETUNE.memory().get(), 8_589_934_592);
+        assert!(FINETUNE_INFER_TIME_LIMIT <= MAX_TIME_LIMIT);
+        assert!(TimeLimit::new(FINETUNE_INFER_TIME_LIMIT).is_ok());
+        // MemoryLimit::new の天井は 2 GiB のまま
+        assert!(MemoryLimit::new(FINETUNE_INFER_RSS_LIMIT_BYTES).is_err());
+    }
+
+    /// REQ-39・TASK-39.5-4・#578: 表の kind 集合が許可リストと一致する（kind 追加時の行の足し忘れ検出）。
+    #[test]
+    fn req39_kind_safety_table_covers_supported_kinds() {
+        use std::collections::BTreeSet;
+        let table: Vec<&str> = KIND_SAFETY_LIMITS.iter().map(|(k, _)| *k).collect();
+        let set: BTreeSet<&str> = table.iter().copied().collect();
+        assert_eq!(set.len(), table.len(), "duplicate kind in table");
+        let supported: BTreeSet<&str> = crate::kind::KindAllowlist::supported().iter().collect();
+        assert_eq!(set, supported);
+    }
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
