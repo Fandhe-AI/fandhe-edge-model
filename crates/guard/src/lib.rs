@@ -20,6 +20,7 @@
 //!   （TASK-39.5-1・#170）。メモリ（RSS）上限（暫定 2 GiB。RSS ポーリングによる模擬。TASK-39.5-2・#171）も実装済み。
 //!   CLI 等への配線は #136
 //! - [`file_size`]: ファイルサイズ上限（暫定 1 GiB）の読み込み前検証（fstat。TASK-39.5-3・#172）。実装済み
+//! - [`split_files`]: 分割ファイル群（1 ファイル 1 GiB 以下）の受け付け・パッケージ合計の上限（暫定 8 GiB）・各 shard の sha256 の記録と照合（TASK-41.2-5・#580）。実装済み。CLI・trainer への配線は #398・#581
 //! - [`kind_version`]: `kind` ごとの `kind_version` 許可リスト判定（TASK-39.6-1・#174）。実装済み。`infer` の `artifact.json` へ CLI 統合済み
 //! - 未統合（#136）: `train` への `kind` 検査（[`kind`] の許可リスト）の統合。`register` は経路の閉じ込め
 //!   （[`path`]）まで接続済み。破損パッケージの確認（TASK-39.6-2・#175）は未着手
@@ -33,4 +34,5 @@ pub mod model_file;
 pub mod package;
 pub mod path;
 pub mod resource;
+pub mod split_files;
 pub mod version_ledger;

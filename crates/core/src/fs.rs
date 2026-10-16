@@ -43,7 +43,7 @@
 use crate::hash::Sha256Digest;
 use std::fmt;
 use std::fs::{File, Metadata};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// ストリームでハッシュを計算する際の固定長バッファサイズ。読み込んだ
@@ -283,8 +283,9 @@ pub fn sha256_file_bounded(path: &Path, limit: u64) -> Result<Sha256Digest, FsEr
 /// （`fandhe_edge_guard::path::open_confined` の戻り値）をそのまま渡すための入口
 /// （[`read_bounded_open_file`] のハッシュ版）。`path` はエラー表示専用で、開き直しには使わない。
 /// ハンドルが通常ファイルでなければ [`FsError::NotRegularFile`]。
+/// 読み進めたハンドルでも先頭から全体をハッシュする（先頭へ seek し、失敗は [`FsError::Read`]）。
 pub fn sha256_open_file_bounded(
-    file: File,
+    mut file: File,
     path: &Path,
     limit: u64,
 ) -> Result<Sha256Digest, FsError> {
@@ -297,6 +298,11 @@ pub fn sha256_open_file_bounded(
             path: path.to_path_buf(),
         });
     }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| FsError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
     sha256_from_file(file, &metadata, path, limit)
 }
 
@@ -344,6 +350,20 @@ fn sha256_from_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39: 読み進めたハンドルでも sha256 は先頭からの全体になる。
+    #[test]
+    fn req39_sha256_open_file_bounded_rewinds_cursor() {
+        use std::io::Read as _;
+        let p = std::env::temp_dir().join(format!("fe-core-rewind-{}", std::process::id()));
+        std::fs::write(&p, b"0123456789").unwrap();
+        let mut f = File::open(&p).unwrap();
+        let mut buf = [0u8; 4];
+        f.read_exact(&mut buf).unwrap();
+        let got = sha256_open_file_bounded(f, &p, 100).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(got, Sha256Digest::of_bytes(b"0123456789"));
+    }
 
     /// REQ-39: 開いた File の上限付き読み込み。上限ちょうどは通り、+1 は拒否、空は空 Vec。
     #[test]
