@@ -41,7 +41,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use fandhe_edge_core::artifact_meta::ArtifactMeta;
+use fandhe_edge_core::artifact_meta::{ArtifactMeta, PackageInputRepresentation};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
@@ -521,6 +521,16 @@ fn load_calibration(
     }))
 }
 
+/// byte 以外の入力表現を拒否する（byte 前処理で黙って推論すると誤った予測になるため。
+/// REQ-41・TASK-41.3-1・#402）。TASK-41.4 でトークナイザー推論が入ったら外す。
+pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), ErrorReport> {
+    if meta.input_representation() == PackageInputRepresentation::Byte {
+        Ok(())
+    } else {
+        Err(invalid("unsupported input representation"))
+    }
+}
+
 /// `max_bytes` の範囲検査・`kind` の解析・[`load_backend`] を行い、前処理と束ねた推論パイプラインを
 /// 組み立てる（`infer` の `prepare` と、`package` の公開前検証・p95 計測が共有する。REQ-32・REQ-39）。
 ///
@@ -528,12 +538,13 @@ fn load_calibration(
 ///
 /// # Errors
 /// `max_bytes` が範囲外・未対応の `kind`・未許可の版・読み込めない ONNX・出力サイズの不一致は
-/// `invalid_input`（64）。
+/// `invalid_input`（64）。`tokenizer` の宣言は推論ランタイム未対応（TASK-41.4。REQ-41）のため同じく 64。
 pub(crate) fn build_pipeline(
     onnx: &[u8],
     meta: &ArtifactMeta,
     n_options: usize,
 ) -> Result<Pipeline, ErrorReport> {
+    check_input_representation(meta)?;
     let max_bytes = usize::try_from(meta.max_bytes())
         .ok()
         .filter(|n| (MIN_MAX_BYTES..=MAX_MAX_BYTES).contains(n))

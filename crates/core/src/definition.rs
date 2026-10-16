@@ -120,8 +120,9 @@ pub struct Choice {
     pub description: String,
 }
 
-/// 入力の表現。README「実装方針（要点）」により byte のみに確定済みで、
-/// 現状は唯一のバリアントを持つ（将来の拡張点として enum にしている）。
+/// 定義ファイル側の入力の表現。唯一のバリアントを持ち、スキーマ・値は不変（正準化ハッシュに入る）。
+/// kind ごとの入力表現（byte／tokenizer）の宣言は配布パッケージ側
+/// `artifact_meta::PackageInputRepresentation`（REQ-41・TASK-41.3-1・#402）が担う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputRepresentation {
