@@ -85,9 +85,9 @@
 ## 4. データ型・rank・件数
 
 - FLOAT: 計算。INT64: id・形状・index。BOOL: 中間値に限る（Greater の出力・Where の cond。initializer には使わない）。BFLOAT16: initializer に限る（`proto.rs` に `DT_BFLOAT16 = 16` を足す。#581）。それ以外（FLOAT16・DOUBLE・INT32 等）は拒否
-- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体を f32 に展開するかは #581 が RSS で決める（1.5B で約 6.2 GB。推定）
+- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体は f32 に展開しない（1.5B で約 6.2 GB〔推定〕となり RSS 安全上限 8 GiB に近いため。#581 の決定）。bf16 は `u16` のまま保持し、外部データは shard 単位で流し読みして生バイトの全量を持たない。RSS の実測は #421・#435
 - rank: 中間値は 5 以下（GQA の `[1,nkv,grp,T,hd]`）。initializer は 2 以下。C1・C3 の `MAX_DIMS=4` は変えず、上限は種類ごとに持つ
-- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る（値は #581 で決める）
+- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る。#581 の暫定値（推定。#431 の実測で見直す）: ノード 4096・initializer 1024・rank 5・本体 64 MiB、外部データは shard 1 GiB・256 件・合計 8 GiB（ガード層の #580 と同じ）。C1・C3 は 128・64・4・44 MiB のまま外部データと bf16 を拒否する
 - 動的な次元は T だけ（`max_seq_length` と `max_position_embeddings` で上限を持つ）。K と M は定数
 
 ## 5. 範囲外を除外する方針

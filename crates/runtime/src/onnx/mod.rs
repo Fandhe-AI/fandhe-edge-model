@@ -47,6 +47,7 @@
 
 mod c1;
 mod c3;
+mod external;
 pub mod ops;
 mod proto;
 mod wire;
@@ -63,8 +64,69 @@ use std::path::Path;
 
 /// 読み込むモデルファイルのサイズ上限（バイト。読み込み前に確認。REQ-39）。学習ワーカーの
 /// `limits.py::MAX_MODEL_BYTES`（40 MiB）に、`artifact.py::_ONNX_READ_CAP_BYTES` と同じ
-/// 余裕 4 MiB を加えた値。
+/// 余裕 4 MiB を加えた値。C1・C3 の上限（[`STRICT_MODEL_LIMITS`]）。
 pub const MAX_MODEL_FILE_BYTES: u64 = 44 * 1024 * 1024;
+
+/// 外部データ（分割した重み）の上限（REQ-39・TASK-41.7-8・#581）。ガード層の同名の上限
+/// （`fandhe_edge_guard::file_size::MAX_READ_FILE_BYTES`・`split_files::MAX_PACKAGE_TOTAL_BYTES`・
+/// `MAX_SPLIT_FILES`）と一致させる。runtime は guard に依存しないため、`crates/cli/tests/
+/// onnx_external_limits_sync.rs` で照合する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalDataLimits {
+    /// shard 1 つのバイト数の上限（fstat で読む前に確認）。
+    pub max_shard_bytes: u64,
+    /// shard 数の上限。
+    pub max_shards: usize,
+    /// shard の合計バイト数の上限（読む前に確認）。
+    pub max_total_bytes: u64,
+}
+
+/// 種類別のモデル上限（REQ-39・#581）。復号と外部データ解決がこの値で資源を有界にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLimits {
+    /// モデル本体ファイルのバイト数の上限（読み込み前に確認）。
+    pub max_model_file_bytes: u64,
+    pub max_nodes: usize,
+    pub max_initializers: usize,
+    /// テンソル・入出力形状の次元数の上限。
+    pub max_dims: usize,
+    /// BFLOAT16 の initializer を受理するか。
+    pub allow_bf16: bool,
+    /// `None` なら外部データを拒否する（C1・C3）。
+    pub external: Option<ExternalDataLimits>,
+}
+
+/// C1・C3 の上限。ノード数（C3 の最大構成は約 42、C1 は 14）・initializer 数（C3 は約 23）に
+/// 余裕を見た値で、外部データと bf16 は拒否する。
+pub const STRICT_MODEL_LIMITS: ModelLimits = ModelLimits {
+    max_model_file_bytes: MAX_MODEL_FILE_BYTES,
+    max_nodes: 128,
+    max_initializers: 64,
+    max_dims: 4,
+    allow_bf16: false,
+    external: None,
+};
+
+/// 追加学習の種類（Qwen2.5-1.5B 級の採点グラフ）の上限。**暫定値（証拠種別: 推定）**。#431 の
+/// 書き出し実測で見直す。kind 名は #424（TASK-41.5-1）で決まるため [`ModelKind`] へ未接続
+/// （接続は Qwen 実行器の #420・#424・#421。実装済みを装わない）。
+///
+/// - 本体: 重みは外部データへ出るので数千ノード・数 MB の見込みに対し 64 MiB
+/// - ノード: 28 層 × 約 60 ≒ 1700 の約 2.4 倍、initializer: 約 340 の 3 倍
+/// - 次元: 中間値の rank 上限 [`ops::MAX_RANK`] と同じ
+/// - 外部データ: ガード層の #580 と同じ値（shard 1 GiB・256 件・合計 8 GiB）
+pub const FINETUNE_MODEL_LIMITS: ModelLimits = ModelLimits {
+    max_model_file_bytes: 64 * 1024 * 1024,
+    max_nodes: 4096,
+    max_initializers: 1024,
+    max_dims: ops::MAX_RANK,
+    allow_bf16: true,
+    external: Some(ExternalDataLimits {
+        max_shard_bytes: 1024 * 1024 * 1024,
+        max_shards: 256,
+        max_total_bytes: 8 * 1024 * 1024 * 1024,
+    }),
+};
 
 /// `max_bytes`（前処理で切り詰めるバイト数）の下限。学習ワーカーの `limits.py`・共有 fixture
 /// `fixtures/train_contract/limits.json` の `min_max_bytes` と一致する（テストで照合）。
@@ -100,6 +162,13 @@ impl ModelKind {
         }
     }
 
+    /// この種類のモデル上限（C1・C3 は [`STRICT_MODEL_LIMITS`]）。
+    pub fn limits(self) -> &'static ModelLimits {
+        match self {
+            Self::C1 | Self::C3 => &STRICT_MODEL_LIMITS,
+        }
+    }
+
     /// `kind` 文字列。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -125,7 +194,7 @@ pub enum OnnxLoadError {
     UnsupportedOpset,
     /// グラフがテンプレートと一致しない（未知の op・順序・属性・入出力・initializer の不一致）。
     UnsupportedGraph,
-    /// テンソルの形式が許可外（`raw_data` 以外・FLOAT/INT64 以外・外部参照・長さ不一致）。
+    /// テンソルの形式が許可外（`raw_data` 以外・許可外の要素型・外部参照の不正・長さ不一致）。
     UnsupportedTensor,
     /// ノード数・名前長などの構造上の上限を超えた（REQ-39）。
     LimitExceeded,
@@ -201,19 +270,20 @@ impl OnnxBackend {
         kind: ModelKind,
         expected_sha256: &Sha256Digest,
     ) -> Result<Self, OnnxLoadError> {
-        let bytes = read_bounded(path, MAX_MODEL_FILE_BYTES).map_err(OnnxLoadError::File)?;
+        let bytes =
+            read_bounded(path, kind.limits().max_model_file_bytes).map_err(OnnxLoadError::File)?;
         if Sha256Digest::of_bytes(&bytes) != *expected_sha256 {
             return Err(OnnxLoadError::IntegrityMismatch);
         }
         Self::from_bytes(&bytes, kind)
     }
 
-    /// バイト列から復号する（sha256 の照合は呼び出し側。サイズ上限は [`MAX_MODEL_FILE_BYTES`]）。
+    /// バイト列から復号する（sha256 の照合は呼び出し側。サイズ上限は [`ModelKind::limits`]）。
     pub fn from_bytes(bytes: &[u8], kind: ModelKind) -> Result<Self, OnnxLoadError> {
-        if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_MODEL_FILE_BYTES) {
+        if u64::try_from(bytes.len()).map_or(true, |n| n > kind.limits().max_model_file_bytes) {
             return Err(OnnxLoadError::LimitExceeded);
         }
-        let model = proto::decode_model(bytes)?;
+        let model = proto::decode_model(bytes, kind.limits())?;
         if model.ir_version != EXPECTED_IR_VERSION {
             return Err(OnnxLoadError::UnsupportedIrVersion);
         }

@@ -8,21 +8,21 @@
 //! 拒否は [`OnnxLoadError`] の分類で返し、本文・重みは保持しない）。
 //!
 //! - 部分グラフ・テンソル・型情報を値に持つ属性（GRAPH・TENSOR・SPARSE_TENSOR 等。再帰を作らない）
-//! - `raw_data` 以外の形で値を持つテンソル、`external_data` / `data_location`（モデル外のファイル
-//!   参照による経路外読み込みを塞ぐ）、FLOAT・INT64 以外の要素型
-//! - ノード数・initializer 数・入出力名数・名前の長さ・テンソルの次元数が上限を超えるモデル
+//! - `raw_data` 以外の形で値を持つテンソル、FLOAT・INT64 以外の要素型（BFLOAT16 は
+//!   [`super::ModelLimits::allow_bf16`] の種類だけ）
+//! - `external_data` / `data_location`（モデル外のファイル参照による経路外読み込みを塞ぐ）。
+//!   [`super::ModelLimits::external`] が `Some` の種類だけ、location・offset・length の 3 key に
+//!   限って参照として保留し、実体は [`super::external`] が閉じ込め済みの `File` から読む
+//! - ノード数・initializer 数・次元数が種類別の上限を超えるモデル、入出力名数・名前の長さの上限超過
 //!
 //! 要素数は次元の積を `checked_mul` で求め、`raw_data` の長さと厳密に一致することを確認してから
 //! 復号する。全体の量は呼び出し元が課すファイルサイズ上限で有界（[`super::MAX_MODEL_FILE_BYTES`]）。
 //! 外部入力の経路のため `unwrap`・添字アクセスを使わない。
 
-use super::OnnxLoadError;
 use super::wire::{Reader, WireType};
+use super::{ModelLimits, OnnxLoadError};
 
-/// ノード数の上限（C3 の最大構成は約 42、C1 は 14。余裕を見た暫定値。REQ-39）。
-pub(super) const MAX_NODES: usize = 128;
-/// initializer 数の上限（C3 の最大構成は約 23。REQ-39）。
-pub(super) const MAX_INITIALIZERS: usize = 64;
+// ノード数・initializer 数・次元数の上限は種類別（`ModelLimits`。C1・C3 は STRICT。#581）。
 /// 1 ノードの属性数の上限（REQ-39）。
 const MAX_ATTRS_PER_NODE: usize = 16;
 /// 1 ノードの入力・出力名数の上限（C3 の `Concat` は幅数 ≤ 8 個。REQ-39）。
@@ -31,8 +31,6 @@ const MAX_NODE_IO: usize = 16;
 const MAX_GRAPH_IO: usize = 8;
 /// 名前・文字列属性のバイト長の上限（REQ-39）。
 const MAX_NAME_BYTES: usize = 128;
-/// テンソル・入出力形状の次元数の上限（C3 の畳み込み重みが 3 次元。REQ-39）。
-const MAX_DIMS: usize = 4;
 
 /// AttributeProto.AttributeType の値のうち受理するもの。
 const ATTR_FLOAT: i64 = 1;
@@ -44,6 +42,8 @@ const ATTR_INTS: i64 = 7;
 /// TensorProto.DataType の値のうち受理するもの。
 pub(super) const DT_FLOAT: i64 = 1;
 pub(super) const DT_INT64: i64 = 7;
+/// bf16 は `ModelLimits::allow_bf16` の種類だけが受理する（#581）。
+pub(super) const DT_BFLOAT16: i64 = 16;
 
 #[derive(Debug)]
 pub(super) struct ModelProto {
@@ -103,6 +103,23 @@ pub(super) struct AttrProto {
 pub(super) enum TensorData {
     F32(Vec<f32>),
     I64(Vec<i64>),
+    /// bf16 のビット列（上位 16 bit の f32）。f32 への展開は計算側（行列積・Gather）で行う。
+    // 読み手は Qwen 実行器（#416・#417・#420）。未接続の間は dead_code になる
+    #[cfg_attr(not(test), allow(dead_code))]
+    Bf16(Vec<u16>),
+    /// 外部データへの参照。[`super::external::resolve_external`] が他の値へ置き換えるまで実行に渡さない。
+    External(ExternalRef),
+}
+
+/// ONNX の外部データ参照（`TensorProto.external_data` の検証済みの写し。REQ-39・#581）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExternalRef {
+    pub location: String,
+    pub offset: u64,
+    /// バイト長。`count × 要素サイズ` と一致することを復号時に確認済み。
+    pub length: u64,
+    pub data_type: i64,
+    pub count: usize,
 }
 
 #[derive(Debug)]
@@ -197,7 +214,10 @@ fn expect_varint(r: &mut Reader<'_>, wt: WireType) -> Result<u64, OnnxLoadError>
 }
 
 /// ModelProto 全体を復号する。`limit_elems` は 1 属性・1 テンソルの要素数の上限（ファイルサイズ）。
-pub(super) fn decode_model(bytes: &[u8]) -> Result<ModelProto, OnnxLoadError> {
+pub(super) fn decode_model(
+    bytes: &[u8],
+    limits: &ModelLimits,
+) -> Result<ModelProto, OnnxLoadError> {
     let elem_limit = bytes.len();
     let mut r = Reader::new(bytes);
     let mut ir_version = 0i64;
@@ -211,7 +231,7 @@ pub(super) fn decode_model(bytes: &[u8]) -> Result<ModelProto, OnnxLoadError> {
                 if graph.is_some() {
                     return Err(OnnxLoadError::MalformedProtobuf);
                 }
-                graph = Some(decode_graph(body, elem_limit)?);
+                graph = Some(decode_graph(body, elem_limit, limits)?);
             }
             8 => {
                 let body = expect_len(&mut r, wt)?;
@@ -241,25 +261,29 @@ fn decode_opset(bytes: &[u8]) -> Result<OpsetId, OnnxLoadError> {
     Ok(OpsetId { domain, version })
 }
 
-fn decode_graph(bytes: &[u8], elem_limit: usize) -> Result<GraphProto, OnnxLoadError> {
+fn decode_graph(
+    bytes: &[u8],
+    elem_limit: usize,
+    limits: &ModelLimits,
+) -> Result<GraphProto, OnnxLoadError> {
     let mut r = Reader::new(bytes);
     let mut g = GraphProto::default();
     while let Some((num, wt)) = r.next_field().map_err(malformed)? {
         match num {
             1 => {
                 let node = decode_node(expect_len(&mut r, wt)?, elem_limit)?;
-                push_limited(&mut g.nodes, node, MAX_NODES)?;
+                push_limited(&mut g.nodes, node, limits.max_nodes)?;
             }
             5 => {
-                let t = decode_tensor(expect_len(&mut r, wt)?)?;
-                push_limited(&mut g.initializers, t, MAX_INITIALIZERS)?;
+                let t = decode_tensor(expect_len(&mut r, wt)?, limits)?;
+                push_limited(&mut g.initializers, t, limits.max_initializers)?;
             }
             11 => {
-                let v = decode_value_info(expect_len(&mut r, wt)?)?;
+                let v = decode_value_info(expect_len(&mut r, wt)?, limits.max_dims)?;
                 push_limited(&mut g.inputs, v, MAX_GRAPH_IO)?;
             }
             12 => {
-                let v = decode_value_info(expect_len(&mut r, wt)?)?;
+                let v = decode_value_info(expect_len(&mut r, wt)?, limits.max_dims)?;
                 push_limited(&mut g.outputs, v, MAX_GRAPH_IO)?;
             }
             // sparse_initializer・quantization_annotation は使わない書き出し器の出力には無い
@@ -330,18 +354,26 @@ fn decode_attr(bytes: &[u8], elem_limit: usize) -> Result<AttrProto, OnnxLoadErr
     Ok(a)
 }
 
-fn decode_tensor(bytes: &[u8]) -> Result<TensorProto, OnnxLoadError> {
+fn decode_tensor(bytes: &[u8], limits: &ModelLimits) -> Result<TensorProto, OnnxLoadError> {
     let mut r = Reader::new(bytes);
     let mut name = String::new();
     let mut dims: Vec<i64> = Vec::new();
     let mut data_type = 0i64;
     let mut raw: Option<&[u8]> = None;
+    let mut ext: Vec<(String, String)> = Vec::new();
+    let mut data_location: Option<u64> = None;
     while let Some((num, wt)) = r.next_field().map_err(malformed)? {
         match num {
-            1 => read_repeated_i64(&mut r, wt, &mut dims, MAX_DIMS)?,
+            1 => read_repeated_i64(&mut r, wt, &mut dims, limits.max_dims)?,
             2 => data_type = expect_varint(&mut r, wt)? as i64,
             8 => name = string_of(expect_len(&mut r, wt)?)?,
             9 => raw = Some(expect_len(&mut r, wt)?),
+            // external_data(13)・data_location(14): 外部データを許す種類だけが解釈する
+            13 if limits.external.is_some() => {
+                let e = decode_external_entry(expect_len(&mut r, wt)?)?;
+                push_limited(&mut ext, e, MAX_EXTERNAL_ENTRIES)?;
+            }
+            14 if limits.external.is_some() => data_location = Some(expect_varint(&mut r, wt)?),
             // segment・float_data・int32_data・string_data・int64_data・double_data・uint64_data・
             // external_data・data_location: raw_data 以外の値の持ち方と外部参照は受理しない
             3..=7 | 10 | 11 | 13 | 14 => return Err(OnnxLoadError::UnsupportedTensor),
@@ -351,6 +383,7 @@ fn decode_tensor(bytes: &[u8]) -> Result<TensorProto, OnnxLoadError> {
     let elem_size: usize = match data_type {
         DT_FLOAT => 4,
         DT_INT64 => 8,
+        DT_BFLOAT16 if limits.allow_bf16 => 2,
         _ => return Err(OnnxLoadError::UnsupportedTensor),
     };
     let mut count: usize = 1;
@@ -363,35 +396,119 @@ fn decode_tensor(bytes: &[u8]) -> Result<TensorProto, OnnxLoadError> {
     let expected = count
         .checked_mul(elem_size)
         .ok_or(OnnxLoadError::UnsupportedTensor)?;
+    // 外部データ: data_location=EXTERNAL(1) と external_data が揃い、raw_data と併用しないものだけ
+    if data_location.is_some() || !ext.is_empty() {
+        if data_location != Some(1) || ext.is_empty() || raw.is_some() {
+            return Err(OnnxLoadError::UnsupportedTensor);
+        }
+        if count > super::ops::MAX_ELEMENTS {
+            return Err(OnnxLoadError::LimitExceeded);
+        }
+        let ext = external_ref(&ext, data_type, count, expected)?;
+        return Ok(TensorProto {
+            name,
+            dims,
+            data: TensorData::External(ext),
+        });
+    }
     let raw = raw.unwrap_or(&[]);
     if raw.len() != expected {
         return Err(OnnxLoadError::UnsupportedTensor);
     }
-    let data = if data_type == DT_FLOAT {
-        let mut v = Vec::with_capacity(count);
-        // raw.len() == count * 4 は上で確認済み
-        for arr in raw.as_chunks::<4>().0 {
-            v.push(f32::from_le_bytes(*arr));
-        }
-        TensorData::F32(v)
-    } else {
-        let mut v = Vec::with_capacity(count);
-        // raw.len() == count * 8 は上で確認済み
-        for arr in raw.as_chunks::<8>().0 {
-            v.push(i64::from_le_bytes(*arr));
-        }
-        TensorData::I64(v)
+    // raw.len() == count * elem_size は上で確認済み。
+    // 確保は raw の実長（ファイルサイズ上限で有界）に比例する
+    let data = match data_type {
+        DT_FLOAT => TensorData::F32(
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|a| f32::from_le_bytes(*a))
+                .collect(),
+        ),
+        DT_INT64 => TensorData::I64(
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|a| i64::from_le_bytes(*a))
+                .collect(),
+        ),
+        _ => TensorData::Bf16(
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|a| u16::from_le_bytes(*a))
+                .collect(),
+        ),
     };
     Ok(TensorProto { name, dims, data })
 }
 
-fn decode_value_info(bytes: &[u8]) -> Result<ValueInfo, OnnxLoadError> {
+/// `external_data` の key/value 数の上限（許す key は location・offset・length の 3 つ。REQ-39）。
+const MAX_EXTERNAL_ENTRIES: usize = 3;
+
+/// StringStringEntryProto（key=1・value=2）。
+fn decode_external_entry(bytes: &[u8]) -> Result<(String, String), OnnxLoadError> {
+    let mut r = Reader::new(bytes);
+    let (mut k, mut v) = (String::new(), String::new());
+    while let Some((num, wt)) = r.next_field().map_err(malformed)? {
+        match num {
+            1 => k = string_of(expect_len(&mut r, wt)?)?,
+            2 => v = string_of(expect_len(&mut r, wt)?)?,
+            _ => r.skip(wt).map_err(malformed)?,
+        }
+    }
+    Ok((k, v))
+}
+
+/// key は location（必須）・offset（省略時 0）・length（必須）だけを受理する。`checksum` を含む
+/// 未知の key と重複は拒否する（sha256 の照合は呼び出し側が渡す期待値で行い、ONNX 内の値は信用しない）。
+fn external_ref(
+    entries: &[(String, String)],
+    data_type: i64,
+    count: usize,
+    expected_len: usize,
+) -> Result<ExternalRef, OnnxLoadError> {
+    let (mut location, mut offset, mut length) = (None, None, None);
+    let num = |v: &str| -> Result<u64, OnnxLoadError> {
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(OnnxLoadError::UnsupportedTensor);
+        }
+        v.parse::<u64>()
+            .map_err(|_| OnnxLoadError::UnsupportedTensor)
+    };
+    for (k, v) in entries {
+        let dup = match k.as_str() {
+            "location" => location.replace(v.clone()).is_some(),
+            "offset" => offset.replace(num(v)?).is_some(),
+            "length" => length.replace(num(v)?).is_some(),
+            _ => true,
+        };
+        if dup {
+            return Err(OnnxLoadError::UnsupportedTensor);
+        }
+    }
+    let (Some(location), Some(length)) = (location, length) else {
+        return Err(OnnxLoadError::UnsupportedTensor);
+    };
+    if u64::try_from(expected_len).ok() != Some(length) {
+        return Err(OnnxLoadError::UnsupportedTensor);
+    }
+    Ok(ExternalRef {
+        location,
+        offset: offset.unwrap_or(0),
+        length,
+        data_type,
+        count,
+    })
+}
+
+fn decode_value_info(bytes: &[u8], max_dims: usize) -> Result<ValueInfo, OnnxLoadError> {
     let mut r = Reader::new(bytes);
     let mut v = ValueInfo::default();
     while let Some((num, wt)) = r.next_field().map_err(malformed)? {
         match num {
             1 => v.name = string_of(expect_len(&mut r, wt)?)?,
-            2 => decode_type(expect_len(&mut r, wt)?, &mut v)?,
+            2 => decode_type(expect_len(&mut r, wt)?, &mut v, max_dims)?,
             _ => r.skip(wt).map_err(malformed)?,
         }
     }
@@ -399,7 +516,7 @@ fn decode_value_info(bytes: &[u8]) -> Result<ValueInfo, OnnxLoadError> {
 }
 
 /// TypeProto（`tensor_type` のみ受理）から要素型と形状を読む。
-fn decode_type(bytes: &[u8], v: &mut ValueInfo) -> Result<(), OnnxLoadError> {
+fn decode_type(bytes: &[u8], v: &mut ValueInfo, max_dims: usize) -> Result<(), OnnxLoadError> {
     let mut r = Reader::new(bytes);
     while let Some((num, wt)) = r.next_field().map_err(malformed)? {
         match num {
@@ -408,7 +525,7 @@ fn decode_type(bytes: &[u8], v: &mut ValueInfo) -> Result<(), OnnxLoadError> {
                 while let Some((n2, w2)) = t.next_field().map_err(malformed)? {
                     match n2 {
                         1 => v.elem_type = expect_varint(&mut t, w2)? as i64,
-                        2 => decode_shape(expect_len(&mut t, w2)?, &mut v.dims)?,
+                        2 => decode_shape(expect_len(&mut t, w2)?, &mut v.dims, max_dims)?,
                         _ => t.skip(w2).map_err(malformed)?,
                     }
                 }
@@ -421,7 +538,7 @@ fn decode_type(bytes: &[u8], v: &mut ValueInfo) -> Result<(), OnnxLoadError> {
     Ok(())
 }
 
-fn decode_shape(bytes: &[u8], dims: &mut Vec<Dim>) -> Result<(), OnnxLoadError> {
+fn decode_shape(bytes: &[u8], dims: &mut Vec<Dim>, max_dims: usize) -> Result<(), OnnxLoadError> {
     let mut r = Reader::new(bytes);
     while let Some((num, wt)) = r.next_field().map_err(malformed)? {
         if num != 1 {
@@ -437,7 +554,7 @@ fn decode_shape(bytes: &[u8], dims: &mut Vec<Dim>) -> Result<(), OnnxLoadError> 
                 _ => d.skip(w2).map_err(malformed)?,
             }
         }
-        push_limited(dims, dim.ok_or(OnnxLoadError::MalformedProtobuf)?, MAX_DIMS)?;
+        push_limited(dims, dim.ok_or(OnnxLoadError::MalformedProtobuf)?, max_dims)?;
     }
     Ok(())
 }

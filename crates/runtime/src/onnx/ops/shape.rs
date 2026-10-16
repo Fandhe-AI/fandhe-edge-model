@@ -22,7 +22,8 @@ use super::{
     MAX_RANK, OpError, Tensor, advance_index, broadcast_shape, broadcast_strides, element_count,
 };
 
-// ponytail: 暫定値。種類別の上限は #581 で確定する。
+// 値の根拠: Qwen2 の採点グラフの Concat は入力数が数個、Split は q・k・v の 3 個程度（設計書）で、
+// 64 は十分な余裕を持つ上限。1.5B 向けに据え置く（#581）。
 /// Concat の入力数の上限。
 pub const MAX_CONCAT_INPUTS: usize = 64;
 /// Split の出力数の上限。
