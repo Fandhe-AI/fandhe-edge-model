@@ -190,3 +190,18 @@ fn req41_name_content_mismatch_rejected() {
         assert!(!msg.contains(sb.base.to_str().unwrap()), "{msg}");
     }
 }
+
+/// REQ-39: 絶対パス・`..` の member は、Display・Debug のどちらにも露出しない。
+#[test]
+fn req39_rejection_does_not_leak_member_path() {
+    let sb = Sandbox::new("leak");
+    for m in [
+        "/private/customer/model.safetensors",
+        "../customer.safetensors",
+    ] {
+        let e = reject(open_base_model_file(&sb.confine(), Path::new(m)));
+        let shown = format!("{e} | {e:?} | {:?}", std::error::Error::source(&e));
+        assert!(!shown.contains("customer"), "{shown}");
+        assert!(!shown.contains("private"), "{shown}");
+    }
+}

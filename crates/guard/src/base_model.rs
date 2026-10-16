@@ -13,16 +13,16 @@
 //!   （blobs への symlink）は拒否される。実ファイルとして置いたディレクトリを渡すこと
 //! - 検査順序は 名前 → 経路 → サイズ（fstat。1 バイトも読まない）→ 形式。名前と内容が食い違う
 //!   もの（pickle 偽装を含む）は `format_not_allowed` で拒否する
-//! - 利用者由来のパス・ファイル名・内容はエラーの値にもメッセージにも含めない
+//! - 利用者由来のパス・ファイル名・内容はエラーの値（Debug・source を含む）にもメッセージにも含めない。
+//!   経路・形式の拒否は終了コードと理由コードだけに畳む
 //!
 //! ponytail: 形式判定のため上限（1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
 //! RSS が問題になれば safetensors はヘッダーだけの検査へ切り替える（#435）。
 //! ハードリンクで外部ファイルを指すメンバーは経路では検出できない（必要なら `st_nlink > 1` を拒否）。
 
 use crate::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES, check_file_size_within};
-use crate::format::{CheckedFile, FileFormat, FormatAllowlist, FormatRejection, check_open_file};
+use crate::format::{CheckedFile, FileFormat, FormatAllowlist, check_open_file};
 use crate::package::ConfinedPackage;
-use crate::path::PathRejection;
 use fandhe_edge_core::exitcode::ExitCode;
 use std::fmt;
 use std::path::Path;
@@ -34,11 +34,19 @@ pub enum BaseModelFileRejection {
     /// ファイル名が許可されていない（`*.safetensors`・`tokenizer.json` 以外）。ファイルには触れない。
     NameNotAllowed,
     /// 経路の閉じ込め・open の拒否（`../`・絶対パス・symlink・通常ファイル以外）。
-    Path(PathRejection),
-    /// 読み込み前のサイズ確認の拒否（上限超過等）。
+    /// 元の [`PathRejection`] は利用者由来のパスを保持するため、終了コードと理由コードだけを残す。
+    Path {
+        exit_code: ExitCode,
+        reason_code: &'static str,
+    },
+    /// 読み込み前のサイズ確認の拒否（上限超過等。パスを含まない）。
     Size(FileSizeRejection),
-    /// 内容の形式の拒否（名前との不一致・pickle 偽装・許可リスト外）。
-    Format(FormatRejection),
+    /// 内容の形式の拒否（名前との不一致・pickle 偽装・許可リスト外・読み込み失敗）。
+    /// 元の [`FormatRejection`] の I/O エラーはパスを保持しうるため、終了コードと理由コードだけを残す。
+    Format {
+        exit_code: ExitCode,
+        reason_code: &'static str,
+    },
 }
 
 impl BaseModelFileRejection {
@@ -46,9 +54,8 @@ impl BaseModelFileRejection {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::NameNotAllowed => ExitCode::InvalidInput,
-            Self::Path(e) => e.exit_code(),
+            Self::Path { exit_code, .. } | Self::Format { exit_code, .. } => *exit_code,
             Self::Size(e) => e.exit_code(),
-            Self::Format(e) => e.exit_code(),
         }
     }
 
@@ -56,9 +63,8 @@ impl BaseModelFileRejection {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::NameNotAllowed => "base_model_file_name_not_allowed",
-            Self::Path(e) => e.reason_code(),
+            Self::Path { reason_code, .. } | Self::Format { reason_code, .. } => reason_code,
             Self::Size(e) => e.reason_code(),
-            Self::Format(e) => e.reason_code(),
         }
     }
 }
@@ -67,9 +73,9 @@ impl fmt::Display for BaseModelFileRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NameNotAllowed => write!(f, "base model file name is not allowed"),
-            Self::Path(e) => e.fmt(f),
+            Self::Path { .. } => write!(f, "base model file path was rejected"),
             Self::Size(e) => e.fmt(f),
-            Self::Format(e) => e.fmt(f),
+            Self::Format { .. } => write!(f, "base model file format was rejected"),
         }
     }
 }
@@ -77,10 +83,8 @@ impl fmt::Display for BaseModelFileRejection {
 impl std::error::Error for BaseModelFileRejection {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NameNotAllowed => None,
-            Self::Path(e) => Some(e),
             Self::Size(e) => Some(e),
-            Self::Format(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -109,7 +113,10 @@ pub fn open_base_model_file(
     let expected = expected_format(member).ok_or(BaseModelFileRejection::NameNotAllowed)?;
     let file = dir
         .open_regular_member(member)
-        .map_err(BaseModelFileRejection::Path)?;
+        .map_err(|e| BaseModelFileRejection::Path {
+            exit_code: e.exit_code(),
+            reason_code: e.reason_code(),
+        })?;
     check_file_size_within(&file, MAX_READ_FILE_BYTES).map_err(BaseModelFileRejection::Size)?;
     check_open_file(
         file,
@@ -117,7 +124,10 @@ pub fn open_base_model_file(
         &FormatAllowlist::new([expected]),
         MAX_READ_FILE_BYTES,
     )
-    .map_err(BaseModelFileRejection::Format)
+    .map_err(|e| BaseModelFileRejection::Format {
+        exit_code: e.exit_code(),
+        reason_code: e.reason_code(),
+    })
 }
 
 #[cfg(test)]
