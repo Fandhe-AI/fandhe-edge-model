@@ -12,7 +12,10 @@ chat template 形式で生成する損失で MLX 学習する。出力は選択�
 
 seed は Python・NumPy・MLX のそれぞれで明示的に設定する（バッチ順は seed 付き permutation、
 LoRA の初期化は `mx.random.key(seed)`）。時間予算に達したら打ち切らず `limit_exceeded`（20）
-で止める。選択肢の採点・予測は #427、ONNX 書き出しは #431・#432（未実装。`runtime_error`）。
+で止める。予測は選択肢の条件付き対数尤度の採点（`predict_records`。#427。長さ正規化なし）で、
+argmax を対応づけ (b)（`autoregressive.map_scores_to_choice`）で選択肢 ID に解決し、解決できない
+ものは `status:"error"`（判定不能）にする。ONNX 書き出しは #431・#432（未実装。`runtime_error`）で、
+CLI の `train` 全体は書き出し未実装のためまだ完走しない。
 mlx は関数内で遅延 import する（選択口の import を軽く保つ）。
 """
 
@@ -29,6 +32,7 @@ from .. import budget, limits
 from ..contract import TrainExample, TrainRequest
 from ..errors import WorkerError
 from ..exitcode import ExitCode
+from .autoregressive import ChoiceMappingTally, build_prediction_record, map_scores_to_choice
 
 # PoC-26 追補 1・追補 2 の固定値と P15 の代表構成（iters 300・lr 1e-4）。変える場合は
 # fixtures/train_contract/kind_defaults.json も同時に更新する。
@@ -48,6 +52,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 _REQUIRED_FIELDS = ("base_model_dir", "base_model_sha256")
 _CONFIG_FIELDS = frozenset(DEFAULT_CONFIG) | frozenset(_REQUIRED_FIELDS)
 _DTYPES = ("bfloat16", "float32")
+
+#: 採点 1 回の forward に入れる選択肢の数（K が大きくてもメモリが線形に伸びない。PoC-26 と同値）
+SCORE_CHUNK = 8
 
 _NOT_IMPLEMENTED = "kind 'qwen2_lora' export_onnx is not implemented yet"
 
@@ -269,8 +276,120 @@ def _train_loop(
     return loss_value, cfg["iters"]
 
 
+def score_chunk(model: Any, prompt_ids: list[int], label_ids: list[list[int]], pad_id: int) -> Any:
+    """選択肢の部分集合を 1 回の forward で採点する（`score_labels` の 1 チャンク）。
+
+    各列は `prompt + label + <|im_end|>` を右 pad する（pad は後ろで因果マスクにより実 token から
+    見えない）。採点位置の隠れ状態だけを float32 の logits にし、符号反転した交差エントロピーを
+    選択肢ごとに合計して対数尤度（float64）で返す。
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    p, k = len(prompt_ids), len(label_ids)
+    width = p + max(len(c) for c in label_ids)
+    seqs = np.full((k, width), pad_id, dtype=np.int32)
+    pos: list[int] = []
+    tgt: list[int] = []
+    owner: list[int] = []
+    for i, c in enumerate(label_ids):
+        seqs[i, :p] = prompt_ids
+        seqs[i, p : p + len(c)] = c
+        for j, t in enumerate(c):
+            pos.append(i * width + p - 1 + j)  # この位置の出力が c[j] を予測する
+            tgt.append(t)
+            owner.append(i)
+    h = model.hidden_states(mx.array(seqs))
+    hv = h.reshape(-1, h.shape[-1])[mx.array(np.array(pos, dtype=np.int32))]
+    logits = model.project(hv, source_shape=(k, width), with_mask=False).astype(mx.float32)
+    ce = nn.losses.cross_entropy(logits, mx.array(np.array(tgt, dtype=np.int32)), reduction="none")
+    mx.eval(ce)
+    return -np.bincount(owner, weights=np.array(ce, dtype=np.float64), minlength=k)
+
+
+def score_labels(
+    model: Any,
+    prompt_ids: list[int],
+    label_ids: list[list[int]],
+    pad_id: int,
+    chunk: int = SCORE_CHUNK,
+) -> Any:
+    """全選択肢の対数尤度の合計（長さ正規化なし。PoC-26 追補 1 の固定値）。
+
+    `chunk` 件ずつ forward する。各選択肢の値は他に依存しないので、分割しても結果は
+    浮動小数の丸めの範囲でしか変わらない。
+    """
+    if chunk < 1:
+        raise ValueError("chunk must be positive")
+    return np.concatenate(
+        [
+            score_chunk(model, prompt_ids, label_ids[i : i + chunk], pad_id)
+            for i in range(0, len(label_ids), chunk)
+        ]
+    )
+
+
+def predict_records(
+    trained: Qwen2LoraTrainedModel,
+    rows: list[tuple[str, str]],
+    *,
+    resource_budget: budget.ResourceBudget | None = None,
+    tally: ChoiceMappingTally | None = None,
+) -> list[dict[str, Any]]:
+    """`rows`（`(id, input)` の列）を選択肢スコアリングで予測する（REQ-41・REQ-19b・TASK-41.5-4）。
+
+    学習ワーカーの `predict.predict_validation`（学習直後の validation 予測）から呼ばれる。
+    **正解ラベルは受け取らない**（REQ-27）。自由生成はせず、各選択肢の条件付き対数尤度の argmax を
+    対応づけ (b) で選択肢 ID に解決する。非有限スコア・解決不能は `status:"error"`（判定不能）。
+    長さ超過は切り詰めず採点前に `limit_exceeded`（20）で止める。エラーに入力本文は含めない。
+    """
+    rb = resource_budget or trained.resource_budget
+    cfg, tok, order = trained.config, trained.tokenizer, trained.label_order
+    # 保持前に総量を見積もる。件数は contract の validation 件数上限で既に制限される。
+    # ponytail: 全件をリストで返す。大量件数を流す用途ではジェネレータ化する。
+    budget.check_total_tokens(len(rows), cfg["max_seq_length"])
+    vocab = trained.model.config.vocab_size
+    end = tok.special_ids["im_end"]
+    label_ids = [[*tok.encode(x), end] for x in order]
+    if any(t >= vocab for ids in label_ids for t in ids):
+        raise WorkerError(
+            "invalid_data", "token id outside the model vocabulary", ExitCode.INVALID_INPUT
+        )
+    longest = max(len(c) for c in label_ids)
+    system = _system_prompt(order)
+    prompts: list[list[int]] = []
+    for _, text in rows:
+        rb.check()
+        ids = tok.build_chat_ids(system, text, add_generation_prompt=True)
+        if ids and max(ids) >= vocab:
+            raise WorkerError(
+                "invalid_data", "token id outside the model vocabulary", ExitCode.INVALID_INPUT
+            )
+        if len(ids) + longest > cfg["max_seq_length"]:
+            raise WorkerError(
+                "limit_exceeded",
+                "a prediction sequence exceeds max_seq_length",
+                ExitCode.LIMIT_EXCEEDED,
+            )
+        prompts.append(ids)
+    pad_id = tok.special_ids["endoftext"]
+    # 対応づけ (b) の表現（UTF-8 バイト値 + 1）に合わせる。
+    choice_ids = {x: [b + 1 for b in x.encode("utf-8")] for x in order}
+    trained.model.eval()
+    out: list[dict[str, Any]] = []
+    for (rid, _), ids in zip(rows, prompts, strict=True):
+        rb.check()
+        loglik = score_labels(trained.model, ids, label_ids, pad_id)
+        rb.check()  # forward の後にも確認する（最後の 1 件で超過しても 20）
+        mapping = map_scores_to_choice(loglik, order, choice_ids)
+        if tally is not None:
+            tally.record(mapping)
+        out.append(build_prediction_record(rid, mapping, order))
+    return out
+
+
 class Qwen2LoraKind:
-    """`Kind` プロトコルの実装。学習は #426、ONNX 書き出しは #431・#432（未実装）。"""
+    """`Kind` プロトコルの実装。学習は #426、予測は #427、ONNX 書き出しは #431・#432（未実装）。"""
 
     def train(
         self,

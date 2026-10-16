@@ -6,6 +6,9 @@ kind ごとの予測処理を 1 箇所で振り分け、kind の追加時に変�
 だけに閉じる（`kinds/__init__.py::Kind` プロトコルには `predict` を含めない。
 オーナー判断で振り分け関数を 1 つにまとめる方針。issue #84 PR #238・選択肢 2）。
 
+- `qwen2_lora`: 選択肢スコアリング（`kinds/qwen2_lora.py::predict_records`。各選択肢の条件付き
+  対数尤度の argmax を対応づけ (b) で解決。REQ-41・TASK-41.5-4・#427）。`autoregressive` と同じく
+  `scores` を除き、理由別の件数だけを stderr へ 1 行出す
 - `c1`・`c3`: 学習時の順伝播（`TfidfLogReg.__call__`・`ByteCNN.__call__`）の
   argmax（`kinds/c1.py::predict_labels`・`kinds/c3.py::predict_labels`）
 - `autoregressive`: 既存の `predict_records`（対応づけ (b)）から `scores` を除く。
@@ -31,7 +34,7 @@ from .prediction import PREDICTION_FIELDS
 
 #: 学習直後の validation 予測に対応している kind。新しい kind を選択口へ足したら、
 #: 予測経路を実装して `predict_validation` の分岐とここへ追加する。
-_SUPPORTED_KINDS = frozenset({"c1", "c3", "autoregressive"})
+_SUPPORTED_KINDS = frozenset({"c1", "c3", "autoregressive", "qwen2_lora"})
 
 
 def require_validation_prediction_support(kind: str) -> None:
@@ -57,6 +60,19 @@ def predict_validation(
     predicted_label}` のレコード列を返す。入力の順序・件数を保つ。
     """
     require_validation_prediction_support(kind)
+    if kind == "qwen2_lora":
+        from .kinds.autoregressive import ChoiceMappingTally
+        from .kinds.qwen2_lora import predict_records as predict_qwen2
+
+        tally = ChoiceMappingTally()
+        records = [
+            {key: record[key] for key in PREDICTION_FIELDS}
+            for record in predict_qwen2(
+                trained, list(rows), resource_budget=resource_budget, tally=tally
+            )
+        ]
+        print(tally.to_log_line("qwen2_lora"), file=sys.stderr)
+        return records
     if kind == "autoregressive":
         from .kinds.autoregressive import ChoiceMappingTally, predict_records
 
