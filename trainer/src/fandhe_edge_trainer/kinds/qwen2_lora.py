@@ -98,6 +98,18 @@ def _validate_config(cfg: dict[str, Any]) -> None:
         raise _invalid_config(f"config.dtype must be one of {list(_DTYPES)}")
 
 
+def _activation_bytes(c: Any, cfg: dict[str, Any]) -> int:
+    """LoRA 層の逆伝播用に保持する活性の上限寄りの見積もり（float32 換算。REQ-39）。
+
+    1 token・1 層あたり hidden の約 10 本と intermediate の 3 本、attention 重み
+    （head 数 x 系列長）を保持するとみなす。保持が必要なのは LoRA を付ける層のみ。
+    """
+    tokens = cfg["batch_size"] * cfg["max_seq_length"]
+    per_token = 10 * c.hidden_size + 3 * c.intermediate_size
+    per_token += c.num_attention_heads * cfg["max_seq_length"]
+    return 4 * tokens * per_token * cfg["lora_num_layers"]
+
+
 def _seed_all(seed: int) -> None:
     """Python・NumPy・MLX の乱数を明示的に seed する（決定性の要件。REQ-19・REQ-41）。"""
     import mlx.core as mx
@@ -113,13 +125,9 @@ def _system_prompt(label_order: list[str]) -> str:
 
 
 def make_batches(lengths: list[int], batch_size: int) -> list[list[int]]:
-    """長さ順に並べて `batch_size` 件ずつに区切る。端数は捨てる（mlx-lm の `iterate_batches`）。
-
-    端数は長さ昇順の末尾（最大 `batch_size - 1` 件）＝最も長い例が落ちる。件数が `batch_size`
-    の倍数でない限り、最長の例は学習に使われない。
-    """
+    """長さ順に並べて `batch_size` 件ずつに区切る。端数バッチ（最長側）も捨てずに残す。"""
     order = sorted(range(len(lengths)), key=lambda i: lengths[i])
-    return [order[i : i + batch_size] for i in range(0, len(order) - batch_size + 1, batch_size)]
+    return [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
 
 
 def collate(seqs: list[list[int]], idxs: list[int], pad_id: int) -> tuple[Any, Any, Any]:
@@ -304,6 +312,7 @@ class Qwen2LoraKind:
             dropout=float(cfg["lora_dropout"]),
             seed=request.seed,
             rss_bytes=resource_budget.rss_bytes,
+            activation_bytes=_activation_bytes(c, cfg),
         )
         loss, done = _train_loop(
             base.model,

@@ -672,11 +672,14 @@ def apply_lora(
     dropout: float,
     seed: int,
     rss_bytes: int,
+    activation_bytes: int = 0,
 ) -> None:
     """base を freeze し、末尾 `num_layers` ブロックの 7 Linear を LoRA に置き換える。
 
     `qwen2_lora` の `train` から呼ばれる。lora_a は `mx.random.key(seed)` を split した鍵で
-    初期化し、グローバル乱数状態に依存しない。置換前に「追加する LoRA 行列＋現在のパラメータ」を
+    初期化し、グローバル乱数状態に依存しない。置換前に「現在のパラメータ＋追加する LoRA 行列
+    （重み・勾配・Adam の 2 状態で 4 倍）
+    ＋呼び出し側が見積もる逆伝播用の保持活性 `activation_bytes`」を
     `rss_bytes`（`ResourceBudget.rss_bytes`）と比べ、超過なら `limit_exceeded`。不正値は
     `invalid_config`（REQ-39）。
     """
@@ -697,8 +700,9 @@ def apply_lora(
         raise _invalid_config(f"invalid LoRA scale: 0 < scale <= {MAX_LORA_SCALE}")
     if not 0.0 <= dropout < 1.0:
         raise _invalid_config("invalid LoRA dropout: 0 <= dropout < 1")
+    # float32 の重み・勾配・Adam の m・v の 4 組
     added = (
-        4
+        16
         * rank
         * sum(
             sum(sum(getattr(getattr(b, o), n).weight.shape) for n in names)
@@ -707,7 +711,7 @@ def apply_lora(
         )
     )
     current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
-    if current + added > rss_bytes:
+    if current + added + activation_bytes > rss_bytes:
         raise limit_error("LoRA matrices would exceed the memory budget")
     model.freeze()
     n_each = sum(len(names) for _, names in _LORA_TARGETS)
