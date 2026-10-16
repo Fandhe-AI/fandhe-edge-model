@@ -5,7 +5,7 @@
 //! 共有型（[`Tensor`]・[`OpError`]・ブロードキャスト）と形状操作（[`shape`]。#417）を提供する。
 //! `docs/design/qwen2-scoring-onnx-ops.md` の演算一覧のうち、行列演算と要素ごとの演算
 //! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は #416 の担当で、本差分では未実装
-//! （後続実装）。正規化と活性化は #418、マスクと RoPE は #419 の担当。
+//! （後続実装）。正規化と活性化は [`norm_act`]（#418）、マスクと RoPE は #419 の担当。
 //!
 //! # 契約
 //!
@@ -18,6 +18,7 @@
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致で比べる
 
+pub mod norm_act;
 pub mod shape;
 
 use std::fmt;
@@ -43,6 +44,8 @@ pub enum OpError {
     IndexOutOfRange,
     /// 属性・補助入力（axes・perm・shape 等）が不正、または本実装が扱わない値。
     InvalidAttribute,
+    /// Softmax 系の入力に NaN・±inf がある（fail-closed。不正な重みを確率として出さない）。
+    NonFinite,
 }
 
 impl OpError {
@@ -54,6 +57,7 @@ impl OpError {
             Self::IntegerOverflow => "op_integer_overflow",
             Self::IndexOutOfRange => "op_index_out_of_range",
             Self::InvalidAttribute => "op_invalid_attribute",
+            Self::NonFinite => "op_non_finite",
         }
     }
 }
@@ -234,5 +238,6 @@ mod tests {
         );
         assert_eq!(Tensor::new(vec![], vec![7i64]).unwrap().data(), &[7]);
         assert_eq!(OpError::LimitExceeded.code(), "limit_exceeded");
+        assert_eq!(OpError::NonFinite.code(), "op_non_finite");
     }
 }
