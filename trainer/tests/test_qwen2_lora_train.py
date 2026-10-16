@@ -135,6 +135,24 @@ def test_too_few_examples_and_too_long_sequence(tmp_path: Path) -> None:
     assert e.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
+def test_make_batches_keeps_remainder_with_longest() -> None:
+    """端数バッチ（最長側）を捨てない（REQ-41・TASK-41.5-3）。"""
+    from fandhe_edge_trainer.kinds.qwen2_lora import make_batches
+
+    assert make_batches([5, 1, 3, 2, 4, 6, 7], 4) == [[1, 3, 2, 4], [0, 5, 6]]
+
+
+def test_activation_bytes_estimate() -> None:
+    """保持活性の見積もり式（REQ-39）。"""
+    from types import SimpleNamespace
+
+    from fandhe_edge_trainer.kinds.qwen2_lora import _activation_bytes
+
+    c = SimpleNamespace(hidden_size=100, intermediate_size=200, num_attention_heads=4)
+    cfg = {"batch_size": 2, "max_seq_length": 10, "lora_num_layers": 3}
+    assert _activation_bytes(c, cfg) == 4 * 20 * (1000 + 600 + 40) * 3
+
+
 def test_export_onnx_is_not_implemented() -> None:
     """REQ-41・#431: export_onnx は未実装で runtime_error(70)。"""
     with pytest.raises(WorkerError) as e:
