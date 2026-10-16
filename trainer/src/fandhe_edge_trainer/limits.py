@@ -166,6 +166,36 @@ MAX_TRAIN_TOTAL_TOKENS = 50_000_000
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_MODEL_BYTES = 40 * 1024 * 1024
 
+#: 追加学習の種類 `qwen2_lora` の書き出しモデル上限（8 GiB。REQ-39・REQ-41・
+#: TASK-41.6-6・#582）。LoRA 統合後の bf16 書き出しはベース重みとほぼ同じ大きさに
+#: なるため、40 MiB（`MAX_MODEL_BYTES`）とは両立しない（#430）。
+#: 根拠: 実測（`docs/design/poc26-result.md` 追加検証④・#559）で P15（Qwen2.5-1.5B）の
+#: bf16 ベース重みは 3087 MB（約 2.9 GiB）、adapter は 10.6 MB。8 GiB はその約 2.8 倍で、
+#: 「暴走止めは実測の 2〜4 倍」の考え方に合う。Rust ガード層 `MAX_PACKAGE_TOTAL_BYTES`
+#: （#580）・`MAX_BASE_MODEL_TOTAL_BYTES` と同値で、推論側で読めない大きさは書き出させない。
+#: 7B（15,231 MB）は超過する（扱いは 1.5B 完了後に相談）。
+#: 証拠種別: 実測の倍率から決めた暫定値。状態: #582 で決めた値で、オーナー確認は未了。
+MAX_QWEN2_LORA_MODEL_BYTES = 8 << 30
+
+#: 書き出しモデル上限の種類ごとの表（REQ-39・#582）。共有 fixture
+#: （`fixtures/train_contract/limits.json` の `max_model_bytes_by_kind`）と Rust 側
+#: `crates/train/src/limits.rs` で照合する。
+MAX_MODEL_BYTES_BY_KIND: dict[str, int] = {
+    "c1": MAX_MODEL_BYTES,
+    "c3": MAX_MODEL_BYTES,
+    "autoregressive": MAX_MODEL_BYTES,
+    "qwen2_lora": MAX_QWEN2_LORA_MODEL_BYTES,
+}
+
+
+def max_model_bytes_for_kind(kind: object) -> int:
+    """`kind` の書き出しモデル上限（bytes）。表に無い値・str 以外は最も厳しい
+    `MAX_MODEL_BYTES` に落とす（fail-safe。REQ-39）。"""
+    if isinstance(kind, str):
+        return MAX_MODEL_BYTES_BY_KIND.get(kind, MAX_MODEL_BYTES)
+    return MAX_MODEL_BYTES
+
+
 # --------------------------------------------------------------------------
 # kind="c3" のアーキテクチャ・ハイパーパラメータ上限。
 #

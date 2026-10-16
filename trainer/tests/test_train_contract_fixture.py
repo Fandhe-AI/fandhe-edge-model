@@ -90,6 +90,11 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
 
     assert _LIMITS["max_result_bytes"] == supervisor._MAX_WORKER_STDOUT_BYTES
     # 学習ジョブ内採点用の validation 入力（REQ-18・REQ-27。issue #84 PR #238）。
+    assert _LIMITS["max_model_bytes_by_kind"] == limits.MAX_MODEL_BYTES_BY_KIND
+    kind_versions = _load_json_fixture("kind_versions.json")
+    assert set(_LIMITS["max_model_bytes_by_kind"]) == {
+        k for k in kind_versions if not k.startswith("_")
+    }
     assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
     assert _LIMITS["max_validation_id_bytes"] == limits.MAX_VALIDATION_ID_BYTES
     assert _LIMITS["max_validation_input_total_bytes"] == limits.MAX_VALIDATION_INPUT_TOTAL_BYTES
