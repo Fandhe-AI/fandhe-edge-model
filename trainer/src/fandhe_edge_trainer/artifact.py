@@ -24,7 +24,9 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import IO, Any
 
 from .errors import WorkerError
@@ -33,6 +35,22 @@ from .limits import MAX_MODEL_BYTES
 
 #: 選択口（本ワーカー）のバージョン。artifact.json の再現性の記録に使う。
 SELECTOR_VERSION = "0.1"
+
+#: 入力表現の宣言（`artifact.json` の任意の欄 `input_representation`）。欄が無ければ既定値。
+#: Rust 側 `PackageInputRepresentation` と共有 fixture
+#: `fixtures/input_representation/declaration_cases.json` で同一解釈を照合する
+#: （REQ-41・TASK-41.3-2・#403）。
+INPUT_REPRESENTATION_KEY = "input_representation"
+
+
+class InputRepresentation(StrEnum):
+    """入力表現。値は Rust 側 `PackageInputRepresentation` のシリアライズ値と一致する。"""
+
+    BYTE = "byte"
+    TOKENIZER = "tokenizer"
+
+
+DEFAULT_INPUT_REPRESENTATION = InputRepresentation.BYTE
 
 ONNX_FILE_NAME = "model.onnx"
 ARTIFACT_FILE_NAME = "artifact.json"
@@ -101,6 +119,20 @@ def build_artifact(
         "created_utc": now_utc(),
         "candidate_label": candidate_label,
     }
+
+
+def parse_input_representation(artifact: Mapping[str, Any]) -> InputRepresentation:
+    """`artifact` の入力表現の宣言を解釈する（REQ-41・TASK-41.3-2・#403）。
+
+    欄が無ければ `BYTE`。許可値（大文字小文字を区別）以外は `ValueError`
+    （Rust 側の `Malformed` に相当。fail-closed）。`null` も不正。
+    """
+    if INPUT_REPRESENTATION_KEY not in artifact:
+        return DEFAULT_INPUT_REPRESENTATION
+    value = artifact[INPUT_REPRESENTATION_KEY]
+    if not isinstance(value, str):
+        raise ValueError("input_representation must be a string")
+    return InputRepresentation(value)
 
 
 def write_artifact(tmp_fd: int, artifact: dict[str, Any]) -> None:
@@ -209,6 +241,10 @@ def verify_output(dir_fd: int) -> None:
     artifact = _read_artifact_via_fd(dir_fd)
     if not isinstance(artifact, dict):
         raise _integrity_error("artifact.json is not a JSON object")
+    try:
+        parse_input_representation(artifact)
+    except ValueError:
+        raise _integrity_error("artifact.json input_representation is invalid") from None
     expected = artifact.get("onnx_sha256")
     if not isinstance(expected, str) or not expected:
         raise _integrity_error("artifact.json missing onnx_sha256")

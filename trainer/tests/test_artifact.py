@@ -138,6 +138,39 @@ def test_verify_output_rejects_missing_hash_field(tmp_path: Path) -> None:
         root_handle.close()
 
 
+def test_req41_verify_output_rejects_invalid_input_representation(tmp_path: Path) -> None:
+    """REQ-41・#403: 不正な入力表現の宣言は `integrity_check_failed` で拒否する。"""
+    root_handle, reservation = _make_reservation(tmp_path)
+    try:
+        onnx = b"fake onnx bytes"
+        fd = os.open(
+            artifact.ONNX_FILE_NAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=reservation.tmp_fd,
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(onnx)
+        art = artifact.build_artifact(
+            kind="c3",
+            kind_version=1,
+            config={},
+            label_order=["a", "b"],
+            output_type="choice",
+            max_bytes=64,
+            candidate_label="c3",
+            onnx_sha256=hashlib.sha256(onnx).hexdigest(),
+        )
+        art["input_representation"] = "BYTE"
+        artifact.write_artifact(reservation.tmp_fd, art)
+        with pytest.raises(WorkerError) as exc_info:
+            artifact.verify_output(reservation.tmp_fd)
+        assert exc_info.value.code == "integrity_check_failed"
+    finally:
+        contract.cleanup_reservation(reservation)
+        root_handle.close()
+
+
 def test_verify_output_rejects_missing_model_file(tmp_path: Path) -> None:
     root_handle, reservation = _make_reservation(tmp_path)
     try:

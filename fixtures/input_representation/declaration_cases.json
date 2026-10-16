@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "description": "REQ-41 / TASK-41.3-2 (#403) artifact.json input_representation declaration cases. Rust (crates/core ArtifactMeta) and the trainer (artifact.parse_input_representation) must interpret every case identically. Evidence kind: test harness. Do not relax expectations to make tests pass."
+  },
+  "default": "byte",
+  "accepted_values": ["byte", "tokenizer"],
+  "base_artifact": {
+    "onnx_file": "model.onnx",
+    "kind": "c1",
+    "kind_version": 1,
+    "max_bytes": 48,
+    "label_order": ["alpha", "beta", "gamma"],
+    "onnx_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "cases": [
+    { "name": "absent", "present": false, "expect": "byte" },
+    { "name": "byte", "present": true, "value": "byte", "expect": "byte" },
+    { "name": "tokenizer", "present": true, "value": "tokenizer", "expect": "tokenizer" },
+    { "name": "null", "present": true, "value": null, "expect": "reject" },
+    { "name": "plural", "present": true, "value": "bytes", "expect": "reject" },
+    { "name": "upper", "present": true, "value": "BYTE", "expect": "reject" },
+    { "name": "capitalized", "present": true, "value": "Byte", "expect": "reject" },
+    { "name": "empty", "present": true, "value": "", "expect": "reject" },
+    { "name": "leading_space", "present": true, "value": " byte", "expect": "reject" },
+    { "name": "unknown", "present": true, "value": "sw2k", "expect": "reject" },
+    { "name": "number", "present": true, "value": 1, "expect": "reject" },
+    { "name": "bool", "present": true, "value": true, "expect": "reject" },
+    { "name": "empty_array", "present": true, "value": [], "expect": "reject" },
+    { "name": "empty_object", "present": true, "value": {}, "expect": "reject" },
+    { "name": "array_of_byte", "present": true, "value": ["byte"], "expect": "reject" }
+  ]
+}
