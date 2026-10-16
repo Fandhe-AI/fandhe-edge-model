@@ -53,6 +53,31 @@ pub const MAX_SEED: u32 = u32::MAX;
 /// 1 学習ジョブあたりの壁時計上限（秒）。`limits.py::MAX_TRAIN_WALL_SECONDS`。
 pub const MAX_TRAIN_WALL_SECONDS: u32 = 3600;
 
+/// 書き出しモデル上限の既定（40 MiB）。`limits.py::MAX_MODEL_BYTES`。表に無い kind もこの値に落とす。
+pub const MAX_MODEL_BYTES: u64 = 40 * 1024 * 1024;
+
+/// `qwen2_lora` の書き出しモデル上限（8 GiB。REQ-39・REQ-41・TASK-41.6-6・#582）。
+/// `limits.py::MAX_QWEN2_LORA_MODEL_BYTES` を写した値。根拠は P15（Qwen2.5-1.5B）の
+/// bf16 ベース重み 3087 MB の約 2.8 倍（実測の倍率から決めた暫定値）。オーナー確認は未了。
+pub const MAX_QWEN2_LORA_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// 書き出しモデル上限の種類ごとの表。`limits.py::MAX_MODEL_BYTES_BY_KIND` と
+/// 共有 fixture（`limits.json` の `max_model_bytes_by_kind`）で照合する。
+pub const MAX_MODEL_BYTES_BY_KIND: [(&str, u64); 4] = [
+    ("c1", MAX_MODEL_BYTES),
+    ("c3", MAX_MODEL_BYTES),
+    ("autoregressive", MAX_MODEL_BYTES),
+    ("qwen2_lora", MAX_QWEN2_LORA_MODEL_BYTES),
+];
+
+/// `kind` の書き出しモデル上限。表に無い kind は最も厳しい [`MAX_MODEL_BYTES`]（fail-safe）。
+pub fn max_model_bytes_for_kind(kind: &str) -> u64 {
+    MAX_MODEL_BYTES_BY_KIND
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(MAX_MODEL_BYTES, |(_, v)| *v)
+}
+
 /// 1 学習ジョブあたりの RSS 上限（バイト）。`limits.py::MAX_TRAIN_RSS_BYTES`。
 pub const MAX_TRAIN_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 

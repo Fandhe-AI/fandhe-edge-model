@@ -205,7 +205,7 @@ def test_verify_output_caps_bytes_read_even_if_model_grows_after_fstat(
     上限を 16 バイトに下げ、`fstat` が検査時点の小さいサイズ（8 バイト）を返す
     ように差し替えて「検査後の伸長」を決定的に再現する。
     """
-    monkeypatch.setattr(artifact, "_ONNX_READ_CAP_BYTES", 16)
+    monkeypatch.setattr(artifact, "_onnx_read_cap_bytes", lambda _kind: 16)
     root_handle, reservation = _make_reservation(tmp_path)
     try:
         _write_model_and_artifact(reservation.tmp_fd, b"x" * 32, onnx_sha256=None)
@@ -227,3 +227,11 @@ def test_verify_output_caps_bytes_read_even_if_model_grows_after_fstat(
     finally:
         reservation.entry.close()
         root_handle.close()
+
+
+def test_req39_onnx_read_cap_is_per_kind() -> None:
+    """REQ-39・REQ-41・#582: 読み込み上限は kind ごと。未知の kind・非 str は厳しい側。"""
+    mib4 = 4 * 1024 * 1024
+    assert artifact._onnx_read_cap_bytes("qwen2_lora") == (8 << 30) + mib4
+    for kind in ("c3", "unknown", None):
+        assert artifact._onnx_read_cap_bytes(kind) == (40 << 20) + mib4
