@@ -30,7 +30,7 @@ mod json;
 mod pretokenize;
 mod unicode_tables;
 
-pub use pretokenize::{MAX_ENCODE_BYTES, TokenizeError, pre_tokenize, split};
+pub use pretokenize::{MAX_ENCODE_BYTES, TokenizeError, pre_tokenize};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

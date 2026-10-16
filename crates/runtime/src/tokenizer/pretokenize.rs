@@ -59,7 +59,7 @@ impl fmt::Display for TokenizeError {
 
 impl std::error::Error for TokenizeError {}
 
-/// `nfc` が true なら NFC 正規化してから [`split`] した piece 列を返す。
+/// `nfc` が true なら NFC 正規化してから `split` した piece 列を返す。
 pub fn pre_tokenize(text: &str, nfc: bool) -> Result<Vec<String>, TokenizeError> {
     if text.len() > MAX_ENCODE_BYTES {
         return Err(TokenizeError::InputTooLong);
@@ -107,7 +107,7 @@ fn is_p(c: char) -> bool {
 }
 
 /// 正規化済みの `text` を Qwen2 の Split(Isolated) で分ける。piece を連結すると `text` に戻る。
-pub fn split(text: &str) -> Vec<&str> {
+fn split(text: &str) -> Vec<&str> {
     let cs: Vec<(usize, char)> = text.char_indices().collect();
     let byte_at = |k: usize| cs.get(k).map_or(text.len(), |&(b, _)| b);
     let mut pieces = Vec::new();

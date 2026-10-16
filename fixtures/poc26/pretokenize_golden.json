@@ -9345,5 +9345,19 @@
     "​"
    ]
   }
+ ],
+ "limit_cases": [
+  {
+   "char": "̈́",
+   "count": 65536,
+   "nfc": true,
+   "pieces_len": 1
+  },
+  {
+   "char": "̈́",
+   "count": 65537,
+   "nfc": true,
+   "error": "input text is too long"
+  }
  ]
 }

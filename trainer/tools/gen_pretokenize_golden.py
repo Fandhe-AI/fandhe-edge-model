@@ -143,6 +143,20 @@ def build_cases() -> list[dict]:
     return cases
 
 
+def build_limit_cases() -> list[dict]:
+    """NFC 前後の上限境界。U+0344 は NFC で 2 文字（4 バイト）に伸びる（REQ-39）。"""
+    tok = _tokenizer(True)
+    out = []
+    for count in (65_536, 65_537):
+        entry: dict = {"char": "̈́", "count": count, "nfc": True}
+        try:
+            entry["pieces_len"] = len(tok.pre_tokenize("̈́" * count))
+        except qwen2_tokenizer.LimitExceededError:
+            entry["error"] = "input text is too long"
+        out.append(entry)
+    return out
+
+
 def render_golden() -> str:
     """golden JSON の全文を返す（決定的）。"""
     doc = {
@@ -151,6 +165,7 @@ def render_golden() -> str:
             "python_unicodedata_version": unicodedata.unidata_version,
         },
         "cases": build_cases(),
+        "limit_cases": build_limit_cases(),
     }
     return json.dumps(doc, ensure_ascii=False, indent=1) + "\n"
 

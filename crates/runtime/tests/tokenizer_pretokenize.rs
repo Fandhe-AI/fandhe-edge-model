@@ -37,3 +37,23 @@ fn unicode_versions_agree() {
     assert_eq!(doc["source"]["python_unicodedata_version"], "15.0.0");
     assert_eq!(unicode_normalization::UNICODE_VERSION, (15, 0, 0));
 }
+
+/// REQ-39: NFC で伸びる入力の上限境界が Python 参照実装と一致する（U+0344 は NFC で 4 バイト）。
+#[test]
+fn limit_cases_match_reference() {
+    use fandhe_edge_runtime::tokenizer::TokenizeError;
+    let doc: serde_json::Value = serde_json::from_str(GOLDEN).expect("golden json");
+    let cases = doc["limit_cases"].as_array().expect("limit_cases");
+    assert_eq!(cases.len(), 2);
+    for case in cases {
+        let ch = case["char"].as_str().expect("char");
+        let count = usize::try_from(case["count"].as_u64().expect("count")).expect("count");
+        let got = pre_tokenize(&ch.repeat(count), case["nfc"].as_bool().expect("nfc"));
+        if case["error"].is_string() {
+            assert_eq!(got, Err(TokenizeError::InputTooLong));
+        } else {
+            let want = usize::try_from(case["pieces_len"].as_u64().expect("len")).expect("len");
+            assert_eq!(got.expect("within limit").len(), want);
+        }
+    }
+}
