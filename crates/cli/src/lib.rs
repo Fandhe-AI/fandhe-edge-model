@@ -30,6 +30,9 @@
 //! TASK-39.2-4（#156）で、同じ経路に `artifact.json` の `kind` の許可リスト検査も接続した。
 //! 拒否は `invalid_input`（64）の JSON 1 行。通過後の推論本体は #136 で [`stages::infer`] に接続した（`kind_version` は許可リストで検証済み。外部台帳による sha256 検証と版管理台帳による前版への復帰は未検証のまま。#168・#174）。
 //!
+//! TASK-39.5-3（#577）で、`infer` の時間・RSS の安全上限を子プロセス境界で強制する [`infer_supervisor`] を追加し、
+//! `main.rs` の `infer` 分岐へ接続した（バイナリ経由のみ。`stages::run` の in-process 経路は変えない）。
+//!
 //! TASK-33.3（#140）で、評価データ未定義の `evaluate` を `status:"skipped"`・exit 0 で終える
 //! `stage_output::evaluate_start`・`emit_evaluate_skipped` を追加した。バイナリへの結線は #136 で [`stages::evaluate`] に実装した。
 
@@ -41,6 +44,7 @@ pub mod frozen_dir;
 pub mod held_ledger_dir;
 pub mod infer_batch;
 pub mod infer_guard;
+pub mod infer_supervisor;
 pub mod log;
 pub mod output;
 pub mod project;
