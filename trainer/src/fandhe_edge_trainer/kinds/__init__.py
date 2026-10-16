@@ -6,7 +6,8 @@
 扱う。推論側の選択口は推論ランタイム（runtime-builder 担当。REQ-32 によりここへは
 依存しない）。
 
-新しい種類を追加する手順（拡張点。C3・C1・autoregressive はこの手順で追加済み）:
+新しい種類を追加する手順（拡張点。C3・C1・autoregressive はこの手順で追加済み。
+qwen2_lora は骨格のみ）:
 1. `kinds/<name>.py` に `Kind` プロトコル（`train`・`export_onnx`・既定 `config`）を実装する
 2. `_REGISTRY` へ `{"<name>": {<kind_version>: <クラス>}}` を追記する
 既存の種類の実装・共通コア・評価器の改変を要しない。
@@ -71,11 +72,13 @@ def _registry() -> dict[str, dict[int, type]]:
     from .autoregressive import AutoregressiveKind
     from .c1 import C1Kind
     from .c3 import C3Kind
+    from .qwen2_lora import Qwen2LoraKind
 
     return {
         "c3": {1: C3Kind},
         "c1": {1: C1Kind},
         "autoregressive": {1: AutoregressiveKind},
+        "qwen2_lora": {1: Qwen2LoraKind},
     }
 
 

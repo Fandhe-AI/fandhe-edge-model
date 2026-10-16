@@ -25,7 +25,7 @@ use std::fmt;
 pub const MAX_KIND_LEN: usize = 64;
 
 /// 既定で対応する `kind`。学習ワーカーの選択口 `_registry`（TASK-19.1）と一致させる。
-const SUPPORTED_KINDS: [&str; 3] = ["c1", "c3", "autoregressive"];
+const SUPPORTED_KINDS: [&str; 4] = ["c1", "c3", "autoregressive", "qwen2_lora"];
 
 /// 許可する `kind` の集合。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +147,7 @@ impl KindAllowlist {
         Ok(Self { kinds: set })
     }
 
-    /// 既定の許可集合（`c1`・`c3`・`autoregressive`。学習ワーカーの選択口と同じ）。
+    /// 既定の許可集合（`c1`・`c3`・`autoregressive`・`qwen2_lora`。学習ワーカーの選択口と同じ）。
     pub fn supported() -> Self {
         Self {
             kinds: SUPPORTED_KINDS.into_iter().collect(),
