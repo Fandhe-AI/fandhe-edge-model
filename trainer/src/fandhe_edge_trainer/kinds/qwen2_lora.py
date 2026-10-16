@@ -1,28 +1,36 @@
-"""追加学習の種類 `qwen2_lora`（ベースモデル Qwen2 系＋LoRA）の骨格（REQ-41・TASK-41.5-1・#424）。
+"""追加学習の種類 `qwen2_lora`（ベースモデル Qwen2 系＋LoRA）の学習（REQ-41・TASK-41.5-3・#426）。
 
-学習ワーカーの選択口（`kinds/__init__.py::_registry`）に種類名を載せるためだけの骨格で、
-学習・ONNX 書き出しは未実装。呼ばれたら `runtime_error`（終了コード 70）を返し、
-実装済みを装わない。ガード層の `kind`・`kind_version` の許可リストと同じ名前を持つ
-（共有 fixture `fixtures/train_contract/kind_versions.json`・`kind_defaults.json` で同期）。
+学習ワーカーの選択口（`kinds/__init__.py::_registry`）から呼ばれる。利用者がローカルに置いた
+ベースモデル（`qwen2_model.load_base_model`・#425）に LoRA を付け、選択肢のラベル文字列を
+chat template 形式で生成する損失で MLX 学習する。出力は選択肢の採点だけで、自由生成はしない
+（REQ-19b の対応づけ (b) と同じ考え方）。既定候補には入れず、利用者が明示したときだけ使う。
 
-ベースモデルの読み込みは `qwen2_model.load_base_model`・`qwen2_tokenizer`（#425）。
-選択口への配線は #426。
-後続: LoRA 学習 #426、選択肢の採点と予測 #427、
-ONNX 書き出し #431・#432。出力は選択肢の採点だけで、自由生成はしない（REQ-19b の
-対応づけ (b) と同じ考え方）。既定候補には入れず、利用者が明示したときだけ使う（REQ-41）。
-mlx は import しない（遅延 import の方針を保つ）。
+ベースモデルの所在は種類固有の `config` で受ける（トップレベルの入出力契約は変えない）:
+
+- `base_model_dir`: `request.root` からの相対パス（必須。経路は `guard.confine` が閉じ込める）
+- `base_model_sha256`: {ファイル名: sha256}（必須。照合は `load_base_model`）
+
+seed は Python・NumPy・MLX のそれぞれで明示的に設定する（バッチ順は seed 付き permutation、
+LoRA の初期化は `mx.random.key(seed)`）。時間予算に達したら打ち切らず `limit_exceeded`（20）
+で止める。選択肢の採点・予測は #427、ONNX 書き出しは #431・#432（未実装。`runtime_error`）。
+mlx は関数内で遅延 import する（選択口の import を軽く保つ）。
 """
 
 from __future__ import annotations
 
+import math
+import random
+from dataclasses import dataclass
 from typing import IO, Any
 
-from .. import budget
+import numpy as np
+
+from .. import budget, limits
 from ..contract import TrainExample, TrainRequest
 from ..errors import WorkerError
 from ..exitcode import ExitCode
 
-# PoC-26 追補 1・追補 2 の固定値と P15 の代表構成（iters 300・lr 1e-4）。#426 で見直す場合は
+# PoC-26 追補 1・追補 2 の固定値と P15 の代表構成（iters 300・lr 1e-4）。変える場合は
 # fixtures/train_contract/kind_defaults.json も同時に更新する。
 DEFAULT_CONFIG: dict[str, Any] = {
     "lora_rank": 8,
@@ -33,22 +41,284 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "iters": 300,
     "batch_size": 4,
     "max_seq_length": 512,
+    "dtype": "bfloat16",
 }
 
-_NOT_IMPLEMENTED = "kind 'qwen2_lora' is registered but training is not implemented yet"
+#: 既定値を持たない必須項目（利用者ごとに異なるため `DEFAULT_CONFIG` に入れない）。
+_REQUIRED_FIELDS = ("base_model_dir", "base_model_sha256")
+_CONFIG_FIELDS = frozenset(DEFAULT_CONFIG) | frozenset(_REQUIRED_FIELDS)
+_DTYPES = ("bfloat16", "float32")
+
+_NOT_IMPLEMENTED = "kind 'qwen2_lora' export_onnx is not implemented yet"
+
+
+def _invalid_config(message: str) -> WorkerError:
+    return WorkerError("invalid_config", message, ExitCode.INVALID_INPUT)
+
+
+def _int_in(cfg: dict[str, Any], key: str, lo: int, hi: int) -> int:
+    v = cfg[key]
+    if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+        raise _invalid_config(f"config.{key} must be an integer in {lo}..{hi}")
+    return v
+
+
+def _num_in(cfg: dict[str, Any], key: str, lo: float, hi: float, *, lo_open: bool) -> float:
+    v = cfg[key]
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not ok or v > hi or (v <= lo if lo_open else v < lo):
+        raise _invalid_config(f"config.{key} is out of range")
+    return float(v)
+
+
+def _validate_config(cfg: dict[str, Any]) -> None:
+    """実効 config（既定値＋リクエスト）を検証する。違反は `invalid_config`（64）。"""
+    unknown = set(cfg) - _CONFIG_FIELDS
+    if unknown:
+        raise _invalid_config(f"unknown config fields: {len(unknown)} field(s)")
+    for k in _REQUIRED_FIELDS:
+        if k not in cfg:
+            raise _invalid_config(f"config.{k} is required")
+    d = cfg["base_model_dir"]
+    if not isinstance(d, str) or not d:
+        raise _invalid_config("config.base_model_dir must be a non-empty string")
+    if not isinstance(cfg["base_model_sha256"], dict):
+        raise _invalid_config("config.base_model_sha256 must be an object")
+    _int_in(cfg, "lora_rank", 1, limits.MAX_LORA_RANK)
+    _int_in(cfg, "lora_num_layers", 1, 1 << 10)  # ベースの層数との比較は `apply_lora`
+    _int_in(cfg, "iters", 1, limits.MAX_LORA_ITERS)
+    _int_in(cfg, "batch_size", 1, limits.MAX_LORA_BATCH_SIZE)
+    _int_in(cfg, "max_seq_length", limits.MIN_LORA_SEQ_LENGTH, limits.MAX_LORA_SEQ_LENGTH)
+    _num_in(cfg, "lora_scale", 0.0, limits.MAX_LORA_SCALE, lo_open=True)
+    _num_in(cfg, "lora_dropout", 0.0, 0.999999, lo_open=False)
+    _num_in(cfg, "lr", 0.0, limits.MAX_LORA_LR, lo_open=True)
+    if cfg["dtype"] not in _DTYPES:
+        raise _invalid_config(f"config.dtype must be one of {list(_DTYPES)}")
+
+
+def _seed_all(seed: int) -> None:
+    """Python・NumPy・MLX の乱数を明示的に seed する（決定性の要件。REQ-19・REQ-41）。"""
+    import mlx.core as mx
+
+    random.seed(seed)
+    np.random.seed(seed % (1 << 32))
+    mx.random.seed(seed)
+
+
+def _system_prompt(label_order: list[str]) -> str:
+    """選択肢を列挙する汎用の固定文（学習と #427 の採点で同じ文を使う）。"""
+    return "Answer with exactly one of: " + ", ".join(label_order) + "."
+
+
+def make_batches(lengths: list[int], batch_size: int) -> list[list[int]]:
+    """長さ順に並べて `batch_size` 件ずつに区切る。端数は捨てる（mlx-lm の `iterate_batches`）。"""
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    return [order[i : i + batch_size] for i in range(0, len(order) - batch_size + 1, batch_size)]
+
+
+def collate(seqs: list[list[int]], idxs: list[int], pad_id: int) -> tuple[Any, Any, Any]:
+    """バッチを右 pad し、損失に使う位置（pad 以外の次 token 予測）の平坦な添字と正解を返す。"""
+    import mlx.core as mx
+
+    n = max(len(seqs[i]) for i in idxs)
+    arr = np.full((len(idxs), n), pad_id, dtype=np.int32)
+    pos: list[int] = []
+    tgt: list[int] = []
+    for r, i in enumerate(idxs):
+        s = seqs[i]
+        arr[r, : len(s)] = s
+        for j in range(len(s) - 1):
+            pos.append(r * (n - 1) + j)
+            tgt.append(s[j + 1])
+    return (
+        mx.array(arr[:, :-1]),
+        mx.array(np.array(pos, dtype=np.int32)),
+        mx.array(np.array(tgt, dtype=np.int32)),
+    )
+
+
+def batch_loss(model: Any, inputs: Any, pos: Any, tgt: Any) -> Any:
+    """pad 以外の全 token の cross_entropy 平均（float32。prompt もマスクしない）。
+
+    損失位置の隠れ状態だけを float32 の logits にし、全 [B,L,vocab] は作らない。
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    h = model.hidden_states(inputs)
+    hv = h.reshape(-1, h.shape[-1])[pos]
+    logits = model.project(
+        hv, source_shape=(inputs.shape[0], inputs.shape[1]), with_mask=False
+    ).astype(mx.float32)
+    return nn.losses.cross_entropy(logits, tgt, reduction="mean")
+
+
+@dataclass
+class Qwen2LoraTrainedModel:
+    """`qwen2_lora` の学習結果。`config`・`label_order`・`max_bytes` は `TrainedModel` の必須項目。
+
+    `base_file_sha256` は照合に使ったベースモデルのファイルの sha256（来歴。REQ-40）。
+    `max_bytes` は入力表現が token のため使わず、持ち回すだけ（長さは `max_seq_length`）。
+    """
+
+    config: dict[str, Any]
+    label_order: list[str]
+    max_bytes: int
+    model: Any
+    tokenizer: Any
+    base_file_sha256: dict[str, str]
+    final_loss: float
+    iters_done: int
+    seed: int
+    resource_budget: budget.ResourceBudget
+
+
+def _build_sequences(
+    examples: list[TrainExample],
+    request: TrainRequest,
+    tokenizer: Any,
+    cfg: dict[str, Any],
+    vocab_size: int,
+    resource_budget: budget.ResourceBudget,
+) -> tuple[list[list[int]], int]:
+    """全件の学習列（chat template＋ラベル＋`<|im_end|>`）を組み立て、長さを確認する。"""
+    system = _system_prompt(request.label_order)
+    header = tokenizer.encode("assistant\n")
+    for label in request.label_order:
+        body = tokenizer.encode(label)
+        # 学習列は `assistant\n{label}` を 1 区間で encode する。ラベル単独の列と一致しないと
+        # 学習と採点（#427）で別の token 列を見る。
+        if not body or tokenizer.encode("assistant\n" + label) != header + body:
+            raise _invalid_config("a label tokenizes differently in context")
+    seqs: list[list[int]] = []
+    for ex in examples:
+        resource_budget.check()
+        ids = tokenizer.build_chat_ids(system, ex.input, ex.label, add_generation_prompt=False)
+        if len(ids) > cfg["max_seq_length"]:
+            # 切り詰めると学習対象のラベル部分が欠けるため、止める。
+            raise WorkerError(
+                "limit_exceeded",
+                "a training sequence exceeds max_seq_length",
+                ExitCode.LIMIT_EXCEEDED,
+            )
+        if ids and max(ids) >= vocab_size:
+            raise WorkerError(
+                "invalid_data", "token id outside the model vocabulary", ExitCode.INVALID_INPUT
+            )
+        seqs.append(ids)
+    return seqs, tokenizer.special_ids["endoftext"]
+
+
+def _train_loop(
+    model: Any,
+    seqs: list[list[int]],
+    *,
+    pad_id: int,
+    cfg: dict[str, Any],
+    seed: int,
+    resource_budget: budget.ResourceBudget,
+) -> tuple[float, int]:
+    """Adam・定数 lr で `iters` ステップ学習する。予算超過は `ResourceBudget.check()` が止める。"""
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+
+    batches = make_batches([len(s) for s in seqs], cfg["batch_size"])
+    rng = np.random.default_rng(seed)
+    opt = optim.Adam(learning_rate=cfg["lr"])
+    step_fn = nn.value_and_grad(model, batch_loss)
+    model.train()
+    order: list[int] = []
+    loss_value = float("nan")
+    for _ in range(cfg["iters"]):
+        resource_budget.check()
+        if not order:
+            order = [int(i) for i in rng.permutation(len(batches))]
+        inputs, pos, tgt = collate(seqs, batches[order.pop(0)], pad_id)
+        loss, grads = step_fn(model, inputs, pos, tgt)
+        opt.update(model, grads)
+        mx.eval(model.parameters(), opt.state, loss)
+        loss_value = float(loss.item())
+        if not math.isfinite(loss_value):
+            raise WorkerError("runtime_error", "loss is not finite", ExitCode.RUNTIME_ERROR)
+    resource_budget.check()
+    model.eval()
+    return loss_value, cfg["iters"]
 
 
 class Qwen2LoraKind:
-    """`Kind` プロトコルの骨格実装。データ・経路・ベースモデルには一切触れない。"""
+    """`Kind` プロトコルの実装。学習は #426、ONNX 書き出しは #431・#432（未実装）。"""
 
     def train(
         self,
         examples: list[TrainExample],
         request: TrainRequest,
         resource_budget: budget.ResourceBudget,
-    ) -> Any:
-        """未実装（#426）。常に `runtime_error` を送出する。"""
-        raise WorkerError("runtime_error", _NOT_IMPLEMENTED, ExitCode.RUNTIME_ERROR)
+    ) -> Qwen2LoraTrainedModel:
+        """ベースモデルを読み、LoRA を付けて学習する（REQ-41・TASK-41.5-3）。"""
+        cfg = {**DEFAULT_CONFIG, **request.config}
+        _validate_config(cfg)
+
+        import mlx.core as mx
+
+        from ..qwen2_model import apply_lora, load_base_model
+
+        mx.set_default_device(mx.gpu if request.device == "gpu" else mx.cpu)
+        _seed_all(request.seed)
+        if len(examples) < cfg["batch_size"]:
+            raise WorkerError(
+                "invalid_data", "fewer training examples than batch_size", ExitCode.INVALID_INPUT
+            )
+        dtype = mx.bfloat16 if cfg["dtype"] == "bfloat16" else mx.float32
+        base = load_base_model(
+            request.root,
+            cfg["base_model_dir"],
+            expected_sha256=cfg["base_model_sha256"],
+            dtype=dtype,
+            resource_budget=resource_budget,
+        )
+        c = base.config
+        if cfg["max_seq_length"] > c.max_position_embeddings:
+            raise _invalid_config("max_seq_length exceeds the model's max_position_embeddings")
+        logits_elements = cfg["batch_size"] * cfg["max_seq_length"] * c.vocab_size
+        if logits_elements > limits.MAX_LOSS_LOGITS_ELEMENTS:
+            raise WorkerError(
+                "limit_exceeded",
+                "batch_size x max_seq_length x vocab exceeds the memory limit",
+                ExitCode.LIMIT_EXCEEDED,
+            )
+        seqs, pad_id = _build_sequences(
+            examples, request, base.tokenizer, cfg, c.vocab_size, resource_budget
+        )
+        apply_lora(
+            base.model,
+            num_layers=cfg["lora_num_layers"],
+            rank=cfg["lora_rank"],
+            scale=float(cfg["lora_scale"]),
+            dropout=float(cfg["lora_dropout"]),
+            seed=request.seed,
+            rss_bytes=resource_budget.rss_bytes,
+        )
+        loss, done = _train_loop(
+            base.model,
+            seqs,
+            pad_id=pad_id,
+            cfg=cfg,
+            seed=request.seed,
+            resource_budget=resource_budget,
+        )
+        return Qwen2LoraTrainedModel(
+            config=cfg,
+            label_order=list(request.label_order),
+            max_bytes=request.max_bytes,
+            model=base.model,
+            tokenizer=base.tokenizer,
+            base_file_sha256=base.file_sha256,
+            final_loss=loss,
+            iters_done=done,
+            seed=request.seed,
+            resource_budget=resource_budget,
+        )
 
     def export_onnx(self, trained: Any, out: IO[bytes]) -> None:
         """未実装（#431・#432）。常に `runtime_error` を送出する。"""

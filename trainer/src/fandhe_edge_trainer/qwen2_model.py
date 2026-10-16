@@ -48,6 +48,8 @@ from .limits import (
     MAX_BASE_MODEL_FILE_BYTES,
     MAX_BASE_MODEL_TOTAL_BYTES,
     MAX_BASE_MODEL_WEIGHT_FILES,
+    MAX_LORA_RANK,
+    MAX_LORA_SCALE,
     MAX_TOKENIZER_JSON_BYTES,
 )
 from .qwen2_tokenizer import Qwen2Tokenizer, limit_error, loads_json, sha256_hex
@@ -55,7 +57,7 @@ from .qwen2_tokenizer import Qwen2Tokenizer, limit_error, loads_json, sha256_hex
 _SUPPORTED = "supported: model_type=qwen2, no rope_scaling, use_sliding_window=false"
 
 #: forward が同時に保持するメモリの見積もり上限（暴走止め。読み込みの上限は `ResourceBudget`）。
-#: 学習時の予算との連動は #426。
+#: 学習時の LoRA 行列の追加分は `apply_lora` が `ResourceBudget.rss_bytes` と別に比べる。
 MAX_FORWARD_MEMORY_BYTES = 8 << 30
 
 #: forward 入力の上限（token 数 B×L・logits 要素数 B×L×vocab・マスク要素数 B×L×L）。
@@ -628,6 +630,102 @@ def _load_shard(data: bytes, what: str) -> dict[str, mx.array]:
     if not isinstance(weights, dict):
         raise _invalid_data(f"invalid {what}")
     return weights
+
+
+class LoRALinear(nn.Module):
+    """mlx-lm と同形の LoRA。a ~ U(±1/sqrt(in))・b = 0・float32。
+
+    `apply_lora` が Linear を置き換えて作る（追加学習 `qwen2_lora` の学習対象。REQ-41・#426）。
+    """
+
+    def __init__(
+        self, base: nn.Module, rank: int, scale: float, dropout: float, key: mx.array
+    ) -> None:
+        super().__init__()
+        out_dim, in_dim = base.weight.shape
+        self.linear = base
+        self.dropout = nn.Dropout(p=dropout)
+        self.scale = scale
+        bound = 1.0 / math.sqrt(in_dim)
+        self.lora_a = mx.random.uniform(-bound, bound, (in_dim, rank), key=key, dtype=mx.float32)
+        self.lora_b = mx.zeros((rank, out_dim), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = self.linear(x)
+        # LoRA 側は float32 で計算し（bf16 の丸めを避ける）、最後に入力の dtype へ戻す。
+        z = (self.dropout(x.astype(mx.float32)) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+
+_LORA_TARGETS = (
+    ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+    ("mlp", ("gate_proj", "up_proj", "down_proj")),
+)
+
+
+def apply_lora(
+    model: Qwen2Model,
+    *,
+    num_layers: int,
+    rank: int,
+    scale: float,
+    dropout: float,
+    seed: int,
+    rss_bytes: int,
+) -> None:
+    """base を freeze し、末尾 `num_layers` ブロックの 7 Linear を LoRA に置き換える。
+
+    `qwen2_lora` の `train` から呼ばれる。lora_a は `mx.random.key(seed)` を split した鍵で
+    初期化し、グローバル乱数状態に依存しない。置換前に「追加する LoRA 行列＋現在のパラメータ」を
+    `rss_bytes`（`ResourceBudget.rss_bytes`）と比べ、超過なら `limit_exceeded`。不正値は
+    `invalid_config`（REQ-39）。
+    """
+    layers = model.model.layers
+    for v in (num_layers, rank, seed):
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise _invalid_config("invalid LoRA rank / num_layers / seed: must be int")
+    if not 0 <= seed < 1 << 32:
+        raise _invalid_config("invalid LoRA seed: 0 <= seed < 2^32")
+    if not 1 <= num_layers <= len(layers):
+        raise _invalid_config(f"lora_num_layers out of range: 1..{len(layers)}")
+    if not 1 <= rank <= MAX_LORA_RANK:
+        raise _invalid_config(f"invalid LoRA rank: 1..{MAX_LORA_RANK}")
+    for v in (scale, dropout):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+            raise _invalid_config("invalid LoRA scale / dropout: must be finite number")
+    if not 0.0 < scale <= MAX_LORA_SCALE:
+        raise _invalid_config(f"invalid LoRA scale: 0 < scale <= {MAX_LORA_SCALE}")
+    if not 0.0 <= dropout < 1.0:
+        raise _invalid_config("invalid LoRA dropout: 0 <= dropout < 1")
+    added = (
+        4
+        * rank
+        * sum(
+            sum(sum(getattr(getattr(b, o), n).weight.shape) for n in names)
+            for b in layers[-num_layers:]
+            for o, names in _LORA_TARGETS
+        )
+    )
+    current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+    if current + added > rss_bytes:
+        raise limit_error("LoRA matrices would exceed the memory budget")
+    model.freeze()
+    n_each = sum(len(names) for _, names in _LORA_TARGETS)
+    keys = iter(mx.random.split(mx.random.key(seed), num_layers * n_each))
+    for block in layers[-num_layers:]:
+        for owner, names in _LORA_TARGETS:
+            parent = getattr(block, owner)
+            for name in names:
+                setattr(
+                    parent,
+                    name,
+                    LoRALinear(getattr(parent, name), rank, scale, dropout, next(keys)),
+                )
+
+
+def trainable_parameter_count(model: nn.Module) -> int:
+    """学習可能パラメータの総数。"""
+    return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
 
 @dataclass(frozen=True)
