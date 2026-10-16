@@ -58,7 +58,8 @@ def render_tables() -> str:
         "//! Split 状態機械（`pretokenize.rs`）の文字分類表。出典は Python 3.12 の `unicodedata`\n"
         f"//! （UCD {major}.{minor}.{patch}）と参照実装の White_Space。Unicode 版は承認済みの\n"
         "//! `unicode-normalization`（15.0）と揃えてあり、一致はテストで固定している。\n"
-        "//! 出典の帰属は `fixtures/poc26/PROVENANCE.md`。\n\n"
+        "//! 出典の帰属とライセンス全文は `fixtures/poc26/UNICODE-LICENSE.txt` と\n"
+        "//! `fixtures/poc26/PROVENANCE.md`。\n\n"
         + _fmt("LETTER_RANGES", _ranges("L"), "`\\p{L}`（昇順・重なりなし・両端含む）。")
         + "\n"
         + _fmt("NUMBER_RANGES", _ranges("N"), "`\\p{N}`（昇順・重なりなし・両端含む）。")

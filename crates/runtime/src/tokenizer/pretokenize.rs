@@ -38,6 +38,8 @@ pub const MAX_ENCODE_BYTES: usize = 262_144;
 pub enum TokenizeError {
     /// 入力が [`MAX_ENCODE_BYTES`] を超える（NFC の前または後。REQ-39）。
     InputTooLong,
+    /// 文字境界の算出が破綻した（到達しない想定の内部不整合。外部入力で添字アクセスしない方針で Result 化）。
+    Internal,
 }
 
 impl TokenizeError {
@@ -45,6 +47,7 @@ impl TokenizeError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InputTooLong => "limit_exceeded",
+            Self::Internal => "runtime_error",
         }
     }
 }
@@ -53,6 +56,7 @@ impl fmt::Display for TokenizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputTooLong => f.write_str("input text is too long"),
+            Self::Internal => f.write_str("internal error while splitting text"),
         }
     }
 }
@@ -65,13 +69,13 @@ pub fn pre_tokenize(text: &str, nfc: bool) -> Result<Vec<String>, TokenizeError>
         return Err(TokenizeError::InputTooLong);
     }
     if !nfc {
-        return Ok(split(text).into_iter().map(str::to_owned).collect());
+        return Ok(split(text)?.into_iter().map(str::to_owned).collect());
     }
     let normalized: String = text.nfc().collect();
     if normalized.len() > MAX_ENCODE_BYTES {
         return Err(TokenizeError::InputTooLong);
     }
-    Ok(split(&normalized).into_iter().map(str::to_owned).collect())
+    Ok(split(&normalized)?.into_iter().map(str::to_owned).collect())
 }
 
 fn in_ranges(ranges: &[(u32, u32)], c: char) -> bool {
@@ -107,18 +111,19 @@ fn is_p(c: char) -> bool {
 }
 
 /// 正規化済みの `text` を Qwen2 の Split(Isolated) で分ける。piece を連結すると `text` に戻る。
-fn split(text: &str) -> Vec<&str> {
+fn split(text: &str) -> Result<Vec<&str>, TokenizeError> {
     let cs: Vec<(usize, char)> = text.char_indices().collect();
     let byte_at = |k: usize| cs.get(k).map_or(text.len(), |&(b, _)| b);
+    let sub = |a: usize, b: usize| text.get(a..b).ok_or(TokenizeError::Internal);
     let mut pieces = Vec::new();
     let (mut i, mut gap) = (0, None::<usize>);
     while i < cs.len() {
         match match_at(&cs, i) {
             Some(len) if len > 0 => {
                 if let Some(g) = gap.take() {
-                    pieces.push(&text[byte_at(g)..byte_at(i)]);
+                    pieces.push(sub(byte_at(g), byte_at(i))?);
                 }
-                pieces.push(&text[byte_at(i)..byte_at(i + len)]);
+                pieces.push(sub(byte_at(i), byte_at(i + len))?);
                 i += len;
             }
             _ => {
@@ -129,9 +134,9 @@ fn split(text: &str) -> Vec<&str> {
         }
     }
     if let Some(g) = gap {
-        pieces.push(&text[byte_at(g)..]);
+        pieces.push(sub(byte_at(g), text.len())?);
     }
-    pieces
+    Ok(pieces)
 }
 
 /// 位置 `i` から始まる最初に成立する選択肢の文字数。
@@ -210,7 +215,7 @@ mod tests {
     use super::*;
 
     fn s(text: &str) -> Vec<&str> {
-        split(text)
+        split(text).unwrap()
     }
 
     /// REQ-41: 参照実装の pytest（test_pre_tokenize_pieces）と同じ 20 件。
