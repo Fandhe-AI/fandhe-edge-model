@@ -25,6 +25,12 @@
 //! 本モジュールでは判定せず、省略時の 1 も含めてガード層の `KindVersionAllowlist` で検査する
 //! （許可リストに 1 が無くなれば、旧形式のパッケージも拒否される）。
 //!
+//! # 後方互換（入力表現の宣言。REQ-41・TASK-41.3-1・#402）
+//!
+//! `input_representation`（`byte`｜`tokenizer`）は**省略可**で、省略時は [`PackageInputRepresentation::Byte`]。
+//! `null`・未知の値（`"bytes"`・大文字違い等）は [`ArtifactMetaError::Malformed`]。簡易リーダー
+//! [`ArtifactOnnxRef`] は他の欄と同じく無視する。
+//!
 //! # 信頼境界
 //!
 //! 入力は信頼できないデータ。値の妥当性（ルート配下か）は本モジュールでは判定せず、
@@ -147,12 +153,29 @@ pub struct ArtifactMeta {
     vocab_sha256: Option<String>,
     calibration_sha256: Option<String>,
     definition_sha256: Option<String>,
+    input_representation: PackageInputRepresentation,
 }
 
 /// `label_order` の最大件数（定義の選択肢数の上限と同じ）。
 const MAX_META_LABELS: usize = 1024;
 /// `kind` の最大バイト数。
 const MAX_META_KIND_BYTES: usize = 64;
+
+/// 配布パッケージが宣言する入力表現（REQ-41・TASK-41.3-1・#402）。
+///
+/// `artifact.json` の任意の欄 `input_representation` で kind ごとに宣言する。欄が無い既存パッケージは
+/// [`Self::Byte`] として従来どおり読める。定義ファイルの `io.input`（`bytes`）とは別物で、定義側の
+/// スキーマ・正準化ハッシュは変えない。`Tokenizer` の推論は TASK-41.4 まで未対応で、CLI の `infer`・
+/// `package`・`select`・`evaluate` は `invalid_input`（64）で拒否する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageInputRepresentation {
+    /// バイト列をそのまま符号化する（既定。宣言なしのパッケージもこちら）。
+    #[default]
+    Byte,
+    /// 事前学習モデルのトークナイザー（REQ-41。推論ランタイムは TASK-41.4 で対応予定）。
+    Tokenizer,
+}
 
 #[derive(Deserialize)]
 struct RawMeta {
@@ -170,6 +193,9 @@ struct RawMeta {
     // 同上（`package` が配布用にだけ追記する。#491）。
     #[serde(default, deserialize_with = "present_string")]
     definition_sha256: Option<String>,
+    // 欠落は byte。`null`・未知の値は enum で拒否する（fail-closed。REQ-41・#402）。
+    #[serde(default)]
+    input_representation: PackageInputRepresentation,
 }
 
 fn is_hex64(s: &str) -> bool {
@@ -495,6 +521,7 @@ impl ArtifactMeta {
             vocab_sha256: raw.vocab_sha256,
             calibration_sha256: raw.calibration_sha256,
             definition_sha256: raw.definition_sha256,
+            input_representation: raw.input_representation,
         })
     }
 
@@ -555,6 +582,12 @@ impl ArtifactMeta {
     #[must_use]
     pub fn definition_sha256(&self) -> Option<&str> {
         self.definition_sha256.as_deref()
+    }
+
+    /// 宣言された入力表現（欄が無ければ [`PackageInputRepresentation::Byte`]。REQ-41・TASK-41.3-1・#402）。
+    #[must_use]
+    pub const fn input_representation(&self) -> PackageInputRepresentation {
+        self.input_representation
     }
 }
 
@@ -676,6 +709,39 @@ mod tests {
         assert_eq!(m.vocab_sha256(), None);
         assert_eq!(m.calibration_sha256(), None);
         assert_eq!(m.definition_sha256(), None);
+        assert_eq!(m.input_representation(), PackageInputRepresentation::Byte);
+    }
+
+    /// REQ-41・TASK-41.3-1・#402: 宣言なしは byte、宣言は enum、`null`・未知の値は拒否する。
+    #[test]
+    fn req41_input_representation_declaration() {
+        let get = |extra: &str| ArtifactMeta::parse(full_meta(extra).as_bytes());
+        assert_eq!(
+            get(r#","input_representation":"byte""#).map(|m| m.input_representation()),
+            Ok(PackageInputRepresentation::Byte)
+        );
+        assert_eq!(
+            get(r#","input_representation":"tokenizer""#).map(|m| m.input_representation()),
+            Ok(PackageInputRepresentation::Tokenizer)
+        );
+        for bad in [
+            "null",
+            r#""bytes""#,
+            r#""BYTE""#,
+            r#""sw2k""#,
+            r#""""#,
+            "1",
+            "[]",
+        ] {
+            assert_eq!(
+                get(&format!(r#","input_representation":{bad}"#)).map(|_| ()),
+                Err(ArtifactMetaError::Malformed),
+                "{bad}"
+            );
+        }
+        // 簡易リーダーは未知の欄として無視する（従来どおり読める）。
+        let json = r#"{"onnx_file":"m.onnx","kind":"c1","input_representation":"tokenizer"}"#;
+        assert!(ArtifactOnnxRef::parse(json.as_bytes()).is_ok());
     }
 
     /// REQ-39・#491: 定義の sha256 は任意だが、あれば小文字 16 進 64 桁の文字列でなければならない（`null` も拒否）。
