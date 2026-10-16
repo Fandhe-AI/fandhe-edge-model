@@ -983,8 +983,20 @@ def test_judge_p95_requires_value_exceeded_exit_code_consistency() -> None:
     """C-1: exceeded は p95_us > limit_us と exit 20 の両方と一致し、容量超過の exit 20 は不可。"""
     j = _j95
     limit = 50000
-    over = {"p95_us": 60000, "limit_us": limit, "exceeded": True}
-    under = {"p95_us": 4, "limit_us": limit, "exceeded": False}
+    over = {
+        "p95_us": 60000,
+        "limit_us": limit,
+        "exceeded": True,
+        "guideline_us": 250000,
+        "over_guideline": False,
+    }
+    under = {
+        "p95_us": 4,
+        "limit_us": limit,
+        "exceeded": False,
+        "guideline_us": 250000,
+        "over_guideline": False,
+    }
     good = _cap(5, 40000000, False)
     assert j(20, over, good, limit) is None
     assert j(0, under, good, limit) is None
@@ -1230,8 +1242,20 @@ def test_item_e_rejects_infer_output_with_a_step_field(
 
 def test_judge_p95_requires_limit_exceeded_code_on_exit_20() -> None:
     """REQ-21・REQ-31: exit 20 は code が limit_exceeded、exit 0 は status が ok のときだけ合格。"""
-    over = {"p95_us": 60000, "limit_us": 50000, "exceeded": True}
-    under = {"p95_us": 4, "limit_us": 50000, "exceeded": False}
+    over = {
+        "p95_us": 60000,
+        "limit_us": 50000,
+        "exceeded": True,
+        "guideline_us": 250000,
+        "over_guideline": False,
+    }
+    under = {
+        "p95_us": 4,
+        "limit_us": 50000,
+        "exceeded": False,
+        "guideline_us": 250000,
+        "over_guideline": False,
+    }
     good = _cap(5, 40000000, False)
     assert _j95(20, over, good, 50000, code="invalid_input") == "unexpected_output"
     assert mod.judge_p95(20, {}, over, good, 50000) == "unexpected_output"
@@ -1504,7 +1528,21 @@ def test_package_report_is_checked_against_definition_and_capacity_rules() -> No
     assert chk(_pkg(f)) is True
     assert chk(_pkg(f, judgment="pass")) is False
     assert chk(_pkg(f, acceptance_defined=True)) is False
-    assert chk(_pkg(f, infer_p95={"p95_us": 1, "limit_us": 2, "exceeded": False})) is False
+    assert (
+        chk(
+            _pkg(
+                f,
+                infer_p95={
+                    "p95_us": 1,
+                    "limit_us": 2,
+                    "exceeded": False,
+                    "guideline_us": 250000,
+                    "over_guideline": False,
+                },
+            )
+        )
+        is False
+    )
     # exit 0 で capacity が超過・不整合・要約不能
     assert chk(_pkg(f, capacity=_cap_json(total=9, limit=5, exceeded=True))) is False
     assert chk(_pkg(f, capacity=_cap_json(total=9, limit=5, exceeded=False))) is False
@@ -1521,7 +1559,13 @@ def test_package_report_is_checked_against_definition_and_capacity_rules() -> No
     # p95 上限のある定義では infer_p95 が非 null
     with_limit = mod.Facts(f.option_ids, f.train_records, f.eval_records, False, 100)
     assert mod._step_check("package", _pkg(f), {0}, 0, with_limit, 0) is False
-    p95 = {"p95_us": 1, "limit_us": 100, "exceeded": False}
+    p95 = {
+        "p95_us": 1,
+        "limit_us": 100,
+        "exceeded": False,
+        "guideline_us": 250000,
+        "over_guideline": False,
+    }
     assert mod._step_check("package", _pkg(f, infer_p95=p95), {0}, 0, with_limit, 0) is True
 
 
@@ -1630,7 +1674,8 @@ if cmd == "package":
     p95 = None
     if "max_infer_p95_us" in limits:
         p95 = {{"p95_us": cfg["p95_us"], "limit_us": limits["max_infer_p95_us"],
-               "exceeded": cfg["p95_exceeded"]}}
+               "exceeded": cfg["p95_exceeded"], "guideline_us": 250000,
+               "over_guideline": cfg["p95_us"] > 250000}}
     total = cfg["total1"] + EXTRA_BYTES
     cap = {{"total_bytes": total, "limit_bytes": cfg["limit1"], "exceeded": False,
            "guideline_bytes": 40000000, "over_guideline": total > 40000000,
@@ -1936,7 +1981,14 @@ EXTRA = {
                 "judgment": "pass",
                 "acceptance_defined": True,
                 "capacity": CAP_SUMMARY,
-                "infer_p95": {"p95_us": 7, "limit_us": 50, "exceeded": False, "extra": "x"},
+                "infer_p95": {
+                    "p95_us": 7,
+                    "limit_us": 50,
+                    "exceeded": False,
+                    "guideline_us": 250000,
+                    "over_guideline": False,
+                    "extra": "x",
+                },
             },
             {
                 "step": "package",
@@ -1945,7 +1997,13 @@ EXTRA = {
                 "judgment": "pass",
                 "acceptance_defined": True,
                 "capacity": CAP_SUMMARY,
-                "infer_p95": {"p95_us": 7, "limit_us": 50, "exceeded": False},
+                "infer_p95": {
+                    "p95_us": 7,
+                    "limit_us": 50,
+                    "exceeded": False,
+                    "guideline_us": 250000,
+                    "over_guideline": False,
+                },
             },
         ),
         (
@@ -2015,7 +2073,13 @@ def test_summarize_step_replaces_out_of_vocabulary_and_wrongly_typed_values() ->
             "judgment": "maybe",
             "acceptance_defined": "yes",
             "capacity": {"total_bytes": 1},
-            "infer_p95": {"p95_us": -1, "limit_us": 1, "exceeded": False},
+            "infer_p95": {
+                "p95_us": -1,
+                "limit_us": 1,
+                "exceeded": False,
+                "guideline_us": 250000,
+                "over_guideline": False,
+            },
         },
         ids,
     )
@@ -2028,7 +2092,17 @@ def test_summarize_step_replaces_out_of_vocabulary_and_wrongly_typed_values() ->
         "capacity": None,
         "infer_p95": None,
     }
-    for bad_p95 in ({"p95_us": True, "limit_us": 1, "exceeded": False}, {"p95_us": 1}, "x"):
+    for bad_p95 in (
+        {
+            "p95_us": True,
+            "limit_us": 1,
+            "exceeded": False,
+            "guideline_us": 250000,
+            "over_guideline": False,
+        },
+        {"p95_us": 1},
+        "x",
+    ):
         assert mod.summarize_step("package", {"infer_p95": bad_p95}, ids)["infer_p95"] is None
 
 
@@ -2417,23 +2491,96 @@ def test_p95_values_must_be_nonnegative_integers() -> None:
     """REQ-31 §2-4: p95_us・limit_us は 0 以上の整数（真偽値・負数・小数を拒否）。0 は合格。"""
     good = _cap(5, 40000000, False)
     j = _j95
-    assert j(0, {"p95_us": 0, "limit_us": 0, "exceeded": False}, good, 0) is None
-    # 背景: p95_us=-5 が通っていた
-    assert j(0, {"p95_us": -5, "limit_us": 50000, "exceeded": False}, good, 50000) == (
-        "unexpected_output"
+    assert (
+        j(
+            0,
+            {
+                "p95_us": 0,
+                "limit_us": 0,
+                "exceeded": False,
+                "guideline_us": 250000,
+                "over_guideline": False,
+            },
+            good,
+            0,
+        )
+        is None
     )
-    assert j(0, {"p95_us": 1, "limit_us": -1, "exceeded": False}, good, -1) == "unexpected_output"
+    # 背景: p95_us=-5 が通っていた
+    assert j(
+        0,
+        {
+            "p95_us": -5,
+            "limit_us": 50000,
+            "exceeded": False,
+            "guideline_us": 250000,
+            "over_guideline": False,
+        },
+        good,
+        50000,
+    ) == ("unexpected_output")
+    assert (
+        j(
+            0,
+            {
+                "p95_us": 1,
+                "limit_us": -1,
+                "exceeded": False,
+                "guideline_us": 250000,
+                "over_guideline": False,
+            },
+            good,
+            -1,
+        )
+        == "unexpected_output"
+    )
     for bad in (True, 1.5, "1"):
-        p95 = {"p95_us": bad, "limit_us": 50000, "exceeded": False}
+        p95 = {
+            "p95_us": bad,
+            "limit_us": 50000,
+            "exceeded": False,
+            "guideline_us": 250000,
+            "over_guideline": False,
+        }
         assert j(0, p95, good, 50000) == "missing_field"
-    assert mod.p95_summary({"p95_us": -5, "limit_us": 1, "exceeded": False}) is None
-    assert mod.p95_summary({"p95_us": 0, "limit_us": 0, "exceeded": False}) == {
+    assert (
+        mod.p95_summary(
+            {
+                "p95_us": -5,
+                "limit_us": 1,
+                "exceeded": False,
+                "guideline_us": 250000,
+                "over_guideline": False,
+            }
+        )
+        is None
+    )
+    assert mod.p95_summary(
+        {
+            "p95_us": 0,
+            "limit_us": 0,
+            "exceeded": False,
+            "guideline_us": 250000,
+            "over_guideline": False,
+        }
+    ) == {
         "p95_us": 0,
         "limit_us": 0,
         "exceeded": False,
+        "guideline_us": 250000,
+        "over_guideline": False,
     }
     f = mod.Facts(["a"], 8, 4, False, 100)
-    pkg = _pkg(f, infer_p95={"p95_us": -5, "limit_us": 100, "exceeded": False})
+    pkg = _pkg(
+        f,
+        infer_p95={
+            "p95_us": -5,
+            "limit_us": 100,
+            "exceeded": False,
+            "guideline_us": 250000,
+            "over_guideline": False,
+        },
+    )
     assert mod._step_check("package", pkg, {0}, 0, f, 0) is False
 
 
@@ -2586,7 +2733,16 @@ def test_p95_over_with_exit_20_is_accepted_only_with_consistent_exceeded() -> No
         "code": "limit_exceeded",
         "step": "package",
         "capacity": _cap_json(),
-        "infer_p95": dict({"p95_us": 101, "limit_us": 100, "exceeded": True}, **p),
+        "infer_p95": dict(
+            {
+                "p95_us": 101,
+                "limit_us": 100,
+                "exceeded": True,
+                "guideline_us": 250000,
+                "over_guideline": False,
+            },
+            **p,
+        ),
     }
     chk = lambda obj: mod._step_check("package", obj, {0, 20}, 20, f, 0)  # noqa: E731
     assert chk(mk()) is True
@@ -5291,3 +5447,28 @@ def test_run_bounded_marks_child_may_remain_when_the_child_cannot_be_stopped_or_
             os.kill(p.pid, signal.SIGKILL)
             os.waitpid(p.pid, 0)
         mod._leftover_procs.clear()
+
+
+def test_p95_over_guideline_is_warning_only_and_must_match_value() -> None:
+    """REQ-31・TASK-41.9・#579: 目標超過は警告のみ（exit 0 で合格）。実値との食い違いは不合格。"""
+    j = _j95
+    cap = _cap(5, 40000000, False)
+    base = {"limit_us": 300000, "exceeded": False, "guideline_us": 250000}
+    over = dict(base, p95_us=250001, over_guideline=True)
+    assert j(0, over, cap, 300000) is None
+    assert j(0, dict(base, p95_us=250000, over_guideline=False), cap, 300000) is None
+    # 実値と合わない over_guideline・目標の値の食い違いは偽の報告
+    assert j(0, dict(over, over_guideline=False), cap, 300000) == "unexpected_output"
+    assert j(0, dict(over, guideline_us=1), cap, 300000) == "unexpected_output"
+    # 欠落は missing_field
+    assert j(0, {k: v for k, v in over.items() if k != "over_guideline"}, cap, 300000) == (
+        "missing_field"
+    )
+
+
+def test_reference_p95_matches_the_rust_constant() -> None:
+    """REQ-31・#579: p95 の目標（µs）は runtime の `REFERENCE_P95_NS`（ns）と一致する。"""
+    src = (REPO / "crates" / "runtime" / "src" / "latency_report.rs").read_text("utf-8")
+    m = re.search(r"pub const REFERENCE_P95_NS: u64 = ([0-9_]+);", src)
+    assert m is not None, "REFERENCE_P95_NS が見つからない"
+    assert int(m.group(1).replace("_", "")) == mod.REFERENCE_P95_US * 1_000

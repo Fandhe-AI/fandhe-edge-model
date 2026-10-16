@@ -54,7 +54,7 @@ fn metrics(limit_bytes: u64, cap_exceeded: bool, p95: Option<(u64, bool)>) -> Pa
             (40_000_000, false),
             PackageCapacityComponents::new(c(1549, 1), c(0, 0), c(0, 0), c(0, 0), c(0, 0)),
         ),
-        infer_p95: p95.map(|(limit_us, e)| InferP95::new(1, limit_us, e)),
+        infer_p95: p95.map(|(limit_us, e)| InferP95::new(1, limit_us, e, (250_000, false))),
     }
 }
 
@@ -85,8 +85,8 @@ fn limit_json(cap: &str, p95: &str) -> String {
 }
 
 const P95_NULL: &str = "null";
-const P95_OVER: &str = "{\"p95_us\":1,\"limit_us\":0,\"exceeded\":true}";
-const P95_WITHIN: &str = "{\"p95_us\":1,\"limit_us\":1,\"exceeded\":false}";
+const P95_OVER: &str = "{\"p95_us\":1,\"limit_us\":0,\"exceeded\":true,\"guideline_us\":250000,\"over_guideline\":false}";
+const P95_WITHIN: &str = "{\"p95_us\":1,\"limit_us\":1,\"exceeded\":false,\"guideline_us\":250000,\"over_guideline\":false}";
 
 /// 超過の種類（容量だけ・p95 だけ・両方）が各 `exceeded` の組で区別できる。
 #[test]

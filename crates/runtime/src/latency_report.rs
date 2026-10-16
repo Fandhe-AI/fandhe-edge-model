@@ -28,12 +28,23 @@
 //! 本モジュールのテストの証拠種別はテストハーネス（偽の時計・模擬バックエンド）のみ。
 
 use crate::latency::LatencySamples;
+use crate::package_outcome::LimitBreach;
 use std::fmt;
 
 /// 既定の目安 p95（ns。250ms。REQ-31。PC・推論のみ・最終判定の完了まで）。
 ///
 /// **参考値**であり合否のしきい値ではない。合否は利用者が設定した上限で判定する。
 pub const REFERENCE_P95_NS: u64 = 250_000_000;
+
+/// 切り上げ済み p95（ns）が目標（[`REFERENCE_P95_NS`]）を超えたか（警告用。REQ-31・TASK-41.9・#579）。
+///
+/// spec の 3 層のうち「目標」の判定で、超えても警告のみ（終了コードに影響しない）。目標ちょうどは超過でない。
+/// 境界規則は [`LimitBreach::latency_if_exceeded`] に任せ再実装しない。結果は
+/// `resolve_package_outcome` に渡さない（利用者設定の上限・安全上限とは別の契約）。
+#[must_use]
+pub fn exceeds_reference_p95(p95_ns: u64) -> bool {
+    LimitBreach::latency_if_exceeded(p95_ns, REFERENCE_P95_NS).is_some()
+}
 
 /// p95 の算出方法の名前（レポートに出す。PoC-14 の `percentile_method` 相当）。
 pub const P95_METHOD: &str =
@@ -275,6 +286,14 @@ mod tests {
         let (f, fr, c) = p(&[u64::MAX - 1, u64::MAX]);
         assert_eq!((f, fr), (u64::MAX - 1, 95));
         assert_eq!(c, u64::MAX);
+    }
+
+    #[test]
+    fn req31_issue579_exceeds_reference_p95_boundaries() {
+        assert!(!exceeds_reference_p95(0));
+        assert!(!exceeds_reference_p95(250_000_000));
+        assert!(exceeds_reference_p95(250_000_001));
+        assert!(exceeds_reference_p95(u64::MAX));
     }
 
     #[test]

@@ -282,7 +282,7 @@ package)
     pv=99999
     [ "$FAKE_C1_EXCEED" = low ] && pv=2
     [ -n "${FAKE_C1_KEEPDIR:-}" ] && mkdir -p "$pd/package"
-    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true}}\n' "$pkgjson" "$G" "$comps" "$pv" "$p95lim"
+    printf '{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{"total_bytes":135,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":{"p95_us":%s,"limit_us":%s,"exceeded":true,"guideline_us":250000,"over_guideline":false}}\n' "$pkgjson" "$G" "$comps" "$pv" "$p95lim"
     exit 20
   fi
   total=$((135 + extrab))
@@ -322,7 +322,7 @@ package)
   p95=null
   pv=2
   [ "$bad" = "p95neg:$here" ] && pv=-1
-  [ "$here" = C1 ] && p95=$(printf '{"p95_us":%s,"limit_us":%s,"exceeded":false}' "$pv" "$p95lim")
+  [ "$here" = C1 ] && p95=$(printf '{"p95_us":%s,"limit_us":%s,"exceeded":false,"guideline_us":250000,"over_guideline":false}' "$pv" "$p95lim")
   jfield='"judgment":null,'
   [ "$bad" = "nojudgment:$here" ] && jfield=
   printf '{"step":"package","status":"ok",%s"acceptance_defined":false,"capacity":{"total_bytes":%s,"limit_bytes":%s,"exceeded":false,%s,%s},"infer_p95":%s,"version":{"id":"%s","previous":%s}%s}\n' "$jfield" "$total" "$lim" "$G" "$comps" "$p95" "$vid" "$vprev" "$extra" ;;

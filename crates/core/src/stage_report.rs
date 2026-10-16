@@ -609,7 +609,7 @@ impl PackageCapacityComponents {
 /// `limit_bytes` は利用者が `limits.max_package_bytes` を設定したときだけ `Some`（未設定は JSON の
 /// `null`・`exceeded:false`）。`exceeded`・`over_guideline` は呼び出し側（cli）が runtime の照合結果から
 /// 渡す。ここでは `>` を計算しない（境界規則は runtime の `LimitBreach` が唯一の実装）。
-/// `guideline_bytes`（目安 40MB。REQ-30）の超過は警告であり、終了コードに影響しない。
+/// `guideline_bytes`（spec の目標 40MB。REQ-30）の超過は警告であり、終了コードに影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PackageCapacity {
     total_bytes: u64,
@@ -662,22 +662,42 @@ impl PackageCapacity {
 /// 推論待ち時間 p95 の計測値と上限照合の結果（µs。REQ-31・#340）。
 ///
 /// `p95_us` は ns の p95 を切り上げた値。`exceeded` は runtime の照合結果をそのまま受け取る。
+///
+/// 性能の 3 層（spec 20 回目のオーナー判断。REQ-31・TASK-41.9・#579）を欄で区別する。
+/// - `limit_us`・`exceeded`: 利用者設定の上限（`limits.max_infer_p95_us`）。超過は終了コード 20
+/// - `guideline_us`・`over_guideline`: 目標（250ms）。超過は警告のみで終了コードは 0 のまま
+/// - 安全上限（暴走止め）は `infer` の監督層が別に強制する。この型には現れない
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct InferP95 {
     p95_us: u64,
     limit_us: u64,
     exceeded: bool,
+    guideline_us: u64,
+    over_guideline: bool,
 }
 
 impl InferP95 {
     /// 値をそのまま保持する。
     #[must_use]
-    pub const fn new(p95_us: u64, limit_us: u64, exceeded: bool) -> Self {
+    pub const fn new(
+        p95_us: u64,
+        limit_us: u64,
+        exceeded: bool,
+        (guideline_us, over_guideline): (u64, bool),
+    ) -> Self {
         Self {
             p95_us,
             limit_us,
             exceeded,
+            guideline_us,
+            over_guideline,
         }
+    }
+
+    /// 目標（250ms）を超えたか（警告。終了コードに影響しない）。
+    #[must_use]
+    pub const fn over_guideline(&self) -> bool {
+        self.over_guideline
     }
 
     /// p95 の上限を超えたか（runtime の照合結果）。
@@ -1603,7 +1623,7 @@ mod tests {
                 (40_000_000, false),
                 components,
             ),
-            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e, (250_000, false))),
         }
     }
 
@@ -1644,7 +1664,7 @@ mod tests {
             .to_json_line()
             .expect("json"),
             format!(
-                r#"{{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,{CAP_OK},"infer_p95":{{"p95_us":5000,"limit_us":6000,"exceeded":false}},"version":{{"id":"v1","previous":null}}}}"#
+                r#"{{"step":"package","status":"ok","judgment":null,"acceptance_defined":false,{CAP_OK},"infer_p95":{{"p95_us":5000,"limit_us":6000,"exceeded":false,"guideline_us":250000,"over_guideline":false}},"version":{{"id":"v1","previous":null}}}}"#
             )
         );
     }
@@ -1671,7 +1691,7 @@ mod tests {
         assert_eq!(
             pending.to_json_line().expect("json"),
             format!(
-                r#"{{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true,{CAP_OK},"infer_p95":{{"p95_us":1,"limit_us":2,"exceeded":false}},{V2}}}"#
+                r#"{{"code":"pending","message":"result is pending","step":"package","judgment":"undeterminable","acceptance_defined":true,{CAP_OK},"infer_p95":{{"p95_us":1,"limit_us":2,"exceeded":false,"guideline_us":250000,"over_guideline":false}},{V2}}}"#
             )
         );
     }
@@ -1690,7 +1710,7 @@ mod tests {
         assert_eq!(
             both.to_json_line().expect("json"),
             format!(
-                r#"{{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{CAP_EXCEEDED},"infer_p95":{{"p95_us":7,"limit_us":6,"exceeded":true}}}}"#
+                r#"{{"code":"limit_exceeded","message":"resource limit exceeded","step":"package","capacity":{CAP_EXCEEDED},"infer_p95":{{"p95_us":7,"limit_us":6,"exceeded":true,"guideline_us":250000,"over_guideline":false}}}}"#
             )
         );
         let only_p95 =
@@ -1700,7 +1720,7 @@ mod tests {
             only_p95
                 .to_json_line()
                 .expect("json")
-                .contains(r#""infer_p95":{"p95_us":7,"limit_us":6,"exceeded":true}"#)
+                .contains(r#""infer_p95":{"p95_us":7,"limit_us":6,"exceeded":true,"guideline_us":250000,"over_guideline":false}"#)
         );
         assert!(PackageLimitExceededReport::new("m".to_string(), metrics(false, None)).is_none());
         assert!(
