@@ -5,7 +5,9 @@
 実装済みを装わない。ガード層の `kind`・`kind_version` の許可リストと同じ名前を持つ
 （共有 fixture `fixtures/train_contract/kind_versions.json`・`kind_defaults.json` で同期）。
 
-後続: ベースモデルの読み込み #425、LoRA 学習 #426、選択肢の採点と予測 #427、
+ベースモデルの読み込みは `qwen2_model.load_base_model`・`qwen2_tokenizer`（#425）。
+選択口への配線は #426。
+後続: LoRA 学習 #426、選択肢の採点と予測 #427、
 ONNX 書き出し #431・#432。出力は選択肢の採点だけで、自由生成はしない（REQ-19b の
 対応づけ (b) と同じ考え方）。既定候補には入れず、利用者が明示したときだけ使う（REQ-41）。
 mlx は import しない（遅延 import の方針を保つ）。
