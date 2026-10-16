@@ -27,6 +27,9 @@
 //! 契約は 2026-10-09 オーナー承認）。OUT は推論の計算前に cwd 配下の既存の親・非存在の名前で
 //! あることを確認し（違反は `invalid_input`）、計算成功が確定してから `O_EXCL` で作る。上書きはしない。
 //!
+//! バイナリ（`fandhe-edge infer`）経由では、親が本経路を worker 子プロセスで実行し、時間・RSS の安全上限を
+//! 子プロセス境界で強制する（[`crate::infer_supervisor`]。REQ-39・TASK-39.5-3・#577）。
+//!
 //! # 未検証の項目（「検証済み」ではない）
 //!
 //! `--version-ledger L [--version-id V]` を指定したときだけ、`artifact.json` を版管理台帳の model 版と照合する

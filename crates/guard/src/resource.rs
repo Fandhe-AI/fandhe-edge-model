@@ -13,8 +13,8 @@
 //!
 //! # 使われ方
 //!
-//! 将来の CLI・MCP・TUI の配線（#136・REQ-36・REQ-37）が、`fandhe-edge infer` を子プロセスとして
-//! [`run_with_limits`] で起動する。起動対象の経路検査（`path`・`package` の閉じ込め）は行わない。
+//! `fandhe-edge infer` は CLI の `infer_supervisor`（#577）が自分自身を worker 子プロセスとして
+//! [`run_with_limits`] で起動する。将来の MCP・TUI（REQ-36・REQ-37）も同様に使う。起動対象の経路検査（`path`・`package` の閉じ込め）は行わない。
 //! 呼び出し側が既存のガードを通した経路だけを渡す前提とする。
 //!
 //! # 不変条件
@@ -38,7 +38,7 @@
 //!
 //! # 制限
 //!
-//! - 対象は直接の子だけで、子孫プロセスは kill しない。`fandhe-edge infer` は子プロセスを
+//! - 対象は直接の子だけで、子孫プロセスは kill しない。`fandhe-edge infer` の worker は子プロセスを
 //!   起動しない（REQ-32）ため受け入れる。子孫の管理にはプロセスグループが要り、承認事項のため
 //!   行わない。`unsafe` は macOS の RSS 取得（`proc_pidinfo` の FFI。#329・2026-10-01 オーナー承認）
 //!   にだけ置き、`libc` はそのための macOS 限定の直接依存
