@@ -2,10 +2,10 @@
 //!
 //! # 役割
 //!
+//! 共有型（[`Tensor`]・[`OpError`]・ブロードキャスト）と形状操作（[`shape`]。#417）を提供する。
 //! `docs/design/qwen2-scoring-onnx-ops.md` の演算一覧のうち、行列演算と要素ごとの演算
-//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）を実装する。形状操作は #417（`shape`）、
-//! 正規化と活性化は #418、マスクと RoPE は #419 の担当で、共有型（[`Tensor`]・[`OpError`]・
-//! ブロードキャスト）は本モジュールに置く。
+//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は #416 の担当で、本差分では未実装
+//! （後続実装）。正規化と活性化は #418、マスクと RoPE は #419 の担当。
 //!
 //! # 契約
 //!
