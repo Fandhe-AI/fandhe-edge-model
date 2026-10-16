@@ -68,6 +68,7 @@ def test_resolve_kind_returns_qwen2_lora_skeleton() -> None:
 
 
 def test_resolve_kind_rejects_unsupported_qwen2_lora_kind_version() -> None:
+    """REQ-39・REQ-41・TASK-41.5-1・#424: qwen2_lora の非対応版は unsupported_kind_version で拒否する。"""
     with pytest.raises(WorkerError) as exc_info:
         resolve_kind("qwen2_lora", 2)
     assert exc_info.value.code == "unsupported_kind_version"
