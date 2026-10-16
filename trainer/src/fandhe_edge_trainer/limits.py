@@ -443,3 +443,33 @@ MAX_BASE_MODEL_CONFIG_BYTES = 64 * 1024
 #: `tokenizer.json` のサイズ上限（16 MiB）。根拠: Rust 推論ランタイム `MAX_TOKENIZER_JSON_BYTES`
 #: と同値（実物の Qwen2.5 は約 7 MiB）。証拠種別: 準用。状態: 同上（確認未了）。
 MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
+
+# --------------------------------------------------------------------------
+# qwen2_lora（LoRA の追加学習。`kinds/qwen2_lora.py`。REQ-41・TASK-41.5-3・#426）
+# --------------------------------------------------------------------------
+# 以下はすべて PoC-26 の値（`tools/poc26/` の `common.py`・`cli.py`・`train.py` 等）の準用。
+# 証拠種別: 仮置き。状態: オーナー確認未了。
+
+#: LoRA の rank の上限。
+MAX_LORA_RANK = 256
+
+#: LoRA の scale の上限（mlx-lm の既定 20 の十分上）。
+MAX_LORA_SCALE = 1000.0
+
+#: 学習ステップ数の上限。
+MAX_LORA_ITERS = 100_000
+
+#: ミニバッチ件数の上限。
+MAX_LORA_BATCH_SIZE = 64
+
+#: 学習列の長さ（token 数）の下限と上限。超過した列は切り詰めずに `limit_exceeded` で止める。
+MIN_LORA_SEQ_LENGTH = 8
+MAX_LORA_SEQ_LENGTH = 4096
+
+#: 学習率の上限。
+MAX_LORA_LR = 1.0
+
+#: 損失位置の float32 logits の要素数（batch_size x max_seq_length x vocab）の上限。
+#: backward は forward の約 3 倍を保持しうると見て、5e8 要素（float32 で 2 GB、x3 = 6 GB <
+#: RSS 上限 8 GiB）に抑える。係数 3 は保守的な見積もりで実測ではない（推定）。
+MAX_LOSS_LOGITS_ELEMENTS = 500_000_000

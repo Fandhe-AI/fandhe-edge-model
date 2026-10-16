@@ -433,3 +433,31 @@ class Qwen2Tokenizer:
                 raise limit_error("decoded output is too large")
             out.extend(chunk)
         return out.decode("utf-8", errors="replace")
+
+    def build_chat_ids(
+        self,
+        system: str,
+        user: str,
+        assistant: str | None = None,
+        *,
+        add_generation_prompt: bool,
+    ) -> list[int]:
+        """`<|im_start|>{role}\\n{content}<|im_end|>\\n` の連結（tools なし経路）を id 列で返す。
+
+        `qwen2_lora` の学習列（`assistant` あり）と採点用 prompt（`add_generation_prompt`）の
+        共通の組み立て（REQ-41・#426）。特殊トークンは id で挿入し、各メッセージの
+        `role\\ncontent` は 1 区間として encode する（本文中の特殊文字列は特殊トークンとして
+        解釈しない。REQ-39）。
+        """
+        if (assistant is None) != add_generation_prompt:
+            raise invalid_data("exactly one of assistant / add_generation_prompt is required")
+        start, end = self.special_ids["im_start"], self.special_ids["im_end"]
+        ids: list[int] = []
+        messages = [("system", system), ("user", user)]
+        if assistant is not None:
+            messages.append(("assistant", assistant))
+        for role, content in messages:
+            ids += [start, *self.encode(f"{role}\n{content}"), end, *self.encode("\n")]
+        if add_generation_prompt:
+            ids += [start, *self.encode("assistant\n")]
+        return ids
