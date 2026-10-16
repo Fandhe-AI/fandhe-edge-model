@@ -18,6 +18,8 @@
 //!   打ち切り、超過は `Result` のエラーで返すため、切り詰めた内容を正常入力として渡せない
 //! - 拒否メッセージにパス・ファイル内容を含めない（size・limit の数値のみ）
 //!
+//! 複数ファイル（shard）の合計上限は [`crate::split_files`]（TASK-41.2-5・#580）。
+//!
 //! CLI の `infer --input-file` への配線と `ToErrorReport` 写像は #136 の範囲。
 
 use crate::path::{ConfinedPath, PathRejection, open_confined};
