@@ -4430,7 +4430,10 @@ mod suite {
     /// `p95_us` は ASCII 数字だけの整数で、`exceeded` が true のときは 2 以上（上限 1 µs を超える）。
     fn assert_p95_tail(line: &str, limit_us: u64, exceeded: bool) {
         let prefix = "\"infer_p95\":{\"p95_us\":";
-        let suffix = format!(",\"limit_us\":{limit_us},\"exceeded\":{exceeded}}}}}\n");
+        // 固定 fixture の ONNX は 250ms の目標よりずっと速いので `over_guideline` は false（REQ-31・#579）。
+        let suffix = format!(
+            ",\"limit_us\":{limit_us},\"exceeded\":{exceeded},\"guideline_us\":250000,\"over_guideline\":false}}}}\n"
+        );
         let start = line.find(prefix).expect("infer_p95 key") + prefix.len();
         assert!(line.ends_with(&suffix), "{line}");
         let digits = &line[start..line.len() - suffix.len()];

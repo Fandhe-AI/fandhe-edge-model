@@ -409,7 +409,7 @@ mod tests {
                 (40_000_000, false),
                 PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
             ),
-            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e, (250_000, false))),
         }
     }
 
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",\"capacity\":{SAMPLE_CAPACITY_EXCEEDED},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true}}}}\n"
+                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",\"capacity\":{SAMPLE_CAPACITY_EXCEEDED},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true,\"guideline_us\":250000,\"over_guideline\":false}}}}\n"
             )
         );
         assert_eq!(text.matches('\n').count(), 1);

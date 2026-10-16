@@ -193,12 +193,13 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 
 定義へ `limits: {"max_infer_p95_us": <値>}` を足して実行します。
 
-- **確かめること**: `package` が exit 0 または 20 で成功し、`infer_p95`（推論 p95 の値・上限・超過フラグ）が記録されること。指定した上限が CLI に伝わること。
+- **確かめること**: `package` が exit 0 または 20 で成功し、`infer_p95`（推論 p95 の値・上限・超過フラグ・目標 250ms と目標超過フラグ）が記録されること。指定した上限が CLI に伝わること。
 - **想定する終了コード**: 0 または 20
 - **C-1 の合格条件**:
   - exit 0 または 20（どちらでも ok。ただし下の対応を満たすこと）
   - `infer_p95` の `p95_us`・`limit_us` が 0 以上の整数（真偽値・負数は不可）で、`exceeded` が boolean
   - `exceeded` が `p95_us > limit_us` の値と一致
+  - `guideline_us` が 250000（pytest が runtime の `REFERENCE_P95_NS` と照合）で、`over_guideline == (p95_us > guideline_us)`。目標超過は警告のみで exit 0 に影響しない（REQ-31・TASK-41.9・#579）
   - `exceeded` が exit コード 20 の有無と一致：`exceeded == true` ↔ `exit 20`
   - exit 20 のときは `code == "limit_exceeded"` で、`package/` が作られていない。exit 0 のときは `status == "ok"` で、`package/` が公開されている
   - `limit_us` が指定値（`--p95-limit-us`）と一致
@@ -708,7 +709,7 @@ G〜J の記録欄（人が実行した結果を記入する。スクリプト�
 **C-1**（`max_infer_p95_us: 50000`）:
 
 - `package` exit 0
-- `infer_p95`: `p95_us` 2・`limit_us` 50000・`exceeded` false
+- `infer_p95`: `p95_us` 2・`limit_us` 50000・`exceeded` false・`guideline_us` 250000・`over_guideline` false
 - `classification: reference_only`（他アプリが動作中。load avg 8.10。`--quiet-machine` 無し）
 
 **C-2**（`max_package_bytes: 1000`）:

@@ -292,7 +292,7 @@ mod tests {
                 (40_000_000, false),
                 PackageCapacityComponents::new(c(100, 1), c(0, 0), c(20, 1), c(0, 0), c(5, 1)),
             ),
-            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e)),
+            infer_p95: p95.map(|(p, l, e)| InferP95::new(p, l, e, (250_000, false))),
         }
     }
 
@@ -382,9 +382,21 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{CAP_OK},\"infer_p95\":{{\"p95_us\":5000,\"limit_us\":6000,\"exceeded\":false}}{VER}}}\n"
+                "{{\"step\":\"package\",\"status\":\"ok\",\"judgment\":null,\"acceptance_defined\":false,{CAP_OK},\"infer_p95\":{{\"p95_us\":5000,\"limit_us\":6000,\"exceeded\":false,\"guideline_us\":250000,\"over_guideline\":false}}{VER}}}\n"
             )
         );
+    }
+
+    /// REQ-31・TASK-41.9・#579: p95 の目標超過だけ（利用者設定の上限は内側）は警告で、exit 0 のまま `over_guideline:true`。
+    #[test]
+    fn req31_issue579_over_guideline_only_is_exit0_warning() {
+        let mut m = metrics(false, None);
+        m.infer_p95 = Some(InferP95::new(250_001, 300_000, false, (250_000, true)));
+        let (code, out) = emit(&[], PackageQualityJudgment::NotDefined, &m);
+        assert_eq!(code, ExitCode::Ok);
+        assert!(out.contains(
+            "\"infer_p95\":{\"p95_us\":250001,\"limit_us\":300000,\"exceeded\":false,\"guideline_us\":250000,\"over_guideline\":true}"
+        ));
     }
 
     /// REQ-21・REQ-33・#328・#340: 不合格・判定不能は判定項目つき、上限超過は計測値つきの exit 20。
@@ -436,7 +448,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",{CAP_OK},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true}}}}\n"
+                "{{\"code\":\"limit_exceeded\",\"message\":\"resource limit exceeded\",\"step\":\"package\",{CAP_OK},\"infer_p95\":{{\"p95_us\":7,\"limit_us\":6,\"exceeded\":true,\"guideline_us\":250000,\"over_guideline\":false}}}}\n"
             )
         );
     }

@@ -69,10 +69,10 @@
 //!
 //! exit 0・10・12・20 の stdout JSON の末尾に `capacity`（常に。5 構成要素の内訳・合計・上限〔未設定は
 //! `null`〕・`exceeded`・目安 `guideline_bytes`〔40MB〕・`over_guideline`）と
-//! `infer_p95`（`limits.max_infer_p95_us` があるときだけ。µs へ切り上げ。無ければ `null`）を載せる。
+//! `infer_p95`（`limits.max_infer_p95_us` があるときだけ。µs へ切り上げ。無ければ `null`。目標 `guideline_us`〔250ms〕・`over_guideline` つき）を載せる。
 //! 値は [`PackageRunResult::metrics`] で返し、`exceeded` は runtime の照合結果から写す（[`capacity_report`]・
 //! [`infer_p95_report`]。写像の不整合は公開前に `runtime_error`）。p95 は上限が無いとき計測しない。
-//! 目安超過（`over_guideline`）は警告で、終了コード・`package/` の公開に影響しない（REQ-30）。
+//! 目安・目標の超過（`over_guideline`。容量・p95 とも）は警告で、終了コード・`package/` の公開に影響しない（REQ-30）。
 //!
 //! 評価記録の `correct` は
 //! 外部台帳に記録されておらず、範囲内の書き換えは検出できない（#168 の完全性検証が対象）。
@@ -126,7 +126,9 @@ use fandhe_edge_runtime::latency::{
     Clock, LatencyConfig, LatencyError, MonotonicClock, measure_latency,
 };
 use fandhe_edge_runtime::latency_limit::{LatencyLimit, LatencyLimitCheck, check_latency_limit};
-use fandhe_edge_runtime::latency_report::summarize_latency;
+use fandhe_edge_runtime::latency_report::{
+    REFERENCE_P95_NS, exceeds_reference_p95, summarize_latency,
+};
 use fandhe_edge_runtime::package_outcome::{
     LimitBreach, PackageOutcome, PackageQualityJudgment, resolve_package_outcome,
 };
@@ -511,6 +513,9 @@ fn capacity_report(
 
 /// runtime の p95 照合結果を stdout 用の値型へ写す（REQ-31・#340）。
 ///
+/// 性能の 3 層（REQ-31・TASK-41.9・#579）のうち、ここで扱うのは利用者設定の上限（`exceeded`。exit 20）と
+/// 目標（`over_guideline`。警告のみ）。安全上限は `infer` の監督層（`infer_supervisor`）が強制する。
+///
 /// `p95_us` は ns を切り上げた値（`limit_ns = limit_us * 1000` なので、`p95_ns > limit_ns` と
 /// `p95_us > limit_us` は同値で、切り上げが偽陽性を生まない）。`exceeded` は照合結果から決める。
 /// `limit_us` と照合に使った `limit_ns` が食い違う・照合していない・未知の区分は `runtime_error`。
@@ -526,7 +531,16 @@ fn infer_p95_report(check: &LatencyLimitCheck, limit_us: u64) -> Result<InferP95
     if limit_us.checked_mul(1_000) != Some(limit_ns) {
         return Err(runtime("latency check is inconsistent"));
     }
-    Ok(InferP95::new(p95_ns.div_ceil(1_000), limit_us, exceeded))
+    // 目標（250ms）の超過は警告だけ。`check.breach()`（終了コードの入力）には入れない（REQ-31・TASK-41.9・#579）。
+    // ponytail: 計測は `max_infer_p95_us` があるときだけなので、上限を設定していない利用者には目標超過の警告が出ない。
+    // 上限なしでも計測するかは、計測回数・期限の種類別化（Qwen は 1 件約 2.8 秒で 10 分の期限を超える）と合わせて決める。
+    let guideline = (REFERENCE_P95_NS / 1_000, exceeds_reference_p95(p95_ns));
+    Ok(InferP95::new(
+        p95_ns.div_ceil(1_000),
+        limit_us,
+        exceeded,
+        guideline,
+    ))
 }
 
 /// p95 計測の入力を `train` 分割の `input` から集める（REQ-27・REQ-39。#338）。
@@ -984,11 +998,48 @@ mod tests {
     /// REQ-31・#340: µs への切り上げの境界。ちょうど・1 ns 超・1000 の倍数でない上限内の 3 点。
     #[test]
     fn req31_issue340_p95_us_ceil_boundaries() {
-        assert_eq!(p95_for_step(5_000_000), InferP95::new(5_000, 5_000, false));
-        assert_eq!(p95_for_step(5_000_001), InferP95::new(5_001, 5_000, true));
+        assert_eq!(
+            p95_for_step(5_000_000),
+            InferP95::new(5_000, 5_000, false, (250_000, false))
+        );
+        assert_eq!(
+            p95_for_step(5_000_001),
+            InferP95::new(5_001, 5_000, true, (250_000, false))
+        );
         // 1000 の倍数でない上限内の値は切り上げても超過にならない（偽陽性なし）。
-        assert_eq!(p95_for_step(4_999_999), InferP95::new(5_000, 5_000, false));
-        assert_eq!(p95_for_step(4_999_001), InferP95::new(5_000, 5_000, false));
+        assert_eq!(
+            p95_for_step(4_999_999),
+            InferP95::new(5_000, 5_000, false, (250_000, false))
+        );
+        assert_eq!(
+            p95_for_step(4_999_001),
+            InferP95::new(5_000, 5_000, false, (250_000, false))
+        );
+    }
+
+    /// REQ-31・TASK-41.9・#579: 目標（250ms）の超過は警告だけ。利用者設定の上限内なら breach なし（exit 0 のまま）。
+    #[test]
+    fn req31_issue579_over_guideline_is_warning_only() {
+        let limit = LatencyLimit::from_ns(300_000 * 1_000).expect("limit");
+        for (step, over) in [(250_000_000, false), (250_000_001, true)] {
+            let (pipeline, clock) = fake_pipeline(step, false, false);
+            let check =
+                check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure");
+            let r = infer_p95_report(&check, 300_000).expect("report");
+            assert_eq!(
+                r,
+                InferP95::new(step.div_ceil(1_000), 300_000, false, (250_000, over))
+            );
+            assert_eq!(check.breach(), None);
+        }
+        // 利用者設定の上限の超過は従来どおり breach あり（exit 20）。目標も超えている。
+        let (pipeline, clock) = fake_pipeline(300_000_001, false, false);
+        let check = check_latency_with_clock(&pipeline, &["a"], limit, &clock).expect("measure");
+        assert_eq!(
+            infer_p95_report(&check, 300_000).expect("report"),
+            InferP95::new(300_001, 300_000, true, (250_000, true))
+        );
+        assert!(check.breach().is_some());
     }
 
     /// REQ-31・#340: `div_ceil` の境界と写像の fail-closed（上限の食い違い・未設定・未知）。
@@ -998,7 +1049,7 @@ mod tests {
         for (ns, us) in [(0, 0), (1, 1), (999, 1), (1000, 1), (1001, 2)] {
             assert_eq!(
                 infer_p95_report(&within(ns, 5_000_000), 5_000).expect("ok"),
-                InferP95::new(us, 5_000, false)
+                InferP95::new(us, 5_000, false, (250_000, false))
             );
         }
         // u64::MAX でも panic せず切り上げる（超過として写す）。
@@ -1008,7 +1059,7 @@ mod tests {
         });
         assert_eq!(
             infer_p95_report(&over, 5_000).expect("ok"),
-            InferP95::new(u64::MAX / 1_000 + 1, 5_000, true)
+            InferP95::new(u64::MAX / 1_000 + 1, 5_000, true, (250_000, true))
         );
         // limit_us と limit_ns の不一致・未設定・オーバーフローは runtime_error。
         for bad in [

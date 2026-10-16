@@ -214,6 +214,9 @@ KIND_VOCAB = frozenset({"c1", "c3", "autoregressive"})
 # 強制上限ではなく、超過は `over_guideline` の警告のみ。REQ-30・TASK-41.9。
 # pytest で Rust のソースと照合する）
 REFERENCE_CAPACITY_BYTES = 40_000_000
+# `infer_p95` の目標 p95（µs。runtime の latency_report.rs の `REFERENCE_P95_NS` = 250ms）。
+# 超過は `over_guideline` の警告のみ。REQ-31・#579。pytest で Rust のソースと照合する
+REFERENCE_P95_US = 250_000
 # パス区切りとして扱う文字（`/`・`\`・U+2215 DIVISION SLASH・U+2044 FRACTION SLASH・
 # U+FF0F FULLWIDTH SOLIDUS）
 PATH_CHARS = ("/", "\\", "∕", "⁄", "／")
@@ -536,16 +539,26 @@ def _unit_or_none(v: Any) -> int | float | None:
 
 
 def p95_summary(v: Any) -> dict[str, Any] | None:
-    """`infer_p95` を固定構造へ写す。`p95_us`・`limit_us` は 0 以上の整数、`exceeded` は真偽値。
+    """`infer_p95` を固定構造へ写す。`p95_us`・`limit_us`・`guideline_us` は 0 以上の整数、
+    `exceeded`・`over_guideline` は真偽値。
 
     形が違えば None（REQ-31）。
     """
     if not isinstance(v, dict):
         return None
     p95, limit, exceeded = v.get("p95_us"), v.get("limit_us"), v.get("exceeded")
-    if not _nonneg_int(p95) or not _nonneg_int(limit) or not isinstance(exceeded, bool):
+    guide, over = v.get("guideline_us"), v.get("over_guideline")
+    if not (_nonneg_int(p95) and _nonneg_int(limit) and _nonneg_int(guide)):
         return None
-    return {"p95_us": p95, "limit_us": limit, "exceeded": exceeded}
+    if not isinstance(exceeded, bool) or not isinstance(over, bool):
+        return None
+    return {
+        "p95_us": p95,
+        "limit_us": limit,
+        "exceeded": exceeded,
+        "guideline_us": guide,
+        "over_guideline": over,
+    }
 
 
 def _split_summary(v: Any) -> dict[str, int] | None:
@@ -1257,8 +1270,10 @@ def check_package_metrics(
     5 項目の合計が `total_bytes` と一致すること（B は項目側で `capacity_sum_mismatch` として
     判定するため外す）。
     `infer_p95` は定義に `max_infer_p95_us` があるときだけ非 null で、`limit_us` が定義の値と
-    一致し、`exceeded == (p95_us > limit_us)`、exit 0 なら超過なし。exit 20 は `code` が
-    `limit_exceeded` で、容量か p95 のどちらかが超過していること。
+    一致し、`exceeded == (p95_us > limit_us)`、`guideline_us` が目標（250000）で
+    `over_guideline == (p95_us > guideline_us)`（目標超過は警告のみ。exit 0 を妨げない）、
+    exit 0 なら上限超過なし。exit 20 は `code` が `limit_exceeded` で、
+    容量か p95 のどちらかが超過していること。
     """
     cap = capacity_summary(obj)
     if cap is None:
@@ -1283,6 +1298,8 @@ def check_package_metrics(
         p95 is None
         or p95["limit_us"] != facts.p95_limit_us
         or p95["exceeded"] != (p95["p95_us"] > p95["limit_us"])
+        or p95["guideline_us"] != REFERENCE_P95_US
+        or p95["over_guideline"] != (p95["p95_us"] > REFERENCE_P95_US)
     ):
         return False
     any_exceeded = cap["exceeded"] or (p95 is not None and p95["exceeded"])
@@ -1896,8 +1913,8 @@ def judge_p95(rc: int, pkg: Any, p95: Any, cap: dict[str, Any] | None, limit_us:
 
     CLI の規則は `p95_us > limit_us` で超過（crates/cli/src/stages/package.rs）。exit 20 は p95 超過
     のときだけで、容量超過など p95 以外の理由の exit 20 は ok にしない。
-    `p95_us`・`limit_us` は 0 以上の整数・`exceeded` は真偽値でなければならず、型違い・欠落は
-    `missing_field`、負数は `unexpected_output`。
+    `p95_us`・`limit_us`・`guideline_us` は 0 以上の整数、`exceeded`・`over_guideline` は
+    真偽値でなければならず、型違い・欠落は `missing_field`、負数は `unexpected_output`。
     C-1 の capacity が欠落・要約不能・超過のいずれでも `unexpected_output`。
     exit 20 は `code == "limit_exceeded"`、exit 0 は `status == "ok"` の JSON のときだけ合格。
     """
@@ -1906,9 +1923,16 @@ def judge_p95(rc: int, pkg: Any, p95: Any, cap: dict[str, Any] | None, limit_us:
         or not _is_int(p95.get("p95_us"))
         or not _is_int(p95.get("limit_us"))
         or not isinstance(p95.get("exceeded"), bool)
+        or not _is_int(p95.get("guideline_us"))
+        or not isinstance(p95.get("over_guideline"), bool)
     ):
         return "missing_field"
     if p95["p95_us"] < 0 or p95["limit_us"] < 0:
+        return "unexpected_output"
+    # 目標（250ms）超過は警告のみ。値が目標と食い違う・実値と合わない報告は偽（REQ-31・#579）
+    if p95["guideline_us"] != REFERENCE_P95_US or p95["over_guideline"] != (
+        p95["p95_us"] > REFERENCE_P95_US
+    ):
         return "unexpected_output"
     exceeded = p95["exceeded"]
     if exceeded != (p95["p95_us"] > p95["limit_us"]) or exceeded != (rc == 20):
