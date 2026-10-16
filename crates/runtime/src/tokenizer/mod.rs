@@ -4,9 +4,9 @@
 //! # 役割と境界
 //!
 //! 配布パッケージへ同梱するトークナイザー定義を、Python なしで推論ランタイムが使える形
-//! （[`TokenizerSpec`]）に検証つきで読み込む。呼び出し元は後続の前段（Split 状態機械。#411）・
-//! BPE と chat template（#412）で、本モジュールは **読み込みと検証だけ** を持つ。
-//! 前処理・BPE・golden 照合は未実装（それぞれ #411・#412・#413）。
+//! （[`TokenizerSpec`]）に検証つきで読み込む。前段の正規化と事前分割
+//! （NFC・Split 状態機械。`pretokenize`。#411）も持つ。呼び出し元は後続の BPE と chat template
+//! （#412）。BPE・golden 照合は未実装（それぞれ #412・#413）。
 //!
 //! 検証条件の参照実装は `trainer/tools/poc26/qwen2_tokenizer.py` の `Qwen2Tokenizer.__init__`・
 //! `_check_pipeline`（同じ条件・同じ順序）。対応範囲外の項目は黙って誤変換せず、対応範囲を示す
@@ -27,6 +27,10 @@
 //! 依存は追加していない（JSON は [`json`] の自作。#409 のオーナー判断）。
 
 mod json;
+mod pretokenize;
+mod unicode_tables;
+
+pub use pretokenize::{MAX_ENCODE_BYTES, TokenizeError, pre_tokenize, split};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -278,6 +282,12 @@ impl TokenizerSpec {
             special,
             source_sha256: Sha256Digest::of_bytes(bytes),
         })
+    }
+
+    /// normalizer に従って（NFC のときだけ）正規化し、Split(Isolated) した piece 列を返す
+    /// （REQ-41・#411）。入力が [`MAX_ENCODE_BYTES`] を超えれば [`TokenizeError::InputTooLong`]。
+    pub fn pre_tokenize(&self, text: &str) -> Result<Vec<String>, TokenizeError> {
+        pre_tokenize(text, self.nfc)
     }
 
     /// normalizer が NFC のとき true（null・キー無しなら false）。
