@@ -58,3 +58,26 @@ def test_resolve_kind_rejects_unsupported_kind_with_bounded_message_length() -> 
         resolve_kind("x" * 10_000, 1)
     assert exc_info.value.code == "unsupported_kind"
     assert len(exc_info.value.message) < 1000  # 切り詰められていることの目安
+
+
+def test_resolve_kind_returns_qwen2_lora_skeleton() -> None:
+    """REQ-41・REQ-19・TASK-41.5-1・#424: kind="qwen2_lora" が解決できること。"""
+    from fandhe_edge_trainer.kinds.qwen2_lora import Qwen2LoraKind
+
+    assert isinstance(resolve_kind("qwen2_lora", 1), Qwen2LoraKind)
+
+
+def test_resolve_kind_rejects_unsupported_qwen2_lora_kind_version() -> None:
+    with pytest.raises(WorkerError) as exc_info:
+        resolve_kind("qwen2_lora", 2)
+    assert exc_info.value.code == "unsupported_kind_version"
+    assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_qwen2_lora_skeleton_train_is_not_implemented() -> None:
+    """REQ-41・TASK-41.5-1・#424: 骨格は学習できず runtime_error（70）を返す。"""
+    kind = resolve_kind("qwen2_lora", 1)
+    with pytest.raises(WorkerError) as exc_info:
+        kind.train([], None, None)  # type: ignore[arg-type]
+    assert exc_info.value.code == "runtime_error"
+    assert exc_info.value.exit_code == ExitCode.RUNTIME_ERROR

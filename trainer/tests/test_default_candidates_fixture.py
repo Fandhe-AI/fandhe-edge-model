@@ -59,3 +59,8 @@ def test_req19_default_candidates_are_unique_and_non_empty() -> None:
     kinds_list = [c["kind"] for c in _default_candidates()]
     assert kinds_list
     assert len(set(kinds_list)) == len(kinds_list)
+
+
+def test_req41_qwen2_lora_is_not_a_default_candidate() -> None:
+    """REQ-41・TASK-41.5-1・#424: 追加学習の種類は利用者が明示したときだけ候補に入る。"""
+    assert "qwen2_lora" not in [c["kind"] for c in _default_candidates()]
