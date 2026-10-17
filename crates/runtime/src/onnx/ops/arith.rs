@@ -18,6 +18,8 @@
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致、または IEEE の単一演算とのビット一致で比べる
 
+use std::time::Instant;
+
 use super::{
     MAX_RANK, OpError, Tensor, advance_index, broadcast_map2, broadcast_shape, broadcast_strides,
     element_count,
@@ -94,7 +96,11 @@ fn last_two(s: &[usize]) -> Result<(usize, usize), OpError> {
 /// 各出力要素は k の昇順の f32 加算（i-k-j のループ順でも要素ごとの加算順は変わらない）。
 // ponytail: 単一スレッドの素朴な積和。LM head（K*M 行 × 151936 × 1536）が律速になりうる。
 // 速度は #421 で実測し、並列化する場合も出力要素ごとの k 昇順の加算順を固定すること。
-pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
+pub fn matmul(
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+    until: Option<Instant>,
+) -> Result<Tensor<f32>, OpError> {
     let (sa, sb) = (a.shape(), b.shape());
     if !(2..=MAX_RANK).contains(&sa.len()) || !(2..=MAX_RANK).contains(&sb.len()) {
         return Err(OpError::ShapeMismatch);
@@ -148,6 +154,7 @@ pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, OpError> 
                 .get_mut(mi * n..(mi + 1) * n)
                 .ok_or(OpError::ShapeMismatch)?;
             for (kk, &av) in arow.iter().enumerate() {
+                check_deadline(until)?;
                 let brow = bm.get(kk * n..(kk + 1) * n).ok_or(OpError::ShapeMismatch)?;
                 for (o, &bv) in orow.iter_mut().zip(brow) {
                     *o += av * bv;
@@ -156,7 +163,16 @@ pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, OpError> 
         }
         advance_index(&mut idx, &batch);
     }
+    check_deadline(until)?;
     Tensor::new(out_shape, out)
+}
+
+/// 期限を過ぎていれば [`OpError::DeadlineExceeded`]。積和ループが行（k または n）ごとに呼ぶ。
+fn check_deadline(until: Option<Instant>) -> Result<(), OpError> {
+    match until {
+        Some(t) if Instant::now() > t => Err(OpError::DeadlineExceeded),
+        _ => Ok(()),
+    }
 }
 
 /// Gemm（transA=0・transB=1・alpha=1・beta=1 固定）。`A[M,K] × W[N,K]ᵀ (+ C[N])`。
@@ -168,6 +184,7 @@ pub fn gemm_trans_b<W: Copy>(
     w: &Tensor<W>,
     c: Option<&Tensor<f32>>,
     to_f32: impl Fn(W) -> f32,
+    until: Option<Instant>,
 ) -> Result<Tensor<f32>, OpError> {
     let (m, k) = match a.shape() {
         [m, k] => (*m, *k),
@@ -197,6 +214,7 @@ pub fn gemm_trans_b<W: Copy>(
             .get(mi * k..(mi + 1) * k)
             .ok_or(OpError::ShapeMismatch)?;
         for ni in 0..n {
+            check_deadline(until)?;
             let wrow = w
                 .data()
                 .get(ni * k..(ni + 1) * k)
@@ -211,6 +229,7 @@ pub fn gemm_trans_b<W: Copy>(
             out.push(s);
         }
     }
+    check_deadline(until)?;
     Tensor::new(vec![m, n], out)
 }
 
@@ -221,6 +240,20 @@ mod tests {
 
     fn t(shape: &[usize], data: Vec<f32>) -> Tensor<f32> {
         Tensor::new(shape.to_vec(), data).unwrap()
+    }
+
+    #[test]
+    fn req39_matmul_gemm_stop_at_deadline() {
+        // 過去の期限を渡すと、積和ループの中で DeadlineExceeded になる
+        let past = Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        let a = t(&[2, 3], vec![1.0; 6]);
+        let b = t(&[3, 2], vec![1.0; 6]);
+        assert_eq!(matmul(&a, &b, past), Err(OpError::DeadlineExceeded));
+        let w = t(&[2, 3], vec![1.0; 6]);
+        assert_eq!(
+            gemm_trans_b(&a, &w, None, |v: f32| v, past),
+            Err(OpError::DeadlineExceeded)
+        );
     }
 
     #[test]
@@ -300,7 +333,7 @@ mod tests {
     fn req41_matmul_2d_and_batch_broadcast() {
         let a = t(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b = t(&[3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let r = matmul(&a, &b).unwrap();
+        let r = matmul(&a, &b, None).unwrap();
         assert_eq!(r.shape(), &[2, 2]);
         assert_eq!(r.data(), &[58.0, 64.0, 139.0, 154.0]);
 
@@ -310,7 +343,7 @@ mod tests {
         for s in [1.0f32, 2.0, 3.0] {
             bd.extend([s, 0.0, 0.0, s]);
         }
-        let r = matmul(&a4, &t(&[3, 2, 2], bd)).unwrap();
+        let r = matmul(&a4, &t(&[3, 2, 2], bd), None).unwrap();
         assert_eq!(r.shape(), &[2, 3, 2, 2]);
         assert_eq!(r.data().get(4..8).unwrap(), &[2.0, 4.0, 6.0, 8.0]);
         assert_eq!(r.data().get(20..24).unwrap(), &[15.0, 18.0, 21.0, 24.0]);
@@ -321,13 +354,13 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let k = t(&[1, 2, 1, 1, 2], vec![1.0, 10.0, 2.0, 20.0]);
-        let r = matmul(&q, &k).unwrap();
+        let r = matmul(&q, &k, None).unwrap();
         assert_eq!(r.shape(), &[1, 2, 2, 2, 2]);
         assert_eq!(r.data().get(0..4).unwrap(), &[1.0, 10.0, 2.0, 20.0]);
         assert_eq!(r.data().get(12..16).unwrap(), &[14.0, 140.0, 16.0, 160.0]);
 
         // K=0 は全 0
-        let z = matmul(&t(&[2, 0], vec![]), &t(&[0, 3], vec![])).unwrap();
+        let z = matmul(&t(&[2, 0], vec![]), &t(&[0, 3], vec![]), None).unwrap();
         assert_eq!(z.data(), &[0.0; 6]);
     }
 
@@ -335,11 +368,11 @@ mod tests {
     fn req41_matmul_rejects() {
         let a = t(&[2, 3], vec![0.0; 6]);
         assert_eq!(
-            matmul(&a, &t(&[2, 3], vec![0.0; 6])),
+            matmul(&a, &t(&[2, 3], vec![0.0; 6]), None),
             Err(OpError::ShapeMismatch)
         );
         assert_eq!(
-            matmul(&t(&[3], vec![0.0; 3]), &t(&[3, 1], vec![0.0; 3])),
+            matmul(&t(&[3], vec![0.0; 3]), &t(&[3, 1], vec![0.0; 3]), None),
             Err(OpError::ShapeMismatch)
         );
         // rank 6 は Tensor 自体が作れない
@@ -349,13 +382,17 @@ mod tests {
         );
         // バッチ不整合
         assert_eq!(
-            matmul(&t(&[2, 1, 1], vec![0.0; 2]), &t(&[3, 1, 1], vec![0.0; 3])),
+            matmul(
+                &t(&[2, 1, 1], vec![0.0; 2]),
+                &t(&[3, 1, 1], vec![0.0; 3]),
+                None
+            ),
             Err(OpError::ShapeMismatch)
         );
         // 巨大出力は確保前に拒否（入力は小さい）
         let x = t(&[1 << 15, 1], vec![0.0; 1 << 15]);
         let y = t(&[1, 1 << 15], vec![0.0; 1 << 15]);
-        assert_eq!(matmul(&x, &y), Err(OpError::LimitExceeded));
+        assert_eq!(matmul(&x, &y, None), Err(OpError::LimitExceeded));
     }
 
     #[test]
@@ -363,7 +400,7 @@ mod tests {
         // REQ-39: A=[0, MAX, 2]・B=[0, 2, 1] は m * k があふれる
         let a = Tensor::new(vec![0, usize::MAX, 2], Vec::<f32>::new()).unwrap();
         let b = Tensor::new(vec![0, 2, 1], Vec::<f32>::new()).unwrap();
-        let r = matmul(&a, &b).unwrap();
+        let r = matmul(&a, &b, None).unwrap();
         assert_eq!(r.shape(), &[0, usize::MAX, 1]);
         assert!(r.data().is_empty());
     }
@@ -373,7 +410,7 @@ mod tests {
         // REQ-39: A=[MAX, 0]・W=[0, 0] は 0..m を回さない
         let a = Tensor::new(vec![usize::MAX, 0], Vec::<f32>::new()).unwrap();
         let w = Tensor::new(vec![0, 0], Vec::<f32>::new()).unwrap();
-        let r = gemm_trans_b(&a, &w, None, |v: f32| v).unwrap();
+        let r = gemm_trans_b(&a, &w, None, |v: f32| v, None).unwrap();
         assert_eq!(r.shape(), &[usize::MAX, 0]);
         assert!(r.data().is_empty());
     }
@@ -383,7 +420,7 @@ mod tests {
         // k 昇順なら ((1e8 + 1) - 1e8) = 0。順序が変わると 1 になる（REQ-28）
         let a = t(&[1, 3], vec![1e8, 1.0, -1e8]);
         let b = t(&[3, 1], vec![1.0, 1.0, 1.0]);
-        assert_eq!(matmul(&a, &b).unwrap().data(), &[0.0]);
+        assert_eq!(matmul(&a, &b, None).unwrap().data(), &[0.0]);
     }
 
     #[test]
@@ -396,13 +433,13 @@ mod tests {
         )
         .unwrap();
         let bias = t(&[2], vec![0.5, -1.0]);
-        let r = gemm_trans_b(&a, &w, Some(&bias), bf16_to_f32).unwrap();
+        let r = gemm_trans_b(&a, &w, Some(&bias), bf16_to_f32, None).unwrap();
         assert_eq!(r.shape(), &[2, 2]);
         assert_eq!(r.data(), &[-1.5, 11.0, -1.5, 29.0]);
-        let r = gemm_trans_b(&a, &w, None, bf16_to_f32).unwrap();
+        let r = gemm_trans_b(&a, &w, None, bf16_to_f32, None).unwrap();
         assert_eq!(r.data(), &[-2.0, 12.0, -2.0, 30.0]);
         let wf = t(&[2, 3], vec![1.0, 0.0, -1.0, 2.0, 2.0, 2.0]);
-        let r = gemm_trans_b(&a, &wf, None, |v| v).unwrap();
+        let r = gemm_trans_b(&a, &wf, None, |v| v, None).unwrap();
         assert_eq!(r.data(), &[-2.0, 12.0, -2.0, 30.0]);
     }
 
@@ -412,20 +449,20 @@ mod tests {
         let w = t(&[2, 3], vec![0.0; 6]);
         let id = |v: f32| v;
         assert_eq!(
-            gemm_trans_b(&a, &t(&[2, 2], vec![0.0; 4]), None, id),
+            gemm_trans_b(&a, &t(&[2, 2], vec![0.0; 4]), None, id, None),
             Err(OpError::ShapeMismatch)
         );
         assert_eq!(
-            gemm_trans_b(&t(&[6], vec![0.0; 6]), &w, None, id),
+            gemm_trans_b(&t(&[6], vec![0.0; 6]), &w, None, id, None),
             Err(OpError::ShapeMismatch)
         );
         assert_eq!(
-            gemm_trans_b(&a, &t(&[6], vec![0.0; 6]), None, id),
+            gemm_trans_b(&a, &t(&[6], vec![0.0; 6]), None, id, None),
             Err(OpError::ShapeMismatch)
         );
         let bad = t(&[3], vec![0.0; 3]);
         assert_eq!(
-            gemm_trans_b(&a, &w, Some(&bad), id),
+            gemm_trans_b(&a, &w, Some(&bad), id, None),
             Err(OpError::ShapeMismatch)
         );
     }

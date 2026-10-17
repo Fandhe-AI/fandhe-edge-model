@@ -49,6 +49,8 @@ pub enum OpError {
     InvalidAttribute,
     /// Softmax 系の入力に NaN・±inf がある（fail-closed。不正な重みを確率として出さない）。
     NonFinite,
+    /// 呼び出し側が渡した期限を超えた（積和ループ内の打ち切り。REQ-39）。
+    DeadlineExceeded,
 }
 
 impl OpError {
@@ -61,6 +63,7 @@ impl OpError {
             Self::IndexOutOfRange => "op_index_out_of_range",
             Self::InvalidAttribute => "op_invalid_attribute",
             Self::NonFinite => "op_non_finite",
+            Self::DeadlineExceeded => "op_deadline_exceeded",
         }
     }
 }

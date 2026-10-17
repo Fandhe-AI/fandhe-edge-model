@@ -145,7 +145,7 @@ fn weights() -> &'static Weights {
 }
 
 fn lin(x: &Tensor<f32>, w: &Tensor<u16>, b: Option<&Tensor<f32>>) -> R<Tensor<f32>> {
-    gemm_trans_b(x, w, b, bf16_to_f32)
+    gemm_trans_b(x, w, b, bf16_to_f32, None)
 }
 
 /// RMSNorm: Mul → ReduceMean → Add(eps) → Sqrt → Reciprocal → Mul → Mul(w)。
@@ -217,7 +217,10 @@ fn layer(
     let q5 = reshape(q, &dims(&[b, KV_HEADS, HEADS / KV_HEADS, r, HEAD_DIM]))?;
     let kt = transpose(&unsqueeze(kf, &ivec(&[2]))?, &[0, 1, 2, 4, 3])?;
     let v5 = unsqueeze(vf, &ivec(&[2]))?;
-    let sc = mul(&matmul(&q5, &kt)?, &scalar(1.0 / (HEAD_DIM as f32).sqrt()))?;
+    let sc = mul(
+        &matmul(&q5, &kt, None)?,
+        &scalar(1.0 / (HEAD_DIM as f32).sqrt()),
+    )?;
     // 因果マスク: key 位置 > query 位置（prefix は全て見える）。
     let qpos = range_i64(&iscalar(p as i64), &iscalar(s as i64), &iscalar(1))?;
     let kpos = range_i64(&iscalar(0), &iscalar(s as i64), &iscalar(1))?;
@@ -226,7 +229,7 @@ fn layer(
         &reshape(qpos, &dims(&[r, 1]))?,
     )?;
     let at = softmax_last_axis(&where_f32(&future, &scalar(-1e30), &sc)?)?;
-    let o = matmul(&at, &v5)?;
+    let o = matmul(&at, &v5, None)?;
     let o = transpose(&reshape(o, &dims(&[b, HEADS, r, HEAD_DIM]))?, &[0, 2, 1, 3])?;
     let o = lin(&reshape(o, &dims(&[b * r, HEADS * HEAD_DIM]))?, &l.wo, None)?;
     let x = add(x, &o)?;
@@ -259,7 +262,7 @@ fn stack(
 /// 隠れ状態 `[K*M,H]`（選択肢 k の位置 j は cand[k][j] を予測する行）から選択肢間の確率 `[K]`。
 fn finish(h: &Tensor<f32>) -> R<Vec<f64>> {
     let w = weights();
-    let logits = gemm_trans_b(&rmsnorm(h, &w.fnorm)?, &w.embed, None, bf16_to_f32)?;
+    let logits = gemm_trans_b(&rmsnorm(h, &w.fnorm)?, &w.embed, None, bf16_to_f32, None)?;
     let lp = log_softmax_last_axis(&reshape(logits, &dims(&[K, M, VOCAB]))?)?;
     let cand = i64t(&[K, M, 1], CAND.iter().flatten().copied().collect());
     let picked = gather_elements_last_axis(&lp, &cand)?;
