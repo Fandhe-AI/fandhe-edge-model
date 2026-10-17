@@ -132,6 +132,8 @@ make doctor      # 環境診断のみ（何も導入しない）
 - トークナイザーの golden 照合は実物の `tokenizer.json` と `fixtures/poc26/tokenizer_golden.json` が要るため、環境変数 `FANDHE_EDGE_QWEN_DIR` が無い間は skip する（人間が実機で実行。手順は [docs/design/poc26-tokenizer-golden-procedure.md](docs/design/poc26-tokenizer-golden-procedure.md)）: `FANDHE_EDGE_QWEN_DIR=<dir> uv --no-config run --locked --directory trainer pytest tests/test_poc26_tokenizer.py -k golden`
 - 学習・採点 CLI（`trainer/tools/poc26/lora_poc.py`）の実重みでの確認（往復・参照との突き合わせ・CPU 決定性）は人間が実機で行う。`train`・`predict`・`probe` は #387 で記録した sha256 を必須引数（`--model-sha256`・`--config-sha256`・`--tokenizer-sha256`・`--tokenizer-config-sha256`。64 桁の小文字 16 進）で受け、不一致は終了コード 64。`predict` は学習時に記録した `--adapter-sha256`（`adapters.safetensors` 全体のハッシュ。設定は metadata に入り同時に守られる）も必須。`--out-dir` は存在しない新規ディレクトリで、失敗時は一時ディレクトリを消すため同じ `--out-dir` で再実行できる（追補 1 の 10 節）。手順・合格条件・記録欄は [docs/design/poc26-preregistration-addendum-1.md](docs/design/poc26-preregistration-addendum-1.md) の 6 節。CI の pytest は合成モデル・CPU のテストハーネスのみ（実機の証拠にならない）
 
+- Rust 推論ランタイムの実物 `tokenizer.json` との全件一致（`fixtures/preprocess/tokenizer_vectors.json` の 23 件。REQ-41・TASK-41.4-5・#413）も実機前提（`#[ignore]`。`rust-ci` では `ignored`）: `FANDHE_EDGE_QWEN_DIR=<dir> cargo test -p fandhe-edge-runtime --test tokenizer_golden -- --ignored --exact req41_real_tokenizer_vectors_all_match`。環境変数が無いまま実行すると失敗する。合成 tokenizer での全件一致は既定の `make test` で実行される（`env_isolation.rs` の `env -i` を含む）
+
 ### 学習ワーカーの起動契約（Issue #12）
 
 - 学習ワーカー（`trainer/`）は `package = false`（配布パッケージを持たないスタブ）のため、外部プロセスからの起動は唯一の起動口 `trainer/launch.py` を経由する契約とする: `<venv の python> -I trainer/launch.py train --request <path>`（`-I` 隔離モード必須。`trainer/launch.py`・`trainer/src/fandhe_edge_trainer/cli.py`・`trainer/src/fandhe_edge_trainer/supervisor.py::worker_argv` のモジュール docstring 参照）
