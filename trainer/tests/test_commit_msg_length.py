@@ -49,3 +49,8 @@ def test_main_reports_english_diagnostic(tmp_path, capsys):
         capsys.readouterr().err
         == "NG: line 3 is 101 chars (max 100, counted in UTF-16 units like commitlint)\n"
     )
+
+
+def test_url_after_japanese_text_is_exempt_like_js():
+    # JS の \b は ASCII 単位のため、日本語の直後の https:// も URL 行として除外される
+    assert mod.check("ci: x\n\n" + "あ" * 100 + "https://example.com") == []

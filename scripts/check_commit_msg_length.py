@@ -15,7 +15,7 @@ MAX_LEN = 100
 # core.commentChar を変えている場合は対象外
 _CUT = re.compile(r"^#\s*-+\s*>8")
 # commitlint の @commitlint/ensure max-line-length と同じ URL 判定（body・footer のみ適用）
-_URL = re.compile(r"\bhttps?://\S+")
+_URL = re.compile(r"\bhttps?://\S+", re.ASCII)  # JS の \b は ASCII 単位
 
 
 def check(text: str) -> list[tuple[int, int]]:
