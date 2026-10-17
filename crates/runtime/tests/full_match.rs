@@ -15,6 +15,10 @@ use fandhe_edge_eval::input_only::{EvalItem, run_inference_input_only};
 use fandhe_edge_runtime::pipeline::*;
 use std::rc::Rc;
 
+#[path = "common/qwen_scoring.rs"]
+mod qwen_scoring;
+use qwen_scoring::{QwenRefBackend, bytes_to_ids};
+
 const TOL: f64 = 1e-9;
 const LABELS: usize = 4;
 const CORPUS_LEN: usize = 650;
@@ -315,4 +319,112 @@ fn req28_negative_control_padded_batch_detected_by_same_comparator() {
     let mm = label_mismatches(&s_labels, &naive);
     // 496 は模擬バックエンド上の観測値（実モデルの値ではない）。
     assert_eq!(mm.len(), 496);
+}
+
+// --- Qwen の KV 使い回し採点（REQ-41・TASK-41.7-7・#421）。証拠種別: テストハーネス（合成重み・極小構成）---
+
+/// 参照順伝播用の前処理（バイト列を語彙内の id へ。実トークナイザーは `tokenizer_golden.rs` が担う）。
+struct QwenPre;
+impl Preprocessor for QwenPre {
+    fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
+        Ok(TokenIds::new(bytes_to_ids(input)))
+    }
+}
+
+fn qwen_pipeline() -> InferencePipeline<QwenPre, QwenRefBackend> {
+    InferencePipeline::new(QwenPre, QwenRefBackend)
+}
+
+/// REQ-28・REQ-41・#421。Qwen の KV 使い回し採点でも全 650 件で 3 経路の予測ラベルが一致し
+/// 不一致 0 件（`req28_single_batch_evaluator_labels_match_all_650` と同じ形。証拠種別: テストハーネス）。
+#[test]
+fn req28_req41_qwen_kv_scoring_single_batch_evaluator_match_all_650() {
+    let c = corpus();
+    let s = single(&qwen_pipeline(), &c);
+    let s_labels = labels_of(&s);
+    assert_eq!(s_labels.len(), 650);
+
+    let identity: Vec<usize> = (0..c.len()).collect();
+    let b = batched(&qwen_pipeline(), &c, &identity, c.len());
+    assert_eq!(
+        label_mismatches(&s_labels, &labels_of(&b)),
+        Vec::<usize>::new()
+    );
+    assert!(scores_close(&s, &b));
+
+    // 1 周が重い（debug で数秒）ため、seed 1 のみ・恒等順の全件チャンクは上で確認済み。
+    for seed in [1u64] {
+        let order = shuffled(c.len(), seed);
+        for chunk in [1usize, 7, 64] {
+            let b = batched(&qwen_pipeline(), &c, &order, chunk);
+            assert_eq!(
+                label_mismatches(&s_labels, &labels_of(&b)),
+                Vec::<usize>::new(),
+                "seed={seed} chunk={chunk}"
+            );
+            assert!(scores_close(&s, &b), "seed={seed} chunk={chunk}");
+        }
+    }
+
+    let e = via_evaluator(qwen_pipeline(), &c);
+    assert_eq!(
+        label_mismatches(&s_labels, &labels_of(&e)),
+        Vec::<usize>::new()
+    );
+    assert!(scores_close(&s, &e));
+}
+
+/// REQ-28・REQ-41・#421。全選択肢が 1 回以上予測され、全件同一ラベルによる自明な一致でないこと。
+#[test]
+fn req41_qwen_kv_scoring_labels_cover_all_choices() {
+    let s_labels = labels_of(&single(&qwen_pipeline(), &corpus()));
+    for l in 0..qwen_scoring::K {
+        let n = s_labels.iter().filter(|&&x| x == l).count();
+        assert!(n > 0, "choice {l} never predicted");
+    }
+}
+
+/// REQ-41・#421。KV 使い回しの採点が、選択肢ごとに全系列を流す素朴な採点と一致する
+/// （マスク・位置・行のずらしの正しさの照合）。確率差の上限 1e-5 は f32 の計算順の違い
+/// （prefix の K・V を共有するか全系列で再計算するか）に由来する差の目安で、f64 用の 1e-9 は使わない。
+#[test]
+fn req41_kv_reuse_matches_naive_full_sequence_scoring() {
+    for (i, x) in corpus().iter().take(64).enumerate() {
+        let ids = bytes_to_ids(x);
+        let a = qwen_scoring::kv_reuse_scores(&ids).expect("kv reuse");
+        let b = qwen_scoring::naive_full_scores(&ids).expect("naive");
+        assert_eq!(a.len(), b.len());
+        let argmax = |v: &[f64]| (0..v.len()).max_by(|&p, &q| v[p].total_cmp(&v[q]));
+        assert_eq!(argmax(&a), argmax(&b), "label differs at index {i}");
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0, f64::max);
+        assert!(worst <= 1e-5, "prob diff {worst} at index {i}");
+    }
+}
+
+/// REQ-28・REQ-41・#421。陰性対照: チャンク内の最大長まで pad の id で右詰めしマスクなしで採点した
+/// 素朴なバッチは、同じ比較器で不一致が検出される（比較器の空振り防止。証拠種別: テストハーネス）。
+#[test]
+fn req28_qwen_negative_control_padded_batch_detected() {
+    let c = corpus();
+    let s_labels = labels_of(&single(&qwen_pipeline(), &c));
+    let mut naive = Vec::with_capacity(c.len());
+    for chunk in c.chunks(64) {
+        let seqs: Vec<Vec<i64>> = chunk.iter().map(|x| bytes_to_ids(x)).collect();
+        let max = seqs.iter().map(Vec::len).max().unwrap_or(0);
+        for mut s in seqs {
+            s.resize(max, qwen_scoring::PAD);
+            let p = qwen_scoring::kv_reuse_scores(&s).expect("padded");
+            let best = (0..p.len())
+                .max_by(|&a, &b| p[a].total_cmp(&p[b]))
+                .unwrap_or(0);
+            naive.push(best);
+        }
+    }
+    let mm = label_mismatches(&s_labels, &naive);
+    // 模擬上の観測値（実モデルの値ではない）。
+    assert_eq!(mm.len(), 111);
 }

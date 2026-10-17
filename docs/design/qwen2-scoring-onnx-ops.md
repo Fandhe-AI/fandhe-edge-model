@@ -85,9 +85,9 @@
 ## 4. データ型・rank・件数
 
 - FLOAT: 計算。INT64: id・形状・index。BOOL: 中間値に限る（Greater の出力・Where の cond。initializer には使わない）。BFLOAT16: initializer に限る（`proto.rs` に `DT_BFLOAT16 = 16` を足す。#581）。それ以外（FLOAT16・DOUBLE・INT32 等）は拒否
-- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体を f32 に展開するかは #581 が RSS で決める（1.5B で約 6.2 GB。推定）
+- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体は f32 に展開しない（1.5B で約 6.2 GB〔推定〕となり RSS 安全上限 8 GiB に近いため。#581 の決定）。bf16 は `u16` のまま保持し、外部データは shard 単位で流し読みして生バイトの全量を持たない。RSS の実測は #421・#435
 - rank: 中間値は 5 以下（GQA の `[1,nkv,grp,T,hd]`）。initializer は 2 以下。C1・C3 の `MAX_DIMS=4` は変えず、上限は種類ごとに持つ
-- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る（値は #581 で決める）
+- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る。#581 の暫定値（推定。#431 の実測で見直す）: ノード 4096・initializer 1024・rank 5・本体 64 MiB、外部データは shard 1 GiB・256 件・合計 8 GiB（ガード層の #580 と同じ）。C1・C3 は 128・64・4・44 MiB のまま外部データと bf16 を拒否する
 - 動的な次元は T だけ（`max_seq_length` と `max_position_embeddings` で上限を持つ）。K と M は定数
 
 ## 5. 範囲外を除外する方針
@@ -102,3 +102,26 @@
 - 行列積の縮約順はスレッド数に依存させない（REQ-28。#416）
 - 演算の単体テストの許容差は各実装 issue に任せる（1e-9 は f64 で計算する場合に限る）
 - 1 件ずつの推論とバッチ推論の全件一致（REQ-28）は、N=1 固定の契約で保つ
+
+## 7. 演算の処理時間の目安（TASK-41.7-7・#421）
+
+- 計測: 2026-10-17、Apple M5、`--release`、単一スレッド（カーネルの仕様）。各演算 3 回の中央値。GPU は使わない
+- 再現: `cargo test -p fandhe-edge-runtime --release --test qwen_ops_timing -- --ignored --nocapture`（`crates/runtime/tests/qwen_ops_timing.rs`。1 演算 1 行の JSON を出す）
+- 証拠種別: テストハーネス（合成の bf16 重み・Qwen2.5-1.5B の 1 層の形状・T=128・K=4・M=8）。1 推論あたりの値は推定（層の合計 × 28 + 層をまたがない処理）。実機の p95・RSS ではない（TASK-41.11・#440・#442）。学習側との Sin / Cos の数値照合は #431・#434
+- 一致確認: 実行器は未実装のため、カーネルを 2 節の順に組んだ参照順伝播（`tests/common/qwen_scoring.rs`、極小構成）で、1 件・バッチ・評価器経路の全件一致（650 件）と、KV 使い回しと素朴な全系列採点の一致を `tests/full_match.rs` で確認する（REQ-28）
+
+| 演算 | 形状 | 中央値 |
+| ---- | ---- | ------ |
+| Gemm lm_head（1 推論に 1 回） | `[32,1536]x[151936,1536]` | 6.62 s |
+| Gemm down | `[128,8960]x[1536,8960]` | 1.72 s |
+| Gemm gate / up | `[128,1536]x[8960,1536]` | 1.56 s |
+| Gemm gate / up | `[32,1536]x[8960,1536]` | 390 ms |
+| Gemm q / o | `[128,1536]x[1536,1536]` | 267 ms |
+| MatMul qk / av（prefix） | `[1,2,6,128,128]` | 約 2.4 ms |
+| Mul（`[128,8960]`） | 要素ごと | 4.3 ms |
+| Where | `[128,128]x[]x[1,2,6,128,128]` | 1.0 ms |
+| Softmax | `[1,2,6,128,128]` | 0.66 ms |
+
+- 1 層の合計は約 6.9 s、1 推論あたりの推定は約 199 s（層 28 × 6.9 s + lm_head 等 6.6 s）。容量・遅延の目標（p95 250 ms 未満。REQ-31）の約 800 倍で、この素朴な実装のままでは満たせない
+- 支配的なのは Gemm（約 1.1 GMAC/s。bf16 を積和の中で f32 に展開する単一スレッドのループ）。要素ごとの演算も約 3.7 ns/要素で、ブロードキャストの汎用経路が遅い。速度の改善（k 昇順の加算順を保つ範囲での並べ替え・ブロック化・並列化）は本 issue の対象外で、別 issue での判断が要る
+- Where の 3 入力ストライドループ化（`mask_rope.rs` の ponytail コメント）: Where は 1.0 ms で層あたり 1 回、1 推論で約 28 ms。Gemm に比べて小さく、現時点では不要

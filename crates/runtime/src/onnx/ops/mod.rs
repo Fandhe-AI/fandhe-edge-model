@@ -4,8 +4,7 @@
 //!
 //! 共有型（[`Tensor`]・[`OpError`]・ブロードキャスト）と形状操作（[`shape`]。#417）を提供する。
 //! `docs/design/qwen2-scoring-onnx-ops.md` の演算一覧のうち、行列演算と要素ごとの演算
-//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は #416 の担当で、本差分では未実装
-//! （後続実装）。正規化と活性化は [`norm_act`]（#418）、マスクと RoPE は #419 の担当。
+//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は [`arith`]（#416）。正規化と活性化は [`norm_act`]（#418）、マスク・Where・RoPE の表の構成演算（Range・Greater・Where・Sin・Cos）は [`mask_rope`]（#419）。
 //!
 //! # 契約
 //!
@@ -18,6 +17,8 @@
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致で比べる
 
+pub mod arith;
+pub mod mask_rope;
 pub mod norm_act;
 pub mod shape;
 
@@ -26,8 +27,10 @@ use std::fmt;
 /// テンソルの rank の上限。GQA の `[1,nkv,grp,T,hd]` までを許す（設計書 4 節）。
 pub const MAX_RANK: usize = 5;
 
-// ponytail: 暫定値（f32 で 1 GiB）。種類別の上限は #581 で確定する。
 /// 1 つのテンソルの要素数の上限。確保の前に必ず照合する（REQ-39）。
+///
+/// f32 で 1 GiB。Qwen2.5-1.5B の埋め込み（151936 × 1536 ≒ 2.3e8）が収まる値で、7B（152064 × 3584 ≒
+/// 5.5e8）は収まらないため 7B を扱うときに見直す（#581）。
 pub const MAX_ELEMENTS: usize = 1 << 28;
 
 /// カーネルのエラー。終了コードへの写像は CLI 側の責務。

@@ -131,6 +131,40 @@ fn req39_limits_fixture_matches_rust_constants() {
         .map(|v| v.as_str().expect("device must be a string").to_string())
         .collect();
     assert_eq!(devices, limits::ALLOWED_DEVICES.to_vec());
+
+    // REQ-39・#582: kind ごとの書き出しモデル上限。
+    let by_kind = fixture["max_model_bytes_by_kind"]
+        .as_object()
+        .expect("max_model_bytes_by_kind must be an object");
+    assert_eq!(by_kind.len(), limits::MAX_MODEL_BYTES_BY_KIND.len());
+    for (kind, bytes) in limits::MAX_MODEL_BYTES_BY_KIND {
+        assert_eq!(
+            by_kind.get(kind).and_then(|v| v.as_u64()),
+            Some(bytes),
+            "{kind}"
+        );
+    }
+    // 新しい kind の上限の書き忘れを検出する（kind_versions.json とキー集合が一致）。
+    let versions = load_fixture_value("kind_versions.json");
+    let mut want: Vec<&str> = versions
+        .as_object()
+        .expect("kind_versions must be an object")
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .map(String::as_str)
+        .collect();
+    let mut got: Vec<&str> = by_kind.keys().map(String::as_str).collect();
+    want.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, want);
+}
+
+/// REQ-39・REQ-41・#582: 種類ごとの書き出しモデル上限の具体値。
+#[test]
+fn req39_max_model_bytes_for_kind_values() {
+    assert_eq!(limits::max_model_bytes_for_kind("qwen2_lora"), 8 << 30);
+    assert_eq!(limits::max_model_bytes_for_kind("c3"), 40 << 20);
+    assert_eq!(limits::max_model_bytes_for_kind("unknown"), 40 << 20);
 }
 
 /// REQ-18(b): `definition.json` からの投影 + `TrainRequest::new` の直列化が
