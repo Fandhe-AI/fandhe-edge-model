@@ -55,11 +55,9 @@ pub fn range_i64(
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let i = i64::try_from(i).map_err(|_| OpError::IntegerOverflow)?;
-        let v = d
-            .checked_mul(i)
-            .and_then(|m| s.checked_add(m))
-            .ok_or(OpError::IntegerOverflow)?;
+        // i128 で計算し、i64 に収まる要素だけを受け入れる。
+        let v = i64::try_from(i128::from(s) + i128::from(d) * i as i128)
+            .map_err(|_| OpError::IntegerOverflow)?;
         out.push(v);
     }
     Tensor::new(vec![n], out)
@@ -127,6 +125,19 @@ mod tests {
             let r = range_i64(&sc(a), &sc(b), &sc(1)).unwrap();
             assert_eq!((r.shape(), r.data().len()), (&[0][..], 0));
         }
+    }
+
+    #[test]
+    fn req41_range_i64_boundary_no_spurious_overflow() {
+        let r = range_i64(&sc(i64::MIN), &sc(i64::MAX), &sc(i64::MAX)).unwrap();
+        assert_eq!(r.data(), &[i64::MIN, -1, i64::MAX - 1]);
+        // 最終要素が INT64 に収まらない場合のみ IntegerOverflow
+        assert_eq!(
+            range_i64(&sc(i64::MAX - 1), &sc(i64::MAX), &sc(1))
+                .unwrap()
+                .data(),
+            &[i64::MAX - 1]
+        );
     }
 
     #[test]
