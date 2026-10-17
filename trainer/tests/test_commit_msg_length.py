@@ -25,3 +25,17 @@ def test_astral_counts_two():
 
 def test_line_number_reported():
     assert mod.check("ci: x\n\n" + "a" * 101) == [(3, 101)]
+
+
+def test_diff_after_cut_line_ignored():
+    cut = "# ------------------------ >8 ------------------------"
+    assert mod.check("ci: x\n\n" + cut + "\n+" + "a" * 200) == []
+
+
+def test_url_line_ok_but_long_plain_line_ng():
+    assert mod.check("ci: x\n\nsee https://example.com/" + "a" * 200) == []
+    assert mod.check("ci: x\n\n" + "a" * 101) == [(3, 101)]
+
+
+def test_header_url_not_exempt():
+    assert mod.check("ci: https://example.com/" + "a" * 100) == [(1, 124)]
