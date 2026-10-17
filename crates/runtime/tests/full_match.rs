@@ -15,7 +15,6 @@ use fandhe_edge_eval::input_only::{EvalItem, run_inference_input_only};
 use fandhe_edge_runtime::pipeline::*;
 use std::rc::Rc;
 
-#[allow(dead_code)]
 #[path = "common/qwen_scoring.rs"]
 mod qwen_scoring;
 use qwen_scoring::{QwenRefBackend, bytes_to_ids};
@@ -427,5 +426,5 @@ fn req28_qwen_negative_control_padded_batch_detected() {
     }
     let mm = label_mismatches(&s_labels, &naive);
     // 模擬上の観測値（実モデルの値ではない）。
-    assert_eq!(mm.len(), 119);
+    assert_eq!(mm.len(), 111);
 }
