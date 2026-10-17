@@ -1,7 +1,7 @@
 //! `fixtures/preprocess/tokenizer_vectors.json`（tokenizer 入力表現のゴールデンベクタ）の
 //! 形式検査（REQ-41・TASK-41.3-3・#404。証拠種別: テストハーネス）。
 //!
-//! 実トークナイザーとの全件一致は TASK-41.4-5（#413）の範囲で、ここでは形式のみ検査する。
+//! 全件一致は `tokenizer_golden.rs`（TASK-41.4-5・#413）の範囲で、ここでは形式のみ検査する。
 //! Python 側 `trainer/tests/test_tokenizer_vectors.py` と同じ項目・同じ順で検査する。
 //! fixture は外部入力として扱い、読み込み前にサイズを確認し、`[]` 添字を使わない。
 
@@ -144,4 +144,14 @@ fn req41_tokenizer_vectors_format_rejects_violations() {
         check_format(&rep),
         Err("input_representation must be tokenizer".into())
     );
+}
+
+/// REQ-41: 合成 fixture も同じ形式を満たす。
+#[test]
+fn req41_synthetic_tokenizer_vectors_format_ok() {
+    let path = fixture_path().with_file_name("tokenizer_vectors_synthetic.json");
+    let len = fs::metadata(&path).expect("metadata").len();
+    assert!(len <= MAX_FIXTURE_BYTES, "fixture too large: {len}");
+    let text = fs::read_to_string(&path).expect("read");
+    assert_eq!(check_format(&text), Ok(189));
 }

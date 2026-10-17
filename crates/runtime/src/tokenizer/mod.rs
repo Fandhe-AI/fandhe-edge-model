@@ -7,7 +7,8 @@
 //! （[`TokenizerSpec`]）に検証つきで読み込む。前段の正規化と事前分割
 //! （NFC・Split 状態機械。`pretokenize`。#411）、BPE（`bpe`）による [`TokenizerSpec::encode`] と
 //! chat template の id 列組み立て [`TokenizerSpec::build_chat_ids`]（#412）も持つ。
-//! 実物 `tokenizer.json` での golden 全件一致は未実装（#413）。
+//! 学習側と共有するゴールデンベクタとの全件一致は `tests/tokenizer_golden.rs`（合成は CI、
+//! 実物は実機前提の `#[ignore]`）と `tests/env_isolation.rs`（`env -i`）が確かめる（#413）。
 //!
 //! # 特殊トークンと長さの上限（REQ-39）
 //!

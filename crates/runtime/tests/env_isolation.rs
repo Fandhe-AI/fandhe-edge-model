@@ -2,7 +2,8 @@
 //! 推論が成功することを確認する（TASK-32.3・#115）。
 //!
 //! 方式: テスト実行ファイル自身を、環境変数を全消去（`env_clear`）した子プロセスとして再起動し、
-//! 子で C1・C3 の fixture（`fixtures/onnx_parity/`）に対する単体・バッチ推論を実行して exit 0 を確かめる。
+//! 子で C1・C3 の fixture（`fixtures/onnx_parity/`）に対する単体・バッチ推論と、
+//! 合成 tokenizer のゴールデンベクタ全件一致（REQ-41・TASK-41.4-5・#413）を実行して exit 0 を確かめる。
 //!
 //! 証拠種別: テストハーネス（CI の rust-ci では Linux・macOS runner で実行される。Mac 実機の
 //! `otool -L` による動的リンク確認は `scripts/check-runtime-linkage.sh` を人間が実行する）。
@@ -14,6 +15,9 @@
 //! ケース名・件数のみを出し、入力本文と環境変数の値は出さない（security.md）。
 
 #![cfg(unix)]
+
+#[path = "common/tokenizer_vectors.rs"]
+mod tokenizer_vectors;
 
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_runtime::onnx::{ModelKind, load_pipeline};
@@ -99,6 +103,12 @@ fn req32_env_i_child_infers_c1_c3_fixture() {
         serde_json::from_str(&fs::read_to_string(&path).expect("cases read")).expect("json");
     check_kind(&doc, ModelKind::C1);
     check_kind(&doc, ModelKind::C3);
+    // REQ-41: トークナイザーの経路も Python・環境変数なしで学習側と全件一致する
+    let n = tokenizer_vectors::check_vectors(
+        &tokenizer_vectors::preprocess_fixture("tokenizer_synthetic.json"),
+        &tokenizer_vectors::preprocess_fixture("tokenizer_vectors_synthetic.json"),
+    );
+    assert_eq!(n, 189, "tokenizer vectors count");
     let mut keys: Vec<String> = std::env::vars_os()
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();

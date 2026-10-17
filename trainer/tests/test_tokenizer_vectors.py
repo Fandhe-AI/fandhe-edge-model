@@ -1,18 +1,24 @@
 """tokenizer 入力表現のゴールデンベクタ形式の読み込みテスト（REQ-41・TASK-41.3-3・#404）。
 
 `fixtures/preprocess/tokenizer_vectors.json` の形式のみを検査する（証拠種別: テストハーネス）。
-実トークナイザーとの一致照合は TASK-41.4-5（#413）の範囲。Rust 側
-`crates/runtime/tests/tokenizer_vectors_format.rs` と同じ項目・同じ順で検査する。
+Rust との全件一致は `crates/runtime/tests/tokenizer_golden.rs`（TASK-41.4-5・#413）。Rust 側
+`crates/runtime/tests/tokenizer_vectors_format.rs` と同じ項目・同じ順で形式を検査し、合成 fixture
+（`tokenizer_*_synthetic.json`）が生成器の出力と一致すること（古くないこと）も確かめる。
 """
 
 from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools import gen_tokenizer_vectors as gen
 
 # 読み込み前にサイズ上限を確認する（coding-python.md）。
 _MAX_FIXTURE_BYTES = 1024 * 1024
@@ -102,3 +108,14 @@ def test_req41_tokenizer_vectors_format_rejects_violations(
     assert src in text
     with pytest.raises(ValueError, match=re.escape(message)):
         check_format(text.replace(src, dst, 1).encode("ascii"))
+
+
+def test_req41_synthetic_vectors_format_ok() -> None:
+    raw = gen.VECTORS_PATH.read_bytes()
+    assert check_format(raw) == 189
+
+
+def test_req41_synthetic_fixtures_are_up_to_date() -> None:
+    """生成物が古くない（再生成すると差分が出ない）。"""
+    assert gen.TOKENIZER_PATH.read_text("utf-8") == gen.render_tokenizer()
+    assert gen.VECTORS_PATH.read_text("utf-8") == gen.render_vectors()
