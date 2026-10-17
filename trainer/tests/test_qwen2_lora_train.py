@@ -1,7 +1,7 @@
 """qwen2_lora の LoRA 追加学習（REQ-41・REQ-19・REQ-39・TASK-41.5-3・#426）。
 
 極小の合成モデル（`test_qwen2_base_model.make_dir`）で完走を確かめる。実重み・GPU は使わない。
-証拠種別: テストハーネス（CPU）。全件一致の決定性・範囲外エラーの網羅は #428。
+証拠種別: テストハーネス（CPU）。決定性と範囲外エラーは本ファイル（#428）。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import pytest
 from mlx.utils import tree_flatten
 from tools.poc26 import synthetic
 
+import fandhe_edge_trainer.kinds.qwen2_lora as q
 from conftest import make_budget, make_examples, make_request
 from fandhe_edge_trainer.errors import WorkerError
 from fandhe_edge_trainer.exitcode import ExitCode
@@ -192,3 +193,55 @@ def test_export_onnx_is_not_implemented() -> None:
     with pytest.raises(WorkerError) as e:
         resolve_kind("qwen2_lora", 1).export_onnx(None, None)  # type: ignore[arg-type]
     assert e.value.exit_code == ExitCode.RUNTIME_ERROR
+
+
+def test_qwen2_lora_training_is_deterministic_on_cpu(tmp_path: Path) -> None:
+    """REQ-41・REQ-19・TASK-41.5-5・#428: CPU・同じ seed の 2 回の学習で重みと予測が全件一致する。
+
+    証拠種別: テストハーネス（CPU）。GPU は対象外で、許容幅の拡大では吸収しない。
+    iters=6 で複数エポックのバッチ順を、dropout で MLX の乱数 seed を通す。
+    """
+    kw = {"seed": 3, "n": 4, "iters": 6, "lora_dropout": 0.1}
+    ra, a = _train(tmp_path / "a", **kw)
+    _, b = _train(tmp_path / "b", **kw)
+    assert ra.device == "cpu"
+    la, lb = _lora(a), _lora(b)
+    assert la.keys() == lb.keys()
+    assert all(mx.array_equal(la[k], lb[k]).item() for k in la)
+    assert a.final_loss == b.final_loss
+    rows = [(str(i), "word " * i) for i in range(1, 6)]
+    pa, pb = q.predict_records(a, rows), q.predict_records(b, rows)
+    assert {r["status"] for r in pa} == {"ok"}
+    assert [(r["id"], r["status"], r["predicted_label"]) for r in pa] == [
+        (r["id"], r["status"], r["predicted_label"]) for r in pb
+    ]
+    for x, y in zip(pa, pb, strict=True):
+        assert np.allclose(list(x["scores"].values()), list(y["scores"].values()), atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("over", "expected"),
+    [
+        ({"lora_rank": 0}, "1..256"),
+        ({"lora_rank": 257}, "1..256"),
+        ({"iters": 0}, "1..100000"),
+        ({"batch_size": 65}, "1..64"),
+        ({"max_seq_length": 7}, "8..4096"),
+        ({"lora_scale": 0}, "(0.0, 1000.0]"),
+        ({"lora_dropout": 1.0}, "[0.0, 0.999999]"),
+        ({"lr": 2.0}, "(0.0, 1.0]"),
+        ({"dtype": "float16"}, "['bfloat16', 'float32']"),
+        ({"unknown_key": 1}, "'lora_rank'"),
+        ({"lora_num_layers": 99}, "1..2"),
+        ({"max_seq_length": 300}, "(256)"),
+    ],
+)
+def test_out_of_range_config_returns_supported_range(
+    tmp_path: Path, over: dict, expected: str
+) -> None:
+    """REQ-19 異常系・TASK-41.5-5・#428: 対応範囲外は 64 で止まり、メッセージに対応範囲を含める。"""
+    with pytest.raises(WorkerError) as e:
+        _train(tmp_path, **over)
+    assert (e.value.code, e.value.exit_code) == ("invalid_config", ExitCode.INVALID_INPUT)
+    assert expected in e.value.message
+    assert "unknown_key" not in e.value.message

@@ -253,6 +253,36 @@ def test_cli_train_exceeding_rss_limit_is_killed_and_cleaned_up(tmp_path: Path) 
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".out.tmp-")]
 
 
+def test_cli_train_qwen2_lora_out_of_range_config_exits_64_with_supported_range(
+    tmp_path: Path,
+) -> None:
+    """REQ-19 異常系・TASK-41.5-5・#428: CLI でも範囲外 config は 64。対応範囲入り。"""
+    _write_train_data(tmp_path / "train.jsonl")
+    request = {
+        "schema_version": 1,
+        "kind": "qwen2_lora",
+        "kind_version": 1,
+        "config": {"base_model_dir": "m", "base_model_sha256": {}, "lora_rank": 0},
+        "label_order": LABEL_ORDER,
+        "max_bytes": 64,
+        "seed": 0,
+        "device": "cpu",
+        "root": str(tmp_path),
+        "train_path": "train.jsonl",
+        "out_dir": "out",
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    result = _run_cli(request_path)
+    assert result.returncode == 64, (result.stdout, result.stderr)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "error"
+    assert payload["code"] == "invalid_config"
+    assert "1..256" in payload["message"]
+
+
 def test_cli_train_invalid_request_exits_64(tmp_path: Path) -> None:
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps({"schema_version": 1, "kind": "c3"}), encoding="utf-8")

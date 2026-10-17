@@ -72,4 +72,5 @@ def test_resolve_kind_rejects_unsupported_qwen2_lora_kind_version() -> None:
     with pytest.raises(WorkerError) as exc_info:
         resolve_kind("qwen2_lora", 2)
     assert exc_info.value.code == "unsupported_kind_version"
+    assert "(supported: [1])" in exc_info.value.message
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT

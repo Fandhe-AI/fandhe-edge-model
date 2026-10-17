@@ -1,6 +1,7 @@
 """qwen2_lora の選択肢スコアリングによる予測（REQ-41・REQ-19b・REQ-39・TASK-41.5-4・#427）。
 
-極小の合成モデルで確かめる。証拠種別: テストハーネス（CPU）。範囲外エラーの網羅は #428。
+極小の合成モデルで確かめる。証拠種別: テストハーネス（CPU）。
+決定性・範囲外エラーは test_qwen2_lora_train（#428）。
 """
 
 from __future__ import annotations
