@@ -294,6 +294,14 @@ def test_non_finite_weight_is_runtime_error() -> None:
     assert e.value.exit_code == ExitCode.RUNTIME_ERROR
 
 
+def test_bf16_overflow_to_inf_is_runtime_error() -> None:
+    """f32 最大有限値（0x7f7fffff）は bf16 丸めで +inf になるため runtime_error(70)。"""
+    big = np.array([0x7F7FFFFF], dtype=np.uint32).view(np.float32)
+    with pytest.raises(WorkerError) as e:
+        qo.bf16_bytes(big)
+    assert e.value.exit_code == ExitCode.RUNTIME_ERROR
+
+
 def test_bf16_rounding_is_rne() -> None:
     """bf16 は最近接偶数丸め。1+2^-8 は偶数側（1.0）、1+3*2^-8 は 1+2^-6 側へ。"""
     a = np.array([1 + 2**-8, 1 + 3 * 2**-8, -2.5], dtype=np.float32)

@@ -67,7 +67,13 @@ def bf16_bytes(a: np.ndarray) -> bytes:
         raise WorkerError("runtime_error", "non-finite weight", ExitCode.RUNTIME_ERROR)
     u = a.view(np.uint32)
     r = (u + ((u >> 16) & 1) + np.uint32(0x7FFF)) >> 16
-    return r.astype("<u2").tobytes()
+    r = r.astype("<u2")
+    # 丸めで指数部が全ビット 1 になる場合（f32 最大有限値の +inf 化等）も拒否する
+    if ((r & 0x7F80) == 0x7F80).any():
+        raise WorkerError(
+            "runtime_error", "non-finite weight after bf16 rounding", ExitCode.RUNTIME_ERROR
+        )
+    return r.tobytes()
 
 
 class _Shards:
