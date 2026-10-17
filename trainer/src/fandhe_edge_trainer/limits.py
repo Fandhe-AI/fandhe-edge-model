@@ -166,6 +166,36 @@ MAX_TRAIN_TOTAL_TOKENS = 50_000_000
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_MODEL_BYTES = 40 * 1024 * 1024
 
+#: 追加学習の種類 `qwen2_lora` の書き出しモデル上限（8 GiB。REQ-39・REQ-41・
+#: TASK-41.6-6・#582）。LoRA 統合後の bf16 書き出しはベース重みとほぼ同じ大きさに
+#: なるため、40 MiB（`MAX_MODEL_BYTES`）とは両立しない（#430）。
+#: 根拠: 実測（`docs/design/poc26-result.md` 追加検証④・#559）で P15（Qwen2.5-1.5B）の
+#: bf16 ベース重みは 3087 MB（約 2.9 GiB）、adapter は 10.6 MB。8 GiB はその約 2.8 倍で、
+#: 「暴走止めは実測の 2〜4 倍」の考え方に合う。Rust ガード層 `MAX_PACKAGE_TOTAL_BYTES`
+#: （#580）・`MAX_BASE_MODEL_TOTAL_BYTES` と同値で、推論側で読めない大きさは書き出させない。
+#: 7B（15,231 MB）は超過する（扱いは 1.5B 完了後に相談）。
+#: 証拠種別: 実測の倍率から決めた暫定値。状態: #582 で決めた値で、オーナー確認は未了。
+MAX_QWEN2_LORA_MODEL_BYTES = 8 << 30
+
+#: 書き出しモデル上限の種類ごとの表（REQ-39・#582）。共有 fixture
+#: （`fixtures/train_contract/limits.json` の `max_model_bytes_by_kind`）と Rust 側
+#: `crates/train/src/limits.rs` で照合する。
+MAX_MODEL_BYTES_BY_KIND: dict[str, int] = {
+    "c1": MAX_MODEL_BYTES,
+    "c3": MAX_MODEL_BYTES,
+    "autoregressive": MAX_MODEL_BYTES,
+    "qwen2_lora": MAX_QWEN2_LORA_MODEL_BYTES,
+}
+
+
+def max_model_bytes_for_kind(kind: object) -> int:
+    """`kind` の書き出しモデル上限（bytes）。表に無い値・str 以外は最も厳しい
+    `MAX_MODEL_BYTES` に落とす（fail-safe。REQ-39）。"""
+    if isinstance(kind, str):
+        return MAX_MODEL_BYTES_BY_KIND.get(kind, MAX_MODEL_BYTES)
+    return MAX_MODEL_BYTES
+
+
 # --------------------------------------------------------------------------
 # kind="c3" のアーキテクチャ・ハイパーパラメータ上限。
 #
@@ -417,3 +447,59 @@ MAX_AR_INFER_BATCH_N = 4096
 #: 想定で、実運用の呼び出し規模を計測した結果ではない）。証拠種別: 仮置き。
 #: 呼び出し元が確定し実運用規模が判明した時点で見直す想定。
 MAX_AR_PREDICT_ROWS = 4_096_000
+
+# --------------------------------------------------------------------------
+# qwen2_lora（ベースモデルの読み込み。`qwen2_model.load_base_model`。REQ-41・TASK-41.5-2・#425）
+# --------------------------------------------------------------------------
+
+#: ベースモデルの重みファイル 1 つのサイズ上限（1 GiB）。
+#: 現行値の根拠: Rust ガード層 `MAX_READ_FILE_BYTES`（#400 のオーナー判断）と同値。
+#: これを超える重みは分割（シャード）して置く。証拠種別: 準用（Rust 側の値）。
+#: **状態: 学習ワーカー固有の値としてのオーナー確認は未了**（Rust 側の値を準用）。
+MAX_BASE_MODEL_FILE_BYTES = 1 << 30
+
+#: ベースモデルの重みファイルの合計サイズ上限（8 GiB）。根拠: Rust ガード層
+#: `MAX_PACKAGE_TOTAL_BYTES`（#580）と同値。証拠種別: 準用。状態: 同上（確認未了）。
+MAX_BASE_MODEL_TOTAL_BYTES = 8 << 30
+
+#: ベースモデルの重みファイルの件数上限。根拠: Rust ガード層 `MAX_SPLIT_FILES`（#580）と同値。
+#: 証拠種別: 準用。状態: 同上（確認未了）。
+MAX_BASE_MODEL_WEIGHT_FILES = 256
+
+#: `config.json` のサイズ上限（64 KiB）。根拠: PoC-26 の値（実物の config は 1 KiB 未満）。
+#: 証拠種別: 仮置き。状態: オーナー未確認。
+MAX_BASE_MODEL_CONFIG_BYTES = 64 * 1024
+
+#: `tokenizer.json` のサイズ上限（16 MiB）。根拠: Rust 推論ランタイム `MAX_TOKENIZER_JSON_BYTES`
+#: と同値（実物の Qwen2.5 は約 7 MiB）。証拠種別: 準用。状態: 同上（確認未了）。
+MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
+
+# --------------------------------------------------------------------------
+# qwen2_lora（LoRA の追加学習。`kinds/qwen2_lora.py`。REQ-41・TASK-41.5-3・#426）
+# --------------------------------------------------------------------------
+# 以下はすべて PoC-26 の値（`tools/poc26/` の `common.py`・`cli.py`・`train.py` 等）の準用。
+# 証拠種別: 仮置き。状態: オーナー確認未了。
+
+#: LoRA の rank の上限。
+MAX_LORA_RANK = 256
+
+#: LoRA の scale の上限（mlx-lm の既定 20 の十分上）。
+MAX_LORA_SCALE = 1000.0
+
+#: 学習ステップ数の上限。
+MAX_LORA_ITERS = 100_000
+
+#: ミニバッチ件数の上限。
+MAX_LORA_BATCH_SIZE = 64
+
+#: 学習列の長さ（token 数）の下限と上限。超過した列は切り詰めずに `limit_exceeded` で止める。
+MIN_LORA_SEQ_LENGTH = 8
+MAX_LORA_SEQ_LENGTH = 4096
+
+#: 学習率の上限。
+MAX_LORA_LR = 1.0
+
+#: 損失位置の float32 logits の要素数（batch_size x max_seq_length x vocab）の上限。
+#: backward は forward の約 3 倍を保持しうると見て、5e8 要素（float32 で 2 GB、x3 = 6 GB <
+#: RSS 上限 8 GiB）に抑える。係数 3 は保守的な見積もりで実測ではない（推定）。
+MAX_LOSS_LOGITS_ELEMENTS = 500_000_000

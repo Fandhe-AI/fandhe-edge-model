@@ -4,8 +4,7 @@
 //!
 //! 共有型（[`Tensor`]・[`OpError`]・ブロードキャスト）と形状操作（[`shape`]。#417）を提供する。
 //! `docs/design/qwen2-scoring-onnx-ops.md` の演算一覧のうち、行列演算と要素ごとの演算
-//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は #416 の担当で、本差分では未実装
-//! （後続実装）。正規化と活性化は [`norm_act`]（#418）、マスクと RoPE は #419 の担当。
+//! （MatMul・Gemm・Add・Sub・Mul・Sqrt・Reciprocal・Cast）は [`arith`]（#416）。正規化と活性化は [`norm_act`]（#418）、マスク・Where・RoPE の表の構成演算（Range・Greater・Where・Sin・Cos）は [`mask_rope`]（#419）。
 //!
 //! # 契約
 //!
@@ -18,6 +17,8 @@
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致で比べる
 
+pub mod arith;
+pub mod mask_rope;
 pub mod norm_act;
 pub mod shape;
 

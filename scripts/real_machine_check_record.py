@@ -209,7 +209,7 @@ I_EVIDENCE = {"cpu": "cpu_real_machine", "gpu": "gpu_real_machine_declared"}
 # 版 ID の形（`v<n>`。crates/cli/src/stages/package.rs の台帳の版）
 VERSION_ID_RE = re.compile(r"v[1-9][0-9]{0,8}")
 # `kind` の許可リスト（crates/guard/src/kind.rs の `SUPPORTED_KINDS`。REQ-39）
-KIND_VOCAB = frozenset({"c1", "c3", "autoregressive"})
+KIND_VOCAB = frozenset({"c1", "c3", "autoregressive", "qwen2_lora"})
 # `package` の容量の目安（crates/runtime/src/capacity_limit.rs の `REFERENCE_CAPACITY_BYTES`。
 # 強制上限ではなく、超過は `over_guideline` の警告のみ。REQ-30・TASK-41.9。
 # pytest で Rust のソースと照合する）

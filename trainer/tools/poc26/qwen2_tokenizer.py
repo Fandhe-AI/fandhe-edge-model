@@ -319,6 +319,9 @@ class Qwen2Tokenizer:
             raise LimitExceededError("input text is too long")
         if self._nfc:
             text = unicodedata.normalize("NFC", text)
+            # NFC で伸びうる（U+0344 は 4 バイトへ）ため後にも確かめる。Rust 側と同じ（REQ-39）
+            if len(text.encode("utf-8")) > MAX_ENCODE_BYTES:
+                raise LimitExceededError("input text is too long")
         pieces: list[str] = []
         pos = 0
         for m in _pre_tokenize_pattern().finditer(text):

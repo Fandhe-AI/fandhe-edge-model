@@ -204,7 +204,7 @@ mod unix_only {
     #[test]
     fn req39_allowed_kinds_pass_guard_and_reach_next_layer() {
         let sb = Sandbox::new("kind-ok");
-        for k in ["\"c1\"", "\"c3\"", "\"autoregressive\""] {
+        for k in ["\"c1\"", "\"c3\"", "\"autoregressive\"", "\"qwen2_lora\""] {
             sb.setup(&meta(k, "model.onnx"), "model.onnx", &MIN_ONNX);
             sb.assert_infer(64, AFTER_GUARD_META_INVALID);
         }
@@ -219,6 +219,7 @@ mod unix_only {
             ("\"c3\"", "99"),
             ("\"c1\"", "99"),
             ("\"autoregressive\"", "99"),
+            ("\"qwen2_lora\"", "99"),
             ("\"c3\"", "0"),
             ("\"c3\"", "2"),
             ("\"c3\"", "4294967295"),

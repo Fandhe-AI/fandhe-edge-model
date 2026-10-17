@@ -4,7 +4,7 @@ use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_guard::kind::{KindAllowlist, KindRejection, MAX_KIND_LEN};
 
 fn all() -> Vec<&'static str> {
-    vec!["autoregressive", "c1", "c3"]
+    vec!["autoregressive", "c1", "c3", "qwen2_lora"]
 }
 
 fn assert_malformed(input: &str, expected: KindRejection) {
@@ -19,7 +19,7 @@ fn assert_malformed(input: &str, expected: KindRejection) {
 #[test]
 fn req39_supported_kinds_accepted() {
     let al = KindAllowlist::supported();
-    for k in ["c1", "c3", "autoregressive"] {
+    for k in ["c1", "c3", "autoregressive", "qwen2_lora"] {
         assert_eq!(al.check(k).unwrap().as_str(), k);
     }
 }
