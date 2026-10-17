@@ -4,5 +4,6 @@
   },
   "c1": [1],
   "c3": [1],
-  "autoregressive": [1]
+  "autoregressive": [1],
+  "qwen2_lora": [1]
 }

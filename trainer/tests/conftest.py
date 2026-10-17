@@ -91,6 +91,7 @@ def make_request(
     max_bytes: int = 64,
     time_limit_seconds: int = MAX_TRAIN_WALL_SECONDS,
     rss_limit_bytes: int = MAX_TRAIN_RSS_BYTES,
+    keep_root: bool = False,
 ) -> TrainRequest:
     """`TrainRequest` を、`guard.resolve_root`/`guard.confine` を実際に経由して
     構築する（`root`＝`tmp_path`。fd の解放はテスト終了時に自動で行われる。
@@ -107,7 +108,8 @@ def make_request(
     root_handle = guard.resolve_root(str(tmp_path))
     train_path_entry = guard.confine(root_handle, "train.jsonl", "train_path")
     out_dir_entry = guard.confine(root_handle, out_name, "out_dir")
-    root_handle.close()  # train_path_entry/out_dir_entry は独立した fd を持つため不要になる
+    if not keep_root:  # qwen2_lora は学習中に root からベースモデルを開くため残せる
+        root_handle.close()  # train_path_entry/out_dir_entry は独立した fd を持つため不要になる
     req = TrainRequest(
         kind=kind,
         kind_version=1,

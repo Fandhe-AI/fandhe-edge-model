@@ -2,7 +2,7 @@
 //!
 //! PoC-20（模擬＋テストハーネス）で、ガード層の無い CLI は `kind_version: 99` のパッケージを
 //! そのまま推論へ通すことが実測されている。本モジュールは `kind` ごとの許可版
-//! （学習ワーカーの選択口 `_registry` と同じ形 `c1:{1}`・`c3:{1}`・`autoregressive:{1}`）と照合し、
+//! （学習ワーカーの選択口 `_registry` と同じ形 `c1:{1}`・`c3:{1}`・`autoregressive:{1}`・`qwen2_lora:{1}`）と照合し、
 //! 合格した組だけを [`CheckedKindVersion`] として返す。
 //!
 //! # 責務境界
@@ -26,8 +26,12 @@ use std::fmt;
 
 /// 既定で対応する `(kind, 許可版)`。学習ワーカーの選択口 `_registry`（TASK-19.1）と一致させる。
 /// 契約値の集約先はここ 1 箇所。
-const SUPPORTED_KIND_VERSIONS: [(&str, &[u32]); 3] =
-    [("c1", &[1]), ("c3", &[1]), ("autoregressive", &[1])];
+const SUPPORTED_KIND_VERSIONS: [(&str, &[u32]); 4] = [
+    ("c1", &[1]),
+    ("c3", &[1]),
+    ("autoregressive", &[1]),
+    ("qwen2_lora", &[1]),
+];
 
 /// `kind` ごとに許可する `kind_version` の集合。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +118,7 @@ impl KindVersionAllowlist {
         Ok(Self { versions })
     }
 
-    /// 既定の許可集合（`c1:{1}`・`c3:{1}`・`autoregressive:{1}`。学習ワーカーの選択口と同じ）。
+    /// 既定の許可集合（`c1:{1}`・`c3:{1}`・`autoregressive:{1}`・`qwen2_lora:{1}`。学習ワーカーの選択口と同じ）。
     pub fn supported() -> Self {
         let mut versions: BTreeMap<&'static str, BTreeSet<u32>> = BTreeMap::new();
         for (kind, vs) in SUPPORTED_KIND_VERSIONS {

@@ -236,8 +236,6 @@ impl SafetyLimits {
     };
 
     /// 追加学習の種類の値（60 秒・8 GiB）。
-    // 表へ行を足すのは kind 名を決める #424 の仕事。それまで表からは参照されない。
-    #[allow(dead_code)]
     const FINETUNE: Self = Self {
         time: TimeLimit(FINETUNE_INFER_TIME_LIMIT),
         memory: MemoryLimit(FINETUNE_INFER_RSS_LIMIT_BYTES),
@@ -246,12 +244,13 @@ impl SafetyLimits {
 
 /// kind → 安全上限の表（唯一の置き場）。
 ///
-/// 追加学習の kind 名・kind_version は #424（TASK-41.5-1）が決める。`KindAllowlist::supported()` に
-/// 足されたら照合テストが落ちるので、そのとき [`SafetyLimits::FINETUNE`] で行を足す。
-const KIND_SAFETY_LIMITS: [(&str, SafetyLimits); 3] = [
+/// 追加学習の種類 `qwen2_lora` は #424（TASK-41.5-1）で足し、[`SafetyLimits::FINETUNE`] を割り当てる。
+/// `KindAllowlist::supported()` に足したら、ここにも行を足す（照合テストが落ちる）。
+const KIND_SAFETY_LIMITS: [(&str, SafetyLimits); 4] = [
     ("c1", SafetyLimits::STRICT),
     ("c3", SafetyLimits::STRICT),
     ("autoregressive", SafetyLimits::STRICT),
+    ("qwen2_lora", SafetyLimits::FINETUNE),
 ];
 
 /// kind の安全上限を引く。完全一致のみで、表に無い kind は厳しい値（10 秒・2 GiB）に落ちる
@@ -1468,6 +1467,15 @@ mod tests {
             assert_eq!(l.time(), TimeLimit::infer_default());
             assert_eq!(l.memory(), MemoryLimit::infer_default());
         }
+    }
+
+    /// REQ-39・REQ-41・TASK-41.5-1・#424: `qwen2_lora` は追加学習の値（60 秒・8 GiB）。
+    #[test]
+    fn req41_qwen2_lora_uses_finetune_limits() {
+        let l = safety_limits_for_kind("qwen2_lora");
+        assert_eq!(l.time().get(), Duration::from_secs(60));
+        assert_eq!(l.memory().get(), 8_589_934_592);
+        assert_eq!(l, SafetyLimits::FINETUNE);
     }
 
     /// REQ-39・TASK-39.5-4・#578: 表に無い kind は厳しい値に落ちる。

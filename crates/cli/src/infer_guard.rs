@@ -43,9 +43,9 @@
 //! # 推論への接続（#136。`stages::infer`）
 //!
 //! - 返す [`PathFormatCheckedInputs::kind`] は許可リスト検査済みの `kind`。ランタイムの
-//!   `ModelKind::parse` へ写すこと。ガードの許可集合（`c1`・`c3`・`autoregressive`）はランタイムの
+//!   `ModelKind::parse` へ写すこと。ガードの許可集合（`c1`・`c3`・`autoregressive`・`qwen2_lora`）はランタイムの
 //!   対応（`c1`・`c3`）より広く、`autoregressive` はガードを通ってもランタイムで
-//!   `unsupported_kind` になる（別の層の検査。autoregressive の ONNX 推論は未着手）
+//!   `unsupported_kind` になる（別の層の検査。autoregressive の ONNX 推論は未着手。qwen2_lora の接続は #421）
 //! - `train`・`register` への `kind` 検査の統合は未了（#136）。両工程は下位層へ接続済みだが、
 //!   ガードの `KindAllowlist` は通していない（候補の `artifact.json` の `kind` 検査は
 //!   `stages::candidate_artifact` が担う）。`train` へ統合する際は学習ワーカー起動前に通すこと

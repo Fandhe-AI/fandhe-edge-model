@@ -31,7 +31,7 @@ from typing import IO, Any
 
 from .errors import WorkerError
 from .exitcode import ExitCode
-from .limits import MAX_MODEL_BYTES
+from .limits import max_model_bytes_for_kind
 
 #: 選択口（本ワーカー）のバージョン。artifact.json の再現性の記録に使う。
 SELECTOR_VERSION = "0.1"
@@ -55,11 +55,18 @@ DEFAULT_INPUT_REPRESENTATION = InputRepresentation.BYTE
 ONNX_FILE_NAME = "model.onnx"
 ARTIFACT_FILE_NAME = "artifact.json"
 
-#: `verify_output` が `model.onnx` を読み込む際の上限（bytes）。学習側で検証済みの
+#: `verify_output` が `model.onnx` を読み込む際の上限（bytes）の余裕分。
+#: 上限は kind ごと（#582）で、学習側で検証済みの
 #: `MAX_MODEL_BYTES`（パラメータ数からの見積もり）に、protobuf のオーバーヘッド分の
 #: 余裕を持たせる（「小さな余裕」。厳密な上限は学習側の `budget.check_model_bytes`
 #: が既に検査済みなので、ここでは異常な巨大ファイルを弾ければ十分）。
-_ONNX_READ_CAP_BYTES = MAX_MODEL_BYTES + 4 * 1024 * 1024
+_ONNX_READ_OVERHEAD_BYTES = 4 * 1024 * 1024
+
+
+def _onnx_read_cap_bytes(kind: object) -> int:
+    """kind ごとの書き出しモデル上限に余裕を足した読み込み上限（#582）。"""
+    return max_model_bytes_for_kind(kind) + _ONNX_READ_OVERHEAD_BYTES
+
 
 #: `artifact.json` 自体の読み込み上限（bytes）。メタデータのみで巨大にはならない
 #: ため、`limits.py::MAX_REQUEST_BYTES` と同じ桁数の暫定値を使う。
@@ -188,7 +195,7 @@ def _read_artifact_via_fd(dir_fd: int) -> Any:
         raise _integrity_error(f"artifact.json is not valid JSON: {type(e).__name__}") from e
 
 
-def _sha256_of_onnx_via_fd(dir_fd: int) -> str:
+def _sha256_of_onnx_via_fd(dir_fd: int, cap: int) -> str:
     """`dir_fd` 配下の `model.onnx` を `O_NOFOLLOW`・サイズ上限付きで読み、
     SHA-256（小文字 16 進数）を計算して返す。
     """
@@ -200,8 +207,8 @@ def _sha256_of_onnx_via_fd(dir_fd: int) -> str:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _integrity_error("model.onnx is not a regular file")
-        if st.st_size > _ONNX_READ_CAP_BYTES:
-            raise _integrity_error(f"model.onnx exceeds {_ONNX_READ_CAP_BYTES} bytes")
+        if st.st_size > cap:
+            raise _integrity_error(f"model.onnx exceeds {cap} bytes")
         hasher = hashlib.sha256()
         total = 0
         with os.fdopen(fd, "rb") as f:
@@ -210,12 +217,12 @@ def _sha256_of_onnx_via_fd(dir_fd: int) -> str:
                 # fstat 後にファイルが伸長されうる（TOCTOU）ため、実際の読み取り量も
                 # 上限で縛る。上限 +1 バイトまで読めた時点で超過として拒否する
                 # （REQ-39 ガード層: 資源の上限）。
-                chunk = f.read(min(1024 * 1024, _ONNX_READ_CAP_BYTES + 1 - total))
+                chunk = f.read(min(1024 * 1024, cap + 1 - total))
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > _ONNX_READ_CAP_BYTES:
-                    raise _integrity_error(f"model.onnx exceeds {_ONNX_READ_CAP_BYTES} bytes")
+                if total > cap:
+                    raise _integrity_error(f"model.onnx exceeds {cap} bytes")
                 hasher.update(chunk)
         return hasher.hexdigest()
     finally:
@@ -248,6 +255,6 @@ def verify_output(dir_fd: int) -> None:
     expected = artifact.get("onnx_sha256")
     if not isinstance(expected, str) or not expected:
         raise _integrity_error("artifact.json missing onnx_sha256")
-    actual = _sha256_of_onnx_via_fd(dir_fd)
+    actual = _sha256_of_onnx_via_fd(dir_fd, _onnx_read_cap_bytes(artifact.get("kind")))
     if actual != expected:
         raise _integrity_error("model.onnx sha256 mismatch")

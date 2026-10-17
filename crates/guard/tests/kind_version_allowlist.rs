@@ -23,7 +23,7 @@ fn req39_allowed_version_passes() {
 /// REQ-39・PoC-20 ケース 7: `kind_version: 99` は全 kind で拒否される。
 #[test]
 fn req39_version_99_is_rejected() {
-    for k in ["c1", "c3", "autoregressive"] {
+    for k in ["c1", "c3", "autoregressive", "qwen2_lora"] {
         let e = KindVersionAllowlist::supported()
             .check(checked(k), 99)
             .expect_err("rejected");
