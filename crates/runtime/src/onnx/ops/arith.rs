@@ -51,7 +51,7 @@ pub fn add_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<i64>, OpError>
 }
 
 /// 要素ごとの単項演算。
-fn map1(x: &Tensor<f32>, f: impl Fn(f32) -> f32) -> Result<Tensor<f32>, OpError> {
+pub(crate) fn map1(x: &Tensor<f32>, f: impl Fn(f32) -> f32) -> Result<Tensor<f32>, OpError> {
     Tensor::new(x.shape().to_vec(), x.data().iter().map(|&v| f(v)).collect())
 }
 
