@@ -113,6 +113,10 @@ pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, OpError> 
         return Err(OpError::ShapeMismatch);
     }
     let total = element_count(&out_shape)?;
+    // 空出力は計算不要。0 次元の隣に巨大次元があると m * k 等があふれるため、ここで返す（REQ-39）
+    if total == 0 {
+        return Tensor::new(out_shape, Vec::new());
+    }
     let nbatch = element_count(&batch)?;
     // 各入力は Tensor::new で上限検証済み、出力も上限内なので積はあふれない
     let (a_mat, b_mat, o_mat) = (m * k, k * n, m * n);
@@ -182,6 +186,10 @@ pub fn gemm_trans_b<W: Copy>(
         return Err(OpError::ShapeMismatch);
     }
     let total = element_count(&[m, n])?;
+    // 空出力は行ループを回さない（m が巨大でも n=0 なら無限に近い反復になるため。REQ-39）
+    if total == 0 {
+        return Tensor::new(vec![m, n], Vec::new());
+    }
     let mut out = Vec::with_capacity(total);
     for mi in 0..m {
         let arow = a
@@ -348,6 +356,26 @@ mod tests {
         let x = t(&[1 << 15, 1], vec![0.0; 1 << 15]);
         let y = t(&[1, 1 << 15], vec![0.0; 1 << 15]);
         assert_eq!(matmul(&x, &y), Err(OpError::LimitExceeded));
+    }
+
+    #[test]
+    fn req41_matmul_empty_output_with_huge_dim_does_not_overflow() {
+        // REQ-39: A=[0, MAX, 2]・B=[0, 2, 1] は m * k があふれる
+        let a = Tensor::new(vec![0, usize::MAX, 2], Vec::<f32>::new()).unwrap();
+        let b = Tensor::new(vec![0, 2, 1], Vec::<f32>::new()).unwrap();
+        let r = matmul(&a, &b).unwrap();
+        assert_eq!(r.shape(), &[0, usize::MAX, 1]);
+        assert!(r.data().is_empty());
+    }
+
+    #[test]
+    fn req41_gemm_empty_output_returns_immediately() {
+        // REQ-39: A=[MAX, 0]・W=[0, 0] は 0..m を回さない
+        let a = Tensor::new(vec![usize::MAX, 0], Vec::<f32>::new()).unwrap();
+        let w = Tensor::new(vec![0, 0], Vec::<f32>::new()).unwrap();
+        let r = gemm_trans_b(&a, &w, None, |v: f32| v).unwrap();
+        assert_eq!(r.shape(), &[usize::MAX, 0]);
+        assert!(r.data().is_empty());
     }
 
     #[test]
