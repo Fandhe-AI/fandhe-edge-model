@@ -1,0 +1,94 @@
+{
+  "status": "ok",
+  "artifact_dir": "/fandhe-edge-fixture-root/out",
+  "artifact": {
+    "kind": "qwen2_lora",
+    "kind_version": 1,
+    "selector_version": "0.1",
+    "config": {
+      "lora_rank": 8,
+      "lora_scale": 20.0,
+      "lora_dropout": 0.0,
+      "lora_num_layers": 8,
+      "lr": 0.0001,
+      "iters": 300,
+      "batch_size": 4,
+      "max_seq_length": 512,
+      "dtype": "bfloat16",
+      "base_model_dir": "base",
+      "base_model_sha256": {
+        "config.json": "1111111111111111111111111111111111111111111111111111111111111111",
+        "tokenizer.json": "2222222222222222222222222222222222222222222222222222222222222222",
+        "model.safetensors": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "base_model_name": "tiny-fixture",
+      "base_model_license": "MIT",
+      "base_model_origin": "https://example.com/tiny-fixture"
+    },
+    "label_order": [
+      "positive",
+      "negative"
+    ],
+    "output_type": "choice",
+    "max_bytes": 512,
+    "onnx_file": "model.onnx",
+    "onnx_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_utc": "2026-10-17T00:00:00Z",
+    "candidate_label": "qwen2_lora",
+    "input_representation": "tokenizer",
+    "tokenizer_file": "tokenizer.json",
+    "tokenizer_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "external_data": [
+      {
+        "location": "weights-00000.bin",
+        "size_bytes": 4096,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "scoring": {
+      "system_prompt": "Answer with exactly one of: positive, negative.",
+      "choices": [
+        {
+          "id": "positive",
+          "token_ids": [
+            10,
+            11,
+            5
+          ]
+        },
+        {
+          "id": "negative",
+          "token_ids": [
+            12,
+            5
+          ]
+        }
+      ]
+    },
+    "base_model": {
+      "files": [
+        {
+          "path": "config.json",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "size_bytes": 10
+        },
+        {
+          "path": "model.safetensors",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "size_bytes": 2000
+        },
+        {
+          "path": "tokenizer.json",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "size_bytes": 300
+        }
+      ],
+      "license": "MIT",
+      "model_name": "tiny-fixture",
+      "origin": "https://example.com/tiny-fixture"
+    }
+  },
+  "empty_input_ids": [
+    0
+  ]
+}

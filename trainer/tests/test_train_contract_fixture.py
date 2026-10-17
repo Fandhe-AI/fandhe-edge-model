@@ -68,6 +68,8 @@ _RESULT_CAP_CASES = _load_json_fixture("result_cap_cases.json")
 _REJECT_CASES = _load_json_fixture("request_reject_cases.json")
 _RESULT_OK = _load_json_fixture("result_ok.json")
 _RESULT_ERROR = _load_json_fixture("result_error.json")
+_REQUEST_QWEN2 = _load_json_fixture("request_qwen2_lora.json")
+_RESULT_OK_QWEN2 = _load_json_fixture("result_ok_qwen2_lora.json")
 
 
 def test_req39_limits_fixture_matches_python_constants() -> None:
@@ -303,6 +305,56 @@ def test_req21_build_artifact_matches_result_ok_fixture() -> None:
     )
     art["created_utc"] = expected["created_utc"]  # now_utc() は時刻依存のため固定する。
     assert art == expected
+
+
+def test_req41_build_artifact_with_extra_matches_qwen2_lora_fixture() -> None:
+    """REQ-41・TASK-41.6-3・#432: `build_artifact(extra=...)` が `result_ok_qwen2_lora.json` の
+    `artifact` と完全一致し、config は種類の既定値＋リクエストの config になる。
+    """
+    from fandhe_edge_trainer.kinds import qwen2_lora
+
+    expected = _RESULT_OK_QWEN2["artifact"]
+    keys = (
+        "input_representation",
+        "tokenizer_file",
+        "tokenizer_sha256",
+        "external_data",
+        "scoring",
+        "base_model",
+    )
+    extra = {k: expected[k] for k in keys}
+    art = artifact.build_artifact(
+        kind=expected["kind"],
+        kind_version=expected["kind_version"],
+        config=expected["config"],
+        label_order=expected["label_order"],
+        output_type=expected["output_type"],
+        max_bytes=expected["max_bytes"],
+        candidate_label=expected["candidate_label"],
+        onnx_sha256=expected["onnx_sha256"],
+        extra=extra,
+    )
+    art["created_utc"] = expected["created_utc"]
+    assert art == expected
+    assert expected["config"] == {**qwen2_lora.DEFAULT_CONFIG, **_REQUEST_QWEN2["config"]}
+    assert _RESULT_OK_QWEN2["empty_input_ids"] == encoding.encode_bytes("", expected["max_bytes"])
+
+
+def test_req41_build_artifact_rejects_unknown_extra_field() -> None:
+    """REQ-41・#432: 許可キー以外の追加欄は runtime_error。"""
+    with pytest.raises(WorkerError) as e:
+        artifact.build_artifact(
+            kind="c3",
+            kind_version=1,
+            config={},
+            label_order=["a"],
+            output_type="choice",
+            max_bytes=64,
+            candidate_label="c3",
+            onnx_sha256="0" * 64,
+            extra={"surprise": 1},
+        )
+    assert e.value.exit_code == ExitCode.RUNTIME_ERROR
 
 
 def test_req19_result_ok_config_matches_c3_default_merged_with_request_full() -> None:

@@ -114,6 +114,10 @@ def test_cli_train_success_emits_single_json_and_exit_0(tmp_path: Path) -> None:
     payload = json.loads(lines[0])
     assert payload["status"] == "ok"
     assert payload["artifact"]["kind"] == "c3"
+    # REQ-41・#432: byte 種類の artifact には tokenizer パッケージの欄を足さない。
+    assert not {"input_representation", "tokenizer_file", "external_data"} & set(
+        payload["artifact"]
+    )
     # REQ-23・TASK-23.2: 空入力の前処理結果（`encode_bytes("", max_bytes)` = `[0]`）を載せる。
     assert payload["empty_input_ids"] == [0]
     assert (out_dir / "artifact.json").exists()
@@ -262,7 +266,12 @@ def test_cli_train_qwen2_lora_out_of_range_config_exits_64_with_supported_range(
         "schema_version": 1,
         "kind": "qwen2_lora",
         "kind_version": 1,
-        "config": {"base_model_dir": "m", "base_model_sha256": {}, "lora_rank": 0},
+        "config": {
+            "base_model_dir": "m",
+            "base_model_sha256": {},
+            "base_model_name": "m",
+            "lora_rank": 0,
+        },
         "label_order": LABEL_ORDER,
         "max_bytes": 64,
         "seed": 0,

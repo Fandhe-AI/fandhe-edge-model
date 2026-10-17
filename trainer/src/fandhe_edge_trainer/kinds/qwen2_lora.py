@@ -9,14 +9,18 @@ chat template 形式で生成する損失で MLX 学習する。出力は選択�
 
 - `base_model_dir`: `request.root` からの相対パス（必須。経路は `guard.confine` が閉じ込める）
 - `base_model_sha256`: {ファイル名: sha256}（必須。照合は `load_base_model`）
+- `base_model_name`: 来歴の名前（必須）。`base_model_license`・`base_model_origin`: 任意
 
 seed は Python・NumPy・MLX のそれぞれで明示的に設定する（バッチ順は seed 付き permutation、
 LoRA の初期化は `mx.random.key(seed)`）。時間予算に達したら打ち切らず `limit_exceeded`（20）
 で止める。予測は選択肢の条件付き対数尤度の採点（`predict_records`。#427。長さ正規化なし）で、
 argmax を対応づけ (b)（`autoregressive.map_scores_to_choice`）で選択肢 ID に解決し、解決できない
 ものは `status:"error"`（判定不能）にする。ONNX の採点グラフと shard の書き出しは
-`qwen2_onnx.export_scoring_onnx`（#431）。`export_onnx`（Kind 契約）への接続と shard の
-artifact.json への記録は #432（未実装。`runtime_error`）で、CLI の `train` 全体はまだ完走しない。
+`qwen2_onnx.export_scoring_onnx`（#431）。`export_onnx`（Kind 契約）は `open_member` で shard と
+`tokenizer.json` を成果物ディレクトリへ作り、`artifact.json` へ足す追加欄（tokenizer・shard の
+sha256・選択肢表・ベースモデルの来歴）を返す（自己完結パッケージ。TASK-41.6-3・#432）。
+来歴の `base_model_name`（必須）・`base_model_license`・`base_model_origin`（任意。無ければ
+`null`。捏造しない）は種類固有の `config` で受ける。
 mlx は関数内で遅延 import する（選択口の import を軽く保つ）。
 """
 
@@ -24,7 +28,8 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import IO, Any
 
 import numpy as np
@@ -50,14 +55,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 #: 既定値を持たない必須項目（利用者ごとに異なるため `DEFAULT_CONFIG` に入れない）。
-_REQUIRED_FIELDS = ("base_model_dir", "base_model_sha256")
-_CONFIG_FIELDS = frozenset(DEFAULT_CONFIG) | frozenset(_REQUIRED_FIELDS)
+_REQUIRED_FIELDS = ("base_model_dir", "base_model_sha256", "base_model_name")
+#: 既定値を持たない任意項目（無ければ来歴は `null`）。
+_OPTIONAL_FIELDS = ("base_model_license", "base_model_origin")
+_CONFIG_FIELDS = (
+    frozenset(DEFAULT_CONFIG) | frozenset(_REQUIRED_FIELDS) | frozenset(_OPTIONAL_FIELDS)
+)
+#: 来歴文字列の上限（Rust data crate の `base_model` 検証と同じ規則）。
+_NAME_MAX, _LICENSE_MAX, _ORIGIN_MAX = 256, 256, 1024
 _DTYPES = ("bfloat16", "float32")
 
 #: 採点 1 回の forward に入れる選択肢の数（K が大きくてもメモリが線形に伸びない。PoC-26 と同値）
 SCORE_CHUNK = 8
-
-_NOT_IMPLEMENTED = "kind 'qwen2_lora' export_onnx is not wired to the CLI yet"
 
 
 def _invalid_config(message: str) -> WorkerError:
@@ -85,6 +94,28 @@ def _num_in(cfg: dict[str, Any], key: str, lo: float, hi: float, *, lo_open: boo
     return float(v)
 
 
+def _check_provenance_text(cfg: dict[str, Any]) -> None:
+    """来歴文字列の検査（ローカル絶対パス・資格情報の漏えいを防ぐ。REQ-40・REQ-39）。"""
+
+    def text(key: str, limit: int) -> str | None:
+        v = cfg.get(key)
+        if v is None and key != "base_model_name":
+            return None
+        if not isinstance(v, str) or not v or len(v.encode("utf-8")) > limit:
+            raise _invalid_config(f"config.{key} must be a non-empty string up to {limit} bytes")
+        if v != v.strip() or any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+            raise _invalid_config(f"config.{key} must not have control characters or edge spaces")
+        return v
+
+    text("base_model_name", _NAME_MAX)
+    text("base_model_license", _LICENSE_MAX)
+    origin = text("base_model_origin", _ORIGIN_MAX)
+    if origin is not None and (
+        not origin.startswith("https://") or any(c in origin for c in "@?# \\")
+    ):
+        raise _invalid_config("config.base_model_origin must be an https:// URL without @ ? #")
+
+
 def _validate_config(cfg: dict[str, Any]) -> None:
     """実効 config（既定値＋リクエスト）を検証する。違反は `invalid_config`（64）。"""
     unknown = set(cfg) - _CONFIG_FIELDS
@@ -100,6 +131,7 @@ def _validate_config(cfg: dict[str, Any]) -> None:
         raise _invalid_config("config.base_model_dir must be a non-empty string")
     if not isinstance(cfg["base_model_sha256"], dict):
         raise _invalid_config("config.base_model_sha256 must be an object")
+    _check_provenance_text(cfg)
     # 範囲検査は `apply_lora` と重複する。`apply_lora` は単体でも公開されるため残し、こちらは
     # ベース読み込み（重い処理）の前に弾くための早期検査として置く。
     _int_in(cfg, "lora_rank", 1, limits.MAX_LORA_RANK)
@@ -203,6 +235,9 @@ class Qwen2LoraTrainedModel:
     iters_done: int
     seed: int
     resource_budget: budget.ResourceBudget
+    #: 配布パッケージへ複写する `tokenizer.json` の照合済みバイト列と来歴用のサイズ（#432）
+    tokenizer_bytes: bytes = b""
+    base_file_sizes: dict[str, int] = field(default_factory=dict)
 
 
 def _build_sequences(
@@ -404,7 +439,7 @@ def predict_records(
 
 
 class Qwen2LoraKind:
-    """`Kind` プロトコルの実装。学習 #426・予測 #427・グラフ書き出し #431・CLI 接続 #432（未）。"""
+    """`Kind` プロトコルの実装。学習 #426・予測 #427・グラフ #431・パッケージ書き出し #432。"""
 
     def train(
         self,
@@ -479,13 +514,58 @@ class Qwen2LoraKind:
             iters_done=done,
             seed=request.seed,
             resource_budget=resource_budget,
+            tokenizer_bytes=base.tokenizer_bytes,
+            base_file_sizes=dict(base.file_sizes),
         )
 
-    def export_onnx(self, trained: Any, out: IO[bytes]) -> None:
-        """未接続（#432）。常に `runtime_error` を送出する。
+    def export_onnx(
+        self,
+        trained: Qwen2LoraTrainedModel,
+        out: IO[bytes],
+        open_member: Callable[[str], IO[bytes]] | None = None,
+    ) -> dict[str, Any]:
+        """自己完結パッケージを書く（TASK-41.6-3・#432）。
 
-        Kind 契約は単一ストリームだが、書き出しは model.onnx と複数の shard になる。グラフと
-        shard の書き出しは `qwen2_onnx.export_scoring_onnx`（#431）で、`_worker` の out_fd への
-        shard 作成と artifact.json への sha256 記録は #432 で扱う（実装済みを装わない）。
+        `out` へ model.onnx、`open_member` で外部データ shard と `tokenizer.json`（照合済みの
+        バイト列をそのまま複写）を作り、`artifact.json` の追加欄（tokenizer・shard の sha256、
+        選択肢表、ベースモデルの来歴）を返す。`open_member` が無ければ契約違反で `runtime_error`。
         """
-        raise WorkerError("runtime_error", _NOT_IMPLEMENTED, ExitCode.RUNTIME_ERROR)
+        if open_member is None:
+            raise WorkerError("runtime_error", "open_member is required", ExitCode.RUNTIME_ERROR)
+        from ..artifact import INPUT_REPRESENTATION_KEY, TOKENIZER_FILE_NAME, HashingWriter
+        from ..qwen2_onnx import export_scoring_onnx
+
+        shards = export_scoring_onnx(trained, out, open_member)
+        with open_member(TOKENIZER_FILE_NAME) as f:
+            tok_writer = HashingWriter(f)
+            tok_writer.write(trained.tokenizer_bytes)
+        cfg, order = trained.config, trained.label_order
+        token_ids = choice_token_ids(trained.tokenizer, order, trained.model.config.vocab_size)
+        return {
+            INPUT_REPRESENTATION_KEY: "tokenizer",
+            "tokenizer_file": TOKENIZER_FILE_NAME,
+            "tokenizer_sha256": tok_writer.hexdigest(),
+            "external_data": [
+                {"location": sh.name, "size_bytes": sh.size, "sha256": sh.sha256} for sh in shards
+            ],
+            "scoring": {
+                "system_prompt": _system_prompt(order),
+                "choices": [
+                    {"id": label, "token_ids": ids}
+                    for label, ids in zip(order, token_ids, strict=True)
+                ],
+            },
+            "base_model": {
+                "files": [
+                    {
+                        "path": name,
+                        "sha256": trained.base_file_sha256[name],
+                        "size_bytes": trained.base_file_sizes[name],
+                    }
+                    for name in sorted(trained.base_file_sha256)
+                ],
+                "license": cfg.get("base_model_license"),
+                "model_name": cfg["base_model_name"],
+                "origin": cfg.get("base_model_origin"),
+            },
+        }

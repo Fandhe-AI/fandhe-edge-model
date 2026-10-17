@@ -31,6 +31,7 @@ def _cfg(tmp_path: Path, **over) -> dict:
     return {
         "base_model_dir": d.name,
         "base_model_sha256": expected(d),
+        "base_model_name": "tiny-synthetic",
         "dtype": "float32",
         "iters": 3,
         "batch_size": 2,
@@ -188,11 +189,40 @@ def test_total_tokens_checked_before_encoding() -> None:
     assert e.value.exit_code == ExitCode.LIMIT_EXCEEDED
 
 
-def test_export_onnx_is_not_implemented() -> None:
-    """REQ-41・#431: export_onnx は未実装で runtime_error(70)。"""
+def test_export_onnx_requires_open_member() -> None:
+    """REQ-41・#432: open_member 無しの export_onnx は呼び出し契約違反で runtime_error(70)。"""
     with pytest.raises(WorkerError) as e:
         resolve_kind("qwen2_lora", 1).export_onnx(None, None)  # type: ignore[arg-type]
     assert e.value.exit_code == ExitCode.RUNTIME_ERROR
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"base_model_name": ""},
+        {"base_model_name": "a\nb"},
+        {"base_model_name": " x"},
+        {"base_model_license": 5},
+        {"base_model_origin": "http://example.com/m"},
+        {"base_model_origin": "https://user@example.com/m"},
+        {"base_model_origin": "https://example.com/m?token=1"},
+    ],
+)
+def test_provenance_config_is_validated(tmp_path: Path, over: dict) -> None:
+    """REQ-40・REQ-39・#432: 来歴の文字列（名前・license・origin）は不正なら invalid_config。"""
+    cfg = {**_cfg(tmp_path), **over}
+    with pytest.raises(WorkerError) as e:
+        q._validate_config({**DEFAULT_CONFIG, **cfg})
+    assert e.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_base_model_name_is_required(tmp_path: Path) -> None:
+    """REQ-40・#432: base_model_name が無ければ invalid_config。"""
+    cfg = {**DEFAULT_CONFIG, **_cfg(tmp_path)}
+    del cfg["base_model_name"]
+    with pytest.raises(WorkerError) as e:
+        q._validate_config(cfg)
+    assert e.value.exit_code == ExitCode.INVALID_INPUT
 
 
 def test_qwen2_lora_training_is_deterministic_on_cpu(tmp_path: Path) -> None:

@@ -26,6 +26,7 @@
 //! doc と同じ設計。詳細は [`expected_artifact_dir`]・
 //! [`canonicalize_root_best_effort`] 参照）。
 
+use fandhe_edge_core::artifact_meta::PackageInputRepresentation;
 use fandhe_edge_core::exitcode::ExitCode;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -95,7 +96,49 @@ impl Serialize for OnnxSha256 {
     }
 }
 
+/// 外部データ（shard）1 件の記録（`artifact.py` の `external_data[]`。REQ-41・TASK-41.6-3・#432）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalDataRecord {
+    pub location: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// `input_representation: tokenizer` の成果物が追加で持つ欄（REQ-41・TASK-41.6-3・#432）。
+///
+/// `scoring`（選択肢表）・`base_model`（来歴）は消費者が推論側（TASK-41.6-4 以降）のため、型を二重定義
+/// せず JSON のまま往復させる。`ArtifactRecord` へ `flatten` して直列化する。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TokenizerPackageRecord {
+    input_representation: &'static str,
+    tokenizer_file: String,
+    tokenizer_sha256: OnnxSha256,
+    external_data: Vec<ExternalDataRecord>,
+    scoring: serde_json::Value,
+    base_model: serde_json::Value,
+}
+
+impl TokenizerPackageRecord {
+    pub fn tokenizer_file(&self) -> &str {
+        &self.tokenizer_file
+    }
+    pub fn tokenizer_sha256(&self) -> &OnnxSha256 {
+        &self.tokenizer_sha256
+    }
+    pub fn external_data(&self) -> &[ExternalDataRecord] {
+        &self.external_data
+    }
+    pub fn scoring(&self) -> &serde_json::Value {
+        &self.scoring
+    }
+    pub fn base_model(&self) -> &serde_json::Value {
+        &self.base_model
+    }
+}
+
 /// 成功時の成果物記録（11 項目。`artifact.py::build_artifact` と同じ名前・型）。
+/// `qwen2_lora` のみ追加欄 [`TokenizerPackageRecord`] を持つ（既存の種類の直列化は不変）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArtifactRecord {
     kind: String,
@@ -109,9 +152,15 @@ pub struct ArtifactRecord {
     onnx_sha256: OnnxSha256,
     created_utc: String,
     candidate_label: String,
+    #[serde(flatten)]
+    tokenizer_package: Option<TokenizerPackageRecord>,
 }
 
 impl ArtifactRecord {
+    /// トークナイザー入力表現の追加欄（`byte` の種類は `None`）。
+    pub fn tokenizer_package(&self) -> Option<&TokenizerPackageRecord> {
+        self.tokenizer_package.as_ref()
+    }
     pub fn kind(&self) -> &str {
         &self.kind
     }
@@ -530,6 +579,82 @@ struct RawArtifact {
     onnx_sha256: String,
     created_utc: String,
     candidate_label: String,
+    // 以下は `qwen2_lora` だけが出す追加欄（REQ-41・#432）。`null` は欠落と区別して拒否する。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    input_representation: Option<PackageInputRepresentation>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    tokenizer_file: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    tokenizer_sha256: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    external_data: Option<Vec<ExternalDataRecord>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    scoring: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    base_model: Option<serde_json::Value>,
+}
+
+/// 追加欄の整合規則（fail-closed。REQ-41・REQ-39・#432）。`byte`（既定）に追加欄があれば拒否し、
+/// `tokenizer` なら全欄を要求する。
+fn parse_tokenizer_package(
+    raw: &mut RawArtifact,
+) -> Result<Option<TokenizerPackageRecord>, TrainResultError> {
+    let bad = |field| TrainResultError::MalformedArtifact { field };
+    let declared = raw.input_representation.unwrap_or_default();
+    if declared == PackageInputRepresentation::Byte {
+        let extra = raw.tokenizer_file.is_some()
+            || raw.tokenizer_sha256.is_some()
+            || raw.external_data.is_some()
+            || raw.scoring.is_some()
+            || raw.base_model.is_some();
+        return if extra {
+            Err(bad("input_representation"))
+        } else {
+            Ok(None)
+        };
+    }
+    let tokenizer_file = raw.tokenizer_file.take().ok_or(bad("tokenizer_file"))?;
+    if tokenizer_file != "tokenizer.json" {
+        return Err(bad("tokenizer_file"));
+    }
+    let tokenizer_sha256 =
+        OnnxSha256::parse(raw.tokenizer_sha256.take().ok_or(bad("tokenizer_sha256"))?)
+            .map_err(|_| bad("tokenizer_sha256"))?;
+    let external_data = raw.external_data.take().ok_or(bad("external_data"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for e in &external_data {
+        if !is_member_name(&e.location)
+            || ["artifact.json", "model.onnx", "tokenizer.json"].contains(&e.location.as_str())
+            || !seen.insert(e.location.as_str())
+        {
+            return Err(bad("external_data"));
+        }
+        OnnxSha256::parse(e.sha256.clone()).map_err(|_| bad("external_data"))?;
+    }
+    let scoring = raw.scoring.take().ok_or(bad("scoring"))?;
+    let base_model = raw.base_model.take().ok_or(bad("base_model"))?;
+    if !scoring.is_object() || !base_model.is_object() {
+        return Err(bad("scoring"));
+    }
+    Ok(Some(TokenizerPackageRecord {
+        input_representation: "tokenizer",
+        tokenizer_file,
+        tokenizer_sha256,
+        external_data,
+        scoring,
+        base_model,
+    }))
+}
+
+/// 成果物ディレクトリ内のファイル名の字句規則（runtime の外部データ `location` と同じ。
+/// 英数字・`.`・`_`・`-`、先頭 `.` 不可、128 バイト以下）。
+fn is_member_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// `created_utc` の構文検査（`YYYY-MM-DDTHH:MM:SSZ`。20 文字固定）。時刻と
@@ -734,7 +859,7 @@ impl TrainOutcome {
                 // 拒否する（REQ-21・REQ-39・P1。codex 指摘 PR #220）。
                 let (
                     Some(Some(artifact_dir)),
-                    Some(Some(raw_artifact)),
+                    Some(Some(mut raw_artifact)),
                     Some(Some(empty_input_ids)),
                     None,
                     None,
@@ -808,6 +933,7 @@ impl TrainOutcome {
                 if raw_artifact.max_bytes != request.max_bytes() {
                     return Err(TrainResultError::ArtifactMismatch { field: "max_bytes" });
                 }
+                let tokenizer_package = parse_tokenizer_package(&mut raw_artifact)?;
                 let label_order = LabelOrder::new(raw_artifact.label_order).map_err(|_| {
                     TrainResultError::MalformedArtifact {
                         field: "label_order",
@@ -867,6 +993,7 @@ impl TrainOutcome {
                         onnx_sha256,
                         created_utc: raw_artifact.created_utc,
                         candidate_label: raw_artifact.candidate_label,
+                        tokenizer_package,
                     }),
                     empty_input_ids,
                     validation_predictions,

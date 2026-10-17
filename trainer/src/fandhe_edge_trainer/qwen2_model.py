@@ -33,7 +33,7 @@ import math
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -745,6 +745,10 @@ class BaseModel:
     config: Qwen2Config
     file_sha256: dict[str, str]
     weight_bytes: int
+    #: 照合済みの `tokenizer.json` のバイト列そのもの（パッケージへ複写する。再読込しない。#432）
+    tokenizer_bytes: bytes = b""
+    #: 照合に使った各ファイルの大きさ（来歴の `size_bytes`。#432）
+    file_sizes: dict[str, int] = field(default_factory=dict)
 
 
 def load_base_model(
@@ -770,26 +774,24 @@ def load_base_model(
         raise _invalid_request("dtype must be float16, bfloat16 or float32")
     dir_fd = _open_dir(root, rel_dir)
     try:
-        config = Qwen2Config.from_bytes(
-            _read_member(
-                dir_fd,
-                CONFIG_NAME,
-                MAX_BASE_MODEL_CONFIG_BYTES,
-                CONFIG_NAME,
-                expected_sha256[CONFIG_NAME],
-                None,
-            )
+        config_bytes = _read_member(
+            dir_fd,
+            CONFIG_NAME,
+            MAX_BASE_MODEL_CONFIG_BYTES,
+            CONFIG_NAME,
+            expected_sha256[CONFIG_NAME],
+            None,
         )
-        tokenizer = Qwen2Tokenizer.from_bytes(
-            _read_member(
-                dir_fd,
-                TOKENIZER_NAME,
-                MAX_TOKENIZER_JSON_BYTES,
-                TOKENIZER_NAME,
-                expected_sha256[TOKENIZER_NAME],
-                None,
-            )
+        config = Qwen2Config.from_bytes(config_bytes)
+        tokenizer_bytes = _read_member(
+            dir_fd,
+            TOKENIZER_NAME,
+            MAX_TOKENIZER_JSON_BYTES,
+            TOKENIZER_NAME,
+            expected_sha256[TOKENIZER_NAME],
+            None,
         )
+        tokenizer = Qwen2Tokenizer.from_bytes(tokenizer_bytes)
         if tokenizer.max_id >= config.vocab_size:
             raise _invalid_config("tokenizer has ids outside config vocab_size")
         sizes: list[int] = []
@@ -840,4 +842,10 @@ def load_base_model(
         config=config,
         file_sha256=dict(expected_sha256),
         weight_bytes=sum(sizes),
+        tokenizer_bytes=tokenizer_bytes,
+        file_sizes={
+            CONFIG_NAME: len(config_bytes),
+            TOKENIZER_NAME: len(tokenizer_bytes),
+            **dict(zip(weight_names, sizes, strict=True)),
+        },
     )

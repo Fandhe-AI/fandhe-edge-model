@@ -563,3 +563,97 @@ fn eval_limits_match_train_and_core_limits() {
         fandhe_edge_core::judgment::MAX_INPUT_ID_BYTES
     );
 }
+
+/// REQ-41・TASK-41.6-3・#432: `qwen2_lora` の自己完結パッケージの結果 JSON（tokenizer・shard・
+/// 選択肢表・来歴の追加欄）を検証して受理し、同じ JSON へ往復できる。
+#[test]
+fn req41_result_ok_qwen2_lora_round_trips_tokenizer_package_fields() {
+    let request = TrainRequest::from_json_slice(&load_fixture_bytes("request_qwen2_lora.json"))
+        .expect("request_qwen2_lora.json must parse");
+    let line = String::from_utf8(load_fixture_bytes("result_ok_qwen2_lora.json"))
+        .unwrap()
+        .replace('\n', "");
+    let outcome = TrainOutcome::from_worker_stdout(line.as_bytes(), &request)
+        .expect("result_ok_qwen2_lora.json must parse and match the request");
+    let TrainOutcome::Ok(success) = &outcome else {
+        panic!("expected Ok");
+    };
+    let pkg = success
+        .artifact()
+        .tokenizer_package()
+        .expect("tokenizer package");
+    assert_eq!(pkg.tokenizer_file(), "tokenizer.json");
+    assert_eq!(pkg.external_data().len(), 1);
+    assert_eq!(pkg.external_data()[0].location, "weights-00000.bin");
+    assert_eq!(pkg.base_model()["model_name"], "tiny-fixture");
+    assert_eq!(
+        serde_json::to_value(&outcome).expect("serialize"),
+        load_fixture_value("result_ok_qwen2_lora.json")
+    );
+}
+
+/// 結果 JSON の `artifact` を壊す操作。
+type Mutation = Box<dyn Fn(&mut Value)>;
+
+/// REQ-41・REQ-39・#432: 追加欄の整合規則の違反は `MalformedArtifact` で拒否する（fail-closed）。
+#[test]
+fn req41_qwen2_lora_package_inconsistencies_are_rejected() {
+    let request = TrainRequest::from_json_slice(&load_fixture_bytes("request_qwen2_lora.json"))
+        .expect("request_qwen2_lora.json must parse");
+    let base = load_fixture_value("result_ok_qwen2_lora.json");
+    let remove = |key: &'static str| -> Mutation {
+        Box::new(move |a| {
+            a.as_object_mut().unwrap().remove(key);
+        })
+    };
+    let set =
+        |key: &'static str, value: Value| -> Mutation { Box::new(move |a| a[key] = value.clone()) };
+    let location = |value: &'static str| -> Mutation {
+        Box::new(move |a| a["external_data"][0]["location"] = value.into())
+    };
+    let cases: Vec<(&str, Mutation)> = vec![
+        ("tokenizer_sha256 missing", remove("tokenizer_sha256")),
+        (
+            "tokenizer_sha256 not hex",
+            set("tokenizer_sha256", "XYZ".into()),
+        ),
+        (
+            "tokenizer_file other name",
+            set("tokenizer_file", "other.json".into()),
+        ),
+        ("external_data null", set("external_data", Value::Null)),
+        ("location with slash", location("a/b")),
+        ("location traversal", location("..")),
+        ("location reserved", location("model.onnx")),
+        (
+            "location duplicated",
+            Box::new(|a| {
+                let first = a["external_data"][0].clone();
+                a["external_data"].as_array_mut().unwrap().push(first);
+            }),
+        ),
+        ("scoring missing", remove("scoring")),
+        ("base_model not object", set("base_model", "x".into())),
+        (
+            "byte with tokenizer fields",
+            set("input_representation", "byte".into()),
+        ),
+        (
+            "unknown representation",
+            set("input_representation", "bytes".into()),
+        ),
+        (
+            "representation null",
+            set("input_representation", Value::Null),
+        ),
+    ];
+    for (name, mutate) in cases {
+        let mut v = base.clone();
+        mutate(&mut v["artifact"]);
+        let line = serde_json::to_string(&v).unwrap();
+        assert!(
+            TrainOutcome::from_worker_stdout(line.as_bytes(), &request).is_err(),
+            "case `{name}` must be rejected"
+        );
+    }
+}
