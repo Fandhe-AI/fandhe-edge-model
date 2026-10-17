@@ -30,7 +30,7 @@ uv --no-config run --locked --directory trainer python tools/gen_qwen2_parity_fi
 ```
 
 - 生成環境: macOS arm64・CPU（`device="cpu"`）・mlx 0.32.2・onnx 1.23.0・numpy 2.5.3
-- seed: 学習・入力生成 20261017、ベース重み 11（標準偏差 1.0）。ラベルは 3 文字 8 種
+- seed: 学習データ生成 20261017（`data_seed`）、検証入力生成 20261018（`input_seed`。20261017+1）、学習リクエスト 0（`train_seed`）、ベース重み 11（標準偏差 1.0）。ラベルは 3 文字 8 種
 - 設定: `lora_rank=4`・`lora_num_layers=2`・`iters=20`・`lr=0.01`・`dtype=float32`
 - 通信なし（REQ-38）
 

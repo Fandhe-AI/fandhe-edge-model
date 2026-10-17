@@ -1,7 +1,9 @@
 {
  "_meta": {
   "kind": "qwen2_lora",
-  "seed": 20261017,
+  "data_seed": 20261017,
+  "input_seed": 20261018,
+  "train_seed": 0,
   "base_seed": 11,
   "weight_std": 1.0,
   "label_order": [

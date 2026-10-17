@@ -45,8 +45,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 1 件の計算時間の上限（REQ-39。C1・C3 と同じく共通コアの `limits::INFER_TIME_LIMIT` が出所）。
-const MAX_SCORING_DURATION: Duration = fandhe_edge_core::limits::INFER_TIME_LIMIT;
+/// 1 件の計算時間の暴走止め（REQ-39）。実効の予算は呼び出し側（guard の `qwen2_lora` は 60 秒）が
+/// `scores_limited` で渡す。素朴な実行器は 1.5B で 1 件約 199 秒かかるため、10 秒では完走できない。
+/// 共通コアの上限 `MAX_TIME_LIMIT` を暴走止めとする。
+const MAX_SCORING_DURATION: Duration = fandhe_edge_core::limits::MAX_TIME_LIMIT;
 /// グラフ出力の名前（書き出し器が固定）。
 const OUTPUT: &str = "probs";
 
@@ -274,26 +276,29 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
     Ok(op)
 }
 
-fn init_value(t: &super::proto::TensorProto) -> Result<Value, OnnxLoadError> {
-    let dims: Vec<usize> = t
-        .dims
+/// 重みの `Vec` は move で取り出す（clone すると bf16 約 3.1GB の読み込みで二重に確保される）。
+fn init_value(dims: &[i64], data: &mut TensorData) -> Result<Value, OnnxLoadError> {
+    let dims: Vec<usize> = dims
         .iter()
         .map(|&d| usize::try_from(d).map_err(|_| OnnxLoadError::UnsupportedTensor))
         .collect::<Result<_, _>>()?;
     let te = |_: OpError| OnnxLoadError::UnsupportedTensor;
-    Ok(match &t.data {
+    Ok(match data {
         TensorData::F32(v) if v.iter().all(|x| x.is_finite()) => {
-            Value::F32(Tensor::new(dims, v.clone()).map_err(te)?)
+            Value::F32(Tensor::new(dims, std::mem::take(v)).map_err(te)?)
         }
-        TensorData::I64(v) => Value::I64(Tensor::new(dims, v.clone()).map_err(te)?),
-        TensorData::Bf16(v) => Value::RawBf16(Arc::new(Tensor::new(dims, v.clone()).map_err(te)?)),
+        TensorData::I64(v) => Value::I64(Tensor::new(dims, std::mem::take(v)).map_err(te)?),
+        TensorData::Bf16(v) => {
+            Value::RawBf16(Arc::new(Tensor::new(dims, std::mem::take(v)).map_err(te)?))
+        }
         _ => return Err(OnnxLoadError::UnsupportedTensor),
     })
 }
 
 impl ScoringModel {
     /// 外部データ解決済みのグラフを照合して実行器にする（`resolve_external` の後に呼ぶ）。
-    pub(super) fn from_graph(graph: &GraphProto) -> Result<Self, OnnxLoadError> {
+    /// 重みは `graph` から move で取り出すため、呼び出し後の `graph` の initializer は空データになる。
+    pub(super) fn from_graph(graph: &mut GraphProto) -> Result<Self, OnnxLoadError> {
         let k = match graph.outputs.as_slice() {
             [o] if o.name == OUTPUT => match o.dims.as_slice() {
                 [Dim::Param(_), Dim::Value(k)] => {
@@ -309,11 +314,11 @@ impl ScoringModel {
         let mut slots: HashMap<&str, usize> = HashMap::new();
         let mut base: Vec<Option<Arc<Value>>> = Vec::new();
         // initializer（名前の重複は拒否）
-        for t in &graph.initializers {
+        for t in &mut graph.initializers {
             if slots.insert(t.name.as_str(), base.len()).is_some() {
                 return bad();
             }
-            base.push(Some(Arc::new(init_value(t)?)));
+            base.push(Some(Arc::new(init_value(&t.dims, &mut t.data)?)));
         }
         if slots.insert("ids", base.len()).is_some() {
             return bad();
@@ -396,7 +401,7 @@ impl ScoringModel {
             return Err(BackendError::InvalidSequenceLength);
         }
         let started = Instant::now();
-        // Instant が表せない巨大な期限は上限扱い（INFER_TIME_LIMIT より先は意味がない）
+        // Instant が表せない巨大な期限は上限扱い（MAX_TIME_LIMIT より先は意味がない）
         let until = started + limit;
         let mut f = Frame {
             vals: self.base.clone(),

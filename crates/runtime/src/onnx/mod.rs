@@ -323,7 +323,7 @@ impl OnnxBackend {
         external::resolve_external(&mut model.graph, shards, ext)?;
         let inner = match kind {
             ModelKind::Qwen2Lora => {
-                Inner::Scoring(scoring::ScoringModel::from_graph(&model.graph)?)
+                Inner::Scoring(scoring::ScoringModel::from_graph(&mut model.graph)?)
             }
             _ => return Err(OnnxLoadError::UnsupportedKind),
         };

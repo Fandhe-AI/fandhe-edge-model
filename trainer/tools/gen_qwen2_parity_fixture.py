@@ -209,7 +209,9 @@ def generate(out_dir: Path, overwrite: bool) -> None:
         )
     meta = {
         "kind": "qwen2_lora",
-        "seed": SEED,
+        "data_seed": SEED,
+        "input_seed": SEED + 1,
+        "train_seed": 0,
         "base_seed": BASE_SEED,
         "weight_std": WEIGHT_STD,
         "label_order": LABELS,
