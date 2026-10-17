@@ -254,3 +254,10 @@ commit-msg:
           echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
           exit 1
         fi
+        # 各行 100 文字以内（commitlint の header・body・footer の行長。UTF-16 単位で数える）。
+        # python3 が無い環境は警告してスキップ（CI の commitlint が検知する）
+        if command -v python3 >/dev/null 2>&1; then
+          python3 -I scripts/check_commit_msg_length.py {1} || exit 1
+        else
+          echo "warn: python3 not found; skipping line-length check (CI commitlint still checks it)" >&2
+        fi

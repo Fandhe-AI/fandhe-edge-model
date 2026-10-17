@@ -10,6 +10,8 @@
 
 `make lint-commits`（commitlint・`commitlint.config.mjs`）と CI の lint-docs（PR 時）で検証する。lefthook の commit-msg フックは `lefthook.yml` の追加後に有効になる。
 
+header・本文・footer の各行は 100 文字以内（commitlint。commit-msg フックでも検査）。
+
 ## type
 
 | type | 用途 |
