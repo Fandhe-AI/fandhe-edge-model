@@ -45,9 +45,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 1 件の計算時間の上限（C1・C3 の `MAX_INFER_DURATION` と同じ考え方の安全弁）。
-/// 実機の遅延目標は REQ-31 の別 TASK（#440・#442）で扱い、ここは暴走止めに留める。
-const MAX_SCORING_DURATION: Duration = Duration::from_secs(3600);
+/// 1 件の計算時間の上限（REQ-39。C1・C3 と同じく共通コアの `limits::INFER_TIME_LIMIT` が出所）。
+const MAX_SCORING_DURATION: Duration = fandhe_edge_core::limits::INFER_TIME_LIMIT;
 /// グラフ出力の名前（書き出し器が固定）。
 const OUTPUT: &str = "probs";
 
@@ -397,7 +396,7 @@ impl ScoringModel {
             return Err(BackendError::InvalidSequenceLength);
         }
         let started = Instant::now();
-        // Instant が表せない巨大な期限は上限扱い（暴走止めの 1 時間より先は意味がない）
+        // Instant が表せない巨大な期限は上限扱い（INFER_TIME_LIMIT より先は意味がない）
         let until = started + limit;
         let mut f = Frame {
             vals: self.base.clone(),
@@ -670,10 +669,12 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
         let (x, s) = (it.next(), it.next());
         // データは移動するだけで二重にならないので、入力は先に手放す
         f.release();
-        let (x, s) = (
-            own(x.ok_or(BackendError::Failed)?),
-            s.ok_or(BackendError::Failed)?,
-        );
+        let x = x.ok_or(BackendError::Failed)?;
+        // 他の消費者と共有中だと own() が全体を複製する。確保前に保持量へ合算して検査する（REQ-39）
+        if Arc::strong_count(&x) > 1 && f.live.saturating_add(value_bytes(&x)) > MAX_LIVE_BYTES {
+            return Err(BackendError::Failed);
+        }
+        let (x, s) = (own(x), s.ok_or(BackendError::Failed)?);
         let s = i64v(&s)?;
         return Ok(vec![if matches!(step.op, Op::Reshape) {
             same_type!(x, t => reshape(t, s))
