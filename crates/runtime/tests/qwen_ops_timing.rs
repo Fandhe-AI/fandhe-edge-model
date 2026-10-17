@@ -122,7 +122,7 @@ fn iv(v: &[i64]) -> Tensor<i64> {
 fn req41_qwen_ops_timing_at_1_5b_shapes() {
     let mut r: Vec<Row> = Vec::new();
     let g = |x: &Tensor<f32>, w: &Tensor<u16>, b: Option<&Tensor<f32>>| {
-        gemm_trans_b(x, w, b, bf16_to_f32)
+        gemm_trans_b(x, w, b, bf16_to_f32, None)
     };
 
     // 線形層（prefix は T 行、選択肢ブロックは K*M 行）。
@@ -190,7 +190,7 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
         &format!("[1,{NKV},{grp},{T},{HD}]x[1,{NKV},1,{HD},{T}]"),
         1,
         false,
-        || matmul(&q1, &k1),
+        || matmul(&q1, &k1, None),
     );
     let s1 = f32t(&[1, NKV, grp, T, T]);
     let v1 = f32t(&[1, NKV, 1, T, HD]);
@@ -200,7 +200,7 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
         &format!("[1,{NKV},{grp},{T},{T}]x[1,{NKV},1,{T},{HD}]"),
         1,
         false,
-        || matmul(&s1, &v1),
+        || matmul(&s1, &v1, None),
     );
     let s = T + M;
     let (q2, k2) = (f32t(&[K, NKV, grp, M, HD]), f32t(&[K, NKV, 1, HD, s]));
@@ -210,7 +210,7 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
         &format!("[{K},{NKV},{grp},{M},{HD}]x[{K},{NKV},1,{HD},{s}]"),
         1,
         false,
-        || matmul(&q2, &k2),
+        || matmul(&q2, &k2, None),
     );
     let (s2, v2) = (f32t(&[K, NKV, grp, M, s]), f32t(&[K, NKV, 1, s, HD]));
     bench(
@@ -219,7 +219,7 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
         &format!("[{K},{NKV},{grp},{M},{s}]x[{K},{NKV},1,{s},{HD}]"),
         1,
         false,
-        || matmul(&s2, &v2),
+        || matmul(&s2, &v2, None),
     );
     bench(
         &mut r,

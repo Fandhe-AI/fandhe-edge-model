@@ -405,9 +405,13 @@ impl ScoringModel {
             return Err(BackendError::InvalidSequenceLength);
         }
         let started = Instant::now();
+        // Instant が表せない巨大な期限は上限扱い（暴走止めの 1 時間より先は意味がない）
+        let until = started + limit;
         let mut f = Frame {
             vals: self.base.clone(),
             left: self.uses.clone(),
+            first_dyn: self.ids_slot,
+            live: 0,
         };
         debug_assert_eq!(f.vals.len(), self.n_slots);
         let t = Tensor::new(vec![1, ids.len()], ids.to_vec()).map_err(op_err)?;
@@ -416,13 +420,17 @@ impl ScoringModel {
             if started.elapsed() > limit {
                 return Err(BackendError::TimeLimitExceeded);
             }
-            let outs = exec(step, &mut f)?;
+            let outs = exec(step, &mut f, until)?;
             if outs.len() != step.outs.len() {
                 return Err(BackendError::Failed);
             }
             for (&slot, v) in step.outs.iter().zip(outs) {
-                *f.vals.get_mut(slot).ok_or(BackendError::Failed)? = Some(Arc::new(v));
+                f.store(slot, v, slot == self.out_slot)?;
             }
+        }
+        // 最終演算が期限を跨いだ場合も超過として返す
+        if started.elapsed() > limit {
+            return Err(BackendError::TimeLimitExceeded);
         }
         let out = f.vals.get(self.out_slot).and_then(|v| v.as_deref());
         match out {
@@ -435,6 +443,7 @@ impl ScoringModel {
 fn op_err(e: OpError) -> BackendError {
     match e {
         OpError::IndexOutOfRange => BackendError::InvalidTokenId,
+        OpError::DeadlineExceeded => BackendError::TimeLimitExceeded,
         _ => BackendError::Failed,
     }
 }
@@ -447,15 +456,53 @@ fn op<T>(r: Result<T, OpError>) -> Result<T, BackendError> {
 struct Frame {
     vals: Vec<Option<Arc<Value>>>,
     left: Vec<usize>,
+    /// これ以降のスロットは実行中に作る値（initializer は共有で数えない）。
+    first_dyn: usize,
+    /// 実行中に保持している値の合計バイト数。
+    live: usize,
+}
+
+/// 同時に保持する中間値の合計バイト数の上限（REQ-39。guard の RSS 上限 2 GiB と同じ桁）。
+const MAX_LIVE_BYTES: usize = 1 << 31;
+
+fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::F32(t) => t.data().len() * 4,
+        Value::F64(t) => t.data().len() * 8,
+        Value::I64(t) => t.data().len() * 8,
+        Value::Bool(t) => t.data().len(),
+        Value::RawBf16(t) | Value::LazyF32(t) => t.data().len() * 2,
+    }
 }
 
 impl Frame {
+    /// 値を表に置く。後の消費者がなく出力でもない値は保存せず、保持量が上限を超えるなら拒否する。
+    fn store(&mut self, slot: usize, v: Value, is_output: bool) -> Result<(), BackendError> {
+        let uses = self.left.get(slot).copied().ok_or(BackendError::Failed)?;
+        if uses == 0 && !is_output {
+            return Ok(());
+        }
+        let live = self.live.saturating_add(value_bytes(&v));
+        if live > MAX_LIVE_BYTES {
+            return Err(BackendError::Failed);
+        }
+        self.live = live;
+        *self.vals.get_mut(slot).ok_or(BackendError::Failed)? = Some(Arc::new(v));
+        Ok(())
+    }
+
     fn take(&mut self, slot: usize) -> Result<Arc<Value>, BackendError> {
         let left = self.left.get_mut(slot).ok_or(BackendError::Failed)?;
         *left = left.saturating_sub(1);
         let last = *left == 0;
         let cell = self.vals.get_mut(slot).ok_or(BackendError::Failed)?;
         let v = if last { cell.take() } else { cell.clone() };
+        if last
+            && slot >= self.first_dyn
+            && let Some(x) = &v
+        {
+            self.live = self.live.saturating_sub(value_bytes(x));
+        }
         v.ok_or(BackendError::Failed)
     }
 }
@@ -491,7 +538,7 @@ macro_rules! same_type {
     };
 }
 
-fn exec(step: &Step, f: &mut Frame) -> Result<Vec<Value>, BackendError> {
+fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, BackendError> {
     let mut a: Vec<Arc<Value>> = Vec::with_capacity(step.ins.len());
     for &i in &step.ins {
         a.push(f.take(i)?);
@@ -541,6 +588,7 @@ fn exec(step: &Step, f: &mut Frame) -> Result<Vec<Value>, BackendError> {
         Op::MatMul => one(Value::F32(op(matmul(
             f32v(arg(0)?)?.as_ref(),
             f32v(arg(1)?)?.as_ref(),
+            Some(until),
         ))?)),
         Op::Gemm => {
             let x = f32v(arg(0)?)?;
@@ -549,8 +597,8 @@ fn exec(step: &Step, f: &mut Frame) -> Result<Vec<Value>, BackendError> {
                 None => None,
             };
             let out = match arg(1)? {
-                Value::LazyF32(w) => gemm_trans_b(&x, w, c.as_deref(), bf16_to_f32),
-                Value::F32(w) => gemm_trans_b(&x, w, c.as_deref(), |v| v),
+                Value::LazyF32(w) => gemm_trans_b(&x, w, c.as_deref(), bf16_to_f32, Some(until)),
+                Value::F32(w) => gemm_trans_b(&x, w, c.as_deref(), |v| v, Some(until)),
                 _ => return Err(BackendError::Failed),
             };
             one(Value::F32(op(out)?))
@@ -646,5 +694,45 @@ fn exec(step: &Step, f: &mut Frame) -> Result<Vec<Value>, BackendError> {
         Op::LogSoftmax => one(Value::F32(op(log_softmax_last_axis(
             f32v(arg(0)?)?.as_ref(),
         ))?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame() -> Frame {
+        Frame {
+            vals: vec![None; 3],
+            left: vec![0, 1, 1],
+            first_dyn: 0,
+            live: 0,
+        }
+    }
+
+    fn f32s(n: usize) -> Value {
+        Value::F32(Tensor::new(vec![n], vec![0.0; n]).unwrap())
+    }
+
+    #[test]
+    fn req39_unused_intermediate_is_not_kept() {
+        let mut f = frame();
+        f.store(0, f32s(4), false).unwrap();
+        assert!(f.vals[0].is_none());
+        assert_eq!(f.live, 0);
+        f.store(0, f32s(4), true).unwrap();
+        assert!(f.vals[0].is_some());
+    }
+
+    #[test]
+    fn req39_live_bytes_are_capped_and_released() {
+        let mut f = frame();
+        f.store(1, f32s(8), false).unwrap();
+        assert_eq!(f.live, 32);
+        f.live = MAX_LIVE_BYTES;
+        assert_eq!(f.store(2, f32s(1), false), Err(BackendError::Failed));
+        f.live = 32;
+        f.take(1).unwrap();
+        assert_eq!(f.live, 0);
     }
 }
