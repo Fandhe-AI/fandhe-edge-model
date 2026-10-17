@@ -79,7 +79,8 @@ def _num_in(cfg: dict[str, Any], key: str, lo: float, hi: float, *, lo_open: boo
         except OverflowError:
             ok = False
     if not ok or v > hi or (v <= lo if lo_open else v < lo):
-        raise _invalid_config(f"config.{key} is out of range")
+        lb = "(" if lo_open else "["
+        raise _invalid_config(f"config.{key} must be a finite number in {lb}{lo}, {hi}]")
     return float(v)
 
 
@@ -87,7 +88,9 @@ def _validate_config(cfg: dict[str, Any]) -> None:
     """実効 config（既定値＋リクエスト）を検証する。違反は `invalid_config`（64）。"""
     unknown = set(cfg) - _CONFIG_FIELDS
     if unknown:
-        raise _invalid_config(f"unknown config fields: {len(unknown)} field(s)")
+        raise _invalid_config(
+            f"unknown config fields: {len(unknown)} field(s) (supported: {sorted(_CONFIG_FIELDS)})"
+        )
     for k in _REQUIRED_FIELDS:
         if k not in cfg:
             raise _invalid_config(f"config.{k} is required")
@@ -421,7 +424,10 @@ class Qwen2LoraKind:
         )
         c = base.config
         if cfg["max_seq_length"] > c.max_position_embeddings:
-            raise _invalid_config("max_seq_length exceeds the model's max_position_embeddings")
+            raise _invalid_config(
+                f"max_seq_length exceeds the model's max_position_embeddings "
+                f"({c.max_position_embeddings})"
+            )
         logits_elements = cfg["batch_size"] * cfg["max_seq_length"] * c.vocab_size
         if logits_elements > limits.MAX_LOSS_LOGITS_ELEMENTS:
             raise WorkerError(
