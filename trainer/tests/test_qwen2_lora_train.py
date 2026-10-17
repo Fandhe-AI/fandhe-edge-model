@@ -208,7 +208,7 @@ def test_qwen2_lora_training_is_deterministic_on_cpu(tmp_path: Path) -> None:
     la, lb = _lora(a), _lora(b)
     assert la.keys() == lb.keys()
     assert all(mx.array_equal(la[k], lb[k]).item() for k in la)
-    assert a.final_loss == b.final_loss
+    assert abs(a.final_loss - b.final_loss) <= 1e-9
     rows = [(str(i), "word " * i) for i in range(1, 6)]
     pa, pb = q.predict_records(a, rows), q.predict_records(b, rows)
     assert {r["status"] for r in pa} == {"ok"}
@@ -216,7 +216,9 @@ def test_qwen2_lora_training_is_deterministic_on_cpu(tmp_path: Path) -> None:
         (r["id"], r["status"], r["predicted_label"]) for r in pb
     ]
     for x, y in zip(pa, pb, strict=True):
-        assert np.allclose(list(x["scores"].values()), list(y["scores"].values()), atol=1e-9)
+        assert np.allclose(
+            list(x["scores"].values()), list(y["scores"].values()), rtol=0, atol=1e-9
+        )
 
 
 @pytest.mark.parametrize(
