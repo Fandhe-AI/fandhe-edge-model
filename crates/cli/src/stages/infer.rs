@@ -43,6 +43,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fandhe_edge_core::artifact_meta::{ArtifactMeta, PackageInputRepresentation};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
@@ -54,6 +55,7 @@ use fandhe_edge_core::stage_report::InferBatchReport;
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::{PathRejection, open_confined};
+use fandhe_edge_guard::resource::safety_limits_for_kind;
 use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
 use fandhe_edge_runtime::pipeline::InferencePipeline;
 use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
@@ -97,6 +99,8 @@ struct Prepared {
     pipeline: Pipeline,
     /// 定義の対象外ラベルとパッケージの校正（REQ-22・#478・#497）。
     scope: JudgmentScope,
+    /// 単件推論の協調的な期限（`kind` 別の安全上限の時間。REQ-39・TASK-41.8・#435）。
+    single_time: Duration,
 }
 
 /// `infer` を実行し、結果（または `ErrorReport`）を `out` へ書く。
@@ -132,6 +136,7 @@ pub fn run<W: Write>(out: &mut W, args: &InferArgs, cwd: &Path) -> io::Result<Ex
                 scope: &prepared.scope,
                 id: id.as_deref().unwrap_or(DEFAULT_TEXT_ID),
                 text,
+                duration: prepared.single_time,
             },
             Arc::new(prepared.pipeline),
         ),
@@ -456,6 +461,7 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         definition,
         pipeline,
         scope,
+        single_time: safety_limits_for_kind(checked.kind.as_str()).time().get(),
     })
 }
 

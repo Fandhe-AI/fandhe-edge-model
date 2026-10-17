@@ -229,8 +229,8 @@ impl SafetyLimits {
         self.memory
     }
 
-    /// 既存の厳しい値（10 秒・2 GiB）。表に無い kind の落ち先。
-    const STRICT: Self = Self {
+    /// 既存の厳しい値（10 秒・2 GiB）。表に無い kind の落ち先（`infer` の監督層も kind を読めないときの落ち先に使う）。
+    pub const STRICT: Self = Self {
         time: TimeLimit::infer_default(),
         memory: MemoryLimit::infer_default(),
     };
