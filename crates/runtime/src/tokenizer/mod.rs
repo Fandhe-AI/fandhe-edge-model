@@ -5,8 +5,19 @@
 //!
 //! 配布パッケージへ同梱するトークナイザー定義を、Python なしで推論ランタイムが使える形
 //! （[`TokenizerSpec`]）に検証つきで読み込む。前段の正規化と事前分割
-//! （NFC・Split 状態機械。`pretokenize`。#411）も持つ。呼び出し元は後続の BPE と chat template
-//! （#412）。BPE・golden 照合は未実装（それぞれ #412・#413）。
+//! （NFC・Split 状態機械。`pretokenize`。#411）、BPE（`bpe`）による [`TokenizerSpec::encode`] と
+//! chat template の id 列組み立て [`TokenizerSpec::build_chat_ids`]（#412）も持つ。
+//! 実物 `tokenizer.json` での golden 全件一致は未実装（#413）。
+//!
+//! # 特殊トークンと長さの上限（REQ-39）
+//!
+//! - `encode` は本文中の `<|im_start|>` 等を照合せず、ふつうの文字として扱う。特殊 id は
+//!   `build_chat_ids` だけが id で挿入する（本文によるプロンプト注入を塞ぐ）
+//! - 本文の上限は [`MAX_ENCODE_BYTES`]（NFC の前後）。超過は切り詰めず
+//!   [`TokenizeError::InputTooLong`]。`build_chat_ids` は区間ごとに encode するため、各区間が
+//!   この上限以下で、出力は区間のバイト数の合計で頭打ちになる
+//! - token 列長の上限（`max_seq_length`）は本モジュールでは持たない。学習側と同じく、採点・推論
+//!   工程が定義値と照合して拒否する
 //!
 //! 検証条件の参照実装は `trainer/tools/poc26/qwen2_tokenizer.py` の `Qwen2Tokenizer.__init__`・
 //! `_check_pipeline`（同じ条件・同じ順序）。対応範囲外の項目は黙って誤変換せず、対応範囲を示す
@@ -26,6 +37,7 @@
 //! エラーメッセージは英語で、入力中の token 文字列・キー名・値は載せない（security.md）。
 //! 依存は追加していない（JSON は [`json`] の自作。#409 のオーナー判断）。
 
+mod bpe;
 mod json;
 mod pretokenize;
 mod unicode_tables;
@@ -182,6 +194,8 @@ pub struct SpecialIds {
 /// （入力本文によるプロンプト注入を塞ぐ。参照実装と同じ方針。REQ-39）。
 pub struct TokenizerSpec {
     nfc: bool,
+    /// バイト値 -> 単一 byte 文字の token id（BPE の初期列。`from_bytes` で 1 回だけ作る）。
+    byte_ids: [u32; 256],
     vocab: HashMap<String, u32>,
     merges: MergeTable,
     added: HashMap<u32, String>,
@@ -274,8 +288,17 @@ impl TokenizerSpec {
         let (added, special) = build_added(&added_raw, id_limit, &vocab)?;
         let merges = build_merges(&merges_raw, &vocab)?;
 
+        let mut byte_ids = [0u32; 256];
+        let mut buf = [0u8; 4];
+        for (slot, c) in byte_ids.iter_mut().zip(bytes_to_unicode()) {
+            *slot = *vocab
+                .get(&*c.encode_utf8(&mut buf))
+                .ok_or_else(|| invalid("a byte-level character is missing from vocab"))?;
+        }
+
         Ok(Self {
             nfc,
+            byte_ids,
             vocab,
             merges,
             added,
@@ -288,6 +311,49 @@ impl TokenizerSpec {
     /// （REQ-41・#411）。入力が [`MAX_ENCODE_BYTES`] を超えれば [`TokenizeError::InputTooLong`]。
     pub fn pre_tokenize(&self, text: &str) -> Result<Vec<String>, TokenizeError> {
         pre_tokenize(text, self.nfc)
+    }
+
+    /// 本文を token id 列へ（pre_tokenize -> piece ごとの BPE）。特殊トークン文字列は照合しない。
+    /// 入力が [`MAX_ENCODE_BYTES`] を超えれば [`TokenizeError::InputTooLong`]（REQ-41・#412）。
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizeError> {
+        let mut ids = Vec::new();
+        for piece in self.pre_tokenize(text)? {
+            ids.extend(bpe::bpe(&piece, &self.byte_ids, &self.merges)?);
+        }
+        Ok(ids)
+    }
+
+    /// `<|im_start|>{role}\n{content}<|im_end|>\n` の連結（tools なし経路）を id 列で返す。
+    ///
+    /// 学習列（`assistant` が `Some`）と採点用 prompt（`None`: 末尾が生成プロンプト
+    /// `<|im_start|>assistant\n`）の共通の組み立て。参照実装は `qwen2_tokenizer.py` の
+    /// `build_chat_ids`。特殊トークンは id で挿入し、`role\ncontent` は 1 区間として encode する
+    /// （本文中の特殊文字列は特殊トークンにならない。REQ-39）。`max_seq_length` の照合は呼び出し側。
+    pub fn build_chat_ids(
+        &self,
+        system: &str,
+        user: &str,
+        assistant: Option<&str>,
+    ) -> Result<Vec<u32>, TokenizeError> {
+        let SpecialIds {
+            im_start, im_end, ..
+        } = self.special;
+        let mut ids = Vec::new();
+        let messages = [Some(("system", system)), Some(("user", user))]
+            .into_iter()
+            .chain([assistant.map(|a| ("assistant", a))])
+            .flatten();
+        for (role, content) in messages {
+            ids.push(im_start);
+            ids.extend(self.encode(&format!("{role}\n{content}"))?);
+            ids.push(im_end);
+            ids.extend(self.encode("\n")?);
+        }
+        if assistant.is_none() {
+            ids.push(im_start);
+            ids.extend(self.encode("assistant\n")?);
+        }
+        Ok(ids)
     }
 
     /// normalizer が NFC のとき true（null・キー無しなら false）。
@@ -322,7 +388,7 @@ impl TokenizerSpec {
 }
 
 /// GPT-2 の byte -> 可視 Unicode 文字の対応表（ByteLevel 前処理と同一。添字がバイト値）。
-/// 後続の BPE（#412）も使う。
+/// BPE の初期列（byte_ids。#412）も使う。
 pub fn bytes_to_unicode() -> [char; 256] {
     let mut out = ['\0'; 256];
     let mut extra = 0u32;

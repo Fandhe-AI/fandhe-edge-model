@@ -47,7 +47,7 @@
 //!   `select` 工程（`stages::select`）へは接続済み。`package` への配線は未着手
 //! - [`tokenizer`][]: Qwen2 系 `tokenizer.json`（byte-level BPE）の読み込みと検証（REQ-41・REQ-39・
 //!   TASK-41.4-2・#410）。std のみの自作 JSON パーサーで、サイズ・件数の上限と未対応項目の拒否を行う。
-//!   正規化と事前分割（#411）は実装済み。BPE と chat template（#412）・golden の全件一致（#413）は未実装
+//!   正規化と事前分割（#411）・BPE と chat template の id 列（#412）は実装済み。golden の全件一致（#413）は未実装
 //!
 //! TASK-28.1-2（#118）で、650 件の入力に対する単体・バッチ・評価器経路の予測ラベル全件一致
 //! テスト（`tests/full_match.rs`。証拠種別: テストハーネス）を追加した。650 件規模の実モデルでの再実行と
