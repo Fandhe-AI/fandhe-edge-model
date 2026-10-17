@@ -237,3 +237,11 @@ print(json.dumps(
 `worker terminated by signal N`・cpu 上限・監視失敗の各文言）から作成した
 （REQ-34・TASK-34.2・#146）。`crates/train/tests/worker_crash_message_fixture.rs` と
 `trainer/tests/test_supervisor.py` が接頭辞と分類を照合する。
+
+## `request_qwen2_lora.json`・`result_ok_qwen2_lora.json`
+
+手作成（ダミーの hex・極小の token 列。実モデル・実データなし）。`qwen2_lora` の自己完結
+パッケージ（`input_representation: tokenizer`・`tokenizer_*`・`external_data`・`scoring`・
+`base_model`。REQ-41・TASK-41.6-3・#432）の結果 JSON を、`crates/train/tests/
+train_contract_fixture.rs`（往復）と `trainer/tests/test_train_contract_fixture.py`
+（`build_artifact(extra=...)` との完全一致）が照合する。証拠種別: テストハーネス。

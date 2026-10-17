@@ -337,18 +337,19 @@ def run_worker_train(out_fd: int) -> ExitCode:
         # ONNX 本体・artifact.json は、スーパーバイザーが渡した一時ディレクトリの
         # fd（`out_fd`）へ、経路文字列を使わず dir_fd 相対で新規作成する
         # （TOCTOU 対策。O_EXCL で上書きしない）。
-        onnx_fd = os.open(
-            artifact_mod.ONNX_FILE_NAME,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=out_fd,
-        )
-        with os.fdopen(onnx_fd, "wb") as onnx_file:
+        # 追加ファイル（外部データ shard・tokenizer.json）も同じ作法で作る（`open_new_member`）。
+        with artifact_mod.open_new_member_unchecked(
+            out_fd, artifact_mod.ONNX_FILE_NAME
+        ) as onnx_file:
             # HashingWriter: model.onnx へ書き込んだ厳密なバイト列の SHA-256 を、
             # export_onnx 側を変更せずに計算する（P0: artifact.py モジュール
             # docstring・AGENTS.md ガード層「完全性と版」参照）。
             hashing_writer = artifact_mod.HashingWriter(onnx_file)
-            kind_impl.export_onnx(trained, hashing_writer)
+            extra = kind_impl.export_onnx(
+                trained,
+                hashing_writer,
+                open_member=lambda name: artifact_mod.open_new_member(out_fd, name),
+            )
         art = artifact_mod.build_artifact(
             kind=request.kind,
             kind_version=request.kind_version,
@@ -363,6 +364,7 @@ def run_worker_train(out_fd: int) -> ExitCode:
             max_bytes=trained.max_bytes,
             candidate_label=request.kind,
             onnx_sha256=hashing_writer.hexdigest(),
+            extra=extra,
         )
         artifact_mod.write_artifact(out_fd, art)
     finally:

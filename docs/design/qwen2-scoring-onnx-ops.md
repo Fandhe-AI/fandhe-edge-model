@@ -133,3 +133,28 @@
 - 件数: 層数 28（1.5B と同じ層構造・次元は極小・tie）でノード 3748・initializer 366（#581 の暫定上限 4096・1024 内）。1 層あたりのノードは prefix とブロックで約 130。件数は層数と tie の有無で決まる。証拠種別: テストハーネス
 - 設計からの変更: GatherElements の `axis` は ONNX 1.23 の ReferenceEvaluator が負の値を受けないため正の値で書く。ReferenceEvaluator の GatherElements は軸の長さが 64 を超えると失敗する（`np.choose` の制限）ため、テストでは同じ意味の `take_along_axis` に差し替える
 - 重みの置き場所: 閾値（1024 バイト）以上は shard `weights-NNNNN.bin`（1 テンソルは 1 shard に収める。1 GiB 超の単一テンソルは `limit_exceeded`。7B の非 tie の `lm_head` が該当し、除外の記録は #433）。小さな定数・重みは inline の `raw_data`
+
+## 9. 配布パッケージの構成（TASK-41.6-3・#432）
+
+`qwen2_lora` の成果物ディレクトリは、ベースモデルのディレクトリ無しで推論に必要なものが揃う。
+
+| ファイル | 内容 |
+| -------- | ---- |
+| `artifact.json` | 既存の 11 欄＋下表の追加欄 |
+| `model.onnx` | 採点グラフ（opset 13）。重みは外部データで shard を参照 |
+| `weights-NNNNN.bin` | 外部データ shard（1 件 1 GiB 以下・256 件以下） |
+| `tokenizer.json` | ベースモデルの `tokenizer.json` を、sha256 照合済みのバイト列のまま複写 |
+
+`artifact.json` の追加欄（`qwen2_lora` のみ。既存の種類の `artifact.json` は変えない）:
+
+| 欄 | 内容 |
+| -- | ---- |
+| `input_representation` | `tokenizer` |
+| `tokenizer_file`・`tokenizer_sha256` | `tokenizer.json` と sha256 |
+| `external_data[]` | shard ごとの `location`・`size_bytes`・`sha256` |
+| `scoring` | `system_prompt`（prefix 組み立て用の固定文）と `choices[]`（`id`・`token_ids`。ラベル token 列＋`<\|im_end\|>`） |
+| `base_model` | 来歴（`files[]`〔`path`・`sha256`・`size_bytes`〕・`license`・`model_name`・`origin`）。名前は必須、license・origin は任意（無ければ `null`。捏造しない） |
+
+- 完全性: `verify_output` が確定直前に `model.onnx`・`tokenizer.json`・全 shard の sha256 とサイズを照合する。記録された名前は字句規則（英数字と `._-`・先頭 `.` 不可・128 文字以下）と予約名で検査してから `dir_fd` 相対・`O_NOFOLLOW` で開く。Rust の `crates/train` は結果 JSON の追加欄を同じ規則で検証する
+- 受け入れテスト: `trainer/tests/test_qwen2_lora_package.py`（CLI で学習し、複写先で `tokenizer.json`・`scoring` から ONNX 推論して学習側の予測と一致）。証拠種別: テストハーネス（ReferenceEvaluator・CPU）
+- 範囲外: Rust の `package`・`infer` での受け入れは #434 以降（現状は `input_representation: tokenizer` を `invalid_input` で拒否）。`base_model_*` を CLI から渡す配線も後続

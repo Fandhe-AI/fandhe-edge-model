@@ -7,7 +7,7 @@
 依存しない）。
 
 新しい種類を追加する手順（拡張点。C3・C1・autoregressive はこの手順で追加済み。
-qwen2_lora は骨格のみ）:
+qwen2_lora も同様）:
 1. `kinds/<name>.py` に `Kind` プロトコル（`train`・`export_onnx`・既定 `config`）を実装する
 2. `_REGISTRY` へ `{"<name>": {<kind_version>: <クラス>}}` を追記する
 既存の種類の実装・共通コア・評価器の改変を要しない。
@@ -15,6 +15,7 @@ qwen2_lora は骨格のみ）:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import IO, Any, Protocol
 
 from .. import budget
@@ -55,7 +56,12 @@ class Kind(Protocol):
         """
         ...
 
-    def export_onnx(self, trained: TrainedModel, out: IO[bytes]) -> None:
+    def export_onnx(
+        self,
+        trained: TrainedModel,
+        out: IO[bytes],
+        open_member: Callable[[str], IO[bytes]] | None = None,
+    ) -> dict[str, Any] | None:
         """学習結果を ONNX として `out`（呼び出し元が開いた書き込み用バイナリファイル
         オブジェクト）へ書き出す。**経路は一切扱わない**: どこへ書き出すか
         （root 配下への閉じ込め・アトミックな確定）は呼び出し元（`cli.py`・
@@ -63,6 +69,11 @@ class Kind(Protocol):
         留める（TOCTOU を避けるための dir_fd ベースの経路解決を、種類ごとの
         実装へ複製しない。推論ランタイムとの ONNX 形式の契約は runtime-builder
         と共有する）。
+
+        `open_member(name)` は呼び出し元（`cli.py`）が渡す「成果物ディレクトリに `name` の
+        ファイルを新規作成して返す」関数で、`model.onnx` 以外のファイル（外部データ shard・
+        `tokenizer.json`。`qwen2_lora`。#432）を作る種類だけが使う。戻り値は `artifact.json` へ
+        足す追加欄（無ければ `None`）。経路は引き続き種類側で扱わない。
         """
         ...
 

@@ -15,6 +15,13 @@ artifact.rs`）とフィールド名・型を揃える。本ワーカーは C3 �
 実際に読み込む側（推論ランタイム・パッケージ層。REQ-39 の完全性・TASK-28・
 TASK-30.x）が、読み込み時にこの `onnx_sha256` を検証する契約は別途そちら側の
 責務とする（本モジュールはハッシュを記録するところまでを担う）。
+
+**自己完結パッケージ（`qwen2_lora`。REQ-41・TASK-41.6-3・#432）**: 成果物ディレクトリは
+`artifact.json`・`model.onnx`・外部データ shard（`weights-NNNNN.bin`）・`tokenizer.json`
+で、推論に必要なものがベースモデルのディレクトリ無しで揃う。`artifact.json` に追加欄
+（`input_representation: tokenizer`・`tokenizer_file`・`tokenizer_sha256`・`external_data`・
+`scoring`・`base_model`）を足し、`verify_output` が tokenizer と全 shard の sha256 も照合する。
+追加ファイルは `open_new_member`（`Kind.export_onnx` の `open_member`）で作る。
 """
 
 from __future__ import annotations
@@ -54,6 +61,29 @@ DEFAULT_INPUT_REPRESENTATION = InputRepresentation.BYTE
 
 ONNX_FILE_NAME = "model.onnx"
 ARTIFACT_FILE_NAME = "artifact.json"
+TOKENIZER_FILE_NAME = "tokenizer.json"
+
+#: 種類が `open_member` で作ってはならない名前（本モジュールが別経路で作る）。
+_RESERVED_MEMBER_NAMES = frozenset({ARTIFACT_FILE_NAME, ONNX_FILE_NAME})
+
+#: `tokenizer.json` を読む上限（`qwen2_model.MAX_TOKENIZER_JSON_BYTES` と同じ 16 MiB）。
+_TOKENIZER_READ_CAP_BYTES = 16 * 1024 * 1024
+
+#: shard 1 件の読み込み上限（`qwen2_onnx.SHARD_MAX_BYTES` と同じ 1 GiB）。
+_SHARD_READ_CAP_BYTES = 1 << 30
+
+#: 種類が `build_artifact(extra=...)` で足してよい欄（`qwen2_lora`。REQ-41・TASK-41.6-3・#432）。
+_EXTRA_KEYS = frozenset(
+    {
+        INPUT_REPRESENTATION_KEY,
+        "tokenizer_file",
+        "tokenizer_sha256",
+        "external_data",
+        "scoring",
+        "base_model",
+    }
+)
+_MEMBER_NAME_MAX = 128
 
 #: `verify_output` が `model.onnx` を読み込む際の上限（bytes）の余裕分。
 #: 上限は kind ごと（#582）で、学習側で検証済みの
@@ -99,6 +129,36 @@ class HashingWriter:
         return self._hasher.hexdigest()
 
 
+def is_member_name(name: object) -> bool:
+    """成果物ディレクトリ内のファイル名の字句規則（Rust runtime の外部データ `location` と同じ）。
+
+    英数字・`.`・`_`・`-` のみ、先頭 `.` 不可、128 文字以下。経路区切りや `..` を含められない。
+    """
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= _MEMBER_NAME_MAX
+        and not name.startswith(".")
+        and all(c.isascii() and (c.isalnum() or c in "._-") for c in name)
+    )
+
+
+def open_new_member(out_fd: int, name: str) -> IO[bytes]:
+    """`out_fd` 配下に `name` を新規作成して書き込み用で返す（`export_onnx` の `open_member`）。
+
+    種類側は経路を扱わない契約のため、`dir_fd` 相対・`O_CREAT|O_EXCL|O_NOFOLLOW` の作成は
+    ここに集約する（TOCTOU 対策）。字句規則外・予約名（`artifact.json`・`model.onnx`）は拒否する。
+    """
+    if not is_member_name(name) or name in _RESERVED_MEMBER_NAMES:
+        raise WorkerError("runtime_error", "invalid package member name", ExitCode.RUNTIME_ERROR)
+    return open_new_member_unchecked(out_fd, name)
+
+
+def open_new_member_unchecked(out_fd: int, name: str) -> IO[bytes]:
+    """予約名の検査なしで新規作成する（`model.onnx` を作る `cli.py` 専用）。"""
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=out_fd)
+    return os.fdopen(fd, "wb")
+
+
 def build_artifact(
     *,
     kind: str,
@@ -109,10 +169,18 @@ def build_artifact(
     max_bytes: int,
     candidate_label: str,
     onnx_sha256: str,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Rust 側 `Artifact` 構造体と同じフィールドに `onnx_sha256`（拡張。本モジュール
     のドキュメント参照）を加えた辞書を作る。
+
+    `extra` は種類が `export_onnx` の戻り値として返す追加欄（`qwen2_lora` の tokenizer・
+    shard・選択肢表・来歴。#432）。許可キー以外・既存欄との衝突は `runtime_error`。
     """
+    if extra and not set(extra) <= _EXTRA_KEYS:
+        raise WorkerError(
+            "runtime_error", "unexpected artifact extra field", ExitCode.RUNTIME_ERROR
+        )
     return {
         "kind": kind,
         "kind_version": kind_version,
@@ -125,6 +193,7 @@ def build_artifact(
         "onnx_sha256": onnx_sha256,
         "created_utc": now_utc(),
         "candidate_label": candidate_label,
+        **(extra or {}),
     }
 
 
@@ -195,20 +264,25 @@ def _read_artifact_via_fd(dir_fd: int) -> Any:
         raise _integrity_error(f"artifact.json is not valid JSON: {type(e).__name__}") from e
 
 
-def _sha256_of_onnx_via_fd(dir_fd: int, cap: int) -> str:
-    """`dir_fd` 配下の `model.onnx` を `O_NOFOLLOW`・サイズ上限付きで読み、
-    SHA-256（小文字 16 進数）を計算して返す。
+def _sha256_of_member_via_fd(
+    dir_fd: int, name: str, cap: int, expected_size: int | None = None
+) -> str:
+    """`dir_fd` 配下の `name` を `O_NOFOLLOW`・サイズ上限付きで読み、SHA-256 を返す。
+
+    `expected_size` があれば実サイズ・読み取り量の一致も確認する。名前の字句検査は呼び出し側。
     """
     try:
-        fd = os.open(ONNX_FILE_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     except OSError as e:
-        raise _integrity_error(f"model.onnx not readable: {type(e).__name__}") from e
+        raise _integrity_error(f"{name} not readable: {type(e).__name__}") from e
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise _integrity_error("model.onnx is not a regular file")
+            raise _integrity_error(f"{name} is not a regular file")
         if st.st_size > cap:
-            raise _integrity_error(f"model.onnx exceeds {cap} bytes")
+            raise _integrity_error(f"{name} exceeds {cap} bytes")
+        if expected_size is not None and st.st_size != expected_size:
+            raise _integrity_error(f"{name} size mismatch")
         hasher = hashlib.sha256()
         total = 0
         with os.fdopen(fd, "rb") as f:
@@ -222,13 +296,61 @@ def _sha256_of_onnx_via_fd(dir_fd: int, cap: int) -> str:
                     break
                 total += len(chunk)
                 if total > cap:
-                    raise _integrity_error(f"model.onnx exceeds {cap} bytes")
+                    raise _integrity_error(f"{name} exceeds {cap} bytes")
                 hasher.update(chunk)
+        if expected_size is not None and total != expected_size:
+            raise _integrity_error(f"{name} size mismatch")
         return hasher.hexdigest()
     finally:
         if fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def _is_hex64(v: object) -> bool:
+    return isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+
+
+def _verify_tokenizer_package(dir_fd: int, artifact: Mapping[str, Any], tokenizer: bool) -> None:
+    """トークナイザー入力表現の追加欄と実ファイルを照合する（#432）。
+
+    `byte` に追加欄があれば拒否し、`tokenizer` なら tokenizer と全 shard の存在・大きさ・
+    sha256 を確かめる。記録された名前は字句規則を通してから開く（経路の閉じ込め）。
+    """
+    if not tokenizer:
+        if _EXTRA_KEYS.intersection(artifact) - {INPUT_REPRESENTATION_KEY}:
+            raise _integrity_error("byte package has tokenizer package fields")
+        return
+    if artifact.get("tokenizer_file") != TOKENIZER_FILE_NAME or not _is_hex64(
+        artifact.get("tokenizer_sha256")
+    ):
+        raise _integrity_error("artifact.json tokenizer fields are invalid")
+    actual = _sha256_of_member_via_fd(dir_fd, TOKENIZER_FILE_NAME, _TOKENIZER_READ_CAP_BYTES)
+    if actual != artifact["tokenizer_sha256"]:
+        raise _integrity_error("tokenizer.json sha256 mismatch")
+    shards = artifact.get("external_data")
+    if not isinstance(shards, list) or not isinstance(artifact.get("scoring"), dict):
+        raise _integrity_error("artifact.json external_data or scoring is invalid")
+    if not isinstance(artifact.get("base_model"), dict):
+        raise _integrity_error("artifact.json base_model is invalid")
+    seen: set[str] = set()
+    for item in shards:
+        loc = item.get("location") if isinstance(item, dict) else None
+        size = item.get("size_bytes") if isinstance(item, dict) else None
+        digest = item.get("sha256") if isinstance(item, dict) else None
+        if (
+            not is_member_name(loc)
+            or loc in seen
+            or loc in _RESERVED_MEMBER_NAMES
+            or loc == TOKENIZER_FILE_NAME
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or not _is_hex64(digest)
+        ):
+            raise _integrity_error("artifact.json external_data entry is invalid")
+        seen.add(loc)
+        if _sha256_of_member_via_fd(dir_fd, loc, _SHARD_READ_CAP_BYTES, size) != digest:
+            raise _integrity_error("external data sha256 mismatch")
 
 
 def verify_output(dir_fd: int) -> None:
@@ -249,12 +371,15 @@ def verify_output(dir_fd: int) -> None:
     if not isinstance(artifact, dict):
         raise _integrity_error("artifact.json is not a JSON object")
     try:
-        parse_input_representation(artifact)
+        representation = parse_input_representation(artifact)
     except ValueError:
         raise _integrity_error("artifact.json input_representation is invalid") from None
     expected = artifact.get("onnx_sha256")
     if not isinstance(expected, str) or not expected:
         raise _integrity_error("artifact.json missing onnx_sha256")
-    actual = _sha256_of_onnx_via_fd(dir_fd, _onnx_read_cap_bytes(artifact.get("kind")))
+    actual = _sha256_of_member_via_fd(
+        dir_fd, ONNX_FILE_NAME, _onnx_read_cap_bytes(artifact.get("kind"))
+    )
     if actual != expected:
         raise _integrity_error("model.onnx sha256 mismatch")
+    _verify_tokenizer_package(dir_fd, artifact, representation is InputRepresentation.TOKENIZER)

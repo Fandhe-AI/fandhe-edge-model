@@ -47,7 +47,7 @@ docstring 末尾・`_export_c1_onnx` 参照）。学習側の numpy 特徴量計
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -700,10 +700,16 @@ class C1Kind:
             resource_budget=resource_budget,
         )
 
-    def export_onnx(self, trained: C1TrainedModel, out: IO[bytes]) -> None:
+    def export_onnx(
+        self,
+        trained: C1TrainedModel,
+        out: IO[bytes],
+        open_member: Callable[[str], IO[bytes]] | None = None,
+    ) -> dict[str, Any] | None:
         if trained.resource_budget is not None:
             trained.resource_budget.check()
         _export_c1_onnx(trained, out)
+        return None  # 追加欄なし（byte 入力表現。#432）
 
 
 def predict_labels(

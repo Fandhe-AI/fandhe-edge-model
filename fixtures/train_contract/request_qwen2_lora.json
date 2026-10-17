@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "kind": "qwen2_lora",
+  "kind_version": 1,
+  "config": {
+    "base_model_dir": "base",
+    "base_model_sha256": {
+      "config.json": "1111111111111111111111111111111111111111111111111111111111111111",
+      "tokenizer.json": "2222222222222222222222222222222222222222222222222222222222222222",
+      "model.safetensors": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "base_model_name": "tiny-fixture",
+    "base_model_license": "MIT",
+    "base_model_origin": "https://example.com/tiny-fixture"
+  },
+  "label_order": [
+    "positive",
+    "negative"
+  ],
+  "max_bytes": 512,
+  "seed": 7,
+  "device": "cpu",
+  "root": "/fandhe-edge-fixture-root",
+  "train_path": "train.jsonl",
+  "out_dir": "out",
+  "time_limit_seconds": 600,
+  "rss_limit_bytes": 1073741824
+}

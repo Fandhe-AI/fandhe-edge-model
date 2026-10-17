@@ -141,7 +141,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import IO, Any
@@ -1372,10 +1372,16 @@ class AutoregressiveKind:
             resource_budget=resource_budget,
         )
 
-    def export_onnx(self, trained: AutoregressiveTrainedModel, out: IO[bytes]) -> None:
+    def export_onnx(
+        self,
+        trained: AutoregressiveTrainedModel,
+        out: IO[bytes],
+        open_member: Callable[[str], IO[bytes]] | None = None,
+    ) -> dict[str, Any] | None:
         if trained.resource_budget is not None:
             trained.resource_budget.check()
         _export_ar_onnx(trained, out)
+        return None  # 追加欄なし（byte 入力表現。#432）
 
 
 def _f32(arr: np.ndarray, name: str) -> TensorProto:

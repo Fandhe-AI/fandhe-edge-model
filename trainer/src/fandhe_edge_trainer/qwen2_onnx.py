@@ -9,8 +9,9 @@
 
 重みは 1 テンソルずつ `W' = W + scale * (A @ B).T`（f32）で統合して bf16（RNE）にし、閾値以上は
 外部データの shard（`weights-NNNNN.bin`）へ逐次書く。全量を同時には持たない。shard 名・
-sha256 の記録（artifact.json）は #432、範囲外構成の除外理由の記録は #433、Rust ランタイムとの
-全件一致は #434 の担当で、本モジュールは model.onnx と shard を呼び出し側のストリームへ書くだけ。
+sha256 の記録（artifact.json）は `Qwen2LoraKind.export_onnx`（#432）、範囲外構成の除外理由の
+記録は #433、Rust ランタイムとの全件一致は #434 の担当で、本モジュールは model.onnx と
+shard を呼び出し側のストリームへ書くだけ。
 経路は扱わない（書き込み先は `out` と `open_shard` が返すストリームのみ）。通信しない（REQ-38）。
 """
 
@@ -44,7 +45,7 @@ _INT64_MAX = (1 << 63) - 1
 
 @dataclass(frozen=True)
 class ShardInfo:
-    """書き出した shard 1 件。sha256 の artifact.json への記録は #432。"""
+    """書き出した shard 1 件。artifact.json への記録は `Qwen2LoraKind.export_onnx`（#432）。"""
 
     name: str
     size: int
@@ -280,8 +281,9 @@ def export_scoring_onnx(
     """採点グラフ（model.onnx）を `out` へ、外部データを `open_shard(name)` のストリームへ書く。
 
     `open_shard` が返すストリームは本関数が閉じる。返す `ShardInfo`（名前・大きさ・sha256）の
-    記録は呼び出し側（#432）の責務。上限超過（推定サイズ・1 テンソルが shard 上限超・shard 件数）は
-    書く前または書き始めに `limit_exceeded`（20）、非有限の重みは `runtime_error`（70）。
+    記録は呼び出し側（`Qwen2LoraKind.export_onnx`。#432）の責務。上限超過（推定サイズ・
+    1 テンソルが shard 上限超・shard 件数）は書く前または書き始めに `limit_exceeded`（20）、
+    非有限の重みは `runtime_error`（70）。
     """
     model, tok, order = trained.model, trained.tokenizer, trained.label_order
     c = model.config
