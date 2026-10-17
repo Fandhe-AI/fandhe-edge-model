@@ -261,17 +261,39 @@ fn req39_external_range_rejected() {
 
 #[test]
 fn req39_external_malformed_reference_rejected_at_decode() {
-    let base = || ext_tensor("w", &[1], 1, "a.bin", 0, 4);
+    // エントリ数上限（3）に当たる前に目的の検証へ届くよう、location・length に追加 1 件の計 3 件で組む
+    let build = |extra: (&str, &str)| {
+        [
+            field_varint(1, 1),
+            field_varint(2, 1),
+            entry("location", "a.bin"),
+            entry("length", "4"),
+            entry(extra.0, extra.1),
+            field_varint(14, 1),
+        ]
+        .concat()
+    };
+    let with = |extra: (&str, &str)| decode(&[build(extra)], &FT).unwrap_err().code();
     // length が次元と合わない
     assert!(decode(&[ext_tensor("w", &[2], 1, "a.bin", 0, 7)], &FT).is_err());
     // 未知の key（checksum）
-    assert!(decode(&[[base(), entry("checksum", "00")].concat()], &FT).is_err());
+    assert_eq!(with(("checksum", "00")), "unsupported_tensor");
     // 重複 key
-    assert!(decode(&[[base(), entry("offset", "0")].concat()], &FT).is_err());
+    assert_eq!(with(("length", "4")), "unsupported_tensor");
     // 非数の offset
-    assert!(decode(&[[base(), entry("offset", "-1")].concat()], &FT).is_err());
+    assert_eq!(with(("offset", "-1")), "unsupported_tensor");
+    // 正常系（同じ組み立てで offset が数なら通る）
+    assert!(decode(&[build(("offset", "0"))], &FT).is_ok());
+    // エントリ数上限超過は別経路で拒否される
+    let base = ext_tensor("w", &[1], 1, "a.bin", 0, 4);
+    assert_ne!(
+        decode(&[[base.clone(), entry("checksum", "00")].concat()], &FT)
+            .unwrap_err()
+            .code(),
+        "unsupported_tensor"
+    );
     // raw_data との併用
-    assert!(decode(&[[base(), field_len(9, &[0; 4])].concat()], &FT).is_err());
+    assert!(decode(&[[base.clone(), field_len(9, &[0; 4])].concat()], &FT).is_err());
     // data_location だけ
     let t = [field_varint(1, 1), field_varint(2, 1), field_varint(14, 1)].concat();
     assert!(decode(&[t], &FT).is_err());
