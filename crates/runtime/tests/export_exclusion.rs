@@ -77,7 +77,7 @@ fn parity_cases<'a>(f: &'a Fixture, labels: &[usize]) -> Vec<ParityCase<'a>> {
 
 fn own_f32(kind: ModelKind) -> ExportConfig {
     ExportConfig {
-        kind,
+        kind: kind.into(),
         runtime: InferenceRuntime::Own,
         format: NumericFormat::F32,
     }
@@ -100,7 +100,7 @@ fn never_load(_: ModelKind) -> Result<Pipeline, OnnxLoadError> {
 #[test]
 fn req32_c3_tract_int8_excluded_type_unification() {
     let config = ExportConfig {
-        kind: ModelKind::C3,
+        kind: ModelKind::C3.into(),
         runtime: InferenceRuntime::Tract,
         format: NumericFormat::Int8Dynamic,
     };
@@ -214,7 +214,7 @@ fn req32_runtime_not_available_and_parity_unverified() {
     let f = fixture(ModelKind::C1);
     let cases = parity_cases(&f, &f.labels);
     let ort = ExportConfig {
-        kind: ModelKind::C1,
+        kind: ModelKind::C1.into(),
         runtime: InferenceRuntime::OnnxRuntime,
         format: NumericFormat::F32,
     };
@@ -238,12 +238,12 @@ fn req32_screen_candidates_order_limits_duplicates() {
     let f = fixture(ModelKind::C1);
     let cases = parity_cases(&f, &f.labels);
     let tract_c3 = ExportConfig {
-        kind: ModelKind::C3,
+        kind: ModelKind::C3.into(),
         runtime: InferenceRuntime::Tract,
         format: NumericFormat::Int8Dynamic,
     };
     let ort = ExportConfig {
-        kind: ModelKind::C1,
+        kind: ModelKind::C1.into(),
         runtime: InferenceRuntime::OnnxRuntime,
         format: NumericFormat::F16,
     };
@@ -280,12 +280,12 @@ fn req39_from_path_verifies_model_before_exclusion() {
         .expect("digest");
     let missing = f.path.with_file_name("does_not_exist.onnx");
     let tract_int8 = ExportConfig {
-        kind: ModelKind::C3,
+        kind: ModelKind::C3.into(),
         runtime: InferenceRuntime::Tract,
         format: NumericFormat::Int8Dynamic,
     };
     let not_available = ExportConfig {
-        kind: ModelKind::C1,
+        kind: ModelKind::C1.into(),
         runtime: InferenceRuntime::OnnxRuntime,
         format: NumericFormat::F16,
     };
@@ -336,12 +336,12 @@ fn req39_case_limit_checked_before_early_exclusion() {
         .collect();
     for config in [
         ExportConfig {
-            kind: ModelKind::C3,
+            kind: ModelKind::C3.into(),
             runtime: InferenceRuntime::Tract,
             format: NumericFormat::Int8Dynamic,
         },
         ExportConfig {
-            kind: ModelKind::C1,
+            kind: ModelKind::C1.into(),
             runtime: InferenceRuntime::OnnxRuntime,
             format: NumericFormat::F16,
         },

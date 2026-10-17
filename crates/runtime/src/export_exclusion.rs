@@ -34,14 +34,28 @@
 //! - sha256 不一致・破損・上限超過・I/O 失敗は「除外」にせず [`ScreeningError`] で全体を止める
 //!   （fail-closed。REQ-39）
 //! - 語彙ファイル超過構成の除外（TASK-30.3・#125）は [`crate::vocab_exclusion`] が持つ。
-//!   [`ExportConfig`] は [`ModelKind`]（C1・C3）を必須とし Qwen 語彙流用の構成を表せないため、
-//!   本モジュールへは相乗りしない
+//!   [`ExportConfig`] は Qwen 語彙流用の構成を表せないため、本モジュールへは相乗りしない
+//!
+//! # 追加学習の種類 `qwen2_lora` の対応範囲外（REQ-41・TASK-41.6-4・#433）
+//!
+//! [`screen_scoring_candidate`] が、書き出した ONNX の演算（演算名 × domain。許可リストは
+//! [`SUPPORTED_SCORING_OPS`]、設計書 `docs/design/qwen2-scoring-onnx-ops.md` §3）とトークナイザー
+//! JSON（[`TokenizerSpec`] の対応範囲）を判定し、範囲外を [`ExclusionReason::UnsupportedOps`]・
+//! [`ExclusionReason::UnsupportedTokenizer`] で除外する。属性・dtype・rank の範囲外は実行器の
+//! 読み込み（#434）で判定する。範囲内でも実行器が未接続で予測照合ができないため
+//! [`ExclusionReason::ParityUnverified`] で除外する（#434 で推論照合へ差し替え）。
+//! 7B 非 tie の lm_head が 1 GiB を超える場合は学習ワーカーが `limit_exceeded` で停止する現行の
+//! 契約のままで、本モジュールでは扱わない。
 
-use crate::onnx::{ModelKind, OnnxBackend, OnnxLoadError, load_pipeline};
+use crate::onnx::{
+    FINETUNE_MODEL_LIMITS, ModelKind, NodeOp, OnnxBackend, OnnxLoadError, load_pipeline,
+    scan_node_ops_path,
+};
 use crate::pipeline::{
     BackendError, InferError, InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES,
 };
 use crate::preprocess::ByteEncodingPreprocessor;
+use crate::tokenizer::{TokenizerLoadError, TokenizerSpec};
 use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::path::Path;
@@ -101,11 +115,53 @@ impl NumericFormat {
     }
 }
 
+/// 配布候補の種類。推論側の [`ModelKind`] に無い `qwen2_lora` も表す（実行器の無い種類を推論の
+/// 許可リストへ載せないため、除外判定側にだけ持つ。REQ-41・#433）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExportKind {
+    /// バイト n-gram TF-IDF + ロジスティック回帰。
+    C1,
+    /// バイト CNN。
+    C3,
+    /// 追加学習（Qwen2 の LoRA 統合・採点グラフ）。推論の実行器は #434 で接続する。
+    Qwen2Lora,
+}
+
+impl ExportKind {
+    /// `artifact.json` の `kind` 文字列と同じ名前（ASCII snake_case）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::C1 => "c1",
+            Self::C3 => "c3",
+            Self::Qwen2Lora => "qwen2_lora",
+        }
+    }
+
+    /// 推論側の種類。実行器の無い種類は `None`。
+    pub fn model_kind(self) -> Option<ModelKind> {
+        match self {
+            Self::C1 => Some(ModelKind::C1),
+            Self::C3 => Some(ModelKind::C3),
+            Self::Qwen2Lora => None,
+        }
+    }
+}
+
+impl From<ModelKind> for ExportKind {
+    fn from(k: ModelKind) -> Self {
+        match k {
+            ModelKind::C1 => Self::C1,
+            ModelKind::C3 => Self::C3,
+        }
+    }
+}
+
 /// 配布候補の構成（種類 × ランタイム × 数値形式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportConfig {
     /// モデルの種類（`autoregressive` は未対応。REQ-19b の後続 TASK）。
-    pub kind: ModelKind,
+    pub kind: ExportKind,
     /// 推論ランタイム。
     pub runtime: InferenceRuntime,
     /// 数値形式。
@@ -179,7 +235,7 @@ pub struct KnownInfeasibility {
 /// PoC-14 実測に基づく既知の書き出し不能構成（証拠種別: 実機）。
 pub static KNOWN_INFEASIBLE: &[KnownInfeasibility] = &[KnownInfeasibility {
     config: ExportConfig {
-        kind: ModelKind::C3,
+        kind: ExportKind::C3,
         runtime: InferenceRuntime::Tract,
         format: NumericFormat::Int8Dynamic,
     },
@@ -213,8 +269,22 @@ pub enum ExclusionReason {
         /// 照合した件数。
         total: usize,
     },
-    /// 照合ケースが 0 件で一致を確かめられない。
+    /// 照合ケースが 0 件、または実行器が未接続で一致を確かめられない。
     ParityUnverified,
+    /// 採点グラフに許可リスト外の演算がある（REQ-41・#433）。`ops` は整形済みの演算名
+    /// （ソート・重複除去・先頭 [`MAX_REPORTED_OPS`] 件）、`total` は相異なる未対応演算の総数。
+    UnsupportedOps {
+        /// 未対応の演算名（整形済み）。
+        ops: Vec<String>,
+        /// 相異なる未対応演算の総数。
+        total: usize,
+    },
+    /// トークナイザー JSON が対応範囲外（REQ-41・#433）。`section` は
+    /// [`TokenizerLoadError::Unsupported`] の固定の節名。
+    UnsupportedTokenizer {
+        /// 範囲外だった節名。
+        section: &'static str,
+    },
 }
 
 impl ExclusionReason {
@@ -226,6 +296,8 @@ impl ExclusionReason {
             Self::RuntimeRejectedModel { .. } => "runtime_rejected_model",
             Self::PredictionMismatch { .. } => "prediction_mismatch",
             Self::ParityUnverified => "parity_unverified",
+            Self::UnsupportedOps { .. } => "unsupported_ops",
+            Self::UnsupportedTokenizer { .. } => "unsupported_tokenizer",
         }
     }
 }
@@ -252,6 +324,7 @@ impl ExclusionRecord {
         match &self.reason {
             ExclusionReason::ExportInfeasible(k) => Some(k.reason.code()),
             ExclusionReason::RuntimeRejectedModel { load_code } => Some(load_code),
+            ExclusionReason::UnsupportedTokenizer { section } => Some(section),
             _ => None,
         }
     }
@@ -286,7 +359,13 @@ impl ExclusionRecord {
                 format!("{head}: {mismatched} of {total} predictions differ from the reference")
             }
             ExclusionReason::ParityUnverified => {
-                format!("{head}: no parity cases were provided")
+                format!("{head}: predictions could not be verified against the reference")
+            }
+            ExclusionReason::UnsupportedOps { total, .. } => {
+                format!("{head}: {total} unsupported operator type(s) in the graph")
+            }
+            ExclusionReason::UnsupportedTokenizer { section } => {
+                format!("{head}: unsupported tokenizer section ({section})")
             }
         }
     }
@@ -316,6 +395,8 @@ pub struct ExportScreening {
 pub enum ScreeningError {
     /// 完全性・I/O・破損・上限の読み込みエラー。
     Load(OnnxLoadError),
+    /// トークナイザー JSON の完全性・破損・上限・内容不正（対応範囲外は除外で、ここには来ない）。
+    Tokenizer(TokenizerLoadError),
     /// 照合中の推論失敗。
     Infer(InferError),
     /// 候補数が [`MAX_EXPORT_CANDIDATES`] を超えた。
@@ -337,6 +418,7 @@ impl ScreeningError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Load(e) => e.code(),
+            Self::Tokenizer(e) => e.code(),
             Self::Infer(e) => e.code(),
             Self::TooManyCandidates
             | Self::TooManyCases
@@ -532,6 +614,16 @@ where
             EvidenceKind::TestHarness,
         ));
     }
+    // 推論側に実行器の無い種類（qwen2_lora）はこの経路では照合できない（screen_scoring_candidate を使う）
+    let Some(model_kind) = config.kind.model_kind() else {
+        return Ok(excluded(
+            config,
+            ExclusionReason::RuntimeRejectedModel {
+                load_code: OnnxLoadError::UnsupportedKind.code(),
+            },
+            EvidenceKind::TestHarness,
+        ));
+    };
     if cases.is_empty() {
         return Ok(excluded(
             config,
@@ -539,7 +631,7 @@ where
             EvidenceKind::TestHarness,
         ));
     }
-    let pipeline = match load(config.kind) {
+    let pipeline = match load(model_kind) {
         Ok(p) => p,
         Err(e) => {
             return match classify_load_error(&e) {
@@ -583,7 +675,10 @@ pub fn screen_candidate_from_path(
     // 検証する。欠落・破損・改ざんは除外に化けさせず全体停止にする（REQ-39 fail-closed）。
     // 形式不成立（`Exclude` 分類）だけは除外判定へ回すため、結果を保持して渡す。
     validate_parity_cases(cases)?;
-    let loaded = load_pipeline(config.kind, max_bytes, path, expected_sha256);
+    let Some(model_kind) = config.kind.model_kind() else {
+        return screen_candidate(config, |_| Err(OnnxLoadError::UnsupportedKind), cases);
+    };
+    let loaded = load_pipeline(model_kind, max_bytes, path, expected_sha256);
     let loaded = match loaded {
         Err(e) if classify_load_error(&e) == LoadErrorClass::Propagate => {
             return Err(ScreeningError::Load(e));
@@ -591,6 +686,165 @@ pub fn screen_candidate_from_path(
         other => other,
     };
     screen_candidate(config, |_| loaded, cases)
+}
+
+/// 採点グラフが使ってよい演算（既定 domain。`docs/design/qwen2-scoring-onnx-ops.md` §3 の 28 種。
+/// ソート済み。変更は設計書の更新を先に行う）。
+pub const SUPPORTED_SCORING_OPS: [&str; 28] = [
+    "Add",
+    "Cast",
+    "Concat",
+    "Cos",
+    "Expand",
+    "Gather",
+    "GatherElements",
+    "Gemm",
+    "Greater",
+    "LogSoftmax",
+    "MatMul",
+    "Mul",
+    "Range",
+    "Reciprocal",
+    "ReduceMean",
+    "ReduceSum",
+    "Reshape",
+    "Shape",
+    "Sigmoid",
+    "Sin",
+    "Slice",
+    "Softmax",
+    "Split",
+    "Sqrt",
+    "Sub",
+    "Transpose",
+    "Unsqueeze",
+    "Where",
+];
+
+/// 除外記録に載せる未対応演算名の件数の上限。
+pub const MAX_REPORTED_OPS: usize = 16;
+/// 除外記録に載せる演算名 1 件の文字数の上限。
+const MAX_REPORTED_OP_CHARS: usize = 64;
+
+/// 許可リスト外の演算を、記録用に整形して返す（相異なる名前の総数も返す）。
+///
+/// 演算名はファイル由来の untrusted な文字列のため、`[A-Za-z0-9_.]` 以外は `_` に置換し
+/// [`MAX_REPORTED_OP_CHARS`] 文字で切り詰め、ソート・重複除去して先頭 [`MAX_REPORTED_OPS`] 件にする。
+/// 既定 domain 以外の演算はすべて未対応（設計書 §5）。
+pub fn unsupported_scoring_ops(ops: &[NodeOp]) -> (Vec<String>, usize) {
+    let mut names: Vec<String> = ops
+        .iter()
+        .filter(|o| !o.domain.is_empty() || !SUPPORTED_SCORING_OPS.contains(&o.op_type.as_str()))
+        .map(|o| {
+            o.op_type
+                .chars()
+                .take(MAX_REPORTED_OP_CHARS)
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    let total = names.len();
+    names.truncate(MAX_REPORTED_OPS);
+    (names, total)
+}
+
+/// トークナイザーの読み込みエラーを「除外」か「全体停止」に振り分ける。対応範囲外
+/// （`Unsupported`）だけを除外にし、完全性・破損・上限・内容不正と未知のバリアントは
+/// `Propagate`（REQ-39 fail-closed）。
+pub fn classify_tokenizer_error(err: &TokenizerLoadError) -> LoadErrorClass {
+    match err {
+        TokenizerLoadError::Unsupported { section, .. } => LoadErrorClass::Exclude(section),
+        _ => LoadErrorClass::Propagate,
+    }
+}
+
+/// 追加学習の種類（`qwen2_lora`）の書き出し物 1 構成を判定する（REQ-41・TASK-41.6-4・#433）。
+///
+/// 順序: 両ファイルの完全性系エラーを先に全体停止 → 既知制約 → ランタイム・形式の門
+/// （`Own` × `F32` のみ）→ トークナイザー範囲外 → ONNX の読み込み拒否 → 未対応演算 →
+/// 実行器未接続（[`ExclusionReason::ParityUnverified`]。#434 で推論照合へ差し替える）。
+/// 経路の閉じ込めは呼び出し側（ガード層）の責務。
+///
+/// # Errors
+/// [`ScreeningError`]（sha256 不一致・破損・上限超過・I/O 失敗・トークナイザーの内容不正）。
+pub fn screen_scoring_candidate(
+    config: ExportConfig,
+    onnx_path: &Path,
+    onnx_sha256: &Sha256Digest,
+    tokenizer_path: &Path,
+    tokenizer_sha256: &Sha256Digest,
+) -> Result<CandidateDecision, ScreeningError> {
+    // 完全性・破損・上限は除外に化けさせず全体停止にする（どの除外判定よりも先。REQ-39）
+    let tokenizer_section = match TokenizerSpec::load_path(tokenizer_path, tokenizer_sha256) {
+        Ok(_) => None,
+        Err(e) => match classify_tokenizer_error(&e) {
+            LoadErrorClass::Exclude(section) => Some(section),
+            LoadErrorClass::Propagate => return Err(ScreeningError::Tokenizer(e)),
+        },
+    };
+    let ops = match scan_node_ops_path(onnx_path, &FINETUNE_MODEL_LIMITS, onnx_sha256) {
+        Err(e) if classify_load_error(&e) == LoadErrorClass::Propagate => {
+            return Err(ScreeningError::Load(e));
+        }
+        other => other,
+    };
+    let harness = EvidenceKind::TestHarness;
+    if let Some(known) = known_infeasibility(&config) {
+        return Ok(excluded(
+            config,
+            ExclusionReason::ExportInfeasible(known),
+            known.evidence,
+        ));
+    }
+    if !matches!(
+        (config.runtime, config.format),
+        (InferenceRuntime::Own, NumericFormat::F32)
+    ) {
+        return Ok(excluded(
+            config,
+            ExclusionReason::RuntimeNotAvailable,
+            harness,
+        ));
+    }
+    if let Some(section) = tokenizer_section {
+        return Ok(excluded(
+            config,
+            ExclusionReason::UnsupportedTokenizer { section },
+            harness,
+        ));
+    }
+    let ops = match ops {
+        Ok(o) => o,
+        Err(e) => {
+            // 上で Propagate は返し済み。残りは形式の不成立（Exclude）
+            let load_code = match classify_load_error(&e) {
+                LoadErrorClass::Exclude(c) => c,
+                LoadErrorClass::Propagate => return Err(ScreeningError::Load(e)),
+            };
+            return Ok(excluded(
+                config,
+                ExclusionReason::RuntimeRejectedModel { load_code },
+                harness,
+            ));
+        }
+    };
+    let (names, total) = unsupported_scoring_ops(&ops);
+    if total > 0 {
+        return Ok(excluded(
+            config,
+            ExclusionReason::UnsupportedOps { ops: names, total },
+            harness,
+        ));
+    }
+    Ok(excluded(config, ExclusionReason::ParityUnverified, harness))
 }
 
 /// 複数構成を入力順に判定する。候補数上限・重複検査・順序保持をここに集約する。
@@ -631,7 +885,7 @@ mod tests {
 
     fn cfg(kind: ModelKind, runtime: InferenceRuntime, format: NumericFormat) -> ExportConfig {
         ExportConfig {
-            kind,
+            kind: kind.into(),
             runtime,
             format,
         }
@@ -751,6 +1005,83 @@ mod tests {
         );
         assert_eq!(r.detail_code(), None);
         assert_eq!(r.source(), None);
+    }
+
+    /// REQ-41・#433: 許可リストは 28 件・ソート済み・重複なし。
+    #[test]
+    fn req41_supported_scoring_ops_sorted_unique_28() {
+        assert_eq!(SUPPORTED_SCORING_OPS.len(), 28);
+        assert!(SUPPORTED_SCORING_OPS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// REQ-41・#433: 演算名は整形・切り詰め・件数制限され、既定 domain 以外は未対応になる。
+    #[test]
+    fn req41_op_name_sanitized_and_capped() {
+        let op = |domain: &str, name: &str| NodeOp {
+            domain: domain.into(),
+            op_type: name.into(),
+        };
+        let long = "A".repeat(100);
+        let mut ops = vec![
+            op("", "Add"),
+            op("", "bad\"name\n"),
+            op("", "bad\"name\n"),
+            op("", &long),
+            op("com.microsoft", "Add"),
+        ];
+        let (names, total) = unsupported_scoring_ops(&ops);
+        assert_eq!(total, 3);
+        assert_eq!(
+            names,
+            vec!["A".repeat(64), "Add".to_string(), "bad_name_".to_string()]
+        );
+
+        ops = (0..20).map(|i| op("", &format!("X{i:02}"))).collect();
+        let (names, total) = unsupported_scoring_ops(&ops);
+        assert_eq!((names.len(), total), (16, 20));
+        assert_eq!(names.first().map(String::as_str), Some("X00"));
+        assert_eq!(names.last().map(String::as_str), Some("X15"));
+    }
+
+    /// REQ-41・REQ-39: トークナイザーは対応範囲外だけが除外で、他は全体停止。
+    #[test]
+    fn req41_classify_tokenizer_error_mapping() {
+        let unsupported = TokenizerLoadError::Unsupported {
+            section: "model",
+            supported: "x",
+        };
+        assert_eq!(
+            classify_tokenizer_error(&unsupported),
+            LoadErrorClass::Exclude("model")
+        );
+        for e in [
+            TokenizerLoadError::IntegrityMismatch,
+            TokenizerLoadError::MalformedJson,
+            TokenizerLoadError::LimitExceeded { what: "x" },
+            TokenizerLoadError::Invalid { what: "x" },
+        ] {
+            assert_eq!(classify_tokenizer_error(&e), LoadErrorClass::Propagate);
+        }
+    }
+
+    /// REQ-41・#433: 新しい除外コード・種類名は固定の ASCII snake_case。
+    #[test]
+    fn req41_new_codes_fixed() {
+        assert_eq!(
+            ExclusionReason::UnsupportedOps {
+                ops: vec![],
+                total: 0
+            }
+            .code(),
+            "unsupported_ops"
+        );
+        assert_eq!(
+            ExclusionReason::UnsupportedTokenizer { section: "model" }.code(),
+            "unsupported_tokenizer"
+        );
+        assert_eq!(ExportKind::Qwen2Lora.as_str(), "qwen2_lora");
+        assert_eq!(ExportKind::Qwen2Lora.model_kind(), None);
+        assert_eq!(ExportKind::from(ModelKind::C3), ExportKind::C3);
     }
 
     /// REQ-32: 推論エラーのコードは ScreeningError にそのまま出る。

@@ -270,11 +270,7 @@ impl OnnxBackend {
         kind: ModelKind,
         expected_sha256: &Sha256Digest,
     ) -> Result<Self, OnnxLoadError> {
-        let bytes =
-            read_bounded(path, kind.limits().max_model_file_bytes).map_err(OnnxLoadError::File)?;
-        if Sha256Digest::of_bytes(&bytes) != *expected_sha256 {
-            return Err(OnnxLoadError::IntegrityMismatch);
-        }
+        let bytes = read_verified(path, kind.limits(), expected_sha256)?;
         Self::from_bytes(&bytes, kind)
     }
 
@@ -283,17 +279,7 @@ impl OnnxBackend {
         if u64::try_from(bytes.len()).map_or(true, |n| n > kind.limits().max_model_file_bytes) {
             return Err(OnnxLoadError::LimitExceeded);
         }
-        let model = proto::decode_model(bytes, kind.limits())?;
-        if model.ir_version != EXPECTED_IR_VERSION {
-            return Err(OnnxLoadError::UnsupportedIrVersion);
-        }
-        let opset_ok = matches!(
-            model.opsets.as_slice(),
-            [o] if o.domain.is_empty() && o.version == EXPECTED_OPSET
-        );
-        if !opset_ok {
-            return Err(OnnxLoadError::UnsupportedOpset);
-        }
+        let model = decode_checked(bytes, kind.limits())?;
         let inner = match kind {
             ModelKind::C1 => Inner::C1(c1::C1Model::from_graph(&model.graph)?),
             ModelKind::C3 => Inner::C3(c3::C3Model::from_graph(&model.graph)?),
@@ -337,6 +323,72 @@ impl ScoringBackend for OnnxBackend {
             Inner::C3(m) => m.scores_limited(ids, limit),
         }
     }
+}
+
+/// 通常ファイルを上限付きで読み、sha256 を照合して返す（復号の前。REQ-39）。
+fn read_verified(
+    path: &Path,
+    limits: &ModelLimits,
+    expected_sha256: &Sha256Digest,
+) -> Result<Vec<u8>, OnnxLoadError> {
+    let bytes = read_bounded(path, limits.max_model_file_bytes).map_err(OnnxLoadError::File)?;
+    if Sha256Digest::of_bytes(&bytes) != *expected_sha256 {
+        return Err(OnnxLoadError::IntegrityMismatch);
+    }
+    Ok(bytes)
+}
+
+/// 復号し、書き出し器が固定する ir_version・opset を検査する（`from_bytes` と演算走査で共用）。
+fn decode_checked(bytes: &[u8], limits: &ModelLimits) -> Result<proto::ModelProto, OnnxLoadError> {
+    if u64::try_from(bytes.len()).map_or(true, |n| n > limits.max_model_file_bytes) {
+        return Err(OnnxLoadError::LimitExceeded);
+    }
+    let model = proto::decode_model(bytes, limits)?;
+    if model.ir_version != EXPECTED_IR_VERSION {
+        return Err(OnnxLoadError::UnsupportedIrVersion);
+    }
+    let opset_ok = matches!(
+        model.opsets.as_slice(),
+        [o] if o.domain.is_empty() && o.version == EXPECTED_OPSET
+    );
+    if !opset_ok {
+        return Err(OnnxLoadError::UnsupportedOpset);
+    }
+    Ok(model)
+}
+
+/// グラフのノードが使う演算 1 件（domain と op_type）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOp {
+    /// 演算の domain（既定 domain は空文字）。
+    pub domain: String,
+    /// 演算名。
+    pub op_type: String,
+}
+
+/// 実行器を持たない種類（追加学習の `qwen2_lora`）の対応範囲判定のため、ONNX のノード列の演算を
+/// 返す（`export_exclusion::screen_scoring_candidate` から呼ばれる。実行器の接続は #434 まで。
+/// REQ-41・TASK-41.6-4・#433）。サイズ・ノード数は `limits` で有界にし、ir_version・opset も検査する。
+pub fn scan_node_ops(bytes: &[u8], limits: &ModelLimits) -> Result<Vec<NodeOp>, OnnxLoadError> {
+    let model = decode_checked(bytes, limits)?;
+    Ok(model
+        .graph
+        .nodes
+        .into_iter()
+        .map(|n| NodeOp {
+            domain: n.domain,
+            op_type: n.op_type,
+        })
+        .collect())
+}
+
+/// [`scan_node_ops`] のファイル版。復号の前に上限付きで読み、sha256 を照合する（REQ-39）。
+pub fn scan_node_ops_path(
+    path: &Path,
+    limits: &ModelLimits,
+    expected_sha256: &Sha256Digest,
+) -> Result<Vec<NodeOp>, OnnxLoadError> {
+    scan_node_ops(&read_verified(path, limits, expected_sha256)?, limits)
 }
 
 /// 前処理（`max_bytes` の範囲検証つき）と ONNX バックエンドを束ねた推論パイプラインを組み立てる。

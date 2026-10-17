@@ -370,6 +370,14 @@ pub fn export_exclusions_json(records: &[ExclusionRecord]) -> String {
             if let ExclusionReason::PredictionMismatch { mismatched, total } = &r.reason {
                 s.push_str(&format!(",\"mismatched\":{mismatched},\"total\":{total}"));
             }
+            if let ExclusionReason::UnsupportedOps { ops, total } = &r.reason {
+                let names = ops
+                    .iter()
+                    .map(|o| format!("\"{}\"", json_escape(o)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                s.push_str(&format!(",\"ops\":[{names}],\"total\":{total}"));
+            }
             s.push_str(&format!(",\"evidence\":\"{}\"", r.evidence.as_str()));
             if let Some(src) = r.source() {
                 s.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
@@ -981,7 +989,7 @@ mod tests {
         format: fandhe_edge_runtime::export_exclusion::NumericFormat,
     ) -> fandhe_edge_runtime::export_exclusion::ExportConfig {
         fandhe_edge_runtime::export_exclusion::ExportConfig {
-            kind,
+            kind: kind.into(),
             runtime,
             format,
         }
@@ -1027,6 +1035,46 @@ mod tests {
                 "\"evidence\":\"test_harness\"},",
                 "{\"kind\":\"c3\",\"runtime\":\"own\",\"format\":\"f32\",",
                 "\"code\":\"runtime_rejected_model\",\"detail\":\"unsupported_graph\",",
+                "\"evidence\":\"test_harness\"}]}"
+            )
+        );
+    }
+
+    /// REQ-41・#433: 未対応演算・未対応トークナイザーの除外記録の JSON を完全一致で固定する。
+    #[test]
+    fn req41_export_exclusions_json_unsupported_exact() {
+        use fandhe_edge_runtime::export_exclusion::{
+            EvidenceKind, ExportConfig, ExportKind, InferenceRuntime as Rt, NumericFormat as Nf,
+        };
+        let config = ExportConfig {
+            kind: ExportKind::Qwen2Lora,
+            runtime: Rt::Own,
+            format: Nf::F32,
+        };
+        let ops = ExclusionRecord {
+            config,
+            reason: ExclusionReason::UnsupportedOps {
+                ops: vec!["Conv".into(), "Er\"f".into()],
+                total: 2,
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        let tok = ExclusionRecord {
+            config,
+            reason: ExclusionReason::UnsupportedTokenizer {
+                section: "top-level",
+            },
+            evidence: EvidenceKind::TestHarness,
+        };
+        assert_eq!(
+            export_exclusions_json(&[ops, tok]),
+            concat!(
+                "{\"excluded\":[",
+                "{\"kind\":\"qwen2_lora\",\"runtime\":\"own\",\"format\":\"f32\",",
+                "\"code\":\"unsupported_ops\",\"ops\":[\"Conv\",\"Er\\\"f\"],\"total\":2,",
+                "\"evidence\":\"test_harness\"},",
+                "{\"kind\":\"qwen2_lora\",\"runtime\":\"own\",\"format\":\"f32\",",
+                "\"code\":\"unsupported_tokenizer\",\"detail\":\"top-level\",",
                 "\"evidence\":\"test_harness\"}]}"
             )
         );
