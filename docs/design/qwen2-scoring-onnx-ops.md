@@ -92,7 +92,7 @@
 
 ## 5. 範囲外を除外する方針
 
-- 学習側（#431・#433）: 書き出した ONNX の演算・属性・dtype・rank・opset が一覧の範囲外なら、配布候補から外して理由を記録する（TASK-32.2 の仕組み。`export_exclusion.rs` の理由に未対応演算を足す）。config の範囲外（rope_scaling・sliding window・silu 以外）は書き出しの前に止める。#431 の受け入れテストは本書の表を基準にする
+- 学習側（#431・#433）: 書き出した ONNX の演算・属性・dtype・rank・opset が一覧の範囲外なら、配布候補から外して理由を記録する（TASK-32.2 の仕組み。`export_exclusion.rs` の理由に未対応演算を足す）。config の範囲外（rope_scaling・sliding window・silu 以外）は書き出しの前に止める。#431 の受け入れテストは本書の表を基準にする。#433 の実装: 演算名 × domain と opset を `screen_scoring_candidate` で判定する（属性・dtype・rank は実行器の読み込み〔#434〕で判定）
 - 推論側（#416〜#419・#581）: 読み込み時に許可リスト（演算 × 属性 × dtype × rank）で照合し、外れたら fail-closed で拒否する（`invalid_input`=64。上限超過は `limit_exceeded`=20。REQ-39）。既定以外の domain・部分グラフ属性・opset ≠ 13 も拒否する
 - 資源の上限: T・Range の要素数・Concat の入力数・ノード数・initializer 数・rank を許可リストの一部として持つ。上限の無いアロケーションを作らない
 - 完全性: 外部データ（bf16 の重み）は経路の閉じ込めと sha256 照合を通す（#581）。入力 id が語彙外なら Gather で拒否する
