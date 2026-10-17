@@ -676,6 +676,12 @@ pub fn screen_candidate_from_path(
     // 形式不成立（`Exclude` 分類）だけは除外判定へ回すため、結果を保持して渡す。
     validate_parity_cases(cases)?;
     let Some(model_kind) = config.kind.model_kind() else {
+        // 実行器の無い種類でも、上限付き読み込みと sha256 照合を除外判定より先に行う（REQ-39）
+        if let Err(e) = scan_node_ops_path(path, &FINETUNE_MODEL_LIMITS, expected_sha256)
+            && classify_load_error(&e) == LoadErrorClass::Propagate
+        {
+            return Err(ScreeningError::Load(e));
+        }
         return screen_candidate(config, |_| Err(OnnxLoadError::UnsupportedKind), cases);
     };
     let loaded = load_pipeline(model_kind, max_bytes, path, expected_sha256);
@@ -729,15 +735,22 @@ const MAX_REPORTED_OP_CHARS: usize = 64;
 /// 許可リスト外の演算を、記録用に整形して返す（相異なる名前の総数も返す）。
 ///
 /// 演算名はファイル由来の untrusted な文字列のため、`[A-Za-z0-9_.]` 以外は `_` に置換し
-/// [`MAX_REPORTED_OP_CHARS`] 文字で切り詰め、ソート・重複除去して先頭 [`MAX_REPORTED_OPS`] 件にする。
+/// [`MAX_REPORTED_OP_CHARS`] 文字で切り詰め（総数は整形前の domain と op_type の組で数える）、ソート・重複除去して先頭 [`MAX_REPORTED_OPS`] 件にする。
 /// 既定 domain 以外の演算はすべて未対応（設計書 §5）。
 pub fn unsupported_scoring_ops(ops: &[NodeOp]) -> (Vec<String>, usize) {
-    let mut names: Vec<String> = ops
+    let mut raw: Vec<(&str, &str)> = ops
         .iter()
         .filter(|o| !o.domain.is_empty() || !SUPPORTED_SCORING_OPS.contains(&o.op_type.as_str()))
-        .map(|o| {
-            o.op_type
-                .chars()
+        .map(|o| (o.domain.as_str(), o.op_type.as_str()))
+        .collect();
+    // 総数は整形前の (domain, op_type) の組で数える（整形後の衝突で過少にしない）
+    raw.sort();
+    raw.dedup();
+    let total = raw.len();
+    let mut names: Vec<String> = raw
+        .iter()
+        .map(|(_, op)| {
+            op.chars()
                 .take(MAX_REPORTED_OP_CHARS)
                 .map(|c| {
                     if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
@@ -751,7 +764,6 @@ pub fn unsupported_scoring_ops(ops: &[NodeOp]) -> (Vec<String>, usize) {
         .collect();
     names.sort();
     names.dedup();
-    let total = names.len();
     names.truncate(MAX_REPORTED_OPS);
     (names, total)
 }
@@ -1035,6 +1047,9 @@ mod tests {
             names,
             vec!["A".repeat(64), "Add".to_string(), "bad_name_".to_string()]
         );
+
+        let collide = [op("", "Foo-Bar"), op("", "Foo_Bar")];
+        assert_eq!(unsupported_scoring_ops(&collide).1, 2);
 
         ops = (0..20).map(|i| op("", &format!("X{i:02}"))).collect();
         let (names, total) = unsupported_scoring_ops(&ops);

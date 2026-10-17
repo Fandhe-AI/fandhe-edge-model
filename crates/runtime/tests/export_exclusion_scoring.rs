@@ -12,7 +12,8 @@ mod proto_builder;
 use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_runtime::export_exclusion::{
     CandidateDecision, EvidenceKind, ExclusionReason, ExportConfig, ExportKind, InferenceRuntime,
-    NumericFormat, ScreeningError, screen_candidate, screen_scoring_candidate,
+    NumericFormat, ScreeningError, screen_candidate, screen_candidate_from_path,
+    screen_scoring_candidate,
 };
 use fandhe_edge_runtime::onnx::{FINETUNE_MODEL_LIMITS, ModelKind, scan_node_ops};
 use fandhe_edge_runtime::tokenizer::{SPLIT_REGEX, bytes_to_unicode};
@@ -242,6 +243,26 @@ fn req41_model_kind_less_config_rejected_in_legacy_path() {
     ));
     assert_eq!(r.code(), "runtime_rejected_model");
     assert_eq!(r.detail_code(), Some("unsupported_kind"));
+}
+
+/// REQ-39: 実行器の無い種類の旧経路でも、欠落・sha256 不一致は除外にせず全体停止にする（#433）。
+#[test]
+fn req39_legacy_path_checks_integrity_for_model_kind_less_config() {
+    let f = put("legacy", &c3_bytes(), b"{}");
+    let bad = Sha256Digest::of_bytes(b"other");
+    let r = screen_candidate_from_path(config(), 4096, &f.onnx, &bad, &[]);
+    assert!(matches!(r, Err(ScreeningError::Load(_))));
+    let missing = f.dir.join("nope.onnx");
+    let r = screen_candidate_from_path(config(), 4096, &missing, &f.onnx_sha, &[]);
+    assert!(matches!(r, Err(ScreeningError::Load(_))));
+    let ok = excluded(screen_candidate_from_path(
+        config(),
+        4096,
+        &f.onnx,
+        &f.onnx_sha,
+        &[],
+    ));
+    assert_eq!(ok.detail_code(), Some("unsupported_kind"));
 }
 
 const EXPECTED_C3_UNSUPPORTED: [&str; 3] = ["Conv", "ReduceMax", "Relu"];
