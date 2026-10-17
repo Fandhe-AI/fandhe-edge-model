@@ -33,8 +33,8 @@ use super::ops::norm_act::{
     softmax_last_axis_f64,
 };
 use super::ops::shape::{
-    concat, expand, gather_axis0, gather_elements_last_axis, reshape, shape, slice, split,
-    transpose, unsqueeze,
+    concat, expand, gather_axis0, gather_elements_last_axis, normalize_axis, reshape, shape, slice,
+    split, transpose, unsqueeze,
 };
 use super::ops::{OpError, Tensor};
 use super::proto::{DT_FLOAT, Dim, GraphProto, NodeProto, TensorData};
@@ -403,29 +403,12 @@ impl ScoringModel {
         let started = Instant::now();
         // Instant が表せない巨大な期限は上限扱い（MAX_TIME_LIMIT より先は意味がない）
         let until = started + limit;
-        let mut f = Frame {
-            vals: self.base.clone(),
-            left: self.uses.clone(),
-            first_dyn: self.ids_slot,
-            live: 0,
-            held: 0,
-        };
-        debug_assert_eq!(f.vals.len(), self.n_slots);
-        let t = Tensor::new(vec![1, ids.len()], ids.to_vec()).map_err(op_err)?;
-        *f.vals.get_mut(self.ids_slot).ok_or(BackendError::Failed)? = Some(Arc::new(Value::I64(t)));
+        let mut f = self.start(ids)?;
         for step in &self.steps {
             if started.elapsed() > limit {
                 return Err(BackendError::TimeLimitExceeded);
             }
-            let outs = exec(step, &mut f, until)?;
-            if outs.len() != step.outs.len() {
-                return Err(BackendError::Failed);
-            }
-            // 出力の保持量検査は入力がまだ生きている状態で行い、済んでから入力を手放す
-            for (&slot, v) in step.outs.iter().zip(outs) {
-                f.store(slot, v, slot == self.out_slot)?;
-            }
-            f.release();
+            self.step(&mut f, step, until)?;
         }
         // 最終演算が期限を跨いだ場合も超過として返す
         if started.elapsed() > limit {
@@ -436,6 +419,36 @@ impl ScoringModel {
             Some(Value::F64(t)) if t.shape() == [1, self.n_classes] => Ok(t.data().to_vec()),
             _ => Err(BackendError::Failed),
         }
+    }
+
+    /// 1 回の実行の値表を作り、入力 `ids` を置く。
+    fn start(&self, ids: &[i64]) -> Result<Frame, BackendError> {
+        let mut f = Frame {
+            vals: self.base.clone(),
+            left: self.uses.clone(),
+            first_dyn: self.ids_slot,
+            live: 0,
+            held: 0,
+        };
+        debug_assert_eq!(f.vals.len(), self.n_slots);
+        let t = Tensor::new(vec![1, ids.len()], ids.to_vec()).map_err(op_err)?;
+        // 入力も中間値と同じ store で計上する（最後の消費で take・release が同じ量を引くため）
+        f.store(self.ids_slot, Value::I64(t), false)?;
+        Ok(f)
+    }
+
+    /// 1 ノードを実行し、出力を値表へ置く。
+    fn step(&self, f: &mut Frame, step: &Step, until: Instant) -> Result<(), BackendError> {
+        let outs = exec(step, f, until)?;
+        // 最後の消費だった入力は exec の終了で解放済み。出力を置く前に手放す
+        f.release();
+        if outs.len() != step.outs.len() {
+            return Err(BackendError::Failed);
+        }
+        for (&slot, v) in step.outs.iter().zip(outs) {
+            f.store(slot, v, slot == self.out_slot)?;
+        }
+        Ok(())
     }
 }
 
@@ -452,6 +465,11 @@ fn op<T>(r: Result<T, OpError>) -> Result<T, BackendError> {
 }
 
 /// 1 回の実行の値表。最後の消費で値を手放す。
+///
+/// 保持量の計上は対になる 2 経路に限る（REQ-39）: `first_dyn` 以降のスロットへ値を置くのは
+/// [`Frame::store`] だけで、置いた量を `live` に足す。最後の消費の [`Frame::take`] が同じ値の量を
+/// `held` に移し、演算後の [`Frame::release`] が `live` から引く。入力 `ids` も store を通す。
+/// `first_dyn` より前（initializer）は借用している共有重みで、足しも引きもしない。
 struct Frame {
     vals: Vec<Option<Arc<Value>>>,
     left: Vec<usize>,
@@ -561,7 +579,7 @@ fn numel(v: &Value) -> usize {
     shape_of(v).iter().fold(1usize, |a, &d| a.saturating_mul(d))
 }
 
-/// 値 1 要素の実バイト数（確保前検査の dtype 別見積もり用）。
+/// 値 1 要素の実バイト数（確保前検査の dtype 別見積もり用）。遅延重みは f32 へ展開した大きさ。
 fn elem_bytes(v: &Value) -> usize {
     match v {
         Value::F32(_) | Value::LazyF32(_) | Value::RawBf16(_) => 4,
@@ -570,11 +588,16 @@ fn elem_bytes(v: &Value) -> usize {
     }
 }
 
-/// 出力バイト数の上界（出力 dtype の実サイズ × 出力形状から求めた要素数）。確保前の保持量検査に
-/// 使う（REQ-39）。縮む演算は出力形状から、MatMul は broadcast 後の batch で数える。
-/// 上界を作れない入力は `None`。
-fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
+/// 演算 1 回で新たに確保するバイト数の上界。カーネルを実行する前の保持量検査に使う（REQ-39）。
+///
+/// 出力（出力 dtype の実サイズ × 出力形状の要素数）・カーネル内の一時領域・遅延重みの f32 展開を
+/// 合算する。出力形状は演算の意味から求め、入力の大きさからは推定しない（空軸の縮約・空の表の
+/// Gather・broadcast・Expand では出力が入力より大きくなる）。broadcast は軸ごとの最大、Slice は
+/// 入力の各軸（出力の各軸は `[0, 入力の軸]` に clamp される）を上界にする。新しい演算で見積もりを
+/// 書き忘れないよう `_` の腕を置かない。上界を作れない入力は `None`（呼び出し側で拒否する）。
+fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
     let v = |i: usize| a.get(i).map(|x| x.as_ref());
+    let prod = |d: &[usize]| d.iter().fold(1usize, |a, &d| a.saturating_mul(d));
     let bcast = |dims: &[&[usize]]| {
         let rank = dims.iter().map(|d| d.len()).max().unwrap_or(0);
         (0..rank).fold(1usize, |acc, k| {
@@ -587,13 +610,33 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             acc.saturating_mul(m)
         })
     };
-    let prod = |d: &[usize]| d.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    let all_shapes = || a.iter().map(|x| shape_of(x)).collect::<Vec<_>>();
+    // f32v() が展開する遅延重み。Gemm の重み・Gather の表は積和・参照行の中で展開し、
+    // Shape・Cast・Reshape・Unsqueeze は展開しない
+    let expanded = a
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match op {
+            Op::Gemm => *i != 1,
+            Op::Gather => *i != 0,
+            Op::Shape | Op::Cast | Op::Reshape | Op::Unsqueeze => false,
+            _ => true,
+        })
+        .fold(0usize, |acc, (_, x)| match x.as_ref() {
+            Value::LazyF32(t) => acc.saturating_add(t.data().len().saturating_mul(4)),
+            _ => acc,
+        });
     let (n, size) = match op {
-        Op::Gemm => {
-            let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
-            let rows = prod(x.get(..x.len().saturating_sub(1))?);
-            (rows.saturating_mul(*w.first()?), 4)
+        Op::Add | Op::Sub | Op::Mul => {
+            let size = a.iter().map(|x| elem_bytes(x)).max().unwrap_or(4);
+            (bcast(&all_shapes()), size)
         }
+        Op::Sqrt | Op::Reciprocal | Op::Sigmoid | Op::Sin | Op::Cos => (numel(v(0)?), 4),
+        // bf16 → 遅延 f32 は共有バッファの Arc を渡すだけで確保しない
+        Op::Cast => match v(0)? {
+            Value::RawBf16(_) => (0, 4),
+            x => (numel(x), 4),
+        },
         Op::MatMul => {
             let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
             let (xb, wb) = (
@@ -608,10 +651,28 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             let n = if w.len() >= 2 { *w.last()? } else { 1 };
             (bcast(&[xb, wb]).saturating_mul(m).saturating_mul(n), 4)
         }
+        Op::Gemm => {
+            let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
+            let rows = prod(x.get(..x.len().saturating_sub(1))?);
+            (rows.saturating_mul(*w.first()?), 4)
+        }
+        Op::Shape => (shape_of(v(0)?).len(), 8),
+        // 出力は indices.shape ++ data.shape[1..]（表の先頭軸が 0 でも行の大きさは残る）
         Op::Gather => {
-            let (d, i) = (v(0)?, v(1)?);
-            let row = numel(d) / shape_of(d).first().copied().filter(|&n| n > 0).unwrap_or(1);
-            (numel(i).saturating_mul(row), elem_bytes(d))
+            let d = v(0)?;
+            let row = prod(shape_of(d).get(1..)?);
+            (numel(v(1)?).saturating_mul(row), elem_bytes(d))
+        }
+        Op::GatherElements { .. } => (numel(v(1)?), 4),
+        // 唯一の持ち主ならデータを移すだけ。共有中は own() が全体を複製する
+        Op::Reshape | Op::Unsqueeze => {
+            let x = a.first()?;
+            let n = if Arc::strong_count(x) > 1 {
+                numel(x)
+            } else {
+                0
+            };
+            (n, elem_bytes(x))
         }
         Op::Expand => {
             let dims: Vec<usize> = i64v(v(1)?)
@@ -621,6 +682,22 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
                 .map(|&d| usize::try_from(d).ok())
                 .collect::<Option<_>>()?;
             (bcast(&[shape_of(v(0)?), &dims]), elem_bytes(v(0)?))
+        }
+        Op::Transpose { .. } | Op::Slice => (numel(v(0)?), elem_bytes(v(0)?)),
+        Op::Concat { .. } => (a.iter().fold(0usize, |s, x| s.saturating_add(numel(x))), 4),
+        // 出力の合計は (axis 以外の軸の積) × Σ split
+        Op::Split { axis } => {
+            let x = shape_of(v(0)?);
+            let ax = normalize_axis(*axis, x.len()).ok()?;
+            let other = x
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| k != ax)
+                .fold(1usize, |acc, (_, &d)| acc.saturating_mul(d));
+            let total = i64v(v(1)?).ok()?.data().iter().fold(0usize, |s, &l| {
+                s.saturating_add(usize::try_from(l).unwrap_or(0))
+            });
+            (other.saturating_mul(total), 4)
         }
         Op::Range => {
             let g = |i: usize| i64v(v(i)?).ok()?.data().first().copied();
@@ -636,31 +713,50 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             };
             (usize::try_from(n).unwrap_or(usize::MAX), 8)
         }
-        Op::Shape => (shape_of(v(0)?).len(), 8),
-        Op::GatherElements { .. } => (numel(v(1)?), 4),
-        Op::Cast => (numel(v(0)?), 4),
-        Op::Softmax { f64_out: true } => (numel(v(0)?), 8),
-        // 出力が入力 0 以下の大きさで同じ dtype の演算
-        Op::ReduceMean
-        | Op::ReduceSum
-        | Op::Softmax { .. }
-        | Op::LogSoftmax
-        | Op::Slice
-        | Op::Transpose { .. }
-        | Op::Split { .. } => (numel(v(0)?), elem_bytes(v(0)?)),
-        Op::Concat { .. } => (a.iter().fold(0usize, |s, x| s.saturating_add(numel(x))), 4),
-        Op::Greater => {
-            let shapes: Vec<&[usize]> = a.iter().map(|x| shape_of(x)).collect();
-            (bcast(&shapes), 1)
+        Op::Greater => (bcast(&all_shapes()), 1),
+        // where_f32 は (cond, x) の組の列を中間に 1 つ確保する
+        Op::Where => {
+            let pairs = bcast(&[shape_of(v(0)?), shape_of(v(1)?)])
+                .saturating_mul(std::mem::size_of::<(bool, f32)>());
+            let out = bcast(&all_shapes()).saturating_mul(4);
+            return Some(out.saturating_add(pairs).saturating_add(expanded));
         }
-        _ => {
-            // 要素ごとの演算（Add・Sub・Mul・Where 等）は broadcast 後の形状
-            let shapes: Vec<&[usize]> = a.iter().map(|x| shape_of(x)).collect();
-            let size = a.iter().map(|x| elem_bytes(x)).max().unwrap_or(4);
-            (bcast(&shapes), size)
+        // keepdims=1 で最後の軸が 1 になる
+        Op::ReduceMean => {
+            let x = shape_of(v(0)?);
+            (prod(x.get(..x.len().saturating_sub(1))?), 4)
         }
+        // keepdims=0 で縮約軸を除く。空 axes は全縮約。範囲外の軸は縮約しない扱い（上界側）
+        Op::ReduceSum => {
+            let x = shape_of(v(0)?);
+            let axes: Vec<usize> = i64v(v(1)?)
+                .ok()?
+                .data()
+                .iter()
+                .filter_map(|&ax| normalize_axis(ax, x.len()).ok())
+                .collect();
+            let all = i64v(v(1)?).ok()?.data().is_empty();
+            let kept = x
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !all && !axes.contains(k))
+                .fold(1usize, |acc, (_, &d)| acc.saturating_mul(d));
+            (kept, 4)
+        }
+        // softmax_f64 が行ごとに exp と確率の 2 本（各 f64 × 最後の軸）を一時に持つ
+        Op::Softmax { f64_out: true } => {
+            let x = shape_of(v(0)?);
+            let tmp = x.last().copied().unwrap_or(0).saturating_mul(16);
+            return Some(
+                numel(v(0)?)
+                    .saturating_mul(8)
+                    .saturating_add(tmp)
+                    .saturating_add(expanded),
+            );
+        }
+        Op::Softmax { f64_out: false } | Op::LogSoftmax => (numel(v(0)?), 4),
     };
-    Some(n.saturating_mul(size))
+    Some(n.saturating_mul(size).saturating_add(expanded))
 }
 
 fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, BackendError> {
@@ -668,43 +764,25 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
     for &i in &step.ins {
         a.push(f.take(i)?);
     }
+    // 確保の前に、入力を保持したままの量へ演算の確保量を足して上限と照合する（REQ-39）
+    let need = alloc_bound(&step.op, &a).ok_or(BackendError::Failed)?;
+    if f.live.saturating_add(need) > MAX_LIVE_BYTES {
+        return Err(BackendError::Failed);
+    }
     // 所有権を要る形状演算は、入力を唯一の持ち主にしてからデータをコピーせず渡す
     if matches!(step.op, Op::Reshape | Op::Unsqueeze) {
         let mut it = a.into_iter();
         let (x, s) = (it.next(), it.next());
-        // データは移動するだけで二重にならないので、入力は先に手放す
-        f.release();
-        let x = x.ok_or(BackendError::Failed)?;
-        // 他の消費者と共有中だと own() が全体を複製する。確保前に保持量へ合算して検査する（REQ-39）
-        if Arc::strong_count(&x) > 1 && f.live.saturating_add(value_bytes(&x)) > MAX_LIVE_BYTES {
-            return Err(BackendError::Failed);
-        }
-        let (x, s) = (own(x), s.ok_or(BackendError::Failed)?);
+        let (x, s) = (
+            own(x.ok_or(BackendError::Failed)?),
+            s.ok_or(BackendError::Failed)?,
+        );
         let s = i64v(&s)?;
         return Ok(vec![if matches!(step.op, Op::Reshape) {
             same_type!(x, t => reshape(t, s))
         } else {
             same_type!(x, t => unsqueeze(t, s))
         }]);
-    }
-    // f32 へ展開する遅延重みの一時領域を、確保前に保持量の上限へ予約して検査する（REQ-39）。
-    // Gemm の重み・Gather の表・Shape・Cast は展開せずに読むので数えない。
-    let expanded = a
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| match step.op {
-            Op::Gemm => *i != 1,
-            Op::Gather => *i != 0,
-            Op::Shape | Op::Cast => false,
-            _ => true,
-        })
-        .fold(0usize, |acc, (_, v)| match v.as_ref() {
-            Value::LazyF32(t) => acc.saturating_add(t.data().len().saturating_mul(4)),
-            _ => acc,
-        });
-    let out = out_bytes_bound(&step.op, &a).ok_or(BackendError::Failed)?;
-    if f.live.saturating_add(expanded).saturating_add(out) > MAX_LIVE_BYTES {
-        return Err(BackendError::Failed);
     }
     let arg = |i: usize| -> Result<&Value, BackendError> {
         a.get(i).map(|v| v.as_ref()).ok_or(BackendError::Failed)
@@ -901,23 +979,146 @@ mod tests {
             i64s(vec![], vec![i64::MIN]),
             i64s(vec![], vec![-1]),
         ];
-        assert!(out_bytes_bound(&Op::Range, &a).unwrap() > MAX_LIVE_BYTES);
+        assert!(alloc_bound(&Op::Range, &a).unwrap() > MAX_LIVE_BYTES);
     }
 
     #[test]
     fn req39_bound_uses_i64_size_and_broadcast_batch() {
         let e = [i64s(vec![], vec![1]), i64s(vec![1], vec![1 << 28])];
-        assert_eq!(out_bytes_bound(&Op::Expand, &e), Some((1usize << 28) * 8));
+        assert_eq!(alloc_bound(&Op::Expand, &e), Some((1usize << 28) * 8));
         let x = Arc::new(f32s_shape(vec![4, 2, 3, 5]));
         let w = Arc::new(f32s_shape(vec![4, 2, 5, 7]));
-        assert_eq!(
-            out_bytes_bound(&Op::MatMul, &[x, w]),
-            Some(4 * 2 * 3 * 7 * 4)
-        );
+        assert_eq!(alloc_bound(&Op::MatMul, &[x, w]), Some(4 * 2 * 3 * 7 * 4));
     }
 
     fn f32s_shape(shape: Vec<usize>) -> Value {
         let n = shape.iter().product();
         Value::F32(Tensor::new(shape, vec![0.0; n]).unwrap())
+    }
+
+    /// 保持量 1 GiB を確保する直前の値表（残り 1 GiB - 1 バイト）。
+    fn nearly_full(n_slots: usize) -> Frame {
+        Frame {
+            vals: vec![None; n_slots],
+            left: vec![1; n_slots],
+            first_dyn: 0,
+            live: MAX_LIVE_BYTES - (1 << 30) + 1,
+            held: 0,
+        }
+    }
+
+    /// 縮約軸が空だと出力は入力より大きい。FLOAT [0, 2^28] を axes=[0] で縮約すると入力 0 バイト・
+    /// 出力 1 GiB で、入力からの見積もりでは確保前の検査を素通りしていた（REQ-39・TASK-41.6-5）。
+    #[test]
+    fn req39_reduce_sum_over_empty_axis_is_bounded_by_output_shape() {
+        let x = Arc::new(f32s_shape(vec![0, 1 << 28]));
+        let axes = i64s(vec![1], vec![0]);
+        let a = [x.clone(), axes.clone()];
+        assert_eq!(alloc_bound(&Op::ReduceSum, &a), Some(1 << 30));
+        // 空 axes は全縮約でスカラー
+        assert_eq!(
+            alloc_bound(&Op::ReduceSum, &[x.clone(), i64s(vec![0], vec![])]),
+            Some(4)
+        );
+        let mut f = nearly_full(2);
+        f.vals = vec![Some(x), Some(axes)];
+        let step = Step {
+            op: Op::ReduceSum,
+            ins: vec![0, 1],
+            outs: vec![],
+        };
+        assert!(matches!(
+            exec(&step, &mut f, Instant::now() + Duration::from_secs(60)),
+            Err(BackendError::Failed)
+        ));
+    }
+
+    /// 先頭軸が 0 の表でも Gather の出力は indices × 行の大きさ（REQ-39・TASK-41.6-5）。
+    #[test]
+    fn req39_gather_from_empty_table_is_bounded_by_output_shape() {
+        let d = Arc::new(f32s_shape(vec![0, 1 << 28]));
+        let idx = i64s(vec![1], vec![0]);
+        assert_eq!(
+            alloc_bound(&Op::Gather, &[d.clone(), idx.clone()]),
+            Some(1 << 30)
+        );
+        let mut f = nearly_full(2);
+        f.vals = vec![Some(d), Some(idx)];
+        let step = Step {
+            op: Op::Gather,
+            ins: vec![0, 1],
+            outs: vec![],
+        };
+        assert!(matches!(
+            exec(&step, &mut f, Instant::now() + Duration::from_secs(60)),
+            Err(BackendError::Failed)
+        ));
+    }
+
+    /// カーネル内の一時領域も確保量に含める（Where の (cond, x) の組・softmax_f64 の行）。
+    #[test]
+    fn req39_bound_includes_kernel_temporaries() {
+        let c = Arc::new(Value::Bool(Tensor::new(vec![3], vec![true; 3]).unwrap()));
+        let x = Arc::new(f32s(3));
+        assert_eq!(
+            alloc_bound(&Op::Where, &[c, x.clone(), x.clone()]),
+            Some(3 * 4 + 3 * 8)
+        );
+        assert_eq!(
+            alloc_bound(&Op::Softmax { f64_out: true }, &[x]),
+            Some(3 * 8 + 3 * 16)
+        );
+        // bf16 → 遅延 f32 の Cast は確保しない
+        let w = Arc::new(Value::RawBf16(Arc::new(
+            Tensor::new(vec![2], vec![0u16; 2]).unwrap(),
+        )));
+        assert_eq!(alloc_bound(&Op::Cast, &[w]), Some(0));
+    }
+
+    /// 値表に残る動的スロットの合計バイト数（`live` が一致すべき実保持量）。
+    fn dyn_bytes(f: &Frame) -> usize {
+        f.vals
+            .iter()
+            .skip(f.first_dyn)
+            .flatten()
+            .map(|v| value_bytes(v))
+            .sum()
+    }
+
+    /// 入力 `ids` も store で計上し、最後の消費で引く量と対にする。直接登録していたときは
+    /// 計上していない ids の分まで引かれ、保持量が実際より少なくなっていた（REQ-39・TASK-41.6-5）。
+    #[test]
+    fn req39_ids_are_counted_like_intermediates() {
+        // ids [1,3] → Cast → x、ids → Cast → y、Add(x, y) → z、Softmax(f64) → probs [1,3]
+        let st = |op, ins: Vec<usize>, out| Step {
+            op,
+            ins,
+            outs: vec![out],
+        };
+        let m = ScoringModel {
+            steps: vec![
+                st(Op::Cast, vec![0], 1),
+                st(Op::Cast, vec![0], 2),
+                st(Op::Add, vec![1, 2], 3),
+                st(Op::Softmax { f64_out: true }, vec![3], 4),
+            ],
+            n_slots: 5,
+            base: vec![None; 5],
+            uses: vec![2, 1, 1, 1, 0],
+            ids_slot: 0,
+            out_slot: 4,
+            n_classes: 3,
+        };
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut f = m.start(&[1, 2, 3]).unwrap();
+        assert_eq!(f.live, 3 * 8);
+        // 各ノードの後で、計上量が値表に実際に残る量と一致する
+        for s in &m.steps {
+            m.step(&mut f, s, until).unwrap();
+            assert_eq!(f.live, dyn_bytes(&f));
+        }
+        assert_eq!(f.live, 3 * 8);
+        let p = m.scores(&[1, 1, 1]).unwrap();
+        assert!(p.iter().all(|&v| (v - 1.0 / 3.0).abs() < 1e-9));
     }
 }
