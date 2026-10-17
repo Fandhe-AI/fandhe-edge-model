@@ -116,9 +116,6 @@ fn dims(d: &[usize]) -> Tensor<i64> {
 fn iv(v: &[i64]) -> Tensor<i64> {
     Tensor::new(vec![v.len()], v.to_vec()).unwrap()
 }
-fn sc(v: i64) -> Tensor<i64> {
-    Tensor::new(vec![], vec![v]).unwrap()
-}
 
 #[test]
 #[ignore = "measurement at Qwen2.5-1.5B shapes; run with --release (TASK-41.7-7)"]
@@ -140,8 +137,7 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
     let bq = f32t(&[H]);
     let bkv = f32t(&[NKV * HD]);
     let xi = f32t(&[T, INTER]);
-    for (name, x, tag) in [("prefix", &xp, T), ("block", &xb, K * M)] {
-        let _ = name;
+    for (x, tag) in [(&xp, T), (&xb, K * M)] {
         bench(
             &mut r,
             "Gemm q/o",
@@ -466,7 +462,6 @@ fn req41_qwen_ops_timing_at_1_5b_shapes() {
         true,
         || reduce_sum(&pk3, &iv(&[1, 2])),
     );
-    let _ = sc(0);
 
     // 1 推論あたりの推定 = 1 層の合計 x 28 + 層をまたがない処理（推定。実機の p95 ではない）。
     let layer_ns: u128 = r

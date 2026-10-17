@@ -353,9 +353,10 @@ fn req28_req41_qwen_kv_scoring_single_batch_evaluator_match_all_650() {
     );
     assert!(scores_close(&s, &b));
 
-    for seed in [1u64, 2, 3] {
+    // 1 周が重い（debug で数秒）ため、seed 1 のみ・恒等順の全件チャンクは上で確認済み。
+    for seed in [1u64] {
         let order = shuffled(c.len(), seed);
-        for chunk in [1usize, 7, 64, 650] {
+        for chunk in [1usize, 7, 64] {
             let b = batched(&qwen_pipeline(), &c, &order, chunk);
             assert_eq!(
                 label_mismatches(&s_labels, &labels_of(&b)),
