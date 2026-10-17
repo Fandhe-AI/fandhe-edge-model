@@ -134,6 +134,8 @@ make doctor      # 環境診断のみ（何も導入しない）
 
 - Rust 推論ランタイムの実物 `tokenizer.json` との全件一致（`fixtures/preprocess/tokenizer_vectors.json` の 23 件。REQ-41・TASK-41.4-5・#413）も実機前提（`#[ignore]`。`rust-ci` では `ignored`）: `FANDHE_EDGE_QWEN_DIR=<dir> cargo test -p fandhe-edge-runtime --test tokenizer_golden -- --ignored --exact req41_real_tokenizer_vectors_all_match`。環境変数が無いまま実行すると失敗する。合成 tokenizer での全件一致は既定の `make test` で実行される（`env_isolation.rs` の `env -i` を含む）
 
+- Qwen の演算ごとの処理時間の計測（REQ-41・TASK-41.7-7・#421）は 1.5B 形状の重い計測で正しさの検査ではないため `#[ignore]`（要 `--release`・数十秒・約 0.5 GB）: `cargo test -p fandhe-edge-runtime --release --test qwen_ops_timing -- --ignored --nocapture`。証拠種別はテストハーネス（合成重み）で、結果は [docs/design/qwen2-scoring-onnx-ops.md](docs/design/qwen2-scoring-onnx-ops.md) の 7 節
+
 ### 学習ワーカーの起動契約（Issue #12）
 
 - 学習ワーカー（`trainer/`）は `package = false`（配布パッケージを持たないスタブ）のため、外部プロセスからの起動は唯一の起動口 `trainer/launch.py` を経由する契約とする: `<venv の python> -I trainer/launch.py train --request <path>`（`-I` 隔離モード必須。`trainer/launch.py`・`trainer/src/fandhe_edge_trainer/cli.py`・`trainer/src/fandhe_edge_trainer/supervisor.py::worker_argv` のモジュール docstring 参照）
