@@ -12,6 +12,7 @@ seed 固定の乱数重み）を学習ワーカーの CLI（`launch.py train`）
 - 合成データのみ（外部データ・LLM 生成物・実データは使わない）。通信なし（REQ-38）
 - 統合重みは bf16 に丸められるため、f32 の MLX と順位が入れ替わりうる僅差
   （上位 2 つの確率差が `NEAR_TIE_MARGIN` 未満）のケースは記録から除外し、件数を記録する
+  （僅差でない MLX との不一致は除外せず失敗させる）
 - 手順: `uv --no-config run --locked --directory trainer python tools/gen_qwen2_parity_fixture.py
   --out ../fixtures/qwen2_parity --overwrite`
 """
@@ -185,9 +186,12 @@ def generate(out_dir: Path, overwrite: bool) -> None:
         p = _ref_probs(out_dir, ids)
         order = np.argsort(-p, kind="stable")
         mlx_index = LABELS.index(predicted[cid])
-        if float(p[order[0]] - p[order[1]]) < NEAR_TIE_MARGIN or int(order[0]) != mlx_index:
+        if float(p[order[0]] - p[order[1]]) < NEAR_TIE_MARGIN:
             excluded += 1
             continue
+        if int(order[0]) != mlx_index:
+            # 僅差でない不一致は書き出し不具合の疑いがあるため、除外せず生成を失敗させる
+            raise SystemExit(f"non-near-tie mismatch: {cid} ref={int(order[0])} mlx={mlx_index}")
         cases.append(
             {
                 "name": cid,

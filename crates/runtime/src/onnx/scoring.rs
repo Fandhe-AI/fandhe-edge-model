@@ -558,6 +558,24 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
             same_type!(x, t => unsqueeze(t, s))
         }]);
     }
+    // f32 へ展開する遅延重みの一時領域を、確保前に保持量の上限へ予約して検査する（REQ-39）。
+    // Gemm の重み・Gather の表・Shape・Cast は展開せずに読むので数えない。
+    let expanded = a
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match step.op {
+            Op::Gemm => *i != 1,
+            Op::Gather => *i != 0,
+            Op::Shape | Op::Cast => false,
+            _ => true,
+        })
+        .fold(0usize, |acc, (_, v)| match v.as_ref() {
+            Value::LazyF32(t) => acc.saturating_add(t.data().len().saturating_mul(4)),
+            _ => acc,
+        });
+    if f.live.saturating_add(expanded) > MAX_LIVE_BYTES {
+        return Err(BackendError::Failed);
+    }
     let arg = |i: usize| -> Result<&Value, BackendError> {
         a.get(i).map(|v| v.as_ref()).ok_or(BackendError::Failed)
     };
