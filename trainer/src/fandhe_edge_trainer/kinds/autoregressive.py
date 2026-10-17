@@ -705,10 +705,10 @@ class ChoiceMappingTally:
         else:
             raise TypeError("unexpected choice mapping type")
 
-    def to_log_line(self) -> str:
-        """stderr 用の英語 1 行（件数のみ）。"""
+    def to_log_line(self, kind: str = "autoregressive") -> str:
+        """stderr 用の英語 1 行（件数のみ）。`kind` は行頭の種類名（`qwen2_lora` も共用）。"""
         return (
-            f"autoregressive choice mapping: mapped={self.mapped}"
+            f"{kind} choice mapping: mapped={self.mapped}"
             f" no_choice_match={self.no_choice_match} invalid_score={self.invalid_score}"
         )
 

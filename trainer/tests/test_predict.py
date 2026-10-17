@@ -130,7 +130,7 @@ def test_req18_unsupported_kind_is_rejected_as_invalid_request() -> None:
         predict.require_validation_prediction_support("bogus")
     assert exc_info.value.code == "invalid_request"
     assert exc_info.value.exit_code == ExitCode.INVALID_INPUT
-    for supported in ("c1", "c3", "autoregressive"):
+    for supported in ("c1", "c3", "autoregressive", "qwen2_lora"):
         predict.require_validation_prediction_support(supported)
 
 
