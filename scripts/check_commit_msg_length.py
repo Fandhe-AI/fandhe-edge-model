@@ -40,7 +40,7 @@ def main(argv: list[str]) -> int:
     with open(argv[1], encoding="utf-8") as f:
         bad = check(f.read())
     for no, n in bad:
-        msg = f"NG: {no} 行目が {n} 文字です（上限 {MAX_LEN} 文字。commitlint と同じ数え方）"
+        msg = f"NG: line {no} is {n} chars (max {MAX_LEN}, counted in UTF-16 units like commitlint)"
         print(msg, file=sys.stderr)
     return 1 if bad else 0
 

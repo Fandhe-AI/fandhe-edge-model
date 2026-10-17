@@ -259,5 +259,5 @@ commit-msg:
         if command -v python3 >/dev/null 2>&1; then
           python3 -I scripts/check_commit_msg_length.py {1} || exit 1
         else
-          echo "warn: python3 が無いため行長検査をスキップ（CI の commitlint で検査される）" >&2
+          echo "warn: python3 not found; skipping line-length check (CI commitlint still checks it)" >&2
         fi

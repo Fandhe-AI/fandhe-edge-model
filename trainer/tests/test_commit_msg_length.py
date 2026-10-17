@@ -39,3 +39,13 @@ def test_url_line_ok_but_long_plain_line_ng():
 
 def test_header_url_not_exempt():
     assert mod.check("ci: https://example.com/" + "a" * 100) == [(1, 124)]
+
+
+def test_main_reports_english_diagnostic(tmp_path, capsys):
+    f = tmp_path / "m"
+    f.write_text("ci: x\n\n" + "a" * 101)
+    assert mod.main(["x", str(f)]) == 1
+    assert (
+        capsys.readouterr().err
+        == "NG: line 3 is 101 chars (max 100, counted in UTF-16 units like commitlint)\n"
+    )
