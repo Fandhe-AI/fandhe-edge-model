@@ -35,19 +35,24 @@
 //! - 親の stdout 中継は最大 `MAX_OUTPUT_CAP` のバッファを持つ。親の書き込み停止は `OutputWatchdog` で回収する
 //! - 親が kill したとき、`--out` の OUT が途中まで書かれて残りうる（worker 内の見張りの exit 20 と同じ）
 //!
-//! 上限値は [`supervisor_config`] に集約する。種類ごとの安全上限（#578）はここを差し替える。
+//! 上限値は [`supervisor_config`] に集約する。種類ごとの安全上限（`safety_limits_for_kind`。#578・#435）は
+//! `kind` を [`peek_checked_kind`] で先読みして渡す。
+//! - 先読みと worker の読み取りの間にパッケージが差し替わると、変わるのは上限の選択だけ（緩い側へ誘導されうる）。
+//!   worker のガード検査と協調的な期限は実際の `kind` で効く
+//! - `kind` を読めない・許可外のときは厳しい上限（10 秒・2 GiB）に落とす（本来のエラーは worker が出す）
 
 use crate::args::{InferArgs, InferSource};
 use crate::error_report::default_message;
 use crate::infer_batch::{
     MAX_INFER_BATCH_OUTPUT_DURATION, OutputWatchdog, SINGLE_HARD_LIMIT_GRACE,
 };
+use crate::infer_guard::peek_checked_kind;
 use crate::output::write_error_report;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_guard::resource::{
-    DEFAULT_STDERR_CAP, GuardRunError, GuardedCommand, GuardedRunOutcome, INFER_TIME_LIMIT,
-    MAX_OUTPUT_CAP, ResourceConfigError, ResourceKind, ResourceLimitExceeded, RunConfig, TimeLimit,
-    run_with_limits,
+    DEFAULT_STDERR_CAP, GuardRunError, GuardedCommand, GuardedRunOutcome, MAX_OUTPUT_CAP,
+    ResourceConfigError, ResourceKind, ResourceLimitExceeded, RunConfig, SafetyLimits, TimeLimit,
+    run_with_limits, safety_limits_for_kind,
 };
 use fandhe_edge_runtime::pipeline::MAX_INFER_BATCH_DURATION;
 use std::ffi::OsString;
@@ -60,7 +65,7 @@ pub const WORKER_ENV: &str = "FANDHE_EDGE_INFER_WORKER";
 
 /// 親の時間上限を worker 内の上限より長くする猶予（暫定）。パッケージの読み込みと起動の時間も
 /// 親の時間に入るため、worker 自身の `limit_exceeded` JSON が先に出る余地を残す。
-// ponytail: 暫定 2 秒。大きいパッケージ（Qwen など）は種類ごとの上限（#578）で見直す。
+// ponytail: 暫定 2 秒。種類ごとの時間上限（#578・#435）に上乗せする固定値で、大きいパッケージの起動が長引くなら見直す。
 pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(2);
 
 /// 現在のプロセスが worker か。
@@ -69,16 +74,19 @@ pub fn is_worker() -> bool {
     std::env::var_os(WORKER_ENV).is_some_and(|v| v == "1")
 }
 
-/// 入力源ごとの監督設定。時間以外は既定（RSS 2 GiB。迂回しない）。
+/// 入力源と種類別の安全上限 `limits` からの監督設定（RSS は `limits.memory()`。迂回しない）。
 ///
 /// 親の時間上限は worker 内の上限（協調的な期限＋見張りまでの猶予）より必ず長い。
-/// 唯一の継ぎ目として、種類ごとの安全上限（#578）はここを差し替える。
+/// バッチの時間（全体 600 秒＋出力 60 秒）は種類に依らず追加学習の 60 秒より長いので据え置く。
 ///
 /// # Errors
 /// 上限が範囲外（定数から作るため通常は起きない）。
-pub fn supervisor_config(source: &InferSource) -> Result<RunConfig, ResourceConfigError> {
+pub fn supervisor_config(
+    source: &InferSource,
+    limits: SafetyLimits,
+) -> Result<RunConfig, ResourceConfigError> {
     let inner = match source {
-        InferSource::Text { .. } => INFER_TIME_LIMIT.saturating_add(SINGLE_HARD_LIMIT_GRACE),
+        InferSource::Text { .. } => limits.time().get().saturating_add(SINGLE_HARD_LIMIT_GRACE),
         InferSource::InputFile { .. } => {
             MAX_INFER_BATCH_DURATION.saturating_add(MAX_INFER_BATCH_OUTPUT_DURATION)
         }
@@ -88,6 +96,7 @@ pub fn supervisor_config(source: &InferSource) -> Result<RunConfig, ResourceConf
         MAX_OUTPUT_CAP,
         DEFAULT_STDERR_CAP,
     )
+    .map(|c| c.with_memory_limit(limits.memory()))
 }
 
 fn runtime_error() -> ErrorReport {
@@ -122,7 +131,9 @@ pub fn run<W: Write>(
     raw_args: impl IntoIterator<Item = OsString>,
     cwd: &Path,
 ) -> io::Result<ExitCode> {
-    let prepared = supervisor_config(&args.source)
+    let limits = peek_checked_kind(cwd, &args.package)
+        .map_or(SafetyLimits::STRICT, |k| safety_limits_for_kind(k.as_str()));
+    let prepared = supervisor_config(&args.source, limits)
         .map_err(|_| GuardRunError::InvalidConfig)
         .and_then(|config| {
             let exe = std::env::current_exe().map_err(|_| GuardRunError::Spawn)?;
@@ -221,12 +232,28 @@ mod tests {
 
     #[test]
     fn req39_config_text_is_12_5_seconds_and_file_is_662_seconds() {
-        let t = supervisor_config(&text()).unwrap();
-        assert_eq!(t.time_limit(), Duration::from_millis(12_500));
-        assert_eq!(t.memory_limit(), Some(2_147_483_648));
-        let f = supervisor_config(&file()).unwrap();
+        // 既存の 3 種と表に無い kind は厳しい側（10 秒・2 GiB）。
+        for kind in ["c1", "c3", "autoregressive", "unknown"] {
+            let l = safety_limits_for_kind(kind);
+            let t = supervisor_config(&text(), l).unwrap();
+            assert_eq!(t.time_limit(), Duration::from_millis(12_500));
+            assert_eq!(t.memory_limit(), Some(2_147_483_648));
+            let f = supervisor_config(&file(), l).unwrap();
+            assert_eq!(f.time_limit(), Duration::from_secs(662));
+            assert_eq!(f.memory_limit(), Some(2_147_483_648));
+        }
+    }
+
+    /// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類は 60 秒・8 GiB（親は 62.5 秒）。
+    #[test]
+    fn req39_config_qwen2_lora_is_62_5_seconds_and_8_gib() {
+        let l = safety_limits_for_kind("qwen2_lora");
+        let t = supervisor_config(&text(), l).unwrap();
+        assert_eq!(t.time_limit(), Duration::from_millis(62_500));
+        assert_eq!(t.memory_limit(), Some(8_589_934_592));
+        let f = supervisor_config(&file(), l).unwrap();
         assert_eq!(f.time_limit(), Duration::from_secs(662));
-        assert_eq!(f.memory_limit(), Some(2_147_483_648));
+        assert_eq!(f.memory_limit(), Some(8_589_934_592));
     }
 
     #[test]

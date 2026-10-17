@@ -906,11 +906,15 @@ where
     P: Preprocessor + Send + Sync + 'static,
     B: ScoringBackend + Send + Sync + 'static,
 {
+    let duration = call.duration;
     emit_infer_single_inner(
         out,
         pipeline,
         call,
-        default_single_limits(),
+        BatchLimits {
+            duration,
+            ..default_single_limits()
+        },
         StallPolicy::TerminateProcess,
     )
 }
@@ -946,6 +950,7 @@ where
             scope: &JudgmentScope::default(),
             id,
             text,
+            duration: limits.duration,
         },
         limits,
         StallPolicy::TerminateProcess,
@@ -960,6 +965,9 @@ pub(crate) struct SingleCall<'a> {
     pub(crate) scope: &'a JudgmentScope,
     pub(crate) id: &'a str,
     pub(crate) text: &'a str,
+    /// 協調的な期限（種類別の安全上限の時間。REQ-39・TASK-41.8・#435）。既定は
+    /// `core::limits::INFER_TIME_LIMIT`。
+    pub(crate) duration: Duration,
 }
 
 /// [`emit_infer_single_with_limits`] の本体。回収方式を選べる（crate 内部。REQ-39）。
@@ -981,6 +989,7 @@ where
         scope,
         id,
         text,
+        duration: _,
     } = call;
     let input = match InferInput::from_text(id, text, io) {
         Ok(input) => input,
@@ -1363,6 +1372,7 @@ mod tests {
                 scope,
                 id: "t",
                 text,
+                duration: fandhe_edge_core::limits::INFER_TIME_LIMIT,
             },
             Arc::new(InferencePipeline::new(UnitPre, MixBackend)),
         )

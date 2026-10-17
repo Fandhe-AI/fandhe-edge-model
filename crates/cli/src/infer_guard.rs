@@ -26,6 +26,9 @@
 //!    許可制の形式検査（ONNX のみ許可。pickle 偽装・非 ONNX は拒否）を通す
 //!    （形式不許可は `invalid_input`=64、超過は `limit_exceeded`=20。REQ-39）
 //!
+//! 監督層（`infer_supervisor`）は同じ経路で `kind` だけを先読みし（[`peek_checked_kind`]）、
+//! 種類別の安全上限（`safety_limits_for_kind`。#435）を選ぶ。
+//!
 //! # 未検証の項目（「検証済み」ではない）
 //!
 //! 本モジュールが行うのは経路の閉じ込め・形式の許可制と、指定時の版管理台帳との照合のみ。次は**まだ検査していない**ため、
@@ -96,21 +99,13 @@ pub struct PathFormatCheckedInputs {
     pub meta_bytes: Vec<u8>,
 }
 
-/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式を検査する。
-/// `kind_version` は許可リストで検査する（#174）。`args.version`（`--version-ledger`）があるときだけ、ONNX を
-/// 開く前に `artifact.json` のバイト列の sha256 を版管理台帳と照合する（#491）。ONNX・定義などパッケージ内の
-/// sha256 の自己整合は `stages::infer` が `artifact.json` の記録と照合する。
-///
-/// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
-///
-/// # Errors
-/// 経路の拒否は `invalid_input`（64）、`artifact.json` の上限超過は `limit_exceeded`（20）、
-/// 不正な内容は `invalid_input`、I/O 起因・非対応 OS は `runtime_error`（70）。
-pub fn check_infer_path_and_format(
+/// 閉じ込め → `artifact.json` の上限付き読み → 解析 → `kind` 許可リスト検査（手順 1〜4）。
+/// モデルのバイト列に触れる前の共通部分で、`infer` の監督層（[`peek_checked_kind`]）と共有する。
+fn read_meta_and_kind(
     workspace: &Path,
-    args: &InferArgs,
-) -> Result<PathFormatCheckedInputs, ErrorReport> {
-    let package = confine_package(workspace, &args.package).map_err(|e| e.to_error_report())?;
+    package: &Path,
+) -> Result<(ConfinedPackage, Vec<u8>, ArtifactOnnxRef, CheckedKind), ErrorReport> {
+    let package = confine_package(workspace, package).map_err(|e| e.to_error_report())?;
     let (meta_file, _) = package
         .open_member(Path::new(ARTIFACT_META_FILE))
         .map_err(|e| e.to_error_report())?;
@@ -125,6 +120,34 @@ pub fn check_infer_path_and_format(
     let kind = KindAllowlist::supported()
         .check(onnx_ref.kind())
         .map_err(|e| e.to_error_report())?;
+    Ok((package, bytes, onnx_ref, kind))
+}
+
+/// 親（監督層）が種類別の安全上限を選ぶために `kind` だけを読む（REQ-39・TASK-41.8・#435）。
+/// 閉じ込め・上限・許可リストは [`check_infer_path_and_format`] と同じ経路。失敗は `None`
+/// （呼び出し側は厳しい上限に落とす。本来のエラーは worker が出す）。
+#[must_use]
+pub fn peek_checked_kind(workspace: &Path, package: &Path) -> Option<CheckedKind> {
+    read_meta_and_kind(workspace, package)
+        .ok()
+        .map(|(_, _, _, k)| k)
+}
+
+/// `args.package` と `artifact.json` の `onnx_file` の経路を閉じ込め、ONNX ファイルを開いて形式を検査する。
+/// `kind_version` は許可リストで検査する（#174）。`args.version`（`--version-ledger`）があるときだけ、ONNX を
+/// 開く前に `artifact.json` のバイト列の sha256 を版管理台帳と照合する（#491）。ONNX・定義などパッケージ内の
+/// sha256 の自己整合は `stages::infer` が `artifact.json` の記録と照合する。
+///
+/// `workspace` はカレントディレクトリ（CLI の規約。容量計測 example と同じ）。
+///
+/// # Errors
+/// 経路の拒否は `invalid_input`（64）、`artifact.json` の上限超過は `limit_exceeded`（20）、
+/// 不正な内容は `invalid_input`、I/O 起因・非対応 OS は `runtime_error`（70）。
+pub fn check_infer_path_and_format(
+    workspace: &Path,
+    args: &InferArgs,
+) -> Result<PathFormatCheckedInputs, ErrorReport> {
+    let (package, bytes, onnx_ref, kind) = read_meta_and_kind(workspace, &args.package)?;
     // 版の検査も同様にモデルのバイト列を開く前に行う（REQ-39・PoC-20 ケース 7・TASK-39.6-1）。
     let kind_version = KindVersionAllowlist::supported()
         .check(kind, onnx_ref.kind_version())
