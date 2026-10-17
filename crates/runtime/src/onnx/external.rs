@@ -4,9 +4,9 @@
 //!
 //! 追加学習の種類（Qwen2.5-1.5B 級。bf16 で約 3.1 GB〔推定〕）は重みを 1 GiB 以下の shard に
 //! 分け、ONNX の `external_data` で参照する。本モジュールは [`super::proto`] が保留した参照を、
-//! 呼び出し側が渡す閉じ込め済みの `File` から読んで実体に置き換える。**未接続**: 呼び出し元の
-//! Qwen 実行器は #420・#424・#421 で追加する（kind 名は #424 で決まるため、[`super::ModelKind`]
-//! にも未登録。C1・C3 は [`super::STRICT_MODEL_LIMITS`] で外部データを拒否したまま）。
+//! 呼び出し側が渡す閉じ込め済みの `File` から読んで実体に置き換える。呼び出し元は
+//! [`super::OnnxBackend::from_bytes_with_shards`]（`qwen2_lora`。#434）。C1・C3 は
+//! [`super::STRICT_MODEL_LIMITS`] で外部データを拒否したまま。
 //!
 //! # 契約
 //!
@@ -37,8 +37,7 @@ const MAX_LOCATION_BYTES: usize = 128;
 
 /// 呼び出し側が閉じ込めて開いた shard 1 つ。
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) struct ExternalShard {
+pub struct ExternalShard {
     pub location: String,
     pub file: File,
     /// 呼び出し側（`artifact.json` 由来）が渡す期待 sha256。
@@ -154,7 +153,6 @@ fn read_err(location: &str, source: std::io::Error) -> OnnxLoadError {
 
 /// グラフの `External` を、閉じ込め済みの shard から読んだ値へ置き換える。成功時、`External` は
 /// 1 つも残らない。失敗時は `graph` の中身を信用してはならない（呼び出し側は捨てる）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn resolve_external(
     graph: &mut GraphProto,
     shards: Vec<ExternalShard>,

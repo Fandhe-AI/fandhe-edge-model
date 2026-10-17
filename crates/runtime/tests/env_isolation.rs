@@ -16,6 +16,9 @@
 
 #![cfg(unix)]
 
+#[path = "common/qwen2_package.rs"]
+#[allow(dead_code)] // 共有の読み込み関数のうち本テストで使わないものがある
+mod qwen2_package;
 #[path = "common/tokenizer_vectors.rs"]
 mod tokenizer_vectors;
 
@@ -36,6 +39,8 @@ const MAX_CASES_BYTES: u64 = 4 * 1024 * 1024;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
 /// 子の stdout・stderr を保持する上限。
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
+/// 子で照合する qwen2_lora のケース数。
+const QWEN2_CASES: usize = 8;
 /// 親から呼ぶ子テストの名前（変更時は親の `1 passed` 判定が失敗して気づける）。
 const CHILD_TEST: &str = "req32_env_i_child_infers_c1_c3_fixture";
 const KEYS_PREFIX: &str = "FANDHE_ENV_KEYS=";
@@ -109,6 +114,25 @@ fn req32_env_i_child_infers_c1_c3_fixture() {
         &tokenizer_vectors::preprocess_fixture("tokenizer_vectors_synthetic.json"),
     );
     assert_eq!(n, 189, "tokenizer vectors count");
+    // REQ-41: qwen2_lora の採点グラフも Python・環境変数なしで単体・バッチが学習側と一致する
+    // （debug ビルドでの実行時間のため先頭 `QWEN2_CASES` 件。全件は `tests/qwen2_parity.rs`）
+    let (qwen, _) = qwen2_package::load_pipeline();
+    let qcases: Vec<_> = qwen2_package::load_cases()
+        .into_iter()
+        .take(QWEN2_CASES)
+        .collect();
+    let qinputs: Vec<&str> = qcases.iter().map(|c| c.input.as_str()).collect();
+    let qbatch = qwen.infer_batch(&qinputs).expect("qwen2 infer_batch");
+    for (c, b) in qcases.iter().zip(&qbatch) {
+        let single = qwen.infer_one(&c.input).expect("qwen2 infer_one");
+        assert_eq!(single.label_index(), c.label, "qwen2: {}: label", c.name);
+        assert_eq!(
+            b.as_ref().expect("batch item"),
+            &single,
+            "qwen2: {}: batch differs from single",
+            c.name
+        );
+    }
     let mut keys: Vec<String> = std::env::vars_os()
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();

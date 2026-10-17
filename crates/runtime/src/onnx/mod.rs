@@ -42,7 +42,9 @@
 //! - エラーの 7 種終了コードへの写像は CLI 側の責務。想定は形式・内容の不正が
 //!   `invalid_input`（64）、上限超過が `limit_exceeded`（20）、ファイル I/O 失敗が
 //!   `runtime_error`（70）
-//! - 対応するのは C1・C3 のみ。`autoregressive`（REQ-19b）等の ONNX 読み込みは後続 TASK
+//! - 対応するのは C1・C3 と、追加学習 `qwen2_lora` の採点グラフ（[`scoring`]。外部データ付きで
+//!   [`OnnxBackend::from_bytes_with_shards`] だけが読める。REQ-41・#434）。`autoregressive`
+//!   （REQ-19b）等の ONNX 読み込みは後続 TASK
 //!   （実装済みを装わない。[`ModelKind::parse`] は `unsupported_kind` で拒否する）
 
 mod c1;
@@ -50,7 +52,10 @@ mod c3;
 mod external;
 pub mod ops;
 mod proto;
+mod scoring;
 mod wire;
+
+pub use external::ExternalShard;
 
 use crate::pipeline::{BackendError, InferencePipeline, ScoringBackend, TokenIds};
 use crate::preprocess::ByteEncodingPreprocessor;
@@ -107,9 +112,8 @@ pub const STRICT_MODEL_LIMITS: ModelLimits = ModelLimits {
     external: None,
 };
 
-/// 追加学習の種類（Qwen2.5-1.5B 級の採点グラフ）の上限。**暫定値（証拠種別: 推定）**。#431 の
-/// 書き出し実測で見直す。kind 名は #424（TASK-41.5-1）で決まるため [`ModelKind`] へ未接続
-/// （接続は Qwen 実行器の #420・#424・#421。実装済みを装わない）。
+/// 追加学習 `qwen2_lora`（Qwen2.5-1.5B 級の採点グラフ）の上限。**暫定値（証拠種別: 推定）**。#431 の
+/// 書き出し実測で見直す。[`ModelKind::Qwen2Lora`] に接続済み（#434）。
 ///
 /// - 本体: 重みは外部データへ出るので数千ノード・数 MB の見込みに対し 64 MiB
 /// - ノード: 28 層 × 約 60 ≒ 1700 の約 2.4 倍、initializer: 約 340 の 3 倍
@@ -149,6 +153,9 @@ pub enum ModelKind {
     C1,
     /// バイト CNN（`kind="c3"`）。
     C3,
+    /// 追加学習（Qwen2 + LoRA 統合の採点グラフ。`kind="qwen2_lora"`。REQ-41・#434）。
+    /// 重みは外部データなので [`OnnxBackend::from_bytes_with_shards`] だけが読み込める。
+    Qwen2Lora,
 }
 
 impl ModelKind {
@@ -158,14 +165,17 @@ impl ModelKind {
         match kind {
             "c1" => Ok(Self::C1),
             "c3" => Ok(Self::C3),
+            "qwen2_lora" => Ok(Self::Qwen2Lora),
             _ => Err(OnnxLoadError::UnsupportedKind),
         }
     }
 
-    /// この種類のモデル上限（C1・C3 は [`STRICT_MODEL_LIMITS`]）。
+    /// この種類のモデル上限（C1・C3 は [`STRICT_MODEL_LIMITS`]、`qwen2_lora` は
+    /// [`FINETUNE_MODEL_LIMITS`]）。
     pub fn limits(self) -> &'static ModelLimits {
         match self {
             Self::C1 | Self::C3 => &STRICT_MODEL_LIMITS,
+            Self::Qwen2Lora => &FINETUNE_MODEL_LIMITS,
         }
     }
 
@@ -174,6 +184,7 @@ impl ModelKind {
         match self {
             Self::C1 => "c1",
             Self::C3 => "c3",
+            Self::Qwen2Lora => "qwen2_lora",
         }
     }
 }
@@ -238,6 +249,7 @@ impl std::error::Error for OnnxLoadError {}
 enum Inner {
     C1(c1::C1Model),
     C3(c3::C3Model),
+    Scoring(scoring::ScoringModel),
 }
 
 /// 読み込み済みの ONNX モデル（C1 または C3）。[`ScoringBackend`] を実装する。
@@ -276,6 +288,10 @@ impl OnnxBackend {
 
     /// バイト列から復号する（sha256 の照合は呼び出し側。サイズ上限は [`ModelKind::limits`]）。
     pub fn from_bytes(bytes: &[u8], kind: ModelKind) -> Result<Self, OnnxLoadError> {
+        // 外部データを持つ種類は shard 無しでは読めない（C1・C3 の経路で誤って実行させない）
+        if kind.limits().external.is_some() {
+            return Err(OnnxLoadError::UnsupportedKind);
+        }
         if u64::try_from(bytes.len()).map_or(true, |n| n > kind.limits().max_model_file_bytes) {
             return Err(OnnxLoadError::LimitExceeded);
         }
@@ -283,6 +299,33 @@ impl OnnxBackend {
         let inner = match kind {
             ModelKind::C1 => Inner::C1(c1::C1Model::from_graph(&model.graph)?),
             ModelKind::C3 => Inner::C3(c3::C3Model::from_graph(&model.graph)?),
+            ModelKind::Qwen2Lora => return Err(OnnxLoadError::UnsupportedKind),
+        };
+        Ok(Self { kind, inner })
+    }
+
+    /// 外部データ（分割した重み）を持つ種類（`qwen2_lora`）を読み込む（REQ-41・REQ-39・#434）。
+    ///
+    /// `shards` は呼び出し側が閉じ込めて開いた `File` と期待 sha256 の組で、参照集合と過不足なく
+    /// 一致し、読みながら sha256 を照合する（[`external`]。不一致は fail-closed）。外部データを
+    /// 許さない種類（C1・C3）は [`OnnxLoadError::UnsupportedKind`]。
+    pub fn from_bytes_with_shards(
+        bytes: &[u8],
+        kind: ModelKind,
+        shards: Vec<ExternalShard>,
+    ) -> Result<Self, OnnxLoadError> {
+        let limits = kind.limits();
+        let ext = limits
+            .external
+            .as_ref()
+            .ok_or(OnnxLoadError::UnsupportedKind)?;
+        let mut model = decode_checked(bytes, limits)?;
+        external::resolve_external(&mut model.graph, shards, ext)?;
+        let inner = match kind {
+            ModelKind::Qwen2Lora => {
+                Inner::Scoring(scoring::ScoringModel::from_graph(&model.graph)?)
+            }
+            _ => return Err(OnnxLoadError::UnsupportedKind),
         };
         Ok(Self { kind, inner })
     }
@@ -297,6 +340,7 @@ impl OnnxBackend {
         match &self.inner {
             Inner::C1(m) => m.n_classes(),
             Inner::C3(m) => m.n_classes(),
+            Inner::Scoring(m) => m.n_classes(),
         }
     }
 }
@@ -304,10 +348,14 @@ impl OnnxBackend {
 impl ScoringBackend for OnnxBackend {
     fn scores(&self, ids: &TokenIds) -> Result<Vec<f64>, BackendError> {
         let ids = ids.as_slice();
+        if let Inner::Scoring(m) = &self.inner {
+            return m.scores(ids);
+        }
         check_token_ids(ids)?;
         match &self.inner {
             Inner::C1(m) => m.scores(ids),
             Inner::C3(m) => m.scores(ids),
+            Inner::Scoring(_) => Err(BackendError::Failed),
         }
     }
 
@@ -317,10 +365,14 @@ impl ScoringBackend for OnnxBackend {
         limit: std::time::Duration,
     ) -> Result<Vec<f64>, BackendError> {
         let ids = ids.as_slice();
+        if let Inner::Scoring(m) = &self.inner {
+            return m.scores_limited(ids, limit);
+        }
         check_token_ids(ids)?;
         match &self.inner {
             Inner::C1(m) => m.scores_limited(ids, limit),
             Inner::C3(m) => m.scores_limited(ids, limit),
+            Inner::Scoring(_) => Err(BackendError::Failed),
         }
     }
 }
