@@ -268,16 +268,8 @@ fn compile_node(n: &NodeProto) -> Result<Op, OnnxLoadError> {
                 return bad();
             }
         }
-        Op::ReduceSum => {
-            if req_int(n, "keepdims")? != 0 {
-                return bad();
-            }
-        }
-        Op::Softmax { .. } | Op::LogSoftmax => {
-            if req_int(n, "axis")? != -1 {
-                return bad();
-            }
-        }
+        Op::ReduceSum if req_int(n, "keepdims")? != 0 => return bad(),
+        Op::Softmax { .. } | Op::LogSoftmax if req_int(n, "axis")? != -1 => return bad(),
         _ => {}
     }
     Ok(op)
@@ -412,6 +404,7 @@ impl ScoringModel {
             left: self.uses.clone(),
             first_dyn: self.ids_slot,
             live: 0,
+            held: 0,
         };
         debug_assert_eq!(f.vals.len(), self.n_slots);
         let t = Tensor::new(vec![1, ids.len()], ids.to_vec()).map_err(op_err)?;
@@ -424,9 +417,11 @@ impl ScoringModel {
             if outs.len() != step.outs.len() {
                 return Err(BackendError::Failed);
             }
+            // 出力の保持量検査は入力がまだ生きている状態で行い、済んでから入力を手放す
             for (&slot, v) in step.outs.iter().zip(outs) {
                 f.store(slot, v, slot == self.out_slot)?;
             }
+            f.release();
         }
         // 最終演算が期限を跨いだ場合も超過として返す
         if started.elapsed() > limit {
@@ -460,6 +455,9 @@ struct Frame {
     first_dyn: usize,
     /// 実行中に保持している値の合計バイト数。
     live: usize,
+    /// 実行中の演算が最後に消費した入力のバイト数。演算が終わるまで `live` に残す（入力の
+    /// Arc は演算が終わるまで解放されない）。
+    held: usize,
 }
 
 /// 同時に保持する中間値の合計バイト数の上限（REQ-39。guard の RSS 上限 2 GiB と同じ桁）。
@@ -471,7 +469,8 @@ fn value_bytes(v: &Value) -> usize {
         Value::F64(t) => t.data().len() * 8,
         Value::I64(t) => t.data().len() * 8,
         Value::Bool(t) => t.data().len(),
-        Value::RawBf16(t) | Value::LazyF32(t) => t.data().len() * 2,
+        // bf16 の重みは initializer の共有バッファで、実確保の中間値ではないので数えない
+        Value::RawBf16(_) | Value::LazyF32(_) => 0,
     }
 }
 
@@ -501,9 +500,15 @@ impl Frame {
             && slot >= self.first_dyn
             && let Some(x) = &v
         {
-            self.live = self.live.saturating_sub(value_bytes(x));
+            self.held = self.held.saturating_add(value_bytes(x));
         }
         v.ok_or(BackendError::Failed)
+    }
+
+    /// 演算が終わった入力を `live` から手放す。
+    fn release(&mut self) {
+        self.live = self.live.saturating_sub(self.held);
+        self.held = 0;
     }
 }
 
@@ -538,6 +543,87 @@ macro_rules! same_type {
     };
 }
 
+fn shape_of(v: &Value) -> &[usize] {
+    match v {
+        Value::F32(t) => t.shape(),
+        Value::F64(t) => t.shape(),
+        Value::I64(t) => t.shape(),
+        Value::Bool(t) => t.shape(),
+        Value::RawBf16(t) | Value::LazyF32(t) => t.shape(),
+    }
+}
+
+fn numel(v: &Value) -> usize {
+    shape_of(v).iter().fold(1usize, |a, &d| a.saturating_mul(d))
+}
+
+/// 出力の要素数の上界（バイトは f32 想定の 4 倍）。確保前の保持量検査に使う（REQ-39）。
+/// 上界を作れない入力は `None`。
+fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
+    let v = |i: usize| a.get(i).map(|x| x.as_ref());
+    let bcast = |dims: &[&[usize]]| {
+        let rank = dims.iter().map(|d| d.len()).max().unwrap_or(0);
+        (0..rank).fold(1usize, |acc, k| {
+            let m = dims
+                .iter()
+                .filter_map(|d| (d.len() + k).checked_sub(rank).and_then(|j| d.get(j)))
+                .copied()
+                .max()
+                .unwrap_or(1);
+            acc.saturating_mul(m)
+        })
+    };
+    let n = match op {
+        Op::Gemm | Op::MatMul => {
+            let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
+            let rows = x
+                .iter()
+                .rev()
+                .skip(1)
+                .fold(1usize, |a, &d| a.saturating_mul(d));
+            let cols = if matches!(op, Op::Gemm) {
+                w.first()?
+            } else {
+                w.last()?
+            };
+            let batch = w
+                .iter()
+                .rev()
+                .skip(2)
+                .fold(1usize, |a, &d| a.saturating_mul(d));
+            rows.saturating_mul(*cols).saturating_mul(batch)
+        }
+        Op::Gather => {
+            let (d, i) = (v(0)?, v(1)?);
+            let row = numel(d) / shape_of(d).first().copied().filter(|&n| n > 0).unwrap_or(1);
+            numel(i).saturating_mul(row)
+        }
+        Op::Expand => {
+            let dims: Vec<usize> = i64v(v(1)?)
+                .ok()?
+                .data()
+                .iter()
+                .map(|&d| usize::try_from(d).ok())
+                .collect::<Option<_>>()?;
+            bcast(&[shape_of(v(0)?), &dims])
+        }
+        Op::Range => {
+            let g = |i: usize| i64v(v(i)?).ok()?.data().first().copied();
+            let (s, l, d) = (g(0)?, g(1)?, g(2)?);
+            if d == 0 {
+                return None;
+            }
+            usize::try_from(l.saturating_sub(s).saturating_add(d - d.signum()) / d).unwrap_or(0)
+        }
+        _ => {
+            let shapes: Vec<&[usize]> = a.iter().map(|x| shape_of(x)).collect();
+            let sum = a.iter().fold(0usize, |acc, x| acc.saturating_add(numel(x)));
+            bcast(&shapes).max(sum)
+        }
+    };
+    Some(n.saturating_mul(4))
+}
+
 fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, BackendError> {
     let mut a: Vec<Arc<Value>> = Vec::with_capacity(step.ins.len());
     for &i in &step.ins {
@@ -547,6 +633,8 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
     if matches!(step.op, Op::Reshape | Op::Unsqueeze) {
         let mut it = a.into_iter();
         let (x, s) = (it.next(), it.next());
+        // データは移動するだけで二重にならないので、入力は先に手放す
+        f.release();
         let (x, s) = (
             own(x.ok_or(BackendError::Failed)?),
             s.ok_or(BackendError::Failed)?,
@@ -573,7 +661,8 @@ fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, Backen
             Value::LazyF32(t) => acc.saturating_add(t.data().len().saturating_mul(4)),
             _ => acc,
         });
-    if f.live.saturating_add(expanded) > MAX_LIVE_BYTES {
+    let out = out_bytes_bound(&step.op, &a).ok_or(BackendError::Failed)?;
+    if f.live.saturating_add(expanded).saturating_add(out) > MAX_LIVE_BYTES {
         return Err(BackendError::Failed);
     }
     let arg = |i: usize| -> Result<&Value, BackendError> {
@@ -725,6 +814,7 @@ mod tests {
             left: vec![0, 1, 1],
             first_dyn: 0,
             live: 0,
+            held: 0,
         }
     }
 
@@ -751,6 +841,11 @@ mod tests {
         assert_eq!(f.store(2, f32s(1), false), Err(BackendError::Failed));
         f.live = 32;
         f.take(1).unwrap();
+        assert_eq!(f.live, 32);
+        f.release();
         assert_eq!(f.live, 0);
+        // 共有 initializer の bf16 は数えない
+        let w = Value::LazyF32(Arc::new(Tensor::new(vec![2], vec![0u16; 2]).unwrap()));
+        assert_eq!(value_bytes(&w), 0);
     }
 }
