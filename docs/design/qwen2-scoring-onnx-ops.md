@@ -4,7 +4,7 @@
 
 - 本書は自作の推論バックエンド（`crates/runtime/src/onnx/`）が Qwen2 系の採点グラフに対して許す演算・属性・データ型・rank の一覧と、範囲外を除外する方針を定める。**一覧が唯一の正**で、変更は本書の更新を先に行う
 - 本書は文書のみ。コード・fixture・`docs/spec` は変更しない。演算の実装は #416〜#419・#581、書き出しは #431、除外理由の実装は #433
-- 証拠の種別: 本書の構成は設計（参照グラフ）。ReferenceEvaluator 等による数値照合は**未検証**で、#431 で確認する。件数・容量の数値は「推定」と明記する
+- 証拠の種別: 本書の構成は設計（参照グラフ）。ReferenceEvaluator による数値照合は #431 で確認した（§8）。件数・容量の数値は「推定」と明記する
 - autoregressive（#420・REQ-19b）の演算は対象外。本書の一覧に入れない
 
 ## 1. 前提と範囲
@@ -60,7 +60,7 @@
 | Cast | bf16 の重みの展開・位置の型変換 | `to=FLOAT` だけ。入力は BFLOAT16（initializer のみ）か INT64 | #416 |
 | Shape | T の取得 | 属性 start・end は使わない | #417 |
 | Gather | 埋め込み・スカラー T | `axis=0`。data は FLOAT か `Cast(BFLOAT16 の initializer)`（埋め込み。2 節の融合実行）か、Shape の出力である INT64（形状取得用。出力は INT64 のまま Range へ渡す）。index は INT64 で、範囲外は拒否 | #417 |
-| GatherElements | 目標 token の対数確率 | `axis=-1`。index は INT64 で、範囲外は拒否 | #417 |
+| GatherElements | 目標 token の対数確率 | `axis` は最後の軸（負の値 -1 または rank-1 の正の値。書き出しは正の値 `axis=2` で書く）。index は INT64 で、範囲外は拒否 | #417 |
 | Reshape | heads・平坦化 | shape は INT64 の入力。0 と -1 の意味は opset 13 のとおり | #417 |
 | Transpose | heads・k の転置 | `perm` は rank と一致する順列 | #417 |
 | Unsqueeze | 次元の追加 | axes は入力（opset 13） | #417 |
@@ -125,3 +125,11 @@
 - 1 層の合計は約 6.9 s、1 推論あたりの推定は約 199 s（層 28 × 6.9 s + lm_head 等 6.6 s）。容量・遅延の目標（p95 250 ms 未満。REQ-31）の約 800 倍で、この素朴な実装のままでは満たせない
 - 支配的なのは Gemm（約 1.1 GMAC/s。bf16 を積和の中で f32 に展開する単一スレッドのループ）。要素ごとの演算も約 3.7 ns/要素で、ブロードキャストの汎用経路が遅い。速度の改善（k 昇順の加算順を保つ範囲での並べ替え・ブロック化・並列化）は本 issue の対象外で、別 issue での判断が要る
 - Where の 3 入力ストライドループ化（`mask_rope.rs` の ponytail コメント）: Where は 1.0 ms で層あたり 1 回、1 推論で約 28 ms。Gemm に比べて小さく、現時点では不要
+
+## 8. 書き出しの実測（TASK-41.6-2・#431）
+
+- 実装: `trainer/src/fandhe_edge_trainer/qwen2_onnx.py`（`export_scoring_onnx`）。受け入れテスト `trainer/tests/test_qwen2_onnx_export.py` が本書 §3 の表を読んで、書き出した ONNX の演算・属性・dtype・rank を照合する
+- 数値照合: ReferenceEvaluator の `probs` と、統合・bf16 丸め済みの重みを読み込んだ f32 の MLX モデルの採点（`score_labels` → softmax）の最大絶対差は 7.2e-7（tie と非 tie の合成モデル・各 3 入力。2026-10-17）。証拠種別: テストハーネス。実重みでの確認は #434・#435
+- 件数: 層数 28（1.5B と同じ層構造・次元は極小・tie）でノード 3748・initializer 366（#581 の暫定上限 4096・1024 内）。1 層あたりのノードは prefix とブロックで約 130。件数は層数と tie の有無で決まる。証拠種別: テストハーネス
+- 設計からの変更: GatherElements の `axis` は ONNX 1.23 の ReferenceEvaluator が負の値を受けないため正の値で書く。ReferenceEvaluator の GatherElements は軸の長さが 64 を超えると失敗する（`np.choose` の制限）ため、テストでは同じ意味の `take_along_axis` に差し替える
+- 重みの置き場所: 閾値（1024 バイト）以上は shard `weights-NNNNN.bin`（1 テンソルは 1 shard に収める。1 GiB 超の単一テンソルは `limit_exceeded`。7B の非 tie の `lm_head` が該当し、除外の記録は #433）。小さな定数・重みは inline の `raw_data`

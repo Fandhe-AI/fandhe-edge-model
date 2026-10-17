@@ -14,8 +14,9 @@ seed は Python・NumPy・MLX のそれぞれで明示的に設定する（バ�
 LoRA の初期化は `mx.random.key(seed)`）。時間予算に達したら打ち切らず `limit_exceeded`（20）
 で止める。予測は選択肢の条件付き対数尤度の採点（`predict_records`。#427。長さ正規化なし）で、
 argmax を対応づけ (b)（`autoregressive.map_scores_to_choice`）で選択肢 ID に解決し、解決できない
-ものは `status:"error"`（判定不能）にする。ONNX 書き出しは #431・#432（未実装。`runtime_error`）で、
-CLI の `train` 全体は書き出し未実装のためまだ完走しない。
+ものは `status:"error"`（判定不能）にする。ONNX の採点グラフと shard の書き出しは
+`qwen2_onnx.export_scoring_onnx`（#431）。`export_onnx`（Kind 契約）への接続と shard の
+artifact.json への記録は #432（未実装。`runtime_error`）で、CLI の `train` 全体はまだ完走しない。
 mlx は関数内で遅延 import する（選択口の import を軽く保つ）。
 """
 
@@ -56,7 +57,7 @@ _DTYPES = ("bfloat16", "float32")
 #: 採点 1 回の forward に入れる選択肢の数（K が大きくてもメモリが線形に伸びない。PoC-26 と同値）
 SCORE_CHUNK = 8
 
-_NOT_IMPLEMENTED = "kind 'qwen2_lora' export_onnx is not implemented yet"
+_NOT_IMPLEMENTED = "kind 'qwen2_lora' export_onnx is not wired to the CLI yet"
 
 
 def _invalid_config(message: str) -> WorkerError:
@@ -332,6 +333,22 @@ def score_labels(
     )
 
 
+def choice_token_ids(tokenizer: Any, label_order: list[str], vocab_size: int) -> list[list[int]]:
+    """選択肢ごとの採点対象 token 列（ラベル token 列＋`<|im_end|>`）を返す。
+
+    `predict_records`（MLX の採点）と `qwen2_onnx.export_scoring_onnx`（グラフ内の定数）が
+    同じ列を使うための共有点（REQ-41。ずれると書き出しモデルと学習側の予測が食い違う）。
+    語彙外の id を含むなら `invalid_data`（64）。
+    """
+    end = tokenizer.special_ids["im_end"]
+    label_ids = [[*tokenizer.encode(x), end] for x in label_order]
+    if any(t >= vocab_size for ids in label_ids for t in ids):
+        raise WorkerError(
+            "invalid_data", "token id outside the model vocabulary", ExitCode.INVALID_INPUT
+        )
+    return label_ids
+
+
 def predict_records(
     trained: Qwen2LoraTrainedModel,
     rows: list[tuple[str, str]],
@@ -352,12 +369,7 @@ def predict_records(
     # ponytail: 全件をリストで返す。大量件数を流す用途ではジェネレータ化する。
     budget.check_total_tokens(len(rows), cfg["max_seq_length"])
     vocab = trained.model.config.vocab_size
-    end = tok.special_ids["im_end"]
-    label_ids = [[*tok.encode(x), end] for x in order]
-    if any(t >= vocab for ids in label_ids for t in ids):
-        raise WorkerError(
-            "invalid_data", "token id outside the model vocabulary", ExitCode.INVALID_INPUT
-        )
+    label_ids = choice_token_ids(tok, order, vocab)
     longest = max(len(c) for c in label_ids)
     system = _system_prompt(order)
     prompts: list[list[int]] = []
@@ -392,7 +404,7 @@ def predict_records(
 
 
 class Qwen2LoraKind:
-    """`Kind` プロトコルの実装。学習は #426、予測は #427、ONNX 書き出しは #431・#432（未実装）。"""
+    """`Kind` プロトコルの実装。学習 #426・予測 #427・グラフ書き出し #431・CLI 接続 #432（未）。"""
 
     def train(
         self,
@@ -470,5 +482,10 @@ class Qwen2LoraKind:
         )
 
     def export_onnx(self, trained: Any, out: IO[bytes]) -> None:
-        """未実装（#431・#432）。常に `runtime_error` を送出する。"""
+        """未接続（#432）。常に `runtime_error` を送出する。
+
+        Kind 契約は単一ストリームだが、書き出しは model.onnx と複数の shard になる。グラフと
+        shard の書き出しは `qwen2_onnx.export_scoring_onnx`（#431）で、`_worker` の out_fd への
+        shard 作成と artifact.json への sha256 記録は #432 で扱う（実装済みを装わない）。
+        """
         raise WorkerError("runtime_error", _NOT_IMPLEMENTED, ExitCode.RUNTIME_ERROR)
