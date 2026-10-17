@@ -96,6 +96,28 @@ fn req39_time_overrun_maps_to_limit_exceeded() {
     );
 }
 
+/// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類の設定（62.5 秒・8 GiB）を実プロセスに適用しても、
+/// 上限内の子は止められず出力が中継される。8 GiB の上限が `run_with_limits` に受理される。
+#[test]
+fn req39_qwen2_lora_limits_apply_and_allow_within_limit_child() {
+    use fandhe_edge_cli::args::InferSource;
+    use fandhe_edge_cli::infer_supervisor::supervisor_config;
+    use fandhe_edge_guard::resource::safety_limits_for_kind;
+    let source = InferSource::Text {
+        text: "x".to_string(),
+        id: None,
+    };
+    let cfg = supervisor_config(&source, safety_limits_for_kind("qwen2_lora")).expect("config");
+    assert_eq!(cfg.time_limit(), Duration::from_millis(62_500));
+    assert_eq!(cfg.memory_limit(), Some(8 * 1024 * 1024 * 1024));
+    let (code, text) = supervise("ok", &cfg);
+    assert_eq!(code, ExitCode::Ok);
+    assert!(
+        text.contains("{\"id\":\"input\",\"status\":\"ok\"}\n"),
+        "{text}"
+    );
+}
+
 /// REQ-39: 上限内の子の stdout は変えずに中継する。テストバイナリの出力（libtest の行）が混ざるため、
 /// 終了コードが 0 でない場合の写像だけでなく、中継で JSON 行が失われないことを確かめる。
 #[test]
