@@ -344,6 +344,14 @@ impl TokenizerSpec {
             .chain([assistant.map(|a| ("assistant", a))])
             .flatten();
         for (role, content) in messages {
+            // 連結で本文を複製する前に上限を検証する（確保前の長さ検証。REQ-39）。NFC 後の検証は encode 側
+            let joined_len = role
+                .len()
+                .checked_add(1)
+                .and_then(|n| n.checked_add(content.len()));
+            if joined_len.is_none_or(|n| n > MAX_ENCODE_BYTES) {
+                return Err(TokenizeError::InputTooLong);
+            }
             ids.push(im_start);
             ids.extend(self.encode(&format!("{role}\n{content}"))?);
             ids.push(im_end);

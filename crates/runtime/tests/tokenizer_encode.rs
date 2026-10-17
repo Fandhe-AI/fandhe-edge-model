@@ -157,4 +157,12 @@ fn input_length_limit() {
     assert_eq!(err.code(), "limit_exceeded");
     let err = s.build_chat_ids("hi", &over, None).expect_err("over limit");
     assert_eq!(err.code(), "limit_exceeded");
+    // role + 改行 + 本文の連結長で数える（連結前に拒否。REQ-39）
+    let edge = "a".repeat(MAX_ENCODE_BYTES - 4);
+    let err = s
+        .build_chat_ids("hi", &edge, None)
+        .expect_err("joined over");
+    assert_eq!(err.code(), "limit_exceeded");
+    let edge = "a".repeat(MAX_ENCODE_BYTES - 5);
+    assert!(s.build_chat_ids("hi", &edge, None).is_ok());
 }
