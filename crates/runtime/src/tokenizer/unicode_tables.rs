@@ -3,7 +3,7 @@
 //! Split 状態機械（`pretokenize.rs`）の文字分類表。出典は Python 3.12 の `unicodedata`
 //! （UCD 15.0.0）と参照実装の White_Space。Unicode 版は承認済みの
 //! `unicode-normalization`（15.0）と揃えてあり、一致はテストで固定している。
-//! 出典の帰属とライセンス全文は `fixtures/poc26/UNICODE-LICENSE.txt` と
+//! 出典の帰属とライセンス全文は `UNICODE-LICENSE.txt`（同ディレクトリ）と
 //! `fixtures/poc26/PROVENANCE.md`。
 
 /// `\p{L}`（昇順・重なりなし・両端含む）。
