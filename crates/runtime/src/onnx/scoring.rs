@@ -557,7 +557,17 @@ fn numel(v: &Value) -> usize {
     shape_of(v).iter().fold(1usize, |a, &d| a.saturating_mul(d))
 }
 
-/// 出力の要素数の上界（バイトは f32 想定の 4 倍）。確保前の保持量検査に使う（REQ-39）。
+/// 値 1 要素の実バイト数（確保前検査の dtype 別見積もり用）。
+fn elem_bytes(v: &Value) -> usize {
+    match v {
+        Value::F32(_) | Value::LazyF32(_) | Value::RawBf16(_) => 4,
+        Value::F64(_) | Value::I64(_) => 8,
+        Value::Bool(_) => 1,
+    }
+}
+
+/// 出力バイト数の上界（出力 dtype の実サイズ × 出力形状から求めた要素数）。確保前の保持量検査に
+/// 使う（REQ-39）。縮む演算は出力形状から、MatMul は broadcast 後の batch で数える。
 /// 上界を作れない入力は `None`。
 fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
     let v = |i: usize| a.get(i).map(|x| x.as_ref());
@@ -573,30 +583,31 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             acc.saturating_mul(m)
         })
     };
-    let n = match op {
-        Op::Gemm | Op::MatMul => {
+    let prod = |d: &[usize]| d.iter().fold(1usize, |a, &d| a.saturating_mul(d));
+    let (n, size) = match op {
+        Op::Gemm => {
             let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
-            let rows = x
-                .iter()
-                .rev()
-                .skip(1)
-                .fold(1usize, |a, &d| a.saturating_mul(d));
-            let cols = if matches!(op, Op::Gemm) {
-                w.first()?
+            let rows = prod(x.get(..x.len().saturating_sub(1))?);
+            (rows.saturating_mul(*w.first()?), 4)
+        }
+        Op::MatMul => {
+            let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
+            let (xb, wb) = (
+                x.get(..x.len().saturating_sub(2))?,
+                w.get(..w.len().saturating_sub(2))?,
+            );
+            let m = if x.len() >= 2 {
+                x.get(x.len() - 2).copied()?
             } else {
-                w.last()?
+                1
             };
-            let batch = w
-                .iter()
-                .rev()
-                .skip(2)
-                .fold(1usize, |a, &d| a.saturating_mul(d));
-            rows.saturating_mul(*cols).saturating_mul(batch)
+            let n = if w.len() >= 2 { *w.last()? } else { 1 };
+            (bcast(&[xb, wb]).saturating_mul(m).saturating_mul(n), 4)
         }
         Op::Gather => {
             let (d, i) = (v(0)?, v(1)?);
             let row = numel(d) / shape_of(d).first().copied().filter(|&n| n > 0).unwrap_or(1);
-            numel(i).saturating_mul(row)
+            (numel(i).saturating_mul(row), elem_bytes(d))
         }
         Op::Expand => {
             let dims: Vec<usize> = i64v(v(1)?)
@@ -605,23 +616,47 @@ fn out_bytes_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
                 .iter()
                 .map(|&d| usize::try_from(d).ok())
                 .collect::<Option<_>>()?;
-            bcast(&[shape_of(v(0)?), &dims])
+            (bcast(&[shape_of(v(0)?), &dims]), elem_bytes(v(0)?))
         }
         Op::Range => {
             let g = |i: usize| i64v(v(i)?).ok()?.data().first().copied();
-            let (s, l, d) = (g(0)?, g(1)?, g(2)?);
+            let (s, l, d) = (i128::from(g(0)?), i128::from(g(1)?), i128::from(g(2)?));
             if d == 0 {
                 return None;
             }
-            usize::try_from(l.saturating_sub(s).saturating_add(d - d.signum()) / d).unwrap_or(0)
+            let diff = l - s;
+            let n = if (diff > 0) == (d > 0) && diff != 0 {
+                (diff.abs() + d.abs() - 1) / d.abs()
+            } else {
+                0
+            };
+            (usize::try_from(n).unwrap_or(usize::MAX), 8)
+        }
+        Op::Shape => (shape_of(v(0)?).len(), 8),
+        Op::GatherElements { .. } => (numel(v(1)?), 4),
+        Op::Cast => (numel(v(0)?), 4),
+        Op::Softmax { f64_out: true } => (numel(v(0)?), 8),
+        // 出力が入力 0 以下の大きさで同じ dtype の演算
+        Op::ReduceMean
+        | Op::ReduceSum
+        | Op::Softmax { .. }
+        | Op::LogSoftmax
+        | Op::Slice
+        | Op::Transpose { .. }
+        | Op::Split { .. } => (numel(v(0)?), elem_bytes(v(0)?)),
+        Op::Concat { .. } => (a.iter().fold(0usize, |s, x| s.saturating_add(numel(x))), 4),
+        Op::Greater => {
+            let shapes: Vec<&[usize]> = a.iter().map(|x| shape_of(x)).collect();
+            (bcast(&shapes), 1)
         }
         _ => {
+            // 要素ごとの演算（Add・Sub・Mul・Where 等）は broadcast 後の形状
             let shapes: Vec<&[usize]> = a.iter().map(|x| shape_of(x)).collect();
-            let sum = a.iter().fold(0usize, |acc, x| acc.saturating_add(numel(x)));
-            bcast(&shapes).max(sum)
+            let size = a.iter().map(|x| elem_bytes(x)).max().unwrap_or(4);
+            (bcast(&shapes), size)
         }
     };
-    Some(n.saturating_mul(4))
+    Some(n.saturating_mul(size))
 }
 
 fn exec(step: &Step, f: &mut Frame, until: Instant) -> Result<Vec<Value>, BackendError> {
@@ -847,5 +882,36 @@ mod tests {
         // 共有 initializer の bf16 は数えない
         let w = Value::LazyF32(Arc::new(Tensor::new(vec![2], vec![0u16; 2]).unwrap()));
         assert_eq!(value_bytes(&w), 0);
+    }
+
+    fn i64s(shape: Vec<usize>, v: Vec<i64>) -> Arc<Value> {
+        Arc::new(Value::I64(Tensor::new(shape, v).unwrap()))
+    }
+
+    #[test]
+    fn req39_bound_range_min_does_not_panic() {
+        let a = [
+            i64s(vec![], vec![0]),
+            i64s(vec![], vec![i64::MIN]),
+            i64s(vec![], vec![-1]),
+        ];
+        assert!(out_bytes_bound(&Op::Range, &a).unwrap() > MAX_LIVE_BYTES);
+    }
+
+    #[test]
+    fn req39_bound_uses_i64_size_and_broadcast_batch() {
+        let e = [i64s(vec![], vec![1]), i64s(vec![1], vec![1 << 28])];
+        assert_eq!(out_bytes_bound(&Op::Expand, &e), Some((1usize << 28) * 8));
+        let x = Arc::new(f32s_shape(vec![4, 2, 3, 5]));
+        let w = Arc::new(f32s_shape(vec![4, 2, 5, 7]));
+        assert_eq!(
+            out_bytes_bound(&Op::MatMul, &[x, w]),
+            Some(4 * 2 * 3 * 7 * 4)
+        );
+    }
+
+    fn f32s_shape(shape: Vec<usize>) -> Value {
+        let n = shape.iter().product();
+        Value::F32(Tensor::new(shape, vec![0.0; n]).unwrap())
     }
 }
