@@ -40,7 +40,7 @@ pre-commit:
       glob: "trainer/**/*.py"
       run: |
         if [ -f trainer/pyproject.toml ] && command -v uv >/dev/null 2>&1; then
-          uv run --locked --directory trainer ruff format --check .
+          uv --no-config run --locked --directory trainer ruff format --check .
         else
           echo "skip: trainer/pyproject.toml 未追加または uv 未導入"
         fi
