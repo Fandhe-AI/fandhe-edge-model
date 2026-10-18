@@ -123,7 +123,6 @@ const REGISTER_OPTS: &[OptSpec] = &[
         "Existing project to compare against for the rebuild decision (read only)",
     ),
 ];
-const PROJECT_OPTS: &[OptSpec] = &[opt("--project-dir", "DIR", true, "Project directory")];
 const PACKAGE_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
     OptSpec {
@@ -148,8 +147,23 @@ const INSPECT_OPTS: &[OptSpec] = &[
         "Project seed for the split and training (u32, default 42)",
     ),
 ];
+const SELECT_OPTS: &[OptSpec] = &[
+    opt("--project-dir", "DIR", true, "Project directory"),
+    opt(
+        "--kind",
+        "KIND",
+        false,
+        "Explicit-only kind to add as a candidate after the default candidates (repeatable; e.g. qwen2_lora)",
+    ),
+];
 const TRAIN_OPTS: &[OptSpec] = &[
     opt("--project-dir", "DIR", true, "Project directory"),
+    opt(
+        "--kind",
+        "KIND",
+        false,
+        "Explicit-only kind to add as a candidate after the default candidates (repeatable; e.g. qwen2_lora)",
+    ),
     opt(
         "--candidate",
         "N",
@@ -245,14 +259,14 @@ const INFER_OPTS: &[OptSpec] = &[
 ];
 
 /// 複数回指定できるオプション（値は指定順に集める。#490）。
-const REPEATABLE_OPTS: &[&str] = &["--seed-run-project"];
+const REPEATABLE_OPTS: &[&str] = &["--seed-run-project", "--kind"];
 
 /// サブコマンドが受理するオプションの表。
 pub const fn options(sub: Subcommand) -> &'static [OptSpec] {
     match sub {
         Subcommand::Register => REGISTER_OPTS,
         Subcommand::Inspect => INSPECT_OPTS,
-        Subcommand::Select => PROJECT_OPTS,
+        Subcommand::Select => SELECT_OPTS,
         Subcommand::Package => PACKAGE_OPTS,
         Subcommand::Train => TRAIN_OPTS,
         Subcommand::Evaluate => EVALUATE_OPTS,
@@ -306,6 +320,8 @@ pub struct TrainArgs {
     pub smoke: bool,
     /// `--train-seed`: 学習 seed の上書き（省略時は `split.json` の seed。分割は変えない。REQ-17・REQ-41）。
     pub train_seed: Option<u32>,
+    /// `--kind`（指定順。明示指定専用の種類を既定候補の後ろへ足す。検証は候補の解決時。REQ-41・TASK-41.10-1）。
+    pub kinds: Vec<String>,
 }
 /// `evaluate` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +338,8 @@ pub struct EvaluateArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectArgs {
     pub project_dir: PathBuf,
+    /// `--kind`（`train --kind` と同じ候補集合で選定する。REQ-41・TASK-41.10-1）。
+    pub kinds: Vec<String>,
 }
 /// `package` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,6 +685,26 @@ impl Values {
         });
         paths
     }
+    fn all_strings(&mut self, name: &'static str) -> Result<Vec<String>, ArgsError> {
+        let mut out = Vec::new();
+        let mut bad = false;
+        self.0.retain(|(n, v)| {
+            if *n == name {
+                match v.clone().into_string() {
+                    Ok(s) => out.push(s),
+                    Err(_) => bad = true,
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if bad {
+            Err(ArgsError::NonUtf8Argument)
+        } else {
+            Ok(out)
+        }
+    }
     fn opt_path(&mut self, name: &'static str) -> Option<PathBuf> {
         self.take(name).map(PathBuf::from)
     }
@@ -781,12 +819,29 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
             project_dir: v.path("--project-dir")?,
             seed: v.seed()?,
         }),
-        Subcommand::Train => Command::Train(TrainArgs {
-            project_dir: v.path("--project-dir")?,
-            op: v.train_op()?,
-            smoke: v.take("--smoke").is_some(),
-            train_seed: v.train_seed()?,
-        }),
+        Subcommand::Train => {
+            // 他の `take`（`swap_remove`）で並びが崩れる前に、指定順のまま取り出す。
+            let kinds = v.all_strings("--kind")?;
+            let project_dir = v.path("--project-dir")?;
+            let op = v.train_op()?;
+            // 状態確認・キャンセルは学習しないため、候補集合の指定は意味を持たない。
+            match (&op, kinds.is_empty()) {
+                (TrainOp::Status(_), false) => {
+                    return Err(ArgsError::IncompatibleWithStatus { option: "--kind" });
+                }
+                (TrainOp::Cancel(_), false) => {
+                    return Err(ArgsError::IncompatibleWithCancel { option: "--kind" });
+                }
+                _ => {}
+            }
+            Command::Train(TrainArgs {
+                project_dir,
+                op,
+                smoke: v.take("--smoke").is_some(),
+                train_seed: v.train_seed()?,
+                kinds,
+            })
+        }
         Subcommand::Evaluate => {
             // 他の `take`（`swap_remove`）で並びが崩れる前に、指定順のまま取り出す。
             let seed_run_projects = v.all_paths("--seed-run-project");
@@ -797,9 +852,13 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
                 seed_run_projects,
             })
         }
-        Subcommand::Select => Command::Select(SelectArgs {
-            project_dir: v.path("--project-dir")?,
-        }),
+        Subcommand::Select => {
+            let kinds = v.all_strings("--kind")?;
+            Command::Select(SelectArgs {
+                project_dir: v.path("--project-dir")?,
+                kinds,
+            })
+        }
         Subcommand::Package => Command::Package(PackageArgs {
             project_dir: v.path("--project-dir")?,
             allow_smoke: v.take("--allow-smoke").is_some(),
@@ -933,6 +992,7 @@ mod tests {
         assert_eq!(
             run(&["select", "--project-dir", "proj"]),
             Command::Select(SelectArgs {
+                kinds: Vec::new(),
                 project_dir: d.clone()
             })
         );
@@ -1027,6 +1087,48 @@ mod tests {
         );
     }
 
+    /// REQ-41・TASK-41.10-1: `--kind` は繰り返し指定でき、`train`・`select` だけが受理する。
+    /// 状態確認・キャンセルとは併用できない。
+    #[test]
+    fn req41_kind_option_is_repeatable_on_train_and_select() {
+        let Command::Train(t) = run(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--kind",
+            "qwen2_lora",
+            "--kind=other",
+        ]) else {
+            panic!("train expected");
+        };
+        assert_eq!(t.kinds, vec!["qwen2_lora".to_string(), "other".to_string()]);
+        let Command::Select(sel) =
+            run(&["select", "--project-dir", "proj", "--kind", "qwen2_lora"])
+        else {
+            panic!("select expected");
+        };
+        assert_eq!(sel.kinds, vec!["qwen2_lora".to_string()]);
+        let Command::Select(sel) = run(&["select", "--project-dir", "proj"]) else {
+            panic!("select expected");
+        };
+        assert!(sel.kinds.is_empty());
+        assert!(
+            p(&[
+                "evaluate",
+                "--project-dir",
+                "p",
+                "--candidate",
+                "0",
+                "--kind",
+                "x"
+            ])
+            .is_err()
+        );
+        assert!(p(&["train", "--project-dir", "p", "--status", "--kind", "x"]).is_err());
+        assert!(p(&["train", "--project-dir", "p", "--cancel", "--kind", "x"]).is_err());
+    }
+
     #[test]
     fn req33_train_and_evaluate_parse() {
         assert_eq!(
@@ -1039,6 +1141,7 @@ mod tests {
                 "--smoke"
             ]),
             Command::Train(TrainArgs {
+                kinds: Vec::new(),
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(2)),
                 smoke: true,
@@ -1048,6 +1151,7 @@ mod tests {
         assert_eq!(
             run(&["train", "--candidate=0", "--project-dir", "proj"]),
             Command::Train(TrainArgs {
+                kinds: Vec::new(),
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,
@@ -1155,6 +1259,7 @@ mod tests {
                 "7"
             ]),
             Command::Train(TrainArgs {
+                kinds: Vec::new(),
                 project_dir: "proj".into(),
                 op: budget(3600),
                 smoke: true,

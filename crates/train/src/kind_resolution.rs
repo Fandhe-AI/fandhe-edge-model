@@ -78,6 +78,9 @@ pub enum KindSource {
     Explicit,
     /// `kind` が省略され、既定候補の集合になった。
     Default,
+    /// 既定候補の集合に、利用者が明示した明示指定専用の種類を足した
+    /// （[`resolve_with_explicit_kinds`]。REQ-41・TASK-41.10-1）。
+    DefaultWithExplicit,
 }
 
 /// 解決済みの候補一覧。
@@ -148,6 +151,9 @@ pub enum KindResolutionError {
     /// 制御文字を含む）。`run_search` が同じ規則で拒否するため、解決時点で
     /// 先に `invalid_input` にする。`kind` の内容はメッセージに含めない。
     InvalidKindId,
+    /// 明示指定専用の種類の一覧（[`EXPLICIT_ONLY_KINDS`]）に無い名前を指定した
+    /// （既定候補の名前・未知の名前・空を含む）。入力値はメッセージに含めない。
+    UnsupportedExplicitKind,
 }
 
 impl std::fmt::Display for KindResolutionError {
@@ -158,6 +164,9 @@ impl std::fmt::Display for KindResolutionError {
             }
             Self::InvalidParams(e) => write!(f, "invalid train parameters: {e}"),
             Self::InvalidKindId => write!(f, "kind is not a valid candidate id"),
+            Self::UnsupportedExplicitKind => {
+                write!(f, "kind is not an explicit-only kind")
+            }
         }
     }
 }
@@ -175,7 +184,9 @@ impl KindResolutionError {
             Self::InvalidParams(TrainRequestError::ConfigTooLarge { .. }) => {
                 ExitCode::LimitExceeded
             }
-            Self::InvalidParams(_) | Self::InvalidKindId => ExitCode::InvalidInput,
+            Self::InvalidParams(_) | Self::InvalidKindId | Self::UnsupportedExplicitKind => {
+                ExitCode::InvalidInput
+            }
         }
     }
 
@@ -188,6 +199,7 @@ impl KindResolutionError {
             // `limit_exceeded` 等）をそのまま使う。
             Self::InvalidParams(e) => e.reason_code(),
             Self::InvalidKindId => "invalid_kind",
+            Self::UnsupportedExplicitKind => "unsupported_kind",
         }
     }
 }
@@ -368,6 +380,69 @@ pub fn resolve_kind_candidates(
             })
         }
     }
+}
+
+/// 利用者が明示したときだけ候補に入れる種類（kind 省略時の既定候補には入れない。
+/// REQ-41・TASK-41.10・TASK-41.10-1）と、その `kind_version`。
+///
+/// 候補の番号は「既定候補 → 指定された明示指定専用の種類（この定数の宣言順）」で付く。
+/// CLI の `train`・`select`・`evaluate`・`package` が同じ関数で候補を再構成するため、
+/// 番号は選定記録の `explicit_kinds` と本定数から一意に決まる。
+// ponytail: 種類が 1 つの間だけ「指定すれば常に最後尾」で番号が安定する。2 種類以上に
+// なると一部だけの指定で番号がずれるため、足すときは位置と候補番号の対応表を持たせる
+// （定数の長さが 1 であることはテストで固定している）。
+pub const EXPLICIT_ONLY_KINDS: [(&str, u32); 1] = [("qwen2_lora", 1)];
+
+/// 明示指定専用の種類の名前を検証し、重複を除いて [`EXPLICIT_ONLY_KINDS`] の宣言順に並べる
+/// （選定記録の `explicit_kinds` に入れる正規形。空なら空）。
+///
+/// # Errors
+/// 一覧に無い名前（既定候補の名前・未知の名前・空）は [`KindResolutionError::UnsupportedExplicitKind`]。
+pub fn normalize_explicit_kinds(names: &[String]) -> Result<Vec<String>, KindResolutionError> {
+    if names
+        .iter()
+        .any(|n| !EXPLICIT_ONLY_KINDS.iter().any(|(k, _)| k == n))
+    {
+        return Err(KindResolutionError::UnsupportedExplicitKind);
+    }
+    Ok(EXPLICIT_ONLY_KINDS
+        .iter()
+        .filter(|(k, _)| names.iter().any(|n| n == k))
+        .map(|(k, _)| (*k).to_string())
+        .collect())
+}
+
+/// 既定候補に、指定された明示指定専用の種類を後ろへ足した探索候補を組み立てる
+/// （REQ-41・TASK-41.10-1。選定は探索予算の中で行う。REQ-18）。
+///
+/// 指定が空なら [`resolve_kind_candidates`]`(None, ..)` と同じ集合（`source` も `Default`）。
+/// 足した候補の `config` は空、`out_dir` は既定候補と同じ `{out_dir}-{kind}`。
+///
+/// # Errors
+/// [`normalize_explicit_kinds`] と [`resolve_kind_candidates`] に同じ。
+pub fn resolve_with_explicit_kinds(
+    names: &[String],
+    common: CommonTrainParams,
+) -> Result<KindResolution, KindResolutionError> {
+    let explicit = normalize_explicit_kinds(names)?;
+    let out_dir_base = common.out_dir.clone();
+    let mut resolution = resolve_kind_candidates(None, common.clone())?;
+    if explicit.is_empty() {
+        return Ok(resolution);
+    }
+    for (kind, version) in EXPLICIT_ONLY_KINDS
+        .iter()
+        .filter(|(k, _)| explicit.iter().any(|e| e == k))
+    {
+        let out_dir = suffixed_out_dir(&out_dir_base, kind)?;
+        let params = build_params(&common, (*kind).to_string(), *version, Map::new(), out_dir)?;
+        resolution.candidates.push(SearchCandidate {
+            candidate_id: (*kind).to_string(),
+            params,
+        });
+    }
+    resolution.source = KindSource::DefaultWithExplicit;
+    Ok(resolution)
 }
 
 #[cfg(test)]
@@ -573,5 +648,69 @@ mod tests {
             err.exit_code(),
             fandhe_edge_core::exitcode::ExitCode::InvalidInput
         );
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// REQ-41・TASK-41.10-1: 明示指定専用の種類は kind 省略時の既定候補に入らない。
+    #[test]
+    fn req41_explicit_only_kind_is_not_in_default_candidates() {
+        let r = resolve_kind_candidates(None, common()).expect("default resolves");
+        for (k, _) in EXPLICIT_ONLY_KINDS {
+            assert!(r.candidates().iter().all(|c| c.candidate_id != k), "{k}");
+        }
+    }
+
+    /// REQ-41・TASK-41.10-1: 指定した種類は既定候補の後ろへ足される。
+    #[test]
+    fn req41_named_explicit_kind_is_appended_after_defaults() {
+        let r = resolve_with_explicit_kinds(&names(&["qwen2_lora", "qwen2_lora"]), common())
+            .expect("resolves");
+        assert_eq!(r.source(), KindSource::DefaultWithExplicit);
+        let base = resolve_kind_candidates(None, common()).expect("default resolves");
+        let n = base.candidates().len();
+        assert_eq!(r.candidates().len(), n + 1);
+        let last = &r.candidates()[n];
+        assert_eq!(last.candidate_id, "qwen2_lora");
+        assert_eq!(last.params.kind_version, 1);
+        assert!(last.params.config.is_empty());
+        assert_eq!(last.params.out_dir, "out-qwen2_lora");
+        let none = resolve_with_explicit_kinds(&[], common()).expect("resolves");
+        assert_eq!(none.source(), KindSource::Default);
+        assert_eq!(none.candidates().len(), n);
+    }
+
+    /// REQ-41・TASK-41.10-1: 一覧に無い名前は fail-closed で拒否する。
+    #[test]
+    fn req41_explicit_kinds_reject_unknown_and_default_names() {
+        for bad in ["c1", "nope", ""] {
+            let err = resolve_with_explicit_kinds(&names(&[bad]), common()).unwrap_err();
+            assert_eq!(err.reason_code(), "unsupported_kind");
+            assert_eq!(
+                err.exit_code(),
+                fandhe_edge_core::exitcode::ExitCode::InvalidInput
+            );
+        }
+        assert_eq!(
+            normalize_explicit_kinds(&names(&["qwen2_lora", "qwen2_lora"])).expect("ok"),
+            names(&["qwen2_lora"])
+        );
+    }
+
+    /// REQ-41・TASK-41.10-1: 定数は既定候補と重ならず、既定値を解決でき、長さ 1 に固定する。
+    #[test]
+    fn req41_explicit_only_kinds_are_disjoint_and_resolvable() {
+        assert_eq!(
+            EXPLICIT_ONLY_KINDS.len(),
+            1,
+            "番号付けの上限（ponytail コメント）"
+        );
+        let defaults = default_candidates().expect("bundled fixture is valid");
+        for (k, _) in EXPLICIT_ONLY_KINDS {
+            assert!(defaults.iter().all(|(d, _)| d != k));
+            assert!(kind_defaults::defaults_for_kind(k).is_some());
+        }
     }
 }

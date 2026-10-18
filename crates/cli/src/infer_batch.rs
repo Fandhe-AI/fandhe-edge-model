@@ -1049,6 +1049,7 @@ mod tests {
                 seed: 42,
             }),
             Command::Train(TrainArgs {
+                kinds: Vec::new(),
                 project_dir: p(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,
@@ -1060,7 +1061,10 @@ mod tests {
                 previous_project_dir: None,
                 seed_run_projects: Vec::new(),
             }),
-            Command::Select(SelectArgs { project_dir: p() }),
+            Command::Select(SelectArgs {
+                project_dir: p(),
+                kinds: Vec::new(),
+            }),
             Command::Package(PackageArgs {
                 project_dir: p(),
                 allow_smoke: false,

@@ -230,13 +230,15 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
     let definition = project.load_definition()?;
     // 最終 test の結果を見て候補を選び直せないよう、validation による選定（`select`）を先に確定させ、
     // 選定された候補だけを評価可能にする（REQ-27）。
-    let selection_sha256 = ensure_selected(&project, &definition, args.candidate)?;
+    let (selection_sha256, explicit_kinds) =
+        ensure_selected(&project, &definition, args.candidate)?;
     let records = project.load_records(&definition)?;
     let (split, seed) = verified_split(&project, &records)?;
 
     let mut prepared_target: Option<PreparedCandidate> = None;
     let mut entries: Vec<RegisteredConfig> = Vec::new();
-    let n_candidates = resolve_candidates(&project, &definition, args.candidate, seed)?.len();
+    let n_candidates =
+        resolve_candidates(&project, &definition, args.candidate, seed, &explicit_kinds)?.len();
     if args.candidate >= n_candidates {
         return Err(invalid("candidate index is out of range"));
     }
@@ -253,6 +255,7 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             seed,
             index,
             is_target,
+            &explicit_kinds,
         )?
         else {
             continue;
@@ -437,20 +440,22 @@ fn ensure_selected(
     project: &Project,
     definition: &Definition,
     candidate: usize,
-) -> Result<Sha256Digest, ErrorReport> {
+) -> Result<(Sha256Digest, Vec<String>), ErrorReport> {
     let Some(bytes) = project.read_optional(SELECTION_FILE, 64 * 1024)? else {
         return Err(invalid("candidate selection has not been recorded"));
     };
     let selection = SelectionRecord::from_json_slice(&bytes)
         .map_err(|_| invalid("selection record is invalid"))?;
-    if compute_selection(project, definition)?.as_ref() != Some(&selection) {
+    if compute_selection(project, definition, &selection.explicit_kinds)?.as_ref()
+        != Some(&selection)
+    {
         return Err(invalid("selection record does not match the candidate"));
     }
     if selection.candidate_index != candidate {
         return Err(invalid("candidate is not the selected candidate"));
     }
     // 選定記録には選定の入力になった validation 結果（正解数・件数）が含まれる。
-    Ok(Sha256Digest::of_bytes(&bytes))
+    Ok((Sha256Digest::of_bytes(&bytes), selection.explicit_kinds))
 }
 
 /// 候補 `index` の学習結果を検証して、評価に使える形にする（評価できない候補は `None`）。
@@ -458,6 +463,9 @@ fn ensure_selected(
 /// 対象候補（`is_target`）は、未学習・smoke 学習・リクエスト不一致を `invalid_input` で拒否する。
 /// 対象以外の候補は、未学習・smoke 学習・失敗結果なら登録しないだけ（`None`）で、保存済みの結果が
 /// 壊れている（リクエスト・成果物の不一致）場合は停止する（fail-closed）。
+// 候補の準備に必要な入力（プロジェクト・定義・分割・記録・選定の各情報）が独立しており、
+// 構造体にまとめると呼び出し側の組み立てが増えるだけなので引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
 fn prepare_candidate(
     project: &Project,
     definition: &Definition,
@@ -466,9 +474,10 @@ fn prepare_candidate(
     seed: u32,
     index: usize,
     is_target: bool,
+    explicit_kinds: &[String],
 ) -> Result<Option<PreparedCandidate>, ErrorReport> {
     let seed = effective_train_seed(project, index, seed)?;
-    let candidates = resolve_candidates(project, definition, index, seed)?;
+    let candidates = resolve_candidates(project, definition, index, seed, explicit_kinds)?;
     let candidate = candidates
         .get(index)
         .ok_or_else(|| invalid("candidate index is out of range"))?;

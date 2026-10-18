@@ -40,15 +40,17 @@ use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::selection_significance::CandidateValidation;
 use fandhe_edge_train::stage_files::{
-    ExcludedCandidate, SelectionExclusions, SelectionRecord, validation_accuracy,
-    validation_outcomes,
+    ExcludedCandidate, MAX_SEARCH_RECORD_BYTES, SelectionExclusions, SelectionRecord,
+    validation_accuracy, validation_outcomes,
 };
 
 use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
 use crate::project::{
-    DEFINITION_FILE, Project, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail, invalid, runtime,
+    DEFINITION_FILE, Project, SEARCH_RECORD_FILE, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail,
+    invalid, runtime,
 };
+use fandhe_edge_train::kind_resolution::normalize_explicit_kinds;
 
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
@@ -72,7 +74,7 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         return Err(crate::project::invalid("selection record already exists"));
     }
     let definition = project.load_definition()?;
-    let (record, excluded) = compute_selection_with_exclusions(&project, &definition)?;
+    let (record, excluded) = compute_selection_with_exclusions(&project, &definition, &args.kinds)?;
     let Some(record) = record else {
         // 全候補が容量の目安超過で除外された場合は、除外理由をメッセージに残し、内部記録
         // `selection_exclusions.json` にも保存する（`selection_record.json` は作らない。他工程は
@@ -113,8 +115,9 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
 pub fn compute_selection(
     project: &Project,
     definition: &Definition,
+    explicit_kinds: &[String],
 ) -> Result<Option<SelectionRecord>, ErrorReport> {
-    compute_selection_with_exclusions(project, definition).map(|(record, _)| record)
+    compute_selection_with_exclusions(project, definition, explicit_kinds).map(|(record, _)| record)
 }
 
 /// 全候補が容量の目安超過で除外されたときの `pending` メッセージ（英語。除外理由を残す）。
@@ -142,7 +145,15 @@ fn all_excluded_message(excluded: &[ExcludedCandidate]) -> String {
 pub fn compute_selection_with_exclusions(
     project: &Project,
     definition: &Definition,
+    explicit_kinds: &[String],
 ) -> Result<(Option<SelectionRecord>, Vec<ExcludedCandidate>), ErrorReport> {
+    // 明示指定専用の種類は正規形で記録し、`package`・`evaluate` が同じ候補集合を再構成する（REQ-41・TASK-41.10-1）。
+    let explicit_kinds = normalize_explicit_kinds(explicit_kinds).map_err(|e| {
+        ErrorReport::new(
+            e.exit_code(),
+            format!("kind resolution failed: {}", e.reason_code()),
+        )
+    })?;
     let records = project.load_records(definition)?;
     let gold: BTreeMap<&str, &str> = records
         .iter()
@@ -157,11 +168,47 @@ pub fn compute_selection_with_exclusions(
     let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
-    let candidate_count = resolve_candidates(project, definition, 0, split_seed)?.len();
+    let candidate_count =
+        resolve_candidates(project, definition, 0, split_seed, &explicit_kinds)?.len();
+    // 探索時より少ない候補集合の再構成を拒否する。`--kind` の指定漏れで、失敗・時間切れ候補を含む
+    // 事前登録した族より小さい family_size が Holm 補正へ渡るのを防ぐ（REQ-25・fail-closed）。
+    if super::train::candidate_rel(candidate_count)
+        .to_str()
+        .is_some_and(|rel| project.exists(rel).unwrap_or(true))
+    {
+        return Err(invalid(
+            "candidate set differs from the trained set; pass the same --kind as train",
+        ));
+    }
+    // 探索記録がある場合は、記録の候補 ID 列と再構成した候補集合が一致することを要求する。
+    // 失敗・時間切れ候補のディレクトリは片付けられるため、ディレクトリの有無だけでは族の縮小を
+    // 検出できない（REQ-25・fail-closed）。
+    if let Some(bytes) =
+        project.read_optional(SEARCH_RECORD_FILE, MAX_SEARCH_RECORD_BYTES as u64)?
+    {
+        let recorded = fandhe_edge_train::stage_files::search_record_candidate_ids(&bytes)
+            .map_err(|_| invalid("search record is invalid"))?;
+        let rebuilt = (0..candidate_count)
+            .map(|i| {
+                let seed = effective_train_seed(project, i, split_seed)?;
+                let mut all = resolve_candidates(project, definition, i, seed, &explicit_kinds)?;
+                if i < all.len() {
+                    Ok(all.swap_remove(i).candidate_id)
+                } else {
+                    Err(runtime("candidate is not available"))
+                }
+            })
+            .collect::<Result<Vec<_>, ErrorReport>>()?;
+        if recorded != rebuilt {
+            return Err(invalid(
+                "candidate set differs from the search record; pass the same --kind as train",
+            ));
+        }
+    }
     let candidates = (0..candidate_count)
         .map(|i| {
             let seed = effective_train_seed(project, i, split_seed)?;
-            let mut all = resolve_candidates(project, definition, i, seed)?;
+            let mut all = resolve_candidates(project, definition, i, seed, &explicit_kinds)?;
             if i < all.len() {
                 Ok(all.swap_remove(i))
             } else {
@@ -282,6 +329,7 @@ pub fn compute_selection_with_exclusions(
             validation_total: accuracy.total,
             excluded_candidates: excluded.clone(),
             significance,
+            explicit_kinds,
         }),
         excluded,
     ))
