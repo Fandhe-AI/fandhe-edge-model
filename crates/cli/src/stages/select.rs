@@ -169,6 +169,16 @@ pub fn compute_selection_with_exclusions(
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
     let candidate_count =
         resolve_candidates(project, definition, 0, split_seed, &explicit_kinds)?.len();
+    // 探索時より少ない候補集合の再構成を拒否する。`--kind` の指定漏れで、失敗・時間切れ候補を含む
+    // 事前登録した族より小さい family_size が Holm 補正へ渡るのを防ぐ（REQ-25・fail-closed）。
+    if super::train::candidate_rel(candidate_count)
+        .to_str()
+        .is_some_and(|rel| project.exists(rel).unwrap_or(true))
+    {
+        return Err(invalid(
+            "candidate set differs from the trained set; pass the same --kind as train",
+        ));
+    }
     let candidates = (0..candidate_count)
         .map(|i| {
             let seed = effective_train_seed(project, i, split_seed)?;

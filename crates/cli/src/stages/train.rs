@@ -1915,6 +1915,12 @@ mod all_tests {
         select(Vec::new()).expect("select");
         let record = std::fs::read_to_string(&sel_path).expect("record");
         assert!(!record.contains("explicit_kinds"), "{record}");
+        // 探索時の候補ディレクトリ 3 件目が在るのに `--kind` を省くと、候補集合が小さくなるので拒否する。
+        std::fs::remove_file(&sel_path).expect("remove");
+        std::fs::create_dir_all(cwd.join("proj/candidates/2")).expect("mkdir");
+        let err = select(Vec::new()).expect_err("family would shrink");
+        assert_eq!(err.code, ExitCode::InvalidInput);
+        assert!(!sel_path.exists());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

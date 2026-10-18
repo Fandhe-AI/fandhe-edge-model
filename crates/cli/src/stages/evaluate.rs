@@ -463,6 +463,8 @@ fn ensure_selected(
 /// 対象候補（`is_target`）は、未学習・smoke 学習・リクエスト不一致を `invalid_input` で拒否する。
 /// 対象以外の候補は、未学習・smoke 学習・失敗結果なら登録しないだけ（`None`）で、保存済みの結果が
 /// 壊れている（リクエスト・成果物の不一致）場合は停止する（fail-closed）。
+// 候補の準備に必要な入力（プロジェクト・定義・分割・記録・選定の各情報）が独立しており、
+// 構造体にまとめると呼び出し側の組み立てが増えるだけなので引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn prepare_candidate(
     project: &Project,
