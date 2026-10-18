@@ -49,6 +49,7 @@ use crate::error_report::{ToErrorReport, default_message};
 use crate::project::{
     DEFINITION_FILE, Project, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail, invalid, runtime,
 };
+use fandhe_edge_train::kind_resolution::normalize_explicit_kinds;
 
 use super::candidate_artifact::{
     CandidateArtifact, check_meta_consistency, load_candidate_artifact,
@@ -72,7 +73,7 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
         return Err(crate::project::invalid("selection record already exists"));
     }
     let definition = project.load_definition()?;
-    let (record, excluded) = compute_selection_with_exclusions(&project, &definition)?;
+    let (record, excluded) = compute_selection_with_exclusions(&project, &definition, &args.kinds)?;
     let Some(record) = record else {
         // 全候補が容量の目安超過で除外された場合は、除外理由をメッセージに残し、内部記録
         // `selection_exclusions.json` にも保存する（`selection_record.json` は作らない。他工程は
@@ -113,8 +114,9 @@ pub fn run(args: &SelectArgs, cwd: &Path) -> Result<SelectReport, ErrorReport> {
 pub fn compute_selection(
     project: &Project,
     definition: &Definition,
+    explicit_kinds: &[String],
 ) -> Result<Option<SelectionRecord>, ErrorReport> {
-    compute_selection_with_exclusions(project, definition).map(|(record, _)| record)
+    compute_selection_with_exclusions(project, definition, explicit_kinds).map(|(record, _)| record)
 }
 
 /// 全候補が容量の目安超過で除外されたときの `pending` メッセージ（英語。除外理由を残す）。
@@ -142,7 +144,15 @@ fn all_excluded_message(excluded: &[ExcludedCandidate]) -> String {
 pub fn compute_selection_with_exclusions(
     project: &Project,
     definition: &Definition,
+    explicit_kinds: &[String],
 ) -> Result<(Option<SelectionRecord>, Vec<ExcludedCandidate>), ErrorReport> {
+    // 明示指定専用の種類は正規形で記録し、`package`・`evaluate` が同じ候補集合を再構成する（REQ-41・TASK-41.10-1）。
+    let explicit_kinds = normalize_explicit_kinds(explicit_kinds).map_err(|e| {
+        ErrorReport::new(
+            e.exit_code(),
+            format!("kind resolution failed: {}", e.reason_code()),
+        )
+    })?;
     let records = project.load_records(definition)?;
     let gold: BTreeMap<&str, &str> = records
         .iter()
@@ -157,11 +167,12 @@ pub fn compute_selection_with_exclusions(
     let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
-    let candidate_count = resolve_candidates(project, definition, 0, split_seed)?.len();
+    let candidate_count =
+        resolve_candidates(project, definition, 0, split_seed, &explicit_kinds)?.len();
     let candidates = (0..candidate_count)
         .map(|i| {
             let seed = effective_train_seed(project, i, split_seed)?;
-            let mut all = resolve_candidates(project, definition, i, seed)?;
+            let mut all = resolve_candidates(project, definition, i, seed, &explicit_kinds)?;
             if i < all.len() {
                 Ok(all.swap_remove(i))
             } else {
@@ -282,6 +293,7 @@ pub fn compute_selection_with_exclusions(
             validation_total: accuracy.total,
             excluded_candidates: excluded.clone(),
             significance,
+            explicit_kinds,
         }),
         excluded,
     ))

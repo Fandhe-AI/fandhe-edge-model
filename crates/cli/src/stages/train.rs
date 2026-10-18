@@ -4,7 +4,8 @@
 //! # 手順
 //!
 //! 1. `split.json`（`inspect` の記録）で分割を再現・検証する（不一致は停止。REQ-17）
-//! 2. `kind` を省略した既定候補（[`resolve_kind_candidates`]。暫定・オーナー確認前）の
+//! 2. `kind` を省略した既定候補（[`resolve_with_explicit_kinds`]。暫定・オーナー確認前。`--kind` で明示した
+//!    追加学習の種類は後ろへ足す。REQ-41・TASK-41.10-1）の
 //!    `--candidate` 番目を選ぶ（範囲外は `invalid_input`）
 //! 3. `candidates/<N>/` に train 分割の `train_input.jsonl`（trainer 形式）・学習リクエスト
 //!    `request.json` を置き、[`run_train`] で子プロセスを起動する（固定 argv・シェル非経由・
@@ -110,7 +111,9 @@ use fandhe_edge_train::job::{CancelOutcome, JobHandle, JobState, RecordedRun, Tr
 use fandhe_edge_train::job_record::{
     JobDirOps, JobRecordError, JobStatusReport, read_job_status_in, unix_now,
 };
-use fandhe_edge_train::kind_resolution::{CommonTrainParams, resolve_kind_candidates};
+use fandhe_edge_train::kind_resolution::{
+    CommonTrainParams, EXPLICIT_ONLY_KINDS, resolve_with_explicit_kinds,
+};
 use fandhe_edge_train::limits::{MAX_REQUEST_BYTES, MAX_RESULT_BYTES_WITH_VALIDATION};
 use fandhe_edge_train::process::{RunLimits, TrainRunEnd, WorkerCandidateRunner, WorkerLauncher};
 use fandhe_edge_train::request::{
@@ -196,6 +199,7 @@ pub fn resolve_candidates(
     definition: &Definition,
     index: usize,
     seed: u32,
+    explicit_kinds: &[String],
 ) -> Result<Vec<SearchCandidate>, ErrorReport> {
     let label_order = label_order_from_definition(definition)
         .map_err(|e| e.to_error_report())?
@@ -205,8 +209,8 @@ pub fn resolve_candidates(
         .to_str()
         .map(str::to_string)
         .ok_or_else(|| invalid("project path is not valid UTF-8"))?;
-    let resolution = resolve_kind_candidates(
-        None,
+    let resolution = resolve_with_explicit_kinds(
+        explicit_kinds,
         CommonTrainParams {
             label_order,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -292,13 +296,13 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Tr
     // [`effective_train_seed`] でそれを正とする（`request.json` の seed 改ざんは従来どおり照合で弾く）。
     let seed = args.train_seed.unwrap_or(split_seed);
 
-    let mut candidates = resolve_candidates(&project, &definition, index, seed)?;
+    let mut candidates = resolve_candidates(&project, &definition, index, seed, &args.kinds)?;
     if index >= candidates.len() {
         return Err(invalid("candidate index is out of range").into());
     }
     let mut candidate = candidates.swap_remove(index);
     if args.smoke {
-        apply_smoke(&mut candidate);
+        apply_smoke_checked(&mut candidate)?;
     }
 
     let train_jsonl = trainer_jsonl(
@@ -854,7 +858,23 @@ fn prepare_candidate_dir(
     Ok(job_dir)
 }
 
-/// `train --smoke`: 動作確認用の軽量実行（エポック数のみ 1 へ）。全種類の既定設定が `epochs` を持つ。
+///
+/// 明示指定専用の種類（`qwen2_lora` 等）は設定キーが `epochs` でなく、`request_is_smoke_trained` も
+/// `epochs` しか見ないため、smoke では扱えない（拒否する。REQ-41・TASK-41.10-1）。
+fn apply_smoke_checked(candidate: &mut SearchCandidate) -> Result<(), ErrorReport> {
+    if EXPLICIT_ONLY_KINDS
+        .iter()
+        .any(|(k, _)| *k == candidate.params.kind)
+    {
+        return Err(invalid(
+            "smoke training is not supported for explicit-only kinds",
+        ));
+    }
+    apply_smoke(candidate);
+    Ok(())
+}
+
+/// `train --smoke`: 動作確認用の軽量実行（エポック数のみ 1 へ）。既定候補の設定は `epochs` を持つ。
 fn apply_smoke(candidate: &mut SearchCandidate) {
     candidate
         .params
@@ -947,15 +967,15 @@ where
     let seed = args.train_seed.unwrap_or(split_seed);
 
     // 候補 N の `root` は `candidates/<N>`。単発の `train --candidate N` と同じ解決を候補ごとに行う。
-    let n_candidates = resolve_candidates(&project, &definition, 0, seed)?.len();
+    let n_candidates = resolve_candidates(&project, &definition, 0, seed, &args.kinds)?.len();
     let mut candidates = Vec::with_capacity(n_candidates);
     for index in 0..n_candidates {
-        let mut candidate = resolve_candidates(&project, &definition, index, seed)?
+        let mut candidate = resolve_candidates(&project, &definition, index, seed, &args.kinds)?
             .into_iter()
             .nth(index)
             .ok_or_else(|| runtime("candidate resolution is inconsistent"))?;
         if args.smoke {
-            apply_smoke(&mut candidate);
+            apply_smoke_checked(&mut candidate)?;
         }
         candidates.push(candidate);
     }
@@ -1637,6 +1657,7 @@ mod all_tests {
 
     fn all_args() -> TrainArgs {
         TrainArgs {
+            kinds: Vec::new(),
             project_dir: "proj".into(),
             op: TrainOp::Run(TrainTarget::All {
                 budget: SearchBudget::default(),
@@ -1735,6 +1756,7 @@ mod all_tests {
 
         let selected = super::super::select::run(
             &SelectArgs {
+                kinds: Vec::new(),
                 project_dir: "proj".into(),
             },
             &cwd,
@@ -1807,6 +1829,122 @@ mod all_tests {
             (ExitCode::InvalidInput, "search record already exists")
         );
         assert!(!proj.join("candidates/0").exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-41・TASK-41.10-1: `--kind` が無ければ `train --all` の候補は既定候補の 2 件のまま、
+    /// `--kind qwen2_lora` ありなら 3 件目（候補 2）に明示指定専用の種類が載る（偽の実行器。
+    /// 証拠種別: テストハーネス）。
+    #[test]
+    fn req41_train_all_adds_explicit_kind_only_when_named() {
+        let run_with = |case: &str, kinds: Vec<String>| {
+            let cwd = inspected_workdir(case);
+            let clock = FakeClock {
+                now_ms: Rc::new(Cell::new(0)),
+            };
+            let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+                Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
+                    if request.kind() == "c1" {
+                        return Ok(fake_c1_success(request));
+                    }
+                    let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                    Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+                }))
+            };
+            let args = TrainArgs {
+                kinds,
+                ..all_args()
+            };
+            let line = run_all_with(&args, SearchBudget::default(), &cwd, make_job, &clock)
+                .expect("train --all")
+                .to_json_line()
+                .expect("json");
+            let _ = std::fs::remove_dir_all(&cwd);
+            line
+        };
+        let plain = run_with("kind-none", Vec::new());
+        assert!(!plain.contains("qwen2_lora"), "{plain}");
+        assert!(!plain.contains("\"candidate\":2"), "{plain}");
+        let named = run_with("kind-named", vec!["qwen2_lora".to_string()]);
+        assert!(
+            named.contains("{\"candidate\":2,\"kind\":\"qwen2_lora\","),
+            "{named}"
+        );
+    }
+
+    /// REQ-41・TASK-41.10-1: `select --kind` は選定記録に `explicit_kinds` を残し、`--kind` が無ければ
+    /// 欄を出さない（従来の記録と同じ）。一覧に無い種類は `invalid_input`。
+    #[test]
+    fn req41_select_records_explicit_kinds_only_when_named() {
+        let cwd = inspected_workdir("kind-select");
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
+                if request.kind() == "c1" {
+                    return Ok(fake_c1_success(request));
+                }
+                let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+            }))
+        };
+        run_all_with(&all_args(), SearchBudget::default(), &cwd, make_job, &clock)
+            .expect("train --all");
+        let select = |kinds: Vec<String>| {
+            super::super::select::run(
+                &SelectArgs {
+                    project_dir: "proj".into(),
+                    kinds,
+                },
+                &cwd,
+            )
+        };
+        let bad = select(vec!["c1".to_string()]).expect_err("c1 is not an explicit-only kind");
+        assert_eq!(bad.code, ExitCode::InvalidInput);
+        let sel_path = cwd.join("proj/selection_record.json");
+        assert!(!sel_path.exists());
+        // 候補 2 は未学習なので選定は変わらないが、候補集合は記録に残る。
+        select(vec!["qwen2_lora".to_string(), "qwen2_lora".to_string()]).expect("select");
+        let record = std::fs::read_to_string(&sel_path).expect("record");
+        assert!(
+            record.contains("\"explicit_kinds\":[\"qwen2_lora\"]"),
+            "{record}"
+        );
+        std::fs::remove_file(&sel_path).expect("remove");
+        select(Vec::new()).expect("select");
+        let record = std::fs::read_to_string(&sel_path).expect("record");
+        assert!(!record.contains("explicit_kinds"), "{record}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-41・TASK-41.10-1: `--kind` が無ければ候補 2 は範囲外、明示指定専用の種類と `--smoke` の併用は
+    /// 学習ワーカーを起動する前に `invalid_input`。
+    #[test]
+    fn req41_train_single_explicit_kind_index_and_smoke_are_guarded() {
+        let cwd = inspected_workdir("kind-single");
+        let single = TrainArgs {
+            op: TrainOp::Run(TrainTarget::Candidate(2)),
+            ..all_args()
+        };
+        let e = run(&single, 2, &cwd).expect_err("out of range");
+        assert_eq!(
+            train_error_pair(&e),
+            (ExitCode::InvalidInput, "candidate index is out of range")
+        );
+        let smoke = TrainArgs {
+            kinds: vec!["qwen2_lora".to_string()],
+            smoke: true,
+            ..single
+        };
+        let e = run(&smoke, 2, &cwd).expect_err("smoke is rejected");
+        assert_eq!(
+            train_error_pair(&e),
+            (
+                ExitCode::InvalidInput,
+                "smoke training is not supported for explicit-only kinds"
+            )
+        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -2181,6 +2319,7 @@ mod status_tests {
 
     fn status_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
         let args = TrainArgs {
+            kinds: Vec::new(),
             project_dir: "proj".into(),
             op: TrainOp::Status(candidate),
             smoke: false,
@@ -2759,6 +2898,7 @@ mod status_tests {
 
     fn cancel_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
         let args = TrainArgs {
+            kinds: Vec::new(),
             project_dir: "proj".into(),
             op: TrainOp::Cancel(candidate),
             smoke: false,

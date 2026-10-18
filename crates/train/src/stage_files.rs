@@ -266,6 +266,10 @@ pub struct SelectionRecord {
     /// TASK-18.3・#481）。定義に `baseline_comparison` が無いときはキーごと省略する（従来の記録と互換）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub significance: Option<SelectionSignificanceRecord>,
+    /// 候補に入れた明示指定専用の種類（正規形。REQ-41・TASK-41.10-1）。`package`・`evaluate` が
+    /// 同じ候補集合を再構成するために使う。指定が無いときはキーごと省略する（従来の記録と互換）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_kinds: Vec<String>,
 }
 
 /// 語彙ファイルを持つ構成が容量の目安（40MB）を超えたため選定対象から外した候補の記録
@@ -524,6 +528,7 @@ mod tests {
             validation_total: 4,
             excluded_candidates: Vec::new(),
             significance: None,
+            explicit_kinds: Vec::new(),
         };
         let bytes = r.to_json_vec().expect("json");
         // 除外が無い記録は従来どおり `excluded_candidates` キーを出さない。
@@ -552,6 +557,7 @@ mod tests {
                 guideline_bytes: 40_000_000,
             }],
             significance: None,
+            explicit_kinds: Vec::new(),
         };
         let bytes = r.to_json_vec().expect("json");
         assert!(String::from_utf8_lossy(&bytes).contains("\"total_bytes\":46365993"));
@@ -582,6 +588,21 @@ mod tests {
             String::from_utf8_lossy(&bytes),
             "{\"candidate_index\":0,\"candidate_id\":\"c1\",\"rule\":\"r\",\"validation_correct\":1,\"validation_total\":2,\"significance\":{\"majority_label\":\"a\",\"baseline_correct\":1,\"b\":1,\"c\":0,\"required_n\":7,\"family_size\":2,\"verdict\":\"undeterminable\"}}\n"
         );
+        assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
+    }
+
+    /// REQ-41・TASK-41.10-1: 明示指定専用の種類は、あるときだけ記録に出て往復できる。
+    #[test]
+    fn req41_selection_record_explicit_kinds_is_optional() {
+        let old = br#"{"candidate_index":0,"candidate_id":"c1","rule":"r","validation_correct":1,"validation_total":2}"#;
+        let r = SelectionRecord::from_json_slice(old).expect("old record");
+        assert!(r.explicit_kinds.is_empty());
+        let r = SelectionRecord {
+            explicit_kinds: vec!["qwen2_lora".to_string()],
+            ..r
+        };
+        let bytes = r.to_json_vec().expect("json");
+        assert!(String::from_utf8_lossy(&bytes).contains("\"explicit_kinds\":[\"qwen2_lora\"]"));
         assert_eq!(SelectionRecord::from_json_slice(&bytes), Ok(r));
     }
 

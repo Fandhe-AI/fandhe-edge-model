@@ -198,7 +198,9 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 記録された選定結果を信じず、`select` と同じ関数で保存済みの候補結果・分割データから
     // 選定をやり直し、記録と完全一致することを確認する（記録の改変対策。validation のみを使い、
     // 凍結 test には触れない。REQ-27）。
-    if compute_selection(&project, &definition)?.as_ref() != Some(&selection) {
+    if compute_selection(&project, &definition, &selection.explicit_kinds)?.as_ref()
+        != Some(&selection)
+    {
         return Err(invalid("selection record does not match the candidate"));
     }
     // 期待する seed・validation 入力は固定値ではなく `split.json` の記録とデータから求める
@@ -211,7 +213,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     let records = inspect_bytes(&train_bytes, &definition)?;
     let (split, split_seed) = verified_split(&project, &records)?;
     let seed = effective_train_seed(&project, selection.candidate_index, split_seed)?;
-    let candidates = resolve_candidates(&project, &definition, selection.candidate_index, seed)?;
+    let candidates = resolve_candidates(
+        &project,
+        &definition,
+        selection.candidate_index,
+        seed,
+        &selection.explicit_kinds,
+    )?;
     let candidate = candidates
         .get(selection.candidate_index)
         .filter(|c| c.candidate_id == selection.candidate_id)
