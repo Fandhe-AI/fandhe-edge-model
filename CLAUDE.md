@@ -4,11 +4,11 @@
 
 用途専用の小型ローカル判定モデルを作成・評価するツールの実装リポジトリ。利用者が用意した選択肢（ラベル）・入出力構造・学習データ・独立した評価データから、数十 MB 以下を志向する判定モデルを作り、Claude Code・Codex などから CLI＋JSON（ローカル MCP を含む）で呼び出せるようにする。
 
-- **本リポは public**。仕様・要件定義の SSOT は private リポ [fandhe-edge-model-spec](https://github.com/Fandhe-AI/fandhe-edge-model-spec)（`docs/spec` submodule の `04-requirements.md`。REQ-15〜40）。spec の内容は本リポに載せてよいが、REQ-n・TASK-n を併記して SSOT へ辿れるようにする（[spec-reference](.claude/rules/spec-reference.md)）
-- 実装方針の要点は README「実装方針（要点）」を参照（薄い統合ツール・推論は学習に依存しない・モデルの種類の選択口・評価契約・入力表現は byte のみ・ローカル完結・共通コアは Rust 中心）
+- **本リポは public**。仕様・要件定義の SSOT は private リポ [fandhe-edge-model-spec](https://github.com/Fandhe-AI/fandhe-edge-model-spec)（`docs/spec` submodule の `04-requirements.md`。REQ-15〜41）。spec の内容は本リポに載せてよいが、REQ-n・TASK-n を併記して SSOT へ辿れるようにする（[spec-reference](.claude/rules/spec-reference.md)）
+- 実装方針の要点は README「実装方針（要点）」を参照（薄い統合ツール・推論は学習に依存しない・モデルの種類の選択口・評価契約・入力表現は kind ごとに選べる（既定 byte。REQ-41・M12）・ローカル完結・共通コアは Rust 中心）
 - 評価契約（評価データの凍結とハッシュ不変・有意性判定・終了コード 7 種など）はコードが破ってはならない不変条件（[evaluation-contract](.claude/rules/evaluation-contract.md)）
 - 依存は最小・完全固定・ユーザー承認制。通信を伴う操作もユーザー承認後（[dependency-policy](.claude/rules/dependency-policy.md)）。ライセンスは `MIT OR Apache-2.0`（[licensing](.claude/rules/licensing.md)）
-- **実装の着手はユーザーの明示指示を経てから**行う。タスク定義は spec の `05-tasks.md`（TASK-15.1〜40.x。6 層の対応は「実装計画の詳細」節）、マイルストーンは `06-roadmap.md`（M6〜M11。初期スコープは M6〜M10）。v1・v2（REQ-1〜14）は凍結済みで対象外
+- **実装の着手はユーザーの明示指示を経てから**行う。タスク定義は spec の `05-tasks.md`（TASK-15.1〜41.12。6 層の対応は「実装計画の詳細」節）、マイルストーンは `06-roadmap.md`（M6〜M12。初期スコープは M6〜M10、その後に M12〔REQ-41〕）。v1・v2（REQ-1〜14）は凍結済みで対象外
 - 進捗・ステータスは本ファイルに逐次記録しない（Issue で管理する）
 
 ## Repository Structure

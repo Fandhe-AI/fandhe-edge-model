@@ -9,7 +9,7 @@
 
 ## ステータス
 
-実装は進行中です（CLI 7 工程は結線済み。進捗は Issue で管理します）。要件は spec リポの [`04-requirements.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/04-requirements.md)（REQ-15〜40）、タスク定義は [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/05-tasks.md)（87 件・35.0 人日）、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/06-roadmap.md)（M6〜M11。初期スコープは M6〜M10）を参照してください。
+実装は進行中です（CLI 7 工程は結線済み。進捗は Issue で管理します）。要件は spec リポの [`04-requirements.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/04-requirements.md)（REQ-15〜41）、タスク定義は [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/05-tasks.md)（TASK-15.1〜41.12）、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-edge-model-spec/blob/main/06-roadmap.md)（M6〜M12。初期スコープは M6〜M10、その後に M12〔REQ-41・公開モデルの追加学習〕）を参照してください。
 
 ## 実装方針（要点）
 
@@ -17,7 +17,7 @@
 - **推論は学習に依存しない**: 推論ランタイムと配布パッケージに学習側の依存を持ち込みません
 - **モデルの種類の選択口**: 判別型・生成型などの種類を同じ選択口から選べるようにし、種類は PoC の結果で増やします
 - **評価契約**: 評価データの凍結・ハッシュの不変・下限基準に対する有意性の判定を、評価器の正しさとあわせて保証します
-- **入力表現**: 既定は byte。`artifact.json` の `input_representation`（`byte`｜`tokenizer`）で宣言します（tokenizer は REQ-41・TASK-41.4 で対応予定。現状は `invalid_input` で拒否）
+- **入力表現**: 既定は byte。モデルの種類（kind）ごとに byte か事前学習モデルのトークナイザーを選べる方針です（REQ-41・M12。sw2k などの自作語彙は除外のまま）。`artifact.json` の `input_representation`（`byte`｜`tokenizer`）で宣言します（tokenizer は REQ-41・TASK-41.4 で対応中。現状 CLI は `invalid_input` で拒否）
 - **呼び出し口**: CLI＋JSON を基本とします。ローカル MCP・Codex からの呼び出しも要件に含みますが、実クライアントとの接続は初期スコープ外です
 - **ローカル完結**: 推論・学習・評価はローカルで完結させます
 - **実装言語の境界**: 共通コアを Rust 中心とする案を暫定で推奨しています。学習側をどこまで Rust に寄せるかは未決です
