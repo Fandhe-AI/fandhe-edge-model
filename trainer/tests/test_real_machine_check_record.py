@@ -587,6 +587,8 @@ def test_on_signal_only_sets_the_mark_and_run_clears_it(
         with_ci=False,
         g_budget_seconds=3600,
         i_device="cpu",
+        k_package="",
+        k_runs=20,
     )
     try:
         rc = mod.run(args)
@@ -710,6 +712,7 @@ def test_interrupt_during_cli_build_writes_a_skeleton_record(tmp_path: Path) -> 
         "H": unselected,
         "I": unselected,
         "J": unselected,
+        "K": unselected,
     }
     assert "(not collected)" in (work / "record.md").read_text()
 
@@ -731,6 +734,8 @@ def _run_in_process(tmp_path: Path, items: str, fake_item: Any, monkeypatch: Any
         with_ci=False,
         g_budget_seconds=3600,
         i_device="cpu",
+        k_package="",
+        k_runs=20,
     )
     try:
         rc = mod.run(args)
@@ -837,6 +842,8 @@ def _ns(**over: Any) -> argparse.Namespace:
         "overall_timeout_sec": 14400,
         "g_budget_seconds": 3600,
         "i_device": "cpu",
+        "k_package": "",
+        "k_runs": 20,
         "bin_override": False,
         "bin": None,
     }
@@ -1863,6 +1870,8 @@ def test_internal_error_makes_the_script_exit_70_and_still_writes_record(
         with_ci=False,
         g_budget_seconds=3600,
         i_device="cpu",
+        k_package="",
+        k_runs=20,
     )
     (tmp_path / "w").mkdir()
     try:
@@ -2321,6 +2330,36 @@ def _representative_record(tmp_path: Path) -> dict[str, Any]:
             "rollback_to_v1_ok": True,
             "version_id_only_exit_code": 64,
         },
+        "K": {
+            "status": "ok",
+            "package": {
+                "kind": "qwen2_lora",
+                "artifact_sha256": "a" * 64,
+                "files": [{"name": "artifact.json", "bytes": 20}],
+                "file_count": 1,
+                "total_bytes": 20,
+                "reference_bytes": 40_000_000,
+                "over_reference": False,
+            },
+            "rss": {
+                "max_rss_bytes": 1_000_000,
+                "target_bytes": 2_147_483_648,
+                "over_target": False,
+                "scope": "process_tree_via_time_l",
+            },
+            "e2e": {
+                "runs": 5,
+                "warmup": 1,
+                "p95_us": 58_000,
+                "median_us": 40_000,
+                "max_us": 60_000,
+                "guideline_us": 250_000,
+                "over_guideline": False,
+                "resolution_us": 10_000,
+                "classification": "reference_only",
+            },
+            "inference_only_p95": None,
+        },
     }
     return {
         "schema": "real-machine-check/1",
@@ -2358,6 +2397,8 @@ def _representative_record(tmp_path: Path) -> dict[str, Any]:
             "p95_limit_us": 5,
             "g_budget_seconds": 3600,
             "i_device": "cpu",
+            "k_package_given": False,
+            "k_runs": 20,
         },
         "items": items,
     }
@@ -4708,7 +4749,7 @@ def test_default_items_match_the_shell_script_and_exclude_a_and_i() -> None:
     m = re.search(r"^items=(\S+)$", sh, re.MULTILINE)
     assert m is not None
     assert m.group(1).split(",") == mod.DEFAULT_ITEMS == ["B", "C", "D", "E", "F", "G", "H", "J"]
-    assert mod.ITEM_ORDER == list("ABCDEFGHIJ")
+    assert mod.ITEM_ORDER == list("ABCDEFGHIJK")
     assert "A" not in mod.DEFAULT_ITEMS
     assert "I" not in mod.DEFAULT_ITEMS
     assert mod.ITEMS_MESSAGE in sh
@@ -4722,8 +4763,8 @@ def test_default_items_match_the_shell_script_and_exclude_a_and_i() -> None:
         ({"items": "B,J"}, None),
         ({"items": "G,H,I"}, None),
         (
-            {"items": "K"},
-            "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J",
+            {"items": "Z"},
+            "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K",
         ),
         ({"g_budget_seconds": 921_600}, None),
         (
@@ -5472,3 +5513,93 @@ def test_reference_p95_matches_the_rust_constant() -> None:
     m = re.search(r"pub const REFERENCE_P95_NS: u64 = ([0-9_]+);", src)
     assert m is not None, "REFERENCE_P95_NS が見つからない"
     assert int(m.group(1).replace("_", "")) == mod.REFERENCE_P95_US * 1_000
+
+
+# ---- 項目 K（追加学習の種類のパッケージ測定。REQ-41・TASK-41.11-1・#441） ----
+
+
+def test_parse_time_l_takes_the_last_lines_and_none_when_missing() -> None:
+    """REQ-41: `time -l` の最後の real と最大 RSS を採る。行が無ければ None。"""
+    text = (
+        "        1.50 real         0.10 user         0.05 sys\n"
+        "   111  maximum resident set size\n"
+        "        0.25 real         0.10 user         0.05 sys\n"
+        "     222333  maximum resident set size\n"
+    )
+    assert mod.parse_time_l(text) == (222333, 250_000)
+    assert mod.parse_time_l("no stats here\n") == (None, None)
+
+
+def test_p95_linear_us_matches_numpy_linear_interpolation() -> None:
+    """REQ-31: 線形補間・外れ値を除かない・µs の整数へ切り上げ。"""
+    assert mod.p95_linear_us([20_000, 30_000, 40_000, 50_000, 60_000]) == 58_000
+    assert mod.p95_linear_us([10_000]) == 10_000
+    # 20 件（10 ms〜200 ms）: pos=18.05 → 190 ms と 200 ms の間 → 190.5 ms
+    assert mod.p95_linear_us([10_000 * i for i in range(1, 21)]) == 190_500
+    # 順序によらない
+    assert mod.p95_linear_us([60_000, 20_000, 40_000, 30_000, 50_000]) == 58_000
+
+
+_K_RUNS_MSG = "--k-runs must be an integer from 1 to 1000"
+_K_PKG_MSG = "--k-package must be a directory with a plain name"
+_K_PAIR_MSG = "item K and --k-package must be given together"
+
+
+@pytest.mark.parametrize(
+    ("over", "want"),
+    [
+        ({"items": "K"}, _K_PAIR_MSG),
+        ({"k_package": "/usr"}, _K_PAIR_MSG),
+        ({"items": "K", "k_package": "/usr", "k_runs": 0}, _K_RUNS_MSG),
+        ({"items": "K", "k_package": "/usr", "k_runs": 1001}, _K_RUNS_MSG),
+        ({"items": "K", "k_package": "relative"}, _K_PKG_MSG),
+        ({"items": "K", "k_package": "/nonexistent-k-dir"}, _K_PKG_MSG),
+    ],
+)
+def test_validate_args_for_item_k(over: dict[str, Any], want: str | None) -> None:
+    """REQ-41・REQ-39: K と `--k-package` は対。回数・パッケージの形を検証する。"""
+    assert mod.validate_args(_ns(**over)) == want
+
+
+def test_validate_args_accepts_a_plain_package_directory(tmp_path: Path) -> None:
+    """REQ-41・REQ-39: 通常のディレクトリは通り、symlink・`-` 始まりの名前は拒否する。"""
+    pkg = tmp_path / "qwen-pkg"
+    pkg.mkdir()
+    assert mod.validate_args(_ns(items="K", k_package=str(pkg), k_runs=1000)) is None
+    link = tmp_path / "link"
+    link.symlink_to(pkg)
+    assert mod.validate_args(_ns(items="K", k_package=str(link))) == _K_PKG_MSG
+    dash = tmp_path / "-opt"
+    dash.mkdir()
+    assert mod.validate_args(_ns(items="K", k_package=str(dash))) == _K_PKG_MSG
+
+
+def test_item_k_is_not_a_default_item_and_additional_kinds_match_rust() -> None:
+    """REQ-41: K は既定に入れない。追加学習の種類は Rust の `EXPLICIT_ONLY_KINDS` と一致する。"""
+    assert "K" not in mod.DEFAULT_ITEMS
+    src = (REPO / "crates" / "train" / "src" / "kind_resolution.rs").read_text("utf-8")
+    m = re.search(r"pub const EXPLICIT_ONLY_KINDS: \[\(&str, u32\); \d+\] = \[(.*?)\];", src, re.S)
+    assert m is not None, "EXPLICIT_ONLY_KINDS が見つからない"
+    assert set(re.findall(r'\("([a-z0-9_]+)",', m.group(1))) == set(mod.ADDITIONAL_KINDS)
+    assert mod.ADDITIONAL_KINDS <= mod.KIND_VOCAB
+
+
+def test_item_k_bounds_package_listing_and_honors_overall_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39・#441: K は `--k-package` の列挙に件数上限と全体期限を効かせる。"""
+    from types import SimpleNamespace
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(mod, "MAX_K_PACKAGE_ENTRIES", 2)
+    for i in range(3):
+        (pkg / f"f{i}.bin").write_bytes(b"x")
+    ctx = SimpleNamespace(k_package=pkg)
+    assert mod.item_k(ctx) == {"status": "failed", "reason": "package_too_many_entries"}
+    monkeypatch.setattr(mod, "_overall_deadline", 0.0)
+    try:
+        with pytest.raises(mod.OverallTimeout):
+            mod.item_k(ctx)
+    finally:
+        mod.clear_overall()

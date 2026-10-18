@@ -31,7 +31,7 @@ Rust
   fmt / fmt-check / lint / test / clean  make <target>             cargo 直書き（clean は scripts/clean.sh）
   deny                      scripts/deny.sh                         cargo deny（PIN_CARGO_DENY_VERSION）
   check-runtime-linkage     scripts/check-runtime-linkage.sh        動的リンク確認（Mac 実機・人間が実行）
-  real-machine-check        scripts/real-machine-check.sh [args]    Mac 実機での動作確認 A〜J（make 経由は ARGS='...' をコマンドラインで渡す）
+  real-machine-check        scripts/real-machine-check.sh [args]    Mac 実機での動作確認 A〜K（make 経由は ARGS='...' をコマンドラインで渡す）
 
 学習ワーカー（trainer/。PIN_UV_VERSION が必要）
   py-sync / py-fmt / py-fmt-check / py-lint / py-test  scripts/py.sh <sync|fmt|fmt-check|lint|test>

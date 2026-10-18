@@ -1,6 +1,6 @@
 #!/bin/sh
-# Mac 実機での動作確認（項目 A〜J）を、PC を変えても同じ手順で再現するための入口スクリプト
-# （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39。
+# Mac 実機での動作確認（項目 A〜K）を、PC を変えても同じ手順で再現するための入口スクリプト
+# （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39・REQ-41（K。TASK-41.11-1・#441）。
 # 特定の TASK には対応しない横断の確認ツール。
 # REQ-38 の sandbox 下の通信 0 件は対象外で、`sandbox-monitor.sh` の担当）。
 #
@@ -14,16 +14,25 @@
 #   real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci]
 #                         [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N]
 #                         [--g-budget-seconds N] [--i-device cpu|gpu]
+#                         [--k-package DIR] [--k-runs N]
 #   値を取るオプションは `--key VALUE` と `--key=VALUE` の両方を受け付ける。
 #   --work-dir: 必須。存在しないか空のディレクトリで、リポジトリ配下でないこと（物理パスで比較）
-#   --items:    A,B,C,D,E,F,G,H,I,J の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F,G,H,J。
-#               実行順は常に A→J。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は
+#   --items:    A,B,C,D,E,F,G,H,I,J,K の部分集合（カンマ区切り・大文字・重複不可）。既定は B,C,D,E,F,G,H,J。
+#               実行順は常に A→K。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は
 #               invalid_input(64)）。A は通信しうる（--with-ci が要る）、I は 4 回の学習で GPU・時間を
-#               長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する
+#               長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する。
+#               K も既定に入れず、`--items K --k-package DIR` で明示したときだけ実行する
 #   G:          `train --all`（探索予算内の全候補の学習。REQ-18）。実 trainer を使う
 #   H:          `train --cancel`・`--status`・クラッシュ検出（REQ-34・REQ-39）。実 trainer を使う
 #   I:          3 seed の再現性と前のモデルとの比較（REQ-26・REQ-27）。学習 4 回
 #   J:          前の版への復帰（REQ-39。B の project を旧プロジェクトに使う）
+#   K:          追加学習の種類（qwen2_lora）のパッケージの容量・最大 RSS・E2E p95（REQ-41・REQ-30・
+#               REQ-31・REQ-39）。パッケージは人が別の手段で用意して --k-package で渡す（読み取りのみ）。
+#               p95 は `infer` 1 回ごとの E2E（プロセスの起動と読み込みを含む。推論のみの p95 ではない）。
+#               CLI が追加学習の種類の infer に未対応の間は exit 64 の failed になる（正直に記録する）
+#   --k-package: K を指定したら必須（K が無いのに指定すると invalid_input）。存在するディレクトリ
+#               （symlink 不可）で、名前は [A-Za-z0-9_][A-Za-z0-9._-]{0,63}
+#   --k-runs:   K の計測回数（1〜1000。既定 20。別に先頭 1 回のウォームアップを実行する）
 #   --with-ci:  A（make ci）を実行する明示の同意。A は通信を伴いうる（uv sync・advisory DB・npx）。
 #               --items に A があり --with-ci が無ければ invalid_input(64) で何も実行しない
 #   --repeat:   F の回数（1〜1000。既定 50）
@@ -45,8 +54,10 @@
 #                          存在しない・実行できない場合は invalid_input(64)。未設定なら cargo build --locked --release の `compiler-artifact` の executable を使う
 #   FANDHE_EDGE_MAKE_CMD   make の代役（テスト専用。絶対パスの実行ファイル）
 #   FANDHE_EDGE_CARGO_CMD  cargo の代役（テスト専用。絶対パスの実行ファイル）
+#   FANDHE_EDGE_TIME_CMD   /usr/bin/time の代役（テスト専用。絶対パスの実行ファイル。K が使う）。
+#                          未設定なら /usr/bin/time 固定（PATH で探さない）
 #   FANDHE_EDGE_TRAINER_DIR  CLI の train が読む trainer の場所。値は読まず、設定の有無だけを記録する
-#   MAKE_CMD・CARGO_CMD のどちらかを設定すると record の evidence_hint は test_harness になる
+#   MAKE_CMD・CARGO_CMD・TIME_CMD のいずれかを設定すると record の evidence_hint は test_harness になる
 #
 # 契約:
 #   - 引数の誤りは CLI・make・cargo を起動する前に {"code":"invalid_input","message":"<固定>"} を 1 行出して exit 64
@@ -91,6 +102,8 @@ p95_limit=50000
 pkg_limit=1000
 g_budget=3600
 i_device=cpu
+k_package=
+k_runs=20
 overall_timeout=14400
 seen=
 while [ $# -gt 0 ]; do
@@ -106,7 +119,7 @@ while [ $# -gt 0 ]; do
     esac
     case "$key" in
         --help)
-            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu]"
+            fail 0 ok "usage: real-machine-check.sh --work-dir DIR [--items LIST] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu] [--k-package DIR] [--k-runs N]"
             ;;
         --quiet-machine | --with-ci)
             [ "$has_val" -eq 0 ] || fail 64 invalid_input "option does not take a value"
@@ -116,7 +129,7 @@ while [ $# -gt 0 ]; do
             shift
             continue
             ;;
-        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes | --overall-timeout-sec | --g-budget-seconds | --i-device) ;;
+        --work-dir | --items | --repeat | --p95-limit-us | --package-limit-bytes | --overall-timeout-sec | --g-budget-seconds | --i-device | --k-package | --k-runs) ;;
         *) fail 64 invalid_input "unknown option" ;;
     esac
     if [ "$has_val" -eq 0 ]; then
@@ -137,26 +150,28 @@ while [ $# -gt 0 ]; do
         --overall-timeout-sec) overall_timeout=$val ;;
         --g-budget-seconds) g_budget=$val ;;
         --i-device) i_device=$val ;;
+        --k-package) k_package=$val ;;
+        --k-runs) k_runs=$val ;;
     esac
 done
 
 [ -n "$work_dir" ] || fail 64 invalid_input "--work-dir is required"
 
-# --items: A〜J の部分集合（大文字・重複なし・空要素なし）。分割の前に文字種を絞る（二重の守り。
+# --items: A〜K の部分集合（大文字・重複なし・空要素なし）。分割の前に文字種を絞る（二重の守り。
 # 範囲指定 A-F は照合順序に左右されるため使わない）
 case "$items" in
-    *[!ABCDEFGHIJ,]*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J" ;;
-    '' | ,* | *, | *,,*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J" ;;
+    *[!ABCDEFGHIJK,]*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K" ;;
+    '' | ,* | *, | *,,*) fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K" ;;
 esac
 item_seen=
 old_ifs=$IFS
 IFS=,
 for it in $items; do
     case "$it" in
-        A | B | C | D | E | F | G | H | I | J) ;;
+        A | B | C | D | E | F | G | H | I | J | K) ;;
         *)
             IFS=$old_ifs
-            fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J"
+            fail 64 invalid_input "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K"
             ;;
     esac
     case "$item_seen" in
@@ -191,6 +206,16 @@ case "$item_seen" in
             *) fail 64 invalid_input "item J requires item B" ;;
         esac
         ;;
+esac
+
+# K と --k-package は対（片方だけは起動前に拒否する）
+case "$item_seen" in
+    *" K "*) [ -n "$k_package" ] || fail 64 invalid_input "item K requires --k-package" ;;
+    *) [ -z "$k_package" ] || fail 64 invalid_input "--k-package requires item K" ;;
+esac
+case "$k_runs" in
+    [1-9] | [1-9][0-9] | [1-9][0-9][0-9] | 1000) ;;
+    *) fail 64 invalid_input "--k-runs must be an integer from 1 to 1000" ;;
 esac
 
 # 整数オプション（先頭 0 は拒否。桁数を制限して算術の桁あふれを避ける）
@@ -308,6 +333,7 @@ check_cmd() {
 }
 check_cmd FANDHE_EDGE_MAKE_CMD "${FANDHE_EDGE_MAKE_CMD:-}"
 check_cmd FANDHE_EDGE_CARGO_CMD "${FANDHE_EDGE_CARGO_CMD:-}"
+check_cmd FANDHE_EDGE_TIME_CMD "${FANDHE_EDGE_TIME_CMD:-}"
 
 # FANDHE_EDGE_BIN は絶対の物理パスへ正規化してから渡す（ハッシュを取る対象と実行する対象を同一にする）。
 # 相対パスは呼び出し時のカレントを基準に解決し、`/` を含まない裸の名前は拒否する
@@ -325,6 +351,30 @@ if [ -n "${FANDHE_EDGE_BIN:-}" ]; then
     if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
         fail 64 invalid_input "FANDHE_EDGE_BIN must be a path to an executable file"
     fi
+fi
+
+# K のパッケージは読み取りだけ。末尾の `/` と `/.` を除き、symlink・非ディレクトリ・`-` 始まり等の
+# 名前を拒否して、物理パスへ正規化する（値はメッセージに出さない）
+if [ -n "$k_package" ]; then
+    while :; do
+        case "$k_package" in
+            */.) k_package=${k_package%/.} ;;
+            ?*/) k_package=${k_package%/} ;;
+            *) break ;;
+        esac
+    done
+    if [ ! -d "$k_package" ] || [ -L "$k_package" ]; then
+        fail 64 invalid_input "--k-package must be a directory with a plain name"
+    fi
+    k_parent=$(cd -P -- "$(dirname -- "$k_package")" 2>/dev/null && pwd -P) \
+        || fail 64 invalid_input "--k-package must be a directory with a plain name"
+    k_base=$(basename -- "$k_package")
+    case "$k_base" in
+        '' | [!A-Za-z0-9_]* | *[!A-Za-z0-9._-]* | ?????????????????????????????????????????????????????????????????*)
+            fail 64 invalid_input "--k-package must be a directory with a plain name"
+            ;;
+    esac
+    k_package="${k_parent%/}/$k_base"
 fi
 
 # 作業ディレクトリ（最上位を含む）は本人だけが読み書きできる権限で作る
@@ -346,7 +396,9 @@ set -- run \
     --package-limit-bytes "$pkg_limit" \
     --overall-timeout-sec "$overall_timeout" \
     --g-budget-seconds "$g_budget" \
-    --i-device "$i_device"
+    --i-device "$i_device" \
+    --k-runs "$k_runs"
+[ -z "$k_package" ] || set -- "$@" --k-package "$k_package"
 [ -z "${bin:-}" ] || set -- "$@" --bin "$bin" --bin-override
 [ "$quiet" -eq 0 ] || set -- "$@" --quiet-machine
 [ "$with_ci" -eq 0 ] || set -- "$@" --with-ci

@@ -1,6 +1,6 @@
-//! `scripts/real-machine-check.sh`（Mac 実機での動作確認 A〜J の入口）と
+//! `scripts/real-machine-check.sh`（Mac 実機での動作確認 A〜K の入口）と
 //! `scripts/real_machine_check_record.py`（実行・伏せ処理・記録の生成）の結合テスト
-//! （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-33・REQ-34・REQ-39・Issue #354）。
+//! （REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-33・REQ-34・REQ-39・REQ-41・Issue #354・#441）。
 //!
 //! 証拠種別: テストハーネス。偽の make・偽の cargo・偽の CLI を一時ディレクトリへ書き出して使うため、
 //! **実 make・実 cargo・実 CLI・実機の測定は一切行っていない**。ここで検証するのは
@@ -801,7 +801,7 @@ fn fixture_ids(name: &str) -> Vec<String> {
 }
 
 const INVALID: &str = "{\"code\":\"invalid_input\",\"message\":\"";
-const ITEMS_MSG: &str = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J";
+const ITEMS_MSG: &str = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K";
 /// stdout の状態（REQ-21: 最終 JSON を書けない場合の終了コードの確認用）。
 #[derive(Clone, Copy)]
 enum StdoutKind {
@@ -2864,7 +2864,8 @@ fn req33_default_items_include_g_h_j_but_not_a_or_i() {
 fn req21_new_items_and_options_are_validated_before_start() {
     const BUDGET_MSG: &str = "--g-budget-seconds must be an integer from 1 to 921600";
     for (extra, message) in [
-        (vec!["--items", "K"], ITEMS_MSG),
+        (vec!["--items", "Z"], ITEMS_MSG),
+        (vec!["--items", "K"], "item K requires --k-package"),
         (vec!["--items", "J"], "item J requires item B"),
         (vec!["--items", "C,J"], "item J requires item B"),
         (vec!["--g-budget-seconds", "0"], BUDGET_MSG),
@@ -3257,4 +3258,231 @@ fn req39_j_stops_at_the_first_failing_infer() {
         .count();
     assert_eq!(ledger_infers, 1, "{args:?}");
     assert!(!args.iter().any(|a| a.contains("J/tampered")), "{args:?}");
+}
+// ---- 項目 K（追加学習の種類のパッケージ測定。REQ-41・REQ-30・REQ-31・REQ-39・TASK-41.11-1・#441） ----
+
+/// K 用の偽 CLI。`infer` だけを受け、cwd の basename と引数を `k.log` に残す。
+/// `FAKE_K_EXIT=64` なら追加学習の種類が未対応の現状の CLI と同じ応答（exit 64）を返す。
+const FAKE_K_CLI: &str = r##"#!/bin/sh
+echo "$(basename "$PWD") $*" >> "$FAKE_DIR/k.log"
+if [ "${FAKE_K_EXIT:-0}" = 64 ]; then
+  echo '{"code":"invalid_input","message":"unsupported input representation"}'
+  exit 64
+fi
+echo '{"id":"input","status":"ok","label":"a","scores":{}}'
+exit 0
+"##;
+
+/// `/usr/bin/time -l` の代役。`-l` を読み飛ばして子を実行し、stderr に real と最大 RSS の行を出す。
+/// n 回目の real は 0.0n 秒・RSS は n MB（`FAKE_TIME_REAL`・`FAKE_TIME_RSS` で固定できる）。
+const FAKE_TIME: &str = r##"#!/bin/sh
+shift
+n=$(cat "$FAKE_DIR/time.count" 2>/dev/null || echo 0)
+n=$((n+1))
+echo $n > "$FAKE_DIR/time.count"
+"$@"
+rc=$?
+if [ -n "${FAKE_TIME_REAL:-}" ]; then real=$FAKE_TIME_REAL; else real=$(printf '0.%02d' $n); fi
+rss=${FAKE_TIME_RSS:-$((n*1000000))}
+printf '        %s real         0.00 user         0.00 sys\n' "$real" >&2
+printf '%12d  maximum resident set size\n' "$rss" >&2
+exit $rc
+"##;
+
+/// K の対象パッケージ（artifact.json と 1000 バイトの重み）を作り、(パッケージ, artifact.json の
+/// バイト数) を返す。
+fn k_package(e: &Env, kind: &str) -> (PathBuf, u64) {
+    let dir = e.dir.join("pkgs").join("qwen-pkg");
+    fs::create_dir_all(&dir).expect("mkdir pkg");
+    let art = format!("{{\"kind\":\"{kind}\"}}");
+    fs::write(dir.join("artifact.json"), &art).expect("artifact");
+    fs::write(dir.join("model.safetensors"), vec![0u8; 1000]).expect("weights");
+    (dir, art.len() as u64)
+}
+
+/// K を動かす envs（偽の CLI・偽の time）。
+fn k_envs(e: &Env) -> Vec<(&'static str, String)> {
+    let cli = e.dir.join("fake-k-cli");
+    let time = e.dir.join("fake-time");
+    write_exe(&cli, FAKE_K_CLI);
+    write_exe(&time, FAKE_TIME);
+    vec![
+        ("FANDHE_EDGE_BIN", cli.display().to_string()),
+        ("FANDHE_EDGE_TIME_CMD", time.display().to_string()),
+    ]
+}
+
+fn run_k(e: &Env, pkg: &Path, runs: &str, extra: &[(&str, &str)]) -> Out {
+    let owned = k_envs(e);
+    let mut envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    envs.extend_from_slice(extra);
+    e.run(
+        &with_work(
+            e,
+            &[
+                "--items",
+                "K",
+                "--k-package",
+                &pkg.display().to_string(),
+                "--k-runs",
+                runs,
+            ],
+        ),
+        &envs,
+    )
+}
+
+/// REQ-41・REQ-39: 容量・RSS・E2E p95 を記録する。ウォームアップ 1 回は p95 に含めず RSS には含める。
+/// p95 は線形補間（[20,30,40,50,60] ms の 95 パーセンタイルは 58 ms）。推論のみの p95 は null。
+#[test]
+fn req41_item_k_records_capacity_rss_and_e2e_p95() {
+    let e = Env::new();
+    let (pkg, art_len) = k_package(&e, "qwen2_lora");
+    let o = run_k(&e, &pkg, "5", &[]);
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.K.status"), "\"ok\"");
+    assert_eq!(e.q("evidence_hint"), "\"test_harness\"");
+    assert_eq!(e.q("items.K.package.kind"), "\"qwen2_lora\"");
+    assert_eq!(e.q("items.K.package.file_count"), "2");
+    assert_eq!(
+        e.q("items.K.package.total_bytes"),
+        (art_len + 1000).to_string()
+    );
+    assert_eq!(e.q("items.K.package.over_reference"), "false");
+    assert_eq!(e.q("items.K.rss.max_rss_bytes"), "6000000");
+    assert_eq!(e.q("items.K.rss.over_target"), "false");
+    assert_eq!(e.q("items.K.e2e.runs"), "5");
+    assert_eq!(e.q("items.K.e2e.warmup"), "1");
+    assert_eq!(e.q("items.K.e2e.p95_us"), "58000");
+    assert_eq!(e.q("items.K.e2e.median_us"), "40000");
+    assert_eq!(e.q("items.K.e2e.max_us"), "60000");
+    assert_eq!(e.q("items.K.e2e.classification"), "\"reference_only\"");
+    assert_eq!(e.q("items.K.inference_only_p95"), "null");
+    assert_eq!(e.q("options.k_runs"), "5");
+    assert_eq!(e.q("options.k_package_given"), "true");
+    // 6 回（ウォームアップ 1 + 5）。cwd はパッケージの親、引数は相対の basename
+    let log = e.lines("k.log");
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert_eq!(
+        log[0],
+        "pkgs infer --package qwen-pkg --text sandbox check 0123456789"
+    );
+    // 記録にパスと入力本文を出さない
+    let rec = format!("{}{}", e.text("record.json"), e.text("record.md"));
+    assert!(!rec.contains(&e.dir.display().to_string()), "path leaked");
+    assert!(!rec.contains("sandbox check"), "sample leaked");
+    assert!(rec.contains("E2E p95"), "markdown section missing");
+}
+
+/// REQ-41・TASK-41.9 の方針: 目標（RSS 2 GiB・E2E p95 250 ms・容量 40 MB）の超過は警告で、失敗にしない。
+#[test]
+fn req41_item_k_over_target_is_recorded_not_failed() {
+    let e = Env::new();
+    let (pkg, _) = k_package(&e, "qwen2_lora");
+    let o = run_k(
+        &e,
+        &pkg,
+        "2",
+        &[("FAKE_TIME_REAL", "0.30"), ("FAKE_TIME_RSS", "3000000000")],
+    );
+    assert_eq!(o.code, Some(0), "{}", o.diag());
+    assert_eq!(e.q("items.K.status"), "\"ok\"");
+    assert_eq!(e.q("items.K.rss.over_target"), "true");
+    assert_eq!(e.q("items.K.e2e.p95_us"), "300000");
+    assert_eq!(e.q("items.K.e2e.over_guideline"), "true");
+}
+
+/// REQ-41: CLI が追加学習の種類の infer に未対応（exit 64）の間は、正直に failed で記録する。
+#[test]
+fn req41_item_k_unwired_infer_fails_with_exit_code() {
+    let e = Env::new();
+    let (pkg, _) = k_package(&e, "qwen2_lora");
+    let o = run_k(&e, &pkg, "2", &[("FAKE_K_EXIT", "64")]);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.K.status"), "\"failed\"");
+    assert_eq!(e.q("items.K.reason"), "\"unexpected_exit_code\"");
+    assert_eq!(e.q("items.K.exit_code"), "64");
+    assert_eq!(e.q("items.K.run"), "0");
+    assert_eq!(e.lines("k.log").len(), 1);
+}
+
+/// REQ-41・REQ-39: 追加学習の種類以外の kind のパッケージは測らない。
+#[test]
+fn req41_item_k_non_additional_kind_fails() {
+    let e = Env::new();
+    let (pkg, _) = k_package(&e, "c1");
+    let o = run_k(&e, &pkg, "2", &[]);
+    assert_eq!(o.code, Some(10), "{}", o.diag());
+    assert_eq!(e.q("items.K.reason"), "\"unexpected_kind\"");
+    assert!(e.lines("k.log").is_empty());
+}
+
+/// REQ-21・REQ-39: K と `--k-package` は対。不正なパッケージ指定・回数は起動前に 64。値は出力しない。
+#[test]
+fn req41_k_arguments_are_validated_before_start() {
+    const KMSG: &str = "--k-package must be a directory with a plain name";
+    const RUNS: &str = "--k-runs must be an integer from 1 to 1000";
+    let e = Env::new();
+    let (pkg, _) = k_package(&e, "qwen2_lora");
+    let p = pkg.display().to_string();
+    let file = e.dir.join("afile");
+    fs::write(&file, "x").expect("file");
+    let link = e.dir.join("alink");
+    symlink(&pkg, &link).expect("symlink");
+    let dash = e.dir.join("-opt");
+    fs::create_dir_all(&dash).expect("dash");
+    let long = e.dir.join("a".repeat(65));
+    fs::create_dir_all(&long).expect("long");
+    let none = e.dir.join("none").display().to_string();
+    let file_s = file.display().to_string();
+    let link_s = link.display().to_string();
+    let link_slash = format!("{link_s}/");
+    let dash_s = dash.display().to_string();
+    let long_s = long.display().to_string();
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["--items", "K"], "item K requires --k-package"),
+        (vec!["--k-package", &p], "--k-package requires item K"),
+        (
+            vec!["--items", "K", "--k-package", &p, "--k-runs", "0"],
+            RUNS,
+        ),
+        (
+            vec!["--items", "K", "--k-package", &p, "--k-runs", "1001"],
+            RUNS,
+        ),
+        (
+            vec!["--items", "K", "--k-package", &p, "--k-runs", "05"],
+            RUNS,
+        ),
+        (vec!["--items", "K", "--k-package", &none], KMSG),
+        (vec!["--items", "K", "--k-package", &file_s], KMSG),
+        (vec!["--items", "K", "--k-package", &link_s], KMSG),
+        (vec!["--items", "K", "--k-package", &link_slash], KMSG),
+        (vec!["--items", "K", "--k-package", &dash_s], KMSG),
+        (vec!["--items", "K", "--k-package", &long_s], KMSG),
+    ];
+    for (extra, message) in cases {
+        let o = e.run(&with_work(&e, &extra), &[]);
+        assert_eq!(o.code, Some(64), "{extra:?}: {}", o.diag());
+        assert_eq!(o.stdout, format!("{INVALID}{message}\"}}\n"), "{extra:?}");
+        assert!(e.lines("cli.log").is_empty(), "{extra:?}");
+        assert!(!e.work.join("record.json").exists(), "{extra:?}");
+    }
+}
+
+/// REQ-39: `FANDHE_EDGE_TIME_CMD` は絶対パスの実行ファイルに限る（PATH で探さない）。
+#[test]
+fn req41_time_cmd_override_must_be_absolute_executable() {
+    let e = Env::new();
+    let (pkg, _) = k_package(&e, "qwen2_lora");
+    let args = with_work(
+        &e,
+        &["--items", "K", "--k-package", &pkg.display().to_string()],
+    );
+    assert_rejected_before_start(
+        &e,
+        &args,
+        &[("FANDHE_EDGE_TIME_CMD", "time")],
+        "FANDHE_EDGE_TIME_CMD must be an absolute path to an executable",
+    );
 }
