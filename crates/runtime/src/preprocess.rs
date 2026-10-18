@@ -37,6 +37,7 @@
 //!   `unwrap` / 添字アクセスを使わず panic しない
 
 use crate::pipeline::{PreprocessError, Preprocessor, TokenIds};
+use crate::tokenizer::{MAX_ENCODE_BYTES, TokenizerSpec};
 use unicode_normalization::UnicodeNormalization;
 
 /// Python の `str.split()` 互換の空白判定。`char::is_whitespace` に U+001C〜U+001F
@@ -95,6 +96,40 @@ impl Preprocessor for ByteEncodingPreprocessor {
             &normalize_input(input),
             self.max_bytes,
         )))
+    }
+}
+
+/// トークナイザー前処理（追加学習 `qwen2_lora`。REQ-41・REQ-32・TASK-41.6-5・#434）。
+///
+/// `artifact.json` の `scoring.system_prompt` とベースモデル由来の `tokenizer.json` から、学習側
+/// （`qwen2_tokenizer.py::build_chat_ids`。採点用 prompt は `add_generation_prompt=True` 経路）と
+/// 同じ chat template の id 列を作る。選択肢の採点はグラフ内（定数）で行うため、ここは prefix のみ。
+/// 状態を持たない（REQ-28）。`max_seq_length` の照合は呼び出し側（本文は
+/// [`crate::tokenizer::MAX_ENCODE_BYTES`] で有界）。
+#[derive(Debug)]
+pub struct TokenizerPreprocessor {
+    spec: TokenizerSpec,
+    system_prompt: String,
+}
+
+impl TokenizerPreprocessor {
+    /// 検証済みのトークナイザーと system プロンプトから作る。プロンプトが長すぎれば `None`
+    /// （[`crate::tokenizer::MAX_ENCODE_BYTES`] 超。外部入力の上限検査）。
+    pub fn new(spec: TokenizerSpec, system_prompt: String) -> Option<Self> {
+        (system_prompt.len() <= MAX_ENCODE_BYTES).then_some(Self {
+            spec,
+            system_prompt,
+        })
+    }
+}
+
+impl Preprocessor for TokenizerPreprocessor {
+    fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
+        let ids = self
+            .spec
+            .build_chat_ids(&self.system_prompt, input, None)
+            .map_err(|_| PreprocessError::Failed)?;
+        Ok(TokenIds::new(ids.into_iter().map(i64::from).collect()))
     }
 }
 

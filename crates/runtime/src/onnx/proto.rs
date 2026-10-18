@@ -104,8 +104,6 @@ pub(super) enum TensorData {
     F32(Vec<f32>),
     I64(Vec<i64>),
     /// bf16 のビット列（上位 16 bit の f32）。f32 への展開は計算側（行列積・Gather）で行う。
-    // 読み手は Qwen 実行器（#416・#417・#420）。未接続の間は dead_code になる
-    #[cfg_attr(not(test), allow(dead_code))]
     Bf16(Vec<u16>),
     /// 外部データへの参照。[`super::external::resolve_external`] が他の値へ置き換えるまで実行に渡さない。
     External(ExternalRef),

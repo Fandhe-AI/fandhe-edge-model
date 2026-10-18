@@ -153,6 +153,7 @@ impl From<ModelKind> for ExportKind {
         match k {
             ModelKind::C1 => Self::C1,
             ModelKind::C3 => Self::C3,
+            ModelKind::Qwen2Lora => Self::Qwen2Lora,
         }
     }
 }

@@ -92,7 +92,7 @@
 
 ## 5. 範囲外を除外する方針
 
-- 学習側（#431・#433）: 書き出した ONNX の演算・属性・dtype・rank・opset が一覧の範囲外なら、配布候補から外して理由を記録する（TASK-32.2 の仕組み。`export_exclusion.rs` の理由に未対応演算を足す）。config の範囲外（rope_scaling・sliding window・silu 以外）は書き出しの前に止める。#431 の受け入れテストは本書の表を基準にする。#433 の実装: 演算名 × domain と opset を `screen_scoring_candidate` で判定する（属性・dtype・rank は実行器の読み込み〔#434〕で判定）
+- 学習側（#431・#433）: 書き出した ONNX の演算・属性・dtype・rank・opset が一覧の範囲外なら、配布候補から外して理由を記録する（TASK-32.2 の仕組み。`export_exclusion.rs` の理由に未対応演算を足す）。config の範囲外（rope_scaling・sliding window・silu 以外）は書き出しの前に止める。#431 の受け入れテストは本書の表を基準にする。#433 の実装: 演算名 × domain と opset を `screen_scoring_candidate` で判定する（属性は実行器の読み込み〔#434。§10〕で、dtype・rank は実行時にカーネルが判定する）
 - 推論側（#416〜#419・#581）: 読み込み時に許可リスト（演算 × 属性 × dtype × rank）で照合し、外れたら fail-closed で拒否する（`invalid_input`=64。上限超過は `limit_exceeded`=20。REQ-39）。既定以外の domain・部分グラフ属性・opset ≠ 13 も拒否する
 - 資源の上限: T・Range の要素数・Concat の入力数・ノード数・initializer 数・rank を許可リストの一部として持つ。上限の無いアロケーションを作らない
 - 完全性: 外部データ（bf16 の重み）は経路の閉じ込めと sha256 照合を通す（#581）。入力 id が語彙外なら Gather で拒否する
@@ -157,4 +157,14 @@
 
 - 完全性: `verify_output` が確定直前に `model.onnx`・`tokenizer.json`・全 shard の sha256 とサイズを照合する。記録された名前は字句規則（英数字と `._-`・先頭 `.` 不可・128 文字以下）と予約名で検査してから `dir_fd` 相対・`O_NOFOLLOW` で開く。Rust の `crates/train` は結果 JSON の追加欄を同じ規則で検証する
 - 受け入れテスト: `trainer/tests/test_qwen2_lora_package.py`（CLI で学習し、複写先で `tokenizer.json`・`scoring` から ONNX 推論して学習側の予測と一致）。証拠種別: テストハーネス（ReferenceEvaluator・CPU）
-- 範囲外: Rust の `package`・`infer` での受け入れは #434 以降（現状は `input_representation: tokenizer` を `invalid_input` で拒否）。`base_model_*` を CLI から渡す配線も後続
+- 範囲外: Rust の `package`・`infer` での受け入れは #434 の実行器（§10）の後続（現状は `input_representation: tokenizer` を `invalid_input` で拒否）。`base_model_*` を CLI から渡す配線も後続
+
+## 10. 推論側の実行器と全件一致（TASK-41.6-5・#434）
+
+- 実装: `crates/runtime/src/onnx/scoring.rs`。書き出し順（トポロジカル順）にノードを走査し、演算名で #416〜#419 のカーネルへ振り分ける許可リスト付きの有界インタプリタ。汎用 ONNX ランタイムではない
+- 読み込み: `OnnxBackend::from_bytes_with_shards(bytes, ModelKind::Qwen2Lora, shards)` だけが読める（`ModelKind::Qwen2Lora` は外部データ必須。shard 無しの `from_bytes` は `unsupported_kind` で拒否する）。shard は `external::resolve_external` が件数・サイズ・範囲・sha256 を照合してから実体に置き換える
+- 許可リストの照合（読み込み時）: 演算名（§3 の 28 種）・domain（既定のみ）・属性（書き出し器が書く固定値のみ。`Gemm` の `transB=1`、`Softmax`・`LogSoftmax` の `axis=-1`、`ReduceMean` の `axes=[-1]`・`keepdims=1`、`ReduceSum` の `keepdims=0`、`Cast` の `to=FLOAT` 等）・入力数・出力名の重複・トポロジカル順。外れたものは `unsupported_graph`。dtype と rank はカーネルが実行時に検査し、外れると推論が失敗する
+- bf16: `Cast(to=FLOAT)` の出力は f32 に展開せず遅延 f32 として持ち、`Gemm` の B と `Gather` の data だけがカーネル内で展開する。それ以外の消費者（RMSNorm の重み・bias）は小さいテンソルとして f32 に展開する。中間値は最後の消費で解放する
+- 前処理: `TokenizerPreprocessor`（`crates/runtime/src/preprocess.rs`）が `scoring.system_prompt` と `tokenizer.json` から `build_chat_ids(add_generation_prompt=True)` の id 列を作る
+- 受け入れ: `crates/runtime/tests/qwen2_parity.rs`。`fixtures/qwen2_parity/`（学習ワーカーが書いた自己完結パッケージと `cases.json`）の全ケースで、予測ラベルが学習側（MLX）と全件一致し、確率が ReferenceEvaluator と 1e-5 以内で一致し、単体・バッチが同一であることを確かめる。`env_isolation.rs` は環境変数を空にした子プロセスでも同じ推論が成功することを確かめる。証拠種別: テストハーネス（合成の極小モデル・CPU）。実重みでの照合・p95・RSS は TASK-41.11（#442）
+- 未実装: `export_exclusion::screen_scoring_candidate` の `ParityUnverified` を推論照合へ差し替えること、CLI（`infer`・`package`）での受け入れ、ガード層の `kind`・`kind_version` 許可リストへの `qwen2_lora` 追加

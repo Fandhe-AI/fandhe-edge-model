@@ -1,0 +1,150 @@
+{
+  "kind": "qwen2_lora",
+  "kind_version": 1,
+  "selector_version": "0.1",
+  "config": {
+    "lora_rank": 4,
+    "lora_scale": 20.0,
+    "lora_dropout": 0.0,
+    "lora_num_layers": 2,
+    "lr": 0.01,
+    "iters": 20,
+    "batch_size": 8,
+    "max_seq_length": 700,
+    "dtype": "float32",
+    "base_model_dir": "base",
+    "base_model_sha256": {
+      "config.json": "04555ea77efb9aa4e889d1146b32f070f6a96c1c54a9dee447f9722d61d1f898",
+      "model.safetensors": "3d2348db7563c305d181844f7342601bad3091e928e5d1d321097a06d514b2e9",
+      "tokenizer.json": "06a3dc09f2f53646489b6a024397a5af5371764889360af68bd508ffb136e27e"
+    },
+    "base_model_name": "tiny-synthetic",
+    "base_model_license": "MIT",
+    "base_model_origin": "https://example.com/tiny"
+  },
+  "label_order": [
+    "red",
+    "tan",
+    "sky",
+    "map",
+    "fox",
+    "owl",
+    "gem",
+    "ink"
+  ],
+  "output_type": "choice",
+  "max_bytes": 64,
+  "onnx_file": "model.onnx",
+  "onnx_sha256": "b91a033efeb38f7b0d95d07a78269774dbb1235402c119bf4495390d16996ae6",
+  "created_utc": "2026-10-17T14:01:13Z",
+  "candidate_label": "qwen2_lora",
+  "input_representation": "tokenizer",
+  "tokenizer_file": "tokenizer.json",
+  "tokenizer_sha256": "06a3dc09f2f53646489b6a024397a5af5371764889360af68bd508ffb136e27e",
+  "external_data": [
+    {
+      "location": "weights-00000.bin",
+      "size_bytes": 15744,
+      "sha256": "c525e45dfc162fbb7f51b490a6c1013bb4cd40fe399e2ec2ec2284ec685ab7f9"
+    }
+  ],
+  "scoring": {
+    "system_prompt": "Answer with exactly one of: red, tan, sky, map, fox, owl, gem, ink.",
+    "choices": [
+      {
+        "id": "red",
+        "token_ids": [
+          114,
+          101,
+          100,
+          264
+        ]
+      },
+      {
+        "id": "tan",
+        "token_ids": [
+          116,
+          97,
+          110,
+          264
+        ]
+      },
+      {
+        "id": "sky",
+        "token_ids": [
+          115,
+          107,
+          121,
+          264
+        ]
+      },
+      {
+        "id": "map",
+        "token_ids": [
+          109,
+          97,
+          112,
+          264
+        ]
+      },
+      {
+        "id": "fox",
+        "token_ids": [
+          102,
+          111,
+          120,
+          264
+        ]
+      },
+      {
+        "id": "owl",
+        "token_ids": [
+          111,
+          119,
+          108,
+          264
+        ]
+      },
+      {
+        "id": "gem",
+        "token_ids": [
+          103,
+          101,
+          109,
+          264
+        ]
+      },
+      {
+        "id": "ink",
+        "token_ids": [
+          105,
+          110,
+          107,
+          264
+        ]
+      }
+    ]
+  },
+  "base_model": {
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "04555ea77efb9aa4e889d1146b32f070f6a96c1c54a9dee447f9722d61d1f898",
+        "size_bytes": 347
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "3d2348db7563c305d181844f7342601bad3091e928e5d1d321097a06d514b2e9",
+        "size_bytes": 40761
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "06a3dc09f2f53646489b6a024397a5af5371764889360af68bd508ffb136e27e",
+        "size_bytes": 4194
+      }
+    ],
+    "license": "MIT",
+    "model_name": "tiny-synthetic",
+    "origin": "https://example.com/tiny"
+  }
+}

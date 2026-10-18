@@ -1,1 +1,3 @@
 fixtures/preprocess/tokenizer_synthetic.json text eol=lf
+fixtures/qwen2_parity/tokenizer.json text eol=lf
+fixtures/qwen2_parity/*.bin binary

@@ -10,9 +10,11 @@
 //!
 //! - [`pipeline`][]: 単体推論とバッチ推論が同一の 1 系列経路を通る構造の継ぎ目（TASK-28.1-1・#117）。
 //!   ONNX 推論の実装は [`onnx`][]（#113）
-//! - [`preprocess`][]: バイト前処理（NFKC 正規化＋バイトエンコード。REQ-32・TASK-32.1-1・#112）。
+//! - [`preprocess`][]: バイト前処理（NFKC 正規化＋バイトエンコード。REQ-32・TASK-32.1-1・#112）と、
+//!   `qwen2_lora` 用のトークナイザー前処理 `TokenizerPreprocessor`（#434）。
 //!   実装済み。共有ゴールデンベクタで学習ワーカーの出力と機械照合する
-//! - [`onnx`][]: C1・C3 の ONNX を読む自作の推論バックエンド（`ScoringBackend` 実装。REQ-32・REQ-28・
+//! - [`onnx`][]: C1・C3 と、追加学習 `qwen2_lora` の採点グラフ（REQ-41・TASK-41.6-5・#434。
+//!   `tests/qwen2_parity.rs` で学習側と全件一致）を読む自作の推論バックエンド（`ScoringBackend` 実装。REQ-32・REQ-28・
 //!   TASK-32.1-2・#113）。std と承認済み依存のみで、書き出し器のグラフとの完全一致を照合する許可制。
 //!   `ort`・`tract-onnx` は未承認のため使わない（承認事項）。`artifact.json` の読み込みと CLI 配線は
 //!   `stages::infer`・`stages::package` で接続済み（#136）。`autoregressive` は未対応（REQ-19b の後続 TASK）。共有 fixture
