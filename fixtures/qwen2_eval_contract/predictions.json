@@ -1,0 +1,1301 @@
+{
+ "_meta": {
+  "runs": [
+   "c1:seed0",
+   "c3:seed0",
+   "qwen2_lora:seed0",
+   "qwen2_lora:seed1",
+   "qwen2_lora:seed2"
+  ],
+  "label_order": [
+   "red",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink"
+  ],
+  "gold_rule": "gold of case i is label_order[i % 8]",
+  "data_seed": 20261017,
+  "input_seed": 20261018,
+  "base_seed": 11,
+  "config": {
+   "base_model_dir": "base",
+   "base_model_sha256": "<omitted>",
+   "base_model_name": "tiny-synthetic",
+   "base_model_license": "MIT",
+   "base_model_origin": "https://example.com/tiny",
+   "dtype": "float32",
+   "iters": 20,
+   "batch_size": 8,
+   "max_seq_length": 700,
+   "lora_rank": 4,
+   "lora_num_layers": 2,
+   "lr": 0.01
+  },
+  "env": {
+   "platform": "macOS-26.6.2-arm64-arm-64bit",
+   "mlx": "0.32.2",
+   "onnx": "1.23.0",
+   "numpy": "2.5.3"
+  }
+ },
+ "train_labels": [
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink",
+  "red",
+  "tan",
+  "sky",
+  "map",
+  "fox",
+  "owl",
+  "gem",
+  "ink"
+ ],
+ "cases": [
+  {
+   "name": "c000",
+   "gold": "red"
+  },
+  {
+   "name": "c001",
+   "gold": "tan"
+  },
+  {
+   "name": "c002",
+   "gold": "sky"
+  },
+  {
+   "name": "c003",
+   "gold": "map"
+  },
+  {
+   "name": "c004",
+   "gold": "fox"
+  },
+  {
+   "name": "c005",
+   "gold": "owl"
+  },
+  {
+   "name": "c006",
+   "gold": "gem"
+  },
+  {
+   "name": "c007",
+   "gold": "ink"
+  },
+  {
+   "name": "c008",
+   "gold": "red"
+  },
+  {
+   "name": "c009",
+   "gold": "tan"
+  },
+  {
+   "name": "c010",
+   "gold": "sky"
+  },
+  {
+   "name": "c011",
+   "gold": "map"
+  },
+  {
+   "name": "c012",
+   "gold": "fox"
+  },
+  {
+   "name": "c013",
+   "gold": "owl"
+  },
+  {
+   "name": "c014",
+   "gold": "gem"
+  },
+  {
+   "name": "c015",
+   "gold": "ink"
+  },
+  {
+   "name": "c016",
+   "gold": "red"
+  },
+  {
+   "name": "c017",
+   "gold": "tan"
+  },
+  {
+   "name": "c018",
+   "gold": "sky"
+  },
+  {
+   "name": "c019",
+   "gold": "map"
+  },
+  {
+   "name": "c020",
+   "gold": "fox"
+  },
+  {
+   "name": "c021",
+   "gold": "owl"
+  },
+  {
+   "name": "c022",
+   "gold": "gem"
+  },
+  {
+   "name": "c023",
+   "gold": "ink"
+  },
+  {
+   "name": "c024",
+   "gold": "red"
+  },
+  {
+   "name": "c025",
+   "gold": "tan"
+  },
+  {
+   "name": "c026",
+   "gold": "sky"
+  },
+  {
+   "name": "c027",
+   "gold": "map"
+  },
+  {
+   "name": "c028",
+   "gold": "fox"
+  },
+  {
+   "name": "c029",
+   "gold": "owl"
+  },
+  {
+   "name": "c030",
+   "gold": "gem"
+  },
+  {
+   "name": "c031",
+   "gold": "ink"
+  },
+  {
+   "name": "c032",
+   "gold": "red"
+  },
+  {
+   "name": "c033",
+   "gold": "tan"
+  },
+  {
+   "name": "c034",
+   "gold": "sky"
+  },
+  {
+   "name": "c035",
+   "gold": "map"
+  },
+  {
+   "name": "c036",
+   "gold": "fox"
+  },
+  {
+   "name": "c037",
+   "gold": "owl"
+  },
+  {
+   "name": "c038",
+   "gold": "gem"
+  },
+  {
+   "name": "c039",
+   "gold": "ink"
+  },
+  {
+   "name": "c040",
+   "gold": "red"
+  },
+  {
+   "name": "c041",
+   "gold": "tan"
+  },
+  {
+   "name": "c042",
+   "gold": "sky"
+  },
+  {
+   "name": "c043",
+   "gold": "map"
+  },
+  {
+   "name": "c044",
+   "gold": "fox"
+  },
+  {
+   "name": "c045",
+   "gold": "owl"
+  },
+  {
+   "name": "c046",
+   "gold": "gem"
+  },
+  {
+   "name": "c047",
+   "gold": "ink"
+  },
+  {
+   "name": "c048",
+   "gold": "red"
+  },
+  {
+   "name": "c049",
+   "gold": "tan"
+  },
+  {
+   "name": "c050",
+   "gold": "sky"
+  },
+  {
+   "name": "c051",
+   "gold": "map"
+  },
+  {
+   "name": "c052",
+   "gold": "fox"
+  },
+  {
+   "name": "c053",
+   "gold": "owl"
+  },
+  {
+   "name": "c054",
+   "gold": "gem"
+  },
+  {
+   "name": "c055",
+   "gold": "ink"
+  },
+  {
+   "name": "c056",
+   "gold": "red"
+  },
+  {
+   "name": "c057",
+   "gold": "tan"
+  },
+  {
+   "name": "c058",
+   "gold": "sky"
+  },
+  {
+   "name": "c059",
+   "gold": "map"
+  },
+  {
+   "name": "c060",
+   "gold": "fox"
+  },
+  {
+   "name": "c061",
+   "gold": "owl"
+  },
+  {
+   "name": "c062",
+   "gold": "gem"
+  },
+  {
+   "name": "c063",
+   "gold": "ink"
+  },
+  {
+   "name": "c064",
+   "gold": "red"
+  },
+  {
+   "name": "c065",
+   "gold": "tan"
+  },
+  {
+   "name": "c066",
+   "gold": "sky"
+  },
+  {
+   "name": "c067",
+   "gold": "map"
+  },
+  {
+   "name": "c068",
+   "gold": "fox"
+  },
+  {
+   "name": "c069",
+   "gold": "owl"
+  },
+  {
+   "name": "c070",
+   "gold": "gem"
+  },
+  {
+   "name": "c071",
+   "gold": "ink"
+  },
+  {
+   "name": "c072",
+   "gold": "red"
+  },
+  {
+   "name": "c073",
+   "gold": "tan"
+  },
+  {
+   "name": "c074",
+   "gold": "sky"
+  },
+  {
+   "name": "c075",
+   "gold": "map"
+  },
+  {
+   "name": "c076",
+   "gold": "fox"
+  },
+  {
+   "name": "c077",
+   "gold": "owl"
+  },
+  {
+   "name": "c078",
+   "gold": "gem"
+  },
+  {
+   "name": "c079",
+   "gold": "ink"
+  },
+  {
+   "name": "c080",
+   "gold": "red"
+  },
+  {
+   "name": "c081",
+   "gold": "tan"
+  },
+  {
+   "name": "c082",
+   "gold": "sky"
+  },
+  {
+   "name": "c083",
+   "gold": "map"
+  },
+  {
+   "name": "c084",
+   "gold": "fox"
+  },
+  {
+   "name": "c085",
+   "gold": "owl"
+  },
+  {
+   "name": "c086",
+   "gold": "gem"
+  },
+  {
+   "name": "c087",
+   "gold": "ink"
+  },
+  {
+   "name": "c088",
+   "gold": "red"
+  },
+  {
+   "name": "c089",
+   "gold": "tan"
+  },
+  {
+   "name": "c090",
+   "gold": "sky"
+  },
+  {
+   "name": "c091",
+   "gold": "map"
+  },
+  {
+   "name": "c092",
+   "gold": "fox"
+  },
+  {
+   "name": "c093",
+   "gold": "owl"
+  },
+  {
+   "name": "c094",
+   "gold": "gem"
+  },
+  {
+   "name": "c095",
+   "gold": "ink"
+  },
+  {
+   "name": "c096",
+   "gold": "red"
+  },
+  {
+   "name": "c097",
+   "gold": "tan"
+  },
+  {
+   "name": "c098",
+   "gold": "sky"
+  },
+  {
+   "name": "c099",
+   "gold": "map"
+  },
+  {
+   "name": "c100",
+   "gold": "fox"
+  },
+  {
+   "name": "c101",
+   "gold": "owl"
+  },
+  {
+   "name": "c102",
+   "gold": "gem"
+  },
+  {
+   "name": "c103",
+   "gold": "ink"
+  },
+  {
+   "name": "c104",
+   "gold": "red"
+  },
+  {
+   "name": "c105",
+   "gold": "tan"
+  },
+  {
+   "name": "c106",
+   "gold": "sky"
+  },
+  {
+   "name": "c107",
+   "gold": "map"
+  },
+  {
+   "name": "c108",
+   "gold": "fox"
+  },
+  {
+   "name": "c109",
+   "gold": "owl"
+  },
+  {
+   "name": "c110",
+   "gold": "gem"
+  },
+  {
+   "name": "c111",
+   "gold": "ink"
+  },
+  {
+   "name": "c112",
+   "gold": "red"
+  },
+  {
+   "name": "c113",
+   "gold": "tan"
+  },
+  {
+   "name": "c114",
+   "gold": "sky"
+  },
+  {
+   "name": "c115",
+   "gold": "map"
+  },
+  {
+   "name": "c116",
+   "gold": "fox"
+  },
+  {
+   "name": "c117",
+   "gold": "owl"
+  },
+  {
+   "name": "c118",
+   "gold": "gem"
+  },
+  {
+   "name": "c119",
+   "gold": "ink"
+  }
+ ],
+ "predictions": {
+  "c1:seed0": [
+   "red",
+   "red",
+   "sky",
+   "gem",
+   "fox",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "tan",
+   "gem",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "gem",
+   "sky",
+   "map",
+   "fox",
+   "gem",
+   "gem",
+   "ink",
+   "gem",
+   "owl",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "gem",
+   "red",
+   "tan",
+   "gem",
+   "map",
+   "fox",
+   "owl",
+   "red",
+   "ink",
+   "red",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "gem",
+   "gem",
+   "ink",
+   "red",
+   "red",
+   "sky",
+   "map",
+   "gem",
+   "gem",
+   "gem",
+   "ink",
+   "red",
+   "red",
+   "sky",
+   "red",
+   "fox",
+   "gem",
+   "gem",
+   "ink",
+   "red",
+   "tan",
+   "red",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "gem",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "map",
+   "sky",
+   "map",
+   "fox",
+   "ink",
+   "gem",
+   "gem",
+   "red",
+   "map",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "ink",
+   "ink",
+   "red",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "ink",
+   "gem",
+   "ink",
+   "red",
+   "gem",
+   "sky",
+   "map",
+   "gem",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "gem",
+   "sky",
+   "gem",
+   "fox",
+   "owl",
+   "gem",
+   "ink"
+  ],
+  "c3:seed0": [
+   "red",
+   "owl",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink",
+   "red",
+   "tan",
+   "red",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "owl",
+   "gem",
+   "fox",
+   "sky",
+   "map",
+   "fox",
+   "gem",
+   "gem",
+   "ink",
+   "gem",
+   "owl",
+   "map",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "red",
+   "gem",
+   "tan",
+   "gem",
+   "map",
+   "fox",
+   "owl",
+   "red",
+   "ink",
+   "red",
+   "owl",
+   "sky",
+   "map",
+   "fox",
+   "map",
+   "red",
+   "ink",
+   "fox",
+   "tan",
+   "sky",
+   "map",
+   "map",
+   "gem",
+   "gem",
+   "ink",
+   "red",
+   "map",
+   "sky",
+   "map",
+   "fox",
+   "fox",
+   "gem",
+   "ink",
+   "red",
+   "tan",
+   "red",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "owl",
+   "red",
+   "fox",
+   "sky",
+   "owl",
+   "fox",
+   "owl",
+   "owl",
+   "ink",
+   "gem",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "map",
+   "owl",
+   "tan",
+   "owl",
+   "map",
+   "fox",
+   "owl",
+   "red",
+   "ink",
+   "red",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "map",
+   "gem",
+   "ink",
+   "fox",
+   "owl",
+   "owl",
+   "map",
+   "map",
+   "owl",
+   "gem",
+   "map",
+   "red",
+   "tan",
+   "sky",
+   "map",
+   "fox",
+   "owl",
+   "gem",
+   "ink"
+  ],
+  "qwen2_lora:seed0": [
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "tan",
+   "tan",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "sky",
+   "tan",
+   "sky",
+   "tan",
+   "sky"
+  ],
+  "qwen2_lora:seed1": [
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "sky",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "sky",
+   "map",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "tan",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "sky",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "owl",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "tan",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "sky",
+   "tan",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "sky",
+   "owl",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "ink",
+   "sky",
+   "ink",
+   "ink",
+   "ink"
+  ],
+  "qwen2_lora:seed2": [
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan",
+   "tan"
+  ]
+ }
+}
