@@ -1,8 +1,8 @@
-"""Mac 実機での動作確認（項目 A〜J）の実行・要約・記録（record.json / record.md）の生成。
+"""Mac 実機での動作確認（項目 A〜K）の実行・要約・記録（record.json / record.md）の生成。
 
 REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-38・
-REQ-39。特定の TASK には対応しない横断の確認ツール。REQ-38 のうち sandbox 下の通信 0 件の
-判定は対象外（`sandbox-monitor.sh` の担当）。
+REQ-39・REQ-41（K。TASK-41.11-1・#441）。特定の TASK には対応しない横断の確認ツール。
+REQ-38 のうち sandbox 下の通信 0 件の判定は対象外（`sandbox-monitor.sh` の担当）。
 本スクリプトは通信を起こさない側に倒す（cargo は `--locked`、A 以外の子には `CARGO_NET_OFFLINE`、
 A を含む全ての子には rustup のツールチェーン自動取得を止める `RUSTUP_AUTO_INSTALL=0`。#375）。
 
@@ -11,7 +11,7 @@ A を含む全ての子には rustup のツールチェーン自動取得を止�
 標準ライブラリだけを使う（依存の追加なし。Python 3.9 の文法で書く）。
 
 責務:
-- 項目 A〜J の子プロセス起動（上限時間・出力サイズ上限つき。中断時は子のグループを止める。REQ-39）
+- 項目 A〜K の子プロセス起動（上限時間・出力サイズ上限つき。中断時は子のグループを止める。REQ-39）
 - 実行全体の上限時間（`--overall-timeout-sec`）と、環境採取の子（git・sysctl・sw_vers・otool）の
   固定パス・最小の環境での起動（PATH・GIT_* に左右されない。REQ-38・REQ-39・#364）
 - CLI の JSON の要約と、記録へ出してよい値だけへの絞り込み（伏せ処理は `sanitize_record` に集約）
@@ -40,6 +40,7 @@ import re
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -51,11 +52,12 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "real-machine-check/1"
-ITEM_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+ITEM_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
 # 既定の項目（`scripts/real-machine-check.sh` の `items` 既定値と一致。pytest が機械照合する）。
-# A は通信しうる（`--with-ci`）、I は GPU を長時間占有しうる（#103）ため既定に入れない
+# A は通信しうる（`--with-ci`）、I は GPU を長時間占有しうる（#103）、K は人が用意した数 GB 級の
+# パッケージ（`--k-package`）が要るため既定に入れない
 DEFAULT_ITEMS = ["B", "C", "D", "E", "F", "G", "H", "J"]
-ITEMS_MESSAGE = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J"
+ITEMS_MESSAGE = "--items must be a comma-separated subset of A,B,C,D,E,F,G,H,I,J,K"
 # 公開前の組み立て先ディレクトリ名。`package` の実行後（exit 0・20 のどちらも）に残ってはならない
 # （crates/cli/src/project.rs の `PACKAGE_STAGING_DIR` と一致。pytest が機械照合する。REQ-30）
 PACKAGE_STAGING_DIR = "package.staging"
@@ -217,6 +219,23 @@ REFERENCE_CAPACITY_BYTES = 40_000_000
 # `infer_p95` の目標 p95（µs。runtime の latency_report.rs の `REFERENCE_P95_NS` = 250ms）。
 # 超過は `over_guideline` の警告のみ。REQ-31・#579。pytest で Rust のソースと照合する
 REFERENCE_P95_US = 250_000
+# K（追加学習の種類のパッケージ測定。REQ-41・TASK-41.11-1・#441）の定数。
+# 追加学習の種類（crates/train の `EXPLICIT_ONLY_KINDS` と対。pytest で照合する）
+ADDITIONAL_KINDS = frozenset({"qwen2_lora"})
+# RSS の目標（REQ-39 の暫定上限 2 GiB。crates/guard の RSS 上限と対）。超過は警告で、失敗にしない
+RSS_TARGET_BYTES = 2 * 1024 * 1024 * 1024
+# `/usr/bin/time -l` の real の分解能（0.01 秒）
+TIME_RESOLUTION_US = 10_000
+DEFAULT_K_RUNS = 20
+MAX_K_RUNS = 1000
+# `/usr/bin/time` の固定パス（PATH で探さない）。テストだけ `FANDHE_EDGE_TIME_CMD` で差し替える
+TIME_CMD_DEFAULT = "/usr/bin/time"
+CAP_ARTIFACT_JSON = 2 * 1024 * 1024
+# `--k-package` の basename（`-` 始まりが CLI のオプションに化けるのを防ぐ）
+K_PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+K_SAMPLE_TEXT = "sandbox check 0123456789"
+TIME_RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size\s*$", re.MULTILINE)
+TIME_REAL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+real\b", re.MULTILINE)
 # パス区切りとして扱う文字（`/`・`\`・U+2215 DIVISION SLASH・U+2044 FRACTION SLASH・
 # U+FF0F FULLWIDTH SOLIDUS）
 PATH_CHARS = ("/", "\\", "∕", "⁄", "／")
@@ -281,6 +300,7 @@ STR_KEYS = frozenset(
         "outcome",
         "i_device",
         "restart_action",
+        "scope",
     }
 )
 # list の要素として文字列を持ってよい位置（`options.items`・`items.D.direct_libraries`）
@@ -1035,6 +1055,10 @@ class Ctx:
     # G の探索予算（秒。`--g-budget-seconds`）と I の証拠種別の申告（`--i-device`）
     g_budget_seconds: int = DEFAULT_G_BUDGET_SECONDS
     i_device: str = "cpu"
+    # K の対象パッケージ（物理パス。記録へ出さない）・計測回数・`time` の実体
+    k_package: Path | None = None
+    k_runs: int = DEFAULT_K_RUNS
+    time_cmd: str = TIME_CMD_DEFAULT
 
 
 # rustup プロキシ（~/.cargo/bin/cargo）は `rust-toolchain.toml` の指すツールチェーンが未導入だと
@@ -3309,6 +3333,136 @@ def item_i(ctx: Ctx) -> dict[str, Any]:
     }
 
 
+def parse_time_l(text: str) -> tuple[int | None, int | None]:
+    """`/usr/bin/time -l` の stderr から (最大 RSS のバイト数, real の µs)。最後の行を採る。"""
+    rss = TIME_RSS_RE.findall(text)
+    real = TIME_REAL_RE.findall(text)
+    return (
+        int(rss[-1]) if rss else None,
+        round(float(real[-1]) * 1_000_000) if real else None,
+    )
+
+
+def p95_linear_us(samples: list[int]) -> int:
+    """p95（µs）。numpy.percentile 既定と同じ線形補間・外れ値を除かない・整数へ切り上げ。
+
+    runtime の `latency_report` の定義に合わせる（REQ-31）。浮動小数の誤差で 1 µs 余分に
+    切り上がらないよう、小数 6 桁へ丸めてから切り上げる。
+    """
+    s = sorted(samples)
+    pos = (len(s) - 1) * 0.95
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return math.ceil(round(s[lo] + (s[hi] - s[lo]) * (pos - lo), 6))
+
+
+def item_k(ctx: Ctx) -> dict[str, Any]:
+    """K: 追加学習の種類のパッケージの容量・RSS・E2E p95（REQ-41・REQ-30・REQ-31・REQ-39・#441）。
+
+    人が別の手段（学習ワーカーの書き出し）で用意したパッケージ（`--k-package`）を、CLI の
+    `infer --package` で `k_runs + 1` 回測る（先頭 1 回はウォームアップで p95 から除く）。
+    `infer` は 1 呼び出し 1 プロセスなので、p95 はプロセスの起動と読み込みを含む E2E であり、
+    推論のみの p95 は CLI からは分けられない（`inference_only_p95` は null）。目標の超過は
+    警告として記録し、失敗にしない（TASK-41.9 の方針）。パッケージは読み取りだけで、cwd をその
+    親にして相対の basename を渡す（ガードの経路の閉じ込めをそのまま効かせる）。現状 CLI の
+    `infer` は追加学習の種類に未対応（exit 64）のため、実機でも `unexpected_exit_code` になりうる。
+    """
+    pdir = ctx.k_package
+    if pdir is None:
+        return fail_item("package_missing")
+    regular = package_entries_regular(pdir)
+    if regular is None:
+        return fail_item("package_unreadable")
+    if not regular:
+        return fail_item("package_entry_not_regular")
+    try:
+        entries = sorted(os.scandir(pdir), key=lambda e: e.name)
+        files = [
+            {
+                "name": e.name if PACKAGE_FILE_NAME_RE.fullmatch(e.name) else UNRECOGNIZED,
+                "bytes": e.stat(follow_symlinks=False).st_size,
+            }
+            for e in entries
+        ]
+    except OSError:
+        return fail_item("package_unreadable")
+    if not files:
+        return fail_item("package_empty")
+    art = parse_json_object(pdir / "artifact.json", CAP_ARTIFACT_JSON)
+    digest = sha256_file(pdir / "artifact.json", CAP_ARTIFACT_JSON)
+    if art is None or digest is None:
+        return fail_item("artifact_unreadable")
+    kind = vocab_value(art.get("kind"), KIND_VOCAB)
+    if kind not in ADDITIONAL_KINDS:
+        return fail_item("unexpected_kind")
+    total = sum(f["bytes"] for f in files)
+    package = {
+        "kind": kind,
+        "artifact_sha256": digest,
+        "files": files,
+        "file_count": len(files),
+        "total_bytes": total,
+        "reference_bytes": REFERENCE_CAPACITY_BYTES,
+        "over_reference": total > REFERENCE_CAPACITY_BYTES,
+    }
+    logs = ctx.work / "K" / "steps"
+    try:
+        logs.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return fail_item("log_unwritable", package=package)
+    samples: list[int] = []
+    max_rss = 0
+    for i in range(ctx.k_runs + 1):
+        so, se = logs / f"{i:04d}.stdout", logs / f"{i:04d}.stderr"
+        r = run_cmd(
+            [ctx.time_cmd, "-l", str(ctx.bin), "infer", "--package", pdir.name,
+             "--text", K_SAMPLE_TEXT],
+            pdir.parent, so, se, TIMEOUT_CLI_STEP, CAP_CLI_STDOUT, CAP_CLI_STDERR, ctx.offline_env,
+        )  # fmt: skip
+        where: dict[str, Any] = {"step": "infer", "run": i, "package": package}
+        if r.reason is not None:
+            return fail_item(r.reason, exit_code=r.exit_code, **where)
+        rc = r.exit_code if r.exit_code is not None else EXIT_RUNTIME_ERROR
+        obj = parse_json_object(so, CAP_CLI_STDOUT)
+        if rc not in INFER_EXIT_STATUS:
+            return fail_item("unexpected_exit_code", exit_code=rc, **error_fields(obj), **where)
+        if obj is None:
+            return fail_item("invalid_json", exit_code=rc, **where)
+        if not _infer_envelope_ok(obj, rc):
+            return fail_item("unexpected_output", exit_code=rc, **where)
+        rss, real_us = parse_time_l(read_capped(se, CAP_CLI_STDERR) or "")
+        if rss is None:
+            return fail_item("rss_unavailable", exit_code=rc, **where)
+        if real_us is None:
+            return fail_item("time_unavailable", exit_code=rc, **where)
+        max_rss = max(max_rss, rss)  # ウォームアップも RSS には含める
+        if i > 0:
+            samples.append(real_us)
+    p95 = p95_linear_us(samples)
+    return {
+        "status": "ok",
+        "package": package,
+        "rss": {
+            "max_rss_bytes": max_rss,
+            "target_bytes": RSS_TARGET_BYTES,
+            "over_target": max_rss > RSS_TARGET_BYTES,
+            "scope": "process_tree_via_time_l",
+        },
+        "e2e": {
+            "runs": len(samples),
+            "warmup": 1,
+            "p95_us": p95,
+            "median_us": round(statistics.median(samples)),
+            "max_us": max(samples),
+            "guideline_us": REFERENCE_P95_US,
+            "over_guideline": p95 > REFERENCE_P95_US,
+            "resolution_us": TIME_RESOLUTION_US,
+            "classification": classify_p95(ctx),
+        },
+        "inference_only_p95": None,
+    }
+
+
 def item_j(ctx: Ctx) -> dict[str, Any]:
     """J: 前の版への復帰（REQ-39・REQ-27・#491）。B の `project`（v1）を旧プロジェクトに使う。
 
@@ -3955,6 +4109,26 @@ def render_markdown(rec: dict[str, Any]) -> str:
         f"{_cell(d_item.get('linkage_target_matches_cli'))}"
         f"（検査対象 sha256: {_cell(d_item.get('linkage_target_sha256'))}）",
     ]
+    k_item = rec["items"]["K"]
+    if k_item.get("status") == "ok":
+        pk, rs, e2 = k_item["package"], k_item["rss"], k_item["e2e"]
+        lines += [
+            "",
+            "## K 追加学習の種類のパッケージ測定",
+            "",
+            "| 指標 | 値 | 目標 | 超過 |",
+            "| ---- | -- | ---- | ---- |",
+            f"| 容量（bytes） | {_cell(pk['total_bytes'])} | {_cell(pk['reference_bytes'])} "
+            f"| {_cell(pk['over_reference'])} |",
+            f"| 最大 RSS（bytes） | {_cell(rs['max_rss_bytes'])} | {_cell(rs['target_bytes'])} "
+            f"| {_cell(rs['over_target'])} |",
+            f"| E2E p95（µs） | {_cell(e2['p95_us'])} | {_cell(e2['guideline_us'])} "
+            f"| {_cell(e2['over_guideline'])} |",
+            "",
+            "- E2E はプロセスの起動と読み込みを含む。推論のみの p95 は CLI から分けられず null"
+            "（REQ-31 の指標そのものではない）。分解能は 0.01 秒",
+            "- 目標の超過は警告で、合否は人が判断する",
+        ]
     lines += [
         "",
         "## 検証済みと扱わない点",
@@ -4137,6 +4311,8 @@ def run_item(ctx: Ctx, name: str, b_ok: bool) -> tuple[dict[str, Any], bool]:
         return item_h(ctx), b_ok
     if name == "I":
         return item_i(ctx), b_ok
+    if name == "K":
+        return item_k(ctx), b_ok
     return item_j(ctx), b_ok
 
 
@@ -4177,8 +4353,11 @@ def _run(args: argparse.Namespace) -> int:
     items = [x for x in ITEM_ORDER if x in args.items.split(",")]
     make_cmd = os.environ.get("FANDHE_EDGE_MAKE_CMD") or "make"
     cargo_cmd = os.environ.get("FANDHE_EDGE_CARGO_CMD") or "cargo"
+    time_cmd = os.environ.get("FANDHE_EDGE_TIME_CMD") or TIME_CMD_DEFAULT
     harness = bool(
-        os.environ.get("FANDHE_EDGE_MAKE_CMD") or os.environ.get("FANDHE_EDGE_CARGO_CMD")
+        os.environ.get("FANDHE_EDGE_MAKE_CMD")
+        or os.environ.get("FANDHE_EDGE_CARGO_CMD")
+        or os.environ.get("FANDHE_EDGE_TIME_CMD")
     )
     ctx = Ctx(
         repo=Path(args.repo_root),
@@ -4197,6 +4376,9 @@ def _run(args: argparse.Namespace) -> int:
     ctx.bin_override = bool(args.bin_override)
     ctx.g_budget_seconds = args.g_budget_seconds
     ctx.i_device = args.i_device
+    ctx.k_package = Path(args.k_package) if args.k_package else None
+    ctx.k_runs = args.k_runs
+    ctx.time_cmd = time_cmd
     rec: dict[str, Any] = {
         "schema": SCHEMA,
         "evidence_hint": "test_harness" if harness else "requires_human_review",
@@ -4213,6 +4395,8 @@ def _run(args: argparse.Namespace) -> int:
             "with_ci": bool(args.with_ci),
             "g_budget_seconds": ctx.g_budget_seconds,
             "i_device": ctx.i_device,
+            "k_runs": ctx.k_runs,
+            "k_package_given": ctx.k_package is not None,
             "cargo_offline": "A" not in items,
         },
         "child_may_remain": False,
@@ -4374,6 +4558,20 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "--g-budget-seconds must be an integer from 1 to 921600"
     if args.i_device not in I_EVIDENCE:
         return "--i-device must be cpu or gpu"
+    # K は人が用意したパッケージが要る。K が無いのに指定された場合も拒否する
+    if ("K" in parts) != bool(args.k_package):
+        return "item K and --k-package must be given together"
+    if not 1 <= args.k_runs <= MAX_K_RUNS:
+        return "--k-runs must be an integer from 1 to 1000"
+    if args.k_package:
+        kp = Path(args.k_package)
+        if (
+            not kp.is_absolute()
+            or kp.is_symlink()
+            or not kp.is_dir()
+            or K_PACKAGE_NAME_RE.fullmatch(kp.name) is None
+        ):
+            return "--k-package must be a directory with a plain name"
     if args.bin_override and not args.bin:
         return "--bin-override requires --bin"
     if args.bin_override:
@@ -4399,6 +4597,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--overall-timeout-sec", type=int, required=True)
     r.add_argument("--g-budget-seconds", type=int, default=DEFAULT_G_BUDGET_SECONDS)
     r.add_argument("--i-device", default="cpu")
+    r.add_argument("--k-package", default="")
+    r.add_argument("--k-runs", type=int, default=DEFAULT_K_RUNS)
     r.add_argument("--quiet-machine", action="store_true")
     r.add_argument("--with-ci", action="store_true")
     ns = p.parse_args(argv)

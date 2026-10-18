@@ -1,11 +1,11 @@
-# Mac 実機での動作確認（項目 A〜J）の手順と記録簿
+# Mac 実機での動作確認（項目 A〜K）の手順と記録簿
 
 対応: REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39（横断の確認。spec の特定の TASK には対応しない）・#354・#469（G〜J と B の拡張）。REQ-38（sandbox 下の通信 0 件）は対象外（`sandbox-offline-check-procedure.md` の担当）。
 spec の内容は要約であり、詳細は spec の REQ-18・REQ-21・REQ-26・REQ-27・REQ-28・REQ-30・REQ-31・REQ-32・REQ-33・REQ-34・REQ-39 を参照する。
 
 ## 1. 目的と範囲
 
-PC を変えても同じ手順で main の動作確認（項目 A〜J）を再現できるようにする。G〜J は #469 の CLI 結線（`train --all`・`--cancel`・`--status`・再現性・旧モデルとの比較・版管理台帳）で増えた機能の確認で、実 trainer を使う（G・H は既定の項目、I は明示したときだけ）。
+PC を変えても同じ手順で main の動作確認（項目 A〜K）を再現できるようにする。G〜J は #469 の CLI 結線（`train --all`・`--cancel`・`--status`・再現性・旧モデルとの比較・版管理台帳）で増えた機能の確認で、実 trainer を使う（G・H は既定の項目、I は明示したときだけ）。
 スクリプト（`scripts/real-machine-check.sh`・`scripts/real_machine_check_record.py`）は実行と記録の整形までを行い、
 「実機」の証拠としての確定は人が行う。Agent の範囲はスクリプトと手順の準備までで、実機の結果を Agent が確定させない（`evidence_hint` は `requires_human_review` か `test_harness` のみ）。
 
@@ -25,7 +25,7 @@ PC を変えても同じ手順で main の動作確認（項目 A〜J）を再�
 ### 3-1. コマンドラインの形式
 
 ```bash
-make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu]"
+make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--quiet-machine] [--with-ci] [--p95-limit-us N] [--package-limit-bytes N] [--overall-timeout-sec N] [--g-budget-seconds N] [--i-device cpu|gpu] [--k-package DIR] [--k-runs N]"
 ```
 
 または、スクリプトを直接実行する場合：
@@ -36,12 +36,12 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 
 ### 3-2. 引数
 
-値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes` / `--overall-timeout-sec` / `--g-budget-seconds` / `--i-device`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
+値を取るオプション（`--work-dir` / `--items` / `--repeat` / `--p95-limit-us` / `--package-limit-bytes` / `--overall-timeout-sec` / `--g-budget-seconds` / `--i-device` / `--k-package` / `--k-runs`）は `--key VALUE` と `--key=VALUE` の両方を受け付けます。重複・空要素・未知のオプションは拒否（exit 64）。
 
 | 引数 | 説明 | 既定値 / 必須 |
 | ---- | ---- | ---------- |
 | `--work-dir DIR` | 作業と記録の置き場。存在しないか空であること。**作業ディレクトリがリポジトリ自身・その配下・その祖先のどれかなら拒否される。symlink・非ディレクトリ・空でないディレクトリも拒否される**（物理パスへ正規化して比較。末尾の `/`・`/.` は判定の前に取り除くため、`link/` や `link/.` でも symlink は拒否される。#364） | 必須 |
-| `--items LIST` | 実行する項目。`A,B,C,D,E,F,G,H,I,J` の部分集合（カンマ区切り・大文字・重複不可）。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`J` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364）。A は通信しうる（`--with-ci`）、I は学習を 4 回行い GPU・時間を長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する | `B,C,D,E,F,G,H,J`（A・I は既定では含まない） |
+| `--items LIST` | 実行する項目。`A,B,C,D,E,F,G,H,I,J,K` の部分集合（カンマ区切り・大文字・重複不可）。E・J は B の成果物を使うため B と一緒に指定する（B なしの E・J は引数エラー〔exit 64。何も実行しない〕。#362）。`A`〜`K` とカンマ以外の文字（`*`・`?`・`[` 等）を含む値は、分割の前に拒否する（パス名展開でカレントのファイル名に化けない。#364）。A は通信しうる（`--with-ci`）、I は学習を 4 回行い GPU・時間を長く占有しうる（#103）ため、既定に入れず `--items I` で明示したときだけ実行する。K は人が用意したパッケージが要るため、同じく既定に入れず `--items K --k-package DIR` で明示したときだけ実行する | `B,C,D,E,F,G,H,J`（A・I・K は既定では含まない） |
 | `--with-ci` | A（`make ci`）を実行する明示の同意。通信を伴いうる（`uv sync`・advisory DB・`npx`）。`--items` に A があり `--with-ci` が無ければ引数エラー（exit 64）で、何も実行しない | — |
 | `--repeat N` | F（ガード層の時間制限テスト）の実行回数。1 以上 1000 以下の整数 | 50 |
 | `--quiet-machine` | 「他のアプリを閉じた静かな状態」という人の申告。p95 の分類が `real_machine` になるのは、これがあり、かつ `make`・`cargo` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ。それ以外は `reference_only` | — |
@@ -50,9 +50,11 @@ make real-machine-check ARGS="--work-dir <DIR> [--items <LIST>] [--repeat N] [--
 | `--overall-timeout-sec N` | 実行全体の上限時間（秒。入力の採取・CLI のビルド・開始時の環境採取を含み、終了時の再採取と記録の書き出しは含まない）。1 以上 86400 以下の整数。範囲外は引数エラー（exit 64）。契約に定めのない暫定値（自分で決めた点。REQ-39）。超えたら §5 のとおり打ち切る。`--repeat` を大きくする場合は併せて上げる | 14400（4 時間） |
 | `--g-budget-seconds N` | G（`train --all`）の探索予算（秒）。1 以上 921600 以下の整数（CLI の `--budget-seconds` の上限 `MAX_SEARCH_BUDGET_SECONDS` と同じ。範囲外は引数エラー〔exit 64〕）。小さくすると全候補が予算到達（exit 20）になりうる。それも想定内の結果として記録する（§4-G） | 3600（CLI の既定） |
 | `--i-device cpu\|gpu` | I の証拠種別の申告。`cpu` → `cpu_real_machine`、`gpu` → `gpu_real_machine_declared`。**CLI の `train` は現状 CPU 固定**（`crates/cli/src/stages/train.rs` の `Device::Cpu`）のため、`gpu` は人が別の手段で GPU 学習へ切り替えたときだけ指定する（切り替えの有無はスクリプトが確認できない）。MLX の GPU 学習は同一 seed でも完全再現しないため、再現性の確認は CPU で行う（REQ-26・#103） | `cpu` |
+| `--k-package DIR` | K の対象パッケージ（追加学習の種類の `package/`）。**K を指定したら必須。K が無いのに指定すると引数エラー（exit 64）**。存在するディレクトリ（symlink 不可。末尾の `/`・`/.` は取り除く）で、名前は `[A-Za-z0-9_][A-Za-z0-9._-]{0,63}`（`-` 始まりが CLI のオプションに化けるのを防ぐ）。物理パスへ正規化する。読み取りだけで、リポジトリの配下でも拒否しない。違反は固定メッセージで拒否し、値は出さない（§4-K） | K のとき必須 |
+| `--k-runs N` | K の計測回数。1 以上 1000 以下の整数（先頭 0 は拒否）。別に先頭 1 回のウォームアップを実行する | 20 |
 | `--help` | 使い方を JSON 1 行（`{"code":"ok","message":"usage: ..."}` の形）で stdout へ出して exit 0 | — |
 
-**A を実行する場合の注意**: `--items` に `A` を含めても、`--with-ci` が無ければ以下の JSON を出して exit 64（`invalid_input`）で停止します。実行順は常に A→J です。
+**A を実行する場合の注意**: `--items` に `A` を含めても、`--with-ci` が無ければ以下の JSON を出して exit 64（`invalid_input`）で停止します。実行順は常に A→K です。
 
 ```json
 {"code":"invalid_input","message":"<固定メッセージ>"}
@@ -77,6 +79,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
 | 環境変数 | 説明 | 備考 |
 | ------- | ---- | ---- |
 | `FANDHE_EDGE_BIN` | CLI のバイナリパス。`/` を含む相対・絶対パスで指定。相対パスは呼び出し時のカレント基準で絶対化される。存在しない・通常ファイルでない・実行権限が無い場合は、何も起動する前に引数エラー（exit 64。`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` の不正と同じ分類。#362）。未設定なら `cargo build --locked --release -p fandhe-edge-cli --bin fandhe-edge` でビルドして、`compiler-artifact` の executable を特定する（出力先は cargo が報告したパス）。ビルドの上限時間は 1800 秒 | `cli_profile:"release"`（未設定時）または `null`（設定時）。`evidence_hint` は MAKE_CMD / CARGO_CMD の有無で決まる（FANDHE_EDGE_BIN の有無は影響しない）。**差し替えた CLI が、cargo がビルドした CLI とバイト単位で同一でない限り D は失敗する**（`make`・`cargo` の代役の下では照合しないため対象外）: `make check-runtime-linkage` が検査するのは cargo がビルドした CLI（cargo の報告から取る。`build.target-dir`・`CARGO_BUILD_TARGET_DIR`・`CARGO_TARGET_DIR` のどれで出力先を変えていても追従する）で、その sha256 が差し替えた CLI と一致しなければ `linkage_target_mismatch`（§4-D） |
+| `FANDHE_EDGE_TIME_CMD` | 検査用（テスト専用の上書き）。`/usr/bin/time` の代役。**絶対パスの実行ファイル**（PATH で探さない）。K だけが使う。設定すると `evidence_hint` が `test_harness` に変わる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64）。未設定なら `/usr/bin/time` 固定 | テスト用のみ |
 | `FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` | 検査用（テスト専用の上書き）。**絶対パスの実行ファイル**（PATH で探さない）。どちらかを設定すると `evidence_hint` が `test_harness` に変わり、`otool -L` は実行されず `direct_libraries` が `null` になる。絶対パスでない場合や実行可能でなければ引数エラー（exit 64） | テスト用のみ。両方同時に設定可能 |
 | `FANDHE_EDGE_TRAINER_DIR` | 学習ワーカー（`trainer/`）の場所。CLI の `train` 工程が読む（設定の有無は空文字も設定扱い）。このスクリプトは値を読まず、設定の有無だけを `environment.trainer_origin`（`env` または `build_default`）へ記録する。パスは記録しない | 未設定なら CLI をビルドしたツリーの `trainer/`（ビルド時の既定）を使う。`FANDHE_EDGE_BIN` で差し替えた CLI の既定は、その CLI をビルドしたツリーを指し、このリポジトリの `trainer/` とは限らない。`train` を使わない項目（A・D・F のみ）の実行でも、この欄は環境変数の状態を表す |
 
@@ -129,7 +132,7 @@ scripts/real-machine-check.sh --work-dir '/path with space' ...
   - 補足（証拠種別: 推定。コードの読解）: `record.json`・`record.md` は最終 JSON の `emit` より前に書かれる（`main` の書き出しの後に `emit` を呼ぶ）ため、書き込みで止まった時点では書き終わっている場合が多い
   - 実装で止められるようにする（stdout 書き込みへの上限時間など）かは本手順では決めない。必要になれば別 Issue で扱う
 
-## 4. 各項目 A〜J が何を確かめるか
+## 4. 各項目 A〜K が何を確かめるか
 
 ### 4-A. `make ci`（ローカルゲート）
 
@@ -391,6 +394,22 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 - **記録する `record.json` フィールド**: `version_number`（2）・`previous_version_number`（1）・`rollback_to_v1_ok`・`latest_ok`・`version_id_only_exit_code`（64）・`tampered_artifact_exit_code`（64）・`steps`
 - **限界**: 台帳ファイル自体の改変は検出できない（読み取り専用化のみ。#491 の範囲外）
 
+### 4-K. 追加学習の種類のパッケージの容量・RSS・E2E p95（REQ-41・REQ-30・REQ-31・REQ-39・TASK-41.11-1・#441）
+
+追加学習の種類（`qwen2_lora`）の配布パッケージを測る。**既定の項目に入れず、`--items K --k-package DIR` で明示したときだけ実行する**。実機での測定そのもの（TASK-41.11-2・#442）は人が行い、本項目は測定と記録の道具である。
+
+- **パッケージの用意**: CLI の 7 工程はまだ追加学習の種類につながっていない（`train --kind qwen2_lora` はベースモデルを渡す口が無く `invalid_config` で止まる）。パッケージは人が別の手段（学習ワーカーの書き出し。TASK-41.6-3）で用意し、`--k-package DIR` で渡す。読み取りだけを行い、パッケージは変更しない。数 GB の重みは作業ディレクトリへ写さず、`DIR` の親をカレントにして相対の basename で `infer --package` を呼ぶ（ガードの経路の閉じ込めをそのまま効かせる）
+- **何を測るか**: ① 容量（直下のファイル数・バイト数の合計。目安 40,000,000 バイトは `over_reference` の警告）② 最大 RSS（`/usr/bin/time -l` の `maximum resident set size`。目標 2 GiB〔REQ-39 の暫定上限〕は `over_target` の警告）③ `infer` 1 回ごとの E2E 時間（`/usr/bin/time -l` の `real`。目標 250 ms は `over_guideline` の警告）。目標の超過は警告であり失敗にしない（TASK-41.9 と同じ方針）。合否は人が判断する
+- **回数**: `--k-runs N`（既定 20）回の測定の前に、ウォームアップ 1 回を実行する。ウォームアップは p95 に含めず、RSS には含める。p95 は runtime の `latency_report` と同じ定義（線形補間・外れ値を除かない・µs の整数へ切り上げ）で、中央値・最大値も記録する
+- **E2E と推論のみの違い（誤読しやすい点）**: `infer` は 1 呼び出し 1 プロセスのため、記録する時間はプロセスの起動とパッケージの読み込みを含む E2E で、REQ-31 の「推論のみ・バッチ 1 件」の p95 そのものではない。推論のみの p95 は CLI の外からは分けられないので `inference_only_p95` は `null`。Jev の公表値（E2E 70〜500 ms）と並べる場合は E2E 同士で比べる（指標の違いを必ず明記する）。分解能は `time -l` の 0.01 秒（`resolution_us: 10000`）
+- **静かな状態で測る**: `--quiet-machine` があり、`make`・`cargo`・`time` の代役も `FANDHE_EDGE_BIN` の差し替えも無いときだけ `classification` が `real_machine` になる（C-1 と同じ。それ以外は `reference_only`）
+- **今の main での結果**: CLI の `infer` は追加学習の種類に未対応で、ガードを通った後 `unsupported input representation`（exit 64）で止まる。このため K は `failed`（`reason: "unexpected_exit_code"`・`exit_code: 64`・`run: 0`）として記録される。CLI がつながれば同じ手順でそのまま測定できる
+- **実機での突き合わせ（未確認事項）**: `time -l` の最大 RSS（wait4 の rusage）が CLI の worker（子プロセス）の RSS を含むかどうかは未確認。実機で 1 回、アクティビティモニタ等の値と突き合わせて記録する（`rss.scope` は `process_tree_via_time_l` と書くが、これは主張でなく測定方法の名前）
+- **合格条件（`status: ok`）**: パッケージ直下が通常ファイルだけ、`artifact.json` の `kind` が追加学習の種類、すべての `infer` が exit 0・11・12 のいずれかで出力の `status` と対応、各回の stderr から最大 RSS と real が取れること
+- **失敗の理由**: `package_missing`・`package_unreadable`・`package_entry_not_regular`・`package_empty`・`artifact_unreadable`・`unexpected_kind`・`log_unwritable`・`unexpected_exit_code`（補助欄 `code`・`message_bytes`・`message_sha256`）・`invalid_json`・`unexpected_output`・`rss_unavailable`・`time_unavailable`・起動と回収の失敗（§5 (a)）。`step`・`run`（何回目か）・`package` を付ける
+- **記録する `record.json` フィールド**: `package`（`kind`・`artifact_sha256`〔`artifact.json` の sha256。パッケージの同一性の手がかり。数 GB の重みはハッシュを取らない〕・`files`〔`name`・`bytes`〕・`file_count`・`total_bytes`・`reference_bytes`・`over_reference`）・`rss`（`max_rss_bytes`・`target_bytes`・`over_target`・`scope`）・`e2e`（`runs`・`warmup`・`p95_us`・`median_us`・`max_us`・`guideline_us`・`over_guideline`・`resolution_us`・`classification`）・`inference_only_p95`（`null`）。パス・入力本文・stderr は書かない。`options` には `k_runs` と `k_package_given`（真偽のみ）
+- **限界**: 証拠種別は、偽の CLI・偽の `time` の下では `test_harness`、実機では人が確認して記入する。E2E に含まれるプロセス起動の時間は個体差と OS のキャッシュ（2 回目以降のファイル読み込み）に左右される
+
 ## 5. 判定の読み方
 
 スクリプトの終了コードは 4 種です（120・141・1 など 7 種の外の値は出さず、70 へ写します。下の 70 の行の「stdout へ書けなかった場合」）。
@@ -404,7 +423,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 
 **項目の実行フロー**:
 
-1. 要求した項目（`--items LIST`）を A→J の順で実行する
+1. 要求した項目（`--items LIST`）を A→K の順で実行する
 2. 各項目の実行：
    - 要求されていない → `not_run` / `not_selected`
    - 中断済み → `not_run` / `interrupted`（前の項目が `failed` の場合よりも優先する）
@@ -430,6 +449,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 - **H**: キャンセル（応答・exit 70・`cancelled`・`package/` なし・子孫 0 件）とクラッシュ検出（`failed`・`owner_lost`）がすべて契約どおり = `ok`
 - **I**: 4 複製の 7 工程と、再現性・比較の出力が契約の形 = `ok`（`some_pairs_disjoint` も `ok`。解釈は人）
 - **J**: v2 の作成・v1 での復帰・最新版・`--version-id` 単独の 64・改変の 64 がすべて契約どおり = `ok`
+- **K**: パッケージの `kind` が追加学習の種類で、全回の `infer` が exit 0・11・12 かつ最大 RSS・real が取れた = `ok`（目標の超過は警告で `ok` のまま。§4-K）
 
 **失敗時の報告の 5 点**:
 
@@ -473,6 +493,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 | H | `input_unreadable`・`driver_error`・`ps_unavailable`・`job_not_running`・`job_finished_before_cancel`・`cancel_response_invalid`・`cancel_not_requested`・`train_exit_code_not_70`・`train_output_invalid`・`status_invalid`・`status_unexpected`・`package_created`・`no_descendant_observed`・`descendants_remain_after_cancel`・`descendants_remain_after_crash`・工程別の失敗 |
 | I | `input_unreadable`・`copy_failed`・`missing_field`・`reproducibility_invalid`・`comparison_invalid`・工程別の失敗 |
 | J | `previous_package_missing`・`input_unreadable`・`copy_failed`・`missing_field`・`version_invalid`・`version_ledger_invalid`・`rejection_not_64`・`unexpected_exit_code`・`unexpected_output`・工程別の失敗 |
+| K | `package_missing`・`package_unreadable`・`package_entry_not_regular`・`package_empty`・`artifact_unreadable`・`unexpected_kind`・`log_unwritable`・`unexpected_exit_code`・`invalid_json`・`unexpected_output`・`rss_unavailable`・`time_unavailable`（`step`・`run`・`package` つき） |
 
 **(c) 実行の制御**
 
@@ -501,6 +522,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
 - **E**: 学習データ（`train.jsonl`）のみ使用し、評価データ（`evaluation.jsonl`）は使わない（REQ-27。評価の独立性）
 - **G・H・J**: 実 CLI・実 trainer（CPU）を実機で実行した結果。`FANDHE_EDGE_MAKE_CMD`・`FANDHE_EDGE_CARGO_CMD` の下（偽 CLI）の実行は `test_harness` で、実機の証拠にならない。H の子孫の観測は `ps`（固定パス）の `ppid` の連鎖によるもので、証拠種別は実機（人が確認して記入）
 - **I**: `--i-device` で証拠種別を区別して記録する（`cpu_real_machine`・`gpu_real_machine_declared`）。後者は人の申告で、CLI が GPU で学習した確認はスクリプトにはできない（CLI は CPU 固定）。再現性の合否・回帰の多寡の解釈は人が行い、スクリプトは出力の整合までを確かめる
+- **K**: 偽の CLI・偽の `time`（`FANDHE_EDGE_BIN`・`FANDHE_EDGE_TIME_CMD`）の下の実行は `test_harness` で実機の証拠にならない。実機の値は E2E（プロセスの起動と読み込みを含む）であり、推論のみの p95 ではない。`time -l` の最大 RSS が worker を含むかは実機で突き合わせて確認する（§4-K）
 - **F**: テストハーネスを実機で実行したもの。テストの実装（偽の sleeper、実時計）は実機ですが、判定対象（予測値・スコア）は合成に依存しているため、実機の証拠としては「テストハーネス」扱い
 
 **B・C のプロジェクト**: 複数項目で同じ評価データを使う場合は、project ごとに 1 回だけ適用します。B・C-1・C-2 は各々異なる project を使い、各 project へ 1 回ずつ評価データを適用します（REQ-27）。
@@ -583,7 +605,7 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
     "evaluation_sha256": "64-char hex"
   },
   "options": {
-    "items": ["A" | "B" | ... | "J"],
+    "items": ["A" | "B" | ... | "K"],
     "repeat": "int",
     "quiet_machine": "true | false",
     "p95_limit_us": "int",
@@ -592,6 +614,8 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
     "with_ci": "true | false",
     "g_budget_seconds": "int (G の探索予算。既定 3600)",
     "i_device": "cpu | gpu (I の証拠種別の申告)",
+    "k_runs": "int (K の計測回数。既定 20)",
+    "k_package_given": "true | false (K のパッケージを渡したか。パスは書かない)",
     "cargo_offline": "true | false (A を含まなければ true)"
   },
   "items": {
@@ -602,12 +626,13 @@ B の `project`（`package` 済み。版 v1）を旧プロジェクトとして�
     "G": { "status": "ok" | "failed" | "not_run", ... },
     "H": { "status": "ok" | "failed" | "not_run", ... },
     "I": { "status": "ok" | "failed" | "not_run", ... },
-    "J": { "status": "ok" | "failed" | "not_run", ... }
+    "J": { "status": "ok" | "failed" | "not_run", ... },
+    "K": { "status": "ok" | "failed" | "not_run", ... }
   }
 }
 ```
 
-各項目の詳細フィールドは §4-A 〜 §4-J 参照。記録の文字列の欄は許可リスト方式で組み立てられ、語彙外の値は `<unexpected>`・`<unrecognized>`・`<redacted>`、型が違う欄は `null` になる（§7）。`schema` は `real-machine-check/1` のまま。`not_run` 項目の `reason` は：
+各項目の詳細フィールドは §4-A 〜 §4-K 参照。記録の文字列の欄は許可リスト方式で組み立てられ、語彙外の値は `<unexpected>`・`<unrecognized>`・`<redacted>`、型が違う欄は `null` になる（§7）。`schema` は `real-machine-check/1` のまま。`not_run` 項目の `reason` は：
 
 - `not_selected`: `--items` に指定されなかった
 - `previous_item_failed`: 前の項目が `failed` になった
