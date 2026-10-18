@@ -2,7 +2,7 @@
 
 ## 前提
 
-- 仕様・要件定義の SSOT は [fandhe-edge-model-spec](https://github.com/Fandhe-AI/fandhe-edge-model-spec)（`docs/spec` submodule）の `04-requirements.md`（REQ-15〜40。REQ-19b を含む）。タスク定義は `05-tasks.md`（TASK-15.1〜40.x）、マイルストーンは `06-roadmap.md`（M6〜M11）、PoC 成果物は `03-poc/`・`02-poc-plan.md`（PoC-n・C-n）、設計判断・疑問点は `01-brainstorm.md`（疑問点 n）
+- 仕様・要件定義の SSOT は [fandhe-edge-model-spec](https://github.com/Fandhe-AI/fandhe-edge-model-spec)（`docs/spec` submodule）の `04-requirements.md`（REQ-15〜41。REQ-19b を含む）。タスク定義は `05-tasks.md`（TASK-15.1〜41.12）、マイルストーンは `06-roadmap.md`（M6〜M12）、PoC 成果物は `03-poc/`・`02-poc-plan.md`（PoC-n・C-n）、設計判断・疑問点は `01-brainstorm.md`（疑問点 n）
 - v1・v2（REQ-1〜14 と対応 TASK・M1〜M5）は凍結済みで、本リポの実装対象外（`01-brainstorm.md` 疑問点 24）
 - spec リポは private として維持するが、**spec の内容を本リポ（public）のコード・コメント・ドキュメント・Issue・PR・コミットメッセージに載せてよい**（オーナー判断 2026-09-27）。ただし要約・引用は必要な範囲に留める
 - spec リポへのアクセス権がない環境では `docs/spec` を解決できない

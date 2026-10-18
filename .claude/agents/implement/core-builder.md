@@ -21,7 +21,7 @@ tools: [Read, Edit, Write, Glob, Grep, Bash]
 - 共通コアは他のどの層にも依存しない（最下層を保つ）
 - 正準化の規則は 1 箇所に集約し、他層で独自にハッシュを計算させない
 - 定義ファイルのスキーマ・判定型の変更は全層に波及するため、main の設計承認なしに変更しない
-- 入力表現は byte のみで確定（README「実装方針（要点）」・PoC-13。sw2k 等の語彙の流用は除外事項）
+- 入力表現は既定 byte で、kind ごとに byte か tokenizer を宣言する（`artifact.json` の `input_representation`。REQ-41・TASK-41.3・M12）。sw2k 等の自作語彙の流用は除外事項のまま（PoC-13）
 
 ## 共通の遵守事項
 
