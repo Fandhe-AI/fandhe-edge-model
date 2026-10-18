@@ -181,6 +181,24 @@ pub fn allotted_time_limit_seconds(
         .ok_or(StageFileError::Malformed)
 }
 
+/// 保存済みの探索記録に残る候補 ID を宣言順で返す（`select` が再構成した候補集合との照合に使う。
+/// 失敗・時間切れで候補ディレクトリが片付けられても、記録から探索時の族を復元できる。REQ-25・REQ-27）。
+///
+/// # Errors
+/// [`MAX_SEARCH_RECORD_BYTES`] 超過・JSON として不正な場合は [`StageFileError::Malformed`]（fail-closed）。
+pub fn search_record_candidate_ids(bytes: &[u8]) -> Result<Vec<String>, StageFileError> {
+    if bytes.len() > MAX_SEARCH_RECORD_BYTES {
+        return Err(StageFileError::Malformed);
+    }
+    let record: StoredSearchRecord =
+        serde_json::from_slice(bytes).map_err(|_| StageFileError::Malformed)?;
+    Ok(record
+        .candidates
+        .into_iter()
+        .map(|e| e.candidate_id)
+        .collect())
+}
+
 /// 学習ジョブが返した validation 予測（入力順）を、正解ラベル `gold`（同じ順序）と突き合わせて
 /// 全体正解率を返す。件数・`id` の順序が入力 `ids` と一致しなければ [`StageFileError::Scoring`]。
 ///

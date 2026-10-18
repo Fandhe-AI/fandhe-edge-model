@@ -1904,14 +1904,10 @@ mod all_tests {
         assert_eq!(bad.code, ExitCode::InvalidInput);
         let sel_path = cwd.join("proj/selection_record.json");
         assert!(!sel_path.exists());
-        // 候補 2 は未学習なので選定は変わらないが、候補集合は記録に残る。
-        select(vec!["qwen2_lora".to_string(), "qwen2_lora".to_string()]).expect("select");
-        let record = std::fs::read_to_string(&sel_path).expect("record");
-        assert!(
-            record.contains("\"explicit_kinds\":[\"qwen2_lora\"]"),
-            "{record}"
-        );
-        std::fs::remove_file(&sel_path).expect("remove");
+        // 探索記録は 2 候補なので、明示指定専用の種類を足した族は記録と一致せず拒否する。
+        let grown = select(vec!["qwen2_lora".to_string()]).expect_err("family would grow");
+        assert_eq!(grown.code, ExitCode::InvalidInput);
+        assert!(!sel_path.exists());
         select(Vec::new()).expect("select");
         let record = std::fs::read_to_string(&sel_path).expect("record");
         assert!(!record.contains("explicit_kinds"), "{record}");
@@ -1921,6 +1917,52 @@ mod all_tests {
         let err = select(Vec::new()).expect_err("family would shrink");
         assert_eq!(err.code, ExitCode::InvalidInput);
         assert!(!sel_path.exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-25・REQ-41・TASK-41.10-1: `train --all --kind qwen2_lora` で 3 件目が失敗して候補ディレクトリが
+    /// 片付けられても、探索記録（3 候補）と再構成した候補集合（`--kind` 省略で 2 候補）の不一致を
+    /// `select` が拒否する（Holm の family_size の縮小を防ぐ。証拠種別: テストハーネス）。
+    #[test]
+    fn req25_select_rejects_family_shrink_after_failed_explicit_candidate_cleanup() {
+        let cwd = inspected_workdir("kind-shrink");
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        let make_job = || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(|request: &TrainRequest, _job: ConfinedPackage| {
+                if request.kind() == "c1" {
+                    return Ok(fake_c1_success(request));
+                }
+                let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+            }))
+        };
+        let args = TrainArgs {
+            kinds: vec!["qwen2_lora".to_string()],
+            ..all_args()
+        };
+        run_all_with(&args, SearchBudget::default(), &cwd, make_job, &clock).expect("train --all");
+        assert!(!cwd.join("proj/candidates/2").exists());
+        let select = |kinds: Vec<String>| {
+            super::super::select::run(
+                &SelectArgs {
+                    project_dir: "proj".into(),
+                    kinds,
+                },
+                &cwd,
+            )
+        };
+        let err = select(Vec::new()).expect_err("family would shrink");
+        assert_eq!(err.code, ExitCode::InvalidInput);
+        assert!(!cwd.join("proj/selection_record.json").exists());
+        select(vec!["qwen2_lora".to_string()]).expect("same --kind passes");
+        let record =
+            std::fs::read_to_string(cwd.join("proj/selection_record.json")).expect("record");
+        assert!(
+            record.contains("\"explicit_kinds\":[\"qwen2_lora\"]"),
+            "{record}"
+        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
