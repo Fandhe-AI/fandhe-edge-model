@@ -5582,3 +5582,24 @@ def test_item_k_is_not_a_default_item_and_additional_kinds_match_rust() -> None:
     assert m is not None, "EXPLICIT_ONLY_KINDS が見つからない"
     assert set(re.findall(r'\("([a-z0-9_]+)",', m.group(1))) == set(mod.ADDITIONAL_KINDS)
     assert mod.ADDITIONAL_KINDS <= mod.KIND_VOCAB
+
+
+def test_item_k_bounds_package_listing_and_honors_overall_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39・#441: K は `--k-package` の列挙に件数上限と全体期限を効かせる。"""
+    from types import SimpleNamespace
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(mod, "MAX_K_PACKAGE_ENTRIES", 2)
+    for i in range(3):
+        (pkg / f"f{i}.bin").write_bytes(b"x")
+    ctx = SimpleNamespace(k_package=pkg)
+    assert mod.item_k(ctx) == {"status": "failed", "reason": "package_too_many_entries"}
+    monkeypatch.setattr(mod, "_overall_deadline", 0.0)
+    try:
+        with pytest.raises(mod.OverallTimeout):
+            mod.item_k(ctx)
+    finally:
+        mod.clear_overall()

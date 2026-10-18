@@ -233,6 +233,9 @@ TIME_CMD_DEFAULT = "/usr/bin/time"
 CAP_ARTIFACT_JSON = 2 * 1024 * 1024
 # `--k-package` の basename（`-` 始まりが CLI のオプションに化けるのを防ぐ）
 K_PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+# `--k-package` 直下のエントリ数の上限（REQ-39 の資源上限。パッケージは数ファイルで十分大きい値）。
+# 超過は fail-closed。列挙は上限で打ち切るためメモリは件数に比例しない
+MAX_K_PACKAGE_ENTRIES = 1000
 K_SAMPLE_TEXT = "sandbox check 0123456789"
 TIME_RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size\s*$", re.MULTILINE)
 TIME_REAL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+real\b", re.MULTILINE)
@@ -3370,22 +3373,24 @@ def item_k(ctx: Ctx) -> dict[str, Any]:
     pdir = ctx.k_package
     if pdir is None:
         return fail_item("package_missing")
-    regular = package_entries_regular(pdir)
-    if regular is None:
-        return fail_item("package_unreadable")
-    if not regular:
-        return fail_item("package_entry_not_regular")
     try:
-        entries = sorted(os.scandir(pdir), key=lambda e: e.name)
-        files = [
-            {
-                "name": e.name if PACKAGE_FILE_NAME_RE.fullmatch(e.name) else UNRECOGNIZED,
-                "bytes": e.stat(follow_symlinks=False).st_size,
-            }
-            for e in entries
-        ]
+        files = []
+        with os.scandir(pdir) as it:  # 逐次列挙。上限超過・期限切れはここで止める
+            for e in it:
+                check_overall()
+                if len(files) >= MAX_K_PACKAGE_ENTRIES:
+                    return fail_item("package_too_many_entries")
+                if not e.is_file(follow_symlinks=False):
+                    return fail_item("package_entry_not_regular")
+                files.append(
+                    {
+                        "name": e.name if PACKAGE_FILE_NAME_RE.fullmatch(e.name) else UNRECOGNIZED,
+                        "bytes": e.stat(follow_symlinks=False).st_size,
+                    }
+                )
     except OSError:
         return fail_item("package_unreadable")
+    files.sort(key=lambda f: f["name"])
     if not files:
         return fail_item("package_empty")
     art = parse_json_object(pdir / "artifact.json", CAP_ARTIFACT_JSON)
