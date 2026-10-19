@@ -69,15 +69,15 @@ def write_tokenizer_json(directory: Path, *, merges_as_lists: bool = False) -> P
 TINY_VOCAB = 300
 
 
-def tiny_config(*, tie: bool = True, rope_theta: float = 10000.0) -> dict:
+def tiny_config(*, tie: bool = True, rope_theta: float = 10000.0, hidden: int = 16) -> dict:
     """極小 Qwen2 の config.json 内容。"""
     return {
         "model_type": "qwen2",
-        "hidden_size": 16,
+        "hidden_size": hidden,
         "num_hidden_layers": 2,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
-        "intermediate_size": 32,
+        "intermediate_size": 2 * hidden,
         "vocab_size": TINY_VOCAB,
         "rms_norm_eps": 1e-6,
         "rope_theta": rope_theta,
@@ -90,7 +90,12 @@ def tiny_config(*, tie: bool = True, rope_theta: float = 10000.0) -> dict:
 
 
 def write_model_dir(
-    directory: Path, *, seed: int = 0, tie: bool = True, rope_theta: float = 10000.0
+    directory: Path,
+    *,
+    seed: int = 0,
+    tie: bool = True,
+    rope_theta: float = 10000.0,
+    hidden: int = 16,
 ) -> Path:
     """極小 Qwen2 の `config.json` と `model.safetensors`（float32・seed 固定）を書く。"""
     # tokenizer のテストが mlx / qwen2_model なしで動くよう、モデル部分だけ遅延 import する。
@@ -100,7 +105,7 @@ def write_model_dir(
     from tools.poc26.qwen2_model import Qwen2Config, Qwen2Model
 
     (directory / "config.json").write_text(
-        json.dumps(tiny_config(tie=tie, rope_theta=rope_theta)), encoding="utf-8"
+        json.dumps(tiny_config(tie=tie, rope_theta=rope_theta, hidden=hidden)), encoding="utf-8"
     )
     model = Qwen2Model(Qwen2Config.from_file(directory / "config.json"))
     rng = np.random.default_rng(seed)

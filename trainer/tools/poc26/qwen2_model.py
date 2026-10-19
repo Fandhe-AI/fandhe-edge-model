@@ -509,6 +509,45 @@ def apply_lora(
                 setattr(parent, name, lora)
 
 
+def lora_delta(lin: LoRALinear) -> mx.array:
+    """統合の差分 `scale * (A @ B).T`（float32。base と同じ (out, in)）。ONNX 書き出しと共通。"""
+    return lin.scale * (lin.lora_a @ lin.lora_b).T
+
+
+def fuse_lora(model: Qwen2Model) -> None:
+    """各 LoRALinear を `W + scale*(A@B).T` を統合した `nn.Linear` に置き換える（REQ-41）。
+
+    統合は float32 で行い、base の dtype へ戻す。bias は base のものを引き継ぐ。量子化の前に呼ぶ。
+    """
+    for block in model.model.layers:
+        for owner, names in _LORA_TARGETS:
+            parent = getattr(block, owner)
+            for name in names:
+                lin = getattr(parent, name)
+                if not isinstance(lin, LoRALinear):
+                    continue
+                base = lin.linear
+                w = base.weight.astype(mx.float32) + lora_delta(lin)
+                new = nn.Linear(w.shape[1], w.shape[0], bias="bias" in base)
+                new.weight = w.astype(base.weight.dtype)
+                if "bias" in base:
+                    new.bias = base.bias
+                setattr(parent, name, new)
+    mx.eval(model.parameters())
+
+
+QUANT_GROUP_SIZE = 64
+QUANT_BITS = 4
+
+
+def quantize_model(
+    model: Qwen2Model, group_size: int = QUANT_GROUP_SIZE, bits: int = QUANT_BITS
+) -> None:
+    """Linear と Embedding を量子化する（mlx_lm の既定と同じ範囲。tie の as_linear も量子化後）。"""
+    nn.quantize(model, group_size=group_size, bits=bits)
+    mx.eval(model.parameters())
+
+
 def trainable_parameter_count(model: nn.Module) -> int:
     """学習可能パラメータの総数。"""
     return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))

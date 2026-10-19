@@ -46,7 +46,7 @@ from tools.poc26.io_records import (
     load_adapter,
 )
 from tools.poc26.predict import attach_adapter
-from tools.poc26.qwen2_model import LoRALinear, Qwen2Config, Qwen2Model
+from tools.poc26.qwen2_model import LoRALinear, Qwen2Config, Qwen2Model, lora_delta
 from tools.poc26.safe_io import LimitExceededError, open_regular
 
 OPSET = 13
@@ -129,8 +129,7 @@ def fused_weights(model: Qwen2Model, shapes_only: bool = False) -> dict[str, np.
                 w = lin.linear.weight if isinstance(lin, LoRALinear) else lin.weight
                 w = np_array(w, dtype=np.float32)
                 if isinstance(lin, LoRALinear) and not shapes_only:
-                    delta = lin.scale * (np_array(lin.lora_a) @ np_array(lin.lora_b)).T
-                    w = w + delta.astype(np.float32)
+                    w = w + np.array(lora_delta(lin), dtype=np.float32)
                 key = f"{p}{owner}.{name}."
                 out[key + "weight"] = w
                 base = lin.linear if isinstance(lin, LoRALinear) else lin

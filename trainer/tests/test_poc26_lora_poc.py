@@ -48,11 +48,11 @@ def _jsonl(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-def make_dir(tmp: Path, *, config_patch: dict | None = None) -> Path:
+def make_dir(tmp: Path, *, config_patch: dict | None = None, hidden: int = 16) -> Path:
     """合成モデル・tokenizer・tokenizer_config を `tmp/model` に書く。"""
     d = tmp / "model"
     d.mkdir()
-    synthetic.write_model_dir(d)
+    synthetic.write_model_dir(d, hidden=hidden)
     # 合成モデルの max_position_embeddings（64）は CLI の prompt 長より短いため広げる
     cfg_path = d / "config.json"
     cfg_path.write_text(
