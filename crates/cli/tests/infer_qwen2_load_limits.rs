@@ -45,13 +45,22 @@ fn workspace(tag: &str) -> PathBuf {
     ws
 }
 
-fn supervise(ws: &Path, config: &RunConfig) -> (ExitCode, String) {
+/// worker を確実に長く走らせる入力ファイルを置く（監督層の 50 ms ポーリングより十分長い。
+/// 1 件推論だけだと完走が速く、超過の観測前に終了して競合する）。
+fn write_long_input(ws: &Path) {
+    let jsonl: String = (0..5000)
+        .map(|i| format!("{{\"id\":\"{i}\",\"input\":\"hello world {i}\"}}\n"))
+        .collect();
+    fs::write(ws.join("in.jsonl"), jsonl).expect("jsonl");
+}
+
+fn supervise(ws: &Path, config: &RunConfig, args: &[&str]) -> (ExitCode, String) {
     let mut cmd = GuardedCommand::new(env!("CARGO_BIN_EXE_fandhe-edge"))
         .expect("abs")
         .current_dir(ws)
         .env(WORKER_ENV, "1");
-    for a in ["infer", "--package", "p", "--text", "hello"] {
-        cmd = cmd.arg(a);
+    for a in ["infer", "--package", "p"].iter().chain(args) {
+        cmd = cmd.arg(*a);
     }
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = run_supervised(&mut out, &mut err, &cmd, config).expect("io");
@@ -66,7 +75,7 @@ fn config(time: Duration) -> RunConfig {
 #[test]
 fn req39_qwen2_lora_worker_completes_within_limits() {
     let ws = workspace("ok");
-    let (code, text) = supervise(&ws, &config(Duration::from_secs(30)));
+    let (code, text) = supervise(&ws, &config(Duration::from_secs(30)), &["--text", "hello"]);
     assert_eq!(code, ExitCode::Ok, "{text}");
     assert!(
         text.starts_with("{\"id\":\"input\",\"status\":\"ok\""),
@@ -76,11 +85,16 @@ fn req39_qwen2_lora_worker_completes_within_limits() {
 }
 
 /// REQ-39: 読み込みを含む worker の時間が上限を超えたら exit 20（読み込みだけが長くても止まる）。
-/// 実測でこの worker は完走まで約 0.3 秒かかり、20 ms の上限は読み込み中に超過する。
+/// 入力は 5000 件で worker は 20 ms を確実に超えて走り、読み込み中に超過する。
 #[test]
 fn req39_qwen2_lora_load_phase_time_overrun_is_limit_exceeded() {
     let ws = workspace("time");
-    let (code, text) = supervise(&ws, &config(Duration::from_millis(20)));
+    write_long_input(&ws);
+    let (code, text) = supervise(
+        &ws,
+        &config(Duration::from_millis(20)),
+        &["--input-file", "in.jsonl"],
+    );
     assert_eq!(code, ExitCode::LimitExceeded, "{text}");
     assert_eq!(
         text,
@@ -90,12 +104,14 @@ fn req39_qwen2_lora_load_phase_time_overrun_is_limit_exceeded() {
 }
 
 /// REQ-39: 読み込みを含む worker の RSS が上限を超えたら exit 20（メモリ）。
+/// 上限 1 MiB は起動直後から超えており、5000 件の入力で worker が最初のポーリングまで生きている。
 #[test]
 fn req39_qwen2_lora_load_phase_memory_overrun_is_limit_exceeded() {
     let ws = workspace("mem");
     let cfg = config(Duration::from_secs(30))
         .with_memory_limit(MemoryLimit::new(1024 * 1024).expect("mem"));
-    let (code, text) = supervise(&ws, &cfg);
+    write_long_input(&ws);
+    let (code, text) = supervise(&ws, &cfg, &["--input-file", "in.jsonl"]);
     assert_eq!(code, ExitCode::LimitExceeded, "{text}");
     assert_eq!(
         text,
