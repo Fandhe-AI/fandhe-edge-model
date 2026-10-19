@@ -1,0 +1,7 @@
+{
+  "_meta": {
+    "description": "qwen2_lora config.max_seq_length range (REQ-41, REQ-39). Single source of truth cross-checked by crates/core/tests/lora_seq_length_fixture.rs (fandhe_edge_core::limits) and trainer/tests/test_lora_seq_length_fixture.py (limits.py). Do not relax."
+  },
+  "min_lora_seq_length": 8,
+  "max_lora_seq_length": 4096
+}

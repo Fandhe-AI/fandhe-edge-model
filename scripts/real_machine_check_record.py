@@ -3367,8 +3367,8 @@ def item_k(ctx: Ctx) -> dict[str, Any]:
     `infer` は 1 呼び出し 1 プロセスなので、p95 はプロセスの起動と読み込みを含む E2E であり、
     推論のみの p95 は CLI からは分けられない（`inference_only_p95` は null）。目標の超過は
     警告として記録し、失敗にしない（TASK-41.9 の方針）。パッケージは読み取りだけで、cwd をその
-    親にして相対の basename を渡す（ガードの経路の閉じ込めをそのまま効かせる）。現状 CLI の
-    `infer` は追加学習の種類に未対応（exit 64）のため、実機でも `unexpected_exit_code` になりうる。
+    親にして相対の basename を渡す（ガードの経路の閉じ込めをそのまま効かせる）。パッケージが
+    `infer` に拒否された場合（exit 64 など）は `unexpected_exit_code` で失敗として記録する。
     """
     pdir = ctx.k_package
     if pdir is None:

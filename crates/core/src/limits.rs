@@ -50,6 +50,21 @@ pub const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// 実機測定後に spec 側で決まる。
 pub const TRAINER_JSONL_MAX_BYTES: u64 = 4 * MAX_PROJECT_FILE_BYTES;
 
+/// 分割ファイル（外部データの shard）の最大件数（REQ-39・TASK-41.7-8）。
+///
+/// ガード層の `MAX_SPLIT_FILES`・推論ランタイムの `FINETUNE_MODEL_LIMITS.external.max_shards`・
+/// `artifact.json` の `external_data` 件数上限が同じ値を参照する（上限変更時に受理範囲をずらさない）。
+pub const MAX_EXTERNAL_DATA_SHARDS: usize = 256;
+
+/// `qwen2_lora` の `config.max_seq_length` の下限（REQ-41・REQ-39）。
+///
+/// 学習ワーカーの `limits.py::MIN_LORA_SEQ_LENGTH` とは言語が違い参照できないため、共有 fixture
+/// `fixtures/lora_limits/lora_seq_length.json` を介して双方のテストで照合する。
+pub const MIN_LORA_SEQ_LENGTH: u64 = 8;
+
+/// `qwen2_lora` の `config.max_seq_length` の上限（`limits.py::MAX_LORA_SEQ_LENGTH` と同値）。
+pub const MAX_LORA_SEQ_LENGTH: u64 = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;

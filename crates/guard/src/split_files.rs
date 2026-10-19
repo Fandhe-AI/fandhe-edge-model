@@ -29,7 +29,7 @@ use std::fs::File;
 pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// 受け付ける分割ファイルの最大件数（ハッシュ計算の時間と fd 数を有界にする）。
-pub const MAX_SPLIT_FILES: usize = 256;
+pub const MAX_SPLIT_FILES: usize = fandhe_edge_core::limits::MAX_EXTERNAL_DATA_SHARDS;
 
 /// 呼び出し側の希望上限を天井 [`MAX_PACKAGE_TOTAL_BYTES`] で丸めた実効上限を返す。
 pub const fn effective_total_limit(requested: u64) -> u64 {

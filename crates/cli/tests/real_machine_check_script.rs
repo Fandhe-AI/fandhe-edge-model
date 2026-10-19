@@ -3262,7 +3262,7 @@ fn req39_j_stops_at_the_first_failing_infer() {
 // ---- 項目 K（追加学習の種類のパッケージ測定。REQ-41・REQ-30・REQ-31・REQ-39・TASK-41.11-1・#441） ----
 
 /// K 用の偽 CLI。`infer` だけを受け、cwd の basename と引数を `k.log` に残す。
-/// `FAKE_K_EXIT=64` なら追加学習の種類が未対応の現状の CLI と同じ応答（exit 64）を返す。
+/// `FAKE_K_EXIT=64` なら `infer` がパッケージを拒否した場合と同じ応答（exit 64）を返す。
 const FAKE_K_CLI: &str = r##"#!/bin/sh
 echo "$(basename "$PWD") $*" >> "$FAKE_DIR/k.log"
 if [ "${FAKE_K_EXIT:-0}" = 64 ]; then
@@ -3392,9 +3392,9 @@ fn req41_item_k_over_target_is_recorded_not_failed() {
     assert_eq!(e.q("items.K.e2e.over_guideline"), "true");
 }
 
-/// REQ-41: CLI が追加学習の種類の infer に未対応（exit 64）の間は、正直に failed で記録する。
+/// REQ-41: `infer` がパッケージを exit 64 で拒否したときは、正直に failed で記録する。
 #[test]
-fn req41_item_k_unwired_infer_fails_with_exit_code() {
+fn req41_item_k_rejected_infer_fails_with_exit_code() {
     let e = Env::new();
     let (pkg, _) = k_package(&e, "qwen2_lora");
     let o = run_k(&e, &pkg, "2", &[("FAKE_K_EXIT", "64")]);

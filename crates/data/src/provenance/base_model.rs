@@ -299,12 +299,12 @@ mod tests {
         }
     }
 
-    /// guard の `MAX_SPLIT_FILES` との値の一致を機械照合する（data は guard に依存しないため
-    /// ソース文字列で確認する）。
+    /// core の `MAX_EXTERNAL_DATA_SHARDS`（guard の `MAX_SPLIT_FILES` の出所）との値の一致を
+    /// 機械照合する（data は core に依存しないためソース文字列で確認する）。
     #[test]
     fn req41_max_files_matches_guard() {
-        let src = include_str!("../../../guard/src/split_files.rs");
-        let want = format!("pub const MAX_SPLIT_FILES: usize = {MAX_FILES};");
+        let src = include_str!("../../../core/src/limits.rs");
+        let want = format!("pub const MAX_EXTERNAL_DATA_SHARDS: usize = {MAX_FILES};");
         assert!(src.contains(&want), "{want}");
     }
 

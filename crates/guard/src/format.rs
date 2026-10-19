@@ -46,6 +46,10 @@ use std::path::Path;
 pub enum FileFormat {
     /// ONNX（ModelProto の top-level 構造の検査に合格したもの）。
     Onnx,
+    /// 外部データ（重みの shard）を参照する ONNX。構造は [`FileFormat::Onnx`] と同じ検査に合格している。
+    /// 参照先の閉じ込め・サイズ・sha256 は呼び出し側（推論ランタイムの shard 照合）が行う。
+    /// 外部データ付きの種類（`qwen2_lora`）の許可リストにだけ入れる（REQ-41・REQ-39・#626）。
+    OnnxExternalData,
     /// pickle（先頭 `0x80` とプロトコル版 2..=5）。任意コード実行につながる形式。
     Pickle,
     /// NumPy `.npy`（先頭 `\x93NUMPY`）。
@@ -67,6 +71,7 @@ impl FileFormat {
     pub const fn name(self) -> &'static str {
         match self {
             FileFormat::Onnx => "onnx",
+            FileFormat::OnnxExternalData => "onnx_external_data",
             FileFormat::Pickle => "pickle",
             FileFormat::Npy => "npy",
             FileFormat::Zip => "zip",
@@ -387,6 +392,8 @@ const MAX_TENSOR_SCAN_FIELDS: usize = 1 << 22;
 /// 外部データ参照の検査の走査状態。
 struct ExternalScan {
     remaining_fields: usize,
+    /// 外部データ参照を見つけたか（見つけても走査は続け、深さ・件数の上限超過は引き続き拒否する）。
+    found_external: bool,
 }
 
 /// 1 フィールド分の値。
@@ -497,25 +504,31 @@ impl ExternalScan {
         })
     }
 
-    /// TensorProto: external_data(13) が 1 件でもある、または data_location(14) が DEFAULT(0) 以外なら拒否。
+    /// TensorProto: external_data(13) が 1 件、または data_location(14) が EXTERNAL(1) なら外部参照ありとして
+    /// 記録する。data_location が 0・1 以外（未知の値・varint でない型）は不正として拒否する（fail-closed）。
     fn tensor(&mut self, buf: &[u8]) -> Result<(), ()> {
-        self.each_field(buf, |_, field, v| match (field, v) {
-            (13, _) => Err(()),
+        self.each_field(buf, |me, field, v| match (field, v) {
             (14, WireValue::Varint(0)) => Ok(()),
+            (13, _) | (14, WireValue::Varint(1)) => {
+                me.found_external = true;
+                Ok(())
+            }
             (14, _) => Err(()),
             _ => Ok(()),
         })
     }
 }
 
-/// ModelProto 内のすべての TensorProto を降りて、外部データ（外部ファイル）への参照が無いことを確認する。
-/// 参照先を追って検査することはせず、参照があれば拒否する（経路の閉じ込め・サイズ上限の迂回を防ぐ。REQ-39）。
-fn has_no_external_data(bytes: &[u8]) -> bool {
-    ExternalScan {
+/// ModelProto 内のすべての TensorProto を降りて、外部データ（外部ファイル）への参照を調べる。
+/// 参照先を追って検査することはせず、参照の有無だけを返す（経路の閉じ込め・サイズ上限は参照を
+/// 受け付ける側の責務。`onnx_only` は参照ありを拒否する。REQ-39）。走査の上限超過は `Err`（fail-closed）。
+fn scan_external_data(bytes: &[u8]) -> Result<bool, ()> {
+    let mut scan = ExternalScan {
         remaining_fields: MAX_TENSOR_SCAN_FIELDS,
-    }
-    .model(bytes)
-    .is_ok()
+        found_external: false,
+    };
+    scan.model(bytes)?;
+    Ok(scan.found_external)
 }
 
 /// バイト列全体からファイル形式を判定する純関数（非公開。公開すると検査を経ない判定値が出回る）。
@@ -538,7 +551,12 @@ fn detect_format(bytes: &[u8]) -> FileFormat {
         total_len,
     };
     match scan_onnx_model(&mut src, total_len) {
-        Ok(OnnxScan::Onnx) if has_no_external_data(bytes) => FileFormat::Onnx,
+        Ok(OnnxScan::Onnx) => match scan_external_data(bytes) {
+            Ok(false) => FileFormat::Onnx,
+            // 外部データ参照ありは別形式として返し、`onnx_only` では拒否される。
+            Ok(true) => FileFormat::OnnxExternalData,
+            Err(()) => FileFormat::Unknown,
+        },
         // ベースモデル形式（REQ-41・TASK-41.2-1）。ONNX を先に判定し既存の判定結果は変えない。
         _ if base_model_format::check_tokenizer_json(bytes).is_ok() => FileFormat::TokenizerJson,
         _ => FileFormat::Unknown,
@@ -565,6 +583,12 @@ impl FormatAllowlist {
     /// 推論・パッケージ用の既定（ONNX のみ）。
     pub fn onnx_only() -> Self {
         Self::new([FileFormat::Onnx])
+    }
+
+    /// 外部データ付きの種類（`qwen2_lora`）の推論用。ONNX（外部参照なし・あり）のみ。
+    /// 外部データを許さない種類〔C1・C3〕は [`FormatAllowlist::onnx_only`] を使う（REQ-41・#626）。
+    pub fn onnx_with_external_data() -> Self {
+        Self::new([FileFormat::Onnx, FileFormat::OnnxExternalData])
     }
 
     /// ベースモデルの重み・トークナイザー用（REQ-41・TASK-41.2-1）。safetensors と tokenizer JSON のみ。
@@ -880,7 +904,37 @@ mod tests {
         ld(13, &[0x0a, 0x01, 0x6b]) // external_data(key)
     }
 
-    /// REQ-39・TASK-39.2-1: 外部データを参照するテンソルは、どこに現れても ONNX と認めない。
+    /// REQ-41・REQ-39・#626: `onnx_only` は外部データ付き ONNX を拒否し、`onnx_with_external_data` は許す。
+    #[test]
+    fn req39_external_data_allowlists() {
+        let m = model_with_graph_extra(&ld(5, &tensor_with_external()));
+        assert!(check_bytes(m.clone(), &FormatAllowlist::onnx_only()).is_err());
+        let ok = check_bytes(m, &FormatAllowlist::onnx_with_external_data()).expect("allowed");
+        assert_eq!(ok.format(), FileFormat::OnnxExternalData);
+        // 外部データ許可でも非 ONNX は拒否する。
+        let pickle = b"(lp0\n.".to_vec();
+        assert!(check_bytes(pickle, &FormatAllowlist::onnx_with_external_data()).is_err());
+    }
+
+    /// REQ-39・#626: `data_location` は 0（DEFAULT）・1（EXTERNAL）だけを認め、それ以外の値は `Unknown`。
+    #[test]
+    fn req39_unknown_data_location_value_is_rejected() {
+        for v in [2u8, 3, 100] {
+            assert_eq!(
+                d(&model_with_graph_extra(&ld(5, &[0x70, v]))),
+                FileFormat::Unknown,
+                "{v}"
+            );
+        }
+        // varint でない data_location（LEN）も拒否する。
+        assert_eq!(
+            d(&model_with_graph_extra(&ld(5, &ld(14, &[0x00])))),
+            FileFormat::Unknown
+        );
+    }
+
+    /// REQ-39・TASK-39.2-1: 外部データを参照するテンソルは、どこに現れても `Onnx` と認めない
+    /// （`OnnxExternalData` として区別し、`onnx_only` は拒否する。#626）。
     #[test]
     fn req39_external_data_is_rejected_everywhere() {
         let ext = tensor_with_external();
@@ -899,18 +953,18 @@ mod tests {
         // initializer の external_data・data_location=EXTERNAL
         assert_eq!(
             d(&model_with_graph_extra(&ld(5, &ext))),
-            FileFormat::Unknown
+            FileFormat::OnnxExternalData
         );
         assert_eq!(
             d(&model_with_graph_extra(&ld(5, &loc))),
-            FileFormat::Unknown
+            FileFormat::OnnxExternalData
         );
         // sparse_initializer の values・indices
         for f in [1u8, 2] {
             let sp = ld(f, &ext);
             assert_eq!(
                 d(&model_with_graph_extra(&ld(15, &sp))),
-                FileFormat::Unknown
+                FileFormat::OnnxExternalData
             );
         }
         // node の attribute の t・tensors・sparse_tensor・sparse_tensors
@@ -923,7 +977,7 @@ mod tests {
             let node = ld(5, &ld(af, &inner));
             assert_eq!(
                 d(&model_with_graph_extra(&ld(1, &node))),
-                FileFormat::Unknown
+                FileFormat::OnnxExternalData
             );
         }
         // サブグラフ（属性 g・graphs）内の外部参照
@@ -932,20 +986,20 @@ mod tests {
             let node = ld(5, &ld(af, &sub));
             assert_eq!(
                 d(&model_with_graph_extra(&ld(1, &node))),
-                FileFormat::Unknown
+                FileFormat::OnnxExternalData
             );
         }
         // functions 内のノードの属性・attribute_proto、training_info の graph
         let node = ld(5, &ld(5, &ext));
         let mut m = model_with_graph_extra(&[]);
         m.extend(ld(25, &ld(7, &node)));
-        assert_eq!(d(&m), FileFormat::Unknown);
+        assert_eq!(d(&m), FileFormat::OnnxExternalData);
         let mut m = model_with_graph_extra(&[]);
         m.extend(ld(25, &ld(11, &ld(5, &ext))));
-        assert_eq!(d(&m), FileFormat::Unknown);
+        assert_eq!(d(&m), FileFormat::OnnxExternalData);
         let mut m = model_with_graph_extra(&[]);
         m.extend(ld(20, &ld(2, &ld(5, &ext))));
-        assert_eq!(d(&m), FileFormat::Unknown);
+        assert_eq!(d(&m), FileFormat::OnnxExternalData);
         // 外部参照の無い functions は通る。
         let mut m = model_with_graph_extra(&[]);
         m.extend(ld(25, &ld(7, &ld(5, &ld(5, &clean_tensor)))));

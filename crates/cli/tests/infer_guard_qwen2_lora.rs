@@ -2,9 +2,9 @@
 //! sha256）が `infer` の経路に結合して効くこと（REQ-39・REQ-41・TASK-41.8・#435。
 //! 証拠種別: テストハーネス・合成パッケージ）。
 //!
-//! 推論本体（`qwen2_lora` の CLI 配線）は本ファイルの範囲外で、正常形はガードを通過して次の層
-//! （`unsupported input representation`・64）に到達することだけを固定する。配線後は
-//! `REACHED_NEXT_LAYER` の期待値を推論結果へ更新する。
+//! 推論本体（全件一致）は `infer_qwen2_parity.rs`（#626）の範囲で、本ファイルの正常形はガードを通過して
+//! 次の層（`tokenizer.json` の記録ハッシュ照合。合成の最小 ONNX・ダミーのハッシュのため 64）に到達する
+//! ことだけを固定する。
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 const MIN_ONNX: [u8; 9] = [0x08, 0x07, 0x3a, 0x05, 0x62, 0x03, 0x0a, 0x01, 0x78];
 const CANARY: &str = "CANARY_SECRET";
 const DEFINITION: &str = r#"{"schema":"fandhe-edge-model-definition/v1","name":"q","version":1,"judgment_type":"single_select","options":[{"id":"positive","display_name":"p","description":"d"},{"id":"negative","display_name":"n","description":"d"}],"io":{"input":"bytes"}}"#;
-const REACHED_NEXT_LAYER: &str =
-    "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n";
+/// `tokenizer_sha256` はダミー（0 埋め）なので、`tokenizer.json` の記録ハッシュ照合は必ず不一致になる。
+const REACHED_NEXT_LAYER: &str = "{\"code\":\"invalid_input\",\"message\":\"package tokenizer does not match its recorded hash\"}\n";
 
 fn err(code: &str, message: &str) -> String {
     format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
@@ -48,7 +48,7 @@ impl Pkg {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("p")).expect("mkdir");
         let meta = format!(
-            r#"{{"kind":{kind},"kind_version":{version},"label_order":["positive","negative"],"max_bytes":512,"onnx_file":"{onnx_file}","onnx_sha256":"{sha}","input_representation":"tokenizer","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{z}","external_data":[{{"location":"weights-00000.bin","size_bytes":4,"sha256":"{z}"}}],"scoring":{{"system_prompt":"x","choices":[{{"id":"positive","token_ids":[1]}},{{"id":"negative","token_ids":[2]}}]}}}}"#,
+            r#"{{"kind":{kind},"kind_version":{version},"label_order":["positive","negative"],"max_bytes":512,"onnx_file":"{onnx_file}","onnx_sha256":"{sha}","config":{{"max_seq_length":512}},"input_representation":"tokenizer","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{z}","external_data":[{{"location":"weights-00000.bin","size_bytes":4,"sha256":"{z}"}}],"scoring":{{"system_prompt":"x","choices":[{{"id":"positive","token_ids":[1]}},{{"id":"negative","token_ids":[2]}}]}}}}"#,
             z = "0".repeat(64)
         );
         fs::write(base.join("p/artifact.json"), meta).expect("meta");
