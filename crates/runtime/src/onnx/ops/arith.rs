@@ -25,8 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::{
-    MAX_RANK, OpError, Tensor, advance_index, broadcast_map2, broadcast_shape, broadcast_strides,
-    element_count,
+    MAX_RANK, OpError, Tensor, broadcast_map2, broadcast_shape, broadcast_strides, element_count,
 };
 
 /// BFLOAT16（u16 のビット列）を f32 へ。上位 16 bit へ置くだけで正確（丸めなし）。
@@ -137,9 +136,8 @@ fn run_workers(
             .collect();
         run();
         // 短絡せず全件 join する（panic したスレッドがあっても残りを待つ）
-        handles
-            .into_iter()
-            .fold(true, |ok, h| h.join().is_ok() && ok)
+        let joined: Vec<bool> = handles.into_iter().map(|h| h.join().is_ok()).collect();
+        joined.iter().all(|&ok| ok)
     });
     if let Some(e) = first_err.into_inner().ok().flatten() {
         return Err(e);
@@ -154,8 +152,9 @@ fn run_workers(
 ///
 /// 各出力要素は k の昇順の f32 加算（i-k-j のループ順でも要素ごとの加算順は変わらない）。
 /// 出力の行（バッチ × m）を連続した範囲でスレッドに静的に割り当てる。1 つの出力要素の加算を
-/// 複数スレッドに分けないので、結果はスレッド数に依存しない（REQ-28）。期限検査は出力行ごと、
-/// k × n が大きいときは行の中でも k の 64 ステップごと（REQ-39）。
+/// 複数スレッドに分けないので、結果はスレッド数に依存しない（REQ-28）。期限と停止フラグの検査は
+/// 出力行ごと、および行の中でも高々 [`MATMUL_CHECK_MACS`] 積和ごと（REQ-39）。
+/// バッチごとのオフセットは行から都度求め、バッチ数に比例する表を確保しない（REQ-39）。
 pub fn matmul(
     a: &Tensor<f32>,
     b: &Tensor<f32>,
@@ -206,18 +205,6 @@ fn matmul_with(
         .iter()
         .map(|s| s * b_mat)
         .collect();
-    // バッチごとの A・B の先頭オフセット（出力行 → バッチの対応をスレッドから引くため先に求める）
-    let mut offsets = Vec::with_capacity(nbatch);
-    let mut idx = vec![0usize; rank];
-    for _ in 0..nbatch {
-        let (mut oa, mut ob) = (0usize, 0usize);
-        for (d, &i) in idx.iter().enumerate() {
-            oa += i * ra.get(d).copied().unwrap_or(0);
-            ob += i * rb.get(d).copied().unwrap_or(0);
-        }
-        offsets.push((oa, ob));
-        advance_index(&mut idx, &batch);
-    }
     let rows = nbatch * m;
     let threads = threads.map_or_else(
         || worker_count(total.saturating_mul(k), rows),
@@ -242,28 +229,65 @@ fn matmul_with(
                 }
                 check_deadline(until)?;
                 let (bi, mi) = ((row0 + r) / m, (row0 + r) % m);
-                let (oa, ob) = offsets.get(bi).copied().ok_or(OpError::ShapeMismatch)?;
+                let (oa, ob) = batch_offsets(bi, &batch, &ra, &rb);
                 let arow = a
                     .data()
                     .get(oa + mi * k..oa + (mi + 1) * k)
                     .ok_or(OpError::ShapeMismatch)?;
                 let bm = b.data().get(ob..ob + b_mat).ok_or(OpError::ShapeMismatch)?;
-                for (kk, (&av, brow)) in arow.iter().zip(bm.chunks_exact(n)).enumerate() {
-                    if kk % 64 == 0 && b_mat >= MATMUL_ROW_CHECK_MIN {
-                        check_deadline(until)?;
-                    }
-                    for (o, &bv) in orow.iter_mut().zip(brow) {
-                        *o += av * bv;
+                // 列を MATMUL_COL_CHUNK ごとに分け、k 方向は列幅に応じた歩幅で検査する（検査 1 回あたりの
+                // 積和を n にも k にも依らず有界にする）。要素ごとの加算順（k 昇順）は変わらない
+                for (ci, ocols) in orow.chunks_mut(MATMUL_COL_CHUNK).enumerate() {
+                    let col0 = ci * MATMUL_COL_CHUNK;
+                    let kstep = matmul_check_step(ocols.len());
+                    let mut left = kstep;
+                    for (&av, brow) in arow.iter().zip(bm.chunks_exact(n)) {
+                        if left == 0 {
+                            if stop.load(Ordering::Relaxed) {
+                                return Ok(());
+                            }
+                            check_deadline(until)?;
+                            left = kstep;
+                        }
+                        left -= 1;
+                        let bcols = brow
+                            .get(col0..col0 + ocols.len())
+                            .ok_or(OpError::ShapeMismatch)?;
+                        for (o, &bv) in ocols.iter_mut().zip(bcols) {
+                            *o += av * bv;
+                        }
                     }
                 }
             }
         }
     })?;
+    check_deadline(until)?;
     Tensor::new(out_shape, out)
 }
 
-/// k × n がこれ以上なら MatMul は行の中でも期限を検査する（1 行が長くなる形状向け）。
-const MATMUL_ROW_CHECK_MIN: usize = 1 << 16;
+/// バッチの線形添字 `bi` に対応する A・B の先頭オフセット。表を持たず行ごとに求める（REQ-39）。
+/// `batch` の各次元は呼び出し側で 1 以上（出力が空でない）と分かっているが、0 でも割らない。
+fn batch_offsets(mut bi: usize, batch: &[usize], ra: &[usize], rb: &[usize]) -> (usize, usize) {
+    let (mut oa, mut ob) = (0usize, 0usize);
+    for ((&d, &sa), &sb) in batch.iter().zip(ra).zip(rb).rev() {
+        let d = d.max(1);
+        let i = bi % d;
+        bi /= d;
+        oa += i * sa;
+        ob += i * sb;
+    }
+    (oa, ob)
+}
+
+/// MatMul の期限・停止フラグの検査 1 回あたりの積和回数の上限（REQ-39）。
+const MATMUL_CHECK_MACS: usize = 1 << 18;
+/// MatMul が出力行を列方向に分ける幅。1 行が長くても検査間隔を [`MATMUL_CHECK_MACS`] に収める。
+const MATMUL_COL_CHUNK: usize = 1 << 16;
+
+/// 列幅 `cols`（1〜[`MATMUL_COL_CHUNK`]）に対する k 方向の検査歩幅。`cols × 歩幅 ≤ MATMUL_CHECK_MACS`。
+fn matmul_check_step(cols: usize) -> usize {
+    (MATMUL_CHECK_MACS / cols.max(1)).max(1)
+}
 
 /// 期限を過ぎていれば [`OpError::DeadlineExceeded`]。積和ループが行またはブロックごとに呼ぶ。
 fn check_deadline(until: Option<Instant>) -> Result<(), OpError> {
@@ -283,13 +307,35 @@ const GEMM_LANES: usize = 4;
 const GEMM_NB: usize = 16;
 /// W のブロックを使い回す A の行数（この行数分の A を L2 に留めたまま W のブロックを再走査する）。
 const GEMM_M_CHUNK: usize = 32;
+/// k 方向のブロック幅（[`GEMM_LANES`] の倍数）。W の展開領域を `GEMM_NR × GEMM_KB` に有界にし、
+/// 期限・停止フラグの検査間隔を高々 `GEMM_M_CHUNK × GEMM_NR × GEMM_KB` 積和（約 13 万）にする（REQ-39）。
+const GEMM_KB: usize = 1024;
 // [`gemm_tile`] の zip は A・W の 4 行ずつを明示的に並べているので、タイル幅を変えるならそこも直す
 const _: () = assert!(GEMM_MR == 4 && GEMM_NR == 4);
+const _: () = assert!(GEMM_KB.is_multiple_of(GEMM_LANES) && GEMM_NB.is_multiple_of(GEMM_NR));
+const _: () = assert!(GEMM_M_CHUNK.is_multiple_of(GEMM_MR));
+
+/// タイル 1 枚の累積器（出力要素ごとに lane 別の部分和）。k のブロックをまたいで持ち越す。
+type GemmAcc = [[[f32; GEMM_LANES]; GEMM_NR]; GEMM_MR];
+
+/// Gemm がカーネル内で確保する一時領域の上界（バイト）。worker ごとの W の展開領域（heap）と
+/// 累積器・書き戻し用バッファ（stack）× 最大スレッド数。形状に依らない定数で、scoring の
+/// 確保前検査が出力の見積もりに足す（REQ-39）。
+pub fn gemm_temp_bytes() -> usize {
+    let per_worker = (GEMM_NR * GEMM_KB
+        + GEMM_M_CHUNK * GEMM_NB
+        + (GEMM_M_CHUNK / GEMM_MR) * GEMM_MR * GEMM_NR * GEMM_LANES)
+        * std::mem::size_of::<f32>();
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .saturating_mul(per_worker)
+}
 
 /// `s`（長さ < GEMM_LANES。k の端数）を配列の先頭へ。残りの lane は 0。
 ///
-/// 不変条件: [`gemm_tile`] が全行の長さ == k を検証したうえで `as_chunks` の余りを渡すので、
-/// 長さは常に `k % GEMM_LANES`。可変長のコピーは memcpy 呼び出しになり積和の自動ベクトル化を
+/// 不変条件: [`gemm_tile`] が全行の長さ == kl を検証したうえで `as_chunks` の余りを渡すので、
+/// 長さは常に `kl % GEMM_LANES`。可変長のコピーは memcpy 呼び出しになり積和の自動ベクトル化を
 /// 妨げるので、本体ループとは分けて端数の 1 ステップだけで使う。
 #[inline(always)]
 fn gemm_load_tail(s: &[f32]) -> [f32; GEMM_LANES] {
@@ -307,7 +353,7 @@ fn gemm_load_tail(s: &[f32]) -> [f32; GEMM_LANES] {
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
 fn gemm_fma(
-    acc: &mut [[[f32; GEMM_LANES]; GEMM_NR]; GEMM_MR],
+    acc: &mut GemmAcc,
     av: &[[f32; GEMM_LANES]; GEMM_MR],
     wv: &[[f32; GEMM_LANES]; GEMM_NR],
 ) {
@@ -320,22 +366,25 @@ fn gemm_fma(
     }
 }
 
-/// [`GEMM_MR`] 行 × [`GEMM_NR`] 行のタイルの内積（各行の長さは `k`）。
+/// [`GEMM_MR`] 行 × [`GEMM_NR`] 行のタイルの内積を k のブロック（各行の長さ `kl`）ぶん `acc` に積む。
 ///
 /// 加算順（固定・スレッド数に依存しない。REQ-28）: 出力要素ごとに k を `k mod GEMM_LANES` で
-/// lane に分け、lane 内は k 昇順で f32 累積し、最後に lane 0 から順に足す。
+/// lane に分け、lane 内は k 昇順で f32 累積する（ブロックの先頭は lane の倍数なので、ブロックを
+/// またいでも lane の割り当ては変わらない）。lane の合算は全ブロックの後に [`gemm_fold`] が行う。
 #[inline(always)]
 fn gemm_tile(
+    acc: &mut GemmAcc,
     a: [&[f32]; GEMM_MR],
     w: [&[f32]; GEMM_NR],
-    k: usize,
-) -> Result<[[f32; GEMM_NR]; GEMM_MR], OpError> {
-    // 以降のロードの不変条件（全行の長さ == k）をここで 1 度だけ検証する
-    if a.iter().chain(&w).any(|r| r.len() != k) {
+    kl: usize,
+) -> Result<(), OpError> {
+    // 以降のロードの不変条件（全行の長さ == kl）をここで 1 度だけ検証する
+    if a.iter().chain(&w).any(|r| r.len() != kl) {
         return Err(OpError::ShapeMismatch);
     }
-    let mut acc = [[[0f32; GEMM_LANES]; GEMM_NR]; GEMM_MR];
-    // 各行を lane 幅の固定長チャンクと端数に分け、8 本を zip で同時に進める。長さは上で全行 == k と
+    // 累積器はブロックの間だけローカルに写してレジスタに乗せる（参照経由だと遅い。gemm_fma の注記）
+    let mut local = *acc;
+    // 各行を lane 幅の固定長チャンクと端数に分け、8 本を zip で同時に進める。長さは上で全行 == kl と
     // 検証済みなので zip の打ち切りは起きない。ロードに Option・境界検査を挟むと（#629 のレビュー後の
     // 版で）積和が約 2.4 倍遅くなったため、本体ループは分岐を持たない形にする
     let (ac, at): ([&[[f32; GEMM_LANES]]; GEMM_MR], [&[f32]; GEMM_MR]) = {
@@ -356,26 +405,34 @@ fn gemm_tile(
         .zip(wc[2])
         .zip(wc[3]);
     for (((((((a0, a1), a2), a3), w0), w1), w2), w3) in steps {
-        gemm_fma(&mut acc, &[*a0, *a1, *a2, *a3], &[*w0, *w1, *w2, *w3]);
+        gemm_fma(&mut local, &[*a0, *a1, *a2, *a3], &[*w0, *w1, *w2, *w3]);
     }
     if !at[0].is_empty() {
         let av = at.map(gemm_load_tail);
         let wv = wt.map(gemm_load_tail);
-        gemm_fma(&mut acc, &av, &wv);
+        gemm_fma(&mut local, &av, &wv);
     }
+    *acc = local;
+    Ok(())
+}
+
+/// 累積器の lane を lane 0 から順に足して出力要素にする（[`gemm_tile`] の加算順の最終段）。
+fn gemm_fold(acc: &GemmAcc) -> [[f32; GEMM_NR]; GEMM_MR] {
     let mut out = [[0f32; GEMM_NR]; GEMM_MR];
-    for (oi, acc_i) in out.iter_mut().zip(&acc) {
+    for (oi, acc_i) in out.iter_mut().zip(acc) {
         for (o, lanes) in oi.iter_mut().zip(acc_i) {
             *o = lanes.iter().fold(0.0, |s, &v| s + v);
         }
     }
-    Ok(out)
+    out
 }
 
-/// Gemm の仕事の単位: W の行 `n0..n1`（高々 [`GEMM_NB`] 行）× A の全行。結果は `[m][n1-n0]` の行優先。
+/// Gemm の仕事の単位: W の行 `n0..n1`（高々 [`GEMM_NB`] 行）× A の全行を `out`（`[m][n]` 行優先）へ書く。
 ///
-/// W のブロック（[`GEMM_NR`] 行）を `scratch` に f32 で 1 度だけ展開し、[`GEMM_M_CHUNK`] 行分の A と
-/// 突き合わせる（bf16→f32 の展開を A の行で共用し、W の再走査を m のチャンク単位にする）。
+/// A の [`GEMM_M_CHUNK`] 行 × W の [`GEMM_NR`] 行ごとに、k を [`GEMM_KB`] のブロックで進める:
+/// ブロックの W を `scratch` に f32 で展開し（bf16→f32 の展開を A の行で共用）、各タイルの累積器に
+/// 積む。ブロックごとに期限と `stop` を検査する。結果は A のチャンクごとに固定長のバッファへ畳み、
+/// `out` のロックの下で書き戻す（出力以外に m×n の領域を持たない。REQ-39）。
 #[allow(clippy::too_many_arguments)]
 fn gemm_item<W: Copy>(
     a: &[f32],
@@ -383,45 +440,62 @@ fn gemm_item<W: Copy>(
     k: usize,
     w: &[W],
     c: Option<&[f32]>,
+    n: usize,
     n0: usize,
     n1: usize,
     to_f32: &impl Fn(W) -> f32,
-    scratch: &mut Vec<f32>,
+    scratch: &mut [f32],
+    out: &Mutex<Vec<f32>>,
     until: Option<Instant>,
-) -> Result<Vec<f32>, OpError> {
+    stop: &AtomicBool,
+) -> Result<(), OpError> {
     let len = n1 - n0;
-    let mut res = vec![0.0f32; m * len];
-    scratch.clear();
-    scratch.resize(GEMM_NR * k, 0.0);
+    let mut res = [0.0f32; GEMM_M_CHUNK * GEMM_NB];
+    let mut accs: [GemmAcc; GEMM_M_CHUNK / GEMM_MR];
     for mc in (0..m).step_by(GEMM_M_CHUNK) {
-        check_deadline(until)?;
         let mend = (mc + GEMM_M_CHUNK).min(m);
         for nb in (n0..n1).step_by(GEMM_NR) {
             let nend = (nb + GEMM_NR).min(n1);
-            // タイルの端で W の行が足りない分は最後の行を重ねて計算し、書き戻さない（分岐を増やさない）
-            for j in 0..GEMM_NR {
-                let ni = (nb + j).min(nend - 1);
-                let src = w.get(ni * k..(ni + 1) * k).ok_or(OpError::ShapeMismatch)?;
-                let dst = scratch
-                    .get_mut(j * k..(j + 1) * k)
-                    .ok_or(OpError::ShapeMismatch)?;
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = to_f32(s);
+            accs = [[[[0.0f32; GEMM_LANES]; GEMM_NR]; GEMM_MR]; GEMM_M_CHUNK / GEMM_MR];
+            for kb in (0..k).step_by(GEMM_KB) {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                check_deadline(until)?;
+                let kend = (kb + GEMM_KB).min(k);
+                let kl = kend - kb;
+                // タイルの端で W の行が足りない分は最後の行を重ねて計算し、書き戻さない（分岐を増やさない）
+                for j in 0..GEMM_NR {
+                    let ni = (nb + j).min(nend - 1);
+                    let src = w
+                        .get(ni * k + kb..ni * k + kend)
+                        .ok_or(OpError::ShapeMismatch)?;
+                    let dst = scratch
+                        .get_mut(j * kl..(j + 1) * kl)
+                        .ok_or(OpError::ShapeMismatch)?;
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = to_f32(s);
+                    }
+                }
+                let mut wr: [&[f32]; GEMM_NR] = [&[]; GEMM_NR];
+                for (j, r) in wr.iter_mut().enumerate() {
+                    *r = scratch
+                        .get(j * kl..(j + 1) * kl)
+                        .ok_or(OpError::ShapeMismatch)?;
+                }
+                for (acc, mb) in accs.iter_mut().zip((mc..mend).step_by(GEMM_MR)) {
+                    let mut ar: [&[f32]; GEMM_MR] = [&[]; GEMM_MR];
+                    for (i, r) in ar.iter_mut().enumerate() {
+                        let mi = (mb + i).min(mend - 1);
+                        *r = a
+                            .get(mi * k + kb..mi * k + kend)
+                            .ok_or(OpError::ShapeMismatch)?;
+                    }
+                    gemm_tile(acc, ar, wr, kl)?;
                 }
             }
-            let mut wr: [&[f32]; GEMM_NR] = [&[]; GEMM_NR];
-            for (j, r) in wr.iter_mut().enumerate() {
-                *r = scratch
-                    .get(j * k..(j + 1) * k)
-                    .ok_or(OpError::ShapeMismatch)?;
-            }
-            for mb in (mc..mend).step_by(GEMM_MR) {
-                let mut ar: [&[f32]; GEMM_MR] = [&[]; GEMM_MR];
-                for (i, r) in ar.iter_mut().enumerate() {
-                    let mi = (mb + i).min(mend - 1);
-                    *r = a.get(mi * k..(mi + 1) * k).ok_or(OpError::ShapeMismatch)?;
-                }
-                let t = gemm_tile(ar, wr, k)?;
+            for (acc, mb) in accs.iter().zip((mc..mend).step_by(GEMM_MR)) {
+                let t = gemm_fold(acc);
                 for (i, ti) in t.iter().enumerate().take(mend - mb) {
                     for (j, &v) in ti.iter().enumerate().take(nend - nb) {
                         // bias 無しのときは何も足さず、タイルの値をそのまま書く
@@ -429,14 +503,23 @@ fn gemm_item<W: Copy>(
                             Some(c) => v + c.get(nb + j).copied().ok_or(OpError::ShapeMismatch)?,
                             None => v,
                         };
-                        *res.get_mut((mb + i) * len + (nb - n0) + j)
+                        *res.get_mut((mb - mc + i) * len + (nb - n0) + j)
                             .ok_or(OpError::ShapeMismatch)? = v;
                     }
                 }
             }
         }
+        let mut o = out.lock().map_err(|_| OpError::LimitExceeded)?;
+        for mi in mc..mend {
+            o.get_mut(mi * n + n0..mi * n + n1)
+                .ok_or(OpError::ShapeMismatch)?
+                .copy_from_slice(
+                    res.get((mi - mc) * len..(mi - mc + 1) * len)
+                        .ok_or(OpError::ShapeMismatch)?,
+                );
+        }
     }
-    Ok(res)
+    Ok(())
 }
 
 /// Gemm（transA=0・transB=1・alpha=1・beta=1 固定）。`A[M,K] × W[N,K]ᵀ (+ C[N])`。
@@ -444,11 +527,12 @@ fn gemm_item<W: Copy>(
 /// 重みは元の型 `W` のまま受け、`to_f32` でブロックごとに展開する（全体を f32 へ複製しない。
 /// bf16 なら [`bf16_to_f32`]）。`out[m][n] = Σ_k a[m,k]*w[n,k]` を求めてから `c[n]` を足す。
 ///
-/// 加算順は [`gemm_tile`] の固定順（lane 別に k 昇順 → lane 順）で、スレッド数・分配順に依存しない
-/// （REQ-28。k 昇順の逐次加算とは丸めが異なりうるが決定的）。W の行を [`GEMM_NB`] 行ずつの単位に
-/// 切ってスレッドへ動的に配り、1 つの出力要素は 1 つのスレッドだけが計算する。
-/// 期限検査は単位ごと、および単位の中の A の [`GEMM_M_CHUNK`] 行ごと（REQ-39。1 検査あたり高々
-/// 16 × 32 × K 積和。Qwen2 1.5B の実形状〔K ≤ 8960〕では ms 程度で、K が極端に大きい形状では伸びる）。
+/// 加算順は [`gemm_tile`] の固定順（lane 別に k 昇順 → lane 順）で、スレッド数・分配順・k の
+/// ブロック幅に依存しない（REQ-28。k 昇順の逐次加算とは丸めが異なりうるが決定的）。W の行を
+/// [`GEMM_NB`] 行ずつの単位に切ってスレッドへ動的に配り、1 つの出力要素は 1 つのスレッドだけが計算する。
+/// 期限と停止フラグ（他の worker のエラー）の検査は k の [`GEMM_KB`] ブロックごとで、1 検査あたり
+/// 高々 `GEMM_M_CHUNK × GEMM_NR × GEMM_KB` 積和（形状に依らない。REQ-39）。一時領域は worker ごとの
+/// 定数（[`gemm_temp_bytes`]）で、出力のほかに m×n の領域を持たない。
 pub fn gemm_trans_b<W: Copy + Sync>(
     a: &Tensor<f32>,
     w: &Tensor<W>,
@@ -496,51 +580,43 @@ fn gemm_trans_b_with<W: Copy + Sync>(
         |t| t.min(nitems).max(1),
     );
     let next = AtomicUsize::new(0);
-    let slots: Mutex<Vec<Vec<f32>>> = Mutex::new((0..nitems).map(|_| Vec::new()).collect());
+    let done = AtomicUsize::new(0);
+    // 出力は 1 つだけ確保し、各単位が自分の列範囲をロックの下で書く（単位の結果を別に溜めない）
+    let out: Mutex<Vec<f32>> = Mutex::new(vec![0.0f32; total]);
     let c = c.map(Tensor::data);
     run_workers(threads, |stop| {
-        let mut scratch = Vec::new();
+        let mut scratch = vec![0.0f32; GEMM_NR * GEMM_KB];
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= nitems || stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            check_deadline(until)?;
             let n0 = i * GEMM_NB;
             let n1 = (n0 + GEMM_NB).min(n);
-            let r = gemm_item(
+            gemm_item(
                 a.data(),
                 m,
                 k,
                 w.data(),
                 c,
+                n,
                 n0,
                 n1,
                 &to_f32,
                 &mut scratch,
+                &out,
                 until,
+                stop,
             )?;
-            let mut s = slots.lock().map_err(|_| OpError::LimitExceeded)?;
-            *s.get_mut(i).ok_or(OpError::ShapeMismatch)? = r;
+            done.fetch_add(1, Ordering::Relaxed);
         }
     })?;
-    let slots = slots.into_inner().map_err(|_| OpError::LimitExceeded)?;
-    // ゼロ初期化の確保は未書き込みのページを実メモリに載せないので、単位の結果を 1 件ずつ
-    // 書き戻して drop すれば、出力と全単位の結果が同時に常駐する 2 倍ピークにならない
-    let mut out = vec![0.0f32; total];
-    for (i, r) in slots.into_iter().enumerate() {
-        let n0 = i * GEMM_NB;
-        let len = (n0 + GEMM_NB).min(n) - n0;
-        if r.len() != m * len {
-            // 未計算の単位（全単位が計算済みなら起きない）を 0 のまま成功として返さない
-            return Err(OpError::ShapeMismatch);
-        }
-        for (mi, src) in r.chunks_exact(len).enumerate() {
-            out.get_mut(mi * n + n0..mi * n + n0 + len)
-                .ok_or(OpError::ShapeMismatch)?
-                .copy_from_slice(src);
-        }
+    check_deadline(until)?;
+    // 未計算の単位（全 worker が正常終了したなら起きない）を 0 のまま成功として返さない
+    if done.load(Ordering::Relaxed) != nitems {
+        return Err(OpError::ShapeMismatch);
     }
+    let out = out.into_inner().map_err(|_| OpError::LimitExceeded)?;
     Tensor::new(vec![m, n], out)
 }
 
@@ -889,6 +965,106 @@ mod tests {
             let r = matmul_with(Some(th), &a, &b, None).unwrap();
             assert_eq!(bits(&r), bits(&base), "threads={th}");
         }
+    }
+
+    /// 1 つの worker のエラーで停止フラグが立ち、他の worker が仕事を残したまま早期に抜ける（REQ-39・#630）。
+    #[test]
+    fn req39_run_workers_stop_flag_halts_other_workers() {
+        let claimed = AtomicUsize::new(0);
+        let r = run_workers(3, |stop| {
+            if claimed.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(OpError::DeadlineExceeded);
+            }
+            // 停止フラグが立つまで待つ。立たなければ（伝播が壊れていれば）10 秒で別のエラーにして失敗させる
+            let t0 = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                if t0.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err(OpError::LimitExceeded);
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        });
+        assert_eq!(r, Err(OpError::DeadlineExceeded));
+    }
+
+    /// Gemm は k のブロックごとに期限を検査する。W の展開（`to_f32`）で最初のブロックの間に期限を
+    /// 跨がせると、次のブロックの前で止まり、展開の回数は 1 ブロック分（GEMM_NR × GEMM_KB）に留まる。
+    /// 検査が A のチャンクごと（k に比例）だと 4 ブロック分を展開し切ってしまう（REQ-39・#630）。
+    #[test]
+    fn req39_gemm_checks_deadline_per_k_block() {
+        let k = 4 * GEMM_KB;
+        let a = t(&[4, k], vec![1.0; 4 * k]);
+        let w = t(&[4, k], vec![1.0; 4 * k]);
+        let calls = AtomicUsize::new(0);
+        let to_f32 = |v: f32| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            v
+        };
+        let until = Instant::now().checked_add(std::time::Duration::from_millis(5));
+        assert_eq!(
+            gemm_trans_b_with(Some(1), &a, &w, None, to_f32, until),
+            Err(OpError::DeadlineExceeded)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), GEMM_NR * GEMM_KB);
+    }
+
+    /// 最後の計算区間で期限を跨いでも、結果を返す直前の検査で期限超過にする（REQ-39・#630）。
+    #[test]
+    fn req39_gemm_checks_deadline_before_returning() {
+        let a = t(&[1, 1], vec![1.0]);
+        let w = t(&[1, 1], vec![1.0]);
+        let to_f32 = |v: f32| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            v
+        };
+        let until = Instant::now().checked_add(std::time::Duration::from_millis(5));
+        assert_eq!(
+            gemm_trans_b(&a, &w, None, to_f32, until),
+            Err(OpError::DeadlineExceeded)
+        );
+    }
+
+    /// MatMul の行内の検査歩幅は列幅に依らず 1 検査あたり MATMUL_CHECK_MACS 積和以下（REQ-39・#630）。
+    #[test]
+    fn req39_matmul_check_step_is_bounded() {
+        for cols in [1usize, 2, 3, 64, 1000, 1 << 15, MATMUL_COL_CHUNK] {
+            let step = matmul_check_step(cols);
+            assert!(step >= 1, "cols={cols}");
+            assert!(step * cols <= MATMUL_CHECK_MACS, "cols={cols} step={step}");
+        }
+        assert_eq!(matmul_check_step(1), MATMUL_CHECK_MACS);
+        assert_eq!(matmul_check_step(MATMUL_COL_CHUNK), 4);
+    }
+
+    /// MatMul はバッチ数に比例する表を確保しない。バッチ 2^22（旧実装なら 64 MiB のオフセット表）でも
+    /// 最初の行の検査で止まる（REQ-39・#630）。出力は calloc で未使用ページを実メモリに載せない。
+    #[test]
+    fn req39_matmul_huge_batch_has_no_offset_table() {
+        let a = Tensor::new(vec![1 << 22, 1, 0], Vec::<f32>::new()).unwrap();
+        let b = Tensor::new(vec![0, 1], Vec::<f32>::new()).unwrap();
+        let past = Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        assert_eq!(
+            matmul_with(Some(1), &a, &b, past),
+            Err(OpError::DeadlineExceeded)
+        );
+        // 都度計算のオフセットがブロードキャストを正しく辿ることは
+        // req41_matmul_2d_and_batch_broadcast・req28_matmul_parallel_matches_naive で照合する
+        assert_eq!(batch_offsets(5, &[2, 3], &[0, 4], &[12, 0]), (2 * 4, 12));
+    }
+
+    /// Gemm の一時領域は形状（特に K）に依らない定数で、2 GiB の保持上限に対して無視できる大きさ（REQ-39・#630）。
+    #[test]
+    fn req39_gemm_temp_bytes_is_shape_independent_constant() {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let per = (GEMM_NR * GEMM_KB + GEMM_M_CHUNK * GEMM_NB + (GEMM_M_CHUNK / GEMM_MR) * 64) * 4;
+        assert_eq!(gemm_temp_bytes(), threads * per);
+        assert!(per < 1 << 16);
+        assert_eq!(gemm_temp_bytes(), gemm_temp_bytes());
     }
 
     #[test]
