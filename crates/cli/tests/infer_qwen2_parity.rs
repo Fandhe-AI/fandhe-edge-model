@@ -254,3 +254,65 @@ fn req41_tokenizer_with_c3_kind_is_rejected() {
         "{\"code\":\"invalid_input\",\"message\":\"format rejected: format_not_allowed\"}\n"
     );
 }
+
+/// 入力 `text` の prompt 長 + 最長の選択肢のトークン数（採点前の長さ検査の左辺。学習側の
+/// `predict_records` の `len(ids) + longest` と同じ定義）。
+fn required_len(ws: &Path, text: &str) -> usize {
+    let meta = fs::read(ws.join("p/artifact.json")).expect("meta");
+    let refs = fandhe_edge_core::artifact_meta::TokenizerPackageRefs::parse(&meta).expect("refs");
+    let sha = refs.tokenizer_sha256.parse().expect("sha");
+    let spec = fandhe_edge_runtime::tokenizer::TokenizerSpec::load_path(
+        &ws.join("p").join(&refs.tokenizer_file),
+        &sha,
+    )
+    .expect("tokenizer");
+    let ids = spec
+        .build_chat_ids(&refs.system_prompt, text, None)
+        .expect("ids");
+    ids.len() + refs.longest_choice_tokens
+}
+
+fn set_max_seq_length(ws: &Path, n: usize) {
+    let path = ws.join("p/artifact.json");
+    let meta = fs::read_to_string(&path).expect("meta");
+    let key = "\"max_seq_length\": ";
+    let start = meta
+        .find(key)
+        .map(|i| i + key.len())
+        .expect("fixture の整形形式が想定と違う: max_seq_length");
+    let len = meta[start..]
+        .find(',')
+        .expect("fixture の整形形式が想定と違う: max_seq_length の後");
+    let edited = format!("{}{n}{}", &meta[..start], &meta[start + len..]);
+    fs::write(&path, edited).expect("meta");
+}
+
+/// REQ-41・REQ-39: prompt + 最長の選択肢が `config.max_seq_length` ちょうどなら通り、1 超えると採点前に
+/// `limit_exceeded`（20）。境界は学習側 `predict_records`（`len(ids) + longest > max_seq_length` で
+/// `limit_exceeded`・等しければ通す）と同一。単体と `--input-file` の両方で効く。
+#[test]
+fn req41_max_seq_length_boundary_matches_training_side() {
+    let text = "red3 red0 sky3 red1";
+    for file_mode in [false, true] {
+        let (ws, _) = workspace(if file_mode { "seqf" } else { "seqs" });
+        let need = required_len(&ws, text);
+        fs::write(
+            ws.join("in.jsonl"),
+            format!("{{\"id\":\"a\",\"input\":\"{text}\"}}\n"),
+        )
+        .expect("jsonl");
+        let args: Vec<&str> = if file_mode {
+            vec!["--input-file", "in.jsonl"]
+        } else {
+            vec!["--text", text]
+        };
+        set_max_seq_length(&ws, need);
+        let (code, out) = infer(&ws, &args);
+        assert_eq!(code, Some(0), "file_mode={file_mode}: {out}");
+        set_max_seq_length(&ws, need - 1);
+        let (code, out) = infer(&ws, &args);
+        assert_eq!(code, Some(20), "file_mode={file_mode}: {out}");
+        assert!(out.contains("limit_exceeded"), "{out}");
+        let _ = fs::remove_dir_all(&ws);
+    }
+}

@@ -624,8 +624,11 @@ fn build_qwen2_pipeline(
     }
     let spec = TokenizerSpec::from_bytes(&tok_bytes)
         .map_err(|_| invalid("tokenizer file cannot be loaded"))?;
+    // prompt + 最長の選択肢が `config.max_seq_length` を超える入力は採点前に `limit_exceeded`（20）で
+    // 拒否する。学習側 `predict_records` と同じ定義（等しければ通す。REQ-41・#626）。
     let pre = TokenizerPreprocessor::new(spec, refs.system_prompt)
-        .ok_or_else(|| invalid("package system prompt is too long"))?;
+        .ok_or_else(|| invalid("package system prompt is too long"))?
+        .with_sequence_limit(refs.max_seq_length, refs.longest_choice_tokens);
 
     let mut shards = Vec::with_capacity(refs.external_data.len());
     for e in &refs.external_data {

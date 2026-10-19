@@ -197,7 +197,15 @@ pub struct TokenizerPackageRefs {
     pub tokenizer_sha256: String,
     pub external_data: Vec<ExternalDataRef>,
     pub system_prompt: String,
+    /// 学習時の `config.max_seq_length`（prompt + 最長の選択肢のトークン数の上限。採点前に照合する）。
+    pub max_seq_length: usize,
+    /// `scoring.choices[].token_ids` のうち最長のトークン数（1 以上）。
+    pub longest_choice_tokens: usize,
 }
+
+/// `max_seq_length` の範囲（学習ワーカーの `limits.py` の `MIN_LORA_SEQ_LENGTH`・`MAX_LORA_SEQ_LENGTH` と同値）。
+const MIN_MAX_SEQ_LENGTH: u64 = 8;
+const MAX_MAX_SEQ_LENGTH: u64 = 4096;
 
 /// `external_data` の最大件数（ガード層の分割ファイル数上限と同値）。
 const MAX_EXTERNAL_DATA_REFS: usize = 256;
@@ -211,6 +219,17 @@ struct RawExternalRef {
 #[derive(Deserialize)]
 struct RawScoring {
     system_prompt: String,
+    choices: Vec<RawChoice>,
+}
+
+#[derive(Deserialize)]
+struct RawChoice {
+    token_ids: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawTokenizerConfig {
+    max_seq_length: u64,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +238,7 @@ struct RawTokenizerRefs {
     tokenizer_sha256: String,
     external_data: Vec<RawExternalRef>,
     scoring: RawScoring,
+    config: RawTokenizerConfig,
 }
 
 impl TokenizerPackageRefs {
@@ -235,10 +255,24 @@ impl TokenizerPackageRefs {
                 .external_data
                 .iter()
                 .all(|e| !e.location.is_empty() && is_hex64(&e.sha256));
-        if !ok {
+        // 空の選択肢は学習側が拒否する（`not body`）ため、ここでも不正とする。
+        let longest = raw
+            .scoring
+            .choices
+            .iter()
+            .map(|c| c.token_ids.len())
+            .min()
+            .and(raw.scoring.choices.iter().map(|c| c.token_ids.len()).max());
+        let any_empty = raw.scoring.choices.iter().any(|c| c.token_ids.is_empty());
+        let seq_ok = (MIN_MAX_SEQ_LENGTH..=MAX_MAX_SEQ_LENGTH).contains(&raw.config.max_seq_length);
+        let (true, true, false, Some(longest)) = (ok, seq_ok, any_empty, longest) else {
             return Err(ArtifactMetaError::Malformed);
-        }
+        };
+        let max_seq_length =
+            usize::try_from(raw.config.max_seq_length).map_err(|_| ArtifactMetaError::Malformed)?;
         Ok(Self {
+            max_seq_length,
+            longest_choice_tokens: longest,
             tokenizer_file: raw.tokenizer_file,
             tokenizer_sha256: raw.tokenizer_sha256,
             external_data: raw
@@ -1092,7 +1126,8 @@ mod tests {
             "tokenizer_file": "tokenizer.json",
             "tokenizer_sha256": h,
             "external_data": [{"location": "weights-00000.bin", "sha256": h}],
-            "scoring": {"system_prompt": "p"},
+            "scoring": {"system_prompt": "p", "choices": [{"id": "a", "token_ids": [1]}, {"id": "b", "token_ids": [1, 2, 3]}]},
+            "config": {"max_seq_length": 700},
         });
         patch(&mut v);
         serde_json::to_vec(&v).expect("json")
@@ -1107,6 +1142,7 @@ mod tests {
         assert_eq!(r.external_data.len(), 1);
         assert_eq!(r.external_data[0].location, "weights-00000.bin");
         assert_eq!(r.system_prompt, "p");
+        assert_eq!((r.max_seq_length, r.longest_choice_tokens), (700, 3));
     }
 
     /// REQ-41・REQ-39・#626: 欠落・型違い・不正な sha256・件数の過不足は `Malformed`（fail-closed）。
@@ -1131,6 +1167,36 @@ mod tests {
                 Box::new(|v| {
                     v.as_object_mut().unwrap().remove("external_data");
                 }),
+            ),
+            (
+                "no config",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("config");
+                }),
+            ),
+            (
+                "seq type",
+                Box::new(|v| v["config"]["max_seq_length"] = serde_json::json!("700")),
+            ),
+            (
+                "seq zero",
+                Box::new(|v| v["config"]["max_seq_length"] = serde_json::json!(0)),
+            ),
+            (
+                "seq below min",
+                Box::new(|v| v["config"]["max_seq_length"] = serde_json::json!(7)),
+            ),
+            (
+                "seq too big",
+                Box::new(|v| v["config"]["max_seq_length"] = serde_json::json!(4097)),
+            ),
+            (
+                "no choices",
+                Box::new(|v| v["scoring"]["choices"] = serde_json::json!([])),
+            ),
+            (
+                "empty choice",
+                Box::new(|v| v["scoring"]["choices"][0]["token_ids"] = serde_json::json!([])),
             ),
             (
                 "file type",

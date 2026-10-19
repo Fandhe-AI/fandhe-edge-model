@@ -46,7 +46,7 @@ use fandhe_edge_guard::kind::KindRejection;
 use fandhe_edge_guard::kind_version::KindVersionRejection;
 use fandhe_edge_guard::path::PathRejection;
 use fandhe_edge_guard::resource::{GuardRunError, ResourceKind, ResourceLimitExceeded};
-use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError};
+use fandhe_edge_runtime::pipeline::{BackendError, BatchError, InferError, PreprocessError};
 use fandhe_edge_train::error::{TrainProcessError, TrainRequestError, TrainResultError};
 use fandhe_edge_train::job_record::JobRecordError;
 use fandhe_edge_train::result::TrainOutcome;
@@ -301,6 +301,8 @@ impl ToErrorReport for InferError {
             | InferError::TooManyScores { .. } => ExitCode::LimitExceeded,
             // 1 件の計算時間上限（REQ-39）は `DeadlineExceeded` と同じく `limit_exceeded`（REQ-21）。
             InferError::Backend(BackendError::TimeLimitExceeded) => ExitCode::LimitExceeded,
+            // 入力が `max_seq_length` を超える（採点前に拒否。学習側の予測と同じ。REQ-41・#626）。
+            InferError::Preprocess(PreprocessError::SequenceTooLong) => ExitCode::LimitExceeded,
             InferError::Preprocess(_) | InferError::Backend(_) | InferError::InvalidScores => {
                 ExitCode::RuntimeError
             }
@@ -752,6 +754,14 @@ mod tests {
             ),
             (InferError::Backend(BackendError::Failed), runtime.clone()),
             (InferError::InvalidScores, runtime.clone()),
+            (
+                InferError::Preprocess(PreprocessError::SequenceTooLong),
+                limit.clone(),
+            ),
+            (
+                InferError::Preprocess(PreprocessError::Failed),
+                runtime.clone(),
+            ),
         ];
         for (error, expected) in infer_cases {
             assert_eq!(error.to_error_report(), expected);

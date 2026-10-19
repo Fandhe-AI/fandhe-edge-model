@@ -110,6 +110,8 @@ impl Preprocessor for ByteEncodingPreprocessor {
 pub struct TokenizerPreprocessor {
     spec: TokenizerSpec,
     system_prompt: String,
+    /// `(max_seq_length, 最長の選択肢のトークン数)`。あれば prompt 長との合計を検査する。
+    sequence_limit: Option<(usize, usize)>,
 }
 
 impl TokenizerPreprocessor {
@@ -119,7 +121,17 @@ impl TokenizerPreprocessor {
         (system_prompt.len() <= MAX_ENCODE_BYTES).then_some(Self {
             spec,
             system_prompt,
+            sequence_limit: None,
         })
+    }
+
+    /// 採点前の長さ検査を有効にする（REQ-41・REQ-39・#626）。学習側の予測
+    /// （`qwen2_lora.py` の `predict_records`）と同じ定義で、prompt のトークン数 + 最長の選択肢の
+    /// トークン数が `max_seq_length` を**超えたら**拒否する（ちょうど等しいなら通す）。
+    #[must_use]
+    pub fn with_sequence_limit(mut self, max_seq_length: usize, longest_choice: usize) -> Self {
+        self.sequence_limit = Some((max_seq_length, longest_choice));
+        self
     }
 }
 
@@ -129,6 +141,11 @@ impl Preprocessor for TokenizerPreprocessor {
             .spec
             .build_chat_ids(&self.system_prompt, input, None)
             .map_err(|_| PreprocessError::Failed)?;
+        if let Some((max, longest)) = self.sequence_limit
+            && ids.len().saturating_add(longest) > max
+        {
+            return Err(PreprocessError::SequenceTooLong);
+        }
         Ok(TokenIds::new(ids.into_iter().map(i64::from).collect()))
     }
 }

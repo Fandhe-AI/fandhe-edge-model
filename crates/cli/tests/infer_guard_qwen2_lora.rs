@@ -48,7 +48,7 @@ impl Pkg {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("p")).expect("mkdir");
         let meta = format!(
-            r#"{{"kind":{kind},"kind_version":{version},"label_order":["positive","negative"],"max_bytes":512,"onnx_file":"{onnx_file}","onnx_sha256":"{sha}","input_representation":"tokenizer","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{z}","external_data":[{{"location":"weights-00000.bin","size_bytes":4,"sha256":"{z}"}}],"scoring":{{"system_prompt":"x","choices":[{{"id":"positive","token_ids":[1]}},{{"id":"negative","token_ids":[2]}}]}}}}"#,
+            r#"{{"kind":{kind},"kind_version":{version},"label_order":["positive","negative"],"max_bytes":512,"onnx_file":"{onnx_file}","onnx_sha256":"{sha}","config":{{"max_seq_length":512}},"input_representation":"tokenizer","tokenizer_file":"tokenizer.json","tokenizer_sha256":"{z}","external_data":[{{"location":"weights-00000.bin","size_bytes":4,"sha256":"{z}"}}],"scoring":{{"system_prompt":"x","choices":[{{"id":"positive","token_ids":[1]}},{{"id":"negative","token_ids":[2]}}]}}}}"#,
             z = "0".repeat(64)
         );
         fs::write(base.join("p/artifact.json"), meta).expect("meta");

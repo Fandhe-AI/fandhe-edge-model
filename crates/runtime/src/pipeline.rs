@@ -127,6 +127,9 @@ pub trait ScoringBackend {
 pub enum PreprocessError {
     /// 前処理を実行できない。
     Failed,
+    /// 前処理後の系列が、パッケージの上限（`max_seq_length`）に選択肢の長さを足すと収まらない
+    /// （トークナイザー前処理。採点前に拒否する。REQ-41・REQ-39）。
+    SequenceTooLong,
 }
 
 impl PreprocessError {
@@ -134,6 +137,7 @@ impl PreprocessError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Failed => "preprocess_failed",
+            Self::SequenceTooLong => "sequence_too_long",
         }
     }
 }
