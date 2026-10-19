@@ -15,7 +15,30 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from tools.poc26 import qwen2_model
 from tools.poc26.qwen2_model import Attention, Qwen2Model
+from tools.poc26.safe_io import LimitExceededError
+
+
+def _check_kv_memory(model: Qwen2Model, prefix_len: int, b: int, w: int, *, chunk: bool) -> None:
+    """KV 再利用の同時保持量を確保前に見積もり、上限超過を拒否する（REQ-39）。
+
+    共通: `forward_bytes(b, w, with_logits=False)`（パラメータ・注意スコア・活性）＋全層の
+    キャッシュ（batch 1・長さ prefix_len。prefix は作る側、chunk は保持中）。
+    chunk はさらに 1 層分の broadcast・連結後 K/V（b×(prefix_len+w)）と、プレフィックスまで
+    広がった注意スコア・マスクを足す。最後の logits は `project` が判定する。
+    """
+    c = model.config
+    size = model.model.embed_tokens.weight.dtype.size
+    kv_row = c.num_key_value_heads * c.head_dim * size  # K または V の 1 token 分
+    need = model.forward_bytes(b, w, with_mask=False, with_logits=False)
+    need += c.num_hidden_layers * 2 * kv_row * prefix_len
+    if chunk:
+        total = prefix_len + w
+        need += 2 * b * kv_row * total
+        need += b * c.num_attention_heads * w * total * max(4, size) + w * total
+    if need > qwen2_model.MAX_MODEL_MEMORY_BYTES:
+        raise LimitExceededError("kv reuse would exceed the memory limit")
 
 
 def _attend(
@@ -42,6 +65,7 @@ def prefix_states(
     """プレフィックスを batch 1 で forward し、各層の (K, V) と末尾の隠れ状態 `[1, H]` を返す。"""
     ids = mx.array(np.array([prompt_ids], dtype=np.int32))
     model._check_input(ids, None, with_logits=False)
+    _check_kv_memory(model, len(prompt_ids), 1, len(prompt_ids), chunk=False)
     inner = model.model
     h = inner.embed_tokens(ids)
     cache = []
@@ -73,6 +97,7 @@ def score_chunk_kv(
         seqs[i, : len(c)] = c
     ids = mx.array(seqs)
     model._check_input(ids, None, with_logits=False)
+    _check_kv_memory(model, prefix_len, k, w, chunk=True)
     causal = mx.tril(mx.ones((w, w), dtype=mx.bool_))
     mask = mx.concatenate([mx.ones((w, prefix_len), dtype=mx.bool_), causal], axis=1)
     inner = model.model

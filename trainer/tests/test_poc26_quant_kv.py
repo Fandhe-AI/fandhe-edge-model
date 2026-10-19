@@ -16,8 +16,8 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
-from tools.poc26 import synthetic
-from tools.poc26.kv_reuse import score_labels_kv
+from tools.poc26 import qwen2_model, synthetic
+from tools.poc26.kv_reuse import prefix_states, score_chunk_kv, score_labels_kv
 from tools.poc26.lora_poc import main
 from tools.poc26.qwen2_model import (
     LoRALinear,
@@ -28,6 +28,7 @@ from tools.poc26.qwen2_model import (
     lora_delta,
     quantize_model,
 )
+from tools.poc26.safe_io import LimitExceededError
 from tools.poc26.score import score_labels
 
 from test_poc26_lora_poc import _predict_argv, make_data, make_dir, train_args
@@ -68,6 +69,39 @@ def test_kv_reuse_matches_full_forward(tmp_path: Path, tie: bool) -> None:
     assert got.shape == (10,)
     np.testing.assert_allclose(got, ref, atol=1e-4)
     np.testing.assert_allclose(score_labels_kv(m, prompt, labels, 262, 3), ref, atol=1e-4)
+
+
+def test_kv_memory_limit_rejects_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: キャッシュ込み・連結 K/V 込みの見積もりが上限超過なら確保前に拒否し、通常は通る。"""
+    m = _model(tmp_path)
+    p, k, w = 11, 4, 3
+    prompt = list(range(p))
+    labels = [[1, 2, 3]] * k
+    # 通常の上限: 通る
+    cache, h_last = prefix_states(m, prompt)
+    mx.eval([x for kv in cache for x in kv], h_last)
+    assert score_chunk_kv(m, cache, h_last, p, labels, 262).shape == (k,)
+    # forward 見積もり（キャッシュ抜き）は通るがキャッシュ込みで超える上限 → prefix_states が拒否
+    base = m.forward_bytes(1, p, with_mask=False, with_logits=False)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", base)
+    m._check_input(mx.array([prompt]), None, with_logits=False)  # 既存検査は通る
+    with pytest.raises(LimitExceededError):
+        prefix_states(m, prompt)
+    # プレフィックス（キャッシュ込み）は通り、チャンクの連結 K/V 分で超える上限 → chunk が拒否
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", 8 << 30)
+    c = m.config
+    kv_row = c.num_key_value_heads * c.head_dim * m.model.embed_tokens.weight.dtype.size
+    chunk_need = (
+        m.forward_bytes(k, w, with_mask=False, with_logits=False)
+        + c.num_hidden_layers * 2 * kv_row * p
+        + 2 * k * kv_row * (p + w)
+    )
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", chunk_need)
+    prefix_states(m, prompt)  # プレフィックスは通る
+    with pytest.raises(LimitExceededError):
+        score_chunk_kv(m, cache, h_last, p, labels, 262)
 
 
 def test_fuse_lora_equals_lora_forward(tmp_path: Path) -> None:
