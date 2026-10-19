@@ -18,6 +18,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -495,7 +496,7 @@ def apply_lora(
             for o, names in _LORA_TARGETS
         )
     )
-    current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+    current = param_bytes(model)
     if current + added > MAX_MODEL_MEMORY_BYTES:
         raise LimitExceededError("LoRA matrices would exceed the memory limit")
     model.freeze()
@@ -514,25 +515,60 @@ def lora_delta(lin: LoRALinear) -> mx.array:
     return lin.scale * (lin.lora_a @ lin.lora_b).T
 
 
+def param_bytes(model: nn.Module) -> int:
+    """現在のパラメータの総バイト数（実 dtype。量子化後は packed 重みと scales / biases）。"""
+    return sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+
+
+def check_work_memory(model: nn.Module, work: int, what: str) -> None:
+    """現在のパラメータ + 1 行列分の作業領域が上限を超えるなら確保前に拒否する。
+
+    上限は `MAX_MODEL_MEMORY_BYTES`。統合・量子化は 1 行列ずつ評価して前の配列を手放すため、
+    ピークは「現在のモデル全体 + 最大 1 行列」で押さえられる（REQ-39）。
+    上限は呼び出し時に参照する（`--max-memory-bytes` の上書きに追従）。
+    """
+    if param_bytes(model) + work > MAX_MODEL_MEMORY_BYTES:
+        raise LimitExceededError(f"{what} would exceed the memory limit")
+
+
+def _lora_targets(model: Qwen2Model) -> list[tuple[Any, str, LoRALinear]]:
+    return [
+        (parent, name, lin)
+        for block in model.model.layers
+        for owner, names in _LORA_TARGETS
+        for parent in (getattr(block, owner),)
+        for name in names
+        if isinstance(lin := getattr(parent, name), LoRALinear)
+    ]
+
+
 def fuse_lora(model: Qwen2Model) -> None:
     """各 LoRALinear を `W + scale*(A@B).T` を統合した `nn.Linear` に置き換える（REQ-41）。
 
     統合は float32 で行い、base の dtype へ戻す。bias は base のものを引き継ぐ。量子化の前に呼ぶ。
+    メモリは全行列分を先に一括で見積もり（超過は変更前に `LimitExceededError`）、1 行列ずつ評価して
+    base 重みと LoRA 行列を手放す。作業領域は float32 の W・A@B・scale 倍・和と統合結果。
     """
-    for block in model.model.layers:
-        for owner, names in _LORA_TARGETS:
-            parent = getattr(block, owner)
-            for name in names:
-                lin = getattr(parent, name)
-                if not isinstance(lin, LoRALinear):
-                    continue
-                base = lin.linear
-                w = base.weight.astype(mx.float32) + lora_delta(lin)
-                new = nn.Linear(w.shape[1], w.shape[0], bias="bias" in base)
-                new.weight = w.astype(base.weight.dtype)
-                if "bias" in base:
-                    new.bias = base.bias
-                setattr(parent, name, new)
+    targets = _lora_targets(model)
+    work = max(
+        (
+            n * (4 * 4 + lin.linear.weight.dtype.size)
+            for _, _, lin in targets
+            for n in (lin.linear.weight.size,)
+        ),
+        default=0,
+    )
+    check_work_memory(model, work, "LoRA fusion")
+    for parent, name, lin in targets:
+        base = lin.linear
+        w = base.weight.astype(mx.float32) + lora_delta(lin)
+        new = nn.Linear(w.shape[1], w.shape[0], bias="bias" in base)
+        new.weight = w.astype(base.weight.dtype)
+        if "bias" in base:
+            new.bias = base.bias
+        mx.eval(new.weight)
+        setattr(parent, name, new)
+        del w, lin, base
     mx.eval(model.parameters())
 
 
@@ -540,11 +576,29 @@ QUANT_GROUP_SIZE = 64
 QUANT_BITS = 4
 
 
+def _quantized_bytes(m: nn.Module, group_size: int, bits: int) -> int:
+    """量子化後の packed 重み + scales + biases のバイト数（scales / biases は元の dtype）。"""
+    n = m.weight.size
+    return n * bits // 8 + 2 * (n // group_size) * m.weight.dtype.size
+
+
 def quantize_model(
     model: Qwen2Model, group_size: int = QUANT_GROUP_SIZE, bits: int = QUANT_BITS
 ) -> None:
-    """Linear と Embedding を量子化する（mlx_lm の既定と同じ範囲。tie の as_linear も量子化後）。"""
-    nn.quantize(model, group_size=group_size, bits=bits)
+    """Linear と Embedding を量子化する（mlx_lm の既定と同じ範囲。tie の as_linear も量子化後）。
+
+    全体の見積もり（現在のモデル + 最大 1 行列の出力）を先に確認し、超過は変更前に拒否する。
+    1 行列ずつ量子化・評価して元の重みを手放す（ピーク＝モデル全体 + 1 行列分）。
+    """
+    paths = [k for k, m in model.named_modules() if hasattr(m, "to_quantized")]
+    mods = dict(model.named_modules())
+    work = max((_quantized_bytes(mods[k], group_size, bits) for k in paths), default=0)
+    check_work_memory(model, work, "quantization")
+    for k in paths:
+        nn.quantize(
+            model, group_size=group_size, bits=bits, class_predicate=lambda p, _, k=k: p == k
+        )
+        mx.eval(dict(model.named_modules())[k].parameters())
     mx.eval(model.parameters())
 
 

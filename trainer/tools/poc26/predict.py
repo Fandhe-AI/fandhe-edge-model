@@ -46,7 +46,9 @@ from tools.poc26.qwen2_model import (
     QUANT_GROUP_SIZE,
     Qwen2Model,
     apply_lora,
+    check_work_memory,
     fuse_lora,
+    param_bytes,
     quantize_model,
 )
 from tools.poc26.score import build_prompting, prepare_prompts, score_records
@@ -84,6 +86,8 @@ def attach_adapter(model: Qwen2Model, cfg: dict, weights: dict[str, mx.array]) -
 
 def quantized_weights_bytes(model: Qwen2Model) -> bytes:
     """量子化後の全パラメータを safetensors のバイト列にする（一時ファイル経由。保存後に消す）。"""
+    # read_bytes がファイル相当のバイト列を確保するため、総量をもう 1 つ分見積もる（REQ-39）。
+    check_work_memory(model, param_bytes(model), "quantized weights serialization")
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "w.safetensors"
         mx.save_safetensors(str(path), dict(tree_flatten(model.parameters())))

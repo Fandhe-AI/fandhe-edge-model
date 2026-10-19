@@ -26,7 +26,8 @@ def _check_kv_memory(model: Qwen2Model, prefix_len: int, b: int, w: int, *, chun
     共通: `forward_bytes(b, w, with_logits=False)`（パラメータ・注意スコア・活性）＋全層の
     キャッシュ（batch 1・長さ prefix_len。prefix は作る側、chunk は保持中）。
     chunk はさらに 1 層分の broadcast・連結後 K/V（b×(prefix_len+w)）と、プレフィックスまで
-    広がった注意スコア・マスクを足す。最後の logits は `project` が判定する。
+    広がった注意スコア・マスク、末尾で作る `flat`・`hv`（各 b×w 行）を足す。
+    最後の logits は `project` が判定する。
     """
     c = model.config
     size = model.model.embed_tokens.weight.dtype.size
@@ -37,6 +38,7 @@ def _check_kv_memory(model: Qwen2Model, prefix_len: int, b: int, w: int, *, chun
         total = prefix_len + w
         need += 2 * b * kv_row * total
         need += b * c.num_attention_heads * w * total * max(4, size) + w * total
+        need += 2 * (b * w + 1) * c.hidden_size * size  # 連結後の `flat` と gather した `hv`
     if need > qwen2_model.MAX_MODEL_MEMORY_BYTES:
         raise LimitExceededError("kv reuse would exceed the memory limit")
 
