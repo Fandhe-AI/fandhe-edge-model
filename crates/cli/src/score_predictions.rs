@@ -43,7 +43,8 @@
 //! `train --train-seed` → `select` → `evaluate` を行う。採点は原本プロジェクト 1 か所だけで行い、比較相手は
 //! 複製側の `candidates/<N>/evaluation_predictions.jsonl` を読むだけ（複製を開かず、書かない）。
 //! 追補 3（TASK-41.11-3）: `P15KV`・`P15Q4`・`P15Q4KV` は P 系。これらの採点では bf16 の基準 `P15` を
-//! `--reference P15=…` に取れる（Holm の族に入れず McNemar の生の値だけ。追補 3 の 7 節）。P15 は台帳を消費しない。
+//! `--reference P15=…` に取れる（Holm の族に入れず McNemar の生の値だけ。追補 3 の 7 節）。ただし同じ seed の台帳に
+//! P15 自身の採点記録があり、渡した予測の sha256 が一致するときだけ（未採点・不一致は拒否。REQ-27）。P15 reference は台帳へ記録しない。
 //! `--reference AR` の経路は残すが、AR は 7 工程から学習・評価できないため PoC-26 では欠測になる。
 //!
 //! # 1 回限りの担保（REQ-27）
@@ -757,8 +758,13 @@ fn check_ledger<'a>(
     let mut to_write = Vec::new();
     for l in loaded {
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
-            // P15 を参照にするだけの採点は台帳を消費しない（P15 自身の採点対象としての適用を塞がない。追補 3）。
-            None if l.role == Role::Reference && l.named.name == "P15" => {}
+            // P15 は来歴照合の対象外のため、参照に取れるのは P15 自身の採点記録があり sha256 が一致するときだけ
+            // （比較相手の差し替えを許さない。REQ-27）。P15 を台帳へ新規記録はしない。
+            None if l.role == Role::Reference && l.named.name == "P15" => {
+                return Err(invalid(
+                    "--reference P15 requires P15 to be scored first for this seed",
+                ));
+            }
             None => {
                 to_write.push(l);
             }
