@@ -238,6 +238,11 @@ fn matmul_with(
                 // 列を MATMUL_COL_CHUNK ごとに分け、k 方向は列幅に応じた歩幅で検査する（検査 1 回あたりの
                 // 積和を n にも k にも依らず有界にする）。要素ごとの加算順（k 昇順）は変わらない
                 for (ci, ocols) in orow.chunks_mut(MATMUL_COL_CHUNK).enumerate() {
+                    // 列チャンクの開始ごとにも検査する（K が小さく n が大きいと k ループの検査が走らない。REQ-39）
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    check_deadline(until)?;
                     let col0 = ci * MATMUL_COL_CHUNK;
                     let kstep = matmul_check_step(ocols.len());
                     let mut left = kstep;
@@ -291,10 +296,24 @@ fn matmul_check_step(cols: usize) -> usize {
 
 /// 期限を過ぎていれば [`OpError::DeadlineExceeded`]。積和ループが行またはブロックごとに呼ぶ。
 fn check_deadline(until: Option<Instant>) -> Result<(), OpError> {
+    // テスト専用: 検査の呼び出し回数を数え、指定回数を超えたら期限超過にする（実時間に依らず検査位置を観測する）
+    #[cfg(test)]
+    if let Some(left) = TEST_CHECKS_LEFT.get() {
+        if left == 0 {
+            return Err(OpError::DeadlineExceeded);
+        }
+        TEST_CHECKS_LEFT.set(Some(left - 1));
+    }
     match until {
         Some(t) if Instant::now() > t => Err(OpError::DeadlineExceeded),
         _ => Ok(()),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: `Some(n)` なら [`check_deadline`] の n 回の呼び出しの後で期限超過にする。
+    static TEST_CHECKS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Gemm のタイル: A の行数。
@@ -453,6 +472,11 @@ fn gemm_item<W: Copy>(
     let mut res = [0.0f32; GEMM_M_CHUNK * GEMM_NB];
     let mut accs: [GemmAcc; GEMM_M_CHUNK / GEMM_MR];
     for mc in (0..m).step_by(GEMM_M_CHUNK) {
+        // k = 0 だと k ブロックの検査が走らないので、m チャンクの開始ごとにも検査する（REQ-39）
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        check_deadline(until)?;
         let mend = (mc + GEMM_M_CHUNK).min(m);
         for nb in (n0..n1).step_by(GEMM_NR) {
             let nend = (nb + GEMM_NR).min(n1);
@@ -641,6 +665,32 @@ mod tests {
             gemm_trans_b(&a, &w, None, |v: f32| v, past),
             Err(OpError::DeadlineExceeded)
         );
+    }
+
+    /// K=0 の Gemm でも m チャンクごとに期限を検査する（REQ-39）。m チャンク 3 つで 1 回目だけ通る設定にし、
+    /// 2 つ目のチャンクの開始で止まること（検査が無いと最後の検査まで全出力を書き戻す）。
+    #[test]
+    fn req39_gemm_k0_checks_deadline_per_m_chunk() {
+        let m = 3 * GEMM_M_CHUNK;
+        let a = t(&[m, 0], Vec::new());
+        let w = t(&[4, 0], Vec::new());
+        TEST_CHECKS_LEFT.set(Some(1));
+        let r = gemm_trans_b_with(Some(1), &a, &w, None, |v: f32| v, None);
+        TEST_CHECKS_LEFT.set(None);
+        assert_eq!(r, Err(OpError::DeadlineExceeded));
+    }
+
+    /// K が小さく n が大きい MatMul でも列チャンクごとに期限を検査する（REQ-39）。行の検査と
+    /// 1 つ目の列チャンクだけ通る設定にし、2 つ目の列チャンクの開始で止まること。
+    #[test]
+    fn req39_matmul_small_k_checks_deadline_per_col_chunk() {
+        let n = 3 * MATMUL_COL_CHUNK;
+        let a = t(&[1, 4], vec![1.0; 4]);
+        let b = t(&[4, n], vec![1.0; 4 * n]);
+        TEST_CHECKS_LEFT.set(Some(2));
+        let r = matmul_with(Some(1), &a, &b, None);
+        TEST_CHECKS_LEFT.set(None);
+        assert_eq!(r, Err(OpError::DeadlineExceeded));
     }
 
     #[test]
