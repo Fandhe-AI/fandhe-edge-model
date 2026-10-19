@@ -903,11 +903,11 @@ fn req27_roles_are_restricted_by_preregistration() {
     );
     env.fails(
         &args(&["--candidate", "P=p.jsonl", "--reference", "C1=p.jsonl"]),
-        "--reference accepts only AR",
+        "--reference accepts only AR (or P15 for P15KV, P15Q4, P15Q4KV)",
     );
     env.fails(
         &args(&["--candidate", "C1=p.jsonl", "--compare", "C3=p.jsonl"]),
-        "--compare and --reference require a P-family candidate (P, P15, P7)",
+        "--compare and --reference require a P-family candidate (P, P15, P7, P15KV, P15Q4, P15Q4KV)",
     );
     assert!(!env.work.join("proj/poc26_score_ledger").exists());
 }
@@ -1027,4 +1027,93 @@ fn req41_p_family_cannot_compare_with_p_family_and_unlisted_names_are_rejected()
             "name is not in the preregistered list",
         );
     }
+}
+
+/// REQ-27・REQ-41・追補 3: P15 reference は P15 の採点記録（同一 sha256）があるときだけ受理し、
+/// Holm の族に入れず McNemar の生の値だけを出す。P15 reference は台帳を新規記録しない。
+#[test]
+fn req41_quant_kv_candidates_accept_recorded_p15_reference_outside_holm() {
+    let env = Env::new("quant_kv");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.write("p15.jsonl", &pred_jsonl(pred_a));
+    env.ok(&args(&["--candidate", "P15=p15.jsonl"]));
+    for name in ["P15KV", "P15Q4", "P15Q4KV"] {
+        let out = env.ok(&args(&[
+            "--candidate",
+            &format!("{name}=p.jsonl"),
+            "--reference",
+            "P15=p15.jsonl",
+        ]));
+        assert!(
+            out.contains(&format!("\"holm\":{{\"candidate\":\"{name}\",\"m\":3,")),
+            "{out}"
+        );
+        assert_eq!(out.matches("\"against\":").count(), 2, "{out}");
+        assert!(
+            out.contains(&format!(
+                "\"references\":[{{\"candidate\":\"{name}\",\"against\":\"P15\","
+            )),
+            "{out}"
+        );
+    }
+}
+
+/// REQ-27・REQ-41: P15 未採点の `--reference P15` は拒否し、採点対象の台帳を消費しない。
+#[test]
+fn req27_p15_reference_before_p15_scored_is_rejected_without_consuming_ledger() {
+    let env = Env::new("quant_kv_unscored");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.write("p15.jsonl", &pred_jsonl(pred_a));
+    let a = args(&[
+        "--candidate",
+        "P15KV=p.jsonl",
+        "--reference",
+        "P15=p15.jsonl",
+    ]);
+    env.fails(
+        &a,
+        "--reference P15 requires P15 to be scored first for this seed",
+    );
+    assert!(!ledger_file(&env, 0, "P15KV").exists());
+    assert!(!ledger_file(&env, 0, "P15").exists());
+    env.ok(&args(&["--candidate", "P15KV=p.jsonl"]));
+}
+
+/// REQ-27・REQ-41: P15 採点済みでも別内容の予測を P15 として渡すと拒否し、台帳を消費しない。
+#[test]
+fn req27_p15_reference_with_different_prediction_is_rejected_without_consuming_ledger() {
+    let env = Env::new("quant_kv_swapped");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    env.write("p15.jsonl", &pred_jsonl(pred_a));
+    env.ok(&args(&["--candidate", "P15=p15.jsonl"]));
+    let a = args(&["--candidate", "P15Q4=p.jsonl", "--reference", "P15=p.jsonl"]);
+    env.fails(
+        &a,
+        "prediction file differs from the one recorded for this name",
+    );
+    assert!(!ledger_file(&env, 0, "P15Q4").exists());
+}
+
+/// REQ-41・追補 3: P15 を reference に取れるのは P15KV・P15Q4・P15Q4KV の採点だけ。
+#[test]
+fn req41_p15_reference_is_rejected_for_other_candidates() {
+    let env = Env::new("quant_kv_reject");
+    env.write("p.jsonl", &pred_jsonl(pred_p));
+    let msg = "--reference accepts only AR (or P15 for P15KV, P15Q4, P15Q4KV)";
+    for cand in ["P", "P7", "P15", "C1"] {
+        env.fails(
+            &args(&["--candidate", &format!("{cand}=p.jsonl"), "--reference", "P15=p.jsonl"]),
+            if cand == "C1" {
+                "--compare and --reference require a P-family candidate (P, P15, P7, P15KV, P15Q4, P15Q4KV)"
+            } else if cand == "P15" {
+                "duplicate NAME"
+            } else {
+                msg
+            },
+        );
+    }
+    env.fails(
+        &args(&["--candidate", "P15KV=p.jsonl", "--reference", "P=p.jsonl"]),
+        msg,
+    );
 }

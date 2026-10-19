@@ -145,6 +145,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", type=Path, required=True)
     # 先頭 N 件を採点時間の統計から除く（#393 のウォームアップ。既定 0 は従来どおり）
     p.add_argument("--warmup", type=int, default=0)
+    # LoRA を統合してから 4bit 量子化する（#583）。既定 none は従来どおり
+    p.add_argument("--quantize", choices=("none", "4bit"), default="none")
+    # 共通プレフィックスの K/V を使い回して採点する（#583）。既定 off は従来どおり
+    p.add_argument("--kv-reuse", action="store_true")
     p.set_defaults(func=cmd_predict)
 
     # ONNX 書き出し可否の確認（#392）。MLX は常に CPU・float32 で動かす

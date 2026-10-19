@@ -18,6 +18,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -495,7 +496,7 @@ def apply_lora(
             for o, names in _LORA_TARGETS
         )
     )
-    current = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+    current = param_bytes(model)
     if current + added > MAX_MODEL_MEMORY_BYTES:
         raise LimitExceededError("LoRA matrices would exceed the memory limit")
     model.freeze()
@@ -507,6 +508,108 @@ def apply_lora(
             for name in names:
                 lora = LoRALinear(getattr(parent, name), rank, scale, dropout, next(keys))
                 setattr(parent, name, lora)
+
+
+def lora_delta(lin: LoRALinear) -> mx.array:
+    """統合の差分 `scale * (A @ B).T`（float32。base と同じ (out, in)）。ONNX 書き出しと共通。"""
+    return lin.scale * (lin.lora_a @ lin.lora_b).T
+
+
+def param_bytes(model: nn.Module) -> int:
+    """現在のパラメータの総バイト数（実 dtype。量子化後は packed 重みと scales / biases）。"""
+    return sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+
+
+def check_work_memory(model: nn.Module, work: int, what: str) -> None:
+    """現在のパラメータ + 1 行列分の作業領域が上限を超えるなら確保前に拒否する。
+
+    上限は `MAX_MODEL_MEMORY_BYTES`。統合・量子化は 1 行列ずつ評価して前の配列を手放すため、
+    ピークは「現在のモデル全体 + 最大 1 行列」で押さえられる（REQ-39）。
+    上限は呼び出し時に参照する（`--max-memory-bytes` の上書きに追従）。
+    """
+    if param_bytes(model) + work > MAX_MODEL_MEMORY_BYTES:
+        raise LimitExceededError(f"{what} would exceed the memory limit")
+
+
+def _lora_target_paths(model: Qwen2Model) -> list[tuple[Any, str]]:
+    """LoRALinear の置き場所（親モジュールと属性名）。置換対象のモジュール自体は保持しない。"""
+    return [
+        (parent, name)
+        for block in model.model.layers
+        for owner, names in _LORA_TARGETS
+        for parent in (getattr(block, owner),)
+        for name in names
+        if isinstance(getattr(parent, name), LoRALinear)
+    ]
+
+
+def _fuse_one(parent: Any, name: str) -> None:
+    """1 つの LoRALinear を統合済み `nn.Linear` に置き換える。ローカルは戻ると破棄される。"""
+    lin = getattr(parent, name)
+    base = lin.linear
+    w = base.weight.astype(mx.float32) + lora_delta(lin)
+    new = nn.Linear(w.shape[1], w.shape[0], bias="bias" in base)
+    new.weight = w.astype(base.weight.dtype)
+    if "bias" in base:
+        new.bias = base.bias
+    mx.eval(new.weight)
+    setattr(parent, name, new)
+
+
+def fuse_lora(model: Qwen2Model) -> None:
+    """各 LoRALinear を `W + scale*(A@B).T` を統合した `nn.Linear` に置き換える（REQ-41）。
+
+    統合は float32 で行い、base の dtype へ戻す。bias は base のものを引き継ぐ。量子化の前に呼ぶ。
+    メモリは変更前に「現在のパラメータ + 統合後の重み全体の累積 + 最大 1 行列の作業領域
+    （float32 の W・A@B・scale 倍・和と統合結果）」で見積もり、超過は `LimitExceededError`。
+    旧モジュールは参照を残さず手放すが、MLX の遅延評価・アロケータのキャッシュで即時に返らない
+    ことがあるため、安全側に統合後の重みを累積で数える（REQ-39）。
+    """
+    paths = _lora_target_paths(model)
+    sizes = [(w := getattr(p, n).linear.weight).size * w.dtype.size for p, n in paths]
+    work = max(
+        ((w := getattr(p, n).linear.weight).size * (4 * 4 + w.dtype.size) for p, n in paths),
+        default=0,
+    )
+    check_work_memory(model, sum(sizes) + work, "LoRA fusion")
+    for parent, name in paths:
+        _fuse_one(parent, name)
+    mx.eval(model.parameters())
+
+
+QUANT_GROUP_SIZE = 64
+QUANT_BITS = 4
+
+
+def _quantized_bytes(m: nn.Module, group_size: int, bits: int) -> int:
+    """量子化後の packed 重み + scales + biases のバイト数（scales / biases は元の dtype）。"""
+    n = m.weight.size
+    return n * bits // 8 + 2 * (n // group_size) * m.weight.dtype.size
+
+
+def _quantize_sizes(model: Qwen2Model, group_size: int, bits: int) -> tuple[list[str], list[int]]:
+    """量子化対象のパスと、各層の量子化後バイト数。モジュール参照は戻ると破棄される。"""
+    items = [(k, m) for k, m in model.named_modules() if hasattr(m, "to_quantized")]
+    return [k for k, _ in items], [_quantized_bytes(m, group_size, bits) for _, m in items]
+
+
+def quantize_model(
+    model: Qwen2Model, group_size: int = QUANT_GROUP_SIZE, bits: int = QUANT_BITS
+) -> None:
+    """Linear と Embedding を量子化する（mlx_lm の既定と同じ範囲。tie の as_linear も量子化後）。
+
+    見積もりは「現在のモデル + 量子化後の重み全体の累積 + 最大 1 行列の出力」で、変更前に確認し
+    超過は拒否する。1 行列ずつ量子化・評価して元の重みを手放すが、遅延評価・アロケータの
+    キャッシュで即時に返らないことがあるため、量子化後の重みは累積で数える（REQ-39）。
+    """
+    paths, sizes = _quantize_sizes(model, group_size, bits)
+    check_work_memory(model, sum(sizes) + max(sizes, default=0), "quantization")
+    for k in paths:
+        nn.quantize(
+            model, group_size=group_size, bits=bits, class_predicate=lambda p, _, k=k: p == k
+        )
+        mx.eval(dict(model.named_modules())[k].parameters())
+    mx.eval(model.parameters())
 
 
 def trainable_parameter_count(model: nn.Module) -> int:

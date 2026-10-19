@@ -9,6 +9,9 @@ max_seq_length を学習時の記録と照合し、重みは構造・形状・�
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
+from pathlib import Path
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -39,7 +42,14 @@ from tools.poc26.io_records import (
     read_adapter_config,
     write_scores,
 )
-from tools.poc26.qwen2_model import Qwen2Model, apply_lora
+from tools.poc26.qwen2_model import (
+    QUANT_BITS,
+    QUANT_GROUP_SIZE,
+    Qwen2Model,
+    apply_lora,
+    fuse_lora,
+    quantize_model,
+)
 from tools.poc26.score import build_prompting, prepare_prompts, score_records
 
 ADAPTER_DTYPES = (mx.float32, mx.bfloat16, mx.float16)
@@ -71,6 +81,21 @@ def attach_adapter(model: Qwen2Model, cfg: dict, weights: dict[str, mx.array]) -
         raise invalid("adapter weights are not finite")
     model.load_weights([(k, v.astype(mx.float32)) for k, v in weights.items()], strict=False)
     mx.eval(model.parameters())
+
+
+def save_quantized_weights(model: Qwen2Model, path: Path) -> tuple[int, str]:
+    """量子化後の全パラメータを `path` へ safetensors で保存し、(バイト数, sha256) を返す。
+
+    ファイル全体をメモリへ読まず、チャンクで sha256 を計算する（REQ-39）。
+    """
+    mx.save_safetensors(str(path), dict(tree_flatten(model.parameters())))
+    os.chmod(path, 0o600)  # OutputDir の他ファイルと同じ権限
+    h, n = hashlib.sha256(), 0
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+            n += len(chunk)
+    return n, h.hexdigest()
 
 
 def cmd_predict(a: argparse.Namespace) -> int:
@@ -120,25 +145,49 @@ def cmd_predict(a: argparse.Namespace) -> int:
     ):
         raise invalid("adapter was trained with a different config / tokenizer")
     attach_adapter(model, cfg, weights)
-    pred, raw, stats = score_records(
-        model, ctx, records, prompts, Budget(wall_limit=a.max_score_seconds), warmup=a.warmup
-    )
-    run = common_run(a, assets.hashes, sha, size, shards=model.shard_info)
-    run.update(
-        {
-            "definition_sha256": def_sha,
-            "input_data_sha256": in_sha,
-            "adapter_config": cfg,
-            "adapters_sha256": a.adapter_sha256,
-            "max_score_seconds": a.max_score_seconds,
-            "records": len(records),
-            "scoring": stats,
-            "elapsed_seconds": budget.elapsed(),
-            "max_rss_bytes": max_rss_bytes(),
-        }
-    )
     with OutputDir(a.out_dir) as out:
+        quant: tuple[int, str] | None = None
+        if a.quantize == "4bit":  # 統合が先、量子化が後（REQ-41・#583）
+            fuse_lora(model)
+            quantize_model(model)
+            # 出力用の一時ディレクトリへ直接保存し、バイト列は保持しない（採点中の常駐を避ける）
+            quant = save_quantized_weights(model, out.tmp / "quantized_weights.safetensors")
+        pred, raw, stats = score_records(
+            model,
+            ctx,
+            records,
+            prompts,
+            Budget(wall_limit=a.max_score_seconds),
+            warmup=a.warmup,
+            kv_reuse=a.kv_reuse,
+        )
+        run = common_run(a, assets.hashes, sha, size, shards=model.shard_info)
+        run.update(
+            {
+                "definition_sha256": def_sha,
+                "input_data_sha256": in_sha,
+                "adapter_config": cfg,
+                "adapters_sha256": a.adapter_sha256,
+                "max_score_seconds": a.max_score_seconds,
+                "records": len(records),
+                "scoring": stats,
+                "elapsed_seconds": budget.elapsed(),
+                "max_rss_bytes": max_rss_bytes(),
+            }
+        )
+        if a.kv_reuse:
+            run["kv_reuse"] = True
+        if quant is not None:
+            run["quantization"] = {
+                "bits": QUANT_BITS,
+                "group_size": QUANT_GROUP_SIZE,
+                "scope": "linear+embedding",
+                "order": "fuse_lora_then_quantize",
+                "weights_bytes": quant[0],
+                "weights_sha256": quant[1],
+            }
+        run["mlx_peak_memory_bytes"] = int(mx.get_peak_memory())  # 採点後のピークで上書き
         write_scores(out, pred, raw)
         out.write("run.json", json_text(run))
         out.commit()
-    return 0
+        return 0

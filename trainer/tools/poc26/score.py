@@ -28,6 +28,7 @@ from tools.poc26.common import (
     too_large,
 )
 from tools.poc26.io_records import Record
+from tools.poc26.kv_reuse import score_labels_kv
 from tools.poc26.qwen2_model import (
     Qwen2Model,
 )
@@ -212,6 +213,7 @@ def score_records(
     prompts: list[list[int]],
     budget: Budget,
     warmup: int = 0,
+    kv_reuse: bool = False,
 ) -> tuple[list[str], list[str], dict[str, Any]]:
     """各レコードを採点し、`pred.jsonl`・`raw_scores.jsonl` の行と採点時間の統計を返す。
 
@@ -230,7 +232,10 @@ def score_records(
     for rec, ids in zip(records, prompts, strict=True):
         budget.check()
         t0 = time.perf_counter()
-        loglik = score_labels(model, ids, ctx.label_ids, ctx.pad_id)
+        if kv_reuse:  # 共通プレフィックスの K/V を使い回す（REQ-41・#583）
+            loglik = score_labels_kv(model, ids, ctx.label_ids, ctx.pad_id, SCORE_CHUNK)
+        else:
+            loglik = score_labels(model, ids, ctx.label_ids, ctx.pad_id)
         secs.append(time.perf_counter() - t0)
         budget.check()  # forward の後にも確認する（最後の 1 件で超過しても 20）
         mapping = map_scores_to_choice(loglik, ctx.label_order, choice_ids)
@@ -259,4 +264,9 @@ def score_records(
         "choices_per_prompt": len(ctx.label_ids),  # 1 件あたりの選択肢数 K（26）
         "forward_chunk": SCORE_CHUNK,  # K を何件ずつ forward するか（合算は分割に依らない）
     }
+    if kv_reuse:  # 指定時だけ足す（既定の stats は従来と同一）
+        lens = [len(c) for c in ctx.label_ids]
+        stats["kv_reuse"] = True
+        stats["prefix_tokens_mean"] = sum(len(p) for p in prompts) / len(prompts)
+        stats["continuation_tokens_mean"] = sum(lens) / len(lens)
     return pred, raw, stats
