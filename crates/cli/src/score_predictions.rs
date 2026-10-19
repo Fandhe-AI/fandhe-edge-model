@@ -42,6 +42,8 @@
 //! `inspect` 済み）のプロジェクトを学習前に候補×seed ごとに複製し（C1×3・C3×3）、各複製で 1 候補だけ
 //! `train --train-seed` → `select` → `evaluate` を行う。採点は原本プロジェクト 1 か所だけで行い、比較相手は
 //! 複製側の `candidates/<N>/evaluation_predictions.jsonl` を読むだけ（複製を開かず、書かない）。
+//! 追補 3（TASK-41.11-3）: `P15KV`・`P15Q4`・`P15Q4KV` は P 系。これらの採点では bf16 の基準 `P15` を
+//! `--reference P15=…` に取れる（Holm の族に入れず McNemar の生の値だけ。追補 3 の 7 節）。P15 は台帳を消費しない。
 //! `--reference AR` の経路は残すが、AR は 7 工程から学習・評価できないため PoC-26 では欠測になる。
 //!
 //! # 1 回限りの担保（REQ-27）
@@ -56,13 +58,13 @@
 //!
 //! # 適用回数の機械的な制限（事前登録 4〜5 節）
 //!
-//! NAME は許可リスト {P, P15, P7, C1, C3, AR}（P15・P7 は追補 2）、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の
-//! sha256 単位に分ける。採点対象としての適用は 6 候補 × 3 seed = 最大 18 回に機械的に制限される。予測ファイルを作り直して
+//! NAME は許可リスト {P, P15, P7, P15KV, P15Q4, P15Q4KV, C1, C3, AR}（P15・P7 は追補 2、P15KV・P15Q4・P15Q4KV は追補 3）、`--seed` は {0, 1, 2} に限り、台帳は凍結 test の
+//! sha256 単位に分ける。採点対象としての適用は 9 候補 × 3 seed = 最大 27 回に機械的に制限される。予測ファイルを作り直して
 //! 同名・別 sha256 で出すと拒否し、別名は許可リストで塞ぐ。
 //! 別 NAME の予測が同じバイト列でも拒否しない（異なる候補が同じ予測を返す正当な比較がある。同じバイト列を
 //! 別 NAME で再採点しても新しい情報は得られず、C1・C3・AR は評価記録の来歴照合で束縛される）。
 //! `--reference` は最大 1 個、`--compare` は最大 2 個。役割も固定: `--compare` は C1・C3 のみ、
-//! `--reference` は AR のみで、どちらも `--candidate` が P 系（P・P15・P7）のときだけ許す（`--candidate` は 6 つの
+//! `--reference` は AR（採点対象が P15KV・P15Q4・P15Q4KV のときは P15 も）のみで、どちらも `--candidate` が P 系のときだけ許す（`--candidate` は 9 つの
 //! いずれでもよい）。P 系同士の比較は `--compare` の役割制約で拒否し、Holm の族は P 系の候補ごとに m=3 のまま。
 //! 台帳の確認から書き込みまでは `<evaluation_sha256>/seed-<n>/.lock` の排他ロック（`flock`。プロセス終了で
 //! 解放される）の中で行い、同時実行による二重適用を防ぐ。許可リスト外の候補を足すには、事前登録の追補と
@@ -157,10 +159,14 @@ const MAX_COMPARES: usize = FAMILY_SIZE - 1;
 /// P15・P7 は追補 2 の追加学習候補（REQ-41）。
 ///
 /// ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
-const ALLOWED_NAMES: [&str; 6] = ["P", "P15", "P7", "C1", "C3", "AR"];
+const ALLOWED_NAMES: [&str; 9] = [
+    "P", "P15", "P7", "P15KV", "P15Q4", "P15Q4KV", "C1", "C3", "AR",
+];
 /// P 系候補（追加学習候補）。`--compare`・`--reference` を付けられる唯一の系統で、`evaluate` の保存予測を
 /// 持たないため来歴照合の対象外（REQ-41・追補 2）。P 系の判定はここに集約する。
-const P_FAMILY: [&str; 3] = ["P", "P15", "P7"];
+const P_FAMILY: [&str; 6] = ["P", "P15", "P7", "P15KV", "P15Q4", "P15Q4KV"];
+/// 量子化・KV 圧縮の候補（追補 3。REQ-41・TASK-41.11-3）。bf16 の基準 `P15` を `--reference` に取れる。
+const QUANT_KV_CANDIDATES: [&str; 3] = ["P15KV", "P15Q4", "P15Q4KV"];
 
 /// 名前が P 系（P・P15・P7）か。
 fn is_p_family(name: &str) -> bool {
@@ -223,7 +229,7 @@ impl ScoreArgs {
         let has_others = !self.compares.is_empty() || !self.references.is_empty();
         if has_others && !is_p_family(&self.candidate.name) {
             return Err(invalid(
-                "--compare and --reference require a P-family candidate (P, P15, P7)",
+                "--compare and --reference require a P-family candidate (P, P15, P7, P15KV, P15Q4, P15Q4KV)",
             ));
         }
         if self
@@ -233,8 +239,16 @@ impl ScoreArgs {
         {
             return Err(invalid("--compare accepts only C1 or C3"));
         }
-        if self.references.iter().any(|n| n.name != "AR") {
-            return Err(invalid("--reference accepts only AR"));
+        // 追補 3 の 7 節: 量子化・KV 圧縮候補は bf16 の基準 P15 との差を参考値（Holm なし）で出す。
+        let p15_ok = QUANT_KV_CANDIDATES.contains(&self.candidate.name.as_str());
+        if self
+            .references
+            .iter()
+            .any(|n| n.name != "AR" && !(p15_ok && n.name == "P15"))
+        {
+            return Err(invalid(
+                "--reference accepts only AR (or P15 for P15KV, P15Q4, P15Q4KV)",
+            ));
         }
         Ok(())
     }
@@ -743,6 +757,8 @@ fn check_ledger<'a>(
     let mut to_write = Vec::new();
     for l in loaded {
         match project.read_optional(ledger_rel(eval_sha, seed, &l.named.name), MAX_LEDGER_BYTES)? {
+            // P15 を参照にするだけの採点は台帳を消費しない（P15 自身の採点対象としての適用を塞がない。追補 3）。
+            None if l.role == Role::Reference && l.named.name == "P15" => {}
             None => {
                 to_write.push(l);
             }
