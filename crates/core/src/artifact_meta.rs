@@ -38,6 +38,7 @@
 //! 本文を含めない（`.claude/rules/security.md`）。
 
 use crate::hash::Sha256Digest;
+use crate::limits::{MAX_EXTERNAL_DATA_SHARDS, MAX_LORA_SEQ_LENGTH, MIN_LORA_SEQ_LENGTH};
 use serde::Deserialize;
 use std::fmt;
 
@@ -203,13 +204,6 @@ pub struct TokenizerPackageRefs {
     pub longest_choice_tokens: usize,
 }
 
-/// `max_seq_length` の範囲（学習ワーカーの `limits.py` の `MIN_LORA_SEQ_LENGTH`・`MAX_LORA_SEQ_LENGTH` と同値）。
-const MIN_MAX_SEQ_LENGTH: u64 = 8;
-const MAX_MAX_SEQ_LENGTH: u64 = 4096;
-
-/// `external_data` の最大件数（ガード層の分割ファイル数上限と同値）。
-const MAX_EXTERNAL_DATA_REFS: usize = 256;
-
 #[derive(Deserialize)]
 struct RawExternalRef {
     location: String,
@@ -250,7 +244,7 @@ impl TokenizerPackageRefs {
         let ok = !raw.tokenizer_file.is_empty()
             && is_hex64(&raw.tokenizer_sha256)
             && !raw.external_data.is_empty()
-            && raw.external_data.len() <= MAX_EXTERNAL_DATA_REFS
+            && raw.external_data.len() <= MAX_EXTERNAL_DATA_SHARDS
             && raw
                 .external_data
                 .iter()
@@ -264,7 +258,8 @@ impl TokenizerPackageRefs {
             .min()
             .and(raw.scoring.choices.iter().map(|c| c.token_ids.len()).max());
         let any_empty = raw.scoring.choices.iter().any(|c| c.token_ids.is_empty());
-        let seq_ok = (MIN_MAX_SEQ_LENGTH..=MAX_MAX_SEQ_LENGTH).contains(&raw.config.max_seq_length);
+        let seq_ok =
+            (MIN_LORA_SEQ_LENGTH..=MAX_LORA_SEQ_LENGTH).contains(&raw.config.max_seq_length);
         let (true, true, false, Some(longest)) = (ok, seq_ok, any_empty, longest) else {
             return Err(ArtifactMetaError::Malformed);
         };

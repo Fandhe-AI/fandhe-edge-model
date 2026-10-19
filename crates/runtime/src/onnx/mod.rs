@@ -127,7 +127,7 @@ pub const FINETUNE_MODEL_LIMITS: ModelLimits = ModelLimits {
     allow_bf16: true,
     external: Some(ExternalDataLimits {
         max_shard_bytes: 1024 * 1024 * 1024,
-        max_shards: 256,
+        max_shards: fandhe_edge_core::limits::MAX_EXTERNAL_DATA_SHARDS,
         max_total_bytes: 8 * 1024 * 1024 * 1024,
     }),
 };
