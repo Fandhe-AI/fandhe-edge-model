@@ -165,16 +165,93 @@ const MAX_META_KIND_BYTES: usize = 64;
 ///
 /// `artifact.json` の任意の欄 `input_representation` で kind ごとに宣言する。欄が無い既存パッケージは
 /// [`Self::Byte`] として従来どおり読める。定義ファイルの `io.input`（`bytes`）とは別物で、定義側の
-/// スキーマ・正準化ハッシュは変えない。`Tokenizer` の推論は TASK-41.4 まで未対応で、CLI の `infer`・
-/// `package`・`select`・`evaluate` は `invalid_input`（64）で拒否する。
+/// スキーマ・正準化ハッシュは変えない。`Tokenizer` は `qwen2_lora` の `infer` だけが推論でき（#626）、
+/// `package`・`select`・`evaluate` は未接続のため `invalid_input`（64）で拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageInputRepresentation {
     /// バイト列をそのまま符号化する（既定。宣言なしのパッケージもこちら）。
     #[default]
     Byte,
-    /// 事前学習モデルのトークナイザー（REQ-41。推論ランタイムは TASK-41.4 で対応予定）。
+    /// 事前学習モデルのトークナイザー（REQ-41。`infer` が `qwen2_lora` で対応〔#626〕）。
     Tokenizer,
+}
+
+/// 外部データ（重みの shard）1 件の参照（`artifact.json` の `external_data`。REQ-41・#626）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDataRef {
+    /// パッケージ直下のファイル名（経路の検証は呼び出し側のガード層）。
+    pub location: String,
+    /// 期待 sha256（小文字 16 進 64 桁）。
+    pub sha256: String,
+}
+
+/// 入力表現 `tokenizer` のパッケージ（`qwen2_lora`）が `artifact.json` に持つ参照欄
+/// （REQ-41・TASK-41.6-3・#432、`infer` への接続は #626）。
+///
+/// [`ArtifactMeta`] とは別に、トークナイザー経路でだけ読む（byte パッケージの検査を変えない）。値の
+/// 経路検証・ハッシュ照合は呼び出し側（ガード層と推論ランタイム）が行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizerPackageRefs {
+    pub tokenizer_file: String,
+    pub tokenizer_sha256: String,
+    pub external_data: Vec<ExternalDataRef>,
+    pub system_prompt: String,
+}
+
+/// `external_data` の最大件数（ガード層の分割ファイル数上限と同値）。
+const MAX_EXTERNAL_DATA_REFS: usize = 256;
+
+#[derive(Deserialize)]
+struct RawExternalRef {
+    location: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+struct RawScoring {
+    system_prompt: String,
+}
+
+#[derive(Deserialize)]
+struct RawTokenizerRefs {
+    tokenizer_file: String,
+    tokenizer_sha256: String,
+    external_data: Vec<RawExternalRef>,
+    scoring: RawScoring,
+}
+
+impl TokenizerPackageRefs {
+    /// `artifact.json` のバイト列から参照欄を読む。欠落・型違い・不正な sha256・件数超過は
+    /// [`ArtifactMetaError::Malformed`]（fail-closed）。
+    pub fn parse(bytes: &[u8]) -> Result<Self, ArtifactMetaError> {
+        let raw: RawTokenizerRefs =
+            serde_json::from_slice(bytes).map_err(|_| ArtifactMetaError::Malformed)?;
+        let ok = !raw.tokenizer_file.is_empty()
+            && is_hex64(&raw.tokenizer_sha256)
+            && !raw.external_data.is_empty()
+            && raw.external_data.len() <= MAX_EXTERNAL_DATA_REFS
+            && raw
+                .external_data
+                .iter()
+                .all(|e| !e.location.is_empty() && is_hex64(&e.sha256));
+        if !ok {
+            return Err(ArtifactMetaError::Malformed);
+        }
+        Ok(Self {
+            tokenizer_file: raw.tokenizer_file,
+            tokenizer_sha256: raw.tokenizer_sha256,
+            external_data: raw
+                .external_data
+                .into_iter()
+                .map(|e| ExternalDataRef {
+                    location: e.location,
+                    sha256: e.sha256,
+                })
+                .collect(),
+            system_prompt: raw.scoring.system_prompt,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -1006,6 +1083,113 @@ mod tests {
         assert_eq!(
             ArtifactMeta::parse(empty_file.as_bytes()),
             Err(ArtifactMetaError::InvalidOnnxFile)
+        );
+    }
+
+    fn tok_json(patch: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
+        let h = "a".repeat(64);
+        let mut v = serde_json::json!({
+            "tokenizer_file": "tokenizer.json",
+            "tokenizer_sha256": h,
+            "external_data": [{"location": "weights-00000.bin", "sha256": h}],
+            "scoring": {"system_prompt": "p"},
+        });
+        patch(&mut v);
+        serde_json::to_vec(&v).expect("json")
+    }
+
+    /// REQ-41・#626: 正常な参照欄を読める。
+    #[test]
+    fn req41_tokenizer_refs_parse_ok() {
+        let r = TokenizerPackageRefs::parse(&tok_json(|_| {})).expect("ok");
+        assert_eq!(r.tokenizer_file, "tokenizer.json");
+        assert_eq!(r.tokenizer_sha256, "a".repeat(64));
+        assert_eq!(r.external_data.len(), 1);
+        assert_eq!(r.external_data[0].location, "weights-00000.bin");
+        assert_eq!(r.system_prompt, "p");
+    }
+
+    /// REQ-41・REQ-39・#626: 欠落・型違い・不正な sha256・件数の過不足は `Malformed`（fail-closed）。
+    #[test]
+    fn req41_tokenizer_refs_malformed_cases() {
+        type Patch = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, Patch)> = vec![
+            (
+                "no tokenizer_file",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("tokenizer_file");
+                }),
+            ),
+            (
+                "no scoring",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("scoring");
+                }),
+            ),
+            (
+                "no external_data",
+                Box::new(|v| {
+                    v.as_object_mut().unwrap().remove("external_data");
+                }),
+            ),
+            (
+                "file type",
+                Box::new(|v| v["tokenizer_file"] = serde_json::json!(1)),
+            ),
+            (
+                "prompt type",
+                Box::new(|v| v["scoring"]["system_prompt"] = serde_json::json!(null)),
+            ),
+            (
+                "empty file",
+                Box::new(|v| v["tokenizer_file"] = serde_json::json!("")),
+            ),
+            (
+                "sha short",
+                Box::new(|v| v["tokenizer_sha256"] = serde_json::json!("a".repeat(63))),
+            ),
+            (
+                "sha long",
+                Box::new(|v| v["tokenizer_sha256"] = serde_json::json!("a".repeat(65))),
+            ),
+            (
+                "sha non-hex",
+                Box::new(|v| v["tokenizer_sha256"] = serde_json::json!("g".repeat(64))),
+            ),
+            (
+                "sha upper",
+                Box::new(|v| v["tokenizer_sha256"] = serde_json::json!("A".repeat(64))),
+            ),
+            (
+                "shard sha bad",
+                Box::new(|v| v["external_data"][0]["sha256"] = serde_json::json!("x")),
+            ),
+            (
+                "external empty",
+                Box::new(|v| v["external_data"] = serde_json::json!([])),
+            ),
+            (
+                "location empty",
+                Box::new(|v| v["external_data"][0]["location"] = serde_json::json!("")),
+            ),
+            (
+                "257 shards",
+                Box::new(|v| {
+                    let e = v["external_data"][0].clone();
+                    v["external_data"] = serde_json::Value::Array(vec![e; 257]);
+                }),
+            ),
+        ];
+        for (name, patch) in &cases {
+            assert_eq!(
+                TokenizerPackageRefs::parse(&tok_json(patch)),
+                Err(ArtifactMetaError::Malformed),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            TokenizerPackageRefs::parse(b"not json"),
+            Err(ArtifactMetaError::Malformed)
         );
     }
 }
