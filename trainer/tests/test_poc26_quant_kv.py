@@ -196,3 +196,44 @@ def test_cli_quantize_records_file_hash(env: dict, kv: bool) -> None:
     assert "model.embed_tokens.scales" in names
     assert not any("lora" in n for n in names)
     assert all(np.isfinite(v) for r in raw for v in r["loglik"].values())
+
+
+def test_fuse_lora_estimate_includes_cumulative_fused_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 統合の見積もりは統合後の重みの累積を含む。旧境界で拒否し不変。"""
+    m = _model(tmp_path)
+    paths = qwen2_model._lora_target_paths(m)
+    old_work = max(getattr(p, n).linear.weight.size * (16 + 4) for p, n in paths)
+    cur = qwen2_model.param_bytes(m)
+    monkeypatch.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", cur + old_work)
+    with pytest.raises(LimitExceededError):
+        fuse_lora(m)
+    assert all(isinstance(getattr(p, n), LoRALinear) for p, n in paths)
+    assert qwen2_model.param_bytes(m) == cur
+
+
+def test_quantize_estimate_includes_cumulative_and_leaves_no_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-39: 量子化の見積もりは量子化後の累積を含み、旧境界で拒否する。旧 Linear は残らない。"""
+    import gc
+    import weakref
+
+    m = _model(tmp_path)
+    fuse_lora(m)
+    sizes = [
+        qwen2_model._quantized_bytes(x, 64, 4)
+        for _, x in m.named_modules()
+        if hasattr(x, "to_quantized")
+    ]
+    cur = qwen2_model.param_bytes(m)
+    with monkeypatch.context() as mp:
+        mp.setattr(qwen2_model, "MAX_MODEL_MEMORY_BYTES", cur + max(sizes))
+        with pytest.raises(LimitExceededError):
+            quantize_model(m)
+    assert qwen2_model.param_bytes(m) == cur
+    ref = weakref.ref(m.model.layers[0].self_attn.q_proj)
+    quantize_model(m)
+    gc.collect()
+    assert ref() is None
