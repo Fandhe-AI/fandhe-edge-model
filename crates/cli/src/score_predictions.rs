@@ -155,20 +155,20 @@ const LEDGER_DIR: &str = "poc26_score_ledger";
 const FAMILY_SIZE: usize = 3;
 /// `--compare` の最大数（族の大きさ 3 から対 majority の 1 を引いた数）。
 const MAX_COMPARES: usize = FAMILY_SIZE - 1;
-/// 事前登録 4 節の候補名（P・P15・P7・C1・C3・AR〔autoregressive〕）。大文字小文字は区別する。
-/// P15・P7 は追補 2 の追加学習候補（REQ-41）。
+/// 事前登録 4 節の候補名（P・P15・P7・P15KV・P15Q4・P15Q4KV・C1・C3・AR〔autoregressive〕）。大文字小文字は
+/// 区別する。P15・P7 は追補 2、P15KV・P15Q4・P15Q4KV は追補 3 の追加学習候補（REQ-41）。
 ///
 /// ponytail: PoC-26 専用の固定値。汎用化（候補名・seed を定義から取る）は TASK-33.x の配線時。
 const ALLOWED_NAMES: [&str; 9] = [
     "P", "P15", "P7", "P15KV", "P15Q4", "P15Q4KV", "C1", "C3", "AR",
 ];
 /// P 系候補（追加学習候補）。`--compare`・`--reference` を付けられる唯一の系統で、`evaluate` の保存予測を
-/// 持たないため来歴照合の対象外（REQ-41・追補 2）。P 系の判定はここに集約する。
+/// 持たないため来歴照合の対象外（REQ-41・追補 2・追補 3）。P 系の判定はここに集約する。
 const P_FAMILY: [&str; 6] = ["P", "P15", "P7", "P15KV", "P15Q4", "P15Q4KV"];
-/// 量子化・KV 圧縮の候補（追補 3。REQ-41・TASK-41.11-3）。bf16 の基準 `P15` を `--reference` に取れる。
+/// 4bit 量子化・KV の使い回しの候補（追補 3。REQ-41・TASK-41.11-3）。bf16 の基準 `P15` を `--reference` に取れる。
 const QUANT_KV_CANDIDATES: [&str; 3] = ["P15KV", "P15Q4", "P15Q4KV"];
 
-/// 名前が P 系（P・P15・P7）か。
+/// 名前が P 系（`P_FAMILY` の 6 件）か。
 fn is_p_family(name: &str) -> bool {
     P_FAMILY.contains(&name)
 }
