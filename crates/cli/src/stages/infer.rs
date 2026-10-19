@@ -37,6 +37,12 @@
 //! TASK-39.6・#491）。`package/` は変えない（物理コピー・現在版ポインタなし）。指定しなければ、ここで
 //! 行う sha256 照合はパッケージ自身が記す値との一致だけを確認する。台帳ファイル自体の改変は検出しない。`kind_version` は
 //! 許可リスト（[`ALLOWED_KIND_VERSIONS`]）で検証し、未許可の版は `invalid_input` で拒否する（REQ-39）。
+//! したがって台帳なしでは、`artifact.json` ごと差し替えた自己整合な偽パッケージ（記録ハッシュも偽造済み）は検出できない。
+//! 配布物の真正性が要る場面は `--version-ledger` を指定する（REQ-39・#626 の監査 P2-2）。
+//!
+//! `qwen2_lora` の読み込み（トークナイザー・shard の読み込み・sha256 照合・重みの展開）も worker プロセスの内側で
+//! 走るため、推論呼び出しの期限だけでなく監督層の kind 別の時間・RSS 上限（超過は exit 20）の下に入る
+//! （`tests/infer_qwen2_load_limits.rs`。REQ-39・#626）。
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -45,7 +51,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fandhe_edge_core::artifact_meta::{ArtifactMeta, PackageInputRepresentation};
+use fandhe_edge_core::artifact_meta::{
+    ArtifactMeta, PackageInputRepresentation, TokenizerPackageRefs,
+};
 use fandhe_edge_core::definition::{Definition, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::fs::read_bounded_open_file;
@@ -56,9 +64,13 @@ use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::{PathRejection, open_confined};
 use fandhe_edge_guard::resource::safety_limits_for_kind;
-use fandhe_edge_runtime::onnx::{MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend};
+use fandhe_edge_runtime::onnx::{
+    ExternalShard, MAX_MAX_BYTES, MIN_MAX_BYTES, ModelKind, OnnxBackend,
+};
 use fandhe_edge_runtime::pipeline::InferencePipeline;
-use fandhe_edge_runtime::preprocess::ByteEncodingPreprocessor;
+use fandhe_edge_runtime::pipeline::{PreprocessError, Preprocessor, TokenIds};
+use fandhe_edge_runtime::preprocess::{ByteEncodingPreprocessor, TokenizerPreprocessor};
+use fandhe_edge_runtime::tokenizer::{MAX_TOKENIZER_JSON_BYTES, TokenizerSpec};
 use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 
 use crate::args::{InferArgs, InferSource};
@@ -78,8 +90,11 @@ use crate::project::{
 /// 学習ワーカーの登録簿（`trainer` の `resolve_kind`）と同じ版だけを許可し、未知の版のパッケージを
 /// 推論へ進めない。版管理台帳による前版の照合は `infer --version-ledger`・`--version-id` で接続済み
 /// （#491・#518。TASK-39.6）。
-const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] =
-    &[(ModelKind::C1, &[1]), (ModelKind::C3, &[1])];
+const ALLOWED_KIND_VERSIONS: &[(ModelKind, &[u32])] = &[
+    (ModelKind::C1, &[1]),
+    (ModelKind::C3, &[1]),
+    (ModelKind::Qwen2Lora, &[1]),
+];
 
 /// `kind_version` が許可リストにあるか。
 pub(crate) fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
@@ -91,7 +106,24 @@ pub(crate) fn kind_version_allowed(kind: ModelKind, version: u32) -> bool {
 /// `--id` を省略した `--text` の入力 ID。
 const DEFAULT_TEXT_ID: &str = "input";
 
-pub(crate) type Pipeline = InferencePipeline<ByteEncodingPreprocessor, OnnxBackend>;
+/// 入力表現ごとの前処理（byte は c1・c3、tokenizer は `qwen2_lora`。REQ-41・#626）。
+///
+/// 推論経路（単体・バッチ）は 1 つの [`Pipeline`] 型のまま、前処理だけを入力表現で切り替える。
+pub(crate) enum InferPreprocessor {
+    Byte(ByteEncodingPreprocessor),
+    Tokenizer(Box<TokenizerPreprocessor>),
+}
+
+impl Preprocessor for InferPreprocessor {
+    fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
+        match self {
+            Self::Byte(p) => p.preprocess(input),
+            Self::Tokenizer(p) => p.preprocess(input),
+        }
+    }
+}
+
+pub(crate) type Pipeline = InferencePipeline<InferPreprocessor, OnnxBackend>;
 
 /// 検査を通過したパッケージから組み立てた推論の準備。
 struct Prepared {
@@ -452,7 +484,18 @@ fn prepare(cwd: &Path, args: &InferArgs) -> Result<Prepared, ErrorReport> {
         onnx,
         &definition,
     )?;
-    let pipeline = build_pipeline(onnx, &meta, definition.options().len())?;
+    let n_options = definition.options().len();
+    let pipeline = if is_tokenizer_qwen2(&meta) {
+        build_qwen2_pipeline(
+            onnx,
+            &checked.package,
+            &checked.meta_bytes,
+            &meta,
+            n_options,
+        )?
+    } else {
+        build_pipeline(onnx, &meta, n_options)?
+    };
     let scope = JudgmentScope {
         out_of_scope_label: definition.out_of_scope_label().map(str::to_string),
         calibration,
@@ -531,13 +574,83 @@ fn load_calibration(
 }
 
 /// byte 以外の入力表現を拒否する（byte 前処理で黙って推論すると誤った予測になるため。
-/// REQ-41・TASK-41.3-1・#402）。TASK-41.4 でトークナイザー推論が入ったら外す。
+/// REQ-41・TASK-41.3-1・#402）。`infer` の `qwen2_lora`（tokenizer）は
+/// [`build_qwen2_pipeline`] へ分岐して
+/// 本関数を通らない（#626）。`package`・`select`・`evaluate` は tokenizer 経路が未接続のため引き続き拒否する。
 pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), ErrorReport> {
     if meta.input_representation() == PackageInputRepresentation::Byte {
         Ok(())
     } else {
         Err(invalid("unsupported input representation"))
     }
+}
+
+/// 入力表現 `tokenizer` かつ `kind` が `qwen2_lora` のパッケージか。これだけが tokenizer 経路で推論できる
+/// （それ以外の tokenizer 宣言は [`check_input_representation`] が拒否する。REQ-41・#626）。
+fn is_tokenizer_qwen2(meta: &ArtifactMeta) -> bool {
+    meta.input_representation() == PackageInputRepresentation::Tokenizer
+        && meta.kind() == ModelKind::Qwen2Lora.as_str()
+}
+
+/// `qwen2_lora` のパッケージ（tokenizer 入力表現）から推論パイプラインを組む（REQ-41・REQ-32・REQ-39・#626）。
+///
+/// `tokenizer.json` と外部データの shard は、`infer` の閉じ込めたパッケージの直下から fd で開く
+/// （パスから開き直さない）。トークナイザーは上限つきで読み sha256 を照合し、shard の sha256・
+/// 件数・サイズ上限はランタイムの `from_bytes_with_shards` が読みながら照合する（不一致は fail-closed）。
+/// 本文・重みはエラーに出さない。
+fn build_qwen2_pipeline(
+    onnx: &[u8],
+    package: &ConfinedPackage,
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+    n_options: usize,
+) -> Result<Pipeline, ErrorReport> {
+    let kind = ModelKind::Qwen2Lora;
+    if !kind_version_allowed(kind, meta.kind_version()) {
+        return Err(invalid("unsupported kind_version"));
+    }
+    let refs = TokenizerPackageRefs::parse(meta_bytes).map_err(|e| e.to_error_report())?;
+
+    let tok_path = Path::new(&refs.tokenizer_file);
+    let (tok_file, _) = package
+        .open_member(tok_path)
+        .map_err(|e| e.to_error_report())?;
+    let tok_bytes = read_bounded_open_file(tok_file, tok_path, MAX_TOKENIZER_JSON_BYTES)
+        .map_err(|e| fs_report(&e))?;
+    if Sha256Digest::of_bytes(&tok_bytes).to_hex() != refs.tokenizer_sha256 {
+        return Err(invalid(
+            "package tokenizer does not match its recorded hash",
+        ));
+    }
+    let spec = TokenizerSpec::from_bytes(&tok_bytes)
+        .map_err(|_| invalid("tokenizer file cannot be loaded"))?;
+    let pre = TokenizerPreprocessor::new(spec, refs.system_prompt)
+        .ok_or_else(|| invalid("package system prompt is too long"))?;
+
+    let mut shards = Vec::with_capacity(refs.external_data.len());
+    for e in &refs.external_data {
+        let (file, _) = package
+            .open_member(Path::new(&e.location))
+            .map_err(|err| err.to_error_report())?;
+        let sha256 = e
+            .sha256
+            .parse()
+            .map_err(|_| invalid("package external data hash is malformed"))?;
+        shards.push(ExternalShard {
+            location: e.location.clone(),
+            file,
+            sha256,
+        });
+    }
+    let backend = OnnxBackend::from_bytes_with_shards(onnx, kind, shards)
+        .map_err(|_| invalid("model file cannot be loaded"))?;
+    if backend.n_classes() != n_options {
+        return Err(invalid("model output size does not match definition"));
+    }
+    Ok(InferencePipeline::new(
+        InferPreprocessor::Tokenizer(Box::new(pre)),
+        backend,
+    ))
 }
 
 /// `max_bytes` の範囲検査・`kind` の解析・[`load_backend`] を行い、前処理と束ねた推論パイプラインを
@@ -547,7 +660,8 @@ pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), Erro
 ///
 /// # Errors
 /// `max_bytes` が範囲外・未対応の `kind`・未許可の版・読み込めない ONNX・出力サイズの不一致は
-/// `invalid_input`（64）。`tokenizer` の宣言は推論ランタイム未対応（TASK-41.4。REQ-41）のため同じく 64。
+/// `invalid_input`（64）。`tokenizer` の宣言は本関数では未対応のため同じく 64
+/// （`infer` の `qwen2_lora` は [`build_qwen2_pipeline`]。REQ-41）。
 pub(crate) fn build_pipeline(
     onnx: &[u8],
     meta: &ArtifactMeta,
@@ -561,7 +675,7 @@ pub(crate) fn build_pipeline(
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
     let backend = load_backend(onnx, kind, meta.kind_version(), n_options)?;
     Ok(InferencePipeline::new(
-        ByteEncodingPreprocessor::new(max_bytes),
+        InferPreprocessor::Byte(ByteEncodingPreprocessor::new(max_bytes)),
         backend,
     ))
 }

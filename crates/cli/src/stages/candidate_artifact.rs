@@ -135,7 +135,8 @@ pub(crate) fn check_meta_consistency(
     trained_kind_version: u32,
     trained_max_bytes: u32,
 ) -> Result<(), ErrorReport> {
-    // 入力表現が tokenizer の候補は推論できない（REQ-41・TASK-41.3-1・#402。TASK-41.4 で外す）。
+    // 入力表現が tokenizer の候補は推論できない（REQ-41・TASK-41.3-1・#402）。
+    // `package`・`select`・`evaluate` の tokenizer 経路は未接続（`infer` のみ #626 で対応）。
     super::infer::check_input_representation(meta)?;
     KindAllowlist::supported()
         .check(meta.kind())

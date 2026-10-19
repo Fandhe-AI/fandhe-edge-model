@@ -1,7 +1,7 @@
 //! `infer` の入力表現の宣言（REQ-41・TASK-41.3-1・#402）。
 //!
 //! 共有 fixture の C1・C3 の ONNX でパッケージを組み、宣言なしと `byte` は同じ結果で推論に進み、
-//! `tokenizer`（推論未対応。TASK-41.4）と不正な値は `invalid_input`（64）で拒否されることを確かめる
+//! `tokenizer` かつ `qwen2_lora` 以外（`infer` が推論できるのは `qwen2_lora` のみ。#626）と不正な値は `invalid_input`（64）で拒否されることを確かめる
 //! （証拠種別: テストハーネス）。
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
@@ -62,9 +62,9 @@ fn req41_undeclared_equals_byte() {
     }
 }
 
-/// `tokenizer` は推論未対応のため 64 で拒否する。
+/// `tokenizer` でも `qwen2_lora` 以外（c1）は 64 で拒否する（REQ-41・#626）。
 #[test]
-fn req41_tokenizer_is_rejected_until_runtime_supports_it() {
+fn req41_tokenizer_with_non_qwen2_lora_kind_is_rejected() {
     let (code, stdout) = run("tok", "c1", r#","input_representation":"tokenizer""#);
     assert_eq!(code, Some(64), "{stdout}");
     assert_eq!(
