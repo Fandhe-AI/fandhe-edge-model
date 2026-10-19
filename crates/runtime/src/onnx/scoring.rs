@@ -24,8 +24,8 @@
 //! - 最後の Softmax（グラフ出力 `probs`）だけ f64（C1・C3 と同じ）
 
 use super::ops::arith::{
-    add, add_i64, bf16_to_f32, cast_bf16_to_f32, cast_i64_to_f32, gemm_trans_b, matmul, mul,
-    reciprocal, sqrt, sub,
+    add, add_i64, bf16_to_f32, cast_bf16_to_f32, cast_i64_to_f32, gemm_temp_bytes, gemm_trans_b,
+    matmul, mul, reciprocal, sqrt, sub,
 };
 use super::ops::mask_rope::{cos, greater_i64, range_i64, sin, where_f32};
 use super::ops::norm_act::{
@@ -651,10 +651,15 @@ fn alloc_bound(op: &Op, a: &[Arc<Value>]) -> Option<usize> {
             let n = if w.len() >= 2 { *w.last()? } else { 1 };
             (bcast(&[xb, wb]).saturating_mul(m).saturating_mul(n), 4)
         }
+        // 出力のほかに、worker ごとの W の展開領域・累積器（形状に依らない定数 × 最大スレッド数）
         Op::Gemm => {
             let (x, w) = (shape_of(v(0)?), shape_of(v(1)?));
             let rows = prod(x.get(..x.len().saturating_sub(1))?);
-            (rows.saturating_mul(*w.first()?), 4)
+            let out = rows.saturating_mul(*w.first()?).saturating_mul(4);
+            return Some(
+                out.saturating_add(gemm_temp_bytes())
+                    .saturating_add(expanded),
+            );
         }
         Op::Shape => (shape_of(v(0)?).len(), 8),
         // 出力は indices.shape ++ data.shape[1..]（表の先頭軸が 0 でも行の大きさは残る）
@@ -1053,6 +1058,25 @@ mod tests {
             exec(&step, &mut f, Instant::now() + Duration::from_secs(60)),
             Err(BackendError::Failed)
         ));
+    }
+
+    /// Gemm の一時領域（worker ごとの W の展開領域・累積器）を出力の見積もりに足す。K を大きくしても
+    /// 一時領域は増えない（k のブロック化で有界。REQ-39・#630）。
+    #[test]
+    fn req39_gemm_bound_includes_bounded_temporaries() {
+        let x = Arc::new(f32s_shape(vec![2, 3]));
+        let w = Arc::new(f32s_shape(vec![4, 3]));
+        let temp = gemm_temp_bytes();
+        assert!(temp > 0);
+        assert_eq!(alloc_bound(&Op::Gemm, &[x, w]), Some(2 * 4 * 4 + temp));
+        // M=N=1・K=2^20 でも一時領域は同じ定数（出力 4 バイト + 定数）
+        let x = Arc::new(f32s_shape(vec![1, 1 << 20]));
+        let w = Arc::new(f32s_shape(vec![1, 1 << 20]));
+        assert_eq!(alloc_bound(&Op::Gemm, &[x, w]), Some(4 + temp));
+        // MatMul はバッチ数に比例する表を持たないので、バッチ 2^28 でも出力だけ
+        let a = Arc::new(f32s_shape(vec![1 << 28, 1, 0]));
+        let b = Arc::new(f32s_shape(vec![0, 1]));
+        assert_eq!(alloc_bound(&Op::MatMul, &[a, b]), Some((1 << 28) * 4));
     }
 
     /// カーネル内の一時領域も確保量に含める（Where の (cond, x) の組・softmax_f64 の行）。

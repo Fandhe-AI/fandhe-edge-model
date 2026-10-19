@@ -126,6 +126,27 @@
 - 支配的なのは Gemm（約 1.1 GMAC/s。bf16 を積和の中で f32 に展開する単一スレッドのループ）。要素ごとの演算も約 3.7 ns/要素で、ブロードキャストの汎用経路が遅い。速度の改善（k 昇順の加算順を保つ範囲での並べ替え・ブロック化・並列化）は本 issue の対象外で、別 issue での判断が要る
 - Where の 3 入力ストライドループ化（`mask_rope.rs` の ponytail コメント）: Where は 1.0 ms で層あたり 1 回、1 推論で約 28 ms。Gemm に比べて小さく、現時点では不要
 
+### 7.1 行列積の最適化と並列化の後（#629）
+
+- 計測: 2026-10-19、Apple M5（P 4 + E 6・`available_parallelism` = 10）、`--release`、同じ `qwen_ops_timing`（各演算 3 回の中央値）。GPU は使わない
+- 変更（`ops/arith.rs`）: Gemm は 4 行 × 4 行のタイルを lane 4 本（k mod 4）で独立に累積し（NEON の自動ベクトル化）、W の 4 行を f32 に 1 度だけ展開して A の 32 行と突き合わせ、W の 16 行単位をスレッドへ動的に配る。MatMul は出力行を静的に分けて並列化（k 昇順は不変）。期限検査は Gemm が単位ごと・A の 32 行ごと、MatMul が出力行ごと（k × n が大きいときは行内も。REQ-39）。1 検査の粒度が ms 程度なのは Qwen2 1.5B の実形状に限る。スレッド数は `available_parallelism` を上限にし、積和 2^22 回未満では使わない
+- 加算順: Gemm は「k 昇順の逐次」から「lane 別（k mod 4）に k 昇順 → lane 順」の固定順へ変えた。スレッド数・分配順に依存せず決定的（`req28_gemm_sum_order_is_lane_fixed` で機械照合。REQ-28）。1 件・バッチ・評価器経路の全件一致（`tests/full_match.rs`）と ONNX / 学習側のパリティ fixture は変更なしで通る
+- 証拠種別: テストハーネス（上と同じ合成重み・形状）。1 推論あたりの値は推定
+
+| 演算 | 形状 | 前（2026-10-17） | 後（#629） |
+| ---- | ---- | ---------------- | ---------- |
+| Gemm lm_head（1 推論に 1 回） | `[32,1536]x[151936,1536]` | 6.62 s | 88 ms |
+| Gemm down | `[128,8960]x[1536,8960]` | 1.72 s | 22 ms |
+| Gemm gate / up | `[128,1536]x[8960,1536]` | 1.56 s | 17 ms |
+| Gemm gate / up | `[32,1536]x[8960,1536]` | 390 ms | 4.6 ms |
+| Gemm q / o | `[128,1536]x[1536,1536]` | 267 ms | 3.2 ms |
+| MatMul qk / av（prefix） | `[1,2,6,128,128]` | 約 2.4 ms | 0.6〜0.9 ms |
+
+- Gemm の実効速度は約 1.1 GMAC/s → 約 85〜110 GMAC/s（10 スレッド。単スレッドで約 13 GMAC/s。出典: 同じ計測を threads=1 に固定して得た値）。1 層の合計は約 6.9 s → 約 114 ms、1 推論あたりの推定は約 200 s → 約 3.3 s（T=128・K=4・M=8）
+- 実機（証拠種別: 実機・1 回。`~/poc26/k15` の P15 パッケージ `pkg15`〔約 3.09 GB〕に `fandhe-edge infer --package pkg15 --text "Open the page https://example.com in the browser"` を `/usr/bin/time -l` 下で 1 回。Apple M5）: exit 0、real 15.0 s（前: 約 199 s で上限 60 s の exit 20）、user 54.3 s、最大 RSS 3.45 GB（前: 約 3.19 GB。作業バッファとスレッド分）、予測 `browser_navigate`（PoC と一致）
+- レビュー後の再計測（2026-10-19・同じハーネス・load average 約 10〜17 の他作業ありの状態。証拠種別: テストハーネス）: レビュー指摘の修正で `gemm_tile` のロードに `Option` と NaN フォールバックの境界検査を挟んだ版は Gemm が約 2.4〜3 倍に後退した（単スレッド lm_head 1371 ms = 約 5.4 GMAC/s、並列 lm_head 252 ms・down 68 ms・gate/up 56 ms）。本体ループを `as_chunks` の固定長チャンク 8 本の zip に直して分岐を無くした版（現行）は単スレッド lm_head 684 ms（約 10.9 GMAC/s）、並列 lm_head 99 ms・down 23 ms・gate/up 20 ms・q/o 3.7 ms・MatMul 0.3〜0.8 ms で、表の値と同程度（負荷ぶんの差）。asm で worker の閉包に `fmul.4s` が 32 本・スカラー積和 0 本であることを確認。実機（同条件・1 回・load average 約 7〜9）: exit 0、real 13.7 s、user 58.0 s、最大 RSS 3.45 GB、予測 `browser_navigate`
+- 残り: real と user の比（約 3.6）から、重みの読み込みと要素ごとの演算・Softmax など Gemm 以外の単一スレッド部分が残る。p95 0.25 秒（REQ-31）・RSS 2 GB（REQ-30）は 1.5B を CPU で動かす限り届かない（#629 のオーナー判断事項）
+
 ## 8. 書き出しの実測（TASK-41.6-2・#431）
 
 - 実装: `trainer/src/fandhe_edge_trainer/qwen2_onnx.py`（`export_scoring_onnx`）。受け入れテスト `trainer/tests/test_qwen2_onnx_export.py` が本書 §3 の表を読んで、書き出した ONNX の演算・属性・dtype・rank を照合する
