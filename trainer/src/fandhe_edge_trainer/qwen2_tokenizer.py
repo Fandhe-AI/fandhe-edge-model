@@ -434,6 +434,19 @@ class Qwen2Tokenizer:
             out.extend(chunk)
         return out.decode("utf-8", errors="replace")
 
+    def _turn_ids(self, role: str, content: str) -> list[int]:
+        """1 メッセージ `<|im_start|>role\\ncontent<|im_end|>\\n` の id 列（区間ごとに encode）。"""
+        start, end = self.special_ids["im_start"], self.special_ids["im_end"]
+        return [start, *self.encode(f"{role}\n{content}"), end, *self.encode("\n")]
+
+    def system_turn_ids(self, system: str) -> list[int]:
+        """`build_chat_ids` の先頭になる system 区間の id 列。
+
+        特殊トークンで区切られ入力に依らず不変なので、採点グラフへ K/V を同梱できる
+        （`qwen2_onnx`。REQ-41・#634）。`build_chat_ids(system, x, ...)[:P]` と常に一致する。
+        """
+        return self._turn_ids("system", system)
+
     def build_chat_ids(
         self,
         system: str,
@@ -451,13 +464,12 @@ class Qwen2Tokenizer:
         """
         if (assistant is None) != add_generation_prompt:
             raise invalid_data("exactly one of assistant / add_generation_prompt is required")
-        start, end = self.special_ids["im_start"], self.special_ids["im_end"]
-        ids: list[int] = []
-        messages = [("system", system), ("user", user)]
+        ids: list[int] = self.system_turn_ids(system)
+        messages = [("user", user)]
         if assistant is not None:
             messages.append(("assistant", assistant))
         for role, content in messages:
-            ids += [start, *self.encode(f"{role}\n{content}"), end, *self.encode("\n")]
+            ids += self._turn_ids(role, content)
         if add_generation_prompt:
-            ids += [start, *self.encode("assistant\n")]
+            ids += [self.special_ids["im_start"], *self.encode("assistant\n")]
         return ids

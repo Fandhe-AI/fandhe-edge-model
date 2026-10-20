@@ -6,6 +6,10 @@
 採点（ラベル token 列＋`<|im_end|>` の対数尤度の合計 → 選択肢間 softmax。`kinds/qwen2_lora.py` の
 `score_chunk` と同じ）はグラフの中で行い、共通 prefix は 1 回だけ forward して各層の K/V を
 選択肢ブロックから参照する（KV の使い回し）。
+system 区間（`ids` の先頭 P 個。入力に依らず不変）の K/V は書き出し時に numpy（f32）で求めて
+f32 の initializer として同梱し、グラフは `ids[:, P:]` だけを forward する（REQ-41・#634）。
+グラフ入力は従来どおり全体の `ids` で、`ids[:P]` は読み捨てる（system 区間の一致は呼び出し側が
+`Qwen2Tokenizer.system_turn_ids` で保証する）。
 
 重みは 1 テンソルずつ `W' = W + scale * (A @ B).T`（f32）で統合して bf16（RNE）にし、閾値以上は
 外部データの shard（`weights-NNNNN.bin`）へ逐次書く。全量を同時には持たない。shard 名・
@@ -59,6 +63,12 @@ def _limit(message: str) -> WorkerError:
 def shard_name(index: int) -> str:
     """shard のファイル名。Rust 側 `location_ok` の字句規則（英数字と `._-`）を満たす。"""
     return f"weights-{index:05d}.bin"
+
+
+def bf16_round(a: np.ndarray) -> np.ndarray:
+    """bf16（RNE）へ丸めて f32 へ戻す。グラフ内の `Cast(bf16→f32)` と同値。"""
+    u = np.frombuffer(bf16_bytes(a), dtype="<u2").astype(np.uint32) << 16
+    return u.view(np.float32).reshape(a.shape)
 
 
 def bf16_bytes(a: np.ndarray) -> bytes:
@@ -144,10 +154,19 @@ class _Graph:
     def weight(self, name: str, arr: np.ndarray) -> str:
         """bf16 の重み。`Cast(to=FLOAT)` の出力名を返す（消費側は常に f32 として使う）。"""
         self._rb.check()
-        raw = bf16_bytes(arr)
+        self._store(name, TensorProto.BFLOAT16, arr.shape, bf16_bytes(arr))
+        return self.op("Cast", [name], to=TensorProto.FLOAT)
+
+    def kv(self, name: str, arr: np.ndarray) -> str:
+        """system 区間の K/V（f32 の rank 2 initializer）。名前をそのまま返す（#634）。"""
+        self._rb.check()
+        self._store(name, TensorProto.FLOAT, arr.shape, np.ascontiguousarray(arr, "<f4").tobytes())
+        return name
+
+    def _store(self, name: str, dtype: int, shape: tuple[int, ...], raw: bytes) -> None:
         t = TensorProto()
-        t.name, t.data_type = name, TensorProto.BFLOAT16
-        t.dims.extend(arr.shape)
+        t.name, t.data_type = name, dtype
+        t.dims.extend(shape)
         if len(raw) < self._threshold:
             t.raw_data = raw
         else:
@@ -158,7 +177,6 @@ class _Graph:
                 e = t.external_data.add()
                 e.key, e.value = k, str(v)
         self.inits.append(t)
-        return self.op("Cast", [name], to=TensorProto.FLOAT)
 
     def op(self, op_type: str, inputs: list[str], out: str | None = None, **attrs: Any) -> str:
         out = out or self.fresh(op_type.lower())
@@ -223,9 +241,11 @@ def _layer(
     mask: str,
     kv_prefix: tuple[str, str] | None,
 ) -> tuple[str, str, str]:
-    """1 層。prefix（b=1・kv_prefix なし）と選択肢ブロック（b=K・kv_prefix あり）で共有する。
+    """1 層。入力テキスト（b=1・kv_prefix は system の同梱 K/V）と選択肢ブロック（b=K・
+    kv_prefix は system＋入力テキストの K/V）で共有する。
 
-    隠れ状態は `[b*S, H]`。`(出力, K, V)` を返し、K・V は RoPE 後の `[b, nkv, 1, S, hd]`。
+    隠れ状態は `[b*S, H]`。`(出力, K, V)` を返し、K・V は kv_prefix を連結した後の
+    RoPE 後 `[b, nkv, 1, 全長, hd]`（次の段の kv_prefix にそのまま使える）。
     """
     nh, nkv, hd, grp = d.nh, d.nkv, d.hd, d.grp
     a = _rms(g, d, x, w["ln1"])
@@ -238,9 +258,12 @@ def _layer(
     v = g.op("Unsqueeze", [g.op("Transpose", [v], perm=[0, 2, 1, 3]), g.i64(2)])
     kf, vf = k, v
     if kv_prefix is not None:
-        shape = g.i64(b, 1, 1, 1, 1)
-        kf = g.op("Concat", [g.op("Expand", [kv_prefix[0], shape]), k], axis=3)
-        vf = g.op("Concat", [g.op("Expand", [kv_prefix[1], shape]), v], axis=3)
+        pk, pv = kv_prefix
+        if b != 1:
+            shape = g.i64(b, 1, 1, 1, 1)
+            pk, pv = g.op("Expand", [pk, shape]), g.op("Expand", [pv, shape])
+        kf = g.op("Concat", [pk, k], axis=3)
+        vf = g.op("Concat", [pv, v], axis=3)
     s = g.op("MatMul", [q, g.op("Transpose", [kf], perm=[0, 1, 2, 4, 3])])
     s = g.op("Where", [mask, g.const(NEG), g.op("Mul", [s, g.const(hd**-0.5)])])
     ctx = g.op("MatMul", [g.op("Softmax", [s], axis=-1), vf])  # [b,nkv,grp,S,hd]
@@ -250,7 +273,7 @@ def _layer(
     gate = _lin(g, m, w["gate"])
     act = g.op("Mul", [gate, g.op("Sigmoid", [gate])])
     h = g.op("Add", [h, _lin(g, g.op("Mul", [act, _lin(g, m, w["up"])]), w["down"])])
-    return h, k, v
+    return h, kf, vf
 
 
 def _f32(a: Any) -> np.ndarray:
@@ -270,11 +293,56 @@ def _fused(lin: Any) -> tuple[np.ndarray, np.ndarray | None]:
     return w, (_f32(base.bias) if "bias" in base else None)
 
 
+def _np_rms(x: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:
+    r = np.float32(1) / np.sqrt((x * x).mean(-1, keepdims=True) + np.float32(eps))
+    return (x * r * w).astype(np.float32)
+
+
+def _np_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    x1, x2 = np.split(x, 2, axis=-1)
+    return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+
+
+def _np_prefix_layer(
+    d: _Dims, rw: dict[str, np.ndarray], x: np.ndarray, rope: tuple[np.ndarray, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """system 区間 1 層分の f32 forward（`_layer` の b=1・kv_prefix なしと同じ式）。
+
+    `rw` は bf16 丸め済み（グラフの `Cast(bf16→f32)` 後と同値）の重み。`(出力, K, V)` を返し、
+    K・V は RoPE 後の `[nkv, P, hd]`。縮約順は onnx / Rust と異なりうる。K/V の直接比較は
+    せず、MLX 参照との採点全件一致（許容差 1e-5・テスト）で間接的に確認する（REQ-28・#634）。
+    """
+    n = x.shape[0]
+    cos, sin = rope
+
+    def lin(a: np.ndarray, key: str) -> np.ndarray:
+        y = a @ rw[key].T
+        return y + rw[key + "b"] if key + "b" in rw else y
+
+    a = _np_rms(x, rw["ln1"], d.eps)
+    q = lin(a, "q").reshape(n, d.nkv, d.grp, d.hd).transpose(1, 2, 0, 3)
+    k = lin(a, "k").reshape(n, d.nkv, d.hd).transpose(1, 0, 2)
+    v = lin(a, "v").reshape(n, d.nkv, d.hd).transpose(1, 0, 2)
+    q, k = _np_rope(q, cos, sin), _np_rope(k, cos, sin)
+    s = np.einsum("ngih,njh->ngij", q, k) * np.float32(d.hd**-0.5)
+    s = np.where(np.triu(np.ones((n, n), dtype=bool), 1), np.float32(NEG), s)
+    s = np.exp(s - s.max(-1, keepdims=True))
+    p = s / s.sum(-1, keepdims=True)
+    ctx = np.einsum("ngij,njh->ngih", p, v).transpose(2, 0, 1, 3).reshape(n, d.nh * d.hd)
+    h = x + lin(ctx, "o")
+    m = _np_rms(h, rw["ln2"], d.eps)
+    gate = lin(m, "gate")
+    act = gate / (np.float32(1) + np.exp(-gate))
+    h = h + lin(act * lin(m, "up"), "down")
+    return h.astype(np.float32), k.astype(np.float32), v.astype(np.float32)
+
+
 def export_scoring_onnx(
     trained: Qwen2LoraTrainedModel,
     out: IO[bytes],
     open_shard: Callable[[str], IO[bytes]],
     *,
+    system_ids: list[int],
     shard_max_bytes: int = SHARD_MAX_BYTES,
     external_threshold: int = EXTERNAL_THRESHOLD,
 ) -> list[ShardInfo]:
@@ -284,7 +352,13 @@ def export_scoring_onnx(
     記録は呼び出し側（`Qwen2LoraKind.export_onnx`。#432）の責務。上限超過（推定サイズ・
     1 テンソルが shard 上限超・shard 件数）は書く前または書き始めに `limit_exceeded`（20）、
     非有限の重みは `runtime_error`（70）。
+
+    `system_ids` は `Qwen2Tokenizer.system_turn_ids` の system 区間の id 列（P 個）。その K/V を
+    グラフへ同梱する（#634）。グラフの前提として実行時の `ids` は P+1 個以上（入力側が 1 行以上）
+    必要で、通常経路の `build_chat_ids` は P+3 以上を作る。T<=P の検査はグラフ内に無い。
     """
+    if not system_ids:
+        raise WorkerError("runtime_error", "system_ids is empty", ExitCode.RUNTIME_ERROR)
     model, tok, order = trained.model, trained.tokenizer, trained.label_order
     c = model.config
     cap = limits.max_model_bytes_for_kind("qwen2_lora")
@@ -304,7 +378,7 @@ def export_scoring_onnx(
     shards = _Shards(open_shard, shard_max_bytes)
     try:
         g = _Graph(shards, external_threshold, trained.resource_budget)
-        proto = _build(g, model, c, cand, weights, k_n, m)
+        proto = _build(g, model, c, cand, weights, k_n, m, system_ids)
         shards_done = shards.finish()
     except BaseException:
         shards._close()  # 途中で止めても開いた shard は閉じる
@@ -341,21 +415,44 @@ def _pad(rows: list[list[int]], pad_id: int) -> list[list[int]]:
 
 
 def _build(
-    g: _Graph, model: Any, c: Any, cand: np.ndarray, weights: np.ndarray, k_n: int, m: int
+    g: _Graph,
+    model: Any,
+    c: Any,
+    cand: np.ndarray,
+    weights: np.ndarray,
+    k_n: int,
+    m: int,
+    system_ids: list[int],
 ) -> onnx.ModelProto:
     d = _Dims(c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rms_norm_eps)
     inner = model.model
-    embed = g.weight("embed", _f32(inner.embed_tokens.weight))
+    emb = _f32(inner.embed_tokens.weight)
+    n_sys = len(system_ids)
+    if not all(0 <= t < emb.shape[0] for t in system_ids):
+        raise WorkerError("runtime_error", "system id out of vocab", ExitCode.RUNTIME_ERROR)
+    # system 区間の隠れ状態（f32）。層ごとに更新し、K/V を同梱する（#634）
+    sx = bf16_round(emb[np.array(system_ids, dtype=np.int64)])
+    embed = g.weight("embed", emb)
+    del emb  # 全埋め込みの f32 を層ループの間保持しない
+    spos = np.arange(n_sys, dtype=np.float32)[:, None]
+    inv = (c.rope_theta ** (-np.arange(d.hd // 2, dtype=np.float64) / (d.hd // 2))).astype(
+        np.float32
+    )
+    srope = (np.cos(spos * inv[None, :]), np.sin(spos * inv[None, :]))
+
     ids = "ids"
-    flat = g.op("Reshape", [ids, g.i64(-1)])
-    t_len = g.op("Gather", [g.op("Shape", [ids]), g.const(1, np.int64)], axis=0)  # スカラー T
+    sys_n = g.i64(n_sys)
+    flat = g.op("Reshape", [g.op("Slice", [ids, sys_n, g.i64(_INT64_MAX), g.i64(1)]), g.i64(-1)])
+    # スカラー T（ids 全体の長さ）
+    t_len = g.op("Gather", [g.op("Shape", [ids]), g.const(1, np.int64)], axis=0)
     zero, one = g.const(0, np.int64), g.const(1, np.int64)
-    pos = g.op("Range", [zero, t_len, one])
+    pos = g.op("Range", [g.const(n_sys, np.int64), t_len, one])  # 入力テキストの位置 P..T-1
     bpos = g.op("Add", [t_len, g.const(np.arange(m), np.int64)])  # [M]。ブロックの位置
+    keys = g.op("Range", [zero, t_len, one])  # 入力テキスト側のキー位置 0..T-1
     total = g.op("Range", [zero, g.op("Add", [t_len, g.const(m, np.int64)]), one])
-    # 因果マスク（真 = 遮蔽）。prefix は [T,T]、ブロックは [M,T+M]（prefix は全部見える）
+    # 因果マスク（真 = 遮蔽）。入力は [T-P,T]、ブロックは [M,T+M]（入力・system は全部見える）
     pmask = g.op(
-        "Greater", [g.op("Unsqueeze", [pos, g.i64(0)]), g.op("Unsqueeze", [pos, g.i64(1)])]
+        "Greater", [g.op("Unsqueeze", [keys, g.i64(0)]), g.op("Unsqueeze", [pos, g.i64(1)])]
     )
     bmask = g.op(
         "Greater", [g.op("Unsqueeze", [total, g.i64(0)]), g.op("Unsqueeze", [bpos, g.i64(1)])]
@@ -364,13 +461,18 @@ def _build(
 
     layer_w: list[dict[str, str]] = []
     kvs: list[tuple[str, str]] = []
-    x = g.op("Gather", [embed, flat], axis=0)  # [T,H]
+    x = g.op("Gather", [embed, flat], axis=0)  # [T-P,H]
+    kv_shape = g.i64(1, d.nkv, 1, n_sys, d.hd)
     for i, blk in enumerate(inner.layers):
         p = f"l{i}."
-        w: dict[str, str] = {
-            "ln1": g.weight(p + "ln1", _f32(blk.input_layernorm.weight)),
-            "ln2": g.weight(p + "ln2", _f32(blk.post_attention_layernorm.weight)),
-        }
+        rw: dict[str, np.ndarray] = {}  # この層の bf16 丸め済み重み（system の forward 用）
+        w: dict[str, str] = {}
+        for key, arr in (
+            ("ln1", _f32(blk.input_layernorm.weight)),
+            ("ln2", _f32(blk.post_attention_layernorm.weight)),
+        ):
+            w[key] = g.weight(p + key, arr)
+            rw[key] = bf16_round(arr)
         for key, lin in (
             ("q", blk.self_attn.q_proj),
             ("k", blk.self_attn.k_proj),
@@ -382,12 +484,17 @@ def _build(
         ):
             wt, bias = _fused(lin)
             w[key] = g.weight(p + key, wt)
+            rw[key] = bf16_round(wt)
             if bias is not None:
                 w[key + "b"] = g.weight(p + key + "b", bias)
+                rw[key + "b"] = bf16_round(bias)
         layer_w.append(w)
-        x, k, v = _layer(g, d, w, x, 1, pcs, pmask, None)
+        sx, sk, sv = _np_prefix_layer(d, rw, sx, srope)
+        pk = g.op("Reshape", [g.kv(p + "sysk", sk.reshape(-1, d.hd)), kv_shape])
+        pv = g.op("Reshape", [g.kv(p + "sysv", sv.reshape(-1, d.hd)), kv_shape])
+        x, k, v = _layer(g, d, w, x, 1, pcs, pmask, (pk, pv))
         kvs.append((k, v))
-    last = g.op("Slice", [x, g.i64(-1), g.i64(_INT64_MAX), g.i64(0)])  # prefix の最終行 [1,H]
+    last = g.op("Slice", [x, g.i64(-1), g.i64(_INT64_MAX), g.i64(0)])  # 入力テキストの最終行 [1,H]
 
     y = g.op("Gather", [embed, g.const(cand, np.int64)], axis=0)  # [K,M,H]
     y = g.op("Reshape", [y, g.i64(-1, c.hidden_size)])
