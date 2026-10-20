@@ -317,7 +317,7 @@ thread_local! {
 }
 
 /// Gemm のタイル: A の行数。
-const GEMM_MR: usize = 4;
+const GEMM_MR: usize = 6;
 /// Gemm のタイル: W の行数。
 const GEMM_NR: usize = 4;
 /// Gemm の lane 数（k を `GEMM_LANES` ごとに分けて独立に累積する。NEON 128 bit = f32 × 4）。
@@ -325,12 +325,12 @@ const GEMM_LANES: usize = 4;
 /// 1 つの仕事の単位が受け持つ W の行数（[`GEMM_NR`] の倍数。スレッドへ動的に配る粒度）。
 const GEMM_NB: usize = 16;
 /// W のブロックを使い回す A の行数（この行数分の A を L2 に留めたまま W のブロックを再走査する）。
-const GEMM_M_CHUNK: usize = 32;
+const GEMM_M_CHUNK: usize = 48;
 /// k 方向のブロック幅（[`GEMM_LANES`] の倍数）。W の展開領域を `GEMM_NR × GEMM_KB` に有界にし、
 /// 期限・停止フラグの検査間隔を高々 `GEMM_M_CHUNK × GEMM_NR × GEMM_KB` 積和（約 13 万）にする（REQ-39）。
-const GEMM_KB: usize = 1024;
-// [`gemm_tile`] の zip は A・W の 4 行ずつを明示的に並べているので、タイル幅を変えるならそこも直す
-const _: () = assert!(GEMM_MR == 4 && GEMM_NR == 4);
+const GEMM_KB: usize = 512;
+// [`gemm_tile`] の zip は A の 6 行・W の 4 行を明示的に並べているので、タイル幅を変えるならそこも直す
+const _: () = assert!(GEMM_MR == 6 && GEMM_NR == 4);
 const _: () = assert!(GEMM_KB.is_multiple_of(GEMM_LANES) && GEMM_NB.is_multiple_of(GEMM_NR));
 const _: () = assert!(GEMM_M_CHUNK.is_multiple_of(GEMM_MR));
 
@@ -433,12 +433,18 @@ fn gemm_tile(
         .zip(ac[1])
         .zip(ac[2])
         .zip(ac[3])
+        .zip(ac[4])
+        .zip(ac[5])
         .zip(wc[0])
         .zip(wc[1])
         .zip(wc[2])
         .zip(wc[3]);
-    for (((((((a0, a1), a2), a3), w0), w1), w2), w3) in steps {
-        gemm_fma(&mut local, &[*a0, *a1, *a2, *a3], &[*w0, *w1, *w2, *w3]);
+    for (((((((((a0, a1), a2), a3), a4), a5), w0), w1), w2), w3) in steps {
+        gemm_fma(
+            &mut local,
+            &[*a0, *a1, *a2, *a3, *a4, *a5],
+            &[*w0, *w1, *w2, *w3],
+        );
     }
     if !at[0].is_empty() {
         let av = at.map(gemm_load_tail);
@@ -979,12 +985,19 @@ mod tests {
 
     #[test]
     fn req28_gemm_result_is_independent_of_thread_count() {
-        // m=70 は GEMM_M_CHUNK(32) を跨ぐ 3 チャンク、n=37 は 3 単位・端数あり。
+        // m=110 は GEMM_M_CHUNK を跨ぐ 3 チャンク、m=1/5/7/47/49 はタイル端数。k=515・1030 は GEMM_KB を跨ぐ、n=37 は 3 単位・端数あり。
         // k は < 4・k%4=1/2/3・lane 割り切れを含む。f32 と bf16 の両方（REQ-28・#629）
-        let (m, n) = (70usize, 37usize);
-        assert!(m > 2 * GEMM_M_CHUNK);
+        let n = 37usize;
+        const _: () = assert!(110 > 2 * GEMM_M_CHUNK);
         let mut st = 0x9E37_79B9_7F4A_7C15u64;
-        for k in [1usize, 2, 3, 4, 5, 130, 131, 132] {
+        for (m, k) in [1usize, 5, 6, 7, 47, 48, 49, 110]
+            .into_iter()
+            .flat_map(|m| {
+                [1usize, 2, 3, 4, 5, 130, 131, 132, 515, 1030]
+                    .into_iter()
+                    .map(move |k| (m, k))
+            })
+        {
             let a = t(&[m, k], rand_f32(&mut st, m * k));
             let bias = t(&[n], rand_f32(&mut st, n));
             let wf = t(&[n, k], rand_f32(&mut st, n * k));
@@ -1128,7 +1141,10 @@ mod tests {
         let threads = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        let per = (GEMM_NR * GEMM_KB + GEMM_M_CHUNK * GEMM_NB + (GEMM_M_CHUNK / GEMM_MR) * 64) * 4;
+        let per = (GEMM_NR * GEMM_KB
+            + GEMM_M_CHUNK * GEMM_NB
+            + (GEMM_M_CHUNK / GEMM_MR) * GEMM_MR * GEMM_NR * GEMM_LANES)
+            * 4;
         assert_eq!(gemm_temp_bytes(), threads * per);
         assert!(per < 1 << 16);
         assert_eq!(gemm_temp_bytes(), gemm_temp_bytes());
