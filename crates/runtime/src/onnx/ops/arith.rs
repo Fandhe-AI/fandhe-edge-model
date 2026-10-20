@@ -259,7 +259,7 @@ fn matmul_with(
                             .get(col0..col0 + ocols.len())
                             .ok_or(OpError::ShapeMismatch)?;
                         for (o, &bv) in ocols.iter_mut().zip(bcols) {
-                            *o += av * bv;
+                            *o = mul_acc(av, bv, *o);
                         }
                     }
                 }
@@ -365,6 +365,20 @@ fn gemm_load_tail(s: &[f32]) -> [f32; GEMM_LANES] {
     v
 }
 
+/// 積和 `a * b + c`。FMA 命令がある target（aarch64・`fma` 付き）だけ融合積和にする。
+/// 無い target の `mul_add` は libm のソフトウェア実装で極端に遅いため従来式のまま（REQ-31・#636）。
+#[inline(always)]
+fn mul_acc(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+    {
+        a * b + c
+    }
+}
+
 /// タイルの 1 ステップ（lane 幅ぶんの k）: ロード済みの A・W の lane 配列を `acc` に積む。
 ///
 /// 添字は定数範囲（`GEMM_MR`・`GEMM_NR`・`GEMM_LANES`）で範囲外にならない。イテレータの zip で書くと
@@ -379,7 +393,7 @@ fn gemm_fma(
     for i in 0..GEMM_MR {
         for j in 0..GEMM_NR {
             for l in 0..GEMM_LANES {
-                acc[i][j][l] += av[i][l] * wv[j][l];
+                acc[i][j][l] = mul_acc(av[i][l], wv[j][l], acc[i][j][l]);
             }
         }
     }
@@ -990,12 +1004,13 @@ mod tests {
                     gemm_trans_b_with(Some(th), &a, &wb, Some(&bias), bf16_to_f32, None).unwrap();
                 assert_eq!(bits(&r), bits(&baseb), "bf16 k={k} threads={th}");
             }
-            // lane 別（k mod 4）に k 昇順 → lane 順 → bias の定義と一致する
+            // lane 別（k mod 4）に k 昇順（積和は [`mul_acc`]）→ lane 順 → bias の定義と一致する
             for mi in 0..m {
                 for ni in 0..n {
                     let mut lanes = [0.0f32; GEMM_LANES];
                     for kk in 0..k {
-                        lanes[kk % GEMM_LANES] += a.data()[mi * k + kk] * wf.data()[ni * k + kk];
+                        let l = kk % GEMM_LANES;
+                        lanes[l] = mul_acc(a.data()[mi * k + kk], wf.data()[ni * k + kk], lanes[l]);
                     }
                     let s = lanes.iter().fold(0.0, |s, &v| s + v) + bias.data()[ni];
                     assert_eq!(base.data()[mi * n + ni], s, "k={k} m={mi} n={ni}");
