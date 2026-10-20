@@ -120,9 +120,21 @@ impl Sink {
             }
             self.clen = 0;
         }
+        // 要素ごとの match を避け、型の分岐は 1 回にして一括で変換する（REQ-32・#635）
         let mut it = bytes.chunks_exact(self.elem);
-        for c in it.by_ref() {
-            self.emit(c);
+        match &mut self.out {
+            Out::F32(v) => v.extend(
+                it.by_ref()
+                    .filter_map(|c| c.try_into().map(f32::from_le_bytes).ok()),
+            ),
+            Out::I64(v) => v.extend(
+                it.by_ref()
+                    .filter_map(|c| c.try_into().map(i64::from_le_bytes).ok()),
+            ),
+            Out::Bf16(v) => v.extend(
+                it.by_ref()
+                    .filter_map(|c| c.try_into().map(u16::from_le_bytes).ok()),
+            ),
         }
         let rem = it.remainder();
         if let Some(dst) = self.carry.get_mut(..rem.len()) {
