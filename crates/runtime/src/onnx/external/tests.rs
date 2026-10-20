@@ -374,3 +374,114 @@ fn req39_model_limits_by_kind() {
         (1 << 30, 256, 8 << 30)
     );
 }
+
+// ---- Sink の一括変換（REQ-32・#635） ----
+
+fn new_sink(dt: i64, len: usize) -> Sink {
+    let elem = match dt {
+        DT_FLOAT => 4,
+        DT_INT64 => 8,
+        _ => 2,
+    };
+    Sink::new(&ExternalRef {
+        location: String::new(),
+        offset: 0,
+        length: len as u64,
+        data_type: dt,
+        count: len / elem,
+    })
+    .unwrap()
+}
+
+/// 変更前の実装（1 要素ずつ `emit`）。一括変換の期待値を作る基準。
+fn reference_decode(dt: i64, bytes: &[u8]) -> TensorData {
+    let mut s = new_sink(dt, bytes.len());
+    for c in bytes.chunks_exact(s.elem) {
+        s.emit(c);
+    }
+    let n = bytes.len() / s.elem;
+    s.finish(n).unwrap()
+}
+
+fn sink_decode(dt: i64, bytes: &[u8], chunk: usize) -> Sink {
+    let mut s = new_sink(dt, bytes.len());
+    for c in bytes.chunks(chunk) {
+        s.push(c);
+    }
+    s
+}
+
+#[test]
+fn req32_sink_bulk_convert_matches_per_element_reference_635() {
+    // 固定の疑似乱数バイト列。NaN のビット列も含むため Debug 表現ではなくバイト単位で比べる
+    let mut x: u32 = 0x1234_5678;
+    let raw: Vec<u8> = (0..4096)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    let to_bytes = |d: &TensorData| -> Vec<u8> {
+        match d {
+            TensorData::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            TensorData::I64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            TensorData::Bf16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            _ => Vec::new(),
+        }
+    };
+    for (dt, elem) in [(DT_FLOAT, 4usize), (DT_INT64, 8), (DT_BFLOAT16, 2)] {
+        let whole = raw.len() / elem * elem;
+        let want = reference_decode(dt, &raw[..whole]);
+        assert_eq!(to_bytes(&want), raw[..whole], "dt={dt} reference");
+        // 1 バイトずつ・要素境界の途中で切れる・要素より大きい・全量
+        for chunk in [1usize, 3, 5, 7, elem, elem + 1, 64, 1000, whole] {
+            let got = sink_decode(dt, &raw[..whole], chunk)
+                .finish(whole / elem)
+                .unwrap();
+            assert_eq!(to_bytes(&got), to_bytes(&want), "dt={dt} chunk={chunk}");
+        }
+        // 要素サイズの倍数でない長さは finish が拒否する
+        let odd = sink_decode(dt, &raw[..whole - 1], 3);
+        assert!(odd.finish(whole / elem).is_err(), "dt={dt}");
+    }
+}
+
+#[test]
+fn req32_sink_bulk_convert_through_two_shards_635() {
+    // shard をまたぐ複数テンソルで、端数つきの長さでも resolve_external 経由の値が一致する
+    let d = Dir::new();
+    let a: Vec<f32> = (0..301).map(|i| i as f32 * 0.5).collect();
+    let b: Vec<f32> = (0..77).map(|i| -(i as f32)).collect();
+    let (ba, bb) = (f32s(&a), f32s(&b));
+    let l = ExternalDataLimits {
+        max_shard_bytes: 1 << 20,
+        max_shards: 4,
+        max_total_bytes: 1 << 20,
+    };
+    let ta = ext_tensor("a", &[301], 1, "a.bin", 0, ba.len() as u64);
+    let tb = ext_tensor("b", &[77], 1, "b.bin", 0, bb.len() as u64);
+    let mut g = decode(&[ta, tb], &FT).unwrap();
+    let shards = vec![d.shard("a.bin", &ba), d.shard("b.bin", &bb)];
+    resolve_external(&mut g, shards, &l).unwrap();
+    assert!(matches!(&g.initializers[0].data, TensorData::F32(v) if v == &a));
+    assert!(matches!(&g.initializers[1].data, TensorData::F32(v) if v == &b));
+}
+
+/// 合成データでの変換速度の参考値（静かな状態ではない。実機の測定は #633）。
+#[test]
+#[ignore = "perf reference; run with --ignored --nocapture"]
+fn req32_sink_bulk_convert_timing_635() {
+    let bytes = vec![0x3fu8; 256 << 20];
+    for (name, dt) in [("bf16", DT_BFLOAT16), ("f32", DT_FLOAT)] {
+        let t = std::time::Instant::now();
+        let mut s = new_sink(dt, bytes.len());
+        for c in bytes.chunks(BUF_BYTES) {
+            s.push(c);
+        }
+        eprintln!("bulk {name} 256MiB: {:?}", t.elapsed());
+        drop(s);
+        let t = std::time::Instant::now();
+        let _ = reference_decode(dt, &bytes);
+        eprintln!("per-element {name} 256MiB: {:?}", t.elapsed());
+    }
+}
