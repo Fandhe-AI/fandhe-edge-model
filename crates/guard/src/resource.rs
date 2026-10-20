@@ -197,8 +197,13 @@ impl MemoryLimit {
 
 /// 追加学習（Qwen 1.5B 等）の種類の推論 1 件の安全上限（時間）。60 秒（REQ-39・REQ-41・TASK-39.5-4・#578）。
 ///
-/// 根拠は Qwen 1.5B の実測（1 件 2.8 秒・RSS 4.15 GB）の 2〜4 倍。出典は `poc26-result.md`
+/// 根拠は Qwen 1.5B の実測（1 件 2.8 秒・メモリ 4.15 GB）の 2〜4 倍。出典は `poc26-result.md`
 /// 判断の記録（2026-10-16）。証拠種別は実測の倍率から決めた暫定値。
+///
+/// この実測は Python・MLX を GPU（Metal）・bf16・KV の使い回しなしで動かした `predict` の p95 と、
+/// MLX のピークメモリ（RSS ではない。同じ測定の `/usr/bin/time -l` の最大 RSS は 6.37 GB）。
+/// 本 crate が守る Rust の推論ランタイム（CPU）の実機値は、推論 1 件あたり約 7.2 秒・最大 RSS 約 3.39 GB
+/// （1.5B・bf16。件数差分による推定。#442）で、上限の 60 秒・8 GiB はどちらに対しても余裕がある（#632）。
 pub const FINETUNE_INFER_TIME_LIMIT: Duration = Duration::from_secs(60);
 
 /// 追加学習の種類の安全上限（RSS）。8 GiB（2^30 × 8。REQ-39・REQ-41・TASK-39.5-4・#578）。
