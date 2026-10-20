@@ -535,7 +535,8 @@ class Qwen2LoraKind:
         from ..artifact import INPUT_REPRESENTATION_KEY, TOKENIZER_FILE_NAME, HashingWriter
         from ..qwen2_onnx import export_scoring_onnx
 
-        shards = export_scoring_onnx(trained, out, open_member)
+        system_ids = trained.tokenizer.system_turn_ids(_system_prompt(trained.label_order))
+        shards = export_scoring_onnx(trained, out, open_member, system_ids=system_ids)
         with open_member(TOKENIZER_FILE_NAME) as f:
             tok_writer = HashingWriter(f)
             tok_writer.write(trained.tokenizer_bytes)

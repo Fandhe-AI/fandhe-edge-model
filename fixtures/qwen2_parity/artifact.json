@@ -35,8 +35,8 @@
   "output_type": "choice",
   "max_bytes": 64,
   "onnx_file": "model.onnx",
-  "onnx_sha256": "b91a033efeb38f7b0d95d07a78269774dbb1235402c119bf4495390d16996ae6",
-  "created_utc": "2026-10-17T14:01:13Z",
+  "onnx_sha256": "f0491d3fe941df04b3c4964791ced4836516d599593fd939f82d9508da60ad8f",
+  "created_utc": "2026-10-20T03:20:59Z",
   "candidate_label": "qwen2_lora",
   "input_representation": "tokenizer",
   "tokenizer_file": "tokenizer.json",
@@ -44,8 +44,8 @@
   "external_data": [
     {
       "location": "weights-00000.bin",
-      "size_bytes": 15744,
-      "sha256": "c525e45dfc162fbb7f51b490a6c1013bb4cd40fe399e2ec2ec2284ec685ab7f9"
+      "size_bytes": 25472,
+      "sha256": "e30606f1c79af59b75d818306d35a78afebb82f6a0b1e254e8a40b6be3e579a1"
     }
   ],
   "scoring": {

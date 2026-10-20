@@ -50,6 +50,10 @@ class Keep(io.BytesIO):
         pass
 
 
+def _sys_ids(trained) -> list[int]:
+    return trained.tokenizer.system_turn_ids(q._system_prompt(trained.label_order))
+
+
 def export(trained, **kw):
     files: dict[str, Keep] = {}
 
@@ -58,7 +62,7 @@ def export(trained, **kw):
         return files[name]
 
     out = io.BytesIO()
-    infos = qo.export_scoring_onnx(trained, out, open_shard, **kw)
+    infos = qo.export_scoring_onnx(trained, out, open_shard, system_ids=_sys_ids(trained), **kw)
     return out.getvalue(), {n: f.getvalue() for n, f in files.items()}, infos
 
 
@@ -125,10 +129,7 @@ def exported(request, base, tmp_path_factory):
     return trained, mb, shards, infos, load(mb, shards, tmp_path_factory.mktemp("x"))
 
 
-def _r(a: np.ndarray) -> np.ndarray:
-    """bf16 へ丸めて f32 へ戻す。"""
-    u = np.frombuffer(qo.bf16_bytes(a), dtype="<u2").astype(np.uint32) << 16
-    return u.view(np.float32).reshape(a.shape)
+_r = qo.bf16_round
 
 
 def reference_model(trained) -> Qwen2Model:
@@ -274,7 +275,9 @@ def test_estimated_size_over_limit_is_limit_exceeded(base, monkeypatch) -> None:
     monkeypatch.setattr(limits, "MAX_MODEL_BYTES_BY_KIND", {"qwen2_lora": 1000})
     opened: list[str] = []
     with pytest.raises(WorkerError) as e:
-        qo.export_scoring_onnx(base, io.BytesIO(), lambda n: opened.append(n) or Keep())
+        qo.export_scoring_onnx(
+            base, io.BytesIO(), lambda n: opened.append(n) or Keep(), system_ids=_sys_ids(base)
+        )
     assert e.value.exit_code == ExitCode.LIMIT_EXCEEDED
     assert opened == []
 
@@ -320,3 +323,50 @@ def test_node_and_initializer_counts_at_28_layers(base) -> None:
     print("nodes", len(proto.graph.node), "initializers", len(proto.graph.initializer))
     assert len(proto.graph.node) <= 4096
     assert len(proto.graph.initializer) <= 1024
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "\nfoo", " lead space", "a<|im_start|>b<|im_end|>c", "long " * 200, "日本語\n\n"],
+)
+def test_system_turn_ids_is_prefix_of_chat_ids(base, text) -> None:
+    """REQ-41・#634: system 区間の id 列は入力に依らず build_chat_ids の先頭と一致する。"""
+    tok, order = base.tokenizer, base.label_order
+    sysp = q._system_prompt(order)
+    p = tok.system_turn_ids(sysp)
+    assert p[0] == tok.special_ids["im_start"]
+    assert len(p) > 3
+    assert tok.build_chat_ids(sysp, text, add_generation_prompt=True)[: len(p)] == p
+    assert tok.build_chat_ids(sysp, text, "x", add_generation_prompt=False)[: len(p)] == p
+
+
+def test_export_is_deterministic(base) -> None:
+    """REQ-41・REQ-28・#634: 同じモデルを 2 回書き出すと model.onnx と各 shard の sha256 が一致。"""
+    a = export(base, shard_max_bytes=SHARD_MAX, external_threshold=THRESHOLD)
+    b = export(base, shard_max_bytes=SHARD_MAX, external_threshold=THRESHOLD)
+    assert a[0] == b[0]
+    assert [(i.name, i.size, i.sha256) for i in a[2]] == [(i.name, i.size, i.sha256) for i in b[2]]
+
+
+def test_system_kv_is_bundled_and_graph_ignores_system_ids(exported) -> None:
+    """REQ-41・#634: K/V が f32 initializer で同梱され、ids の先頭 P 個を書き換えても結果が同じ。"""
+    trained, _, _, _, proto = exported
+    names = {t.name: t for t in proto.graph.initializer}
+    n = len(trained.model.model.layers)
+    assert all(names[f"l{i}.sys{x}"].data_type == TensorProto.FLOAT for i in range(n) for x in "kv")
+    ids = trained.tokenizer.build_chat_ids(
+        q._system_prompt(trained.label_order), "abc", add_generation_prompt=True
+    )
+    p = len(_sys_ids(trained))
+    sess = evaluator(proto)
+    (a,) = sess.run(None, {"ids": np.array([ids], dtype=np.int64)})
+    (b,) = sess.run(None, {"ids": np.array([[0] * p + ids[p:]], dtype=np.int64)})
+    np.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.parametrize("bad", [[], [-1], [10**9]])
+def test_invalid_system_ids_is_runtime_error(base, bad) -> None:
+    """REQ-41・#634: system_ids が空または語彙範囲外なら書く前に runtime_error(70)。"""
+    with pytest.raises(WorkerError) as e:
+        qo.export_scoring_onnx(base, io.BytesIO(), lambda n: Keep(), system_ids=bad)
+    assert e.value.exit_code == ExitCode.RUNTIME_ERROR

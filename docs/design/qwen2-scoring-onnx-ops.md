@@ -1,6 +1,6 @@
 # Qwen2 採点グラフの ONNX 演算一覧
 
-対応: REQ-41・TASK-41.7-1・M12・issue #415（依存 #394。前提の決定 #405・#409・#392）。関連 REQ: REQ-28（推論の一致）・REQ-32（学習非依存の推論）・REQ-39（ガード層）。
+対応: REQ-41・TASK-41.7-1・M12・issue #415（依存 #394。前提の決定 #405・#409・#392）。system 区間の KV 同梱は #634（REQ-41・REQ-31）。関連 REQ: REQ-28（推論の一致）・REQ-31（推論の容量・遅延）・REQ-32（学習非依存の推論）・REQ-39（ガード層）。
 
 - 本書は自作の推論バックエンド（`crates/runtime/src/onnx/`）が Qwen2 系の採点グラフに対して許す演算・属性・データ型・rank の一覧と、範囲外を除外する方針を定める。**一覧が唯一の正**で、変更は本書の更新を先に行う
 - 本書は文書のみ。コード・fixture・`docs/spec` は変更しない。演算の実装は #416〜#419・#581、書き出しは #431、除外理由の実装は #433
@@ -21,6 +21,7 @@
 隠れ状態は 2 次元 `[rows, H]` で持つ。prefix は `rows=T`、選択肢ブロックは `rows=K*M`。線形層がすべて `Gemm(transB=1)` になり、重みを HF の (out, in) のまま bf16 で持てる（転置コピーを作らない）。
 
 1. 共通の前処理: `Reshape(ids,[-1])`。`Shape`・`Gather`（INT64 の形状から INT64 スカラー T を取る。出力は INT64 のまま `Range(0,T,1)` へ渡す）で位置を作り、`Cast`（INT64 → FLOAT）・`Unsqueeze`・`Mul(inv_freq)` から `Cos`・`Sin` で RoPE 表を作る。prefix の因果マスクは `Unsqueeze`・`Greater` → `Where(future, -1e30, s)`（Trilu は opset 14 のため使わない）
+   - system 区間の同梱（#634）: 入力 `ids [N,T]` の先頭 P 列（`[im_start, encode("system\n"+system), im_end, encode("\n")]`。特殊トークンで区切られ区間ごとに encode されるため、入力テキストに依らず不変。P はラベル集合で決まる定数）は採点に使わない。先頭で `Slice(ids, P, ∞, axis=1)` して入力テキスト以降（長さ T-P）だけを forward する。入力側の位置は `Range(P, T)`、選択肢ブロックの位置は従来どおり `T + arange(M)`。グラフ入力の形 `ids [N,T]` は変えない。前提として実行時の `ids` は P+1 個以上（通常経路の `build_chat_ids` は P+3 以上を作る）。T<=P の拒否はグラフ内に無い
 2. 埋め込み: 論理グラフは `Gather(Cast(embed_bf16), ids)`（BFLOAT16 は initializer と Cast の入力にだけ現れ、Gather の出力は FLOAT）。実行時は Cast と Gather を融合し、参照された行だけを f32 に展開する。埋め込み全体は f32 に展開しない
 3. 各層（prefix）
    - RMSNorm: `Mul(x,x)` → `ReduceMean` → `Add(eps)` → `Sqrt` → `Reciprocal` → `Mul` → `Mul(Cast(w_bf16))`
@@ -30,9 +31,10 @@
    - 注意: `Transpose(k)` → `MatMul` → `Mul(scale)` → `Where` → `Softmax` → `MatMul(v)` → `Transpose` → `Reshape`。残差は `Add`
    - SwiGLU: `Sigmoid` → `Mul`（SiLU）、`Mul(up)` → `Gemm(down)`
    - 各層で RoPE 後の K と V をブロック側へ渡す
+   - 同梱 K/V（#634）: system 区間の K/V（RoPE 適用後・位置 0〜P-1・f32）を層ごとの定数として持ち、入力側の prefix の K/V の前へ `Concat`（seq 軸）する。system の列は全行から見え、因果マスクは入力側の列に掛ける。定数は rank 2 `[nkv*P, hd]` の initializer で保存し、`Reshape` で `[1,nkv,1,P,hd]` に戻す。値は package 時に numpy f32 で層ごとに prefix forward して計算する（`qwen2_onnx.py`）
 4. 選択肢ブロック（K 件。長さ M に右 pad した定数 `cand: INT64 [K,M]`。pad は `endoftext`）
    - 位置は `Add(Cast(T), arange(M))`（arange は定数）から RoPE 表
-   - prefix の KV を `Expand` で K 件に広げ、ブロックの KV と `Concat`（seq 軸）で連結する
+   - prefix の KV（同梱の system 分を含む）を `Expand` で K 件に広げ、ブロックの KV と `Concat`（seq 軸）で連結する
    - スコアに加算マスクを足す。prefix は全位置を見せ、ブロック内は因果（`Where`）。pad は実 token の後ろにあるため、因果マスクで実 token からは見えない
    - 残りは prefix の層と同じ演算
 5. 採点
@@ -45,7 +47,7 @@
    - OneHot＋ReduceSum による対数尤度の取り出し: GatherElements の 1 演算で足りる
    - スコアを Concat して KV の Expand を避ける案: 演算が増える。Expand のコピーは層ごとに一時的（推定: 数十 MB 程度）
    - `MatMul(h, Transpose(embed))`: 実行時に転置コピー（約 0.9 GB。推定）が要る
-   - system プロンプト部の KV を書き出し時に定数化する案（#405）: 対象外・将来
+   - system プロンプト部の KV を書き出し時に定数化する案（#405）: #634 で採用（2 節の同梱 K/V）。同梱の容量は f32 で約 10 MB（28 層・nkv 2・hd 128・P=176 の場合の推定）
 
 ## 3. 演算一覧（opset 13）
 
@@ -64,8 +66,8 @@
 | Reshape | heads・平坦化 | shape は INT64 の入力。0 と -1 の意味は opset 13 のとおり | #417 |
 | Transpose | heads・k の転置 | `perm` は rank と一致する順列 | #417 |
 | Unsqueeze | 次元の追加 | axes は入力（opset 13） | #417 |
-| Concat | RoPE・KV の seq 連結・行の連結 | axis を明示する。入力数に上限 | #417 |
-| Slice | 最後の行・ブロックの前半 | starts・ends・axes は入力。steps は省略か 1 | #417 |
+| Concat | RoPE・KV の seq 連結（同梱 K/V を含む）・行の連結 | axis を明示する。入力数に上限 | #417 |
+| Slice | 最後の行・ブロックの前半・入力 ids の先頭 P 列の除外（#634） | starts・ends・axes は入力。steps は省略か 1 | #417 |
 | Split | RoPE の半分割 | `axis=-1`。split は入力で、等分 2 つ | #417 |
 | Expand | prefix の KV・最後の行を K 件に複製 | shape は INT64 の入力 | #417 |
 | ReduceMean | RMSNorm | axes は属性で `[-1]`。`keepdims=1` | #418 |
@@ -73,21 +75,22 @@
 | Sigmoid | SiLU | FLOAT | #418 |
 | Softmax | 注意・最終出力 | `axis=-1`。グラフ出力を作る Softmax だけ f64 | #418 |
 | LogSoftmax | 採点 | `axis=-1`。max を引く数値安定化を行う | #418 |
-| Range | 位置 | INT64 のスカラー start・limit・delta。要素数に上限 | #419 |
+| Range | 位置（入力側は `Range(P, T)`。#634） | INT64 のスカラー start・limit・delta。要素数に上限 | #419 |
 | Greater | 因果マスク | INT64 の入力。BOOL を出力 | #419 |
 | Where | マスク | cond は BOOL、値は FLOAT | #419 |
 | Sin / Cos | RoPE | FLOAT | #419 |
 
-- 合計 28 種。内訳: PoC の未対応 11 種、既存の C1・C3 にある 11 種（Add・Mul・Gemm・Gather・Softmax・Cast・Concat・Transpose・Unsqueeze・Sub・ReduceSum）、新規 6 種（Slice・Expand・GatherElements・LogSoftmax・Sqrt・Greater）
+- 合計 28 種（#634 の同梱後も 28 種のまま。新しい演算は加えず、Slice・Concat・Reshape の利用箇所が増える）。内訳: PoC の未対応 11 種、既存の C1・C3 にある 11 種（Add・Mul・Gemm・Gather・Softmax・Cast・Concat・Transpose・Unsqueeze・Sub・ReduceSum）、新規 6 種（Slice・Expand・GatherElements・LogSoftmax・Sqrt・Greater）
 - 既存の C1・C3 にある演算も、汎用の形（ブロードキャスト・高い rank）では実装し直す。C1・C3 の既存テンプレート照合と上限は変えない
 - 実装者向けの確認: 2 節の各手順で使う演算の和集合と本表が一致すること。autoregressive 専用の演算（Erf・CumSum・And・Equal・Less・GreaterOrEqual・Div 等）は本表に無い
 
 ## 4. データ型・rank・件数
 
-- FLOAT: 計算。INT64: id・形状・index。BOOL: 中間値に限る（Greater の出力・Where の cond。initializer には使わない）。BFLOAT16: initializer に限る（`proto.rs` に `DT_BFLOAT16 = 16` を足す。#581）。それ以外（FLOAT16・DOUBLE・INT32 等）は拒否
+- FLOAT: 計算。同梱 K/V（#634）は FLOAT の initializer として外部データの shard に置く（閾値 1024 バイト未満は inline。§8）。INT64: id・形状・index。BOOL: 中間値に限る（Greater の出力・Where の cond。initializer には使わない）。BFLOAT16: initializer に限る（`proto.rs` に `DT_BFLOAT16 = 16` を足す。#581）。それ以外（FLOAT16・DOUBLE・INT32 等）は拒否
 - bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体は f32 に展開しない（1.5B で約 6.2 GB〔推定〕となり RSS 安全上限 8 GiB に近いため。#581 の決定）。bf16 は `u16` のまま保持し、外部データは shard 単位で流し読みして生バイトの全量を持たない。RSS の実測は #421・#435
 - rank: 中間値は 5 以下（GQA の `[1,nkv,grp,T,hd]`）。initializer は 2 以下。C1・C3 の `MAX_DIMS=4` は変えず、上限は種類ごとに持つ
 - 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る。#581 の暫定値（推定。#431 の実測で見直す）: ノード 4096・initializer 1024・rank 5・本体 64 MiB、外部データは shard 1 GiB・256 件・合計 8 GiB（ガード層の #580 と同じ）。C1・C3 は 128・64・4・44 MiB のまま外部データと bf16 を拒否する
+- #634 で増える: 同梱 K/V のための Slice・Concat・Reshape と、層ごとの K・V の initializer 2 つ（28 層で 56）。28 層（極小次元の合成モデル）の実測はノード 3,862・initializer 425（証拠の種別: テストハーネス）で、暫定上限 4096・1024 の内。ノードの余裕は 234
 - 動的な次元は T だけ（`max_seq_length` と `max_position_embeddings` で上限を持つ）。K と M は定数
 
 ## 5. 範囲外を除外する方針
@@ -162,7 +165,7 @@
 | ファイル | 内容 |
 | -------- | ---- |
 | `artifact.json` | 既存の 11 欄＋下表の追加欄 |
-| `model.onnx` | 採点グラフ（opset 13）。重みは外部データで shard を参照 |
+| `model.onnx` | 採点グラフ（opset 13）。同梱 K/V（#634）を含む。重みは外部データで shard を参照 |
 | `weights-NNNNN.bin` | 外部データ shard（1 件 1 GiB 以下・256 件以下） |
 | `tokenizer.json` | ベースモデルの `tokenizer.json` を、sha256 照合済みのバイト列のまま複写 |
 
@@ -178,6 +181,7 @@
 
 - 完全性: `verify_output` が確定直前に `model.onnx`・`tokenizer.json`・全 shard の sha256 とサイズを照合する。記録された名前は字句規則（英数字と `._-`・先頭 `.` 不可・128 文字以下）と予約名で検査してから `dir_fd` 相対・`O_NOFOLLOW` で開く。Rust の `crates/train` は結果 JSON の追加欄を同じ規則で検証する
 - 受け入れテスト: `trainer/tests/test_qwen2_lora_package.py`（CLI で学習し、複写先で `tokenizer.json`・`scoring` から ONNX 推論して学習側の予測と一致）。証拠種別: テストハーネス（ReferenceEvaluator・CPU）
+- #634（system の KV 同梱）: グラフ内部の変更のみ。入出力契約（`ids: INT64 [N,T]` → `probs: FLOAT [N,K]`）・`artifact.json` の欄・`kind_version` は変えない（2026-10-20 オーナー承認）。同梱後は `scoring.system_prompt` を書き換えても予測は変わらない（グラフは `ids` の先頭 P 列を参照しない。文の内容・長さを実行時に照合する処理は無い）。トークン化の誤りは全件一致テストと tokenizer の golden テストで守る
 - 範囲外: Rust の `package`・`infer` での受け入れは #434 の実行器（§10）の後続（現状は `input_representation: tokenizer` を `invalid_input` で拒否）。`base_model_*` を CLI から渡す配線も後続
 
 ## 10. 推論側の実行器と全件一致（TASK-41.6-5・#434）

@@ -135,6 +135,9 @@ impl TokenizerPreprocessor {
     }
 }
 
+/// system 区間を含む chat 全体の id 列を返す。#634 以降のパッケージでは採点グラフが system 区間
+/// （先頭 P 列）の K/V を同梱し、`ids[:P]` を参照しない（P はグラフ内の定数。REQ-41・REQ-31）。
+/// 長さ検査は従来どおり全体の長さで行う（学習側の予測と同じ定義を保つため）。
 impl Preprocessor for TokenizerPreprocessor {
     fn preprocess(&self, input: &str) -> Result<TokenIds, PreprocessError> {
         let ids = self
