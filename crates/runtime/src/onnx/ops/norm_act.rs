@@ -19,6 +19,7 @@
 //! - 縮約・合計は単一スレッドで添字の昇順に加算し、スレッド数に依存させない（REQ-28）
 //! - 形状は [`element_count`]・[`Tensor::new`] で上限照合してから確保する（REQ-39）。panic しない
 
+use super::arith::{map1, par_collect};
 use super::shape::normalize_axis;
 use super::{OpError, Tensor, advance_index, element_count};
 
@@ -96,41 +97,48 @@ pub fn reduce_sum(x: &Tensor<f32>, axes: &Tensor<i64>) -> Result<Tensor<f32>, Op
 /// Sigmoid（FLOAT）。SiLU は #416 の Mul と組み合わせる。
 /// `exp` の引数を常に非正にしてあふれを避ける。±inf は 1・0、NaN は伝播する。
 pub fn sigmoid(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    let out = x
-        .data()
-        .iter()
-        .map(|&v| {
-            if v >= 0.0 {
-                1.0 / (1.0 + (-v).exp())
-            } else {
-                let e = v.exp();
-                e / (1.0 + e)
-            }
-        })
-        .collect();
-    Tensor::new(x.shape().to_vec(), out)
+    // `exp` を含むので重み 4（#648）
+    map1(x, 4, |v| {
+        if v >= 0.0 {
+            1.0 / (1.0 + (-v).exp())
+        } else {
+            let e = v.exp();
+            e / (1.0 + e)
+        }
+    })
 }
 
 /// 行ごとに非有限を拒否し max を求め、`f(row, max, out)` で行を変換して連結する。
-fn map_rows<T>(
+/// 行は [`par_collect`] で連続範囲に分けて並列に処理する（1 行は 1 ワーカーで、行内の順序は不変。
+/// REQ-28・#648）。`weight` は 1 要素あたりの重み。
+fn map_rows<T: Send>(
     x: &Tensor<f32>,
-    mut f: impl FnMut(&[f32], f32, &mut Vec<T>) -> Result<(), OpError>,
+    weight: usize,
+    f: impl Fn(&[f32], f32, &mut Vec<T>) -> Result<(), OpError> + Sync,
 ) -> Result<(Vec<usize>, Vec<T>), OpError> {
     let d = last_dim(x.shape())?;
-    let mut out = Vec::with_capacity(x.data().len());
-    for row in x.data().chunks(d) {
-        if row.iter().any(|v| !v.is_finite()) {
-            return Err(OpError::NonFinite);
+    let rows = x.data().len() / d;
+    let out = par_collect(rows, weight.saturating_mul(d), |r| {
+        let part = x
+            .data()
+            .get(r.start * d..r.end * d)
+            .ok_or(OpError::ShapeMismatch)?;
+        let mut out = Vec::with_capacity(part.len());
+        for row in part.chunks(d) {
+            if row.iter().any(|v| !v.is_finite()) {
+                return Err(OpError::NonFinite);
+            }
+            let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            f(row, max, &mut out)?;
         }
-        let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-        f(row, max, &mut out)?;
-    }
+        Ok(out)
+    })?;
     Ok((x.shape().to_vec(), out))
 }
 
 /// Softmax（axis=-1）。max を引いて f32 で計算する。注意の重みに使う。
 pub fn softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    let (shape, out) = map_rows(x, |row, max, out| {
+    let (shape, out) = map_rows(x, 4, |row, max, out| {
         let start = out.len();
         let mut sum = 0.0f32;
         for &v in row {
@@ -146,7 +154,7 @@ pub fn softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
 
 /// Softmax（axis=-1）の f64 出力。グラフ出力 `probs` 用で、C1・C3 と同じ `softmax_f64` を行ごとに使う。
 pub fn softmax_last_axis_f64(x: &Tensor<f32>) -> Result<Tensor<f64>, OpError> {
-    let (shape, out) = map_rows(x, |row, _, out| {
+    let (shape, out) = map_rows(x, 4, |row, _, out| {
         out.extend(super::super::softmax_f64(row).map_err(|_| OpError::NonFinite)?);
         Ok(())
     })?;
@@ -155,7 +163,7 @@ pub fn softmax_last_axis_f64(x: &Tensor<f32>) -> Result<Tensor<f64>, OpError> {
 
 /// LogSoftmax（axis=-1）。`x - max - ln(Σ exp(x - max))` で桁あふれ・桁落ちを避ける。採点に使う。
 pub fn log_softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    let (shape, out) = map_rows(x, |row, max, out| {
+    let (shape, out) = map_rows(x, 4, |row, max, out| {
         let sum: f32 = row.iter().fold(0.0f32, |a, &v| a + (v - max).exp());
         let lse = sum.ln();
         out.extend(row.iter().map(|&v| (v - max) - lse));
@@ -288,5 +296,34 @@ mod tests {
             log_softmax_last_axis(&t(&[1], &[f32::INFINITY])),
             Err(OpError::NonFinite)
         );
+    }
+
+    /// Sigmoid・Softmax・LogSoftmax の並列版が 1 スレッド版とビット一致する（REQ-28・#648）。
+    #[test]
+    fn req28_sigmoid_softmax_parallel_match_serial_648() {
+        use super::super::arith::with_threads;
+        let (rows, d) = (157usize, 901usize); // 行数が分割数で割り切れない・しきい値超え
+        let data: Vec<f32> = (0..rows * d)
+            .map(|i| ((i as f32) * 0.013).sin() * 9.0 - 1.0)
+            .collect();
+        let x = t(&[rows, d], &data);
+        let bits = |r: Tensor<f32>| r.data().iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+        type Op = fn(&Tensor<f32>) -> Result<Tensor<f32>, OpError>;
+        for op in [sigmoid as Op, softmax_last_axis, log_softmax_last_axis] {
+            let want = bits(with_threads(1, || op(&x)).unwrap());
+            for th in [2, 3, 7] {
+                assert_eq!(
+                    bits(with_threads(th, || op(&x)).unwrap()),
+                    want,
+                    "threads={th}"
+                );
+            }
+            assert_eq!(bits(op(&x).unwrap()), want);
+        }
+        // 非有限は並列でも拒否する
+        let mut bad = data.clone();
+        bad[5 * d + 3] = f32::NAN;
+        let r = with_threads(4, || softmax_last_axis(&t(&[rows, d], &bad)));
+        assert_eq!(r, Err(OpError::NonFinite));
     }
 }

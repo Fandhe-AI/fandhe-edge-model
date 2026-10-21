@@ -272,7 +272,7 @@ fn finish(h: &Tensor<f32>) -> R<Vec<f64>> {
 }
 
 /// `axis` 方向の `[from, to)` を切り出す。
-fn rows<T: Copy>(x: &Tensor<T>, axis: i64, from: usize, to: usize) -> R<Tensor<T>> {
+fn rows<T: Copy + Send + Sync>(x: &Tensor<T>, axis: i64, from: usize, to: usize) -> R<Tensor<T>> {
     slice(
         x,
         &ivec(&[from as i64]),

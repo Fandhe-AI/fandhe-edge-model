@@ -20,6 +20,7 @@
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致、または IEEE の単一演算とのビット一致で比べる
 
+use std::ops::Range;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -56,18 +57,31 @@ pub fn add_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<i64>, OpError>
 }
 
 /// 要素ごとの単項演算。
-pub(crate) fn map1(x: &Tensor<f32>, f: impl Fn(f32) -> f32) -> Result<Tensor<f32>, OpError> {
-    Tensor::new(x.shape().to_vec(), x.data().iter().map(|&v| f(v)).collect())
+/// 大きい入力は [`par_collect`] で連続範囲に分けて並列に計算する（#648）。`weight` は 1 要素あたりの重み。
+pub(crate) fn map1(
+    x: &Tensor<f32>,
+    weight: usize,
+    f: impl Fn(f32) -> f32 + Sync,
+) -> Result<Tensor<f32>, OpError> {
+    let d = x.data();
+    let out = par_collect(d.len(), weight, |r| {
+        Ok(d.get(r)
+            .ok_or(OpError::ShapeMismatch)?
+            .iter()
+            .map(|&v| f(v))
+            .collect())
+    })?;
+    Tensor::new(x.shape().to_vec(), out)
 }
 
 /// Sqrt（FLOAT）。負は NaN。
 pub fn sqrt(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, f32::sqrt)
+    map1(x, 1, f32::sqrt)
 }
 
 /// Reciprocal（FLOAT）。0 は inf。
 pub fn reciprocal(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, |v| 1.0 / v)
+    map1(x, 1, |v| 1.0 / v)
 }
 
 /// Cast（`to=FLOAT`）。入力は BFLOAT16（u16 のビット列）。
@@ -113,7 +127,7 @@ fn worker_count(macs: usize, items: usize) -> usize {
 /// `worker` を `threads` 本で走らせ、最初のエラーを返す。各 worker は `stop` を見て早期に抜ける。
 /// スレッドの panic（本モジュールは panic しない設計だが念のため）は計算不能として
 /// [`OpError::LimitExceeded`] に写し、結果を返さない（fail-closed）。
-fn run_workers(
+pub(super) fn run_workers(
     threads: usize,
     worker: impl Fn(&AtomicBool) -> Result<(), OpError> + Sync,
 ) -> Result<(), OpError> {
@@ -146,6 +160,81 @@ fn run_workers(
         return Err(OpError::LimitExceeded);
     }
     Ok(())
+}
+
+/// 要素ごとの演算を並列化する仕事量のしきい値（#648）。仕事量 = 要素数 × 1 要素あたりの重み（単純な
+/// 四則・コピーが 1、`exp` を含む演算が 4）。これ未満は 1 スレッドのまま走らせる。
+/// 根拠（実機の演算別ログ、PR #647 後。証拠種別: テストハーネス）: 単純演算は約 1.7 ns/要素、Sigmoid は約
+/// 4.5 ns/要素で、スレッドの生成と join は 1 本あたり十数 µs。仕事量 2^17 ≒ 13 万は単純演算で約 0.2 ms
+/// （起動コストの数倍）なので、それ未満は並列化の利得が出ない。
+pub(super) const PARALLEL_MIN_WORK: usize = 1 << 17;
+
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: `Some(n)` なら [`par_collect`] がしきい値を無視して n 本で走らせる（呼び出しスレッドで読む）。
+    pub(super) static TEST_FORCE_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト専用: `threads` 本に固定して `f` を実行する（しきい値を無視。REQ-28・#648）。
+#[cfg(test)]
+pub(super) fn with_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+    TEST_FORCE_THREADS.set(Some(threads));
+    let r = f();
+    TEST_FORCE_THREADS.set(None);
+    r
+}
+
+/// `0..units` を連続した範囲に分けて `f` を並列に走らせ、各範囲の結果を範囲の順に連結して返す。
+///
+/// 仕事量 `units × weight` が [`PARALLEL_MIN_WORK`] 未満なら呼び出しスレッドだけで `f(0..units)`。
+/// 各出力要素は 1 つの範囲の中で計算されるので、結果はスレッド数に依存しない（REQ-28）。スレッド数は
+/// `available_parallelism` と `units` で頭打ち（REQ-39）。`f` の返す長さの合計が出力の長さになる。
+pub(super) fn par_collect<U: Send>(
+    units: usize,
+    weight: usize,
+    f: impl Fn(Range<usize>) -> Result<Vec<U>, OpError> + Sync,
+) -> Result<Vec<U>, OpError> {
+    let threads = if units.saturating_mul(weight) < PARALLEL_MIN_WORK {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    };
+    #[cfg(test)]
+    let threads = TEST_FORCE_THREADS.get().unwrap_or(threads);
+    let threads = threads.min(units).max(1);
+    if threads == 1 {
+        return f(0..units);
+    }
+    let per = units.div_ceil(threads);
+    let jobs: Mutex<Vec<(usize, Range<usize>)>> = Mutex::new(
+        (0..units.div_ceil(per))
+            .map(|i| (i, i * per..((i + 1) * per).min(units)))
+            .collect(),
+    );
+    let done: Mutex<Vec<(usize, Vec<U>)>> = Mutex::new(Vec::new());
+    run_workers(threads, |stop| {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let Some((i, r)) = jobs.lock().ok().and_then(|mut v| v.pop()) else {
+                return Ok(());
+            };
+            let part = f(r)?;
+            done.lock()
+                .map_err(|_| OpError::LimitExceeded)?
+                .push((i, part));
+        }
+    })?;
+    let mut parts = done.into_inner().map_err(|_| OpError::LimitExceeded)?;
+    parts.sort_by_key(|(i, _)| *i);
+    let mut out = Vec::with_capacity(parts.iter().map(|(_, p)| p.len()).sum());
+    for (_, p) in parts {
+        out.extend(p);
+    }
+    Ok(out)
 }
 
 /// MatMul（FLOAT）。両入力 rank 2〜[`MAX_RANK`]。先頭（バッチ）次元は numpy 方式でブロードキャストする。
@@ -1221,5 +1310,29 @@ mod tests {
         // SiLU: x * sigmoid(x)。x=0 -> 0
         let z = t(&[1], vec![0.0]);
         assert_eq!(mul(&z, &sigmoid(&z).unwrap()).unwrap().data(), &[0.0]);
+    }
+
+    /// 仕事量がしきい値の直前は 1 スレッド・以上は並列でも、結果が同じ（REQ-28・#648）。
+    #[test]
+    fn req28_par_collect_threshold_boundary_matches_serial_648() {
+        let f = |r: Range<usize>| -> Result<Vec<u64>, OpError> {
+            Ok(r.map(|i| (i * i) as u64).collect())
+        };
+        for units in [
+            PARALLEL_MIN_WORK - 1,
+            PARALLEL_MIN_WORK,
+            PARALLEL_MIN_WORK + 7,
+        ] {
+            let want: Vec<u64> = (0..units).map(|i| (i * i) as u64).collect();
+            assert_eq!(par_collect(units, 1, f).unwrap(), want, "{units}");
+            for t in [1, 3, 8] {
+                assert_eq!(with_threads(t, || par_collect(units, 1, f)).unwrap(), want);
+            }
+        }
+        // 範囲のエラーは呼び出し元へ返る
+        let e = with_threads(4, || {
+            par_collect(100, 1, |_| Err::<Vec<u8>, _>(OpError::NonFinite))
+        });
+        assert_eq!(e, Err(OpError::NonFinite));
     }
 }

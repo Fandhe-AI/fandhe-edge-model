@@ -235,59 +235,82 @@ fn inner_block(
 /// 2 入力の要素ごとの演算を多方向ブロードキャストで適用する。出力型 `U` は入力と異なってよい。
 /// 同形状・スカラー・末尾ブロードキャストなど、最内ブロックが連続または定数になる形は
 /// ブロック単位のループで処理する。要素の適用順と各要素の計算は汎用経路と同一（REQ-28・#637）。
-pub fn broadcast_map2<A: Copy, B: Copy, U>(
+/// 出力要素数が [`arith::PARALLEL_MIN_WORK`] 以上なら、出力を連続した要素範囲に分けて並列に計算する。
+/// 各要素は独立に計算されるので結果はスレッド数に依存しない（REQ-28・#648）。
+pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Send>(
     a: &Tensor<A>,
     b: &Tensor<B>,
-    mut f: impl FnMut(A, B) -> Result<U, OpError>,
+    f: impl Fn(A, B) -> Result<U, OpError> + Sync,
 ) -> Result<Tensor<U>, OpError> {
     let out_shape = broadcast_shape(a.shape(), b.shape())?;
     let n = element_count(&out_shape)?;
     let rank = out_shape.len();
     let sa = broadcast_strides(a.shape(), rank);
     let sb = broadcast_strides(b.shape(), rank);
-    let mut out = Vec::with_capacity(n);
     if n == 0 {
-        return Tensor::new(out_shape, out);
+        return Tensor::new(out_shape, Vec::new());
     }
     let (k, ma, mb) = inner_block(&out_shape, &sa, &sb);
     let len = element_count(out_shape.get(k..).unwrap_or(&[]))?;
     let outer = out_shape.get(..k).unwrap_or(&[]);
-    let mut idx = vec![0usize; k];
-    for _ in 0..n / len {
-        let (mut pa, mut pb) = (0usize, 0usize);
-        for (j, &i) in idx.iter().enumerate() {
-            pa += i * sa.get(j).copied().unwrap_or(0);
-            pb += i * sb.get(j).copied().unwrap_or(0);
+    let out = arith::par_collect(n, 1, |range| {
+        let mut out = Vec::with_capacity(range.len());
+        // 範囲の先頭が属するブロックと、そのブロックの出力先頭の多重添字
+        let mut idx = vec![0usize; k];
+        let mut rem = range.start / len;
+        for (i, &d) in idx.iter_mut().zip(outer).rev() {
+            *i = rem % d;
+            rem /= d;
         }
-        if ma == Some(InnerMode::Contig) {
-            let xs = a.data().get(pa..pa + len).ok_or(OpError::ShapeMismatch)?;
-            if mb == Some(InnerMode::Contig) {
-                let ys = b.data().get(pb..pb + len).ok_or(OpError::ShapeMismatch)?;
-                for (&x, &y) in xs.iter().zip(ys) {
-                    out.push(f(x, y)?);
+        let mut pos = range.start - range.start % len;
+        while pos < range.end {
+            let (lo, hi) = (range.start.max(pos) - pos, range.end.min(pos + len) - pos);
+            let (mut pa, mut pb) = (0usize, 0usize);
+            for (j, &i) in idx.iter().enumerate() {
+                pa += i * sa.get(j).copied().unwrap_or(0);
+                pb += i * sb.get(j).copied().unwrap_or(0);
+            }
+            if ma == Some(InnerMode::Contig) {
+                let xs = a
+                    .data()
+                    .get(pa + lo..pa + hi)
+                    .ok_or(OpError::ShapeMismatch)?;
+                if mb == Some(InnerMode::Contig) {
+                    let ys = b
+                        .data()
+                        .get(pb + lo..pb + hi)
+                        .ok_or(OpError::ShapeMismatch)?;
+                    for (&x, &y) in xs.iter().zip(ys) {
+                        out.push(f(x, y)?);
+                    }
+                } else {
+                    let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
+                    for &x in xs {
+                        out.push(f(x, y)?);
+                    }
                 }
             } else {
-                let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
-                for &x in xs {
-                    out.push(f(x, y)?);
+                let x = *a.data().get(pa).ok_or(OpError::ShapeMismatch)?;
+                if mb == Some(InnerMode::Contig) {
+                    let ys = b
+                        .data()
+                        .get(pb + lo..pb + hi)
+                        .ok_or(OpError::ShapeMismatch)?;
+                    for &y in ys {
+                        out.push(f(x, y)?);
+                    }
+                } else {
+                    let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
+                    for _ in lo..hi {
+                        out.push(f(x, y)?);
+                    }
                 }
             }
-        } else {
-            let x = *a.data().get(pa).ok_or(OpError::ShapeMismatch)?;
-            if mb == Some(InnerMode::Contig) {
-                let ys = b.data().get(pb..pb + len).ok_or(OpError::ShapeMismatch)?;
-                for &y in ys {
-                    out.push(f(x, y)?);
-                }
-            } else {
-                let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
-                for _ in 0..len {
-                    out.push(f(x, y)?);
-                }
-            }
+            pos += len;
+            advance_index(&mut idx, outer);
         }
-        advance_index(&mut idx, outer);
-    }
+        Ok(out)
+    })?;
     Tensor::new(out_shape, out)
 }
 
@@ -296,7 +319,7 @@ pub fn broadcast_map2<A: Copy, B: Copy, U>(
 fn broadcast_map2_reference<A: Copy, B: Copy, U>(
     a: &Tensor<A>,
     b: &Tensor<B>,
-    mut f: impl FnMut(A, B) -> Result<U, OpError>,
+    f: impl Fn(A, B) -> Result<U, OpError>,
 ) -> Result<Tensor<U>, OpError> {
     let out_shape = broadcast_shape(a.shape(), b.shape())?;
     let n = element_count(&out_shape)?;
@@ -390,5 +413,41 @@ mod tests {
         assert_eq!(Tensor::new(vec![], vec![7i64]).unwrap().data(), &[7]);
         assert_eq!(OpError::LimitExceeded.code(), "limit_exceeded");
         assert_eq!(OpError::NonFinite.code(), "op_non_finite");
+    }
+
+    /// 並列版（範囲分割）が汎用経路とビット一致する。範囲がブロックの途中で切れる形を含む（REQ-28・#648）。
+    #[test]
+    fn req28_broadcast_map2_parallel_matches_reference_648() {
+        let mk = |shape: &[usize]| {
+            let n: usize = shape.iter().product();
+            let d: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.11 - 3.0).cos() * 2.3)
+                .collect();
+            Tensor::new(shape.to_vec(), d).unwrap()
+        };
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[156, 896], &[156, 896]),
+            (&[156, 896], &[896]),
+            (&[156, 896], &[156, 1]),
+            (&[156, 896], &[]),
+            (&[2, 3, 7, 11, 13], &[7, 11, 13]),
+            (&[2, 3, 7, 11, 13], &[3, 1, 1, 13]),
+            (&[2, 3, 1, 1], &[1, 1, 7, 5]),
+        ];
+        for (sa, sb) in cases {
+            let (a, b) = (mk(sa), mk(sb));
+            let slow = broadcast_map2_reference(&a, &b, |x, y| Ok(x * y + x)).unwrap();
+            let sbits: Vec<u32> = slow.data().iter().map(|v| v.to_bits()).collect();
+            for t in [1, 3, 7] {
+                let fast = arith::with_threads(t, || broadcast_map2(&a, &b, |x, y| Ok(x * y + x)))
+                    .unwrap();
+                let fb: Vec<u32> = fast.data().iter().map(|v| v.to_bits()).collect();
+                assert_eq!(fb, sbits, "{sa:?} {sb:?} threads={t}");
+            }
+            // しきい値を超える実スレッド数（既定）でも一致する
+            let fast = broadcast_map2(&a, &b, |x, y| Ok(x * y + x)).unwrap();
+            let fb: Vec<u32> = fast.data().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(fb, sbits, "{sa:?} {sb:?}");
+        }
     }
 }
