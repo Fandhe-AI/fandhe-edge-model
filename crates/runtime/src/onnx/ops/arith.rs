@@ -184,6 +184,18 @@ pub(super) fn with_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// 要素数 `total` と重み `weight` に対する並列度の上限。仕事量がしきい値未満なら 1、以上なら
+/// `available_parallelism`（取れなければ 1）。[`par_collect`] が `units` で頭打ちにする前の値。
+fn par_threads(total: usize, weight: usize) -> usize {
+    if total.saturating_mul(weight) < PARALLEL_MIN_WORK {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    }
+}
+
 /// `units` 個の仕事（各 `unit_len` 要素を出力する）を連続した範囲に分けて `f` を並列に走らせ、
 /// 長さ `units × unit_len` の出力を返す。出力は事前に確保し、各ワーカーが自分の範囲の `&mut [U]`
 /// （`f(範囲, 出力の該当部分)`）へ直接書く（連結のコピーも 2 倍のピークメモリもない。unsafe なし）。
@@ -204,13 +216,7 @@ pub(super) fn par_collect<U: Copy + Default + Send>(
     if total == 0 {
         return Ok(out);
     }
-    let threads = if total.saturating_mul(weight) < PARALLEL_MIN_WORK {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-    };
+    let threads = par_threads(total, weight);
     #[cfg(test)]
     let threads = TEST_FORCE_THREADS.get().unwrap_or(threads);
     let threads = threads.min(units).max(1);
@@ -1353,25 +1359,18 @@ mod tests {
         }
     }
 
-    /// 同じ要素数でも weight が大きいとしきい値をまたぎ並列になる（REQ-28・#648）。
+    /// 同じ要素数でも weight が大きいとしきい値をまたぎ並列になる。スレッドの実行は観測せず、
+    /// 並列度の決定関数を直接確かめる（スケジューリングに依存させない。REQ-28・#648）。
     #[test]
-    fn req28_par_collect_weight_crosses_threshold_648() {
-        let n = PARALLEL_MIN_WORK / 4;
-        let ids = Mutex::new(std::collections::HashSet::new());
-        let f = |r: Range<usize>, o: &mut [u32]| -> Result<(), OpError> {
-            ids.lock().unwrap().insert(std::thread::current().id());
-            for (x, i) in o.iter_mut().zip(r) {
-                *x = i as u32;
-            }
-            Ok(())
-        };
-        let want: Vec<u32> = (0..n as u32).collect();
-        assert_eq!(par_collect(n, 1, 1, f).unwrap(), want);
-        assert_eq!(ids.lock().unwrap().len(), 1); // weight 1 は直列
-        assert_eq!(par_collect(n, 1, 4, f).unwrap(), want);
+    fn req28_par_threads_weight_crosses_threshold_648() {
         let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
-        // weight 4 は並列（コアが 1 つの環境では直列のまま）
-        assert!(ids.lock().unwrap().len() > 1 || cores == 1);
+        let n = PARALLEL_MIN_WORK / 4;
+        assert_eq!(par_threads(n, 1), 1);
+        assert_eq!(par_threads(n - 1, 4), 1);
+        assert_eq!(par_threads(n, 4), cores);
+        assert_eq!(par_threads(PARALLEL_MIN_WORK - 1, 1), 1);
+        assert_eq!(par_threads(PARALLEL_MIN_WORK, 1), cores);
+        assert_eq!(par_threads(usize::MAX, usize::MAX), cores);
     }
 
     /// 複数の範囲が失敗しても、範囲の添字が最小のエラーを返す（REQ-28・#648）。
