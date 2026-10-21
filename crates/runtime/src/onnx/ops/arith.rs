@@ -15,6 +15,8 @@
 //! - 縮約（MatMul・Gemm）の加算順は固定で、スレッド数・分配順に依存しない（REQ-28）。MatMul は k 昇順、
 //!   Gemm は lane 別（k mod 4）に k 昇順で累積してから lane 順に足す（[`gemm_tile`]）。並列化は出力の
 //!   行・ブロック単位で、1 つの出力要素の加算を複数スレッドに分けない（#629）
+//! - 要素ごとの演算・Softmax 系・gather 系は、出力を連続範囲に分けて [`par_collect`] で並列に計算する（#648）。
+//!   各出力要素・各行は 1 つのワーカーが従来と同じ順序で計算するので、結果はスレッド数に依存しない（REQ-28）
 //! - Sqrt・Reciprocal は IEEE どおり（負の Sqrt は NaN、0 の Reciprocal は inf）。拒否せず伝播させ、
 //!   確率を作る Softmax 系が [`OpError::NonFinite`] で fail-closed にする
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
@@ -56,20 +58,18 @@ pub fn add_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<i64>, OpError>
     })
 }
 
-/// 要素ごとの単項演算。
-/// 大きい入力は [`par_collect`] で連続範囲に分けて並列に計算する（#648）。`weight` は 1 要素あたりの重み。
+/// 要素ごとの単項演算。大きい入力は [`par_collect`] で連続範囲に分けて並列に計算する（#648）。`weight` は 1 要素あたりの重み。
 pub(crate) fn map1(
     x: &Tensor<f32>,
     weight: usize,
     f: impl Fn(f32) -> f32 + Sync,
 ) -> Result<Tensor<f32>, OpError> {
     let d = x.data();
-    let out = par_collect(d.len(), weight, |r| {
-        Ok(d.get(r)
-            .ok_or(OpError::ShapeMismatch)?
-            .iter()
-            .map(|&v| f(v))
-            .collect())
+    let out = par_collect(d.len(), 1, weight, |r, out| {
+        for (o, &v) in out.iter_mut().zip(d.get(r).ok_or(OpError::ShapeMismatch)?) {
+            *o = f(v);
+        }
+        Ok(())
     })?;
     Tensor::new(x.shape().to_vec(), out)
 }
@@ -184,17 +184,27 @@ pub(super) fn with_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `0..units` を連続した範囲に分けて `f` を並列に走らせ、各範囲の結果を範囲の順に連結して返す。
+/// `units` 個の仕事（各 `unit_len` 要素を出力する）を連続した範囲に分けて `f` を並列に走らせ、
+/// 長さ `units × unit_len` の出力を返す。出力は事前に確保し、各ワーカーが自分の範囲の `&mut [U]`
+/// （`f(範囲, 出力の該当部分)`）へ直接書く（連結のコピーも 2 倍のピークメモリもない。unsafe なし）。
 ///
-/// 仕事量 `units × weight` が [`PARALLEL_MIN_WORK`] 未満なら呼び出しスレッドだけで `f(0..units)`。
+/// 仕事量 `units × unit_len × weight` が [`PARALLEL_MIN_WORK`] 未満なら呼び出しスレッドだけで走らせる。
 /// 各出力要素は 1 つの範囲の中で計算されるので、結果はスレッド数に依存しない（REQ-28）。スレッド数は
-/// `available_parallelism` と `units` で頭打ち（REQ-39）。`f` の返す長さの合計が出力の長さになる。
-pub(super) fn par_collect<U: Send>(
+/// `available_parallelism` と `units` で頭打ち（REQ-39）。
+/// 複数の範囲が失敗したときは範囲の添字が最小のエラーを返す（1 スレッド版と同じエラーで決定的）。範囲は
+/// 昇順に配るので、失敗した範囲より前の範囲は必ず着手済みで、その結果を待ってから最小を選ぶ。
+pub(super) fn par_collect<U: Copy + Default + Send>(
     units: usize,
+    unit_len: usize,
     weight: usize,
-    f: impl Fn(Range<usize>) -> Result<Vec<U>, OpError> + Sync,
+    f: impl Fn(Range<usize>, &mut [U]) -> Result<(), OpError> + Sync,
 ) -> Result<Vec<U>, OpError> {
-    let threads = if units.saturating_mul(weight) < PARALLEL_MIN_WORK {
+    let total = units.checked_mul(unit_len).ok_or(OpError::LimitExceeded)?;
+    let mut out = vec![U::default(); total];
+    if total == 0 {
+        return Ok(out);
+    }
+    let threads = if total.saturating_mul(weight) < PARALLEL_MIN_WORK {
         1
     } else {
         std::thread::available_parallelism()
@@ -205,34 +215,40 @@ pub(super) fn par_collect<U: Send>(
     let threads = TEST_FORCE_THREADS.get().unwrap_or(threads);
     let threads = threads.min(units).max(1);
     if threads == 1 {
-        return f(0..units);
+        f(0..units, &mut out)?;
+        return Ok(out);
     }
     let per = units.div_ceil(threads);
-    let jobs: Mutex<Vec<(usize, Range<usize>)>> = Mutex::new(
-        (0..units.div_ceil(per))
-            .map(|i| (i, i * per..((i + 1) * per).min(units)))
-            .collect(),
-    );
-    let done: Mutex<Vec<(usize, Vec<U>)>> = Mutex::new(Vec::new());
-    run_workers(threads, |stop| {
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let Some((i, r)) = jobs.lock().ok().and_then(|mut v| v.pop()) else {
+    // 昇順に配るため逆順に積んで pop する
+    let mut list: Vec<(usize, Range<usize>, &mut [U])> = out
+        .chunks_mut(per * unit_len)
+        .enumerate()
+        .map(|(i, c)| (i, i * per..((i + 1) * per).min(units), c))
+        .collect();
+    list.reverse();
+    let jobs = Mutex::new(list);
+    let errors: Mutex<Vec<(usize, OpError)>> = Mutex::new(Vec::new());
+    let failed = AtomicBool::new(false);
+    run_workers(threads, |_| {
+        // ロックの poison は他のスレッドの panic で、計算不能として fail-closed にする
+        while !failed.load(Ordering::Relaxed) {
+            let job = jobs.lock().map_err(|_| OpError::LimitExceeded)?.pop();
+            let Some((i, r, chunk)) = job else {
                 return Ok(());
             };
-            let part = f(r)?;
-            done.lock()
-                .map_err(|_| OpError::LimitExceeded)?
-                .push((i, part));
+            if let Err(e) = f(r, chunk) {
+                failed.store(true, Ordering::Relaxed);
+                errors
+                    .lock()
+                    .map_err(|_| OpError::LimitExceeded)?
+                    .push((i, e));
+            }
         }
+        Ok(())
     })?;
-    let mut parts = done.into_inner().map_err(|_| OpError::LimitExceeded)?;
-    parts.sort_by_key(|(i, _)| *i);
-    let mut out = Vec::with_capacity(parts.iter().map(|(_, p)| p.len()).sum());
-    for (_, p) in parts {
-        out.extend(p);
+    let errs = errors.into_inner().map_err(|_| OpError::LimitExceeded)?;
+    if let Some((_, e)) = errs.into_iter().min_by_key(|(i, _)| *i) {
+        return Err(e);
     }
     Ok(out)
 }
@@ -1315,8 +1331,11 @@ mod tests {
     /// 仕事量がしきい値の直前は 1 スレッド・以上は並列でも、結果が同じ（REQ-28・#648）。
     #[test]
     fn req28_par_collect_threshold_boundary_matches_serial_648() {
-        let f = |r: Range<usize>| -> Result<Vec<u64>, OpError> {
-            Ok(r.map(|i| (i * i) as u64).collect())
+        let f = |r: Range<usize>, o: &mut [u64]| -> Result<(), OpError> {
+            for (x, i) in o.iter_mut().zip(r) {
+                *x = (i * i) as u64;
+            }
+            Ok(())
         };
         for units in [
             PARALLEL_MIN_WORK - 1,
@@ -1324,15 +1343,53 @@ mod tests {
             PARALLEL_MIN_WORK + 7,
         ] {
             let want: Vec<u64> = (0..units).map(|i| (i * i) as u64).collect();
-            assert_eq!(par_collect(units, 1, f).unwrap(), want, "{units}");
+            assert_eq!(par_collect(units, 1, 1, f).unwrap(), want, "{units}");
             for t in [1, 3, 8] {
-                assert_eq!(with_threads(t, || par_collect(units, 1, f)).unwrap(), want);
+                assert_eq!(
+                    with_threads(t, || par_collect(units, 1, 1, f)).unwrap(),
+                    want
+                );
             }
         }
-        // 範囲のエラーは呼び出し元へ返る
-        let e = with_threads(4, || {
-            par_collect(100, 1, |_| Err::<Vec<u8>, _>(OpError::NonFinite))
-        });
-        assert_eq!(e, Err(OpError::NonFinite));
+    }
+
+    /// 同じ要素数でも weight が大きいとしきい値をまたぎ並列になる（REQ-28・#648）。
+    #[test]
+    fn req28_par_collect_weight_crosses_threshold_648() {
+        let n = PARALLEL_MIN_WORK / 4;
+        let ids = Mutex::new(std::collections::HashSet::new());
+        let f = |r: Range<usize>, o: &mut [u32]| -> Result<(), OpError> {
+            ids.lock().unwrap().insert(std::thread::current().id());
+            for (x, i) in o.iter_mut().zip(r) {
+                *x = i as u32;
+            }
+            Ok(())
+        };
+        let want: Vec<u32> = (0..n as u32).collect();
+        assert_eq!(par_collect(n, 1, 1, f).unwrap(), want);
+        assert_eq!(ids.lock().unwrap().len(), 1); // weight 1 は直列
+        assert_eq!(par_collect(n, 1, 4, f).unwrap(), want);
+        let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+        // weight 4 は並列（コアが 1 つの環境では直列のまま）
+        assert!(ids.lock().unwrap().len() > 1 || cores == 1);
+    }
+
+    /// 複数の範囲が失敗しても、範囲の添字が最小のエラーを返す（REQ-28・#648）。
+    #[test]
+    fn req28_par_collect_returns_min_index_error_648() {
+        for _ in 0..20 {
+            let r = with_threads(8, || {
+                par_collect(80, 1, 1, |r: Range<usize>, _: &mut [u8]| {
+                    // 範囲の先頭が 0 の範囲だけ別のエラー、他は NonFinite
+                    if r.start == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Err(OpError::ShapeMismatch)
+                    } else {
+                        Err(OpError::NonFinite)
+                    }
+                })
+            });
+            assert_eq!(r, Err(OpError::ShapeMismatch));
+        }
     }
 }

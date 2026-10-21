@@ -237,7 +237,7 @@ fn inner_block(
 /// ブロック単位のループで処理する。要素の適用順と各要素の計算は汎用経路と同一（REQ-28・#637）。
 /// 出力要素数が [`arith::PARALLEL_MIN_WORK`] 以上なら、出力を連続した要素範囲に分けて並列に計算する。
 /// 各要素は独立に計算されるので結果はスレッド数に依存しない（REQ-28・#648）。
-pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Send>(
+pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Copy + Default + Send>(
     a: &Tensor<A>,
     b: &Tensor<B>,
     f: impl Fn(A, B) -> Result<U, OpError> + Sync,
@@ -253,8 +253,12 @@ pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Send>(
     let (k, ma, mb) = inner_block(&out_shape, &sa, &sb);
     let len = element_count(out_shape.get(k..).unwrap_or(&[]))?;
     let outer = out_shape.get(..k).unwrap_or(&[]);
-    let out = arith::par_collect(n, 1, |range| {
-        let mut out = Vec::with_capacity(range.len());
+    let out = arith::par_collect(n, 1, 1, |range, out| {
+        let mut slots = out.iter_mut();
+        let mut put = |v: U| -> Result<(), OpError> {
+            *slots.next().ok_or(OpError::ShapeMismatch)? = v;
+            Ok(())
+        };
         // 範囲の先頭が属するブロックと、そのブロックの出力先頭の多重添字
         let mut idx = vec![0usize; k];
         let mut rem = range.start / len;
@@ -281,12 +285,12 @@ pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Send>(
                         .get(pb + lo..pb + hi)
                         .ok_or(OpError::ShapeMismatch)?;
                     for (&x, &y) in xs.iter().zip(ys) {
-                        out.push(f(x, y)?);
+                        put(f(x, y)?)?;
                     }
                 } else {
                     let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
                     for &x in xs {
-                        out.push(f(x, y)?);
+                        put(f(x, y)?)?;
                     }
                 }
             } else {
@@ -297,19 +301,19 @@ pub fn broadcast_map2<A: Copy + Sync, B: Copy + Sync, U: Send>(
                         .get(pb + lo..pb + hi)
                         .ok_or(OpError::ShapeMismatch)?;
                     for &y in ys {
-                        out.push(f(x, y)?);
+                        put(f(x, y)?)?;
                     }
                 } else {
                     let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
                     for _ in lo..hi {
-                        out.push(f(x, y)?);
+                        put(f(x, y)?)?;
                     }
                 }
             }
             pos += len;
             advance_index(&mut idx, outer);
         }
-        Ok(out)
+        Ok(())
     })?;
     Tensor::new(out_shape, out)
 }

@@ -16,7 +16,8 @@
 //! - 数値安定化: Softmax 系は行ごとに max を引いてから exp する（`exp` のあふれ防止）。
 //!   Sigmoid は符号で式を分け `exp` の引数を常に非正にする。
 //!   Softmax 系の行に NaN・±inf があれば [`OpError::NonFinite`]（因果マスクは有限の -1e30 を使うため当たらない）
-//! - 縮約・合計は単一スレッドで添字の昇順に加算し、スレッド数に依存させない（REQ-28）
+//! - 縮約・合計は添字の昇順に加算し、スレッド数に依存させない（REQ-28）。Softmax 系は行を 1 ワーカーが
+//!   全体処理し（行内の順序は不変）、行を単位に並列化する（#648）。ReduceMean・ReduceSum は単一スレッド
 //! - 形状は [`element_count`]・[`Tensor::new`] で上限照合してから確保する（REQ-39）。panic しない
 
 use super::arith::{map1, par_collect};
@@ -111,27 +112,26 @@ pub fn sigmoid(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
 /// 行ごとに非有限を拒否し max を求め、`f(row, max, out)` で行を変換して連結する。
 /// 行は [`par_collect`] で連続範囲に分けて並列に処理する（1 行は 1 ワーカーで、行内の順序は不変。
 /// REQ-28・#648）。`weight` は 1 要素あたりの重み。
-fn map_rows<T: Send>(
+fn map_rows<T: Copy + Default + Send>(
     x: &Tensor<f32>,
     weight: usize,
-    f: impl Fn(&[f32], f32, &mut Vec<T>) -> Result<(), OpError> + Sync,
+    f: impl Fn(&[f32], f32, &mut [T]) -> Result<(), OpError> + Sync,
 ) -> Result<(Vec<usize>, Vec<T>), OpError> {
     let d = last_dim(x.shape())?;
     let rows = x.data().len() / d;
-    let out = par_collect(rows, weight.saturating_mul(d), |r| {
+    let out = par_collect(rows, d, weight, |r, out| {
         let part = x
             .data()
             .get(r.start * d..r.end * d)
             .ok_or(OpError::ShapeMismatch)?;
-        let mut out = Vec::with_capacity(part.len());
-        for row in part.chunks(d) {
+        for (row, orow) in part.chunks(d).zip(out.chunks_mut(d)) {
             if row.iter().any(|v| !v.is_finite()) {
                 return Err(OpError::NonFinite);
             }
             let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            f(row, max, &mut out)?;
+            f(row, max, orow)?;
         }
-        Ok(out)
+        Ok(())
     })?;
     Ok((x.shape().to_vec(), out))
 }
@@ -139,14 +139,13 @@ fn map_rows<T: Send>(
 /// Softmax（axis=-1）。max を引いて f32 で計算する。注意の重みに使う。
 pub fn softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
     let (shape, out) = map_rows(x, 4, |row, max, out| {
-        let start = out.len();
         let mut sum = 0.0f32;
-        for &v in row {
+        for (o, &v) in out.iter_mut().zip(row) {
             let e = (v - max).exp();
             sum += e;
-            out.push(e);
+            *o = e;
         }
-        out.iter_mut().skip(start).for_each(|e| *e /= sum);
+        out.iter_mut().for_each(|e| *e /= sum);
         Ok(())
     })?;
     Tensor::new(shape, out)
@@ -155,7 +154,8 @@ pub fn softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
 /// Softmax（axis=-1）の f64 出力。グラフ出力 `probs` 用で、C1・C3 と同じ `softmax_f64` を行ごとに使う。
 pub fn softmax_last_axis_f64(x: &Tensor<f32>) -> Result<Tensor<f64>, OpError> {
     let (shape, out) = map_rows(x, 4, |row, _, out| {
-        out.extend(super::super::softmax_f64(row).map_err(|_| OpError::NonFinite)?);
+        let p = super::super::softmax_f64(row).map_err(|_| OpError::NonFinite)?;
+        out.copy_from_slice(&p);
         Ok(())
     })?;
     Tensor::new(shape, out)
@@ -166,7 +166,9 @@ pub fn log_softmax_last_axis(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
     let (shape, out) = map_rows(x, 4, |row, max, out| {
         let sum: f32 = row.iter().fold(0.0f32, |a, &v| a + (v - max).exp());
         let lse = sum.ln();
-        out.extend(row.iter().map(|&v| (v - max) - lse));
+        for (o, &v) in out.iter_mut().zip(row) {
+            *o = (v - max) - lse;
+        }
         Ok(())
     })?;
     Tensor::new(shape, out)
@@ -325,5 +327,30 @@ mod tests {
         bad[5 * d + 3] = f32::NAN;
         let r = with_threads(4, || softmax_last_axis(&t(&[rows, d], &bad)));
         assert_eq!(r, Err(OpError::NonFinite));
+    }
+
+    /// 行数がスレッド数より少なくてもビット一致する（REQ-28・#648）。
+    #[test]
+    fn req28_softmax_fewer_rows_than_threads_648() {
+        use super::super::arith::with_threads;
+        let d = 37usize;
+        let data: Vec<f32> = (0..3 * d).map(|i| (i as f32 * 0.21).cos() * 5.0).collect();
+        let x = t(&[3, d], &data);
+        type Op = fn(&Tensor<f32>) -> Result<Tensor<f32>, OpError>;
+        for op in [softmax_last_axis as Op, log_softmax_last_axis] {
+            let want: Vec<u32> = with_threads(1, || op(&x))
+                .unwrap()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let got: Vec<u32> = with_threads(7, || op(&x))
+                .unwrap()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(got, want);
+        }
     }
 }

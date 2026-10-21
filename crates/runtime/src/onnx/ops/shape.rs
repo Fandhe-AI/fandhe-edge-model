@@ -60,7 +60,7 @@ fn row_strides(shape: &[usize]) -> Vec<usize> {
 /// 最内次元は行単位で写す（stride 1 は連続コピー、0 は同一要素の複製）。外側の位置計算は
 /// 行ごとに 1 回で、要素の並びは要素ごとの汎用経路と同一（REQ-28・#637）。
 /// 出力の行は [`par_collect`] で連続範囲に分けて並列に写す（要素は独立で結果は不変。REQ-28・#648）。
-fn gather_by_strides<T: Copy + Send + Sync>(
+fn gather_by_strides<T: Copy + Default + Send + Sync>(
     data: &[T],
     out_shape: Vec<usize>,
     strides: &[usize],
@@ -75,8 +75,7 @@ fn gather_by_strides<T: Copy + Send + Sync>(
         return Tensor::new(out_shape, vec![v]);
     };
     let inner = strides.get(outer.len()).copied().unwrap_or(0);
-    let out = par_collect(n / len, len, |rows| {
-        let mut out = Vec::with_capacity(rows.len() * len);
+    let out = par_collect(n / len, len, 1, |rows, out| {
         // 範囲の先頭の行の多重添字
         let mut idx = vec![0usize; outer.len()];
         let mut rem = rows.start;
@@ -84,26 +83,23 @@ fn gather_by_strides<T: Copy + Send + Sync>(
             *i = rem % d;
             rem /= d;
         }
-        for _ in rows {
+        for orow in out.chunks_mut(len) {
             let mut p = base;
             for (k, &i) in idx.iter().enumerate() {
                 p += i * strides.get(k).copied().unwrap_or(0);
             }
             match inner {
-                1 => out.extend_from_slice(data.get(p..p + len).ok_or(OpError::ShapeMismatch)?),
-                0 => {
-                    let v = *data.get(p).ok_or(OpError::ShapeMismatch)?;
-                    out.resize(out.len() + len, v);
-                }
+                1 => orow.copy_from_slice(data.get(p..p + len).ok_or(OpError::ShapeMismatch)?),
+                0 => orow.fill(*data.get(p).ok_or(OpError::ShapeMismatch)?),
                 s => {
-                    for j in 0..len {
-                        out.push(*data.get(p + j * s).ok_or(OpError::ShapeMismatch)?);
+                    for (j, o) in orow.iter_mut().enumerate() {
+                        *o = *data.get(p + j * s).ok_or(OpError::ShapeMismatch)?;
                     }
                 }
             }
             advance_index(&mut idx, outer);
         }
-        Ok(out)
+        Ok(())
     })?;
     Tensor::new(out_shape, out)
 }
@@ -216,7 +212,10 @@ pub fn reshape<T>(x: Tensor<T>, shape: &Tensor<i64>) -> Result<Tensor<T>, OpErro
 }
 
 /// Transpose。`perm` は `0..rank` の順列であること。
-pub fn transpose<T: Copy + Send + Sync>(x: &Tensor<T>, perm: &[i64]) -> Result<Tensor<T>, OpError> {
+pub fn transpose<T: Copy + Default + Send + Sync>(
+    x: &Tensor<T>,
+    perm: &[i64],
+) -> Result<Tensor<T>, OpError> {
     let rank = x.shape().len();
     if perm.len() != rank {
         return Err(OpError::InvalidAttribute);
@@ -316,7 +315,7 @@ pub fn concat<T: Copy>(inputs: &[&Tensor<T>], axis: i64) -> Result<Tensor<T>, Op
 }
 
 /// 各軸の `(start, len)` で切り出す共通処理（軸数は x の rank と同じ）。
-fn slice_ranges<T: Copy + Send + Sync>(
+fn slice_ranges<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     ranges: &[(usize, usize)],
 ) -> Result<Tensor<T>, OpError> {
@@ -342,7 +341,7 @@ fn slice_ranges<T: Copy + Send + Sync>(
 }
 
 /// Slice。steps は省略か全要素 1 のみ。starts・ends は負なら dim を足し `[0, dim]` に clamp する。
-pub fn slice<T: Copy + Send + Sync>(
+pub fn slice<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     starts: &Tensor<i64>,
     ends: &Tensor<i64>,
@@ -399,7 +398,7 @@ pub fn slice<T: Copy + Send + Sync>(
 }
 
 /// Split。`split` の各要素は 0 以上で和は軸の次元と一致すること。
-pub fn split<T: Copy + Send + Sync>(
+pub fn split<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     axis: i64,
     split: &Tensor<i64>,
@@ -434,7 +433,7 @@ pub fn split<T: Copy + Send + Sync>(
 }
 
 /// Expand（双方向ブロードキャスト）。`shape` の負の次元は拒否する。
-pub fn expand<T: Copy + Send + Sync>(
+pub fn expand<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     shape: &Tensor<i64>,
 ) -> Result<Tensor<T>, OpError> {
