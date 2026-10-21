@@ -56,6 +56,8 @@ fn row_strides(shape: &[usize]) -> Vec<usize> {
 }
 
 /// 多重添字ごとに `base + Σ idx[k] * strides[k]` の位置を読んで集める共通ループ。
+/// 最内次元は行単位で写す（stride 1 は連続コピー、0 は同一要素の複製）。外側の位置計算は
+/// 行ごとに 1 回で、要素の並びは要素ごとの汎用経路と同一（REQ-28・#637）。
 fn gather_by_strides<T: Copy>(
     data: &[T],
     out_shape: Vec<usize>,
@@ -64,14 +66,33 @@ fn gather_by_strides<T: Copy>(
 ) -> Result<Tensor<T>, OpError> {
     let n = element_count(&out_shape)?;
     let mut out = Vec::with_capacity(n);
-    let mut idx = vec![0usize; out_shape.len()];
-    for _ in 0..n {
+    if n == 0 {
+        return Tensor::new(out_shape, out);
+    }
+    let Some((&len, outer)) = out_shape.split_last() else {
+        out.push(*data.get(base).ok_or(OpError::ShapeMismatch)?);
+        return Tensor::new(out_shape, out);
+    };
+    let inner = strides.get(outer.len()).copied().unwrap_or(0);
+    let mut idx = vec![0usize; outer.len()];
+    for _ in 0..n / len {
         let mut p = base;
         for (k, &i) in idx.iter().enumerate() {
             p += i * strides.get(k).copied().unwrap_or(0);
         }
-        out.push(*data.get(p).ok_or(OpError::ShapeMismatch)?);
-        advance_index(&mut idx, &out_shape);
+        match inner {
+            1 => out.extend_from_slice(data.get(p..p + len).ok_or(OpError::ShapeMismatch)?),
+            0 => {
+                let v = *data.get(p).ok_or(OpError::ShapeMismatch)?;
+                out.resize(out.len() + len, v);
+            }
+            s => {
+                for j in 0..len {
+                    out.push(*data.get(p + j * s).ok_or(OpError::ShapeMismatch)?);
+                }
+            }
+        }
+        advance_index(&mut idx, outer);
     }
     Tensor::new(out_shape, out)
 }
@@ -426,6 +447,39 @@ mod tests {
     fn iota(shape: &[usize]) -> Tensor<f32> {
         let n: usize = shape.iter().product();
         t(shape, (0..n).map(|i| i as f32).collect())
+    }
+
+    /// 高速経路（最内の連続コピー・複製）が要素ごとの汎用経路と一致する（REQ-28・#637）。
+    #[test]
+    fn req28_gather_by_strides_matches_reference_637() {
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5 - 3.0).collect();
+        // (out_shape, strides, base): 連続・最内ブロードキャスト・外側ブロードキャスト・非連続・rank 0
+        let cases: &[(&[usize], &[usize], usize)] = &[
+            (&[2, 3, 4], &[12, 4, 1], 0),
+            (&[2, 3, 4], &[12, 4, 0], 1),
+            (&[2, 3, 4], &[0, 4, 1], 0),
+            (&[2, 3, 4], &[12, 1, 3], 0),
+            (&[3, 4], &[1, 4], 2),
+            (&[5], &[1], 3),
+            (&[], &[], 7),
+            (&[2, 0, 4], &[12, 4, 1], 0),
+        ];
+        for &(shape, strides, base) in cases {
+            let fast = gather_by_strides(&data, shape.to_vec(), strides, base).unwrap();
+            let n: usize = shape.iter().product();
+            let mut want = Vec::new();
+            let mut idx = vec![0usize; shape.len()];
+            for _ in 0..n {
+                let p: usize = base + idx.iter().zip(strides).map(|(i, s)| i * s).sum::<usize>();
+                want.push(data[p]);
+                advance_index(&mut idx, shape);
+            }
+            let fb: Vec<u32> = fast.data().iter().map(|v| v.to_bits()).collect();
+            let wb: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(fb, wb, "{shape:?} {strides:?}");
+        }
+        // 範囲外は panic せず Err
+        assert!(gather_by_strides(&data, vec![2, 40], &[0, 1], 30).is_err());
     }
 
     #[test]

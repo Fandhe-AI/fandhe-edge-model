@@ -184,8 +184,116 @@ pub(crate) fn advance_index(idx: &mut [usize], shape: &[usize]) {
     }
 }
 
+/// 入力が最内ブロック内でどう並ぶか。`Contig` はブロック内で連続、`Const` は全要素が同一位置。
+#[derive(Clone, Copy, PartialEq)]
+enum InnerMode {
+    Contig,
+    Const,
+}
+
+/// 出力の末尾次元から、入力が連続または定数であり続ける範囲を伸ばした境界 `k` と、
+/// 各入力の方式を返す。`out_shape[k..]` が最内ブロック（REQ-28・#637）。
+fn inner_block(
+    out_shape: &[usize],
+    sa: &[usize],
+    sb: &[usize],
+) -> (usize, Option<InnerMode>, Option<InnerMode>) {
+    let (mut ma, mut mb) = (None, None);
+    let mut acc = 1usize;
+    let mut k = out_shape.len();
+    // 入力 1 本が次元 `j` を現在の方式のまま含められるか。含められなければ None。
+    let fit =
+        |m: Option<InnerMode>, d: usize, st: usize, acc: usize| -> Option<Option<InnerMode>> {
+            if d == 1 {
+                Some(m)
+            } else if st == 0 && m != Some(InnerMode::Contig) {
+                Some(Some(InnerMode::Const))
+            } else if st == acc && m != Some(InnerMode::Const) {
+                Some(Some(InnerMode::Contig))
+            } else {
+                None
+            }
+        };
+    while k > 0 {
+        let j = k - 1;
+        let d = out_shape.get(j).copied().unwrap_or(1);
+        let st_a = sa.get(j).copied().unwrap_or(0);
+        let st_b = sb.get(j).copied().unwrap_or(0);
+        match (fit(ma, d, st_a, acc), fit(mb, d, st_b, acc)) {
+            (Some(na), Some(nb)) => {
+                ma = na;
+                mb = nb;
+                acc = acc.saturating_mul(d);
+                k = j;
+            }
+            _ => break,
+        }
+    }
+    (k, ma, mb)
+}
+
 /// 2 入力の要素ごとの演算を多方向ブロードキャストで適用する。出力型 `U` は入力と異なってよい。
+/// 同形状・スカラー・末尾ブロードキャストなど、最内ブロックが連続または定数になる形は
+/// ブロック単位のループで処理する。要素の適用順と各要素の計算は汎用経路と同一（REQ-28・#637）。
 pub fn broadcast_map2<A: Copy, B: Copy, U>(
+    a: &Tensor<A>,
+    b: &Tensor<B>,
+    mut f: impl FnMut(A, B) -> Result<U, OpError>,
+) -> Result<Tensor<U>, OpError> {
+    let out_shape = broadcast_shape(a.shape(), b.shape())?;
+    let n = element_count(&out_shape)?;
+    let rank = out_shape.len();
+    let sa = broadcast_strides(a.shape(), rank);
+    let sb = broadcast_strides(b.shape(), rank);
+    let mut out = Vec::with_capacity(n);
+    if n == 0 {
+        return Tensor::new(out_shape, out);
+    }
+    let (k, ma, mb) = inner_block(&out_shape, &sa, &sb);
+    let len = element_count(out_shape.get(k..).unwrap_or(&[]))?;
+    let outer = out_shape.get(..k).unwrap_or(&[]);
+    let mut idx = vec![0usize; k];
+    for _ in 0..n / len {
+        let (mut pa, mut pb) = (0usize, 0usize);
+        for (j, &i) in idx.iter().enumerate() {
+            pa += i * sa.get(j).copied().unwrap_or(0);
+            pb += i * sb.get(j).copied().unwrap_or(0);
+        }
+        if ma == Some(InnerMode::Contig) {
+            let xs = a.data().get(pa..pa + len).ok_or(OpError::ShapeMismatch)?;
+            if mb == Some(InnerMode::Contig) {
+                let ys = b.data().get(pb..pb + len).ok_or(OpError::ShapeMismatch)?;
+                for (&x, &y) in xs.iter().zip(ys) {
+                    out.push(f(x, y)?);
+                }
+            } else {
+                let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
+                for &x in xs {
+                    out.push(f(x, y)?);
+                }
+            }
+        } else {
+            let x = *a.data().get(pa).ok_or(OpError::ShapeMismatch)?;
+            if mb == Some(InnerMode::Contig) {
+                let ys = b.data().get(pb..pb + len).ok_or(OpError::ShapeMismatch)?;
+                for &y in ys {
+                    out.push(f(x, y)?);
+                }
+            } else {
+                let y = *b.data().get(pb).ok_or(OpError::ShapeMismatch)?;
+                for _ in 0..len {
+                    out.push(f(x, y)?);
+                }
+            }
+        }
+        advance_index(&mut idx, outer);
+    }
+    Tensor::new(out_shape, out)
+}
+
+/// 参照実装（要素ごとに多重添字から位置を計算する汎用経路）。高速経路との一致照合専用。
+#[cfg(test)]
+fn broadcast_map2_reference<A: Copy, B: Copy, U>(
     a: &Tensor<A>,
     b: &Tensor<B>,
     mut f: impl FnMut(A, B) -> Result<U, OpError>,
@@ -230,6 +338,43 @@ mod tests {
             broadcast_shape(&[1 << 15, 1], &[1, 1 << 15]),
             Err(OpError::LimitExceeded)
         );
+    }
+
+    /// 高速経路が汎用経路とビット一致する（REQ-28・#637）。
+    #[test]
+    fn req28_broadcast_map2_fast_paths_match_reference_637() {
+        let mk = |shape: &[usize]| {
+            let n: usize = shape.iter().product();
+            let d: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.37 - 5.0).sin() * 1.7)
+                .collect();
+            Tensor::new(shape.to_vec(), d).unwrap()
+        };
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[4, 6], &[4, 6]),
+            (&[4, 6], &[]),
+            (&[], &[4, 6]),
+            (&[4, 6], &[1]),
+            (&[4, 6], &[6]),
+            (&[6], &[4, 6]),
+            (&[4, 6], &[4, 1]),
+            (&[4, 1], &[4, 6]),
+            (&[2, 3, 4], &[3, 1]),
+            (&[2, 3, 4], &[2, 1, 4]),
+            (&[2, 1, 4], &[3, 1]),
+            (&[2, 3, 1], &[1, 1, 4]),
+            (&[1, 4], &[3, 1]),
+            (&[0, 3], &[3]),
+        ];
+        for (sa, sb) in cases {
+            let (a, b) = (mk(sa), mk(sb));
+            let fast = broadcast_map2(&a, &b, |x, y| Ok(x * y + x)).unwrap();
+            let slow = broadcast_map2_reference(&a, &b, |x, y| Ok(x * y + x)).unwrap();
+            assert_eq!(fast.shape(), slow.shape(), "{sa:?} {sb:?}");
+            let fb: Vec<u32> = fast.data().iter().map(|v| v.to_bits()).collect();
+            let sb_: Vec<u32> = slow.data().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(fb, sb_, "{sa:?} {sb:?}");
+        }
     }
 
     #[test]
