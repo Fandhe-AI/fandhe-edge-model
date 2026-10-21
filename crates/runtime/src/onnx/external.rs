@@ -120,23 +120,26 @@ impl Sink {
             }
             self.clen = 0;
         }
-        // 要素ごとの match を避け、型の分岐は 1 回にして一括で変換する（REQ-32・#635）
-        let mut it = bytes.chunks_exact(self.elem);
-        match &mut self.out {
-            Out::F32(v) => v.extend(
-                it.by_ref()
-                    .filter_map(|c| c.try_into().map(f32::from_le_bytes).ok()),
-            ),
-            Out::I64(v) => v.extend(
-                it.by_ref()
-                    .filter_map(|c| c.try_into().map(i64::from_le_bytes).ok()),
-            ),
-            Out::Bf16(v) => v.extend(
-                it.by_ref()
-                    .filter_map(|c| c.try_into().map(u16::from_le_bytes).ok()),
-            ),
-        }
-        let rem = it.remainder();
+        // 要素ごとの match を避け、型の分岐は 1 回にして一括で変換する（REQ-32・#635）。
+        // 大きさは型ごとの定数にして `as_chunks` で畳み込み、ベクトル化できる形にする。
+        // 各 N は `Sink::new` が `elem` に入れる値（F32=4・I64=8・Bf16=2）と一致する。
+        let rem = match &mut self.out {
+            Out::F32(v) => {
+                let (c, rem) = bytes.as_chunks::<4>();
+                v.extend(c.iter().map(|c| f32::from_le_bytes(*c)));
+                rem
+            }
+            Out::I64(v) => {
+                let (c, rem) = bytes.as_chunks::<8>();
+                v.extend(c.iter().map(|c| i64::from_le_bytes(*c)));
+                rem
+            }
+            Out::Bf16(v) => {
+                let (c, rem) = bytes.as_chunks::<2>();
+                v.extend(c.iter().map(|c| u16::from_le_bytes(*c)));
+                rem
+            }
+        };
         if let Some(dst) = self.carry.get_mut(..rem.len()) {
             dst.copy_from_slice(rem);
         }
