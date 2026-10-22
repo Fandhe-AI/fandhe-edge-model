@@ -15,11 +15,14 @@
 //! - 縮約（MatMul・Gemm）の加算順は固定で、スレッド数・分配順に依存しない（REQ-28）。MatMul は k 昇順、
 //!   Gemm は lane 別（k mod 4）に k 昇順で累積してから lane 順に足す（[`gemm_tile`]）。並列化は出力の
 //!   行・ブロック単位で、1 つの出力要素の加算を複数スレッドに分けない（#629）
+//! - 要素ごとの演算・Softmax 系・gather 系は、出力を連続範囲に分けて [`par_collect`] で並列に計算する（#648）。
+//!   各出力要素・各行は 1 つのワーカーが従来と同じ順序で計算するので、結果はスレッド数に依存しない（REQ-28）
 //! - Sqrt・Reciprocal は IEEE どおり（負の Sqrt は NaN、0 の Reciprocal は inf）。拒否せず伝播させ、
 //!   確率を作る Softmax 系が [`OpError::NonFinite`] で fail-closed にする
 //! - 許容差: f32 の演算に 1e-9 は適用しない（1e-9 は f64 計算の場合）。テストは 2 進で正確な値の
 //!   厳密一致、または IEEE の単一演算とのビット一致で比べる
 
+use std::ops::Range;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -55,19 +58,30 @@ pub fn add_i64(a: &Tensor<i64>, b: &Tensor<i64>) -> Result<Tensor<i64>, OpError>
     })
 }
 
-/// 要素ごとの単項演算。
-pub(crate) fn map1(x: &Tensor<f32>, f: impl Fn(f32) -> f32) -> Result<Tensor<f32>, OpError> {
-    Tensor::new(x.shape().to_vec(), x.data().iter().map(|&v| f(v)).collect())
+/// 要素ごとの単項演算。大きい入力は [`par_collect`] で連続範囲に分けて並列に計算する（#648）。`weight` は 1 要素あたりの重み。
+pub(crate) fn map1(
+    x: &Tensor<f32>,
+    weight: usize,
+    f: impl Fn(f32) -> f32 + Sync,
+) -> Result<Tensor<f32>, OpError> {
+    let d = x.data();
+    let out = par_collect(d.len(), 1, weight, |r, out| {
+        for (o, &v) in out.iter_mut().zip(d.get(r).ok_or(OpError::ShapeMismatch)?) {
+            *o = f(v);
+        }
+        Ok(())
+    })?;
+    Tensor::new(x.shape().to_vec(), out)
 }
 
 /// Sqrt（FLOAT）。負は NaN。
 pub fn sqrt(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, f32::sqrt)
+    map1(x, 1, f32::sqrt)
 }
 
 /// Reciprocal（FLOAT）。0 は inf。
 pub fn reciprocal(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, |v| 1.0 / v)
+    map1(x, 1, |v| 1.0 / v)
 }
 
 /// Cast（`to=FLOAT`）。入力は BFLOAT16（u16 のビット列）。
@@ -113,7 +127,7 @@ fn worker_count(macs: usize, items: usize) -> usize {
 /// `worker` を `threads` 本で走らせ、最初のエラーを返す。各 worker は `stop` を見て早期に抜ける。
 /// スレッドの panic（本モジュールは panic しない設計だが念のため）は計算不能として
 /// [`OpError::LimitExceeded`] に写し、結果を返さない（fail-closed）。
-fn run_workers(
+pub(super) fn run_workers(
     threads: usize,
     worker: impl Fn(&AtomicBool) -> Result<(), OpError> + Sync,
 ) -> Result<(), OpError> {
@@ -146,6 +160,103 @@ fn run_workers(
         return Err(OpError::LimitExceeded);
     }
     Ok(())
+}
+
+/// 要素ごとの演算を並列化する仕事量のしきい値（#648）。仕事量 = 要素数 × 1 要素あたりの重み（単純な
+/// 四則・コピーが 1、`exp` を含む演算が 4）。これ未満は 1 スレッドのまま走らせる。
+/// 根拠（実機の演算別ログ、PR #647 後。証拠種別: テストハーネス）: 単純演算は約 1.7 ns/要素、Sigmoid は約
+/// 4.5 ns/要素で、スレッドの生成と join は 1 本あたり十数 µs。仕事量 2^17 ≒ 13 万は単純演算で約 0.2 ms
+/// （起動コストの数倍）なので、それ未満は並列化の利得が出ない。
+pub(super) const PARALLEL_MIN_WORK: usize = 1 << 17;
+
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: `Some(n)` なら [`par_collect`] がしきい値を無視して n 本で走らせる（呼び出しスレッドで読む）。
+    pub(super) static TEST_FORCE_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// テスト専用: `threads` 本に固定して `f` を実行する（しきい値を無視。REQ-28・#648）。
+#[cfg(test)]
+pub(super) fn with_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+    TEST_FORCE_THREADS.set(Some(threads));
+    let r = f();
+    TEST_FORCE_THREADS.set(None);
+    r
+}
+
+/// 要素数 `total` と重み `weight` に対する並列度の上限。仕事量がしきい値未満なら 1、以上なら
+/// `available_parallelism`（取れなければ 1）。[`par_collect`] が `units` で頭打ちにする前の値。
+fn par_threads(total: usize, weight: usize) -> usize {
+    if total.saturating_mul(weight) < PARALLEL_MIN_WORK {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    }
+}
+
+/// `units` 個の仕事（各 `unit_len` 要素を出力する）を連続した範囲に分けて `f` を並列に走らせ、
+/// 長さ `units × unit_len` の出力を返す。出力は事前に確保し、各ワーカーが自分の範囲の `&mut [U]`
+/// （`f(範囲, 出力の該当部分)`）へ直接書く（連結のコピーも 2 倍のピークメモリもない。unsafe なし）。
+///
+/// 仕事量 `units × unit_len × weight` が [`PARALLEL_MIN_WORK`] 未満なら呼び出しスレッドだけで走らせる。
+/// 各出力要素は 1 つの範囲の中で計算されるので、結果はスレッド数に依存しない（REQ-28）。スレッド数は
+/// `available_parallelism` と `units` で頭打ち（REQ-39）。
+/// 複数の範囲が失敗したときは範囲の添字が最小のエラーを返す（1 スレッド版と同じエラーで決定的）。範囲は
+/// 昇順に配るので、失敗した範囲より前の範囲は必ず着手済みで、その結果を待ってから最小を選ぶ。
+pub(super) fn par_collect<U: Copy + Default + Send>(
+    units: usize,
+    unit_len: usize,
+    weight: usize,
+    f: impl Fn(Range<usize>, &mut [U]) -> Result<(), OpError> + Sync,
+) -> Result<Vec<U>, OpError> {
+    let total = units.checked_mul(unit_len).ok_or(OpError::LimitExceeded)?;
+    let mut out = vec![U::default(); total];
+    if total == 0 {
+        return Ok(out);
+    }
+    let threads = par_threads(total, weight);
+    #[cfg(test)]
+    let threads = TEST_FORCE_THREADS.get().unwrap_or(threads);
+    let threads = threads.min(units).max(1);
+    if threads == 1 {
+        f(0..units, &mut out)?;
+        return Ok(out);
+    }
+    let per = units.div_ceil(threads);
+    // 昇順に配るため逆順に積んで pop する
+    let mut list: Vec<(usize, Range<usize>, &mut [U])> = out
+        .chunks_mut(per * unit_len)
+        .enumerate()
+        .map(|(i, c)| (i, i * per..((i + 1) * per).min(units), c))
+        .collect();
+    list.reverse();
+    let jobs = Mutex::new(list);
+    let errors: Mutex<Vec<(usize, OpError)>> = Mutex::new(Vec::new());
+    let failed = AtomicBool::new(false);
+    run_workers(threads, |_| {
+        // ロックの poison は他のスレッドの panic で、計算不能として fail-closed にする
+        while !failed.load(Ordering::Relaxed) {
+            let job = jobs.lock().map_err(|_| OpError::LimitExceeded)?.pop();
+            let Some((i, r, chunk)) = job else {
+                return Ok(());
+            };
+            if let Err(e) = f(r, chunk) {
+                failed.store(true, Ordering::Relaxed);
+                errors
+                    .lock()
+                    .map_err(|_| OpError::LimitExceeded)?
+                    .push((i, e));
+            }
+        }
+        Ok(())
+    })?;
+    let errs = errors.into_inner().map_err(|_| OpError::LimitExceeded)?;
+    if let Some((_, e)) = errs.into_iter().min_by_key(|(i, _)| *i) {
+        return Err(e);
+    }
+    Ok(out)
 }
 
 /// MatMul（FLOAT）。両入力 rank 2〜[`MAX_RANK`]。先頭（バッチ）次元は numpy 方式でブロードキャストする。
@@ -1221,5 +1332,63 @@ mod tests {
         // SiLU: x * sigmoid(x)。x=0 -> 0
         let z = t(&[1], vec![0.0]);
         assert_eq!(mul(&z, &sigmoid(&z).unwrap()).unwrap().data(), &[0.0]);
+    }
+
+    /// 仕事量がしきい値の直前は 1 スレッド・以上は並列でも、結果が同じ（REQ-28・#648）。
+    #[test]
+    fn req28_par_collect_threshold_boundary_matches_serial_648() {
+        let f = |r: Range<usize>, o: &mut [u64]| -> Result<(), OpError> {
+            for (x, i) in o.iter_mut().zip(r) {
+                *x = (i * i) as u64;
+            }
+            Ok(())
+        };
+        for units in [
+            PARALLEL_MIN_WORK - 1,
+            PARALLEL_MIN_WORK,
+            PARALLEL_MIN_WORK + 7,
+        ] {
+            let want: Vec<u64> = (0..units).map(|i| (i * i) as u64).collect();
+            assert_eq!(par_collect(units, 1, 1, f).unwrap(), want, "{units}");
+            for t in [1, 3, 8] {
+                assert_eq!(
+                    with_threads(t, || par_collect(units, 1, 1, f)).unwrap(),
+                    want
+                );
+            }
+        }
+    }
+
+    /// 同じ要素数でも weight が大きいとしきい値をまたぎ並列になる。スレッドの実行は観測せず、
+    /// 並列度の決定関数を直接確かめる（スケジューリングに依存させない。REQ-28・#648）。
+    #[test]
+    fn req28_par_threads_weight_crosses_threshold_648() {
+        let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+        let n = PARALLEL_MIN_WORK / 4;
+        assert_eq!(par_threads(n, 1), 1);
+        assert_eq!(par_threads(n - 1, 4), 1);
+        assert_eq!(par_threads(n, 4), cores);
+        assert_eq!(par_threads(PARALLEL_MIN_WORK - 1, 1), 1);
+        assert_eq!(par_threads(PARALLEL_MIN_WORK, 1), cores);
+        assert_eq!(par_threads(usize::MAX, usize::MAX), cores);
+    }
+
+    /// 複数の範囲が失敗しても、範囲の添字が最小のエラーを返す（REQ-28・#648）。
+    #[test]
+    fn req28_par_collect_returns_min_index_error_648() {
+        for _ in 0..20 {
+            let r = with_threads(8, || {
+                par_collect(80, 1, 1, |r: Range<usize>, _: &mut [u8]| {
+                    // 範囲の先頭が 0 の範囲だけ別のエラー、他は NonFinite
+                    if r.start == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Err(OpError::ShapeMismatch)
+                    } else {
+                        Err(OpError::NonFinite)
+                    }
+                })
+            });
+            assert_eq!(r, Err(OpError::ShapeMismatch));
+        }
     }
 }

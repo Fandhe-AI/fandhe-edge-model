@@ -18,6 +18,7 @@
 //!   エラーに値は含めない
 //! - 値を並べ替えるだけで算術をしないため、テストは厳密一致で比べる（1e-9 は適用しない）
 
+use super::arith::par_collect;
 use super::{
     MAX_RANK, OpError, Tensor, advance_index, broadcast_shape, broadcast_strides, element_count,
 };
@@ -58,42 +59,48 @@ fn row_strides(shape: &[usize]) -> Vec<usize> {
 /// 多重添字ごとに `base + Σ idx[k] * strides[k]` の位置を読んで集める共通ループ。
 /// 最内次元は行単位で写す（stride 1 は連続コピー、0 は同一要素の複製）。外側の位置計算は
 /// 行ごとに 1 回で、要素の並びは要素ごとの汎用経路と同一（REQ-28・#637）。
-fn gather_by_strides<T: Copy>(
+/// 出力の行は [`par_collect`] で連続範囲に分けて並列に写す（要素は独立で結果は不変。REQ-28・#648）。
+fn gather_by_strides<T: Copy + Default + Send + Sync>(
     data: &[T],
     out_shape: Vec<usize>,
     strides: &[usize],
     base: usize,
 ) -> Result<Tensor<T>, OpError> {
     let n = element_count(&out_shape)?;
-    let mut out = Vec::with_capacity(n);
     if n == 0 {
-        return Tensor::new(out_shape, out);
+        return Tensor::new(out_shape, Vec::new());
     }
     let Some((&len, outer)) = out_shape.split_last() else {
-        out.push(*data.get(base).ok_or(OpError::ShapeMismatch)?);
-        return Tensor::new(out_shape, out);
+        let v = *data.get(base).ok_or(OpError::ShapeMismatch)?;
+        return Tensor::new(out_shape, vec![v]);
     };
     let inner = strides.get(outer.len()).copied().unwrap_or(0);
-    let mut idx = vec![0usize; outer.len()];
-    for _ in 0..n / len {
-        let mut p = base;
-        for (k, &i) in idx.iter().enumerate() {
-            p += i * strides.get(k).copied().unwrap_or(0);
+    let out = par_collect(n / len, len, 1, |rows, out| {
+        // 範囲の先頭の行の多重添字
+        let mut idx = vec![0usize; outer.len()];
+        let mut rem = rows.start;
+        for (i, &d) in idx.iter_mut().zip(outer).rev() {
+            *i = rem % d;
+            rem /= d;
         }
-        match inner {
-            1 => out.extend_from_slice(data.get(p..p + len).ok_or(OpError::ShapeMismatch)?),
-            0 => {
-                let v = *data.get(p).ok_or(OpError::ShapeMismatch)?;
-                out.resize(out.len() + len, v);
+        for orow in out.chunks_mut(len) {
+            let mut p = base;
+            for (k, &i) in idx.iter().enumerate() {
+                p += i * strides.get(k).copied().unwrap_or(0);
             }
-            s => {
-                for j in 0..len {
-                    out.push(*data.get(p + j * s).ok_or(OpError::ShapeMismatch)?);
+            match inner {
+                1 => orow.copy_from_slice(data.get(p..p + len).ok_or(OpError::ShapeMismatch)?),
+                0 => orow.fill(*data.get(p).ok_or(OpError::ShapeMismatch)?),
+                s => {
+                    for (j, o) in orow.iter_mut().enumerate() {
+                        *o = *data.get(p + j * s).ok_or(OpError::ShapeMismatch)?;
+                    }
                 }
             }
+            advance_index(&mut idx, outer);
         }
-        advance_index(&mut idx, outer);
-    }
+        Ok(())
+    })?;
     Tensor::new(out_shape, out)
 }
 
@@ -205,7 +212,10 @@ pub fn reshape<T>(x: Tensor<T>, shape: &Tensor<i64>) -> Result<Tensor<T>, OpErro
 }
 
 /// Transpose。`perm` は `0..rank` の順列であること。
-pub fn transpose<T: Copy>(x: &Tensor<T>, perm: &[i64]) -> Result<Tensor<T>, OpError> {
+pub fn transpose<T: Copy + Default + Send + Sync>(
+    x: &Tensor<T>,
+    perm: &[i64],
+) -> Result<Tensor<T>, OpError> {
     let rank = x.shape().len();
     if perm.len() != rank {
         return Err(OpError::InvalidAttribute);
@@ -305,7 +315,10 @@ pub fn concat<T: Copy>(inputs: &[&Tensor<T>], axis: i64) -> Result<Tensor<T>, Op
 }
 
 /// 各軸の `(start, len)` で切り出す共通処理（軸数は x の rank と同じ）。
-fn slice_ranges<T: Copy>(x: &Tensor<T>, ranges: &[(usize, usize)]) -> Result<Tensor<T>, OpError> {
+fn slice_ranges<T: Copy + Default + Send + Sync>(
+    x: &Tensor<T>,
+    ranges: &[(usize, usize)],
+) -> Result<Tensor<T>, OpError> {
     let strides = row_strides(x.shape());
     let mut base = 0usize;
     let mut out_shape = Vec::with_capacity(ranges.len());
@@ -328,7 +341,7 @@ fn slice_ranges<T: Copy>(x: &Tensor<T>, ranges: &[(usize, usize)]) -> Result<Ten
 }
 
 /// Slice。steps は省略か全要素 1 のみ。starts・ends は負なら dim を足し `[0, dim]` に clamp する。
-pub fn slice<T: Copy>(
+pub fn slice<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     starts: &Tensor<i64>,
     ends: &Tensor<i64>,
@@ -385,7 +398,7 @@ pub fn slice<T: Copy>(
 }
 
 /// Split。`split` の各要素は 0 以上で和は軸の次元と一致すること。
-pub fn split<T: Copy>(
+pub fn split<T: Copy + Default + Send + Sync>(
     x: &Tensor<T>,
     axis: i64,
     split: &Tensor<i64>,
@@ -420,7 +433,10 @@ pub fn split<T: Copy>(
 }
 
 /// Expand（双方向ブロードキャスト）。`shape` の負の次元は拒否する。
-pub fn expand<T: Copy>(x: &Tensor<T>, shape: &Tensor<i64>) -> Result<Tensor<T>, OpError> {
+pub fn expand<T: Copy + Default + Send + Sync>(
+    x: &Tensor<T>,
+    shape: &Tensor<i64>,
+) -> Result<Tensor<T>, OpError> {
     // rank 上限は target の確保・コピーより前に検証する（REQ-39）。
     if shape.data().len() > MAX_RANK {
         return Err(OpError::ShapeMismatch);
@@ -729,5 +745,37 @@ mod tests {
         let g = gather_axis0(&s, &t(&[], vec![1]), |x| x).unwrap();
         assert_eq!(g.shape(), &[] as &[usize]);
         assert_eq!(g.data(), &[5]);
+    }
+
+    /// 並列版の gather（Transpose・Expand）が要素ごとの汎用経路とビット一致する（REQ-28・#648）。
+    #[test]
+    fn req28_gather_by_strides_parallel_matches_reference_648() {
+        let data: Vec<f32> = (0..2 * 195 * 128).map(|i| i as f32 * 0.25 - 9.0).collect();
+        let cases: &[(&[usize], &[usize], usize)] = &[
+            (&[2, 195, 128], &[195 * 128, 128, 1], 0),
+            (&[128, 195, 2], &[1, 128, 195 * 128], 0),
+            (&[2, 3, 195, 128], &[195 * 128, 0, 128, 1], 0),
+            (&[2, 195, 128], &[195 * 128, 128, 0], 5),
+        ];
+        for &(shape, strides, base) in cases {
+            let mut want = Vec::new();
+            let mut idx = vec![0usize; shape.len()];
+            for _ in 0..shape.iter().product::<usize>() {
+                let p: usize = base + idx.iter().zip(strides).map(|(i, s)| i * s).sum::<usize>();
+                want.push(data[p].to_bits());
+                advance_index(&mut idx, shape);
+            }
+            for t in [1, 3, 7] {
+                let got = crate::onnx::ops::arith::with_threads(t, || {
+                    gather_by_strides(&data, shape.to_vec(), strides, base)
+                })
+                .unwrap();
+                let gb: Vec<u32> = got.data().iter().map(|v| v.to_bits()).collect();
+                assert_eq!(gb, want, "{shape:?} {strides:?} threads={t}");
+            }
+            let got = gather_by_strides(&data, shape.to_vec(), strides, base).unwrap();
+            let gb: Vec<u32> = got.data().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(gb, want, "{shape:?} {strides:?}");
+        }
     }
 }

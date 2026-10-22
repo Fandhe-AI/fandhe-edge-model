@@ -84,12 +84,12 @@ pub fn where_f32(
 
 /// Sin（FLOAT）。RoPE の表用。±inf は NaN になり、そのまま伝播する。
 pub fn sin(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, f32::sin)
+    map1(x, 4, f32::sin)
 }
 
 /// Cos（FLOAT）。RoPE の表用。±inf は NaN になり、そのまま伝播する。
 pub fn cos(x: &Tensor<f32>) -> Result<Tensor<f32>, OpError> {
-    map1(x, f32::cos)
+    map1(x, 4, f32::cos)
 }
 
 #[cfg(test)]
