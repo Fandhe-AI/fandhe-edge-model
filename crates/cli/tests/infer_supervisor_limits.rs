@@ -96,8 +96,8 @@ fn req39_time_overrun_maps_to_limit_exceeded() {
     );
 }
 
-/// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類の設定（62.5 秒・8 GiB）を実プロセスに適用しても、
-/// 上限内の子は止められず出力が中継される。8 GiB の上限が `run_with_limits` に受理される。
+/// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類の設定（62.5 秒・24 GiB）を実プロセスに適用しても、
+/// 上限内の子は止められず出力が中継される。24 GiB の上限が `run_with_limits` に受理される。
 #[test]
 fn req39_qwen2_lora_limits_apply_and_allow_within_limit_child() {
     use fandhe_edge_cli::args::InferSource;
@@ -109,7 +109,7 @@ fn req39_qwen2_lora_limits_apply_and_allow_within_limit_child() {
     };
     let cfg = supervisor_config(&source, safety_limits_for_kind("qwen2_lora")).expect("config");
     assert_eq!(cfg.time_limit(), Duration::from_millis(62_500));
-    assert_eq!(cfg.memory_limit(), Some(8 * 1024 * 1024 * 1024));
+    assert_eq!(cfg.memory_limit(), Some(24 * 1024 * 1024 * 1024));
     let (code, text) = supervise("ok", &cfg);
     assert_eq!(code, ExitCode::Ok);
     assert!(

@@ -371,7 +371,7 @@ fn req39_model_limits_by_kind() {
     let ext = FT.external.unwrap();
     assert_eq!(
         (ext.max_shard_bytes, ext.max_shards, ext.max_total_bytes),
-        (1 << 30, 256, 8 << 30)
+        (2 << 30, 256, 20 << 30)
     );
 }
 

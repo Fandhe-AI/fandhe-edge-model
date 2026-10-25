@@ -97,6 +97,15 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
     assert set(_LIMITS["max_model_bytes_by_kind"]) == {
         k for k in kind_versions if not k.startswith("_")
     }
+    # REQ-39・#654: shard 1 件の上限は書き出し側・読み込み側・fixture で一致。
+    from fandhe_edge_trainer import qwen2_onnx
+
+    assert (
+        _LIMITS["max_external_shard_bytes"]
+        == qwen2_onnx.SHARD_MAX_BYTES
+        == artifact._SHARD_READ_CAP_BYTES
+        == 2 << 30
+    )
     assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
     assert _LIMITS["max_validation_id_bytes"] == limits.MAX_VALIDATION_ID_BYTES
     assert _LIMITS["max_validation_input_total_bytes"] == limits.MAX_VALIDATION_INPUT_TOTAL_BYTES

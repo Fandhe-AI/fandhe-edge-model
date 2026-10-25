@@ -87,9 +87,9 @@
 ## 4. データ型・rank・件数
 
 - FLOAT: 計算。同梱 K/V（#634）は FLOAT の initializer として外部データの shard に置く（閾値 1024 バイト未満は inline。§8）。INT64: id・形状・index。BOOL: 中間値に限る（Greater の出力・Where の cond。initializer には使わない）。BFLOAT16: initializer に限る（`proto.rs` に `DT_BFLOAT16 = 16` を足す。#581）。それ以外（FLOAT16・DOUBLE・INT32 等）は拒否
-- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体は f32 に展開しない（1.5B で約 6.2 GB〔推定〕となり RSS 安全上限 8 GiB に近いため。#581 の決定）。bf16 は `u16` のまま保持し、外部データは shard 単位で流し読みして生バイトの全量を持たない。RSS の実測は #421・#435
+- bf16: `Cast(BFLOAT16 の initializer)` の消費者が Gemm の B か Gather の data のときは、読み込み時に f32 の全量を作らずカーネル内で展開する。norm の重みなど小さいものは読み込み時に f32 へ畳んでよい。全体は f32 に展開しない（1.5B で約 6.2 GB〔推定〕となり RSS 安全上限 8 GiB に近いため。#581 の決定。現行の安全上限は 24 GiB。#654・§7 の注記）。bf16 は `u16` のまま保持し、外部データは shard 単位で流し読みして生バイトの全量を持たない。RSS の実測は #421・#435
 - rank: 中間値は 5 以下（GQA の `[1,nkv,grp,T,hd]`）。initializer は 2 以下。C1・C3 の `MAX_DIMS=4` は変えず、上限は種類ごとに持つ
-- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る。#581 の暫定値（推定。#431 の実測で見直す）: ノード 4096・initializer 1024・rank 5・本体 64 MiB、外部データは shard 1 GiB・256 件・合計 8 GiB（ガード層の #580 と同じ）。C1・C3 は 128・64・4・44 MiB のまま外部データと bf16 を拒否する
+- 件数: 1 層あたりのノードは 2 節から約 50〜60、initializer は約 12（q・k・v の重みと bias、o・gate・up・down、norm 2 つ）。28 層で数千ノード・数百 initializer になる（推定。#431 で実測）。現行の `MAX_NODES=128`・`MAX_INITIALIZERS=64` には収まらないので、種類別の上限が要る。#581 の暫定値（推定。#431 の実測で見直す）: ノード 4096・initializer 1024・rank 5・本体 64 MiB、外部データは shard 1 GiB・256 件・合計 8 GiB（ガード層の #580 と同じ）。#654 で shard 2 GiB・合計 20 GiB に変更（7B の bf16 重み 15,231 MB の約 1.4 倍。証拠種別: 推定）。C1・C3 は 128・64・4・44 MiB のまま外部データと bf16 を拒否する
 - #634 で増える: 同梱 K/V のための Slice・Concat・Reshape と、層ごとの K・V の initializer 2 つ（28 層で 56）。28 層（極小次元の合成モデル）の実測はノード 3,862・initializer 425（証拠の種別: テストハーネス）で、暫定上限 4096・1024 の内。ノードの余裕は 234
 - 動的な次元は T だけ（`max_seq_length` と `max_position_embeddings` で上限を持つ）。K と M は定数
 
@@ -149,6 +149,7 @@
 - 実機（証拠種別: 実機・1 回。`~/poc26/k15` の P15 パッケージ `pkg15`〔約 3.09 GB〕に `fandhe-edge infer --package pkg15 --text "Open the page https://example.com in the browser"` を `/usr/bin/time -l` 下で 1 回。Apple M5）: exit 0、real 15.0 s（前: 約 199 s で上限 60 s の exit 20）、user 54.3 s、最大 RSS 3.45 GB（前: 約 3.19 GB。作業バッファとスレッド分）、予測 `browser_navigate`（PoC と一致）
 - レビュー後の再計測（2026-10-19・同じハーネス・load average 約 10〜17 の他作業ありの状態。証拠種別: テストハーネス）: レビュー指摘の修正で `gemm_tile` のロードに `Option` と NaN フォールバックの境界検査を挟んだ版は Gemm が約 2.4〜3 倍に後退した（単スレッド lm_head 1371 ms = 約 5.4 GMAC/s、並列 lm_head 252 ms・down 68 ms・gate/up 56 ms）。本体ループを `as_chunks` の固定長チャンク 8 本の zip に直して分岐を無くした版（現行）は単スレッド lm_head 684 ms（約 10.9 GMAC/s）、並列 lm_head 99 ms・down 23 ms・gate/up 20 ms・q/o 3.7 ms・MatMul 0.3〜0.8 ms で、表の値と同程度（負荷ぶんの差）。asm で worker の閉包に `fmul.4s` が 32 本・スカラー積和 0 本であることを確認。実機（同条件・1 回・load average 約 7〜9）: exit 0、real 13.7 s、user 58.0 s、最大 RSS 3.45 GB、予測 `browser_navigate`
 - 残り: real と user の比（約 3.6）から、重みの読み込みと要素ごとの演算・Softmax など Gemm 以外の単一スレッド部分が残る。p95 0.25 秒（REQ-31）・RSS 2 GB（REQ-30）は 1.5B を CPU で動かす限り届かない（#629 のオーナー判断事項）
+- RSS の上限: REQ-39 の RSS 目標 2 GiB は目標扱い（警告のみ。#579）とし、kind 単位の安全上限（暴走止め）は qwen2_lora で 24 GiB とする（2026-10-16 の「上限は目標扱い＋暴走止め」の合意の延長。#654）
 
 ## 8. 書き出しの実測（TASK-41.6-2・#431）
 
@@ -156,7 +157,7 @@
 - 数値照合: ReferenceEvaluator の `probs` と、統合・bf16 丸め済みの重みを読み込んだ f32 の MLX モデルの採点（`score_labels` → softmax）の最大絶対差は 7.2e-7（tie と非 tie の合成モデル・各 3 入力。2026-10-17）。証拠種別: テストハーネス。実重みでの確認は #434・#435
 - 件数: 層数 28（1.5B と同じ層構造・次元は極小・tie）でノード 3748・initializer 366（#581 の暫定上限 4096・1024 内）。1 層あたりのノードは prefix とブロックで約 130。件数は層数と tie の有無で決まる。証拠種別: テストハーネス
 - 設計からの変更: GatherElements の `axis` は ONNX 1.23 の ReferenceEvaluator が負の値を受けないため正の値で書く。ReferenceEvaluator の GatherElements は軸の長さが 64 を超えると失敗する（`np.choose` の制限）ため、テストでは同じ意味の `take_along_axis` に差し替える
-- 重みの置き場所: 閾値（1024 バイト）以上は shard `weights-NNNNN.bin`（1 テンソルは 1 shard に収める。1 GiB 超の単一テンソルは `limit_exceeded`。7B の非 tie の `lm_head` が該当し、除外の記録は #433）。小さな定数・重みは inline の `raw_data`
+- 重みの置き場所: 閾値（1024 バイト）以上は shard `weights-NNNNN.bin`（1 テンソルは 1 shard に収める。2 GiB 超の単一テンソルは `limit_exceeded`。7B の非 tie の `lm_head`（約 1.09 GB）は 2 GiB 以下で 1 shard に収まる。1 GiB 上限当時の除外記録は #433。#654）。小さな定数・重みは inline の `raw_data`
 
 ## 9. 配布パッケージの構成（TASK-41.6-3・#432）
 
@@ -166,7 +167,7 @@
 | -------- | ---- |
 | `artifact.json` | 既存の 11 欄＋下表の追加欄 |
 | `model.onnx` | 採点グラフ（opset 13）。同梱 K/V（#634）を含む。重みは外部データで shard を参照 |
-| `weights-NNNNN.bin` | 外部データ shard（1 件 1 GiB 以下・256 件以下） |
+| `weights-NNNNN.bin` | 外部データ shard（1 件 2 GiB 以下・256 件以下・合計 20 GiB 以下。#654） |
 | `tokenizer.json` | ベースモデルの `tokenizer.json` を、sha256 照合済みのバイト列のまま複写 |
 
 `artifact.json` の追加欄（`qwen2_lora` のみ。既存の種類の `artifact.json` は変えない）:

@@ -162,7 +162,7 @@ fn req39_limits_fixture_matches_rust_constants() {
 /// REQ-39・REQ-41・#582: 種類ごとの書き出しモデル上限の具体値。
 #[test]
 fn req39_max_model_bytes_for_kind_values() {
-    assert_eq!(limits::max_model_bytes_for_kind("qwen2_lora"), 8 << 30);
+    assert_eq!(limits::max_model_bytes_for_kind("qwen2_lora"), 20 << 30);
     assert_eq!(limits::max_model_bytes_for_kind("c3"), 40 << 20);
     assert_eq!(limits::max_model_bytes_for_kind("unknown"), 40 << 20);
 }

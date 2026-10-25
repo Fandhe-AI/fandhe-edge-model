@@ -29,9 +29,12 @@ pub const MAX_RANK: usize = 5;
 
 /// 1 つのテンソルの要素数の上限。確保の前に必ず照合する（REQ-39）。
 ///
-/// f32 で 1 GiB。Qwen2.5-1.5B の埋め込み（151936 × 1536 ≒ 2.3e8）が収まる値で、7B（152064 × 3584 ≒
-/// 5.5e8）は収まらないため 7B を扱うときに見直す（#581）。
-pub const MAX_ELEMENTS: usize = 1 << 28;
+/// `1 << 30`（f32 換算で 4 GiB 相当）。7B の埋め込み（152064 × 3584 ≒ 5.45e8）が収まる値
+/// （オーナー判断 2026-10-25・#654・REQ-39・REQ-41）。確保前の照合上限であり、bf16 の重みは
+/// `u16` のまま保持してカーネル内で展開するため全量の f32 化はしない（#581）。
+/// 本モジュールのカーネルは `qwen2_lora` の採点実行器（`scoring.rs`）と外部データの検査
+/// （`proto.rs`。外部データを拒否する C1・C3 には効かない）からだけ使われ、C1・C3 の上限は緩めない。
+pub const MAX_ELEMENTS: usize = 1 << 30;
 
 /// カーネルのエラー。終了コードへの写像は CLI 側の責務。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +353,18 @@ fn broadcast_map2_reference<A: Copy, B: Copy, U>(
 mod tests {
     use super::*;
 
+    /// REQ-39・REQ-41・#654: 7B の埋め込み形状は通り、`1 << 30` 超は確保前に拒否される。
+    #[test]
+    fn req39_element_count_boundary_for_7b() {
+        assert_eq!(element_count(&[152064, 3584]), Ok(152064 * 3584));
+        assert_eq!(element_count(&[1 << 30]), Ok(1 << 30));
+        assert_eq!(element_count(&[(1 << 30) + 1]), Err(OpError::LimitExceeded));
+        assert_eq!(
+            element_count(&[1 << 16, 1 << 15]),
+            Err(OpError::LimitExceeded)
+        );
+    }
+
     #[test]
     fn req41_broadcast_shape_cases() {
         assert_eq!(broadcast_shape(&[2, 3], &[3]).unwrap(), vec![2, 3]);
@@ -362,7 +377,7 @@ mod tests {
         );
         // 確保せずに上限超過を判定する
         assert_eq!(
-            broadcast_shape(&[1 << 15, 1], &[1, 1 << 15]),
+            broadcast_shape(&[1 << 16, 1], &[1, 1 << 15]),
             Err(OpError::LimitExceeded)
         );
     }

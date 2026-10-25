@@ -2,7 +2,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! 追加学習の種類（Qwen2.5-1.5B 級。bf16 で約 3.1 GB〔推定〕）は重みを 1 GiB 以下の shard に
+//! 追加学習の種類（Qwen2.5-1.5B 級。bf16 で約 3.1 GB〔推定〕）は重みを 2 GiB 以下の shard に
 //! 分け、ONNX の `external_data` で参照する。本モジュールは [`super::proto`] が保留した参照を、
 //! 呼び出し側が渡す閉じ込め済みの `File` から読んで実体に置き換える。呼び出し元は
 //! [`super::OnnxBackend::from_bytes_with_shards`]（`qwen2_lora`。#434）。C1・C3 は
@@ -18,8 +18,8 @@
 //! - 資源: 件数・shard ごとの fstat サイズ・合計を、1 バイトも読む前に上限と照合する。
 //!   参照範囲の重なりを拒否し（同じ領域を何度も参照させて確保量を増幅させない）、確保は
 //!   `try_reserve_exact`。shard は固定長バッファで 1 回だけ流し読みし、生バイトの全量を保持しない
-//! - 保持形式: bf16 は `u16` のまま保持する（f32 へ全量展開すると約 6.2 GB〔推定〕で RSS 安全上限
-//!   8 GiB に近い）。f32 への展開は Gemm・Gather のカーネル内（#416・#417）。RSS の実測は #421・#435
+//! - 保持形式: bf16 は `u16` のまま保持する（f32 へ全量展開すると1.5B で約 6.2 GB〔推定〕となり、
+//!   当時の RSS 安全上限 8 GiB に近かった。#581。現行の上限は 24 GiB〔#654〕）。f32 への展開は Gemm・Gather のカーネル内（#416・#417）。RSS の実測は #421・#435
 
 use super::proto::{DT_BFLOAT16, DT_FLOAT, DT_INT64, ExternalRef, GraphProto, TensorData};
 use super::{ExternalDataLimits, OnnxLoadError};
