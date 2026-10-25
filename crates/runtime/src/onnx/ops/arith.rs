@@ -960,7 +960,7 @@ mod tests {
             Err(OpError::ShapeMismatch)
         );
         // 巨大出力は確保前に拒否（入力は小さい）
-        let x = t(&[1 << 15, 1], vec![0.0; 1 << 15]);
+        let x = t(&[1 << 16, 1], vec![0.0; 1 << 16]);
         let y = t(&[1, 1 << 15], vec![0.0; 1 << 15]);
         assert_eq!(matmul(&x, &y, None), Err(OpError::LimitExceeded));
     }

@@ -1,5 +1,5 @@
 //! 分割ファイル群の受け付けと合計上限の結合テスト（REQ-39・REQ-41・TASK-41.2-5・#580）。
-//! スパースファイルで 1 GiB・8 GiB の境界を検証する（証拠種別: テストハーネス）。
+//! スパースファイルで 2 GiB（shard）・20 GiB（合計）の境界を検証する（証拠種別: テストハーネス）。
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use fandhe_edge_core::exitcode::ExitCode;
@@ -7,8 +7,8 @@ use fandhe_edge_core::hash::Sha256Digest;
 use fandhe_edge_guard::file_size::FileSizeRejection;
 use fandhe_edge_guard::path::{ConfinedPath, open_confined};
 use fandhe_edge_guard::split_files::{
-    MAX_PACKAGE_TOTAL_BYTES, MAX_SPLIT_FILES, SplitFilesRejection, check_split_files,
-    effective_total_limit, verify_split_files,
+    MAX_PACKAGE_TOTAL_BYTES, MAX_SHARD_FILE_BYTES, MAX_SPLIT_FILES, SplitFilesRejection,
+    check_split_files, effective_total_limit, verify_split_files,
 };
 use std::fs::File;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ fn req41_split_files_accepted_with_sizes_and_hashes() {
     let d = TempDir::new("sp-ok");
     let r = check_split_files(three(&d), MAX_PACKAGE_TOTAL_BYTES).unwrap();
     assert_eq!(r.total(), 30);
-    assert_eq!(r.limit(), 8_589_934_592);
+    assert_eq!(r.limit(), 21_474_836_480);
     let sizes: Vec<u64> = r.files().iter().map(|f| f.size()).collect();
     assert_eq!(sizes, vec![10, 10, 10]);
     assert_eq!(r.files()[1].sha256(), Sha256Digest::of_bytes(b"bbbbbbbbbb"));
@@ -79,36 +79,36 @@ fn req39_total_limit_boundary() {
 }
 
 #[test]
-fn req41_total_over_8gib_rejected_without_reading() {
-    let d = TempDir::new("sp-8g");
+fn req41_total_over_20gib_rejected_without_reading() {
+    let d = TempDir::new("sp-20g");
     let mut m = Vec::new();
-    for i in 0..9 {
+    for i in 0..11 {
         let n = format!("s{i}");
-        d.sparse(&n, GIB);
+        d.sparse(&n, 2 * GIB);
         m.push(d.open(&n));
     }
     let e = check_split_files(m, u64::MAX).unwrap_err();
     assert!(matches!(
         e,
         SplitFilesRejection::TotalTooLarge {
-            total: 9_663_676_416,
-            limit: 8_589_934_592
+            total: 23_622_320_128,
+            limit: 21_474_836_480
         }
     ));
 }
 
 #[test]
-fn req39_single_file_over_1gib_rejected() {
-    let d = TempDir::new("sp-1g");
+fn req39_single_file_over_2gib_rejected() {
+    let d = TempDir::new("sp-2g");
     d.write("a", b"x");
-    d.sparse("big", GIB + 1);
+    d.sparse("big", MAX_SHARD_FILE_BYTES + 1);
     let e = check_split_files(vec![d.open("a"), d.open("big")], u64::MAX).unwrap_err();
     assert!(matches!(
         e,
         SplitFilesRejection::File {
             index: 1,
             source: FileSizeRejection::TooLarge {
-                size: 1_073_741_825,
+                size: 2_147_483_649,
                 ..
             }
         }
@@ -178,7 +178,7 @@ fn req39_empty_too_many_and_directory() {
 
 #[test]
 fn req39_effective_total_limit_clamps() {
-    assert_eq!(effective_total_limit(u64::MAX), 8_589_934_592);
+    assert_eq!(effective_total_limit(u64::MAX), 21_474_836_480);
     assert_eq!(effective_total_limit(100), 100);
 }
 
@@ -193,4 +193,43 @@ fn req39_consumed_handle_hashed_from_start() {
     f.read_exact(&mut buf).unwrap();
     let r = check_split_files(vec![(f, p)], u64::MAX).unwrap();
     assert_eq!(r.files()[0].sha256(), Sha256Digest::of_bytes(b"aaaaaaaaaa"));
+}
+
+/// REQ-39・#654: shard ちょうど 2 GiB は fstat 段を通る（合計上限 1 byte で合計段の拒否を観測する。
+/// ハッシュまで進めると 2 GiB を読むため、通過は「合計超過で止まる＝単体検査は通った」で確認する）。
+#[test]
+fn req39_shard_exactly_max_passes_single_file_check() {
+    let d = TempDir::new("sp-2g-exact");
+    d.sparse("s", MAX_SHARD_FILE_BYTES);
+    let e = check_split_files(vec![d.open("s")], 1).unwrap_err();
+    assert!(matches!(
+        e,
+        SplitFilesRejection::TotalTooLarge {
+            total: 2_147_483_648,
+            limit: 1
+        }
+    ));
+}
+
+/// REQ-39・#654: 合計 20 GiB + 1 は、ハッシュを読む前の合計検査で拒否される（上限値は 20 GiB）。
+/// ちょうど 20 GiB の通過は 20 GiB 分の sparse をハッシュで読むことになり遅いため置かない。
+#[test]
+fn req39_total_boundary_at_package_max() {
+    let d = TempDir::new("sp-20g-bound");
+    let mut m = Vec::new();
+    for i in 0..10 {
+        let n = format!("s{i}");
+        d.sparse(&n, 2 * GIB);
+        m.push(d.open(&n));
+    }
+    d.sparse("one", 1);
+    m.push(d.open("one"));
+    let e = check_split_files(m, u64::MAX).unwrap_err();
+    assert!(matches!(
+        e,
+        SplitFilesRejection::TotalTooLarge {
+            total: 21_474_836_481,
+            limit: 21_474_836_480
+        }
+    ));
 }

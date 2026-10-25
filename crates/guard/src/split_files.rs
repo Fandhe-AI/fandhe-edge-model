@@ -1,6 +1,7 @@
 //! 分割ファイル群（重みの shard 等）の受け付けとパッケージ合計の上限（REQ-39・REQ-41・TASK-41.2-5・#580・#400）。
 //!
-//! 1 ファイルの上限 [`MAX_READ_FILE_BYTES`]（1 GiB）は据え置き、1 GiB 以下に分割された複数ファイルを
+//! 1 ファイルの上限は重みファイル専用の [`MAX_SHARD_FILE_BYTES`]（2 GiB）。他のファイルの上限
+//! [`MAX_READ_FILE_BYTES`]（1 GiB）は据え置き。分割された複数ファイルを
 //! まとめて受け付けて、合計を [`MAX_PACKAGE_TOTAL_BYTES`] と照合し、各ファイルの sha256 を記録・照合する。
 //! ベースモデルのディレクトリ受付（#398）・ONNX 外部データの読み込み（#581）・来歴への記録（#399）から
 //! 呼ばれる想定で、現時点で CLI・trainer には未接続。形式（safetensors か）の判定は #397 の責務で扱わない。
@@ -8,16 +9,16 @@
 //! # 設計上の要点
 //!
 //! - 入力は [`crate::path::open_confined`] 等が返した開いたハンドル。パスから開き直さない（TOCTOU を作らない）
-//! - 検査順序は 件数 → 各ファイルの fstat（通常ファイル・1 GiB 以下）→ 合計 → ハッシュ。合計超過までは 1 バイトも読まない
+//! - 検査順序は 件数 → 各ファイルの fstat（通常ファイル・2 GiB 以下）→ 合計 → ハッシュ。合計超過までは 1 バイトも読まない
 //! - 合計は飽和加算（溢れは超過扱い）。ハッシュは確認済み fstat サイズを上限とするストリームで、fstat 後に伸びたファイルは拒否する
 //! - 拒否メッセージにパス・内容を含めない（数値と index のみ）
 //!
 //! # 合計上限の値（暫定。オーナー確認事項）
 //!
-//! 8 GiB。Qwen2.5-1.5B の bf16 重み（約 3.09GB）の約 2.8 倍で、「安全上限は実測の 2〜4 倍」の方針（2026-10-16）に
-//! 沿う。7B（約 15GB）は超えるため、7B を扱う判断（1.5B 完了後に相談）の時点で見直す。証拠種別: 推定。
+//! 20 GiB。Qwen2.5-7B の bf16 重み（15,231 MB）の約 1.4 倍（#654。オーナー承認 2026-10-25）。
+//! 1.5B（約 3.09GB）にも十分な余裕がある暴走止めの上限。証拠種別: 推定。
 
-use crate::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES, check_file_size_within};
+use crate::file_size::{FileSizeRejection, check_file_size_unclamped};
 use crate::path::ConfinedPath;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
@@ -25,8 +26,14 @@ use fandhe_edge_core::hash::Sha256Digest;
 use std::fmt;
 use std::fs::File;
 
-/// パッケージ（分割ファイル群）の合計サイズの上限（8 GiB。暫定）。
-pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// 重みファイル（外部データ shard）専用の 1 ファイル上限（2 GiB）。
+///
+/// 7B の埋め込み 1 テンソル（約 1.09 GB）が [`crate::file_size::MAX_READ_FILE_BYTES`]（1 GiB）に収まらないため。
+/// オーナー判断 2026-10-25・#654（REQ-39・REQ-41）。他のファイルは 1 GiB のまま。
+pub const MAX_SHARD_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// パッケージ（分割ファイル群）の合計サイズの上限（20 GiB。7B の bf16 重み 15,231 MB の約 1.4 倍。証拠種別: 推定）。
+pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// 受け付ける分割ファイルの最大件数（ハッシュ計算の時間と fd 数を有界にする）。
 pub const MAX_SPLIT_FILES: usize = fandhe_edge_core::limits::MAX_EXTERNAL_DATA_SHARDS;
@@ -99,7 +106,7 @@ pub enum SplitFilesRejection {
         /// 件数の上限。
         limit: usize,
     },
-    /// `index` 番目のファイルがサイズ検査（1 GiB・通常ファイル）で拒否された。
+    /// `index` 番目のファイルがサイズ検査（2 GiB・通常ファイル）で拒否された。
     File {
         /// 入力順の位置。
         index: usize,
@@ -201,7 +208,7 @@ impl std::error::Error for SplitFilesRejection {
     }
 }
 
-/// 分割ファイル群を受け付ける。1 ファイル 1 GiB 以下・合計が実効上限以下を fstat で確認してから
+/// 分割ファイル群を受け付ける。1 ファイル 2 GiB 以下・合計が実効上限以下を fstat で確認してから
 /// （この間 1 バイトも読まない）、各ファイルの sha256 を計算して返す。
 pub fn check_split_files(
     members: Vec<(File, ConfinedPath)>,
@@ -220,7 +227,7 @@ pub fn check_split_files(
     let mut sizes = Vec::with_capacity(members.len());
     let mut total: u64 = 0;
     for (index, (file, _)) in members.iter().enumerate() {
-        let size = check_file_size_within(file, MAX_READ_FILE_BYTES)
+        let size = check_file_size_unclamped(file, MAX_SHARD_FILE_BYTES)
             .map_err(|source| SplitFilesRejection::File { index, source })?;
         total = total.saturating_add(size);
         sizes.push(size);

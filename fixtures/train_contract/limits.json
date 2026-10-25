@@ -18,6 +18,7 @@
   "max_validation_id_bytes": 1024,
   "max_validation_input_total_bytes": 67108864,
   "max_result_bytes_with_validation": 67108864,
-  "max_model_bytes_by_kind": {"c1": 41943040, "c3": 41943040, "autoregressive": 41943040, "qwen2_lora": 8589934592},
+  "max_model_bytes_by_kind": {"c1": 41943040, "c3": 41943040, "autoregressive": 41943040, "qwen2_lora": 21474836480},
+  "max_external_shard_bytes": 2147483648,
   "allowed_devices": ["cpu", "gpu"]
 }

@@ -73,7 +73,7 @@ use std::path::Path;
 pub const MAX_MODEL_FILE_BYTES: u64 = 44 * 1024 * 1024;
 
 /// 外部データ（分割した重み）の上限（REQ-39・TASK-41.7-8・#581）。ガード層の同名の上限
-/// （`fandhe_edge_guard::file_size::MAX_READ_FILE_BYTES`・`split_files::MAX_PACKAGE_TOTAL_BYTES`・
+/// （`fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES`・`split_files::MAX_PACKAGE_TOTAL_BYTES`・
 /// `MAX_SPLIT_FILES`）と一致させる。runtime は guard に依存しないため、`crates/cli/tests/
 /// onnx_external_limits_sync.rs` で照合する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +118,8 @@ pub const STRICT_MODEL_LIMITS: ModelLimits = ModelLimits {
 /// - 本体: 重みは外部データへ出るので数千ノード・数 MB の見込みに対し 64 MiB
 /// - ノード: 28 層 × 約 60 ≒ 1700 の約 2.4 倍、initializer: 約 340 の 3 倍
 /// - 次元: 中間値の rank 上限 [`ops::MAX_RANK`] と同じ
-/// - 外部データ: ガード層の #580 と同じ値（shard 1 GiB・256 件・合計 8 GiB）
+/// - 外部データ: ガード層と同じ値（shard 2 GiB・256 件・合計 20 GiB）。7B 級を扱うため引き上げ
+///   （オーナー判断 2026-10-25・#654・REQ-39・REQ-41）
 pub const FINETUNE_MODEL_LIMITS: ModelLimits = ModelLimits {
     max_model_file_bytes: 64 * 1024 * 1024,
     max_nodes: 4096,
@@ -126,9 +127,9 @@ pub const FINETUNE_MODEL_LIMITS: ModelLimits = ModelLimits {
     max_dims: ops::MAX_RANK,
     allow_bf16: true,
     external: Some(ExternalDataLimits {
-        max_shard_bytes: 1024 * 1024 * 1024,
+        max_shard_bytes: 2 * 1024 * 1024 * 1024,
         max_shards: fandhe_edge_core::limits::MAX_EXTERNAL_DATA_SHARDS,
-        max_total_bytes: 8 * 1024 * 1024 * 1024,
+        max_total_bytes: 20 * 1024 * 1024 * 1024,
     }),
 };
 

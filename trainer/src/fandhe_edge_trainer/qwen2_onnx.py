@@ -39,8 +39,10 @@ OPSET = 13
 IR_VERSION = 8
 #: マスクの遮蔽値。f32 の Softmax で exp が 0 になる十分小さな有限値（-inf は使わない）。
 NEG = -1e30
-#: shard 1 件の上限（#580・#581。Rust ガード層と同値）と件数の上限。
-SHARD_MAX_BYTES = 1 << 30
+#: shard 1 件の上限（2 GiB）と件数の上限。Rust ガード層 `split_files::MAX_SHARD_FILE_BYTES` と同値。
+#: 7B の埋め込み / lm_head 1 テンソル（約 1.09 GB）が 1 shard に収まる大きさ。
+#: オーナー判断 2026-10-25・#654（証拠種別: 推定）。
+SHARD_MAX_BYTES = 2 << 30
 MAX_SHARDS = 256
 #: これ未満の initializer は inline の raw_data にする。
 EXTERNAL_THRESHOLD = 1024

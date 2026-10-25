@@ -166,16 +166,14 @@ MAX_TRAIN_TOTAL_TOKENS = 50_000_000
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_MODEL_BYTES = 40 * 1024 * 1024
 
-#: 追加学習の種類 `qwen2_lora` の書き出しモデル上限（8 GiB。REQ-39・REQ-41・
-#: TASK-41.6-6・#582）。LoRA 統合後の bf16 書き出しはベース重みとほぼ同じ大きさに
+#: 追加学習の種類 `qwen2_lora` の書き出しモデル上限（20 GiB。REQ-39・REQ-41・
+#: TASK-41.6-6・#582・#654）。LoRA 統合後の bf16 書き出しはベース重みとほぼ同じ大きさに
 #: なるため、40 MiB（`MAX_MODEL_BYTES`）とは両立しない（#430）。
-#: 根拠: 実測（`docs/design/poc26-result.md` 追加検証④・#559）で P15（Qwen2.5-1.5B）の
-#: bf16 ベース重みは 3087 MB（約 2.9 GiB）、adapter は 10.6 MB。8 GiB はその約 2.8 倍で、
-#: 「暴走止めは実測の 2〜4 倍」の考え方に合う。Rust ガード層 `MAX_PACKAGE_TOTAL_BYTES`
-#: （#580）・`MAX_BASE_MODEL_TOTAL_BYTES` と同値で、推論側で読めない大きさは書き出させない。
-#: 7B（15,231 MB）は超過する（扱いは 1.5B 完了後に相談）。
-#: 証拠種別: 実測の倍率から決めた暫定値。状態: #582 で決めた値で、オーナー確認は未了。
-MAX_QWEN2_LORA_MODEL_BYTES = 8 << 30
+#: 根拠: 7B（Qwen2.5-7B）の bf16 重み 15,231 MB の約 1.4 倍（オーナー判断 2026-10-25・#654。
+#: 当初の 8 GiB は 1.5B の 3087 MB の約 2.8 倍だった。#582）。Rust ガード層
+#: `MAX_PACKAGE_TOTAL_BYTES`・`MAX_BASE_MODEL_TOTAL_BYTES` と同値で、推論側で読めない大きさは
+#: 書き出させない。証拠種別: 推定。
+MAX_QWEN2_LORA_MODEL_BYTES = 20 << 30
 
 #: 書き出しモデル上限の種類ごとの表（REQ-39・#582）。共有 fixture
 #: （`fixtures/train_contract/limits.json` の `max_model_bytes_by_kind`）と Rust 側
@@ -458,9 +456,10 @@ MAX_AR_PREDICT_ROWS = 4_096_000
 #: **状態: 学習ワーカー固有の値としてのオーナー確認は未了**（Rust 側の値を準用）。
 MAX_BASE_MODEL_FILE_BYTES = 1 << 30
 
-#: ベースモデルの重みファイルの合計サイズ上限（8 GiB）。根拠: Rust ガード層
-#: `MAX_PACKAGE_TOTAL_BYTES`（#580）と同値。証拠種別: 準用。状態: 同上（確認未了）。
-MAX_BASE_MODEL_TOTAL_BYTES = 8 << 30
+#: ベースモデルの重みファイルの合計サイズ上限（20 GiB）。7B bf16 15,231 MB の約 1.4 倍。
+#: Rust ガード層 `MAX_PACKAGE_TOTAL_BYTES`（20 GiB）と同値。オーナー判断 2026-10-25・#654。
+#: 証拠種別: 推定。
+MAX_BASE_MODEL_TOTAL_BYTES = 20 << 30
 
 #: ベースモデルの重みファイルの件数上限。根拠: Rust ガード層 `MAX_SPLIT_FILES`（#580）と同値。
 #: 証拠種別: 準用。状態: 同上（確認未了）。

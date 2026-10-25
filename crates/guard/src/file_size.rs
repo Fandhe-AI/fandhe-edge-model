@@ -107,8 +107,20 @@ pub fn check_file_size_within(file: &File, limit: u64) -> Result<u64, FileSizeRe
     if !meta.file_type().is_file() {
         return Err(FileSizeRejection::NotRegularFile);
     }
-    let limit = effective_read_limit(limit);
-    let size = meta.len();
+    check_len_within(meta.len(), effective_read_limit(limit))
+}
+
+/// 天井で丸めずに `limit` と照合する（重みファイル専用の上限〔`split_files::MAX_SHARD_FILE_BYTES`〕用。
+/// 呼び出し側が定数の上限だけを渡すこと。REQ-39・#654）。
+pub(crate) fn check_file_size_unclamped(file: &File, limit: u64) -> Result<u64, FileSizeRejection> {
+    let meta = file.metadata().map_err(FileSizeRejection::Metadata)?;
+    if !meta.file_type().is_file() {
+        return Err(FileSizeRejection::NotRegularFile);
+    }
+    check_len_within(meta.len(), limit)
+}
+
+fn check_len_within(size: u64, limit: u64) -> Result<u64, FileSizeRejection> {
     if size > limit {
         return Err(FileSizeRejection::TooLarge { size, limit });
     }

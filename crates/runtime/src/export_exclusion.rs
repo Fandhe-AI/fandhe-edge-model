@@ -44,8 +44,8 @@
 //! [`ExclusionReason::UnsupportedTokenizer`] で除外する。属性・dtype・rank の範囲外は実行器の
 //! 読み込み（#434）で判定する。範囲内でも実行器が未接続で予測照合ができないため
 //! [`ExclusionReason::ParityUnverified`] で除外する（#434 で推論照合へ差し替え）。
-//! 7B 非 tie の lm_head が 1 GiB を超える場合は学習ワーカーが `limit_exceeded` で停止する現行の
-//! 契約のままで、本モジュールでは扱わない。
+//! 7B 非 tie の lm_head（約 1.09 GB）は shard 上限 2 GiB に収まる（オーナー判断 2026-10-25・
+//! #654）ため、本モジュールでは上限超過を扱わない。
 
 use crate::onnx::{
     FINETUNE_MODEL_LIMITS, ModelKind, NodeOp, OnnxBackend, OnnxLoadError, load_pipeline,

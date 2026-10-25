@@ -69,8 +69,9 @@ _RESERVED_MEMBER_NAMES = frozenset({ARTIFACT_FILE_NAME, ONNX_FILE_NAME})
 #: `tokenizer.json` を読む上限（`qwen2_model.MAX_TOKENIZER_JSON_BYTES` と同じ 16 MiB）。
 _TOKENIZER_READ_CAP_BYTES = 16 * 1024 * 1024
 
-#: shard 1 件の読み込み上限（`qwen2_onnx.SHARD_MAX_BYTES` と同じ 1 GiB）。
-_SHARD_READ_CAP_BYTES = 1 << 30
+#: shard 1 件の読み込み上限（`qwen2_onnx.SHARD_MAX_BYTES` と同じ 2 GiB。#654）。
+#: qwen2_onnx は MLX 依存で import しないため値を置き、テストで一致を確認する。
+_SHARD_READ_CAP_BYTES = 2 << 30
 
 #: 種類が `build_artifact(extra=...)` で足してよい欄（`qwen2_lora`。REQ-41・TASK-41.6-3・#432）。
 _EXTRA_KEYS = frozenset(

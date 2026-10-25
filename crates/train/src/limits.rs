@@ -56,10 +56,10 @@ pub const MAX_TRAIN_WALL_SECONDS: u32 = 3600;
 /// 書き出しモデル上限の既定（40 MiB）。`limits.py::MAX_MODEL_BYTES`。表に無い kind もこの値に落とす。
 pub const MAX_MODEL_BYTES: u64 = 40 * 1024 * 1024;
 
-/// `qwen2_lora` の書き出しモデル上限（8 GiB。REQ-39・REQ-41・TASK-41.6-6・#582）。
-/// `limits.py::MAX_QWEN2_LORA_MODEL_BYTES` を写した値。根拠は P15（Qwen2.5-1.5B）の
-/// bf16 ベース重み 3087 MB の約 2.8 倍（実測の倍率から決めた暫定値）。オーナー確認は未了。
-pub const MAX_QWEN2_LORA_MODEL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// `qwen2_lora` の書き出しモデル上限（20 GiB。REQ-39・REQ-41・TASK-41.6-6・#582・#654）。
+/// `limits.py::MAX_QWEN2_LORA_MODEL_BYTES` を写した値。7B（bf16 15,231 MB）の約 1.4 倍で、
+/// ガード層 `MAX_PACKAGE_TOTAL_BYTES` と同値（オーナー判断 2026-10-25。証拠種別: 推定）。
+pub const MAX_QWEN2_LORA_MODEL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// 書き出しモデル上限の種類ごとの表。`limits.py::MAX_MODEL_BYTES_BY_KIND` と
 /// 共有 fixture（`limits.json` の `max_model_bytes_by_kind`）で照合する。

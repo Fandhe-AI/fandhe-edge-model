@@ -232,6 +232,6 @@ def test_verify_output_caps_bytes_read_even_if_model_grows_after_fstat(
 def test_req39_onnx_read_cap_is_per_kind() -> None:
     """REQ-39・REQ-41・#582: 読み込み上限は kind ごと。未知の kind・非 str は厳しい側。"""
     mib4 = 4 * 1024 * 1024
-    assert artifact._onnx_read_cap_bytes("qwen2_lora") == (8 << 30) + mib4
+    assert artifact._onnx_read_cap_bytes("qwen2_lora") == (20 << 30) + mib4
     for kind in ("c3", "unknown", None):
         assert artifact._onnx_read_cap_bytes(kind) == (40 << 20) + mib4

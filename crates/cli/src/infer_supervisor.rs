@@ -244,16 +244,16 @@ mod tests {
         }
     }
 
-    /// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類は 60 秒・8 GiB（親は 62.5 秒）。
+    /// REQ-39・REQ-41・TASK-41.8・#435: 追加学習の種類は 60 秒・24 GiB（親は 62.5 秒）。
     #[test]
-    fn req39_config_qwen2_lora_is_62_5_seconds_and_8_gib() {
+    fn req39_config_qwen2_lora_is_62_5_seconds_and_24_gib() {
         let l = safety_limits_for_kind("qwen2_lora");
         let t = supervisor_config(&text(), l).unwrap();
         assert_eq!(t.time_limit(), Duration::from_millis(62_500));
-        assert_eq!(t.memory_limit(), Some(8_589_934_592));
+        assert_eq!(t.memory_limit(), Some(25_769_803_776));
         let f = supervisor_config(&file(), l).unwrap();
         assert_eq!(f.time_limit(), Duration::from_secs(662));
-        assert_eq!(f.memory_limit(), Some(8_589_934_592));
+        assert_eq!(f.memory_limit(), Some(25_769_803_776));
     }
 
     #[test]
