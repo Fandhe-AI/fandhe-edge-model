@@ -315,7 +315,7 @@ def test_memory_budget_limit(tmp_path: Path) -> None:
 
 def test_limit_values_match_rust_guard() -> None:
     """REQ-39: 準用した上限が Rust ガード層・runtime の値（#400・#580）と同じ。"""
-    assert limits.MAX_BASE_MODEL_FILE_BYTES == 1 << 30
+    assert limits.MAX_BASE_MODEL_FILE_BYTES == 2 << 30
     assert limits.MAX_BASE_MODEL_TOTAL_BYTES == 20 << 30
     assert limits.MAX_BASE_MODEL_WEIGHT_FILES == 256
     assert limits.MAX_TOKENIZER_JSON_BYTES == 16 * 1024 * 1024

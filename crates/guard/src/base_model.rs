@@ -16,13 +16,21 @@
 //! - 利用者由来のパス・ファイル名・内容はエラーの値（Debug・source を含む）にもメッセージにも含めない。
 //!   経路・形式の拒否は終了コードと理由コードだけに畳む
 //!
-//! ponytail: 形式判定のため上限（1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
+//! - サイズ上限は重み（safetensors）が 2 GiB（`split_files::MAX_SHARD_FILE_BYTES`。#655）、
+//!   `tokenizer.json` が 1 GiB（`MAX_READ_FILE_BYTES`）
+//!
+//! ponytail: 形式判定のため上限（重み 2 GiB・他 1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
 //! RSS が問題になれば safetensors はヘッダーだけの検査へ切り替える（#435）。
 //! ハードリンクで外部ファイルを指すメンバーは経路では検出できない（必要なら `st_nlink > 1` を拒否）。
 
-use crate::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES, check_file_size_within};
-use crate::format::{CheckedFile, FileFormat, FormatAllowlist, check_open_file};
+use crate::file_size::{
+    FileSizeRejection, MAX_READ_FILE_BYTES, check_file_size_unclamped, check_file_size_within,
+};
+use crate::format::{
+    CheckedFile, FileFormat, FormatAllowlist, check_open_file, check_open_file_unclamped,
+};
 use crate::package::ConfinedPackage;
+use crate::split_files::MAX_SHARD_FILE_BYTES;
 use fandhe_edge_core::exitcode::ExitCode;
 use std::fmt;
 use std::path::Path;
@@ -117,14 +125,18 @@ pub fn open_base_model_file(
             exit_code: e.exit_code(),
             reason_code: e.reason_code(),
         })?;
-    check_file_size_within(&file, MAX_READ_FILE_BYTES).map_err(BaseModelFileRejection::Size)?;
-    check_open_file(
-        file,
-        member,
-        &FormatAllowlist::new([expected]),
-        MAX_READ_FILE_BYTES,
-    )
-    .map_err(|e| BaseModelFileRejection::Format {
+    let allow = FormatAllowlist::new([expected]);
+    // 重み（safetensors）だけ重みファイル専用の 2 GiB。7B の埋め込み 1 テンソルが 1 GiB 超で
+    // 分割できないため（REQ-39・REQ-41・#654・#655）。他のファイルは 1 GiB のまま
+    let checked = if expected == FileFormat::Safetensors {
+        check_file_size_unclamped(&file, MAX_SHARD_FILE_BYTES)
+            .map_err(BaseModelFileRejection::Size)?;
+        check_open_file_unclamped(file, member, &allow, MAX_SHARD_FILE_BYTES)
+    } else {
+        check_file_size_within(&file, MAX_READ_FILE_BYTES).map_err(BaseModelFileRejection::Size)?;
+        check_open_file(file, member, &allow, MAX_READ_FILE_BYTES)
+    };
+    checked.map_err(|e| BaseModelFileRejection::Format {
         exit_code: e.exit_code(),
         reason_code: e.reason_code(),
     })
