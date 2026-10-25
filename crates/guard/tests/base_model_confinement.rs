@@ -8,6 +8,7 @@ use fandhe_edge_guard::base_model::{BaseModelFileRejection, open_base_model_file
 use fandhe_edge_guard::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES};
 use fandhe_edge_guard::format::FileFormat;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
+use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -138,15 +139,15 @@ fn req39_symlink_parent_rejected() {
     assert_eq!(e.exit_code(), ExitCode::InvalidInput);
 }
 
-/// REQ-39: 上限 +1 のスパースファイルは、読む前の fstat で file_size_limit_exceeded(20) になる。
+/// REQ-39: tokenizer.json は 1 GiB+1 で、読む前の fstat により file_size_limit_exceeded(20)。
 #[test]
 fn req39_oversize_rejected_before_read() {
     let sb = Sandbox::new("big");
-    let f = fs::File::create(sb.dir().join("model.safetensors")).unwrap();
+    let f = fs::File::create(sb.dir().join("tokenizer.json")).unwrap();
     f.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
     let e = reject(open_base_model_file(
         &sb.confine(),
-        Path::new("model.safetensors"),
+        Path::new("tokenizer.json"),
     ));
     match &e {
         BaseModelFileRejection::Size(FileSizeRejection::TooLarge { size, limit }) => {
@@ -156,6 +157,32 @@ fn req39_oversize_rejected_before_read() {
         other => panic!("unexpected {other:?}"),
     }
     assert_eq!(e.exit_code(), ExitCode::LimitExceeded);
+    assert_eq!(e.reason_code(), "file_size_limit_exceeded");
+}
+
+/// REQ-39・REQ-41・#655: 重みは 2 GiB まで。1 GiB+1 はサイズ検査を通り（形式段で拒否）、2 GiB+1 は Size で拒否。
+#[test]
+fn req39_weight_limit_is_2gib() {
+    let sb = Sandbox::new("bigw");
+    let f = fs::File::create(sb.dir().join("model.safetensors")).unwrap();
+    f.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
+    let e = reject(open_base_model_file(
+        &sb.confine(),
+        Path::new("model.safetensors"),
+    ));
+    assert!(matches!(e, BaseModelFileRejection::Format { .. }), "{e:?}");
+    f.set_len(MAX_SHARD_FILE_BYTES + 1).unwrap();
+    let e = reject(open_base_model_file(
+        &sb.confine(),
+        Path::new("model.safetensors"),
+    ));
+    match &e {
+        BaseModelFileRejection::Size(FileSizeRejection::TooLarge { size, limit }) => {
+            assert_eq!(*size, MAX_SHARD_FILE_BYTES + 1);
+            assert_eq!(*limit, MAX_SHARD_FILE_BYTES);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
     assert_eq!(e.reason_code(), "file_size_limit_exceeded");
 }
 

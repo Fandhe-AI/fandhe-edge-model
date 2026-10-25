@@ -749,7 +749,17 @@ pub fn check_open_file(
     allowlist: &FormatAllowlist,
     max_bytes: u64,
 ) -> Result<CheckedFile, FormatRejection> {
-    let max_bytes = effective_read_limit(max_bytes);
+    check_open_file_unclamped(file, path, allowlist, effective_read_limit(max_bytes))
+}
+
+/// 天井（1 GiB）で丸めずに `max_bytes` で読み切って検査する。重みファイル専用の上限
+/// （`split_files::MAX_SHARD_FILE_BYTES`）を定数で渡す呼び出し元だけが使う（REQ-39・#655）。
+pub(crate) fn check_open_file_unclamped(
+    file: std::fs::File,
+    path: &Path,
+    allowlist: &FormatAllowlist,
+    max_bytes: u64,
+) -> Result<CheckedFile, FormatRejection> {
     let bytes = read_bounded_open_file(file, path, max_bytes).map_err(FormatRejection::Io)?;
     check_bytes(bytes, allowlist)
 }

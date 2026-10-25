@@ -104,6 +104,7 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
         _LIMITS["max_external_shard_bytes"]
         == qwen2_onnx.SHARD_MAX_BYTES
         == artifact._SHARD_READ_CAP_BYTES
+        == limits.MAX_BASE_MODEL_FILE_BYTES
         == 2 << 30
     )
     assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
