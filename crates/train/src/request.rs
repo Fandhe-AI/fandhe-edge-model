@@ -32,8 +32,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::TrainRequestError;
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_LABELS, MAX_MAX_BYTES, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
-    MAX_RESULT_BYTES_WITH_VALIDATION, MAX_SEED, MAX_TRAIN_RSS_BYTES, MAX_TRAIN_WALL_SECONDS,
+    MAX_RESULT_BYTES_WITH_VALIDATION, MAX_SEED, MAX_TRAIN_WALL_SECONDS,
     MAX_VALIDATION_INPUT_TOTAL_BYTES, MIN_LABELS, MIN_MAX_BYTES, MIN_SEED, REQUEST_SCHEMA_VERSION,
+    max_train_rss_bytes_for_kind,
 };
 
 /// 学習の実行デバイス。`contract.py::_ALLOWED_DEVICES`。
@@ -242,7 +243,7 @@ pub struct TrainRequestParams {
     pub out_dir: String,
     /// 省略時は [`MAX_TRAIN_WALL_SECONDS`]（`contract.py` の既定値と同じ）。
     pub time_limit_seconds: Option<u32>,
-    /// 省略時は [`MAX_TRAIN_RSS_BYTES`]（`contract.py` の既定値と同じ）。
+    /// 省略時は [`max_train_rss_bytes_for_kind`]（`contract.py` の既定値と同じ。qwen2_lora のみ 12 GiB、他は 8 GiB）。
     pub rss_limit_bytes: Option<u64>,
 }
 
@@ -350,18 +351,14 @@ struct WireTrainRequest<'a> {
     out_dir: &'a str,
     #[serde(skip_serializing_if = "is_default_wall_seconds")]
     time_limit_seconds: u32,
-    #[serde(skip_serializing_if = "is_default_rss_bytes")]
-    rss_limit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rss_limit_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validation_inputs: Option<&'a [ValidationInput]>,
 }
 
 fn is_default_wall_seconds(value: &u32) -> bool {
     *value == MAX_TRAIN_WALL_SECONDS
-}
-
-fn is_default_rss_bytes(value: &u64) -> bool {
-    *value == MAX_TRAIN_RSS_BYTES
 }
 
 /// `root`（絶対パス）の構文検査。`guard.py::resolve_root` の文字列レベルの
@@ -538,8 +535,10 @@ impl TrainRequest {
         if !(1..=MAX_TRAIN_WALL_SECONDS).contains(&time_limit_seconds) {
             return Err(TrainRequestError::InvalidTimeLimitSeconds);
         }
-        let rss_limit_bytes = params.rss_limit_bytes.unwrap_or(MAX_TRAIN_RSS_BYTES);
-        if !(1..=MAX_TRAIN_RSS_BYTES).contains(&rss_limit_bytes) {
+        // kind ごとの既定・上限（qwen2_lora のみ 12 GiB。#665・REQ-39）
+        let max_rss = max_train_rss_bytes_for_kind(&params.kind);
+        let rss_limit_bytes = params.rss_limit_bytes.unwrap_or(max_rss);
+        if !(1..=max_rss).contains(&rss_limit_bytes) {
             return Err(TrainRequestError::InvalidRssLimitBytes);
         }
         check_root_syntax(&params.root)?;
@@ -673,7 +672,9 @@ impl TrainRequest {
             train_path: &self.train_path,
             out_dir: &self.out_dir,
             time_limit_seconds: self.time_limit_seconds,
-            rss_limit_bytes: self.rss_limit_bytes,
+            // kind の既定と等しければ省略する（Python 側が同じ既定で解決する）
+            rss_limit_bytes: (self.rss_limit_bytes != max_train_rss_bytes_for_kind(&self.kind))
+                .then_some(self.rss_limit_bytes),
             validation_inputs: self.validation_inputs.as_deref(),
         };
         let mut writer = LimitedVecWriter::new(MAX_REQUEST_BYTES);
@@ -874,7 +875,45 @@ mod tests {
     fn req39_defaults_resolve_to_the_upper_limits() {
         let req = TrainRequest::new(valid_params()).expect("valid params must be accepted");
         assert_eq!(req.time_limit_seconds(), MAX_TRAIN_WALL_SECONDS);
-        assert_eq!(req.rss_limit_bytes(), MAX_TRAIN_RSS_BYTES);
+        assert_eq!(req.rss_limit_bytes(), crate::limits::MAX_TRAIN_RSS_BYTES);
+    }
+
+    /// REQ-39・#665: `rss_limit_bytes` の上限と既定は kind 依存。qwen2_lora は 12 GiB 可・
+    /// 12 GiB + 1 拒否・省略時 12 GiB、他 kind は 8 GiB 可・8 GiB + 1 拒否。
+    #[test]
+    fn req39_rss_limit_is_kind_dependent() {
+        let with = |kind: &str, rss: Option<u64>| {
+            let mut p = valid_params();
+            p.kind = kind.to_string();
+            p.rss_limit_bytes = rss;
+            TrainRequest::new(p)
+        };
+        let gib = 1u64 << 30;
+        assert_eq!(
+            with("qwen2_lora", Some(12 * gib))
+                .unwrap()
+                .rss_limit_bytes(),
+            12 * gib
+        );
+        assert_eq!(
+            with("qwen2_lora", None).unwrap().rss_limit_bytes(),
+            12 * gib
+        );
+        assert!(matches!(
+            with("qwen2_lora", Some(12 * gib + 1)),
+            Err(TrainRequestError::InvalidRssLimitBytes)
+        ));
+        assert_eq!(
+            with("c3", Some(8 * gib)).unwrap().rss_limit_bytes(),
+            8 * gib
+        );
+        assert!(matches!(
+            with("c3", Some(8 * gib + 1)),
+            Err(TrainRequestError::InvalidRssLimitBytes)
+        ));
+        // 既定と等しい値は直列化で省略する（Python 側が同じ既定で解決する）
+        let json = with("qwen2_lora", None).unwrap().to_json_vec().unwrap();
+        assert!(!String::from_utf8(json).unwrap().contains("rss_limit_bytes"));
     }
 
     /// REQ-39・境界値: `label_order` が 1 件（`MIN_LABELS` 未満）だと拒否する。

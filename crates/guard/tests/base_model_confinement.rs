@@ -5,6 +5,7 @@
 
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_guard::base_model::MAX_BASE_MODEL_FILE_BYTES;
 use fandhe_edge_guard::base_model::{
     BaseModelFileRejection, MAX_BASE_MODEL_CONFIG_BYTES, open_base_model_file,
     verify_base_model_sha256,
@@ -12,7 +13,6 @@ use fandhe_edge_guard::base_model::{
 use fandhe_edge_guard::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES};
 use fandhe_edge_guard::format::FileFormat;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
-use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -165,26 +165,22 @@ fn req39_oversize_rejected_before_read() {
     assert_eq!(e.reason_code(), "file_size_limit_exceeded");
 }
 
-/// REQ-39・REQ-41・#655: 重みは 2 GiB まで。1 GiB+1 はサイズ検査を通り（形式段で拒否）、2 GiB+1 は Size で拒否。
+/// REQ-39・REQ-41・#655: 重みは 5 GiB まで（#665）。5 GiB+1 はサイズ検査で拒否（読まずに止まる）。
+/// 5 GiB ちょうどが通ることは `base_model.rs` の単体テストで確認する（CI で数 GB を確保しない）。
 #[test]
-fn req39_weight_limit_is_2gib() {
+fn req39_weight_limit_is_5gib() {
     let sb = Sandbox::new("bigw");
     let f = fs::File::create(sb.dir().join("model.safetensors")).unwrap();
-    f.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
-    let e = reject(open_base_model_file(
-        &sb.confine(),
-        Path::new("model.safetensors"),
-    ));
-    assert!(matches!(e, BaseModelFileRejection::Format { .. }), "{e:?}");
-    f.set_len(MAX_SHARD_FILE_BYTES + 1).unwrap();
+    assert_eq!(MAX_BASE_MODEL_FILE_BYTES, 5 << 30);
+    f.set_len(MAX_BASE_MODEL_FILE_BYTES + 1).unwrap();
     let e = reject(open_base_model_file(
         &sb.confine(),
         Path::new("model.safetensors"),
     ));
     match &e {
         BaseModelFileRejection::Size(FileSizeRejection::TooLarge { size, limit }) => {
-            assert_eq!(*size, MAX_SHARD_FILE_BYTES + 1);
-            assert_eq!(*limit, MAX_SHARD_FILE_BYTES);
+            assert_eq!(*size, MAX_BASE_MODEL_FILE_BYTES + 1);
+            assert_eq!(*limit, MAX_BASE_MODEL_FILE_BYTES);
         }
         other => panic!("unexpected {other:?}"),
     }

@@ -36,6 +36,7 @@ use fandhe_edge_runtime::capacity::{
 };
 use fandhe_edge_runtime::onnx::ModelKind;
 use fandhe_edge_runtime::vocab_exclusion::{VOCAB_GUIDELINE_BYTES, screen_vocab_candidates};
+use fandhe_edge_train::request::Device;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::search::{EvaluatedCandidate, SelectionDecision, select_best};
 use fandhe_edge_train::selection_significance::CandidateValidation;
@@ -168,8 +169,15 @@ pub fn compute_selection_with_exclusions(
     let mut excluded = Vec::new();
     // 候補 N ごとに `train` と同じ関数で `root`・`out_dir` を組み立てた既定候補を用意する
     // （保存済みリクエストの `root`・`out_dir` の照合に使う。REQ-39）。
-    let candidate_count =
-        resolve_candidates(project, definition, 0, split_seed, &explicit_kinds)?.len();
+    let candidate_count = resolve_candidates(
+        project,
+        definition,
+        0,
+        split_seed,
+        &explicit_kinds,
+        Device::Cpu,
+    )?
+    .len();
     // 探索時より少ない候補集合の再構成を拒否する。`--kind` の指定漏れで、失敗・時間切れ候補を含む
     // 事前登録した族より小さい family_size が Holm 補正へ渡るのを防ぐ（REQ-25・fail-closed）。
     if super::train::candidate_rel(candidate_count)
@@ -191,7 +199,8 @@ pub fn compute_selection_with_exclusions(
         let rebuilt = (0..candidate_count)
             .map(|i| {
                 let seed = effective_train_seed(project, i, split_seed)?;
-                let mut all = resolve_candidates(project, definition, i, seed, &explicit_kinds)?;
+                let mut all =
+                    resolve_candidates(project, definition, i, seed, &explicit_kinds, Device::Cpu)?;
                 if i < all.len() {
                     Ok(all.swap_remove(i).candidate_id)
                 } else {
@@ -208,7 +217,8 @@ pub fn compute_selection_with_exclusions(
     let candidates = (0..candidate_count)
         .map(|i| {
             let seed = effective_train_seed(project, i, split_seed)?;
-            let mut all = resolve_candidates(project, definition, i, seed, &explicit_kinds)?;
+            let mut all =
+                resolve_candidates(project, definition, i, seed, &explicit_kinds, Device::Cpu)?;
             if i < all.len() {
                 Ok(all.swap_remove(i))
             } else {

@@ -539,6 +539,40 @@ mod suite {
         assert!(env.project_file("package/artifact.json").is_file());
     }
 
+    /// REQ-41・REQ-33・#665: `train` は既定で `device:"cpu"` を、`--device gpu` で `"gpu"` を学習リクエストへ
+    /// 記録し、`gpu` で学習した候補も `select`・`package` の照合を通る。不正値・重複は `invalid_input`（64）。
+    pub fn train_device_option_is_recorded_in_request() {
+        let env = inspected("device");
+        env.ok(&["train", "--project-dir", "proj", "--candidate", "0"]);
+        let text = std::fs::read_to_string(env.project_file("candidates/0/request.json"))
+            .expect("request.json");
+        assert!(text.contains("\"device\":\"cpu\""), "{text}");
+        let gpu = inspected("device_gpu");
+        gpu.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "0",
+            "--device",
+            "gpu",
+        ]);
+        let text = std::fs::read_to_string(gpu.project_file("candidates/0/request.json"))
+            .expect("request.json");
+        assert!(text.contains("\"device\":\"gpu\""), "{text}");
+        gpu.ok(&["select", "--project-dir", "proj"]);
+        gpu.ok(&["package", "--project-dir", "proj"]);
+        for bad in [
+            vec!["--device", "tpu"],
+            vec!["--device", "cpu", "--device", "gpu"],
+            vec!["--device", ""],
+        ] {
+            let mut args = vec!["train", "--project-dir", "proj", "--candidate", "0"];
+            args.extend(bad);
+            env.fails(&args, 64, "invalid_input");
+        }
+    }
+
     /// REQ-27・REQ-39: 保存済みの `request.json` の `device`・`train_path`（結果 `result.json` とは
     /// 整合したまま）を書き換えると、`select` も `package` も、期待するリクエストを丸ごと組み立てた比較で
     /// `invalid_input`（64）・固定 message で止まり、選定記録・`package/` を作らない。`epochs` だけが違う
@@ -551,7 +585,7 @@ mod suite {
         let request = env.project_file("candidates/0/request.json");
         let original = std::fs::read_to_string(&request).expect("request.json");
         let tampers = [
-            ("device", "\"device\":\"cpu\"", "\"device\":\"gpu\""),
+            // `device` は `train --device`（#665）の記録値として保存値を受理するため、ここでは改ざん扱いしない。
             // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加える。
             ("time limit", "{", "{\"time_limit_seconds\":1,"),
             (
@@ -6664,6 +6698,10 @@ fn main() -> std::process::ExitCode {
         (
             "package_rejects_smoke_trained_candidate_unless_allowed",
             suite::package_rejects_smoke_trained_candidate_unless_allowed,
+        ),
+        (
+            "train_device_option_is_recorded_in_request",
+            suite::train_device_option_is_recorded_in_request,
         ),
         (
             "select_and_package_reject_request_fields_beyond_kind_and_seed",

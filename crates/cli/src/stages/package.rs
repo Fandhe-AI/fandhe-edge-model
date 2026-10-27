@@ -137,6 +137,7 @@ use fandhe_edge_runtime::pipeline::{
     ScoringBackend,
 };
 use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
+use fandhe_edge_train::request::Device;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
@@ -219,6 +220,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         selection.candidate_index,
         seed,
         &selection.explicit_kinds,
+        Device::Cpu,
     )?;
     let candidate = candidates
         .get(selection.candidate_index)

@@ -126,7 +126,8 @@ MAX_SEED = 2**32 - 1
 #: 3600 秒）のまま確定）。
 MAX_TRAIN_WALL_SECONDS = 3600
 
-#: 現行値: 8 GiB（学習ジョブ 1 回あたりのプロセス RSS の既定・上限）。
+#: 現行値: 8 GiB（学習ジョブ 1 回あたりのプロセス RSS の既定・上限。qwen2_lora だけ
+#: 下の `MAX_QWEN2_LORA_TRAIN_RSS_BYTES`＝12 GiB）。
 #: 根拠: 仮置き。証拠種別: 仮置き（開発機の実メモリ規模に対する妥当性の検証は
 #: PR #15 時点で未実施。CPU smoke 学習の実測ピーク RSS を参考値として計測する
 #: 案があるが、計測自体は本 Issue のスコープ外〔`outOfScope` 参照〕）。
@@ -136,6 +137,23 @@ MAX_TRAIN_WALL_SECONDS = 3600
 #: 済み（`budget.py::ResourceBudget.check` の docstring も参照）。
 #: 状態: オーナー確認済み（2026-09-27。Issue #11。現行値のまま確定）。
 MAX_TRAIN_RSS_BYTES = 8 * 1024 * 1024 * 1024
+
+#: qwen2_lora の学習ジョブ 1 回あたりの RSS の既定・上限（12 GiB）。他の kind は
+#: `MAX_TRAIN_RSS_BYTES`（8 GiB）のまま。根拠: 1.5B の GPU 学習の実測ピークは 7.37 GB で、
+#: 見積式（`_activation_bytes` 等）は実測の約 1.4 倍のため max_seq_length 512 では約 10 GB 要る。
+#: PoC は 12 GiB で完走した（PoC-26・#628 の実機）。7B の学習はこの上限に収まらず範囲外。
+#: 値は Rust `crates/train/src/limits.rs::MAX_QWEN2_LORA_TRAIN_RSS_BYTES` と同値
+#: （fixtures/train_contract/limits.json で照合）。証拠種別: 実機（1.5B）＋見積。
+#: 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。REQ-39・REQ-41。
+MAX_QWEN2_LORA_TRAIN_RSS_BYTES = 12 * 1024 * 1024 * 1024
+
+
+def max_train_rss_bytes_for_kind(kind: str) -> int:
+    """`kind` ごとの学習 RSS の既定・上限。qwen2_lora のみ 12 GiB、他は 8 GiB。"""
+    if kind == "qwen2_lora":
+        return MAX_QWEN2_LORA_TRAIN_RSS_BYTES
+    return MAX_TRAIN_RSS_BYTES
+
 
 #: 現行値: 20,000,000（examples 件数 × epochs の見積もり上限。学習開始前に
 #: 見積もりで検査し、実測を待たずに拒否する。1 ステップも回さずに reject
@@ -305,7 +323,7 @@ MAX_C1_SPARSE_ELEMENTS = 200_000_000
 #: 開始前（1 バッチも確保する前）にこの上限で fail-closed に拒否する
 #: （`limit_exceeded`・exit 20。素の MLX 確保失敗による exit 70・OOM kill を防ぐ）。
 #: 既定値は float32 換算で 1 要素あたり概算 8 bytes（順伝播+逆伝播の 2 倍見積もり）
-#: として `MAX_TRAIN_RSS_BYTES`（既定 8 GiB）の一部（ここでは目安として
+#: として `MAX_TRAIN_RSS_BYTES`（他の kind の既定 8 GiB）の一部（ここでは目安として
 #: 1.5 GiB 程度）に収まる水準。
 MAX_C1_BATCH_ELEMENTS = 200_000_000
 
@@ -364,7 +382,7 @@ MAX_AR_WARMUP_STEPS = 100_000
 #: 中間テンソルを学習ステップ内で同時に保持しうる。旧式（`layers` を
 #: 含まない `batch_size × heads × L^2`）は `layers=32`・`heads=dims=64`・
 #: `batch_size=1`・`max_bytes≈1700` のような設定を通過させてしまい、
-#: attention テンソルの保持だけで `MAX_TRAIN_RSS_BYTES`（8 GiB）を超える
+#: attention テンソルの保持だけで `MAX_TRAIN_RSS_BYTES`（8 GiB。ar は qwen2_lora ではない）を超える
 #: 実例があった（Codex P0 指摘。`kinds/autoregressive.py::
 #: AutoregressiveKind.train` 参照。REQ-39）。値そのもの（200,000,000）は
 #: 変更せず、見積もり式のみを是正した。
@@ -450,12 +468,14 @@ MAX_AR_PREDICT_ROWS = 4_096_000
 # qwen2_lora（ベースモデルの読み込み。`qwen2_model.load_base_model`。REQ-41・TASK-41.5-2・#425）
 # --------------------------------------------------------------------------
 
-#: ベースモデルの重みファイル 1 つのサイズ上限（2 GiB）。
-#: Rust ガード層 `split_files::MAX_SHARD_FILE_BYTES`（base_model.rs の重みにも適用）と同値。
-#: 7B の埋め込み・lm_head は 1 テンソルで 152064×3584×2 = 1,089,994,752 B（>1 GiB）で、
-#: safetensors は 1 テンソルを複数ファイルに分けられないため 1 GiB 未満に分割できない。
-#: オーナー判断 2026-10-26・#655。証拠種別: 7B の config から計算。
-MAX_BASE_MODEL_FILE_BYTES = 2 << 30
+#: ベースモデルの重みファイル 1 つのサイズ上限（5 GiB）。
+#: 学習側（ベースモデルの読み込み）だけの上限で、パッケージ側の shard 上限（Rust ガード層
+#: `split_files::MAX_SHARD_FILE_BYTES`・`qwen2_onnx.SHARD_MAX_BYTES`・推論で使う 2 GiB）とは別。
+#: 根拠: 1.5B の model.safetensors は 3.09 GB、7B の各ファイルは 3.6〜3.9 GB（HF の分割既定は 5 GB、
+#: Qwen の重みは最大 3.95 GB）で 2 GiB を超える。7B の埋め込み・lm_head は 1 テンソルで
+#: 1,089,994,752 B あり 1 GiB 未満に分割できない。証拠種別: 実ファイルの大きさ（1.5B 実測）。
+#: 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。
+MAX_BASE_MODEL_FILE_BYTES = 5 << 30
 
 #: ベースモデルの重みファイルの合計サイズ上限（20 GiB）。7B bf16 15,231 MB の約 1.4 倍。
 #: Rust ガード層 `MAX_PACKAGE_TOTAL_BYTES`（20 GiB）と同値。オーナー判断 2026-10-25・#654。

@@ -87,6 +87,7 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
     assert _LIMITS["max_seed"] == limits.MAX_SEED
     assert _LIMITS["max_train_wall_seconds"] == limits.MAX_TRAIN_WALL_SECONDS
     assert _LIMITS["max_train_rss_bytes"] == limits.MAX_TRAIN_RSS_BYTES
+    assert _LIMITS["max_train_rss_bytes"] == limits.max_train_rss_bytes_for_kind("c3")
 
     from fandhe_edge_trainer import supervisor
 
@@ -104,8 +105,14 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
         _LIMITS["max_external_shard_bytes"]
         == qwen2_onnx.SHARD_MAX_BYTES
         == artifact._SHARD_READ_CAP_BYTES
-        == limits.MAX_BASE_MODEL_FILE_BYTES
         == 2 << 30
+    )
+    # 学習側のベースモデル読み込み上限は別（#665: 1.5B の重み 3.09 GB を読むため 5 GiB）
+    assert limits.MAX_BASE_MODEL_FILE_BYTES == 5 << 30
+    assert (
+        _LIMITS["max_qwen2_lora_train_rss_bytes"]
+        == limits.MAX_QWEN2_LORA_TRAIN_RSS_BYTES
+        == 12 << 30
     )
     assert _LIMITS["max_validation_input_bytes"] == limits.MAX_VALIDATION_INPUT_BYTES
     assert _LIMITS["max_validation_id_bytes"] == limits.MAX_VALIDATION_ID_BYTES
@@ -116,6 +123,10 @@ def test_req39_limits_fixture_matches_python_constants() -> None:
         == supervisor._MAX_WORKER_STDOUT_BYTES_WITH_VALIDATION
     )
     assert list(_LIMITS["allowed_devices"]) == list(contract._ALLOWED_DEVICES)
+    # 進捗行の接頭辞は Rust `process.rs::PROGRESS_LINE_PREFIX` と同値（#665）
+    from fandhe_edge_trainer.kinds import qwen2_lora
+
+    assert _LIMITS["progress_line_prefix"] == qwen2_lora.PROGRESS_LINE_PREFIX
 
 
 def test_req18_request_full_fixture_has_exactly_the_contract_fields() -> None:

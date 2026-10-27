@@ -67,6 +67,18 @@ def test_train_completes_and_only_lora_is_trainable(tmp_path: Path) -> None:
     assert any(float(mx.abs(v).max()) > 0 for k, v in _lora(t).items() if k.endswith("lora_b"))
 
 
+def test_progress_lines_every_10_steps_and_last(tmp_path: Path, capsys) -> None:
+    """REQ-39・REQ-41・#665: 進捗は 10 ステップごと・最終で接頭辞つき 1 行（本文なし）。"""
+    from fandhe_edge_trainer.kinds.qwen2_lora import PROGRESS_LINE_PREFIX
+
+    _train(tmp_path, iters=12)
+    lines = [
+        ln for ln in capsys.readouterr().err.splitlines() if ln.startswith(PROGRESS_LINE_PREFIX)
+    ]
+    assert [ln.split()[2] for ln in lines] == ["10/12", "12/12"]
+    assert all(ln.split()[3].startswith("loss=") and "rss_bytes=" in ln for ln in lines)
+
+
 def test_lora_settings_come_from_request(tmp_path: Path) -> None:
     """REQ-41: rank と対象層数が学習リクエストの config から効く。"""
     _, t = _train(tmp_path, lora_rank=3, lora_num_layers=1)

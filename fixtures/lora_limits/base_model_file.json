@@ -1,0 +1,6 @@
+{
+  "_meta": {
+    "description": "Base model weight file size limit in bytes (REQ-41, REQ-39, #665). 5 GiB: HF default shard is 5 GB, Qwen weight files are at most 3.95 GB. Cross-checked by crates/cli/tests/base_model_file_limit_fixture.rs (fandhe_edge_guard::base_model) and, on the trainer side, limits.py MAX_BASE_MODEL_FILE_BYTES. Do not relax."
+  },
+  "max_base_model_file_bytes": 5368709120
+}

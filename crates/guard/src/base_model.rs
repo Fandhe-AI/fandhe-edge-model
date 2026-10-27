@@ -16,7 +16,7 @@
 //! - 利用者由来のパス・ファイル名・内容はエラーの値（Debug・source を含む）にもメッセージにも含めない。
 //!   経路・形式の拒否は終了コードと理由コードだけに畳む
 //!
-//! - サイズ上限は重み（safetensors）が 2 GiB（`split_files::MAX_SHARD_FILE_BYTES`。#655）、
+//! - サイズ上限は重み（safetensors）が 5 GiB（[`MAX_BASE_MODEL_FILE_BYTES`]。パッケージ側の shard 上限 2 GiB とは別。#655）、
 //!   `tokenizer.json` が 1 GiB（`MAX_READ_FILE_BYTES`）
 //!
 //! - `train --kind qwen2_lora` の起動前照合（#628）は [`verify_base_model_sha256`]。定義の `base_model.sha256` の
@@ -24,7 +24,7 @@
 //!   名前・経路・サイズ（64 KiB。学習ワーカーの `MAX_BASE_MODEL_CONFIG_BYTES` と同値）だけを確かめてストリームで
 //!   ハッシュする。重み・`tokenizer.json` は [`open_base_model_file`] の検査を通したバイト列をハッシュする
 //!
-//! ponytail: 形式判定のため上限（重み 2 GiB・他 1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
+//! ponytail: 形式判定のため上限（重み 5 GiB・他 1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
 //! RSS が問題になれば safetensors はヘッダーだけの検査へ切り替える（#435）。
 //! ハードリンクで外部ファイルを指すメンバーは経路では検出できない（必要なら `st_nlink > 1` を拒否）。
 
@@ -35,7 +35,13 @@ use crate::format::{
     CheckedFile, FileFormat, FormatAllowlist, check_open_file, check_open_file_unclamped,
 };
 use crate::package::ConfinedPackage;
-use crate::split_files::MAX_SHARD_FILE_BYTES;
+/// ベースモデルの重み（safetensors）1 ファイルの上限（5 GiB。REQ-39・REQ-41・#665）。
+/// 根拠: HF の分割既定が 5 GB で、Qwen 系の重み 1 ファイルは最大 3.95 GB。学習ワーカー側
+/// `limits.py::MAX_BASE_MODEL_FILE_BYTES` と同値（共有 fixture `fixtures/lora_limits/base_model_file.json` で照合）。
+/// パッケージ側の shard 上限（`split_files::MAX_SHARD_FILE_BYTES`、2 GiB）とは別で、そちらは変えない。
+/// 上限緩和はオーナー判断 2026-10-27（上限の見直しを一任）・#665。
+pub const MAX_BASE_MODEL_FILE_BYTES: u64 = 5 << 30;
+
 use fandhe_edge_core::definition::BASE_MODEL_CONFIG_FILE;
 use fandhe_edge_core::exitcode::ExitCode;
 use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
@@ -142,12 +148,12 @@ pub fn open_base_model_file(
             reason_code: e.reason_code(),
         })?;
     let allow = FormatAllowlist::new([expected]);
-    // 重み（safetensors）だけ重みファイル専用の 2 GiB。7B の埋め込み 1 テンソルが 1 GiB 超で
-    // 分割できないため（REQ-39・REQ-41・#654・#655）。他のファイルは 1 GiB のまま
+    // 重み（safetensors）だけ重みファイル専用の 5 GiB。1.5B の model.safetensors は 3.09 GB で、
+    // 7B の埋め込み 1 テンソルは 1 GiB 超で分割できないため（REQ-39・REQ-41・#654・#655）。他のファイルは 1 GiB のまま
     let checked = if expected == FileFormat::Safetensors {
-        check_file_size_unclamped(&file, MAX_SHARD_FILE_BYTES)
+        check_file_size_unclamped(&file, MAX_BASE_MODEL_FILE_BYTES)
             .map_err(BaseModelFileRejection::Size)?;
-        check_open_file_unclamped(file, member, &allow, MAX_SHARD_FILE_BYTES)
+        check_open_file_unclamped(file, member, &allow, MAX_BASE_MODEL_FILE_BYTES)
     } else {
         check_file_size_within(&file, MAX_READ_FILE_BYTES).map_err(BaseModelFileRejection::Size)?;
         check_open_file(file, member, &allow, MAX_READ_FILE_BYTES)
@@ -162,7 +168,7 @@ pub fn open_base_model_file(
 /// 実ファイルと照合する（`train --kind qwen2_lora` が学習ワーカーの起動前・候補ディレクトリの作成前に呼ぶ。
 /// REQ-41・REQ-39・#628）。
 ///
-/// 名前順に 1 ファイルずつ開き、最初の拒否で止める。メモリに載せるのは 1 ファイル分だけ（重みは最大 2 GiB）。
+/// 名前順に 1 ファイルずつ開き、最初の拒否で止める。メモリに載せるのは 1 ファイル分だけ（重みは最大 5 GiB）。
 ///
 /// # Errors
 /// 欠落・symlink・経路外は `Path`、上限超過は `Size`（20）、形式の不一致は `Format`、`config.json`・
@@ -216,6 +222,20 @@ fn sha256_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-39・REQ-41・#665: 5 GiB ちょうど（sparse）はサイズ検査を通り、+1 は拒否。読み込まない。
+    #[test]
+    fn req39_size_check_boundary_at_5gib() {
+        let p = std::env::temp_dir().join(format!("fe-guard-bm5g-{}", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_BASE_MODEL_FILE_BYTES).unwrap();
+        let ok = check_file_size_unclamped(&f, MAX_BASE_MODEL_FILE_BYTES);
+        f.set_len(MAX_BASE_MODEL_FILE_BYTES + 1).unwrap();
+        let ng = check_file_size_unclamped(&f, MAX_BASE_MODEL_FILE_BYTES);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(ok.unwrap(), MAX_BASE_MODEL_FILE_BYTES);
+        assert!(matches!(ng, Err(FileSizeRejection::TooLarge { .. })));
+    }
 
     /// REQ-41・REQ-39・TASK-41.2-2: 名前判定の境界。
     #[test]

@@ -27,6 +27,7 @@
 
 use crate::project::DEFAULT_SEED;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
+use fandhe_edge_train::request::Device;
 use fandhe_edge_train::search::SearchBudget;
 use std::ffi::OsString;
 use std::fmt;
@@ -200,17 +201,23 @@ const TRAIN_OPTS: &[OptSpec] = &[
         false,
         "Base model directory for --kind qwen2_lora (under the current directory; verified against base_model.sha256 in the definition)",
     ),
+    opt(
+        "--device",
+        "cpu|gpu",
+        false,
+        "Training device (default: cpu; gpu is not bit-reproducible across runs)",
+    ),
     OptSpec {
         name: "--status",
         value: None,
         required: false,
-        help: "Report recorded training jobs (optionally only --candidate N); not with --all, --budget-seconds, --smoke or --train-seed",
+        help: "Report recorded training jobs (optionally only --candidate N); not with --all, --budget-seconds, --smoke, --train-seed or --device",
     },
     OptSpec {
         name: "--cancel",
         value: None,
         required: false,
-        help: "Request cancellation of running training jobs (optionally only --candidate N) and return immediately; not with --status, --all, --budget-seconds, --smoke or --train-seed",
+        help: "Request cancellation of running training jobs (optionally only --candidate N) and return immediately; not with --status, --all, --budget-seconds, --smoke, --train-seed or --device",
     },
 ];
 const EVALUATE_OPTS: &[OptSpec] = &[
@@ -331,6 +338,8 @@ pub struct TrainArgs {
     /// `--base-model-dir`: `--kind qwen2_lora` のベースモデルのディレクトリ（cwd 配下。`--kind qwen2_lora` との
     /// 組み合わせの検査は `train` 工程。REQ-41・#628）。
     pub base_model_dir: Option<PathBuf>,
+    /// `--device`: 学習の実行デバイス（既定 cpu。同一 seed で結果一致が要るテストは CPU で行う。REQ-41・#665）。
+    pub device: Device,
 }
 /// `evaluate` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +447,8 @@ pub enum ArgsError {
     InvalidSeed,
     /// `--train-seed` が `u32` の範囲の非負整数でない。
     InvalidTrainSeed,
+    /// `--device` が `cpu` / `gpu` のどちらでもない。
+    InvalidDevice,
     /// `--budget-seconds` が `1..=MAX_SEARCH_BUDGET_SECONDS` の整数でない。
     InvalidBudgetSeconds,
     /// `train` に `--candidate` と `--all` の両方が指定された。
@@ -506,6 +517,7 @@ impl fmt::Display for ArgsError {
             ArgsError::InvalidTrainSeed => {
                 f.write_str("option --train-seed must be an integer in the range 0 to 4294967295")
             }
+            ArgsError::InvalidDevice => f.write_str("option --device must be cpu or gpu"),
             ArgsError::InvalidBudgetSeconds => {
                 f.write_str("option --budget-seconds must be an integer in the range 1 to 921600")
             }
@@ -742,6 +754,20 @@ impl Values {
             })
             .transpose()
     }
+    fn device(&mut self) -> Result<Device, ArgsError> {
+        match self.take("--device") {
+            None => Ok(Device::Cpu),
+            Some(v) => match v
+                .into_string()
+                .map_err(|_| ArgsError::NonUtf8Argument)?
+                .as_str()
+            {
+                "cpu" => Ok(Device::Cpu),
+                "gpu" => Ok(Device::Gpu),
+                _ => Err(ArgsError::InvalidDevice),
+            },
+        }
+    }
     fn budget(&mut self) -> Result<SearchBudget, ArgsError> {
         match self.take("--budget-seconds") {
             None => Ok(SearchBudget::default()),
@@ -771,6 +797,7 @@ impl Values {
             "--smoke",
             "--train-seed",
             "--base-model-dir",
+            "--device",
         ] {
             if self.0.iter().any(|(n, _)| *n == option) {
                 return Err(if status {
@@ -856,6 +883,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
                 train_seed: v.train_seed()?,
                 kinds,
                 base_model_dir: v.opt_path("--base-model-dir"),
+                device: v.device()?,
             })
         }
         Subcommand::Evaluate => {
@@ -1145,6 +1173,45 @@ mod tests {
         assert!(p(&["train", "--project-dir", "p", "--cancel", "--kind", "x"]).is_err());
     }
 
+    /// REQ-41・REQ-33・#665: `--device` は既定 cpu。`cpu`・`gpu` 以外・重複・状態確認・キャンセルとの併用は拒否。
+    #[test]
+    fn req41_issue665_device_option() {
+        let dev = |extra: &[&'static str]| {
+            let mut a = vec!["train", "--project-dir", "p", "--all"];
+            a.extend_from_slice(extra);
+            p(&a)
+        };
+        let device = |extra: &[&'static str]| {
+            let mut a = vec!["train", "--project-dir", "p", "--all"];
+            a.extend_from_slice(extra);
+            match run(&a) {
+                Command::Train(t) => t.device,
+                other => panic!("train expected: {other:?}"),
+            }
+        };
+        assert_eq!(device(&[]), Device::Cpu);
+        assert_eq!(device(&["--device", "cpu"]), Device::Cpu);
+        assert_eq!(device(&["--device", "gpu"]), Device::Gpu);
+        assert_eq!(dev(&["--device", "tpu"]), Err(ArgsError::InvalidDevice));
+        assert_eq!(
+            dev(&["--device", "cpu", "--device", "gpu"]),
+            Err(ArgsError::DuplicateOption { option: "--device" })
+        );
+        assert_eq!(
+            dev(&["--device"]).unwrap_err().exit_code(),
+            ExitCode::InvalidInput
+        );
+        for (flag, want) in [("--status", true), ("--cancel", false)] {
+            let r = p(&["train", "--project-dir", "p", flag, "--device", "gpu"]);
+            let expected = if want {
+                ArgsError::IncompatibleWithStatus { option: "--device" }
+            } else {
+                ArgsError::IncompatibleWithCancel { option: "--device" }
+            };
+            assert_eq!(r, Err(expected));
+        }
+    }
+
     /// REQ-41・REQ-33・#628: `--base-model-dir` は `train` だけが 1 回受理し、空値・重複・状態確認・
     /// キャンセルとの併用は拒否する（`--kind qwen2_lora` との組み合わせは `train` 工程で検査する）。
     #[test]
@@ -1218,6 +1285,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(2)),
                 smoke: true,
@@ -1229,6 +1297,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,
@@ -1338,6 +1407,7 @@ mod tests {
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
                 base_model_dir: None,
+                device: Device::Cpu,
                 project_dir: "proj".into(),
                 op: budget(3600),
                 smoke: true,

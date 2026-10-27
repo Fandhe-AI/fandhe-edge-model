@@ -504,6 +504,27 @@ def test_load_request_rejects_rss_limit_above_max(tmp_path: Path) -> None:
     assert exc_info.value.code == "invalid_request"
 
 
+def test_rss_limit_is_kind_dependent(tmp_path: Path) -> None:
+    """REQ-39・#665: qwen2_lora は 12 GiB まで可（既定も 12 GiB）、他 kind は 8 GiB 超を拒否。"""
+    from fandhe_edge_trainer.limits import MAX_QWEN2_LORA_TRAIN_RSS_BYTES, MAX_TRAIN_RSS_BYTES
+
+    def load(kind: str, rss: int | None) -> int | None:
+        d = {**_base_request(tmp_path), "kind": kind}
+        if rss is not None:
+            d["rss_limit_bytes"] = rss
+        p = _write(tmp_path / "req.json", d)
+        try:
+            return contract.load_request(p).rss_limit_bytes
+        except WorkerError:
+            return None
+
+    assert load("qwen2_lora", 12 << 30) == 12 << 30
+    assert load("qwen2_lora", None) == MAX_QWEN2_LORA_TRAIN_RSS_BYTES
+    assert load("qwen2_lora", (12 << 30) + 1) is None
+    assert load("c3", 8 << 30) == MAX_TRAIN_RSS_BYTES
+    assert load("c3", (8 << 30) + 1) is None
+
+
 def test_load_train_examples_rejects_nan_in_line(tmp_path: Path) -> None:
     (tmp_path / "train.jsonl").write_text('{"input": NaN, "label": "a"}\n', encoding="utf-8")
     with _confined_train_path(tmp_path) as entry:
