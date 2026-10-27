@@ -25,6 +25,7 @@
 
 #[cfg(unix)]
 mod suite {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
 
@@ -5795,6 +5796,334 @@ mod suite {
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
         std::process::exit(0);
     }
+    // ---- qwen2_lora（追加学習）の 7 工程（REQ-41・REQ-33・REQ-39・#628） ----
+
+    /// `fixtures/qwen2_parity` の選択肢（宣言順。採点グラフの選択肢表と同じ順）。
+    const QWEN2_LABELS: [&str; 8] = ["red", "tan", "sky", "map", "fox", "owl", "gem", "ink"];
+    /// `qwen2_lora` の既定設定（`fixtures/train_contract/kind_defaults.json` と同じ具体値）。
+    const QWEN2_CONFIG: [(&str, &str); 9] = [
+        ("lora_rank", "8"),
+        ("lora_scale", "20.0"),
+        ("lora_dropout", "0.0"),
+        ("lora_num_layers", "8"),
+        ("lr", "0.0001"),
+        ("iters", "300"),
+        ("batch_size", "4"),
+        ("max_seq_length", "512"),
+        ("dtype", "\"bfloat16\""),
+    ];
+    /// cwd（`work/`）配下のベースモデルのディレクトリ。
+    const BASE_MODEL_DIR: &str = "bm";
+    const SELECT_QWEN2: [&str; 5] = ["select", "--project-dir", "proj", "--kind", "qwen2_lora"];
+    const TRAIN_QWEN2: [&str; 9] = [
+        "train",
+        "--project-dir",
+        "proj",
+        "--candidate",
+        "2",
+        "--kind",
+        "qwen2_lora",
+        "--base-model-dir",
+        BASE_MODEL_DIR,
+    ];
+
+    /// 偽の `qwen2_lora` 学習: `fixtures/qwen2_parity` の自己完結パッケージ（採点グラフ・shard・tokenizer）を
+    /// 置き、`artifact.json` の `config` を「既定値＋要求の設定」に、`max_bytes` を要求の値に替えて返す。
+    /// validation 予測は入力の先頭の語（合成データの正解ラベル）。ベースモデルは読まない（場所と照合は CLI）。
+    fn run_fake_qwen2_worker(request: &TrainRequest, out_dir: &str) -> ! {
+        let parity = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/qwen2_parity");
+        for f in ["model.onnx", "weights-00000.bin", "tokenizer.json"] {
+            std::fs::copy(parity.join(f), Path::new(out_dir).join(f)).expect("copy parity file");
+        }
+        let mut config: BTreeMap<String, String> = QWEN2_CONFIG
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        for (k, v) in request.config() {
+            config.insert(k.clone(), v.to_string());
+        }
+        let config: Vec<String> = config.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        let text = std::fs::read_to_string(parity.join("artifact.json")).expect("parity artifact");
+        let start = text.find("\"config\": {").expect("config");
+        let end = start + text[start..].find("\n  },").expect("config end") + "\n  }".len();
+        let artifact = format!(
+            "{}\"config\": {{{}}}{}",
+            &text[..start],
+            config.join(","),
+            &text[end..]
+        )
+        .replace(
+            "\"max_bytes\": 64",
+            &format!("\"max_bytes\": {}", request.max_bytes()),
+        )
+        .replace('\n', "");
+        std::fs::write(Path::new(out_dir).join("artifact.json"), &artifact).expect("artifact");
+        let predictions: Vec<String> = request
+            .validation_inputs()
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                let label = v.input().split(' ').next().unwrap_or("red");
+                format!(
+                    r#"{{"id":"{}","status":"ok","predicted_label":"{label}"}}"#,
+                    v.id()
+                )
+            })
+            .collect();
+        println!(
+            r#"{{"status":"ok","artifact_dir":"{out_dir}","artifact":{artifact},"empty_input_ids":[0],"validation_predictions":[{}]}}"#,
+            predictions.join(",")
+        );
+        std::process::exit(0);
+    }
+
+    /// `dir` に最小のベースモデル 3 ファイル（形式検査を通る safetensors・tokenizer JSON と任意の
+    /// config.json）を置き、定義の `base_model` の JSON を返す。偽ワーカーは読まない（CLI の照合用）。
+    fn write_base_model(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).expect("base model dir");
+        let header = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut weights = (header.len() as u64).to_le_bytes().to_vec();
+        weights.extend_from_slice(header.as_bytes());
+        weights.extend_from_slice(&[0; 4]);
+        let files: [(&str, Vec<u8>); 3] = [
+            ("config.json", br#"{"model_type":"qwen2"}"#.to_vec()),
+            ("model.safetensors", weights),
+            (
+                "tokenizer.json",
+                br#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]}}"#.to_vec(),
+            ),
+        ];
+        let sha: Vec<String> = files
+            .iter()
+            .map(|(name, bytes)| {
+                std::fs::write(dir.join(name), bytes).expect("base model file");
+                format!(r#""{name}":"{}""#, Sha256Digest::of_bytes(bytes).to_hex())
+            })
+            .collect();
+        format!(
+            r#"{{"name":"tiny-synthetic","sha256":{{{}}},"license":"MIT","origin":"https://example.com/tiny"}}"#,
+            sha.join(",")
+        )
+    }
+
+    /// `qwen2_lora` 用の作業ディレクトリ（8 ラベル・評価データあり・`work/bm/` に合成のベースモデル）を
+    /// `register`・`inspect` まで進める。`with_base_model` が偽なら定義に `base_model` を書かない。
+    fn qwen2_inspected(case: &str, with_base_model: bool) -> Env {
+        let env = Env::new(case, true);
+        let base_model = write_base_model(&env.work.join(BASE_MODEL_DIR));
+        let options: Vec<String> = QWEN2_LABELS
+            .iter()
+            .map(|l| format!(r#"{{"id":"{l}","display_name":"{l}","description":"dummy"}}"#))
+            .collect();
+        let base_model = if with_base_model {
+            format!(r#","base_model":{base_model}"#)
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            env.work.join(DEF),
+            format!(
+                r#"{{"schema":"fandhe-edge-model-definition/v1","name":"pipeline_e2e_qwen2","version":1,"judgment_type":"single_select","options":[{}],"io":{{"input":"bytes"}}{base_model}}}"#,
+                options.join(",")
+            ),
+        )
+        .expect("definition");
+        let rows = |prefix: &str, n: usize| {
+            let mut out = String::new();
+            for i in 0..n {
+                for l in QWEN2_LABELS {
+                    out.push_str(&format!(
+                        r#"{{"id":"{prefix}{l}-{i}","input":"{l} {l}{} {prefix}sample {i}","output":{{"intent":"{l}"}},"group_id":"{prefix}g-{l}-{i}"}}"#,
+                        i % 4
+                    ));
+                    out.push('\n');
+                }
+            }
+            out
+        };
+        std::fs::write(env.work.join("def/train.jsonl"), rows("", 15)).expect("train");
+        std::fs::write(env.work.join("def/evaluation.jsonl"), rows("e-", 2)).expect("evaluation");
+        env.ok(&["register", "--definition", DEF, "--project-dir", "proj"]);
+        env.ok(&["inspect", "--project-dir", "proj"]);
+        env
+    }
+
+    /// REQ-41・REQ-33・REQ-39・#628: `train --kind qwen2_lora --base-model-dir` が CLI から完走し、学習リクエストに
+    /// 定義の同一性・来歴と照合済みの場所が入る（偽ワーカー＋parity fixture。証拠種別: テストハーネス）。
+    ///
+    /// `select`・`evaluate`・`package` の tokenizer 入力表現（`qwen2_lora`）の経路は未接続で、
+    /// `check_input_representation` が fail-closed で止める（byte 前処理で黙って評価・公開しない）。本テストは
+    /// 現状のその境界（`select` が保存済みリクエストの照合を通った後に 64）までを確かめる。接続したら
+    /// `evaluate`・`package`・`infer`（`fixtures/qwen2_parity/cases.json` の予測と照合）まで延ばす。
+    pub fn qwen2_lora_trains_via_cli_until_select_boundary() {
+        let env = qwen2_inspected("qwen2-full", true);
+        assert_eq!(
+            env.ok(&TRAIN_QWEN2),
+            "{\"step\":\"train\",\"status\":\"ok\",\"candidate\":2,\"kind\":\"qwen2_lora\"}\n"
+        );
+        // 学習リクエストには定義の同一性・来歴と、照合済みの場所（正準化した絶対パス）が入る。
+        let request =
+            std::fs::read_to_string(env.project_file("candidates/2/request.json")).expect("req");
+        let dir = std::fs::canonicalize(env.work.join(BASE_MODEL_DIR)).expect("canonical");
+        for part in [
+            format!("\"base_model_dir\":\"{}\"", dir.display()),
+            "\"base_model_name\":\"tiny-synthetic\"".to_string(),
+            "\"base_model_license\":\"MIT\"".to_string(),
+            "\"base_model_origin\":\"https://example.com/tiny\"".to_string(),
+            "\"base_model_sha256\":{\"config.json\":\"".to_string(),
+        ] {
+            assert!(request.contains(&part), "{part}: {request}");
+        }
+        // 保存済みリクエストの照合（`base_model_dir` の例外を含む）を通り、tokenizer 経路の未接続で止まる。
+        assert_eq!(
+            env.fails(&SELECT_QWEN2, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
+        );
+        assert!(!env.project_file("selection_record.json").exists());
+    }
+
+    /// REQ-41・REQ-18・#628: `train --all --kind qwen2_lora --base-model-dir` は既定候補の後ろに `qwen2_lora` を
+    /// 学習し、`evaluated` として記録する（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_train_all_with_base_model_dir() {
+        let env = qwen2_inspected("qwen2-all", true);
+        let out = env.ok(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--all",
+            "--kind",
+            "qwen2_lora",
+            "--base-model-dir",
+            BASE_MODEL_DIR,
+        ]);
+        assert!(
+            out.contains("{\"candidate\":2,\"kind\":\"qwen2_lora\",\"result\":\"evaluated\""),
+            "{out}"
+        );
+        assert!(env.project_file("candidates/2/result.json").is_file());
+    }
+
+    /// REQ-41・REQ-39・#628: ベースモデルの場所・定義・実ファイルの不整合は `train` が 64 で止め、候補
+    /// ディレクトリを作らず学習ワーカーも起動しない（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_train_rejects_bad_base_model_before_side_effects() {
+        let env = qwen2_inspected("qwen2-reject", true);
+        let outside = env.base.join("outside-bm");
+        write_base_model(&outside);
+        std::os::unix::fs::symlink(&outside, env.work.join("bm-link")).expect("symlink");
+        let with_dir = |dir: &str| -> Vec<String> {
+            let mut args: Vec<String> = TRAIN_QWEN2.iter().map(|s| (*s).to_string()).collect();
+            if let Some(last) = args.last_mut() {
+                *last = dir.to_string();
+            }
+            args
+        };
+        let outside_s = outside.to_str().expect("utf8").to_string();
+        let cases: Vec<(Vec<String>, &str)> = vec![
+            (with_dir(&outside_s), "path rejected: path_escapes_root"),
+            (
+                with_dir("../outside-bm"),
+                "path rejected: path_escapes_root",
+            ),
+            (with_dir("bm-link"), "path rejected: path_escapes_root"),
+            (
+                TRAIN_QWEN2[..7].iter().map(|s| (*s).to_string()).collect(),
+                "base model directory is required for qwen2_lora",
+            ),
+            (
+                [
+                    "train",
+                    "--project-dir",
+                    "proj",
+                    "--candidate",
+                    "0",
+                    "--base-model-dir",
+                    BASE_MODEL_DIR,
+                ]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+                "option --base-model-dir requires --kind qwen2_lora",
+            ),
+        ];
+        let check = |args: &[String], message: &str| {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(
+                env.fails(&args, 64, "invalid_input"),
+                format!("{{\"code\":\"invalid_input\",\"message\":\"{message}\"}}\n")
+            );
+            assert!(!env.project_file("candidates/2").exists(), "{message}");
+            assert!(!env.project_file("candidates/0").exists(), "{message}");
+        };
+        for (args, message) in &cases {
+            check(args, message);
+        }
+        let own: Vec<String> = TRAIN_QWEN2.iter().map(|s| (*s).to_string()).collect();
+        // 1 バイトの改変（形式は保つ）と欠落。
+        let tok = env.work.join(BASE_MODEL_DIR).join("tokenizer.json");
+        let original = std::fs::read(&tok).expect("tokenizer");
+        let mut changed = original.clone();
+        changed.insert(changed.len() - 1, b' ');
+        std::fs::write(&tok, &changed).expect("write");
+        check(&own, "base model file sha256 mismatch");
+        std::fs::write(&tok, &original).expect("restore");
+        let weights = env.work.join(BASE_MODEL_DIR).join("model.safetensors");
+        std::fs::rename(&weights, env.work.join("moved.safetensors")).expect("move");
+        check(&own, "base model file rejected: path_unresolvable");
+
+        // 定義に `base_model` が無い。
+        let env = qwen2_inspected("qwen2-nodecl", false);
+        let args: Vec<&str> = TRAIN_QWEN2.to_vec();
+        assert_eq!(
+            env.fails(&args, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"base model is not declared in the definition\"}\n"
+        );
+        assert!(!env.project_file("candidates/2").exists());
+    }
+
+    /// REQ-41・REQ-27・#628: 後工程は学習リクエストの同一性（`base_model_sha256` 等）を定義から組んで厳密に
+    /// 照合し、場所（`base_model_dir`）だけは保存値を写して比べる（証拠種別: テストハーネス）。
+    pub fn qwen2_lora_select_matches_identity_but_not_location() {
+        let env = qwen2_inspected("qwen2-select", true);
+        env.ok(&TRAIN_QWEN2);
+        let files = ["candidates/2/request.json", "candidates/2/result.json"];
+        let originals: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(env.project_file(f)).expect("read"))
+            .collect();
+        let rewrite = |from: &str, to: &str| {
+            for (f, text) in files.iter().zip(&originals) {
+                assert!(text.contains(from), "{f}");
+                let path = env.project_file(f);
+                let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                std::fs::set_permissions(&path, perms).expect("perms");
+                std::fs::write(&path, text.replace(from, to)).expect("write");
+            }
+        };
+        let select = SELECT_QWEN2;
+        // 同一性の改変（名前）は request と結果の両方を揃えても拒否する。
+        rewrite(
+            "\"base_model_name\":\"tiny-synthetic\"",
+            "\"base_model_name\":\"other\"",
+        );
+        assert_eq!(
+            env.fails(&select, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n"
+        );
+        // 場所だけの違い（プロジェクトを別の機械で読む等）は照合を通る。
+        let dir = std::fs::canonicalize(env.work.join(BASE_MODEL_DIR)).expect("canonical");
+        rewrite(
+            &format!("\"base_model_dir\":\"{}\"", dir.display()),
+            "\"base_model_dir\":\"/elsewhere/bm\"",
+        );
+        // 照合を通った後、tokenizer 経路の未接続（`check_input_representation`）で止まる（同一性の改変とは
+        // 別の拒否理由であることが、場所の違いが照合を通った証拠になる）。
+        assert_eq!(
+            env.fails(&select, 64, "invalid_input"),
+            "{\"code\":\"invalid_input\",\"message\":\"unsupported input representation\"}\n"
+        );
+    }
 
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
     pub fn run_fake_worker(request_path: &str) -> ! {
@@ -5860,6 +6189,9 @@ mod suite {
                 r#"{{"status":"error","code":"limit_exceeded","message":"worker exceeded the time limit"}}"#
             );
             std::process::exit(20);
+        }
+        if request.kind() == "qwen2_lora" {
+            run_fake_qwen2_worker(&request, &out_dir);
         }
         let onnx_src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/onnx_parity")
@@ -5945,6 +6277,22 @@ fn main() -> std::process::ExitCode {
         suite::run_fake_grandchild();
     }
     let tests: &[(&str, fn())] = &[
+        (
+            "qwen2_lora_trains_via_cli_until_select_boundary",
+            suite::qwen2_lora_trains_via_cli_until_select_boundary,
+        ),
+        (
+            "qwen2_lora_train_all_with_base_model_dir",
+            suite::qwen2_lora_train_all_with_base_model_dir,
+        ),
+        (
+            "qwen2_lora_train_rejects_bad_base_model_before_side_effects",
+            suite::qwen2_lora_train_rejects_bad_base_model_before_side_effects,
+        ),
+        (
+            "qwen2_lora_select_matches_identity_but_not_location",
+            suite::qwen2_lora_select_matches_identity_but_not_location,
+        ),
         (
             "full_pipeline_completes_without_evaluation_data",
             suite::full_pipeline_completes_without_evaluation_data,
