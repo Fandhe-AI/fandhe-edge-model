@@ -305,7 +305,7 @@ def test_absolute_base_model_dir_outside_root_trains(tmp_path: Path) -> None:
         (lambda real: f"{real}/../m", "invalid_path"),
         (lambda real: f"{real}\x00", "invalid_path"),
         (lambda real: f"{real.parent}/missing", "invalid_path"),
-        (lambda real: f"{real}/", "symlink_not_allowed"),
+        (lambda real: f"{real}/", "invalid_path"),
     ],
 )
 def test_absolute_base_model_dir_rejects_bad_paths(tmp_path: Path, make_path, code: str) -> None:
