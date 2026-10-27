@@ -119,7 +119,7 @@
 //! `compare_definitions` はいずれも private のため、外部 crate から比較
 //! 関数を注入したり判定結果を偽造したりできない。
 
-use crate::canonical::{CanonicalError, DefinitionHash, DefinitionIdentity};
+use crate::canonical::{CanonicalError, DefinitionHash};
 use crate::definition::{Choice, Definition, JudgmentType};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -232,6 +232,10 @@ pub enum RebuildReason {
         old: JudgmentType,
         new: JudgmentType,
     },
+    /// ベースモデルの重みの実体が変わった（`base_model.sha256`〔ファイル名 → sha256〕の差。
+    /// 片側だけ `base_model` を持つ場合を含む。`name`・`license`・`origin` だけの差は
+    /// 重みが同一のため含めない。#667・REQ-20・REQ-41）。
+    BaseModelChanged,
 }
 
 /// 新旧定義を比較し、作り直しの要否を判定する
@@ -353,7 +357,7 @@ where
 /// 説明の差分詳細（[`classify_display_only_change`]）を伴う `NotRequired`
 /// を返す。
 fn compare_definitions(old: &Definition, new: &Definition) -> RebuildDecision {
-    let reasons = classify_change(&old.identity(), &new.identity());
+    let reasons = classify_change(old, new);
 
     match RequiredRebuild::from_reasons(reasons) {
         Some(required) => RebuildDecision::Required(required),
@@ -362,8 +366,9 @@ fn compare_definitions(old: &Definition, new: &Definition) -> RebuildDecision {
 }
 
 /// 新旧の同一性を比較し、作り直しが必要になる理由を集める（内部実装）。
-/// 理由の並びは OptionIds → JudgmentType の固定順にし、結果を決定的にする。
-fn classify_change(old: &DefinitionIdentity, new: &DefinitionIdentity) -> Vec<RebuildReason> {
+/// 理由の並びは OptionIds → JudgmentType → BaseModel の固定順にし、結果を決定的にする。
+fn classify_change(old_def: &Definition, new_def: &Definition) -> Vec<RebuildReason> {
+    let (old, new) = (&old_def.identity(), &new_def.identity());
     let mut reasons = Vec::new();
 
     let old_ids = old.option_ids();
@@ -379,6 +384,11 @@ fn classify_change(old: &DefinitionIdentity, new: &DefinitionIdentity) -> Vec<Re
             old: old.judgment_type(),
             new: new.judgment_type(),
         });
+    }
+
+    // 比較のキーは重みの実体（sha256 表）。name 等の表記差では作り直さない（#667）。
+    if old_def.base_model().map(|b| b.sha256()) != new_def.base_model().map(|b| b.sha256()) {
+        reasons.push(RebuildReason::BaseModelChanged);
     }
 
     reasons
@@ -1091,5 +1101,66 @@ mod tests {
             }
             other => panic!("Unchanged を期待したが {other:?} だった"),
         }
+    }
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn with_base_model(name: &str, weight_hex: &str) -> Definition {
+        let json = DEFINITION_A_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(
+                r#""io": {{ "input": "bytes" }}, "base_model": {{"name":"{name}","sha256":{{"config.json":"{HEX_A}","tokenizer.json":"{HEX_A}","m.safetensors":"{weight_hex}"}}}}"#
+            ),
+            1,
+        );
+        Definition::parse(&json).expect("valid なはず")
+    }
+
+    /// REQ-20・#667: 重み（sha256）だけ替えると `Required([BaseModelChanged])`。
+    #[test]
+    fn req20_issue667_base_model_weights_change_requires_rebuild() {
+        let d = decide_rebuild(&with_base_model("m", HEX_A), &with_base_model("m", HEX_B))
+            .expect("失敗しないはず");
+        match d {
+            RebuildDecision::Required(r) => {
+                assert_eq!(r.reasons(), &[RebuildReason::BaseModelChanged]);
+            }
+            other => panic!("Required を期待したが {other:?} だった"),
+        }
+    }
+
+    /// REQ-20・#667: name だけの差は重みが同一なので `NotRequired`。
+    #[test]
+    fn req20_issue667_base_model_name_only_change_is_not_required() {
+        let d = decide_rebuild(
+            &with_base_model("m", HEX_A),
+            &with_base_model("renamed", HEX_A),
+        )
+        .expect("失敗しないはず");
+        assert!(matches!(d, RebuildDecision::NotRequired(_)), "{d:?}");
+    }
+
+    /// REQ-20・#667: 片側だけ `base_model` を持つ（c1 から qwen2_lora 等）なら `Required`。
+    #[test]
+    fn req20_issue667_base_model_added_or_removed_requires_rebuild() {
+        for (old, new) in [
+            (definition_a(), with_base_model("m", HEX_A)),
+            (with_base_model("m", HEX_A), definition_a()),
+        ] {
+            match decide_rebuild(&old, &new).expect("失敗しないはず") {
+                RebuildDecision::Required(r) => {
+                    assert_eq!(r.reasons(), &[RebuildReason::BaseModelChanged]);
+                }
+                other => panic!("Required を期待したが {other:?} だった"),
+            }
+        }
+    }
+
+    /// REQ-20・#667: `base_model` の無い定義同士（c1・c3）の判定は変わらない。
+    #[test]
+    fn req20_issue667_without_base_model_decision_unchanged() {
+        let d = decide_rebuild(&definition_a(), &definition_a()).expect("失敗しないはず");
+        assert!(matches!(d, RebuildDecision::Unchanged { .. }), "{d:?}");
     }
 }

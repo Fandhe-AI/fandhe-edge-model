@@ -978,6 +978,8 @@ enum RebuildDecisionKind {
 /// 作り直しが必要な理由 1 件（[`RebuildReason`] の直列化形。`kind` で区別する）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// kind の直列化名（*_changed）は契約のため変えない
+#[allow(clippy::enum_variant_names)]
 enum RebuildReasonReport {
     OptionIdsChanged {
         added: BTreeSet<String>,
@@ -987,6 +989,7 @@ enum RebuildReasonReport {
         old: JudgmentType,
         new: JudgmentType,
     },
+    BaseModelChanged,
 }
 
 /// `register --previous-project-dir` の作り直し判定（`RegisterReport` の `rebuild` 欄。
@@ -1047,6 +1050,7 @@ impl RebuildReport {
                                 new: *new,
                             }
                         }
+                        RebuildReason::BaseModelChanged => RebuildReasonReport::BaseModelChanged,
                     })
                     .collect(),
                 BTreeSet::new(),
@@ -2212,7 +2216,7 @@ mod tests {
         );
     }
 
-    /// REQ-20・#487: 判定型の変更と選択肢 ID の変更は `kind` で区別した理由として、ID は辞書順で出る。
+    /// REQ-20・#487・#667: ベースモデル・判定型の変更と選択肢 ID の変更は `kind` で区別した理由として、ID は辞書順で出る。
     #[test]
     fn req20_register_rebuild_required_json_is_exact() {
         let decision = RebuildDecision::Required(
@@ -2225,6 +2229,7 @@ mod tests {
                     old: JudgmentType::SingleSelect,
                     new: JudgmentType::TestOnlyAlternate,
                 },
+                RebuildReason::BaseModelChanged,
             ])
             .expect("non-empty"),
         );
@@ -2234,7 +2239,7 @@ mod tests {
                 .to_json_line()
                 .expect("json"),
             format!(
-                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":true,\"rebuild\":{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"option_ids_changed\",\"added\":[\"b\",\"d\"],\"removed\":[\"c\"]}},{{\"kind\":\"judgment_type_changed\",\"old\":\"single_select\",\"new\":\"test_only_alternate\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":true,\"evaluation_data_changed\":null}}}}",
+                "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{}\",\"options\":3,\"evaluation_defined\":true,\"rebuild\":{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"option_ids_changed\",\"added\":[\"b\",\"d\"],\"removed\":[\"c\"]}},{{\"kind\":\"judgment_type_changed\",\"old\":\"single_select\",\"new\":\"test_only_alternate\"}},{{\"kind\":\"base_model_changed\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":true,\"evaluation_data_changed\":null}}}}",
                 "ab".repeat(32),
                 "cd".repeat(32)
             )
