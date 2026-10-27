@@ -251,6 +251,17 @@ pub fn resolve_candidates(
             insert_base_model_identity(&mut c.params, base_model);
         }
     }
+    // タスクの説明（#666・REQ-41）: qwen2_lora の system プロンプトの冒頭に使う。c1・c3 などには入れない。
+    if let Some(instruction) = definition.instruction() {
+        for c in candidates
+            .iter_mut()
+            .filter(|c| c.params.kind == BASE_MODEL_KIND)
+        {
+            c.params
+                .config
+                .insert("system_instruction".to_string(), instruction.into());
+        }
+    }
     Ok(candidates)
 }
 
