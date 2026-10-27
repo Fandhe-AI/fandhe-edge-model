@@ -51,7 +51,7 @@ class Keep(io.BytesIO):
 
 
 def _sys_ids(trained) -> list[int]:
-    return trained.tokenizer.system_turn_ids(q._system_prompt(trained.label_order))
+    return trained.tokenizer.system_turn_ids(q.build_system_prompt(trained.label_order))
 
 
 def export(trained, **kw):
@@ -214,7 +214,7 @@ def test_numeric_match_with_fused_bf16_reference(exported) -> None:
     pad = tok.special_ids["endoftext"]
     sess = evaluator(proto)
     for text in PROMPTS:
-        ids = tok.build_chat_ids(q._system_prompt(order), text, add_generation_prompt=True)
+        ids = tok.build_chat_ids(q.build_system_prompt(order), text, add_generation_prompt=True)
         ll = q.score_labels(ref, ids, label_ids, pad)
         want = np.exp(ll - ll.max())
         want /= want.sum()
@@ -332,7 +332,7 @@ def test_node_and_initializer_counts_at_28_layers(base) -> None:
 def test_system_turn_ids_is_prefix_of_chat_ids(base, text) -> None:
     """REQ-41・#634: system 区間の id 列は入力に依らず build_chat_ids の先頭と一致する。"""
     tok, order = base.tokenizer, base.label_order
-    sysp = q._system_prompt(order)
+    sysp = q.build_system_prompt(order)
     p = tok.system_turn_ids(sysp)
     assert p[0] == tok.special_ids["im_start"]
     assert len(p) > 3
@@ -355,7 +355,7 @@ def test_system_kv_is_bundled_and_graph_ignores_system_ids(exported) -> None:
     n = len(trained.model.model.layers)
     assert all(names[f"l{i}.sys{x}"].data_type == TensorProto.FLOAT for i in range(n) for x in "kv")
     ids = trained.tokenizer.build_chat_ids(
-        q._system_prompt(trained.label_order), "abc", add_generation_prompt=True
+        q.build_system_prompt(trained.label_order), "abc", add_generation_prompt=True
     )
     p = len(_sys_ids(trained))
     sess = evaluator(proto)

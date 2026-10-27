@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import IO, Any
@@ -61,12 +62,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
 #: 既定値を持たない必須項目（利用者ごとに異なるため `DEFAULT_CONFIG` に入れない）。
 _REQUIRED_FIELDS = ("base_model_dir", "base_model_sha256", "base_model_name")
 #: 既定値を持たない任意項目（無ければ来歴は `null`）。
-_OPTIONAL_FIELDS = ("base_model_license", "base_model_origin")
+_OPTIONAL_FIELDS = ("base_model_license", "base_model_origin", "system_instruction")
 _CONFIG_FIELDS = (
     frozenset(DEFAULT_CONFIG) | frozenset(_REQUIRED_FIELDS) | frozenset(_OPTIONAL_FIELDS)
 )
 #: 来歴文字列の上限（Rust data crate の `base_model` 検証と同じ規則）。
 _NAME_MAX, _LICENSE_MAX, _ORIGIN_MAX = 256, 256, 1024
+#: `system_instruction` の上限バイト数（Rust 側 `INSTRUCTION_MAX_BYTES` と同値）。
+INSTRUCTION_MAX_BYTES = 1024
 _DTYPES = ("bfloat16", "float32")
 
 #: 採点 1 回の forward に入れる選択肢の数（K が大きくてもメモリが線形に伸びない。PoC-26 と同値）
@@ -105,9 +108,14 @@ def _check_provenance_text(cfg: dict[str, Any]) -> None:
         v = cfg.get(key)
         if v is None and key != "base_model_name":
             return None
-        if not isinstance(v, str) or not v or len(v.encode("utf-8")) > limit:
+        try:
+            n = len(v.encode("utf-8")) if isinstance(v, str) else 0
+        except UnicodeEncodeError:  # 孤立サロゲート。本文は出さない
+            raise _invalid_config(f"config.{key} must be valid UTF-8") from None
+        if not n or n > limit:
             raise _invalid_config(f"config.{key} must be a non-empty string up to {limit} bytes")
-        if v != v.strip() or any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        # Rust の `char::is_control`（Unicode の Cc 全体。C1 の U+0080〜U+009F を含む）と同じ条件
+        if v != v.strip() or any(unicodedata.category(c) == "Cc" for c in v):
             raise _invalid_config(f"config.{key} must not have control characters or edge spaces")
         return v
 
@@ -118,6 +126,27 @@ def _check_provenance_text(cfg: dict[str, Any]) -> None:
         not origin.startswith("https://") or any(c in origin for c in "@?# \\")
     ):
         raise _invalid_config("config.base_model_origin must be an https:// URL without @ ? #")
+
+
+def _check_system_instruction(cfg: dict[str, Any]) -> None:
+    """任意の `system_instruction`（文字列・1〜1024 バイト・前後空白と制御文字なし）を検査する。"""
+    if "system_instruction" not in cfg:
+        return
+    v = cfg["system_instruction"]
+    try:
+        n = len(v.encode("utf-8")) if isinstance(v, str) else 0
+    except UnicodeEncodeError:  # 孤立サロゲート（JSON の "\ud800" 等）。本文は出さない
+        raise _invalid_config("config.system_instruction must be valid UTF-8") from None
+    if not n or n > INSTRUCTION_MAX_BYTES:
+        raise _invalid_config(
+            "config.system_instruction must be a non-empty string "
+            f"up to {INSTRUCTION_MAX_BYTES} bytes"
+        )
+    # Rust の `char::is_control`（Unicode の Cc 全体。C1 の U+0080〜U+009F を含む）と同じ条件
+    if v != v.strip() or any(unicodedata.category(c) == "Cc" for c in v):
+        raise _invalid_config(
+            "config.system_instruction must not have control characters or edge spaces"
+        )
 
 
 def _validate_config(cfg: dict[str, Any]) -> None:
@@ -143,6 +172,7 @@ def _validate_config(cfg: dict[str, Any]) -> None:
     if not isinstance(cfg["base_model_sha256"], dict):
         raise _invalid_config("config.base_model_sha256 must be an object")
     _check_provenance_text(cfg)
+    _check_system_instruction(cfg)
     # 範囲検査は `apply_lora` と重複する。`apply_lora` は単体でも公開されるため残し、こちらは
     # ベース読み込み（重い処理）の前に弾くための早期検査として置く。
     _int_in(cfg, "lora_rank", 1, limits.MAX_LORA_RANK)
@@ -180,9 +210,19 @@ def _seed_all(seed: int) -> None:
     mx.random.seed(seed)
 
 
-def _system_prompt(label_order: list[str]) -> str:
-    """選択肢を列挙する汎用の固定文（学習と #427 の採点で同じ文を使う）。"""
-    return "Answer with exactly one of: " + ", ".join(label_order) + "."
+def build_system_prompt(label_order: list[str], instruction: str | None = None) -> str:
+    """system プロンプトの唯一の生成規則（学習・予測・ONNX 書き出し・`scoring.system_prompt`）。
+
+    `instruction`（定義ファイルの `instruction`）が無ければ従来の汎用文、あれば
+    `{instruction}\nNames:` に選択肢を `- ` 付きで宣言順に列挙する（REQ-41・#666）。
+    """
+    if instruction is None:
+        return "Answer with exactly one of: " + ", ".join(label_order) + "."
+    return "\n".join([f"{instruction}\nNames:", *(f"- {x}" for x in label_order)])
+
+
+def _system_prompt(label_order: list[str], cfg: dict[str, Any]) -> str:
+    return build_system_prompt(label_order, cfg.get("system_instruction"))
 
 
 def make_batches(lengths: list[int], batch_size: int) -> list[list[int]]:
@@ -262,7 +302,7 @@ def _build_sequences(
     """全件の学習列（chat template＋ラベル＋`<|im_end|>`）を組み立て、長さを確認する。"""
     # 保持前に総トークン数の上限を件数 x max_seq_length で見積もる（REQ-39）
     budget.check_total_tokens(len(examples), cfg["max_seq_length"])
-    system = _system_prompt(request.label_order)
+    system = _system_prompt(request.label_order, cfg)
     header = tokenizer.encode("assistant\n")
     for label in request.label_order:
         body = tokenizer.encode(label)
@@ -417,7 +457,7 @@ def predict_records(
     vocab = trained.model.config.vocab_size
     label_ids = choice_token_ids(tok, order, vocab)
     longest = max(len(c) for c in label_ids)
-    system = _system_prompt(order)
+    system = _system_prompt(order, cfg)
     prompts: list[list[int]] = []
     for _, text in rows:
         rb.check()
@@ -549,7 +589,8 @@ class Qwen2LoraKind:
         from ..artifact import INPUT_REPRESENTATION_KEY, TOKENIZER_FILE_NAME, HashingWriter
         from ..qwen2_onnx import export_scoring_onnx
 
-        system_ids = trained.tokenizer.system_turn_ids(_system_prompt(trained.label_order))
+        system = _system_prompt(trained.label_order, trained.config)
+        system_ids = trained.tokenizer.system_turn_ids(system)
         shards = export_scoring_onnx(trained, out, open_member, system_ids=system_ids)
         with open_member(TOKENIZER_FILE_NAME) as f:
             tok_writer = HashingWriter(f)
@@ -564,7 +605,7 @@ class Qwen2LoraKind:
                 {"location": sh.name, "size_bytes": sh.size, "sha256": sh.sha256} for sh in shards
             ],
             "scoring": {
-                "system_prompt": _system_prompt(order),
+                "system_prompt": _system_prompt(order, cfg),
                 "choices": [
                     {"id": label, "token_ids": ids}
                     for label, ids in zip(order, token_ids, strict=True)

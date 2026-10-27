@@ -29,22 +29,25 @@ from tools.poc26.qwen2_model import (
 )
 from tools.poc26.qwen2_tokenizer import MAX_TOKENIZER_JSON_BYTES, Qwen2Tokenizer
 
+from fandhe_edge_trainer.kinds import qwen2_lora
+
 MAX_TOKENIZER_CONFIG_BYTES = 1 << 20
 
 
 MAX_SYSTEM_PROMPT_BYTES = 64 * 1024
 
 
-_HEAD = (
+#: 事前登録 追補 1 の冒頭 3 文（Playwright 専用）。生成規則は製品側 `qwen2_lora` の 1 箇所。
+INSTRUCTION = (
     "You are a tool selector for Playwright MCP. The user describes a browser task in Japanese. "
     "Reply with exactly one name from the list below and nothing else. "
-    "Reply none when no tool applies.\nNames:"
+    "Reply none when no tool applies."
 )
 
 
 def build_system_prompt(label_order: list[str]) -> str:
-    """固定の system プロンプト（ラベルを宣言順に列挙する）。全文は追補 1 に記録する。"""
-    return "\n".join([_HEAD, *(f"- {x}" for x in label_order)])
+    """事前登録の system プロンプト（全文は追補 1 に記録する）。"""
+    return qwen2_lora.build_system_prompt(label_order, INSTRUCTION)
 
 
 @dataclass

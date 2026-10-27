@@ -481,6 +481,9 @@ pub struct Definition {
     /// 省略可能なベースモデルの同一性と来歴（#628・REQ-41）。`None` は正準化 JSON にも現れない。
     #[serde(skip_serializing_if = "Option::is_none")]
     base_model: Option<BaseModel>,
+    /// 省略可能なタスクの説明（#666・REQ-41）。`None` は正準化 JSON にも現れない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instruction: Option<String>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -510,7 +513,12 @@ struct RawDefinition {
     out_of_scope_label: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_base_model")]
     base_model: Option<RawBaseModel>,
+    #[serde(default, deserialize_with = "deserialize_present_string")]
+    instruction: Option<String>,
 }
+
+/// `instruction` の最大バイト数（UTF-8。#666・REQ-41）。学習ワーカーも同じ値で検査する。
+pub const INSTRUCTION_MAX_BYTES: usize = 1024;
 
 /// キーがあるのに値が `null` のとき `None` として黙って受理せず型エラーにする（#478）。
 fn deserialize_present_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
@@ -580,6 +588,8 @@ pub enum FieldPath {
     BaseModelLicense,
     /// `base_model.origin`（#628）。
     BaseModelOrigin,
+    /// `instruction`（#666・REQ-41）。
+    Instruction,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -614,6 +624,7 @@ impl std::fmt::Display for FieldPath {
             FieldPath::BaseModelSha256 => write!(f, "base_model.sha256"),
             FieldPath::BaseModelLicense => write!(f, "base_model.license"),
             FieldPath::BaseModelOrigin => write!(f, "base_model.origin"),
+            FieldPath::Instruction => write!(f, "instruction"),
         }
     }
 }
@@ -1216,6 +1227,18 @@ impl Definition {
         // ベースモデル（#628・REQ-41）: 規則は [`validate_base_model`]。
         let base_model = raw.base_model.map(validate_base_model).transpose()?;
 
+        // タスクの説明（#666・REQ-41）: 1..=1024 バイト・前後の空白なし・制御文字（改行含む）なし。
+        if let Some(text) = &raw.instruction
+            && (text.is_empty()
+                || text.len() > INSTRUCTION_MAX_BYTES
+                || text.trim() != text
+                || text.chars().any(char::is_control))
+        {
+            return Err(DefinitionError::UnsupportedValue {
+                field: FieldPath::Instruction,
+            });
+        }
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -1228,6 +1251,7 @@ impl Definition {
             baseline_comparison,
             out_of_scope_label: raw.out_of_scope_label,
             base_model,
+            instruction: raw.instruction,
         })
     }
 
@@ -1311,6 +1335,12 @@ impl Definition {
     #[must_use]
     pub fn out_of_scope_label(&self) -> Option<&str> {
         self.out_of_scope_label.as_deref()
+    }
+
+    /// タスクの説明（#666・REQ-41）。`qwen2_lora` の system プロンプトの冒頭に使う。
+    #[must_use]
+    pub fn instruction(&self) -> Option<&str> {
+        self.instruction.as_deref()
     }
 
     /// ベースモデルの同一性と来歴（#628・REQ-41）。`None` は宣言なし（追加学習の `train` は 64 で止まる）。
@@ -2297,6 +2327,61 @@ mod tests {
                 crate::exitcode::ExitCode::InvalidInput,
                 "value={value}"
             );
+        }
+    }
+
+    /// `instruction` を `value_json` で差し込んだ定義 JSON（#666）。
+    fn with_instruction(value_json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "instruction": {value_json}"#),
+            1,
+        )
+    }
+
+    /// REQ-41・#666: 受理（境界 1・1024 バイト）し、省略時は正準化 JSON・ハッシュが変わらない。
+    #[test]
+    fn req41_issue666_instruction_accepts_and_omits_when_absent() {
+        let def = Definition::parse(&with_instruction(r#""Pick the tool.""#)).expect("parse");
+        assert_eq!(def.instruction(), Some("Pick the tool."));
+        assert!(
+            def.canonical_json()
+                .expect("canon")
+                .contains(r#""instruction":"Pick the tool.""#)
+        );
+        let max = "a".repeat(INSTRUCTION_MAX_BYTES);
+        assert!(Definition::parse(&with_instruction(&format!("\"{max}\""))).is_ok());
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("parse");
+        assert_eq!(without.instruction(), None);
+        assert!(
+            !without
+                .canonical_json()
+                .expect("canon")
+                .contains("instruction")
+        );
+        assert_ne!(
+            without.canonical_hash().expect("hash"),
+            def.canonical_hash().expect("hash")
+        );
+    }
+
+    /// REQ-41・REQ-21・#666: null・空・1025 バイト・制御文字・前後空白は `invalid_input`。
+    #[test]
+    fn req41_issue666_instruction_rejects_invalid_values() {
+        let too_long = format!("\"{}\"", "a".repeat(INSTRUCTION_MAX_BYTES + 1));
+        for (value, reason) in [
+            ("null".to_string(), "type_mismatch"),
+            ("1".to_string(), "type_mismatch"),
+            (r#""""#.to_string(), "unsupported_value"),
+            (too_long, "unsupported_value"),
+            (r#""a\nb""#.to_string(), "unsupported_value"),
+            (r#""a\u0000b""#.to_string(), "unsupported_value"),
+            (r#"" a""#.to_string(), "unsupported_value"),
+            (r#""a ""#.to_string(), "unsupported_value"),
+        ] {
+            let err = Definition::parse(&with_instruction(&value)).unwrap_err();
+            assert_eq!(err.reason_code(), reason, "value={value}");
+            assert_eq!(err.exit_code(), crate::exitcode::ExitCode::InvalidInput);
         }
     }
 
