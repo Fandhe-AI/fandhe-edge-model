@@ -191,6 +191,23 @@ impl ToErrorReport for JobRecordError {
 
 /// 経路の閉じ込めの拒否（REQ-39・TASK-39.4-2・#159）。`Display` は candidate の
 /// パスを含みうるため使わず、`reason_code` の固定語彙だけを出す。
+/// ベースモデルのファイルの拒否（`train --kind qwen2_lora` の起動前照合。REQ-41・REQ-39・#628）。
+/// ファイル名・パスは含めず、理由コードだけの固定語彙にする。
+impl ToErrorReport for fandhe_edge_guard::base_model::BaseModelFileRejection {
+    fn to_error_report(&self) -> ErrorReport {
+        use fandhe_edge_guard::base_model::BaseModelFileRejection as R;
+        let code = self.exit_code();
+        let message = match self {
+            R::Sha256Mismatch => "base model file sha256 mismatch".to_string(),
+            _ if code == ExitCode::LimitExceeded => {
+                "base model file exceeds size limit".to_string()
+            }
+            _ => format!("base model file rejected: {}", self.reason_code()),
+        };
+        ErrorReport::new(code, message)
+    }
+}
+
 impl ToErrorReport for PathRejection {
     fn to_error_report(&self) -> ErrorReport {
         ErrorReport::new(

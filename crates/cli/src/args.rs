@@ -194,6 +194,12 @@ const TRAIN_OPTS: &[OptSpec] = &[
         false,
         "Training seed override (u32, default: the seed recorded in split.json; the split is unchanged)",
     ),
+    opt(
+        "--base-model-dir",
+        "DIR",
+        false,
+        "Base model directory for --kind qwen2_lora (under the current directory; verified against base_model.sha256 in the definition)",
+    ),
     OptSpec {
         name: "--status",
         value: None,
@@ -322,6 +328,9 @@ pub struct TrainArgs {
     pub train_seed: Option<u32>,
     /// `--kind`（指定順。明示指定専用の種類を既定候補の後ろへ足す。検証は候補の解決時。REQ-41・TASK-41.10-1）。
     pub kinds: Vec<String>,
+    /// `--base-model-dir`: `--kind qwen2_lora` のベースモデルのディレクトリ（cwd 配下。`--kind qwen2_lora` との
+    /// 組み合わせの検査は `train` 工程。REQ-41・#628）。
+    pub base_model_dir: Option<PathBuf>,
 }
 /// `evaluate` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -756,7 +765,13 @@ impl Values {
             (true, true) => return Err(ArgsError::IncompatibleWithStatus { option: "--cancel" }),
             _ => {}
         }
-        for option in ["--all", "--budget-seconds", "--smoke", "--train-seed"] {
+        for option in [
+            "--all",
+            "--budget-seconds",
+            "--smoke",
+            "--train-seed",
+            "--base-model-dir",
+        ] {
             if self.0.iter().any(|(n, _)| *n == option) {
                 return Err(if status {
                     ArgsError::IncompatibleWithStatus { option }
@@ -840,6 +855,7 @@ fn build(sub: Subcommand, values: Vec<(&'static str, OsString)>) -> Result<Comma
                 smoke: v.take("--smoke").is_some(),
                 train_seed: v.train_seed()?,
                 kinds,
+                base_model_dir: v.opt_path("--base-model-dir"),
             })
         }
         Subcommand::Evaluate => {
@@ -1129,6 +1145,65 @@ mod tests {
         assert!(p(&["train", "--project-dir", "p", "--cancel", "--kind", "x"]).is_err());
     }
 
+    /// REQ-41・REQ-33・#628: `--base-model-dir` は `train` だけが 1 回受理し、空値・重複・状態確認・
+    /// キャンセルとの併用は拒否する（`--kind qwen2_lora` との組み合わせは `train` 工程で検査する）。
+    #[test]
+    fn req41_issue628_base_model_dir_option() {
+        let Command::Train(t) = run(&[
+            "train",
+            "--project-dir",
+            "proj",
+            "--candidate",
+            "2",
+            "--kind",
+            "qwen2_lora",
+            "--base-model-dir",
+            "models/qwen",
+        ]) else {
+            panic!("train expected");
+        };
+        assert_eq!(t.base_model_dir, Some(PathBuf::from("models/qwen")));
+        let Command::Train(t) = run(&["train", "--project-dir", "proj", "--all"]) else {
+            panic!("train expected");
+        };
+        assert_eq!(t.base_model_dir, None);
+        let train = ["train", "--project-dir", "p"];
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            train.iter().copied().chain(extra.iter().copied()).collect()
+        };
+        assert_eq!(
+            p(&with(&[
+                "--all",
+                "--base-model-dir",
+                "a",
+                "--base-model-dir",
+                "b"
+            ])),
+            Err(ArgsError::DuplicateOption {
+                option: "--base-model-dir"
+            })
+        );
+        assert_eq!(
+            p(&with(&["--all", "--base-model-dir", ""])),
+            Err(ArgsError::EmptyValue {
+                option: "--base-model-dir"
+            })
+        );
+        assert_eq!(
+            p(&with(&["--status", "--base-model-dir", "a"])),
+            Err(ArgsError::IncompatibleWithStatus {
+                option: "--base-model-dir"
+            })
+        );
+        assert_eq!(
+            p(&with(&["--cancel", "--base-model-dir", "a"])),
+            Err(ArgsError::IncompatibleWithCancel {
+                option: "--base-model-dir"
+            })
+        );
+        assert!(p(&["select", "--project-dir", "p", "--base-model-dir", "a"]).is_err());
+    }
+
     #[test]
     fn req33_train_and_evaluate_parse() {
         assert_eq!(
@@ -1142,6 +1217,7 @@ mod tests {
             ]),
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
+                base_model_dir: None,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(2)),
                 smoke: true,
@@ -1152,6 +1228,7 @@ mod tests {
             run(&["train", "--candidate=0", "--project-dir", "proj"]),
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
+                base_model_dir: None,
                 project_dir: "proj".into(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,
@@ -1260,6 +1337,7 @@ mod tests {
             ]),
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
+                base_model_dir: None,
                 project_dir: "proj".into(),
                 op: budget(3600),
                 smoke: true,

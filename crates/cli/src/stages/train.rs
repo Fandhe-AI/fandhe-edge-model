@@ -89,6 +89,18 @@
 //! `runtime_error`（70。候補の準備・子プロセスの起動失敗は単発の `train` と同じ写像）。探索が完了していれば
 //! 失敗時も `search_record.json` は残す。
 //!
+//! # ベースモデルの所在（`--base-model-dir`。REQ-41・REQ-39・REQ-40・#628）
+//!
+//! `--kind qwen2_lora` の候補は、定義ファイルの `base_model`（同一性と来歴）と `--base-model-dir`（場所）を
+//! 要する（どちらか欠ければ 64。`--kind qwen2_lora` なしの `--base-model-dir` も 64）。場所は cwd 配下へ
+//! 閉じ込め（`../`・cwd 外の絶対パス・symlink は 64）、学習する候補が `qwen2_lora` なら定義の
+//! `base_model.sha256` の全ファイルを実ファイルと照合する（不一致・欠落は 64、上限超過は 20。
+//! [`verify_base_model_sha256`]）。照合は候補ディレクトリの作成・学習ワーカーの起動より前（`--all` は探索の
+//! 開始前に 1 回）。学習リクエストの `config` には、定義から `base_model_sha256`・`base_model_name`・任意の
+//! `base_model_license`・`base_model_origin` を、照合済みの場所（正準化した絶対パス）を `base_model_dir` として
+//! 入れる。`select`・`evaluate`・`package` は `base_model_dir` だけを保存値から写して照合する
+//! （[`request_matches_candidate`]）。stdout の形は変えない。
+//!
 //! # 学習ワーカーの発見（暫定）
 //!
 //! 環境変数 [`TRAINER_DIR_ENV`]（絶対パスのみ）。未設定なら開発ツリーの `trainer/`
@@ -134,7 +146,8 @@ use fandhe_edge_train::time_allotment::{
     CandidateRunner, CandidateTimeError, Clock, PerCandidatePolicy, SystemClock,
 };
 
-use fandhe_edge_guard::package::ConfinedPackage;
+use fandhe_edge_guard::base_model::verify_base_model_sha256;
+use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::path::PathRejection;
 
 use super::inspect::split_rows;
@@ -229,7 +242,105 @@ pub fn resolve_candidates(
             format!("kind resolution failed: {}", e.reason_code()),
         )
     })?;
-    Ok(resolution.into_candidates())
+    let mut candidates = resolution.into_candidates();
+    if let Some(base_model) = definition.base_model() {
+        for c in candidates
+            .iter_mut()
+            .filter(|c| c.params.kind == BASE_MODEL_KIND)
+        {
+            insert_base_model_identity(&mut c.params, base_model);
+        }
+    }
+    Ok(candidates)
+}
+
+/// ベースモデルを使う種類（定義の `base_model` と `--base-model-dir` を要する。REQ-41・#628）。
+const BASE_MODEL_KIND: &str = "qwen2_lora";
+
+/// 学習リクエストの `config.base_model_dir`（場所。`train` だけが入れ、後工程は保存値を写して照合する）。
+const BASE_MODEL_DIR_KEY: &str = "base_model_dir";
+
+/// 定義の `base_model`（同一性と来歴）を学習リクエストの `config.base_model_*` へ写す（#628）。任意欄は
+/// 定義に無ければ入れない（学習ワーカーは来歴を `null` にする）。`select`・`evaluate`・`package` も同じ
+/// [`resolve_candidates`] で期待値を組むため、これらは厳密に照合される。
+fn insert_base_model_identity(
+    params: &mut TrainRequestParams,
+    base_model: &fandhe_edge_core::definition::BaseModel,
+) {
+    let config = &mut params.config;
+    config.insert(
+        "base_model_sha256".to_string(),
+        base_model
+            .sha256()
+            .iter()
+            .map(|(name, digest)| (name.clone(), digest.to_hex()))
+            .collect(),
+    );
+    config.insert("base_model_name".to_string(), base_model.name().into());
+    if let Some(license) = base_model.license() {
+        config.insert("base_model_license".to_string(), license.into());
+    }
+    if let Some(origin) = base_model.origin() {
+        config.insert("base_model_origin".to_string(), origin.into());
+    }
+}
+
+/// `train` の `--base-model-dir` を検査し、ベースモデルを使う候補があれば実ファイルを照合して場所を返す
+/// （REQ-41・REQ-39・#628）。候補ディレクトリの作成・学習ワーカーの起動より前に呼ぶ。
+///
+/// - `--kind qwen2_lora` が無いのに `--base-model-dir` がある、`--kind qwen2_lora` があるのに
+///   `--base-model-dir` か定義の `base_model` が無いときは 64
+/// - 場所は cwd 配下へ閉じ込める（`../`・cwd 外の絶対パス・symlink は 64。`--previous-project-dir` と同じ）
+/// - `verify` が真（学習する候補にベースモデルを使う種類がある）なら、定義の `base_model.sha256` の全ファイルを
+///   照合する（不一致・欠落は 64、上限超過は 20）。返す値は正準化した絶対パスで、学習ワーカーは
+///   `request.root` の外の別 root として開く
+///
+/// # Errors
+/// 上記の拒否。
+fn checked_base_model_dir(
+    args: &TrainArgs,
+    definition: &Definition,
+    cwd: &Path,
+    verify: bool,
+) -> Result<Option<String>, ErrorReport> {
+    let wanted = args.kinds.iter().any(|k| k == BASE_MODEL_KIND);
+    let Some(dir) = &args.base_model_dir else {
+        return if wanted {
+            Err(invalid("base model directory is required for qwen2_lora"))
+        } else {
+            Ok(None)
+        };
+    };
+    if !wanted {
+        return Err(invalid(
+            "option --base-model-dir requires --kind qwen2_lora",
+        ));
+    }
+    let base_model = definition
+        .base_model()
+        .ok_or_else(|| invalid("base model is not declared in the definition"))?;
+    let confined = confine_package(cwd, dir).map_err(|e| e.to_error_report())?;
+    if verify {
+        verify_base_model_sha256(&confined, base_model.sha256())
+            .map_err(|e| e.to_error_report())?;
+    }
+    confined
+        .dir()
+        .to_str()
+        .map(|s| Some(s.to_string()))
+        .ok_or_else(|| invalid("base model directory is not valid UTF-8"))
+}
+
+/// 照合済みの場所をベースモデルを使う候補の `config.base_model_dir` へ入れる（#628）。
+fn apply_base_model_dir(candidate: &mut SearchCandidate, dir: Option<&str>) {
+    if let Some(dir) = dir
+        && candidate.params.kind == BASE_MODEL_KIND
+    {
+        candidate
+            .params
+            .config
+            .insert(BASE_MODEL_DIR_KEY.to_string(), dir.into());
+    }
 }
 
 /// `train`（学習。単発・`--all`）の失敗の stdout。
@@ -304,6 +415,14 @@ pub fn run(args: &TrainArgs, index: usize, cwd: &Path) -> Result<TrainReport, Tr
     if args.smoke {
         apply_smoke_checked(&mut candidate)?;
     }
+    // ベースモデルの場所と実ファイルの照合（#628）。候補ディレクトリの作成・学習ワーカーの起動より前に止める。
+    let base_model_dir = checked_base_model_dir(
+        args,
+        &definition,
+        cwd,
+        candidate.params.kind == BASE_MODEL_KIND,
+    )?;
+    apply_base_model_dir(&mut candidate, base_model_dir.as_deref());
 
     let train_jsonl = trainer_jsonl(
         train_rows(&records, &split).map(|r| (r.input.as_str(), r.label_id.as_str())),
@@ -968,6 +1087,8 @@ where
 
     // 候補 N の `root` は `candidates/<N>`。単発の `train --candidate N` と同じ解決を候補ごとに行う。
     let n_candidates = resolve_candidates(&project, &definition, 0, seed, &args.kinds)?.len();
+    // ベースモデルの照合は探索の開始前に 1 回（#628）。`--kind qwen2_lora` があれば候補に含まれる。
+    let base_model_dir = checked_base_model_dir(args, &definition, cwd, true)?;
     let mut candidates = Vec::with_capacity(n_candidates);
     for index in 0..n_candidates {
         let mut candidate = resolve_candidates(&project, &definition, index, seed, &args.kinds)?
@@ -977,6 +1098,7 @@ where
         if args.smoke {
             apply_smoke_checked(&mut candidate)?;
         }
+        apply_base_model_dir(&mut candidate, base_model_dir.as_deref());
         candidates.push(candidate);
     }
     // やり直しは新規（REQ-34）。既存の探索記録があれば何も作らずに止める。既存の候補ディレクトリは単発の
@@ -1437,8 +1559,11 @@ pub fn build_train_request(
 /// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
 /// 移動すると一致せず拒否される（fail-closed として許容する）。
 ///
-/// **例外は `epochs` の 1 か所だけ**: `train --smoke` が 1 へ上書きする項目のため、期待値の `epochs` を
-/// 保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に [`request_is_smoke_trained`] で判定する）。
+/// **例外は `epochs` と `base_model_dir` の 2 か所だけ**: `epochs` は `train --smoke` が 1 へ上書きする項目のため、
+/// 期待値の `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
+/// [`request_is_smoke_trained`] で判定する）。`base_model_dir`（`qwen2_lora` の候補に限る。#628）は
+/// ベースモデルの場所で、同一性ではない（同一性の `base_model_sha256`・`base_model_name` 等は定義から
+/// 組んで厳密に比べる）。例外に加えてよいのは同一性に関わらない項目だけ。
 /// `time_limit_seconds` は除外しない: `allotted_time_limit` が `Some`（`train --all` の候補。
 /// [`allotted_time_limit`] で探索記録から読んだ配分値）ならその値、`None`（単発の `train`）なら既定値を
 /// 期待値にして厳密に比べる（保存後に時間制限だけを書き換えた request を通さない。REQ-18・REQ-27・#482）。
@@ -1465,6 +1590,19 @@ pub fn request_matches_candidate(
         None => {
             expected_params.config.remove("epochs");
         }
+    }
+    // ベースモデルの場所（#628）は同一性ではない（同一性は `base_model_sha256` 等が定義から束縛され、
+    // `train` が起動前に実ファイルと照合済み）ため、ベースモデルを使う種類に限って保存値を期待値へ写す。
+    // 文字列でない値は写さない（期待値に無い項目として不一致になる）。
+    if params.kind == BASE_MODEL_KIND
+        && let Some(dir) = request
+            .config()
+            .get(BASE_MODEL_DIR_KEY)
+            .filter(|v| v.is_string())
+    {
+        expected_params
+            .config
+            .insert(BASE_MODEL_DIR_KEY.to_string(), dir.clone());
     }
     build_train_request(expected_params, records, split).is_ok_and(|expected| &expected == request)
 }
@@ -1621,8 +1759,9 @@ mod all_tests {
         std::fs::write(
             dir.join("def/definition.json"),
             format!(
-                r#"{{"schema":"fandhe-edge-model-definition/v1","name":"train_all","version":1,"judgment_type":"single_select","options":[{}],"io":{{"input":"bytes"}}}}"#,
-                options.join(",")
+                r#"{{"schema":"fandhe-edge-model-definition/v1","name":"train_all","version":1,"judgment_type":"single_select","options":[{}],"io":{{"input":"bytes"}},"base_model":{}}}"#,
+                options.join(","),
+                write_base_model(&dir.join(BASE_MODEL_DIR))
             ),
         )
         .expect("definition");
@@ -1655,9 +1794,47 @@ mod all_tests {
         dir
     }
 
+    /// 合成のベースモデルを置く cwd 配下のディレクトリ（`--kind qwen2_lora` の候補が要する。#628）。
+    const BASE_MODEL_DIR: &str = "bm";
+
+    /// `dir` に最小のベースモデル 3 ファイルを置き、定義の `base_model` の JSON を返す（#628）。
+    fn write_base_model(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).expect("base model dir");
+        let header = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut weights = (header.len() as u64).to_le_bytes().to_vec();
+        weights.extend_from_slice(header.as_bytes());
+        weights.extend_from_slice(&[0; 4]);
+        let files: [(&str, Vec<u8>); 3] = [
+            ("config.json", br#"{"model_type":"qwen2"}"#.to_vec()),
+            ("model.safetensors", weights),
+            (
+                "tokenizer.json",
+                br#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]}}"#.to_vec(),
+            ),
+        ];
+        let sha: Vec<String> = files
+            .iter()
+            .map(|(name, bytes)| {
+                std::fs::write(dir.join(name), bytes).expect("base model file");
+                format!(r#""{name}":"{}""#, Sha256Digest::of_bytes(bytes).to_hex())
+            })
+            .collect();
+        format!(r#"{{"name":"tiny","sha256":{{{}}}}}"#, sha.join(","))
+    }
+
+    /// `--kind qwen2_lora --base-model-dir bm` の `train --all`（#628）。
+    fn qwen2_all_args() -> TrainArgs {
+        TrainArgs {
+            kinds: vec!["qwen2_lora".to_string()],
+            base_model_dir: Some(BASE_MODEL_DIR.into()),
+            ..all_args()
+        }
+    }
+
     fn all_args() -> TrainArgs {
         TrainArgs {
             kinds: Vec::new(),
+            base_model_dir: None,
             project_dir: "proj".into(),
             op: TrainOp::Run(TrainTarget::All {
                 budget: SearchBudget::default(),
@@ -1852,6 +2029,7 @@ mod all_tests {
                 }))
             };
             let args = TrainArgs {
+                base_model_dir: (!kinds.is_empty()).then(|| BASE_MODEL_DIR.into()),
                 kinds,
                 ..all_args()
             };
@@ -1938,10 +2116,7 @@ mod all_tests {
                 Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
             }))
         };
-        let args = TrainArgs {
-            kinds: vec!["qwen2_lora".to_string()],
-            ..all_args()
-        };
+        let args = qwen2_all_args();
         run_all_with(&args, SearchBudget::default(), &cwd, make_job, &clock).expect("train --all");
         assert!(!cwd.join("proj/candidates/2").exists());
         let select = |kinds: Vec<String>| {
@@ -1982,6 +2157,7 @@ mod all_tests {
         );
         let smoke = TrainArgs {
             kinds: vec!["qwen2_lora".to_string()],
+            base_model_dir: None,
             smoke: true,
             ..single
         };
@@ -2328,6 +2504,212 @@ mod all_tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// 学習ジョブを 1 度も呼ばれてはならない偽の実行器（照合で止まることの確認用。#628）。
+    fn job_must_not_run() -> Result<Box<JobFn<'static>>, ErrorReport> {
+        Ok(Box::new(|_: &TrainRequest, _: ConfinedPackage| {
+            panic!("the training job must not start")
+        }))
+    }
+
+    /// REQ-41・REQ-39・#628: `--base-model-dir` の組み合わせ違反・経路違反（`../`・cwd 外の絶対パス・cwd 外を指す
+    /// symlink）・sha256 不一致は、候補ディレクトリを
+    /// 作る前・学習ワーカーを起動する前に 64 で止まる（証拠種別: テストハーネス）。
+    #[test]
+    fn req41_issue628_base_model_dir_is_checked_before_any_side_effect() {
+        let cwd = inspected_workdir("bm-guard");
+        let outside = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
+        std::os::unix::fs::symlink(&outside, cwd.join("bm-link")).expect("link");
+        let cases: Vec<(TrainArgs, &str)> = vec![
+            (
+                TrainArgs {
+                    kinds: vec!["qwen2_lora".to_string()],
+                    ..all_args()
+                },
+                "base model directory is required for qwen2_lora",
+            ),
+            (
+                TrainArgs {
+                    base_model_dir: Some(BASE_MODEL_DIR.into()),
+                    ..all_args()
+                },
+                "option --base-model-dir requires --kind qwen2_lora",
+            ),
+            (
+                TrainArgs {
+                    base_model_dir: Some("../bm".into()),
+                    ..qwen2_all_args()
+                },
+                "path rejected: path_escapes_root",
+            ),
+            (
+                TrainArgs {
+                    base_model_dir: Some(outside.clone()),
+                    ..qwen2_all_args()
+                },
+                "path rejected: path_escapes_root",
+            ),
+            (
+                TrainArgs {
+                    base_model_dir: Some("bm-link".into()),
+                    ..qwen2_all_args()
+                },
+                "path rejected: path_escapes_root",
+            ),
+        ];
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        for (args, message) in cases {
+            let e = run_all_with(
+                &args,
+                SearchBudget::default(),
+                &cwd,
+                job_must_not_run,
+                &clock,
+            )
+            .expect_err("rejected");
+            let (code, got) = train_error_pair(&e);
+            assert_eq!(code, ExitCode::InvalidInput, "{message}");
+            assert!(
+                got.starts_with(message.split(':').next().unwrap_or("")),
+                "{got}"
+            );
+            assert!(!cwd.join("proj/candidates").exists(), "{message}");
+        }
+        // 1 バイトの改変は sha256 不一致（ファイル名・パスを message に出さない）。
+        let weights = cwd.join(BASE_MODEL_DIR).join("model.safetensors");
+        let mut bytes = std::fs::read(&weights).expect("read");
+        if let Some(last) = bytes.last_mut() {
+            *last = 1;
+        }
+        std::fs::write(&weights, bytes).expect("write");
+        let e = run_all_with(
+            &qwen2_all_args(),
+            SearchBudget::default(),
+            &cwd,
+            job_must_not_run,
+            &clock,
+        )
+        .expect_err("sha256 mismatch");
+        assert_eq!(
+            train_error_pair(&e),
+            (ExitCode::InvalidInput, "base model file sha256 mismatch")
+        );
+        assert!(!cwd.join("proj/candidates").exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// REQ-41・REQ-40・#628: `qwen2_lora` の学習リクエストの `config` に、定義の `base_model` と照合済みの場所
+    /// （正準化した絶対パス）が入り、`request_matches_candidate` は場所だけを例外にする（証拠種別: テストハーネス）。
+    #[test]
+    fn req41_issue628_request_carries_base_model_and_matches_only_by_identity() {
+        let cwd = inspected_workdir("bm-request");
+        let seen: Rc<std::cell::RefCell<Vec<TrainRequest>>> = Rc::default();
+        let captured = Rc::clone(&seen);
+        let make_job = move || -> Result<Box<JobFn<'static>>, ErrorReport> {
+            Ok(Box::new(
+                move |request: &TrainRequest, _: ConfinedPackage| {
+                    captured.borrow_mut().push(request.clone());
+                    if request.kind() == "c1" {
+                        return Ok(fake_c1_success(request));
+                    }
+                    let stdout = br#"{"status":"error","code":"training_diverged","message":"x"}"#;
+                    Ok(TrainOutcome::from_worker_stdout(stdout, request).expect("failure"))
+                },
+            ))
+        };
+        let clock = FakeClock {
+            now_ms: Rc::new(Cell::new(0)),
+        };
+        run_all_with(
+            &qwen2_all_args(),
+            SearchBudget::default(),
+            &cwd,
+            make_job,
+            &clock,
+        )
+        .expect("train --all");
+        let requests = seen.borrow();
+        let qwen = requests
+            .iter()
+            .find(|r| r.kind() == "qwen2_lora")
+            .expect("qwen2_lora ran");
+        let dir = std::fs::canonicalize(cwd.join(BASE_MODEL_DIR)).expect("canonical");
+        let config = qwen.config();
+        assert_eq!(
+            config.get("base_model_dir").and_then(|v| v.as_str()),
+            dir.to_str()
+        );
+        assert_eq!(
+            config.get("base_model_name").and_then(|v| v.as_str()),
+            Some("tiny")
+        );
+        assert_eq!(
+            config
+                .get("base_model_sha256")
+                .and_then(|v| v.as_object())
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            Some(vec![
+                "config.json".to_string(),
+                "model.safetensors".to_string(),
+                "tokenizer.json".to_string()
+            ])
+        );
+        assert!(config.get("base_model_license").is_none());
+        // c1・c3 には何も足さない。
+        for r in requests.iter().filter(|r| r.kind() != "qwen2_lora") {
+            assert!(
+                r.config().keys().all(|k| !k.starts_with("base_model")),
+                "{}",
+                r.kind()
+            );
+        }
+
+        // 期待値（後工程と同じ組み方）に対し、場所だけ違う request は一致、同一性が違う request は不一致。
+        let project = Project::open(&cwd, Path::new("proj")).expect("project");
+        let definition = project.load_definition().expect("definition");
+        let records = project.load_records(&definition).expect("records");
+        let (split, seed) = verified_split(&project, &records).expect("split");
+        let params = resolve_candidates(&project, &definition, 2, seed, &qwen2_all_args().kinds)
+            .expect("candidates")
+            .swap_remove(2)
+            .params;
+        let mut moved = params.clone();
+        moved
+            .config
+            .insert("base_model_dir".to_string(), "/elsewhere/bm".into());
+        let moved = build_train_request(moved, &records, &split).expect("request");
+        assert!(request_matches_candidate(
+            &moved, &params, None, &records, &split
+        ));
+        let mut tampered = params.clone();
+        tampered
+            .config
+            .insert("base_model_name".to_string(), "other".into());
+        let tampered = build_train_request(tampered, &records, &split).expect("request");
+        assert!(!request_matches_candidate(
+            &tampered, &params, None, &records, &split
+        ));
+        // 場所の例外は qwen2_lora に限る（c1 の request に base_model_dir が混ざれば不一致）。
+        let c1 = resolve_candidates(&project, &definition, 0, seed, &[])
+            .expect("candidates")
+            .swap_remove(0)
+            .params;
+        let mut c1_with_dir = c1.clone();
+        c1_with_dir
+            .config
+            .insert("base_model_dir".to_string(), "/x".into());
+        let c1_with_dir = build_train_request(c1_with_dir, &records, &split).expect("request");
+        assert!(!request_matches_candidate(
+            &c1_with_dir,
+            &c1,
+            None,
+            &records,
+            &split
+        ));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     fn train_error_pair(error: &TrainError) -> (ExitCode, &str) {
         match error {
             TrainError::Report(report) => error_pair(report),
@@ -2368,6 +2750,7 @@ mod status_tests {
     fn status_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
         let args = TrainArgs {
             kinds: Vec::new(),
+            base_model_dir: None,
             project_dir: "proj".into(),
             op: TrainOp::Status(candidate),
             smoke: false,
@@ -2947,6 +3330,7 @@ mod status_tests {
     fn cancel_line(cwd: &Path, candidate: Option<usize>) -> Result<String, ErrorReport> {
         let args = TrainArgs {
             kinds: Vec::new(),
+            base_model_dir: None,
             project_dir: "proj".into(),
             op: TrainOp::Cancel(candidate),
             smoke: false,
