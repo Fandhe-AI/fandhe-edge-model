@@ -295,14 +295,14 @@ where
     RawBaselineComparison::deserialize(d).map(Some)
 }
 
-/// `base_model.name` の上限バイト長（データ契約層の `MODEL_NAME_MAX_BYTES` と同値。#628）。
+/// `base_model.name` の上限バイト長（データ契約層の来歴のモデル名も参照する。#628）。
 pub const BASE_MODEL_NAME_MAX_BYTES: usize = 256;
-/// `base_model.license` の上限バイト長（データ契約層の来歴と同値。#628）。
+/// `base_model.license` の上限バイト長（データ契約層の来歴も参照する。#628）。
 pub const BASE_MODEL_LICENSE_MAX_BYTES: usize = 256;
-/// `base_model.origin` の上限バイト長（データ契約層の来歴と同値。#628）。
+/// `base_model.origin` の上限バイト長（データ契約層の来歴も参照する。#628）。
 pub const BASE_MODEL_ORIGIN_MAX_BYTES: usize = 1024;
 /// `base_model.sha256` の重みファイル（`*.safetensors`）の上限件数（学習ワーカーの
-/// `MAX_BASE_MODEL_WEIGHT_FILES` と同値。#628）。
+/// `MAX_BASE_MODEL_WEIGHT_FILES` と同値。データ契約層の来歴も参照する。#628）。
 pub const MAX_BASE_MODEL_WEIGHT_FILES: usize = 256;
 /// ベースモデルの設定ファイル名（`sha256` に必須）。
 pub const BASE_MODEL_CONFIG_FILE: &str = "config.json";
