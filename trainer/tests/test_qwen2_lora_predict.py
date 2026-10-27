@@ -87,7 +87,7 @@ def test_chunking_does_not_change_scores(trained) -> None:
     tok = trained.tokenizer
     end = tok.special_ids["im_end"]
     ids = [[*tok.encode(x), end] for x in trained.label_order]
-    system = q._system_prompt(trained.label_order)
+    system = q._system_prompt(trained.label_order, trained.config)
     prompt = tok.build_chat_ids(system, "hi", add_generation_prompt=True)
     pad = tok.special_ids["endoftext"]
     a = q.score_labels(trained.model, prompt, ids, pad, chunk=1)

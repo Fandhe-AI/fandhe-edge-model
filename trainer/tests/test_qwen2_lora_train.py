@@ -326,3 +326,41 @@ def test_absolute_base_model_dir_rejects_symlink(tmp_path: Path) -> None:
         with pytest.raises(WorkerError) as e:
             _train_abs(tmp / case, base_model_dir=str(p))
         assert (e.value.code, e.value.exit_code) == ("symlink_not_allowed", ExitCode.INVALID_INPUT)
+
+
+def test_system_prompt_without_instruction_is_generic() -> None:
+    """REQ-41・#666: system_instruction なしは従来の汎用文のまま（既存 fixture を保つ）。"""
+    assert q.build_system_prompt(["a", "b", "c"]) == "Answer with exactly one of: a, b, c."
+
+
+def test_system_prompt_with_instruction_lists_names() -> None:
+    """REQ-41・#666: system_instruction ありは指示文＋Names＋宣言順の箇条書き。"""
+    assert q._system_prompt(["b", "a"], {"system_instruction": "Pick one."}) == (
+        "Pick one.\nNames:\n- b\n- a"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "x" * 1025, "a\nb", " a", "a ", "a\x7f", 1, None, ["a"]],
+)
+def test_invalid_system_instruction_is_rejected(tmp_path: Path, bad: object) -> None:
+    """REQ-41・#666: system_instruction の違反は invalid_input（64）。"""
+    cfg = {**DEFAULT_CONFIG, **_cfg(tmp_path), "system_instruction": bad}
+    with pytest.raises(WorkerError) as e:
+        q._validate_config(cfg)
+    assert e.value.exit_code == ExitCode.INVALID_INPUT
+
+
+def test_valid_system_instruction_boundaries(tmp_path: Path) -> None:
+    """REQ-41・#666: 1 バイトと 1024 バイトちょうどは受理する。"""
+    base = {**DEFAULT_CONFIG, **_cfg(tmp_path)}
+    for ok in ("x", "x" * 1024):
+        q._validate_config({**base, "system_instruction": ok})
+
+
+def test_instruction_max_bytes_matches_rust_definition() -> None:
+    """REQ-41・#666: `system_instruction` の上限が Rust の定義ファイル側の値と同じ。"""
+    src = (Path(__file__).parents[2] / "crates/core/src/definition.rs").read_text(encoding="utf-8")
+    assert f"pub const INSTRUCTION_MAX_BYTES: usize = {q.INSTRUCTION_MAX_BYTES};" in src
+    assert q.INSTRUCTION_MAX_BYTES == 1024
