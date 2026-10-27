@@ -131,6 +131,25 @@ def resolve_root(root_raw: object) -> RootHandle:
     return RootHandle(real, fd)
 
 
+def resolve_external_dir(path_raw: object, field_name: str) -> RootHandle:
+    """`request.root` の外にある絶対パスのディレクトリを、別の root として開く（#628・REQ-39）。
+
+    `config.base_model_dir` に CLI が渡す絶対パス（cwd 配下に閉じ込めて正準化済み）を受ける口。
+    `resolve_root` の検査（絶対パス・`..`・NUL・`O_DIRECTORY`）に加え、経路のどこかに
+    symlink があれば
+    拒否する（正準化した結果が字面と一致することを要求する。末尾 `/`・`.` を含む字面も拒否される）。
+    中身のファイルは呼び出し側が返した fd 起点の `O_NOFOLLOW` で開く。
+
+    ponytail: 字面と realpath の比較から open までの間の差し替えは検出しない（中身は sha256 で照合
+    するため、差し替えられても照合で止まる）。必要になれば構成要素を fd 起点で辿る方式へ替える。
+    """
+    handle = resolve_root(path_raw)
+    if str(handle.root_real) != path_raw:
+        handle.close()
+        raise _symlink_not_allowed(f"{field_name} must be a canonical path without symlinks")
+    return handle
+
+
 def _check_syntax(rel_raw: object, field_name: str) -> PurePosixPath:
     if not isinstance(rel_raw, str) or not rel_raw:
         raise _invalid_path(f"{field_name} must be a non-empty string")

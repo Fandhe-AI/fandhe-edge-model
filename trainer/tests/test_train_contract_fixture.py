@@ -485,3 +485,19 @@ def test_req39_control_char_label_with_many_inputs_is_rejected_before_training(
         assert accepted.max_result_bytes >= worst_case
     finally:
         accepted.close_resources()
+
+
+def test_req41_issue628_absolute_base_model_dir_fixture_passes_config_validation() -> None:
+    """REQ-41・REQ-39・#628: 絶対パスの `base_model_dir`（共有 fixture）を config 検証が受理する。
+
+    実在の確認と symlink の拒否は読み込み時の `guard.resolve_external_dir`
+    （`test_qwen2_lora_train.py`）。
+    """
+    from fandhe_edge_trainer.kinds import qwen2_lora
+
+    req = _load_json_fixture("request_qwen2_lora_abs.json")
+    assert req["config"]["base_model_dir"] == "/fandhe-edge-fixture-models/tiny-fixture"
+    assert {k: v for k, v in req.items() if k != "config"} == {
+        k: v for k, v in _REQUEST_QWEN2.items() if k != "config"
+    }
+    qwen2_lora._validate_config({**qwen2_lora.DEFAULT_CONFIG, **req["config"]})

@@ -66,7 +66,14 @@ def _sha(p: Path) -> str:
 
 def _base_model(root: Path) -> Path:
     """`root/base` に config・tokenizer・seed 固定の f32 重みを置く。"""
-    d = root / "base"
+    return write_base_model(root / "base")
+
+
+def write_base_model(d: Path) -> Path:
+    """`d`（新規に作る）に config・tokenizer・seed 固定の f32 重みを置く。
+
+    `gen_qwen2_tiny_base_model.py` も使う。
+    """
     d.mkdir()
     config = {**synthetic.tiny_config(), "max_position_embeddings": 1024}
     (d / "config.json").write_text(json.dumps(config), encoding="utf-8")

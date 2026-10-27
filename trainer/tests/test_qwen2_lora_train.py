@@ -277,3 +277,52 @@ def test_out_of_range_config_returns_supported_range(
     assert (e.value.code, e.value.exit_code) == ("invalid_config", ExitCode.INVALID_INPUT)
     assert expected in e.value.message
     assert "unknown_key" not in e.value.message
+
+
+def _train_abs(tmp_path: Path, base_model_dir: str | None = None, **over):
+    """ベースモデルを `request.root` の外（`tmp_path/bm/m`）に置き、絶対パスで渡して学習する。
+
+    #628。
+    """
+    cfg = _cfg(tmp_path / "bm", iters=1, **over)
+    real = (tmp_path / "bm" / "m").resolve()
+    cfg["base_model_dir"] = base_model_dir if base_model_dir is not None else str(real)
+    req = make_request(tmp_path / "root", kind="qwen2_lora", config=cfg, keep_root=True)
+    return real, resolve_kind("qwen2_lora", 1).train(make_examples(4), req, make_budget(req))
+
+
+def test_absolute_base_model_dir_outside_root_trains(tmp_path: Path) -> None:
+    """REQ-41・REQ-39・#628: `request.root` の外の絶対パスのベースモデルで学習が完走する。"""
+    real, t = _train_abs(tmp_path)
+    assert t.iters_done == 1
+    assert t.config["base_model_dir"] == str(real)
+    assert sorted(t.base_file_sha256) == ["config.json", "model.safetensors", "tokenizer.json"]
+
+
+@pytest.mark.parametrize(
+    ("make_path", "code"),
+    [
+        (lambda real: f"{real}/../m", "invalid_path"),
+        (lambda real: f"{real}\x00", "invalid_path"),
+        (lambda real: f"{real.parent}/missing", "invalid_path"),
+        (lambda real: f"{real}/", "symlink_not_allowed"),
+    ],
+)
+def test_absolute_base_model_dir_rejects_bad_paths(tmp_path: Path, make_path, code: str) -> None:
+    """REQ-39・#628: 絶対パスの `..`・NUL・存在しないディレクトリ・正準形でない字面は 64。"""
+    real = (tmp_path / "bm" / "m").resolve().parent / "m"
+    with pytest.raises(WorkerError) as e:
+        _train_abs(tmp_path, base_model_dir=make_path(real))
+    assert (e.value.code, e.value.exit_code) == (code, ExitCode.INVALID_INPUT)
+
+
+def test_absolute_base_model_dir_rejects_symlink(tmp_path: Path) -> None:
+    """REQ-39・#628: 絶対パスの経路に symlink があれば（ディレクトリ自身・親とも）64。"""
+    tmp = tmp_path.resolve()
+    _cfg(tmp / "bm")
+    (tmp / "link").symlink_to(tmp / "bm" / "m")
+    (tmp / "parent-link").symlink_to(tmp / "bm")
+    for case, p in (("a", tmp / "link"), ("b", tmp / "parent-link" / "m")):
+        with pytest.raises(WorkerError) as e:
+            _train_abs(tmp / case, base_model_dir=str(p))
+        assert (e.value.code, e.value.exit_code) == ("symlink_not_allowed", ExitCode.INVALID_INPUT)
