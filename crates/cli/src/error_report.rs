@@ -189,8 +189,6 @@ impl ToErrorReport for JobRecordError {
     }
 }
 
-/// 経路の閉じ込めの拒否（REQ-39・TASK-39.4-2・#159）。`Display` は candidate の
-/// パスを含みうるため使わず、`reason_code` の固定語彙だけを出す。
 /// ベースモデルのファイルの拒否（`train --kind qwen2_lora` の起動前照合。REQ-41・REQ-39・#628）。
 /// ファイル名・パスは含めず、理由コードだけの固定語彙にする。
 impl ToErrorReport for fandhe_edge_guard::base_model::BaseModelFileRejection {
@@ -208,6 +206,8 @@ impl ToErrorReport for fandhe_edge_guard::base_model::BaseModelFileRejection {
     }
 }
 
+/// 経路の閉じ込めの拒否（REQ-39・TASK-39.4-2・#159）。`Display` は candidate の
+/// パスを含みうるため使わず、`reason_code` の固定語彙だけを出す。
 impl ToErrorReport for PathRejection {
     fn to_error_report(&self) -> ErrorReport {
         ErrorReport::new(
