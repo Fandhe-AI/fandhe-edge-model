@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import IO, Any
@@ -107,9 +108,14 @@ def _check_provenance_text(cfg: dict[str, Any]) -> None:
         v = cfg.get(key)
         if v is None and key != "base_model_name":
             return None
-        if not isinstance(v, str) or not v or len(v.encode("utf-8")) > limit:
+        try:
+            n = len(v.encode("utf-8")) if isinstance(v, str) else 0
+        except UnicodeEncodeError:  # 孤立サロゲート。本文は出さない
+            raise _invalid_config(f"config.{key} must be valid UTF-8") from None
+        if not n or n > limit:
             raise _invalid_config(f"config.{key} must be a non-empty string up to {limit} bytes")
-        if v != v.strip() or any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        # Rust の `char::is_control`（Unicode の Cc 全体。C1 の U+0080〜U+009F を含む）と同じ条件
+        if v != v.strip() or any(unicodedata.category(c) == "Cc" for c in v):
             raise _invalid_config(f"config.{key} must not have control characters or edge spaces")
         return v
 
@@ -127,12 +133,17 @@ def _check_system_instruction(cfg: dict[str, Any]) -> None:
     if "system_instruction" not in cfg:
         return
     v = cfg["system_instruction"]
-    if not isinstance(v, str) or not v or len(v.encode("utf-8")) > INSTRUCTION_MAX_BYTES:
+    try:
+        n = len(v.encode("utf-8")) if isinstance(v, str) else 0
+    except UnicodeEncodeError:  # 孤立サロゲート（JSON の "\ud800" 等）。本文は出さない
+        raise _invalid_config("config.system_instruction must be valid UTF-8") from None
+    if not n or n > INSTRUCTION_MAX_BYTES:
         raise _invalid_config(
             "config.system_instruction must be a non-empty string "
             f"up to {INSTRUCTION_MAX_BYTES} bytes"
         )
-    if v != v.strip() or any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+    # Rust の `char::is_control`（Unicode の Cc 全体。C1 の U+0080〜U+009F を含む）と同じ条件
+    if v != v.strip() or any(unicodedata.category(c) == "Cc" for c in v):
         raise _invalid_config(
             "config.system_instruction must not have control characters or edge spaces"
         )

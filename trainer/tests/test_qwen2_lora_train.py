@@ -203,6 +203,8 @@ def test_export_onnx_requires_open_member() -> None:
         {"base_model_name": "a\nb"},
         {"base_model_name": " x"},
         {"base_model_license": 5},
+        {"base_model_name": "a\x85b"},
+        {"base_model_license": "\ud800"},
         {"base_model_origin": "http://example.com/m"},
         {"base_model_origin": "https://user@example.com/m"},
         {"base_model_origin": "https://example.com/m?token=1"},
@@ -342,7 +344,7 @@ def test_system_prompt_with_instruction_lists_names() -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ["", "x" * 1025, "a\nb", " a", "a ", "a\x7f", 1, None, ["a"]],
+    ["", "x" * 1025, "a\nb", " a", "a ", "a\x7f", "a\x85b", "a\x9bb", "\ud800", 1, None, ["a"]],
 )
 def test_invalid_system_instruction_is_rejected(tmp_path: Path, bad: object) -> None:
     """REQ-41・#666: system_instruction の違反は invalid_input（64）。"""
