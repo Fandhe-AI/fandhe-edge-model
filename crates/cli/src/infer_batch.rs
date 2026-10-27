@@ -1050,6 +1050,7 @@ mod tests {
             }),
             Command::Train(TrainArgs {
                 kinds: Vec::new(),
+                base_model_dir: None,
                 project_dir: p(),
                 op: TrainOp::Run(TrainTarget::Candidate(0)),
                 smoke: false,

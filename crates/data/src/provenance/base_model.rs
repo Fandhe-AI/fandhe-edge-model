@@ -19,19 +19,17 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use fandhe_edge_core::definition::{
+    BASE_MODEL_LICENSE_MAX_BYTES as LICENSE_MAX_BYTES,
+    BASE_MODEL_ORIGIN_MAX_BYTES as ORIGIN_MAX_BYTES, MAX_BASE_MODEL_WEIGHT_FILES as MAX_FILES,
+};
 use fandhe_edge_core::hash::Sha256Digest;
 use serde_json::{Map, Value};
 
 use super::ModelName;
 
-/// ライセンス表記の上限バイト長。
-const LICENSE_MAX_BYTES: usize = 256;
-/// 取得元の上限バイト長。
-const ORIGIN_MAX_BYTES: usize = 1024;
 /// ファイルパスの上限バイト長。
 const PATH_MAX_BYTES: usize = 512;
-/// ファイル件数の上限（guard の `MAX_SPLIT_FILES` と同じ値。data は guard に依存しないため複製）。
-const MAX_FILES: usize = 256;
 
 /// 記録の構築エラー。`Display` は固定の英語文で、入力値を含めない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,12 +298,13 @@ mod tests {
     }
 
     /// core の `MAX_EXTERNAL_DATA_SHARDS`（guard の `MAX_SPLIT_FILES` の出所）との値の一致を
-    /// 機械照合する（data は core に依存しないためソース文字列で確認する）。
+    /// 機械照合する。
     #[test]
     fn req41_max_files_matches_guard() {
-        let src = include_str!("../../../core/src/limits.rs");
-        let want = format!("pub const MAX_EXTERNAL_DATA_SHARDS: usize = {MAX_FILES};");
-        assert!(src.contains(&want), "{want}");
+        assert_eq!(
+            MAX_FILES,
+            fandhe_edge_core::limits::MAX_EXTERNAL_DATA_SHARDS
+        );
     }
 
     #[test]

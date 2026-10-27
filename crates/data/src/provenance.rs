@@ -56,8 +56,8 @@ use std::fmt;
 pub mod base_model;
 pub mod ingest;
 
-/// モデル名の許容バイト長の上限。
-const MODEL_NAME_MAX_BYTES: usize = 256;
+// モデル名の許容バイト長の上限（定義ファイルの `base_model.name` と共有。#628）。
+use fandhe_edge_core::definition::BASE_MODEL_NAME_MAX_BYTES as MODEL_NAME_MAX_BYTES;
 
 /// 生成日時の入力文字列の許容バイト長の上限（解析前に検査する）。
 const GENERATED_AT_MAX_INPUT_BYTES: usize = 64;

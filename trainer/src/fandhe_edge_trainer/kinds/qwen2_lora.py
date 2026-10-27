@@ -7,7 +7,10 @@ chat template 形式で生成する損失で MLX 学習する。出力は選択�
 
 ベースモデルの所在は種類固有の `config` で受ける（トップレベルの入出力契約は変えない）:
 
-- `base_model_dir`: `request.root` からの相対パス（必須。経路は `guard.confine` が閉じ込める）
+- `base_model_dir`: `request.root` からの相対パス、または絶対パス（必須）。相対は `guard.confine` が
+  `request.root` 配下へ閉じ込め、絶対（CLI の `train --base-model-dir` が cwd 配下へ閉じ込めて
+  正準化したもの。#628）は `guard.resolve_external_dir` が別の root として開く。どちらも `..`・
+  symlink は拒否
 - `base_model_sha256`: {ファイル名: sha256}（必須。照合は `load_base_model`）
 - `base_model_name`: 来歴の名前（必須）。`base_model_license`・`base_model_origin`: 任意
 
@@ -27,6 +30,7 @@ mlx は関数内で遅延 import する（選択口の import を軽く保つ）
 from __future__ import annotations
 
 import math
+import os
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,7 +38,7 @@ from typing import IO, Any
 
 import numpy as np
 
-from .. import budget, limits
+from .. import budget, guard, limits
 from ..contract import TrainExample, TrainRequest
 from ..errors import WorkerError
 from ..exitcode import ExitCode
@@ -129,6 +133,13 @@ def _validate_config(cfg: dict[str, Any]) -> None:
     d = cfg["base_model_dir"]
     if not isinstance(d, str) or not d:
         raise _invalid_config("config.base_model_dir must be a non-empty string")
+    # 絶対パスは重い読み込みの前に字面だけ確かめる（相対パスは `guard.confine` が読み込み時に検査）
+    if os.path.isabs(d) and ("\x00" in d or ".." in d.split("/")):
+        raise WorkerError(
+            "invalid_path",
+            "config.base_model_dir must not contain NUL or '..'",
+            ExitCode.INVALID_INPUT,
+        )
     if not isinstance(cfg["base_model_sha256"], dict):
         raise _invalid_config("config.base_model_sha256 must be an object")
     _check_provenance_text(cfg)
@@ -453,7 +464,7 @@ class Qwen2LoraKind:
 
         import mlx.core as mx
 
-        from ..qwen2_model import apply_lora, load_base_model
+        from ..qwen2_model import apply_lora, load_base_model, load_base_model_at
 
         mx.set_default_device(mx.gpu if request.device == "gpu" else mx.cpu)
         _seed_all(request.seed)
@@ -462,13 +473,16 @@ class Qwen2LoraKind:
                 "invalid_data", "fewer training examples than batch_size", ExitCode.INVALID_INPUT
             )
         dtype = mx.bfloat16 if cfg["dtype"] == "bfloat16" else mx.float32
-        base = load_base_model(
-            request.root,
-            cfg["base_model_dir"],
-            expected_sha256=cfg["base_model_sha256"],
-            dtype=dtype,
-            resource_budget=resource_budget,
-        )
+        load_args = {
+            "expected_sha256": cfg["base_model_sha256"],
+            "dtype": dtype,
+            "resource_budget": resource_budget,
+        }
+        if os.path.isabs(cfg["base_model_dir"]):
+            with guard.resolve_external_dir(cfg["base_model_dir"], "base_model_dir") as h:
+                base = load_base_model_at(h.fd, **load_args)
+        else:
+            base = load_base_model(request.root, cfg["base_model_dir"], **load_args)
         c = base.config
         if cfg["max_seq_length"] > c.max_position_embeddings:
             raise _invalid_config(

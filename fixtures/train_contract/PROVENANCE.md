@@ -245,3 +245,11 @@ print(json.dumps(
 `base_model`。REQ-41・TASK-41.6-3・#432）の結果 JSON を、`crates/train/tests/
 train_contract_fixture.rs`（往復）と `trainer/tests/test_train_contract_fixture.py`
 （`build_artifact(extra=...)` との完全一致）が照合する。証拠種別: テストハーネス。
+
+## `request_qwen2_lora_abs.json`
+
+`request_qwen2_lora.json` の `config.base_model_dir` だけを `request.root` の外の絶対パス
+（`/fandhe-edge-fixture-models/tiny-fixture`。実在しない）に替えた手作成の fixture（#628・REQ-41・REQ-39）。
+CLI の `train --base-model-dir` が渡す形で、`crates/train/tests/train_contract_fixture.rs`（Rust の学習
+リクエストとして受理し往復する）と `trainer/tests/test_train_contract_fixture.py`（`qwen2_lora` の
+config 検証が字面で受理する）が読む。証拠種別: テストハーネス。

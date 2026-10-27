@@ -53,7 +53,7 @@ pub enum BaseModelFormatError {
     SafetensorsHeaderLength,
     /// ヘッダーが `{` 始まりの JSON object ではない。
     SafetensorsHeaderJson,
-    /// `__metadata__` が文字列→文字列の object ではない。
+    /// `__metadata__` が文字列→文字列の object でも `null` でもない。
     SafetensorsMetadata,
     /// テンソルのエントリが不正（未知 dtype・shape 溢れ・オフセットとサイズの不一致）。
     SafetensorsTensor,
@@ -92,10 +92,12 @@ pub fn check_safetensors(bytes: &[u8]) -> Result<(), BaseModelFormatError> {
     let mut ranges = Vec::new();
     for (k, v) in &map {
         if k == "__metadata__" {
-            // 任意。あれば文字列→文字列の object。
-            if !v
-                .as_object()
-                .is_some_and(|m| m.values().all(Value::is_string))
+            // 任意。あれば文字列→文字列の object、または `null`（MLX の `save_safetensors` が metadata
+            // なしで書く形。#628）。
+            if !v.is_null()
+                && !v
+                    .as_object()
+                    .is_some_and(|m| m.values().all(Value::is_string))
             {
                 return Err(E::SafetensorsMetadata);
             }
@@ -166,6 +168,10 @@ mod tests {
         assert!(is_safetensors(&st(ONE, &[0; 4])));
         let meta = r#"{"__metadata__":{"format":"pt"},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
         assert!(is_safetensors(&st(meta, &[0; 4])));
+        // MLX の `mx.save_safetensors`（metadata なし）は `"__metadata__":null` を書く（#628）。
+        let null_meta =
+            r#"{"__metadata__":null,"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert!(is_safetensors(&st(null_meta, &[0; 4])));
         let pad = format!("{ONE}   ");
         assert!(is_safetensors(&st(&pad, &[0; 4])));
         let two = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[2,3],"data_offsets":[4,10]}}"#;
@@ -210,6 +216,12 @@ mod tests {
         // metadata が文字列以外
         let m = r#"{"__metadata__":{"k":1},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
         assert!(!is_safetensors(&st(m, &[0; 4])));
+        for m in ["1", "\"pt\"", "[]"] {
+            let h = format!(
+                r#"{{"__metadata__":{m},"a":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#
+            );
+            assert!(!is_safetensors(&st(&h, &[0; 4])), "{m}");
+        }
     }
 
     /// REQ-39・TASK-41.2-1: tokenizer.json の形の検査。

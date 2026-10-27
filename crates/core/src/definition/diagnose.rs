@@ -312,9 +312,17 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         });
     }
 
+    // 5f. base_model（省略可能。#628）。キーがあれば object で、`name`・`sha256` は必須、
+    // `sha256` の値と `license`・`origin` は string。`null` は型エラーにする。
+    if let Some(value) = root.get("base_model")
+        && let Some(e) = check_base_model(value)
+    {
+        return Some(e);
+    }
+
     // 6. トップレベルの未知キー（`serde_json::Map` は既定で `BTreeMap` の
     // ためキー順走査は決定的）。
-    const KNOWN_TOP_LEVEL_KEYS: [&str; 10] = [
+    const KNOWN_TOP_LEVEL_KEYS: [&str; 11] = [
         "schema",
         "name",
         "version",
@@ -325,6 +333,7 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
         "limits",
         "baseline_comparison",
         "out_of_scope_label",
+        "base_model",
     ];
     for key in root.keys() {
         if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
@@ -336,6 +345,60 @@ pub(super) fn diagnose(text: &str) -> Option<DefinitionError> {
     }
 
     None
+}
+
+/// `base_model` の構造を確認する（#628）。値の規則（名前・hex・必須ファイル）は `parse` 側。
+fn check_base_model(value: &Value) -> Option<DefinitionError> {
+    let Some(object) = value.as_object() else {
+        return Some(DefinitionError::TypeMismatch {
+            field: FieldPath::BaseModel,
+            expected: ExpectedType::Object,
+            actual: json_type(value),
+        });
+    };
+    if let Some(e) = check_required_string(object.get("name"), FieldPath::BaseModelName) {
+        return Some(e);
+    }
+    let Some(sha256) = object.get("sha256") else {
+        return Some(DefinitionError::MissingField {
+            field: FieldPath::BaseModelSha256,
+        });
+    };
+    let Some(entries) = sha256.as_object() else {
+        return Some(DefinitionError::TypeMismatch {
+            field: FieldPath::BaseModelSha256,
+            expected: ExpectedType::Object,
+            actual: json_type(sha256),
+        });
+    };
+    if let Some(v) = entries.values().find(|v| !v.is_string()) {
+        return Some(DefinitionError::TypeMismatch {
+            field: FieldPath::BaseModelSha256,
+            expected: ExpectedType::String,
+            actual: json_type(v),
+        });
+    }
+    for (key, field) in [
+        ("license", FieldPath::BaseModelLicense),
+        ("origin", FieldPath::BaseModelOrigin),
+    ] {
+        if let Some(v) = object.get(key)
+            && !v.is_string()
+        {
+            return Some(DefinitionError::TypeMismatch {
+                field,
+                expected: ExpectedType::String,
+                actual: json_type(v),
+            });
+        }
+    }
+    object
+        .keys()
+        .find(|k| !matches!(k.as_str(), "name" | "sha256" | "license" | "origin"))
+        .map(|k| DefinitionError::UnknownField {
+            parent: FieldPath::BaseModel,
+            name: k.clone(),
+        })
 }
 
 /// ルートが object であることを確認する。object でなければ

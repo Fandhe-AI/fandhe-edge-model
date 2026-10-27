@@ -657,3 +657,19 @@ fn req41_qwen2_lora_package_inconsistencies_are_rejected() {
         );
     }
 }
+/// REQ-41・REQ-39・#628: `config.base_model_dir` が `root` の外の絶対パスの学習リクエスト（CLI の
+/// `train --base-model-dir` が渡す形）を受理し、同じ JSON へ往復できる（`config` は kind 固有で Rust は
+/// 中身を解釈しない。経路の検査は CLI の閉じ込めと学習ワーカーの `resolve_external_dir`）。
+#[test]
+fn req41_issue628_request_with_absolute_base_model_dir_round_trips() {
+    let bytes = load_fixture_bytes("request_qwen2_lora_abs.json");
+    let request =
+        TrainRequest::from_json_slice(&bytes).expect("request_qwen2_lora_abs.json must parse");
+    assert_eq!(
+        request.config().get("base_model_dir"),
+        Some(&Value::from("/fandhe-edge-fixture-models/tiny-fixture"))
+    );
+    let written: Value =
+        serde_json::from_slice(&request.to_json_vec().expect("serialize")).unwrap();
+    assert_eq!(written, load_fixture_value("request_qwen2_lora_abs.json"));
+}

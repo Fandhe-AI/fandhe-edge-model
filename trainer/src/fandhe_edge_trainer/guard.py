@@ -131,6 +131,36 @@ def resolve_root(root_raw: object) -> RootHandle:
     return RootHandle(real, fd)
 
 
+def resolve_external_dir(path_raw: object, field_name: str) -> RootHandle:
+    """`request.root` の外にある絶対パスのディレクトリを、別の root として開く（#628・REQ-39）。
+
+    `config.base_model_dir` に CLI が渡す絶対パス（cwd 配下に閉じ込めて正準化済み）を受ける口。
+    realpath を使わず、`/` の fd から各構成要素を `_walk_parent` で 1 段ずつ `O_NOFOLLOW` で
+    開く（検証と使用を同じ fd へ束縛し、親の差し替え TOCTOU を塞ぐ）。途中に symlink があれば
+    `symlink_not_allowed`、無い・ディレクトリでなければ `invalid_path`。空の構成要素（連続 `/`・
+    末尾 `/`）・`.`・`..`・NUL・相対パスは `invalid_path`（字面が正準形であることを要求する）。
+    返す `RootHandle.root_real` は入力の字面。中身のファイルは fd 起点の `O_NOFOLLOW` で開く。
+    """
+    _assert_dir_fd_support()
+    if not isinstance(path_raw, str) or not path_raw:
+        raise _invalid_path(f"{field_name} must be a non-empty string")
+    if "\x00" in path_raw:
+        raise _invalid_path(f"{field_name} must not contain NUL")
+    if not path_raw.startswith("/"):
+        raise _invalid_path(f"{field_name} must be an absolute path")
+    parts = () if path_raw == "/" else tuple(path_raw.split("/")[1:])
+    if any(p in ("", ".", "..") for p in parts):
+        raise _invalid_path(
+            f"{field_name} must be a canonical path without '.', '..' or empty parts"
+        )
+    top = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = _walk_parent(top, parts, field_name)
+    finally:
+        os.close(top)
+    return RootHandle(Path(path_raw), fd)
+
+
 def _check_syntax(rel_raw: object, field_name: str) -> PurePosixPath:
     if not isinstance(rel_raw, str) or not rel_raw:
         raise _invalid_path(f"{field_name} must be a non-empty string")

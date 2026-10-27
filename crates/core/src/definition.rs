@@ -63,9 +63,21 @@
 //! - `None` のときは直列化しないので、欄の無い定義の正準化ハッシュは変わらない。作り直し判定は
 //!   `NotRequired` である
 //! - 値は正準化ハッシュに含まれるため、評価データを見た後に仮定を変えると `package` が止める
+//!
+//! # ベースモデルの同一性（#628・REQ-41・REQ-40）
+//! - `base_model`（`name`・`sha256`〔ファイル名 → sha256〕・任意の `license`・`origin`）は、追加学習の
+//!   種類（`qwen2_lora`）が使うベースモデルの同一性と来歴である。場所（ディレクトリ）は機械ごとに違うため
+//!   定義には持たせず、`train --base-model-dir` で受ける
+//! - `None` のときは直列化しないので、欄の無い定義の正準化ハッシュは変わらない。ベースモデルを替えると
+//!   `definition_sha256` が変わり、評価記録・選定記録・配布パッケージの照合が別定義として扱う
+//! - 検証規則は学習ワーカー（`qwen2_model._check_expected`・`qwen2_lora._check_provenance_text`）と
+//!   データ契約層の来歴（`provenance::base_model`）に合わせる（core は data に依存しないため値を複製する）
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use crate::hash::Sha256Digest;
 
 // `diagnose` は `Definition::parse` の失敗経路（`Category::Data`）でのみ
 // 呼ばれる内部専用モジュール（TASK-15.3-2）。`super::` 経由で `FieldPath` 等の
@@ -283,6 +295,147 @@ where
     RawBaselineComparison::deserialize(d).map(Some)
 }
 
+/// `base_model.name` の上限バイト長（データ契約層の来歴のモデル名も参照する。#628）。
+pub const BASE_MODEL_NAME_MAX_BYTES: usize = 256;
+/// `base_model.license` の上限バイト長（データ契約層の来歴も参照する。#628）。
+pub const BASE_MODEL_LICENSE_MAX_BYTES: usize = 256;
+/// `base_model.origin` の上限バイト長（データ契約層の来歴も参照する。#628）。
+pub const BASE_MODEL_ORIGIN_MAX_BYTES: usize = 1024;
+/// `base_model.sha256` の重みファイル（`*.safetensors`）の上限件数（学習ワーカーの
+/// `MAX_BASE_MODEL_WEIGHT_FILES` と同値。データ契約層の来歴も参照する。#628）。
+pub const MAX_BASE_MODEL_WEIGHT_FILES: usize = 256;
+/// ベースモデルの設定ファイル名（`sha256` に必須）。
+pub const BASE_MODEL_CONFIG_FILE: &str = "config.json";
+/// ベースモデルのトークナイザーのファイル名（`sha256` に必須）。
+pub const BASE_MODEL_TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// 追加学習のベースモデルの同一性と来歴（#628・REQ-41・REQ-40）。
+///
+/// `train --kind qwen2_lora` が学習ワーカーの起動前に `sha256` を実ファイルと照合し、学習リクエストの
+/// `config.base_model_*` へ写す。`Deserialize` は実装しない（検証の迂回を防ぐ。[`Acceptance`] と同じ流儀）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaseModel {
+    name: String,
+    sha256: BTreeMap<String, Sha256Digest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+}
+
+impl BaseModel {
+    /// モデル名（非空・上限内・制御文字と前後の空白なし）。
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// ファイル名 → sha256（`config.json`・`tokenizer.json` と 1 件以上の `*.safetensors`。名前順）。
+    #[must_use]
+    pub fn sha256(&self) -> &BTreeMap<String, Sha256Digest> {
+        &self.sha256
+    }
+
+    /// ライセンス表記（記録するだけで可否は判定しない）。
+    #[must_use]
+    pub fn license(&self) -> Option<&str> {
+        self.license.as_deref()
+    }
+
+    /// 取得元（`https://` 始まり・`@`・`?`・`#`・空白・`\\` なし。通信はしない。REQ-38）。
+    #[must_use]
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+}
+
+/// [`BaseModel`] の未検証の中間表現（デシリアライズ専用）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBaseModel {
+    name: String,
+    sha256: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_present_string")]
+    license: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_string")]
+    origin: Option<String>,
+}
+
+/// `base_model` キーがあるのに値が `null` のとき型エラーにする（#628）。
+fn deserialize_present_base_model<'de, D>(d: D) -> Result<Option<RawBaseModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RawBaseModel::deserialize(d).map(Some)
+}
+
+/// 空でなく上限内で、制御文字・前後の空白を含まない（データ契約層の来歴の `text_ok` と同じ規則）。
+fn base_model_text_ok(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && value.trim().len() == value.len()
+}
+
+/// 重みファイル名として許すか（学習ワーカーの `_WEIGHT_NAME_RE`
+/// `[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.safetensors` と同じ規則。区切り文字・`..` 単独は通らない）。
+fn is_weight_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let mut chars = stem.chars();
+    stem.len() <= 128
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `base_model` を検証する（#628）。違反は対応する [`FieldPath`] の `UnsupportedValue`。
+fn validate_base_model(raw: RawBaseModel) -> Result<BaseModel, DefinitionError> {
+    let bad = |field| DefinitionError::UnsupportedValue { field };
+    if !base_model_text_ok(&raw.name, BASE_MODEL_NAME_MAX_BYTES) {
+        return Err(bad(FieldPath::BaseModelName));
+    }
+    if let Some(license) = &raw.license
+        && !base_model_text_ok(license, BASE_MODEL_LICENSE_MAX_BYTES)
+    {
+        return Err(bad(FieldPath::BaseModelLicense));
+    }
+    // https:// 始まりのみ許可し、資格情報（`@`）・クエリ・フラグメント・空白・`\` を拒否する
+    // （ローカルパス・資格情報入り URL を配布メタデータへ漏らさない。データ契約層・学習ワーカーと同じ）。
+    if let Some(origin) = &raw.origin
+        && (!base_model_text_ok(origin, BASE_MODEL_ORIGIN_MAX_BYTES)
+            || !origin.starts_with("https://")
+            || origin.contains(['@', '?', '#', ' ', '\\']))
+    {
+        return Err(bad(FieldPath::BaseModelOrigin));
+    }
+    let mut weights = 0usize;
+    let mut sha256 = BTreeMap::new();
+    for (file, hex) in raw.sha256 {
+        if file != BASE_MODEL_CONFIG_FILE && file != BASE_MODEL_TOKENIZER_FILE {
+            if !is_weight_file_name(&file) {
+                return Err(bad(FieldPath::BaseModelSha256));
+            }
+            weights += 1;
+        }
+        let digest: Sha256Digest = hex.parse().map_err(|_| bad(FieldPath::BaseModelSha256))?;
+        sha256.insert(file, digest);
+    }
+    if !sha256.contains_key(BASE_MODEL_CONFIG_FILE)
+        || !sha256.contains_key(BASE_MODEL_TOKENIZER_FILE)
+        || weights == 0
+        || weights > MAX_BASE_MODEL_WEIGHT_FILES
+    {
+        return Err(bad(FieldPath::BaseModelSha256));
+    }
+    Ok(BaseModel {
+        name: raw.name,
+        sha256,
+        license: raw.license,
+        origin: raw.origin,
+    })
+}
+
 /// 入出力のデータ構造（REQ-15）。出力側は `judgment_type`／`options` で
 /// 表現済みのため、ここでは入力表現のみを持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +478,9 @@ pub struct Definition {
     /// 省略可能な対象外ラベル（`options[].id`。#478・REQ-22）。`None` は対象外を区別しない。
     #[serde(skip_serializing_if = "Option::is_none")]
     out_of_scope_label: Option<String>,
+    /// 省略可能なベースモデルの同一性と来歴（#628・REQ-41）。`None` は正準化 JSON にも現れない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_model: Option<BaseModel>,
 }
 
 /// `Definition` の未検証の中間表現（デシリアライズ専用）。
@@ -352,6 +508,8 @@ struct RawDefinition {
     baseline_comparison: Option<RawBaselineComparison>,
     #[serde(default, deserialize_with = "deserialize_present_string")]
     out_of_scope_label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_base_model")]
+    base_model: Option<RawBaseModel>,
 }
 
 /// キーがあるのに値が `null` のとき `None` として黙って受理せず型エラーにする（#478）。
@@ -412,6 +570,16 @@ pub enum FieldPath {
     BaselineComparisonPowerBp,
     /// `out_of_scope_label`（#478・REQ-22）。
     OutOfScopeLabel,
+    /// `base_model`（#628・REQ-41）。
+    BaseModel,
+    /// `base_model.name`（#628）。
+    BaseModelName,
+    /// `base_model.sha256`（#628）。ファイル名は利用者由来のため位置に含めない。
+    BaseModelSha256,
+    /// `base_model.license`（#628）。
+    BaseModelLicense,
+    /// `base_model.origin`（#628）。
+    BaseModelOrigin,
 }
 
 impl std::fmt::Display for FieldPath {
@@ -441,6 +609,11 @@ impl std::fmt::Display for FieldPath {
             }
             FieldPath::BaselineComparisonPowerBp => write!(f, "baseline_comparison.power_bp"),
             FieldPath::OutOfScopeLabel => write!(f, "out_of_scope_label"),
+            FieldPath::BaseModel => write!(f, "base_model"),
+            FieldPath::BaseModelName => write!(f, "base_model.name"),
+            FieldPath::BaseModelSha256 => write!(f, "base_model.sha256"),
+            FieldPath::BaseModelLicense => write!(f, "base_model.license"),
+            FieldPath::BaseModelOrigin => write!(f, "base_model.origin"),
         }
     }
 }
@@ -1040,6 +1213,9 @@ impl Definition {
             });
         }
 
+        // ベースモデル（#628・REQ-41）: 規則は [`validate_base_model`]。
+        let base_model = raw.base_model.map(validate_base_model).transpose()?;
+
         Ok(Definition {
             schema: raw.schema,
             name: raw.name,
@@ -1051,6 +1227,7 @@ impl Definition {
             limits,
             baseline_comparison,
             out_of_scope_label: raw.out_of_scope_label,
+            base_model,
         })
     }
 
@@ -1134,6 +1311,12 @@ impl Definition {
     #[must_use]
     pub fn out_of_scope_label(&self) -> Option<&str> {
         self.out_of_scope_label.as_deref()
+    }
+
+    /// ベースモデルの同一性と来歴（#628・REQ-41）。`None` は宣言なし（追加学習の `train` は 64 で止まる）。
+    #[must_use]
+    pub fn base_model(&self) -> Option<&BaseModel> {
+        self.base_model.as_ref()
     }
 
     /// 定義の同一性（選択肢 ID の集合＋`judgment_type`。表示名・説明・`name`・
@@ -2511,5 +2694,322 @@ mod tests {
             with.canonical_hash().expect("hash")
         );
         assert_eq!(without.identity(), with.identity());
+    }
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn with_base_model(value_json: &str) -> String {
+        TWO_OPTIONS_JSON.replacen(
+            r#""io": { "input": "bytes" }"#,
+            &format!(r#""io": {{ "input": "bytes" }}, "base_model": {value_json}"#),
+            1,
+        )
+    }
+
+    fn base_model_json(name: &str, sha256: &str, extra: &str) -> String {
+        format!(r#"{{"name":{name},"sha256":{sha256}{extra}}}"#)
+    }
+
+    fn sha_map(weights: &[&str]) -> String {
+        let mut entries = vec![
+            format!(r#""config.json":"{HEX_A}""#),
+            format!(r#""tokenizer.json":"{HEX_B}""#),
+        ];
+        entries.extend(weights.iter().map(|w| format!(r#""{w}":"{HEX_A}""#)));
+        format!("{{{}}}", entries.join(","))
+    }
+
+    /// REQ-41・REQ-40・#628: `base_model` を受理し、省略時は正準化 JSON に現れずハッシュが変わらない。
+    #[test]
+    fn req41_issue628_base_model_accepts_valid_and_omits_when_absent() {
+        let json = base_model_json(
+            r#""Qwen2.5-1.5B""#,
+            &sha_map(&[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ]),
+            r#","license":"Apache-2.0","origin":"https://huggingface.co/Qwen/Qwen2.5-1.5B""#,
+        );
+        let def = Definition::parse(&with_base_model(&json)).expect("valid");
+        let bm = def.base_model().expect("declared");
+        assert_eq!(bm.name(), "Qwen2.5-1.5B");
+        assert_eq!(bm.license(), Some("Apache-2.0"));
+        assert_eq!(
+            bm.origin(),
+            Some("https://huggingface.co/Qwen/Qwen2.5-1.5B")
+        );
+        assert_eq!(
+            bm.sha256().keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "config.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "tokenizer.json"
+            ]
+        );
+        assert_eq!(
+            bm.sha256().get("tokenizer.json").map(|d| d.to_hex()),
+            Some(HEX_B.to_string())
+        );
+        let canonical = def.canonical_json().expect("canonical");
+        assert!(
+            canonical.contains(r#""base_model":{"license":"Apache-2.0","name":"Qwen2.5-1.5B""#),
+            "{canonical}"
+        );
+
+        // license・origin は任意。省略すると正準化 JSON にも現れない。
+        let minimal = Definition::parse(&with_base_model(&base_model_json(
+            r#""tiny""#,
+            &sha_map(&["model.safetensors"]),
+            "",
+        )))
+        .expect("valid");
+        let bm = minimal.base_model().expect("declared");
+        assert_eq!((bm.license(), bm.origin()), (None, None));
+        let canonical = minimal.canonical_json().expect("canonical");
+        assert!(
+            !canonical.contains("license") && !canonical.contains("origin"),
+            "{canonical}"
+        );
+
+        // 欄の無い既存定義はハッシュ不変（`base_model` が直列化されない）。
+        let without = Definition::parse(TWO_OPTIONS_JSON).expect("valid");
+        assert!(without.base_model().is_none());
+        assert!(
+            !without
+                .canonical_json()
+                .expect("canonical")
+                .contains("base_model")
+        );
+        assert_ne!(
+            without.canonical_hash().expect("hash"),
+            minimal.canonical_hash().expect("hash")
+        );
+        assert_eq!(without.identity(), minimal.identity());
+    }
+
+    /// REQ-41・REQ-39・#628: 不正な `base_model` は `invalid_input`（64）で拒否する。
+    #[test]
+    fn req41_issue628_base_model_rejects_invalid_values() {
+        let ok_sha = sha_map(&["model.safetensors"]);
+        let too_many: Vec<String> = (0..=MAX_BASE_MODEL_WEIGHT_FILES)
+            .map(|i| format!("w{i}.safetensors"))
+            .collect();
+        let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        let long_name = format!("\"{}\"", "n".repeat(BASE_MODEL_NAME_MAX_BYTES + 1));
+        let cases: Vec<(String, &str, FieldPath)> = vec![
+            ("null".into(), "type_mismatch", FieldPath::BaseModel),
+            ("[]".into(), "type_mismatch", FieldPath::BaseModel),
+            ("{}".into(), "missing_field", FieldPath::BaseModelName),
+            (
+                format!(r#"{{"sha256":{ok_sha}}}"#),
+                "missing_field",
+                FieldPath::BaseModelName,
+            ),
+            (
+                r#"{"name":"x"}"#.into(),
+                "missing_field",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json("1", &ok_sha, ""),
+                "type_mismatch",
+                FieldPath::BaseModelName,
+            ),
+            (
+                base_model_json(r#""x""#, "[]", ""),
+                "type_mismatch",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, r#"{"config.json":1}"#, ""),
+                "type_mismatch",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &ok_sha, r#","license":null"#),
+                "type_mismatch",
+                FieldPath::BaseModelLicense,
+            ),
+            (
+                base_model_json(r#""x""#, &ok_sha, r#","path":"/abs""#),
+                "unknown_field",
+                FieldPath::BaseModel,
+            ),
+            (
+                base_model_json(r#""""#, &ok_sha, ""),
+                "unsupported_value",
+                FieldPath::BaseModelName,
+            ),
+            (
+                base_model_json(r#"" x""#, &ok_sha, ""),
+                "unsupported_value",
+                FieldPath::BaseModelName,
+            ),
+            (
+                base_model_json(r#""a\nb""#, &ok_sha, ""),
+                "unsupported_value",
+                FieldPath::BaseModelName,
+            ),
+            (
+                base_model_json(&long_name, &ok_sha, ""),
+                "unsupported_value",
+                FieldPath::BaseModelName,
+            ),
+            (
+                base_model_json(r#""x""#, &ok_sha, r#","license":"""#),
+                "unsupported_value",
+                FieldPath::BaseModelLicense,
+            ),
+            (
+                base_model_json(r#""x""#, &ok_sha, r#","origin":"http://example.com/m""#),
+                "unsupported_value",
+                FieldPath::BaseModelOrigin,
+            ),
+            (
+                base_model_json(r#""x""#, &ok_sha, r#","origin":"/Users/me/models/qwen""#),
+                "unsupported_value",
+                FieldPath::BaseModelOrigin,
+            ),
+            (
+                base_model_json(
+                    r#""x""#,
+                    &ok_sha,
+                    r#","origin":"https://user@example.com/m""#,
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelOrigin,
+            ),
+            (
+                base_model_json(
+                    r#""x""#,
+                    &ok_sha,
+                    r#","origin":"https://example.com/m?token=1""#,
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelOrigin,
+            ),
+            // sha256: 必須ファイルの欠落・重み 0 件・上限超過・不正な名前・不正な hex。
+            (
+                base_model_json(
+                    r#""x""#,
+                    &format!(r#"{{"tokenizer.json":"{HEX_A}","m.safetensors":"{HEX_A}"}}"#),
+                    "",
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(
+                    r#""x""#,
+                    &format!(r#"{{"config.json":"{HEX_A}","m.safetensors":"{HEX_A}"}}"#),
+                    "",
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&[]), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&too_many), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&["a/b.safetensors"]), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&["../m.safetensors"]), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&[".safetensors"]), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(r#""x""#, &sha_map(&["pytorch_model.bin"]), ""),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(
+                    r#""x""#,
+                    &format!(
+                        r#"{{"config.json":"{}","tokenizer.json":"{HEX_B}","m.safetensors":"{HEX_A}"}}"#,
+                        HEX_A.to_uppercase()
+                    ),
+                    "",
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+            (
+                base_model_json(
+                    r#""x""#,
+                    r#"{"config.json":"abc","tokenizer.json":"abc","m.safetensors":"abc"}"#,
+                    "",
+                ),
+                "unsupported_value",
+                FieldPath::BaseModelSha256,
+            ),
+        ];
+        for (value, reason, field) in cases {
+            let err = Definition::parse(&with_base_model(&value)).unwrap_err();
+            assert_eq!(err.reason_code(), reason, "value={value}");
+            assert_eq!(
+                err.exit_code(),
+                crate::exitcode::ExitCode::InvalidInput,
+                "value={value}"
+            );
+            let field_of = match &err {
+                DefinitionError::MissingField { field }
+                | DefinitionError::TypeMismatch { field, .. }
+                | DefinitionError::UnsupportedValue { field } => *field,
+                DefinitionError::UnknownField { parent, .. } => *parent,
+                other => panic!("unexpected error {other:?} for {value}"),
+            };
+            assert_eq!(field_of, field, "value={value}");
+            // 利用者由来の値（ファイル名・origin）をメッセージへ出さない。
+            let message = err.public_message();
+            assert!(
+                !message.contains("safetensors") && !message.contains("example.com"),
+                "{message}"
+            );
+        }
+    }
+
+    /// REQ-41・#628: 重みファイル名の規則は学習ワーカーの `_WEIGHT_NAME_RE` と同じ境界。
+    #[test]
+    fn req41_issue628_weight_file_name_boundaries() {
+        let stem128 = format!("{}.safetensors", "a".repeat(128));
+        let stem129 = format!("{}.safetensors", "a".repeat(129));
+        for ok in [
+            "model.safetensors",
+            "m-1_2.x.safetensors",
+            "0.safetensors",
+            stem128.as_str(),
+        ] {
+            assert!(is_weight_file_name(ok), "{ok}");
+        }
+        for ng in [
+            ".safetensors",
+            "_m.safetensors",
+            "m.SAFETENSORS",
+            "m safetensors",
+            "a/b.safetensors",
+            "m+.safetensors",
+            "モデル.safetensors",
+            stem129.as_str(),
+        ] {
+            assert!(!is_weight_file_name(ng), "{ng}");
+        }
     }
 }

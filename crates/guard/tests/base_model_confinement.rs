@@ -4,11 +4,16 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use fandhe_edge_core::exitcode::ExitCode;
-use fandhe_edge_guard::base_model::{BaseModelFileRejection, open_base_model_file};
+use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_guard::base_model::{
+    BaseModelFileRejection, MAX_BASE_MODEL_CONFIG_BYTES, open_base_model_file,
+    verify_base_model_sha256,
+};
 use fandhe_edge_guard::file_size::{FileSizeRejection, MAX_READ_FILE_BYTES};
 use fandhe_edge_guard::format::FileFormat;
 use fandhe_edge_guard::package::{ConfinedPackage, confine_package};
 use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -231,4 +236,108 @@ fn req39_rejection_does_not_leak_member_path() {
         assert!(!shown.contains("customer"), "{shown}");
         assert!(!shown.contains("private"), "{shown}");
     }
+}
+const CONFIG: &[u8] = br#"{"model_type":"qwen2"}"#;
+
+/// 合成のベースモデル 3 ファイルを置き、定義に書く sha256 の写像を返す。
+fn write_base_model(dir: &Path) -> BTreeMap<String, Sha256Digest> {
+    let files: [(&str, Vec<u8>); 3] = [
+        ("config.json", CONFIG.to_vec()),
+        ("model.safetensors", safetensors()),
+        ("tokenizer.json", TOKENIZER.to_vec()),
+    ];
+    files
+        .into_iter()
+        .map(|(name, bytes)| {
+            fs::write(dir.join(name), &bytes).unwrap();
+            (name.to_string(), Sha256Digest::of_bytes(&bytes))
+        })
+        .collect()
+}
+
+fn verify_err(sb: &Sandbox, expected: &BTreeMap<String, Sha256Digest>) -> (ExitCode, &'static str) {
+    let e = verify_base_model_sha256(&sb.confine(), expected).unwrap_err();
+    (e.exit_code(), e.reason_code())
+}
+
+/// REQ-41・REQ-39・#628: 定義の sha256 と実ファイルが一致すれば通る。
+#[test]
+fn req41_issue628_verify_sha256_accepts_matching_files() {
+    let sb = Sandbox::new("sha-ok");
+    let expected = write_base_model(&sb.dir());
+    verify_base_model_sha256(&sb.confine(), &expected).unwrap();
+}
+
+/// REQ-41・REQ-39・#628: 1 バイトの改変は sha256 不一致（64）。メッセージにファイル名を出さない。
+#[test]
+fn req41_issue628_verify_sha256_rejects_one_byte_change() {
+    for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+        let sb = Sandbox::new(&format!("sha-ng-{name}"));
+        let expected = write_base_model(&sb.dir());
+        let mut bytes = fs::read(sb.dir().join(name)).unwrap();
+        // safetensors はデータ部の末尾、JSON は末尾の `}` の直前に空白を足して形式は保つ
+        if name == "model.safetensors" {
+            *bytes.last_mut().unwrap() = 1;
+        } else {
+            bytes.insert(bytes.len() - 1, b' ');
+        }
+        fs::write(sb.dir().join(name), &bytes).unwrap();
+        let e = verify_base_model_sha256(&sb.confine(), &expected).unwrap_err();
+        assert!(
+            matches!(e, BaseModelFileRejection::Sha256Mismatch),
+            "{name}: {e:?}"
+        );
+        assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(e.reason_code(), "base_model_sha256_mismatch");
+        assert!(!e.to_string().contains(name), "{e}");
+    }
+}
+
+/// REQ-41・REQ-39・#628: ファイルの欠落・symlink のメンバーは経路の拒否（64）。
+#[test]
+fn req41_issue628_verify_sha256_rejects_missing_and_symlink() {
+    let sb = Sandbox::new("sha-missing");
+    let expected = write_base_model(&sb.dir());
+    fs::remove_file(sb.dir().join("model.safetensors")).unwrap();
+    assert_eq!(verify_err(&sb, &expected).0, ExitCode::InvalidInput);
+
+    let sb = Sandbox::new("sha-symlink");
+    let expected = write_base_model(&sb.dir());
+    let real = sb.outside().join("config.json");
+    fs::rename(sb.dir().join("config.json"), &real).unwrap();
+    symlink(&real, sb.dir().join("config.json")).unwrap();
+    assert_eq!(verify_err(&sb, &expected).0, ExitCode::InvalidInput);
+}
+
+/// REQ-41・REQ-39・#628: `config.json` は 64 KiB まで。超過は 20（読み込み前に止める）。
+#[test]
+fn req41_issue628_verify_sha256_config_size_limit() {
+    let sb = Sandbox::new("sha-config-size");
+    let mut expected = write_base_model(&sb.dir());
+    let limit = usize::try_from(MAX_BASE_MODEL_CONFIG_BYTES).unwrap();
+    let exact = vec![b' '; limit];
+    fs::write(sb.dir().join("config.json"), &exact).unwrap();
+    expected.insert("config.json".into(), Sha256Digest::of_bytes(&exact));
+    verify_base_model_sha256(&sb.confine(), &expected).unwrap();
+
+    let over = vec![b' '; limit + 1];
+    fs::write(sb.dir().join("config.json"), &over).unwrap();
+    expected.insert("config.json".into(), Sha256Digest::of_bytes(&over));
+    assert_eq!(
+        verify_err(&sb, &expected),
+        (ExitCode::LimitExceeded, "file_size_limit_exceeded")
+    );
+}
+
+/// REQ-41・REQ-39・#628: 許可外の名前は開かずに拒否する（定義の検証を迂回した写像への多層防御）。
+#[test]
+fn req41_issue628_verify_sha256_rejects_disallowed_name() {
+    let sb = Sandbox::new("sha-name");
+    let mut expected = write_base_model(&sb.dir());
+    fs::write(sb.dir().join("pytorch_model.bin"), b"x").unwrap();
+    expected.insert("pytorch_model.bin".into(), Sha256Digest::of_bytes(b"x"));
+    assert_eq!(
+        verify_err(&sb, &expected),
+        (ExitCode::InvalidInput, "base_model_file_name_not_allowed")
+    );
 }

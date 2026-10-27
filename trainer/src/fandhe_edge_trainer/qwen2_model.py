@@ -769,73 +769,95 @@ def load_base_model(
     「読む・照合・解釈・形状 / dtype 検査・変換」（各ファイル後に `resource_budget.check()`）
     -> キー検査 -> モデル構築。
     """
-    weight_names = _check_expected(expected_sha256)
+    _check_expected(expected_sha256)
     if dtype not in _FLOAT_DTYPES:
         raise _invalid_request("dtype must be float16, bfloat16 or float32")
     dir_fd = _open_dir(root, rel_dir)
     try:
-        config_bytes = _read_member(
-            dir_fd,
-            CONFIG_NAME,
-            MAX_BASE_MODEL_CONFIG_BYTES,
-            CONFIG_NAME,
-            expected_sha256[CONFIG_NAME],
-            None,
+        return load_base_model_at(
+            dir_fd, expected_sha256=expected_sha256, dtype=dtype, resource_budget=resource_budget
         )
-        config = Qwen2Config.from_bytes(config_bytes)
-        tokenizer_bytes = _read_member(
-            dir_fd,
-            TOKENIZER_NAME,
-            MAX_TOKENIZER_JSON_BYTES,
-            TOKENIZER_NAME,
-            expected_sha256[TOKENIZER_NAME],
-            None,
-        )
-        tokenizer = Qwen2Tokenizer.from_bytes(tokenizer_bytes)
-        if tokenizer.max_id >= config.vocab_size:
-            raise _invalid_config("tokenizer has ids outside config vocab_size")
-        sizes: list[int] = []
-        for name in weight_names:  # 種類・サイズを読む前に確認する
-            fd, size = _open_member(dir_fd, name, MAX_BASE_MODEL_FILE_BYTES, "weight file")
-            os.close(fd)
-            sizes.append(size)
-        if sum(sizes) > MAX_BASE_MODEL_TOTAL_BYTES:
-            raise limit_error(f"weight files too large: {sum(sizes)} bytes")
-        if (
-            config.estimated_params() * 2 > MAX_BASE_MODEL_TOTAL_BYTES
-            or load_peak_bytes(config, sizes, dtype) > resource_budget.rss_bytes
-        ):
-            raise limit_error("model would exceed the memory budget")
-        shapes = config.expected_shapes()
-        weights: dict[str, mx.array] = {}
-        unknown: set[str] = set()
-        for name, size in zip(weight_names, sizes, strict=True):
-            data = _read_member(
-                dir_fd, name, MAX_BASE_MODEL_FILE_BYTES, "weight file", expected_sha256[name], size
-            )
-            shard = _load_shard(data, "weight file")
-            del data
-            _check_shard_tensors(shard, shapes)
-            if shard.keys() & (weights.keys() | unknown):
-                raise _invalid_data("duplicate weight key across files")
-            for k in list(shard):  # 1 キーずつ変換して元を即解放する
-                if k not in shapes:
-                    del shard[k]  # 後段のキー検査で拒否するため名前だけ残す
-                    unknown.add(k)
-                    continue
-                converted = shard.pop(k).astype(dtype)
-                mx.eval(converted)
-                weights[k] = converted
-                del converted
-            del shard
-            resource_budget.check()
-        _check_keys(config, set(weights) | unknown, "weight files")
-        model = Qwen2Model(config)
-        model.load_weights(list(weights.items()), strict=True)
-        del weights
-        mx.eval(model.parameters())
     finally:
         os.close(dir_fd)
+
+
+def load_base_model_at(
+    dir_fd: int,
+    *,
+    expected_sha256: dict[str, str],
+    dtype: mx.Dtype,
+    resource_budget: ResourceBudget,
+) -> BaseModel:
+    """開いたベースモデルのディレクトリ fd から読む（`load_base_model` の本体。#628）。
+
+    `dir_fd` は呼び出し側が閉じる。メンバーは `dir_fd` 起点の `O_NOFOLLOW` で開く。CLI が
+    `config.base_model_dir` に絶対パスを渡す経路（`guard.resolve_external_dir`）と、`request.root`
+    からの相対パスの経路（`load_base_model`）が共有する。順序と照合は `load_base_model` の doc の
+    とおり。
+    """
+    weight_names = _check_expected(expected_sha256)
+    if dtype not in _FLOAT_DTYPES:
+        raise _invalid_request("dtype must be float16, bfloat16 or float32")
+    config_bytes = _read_member(
+        dir_fd,
+        CONFIG_NAME,
+        MAX_BASE_MODEL_CONFIG_BYTES,
+        CONFIG_NAME,
+        expected_sha256[CONFIG_NAME],
+        None,
+    )
+    config = Qwen2Config.from_bytes(config_bytes)
+    tokenizer_bytes = _read_member(
+        dir_fd,
+        TOKENIZER_NAME,
+        MAX_TOKENIZER_JSON_BYTES,
+        TOKENIZER_NAME,
+        expected_sha256[TOKENIZER_NAME],
+        None,
+    )
+    tokenizer = Qwen2Tokenizer.from_bytes(tokenizer_bytes)
+    if tokenizer.max_id >= config.vocab_size:
+        raise _invalid_config("tokenizer has ids outside config vocab_size")
+    sizes: list[int] = []
+    for name in weight_names:  # 種類・サイズを読む前に確認する
+        fd, size = _open_member(dir_fd, name, MAX_BASE_MODEL_FILE_BYTES, "weight file")
+        os.close(fd)
+        sizes.append(size)
+    if sum(sizes) > MAX_BASE_MODEL_TOTAL_BYTES:
+        raise limit_error(f"weight files too large: {sum(sizes)} bytes")
+    if (
+        config.estimated_params() * 2 > MAX_BASE_MODEL_TOTAL_BYTES
+        or load_peak_bytes(config, sizes, dtype) > resource_budget.rss_bytes
+    ):
+        raise limit_error("model would exceed the memory budget")
+    shapes = config.expected_shapes()
+    weights: dict[str, mx.array] = {}
+    unknown: set[str] = set()
+    for name, size in zip(weight_names, sizes, strict=True):
+        data = _read_member(
+            dir_fd, name, MAX_BASE_MODEL_FILE_BYTES, "weight file", expected_sha256[name], size
+        )
+        shard = _load_shard(data, "weight file")
+        del data
+        _check_shard_tensors(shard, shapes)
+        if shard.keys() & (weights.keys() | unknown):
+            raise _invalid_data("duplicate weight key across files")
+        for k in list(shard):  # 1 キーずつ変換して元を即解放する
+            if k not in shapes:
+                del shard[k]  # 後段のキー検査で拒否するため名前だけ残す
+                unknown.add(k)
+                continue
+            converted = shard.pop(k).astype(dtype)
+            mx.eval(converted)
+            weights[k] = converted
+            del converted
+        del shard
+        resource_budget.check()
+    _check_keys(config, set(weights) | unknown, "weight files")
+    model = Qwen2Model(config)
+    model.load_weights(list(weights.items()), strict=True)
+    del weights
+    mx.eval(model.parameters())
     return BaseModel(
         model=model,
         tokenizer=tokenizer,
