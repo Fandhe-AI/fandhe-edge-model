@@ -244,6 +244,19 @@ pub fn base_model_to_json(p: &BaseModelProvenance) -> String {
 mod tests {
     use super::*;
 
+    /// REQ-41・REQ-40・#628: 定義ファイルの `base_model` 検証（core）と来歴の上限が同じ値である。
+    /// core は data に依存できないため値を複製しており、片方だけ変えるとここで落ちる。
+    #[test]
+    fn req41_issue628_limits_match_definition_base_model() {
+        use fandhe_edge_core::definition as d;
+        assert_eq!(
+            d::BASE_MODEL_NAME_MAX_BYTES,
+            super::super::MODEL_NAME_MAX_BYTES
+        );
+        assert_eq!(d::BASE_MODEL_LICENSE_MAX_BYTES, LICENSE_MAX_BYTES);
+        assert_eq!(d::BASE_MODEL_ORIGIN_MAX_BYTES, ORIGIN_MAX_BYTES);
+    }
+
     fn file(p: &str) -> BaseModelFile {
         BaseModelFile::new(p, 1, Sha256Digest::of_bytes(b""))
     }
