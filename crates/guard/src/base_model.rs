@@ -19,6 +19,11 @@
 //! - サイズ上限は重み（safetensors）が 2 GiB（`split_files::MAX_SHARD_FILE_BYTES`。#655）、
 //!   `tokenizer.json` が 1 GiB（`MAX_READ_FILE_BYTES`）
 //!
+//! - `train --kind qwen2_lora` の起動前照合（#628）は [`verify_base_model_sha256`]。定義の `base_model.sha256` の
+//!   全ファイルを開いて sha256 を比べる。`config.json` は形式の許可リストに無い（JSON の解釈は学習ワーカー）ため、
+//!   名前・経路・サイズ（64 KiB。学習ワーカーの `MAX_BASE_MODEL_CONFIG_BYTES` と同値）だけを確かめてストリームで
+//!   ハッシュする。重み・`tokenizer.json` は [`open_base_model_file`] の検査を通したバイト列をハッシュする
+//!
 //! ponytail: 形式判定のため上限（重み 2 GiB・他 1 GiB）までメモリへ読み切る（`check_open_file` の方式）。
 //! RSS が問題になれば safetensors はヘッダーだけの検査へ切り替える（#435）。
 //! ハードリンクで外部ファイルを指すメンバーは経路では検出できない（必要なら `st_nlink > 1` を拒否）。
@@ -31,9 +36,16 @@ use crate::format::{
 };
 use crate::package::ConfinedPackage;
 use crate::split_files::MAX_SHARD_FILE_BYTES;
+use fandhe_edge_core::definition::BASE_MODEL_CONFIG_FILE;
 use fandhe_edge_core::exitcode::ExitCode;
+use fandhe_edge_core::fs::{FsError, sha256_open_file_bounded};
+use fandhe_edge_core::hash::Sha256Digest;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+
+/// `config.json` の 1 ファイル上限（64 KiB。学習ワーカーの `MAX_BASE_MODEL_CONFIG_BYTES` と同値。#628）。
+pub const MAX_BASE_MODEL_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// ベースモデルのファイルを開く際の拒否理由。
 #[derive(Debug)]
@@ -55,13 +67,15 @@ pub enum BaseModelFileRejection {
         exit_code: ExitCode,
         reason_code: &'static str,
     },
+    /// 実ファイルの sha256 が定義の値と一致しない（#628）。どのファイルかは利用者由来の名前のため持たない。
+    Sha256Mismatch,
 }
 
 impl BaseModelFileRejection {
     /// 終了コード（REQ-21）。名前不許可は `InvalidInput`、他は内包する拒否のもの。
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::NameNotAllowed => ExitCode::InvalidInput,
+            Self::NameNotAllowed | Self::Sha256Mismatch => ExitCode::InvalidInput,
             Self::Path { exit_code, .. } | Self::Format { exit_code, .. } => *exit_code,
             Self::Size(e) => e.exit_code(),
         }
@@ -71,6 +85,7 @@ impl BaseModelFileRejection {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::NameNotAllowed => "base_model_file_name_not_allowed",
+            Self::Sha256Mismatch => "base_model_sha256_mismatch",
             Self::Path { reason_code, .. } | Self::Format { reason_code, .. } => reason_code,
             Self::Size(e) => e.reason_code(),
         }
@@ -84,6 +99,7 @@ impl fmt::Display for BaseModelFileRejection {
             Self::Path { .. } => write!(f, "base model file path was rejected"),
             Self::Size(e) => e.fmt(f),
             Self::Format { .. } => write!(f, "base model file format was rejected"),
+            Self::Sha256Mismatch => write!(f, "base model file sha256 mismatch"),
         }
     }
 }
@@ -142,6 +158,61 @@ pub fn open_base_model_file(
     })
 }
 
+/// 閉じ込め済みのベースモデルのディレクトリで、`expected`（定義の `base_model.sha256`）の全ファイルの sha256 を
+/// 実ファイルと照合する（`train --kind qwen2_lora` が学習ワーカーの起動前・候補ディレクトリの作成前に呼ぶ。
+/// REQ-41・REQ-39・#628）。
+///
+/// 名前順に 1 ファイルずつ開き、最初の拒否で止める。メモリに載せるのは 1 ファイル分だけ（重みは最大 2 GiB）。
+///
+/// # Errors
+/// 欠落・symlink・経路外は `Path`、上限超過は `Size`（20）、形式の不一致は `Format`、`config.json`・
+/// `tokenizer.json`・`*.safetensors` 以外の名前は `NameNotAllowed`、ハッシュの不一致は `Sha256Mismatch`（64）。
+pub fn verify_base_model_sha256(
+    dir: &ConfinedPackage,
+    expected: &BTreeMap<String, Sha256Digest>,
+) -> Result<(), BaseModelFileRejection> {
+    for (name, want) in expected {
+        let member = Path::new(name);
+        let got = if name == BASE_MODEL_CONFIG_FILE {
+            sha256_config(dir, member)?
+        } else {
+            Sha256Digest::of_bytes(open_base_model_file(dir, member)?.as_bytes())
+        };
+        if &got != want {
+            return Err(BaseModelFileRejection::Sha256Mismatch);
+        }
+    }
+    Ok(())
+}
+
+/// `config.json` を閉じ込め付きで開き、64 KiB を上限にストリームで sha256 を計算する（内容は解釈しない）。
+fn sha256_config(
+    dir: &ConfinedPackage,
+    member: &Path,
+) -> Result<Sha256Digest, BaseModelFileRejection> {
+    let file = dir
+        .open_regular_member(member)
+        .map_err(|e| BaseModelFileRejection::Path {
+            exit_code: e.exit_code(),
+            reason_code: e.reason_code(),
+        })?;
+    check_file_size_within(&file, MAX_BASE_MODEL_CONFIG_BYTES)
+        .map_err(BaseModelFileRejection::Size)?;
+    // 検査後の増加は読み進めた累計で検出される（`FsError::TooLarge`）。I/O エラーはパスを保持するため畳む
+    sha256_open_file_bounded(file, member, MAX_BASE_MODEL_CONFIG_BYTES).map_err(|e| match e {
+        FsError::TooLarge { size, limit, .. } => {
+            BaseModelFileRejection::Size(FileSizeRejection::TooLarge { size, limit })
+        }
+        FsError::NotRegularFile { .. } => {
+            BaseModelFileRejection::Size(FileSizeRejection::NotRegularFile)
+        }
+        _ => BaseModelFileRejection::Format {
+            exit_code: ExitCode::RuntimeError,
+            reason_code: "base_model_file_unreadable",
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +255,9 @@ mod tests {
         let e = BaseModelFileRejection::NameNotAllowed;
         assert_eq!(e.exit_code(), ExitCode::InvalidInput);
         assert_eq!(e.reason_code(), "base_model_file_name_not_allowed");
+        let e = BaseModelFileRejection::Sha256Mismatch;
+        assert_eq!(e.exit_code(), ExitCode::InvalidInput);
+        assert_eq!(e.reason_code(), "base_model_sha256_mismatch");
+        assert_eq!(e.to_string(), "base model file sha256 mismatch");
     }
 }
