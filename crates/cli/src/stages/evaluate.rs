@@ -270,7 +270,11 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         // （shard だけが違う候補を台帳が見分ける。REQ-27・#662。`registered_weights_digest` の doc）。
         let mut entry = RegisteredConfig::new(
             prepared.config_id.clone(),
-            registered_weights_digest(&prepared.artifact),
+            registered_weights_digest(
+                &prepared.artifact.onnx_bytes,
+                &prepared.artifact.meta_bytes,
+                &prepared.artifact.meta,
+            ),
         );
         // tokenizer 表現は tokenizer.json の sha256 も代表構成の登録へ結び付ける（登録の完全性のため。REQ-27・
         // #662）。評価器が前後で照合するのは私用ディレクトリへ複製したバイト列で、複製のハッシュは常に一致する
@@ -1084,7 +1088,11 @@ fn apply_to_frozen_data<R>(
         target.config_id.clone(),
         &model,
         // tokenizer 表現だけ識別を明示する（登録時と同じ値。byte は `None` で従来どおりファイルの sha256）。
-        ledger_weights_identity(&target.artifact),
+        ledger_weights_identity(
+            &target.artifact.onnx_bytes,
+            &target.artifact.meta_bytes,
+            &target.artifact.meta,
+        ),
         |bytes| decode_evaluation(bytes, definition).map_err(|_| DecodeFailed),
         // 推論関数へは `input` の列だけが渡る（正解ラベルは評価器側に残る。REQ-27）。
         |_ticket, inputs, paths| {

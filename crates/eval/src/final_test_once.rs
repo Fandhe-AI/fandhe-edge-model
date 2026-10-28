@@ -1380,8 +1380,15 @@ pub fn apply_once_then<T, E, R>(
 /// （`qwen2_lora`）を、台帳が別のモデルとして扱うため。呼び出し側が正準化した入力から 1 か所で計算した値を渡す。
 ///
 /// 識別とファイルの照合は別物で、`model.weights` を含む各構成要素ファイルの評価前後の不変性検証
-/// （[`evaluate_with_invariance`]）は今までどおり行う。`Some` のときは `model.weights` のファイルと識別の
-/// 対応は本関数では確かめない（呼び出し側が、識別の材料と推論に使うファイルの一致を `predict` 内で確かめること）。
+/// （[`evaluate_with_invariance`]）は今までどおり行う。
+///
+/// # 注意（呼び出し側の責任）
+///
+/// `Some` を渡すと、本関数は `model.weights` のファイルと識別の対応を**確かめない**（識別をそのまま信じる）。
+/// 識別の材料と推論に使うファイルが一致していることは、呼び出し側が `predict` の中で自分で照合すること
+/// （`evaluate` はステージングした ONNX の sha256 を照合して `ModelChanged` にしている）。
+/// ファイルの内容がそのまま識別になる経路（byte の c1・c3 など）では必ず `None` を使い、評価器にファイルの
+/// sha256 を照合させること。
 #[allow(clippy::too_many_arguments)]
 pub fn apply_once_then_with_identity<T, E, R>(
     ledger: &FinalTestLedger,

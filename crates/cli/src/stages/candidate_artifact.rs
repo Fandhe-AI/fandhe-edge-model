@@ -288,19 +288,30 @@ fn weights_identity_digest(onnx: &Sha256Digest, artifact_meta: &Sha256Digest) ->
 /// 2 つ目が重みロックで `already evaluated` と誤って断られる。`artifact.json` は各 shard の sha256 を持つので、
 /// 識別へ含めれば shard の違いが識別に出る。ファイルの照合（ステージングした ONNX の `ModelChanged` など）は
 /// 識別とは別に従来どおり行う。
-pub(crate) fn ledger_weights_identity(artifact: &CandidateArtifact) -> Option<Sha256Digest> {
-    is_tokenizer_qwen2(&artifact.meta).then(|| {
+///
+/// 入力は候補の `onnx_bytes`・`artifact.json` のバイト列（`meta_bytes`。`package` が追記する前の候補側のもの）・
+/// その解析結果。`evaluate`（登録と適用）と `package`（評価済みの照会）が同じ関数を使い、識別を 1 か所で決める。
+pub(crate) fn ledger_weights_identity(
+    onnx_bytes: &[u8],
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+) -> Option<Sha256Digest> {
+    is_tokenizer_qwen2(meta).then(|| {
         weights_identity_digest(
-            &Sha256Digest::of_bytes(&artifact.onnx_bytes),
-            &Sha256Digest::of_bytes(&artifact.meta_bytes),
+            &Sha256Digest::of_bytes(onnx_bytes),
+            &Sha256Digest::of_bytes(meta_bytes),
         )
     })
 }
 
 /// 評価台帳へ事前登録する重みの識別（byte は ONNX ファイルの sha256。[`ledger_weights_identity`]）。
-pub(crate) fn registered_weights_digest(artifact: &CandidateArtifact) -> Sha256Digest {
-    ledger_weights_identity(artifact)
-        .unwrap_or_else(|| Sha256Digest::of_bytes(&artifact.onnx_bytes))
+pub(crate) fn registered_weights_digest(
+    onnx_bytes: &[u8],
+    meta_bytes: &[u8],
+    meta: &ArtifactMeta,
+) -> Sha256Digest {
+    ledger_weights_identity(onnx_bytes, meta_bytes, meta)
+        .unwrap_or_else(|| Sha256Digest::of_bytes(onnx_bytes))
 }
 
 /// 容量計測の対象（`(区分, 実パス, fd)`）を列挙する。ONNX と shard は重み、`artifact.json` はメタデータ、
@@ -488,6 +499,32 @@ mod tests {
             weights_identity_digest(&meta_a, &onnx)
         );
         assert_ne!(weights_identity_digest(&onnx, &meta_a), onnx);
+    }
+
+    /// REQ-27・#662: 台帳へ登録・照会する重みの識別は、byte（c1・c3）では従来どおり ONNX の sha256 のままで値が
+    /// 変わらず、tokenizer 表現（`qwen2_lora`）だけ ONNX と `artifact.json` から求めた値になる。
+    #[test]
+    fn req27_issue662_registered_digest_is_unchanged_for_byte_kinds() {
+        let tokenizer = r#","input_representation":"tokenizer""#;
+        let onnx_digest = Sha256Digest::of_bytes(b"onnx");
+        for kind_meta in [meta("c1", ""), meta("c3", "")] {
+            assert_eq!(ledger_weights_identity(b"onnx", b"meta", &kind_meta), None);
+            assert_eq!(
+                registered_weights_digest(b"onnx", b"meta", &kind_meta),
+                onnx_digest
+            );
+        }
+        let qwen2 = meta("qwen2_lora", tokenizer);
+        let identity = registered_weights_digest(b"onnx", b"meta", &qwen2);
+        assert_ne!(identity, onnx_digest);
+        assert_eq!(
+            Some(identity),
+            ledger_weights_identity(b"onnx", b"meta", &qwen2)
+        );
+        assert_ne!(
+            identity,
+            registered_weights_digest(b"onnx", b"other", &qwen2)
+        );
     }
 
     /// REQ-27・#662: fixture の `qwen2_lora` 成果物で、`model.onnx` が同じまま shard の sha256（`artifact.json`）

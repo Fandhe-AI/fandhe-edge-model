@@ -151,7 +151,7 @@ use crate::project::{
 use super::baseline::{PreparedBaseline, prepare_baseline, record_matches};
 use super::candidate_artifact::{
     ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
-    verify_vocab_file,
+    registered_weights_digest, verify_vocab_file,
 };
 
 use super::infer::build_pipeline;
@@ -288,7 +288,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
                 // majority・必要件数は train 分割と定義から計算し直す（評価データは渡さない。#339）。
                 prepare_baseline(&definition, &records, &split)?,
             ),
-            &meta_bytes,
+            (&meta_bytes, &meta),
             &onnx_bytes,
             &format!("{}:seed{}", candidate.candidate_id, seed),
         )?),
@@ -739,7 +739,7 @@ fn verify_evaluation_record(
     (selection, selection_sha256): (&SelectionRecord, &Sha256Digest),
     (freeze, eval_bytes): (&FreezeRecord, &[u8]),
     (definition, baseline): (&Definition, Option<PreparedBaseline>),
-    meta_bytes: &[u8],
+    (meta_bytes, meta): (&[u8], &ArtifactMeta),
     onnx_bytes: &[u8],
     config_id: &str,
 ) -> Result<EvaluationRecord, ErrorReport> {
@@ -797,13 +797,15 @@ fn verify_evaluation_record(
     // この評価データ × 代表構成 × 重みの適用完了を記録していることを必ず照合する（REQ-27）。
     let config_id =
         RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
-    let onnx_digest = Sha256Digest::of_bytes(onnx_bytes);
+    // 台帳が見分ける重みの識別は `evaluate` の登録と同じ関数で求める（byte は ONNX の sha256、tokenizer 表現は
+    // ONNX と `artifact.json` から。REQ-27・#662）。
+    let weights_digest = registered_weights_digest(onnx_bytes, meta_bytes, meta);
     let Some(held) = HeldLedger::open(project, false)? else {
         return Err(invalid("evaluation has not been completed"));
     };
     let applied = held
         .ledger()
-        .is_applied(&freeze.sha256(), &config_id, &onnx_digest)
+        .is_applied(&freeze.sha256(), &config_id, &weights_digest)
         .map_err(|e| acquire_error_report(&e))?;
     if !applied {
         return Err(invalid("evaluation has not been completed"));
