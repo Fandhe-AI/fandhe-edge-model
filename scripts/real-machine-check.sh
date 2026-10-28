@@ -402,4 +402,16 @@ set -- run \
 [ -z "${bin:-}" ] || set -- "$@" --bin "$bin" --bin-override
 [ "$quiet" -eq 0 ] || set -- "$@" --quiet-machine
 [ "$with_ci" -eq 0 ] || set -- "$@" --with-ci
+# python 3.12 は閉じた fd 1 を /dev/null に開き直すため、record 側の emit は stdout の閉塞を
+# 検出できず 0 を返す。起動前にシェル側で fd 1 を確かめ、閉じていれば環境変数で emit に
+# 伝えて 70（runtime_error）にさせる（record は emit の前に書き終える。REQ-21・#676）。
+# bash/dash とも閉じた fd への `>&1` は成功扱いになるため、/dev/fd/1 の有無で判定する。
+# exec を保つのはシグナルを python が直接受けるため。
+if [ ! -e /dev/fd/1 ]; then
+  FANDHE_RMC_STDOUT_CLOSED=1
+  export FANDHE_RMC_STDOUT_CLOSED
+else
+  # 外から持ち込まれた値で誤って 70 にしない
+  unset FANDHE_RMC_STDOUT_CLOSED
+fi
 exec python3 -I "$root/scripts/real_machine_check_record.py" "$@"
