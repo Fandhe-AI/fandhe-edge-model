@@ -187,7 +187,7 @@ use super::previous_comparison::{PreparedPrevious, current_correctness, prepare_
 use super::reproducibility::{OwnRun, SeedRuns, check_run_count, load_seed_runs};
 use super::select::compute_selection;
 use super::train::{
-    allotted_time_limit, candidate_rel, effective_train_seed, load_trained,
+    allotted_time_limit, candidate_rel, effective_train_seed, load_trained, recorded_device,
     request_is_smoke_trained, request_matches_candidate, resolve_candidates, train_rows,
     verified_split,
 };
@@ -490,7 +490,7 @@ fn prepare_candidate(
         index,
         seed,
         explicit_kinds,
-        Device::Cpu,
+        recorded_device(project, index)?,
     )?;
     let candidate = candidates
         .get(index)

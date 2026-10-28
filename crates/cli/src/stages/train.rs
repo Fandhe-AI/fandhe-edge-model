@@ -155,8 +155,8 @@ use crate::args::TrainArgs;
 use crate::error_report::{ToErrorReport, train_outcome_error_report};
 use crate::project::{
     CANCEL_REQUEST_FILE, CANDIDATES_DIR, CreatedDir, DEFAULT_MAX_BYTES, JOB_DIR, MODEL_DIR,
-    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_INPUT_FILE,
-    TRAIN_SEED_FILE, fail, invalid, runtime,
+    Project, REQUEST_FILE, RESULT_FILE, SEARCH_RECORD_FILE, SPLIT_FILE, TRAIN_DEVICE_FILE,
+    TRAIN_INPUT_FILE, TRAIN_SEED_FILE, fail, invalid, runtime,
 };
 
 /// 学習ワーカーのディレクトリ（`launch.py` と `.venv`）を指す環境変数。絶対パスのみ受理する。
@@ -987,6 +987,10 @@ fn prepare_candidate_dir(
     if let Some(seed) = train_seed_override {
         project.write_new(rel.join(TRAIN_SEED_FILE), seed.to_string().as_bytes())?;
     }
+    // 実行デバイスは request.json とは別に記録し、下流が両者の一致を要求する（#665）。cpu は作らない。
+    if request.device() == Device::Gpu {
+        project.write_new(rel.join(TRAIN_DEVICE_FILE), b"gpu")?;
+    }
     Ok(job_dir)
 }
 
@@ -1476,6 +1480,23 @@ pub fn effective_train_seed(
         .ok_or_else(|| invalid("train seed record is invalid"))
 }
 
+/// 候補 `index` の学習時の実行デバイスを `train_device.txt` から返す。記録が無い候補（cpu で学習した候補・
+/// #665 以前の候補）は cpu。`evaluate`・`select`・`package` が期待する学習リクエストの device に使い、
+/// `request.json` の device 単独の書き換えを [`request_matches_candidate`] で弾く（REQ-27・REQ-41・#665）。
+///
+/// # Errors
+/// 記録が `gpu` 以外の場合は `invalid_input`（64。fail-closed）。
+pub fn recorded_device(project: &Project, index: usize) -> Result<Device, ErrorReport> {
+    match project
+        .read_optional(candidate_rel(index).join(TRAIN_DEVICE_FILE), 8)?
+        .as_deref()
+    {
+        None => Ok(Device::Cpu),
+        Some(b"gpu") => Ok(Device::Gpu),
+        Some(_) => Err(invalid("train device record is invalid")),
+    }
+}
+
 /// `split.json` を読んで解析する（検証はしない。`package` が記録済みの seed を取り出すのにも使う）。
 ///
 /// # Errors
@@ -1574,6 +1595,10 @@ pub fn build_train_request(
 /// `root`・`out_dir` を含む）。`root` は絶対パスで記録されるので、プロジェクトのディレクトリを
 /// 移動すると一致せず拒否される（fail-closed として許容する）。
 ///
+/// `device` は例外にせず厳密に比べる: 呼び出し元が `params` の device に [`recorded_device`]（`train` が
+/// request とは別に書く `train_device.txt`）を渡す。request.json か記録のどちらか片方だけの書き換えは
+/// 不一致で拒否される（両方を書き換えれば通る。他の記録の束縛と同水準。#665）。
+///
 /// **例外は `epochs` と `base_model_dir` の 2 か所だけ**: `epochs` は `train --smoke` が 1 へ上書きする項目のため、
 /// 期待値の `epochs` を保存済みリクエストの値に揃えてから比べる（smoke かどうかは別に
 /// [`request_is_smoke_trained`] で判定する）。`base_model_dir`（`qwen2_lora` の候補に限る。#628）は
@@ -1596,9 +1621,6 @@ pub fn request_matches_candidate(
     if allotted_time_limit.is_some() {
         expected_params.time_limit_seconds = allotted_time_limit;
     }
-    // 実行デバイス（#665）は同一性ではなく記録値（再現性の比較は `reproducibility` が device も見る）のため、
-    // 保存値を期待値へ写す。`select`・`package` 等は `train --device` を知らない。
-    expected_params.device = request.device();
     match request.config().get("epochs") {
         Some(epochs) => {
             expected_params

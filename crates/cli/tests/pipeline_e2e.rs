@@ -560,7 +560,47 @@ mod suite {
         let text = std::fs::read_to_string(gpu.project_file("candidates/0/request.json"))
             .expect("request.json");
         assert!(text.contains("\"device\":\"gpu\""), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(gpu.project_file("candidates/0/train_device.txt"))
+                .expect("train_device.txt"),
+            "gpu"
+        );
+        assert!(!env.project_file("candidates/0/train_device.txt").exists());
+        // request 側だけ、または記録側だけの書き換えは、どちらも拒否される（#665）。
+        let request = gpu.project_file("candidates/0/request.json");
+        let record = gpu.project_file("candidates/0/train_device.txt");
+        let original = std::fs::read_to_string(&request).expect("request.json");
+        let mismatch = "{\"code\":\"invalid_input\",\"message\":\"train request does not match the candidate\"}\n";
+        let rejects = |stage: &str, label: &str| {
+            assert_eq!(
+                gpu.fails(&[stage, "--project-dir", "proj"], 64, "invalid_input"),
+                mismatch,
+                "{stage} {label}"
+            );
+        };
+        std::fs::write(
+            &request,
+            original.replacen("\"device\":\"gpu\"", "\"device\":\"cpu\"", 1),
+        )
+        .expect("tamper request");
+        rejects("select", "request only");
+        std::fs::write(&request, &original).expect("restore request");
+        std::fs::remove_file(&record).expect("remove record");
+        rejects("select", "record only");
+        std::fs::write(&record, "tpu").expect("invalid record");
+        gpu.fails(&["select", "--project-dir", "proj"], 64, "invalid_input");
+        std::fs::write(&record, "gpu").expect("restore record");
         gpu.ok(&["select", "--project-dir", "proj"]);
+        std::fs::write(
+            &request,
+            original.replacen("\"device\":\"gpu\"", "\"device\":\"cpu\"", 1),
+        )
+        .expect("tamper request");
+        rejects("package", "request only");
+        std::fs::write(&request, &original).expect("restore request");
+        std::fs::remove_file(&record).expect("remove record");
+        rejects("package", "record only");
+        std::fs::write(&record, "gpu").expect("restore record");
         gpu.ok(&["package", "--project-dir", "proj"]);
         for bad in [
             vec!["--device", "tpu"],
@@ -585,7 +625,8 @@ mod suite {
         let request = env.project_file("candidates/0/request.json");
         let original = std::fs::read_to_string(&request).expect("request.json");
         let tampers = [
-            // `device` は `train --device`（#665）の記録値として保存値を受理するため、ここでは改ざん扱いしない。
+            // cpu で学習した候補（`train_device.txt` なし）の request だけを gpu へ書き換える（#665）。
+            ("device", "\"device\":\"cpu\"", "\"device\":\"gpu\""),
             // 既定の時間制限は JSON に出ないため、非既定の値（1 秒）を先頭に加える。
             ("time limit", "{", "{\"time_limit_seconds\":1,"),
             (

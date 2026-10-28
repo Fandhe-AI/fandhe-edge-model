@@ -307,7 +307,14 @@ def run_worker_train(out_fd: int) -> ExitCode:
     raw = _read_request_from_stdin()
     parsed = contract.parse_request_bytes(raw)
     request = contract.validate_request(parsed)
+    # qwen2_lora だけ、学習・validation 予測・ONNX 書き出しの全体で MLX のキャッシュ上限を掛ける
+    # （後段でキャッシュが無制限に戻り RSS 上限を超えるのを防ぐ。REQ-41・REQ-39・#665）。
+    exit_stack = contextlib.ExitStack()
     try:
+        if request.kind == "qwen2_lora":
+            from .kinds.qwen2_lora import mlx_cache_limited
+
+            exit_stack.enter_context(mlx_cache_limited())
         _apply_rlimit_cpu_backstop(request.time_limit_seconds)
         resource_budget = budget_mod.ResourceBudget(
             wall_seconds=float(request.time_limit_seconds),
@@ -368,6 +375,7 @@ def run_worker_train(out_fd: int) -> ExitCode:
         )
         artifact_mod.write_artifact(out_fd, art)
     finally:
+        exit_stack.close()
         request.close_resources()
 
     payload: dict[str, object] = {

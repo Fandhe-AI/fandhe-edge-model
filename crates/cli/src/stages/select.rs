@@ -58,8 +58,8 @@ use super::candidate_artifact::{
 };
 use super::infer::load_backend;
 use super::train::{
-    allotted_time_limit, effective_train_seed, load_trained, request_matches_candidate,
-    resolve_candidates, verified_split,
+    allotted_time_limit, effective_train_seed, load_trained, recorded_device,
+    request_matches_candidate, resolve_candidates, verified_split,
 };
 
 /// `select` を実行する。
@@ -217,8 +217,9 @@ pub fn compute_selection_with_exclusions(
     let candidates = (0..candidate_count)
         .map(|i| {
             let seed = effective_train_seed(project, i, split_seed)?;
+            let device = recorded_device(project, i)?;
             let mut all =
-                resolve_candidates(project, definition, i, seed, &explicit_kinds, Device::Cpu)?;
+                resolve_candidates(project, definition, i, seed, &explicit_kinds, device)?;
             if i < all.len() {
                 Ok(all.swap_remove(i))
             } else {

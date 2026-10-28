@@ -29,12 +29,13 @@ mlx は関数内で遅延 import する（選択口の import を軽く保つ）
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import random
 import sys
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any
 
@@ -335,6 +336,22 @@ def _build_sequences(
 #: 計算内容は変わらない。PoC（`tools/poc26/cli.py::CACHE_LIMIT_BYTES`）と同値。#665。
 MLX_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 
+
+@contextlib.contextmanager
+def mlx_cache_limited() -> Iterator[None]:
+    """qwen2_lora のワーカー処理全体（学習・予測・書き出し）で MLX の cache 上限を掛ける。
+
+    `cli.py` の train ワーカーが qwen2_lora のときだけ使う。抜けるときに元の上限へ戻す（#665）。
+    """
+    import mlx.core as mx
+
+    prev = mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(prev)
+
+
 #: 進捗を stderr へ出すステップ間隔（最終ステップも出す）。
 PROGRESS_EVERY_STEPS = 10
 
@@ -529,77 +546,73 @@ class Qwen2LoraKind:
         from ..qwen2_model import apply_lora, load_base_model, load_base_model_at
 
         resource_budget.include_mlx_peak = True
-        prev_cache_limit = mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
-        try:
-            mx.set_default_device(mx.gpu if request.device == "gpu" else mx.cpu)
-            _seed_all(request.seed)
-            if len(examples) < cfg["batch_size"]:
-                raise WorkerError(
-                    "invalid_data",
-                    "fewer training examples than batch_size",
-                    ExitCode.INVALID_INPUT,
-                )
-            dtype = mx.bfloat16 if cfg["dtype"] == "bfloat16" else mx.float32
-            load_args = {
-                "expected_sha256": cfg["base_model_sha256"],
-                "dtype": dtype,
-                "resource_budget": resource_budget,
-            }
-            if os.path.isabs(cfg["base_model_dir"]):
-                with guard.resolve_external_dir(cfg["base_model_dir"], "base_model_dir") as h:
-                    base = load_base_model_at(h.fd, **load_args)
-            else:
-                base = load_base_model(request.root, cfg["base_model_dir"], **load_args)
-            c = base.config
-            if cfg["max_seq_length"] > c.max_position_embeddings:
-                raise _invalid_config(
-                    f"max_seq_length exceeds the model's max_position_embeddings "
-                    f"({c.max_position_embeddings})"
-                )
-            logits_elements = cfg["batch_size"] * cfg["max_seq_length"] * c.vocab_size
-            if logits_elements > limits.MAX_LOSS_LOGITS_ELEMENTS:
-                raise WorkerError(
-                    "limit_exceeded",
-                    "batch_size x max_seq_length x vocab exceeds the memory limit",
-                    ExitCode.LIMIT_EXCEEDED,
-                )
-            seqs, pad_id = _build_sequences(
-                examples, request, base.tokenizer, cfg, c.vocab_size, resource_budget
+        mx.set_default_device(mx.gpu if request.device == "gpu" else mx.cpu)
+        _seed_all(request.seed)
+        if len(examples) < cfg["batch_size"]:
+            raise WorkerError(
+                "invalid_data",
+                "fewer training examples than batch_size",
+                ExitCode.INVALID_INPUT,
             )
-            apply_lora(
-                base.model,
-                num_layers=cfg["lora_num_layers"],
-                rank=cfg["lora_rank"],
-                scale=float(cfg["lora_scale"]),
-                dropout=float(cfg["lora_dropout"]),
-                seed=request.seed,
-                rss_bytes=resource_budget.rss_bytes,
-                activation_bytes=_activation_bytes(c, cfg),
+        dtype = mx.bfloat16 if cfg["dtype"] == "bfloat16" else mx.float32
+        load_args = {
+            "expected_sha256": cfg["base_model_sha256"],
+            "dtype": dtype,
+            "resource_budget": resource_budget,
+        }
+        if os.path.isabs(cfg["base_model_dir"]):
+            with guard.resolve_external_dir(cfg["base_model_dir"], "base_model_dir") as h:
+                base = load_base_model_at(h.fd, **load_args)
+        else:
+            base = load_base_model(request.root, cfg["base_model_dir"], **load_args)
+        c = base.config
+        if cfg["max_seq_length"] > c.max_position_embeddings:
+            raise _invalid_config(
+                f"max_seq_length exceeds the model's max_position_embeddings "
+                f"({c.max_position_embeddings})"
             )
-            loss, done = _train_loop(
-                base.model,
-                seqs,
-                pad_id=pad_id,
-                cfg=cfg,
-                seed=request.seed,
-                resource_budget=resource_budget,
+        logits_elements = cfg["batch_size"] * cfg["max_seq_length"] * c.vocab_size
+        if logits_elements > limits.MAX_LOSS_LOGITS_ELEMENTS:
+            raise WorkerError(
+                "limit_exceeded",
+                "batch_size x max_seq_length x vocab exceeds the memory limit",
+                ExitCode.LIMIT_EXCEEDED,
             )
-            return Qwen2LoraTrainedModel(
-                config=cfg,
-                label_order=list(request.label_order),
-                max_bytes=request.max_bytes,
-                model=base.model,
-                tokenizer=base.tokenizer,
-                base_file_sha256=base.file_sha256,
-                final_loss=loss,
-                iters_done=done,
-                seed=request.seed,
-                resource_budget=resource_budget,
-                tokenizer_bytes=base.tokenizer_bytes,
-                base_file_sizes=dict(base.file_sizes),
-            )
-        finally:
-            mx.set_cache_limit(prev_cache_limit)
+        seqs, pad_id = _build_sequences(
+            examples, request, base.tokenizer, cfg, c.vocab_size, resource_budget
+        )
+        apply_lora(
+            base.model,
+            num_layers=cfg["lora_num_layers"],
+            rank=cfg["lora_rank"],
+            scale=float(cfg["lora_scale"]),
+            dropout=float(cfg["lora_dropout"]),
+            seed=request.seed,
+            rss_bytes=resource_budget.rss_bytes,
+            activation_bytes=_activation_bytes(c, cfg),
+        )
+        loss, done = _train_loop(
+            base.model,
+            seqs,
+            pad_id=pad_id,
+            cfg=cfg,
+            seed=request.seed,
+            resource_budget=resource_budget,
+        )
+        return Qwen2LoraTrainedModel(
+            config=cfg,
+            label_order=list(request.label_order),
+            max_bytes=request.max_bytes,
+            model=base.model,
+            tokenizer=base.tokenizer,
+            base_file_sha256=base.file_sha256,
+            final_loss=loss,
+            iters_done=done,
+            seed=request.seed,
+            resource_budget=resource_budget,
+            tokenizer_bytes=base.tokenizer_bytes,
+            base_file_sizes=dict(base.file_sizes),
+        )
 
     def export_onnx(
         self,

@@ -502,6 +502,7 @@ fn drain_capped<R: Read>(mut reader: R, cap: usize) -> DrainedOutput {
 /// 進捗行として親の stderr へ転送する行の接頭辞（`kinds/qwen2_lora.py` の進捗行。#665）。
 pub const PROGRESS_LINE_PREFIX: &[u8] = b"qwen2_lora: step ";
 /// 転送する 1 行の長さ上限（超過分は切る）。
+#[cfg(unix)]
 const PROGRESS_LINE_MAX_BYTES: usize = 256;
 
 /// ワーカーの stderr を読みつつ、`qwen2_lora: step ` で始まる行だけを `sink` へ 1 行ずつ
@@ -509,12 +510,14 @@ const PROGRESS_LINE_MAX_BYTES: usize = 256;
 /// 保持・上限の挙動は変わらない。他の行（データ由来の文字列を含みうる）は転送しない。
 /// 転送する行は印字可能 ASCII 以外（制御文字・ANSI・非 UTF-8）を `?` に置換し、行末の `\r` は落とす。
 /// 転送失敗は無視する（進捗は診断用で、学習の成否に影響させない）。REQ-39・#665。
+#[cfg(unix)]
 struct ProgressTee<R, W> {
     inner: R,
     sink: W,
     line: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl<R: Read, W: Write> Read for ProgressTee<R, W> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
@@ -2052,6 +2055,7 @@ pub fn run_train(
 #[cfg(test)]
 mod tests {
     /// REQ-39・#665: 進捗行（接頭辞つき）だけが転送され、他の行は転送されず、読み取り結果は不変。
+    #[cfg(unix)]
     #[test]
     fn progress_tee_forwards_only_prefixed_lines() {
         let input: &[u8] =
@@ -2072,6 +2076,7 @@ mod tests {
     }
 
     /// 1 byte ずつ read させて ProgressTee の転送結果を返す（複数 read にまたがる行の検証用）。
+    #[cfg(unix)]
     fn tee_bytewise(input: &[u8]) -> Vec<u8> {
         struct OneByte<'a>(&'a [u8]);
         impl std::io::Read for OneByte<'_> {
@@ -2098,6 +2103,7 @@ mod tests {
 
     /// REQ-39・#665: 制御文字・ANSI・非 UTF-8 は `?` に置換、`\r\n` の `\r` は落ちる、改行無しの末尾は転送しない、
     /// 256 B 超の行は切り詰め、複数 read にまたがる行も転送される。
+    #[cfg(unix)]
     #[test]
     fn progress_tee_sanitizes_truncates_and_handles_split_reads() {
         let out = tee_bytewise(b"qwen2_lora: step 1/2 \x1b[31m\xff\x00x\r\n");

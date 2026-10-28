@@ -378,3 +378,16 @@ def test_instruction_max_bytes_matches_rust_definition() -> None:
     src = (Path(__file__).parents[2] / "crates/core/src/definition.rs").read_text(encoding="utf-8")
     assert f"pub const INSTRUCTION_MAX_BYTES: usize = {q.INSTRUCTION_MAX_BYTES};" in src
     assert q.INSTRUCTION_MAX_BYTES == 1024
+
+
+def test_req41_issue665_cache_limit_wraps_worker_and_restores() -> None:
+    """REQ-41・REQ-39・#665: `mlx_cache_limited` の間だけ cache 上限が 512 MiB で、抜けると戻る。"""
+    before = mx.set_cache_limit(0)
+    try:
+        with q.mlx_cache_limited():
+            inside = mx.set_cache_limit(0)
+            mx.set_cache_limit(inside)
+        assert inside == q.MLX_CACHE_LIMIT_BYTES
+        assert mx.set_cache_limit(before) == 0
+    finally:
+        mx.set_cache_limit(before)
