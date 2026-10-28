@@ -798,8 +798,8 @@ fn verify_evaluation_record(
     let config_id =
         RepresentativeConfigId::parse(config_id).map_err(|e| acquire_error_report(&e))?;
     // 台帳が見分ける重みの識別は `evaluate` の登録と同じ関数で求める（byte は ONNX の sha256、tokenizer 表現は
-    // ONNX と `artifact.json` から。REQ-27・#662）。
-    let weights_digest = registered_weights_digest(onnx_bytes, meta_bytes, meta);
+    // ONNX・tokenizer.json・各 shard の sha256 から。REQ-27・#662）。
+    let weights_digest = registered_weights_digest(onnx_bytes, meta_bytes, meta)?;
     let Some(held) = HeldLedger::open(project, false)? else {
         return Err(invalid("evaluation has not been completed"));
     };

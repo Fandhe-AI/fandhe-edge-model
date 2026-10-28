@@ -266,15 +266,15 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         else {
             continue;
         };
-        // 重みの識別は byte が ONNX の sha256、tokenizer 表現が ONNX と `artifact.json` から求めた値
-        // （shard だけが違う候補を台帳が見分ける。REQ-27・#662。`registered_weights_digest` の doc）。
+        // 重みの識別は byte が ONNX の sha256、tokenizer 表現が ONNX・tokenizer.json・各 shard の sha256 から
+        // 求めた値（重みの中身だけで決める。REQ-27・#662。`ledger_weights_identity` の doc）。
         let mut entry = RegisteredConfig::new(
             prepared.config_id.clone(),
             registered_weights_digest(
                 &prepared.artifact.onnx_bytes,
                 &prepared.artifact.meta_bytes,
                 &prepared.artifact.meta,
-            ),
+            )?,
         );
         // tokenizer 表現は tokenizer.json の sha256 も代表構成の登録へ結び付ける（登録の完全性のため。REQ-27・
         // #662）。評価器が前後で照合するのは私用ディレクトリへ複製したバイト列で、複製のハッシュは常に一致する
@@ -1105,7 +1105,7 @@ fn apply_to_frozen_data<R>(
             &target.artifact.onnx_bytes,
             &target.artifact.meta_bytes,
             &target.artifact.meta,
-        ),
+        )?,
         |bytes| decode_evaluation(bytes, definition).map_err(|_| DecodeFailed),
         // 推論関数へは `input` の列だけが渡る（正解ラベルは評価器側に残る。REQ-27）。
         |_ticket, inputs, paths| {
