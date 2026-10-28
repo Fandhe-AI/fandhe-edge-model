@@ -174,6 +174,39 @@ fn req20_same_definition_is_unchanged() {
     assert!(e.exists("proj/definition.json"));
 }
 
+/// REQ-20・#670: `instruction` だけを足した新定義は `required`（理由は `instruction_changed` のみ）。
+#[test]
+fn req20_instruction_only_change_is_required() {
+    let e = Env::new("instruction");
+    e.register_old("v1_9.json", TRAIN_A, None);
+    e.source("new", "v1_9.json", TRAIN_A, None);
+    let text = std::fs::read_to_string(Path::new(FIXTURES).join("v1_9.json")).expect("fixture");
+    let new_text = text.replacen(
+        r#""io": { "input": "bytes" }"#,
+        r#""io": { "input": "bytes" }, "instruction": "Pick the tool.""#,
+        1,
+    );
+    assert_ne!(text, new_text);
+    std::fs::write(e.0.join("new/def.json"), &new_text).expect("write def");
+    let new_hash = Definition::parse(&new_text)
+        .expect("definition")
+        .canonical_hash()
+        .expect("hash")
+        .to_hex();
+    let o = e.register_new("proj", "oldproj");
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let rebuild = format!(
+        "{{\"decision\":\"required\",\"previous_definition_sha256\":\"{}\",\"reasons\":[{{\"kind\":\"instruction_changed\"}}],\"display_name_changed\":[],\"description_changed\":[],\"training_data_changed\":false,\"evaluation_data_changed\":null}}",
+        hash("v1_9.json")
+    );
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "{{\"step\":\"register\",\"status\":\"ok\",\"definition_sha256\":\"{new_hash}\",\"options\":9,\"evaluation_defined\":false,\"rebuild\":{rebuild}}}\n"
+        )
+    );
+}
+
 /// REQ-20 P5: 判定型 `multi_select` の新定義は読み込みで 64（判定しない）。
 #[test]
 fn req20_multi_select_new_definition_is_invalid() {
