@@ -266,11 +266,10 @@ fn sha256_safetensors_stream<R: std::io::Read>(
     if end as u64 > size {
         return Err(not_allowed());
     }
-    let mut prefix = vec![0u8; end];
-    prefix[..8].copy_from_slice(&first8);
-    reader
-        .read_exact(&mut prefix[8..])
-        .map_err(|e| read_failed(&e))?;
+    let mut prefix = first8.to_vec();
+    prefix.resize(end, 0);
+    let rest = prefix.get_mut(first8.len()..).ok_or_else(not_allowed)?;
+    reader.read_exact(rest).map_err(|e| read_failed(&e))?;
     check_safetensors_prefix(&prefix, size).map_err(|_| not_allowed())?;
     hasher.update(&prefix);
     let mut total = end as u64;
@@ -282,7 +281,7 @@ fn sha256_safetensors_stream<R: std::io::Read>(
             break;
         }
         total += n as u64;
-        hasher.update(&buf[..n]);
+        hasher.update(buf.get(..n).ok_or_else(not_allowed)?);
     }
     if total > limit {
         return Err(BaseModelFileRejection::Format {
