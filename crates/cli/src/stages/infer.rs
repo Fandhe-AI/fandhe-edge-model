@@ -575,7 +575,7 @@ fn load_calibration(
 
 /// 推論できない入力表現を拒否する（byte 前処理で黙って推論すると誤った予測になるため。
 /// REQ-41・TASK-41.3-1・#402）。通すのは byte と、tokenizer かつ `qwen2_lora`（[`build_qwen2_pipeline`]。
-/// `infer` は #626、`select`・`evaluate` は #662 で接続）。`package` の tokenizer 経路は #662-b で接続する。
+/// `infer` は #626、`select`・`evaluate`・`package` は #662 で接続）。
 pub(crate) fn check_input_representation(meta: &ArtifactMeta) -> Result<(), ErrorReport> {
     if meta.input_representation() == PackageInputRepresentation::Byte || is_tokenizer_qwen2(meta) {
         Ok(())

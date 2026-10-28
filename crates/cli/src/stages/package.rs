@@ -15,7 +15,10 @@
 //!    を再検証つきで読み戻す（[`super::train::load_trained`]）。記録の `candidate_id`・添字の既定候補・
 //!    学習リクエストの `kind` の一致も確認する
 //! 2. 選定候補の学習ワーカー出力（`artifact.json`・ONNX ファイル）と登録済みの `definition.json`
-//!    （選択肢表）をステージングへ新規コピーする（既存の `package/` は拒否。上書きしない）
+//!    （選択肢表）をステージングへ新規コピーする（既存の `package/` は拒否。上書きしない）。
+//!    tokenizer 表現（`qwen2_lora`）は `artifact.json` の参照欄どおりに `tokenizer.json`（語彙・特徴量変換の区分）と
+//!    外部データの shard（重みの区分）も複写し、複写後に記録の sha256 を再照合する（shard は流し読み。
+//!    計測の 1 ファイル上限は shard の上限。REQ-41・REQ-39・#662）
 //! 3. `artifact.json` の `onnx_sha256` とコピーした ONNX の sha256 の一致、および `kind`・
 //!    `label_order`・`max_bytes` の定義・選定候補との一致を確認する
 //!    （パッケージの自己整合性。**外部台帳による完全性検証〔#168〕の代替ではない**）
@@ -92,15 +95,17 @@
 //! 改変（読み取り専用を外して全体を書き直すこと）は検出しない（#491 の契約で範囲外）。
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use fandhe_edge_core::artifact_meta::ArtifactMeta;
 use fandhe_edge_core::artifact_meta::MAX_ARTIFACT_META_BYTES;
+use fandhe_edge_core::artifact_meta::TokenizerPackageRefs;
 use fandhe_edge_core::definition::{Definition, Limits, MAX_DEFINITION_FILE_BYTES};
 use fandhe_edge_core::evaluation_record::{EvaluationRecord, MAX_EVALUATION_RECORD_BYTES};
 use fandhe_edge_core::exitcode::ErrorReport;
-use fandhe_edge_core::hash::Sha256Digest;
+use fandhe_edge_core::fs::FsError;
+use fandhe_edge_core::hash::{Sha256Digest, Sha256Stream};
 use fandhe_edge_core::package_calibration::{PACKAGE_CALIBRATION_FILE, PackageCalibration};
 use fandhe_edge_core::stage_report::{
     InferP95, PackageCapacity, PackageCapacityComponents, PackageComponentSize, PackageMetrics,
@@ -114,7 +119,8 @@ use fandhe_edge_eval::acceptance::{AcceptanceVerdict, judge_min_accuracy};
 use fandhe_edge_eval::calibration::{TEMPERATURE_MAX, TEMPERATURE_MIN};
 use fandhe_edge_eval::final_test_once::RepresentativeConfigId;
 use fandhe_edge_eval::weights_identity::weights_identity_from_bytes;
-use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
+use fandhe_edge_guard::format::check_bytes;
+use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
 use fandhe_edge_guard::version_ledger::{ArtifactKind, CreatedAt, VersionId, VersionLedger};
 use fandhe_edge_runtime::capacity::{
     CapacityBreakdown, MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
@@ -137,25 +143,27 @@ use fandhe_edge_runtime::pipeline::{
     InferencePipeline, MAX_INFER_BATCH_LEN, MAX_INFER_BATCH_TOTAL_BYTES, Preprocessor,
     ScoringBackend,
 };
+use fandhe_edge_runtime::tokenizer::MAX_TOKENIZER_JSON_BYTES;
 use fandhe_edge_runtime::vocab_exclusion::VOCAB_FILE_NAME;
 use fandhe_edge_train::result::TrainOutcome;
 use fandhe_edge_train::stage_files::SelectionRecord;
 
 use crate::args::PackageArgs;
 use crate::error_report::{ToErrorReport, acquire_error_report};
+use crate::infer_guard::format_allowlist_for;
 use crate::project::{
     CreatedDir, DATA_DIR, DEFINITION_FILE, EVALUATION_RECORD_FILE, MAX_PROJECT_FILE_BYTES,
-    PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE, TRAIN_DATA_FILE, inspect_bytes,
-    invalid, parse_definition, runtime,
+    PACKAGE_DIR, PACKAGE_STAGING_DIR, Project, SELECTION_FILE, TRAIN_DATA_FILE, fs_report,
+    inspect_bytes, invalid, parse_definition, runtime,
 };
 
 use super::baseline::{PreparedBaseline, prepare_baseline, record_matches};
 use super::candidate_artifact::{
-    ARTIFACT_META_FILE, CandidateArtifact, check_meta_consistency, load_candidate_artifact,
-    verify_vocab_file,
+    ARTIFACT_META_FILE, ArtifactHandles, CandidateArtifact, build_candidate_pipeline,
+    check_meta_consistency, load_candidate_artifact, verify_vocab_file,
 };
 
-use super::infer::build_pipeline;
+use super::infer::is_tokenizer_qwen2;
 use super::ledger::HeldLedger;
 use super::select::compute_selection;
 use super::train::{
@@ -245,6 +253,7 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 成果物は選定候補のディレクトリ（`candidates/<N>/`）配下から閉じ込めつきで読む
     // （`evaluate` と共有する [`load_candidate_artifact`]。語彙ファイルの保持 fd 1 本によるストリーミング
     // 検証もここで行い、以降の複写・計測は同じ fd を使う。REQ-30・REQ-39）。
+    let artifact = load_candidate_artifact(&project, selection.candidate_index, success)?;
     let CandidateArtifact {
         meta_bytes,
         meta,
@@ -252,16 +261,16 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         onnx_file,
         handles,
         ..
-    } = load_candidate_artifact(&project, selection.candidate_index, success)?;
-    // tokenizer 表現（`qwen2_lora`）の複写・容量・再検証は #662-b で接続する。それまでは従来どおり拒否する
-    // （shard・tokenizer.json を欠いた不完全なパッケージを作らない。REQ-41・REQ-39）。
-    if super::infer::is_tokenizer_qwen2(&meta) {
-        return Err(invalid("unsupported input representation"));
-    }
+    } = &artifact;
     let onnx_file = onnx_file.as_str();
-    let vocab_file = handles.vocab;
+    let vocab_file = handles.vocab.as_ref();
+    // tokenizer 表現（`qwen2_lora`）は tokenizer.json と shard も複写する。参照欄は候補側の
+    // `artifact.json` から読む（`package` が追記する欄は参照欄に影響しない。REQ-41・#662）。
+    let tokenizer_refs = is_tokenizer_qwen2(meta)
+        .then(|| TokenizerPackageRefs::parse(meta_bytes).map_err(|e| e.to_error_report()))
+        .transpose()?;
     check_meta_consistency(
-        &meta,
+        meta,
         &definition,
         request.kind(),
         request.kind_version(),
@@ -270,10 +279,11 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 公開前に、`infer` が同じパッケージを読むときと同じ検証を通す（ハッシュが一致しても ONNX として
     // 読めないファイルを公開しない）。形式の許可リスト（ガード層）→ `kind_version` の許可リスト・
     // ONNX の読み込み・出力サイズの一致（`infer` の `load_backend` と共通。REQ-39）。
-    check_bytes(onnx_bytes.clone(), &FormatAllowlist::onnx_only())
+    check_bytes(onnx_bytes.clone(), &format_allowlist_for(request.kind()))
         .map_err(|e| e.to_error_report())?;
     // 組み立てたパイプラインは p95 の計測にも使う（公開するのと同じ `onnx_bytes` から作る。#338）。
-    let pipeline = build_pipeline(&onnx_bytes, &meta, definition.options().len())?;
+    // tokenizer 表現は shard を成果物ディレクトリの保持 fd から開き、ランタイムが sha256 を照合する。
+    let pipeline = build_candidate_pipeline(onnx_bytes, &artifact, definition.options().len())?;
 
     // 評価データがあるなら、選定候補が評価済みで、記録とモデル・評価データ・定義が一致することを
     // 公開（ステージングの作成）より前に確認する（評価していないモデルを配布しない。REQ-27）。
@@ -289,17 +299,17 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
                 // majority・必要件数は train 分割と定義から計算し直す（評価データは渡さない。#339）。
                 prepare_baseline(&definition, &records, &split)?,
             ),
-            &meta_bytes,
-            &onnx_bytes,
+            meta_bytes,
+            onnx_bytes,
             &format!("{}:seed{}", candidate.candidate_id, seed),
         )?),
         None => None,
     };
     // 合否判定は公開（ステージングの作成）より前に確定する（半端な状態を残さない。#328）。
     let quality = quality_from_acceptance(&definition, verified_record.as_ref())?;
-    let calibration = package_calibration(verified_record.as_ref(), &definition, &onnx_bytes)?;
+    let calibration = package_calibration(verified_record.as_ref(), &definition, onnx_bytes)?;
     let package_meta_bytes =
-        with_package_hashes(&meta_bytes, &definition_bytes, calibration.as_deref())?;
+        with_package_hashes(meta_bytes, &definition_bytes, calibration.as_deref())?;
 
     // 版管理台帳は上書きしない（`package/` の有無によらず拒否する。#491）。
     if project.exists(VERSION_LEDGER_FILE)? {
@@ -346,12 +356,12 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
     // 半端なステージングが残ると再実行が「既存」で拒否されるため。
     let breakdown = match assemble_and_measure(
         &project,
-        onnx_file,
+        (onnx_file, onnx_bytes),
         &package_meta_bytes,
-        &onnx_bytes,
         (&definition_bytes, calibration.as_deref()),
-        &meta,
-        vocab_file.as_ref().map(|(f, p)| (f, p.as_path())),
+        meta,
+        vocab_file.map(|(f, p)| (f, p.as_path())),
+        tokenizer_refs.as_ref().map(|refs| (refs, handles)),
     ) {
         Ok(breakdown) => breakdown,
         Err(report) => {
@@ -865,13 +875,15 @@ fn finalize_staging(
 /// 呼び出し元（[`run`]）はステージングを作成済みで、失敗時の後始末は呼び出し元が行う。
 fn assemble_and_measure(
     project: &Project,
-    onnx_file: &str,
+    // ONNX のファイル名とバイト列。
+    (onnx_file, onnx_bytes): (&str, &[u8]),
     meta_bytes: &[u8],
-    onnx_bytes: &[u8],
     // 登録済みの定義と、同梱する校正（あれば）のバイト列。
     (definition_bytes, calibration): (&[u8], Option<&[u8]>),
     meta: &ArtifactMeta,
     vocab: Option<(&File, &Path)>,
+    // tokenizer 表現（`qwen2_lora`）のときだけ、参照欄と候補成果物の保持 fd（tokenizer.json・shard）。
+    tokenizer: Option<(&TokenizerPackageRefs, &ArtifactHandles)>,
 ) -> Result<CapacityBreakdown, ErrorReport> {
     let pkg = Path::new(PACKAGE_STAGING_DIR);
     project.write_new(pkg.join(ARTIFACT_META_FILE), meta_bytes)?;
@@ -894,8 +906,31 @@ fn assemble_and_measure(
         members.push((PackageComponent::VocabOrFeatureTransform, VOCAB_FILE_NAME));
     }
 
+    // tokenizer.json は語彙・特徴量変換、shard は重みの区分に計上する（`capacity` の 5 区分は据え置き。
+    // 名前は `infer` が読む `artifact.json` の参照欄どおり。REQ-30・REQ-41・#662）。
+    let mut owned_members = Vec::new();
+    if let Some((refs, handles)) = tokenizer {
+        let (tokenizer_file, _) = handles
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| runtime("cannot read candidate artifact"))?;
+        copy_from_start(
+            project,
+            pkg.join(&refs.tokenizer_file),
+            tokenizer_file,
+            MAX_TOKENIZER_JSON_BYTES,
+        )?;
+        owned_members.push((
+            PackageComponent::VocabOrFeatureTransform,
+            refs.tokenizer_file.as_str(),
+        ));
+        for (location, shard, _) in &handles.shards {
+            copy_from_start(project, pkg.join(location), shard, MAX_SHARD_FILE_BYTES)?;
+            owned_members.push((PackageComponent::Weights, location.as_str()));
+        }
+    }
     let mut files = Vec::new();
-    for (component, name) in members {
+    for (component, name) in members.into_iter().chain(owned_members) {
         let (file, path) = project.open_file(pkg.join(name))?;
         files.push((component, path, file));
     }
@@ -905,8 +940,88 @@ fn assemble_and_measure(
         let (file, path) = project.open_file(pkg.join(VOCAB_FILE_NAME))?;
         verify_vocab_file(meta, Some((&file, path.as_path())))?;
     }
-    measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
+    // 複写した tokenizer.json・shard も記録の sha256 と照合する（検証から複写までの間の差し替え対策。
+    // shard は GiB 級のため固定長バッファで流し読みする。オーナー判断 2026-10-29・REQ-39・#662）。
+    if let Some((refs, _)) = tokenizer {
+        let (file, path) = project.open_file(pkg.join(&refs.tokenizer_file))?;
+        verify_copied_hash(
+            &file,
+            &path,
+            MAX_TOKENIZER_JSON_BYTES,
+            &refs.tokenizer_sha256,
+            "package tokenizer does not match its recorded hash",
+        )?;
+        for e in &refs.external_data {
+            let (file, path) = project.open_file(pkg.join(&e.location))?;
+            verify_copied_hash(
+                &file,
+                &path,
+                MAX_SHARD_FILE_BYTES,
+                &e.sha256,
+                "package shard does not match its recorded hash",
+            )?;
+        }
+    }
+    // 1 ファイルの計測上限は、shard を持つ tokenizer 表現だけ重み専用の上限（2 GiB）にする（fstat のみで
+    // アロケーションしない。`select` と同じ。オーナー判断 2026-10-29・REQ-39・#662）。
+    let file_limit = if tokenizer.is_some() {
+        MAX_SHARD_FILE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    };
+    measure_opened_files_with_limit(&files, file_limit)
         .map_err(|e| crate::output::capacity_error_report(&e))
+}
+
+/// 保持 fd を先頭へ戻し、固定長バッファで `rel` へ新規に複写する（全体をメモリへ読まない。上限超過は
+/// `invalid_input`。複写の失敗時は `write_new_from_reader` が複写先を消す）。
+fn copy_from_start(
+    project: &Project,
+    rel: PathBuf,
+    mut file: &File,
+    limit: u64,
+) -> Result<(), ErrorReport> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| runtime("cannot read candidate artifact"))?;
+    project.write_new_from_reader(rel, &mut file, limit)
+}
+
+/// 開いたファイルの内容を `limit` まで流し読みして sha256 を求め、`expected`（小文字 16 進）と照合する。
+/// 上限超過・読み込み失敗は固定文で止め、本文・パスは出さない。不一致は `mismatch`（`invalid_input`）。
+fn verify_copied_hash(
+    mut file: &File,
+    path: &Path,
+    limit: u64,
+    expected: &str,
+    mismatch: &str,
+) -> Result<(), ErrorReport> {
+    let mut hash = Sha256Stream::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).map_err(|source| {
+            fs_report(&FsError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > limit {
+            return Err(fs_report(&FsError::TooLarge {
+                path: path.to_path_buf(),
+                size: total,
+                limit,
+            }));
+        }
+        hash.update(buf.get(..n).unwrap_or_default());
+    }
+    if hash.finish().to_hex() != expected {
+        return Err(invalid(mismatch));
+    }
+    Ok(())
 }
 #[cfg(all(test, unix))]
 mod tests {
@@ -1693,5 +1808,32 @@ mod tests {
             let _ = std::fs::remove_file(&p);
         }
         let _ = std::fs::remove_file(&p1);
+    }
+
+    /// REQ-39・REQ-41・#662: 複写した shard・tokenizer.json は記録の sha256 と一致するときだけ通す
+    /// （流し読み。差し替えは不一致、上限超過は `limit_exceeded` になり、メッセージは固定文）。
+    #[test]
+    fn req39_issue662_verify_copied_hash_matches_mismatches_and_bounds() {
+        let body = b"copied shard bytes";
+        let hex = Sha256Digest::of_bytes(body).to_hex();
+        let (p, f) = temp_vocab("copied", body);
+        let limit = body.len() as u64;
+        assert!(verify_copied_hash(&f, &p, limit, &hex, "mismatch").is_ok());
+        // 1 バイトだけ違う記録は固定文で拒否する（本文・パスは出さない）。
+        let other = Sha256Digest::of_bytes(b"copied shard byteS").to_hex();
+        let (p2, f2) = temp_vocab("copied-other", body);
+        let err = verify_copied_hash(&f2, &p2, limit, &other, "mismatch").unwrap_err();
+        assert_eq!(err.code, fandhe_edge_core::exitcode::ExitCode::InvalidInput);
+        assert_eq!(err.message, "mismatch");
+        // 上限を 1 バイト下回ると、中身を最後まで読まずに limit_exceeded。
+        let (p3, f3) = temp_vocab("copied-limit", body);
+        let err = verify_copied_hash(&f3, &p3, limit - 1, &hex, "mismatch").unwrap_err();
+        assert_eq!(
+            err.code,
+            fandhe_edge_core::exitcode::ExitCode::LimitExceeded
+        );
+        for path in [p, p2, p3] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
