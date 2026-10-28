@@ -556,3 +556,30 @@ fn req28_req32_parallel_load_matches_serial_675() {
     assert_eq!(one, three);
     assert!(one[0].contains("1.5") && one[1].contains("16256") && one[2].contains("-7"));
 }
+
+/// `try_clone` で読み取り位置を共有する File を別の location として渡しても、並列読み込みが
+/// 互いの位置を動かさず読める（#675・PR #677 のレビュー指摘）。
+#[test]
+fn req41_parallel_load_with_cloned_handles_sharing_cursor_675() {
+    let d = Dir::new();
+    let a = f32s(&[1.5, -2.0, 3.25, 4.0, 5.5, 6.0, 7.25, 8.0]);
+    let inits = [
+        ext_tensor("p", &[8], 1, "a.bin", 0, 32),
+        ext_tensor("q", &[8], 1, "b.bin", 0, 32),
+    ];
+    let mut g = decode(&inits, &FT).unwrap();
+    let first = d.shard("a.bin", &a);
+    let second = ExternalShard {
+        location: "b.bin".into(),
+        file: first.file.try_clone().unwrap(),
+        sha256: first.sha256,
+    };
+    resolve_external_with(&mut g, vec![first, second], &lim(), 2).unwrap();
+    let got: Vec<_> = g
+        .initializers
+        .iter()
+        .map(|t| format!("{:?}", t.data))
+        .collect();
+    assert_eq!(got[0], got[1]);
+    assert!(got[0].contains("1.5") && got[0].contains("8.0"));
+}

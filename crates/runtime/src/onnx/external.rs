@@ -28,7 +28,7 @@ use fandhe_edge_core::fs::FsError;
 use fandhe_edge_core::hash::{Sha256Digest, Sha256Stream};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read as _, Seek as _, SeekFrom};
+
 use std::path::PathBuf;
 
 /// 流し読みのバッファ長（8 の倍数）。
@@ -229,6 +229,19 @@ fn run_jobs(jobs: Vec<Job>) -> Vec<(usize, OnnxLoadError)> {
         .collect()
 }
 
+/// 位置を指定して読む。`try_clone` した File どうしは読み取り位置を共有するため、並列に読む
+/// shard が同じファイルを指していても互いの seek・read に干渉しないよう共有位置を使わない（#675）。
+fn read_at(file: &File, buf: &mut [u8], pos: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, pos)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, pos)
+    }
+}
+
 /// shard 1 つを先頭から 1 回だけ流し読みし、sha256 を計算しながら `parts`（範囲順・重ならない）へ
 /// 復号して配る。サイズ超過・sha256 不一致は完全性の違反として返す（REQ-39）。
 fn stream_shard(
@@ -236,17 +249,12 @@ fn stream_shard(
     size: u64,
     parts: &mut [(u64, u64, Sink)],
 ) -> Result<(), OnnxLoadError> {
-    let mut file = &shard.file;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| read_err(&shard.location, e))?;
     let mut mine = parts.iter_mut().peekable();
     let mut hasher = Sha256Stream::new();
     let mut buf = [0u8; BUF_BYTES];
     let mut pos: u64 = 0;
     loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| read_err(&shard.location, e))?;
+        let n = read_at(&shard.file, &mut buf, pos).map_err(|e| read_err(&shard.location, e))?;
         if n == 0 {
             break;
         }
