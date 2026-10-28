@@ -6066,10 +6066,31 @@ mod suite {
             env.project_file("candidates/2/evaluation_record.json")
                 .is_file()
         );
-        assert!(
-            env.project_file("candidates/2/evaluation_predictions.jsonl")
-                .is_file()
-        );
+        // 1 件ごとの予測: 評価データの件数（8 ラベル × 2）ぶん、評価データの順に、行の形（id・status・
+        // predicted_label・scores〔選択肢 ID をキーとする〕）で書かれる（REQ-27・REQ-41・#445）。
+        let predictions =
+            std::fs::read_to_string(env.project_file("candidates/2/evaluation_predictions.jsonl"))
+                .expect("predictions");
+        let lines: Vec<&str> = predictions.lines().collect();
+        let expected_ids: Vec<String> = (0..2)
+            .flat_map(|i| QWEN2_LABELS.iter().map(move |l| format!("e-{l}-{i}")))
+            .collect();
+        assert_eq!(lines.len(), expected_ids.len(), "{predictions}");
+        let scores_keys = QWEN2_LABELS
+            .iter()
+            .map(|l| format!("\"{l}\":"))
+            .collect::<Vec<_>>();
+        for (line, id) in lines.iter().zip(&expected_ids) {
+            let head = format!("{{\"id\":\"{id}\",\"status\":\"ok\",\"predicted_label\":\"");
+            assert!(line.starts_with(&head), "{line}");
+            let scores = line.split_once("\"scores\":{").expect("scores").1;
+            let mut at = 0;
+            for key in &scores_keys {
+                let found = scores[at..].find(key.as_str()).expect(key);
+                at += found + key.len();
+            }
+            assert!(line.ends_with("}}"), "{line}");
+        }
         // 適用権は 1 回限り（REQ-27）。
         assert_eq!(
             env.fails(&EVALUATE_QWEN2, 64, "invalid_input"),
@@ -6292,21 +6313,22 @@ mod suite {
             &dir.join("artifact.json"),
             meta.replace(&shard_sha, &"0".repeat(64)).as_bytes(),
         );
-        stopped(&env, None);
+        stopped(&env, Some("model file cannot be loaded"));
         // (d) shard の symlink 化（プロジェクトの外を指す）は経路の閉じ込めで拒否する。
         let (env, dir) = qwen2_selected("qwen2-symlink-shard");
         let outside = env.base.join("outside.bin");
         std::fs::write(&outside, b"outside").expect("outside");
         std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
         std::os::unix::fs::symlink(&outside, dir.join("weights-00000.bin")).expect("symlink");
-        stopped(&env, None);
+        stopped(&env, Some("path rejected: path_escapes_root"));
         // (e) shard の欠落。
         let (env, dir) = qwen2_selected("qwen2-missing-shard");
         std::fs::remove_file(dir.join("weights-00000.bin")).expect("remove shard");
-        stopped(&env, None);
+        stopped(&env, Some("path rejected: path_unresolvable"));
     }
 
-    /// REQ-39・REQ-41・#662: tokenizer.json・shard の差し替えは `select` も止める（選定記録は作らない）。
+    /// REQ-39・REQ-41・#662: `select` が検出するのは shard の欠落と symlink 化（経路の閉じ込め）まで。
+    /// 同じサイズの改変は `select` では検出せず、`evaluate` 以降のランタイムの照合で止まる。
     pub fn qwen2_lora_select_rejects_tampered_members() {
         let env = qwen2_inspected("qwen2-select-tamper", true);
         env.ok(&TRAIN_QWEN2);
@@ -6328,6 +6350,35 @@ mod suite {
         // 復元すれば通る（上の拒否が改変によるものであることの対照）。
         std::fs::write(&shard, original).expect("restore");
         env.ok(&SELECT_QWEN2);
+    }
+
+    /// REQ-39・REQ-41・#662: `select` は shard を 1 ファイルごとの上限（`MAX_SHARD_FILE_BYTES`）で fstat 検査する。
+    /// 上限を 1 バイト超えると 20 `limit_exceeded`、ちょうどなら中身を読まずに（疎ファイルなので読めば
+    /// 2 GiB の読み込みになる）通る。shard の中身の sha256 は `select` では見ない（`evaluate` 以降）。
+    /// 疎ファイルを作れないファイルシステムでは領域を食うため、本テストは疎ファイル対応の環境
+    /// （macOS の APFS・Linux の ext4/tmpfs）を前提にする。
+    pub fn qwen2_lora_select_checks_shard_size_limit() {
+        use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
+        let env = qwen2_inspected("qwen2-shard-limit", true);
+        env.ok(&TRAIN_QWEN2);
+        let dir = std::fs::read_dir(env.project_file("candidates/2"))
+            .expect("candidate dir")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join("artifact.json").is_file())
+            .expect("artifact dir");
+        let shard = dir.join("weights-00000.bin");
+        let sparse = |len: u64| {
+            std::fs::remove_file(&shard).expect("remove shard");
+            std::fs::File::create(&shard)
+                .and_then(|f| f.set_len(len))
+                .expect("sparse shard");
+        };
+        sparse(MAX_SHARD_FILE_BYTES + 1);
+        env.fails(&SELECT_QWEN2, 20, "limit_exceeded");
+        assert!(!env.project_file("selection_record.json").exists());
+        sparse(MAX_SHARD_FILE_BYTES);
+        env.ok(&SELECT_QWEN2);
+        assert!(env.project_file("selection_record.json").is_file());
     }
 
     /// 偽ワーカー本体。`launch_script` の中身は使わず、学習リクエストの内容だけで動く。
@@ -6493,6 +6544,10 @@ fn main() -> std::process::ExitCode {
         (
             "qwen2_lora_select_rejects_tampered_members",
             suite::qwen2_lora_select_rejects_tampered_members,
+        ),
+        (
+            "qwen2_lora_select_checks_shard_size_limit",
+            suite::qwen2_lora_select_checks_shard_size_limit,
         ),
         (
             "qwen2_lora_train_all_with_base_model_dir",

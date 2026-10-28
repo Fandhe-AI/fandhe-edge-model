@@ -394,8 +394,12 @@ fn vocab_exclusion_of(
     let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
     // tokenizer 表現（`qwen2_lora`）は `select` では推論しない（validation の予測は `result.json`）ため、
     // shard（GiB 級）を読む `load_backend` は使わず、`load_candidate_artifact` の構造検査
-    // （tokenizer.json の sha256・shard の存在と fstat サイズ）に `kind_version` の許可だけを足して代える。
-    // shard の sha256 は `evaluate`・`package`・`infer` がランタイムの読み込み時に照合する（REQ-41・#662）。
+    // （tokenizer.json の sha256・shard の存在・symlink でないこと・fstat サイズの上限）に `kind_version` の
+    // 許可だけを足して代える。これは「欠落・symlink・サイズ」までの軽い検査で、次は `select` では検出しない:
+    // 同じサイズのまま中身を変えた shard（sha256 照合）、ONNX の構造・外部参照の整合、出力クラス数と選択肢数の
+    // 一致。これらはランタイムの読み込み時に照合する `evaluate`・`package`・`infer` で止まる（REQ-41・#662）。
+    // また shard の合計上限（`MAX_PACKAGE_TOTAL_BYTES`・20 GiB）は `select` では見ない（1 ファイルごとの上限のみ。
+    // 合計はランタイムの読み込みで検査される）。この非対称は byte 表現の `load_backend`（ONNX 全体を読む）と異なる。
     // byte 表現は `package`・`infer` と共有する `load_backend` で、ONNX として読み込めること・出力クラス数が
     // 定義の選択肢数と一致すること・`kind_version` の許可も確認する（容量超過の候補も同じ。
     // 失敗は除外にせず、`package` と同じ終了コードで止める。REQ-30・REQ-39）。

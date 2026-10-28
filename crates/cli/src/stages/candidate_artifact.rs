@@ -105,8 +105,13 @@ pub(crate) fn load_candidate_artifact(
     if !is_single_component(onnx_file) {
         return Err(invalid("onnx file name is invalid"));
     }
+    // 成果物ディレクトリは保持 fd で 1 回だけ開き、メンバーはすべてそこから相対で開く（ディレクトリを
+    // 辿るのは 1 回。tokenizer 表現の shard を推論時に開き直す口にもなる。REQ-39）。
+    let dir = candidate_dir
+        .open_subdir(&artifact_rel)
+        .map_err(|e| e.to_error_report())?;
     // 各メンバーは 1 回だけ開き、読み込み用に複製した fd で読む（元の fd は容量計測用に保持する）。
-    let open_member = |name: &str| candidate_dir.open_member(&artifact_rel.join(name));
+    let open_member = |name: &str| dir.open_member(Path::new(name));
     let read_member = |name: &str, limit: u64| -> Result<(Vec<u8>, File, PathBuf), ErrorReport> {
         let (file, real) = open_member(name).map_err(|e| e.to_error_report())?;
         let reader = file
@@ -142,9 +147,6 @@ pub(crate) fn load_candidate_artifact(
         Err(e) => return Err(e.to_error_report()),
     };
     verify_vocab_file(&meta, vocab.as_ref().map(|(f, p)| (f, p.as_path())))?;
-    let dir = candidate_dir
-        .open_subdir(&artifact_rel)
-        .map_err(|e| e.to_error_report())?;
     let (tokenizer, tokenizer_bytes, shards) = if is_tokenizer_qwen2(&meta) {
         let members = open_tokenizer_members(&dir, &meta_bytes)?;
         (

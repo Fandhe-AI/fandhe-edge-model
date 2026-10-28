@@ -269,8 +269,11 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
             prepared.config_id.clone(),
             Sha256Digest::of_bytes(&prepared.artifact.onnx_bytes),
         );
-        // tokenizer 表現は tokenizer.json の sha256 も結び付け、評価の前後で一致を確認する（REQ-27・#662）。
-        // shard は `artifact_meta_sha256`（評価記録）とランタイムの読み込み時照合で束縛する。
+        // tokenizer 表現は tokenizer.json の sha256 も代表構成の登録へ結び付ける（登録の完全性のため。REQ-27・
+        // #662）。評価器が前後で照合するのは私用ディレクトリへ複製したバイト列で、複製のハッシュは常に一致する
+        // ため、この登録自体は成果物の改変を検出しない。改変を止めているのは `build_qwen2_pipeline` の
+        // tokenizer.json の sha256 照合（`artifact.json` の記録との照合）と、ランタイムが shard を読みながら行う
+        // sha256 照合（不一致は fail-closed）。
         if let Some(tokenizer) = &prepared.artifact.tokenizer_bytes {
             entry = entry.with_vocab(Sha256Digest::of_bytes(tokenizer));
         }
@@ -1050,8 +1053,10 @@ fn apply_to_frozen_data<R>(
     let staged = StagedFiles::create()?;
     let eval_path = staged.write("evaluation.jsonl", eval_bytes)?;
     let weights_path = staged.write("model.onnx", &target.artifact.onnx_bytes)?;
-    // tokenizer 表現は tokenizer.json も私用ディレクトリへ複製し、語彙として前後ハッシュ照合に乗せる
-    // （REQ-27・#662。shard は GiB 級のため複製せず、記録とランタイムの読み込み時照合で束縛する）。
+    // tokenizer 表現は tokenizer.json も私用ディレクトリへ複製し、語彙として評価器の前後ハッシュ照合へ渡す
+    // （登録の完全性のため。REQ-27・#662）。複製のハッシュは常に一致するので、これは改変を検出しない。
+    // 実際に止めるのは `build_qwen2_pipeline` の tokenizer.json の sha256 照合とランタイムの shard の照合。
+    // shard は GiB 級のため複製しない。
     let vocab_path = target
         .artifact
         .tokenizer_bytes
@@ -1084,6 +1089,10 @@ fn apply_to_frozen_data<R>(
             if Sha256Digest::of_bytes(&weights) != onnx_digest {
                 return Err(EvalPredictFailure::ModelChanged);
             }
+            // 注意（tokenizer 表現）: ここで shard を読み直して sha256 を照合する（適用権の取得後）。適用権の前の
+            // 試し組み立てからここまでの間に shard が差し替えられる、またはメモリが足りなくなると、適用権だけが
+            // 消費されて `Failed`（`runtime_error`・70）になる。評価は成功を記録せず `package` は配布を許さない
+            // ので fail-closed で契約違反ではないが、その候補は再評価できない（モジュール doc の適用権の規則）。
             let pipeline = build_candidate_pipeline(&weights, &target.artifact, options.len())
                 .map_err(|_| EvalPredictFailure::Failed)?;
             let deadline = Instant::now().checked_add(MAX_INFER_BATCH_DURATION);
