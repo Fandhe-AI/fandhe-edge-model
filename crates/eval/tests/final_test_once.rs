@@ -12,6 +12,7 @@ use fandhe_edge_eval::eval_data_invariance::{EvalDataInvarianceError, FrozenEval
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedBy, AppliedOnce, ApplyOnceError, DecodeFailed, FinalTestLedger,
     LabeledInput, RegisteredConfig, RepresentativeConfigId, apply_once, apply_once_then,
+    apply_once_then_with_identity,
 };
 use fandhe_edge_eval::invariance::{EvaluationInvarianceError, ModelPackagePaths};
 use std::cell::Cell;
@@ -1428,5 +1429,75 @@ fn req27_is_applied_rejects_tampered_completion_record() {
     assert!(
         matches!(r, Err(AcquireError::RegistryTampered { .. })),
         "{r:?}"
+    );
+}
+/// REQ-27・#662: 重みの識別を明示すると、モデルファイル（ONNX 本体）が同じでも識別が違う 2 候補
+/// （shard だけが違う `qwen2_lora` の想定）を、同じ凍結 test に別々に 1 回ずつ適用できる。
+/// 同じ候補の再適用は従来どおり拒否し、登録と違う識別での適用は未登録の重みとして拒否する。
+#[test]
+fn req27_issue662_explicit_identity_separates_candidates_with_same_model_file() {
+    let ledger_dir = TempDir::new("ledger-identity");
+    let ledger = FinalTestLedger::open(ledger_dir.path()).unwrap();
+    let model = Model::new(b"same-onnx", None);
+    let identity_a = Sha256Digest::of_bytes(b"onnx+meta-a");
+    let identity_b = Sha256Digest::of_bytes(b"onnx+meta-b");
+    let record = freeze_eval_data(DATA).unwrap();
+    ledger
+        .register_configs(
+            &record.sha256(),
+            &[
+                RegisteredConfig::new(id("q:seed0"), identity_a),
+                RegisteredConfig::new(id("r:seed0"), identity_b),
+            ],
+        )
+        .unwrap();
+    let data_dir = TempDir::new("data-identity");
+    let path = data_dir.path().join("eval.bin");
+    fs::write(&path, DATA).unwrap();
+    let apply = |config: &str, identity: Sha256Digest| {
+        let frozen = FrozenEvalData {
+            path: &path,
+            sha256: record.sha256(),
+            byte_len: record.byte_len(),
+        };
+        apply_once_then_with_identity(
+            &ledger,
+            &frozen,
+            id(config),
+            &model.paths(),
+            Some(identity),
+            dec,
+            |_t, _inputs, _paths| Ok::<_, String>(()),
+            |_| Ok(()),
+        )
+        .map(|_| ())
+    };
+    assert!(apply("q:seed0", identity_a).is_ok());
+    assert!(apply("r:seed0", identity_b).is_ok());
+    // 同じ候補の再適用は拒否する。
+    let again = apply("q:seed0", identity_a);
+    assert!(
+        matches!(
+            again,
+            Err(EvalDataInvarianceError::Evaluation(
+                EvaluationInvarianceError::Evaluation(ApplyOnceError::Acquire(
+                    AcquireError::AlreadyApplied { .. }
+                ))
+            ))
+        ),
+        "{again:?}"
+    );
+    // 登録と違う識別（他の候補の識別）での適用は、重みが未登録として拒否する。
+    let mismatched = apply("r:seed0", identity_a);
+    assert!(
+        matches!(
+            mismatched,
+            Err(EvalDataInvarianceError::Evaluation(
+                EvaluationInvarianceError::Evaluation(ApplyOnceError::Acquire(
+                    AcquireError::WeightsNotRegistered
+                ))
+            ))
+        ),
+        "{mismatched:?}"
     );
 }

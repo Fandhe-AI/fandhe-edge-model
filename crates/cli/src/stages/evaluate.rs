@@ -49,7 +49,7 @@
 //! （パスへ戻る経路なし。検証後の差し替えでプロジェクト外を読み書きしない。#168）。
 //!
 //! 指標の算出・結果の検証・記録ファイルの書き込みは、台帳へ完了を記録する前
-//! （[`fandhe_edge_eval::final_test_once::apply_once_then`] の `finish`）に行う。これらが失敗しても
+//! （[`fandhe_edge_eval::final_test_once::apply_once_then_with_identity`] の `finish`）に行う。これらが失敗しても
 //! 台帳は完了状態にならず（適用権のロックのみが残る）、記録の無い完了を作らない（REQ-27）。
 //!
 //! # 1 件ごとの予測の保存（REQ-27・REQ-41・#445）
@@ -149,7 +149,7 @@ use fandhe_edge_eval::calibration::{
 use fandhe_edge_eval::eval_data_invariance::FrozenEvalData;
 use fandhe_edge_eval::final_test_once::{
     AcquireError, AppliedOnce, DecodeFailed, FinalTestLedger, LabeledInput, RegisteredConfig,
-    RepresentativeConfigId, apply_once_then,
+    RepresentativeConfigId, apply_once_then_with_identity,
 };
 use fandhe_edge_eval::invariance::ModelPackagePaths;
 use fandhe_edge_eval::metrics::{self, EvalRecord, Outcome};
@@ -177,7 +177,8 @@ use crate::stage_output::{EvaluateStart, evaluate_start};
 
 use super::baseline::{PreparedBaseline, compare, prepare_baseline};
 use super::candidate_artifact::{
-    CandidateArtifact, build_candidate_pipeline, check_meta_consistency, load_candidate_artifact,
+    CandidateArtifact, build_candidate_pipeline, check_meta_consistency, ledger_weights_identity,
+    load_candidate_artifact, registered_weights_digest,
 };
 use super::diagnostics::{PreparedStats, prepare_stats};
 use super::infer::Pipeline;
@@ -265,9 +266,11 @@ pub fn run(args: &EvaluateArgs, cwd: &Path) -> Result<EvaluateOutcome, ErrorRepo
         else {
             continue;
         };
+        // 重みの識別は byte が ONNX の sha256、tokenizer 表現が ONNX と `artifact.json` から求めた値
+        // （shard だけが違う候補を台帳が見分ける。REQ-27・#662。`registered_weights_digest` の doc）。
         let mut entry = RegisteredConfig::new(
             prepared.config_id.clone(),
-            Sha256Digest::of_bytes(&prepared.artifact.onnx_bytes),
+            registered_weights_digest(&prepared.artifact),
         );
         // tokenizer 表現は tokenizer.json の sha256 も代表構成の登録へ結び付ける（登録の完全性のため。REQ-27・
         // #662）。評価器が前後で照合するのは私用ディレクトリへ複製したバイト列で、複製のハッシュは常に一致する
@@ -1075,11 +1078,13 @@ fn apply_to_frozen_data<R>(
         thresholds: None,
     };
     let options = definition.options();
-    apply_once_then(
+    apply_once_then_with_identity(
         ledger,
         &frozen,
         target.config_id.clone(),
         &model,
+        // tokenizer 表現だけ識別を明示する（登録時と同じ値。byte は `None` で従来どおりファイルの sha256）。
+        ledger_weights_identity(&target.artifact),
         |bytes| decode_evaluation(bytes, definition).map_err(|_| DecodeFailed),
         // 推論関数へは `input` の列だけが渡る（正解ラベルは評価器側に残る。REQ-27）。
         |_ticket, inputs, paths| {

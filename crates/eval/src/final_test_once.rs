@@ -1367,6 +1367,32 @@ pub fn apply_once_then<T, E, R>(
     predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
     finish: impl FnOnce(&AppliedOnce<T>) -> Result<R, E>,
 ) -> ApplyOnceThenResult<T, E, R> {
+    apply_once_then_with_identity(
+        ledger, frozen, config_id, model, None, decode, predict, finish,
+    )
+}
+
+/// [`apply_once_then`] に、重みの識別（台帳が候補を見分ける値）の明示を加えた版（REQ-27・#662）。
+///
+/// `weights_identity` が `None` なら [`apply_once_then`] と同じ（`model.weights` のファイルの sha256 が識別）。
+/// `Some(d)` のときは `d` を識別として、事前登録（[`RegisteredConfig::new`] へ渡した値）との照合と、
+/// 重みロック・代表構成ロックのキーに使う。ONNX 本体が同じでも外部データ（shard）が違う候補
+/// （`qwen2_lora`）を、台帳が別のモデルとして扱うため。呼び出し側が正準化した入力から 1 か所で計算した値を渡す。
+///
+/// 識別とファイルの照合は別物で、`model.weights` を含む各構成要素ファイルの評価前後の不変性検証
+/// （[`evaluate_with_invariance`]）は今までどおり行う。`Some` のときは `model.weights` のファイルと識別の
+/// 対応は本関数では確かめない（呼び出し側が、識別の材料と推論に使うファイルの一致を `predict` 内で確かめること）。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_once_then_with_identity<T, E, R>(
+    ledger: &FinalTestLedger,
+    frozen: &FrozenEvalData<'_>,
+    config_id: RepresentativeConfigId,
+    model: &ModelPackagePaths<'_>,
+    weights_identity: Option<Sha256Digest>,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<LabeledInput>, DecodeFailed>,
+    predict: impl FnOnce(ApplicationTicket, &[&str], &ModelPackagePaths<'_>) -> Result<T, E>,
+    finish: impl FnOnce(&AppliedOnce<T>) -> Result<R, E>,
+) -> ApplyOnceThenResult<T, E, R> {
     // 評価が最後まで成功したときに記録する完了記録の材料（適用権の消費とは別の状態。REQ-27）。
     let mut pending_completion: Option<(FinalTestKey, Sha256Digest)> = None;
     let result = evaluate_with_eval_data_invariance(frozen, |bytes| {
@@ -1378,8 +1404,10 @@ pub fn apply_once_then<T, E, R>(
             let Some(entry) = registered.iter().find(|e| e.id == config_id) else {
                 return Err(ApplyOnceError::Acquire(AcquireError::UnregisteredConfig));
             };
-            let weights_sha256 =
-                digest_component(paths.weights).map_err(ApplyOnceError::Acquire)?;
+            let weights_sha256 = match weights_identity {
+                Some(identity) => identity,
+                None => digest_component(paths.weights).map_err(ApplyOnceError::Acquire)?,
+            };
             if weights_sha256 != entry.weights_sha256 {
                 return Err(ApplyOnceError::Acquire(AcquireError::WeightsNotRegistered));
             }
