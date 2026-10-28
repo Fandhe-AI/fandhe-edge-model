@@ -30,7 +30,8 @@ use std::path::Path;
 use fandhe_edge_core::definition::Definition;
 use fandhe_edge_core::exitcode::{ErrorReport, ExitCode};
 use fandhe_edge_core::stage_report::SelectReport;
-use fandhe_edge_guard::format::{FormatAllowlist, check_bytes};
+use fandhe_edge_guard::format::check_bytes;
+use fandhe_edge_guard::split_files::MAX_SHARD_FILE_BYTES;
 use fandhe_edge_runtime::capacity::{
     MAX_FILE_BYTES, PackageComponent, measure_opened_files_with_limit,
 };
@@ -47,6 +48,7 @@ use fandhe_edge_train::stage_files::{
 
 use crate::args::SelectArgs;
 use crate::error_report::{ToErrorReport, default_message};
+use crate::infer_guard::format_allowlist_for;
 use crate::project::{
     DEFINITION_FILE, Project, SEARCH_RECORD_FILE, SELECTION_EXCLUSIONS_FILE, SELECTION_FILE, fail,
     invalid, runtime,
@@ -54,9 +56,9 @@ use crate::project::{
 use fandhe_edge_train::kind_resolution::normalize_explicit_kinds;
 
 use super::candidate_artifact::{
-    CandidateArtifact, check_meta_consistency, load_candidate_artifact,
+    CandidateArtifact, check_meta_consistency, load_candidate_artifact, measured_members,
 };
-use super::infer::load_backend;
+use super::infer::{is_tokenizer_qwen2, kind_version_allowed, load_backend};
 use super::train::{
     allotted_time_limit, effective_train_seed, load_trained, recorded_device,
     request_matches_candidate, resolve_candidates, verified_split,
@@ -386,32 +388,47 @@ fn vocab_exclusion_of(
         request.kind_version(),
         request.max_bytes(),
     )?;
-    // `package`・`infer` と共有する `load_backend` で、ONNX として読み込めること・出力クラス数が
+    // ONNX の形式は kind 別の許可リストで検査する（`qwen2_lora` だけ外部データ参照を許す。REQ-39）。
+    let checked = check_bytes(onnx_bytes, &format_allowlist_for(meta.kind()))
+        .map_err(|e| e.to_error_report())?;
+    let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
+    // tokenizer 表現（`qwen2_lora`）は `select` では推論しない（validation の予測は `result.json`）ため、
+    // shard（GiB 級）を読む `load_backend` は使わず、`load_candidate_artifact` の構造検査
+    // （tokenizer.json の sha256・shard の存在と fstat サイズ）に `kind_version` の許可だけを足して代える。
+    // shard の sha256 は `evaluate`・`package`・`infer` がランタイムの読み込み時に照合する（REQ-41・#662）。
+    // byte 表現は `package`・`infer` と共有する `load_backend` で、ONNX として読み込めること・出力クラス数が
     // 定義の選択肢数と一致すること・`kind_version` の許可も確認する（容量超過の候補も同じ。
     // 失敗は除外にせず、`package` と同じ終了コードで止める。REQ-30・REQ-39）。
-    let checked =
-        check_bytes(onnx_bytes, &FormatAllowlist::onnx_only()).map_err(|e| e.to_error_report())?;
-    let kind = ModelKind::parse(meta.kind()).map_err(|_| invalid("unsupported model kind"))?;
-    load_backend(
-        checked.as_bytes(),
-        kind,
-        meta.kind_version(),
-        definition.options().len(),
-    )?;
+    let tokenizer_repr = is_tokenizer_qwen2(&meta);
+    if tokenizer_repr {
+        if !kind_version_allowed(kind, meta.kind_version()) {
+            return Err(invalid("unsupported kind_version"));
+        }
+    } else {
+        load_backend(
+            checked.as_bytes(),
+            kind,
+            meta.kind_version(),
+            definition.options().len(),
+        )?;
+    }
     // 語彙の保持 fd 1 本を検証（ローダー内）と容量計測（fstat）の両方で使い、開き直さない。
     // 容量を超える語彙も同じ形式検証を通し済みで、不正なら除外にせず `invalid_input` で止まる。
-    let has_vocab_file = handles.vocab.is_some();
-    let mut files = vec![
-        (PackageComponent::Weights, handles.onnx.1, handles.onnx.0),
-        (PackageComponent::Metadata, handles.meta.1, handles.meta.0),
-    ];
-    if let Some((file, real)) = handles.vocab {
-        files.push((PackageComponent::VocabOrFeatureTransform, real, file));
-    }
+    // tokenizer 表現は語彙の目安超過の除外（PoC-13・40 MB）を適用しない（`has_vocab_file=false`。
+    // tokenizer.json のバイト数は語彙・特徴量変換の区分に計上する。オーナー判断 2026-10-29・#662）。
+    let has_vocab_file = !tokenizer_repr && handles.vocab.is_some();
+    let mut files = measured_members(&handles)?;
     // 選択肢表（`package` は `definition.json` を LabelTable として合計に含める）。
     let (file, path) = project.open_file(DEFINITION_FILE)?;
     files.push((PackageComponent::LabelTable, path, file));
-    let breakdown = measure_opened_files_with_limit(&files, MAX_FILE_BYTES)
+    // 計測の 1 ファイル上限は、shard を持つ tokenizer 表現だけ重み専用の上限（2 GiB）にする（fstat のみで
+    // アロケーションしない。REQ-39。オーナー判断 2026-10-29・#662）。
+    let file_limit = if tokenizer_repr {
+        MAX_SHARD_FILE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    };
+    let breakdown = measure_opened_files_with_limit(&files, file_limit)
         .map_err(|e| crate::output::capacity_error_report(&e))?;
     let screening = screen_vocab_candidates(&[(index, breakdown, has_vocab_file)])
         .map_err(|_| runtime("cannot screen candidate capacity"))?;

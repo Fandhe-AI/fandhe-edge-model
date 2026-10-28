@@ -250,7 +250,13 @@ pub fn run(args: &PackageArgs, cwd: &Path) -> Result<PackageRunResult, ErrorRepo
         onnx_bytes,
         onnx_file,
         handles,
+        ..
     } = load_candidate_artifact(&project, selection.candidate_index, success)?;
+    // tokenizer 表現（`qwen2_lora`）の複写・容量・再検証は #662-b で接続する。それまでは従来どおり拒否する
+    // （shard・tokenizer.json を欠いた不完全なパッケージを作らない。REQ-41・REQ-39）。
+    if super::infer::is_tokenizer_qwen2(&meta) {
+        return Err(invalid("unsupported input representation"));
+    }
     let onnx_file = onnx_file.as_str();
     let vocab_file = handles.vocab;
     check_meta_consistency(
